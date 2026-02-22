@@ -1,0 +1,135 @@
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: videoroll
+      POSTGRES_PASSWORD: videoroll
+      POSTGRES_DB: videoroll
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U videoroll -d videoroll"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    image: redis:7
+    ports:
+      - "6379:6379"
+
+  db-init:
+    build:
+      context: .
+      args:
+        INSTALL_ASR: ${INSTALL_ASR:-1}
+    image: videoroll:dev
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      REDIS_URL: ${REDIS_URL}
+      S3_ENDPOINT_URL: ${S3_ENDPOINT_URL}
+      S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID}
+      S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY}
+      S3_BUCKET: ${S3_BUCKET}
+      S3_REGION_NAME: ${S3_REGION_NAME:-us-east-1}
+      S3_USE_SSL: ${S3_USE_SSL:-false}
+    command: >
+      python -c "from videoroll.config import get_orchestrator_settings;
+      from videoroll.db.base import Base;
+      from videoroll.db.session import get_engine;
+      import videoroll.db.models  # noqa: F401
+      ;
+      s=get_orchestrator_settings();
+      Base.metadata.create_all(get_engine(s.database_url));
+      print('db init ok')"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${S3_ACCESS_KEY_ID:-videoroll}
+      MINIO_ROOT_PASSWORD: ${S3_SECRET_ACCESS_KEY:-videorollsecret}
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio-data:/data
+
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      - minio
+    entrypoint: /bin/sh
+    command: >
+      -c "
+      mc alias set local http://minio:9000 ${S3_ACCESS_KEY_ID:-videoroll} ${S3_SECRET_ACCESS_KEY:-videorollsecret} &&
+      mc mb -p local/${S3_BUCKET:-videoroll} || true
+      "
+
+  web:
+    build:
+      context: ./web
+    image: videoroll-web:dev
+    ports:
+      - "3000:80"
+    depends_on:
+      app:
+        condition: service_started
+
+  app:
+    build:
+      context: .
+      args:
+        INSTALL_ASR: ${INSTALL_ASR:-1}
+    image: videoroll:dev
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      REDIS_URL: ${REDIS_URL}
+      S3_ENDPOINT_URL: ${S3_ENDPOINT_URL}
+      S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID}
+      S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY}
+      S3_BUCKET: ${S3_BUCKET}
+      S3_REGION_NAME: ${S3_REGION_NAME:-us-east-1}
+      S3_USE_SSL: ${S3_USE_SSL:-false}
+      SUBTITLE_ASR_ENGINE: ${SUBTITLE_ASR_ENGINE:-faster-whisper}
+      SUBTITLE_WHISPER_MODEL: ${SUBTITLE_WHISPER_MODEL:-tiny}
+      SUBTITLE_WHISPER_DEVICE: ${SUBTITLE_WHISPER_DEVICE:-cpu}
+      SUBTITLE_WHISPER_COMPUTE_TYPE: ${SUBTITLE_WHISPER_COMPUTE_TYPE:-int8}
+      SUBTITLE_WHISPER_MODEL_DIR: ${SUBTITLE_WHISPER_MODEL_DIR:-/models/whisper}
+      FFMPEG_PATH: ${FFMPEG_PATH:-ffmpeg}
+      WORK_DIR: ${WORK_DIR:-/tmp/videoroll}
+      YOUTUBE_USER_AGENT: ${YOUTUBE_USER_AGENT:-videoroll/0.1}
+      YOUTUBE_COOKIE_FILE: ${YOUTUBE_COOKIE_FILE:-}
+      YOUTUBE_PROXY: ${YOUTUBE_PROXY:-}
+      YOUTUBE_YTDLP_FORMAT: ${YOUTUBE_YTDLP_FORMAT:-bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best}
+      YOUTUBE_EXTRACTOR_ARGS_JSON: ${YOUTUBE_EXTRACTOR_ARGS_JSON:-}
+      BILIBILI_PUBLISH_MODE: ${BILIBILI_PUBLISH_MODE:-mock}
+      CORS_ALLOW_ORIGINS: ${CORS_ALLOW_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000}
+      SUBTITLE_SERVICE_URL: ${SUBTITLE_SERVICE_URL:-http://localhost:8000/subtitle-service}
+      YOUTUBE_INGEST_URL: ${YOUTUBE_INGEST_URL:-http://localhost:8000/youtube-ingest}
+      BILIBILI_PUBLISHER_URL: ${BILIBILI_PUBLISHER_URL:-http://localhost:8000/bilibili-publisher}
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data/models:/models
+      - ./data/secrets:/secrets
+    depends_on:
+      postgres:
+        condition: service_healthy
+      db-init:
+        condition: service_completed_successfully
+      redis:
+        condition: service_started
+      minio:
+        condition: service_started
+      minio-init:
+        condition: service_completed_successfully
+
+volumes:
+  postgres-data:
+  minio-data:
