@@ -9,6 +9,7 @@ type ConvertedVideoItem = {
   task: Task;
   final_asset: Asset;
   cover_asset?: Asset | null;
+  display_title?: string | null;
 };
 
 function fileNameFromKey(key: string): string {
@@ -159,7 +160,8 @@ export default function VideosPage() {
                       />
                     </td>
                     <td className="py-2 pr-3">
-                      <div className="font-mono text-xs text-slate-900">{fileNameFromKey(it.final_asset.storage_key)}</div>
+                      <div className="text-sm font-semibold text-slate-900">{it.display_title?.trim() || fileNameFromKey(it.final_asset.storage_key)}</div>
+                      <div className="font-mono text-[11px] text-slate-600">{fileNameFromKey(it.final_asset.storage_key)}</div>
                       <div className="font-mono text-[11px] text-slate-500">{it.final_asset.storage_key}</div>
                     </td>
                     <td className="py-2 pr-3">
@@ -179,6 +181,14 @@ export default function VideosPage() {
                     </td>
                     <td className="py-2 pr-3">
                       <div className="flex flex-wrap items-center gap-2">
+                        <a
+                          className="rounded border px-2 py-1 text-xs hover:bg-slate-50"
+                          href={`${ORCHESTRATOR_URL}/tasks/${it.task.id}/assets/${it.final_asset.id}/stream`}
+                          target="_blank"
+                          rel="noreferrer"
+                        >
+                          Play
+                        </a>
                         <a
                           className="rounded border px-2 py-1 text-xs hover:bg-slate-50"
                           href={`${ORCHESTRATOR_URL}/tasks/${it.task.id}/assets/${it.final_asset.id}/download`}

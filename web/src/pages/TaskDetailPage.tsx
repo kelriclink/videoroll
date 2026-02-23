@@ -24,6 +24,7 @@ type SubtitleAutoProfile = {
   burn_in: boolean;
   soft_sub: boolean;
   ass_style: string;
+  video_codec: string;
   asr_engine: string;
   asr_language: string;
   asr_model?: string | null;
@@ -39,6 +40,10 @@ type SubtitleAutoProfile = {
   publish_use_youtube_cover: boolean;
 };
 
+type BiliTypeNode = { id: number; name: string; children?: BiliTypeNode[] };
+type BilibiliArchiveTypesResponse = { typelist: BiliTypeNode[] };
+type BilibiliTypeRecommendResponse = { ok: boolean; typeid?: number | null; path?: string | null; reason?: string; used_text?: string };
+
 export default function TaskDetailPage() {
   const { taskId } = useParams();
   const [task, setTask] = useState<Task | null>(null);
@@ -53,6 +58,7 @@ export default function TaskDetailPage() {
   const [subtitleFormats, setSubtitleFormats] = useState<{ srt: boolean; ass: boolean }>({ srt: true, ass: false });
   const [burnIn, setBurnIn] = useState(false);
   const [softSub, setSoftSub] = useState(false);
+  const [videoCodec, setVideoCodec] = useState("av1");
   const [asrEngine, setAsrEngine] = useState("auto");
   const [asrLanguage, setAsrLanguage] = useState("auto");
   const [asrModel, setAsrModel] = useState<string>("");
@@ -70,6 +76,12 @@ export default function TaskDetailPage() {
   const [publishVideoKey, setPublishVideoKey] = useState<string>("");
   const [publishCoverKey, setPublishCoverKey] = useState<string>("");
   const [coverFile, setCoverFile] = useState<File | null>(null);
+  const [publishTypeidMode, setPublishTypeidMode] = useState<string>("ai_summary");
+  const [publishTypeid, setPublishTypeid] = useState<number | "">("");
+  const [biliTypes, setBiliTypes] = useState<BiliTypeNode[] | null>(null);
+  const [biliTypesBusy, setBiliTypesBusy] = useState(false);
+  const [typeRecommendBusy, setTypeRecommendBusy] = useState(false);
+  const [typeRecommend, setTypeRecommend] = useState<BilibiliTypeRecommendResponse | null>(null);
   const [youtubeMeta, setYoutubeMeta] = useState<YouTubeMeta | null>(null);
   const [didAutoFillPublishMeta, setDidAutoFillPublishMeta] = useState(false);
   const [didAutoPickCover, setDidAutoPickCover] = useState(false);
@@ -105,6 +117,10 @@ export default function TaskDetailPage() {
     setPublishVideoKey("");
     setPublishCoverKey("");
     setCoverFile(null);
+    setPublishTypeidMode("ai_summary");
+    setPublishTypeid("");
+    setBiliTypes(null);
+    setTypeRecommend(null);
     setYoutubeMeta(null);
     setDidAutoFillPublishMeta(false);
     setDidAutoPickCover(false);
@@ -112,6 +128,11 @@ export default function TaskDetailPage() {
       .then((s) => {
         setPublishSettings(s);
         setPublishMetaText(JSON.stringify(s.default_meta ?? {}, null, 2));
+        try {
+          const meta = s.default_meta ?? {};
+          const tid = Number((meta as any)?.typeid ?? (meta as any)?.tid ?? 0);
+          if (Number.isFinite(tid) && tid > 0) setPublishTypeid(tid);
+        } catch {}
       })
       .catch(() => {
         setPublishSettings(null);
@@ -140,6 +161,7 @@ export default function TaskDetailPage() {
         });
         setBurnIn(Boolean(profile.burn_in));
         setSoftSub(Boolean(profile.soft_sub));
+        setVideoCodec((profile.video_codec || "av1").toLowerCase());
         setAsrEngine(profile.asr_engine || "auto");
         setAsrLanguage(profile.asr_language || "auto");
         setAsrModel((profile.asr_model ?? "").trim());
@@ -208,6 +230,38 @@ export default function TaskDetailPage() {
     return out.length > maxLen ? clampText(out, maxLen) : out;
   }
 
+  function flattenBiliTypeOptions(nodes: BiliTypeNode[] | null): Array<{ id: number; label: string }> {
+    const out: Array<{ id: number; label: string }> = [];
+    const walk = (node: BiliTypeNode, parents: string[]) => {
+      const name = String(node?.name ?? "").trim();
+      const next = name ? [...parents, name] : parents;
+      const children = Array.isArray(node?.children) ? node.children : [];
+      if (children.length) {
+        children.forEach((c) => walk(c, next));
+        return;
+      }
+      const id = Number(node?.id ?? 0);
+      if (!Number.isFinite(id) || id <= 0) return;
+      const label = next.filter(Boolean).join(" / ") || String(id);
+      out.push({ id, label });
+    };
+    (nodes ?? []).forEach((n) => walk(n, []));
+    return out;
+  }
+
+  function applyPublishTypeid(tid: number) {
+    if (!Number.isFinite(tid) || tid <= 0) return;
+    try {
+      const metaIn = JSON.parse(publishMetaText);
+      if (!metaIn || typeof metaIn !== "object" || Array.isArray(metaIn)) throw new Error("publish meta must be a JSON object");
+      const metaOut = { ...metaIn, typeid: tid };
+      setPublishMetaText(JSON.stringify(metaOut, null, 2));
+      setPublishTypeid(tid);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  }
+
   const fetchYouTubeMeta = useCallback(async () => {
     if (!taskId) return null;
     const resp = await fetchJson<YouTubeMetaActionResponse>(`${ORCHESTRATOR_URL}/tasks/${taskId}/actions/youtube_meta`, {
@@ -250,6 +304,14 @@ export default function TaskDetailPage() {
   const isYouTubeTask = task?.source_type === "youtube" && !!(task.source_url ?? "").trim();
 
   useEffect(() => {
+    try {
+      const meta = JSON.parse(publishMetaText);
+      const tid = Number((meta as any)?.typeid ?? (meta as any)?.tid ?? 0);
+      if (Number.isFinite(tid) && tid > 0) setPublishTypeid(tid);
+    } catch {}
+  }, [publishMetaText]);
+
+  useEffect(() => {
     if (!taskId) return;
     if (!isYouTubeTask) return;
     if (didAutoFillPublishMeta) return;
@@ -279,6 +341,48 @@ export default function TaskDetailPage() {
   }, [assets]);
   const finalAssets = useMemo(() => (assets ?? []).filter((x) => x.kind === "video_final"), [assets]);
   const coverAssets = useMemo(() => (assets ?? []).filter((x) => x.kind === "cover_image"), [assets]);
+  const biliTypeOptions = useMemo(() => flattenBiliTypeOptions(biliTypes), [biliTypes]);
+  const publishTypeLabel = useMemo(() => {
+    const tid = typeof publishTypeid === "number" ? publishTypeid : Number(publishTypeid);
+    if (!Number.isFinite(tid) || tid <= 0) return "";
+    return biliTypeOptions.find((o) => o.id === tid)?.label ?? String(tid);
+  }, [biliTypeOptions, publishTypeid]);
+
+  async function loadBilibiliTypes() {
+    setBiliTypesBusy(true);
+    setError(null);
+    try {
+      const resp = await fetchJson<BilibiliArchiveTypesResponse>(`${BILIBILI_PUBLISHER_URL}/bilibili/archive/types`);
+      setBiliTypes(Array.isArray(resp.typelist) ? resp.typelist : []);
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBiliTypesBusy(false);
+    }
+  }
+
+  async function recommendBilibiliTypeid() {
+    if (!taskId) return;
+    setTypeRecommendBusy(true);
+    setError(null);
+    setTypeRecommend(null);
+    try {
+      const resp = await fetchJson<BilibiliTypeRecommendResponse>(`${BILIBILI_PUBLISHER_URL}/bilibili/archive/type/recommend`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ task_id: taskId }),
+      });
+      setTypeRecommend(resp);
+      if (resp.ok && resp.typeid && Number(resp.typeid) > 0) {
+        applyPublishTypeid(Number(resp.typeid));
+        setPublishTypeidMode("meta");
+      }
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setTypeRecommendBusy(false);
+    }
+  }
 
   const shouldPoll = useMemo(() => {
     const hasSubtitleInFlight = (subtitleJobs ?? []).some((j) => j.status === "queued" || j.status === "running");
@@ -446,6 +550,16 @@ export default function TaskDetailPage() {
                 软字幕（mkv）
               </label>
             </div>
+            <div className="mt-3">
+              <label className="block">
+                <div className="mb-1 text-xs text-slate-600">video_codec（硬字幕输出编码）</div>
+                <select className="w-full rounded border px-3 py-2 text-sm" value={videoCodec} onChange={(e) => setVideoCodec(e.target.value)}>
+                  <option value="av1">av1（体积更小，编码更慢）</option>
+                  <option value="h264">h264（兼容更好，编码更快）</option>
+                </select>
+              </label>
+              <div className="mt-2 text-xs text-slate-500">提示：只有在启用 “硬字幕（burn-in）” 时才会用到该编码设置。</div>
+            </div>
           </div>
 
           <div className="rounded border p-3">
@@ -577,6 +691,7 @@ export default function TaskDetailPage() {
                     burn_in: burnIn,
                     soft_sub: softSub,
                     ass_style: "clean_white",
+                    video_codec: videoCodec,
                     asr_engine: asrEngine,
                     asr_language: asrLanguage,
                     asr_model: asrModel.trim() ? asrModel.trim() : null,
@@ -789,6 +904,68 @@ export default function TaskDetailPage() {
           </button>
         </div>
 
+        <div className="mt-3 rounded border p-3">
+          <div className="text-xs text-slate-500">分区（tid/typeid）</div>
+          <div className="mt-3 grid gap-2 md:grid-cols-2">
+            <label className="block">
+              <div className="mb-1 text-xs text-slate-600">typeid_mode</div>
+              <select
+                className="w-full rounded border px-3 py-2 text-sm"
+                value={publishTypeidMode}
+                onChange={(e) => setPublishTypeidMode(e.target.value)}
+              >
+                <option value="ai_summary">AI（根据字幕总结）</option>
+                <option value="bilibili_predict">B站预测（标题/文件）</option>
+                <option value="meta">手动（使用 meta.typeid）</option>
+              </select>
+            </label>
+
+            <label className="block">
+              <div className="mb-1 text-xs text-slate-600">typeid（手动选择）</div>
+              <select
+                className="w-full rounded border px-3 py-2 text-sm"
+                value={publishTypeid}
+                onChange={(e) => applyPublishTypeid(Number(e.target.value))}
+                disabled={publishTypeidMode !== "meta"}
+              >
+                <option value="">{publishTypeidMode !== "meta" ? "(切换为 手动 才可选择)" : "(请选择分区…)"}</option>
+                {biliTypeOptions.map((o) => (
+                  <option key={o.id} value={o.id}>
+                    {o.label} ({o.id})
+                  </option>
+                ))}
+              </select>
+              <div className="mt-2 text-xs text-slate-500">当前：{publishTypeLabel || "—"}</div>
+            </label>
+          </div>
+
+          <div className="mt-3 flex flex-wrap items-center gap-2">
+            <button
+              disabled={biliTypesBusy}
+              className="rounded border px-3 py-2 text-sm hover:bg-slate-50 disabled:opacity-50"
+              onClick={loadBilibiliTypes}
+            >
+              {biliTypesBusy ? "加载中…" : "加载分区列表"}
+            </button>
+            <button
+              disabled={typeRecommendBusy || !taskId}
+              className="rounded border px-3 py-2 text-sm hover:bg-slate-50 disabled:opacity-50"
+              onClick={recommendBilibiliTypeid}
+              title="使用字幕阶段生成的 summary 让 AI 推荐分区"
+            >
+              {typeRecommendBusy ? "分析中…" : "AI 推荐分区"}
+            </button>
+            {typeRecommend && !typeRecommend.ok ? (
+              <div className="text-xs text-rose-700">AI 推荐失败：{typeRecommend.reason || "unknown error"}</div>
+            ) : null}
+            {typeRecommend && typeRecommend.ok ? (
+              <div className="text-xs text-slate-600">
+                AI 推荐：{typeRecommend.path || typeRecommend.typeid}（{typeRecommend.typeid}）
+              </div>
+            ) : null}
+          </div>
+        </div>
+
         <div className="mt-3">
           <div className="mb-1 flex items-center justify-between gap-2 text-xs text-slate-600">
             <div>meta.json</div>
@@ -854,6 +1031,12 @@ export default function TaskDetailPage() {
                   publishSettings?.default_meta && typeof publishSettings.default_meta === "object" && !Array.isArray(publishSettings.default_meta)
                     ? { ...publishSettings.default_meta, ...metaIn }
                     : metaIn;
+                if (publishTypeidMode === "meta") {
+                  const tid = typeof publishTypeid === "number" ? publishTypeid : Number(publishTypeid);
+                  if (Number.isFinite(tid) && tid > 0) meta.typeid = tid;
+                }
+                if (typeof meta?.desc === "string" && meta.desc.length > 2000) meta.desc = clampText(meta.desc, 2000);
+                if (typeof meta?.title === "string" && meta.title.length > 80) meta.title = clampText(meta.title, 80);
                 const resp = await fetchJson<PublishResponse>(`${ORCHESTRATOR_URL}/tasks/${taskId}/actions/publish`, {
                   method: "POST",
                   headers: { "Content-Type": "application/json" },
@@ -861,6 +1044,7 @@ export default function TaskDetailPage() {
                     account_id: null,
                     video_key: publishVideoKey || null,
                     cover_key: publishCoverKey || null,
+                    typeid_mode: publishTypeidMode,
                     meta,
                   }),
                 });
@@ -893,6 +1077,7 @@ export default function TaskDetailPage() {
                     <th className="py-2 pr-3">ID</th>
                     <th className="py-2 pr-3">State</th>
                     <th className="py-2 pr-3">bvid</th>
+                    <th className="py-2 pr-3">Error</th>
                     <th className="py-2 pr-3">Updated</th>
                   </tr>
                 </thead>
@@ -902,6 +1087,15 @@ export default function TaskDetailPage() {
                       <td className="py-2 pr-3 font-mono text-xs">{j.id.slice(0, 8)}</td>
                       <td className="py-2 pr-3">{j.state}</td>
                       <td className="py-2 pr-3 font-mono text-xs">{j.bvid ?? "-"}</td>
+                      <td className="py-2 pr-3">
+                        {j.error_message ? (
+                          <div className="max-w-[36rem] truncate text-xs text-rose-700" title={j.error_message}>
+                            {j.error_message}
+                          </div>
+                        ) : (
+                          <span className="text-xs text-slate-400">-</span>
+                        )}
+                      </td>
                       <td className="py-2 pr-3 text-xs text-slate-600">{new Date(j.updated_at).toLocaleString()}</td>
                     </tr>
                   ))}

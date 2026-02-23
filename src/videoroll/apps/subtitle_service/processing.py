@@ -523,8 +523,24 @@ def segments_to_ass(segments: Iterable[Segment], style_name: str = "clean_white"
     )
 
 
-def render_burn_in(ffmpeg_path: str, video_path: Path, ass_path: Path, output_path: Path) -> None:
+def render_burn_in(
+    ffmpeg_path: str,
+    video_path: Path,
+    ass_path: Path,
+    output_path: Path,
+    *,
+    video_codec: str = "av1",
+) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    codec = str(video_codec or "").strip().lower() or "av1"
+
+    if codec in {"h264", "avc"}:
+        video_args = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "18"]
+    else:
+        # AV1 default: SVT-AV1, balanced preset and constant quality.
+        # Note: preset range is 0..13 (lower = slower/better).
+        video_args = ["-c:v", "libsvtav1", "-preset", "6", "-crf", "28"]
+
     cmd = [
         ffmpeg_path,
         "-y",
@@ -532,12 +548,7 @@ def render_burn_in(ffmpeg_path: str, video_path: Path, ass_path: Path, output_pa
         str(video_path),
         "-vf",
         f"ass={ass_path}",
-        "-c:v",
-        "libx264",
-        "-preset",
-        "veryfast",
-        "-crf",
-        "18",
+        *video_args,
         "-c:a",
         "copy",
         str(output_path),

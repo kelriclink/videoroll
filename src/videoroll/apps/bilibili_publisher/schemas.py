@@ -7,6 +7,15 @@ from typing import Any, Literal, Optional
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
+def _clamp_text(text: str, max_len: int) -> str:
+    s = str(text or "").strip()
+    if len(s) <= max_len:
+        return s
+    if max_len <= 1:
+        return s[:max_len]
+    return s[: max_len - 1] + "…"
+
+
 class BilibiliSubtitle(BaseModel):
     # NOTE: B 站 Web 投稿接口里 open=0 表示启用字幕投稿，open=1 表示不启用。
     open: int = 0
@@ -105,7 +114,7 @@ class BilibiliPublishMeta(BaseModel):
         if len(self.title) > 80:
             raise ValueError("meta.title too long (max 80)")
         if len(self.desc) > 2000:
-            raise ValueError("meta.desc too long (max 2000)")
+            self.desc = _clamp_text(self.desc, 2000)
         if not isinstance(self.typeid, int) or self.typeid <= 0:
             raise ValueError("meta.typeid/tid must be a positive integer")
 
@@ -178,9 +187,35 @@ class InputRef(BaseModel):
 class PublishRequest(BaseModel):
     task_id: uuid.UUID
     account_id: Optional[str] = None
+    typeid_mode: Literal["meta", "bilibili_predict", "ai_summary"] = "bilibili_predict"
     video: InputRef
     cover: Optional[InputRef] = None
     meta: BilibiliPublishMeta
+
+
+class BilibiliTypeNode(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    id: int
+    name: str
+    children: list["BilibiliTypeNode"] = Field(default_factory=list)
+
+
+class BilibiliArchiveTypesRead(BaseModel):
+    typelist: list[BilibiliTypeNode] = Field(default_factory=list)
+
+
+class BilibiliTypeRecommendRequest(BaseModel):
+    task_id: Optional[uuid.UUID] = None
+    text: Optional[str] = None
+
+
+class BilibiliTypeRecommendResponse(BaseModel):
+    ok: bool
+    typeid: Optional[int] = None
+    path: Optional[str] = None
+    reason: str = ""
+    used_text: str = ""
 
 
 class PublishResponse(BaseModel):

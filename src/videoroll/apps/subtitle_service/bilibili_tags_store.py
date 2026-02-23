@@ -37,6 +37,14 @@ def get_task_bilibili_tags(db: Session, task_id: str) -> list[str]:
     return out
 
 
+def get_task_bilibili_summary(db: Session, task_id: str) -> str:
+    row = db.get(AppSetting, _key(task_id))
+    if not row:
+        return ""
+    data = _as_dict(row.value_json)
+    return str(data.get("summary") or "").strip()
+
+
 def set_task_bilibili_tags(
     db: Session,
     task_id: str,
@@ -73,4 +81,3 @@ def set_task_bilibili_tags(
     row.value_json = payload
     db.add(row)
     db.commit()
-

@@ -13,6 +13,7 @@ _ALLOWED_FORMATS = {"srt", "ass"}
 _ALLOWED_ASR_ENGINES = {"auto", "mock", "faster-whisper"}
 _ALLOWED_TRANSLATE_PROVIDERS = {"mock", "noop", "openai"}
 _ALLOWED_ASS_STYLES = {"clean_white"}
+_ALLOWED_VIDEO_CODECS = {"av1", "h264"}
 
 
 def _default_profile() -> dict[str, Any]:
@@ -21,6 +22,7 @@ def _default_profile() -> dict[str, Any]:
         "burn_in": True,
         "soft_sub": False,
         "ass_style": "clean_white",
+        "video_codec": "av1",
         "asr_engine": "auto",
         "asr_language": "auto",
         "asr_model": None,
@@ -63,6 +65,11 @@ def _normalize_formats(val: Any, *, fallback: list[str]) -> list[str]:
     return out or fallback
 
 
+def _normalize_video_codec(val: Any, *, fallback: str) -> str:
+    s = str(val or "").strip().lower()
+    return s if s in _ALLOWED_VIDEO_CODECS else fallback
+
+
 def get_auto_profile(db: Session) -> dict[str, Any]:
     row = db.get(AppSetting, AUTO_PROFILE_KEY)
     stored = dict(_as_dict(row.value_json)) if row else {}
@@ -75,6 +82,8 @@ def get_auto_profile(db: Session) -> dict[str, Any]:
 
     ass_style = str(merged.get("ass_style") or baseline["ass_style"]).strip() or baseline["ass_style"]
     merged["ass_style"] = ass_style if ass_style in _ALLOWED_ASS_STYLES else baseline["ass_style"]
+
+    merged["video_codec"] = _normalize_video_codec(merged.get("video_codec"), fallback=baseline["video_codec"])
 
     asr_engine = str(merged.get("asr_engine") or baseline["asr_engine"]).strip() or baseline["asr_engine"]
     merged["asr_engine"] = asr_engine if asr_engine in _ALLOWED_ASR_ENGINES else baseline["asr_engine"]
@@ -111,7 +120,7 @@ def update_auto_profile(db: Session, update: dict[str, Any]) -> dict[str, Any]:
         if k in update and update[k] is not None:
             stored[k] = bool(update[k])
 
-    for k in ["ass_style", "asr_engine", "asr_language", "translate_provider", "target_lang", "translate_style", "publish_title_prefix"]:
+    for k in ["ass_style", "video_codec", "asr_engine", "asr_language", "translate_provider", "target_lang", "translate_style", "publish_title_prefix"]:
         if k in update and update[k] is not None:
             stored[k] = update[k]
 
@@ -123,4 +132,3 @@ def update_auto_profile(db: Session, update: dict[str, Any]) -> dict[str, Any]:
     db.add(row)
     db.commit()
     return get_auto_profile(db)
-

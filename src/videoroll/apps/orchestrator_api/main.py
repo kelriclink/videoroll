@@ -10,12 +10,12 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Generator, Optional
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 import httpx
-from fastapi import Depends, FastAPI, File, HTTPException, Query, UploadFile
+from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
@@ -59,6 +59,7 @@ from videoroll.apps.orchestrator_api.storage_retention_store import (
     update_storage_retention_settings,
 )
 from videoroll.apps.subtitle_service.bilibili_tags_store import get_task_bilibili_tags
+from videoroll.apps.subtitle_service.task_title_store import get_task_display_title
 from videoroll.apps.youtube_settings_store import get_youtube_settings, update_youtube_settings
 
 
@@ -86,6 +87,31 @@ def _as_dict(v: Any) -> dict[str, Any]:
     return v if isinstance(v, dict) else {}
 
 
+def _publish_job_error_message(job: PublishJob) -> str | None:
+    data = _as_dict(job.response_json)
+    if not data:
+        return None
+
+    msg = str(data.get("error") or data.get("message") or data.get("detail") or "").strip()
+    if not msg:
+        return None
+
+    extras: list[str] = []
+    for k in ["code", "status_code", "v_voucher"]:
+        v = data.get(k)
+        if v is None:
+            continue
+        s = str(v).strip()
+        if s:
+            extras.append(f"{k}={s}")
+    if extras:
+        msg = f"{msg} ({', '.join(extras)})"
+
+    if len(msg) > 500:
+        msg = msg[:499] + "…"
+    return msg
+
+
 def _normalize_tags(v: Any) -> list[str]:
     if v is None:
         return []
@@ -101,6 +127,93 @@ def _normalize_tags(v: Any) -> list[str]:
         return out
     s = str(v or "").strip()
     return [s] if s else []
+
+
+def _clean_download_filename(name: str, *, max_len: int = 120) -> str:
+    s = str(name or "").replace("\r", " ").replace("\n", " ").strip()
+    s = s.replace("/", " ").replace("\\", " ")
+    s = s.replace('"', "'")
+    s = " ".join(s.split())
+    if not s:
+        return "download.bin"
+    if len(s) > max_len:
+        s = s[: max_len - 1] + "…"
+    return s
+
+
+def _content_disposition(filename: str, *, inline: bool) -> str:
+    disp = "inline" if inline else "attachment"
+    fn = _clean_download_filename(filename)
+
+    # ASCII fallback for legacy clients.
+    fallback = "".join(c if 32 <= ord(c) < 127 else "_" for c in fn)
+    fallback = fallback.replace("\\", "_").replace('"', "_").strip() or "download.bin"
+    encoded = quote(fn, safe="")
+    return f"{disp}; filename=\"{fallback}\"; filename*=UTF-8''{encoded}"
+
+
+def _suggest_asset_filename(db: Session, task_id: uuid.UUID, asset: Asset) -> str:
+    base = Path(asset.storage_key).name or "download.bin"
+    if asset.kind == AssetKind.video_final:
+        title = get_task_display_title(db, str(task_id)).strip()
+        if title:
+            ext = Path(base).suffix
+            if ext and len(ext) <= 8:
+                return f"{title}{ext}"
+            return title
+    return base
+
+
+def _parse_range_header(range_header: str, total_size: int) -> tuple[int, int] | None:
+    """
+    Supports a single range of the form:
+      - bytes=start-end
+      - bytes=start-
+      - bytes=-suffix_len
+    Returns (start, end) inclusive.
+    """
+    if total_size <= 0:
+        return None
+    raw = str(range_header or "").strip().lower()
+    if not raw.startswith("bytes="):
+        return None
+    spec = raw[len("bytes=") :].split(",")[0].strip()
+    if not spec:
+        return None
+    if spec.startswith("-"):
+        try:
+            suffix_len = int(spec[1:])
+        except Exception:
+            return None
+        if suffix_len <= 0:
+            return None
+        end = total_size - 1
+        start = max(0, total_size - suffix_len)
+        return start, end
+
+    if "-" not in spec:
+        return None
+    start_s, end_s = spec.split("-", 1)
+    try:
+        start = int(start_s)
+    except Exception:
+        return None
+    if start < 0:
+        return None
+
+    if end_s.strip() == "":
+        end = total_size - 1
+    else:
+        try:
+            end = int(end_s)
+        except Exception:
+            return None
+    if end < start:
+        return None
+    if start >= total_size:
+        return None
+    end = min(end, total_size - 1)
+    return start, end
 
 
 def _youtube_meta_to_read(meta: Any) -> YouTubeMetaRead:
@@ -353,7 +466,8 @@ def list_converted_videos(
             .order_by(Asset.created_at.desc())
             .first()
         )
-        items.append({"task": task, "final_asset": a, "cover_asset": cover_asset})
+        display_title = get_task_display_title(db, str(a.task_id))
+        items.append({"task": task, "final_asset": a, "cover_asset": cover_asset, "display_title": display_title or None})
         if len(items) >= limit:
             break
     return items
@@ -586,13 +700,74 @@ def download_task_asset(
     resp = s3.get_object(asset.storage_key)
     body = resp["Body"]
     media_type = resp.get("ContentType") or "application/octet-stream"
-    filename = Path(asset.storage_key).name or "download.bin"
+    filename = _suggest_asset_filename(db, task_id, asset)
 
-    headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
+    headers = {"Content-Disposition": _content_disposition(filename, inline=False)}
     length = resp.get("ContentLength") or asset.size_bytes
     if isinstance(length, int):
         headers["Content-Length"] = str(length)
 
+    return StreamingResponse(S3Store.iter_body(body), media_type=media_type, headers=headers)
+
+
+@app.get("/tasks/{task_id}/assets/{asset_id}/stream")
+def stream_task_asset(
+    task_id: uuid.UUID,
+    asset_id: uuid.UUID,
+    request: Request,
+    db: Session = Depends(get_db),
+    s3: S3Store = Depends(get_s3),
+) -> StreamingResponse:
+    asset = db.get(Asset, asset_id)
+    if not asset or asset.task_id != task_id:
+        raise HTTPException(status_code=404, detail="asset not found")
+
+    filename = _suggest_asset_filename(db, task_id, asset)
+
+    total_size: int | None = None
+    media_type = "application/octet-stream"
+    try:
+        head = s3.head_object(asset.storage_key)
+        if isinstance(head.get("ContentLength"), int):
+            total_size = int(head["ContentLength"])
+        if head.get("ContentType"):
+            media_type = str(head["ContentType"]) or media_type
+    except Exception:
+        total_size = asset.size_bytes if isinstance(asset.size_bytes, int) else None
+
+    base_headers = {
+        "Accept-Ranges": "bytes",
+        "Content-Disposition": _content_disposition(filename, inline=True),
+    }
+
+    range_header = request.headers.get("range") or ""
+    if range_header and isinstance(total_size, int) and total_size > 0:
+        parsed = _parse_range_header(range_header, total_size)
+        if not parsed:
+            return Response(status_code=416, headers={"Content-Range": f"bytes */{total_size}"})
+        start, end = parsed
+
+        resp = s3.get_object(asset.storage_key, range_bytes=f"bytes={start}-{end}")
+        body = resp["Body"]
+        headers = {
+            **base_headers,
+            "Content-Range": f"bytes {start}-{end}/{total_size}",
+            "Content-Length": str(end - start + 1),
+        }
+        return StreamingResponse(
+            S3Store.iter_body(body),
+            status_code=206,
+            media_type=media_type,
+            headers=headers,
+        )
+
+    resp = s3.get_object(asset.storage_key)
+    body = resp["Body"]
+    media_type = resp.get("ContentType") or media_type
+    headers = dict(base_headers)
+    length = resp.get("ContentLength") or asset.size_bytes
+    if isinstance(length, int):
+        headers["Content-Length"] = str(length)
     return StreamingResponse(S3Store.iter_body(body), media_type=media_type, headers=headers)
 
 
@@ -813,10 +988,25 @@ def list_task_subtitle_jobs(task_id: uuid.UUID, limit: int = Query(default=50, g
 
 
 @app.get("/tasks/{task_id}/publish_jobs", response_model=list[PublishJobSummary])
-def list_task_publish_jobs(task_id: uuid.UUID, limit: int = Query(default=50, ge=1, le=500), db: Session = Depends(get_db)) -> list[PublishJob]:
+def list_task_publish_jobs(task_id: uuid.UUID, limit: int = Query(default=50, ge=1, le=500), db: Session = Depends(get_db)) -> list[dict[str, Any]]:
     if not db.get(Task, task_id):
         raise HTTPException(status_code=404, detail="task not found")
-    return db.query(PublishJob).filter(PublishJob.task_id == task_id).order_by(PublishJob.created_at.desc()).limit(limit).all()
+    jobs = db.query(PublishJob).filter(PublishJob.task_id == task_id).order_by(PublishJob.created_at.desc()).limit(limit).all()
+    out: list[dict[str, Any]] = []
+    for j in jobs:
+        out.append(
+            {
+                "id": j.id,
+                "task_id": j.task_id,
+                "state": j.state.value,
+                "aid": j.aid,
+                "bvid": j.bvid,
+                "error_message": _publish_job_error_message(j),
+                "created_at": j.created_at,
+                "updated_at": j.updated_at,
+            }
+        )
+    return out
 
 
 @app.post("/tasks/{task_id}/actions/subtitle", response_model=RemoteJobResponse)
@@ -862,7 +1052,12 @@ def enqueue_subtitle_job(
         "translate": translate,
         "output": {
             "formats": payload.formats,
-            "render": {"burn_in": payload.burn_in, "soft_sub": payload.soft_sub, "ass_style": payload.ass_style},
+            "render": {
+                "burn_in": payload.burn_in,
+                "soft_sub": payload.soft_sub,
+                "ass_style": payload.ass_style,
+                "video_codec": payload.video_codec,
+            },
         },
         "output_prefix": f"sub/{task_id}/",
     }
@@ -937,6 +1132,9 @@ def enqueue_publish_job(
         "cover": {"type": "s3", "key": payload.cover_key} if payload.cover_key else None,
         "meta": meta,
     }
+    typeid_mode = str(payload.typeid_mode or "").strip()
+    if typeid_mode:
+        req["typeid_mode"] = typeid_mode
 
     try:
         with httpx.Client(timeout=30.0) as client:

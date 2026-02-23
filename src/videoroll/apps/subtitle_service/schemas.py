@@ -33,6 +33,7 @@ class RenderOptions(BaseModel):
     burn_in: bool = False
     soft_sub: bool = False
     ass_style: str = "clean_white"
+    video_codec: str = "av1"
 
 
 class OutputOptions(BaseModel):
@@ -89,6 +90,7 @@ class SubtitleAutoProfileRead(BaseModel):
     burn_in: bool = True
     soft_sub: bool = False
     ass_style: str = "clean_white"
+    video_codec: str = "av1"
 
     asr_engine: str = "auto"
     asr_language: str = "auto"
@@ -112,6 +114,7 @@ class SubtitleAutoProfileUpdate(BaseModel):
     burn_in: Optional[bool] = None
     soft_sub: Optional[bool] = None
     ass_style: Optional[str] = None
+    video_codec: Optional[str] = None
 
     asr_engine: Optional[str] = None
     asr_language: Optional[str] = None
@@ -135,6 +138,7 @@ class TranslateSettingsRead(BaseModel):
     default_target_lang: str
     default_style: str
     default_batch_size: int
+    default_max_retries: int
     default_enable_summary: bool
 
     openai_api_key_set: bool
@@ -149,6 +153,7 @@ class TranslateSettingsUpdate(BaseModel):
     default_target_lang: Optional[str] = None
     default_style: Optional[str] = None
     default_batch_size: Optional[int] = None
+    default_max_retries: Optional[int] = None
     default_enable_summary: Optional[bool] = None
 
     # Secrets are never returned from the API. If set to "" it clears the stored key.

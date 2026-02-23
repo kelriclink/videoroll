@@ -59,6 +59,7 @@ export type PublishJob = {
   state: string;
   aid?: string | null;
   bvid?: string | null;
+  error_message?: string | null;
   created_at: string;
   updated_at: string;
 };
@@ -73,4 +74,3 @@ export type YouTubeSource = {
   created_at: string;
   updated_at: string;
 };
-

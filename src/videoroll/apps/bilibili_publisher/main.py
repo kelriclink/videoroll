@@ -11,17 +11,22 @@ from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 
-from videoroll.config import BilibiliPublisherSettings, get_bilibili_publisher_settings
+from videoroll.config import BilibiliPublisherSettings, get_bilibili_publisher_settings, get_subtitle_settings
 from videoroll.db.base import Base
 from videoroll.db.models import Asset, AssetKind, PublishJob, PublishState, Task, TaskStatus
 from videoroll.db.session import db_session, get_engine
 from videoroll.storage.s3 import S3Store
 from videoroll.apps.bilibili_publisher.auth_settings_store import get_bilibili_auth_settings, get_bilibili_cookie_header, update_bilibili_auth_settings
+from videoroll.apps.bilibili_publisher.bilibili_web_client import BilibiliWebClient
+from videoroll.apps.bilibili_publisher.typeid_recommender import flatten_typelist, recommend_typeid_openai
 from videoroll.apps.bilibili_publisher.publish_settings_store import get_bilibili_publish_settings, update_bilibili_publish_settings
 from videoroll.apps.bilibili_publisher.worker import celery_app
 from videoroll.apps.bilibili_publisher.schemas import (
     BilibiliAuthSettingsRead,
     BilibiliAuthSettingsUpdate,
+    BilibiliArchiveTypesRead,
+    BilibiliTypeRecommendRequest,
+    BilibiliTypeRecommendResponse,
     BilibiliMeRead,
     BilibiliPublishSettingsRead,
     BilibiliPublishSettingsUpdate,
@@ -29,6 +34,8 @@ from videoroll.apps.bilibili_publisher.schemas import (
     PublishRequest,
     PublishResponse,
 )
+from videoroll.apps.subtitle_service.bilibili_tags_store import get_task_bilibili_summary
+from videoroll.apps.subtitle_service.translate_settings_store import get_translate_settings
 
 
 def get_settings() -> BilibiliPublisherSettings:
@@ -65,6 +72,85 @@ def _startup() -> None:
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/bilibili/archive/types", response_model=BilibiliArchiveTypesRead)
+def get_archive_types(db: Session = Depends(get_db)) -> BilibiliArchiveTypesRead:
+    cookie = get_bilibili_cookie_header(db).strip()
+    if not cookie:
+        raise HTTPException(status_code=400, detail="bilibili cookie is not set")
+
+    try:
+        with BilibiliWebClient(cookie) as client:
+            pre = client.archive_pre()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"bilibili request failed: {e}") from e
+
+    data = pre.get("data") if isinstance(pre, dict) else {}
+    data = data if isinstance(data, dict) else {}
+    typelist = data.get("typelist") if isinstance(data.get("typelist"), list) else []
+    return BilibiliArchiveTypesRead(typelist=typelist)
+
+
+@app.post("/bilibili/archive/type/recommend", response_model=BilibiliTypeRecommendResponse)
+def recommend_archive_type(
+    payload: BilibiliTypeRecommendRequest,
+    settings: BilibiliPublisherSettings = Depends(get_settings),
+    db: Session = Depends(get_db),
+) -> BilibiliTypeRecommendResponse:
+    cookie = get_bilibili_cookie_header(db).strip()
+    if not cookie:
+        raise HTTPException(status_code=400, detail="bilibili cookie is not set")
+    translate_settings = get_translate_settings(db, get_subtitle_settings())
+    if not translate_settings.get("openai_api_key"):
+        raise HTTPException(status_code=400, detail="OpenAI API key is not set (save it in Settings · Translate)")
+
+    text = get_task_bilibili_summary(db, str(payload.task_id)) if payload.task_id else ""
+    if not text:
+        text = str(payload.text or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="missing text (and no task summary found)")
+    if len(text) > 2000:
+        text = text[:1999] + "…"
+
+    try:
+        with BilibiliWebClient(cookie) as client:
+            pre = client.archive_pre()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"bilibili request failed: {e}") from e
+
+    data = pre.get("data") if isinstance(pre, dict) else {}
+    data = data if isinstance(data, dict) else {}
+    typelist = data.get("typelist") if isinstance(data.get("typelist"), list) else []
+    options = flatten_typelist(typelist)
+    if not options:
+        raise HTTPException(status_code=502, detail="bilibili typelist is empty")
+
+    by_id = {int(o.get("id") or 0): str(o.get("path") or "").strip() for o in options}
+    by_id = {k: v for k, v in by_id.items() if k > 0 and v}
+
+    try:
+        obj = recommend_typeid_openai(
+            text,
+            options=options,
+            api_key=str(translate_settings.get("openai_api_key") or ""),
+            base_url=str(translate_settings.get("openai_base_url") or ""),
+            model=str(translate_settings.get("openai_model") or ""),
+            temperature=float(translate_settings.get("openai_temperature") or 0.0),
+            timeout_seconds=float(translate_settings.get("openai_timeout_seconds") or 30.0),
+        )
+        try:
+            tid = int(obj.get("typeid") or 0)
+        except Exception:
+            tid = 0
+        reason = str(obj.get("reason") or "").strip()
+    except Exception as e:
+        return BilibiliTypeRecommendResponse(ok=False, reason=str(e), used_text=text)
+
+    if tid <= 0 or tid not in by_id:
+        return BilibiliTypeRecommendResponse(ok=False, reason="typeid not in candidate list", used_text=text)
+
+    return BilibiliTypeRecommendResponse(ok=True, typeid=tid, path=by_id.get(tid), reason=reason, used_text=text)
 
 
 @app.get("/bilibili/publish/settings", response_model=BilibiliPublishSettingsRead)
@@ -149,6 +235,7 @@ def publish(payload: PublishRequest, settings: BilibiliPublisherSettings = Depen
             "meta": payload.meta.model_dump(),
             "video": payload.video.model_dump(),
             "account_id": payload.account_id,
+            "typeid_mode": payload.typeid_mode,
         },
         cover_key=payload.cover.key if payload.cover else None,
         state=PublishState.submitting,

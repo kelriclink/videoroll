@@ -46,6 +46,7 @@ def get_translate_settings(db: Session, defaults: SubtitleServiceSettings) -> di
         "default_target_lang": str(stored.get("default_target_lang") or defaults.translate_default_target_lang),
         "default_style": str(stored.get("default_style") or defaults.translate_default_style),
         "default_batch_size": int(stored.get("default_batch_size") or defaults.translate_batch_size),
+        "default_max_retries": int(stored.get("default_max_retries") or defaults.translate_max_retries),
         "default_enable_summary": bool(
             stored.get("default_enable_summary") if "default_enable_summary" in stored else defaults.translate_enable_summary
         ),
@@ -62,7 +63,14 @@ def update_translate_settings(db: Session, defaults: SubtitleServiceSettings, up
     row = _get_row(db)
     stored = dict(_as_dict(row.value_json))
 
-    for key in ["default_provider", "default_target_lang", "default_style", "default_batch_size", "default_enable_summary"]:
+    for key in [
+        "default_provider",
+        "default_target_lang",
+        "default_style",
+        "default_batch_size",
+        "default_max_retries",
+        "default_enable_summary",
+    ]:
         if key not in update:
             continue
         val = update.get(key)
@@ -107,6 +115,11 @@ def update_translate_settings(db: Session, defaults: SubtitleServiceSettings, up
             stored["default_batch_size"] = max(1, int(stored["default_batch_size"]))
     except Exception:
         stored["default_batch_size"] = defaults.translate_batch_size
+    try:
+        if "default_max_retries" in stored and stored["default_max_retries"] is not None:
+            stored["default_max_retries"] = max(0, min(10, int(stored["default_max_retries"])))
+    except Exception:
+        stored["default_max_retries"] = defaults.translate_max_retries
     try:
         if "openai_temperature" in update and update["openai_temperature"] is not None:
             openai["temperature"] = float(openai.get("temperature"))

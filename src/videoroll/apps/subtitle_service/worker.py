@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import shutil
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -45,6 +46,7 @@ from videoroll.apps.subtitle_service.processing import (
 from videoroll.apps.subtitle_service.asr_settings_store import get_asr_settings
 from videoroll.apps.subtitle_service.auto_profile_store import get_auto_profile
 from videoroll.apps.subtitle_service.bilibili_tags_store import set_task_bilibili_tags
+from videoroll.apps.subtitle_service.task_title_store import set_task_titles
 from videoroll.apps.subtitle_service.translate_settings_store import get_translate_settings
 from videoroll.apps.bilibili_publisher.publish_settings_store import get_bilibili_publish_settings
 from videoroll.utils.hf_hub import configure_hf_hub_proxy
@@ -419,27 +421,75 @@ def process_job(job_id: str) -> dict[str, str]:
             batch_size = int(translate_cfg.get("batch_size") or translate_settings["default_batch_size"])
             enable_summary_val = translate_cfg.get("enable_summary")
             enable_summary = translate_settings["default_enable_summary"] if enable_summary_val is None else bool(enable_summary_val)
-            if provider == "mock":
-                segments_out = translate_segments_mock(segments, target_lang=target_lang)
-            elif provider in {"noop", "none"}:
-                segments_out = segments
-            elif provider == "openai":
-                segments_out, translation_summary = translate_segments_openai_with_summary(
-                    segments,
-                    target_lang=target_lang,
-                    style=style,
-                    api_key=translate_settings["openai_api_key"],
-                    base_url=translate_settings["openai_base_url"],
-                    model=translate_settings["openai_model"],
-                    temperature=translate_settings["openai_temperature"],
-                    timeout_seconds=translate_settings["openai_timeout_seconds"],
-                    batch_size=batch_size,
-                    enable_summary=enable_summary,
-                )
-            else:
-                raise ValueError(f"unsupported translate provider: {provider}")
+
+            max_retries = int(translate_settings.get("default_max_retries") or 0)
+
+            def _is_retryable_translate_error(err: Exception) -> bool:
+                msg = str(err or "")
+                if "api key is not set" in msg.lower():
+                    return False
+                return True
+
+            def _sleep_retry(attempt: int) -> None:
+                # Exponential backoff: 2s, 4s, 8s... capped at 30s.
+                delay = min(30.0, float(2 ** max(0, attempt)))
+                time.sleep(delay)
+
+            attempt = 0
+            while True:
+                try:
+                    if provider == "mock":
+                        segments_out = translate_segments_mock(segments, target_lang=target_lang)
+                    elif provider in {"noop", "none"}:
+                        segments_out = segments
+                    elif provider == "openai":
+                        segments_out, translation_summary = translate_segments_openai_with_summary(
+                            segments,
+                            target_lang=target_lang,
+                            style=style,
+                            api_key=translate_settings["openai_api_key"],
+                            base_url=translate_settings["openai_base_url"],
+                            model=translate_settings["openai_model"],
+                            temperature=translate_settings["openai_temperature"],
+                            timeout_seconds=translate_settings["openai_timeout_seconds"],
+                            batch_size=batch_size,
+                            enable_summary=enable_summary,
+                        )
+                    else:
+                        raise ValueError(f"unsupported translate provider: {provider}")
+                    job.error_message = None
+                    db.add(job)
+                    db.commit()
+                    break
+                except Exception as e:
+                    if provider != "openai" or attempt >= max_retries or not _is_retryable_translate_error(e):
+                        raise
+                    attempt += 1
+                    job.error_message = f"translate failed; retrying ({attempt}/{max_retries}): {e}"
+                    db.add(job)
+                    db.commit()
+                    _sleep_retry(attempt)
             task.status = TaskStatus.translated
             db.add(task)
+
+            # Best-effort: store translated title for UI display / downloads.
+            try:
+                title_src = _latest_youtube_title(db, store, task.id)
+                if title_src:
+                    title_out = title_src
+                    if provider == "openai" and not _has_cjk(title_src):
+                        try:
+                            title_out = _translate_title_openai(
+                                title_src,
+                                target_lang=target_lang,
+                                style=style,
+                                translate_settings=translate_settings,
+                            )
+                        except Exception:
+                            title_out = title_src
+                    set_task_titles(db, str(task.id), source_title=title_src, translated_title=title_out)
+            except Exception:
+                pass
 
             # Best-effort: generate Bilibili tags from translation summary + transcript excerpt.
             try:
@@ -506,13 +556,14 @@ def process_job(job_id: str) -> dict[str, str]:
         render_cfg = ((req.get("output") or {}).get("render") or {})
         burn_in = bool(render_cfg.get("burn_in"))
         soft_sub = bool(render_cfg.get("soft_sub"))
+        video_codec = str(render_cfg.get("video_codec") or "av1").strip().lower() or "av1"
 
         if burn_in:
             if not ass_path.exists():
                 ass_text = segments_to_ass(segments_out, style_name=render_cfg.get("ass_style", "clean_white"))
                 ass_path.write_text(ass_text, encoding="utf-8")
             out_video = work_root / "video_burnin.mp4"
-            render_burn_in(settings.ffmpeg_path, video_path, ass_path, out_video)
+            render_burn_in(settings.ffmpeg_path, video_path, ass_path, out_video, video_codec=video_codec)
             final_key = f"final/{task.id}/video_burnin.mp4"
             store.upload_file(out_video, final_key, content_type="video/mp4")
             db.add(
@@ -660,6 +711,7 @@ def auto_youtube_pipeline(task_id: str) -> dict[str, str]:
                         "burn_in": bool(profile.get("burn_in")),
                         "soft_sub": bool(profile.get("soft_sub")),
                         "ass_style": profile.get("ass_style") or "clean_white",
+                        "video_codec": profile.get("video_codec") or "av1",
                     },
                 },
                 "output_prefix": f"sub/{tid}/",
@@ -719,6 +771,7 @@ def auto_youtube_pipeline(task_id: str) -> dict[str, str]:
                 "account_id": None,
                 "video_key": final_asset.storage_key,
                 "cover_key": cover_key,
+                "typeid_mode": "ai_summary",
                 "meta": meta,
             }
 

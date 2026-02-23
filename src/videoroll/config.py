@@ -54,6 +54,7 @@ class SubtitleServiceSettings(CommonSettings):
     translate_default_style: str = Field("口语自然", alias="SUBTITLE_TRANSLATE_DEFAULT_STYLE")
     translate_batch_size: int = Field(50, alias="SUBTITLE_TRANSLATE_BATCH_SIZE")
     translate_enable_summary: bool = Field(True, alias="SUBTITLE_TRANSLATE_ENABLE_SUMMARY")
+    translate_max_retries: int = Field(2, alias="SUBTITLE_TRANSLATE_MAX_RETRIES")
 
     openai_api_key: str | None = Field(None, alias="OPENAI_API_KEY")
     openai_base_url: str = Field("https://api.openai.com/v1", alias="OPENAI_BASE_URL")

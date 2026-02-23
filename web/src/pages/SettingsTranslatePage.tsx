@@ -7,6 +7,7 @@ type TranslateSettings = {
   default_target_lang: string;
   default_style: string;
   default_batch_size: number;
+  default_max_retries: number;
   default_enable_summary: boolean;
 
   openai_api_key_set: boolean;
@@ -25,6 +26,7 @@ export default function SettingsTranslatePage() {
   const [defaultTargetLang, setDefaultTargetLang] = useState("zh");
   const [defaultStyle, setDefaultStyle] = useState("口语自然");
   const [defaultBatchSize, setDefaultBatchSize] = useState(50);
+  const [defaultMaxRetries, setDefaultMaxRetries] = useState(2);
   const [defaultEnableSummary, setDefaultEnableSummary] = useState(true);
 
   const [openaiBaseUrl, setOpenaiBaseUrl] = useState("https://api.openai.com/v1");
@@ -47,6 +49,7 @@ export default function SettingsTranslatePage() {
       setDefaultTargetLang(s.default_target_lang);
       setDefaultStyle(s.default_style);
       setDefaultBatchSize(s.default_batch_size);
+      setDefaultMaxRetries(s.default_max_retries ?? 0);
       setDefaultEnableSummary(s.default_enable_summary);
       setOpenaiBaseUrl(s.openai_base_url);
       setOpenaiModel(s.openai_model);
@@ -99,6 +102,10 @@ export default function SettingsTranslatePage() {
               <div className="text-xs text-slate-500">default_batch_size</div>
               <div className="mt-1 font-mono text-sm">{settings.default_batch_size}</div>
             </div>
+            <div className="rounded border p-3">
+              <div className="text-xs text-slate-500">default_max_retries</div>
+              <div className="mt-1 font-mono text-sm">{settings.default_max_retries}</div>
+            </div>
             <div className="rounded border p-3 md:col-span-2">
               <div className="text-xs text-slate-500">default_enable_summary</div>
               <div className="mt-1 text-sm">{settings.default_enable_summary ? "true" : "false"}</div>
@@ -148,6 +155,18 @@ export default function SettingsTranslatePage() {
               className="w-full rounded border px-3 py-2 text-sm"
               value={defaultBatchSize}
               onChange={(e) => setDefaultBatchSize(parseInt(e.target.value || "1", 10))}
+            />
+          </label>
+
+          <label className="block">
+            <div className="mb-1 text-xs text-slate-600">default_max_retries</div>
+            <input
+              type="number"
+              min={0}
+              max={10}
+              className="w-full rounded border px-3 py-2 text-sm"
+              value={defaultMaxRetries}
+              onChange={(e) => setDefaultMaxRetries(parseInt(e.target.value || "0", 10))}
             />
           </label>
 
@@ -223,6 +242,7 @@ export default function SettingsTranslatePage() {
                   default_target_lang: defaultTargetLang,
                   default_style: defaultStyle,
                   default_batch_size: defaultBatchSize,
+                  default_max_retries: defaultMaxRetries,
                   default_enable_summary: defaultEnableSummary,
                   openai_base_url: openaiBaseUrl,
                   openai_model: openaiModel,

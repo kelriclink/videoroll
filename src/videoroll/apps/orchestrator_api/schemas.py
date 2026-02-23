@@ -55,6 +55,7 @@ class SubtitleActionRequest(BaseModel):
     burn_in: bool = False
     soft_sub: bool = False
     ass_style: str = "clean_white"
+    video_codec: str = "av1"
 
     asr_engine: str = "auto"
     asr_language: str = "auto"
@@ -73,6 +74,7 @@ class PublishActionRequest(BaseModel):
     account_id: Optional[str] = None
     video_key: Optional[str] = None
     cover_key: Optional[str] = None
+    typeid_mode: Optional[str] = None
     meta: dict[str, Any]
 
 
@@ -107,6 +109,7 @@ class PublishJobSummary(BaseModel):
     state: str
     aid: Optional[str]
     bvid: Optional[str]
+    error_message: Optional[str] = None
     created_at: datetime
     updated_at: datetime
 
@@ -152,6 +155,7 @@ class ConvertedVideoItem(BaseModel):
     task: TaskRead
     final_asset: AssetRead
     cover_asset: Optional[AssetRead] = None
+    display_title: Optional[str] = None
 
 
 class StorageRetentionSettingsRead(BaseModel):

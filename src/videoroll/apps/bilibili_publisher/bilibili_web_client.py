@@ -445,6 +445,15 @@ class BilibiliWebClient:
             tid = 0
         return tid if tid > 0 else None
 
+    def archive_pre(self) -> dict[str, Any]:
+        resp = self._bili.get(
+            "https://member.bilibili.com/x/vupre/web/archive/pre",
+            params={"ts": int(time.time() * 1000)},
+        )
+        data = _json(resp)
+        _bili_code_ok(data)
+        return data
+
     def add_archive(
         self,
         meta: BilibiliPublishMeta,

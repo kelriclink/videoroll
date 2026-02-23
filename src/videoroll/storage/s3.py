@@ -64,8 +64,14 @@ class S3Store:
         path.parent.mkdir(parents=True, exist_ok=True)
         self._client.download_file(self._bucket, key, str(path))
 
-    def get_object(self, key: str) -> dict:
-        return self._client.get_object(Bucket=self._bucket, Key=key)
+    def head_object(self, key: str) -> dict:
+        return self._client.head_object(Bucket=self._bucket, Key=key)
+
+    def get_object(self, key: str, *, range_bytes: str | None = None) -> dict:
+        args = {"Bucket": self._bucket, "Key": key}
+        if range_bytes:
+            args["Range"] = range_bytes
+        return self._client.get_object(**args)
 
     def delete_object(self, key: str) -> None:
         self._client.delete_object(Bucket=self._bucket, Key=key)

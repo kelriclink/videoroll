@@ -8,6 +8,7 @@ type AutoProfile = {
   burn_in: boolean;
   soft_sub: boolean;
   ass_style: string;
+  video_codec: string;
 
   asr_engine: string;
   asr_language: string;
@@ -37,6 +38,7 @@ export default function SettingsAutoPage() {
   const [burnIn, setBurnIn] = useState(true);
   const [softSub, setSoftSub] = useState(false);
   const [assStyle, setAssStyle] = useState("clean_white");
+  const [videoCodec, setVideoCodec] = useState("av1");
 
   const [asrEngine, setAsrEngine] = useState("auto");
   const [asrLanguage, setAsrLanguage] = useState("auto");
@@ -71,6 +73,7 @@ export default function SettingsAutoPage() {
       setBurnIn(Boolean(profile.burn_in));
       setSoftSub(Boolean(profile.soft_sub));
       setAssStyle(profile.ass_style || "clean_white");
+      setVideoCodec((profile.video_codec || "av1").toLowerCase());
 
       setAsrEngine(profile.asr_engine || "auto");
       setAsrLanguage(profile.asr_language || "auto");
@@ -147,6 +150,16 @@ export default function SettingsAutoPage() {
                 <input type="checkbox" checked={softSub} onChange={(e) => setSoftSub(e.target.checked)} />
                 软字幕（mkv）
               </label>
+            </div>
+            <div className="mt-3">
+              <label className="block">
+                <div className="mb-1 text-xs text-slate-600">video_codec（硬字幕输出编码）</div>
+                <select className="w-full rounded border px-3 py-2 text-sm" value={videoCodec} onChange={(e) => setVideoCodec(e.target.value)}>
+                  <option value="av1">av1（体积更小，编码更慢）</option>
+                  <option value="h264">h264（兼容更好，编码更快）</option>
+                </select>
+              </label>
+              <div className="mt-2 text-xs text-slate-500">提示：只有在启用 “硬字幕（burn-in）” 时才会用到该编码设置。</div>
             </div>
             <div className="mt-3">
               <label className="block">
@@ -299,6 +312,7 @@ export default function SettingsAutoPage() {
                     burn_in: burnIn,
                     soft_sub: softSub,
                     ass_style: assStyle,
+                    video_codec: videoCodec,
                     asr_engine: asrEngine,
                     asr_language: asrLanguage,
                     asr_model: asrModel.trim() ? asrModel.trim() : "",
@@ -334,6 +348,7 @@ export default function SettingsAutoPage() {
               setBurnIn(true);
               setSoftSub(false);
               setAssStyle("clean_white");
+              setVideoCodec("av1");
               setAsrEngine("auto");
               setAsrLanguage("auto");
               setAsrModel("");
@@ -366,4 +381,3 @@ export default function SettingsAutoPage() {
     </div>
   );
 }
-

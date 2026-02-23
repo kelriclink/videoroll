@@ -18,11 +18,14 @@ from celery.exceptions import Retry
 
 from videoroll.apps.bilibili_publisher.bilibili_web_client import BilibiliRateLimitError, BilibiliWebClient
 from videoroll.apps.bilibili_publisher.schemas import BilibiliPublishMeta
-from videoroll.config import get_bilibili_publisher_settings
+from videoroll.apps.bilibili_publisher.typeid_recommender import flatten_typelist, recommend_typeid_openai
+from videoroll.config import get_bilibili_publisher_settings, get_subtitle_settings
 from videoroll.db.base import Base
 from videoroll.db.models import Asset, AssetKind, PublishJob, PublishState, Task, TaskStatus
 from videoroll.db.session import get_engine, get_sessionmaker
 from videoroll.storage.s3 import S3Store
+from videoroll.apps.subtitle_service.bilibili_tags_store import get_task_bilibili_summary
+from videoroll.apps.subtitle_service.translate_settings_store import get_translate_settings
 
 
 settings = get_bilibili_publisher_settings()
@@ -116,6 +119,7 @@ def process_job(self, job_id: str) -> dict[str, Any]:
         # Backward compatible: earlier versions stored meta directly.
         meta_dict = _as_dict(meta_json.get("meta")) or meta_json
         meta = BilibiliPublishMeta.model_validate(meta_dict)
+        typeid_mode = str(meta_json.get("typeid_mode") or "bilibili_predict").strip() or "bilibili_predict"
 
         video_key = _extract_video_key(meta_json)
         if not video_key:
@@ -146,13 +150,58 @@ def process_job(self, job_id: str) -> dict[str, Any]:
                     cover_url = client.upload_cover(cover_path, csrf=csrf)
 
                 uploaded, upload_debug = client.upload_video_file(video_path)
-                predicted_tid = client.predict_type(
-                    csrf=csrf,
-                    filename=uploaded.filename_no_suffix,
-                    title=meta.title,
-                    upload_id=uploaded.upload_id,
-                )
-                tid = int(predicted_tid or meta.typeid)
+                predicted_tid: int | None = None
+                if typeid_mode == "bilibili_predict":
+                    predicted_tid = client.predict_type(
+                        csrf=csrf,
+                        filename=uploaded.filename_no_suffix,
+                        title=meta.title,
+                        upload_id=uploaded.upload_id,
+                    )
+
+                tid = int(meta.typeid)
+                if typeid_mode == "ai_summary":
+                    ai_ok = False
+                    summary = get_task_bilibili_summary(db, str(task.id))
+                    translate_settings = get_translate_settings(db, get_subtitle_settings())
+                    if summary and translate_settings.get("openai_api_key"):
+                        try:
+                            pre = client.archive_pre()
+                            data = _as_dict(pre.get("data"))
+                            typelist = data.get("typelist")
+                            options = flatten_typelist(typelist)
+                            obj = recommend_typeid_openai(
+                                summary,
+                                options=options,
+                                api_key=str(translate_settings.get("openai_api_key") or ""),
+                                base_url=str(translate_settings.get("openai_base_url") or ""),
+                                model=str(translate_settings.get("openai_model") or ""),
+                                temperature=float(translate_settings.get("openai_temperature") or 0.0),
+                                timeout_seconds=float(translate_settings.get("openai_timeout_seconds") or 30.0),
+                            )
+                            tid_ai = int(obj.get("typeid") or 0)
+                            candidate_ids = {int(o.get("id") or 0) for o in options}
+                            if tid_ai in candidate_ids:
+                                tid = tid_ai
+                                ai_ok = True
+                        except Exception:
+                            pass
+
+                    if not ai_ok and predicted_tid is None:
+                        try:
+                            predicted_tid = client.predict_type(
+                                csrf=csrf,
+                                filename=uploaded.filename_no_suffix,
+                                title=meta.title,
+                                upload_id=uploaded.upload_id,
+                            )
+                        except Exception:
+                            predicted_tid = None
+                    if not ai_ok and predicted_tid:
+                        tid = int(predicted_tid)
+                elif typeid_mode == "bilibili_predict":
+                    if predicted_tid:
+                        tid = int(predicted_tid)
 
                 add_resp = client.add_archive(meta, csrf=csrf, tid=tid, uploaded=uploaded, cover_url=cover_url)
 
