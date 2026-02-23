@@ -539,7 +539,7 @@ def render_burn_in(
     else:
         # AV1 default: SVT-AV1, balanced preset and constant quality.
         # Note: preset range is 0..13 (lower = slower/better).
-        video_args = ["-c:v", "libsvtav1", "-preset", "6", "-crf", "28"]
+        video_args = ["-c:v", "libsvtav1", "-preset", "4", "-crf", "24"]
 
     cmd = [
         ffmpeg_path,
