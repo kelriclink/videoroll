@@ -59,6 +59,11 @@ export type PublishJob = {
   state: string;
   aid?: string | null;
   bvid?: string | null;
+  tid?: number | null;
+  typeid_mode?: string | null;
+  typeid_selected_by?: string | null;
+  typeid_ai_ok?: boolean | null;
+  typeid_ai_reason?: string | null;
   error_message?: string | null;
   created_at: string;
   updated_at: string;

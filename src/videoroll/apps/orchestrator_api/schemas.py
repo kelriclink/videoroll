@@ -109,6 +109,11 @@ class PublishJobSummary(BaseModel):
     state: str
     aid: Optional[str]
     bvid: Optional[str]
+    tid: Optional[int] = None
+    typeid_mode: Optional[str] = None
+    typeid_selected_by: Optional[str] = None
+    typeid_ai_ok: Optional[bool] = None
+    typeid_ai_reason: Optional[str] = None
     error_message: Optional[str] = None
     created_at: datetime
     updated_at: datetime

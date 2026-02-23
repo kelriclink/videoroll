@@ -1077,6 +1077,8 @@ export default function TaskDetailPage() {
                     <th className="py-2 pr-3">ID</th>
                     <th className="py-2 pr-3">State</th>
                     <th className="py-2 pr-3">bvid</th>
+                    <th className="py-2 pr-3">tid</th>
+                    <th className="py-2 pr-3">typeid</th>
                     <th className="py-2 pr-3">Error</th>
                     <th className="py-2 pr-3">Updated</th>
                   </tr>
@@ -1087,6 +1089,22 @@ export default function TaskDetailPage() {
                       <td className="py-2 pr-3 font-mono text-xs">{j.id.slice(0, 8)}</td>
                       <td className="py-2 pr-3">{j.state}</td>
                       <td className="py-2 pr-3 font-mono text-xs">{j.bvid ?? "-"}</td>
+                      <td className="py-2 pr-3 font-mono text-xs">{j.tid ?? "-"}</td>
+                      <td
+                        className="py-2 pr-3 text-xs text-slate-600"
+                        title={
+                          j.typeid_mode === "ai_summary" && j.typeid_selected_by !== "ai_summary" && j.typeid_ai_reason
+                            ? `AI 分区失败：${j.typeid_ai_reason}`
+                            : ""
+                        }
+                      >
+                        {(() => {
+                          const mode = j.typeid_mode ?? "-";
+                          const by = j.typeid_selected_by ?? "-";
+                          if (mode !== "-" && by !== "-" && mode !== by) return `${mode}→${by}`;
+                          return by !== "-" ? by : mode;
+                        })()}
+                      </td>
                       <td className="py-2 pr-3">
                         {j.error_message ? (
                           <div className="max-w-[36rem] truncate text-xs text-rose-700" title={j.error_message}>

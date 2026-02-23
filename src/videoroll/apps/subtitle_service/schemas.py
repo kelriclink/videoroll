@@ -104,6 +104,7 @@ class SubtitleAutoProfileRead(BaseModel):
     bilingual: bool = False
 
     auto_publish: bool = True
+    publish_typeid_mode: str = "ai_summary"
     publish_title_prefix: str = "【熟肉】"
     publish_translate_title: bool = True
     publish_use_youtube_cover: bool = True
@@ -128,6 +129,7 @@ class SubtitleAutoProfileUpdate(BaseModel):
     bilingual: Optional[bool] = None
 
     auto_publish: Optional[bool] = None
+    publish_typeid_mode: Optional[str] = None
     publish_title_prefix: Optional[str] = None
     publish_translate_title: Optional[bool] = None
     publish_use_youtube_cover: Optional[bool] = None

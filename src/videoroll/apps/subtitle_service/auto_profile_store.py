@@ -14,6 +14,7 @@ _ALLOWED_ASR_ENGINES = {"auto", "mock", "faster-whisper"}
 _ALLOWED_TRANSLATE_PROVIDERS = {"mock", "noop", "openai"}
 _ALLOWED_ASS_STYLES = {"clean_white"}
 _ALLOWED_VIDEO_CODECS = {"av1", "h264"}
+_ALLOWED_PUBLISH_TYPEID_MODES = {"ai_summary", "bilibili_predict", "meta"}
 
 
 def _default_profile() -> dict[str, Any]:
@@ -33,6 +34,7 @@ def _default_profile() -> dict[str, Any]:
         "translate_enable_summary": True,
         "bilingual": False,
         "auto_publish": True,
+        "publish_typeid_mode": "ai_summary",
         "publish_title_prefix": "【熟肉】",
         "publish_translate_title": True,
         "publish_use_youtube_cover": True,
@@ -102,6 +104,8 @@ def get_auto_profile(db: Session) -> dict[str, Any]:
     merged["bilingual"] = bool(merged.get("bilingual"))
 
     merged["auto_publish"] = bool(merged.get("auto_publish"))
+    publish_typeid_mode = str(merged.get("publish_typeid_mode") or baseline["publish_typeid_mode"]).strip() or baseline["publish_typeid_mode"]
+    merged["publish_typeid_mode"] = publish_typeid_mode if publish_typeid_mode in _ALLOWED_PUBLISH_TYPEID_MODES else baseline["publish_typeid_mode"]
     merged["publish_title_prefix"] = str(merged.get("publish_title_prefix") or baseline["publish_title_prefix"]).strip() or baseline[
         "publish_title_prefix"
     ]
@@ -123,6 +127,8 @@ def update_auto_profile(db: Session, update: dict[str, Any]) -> dict[str, Any]:
     for k in ["ass_style", "video_codec", "asr_engine", "asr_language", "translate_provider", "target_lang", "translate_style", "publish_title_prefix"]:
         if k in update and update[k] is not None:
             stored[k] = update[k]
+    if "publish_typeid_mode" in update and update["publish_typeid_mode"] is not None:
+        stored["publish_typeid_mode"] = update["publish_typeid_mode"]
 
     if "asr_model" in update and update["asr_model"] is not None:
         val = str(update["asr_model"]).strip()

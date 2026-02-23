@@ -22,6 +22,7 @@ type AutoProfile = {
   bilingual: boolean;
 
   auto_publish: boolean;
+  publish_typeid_mode: string;
   publish_title_prefix: string;
   publish_translate_title: boolean;
   publish_use_youtube_cover: boolean;
@@ -52,6 +53,7 @@ export default function SettingsAutoPage() {
   const [translateEnableSummary, setTranslateEnableSummary] = useState(true);
 
   const [autoPublish, setAutoPublish] = useState(true);
+  const [publishTypeidMode, setPublishTypeidMode] = useState("ai_summary");
   const [publishTranslateTitle, setPublishTranslateTitle] = useState(true);
   const [publishTitlePrefix, setPublishTitlePrefix] = useState("【熟肉】");
   const [publishUseYouTubeCover, setPublishUseYouTubeCover] = useState(true);
@@ -87,6 +89,7 @@ export default function SettingsAutoPage() {
       setTranslateEnableSummary(Boolean(profile.translate_enable_summary));
 
       setAutoPublish(Boolean(profile.auto_publish));
+      setPublishTypeidMode((profile.publish_typeid_mode || "ai_summary").toLowerCase());
       setPublishTranslateTitle(Boolean(profile.publish_translate_title));
       setPublishTitlePrefix((profile.publish_title_prefix ?? "【熟肉】").trim() || "【熟肉】");
       setPublishUseYouTubeCover(Boolean(profile.publish_use_youtube_cover));
@@ -272,6 +275,25 @@ export default function SettingsAutoPage() {
               />
               使用 YouTube 封面
             </label>
+            <label className="block md:col-span-2">
+              <div className="mb-1 text-xs text-slate-600">分区模式（typeid_mode）</div>
+              <select
+                className="w-full rounded border px-3 py-2 text-sm"
+                value={publishTypeidMode}
+                onChange={(e) => setPublishTypeidMode(e.target.value)}
+              >
+                <option value="ai_summary">AI（根据字幕总结）</option>
+                <option value="bilibili_predict">B站预测（标题/文件）</option>
+                <option value="meta">手动（使用 Settings · Bilibili 的 meta.typeid）</option>
+              </select>
+              {publishTypeidMode === "ai_summary" && (!translateEnableSummary || translateProvider !== "openai" || openaiKeySet === false) ? (
+                <div className="mt-2 text-xs text-rose-700">
+                  提示：AI 分区需要启用 OpenAI summary，并在 Settings · Translate 保存 OpenAI API Key；否则会回退到 B 站预测/手动分区。
+                </div>
+              ) : (
+                <div className="mt-2 text-xs text-slate-500">AI 分区会在投稿时自动拉取可用分区列表，让 AI 从候选中选择一个 typeid。</div>
+              )}
+            </label>
             <label className="flex items-center gap-2 text-sm">
               <input
                 type="checkbox"
@@ -291,7 +313,7 @@ export default function SettingsAutoPage() {
             </label>
           </div>
           <div className="mt-2 text-xs text-slate-500">
-            投稿 meta 的默认值（分区/typeid/tags 等）请到 <Link className="underline" to="/settings/bilibili">Settings · Bilibili</Link> 配置。
+            投稿 meta 的默认值（标题/简介/tags 等）请到 <Link className="underline" to="/settings/bilibili">Settings · Bilibili</Link> 配置；分区由上面的 “分区模式” 决定。
           </div>
         </div>
 
@@ -323,6 +345,7 @@ export default function SettingsAutoPage() {
                     translate_enable_summary: translateEnableSummary,
                     bilingual,
                     auto_publish: autoPublish,
+                    publish_typeid_mode: publishTypeidMode,
                     publish_title_prefix: publishTitlePrefix,
                     publish_translate_title: publishTranslateTitle,
                     publish_use_youtube_cover: publishUseYouTubeCover,
@@ -359,6 +382,7 @@ export default function SettingsAutoPage() {
               setTranslateStyle("口语自然");
               setTranslateEnableSummary(true);
               setAutoPublish(true);
+              setPublishTypeidMode("ai_summary");
               setPublishTranslateTitle(true);
               setPublishTitlePrefix("【熟肉】");
               setPublishUseYouTubeCover(true);

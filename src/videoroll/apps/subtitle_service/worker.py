@@ -771,7 +771,7 @@ def auto_youtube_pipeline(task_id: str) -> dict[str, str]:
                 "account_id": None,
                 "video_key": final_asset.storage_key,
                 "cover_key": cover_key,
-                "typeid_mode": "ai_summary",
+                "typeid_mode": profile.get("publish_typeid_mode") or "ai_summary",
                 "meta": meta,
             }
 

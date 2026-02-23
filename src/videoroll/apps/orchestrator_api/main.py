@@ -994,6 +994,26 @@ def list_task_publish_jobs(task_id: uuid.UUID, limit: int = Query(default=50, ge
     jobs = db.query(PublishJob).filter(PublishJob.task_id == task_id).order_by(PublishJob.created_at.desc()).limit(limit).all()
     out: list[dict[str, Any]] = []
     for j in jobs:
+        resp = _as_dict(j.response_json)
+        typeid_obj = _as_dict(resp.get("typeid"))
+        ai_obj = _as_dict(typeid_obj.get("ai"))
+
+        typeid_mode = str(typeid_obj.get("mode") or _as_dict(j.meta_json).get("typeid_mode") or "").strip() or None
+        typeid_selected_by = str(typeid_obj.get("selected_by") or "").strip() or None
+
+        tid_val = typeid_obj.get("selected") if typeid_obj else resp.get("tid")
+        try:
+            tid = int(tid_val) if tid_val is not None else None
+        except Exception:
+            tid = None
+        if tid is not None and tid <= 0:
+            tid = None
+
+        typeid_ai_ok = ai_obj.get("ok") if "ok" in ai_obj else None
+        if typeid_ai_ok is not None:
+            typeid_ai_ok = bool(typeid_ai_ok)
+        typeid_ai_reason = str(ai_obj.get("reason") or "").strip() or None
+
         out.append(
             {
                 "id": j.id,
@@ -1001,6 +1021,11 @@ def list_task_publish_jobs(task_id: uuid.UUID, limit: int = Query(default=50, ge
                 "state": j.state.value,
                 "aid": j.aid,
                 "bvid": j.bvid,
+                "tid": tid,
+                "typeid_mode": typeid_mode,
+                "typeid_selected_by": typeid_selected_by,
+                "typeid_ai_ok": typeid_ai_ok,
+                "typeid_ai_reason": typeid_ai_reason,
                 "error_message": _publish_job_error_message(j),
                 "created_at": j.created_at,
                 "updated_at": j.updated_at,

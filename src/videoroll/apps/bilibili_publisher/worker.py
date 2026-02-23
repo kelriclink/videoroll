@@ -151,43 +151,68 @@ def process_job(self, job_id: str) -> dict[str, Any]:
 
                 uploaded, upload_debug = client.upload_video_file(video_path)
                 predicted_tid: int | None = None
-                if typeid_mode == "bilibili_predict":
-                    predicted_tid = client.predict_type(
-                        csrf=csrf,
-                        filename=uploaded.filename_no_suffix,
-                        title=meta.title,
-                        upload_id=uploaded.upload_id,
-                    )
+                tid_meta = int(meta.typeid)
+                tid = tid_meta
+                selected_by = "meta"
 
-                tid = int(meta.typeid)
+                ai_info: dict[str, Any] = {
+                    "ok": False,
+                    "typeid": None,
+                    "path": None,
+                    "reason": "",
+                    "text_source": "",
+                    "text_chars": 0,
+                    "candidate_count": 0,
+                }
                 if typeid_mode == "ai_summary":
-                    ai_ok = False
                     summary = get_task_bilibili_summary(db, str(task.id))
+                    text_for_ai = (summary or "").strip()
+                    text_source = "summary"
+                    if not text_for_ai:
+                        text_for_ai = f"{meta.title}\n{meta.desc}".strip()
+                        text_source = "meta"
+
                     translate_settings = get_translate_settings(db, get_subtitle_settings())
-                    if summary and translate_settings.get("openai_api_key"):
+                    api_key = str(translate_settings.get("openai_api_key") or "").strip()
+                    ai_info["text_source"] = text_source
+                    ai_info["text_chars"] = len(text_for_ai)
+
+                    if not api_key:
+                        ai_info["reason"] = "openai api key not set"
+                    elif not text_for_ai:
+                        ai_info["reason"] = "text is empty"
+                    else:
                         try:
                             pre = client.archive_pre()
                             data = _as_dict(pre.get("data"))
                             typelist = data.get("typelist")
                             options = flatten_typelist(typelist)
-                            obj = recommend_typeid_openai(
-                                summary,
-                                options=options,
-                                api_key=str(translate_settings.get("openai_api_key") or ""),
-                                base_url=str(translate_settings.get("openai_base_url") or ""),
-                                model=str(translate_settings.get("openai_model") or ""),
-                                temperature=float(translate_settings.get("openai_temperature") or 0.0),
-                                timeout_seconds=float(translate_settings.get("openai_timeout_seconds") or 30.0),
-                            )
-                            tid_ai = int(obj.get("typeid") or 0)
-                            candidate_ids = {int(o.get("id") or 0) for o in options}
-                            if tid_ai in candidate_ids:
-                                tid = tid_ai
-                                ai_ok = True
-                        except Exception:
-                            pass
+                            ai_info["candidate_count"] = len(options)
+                            if not options:
+                                ai_info["reason"] = "bilibili typelist is empty"
+                            else:
+                                id_to_path = {int(o.get("id") or 0): str(o.get("path") or "").strip() for o in options}
+                                obj = recommend_typeid_openai(
+                                    text_for_ai,
+                                    options=options,
+                                    api_key=api_key,
+                                    base_url=str(translate_settings.get("openai_base_url") or ""),
+                                    model=str(translate_settings.get("openai_model") or ""),
+                                    temperature=float(translate_settings.get("openai_temperature") or 0.0),
+                                    timeout_seconds=float(translate_settings.get("openai_timeout_seconds") or 30.0),
+                                )
+                                tid_ai = int(obj.get("typeid") or 0)
+                                ai_info["typeid"] = tid_ai or None
+                                ai_info["reason"] = str(obj.get("reason") or "").strip()
+                                if tid_ai in id_to_path:
+                                    tid = tid_ai
+                                    selected_by = "ai_summary"
+                                    ai_info["ok"] = True
+                                    ai_info["path"] = id_to_path.get(tid_ai) or None
+                        except Exception as e:
+                            ai_info["reason"] = f"ai failed: {type(e).__name__}"
 
-                    if not ai_ok and predicted_tid is None:
+                    if selected_by != "ai_summary":
                         try:
                             predicted_tid = client.predict_type(
                                 csrf=csrf,
@@ -197,11 +222,38 @@ def process_job(self, job_id: str) -> dict[str, Any]:
                             )
                         except Exception:
                             predicted_tid = None
-                    if not ai_ok and predicted_tid:
-                        tid = int(predicted_tid)
+                        if predicted_tid:
+                            tid = int(predicted_tid)
+                            selected_by = "bilibili_predict"
                 elif typeid_mode == "bilibili_predict":
+                    predicted_tid = client.predict_type(
+                        csrf=csrf,
+                        filename=uploaded.filename_no_suffix,
+                        title=meta.title,
+                        upload_id=uploaded.upload_id,
+                    )
                     if predicted_tid:
                         tid = int(predicted_tid)
+                        selected_by = "bilibili_predict"
+
+                typeid_debug = {
+                    "mode": typeid_mode,
+                    "selected": tid,
+                    "selected_by": selected_by,
+                    "meta": tid_meta,
+                    "predicted": predicted_tid,
+                    "ai": ai_info,
+                }
+                logger.info(
+                    "select tid (mode=%s selected=%s by=%s meta=%s predicted=%s ai_ok=%s ai_tid=%s)",
+                    typeid_mode,
+                    tid,
+                    selected_by,
+                    tid_meta,
+                    predicted_tid,
+                    bool(ai_info.get("ok")),
+                    ai_info.get("typeid"),
+                )
 
                 add_resp = client.add_archive(meta, csrf=csrf, tid=tid, uploaded=uploaded, cover_url=cover_url)
 
@@ -221,6 +273,7 @@ def process_job(self, job_id: str) -> dict[str, Any]:
             "cover_url": cover_url or None,
             "video": upload_debug,
             "tid": tid,
+            "typeid": typeid_debug,
             "result": {"aid": aid_str or None, "bvid": bvid_str or None},
         }
         job.updated_at = _utcnow()
