@@ -8,6 +8,10 @@ type WhisperSettings = {
   whisper_model_dir: string;
   whisper_device: string;
   whisper_compute_type: string;
+  whisper_cpu_threads: number;
+  whisper_num_workers: number;
+  whisper_cpu_threads_effective: number;
+  whisper_num_workers_effective: number;
   faster_whisper_installed: boolean;
 };
 
@@ -135,6 +139,20 @@ export default function SettingsASRPage() {
             <div className="rounded border p-3">
               <div className="text-xs text-slate-500">compute_type</div>
               <div className="mt-1 font-mono text-sm">{settings.whisper_compute_type}</div>
+            </div>
+            <div className="rounded border p-3">
+              <div className="text-xs text-slate-500">SUBTITLE_WHISPER_CPU_THREADS</div>
+              <div className="mt-1 font-mono text-sm">
+                {settings.whisper_cpu_threads}{" "}
+                {settings.whisper_cpu_threads !== settings.whisper_cpu_threads_effective ? `(effective: ${settings.whisper_cpu_threads_effective})` : null}
+              </div>
+            </div>
+            <div className="rounded border p-3">
+              <div className="text-xs text-slate-500">SUBTITLE_WHISPER_NUM_WORKERS</div>
+              <div className="mt-1 font-mono text-sm">
+                {settings.whisper_num_workers}{" "}
+                {settings.whisper_num_workers !== settings.whisper_num_workers_effective ? `(effective: ${settings.whisper_num_workers_effective})` : null}
+              </div>
             </div>
           </div>
         )}

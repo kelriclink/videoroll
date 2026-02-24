@@ -41,6 +41,7 @@ from videoroll.apps.subtitle_service.asr_settings_store import get_asr_settings,
 from videoroll.apps.subtitle_service.auto_profile_store import get_auto_profile, update_auto_profile
 from videoroll.apps.subtitle_service.translate_settings_store import get_translate_settings, update_translate_settings
 from videoroll.apps.subtitle_service.worker import celery_app
+from videoroll.utils.cpu import process_cpu_count
 from videoroll.utils.hf_hub import configure_hf_hub_proxy
 
 
@@ -127,12 +128,22 @@ def get_subtitle_settings_view(settings: SubtitleServiceSettings = Depends(get_s
         fw_installed = True
     except Exception:
         fw_installed = False
+    cpu_threads = int(getattr(settings, "whisper_cpu_threads", 0) or 0)
+    num_workers = int(getattr(settings, "whisper_num_workers", 1) or 1)
+    effective_threads = cpu_threads
+    if effective_threads <= 0:
+        effective_threads = process_cpu_count() or 4
+    effective_workers = num_workers if num_workers > 0 else 1
     return WhisperSettingsRead(
         asr_engine=settings.asr_engine,
         whisper_model=settings.whisper_model,
         whisper_model_dir=settings.whisper_model_dir,
         whisper_device=settings.whisper_device,
         whisper_compute_type=settings.whisper_compute_type,
+        whisper_cpu_threads=cpu_threads,
+        whisper_num_workers=num_workers,
+        whisper_cpu_threads_effective=int(effective_threads),
+        whisper_num_workers_effective=int(effective_workers),
         faster_whisper_installed=fw_installed,
     )
 

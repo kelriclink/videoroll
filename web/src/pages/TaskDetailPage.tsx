@@ -25,6 +25,8 @@ type SubtitleAutoProfile = {
   soft_sub: boolean;
   ass_style: string;
   video_codec: string;
+  video_preset?: string | null;
+  video_crf?: number | null;
   asr_engine: string;
   asr_language: string;
   asr_model?: string | null;
@@ -59,6 +61,8 @@ export default function TaskDetailPage() {
   const [burnIn, setBurnIn] = useState(false);
   const [softSub, setSoftSub] = useState(false);
   const [videoCodec, setVideoCodec] = useState("av1");
+  const [videoPresetText, setVideoPresetText] = useState<string>("");
+  const [videoCrfText, setVideoCrfText] = useState<string>("");
   const [asrEngine, setAsrEngine] = useState("auto");
   const [asrLanguage, setAsrLanguage] = useState("auto");
   const [asrModel, setAsrModel] = useState<string>("");
@@ -162,6 +166,8 @@ export default function TaskDetailPage() {
         setBurnIn(Boolean(profile.burn_in));
         setSoftSub(Boolean(profile.soft_sub));
         setVideoCodec((profile.video_codec || "av1").toLowerCase());
+        setVideoPresetText(typeof profile.video_preset === "string" ? profile.video_preset : "");
+        setVideoCrfText(typeof profile.video_crf === "number" ? String(profile.video_crf) : "");
         setAsrEngine(profile.asr_engine || "auto");
         setAsrLanguage(profile.asr_language || "auto");
         setAsrModel((profile.asr_model ?? "").trim());
@@ -384,6 +390,78 @@ export default function TaskDetailPage() {
     }
   }
 
+  async function submitSubtitleJob(opts: { resume: boolean }) {
+    if (!taskId) return;
+    setBusy(true);
+    setError(null);
+    try {
+      if (!rawAsset && isYouTubeTask) {
+        const resp = await fetchJson<YouTubeDownloadActionResponse>(`${ORCHESTRATOR_URL}/tasks/${taskId}/actions/youtube_download`, {
+          method: "POST",
+        });
+        setYoutubeMeta(resp.metadata);
+        if (!publishCoverKey && resp.cover_asset?.storage_key) {
+          setPublishCoverKey(resp.cover_asset.storage_key);
+          setDidAutoPickCover(true);
+        }
+        if (publishSettings?.default_meta) {
+          const defaultText = JSON.stringify(publishSettings.default_meta ?? {}, null, 2);
+          if (publishMetaText === defaultText) await applyYouTubeMetaToPublishMeta(resp.metadata);
+        }
+        await refresh();
+      }
+
+      const formats = [
+        subtitleFormats.srt ? "srt" : null,
+        subtitleFormats.ass ? "ass" : null,
+      ].filter(Boolean);
+      const crfRaw = videoCrfText.trim();
+      let video_crf: number | null = null;
+      if (crfRaw) {
+        const n = Number(crfRaw);
+        if (!Number.isFinite(n) || !Number.isInteger(n)) throw new Error("video_crf 必须是整数");
+        video_crf = n;
+      }
+      const presetRaw = videoPresetText.trim();
+
+      const resp = await fetchJson<SubtitleActionResponse>(`${ORCHESTRATOR_URL}/tasks/${taskId}/actions/subtitle`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          formats,
+          resume: opts.resume,
+          burn_in: burnIn,
+          soft_sub: softSub,
+          ass_style: "clean_white",
+          video_codec: videoCodec,
+          video_preset: presetRaw ? presetRaw : null,
+          video_crf,
+          asr_engine: asrEngine,
+          asr_language: asrLanguage,
+          asr_model: asrModel.trim() ? asrModel.trim() : null,
+          translate_enabled: translateEnabled,
+          translate_provider: translateProvider,
+          target_lang: targetLang,
+          translate_style: translateStyle,
+          translate_enable_summary: translateProvider === "openai" ? translateEnableSummary : null,
+          bilingual,
+        }),
+      });
+      await refresh();
+      alert(`${opts.resume ? "已继续字幕任务" : "已提交字幕任务"}：${resp.job_id}`);
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const canResumeSubtitle = useMemo(() => {
+    const hasFailedJob = (subtitleJobs ?? []).some((j) => j.status === "failed");
+    const isTaskFailed = task?.status === "FAILED";
+    return hasFailedJob || isTaskFailed;
+  }, [subtitleJobs, task]);
+
   const shouldPoll = useMemo(() => {
     const hasSubtitleInFlight = (subtitleJobs ?? []).some((j) => j.status === "queued" || j.status === "running");
     const hasPublishInFlight = (publishJobs ?? []).some((j) => j.state === "submitting" || j.state === "submitted");
@@ -560,6 +638,31 @@ export default function TaskDetailPage() {
               </label>
               <div className="mt-2 text-xs text-slate-500">提示：只有在启用 “硬字幕（burn-in）” 时才会用到该编码设置。</div>
             </div>
+            <div className="mt-3">
+              <label className="block">
+                <div className="mb-1 text-xs text-slate-600">video_crf（可选：留空=默认）</div>
+                <input
+                  className="w-full rounded border px-3 py-2 text-sm"
+                  value={videoCrfText}
+                  onChange={(e) => setVideoCrfText(e.target.value)}
+                  placeholder={videoCodec === "h264" ? "默认 18（h264）" : "默认 24（av1）"}
+                />
+              </label>
+            </div>
+            <div className="mt-3">
+              <label className="block">
+                <div className="mb-1 text-xs text-slate-600">video_preset（可选：留空=默认）</div>
+                <input
+                  className="w-full rounded border px-3 py-2 text-sm"
+                  value={videoPresetText}
+                  onChange={(e) => setVideoPresetText(e.target.value)}
+                  placeholder={videoCodec === "h264" ? "默认 veryfast（h264）" : "默认 4（av1, 0..13 越小越慢）"}
+                />
+              </label>
+              <div className="mt-2 text-xs text-slate-500">
+                提示：h264 可用 preset：ultrafast/superfast/veryfast/faster/fast/medium/slow/slower/veryslow；av1（SVT）为 0..13（越小越慢、质量更高）。
+              </div>
+            </div>
           </div>
 
           <div className="rounded border p-3">
@@ -656,65 +759,24 @@ export default function TaskDetailPage() {
           </div>
         </div>
 
-        <div className="mt-3">
+        <div className="mt-3 flex flex-wrap items-center gap-2">
           <button
             disabled={busy}
-            onClick={async () => {
-              setBusy(true);
-              setError(null);
-              try {
-                if (!rawAsset && isYouTubeTask) {
-                  const resp = await fetchJson<YouTubeDownloadActionResponse>(`${ORCHESTRATOR_URL}/tasks/${taskId}/actions/youtube_download`, {
-                    method: "POST",
-                  });
-                  setYoutubeMeta(resp.metadata);
-                  if (!publishCoverKey && resp.cover_asset?.storage_key) {
-                    setPublishCoverKey(resp.cover_asset.storage_key);
-                    setDidAutoPickCover(true);
-                  }
-                  if (publishSettings?.default_meta) {
-                    const defaultText = JSON.stringify(publishSettings.default_meta ?? {}, null, 2);
-                    if (publishMetaText === defaultText) await applyYouTubeMetaToPublishMeta(resp.metadata);
-                  }
-                  await refresh();
-                }
-
-                const formats = [
-                  subtitleFormats.srt ? "srt" : null,
-                  subtitleFormats.ass ? "ass" : null,
-                ].filter(Boolean);
-                const resp = await fetchJson<SubtitleActionResponse>(`${ORCHESTRATOR_URL}/tasks/${taskId}/actions/subtitle`, {
-                  method: "POST",
-                  headers: { "Content-Type": "application/json" },
-                  body: JSON.stringify({
-                    formats,
-                    burn_in: burnIn,
-                    soft_sub: softSub,
-                    ass_style: "clean_white",
-                    video_codec: videoCodec,
-                    asr_engine: asrEngine,
-                    asr_language: asrLanguage,
-                    asr_model: asrModel.trim() ? asrModel.trim() : null,
-                    translate_enabled: translateEnabled,
-                    translate_provider: translateProvider,
-                    target_lang: targetLang,
-                    translate_style: translateStyle,
-                    translate_enable_summary: translateProvider === "openai" ? translateEnableSummary : null,
-                    bilingual,
-                  }),
-                });
-                await refresh();
-                alert(`已提交字幕任务：${resp.job_id}`);
-              } catch (e: unknown) {
-                setError(e instanceof Error ? e.message : String(e));
-              } finally {
-                setBusy(false);
-              }
-            }}
+            onClick={() => submitSubtitleJob({ resume: false })}
             className="rounded bg-slate-900 px-3 py-2 text-sm text-white hover:bg-slate-800 disabled:opacity-50"
           >
             生成字幕
           </button>
+          {canResumeSubtitle ? (
+            <button
+              disabled={busy}
+              onClick={() => submitSubtitleJob({ resume: true })}
+              className="rounded border px-3 py-2 text-sm hover:bg-slate-50 disabled:opacity-50"
+              title="尽量复用已有字幕/转写结果，避免重复转写与翻译。"
+            >
+              从失败处继续
+            </button>
+          ) : null}
         </div>
 
         <div className="mt-4">

@@ -46,6 +46,11 @@ class SubtitleServiceSettings(CommonSettings):
     whisper_device: str = Field("cpu", alias="SUBTITLE_WHISPER_DEVICE")
     whisper_compute_type: str = Field("int8", alias="SUBTITLE_WHISPER_COMPUTE_TYPE")
     whisper_model_dir: str = Field("/models/whisper", alias="SUBTITLE_WHISPER_MODEL_DIR")
+    # faster-whisper runtime parallelism (CPU only):
+    # - cpu_threads=0 means "auto" (use available CPUs).
+    # - num_workers defaults to 1 to avoid memory spikes.
+    whisper_cpu_threads: int = Field(0, alias="SUBTITLE_WHISPER_CPU_THREADS")
+    whisper_num_workers: int = Field(1, alias="SUBTITLE_WHISPER_NUM_WORKERS")
     ffmpeg_path: str = Field("ffmpeg", alias="FFMPEG_PATH")
     work_dir: str = Field("/tmp/videoroll", alias="WORK_DIR")
 

@@ -52,10 +52,13 @@ class AssetRead(BaseModel):
 
 class SubtitleActionRequest(BaseModel):
     formats: list[str] = Field(default_factory=lambda: ["srt"])
+    resume: bool = False
     burn_in: bool = False
     soft_sub: bool = False
     ass_style: str = "clean_white"
     video_codec: str = "av1"
+    video_preset: Optional[str] = None
+    video_crf: Optional[int] = Field(default=None, ge=0, le=63)
 
     asr_engine: str = "auto"
     asr_language: str = "auto"

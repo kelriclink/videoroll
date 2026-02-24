@@ -1072,6 +1072,7 @@ def enqueue_subtitle_job(
 
     req = {
         "task_id": str(task_id),
+        "resume": bool(payload.resume),
         "input": {"type": "s3", "key": raw_asset.storage_key},
         "asr": {"engine": payload.asr_engine, "language": payload.asr_language, "model": payload.asr_model},
         "translate": translate,
@@ -1082,6 +1083,8 @@ def enqueue_subtitle_job(
                 "soft_sub": payload.soft_sub,
                 "ass_style": payload.ass_style,
                 "video_codec": payload.video_codec,
+                "video_preset": payload.video_preset,
+                "video_crf": payload.video_crf,
             },
         },
         "output_prefix": f"sub/{task_id}/",

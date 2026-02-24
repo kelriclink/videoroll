@@ -34,6 +34,7 @@ from videoroll.apps.subtitle_service.processing import (
     generate_bilibili_tags_openai,
     mux_soft_sub,
     render_burn_in,
+    srt_to_segments,
     segments_to_ass,
     segments_to_srt,
     transcribe_faster_whisper,
@@ -49,6 +50,7 @@ from videoroll.apps.subtitle_service.bilibili_tags_store import set_task_bilibil
 from videoroll.apps.subtitle_service.task_title_store import set_task_titles
 from videoroll.apps.subtitle_service.translate_settings_store import get_translate_settings
 from videoroll.apps.bilibili_publisher.publish_settings_store import get_bilibili_publish_settings
+from videoroll.utils.cpu import process_cpu_count
 from videoroll.utils.hf_hub import configure_hf_hub_proxy
 
 
@@ -350,59 +352,212 @@ def process_job(job_id: str) -> dict[str, str]:
         srt_path = work_root / "subtitle_zh.srt"
         ass_path = work_root / "subtitle_zh.ass"
 
-        store.download_file(input_key, video_path)
-
-        extract_audio(settings.ffmpeg_path, video_path, audio_path)
         audio_key = f"work/{task.id}/audio.wav"
-        store.upload_file(audio_path, audio_key, content_type="audio/wav")
-        db.add(
-            Asset(
-                task_id=task.id,
-                kind=AssetKind.audio_wav,
-                storage_key=audio_key,
-                sha256=sha256_file(audio_path),
-                size_bytes=audio_path.stat().st_size,
-            )
-        )
-        task.status = TaskStatus.audio_extracted
-        db.add(task)
-
-        job.progress = 25
-        db.add(job)
-        db.commit()
-
-        asr_cfg = req.get("asr") or {}
-        asr_defaults = get_asr_settings(db, settings)
-        requested_engine = (asr_cfg.get("engine") or "auto").strip()
-        requested_language = (asr_cfg.get("language") or "auto").strip()
-        requested_model = (asr_cfg.get("model") or "").strip() or None
-
-        engine = asr_defaults["default_engine"] if requested_engine in {"", "auto"} else requested_engine
-        language = asr_defaults["default_language"] if requested_language in {"", "auto"} else requested_language
-        model_name = requested_model or asr_defaults["default_model"]
-
-        if engine == "mock":
-            segments = transcribe_mock(audio_path)
-        elif engine == "faster-whisper":
-            proxy = str(asr_defaults.get("model_download_proxy") or "").strip() or None
-            model_name = _resolve_faster_whisper_model(model_name, Path(settings.whisper_model_dir), proxy=proxy)
-            segments = transcribe_faster_whisper(
-                audio_path,
-                model_name=model_name,
-                language=language,
-                device=settings.whisper_device,
-                compute_type=settings.whisper_compute_type,
-            )
-        else:
-            raise ValueError(f"unsupported ASR engine: {engine}")
-        segments_json = [seg.__dict__ for seg in segments]
-        write_json(segments_path, segments_json)
         segments_key = f"sub/{task.id}/segments.json"
-        store.upload_file(segments_path, segments_key, content_type="application/json")
-        db.add(Asset(task_id=task.id, kind=AssetKind.segments_json, storage_key=segments_key, size_bytes=segments_path.stat().st_size))
+        srt_key = f"sub/{task.id}/subtitle_zh.srt"
+        ass_key = f"sub/{task.id}/subtitle_zh.ass"
 
-        task.status = TaskStatus.asr_done
-        db.add(task)
+        resume = bool(req.get("resume"))
+        output_cfg = (req.get("output") or {})
+        formats = output_cfg.get("formats") or []
+        render_cfg = output_cfg.get("render") or {}
+        burn_in = bool(render_cfg.get("burn_in"))
+        soft_sub = bool(render_cfg.get("soft_sub"))
+        video_codec = str(render_cfg.get("video_codec") or "av1").strip().lower() or "av1"
+        video_crf = render_cfg.get("video_crf")
+        video_preset = render_cfg.get("video_preset")
+
+        want_ass = "ass" in formats
+        need_ass = want_ass or burn_in
+
+        def _download_if_asset_exists(kind: AssetKind, key: str, dest: Path) -> bool:
+            row = (
+                db.query(Asset)
+                .filter(Asset.task_id == task.id, Asset.kind == kind, Asset.storage_key == key)
+                .order_by(Asset.created_at.desc())
+                .first()
+            )
+            if not row:
+                return False
+            try:
+                store.download_file(key, dest)
+                return dest.exists() and dest.stat().st_size > 0
+            except Exception:
+                return False
+
+        if resume and _download_if_asset_exists(AssetKind.subtitle_srt, srt_key, srt_path):
+            if task.status in {TaskStatus.failed, TaskStatus.created, TaskStatus.ingested, TaskStatus.downloaded, TaskStatus.audio_extracted, TaskStatus.asr_done, TaskStatus.translated}:
+                task.status = TaskStatus.subtitle_ready
+                db.add(task)
+            job.progress = 80
+            db.add(job)
+            db.commit()
+
+            if need_ass and not _download_if_asset_exists(AssetKind.subtitle_ass, ass_key, ass_path):
+                segs = srt_to_segments(srt_path.read_text(encoding="utf-8"))
+                ass_text = segments_to_ass(segs, style_name=render_cfg.get("ass_style", "clean_white"))
+                ass_path.write_text(ass_text, encoding="utf-8")
+                store.upload_file(ass_path, ass_key, content_type="text/plain")
+                db.add(
+                    Asset(
+                        task_id=task.id,
+                        kind=AssetKind.subtitle_ass,
+                        storage_key=ass_key,
+                        sha256=sha256_file(ass_path),
+                        size_bytes=ass_path.stat().st_size,
+                    )
+                )
+                db.add(Subtitle(task_id=task.id, version=1, format=SubtitleFormat.ass, language="zh", storage_key=ass_key))
+                db.commit()
+
+            if not burn_in and not soft_sub:
+                job.status = SubtitleJobStatus.succeeded
+                job.progress = 100
+                db.add(job)
+                db.commit()
+                return {"status": "ok"}
+
+            store.download_file(input_key, video_path)
+            if burn_in:
+                out_video = work_root / "video_burnin.mp4"
+                render_burn_in(
+                    settings.ffmpeg_path,
+                    video_path,
+                    ass_path,
+                    out_video,
+                    video_codec=video_codec,
+                    preset=video_preset,
+                    crf=video_crf,
+                )
+                final_key = f"final/{task.id}/video_burnin.mp4"
+                store.upload_file(out_video, final_key, content_type="video/mp4")
+                db.add(
+                    Asset(
+                        task_id=task.id,
+                        kind=AssetKind.video_final,
+                        storage_key=final_key,
+                        sha256=sha256_file(out_video),
+                        size_bytes=out_video.stat().st_size,
+                    )
+                )
+
+            if soft_sub:
+                out_video = work_root / "video_softsub.mkv"
+                mux_soft_sub(settings.ffmpeg_path, video_path, srt_path, out_video)
+                final_key = f"final/{task.id}/video_softsub.mkv"
+                store.upload_file(out_video, final_key, content_type="video/x-matroska")
+                db.add(
+                    Asset(
+                        task_id=task.id,
+                        kind=AssetKind.video_final,
+                        storage_key=final_key,
+                        sha256=sha256_file(out_video),
+                        size_bytes=out_video.stat().st_size,
+                    )
+                )
+
+            if burn_in or soft_sub:
+                task.status = TaskStatus.rendered
+                db.add(task)
+
+            job.status = SubtitleJobStatus.succeeded
+            job.progress = 100
+            db.add(job)
+            db.commit()
+            return {"status": "ok"}
+
+        video_downloaded = False
+
+        def _ensure_video() -> None:
+            nonlocal video_downloaded
+            if video_downloaded:
+                return
+            store.download_file(input_key, video_path)
+            video_downloaded = True
+
+        segments: list[Segment] | None = None
+        if resume and _download_if_asset_exists(AssetKind.segments_json, segments_key, segments_path):
+            try:
+                data = json.loads(segments_path.read_text(encoding="utf-8"))
+                if isinstance(data, list):
+                    tmp: list[Segment] = []
+                    for item in data:
+                        if not isinstance(item, dict):
+                            continue
+                        start = float(item.get("start") or 0.0)
+                        end = float(item.get("end") or 0.0)
+                        text = str(item.get("text") or "").strip()
+                        if not text:
+                            continue
+                        tmp.append(Segment(start=start, end=end, text=text, confidence=item.get("confidence")))
+                    if tmp:
+                        segments = tmp
+            except Exception:
+                segments = None
+
+        if segments is None:
+            if resume and _download_if_asset_exists(AssetKind.audio_wav, audio_key, audio_path):
+                pass
+            else:
+                _ensure_video()
+                extract_audio(settings.ffmpeg_path, video_path, audio_path)
+                store.upload_file(audio_path, audio_key, content_type="audio/wav")
+                db.add(
+                    Asset(
+                        task_id=task.id,
+                        kind=AssetKind.audio_wav,
+                        storage_key=audio_key,
+                        sha256=sha256_file(audio_path),
+                        size_bytes=audio_path.stat().st_size,
+                    )
+                )
+                task.status = TaskStatus.audio_extracted
+                db.add(task)
+                db.commit()
+
+            job.progress = 25
+            db.add(job)
+            db.commit()
+            asr_cfg = req.get("asr") or {}
+            asr_defaults = get_asr_settings(db, settings)
+            requested_engine = (asr_cfg.get("engine") or "auto").strip()
+            requested_language = (asr_cfg.get("language") or "auto").strip()
+            requested_model = (asr_cfg.get("model") or "").strip() or None
+
+            engine = asr_defaults["default_engine"] if requested_engine in {"", "auto"} else requested_engine
+            language = asr_defaults["default_language"] if requested_language in {"", "auto"} else requested_language
+            model_name = requested_model or asr_defaults["default_model"]
+
+            if engine == "mock":
+                segments = transcribe_mock(audio_path)
+            elif engine == "faster-whisper":
+                proxy = str(asr_defaults.get("model_download_proxy") or "").strip() or None
+                model_name = _resolve_faster_whisper_model(model_name, Path(settings.whisper_model_dir), proxy=proxy)
+                cpu_threads_cfg = int(getattr(settings, "whisper_cpu_threads", 0) or 0)
+                if cpu_threads_cfg <= 0:
+                    cpu_threads_cfg = process_cpu_count() or 4
+                num_workers_cfg = int(getattr(settings, "whisper_num_workers", 1) or 1)
+                if num_workers_cfg <= 0:
+                    num_workers_cfg = 1
+                segments = transcribe_faster_whisper(
+                    audio_path,
+                    model_name=model_name,
+                    language=language,
+                    device=settings.whisper_device,
+                    compute_type=settings.whisper_compute_type,
+                    cpu_threads=cpu_threads_cfg,
+                    num_workers=num_workers_cfg,
+                )
+            else:
+                raise ValueError(f"unsupported ASR engine: {engine}")
+            segments_json = [seg.__dict__ for seg in segments]
+            write_json(segments_path, segments_json)
+            store.upload_file(segments_path, segments_key, content_type="application/json")
+            db.add(Asset(task_id=task.id, kind=AssetKind.segments_json, storage_key=segments_key, size_bytes=segments_path.stat().st_size))
+
+            task.status = TaskStatus.asr_done
+            db.add(task)
+            db.commit()
 
         job.progress = 60
         db.add(job)
@@ -533,16 +688,13 @@ def process_job(job_id: str) -> dict[str, str]:
 
         srt_text = segments_to_srt(segments_out)
         srt_path.write_text(srt_text, encoding="utf-8")
-        srt_key = f"sub/{task.id}/subtitle_zh.srt"
         store.upload_file(srt_path, srt_key, content_type="text/plain")
         db.add(Asset(task_id=task.id, kind=AssetKind.subtitle_srt, storage_key=srt_key, sha256=sha256_file(srt_path), size_bytes=srt_path.stat().st_size))
         db.add(Subtitle(task_id=task.id, version=1, format=SubtitleFormat.srt, language="zh", storage_key=srt_key))
 
-        want_ass = "ass" in (req.get("output") or {}).get("formats", [])
-        if want_ass:
-            ass_text = segments_to_ass(segments_out, style_name=((req.get("output") or {}).get("render") or {}).get("ass_style", "clean_white"))
+        if need_ass:
+            ass_text = segments_to_ass(segments_out, style_name=render_cfg.get("ass_style", "clean_white"))
             ass_path.write_text(ass_text, encoding="utf-8")
-            ass_key = f"sub/{task.id}/subtitle_zh.ass"
             store.upload_file(ass_path, ass_key, content_type="text/plain")
             db.add(Asset(task_id=task.id, kind=AssetKind.subtitle_ass, storage_key=ass_key, sha256=sha256_file(ass_path), size_bytes=ass_path.stat().st_size))
             db.add(Subtitle(task_id=task.id, version=1, format=SubtitleFormat.ass, language="zh", storage_key=ass_key))
@@ -553,17 +705,18 @@ def process_job(job_id: str) -> dict[str, str]:
         db.add(job)
         db.commit()
 
-        render_cfg = ((req.get("output") or {}).get("render") or {})
-        burn_in = bool(render_cfg.get("burn_in"))
-        soft_sub = bool(render_cfg.get("soft_sub"))
-        video_codec = str(render_cfg.get("video_codec") or "av1").strip().lower() or "av1"
-
         if burn_in:
-            if not ass_path.exists():
-                ass_text = segments_to_ass(segments_out, style_name=render_cfg.get("ass_style", "clean_white"))
-                ass_path.write_text(ass_text, encoding="utf-8")
+            _ensure_video()
             out_video = work_root / "video_burnin.mp4"
-            render_burn_in(settings.ffmpeg_path, video_path, ass_path, out_video, video_codec=video_codec)
+            render_burn_in(
+                settings.ffmpeg_path,
+                video_path,
+                ass_path,
+                out_video,
+                video_codec=video_codec,
+                preset=video_preset,
+                crf=video_crf,
+            )
             final_key = f"final/{task.id}/video_burnin.mp4"
             store.upload_file(out_video, final_key, content_type="video/mp4")
             db.add(
@@ -577,6 +730,7 @@ def process_job(job_id: str) -> dict[str, str]:
             )
 
         if soft_sub:
+            _ensure_video()
             out_video = work_root / "video_softsub.mkv"
             mux_soft_sub(settings.ffmpeg_path, video_path, srt_path, out_video)
             final_key = f"final/{task.id}/video_softsub.mkv"
@@ -691,6 +845,7 @@ def auto_youtube_pipeline(task_id: str) -> dict[str, str]:
         if not final_asset and (profile.get("burn_in") or profile.get("soft_sub")):
             req = {
                 "task_id": str(tid),
+                "resume": task.status == TaskStatus.failed,
                 "input": {"type": "s3", "key": video_key},
                 "asr": {
                     "engine": profile.get("asr_engine") or "auto",
@@ -712,6 +867,8 @@ def auto_youtube_pipeline(task_id: str) -> dict[str, str]:
                         "soft_sub": bool(profile.get("soft_sub")),
                         "ass_style": profile.get("ass_style") or "clean_white",
                         "video_codec": profile.get("video_codec") or "av1",
+                        "video_preset": profile.get("video_preset"),
+                        "video_crf": profile.get("video_crf"),
                     },
                 },
                 "output_prefix": f"sub/{tid}/",

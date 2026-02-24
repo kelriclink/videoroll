@@ -14,7 +14,23 @@ _ALLOWED_ASR_ENGINES = {"auto", "mock", "faster-whisper"}
 _ALLOWED_TRANSLATE_PROVIDERS = {"mock", "noop", "openai"}
 _ALLOWED_ASS_STYLES = {"clean_white"}
 _ALLOWED_VIDEO_CODECS = {"av1", "h264"}
+_ALLOWED_H264_PRESETS = {
+    "ultrafast",
+    "superfast",
+    "veryfast",
+    "faster",
+    "fast",
+    "medium",
+    "slow",
+    "slower",
+    "veryslow",
+    "placebo",
+}
+_AV1_PRESET_MIN = 0
+_AV1_PRESET_MAX = 13
 _ALLOWED_PUBLISH_TYPEID_MODES = {"ai_summary", "bilibili_predict", "meta"}
+_VIDEO_CRF_MIN = 0
+_VIDEO_CRF_MAX = 63
 
 
 def _default_profile() -> dict[str, Any]:
@@ -24,6 +40,10 @@ def _default_profile() -> dict[str, Any]:
         "soft_sub": False,
         "ass_style": "clean_white",
         "video_codec": "av1",
+        # Optional: if None/empty, codec-specific defaults are used by the worker.
+        "video_preset": None,
+        # Optional: if None, codec-specific defaults are used by the worker.
+        "video_crf": None,
         "asr_engine": "auto",
         "asr_language": "auto",
         "asr_model": None,
@@ -72,6 +92,43 @@ def _normalize_video_codec(val: Any, *, fallback: str) -> str:
     return s if s in _ALLOWED_VIDEO_CODECS else fallback
 
 
+def _normalize_video_crf(val: Any) -> int | None:
+    if val is None:
+        return None
+    try:
+        n = int(val)
+    except Exception:
+        return None
+    if n < _VIDEO_CRF_MIN:
+        return _VIDEO_CRF_MIN
+    if n > _VIDEO_CRF_MAX:
+        return _VIDEO_CRF_MAX
+    return n
+
+
+def _normalize_video_preset(val: Any, *, codec: str) -> str | None:
+    if val is None:
+        return None
+    s = str(val or "").strip()
+    if not s:
+        return None
+
+    if codec in {"h264", "avc"}:
+        preset = s.lower()
+        return preset if preset in _ALLOWED_H264_PRESETS else None
+
+    # AV1 (SVT-AV1) uses numeric preset 0..13.
+    try:
+        n = int(s)
+    except Exception:
+        return None
+    if n < _AV1_PRESET_MIN:
+        n = _AV1_PRESET_MIN
+    if n > _AV1_PRESET_MAX:
+        n = _AV1_PRESET_MAX
+    return str(n)
+
+
 def get_auto_profile(db: Session) -> dict[str, Any]:
     row = db.get(AppSetting, AUTO_PROFILE_KEY)
     stored = dict(_as_dict(row.value_json)) if row else {}
@@ -86,6 +143,8 @@ def get_auto_profile(db: Session) -> dict[str, Any]:
     merged["ass_style"] = ass_style if ass_style in _ALLOWED_ASS_STYLES else baseline["ass_style"]
 
     merged["video_codec"] = _normalize_video_codec(merged.get("video_codec"), fallback=baseline["video_codec"])
+    merged["video_preset"] = _normalize_video_preset(merged.get("video_preset"), codec=merged["video_codec"])
+    merged["video_crf"] = _normalize_video_crf(merged.get("video_crf"))
 
     asr_engine = str(merged.get("asr_engine") or baseline["asr_engine"]).strip() or baseline["asr_engine"]
     merged["asr_engine"] = asr_engine if asr_engine in _ALLOWED_ASR_ENGINES else baseline["asr_engine"]
@@ -127,6 +186,15 @@ def update_auto_profile(db: Session, update: dict[str, Any]) -> dict[str, Any]:
     for k in ["ass_style", "video_codec", "asr_engine", "asr_language", "translate_provider", "target_lang", "translate_style", "publish_title_prefix"]:
         if k in update and update[k] is not None:
             stored[k] = update[k]
+    if "video_preset" in update:
+        val = update["video_preset"]
+        if val is None:
+            stored["video_preset"] = None
+        else:
+            s = str(val or "").strip()
+            stored["video_preset"] = s or None
+    if "video_crf" in update:
+        stored["video_crf"] = update["video_crf"]
     if "publish_typeid_mode" in update and update["publish_typeid_mode"] is not None:
         stored["publish_typeid_mode"] = update["publish_typeid_mode"]
 

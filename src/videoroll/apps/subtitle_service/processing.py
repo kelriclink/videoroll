@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import random
+import re
 import subprocess
 import time
 from dataclasses import dataclass
@@ -59,6 +60,8 @@ def transcribe_faster_whisper(
     language: str = "auto",
     device: str = "cpu",
     compute_type: str = "int8",
+    cpu_threads: int | None = None,
+    num_workers: int | None = None,
 ) -> list[Segment]:
     try:
         from faster_whisper import WhisperModel  # type: ignore
@@ -66,7 +69,12 @@ def transcribe_faster_whisper(
         raise RuntimeError("faster-whisper is not installed. Rebuild with INSTALL_ASR=1.") from e
 
     lang = None if language in {"", "auto", None} else language
-    model = WhisperModel(model_name, device=device, compute_type=compute_type)
+    model_kwargs: dict[str, Any] = {"device": device, "compute_type": compute_type}
+    if cpu_threads is not None:
+        model_kwargs["cpu_threads"] = int(cpu_threads)
+    if num_workers is not None:
+        model_kwargs["num_workers"] = int(num_workers)
+    model = WhisperModel(model_name, **model_kwargs)
     seg_iter, _info = model.transcribe(str(audio_path), language=lang)
     out: list[Segment] = []
     for seg in seg_iter:
@@ -479,6 +487,55 @@ def segments_to_srt(segments: Iterable[Segment]) -> str:
     return "\n".join(lines).strip() + "\n"
 
 
+_SRT_TIME_RE = re.compile(r"(?P<start>\\d{2}:\\d{2}:\\d{2},\\d{3})\\s*-->\\s*(?P<end>\\d{2}:\\d{2}:\\d{2},\\d{3})")
+
+
+def _parse_srt_ts(ts: str) -> float:
+    h_s, m_s, rest = (ts or "").strip().split(":", 2)
+    s_s, ms_s = rest.split(",", 1)
+    h = int(h_s)
+    m = int(m_s)
+    s = int(s_s)
+    ms = int(ms_s)
+    return float(h * 3600 + m * 60 + s) + float(ms) / 1000.0
+
+
+def srt_to_segments(srt_text: str) -> list[Segment]:
+    text = (srt_text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not text:
+        return []
+
+    blocks = re.split(r"\n{2,}", text)
+    out: list[Segment] = []
+    for block in blocks:
+        lines = [ln.rstrip() for ln in block.splitlines() if ln.strip()]
+        if not lines:
+            continue
+
+        m = None
+        time_idx = -1
+        for i, ln in enumerate(lines[:3]):
+            m = _SRT_TIME_RE.search(ln)
+            if m:
+                time_idx = i
+                break
+        if not m or time_idx < 0:
+            continue
+
+        try:
+            start = _parse_srt_ts(m.group("start"))
+            end = _parse_srt_ts(m.group("end"))
+        except Exception:
+            continue
+
+        body = "\n".join(lines[time_idx + 1 :]).strip()
+        if not body:
+            continue
+        out.append(Segment(start=start, end=end, text=body))
+
+    return out
+
+
 def _ass_ts(seconds: float) -> str:
     cs = max(0, int(round(seconds * 100)))
     h, rem = divmod(cs, 360_000)
@@ -530,16 +587,41 @@ def render_burn_in(
     output_path: Path,
     *,
     video_codec: str = "av1",
+    preset: str | int | None = None,
+    crf: int | None = None,
 ) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     codec = str(video_codec or "").strip().lower() or "av1"
 
     if codec in {"h264", "avc"}:
-        video_args = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "18"]
+        effective_crf = 18 if crf is None else max(0, min(51, int(crf)))
+        allowed_presets = {
+            "ultrafast",
+            "superfast",
+            "veryfast",
+            "faster",
+            "fast",
+            "medium",
+            "slow",
+            "slower",
+            "veryslow",
+            "placebo",
+        }
+        preset_s = str(preset or "").strip().lower()
+        effective_preset = preset_s if preset_s in allowed_presets else "veryfast"
+        video_args = ["-c:v", "libx264", "-preset", effective_preset, "-crf", str(effective_crf)]
     else:
         # AV1 default: SVT-AV1, balanced preset and constant quality.
         # Note: preset range is 0..13 (lower = slower/better).
-        video_args = ["-c:v", "libsvtav1", "-preset", "4", "-crf", "24"]
+        effective_crf = 24 if crf is None else max(0, min(63, int(crf)))
+        preset_n: int | None = None
+        try:
+            preset_s = str(preset).strip() if preset is not None else ""
+            preset_n = int(preset_s) if preset_s else None
+        except Exception:
+            preset_n = None
+        effective_preset_n = 4 if preset_n is None else max(0, min(13, preset_n))
+        video_args = ["-c:v", "libsvtav1", "-preset", str(effective_preset_n), "-crf", str(effective_crf)]
 
     cmd = [
         ffmpeg_path,

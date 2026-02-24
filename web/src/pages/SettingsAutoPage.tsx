@@ -9,6 +9,8 @@ type AutoProfile = {
   soft_sub: boolean;
   ass_style: string;
   video_codec: string;
+  video_preset?: string | null;
+  video_crf?: number | null;
 
   asr_engine: string;
   asr_language: string;
@@ -40,6 +42,8 @@ export default function SettingsAutoPage() {
   const [softSub, setSoftSub] = useState(false);
   const [assStyle, setAssStyle] = useState("clean_white");
   const [videoCodec, setVideoCodec] = useState("av1");
+  const [videoPresetText, setVideoPresetText] = useState<string>("");
+  const [videoCrfText, setVideoCrfText] = useState<string>("");
 
   const [asrEngine, setAsrEngine] = useState("auto");
   const [asrLanguage, setAsrLanguage] = useState("auto");
@@ -76,6 +80,8 @@ export default function SettingsAutoPage() {
       setSoftSub(Boolean(profile.soft_sub));
       setAssStyle(profile.ass_style || "clean_white");
       setVideoCodec((profile.video_codec || "av1").toLowerCase());
+      setVideoPresetText(typeof profile.video_preset === "string" ? profile.video_preset : "");
+      setVideoCrfText(typeof profile.video_crf === "number" ? String(profile.video_crf) : "");
 
       setAsrEngine(profile.asr_engine || "auto");
       setAsrLanguage(profile.asr_language || "auto");
@@ -163,6 +169,32 @@ export default function SettingsAutoPage() {
                 </select>
               </label>
               <div className="mt-2 text-xs text-slate-500">提示：只有在启用 “硬字幕（burn-in）” 时才会用到该编码设置。</div>
+            </div>
+            <div className="mt-3">
+              <label className="block">
+                <div className="mb-1 text-xs text-slate-600">video_crf（可选：留空=默认）</div>
+                <input
+                  className="w-full rounded border px-3 py-2 text-sm"
+                  value={videoCrfText}
+                  onChange={(e) => setVideoCrfText(e.target.value)}
+                  placeholder={videoCodec === "h264" ? "默认 18（h264）" : "默认 24（av1）"}
+                />
+              </label>
+              <div className="mt-2 text-xs text-slate-500">提示：CRF 越小质量越高、体积越大、编码越慢。常用范围：h264 18~28；av1 24~35。</div>
+            </div>
+            <div className="mt-3">
+              <label className="block">
+                <div className="mb-1 text-xs text-slate-600">video_preset（可选：留空=默认）</div>
+                <input
+                  className="w-full rounded border px-3 py-2 text-sm"
+                  value={videoPresetText}
+                  onChange={(e) => setVideoPresetText(e.target.value)}
+                  placeholder={videoCodec === "h264" ? "默认 veryfast（h264）" : "默认 4（av1, 0..13 越小越慢）"}
+                />
+              </label>
+              <div className="mt-2 text-xs text-slate-500">
+                提示：h264 可用 preset：ultrafast/superfast/veryfast/faster/fast/medium/slow/slower/veryslow；av1（SVT）为 0..13（越小越慢、质量更高）。
+              </div>
             </div>
             <div className="mt-3">
               <label className="block">
@@ -326,6 +358,14 @@ export default function SettingsAutoPage() {
               setError(null);
               try {
                 if (!formatsOut.length) throw new Error("至少选择一种输出格式");
+                const crfRaw = videoCrfText.trim();
+                let video_crf: number | null = null;
+                if (crfRaw) {
+                  const n = Number(crfRaw);
+                  if (!Number.isFinite(n) || !Number.isInteger(n)) throw new Error("video_crf 必须是整数");
+                  video_crf = n;
+                }
+                const presetRaw = videoPresetText.trim();
                 await fetchJson(`${SUBTITLE_SERVICE_URL}/subtitle/auto/profile`, {
                   method: "PUT",
                   headers: { "Content-Type": "application/json" },
@@ -335,6 +375,8 @@ export default function SettingsAutoPage() {
                     soft_sub: softSub,
                     ass_style: assStyle,
                     video_codec: videoCodec,
+                    video_preset: presetRaw ? presetRaw : null,
+                    video_crf,
                     asr_engine: asrEngine,
                     asr_language: asrLanguage,
                     asr_model: asrModel.trim() ? asrModel.trim() : "",
@@ -372,6 +414,8 @@ export default function SettingsAutoPage() {
               setSoftSub(false);
               setAssStyle("clean_white");
               setVideoCodec("av1");
+              setVideoPresetText("");
+              setVideoCrfText("");
               setAsrEngine("auto");
               setAsrLanguage("auto");
               setAsrModel("");

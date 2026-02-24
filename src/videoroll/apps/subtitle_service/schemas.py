@@ -34,6 +34,10 @@ class RenderOptions(BaseModel):
     soft_sub: bool = False
     ass_style: str = "clean_white"
     video_codec: str = "av1"
+    # Optional encoder preset (codec-dependent). If omitted, codec-specific defaults are used.
+    video_preset: Optional[str] = None
+    # Optional encoder quality control. If omitted, codec-specific defaults are used.
+    video_crf: Optional[int] = Field(default=None, ge=0, le=63)
 
 
 class OutputOptions(BaseModel):
@@ -43,6 +47,7 @@ class OutputOptions(BaseModel):
 
 class SubtitleJobCreate(BaseModel):
     task_id: uuid.UUID
+    resume: bool = False
     input: InputRef
     asr: ASROptions = Field(default_factory=ASROptions)
     translate: TranslateOptions = Field(default_factory=TranslateOptions)
@@ -68,6 +73,10 @@ class WhisperSettingsRead(BaseModel):
     whisper_model_dir: str
     whisper_device: str
     whisper_compute_type: str
+    whisper_cpu_threads: int = 0
+    whisper_num_workers: int = 1
+    whisper_cpu_threads_effective: int = 0
+    whisper_num_workers_effective: int = 1
     faster_whisper_installed: bool = False
 
 
@@ -91,6 +100,8 @@ class SubtitleAutoProfileRead(BaseModel):
     soft_sub: bool = False
     ass_style: str = "clean_white"
     video_codec: str = "av1"
+    video_preset: Optional[str] = None
+    video_crf: Optional[int] = None
 
     asr_engine: str = "auto"
     asr_language: str = "auto"
@@ -116,6 +127,8 @@ class SubtitleAutoProfileUpdate(BaseModel):
     soft_sub: Optional[bool] = None
     ass_style: Optional[str] = None
     video_codec: Optional[str] = None
+    video_preset: Optional[str] = None
+    video_crf: Optional[int] = Field(default=None, ge=0, le=63)
 
     asr_engine: Optional[str] = None
     asr_language: Optional[str] = None
