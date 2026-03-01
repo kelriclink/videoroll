@@ -28,6 +28,7 @@ type AutoProfile = {
   publish_title_prefix: string;
   publish_translate_title: boolean;
   publish_use_youtube_cover: boolean;
+  publish_enable_reprint: boolean;
 };
 
 export default function SettingsAutoPage() {
@@ -61,6 +62,7 @@ export default function SettingsAutoPage() {
   const [publishTranslateTitle, setPublishTranslateTitle] = useState(true);
   const [publishTitlePrefix, setPublishTitlePrefix] = useState("【熟肉】");
   const [publishUseYouTubeCover, setPublishUseYouTubeCover] = useState(true);
+  const [publishEnableReprint, setPublishEnableReprint] = useState(true);
 
   async function refresh() {
     setError(null);
@@ -99,6 +101,7 @@ export default function SettingsAutoPage() {
       setPublishTranslateTitle(Boolean(profile.publish_translate_title));
       setPublishTitlePrefix((profile.publish_title_prefix ?? "【熟肉】").trim() || "【熟肉】");
       setPublishUseYouTubeCover(Boolean(profile.publish_use_youtube_cover));
+      setPublishEnableReprint(Boolean(profile.publish_enable_reprint));
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : String(e));
     }
@@ -302,6 +305,14 @@ export default function SettingsAutoPage() {
             <label className="flex items-center gap-2 text-sm">
               <input
                 type="checkbox"
+                checked={publishEnableReprint}
+                onChange={(e) => setPublishEnableReprint(e.target.checked)}
+              />
+              启用转载（copyright=2）
+            </label>
+            <label className="flex items-center gap-2 text-sm">
+              <input
+                type="checkbox"
                 checked={publishUseYouTubeCover}
                 onChange={(e) => setPublishUseYouTubeCover(e.target.checked)}
               />
@@ -391,6 +402,7 @@ export default function SettingsAutoPage() {
                     publish_title_prefix: publishTitlePrefix,
                     publish_translate_title: publishTranslateTitle,
                     publish_use_youtube_cover: publishUseYouTubeCover,
+                    publish_enable_reprint: publishEnableReprint,
                   }),
                 });
                 await refresh();
@@ -430,6 +442,7 @@ export default function SettingsAutoPage() {
               setPublishTranslateTitle(true);
               setPublishTitlePrefix("【熟肉】");
               setPublishUseYouTubeCover(true);
+              setPublishEnableReprint(true);
             }}
           >
             恢复默认（未保存）

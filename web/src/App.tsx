@@ -12,6 +12,7 @@ import SettingsStoragePage from "./pages/SettingsStoragePage";
 import SettingsTranslatePage from "./pages/SettingsTranslatePage";
 import SettingsBilibiliPage from "./pages/SettingsBilibiliPage";
 import SettingsAutoPage from "./pages/SettingsAutoPage";
+import RenderQueuePage from "./pages/RenderQueuePage";
 
 function NavItem({ to, label }: { to: string; label: string }) {
   return (
@@ -59,6 +60,7 @@ export default function App() {
             <NavItem to="/videos" label="Videos" />
             <NavItem to="/tasks/new" label="New Task" />
             <NavItem to="/youtube/sources" label="YouTube Sources" />
+            <NavItem to="/queue/render" label="Queue · Render" />
             <NavItem to="/settings/asr" label="Settings · ASR" />
             <NavItem to="/settings/youtube" label="Settings · YouTube" />
             <NavItem to="/settings/storage" label="Settings · Storage" />
@@ -79,6 +81,7 @@ export default function App() {
             <Route path="/tasks/new" element={<TaskNewPage />} />
             <Route path="/tasks/:taskId" element={<TaskDetailPage />} />
             <Route path="/youtube/sources" element={<YouTubeSourcesPage />} />
+            <Route path="/queue/render" element={<RenderQueuePage />} />
             <Route path="/settings/asr" element={<SettingsASRPage />} />
             <Route path="/settings/youtube" element={<SettingsYouTubePage />} />
             <Route path="/settings/storage" element={<SettingsStoragePage />} />

@@ -40,6 +40,7 @@ type SubtitleAutoProfile = {
   publish_title_prefix: string;
   publish_translate_title: boolean;
   publish_use_youtube_cover: boolean;
+  publish_enable_reprint: boolean;
 };
 
 type BiliTypeNode = { id: number; name: string; children?: BiliTypeNode[] };
@@ -53,6 +54,10 @@ export default function TaskDetailPage() {
   const [subtitleJobs, setSubtitleJobs] = useState<SubtitleJob[] | null>(null);
   const [publishJobs, setPublishJobs] = useState<PublishJob[] | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [logSelection, setLogSelection] = useState<string>("combined");
+  const [logText, setLogText] = useState<string>("");
+  const [logBusy, setLogBusy] = useState(false);
+  const [logError, setLogError] = useState<string | null>(null);
 
   const [videoFile, setVideoFile] = useState<File | null>(null);
   const [busy, setBusy] = useState(false);
@@ -82,6 +87,7 @@ export default function TaskDetailPage() {
   const [coverFile, setCoverFile] = useState<File | null>(null);
   const [publishTypeidMode, setPublishTypeidMode] = useState<string>("ai_summary");
   const [publishTypeid, setPublishTypeid] = useState<number | "">("");
+  const [publishEnableReprint, setPublishEnableReprint] = useState(true);
   const [biliTypes, setBiliTypes] = useState<BiliTypeNode[] | null>(null);
   const [biliTypesBusy, setBiliTypesBusy] = useState(false);
   const [typeRecommendBusy, setTypeRecommendBusy] = useState(false);
@@ -123,6 +129,7 @@ export default function TaskDetailPage() {
     setCoverFile(null);
     setPublishTypeidMode("ai_summary");
     setPublishTypeid("");
+    setPublishEnableReprint(true);
     setBiliTypes(null);
     setTypeRecommend(null);
     setYoutubeMeta(null);
@@ -177,6 +184,7 @@ export default function TaskDetailPage() {
         setTranslateProvider(profile.translate_provider || "openai");
         setTranslateStyle(profile.translate_style || "口语自然");
         setTranslateEnableSummary(Boolean(profile.translate_enable_summary));
+        setPublishEnableReprint(Boolean(profile.publish_enable_reprint));
         setOpenaiKeySet(Boolean(translateSettings.openai_api_key_set));
       } catch (e) {
         // Fallback: only fetch OpenAI key status so UI can show guidance.
@@ -268,6 +276,22 @@ export default function TaskDetailPage() {
     }
   }
 
+  function applyPublishEnableReprint(enabled: boolean) {
+    setPublishEnableReprint(enabled);
+    try {
+      const metaIn = JSON.parse(publishMetaText);
+      if (!metaIn || typeof metaIn !== "object" || Array.isArray(metaIn)) return;
+      const metaOut: any = { ...metaIn, copyright: enabled ? 2 : 1 };
+      if (enabled) {
+        const src = String(metaIn?.source ?? "").trim() || String(task?.source_url ?? "").trim();
+        if (src) metaOut.source = src;
+      } else {
+        metaOut.source = "";
+      }
+      setPublishMetaText(JSON.stringify(metaOut, null, 2));
+    } catch {}
+  }
+
   const fetchYouTubeMeta = useCallback(async () => {
     if (!taskId) return null;
     const resp = await fetchJson<YouTubeMetaActionResponse>(`${ORCHESTRATOR_URL}/tasks/${taskId}/actions/youtube_meta`, {
@@ -299,12 +323,12 @@ export default function TaskDetailPage() {
         ...metaIn,
         title,
         desc,
-        copyright: 2,
-        source: sourceUrl,
+        copyright: publishEnableReprint ? 2 : 1,
+        source: publishEnableReprint ? sourceUrl : "",
       };
       setPublishMetaText(JSON.stringify(metaOut, null, 2));
     },
-    [publishMetaText, task, openaiKeySet, translateStyle],
+    [publishMetaText, task, openaiKeySet, translateStyle, publishEnableReprint],
   );
 
   const isYouTubeTask = task?.source_type === "youtube" && !!(task.source_url ?? "").trim();
@@ -347,6 +371,18 @@ export default function TaskDetailPage() {
   }, [assets]);
   const finalAssets = useMemo(() => (assets ?? []).filter((x) => x.kind === "video_final"), [assets]);
   const coverAssets = useMemo(() => (assets ?? []).filter((x) => x.kind === "cover_image"), [assets]);
+  const logAssets = useMemo(() => (assets ?? []).filter((x) => x.kind === "log"), [assets]);
+  const subtitleLogAssets = useMemo(() => logAssets.filter((x) => x.storage_key.includes("/subtitle_")), [logAssets]);
+  const renderLogAssets = useMemo(() => logAssets.filter((x) => x.storage_key.includes("/render_")), [logAssets]);
+  const latestSubtitleLog = useMemo(
+    () => (subtitleLogAssets.length ? subtitleLogAssets[subtitleLogAssets.length - 1] : null),
+    [subtitleLogAssets],
+  );
+  const latestRenderLog = useMemo(() => (renderLogAssets.length ? renderLogAssets[renderLogAssets.length - 1] : null), [renderLogAssets]);
+  const selectedLogAsset = useMemo(() => {
+    if (logSelection === "combined") return null;
+    return logAssets.find((a) => a.id === logSelection) ?? null;
+  }, [logAssets, logSelection]);
   const biliTypeOptions = useMemo(() => flattenBiliTypeOptions(biliTypes), [biliTypes]);
   const publishTypeLabel = useMemo(() => {
     const tid = typeof publishTypeid === "number" ? publishTypeid : Number(publishTypeid);
@@ -468,6 +504,60 @@ export default function TaskDetailPage() {
     return hasSubtitleInFlight || hasPublishInFlight;
   }, [subtitleJobs, publishJobs]);
 
+  const loadLogs = useCallback(
+    async (opts?: { silent?: boolean }) => {
+      if (!taskId) return;
+      const silent = Boolean(opts?.silent);
+      if (!silent) setLogError(null);
+      if (!silent) setLogBusy(true);
+      try {
+        const fetchTail = async (assetId: string, maxBytes: number) => {
+          const resp = await fetch(`${ORCHESTRATOR_URL}/tasks/${taskId}/assets/${assetId}/stream`, {
+            headers: { Range: `bytes=-${maxBytes}` },
+          });
+          if (!resp.ok) throw new Error(`日志获取失败：${resp.status} ${resp.statusText}`);
+          return await resp.text();
+        };
+
+        const maxBytes = 200_000;
+        if (logSelection === "combined") {
+          const parts: Array<{ title: string; asset: Asset }> = [];
+          if (latestSubtitleLog) parts.push({ title: `Subtitle · ${latestSubtitleLog.storage_key}`, asset: latestSubtitleLog });
+          if (latestRenderLog) parts.push({ title: `Render · ${latestRenderLog.storage_key}`, asset: latestRenderLog });
+          if (!parts.length) {
+            setLogText("暂无日志（任务开始后会生成 log 资产）");
+            return;
+          }
+          const texts = await Promise.all(parts.map((p) => fetchTail(p.asset.id, maxBytes)));
+          const merged = parts
+            .map((p, idx) => `===== ${p.title} =====\n${(texts[idx] ?? "").trimEnd()}\n`)
+            .join("\n");
+          setLogText(merged.trimEnd() + "\n");
+          return;
+        }
+
+        if (!selectedLogAsset) {
+          setLogText("日志资产不存在或已被删除");
+          return;
+        }
+
+        const text = await fetchTail(selectedLogAsset.id, maxBytes);
+        setLogText(text);
+      } catch (e: unknown) {
+        if (!silent) setLogError(e instanceof Error ? e.message : String(e));
+      } finally {
+        if (!silent) setLogBusy(false);
+      }
+    },
+    [taskId, logSelection, latestSubtitleLog, latestRenderLog, selectedLogAsset],
+  );
+
+  useEffect(() => {
+    if (logSelection === "combined") return;
+    if (selectedLogAsset) return;
+    setLogSelection("combined");
+  }, [logSelection, selectedLogAsset]);
+
   useEffect(() => {
     if (!isYouTubeTask) return;
     if (didAutoPickCover) return;
@@ -497,6 +587,26 @@ export default function TaskDetailPage() {
       if (timer) window.clearTimeout(timer);
     };
   }, [taskId, shouldPoll, refresh]);
+
+  useEffect(() => {
+    if (!taskId) return;
+
+    let cancelled = false;
+    let timer: number | undefined;
+
+    const tick = async () => {
+      if (cancelled) return;
+      await loadLogs({ silent: true });
+      if (cancelled) return;
+      if (shouldPoll) timer = window.setTimeout(tick, 2000);
+    };
+
+    tick();
+    return () => {
+      cancelled = true;
+      if (timer) window.clearTimeout(timer);
+    };
+  }, [taskId, shouldPoll, loadLogs]);
 
   if (!taskId) return null;
 
@@ -818,6 +928,36 @@ export default function TaskDetailPage() {
       </div>
 
       <div className="rounded border bg-white p-4">
+        <div className="flex items-center justify-between gap-3">
+          <div className="text-sm font-semibold">Logs</div>
+          <button
+            disabled={logBusy}
+            onClick={() => loadLogs()}
+            className="rounded border px-3 py-2 text-sm hover:bg-slate-50 disabled:opacity-50"
+          >
+            刷新日志
+          </button>
+        </div>
+        <div className="mt-2 flex flex-wrap items-center gap-2">
+          <select className="rounded border px-3 py-2 text-sm" value={logSelection} onChange={(e) => setLogSelection(e.target.value)}>
+            <option value="combined">合并（最新字幕 + 压制）</option>
+            {[...logAssets].reverse().map((a) => (
+              <option key={a.id} value={a.id}>
+                {a.storage_key}
+              </option>
+            ))}
+          </select>
+          <div className="text-xs text-slate-500">仅显示末尾 200KB；完整内容请在 Assets 里下载。</div>
+        </div>
+        {logError ? <div className="mt-2 text-xs text-rose-700">{logError}</div> : null}
+        <textarea
+          readOnly
+          value={logText}
+          className="mt-2 h-72 w-full rounded border bg-slate-50 p-2 font-mono text-xs text-slate-800"
+        />
+      </div>
+
+      <div className="rounded border bg-white p-4">
         <div className="text-sm font-semibold">Assets</div>
         {!assets ? <div className="mt-2 text-sm text-slate-500">加载中…</div> : null}
         {assets ? (
@@ -1028,6 +1168,14 @@ export default function TaskDetailPage() {
           </div>
         </div>
 
+        <div className="mt-3 rounded border p-3">
+          <div className="text-xs text-slate-500">转载</div>
+          <label className="mt-2 flex items-center gap-2 text-sm">
+            <input type="checkbox" checked={publishEnableReprint} onChange={(e) => applyPublishEnableReprint(e.target.checked)} />
+            启用转载（开启=copyright=2；关闭=自制）
+          </label>
+        </div>
+
         <div className="mt-3">
           <div className="mb-1 flex items-center justify-between gap-2 text-xs text-slate-600">
             <div>meta.json</div>
@@ -1096,6 +1244,18 @@ export default function TaskDetailPage() {
                 if (publishTypeidMode === "meta") {
                   const tid = typeof publishTypeid === "number" ? publishTypeid : Number(publishTypeid);
                   if (Number.isFinite(tid) && tid > 0) meta.typeid = tid;
+                }
+                if (publishEnableReprint) {
+                  meta.copyright = 2;
+                  const src = String(meta?.source ?? "").trim() || String(task?.source_url ?? "").trim();
+                  if (src) meta.source = src;
+                } else {
+                  meta.copyright = 1;
+                  meta.source = "";
+                }
+                if (isYouTubeTask) {
+                  const srcUrl = String(task?.source_url ?? "").trim();
+                  if (srcUrl && typeof meta?.desc === "string" && !meta.desc.includes(srcUrl)) meta.desc = buildBilibiliDesc(meta.desc, srcUrl);
                 }
                 if (typeof meta?.desc === "string" && meta.desc.length > 2000) meta.desc = clampText(meta.desc, 2000);
                 if (typeof meta?.title === "string" && meta.title.length > 80) meta.title = clampText(meta.title, 80);

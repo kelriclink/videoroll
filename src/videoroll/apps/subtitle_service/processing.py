@@ -26,7 +26,26 @@ def _run(cmd: list[str]) -> None:
     subprocess.run(cmd, check=True)
 
 
-def extract_audio(ffmpeg_path: str, video_path: Path, audio_path: Path) -> None:
+def _run_logged(cmd: list[str], *, log_path: Path | None) -> None:
+    if log_path is None:
+        _run(cmd)
+        return
+
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with log_path.open("ab") as f:
+            try:
+                f.write(("\n$ " + " ".join(cmd) + "\n").encode("utf-8", errors="replace"))
+                f.flush()
+            except Exception:
+                pass
+            subprocess.run(cmd, check=True, stdout=f, stderr=f)
+    except Exception:
+        # If logging fails, still run the command so the pipeline doesn't break.
+        _run(cmd)
+
+
+def extract_audio(ffmpeg_path: str, video_path: Path, audio_path: Path, *, log_path: Path | None = None) -> None:
     audio_path.parent.mkdir(parents=True, exist_ok=True)
     cmd = [
         ffmpeg_path,
@@ -40,7 +59,7 @@ def extract_audio(ffmpeg_path: str, video_path: Path, audio_path: Path) -> None:
         "16000",
         str(audio_path),
     ]
-    _run(cmd)
+    _run_logged(cmd, log_path=log_path)
 
 
 def transcribe_mock(_audio_path: Path) -> list[Segment]:
@@ -589,6 +608,7 @@ def render_burn_in(
     video_codec: str = "av1",
     preset: str | int | None = None,
     crf: int | None = None,
+    log_path: Path | None = None,
 ) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     codec = str(video_codec or "").strip().lower() or "av1"
@@ -635,10 +655,10 @@ def render_burn_in(
         "copy",
         str(output_path),
     ]
-    _run(cmd)
+    _run_logged(cmd, log_path=log_path)
 
 
-def mux_soft_sub(ffmpeg_path: str, video_path: Path, srt_path: Path, output_path: Path) -> None:
+def mux_soft_sub(ffmpeg_path: str, video_path: Path, srt_path: Path, output_path: Path, *, log_path: Path | None = None) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     cmd = [
         ffmpeg_path,
@@ -661,7 +681,7 @@ def mux_soft_sub(ffmpeg_path: str, video_path: Path, srt_path: Path, output_path
         "language=chi",
         str(output_path),
     ]
-    _run(cmd)
+    _run_logged(cmd, log_path=log_path)
 
 
 def write_json(path: Path, data: Any) -> None:

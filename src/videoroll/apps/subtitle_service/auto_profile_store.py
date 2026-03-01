@@ -58,6 +58,8 @@ def _default_profile() -> dict[str, Any]:
         "publish_title_prefix": "【熟肉】",
         "publish_translate_title": True,
         "publish_use_youtube_cover": True,
+        # If false, publish as "自制" (copyright=1) while keeping the original link in description.
+        "publish_enable_reprint": True,
     }
 
 
@@ -170,6 +172,7 @@ def get_auto_profile(db: Session) -> dict[str, Any]:
     ]
     merged["publish_translate_title"] = bool(merged.get("publish_translate_title"))
     merged["publish_use_youtube_cover"] = bool(merged.get("publish_use_youtube_cover"))
+    merged["publish_enable_reprint"] = bool(merged.get("publish_enable_reprint"))
     return merged
 
 
@@ -179,7 +182,17 @@ def update_auto_profile(db: Session, update: dict[str, Any]) -> dict[str, Any]:
 
     if "formats" in update and update["formats"] is not None:
         stored["formats"] = update["formats"]
-    for k in ["burn_in", "soft_sub", "translate_enabled", "translate_enable_summary", "bilingual", "auto_publish", "publish_translate_title", "publish_use_youtube_cover"]:
+    for k in [
+        "burn_in",
+        "soft_sub",
+        "translate_enabled",
+        "translate_enable_summary",
+        "bilingual",
+        "auto_publish",
+        "publish_translate_title",
+        "publish_use_youtube_cover",
+        "publish_enable_reprint",
+    ]:
         if k in update and update[k] is not None:
             stored[k] = bool(update[k])
 

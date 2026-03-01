@@ -119,6 +119,7 @@ class SubtitleAutoProfileRead(BaseModel):
     publish_title_prefix: str = "【熟肉】"
     publish_translate_title: bool = True
     publish_use_youtube_cover: bool = True
+    publish_enable_reprint: bool = True
 
 
 class SubtitleAutoProfileUpdate(BaseModel):
@@ -146,6 +147,7 @@ class SubtitleAutoProfileUpdate(BaseModel):
     publish_title_prefix: Optional[str] = None
     publish_translate_title: Optional[bool] = None
     publish_use_youtube_cover: Optional[bool] = None
+    publish_enable_reprint: Optional[bool] = None
 
 
 class TranslateSettingsRead(BaseModel):
@@ -214,3 +216,32 @@ class ModelDownloadProxyTestResponse(BaseModel):
     status_code: Optional[int] = None
     elapsed_ms: int
     error: Optional[str] = None
+
+
+class RenderQueueSettingsRead(BaseModel):
+    max_concurrency: int = Field(1, description="0=暂停调度；>0 表示最多同时运行多少个 ffmpeg 压制任务")
+
+
+class RenderQueueSettingsUpdate(BaseModel):
+    max_concurrency: Optional[int] = Field(default=None, ge=0, le=32)
+
+
+class RenderJobRead(BaseModel):
+    id: uuid.UUID
+    task_id: uuid.UUID
+    subtitle_job_id: Optional[uuid.UUID] = None
+    status: str
+    progress: int
+    retry_count: int
+    error_message: Optional[str] = None
+    created_at: datetime
+    updated_at: datetime
+    started_at: Optional[datetime] = None
+    finished_at: Optional[datetime] = None
+
+
+class RenderQueueRead(BaseModel):
+    settings: RenderQueueSettingsRead
+    running_count: int = 0
+    queued_count: int = 0
+    jobs: list[RenderJobRead] = Field(default_factory=list)

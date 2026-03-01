@@ -290,6 +290,10 @@ def process_job(self, job_id: str) -> dict[str, Any]:
         _ensure_publish_result_asset(db, task.id, result_key)
 
         db.commit()
+        try:
+            celery_app.send_task("subtitle_service.cleanup_task", args=[str(task.id)], queue="subtitle")
+        except Exception:
+            logger.exception("failed to enqueue cleanup task (task_id=%s)", task.id)
         return {"status": "ok", "aid": aid_str or None, "bvid": bvid_str or None}
     except Retry:
         raise

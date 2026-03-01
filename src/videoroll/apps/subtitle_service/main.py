@@ -17,7 +17,7 @@ from sqlalchemy.orm import Session
 
 from videoroll.config import SubtitleServiceSettings, get_subtitle_settings
 from videoroll.db.base import Base
-from videoroll.db.models import Asset, AssetKind, SubtitleJob
+from videoroll.db.models import Asset, AssetKind, RenderJob, RenderJobStatus, SubtitleJob
 from videoroll.db.session import db_session, get_engine
 from videoroll.storage.s3 import S3Store
 from videoroll.apps.subtitle_service.schemas import (
@@ -36,9 +36,14 @@ from videoroll.apps.subtitle_service.schemas import (
     WhisperSettingsRead,
     ModelDownloadProxyTestRequest,
     ModelDownloadProxyTestResponse,
+    RenderJobRead,
+    RenderQueueRead,
+    RenderQueueSettingsRead,
+    RenderQueueSettingsUpdate,
 )
 from videoroll.apps.subtitle_service.asr_settings_store import get_asr_settings, update_asr_settings
 from videoroll.apps.subtitle_service.auto_profile_store import get_auto_profile, update_auto_profile
+from videoroll.apps.subtitle_service.render_queue_store import get_render_queue_settings, update_render_queue_settings
 from videoroll.apps.subtitle_service.translate_settings_store import get_translate_settings, update_translate_settings
 from videoroll.apps.subtitle_service.worker import celery_app
 from videoroll.utils.cpu import process_cpu_count
@@ -488,3 +493,64 @@ def get_job(job_id: uuid.UUID, db: Session = Depends(get_db)) -> SubtitleJobRead
         created_at=job.created_at,
         updated_at=job.updated_at,
     )
+
+
+@app.get("/subtitle/render_queue", response_model=RenderQueueRead)
+def get_render_queue(
+    limit: int = 200,
+    db: Session = Depends(get_db),
+) -> RenderQueueRead:
+    limit = int(limit or 200)
+    if limit < 1:
+        limit = 1
+    if limit > 2000:
+        limit = 2000
+
+    cfg = get_render_queue_settings(db)
+    running = (
+        db.query(RenderJob)
+        .filter(RenderJob.status == RenderJobStatus.running)
+        .order_by(RenderJob.started_at.asc(), RenderJob.created_at.asc())
+        .limit(limit)
+        .all()
+    )
+    queued = (
+        db.query(RenderJob)
+        .filter(RenderJob.status == RenderJobStatus.queued)
+        .order_by(RenderJob.created_at.asc())
+        .limit(max(0, limit - len(running)))
+        .all()
+    )
+    jobs = [*running, *queued]
+
+    def _to_read(j: RenderJob) -> RenderJobRead:
+        return RenderJobRead(
+            id=j.id,
+            task_id=j.task_id,
+            subtitle_job_id=j.subtitle_job_id,
+            status=j.status.value,
+            progress=int(j.progress or 0),
+            retry_count=int(j.retry_count or 0),
+            error_message=j.error_message,
+            created_at=j.created_at,
+            updated_at=j.updated_at,
+            started_at=j.started_at,
+            finished_at=j.finished_at,
+        )
+
+    running_count = db.query(RenderJob).filter(RenderJob.status == RenderJobStatus.running).count()
+    queued_count = db.query(RenderJob).filter(RenderJob.status == RenderJobStatus.queued).count()
+
+    return RenderQueueRead(
+        settings=RenderQueueSettingsRead(**cfg),
+        running_count=int(running_count),
+        queued_count=int(queued_count),
+        jobs=[_to_read(j) for j in jobs],
+    )
+
+
+@app.put("/subtitle/render_queue/settings", response_model=RenderQueueSettingsRead)
+def put_render_queue_settings_view(payload: RenderQueueSettingsUpdate, db: Session = Depends(get_db)) -> RenderQueueSettingsRead:
+    cfg = update_render_queue_settings(db, payload.model_dump(exclude_unset=True))
+    celery_app.send_task("subtitle_service.render_queue_tick", args=[], queue="subtitle")
+    return RenderQueueSettingsRead(**cfg)

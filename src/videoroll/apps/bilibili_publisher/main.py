@@ -271,6 +271,10 @@ def publish(payload: PublishRequest, settings: BilibiliPublisherSettings = Depen
     db.add(Asset(task_id=task.id, kind=AssetKind.publish_result, storage_key=result_key))
 
     db.commit()
+    try:
+        celery_app.send_task("subtitle_service.cleanup_task", args=[str(task.id)], queue="subtitle")
+    except Exception:
+        pass
     return PublishResponse(state=job.state.value, aid=aid, bvid=bvid, response=response)
 
 

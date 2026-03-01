@@ -21,7 +21,7 @@ from sqlalchemy.orm import Session
 
 from videoroll.config import OrchestratorSettings, get_orchestrator_settings
 from videoroll.db.base import Base
-from videoroll.db.models import Asset, AssetKind, PublishJob, Subtitle, SubtitleJob, Task, TaskStatus
+from videoroll.db.models import Asset, AssetKind, PublishJob, Subtitle, SubtitleJob, SubtitleJobStatus, Task, TaskStatus
 from videoroll.db.session import db_session, get_engine, get_sessionmaker
 from videoroll.storage.s3 import S3Store
 from videoroll.utils.hashing import sha256_file
@@ -1093,6 +1093,57 @@ def enqueue_subtitle_job(
     try:
         with httpx.Client(timeout=30.0) as client:
             resp = client.post(f"{settings.subtitle_service_url}/subtitle/jobs", json=req)
+            resp.raise_for_status()
+            data = resp.json()
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"subtitle-service request failed: {e}") from e
+
+    return RemoteJobResponse(job_id=uuid.UUID(data["job_id"]), status=str(data.get("status", "queued")))
+
+
+@app.post("/tasks/{task_id}/actions/subtitle_resume", response_model=RemoteJobResponse)
+def resume_subtitle_job(
+    task_id: uuid.UUID,
+    settings: OrchestratorSettings = Depends(get_settings),
+    db: Session = Depends(get_db),
+) -> RemoteJobResponse:
+    task = db.get(Task, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="task not found")
+
+    in_flight = (
+        db.query(SubtitleJob)
+        .filter(
+            SubtitleJob.task_id == task_id,
+            SubtitleJob.status.in_([SubtitleJobStatus.queued, SubtitleJobStatus.running]),
+        )
+        .count()
+    )
+    if in_flight:
+        raise HTTPException(status_code=409, detail="subtitle job already in progress")
+
+    prev = (
+        db.query(SubtitleJob)
+        .filter(SubtitleJob.task_id == task_id)
+        .order_by(SubtitleJob.created_at.desc())
+        .first()
+    )
+    if not prev:
+        raise HTTPException(status_code=400, detail="no subtitle job found to resume")
+
+    req_in = prev.request_json if isinstance(prev.request_json, dict) else {}
+    if not req_in:
+        raise HTTPException(status_code=400, detail="subtitle job request is empty")
+
+    req_out = dict(req_in)
+    req_out["task_id"] = str(task_id)
+    req_out["resume"] = True
+    if not isinstance(req_out.get("output_prefix"), str) or not str(req_out.get("output_prefix") or "").strip():
+        req_out["output_prefix"] = f"sub/{task_id}/"
+
+    try:
+        with httpx.Client(timeout=30.0) as client:
+            resp = client.post(f"{settings.subtitle_service_url}/subtitle/jobs", json=req_out)
             resp.raise_for_status()
             data = resp.json()
     except httpx.HTTPError as e:

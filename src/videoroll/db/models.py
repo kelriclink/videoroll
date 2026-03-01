@@ -215,6 +215,42 @@ class SubtitleJobStatus(str, enum.Enum):
     failed = "failed"
 
 
+class RenderJobStatus(str, enum.Enum):
+    queued = "queued"
+    running = "running"
+    succeeded = "succeeded"
+    failed = "failed"
+    canceled = "canceled"
+
+
+class RenderJob(Base):
+    __tablename__ = "render_jobs"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    task_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("tasks.id", ondelete="CASCADE"), nullable=False)
+    subtitle_job_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("subtitle_jobs.id", ondelete="SET NULL"), nullable=True
+    )
+
+    status: Mapped[RenderJobStatus] = mapped_column(Enum(RenderJobStatus, name="render_job_status"), nullable=False, default=RenderJobStatus.queued)
+    progress: Mapped[int] = mapped_column(Integer, nullable=False, default=0)  # 0..100
+    retry_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    request_json: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+
+    error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    started_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+
+    __table_args__ = (
+        Index("ix_render_jobs_status_created_at", "status", "created_at"),
+        Index("ix_render_jobs_task_status", "task_id", "status"),
+        Index("ix_render_jobs_subtitle_job", "subtitle_job_id"),
+    )
+
+
 class SubtitleJob(Base):
     __tablename__ = "subtitle_jobs"
 

@@ -5,10 +5,13 @@ import { fetchJson } from "../lib/http";
 import { ORCHESTRATOR_URL } from "../lib/urls";
 import { Task, TaskStatus } from "../lib/types";
 
+type SubtitleActionResponse = { job_id: string; status: string };
+
 export default function TasksPage() {
   const [searchParams, setSearchParams] = useSearchParams();
   const [tasks, setTasks] = useState<Task[] | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [resumeBusyId, setResumeBusyId] = useState<string | null>(null);
 
   const status = (searchParams.get("status") as TaskStatus | null) ?? null;
 
@@ -16,6 +19,7 @@ export default function TasksPage() {
     const qs = new URLSearchParams();
     if (status) qs.set("status", status);
     qs.set("limit", "200");
+    setError(null);
     fetchJson<Task[]>(`${ORCHESTRATOR_URL}/tasks?${qs.toString()}`)
       .then((data) => setTasks(data))
       .catch((e: unknown) => setError(e instanceof Error ? e.message : String(e)));
@@ -87,6 +91,7 @@ export default function TasksPage() {
                   <th className="py-2 pr-3">Status</th>
                   <th className="py-2 pr-3">Source</th>
                   <th className="py-2 pr-3">Created</th>
+                  <th className="py-2 pr-3">Actions</th>
                 </tr>
               </thead>
               <tbody>
@@ -107,6 +112,41 @@ export default function TasksPage() {
                     <td className="py-2 pr-3">
                       <div className="text-xs text-slate-700">{new Date(t.created_at).toLocaleString()}</div>
                     </td>
+                    <td className="py-2 pr-3">
+                      <div className="flex flex-wrap items-center gap-2">
+                        {t.status === "FAILED" ? (
+                          <button
+                            disabled={resumeBusyId === t.id}
+                            className="rounded border px-2 py-1 text-xs hover:bg-slate-50 disabled:opacity-50"
+                            onClick={async () => {
+                              if (!confirm("继续字幕任务？会尽量从已有产物处继续（resume=true）。")) return;
+                              setResumeBusyId(t.id);
+                              setError(null);
+                              try {
+                                const resp = await fetchJson<SubtitleActionResponse>(`${ORCHESTRATOR_URL}/tasks/${t.id}/actions/subtitle_resume`, {
+                                  method: "POST",
+                                });
+                                alert(`已提交继续任务：${resp.job_id}`);
+                                const qs = new URLSearchParams();
+                                if (status) qs.set("status", status);
+                                qs.set("limit", "200");
+                                const data = await fetchJson<Task[]>(`${ORCHESTRATOR_URL}/tasks?${qs.toString()}`);
+                                setTasks(data);
+                              } catch (e: unknown) {
+                                setError(e instanceof Error ? e.message : String(e));
+                              } finally {
+                                setResumeBusyId(null);
+                              }
+                            }}
+                          >
+                            继续字幕
+                          </button>
+                        ) : null}
+                        <Link className="rounded border px-2 py-1 text-xs hover:bg-slate-50" to={`/tasks/${t.id}`}>
+                          Detail
+                        </Link>
+                      </div>
+                    </td>
                   </tr>
                 ))}
               </tbody>
@@ -117,4 +157,3 @@ export default function TasksPage() {
     </div>
   );
 }
-
