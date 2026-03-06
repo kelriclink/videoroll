@@ -7,7 +7,7 @@ import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 import httpx
 
@@ -26,26 +26,80 @@ def _run(cmd: list[str]) -> None:
     subprocess.run(cmd, check=True)
 
 
-def _run_logged(cmd: list[str], *, log_path: Path | None) -> None:
+def _run_logged(
+    cmd: list[str],
+    *,
+    log_path: Path | None,
+    live_upload_cb: Callable[[], None] | None = None,
+    live_upload_interval_seconds: float = 3.0,
+) -> None:
     if log_path is None:
         _run(cmd)
         return
 
     log_path.parent.mkdir(parents=True, exist_ok=True)
     try:
-        with log_path.open("ab") as f:
-            try:
-                f.write(("\n$ " + " ".join(cmd) + "\n").encode("utf-8", errors="replace"))
-                f.flush()
-            except Exception:
-                pass
-            subprocess.run(cmd, check=True, stdout=f, stderr=f)
+        f = log_path.open("ab")
     except Exception:
-        # If logging fails, still run the command so the pipeline doesn't break.
+        # If logging can't even open the file, still run the command so the pipeline doesn't break.
         _run(cmd)
+        return
+
+    with f:
+        try:
+            f.write(("\n$ " + " ".join(cmd) + "\n").encode("utf-8", errors="replace"))
+            f.flush()
+        except Exception:
+            pass
+
+        if live_upload_cb is None:
+            subprocess.run(cmd, check=True, stdout=f, stderr=f)
+            return
+
+        try:
+            proc = subprocess.Popen(cmd, stdout=f, stderr=f)
+        except Exception:
+            # If we can't start the process with live upload, fall back to the simple runner.
+            subprocess.run(cmd, check=True, stdout=f, stderr=f)
+            return
+
+        interval = float(live_upload_interval_seconds or 0)
+        if interval <= 0:
+            interval = 3.0
+        # Keep it responsive without busy-looping.
+        tick_sleep = min(0.25, interval)
+
+        next_upload_at = time.monotonic() + interval
+        while True:
+            rc = proc.poll()
+            now = time.monotonic()
+            if now >= next_upload_at:
+                try:
+                    live_upload_cb()
+                except Exception:
+                    pass
+                next_upload_at = now + interval
+            if rc is not None:
+                break
+            time.sleep(tick_sleep)
+
+        try:
+            live_upload_cb()
+        except Exception:
+            pass
+
+        if rc != 0:
+            raise subprocess.CalledProcessError(int(rc), cmd)
 
 
-def extract_audio(ffmpeg_path: str, video_path: Path, audio_path: Path, *, log_path: Path | None = None) -> None:
+def extract_audio(
+    ffmpeg_path: str,
+    video_path: Path,
+    audio_path: Path,
+    *,
+    log_path: Path | None = None,
+    live_upload_cb: Callable[[], None] | None = None,
+) -> None:
     audio_path.parent.mkdir(parents=True, exist_ok=True)
     cmd = [
         ffmpeg_path,
@@ -59,7 +113,7 @@ def extract_audio(ffmpeg_path: str, video_path: Path, audio_path: Path, *, log_p
         "16000",
         str(audio_path),
     ]
-    _run_logged(cmd, log_path=log_path)
+    _run_logged(cmd, log_path=log_path, live_upload_cb=live_upload_cb)
 
 
 def transcribe_mock(_audio_path: Path) -> list[Segment]:
@@ -609,6 +663,7 @@ def render_burn_in(
     preset: str | int | None = None,
     crf: int | None = None,
     log_path: Path | None = None,
+    live_upload_cb: Callable[[], None] | None = None,
 ) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     codec = str(video_codec or "").strip().lower() or "av1"
@@ -655,10 +710,18 @@ def render_burn_in(
         "copy",
         str(output_path),
     ]
-    _run_logged(cmd, log_path=log_path)
+    _run_logged(cmd, log_path=log_path, live_upload_cb=live_upload_cb)
 
 
-def mux_soft_sub(ffmpeg_path: str, video_path: Path, srt_path: Path, output_path: Path, *, log_path: Path | None = None) -> None:
+def mux_soft_sub(
+    ffmpeg_path: str,
+    video_path: Path,
+    srt_path: Path,
+    output_path: Path,
+    *,
+    log_path: Path | None = None,
+    live_upload_cb: Callable[[], None] | None = None,
+) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     cmd = [
         ffmpeg_path,
@@ -681,7 +744,7 @@ def mux_soft_sub(ffmpeg_path: str, video_path: Path, srt_path: Path, output_path
         "language=chi",
         str(output_path),
     ]
-    _run_logged(cmd, log_path=log_path)
+    _run_logged(cmd, log_path=log_path, live_upload_cb=live_upload_cb)
 
 
 def write_json(path: Path, data: Any) -> None:

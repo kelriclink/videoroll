@@ -5,5 +5,4 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
 ENV_FILE="${ENV_FILE:-.env}"
-docker compose --env-file "$ENV_FILE" down
-
+docker compose -f docker-compose.yml --env-file "$ENV_FILE" down

@@ -320,3 +320,26 @@ class IngestedVideo(Base):
         UniqueConstraint("platform", "source_id", name="uq_ingested_videos_platform_source_id"),
         Index("ix_ingested_videos_task", "task_id"),
     )
+
+
+class YouTubeVideoMeta(Base):
+    __tablename__ = "youtube_video_meta"
+
+    task_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("tasks.id", ondelete="CASCADE"), primary_key=True)
+
+    source_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)  # youtube videoId
+
+    title: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    description: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    webpage_url: Mapped[str] = mapped_column(Text, nullable=False, default="")
+
+    uploader: Mapped[Optional[str]] = mapped_column(String(256), nullable=True)
+    upload_date: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)  # YYYYMMDD
+    duration: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+
+    __table_args__ = (
+        Index("ix_youtube_video_meta_source_id", "source_id"),
+    )

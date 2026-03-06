@@ -104,9 +104,6 @@ def build_ydl_opts(settings: OrchestratorSettings, *, outtmpl: str | None = None
     if outtmpl:
         opts["outtmpl"] = outtmpl
 
-    if for_download:
-        opts["format"] = (settings.youtube_ytdlp_format or "").strip() or "best"
-
     return opts
 
 
@@ -251,28 +248,7 @@ def extract_youtube_metadata(url: str, settings: OrchestratorSettings) -> tuple[
     return _as_dict(sanitized), meta
 
 
-def download_youtube_video(url: str, settings: OrchestratorSettings, *, work_dir: Path) -> tuple[Path, dict[str, Any], YouTubeMeta]:
-    """
-    Downloads the best quality video to work_dir and returns:
-      - output video file path
-      - sanitized info dict
-      - meta summary
-    """
-    work_dir.mkdir(parents=True, exist_ok=True)
-    outtmpl = str(work_dir / "%(id)s.%(ext)s")
-    try:
-        with yt_dlp.YoutubeDL(build_ydl_opts(settings, outtmpl=outtmpl, for_download=True)) as ydl:
-            info_raw = ydl.extract_info(url, download=True)
-            info = _pick_video_info(info_raw)
-            if not info:
-                raise ValueError("yt-dlp returned empty info after download")
-            sanitized = ydl.sanitize_info(info)
-    except DownloadError as e:
-        raise RuntimeError(str(e)) from e
-
-    meta = summarize_info(_as_dict(sanitized), fallback_url=url)
-
-    # Determine output file.
+def _resolve_downloaded_file(info: dict[str, Any], *, work_dir: Path) -> Path:
     info_d = _as_dict(info)
     candidates: list[Path] = []
     for key in ("filepath", "_filename"):
@@ -291,7 +267,7 @@ def download_youtube_video(url: str, settings: OrchestratorSettings, *, work_dir
 
     for p in candidates:
         if p.is_file():
-            return p, _as_dict(sanitized), meta
+            return p
 
     # Fallback: pick the largest plausible media file in work_dir.
     media_exts = {".mp4", ".mkv", ".webm", ".mov", ".flv", ".avi", ".m4v"}
@@ -299,10 +275,40 @@ def download_youtube_video(url: str, settings: OrchestratorSettings, *, work_dir
     media_files = [p for p in files if p.suffix.lower() in media_exts and not p.name.endswith(".part")]
     if media_files:
         media_files.sort(key=lambda p: p.stat().st_size, reverse=True)
-        return media_files[0], _as_dict(sanitized), meta
+        return media_files[0]
 
     if files:
         files.sort(key=lambda p: p.stat().st_size, reverse=True)
-        return files[0], _as_dict(sanitized), meta
+        return files[0]
 
     raise RuntimeError("yt-dlp download succeeded but no output file was found")
+
+
+def _download_once(url: str, settings: OrchestratorSettings, *, work_dir: Path) -> tuple[Path, dict[str, Any], YouTubeMeta]:
+    work_dir.mkdir(parents=True, exist_ok=True)
+    outtmpl = str(work_dir / "%(id)s.%(ext)s")
+    with yt_dlp.YoutubeDL(build_ydl_opts(settings, outtmpl=outtmpl, for_download=True)) as ydl:
+        info_raw = ydl.extract_info(url, download=True)
+        info = _pick_video_info(info_raw)
+        if not info:
+            raise ValueError("yt-dlp returned empty info after download")
+        sanitized = ydl.sanitize_info(info)
+
+    meta = summarize_info(_as_dict(sanitized), fallback_url=url)
+    video_path = _resolve_downloaded_file(_as_dict(info), work_dir=work_dir)
+    return video_path, _as_dict(sanitized), meta
+
+
+def download_youtube_video(url: str, settings: OrchestratorSettings, *, work_dir: Path) -> tuple[Path, dict[str, Any], YouTubeMeta]:
+    """
+    Downloads the best quality video to work_dir and returns:
+      - output video file path
+      - sanitized info dict
+      - meta summary
+    """
+    try:
+        return _download_once(url, settings, work_dir=work_dir)
+    except DownloadError as e:
+        raise RuntimeError(str(e)) from e
+    except Exception as e:
+        raise RuntimeError(str(e)) from e

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import os
 import tempfile
@@ -13,19 +14,27 @@ from typing import Any, Generator, Optional
 from urllib.parse import quote, urlparse
 
 import httpx
+from botocore.exceptions import ClientError
 from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.types import ASGIApp
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from videoroll.config import OrchestratorSettings, get_orchestrator_settings
 from videoroll.db.base import Base
-from videoroll.db.models import Asset, AssetKind, PublishJob, Subtitle, SubtitleJob, SubtitleJobStatus, Task, TaskStatus
+from videoroll.db.auto_migrate import auto_migrate
+from videoroll.db.models import AppSetting, Asset, AssetKind, PublishJob, Subtitle, SubtitleJob, SubtitleJobStatus, Task, TaskStatus
 from videoroll.db.session import db_session, get_engine, get_sessionmaker
 from videoroll.storage.s3 import S3Store
+from videoroll.utils.internal_api_token import internal_api_token
 from videoroll.utils.hashing import sha256_file
 from videoroll.apps.orchestrator_api.schemas import (
+    AdminAuthLoginRequest,
+    AdminAuthSetupRequest,
+    AdminAuthStatusRead,
     AssetRead,
     AutoYouTubeRequest,
     AutoYouTubeResponse,
@@ -48,6 +57,18 @@ from videoroll.apps.orchestrator_api.schemas import (
     YouTubeMetaActionResponse,
     YouTubeMetaRead,
 )
+from videoroll.apps.orchestrator_api.admin_auth_store import (
+    DEVICE_COOKIE_NAME,
+    INTERNAL_TOKEN_HEADER,
+    device_cookie_max_age_seconds,
+    encode_password_hash,
+    get_password_hash,
+    set_password_hash,
+    mint_device_cookie_value,
+    validate_new_password,
+    verify_device_cookie_value,
+    verify_password_hash,
+)
 from videoroll.apps.orchestrator_api.youtube_downloader import (
     download_youtube_video,
     download_thumbnail_jpg,
@@ -59,8 +80,14 @@ from videoroll.apps.orchestrator_api.storage_retention_store import (
     update_storage_retention_settings,
 )
 from videoroll.apps.subtitle_service.bilibili_tags_store import get_task_bilibili_tags
-from videoroll.apps.subtitle_service.task_title_store import get_task_display_title
-from videoroll.apps.youtube_settings_store import get_youtube_settings, update_youtube_settings
+from videoroll.apps.subtitle_service.task_title_store import get_task_display_title_with_s3
+from videoroll.apps.youtube_settings_store import (
+    get_youtube_cookies_txt,
+    get_youtube_settings,
+    normalize_and_validate_netscape_cookies_txt,
+    summarize_netscape_cookies_txt,
+    update_youtube_settings,
+)
 
 
 def get_settings() -> OrchestratorSettings:
@@ -152,10 +179,10 @@ def _content_disposition(filename: str, *, inline: bool) -> str:
     return f"{disp}; filename=\"{fallback}\"; filename*=UTF-8''{encoded}"
 
 
-def _suggest_asset_filename(db: Session, task_id: uuid.UUID, asset: Asset) -> str:
+def _suggest_asset_filename(db: Session, task_id: uuid.UUID, asset: Asset, *, s3: S3Store | None) -> str:
     base = Path(asset.storage_key).name or "download.bin"
     if asset.kind == AssetKind.video_final:
-        title = get_task_display_title(db, str(task_id)).strip()
+        title = get_task_display_title_with_s3(db, str(task_id), s3=s3).strip()
         if title:
             ext = Path(base).suffix
             if ext and len(ext) <= 8:
@@ -241,11 +268,101 @@ def _read_s3_bytes(s3: S3Store, key: str) -> bytes:
             pass
 
 
+def _publish_meta_s3_key(task_id: uuid.UUID) -> str:
+    return f"meta/{task_id}/publish_meta.json"
+
+
+def _read_s3_json_object(s3: S3Store, key: str) -> dict[str, Any] | None:
+    try:
+        raw = _read_s3_bytes(s3, key)
+    except ClientError as e:
+        code = str((_as_dict(e.response.get("Error")).get("Code") or "")).strip()
+        if code in {"NoSuchKey", "404", "NotFound"}:
+            return None
+        raise
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw.decode("utf-8"))
+    except Exception:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _is_s3_object_missing(e: ClientError) -> bool:
+    code = str((_as_dict(e.response.get("Error")).get("Code") or "")).strip()
+    return code in {"NoSuchKey", "404", "NotFound"}
+
+
+def _write_s3_json(s3: S3Store, key: str, obj: dict[str, Any]) -> bytes:
+    payload = json.dumps(obj, ensure_ascii=False, indent=2).encode("utf-8")
+    s3.put_bytes(payload, key, content_type="application/json")
+    return payload
+
+
+def _internal_header_token(settings: OrchestratorSettings) -> str:
+    return internal_api_token(settings.s3_secret_access_key)
+
+
+def _admin_cookie_secret(settings: OrchestratorSettings) -> str:
+    # Separate derivation so leaking the internal header token does not automatically
+    # reveal the cookie signing secret.
+    return internal_api_token(settings.s3_secret_access_key + ":admin-cookie")
+
+
+def _internal_http_headers(settings: OrchestratorSettings) -> dict[str, str]:
+    tok = _internal_header_token(settings)
+    return {INTERNAL_TOKEN_HEADER: tok} if tok else {}
+
+
+class _AdminAuthMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        if request.method == "OPTIONS":
+            return await call_next(request)
+
+        # Normalize path for allowlist checks.
+        #
+        # When running behind a reverse proxy or with `uvicorn --root-path`,
+        # `request.url.path` may include `scope["root_path"]` (e.g. "/api/auth/status"),
+        # while route matching is done on the "app path" (e.g. "/auth/status").
+        scope_path = str(request.scope.get("path") or getattr(request.url, "path", "") or "/")
+        root_path = str(request.scope.get("root_path") or "").strip()
+        path = scope_path
+        if root_path and path.startswith(root_path):
+            path = path[len(root_path) :] or "/"
+        if path == "/health" or path.endswith("/health"):
+            return await call_next(request)
+        if path.startswith("/auth"):
+            return await call_next(request)
+
+        pw_hash = _get_admin_password_hash(request)
+        if not pw_hash:
+            return JSONResponse(status_code=403, content={"detail": "admin password not set"})
+
+        internal_header_token = str(getattr(request.app.state, "internal_header_token", "") or "").strip()
+        header_tok = str(request.headers.get(INTERNAL_TOKEN_HEADER) or "").strip()
+        if internal_header_token and header_tok and hmac.compare_digest(header_tok, internal_header_token):
+            return await call_next(request)
+
+        cookie_val = str(request.cookies.get(DEVICE_COOKIE_NAME) or "").strip()
+        cookie_secret = str(getattr(request.app.state, "admin_cookie_secret", "") or "").strip()
+        if cookie_val and cookie_secret and verify_device_cookie_value(
+            cookie_val,
+            internal_secret=cookie_secret,
+            password_hash=pw_hash,
+        ):
+            return await call_next(request)
+
+        return JSONResponse(status_code=401, content={"detail": "unauthorized"})
+
+
 app = FastAPI(title="videoroll-orchestrator", version="0.1.0")
 
 _cleanup_stop = threading.Event()
 _cleanup_thread: Optional[threading.Thread] = None
 _cleanup_interval_seconds = int(os.getenv("STORAGE_CLEANUP_INTERVAL_SECONDS", "3600") or "3600")
+
+app.add_middleware(_AdminAuthMiddleware)
 
 
 _cors_origins = [
@@ -267,7 +384,17 @@ def _startup() -> None:
     settings = get_orchestrator_settings()
     engine = get_engine(settings.database_url)
     Base.metadata.create_all(engine)
+    auto_migrate(settings.database_url)
     S3Store(settings).ensure_bucket()
+    app.state.database_url = settings.database_url
+    app.state.internal_header_token = _internal_header_token(settings)
+    app.state.admin_cookie_secret = _admin_cookie_secret(settings)
+    SessionLocal = get_sessionmaker(settings.database_url)
+    db = SessionLocal()
+    try:
+        app.state.admin_password_hash = get_password_hash(db)
+    finally:
+        db.close()
     _start_cleanup_thread()
 
 
@@ -368,15 +495,203 @@ def _start_cleanup_thread() -> None:
     _cleanup_thread = t
 
 
-def _effective_youtube_settings(settings: OrchestratorSettings, db: Session) -> OrchestratorSettings:
+def _effective_youtube_settings(settings: OrchestratorSettings, db: Session, *, cookie_dir: Path | None = None) -> OrchestratorSettings:
     cfg = get_youtube_settings(db, default_proxy=settings.youtube_proxy)
     proxy = str(cfg.get("proxy") or "").strip()
-    return settings.model_copy(update={"youtube_proxy": proxy or None})
+    cookies_enabled = bool(cfg.get("cookies_enabled"))
+
+    cookie_file = str(settings.youtube_cookie_file or "").strip() or None
+    if cookie_file:
+        try:
+            if not Path(cookie_file).is_file() and cookie_dir is not None and cookies_enabled:
+                # Fall back to the DB-stored cookies when the env-configured cookie file is missing.
+                cookie_file = None
+        except Exception:
+            pass
+    if not cookie_file and cookie_dir is not None and cookies_enabled:
+        cookies_txt = get_youtube_cookies_txt(db)
+        if cookies_txt:
+            cookies_txt = normalize_and_validate_netscape_cookies_txt(cookies_txt)
+            try:
+                cookie_dir.mkdir(parents=True, exist_ok=True)
+                cookie_path = cookie_dir / "youtube_cookies.txt"
+                cookie_path.write_text(cookies_txt, encoding="utf-8")
+                try:
+                    os.chmod(cookie_path, 0o600)
+                except Exception:
+                    pass
+                cookie_file = str(cookie_path)
+            except Exception:
+                cookie_file = None
+
+    return settings.model_copy(update={"youtube_proxy": proxy or None, "youtube_cookie_file": cookie_file})
+
+
+def _looks_like_youtube_bot_check_error(message: str) -> bool:
+    m = str(message or "").lower()
+    return (
+        "not a bot" in m
+        or "unusual traffic" in m
+        or "/sorry/" in m
+        or "confirm you" in m and "not a bot" in m
+    )
+
+
+def _youtube_bot_check_hint(message: str, *, yt_settings: OrchestratorSettings, db: Session) -> str | None:
+    if not _looks_like_youtube_bot_check_error(message):
+        return None
+
+    proxy = str(yt_settings.youtube_proxy or "").strip()
+    cookie_file = str(yt_settings.youtube_cookie_file or "").strip()
+
+    summary: dict[str, Any] | None = None
+    if cookie_file:
+        try:
+            p = Path(cookie_file)
+            if p.is_file():
+                summary = summarize_netscape_cookies_txt(p.read_text(encoding="utf-8", errors="ignore"))
+        except Exception:
+            summary = None
+
+    if summary is None:
+        try:
+            summary = summarize_netscape_cookies_txt(get_youtube_cookies_txt(db))
+        except Exception:
+            summary = summarize_netscape_cookies_txt("")
+
+    lines: list[str] = []
+    lines.append("提示：YouTube 触发了“确认你不是机器人/异常流量”风控页面（与出口 IP/代理或 cookies 有关）。")
+    if proxy:
+        lines.append(f"当前代理：{proxy}")
+        lines.append("请用同一个代理/IP 在浏览器打开 YouTube，按提示完成登录/验证码后再导出 cookies.txt 更新到系统。")
+    else:
+        lines.append("如果当前出口 IP 被风控，建议更换网络或配置可用代理后再导出 cookies.txt。")
+
+    if not bool(summary.get("cookies_has_auth")):
+        lines.append("你保存的 cookies 看起来不包含登录态（缺少 SID/SAPISID 等）；仅 VISITOR_INFO1_LIVE 这类 cookie 通常不够。")
+    if not bool(summary.get("cookies_has_bot_check_bypass")):
+        lines.append("若浏览器出现过“确认你不是机器人”页面，需要在同一出口 IP 下通过验证码后再导出（通常会生成 GOOGLE_ABUSE_EXEMPTION）。")
+    lines.append("建议用无痕/新会话导出并尽快更新，YouTube 会频繁轮换账号 cookies，旧 cookies 可能很快失效。")
+    return "\n".join(lines)
+
+
+def _youtube_cookie_file_status(settings: OrchestratorSettings) -> tuple[bool, bool]:
+    cookie_file = str(settings.youtube_cookie_file or "").strip()
+    if not cookie_file:
+        return False, False
+    try:
+        return True, Path(cookie_file).is_file()
+    except Exception:
+        return True, False
 
 
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+def _secure_cookie(request: Request) -> bool:
+    proto = str(request.headers.get("x-forwarded-proto") or request.url.scheme or "").lower()
+    return proto == "https"
+
+
+def _set_device_cookie(resp: Response, value: str, *, secure: bool) -> None:
+    resp.set_cookie(
+        key=DEVICE_COOKIE_NAME,
+        value=value,
+        max_age=device_cookie_max_age_seconds(),
+        httponly=True,
+        samesite="lax",
+        secure=bool(secure),
+        path="/",
+    )
+
+
+def _get_admin_password_hash(request: Request, db: Session | None = None) -> str:
+    cached = str(getattr(request.app.state, "admin_password_hash", "") or "").strip()
+    if cached:
+        return cached
+
+    pw_hash = ""
+    if db is not None:
+        try:
+            pw_hash = str(get_password_hash(db) or "").strip()
+        except Exception:
+            pw_hash = ""
+    else:
+        database_url = str(getattr(request.app.state, "database_url", "") or "").strip()
+        if database_url:
+            SessionLocal = get_sessionmaker(database_url)
+            db2 = SessionLocal()
+            try:
+                pw_hash = str(get_password_hash(db2) or "").strip()
+            finally:
+                db2.close()
+
+    if pw_hash:
+        request.app.state.admin_password_hash = pw_hash
+    return pw_hash
+
+
+@app.get("/auth/status", response_model=AdminAuthStatusRead)
+def auth_status(request: Request, db: Session = Depends(get_db)) -> AdminAuthStatusRead:
+    pw_hash = _get_admin_password_hash(request, db)
+    password_set = bool(pw_hash)
+
+    trusted = False
+    if password_set:
+        cookie_secret = str(getattr(request.app.state, "admin_cookie_secret", "") or "").strip()
+        cookie_val = str(request.cookies.get(DEVICE_COOKIE_NAME) or "").strip()
+        if cookie_secret and cookie_val:
+            trusted = verify_device_cookie_value(cookie_val, internal_secret=cookie_secret, password_hash=pw_hash)
+
+    return AdminAuthStatusRead(password_set=password_set, trusted=trusted)
+
+
+@app.post("/auth/setup", response_model=AdminAuthStatusRead)
+def auth_setup(payload: AdminAuthSetupRequest, request: Request, db: Session = Depends(get_db)) -> JSONResponse:
+    existing = _get_admin_password_hash(request, db)
+    if existing:
+        raise HTTPException(status_code=400, detail="admin password already set")
+
+    pw = validate_new_password(payload.password)
+    encoded = encode_password_hash(pw)
+    set_password_hash(db, encoded)
+    request.app.state.admin_password_hash = encoded
+
+    cookie_secret = str(getattr(request.app.state, "admin_cookie_secret", "") or "").strip()
+    cookie_val = mint_device_cookie_value(internal_secret=cookie_secret, password_hash=encoded)
+    body = AdminAuthStatusRead(password_set=True, trusted=True).model_dump(mode="json")
+    resp = JSONResponse(status_code=200, content=body)
+    _set_device_cookie(resp, cookie_val, secure=_secure_cookie(request))
+    return resp
+
+
+@app.post("/auth/login", response_model=AdminAuthStatusRead)
+def auth_login(payload: AdminAuthLoginRequest, request: Request, db: Session = Depends(get_db)) -> JSONResponse:
+    pw_hash = _get_admin_password_hash(request, db)
+    if not pw_hash:
+        raise HTTPException(status_code=400, detail="admin password is not set")
+
+    if not verify_password_hash(str(payload.password or ""), pw_hash):
+        raise HTTPException(status_code=401, detail="invalid password")
+
+    cookie_secret = str(getattr(request.app.state, "admin_cookie_secret", "") or "").strip()
+    cookie_val = mint_device_cookie_value(internal_secret=cookie_secret, password_hash=pw_hash)
+    body = AdminAuthStatusRead(password_set=True, trusted=True).model_dump(mode="json")
+    resp = JSONResponse(status_code=200, content=body)
+    _set_device_cookie(resp, cookie_val, secure=_secure_cookie(request))
+    return resp
+
+
+@app.post("/auth/logout", response_model=AdminAuthStatusRead)
+def auth_logout(request: Request, db: Session = Depends(get_db)) -> JSONResponse:
+    pw_hash = _get_admin_password_hash(request, db)
+    password_set = bool(pw_hash)
+    body = AdminAuthStatusRead(password_set=password_set, trusted=False).model_dump(mode="json")
+    resp = JSONResponse(status_code=200, content=body)
+    resp.delete_cookie(key=DEVICE_COOKIE_NAME, path="/")
+    return resp
 
 
 @app.post("/auto/youtube", response_model=AutoYouTubeResponse)
@@ -391,7 +706,7 @@ def auto_youtube(
         raise HTTPException(status_code=400, detail="url is not a valid youtube url")
 
     try:
-        with httpx.Client(timeout=30.0) as client:
+        with httpx.Client(timeout=30.0, headers=_internal_http_headers(settings)) as client:
             resp = client.post(
                 f"{settings.youtube_ingest_url}/youtube/ingest",
                 json={"url": url, "license": payload.license.value, "proof_url": payload.proof_url},
@@ -440,6 +755,7 @@ def create_task(payload: TaskCreate, db: Session = Depends(get_db)) -> Task:
 def list_converted_videos(
     limit: int = Query(default=50, ge=1, le=200),
     db: Session = Depends(get_db),
+    s3: S3Store = Depends(get_s3),
 ) -> list[dict[str, Any]]:
     # Fetch recent video_final assets and dedupe by task_id (keep latest per task).
     fetch_n = min(1000, max(limit, 1) * 5)
@@ -466,7 +782,7 @@ def list_converted_videos(
             .order_by(Asset.created_at.desc())
             .first()
         )
-        display_title = get_task_display_title(db, str(a.task_id))
+        display_title = get_task_display_title_with_s3(db, str(a.task_id), s3=s3)
         items.append({"task": task, "final_asset": a, "cover_asset": cover_asset, "display_title": display_title or None})
         if len(items) >= limit:
             break
@@ -478,11 +794,65 @@ def list_tasks(
     status: Optional[TaskStatus] = Query(default=None),
     limit: int = Query(default=50, ge=1, le=500),
     db: Session = Depends(get_db),
-) -> list[Task]:
+    s3: S3Store = Depends(get_s3),
+) -> list[dict[str, Any]]:
+    def _title_key(tid: uuid.UUID) -> str:
+        return f"task.title.{tid}"
+
     q = db.query(Task).order_by(Task.created_at.desc())
     if status is not None:
         q = q.filter(Task.status == status)
-    return q.limit(limit).all()
+    tasks = q.limit(limit).all()
+
+    ids = [t.id for t in tasks]
+
+    # Batch load translated/source titles from AppSetting first, then fall back to YouTube meta title.
+    title_map: dict[uuid.UUID, str] = {}
+    if ids:
+        keys = [_title_key(tid) for tid in ids]
+        rows = db.query(AppSetting).filter(AppSetting.key.in_(keys)).all()
+        by_key: dict[str, dict[str, Any]] = {}
+        for r in rows:
+            by_key[str(r.key)] = _as_dict(getattr(r, "value_json", None))
+
+        for tid in ids:
+            data = by_key.get(_title_key(tid)) or {}
+            for k in ("translated_title", "source_title"):
+                v = data.get(k)
+                if isinstance(v, str) and v.strip():
+                    title_map[tid] = v.strip()
+                    break
+
+        missing = [tid for tid in ids if tid not in title_map]
+        if missing:
+            assets = (
+                db.query(Asset)
+                .filter(Asset.task_id.in_(missing), Asset.kind == AssetKind.metadata_json)
+                .order_by(Asset.created_at.desc())
+                .all()
+            )
+            picked: dict[uuid.UUID, Asset] = {}
+            for a in assets:
+                if a.task_id not in picked:
+                    picked[a.task_id] = a
+            for tid, asset in picked.items():
+                try:
+                    raw = _read_s3_bytes(s3, asset.storage_key)
+                    parsed = json.loads(raw.decode("utf-8")) if raw else {}
+                    info = parsed if isinstance(parsed, dict) else {}
+                except Exception:
+                    continue
+                title = str(info.get("title") or info.get("fulltitle") or info.get("alt_title") or "").strip()
+                if title:
+                    title_map[tid] = title
+
+    out: list[dict[str, Any]] = []
+    for t in tasks:
+        item = TaskRead.model_validate(t).model_dump()
+        display_title = str(title_map.get(t.id) or "").strip()
+        item["display_title"] = display_title or None
+        out.append(item)
+    return out
 
 
 @app.get("/settings/storage", response_model=StorageRetentionSettingsRead)
@@ -503,7 +873,8 @@ def put_storage_settings(payload: StorageRetentionSettingsUpdate, db: Session = 
 @app.get("/settings/youtube", response_model=YouTubeSettingsRead)
 def get_youtube_settings_view(settings: OrchestratorSettings = Depends(get_settings), db: Session = Depends(get_db)) -> YouTubeSettingsRead:
     cfg = get_youtube_settings(db, default_proxy=settings.youtube_proxy)
-    return YouTubeSettingsRead(**cfg)
+    cookie_file_configured, cookie_file_exists = _youtube_cookie_file_status(settings)
+    return YouTubeSettingsRead(**cfg, cookie_file_configured=cookie_file_configured, cookie_file_exists=cookie_file_exists)
 
 
 @app.put("/settings/youtube", response_model=YouTubeSettingsRead)
@@ -516,7 +887,8 @@ def put_youtube_settings_view(
         cfg = update_youtube_settings(db, payload.model_dump(exclude_unset=True), default_proxy=settings.youtube_proxy)
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
-    return YouTubeSettingsRead(**cfg)
+    cookie_file_configured, cookie_file_exists = _youtube_cookie_file_status(settings)
+    return YouTubeSettingsRead(**cfg, cookie_file_configured=cookie_file_configured, cookie_file_exists=cookie_file_exists)
 
 
 @app.post("/settings/youtube/test", response_model=YouTubeProxyTestResponse)
@@ -581,11 +953,14 @@ def test_youtube_proxy(
 
 
 @app.get("/tasks/{task_id}", response_model=TaskRead)
-def get_task(task_id: uuid.UUID, db: Session = Depends(get_db)) -> Task:
+def get_task(task_id: uuid.UUID, db: Session = Depends(get_db), s3: S3Store = Depends(get_s3)) -> dict[str, Any]:
     task = db.get(Task, task_id)
     if not task:
         raise HTTPException(status_code=404, detail="task not found")
-    return task
+    item = TaskRead.model_validate(task).model_dump()
+    title = get_task_display_title_with_s3(db, str(task_id), s3=s3).strip()
+    item["display_title"] = title or None
+    return item
 
 
 @app.post("/tasks/{task_id}/upload/video", response_model=AssetRead)
@@ -600,7 +975,6 @@ async def upload_task_video(
         raise HTTPException(status_code=404, detail="task not found")
 
     suffix = Path(file.filename or "").suffix or ".mp4"
-    key = f"raw/{task_id}/video{suffix}"
 
     with tempfile.NamedTemporaryFile(prefix="videoroll_", suffix=suffix, delete=False) as tmp:
         tmp_path = Path(tmp.name)
@@ -612,6 +986,7 @@ async def upload_task_video(
 
     sha256 = sha256_file(tmp_path)
     size_bytes = tmp_path.stat().st_size
+    key = f"raw/{task_id}/video_{sha256[:16]}{suffix}"
     s3.upload_file(tmp_path, key)
     try:
         tmp_path.unlink(missing_ok=True)
@@ -648,7 +1023,6 @@ async def upload_task_cover(
         raise HTTPException(status_code=400, detail="cover must be an image")
 
     suffix = Path(file.filename or "").suffix or ".jpg"
-    key = f"final/{task_id}/cover{suffix}"
 
     with tempfile.NamedTemporaryFile(prefix="videoroll_cover_", suffix=suffix, delete=False) as tmp:
         tmp_path = Path(tmp.name)
@@ -660,6 +1034,7 @@ async def upload_task_cover(
 
     sha256 = sha256_file(tmp_path)
     size_bytes = tmp_path.stat().st_size
+    key = f"final/{task_id}/cover_{sha256[:16]}{suffix}"
     s3.upload_file(tmp_path, key)
     try:
         tmp_path.unlink(missing_ok=True)
@@ -697,10 +1072,15 @@ def download_task_asset(
     if not asset or asset.task_id != task_id:
         raise HTTPException(status_code=404, detail="asset not found")
 
-    resp = s3.get_object(asset.storage_key)
+    try:
+        resp = s3.get_object(asset.storage_key)
+    except ClientError as e:
+        if _is_s3_object_missing(e):
+            raise HTTPException(status_code=404, detail="asset object not found") from e
+        raise
     body = resp["Body"]
     media_type = resp.get("ContentType") or "application/octet-stream"
-    filename = _suggest_asset_filename(db, task_id, asset)
+    filename = _suggest_asset_filename(db, task_id, asset, s3=s3)
 
     headers = {"Content-Disposition": _content_disposition(filename, inline=False)}
     length = resp.get("ContentLength") or asset.size_bytes
@@ -722,7 +1102,7 @@ def stream_task_asset(
     if not asset or asset.task_id != task_id:
         raise HTTPException(status_code=404, detail="asset not found")
 
-    filename = _suggest_asset_filename(db, task_id, asset)
+    filename = _suggest_asset_filename(db, task_id, asset, s3=s3)
 
     total_size: int | None = None
     media_type = "application/octet-stream"
@@ -747,7 +1127,12 @@ def stream_task_asset(
             return Response(status_code=416, headers={"Content-Range": f"bytes */{total_size}"})
         start, end = parsed
 
-        resp = s3.get_object(asset.storage_key, range_bytes=f"bytes={start}-{end}")
+        try:
+            resp = s3.get_object(asset.storage_key, range_bytes=f"bytes={start}-{end}")
+        except ClientError as e:
+            if _is_s3_object_missing(e):
+                raise HTTPException(status_code=404, detail="asset object not found") from e
+            raise
         body = resp["Body"]
         headers = {
             **base_headers,
@@ -761,7 +1146,12 @@ def stream_task_asset(
             headers=headers,
         )
 
-    resp = s3.get_object(asset.storage_key)
+    try:
+        resp = s3.get_object(asset.storage_key)
+    except ClientError as e:
+        if _is_s3_object_missing(e):
+            raise HTTPException(status_code=404, detail="asset object not found") from e
+        raise
     body = resp["Body"]
     media_type = resp.get("ContentType") or media_type
     headers = dict(base_headers)
@@ -789,6 +1179,11 @@ def delete_task_asset(
     db.query(Subtitle).filter(Subtitle.task_id == task_id, Subtitle.storage_key == asset.storage_key).delete(
         synchronize_session=False
     )
+    remaining_final = (
+        db.query(Asset)
+        .filter(Asset.task_id == task_id, Asset.kind == AssetKind.video_final, Asset.id != asset_id)
+        .first()
+    )
     db.delete(asset)
     db.commit()
     return {"deleted": True}
@@ -801,6 +1196,68 @@ def _is_youtube_url(url: str) -> bool:
         return False
     host = (parsed.netloc or "").lower()
     return host.endswith("youtube.com") or host == "youtu.be" or host.endswith(".youtube.com")
+
+
+@app.get("/tasks/{task_id}/youtube_meta", response_model=YouTubeMetaRead)
+def get_cached_youtube_meta(task_id: uuid.UUID, db: Session = Depends(get_db), s3: S3Store = Depends(get_s3)) -> YouTubeMetaRead:
+    task = db.get(Task, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="task not found")
+    if task.source_type.value != "youtube":
+        raise HTTPException(status_code=400, detail="task is not a youtube source")
+
+    latest = (
+        db.query(Asset)
+        .filter(Asset.task_id == task_id, Asset.kind == AssetKind.metadata_json)
+        .order_by(Asset.created_at.desc())
+        .first()
+    )
+    if not latest:
+        raise HTTPException(status_code=404, detail="youtube meta not found")
+
+    try:
+        raw = _read_s3_bytes(s3, latest.storage_key)
+        parsed = json.loads(raw.decode("utf-8")) if raw else {}
+        info = parsed if isinstance(parsed, dict) else {}
+        meta = summarize_info(info, fallback_url=str(task.source_url or "").strip())
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"failed to read youtube meta: {e}") from e
+
+    webpage_url = str(meta.webpage_url or "").strip()
+    if not webpage_url:
+        raise HTTPException(status_code=400, detail="task.source_url is empty")
+
+    return _youtube_meta_to_read(meta)
+
+
+@app.get("/tasks/{task_id}/publish_meta")
+def get_task_publish_meta(task_id: uuid.UUID, db: Session = Depends(get_db), s3: S3Store = Depends(get_s3)) -> dict[str, Any]:
+    if not db.get(Task, task_id):
+        raise HTTPException(status_code=404, detail="task not found")
+    key = _publish_meta_s3_key(task_id)
+    obj = _read_s3_json_object(s3, key)
+    if obj is None:
+        raise HTTPException(status_code=404, detail="publish_meta not found")
+    return obj
+
+
+@app.put("/tasks/{task_id}/publish_meta")
+def put_task_publish_meta(
+    task_id: uuid.UUID,
+    meta: dict[str, Any],
+    db: Session = Depends(get_db),
+    s3: S3Store = Depends(get_s3),
+) -> dict[str, Any]:
+    if not db.get(Task, task_id):
+        raise HTTPException(status_code=404, detail="task not found")
+    if not isinstance(meta, dict):
+        raise HTTPException(status_code=400, detail="meta must be an object")
+    key = _publish_meta_s3_key(task_id)
+    try:
+        _write_s3_json(s3, key, meta)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"failed to write publish_meta: {e}") from e
+    return {"stored": True, "key": key}
 
 
 @app.post("/tasks/{task_id}/actions/youtube_meta", response_model=YouTubeMetaActionResponse)
@@ -822,6 +1279,8 @@ def fetch_youtube_meta(
     if not _is_youtube_url(url):
         raise HTTPException(status_code=400, detail="task.source_url is not a valid youtube url")
 
+    yt_settings: OrchestratorSettings = settings
+
     latest = (
         db.query(Asset)
         .filter(Asset.task_id == task_id, Asset.kind == AssetKind.metadata_json)
@@ -839,19 +1298,33 @@ def fetch_youtube_meta(
             pass
 
     try:
-        yt_settings = _effective_youtube_settings(settings, db)
-        info, meta = extract_youtube_metadata(url, yt_settings)
+        work_root = Path(settings.work_dir) / "youtube" / str(task_id)
+        work_root.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="ytmeta_", dir=str(work_root)) as tmp:
+            try:
+                yt_settings = _effective_youtube_settings(settings, db, cookie_dir=Path(tmp))
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=f"invalid youtube cookies: {e}") from e
+            info, meta = extract_youtube_metadata(url, yt_settings)
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"youtube metadata failed: {e}") from e
-    key = f"raw/{task_id}/metadata.json"
+        hint = _youtube_bot_check_hint(str(e), yt_settings=yt_settings, db=db)
+        detail = f"youtube metadata failed: {e}"
+        if hint:
+            detail = f"{detail}\n\n{hint}"
+        raise HTTPException(status_code=502, detail=detail) from e
+
     payload = json.dumps(info, ensure_ascii=False, indent=2).encode("utf-8")
+    sha = _sha256_bytes(payload)
+    key = f"raw/{task_id}/metadata_{sha[:16]}.json"
     s3.put_bytes(payload, key, content_type="application/json")
 
     asset = Asset(
         task_id=task_id,
         kind=AssetKind.metadata_json,
         storage_key=key,
-        sha256=_sha256_bytes(payload),
+        sha256=sha,
         size_bytes=len(payload),
     )
     db.add(asset)
@@ -886,47 +1359,76 @@ def download_youtube(
         .first()
     )
 
-    yt_settings = _effective_youtube_settings(settings, db)
-
-    work_root = Path(yt_settings.work_dir) / "youtube" / str(task_id)
+    work_root = Path(settings.work_dir) / "youtube" / str(task_id)
     work_root.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="ytdlp_", dir=str(work_root)) as tmp:
         tmp_dir = Path(tmp)
+        try:
+            yt_settings = _effective_youtube_settings(settings, db, cookie_dir=tmp_dir)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=f"invalid youtube cookies: {e}") from e
         video_asset = existing_video
-        info: dict[str, Any]
-        meta: Any
+        info: dict[str, Any] = {}
+        meta: Any = None
 
         if video_asset is None:
             try:
                 video_path, info, meta = download_youtube_video(url, yt_settings, work_dir=tmp_dir)
             except Exception as e:
-                raise HTTPException(status_code=502, detail=f"youtube download failed: {e}") from e
+                hint = _youtube_bot_check_hint(str(e), yt_settings=yt_settings, db=db)
+                detail = f"youtube download failed: {e}"
+                if hint:
+                    detail = f"{detail}\n\n{hint}"
+                raise HTTPException(status_code=502, detail=detail) from e
 
             suffix = video_path.suffix.lower() or ".mp4"
-            video_key = f"raw/{task_id}/video{suffix}"
+            video_sha = sha256_file(video_path)
+            video_key = f"raw/{task_id}/video_{video_sha[:16]}{suffix}"
             s3.upload_file(video_path, video_key)
             video_asset = Asset(
                 task_id=task_id,
                 kind=AssetKind.video_raw,
                 storage_key=video_key,
-                sha256=sha256_file(video_path),
+                sha256=video_sha,
                 size_bytes=video_path.stat().st_size,
             )
             db.add(video_asset)
         else:
-            try:
-                info, meta = extract_youtube_metadata(url, yt_settings)
-            except Exception as e:
-                raise HTTPException(status_code=502, detail=f"youtube metadata failed: {e}") from e
+            # Prefer cached metadata to avoid extra YouTube requests.
+            latest_meta_asset = (
+                db.query(Asset)
+                .filter(Asset.task_id == task_id, Asset.kind == AssetKind.metadata_json)
+                .order_by(Asset.created_at.desc())
+                .first()
+            )
 
-        meta_key = f"raw/{task_id}/metadata.json"
+            info_cached: dict[str, Any] | None = None
+            if latest_meta_asset:
+                try:
+                    raw = _read_s3_bytes(s3, latest_meta_asset.storage_key)
+                    parsed = json.loads(raw.decode("utf-8")) if raw else {}
+                    info_cached = parsed if isinstance(parsed, dict) else None
+                except Exception:
+                    info_cached = None
+
+            if info_cached is not None:
+                info = _as_dict(info_cached)
+                meta = summarize_info(_as_dict(info_cached), fallback_url=url)
+            else:
+                try:
+                    info, meta = extract_youtube_metadata(url, yt_settings)
+                except Exception as e:
+                    raise HTTPException(status_code=502, detail=f"youtube metadata failed: {e}") from e
+
         meta_payload = json.dumps(info, ensure_ascii=False, indent=2).encode("utf-8")
+        meta_sha = _sha256_bytes(meta_payload)
+        meta_key = f"raw/{task_id}/metadata_{meta_sha[:16]}.json"
         s3.put_bytes(meta_payload, meta_key, content_type="application/json")
         meta_asset = Asset(
             task_id=task_id,
             kind=AssetKind.metadata_json,
             storage_key=meta_key,
-            sha256=_sha256_bytes(meta_payload),
+            sha256=meta_sha,
             size_bytes=len(meta_payload),
         )
         db.add(meta_asset)
@@ -957,6 +1459,14 @@ def download_youtube(
                     db.add(cover_asset)
         except Exception:
             cover_asset = None
+
+        if cover_asset is None:
+            cover_asset = (
+                db.query(Asset)
+                .filter(Asset.task_id == task_id, Asset.kind == AssetKind.cover_image)
+                .order_by(Asset.created_at.desc())
+                .first()
+            )
 
         if task.status in {TaskStatus.created, TaskStatus.ingested}:
             task.status = TaskStatus.downloaded
@@ -1045,6 +1555,27 @@ def enqueue_subtitle_job(
     if not task:
         raise HTTPException(status_code=404, detail="task not found")
 
+    # Avoid creating duplicate jobs for the same task when a job is already queued/running.
+    # This commonly happens when the user clicks multiple times and results in a "queued" job
+    # that won't start until the current one finishes.
+    in_flight = (
+        db.query(SubtitleJob)
+        .filter(
+            SubtitleJob.task_id == task_id,
+            SubtitleJob.status.in_([SubtitleJobStatus.queued, SubtitleJobStatus.running]),
+        )
+        .order_by(SubtitleJob.created_at.desc())
+        .first()
+    )
+    if in_flight:
+        # Best-effort scheduler kick: helps when a job is queued but a tick was dropped.
+        try:
+            with httpx.Client(timeout=5.0, headers=_internal_http_headers(settings)) as client:
+                client.post(f"{settings.subtitle_service_url}/subtitle/task_queue/tick")
+        except httpx.HTTPError:
+            pass
+        return RemoteJobResponse(job_id=in_flight.id, status=in_flight.status.value)
+
     raw_asset = (
         db.query(Asset)
         .filter(Asset.task_id == task_id, Asset.kind == AssetKind.video_raw)
@@ -1091,7 +1622,7 @@ def enqueue_subtitle_job(
     }
 
     try:
-        with httpx.Client(timeout=30.0) as client:
+        with httpx.Client(timeout=30.0, headers=_internal_http_headers(settings)) as client:
             resp = client.post(f"{settings.subtitle_service_url}/subtitle/jobs", json=req)
             resp.raise_for_status()
             data = resp.json()
@@ -1142,7 +1673,7 @@ def resume_subtitle_job(
         req_out["output_prefix"] = f"sub/{task_id}/"
 
     try:
-        with httpx.Client(timeout=30.0) as client:
+        with httpx.Client(timeout=30.0, headers=_internal_http_headers(settings)) as client:
             resp = client.post(f"{settings.subtitle_service_url}/subtitle/jobs", json=req_out)
             resp.raise_for_status()
             data = resp.json()
@@ -1158,6 +1689,7 @@ def enqueue_publish_job(
     payload: PublishActionRequest,
     settings: OrchestratorSettings = Depends(get_settings),
     db: Session = Depends(get_db),
+    s3: S3Store = Depends(get_s3),
 ) -> RemotePublishResponse:
     task = db.get(Task, task_id)
     if not task:
@@ -1177,7 +1709,13 @@ def enqueue_publish_job(
             raise HTTPException(status_code=400, detail="no final video asset found; render first")
         video_key = final_asset.storage_key
 
-    meta = dict(payload.meta or {})
+    if payload.meta is None:
+        stored = _read_s3_json_object(s3, _publish_meta_s3_key(task_id))
+        if stored is None:
+            raise HTTPException(status_code=400, detail="meta is missing and publish_meta is not found")
+        meta = dict(stored)
+    else:
+        meta = dict(payload.meta or {})
     try:
         copyright_val = int(meta.get("copyright") or 1)
     except Exception:
@@ -1204,6 +1742,12 @@ def enqueue_publish_job(
     if merged_tags:
         meta["tags"] = merged_tags
 
+    # Persist the final publish meta so publish is reproducible and editable before/after.
+    try:
+        _write_s3_json(s3, _publish_meta_s3_key(task_id), meta)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"failed to persist publish_meta: {e}") from e
+
     req = {
         "task_id": str(task_id),
         "account_id": payload.account_id,
@@ -1216,7 +1760,7 @@ def enqueue_publish_job(
         req["typeid_mode"] = typeid_mode
 
     try:
-        with httpx.Client(timeout=30.0) as client:
+        with httpx.Client(timeout=30.0, headers=_internal_http_headers(settings)) as client:
             resp = client.post(f"{settings.bilibili_publisher_url}/bilibili/publish", json=req)
             resp.raise_for_status()
             data = resp.json()

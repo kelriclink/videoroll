@@ -11,7 +11,7 @@ export default function TasksPage() {
   const [searchParams, setSearchParams] = useSearchParams();
   const [tasks, setTasks] = useState<Task[] | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [resumeBusyId, setResumeBusyId] = useState<string | null>(null);
+  const [actionBusyId, setActionBusyId] = useState<string | null>(null);
 
   const status = (searchParams.get("status") as TaskStatus | null) ?? null;
 
@@ -106,6 +106,9 @@ export default function TasksPage() {
                       <StatusBadge status={t.status} />
                     </td>
                     <td className="py-2 pr-3">
+                      {t.display_title?.trim() ? (
+                        <div className="max-w-[28rem] truncate text-sm font-semibold text-slate-900">{t.display_title}</div>
+                      ) : null}
                       <div className="text-xs text-slate-500">{t.source_type}</div>
                       <div className="max-w-[28rem] truncate text-xs text-slate-700">{t.source_url ?? "-"}</div>
                     </td>
@@ -116,11 +119,11 @@ export default function TasksPage() {
                       <div className="flex flex-wrap items-center gap-2">
                         {t.status === "FAILED" ? (
                           <button
-                            disabled={resumeBusyId === t.id}
+                            disabled={actionBusyId === t.id}
                             className="rounded border px-2 py-1 text-xs hover:bg-slate-50 disabled:opacity-50"
                             onClick={async () => {
                               if (!confirm("继续字幕任务？会尽量从已有产物处继续（resume=true）。")) return;
-                              setResumeBusyId(t.id);
+                              setActionBusyId(t.id);
                               setError(null);
                               try {
                                 const resp = await fetchJson<SubtitleActionResponse>(`${ORCHESTRATOR_URL}/tasks/${t.id}/actions/subtitle_resume`, {
@@ -135,11 +138,36 @@ export default function TasksPage() {
                               } catch (e: unknown) {
                                 setError(e instanceof Error ? e.message : String(e));
                               } finally {
-                                setResumeBusyId(null);
+                                setActionBusyId(null);
                               }
                             }}
                           >
                             继续字幕
+                          </button>
+                        ) : null}
+                        {t.status === "FAILED" && t.source_type === "youtube" && !!(t.source_url ?? "").trim() ? (
+                          <button
+                            disabled={actionBusyId === t.id}
+                            className="rounded border px-2 py-1 text-xs hover:bg-slate-50 disabled:opacity-50"
+                            onClick={async () => {
+                              if (!confirm("重试 YouTube 下载（会重新拉取视频/元信息/封面）？")) return;
+                              setActionBusyId(t.id);
+                              setError(null);
+                              try {
+                                await fetchJson(`${ORCHESTRATOR_URL}/tasks/${t.id}/actions/youtube_download`, { method: "POST" });
+                                const qs = new URLSearchParams();
+                                if (status) qs.set("status", status);
+                                qs.set("limit", "200");
+                                const data = await fetchJson<Task[]>(`${ORCHESTRATOR_URL}/tasks?${qs.toString()}`);
+                                setTasks(data);
+                              } catch (e: unknown) {
+                                setError(e instanceof Error ? e.message : String(e));
+                              } finally {
+                                setActionBusyId(null);
+                              }
+                            }}
+                          >
+                            重试下载
                           </button>
                         ) : null}
                         <Link className="rounded border px-2 py-1 text-xs hover:bg-slate-50" to={`/tasks/${t.id}`}>

@@ -4,14 +4,14 @@ function env(name: string): string | undefined {
   return v;
 }
 
-function hostBase(port: number): string {
-  if (typeof window !== "undefined" && window.location?.hostname) {
-    return `http://${window.location.hostname}:${port}`;
-  }
-  return `http://localhost:${port}`;
+function defaultOrchestratorUrl(): string {
+  // When served behind nginx (single-port mode), use same-origin proxy.
+  if (typeof window !== "undefined") return "/api";
+  // Fallback (non-browser environments).
+  return "http://localhost:8000";
 }
 
-export const ORCHESTRATOR_URL = env("VITE_ORCHESTRATOR_URL") ?? hostBase(8000);
+export const ORCHESTRATOR_URL = env("VITE_ORCHESTRATOR_URL") ?? defaultOrchestratorUrl();
 export const SUBTITLE_SERVICE_URL =
   env("VITE_SUBTITLE_SERVICE_URL") ?? `${ORCHESTRATOR_URL}/subtitle-service`;
 export const YOUTUBE_INGEST_URL =

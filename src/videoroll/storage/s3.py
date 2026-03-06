@@ -30,7 +30,12 @@ class S3Store:
             aws_secret_access_key=settings.s3_secret_access_key,
             region_name=settings.s3_region_name,
             use_ssl=settings.s3_use_ssl,
-            config=Config(s3={"addressing_style": "path"}),
+            config=Config(
+                s3={"addressing_style": "path"},
+                retries={"max_attempts": 10, "mode": "adaptive"},
+                connect_timeout=10,
+                read_timeout=120,
+            ),
         )
 
     @property

@@ -27,6 +27,7 @@ class TaskRead(BaseModel):
     status: TaskStatus
     priority: int
     created_by: Optional[str]
+    display_title: Optional[str] = None
     error_code: Optional[str]
     error_message: Optional[str]
     retry_count: int
@@ -48,6 +49,19 @@ class AssetRead(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+class AdminAuthStatusRead(BaseModel):
+    password_set: bool
+    trusted: bool
+
+
+class AdminAuthSetupRequest(BaseModel):
+    password: str
+
+
+class AdminAuthLoginRequest(BaseModel):
+    password: str
 
 
 class SubtitleActionRequest(BaseModel):
@@ -78,7 +92,7 @@ class PublishActionRequest(BaseModel):
     video_key: Optional[str] = None
     cover_key: Optional[str] = None
     typeid_mode: Optional[str] = None
-    meta: dict[str, Any]
+    meta: Optional[dict[str, Any]] = None
 
 
 class RemoteJobResponse(BaseModel):
@@ -136,7 +150,7 @@ class YouTubeMetaRead(BaseModel):
 
 class YouTubeMetaActionResponse(BaseModel):
     metadata: YouTubeMetaRead
-    metadata_asset: AssetRead
+    metadata_asset: Optional[AssetRead] = None
 
 
 class YouTubeDownloadActionResponse(BaseModel):
@@ -176,10 +190,22 @@ class StorageRetentionSettingsUpdate(BaseModel):
 
 class YouTubeSettingsRead(BaseModel):
     proxy: str = ""
+    cookies_set: bool = False
+    cookies_enabled: bool = False
+    cookies_updated_at: Optional[str] = None
+    cookies_count: int = 0
+    cookies_domains_count: int = 0
+    cookies_has_auth: bool = False
+    cookies_has_bot_check_bypass: bool = False
+    cookies_has_visitor_info: bool = False
+    cookie_file_configured: bool = False
+    cookie_file_exists: bool = False
 
 
 class YouTubeSettingsUpdate(BaseModel):
     proxy: Optional[str] = None
+    cookies_txt: Optional[str] = None
+    cookies_enabled: Optional[bool] = None
 
 
 class YouTubeProxyTestRequest(BaseModel):

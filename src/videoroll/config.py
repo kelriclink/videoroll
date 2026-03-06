@@ -5,6 +5,12 @@ from functools import lru_cache
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+DEFAULT_YOUTUBE_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/122.0.0.0 Safari/537.36"
+)
+
 
 class CommonSettings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
@@ -30,13 +36,9 @@ class OrchestratorSettings(CommonSettings):
     ffmpeg_path: str = Field("ffmpeg", alias="FFMPEG_PATH")
 
     # YouTube downloader (yt-dlp) settings.
-    youtube_user_agent: str = Field("videoroll/0.1", alias="YOUTUBE_USER_AGENT")
+    youtube_user_agent: str = Field(DEFAULT_YOUTUBE_USER_AGENT, alias="YOUTUBE_USER_AGENT")
     youtube_cookie_file: str | None = Field(None, alias="YOUTUBE_COOKIE_FILE")
     youtube_proxy: str | None = Field(None, alias="YOUTUBE_PROXY")
-    youtube_ytdlp_format: str = Field(
-        "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
-        alias="YOUTUBE_YTDLP_FORMAT",
-    )
     youtube_extractor_args_json: str | None = Field(None, alias="YOUTUBE_EXTRACTOR_ARGS_JSON")
 
 
@@ -67,9 +69,13 @@ class SubtitleServiceSettings(CommonSettings):
     openai_temperature: float = Field(0.2, alias="OPENAI_TEMPERATURE")
     openai_timeout_seconds: float = Field(180.0, alias="OPENAI_TIMEOUT_SECONDS")
 
+    # Orchestrator API (used by subtitle worker for auto pipelines).
+    orchestrator_url: str = Field("http://localhost:8000", alias="ORCHESTRATOR_URL")
+    orchestrator_timeout_seconds: float = Field(1800.0, alias="ORCHESTRATOR_TIMEOUT_SECONDS")
+
 
 class YouTubeIngestSettings(CommonSettings):
-    user_agent: str = Field("videoroll/0.1", alias="YOUTUBE_USER_AGENT")
+    user_agent: str = Field(DEFAULT_YOUTUBE_USER_AGENT, alias="YOUTUBE_USER_AGENT")
     youtube_proxy: str | None = Field(None, alias="YOUTUBE_PROXY")
 
 

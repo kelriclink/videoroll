@@ -21,6 +21,7 @@ from videoroll.apps.bilibili_publisher.schemas import BilibiliPublishMeta
 from videoroll.apps.bilibili_publisher.typeid_recommender import flatten_typelist, recommend_typeid_openai
 from videoroll.config import get_bilibili_publisher_settings, get_subtitle_settings
 from videoroll.db.base import Base
+from videoroll.db.auto_migrate import auto_migrate
 from videoroll.db.models import Asset, AssetKind, PublishJob, PublishState, Task, TaskStatus
 from videoroll.db.session import get_engine, get_sessionmaker
 from videoroll.storage.s3 import S3Store
@@ -48,6 +49,7 @@ def _db() -> Session:
 def _ensure_db() -> None:
     engine = get_engine(settings.database_url)
     Base.metadata.create_all(engine)
+    auto_migrate(settings.database_url)
 
 
 def _utcnow() -> datetime:

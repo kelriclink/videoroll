@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import json
+import uuid
 from typing import Any
 
 from sqlalchemy.orm import Session
 
-from videoroll.db.models import AppSetting
+from videoroll.db.models import AppSetting, Asset, AssetKind
+from videoroll.storage.s3 import S3Store
 
 
 def _as_dict(v: Any) -> dict[str, Any]:
@@ -29,8 +32,47 @@ def get_task_titles(db: Session, task_id: str) -> dict[str, str]:
 
 
 def get_task_display_title(db: Session, task_id: str) -> str:
+    return get_task_display_title_with_s3(db, task_id, s3=None)
+
+
+def get_task_display_title_with_s3(db: Session, task_id: str, *, s3: S3Store | None) -> str:
     t = get_task_titles(db, task_id)
-    return str(t.get("translated_title") or t.get("source_title") or "").strip()
+    out = str(t.get("translated_title") or t.get("source_title") or "").strip()
+    if out:
+        return out
+
+    if s3 is None:
+        return ""
+
+    try:
+        tid = uuid.UUID(str(task_id))
+    except Exception:
+        return ""
+
+    asset = (
+        db.query(Asset)
+        .filter(Asset.task_id == tid, Asset.kind == AssetKind.metadata_json)
+        .order_by(Asset.created_at.desc())
+        .first()
+    )
+    if not asset:
+        return ""
+
+    try:
+        obj = s3.get_object(asset.storage_key)
+        body = obj.get("Body")
+        raw = body.read() if body else b""
+        try:
+            if body:
+                body.close()
+        except Exception:
+            pass
+        parsed = json.loads(raw.decode("utf-8")) if raw else {}
+        info = parsed if isinstance(parsed, dict) else {}
+        title = str(info.get("title") or info.get("fulltitle") or info.get("alt_title") or "").strip()
+        return title
+    except Exception:
+        return ""
 
 
 def set_task_titles(
@@ -53,4 +95,3 @@ def set_task_titles(
     row.value_json = data
     db.add(row)
     db.commit()
-

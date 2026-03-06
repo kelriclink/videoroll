@@ -48,16 +48,16 @@
 
 建议按 `tenant/account/task_id` 分层，便于多账号与隔离：
 
-- `raw/{task_id}/video.mp4`（原视频）
-- `raw/{task_id}/metadata.json`
-- `work/{task_id}/audio.wav`
-- `sub/{task_id}/segments.json`（ASR 分段结构化结果）
-- `sub/{task_id}/subtitle_src.srt`
-- `sub/{task_id}/subtitle_zh.srt`
-- `sub/{task_id}/subtitle_zh.ass`
-- `final/{task_id}/video_burnin.mp4`
-- `final/{task_id}/video_softsub.mkv`
-- `final/{task_id}/cover.jpg`
+- `raw/{task_id}/video_{sha256[:16]}.mp4`（原视频，建议内容寻址避免覆盖）
+- `raw/{task_id}/metadata_{sha256[:16]}.json`
+- `work/{task_id}/audio_{sha256[:16]}.wav`
+- `sub/{task_id}/segments_{sha256[:16]}.json`（ASR 分段结构化结果）
+- `sub/{task_id}/subtitle_src_{sha256[:16]}.srt`
+- `sub/{task_id}/subtitle_zh_{sha256[:16]}.srt`
+- `sub/{task_id}/subtitle_zh_{sha256[:16]}.ass`
+- `final/{task_id}/video_burnin_{sha256[:16]}.mp4`
+- `final/{task_id}/video_softsub_{sha256[:16]}.mkv`
+- `final/{task_id}/cover_{sha256[:16]}.jpg`
 - `meta/{task_id}/publish_meta.json`
 - `meta/{task_id}/publish_result.json`
 - `logs/{task_id}/stage_{name}.log`
@@ -353,4 +353,3 @@
 3) 翻译：是否需要、是否需要术语表、是否需要双语
 4) 字幕输出：只字幕 / burn-in / soft-sub / 全要
 5) 发布策略：全自动还是必须人工审核后才能投稿
-

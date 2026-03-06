@@ -26,6 +26,7 @@ export type Task = {
   status: TaskStatus;
   priority: number;
   created_by?: string | null;
+  display_title?: string | null;
   error_code?: string | null;
   error_message?: string | null;
   retry_count: number;

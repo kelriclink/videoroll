@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ORCH="${ORCH:-http://localhost:8000}"
+ORCH="${ORCH:-http://localhost:3000/api}"
 SUB="${SUB:-$ORCH/subtitle-service}"
 
 VIDEO_PATH="${1:-}"

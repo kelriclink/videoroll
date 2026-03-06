@@ -95,6 +95,7 @@ export default function TaskDetailPage() {
   const [youtubeMeta, setYoutubeMeta] = useState<YouTubeMeta | null>(null);
   const [didAutoFillPublishMeta, setDidAutoFillPublishMeta] = useState(false);
   const [didAutoPickCover, setDidAutoPickCover] = useState(false);
+  const [didLoadPublishMetaFile, setDidLoadPublishMetaFile] = useState(false);
 
   const refresh = useCallback(
     async (opts?: { silent?: boolean }) => {
@@ -135,19 +136,36 @@ export default function TaskDetailPage() {
     setYoutubeMeta(null);
     setDidAutoFillPublishMeta(false);
     setDidAutoPickCover(false);
-    fetchJson<PublishSettings>(`${BILIBILI_PUBLISHER_URL}/bilibili/publish/settings`)
-      .then((s) => {
+    setDidLoadPublishMetaFile(false);
+
+    (async () => {
+      // 1) Load default meta template (for manual override / fallback).
+      try {
+        const s = await fetchJson<PublishSettings>(`${BILIBILI_PUBLISHER_URL}/bilibili/publish/settings`);
         setPublishSettings(s);
-        setPublishMetaText(JSON.stringify(s.default_meta ?? {}, null, 2));
+        const defaultText = JSON.stringify(s.default_meta ?? {}, null, 2);
+        setPublishMetaText(defaultText);
         try {
           const meta = s.default_meta ?? {};
           const tid = Number((meta as any)?.typeid ?? (meta as any)?.tid ?? 0);
           if (Number.isFinite(tid) && tid > 0) setPublishTypeid(tid);
         } catch {}
-      })
-      .catch(() => {
+      } catch {
         setPublishSettings(null);
-      });
+        setPublishMetaText("{}");
+      }
+
+      // 2) Prefer task-scoped publish_meta file (if exists).
+      try {
+        const metaFile = await fetchJson<any>(`${ORCHESTRATOR_URL}/tasks/${taskId}/publish_meta`);
+        setPublishMetaText(JSON.stringify(metaFile ?? {}, null, 2));
+      } catch (e: unknown) {
+        const msg = e instanceof Error ? e.message : String(e);
+        if (!msg.startsWith("404 ")) setError(msg);
+      } finally {
+        setDidLoadPublishMetaFile(true);
+      }
+    })();
   }, [taskId]);
 
   useEffect(() => {
@@ -301,6 +319,32 @@ export default function TaskDetailPage() {
     return resp.metadata;
   }, [taskId]);
 
+  const fetchCachedYouTubeMeta = useCallback(async () => {
+    if (!taskId) return null;
+    try {
+      const meta = await fetchJson<YouTubeMeta>(`${ORCHESTRATOR_URL}/tasks/${taskId}/youtube_meta`);
+      setYoutubeMeta(meta);
+      return meta;
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e);
+      if (msg.startsWith("404 ")) return null;
+      throw e;
+    }
+  }, [taskId]);
+
+  const savePublishMetaFile = useCallback(
+    async (meta: any) => {
+      if (!taskId) return;
+      if (!meta || typeof meta !== "object" || Array.isArray(meta)) throw new Error("publish meta must be a JSON object");
+      await fetchJson(`${ORCHESTRATOR_URL}/tasks/${taskId}/publish_meta`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(meta),
+      });
+    },
+    [taskId],
+  );
+
   const applyYouTubeMetaToPublishMeta = useCallback(
     async (yt: YouTubeMeta) => {
       const sourceUrl = (task?.source_url ?? "").trim();
@@ -327,8 +371,9 @@ export default function TaskDetailPage() {
         source: publishEnableReprint ? sourceUrl : "",
       };
       setPublishMetaText(JSON.stringify(metaOut, null, 2));
+      await savePublishMetaFile(metaOut);
     },
-    [publishMetaText, task, openaiKeySet, translateStyle, publishEnableReprint],
+    [publishMetaText, task, openaiKeySet, translateStyle, publishEnableReprint, savePublishMetaFile],
   );
 
   const isYouTubeTask = task?.source_type === "youtube" && !!(task.source_url ?? "").trim();
@@ -344,6 +389,7 @@ export default function TaskDetailPage() {
   useEffect(() => {
     if (!taskId) return;
     if (!isYouTubeTask) return;
+    if (!didLoadPublishMetaFile) return;
     if (didAutoFillPublishMeta) return;
     if (!publishSettings?.default_meta) return;
 
@@ -352,14 +398,23 @@ export default function TaskDetailPage() {
 
     (async () => {
       try {
-        const yt = await fetchYouTubeMeta();
+        const yt = await fetchCachedYouTubeMeta();
         if (yt) await applyYouTubeMetaToPublishMeta(yt);
       } catch {
       } finally {
         setDidAutoFillPublishMeta(true);
       }
     })();
-  }, [taskId, isYouTubeTask, publishSettings, publishMetaText, didAutoFillPublishMeta, fetchYouTubeMeta, applyYouTubeMetaToPublishMeta]);
+  }, [
+    taskId,
+    isYouTubeTask,
+    publishSettings,
+    publishMetaText,
+    didAutoFillPublishMeta,
+    didLoadPublishMetaFile,
+    fetchCachedYouTubeMeta,
+    applyYouTubeMetaToPublishMeta,
+  ]);
 
   const rawAsset = useMemo(() => {
     const raws = (assets ?? []).filter((x) => x.kind === "video_raw");
@@ -511,13 +566,14 @@ export default function TaskDetailPage() {
       if (!silent) setLogError(null);
       if (!silent) setLogBusy(true);
       try {
-        const fetchTail = async (assetId: string, maxBytes: number) => {
-          const resp = await fetch(`${ORCHESTRATOR_URL}/tasks/${taskId}/assets/${assetId}/stream`, {
-            headers: { Range: `bytes=-${maxBytes}` },
-          });
-          if (!resp.ok) throw new Error(`日志获取失败：${resp.status} ${resp.statusText}`);
-          return await resp.text();
-        };
+          const fetchTail = async (assetId: string, maxBytes: number) => {
+            const resp = await fetch(`${ORCHESTRATOR_URL}/tasks/${taskId}/assets/${assetId}/stream`, {
+              headers: { Range: `bytes=-${maxBytes}` },
+              credentials: "include",
+            });
+            if (!resp.ok) throw new Error(`日志获取失败：${resp.status} ${resp.statusText}`);
+            return await resp.text();
+          };
 
         const maxBytes = 200_000;
         if (logSelection === "combined") {
@@ -1183,7 +1239,19 @@ export default function TaskDetailPage() {
               <button
                 disabled={busy || !publishSettings?.default_meta}
                 className="rounded border px-2 py-1 text-xs hover:bg-slate-50 disabled:opacity-50"
-                onClick={() => setPublishMetaText(JSON.stringify(publishSettings?.default_meta ?? {}, null, 2))}
+                onClick={async () => {
+                  setBusy(true);
+                  setError(null);
+                  try {
+                    const meta = publishSettings?.default_meta ?? {};
+                    setPublishMetaText(JSON.stringify(meta, null, 2));
+                    await savePublishMetaFile(meta);
+                  } catch (e: unknown) {
+                    setError(e instanceof Error ? e.message : String(e));
+                  } finally {
+                    setBusy(false);
+                  }
+                }}
               >
                 加载默认
               </button>
@@ -1219,6 +1287,26 @@ export default function TaskDetailPage() {
                 }}
               >
                 格式化
+              </button>
+              <button
+                disabled={busy || !taskId}
+                className="rounded border px-2 py-1 text-xs hover:bg-slate-50 disabled:opacity-50"
+                onClick={async () => {
+                  setBusy(true);
+                  setError(null);
+                  try {
+                    const meta = JSON.parse(publishMetaText);
+                    if (!meta || typeof meta !== "object" || Array.isArray(meta)) throw new Error("meta must be a JSON object");
+                    await savePublishMetaFile(meta);
+                    alert("已保存到 publish_meta.json");
+                  } catch (e: unknown) {
+                    setError(e instanceof Error ? e.message : String(e));
+                  } finally {
+                    setBusy(false);
+                  }
+                }}
+              >
+                保存
               </button>
             </div>
           </div>
@@ -1259,6 +1347,7 @@ export default function TaskDetailPage() {
                 }
                 if (typeof meta?.desc === "string" && meta.desc.length > 2000) meta.desc = clampText(meta.desc, 2000);
                 if (typeof meta?.title === "string" && meta.title.length > 80) meta.title = clampText(meta.title, 80);
+                await savePublishMetaFile(meta);
                 const resp = await fetchJson<PublishResponse>(`${ORCHESTRATOR_URL}/tasks/${taskId}/actions/publish`, {
                   method: "POST",
                   headers: { "Content-Type": "application/json" },
@@ -1267,7 +1356,7 @@ export default function TaskDetailPage() {
                     video_key: publishVideoKey || null,
                     cover_key: publishCoverKey || null,
                     typeid_mode: publishTypeidMode,
-                    meta,
+                    meta: null,
                   }),
                 });
                 await refresh();

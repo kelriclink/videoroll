@@ -10,14 +10,14 @@ if [[ ! -f "$ENV_FILE" ]]; then
   echo "Created $ENV_FILE from .env.example"
 fi
 
-docker compose --env-file "$ENV_FILE" up --build -d
+docker compose -f docker-compose.yml --env-file "$ENV_FILE" up --build -d
 
 echo ""
 echo "Web UI:              http://localhost:3000"
-echo "API (monolith):      http://localhost:8000/docs"
-echo "Subtitle Service:    http://localhost:8000/subtitle-service/docs"
-echo "YouTube Ingest:      http://localhost:8000/youtube-ingest/docs"
-echo "Bilibili Publisher:  http://localhost:8000/bilibili-publisher/docs"
+echo "API (monolith):      http://localhost:3000/api/docs"
+echo "Subtitle Service:    http://localhost:3000/api/subtitle-service/docs"
+echo "YouTube Ingest:      http://localhost:3000/api/youtube-ingest/docs"
+echo "Bilibili Publisher:  http://localhost:3000/api/bilibili-publisher/docs"
 echo "MinIO Console:       http://localhost:9001 (user/pass from .env)"
 echo ""
-docker compose --env-file "$ENV_FILE" ps
+docker compose -f docker-compose.yml --env-file "$ENV_FILE" ps

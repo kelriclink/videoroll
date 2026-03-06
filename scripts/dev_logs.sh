@@ -5,5 +5,5 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
 ENV_FILE="${ENV_FILE:-.env}"
-docker compose --env-file "$ENV_FILE" logs -f --tail=200 \
-  app web postgres redis minio
+docker compose -f docker-compose.yml --env-file "$ENV_FILE" logs -f --tail=200 \
+  app web redis minio

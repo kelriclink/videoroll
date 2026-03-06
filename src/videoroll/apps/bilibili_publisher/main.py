@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session
 
 from videoroll.config import BilibiliPublisherSettings, get_bilibili_publisher_settings, get_subtitle_settings
 from videoroll.db.base import Base
+from videoroll.db.auto_migrate import auto_migrate
 from videoroll.db.models import Asset, AssetKind, PublishJob, PublishState, Task, TaskStatus
 from videoroll.db.session import db_session, get_engine
 from videoroll.storage.s3 import S3Store
@@ -66,6 +67,7 @@ def _startup() -> None:
     settings = get_bilibili_publisher_settings()
     engine = get_engine(settings.database_url)
     Base.metadata.create_all(engine)
+    auto_migrate(settings.database_url)
     S3Store(settings).ensure_bucket()
 
 

@@ -4,21 +4,25 @@ import json
 import logging
 import re
 import shutil
+import threading
 import time
 import traceback
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 import httpx
 from celery import Celery
 from celery.signals import worker_init
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from videoroll.config import get_subtitle_settings
 from videoroll.db.base import Base
+from videoroll.db.auto_migrate import auto_migrate
 from videoroll.db.models import (
+    AppSetting,
     Asset,
     AssetKind,
     RenderJob,
@@ -32,7 +36,9 @@ from videoroll.db.models import (
 )
 from videoroll.db.session import get_engine, get_sessionmaker
 from videoroll.storage.s3 import S3Store
+from videoroll.utils.internal_api_token import internal_api_token
 from videoroll.utils.hashing import sha256_file
+from videoroll.apps.orchestrator_api.admin_auth_store import INTERNAL_TOKEN_HEADER
 from videoroll.apps.subtitle_service.processing import (
     Segment,
     extract_audio,
@@ -55,12 +61,14 @@ from videoroll.apps.subtitle_service.bilibili_tags_store import set_task_bilibil
 from videoroll.apps.subtitle_service.task_title_store import set_task_titles
 from videoroll.apps.subtitle_service.translate_settings_store import get_translate_settings
 from videoroll.apps.bilibili_publisher.publish_settings_store import get_bilibili_publish_settings
-from videoroll.apps.subtitle_service.render_queue_store import get_render_queue_settings
+from videoroll.apps.subtitle_service.render_queue_store import TASK_QUEUE_SETTINGS_KEY, get_task_queue_settings
 from videoroll.utils.cpu import process_cpu_count
 from videoroll.utils.hf_hub import configure_hf_hub_proxy
 
 
 settings = get_subtitle_settings()
+_ORCH_INTERNAL_TOKEN = internal_api_token(settings.s3_secret_access_key)
+_ORCH_INTERNAL_HEADERS = {INTERNAL_TOKEN_HEADER: _ORCH_INTERNAL_TOKEN} if _ORCH_INTERNAL_TOKEN else {}
 logger = logging.getLogger(__name__)
 celery_app = Celery("subtitle_service", broker=settings.redis_url, backend=settings.redis_url)
 celery_app.conf.update(
@@ -138,10 +146,80 @@ def _db() -> Session:
 def _ensure_db() -> None:
     engine = get_engine(settings.database_url)
     Base.metadata.create_all(engine)
+    auto_migrate(settings.database_url)
 
 
 def _now() -> datetime:
     return datetime.now(tz=timezone.utc)
+
+
+# Task Queue (task-level concurrency)
+TASK_QUEUE_LOCK_OWNER = "subtitle_service.task_queue"
+_TASK_QUEUE_LOCK_TTL = timedelta(seconds=300)
+_TASK_QUEUE_HEARTBEAT_INTERVAL_SECONDS = 30.0
+_TASK_QUEUE_REQUEUE_COUNTDOWN_SECONDS = 10
+
+
+def _task_queue_expires_at(now: datetime) -> datetime:
+    return now + _TASK_QUEUE_LOCK_TTL
+
+
+def _task_queue_is_task_locked(task: Task, now: datetime) -> bool:
+    return bool(task.lock_owner == TASK_QUEUE_LOCK_OWNER and task.lock_until and task.lock_until > now)
+
+
+def _task_queue_unlock(task: Task) -> None:
+    task.lock_owner = None
+    task.lock_until = None
+
+
+def _task_queue_lock_settings_row(db: Session) -> None:
+    """
+    Serialize queue ticks by locking the settings row.
+    This prevents overshooting max_concurrency when multiple ticks run concurrently.
+    """
+    row = db.get(AppSetting, TASK_QUEUE_SETTINGS_KEY)
+    if not row:
+        row = AppSetting(key=TASK_QUEUE_SETTINGS_KEY, value_json={})
+        db.add(row)
+        db.commit()
+    # Best-effort lock (ignored on dialects that don't support it).
+    db.query(AppSetting).filter(AppSetting.key == TASK_QUEUE_SETTINGS_KEY).with_for_update().first()
+
+
+class _TaskQueueHeartbeat:
+    def __init__(self, task_id: uuid.UUID):
+        self._task_id = task_id
+        self._stop = threading.Event()
+        self._thr = threading.Thread(target=self._run, name=f"task-queue-hb-{task_id}", daemon=True)
+
+    def start(self) -> None:
+        self._thr.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        try:
+            self._thr.join(timeout=5.0)
+        except Exception:
+            pass
+
+    def _run(self) -> None:
+        while not self._stop.wait(_TASK_QUEUE_HEARTBEAT_INTERVAL_SECONDS):
+            db = _db()
+            try:
+                now = _now()
+                db.query(Task).filter(Task.id == self._task_id, Task.lock_owner == TASK_QUEUE_LOCK_OWNER).update(
+                    {"lock_until": _task_queue_expires_at(now)},
+                    synchronize_session=False,
+                )
+                db.commit()
+            except Exception:
+                try:
+                    db.rollback()
+                except Exception:
+                    pass
+            finally:
+                db.close()
 
 
 def _append_log_line(log_path: Path, message: str) -> None:
@@ -422,6 +500,8 @@ def _recover_interrupted_subtitle_jobs() -> None:
                 db.add(old)
                 task = db.get(Task, old.task_id)
                 if task and task.status not in {TaskStatus.published, TaskStatus.canceled}:
+                    if task.lock_owner == TASK_QUEUE_LOCK_OWNER:
+                        _task_queue_unlock(task)
                     task.status = TaskStatus.failed
                     task.error_code = "SUBTITLE_CRASHED"
                     task.error_message = "subtitle job crashed; manual resume required"
@@ -477,7 +557,7 @@ def _on_worker_init(**_kwargs: Any) -> None:
     try:
         _recover_interrupted_subtitle_jobs()
         _recover_interrupted_render_jobs()
-        celery_app.send_task("subtitle_service.render_queue_tick", args=[], queue="subtitle")
+        celery_app.send_task("subtitle_service.task_queue_tick", args=[], queue="subtitle")
     except Exception:
         logger.exception("subtitle job recovery failed")
 
@@ -492,6 +572,7 @@ def process_job(job_id: str) -> dict[str, str]:
     db = _db()
     log_path: Path | None = None
     log_key: str | None = None
+    hb: _TaskQueueHeartbeat | None = None
     try:
         job = db.get(SubtitleJob, jid)
         if not job:
@@ -510,10 +591,31 @@ def process_job(job_id: str) -> dict[str, str]:
             db.commit()
             return {"status": "error", "detail": "task not found"}
 
+        now = _now()
+        if task.lock_owner != TASK_QUEUE_LOCK_OWNER:
+            # Not claimed by the task-level scheduler; put it back and wait.
+            job.status = SubtitleJobStatus.queued
+            db.add(job)
+            db.commit()
+            celery_app.send_task(
+                "subtitle_service.task_queue_tick",
+                args=[],
+                queue="subtitle",
+                countdown=_TASK_QUEUE_REQUEUE_COUNTDOWN_SECONDS,
+            )
+            return {"status": "queued", "detail": "waiting for task queue"}
+        if task.lock_until is None or task.lock_until <= now:
+            task.lock_until = _task_queue_expires_at(now)
+            db.add(task)
+
+        # progress=1 is set by the scheduler; bump to >=2 ASAP to mark as claimed by a worker.
         job.status = SubtitleJobStatus.running
-        job.progress = 1
+        job.progress = max(int(job.progress or 0), 2)
         db.add(job)
         db.commit()
+
+        hb = _TaskQueueHeartbeat(task.id)
+        hb.start()
 
         req = job.request_json
         input_key = (req.get("input") or {}).get("key")
@@ -529,10 +631,10 @@ def process_job(job_id: str) -> dict[str, str]:
         srt_path = work_root / "subtitle_zh.srt"
         ass_path = work_root / "subtitle_zh.ass"
 
-        audio_key = f"work/{task.id}/audio.wav"
-        segments_key = f"sub/{task.id}/segments.json"
-        srt_key = f"sub/{task.id}/subtitle_zh.srt"
-        ass_key = f"sub/{task.id}/subtitle_zh.ass"
+        audio_key: str | None = None
+        segments_key: str | None = None
+        srt_key: str | None = None
+        ass_key: str | None = None
 
         resume = bool(req.get("resume"))
         output_cfg = (req.get("output") or {})
@@ -565,22 +667,26 @@ def process_job(job_id: str) -> dict[str, str]:
         )
         _safe_upload_log(store, log_path, log_key)
 
-        def _download_if_asset_exists(kind: AssetKind, key: str, dest: Path) -> bool:
+        def _download_latest_asset(kind: AssetKind, dest: Path) -> Asset | None:
             row = (
                 db.query(Asset)
-                .filter(Asset.task_id == task.id, Asset.kind == kind, Asset.storage_key == key)
+                .filter(Asset.task_id == task.id, Asset.kind == kind)
                 .order_by(Asset.created_at.desc())
                 .first()
             )
             if not row:
-                return False
+                return None
             try:
-                store.download_file(key, dest)
-                return dest.exists() and dest.stat().st_size > 0
+                store.download_file(row.storage_key, dest)
+                if dest.exists() and dest.stat().st_size > 0:
+                    return row
             except Exception:
-                return False
+                return None
+            return None
 
-        if resume and _download_if_asset_exists(AssetKind.subtitle_srt, srt_key, srt_path):
+        srt_asset = _download_latest_asset(AssetKind.subtitle_srt, srt_path) if resume else None
+        if resume and srt_asset:
+            srt_key = srt_asset.storage_key
             _safe_append_log_line(log_path, f"resume: found existing subtitle_srt asset: {srt_key}")
             _safe_upload_log(store, log_path, log_key)
             if task.status in {TaskStatus.failed, TaskStatus.created, TaskStatus.ingested, TaskStatus.downloaded, TaskStatus.audio_extracted, TaskStatus.asr_done, TaskStatus.translated}:
@@ -590,32 +696,41 @@ def process_job(job_id: str) -> dict[str, str]:
             db.add(job)
             db.commit()
 
-            if need_ass and not _download_if_asset_exists(AssetKind.subtitle_ass, ass_key, ass_path):
-                segs = srt_to_segments(srt_path.read_text(encoding="utf-8"))
-                ass_text = segments_to_ass(segs, style_name=render_cfg.get("ass_style", "clean_white"))
-                ass_path.write_text(ass_text, encoding="utf-8")
-                store.upload_file(ass_path, ass_key, content_type="text/plain")
-                db.add(
-                    Asset(
-                        task_id=task.id,
-                        kind=AssetKind.subtitle_ass,
-                        storage_key=ass_key,
-                        sha256=sha256_file(ass_path),
-                        size_bytes=ass_path.stat().st_size,
+            if need_ass:
+                ass_asset = _download_latest_asset(AssetKind.subtitle_ass, ass_path)
+                if ass_asset:
+                    ass_key = ass_asset.storage_key
+                else:
+                    segs = srt_to_segments(srt_path.read_text(encoding="utf-8"))
+                    ass_text = segments_to_ass(segs, style_name=render_cfg.get("ass_style", "clean_white"))
+                    ass_path.write_text(ass_text, encoding="utf-8")
+                    ass_sha = sha256_file(ass_path)
+                    ass_key = f"sub/{task.id}/subtitle_zh_{ass_sha[:16]}.ass"
+                    store.upload_file(ass_path, ass_key, content_type="text/plain")
+                    db.add(
+                        Asset(
+                            task_id=task.id,
+                            kind=AssetKind.subtitle_ass,
+                            storage_key=ass_key,
+                            sha256=ass_sha,
+                            size_bytes=ass_path.stat().st_size,
+                        )
                     )
-                )
-                db.add(Subtitle(task_id=task.id, version=1, format=SubtitleFormat.ass, language="zh", storage_key=ass_key))
-                db.commit()
-                _safe_append_log_line(log_path, f"generated ass from resumed srt: {ass_key}")
-                _safe_upload_log(store, log_path, log_key)
+                    db.add(Subtitle(task_id=task.id, version=1, format=SubtitleFormat.ass, language="zh", storage_key=ass_key))
+                    db.commit()
+                    _safe_append_log_line(log_path, f"generated ass from resumed srt: {ass_key}")
+                    _safe_upload_log(store, log_path, log_key)
 
             if not burn_in and not soft_sub:
                 job.status = SubtitleJobStatus.succeeded
                 job.progress = 100
+                _task_queue_unlock(task)
+                db.add(task)
                 db.add(job)
                 db.commit()
                 _safe_append_log_line(log_path, "subtitle job done (no render configured)")
                 _safe_upload_log(store, log_path, log_key)
+                celery_app.send_task("subtitle_service.task_queue_tick", args=[], queue="subtitle")
                 return {"status": "ok"}
 
             after_render = req.get("after_render") if isinstance(req, dict) else None
@@ -652,9 +767,9 @@ def process_job(job_id: str) -> dict[str, str]:
             job.status = SubtitleJobStatus.queued
             db.add(job)
             db.commit()
-            _safe_append_log_line(log_path, "render queued; waiting for render queue")
+            _safe_append_log_line(log_path, "render queued; waiting for task queue")
             _safe_upload_log(store, log_path, log_key)
-            celery_app.send_task("subtitle_service.render_queue_tick", args=[], queue="subtitle")
+            celery_app.send_task("subtitle_service.task_queue_tick", args=[], queue="subtitle")
             return {"status": "ok", "detail": "render queued"}
 
         video_downloaded = False
@@ -667,7 +782,9 @@ def process_job(job_id: str) -> dict[str, str]:
             video_downloaded = True
 
         segments: list[Segment] | None = None
-        if resume and _download_if_asset_exists(AssetKind.segments_json, segments_key, segments_path):
+        segments_asset = _download_latest_asset(AssetKind.segments_json, segments_path) if resume else None
+        if resume and segments_asset:
+            segments_key = segments_asset.storage_key
             try:
                 data = json.loads(segments_path.read_text(encoding="utf-8"))
                 if isinstance(data, list):
@@ -687,20 +804,23 @@ def process_job(job_id: str) -> dict[str, str]:
                 segments = None
 
         if segments is None:
-            if resume and _download_if_asset_exists(AssetKind.audio_wav, audio_key, audio_path):
-                pass
+            audio_asset = _download_latest_asset(AssetKind.audio_wav, audio_path) if resume else None
+            if resume and audio_asset:
+                audio_key = audio_asset.storage_key
             else:
                 _ensure_video()
                 _safe_append_log_line(log_path, "ffmpeg: extract audio")
                 extract_audio(settings.ffmpeg_path, video_path, audio_path, log_path=log_path)
                 _safe_upload_log(store, log_path, log_key)
+                audio_sha = sha256_file(audio_path)
+                audio_key = f"work/{task.id}/audio_{audio_sha[:16]}.wav"
                 store.upload_file(audio_path, audio_key, content_type="audio/wav")
                 db.add(
                     Asset(
                         task_id=task.id,
                         kind=AssetKind.audio_wav,
                         storage_key=audio_key,
-                        sha256=sha256_file(audio_path),
+                        sha256=audio_sha,
                         size_bytes=audio_path.stat().st_size,
                     )
                 )
@@ -747,8 +867,18 @@ def process_job(job_id: str) -> dict[str, str]:
                 raise ValueError(f"unsupported ASR engine: {engine}")
             segments_json = [seg.__dict__ for seg in segments]
             write_json(segments_path, segments_json)
+            segments_sha = sha256_file(segments_path)
+            segments_key = f"sub/{task.id}/segments_{segments_sha[:16]}.json"
             store.upload_file(segments_path, segments_key, content_type="application/json")
-            db.add(Asset(task_id=task.id, kind=AssetKind.segments_json, storage_key=segments_key, size_bytes=segments_path.stat().st_size))
+            db.add(
+                Asset(
+                    task_id=task.id,
+                    kind=AssetKind.segments_json,
+                    storage_key=segments_key,
+                    sha256=segments_sha,
+                    size_bytes=segments_path.stat().st_size,
+                )
+            )
 
             task.status = TaskStatus.asr_done
             db.add(task)
@@ -888,16 +1018,36 @@ def process_job(job_id: str) -> dict[str, str]:
 
         srt_text = segments_to_srt(segments_out)
         srt_path.write_text(srt_text, encoding="utf-8")
+        srt_sha = sha256_file(srt_path)
+        srt_key = f"sub/{task.id}/subtitle_zh_{srt_sha[:16]}.srt"
         store.upload_file(srt_path, srt_key, content_type="text/plain")
-        db.add(Asset(task_id=task.id, kind=AssetKind.subtitle_srt, storage_key=srt_key, sha256=sha256_file(srt_path), size_bytes=srt_path.stat().st_size))
+        db.add(
+            Asset(
+                task_id=task.id,
+                kind=AssetKind.subtitle_srt,
+                storage_key=srt_key,
+                sha256=srt_sha,
+                size_bytes=srt_path.stat().st_size,
+            )
+        )
         db.add(Subtitle(task_id=task.id, version=1, format=SubtitleFormat.srt, language="zh", storage_key=srt_key))
         _safe_append_log_line(log_path, f"subtitle srt uploaded: {srt_key}")
 
         if need_ass:
             ass_text = segments_to_ass(segments_out, style_name=render_cfg.get("ass_style", "clean_white"))
             ass_path.write_text(ass_text, encoding="utf-8")
+            ass_sha = sha256_file(ass_path)
+            ass_key = f"sub/{task.id}/subtitle_zh_{ass_sha[:16]}.ass"
             store.upload_file(ass_path, ass_key, content_type="text/plain")
-            db.add(Asset(task_id=task.id, kind=AssetKind.subtitle_ass, storage_key=ass_key, sha256=sha256_file(ass_path), size_bytes=ass_path.stat().st_size))
+            db.add(
+                Asset(
+                    task_id=task.id,
+                    kind=AssetKind.subtitle_ass,
+                    storage_key=ass_key,
+                    sha256=ass_sha,
+                    size_bytes=ass_path.stat().st_size,
+                )
+            )
             db.add(Subtitle(task_id=task.id, version=1, format=SubtitleFormat.ass, language="zh", storage_key=ass_key))
             _safe_append_log_line(log_path, f"subtitle ass uploaded: {ass_key}")
 
@@ -911,10 +1061,13 @@ def process_job(job_id: str) -> dict[str, str]:
         if not burn_in and not soft_sub:
             job.status = SubtitleJobStatus.succeeded
             job.progress = 100
+            _task_queue_unlock(task)
+            db.add(task)
             db.add(job)
             db.commit()
             _safe_append_log_line(log_path, "subtitle job done (no render configured)")
             _safe_upload_log(store, log_path, log_key)
+            celery_app.send_task("subtitle_service.task_queue_tick", args=[], queue="subtitle")
             return {"status": "ok"}
 
         after_render = req.get("after_render") if isinstance(req, dict) else None
@@ -951,9 +1104,9 @@ def process_job(job_id: str) -> dict[str, str]:
         job.status = SubtitleJobStatus.queued
         db.add(job)
         db.commit()
-        _safe_append_log_line(log_path, "render queued; waiting for render queue")
+        _safe_append_log_line(log_path, "render queued; waiting for task queue")
         _safe_upload_log(store, log_path, log_key)
-        celery_app.send_task("subtitle_service.render_queue_tick", args=[], queue="subtitle")
+        celery_app.send_task("subtitle_service.task_queue_tick", args=[], queue="subtitle")
         return {"status": "ok", "detail": "render queued"}
     except Exception as e:
         job = db.get(SubtitleJob, uuid.UUID(job_id))
@@ -962,6 +1115,9 @@ def process_job(job_id: str) -> dict[str, str]:
             job.error_message = str(e)
             db.add(job)
             task = db.get(Task, job.task_id)
+            if task and task.lock_owner == TASK_QUEUE_LOCK_OWNER:
+                _task_queue_unlock(task)
+                db.add(task)
             if task and task.status not in {TaskStatus.published, TaskStatus.canceled}:
                 task.status = TaskStatus.failed
                 task.error_code = task.error_code or "SUBTITLE_FAILED"
@@ -971,49 +1127,262 @@ def process_job(job_id: str) -> dict[str, str]:
         _safe_append_log_line(log_path, f"ERROR: {type(e).__name__}: {e}")
         _safe_append_log_block(log_path, traceback.format_exc())
         _safe_upload_log(store, log_path, log_key)
+        celery_app.send_task("subtitle_service.task_queue_tick", args=[], queue="subtitle")
         return {"status": "error", "detail": str(e)}
     finally:
+        if hb is not None:
+            hb.stop()
         db.close()
 
 
-@celery_app.task(name="subtitle_service.render_queue_tick")
-def render_queue_tick() -> dict[str, Any]:
+@celery_app.task(name="subtitle_service.task_queue_tick")
+def task_queue_tick() -> dict[str, Any]:
+    """
+    Task-level scheduler.
+
+    max_concurrency now limits the number of *tasks* (pipelines) that can be in-flight.
+    A task occupies a slot from subtitle-job start until render finishes (or subtitle finishes
+    when no render is configured).
+    """
     _ensure_db()
     db = _db()
-    started = 0
+    now = _now()
+
+    started_subtitle = 0
+    started_render = 0
+    recovered_subtitle = 0
+    recovered_render = 0
+    unlocked_expired = 0
+
+    to_start: list[tuple[str, str]] = []  # ("subtitle"|"render", job_id)
     try:
-        cfg = get_render_queue_settings(db)
-        max_conc = int(cfg.get("max_concurrency") or 1)
+        _task_queue_lock_settings_row(db)
+        cfg = get_task_queue_settings(db)
+        try:
+            max_conc = int(cfg.get("max_concurrency", 1))
+        except Exception:
+            max_conc = 1
         if max_conc < 0:
             max_conc = 0
         if max_conc == 0:
-            return {"status": "paused", "max_concurrency": str(max_conc), "started": str(started)}
+            return {"status": "paused", "max_concurrency": str(max_conc)}
 
-        running_count = db.query(RenderJob).filter(RenderJob.status == RenderJobStatus.running).count()
-        running = int(running_count or 0)
+        # Clear expired locks to avoid permanent stalls after crashes.
+        try:
+            unlocked_expired = int(
+                db.query(Task)
+                .filter(Task.lock_owner == TASK_QUEUE_LOCK_OWNER, Task.lock_until.is_not(None), Task.lock_until <= now)
+                .update({"lock_owner": None, "lock_until": None}, synchronize_session=False)
+                or 0
+            )
+        except Exception:
+            unlocked_expired = 0
 
-        while running + started < max_conc:
-            j = (
+        # Recover render jobs that were marked as running by the scheduler but never claimed by a worker.
+        cutoff = now - timedelta(seconds=60)
+        # Subtitle jobs: scheduler sets progress=1; worker bumps it to >=2 once claimed.
+        stuck_subtitle = (
+            db.query(SubtitleJob)
+            .filter(
+                SubtitleJob.status == SubtitleJobStatus.running,
+                SubtitleJob.progress <= 1,
+                # If the worker actually started, it sets logs_key very early. Treat jobs without logs_key
+                # as "scheduler started but worker never claimed".
+                SubtitleJob.logs_key.is_(None),
+                SubtitleJob.updated_at.is_not(None),
+                SubtitleJob.updated_at < cutoff,
+            )
+            .order_by(SubtitleJob.updated_at.asc(), SubtitleJob.created_at.asc())
+            .with_for_update(skip_locked=True)
+            .all()
+        )
+        for j in stuck_subtitle:
+            msg = (j.error_message or "").strip()
+            detail = "检测到疑似 Worker 未消费：subtitle job 长时间停留在 running(1%)。已自动重新排队。"
+            j.error_message = f"{msg}\n{detail}" if msg else detail
+            j.status = SubtitleJobStatus.queued
+            j.progress = 0
+            db.add(j)
+            recovered_subtitle += 1
+
+        stuck = (
+            db.query(RenderJob)
+            .filter(
+                RenderJob.status == RenderJobStatus.running,
+                RenderJob.progress <= 1,
+                RenderJob.started_at.is_not(None),
+                RenderJob.started_at < cutoff,
+            )
+            .order_by(RenderJob.started_at.asc(), RenderJob.created_at.asc())
+            .with_for_update(skip_locked=True)
+            .all()
+        )
+        for j in stuck:
+            msg = (j.error_message or "").strip()
+            detail = "检测到疑似 Worker 未消费：render job 长时间停留在 running(1%)。已自动重新排队。"
+            j.error_message = f"{msg}\n{detail}" if msg else detail
+            j.retry_count = int(j.retry_count or 0) + 1
+            j.status = RenderJobStatus.queued
+            j.progress = 0
+            j.started_at = None
+            j.finished_at = None
+            db.add(j)
+            recovered_render += 1
+
+        locked_tasks = (
+            db.query(Task)
+            .filter(Task.lock_owner == TASK_QUEUE_LOCK_OWNER, Task.lock_until.is_not(None), Task.lock_until > now)
+            .order_by(Task.lock_until.asc())
+            .all()
+        )
+
+        # Phase 1: advance locked tasks (start their next queued job if nothing is running).
+        for t in locked_tasks:
+            tid = t.id
+            has_running = (
+                db.query(SubtitleJob).filter(SubtitleJob.task_id == tid, SubtitleJob.status == SubtitleJobStatus.running).count()
+                + db.query(RenderJob).filter(RenderJob.task_id == tid, RenderJob.status == RenderJobStatus.running).count()
+            )
+            if has_running:
+                continue
+
+            rj = (
                 db.query(RenderJob)
-                .filter(RenderJob.status == RenderJobStatus.queued)
+                .filter(RenderJob.task_id == tid, RenderJob.status == RenderJobStatus.queued)
                 .order_by(RenderJob.created_at.asc())
                 .with_for_update(skip_locked=True)
                 .first()
             )
-            if not j:
+            if rj:
+                rj.status = RenderJobStatus.running
+                rj.progress = max(int(rj.progress or 0), 1)
+                rj.started_at = now
+                db.add(rj)
+                to_start.append(("render", str(rj.id)))
+                started_render += 1
+                continue
+
+            sj = (
+                db.query(SubtitleJob)
+                .filter(SubtitleJob.task_id == tid, SubtitleJob.status == SubtitleJobStatus.queued)
+                .order_by(SubtitleJob.created_at.asc())
+                .with_for_update(skip_locked=True)
+                .first()
+            )
+            if sj:
+                sj.status = SubtitleJobStatus.running
+                sj.progress = max(int(sj.progress or 0), 1)
+                db.add(sj)
+                to_start.append(("subtitle", str(sj.id)))
+                started_subtitle += 1
+
+        # Phase 2: lock and start new tasks up to max_concurrency.
+        running_tasks = len(locked_tasks)
+        capacity = max(0, max_conc - running_tasks)
+        for _ in range(capacity):
+            # Prefer queued render jobs (rare, usually after an expired lock) so tasks can finish.
+            rj = (
+                db.query(RenderJob)
+                .join(Task, Task.id == RenderJob.task_id)
+                .filter(
+                    RenderJob.status == RenderJobStatus.queued,
+                    or_(
+                        Task.lock_owner != TASK_QUEUE_LOCK_OWNER,
+                        Task.lock_until.is_(None),
+                        Task.lock_until <= now,
+                    ),
+                )
+                .order_by(RenderJob.created_at.asc())
+                .with_for_update(skip_locked=True)
+                .first()
+            )
+            if rj:
+                task = db.query(Task).filter(Task.id == rj.task_id).with_for_update(skip_locked=True).first()
+                if not task:
+                    continue
+                if _task_queue_is_task_locked(task, now):
+                    continue
+                if task.lock_until and task.lock_until > now and task.lock_owner and task.lock_owner != TASK_QUEUE_LOCK_OWNER:
+                    continue
+                task.lock_owner = TASK_QUEUE_LOCK_OWNER
+                task.lock_until = _task_queue_expires_at(now)
+                rj.status = RenderJobStatus.running
+                rj.progress = max(int(rj.progress or 0), 1)
+                rj.started_at = now
+                db.add(task)
+                db.add(rj)
+                to_start.append(("render", str(rj.id)))
+                started_render += 1
+                running_tasks += 1
+                continue
+
+            sj = (
+                db.query(SubtitleJob)
+                .join(Task, Task.id == SubtitleJob.task_id)
+                .filter(
+                    SubtitleJob.status == SubtitleJobStatus.queued,
+                    or_(
+                        Task.lock_owner != TASK_QUEUE_LOCK_OWNER,
+                        Task.lock_until.is_(None),
+                        Task.lock_until <= now,
+                    ),
+                )
+                .order_by(SubtitleJob.created_at.asc())
+                .with_for_update(skip_locked=True)
+                .first()
+            )
+            if not sj:
                 break
 
-            j.status = RenderJobStatus.running
-            j.progress = max(int(j.progress or 0), 1)
-            j.started_at = _now()
-            db.add(j)
-            db.commit()
-            celery_app.send_task("subtitle_service.process_render_job", args=[str(j.id)], queue="subtitle")
-            started += 1
+            task = db.query(Task).filter(Task.id == sj.task_id).with_for_update(skip_locked=True).first()
+            if not task:
+                continue
+            if _task_queue_is_task_locked(task, now):
+                continue
+            if task.lock_until and task.lock_until > now and task.lock_owner and task.lock_owner != TASK_QUEUE_LOCK_OWNER:
+                continue
 
-        return {"status": "ok", "max_concurrency": str(max_conc), "started": str(started)}
+            task.lock_owner = TASK_QUEUE_LOCK_OWNER
+            task.lock_until = _task_queue_expires_at(now)
+            sj.status = SubtitleJobStatus.running
+            sj.progress = max(int(sj.progress or 0), 1)
+            db.add(task)
+            db.add(sj)
+            to_start.append(("subtitle", str(sj.id)))
+            started_subtitle += 1
+            running_tasks += 1
+
+        db.commit()
+    except Exception:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        raise
     finally:
         db.close()
+
+    for kind, jid in to_start:
+        if kind == "subtitle":
+            celery_app.send_task("subtitle_service.process_job", args=[jid], queue="subtitle")
+        else:
+            celery_app.send_task("subtitle_service.process_render_job", args=[jid], queue="subtitle")
+
+    return {
+        "status": "ok",
+        "max_concurrency": str(max_conc),
+        "started_subtitle": str(started_subtitle),
+        "started_render": str(started_render),
+        "recovered_subtitle": str(recovered_subtitle),
+        "recovered_render": str(recovered_render),
+        "unlocked_expired": str(unlocked_expired),
+    }
+
+
+@celery_app.task(name="subtitle_service.render_queue_tick")
+def render_queue_tick() -> dict[str, Any]:
+    # Legacy alias.
+    return task_queue_tick()
 
 
 @celery_app.task(name="subtitle_service.process_render_job")
@@ -1026,6 +1395,7 @@ def process_render_job(render_job_id: str) -> dict[str, Any]:
     db = _db()
     log_path: Path | None = None
     log_key: str | None = None
+    hb: _TaskQueueHeartbeat | None = None
     try:
         rj = db.get(RenderJob, rid)
         if not rj:
@@ -1036,15 +1406,46 @@ def process_render_job(render_job_id: str) -> dict[str, Any]:
         if rj.status == RenderJobStatus.canceled:
             return {"status": "skipped", "detail": "canceled"}
 
+        task = db.get(Task, rj.task_id)
+        if not task:
+            return {"status": "error", "detail": "task not found"}
+
+        now = _now()
+        if task.lock_owner != TASK_QUEUE_LOCK_OWNER:
+            # Not claimed by the task-level scheduler; put it back and wait.
+            if rj.status != RenderJobStatus.succeeded:
+                rj.status = RenderJobStatus.queued
+                rj.started_at = None
+                rj.progress = 0
+                db.add(rj)
+                db.commit()
+            celery_app.send_task(
+                "subtitle_service.task_queue_tick",
+                args=[],
+                queue="subtitle",
+                countdown=_TASK_QUEUE_REQUEUE_COUNTDOWN_SECONDS,
+            )
+            return {"status": "queued", "detail": "waiting for task queue"}
+        if task.lock_until is None or task.lock_until <= now:
+            task.lock_until = _task_queue_expires_at(now)
+            db.add(task)
+            db.commit()
+
+        hb = _TaskQueueHeartbeat(task.id)
+        hb.start()
+
         # Best-effort: if called directly, try to claim it.
         if rj.status == RenderJobStatus.queued:
             rj.status = RenderJobStatus.running
+            rj.started_at = _now()
+        if rj.status == RenderJobStatus.running and rj.started_at is None:
             rj.started_at = _now()
 
         if rj.status != RenderJobStatus.running:
             return {"status": "skipped", "detail": f"unexpected status={rj.status.value}"}
 
-        rj.progress = max(int(rj.progress or 0), 1)
+        # Mark as claimed by a worker ASAP so the scheduler can detect orphaned jobs.
+        rj.progress = max(int(rj.progress or 0), 2)
         db.add(rj)
         db.commit()
 
@@ -1067,10 +1468,6 @@ def process_render_job(render_job_id: str) -> dict[str, Any]:
         if burn_in and not ass_key:
             raise ValueError("render job missing ass_key for burn_in")
 
-        task = db.get(Task, rj.task_id)
-        if not task:
-            raise RuntimeError("task not found")
-
         work_root = Path(settings.work_dir) / "render" / str(rj.id)
         work_root.mkdir(parents=True, exist_ok=True)
         log_path = work_root / "job.log"
@@ -1087,13 +1484,60 @@ def process_render_job(render_job_id: str) -> dict[str, Any]:
             f"render job start: render_job_id={rj.id} task_id={task.id} burn_in={burn_in} soft_sub={soft_sub} codec={video_codec} preset={video_preset} crf={video_crf}",
         )
         _safe_upload_log(store, log_path, log_key)
+
+        last_live_upload_at = 0.0
+        last_live_upload_size = -1
+        last_db_heartbeat_at = 0.0
+
+        def _heartbeat_db(now: float) -> None:
+            nonlocal last_db_heartbeat_at
+            if now - last_db_heartbeat_at < 10.0:
+                return
+            try:
+                rj.updated_at = _now()
+                db.add(rj)
+                db.commit()
+                last_db_heartbeat_at = now
+            except Exception:
+                try:
+                    db.rollback()
+                except Exception:
+                    pass
+
+        def _live_upload_log() -> None:
+            nonlocal last_live_upload_at, last_live_upload_size
+            if log_path is None or not log_key:
+                return
+            try:
+                now = time.monotonic()
+                _heartbeat_db(now)
+                if now - last_live_upload_at < 2.0:
+                    return
+                size = log_path.stat().st_size if log_path.exists() else 0
+                if last_live_upload_size >= 0 and size - last_live_upload_size < 4096 and now - last_live_upload_at < 10.0:
+                    return
+                _safe_upload_log(store, log_path, log_key)
+                last_live_upload_at = now
+                last_live_upload_size = size
+            except Exception:
+                pass
+
         video_path = work_root / "input.mp4"
         srt_path = work_root / "subtitle_zh.srt"
         ass_path = work_root / "subtitle_zh.ass"
 
+        _safe_append_log_line(log_path, f"download: input_key={input_key}")
+        _safe_upload_log(store, log_path, log_key)
+        rj.progress = max(int(rj.progress or 0), 5)
+        db.add(rj)
+        db.commit()
         store.download_file(input_key, video_path)
+        _safe_append_log_line(log_path, f"download: srt_key={srt_key}")
+        _safe_upload_log(store, log_path, log_key)
         store.download_file(srt_key, srt_path)
         if burn_in and ass_key:
+            _safe_append_log_line(log_path, f"download: ass_key={ass_key}")
+            _safe_upload_log(store, log_path, log_key)
             store.download_file(ass_key, ass_path)
         _safe_append_log_line(log_path, "inputs downloaded")
         _safe_upload_log(store, log_path, log_key)
@@ -1128,16 +1572,18 @@ def process_render_job(render_job_id: str) -> dict[str, Any]:
                 preset=video_preset,
                 crf=video_crf,
                 log_path=log_path,
+                live_upload_cb=_live_upload_log,
             )
             _safe_upload_log(store, log_path, log_key)
-            final_key = f"final/{task.id}/video_burnin.mp4"
+            final_sha = sha256_file(out_video)
+            final_key = f"final/{task.id}/video_burnin_{final_sha[:16]}.mp4"
             store.upload_file(out_video, final_key, content_type="video/mp4")
             db.add(
                 Asset(
                     task_id=task.id,
                     kind=AssetKind.video_final,
                     storage_key=final_key,
-                    sha256=sha256_file(out_video),
+                    sha256=final_sha,
                     size_bytes=out_video.stat().st_size,
                 )
             )
@@ -1152,16 +1598,17 @@ def process_render_job(render_job_id: str) -> dict[str, Any]:
 
             out_video = work_root / "video_softsub.mkv"
             _safe_append_log_line(log_path, "ffmpeg: mux soft subtitles")
-            mux_soft_sub(settings.ffmpeg_path, video_path, srt_path, out_video, log_path=log_path)
+            mux_soft_sub(settings.ffmpeg_path, video_path, srt_path, out_video, log_path=log_path, live_upload_cb=_live_upload_log)
             _safe_upload_log(store, log_path, log_key)
-            final_key = f"final/{task.id}/video_softsub.mkv"
+            final_sha = sha256_file(out_video)
+            final_key = f"final/{task.id}/video_softsub_{final_sha[:16]}.mkv"
             store.upload_file(out_video, final_key, content_type="video/x-matroska")
             db.add(
                 Asset(
                     task_id=task.id,
                     kind=AssetKind.video_final,
                     storage_key=final_key,
-                    sha256=sha256_file(out_video),
+                    sha256=final_sha,
                     size_bytes=out_video.stat().st_size,
                 )
             )
@@ -1184,12 +1631,17 @@ def process_render_job(render_job_id: str) -> dict[str, Any]:
         _safe_append_log_line(log_path, "render job done")
         _safe_upload_log(store, log_path, log_key)
 
+        if task.lock_owner == TASK_QUEUE_LOCK_OWNER:
+            _task_queue_unlock(task)
+            db.add(task)
+            db.commit()
+
         # Trigger optional after_render actions (e.g. auto publish).
         after_render = req.get("after_render") if isinstance(req, dict) else None
         if isinstance(after_render, dict) and after_render.get("publish"):
             celery_app.send_task("subtitle_service.after_render_publish", args=[str(rj.id)], queue="subtitle")
 
-        celery_app.send_task("subtitle_service.render_queue_tick", args=[], queue="subtitle")
+        celery_app.send_task("subtitle_service.task_queue_tick", args=[], queue="subtitle")
         return {"status": "ok"}
     except Exception as e:
         rj = db.get(RenderJob, rid)
@@ -1199,10 +1651,13 @@ def process_render_job(render_job_id: str) -> dict[str, Any]:
             rj.finished_at = _now()
             db.add(rj)
             task = db.get(Task, rj.task_id)
-            if task and task.status not in {TaskStatus.published, TaskStatus.canceled}:
-                task.status = TaskStatus.failed
-                task.error_code = task.error_code or "RENDER_FAILED"
-                task.error_message = str(e)
+            if task:
+                if task.status not in {TaskStatus.published, TaskStatus.canceled}:
+                    task.status = TaskStatus.failed
+                    task.error_code = task.error_code or "RENDER_FAILED"
+                    task.error_message = str(e)
+                if task.lock_owner == TASK_QUEUE_LOCK_OWNER:
+                    _task_queue_unlock(task)
                 db.add(task)
         if rj and rj.subtitle_job_id:
             sj = db.get(SubtitleJob, rj.subtitle_job_id)
@@ -1214,9 +1669,11 @@ def process_render_job(render_job_id: str) -> dict[str, Any]:
         _safe_append_log_line(log_path, f"ERROR: {type(e).__name__}: {e}")
         _safe_append_log_block(log_path, traceback.format_exc())
         _safe_upload_log(store, log_path, log_key)
-        celery_app.send_task("subtitle_service.render_queue_tick", args=[], queue="subtitle")
+        celery_app.send_task("subtitle_service.task_queue_tick", args=[], queue="subtitle")
         return {"status": "error", "detail": str(e)}
     finally:
+        if hb is not None:
+            hb.stop()
         db.close()
 
 
@@ -1224,7 +1681,7 @@ def process_render_job(render_job_id: str) -> dict[str, Any]:
 def after_render_publish(render_job_id: str) -> dict[str, Any]:
     _ensure_db()
     db = _db()
-    orch_base = "http://localhost:8000"
+    orch_base = str(settings.orchestrator_url or "").strip().rstrip("/") or "http://localhost:8000"
     try:
         rid = uuid.UUID(render_job_id)
         rj = db.get(RenderJob, rid)
@@ -1250,7 +1707,7 @@ def after_render_publish(render_job_id: str) -> dict[str, Any]:
         if publish_payload.get("video_key") in {"", None}:
             publish_payload["video_key"] = None
 
-        with httpx.Client(timeout=30.0) as client:
+        with httpx.Client(timeout=30.0, headers=_ORCH_INTERNAL_HEADERS) as client:
             resp = client.post(f"{orch_base}/tasks/{task.id}/actions/publish", json=publish_payload)
             resp.raise_for_status()
 
@@ -1313,9 +1770,14 @@ def cleanup_task(task_id: str) -> dict[str, Any]:
 
         if not any(a.kind == AssetKind.video_final for a in assets):
             # Safety: if there's no final video, keep the latest raw video asset (if any) to avoid deleting the only video.
-            raw_assets = [a for a in assets if a.kind == AssetKind.video_raw]
-            if raw_assets:
-                keep_keys.add(raw_assets[-1].storage_key)
+            latest_raw = (
+                db.query(Asset)
+                .filter(Asset.task_id == tid, Asset.kind == AssetKind.video_raw)
+                .order_by(Asset.created_at.desc(), Asset.id.desc())
+                .first()
+            )
+            if latest_raw:
+                keep_keys.add(latest_raw.storage_key)
 
         deleted_keys: list[str] = []
         for a in assets:
@@ -1380,9 +1842,11 @@ def auto_youtube_pipeline(task_id: str) -> dict[str, str]:
     store = S3Store(settings)
     store.ensure_bucket()
 
-    orch_base = "http://localhost:8000"
+    orch_base = str(settings.orchestrator_url or "").strip().rstrip("/") or "http://localhost:8000"
 
     db = _db()
+    hb: _TaskQueueHeartbeat | None = None
+    acquired_lock = False
     try:
         tid = uuid.UUID(task_id)
         task = db.get(Task, tid)
@@ -1391,13 +1855,106 @@ def auto_youtube_pipeline(task_id: str) -> dict[str, str]:
         if task.source_type.value != "youtube":
             raise RuntimeError("task is not a youtube source")
 
+        now = _now()
+        if not _task_queue_is_task_locked(task, now):
+            # Claim a task slot before doing anything heavy (download/ASR/render).
+            _task_queue_lock_settings_row(db)
+            cfg = get_task_queue_settings(db)
+            try:
+                max_conc = int(cfg.get("max_concurrency", 1))
+            except Exception:
+                max_conc = 1
+            if max_conc < 0:
+                max_conc = 0
+            if max_conc == 0:
+                celery_app.send_task(
+                    "subtitle_service.auto_youtube_pipeline",
+                    args=[str(tid)],
+                    queue="subtitle",
+                    countdown=_TASK_QUEUE_REQUEUE_COUNTDOWN_SECONDS,
+                )
+                return {"status": "queued", "task_id": str(tid), "detail": "task queue paused"}
+
+            running = (
+                db.query(Task)
+                .filter(Task.lock_owner == TASK_QUEUE_LOCK_OWNER, Task.lock_until.is_not(None), Task.lock_until > now)
+                .count()
+            )
+            if int(running or 0) >= int(max_conc):
+                celery_app.send_task(
+                    "subtitle_service.auto_youtube_pipeline",
+                    args=[str(tid)],
+                    queue="subtitle",
+                    countdown=_TASK_QUEUE_REQUEUE_COUNTDOWN_SECONDS,
+                )
+                return {"status": "queued", "task_id": str(tid), "detail": "waiting for task queue"}
+
+            task.lock_owner = TASK_QUEUE_LOCK_OWNER
+            task.lock_until = _task_queue_expires_at(now)
+            db.add(task)
+            db.commit()
+            acquired_lock = True
+        elif task.lock_until is None or task.lock_until <= now:
+            # Refresh a stale/expired lock to avoid accidental eviction mid-pipeline.
+            task.lock_until = _task_queue_expires_at(now)
+            db.add(task)
+            db.commit()
+
+        hb = _TaskQueueHeartbeat(task.id)
+        hb.start()
+
         profile = get_auto_profile(db)
 
         # Download YouTube video + cover + metadata (idempotent).
-        with httpx.Client(timeout=None) as client:
-            resp = client.post(f"{orch_base}/tasks/{tid}/actions/youtube_download")
-            resp.raise_for_status()
-            yt = resp.json() if resp.content else {}
+        yt: dict[str, Any] = {}
+        yt_attempt = 0
+        yt_max_retries = 2
+        while True:
+            try:
+                timeout_seconds = float(getattr(settings, "orchestrator_timeout_seconds", 1800.0) or 1800.0)
+                with httpx.Client(timeout=httpx.Timeout(timeout_seconds, connect=10.0), headers=_ORCH_INTERNAL_HEADERS) as client:
+                    resp = client.post(f"{orch_base}/tasks/{tid}/actions/youtube_download")
+                    resp.raise_for_status()
+                    yt = resp.json() if resp.content else {}
+                break
+            except httpx.HTTPStatusError as e:
+                status_code = int(getattr(e.response, "status_code", 0) or 0)
+                if status_code in {429, 500, 502, 503, 504} and yt_attempt < yt_max_retries:
+                    yt_attempt += 1
+                    try:
+                        task.retry_count = int(task.retry_count or 0) + 1
+                        msg = (e.response.text or "").strip()
+                        if len(msg) > 300:
+                            msg = msg[:299] + "…"
+                        task.error_message = f"youtube_download failed; retrying ({yt_attempt}/{yt_max_retries}): {status_code} {msg}".strip()
+                        db.add(task)
+                        db.commit()
+                    except Exception:
+                        db.rollback()
+                    time.sleep(min(30.0, float(3 * (2**yt_attempt))))
+                    continue
+                raise
+            except httpx.HTTPError as e:
+                if yt_attempt < yt_max_retries:
+                    yt_attempt += 1
+                    try:
+                        task.retry_count = int(task.retry_count or 0) + 1
+                        task.error_message = f"youtube_download request failed; retrying ({yt_attempt}/{yt_max_retries}): {type(e).__name__}: {e}"
+                        db.add(task)
+                        db.commit()
+                    except Exception:
+                        db.rollback()
+                    time.sleep(min(30.0, float(3 * (2**yt_attempt))))
+                    continue
+                raise
+
+        if yt_attempt:
+            try:
+                task.error_message = None
+                db.add(task)
+                db.commit()
+            except Exception:
+                db.rollback()
 
         yt_meta = yt.get("metadata") if isinstance(yt, dict) else {}
         if not isinstance(yt_meta, dict):
@@ -1512,13 +2069,21 @@ def auto_youtube_pipeline(task_id: str) -> dict[str, str]:
                     meta["copyright"] = 1
                     meta["source"] = ""
 
+                # Persist publish meta as a file so it can be edited before publishing.
+                publish_meta_key = f"meta/{tid}/publish_meta.json"
+                store.put_bytes(
+                    json.dumps(meta, ensure_ascii=False, indent=2).encode("utf-8"),
+                    publish_meta_key,
+                    content_type="application/json",
+                )
+
                 # Let orchestrator pick the latest rendered asset when publishing.
                 publish_payload = {
                     "account_id": None,
                     "video_key": None,
                     "cover_key": cover_key,
                     "typeid_mode": profile.get("publish_typeid_mode") or "ai_summary",
-                    "meta": meta,
+                    "meta": None,
                 }
 
                 req["after_render"] = {"publish": True, "publish_payload": publish_payload}
@@ -1526,7 +2091,7 @@ def auto_youtube_pipeline(task_id: str) -> dict[str, str]:
                 db.add(job)
                 db.commit()
 
-            celery_app.send_task("subtitle_service.process_job", args=[str(job.id)], queue="subtitle")
+            celery_app.send_task("subtitle_service.task_queue_tick", args=[], queue="subtitle")
             return {"status": "ok", "task_id": str(tid), "detail": f"queued subtitle job {job.id}"}
 
         if profile.get("auto_publish"):
@@ -1567,15 +2132,22 @@ def auto_youtube_pipeline(task_id: str) -> dict[str, str]:
                 meta["copyright"] = 1
                 meta["source"] = ""
 
+            publish_meta_key = f"meta/{tid}/publish_meta.json"
+            store.put_bytes(
+                json.dumps(meta, ensure_ascii=False, indent=2).encode("utf-8"),
+                publish_meta_key,
+                content_type="application/json",
+            )
+
             publish_payload = {
                 "account_id": None,
                 "video_key": final_asset.storage_key,
                 "cover_key": cover_key,
                 "typeid_mode": profile.get("publish_typeid_mode") or "ai_summary",
-                "meta": meta,
+                "meta": None,
             }
 
-            with httpx.Client(timeout=30.0) as client:
+            with httpx.Client(timeout=30.0, headers=_ORCH_INTERNAL_HEADERS) as client:
                 resp = client.post(f"{orch_base}/tasks/{tid}/actions/publish", json=publish_payload)
                 resp.raise_for_status()
 
@@ -1587,6 +2159,35 @@ def auto_youtube_pipeline(task_id: str) -> dict[str, str]:
             task.error_message = str(e)
             db.add(task)
             db.commit()
+        celery_app.send_task("subtitle_service.task_queue_tick", args=[], queue="subtitle")
         raise
     finally:
+        if hb is not None:
+            hb.stop()
+        try:
+            if acquired_lock:
+                tid2 = uuid.UUID(task_id)
+                task2 = db.get(Task, tid2)
+                if task2 and task2.lock_owner == TASK_QUEUE_LOCK_OWNER:
+                    inflight = (
+                        db.query(SubtitleJob)
+                        .filter(
+                            SubtitleJob.task_id == tid2,
+                            SubtitleJob.status.in_([SubtitleJobStatus.queued, SubtitleJobStatus.running]),
+                        )
+                        .count()
+                        + db.query(RenderJob)
+                        .filter(RenderJob.task_id == tid2, RenderJob.status.in_([RenderJobStatus.queued, RenderJobStatus.running]))
+                        .count()
+                    )
+                    if not inflight:
+                        _task_queue_unlock(task2)
+                        db.add(task2)
+                        db.commit()
+                        celery_app.send_task("subtitle_service.task_queue_tick", args=[], queue="subtitle")
+        except Exception:
+            try:
+                db.rollback()
+            except Exception:
+                pass
         db.close()

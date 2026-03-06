@@ -15,6 +15,6 @@ build/
 
 data/
 
-web/node_modules/
-web/dist/
-web/*.tsbuildinfo
+src/web/node_modules/
+src/web/dist/
+src/web/*.tsbuildinfo

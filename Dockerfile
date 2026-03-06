@@ -19,7 +19,7 @@ RUN INSTALL_ASR="$INSTALL_ASR" python -c "import os, tomllib; from pathlib impor
   && pip install --no-cache-dir -U pip \
   && pip install --no-cache-dir -r /tmp/requirements.txt
 
-COPY src ./src
+COPY src/videoroll ./src/videoroll
 COPY docs ./docs
 COPY docker ./docker
 

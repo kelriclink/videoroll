@@ -218,8 +218,35 @@ class ModelDownloadProxyTestResponse(BaseModel):
     error: Optional[str] = None
 
 
+class TaskQueueSettingsRead(BaseModel):
+    max_concurrency: int = Field(1, description="0=暂停调度；>0 表示最多同时运行多少个任务（Task pipeline）")
+
+
+class TaskQueueSettingsUpdate(BaseModel):
+    max_concurrency: Optional[int] = Field(default=None, ge=0, le=32)
+
+
+class TaskQueueItemRead(BaseModel):
+    task_id: uuid.UUID
+    state: str
+    stage: str
+    subtitle_job_id: Optional[uuid.UUID] = None
+    render_job_id: Optional[uuid.UUID] = None
+    progress: int = 0
+    error_message: Optional[str] = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class TaskQueueRead(BaseModel):
+    settings: TaskQueueSettingsRead
+    running_count: int = 0
+    queued_count: int = 0
+    tasks: list[TaskQueueItemRead] = Field(default_factory=list)
+
+
 class RenderQueueSettingsRead(BaseModel):
-    max_concurrency: int = Field(1, description="0=暂停调度；>0 表示最多同时运行多少个 ffmpeg 压制任务")
+    max_concurrency: int = Field(1, description="(legacy) use TaskQueueSettingsRead instead")
 
 
 class RenderQueueSettingsUpdate(BaseModel):
@@ -245,3 +272,4 @@ class RenderQueueRead(BaseModel):
     running_count: int = 0
     queued_count: int = 0
     jobs: list[RenderJobRead] = Field(default_factory=list)
+    history: list[RenderJobRead] = Field(default_factory=list, description="最近已结束（succeeded/failed/canceled）的压制任务列表（用于排查消失/失败原因）")

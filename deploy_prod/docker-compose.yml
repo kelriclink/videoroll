@@ -52,10 +52,10 @@ services:
       SUBTITLE_WHISPER_MODEL_DIR: ${SUBTITLE_WHISPER_MODEL_DIR:-/models/whisper}
       FFMPEG_PATH: ${FFMPEG_PATH:-ffmpeg}
       WORK_DIR: ${WORK_DIR:-/tmp/videoroll}
-      YOUTUBE_USER_AGENT: ${YOUTUBE_USER_AGENT:-videoroll/0.1}
+      UVICORN_ROOT_PATH: ${UVICORN_ROOT_PATH:-/api}
+      YOUTUBE_USER_AGENT: "${YOUTUBE_USER_AGENT:-Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36}"
       YOUTUBE_COOKIE_FILE: ${YOUTUBE_COOKIE_FILE:-}
       YOUTUBE_PROXY: ${YOUTUBE_PROXY:-}
-      YOUTUBE_YTDLP_FORMAT: ${YOUTUBE_YTDLP_FORMAT:-bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best}
       YOUTUBE_EXTRACTOR_ARGS_JSON: ${YOUTUBE_EXTRACTOR_ARGS_JSON:-}
       BILIBILI_PUBLISH_MODE: ${BILIBILI_PUBLISH_MODE:-web}
       CELERY_PUB_CONCURRENCY: ${CELERY_PUB_CONCURRENCY:-1}
@@ -64,8 +64,6 @@ services:
       YOUTUBE_INGEST_URL: ${YOUTUBE_INGEST_URL:-http://localhost:8000/youtube-ingest}
       BILIBILI_PUBLISHER_URL: ${BILIBILI_PUBLISHER_URL:-http://localhost:8000/bilibili-publisher}
       STORAGE_CLEANUP_INTERVAL_SECONDS: ${STORAGE_CLEANUP_INTERVAL_SECONDS:-3600}
-    ports:
-      - "${PUBLISH_ADDR:-127.0.0.1}:${ORCHESTRATOR_PORT:-8000}:8000"
     volumes:
       - ./data/models:/models
       - ./data/secrets:/secrets
@@ -82,7 +80,7 @@ services:
 
   web:
     build:
-      context: ./web
+      context: ./src/web
       args:
         VITE_ORCHESTRATOR_URL: ${VITE_ORCHESTRATOR_URL:-}
         VITE_SUBTITLE_SERVICE_URL: ${VITE_SUBTITLE_SERVICE_URL:-}

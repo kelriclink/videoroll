@@ -7,10 +7,12 @@ from urllib.parse import parse_qs, urlparse
 
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from videoroll.config import YouTubeIngestSettings, get_youtube_ingest_settings
 from videoroll.db.base import Base
+from videoroll.db.auto_migrate import auto_migrate
 from videoroll.db.models import (
     IngestedVideo,
     SourceType,
@@ -60,6 +62,7 @@ def _startup() -> None:
     settings = get_youtube_ingest_settings()
     engine = get_engine(settings.database_url)
     Base.metadata.create_all(engine)
+    auto_migrate(settings.database_url)
     S3Store(settings).ensure_bucket()
 
 
@@ -120,13 +123,25 @@ def ingest_single(payload: YouTubeIngestRequest, db: Session = Depends(get_db)) 
         status=TaskStatus.ingested,
     )
     db.add(task)
-    db.commit()
-    db.refresh(task)
-
     if video_id:
+        db.flush()
         db.add(IngestedVideo(platform="youtube", source_id=video_id, task_id=task.id))
+    try:
         db.commit()
+    except IntegrityError as e:
+        # Concurrency-safe dedupe: another request inserted the same IngestedVideo.
+        db.rollback()
+        if video_id:
+            existing = (
+                db.query(IngestedVideo)
+                .filter(IngestedVideo.platform == "youtube", IngestedVideo.source_id == video_id)
+                .first()
+            )
+            if existing:
+                return YouTubeIngestResponse(task_id=existing.task_id, deduped=True, source_id=video_id)
+        raise HTTPException(status_code=500, detail=f"ingest failed: {e}") from e
 
+    db.refresh(task)
     return YouTubeIngestResponse(task_id=task.id, deduped=False, source_id=video_id)
 
 
@@ -175,10 +190,23 @@ def scan_source(
             status=TaskStatus.ingested,
         )
         db.add(task)
-        db.commit()
-        db.refresh(task)
+        db.flush()
         db.add(IngestedVideo(platform="youtube", source_id=e.video_id, task_id=task.id, published_at=e.published_at))
-        db.commit()
+        try:
+            db.commit()
+        except IntegrityError:
+            # Another worker/request beat us to it.
+            db.rollback()
+            if (
+                db.query(IngestedVideo)
+                .filter(IngestedVideo.platform == "youtube", IngestedVideo.source_id == e.video_id)
+                .first()
+                is not None
+            ):
+                skipped += 1
+                continue
+            raise
+        db.refresh(task)
         created.append(task.id)
 
         if payload.auto_process:
