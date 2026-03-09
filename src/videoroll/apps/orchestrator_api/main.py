@@ -12,7 +12,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Generator, Optional
-from urllib.parse import quote, urlparse
+from urllib.parse import quote
 
 import httpx
 from botocore.exceptions import ClientError
@@ -33,6 +33,7 @@ from videoroll.db.session import db_session, get_engine, get_sessionmaker
 from videoroll.storage.s3 import S3Store
 from videoroll.utils.internal_api_token import internal_api_token
 from videoroll.utils.hashing import sha256_file
+from videoroll.utils.youtube_urls import canonicalize_youtube_url, is_youtube_url
 from videoroll.apps.orchestrator_api.schemas import (
     AdminAuthLoginRequest,
     AdminAuthSetupRequest,
@@ -949,7 +950,7 @@ def _start_auto_youtube_pipeline(
     proof_url: str | None,
     settings: OrchestratorSettings,
 ) -> AutoYouTubeResponse:
-    url = str(url or "").strip()
+    url = canonicalize_youtube_url(str(url or "").strip())
     if not url:
         raise HTTPException(status_code=400, detail="url is required")
     if not _is_youtube_url(url):
@@ -1426,12 +1427,7 @@ def delete_task_asset(
 
 
 def _is_youtube_url(url: str) -> bool:
-    try:
-        parsed = urlparse(url)
-    except Exception:
-        return False
-    host = (parsed.netloc or "").lower()
-    return host.endswith("youtube.com") or host == "youtu.be" or host.endswith(".youtube.com")
+    return is_youtube_url(url)
 
 
 @app.get("/tasks/{task_id}/youtube_meta", response_model=YouTubeMetaRead)

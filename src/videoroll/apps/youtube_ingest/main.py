@@ -2,8 +2,7 @@ from __future__ import annotations
 
 import os
 import uuid
-from typing import Generator, Optional
-from urllib.parse import parse_qs, urlparse
+from typing import Generator
 
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -32,6 +31,7 @@ from videoroll.apps.youtube_ingest.schemas import (
 )
 from videoroll.apps.youtube_ingest.youtube_feed import fetch_youtube_feed
 from videoroll.apps.youtube_settings_store import get_youtube_settings
+from videoroll.utils.youtube_urls import canonicalize_youtube_url, extract_youtube_video_id
 
 
 def get_settings() -> YouTubeIngestSettings:
@@ -95,21 +95,10 @@ def list_sources(db: Session = Depends(get_db)) -> list[YouTubeSource]:
     return db.query(YouTubeSource).order_by(YouTubeSource.created_at.desc()).all()
 
 
-def _extract_video_id(url: str) -> Optional[str]:
-    parsed = urlparse(url)
-    if parsed.netloc in {"youtu.be"}:
-        vid = parsed.path.strip("/").split("/")[0]
-        return vid or None
-    if "youtube.com" in parsed.netloc:
-        qs = parse_qs(parsed.query)
-        vid = (qs.get("v") or [None])[0]
-        return vid or None
-    return None
-
-
 @app.post("/youtube/ingest", response_model=YouTubeIngestResponse)
 def ingest_single(payload: YouTubeIngestRequest, db: Session = Depends(get_db)) -> YouTubeIngestResponse:
-    video_id = _extract_video_id(payload.url)
+    normalized_url = canonicalize_youtube_url(payload.url)
+    video_id = extract_youtube_video_id(normalized_url)
     if video_id:
         existing = db.query(IngestedVideo).filter(IngestedVideo.platform == "youtube", IngestedVideo.source_id == video_id).first()
         if existing:
@@ -117,7 +106,7 @@ def ingest_single(payload: YouTubeIngestRequest, db: Session = Depends(get_db)) 
 
     task = Task(
         source_type=SourceType.youtube,
-        source_url=payload.url,
+        source_url=normalized_url,
         source_license=payload.license,
         source_proof_url=payload.proof_url,
         status=TaskStatus.ingested,

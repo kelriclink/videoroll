@@ -151,17 +151,17 @@ export default function TaskNewPage() {
           <div className="mt-4">
             <label className="block">
               <div className="mb-1 text-xs text-slate-600">YouTube 视频链接</div>
-            <input
+              <input
                 className="w-full rounded border px-3 py-2 text-sm"
-                placeholder="https://www.youtube.com/watch?v=..."
+                placeholder="https://www.youtube.com/watch?v=... 或 https://youtube.com/shorts/..."
                 value={youtubeUrl}
                 onChange={(e) => setYoutubeUrl(e.target.value)}
               />
             </label>
             <div className="mt-2 text-xs text-slate-500">
               {mode === "youtube-auto"
-                ? "自动模式：会按 Settings 中的默认参数执行（下载→字幕/翻译→硬字幕 burn-in→自动投稿 Bilibili）。"
-                : "说明：创建后可在任务详情页一键下载视频，并自动填充投稿标题/简介/转载来源（请确保你拥有版权/已获授权/可再分发）。"}
+                ? "自动模式：会按 Settings 中的默认参数执行（下载→字幕/翻译→硬字幕 burn-in→自动投稿 Bilibili）。支持 watch / youtu.be / shorts 链接。"
+                : "说明：创建后可在任务详情页一键下载视频，并自动填充投稿标题/简介/转载来源（支持 watch / youtu.be / shorts 链接；请确保你拥有版权/已获授权/可再分发）。"}
             </div>
           </div>
         )}

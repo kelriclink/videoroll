@@ -3,8 +3,10 @@ from __future__ import annotations
 import json
 import random
 import re
+import shutil
 import subprocess
 import time
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -617,27 +619,209 @@ def _ass_ts(seconds: float) -> str:
     return f"{h}:{m:02}:{s:02}.{cs:02}"
 
 
-def segments_to_ass(segments: Iterable[Segment], style_name: str = "clean_white") -> str:
+def probe_video_resolution(ffmpeg_path: str, video_path: Path) -> tuple[int, int]:
+    ffmpeg_cmd = str(ffmpeg_path or "").strip() or "ffmpeg"
+    ffmpeg_bin = Path(ffmpeg_cmd)
+    ffprobe_name = "ffprobe" + ffmpeg_bin.suffix if ffmpeg_bin.suffix else "ffprobe"
+    candidates = [str(ffmpeg_bin.with_name(ffprobe_name)), shutil.which("ffprobe") or "ffprobe"]
+
+    for candidate in candidates:
+        if not candidate:
+            continue
+        try:
+            proc = subprocess.run(
+                [
+                    candidate,
+                    "-v",
+                    "error",
+                    "-select_streams",
+                    "v:0",
+                    "-show_entries",
+                    "stream=width,height",
+                    "-of",
+                    "json",
+                    str(video_path),
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            data = json.loads(proc.stdout or "{}")
+            streams = data.get("streams")
+            if not isinstance(streams, list) or not streams:
+                continue
+            stream = streams[0] if isinstance(streams[0], dict) else {}
+            width = int(stream.get("width") or 0)
+            height = int(stream.get("height") or 0)
+            if width > 0 and height > 0:
+                return width, height
+        except Exception:
+            continue
+
+    return 1920, 1080
+
+
+def _char_width_units(ch: str) -> float:
+    if not ch:
+        return 0.0
+    if ch.isspace():
+        return 0.35
+    east_asian = unicodedata.east_asian_width(ch)
+    if east_asian in {"W", "F"}:
+        return 1.0
+    if ord(ch) < 128:
+        if ch in "ilI.,'`!|:;":
+            return 0.32
+        if ch in "MW@#%&":
+            return 0.9
+        return 0.6
+    if unicodedata.category(ch).startswith("P"):
+        return 0.5
+    return 0.75
+
+
+def _text_width_units(text: str) -> float:
+    return sum(_char_width_units(ch) for ch in text)
+
+
+def _split_long_token(token: str, max_units: float) -> list[str]:
+    pieces: list[str] = []
+    current = ""
+    current_units = 0.0
+    limit = max(1.0, float(max_units or 1.0))
+    for ch in token:
+        ch_units = _char_width_units(ch)
+        if current and current_units + ch_units > limit:
+            pieces.append(current)
+            current = ch
+            current_units = ch_units
+            continue
+        current += ch
+        current_units += ch_units
+    if current:
+        pieces.append(current)
+    return pieces
+
+
+def _wrap_ass_line(text: str, max_units: float) -> list[str]:
+    normalized = re.sub(r"[ \t\f\v]+", " ", str(text or "").strip())
+    if not normalized:
+        return []
+
+    lines: list[str] = []
+    current = ""
+    current_units = 0.0
+
+    for token in re.findall(r"\S+|\s+", normalized):
+        if token.isspace():
+            if not current or current.endswith(" "):
+                continue
+            space_units = _char_width_units(" ")
+            if current_units + space_units <= max_units:
+                current += " "
+                current_units += space_units
+            else:
+                lines.append(current.rstrip())
+                current = ""
+                current_units = 0.0
+            continue
+
+        token_units = _text_width_units(token)
+        if current and current_units + token_units <= max_units:
+            current += token
+            current_units += token_units
+            continue
+
+        if current:
+            lines.append(current.rstrip())
+            current = ""
+            current_units = 0.0
+
+        if token_units <= max_units:
+            current = token
+            current_units = token_units
+            continue
+
+        pieces = _split_long_token(token, max_units)
+        if pieces:
+            lines.extend(pieces[:-1])
+            current = pieces[-1]
+            current_units = _text_width_units(current)
+
+    if current.strip():
+        lines.append(current.rstrip())
+
+    return [line for line in lines if line]
+
+
+def _wrap_ass_text(text: str, max_units: float, *, secondary_font_size: int | None = None) -> str:
+    styled_lines: list[tuple[str, bool]] = []
+    raw_lines = str(text or "").replace("\r", "").split("\n")
+    for idx, raw_line in enumerate(raw_lines):
+        wrapped = _wrap_ass_line(raw_line, max_units)
+        if not wrapped:
+            continue
+        is_secondary = secondary_font_size is not None and idx > 0
+        styled_lines.extend((line, is_secondary) for line in wrapped)
+
+    out: list[str] = []
+    active_secondary = False
+    for i, (line, is_secondary) in enumerate(styled_lines):
+        prefix = ""
+        if is_secondary and not active_secondary and secondary_font_size is not None:
+            prefix = f"{{\\fs{secondary_font_size}}}"
+        elif not is_secondary and active_secondary:
+            prefix = "{\\rDefault}"
+        active_secondary = is_secondary
+        out.append(prefix + line if prefix else line)
+        if i < len(styled_lines) - 1:
+            out.append("\\N")
+    return "".join(out)
+
+
+def segments_to_ass(
+    segments: Iterable[Segment],
+    style_name: str = "clean_white",
+    *,
+    play_res_x: int = 1920,
+    play_res_y: int = 1080,
+    secondary_line_scale: float | None = None,
+) -> str:
     if style_name not in {"clean_white"}:
         style_name = "clean_white"
 
+    play_res_x = max(320, int(play_res_x or 1920))
+    play_res_y = max(320, int(play_res_y or 1080))
+    portrait = play_res_y > play_res_x
+    margin_x = max(36, int(round(play_res_x * (0.065 if portrait else 0.055))))
+    margin_v = max(48, int(round(play_res_y * (0.06 if portrait else 0.055))))
+    font_basis = play_res_x if portrait else min(play_res_x, play_res_y)
+    font_size = max(30, int(round(font_basis * (0.048 if portrait else 0.05))))
+    secondary_font_size = None
+    if secondary_line_scale is not None:
+        secondary_font_size = max(24, int(round(font_size * float(secondary_line_scale))))
+    outline = max(2, int(round(font_size * 0.035)))
+    max_line_units = max(10.0, ((play_res_x - margin_x * 2) / max(font_size, 1)) * 0.96)
+
     # Use a CJK-capable font by default so burn-in works in minimal containers.
     style_default = (
-        "Style: Default,Noto Sans CJK SC,67,&H00FFFFFF,&H000000FF,&H00000000,&H64000000,"
-        "0,0,0,0,100,100,0,0,1,2,0,2,50,50,50,1"
+        f"Style: Default,Noto Sans CJK SC,{font_size},&H00FFFFFF,&H000000FF,&H00000000,&H64000000,"
+        f"0,0,0,0,100,100,0,0,1,{outline},0,2,{margin_x},{margin_x},{margin_v},1"
     )
 
     events: list[str] = []
     for seg in segments:
-        text = seg.text.replace("\n", "\\N").replace("\r", "").strip()
+        text = _wrap_ass_text(seg.text, max_line_units, secondary_font_size=secondary_font_size).strip()
+        if not text:
+            continue
         events.append(f"Dialogue: 0,{_ass_ts(seg.start)},{_ass_ts(seg.end)},Default,,0,0,0,,{text}")
 
     return "\n".join(
         [
             "[Script Info]",
             "ScriptType: v4.00+",
-            "PlayResX: 1920",
-            "PlayResY: 1080",
+            f"PlayResX: {play_res_x}",
+            f"PlayResY: {play_res_y}",
             "WrapStyle: 2",
             "ScaledBorderAndShadow: yes",
             "",

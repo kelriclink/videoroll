@@ -45,6 +45,7 @@ from videoroll.apps.subtitle_service.processing import (
     extract_audio,
     generate_bilibili_tags_openai,
     mux_soft_sub,
+    probe_video_resolution,
     render_burn_in,
     srt_to_segments,
     segments_to_ass,
@@ -62,6 +63,7 @@ from videoroll.apps.subtitle_service.bilibili_tags_store import set_task_bilibil
 from videoroll.apps.subtitle_service.task_title_store import set_task_titles
 from videoroll.apps.subtitle_service.translate_settings_store import get_translate_settings
 from videoroll.apps.bilibili_publisher.publish_settings_store import get_bilibili_publish_settings
+from videoroll.apps.bilibili_publisher.constants import BILIBILI_DESC_MAX_CHARS
 from videoroll.apps.subtitle_service.render_queue_store import TASK_QUEUE_SETTINGS_KEY, get_task_queue_settings
 from videoroll.utils.cpu import process_cpu_count
 from videoroll.utils.hf_hub import configure_hf_hub_proxy
@@ -330,17 +332,23 @@ def _clamp_text(text: str, max_len: int) -> str:
 
 def _build_bilibili_desc(youtube_desc: str, source_url: str) -> str:
     src = (source_url or "").strip()
-    tail = f"\n\n原视频：{src}" if src else ""
-    max_len = 2000
-    if not tail:
-        return _clamp_text((youtube_desc or "").strip(), max_len)
-    if len(tail) >= max_len:
-        return _clamp_text(tail, max_len)
+    source_line = f"原视频：{src}" if src else ""
+    max_len = BILIBILI_DESC_MAX_CHARS
+
     base = (youtube_desc or "").strip()
-    avail = max_len - len(tail)
+    if source_line:
+        base = base.replace(source_line, "").strip()
+
+    if not source_line:
+        return _clamp_text(base, max_len)
+    if len(source_line) >= max_len:
+        return _clamp_text(source_line, max_len)
+
+    sep = "\n\n" if base else ""
+    avail = max_len - len(source_line) - len(sep)
     if len(base) > avail:
         base = _clamp_text(base, avail)
-    out = (base + tail).strip() if base else f"原视频：{src}"
+    out = f"{source_line}{sep}{base}" if base else source_line
     return _clamp_text(out, max_len)
 
 
@@ -707,6 +715,69 @@ def process_job(job_id: str) -> dict[str, str]:
                 return None
             return None
 
+        video_downloaded = False
+
+        def _ensure_video() -> None:
+            nonlocal video_downloaded
+            if video_downloaded:
+                return
+            store.download_file(input_key, video_path)
+            video_downloaded = True
+
+        def _ass_resolution() -> tuple[int, int]:
+            try:
+                _ensure_video()
+                return probe_video_resolution(settings.ffmpeg_path, video_path)
+            except Exception as e:
+                _safe_append_log_line(log_path, f"subtitle ass resolution probe failed; fallback to 1920x1080: {e}")
+                return 1920, 1080
+
+        def _store_ass_from_segments(segs: list[Segment], *, log_prefix: str) -> str:
+            play_res_x, play_res_y = _ass_resolution()
+            secondary_line_scale = 0.8 if bool((req.get("translate") or {}).get("bilingual")) else None
+            ass_text = segments_to_ass(
+                segs,
+                style_name=render_cfg.get("ass_style", "clean_white"),
+                play_res_x=play_res_x,
+                play_res_y=play_res_y,
+                secondary_line_scale=secondary_line_scale,
+            )
+            ass_path.write_text(ass_text, encoding="utf-8")
+            ass_sha = sha256_file(ass_path)
+            ass_key_local = f"sub/{task.id}/subtitle_zh_{ass_sha[:16]}.ass"
+            existing_asset = (
+                db.query(Asset)
+                .filter(Asset.task_id == task.id, Asset.kind == AssetKind.subtitle_ass, Asset.storage_key == ass_key_local)
+                .first()
+            )
+            if existing_asset is None:
+                store.upload_file(ass_path, ass_key_local, content_type="text/plain")
+                db.add(
+                    Asset(
+                        task_id=task.id,
+                        kind=AssetKind.subtitle_ass,
+                        storage_key=ass_key_local,
+                        sha256=ass_sha,
+                        size_bytes=ass_path.stat().st_size,
+                    )
+                )
+                existing_subtitle = (
+                    db.query(Subtitle)
+                    .filter(
+                        Subtitle.task_id == task.id,
+                        Subtitle.format == SubtitleFormat.ass,
+                        Subtitle.language == "zh",
+                        Subtitle.storage_key == ass_key_local,
+                    )
+                    .first()
+                )
+                if existing_subtitle is None:
+                    db.add(Subtitle(task_id=task.id, version=1, format=SubtitleFormat.ass, language="zh", storage_key=ass_key_local))
+                _safe_append_log_line(log_path, f"{log_prefix}: {ass_key_local} ({play_res_x}x{play_res_y})")
+            else:
+                _safe_append_log_line(log_path, f"{log_prefix} unchanged: {ass_key_local} ({play_res_x}x{play_res_y})")
+            return ass_key_local
+
         srt_asset = _download_latest_asset(AssetKind.subtitle_srt, srt_path) if resume else None
         if resume and srt_asset:
             srt_key = srt_asset.storage_key
@@ -720,29 +791,10 @@ def process_job(job_id: str) -> dict[str, str]:
             db.commit()
 
             if need_ass:
-                ass_asset = _download_latest_asset(AssetKind.subtitle_ass, ass_path)
-                if ass_asset:
-                    ass_key = ass_asset.storage_key
-                else:
-                    segs = srt_to_segments(srt_path.read_text(encoding="utf-8"))
-                    ass_text = segments_to_ass(segs, style_name=render_cfg.get("ass_style", "clean_white"))
-                    ass_path.write_text(ass_text, encoding="utf-8")
-                    ass_sha = sha256_file(ass_path)
-                    ass_key = f"sub/{task.id}/subtitle_zh_{ass_sha[:16]}.ass"
-                    store.upload_file(ass_path, ass_key, content_type="text/plain")
-                    db.add(
-                        Asset(
-                            task_id=task.id,
-                            kind=AssetKind.subtitle_ass,
-                            storage_key=ass_key,
-                            sha256=ass_sha,
-                            size_bytes=ass_path.stat().st_size,
-                        )
-                    )
-                    db.add(Subtitle(task_id=task.id, version=1, format=SubtitleFormat.ass, language="zh", storage_key=ass_key))
-                    db.commit()
-                    _safe_append_log_line(log_path, f"generated ass from resumed srt: {ass_key}")
-                    _safe_upload_log(store, log_path, log_key)
+                segs = srt_to_segments(srt_path.read_text(encoding="utf-8"))
+                ass_key = _store_ass_from_segments(segs, log_prefix="generated ass from resumed srt")
+                db.commit()
+                _safe_upload_log(store, log_path, log_key)
 
             if not burn_in and not soft_sub:
                 job.status = SubtitleJobStatus.succeeded
@@ -794,15 +846,6 @@ def process_job(job_id: str) -> dict[str, str]:
             _safe_upload_log(store, log_path, log_key)
             celery_app.send_task("subtitle_service.task_queue_tick", args=[], queue="subtitle")
             return {"status": "ok", "detail": "render queued"}
-
-        video_downloaded = False
-
-        def _ensure_video() -> None:
-            nonlocal video_downloaded
-            if video_downloaded:
-                return
-            store.download_file(input_key, video_path)
-            video_downloaded = True
 
         segments: list[Segment] | None = None
         segments_asset = _download_latest_asset(AssetKind.segments_json, segments_path) if resume else None
@@ -1057,22 +1100,7 @@ def process_job(job_id: str) -> dict[str, str]:
         _safe_append_log_line(log_path, f"subtitle srt uploaded: {srt_key}")
 
         if need_ass:
-            ass_text = segments_to_ass(segments_out, style_name=render_cfg.get("ass_style", "clean_white"))
-            ass_path.write_text(ass_text, encoding="utf-8")
-            ass_sha = sha256_file(ass_path)
-            ass_key = f"sub/{task.id}/subtitle_zh_{ass_sha[:16]}.ass"
-            store.upload_file(ass_path, ass_key, content_type="text/plain")
-            db.add(
-                Asset(
-                    task_id=task.id,
-                    kind=AssetKind.subtitle_ass,
-                    storage_key=ass_key,
-                    sha256=ass_sha,
-                    size_bytes=ass_path.stat().st_size,
-                )
-            )
-            db.add(Subtitle(task_id=task.id, version=1, format=SubtitleFormat.ass, language="zh", storage_key=ass_key))
-            _safe_append_log_line(log_path, f"subtitle ass uploaded: {ass_key}")
+            ass_key = _store_ass_from_segments(segments_out, log_prefix="subtitle ass uploaded")
 
         task.status = TaskStatus.subtitle_ready
         db.add(task)

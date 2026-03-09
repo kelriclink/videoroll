@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import StatusBadge from "../components/StatusBadge";
 import { fetchJson } from "../lib/http";
@@ -46,6 +46,8 @@ type SubtitleAutoProfile = {
 type BiliTypeNode = { id: number; name: string; children?: BiliTypeNode[] };
 type BilibiliArchiveTypesResponse = { typelist: BiliTypeNode[] };
 type BilibiliTypeRecommendResponse = { ok: boolean; typeid?: number | null; path?: string | null; reason?: string; used_text?: string };
+
+const BILIBILI_DESC_MAX_CHARS = 2000;
 
 export default function TaskDetailPage() {
   const { taskId } = useParams();
@@ -96,6 +98,7 @@ export default function TaskDetailPage() {
   const [didAutoFillPublishMeta, setDidAutoFillPublishMeta] = useState(false);
   const [didAutoPickCover, setDidAutoPickCover] = useState(false);
   const [didLoadPublishMetaFile, setDidLoadPublishMetaFile] = useState(false);
+  const lastQueueKickAtRef = useRef<number>(0);
 
   const refresh = useCallback(
     async (opts?: { silent?: boolean }) => {
@@ -250,15 +253,17 @@ export default function TaskDetailPage() {
 
   function buildBilibiliDesc(youtubeDesc: string, sourceUrl: string): string {
     const src = (sourceUrl ?? "").trim();
-    const tail = src ? `\n\n原视频：${src}` : "";
-    const maxLen = 2000;
-    if (!tail) return clampText((youtubeDesc ?? "").trim(), maxLen);
-    if (tail.length >= maxLen) return clampText(tail, maxLen);
-
+    const sourceLine = src ? `原视频：${src}` : "";
+    const maxLen = BILIBILI_DESC_MAX_CHARS;
     let base = (youtubeDesc ?? "").trim();
-    const avail = maxLen - tail.length;
+    if (sourceLine) base = base.replace(sourceLine, "").trim();
+    if (!sourceLine) return clampText(base, maxLen);
+    if (sourceLine.length >= maxLen) return clampText(sourceLine, maxLen);
+
+    const sep = base ? "\n\n" : "";
+    const avail = maxLen - sourceLine.length - sep.length;
     if (base.length > avail) base = clampText(base, avail);
-    const out = (base ? base + tail : `原视频：${src}`).trim();
+    const out = base ? `${sourceLine}${sep}${base}` : sourceLine;
     return out.length > maxLen ? clampText(out, maxLen) : out;
   }
 
@@ -507,42 +512,49 @@ export default function TaskDetailPage() {
         await refresh();
       }
 
-      const formats = [
-        subtitleFormats.srt ? "srt" : null,
-        subtitleFormats.ass ? "ass" : null,
-      ].filter(Boolean);
-      const crfRaw = videoCrfText.trim();
-      let video_crf: number | null = null;
-      if (crfRaw) {
-        const n = Number(crfRaw);
-        if (!Number.isFinite(n) || !Number.isInteger(n)) throw new Error("video_crf 必须是整数");
-        video_crf = n;
-      }
-      const presetRaw = videoPresetText.trim();
+      let resp: SubtitleActionResponse;
+      if (opts.resume) {
+        resp = await fetchJson<SubtitleActionResponse>(`${ORCHESTRATOR_URL}/tasks/${taskId}/actions/subtitle_resume`, {
+          method: "POST",
+        });
+      } else {
+        const formats = [
+          subtitleFormats.srt ? "srt" : null,
+          subtitleFormats.ass ? "ass" : null,
+        ].filter(Boolean);
+        const crfRaw = videoCrfText.trim();
+        let video_crf: number | null = null;
+        if (crfRaw) {
+          const n = Number(crfRaw);
+          if (!Number.isFinite(n) || !Number.isInteger(n)) throw new Error("video_crf 必须是整数");
+          video_crf = n;
+        }
+        const presetRaw = videoPresetText.trim();
 
-      const resp = await fetchJson<SubtitleActionResponse>(`${ORCHESTRATOR_URL}/tasks/${taskId}/actions/subtitle`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          formats,
-          resume: opts.resume,
-          burn_in: burnIn,
-          soft_sub: softSub,
-          ass_style: "clean_white",
-          video_codec: videoCodec,
-          video_preset: presetRaw ? presetRaw : null,
-          video_crf,
-          asr_engine: asrEngine,
-          asr_language: asrLanguage,
-          asr_model: asrModel.trim() ? asrModel.trim() : null,
-          translate_enabled: translateEnabled,
-          translate_provider: translateProvider,
-          target_lang: targetLang,
-          translate_style: translateStyle,
-          translate_enable_summary: translateProvider === "openai" ? translateEnableSummary : null,
-          bilingual,
-        }),
-      });
+        resp = await fetchJson<SubtitleActionResponse>(`${ORCHESTRATOR_URL}/tasks/${taskId}/actions/subtitle`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            formats,
+            resume: false,
+            burn_in: burnIn,
+            soft_sub: softSub,
+            ass_style: "clean_white",
+            video_codec: videoCodec,
+            video_preset: presetRaw ? presetRaw : null,
+            video_crf,
+            asr_engine: asrEngine,
+            asr_language: asrLanguage,
+            asr_model: asrModel.trim() ? asrModel.trim() : null,
+            translate_enabled: translateEnabled,
+            translate_provider: translateProvider,
+            target_lang: targetLang,
+            translate_style: translateStyle,
+            translate_enable_summary: translateProvider === "openai" ? translateEnableSummary : null,
+            bilingual,
+          }),
+        });
+      }
       await refresh();
       alert(`${opts.resume ? "已继续字幕任务" : "已提交字幕任务"}：${resp.job_id}`);
     } catch (e: unknown) {
@@ -567,6 +579,8 @@ export default function TaskDetailPage() {
     const hasPublishInFlight = (publishJobs ?? []).some((j) => j.state === "submitting" || j.state === "submitted");
     return hasSubtitleInFlight || hasPublishInFlight;
   }, [subtitleJobs, publishJobs]);
+
+  const hasQueuedSubtitleJob = useMemo(() => (subtitleJobs ?? []).some((j) => j.status === "queued"), [subtitleJobs]);
 
   const loadLogs = useCallback(
     async (opts?: { silent?: boolean }) => {
@@ -655,6 +669,31 @@ export default function TaskDetailPage() {
       if (timer) window.clearTimeout(timer);
     };
   }, [taskId, shouldPoll, refresh]);
+
+  useEffect(() => {
+    if (!taskId) return;
+    if (!hasQueuedSubtitleJob) return;
+
+    let cancelled = false;
+    let timer: number | undefined;
+
+    const kick = async () => {
+      if (cancelled) return;
+      const now = Date.now();
+      if (now - (lastQueueKickAtRef.current || 0) > 10_000) {
+        lastQueueKickAtRef.current = now;
+        fetchJson(`${SUBTITLE_SERVICE_URL}/subtitle/task_queue/tick`, { method: "POST" }).catch(() => {});
+      }
+      if (cancelled) return;
+      timer = window.setTimeout(kick, 2000);
+    };
+
+    kick();
+    return () => {
+      cancelled = true;
+      if (timer) window.clearTimeout(timer);
+    };
+  }, [taskId, hasQueuedSubtitleJob]);
 
   useEffect(() => {
     if (!taskId) return;
@@ -954,7 +993,7 @@ export default function TaskDetailPage() {
               disabled={busy}
               onClick={() => submitSubtitleJob({ resume: true })}
               className="rounded border px-3 py-2 text-sm hover:bg-slate-50 disabled:opacity-50"
-              title="尽量复用已有字幕/转写结果，避免重复转写与翻译。"
+              title="沿用上一次失败任务的完整配置继续执行，保留自动投稿等后续流程。"
             >
               从失败处继续
             </button>
@@ -1359,9 +1398,11 @@ export default function TaskDetailPage() {
                 }
                 if (isYouTubeTask) {
                   const srcUrl = String(task?.source_url ?? "").trim();
-                  if (srcUrl && typeof meta?.desc === "string" && !meta.desc.includes(srcUrl)) meta.desc = buildBilibiliDesc(meta.desc, srcUrl);
+                  if (srcUrl && typeof meta?.desc === "string") meta.desc = buildBilibiliDesc(meta.desc, srcUrl);
                 }
-                if (typeof meta?.desc === "string" && meta.desc.length > 2000) meta.desc = clampText(meta.desc, 2000);
+                if (typeof meta?.desc === "string" && meta.desc.length > BILIBILI_DESC_MAX_CHARS) {
+                  meta.desc = clampText(meta.desc, BILIBILI_DESC_MAX_CHARS);
+                }
                 if (typeof meta?.title === "string" && meta.title.length > 80) meta.title = clampText(meta.title, 80);
                 await savePublishMetaFile(meta);
                 const resp = await fetchJson<PublishResponse>(`${ORCHESTRATOR_URL}/tasks/${taskId}/actions/publish`, {

@@ -6,6 +6,8 @@ from typing import Any, Literal, Optional
 
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from videoroll.apps.bilibili_publisher.constants import BILIBILI_DESC_MAX_CHARS
+
 
 def _clamp_text(text: str, max_len: int) -> str:
     s = str(text or "").strip()
@@ -34,7 +36,7 @@ class BilibiliPublishMeta(BaseModel):
     model_config = ConfigDict(extra="allow")
 
     title: str = Field(..., description="视频标题（建议 ≤ 80 字）")
-    desc: str = Field("", description="视频简介（建议 ≤ 2000 字，需包含来源/授权说明）")
+    desc: str = Field("", description=f"视频简介（≤ {BILIBILI_DESC_MAX_CHARS} 字，需包含来源/授权说明）")
 
     # Common aliases from various clients/libraries.
     typeid: int = Field(..., validation_alias=AliasChoices("typeid", "tid"), description="分区 ID（tid/typeid）")
@@ -113,8 +115,8 @@ class BilibiliPublishMeta(BaseModel):
             raise ValueError("meta.title is required")
         if len(self.title) > 80:
             raise ValueError("meta.title too long (max 80)")
-        if len(self.desc) > 2000:
-            self.desc = _clamp_text(self.desc, 2000)
+        if len(self.desc) > BILIBILI_DESC_MAX_CHARS:
+            self.desc = _clamp_text(self.desc, BILIBILI_DESC_MAX_CHARS)
         if not isinstance(self.typeid, int) or self.typeid <= 0:
             raise ValueError("meta.typeid/tid must be a positive integer")
 
