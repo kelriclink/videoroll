@@ -12,6 +12,7 @@ import YouTubeSourcesPage from "./pages/YouTubeSourcesPage";
 import SettingsASRPage from "./pages/SettingsASRPage";
 import SettingsYouTubePage from "./pages/SettingsYouTubePage";
 import SettingsStoragePage from "./pages/SettingsStoragePage";
+import SettingsApiPage from "./pages/SettingsApiPage";
 import SettingsTranslatePage from "./pages/SettingsTranslatePage";
 import SettingsBilibiliPage from "./pages/SettingsBilibiliPage";
 import SettingsAutoPage from "./pages/SettingsAutoPage";
@@ -97,6 +98,7 @@ export default function App() {
               <NavItem to="/settings/asr" label="Settings · ASR" />
               <NavItem to="/settings/youtube" label="Settings · YouTube" />
               <NavItem to="/settings/storage" label="Settings · Storage" />
+              <NavItem to="/settings/api" label="Settings · API" />
               <NavItem to="/settings/auto" label="Settings · Auto" />
               <NavItem to="/settings/translate" label="Settings · Translate" />
               <NavItem to="/settings/bilibili" label="Settings · Bilibili" />
@@ -118,6 +120,7 @@ export default function App() {
               <Route path="/settings/asr" element={<SettingsASRPage />} />
               <Route path="/settings/youtube" element={<SettingsYouTubePage />} />
               <Route path="/settings/storage" element={<SettingsStoragePage />} />
+              <Route path="/settings/api" element={<SettingsApiPage />} />
               <Route path="/settings/auto" element={<SettingsAutoPage />} />
               <Route path="/settings/translate" element={<SettingsTranslatePage />} />
               <Route path="/settings/bilibili" element={<SettingsBilibiliPage />} />

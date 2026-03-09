@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import shutil
 import threading
@@ -70,6 +71,8 @@ settings = get_subtitle_settings()
 _ORCH_INTERNAL_TOKEN = internal_api_token(settings.s3_secret_access_key)
 _ORCH_INTERNAL_HEADERS = {INTERNAL_TOKEN_HEADER: _ORCH_INTERNAL_TOKEN} if _ORCH_INTERNAL_TOKEN else {}
 logger = logging.getLogger(__name__)
+_DB_READY_LOCK = threading.Lock()
+_DB_READY_PID: int | None = None
 celery_app = Celery("subtitle_service", broker=settings.redis_url, backend=settings.redis_url)
 celery_app.conf.update(
     task_serializer="json",
@@ -144,9 +147,17 @@ def _db() -> Session:
 
 
 def _ensure_db() -> None:
-    engine = get_engine(settings.database_url)
-    Base.metadata.create_all(engine)
-    auto_migrate(settings.database_url)
+    global _DB_READY_PID
+    pid = os.getpid()
+    if _DB_READY_PID == pid:
+        return
+    with _DB_READY_LOCK:
+        if _DB_READY_PID == pid:
+            return
+        engine = get_engine(settings.database_url)
+        Base.metadata.create_all(engine)
+        auto_migrate(settings.database_url)
+        _DB_READY_PID = pid
 
 
 def _now() -> datetime:
@@ -171,6 +182,18 @@ def _task_queue_is_task_locked(task: Task, now: datetime) -> bool:
 def _task_queue_unlock(task: Task) -> None:
     task.lock_owner = None
     task.lock_until = None
+
+
+def _task_queue_join_message(message: str | None, detail: str, *, limit: int = 2000) -> str:
+    head = str(message or "").strip()
+    tail = str(detail or "").strip()
+    if head and tail:
+        out = f"{head}\n{tail}"
+    else:
+        out = head or tail
+    if len(out) > limit:
+        out = out[: limit - 1] + "…"
+    return out
 
 
 def _task_queue_lock_settings_row(db: Session) -> None:
@@ -1177,6 +1200,53 @@ def task_queue_tick() -> dict[str, Any]:
             )
         except Exception:
             unlocked_expired = 0
+
+        unlocked = or_(
+            Task.lock_owner != TASK_QUEUE_LOCK_OWNER,
+            Task.lock_until.is_(None),
+            Task.lock_until <= now,
+        )
+
+        # Recover jobs that were actively running but lost their task slot/heartbeat.
+        # This is the "ghost running" case: task disappears from the queue while the job row
+        # still says running forever.
+        orphaned_subtitle = (
+            db.query(SubtitleJob)
+            .join(Task, Task.id == SubtitleJob.task_id)
+            .filter(SubtitleJob.status == SubtitleJobStatus.running, unlocked)
+            .order_by(SubtitleJob.updated_at.asc(), SubtitleJob.created_at.asc())
+            .with_for_update(skip_locked=True)
+            .all()
+        )
+        for j in orphaned_subtitle:
+            detail = "检测到任务队列锁已丢失：subtitle job 已自动按 resume 方式重新排队。"
+            req = dict(j.request_json) if isinstance(j.request_json, dict) else {}
+            req["resume"] = True
+            j.request_json = req
+            j.error_message = _task_queue_join_message(j.error_message, detail)
+            j.status = SubtitleJobStatus.queued
+            j.progress = 0
+            db.add(j)
+            recovered_subtitle += 1
+
+        orphaned_render = (
+            db.query(RenderJob)
+            .join(Task, Task.id == RenderJob.task_id)
+            .filter(RenderJob.status == RenderJobStatus.running, unlocked)
+            .order_by(RenderJob.updated_at.asc(), RenderJob.created_at.asc())
+            .with_for_update(skip_locked=True)
+            .all()
+        )
+        for j in orphaned_render:
+            detail = "检测到任务队列锁已丢失：render job 已自动重新排队。"
+            j.error_message = _task_queue_join_message(j.error_message, detail)
+            j.retry_count = int(j.retry_count or 0) + 1
+            j.status = RenderJobStatus.queued
+            j.progress = 0
+            j.started_at = None
+            j.finished_at = None
+            db.add(j)
+            recovered_render += 1
 
         # Recover render jobs that were marked as running by the scheduler but never claimed by a worker.
         cutoff = now - timedelta(seconds=60)

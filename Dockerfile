@@ -12,6 +12,7 @@ RUN apt-get update \
 COPY pyproject.toml README.md ./
 
 ARG INSTALL_ASR=0
+ARG YTDLP_VERSION=latest
 
 # Install dependencies in a cache-friendly layer so editing source code doesn't
 # force re-downloading everything on every docker build.
@@ -24,6 +25,14 @@ COPY docs ./docs
 COPY docker ./docker
 
 RUN pip install --no-cache-dir -e . --no-deps
+
+RUN if [ -n "$YTDLP_VERSION" ]; then \
+      if [ "$YTDLP_VERSION" = "latest" ]; then \
+        pip install --no-cache-dir -U "yt-dlp[default]"; \
+      else \
+        pip install --no-cache-dir -U "yt-dlp[default]==${YTDLP_VERSION}"; \
+      fi; \
+    fi
 
 RUN chmod +x /app/docker/entrypoint.sh
 

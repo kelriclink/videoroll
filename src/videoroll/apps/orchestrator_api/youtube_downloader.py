@@ -6,7 +6,7 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit, urlunsplit
 
 import httpx
 import yt_dlp
@@ -23,6 +23,12 @@ class YouTubeMeta:
     uploader: Optional[str] = None
     upload_date: Optional[str] = None
     duration: Optional[int] = None
+
+
+class YtDlpRuntimeError(RuntimeError):
+    def __init__(self, message: str, *, diagnostics: list[str] | None = None) -> None:
+        super().__init__(message)
+        self.diagnostics = diagnostics or []
 
 
 def _run(cmd: list[str]) -> None:
@@ -66,10 +72,85 @@ def _extractor_args(settings: OrchestratorSettings) -> dict[str, Any] | None:
     return parsed
 
 
-def build_ydl_opts(settings: OrchestratorSettings, *, outtmpl: str | None = None, for_download: bool) -> dict[str, Any]:
+def _redact_url(value: str) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    try:
+        parts = urlsplit(raw)
+    except Exception:
+        return raw
+    hostname = parts.hostname or ""
+    if not hostname:
+        return raw
+    auth = ""
+    if parts.username:
+        auth = parts.username
+        if parts.password is not None:
+            auth += ":***"
+        auth += "@"
+    netloc = auth + hostname
+    if parts.port is not None:
+        netloc += f":{parts.port}"
+    return urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
+
+
+def _sanitize_diagnostic_line(line: str, *, proxy: str | None) -> str:
+    text = str(line or "").rstrip()
+    if proxy:
+        text = text.replace(proxy, _redact_url(proxy))
+    return text
+
+
+def _yt_dlp_diagnostics_header(
+    *,
+    url: str,
+    settings: OrchestratorSettings,
+    outtmpl: str | None,
+) -> list[str]:
+    extractor_args = _extractor_args(settings)
+    return [
+        "videoroll yt-dlp diagnostics",
+        f"url={url}",
+        f"proxy={_redact_url(str(settings.youtube_proxy or '').strip()) or '(none)'}",
+        f"cookiefile={(str(settings.youtube_cookie_file or '').strip() or '(none)')}",
+        f"ffmpeg_location={(str(settings.ffmpeg_path or '').strip() or '(default PATH)')}",
+        f"outtmpl={outtmpl or '(none)'}",
+        f"extractor_args={json.dumps(extractor_args, ensure_ascii=False, sort_keys=True) if extractor_args else '(none)'}",
+        "---- yt-dlp verbose ----",
+    ]
+
+
+class _DiagnosticsLogger:
+    def __init__(self, diagnostics: list[str], *, proxy: str | None) -> None:
+        self._diagnostics = diagnostics
+        self._proxy = str(proxy or "").strip() or None
+
+    def debug(self, msg: str) -> None:
+        self._diagnostics.append(_sanitize_diagnostic_line(f"[debug] {msg}", proxy=self._proxy))
+
+    def info(self, msg: str) -> None:
+        self._diagnostics.append(_sanitize_diagnostic_line(str(msg), proxy=self._proxy))
+
+    def warning(self, msg: str) -> None:
+        self._diagnostics.append(_sanitize_diagnostic_line(f"WARNING: {msg}", proxy=self._proxy))
+
+    def error(self, msg: str) -> None:
+        self._diagnostics.append(_sanitize_diagnostic_line(f"ERROR: {msg}", proxy=self._proxy))
+
+
+def build_ydl_opts(
+    settings: OrchestratorSettings,
+    *,
+    outtmpl: str | None = None,
+    for_download: bool,
+    logger: Any | None = None,
+    verbose: bool = False,
+) -> dict[str, Any]:
     opts: dict[str, Any] = {
         "quiet": True,
         "no_warnings": True,
+        "ignoreconfig": True,
         "noplaylist": True,
         "retries": 3,
         "fragment_retries": 3,
@@ -103,6 +184,10 @@ def build_ydl_opts(settings: OrchestratorSettings, *, outtmpl: str | None = None
 
     if outtmpl:
         opts["outtmpl"] = outtmpl
+    if logger is not None:
+        opts["logger"] = logger
+    if verbose:
+        opts["verbose"] = True
 
     return opts
 
@@ -284,10 +369,20 @@ def _resolve_downloaded_file(info: dict[str, Any], *, work_dir: Path) -> Path:
     raise RuntimeError("yt-dlp download succeeded but no output file was found")
 
 
-def _download_once(url: str, settings: OrchestratorSettings, *, work_dir: Path) -> tuple[Path, dict[str, Any], YouTubeMeta]:
+def _download_once(
+    url: str,
+    settings: OrchestratorSettings,
+    *,
+    work_dir: Path,
+    diagnostics: list[str] | None = None,
+) -> tuple[Path, dict[str, Any], YouTubeMeta]:
     work_dir.mkdir(parents=True, exist_ok=True)
     outtmpl = str(work_dir / "%(id)s.%(ext)s")
-    with yt_dlp.YoutubeDL(build_ydl_opts(settings, outtmpl=outtmpl, for_download=True)) as ydl:
+    ydl_logger = None
+    if diagnostics is not None:
+        diagnostics.extend(_yt_dlp_diagnostics_header(url=url, settings=settings, outtmpl=outtmpl))
+        ydl_logger = _DiagnosticsLogger(diagnostics, proxy=settings.youtube_proxy)
+    with yt_dlp.YoutubeDL(build_ydl_opts(settings, outtmpl=outtmpl, for_download=True, logger=ydl_logger, verbose=diagnostics is not None)) as ydl:
         info_raw = ydl.extract_info(url, download=True)
         info = _pick_video_info(info_raw)
         if not info:
@@ -306,9 +401,10 @@ def download_youtube_video(url: str, settings: OrchestratorSettings, *, work_dir
       - sanitized info dict
       - meta summary
     """
+    diagnostics: list[str] = []
     try:
-        return _download_once(url, settings, work_dir=work_dir)
+        return _download_once(url, settings, work_dir=work_dir, diagnostics=diagnostics)
     except DownloadError as e:
-        raise RuntimeError(str(e)) from e
+        raise YtDlpRuntimeError(str(e), diagnostics=diagnostics) from e
     except Exception as e:
-        raise RuntimeError(str(e)) from e
+        raise YtDlpRuntimeError(str(e), diagnostics=diagnostics) from e

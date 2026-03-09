@@ -427,8 +427,13 @@ export default function TaskDetailPage() {
   const finalAssets = useMemo(() => (assets ?? []).filter((x) => x.kind === "video_final"), [assets]);
   const coverAssets = useMemo(() => (assets ?? []).filter((x) => x.kind === "cover_image"), [assets]);
   const logAssets = useMemo(() => (assets ?? []).filter((x) => x.kind === "log"), [assets]);
+  const youtubeDownloadLogAssets = useMemo(() => logAssets.filter((x) => x.storage_key.includes("/youtube_download_")), [logAssets]);
   const subtitleLogAssets = useMemo(() => logAssets.filter((x) => x.storage_key.includes("/subtitle_")), [logAssets]);
   const renderLogAssets = useMemo(() => logAssets.filter((x) => x.storage_key.includes("/render_")), [logAssets]);
+  const latestYouTubeDownloadLog = useMemo(
+    () => (youtubeDownloadLogAssets.length ? youtubeDownloadLogAssets[youtubeDownloadLogAssets.length - 1] : null),
+    [youtubeDownloadLogAssets],
+  );
   const latestSubtitleLog = useMemo(
     () => (subtitleLogAssets.length ? subtitleLogAssets[subtitleLogAssets.length - 1] : null),
     [subtitleLogAssets],
@@ -541,6 +546,10 @@ export default function TaskDetailPage() {
       await refresh();
       alert(`${opts.resume ? "已继续字幕任务" : "已提交字幕任务"}：${resp.job_id}`);
     } catch (e: unknown) {
+      try {
+        await refresh({ silent: true });
+        await loadLogs({ silent: true });
+      } catch {}
       setError(e instanceof Error ? e.message : String(e));
     } finally {
       setBusy(false);
@@ -578,6 +587,9 @@ export default function TaskDetailPage() {
         const maxBytes = 200_000;
         if (logSelection === "combined") {
           const parts: Array<{ title: string; asset: Asset }> = [];
+          if (latestYouTubeDownloadLog) {
+            parts.push({ title: `YouTube Download · ${latestYouTubeDownloadLog.storage_key}`, asset: latestYouTubeDownloadLog });
+          }
           if (latestSubtitleLog) parts.push({ title: `Subtitle · ${latestSubtitleLog.storage_key}`, asset: latestSubtitleLog });
           if (latestRenderLog) parts.push({ title: `Render · ${latestRenderLog.storage_key}`, asset: latestRenderLog });
           if (!parts.length) {
@@ -605,7 +617,7 @@ export default function TaskDetailPage() {
         if (!silent) setLogBusy(false);
       }
     },
-    [taskId, logSelection, latestSubtitleLog, latestRenderLog, selectedLogAsset],
+    [taskId, logSelection, latestYouTubeDownloadLog, latestSubtitleLog, latestRenderLog, selectedLogAsset],
   );
 
   useEffect(() => {
@@ -679,7 +691,7 @@ export default function TaskDetailPage() {
           </button>
         </div>
 
-        {error ? <div className="mt-3 text-sm text-rose-700">{error}</div> : null}
+        {error ? <div className="mt-3 whitespace-pre-wrap break-words text-sm text-rose-700">{error}</div> : null}
         {!task ? <div className="mt-3 text-sm text-slate-500">加载中…</div> : null}
         {task ? (
           <div className="mt-3 grid gap-3 md:grid-cols-2">
@@ -748,6 +760,10 @@ export default function TaskDetailPage() {
                   }
                   await refresh();
                 } catch (e: unknown) {
+                  try {
+                    await refresh({ silent: true });
+                    await loadLogs({ silent: true });
+                  } catch {}
                   setError(e instanceof Error ? e.message : String(e));
                 } finally {
                   setBusy(false);
@@ -996,7 +1012,7 @@ export default function TaskDetailPage() {
         </div>
         <div className="mt-2 flex flex-wrap items-center gap-2">
           <select className="rounded border px-3 py-2 text-sm" value={logSelection} onChange={(e) => setLogSelection(e.target.value)}>
-            <option value="combined">合并（最新字幕 + 压制）</option>
+            <option value="combined">合并（最新 YouTube 下载 + 字幕 + 压制）</option>
             {[...logAssets].reverse().map((a) => (
               <option key={a.id} value={a.id}>
                 {a.storage_key}

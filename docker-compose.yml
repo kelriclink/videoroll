@@ -35,6 +35,7 @@ services:
       context: .
       args:
         INSTALL_ASR: ${INSTALL_ASR:-1}
+        YTDLP_VERSION: ${YTDLP_VERSION:-latest}
     image: videoroll:prod
     environment:
       DATABASE_URL: ${DATABASE_URL}

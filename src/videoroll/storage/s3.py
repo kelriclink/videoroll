@@ -42,11 +42,31 @@ class S3Store:
     def bucket(self) -> str:
         return self._bucket
 
+    @staticmethod
+    def _is_missing_bucket_error(exc: ClientError) -> bool:
+        err = exc.response.get("Error") or {}
+        code = str(err.get("Code") or "").strip()
+        status = int((exc.response.get("ResponseMetadata") or {}).get("HTTPStatusCode") or 0)
+        return code in {"404", "NoSuchBucket", "NotFound"} or status == 404
+
+    @staticmethod
+    def _is_bucket_already_exists_error(exc: ClientError) -> bool:
+        err = exc.response.get("Error") or {}
+        code = str(err.get("Code") or "").strip()
+        return code in {"BucketAlreadyOwnedByYou", "BucketAlreadyExists"}
+
     def ensure_bucket(self) -> None:
         try:
             self._client.head_bucket(Bucket=self._bucket)
-        except ClientError:
-            self._client.create_bucket(Bucket=self._bucket)
+        except ClientError as e:
+            if not self._is_missing_bucket_error(e):
+                raise
+            try:
+                self._client.create_bucket(Bucket=self._bucket)
+            except ClientError as create_error:
+                if self._is_bucket_already_exists_error(create_error):
+                    return
+                raise
 
     def upload_file(self, path: Path, key: str, content_type: Optional[str] = None) -> PutResult:
         if content_type is None:

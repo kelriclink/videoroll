@@ -1,0 +1,4 @@
+interface:
+  display_name: "OpenClaw VideoRoll"
+  short_description: "Collect YouTube URLs and push them to VideoRoll"
+  default_prompt: "Use $openclaw-videoroll to collect YouTube watch URLs on an external machine and submit them to VideoRoll through the remote API."

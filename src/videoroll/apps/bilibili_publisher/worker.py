@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import random
 import tempfile
+import threading
 import traceback
 import uuid
 from datetime import datetime, timezone
@@ -31,6 +33,8 @@ from videoroll.apps.subtitle_service.translate_settings_store import get_transla
 
 settings = get_bilibili_publisher_settings()
 logger = logging.getLogger(__name__)
+_DB_READY_LOCK = threading.Lock()
+_DB_READY_PID: int | None = None
 celery_app = Celery("bilibili_publisher", broker=settings.redis_url, backend=settings.redis_url)
 celery_app.conf.update(
     task_serializer="json",
@@ -47,9 +51,17 @@ def _db() -> Session:
 
 
 def _ensure_db() -> None:
-    engine = get_engine(settings.database_url)
-    Base.metadata.create_all(engine)
-    auto_migrate(settings.database_url)
+    global _DB_READY_PID
+    pid = os.getpid()
+    if _DB_READY_PID == pid:
+        return
+    with _DB_READY_LOCK:
+        if _DB_READY_PID == pid:
+            return
+        engine = get_engine(settings.database_url)
+        Base.metadata.create_all(engine)
+        auto_migrate(settings.database_url)
+        _DB_READY_PID = pid
 
 
 def _utcnow() -> datetime:

@@ -632,8 +632,29 @@ def _read_task_queue(db: Session, *, limit: int) -> TaskQueueRead:
         )
 
     unlocked = (Task.lock_owner != TASK_QUEUE_LOCK_OWNER) | (Task.lock_until.is_(None)) | (Task.lock_until <= now)
-    # queued_count: distinct tasks with queued subtitle/render jobs (best-effort, capped).
-    queued_task_ids: set[uuid.UUID] = set()
+    orphaned_render_by_task: dict[uuid.UUID, RenderJob] = {}
+    orphaned_subtitle_by_task: dict[uuid.UUID, SubtitleJob] = {}
+    for rj in (
+        db.query(RenderJob)
+        .join(Task, Task.id == RenderJob.task_id)
+        .filter(RenderJob.status == RenderJobStatus.running, unlocked)
+        .order_by(RenderJob.updated_at.asc(), RenderJob.created_at.asc())
+        .limit(5000)
+        .all()
+    ):
+        orphaned_render_by_task.setdefault(rj.task_id, rj)
+    for sj in (
+        db.query(SubtitleJob)
+        .join(Task, Task.id == SubtitleJob.task_id)
+        .filter(SubtitleJob.status == SubtitleJobStatus.running, unlocked)
+        .order_by(SubtitleJob.updated_at.asc(), SubtitleJob.created_at.asc())
+        .limit(5000)
+        .all()
+    ):
+        orphaned_subtitle_by_task.setdefault(sj.task_id, sj)
+
+    # queued_count: distinct tasks with queued jobs, plus orphaned running jobs that lost their task lock.
+    queued_task_ids: set[uuid.UUID] = set(orphaned_render_by_task) | set(orphaned_subtitle_by_task)
     for tid, in (
         db.query(SubtitleJob.task_id)
         .join(Task, Task.id == SubtitleJob.task_id)
@@ -659,32 +680,73 @@ def _read_task_queue(db: Session, *, limit: int) -> TaskQueueRead:
     queued_items: list[TaskQueueItemRead] = []
     seen: set[uuid.UUID] = set()
 
-    fetch_n = min(5000, max(50, remaining * 20))
-    for sj in (
-        db.query(SubtitleJob)
-        .join(Task, Task.id == SubtitleJob.task_id)
-        .filter(SubtitleJob.status == SubtitleJobStatus.queued, unlocked)
-        .order_by(SubtitleJob.created_at.asc())
-        .limit(fetch_n)
-        .all()
-    ):
-        if sj.task_id in seen:
+    for rj in orphaned_render_by_task.values():
+        if rj.task_id in seen:
             continue
-        seen.add(sj.task_id)
+        seen.add(rj.task_id)
         queued_items.append(
             TaskQueueItemRead(
-                task_id=sj.task_id,
+                task_id=rj.task_id,
                 state="queued",
-                stage="subtitle",
-                subtitle_job_id=sj.id,
-                progress=int(sj.progress or 0),
-                error_message=sj.error_message,
-                created_at=sj.created_at,
-                updated_at=sj.updated_at,
+                stage="recover_render",
+                render_job_id=rj.id,
+                subtitle_job_id=rj.subtitle_job_id,
+                progress=int(rj.progress or 0),
+                error_message=rj.error_message,
+                created_at=rj.created_at,
+                updated_at=rj.updated_at,
             )
         )
         if len(queued_items) >= remaining:
             break
+
+    if len(queued_items) < remaining:
+        for sj in orphaned_subtitle_by_task.values():
+            if sj.task_id in seen:
+                continue
+            seen.add(sj.task_id)
+            queued_items.append(
+                TaskQueueItemRead(
+                    task_id=sj.task_id,
+                    state="queued",
+                    stage="recover_subtitle",
+                    subtitle_job_id=sj.id,
+                    progress=int(sj.progress or 0),
+                    error_message=sj.error_message,
+                    created_at=sj.created_at,
+                    updated_at=sj.updated_at,
+                )
+            )
+            if len(queued_items) >= remaining:
+                break
+
+    fetch_n = min(5000, max(50, remaining * 20))
+    if len(queued_items) < remaining:
+        for sj in (
+            db.query(SubtitleJob)
+            .join(Task, Task.id == SubtitleJob.task_id)
+            .filter(SubtitleJob.status == SubtitleJobStatus.queued, unlocked)
+            .order_by(SubtitleJob.created_at.asc())
+            .limit(fetch_n)
+            .all()
+        ):
+            if sj.task_id in seen:
+                continue
+            seen.add(sj.task_id)
+            queued_items.append(
+                TaskQueueItemRead(
+                    task_id=sj.task_id,
+                    state="queued",
+                    stage="subtitle",
+                    subtitle_job_id=sj.id,
+                    progress=int(sj.progress or 0),
+                    error_message=sj.error_message,
+                    created_at=sj.created_at,
+                    updated_at=sj.updated_at,
+                )
+            )
+            if len(queued_items) >= remaining:
+                break
 
     if len(queued_items) < remaining:
         for rj in (

@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import logging
 import os
 import tempfile
 import threading
@@ -18,6 +19,7 @@ from botocore.exceptions import ClientError
 from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
+from starlette.concurrency import run_in_threadpool
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.types import ASGIApp
 from sqlalchemy import func
@@ -26,7 +28,7 @@ from sqlalchemy.orm import Session
 from videoroll.config import OrchestratorSettings, get_orchestrator_settings
 from videoroll.db.base import Base
 from videoroll.db.auto_migrate import auto_migrate
-from videoroll.db.models import AppSetting, Asset, AssetKind, PublishJob, Subtitle, SubtitleJob, SubtitleJobStatus, Task, TaskStatus
+from videoroll.db.models import AppSetting, Asset, AssetKind, PublishJob, SourceLicense, Subtitle, SubtitleJob, SubtitleJobStatus, Task, TaskStatus
 from videoroll.db.session import db_session, get_engine, get_sessionmaker
 from videoroll.storage.s3 import S3Store
 from videoroll.utils.internal_api_token import internal_api_token
@@ -41,6 +43,8 @@ from videoroll.apps.orchestrator_api.schemas import (
     ConvertedVideoItem,
     PublishActionRequest,
     PublishJobSummary,
+    RemoteAPISettingsRead,
+    RemoteAPISettingsUpdate,
     RemoteJobResponse,
     RemotePublishResponse,
     StorageRetentionSettingsRead,
@@ -70,6 +74,7 @@ from videoroll.apps.orchestrator_api.admin_auth_store import (
     verify_password_hash,
 )
 from videoroll.apps.orchestrator_api.youtube_downloader import (
+    YtDlpRuntimeError,
     download_youtube_video,
     download_thumbnail_jpg,
     extract_youtube_metadata,
@@ -78,6 +83,14 @@ from videoroll.apps.orchestrator_api.youtube_downloader import (
 from videoroll.apps.orchestrator_api.storage_retention_store import (
     get_storage_retention_settings,
     update_storage_retention_settings,
+)
+from videoroll.apps.orchestrator_api.remote_api_settings_store import (
+    REMOTE_API_TOKEN_QUERY_PARAM,
+    REMOTE_AUTO_YOUTUBE_PATH,
+    get_remote_api_settings,
+    remote_api_token_is_configured,
+    update_remote_api_settings,
+    verify_remote_api_token,
 )
 from videoroll.apps.subtitle_service.bilibili_tags_store import get_task_bilibili_tags
 from videoroll.apps.subtitle_service.task_title_store import get_task_display_title_with_s3
@@ -89,6 +102,8 @@ from videoroll.apps.youtube_settings_store import (
     update_youtube_settings,
 )
 
+logger = logging.getLogger(__name__)
+
 
 def get_settings() -> OrchestratorSettings:
     return get_orchestrator_settings()
@@ -99,9 +114,7 @@ def get_db(settings: OrchestratorSettings = Depends(get_settings)) -> Generator[
 
 
 def get_s3(settings: OrchestratorSettings = Depends(get_settings)) -> S3Store:
-    store = S3Store(settings)
-    store.ensure_bucket()
-    return store
+    return S3Store(settings)
 
 
 def _sha256_bytes(data: bytes) -> str:
@@ -300,6 +313,228 @@ def _write_s3_json(s3: S3Store, key: str, obj: dict[str, Any]) -> bytes:
     return payload
 
 
+def _write_s3_text(s3: S3Store, key: str, text: str) -> bytes:
+    payload = str(text).encode("utf-8")
+    s3.put_bytes(payload, key, content_type="text/plain; charset=utf-8")
+    return payload
+
+
+def _store_task_log_asset(
+    db: Session,
+    s3: S3Store,
+    *,
+    task_id: uuid.UUID,
+    log_key: str,
+    text: str,
+) -> Asset:
+    payload = _write_s3_text(s3, log_key, text)
+    asset = Asset(
+        task_id=task_id,
+        kind=AssetKind.log,
+        storage_key=log_key,
+        sha256=_sha256_bytes(payload),
+        size_bytes=len(payload),
+    )
+    db.add(asset)
+    db.commit()
+    db.refresh(asset)
+    return asset
+
+
+def _build_youtube_download_failure_log(
+    *,
+    task_id: uuid.UUID,
+    url: str,
+    error_message: str,
+    hint: str | None,
+    diagnostics: list[str] | None,
+) -> str:
+    body = "\n".join([str(line or "") for line in (diagnostics or [])]).strip()
+    sections = [
+        body or "videoroll yt-dlp diagnostics unavailable",
+        "\n".join(
+            [
+                "---- videoroll error summary ----",
+                f"task_id={task_id}",
+                f"url={url}",
+                f"error={error_message}",
+            ]
+        ),
+    ]
+    hint_text = str(hint or "").strip()
+    if hint_text:
+        sections.append(f"---- videoroll hint ----\n{hint_text}")
+    return "\n\n".join(sections).rstrip() + "\n"
+
+
+def _youtube_download_log_key(task_id: uuid.UUID) -> str:
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    return f"log/{task_id}/youtube_download_{stamp}_{uuid.uuid4().hex[:8]}.log"
+
+
+def _extract_metadata_title(raw: bytes) -> str:
+    if not raw:
+        return ""
+    try:
+        parsed = json.loads(raw.decode("utf-8"))
+    except Exception:
+        return ""
+    info = parsed if isinstance(parsed, dict) else {}
+    return str(info.get("title") or info.get("fulltitle") or info.get("alt_title") or "").strip()
+
+
+def _task_title_key(task_id: uuid.UUID) -> str:
+    return f"task.title.{task_id}"
+
+
+def _load_task_display_titles(
+    db: Session,
+    task_ids: list[uuid.UUID],
+    *,
+    s3: S3Store | None = None,
+    allow_s3_fallback: bool,
+) -> dict[uuid.UUID, str]:
+    title_map: dict[uuid.UUID, str] = {}
+    if not task_ids:
+        return title_map
+
+    rows = db.query(AppSetting).filter(AppSetting.key.in_([_task_title_key(tid) for tid in task_ids])).all()
+    by_key = {str(r.key): _as_dict(getattr(r, "value_json", None)) for r in rows}
+    for tid in task_ids:
+        data = by_key.get(_task_title_key(tid)) or {}
+        for key in ("translated_title", "source_title"):
+            value = data.get(key)
+            if isinstance(value, str) and value.strip():
+                title_map[tid] = value.strip()
+                break
+
+    if not allow_s3_fallback or s3 is None:
+        return title_map
+
+    missing = [tid for tid in task_ids if tid not in title_map]
+    if not missing:
+        return title_map
+
+    assets = (
+        db.query(Asset)
+        .filter(Asset.task_id.in_(missing), Asset.kind == AssetKind.metadata_json)
+        .order_by(Asset.created_at.desc())
+        .all()
+    )
+    picked: dict[uuid.UUID, Asset] = {}
+    for asset in assets:
+        if asset.task_id not in picked:
+            picked[asset.task_id] = asset
+    for tid, asset in picked.items():
+        try:
+            title = _extract_metadata_title(_read_s3_bytes(s3, asset.storage_key))
+        except Exception:
+            continue
+        if title:
+            title_map[tid] = title
+    return title_map
+
+
+def _stream_upload_to_tempfile(
+    file_obj: Any,
+    *,
+    prefix: str,
+    suffix: str,
+) -> tuple[Path, str, int]:
+    tmp_path: Path | None = None
+    sha256 = hashlib.sha256()
+    size_bytes = 0
+    try:
+        with tempfile.NamedTemporaryFile(prefix=prefix, suffix=suffix, delete=False) as tmp:
+            tmp_path = Path(tmp.name)
+            while True:
+                chunk = file_obj.read(1024 * 1024)
+                if not chunk:
+                    break
+                if not isinstance(chunk, (bytes, bytearray)):
+                    raise TypeError("uploaded file stream returned non-bytes content")
+                sha256.update(chunk)
+                size_bytes += len(chunk)
+                tmp.write(chunk)
+        return tmp_path, sha256.hexdigest(), size_bytes
+    except Exception:
+        if tmp_path is not None:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+        raise
+
+
+def _safe_unlink(path: Path | None) -> None:
+    if path is None:
+        return
+    try:
+        path.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+async def _store_uploaded_task_asset(
+    *,
+    task: Task,
+    file: UploadFile,
+    s3: S3Store,
+    db: Session,
+    temp_prefix: str,
+    default_suffix: str,
+    key_prefix: str,
+    object_name_prefix: str,
+    asset_kind: AssetKind,
+    update_task_status: TaskStatus | None = None,
+) -> Asset:
+    suffix = Path(file.filename or "").suffix or default_suffix
+    tmp_path: Path | None = None
+    uploaded_key: str | None = None
+
+    try:
+        await file.seek(0)
+        tmp_path, sha256, size_bytes = await run_in_threadpool(
+            _stream_upload_to_tempfile,
+            file.file,
+            prefix=temp_prefix,
+            suffix=suffix,
+        )
+        uploaded_key = f"{key_prefix}/{task.id}/{object_name_prefix}_{sha256[:16]}{suffix}"
+        await run_in_threadpool(s3.upload_file, tmp_path, uploaded_key, file.content_type or None)
+
+        asset = Asset(
+            task_id=task.id,
+            kind=asset_kind,
+            storage_key=uploaded_key,
+            sha256=sha256,
+            size_bytes=size_bytes,
+        )
+        db.add(asset)
+        if update_task_status is not None:
+            task.status = update_task_status
+            db.add(task)
+        db.commit()
+        db.refresh(asset)
+        return asset
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        if uploaded_key:
+            try:
+                await run_in_threadpool(s3.delete_object, uploaded_key)
+            except Exception:
+                logger.exception("failed to roll back uploaded S3 object", extra={"storage_key": uploaded_key})
+        raise HTTPException(status_code=500, detail=f"upload failed: {e}") from e
+    finally:
+        await run_in_threadpool(_safe_unlink, tmp_path)
+        try:
+            await file.close()
+        except Exception:
+            pass
+
+
 def _internal_header_token(settings: OrchestratorSettings) -> str:
     return internal_api_token(settings.s3_secret_access_key)
 
@@ -333,6 +568,8 @@ class _AdminAuthMiddleware(BaseHTTPMiddleware):
         if path == "/health" or path.endswith("/health"):
             return await call_next(request)
         if path.startswith("/auth"):
+            return await call_next(request)
+        if path.rstrip("/") == REMOTE_AUTO_YOUTUBE_PATH:
             return await call_next(request)
 
         pw_hash = _get_admin_password_hash(request)
@@ -422,48 +659,59 @@ def _cleanup_storage_once(settings: OrchestratorSettings) -> dict[str, int]:
 
         cutoff = _utcnow() - timedelta(days=ttl_days)
         store = S3Store(settings)
-        store.ensure_bucket()
 
         deleted_objects = 0
         deleted_assets = 0
         deleted_subtitles = 0
+        failed_keys: set[str] = set()
 
         # 1) Delete fully-expired keys (no Asset rows >= cutoff).
         while True:
-            rows = (
-                db.query(Asset.storage_key)
-                .group_by(Asset.storage_key)
-                .having(func.max(Asset.created_at) < cutoff)
-                .limit(200)
-                .all()
-            )
+            query = db.query(Asset.storage_key).group_by(Asset.storage_key).having(func.max(Asset.created_at) < cutoff)
+            if failed_keys:
+                query = query.filter(~Asset.storage_key.in_(failed_keys))
+            rows = query.limit(200).all()
             keys = [r[0] for r in rows if r and r[0]]
             if not keys:
                 break
 
+            deleted_keys: list[str] = []
             for key in keys:
                 try:
                     store.delete_object(key)
                     deleted_objects += 1
+                    deleted_keys.append(key)
                 except Exception:
-                    # Best-effort: still delete DB rows to honor TTL.
-                    pass
+                    failed_keys.add(key)
+                    logger.exception("failed to delete expired S3 object", extra={"storage_key": key})
 
-            deleted_assets += (
-                db.query(Asset)
-                .filter(Asset.storage_key.in_(keys))
-                .delete(synchronize_session=False)
-            )
-            deleted_subtitles += (
-                db.query(Subtitle)
-                .filter(Subtitle.storage_key.in_(keys))
-                .delete(synchronize_session=False)
+            if not deleted_keys:
+                continue
+
+            deleted_assets += db.query(Asset).filter(Asset.storage_key.in_(deleted_keys)).delete(synchronize_session=False)
+            deleted_subtitles += db.query(Subtitle).filter(Subtitle.storage_key.in_(deleted_keys)).delete(
+                synchronize_session=False
             )
             db.commit()
 
-        # 2) Delete old duplicate rows for keys that still exist (object kept).
-        deleted_assets += db.query(Asset).filter(Asset.created_at < cutoff).delete(synchronize_session=False)
-        deleted_subtitles += db.query(Subtitle).filter(Subtitle.created_at < cutoff).delete(synchronize_session=False)
+        # 2) Delete old duplicate rows only for keys that still have a newer Asset row.
+        active_key_subq = (
+            db.query(Asset.storage_key.label("storage_key"))
+            .group_by(Asset.storage_key)
+            .having(func.max(Asset.created_at) >= cutoff)
+            .subquery()
+        )
+        active_key_query = db.query(active_key_subq.c.storage_key)
+        deleted_assets += (
+            db.query(Asset)
+            .filter(Asset.created_at < cutoff, Asset.storage_key.in_(active_key_query))
+            .delete(synchronize_session=False)
+        )
+        deleted_subtitles += (
+            db.query(Subtitle)
+            .filter(Subtitle.created_at < cutoff, Subtitle.storage_key.in_(active_key_query))
+            .delete(synchronize_session=False)
+        )
         db.commit()
 
         return {
@@ -481,7 +729,7 @@ def _cleanup_loop() -> None:
         try:
             _cleanup_storage_once(settings)
         except Exception:
-            pass
+            logger.exception("storage cleanup loop failed")
         _cleanup_stop.wait(timeout=max(30, _cleanup_interval_seconds))
 
 
@@ -694,22 +942,25 @@ def auth_logout(request: Request, db: Session = Depends(get_db)) -> JSONResponse
     return resp
 
 
-@app.post("/auto/youtube", response_model=AutoYouTubeResponse)
-def auto_youtube(
-    payload: AutoYouTubeRequest,
-    settings: OrchestratorSettings = Depends(get_settings),
+def _start_auto_youtube_pipeline(
+    *,
+    url: str,
+    license: SourceLicense,
+    proof_url: str | None,
+    settings: OrchestratorSettings,
 ) -> AutoYouTubeResponse:
-    url = (payload.url or "").strip()
+    url = str(url or "").strip()
     if not url:
         raise HTTPException(status_code=400, detail="url is required")
     if not _is_youtube_url(url):
         raise HTTPException(status_code=400, detail="url is not a valid youtube url")
+    proof = str(proof_url or "").strip() or None
 
     try:
         with httpx.Client(timeout=30.0, headers=_internal_http_headers(settings)) as client:
             resp = client.post(
                 f"{settings.youtube_ingest_url}/youtube/ingest",
-                json={"url": url, "license": payload.license.value, "proof_url": payload.proof_url},
+                json={"url": url, "license": license.value, "proof_url": proof},
             )
             resp.raise_for_status()
             data = resp.json()
@@ -734,6 +985,41 @@ def auto_youtube(
     )
 
 
+@app.post("/auto/youtube", response_model=AutoYouTubeResponse)
+def auto_youtube(
+    payload: AutoYouTubeRequest,
+    settings: OrchestratorSettings = Depends(get_settings),
+) -> AutoYouTubeResponse:
+    return _start_auto_youtube_pipeline(
+        url=payload.url,
+        license=payload.license,
+        proof_url=payload.proof_url,
+        settings=settings,
+    )
+
+
+@app.get(REMOTE_AUTO_YOUTUBE_PATH, response_model=AutoYouTubeResponse)
+@app.post(REMOTE_AUTO_YOUTUBE_PATH, response_model=AutoYouTubeResponse)
+def remote_auto_youtube(
+    url: str | None = Query(default=None),
+    token: str | None = Query(default=None, alias=REMOTE_API_TOKEN_QUERY_PARAM),
+    license: SourceLicense = Query(default=SourceLicense.authorized),
+    proof_url: str | None = Query(default=None),
+    settings: OrchestratorSettings = Depends(get_settings),
+    db: Session = Depends(get_db),
+) -> AutoYouTubeResponse:
+    if not remote_api_token_is_configured(db):
+        raise HTTPException(status_code=403, detail="remote api token is not set")
+    if not verify_remote_api_token(db, str(token or "")):
+        raise HTTPException(status_code=401, detail="invalid remote api token")
+    return _start_auto_youtube_pipeline(
+        url=str(url or ""),
+        license=license,
+        proof_url=proof_url,
+        settings=settings,
+    )
+
+
 @app.post("/tasks", response_model=TaskRead)
 def create_task(payload: TaskCreate, db: Session = Depends(get_db)) -> Task:
     task = Task(
@@ -755,7 +1041,6 @@ def create_task(payload: TaskCreate, db: Session = Depends(get_db)) -> Task:
 def list_converted_videos(
     limit: int = Query(default=50, ge=1, le=200),
     db: Session = Depends(get_db),
-    s3: S3Store = Depends(get_s3),
 ) -> list[dict[str, Any]]:
     # Fetch recent video_final assets and dedupe by task_id (keep latest per task).
     fetch_n = min(1000, max(limit, 1) * 5)
@@ -767,25 +1052,48 @@ def list_converted_videos(
         .all()
     )
 
-    items: list[dict[str, Any]] = []
+    final_assets: list[Asset] = []
     seen: set[uuid.UUID] = set()
-    for a in assets:
-        if a.task_id in seen:
+    for asset in assets:
+        if asset.task_id in seen:
             continue
-        seen.add(a.task_id)
-        task = db.get(Task, a.task_id)
+        seen.add(asset.task_id)
+        final_assets.append(asset)
+        if len(final_assets) >= limit:
+            break
+
+    task_ids = [asset.task_id for asset in final_assets]
+    if not task_ids:
+        return []
+
+    task_map = {task.id: task for task in db.query(Task).filter(Task.id.in_(task_ids)).all()}
+    cover_assets = (
+        db.query(Asset)
+        .filter(Asset.task_id.in_(task_ids), Asset.kind == AssetKind.cover_image)
+        .order_by(Asset.created_at.desc())
+        .all()
+    )
+    cover_by_task: dict[uuid.UUID, Asset] = {}
+    for asset in cover_assets:
+        if asset.task_id not in cover_by_task:
+            cover_by_task[asset.task_id] = asset
+
+    title_map = _load_task_display_titles(db, task_ids, allow_s3_fallback=False)
+
+    items: list[dict[str, Any]] = []
+    for asset in final_assets:
+        task = task_map.get(asset.task_id)
         if not task:
             continue
-        cover_asset = (
-            db.query(Asset)
-            .filter(Asset.task_id == a.task_id, Asset.kind == AssetKind.cover_image)
-            .order_by(Asset.created_at.desc())
-            .first()
+        display_title = str(title_map.get(asset.task_id) or "").strip()
+        items.append(
+            {
+                "task": task,
+                "final_asset": asset,
+                "cover_asset": cover_by_task.get(asset.task_id),
+                "display_title": display_title or None,
+            }
         )
-        display_title = get_task_display_title_with_s3(db, str(a.task_id), s3=s3)
-        items.append({"task": task, "final_asset": a, "cover_asset": cover_asset, "display_title": display_title or None})
-        if len(items) >= limit:
-            break
     return items
 
 
@@ -796,55 +1104,13 @@ def list_tasks(
     db: Session = Depends(get_db),
     s3: S3Store = Depends(get_s3),
 ) -> list[dict[str, Any]]:
-    def _title_key(tid: uuid.UUID) -> str:
-        return f"task.title.{tid}"
-
     q = db.query(Task).order_by(Task.created_at.desc())
     if status is not None:
         q = q.filter(Task.status == status)
     tasks = q.limit(limit).all()
 
     ids = [t.id for t in tasks]
-
-    # Batch load translated/source titles from AppSetting first, then fall back to YouTube meta title.
-    title_map: dict[uuid.UUID, str] = {}
-    if ids:
-        keys = [_title_key(tid) for tid in ids]
-        rows = db.query(AppSetting).filter(AppSetting.key.in_(keys)).all()
-        by_key: dict[str, dict[str, Any]] = {}
-        for r in rows:
-            by_key[str(r.key)] = _as_dict(getattr(r, "value_json", None))
-
-        for tid in ids:
-            data = by_key.get(_title_key(tid)) or {}
-            for k in ("translated_title", "source_title"):
-                v = data.get(k)
-                if isinstance(v, str) and v.strip():
-                    title_map[tid] = v.strip()
-                    break
-
-        missing = [tid for tid in ids if tid not in title_map]
-        if missing:
-            assets = (
-                db.query(Asset)
-                .filter(Asset.task_id.in_(missing), Asset.kind == AssetKind.metadata_json)
-                .order_by(Asset.created_at.desc())
-                .all()
-            )
-            picked: dict[uuid.UUID, Asset] = {}
-            for a in assets:
-                if a.task_id not in picked:
-                    picked[a.task_id] = a
-            for tid, asset in picked.items():
-                try:
-                    raw = _read_s3_bytes(s3, asset.storage_key)
-                    parsed = json.loads(raw.decode("utf-8")) if raw else {}
-                    info = parsed if isinstance(parsed, dict) else {}
-                except Exception:
-                    continue
-                title = str(info.get("title") or info.get("fulltitle") or info.get("alt_title") or "").strip()
-                if title:
-                    title_map[tid] = title
+    title_map = _load_task_display_titles(db, ids, s3=s3, allow_s3_fallback=True)
 
     out: list[dict[str, Any]] = []
     for t in tasks:
@@ -868,6 +1134,17 @@ def put_storage_settings(payload: StorageRetentionSettingsUpdate, db: Session = 
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     return StorageRetentionSettingsRead(**cfg)
+
+
+@app.get("/settings/api", response_model=RemoteAPISettingsRead)
+def get_remote_api_settings_view(db: Session = Depends(get_db)) -> RemoteAPISettingsRead:
+    return RemoteAPISettingsRead(**get_remote_api_settings(db))
+
+
+@app.put("/settings/api", response_model=RemoteAPISettingsRead)
+def put_remote_api_settings_view(payload: RemoteAPISettingsUpdate, db: Session = Depends(get_db)) -> RemoteAPISettingsRead:
+    cfg = update_remote_api_settings(db, payload.model_dump(exclude_unset=True))
+    return RemoteAPISettingsRead(**cfg)
 
 
 @app.get("/settings/youtube", response_model=YouTubeSettingsRead)
@@ -973,39 +1250,18 @@ async def upload_task_video(
     task = db.get(Task, task_id)
     if not task:
         raise HTTPException(status_code=404, detail="task not found")
-
-    suffix = Path(file.filename or "").suffix or ".mp4"
-
-    with tempfile.NamedTemporaryFile(prefix="videoroll_", suffix=suffix, delete=False) as tmp:
-        tmp_path = Path(tmp.name)
-        while True:
-            chunk = await file.read(1024 * 1024)
-            if not chunk:
-                break
-            tmp.write(chunk)
-
-    sha256 = sha256_file(tmp_path)
-    size_bytes = tmp_path.stat().st_size
-    key = f"raw/{task_id}/video_{sha256[:16]}{suffix}"
-    s3.upload_file(tmp_path, key)
-    try:
-        tmp_path.unlink(missing_ok=True)
-    except Exception:
-        pass
-
-    asset = Asset(
-        task_id=task_id,
-        kind=AssetKind.video_raw,
-        storage_key=key,
-        sha256=sha256,
-        size_bytes=size_bytes,
+    return await _store_uploaded_task_asset(
+        task=task,
+        file=file,
+        s3=s3,
+        db=db,
+        temp_prefix="videoroll_",
+        default_suffix=".mp4",
+        key_prefix="raw",
+        object_name_prefix="video",
+        asset_kind=AssetKind.video_raw,
+        update_task_status=TaskStatus.downloaded,
     )
-    db.add(asset)
-    task.status = TaskStatus.downloaded
-    db.add(task)
-    db.commit()
-    db.refresh(asset)
-    return asset
 
 
 @app.post("/tasks/{task_id}/upload/cover", response_model=AssetRead)
@@ -1021,37 +1277,17 @@ async def upload_task_cover(
 
     if file.content_type and not file.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="cover must be an image")
-
-    suffix = Path(file.filename or "").suffix or ".jpg"
-
-    with tempfile.NamedTemporaryFile(prefix="videoroll_cover_", suffix=suffix, delete=False) as tmp:
-        tmp_path = Path(tmp.name)
-        while True:
-            chunk = await file.read(1024 * 1024)
-            if not chunk:
-                break
-            tmp.write(chunk)
-
-    sha256 = sha256_file(tmp_path)
-    size_bytes = tmp_path.stat().st_size
-    key = f"final/{task_id}/cover_{sha256[:16]}{suffix}"
-    s3.upload_file(tmp_path, key)
-    try:
-        tmp_path.unlink(missing_ok=True)
-    except Exception:
-        pass
-
-    asset = Asset(
-        task_id=task_id,
-        kind=AssetKind.cover_image,
-        storage_key=key,
-        sha256=sha256,
-        size_bytes=size_bytes,
+    return await _store_uploaded_task_asset(
+        task=task,
+        file=file,
+        s3=s3,
+        db=db,
+        temp_prefix="videoroll_cover_",
+        default_suffix=".jpg",
+        key_prefix="final",
+        object_name_prefix="cover",
+        asset_kind=AssetKind.cover_image,
     )
-    db.add(asset)
-    db.commit()
-    db.refresh(asset)
-    return asset
 
 
 @app.get("/tasks/{task_id}/assets", response_model=list[AssetRead])
@@ -1376,6 +1612,24 @@ def download_youtube(
                 video_path, info, meta = download_youtube_video(url, yt_settings, work_dir=tmp_dir)
             except Exception as e:
                 hint = _youtube_bot_check_hint(str(e), yt_settings=yt_settings, db=db)
+                diagnostics = e.diagnostics if isinstance(e, YtDlpRuntimeError) else []
+                try:
+                    _store_task_log_asset(
+                        db,
+                        s3,
+                        task_id=task_id,
+                        log_key=_youtube_download_log_key(task_id),
+                        text=_build_youtube_download_failure_log(
+                            task_id=task_id,
+                            url=url,
+                            error_message=str(e),
+                            hint=hint,
+                            diagnostics=diagnostics,
+                        ),
+                    )
+                except Exception:
+                    db.rollback()
+                    logger.exception("failed to persist youtube download diagnostics log for task %s", task_id)
                 detail = f"youtube download failed: {e}"
                 if hint:
                     detail = f"{detail}\n\n{hint}"

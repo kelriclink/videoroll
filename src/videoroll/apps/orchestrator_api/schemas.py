@@ -188,6 +188,20 @@ class StorageRetentionSettingsUpdate(BaseModel):
     asset_ttl_days: Optional[int] = None
 
 
+class RemoteAPISettingsRead(BaseModel):
+    token_set: bool = False
+    token_updated_at: Optional[str] = None
+    endpoint_path: str = "/remote/auto/youtube"
+    token_query_param: str = "token"
+    url_query_param: str = "url"
+    license_query_param: str = "license"
+    proof_url_query_param: str = "proof_url"
+
+
+class RemoteAPISettingsUpdate(BaseModel):
+    token: Optional[str] = None
+
+
 class YouTubeSettingsRead(BaseModel):
     proxy: str = ""
     cookies_set: bool = False
