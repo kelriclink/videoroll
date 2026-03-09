@@ -18,3 +18,5 @@ data/
 src/web/node_modules/
 src/web/dist/
 src/web/*.tsbuildinfo
+
+skills/videoroll/local.env

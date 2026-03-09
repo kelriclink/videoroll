@@ -40,7 +40,8 @@ export default function RenderQueuePage() {
       const maxConc = Number(q?.settings?.max_concurrency ?? 1);
       const queued = Number(q?.queued_count ?? 0);
       const running = Number(q?.running_count ?? 0);
-      if (queued > 0 && running < maxConc && maxConc > 0) {
+      const hasWaitingStage = (q?.tasks ?? []).some((t) => t.stage === "waiting_subtitle" || t.stage === "waiting_render");
+      if ((queued > 0 && running < maxConc && maxConc > 0) || hasWaitingStage) {
         const now = Date.now();
         if (now - (lastKickAtRef.current || 0) > 10_000) {
           lastKickAtRef.current = now;
