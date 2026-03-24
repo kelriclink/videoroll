@@ -16,6 +16,7 @@ import SettingsApiPage from "./pages/SettingsApiPage";
 import SettingsTranslatePage from "./pages/SettingsTranslatePage";
 import SettingsBilibiliPage from "./pages/SettingsBilibiliPage";
 import SettingsAutoPage from "./pages/SettingsAutoPage";
+import SettingsReviewPage from "./pages/SettingsReviewPage";
 import RenderQueuePage from "./pages/RenderQueuePage";
 
 function NavItem({ to, label }: { to: string; label: string }) {
@@ -99,6 +100,7 @@ export default function App() {
               <NavItem to="/settings/youtube" label="Settings · YouTube" />
               <NavItem to="/settings/storage" label="Settings · Storage" />
               <NavItem to="/settings/api" label="Settings · API" />
+              <NavItem to="/settings/review" label="Settings · Review" />
               <NavItem to="/settings/auto" label="Settings · Auto" />
               <NavItem to="/settings/translate" label="Settings · Translate" />
               <NavItem to="/settings/bilibili" label="Settings · Bilibili" />
@@ -121,6 +123,7 @@ export default function App() {
               <Route path="/settings/youtube" element={<SettingsYouTubePage />} />
               <Route path="/settings/storage" element={<SettingsStoragePage />} />
               <Route path="/settings/api" element={<SettingsApiPage />} />
+              <Route path="/settings/review" element={<SettingsReviewPage />} />
               <Route path="/settings/auto" element={<SettingsAutoPage />} />
               <Route path="/settings/translate" element={<SettingsTranslatePage />} />
               <Route path="/settings/bilibili" element={<SettingsBilibiliPage />} />

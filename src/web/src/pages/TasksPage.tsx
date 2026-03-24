@@ -35,6 +35,8 @@ export default function TasksPage() {
       "ASR_DONE",
       "SUBTITLE_READY",
       "RENDERED",
+      "READY_FOR_REVIEW",
+      "APPROVED",
       "PUBLISHED",
       "FAILED",
     ],
@@ -111,6 +113,11 @@ export default function TasksPage() {
                       ) : null}
                       <div className="text-xs text-slate-500">{t.source_type}</div>
                       <div className="max-w-[28rem] truncate text-xs text-slate-700">{t.source_url ?? "-"}</div>
+                      {t.error_message ? (
+                        <div className="mt-1 max-w-[28rem] truncate text-xs text-rose-700" title={t.error_message}>
+                          {t.error_message}
+                        </div>
+                      ) : null}
                     </td>
                     <td className="py-2 pr-3">
                       <div className="text-xs text-slate-700">{new Date(t.created_at).toLocaleString()}</div>

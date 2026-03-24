@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -93,6 +93,46 @@ class PublishActionRequest(BaseModel):
     cover_key: Optional[str] = None
     typeid_mode: Optional[str] = None
     meta: Optional[dict[str, Any]] = None
+    skip_review: bool = False
+
+
+class PublishMetaDraftRequest(BaseModel):
+    mode: Literal["auto", "default", "source"] = "auto"
+    meta: Optional[dict[str, Any]] = None
+
+
+class PublishMetaDraftResponse(BaseModel):
+    meta: dict[str, Any] = Field(default_factory=dict)
+
+
+class PublishReviewActionRequest(BaseModel):
+    meta: Optional[dict[str, Any]] = None
+
+
+class PublishReviewSettingsRead(BaseModel):
+    enabled: bool = True
+    blocked_words: list[str] = Field(default_factory=list)
+    ai_rules: str = ""
+
+
+class PublishReviewSettingsUpdate(BaseModel):
+    enabled: Optional[bool] = None
+    blocked_words: Optional[list[str]] = None
+    ai_rules: Optional[str] = None
+
+
+class TaskPublishReviewRead(BaseModel):
+    enabled: bool = True
+    checked: bool = False
+    ok: Optional[bool] = None
+    reason: Optional[str] = None
+    matched_blocked_words: list[str] = Field(default_factory=list)
+    review_mode: Optional[str] = None
+    risk_tags: list[str] = Field(default_factory=list)
+    title: Optional[str] = None
+    summary: Optional[str] = None
+    subtitle_chars: int = 0
+    checked_at: Optional[str] = None
 
 
 class RemoteJobResponse(BaseModel):

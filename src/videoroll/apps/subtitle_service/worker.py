@@ -1797,9 +1797,10 @@ def after_render_publish(render_job_id: str) -> dict[str, Any]:
         if not after_render.get("publish"):
             return {"status": "skipped"}
 
-        publish_payload = after_render.get("publish_payload") or after_render.get("payload")
+        publish_payload = after_render.get("publish_payload") or after_render.get("payload") or {}
         if not isinstance(publish_payload, dict):
-            return {"status": "error", "detail": "after_render.publish_payload is missing"}
+            return {"status": "error", "detail": "after_render.publish_payload must be an object"}
+        publish_payload = dict(publish_payload)
 
         # Ensure we don't accidentally override the latest rendered asset selection.
         if publish_payload.get("video_key") in {"", None}:
@@ -1813,6 +1814,8 @@ def after_render_publish(render_job_id: str) -> dict[str, Any]:
     except Exception as e:
         task = db.get(Task, rj.task_id) if "rj" in locals() and rj else None
         if task:
+            if task.status == TaskStatus.ready_for_review and task.error_code == "AI_REVIEW_REJECTED":
+                return {"status": "review_rejected", "detail": task.error_message or str(e)}
             task.status = TaskStatus.failed
             task.error_message = str(e)
             db.add(task)
@@ -2253,6 +2256,9 @@ def auto_youtube_pipeline(task_id: str) -> dict[str, str]:
     except Exception as e:
         task = db.get(Task, uuid.UUID(task_id))
         if task:
+            if task.status == TaskStatus.ready_for_review and task.error_code == "AI_REVIEW_REJECTED":
+                celery_app.send_task("subtitle_service.task_queue_tick", args=[], queue="subtitle")
+                return {"status": "review_rejected", "task_id": str(task.id), "detail": task.error_message or str(e)}
             task.status = TaskStatus.failed
             task.error_message = str(e)
             db.add(task)

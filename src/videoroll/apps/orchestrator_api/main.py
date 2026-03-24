@@ -25,7 +25,9 @@ from starlette.types import ASGIApp
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
+from videoroll.ai.client import openai_chat_config_from_settings
 from videoroll.config import OrchestratorSettings, get_orchestrator_settings
+from videoroll.config import get_subtitle_settings
 from videoroll.db.base import Base
 from videoroll.db.auto_migrate import auto_migrate
 from videoroll.db.models import AppSetting, Asset, AssetKind, PublishJob, SourceLicense, Subtitle, SubtitleJob, SubtitleJobStatus, Task, TaskStatus
@@ -43,7 +45,12 @@ from videoroll.apps.orchestrator_api.schemas import (
     AutoYouTubeResponse,
     ConvertedVideoItem,
     PublishActionRequest,
+    PublishMetaDraftRequest,
+    PublishMetaDraftResponse,
+    PublishReviewActionRequest,
     PublishJobSummary,
+    PublishReviewSettingsRead,
+    PublishReviewSettingsUpdate,
     RemoteAPISettingsRead,
     RemoteAPISettingsUpdate,
     RemoteJobResponse,
@@ -53,6 +60,7 @@ from videoroll.apps.orchestrator_api.schemas import (
     SubtitleActionRequest,
     SubtitleJobSummary,
     TaskCreate,
+    TaskPublishReviewRead,
     TaskRead,
     YouTubeProxyTestRequest,
     YouTubeProxyTestResponse,
@@ -61,6 +69,15 @@ from videoroll.apps.orchestrator_api.schemas import (
     YouTubeDownloadActionResponse,
     YouTubeMetaActionResponse,
     YouTubeMetaRead,
+)
+from videoroll.apps.bilibili_publisher.schemas import BilibiliPublishMeta
+from videoroll.apps.publish_meta_draft import build_task_publish_meta_draft
+from videoroll.apps.publish_review import review_publish_materials
+from videoroll.apps.publish_review_store import (
+    get_publish_review_settings,
+    get_task_publish_review,
+    set_task_publish_review,
+    update_publish_review_settings,
 )
 from videoroll.apps.orchestrator_api.admin_auth_store import (
     DEVICE_COOKIE_NAME,
@@ -93,8 +110,9 @@ from videoroll.apps.orchestrator_api.remote_api_settings_store import (
     update_remote_api_settings,
     verify_remote_api_token,
 )
-from videoroll.apps.subtitle_service.bilibili_tags_store import get_task_bilibili_tags
+from videoroll.apps.subtitle_service.bilibili_tags_store import get_task_bilibili_summary, get_task_bilibili_tags
 from videoroll.apps.subtitle_service.task_title_store import get_task_display_title_with_s3
+from videoroll.apps.subtitle_service.translate_settings_store import get_translate_settings
 from videoroll.apps.youtube_settings_store import (
     get_youtube_cookies_txt,
     get_youtube_settings,
@@ -318,6 +336,151 @@ def _write_s3_text(s3: S3Store, key: str, text: str) -> bytes:
     payload = str(text).encode("utf-8")
     s3.put_bytes(payload, key, content_type="text/plain; charset=utf-8")
     return payload
+
+
+def _task_has_asset_kind(db: Session, task_id: uuid.UUID, kind: AssetKind) -> bool:
+    return (
+        db.query(Asset.id)
+        .filter(Asset.task_id == task_id, Asset.kind == kind)
+        .limit(1)
+        .first()
+        is not None
+    )
+
+
+def _task_status_after_review_pass(db: Session, task: Task) -> TaskStatus:
+    if _task_has_asset_kind(db, task.id, AssetKind.video_final):
+        return TaskStatus.rendered
+    if _task_has_asset_kind(db, task.id, AssetKind.subtitle_srt) or _task_has_asset_kind(db, task.id, AssetKind.subtitle_ass):
+        return TaskStatus.subtitle_ready
+    if _task_has_asset_kind(db, task.id, AssetKind.segments_json):
+        return TaskStatus.asr_done
+    if _task_has_asset_kind(db, task.id, AssetKind.video_raw):
+        return TaskStatus.downloaded
+    return task.status
+
+
+def _apply_task_review_result(db: Session, task: Task, review_result: dict[str, Any]) -> None:
+    if bool(review_result.get("ok")):
+        if task.error_code == "AI_REVIEW_REJECTED":
+            task.error_code = None
+            task.error_message = None
+            if task.status == TaskStatus.ready_for_review:
+                task.status = _task_status_after_review_pass(db, task)
+    else:
+        if task.status not in {TaskStatus.publishing, TaskStatus.published, TaskStatus.canceled}:
+            task.status = TaskStatus.ready_for_review
+        task.error_code = "AI_REVIEW_REJECTED"
+        task.error_message = str(review_result.get("reason") or "").strip() or "AI 审核未通过"
+    db.add(task)
+
+
+def _read_latest_task_subtitle_text(task_id: uuid.UUID, db: Session, s3: S3Store) -> str:
+    asset = (
+        db.query(Asset)
+        .filter(Asset.task_id == task_id, Asset.kind.in_([AssetKind.subtitle_srt, AssetKind.subtitle_ass]))
+        .order_by(Asset.created_at.desc())
+        .first()
+    )
+    if not asset:
+        return ""
+    try:
+        return _read_s3_bytes(s3, asset.storage_key).decode("utf-8", errors="ignore")
+    except Exception:
+        return ""
+
+
+def _prepare_publish_meta(
+    *,
+    task: Task,
+    payload_meta: dict[str, Any] | None,
+    db: Session,
+    s3: S3Store,
+    allow_auto_draft: bool,
+) -> dict[str, Any]:
+    if payload_meta is None:
+        stored = _read_s3_json_object(s3, _publish_meta_s3_key(task.id))
+        if stored is None:
+            if not allow_auto_draft:
+                raise HTTPException(status_code=400, detail="meta is missing and publish_meta is not found")
+            meta = build_task_publish_meta_draft(task, db=db, s3=s3, mode="auto")
+        else:
+            meta = dict(stored)
+    else:
+        meta = dict(payload_meta or {})
+
+    try:
+        copyright_val = int(meta.get("copyright") or 1)
+    except Exception:
+        copyright_val = 1
+    if copyright_val == 2 and not str(meta.get("source") or "").strip() and task.source_url:
+        meta["source"] = task.source_url
+
+    existing_tags = _normalize_tags(meta.get("tags"))
+    auto_tags = get_task_bilibili_tags(db, str(task.id))
+    merged_tags: list[str] = []
+    seen: set[str] = set()
+    for tag in ["videoroll", *auto_tags, *existing_tags]:
+        s = str(tag or "").strip()
+        if not s:
+            continue
+        key = s.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        merged_tags.append(s)
+        if len(merged_tags) >= 10:
+            break
+    if merged_tags:
+        meta["tags"] = merged_tags
+
+    try:
+        meta_model = BilibiliPublishMeta.model_validate(meta)
+        return meta_model.model_dump()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"invalid publish meta: {e}") from e
+
+
+def _run_task_publish_review(task: Task, *, meta: dict[str, Any], db: Session, s3: S3Store) -> dict[str, Any]:
+    settings = get_publish_review_settings(db)
+    current = get_task_publish_review(db, str(task.id))
+    if not settings["enabled"]:
+        if task.error_code == "AI_REVIEW_REJECTED":
+            task.error_code = None
+            task.error_message = None
+            if task.status == TaskStatus.ready_for_review:
+                task.status = _task_status_after_review_pass(db, task)
+            db.add(task)
+            db.commit()
+        return {"enabled": False, **current}
+
+    translate_settings = get_translate_settings(db, get_subtitle_settings())
+    api_key = str(translate_settings.get("openai_api_key") or "").strip()
+    config = openai_chat_config_from_settings(translate_settings) if api_key else None
+
+    result = review_publish_materials(
+        title=str(meta.get("title") or "").strip(),
+        summary=get_task_bilibili_summary(db, str(task.id)),
+        subtitle_text=_read_latest_task_subtitle_text(task.id, db, s3),
+        blocked_words=settings["blocked_words"],
+        reject_rules=settings["ai_rules"],
+        config=config,
+    )
+    stored = set_task_publish_review(
+        db,
+        str(task.id),
+        ok=bool(result.get("ok")),
+        reason=str(result.get("reason") or "").strip(),
+        matched_blocked_words=list(result.get("matched_blocked_words") or []),
+        review_mode=str(result.get("review_mode") or "").strip() or None,
+        risk_tags=list(result.get("risk_tags") or []),
+        title=result.get("title"),
+        summary=result.get("summary"),
+        subtitle_chars=int(result.get("subtitle_chars") or 0),
+    )
+    _apply_task_review_result(db, task, stored)
+    db.commit()
+    return {"enabled": True, **stored}
 
 
 def _store_task_log_asset(
@@ -1148,6 +1311,20 @@ def put_remote_api_settings_view(payload: RemoteAPISettingsUpdate, db: Session =
     return RemoteAPISettingsRead(**cfg)
 
 
+@app.get("/settings/review", response_model=PublishReviewSettingsRead)
+def get_publish_review_settings_view(db: Session = Depends(get_db)) -> PublishReviewSettingsRead:
+    return PublishReviewSettingsRead(**get_publish_review_settings(db))
+
+
+@app.put("/settings/review", response_model=PublishReviewSettingsRead)
+def put_publish_review_settings_view(payload: PublishReviewSettingsUpdate, db: Session = Depends(get_db)) -> PublishReviewSettingsRead:
+    try:
+        cfg = update_publish_review_settings(db, payload.model_dump(exclude_unset=True))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    return PublishReviewSettingsRead(**cfg)
+
+
 @app.get("/settings/youtube", response_model=YouTubeSettingsRead)
 def get_youtube_settings_view(settings: OrchestratorSettings = Depends(get_settings), db: Session = Depends(get_db)) -> YouTubeSettingsRead:
     cfg = get_youtube_settings(db, default_proxy=settings.youtube_proxy)
@@ -1473,6 +1650,34 @@ def get_task_publish_meta(task_id: uuid.UUID, db: Session = Depends(get_db), s3:
     return obj
 
 
+@app.get("/tasks/{task_id}/publish_meta/draft", response_model=PublishMetaDraftResponse)
+def get_task_publish_meta_draft(
+    task_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    s3: S3Store = Depends(get_s3),
+) -> PublishMetaDraftResponse:
+    task = db.get(Task, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="task not found")
+    stored = _read_s3_json_object(s3, _publish_meta_s3_key(task_id))
+    meta = build_task_publish_meta_draft(task, db=db, s3=s3, mode="auto", base_meta=stored)
+    return PublishMetaDraftResponse(meta=meta)
+
+
+@app.post("/tasks/{task_id}/publish_meta/draft", response_model=PublishMetaDraftResponse)
+def generate_task_publish_meta_draft(
+    task_id: uuid.UUID,
+    payload: PublishMetaDraftRequest,
+    db: Session = Depends(get_db),
+    s3: S3Store = Depends(get_s3),
+) -> PublishMetaDraftResponse:
+    task = db.get(Task, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="task not found")
+    meta = build_task_publish_meta_draft(task, db=db, s3=s3, mode=payload.mode, base_meta=payload.meta)
+    return PublishMetaDraftResponse(meta=meta)
+
+
 @app.put("/tasks/{task_id}/publish_meta")
 def put_task_publish_meta(
     task_id: uuid.UUID,
@@ -1484,12 +1689,42 @@ def put_task_publish_meta(
         raise HTTPException(status_code=404, detail="task not found")
     if not isinstance(meta, dict):
         raise HTTPException(status_code=400, detail="meta must be an object")
+    try:
+        meta_model = BilibiliPublishMeta.model_validate(meta)
+        meta_out = meta_model.model_dump()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"invalid publish_meta: {e}") from e
     key = _publish_meta_s3_key(task_id)
     try:
-        _write_s3_json(s3, key, meta)
+        _write_s3_json(s3, key, meta_out)
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"failed to write publish_meta: {e}") from e
-    return {"stored": True, "key": key}
+    return {"stored": True, "key": key, "meta": meta_out}
+
+
+@app.get("/tasks/{task_id}/publish_review", response_model=TaskPublishReviewRead)
+def get_task_publish_review_view(task_id: uuid.UUID, db: Session = Depends(get_db)) -> TaskPublishReviewRead:
+    task = db.get(Task, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="task not found")
+    settings = get_publish_review_settings(db)
+    result = get_task_publish_review(db, str(task_id))
+    return TaskPublishReviewRead(enabled=settings["enabled"], **result)
+
+
+@app.post("/tasks/{task_id}/actions/publish_review", response_model=TaskPublishReviewRead)
+def run_task_publish_review(
+    task_id: uuid.UUID,
+    payload: PublishReviewActionRequest,
+    db: Session = Depends(get_db),
+    s3: S3Store = Depends(get_s3),
+) -> TaskPublishReviewRead:
+    task = db.get(Task, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="task not found")
+    meta = _prepare_publish_meta(task=task, payload_meta=payload.meta, db=db, s3=s3, allow_auto_draft=True)
+    result = _run_task_publish_review(task, meta=meta, db=db, s3=s3)
+    return TaskPublishReviewRead(**result)
 
 
 @app.post("/tasks/{task_id}/actions/youtube_meta", response_model=YouTubeMetaActionResponse)
@@ -1958,45 +2193,25 @@ def enqueue_publish_job(
         if not final_asset:
             raise HTTPException(status_code=400, detail="no final video asset found; render first")
         video_key = final_asset.storage_key
-
-    if payload.meta is None:
-        stored = _read_s3_json_object(s3, _publish_meta_s3_key(task_id))
-        if stored is None:
-            raise HTTPException(status_code=400, detail="meta is missing and publish_meta is not found")
-        meta = dict(stored)
-    else:
-        meta = dict(payload.meta or {})
-    try:
-        copyright_val = int(meta.get("copyright") or 1)
-    except Exception:
-        copyright_val = 1
-    if copyright_val == 2 and not str(meta.get("source") or "").strip() and task.source_url:
-        meta["source"] = task.source_url
-
-    # Auto-append generated Bilibili tags (from subtitle translation stage).
-    existing_tags = _normalize_tags(meta.get("tags"))
-    auto_tags = get_task_bilibili_tags(db, str(task_id))
-    merged_tags: list[str] = []
-    seen: set[str] = set()
-    for t in ["videoroll", *auto_tags, *existing_tags]:
-        s = str(t or "").strip()
-        if not s:
-            continue
-        k = s.lower()
-        if k in seen:
-            continue
-        seen.add(k)
-        merged_tags.append(s)
-        if len(merged_tags) >= 10:
-            break
-    if merged_tags:
-        meta["tags"] = merged_tags
+    meta = _prepare_publish_meta(task=task, payload_meta=payload.meta, db=db, s3=s3, allow_auto_draft=False)
 
     # Persist the final publish meta so publish is reproducible and editable before/after.
     try:
         _write_s3_json(s3, _publish_meta_s3_key(task_id), meta)
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"failed to persist publish_meta: {e}") from e
+
+    if not bool(payload.skip_review):
+        review_result = _run_task_publish_review(task, meta=meta, db=db, s3=s3)
+        if not bool(review_result.get("ok")):
+            raise HTTPException(status_code=409, detail=str(review_result.get("reason") or "AI 审核未通过"))
+    elif task.error_code == "AI_REVIEW_REJECTED":
+        task.error_code = None
+        task.error_message = None
+        if task.status == TaskStatus.ready_for_review:
+            task.status = _task_status_after_review_pass(db, task)
+        db.add(task)
+        db.commit()
 
     req = {
         "task_id": str(task_id),

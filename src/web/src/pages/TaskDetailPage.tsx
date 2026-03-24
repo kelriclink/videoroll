@@ -4,10 +4,12 @@ import StatusBadge from "../components/StatusBadge";
 import { fetchJson } from "../lib/http";
 import { BILIBILI_PUBLISHER_URL, ORCHESTRATOR_URL, SUBTITLE_SERVICE_URL } from "../lib/urls";
 import { Asset, PublishJob, SubtitleJob, Task } from "../lib/types";
+import { createTaskDetailPollPlan } from "./taskDetailPage.helpers";
 
 type SubtitleActionResponse = { job_id: string; status: string };
 type PublishResponse = { state: string; aid?: string | null; bvid?: string | null; response?: any };
-type PublishSettings = { default_meta: any };
+type PublishMetaDraftResponse = { meta: any };
+type PublishMetaStoreResponse = { stored: boolean; key: string; meta?: any };
 type YouTubeMeta = {
   title: string;
   description: string;
@@ -18,7 +20,6 @@ type YouTubeMeta = {
 };
 type YouTubeMetaActionResponse = { metadata: YouTubeMeta };
 type YouTubeDownloadActionResponse = { metadata: YouTubeMeta; video_asset: Asset; metadata_asset: Asset; cover_asset?: Asset | null };
-type TranslateTestResponse = { translated_text: string };
 type SubtitleAutoProfile = {
   formats: string[];
   burn_in: boolean;
@@ -37,6 +38,7 @@ type SubtitleAutoProfile = {
   translate_enable_summary: boolean;
   bilingual: boolean;
   auto_publish: boolean;
+  publish_typeid_mode?: string | null;
   publish_title_prefix: string;
   publish_translate_title: boolean;
   publish_use_youtube_cover: boolean;
@@ -46,8 +48,19 @@ type SubtitleAutoProfile = {
 type BiliTypeNode = { id: number; name: string; children?: BiliTypeNode[] };
 type BilibiliArchiveTypesResponse = { typelist: BiliTypeNode[] };
 type BilibiliTypeRecommendResponse = { ok: boolean; typeid?: number | null; path?: string | null; reason?: string; used_text?: string };
-
-const BILIBILI_DESC_MAX_CHARS = 2000;
+type PublishReview = {
+  enabled: boolean;
+  checked: boolean;
+  ok?: boolean | null;
+  reason?: string | null;
+  matched_blocked_words: string[];
+  review_mode?: string | null;
+  risk_tags: string[];
+  title?: string | null;
+  summary?: string | null;
+  subtitle_chars: number;
+  checked_at?: string | null;
+};
 
 export default function TaskDetailPage() {
   const { taskId } = useParams();
@@ -82,7 +95,6 @@ export default function TaskDetailPage() {
   const [translateEnableSummary, setTranslateEnableSummary] = useState(true);
   const [openaiKeySet, setOpenaiKeySet] = useState<boolean | null>(null);
 
-  const [publishSettings, setPublishSettings] = useState<PublishSettings | null>(null);
   const [publishMetaText, setPublishMetaText] = useState<string>("{}");
   const [publishVideoKey, setPublishVideoKey] = useState<string>("");
   const [publishCoverKey, setPublishCoverKey] = useState<string>("");
@@ -94,10 +106,11 @@ export default function TaskDetailPage() {
   const [biliTypesBusy, setBiliTypesBusy] = useState(false);
   const [typeRecommendBusy, setTypeRecommendBusy] = useState(false);
   const [typeRecommend, setTypeRecommend] = useState<BilibiliTypeRecommendResponse | null>(null);
+  const [publishReview, setPublishReview] = useState<PublishReview | null>(null);
+  const [reviewBusy, setReviewBusy] = useState(false);
   const [youtubeMeta, setYoutubeMeta] = useState<YouTubeMeta | null>(null);
-  const [didAutoFillPublishMeta, setDidAutoFillPublishMeta] = useState(false);
   const [didAutoPickCover, setDidAutoPickCover] = useState(false);
-  const [didLoadPublishMetaFile, setDidLoadPublishMetaFile] = useState(false);
+  const loadedPublishMetaTextRef = useRef<string>("{}");
   const lastQueueKickAtRef = useRef<number>(0);
 
   const refresh = useCallback(
@@ -105,16 +118,18 @@ export default function TaskDetailPage() {
       if (!taskId) return;
       if (!opts?.silent) setError(null);
       try {
-        const [t, a, sj, pj] = await Promise.all([
+        const [t, a, sj, pj, pr] = await Promise.all([
           fetchJson<Task>(`${ORCHESTRATOR_URL}/tasks/${taskId}`),
           fetchJson<Asset[]>(`${ORCHESTRATOR_URL}/tasks/${taskId}/assets`),
           fetchJson<SubtitleJob[]>(`${ORCHESTRATOR_URL}/tasks/${taskId}/subtitle_jobs`),
           fetchJson<PublishJob[]>(`${ORCHESTRATOR_URL}/tasks/${taskId}/publish_jobs`),
+          fetchJson<PublishReview>(`${ORCHESTRATOR_URL}/tasks/${taskId}/publish_review`),
         ]);
         setTask(t);
         setAssets(a);
         setSubtitleJobs(sj);
         setPublishJobs(pj);
+        setPublishReview(pr);
       } catch (e: unknown) {
         if (!opts?.silent) setError(e instanceof Error ? e.message : String(e));
       }
@@ -124,7 +139,34 @@ export default function TaskDetailPage() {
 
   useEffect(() => {
     refresh();
-  }, [taskId]);
+  }, [refresh]);
+
+  const applyLoadedPublishMeta = useCallback((meta: any) => {
+    const nextText = JSON.stringify(meta ?? {}, null, 2);
+    loadedPublishMetaTextRef.current = nextText;
+    setPublishMetaText(nextText);
+    const copyright = Number((meta as any)?.copyright ?? 1);
+    setPublishEnableReprint(copyright === 2);
+  }, []);
+
+  const loadPublishDraft = useCallback(async () => {
+    if (!taskId) return;
+    const resp = await fetchJson<PublishMetaDraftResponse>(`${ORCHESTRATOR_URL}/tasks/${taskId}/publish_meta/draft`);
+    applyLoadedPublishMeta(resp.meta ?? {});
+  }, [taskId, applyLoadedPublishMeta]);
+
+  const generatePublishDraft = useCallback(
+    async (mode: "default" | "source", meta?: any) => {
+      if (!taskId) return;
+      const resp = await fetchJson<PublishMetaDraftResponse>(`${ORCHESTRATOR_URL}/tasks/${taskId}/publish_meta/draft`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ mode, meta: meta ?? null }),
+      });
+      applyLoadedPublishMeta(resp.meta ?? {});
+    },
+    [taskId, applyLoadedPublishMeta],
+  );
 
   useEffect(() => {
     if (!taskId) return;
@@ -133,43 +175,25 @@ export default function TaskDetailPage() {
     setCoverFile(null);
     setPublishTypeidMode("ai_summary");
     setPublishTypeid("");
-    setPublishEnableReprint(true);
     setBiliTypes(null);
     setTypeRecommend(null);
+    setPublishReview(null);
     setYoutubeMeta(null);
-    setDidAutoFillPublishMeta(false);
     setDidAutoPickCover(false);
-    setDidLoadPublishMetaFile(false);
+    lastQueueKickAtRef.current = 0;
+    loadedPublishMetaTextRef.current = "{}";
+    setPublishMetaText("{}");
+    setPublishEnableReprint(true);
 
     (async () => {
-      // 1) Load default meta template (for manual override / fallback).
       try {
-        const s = await fetchJson<PublishSettings>(`${BILIBILI_PUBLISHER_URL}/bilibili/publish/settings`);
-        setPublishSettings(s);
-        const defaultText = JSON.stringify(s.default_meta ?? {}, null, 2);
-        setPublishMetaText(defaultText);
-        try {
-          const meta = s.default_meta ?? {};
-          const tid = Number((meta as any)?.typeid ?? (meta as any)?.tid ?? 0);
-          if (Number.isFinite(tid) && tid > 0) setPublishTypeid(tid);
-        } catch {}
-      } catch {
-        setPublishSettings(null);
-        setPublishMetaText("{}");
-      }
-
-      // 2) Prefer task-scoped publish_meta file (if exists).
-      try {
-        const metaFile = await fetchJson<any>(`${ORCHESTRATOR_URL}/tasks/${taskId}/publish_meta`);
-        setPublishMetaText(JSON.stringify(metaFile ?? {}, null, 2));
+        await loadPublishDraft();
       } catch (e: unknown) {
         const msg = e instanceof Error ? e.message : String(e);
-        if (!msg.startsWith("404 ")) setError(msg);
-      } finally {
-        setDidLoadPublishMetaFile(true);
+        setError(msg);
       }
     })();
-  }, [taskId]);
+  }, [taskId, loadPublishDraft]);
 
   useEffect(() => {
     fetchJson<Array<{ name: string; path: string }>>(`${SUBTITLE_SERVICE_URL}/subtitle/models`)
@@ -205,9 +229,9 @@ export default function TaskDetailPage() {
         setTranslateProvider(profile.translate_provider || "openai");
         setTranslateStyle(profile.translate_style || "口语自然");
         setTranslateEnableSummary(Boolean(profile.translate_enable_summary));
-        setPublishEnableReprint(Boolean(profile.publish_enable_reprint));
+        setPublishTypeidMode((profile.publish_typeid_mode || "ai_summary").toLowerCase());
         setOpenaiKeySet(Boolean(translateSettings.openai_api_key_set));
-      } catch (e) {
+      } catch {
         // Fallback: only fetch OpenAI key status so UI can show guidance.
         try {
           const s = await fetchJson<{ openai_api_key_set: boolean }>(`${SUBTITLE_SERVICE_URL}/subtitle/translate/settings`);
@@ -222,49 +246,6 @@ export default function TaskDetailPage() {
     if (s.length <= maxLen) return s;
     if (maxLen <= 1) return s.slice(0, maxLen);
     return s.slice(0, maxLen - 1) + "…";
-  }
-
-  function hasCjk(text: string): boolean {
-    return /[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uF900-\uFAFF]/.test(text ?? "");
-  }
-
-  function ensureShurouPrefix(title: string): string {
-    const t = (title ?? "").trim();
-    if (!t) return t;
-    return t.startsWith("【熟肉】") ? t : `【熟肉】${t}`;
-  }
-
-  async function translateTitleToZh(title: string): Promise<string> {
-    const t = (title ?? "").trim();
-    if (!t) return t;
-    if (hasCjk(t)) return t;
-    if (openaiKeySet === false) return t;
-    try {
-      const resp = await fetchJson<TranslateTestResponse>(`${SUBTITLE_SERVICE_URL}/subtitle/translate/test`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text: t, target_lang: "zh", style: translateStyle || "口语自然" }),
-      });
-      return (resp.translated_text ?? "").trim() || t;
-    } catch {
-      return t;
-    }
-  }
-
-  function buildBilibiliDesc(youtubeDesc: string, sourceUrl: string): string {
-    const src = (sourceUrl ?? "").trim();
-    const sourceLine = src ? `原视频：${src}` : "";
-    const maxLen = BILIBILI_DESC_MAX_CHARS;
-    let base = (youtubeDesc ?? "").trim();
-    if (sourceLine) base = base.replace(sourceLine, "").trim();
-    if (!sourceLine) return clampText(base, maxLen);
-    if (sourceLine.length >= maxLen) return clampText(sourceLine, maxLen);
-
-    const sep = base ? "\n\n" : "";
-    const avail = maxLen - sourceLine.length - sep.length;
-    if (base.length > avail) base = clampText(base, avail);
-    const out = base ? `${sourceLine}${sep}${base}` : sourceLine;
-    return out.length > maxLen ? clampText(out, maxLen) : out;
   }
 
   function flattenBiliTypeOptions(nodes: BiliTypeNode[] | null): Array<{ id: number; label: string }> {
@@ -315,6 +296,17 @@ export default function TaskDetailPage() {
     } catch {}
   }
 
+  function buildCurrentPublishMeta() {
+    const metaIn = JSON.parse(publishMetaText);
+    if (!metaIn || typeof metaIn !== "object" || Array.isArray(metaIn)) throw new Error("meta must be a JSON object");
+    const meta = { ...metaIn } as Record<string, unknown>;
+    if (publishTypeidMode === "meta") {
+      const tid = typeof publishTypeid === "number" ? publishTypeid : Number(publishTypeid);
+      if (Number.isFinite(tid) && tid > 0) meta.typeid = tid;
+    }
+    return meta;
+  }
+
   const fetchYouTubeMeta = useCallback(async () => {
     if (!taskId) return null;
     const resp = await fetchJson<YouTubeMetaActionResponse>(`${ORCHESTRATOR_URL}/tasks/${taskId}/actions/youtube_meta`, {
@@ -324,61 +316,18 @@ export default function TaskDetailPage() {
     return resp.metadata;
   }, [taskId]);
 
-  const fetchCachedYouTubeMeta = useCallback(async () => {
-    if (!taskId) return null;
-    try {
-      const meta = await fetchJson<YouTubeMeta>(`${ORCHESTRATOR_URL}/tasks/${taskId}/youtube_meta`);
-      setYoutubeMeta(meta);
-      return meta;
-    } catch (e: unknown) {
-      const msg = e instanceof Error ? e.message : String(e);
-      if (msg.startsWith("404 ")) return null;
-      throw e;
-    }
-  }, [taskId]);
-
   const savePublishMetaFile = useCallback(
     async (meta: any) => {
       if (!taskId) return;
       if (!meta || typeof meta !== "object" || Array.isArray(meta)) throw new Error("publish meta must be a JSON object");
-      await fetchJson(`${ORCHESTRATOR_URL}/tasks/${taskId}/publish_meta`, {
+      const resp = await fetchJson<PublishMetaStoreResponse>(`${ORCHESTRATOR_URL}/tasks/${taskId}/publish_meta`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(meta),
       });
+      if (resp.meta) applyLoadedPublishMeta(resp.meta);
     },
-    [taskId],
-  );
-
-  const applyYouTubeMetaToPublishMeta = useCallback(
-    async (yt: YouTubeMeta) => {
-      const sourceUrl = (task?.source_url ?? "").trim();
-      if (!sourceUrl) throw new Error("task.source_url is empty");
-
-      let metaIn: any;
-      try {
-        metaIn = JSON.parse(publishMetaText);
-      } catch {
-        throw new Error("publish meta is not valid JSON");
-      }
-      if (!metaIn || typeof metaIn !== "object" || Array.isArray(metaIn)) throw new Error("publish meta must be a JSON object");
-
-      const baseTitle = yt.title?.trim() || String(metaIn.title ?? "").trim() || "未命名";
-      const zhTitle = await translateTitleToZh(baseTitle);
-      const title = clampText(ensureShurouPrefix(zhTitle || baseTitle), 80) || "未命名";
-      const desc = buildBilibiliDesc(yt.description, sourceUrl);
-
-      const metaOut = {
-        ...metaIn,
-        title,
-        desc,
-        copyright: publishEnableReprint ? 2 : 1,
-        source: publishEnableReprint ? sourceUrl : "",
-      };
-      setPublishMetaText(JSON.stringify(metaOut, null, 2));
-      await savePublishMetaFile(metaOut);
-    },
-    [publishMetaText, task, openaiKeySet, translateStyle, publishEnableReprint, savePublishMetaFile],
+    [taskId, applyLoadedPublishMeta],
   );
 
   const isYouTubeTask = task?.source_type === "youtube" && !!(task.source_url ?? "").trim();
@@ -388,38 +337,10 @@ export default function TaskDetailPage() {
       const meta = JSON.parse(publishMetaText);
       const tid = Number((meta as any)?.typeid ?? (meta as any)?.tid ?? 0);
       if (Number.isFinite(tid) && tid > 0) setPublishTypeid(tid);
+      const copyright = Number((meta as any)?.copyright ?? 1);
+      setPublishEnableReprint(copyright === 2);
     } catch {}
   }, [publishMetaText]);
-
-  useEffect(() => {
-    if (!taskId) return;
-    if (!isYouTubeTask) return;
-    if (!didLoadPublishMetaFile) return;
-    if (didAutoFillPublishMeta) return;
-    if (!publishSettings?.default_meta) return;
-
-    const defaultText = JSON.stringify(publishSettings.default_meta ?? {}, null, 2);
-    if (publishMetaText !== defaultText) return;
-
-    (async () => {
-      try {
-        const yt = await fetchCachedYouTubeMeta();
-        if (yt) await applyYouTubeMetaToPublishMeta(yt);
-      } catch {
-      } finally {
-        setDidAutoFillPublishMeta(true);
-      }
-    })();
-  }, [
-    taskId,
-    isYouTubeTask,
-    publishSettings,
-    publishMetaText,
-    didAutoFillPublishMeta,
-    didLoadPublishMetaFile,
-    fetchCachedYouTubeMeta,
-    applyYouTubeMetaToPublishMeta,
-  ]);
 
   const rawAsset = useMemo(() => {
     const raws = (assets ?? []).filter((x) => x.kind === "video_raw");
@@ -491,12 +412,75 @@ export default function TaskDetailPage() {
     }
   }
 
+  async function runPublishReview() {
+    if (!taskId) return;
+    setReviewBusy(true);
+    setError(null);
+    try {
+      const meta = buildCurrentPublishMeta();
+      await savePublishMetaFile(meta);
+      const resp = await fetchJson<PublishReview>(`${ORCHESTRATOR_URL}/tasks/${taskId}/actions/publish_review`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ meta }),
+      });
+      setPublishReview(resp);
+      await refresh({ silent: true });
+    } catch (e: unknown) {
+      try {
+        await refresh({ silent: true });
+      } catch {}
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setReviewBusy(false);
+    }
+  }
+
+  async function submitPublish(opts?: { skipReview?: boolean }) {
+    if (!taskId) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const meta = buildCurrentPublishMeta();
+      await savePublishMetaFile(meta);
+      const resp = await fetchJson<PublishResponse>(`${ORCHESTRATOR_URL}/tasks/${taskId}/actions/publish`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          account_id: null,
+          video_key: publishVideoKey || null,
+          cover_key: publishCoverKey || null,
+          typeid_mode: publishTypeidMode,
+          meta: null,
+          skip_review: Boolean(opts?.skipReview),
+        }),
+      });
+      await refresh();
+      alert(`Publish state=${resp.state} bvid=${resp.bvid ?? "-"}`);
+    } catch (e: unknown) {
+      try {
+        await refresh({ silent: true });
+      } catch {}
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function submitSubtitleJob(opts: { resume: boolean }) {
     if (!taskId) return;
     setBusy(true);
     setError(null);
     try {
       if (!rawAsset && isYouTubeTask) {
+        const draftWasPristine = publishMetaText === loadedPublishMetaTextRef.current;
+        let metaForDraft: any = null;
+        if (draftWasPristine) {
+          try {
+            const parsed = JSON.parse(publishMetaText);
+            metaForDraft = parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : null;
+          } catch {}
+        }
         const resp = await fetchJson<YouTubeDownloadActionResponse>(`${ORCHESTRATOR_URL}/tasks/${taskId}/actions/youtube_download`, {
           method: "POST",
         });
@@ -505,9 +489,8 @@ export default function TaskDetailPage() {
           setPublishCoverKey(resp.cover_asset.storage_key);
           setDidAutoPickCover(true);
         }
-        if (publishSettings?.default_meta) {
-          const defaultText = JSON.stringify(publishSettings.default_meta ?? {}, null, 2);
-          if (publishMetaText === defaultText) await applyYouTubeMetaToPublishMeta(resp.metadata);
+        if (draftWasPristine) {
+          await generatePublishDraft("source", metaForDraft);
         }
         await refresh();
       }
@@ -589,14 +572,14 @@ export default function TaskDetailPage() {
       if (!silent) setLogError(null);
       if (!silent) setLogBusy(true);
       try {
-          const fetchTail = async (assetId: string, maxBytes: number) => {
-            const resp = await fetch(`${ORCHESTRATOR_URL}/tasks/${taskId}/assets/${assetId}/stream`, {
-              headers: { Range: `bytes=-${maxBytes}` },
-              credentials: "include",
-            });
-            if (!resp.ok) throw new Error(`日志获取失败：${resp.status} ${resp.statusText}`);
-            return await resp.text();
-          };
+        const fetchTail = async (assetId: string, maxBytes: number) => {
+          const resp = await fetch(`${ORCHESTRATOR_URL}/tasks/${taskId}/assets/${assetId}/stream`, {
+            headers: { Range: `bytes=-${maxBytes}` },
+            credentials: "include",
+          });
+          if (!resp.ok) throw new Error(`日志获取失败：${resp.status} ${resp.statusText}`);
+          return await resp.text();
+        };
 
         const maxBytes = 200_000;
         if (logSelection === "combined") {
@@ -640,6 +623,14 @@ export default function TaskDetailPage() {
     setLogSelection("combined");
   }, [logSelection, selectedLogAsset]);
 
+  const logSnapshotKey = [
+    logSelection,
+    latestYouTubeDownloadLog?.id ?? "",
+    latestSubtitleLog?.id ?? "",
+    latestRenderLog?.id ?? "",
+    selectedLogAsset?.id ?? "",
+  ].join("|");
+
   useEffect(() => {
     if (!isYouTubeTask) return;
     if (didAutoPickCover) return;
@@ -651,6 +642,12 @@ export default function TaskDetailPage() {
 
   useEffect(() => {
     if (!taskId) return;
+    if (shouldPoll) return;
+    void loadLogs({ silent: true });
+  }, [taskId, shouldPoll, logSnapshotKey, loadLogs]);
+
+  useEffect(() => {
+    if (!taskId) return;
     if (!shouldPoll) return;
 
     let cancelled = false;
@@ -658,54 +655,24 @@ export default function TaskDetailPage() {
 
     const tick = async () => {
       if (cancelled) return;
-      await refresh({ silent: true });
-      if (cancelled) return;
-      timer = window.setTimeout(tick, 1500);
-    };
-
-    tick();
-    return () => {
-      cancelled = true;
-      if (timer) window.clearTimeout(timer);
-    };
-  }, [taskId, shouldPoll, refresh]);
-
-  useEffect(() => {
-    if (!taskId) return;
-    if (!hasQueuedSubtitleJob) return;
-
-    let cancelled = false;
-    let timer: number | undefined;
-
-    const kick = async () => {
-      if (cancelled) return;
-      const now = Date.now();
-      if (now - (lastQueueKickAtRef.current || 0) > 10_000) {
-        lastQueueKickAtRef.current = now;
-        fetchJson(`${SUBTITLE_SERVICE_URL}/subtitle/task_queue/tick`, { method: "POST" }).catch(() => {});
+      const plan = createTaskDetailPollPlan({
+        shouldPoll,
+        hasQueuedSubtitleJob,
+        lastQueueKickAt: lastQueueKickAtRef.current || 0,
+        now: Date.now(),
+      });
+      const jobs: Array<Promise<unknown>> = [];
+      if (plan.shouldRefreshTask) jobs.push(refresh({ silent: true }));
+      if (plan.shouldLoadLogs) jobs.push(loadLogs({ silent: true }));
+      if (plan.shouldKickQueue) {
+        lastQueueKickAtRef.current = Date.now();
+        jobs.push(fetchJson(`${SUBTITLE_SERVICE_URL}/subtitle/task_queue/tick`, { method: "POST" }).catch(() => null));
       }
+      await Promise.allSettled(jobs);
       if (cancelled) return;
-      timer = window.setTimeout(kick, 2000);
-    };
-
-    kick();
-    return () => {
-      cancelled = true;
-      if (timer) window.clearTimeout(timer);
-    };
-  }, [taskId, hasQueuedSubtitleJob]);
-
-  useEffect(() => {
-    if (!taskId) return;
-
-    let cancelled = false;
-    let timer: number | undefined;
-
-    const tick = async () => {
-      if (cancelled) return;
-      await loadLogs({ silent: true });
-      if (cancelled) return;
-      if (shouldPoll) timer = window.setTimeout(tick, 2000);
+      if (plan.nextDelayMs !== null) {
+        timer = window.setTimeout(tick, plan.nextDelayMs);
+      }
     };
 
     tick();
@@ -713,7 +680,7 @@ export default function TaskDetailPage() {
       cancelled = true;
       if (timer) window.clearTimeout(timer);
     };
-  }, [taskId, shouldPoll, loadLogs]);
+  }, [taskId, shouldPoll, hasQueuedSubtitleJob, refresh, loadLogs]);
 
   if (!taskId) return null;
 
@@ -747,6 +714,12 @@ export default function TaskDetailPage() {
               </div>
               <div className="mt-1 break-all text-xs text-slate-600">{task.source_url ?? "-"}</div>
             </div>
+          </div>
+        ) : null}
+        {task?.error_message ? (
+          <div className="mt-3 rounded border border-amber-200 bg-amber-50 p-3 text-sm text-amber-900">
+            <div className="text-xs text-amber-700">Task Message</div>
+            <div className="mt-1 whitespace-pre-wrap break-words">{task.error_message}</div>
           </div>
         ) : null}
       </div>
@@ -785,6 +758,14 @@ export default function TaskDetailPage() {
                 setBusy(true);
                 setError(null);
                 try {
+                  const draftWasPristine = publishMetaText === loadedPublishMetaTextRef.current;
+                  let metaForDraft: any = null;
+                  if (draftWasPristine) {
+                    try {
+                      const parsed = JSON.parse(publishMetaText);
+                      metaForDraft = parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : null;
+                    } catch {}
+                  }
                   const resp = await fetchJson<YouTubeDownloadActionResponse>(`${ORCHESTRATOR_URL}/tasks/${taskId}/actions/youtube_download`, {
                     method: "POST",
                   });
@@ -793,9 +774,8 @@ export default function TaskDetailPage() {
                     setPublishCoverKey(resp.cover_asset.storage_key);
                     setDidAutoPickCover(true);
                   }
-                  if (publishSettings?.default_meta) {
-                    const defaultText = JSON.stringify(publishSettings.default_meta ?? {}, null, 2);
-                    if (publishMetaText === defaultText) await applyYouTubeMetaToPublishMeta(resp.metadata);
+                  if (draftWasPristine) {
+                    await generatePublishDraft("source", metaForDraft);
                   }
                   await refresh();
                 } catch (e: unknown) {
@@ -1287,20 +1267,65 @@ export default function TaskDetailPage() {
           </label>
         </div>
 
+        <div className="mt-3 rounded border p-3">
+          <div className="text-xs text-slate-500">AI 审核</div>
+          {!publishReview ? <div className="mt-2 text-sm text-slate-500">加载中…</div> : null}
+          {publishReview ? (
+            <>
+              <div className="mt-2 text-sm text-slate-800">
+                状态：
+                {!publishReview.enabled
+                  ? "未启用"
+                  : !publishReview.checked
+                    ? "未执行"
+                    : publishReview.ok
+                      ? "通过"
+                      : "不通过"}
+              </div>
+              {publishReview.checked_at ? (
+                <div className="mt-1 text-xs text-slate-500">最近审核：{new Date(publishReview.checked_at).toLocaleString()}</div>
+              ) : null}
+              {publishReview.reason ? (
+                <div
+                  className={`mt-2 whitespace-pre-wrap break-words text-xs ${publishReview.ok ? "text-emerald-700" : "text-rose-700"}`}
+                >
+                  {publishReview.reason}
+                </div>
+              ) : null}
+              {publishReview.matched_blocked_words.length > 0 ? (
+                <div className="mt-2 text-xs text-rose-700">命中违禁词：{publishReview.matched_blocked_words.join("、")}</div>
+              ) : null}
+              {publishReview.risk_tags.length > 0 ? (
+                <div className="mt-2 text-xs text-slate-500">风险标签：{publishReview.risk_tags.join("、")}</div>
+              ) : null}
+              {publishReview.subtitle_chars > 0 ? (
+                <div className="mt-2 text-xs text-slate-500">本次审核使用字幕字符数：{publishReview.subtitle_chars}</div>
+              ) : null}
+              <div className="mt-3 flex flex-wrap items-center gap-2">
+                <button
+                  disabled={busy || reviewBusy}
+                  className="rounded border px-3 py-2 text-sm hover:bg-slate-50 disabled:opacity-50"
+                  onClick={runPublishReview}
+                >
+                  {reviewBusy ? "审核中…" : "执行审核"}
+                </button>
+              </div>
+            </>
+          ) : null}
+        </div>
+
         <div className="mt-3">
           <div className="mb-1 flex items-center justify-between gap-2 text-xs text-slate-600">
             <div>meta.json</div>
             <div className="flex items-center gap-2">
               <button
-                disabled={busy || !publishSettings?.default_meta}
+                disabled={busy}
                 className="rounded border px-2 py-1 text-xs hover:bg-slate-50 disabled:opacity-50"
                 onClick={async () => {
                   setBusy(true);
                   setError(null);
                   try {
-                    const meta = publishSettings?.default_meta ?? {};
-                    setPublishMetaText(JSON.stringify(meta, null, 2));
-                    await savePublishMetaFile(meta);
+                    await generatePublishDraft("default");
                   } catch (e: unknown) {
                     setError(e instanceof Error ? e.message : String(e));
                   } finally {
@@ -1317,9 +1342,16 @@ export default function TaskDetailPage() {
                   setBusy(true);
                   setError(null);
                   try {
+                    let metaIn: any;
+                    try {
+                      metaIn = JSON.parse(publishMetaText);
+                    } catch {
+                      throw new Error("publish meta is not valid JSON");
+                    }
+                    if (!metaIn || typeof metaIn !== "object" || Array.isArray(metaIn)) throw new Error("publish meta must be a JSON object");
                     const yt = youtubeMeta ?? (await fetchYouTubeMeta());
                     if (!yt) throw new Error("failed to fetch youtube metadata");
-                    await applyYouTubeMetaToPublishMeta(yt);
+                    await generatePublishDraft("source", metaIn);
                   } catch (e: unknown) {
                     setError(e instanceof Error ? e.message : String(e));
                   } finally {
@@ -1374,60 +1406,20 @@ export default function TaskDetailPage() {
         <div className="mt-3 flex items-center gap-2">
           <button
             disabled={busy}
-            onClick={async () => {
-              setBusy(true);
-              setError(null);
-              try {
-                const metaIn = JSON.parse(publishMetaText);
-                if (!metaIn || typeof metaIn !== "object" || Array.isArray(metaIn)) throw new Error("meta must be a JSON object");
-                const meta =
-                  publishSettings?.default_meta && typeof publishSettings.default_meta === "object" && !Array.isArray(publishSettings.default_meta)
-                    ? { ...publishSettings.default_meta, ...metaIn }
-                    : metaIn;
-                if (publishTypeidMode === "meta") {
-                  const tid = typeof publishTypeid === "number" ? publishTypeid : Number(publishTypeid);
-                  if (Number.isFinite(tid) && tid > 0) meta.typeid = tid;
-                }
-                if (publishEnableReprint) {
-                  meta.copyright = 2;
-                  const src = String(meta?.source ?? "").trim() || String(task?.source_url ?? "").trim();
-                  if (src) meta.source = src;
-                } else {
-                  meta.copyright = 1;
-                  meta.source = "";
-                }
-                if (isYouTubeTask) {
-                  const srcUrl = String(task?.source_url ?? "").trim();
-                  if (srcUrl && typeof meta?.desc === "string") meta.desc = buildBilibiliDesc(meta.desc, srcUrl);
-                }
-                if (typeof meta?.desc === "string" && meta.desc.length > BILIBILI_DESC_MAX_CHARS) {
-                  meta.desc = clampText(meta.desc, BILIBILI_DESC_MAX_CHARS);
-                }
-                if (typeof meta?.title === "string" && meta.title.length > 80) meta.title = clampText(meta.title, 80);
-                await savePublishMetaFile(meta);
-                const resp = await fetchJson<PublishResponse>(`${ORCHESTRATOR_URL}/tasks/${taskId}/actions/publish`, {
-                  method: "POST",
-                  headers: { "Content-Type": "application/json" },
-                  body: JSON.stringify({
-                    account_id: null,
-                    video_key: publishVideoKey || null,
-                    cover_key: publishCoverKey || null,
-                    typeid_mode: publishTypeidMode,
-                    meta: null,
-                  }),
-                });
-                await refresh();
-                alert(`Publish state=${resp.state} bvid=${resp.bvid ?? "-"}`);
-              } catch (e: unknown) {
-                setError(e instanceof Error ? e.message : String(e));
-              } finally {
-                setBusy(false);
-              }
-            }}
+            onClick={() => submitPublish()}
             className="rounded bg-slate-900 px-3 py-2 text-sm text-white hover:bg-slate-800 disabled:opacity-50"
           >
             投稿
           </button>
+          {publishReview?.enabled && publishReview.ok === false ? (
+            <button
+              disabled={busy}
+              onClick={() => submitPublish({ skipReview: true })}
+              className="rounded border border-amber-300 px-3 py-2 text-sm text-amber-800 hover:bg-amber-50 disabled:opacity-50"
+            >
+              忽略审核并投稿
+            </button>
+          ) : null}
           <Link to="/tasks" className="rounded border px-3 py-2 text-sm hover:bg-slate-50">
             返回列表
           </Link>

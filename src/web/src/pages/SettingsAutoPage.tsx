@@ -358,6 +358,9 @@ export default function SettingsAutoPage() {
           <div className="mt-2 text-xs text-slate-500">
             投稿 meta 的默认值（标题/简介/tags 等）请到 <Link className="underline" to="/settings/bilibili">Settings · Bilibili</Link> 配置；分区由上面的 “分区模式” 决定。
           </div>
+          <div className="mt-1 text-xs text-slate-500">
+            投稿前 AI 审核规则请到 <Link className="underline" to="/settings/review">Settings · Review</Link> 配置。
+          </div>
         </div>
 
         <div className="mt-3 flex flex-wrap items-center gap-2">
