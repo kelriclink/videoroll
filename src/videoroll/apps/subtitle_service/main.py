@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 import re
 import shutil
@@ -7,7 +8,7 @@ import tempfile
 import time
 import uuid
 import zipfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Generator
 
@@ -16,15 +17,18 @@ from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 
+from videoroll.ai.client import openai_chat_config_from_settings
+from videoroll.ai.service import translate_text_openai
 from videoroll.config import SubtitleServiceSettings, get_subtitle_settings
 from videoroll.db.base import Base
 from videoroll.db.auto_migrate import auto_migrate
-from videoroll.db.models import Asset, AssetKind, RenderJob, RenderJobStatus, SubtitleJob, SubtitleJobStatus, Task
+from videoroll.db.models import Asset, AssetKind, RenderJob, RenderJobStatus, SourceType, SubtitleJob, SubtitleJobStatus, Task, TaskStatus
 from videoroll.db.session import db_session, get_engine
 from videoroll.storage.s3 import S3Store
 from videoroll.apps.subtitle_service.schemas import (
     ASRDefaultsRead,
     ASRDefaultsUpdate,
+    IntelHardwareProbeRead,
     SubtitleJobCreate,
     SubtitleJobRead,
     SubtitleAutoProfileRead,
@@ -45,11 +49,20 @@ from videoroll.apps.subtitle_service.schemas import (
 )
 from videoroll.apps.subtitle_service.asr_settings_store import get_asr_settings, update_asr_settings
 from videoroll.apps.subtitle_service.auto_profile_store import get_auto_profile, update_auto_profile
+from videoroll.apps.subtitle_service.model_downloads import (
+    default_model_dir_name,
+    download_model_snapshot,
+    normalize_model_download_engine,
+)
 from videoroll.apps.subtitle_service.render_queue_store import get_task_queue_settings, update_task_queue_settings
 from videoroll.apps.subtitle_service.translate_settings_store import get_translate_settings, update_translate_settings
+from videoroll.apps.subtitle_service.worker_concurrency import sync_subtitle_worker_concurrency_for_task_queue_settings
 from videoroll.apps.subtitle_service.worker import TASK_QUEUE_LOCK_OWNER, celery_app
+from videoroll.utils.auto_youtube import parse_auto_youtube_created_by
 from videoroll.utils.cpu import process_cpu_count
-from videoroll.utils.hf_hub import configure_hf_hub_proxy
+from videoroll.utils.intel_gpu import detect_intel_hardware
+
+logger = logging.getLogger(__name__)
 
 
 def get_settings() -> SubtitleServiceSettings:
@@ -136,6 +149,12 @@ def get_subtitle_settings_view(settings: SubtitleServiceSettings = Depends(get_s
         fw_installed = True
     except Exception:
         fw_installed = False
+    try:
+        import openvino_genai  # type: ignore  # noqa: F401
+
+        ov_installed = True
+    except Exception:
+        ov_installed = False
     cpu_threads = int(getattr(settings, "whisper_cpu_threads", 0) or 0)
     num_workers = int(getattr(settings, "whisper_num_workers", 1) or 1)
     effective_threads = cpu_threads
@@ -148,12 +167,35 @@ def get_subtitle_settings_view(settings: SubtitleServiceSettings = Depends(get_s
         whisper_model_dir=settings.whisper_model_dir,
         whisper_device=settings.whisper_device,
         whisper_compute_type=settings.whisper_compute_type,
+        openvino_model=settings.openvino_model,
+        openvino_device=settings.openvino_device,
+        openvino_num_beams=int(settings.openvino_num_beams or 1),
+        openvino_max_new_tokens=int(settings.openvino_max_new_tokens or 448),
         whisper_cpu_threads=cpu_threads,
         whisper_num_workers=num_workers,
         whisper_cpu_threads_effective=int(effective_threads),
         whisper_num_workers_effective=int(effective_workers),
         faster_whisper_installed=fw_installed,
+        openvino_installed=ov_installed,
     )
+
+
+@app.get("/subtitle/hardware/intel", response_model=IntelHardwareProbeRead)
+def get_intel_hardware_view(settings: SubtitleServiceSettings = Depends(get_settings)) -> IntelHardwareProbeRead:
+    try:
+        info = detect_intel_hardware(settings.intel_gpu_render_device)
+    except Exception as e:
+        info = {
+            "checked": True,
+            "available": False,
+            "render_device": str(settings.intel_gpu_render_device or "").strip() or "/dev/dri/renderD128",
+            "model_name": None,
+            "driver": None,
+            "pci_slot": None,
+            "pci_id": None,
+            "detail": str(e),
+        }
+    return IntelHardwareProbeRead(**info)
 
 
 @app.get("/subtitle/asr/settings", response_model=ASRDefaultsRead)
@@ -242,8 +284,6 @@ def translate_test(
     settings: SubtitleServiceSettings = Depends(get_settings),
     db: Session = Depends(get_db),
 ) -> TranslateTestResponse:
-    from videoroll.apps.subtitle_service.processing import Segment, translate_segments_openai
-
     text = (payload.text or "").strip()
     if not text:
         raise HTTPException(status_code=400, detail="text is required")
@@ -252,22 +292,16 @@ def translate_test(
 
     try:
         cfg = get_translate_settings(db, settings)
-        translated = translate_segments_openai(
-            [Segment(start=0.0, end=1.0, text=text)],
+        translated = translate_text_openai(
+            text,
             target_lang=payload.target_lang,
             style=payload.style,
-            api_key=cfg["openai_api_key"],
-            base_url=cfg["openai_base_url"],
-            model=cfg["openai_model"],
-            temperature=cfg["openai_temperature"],
-            timeout_seconds=cfg["openai_timeout_seconds"],
-            batch_size=1,
-            enable_summary=cfg["default_enable_summary"],
+            config=openai_chat_config_from_settings(cfg),
         )
     except Exception as e:
         raise HTTPException(status_code=502, detail=str(e)) from e
 
-    return TranslateTestResponse(translated_text=translated[0].text if translated else "")
+    return TranslateTestResponse(translated_text=translated)
 
 
 @app.get("/subtitle/models", response_model=list[WhisperModelInfo])
@@ -292,56 +326,35 @@ def download_whisper_model(
     db: Session = Depends(get_db),
 ) -> WhisperModelInfo:
     try:
-        from huggingface_hub import snapshot_download  # type: ignore
+        engine = normalize_model_download_engine(payload.engine)
     except Exception as e:
-        raise HTTPException(status_code=400, detail="huggingface_hub not installed. Rebuild with INSTALL_ASR=1.") from e
-
-    size_to_repo = {
-        "tiny": "Systran/faster-whisper-tiny",
-        "base": "Systran/faster-whisper-base",
-        "small": "Systran/faster-whisper-small",
-        "medium": "Systran/faster-whisper-medium",
-        "large-v1": "Systran/faster-whisper-large-v1",
-        "large-v2": "Systran/faster-whisper-large-v2",
-        "large-v3": "Systran/faster-whisper-large-v3",
-    }
-
+        raise HTTPException(status_code=400, detail=str(e)) from e
     model = (payload.model or "").strip()
     if not model:
         raise HTTPException(status_code=400, detail="model is required")
-    repo_id = size_to_repo.get(model, model)
 
     name = payload.name
     if not name:
-        name = model.replace("/", "--")
+        try:
+            name = default_model_dir_name(engine, model)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
     name = _validate_model_name(name)
-
-    dest = _models_dir(settings) / name
-    tmp = dest.with_name(dest.name + ".downloading")
-    if dest.exists():
-        if not payload.force:
-            raise HTTPException(status_code=400, detail="model already exists; set force=true to overwrite")
-        shutil.rmtree(dest, ignore_errors=True)
 
     # Use the dedicated model-download proxy (stored in DB via Settings · ASR).
     asr_cfg = get_asr_settings(db, settings)
     proxy = str(asr_cfg.get("model_download_proxy") or "").strip() or None
-    configure_hf_hub_proxy(proxy)
-
-    shutil.rmtree(tmp, ignore_errors=True)
-    tmp.mkdir(parents=True, exist_ok=True)
     try:
-        try:
-            snapshot_download(repo_id=repo_id, revision=payload.revision, local_dir=str(tmp))
-        except TypeError:
-            # Backward-compatible with older huggingface_hub versions (no proxies/local_dir_use_symlinks kwarg).
-            snapshot_download(repo_id=repo_id, revision=payload.revision, local_dir=str(tmp))
-
-        shutil.rmtree(dest, ignore_errors=True)
-        tmp.replace(dest)
+        dest = download_model_snapshot(
+            engine=engine,
+            model=model,
+            model_dir=_models_dir(settings),
+            name=name,
+            revision=payload.revision,
+            force=payload.force,
+            proxy=proxy,
+        )
     except Exception as e:
-        shutil.rmtree(tmp, ignore_errors=True)
-        shutil.rmtree(dest, ignore_errors=True)
         raise HTTPException(status_code=502, detail=f"download failed: {type(e).__name__}: {e}") from e
 
     return WhisperModelInfo(name=name, path=str(dest), size_bytes=_dir_size_bytes(dest))
@@ -452,7 +465,12 @@ def test_model_download_proxy(
 
 @app.post("/subtitle/jobs")
 def create_job(payload: SubtitleJobCreate, db: Session = Depends(get_db)) -> dict[str, str]:
-    job = SubtitleJob(task_id=payload.task_id, request_json=payload.model_dump(mode="json"))
+    request_json = payload.model_dump(mode="json")
+    if "youtube_subtitle_mode" not in payload.model_fields_set:
+        request_json["youtube_subtitle_mode"] = "target" if payload.prefer_youtube_subtitles else "off"
+    request_json["prefer_youtube_subtitles"] = request_json.get("youtube_subtitle_mode") != "off"
+
+    job = SubtitleJob(task_id=payload.task_id, request_json=request_json)
     db.add(job)
     db.commit()
     db.refresh(job)
@@ -674,6 +692,32 @@ def _read_task_queue(db: Session, *, limit: int) -> TaskQueueRead:
     ):
         queued_task_ids.add(tid)
 
+    recoverable_pipeline_tasks: list[Task] = []
+    bootstrap_cutoff = now - timedelta(seconds=60)
+    for task in (
+        db.query(Task)
+        .filter(
+            Task.source_type == SourceType.youtube,
+            Task.status.in_([TaskStatus.ingested, TaskStatus.downloaded]),
+            unlocked,
+            Task.updated_at.is_not(None),
+            Task.updated_at < bootstrap_cutoff,
+        )
+        .order_by(Task.updated_at.asc(), Task.created_at.asc())
+        .limit(5000)
+        .all()
+    ):
+        if parse_auto_youtube_created_by(task.created_by) is None:
+            continue
+        has_jobs = (
+            db.query(SubtitleJob).filter(SubtitleJob.task_id == task.id).count()
+            + db.query(RenderJob).filter(RenderJob.task_id == task.id).count()
+        )
+        if has_jobs:
+            continue
+        recoverable_pipeline_tasks.append(task)
+        queued_task_ids.add(task.id)
+
     queued_count = len(queued_task_ids)
 
     remaining = max(0, limit - len(running_items))
@@ -721,6 +765,25 @@ def _read_task_queue(db: Session, *, limit: int) -> TaskQueueRead:
                 break
 
     fetch_n = min(5000, max(50, remaining * 20))
+    if len(queued_items) < remaining:
+        for task in recoverable_pipeline_tasks:
+            if task.id in seen:
+                continue
+            seen.add(task.id)
+            queued_items.append(
+                TaskQueueItemRead(
+                    task_id=task.id,
+                    state="queued",
+                    stage="recover_pipeline",
+                    progress=0,
+                    error_message=task.error_message,
+                    created_at=task.created_at,
+                    updated_at=task.updated_at,
+                )
+            )
+            if len(queued_items) >= remaining:
+                break
+
     if len(queued_items) < remaining:
         for sj in (
             db.query(SubtitleJob)
@@ -797,8 +860,20 @@ def get_render_queue_legacy(limit: int = 200, db: Session = Depends(get_db)) -> 
 @app.put("/subtitle/task_queue/settings", response_model=TaskQueueSettingsRead)
 def put_task_queue_settings_view(payload: TaskQueueSettingsUpdate, db: Session = Depends(get_db)) -> TaskQueueSettingsRead:
     cfg = update_task_queue_settings(db, payload.model_dump(exclude_unset=True))
+    runtime_sync = sync_subtitle_worker_concurrency_for_task_queue_settings(celery_app, cfg, queue="subtitle")
+    if not bool(runtime_sync.get("ok")):
+        logger.warning(
+            "subtitle worker concurrency runtime sync incomplete after task queue update: %s",
+            runtime_sync.get("detail"),
+        )
     celery_app.send_task("subtitle_service.task_queue_tick", args=[], queue="subtitle")
-    return TaskQueueSettingsRead(**cfg)
+    return TaskQueueSettingsRead(
+        **cfg,
+        runtime_worker_concurrency=runtime_sync.get("target_concurrency"),
+        runtime_sync_ok=bool(runtime_sync.get("ok")),
+        runtime_sync_detail=str(runtime_sync.get("detail") or "").strip() or None,
+        runtime_sync_workers=list(runtime_sync.get("workers") or []),
+    )
 
 
 @app.put("/subtitle/render_queue/settings", response_model=TaskQueueSettingsRead)

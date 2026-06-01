@@ -4,6 +4,7 @@ import StatusBadge from "../components/StatusBadge";
 import { fetchJson } from "../lib/http";
 import { ORCHESTRATOR_URL } from "../lib/urls";
 import { Asset, Task } from "../lib/types";
+import { formatBulkDeleteSummary, summarizeBulkDeleteResults } from "./videosPage.helpers";
 
 type ConvertedVideoItem = {
   task: Task;
@@ -12,15 +13,60 @@ type ConvertedVideoItem = {
   display_title?: string | null;
 };
 
+type WorkdirMaintenance = {
+  work_dir: string;
+  scanned_dirs: number;
+  reclaimable_dirs: number;
+  total_bytes: number;
+  reclaimable_bytes: number;
+  deleted_dirs: number;
+  deleted_bytes: number;
+  deleted_paths: string[];
+  errors: string[];
+};
+
 function fileNameFromKey(key: string): string {
   const parts = (key ?? "").split("/");
   return parts[parts.length - 1] || key || "-";
+}
+
+function formatBytes(value: number): string {
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let size = Math.max(0, Number(value || 0));
+  let unitIndex = 0;
+  while (size >= 1024 && unitIndex < units.length - 1) {
+    size /= 1024;
+    unitIndex += 1;
+  }
+  return `${size >= 100 || unitIndex === 0 ? size.toFixed(0) : size.toFixed(1)} ${units[unitIndex]}`;
+}
+
+function formatWorkdirSummary(result: WorkdirMaintenance, mode: "scan" | "cleanup"): string {
+  const parts: string[] = [];
+  if (mode === "scan") {
+    parts.push(
+      `临时目录扫描完成：共 ${result.scanned_dirs} 个目录，占用 ${formatBytes(result.total_bytes)}；可回收 ${result.reclaimable_dirs} 个，预计释放 ${formatBytes(result.reclaimable_bytes)}。`,
+    );
+  } else {
+    parts.push(
+      `临时目录清理完成：删除 ${result.deleted_dirs} 个目录，释放 ${formatBytes(result.deleted_bytes)}；当前仍可回收 ${result.reclaimable_dirs} 个，预计释放 ${formatBytes(result.reclaimable_bytes)}。`,
+    );
+  }
+  if (result.errors.length > 0) {
+    const preview = result.errors.slice(0, 2).join("；");
+    const suffix = result.errors.length > 2 ? `；其余 ${result.errors.length - 2} 条错误请查看日志。` : "";
+    parts.push(`错误：${preview}${suffix}`);
+  }
+  parts.push(`工作目录：${result.work_dir}`);
+  return parts.join(" ");
 }
 
 export default function VideosPage() {
   const [items, setItems] = useState<ConvertedVideoItem[] | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [deleteSummary, setDeleteSummary] = useState<string | null>(null);
+  const [maintenanceSummary, setMaintenanceSummary] = useState<string | null>(null);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const selectAllRef = useRef<HTMLInputElement | null>(null);
 
@@ -74,6 +120,47 @@ export default function VideosPage() {
             <button onClick={() => refresh()} className="rounded border px-3 py-2 text-sm hover:bg-slate-50">
               刷新
             </button>
+            <button
+              disabled={busy}
+              className="rounded border px-3 py-2 text-sm hover:bg-slate-50 disabled:opacity-50"
+              onClick={async () => {
+                setBusy(true);
+                setError(null);
+                setMaintenanceSummary(null);
+                try {
+                  const result = await fetchJson<WorkdirMaintenance>(`${ORCHESTRATOR_URL}/maintenance/workdir`);
+                  setMaintenanceSummary(formatWorkdirSummary(result, "scan"));
+                } catch (e: unknown) {
+                  setError(e instanceof Error ? e.message : String(e));
+                } finally {
+                  setBusy(false);
+                }
+              }}
+            >
+              扫描临时目录
+            </button>
+            <button
+              disabled={busy}
+              className="rounded border border-amber-300 px-3 py-2 text-sm text-amber-800 hover:bg-amber-50 disabled:opacity-50"
+              onClick={async () => {
+                if (!confirm("确定清理可安全回收的临时目录吗？不会删除运行中的任务目录。")) return;
+                setBusy(true);
+                setError(null);
+                setMaintenanceSummary(null);
+                try {
+                  const result = await fetchJson<WorkdirMaintenance>(`${ORCHESTRATOR_URL}/maintenance/workdir/cleanup`, {
+                    method: "POST",
+                  });
+                  setMaintenanceSummary(formatWorkdirSummary(result, "cleanup"));
+                } catch (e: unknown) {
+                  setError(e instanceof Error ? e.message : String(e));
+                } finally {
+                  setBusy(false);
+                }
+              }}
+            >
+              清理临时目录
+            </button>
             <label className="flex items-center gap-2 rounded border px-3 py-2 text-sm text-slate-700 hover:bg-slate-50">
               <input
                 ref={selectAllRef}
@@ -98,14 +185,28 @@ export default function VideosPage() {
                 if (!confirm(`确定删除选中的 ${selectedCount} 个最终视频（video_final）吗？`)) return;
                 setBusy(true);
                 setError(null);
+                setDeleteSummary(null);
                 try {
-                  for (const it of items) {
-                    if (!selected.has(it.final_asset.id)) continue;
-                    await fetchJson(`${ORCHESTRATOR_URL}/tasks/${it.task.id}/assets/${it.final_asset.id}`, {
-                      method: "DELETE",
-                    });
-                  }
-                  setSelected(new Set());
+                  const targets = items
+                    .filter((it) => selected.has(it.final_asset.id))
+                    .map((it) => ({
+                      assetId: it.final_asset.id,
+                      label: it.display_title?.trim() || fileNameFromKey(it.final_asset.storage_key),
+                      taskId: it.task.id,
+                    }));
+                  const results = await Promise.allSettled(
+                    targets.map((target) =>
+                      fetchJson(`${ORCHESTRATOR_URL}/tasks/${target.taskId}/assets/${target.assetId}`, {
+                        method: "DELETE",
+                      }),
+                    ),
+                  );
+                  const summary = summarizeBulkDeleteResults(
+                    targets.map(({ assetId, label }) => ({ assetId, label })),
+                    results,
+                  );
+                  setDeleteSummary(formatBulkDeleteSummary(summary));
+                  setSelected(new Set(summary.failures.map((failure) => failure.assetId)));
                   await refresh();
                 } catch (e: unknown) {
                   setError(e instanceof Error ? e.message : String(e));
@@ -122,6 +223,8 @@ export default function VideosPage() {
           </div>
         </div>
         {error ? <div className="mt-3 text-sm text-rose-700">{error}</div> : null}
+        {deleteSummary ? <div className="mt-3 text-sm text-slate-700">{deleteSummary}</div> : null}
+        {maintenanceSummary ? <div className="mt-3 text-sm text-slate-700">{maintenanceSummary}</div> : null}
       </div>
 
       <div className="rounded border bg-white p-4">
@@ -210,6 +313,7 @@ export default function VideosPage() {
                             if (!confirm("确定删除这个最终视频（video_final）吗？")) return;
                             setBusy(true);
                             setError(null);
+                            setDeleteSummary(null);
                             try {
                               await fetchJson(`${ORCHESTRATOR_URL}/tasks/${it.task.id}/assets/${it.final_asset.id}`, {
                                 method: "DELETE",

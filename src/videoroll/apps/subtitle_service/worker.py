@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import shutil
+import tempfile
 import threading
 import time
 import traceback
@@ -19,6 +20,8 @@ from celery.signals import worker_init
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
+from videoroll.ai.client import openai_chat_config_from_settings
+from videoroll.ai.service import generate_bilibili_tags_openai, translate_text_openai
 from videoroll.config import get_subtitle_settings
 from videoroll.db.base import Base
 from videoroll.db.auto_migrate import auto_migrate
@@ -28,6 +31,7 @@ from videoroll.db.models import (
     AssetKind,
     RenderJob,
     RenderJobStatus,
+    SourceType,
     Subtitle,
     SubtitleFormat,
     SubtitleJob,
@@ -38,21 +42,25 @@ from videoroll.db.models import (
 from videoroll.db.session import get_engine, get_sessionmaker
 from videoroll.storage.s3 import S3Store
 from videoroll.utils.internal_api_token import internal_api_token
+from videoroll.utils.auto_youtube import parse_auto_youtube_created_by
 from videoroll.utils.hashing import sha256_file
+from videoroll.utils.task_queue import available_task_queue_capacity, task_queue_slot_reserved_for
 from videoroll.apps.orchestrator_api.admin_auth_store import INTERNAL_TOKEN_HEADER
 from videoroll.apps.subtitle_service.processing import (
     Segment,
+    convert_subtitle_to_srt,
     extract_audio,
-    generate_bilibili_tags_openai,
     mux_soft_sub,
     probe_video_resolution,
     render_burn_in,
     srt_to_segments,
+    segments_from_json_data,
     segments_to_ass,
+    segments_to_json_data,
     segments_to_srt,
     transcribe_faster_whisper,
     transcribe_mock,
-    translate_segments_openai,
+    transcribe_openvino_whisper,
     translate_segments_openai_with_summary,
     translate_segments_mock,
     write_json,
@@ -60,15 +68,27 @@ from videoroll.apps.subtitle_service.processing import (
 from videoroll.apps.subtitle_service.asr_settings_store import get_asr_settings
 from videoroll.apps.subtitle_service.auto_profile_store import get_auto_profile
 from videoroll.apps.subtitle_service.bilibili_tags_store import set_task_bilibili_tags
+from videoroll.apps.subtitle_service.model_downloads import (
+    default_model_dir_name,
+    download_model_snapshot,
+    resolve_model_repo_id,
+)
 from videoroll.apps.subtitle_service.task_title_store import set_task_titles
 from videoroll.apps.subtitle_service.translate_settings_store import get_translate_settings
-from videoroll.apps.bilibili_publisher.publish_settings_store import get_bilibili_publish_settings
-from videoroll.apps.bilibili_publisher.constants import BILIBILI_DESC_MAX_CHARS
+from videoroll.apps.publish_meta_draft import apply_publish_source_overrides, default_publish_meta
+from videoroll.apps.orchestrator_api.youtube_downloader import (
+    download_youtube_subtitle,
+    extract_youtube_metadata,
+    normalize_youtube_subtitle_mode,
+    pick_preferred_youtube_subtitle,
+)
 from videoroll.apps.subtitle_service.render_queue_store import TASK_QUEUE_SETTINGS_KEY, get_task_queue_settings
+from videoroll.apps.youtube_settings_store import (
+    get_youtube_cookies_txt,
+    get_youtube_settings,
+    normalize_and_validate_netscape_cookies_txt,
+)
 from videoroll.utils.cpu import process_cpu_count
-from videoroll.utils.hf_hub import configure_hf_hub_proxy
-
-
 settings = get_subtitle_settings()
 _ORCH_INTERNAL_TOKEN = internal_api_token(settings.s3_secret_access_key)
 _ORCH_INTERNAL_HEADERS = {INTERNAL_TOKEN_HEADER: _ORCH_INTERNAL_TOKEN} if _ORCH_INTERNAL_TOKEN else {}
@@ -84,17 +104,6 @@ celery_app.conf.update(
     enable_utc=True,
 )
 
-_SIZE_TO_REPO: dict[str, str] = {
-    "tiny": "Systran/faster-whisper-tiny",
-    "base": "Systran/faster-whisper-base",
-    "small": "Systran/faster-whisper-small",
-    "medium": "Systran/faster-whisper-medium",
-    "large-v1": "Systran/faster-whisper-large-v1",
-    "large-v2": "Systran/faster-whisper-large-v2",
-    "large-v3": "Systran/faster-whisper-large-v3",
-}
-
-
 def _resolve_faster_whisper_model(model_name: str, model_dir: Path, *, proxy: str | None = None) -> str:
     model_name = (model_name or "").strip()
     if not model_name:
@@ -106,8 +115,8 @@ def _resolve_faster_whisper_model(model_name: str, model_dir: Path, *, proxy: st
         return str(p)
 
     # Prefer our persisted models dir so downloads survive container rebuilds.
-    repo_id = _SIZE_TO_REPO.get(model_name, model_name)
-    local_name = model_name if model_name in _SIZE_TO_REPO else model_name.replace("/", "--")
+    repo_id = resolve_model_repo_id("faster-whisper", model_name)
+    local_name = default_model_dir_name("faster-whisper", model_name)
     dest = model_dir / local_name
     if dest.exists():
         return str(dest)
@@ -117,23 +126,15 @@ def _resolve_faster_whisper_model(model_name: str, model_dir: Path, *, proxy: st
     except Exception:
         # Fall back to faster-whisper's own downloader/cache.
         return repo_id
-
-    configure_hf_hub_proxy(proxy)
-
-    model_dir.mkdir(parents=True, exist_ok=True)
-
-    tmp = dest.with_name(dest.name + ".downloading")
-    shutil.rmtree(tmp, ignore_errors=True)
-    tmp.mkdir(parents=True, exist_ok=True)
     try:
-        try:
-            snapshot_download(repo_id=repo_id, local_dir=str(tmp))
-        except TypeError:
-            snapshot_download(repo_id=repo_id, local_dir=str(tmp))
-        shutil.rmtree(dest, ignore_errors=True)
-        tmp.replace(dest)
+        dest = download_model_snapshot(
+            engine="faster-whisper",
+            model=model_name,
+            model_dir=model_dir,
+            name=local_name,
+            proxy=proxy,
+        )
     except Exception as e:
-        shutil.rmtree(tmp, ignore_errors=True)
         raise RuntimeError(
             f"failed to download whisper model '{repo_id}' into '{dest}'. "
             "Open Settings → ASR/Whisper to download it first, or set asr.model to an existing path. "
@@ -141,6 +142,39 @@ def _resolve_faster_whisper_model(model_name: str, model_dir: Path, *, proxy: st
         ) from e
 
     return str(dest)
+
+
+def _resolve_openvino_model(model_name: str, model_dir: Path, *, proxy: str | None = None) -> str:
+    model_name = (model_name or "").strip()
+    if not model_name:
+        raise RuntimeError(
+            "OpenVINO ASR model is empty. Set SUBTITLE_OPENVINO_MODEL, or save default_model in Settings → ASR/Whisper, "
+            "or pass asr.model with an exported OpenVINO Whisper model directory."
+        )
+
+    p = Path(model_name)
+    if p.exists():
+        return str(p)
+
+    candidate = model_dir / default_model_dir_name("openvino", model_name)
+    if candidate.exists():
+        return str(candidate)
+
+    try:
+        dest = download_model_snapshot(
+            engine="openvino",
+            model=model_name,
+            model_dir=model_dir,
+            name=default_model_dir_name("openvino", model_name),
+            proxy=proxy,
+        )
+        return str(dest)
+    except Exception as e:
+        raise RuntimeError(
+            f"failed to download OpenVINO Whisper model '{model_name}' into '{candidate}'. "
+            "Open Settings → ASR/Whisper to download it first, or set asr.model to an existing path. "
+            f"detail={type(e).__name__}: {e}"
+        ) from e
 
 
 def _db() -> Session:
@@ -186,6 +220,50 @@ def _task_queue_unlock(task: Task) -> None:
     task.lock_until = None
 
 
+def _build_after_render_publish_action(
+    *,
+    task_id: uuid.UUID,
+    cover_key: str | None,
+    profile: dict[str, Any],
+    yt_title: str,
+    yt_desc: str,
+    webpage_url: str,
+    yt_uploader: str = "",
+    db: Session,
+    store: S3Store,
+) -> dict[str, Any] | None:
+    if not profile.get("auto_publish"):
+        return None
+
+    meta = default_publish_meta(db)
+    translate_settings = get_translate_settings(db, settings)
+    meta = apply_publish_source_overrides(
+        meta,
+        source_title=yt_title,
+        source_description=yt_desc,
+        source_url=webpage_url,
+        source_uploader=yt_uploader,
+        profile=profile,
+        translate_settings=translate_settings,
+    )
+
+    publish_meta_key = f"meta/{task_id}/publish_meta.json"
+    store.put_bytes(
+        json.dumps(meta, ensure_ascii=False, indent=2).encode("utf-8"),
+        publish_meta_key,
+        content_type="application/json",
+    )
+
+    publish_payload = {
+        "account_id": None,
+        "video_key": None,
+        "cover_key": cover_key,
+        "typeid_mode": profile.get("publish_typeid_mode") or "ai_summary",
+        "meta": None,
+    }
+    return {"publish": True, "publish_payload": publish_payload}
+
+
 def _task_queue_join_message(message: str | None, detail: str, *, limit: int = 2000) -> str:
     head = str(message or "").strip()
     tail = str(detail or "").strip()
@@ -210,6 +288,22 @@ def _task_queue_lock_settings_row(db: Session) -> None:
         db.commit()
     # Best-effort lock (ignored on dialects that don't support it).
     db.query(AppSetting).filter(AppSetting.key == TASK_QUEUE_SETTINGS_KEY).with_for_update().first()
+
+
+def _task_has_queued_or_running_jobs(db: Session, task_id: uuid.UUID) -> bool:
+    subtitle_jobs = (
+        db.query(SubtitleJob)
+        .filter(SubtitleJob.task_id == task_id, SubtitleJob.status.in_([SubtitleJobStatus.queued, SubtitleJobStatus.running]))
+        .count()
+    )
+    if int(subtitle_jobs or 0) > 0:
+        return True
+    render_jobs = (
+        db.query(RenderJob)
+        .filter(RenderJob.task_id == task_id, RenderJob.status.in_([RenderJobStatus.queued, RenderJobStatus.running]))
+        .count()
+    )
+    return bool(int(render_jobs or 0) > 0)
 
 
 class _TaskQueueHeartbeat:
@@ -290,6 +384,15 @@ def _safe_upload_log(store: S3Store, log_path: Path | None, log_key: str | None)
         pass
 
 
+def _cleanup_local_work_root(path: Path | None) -> None:
+    if path is None:
+        return
+    try:
+        shutil.rmtree(path, ignore_errors=True)
+    except Exception:
+        pass
+
+
 def _seed_log_from_store(store: S3Store, log_key: str, log_path: Path) -> None:
     try:
         if log_path.exists() and log_path.stat().st_size > 0:
@@ -321,37 +424,6 @@ def _has_cjk(text: str) -> bool:
     return bool(_CJK_RE.search(text or ""))
 
 
-def _clamp_text(text: str, max_len: int) -> str:
-    s = (text or "").strip()
-    if len(s) <= max_len:
-        return s
-    if max_len <= 1:
-        return s[:max_len]
-    return s[: max_len - 1] + "…"
-
-
-def _build_bilibili_desc(youtube_desc: str, source_url: str) -> str:
-    src = (source_url or "").strip()
-    source_line = f"原视频：{src}" if src else ""
-    max_len = BILIBILI_DESC_MAX_CHARS
-
-    base = (youtube_desc or "").strip()
-    if source_line:
-        base = base.replace(source_line, "").strip()
-
-    if not source_line:
-        return _clamp_text(base, max_len)
-    if len(source_line) >= max_len:
-        return _clamp_text(source_line, max_len)
-
-    sep = "\n\n" if base else ""
-    avail = max_len - len(source_line) - len(sep)
-    if len(base) > avail:
-        base = _clamp_text(base, avail)
-    out = f"{source_line}{sep}{base}" if base else source_line
-    return _clamp_text(out, max_len)
-
-
 def _translate_title_openai(
     title: str,
     *,
@@ -363,21 +435,15 @@ def _translate_title_openai(
         return title
     if not translate_settings.get("openai_api_key"):
         return title
-    translated = translate_segments_openai(
-        [Segment(start=0.0, end=1.0, text=title)],
-        target_lang=target_lang,
-        style=style,
-        api_key=translate_settings.get("openai_api_key"),
-        base_url=translate_settings.get("openai_base_url"),
-        model=translate_settings.get("openai_model"),
-        temperature=float(translate_settings.get("openai_temperature") or 0.2),
-        timeout_seconds=float(translate_settings.get("openai_timeout_seconds") or 180.0),
-        batch_size=1,
-        enable_summary=False,
-    )
-    if not translated:
+    try:
+        return translate_text_openai(
+            title,
+            target_lang=target_lang,
+            style=style,
+            config=openai_chat_config_from_settings(translate_settings),
+        )
+    except Exception:
         return title
-    return str(translated[0].text or "").strip() or title
 
 
 def _read_s3_bytes(store: S3Store, key: str) -> bytes:
@@ -392,6 +458,115 @@ def _read_s3_bytes(store: S3Store, key: str) -> bytes:
             body.close()
         except Exception:
             pass
+
+
+def _effective_subtitle_worker_youtube_settings(db: Session, *, cookie_dir: Path | None = None) -> Any:
+    cfg = get_youtube_settings(db, default_proxy=settings.youtube_proxy)
+    proxy = str(cfg.get("proxy") or "").strip()
+    cookies_enabled = bool(cfg.get("cookies_enabled"))
+
+    cookie_file = str(getattr(settings, "youtube_cookie_file", "") or "").strip() or None
+    if cookie_file:
+        try:
+            if not Path(cookie_file).is_file() and cookie_dir is not None and cookies_enabled:
+                cookie_file = None
+        except Exception:
+            pass
+
+    if not cookie_file and cookie_dir is not None and cookies_enabled:
+        cookies_txt = get_youtube_cookies_txt(db)
+        if cookies_txt:
+            cookies_txt = normalize_and_validate_netscape_cookies_txt(cookies_txt)
+            try:
+                cookie_dir.mkdir(parents=True, exist_ok=True)
+                cookie_path = cookie_dir / "youtube_cookies.txt"
+                cookie_path.write_text(cookies_txt, encoding="utf-8")
+                try:
+                    os.chmod(cookie_path, 0o600)
+                except Exception:
+                    pass
+                cookie_file = str(cookie_path)
+            except Exception:
+                cookie_file = None
+
+    return settings.model_copy(update={"youtube_proxy": proxy or None, "youtube_cookie_file": cookie_file})
+
+
+def _download_youtube_subtitle_segments(
+    *,
+    task: Task,
+    db: Session,
+    work_root: Path,
+    log_path: Path | None,
+    log_key: str | None,
+    store: S3Store,
+    target_lang: str,
+    youtube_subtitle_mode: str,
+) -> tuple[list[Segment] | None, dict[str, str] | None]:
+    normalized_mode = normalize_youtube_subtitle_mode(youtube_subtitle_mode)
+    if task.source_type != SourceType.youtube or normalized_mode == "off":
+        return None, None
+
+    source_url = str(task.source_url or "").strip()
+    if not source_url:
+        return None, None
+
+    _safe_append_log_line(log_path, f"youtube subtitles: probing mode={normalized_mode} target_lang={target_lang or 'zh'}")
+    _safe_upload_log(store, log_path, log_key)
+
+    try:
+        with tempfile.TemporaryDirectory(prefix="ytsub_", dir=str(work_root)) as tmp:
+            tmp_dir = Path(tmp)
+            yt_settings = _effective_subtitle_worker_youtube_settings(db, cookie_dir=tmp_dir)
+            started_at = time.monotonic()
+            _safe_append_log_line(log_path, "youtube subtitles: fetching metadata via yt-dlp")
+            _safe_upload_log(store, log_path, log_key)
+            info, _meta = extract_youtube_metadata(
+                source_url,
+                yt_settings,
+                extractor_args_override={"youtube": {"skip": ["translated_subs"]}},
+            )
+            _safe_append_log_line(log_path, f"youtube subtitles: metadata fetched in {time.monotonic() - started_at:.1f}s")
+            _safe_upload_log(store, log_path, log_key)
+            selection = pick_preferred_youtube_subtitle(info, target_lang=target_lang, mode=normalized_mode)
+            if selection is None:
+                if normalized_mode == "auto_source":
+                    _safe_append_log_line(log_path, "youtube subtitles: no auto-generated source subtitles found; fallback to ASR")
+                else:
+                    _safe_append_log_line(log_path, "youtube subtitles: no target-language subtitles found; fallback to ASR")
+                return None, None
+
+            _safe_append_log_line(
+                log_path,
+                f"youtube subtitles: downloading track source={selection.source} language={selection.language} reason={selection.reason}",
+            )
+            _safe_upload_log(store, log_path, log_key)
+            subtitle_path, _subtitle_info, _subtitle_meta = download_youtube_subtitle(
+                source_url,
+                yt_settings,
+                work_dir=tmp_dir,
+                selection=selection,
+            )
+            srt_input_path = subtitle_path
+            if subtitle_path.suffix.lower() != ".srt":
+                srt_input_path = tmp_dir / f"{subtitle_path.stem}.srt"
+                _safe_append_log_line(log_path, f"youtube subtitles: converting {subtitle_path.suffix.lower() or '(unknown)'} -> srt")
+                convert_subtitle_to_srt(settings.ffmpeg_path, subtitle_path, srt_input_path, log_path=log_path)
+
+            segments = srt_to_segments(srt_input_path.read_text(encoding="utf-8"))
+            if not segments:
+                _safe_append_log_line(log_path, "youtube subtitles: parsed 0 segments; fallback to ASR")
+                return None, None
+
+            _safe_append_log_line(
+                log_path,
+                f"youtube subtitles: selected {selection.source}:{selection.language} reason={selection.reason} segments={len(segments)}",
+            )
+            return segments, {"language": selection.language, "source": selection.source, "reason": selection.reason}
+    except Exception as e:
+        _safe_append_log_line(log_path, f"youtube subtitles: probe/download failed; fallback to ASR: {type(e).__name__}: {e}")
+        _safe_upload_log(store, log_path, log_key)
+        return None, None
 
 
 def _latest_youtube_title(db: Session, store: S3Store, task_id: uuid.UUID) -> str:
@@ -604,6 +779,7 @@ def process_job(job_id: str) -> dict[str, str]:
     log_path: Path | None = None
     log_key: str | None = None
     hb: _TaskQueueHeartbeat | None = None
+    work_root: Path | None = None
     try:
         job = db.get(SubtitleJob, jid)
         if not job:
@@ -648,7 +824,7 @@ def process_job(job_id: str) -> dict[str, str]:
         hb = _TaskQueueHeartbeat(task.id)
         hb.start()
 
-        req = job.request_json
+        req = dict(job.request_json) if isinstance(job.request_json, dict) else {}
         input_key = (req.get("input") or {}).get("key")
         if not input_key:
             raise ValueError("missing input.key")
@@ -659,6 +835,8 @@ def process_job(job_id: str) -> dict[str, str]:
         video_path = work_root / "input.mp4"
         audio_path = work_root / "audio.wav"
         segments_path = work_root / "segments.json"
+        subtitle_segments_path = work_root / "subtitle_segments.json"
+        translation_checkpoint_path = work_root / "translation_checkpoint.json"
         srt_path = work_root / "subtitle_zh.srt"
         ass_path = work_root / "subtitle_zh.ass"
 
@@ -674,11 +852,22 @@ def process_job(job_id: str) -> dict[str, str]:
         burn_in = bool(render_cfg.get("burn_in"))
         soft_sub = bool(render_cfg.get("soft_sub"))
         video_codec = str(render_cfg.get("video_codec") or "av1").strip().lower() or "av1"
+        use_intel_gpu = bool(render_cfg.get("use_intel_gpu"))
         video_crf = render_cfg.get("video_crf")
         video_preset = render_cfg.get("video_preset")
 
         want_ass = "ass" in formats
         need_ass = want_ass or burn_in
+        youtube_subtitle_mode = normalize_youtube_subtitle_mode(
+            req.get("youtube_subtitle_mode"),
+            prefer_youtube_subtitles=req.get("prefer_youtube_subtitles", True),
+        )
+        prefer_youtube_subtitles = youtube_subtitle_mode != "off"
+        translate_cfg = req.get("translate") or {}
+        translate_enabled = bool(translate_cfg.get("enabled"))
+        target_lang = (translate_cfg.get("target_lang") or "zh").strip() or "zh"
+        provider = (translate_cfg.get("provider") or "mock").strip() or "mock"
+        bilingual = bool(translate_cfg.get("bilingual"))
 
         log_path = work_root / "job.log"
         log_key = f"log/{task.id}/subtitle_{job.id}.log"
@@ -694,7 +883,7 @@ def process_job(job_id: str) -> dict[str, str]:
         _seed_log_from_store(store, log_key, log_path)
         _safe_append_log_line(
             log_path,
-            f"subtitle job start: job_id={job.id} task_id={task.id} resume={resume} formats={formats} burn_in={burn_in} soft_sub={soft_sub}",
+            f"subtitle job start: job_id={job.id} task_id={task.id} resume={resume} formats={formats} burn_in={burn_in} soft_sub={soft_sub} intel_gpu={use_intel_gpu}",
         )
         _safe_upload_log(store, log_path, log_key)
 
@@ -715,6 +904,47 @@ def process_job(job_id: str) -> dict[str, str]:
                 return None
             return None
 
+        def _save_job_request() -> None:
+            nonlocal req
+            job.request_json = req
+            db.add(job)
+
+        def _final_subtitle_segments_key() -> str | None:
+            artifacts = req.get("artifacts")
+            if not isinstance(artifacts, dict):
+                return None
+            key = str(artifacts.get("final_subtitle_segments_key") or "").strip()
+            return key or None
+
+        def _set_final_subtitle_segments_key(key: str) -> None:
+            artifacts = dict(req.get("artifacts") or {})
+            artifacts["final_subtitle_segments_key"] = key
+            req["artifacts"] = artifacts
+            _save_job_request()
+
+        def _set_youtube_subtitle_info(info: dict[str, str]) -> None:
+            artifacts = dict(req.get("artifacts") or {})
+            artifacts["youtube_subtitle"] = dict(info)
+            req["artifacts"] = artifacts
+            _save_job_request()
+
+        def _load_segments_json(path: Path) -> list[Segment] | None:
+            try:
+                return segments_from_json_data(json.loads(path.read_text(encoding="utf-8")))
+            except Exception:
+                return None
+
+        def _download_final_subtitle_segments() -> list[Segment] | None:
+            key = _final_subtitle_segments_key()
+            if not key:
+                return None
+            try:
+                store.download_file(key, subtitle_segments_path)
+            except Exception:
+                return None
+            segs = _load_segments_json(subtitle_segments_path)
+            return segs or None
+
         video_downloaded = False
 
         def _ensure_video() -> None:
@@ -734,13 +964,15 @@ def process_job(job_id: str) -> dict[str, str]:
 
         def _store_ass_from_segments(segs: list[Segment], *, log_prefix: str) -> str:
             play_res_x, play_res_y = _ass_resolution()
-            secondary_line_scale = 0.8 if bool((req.get("translate") or {}).get("bilingual")) else None
+            secondary_line_scale = 0.68 if bool((req.get("translate") or {}).get("bilingual")) else None
             ass_text = segments_to_ass(
                 segs,
                 style_name=render_cfg.get("ass_style", "clean_white"),
                 play_res_x=play_res_x,
                 play_res_y=play_res_y,
                 secondary_line_scale=secondary_line_scale,
+                primary_font_scale_percent=render_cfg.get("primary_font_scale_percent") or 100,
+                secondary_font_scale_percent=render_cfg.get("secondary_font_scale_percent") or 100,
             )
             ass_path.write_text(ass_text, encoding="utf-8")
             ass_sha = sha256_file(ass_path)
@@ -778,9 +1010,98 @@ def process_job(job_id: str) -> dict[str, str]:
                 _safe_append_log_line(log_path, f"{log_prefix} unchanged: {ass_key_local} ({play_res_x}x{play_res_y})")
             return ass_key_local
 
+        def _store_final_subtitle_segments(segs: list[Segment]) -> str:
+            write_json(subtitle_segments_path, segments_to_json_data(segs))
+            subtitle_segments_sha = sha256_file(subtitle_segments_path)
+            key = f"sub/{task.id}/subtitle_segments_{subtitle_segments_sha[:16]}.json"
+            store.upload_file(subtitle_segments_path, key, content_type="application/json")
+            _set_final_subtitle_segments_key(key)
+            db.commit()
+            _safe_append_log_line(log_path, f"subtitle segments uploaded: {key}")
+            return key
+
+        def _store_source_segments(segs: list[Segment], *, source_label: str) -> None:
+            nonlocal segments_key
+            write_json(segments_path, segments_to_json_data(segs))
+            segments_sha = sha256_file(segments_path)
+            segments_key = f"sub/{task.id}/segments_{segments_sha[:16]}.json"
+            store.upload_file(segments_path, segments_key, content_type="application/json")
+            db.add(
+                Asset(
+                    task_id=task.id,
+                    kind=AssetKind.segments_json,
+                    storage_key=segments_key,
+                    sha256=segments_sha,
+                    size_bytes=segments_path.stat().st_size,
+                )
+            )
+            task.status = TaskStatus.asr_done
+            db.add(task)
+            db.commit()
+            _safe_append_log_line(log_path, f"{source_label}: segments={len(segs)}")
+            _safe_upload_log(store, log_path, log_key)
+
+        def _translation_checkpoint_key() -> str:
+            return f"sub/{task.id}/translation_checkpoint.json"
+
+        def _translation_checkpoint_matches(source: list[Segment], translated_prefix: list[Segment]) -> bool:
+            if len(translated_prefix) > len(source):
+                return False
+            for i, translated_seg in enumerate(translated_prefix):
+                source_seg = source[i]
+                if abs(float(translated_seg.start) - float(source_seg.start)) > 0.01:
+                    return False
+                if abs(float(translated_seg.end) - float(source_seg.end)) > 0.01:
+                    return False
+            return True
+
+        def _load_translation_checkpoint(source: list[Segment], *, source_segments_key: str | None) -> tuple[list[Segment], str]:
+            if not source or not source_segments_key:
+                return [], ""
+            try:
+                store.download_file(_translation_checkpoint_key(), translation_checkpoint_path)
+                payload = json.loads(translation_checkpoint_path.read_text(encoding="utf-8"))
+            except Exception:
+                return [], ""
+            if not isinstance(payload, dict):
+                return [], ""
+            if str(payload.get("source_segments_key") or "").strip() != str(source_segments_key or "").strip():
+                return [], ""
+            translated_prefix = segments_from_json_data(payload.get("translated_segments"))
+            if not translated_prefix:
+                return [], ""
+            if not _translation_checkpoint_matches(source, translated_prefix):
+                return [], ""
+            summary = str(payload.get("summary") or "").strip()[:500]
+            return translated_prefix, summary
+
+        def _save_translation_checkpoint(source_segments_key: str | None, translated_prefix: list[Segment], *, summary: str) -> None:
+            if not source_segments_key or not translated_prefix:
+                return
+            payload = {
+                "source_segments_key": str(source_segments_key or "").strip(),
+                "summary": str(summary or "").strip()[:500],
+                "translated_segments": segments_to_json_data(translated_prefix),
+            }
+            try:
+                write_json(translation_checkpoint_path, payload)
+                store.upload_file(translation_checkpoint_path, _translation_checkpoint_key(), content_type="application/json")
+            except Exception as e:
+                _safe_append_log_line(log_path, f"translation checkpoint save failed: {type(e).__name__}: {e}")
+
+        def _clear_translation_checkpoint() -> None:
+            try:
+                store.delete_object(_translation_checkpoint_key())
+            except Exception:
+                pass
+
+        if not resume:
+            _clear_translation_checkpoint()
+
         srt_asset = _download_latest_asset(AssetKind.subtitle_srt, srt_path) if resume else None
         if resume and srt_asset:
             srt_key = srt_asset.storage_key
+            _clear_translation_checkpoint()
             _safe_append_log_line(log_path, f"resume: found existing subtitle_srt asset: {srt_key}")
             _safe_upload_log(store, log_path, log_key)
             if task.status in {TaskStatus.failed, TaskStatus.created, TaskStatus.ingested, TaskStatus.downloaded, TaskStatus.audio_extracted, TaskStatus.asr_done, TaskStatus.translated}:
@@ -791,8 +1112,13 @@ def process_job(job_id: str) -> dict[str, str]:
             db.commit()
 
             if need_ass:
-                segs = srt_to_segments(srt_path.read_text(encoding="utf-8"))
-                ass_key = _store_ass_from_segments(segs, log_prefix="generated ass from resumed srt")
+                segs = _download_final_subtitle_segments()
+                if segs:
+                    ass_key = _store_ass_from_segments(segs, log_prefix="generated ass from resumed subtitle segments")
+                else:
+                    segs = srt_to_segments(srt_path.read_text(encoding="utf-8"))
+                    ass_key = _store_ass_from_segments(segs, log_prefix="generated ass from resumed srt (fallback)")
+                    _safe_append_log_line(log_path, "resume: final subtitle segments not found; ass regenerated from srt without structured bilingual data")
                 db.commit()
                 _safe_upload_log(store, log_path, log_key)
 
@@ -830,6 +1156,7 @@ def process_job(job_id: str) -> dict[str, str]:
                     "soft_sub": bool(soft_sub),
                     "render": {
                         "video_codec": video_codec,
+                        "use_intel_gpu": use_intel_gpu,
                         "video_preset": video_preset,
                         "video_crf": video_crf,
                     },
@@ -851,23 +1178,42 @@ def process_job(job_id: str) -> dict[str, str]:
         segments_asset = _download_latest_asset(AssetKind.segments_json, segments_path) if resume else None
         if resume and segments_asset:
             segments_key = segments_asset.storage_key
-            try:
-                data = json.loads(segments_path.read_text(encoding="utf-8"))
-                if isinstance(data, list):
-                    tmp: list[Segment] = []
-                    for item in data:
-                        if not isinstance(item, dict):
-                            continue
-                        start = float(item.get("start") or 0.0)
-                        end = float(item.get("end") or 0.0)
-                        text = str(item.get("text") or "").strip()
-                        if not text:
-                            continue
-                        tmp.append(Segment(start=start, end=end, text=text, confidence=item.get("confidence")))
-                    if tmp:
-                        segments = tmp
-            except Exception:
-                segments = None
+            segments = _load_segments_json(segments_path)
+
+        youtube_subtitle_info: dict[str, str] | None = None
+        if segments is None:
+            job.progress = 25
+            db.add(job)
+            db.commit()
+
+            if prefer_youtube_subtitles:
+                segments, youtube_subtitle_info = _download_youtube_subtitle_segments(
+                    task=task,
+                    db=db,
+                    work_root=work_root,
+                    log_path=log_path,
+                    log_key=log_key,
+                    store=store,
+                    target_lang=target_lang,
+                    youtube_subtitle_mode=youtube_subtitle_mode,
+                )
+                if segments:
+                    if youtube_subtitle_info:
+                        _set_youtube_subtitle_info(youtube_subtitle_info)
+                    if youtube_subtitle_info and youtube_subtitle_info.get("reason") == "target":
+                        translate_cfg = dict(req.get("translate") or {})
+                        translate_cfg["enabled"] = False
+                        req["translate"] = translate_cfg
+                        translate_enabled = False
+                        _safe_append_log_line(log_path, "youtube subtitles: target language subtitle found; skipping translation")
+                    elif youtube_subtitle_info and youtube_subtitle_info.get("reason") == "auto_source":
+                        if translate_enabled:
+                            _safe_append_log_line(log_path, "youtube subtitles: auto-generated source subtitle found; translation will run instead of ASR")
+                        else:
+                            _safe_append_log_line(log_path, "youtube subtitles: auto-generated source subtitle found; translation disabled; using it directly")
+                    _save_job_request()
+                    db.commit()
+                    _store_source_segments(segments, source_label="youtube subtitles ready")
 
         if segments is None:
             audio_asset = _download_latest_asset(AssetKind.audio_wav, audio_path) if resume else None
@@ -894,9 +1240,6 @@ def process_job(job_id: str) -> dict[str, str]:
                 db.add(task)
                 db.commit()
 
-            job.progress = 25
-            db.add(job)
-            db.commit()
             asr_cfg = req.get("asr") or {}
             asr_defaults = get_asr_settings(db, settings)
             requested_engine = (asr_cfg.get("engine") or "auto").strip()
@@ -929,28 +1272,29 @@ def process_job(job_id: str) -> dict[str, str]:
                     cpu_threads=cpu_threads_cfg,
                     num_workers=num_workers_cfg,
                 )
+            elif engine == "openvino":
+                proxy = str(asr_defaults.get("model_download_proxy") or "").strip() or None
+                model_name = _resolve_openvino_model(model_name, Path(settings.whisper_model_dir), proxy=proxy)
+                openvino_device = str(asr_defaults.get("openvino_device") or settings.openvino_device).strip() or settings.openvino_device
+                openvino_num_beams = int(asr_defaults.get("openvino_num_beams") or settings.openvino_num_beams or 1)
+                openvino_max_new_tokens = int(asr_defaults.get("openvino_max_new_tokens") or settings.openvino_max_new_tokens or 448)
+                _safe_append_log_line(
+                    log_path,
+                    "asr: "
+                    f"engine=openvino model={model_name} language={language} "
+                    f"device={openvino_device} num_beams={openvino_num_beams} max_new_tokens={openvino_max_new_tokens}",
+                )
+                segments = transcribe_openvino_whisper(
+                    audio_path,
+                    model_name=model_name,
+                    language=language,
+                    device=openvino_device,
+                    num_beams=openvino_num_beams,
+                    max_new_tokens=openvino_max_new_tokens,
+                )
             else:
                 raise ValueError(f"unsupported ASR engine: {engine}")
-            segments_json = [seg.__dict__ for seg in segments]
-            write_json(segments_path, segments_json)
-            segments_sha = sha256_file(segments_path)
-            segments_key = f"sub/{task.id}/segments_{segments_sha[:16]}.json"
-            store.upload_file(segments_path, segments_key, content_type="application/json")
-            db.add(
-                Asset(
-                    task_id=task.id,
-                    kind=AssetKind.segments_json,
-                    storage_key=segments_key,
-                    sha256=segments_sha,
-                    size_bytes=segments_path.stat().st_size,
-                )
-            )
-
-            task.status = TaskStatus.asr_done
-            db.add(task)
-            db.commit()
-            _safe_append_log_line(log_path, f"asr done: segments={len(segments)}")
-            _safe_upload_log(store, log_path, log_key)
+            _store_source_segments(segments, source_label="asr done")
 
         job.progress = 60
         db.add(job)
@@ -958,9 +1302,6 @@ def process_job(job_id: str) -> dict[str, str]:
 
         translate_cfg = req.get("translate") or {}
         translate_enabled = bool(translate_cfg.get("enabled"))
-        target_lang = (translate_cfg.get("target_lang") or "zh").strip() or "zh"
-        provider = (translate_cfg.get("provider") or "mock").strip() or "mock"
-        bilingual = bool(translate_cfg.get("bilingual"))
         segments_out = segments
         translation_summary = ""
         if translate_enabled:
@@ -992,6 +1333,20 @@ def process_job(job_id: str) -> dict[str, str]:
                     elif provider in {"noop", "none"}:
                         segments_out = segments
                     elif provider == "openai":
+                        resume_prefix, resume_summary = _load_translation_checkpoint(segments, source_segments_key=segments_key)
+                        if resume_prefix:
+                            _safe_append_log_line(
+                                log_path,
+                                f"translate: resuming from checkpoint at segment {len(resume_prefix)}/{len(segments)}",
+                            )
+
+                        checkpoint_segments = list(resume_prefix)
+
+                        def _on_translate_batch_done(batch_segments: list[Segment], updated_summary: str, completed_count: int) -> None:
+                            del completed_count
+                            checkpoint_segments.extend(batch_segments)
+                            _save_translation_checkpoint(segments_key, checkpoint_segments, summary=updated_summary)
+
                         segments_out, translation_summary = translate_segments_openai_with_summary(
                             segments,
                             target_lang=target_lang,
@@ -1003,6 +1358,9 @@ def process_job(job_id: str) -> dict[str, str]:
                             timeout_seconds=translate_settings["openai_timeout_seconds"],
                             batch_size=batch_size,
                             enable_summary=enable_summary,
+                            resume_from=resume_prefix,
+                            initial_summary=resume_summary,
+                            on_batch_done=_on_translate_batch_done,
                         )
                     else:
                         raise ValueError(f"unsupported translate provider: {provider}")
@@ -1053,11 +1411,7 @@ def process_job(job_id: str) -> dict[str, str]:
                             title=title_hint,
                             summary=translation_summary,
                             transcript=transcript_excerpt,
-                            api_key=translate_settings.get("openai_api_key"),
-                            base_url=translate_settings.get("openai_base_url"),
-                            model=translate_settings.get("openai_model"),
-                            temperature=float(translate_settings.get("openai_temperature") or 0.2),
-                            timeout_seconds=float(translate_settings.get("openai_timeout_seconds") or 180.0),
+                            config=openai_chat_config_from_settings(translate_settings),
                             n_tags=6,
                         )
                     except Exception:
@@ -1076,17 +1430,20 @@ def process_job(job_id: str) -> dict[str, str]:
                         Segment(
                             start=zh_seg.start,
                             end=zh_seg.end,
-                            text=f"{zh_seg.text}\n{src_seg.text}",
+                            text=zh_seg.text,
                             confidence=zh_seg.confidence,
+                            secondary_text=str(src_seg.text or "").strip() or None,
                         )
                     )
                 segments_out = merged
 
         srt_text = segments_to_srt(segments_out)
         srt_path.write_text(srt_text, encoding="utf-8")
+        _store_final_subtitle_segments(segments_out)
         srt_sha = sha256_file(srt_path)
         srt_key = f"sub/{task.id}/subtitle_zh_{srt_sha[:16]}.srt"
         store.upload_file(srt_path, srt_key, content_type="text/plain")
+        _clear_translation_checkpoint()
         db.add(
             Asset(
                 task_id=task.id,
@@ -1143,6 +1500,7 @@ def process_job(job_id: str) -> dict[str, str]:
                 "soft_sub": bool(soft_sub),
                 "render": {
                     "video_codec": video_codec,
+                    "use_intel_gpu": use_intel_gpu,
                     "video_preset": video_preset,
                     "video_crf": video_crf,
                 },
@@ -1184,6 +1542,7 @@ def process_job(job_id: str) -> dict[str, str]:
         if hb is not None:
             hb.stop()
         db.close()
+        _cleanup_local_work_root(work_root)
 
 
 @celery_app.task(name="subtitle_service.task_queue_tick")
@@ -1203,9 +1562,11 @@ def task_queue_tick() -> dict[str, Any]:
     started_render = 0
     recovered_subtitle = 0
     recovered_render = 0
+    recovered_pipeline = 0
     unlocked_expired = 0
 
     to_start: list[tuple[str, str]] = []  # ("subtitle"|"render", job_id)
+    to_bootstrap: list[tuple[str, dict[str, Any] | None]] = []
     try:
         _task_queue_lock_settings_row(db)
         cfg = get_task_queue_settings(db)
@@ -1376,7 +1737,7 @@ def task_queue_tick() -> dict[str, Any]:
 
         # Phase 2: lock and start new tasks up to max_concurrency.
         running_tasks = len(locked_tasks)
-        capacity = max(0, max_conc - running_tasks)
+        capacity = available_task_queue_capacity(max_conc, running_tasks)
         for _ in range(capacity):
             # Prefer queued render jobs (rare, usually after an expired lock) so tasks can finish.
             rj = (
@@ -1450,6 +1811,46 @@ def task_queue_tick() -> dict[str, Any]:
             started_subtitle += 1
             running_tasks += 1
 
+        # Phase 3: bootstrap auto-YouTube tasks only with remaining task slots.
+        bootstrap_capacity = available_task_queue_capacity(max_conc, running_tasks)
+        if bootstrap_capacity > 0:
+            bootstrap_cutoff = now - timedelta(seconds=60)
+            bootstrap_candidates = (
+                db.query(Task)
+                .filter(
+                    Task.source_type == SourceType.youtube,
+                    Task.status.in_([TaskStatus.ingested, TaskStatus.downloaded]),
+                    unlocked,
+                    Task.updated_at.is_not(None),
+                    Task.updated_at < bootstrap_cutoff,
+                )
+                .order_by(Task.updated_at.asc(), Task.created_at.asc())
+                .with_for_update(skip_locked=True)
+                .limit(max(bootstrap_capacity * 4, bootstrap_capacity))
+                .all()
+            )
+            for task in bootstrap_candidates:
+                if available_task_queue_capacity(max_conc, running_tasks) <= 0:
+                    break
+                meta = parse_auto_youtube_created_by(task.created_by)
+                if meta is None:
+                    continue
+                if _task_has_queued_or_running_jobs(db, task.id):
+                    continue
+                if _task_queue_is_task_locked(task, now):
+                    continue
+
+                task.lock_owner = TASK_QUEUE_LOCK_OWNER
+                task.lock_until = _task_queue_expires_at(now)
+                db.add(task)
+
+                overrides: dict[str, Any] | None = None
+                if meta.get("auto_publish") is not None:
+                    overrides = {"auto_publish": bool(meta["auto_publish"])}
+                to_bootstrap.append((str(task.id), overrides))
+                recovered_pipeline += 1
+                running_tasks += 1
+
         db.commit()
     except Exception:
         try:
@@ -1465,6 +1866,11 @@ def task_queue_tick() -> dict[str, Any]:
             celery_app.send_task("subtitle_service.process_job", args=[jid], queue="subtitle")
         else:
             celery_app.send_task("subtitle_service.process_render_job", args=[jid], queue="subtitle")
+    for task_id, overrides in to_bootstrap:
+        task_args: list[Any] = [task_id]
+        if isinstance(overrides, dict) and overrides:
+            task_args.append(dict(overrides))
+        celery_app.send_task("subtitle_service.auto_youtube_pipeline", args=task_args, queue="subtitle")
 
     return {
         "status": "ok",
@@ -1473,6 +1879,7 @@ def task_queue_tick() -> dict[str, Any]:
         "started_render": str(started_render),
         "recovered_subtitle": str(recovered_subtitle),
         "recovered_render": str(recovered_render),
+        "recovered_pipeline": str(recovered_pipeline),
         "unlocked_expired": str(unlocked_expired),
     }
 
@@ -1494,6 +1901,7 @@ def process_render_job(render_job_id: str) -> dict[str, Any]:
     log_path: Path | None = None
     log_key: str | None = None
     hb: _TaskQueueHeartbeat | None = None
+    work_root: Path | None = None
     try:
         rj = db.get(RenderJob, rid)
         if not rj:
@@ -1556,6 +1964,7 @@ def process_render_job(render_job_id: str) -> dict[str, Any]:
         render_cfg = req.get("render") if isinstance(req.get("render"), dict) else {}
 
         video_codec = str(render_cfg.get("video_codec") or "av1").strip().lower() or "av1"
+        use_intel_gpu = bool(render_cfg.get("use_intel_gpu"))
         video_preset = render_cfg.get("video_preset")
         video_crf = render_cfg.get("video_crf")
 
@@ -1579,7 +1988,7 @@ def process_render_job(render_job_id: str) -> dict[str, Any]:
         _seed_log_from_store(store, log_key, log_path)
         _safe_append_log_line(
             log_path,
-            f"render job start: render_job_id={rj.id} task_id={task.id} burn_in={burn_in} soft_sub={soft_sub} codec={video_codec} preset={video_preset} crf={video_crf}",
+            f"render job start: render_job_id={rj.id} task_id={task.id} burn_in={burn_in} soft_sub={soft_sub} codec={video_codec} intel_gpu={use_intel_gpu} preset={video_preset} crf={video_crf}",
         )
         _safe_upload_log(store, log_path, log_key)
 
@@ -1667,6 +2076,8 @@ def process_render_job(render_job_id: str) -> dict[str, Any]:
                 ass_path,
                 out_video,
                 video_codec=video_codec,
+                use_intel_gpu=use_intel_gpu,
+                intel_gpu_render_device=settings.intel_gpu_render_device,
                 preset=video_preset,
                 crf=video_crf,
                 log_path=log_path,
@@ -1773,6 +2184,7 @@ def process_render_job(render_job_id: str) -> dict[str, Any]:
         if hb is not None:
             hb.stop()
         db.close()
+        _cleanup_local_work_root(work_root)
 
 
 @celery_app.task(name="subtitle_service.after_render_publish")
@@ -1931,7 +2343,7 @@ def cleanup_task(task_id: str) -> dict[str, Any]:
 
 
 @celery_app.task(name="subtitle_service.auto_youtube_pipeline")
-def auto_youtube_pipeline(task_id: str) -> dict[str, str]:
+def auto_youtube_pipeline(task_id: str, overrides: dict[str, Any] | None = None) -> dict[str, str]:
     """
     One-click pipeline:
       - download YouTube video (+ metadata + cover)
@@ -1950,6 +2362,9 @@ def auto_youtube_pipeline(task_id: str) -> dict[str, str]:
     acquired_lock = False
     try:
         tid = uuid.UUID(task_id)
+        pipeline_args: list[Any] = [str(tid)]
+        if isinstance(overrides, dict) and overrides:
+            pipeline_args.append(dict(overrides))
         task = db.get(Task, tid)
         if not task:
             raise RuntimeError("task not found")
@@ -1957,34 +2372,56 @@ def auto_youtube_pipeline(task_id: str) -> dict[str, str]:
             raise RuntimeError("task is not a youtube source")
 
         now = _now()
-        if not _task_queue_is_task_locked(task, now):
-            # Claim a task slot before doing anything heavy (download/ASR/render).
-            _task_queue_lock_settings_row(db)
-            cfg = get_task_queue_settings(db)
-            try:
-                max_conc = int(cfg.get("max_concurrency", 1))
-            except Exception:
-                max_conc = 1
-            if max_conc < 0:
-                max_conc = 0
-            if max_conc == 0:
+        _task_queue_lock_settings_row(db)
+        cfg = get_task_queue_settings(db)
+        try:
+            max_conc = int(cfg.get("max_concurrency", 1))
+        except Exception:
+            max_conc = 1
+        if max_conc < 0:
+            max_conc = 0
+        if max_conc == 0:
+            celery_app.send_task(
+                "subtitle_service.auto_youtube_pipeline",
+                args=pipeline_args,
+                queue="subtitle",
+                countdown=_TASK_QUEUE_REQUEUE_COUNTDOWN_SECONDS,
+            )
+            return {"status": "queued", "task_id": str(tid), "detail": "task queue paused"}
+
+        locked_task_ids = [
+            row[0]
+            for row in (
+                db.query(Task.id)
+                .filter(Task.lock_owner == TASK_QUEUE_LOCK_OWNER, Task.lock_until.is_not(None), Task.lock_until > now)
+                .order_by(Task.lock_until.asc(), Task.created_at.asc())
+                .all()
+            )
+        ]
+        has_queue_jobs = _task_has_queued_or_running_jobs(db, tid)
+        if _task_queue_is_task_locked(task, now):
+            # Self-heal old over-bootstrapped locks: only the first N locked tasks keep their slot.
+            if (
+                task.status in [TaskStatus.ingested, TaskStatus.downloaded]
+                and not has_queue_jobs
+                and not task_queue_slot_reserved_for(task.id, locked_task_ids, max_conc)
+            ):
+                _task_queue_unlock(task)
+                db.add(task)
+                db.commit()
                 celery_app.send_task(
                     "subtitle_service.auto_youtube_pipeline",
-                    args=[str(tid)],
+                    args=pipeline_args,
                     queue="subtitle",
                     countdown=_TASK_QUEUE_REQUEUE_COUNTDOWN_SECONDS,
                 )
-                return {"status": "queued", "task_id": str(tid), "detail": "task queue paused"}
-
-            running = (
-                db.query(Task)
-                .filter(Task.lock_owner == TASK_QUEUE_LOCK_OWNER, Task.lock_until.is_not(None), Task.lock_until > now)
-                .count()
-            )
-            if int(running or 0) >= int(max_conc):
+                return {"status": "queued", "task_id": str(tid), "detail": "waiting for task queue"}
+        else:
+            # Claim a task slot before doing anything heavy (download/ASR/render).
+            if len(locked_task_ids) >= int(max_conc):
                 celery_app.send_task(
                     "subtitle_service.auto_youtube_pipeline",
-                    args=[str(tid)],
+                    args=pipeline_args,
                     queue="subtitle",
                     countdown=_TASK_QUEUE_REQUEUE_COUNTDOWN_SECONDS,
                 )
@@ -1995,7 +2432,7 @@ def auto_youtube_pipeline(task_id: str) -> dict[str, str]:
             db.add(task)
             db.commit()
             acquired_lock = True
-        elif task.lock_until is None or task.lock_until <= now:
+        if task.lock_until is None or task.lock_until <= now:
             # Refresh a stale/expired lock to avoid accidental eviction mid-pipeline.
             task.lock_until = _task_queue_expires_at(now)
             db.add(task)
@@ -2004,7 +2441,9 @@ def auto_youtube_pipeline(task_id: str) -> dict[str, str]:
         hb = _TaskQueueHeartbeat(task.id)
         hb.start()
 
-        profile = get_auto_profile(db)
+        profile = dict(get_auto_profile(db))
+        if isinstance(overrides, dict) and overrides.get("auto_publish") is not None:
+            profile["auto_publish"] = bool(overrides.get("auto_publish"))
 
         # Download YouTube video + cover + metadata (idempotent).
         yt: dict[str, Any] = {}
@@ -2063,6 +2502,7 @@ def auto_youtube_pipeline(task_id: str) -> dict[str, str]:
         yt_title = str(yt_meta.get("title") or "").strip()
         yt_desc = str(yt_meta.get("description") or "")
         webpage_url = str(yt_meta.get("webpage_url") or task.source_url or "").strip()
+        yt_uploader = str(yt_meta.get("uploader") or yt_meta.get("channel") or yt_meta.get("uploader_id") or "").strip()
 
         video_key = None
         if isinstance(yt, dict):
@@ -2105,6 +2545,11 @@ def auto_youtube_pipeline(task_id: str) -> dict[str, str]:
             req = {
                 "task_id": str(tid),
                 "resume": task.status == TaskStatus.failed,
+                "prefer_youtube_subtitles": bool(profile.get("prefer_youtube_subtitles", True)),
+                "youtube_subtitle_mode": normalize_youtube_subtitle_mode(
+                    profile.get("youtube_subtitle_mode"),
+                    prefer_youtube_subtitles=profile.get("prefer_youtube_subtitles", True),
+                ),
                 "input": {"type": "s3", "key": video_key},
                 "asr": {
                     "engine": profile.get("asr_engine") or "auto",
@@ -2126,71 +2571,34 @@ def auto_youtube_pipeline(task_id: str) -> dict[str, str]:
                         "soft_sub": bool(profile.get("soft_sub")),
                         "ass_style": profile.get("ass_style") or "clean_white",
                         "video_codec": profile.get("video_codec") or "av1",
+                        "use_intel_gpu": bool(profile.get("use_intel_gpu")),
                         "video_preset": profile.get("video_preset"),
                         "video_crf": profile.get("video_crf"),
+                        "primary_font_scale_percent": profile.get("primary_font_scale_percent") or 100,
+                        "secondary_font_scale_percent": profile.get("secondary_font_scale_percent") or 100,
                     },
                 },
                 "output_prefix": f"sub/{tid}/",
             }
 
+            after_render = _build_after_render_publish_action(
+                task_id=tid,
+                cover_key=cover_key,
+                profile=profile,
+                yt_title=yt_title,
+                yt_desc=yt_desc,
+                webpage_url=webpage_url,
+                yt_uploader=yt_uploader,
+                db=db,
+                store=store,
+            )
+            if after_render:
+                req["after_render"] = after_render
+
             job = SubtitleJob(task_id=tid, request_json=req, status=SubtitleJobStatus.queued, progress=0)
             db.add(job)
             db.commit()
             db.refresh(job)
-
-            # If auto_publish is enabled, defer publishing until render finishes.
-            if profile.get("auto_publish"):
-                meta_model = get_bilibili_publish_settings(db)["default_meta"]
-                meta = meta_model.model_dump() if hasattr(meta_model, "model_dump") else dict(meta_model)
-
-                translate_settings = get_translate_settings(db, settings)
-                title_out = yt_title or str(meta.get("title") or "").strip() or "未命名"
-                if profile.get("publish_translate_title") and title_out and not _has_cjk(title_out):
-                    provider = str(profile.get("translate_provider") or translate_settings.get("default_provider") or "").strip() or "openai"
-                    if provider == "openai":
-                        try:
-                            title_out = _translate_title_openai(
-                                title_out,
-                                target_lang=str(profile.get("target_lang") or translate_settings.get("default_target_lang") or "zh"),
-                                style=str(profile.get("translate_style") or translate_settings.get("default_style") or "口语自然"),
-                                translate_settings=translate_settings,
-                            )
-                        except Exception:
-                            pass
-
-                prefix = str(profile.get("publish_title_prefix") or "").strip()
-                if prefix and not title_out.startswith(prefix):
-                    title_out = prefix + title_out
-                meta["title"] = _clamp_text(title_out, 80) or _clamp_text(yt_title, 80) or "未命名"
-                meta["desc"] = _build_bilibili_desc(yt_desc, webpage_url)
-                if bool(profile.get("publish_enable_reprint", True)):
-                    meta["copyright"] = 2
-                    meta["source"] = webpage_url
-                else:
-                    meta["copyright"] = 1
-                    meta["source"] = ""
-
-                # Persist publish meta as a file so it can be edited before publishing.
-                publish_meta_key = f"meta/{tid}/publish_meta.json"
-                store.put_bytes(
-                    json.dumps(meta, ensure_ascii=False, indent=2).encode("utf-8"),
-                    publish_meta_key,
-                    content_type="application/json",
-                )
-
-                # Let orchestrator pick the latest rendered asset when publishing.
-                publish_payload = {
-                    "account_id": None,
-                    "video_key": None,
-                    "cover_key": cover_key,
-                    "typeid_mode": profile.get("publish_typeid_mode") or "ai_summary",
-                    "meta": None,
-                }
-
-                req["after_render"] = {"publish": True, "publish_payload": publish_payload}
-                job.request_json = req
-                db.add(job)
-                db.commit()
 
             celery_app.send_task("subtitle_service.task_queue_tick", args=[], queue="subtitle")
             return {"status": "ok", "task_id": str(tid), "detail": f"queued subtitle job {job.id}"}
@@ -2203,35 +2611,17 @@ def auto_youtube_pipeline(task_id: str) -> dict[str, str]:
             if not final_asset:
                 raise RuntimeError("no final video asset found; enable burn_in/soft_sub in auto profile")
 
-            meta_model = get_bilibili_publish_settings(db)["default_meta"]
-            meta = meta_model.model_dump() if hasattr(meta_model, "model_dump") else dict(meta_model)
-
+            meta = default_publish_meta(db)
             translate_settings = get_translate_settings(db, settings)
-            title_out = yt_title or str(meta.get("title") or "").strip() or "未命名"
-            if profile.get("publish_translate_title") and title_out and not _has_cjk(title_out):
-                provider = str(profile.get("translate_provider") or translate_settings.get("default_provider") or "").strip() or "openai"
-                if provider == "openai":
-                    try:
-                        title_out = _translate_title_openai(
-                            title_out,
-                            target_lang=str(profile.get("target_lang") or translate_settings.get("default_target_lang") or "zh"),
-                            style=str(profile.get("translate_style") or translate_settings.get("default_style") or "口语自然"),
-                            translate_settings=translate_settings,
-                        )
-                    except Exception:
-                        pass
-
-            prefix = str(profile.get("publish_title_prefix") or "").strip()
-            if prefix and not title_out.startswith(prefix):
-                title_out = prefix + title_out
-            meta["title"] = _clamp_text(title_out, 80) or _clamp_text(yt_title, 80) or "未命名"
-            meta["desc"] = _build_bilibili_desc(yt_desc, webpage_url)
-            if bool(profile.get("publish_enable_reprint", True)):
-                meta["copyright"] = 2
-                meta["source"] = webpage_url
-            else:
-                meta["copyright"] = 1
-                meta["source"] = ""
+            meta = apply_publish_source_overrides(
+                meta,
+                source_title=yt_title,
+                source_description=yt_desc,
+                source_url=webpage_url,
+                source_uploader=yt_uploader,
+                profile=profile,
+                translate_settings=translate_settings,
+            )
 
             publish_meta_key = f"meta/{tid}/publish_meta.json"
             store.put_bytes(

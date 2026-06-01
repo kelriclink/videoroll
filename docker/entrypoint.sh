@@ -11,9 +11,17 @@ CELERY_SUB_QUEUE="${CELERY_SUB_QUEUE:-${CELERY_QUEUE:-subtitle}}"
 CELERY_PUB_APP="${CELERY_PUB_APP:-videoroll.apps.bilibili_publisher.worker:celery_app}"
 CELERY_PUB_QUEUE="${CELERY_PUB_QUEUE:-publish}"
 CELERY_PUB_CONCURRENCY="${CELERY_PUB_CONCURRENCY:-1}"
+CELERY_SUB_CONCURRENCY_FALLBACK="${CELERY_SUB_CONCURRENCY_FALLBACK:-1}"
 
-echo "Starting celery worker (subtitle): $CELERY_SUB_APP queue=$CELERY_SUB_QUEUE"
-celery -A "$CELERY_SUB_APP" worker -Q "$CELERY_SUB_QUEUE" -l INFO &
+if ! CELERY_SUB_CONCURRENCY="$(CELERY_SUB_CONCURRENCY_FALLBACK="$CELERY_SUB_CONCURRENCY_FALLBACK" python -m videoroll.apps.subtitle_service.worker_concurrency)"; then
+  CELERY_SUB_CONCURRENCY="$CELERY_SUB_CONCURRENCY_FALLBACK"
+fi
+if ! [[ "$CELERY_SUB_CONCURRENCY" =~ ^[0-9]+$ ]] || [[ "$CELERY_SUB_CONCURRENCY" -lt 1 ]]; then
+  CELERY_SUB_CONCURRENCY="$CELERY_SUB_CONCURRENCY_FALLBACK"
+fi
+
+echo "Starting celery worker (subtitle): $CELERY_SUB_APP queue=$CELERY_SUB_QUEUE concurrency=$CELERY_SUB_CONCURRENCY"
+celery -A "$CELERY_SUB_APP" worker -Q "$CELERY_SUB_QUEUE" -l INFO --concurrency "$CELERY_SUB_CONCURRENCY" &
 CELERY_SUB_PID=$!
 
 echo "Starting celery worker (publish): $CELERY_PUB_APP queue=$CELERY_PUB_QUEUE concurrency=$CELERY_PUB_CONCURRENCY"

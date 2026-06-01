@@ -3,19 +3,26 @@ import { useEffect, useMemo, useState } from "react";
 import { fetchJson } from "../lib/http";
 import { SUBTITLE_SERVICE_URL } from "../lib/urls";
 
+type YouTubeSubtitleMode = "off" | "target" | "auto_source";
+
 type AutoProfile = {
   formats: string[];
   burn_in: boolean;
   soft_sub: boolean;
   ass_style: string;
   video_codec: string;
+  use_intel_gpu: boolean;
   video_preset?: string | null;
   video_crf?: number | null;
+  primary_font_scale_percent?: number | null;
+  secondary_font_scale_percent?: number | null;
 
   asr_engine: string;
   asr_language: string;
   asr_model?: string | null;
 
+  prefer_youtube_subtitles: boolean;
+  youtube_subtitle_mode?: YouTubeSubtitleMode | null;
   translate_enabled: boolean;
   translate_provider: string;
   target_lang: string;
@@ -31,6 +38,24 @@ type AutoProfile = {
   publish_enable_reprint: boolean;
 };
 
+type IntelHardwareProbe = {
+  checked: boolean;
+  available: boolean;
+  render_device: string;
+  model_name?: string | null;
+  driver?: string | null;
+  pci_slot?: string | null;
+  pci_id?: string | null;
+  detail: string;
+};
+
+function normalizeYouTubeSubtitleMode(value: unknown, legacyPrefer?: boolean | null): YouTubeSubtitleMode {
+  const mode = String(value ?? "").trim().toLowerCase();
+  if (mode === "off" || mode === "target" || mode === "auto_source") return mode;
+  if (legacyPrefer === false) return "off";
+  return "target";
+}
+
 export default function SettingsAutoPage() {
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -43,13 +68,19 @@ export default function SettingsAutoPage() {
   const [softSub, setSoftSub] = useState(false);
   const [assStyle, setAssStyle] = useState("clean_white");
   const [videoCodec, setVideoCodec] = useState("av1");
+  const [useIntelGpu, setUseIntelGpu] = useState(false);
+  const [intelProbeBusy, setIntelProbeBusy] = useState(false);
+  const [intelProbe, setIntelProbe] = useState<IntelHardwareProbe | null>(null);
   const [videoPresetText, setVideoPresetText] = useState<string>("");
   const [videoCrfText, setVideoCrfText] = useState<string>("");
+  const [primaryFontScalePercentText, setPrimaryFontScalePercentText] = useState<string>("100");
+  const [secondaryFontScalePercentText, setSecondaryFontScalePercentText] = useState<string>("100");
 
   const [asrEngine, setAsrEngine] = useState("auto");
   const [asrLanguage, setAsrLanguage] = useState("auto");
   const [asrModel, setAsrModel] = useState("");
 
+  const [youtubeSubtitleMode, setYouTubeSubtitleMode] = useState<YouTubeSubtitleMode>("target");
   const [translateEnabled, setTranslateEnabled] = useState(true);
   const [bilingual, setBilingual] = useState(false);
   const [targetLang, setTargetLang] = useState("zh");
@@ -82,13 +113,17 @@ export default function SettingsAutoPage() {
       setSoftSub(Boolean(profile.soft_sub));
       setAssStyle(profile.ass_style || "clean_white");
       setVideoCodec((profile.video_codec || "av1").toLowerCase());
+      setUseIntelGpu(Boolean(profile.use_intel_gpu));
       setVideoPresetText(typeof profile.video_preset === "string" ? profile.video_preset : "");
       setVideoCrfText(typeof profile.video_crf === "number" ? String(profile.video_crf) : "");
+      setPrimaryFontScalePercentText(typeof profile.primary_font_scale_percent === "number" ? String(profile.primary_font_scale_percent) : "100");
+      setSecondaryFontScalePercentText(typeof profile.secondary_font_scale_percent === "number" ? String(profile.secondary_font_scale_percent) : "100");
 
       setAsrEngine(profile.asr_engine || "auto");
       setAsrLanguage(profile.asr_language || "auto");
       setAsrModel((profile.asr_model ?? "").trim());
 
+      setYouTubeSubtitleMode(normalizeYouTubeSubtitleMode(profile.youtube_subtitle_mode, profile.prefer_youtube_subtitles));
       setTranslateEnabled(Boolean(profile.translate_enabled));
       setBilingual(Boolean(profile.bilingual));
       setTargetLang(profile.target_lang || "zh");
@@ -111,10 +146,31 @@ export default function SettingsAutoPage() {
     refresh();
   }, []);
 
+  useEffect(() => {
+    if (!useIntelGpu) setIntelProbe(null);
+  }, [useIntelGpu]);
+
   const formatsOut = useMemo(
     () => [formats.srt ? "srt" : null, formats.ass ? "ass" : null].filter(Boolean) as string[],
     [formats],
   );
+
+  async function detectIntelHardware() {
+    setIntelProbeBusy(true);
+    try {
+      const probe = await fetchJson<IntelHardwareProbe>(`${SUBTITLE_SERVICE_URL}/subtitle/hardware/intel`);
+      setIntelProbe(probe);
+    } catch (e: unknown) {
+      setIntelProbe({
+        checked: true,
+        available: false,
+        render_device: "/dev/dri/renderD128",
+        detail: e instanceof Error ? e.message : String(e),
+      });
+    } finally {
+      setIntelProbeBusy(false);
+    }
+  }
 
   return (
     <div className="space-y-4">
@@ -173,6 +229,54 @@ export default function SettingsAutoPage() {
               </label>
               <div className="mt-2 text-xs text-slate-500">提示：只有在启用 “硬字幕（burn-in）” 时才会用到该编码设置。</div>
             </div>
+            <div className="mt-3 flex items-center gap-3 text-sm">
+              <label className="flex items-center gap-2">
+                <input
+                  type="checkbox"
+                  checked={useIntelGpu}
+                  onChange={(e) => setUseIntelGpu(e.target.checked)}
+                />
+                启用 Intel iGPU 硬件编码
+              </label>
+            </div>
+            {useIntelGpu ? (
+              <div className="mt-3 rounded border border-slate-200 bg-slate-50 p-3">
+                <div className="flex flex-wrap items-center gap-3">
+                  <button
+                    type="button"
+                    onClick={() => detectIntelHardware()}
+                    disabled={intelProbeBusy}
+                    className="rounded border border-slate-300 bg-white px-3 py-2 text-sm hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-60"
+                  >
+                    {intelProbeBusy ? "检测中..." : "检测硬件"}
+                  </button>
+                  {intelProbe?.available && intelProbe.model_name ? (
+                    <div className="text-sm text-emerald-700">已检测到：{intelProbe.model_name}</div>
+                  ) : null}
+                  {intelProbe && !intelProbe.available ? (
+                    <div className="text-sm text-amber-700">未检测到可用 Intel 硬件</div>
+                  ) : null}
+                </div>
+                {intelProbe ? (
+                  <div className="mt-2 text-xs text-slate-600">
+                    <div>{intelProbe.detail || (intelProbe.available ? "已检测到 Intel 硬件" : "当前未检测到可用 Intel 硬件")}</div>
+                    <div className="mt-1">
+                      设备：{intelProbe.render_device || "-"}
+                      {intelProbe.driver ? ` · 驱动：${intelProbe.driver}` : ""}
+                      {intelProbe.pci_slot ? ` · PCI：${intelProbe.pci_slot}` : ""}
+                      {intelProbe.pci_id ? ` · ID：${intelProbe.pci_id}` : ""}
+                    </div>
+                  </div>
+                ) : (
+                  <div className="mt-2 text-xs text-slate-500">
+                    点击“检测硬件”后，会显示当前容器可见的 Intel 显卡型号。
+                  </div>
+                )}
+              </div>
+            ) : null}
+            <div className="mt-2 text-xs text-slate-500">
+              提示：这里只加速硬字幕的最终视频编码。字幕烧录本身仍是 CPU 过滤；软字幕只是封装，不走 GPU。当前 Intel 路径支持 h264/av1。
+            </div>
             <div className="mt-3">
               <label className="block">
                 <div className="mb-1 text-xs text-slate-600">video_crf（可选：留空=默认）</div>
@@ -192,12 +296,49 @@ export default function SettingsAutoPage() {
                   className="w-full rounded border px-3 py-2 text-sm"
                   value={videoPresetText}
                   onChange={(e) => setVideoPresetText(e.target.value)}
-                  placeholder={videoCodec === "h264" ? "默认 veryfast（h264）" : "默认 4（av1, 0..13 越小越慢）"}
+                  placeholder={
+                    useIntelGpu
+                      ? videoCodec === "h264"
+                        ? "留空=驱动默认（Intel h264）"
+                        : "留空=驱动默认（Intel av1）；可填 0..13"
+                      : videoCodec === "h264"
+                        ? "默认 veryfast（h264）"
+                        : "默认 4（av1, 0..13 越小越慢）"
+                  }
                 />
               </label>
               <div className="mt-2 text-xs text-slate-500">
-                提示：h264 可用 preset：ultrafast/superfast/veryfast/faster/fast/medium/slow/slower/veryslow；av1（SVT）为 0..13（越小越慢、质量更高）。
+                提示：CPU h264 可用 ultrafast..veryslow；CPU av1（SVT）为 0..13。Intel GPU 开启时，h264 文本 preset 和 av1 的 0..13 都会映射到 VAAPI quality。
               </div>
+            </div>
+            <div className="mt-3 grid gap-3 md:grid-cols-2">
+              <label className="block">
+                <div className="mb-1 text-xs text-slate-600">主字幕字号（%）</div>
+                <input
+                  type="number"
+                  min={25}
+                  max={300}
+                  className="w-full rounded border px-3 py-2 text-sm"
+                  value={primaryFontScalePercentText}
+                  onChange={(e) => setPrimaryFontScalePercentText(e.target.value)}
+                  placeholder="100"
+                />
+              </label>
+              <label className="block">
+                <div className="mb-1 text-xs text-slate-600">辅字幕字号（%）</div>
+                <input
+                  type="number"
+                  min={25}
+                  max={300}
+                  className="w-full rounded border px-3 py-2 text-sm"
+                  value={secondaryFontScalePercentText}
+                  onChange={(e) => setSecondaryFontScalePercentText(e.target.value)}
+                  placeholder="100"
+                />
+              </label>
+            </div>
+            <div className="mt-2 text-xs text-slate-500">
+              提示：`100` 表示保持当前默认字号；主/辅字幕可以分别调节。这里设置的是相对当前自适应字号的百分比，会继续按视频分辨率等比缩放。
             </div>
             <div className="mt-3">
               <label className="block">
@@ -212,6 +353,18 @@ export default function SettingsAutoPage() {
           <div className="rounded border p-3">
             <div className="text-xs text-slate-500">翻译（可选：mock/noop/openai）</div>
             <div className="mt-2 flex items-center gap-3 text-sm">
+              <label className="block min-w-64">
+                <div className="mb-1 text-xs text-slate-600">YouTube 字幕复用</div>
+                <select
+                  className="w-full rounded border px-3 py-2 text-sm"
+                  value={youtubeSubtitleMode}
+                  onChange={(e) => setYouTubeSubtitleMode(normalizeYouTubeSubtitleMode(e.target.value))}
+                >
+                  <option value="off">关闭，直接走 ASR</option>
+                  <option value="target">优先目标语言字幕</option>
+                  <option value="auto_source">优先自动生成原语言字幕</option>
+                </select>
+              </label>
               <label className="flex items-center gap-2">
                 <input type="checkbox" checked={translateEnabled} onChange={(e) => setTranslateEnabled(e.target.checked)} />
                 启用翻译
@@ -254,6 +407,14 @@ export default function SettingsAutoPage() {
                 dynamic summary（仅 openai）
               </label>
 
+              <div className="md:col-span-2 text-xs text-slate-500">
+                {youtubeSubtitleMode === "off"
+                  ? "逻辑：不复用 YouTube 字幕，直接进入 ASR；若启用翻译，则在 ASR 结果上继续翻译。"
+                  : youtubeSubtitleMode === "auto_source"
+                    ? "逻辑：优先抓取 YouTube 自动生成的原语言字幕；若启用翻译，则直接进入翻译管线；如果没有可用自动字幕，再回退到 ASR。"
+                    : "逻辑：优先找 `target_lang` 对应的 YouTube 字幕；命中后直接复用并跳过翻译；如果没有可用目标字幕，再回退到 ASR。"}
+              </div>
+
               {translateEnabled && translateProvider === "openai" && openaiKeySet === false ? (
                 <div className="md:col-span-2 text-xs text-rose-700">
                   OpenAI API Key 未设置，请先到 <Link className="underline" to="/settings/translate">Settings · Translate</Link> 保存配置。
@@ -271,6 +432,7 @@ export default function SettingsAutoPage() {
                   <option value="auto">auto（使用后端默认）</option>
                   <option value="mock">mock</option>
                   <option value="faster-whisper">faster-whisper</option>
+                  <option value="openvino">openvino（方案2 / Intel Arc）</option>
                 </select>
               </label>
               <label className="block">
@@ -288,7 +450,7 @@ export default function SettingsAutoPage() {
                   ))}
                 </select>
                 <div className="mt-2 text-xs text-slate-500">
-                  提示：留空表示使用 Settings · ASR 中的默认模型（或后端 env 默认）。
+                  提示：留空表示使用 Settings · ASR 中的默认模型。若选择 `openvino`，这里应指向已导出的 OpenVINO Whisper 模型目录。
                 </div>
               </label>
             </div>
@@ -379,6 +541,22 @@ export default function SettingsAutoPage() {
                   if (!Number.isFinite(n) || !Number.isInteger(n)) throw new Error("video_crf 必须是整数");
                   video_crf = n;
                 }
+                const primaryFontScaleRaw = primaryFontScalePercentText.trim();
+                const primary_font_scale_percent = Number(primaryFontScaleRaw || "100");
+                if (!Number.isFinite(primary_font_scale_percent) || !Number.isInteger(primary_font_scale_percent)) {
+                  throw new Error("主字幕字号必须是整数百分比");
+                }
+                if (primary_font_scale_percent < 25 || primary_font_scale_percent > 300) {
+                  throw new Error("主字幕字号百分比必须在 25~300 之间");
+                }
+                const secondaryFontScaleRaw = secondaryFontScalePercentText.trim();
+                const secondary_font_scale_percent = Number(secondaryFontScaleRaw || "100");
+                if (!Number.isFinite(secondary_font_scale_percent) || !Number.isInteger(secondary_font_scale_percent)) {
+                  throw new Error("辅字幕字号必须是整数百分比");
+                }
+                if (secondary_font_scale_percent < 25 || secondary_font_scale_percent > 300) {
+                  throw new Error("辅字幕字号百分比必须在 25~300 之间");
+                }
                 const presetRaw = videoPresetText.trim();
                 await fetchJson(`${SUBTITLE_SERVICE_URL}/subtitle/auto/profile`, {
                   method: "PUT",
@@ -389,11 +567,16 @@ export default function SettingsAutoPage() {
                     soft_sub: softSub,
                     ass_style: assStyle,
                     video_codec: videoCodec,
+                    use_intel_gpu: useIntelGpu,
                     video_preset: presetRaw ? presetRaw : null,
                     video_crf,
+                    primary_font_scale_percent,
+                    secondary_font_scale_percent,
                     asr_engine: asrEngine,
                     asr_language: asrLanguage,
                     asr_model: asrModel.trim() ? asrModel.trim() : "",
+                    prefer_youtube_subtitles: youtubeSubtitleMode !== "off",
+                    youtube_subtitle_mode: youtubeSubtitleMode,
                     translate_enabled: translateEnabled,
                     translate_provider: translateProvider,
                     target_lang: targetLang,
@@ -431,9 +614,12 @@ export default function SettingsAutoPage() {
               setVideoCodec("av1");
               setVideoPresetText("");
               setVideoCrfText("");
+              setPrimaryFontScalePercentText("100");
+              setSecondaryFontScalePercentText("100");
               setAsrEngine("auto");
               setAsrLanguage("auto");
               setAsrModel("");
+              setYouTubeSubtitleMode("target");
               setTranslateEnabled(true);
               setBilingual(false);
               setTargetLang("zh");

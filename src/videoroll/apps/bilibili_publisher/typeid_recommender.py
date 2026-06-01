@@ -1,11 +1,9 @@
 from __future__ import annotations
 
-import json
 from typing import Any
 
-import httpx
-
-from videoroll.utils.openai_compat import build_openai_chat_completions_url
+from videoroll.ai.client import OpenAIChatConfig
+from videoroll.ai.service import recommend_typeid_openai as _recommend_typeid_openai
 
 
 def flatten_typelist(typelist: Any) -> list[dict[str, Any]]:
@@ -60,61 +58,14 @@ def recommend_typeid_openai(
     temperature: float = 0.0,
     timeout_seconds: float = 30.0,
 ) -> dict[str, Any]:
-    s = (text or "").strip()
-    if not s:
-        raise ValueError("text is empty")
-    if not options:
-        raise ValueError("options is empty")
-
-    url = build_openai_chat_completions_url(base_url)
-    headers = {"Authorization": f"Bearer {api_key}"}
-
-    # Keep the prompt compact; options can be large.
-    options_lines = "\n".join([f"{int(o.get('id') or 0)}\t{str(o.get('path') or '').strip()}" for o in options])
-
-    system_prompt = "Return ONLY valid JSON (no markdown, no extra text)."
-    user_prompt = (
-        "你是 B 站投稿分区（tid/typeid）助手。请根据输入文本，选择最合适的一个分区。\n"
-        "要求：\n"
-        "- 必须从提供的候选列表中选择，输出的 typeid 必须在候选列表里；\n"
-        "- 只输出 JSON 对象，字段为：typeid（数字）与 reason（字符串，<=80字）。\n\n"
-        f"输入文本：\n{s}\n\n"
-        "候选分区（每行：typeid<TAB>path）：\n"
-        f"{options_lines}\n\n"
-        "输出 JSON：\n"
-        '{ "typeid": 0, "reason": "" }'
+    return _recommend_typeid_openai(
+        text,
+        options=options,
+        config=OpenAIChatConfig(
+            api_key=api_key,
+            base_url=base_url,
+            model=model,
+            temperature=float(temperature),
+            timeout_seconds=float(timeout_seconds),
+        ),
     )
-
-    req: dict[str, Any] = {
-        "model": model,
-        "temperature": float(temperature),
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        "response_format": {"type": "json_object"},
-    }
-
-    t = float(timeout_seconds)
-    timeout = httpx.Timeout(t, connect=min(10.0, t), read=t, write=t, pool=t)
-    with httpx.Client(timeout=timeout) as client:
-        resp = client.post(url, headers=headers, json=req)
-        resp.raise_for_status()
-        data = resp.json()
-
-    choices = data.get("choices") if isinstance(data, dict) else None
-    if not isinstance(choices, list) or not choices:
-        raise RuntimeError("OpenAI returned empty choices")
-    msg = choices[0].get("message") if isinstance(choices[0], dict) else None
-    content = msg.get("content") if isinstance(msg, dict) else None
-    if not isinstance(content, str) or not content.strip():
-        raise RuntimeError("OpenAI returned empty content")
-
-    try:
-        obj = json.loads(content)
-    except Exception as e:
-        raise RuntimeError("OpenAI returned invalid JSON") from e
-    if not isinstance(obj, dict):
-        raise RuntimeError("OpenAI returned non-object JSON")
-    return obj
-

@@ -34,10 +34,13 @@ class RenderOptions(BaseModel):
     soft_sub: bool = False
     ass_style: str = "clean_white"
     video_codec: str = "av1"
+    use_intel_gpu: bool = False
     # Optional encoder preset (codec-dependent). If omitted, codec-specific defaults are used.
     video_preset: Optional[str] = None
     # Optional encoder quality control. If omitted, codec-specific defaults are used.
     video_crf: Optional[int] = Field(default=None, ge=0, le=63)
+    primary_font_scale_percent: int = Field(default=100, ge=25, le=300)
+    secondary_font_scale_percent: int = Field(default=100, ge=25, le=300)
 
 
 class OutputOptions(BaseModel):
@@ -48,11 +51,14 @@ class OutputOptions(BaseModel):
 class SubtitleJobCreate(BaseModel):
     task_id: uuid.UUID
     resume: bool = False
+    prefer_youtube_subtitles: bool = True
+    youtube_subtitle_mode: Literal["off", "target", "auto_source"] = "target"
     input: InputRef
     asr: ASROptions = Field(default_factory=ASROptions)
     translate: TranslateOptions = Field(default_factory=TranslateOptions)
     output: OutputOptions = Field(default_factory=OutputOptions)
     output_prefix: str = ""
+    after_render: Optional[dict[str, Any]] = None
 
 
 class SubtitleJobRead(BaseModel):
@@ -73,17 +79,36 @@ class WhisperSettingsRead(BaseModel):
     whisper_model_dir: str
     whisper_device: str
     whisper_compute_type: str
+    openvino_model: str
+    openvino_device: str
+    openvino_num_beams: int = 1
+    openvino_max_new_tokens: int = 448
     whisper_cpu_threads: int = 0
     whisper_num_workers: int = 1
     whisper_cpu_threads_effective: int = 0
     whisper_num_workers_effective: int = 1
     faster_whisper_installed: bool = False
+    openvino_installed: bool = False
+
+
+class IntelHardwareProbeRead(BaseModel):
+    checked: bool = True
+    available: bool = False
+    render_device: str
+    model_name: Optional[str] = None
+    driver: Optional[str] = None
+    pci_slot: Optional[str] = None
+    pci_id: Optional[str] = None
+    detail: str = ""
 
 
 class ASRDefaultsRead(BaseModel):
     default_engine: str
     default_language: str
     default_model: str
+    openvino_device: str = "GPU"
+    openvino_num_beams: int = 1
+    openvino_max_new_tokens: int = 448
     model_download_proxy: str = ""
 
 
@@ -91,6 +116,9 @@ class ASRDefaultsUpdate(BaseModel):
     default_engine: Optional[str] = None
     default_language: Optional[str] = None
     default_model: Optional[str] = None
+    openvino_device: Optional[str] = None
+    openvino_num_beams: Optional[int] = Field(default=None, ge=1, le=16)
+    openvino_max_new_tokens: Optional[int] = Field(default=None, ge=1, le=4096)
     model_download_proxy: Optional[str] = None
 
 
@@ -100,13 +128,18 @@ class SubtitleAutoProfileRead(BaseModel):
     soft_sub: bool = False
     ass_style: str = "clean_white"
     video_codec: str = "av1"
+    use_intel_gpu: bool = False
     video_preset: Optional[str] = None
     video_crf: Optional[int] = None
+    primary_font_scale_percent: int = Field(default=100, ge=25, le=300)
+    secondary_font_scale_percent: int = Field(default=100, ge=25, le=300)
 
     asr_engine: str = "auto"
     asr_language: str = "auto"
     asr_model: Optional[str] = None
 
+    prefer_youtube_subtitles: bool = True
+    youtube_subtitle_mode: Literal["off", "target", "auto_source"] = "target"
     translate_enabled: bool = True
     translate_provider: str = "openai"
     target_lang: str = "zh"
@@ -128,13 +161,18 @@ class SubtitleAutoProfileUpdate(BaseModel):
     soft_sub: Optional[bool] = None
     ass_style: Optional[str] = None
     video_codec: Optional[str] = None
+    use_intel_gpu: Optional[bool] = None
     video_preset: Optional[str] = None
     video_crf: Optional[int] = Field(default=None, ge=0, le=63)
+    primary_font_scale_percent: Optional[int] = Field(default=None, ge=25, le=300)
+    secondary_font_scale_percent: Optional[int] = Field(default=None, ge=25, le=300)
 
     asr_engine: Optional[str] = None
     asr_language: Optional[str] = None
     asr_model: Optional[str] = None
 
+    prefer_youtube_subtitles: Optional[bool] = None
+    youtube_subtitle_mode: Optional[Literal["off", "target", "auto_source"]] = None
     translate_enabled: Optional[bool] = None
     translate_provider: Optional[str] = None
     target_lang: Optional[str] = None
@@ -198,6 +236,7 @@ class WhisperModelInfo(BaseModel):
 
 
 class WhisperModelDownloadRequest(BaseModel):
+    engine: str = "faster-whisper"
     model: str
     name: Optional[str] = None
     revision: Optional[str] = None
@@ -220,6 +259,10 @@ class ModelDownloadProxyTestResponse(BaseModel):
 
 class TaskQueueSettingsRead(BaseModel):
     max_concurrency: int = Field(1, description="0=暂停调度；>0 表示最多同时运行多少个任务（Task pipeline）")
+    runtime_worker_concurrency: Optional[int] = Field(default=None, description="运行中 subtitle worker 的目标并发；最小为 1")
+    runtime_sync_ok: Optional[bool] = None
+    runtime_sync_detail: Optional[str] = None
+    runtime_sync_workers: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class TaskQueueSettingsUpdate(BaseModel):

@@ -1,0 +1,6 @@
+services:
+  app:
+    devices:
+      - "/dev/dri:/dev/dri"
+    environment:
+      INTEL_GPU_RENDER_DEVICE: ${INTEL_GPU_RENDER_DEVICE:-/dev/dri/renderD128}

@@ -6,23 +6,54 @@ import { ORCHESTRATOR_URL } from "../lib/urls";
 import { Task, TaskStatus } from "../lib/types";
 
 type SubtitleActionResponse = { job_id: string; status: string };
+type AutoYouTubeStartResponse = { task_id: string; pipeline_job_id: string };
+type RecentFailedResumeResult = { task_id: string; job_id?: string | null; status: string; detail?: string | null };
+type RecentFailedResumeResponse = {
+  window_hours: number;
+  matched_count: number;
+  resumed_count: number;
+  skipped_count: number;
+  failed_count: number;
+  results: RecentFailedResumeResult[];
+};
+
+function formatRecentFailedResumeSummary(resp: RecentFailedResumeResponse): string {
+  const parts = [`${resp.window_hours} 小时内命中 ${resp.matched_count} 个失败任务`, `已提交 ${resp.resumed_count} 个`];
+  if (resp.skipped_count > 0) parts.push(`跳过 ${resp.skipped_count} 个`);
+  if (resp.failed_count > 0) parts.push(`失败 ${resp.failed_count} 个`);
+
+  const details = resp.results
+    .filter((item) => item.status !== "queued" && !!item.detail?.trim())
+    .slice(0, 3)
+    .map((item) => `${item.task_id.slice(0, 8)}: ${item.detail}`);
+
+  return details.length ? `${parts.join("，")}。\n${details.join("\n")}` : `${parts.join("，")}。`;
+}
 
 export default function TasksPage() {
   const [searchParams, setSearchParams] = useSearchParams();
   const [tasks, setTasks] = useState<Task[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [actionBusyId, setActionBusyId] = useState<string | null>(null);
+  const [bulkResumeBusy, setBulkResumeBusy] = useState(false);
 
   const status = (searchParams.get("status") as TaskStatus | null) ?? null;
 
-  useEffect(() => {
+  async function reloadTasks() {
     const qs = new URLSearchParams();
     if (status) qs.set("status", status);
     qs.set("limit", "200");
+    const data = await fetchJson<Task[]>(`${ORCHESTRATOR_URL}/tasks?${qs.toString()}`);
+    setTasks(data);
+    return data;
+  }
+
+  useEffect(() => {
     setError(null);
-    fetchJson<Task[]>(`${ORCHESTRATOR_URL}/tasks?${qs.toString()}`)
-      .then((data) => setTasks(data))
+    reloadTasks()
+      .then(() => undefined)
       .catch((e: unknown) => setError(e instanceof Error ? e.message : String(e)));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [status]);
 
   const statusOptions = useMemo(
@@ -51,9 +82,33 @@ export default function TasksPage() {
             <div className="text-lg font-semibold">Tasks</div>
             <div className="text-sm text-slate-600">任务列表与状态筛选</div>
           </div>
-          <Link to="/tasks/new" className="rounded bg-slate-900 px-3 py-2 text-sm text-white hover:bg-slate-800">
-            新建任务
-          </Link>
+          <div className="flex flex-wrap items-center gap-2">
+            <button
+              disabled={bulkResumeBusy}
+              className="rounded border px-3 py-2 text-sm text-slate-700 hover:bg-slate-50 disabled:opacity-50"
+              onClick={async () => {
+                if (!confirm("一键继续最近 24 小时内失败任务？会批量恢复字幕任务，并在渲染后自动投稿。")) return;
+                setBulkResumeBusy(true);
+                setError(null);
+                try {
+                  const resp = await fetchJson<RecentFailedResumeResponse>(`${ORCHESTRATOR_URL}/tasks/actions/resume_failed_recent`, {
+                    method: "POST",
+                  });
+                  alert(formatRecentFailedResumeSummary(resp));
+                  await reloadTasks();
+                } catch (e: unknown) {
+                  setError(e instanceof Error ? e.message : String(e));
+                } finally {
+                  setBulkResumeBusy(false);
+                }
+              }}
+            >
+              一键继续24h失败任务
+            </button>
+            <Link to="/tasks/new" className="rounded bg-slate-900 px-3 py-2 text-sm text-white hover:bg-slate-800">
+              新建任务
+            </Link>
+          </div>
         </div>
 
         <div className="mt-3 flex flex-wrap items-center gap-2">
@@ -137,11 +192,7 @@ export default function TasksPage() {
                                   method: "POST",
                                 });
                                 alert(`已提交继续任务：${resp.job_id}`);
-                                const qs = new URLSearchParams();
-                                if (status) qs.set("status", status);
-                                qs.set("limit", "200");
-                                const data = await fetchJson<Task[]>(`${ORCHESTRATOR_URL}/tasks?${qs.toString()}`);
-                                setTasks(data);
+                                await reloadTasks();
                               } catch (e: unknown) {
                                 setError(e instanceof Error ? e.message : String(e));
                               } finally {
@@ -162,11 +213,7 @@ export default function TasksPage() {
                               setError(null);
                               try {
                                 await fetchJson(`${ORCHESTRATOR_URL}/tasks/${t.id}/actions/youtube_download`, { method: "POST" });
-                                const qs = new URLSearchParams();
-                                if (status) qs.set("status", status);
-                                qs.set("limit", "200");
-                                const data = await fetchJson<Task[]>(`${ORCHESTRATOR_URL}/tasks?${qs.toString()}`);
-                                setTasks(data);
+                                await reloadTasks();
                               } catch (e: unknown) {
                                 setError(e instanceof Error ? e.message : String(e));
                               } finally {
@@ -175,6 +222,31 @@ export default function TasksPage() {
                             }}
                           >
                             重试下载
+                          </button>
+                        ) : null}
+                        {["INGESTED", "DOWNLOADED"].includes(t.status) && t.source_type === "youtube" && !!(t.source_url ?? "").trim() ? (
+                          <button
+                            disabled={actionBusyId === t.id}
+                            className="rounded border px-2 py-1 text-xs hover:bg-slate-50 disabled:opacity-50"
+                            onClick={async () => {
+                              if (!confirm("启动 YouTube 自动模式？会继续执行下载、字幕、压制和自动投稿。")) return;
+                              setActionBusyId(t.id);
+                              setError(null);
+                              try {
+                                const resp = await fetchJson<AutoYouTubeStartResponse>(
+                                  `${ORCHESTRATOR_URL}/tasks/${t.id}/actions/auto_youtube_start`,
+                                  { method: "POST" },
+                                );
+                                alert(`已提交自动任务：${resp.pipeline_job_id}`);
+                                await reloadTasks();
+                              } catch (e: unknown) {
+                                setError(e instanceof Error ? e.message : String(e));
+                              } finally {
+                                setActionBusyId(null);
+                              }
+                            }}
+                          >
+                            启动自动
                           </button>
                         ) : null}
                         <Link className="rounded border px-2 py-1 text-xs hover:bg-slate-50" to={`/tasks/${t.id}`}>

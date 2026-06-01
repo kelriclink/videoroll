@@ -6,6 +6,7 @@ import os
 import random
 import tempfile
 import threading
+import time
 import traceback
 import uuid
 from datetime import datetime, timezone
@@ -13,14 +14,21 @@ from pathlib import Path
 from typing import Any
 
 from celery import Celery
+from redis import Redis
+from redis.exceptions import RedisError
 from sqlalchemy.orm import Session
 
+from videoroll.ai.client import openai_chat_config_from_settings
+from videoroll.ai.service import recommend_typeid_openai
 from videoroll.apps.bilibili_publisher.auth_settings_store import get_bilibili_cookie_header, get_bilibili_csrf_token
 from celery.exceptions import Retry
 
-from videoroll.apps.bilibili_publisher.bilibili_web_client import BilibiliRateLimitError, BilibiliWebClient
+from videoroll.apps.bilibili_publisher.bilibili_web_client import BilibiliDescTooLongError, BilibiliRateLimitError, BilibiliWebClient
+from videoroll.apps.bilibili_publisher.constants import BILIBILI_DESC_RETRY_MAX_CHARS
+from videoroll.apps.orchestrator_api.youtube_downloader import extract_youtube_channel_info, pick_thumbnail_url
 from videoroll.apps.bilibili_publisher.schemas import BilibiliPublishMeta
-from videoroll.apps.bilibili_publisher.typeid_recommender import flatten_typelist, recommend_typeid_openai
+from videoroll.apps.bilibili_publisher.typeid_recommender import flatten_typelist
+from videoroll.apps.publish_meta_rules import bilibili_text_units, clamp_bilibili_text
 from videoroll.config import get_bilibili_publisher_settings, get_subtitle_settings
 from videoroll.db.base import Base
 from videoroll.db.auto_migrate import auto_migrate
@@ -35,6 +43,9 @@ settings = get_bilibili_publisher_settings()
 logger = logging.getLogger(__name__)
 _DB_READY_LOCK = threading.Lock()
 _DB_READY_PID: int | None = None
+_REDIS_LOCK = threading.Lock()
+_REDIS_PID: int | None = None
+_REDIS_CLIENT: Redis | None = None
 celery_app = Celery("bilibili_publisher", broker=settings.redis_url, backend=settings.redis_url)
 celery_app.conf.update(
     task_serializer="json",
@@ -72,6 +83,17 @@ def _as_dict(v: Any) -> dict[str, Any]:
     return v if isinstance(v, dict) else {}
 
 
+def _env_float(name: str, default: float, *, minimum: float = 0.0) -> float:
+    raw = str(os.getenv(name, "") or "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except Exception:
+        return default
+    return value if value >= minimum else minimum
+
+
 def _extract_video_key(meta_json: dict[str, Any]) -> str:
     v = meta_json.get("video")
     if isinstance(v, dict):
@@ -82,6 +104,181 @@ def _extract_video_key(meta_json: dict[str, Any]) -> str:
     if isinstance(key, str) and key.strip():
         return key.strip()
     return ""
+
+
+def _read_s3_json(store: S3Store, key: str) -> dict[str, Any]:
+    obj = store.get_object(key)
+    body = obj.get("Body")
+    if not body:
+        return {}
+    try:
+        raw = body.read() or b""
+    finally:
+        try:
+            body.close()
+        except Exception:
+            pass
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw.decode("utf-8"))
+    except Exception:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _read_latest_youtube_info(task: Task, db: Session, store: S3Store) -> dict[str, Any]:
+    if task.source_type.value != "youtube":
+        return {}
+
+    asset = (
+        db.query(Asset)
+        .filter(Asset.task_id == task.id, Asset.kind == AssetKind.metadata_json)
+        .order_by(Asset.created_at.desc())
+        .first()
+    )
+    if not asset:
+        return {}
+    try:
+        return _read_s3_json(store, asset.storage_key)
+    except Exception:
+        return {}
+
+
+def _normalize_collection_title(value: Any, *, max_chars: int = 80) -> str:
+    text = " ".join(str(value or "").split())
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars].rstrip()
+
+
+def _youtube_collection_title_from_info(info: dict[str, Any]) -> str:
+    if not isinstance(info, dict):
+        return ""
+    for key in ("uploader", "channel", "uploader_id", "channel_id"):
+        title = _normalize_collection_title(info.get(key))
+        if title:
+            return title
+    return ""
+
+
+def _youtube_channel_url_from_info(info: dict[str, Any]) -> str:
+    if not isinstance(info, dict):
+        return ""
+    for key in ("uploader_url", "channel_url", "webpage_url"):
+        value = str(info.get(key) or "").strip()
+        if value and "youtube.com/" in value:
+            return value
+    return ""
+
+
+def _pick_youtube_collection_cover(
+    *,
+    task: Task,
+    store: S3Store,
+    db: Session,
+    fallback_cover_url: str,
+) -> tuple[str, dict[str, Any]]:
+    info = _read_latest_youtube_info(task, db, store)
+    channel_url = _youtube_channel_url_from_info(info)
+    if channel_url:
+        try:
+            channel_info = extract_youtube_channel_info(channel_url, get_subtitle_settings())
+            art_url = str(pick_thumbnail_url(channel_info) or "").strip()
+            if art_url:
+                return art_url, {"source": "youtube_channel", "channel_url": channel_url}
+        except Exception as e:
+            logger.warning("failed to extract youtube channel art (task_id=%s url=%s): %s", task.id, channel_url, e)
+
+    fallback = str(fallback_cover_url or "").strip()
+    if fallback:
+        return fallback, {"source": "video_cover"}
+    return "", {"source": "none"}
+
+
+def _attach_youtube_uploader_collection(
+    *,
+    client: BilibiliWebClient,
+    task: Task,
+    meta: BilibiliPublishMeta,
+    uploaded_cid: int,
+    aid: int,
+    csrf: str,
+    cover_url: str,
+    store: S3Store,
+    db: Session,
+) -> dict[str, Any]:
+    info = _read_latest_youtube_info(task, db, store)
+    title = _youtube_collection_title_from_info(info)
+    if not title:
+        return {"ok": False, "skipped": True, "reason": "youtube uploader/channel not found"}
+
+    result: dict[str, Any] = {
+        "ok": False,
+        "title": title,
+        "created": False,
+    }
+    try:
+        season = client.find_season_by_title(title)
+        cover_debug: dict[str, Any] = {"source": "existing_season"} if season else {}
+        if season is None:
+            season_cover, cover_debug = _pick_youtube_collection_cover(
+                task=task,
+                store=store,
+                db=db,
+                fallback_cover_url=cover_url,
+            )
+            if not season_cover:
+                video_info = client.get_video_info(aid=aid)
+                season_cover = video_info.cover
+                cover_debug = {"source": "published_video"}
+            if not season_cover:
+                return {
+                    **result,
+                    "skipped": True,
+                    "reason": "collection cover is empty",
+                    "cover": cover_debug,
+                }
+            season, created = client.ensure_season(title=title, cover=season_cover, csrf=csrf)
+            result["created"] = bool(created)
+
+        episodes = [
+            {
+                "aid": int(aid),
+                "cid": int(uploaded_cid),
+                "title": meta.title,
+                "charging_pay": 0,
+            }
+        ]
+        try:
+            client.add_to_season(section_id=season.section_id, episodes=episodes, csrf=csrf)
+        except Exception:
+            video_info = client.get_video_info(aid=aid)
+            client.add_to_season(
+                section_id=season.section_id,
+                episodes=[
+                    {
+                        "aid": int(video_info.aid),
+                        "cid": int(video_info.cid),
+                        "title": video_info.title,
+                        "charging_pay": 0,
+                    }
+                ],
+                csrf=csrf,
+            )
+
+        return {
+            **result,
+            "ok": True,
+            "season_id": season.season_id,
+            "section_id": season.section_id,
+            "cover": cover_debug,
+        }
+    except Exception as e:
+        return {
+            **result,
+            "error": str(e),
+        }
 
 
 def _ensure_publish_result_asset(db: Session, task_id: uuid.UUID, key: str) -> None:
@@ -96,6 +293,244 @@ def _ensure_publish_result_asset(db: Session, task_id: uuid.UUID, key: str) -> N
     db.add(Asset(task_id=task_id, kind=AssetKind.publish_result, storage_key=key))
 
 
+def _redis_client() -> Redis | None:
+    global _REDIS_PID, _REDIS_CLIENT
+    pid = os.getpid()
+    if _REDIS_CLIENT is not None and _REDIS_PID == pid:
+        return _REDIS_CLIENT
+    with _REDIS_LOCK:
+        if _REDIS_CLIENT is not None and _REDIS_PID == pid:
+            return _REDIS_CLIENT
+        try:
+            client = Redis.from_url(settings.redis_url, decode_responses=True)
+            client.ping()
+        except Exception as e:
+            logger.warning("publish throttle disabled: redis unavailable (%s)", e)
+            _REDIS_CLIENT = None
+            _REDIS_PID = pid
+            return None
+        _REDIS_CLIENT = client
+        _REDIS_PID = pid
+        return _REDIS_CLIENT
+
+
+def _count_pending_publish_jobs(db: Session) -> int:
+    return int(
+        db.query(Task)
+        .filter(Task.status == TaskStatus.publishing)
+        .count()
+    )
+
+
+def _publish_throttle_config(stage: str) -> tuple[float, float, float]:
+    if stage == "upload":
+        return (
+            _env_float("BILIBILI_PUBLISH_UPLOAD_BASE_SECONDS", 45.0, minimum=1.0),
+            _env_float("BILIBILI_PUBLISH_UPLOAD_QUEUE_STEP_SECONDS", 15.0, minimum=0.0),
+            _env_float("BILIBILI_PUBLISH_UPLOAD_MAX_SECONDS", 180.0, minimum=1.0),
+        )
+    return (
+        _env_float("BILIBILI_PUBLISH_SUBMIT_BASE_SECONDS", 20.0, minimum=1.0),
+        _env_float("BILIBILI_PUBLISH_SUBMIT_QUEUE_STEP_SECONDS", 8.0, minimum=0.0),
+        _env_float("BILIBILI_PUBLISH_SUBMIT_MAX_SECONDS", 90.0, minimum=1.0),
+    )
+
+
+def _compute_publish_throttle_interval(stage: str, *, pending_jobs: int) -> float:
+    base, step, cap = _publish_throttle_config(stage)
+    queue_size = max(1, int(pending_jobs))
+    return min(cap, base + max(0, queue_size - 1) * step)
+
+
+def _publish_stage_gate_key(stage: str) -> str:
+    return f"videoroll:bilibili:publish:{stage}:not_before"
+
+
+def _publish_stage_lock_key(stage: str) -> str:
+    return f"videoroll:bilibili:publish:{stage}:lock"
+
+
+def _parse_float(raw: Any) -> float | None:
+    if raw is None:
+        return None
+    try:
+        return float(raw)
+    except Exception:
+        return None
+
+
+def _reserve_publish_stage_slot(db: Session, *, stage: str, job_id: str) -> dict[str, Any]:
+    pending_jobs = _count_pending_publish_jobs(db)
+    interval_seconds = _compute_publish_throttle_interval(stage, pending_jobs=pending_jobs)
+    out = {
+        "stage": stage,
+        "job_id": job_id,
+        "pending_jobs": pending_jobs,
+        "interval_seconds": round(interval_seconds, 3),
+        "wait_seconds": 0.0,
+        "source": "disabled",
+    }
+
+    client = _redis_client()
+    if client is None:
+        return out
+
+    lock = client.lock(
+        _publish_stage_lock_key(stage),
+        timeout=int(_env_float("BILIBILI_PUBLISH_THROTTLE_LOCK_TIMEOUT_SECONDS", 15.0, minimum=3.0)),
+        blocking_timeout=_env_float("BILIBILI_PUBLISH_THROTTLE_LOCK_WAIT_SECONDS", 5.0, minimum=0.0),
+    )
+    acquired = False
+    try:
+        acquired = bool(lock.acquire(blocking=True))
+        if not acquired:
+            out["source"] = "lock_timeout"
+            return out
+        now = time.time()
+        not_before = _parse_float(client.get(_publish_stage_gate_key(stage))) or 0.0
+        slot_at = max(now, not_before)
+        next_not_before = slot_at + interval_seconds
+        ttl_seconds = max(600, int(max(0.0, next_not_before - now) + 600.0))
+        client.set(_publish_stage_gate_key(stage), f"{next_not_before:.3f}", ex=ttl_seconds)
+        out.update(
+            {
+                "wait_seconds": round(max(0.0, slot_at - now), 3),
+                "slot_at": round(slot_at, 3),
+                "next_not_before": round(next_not_before, 3),
+                "source": "redis",
+            }
+        )
+        return out
+    except RedisError as e:
+        logger.warning("publish throttle fallback (stage=%s job_id=%s): %s", stage, job_id, e)
+        out["source"] = "redis_error"
+        return out
+    finally:
+        if acquired:
+            try:
+                lock.release()
+            except Exception:
+                pass
+
+
+def _apply_publish_stage_throttle(db: Session, *, stage: str, job_id: str) -> dict[str, Any]:
+    info = _reserve_publish_stage_slot(db, stage=stage, job_id=job_id)
+    wait_seconds = float(info.get("wait_seconds") or 0.0)
+    if wait_seconds > 0.25:
+        logger.info(
+            "publish throttle wait (stage=%s job_id=%s pending=%s interval=%.3fs wait=%.3fs source=%s)",
+            stage,
+            job_id,
+            info.get("pending_jobs"),
+            float(info.get("interval_seconds") or 0.0),
+            wait_seconds,
+            info.get("source"),
+        )
+        time.sleep(wait_seconds)
+    return info
+
+
+def _extend_publish_stage_cooldown(stage: str, *, delay_seconds: float) -> dict[str, Any]:
+    client = _redis_client()
+    out = {
+        "stage": stage,
+        "delay_seconds": round(max(0.0, float(delay_seconds)), 3),
+        "source": "disabled",
+    }
+    if client is None:
+        return out
+
+    lock = client.lock(
+        _publish_stage_lock_key(stage),
+        timeout=int(_env_float("BILIBILI_PUBLISH_THROTTLE_LOCK_TIMEOUT_SECONDS", 15.0, minimum=3.0)),
+        blocking_timeout=_env_float("BILIBILI_PUBLISH_THROTTLE_LOCK_WAIT_SECONDS", 5.0, minimum=0.0),
+    )
+    acquired = False
+    try:
+        acquired = bool(lock.acquire(blocking=True))
+        if not acquired:
+            out["source"] = "lock_timeout"
+            return out
+        now = time.time()
+        not_before = _parse_float(client.get(_publish_stage_gate_key(stage))) or 0.0
+        next_not_before = max(not_before, now + max(0.0, float(delay_seconds)))
+        ttl_seconds = max(600, int(max(0.0, next_not_before - now) + 600.0))
+        client.set(_publish_stage_gate_key(stage), f"{next_not_before:.3f}", ex=ttl_seconds)
+        out.update(
+            {
+                "source": "redis",
+                "next_not_before": round(next_not_before, 3),
+            }
+        )
+        return out
+    except RedisError as e:
+        logger.warning("publish throttle cooldown fallback (stage=%s): %s", stage, e)
+        out["source"] = "redis_error"
+        return out
+    finally:
+        if acquired:
+            try:
+                lock.release()
+            except Exception:
+                pass
+
+
+def _rate_limit_stage(error: BilibiliRateLimitError) -> str:
+    scope = str(getattr(error, "scope", "") or "").strip().lower()
+    if scope in {"upload", "submit"}:
+        return scope
+    message = str(getattr(error, "message", "") or "")
+    if int(getattr(error, "code", 0) or 0) == 601 or "上传" in message:
+        return "upload"
+    return "submit"
+
+
+def _rate_limit_retry_countdown(*, stage: str, retries_done: int) -> float:
+    exp = (2 ** (retries_done + 1)) + random.random()
+    if stage == "upload":
+        return min(180.0, max(60.0, exp))
+    return min(90.0, max(20.0, exp))
+
+
+def _publish_meta_with_retry_desc_limit(meta: BilibiliPublishMeta) -> BilibiliPublishMeta:
+    payload = meta.model_dump()
+    payload["desc"] = clamp_bilibili_text(meta.desc, BILIBILI_DESC_RETRY_MAX_CHARS)
+    # desc_v2 is another rich-text representation of the description; clearing it
+    # prevents Bilibili from counting stale raw_text after desc has been shortened.
+    payload["desc_v2"] = None
+    return BilibiliPublishMeta.model_validate(payload)
+
+
+def _add_archive_with_desc_retry(
+    *,
+    client: BilibiliWebClient,
+    meta: BilibiliPublishMeta,
+    csrf: str,
+    tid: int,
+    uploaded: Any,
+    cover_url: str,
+) -> tuple[dict[str, Any], BilibiliPublishMeta, dict[str, Any] | None]:
+    try:
+        return client.add_archive(meta, csrf=csrf, tid=tid, uploaded=uploaded, cover_url=cover_url), meta, None
+    except BilibiliDescTooLongError as e:
+        retry_meta = _publish_meta_with_retry_desc_limit(meta)
+        retry_info = {
+            "triggered": True,
+            "error": str(e),
+            "original_units": bilibili_text_units(meta.desc),
+            "retry_units": bilibili_text_units(retry_meta.desc),
+            "retry_max_units": BILIBILI_DESC_RETRY_MAX_CHARS,
+            "cleared_desc_v2": meta.desc_v2 is not None,
+        }
+        logger.warning(
+            "bilibili desc too long; retrying with shorter desc (original_units=%s retry_units=%s retry_max_units=%s)",
+            retry_info["original_units"],
+            retry_info["retry_units"],
+            retry_info["retry_max_units"],
+        )
+        return client.add_archive(retry_meta, csrf=csrf, tid=tid, uploaded=uploaded, cover_url=cover_url), retry_meta, retry_info
+
+
 @celery_app.task(name="bilibili_publisher.process_job", bind=True, max_retries=5)
 def process_job(self, job_id: str) -> dict[str, Any]:
     _ensure_db()
@@ -104,6 +539,8 @@ def process_job(self, job_id: str) -> dict[str, Any]:
     job: PublishJob | None = None
     task: Task | None = None
     store: S3Store | None = None
+    upload_throttle: dict[str, Any] | None = None
+    submit_throttle: dict[str, Any] | None = None
     try:
         job_uuid = uuid.UUID(job_id)
         job = db.get(PublishJob, job_uuid)
@@ -159,10 +596,13 @@ def process_job(self, job_id: str) -> dict[str, Any]:
                 cover_path = workdir / Path(cover_key).name
                 store.download_file(cover_key, cover_path)
 
+            collection_result: dict[str, Any] | None = None
+            desc_retry: dict[str, Any] | None = None
             with BilibiliWebClient(cookie) as client:
                 if cover_path:
                     cover_url = client.upload_cover(cover_path, csrf=csrf)
 
+                upload_throttle = _apply_publish_stage_throttle(db, stage="upload", job_id=job_id)
                 uploaded, upload_debug = client.upload_video_file(video_path)
                 predicted_tid: int | None = None
                 tid_meta = int(meta.typeid)
@@ -209,11 +649,7 @@ def process_job(self, job_id: str) -> dict[str, Any]:
                                 obj = recommend_typeid_openai(
                                     text_for_ai,
                                     options=options,
-                                    api_key=api_key,
-                                    base_url=str(translate_settings.get("openai_base_url") or ""),
-                                    model=str(translate_settings.get("openai_model") or ""),
-                                    temperature=float(translate_settings.get("openai_temperature") or 0.0),
-                                    timeout_seconds=float(translate_settings.get("openai_timeout_seconds") or 30.0),
+                                    config=openai_chat_config_from_settings(translate_settings),
                                 )
                                 tid_ai = int(obj.get("typeid") or 0)
                                 ai_info["typeid"] = tid_ai or None
@@ -269,7 +705,41 @@ def process_job(self, job_id: str) -> dict[str, Any]:
                     ai_info.get("typeid"),
                 )
 
-                add_resp = client.add_archive(meta, csrf=csrf, tid=tid, uploaded=uploaded, cover_url=cover_url)
+                submit_throttle = _apply_publish_stage_throttle(db, stage="submit", job_id=job_id)
+                add_resp, meta, desc_retry = _add_archive_with_desc_retry(
+                    client=client,
+                    meta=meta,
+                    csrf=csrf,
+                    tid=tid,
+                    uploaded=uploaded,
+                    cover_url=cover_url,
+                )
+                add_data = _as_dict(add_resp.get("data"))
+                try:
+                    aid_int = int(add_data.get("aid") or 0)
+                except Exception:
+                    aid_int = 0
+                if task.source_type.value == "youtube":
+                    if aid_int > 0:
+                        collection_result = _attach_youtube_uploader_collection(
+                            client=client,
+                            task=task,
+                            meta=meta,
+                            uploaded_cid=uploaded.cid,
+                            aid=aid_int,
+                            csrf=csrf,
+                            cover_url=cover_url,
+                            store=store,
+                            db=db,
+                        )
+                    else:
+                        collection_result = {
+                            "ok": False,
+                            "skipped": True,
+                            "reason": "publish response missing aid; cannot attach collection",
+                        }
+                    if collection_result and not bool(collection_result.get("ok")) and not bool(collection_result.get("skipped")):
+                        logger.warning("youtube uploader collection attach failed (task_id=%s): %s", task.id, collection_result)
 
         data = _as_dict(add_resp.get("data"))
         aid = data.get("aid")
@@ -286,9 +756,15 @@ def process_job(self, job_id: str) -> dict[str, Any]:
             "mode": "web",
             "cover_url": cover_url or None,
             "video": upload_debug,
+            "throttle": {
+                "upload": upload_throttle,
+                "submit": submit_throttle,
+            },
             "tid": tid,
             "typeid": typeid_debug,
+            "desc_retry": desc_retry,
             "result": {"aid": aid_str or None, "bvid": bvid_str or None},
+            "collection": collection_result,
         }
         job.updated_at = _utcnow()
         db.add(job)
@@ -314,19 +790,21 @@ def process_job(self, job_id: str) -> dict[str, Any]:
     except BilibiliRateLimitError as e:
         retries_done = int(getattr(self.request, "retries", 0))
         max_retries = int(getattr(self, "max_retries", 0) or 0)
+        stage = _rate_limit_stage(e)
+        countdown = _rate_limit_retry_countdown(stage=stage, retries_done=retries_done)
+        cooldown_info = _extend_publish_stage_cooldown(stage, delay_seconds=countdown)
 
         logger.warning(
-            "bilibili rate limited (job_id=%s code=%s status=%s v_voucher=%s retries=%s/%s)",
+            "bilibili rate limited (job_id=%s stage=%s code=%s status=%s v_voucher=%s retries=%s/%s countdown=%.3fs)",
             job_id,
+            stage,
             e.code,
             e.status_code,
             (e.v_voucher or "-"),
             retries_done,
             max_retries,
+            countdown,
         )
-
-        # Match biliup-master: exponential backoff + jitter, cap 64s.
-        countdown = min(64.0, (2 ** (retries_done + 1)) + random.random())
         try:
             if job_uuid is None:
                 job_uuid = uuid.UUID(job_id)
@@ -338,10 +816,16 @@ def process_job(self, job_id: str) -> dict[str, Any]:
                     "error": str(e),
                     "exception_type": type(e).__name__,
                     "rate_limited": True,
+                    "stage": stage,
                     "code": e.code,
                     "status_code": e.status_code,
                     "message": e.message,
                     "v_voucher": e.v_voucher,
+                    "cooldown": cooldown_info,
+                    "throttle": {
+                        "upload": upload_throttle,
+                        "submit": submit_throttle,
+                    },
                     "attempt": retries_done + 1,
                     "max_attempts": max_retries + 1,
                     "retries_done": retries_done,
@@ -383,10 +867,16 @@ def process_job(self, job_id: str) -> dict[str, Any]:
                         "error": str(e),
                         "exception_type": type(e).__name__,
                         "rate_limited": True,
+                        "stage": stage,
                         "code": e.code,
                         "status_code": e.status_code,
                         "message": e.message,
                         "v_voucher": e.v_voucher,
+                        "cooldown": cooldown_info,
+                        "throttle": {
+                            "upload": upload_throttle,
+                            "submit": submit_throttle,
+                        },
                         "attempt": retries_done + 1,
                         "max_attempts": max_retries + 1,
                         "retries_done": retries_done,

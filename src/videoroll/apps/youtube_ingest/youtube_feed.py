@@ -112,15 +112,14 @@ def _fetch_feed_ytdlp(
     return out
 
 
-def fetch_youtube_feed(
+def _fetch_feed_rss(
     source_type: str,
     source_id: str,
     user_agent: str,
     timeout_s: float = 20.0,
     *,
     proxy: Optional[str] = None,
-    limit: Optional[int] = None,
-) -> Iterable[FeedEntry]:
+) -> list[FeedEntry]:
     if source_type == "channel":
         url = f"https://www.youtube.com/feeds/videos.xml?channel_id={source_id}"
     elif source_type == "playlist":
@@ -162,21 +161,64 @@ def fetch_youtube_feed(
                 "atom": "http://www.w3.org/2005/Atom",
                 "yt": "http://www.youtube.com/xml/schemas/2015",
             }
+            out: list[FeedEntry] = []
             for entry in root.findall("atom:entry", ns):
                 video_id_el = entry.find("yt:videoId", ns)
                 title_el = entry.find("atom:title", ns)
                 published_el = entry.find("atom:published", ns)
                 if video_id_el is None or title_el is None or published_el is None:
                     continue
-                yield FeedEntry(
-                    video_id=(video_id_el.text or "").strip(),
-                    title=(title_el.text or "").strip(),
-                    published_at=_parse_datetime((published_el.text or "").strip()),
+                out.append(
+                    FeedEntry(
+                        video_id=(video_id_el.text or "").strip(),
+                        title=(title_el.text or "").strip(),
+                        published_at=_parse_datetime((published_el.text or "").strip()),
+                    )
                 )
-            return
+            return out
         except Exception:
-            # Fall back to yt-dlp.
-            pass
+            return []
 
-    for e in _fetch_feed_ytdlp(source_type, source_id, user_agent, proxy=proxy, limit=limit):
-        yield e
+    return []
+
+
+def fetch_youtube_feed(
+    source_type: str,
+    source_id: str,
+    user_agent: str,
+    timeout_s: float = 20.0,
+    *,
+    proxy: Optional[str] = None,
+    limit: Optional[int] = None,
+) -> Iterable[FeedEntry]:
+    # YouTube's RSS feed exposes only the most recent 15 uploads. For source scans
+    # that need to enumerate deeper history, prefer yt-dlp's paginated channel/tab
+    # extraction and keep RSS only as a fallback.
+    prefer_rss_first = False
+    if limit is not None:
+        try:
+            prefer_rss_first = int(limit) <= 15
+        except Exception:
+            prefer_rss_first = False
+
+    attempts: list[tuple[str, Any]] = []
+    if prefer_rss_first:
+        attempts = [
+            ("rss", lambda: _fetch_feed_rss(source_type, source_id, user_agent, timeout_s, proxy=proxy)),
+            ("ytdlp", lambda: _fetch_feed_ytdlp(source_type, source_id, user_agent, proxy=proxy, limit=limit)),
+        ]
+    else:
+        attempts = [
+            ("ytdlp", lambda: _fetch_feed_ytdlp(source_type, source_id, user_agent, proxy=proxy, limit=limit)),
+            ("rss", lambda: _fetch_feed_rss(source_type, source_id, user_agent, timeout_s, proxy=proxy)),
+        ]
+
+    for _name, loader in attempts:
+        try:
+            entries = loader()
+        except Exception:
+            entries = []
+        if entries:
+            for entry in entries:
+                yield entry
+            return

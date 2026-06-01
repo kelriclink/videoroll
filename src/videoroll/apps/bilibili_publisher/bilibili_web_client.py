@@ -27,13 +27,29 @@ class BilibiliRateLimitError(BilibiliWebError):
         status_code: int | None = None,
         v_voucher: str | None = None,
         raw: dict[str, Any] | None = None,
+        scope: str | None = None,
     ) -> None:
         self.code = int(code)
         self.message = str(message or "").strip()
         self.status_code = int(status_code) if status_code is not None else None
         self.v_voucher = str(v_voucher or "").strip() or None
         self.raw = raw or {}
+        self.scope = str(scope or "").strip() or None
         super().__init__(f"rate limited (code={self.code} status={self.status_code} message={self.message})")
+
+
+class BilibiliDescTooLongError(BilibiliWebError):
+    def __init__(
+        self,
+        *,
+        code: int,
+        message: str,
+        raw: dict[str, Any] | None = None,
+    ) -> None:
+        self.code = int(code)
+        self.message = str(message or "").strip()
+        self.raw = raw or {}
+        super().__init__(f"bilibili api error (code={self.code} message={self.message})")
 
 
 def _as_dict(v: Any) -> dict[str, Any]:
@@ -55,10 +71,23 @@ def _json(resp: httpx.Response) -> dict[str, Any]:
     return data
 
 
-def _bili_code_ok(data: dict[str, Any]) -> None:
+def _bili_code_ok(
+    data: dict[str, Any],
+    *,
+    status_code: int | None = None,
+    rate_limit_scope: str | None = None,
+) -> None:
     code = data.get("code")
     if code == 0:
         return
+    message = str(data.get("message") or "").strip()
+    try:
+        code_int = int(code)
+    except Exception:
+        code_int = 0
+    if code_int == 21010 and "简介" in message and "过长" in message:
+        raise BilibiliDescTooLongError(code=code_int, message=message, raw=_sanitize_error_json(data))
+    _raise_rate_limit_if_needed(data, status_code=status_code, scope=rate_limit_scope)
     raise BilibiliWebError(f"bilibili api error (code={code} message={data.get('message')})")
 
 
@@ -86,6 +115,22 @@ class UploadedVideo:
     upos_uri: str
 
 
+@dataclass(frozen=True)
+class PublishedVideoInfo:
+    aid: int
+    bvid: str
+    title: str
+    cid: int
+    cover: str
+
+
+@dataclass(frozen=True)
+class SeasonRef:
+    season_id: int
+    section_id: int
+    title: str
+
+
 def _upload_url(pre: PreuploadInfo) -> str:
     endpoint = str(pre.endpoint or "").strip()
     upos_uri = str(pre.upos_uri or "").strip()
@@ -107,6 +152,13 @@ def _drop_none(d: dict[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in d.items() if v is not None}
 
 
+def _normalize_bili_url(url: str) -> str:
+    raw = str(url or "").strip()
+    if raw.startswith("//"):
+        return f"https:{raw}"
+    return raw
+
+
 def _sanitize_error_json(data: dict[str, Any]) -> dict[str, Any]:
     safe = dict(data)
     # preupload auth may appear in some responses; never return or log it.
@@ -126,6 +178,51 @@ def _err_msg(data: dict[str, Any]) -> str:
         if s:
             return s
     return ""
+
+
+def _as_int(value: Any) -> int | None:
+    try:
+        return int(value)
+    except Exception:
+        return None
+
+
+def _looks_like_rate_limited(code: int | None, message: str) -> bool:
+    if code in {601, 406, -702}:
+        return True
+    text = str(message or "").strip()
+    if not text:
+        return False
+    return any(
+        token in text
+        for token in (
+            "请求频率过高",
+            "投稿过于频繁",
+            "上传过快",
+            "上传视频过快",
+        )
+    )
+
+
+def _raise_rate_limit_if_needed(
+    data: dict[str, Any],
+    *,
+    status_code: int | None = None,
+    scope: str | None = None,
+) -> None:
+    safe = _sanitize_error_json(data)
+    code = _as_int(safe.get("code"))
+    message = _err_msg(safe)
+    if not _looks_like_rate_limited(code, message):
+        return
+    raise BilibiliRateLimitError(
+        code=code if code is not None else -1,
+        message=message or "请求频率过高，请稍后再试",
+        status_code=status_code,
+        v_voucher=_extract_v_voucher(safe),
+        raw=safe,
+        scope=scope,
+    )
 
 
 def _extract_v_voucher(data: dict[str, Any]) -> str | None:
@@ -270,15 +367,7 @@ class BilibiliWebClient:
             raise BilibiliWebError(f"preupload http error (status={resp.status_code} body={resp.text[:200]})")
 
         safe = _sanitize_error_json(data)
-        code = safe.get("code")
-        if code == 601:
-            raise BilibiliRateLimitError(
-                code=601,
-                message=_err_msg(safe) or "上传过快",
-                status_code=resp.status_code,
-                v_voucher=_extract_v_voucher(safe),
-                raw=safe,
-            )
+        _raise_rate_limit_if_needed(safe, status_code=resp.status_code, scope="upload")
 
         if resp.status_code != 200:
             msg = _err_msg(safe)
@@ -454,6 +543,216 @@ class BilibiliWebClient:
         _bili_code_ok(data)
         return data
 
+    def get_video_info(
+        self,
+        *,
+        aid: int | None = None,
+        bvid: str | None = None,
+        retries: int = 3,
+        retry_delay_seconds: float = 1.0,
+    ) -> PublishedVideoInfo:
+        params = _drop_none(
+            {
+                "aid": int(aid) if aid is not None else None,
+                "bvid": str(bvid or "").strip() or None,
+            }
+        )
+        _require(bool(params), "aid or bvid is required")
+
+        last_error: str = "unknown error"
+        for attempt in range(max(1, int(retries))):
+            resp = self._bili.get("https://api.bilibili.com/x/web-interface/view", params=params)
+            data = _json(resp)
+            code = data.get("code")
+            if code == 0:
+                obj = _as_dict(data.get("data"))
+                try:
+                    aid_val = int(obj.get("aid") or aid or 0)
+                    cid_val = int(obj.get("cid") or 0)
+                except Exception as e:
+                    raise BilibiliWebError("video info returned invalid numeric fields") from e
+                title = str(obj.get("title") or "").strip()
+                bvid_val = str(obj.get("bvid") or bvid or "").strip()
+                cover = _normalize_bili_url(str(obj.get("pic") or "").strip())
+                _require(aid_val > 0, "video info returned empty aid")
+                _require(cid_val > 0, "video info returned empty cid")
+                _require(bool(title), "video info returned empty title")
+                return PublishedVideoInfo(
+                    aid=aid_val,
+                    bvid=bvid_val,
+                    title=title,
+                    cid=cid_val,
+                    cover=cover,
+                )
+
+            last_error = f"code={code} message={data.get('message')}"
+            if attempt + 1 < max(1, int(retries)):
+                time.sleep(max(0.0, float(retry_delay_seconds)))
+
+        raise BilibiliWebError(f"failed to fetch video info ({last_error})")
+
+    def list_seasons(self, *, pn: int = 1, ps: int = 30) -> dict[str, Any]:
+        resp = self._bili.get(
+            "https://member.bilibili.com/x2/creative/web/seasons",
+            params={
+                "pn": max(1, int(pn)),
+                "ps": max(1, int(ps)),
+                "order": "mtime",
+                "sort": "desc",
+                "draft": 1,
+            },
+        )
+        data = _json(resp)
+        _bili_code_ok(data)
+        return _as_dict(data.get("data"))
+
+    @staticmethod
+    def _season_ref_from_item(item: dict[str, Any]) -> SeasonRef | None:
+        season = _as_dict(item.get("season"))
+        sections_root = _as_dict(item.get("sections"))
+        sections = sections_root.get("sections")
+        if not isinstance(sections, list):
+            return None
+
+        try:
+            season_id = int(season.get("id") or 0)
+        except Exception:
+            season_id = 0
+        title = str(season.get("title") or "").strip()
+        if season_id <= 0 or not title:
+            return None
+
+        for section in sections:
+            if not isinstance(section, dict):
+                continue
+            try:
+                section_id = int(section.get("id") or 0)
+            except Exception:
+                section_id = 0
+            if section_id > 0:
+                return SeasonRef(season_id=season_id, section_id=section_id, title=title)
+        return None
+
+    def find_season_by_title(self, title: str, *, ps: int = 30) -> SeasonRef | None:
+        expected = str(title or "").strip()
+        _require(bool(expected), "season title is empty")
+
+        page = 1
+        while True:
+            data = self.list_seasons(pn=page, ps=ps)
+            items = data.get("seasons")
+            if not isinstance(items, list) or not items:
+                return None
+
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                ref = self._season_ref_from_item(item)
+                if ref and ref.title == expected:
+                    return ref
+
+            try:
+                total = int(data.get("total") or 0)
+            except Exception:
+                total = 0
+            if len(items) < ps or total <= page * ps:
+                return None
+            page += 1
+
+    def get_season_by_id(self, season_id: int, *, ps: int = 30) -> SeasonRef | None:
+        target = int(season_id or 0)
+        _require(target > 0, "season_id must be > 0")
+
+        page = 1
+        while True:
+            data = self.list_seasons(pn=page, ps=ps)
+            items = data.get("seasons")
+            if not isinstance(items, list) or not items:
+                return None
+
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                ref = self._season_ref_from_item(item)
+                if ref and ref.season_id == target:
+                    return ref
+
+            try:
+                total = int(data.get("total") or 0)
+            except Exception:
+                total = 0
+            if len(items) < ps or total <= page * ps:
+                return None
+            page += 1
+
+    def create_season(
+        self,
+        *,
+        title: str,
+        cover: str,
+        csrf: str,
+        desc: str = "",
+        season_price: int = 0,
+    ) -> int:
+        csrf = str(csrf or "").strip()
+        title = str(title or "").strip()
+        cover = _normalize_bili_url(str(cover or "").strip())
+        _require(bool(csrf), "csrf (bili_jct) is empty")
+        _require(bool(title), "season title is empty")
+        _require(bool(cover), "season cover is empty")
+
+        resp = self._bili.post(
+            "https://member.bilibili.com/x2/creative/web/season/add",
+            data={
+                "title": title,
+                "desc": str(desc or "").strip(),
+                "cover": cover,
+                "season_price": int(season_price),
+                "csrf": csrf,
+            },
+        )
+        data = _json(resp)
+        _bili_code_ok(data)
+        try:
+            season_id = int(data.get("data") or 0)
+        except Exception as e:
+            raise BilibiliWebError("season add returned invalid id") from e
+        _require(season_id > 0, "season add returned empty id")
+        return season_id
+
+    def ensure_season(self, *, title: str, cover: str, csrf: str) -> tuple[SeasonRef, bool]:
+        existing = self.find_season_by_title(title)
+        if existing is not None:
+            return existing, False
+
+        season_id = self.create_season(title=title, cover=cover, csrf=csrf)
+        for _ in range(3):
+            created = self.get_season_by_id(season_id)
+            if created is not None:
+                return created, True
+            time.sleep(1.0)
+        raise BilibiliWebError(f"season created but not visible yet (season_id={season_id})")
+
+    def add_to_season(self, *, section_id: int, episodes: list[dict[str, Any]], csrf: str) -> dict[str, Any]:
+        csrf = str(csrf or "").strip()
+        _require(bool(csrf), "csrf (bili_jct) is empty")
+        _require(int(section_id or 0) > 0, "section_id must be > 0")
+        _require(bool(episodes), "episodes is empty")
+
+        resp = self._bili.post(
+            "https://member.bilibili.com/x2/creative/web/season/section/episodes/add",
+            params={"csrf": csrf},
+            json={
+                "sectionId": int(section_id),
+                "episodes": episodes,
+                "csrf": csrf,
+            },
+            headers={"Content-Type": "application/json; charset=UTF-8"},
+        )
+        data = _json(resp)
+        _bili_code_ok(data)
+        return data
+
     def add_archive(
         self,
         meta: BilibiliPublishMeta,
@@ -520,5 +819,5 @@ class BilibiliWebClient:
             json=_drop_none(body),
         )
         data = _json(resp)
-        _bili_code_ok(data)
+        _bili_code_ok(data, status_code=resp.status_code, rate_limit_scope="submit")
         return data

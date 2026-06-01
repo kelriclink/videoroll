@@ -1,12 +1,30 @@
-FROM python:3.12-slim
+FROM ubuntu:24.04
 
+ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
+ENV VIRTUAL_ENV=/opt/venv
+ENV PATH="/opt/venv/bin:${PATH}"
 
 WORKDIR /app
 
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends ffmpeg fonts-noto-cjk \
+  && apt-get install -y --no-install-recommends \
+    python3 \
+    python3-pip \
+    python3-venv \
+    python-is-python3 \
+    ffmpeg \
+    fonts-noto-cjk \
+    intel-media-va-driver \
+    i965-va-driver \
+    pciutils \
+    ocl-icd-libopencl1 \
+    intel-opencl-icd \
+    libze-intel-gpu1 \
+    libze1 \
+    clinfo \
+  && python3 -m venv "${VIRTUAL_ENV}" \
   && rm -rf /var/lib/apt/lists/*
 
 COPY pyproject.toml README.md ./

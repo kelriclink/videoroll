@@ -11,6 +11,8 @@ from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 
+from videoroll.ai.client import openai_chat_config_from_settings
+from videoroll.ai.service import recommend_typeid_openai
 from videoroll.config import BilibiliPublisherSettings, get_bilibili_publisher_settings, get_subtitle_settings
 from videoroll.db.base import Base
 from videoroll.db.auto_migrate import auto_migrate
@@ -19,7 +21,7 @@ from videoroll.db.session import db_session, get_engine
 from videoroll.storage.s3 import S3Store
 from videoroll.apps.bilibili_publisher.auth_settings_store import get_bilibili_auth_settings, get_bilibili_cookie_header, update_bilibili_auth_settings
 from videoroll.apps.bilibili_publisher.bilibili_web_client import BilibiliWebClient
-from videoroll.apps.bilibili_publisher.typeid_recommender import flatten_typelist, recommend_typeid_openai
+from videoroll.apps.bilibili_publisher.typeid_recommender import flatten_typelist
 from videoroll.apps.bilibili_publisher.publish_settings_store import get_bilibili_publish_settings, update_bilibili_publish_settings
 from videoroll.apps.bilibili_publisher.worker import celery_app
 from videoroll.apps.bilibili_publisher.schemas import (
@@ -135,11 +137,7 @@ def recommend_archive_type(
         obj = recommend_typeid_openai(
             text,
             options=options,
-            api_key=str(translate_settings.get("openai_api_key") or ""),
-            base_url=str(translate_settings.get("openai_base_url") or ""),
-            model=str(translate_settings.get("openai_model") or ""),
-            temperature=float(translate_settings.get("openai_temperature") or 0.0),
-            timeout_seconds=float(translate_settings.get("openai_timeout_seconds") or 30.0),
+            config=openai_chat_config_from_settings(translate_settings),
         )
         try:
             tid = int(obj.get("typeid") or 0)

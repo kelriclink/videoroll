@@ -18,6 +18,7 @@ type YouTubeMeta = {
   upload_date?: string | null;
   duration?: number | null;
 };
+type YouTubeSubtitleMode = "off" | "target" | "auto_source";
 type YouTubeMetaActionResponse = { metadata: YouTubeMeta };
 type YouTubeDownloadActionResponse = { metadata: YouTubeMeta; video_asset: Asset; metadata_asset: Asset; cover_asset?: Asset | null };
 type SubtitleAutoProfile = {
@@ -26,11 +27,14 @@ type SubtitleAutoProfile = {
   soft_sub: boolean;
   ass_style: string;
   video_codec: string;
+  use_intel_gpu: boolean;
   video_preset?: string | null;
   video_crf?: number | null;
   asr_engine: string;
   asr_language: string;
   asr_model?: string | null;
+  prefer_youtube_subtitles: boolean;
+  youtube_subtitle_mode?: YouTubeSubtitleMode | null;
   translate_enabled: boolean;
   translate_provider: string;
   target_lang: string;
@@ -62,6 +66,13 @@ type PublishReview = {
   checked_at?: string | null;
 };
 
+function normalizeYouTubeSubtitleMode(value: unknown, legacyPrefer?: boolean | null): YouTubeSubtitleMode {
+  const mode = String(value ?? "").trim().toLowerCase();
+  if (mode === "off" || mode === "target" || mode === "auto_source") return mode;
+  if (legacyPrefer === false) return "off";
+  return "target";
+}
+
 export default function TaskDetailPage() {
   const { taskId } = useParams();
   const [task, setTask] = useState<Task | null>(null);
@@ -81,12 +92,14 @@ export default function TaskDetailPage() {
   const [burnIn, setBurnIn] = useState(false);
   const [softSub, setSoftSub] = useState(false);
   const [videoCodec, setVideoCodec] = useState("av1");
+  const [useIntelGpu, setUseIntelGpu] = useState(false);
   const [videoPresetText, setVideoPresetText] = useState<string>("");
   const [videoCrfText, setVideoCrfText] = useState<string>("");
   const [asrEngine, setAsrEngine] = useState("auto");
   const [asrLanguage, setAsrLanguage] = useState("auto");
   const [asrModel, setAsrModel] = useState<string>("");
   const [whisperModels, setWhisperModels] = useState<Array<{ name: string; path: string }> | null>(null);
+  const [youtubeSubtitleMode, setYouTubeSubtitleMode] = useState<YouTubeSubtitleMode>("target");
   const [translateEnabled, setTranslateEnabled] = useState(false);
   const [bilingual, setBilingual] = useState(false);
   const [targetLang, setTargetLang] = useState("zh");
@@ -218,11 +231,13 @@ export default function TaskDetailPage() {
         setBurnIn(Boolean(profile.burn_in));
         setSoftSub(Boolean(profile.soft_sub));
         setVideoCodec((profile.video_codec || "av1").toLowerCase());
+        setUseIntelGpu(Boolean(profile.use_intel_gpu));
         setVideoPresetText(typeof profile.video_preset === "string" ? profile.video_preset : "");
         setVideoCrfText(typeof profile.video_crf === "number" ? String(profile.video_crf) : "");
         setAsrEngine(profile.asr_engine || "auto");
         setAsrLanguage(profile.asr_language || "auto");
         setAsrModel((profile.asr_model ?? "").trim());
+        setYouTubeSubtitleMode(normalizeYouTubeSubtitleMode(profile.youtube_subtitle_mode, profile.prefer_youtube_subtitles));
         setTranslateEnabled(Boolean(profile.translate_enabled));
         setBilingual(Boolean(profile.bilingual));
         setTargetLang(profile.target_lang || "zh");
@@ -524,11 +539,14 @@ export default function TaskDetailPage() {
             soft_sub: softSub,
             ass_style: "clean_white",
             video_codec: videoCodec,
+            use_intel_gpu: useIntelGpu,
             video_preset: presetRaw ? presetRaw : null,
             video_crf,
             asr_engine: asrEngine,
             asr_language: asrLanguage,
             asr_model: asrModel.trim() ? asrModel.trim() : null,
+            prefer_youtube_subtitles: youtubeSubtitleMode !== "off",
+            youtube_subtitle_mode: youtubeSubtitleMode,
             translate_enabled: translateEnabled,
             translate_provider: translateProvider,
             target_lang: targetLang,
@@ -839,6 +857,19 @@ export default function TaskDetailPage() {
               </label>
               <div className="mt-2 text-xs text-slate-500">提示：只有在启用 “硬字幕（burn-in）” 时才会用到该编码设置。</div>
             </div>
+            <div className="mt-3 flex items-center gap-3 text-sm">
+              <label className="flex items-center gap-2">
+                <input
+                  type="checkbox"
+                  checked={useIntelGpu}
+                  onChange={(e) => setUseIntelGpu(e.target.checked)}
+                />
+                启用 Intel iGPU 硬件编码
+              </label>
+            </div>
+            <div className="mt-2 text-xs text-slate-500">
+              提示：这里只加速硬字幕的最终视频编码。字幕烧录本身仍是 CPU 过滤；软字幕只是封装，不走 GPU。当前 Intel 路径支持 h264/av1。
+            </div>
             <div className="mt-3">
               <label className="block">
                 <div className="mb-1 text-xs text-slate-600">video_crf（可选：留空=默认）</div>
@@ -857,11 +888,19 @@ export default function TaskDetailPage() {
                   className="w-full rounded border px-3 py-2 text-sm"
                   value={videoPresetText}
                   onChange={(e) => setVideoPresetText(e.target.value)}
-                  placeholder={videoCodec === "h264" ? "默认 veryfast（h264）" : "默认 4（av1, 0..13 越小越慢）"}
+                  placeholder={
+                    useIntelGpu
+                      ? videoCodec === "h264"
+                        ? "留空=驱动默认（Intel h264）"
+                        : "留空=驱动默认（Intel av1）；可填 0..13"
+                      : videoCodec === "h264"
+                        ? "默认 veryfast（h264）"
+                        : "默认 4（av1, 0..13 越小越慢）"
+                  }
                 />
               </label>
               <div className="mt-2 text-xs text-slate-500">
-                提示：h264 可用 preset：ultrafast/superfast/veryfast/faster/fast/medium/slow/slower/veryslow；av1（SVT）为 0..13（越小越慢、质量更高）。
+                提示：CPU h264 可用 ultrafast..veryslow；CPU av1（SVT）为 0..13。Intel GPU 开启时，h264 文本 preset 和 av1 的 0..13 都会映射到 VAAPI quality。
               </div>
             </div>
           </div>
@@ -869,6 +908,20 @@ export default function TaskDetailPage() {
           <div className="rounded border p-3">
             <div className="text-xs text-slate-500">翻译（可选：mock/noop/openai）</div>
             <div className="mt-2 flex items-center gap-3 text-sm">
+              {isYouTubeTask ? (
+                <label className="block min-w-64">
+                  <div className="mb-1 text-xs text-slate-600">YouTube 字幕复用</div>
+                  <select
+                    className="w-full rounded border px-3 py-2 text-sm"
+                    value={youtubeSubtitleMode}
+                    onChange={(e) => setYouTubeSubtitleMode(normalizeYouTubeSubtitleMode(e.target.value))}
+                  >
+                    <option value="off">关闭，直接走 ASR</option>
+                    <option value="target">优先目标语言字幕</option>
+                    <option value="auto_source">优先自动生成原语言字幕</option>
+                  </select>
+                </label>
+              ) : null}
               <label className="flex items-center gap-2">
                 <input type="checkbox" checked={translateEnabled} onChange={(e) => setTranslateEnabled(e.target.checked)} />
                 启用翻译
@@ -915,6 +968,16 @@ export default function TaskDetailPage() {
                 dynamic summary（仅 openai）
               </label>
 
+              {isYouTubeTask ? (
+                <div className="md:col-span-2 text-xs text-slate-500">
+                  {youtubeSubtitleMode === "off"
+                    ? "逻辑：不复用 YouTube 字幕，直接进入 ASR；若启用翻译，则在 ASR 结果上继续翻译。"
+                    : youtubeSubtitleMode === "auto_source"
+                      ? "逻辑：优先抓取 YouTube 自动生成的原语言字幕；若启用翻译，则直接进入翻译管线；如果没有可用自动字幕，再回退到 ASR。"
+                      : "逻辑：优先找 `target_lang` 对应的 YouTube 字幕；命中后直接复用并跳过翻译；如果没有可用目标字幕，再回退到 ASR。"}
+                </div>
+              ) : null}
+
               {translateEnabled && translateProvider === "openai" && openaiKeySet === false ? (
                 <div className="md:col-span-2 text-xs text-rose-700">
                   OpenAI API Key 未设置，请先到 <Link className="underline" to="/settings/translate">Settings · Translate</Link> 保存配置。
@@ -932,6 +995,7 @@ export default function TaskDetailPage() {
                   <option value="auto">auto（使用后端默认）</option>
                   <option value="mock">mock</option>
                   <option value="faster-whisper">faster-whisper</option>
+                  <option value="openvino">openvino（方案2 / Intel Arc）</option>
                 </select>
               </label>
               <label className="block">
@@ -953,7 +1017,7 @@ export default function TaskDetailPage() {
                   ))}
                 </select>
                 <div className="mt-2 text-xs text-slate-500">
-                  提示：可在 Settings → ASR/Whisper 下载/上传模型；选择后会把该路径传给 job 的 `asr.model`。
+                  提示：`faster-whisper` 和 `openvino` 都可以传本地模型目录路径；OpenVINO 需要先准备好已导出的 Whisper 模型目录。
                 </div>
               </label>
             </div>

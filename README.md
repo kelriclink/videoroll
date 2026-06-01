@@ -165,7 +165,7 @@ docker compose -f docker-compose.yml --env-file .env up --build -d
 - `data/minio`
   MinIO 数据目录
 - `data/models`
-  Whisper 模型目录
+  ASR 模型目录（可存放 faster-whisper 或 OpenVINO Whisper 导出模型）
 - `data/secrets`
   本地密钥和机密目录
 - `data/secrets/fernet.key`
@@ -194,6 +194,18 @@ docker compose -f docker-compose.yml --env-file .env up --build -d
   默认 `/tmp/videoroll`
 - `INSTALL_ASR`
   `1` 时构建真实 ASR 依赖；`0` 时减小镜像体积
+- `SUBTITLE_ASR_ENGINE`
+  默认 ASR 引擎，支持 `faster-whisper` / `openvino` / `mock`
+- `SUBTITLE_WHISPER_MODEL_DIR`
+  ASR 模型目录，默认 `/models/whisper`
+- `SUBTITLE_OPENVINO_MODEL`
+  OpenVINO Whisper 模型目录（可选；也可在 UI 的 ASR 设置里保存默认模型路径）
+- `SUBTITLE_OPENVINO_DEVICE`
+  OpenVINO 推理设备，默认 `GPU`
+- `SUBTITLE_OPENVINO_NUM_BEAMS`
+  OpenVINO 默认 beam size，默认 `1`
+- `SUBTITLE_OPENVINO_MAX_NEW_TOKENS`
+  OpenVINO 默认 `max_new_tokens`，默认 `448`
 - `PUBLISH_ADDR`
   Web / MinIO console 的监听地址，默认 `127.0.0.1`
 - `WEB_PORT`
@@ -255,6 +267,7 @@ YouTube 风控注意事项：
 说明：
 
 - 默认 ASR 为 `faster-whisper`
+- 也支持 `openvino`（方案 2：在现有 `subtitle-service` 进程内直接跑 OpenVINO Whisper，适合 Intel Arc / Intel GPU）
 - `Settings -> Auto` 用于配置 YouTube 自动模式的默认参数：
   - 字幕格式
   - 是否 burn-in / soft-sub
@@ -268,6 +281,22 @@ YouTube 风控注意事项：
 INSTALL_ASR=0
 SUBTITLE_ASR_ENGINE=mock
 ```
+
+如果要启用 `openvino`：
+
+```env
+INSTALL_ASR=1
+SUBTITLE_ASR_ENGINE=openvino
+SUBTITLE_OPENVINO_DEVICE=GPU
+SUBTITLE_OPENVINO_MODEL=/models/whisper/whisper-large-v3-ov
+```
+
+说明：
+
+- `openvino` 需要一个 OpenVINO Whisper 模型目录。
+- 现在支持在 `Settings -> ASR` 里直接下载 OpenVINO 官方预转换模型；输入 `tiny/base/small/medium/large-v3` 时会自动映射到对应的 `OpenVINO/whisper-*-fp16-ov` 仓库。
+- 也支持手工准备模型：可以在宿主机先用 `optimum-cli export openvino --model openai/whisper-large-v3 <output_dir>` 生成，再挂载/上传到 `data/models`。
+- 下载或上传后，在 `Settings -> ASR` 中把默认引擎切到 `openvino`，并配置 `device / num_beams / max_new_tokens`。
 
 ### Bilibili 配置
 

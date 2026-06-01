@@ -1,19 +1,19 @@
 from __future__ import annotations
 
+import copy
 import json
+import os
+import re
 import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Literal, Optional, Protocol
 from urllib.parse import urlparse, urlsplit, urlunsplit
 
 import httpx
 import yt_dlp
 from yt_dlp.utils import DownloadError
-
-from videoroll.config import OrchestratorSettings
-
 
 @dataclass(frozen=True)
 class YouTubeMeta:
@@ -23,6 +23,34 @@ class YouTubeMeta:
     uploader: Optional[str] = None
     upload_date: Optional[str] = None
     duration: Optional[int] = None
+
+
+@dataclass(frozen=True)
+class YouTubeSubtitleSelection:
+    language: str
+    source: Literal["subtitles", "automatic_captions"]
+    reason: Literal["target", "auto_source"]
+
+
+_YOUTUBE_SUBTITLE_MODES = {"off", "target", "auto_source"}
+_FORMAT_UNAVAILABLE_FALLBACKS: tuple[tuple[str, dict[str, Any]], ...] = (
+    (
+        "player_client=tv,android_sdkless,web",
+        {"youtube": {"player_client": ["tv", "android_sdkless", "web"]}},
+    ),
+    (
+        "player_client=android,web",
+        {"youtube": {"player_client": ["android", "web"]}},
+    ),
+)
+
+
+class YouTubeDownloaderSettings(Protocol):
+    youtube_user_agent: str
+    youtube_cookie_file: str | None
+    youtube_proxy: str | None
+    youtube_extractor_args_json: str | None
+    ffmpeg_path: str
 
 
 class YtDlpRuntimeError(RuntimeError):
@@ -56,7 +84,22 @@ def _pick_video_info(info: Any) -> dict[str, Any]:
     return d
 
 
-def _extractor_args(settings: OrchestratorSettings) -> dict[str, Any] | None:
+def _deep_merge(base: Any, override: Any) -> Any:
+    if isinstance(base, dict) and isinstance(override, dict):
+        merged = dict(base)
+        for key, value in override.items():
+            merged[key] = _deep_merge(merged.get(key), value)
+        return merged
+    if isinstance(base, list) and isinstance(override, list):
+        out = list(base)
+        for item in override:
+            if item not in out:
+                out.append(item)
+        return out
+    return copy.deepcopy(override)
+
+
+def _extractor_args(settings: YouTubeDownloaderSettings) -> dict[str, Any] | None:
     raw = settings.youtube_extractor_args_json
     if raw is None:
         return None
@@ -70,6 +113,18 @@ def _extractor_args(settings: OrchestratorSettings) -> dict[str, Any] | None:
     if not isinstance(parsed, dict):
         raise ValueError("YOUTUBE_EXTRACTOR_ARGS_JSON must be a JSON object")
     return parsed
+
+
+def _merged_extractor_args(
+    settings: YouTubeDownloaderSettings,
+    *,
+    extractor_args_override: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    base = _extractor_args(settings) or {}
+    if not extractor_args_override:
+        return base or None
+    merged = _deep_merge(base, extractor_args_override)
+    return merged if isinstance(merged, dict) and merged else None
 
 
 def _redact_url(value: str) -> str:
@@ -102,13 +157,20 @@ def _sanitize_diagnostic_line(line: str, *, proxy: str | None) -> str:
     return text
 
 
+def _looks_like_requested_format_unavailable(message: str) -> bool:
+    text = str(message or "").strip().lower()
+    if not text:
+        return False
+    return "requested format is not available" in text
+
+
 def _yt_dlp_diagnostics_header(
     *,
     url: str,
-    settings: OrchestratorSettings,
+    settings: YouTubeDownloaderSettings,
     outtmpl: str | None,
+    extractor_args: dict[str, Any] | None,
 ) -> list[str]:
-    extractor_args = _extractor_args(settings)
     return [
         "videoroll yt-dlp diagnostics",
         f"url={url}",
@@ -140,12 +202,13 @@ class _DiagnosticsLogger:
 
 
 def build_ydl_opts(
-    settings: OrchestratorSettings,
+    settings: YouTubeDownloaderSettings,
     *,
     outtmpl: str | None = None,
     for_download: bool,
     logger: Any | None = None,
     verbose: bool = False,
+    extractor_args_override: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     opts: dict[str, Any] = {
         "quiet": True,
@@ -157,6 +220,12 @@ def build_ydl_opts(
         "concurrent_fragment_downloads": 4,
         "http_headers": {"User-Agent": settings.youtube_user_agent},
     }
+    try:
+        socket_timeout = float(os.getenv("YTDLP_SOCKET_TIMEOUT_SECONDS", "20").strip() or "20")
+    except Exception:
+        socket_timeout = 20.0
+    if socket_timeout > 0:
+        opts["socket_timeout"] = socket_timeout
 
     cookiefile = (settings.youtube_cookie_file or "").strip()
     if cookiefile:
@@ -178,7 +247,7 @@ def build_ydl_opts(
             if resolved:
                 opts["ffmpeg_location"] = resolved
 
-    extractor_args = _extractor_args(settings)
+    extractor_args = _merged_extractor_args(settings, extractor_args_override=extractor_args_override)
     if extractor_args:
         opts["extractor_args"] = extractor_args
 
@@ -253,7 +322,7 @@ def pick_thumbnail_url(info: dict[str, Any]) -> Optional[str]:
     return None
 
 
-def download_thumbnail_jpg(info: dict[str, Any], settings: OrchestratorSettings, *, work_dir: Path) -> Optional[Path]:
+def download_thumbnail_jpg(info: dict[str, Any], settings: YouTubeDownloaderSettings, *, work_dir: Path) -> Optional[Path]:
     url = pick_thumbnail_url(info)
     if not url:
         return None
@@ -314,14 +383,159 @@ def download_thumbnail_jpg(info: dict[str, Any], settings: OrchestratorSettings,
     return out_path
 
 
-def extract_youtube_metadata(url: str, settings: OrchestratorSettings) -> tuple[dict[str, Any], YouTubeMeta]:
+def _normalize_subtitle_language(value: str) -> str:
+    raw = str(value or "").strip().replace("_", "-")
+    if not raw:
+        return ""
+    parts = [part for part in raw.split("-") if part]
+    if not parts:
+        return ""
+    return "-".join([parts[0].lower(), *[part.lower() for part in parts[1:]]])
+
+
+def _subtitle_language_base(value: str) -> str:
+    normalized = _normalize_subtitle_language(value)
+    return normalized.split("-", 1)[0] if normalized else ""
+
+
+def normalize_youtube_subtitle_mode(value: Any, *, prefer_youtube_subtitles: Any | None = None) -> Literal["off", "target", "auto_source"]:
+    mode = str(value or "").strip().lower()
+    if mode in _YOUTUBE_SUBTITLE_MODES:
+        return mode  # type: ignore[return-value]
+    if prefer_youtube_subtitles is not None:
+        return "target" if bool(prefer_youtube_subtitles) else "off"
+    return "target"
+
+
+def _subtitle_tracks(info: Any, field: str) -> dict[str, list[dict[str, Any]]]:
+    raw = _as_dict(_as_dict(info).get(field))
+    out: dict[str, list[dict[str, Any]]] = {}
+    for key, value in raw.items():
+        lang = str(key or "").strip()
+        if not lang or lang.lower() == "live_chat":
+            continue
+        tracks = value if isinstance(value, list) else []
+        clean_tracks = [_as_dict(item) for item in tracks if _as_dict(item)]
+        if clean_tracks:
+            out[lang] = clean_tracks
+    return out
+
+
+def _subtitle_language_match_score(candidate: str, target: str) -> int | None:
+    cand = _normalize_subtitle_language(candidate)
+    tgt = _normalize_subtitle_language(target)
+    if not cand or not tgt:
+        return None
+    if cand == tgt:
+        return 0
+
+    cand_base = _subtitle_language_base(cand)
+    tgt_base = _subtitle_language_base(tgt)
+    if not cand_base or cand_base != tgt_base:
+        return None
+
+    score = 20
+    if cand == cand_base:
+        score += 5
+    if tgt == tgt_base:
+        score -= 5
+    if "-orig" in cand:
+        score += 5
+
+    cand_parts = cand.split("-")[1:]
+    tgt_parts = tgt.split("-")[1:]
+    if cand_parts and tgt_parts:
+        overlap = len(set(cand_parts) & set(tgt_parts))
+        score -= min(overlap, 2) * 2
+    return score + abs(len(cand_parts) - len(tgt_parts))
+
+
+def _pick_best_subtitle_language(track_map: dict[str, list[dict[str, Any]]], target_lang: str) -> str | None:
+    scored: list[tuple[int, str]] = []
+    for lang in track_map:
+        score = _subtitle_language_match_score(lang, target_lang)
+        if score is None:
+            continue
+        scored.append((score, lang))
+    if not scored:
+        return None
+    scored.sort(key=lambda item: (item[0], item[1].lower()))
+    return scored[0][1]
+
+
+def _pick_auto_source_subtitle_language(info: Any, automatic: dict[str, list[dict[str, Any]]]) -> str | None:
+    if not automatic:
+        return None
+
+    info_d = _as_dict(info)
+    for key in ("original_language", "default_audio_language", "audio_language", "language"):
+        hinted = _pick_best_subtitle_language(automatic, _as_str(info_d.get(key)))
+        if hinted:
+            return hinted
+
+    orig_candidates = sorted(lang for lang in automatic if "-orig" in _normalize_subtitle_language(lang))
+    if orig_candidates:
+        return orig_candidates[0]
+
+    if len(automatic) == 1:
+        return next(iter(automatic))
+
+    ranked = sorted(
+        automatic,
+        key=lambda lang: (
+            "-" in _normalize_subtitle_language(lang),
+            len(_normalize_subtitle_language(lang)),
+            lang.lower(),
+        ),
+    )
+    return ranked[0] if ranked else None
+
+
+def pick_preferred_youtube_subtitle(
+    info: Any,
+    *,
+    target_lang: str,
+    mode: str = "target",
+) -> YouTubeSubtitleSelection | None:
+    normalized_mode = normalize_youtube_subtitle_mode(mode)
+    if normalized_mode == "off":
+        return None
+
+    target = str(target_lang or "").strip() or "zh"
+    manual = _subtitle_tracks(info, "subtitles")
+    automatic = _subtitle_tracks(info, "automatic_captions")
+
+    if normalized_mode == "target":
+        target_manual = _pick_best_subtitle_language(manual, target)
+        if target_manual:
+            return YouTubeSubtitleSelection(language=target_manual, source="subtitles", reason="target")
+
+        target_auto = _pick_best_subtitle_language(automatic, target)
+        if target_auto:
+            return YouTubeSubtitleSelection(language=target_auto, source="automatic_captions", reason="target")
+        return None
+
+    auto_source = _pick_auto_source_subtitle_language(info, automatic)
+    if auto_source:
+        return YouTubeSubtitleSelection(language=auto_source, source="automatic_captions", reason="auto_source")
+    return None
+
+
+def extract_youtube_metadata(
+    url: str,
+    settings: YouTubeDownloaderSettings,
+    *,
+    extractor_args_override: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any], YouTubeMeta]:
     """
     Returns:
       - sanitized info dict (safe for json.dumps)
       - meta summary
     """
     try:
-        with yt_dlp.YoutubeDL(build_ydl_opts(settings, for_download=False)) as ydl:
+        with yt_dlp.YoutubeDL(
+            build_ydl_opts(settings, for_download=False, extractor_args_override=extractor_args_override)
+        ) as ydl:
             info_raw = ydl.extract_info(url, download=False)
             info = _pick_video_info(info_raw)
             if not info:
@@ -331,6 +545,26 @@ def extract_youtube_metadata(url: str, settings: OrchestratorSettings) -> tuple[
         raise RuntimeError(str(e)) from e
     meta = summarize_info(_as_dict(sanitized), fallback_url=url)
     return _as_dict(sanitized), meta
+
+
+def extract_youtube_channel_info(
+    url: str,
+    settings: YouTubeDownloaderSettings,
+    *,
+    extractor_args_override: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    try:
+        opts = build_ydl_opts(settings, for_download=False, extractor_args_override=extractor_args_override)
+        opts["extract_flat"] = True
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info_raw = ydl.extract_info(url, download=False)
+            info = _as_dict(info_raw)
+            if not info:
+                raise ValueError("yt-dlp returned empty channel info")
+            sanitized = ydl.sanitize_info(info)
+    except DownloadError as e:
+        raise RuntimeError(str(e)) from e
+    return _as_dict(sanitized)
 
 
 def _resolve_downloaded_file(info: dict[str, Any], *, work_dir: Path) -> Path:
@@ -371,18 +605,29 @@ def _resolve_downloaded_file(info: dict[str, Any], *, work_dir: Path) -> Path:
 
 def _download_once(
     url: str,
-    settings: OrchestratorSettings,
+    settings: YouTubeDownloaderSettings,
     *,
     work_dir: Path,
     diagnostics: list[str] | None = None,
+    extractor_args_override: dict[str, Any] | None = None,
 ) -> tuple[Path, dict[str, Any], YouTubeMeta]:
     work_dir.mkdir(parents=True, exist_ok=True)
     outtmpl = str(work_dir / "%(id)s.%(ext)s")
     ydl_logger = None
+    extractor_args = _merged_extractor_args(settings, extractor_args_override=extractor_args_override)
     if diagnostics is not None:
-        diagnostics.extend(_yt_dlp_diagnostics_header(url=url, settings=settings, outtmpl=outtmpl))
+        diagnostics.extend(_yt_dlp_diagnostics_header(url=url, settings=settings, outtmpl=outtmpl, extractor_args=extractor_args))
         ydl_logger = _DiagnosticsLogger(diagnostics, proxy=settings.youtube_proxy)
-    with yt_dlp.YoutubeDL(build_ydl_opts(settings, outtmpl=outtmpl, for_download=True, logger=ydl_logger, verbose=diagnostics is not None)) as ydl:
+    with yt_dlp.YoutubeDL(
+        build_ydl_opts(
+            settings,
+            outtmpl=outtmpl,
+            for_download=True,
+            logger=ydl_logger,
+            verbose=diagnostics is not None,
+            extractor_args_override=extractor_args_override,
+        )
+    ) as ydl:
         info_raw = ydl.extract_info(url, download=True)
         info = _pick_video_info(info_raw)
         if not info:
@@ -394,7 +639,96 @@ def _download_once(
     return video_path, _as_dict(sanitized), meta
 
 
-def download_youtube_video(url: str, settings: OrchestratorSettings, *, work_dir: Path) -> tuple[Path, dict[str, Any], YouTubeMeta]:
+def _reset_work_dir_for_retry(work_dir: Path) -> None:
+    try:
+        shutil.rmtree(work_dir)
+    except FileNotFoundError:
+        pass
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+
+def _resolve_downloaded_subtitle_file(info: dict[str, Any], *, work_dir: Path, requested_lang: str) -> Path:
+    info_d = _as_dict(info)
+    requested = _as_dict(info_d.get("requested_subtitles"))
+    requested_langs = [requested_lang]
+    normalized_requested = _normalize_subtitle_language(requested_lang)
+    if normalized_requested:
+        requested_langs.append(normalized_requested)
+
+    candidates: list[Path] = []
+    for lang in requested_langs:
+        data = _as_dict(requested.get(lang))
+        for key in ("filepath", "_filename"):
+            value = data.get(key)
+            if isinstance(value, str) and value.strip():
+                candidates.append(Path(value))
+
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+
+    suffix_re = re.compile(r"\.(?:srt|vtt|ass|ssa|ttml|dfxp|srv3|srv2|srv1|json3)$", re.IGNORECASE)
+    lang_tokens = {requested_lang.lower(), normalized_requested.lower()}
+    files = [p for p in work_dir.iterdir() if p.is_file() and suffix_re.search(p.name)]
+    lang_matches = [
+        p for p in files if any(token and f".{token}." in p.name.lower() for token in lang_tokens)
+    ]
+    if lang_matches:
+        lang_matches.sort(key=lambda p: p.stat().st_size, reverse=True)
+        return lang_matches[0]
+    if files:
+        files.sort(key=lambda p: p.stat().st_size, reverse=True)
+        return files[0]
+    raise RuntimeError("yt-dlp subtitle download succeeded but no subtitle file was found")
+
+
+def download_youtube_subtitle(
+    url: str,
+    settings: YouTubeDownloaderSettings,
+    *,
+    work_dir: Path,
+    selection: YouTubeSubtitleSelection,
+) -> tuple[Path, dict[str, Any], YouTubeMeta]:
+    work_dir.mkdir(parents=True, exist_ok=True)
+    outtmpl = str(work_dir / "%(id)s.%(ext)s")
+    extractor_args_override = {"youtube": {"skip": ["translated_subs"]}}
+    opts = build_ydl_opts(
+        settings,
+        outtmpl=outtmpl,
+        for_download=False,
+        extractor_args_override=extractor_args_override,
+    )
+    opts.update(
+        {
+            "skip_download": True,
+            "writesubtitles": selection.source == "subtitles",
+            "writeautomaticsub": selection.source == "automatic_captions",
+            "subtitleslangs": [selection.language],
+            "subtitlesformat": "vtt/best",
+        }
+    )
+
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info_raw = ydl.extract_info(url, download=True)
+            info = _pick_video_info(info_raw)
+            if not info:
+                raise ValueError("yt-dlp returned empty info after subtitle download")
+            sanitized = _as_dict(ydl.sanitize_info(info))
+    except DownloadError as e:
+        raise YtDlpRuntimeError(str(e)) from e
+
+    subtitle_path = _resolve_downloaded_subtitle_file(sanitized or info, work_dir=work_dir, requested_lang=selection.language)
+    meta = summarize_info(sanitized, fallback_url=url)
+    return subtitle_path, sanitized, meta
+
+
+def download_youtube_video(
+    url: str,
+    settings: YouTubeDownloaderSettings,
+    *,
+    work_dir: Path,
+) -> tuple[Path, dict[str, Any], YouTubeMeta]:
     """
     Downloads the best quality video to work_dir and returns:
       - output video file path
@@ -402,9 +736,34 @@ def download_youtube_video(url: str, settings: OrchestratorSettings, *, work_dir
       - meta summary
     """
     diagnostics: list[str] = []
-    try:
-        return _download_once(url, settings, work_dir=work_dir, diagnostics=diagnostics)
-    except DownloadError as e:
-        raise YtDlpRuntimeError(str(e), diagnostics=diagnostics) from e
-    except Exception as e:
-        raise YtDlpRuntimeError(str(e), diagnostics=diagnostics) from e
+    attempts: list[tuple[str, dict[str, Any] | None]] = [("default", None)]
+    attempts.extend(_FORMAT_UNAVAILABLE_FALLBACKS)
+
+    last_error: Exception | None = None
+    for idx, (label, extractor_args_override) in enumerate(attempts, start=1):
+        if idx > 1:
+            _reset_work_dir_for_retry(work_dir)
+            diagnostics.append(f"---- videoroll retry #{idx}: {label} ----")
+        try:
+            return _download_once(
+                url,
+                settings,
+                work_dir=work_dir,
+                diagnostics=diagnostics,
+                extractor_args_override=extractor_args_override,
+            )
+        except DownloadError as e:
+            last_error = e
+        except Exception as e:
+            last_error = e
+
+        if last_error is None:
+            break
+        if idx >= len(attempts) or not _looks_like_requested_format_unavailable(str(last_error)):
+            break
+
+    if isinstance(last_error, DownloadError):
+        raise YtDlpRuntimeError(str(last_error), diagnostics=diagnostics) from last_error
+    if last_error is not None:
+        raise YtDlpRuntimeError(str(last_error), diagnostics=diagnostics) from last_error
+    raise YtDlpRuntimeError("yt-dlp download failed without an exception", diagnostics=diagnostics)

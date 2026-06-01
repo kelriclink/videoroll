@@ -7,15 +7,7 @@ from typing import Any, Literal, Optional
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from videoroll.apps.bilibili_publisher.constants import BILIBILI_DESC_MAX_CHARS
-
-
-def _clamp_text(text: str, max_len: int) -> str:
-    s = str(text or "").strip()
-    if len(s) <= max_len:
-        return s
-    if max_len <= 1:
-        return s[:max_len]
-    return s[: max_len - 1] + "…"
+from videoroll.apps.publish_meta_rules import bilibili_text_units, clamp_bilibili_text
 
 
 class BilibiliSubtitle(BaseModel):
@@ -115,8 +107,8 @@ class BilibiliPublishMeta(BaseModel):
             raise ValueError("meta.title is required")
         if len(self.title) > 80:
             raise ValueError("meta.title too long (max 80)")
-        if len(self.desc) > BILIBILI_DESC_MAX_CHARS:
-            self.desc = _clamp_text(self.desc, BILIBILI_DESC_MAX_CHARS)
+        if bilibili_text_units(self.desc) > BILIBILI_DESC_MAX_CHARS:
+            self.desc = clamp_bilibili_text(self.desc, BILIBILI_DESC_MAX_CHARS)
         if not isinstance(self.typeid, int) or self.typeid <= 0:
             raise ValueError("meta.typeid/tid must be a positive integer")
 

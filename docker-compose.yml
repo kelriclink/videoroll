@@ -1,3 +1,4 @@
+# This file is intended to be placed at the repository root before deployment.
 services:
   redis:
     image: redis:7
@@ -33,6 +34,7 @@ services:
   app:
     build:
       context: .
+      dockerfile: Dockerfile
       args:
         INSTALL_ASR: ${INSTALL_ASR:-1}
         YTDLP_VERSION: ${YTDLP_VERSION:-latest}
@@ -51,8 +53,12 @@ services:
       SUBTITLE_WHISPER_DEVICE: ${SUBTITLE_WHISPER_DEVICE:-cpu}
       SUBTITLE_WHISPER_COMPUTE_TYPE: ${SUBTITLE_WHISPER_COMPUTE_TYPE:-int8}
       SUBTITLE_WHISPER_MODEL_DIR: ${SUBTITLE_WHISPER_MODEL_DIR:-/models/whisper}
+      SUBTITLE_OPENVINO_MODEL: ${SUBTITLE_OPENVINO_MODEL:-}
+      SUBTITLE_OPENVINO_DEVICE: ${SUBTITLE_OPENVINO_DEVICE:-GPU}
+      SUBTITLE_OPENVINO_NUM_BEAMS: ${SUBTITLE_OPENVINO_NUM_BEAMS:-1}
+      SUBTITLE_OPENVINO_MAX_NEW_TOKENS: ${SUBTITLE_OPENVINO_MAX_NEW_TOKENS:-448}
       FFMPEG_PATH: ${FFMPEG_PATH:-ffmpeg}
-      WORK_DIR: ${WORK_DIR:-/tmp/videoroll}
+      WORK_DIR: ${WORK_DIR:-/work/videoroll}
       UVICORN_ROOT_PATH: ${UVICORN_ROOT_PATH:-/api}
       YOUTUBE_USER_AGENT: "${YOUTUBE_USER_AGENT:-Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36}"
       YOUTUBE_COOKIE_FILE: ${YOUTUBE_COOKIE_FILE:-}
@@ -65,9 +71,15 @@ services:
       YOUTUBE_INGEST_URL: ${YOUTUBE_INGEST_URL:-http://localhost:8000/youtube-ingest}
       BILIBILI_PUBLISHER_URL: ${BILIBILI_PUBLISHER_URL:-http://localhost:8000/bilibili-publisher}
       STORAGE_CLEANUP_INTERVAL_SECONDS: ${STORAGE_CLEANUP_INTERVAL_SECONDS:-3600}
+      INTEL_GPU_RENDER_DEVICE: ${INTEL_GPU_RENDER_DEVICE:-/dev/dri/renderD128}
     volumes:
       - ./data/models:/models
       - ./data/secrets:/secrets
+      - ./data/work:/work
+    # Expose the whole Intel DRM device tree so both VAAPI and OpenVINO GPU
+    # runtimes can discover the render device and initialize compute contexts.
+    devices:
+      - "/dev/dri:/dev/dri"
     extra_hosts:
       - host.docker.internal:host-gateway
     depends_on:

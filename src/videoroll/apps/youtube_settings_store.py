@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import io
 import http.cookiejar
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from videoroll.db.models import AppSetting
@@ -15,6 +16,19 @@ YOUTUBE_SETTINGS_KEY = "youtube.settings"
 
 _MAX_PROXY_LEN = 2048
 _MAX_COOKIES_LEN = 200_000
+_MAX_ERROR_LEN = 1000
+_DEFAULT_HOME_SCAN_INTERVAL_MINUTES = 60
+_MIN_HOME_SCAN_INTERVAL_MINUTES = 1
+_MAX_HOME_SCAN_INTERVAL_MINUTES = 1440
+_DEFAULT_HOME_SCAN_LIMIT = 10
+_MIN_HOME_SCAN_LIMIT = 1
+_MAX_HOME_SCAN_LIMIT = 100
+_DEFAULT_HOME_SCAN_MIN_DURATION_SECONDS = 180
+_MIN_HOME_SCAN_MIN_DURATION_SECONDS = 0
+_MAX_HOME_SCAN_MIN_DURATION_SECONDS = 86_400
+_MAX_HOME_SCAN_SAMPLE_URLS = 10
+_MAX_HOME_SCAN_LOG_LINES = 40
+_MAX_HOME_SCAN_LOG_LINE_LEN = 240
 _AUTH_COOKIE_NAMES = {
     # Common Google/YouTube auth cookies. Presence usually means "logged in".
     "SID",
@@ -65,6 +79,96 @@ def _decrypt_opt(token: Any) -> str:
         return decrypt_str(token).strip()
     except Exception:
         return ""
+
+
+def _parse_dt_opt(value: Any) -> Optional[datetime]:
+    s = str(value or "").strip()
+    if not s:
+        return None
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def _normalize_home_scan_interval_minutes(value: Any) -> int:
+    try:
+        interval = int(value)
+    except Exception:
+        interval = _DEFAULT_HOME_SCAN_INTERVAL_MINUTES
+    if interval < _MIN_HOME_SCAN_INTERVAL_MINUTES:
+        interval = _MIN_HOME_SCAN_INTERVAL_MINUTES
+    if interval > _MAX_HOME_SCAN_INTERVAL_MINUTES:
+        interval = _MAX_HOME_SCAN_INTERVAL_MINUTES
+    return interval
+
+
+def _normalize_home_scan_limit(value: Any) -> int:
+    try:
+        limit = int(value)
+    except Exception:
+        limit = _DEFAULT_HOME_SCAN_LIMIT
+    if limit < _MIN_HOME_SCAN_LIMIT:
+        limit = _MIN_HOME_SCAN_LIMIT
+    if limit > _MAX_HOME_SCAN_LIMIT:
+        limit = _MAX_HOME_SCAN_LIMIT
+    return limit
+
+
+def _normalize_home_scan_min_duration_seconds(value: Any) -> int:
+    try:
+        seconds = int(value)
+    except Exception:
+        seconds = _DEFAULT_HOME_SCAN_MIN_DURATION_SECONDS
+    if seconds < _MIN_HOME_SCAN_MIN_DURATION_SECONDS:
+        seconds = _MIN_HOME_SCAN_MIN_DURATION_SECONDS
+    if seconds > _MAX_HOME_SCAN_MIN_DURATION_SECONDS:
+        seconds = _MAX_HOME_SCAN_MIN_DURATION_SECONDS
+    return seconds
+
+
+def _normalize_home_scan_sample_urls(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    out: list[str] = []
+    for item in value:
+        s = str(item or "").strip()
+        if s and s not in out:
+            out.append(s)
+        if len(out) >= _MAX_HOME_SCAN_SAMPLE_URLS:
+            break
+    return out
+
+
+def _normalize_home_scan_log_lines(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    out: list[str] = []
+    for item in value:
+        s = str(item or "").strip()
+        if not s:
+            continue
+        if len(s) > _MAX_HOME_SCAN_LOG_LINE_LEN:
+            s = s[: _MAX_HOME_SCAN_LOG_LINE_LEN - 1] + "…"
+        out.append(s)
+        if len(out) >= _MAX_HOME_SCAN_LOG_LINES:
+            break
+    return out
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except Exception:
+        return default
+
+
+def _get_locked_row(db: Session) -> AppSetting:
+    row = db.execute(select(AppSetting).where(AppSetting.key == YOUTUBE_SETTINGS_KEY).with_for_update()).scalar_one_or_none()
+    if row is not None:
+        return row
+    _get_row(db)
+    return db.execute(select(AppSetting).where(AppSetting.key == YOUTUBE_SETTINGS_KEY).with_for_update()).scalar_one()
 
 
 def get_youtube_cookies_txt(db: Session) -> str:
@@ -256,11 +360,36 @@ def get_youtube_settings(db: Session, *, default_proxy: Optional[str] = None) ->
     cookies_txt = _decrypt_opt(stored.get("cookies_txt_enc"))
     summary = summarize_netscape_cookies_txt(cookies_txt) if cookies_txt else summarize_netscape_cookies_txt("")
     cookies_updated_at = str(stored.get("cookies_updated_at") or "").strip() or None
+    now = datetime.now(timezone.utc)
+    home_scan_lock_until = _parse_dt_opt(stored.get("home_scan_lock_until"))
+    home_scan_running = bool(home_scan_lock_until and home_scan_lock_until > now)
     return {
         "proxy": proxy_str,
         "cookies_set": bool(cookies_txt),
         "cookies_enabled": _cookies_enabled(stored, cookies_txt),
         "cookies_updated_at": cookies_updated_at,
+        "home_scan_enabled": bool(stored.get("home_scan_enabled")),
+        "home_scan_interval_minutes": _normalize_home_scan_interval_minutes(stored.get("home_scan_interval_minutes")),
+        "home_scan_limit": _normalize_home_scan_limit(stored.get("home_scan_limit")),
+        "home_scan_long_videos_only": bool(stored.get("home_scan_long_videos_only")),
+        "home_scan_min_duration_seconds": _normalize_home_scan_min_duration_seconds(stored.get("home_scan_min_duration_seconds")),
+        "home_scan_running": home_scan_running,
+        "home_scan_last_started_at": str(stored.get("home_scan_last_started_at") or "").strip() or None,
+        "home_scan_last_finished_at": str(stored.get("home_scan_last_finished_at") or "").strip() or None,
+        "home_scan_last_discovered_count": max(0, _safe_int(stored.get("home_scan_last_discovered_count"), 0)),
+        "home_scan_last_started_count": max(0, _safe_int(stored.get("home_scan_last_started_count"), 0)),
+        "home_scan_last_skipped_duplicates": max(0, _safe_int(stored.get("home_scan_last_skipped_duplicates"), 0)),
+        "home_scan_last_failed_count": max(0, _safe_int(stored.get("home_scan_last_failed_count"), 0)),
+        "home_scan_last_candidate_count": max(0, _safe_int(stored.get("home_scan_last_candidate_count"), 0)),
+        "home_scan_last_explicit_shorts_count": max(0, _safe_int(stored.get("home_scan_last_explicit_shorts_count"), 0)),
+        "home_scan_last_known_duration_count": max(0, _safe_int(stored.get("home_scan_last_known_duration_count"), 0)),
+        "home_scan_last_unknown_duration_count": max(0, _safe_int(stored.get("home_scan_last_unknown_duration_count"), 0)),
+        "home_scan_last_below_min_duration_count": max(0, _safe_int(stored.get("home_scan_last_below_min_duration_count"), 0)),
+        "home_scan_last_kept_unknown_duration_count": max(0, _safe_int(stored.get("home_scan_last_kept_unknown_duration_count"), 0)),
+        "home_scan_last_eligible_count": max(0, _safe_int(stored.get("home_scan_last_eligible_count"), 0)),
+        "home_scan_last_log_lines": _normalize_home_scan_log_lines(stored.get("home_scan_last_log_lines")),
+        "home_scan_last_error": (str(stored.get("home_scan_last_error") or "").strip() or None),
+        "home_scan_last_sample_urls": _normalize_home_scan_sample_urls(stored.get("home_scan_last_sample_urls")),
         **summary,
     }
 
@@ -313,8 +442,113 @@ def update_youtube_settings(db: Session, update: dict[str, Any], *, default_prox
             else:
                 stored["cookies_enabled"] = False
 
+    if "home_scan_enabled" in update and update["home_scan_enabled"] is not None:
+        stored["home_scan_enabled"] = bool(update["home_scan_enabled"])
+
+    if "home_scan_interval_minutes" in update and update["home_scan_interval_minutes"] is not None:
+        stored["home_scan_interval_minutes"] = _normalize_home_scan_interval_minutes(update["home_scan_interval_minutes"])
+
+    if "home_scan_limit" in update and update["home_scan_limit"] is not None:
+        stored["home_scan_limit"] = _normalize_home_scan_limit(update["home_scan_limit"])
+
+    if "home_scan_long_videos_only" in update and update["home_scan_long_videos_only"] is not None:
+        stored["home_scan_long_videos_only"] = bool(update["home_scan_long_videos_only"])
+
+    if "home_scan_min_duration_seconds" in update and update["home_scan_min_duration_seconds"] is not None:
+        stored["home_scan_min_duration_seconds"] = _normalize_home_scan_min_duration_seconds(update["home_scan_min_duration_seconds"])
+
     row.value_json = stored
     db.add(row)
     db.commit()
 
     return get_youtube_settings(db, default_proxy=default_proxy)
+
+
+def try_acquire_youtube_home_scan_lock(
+    db: Session,
+    *,
+    owner: str,
+    ttl_seconds: int,
+    now: Optional[datetime] = None,
+) -> bool:
+    lock_owner = str(owner or "").strip()
+    if not lock_owner:
+        raise ValueError("owner is required")
+    ttl = max(30, int(ttl_seconds or 0))
+    now_dt = now or datetime.now(timezone.utc)
+
+    row = _get_locked_row(db)
+    stored = dict(_as_dict(row.value_json))
+    current_owner = str(stored.get("home_scan_lock_owner") or "").strip()
+    current_until = _parse_dt_opt(stored.get("home_scan_lock_until"))
+    if current_owner and current_until and current_until > now_dt and current_owner != lock_owner:
+        db.rollback()
+        return False
+
+    stored["home_scan_lock_owner"] = lock_owner
+    stored["home_scan_lock_until"] = (now_dt + timedelta(seconds=ttl)).isoformat()
+    stored["home_scan_last_started_at"] = now_dt.isoformat()
+    row.value_json = stored
+    db.add(row)
+    db.commit()
+    return True
+
+
+def finish_youtube_home_scan_lock(
+    db: Session,
+    *,
+    owner: str,
+    discovered_count: int = 0,
+    started_count: int = 0,
+    skipped_duplicates: int = 0,
+    failed_count: int = 0,
+    error: Optional[str] = None,
+    sample_urls: Optional[list[str]] = None,
+    candidate_count: int = 0,
+    explicit_shorts_count: int = 0,
+    known_duration_count: int = 0,
+    unknown_duration_count: int = 0,
+    below_min_duration_count: int = 0,
+    kept_unknown_duration_count: int = 0,
+    eligible_count: int = 0,
+    log_lines: Optional[list[str]] = None,
+    finished_at: Optional[datetime] = None,
+) -> dict[str, Any]:
+    lock_owner = str(owner or "").strip()
+    if not lock_owner:
+        raise ValueError("owner is required")
+    row = _get_locked_row(db)
+    stored = dict(_as_dict(row.value_json))
+    current_owner = str(stored.get("home_scan_lock_owner") or "").strip()
+    if current_owner and current_owner != lock_owner:
+        db.rollback()
+        return get_youtube_settings(db)
+
+    stored.pop("home_scan_lock_owner", None)
+    stored.pop("home_scan_lock_until", None)
+    stored["home_scan_last_finished_at"] = (finished_at or datetime.now(timezone.utc)).isoformat()
+    stored["home_scan_last_discovered_count"] = max(0, int(discovered_count or 0))
+    stored["home_scan_last_started_count"] = max(0, int(started_count or 0))
+    stored["home_scan_last_skipped_duplicates"] = max(0, int(skipped_duplicates or 0))
+    stored["home_scan_last_failed_count"] = max(0, int(failed_count or 0))
+    stored["home_scan_last_sample_urls"] = _normalize_home_scan_sample_urls(sample_urls or [])
+    stored["home_scan_last_candidate_count"] = max(0, int(candidate_count or 0))
+    stored["home_scan_last_explicit_shorts_count"] = max(0, int(explicit_shorts_count or 0))
+    stored["home_scan_last_known_duration_count"] = max(0, int(known_duration_count or 0))
+    stored["home_scan_last_unknown_duration_count"] = max(0, int(unknown_duration_count or 0))
+    stored["home_scan_last_below_min_duration_count"] = max(0, int(below_min_duration_count or 0))
+    stored["home_scan_last_kept_unknown_duration_count"] = max(0, int(kept_unknown_duration_count or 0))
+    stored["home_scan_last_eligible_count"] = max(0, int(eligible_count or 0))
+    stored["home_scan_last_log_lines"] = _normalize_home_scan_log_lines(log_lines or [])
+    msg = str(error or "").strip()
+    if msg:
+        if len(msg) > _MAX_ERROR_LEN:
+            msg = msg[: _MAX_ERROR_LEN - 1] + "…"
+        stored["home_scan_last_error"] = msg
+    else:
+        stored.pop("home_scan_last_error", None)
+
+    row.value_json = stored
+    db.add(row)
+    db.commit()
+    return get_youtube_settings(db)

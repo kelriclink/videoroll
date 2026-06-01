@@ -71,6 +71,7 @@ class SubtitleActionRequest(BaseModel):
     soft_sub: bool = False
     ass_style: str = "clean_white"
     video_codec: str = "av1"
+    use_intel_gpu: bool = False
     video_preset: Optional[str] = None
     video_crf: Optional[int] = Field(default=None, ge=0, le=63)
 
@@ -78,6 +79,8 @@ class SubtitleActionRequest(BaseModel):
     asr_language: str = "auto"
     asr_model: Optional[str] = None
 
+    prefer_youtube_subtitles: bool = True
+    youtube_subtitle_mode: Literal["off", "target", "auto_source"] = "target"
     translate_enabled: bool = False
     translate_provider: str = "mock"
     target_lang: str = "zh"
@@ -85,6 +88,8 @@ class SubtitleActionRequest(BaseModel):
     translate_batch_size: Optional[int] = None
     translate_enable_summary: Optional[bool] = None
     bilingual: bool = False
+    auto_publish: bool = False
+    publish_payload: Optional[dict[str, Any]] = None
 
 
 class PublishActionRequest(BaseModel):
@@ -138,6 +143,22 @@ class TaskPublishReviewRead(BaseModel):
 class RemoteJobResponse(BaseModel):
     job_id: uuid.UUID
     status: str
+
+
+class RecentFailedResumeItem(BaseModel):
+    task_id: uuid.UUID
+    job_id: Optional[uuid.UUID] = None
+    status: str
+    detail: Optional[str] = None
+
+
+class RecentFailedResumeResponse(BaseModel):
+    window_hours: int
+    matched_count: int
+    resumed_count: int
+    skipped_count: int
+    failed_count: int
+    results: list[RecentFailedResumeItem] = Field(default_factory=list)
 
 
 class RemotePublishResponse(BaseModel):
@@ -204,6 +225,7 @@ class AutoYouTubeRequest(BaseModel):
     url: str
     license: SourceLicense = SourceLicense.authorized
     proof_url: Optional[str] = None
+    auto_publish: Optional[bool] = None
 
 
 class AutoYouTubeResponse(BaseModel):
@@ -211,6 +233,11 @@ class AutoYouTubeResponse(BaseModel):
     pipeline_job_id: str
     deduped: bool = False
     source_id: Optional[str] = None
+
+
+class AutoYouTubeTaskStartResponse(BaseModel):
+    task_id: uuid.UUID
+    pipeline_job_id: str
 
 
 class ConvertedVideoItem(BaseModel):
@@ -254,12 +281,39 @@ class YouTubeSettingsRead(BaseModel):
     cookies_has_visitor_info: bool = False
     cookie_file_configured: bool = False
     cookie_file_exists: bool = False
+    home_scan_enabled: bool = False
+    home_scan_interval_minutes: int = 60
+    home_scan_limit: int = 10
+    home_scan_long_videos_only: bool = False
+    home_scan_min_duration_seconds: int = 180
+    home_scan_running: bool = False
+    home_scan_last_started_at: Optional[str] = None
+    home_scan_last_finished_at: Optional[str] = None
+    home_scan_last_discovered_count: int = 0
+    home_scan_last_started_count: int = 0
+    home_scan_last_skipped_duplicates: int = 0
+    home_scan_last_failed_count: int = 0
+    home_scan_last_candidate_count: int = 0
+    home_scan_last_explicit_shorts_count: int = 0
+    home_scan_last_known_duration_count: int = 0
+    home_scan_last_unknown_duration_count: int = 0
+    home_scan_last_below_min_duration_count: int = 0
+    home_scan_last_kept_unknown_duration_count: int = 0
+    home_scan_last_eligible_count: int = 0
+    home_scan_last_log_lines: list[str] = Field(default_factory=list)
+    home_scan_last_error: Optional[str] = None
+    home_scan_last_sample_urls: list[str] = Field(default_factory=list)
 
 
 class YouTubeSettingsUpdate(BaseModel):
     proxy: Optional[str] = None
     cookies_txt: Optional[str] = None
     cookies_enabled: Optional[bool] = None
+    home_scan_enabled: Optional[bool] = None
+    home_scan_interval_minutes: Optional[int] = Field(default=None, ge=1, le=1440)
+    home_scan_limit: Optional[int] = Field(default=None, ge=1, le=100)
+    home_scan_long_videos_only: Optional[bool] = None
+    home_scan_min_duration_seconds: Optional[int] = Field(default=None, ge=0, le=86400)
 
 
 class YouTubeProxyTestRequest(BaseModel):
@@ -274,3 +328,45 @@ class YouTubeProxyTestResponse(BaseModel):
     status_code: Optional[int] = None
     elapsed_ms: int
     error: Optional[str] = None
+
+
+class YouTubeHomeScanRunResponse(BaseModel):
+    discovered_count: int
+    created_task_ids: list[uuid.UUID]
+    skipped_duplicates: int
+    failed_count: int = 0
+    candidate_count: int = 0
+    explicit_shorts_count: int = 0
+    known_duration_count: int = 0
+    unknown_duration_count: int = 0
+    below_min_duration_count: int = 0
+    kept_unknown_duration_count: int = 0
+    eligible_count: int = 0
+    min_duration_seconds: int = 0
+    log_lines: list[str] = Field(default_factory=list)
+    started_pipeline_job_ids: list[str] = Field(default_factory=list)
+    sample_urls: list[str] = Field(default_factory=list)
+
+
+class WorkdirMaintenanceEntryRead(BaseModel):
+    kind: Literal["subtitle", "render", "youtube"]
+    owner_id: str
+    rel_path: str
+    size_bytes: int = 0
+    modified_at: datetime
+    reclaimable: bool = False
+    reason: str = ""
+    task_id: Optional[uuid.UUID] = None
+
+
+class WorkdirMaintenanceRead(BaseModel):
+    work_dir: str
+    scanned_dirs: int = 0
+    reclaimable_dirs: int = 0
+    total_bytes: int = 0
+    reclaimable_bytes: int = 0
+    deleted_dirs: int = 0
+    deleted_bytes: int = 0
+    deleted_paths: list[str] = Field(default_factory=list)
+    errors: list[str] = Field(default_factory=list)
+    entries: list[WorkdirMaintenanceEntryRead] = Field(default_factory=list)

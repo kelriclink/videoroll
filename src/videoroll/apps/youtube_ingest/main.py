@@ -4,7 +4,7 @@ import os
 import uuid
 from typing import Generator
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Body, Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -28,9 +28,15 @@ from videoroll.apps.youtube_ingest.schemas import (
     YouTubeScanResponse,
     YouTubeSourceCreate,
     YouTubeSourceRead,
+    YouTubeSourceScanRequest,
+    YouTubeSourceUpdate,
 )
-from videoroll.apps.youtube_ingest.youtube_feed import fetch_youtube_feed
-from videoroll.apps.youtube_settings_store import get_youtube_settings
+from videoroll.apps.youtube_ingest.source_service import (
+    scan_youtube_source_by_id,
+    source_to_read_dict,
+    update_youtube_source,
+    upsert_youtube_source,
+)
 from videoroll.utils.youtube_urls import canonicalize_youtube_url, extract_youtube_video_id
 
 
@@ -72,27 +78,58 @@ def health() -> dict[str, str]:
 
 
 @app.post("/youtube/sources", response_model=YouTubeSourceRead)
-def create_source(payload: YouTubeSourceCreate, db: Session = Depends(get_db)) -> YouTubeSource:
-    src = YouTubeSource(
-        source_type=payload.source_type,
-        source_id=payload.source_id,
-        license=payload.license,
-        proof_url=payload.proof_url,
-        enabled=payload.enabled,
-    )
-    db.add(src)
+def create_source(
+    payload: YouTubeSourceCreate,
+    settings: YouTubeIngestSettings = Depends(get_settings),
+    db: Session = Depends(get_db),
+) -> YouTubeSourceRead:
     try:
-        db.commit()
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=400, detail=f"create source failed: {e}") from e
-    db.refresh(src)
-    return src
+        src = upsert_youtube_source(
+            db,
+            source_input=payload.source_url,
+            source_type=payload.source_type,
+            source_id=payload.source_id,
+            license=payload.license,
+            proof_url=payload.proof_url,
+            enabled=payload.enabled,
+            scan_interval_minutes=payload.scan_interval_minutes,
+            scan_limit=payload.scan_limit,
+            auto_process=payload.auto_process,
+            user_agent=settings.user_agent,
+            default_proxy=settings.youtube_proxy,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    return YouTubeSourceRead(**source_to_read_dict(src))
 
 
 @app.get("/youtube/sources", response_model=list[YouTubeSourceRead])
-def list_sources(db: Session = Depends(get_db)) -> list[YouTubeSource]:
-    return db.query(YouTubeSource).order_by(YouTubeSource.created_at.desc()).all()
+def list_sources(db: Session = Depends(get_db)) -> list[YouTubeSourceRead]:
+    rows = db.query(YouTubeSource).order_by(YouTubeSource.created_at.desc()).all()
+    return [YouTubeSourceRead(**source_to_read_dict(row)) for row in rows]
+
+
+@app.patch("/youtube/sources/{source_pk}", response_model=YouTubeSourceRead)
+def patch_source(
+    source_pk: uuid.UUID,
+    payload: YouTubeSourceUpdate,
+    db: Session = Depends(get_db),
+) -> YouTubeSourceRead:
+    try:
+        src = update_youtube_source(db, source_pk, payload.model_dump(exclude_unset=True))
+    except KeyError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    return YouTubeSourceRead(**source_to_read_dict(src))
+
+
+@app.delete("/youtube/sources/{source_pk}")
+def delete_source(source_pk: uuid.UUID, db: Session = Depends(get_db)) -> dict[str, bool]:
+    src = db.get(YouTubeSource, source_pk)
+    if src is None:
+        raise HTTPException(status_code=404, detail="source not found")
+    db.delete(src)
+    db.commit()
+    return {"ok": True}
 
 
 @app.post("/youtube/ingest", response_model=YouTubeIngestResponse)
@@ -143,77 +180,69 @@ def scan_source(
     src = db.query(YouTubeSource).filter(YouTubeSource.source_type == payload.source_type, YouTubeSource.source_id == payload.source_id).first()
     if not src or not src.enabled:
         raise HTTPException(status_code=400, detail="source not found or disabled")
-
-    yt_cfg = get_youtube_settings(db, default_proxy=settings.youtube_proxy)
     try:
-        entries = list(
-            fetch_youtube_feed(
-                src.source_type.value,
-                src.source_id,
-                user_agent=settings.user_agent,
-                proxy=str(yt_cfg.get("proxy") or "").strip() or None,
-                limit=payload.limit,
-            )
+        res = scan_youtube_source_by_id(
+            db,
+            src.id,
+            user_agent=settings.user_agent,
+            default_proxy=settings.youtube_proxy,
+            limit_override=payload.limit,
+            auto_process_override=payload.auto_process,
+            since=payload.since,
+            force=True,
+            raise_if_locked=True,
+            lock_owner_prefix="manual_youtube_source_scan",
         )
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"fetch youtube feed failed: {e}") from e
-    if payload.since:
-        entries = [e for e in entries if e.published_at > payload.since]
-    entries = entries[: payload.limit]
-
-    created: list[uuid.UUID] = []
-    started: list[str] = []
-    skipped = 0
-    for e in entries:
-        exists = db.query(IngestedVideo).filter(IngestedVideo.platform == "youtube", IngestedVideo.source_id == e.video_id).first()
-        if exists:
-            skipped += 1
-            continue
-
-        url = f"https://www.youtube.com/watch?v={e.video_id}"
-        task = Task(
-            source_type=SourceType.youtube,
-            source_url=url,
-            source_license=src.license,
-            source_proof_url=src.proof_url,
-            status=TaskStatus.ingested,
-        )
-        db.add(task)
-        db.flush()
-        db.add(IngestedVideo(platform="youtube", source_id=e.video_id, task_id=task.id, published_at=e.published_at))
-        try:
-            db.commit()
-        except IntegrityError:
-            # Another worker/request beat us to it.
-            db.rollback()
-            if (
-                db.query(IngestedVideo)
-                .filter(IngestedVideo.platform == "youtube", IngestedVideo.source_id == e.video_id)
-                .first()
-                is not None
-            ):
-                skipped += 1
-                continue
-            raise
-        db.refresh(task)
-        created.append(task.id)
-
-        if payload.auto_process:
-            try:
-                from videoroll.apps.subtitle_service.worker import celery_app as subtitle_celery_app
-
-                res = subtitle_celery_app.send_task(
-                    "subtitle_service.auto_youtube_pipeline",
-                    args=[str(task.id)],
-                    queue="subtitle",
-                )
-                started.append(str(res.id))
-            except Exception:
-                pass
+    except KeyError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except RuntimeError as e:
+        msg = str(e)
+        if "already running" in msg:
+            raise HTTPException(status_code=409, detail=msg) from e
+        raise HTTPException(status_code=502, detail=msg) from e
 
     return YouTubeScanResponse(
-        discovered_count=len(entries),
-        created_task_ids=created,
-        skipped_duplicates=skipped,
-        started_pipeline_job_ids=started,
+        discovered_count=res.discovered_count,
+        created_task_ids=res.created_task_ids,
+        skipped_duplicates=res.skipped_duplicates,
+        started_pipeline_job_ids=res.started_pipeline_job_ids,
+    )
+
+
+@app.post("/youtube/sources/{source_pk}/scan", response_model=YouTubeScanResponse)
+def scan_source_by_row_id(
+    source_pk: uuid.UUID,
+    payload: YouTubeSourceScanRequest = Body(default=YouTubeSourceScanRequest()),
+    settings: YouTubeIngestSettings = Depends(get_settings),
+    db: Session = Depends(get_db),
+) -> YouTubeScanResponse:
+    try:
+        res = scan_youtube_source_by_id(
+            db,
+            source_pk,
+            user_agent=settings.user_agent,
+            default_proxy=settings.youtube_proxy,
+            limit_override=payload.limit,
+            auto_process_override=payload.auto_process,
+            force=True,
+            raise_if_locked=True,
+            lock_owner_prefix="manual_youtube_source_scan",
+        )
+    except KeyError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except RuntimeError as e:
+        msg = str(e)
+        if "already running" in msg:
+            raise HTTPException(status_code=409, detail=msg) from e
+        raise HTTPException(status_code=502, detail=msg) from e
+
+    return YouTubeScanResponse(
+        discovered_count=res.discovered_count,
+        created_task_ids=res.created_task_ids,
+        skipped_duplicates=res.skipped_duplicates,
+        started_pipeline_job_ids=res.started_pipeline_job_ids,
     )

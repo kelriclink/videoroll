@@ -10,7 +10,7 @@ from videoroll.db.models import AppSetting
 
 ASR_SETTINGS_KEY = "subtitle.asr"
 
-_ALLOWED_ENGINES = {"mock", "faster-whisper"}
+_ALLOWED_ENGINES = {"mock", "faster-whisper", "openvino"}
 _MAX_PROXY_LEN = 2048
 
 
@@ -38,13 +38,31 @@ def get_asr_settings(db: Session, defaults: SubtitleServiceSettings) -> dict[str
         engine = defaults.asr_engine if defaults.asr_engine in _ALLOWED_ENGINES else "faster-whisper"
 
     language = str(stored.get("default_language") or "auto").strip() or "auto"
-    model = str(stored.get("default_model") or defaults.whisper_model).strip() or defaults.whisper_model
+    engine_default_model = defaults.whisper_model
+    if engine == "openvino":
+        engine_default_model = str(defaults.openvino_model or "").strip()
+    model = str(stored.get("default_model") or engine_default_model).strip() or engine_default_model
+    openvino_device = str(stored.get("openvino_device") or defaults.openvino_device).strip() or defaults.openvino_device
+    openvino_num_beams = int(stored.get("openvino_num_beams") or defaults.openvino_num_beams or 1)
+    if openvino_num_beams <= 0:
+        openvino_num_beams = int(defaults.openvino_num_beams or 1) or 1
+    openvino_max_new_tokens = int(stored.get("openvino_max_new_tokens") or defaults.openvino_max_new_tokens or 448)
+    if openvino_max_new_tokens <= 0:
+        openvino_max_new_tokens = int(defaults.openvino_max_new_tokens or 448) or 448
 
     proxy = str(stored.get("model_download_proxy") or "").strip()
     if len(proxy) > _MAX_PROXY_LEN:
         proxy = proxy[:_MAX_PROXY_LEN]
 
-    return {"default_engine": engine, "default_language": language, "default_model": model, "model_download_proxy": proxy}
+    return {
+        "default_engine": engine,
+        "default_language": language,
+        "default_model": model,
+        "openvino_device": openvino_device,
+        "openvino_num_beams": openvino_num_beams,
+        "openvino_max_new_tokens": openvino_max_new_tokens,
+        "model_download_proxy": proxy,
+    }
 
 
 def update_asr_settings(db: Session, defaults: SubtitleServiceSettings, update: dict[str, Any]) -> dict[str, Any]:
@@ -73,6 +91,25 @@ def update_asr_settings(db: Session, defaults: SubtitleServiceSettings, update: 
             stored.pop("default_model", None)
         else:
             stored["default_model"] = val
+
+    if "openvino_device" in update and update["openvino_device"] is not None:
+        val = str(update["openvino_device"]).strip()
+        if not val:
+            stored.pop("openvino_device", None)
+        else:
+            stored["openvino_device"] = val
+
+    if "openvino_num_beams" in update and update["openvino_num_beams"] is not None:
+        val = int(update["openvino_num_beams"])
+        if val <= 0:
+            raise ValueError("openvino_num_beams must be >= 1")
+        stored["openvino_num_beams"] = val
+
+    if "openvino_max_new_tokens" in update and update["openvino_max_new_tokens"] is not None:
+        val = int(update["openvino_max_new_tokens"])
+        if val <= 0:
+            raise ValueError("openvino_max_new_tokens must be >= 1")
+        stored["openvino_max_new_tokens"] = val
 
     if "model_download_proxy" in update and update["model_download_proxy"] is not None:
         val = str(update["model_download_proxy"] or "").strip()

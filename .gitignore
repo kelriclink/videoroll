@@ -4,6 +4,8 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
+.codex
+.codex/
 .venv/
 venv/
 
@@ -20,3 +22,13 @@ src/web/dist/
 src/web/*.tsbuildinfo
 
 skills/videoroll/local.env
+deploy_compose/.env
+deploy_prod/.env
+src.zip
+src.7z
+videoroll-app-prod-*.tar
+videoroll-app-prod-*.tar.sha256
+videoroll-prod-bundle-*.tar
+videoroll-prod-bundle-*.tar.sha256
+videoroll-deploy-*/
+videoroll-prod-deploy-*/

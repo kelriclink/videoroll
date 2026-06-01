@@ -22,9 +22,17 @@ type TaskQueue = {
   tasks: TaskQueueItem[];
 };
 
+type TaskQueueSettingsSaveResponse = {
+  max_concurrency: number;
+  runtime_worker_concurrency?: number | null;
+  runtime_sync_ok?: boolean | null;
+  runtime_sync_detail?: string | null;
+};
+
 export default function RenderQueuePage() {
   const [queue, setQueue] = useState<TaskQueue | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [maxConcText, setMaxConcText] = useState("1");
   const [maxConcDirty, setMaxConcDirty] = useState(false);
@@ -79,19 +87,23 @@ export default function RenderQueuePage() {
   async function saveMaxConcurrency() {
     setBusy(true);
     setError(null);
+    setNotice(null);
     try {
       const raw = maxConcText.trim();
       if (!raw) throw new Error("max_concurrency 不能为空");
       const n = Number(raw);
       if (!Number.isFinite(n) || !Number.isInteger(n)) throw new Error("max_concurrency 必须是整数");
       if (n < 0 || n > 32) throw new Error("max_concurrency 范围：0..32（0=暂停）");
-      await fetchJson(`${SUBTITLE_SERVICE_URL}/subtitle/task_queue/settings`, {
+      const saved = await fetchJson<TaskQueueSettingsSaveResponse>(`${SUBTITLE_SERVICE_URL}/subtitle/task_queue/settings`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ max_concurrency: n }),
       });
       setMaxConcDirty(false);
       await refresh();
+      if (saved.runtime_sync_ok === false) {
+        setNotice(`设置已保存，但运行中 worker 并发未完全同步：${saved.runtime_sync_detail ?? "请检查服务日志"}`);
+      }
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -107,6 +119,7 @@ export default function RenderQueuePage() {
           用于限制任务并发：一个任务从字幕处理开始到压制结束占用一个并发名额（按 Task 计数）。
         </div>
         {error ? <div className="mt-3 text-sm text-rose-700">{error}</div> : null}
+        {notice ? <div className="mt-3 text-sm text-amber-700">{notice}</div> : null}
       </div>
 
       <div className="rounded border bg-white p-4">
