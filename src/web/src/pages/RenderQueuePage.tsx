@@ -1,5 +1,5 @@
 import { Link } from "react-router-dom";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { fetchJson } from "../lib/http";
 import { SUBTITLE_SERVICE_URL } from "../lib/urls";
 
@@ -36,7 +36,6 @@ export default function RenderQueuePage() {
   const [busy, setBusy] = useState(false);
   const [maxConcText, setMaxConcText] = useState("1");
   const [maxConcDirty, setMaxConcDirty] = useState(false);
-  const lastKickAtRef = useRef<number>(0);
 
   const refresh = useCallback(async () => {
     setError(null);
@@ -44,18 +43,6 @@ export default function RenderQueuePage() {
       const q = await fetchJson<TaskQueue>(`${SUBTITLE_SERVICE_URL}/subtitle/task_queue`);
       setQueue(q);
       if (!maxConcDirty) setMaxConcText(String(q?.settings?.max_concurrency ?? 1));
-
-      const maxConc = Number(q?.settings?.max_concurrency ?? 1);
-      const queued = Number(q?.queued_count ?? 0);
-      const running = Number(q?.running_count ?? 0);
-      const hasWaitingStage = (q?.tasks ?? []).some((t) => t.stage === "waiting_subtitle" || t.stage === "waiting_render");
-      if ((queued > 0 && running < maxConc && maxConc > 0) || hasWaitingStage) {
-        const now = Date.now();
-        if (now - (lastKickAtRef.current || 0) > 10_000) {
-          lastKickAtRef.current = now;
-          fetchJson(`${SUBTITLE_SERVICE_URL}/subtitle/task_queue/tick`, { method: "POST" }).catch(() => {});
-        }
-      }
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : String(e));
     }

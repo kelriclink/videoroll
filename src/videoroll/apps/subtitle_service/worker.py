@@ -16,6 +16,7 @@ from typing import Any
 
 import httpx
 from celery import Celery
+from celery.exceptions import Retry
 from celery.signals import worker_init
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
@@ -89,12 +90,23 @@ from videoroll.apps.youtube_settings_store import (
     normalize_and_validate_netscape_cookies_txt,
 )
 from videoroll.utils.cpu import process_cpu_count
+
+
+def _positive_int_env(name: str, default: int) -> int:
+    try:
+        value = int(os.getenv(name, str(default)) or default)
+    except Exception:
+        value = default
+    return max(1, value)
+
+
 settings = get_subtitle_settings()
 _ORCH_INTERNAL_TOKEN = internal_api_token(settings.s3_secret_access_key)
 _ORCH_INTERNAL_HEADERS = {INTERNAL_TOKEN_HEADER: _ORCH_INTERNAL_TOKEN} if _ORCH_INTERNAL_TOKEN else {}
 logger = logging.getLogger(__name__)
 _DB_READY_LOCK = threading.Lock()
 _DB_READY_PID: int | None = None
+_TASK_QUEUE_TICK_INTERVAL_SECONDS = _positive_int_env("TASK_QUEUE_TICK_INTERVAL_SECONDS", 10)
 celery_app = Celery("subtitle_service", broker=settings.redis_url, backend=settings.redis_url)
 celery_app.conf.update(
     task_serializer="json",
@@ -102,6 +114,14 @@ celery_app.conf.update(
     accept_content=["json"],
     timezone="UTC",
     enable_utc=True,
+    beat_schedule={
+        "subtitle-service-task-queue-tick": {
+            "task": "subtitle_service.task_queue_tick",
+            "schedule": _TASK_QUEUE_TICK_INTERVAL_SECONDS,
+            "args": (),
+            "options": {"queue": "subtitle"},
+        },
+    },
 )
 
 def _resolve_faster_whisper_model(model_name: str, model_dir: Path, *, proxy: str | None = None) -> str:
@@ -676,12 +696,12 @@ def _recover_interrupted_subtitle_jobs() -> None:
     by an external restart/crash (e.g. host reboot, container restart, SIGKILL).
 
     Strategy:
-      - Mark the old running job as failed (so it's visible in the UI as a crash).
-      - DO NOT auto-resume; user must click "continue/resume" manually.
+      - Put the old running job back into the queue with resume enabled.
+      - Release the task queue lock so beat can schedule it again.
     """
     _ensure_db()
     db = _db()
-    marked = 0
+    recovered = 0
     try:
         running = (
             db.query(SubtitleJob)
@@ -692,33 +712,32 @@ def _recover_interrupted_subtitle_jobs() -> None:
         )
         for old in running:
             try:
-                old.status = SubtitleJobStatus.failed
-                old_progress = int(old.progress or 0)
-                old_msg = (old.error_message or "").strip()
-
-                detail = (
-                    f"检测到 Worker 重启/崩溃：该任务在运行中断开（progress={old_progress}）。"
-                    "未自动恢复，请在页面点击“继续/从失败处继续”手动恢复。"
+                req = dict(old.request_json) if isinstance(old.request_json, dict) else {}
+                req["resume"] = True
+                old.request_json = req
+                old.status = SubtitleJobStatus.queued
+                old.progress = 0
+                old.error_message = _task_queue_join_message(
+                    old.error_message,
+                    "Detected worker restart/crash while this subtitle job was running; requeued with resume enabled.",
                 )
-                if old_msg:
-                    detail = f"{old_msg}\n{detail}"
-                old.error_message = detail[:2000]
                 db.add(old)
                 task = db.get(Task, old.task_id)
                 if task and task.status not in {TaskStatus.published, TaskStatus.canceled}:
                     if task.lock_owner == TASK_QUEUE_LOCK_OWNER:
                         _task_queue_unlock(task)
-                    task.status = TaskStatus.failed
-                    task.error_code = "SUBTITLE_CRASHED"
-                    task.error_message = "subtitle job crashed; manual resume required"
+                    if task.error_code == "SUBTITLE_CRASHED":
+                        task.error_code = None
+                    if task.error_message == "subtitle job crashed; manual resume required":
+                        task.error_message = None
                     db.add(task)
                 db.commit()
-                marked += 1
+                recovered += 1
             except Exception:
-                logger.exception("failed to mark interrupted subtitle job as failed (job_id=%s)", getattr(old, "id", None))
+                logger.exception("failed to recover interrupted subtitle job (job_id=%s)", getattr(old, "id", None))
                 db.rollback()
-        if marked:
-            logger.warning("marked %s interrupted subtitle job(s) as failed", marked)
+        if recovered:
+            logger.warning("recovered %s interrupted subtitle job(s)", recovered)
     finally:
         db.close()
 
@@ -768,8 +787,8 @@ def _on_worker_init(**_kwargs: Any) -> None:
         logger.exception("subtitle job recovery failed")
 
 
-@celery_app.task(name="subtitle_service.process_job")
-def process_job(job_id: str) -> dict[str, str]:
+@celery_app.task(name="subtitle_service.process_job", bind=True, acks_late=True, reject_on_worker_lost=True)
+def process_job(self: Any, job_id: str) -> dict[str, str]:
     _ensure_db()
     store = S3Store(settings)
     store.ensure_bucket()
@@ -1312,7 +1331,7 @@ def process_job(job_id: str) -> dict[str, str]:
             enable_summary_val = translate_cfg.get("enable_summary")
             enable_summary = translate_settings["default_enable_summary"] if enable_summary_val is None else bool(enable_summary_val)
 
-            max_retries = int(translate_settings.get("default_max_retries") or 0)
+            max_retries = max(0, int(translate_settings.get("default_max_retries") or 0))
 
             def _is_retryable_translate_error(err: Exception) -> bool:
                 msg = str(err or "")
@@ -1320,12 +1339,10 @@ def process_job(job_id: str) -> dict[str, str]:
                     return False
                 return True
 
-            def _sleep_retry(attempt: int) -> None:
+            def _translate_retry_countdown(attempt: int) -> float:
                 # Exponential backoff: 2s, 4s, 8s... capped at 30s.
-                delay = min(30.0, float(2 ** max(0, attempt)))
-                time.sleep(delay)
+                return min(30.0, float(2 ** max(0, attempt)))
 
-            attempt = 0
             while True:
                 try:
                     if provider == "mock":
@@ -1369,15 +1386,17 @@ def process_job(job_id: str) -> dict[str, str]:
                     db.commit()
                     break
                 except Exception as e:
-                    if provider != "openai" or attempt >= max_retries or not _is_retryable_translate_error(e):
+                    retry_no = int(getattr(self.request, "retries", 0) or 0) + 1
+                    if provider != "openai" or retry_no > max_retries or not _is_retryable_translate_error(e):
                         raise
-                    attempt += 1
-                    job.error_message = f"translate failed; retrying ({attempt}/{max_retries}): {e}"
+                    req["resume"] = True
+                    _save_job_request()
+                    job.error_message = f"translate failed; celery retrying ({retry_no}/{max_retries}): {e}"
                     db.add(job)
                     db.commit()
-                    _safe_append_log_line(log_path, f"translate retry {attempt}/{max_retries}: {type(e).__name__}: {e}")
+                    _safe_append_log_line(log_path, f"translate retry {retry_no}/{max_retries}: {type(e).__name__}: {e}")
                     _safe_upload_log(store, log_path, log_key)
-                    _sleep_retry(attempt)
+                    raise self.retry(exc=e, countdown=_translate_retry_countdown(retry_no), max_retries=max_retries)
             task.status = TaskStatus.translated
             db.add(task)
 
@@ -1517,6 +1536,8 @@ def process_job(job_id: str) -> dict[str, str]:
         _safe_upload_log(store, log_path, log_key)
         celery_app.send_task("subtitle_service.task_queue_tick", args=[], queue="subtitle")
         return {"status": "ok", "detail": "render queued"}
+    except Retry:
+        raise
     except Exception as e:
         job = db.get(SubtitleJob, uuid.UUID(job_id))
         if job:
@@ -1890,8 +1911,8 @@ def render_queue_tick() -> dict[str, Any]:
     return task_queue_tick()
 
 
-@celery_app.task(name="subtitle_service.process_render_job")
-def process_render_job(render_job_id: str) -> dict[str, Any]:
+@celery_app.task(name="subtitle_service.process_render_job", bind=True, acks_late=True, reject_on_worker_lost=True)
+def process_render_job(self: Any, render_job_id: str) -> dict[str, Any]:
     _ensure_db()
     store = S3Store(settings)
     store.ensure_bucket()
@@ -2152,6 +2173,8 @@ def process_render_job(render_job_id: str) -> dict[str, Any]:
 
         celery_app.send_task("subtitle_service.task_queue_tick", args=[], queue="subtitle")
         return {"status": "ok"}
+    except Retry:
+        raise
     except Exception as e:
         rj = db.get(RenderJob, rid)
         if rj:
@@ -2342,8 +2365,8 @@ def cleanup_task(task_id: str) -> dict[str, Any]:
         db.close()
 
 
-@celery_app.task(name="subtitle_service.auto_youtube_pipeline")
-def auto_youtube_pipeline(task_id: str, overrides: dict[str, Any] | None = None) -> dict[str, str]:
+@celery_app.task(name="subtitle_service.auto_youtube_pipeline", bind=True, acks_late=True, reject_on_worker_lost=True)
+def auto_youtube_pipeline(self: Any, task_id: str, overrides: dict[str, Any] | None = None) -> dict[str, str]:
     """
     One-click pipeline:
       - download YouTube video (+ metadata + cover)
@@ -2447,8 +2470,12 @@ def auto_youtube_pipeline(task_id: str, overrides: dict[str, Any] | None = None)
 
         # Download YouTube video + cover + metadata (idempotent).
         yt: dict[str, Any] = {}
-        yt_attempt = 0
+        yt_retries_done = int(getattr(self.request, "retries", 0) or 0)
         yt_max_retries = 2
+
+        def _youtube_retry_countdown(retry_no: int) -> float:
+            return min(30.0, float(3 * (2**retry_no)))
+
         while True:
             try:
                 timeout_seconds = float(getattr(settings, "orchestrator_timeout_seconds", 1800.0) or 1800.0)
@@ -2459,36 +2486,34 @@ def auto_youtube_pipeline(task_id: str, overrides: dict[str, Any] | None = None)
                 break
             except httpx.HTTPStatusError as e:
                 status_code = int(getattr(e.response, "status_code", 0) or 0)
-                if status_code in {429, 500, 502, 503, 504} and yt_attempt < yt_max_retries:
-                    yt_attempt += 1
+                if status_code in {429, 500, 502, 503, 504} and yt_retries_done < yt_max_retries:
+                    retry_no = yt_retries_done + 1
                     try:
                         task.retry_count = int(task.retry_count or 0) + 1
                         msg = (e.response.text or "").strip()
                         if len(msg) > 300:
-                            msg = msg[:299] + "…"
-                        task.error_message = f"youtube_download failed; retrying ({yt_attempt}/{yt_max_retries}): {status_code} {msg}".strip()
+                            msg = msg[:299] + "..."
+                        task.error_message = f"youtube_download failed; celery retrying ({retry_no}/{yt_max_retries}): {status_code} {msg}".strip()
                         db.add(task)
                         db.commit()
                     except Exception:
                         db.rollback()
-                    time.sleep(min(30.0, float(3 * (2**yt_attempt))))
-                    continue
+                    raise self.retry(exc=e, countdown=_youtube_retry_countdown(retry_no), max_retries=yt_max_retries)
                 raise
             except httpx.HTTPError as e:
-                if yt_attempt < yt_max_retries:
-                    yt_attempt += 1
+                if yt_retries_done < yt_max_retries:
+                    retry_no = yt_retries_done + 1
                     try:
                         task.retry_count = int(task.retry_count or 0) + 1
-                        task.error_message = f"youtube_download request failed; retrying ({yt_attempt}/{yt_max_retries}): {type(e).__name__}: {e}"
+                        task.error_message = f"youtube_download request failed; celery retrying ({retry_no}/{yt_max_retries}): {type(e).__name__}: {e}"
                         db.add(task)
                         db.commit()
                     except Exception:
                         db.rollback()
-                    time.sleep(min(30.0, float(3 * (2**yt_attempt))))
-                    continue
+                    raise self.retry(exc=e, countdown=_youtube_retry_countdown(retry_no), max_retries=yt_max_retries)
                 raise
 
-        if yt_attempt:
+        if yt_retries_done:
             try:
                 task.error_message = None
                 db.add(task)
@@ -2643,6 +2668,8 @@ def auto_youtube_pipeline(task_id: str, overrides: dict[str, Any] | None = None)
                 resp.raise_for_status()
 
         return {"status": "ok", "task_id": str(tid)}
+    except Retry:
+        raise
     except Exception as e:
         task = db.get(Task, uuid.UUID(task_id))
         if task:

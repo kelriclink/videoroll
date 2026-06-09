@@ -12,6 +12,7 @@ CELERY_PUB_APP="${CELERY_PUB_APP:-videoroll.apps.bilibili_publisher.worker:celer
 CELERY_PUB_QUEUE="${CELERY_PUB_QUEUE:-publish}"
 CELERY_PUB_CONCURRENCY="${CELERY_PUB_CONCURRENCY:-1}"
 CELERY_SUB_CONCURRENCY_FALLBACK="${CELERY_SUB_CONCURRENCY_FALLBACK:-1}"
+CELERY_BEAT_ENABLED="${CELERY_BEAT_ENABLED:-true}"
 
 if ! CELERY_SUB_CONCURRENCY="$(CELERY_SUB_CONCURRENCY_FALLBACK="$CELERY_SUB_CONCURRENCY_FALLBACK" python -m videoroll.apps.subtitle_service.worker_concurrency)"; then
   CELERY_SUB_CONCURRENCY="$CELERY_SUB_CONCURRENCY_FALLBACK"
@@ -23,6 +24,13 @@ fi
 echo "Starting celery worker (subtitle): $CELERY_SUB_APP queue=$CELERY_SUB_QUEUE concurrency=$CELERY_SUB_CONCURRENCY"
 celery -A "$CELERY_SUB_APP" worker -Q "$CELERY_SUB_QUEUE" -l INFO --concurrency "$CELERY_SUB_CONCURRENCY" &
 CELERY_SUB_PID=$!
+
+CELERY_BEAT_PID=""
+if [[ "$CELERY_BEAT_ENABLED" == "true" || "$CELERY_BEAT_ENABLED" == "1" || "$CELERY_BEAT_ENABLED" == "yes" ]]; then
+  echo "Starting celery beat (subtitle): $CELERY_SUB_APP"
+  celery -A "$CELERY_SUB_APP" beat -l INFO &
+  CELERY_BEAT_PID=$!
+fi
 
 echo "Starting celery worker (publish): $CELERY_PUB_APP queue=$CELERY_PUB_QUEUE concurrency=$CELERY_PUB_CONCURRENCY"
 celery -A "$CELERY_PUB_APP" worker -Q "$CELERY_PUB_QUEUE" -l INFO --concurrency "$CELERY_PUB_CONCURRENCY" &
@@ -38,11 +46,20 @@ UVICORN_PID=$!
 
 term_handler() {
   echo "Stopping..."
-  kill -TERM "$UVICORN_PID" "$CELERY_SUB_PID" "$CELERY_PUB_PID" 2>/dev/null || true
-  wait "$UVICORN_PID" "$CELERY_SUB_PID" "$CELERY_PUB_PID" 2>/dev/null || true
+  if [[ -n "$CELERY_BEAT_PID" ]]; then
+    kill -TERM "$UVICORN_PID" "$CELERY_SUB_PID" "$CELERY_BEAT_PID" "$CELERY_PUB_PID" 2>/dev/null || true
+    wait "$UVICORN_PID" "$CELERY_SUB_PID" "$CELERY_BEAT_PID" "$CELERY_PUB_PID" 2>/dev/null || true
+  else
+    kill -TERM "$UVICORN_PID" "$CELERY_SUB_PID" "$CELERY_PUB_PID" 2>/dev/null || true
+    wait "$UVICORN_PID" "$CELERY_SUB_PID" "$CELERY_PUB_PID" 2>/dev/null || true
+  fi
 }
 
 trap term_handler SIGINT SIGTERM
 
-wait -n "$UVICORN_PID" "$CELERY_SUB_PID" "$CELERY_PUB_PID"
+if [[ -n "$CELERY_BEAT_PID" ]]; then
+  wait -n "$UVICORN_PID" "$CELERY_SUB_PID" "$CELERY_BEAT_PID" "$CELERY_PUB_PID"
+else
+  wait -n "$UVICORN_PID" "$CELERY_SUB_PID" "$CELERY_PUB_PID"
+fi
 term_handler

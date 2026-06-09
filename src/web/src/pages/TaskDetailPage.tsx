@@ -124,7 +124,6 @@ export default function TaskDetailPage() {
   const [youtubeMeta, setYoutubeMeta] = useState<YouTubeMeta | null>(null);
   const [didAutoPickCover, setDidAutoPickCover] = useState(false);
   const loadedPublishMetaTextRef = useRef<string>("{}");
-  const lastQueueKickAtRef = useRef<number>(0);
 
   const refresh = useCallback(
     async (opts?: { silent?: boolean }) => {
@@ -193,7 +192,6 @@ export default function TaskDetailPage() {
     setPublishReview(null);
     setYoutubeMeta(null);
     setDidAutoPickCover(false);
-    lastQueueKickAtRef.current = 0;
     loadedPublishMetaTextRef.current = "{}";
     setPublishMetaText("{}");
     setPublishEnableReprint(true);
@@ -581,8 +579,6 @@ export default function TaskDetailPage() {
     return hasSubtitleInFlight || hasPublishInFlight;
   }, [subtitleJobs, publishJobs]);
 
-  const hasQueuedSubtitleJob = useMemo(() => (subtitleJobs ?? []).some((j) => j.status === "queued"), [subtitleJobs]);
-
   const loadLogs = useCallback(
     async (opts?: { silent?: boolean }) => {
       if (!taskId) return;
@@ -675,17 +671,10 @@ export default function TaskDetailPage() {
       if (cancelled) return;
       const plan = createTaskDetailPollPlan({
         shouldPoll,
-        hasQueuedSubtitleJob,
-        lastQueueKickAt: lastQueueKickAtRef.current || 0,
-        now: Date.now(),
       });
       const jobs: Array<Promise<unknown>> = [];
       if (plan.shouldRefreshTask) jobs.push(refresh({ silent: true }));
       if (plan.shouldLoadLogs) jobs.push(loadLogs({ silent: true }));
-      if (plan.shouldKickQueue) {
-        lastQueueKickAtRef.current = Date.now();
-        jobs.push(fetchJson(`${SUBTITLE_SERVICE_URL}/subtitle/task_queue/tick`, { method: "POST" }).catch(() => null));
-      }
       await Promise.allSettled(jobs);
       if (cancelled) return;
       if (plan.nextDelayMs !== null) {
@@ -698,7 +687,7 @@ export default function TaskDetailPage() {
       cancelled = true;
       if (timer) window.clearTimeout(timer);
     };
-  }, [taskId, shouldPoll, hasQueuedSubtitleJob, refresh, loadLogs]);
+  }, [taskId, shouldPoll, refresh, loadLogs]);
 
   if (!taskId) return null;
 
