@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from functools import lru_cache
 
 from sqlalchemy import inspect, text
@@ -102,9 +103,13 @@ def auto_migrate_engine(engine: Engine) -> None:
 
 
 @lru_cache
-def auto_migrate(database_url: str) -> None:
+def _auto_migrate_cached(database_url: str, pid: int) -> None:
     """
-    Idempotent auto migration (cached per database_url).
+    Idempotent auto migration cached per process.
     """
     engine = get_engine(database_url)
     auto_migrate_engine(engine)
+
+
+def auto_migrate(database_url: str) -> None:
+    _auto_migrate_cached(database_url, os.getpid())

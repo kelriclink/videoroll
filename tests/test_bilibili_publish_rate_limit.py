@@ -9,19 +9,25 @@ from videoroll.apps.bilibili_publisher import worker
 
 
 class _FakeLock:
+    def __init__(self, acquired: bool = True) -> None:
+        self.acquired = acquired
+        self.released = False
+
     def acquire(self, blocking: bool = True) -> bool:
-        return True
+        return self.acquired
 
     def release(self) -> None:
+        self.released = True
         return None
 
 
 class _FakeRedis:
-    def __init__(self) -> None:
+    def __init__(self, *, lock_acquired: bool = True) -> None:
+        self.lock_acquired = lock_acquired
         self.store: dict[str, str] = {}
 
     def lock(self, *args, **kwargs) -> _FakeLock:
-        return _FakeLock()
+        return _FakeLock(acquired=self.lock_acquired)
 
     def get(self, key: str) -> str | None:
         return self.store.get(key)
@@ -74,3 +80,17 @@ def test_reserve_publish_stage_slot_uses_queue_depth_to_push_later_calls() -> No
     assert first["interval_seconds"] == 75.0
     assert second["wait_seconds"] == 75.0
     assert second["source"] == "redis"
+
+
+def test_try_acquire_publish_job_lock_returns_false_when_already_running() -> None:
+    fake_redis = _FakeRedis(lock_acquired=False)
+    with patch.object(worker, "_redis_client", return_value=fake_redis):
+        assert worker._try_acquire_publish_job_lock("job-1") is False
+
+
+def test_try_acquire_publish_job_lock_returns_lock_when_acquired() -> None:
+    fake_redis = _FakeRedis(lock_acquired=True)
+    with patch.object(worker, "_redis_client", return_value=fake_redis):
+        lock = worker._try_acquire_publish_job_lock("job-1")
+
+    assert isinstance(lock, _FakeLock)

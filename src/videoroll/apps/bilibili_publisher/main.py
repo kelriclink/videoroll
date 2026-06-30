@@ -41,6 +41,10 @@ from videoroll.apps.subtitle_service.bilibili_tags_store import get_task_bilibil
 from videoroll.apps.subtitle_service.translate_settings_store import get_translate_settings
 
 
+def _as_dict(v: object) -> dict:
+    return v if isinstance(v, dict) else {}
+
+
 def get_settings() -> BilibiliPublisherSettings:
     return get_bilibili_publisher_settings()
 
@@ -223,11 +227,46 @@ def _utcnow() -> datetime:
     return datetime.now(tz=timezone.utc)
 
 
+def _latest_publish_job(db: Session, task_id: uuid.UUID, states: set[PublishState]) -> PublishJob | None:
+    return (
+        db.query(PublishJob)
+        .filter(PublishJob.task_id == task_id, PublishJob.state.in_(list(states)))
+        .order_by(PublishJob.updated_at.desc(), PublishJob.created_at.desc())
+        .first()
+    )
+
+
+def _publish_response_from_job(job: PublishJob) -> PublishResponse:
+    return PublishResponse(
+        state=job.state.value,
+        aid=job.aid,
+        bvid=job.bvid,
+        response=_as_dict(job.response_json) or None,
+    )
+
+
 @app.post("/bilibili/publish", response_model=PublishResponse)
 def publish(payload: PublishRequest, settings: BilibiliPublisherSettings = Depends(get_settings), db: Session = Depends(get_db)) -> PublishResponse:
-    task = db.get(Task, payload.task_id)
+    task = db.get(Task, payload.task_id, with_for_update=True)
     if not task:
         raise HTTPException(status_code=404, detail="task not found")
+
+    published_job = _latest_publish_job(db, payload.task_id, {PublishState.published})
+    if published_job:
+        task.status = TaskStatus.published
+        task.error_code = None
+        task.error_message = None
+        db.add(task)
+        db.commit()
+        return _publish_response_from_job(published_job)
+
+    active_job = _latest_publish_job(db, payload.task_id, {PublishState.submitting, PublishState.submitted})
+    if active_job:
+        if settings.publish_mode != "mock":
+            task.status = TaskStatus.publishing
+            db.add(task)
+            db.commit()
+        return _publish_response_from_job(active_job)
 
     job = PublishJob(
         task_id=payload.task_id,

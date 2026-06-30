@@ -36,9 +36,11 @@ from videoroll.db.models import (
     AssetKind,
     IngestedVideo,
     PublishJob,
+    PublishState,
     RenderJob,
     RenderJobStatus,
     SourceLicense,
+    SourceType,
     Subtitle,
     SubtitleJob,
     SubtitleJobStatus,
@@ -49,6 +51,7 @@ from videoroll.db.session import db_session, get_engine, get_sessionmaker
 from videoroll.storage.s3 import S3Store
 from videoroll.utils.auto_youtube import encode_auto_youtube_created_by
 from videoroll.utils.hashing import sha256_file
+from videoroll.utils.httpx_proxy import HTTPX_PROXY_KWARG_UNSUPPORTED, format_httpx_proxy_error
 from videoroll.utils.internal_api_token import internal_api_token
 from videoroll.utils.workdir_maintenance import (
     WorkdirJobState,
@@ -204,6 +207,34 @@ def _publish_job_error_message(job: PublishJob) -> str | None:
     if len(msg) > 500:
         msg = msg[:499] + "…"
     return msg
+
+
+def _published_publish_job_task_ids(db: Session, task_ids: list[uuid.UUID]) -> set[uuid.UUID]:
+    if not task_ids:
+        return set()
+    rows = (
+        db.query(PublishJob.task_id)
+        .filter(PublishJob.task_id.in_(task_ids), PublishJob.state == PublishState.published)
+        .all()
+    )
+    return {row[0] for row in rows}
+
+
+def _reconcile_published_task_state(db: Session, task: Task, *, published_task_ids: set[uuid.UUID] | None = None) -> bool:
+    if task.status in {TaskStatus.published, TaskStatus.canceled}:
+        return False
+    has_published_job = task.id in published_task_ids if published_task_ids is not None else bool(
+        db.query(PublishJob.id)
+        .filter(PublishJob.task_id == task.id, PublishJob.state == PublishState.published)
+        .first()
+    )
+    if not has_published_job:
+        return False
+    task.status = TaskStatus.published
+    task.error_code = None
+    task.error_message = None
+    db.add(task)
+    return True
 
 
 def _normalize_tags(v: Any) -> list[str]:
@@ -1945,10 +1976,19 @@ def list_tasks(
     tasks = q.limit(limit).all()
 
     ids = [t.id for t in tasks]
+    published_task_ids = _published_publish_job_task_ids(db, ids)
+    reconciled = False
+    for t in tasks:
+        reconciled = _reconcile_published_task_state(db, t, published_task_ids=published_task_ids) or reconciled
+    if reconciled:
+        db.commit()
+
     title_map = _load_task_display_titles(db, ids, s3=s3, allow_s3_fallback=True)
 
     out: list[dict[str, Any]] = []
     for t in tasks:
+        if status is not None and t.status != status:
+            continue
         item = TaskRead.model_validate(t).model_dump()
         display_title = str(title_map.get(t.id) or "").strip()
         item["display_title"] = display_title or None
@@ -2121,7 +2161,7 @@ def test_youtube_proxy(
                     used_proxy=None,
                     status_code=resp.status_code,
                     elapsed_ms=elapsed_ms,
-                    error="httpx does not support proxy kwarg in this environment",
+                    error=HTTPX_PROXY_KWARG_UNSUPPORTED,
                 )
     except Exception as e:
         elapsed_ms = int((time.perf_counter() - start) * 1000)
@@ -2131,7 +2171,7 @@ def test_youtube_proxy(
             used_proxy=proxy or None,
             status_code=None,
             elapsed_ms=elapsed_ms,
-            error=str(e),
+            error=format_httpx_proxy_error(e, proxy=proxy),
         )
 
 
@@ -2140,6 +2180,8 @@ def get_task(task_id: uuid.UUID, db: Session = Depends(get_db), s3: S3Store = De
     task = db.get(Task, task_id)
     if not task:
         raise HTTPException(status_code=404, detail="task not found")
+    if _reconcile_published_task_state(db, task):
+        db.commit()
     item = TaskRead.model_validate(task).model_dump()
     title = get_task_display_title_with_s3(db, str(task_id), s3=s3).strip()
     item["display_title"] = title or None

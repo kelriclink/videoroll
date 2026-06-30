@@ -350,6 +350,28 @@ def _publish_stage_lock_key(stage: str) -> str:
     return f"videoroll:bilibili:publish:{stage}:lock"
 
 
+def _publish_job_lock_key(job_id: str) -> str:
+    return f"videoroll:bilibili:publish:job:{job_id}:lock"
+
+
+def _try_acquire_publish_job_lock(job_id: str) -> Any:
+    client = _redis_client()
+    if client is None:
+        return None
+    lock = client.lock(
+        _publish_job_lock_key(job_id),
+        timeout=int(_env_float("BILIBILI_PUBLISH_JOB_LOCK_TIMEOUT_SECONDS", 3600.0, minimum=60.0)),
+        blocking_timeout=0,
+    )
+    try:
+        if not bool(lock.acquire(blocking=False)):
+            return False
+    except RedisError as e:
+        logger.warning("publish job lock disabled for this attempt (job_id=%s): %s", job_id, e)
+        return None
+    return lock
+
+
 def _parse_float(raw: Any) -> float | None:
     if raw is None:
         return None
@@ -501,6 +523,38 @@ def _publish_meta_with_retry_desc_limit(meta: BilibiliPublishMeta) -> BilibiliPu
     return BilibiliPublishMeta.model_validate(payload)
 
 
+def _latest_published_job(db: Session, task_id: uuid.UUID) -> PublishJob | None:
+    return (
+        db.query(PublishJob)
+        .filter(PublishJob.task_id == task_id, PublishJob.state == PublishState.published)
+        .order_by(PublishJob.updated_at.desc(), PublishJob.created_at.desc())
+        .first()
+    )
+
+
+def _task_has_published_job(db: Session, task_id: uuid.UUID) -> bool:
+    return _latest_published_job(db, task_id) is not None
+
+
+def _can_mark_task_publish_failed(db: Session, task: Task) -> bool:
+    return task.status != TaskStatus.published and not _task_has_published_job(db, task.id)
+
+
+def _mirror_published_job(job: PublishJob, published_job: PublishJob | None, task: Task) -> None:
+    job.state = PublishState.published
+    job.aid = published_job.aid if published_job else job.aid
+    job.bvid = published_job.bvid if published_job else job.bvid
+    job.response_json = {
+        **_as_dict(published_job.response_json if published_job else job.response_json),
+        "skipped_duplicate_publish": True,
+        "reason": "task already published",
+    }
+    job.updated_at = _utcnow()
+    task.status = TaskStatus.published
+    task.error_code = None
+    task.error_message = None
+
+
 def _add_archive_with_desc_retry(
     *,
     client: BilibiliWebClient,
@@ -541,8 +595,13 @@ def process_job(self, job_id: str) -> dict[str, Any]:
     store: S3Store | None = None
     upload_throttle: dict[str, Any] | None = None
     submit_throttle: dict[str, Any] | None = None
+    job_lock: Any = None
     try:
         job_uuid = uuid.UUID(job_id)
+        job_lock = _try_acquire_publish_job_lock(job_id)
+        if job_lock is False:
+            return {"status": "skipped", "detail": "publish job already running"}
+
         job = db.get(PublishJob, job_uuid)
         if not job:
             return {"status": "not_found"}
@@ -558,6 +617,14 @@ def process_job(self, job_id: str) -> dict[str, Any]:
             db.add(job)
             db.commit()
             return {"status": "error", "detail": "task not found"}
+
+        published_job = _latest_published_job(db, task.id)
+        if task.status == TaskStatus.published or published_job is not None:
+            _mirror_published_job(job, published_job, task)
+            db.add(job)
+            db.add(task)
+            db.commit()
+            return {"status": "skipped", "detail": "task already published", "aid": job.aid, "bvid": job.bvid}
 
         cookie = (get_bilibili_cookie_header(db) or "").strip()
         csrf = (get_bilibili_csrf_token(db) or "").strip()
@@ -886,7 +953,7 @@ def process_job(self, job_id: str) -> dict[str, Any]:
                     db.add(job)
                 if task is None and job:
                     task = db.get(Task, job.task_id)
-                if task:
+                if task and _can_mark_task_publish_failed(db, task):
                     task.status = TaskStatus.failed
                     task.error_code = "PUBLISH_RATE_LIMITED"
                     task.error_message = e.message or str(e)
@@ -923,7 +990,7 @@ def process_job(self, job_id: str) -> dict[str, Any]:
                 db.add(job)
             if task is None and job:
                 task = db.get(Task, job.task_id)
-            if task:
+            if task and _can_mark_task_publish_failed(db, task):
                 task.status = TaskStatus.failed
                 task.error_code = "PUBLISH_FAILED"
                 task.error_message = str(e)
@@ -945,4 +1012,9 @@ def process_job(self, job_id: str) -> dict[str, Any]:
             pass
         return {"status": "error", "detail": str(e)}
     finally:
+        if job_lock not in (None, False):
+            try:
+                job_lock.release()
+            except Exception:
+                pass
         db.close()

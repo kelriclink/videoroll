@@ -60,6 +60,7 @@ from videoroll.apps.subtitle_service.worker_concurrency import sync_subtitle_wor
 from videoroll.apps.subtitle_service.worker import TASK_QUEUE_LOCK_OWNER, celery_app
 from videoroll.utils.auto_youtube import parse_auto_youtube_created_by
 from videoroll.utils.cpu import process_cpu_count
+from videoroll.utils.httpx_proxy import HTTPX_PROXY_KWARG_UNSUPPORTED, format_httpx_proxy_error
 from videoroll.utils.intel_gpu import detect_intel_hardware
 
 logger = logging.getLogger(__name__)
@@ -449,7 +450,7 @@ def test_model_download_proxy(
                     used_proxy=None,
                     status_code=resp.status_code,
                     elapsed_ms=elapsed_ms,
-                    error="httpx does not support proxy kwarg in this environment",
+                    error=HTTPX_PROXY_KWARG_UNSUPPORTED,
                 )
     except Exception as e:
         elapsed_ms = int((time.perf_counter() - start) * 1000)
@@ -459,7 +460,7 @@ def test_model_download_proxy(
             used_proxy=proxy or None,
             status_code=None,
             elapsed_ms=elapsed_ms,
-            error=str(e),
+            error=format_httpx_proxy_error(e, proxy=proxy),
         )
 
 

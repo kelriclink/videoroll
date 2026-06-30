@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from functools import lru_cache
 from typing import Generator
 
@@ -21,8 +22,14 @@ def _engine_connect_args(database_url: str) -> dict[str, object]:
 
 
 @lru_cache
-def get_engine(database_url: str) -> Engine:
+def _get_engine_cached(database_url: str, pid: int) -> Engine:
     return create_engine(database_url, pool_pre_ping=True, connect_args=_engine_connect_args(database_url))
+
+
+def get_engine(database_url: str) -> Engine:
+    # Celery prefork workers inherit module globals from the parent process.
+    # Keep engines isolated per PID so child processes don't reuse the parent's pool.
+    return _get_engine_cached(database_url, os.getpid())
 
 
 def get_sessionmaker(database_url: str) -> sessionmaker[Session]:

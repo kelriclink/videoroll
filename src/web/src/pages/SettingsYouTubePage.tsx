@@ -352,14 +352,19 @@ export default function SettingsYouTubePage() {
       <div className="rounded border bg-white p-4">
         <div className="text-sm font-semibold">代理设置</div>
         <div className="mt-2 text-xs text-slate-500">
-          例如：<span className="font-mono">http://127.0.0.1:7890</span> / <span className="font-mono">socks5://127.0.0.1:1080</span>（留空=不使用代理）
+          支持 <span className="font-mono">http://</span> 和 <span className="font-mono">socks5://</span>，例如
+          <span className="font-mono"> http://127.0.0.1:7890 </span> /
+          <span className="font-mono"> socks5://127.0.0.1:1080</span>（留空 = 不使用代理）
+        </div>
+        <div className="mt-1 text-xs text-slate-500">
+          SOCKS5 检测和抓取依赖后端安装 SOCKS 支持；当前生产镜像已内置该依赖。
         </div>
         <div className="mt-3 grid gap-3 md:grid-cols-2">
           <label className="block md:col-span-2">
             <div className="mb-1 text-xs text-slate-600">proxy</div>
             <input
               className="w-full rounded border px-3 py-2 text-sm"
-              placeholder="http://host:port"
+              placeholder="http://host:port 或 socks5://host:port"
               value={proxy}
               onChange={(e) => setProxy(e.target.value)}
             />
