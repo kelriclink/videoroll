@@ -13,6 +13,9 @@
 - 若未配置 `YOUTUBE_COOKIE_FILE`，已保存到数据库的 YouTube cookies 会在下载/元信息提取时写入临时文件供 `yt-dlp` 使用。
 - YouTube 触发风控时，接口会返回更明确的 cookies / proxy 提示。
 - Bilibili 投稿支持在 Web UI 中保存 Cookie、测试登录、维护默认投稿模板。
+- Web UI 支持浅色 / 暗色模式切换，Dashboard 增加 CPU、内存和 Intel GPU 资源监控。
+- 字幕翻译支持真正的 RAG 术语知识库：可使用 PostgreSQL + pgvector 检索术语，支持本地 embedding 模型、手动下载模型、重建向量，以及 Agent 自动发现/搜索/验证/入库术语。
+- RAG Agent 支持 SearXNG 搜索、网页正文读取、独立 verifier、保守入库策略，并可在 Dashboard 查看每个 Agent 的工具调用 trace。
 
 ## 架构概览
 
@@ -165,7 +168,7 @@ docker compose -f docker-compose.yml --env-file .env up --build -d
 - `data/minio`
   MinIO 数据目录
 - `data/models`
-  ASR 模型目录（可存放 faster-whisper 或 OpenVINO Whisper 导出模型）
+  ASR / embedding 模型目录（可存放 faster-whisper、OpenVINO Whisper 导出模型、本地 embedding 模型）
 - `data/secrets`
   本地密钥和机密目录
 - `data/secrets/fernet.key`
@@ -263,6 +266,7 @@ YouTube 风控注意事项：
 - `Settings -> ASR`
 - `Settings -> Translate`
 - `Settings -> Auto`
+- `Dashboard`
 
 说明：
 
@@ -274,6 +278,7 @@ YouTube 风控注意事项：
   - 编码参数
   - 翻译目标语言与 provider
   - 是否自动投稿 Bilibili
+- `Dashboard` 会显示任务状态、资源监控、RAG Agent 当前运行状态和历史 trace。
 
 如果只是想做轻量演示，可把：
 
@@ -297,6 +302,71 @@ SUBTITLE_OPENVINO_MODEL=/models/whisper/whisper-large-v3-ov
 - 现在支持在 `Settings -> ASR` 里直接下载 OpenVINO 官方预转换模型；输入 `tiny/base/small/medium/large-v3` 时会自动映射到对应的 `OpenVINO/whisper-*-fp16-ov` 仓库。
 - 也支持手工准备模型：可以在宿主机先用 `optimum-cli export openvino --model openai/whisper-large-v3 <output_dir>` 生成，再挂载/上传到 `data/models`。
 - 下载或上传后，在 `Settings -> ASR` 中把默认引擎切到 `openvino`，并配置 `device / num_beams / max_new_tokens`。
+
+### 翻译 RAG / Agent
+
+相关页面：
+
+- `Settings -> Translate`
+- `Dashboard -> RAG Agent`
+
+RAG 用于解决视频字幕翻译中的上下文和术语问题，例如游戏、动漫、技术讲解中的专有名词、缩写、黑话和社区固定译法。
+
+当前流程：
+
+```text
+字幕片段
+  -> 术语发现
+  -> 查询 PostgreSQL/pgvector 知识库
+  -> 未命中时生成多条搜索 query
+  -> 调用 SearXNG 搜索
+  -> 必要时读取网页正文
+  -> LLM 总结候选术语
+  -> verifier 检查来源和上下文
+  -> 写入知识库或标记为 context_only / skipped
+  -> 翻译时注入 rag_context
+```
+
+关键行为：
+
+- 单字母变量（如逻辑课里的 `P/Q/R`）默认视为局部变量，不搜索、不写入长期知识库。
+- 常见基础术语（如 `truth table`）可以作为本次翻译提示，但默认不自动污染长期知识库。
+- 自动正式入库要求 verifier 通过、上下文一致、有有效外部来源，并达到较高置信度；否则进入待审核或跳过。
+- Dashboard 中可以点击 RAG Agent 查看每步工具调用、耗时、模型、错误类型和 JSON 输入输出。
+
+PostgreSQL 需要启用 pgvector：
+
+```sql
+CREATE EXTENSION IF NOT EXISTS vector;
+```
+
+如果应用账号不是数据库超级用户，请用数据库管理员账号先在目标库执行上面的 SQL。
+
+SearXNG 搜索地址建议填写 base URL，例如：
+
+```text
+https://search.example.com
+```
+
+系统会自动请求 `/search?q=...&format=json`，不需要在配置里手写 `?q=`。
+
+Embedding 支持两种方式：
+
+- OpenAI 兼容 embedding：填写 provider 支持的 embedding 模型名。
+- 本地 embedding：在 `Settings -> Translate` 中选择本地 provider，可手动下载模型到 `data/models`，并选择 CPU / OpenVINO GPU 等设备。
+
+更换 embedding 模型后，已有知识库向量不会静默重建；需要在 `Settings -> Translate` 中点击重建按钮，避免模型切换时旧向量和新向量混用。
+
+### Dashboard 资源监控
+
+Dashboard 会定时显示：
+
+- CPU 使用率和 load average
+- 内存使用率
+- 启用自动模式并配置 Intel GPU 时的 Intel GPU 状态
+- 正在运行和最近完成的 RAG Agent
+
+Intel GPU 使用率依赖宿主机和容器能读取对应设备/驱动信息；如果 busy 不可读，页面会显示不可读原因，但不影响其他流程。
 
 ### Bilibili 配置
 

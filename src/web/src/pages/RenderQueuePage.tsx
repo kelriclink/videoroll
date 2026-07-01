@@ -50,7 +50,7 @@ export default function RenderQueuePage() {
 
   useEffect(() => {
     refresh();
-  }, []);
+  }, [refresh]);
 
   const shouldPoll = useMemo(() => (queue?.tasks ?? []).some((t) => t.state === "queued" || t.state === "running"), [queue]);
 

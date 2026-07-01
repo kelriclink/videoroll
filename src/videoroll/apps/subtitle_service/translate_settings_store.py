@@ -56,6 +56,21 @@ def get_translate_settings(db: Session, defaults: SubtitleServiceSettings) -> di
         "openai_model": str(openai.get("model") or defaults.openai_model),
         "openai_temperature": float(openai.get("temperature") or defaults.openai_temperature),
         "openai_timeout_seconds": float(openai.get("timeout_seconds") or defaults.openai_timeout_seconds),
+        "rag_enabled": bool(stored.get("rag_enabled") if "rag_enabled" in stored else defaults.rag_enabled),
+        "rag_top_k": int(stored.get("rag_top_k") or defaults.rag_top_k),
+        "rag_min_score": float(stored.get("rag_min_score") or defaults.rag_min_score),
+        "rag_embedding_provider": str(stored.get("rag_embedding_provider") or defaults.rag_embedding_provider),
+        "rag_embedding_model": str(stored.get("rag_embedding_model") or defaults.rag_embedding_model),
+        "rag_embedding_dimensions": int(stored.get("rag_embedding_dimensions") or defaults.rag_embedding_dimensions),
+        "rag_embedding_model_dir": str(stored.get("rag_embedding_model_dir") or defaults.rag_embedding_model_dir),
+        "rag_embedding_device": str(stored.get("rag_embedding_device") or defaults.rag_embedding_device),
+        "rag_auto_discover_terms": bool(
+            stored.get("rag_auto_discover_terms") if "rag_auto_discover_terms" in stored else defaults.rag_auto_discover_terms
+        ),
+        "rag_auto_learn_terms": bool(stored.get("rag_auto_learn_terms") if "rag_auto_learn_terms" in stored else defaults.rag_auto_learn_terms),
+        "rag_search_enabled": bool(stored.get("rag_search_enabled") if "rag_search_enabled" in stored else defaults.rag_search_enabled),
+        "rag_search_url": str(stored.get("rag_search_url") or defaults.rag_search_url),
+        "rag_domain": str(stored.get("rag_domain") or defaults.rag_domain),
     }
 
 
@@ -70,6 +85,19 @@ def update_translate_settings(db: Session, defaults: SubtitleServiceSettings, up
         "default_batch_size",
         "default_max_retries",
         "default_enable_summary",
+        "rag_enabled",
+        "rag_top_k",
+        "rag_min_score",
+        "rag_embedding_provider",
+        "rag_embedding_model",
+        "rag_embedding_dimensions",
+        "rag_embedding_model_dir",
+        "rag_embedding_device",
+        "rag_auto_discover_terms",
+        "rag_auto_learn_terms",
+        "rag_search_enabled",
+        "rag_search_url",
+        "rag_domain",
     ]:
         if key not in update:
             continue
@@ -120,6 +148,26 @@ def update_translate_settings(db: Session, defaults: SubtitleServiceSettings, up
             stored["default_max_retries"] = max(0, min(10, int(stored["default_max_retries"])))
     except Exception:
         stored["default_max_retries"] = defaults.translate_max_retries
+    try:
+        stored["rag_top_k"] = max(0, min(30, int(stored.get("rag_top_k") or defaults.rag_top_k)))
+    except Exception:
+        stored["rag_top_k"] = defaults.rag_top_k
+    try:
+        stored["rag_min_score"] = max(0.0, min(1.0, float(stored.get("rag_min_score") or defaults.rag_min_score)))
+    except Exception:
+        stored["rag_min_score"] = defaults.rag_min_score
+    try:
+        stored["rag_embedding_dimensions"] = max(1, min(4096, int(stored.get("rag_embedding_dimensions") or defaults.rag_embedding_dimensions)))
+    except Exception:
+        stored["rag_embedding_dimensions"] = defaults.rag_embedding_dimensions
+    for bool_key in ["rag_enabled", "rag_auto_discover_terms", "rag_auto_learn_terms", "rag_search_enabled"]:
+        if bool_key in stored:
+            stored[bool_key] = bool(stored[bool_key])
+    provider = str(stored.get("rag_embedding_provider") or defaults.rag_embedding_provider).strip().lower()
+    stored["rag_embedding_provider"] = provider if provider in {"openai", "local"} else defaults.rag_embedding_provider
+    for str_key in ["rag_embedding_model", "rag_embedding_model_dir", "rag_embedding_device", "rag_search_url", "rag_domain"]:
+        if str_key in stored and stored[str_key] is not None:
+            stored[str_key] = str(stored[str_key]).strip()
     try:
         if "openai_temperature" in update and update["openai_temperature"] is not None:
             openai["temperature"] = float(openai.get("temperature"))

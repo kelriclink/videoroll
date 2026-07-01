@@ -24,7 +24,12 @@ OPENVINO_WHISPER_SIZE_TO_REPO: dict[str, str] = {
     "large-v3": "OpenVINO/whisper-large-v3-fp16-ov",
 }
 
-_SUPPORTED_MODEL_DOWNLOAD_ENGINES = {"faster-whisper", "openvino"}
+EMBEDDING_MODEL_TO_REPO: dict[str, str] = {
+    "bge-small-zh-v1.5": "BAAI/bge-small-zh-v1.5",
+    "bge-m3": "BAAI/bge-m3",
+}
+
+_SUPPORTED_MODEL_DOWNLOAD_ENGINES = {"faster-whisper", "openvino", "embedding"}
 
 
 def normalize_model_download_engine(engine: str | None) -> str:
@@ -35,6 +40,8 @@ def normalize_model_download_engine(engine: str | None) -> str:
 
 
 def _engine_size_to_repo(engine: str) -> dict[str, str]:
+    if engine == "embedding":
+        return EMBEDDING_MODEL_TO_REPO
     if engine == "openvino":
         return OPENVINO_WHISPER_SIZE_TO_REPO
     return FASTER_WHISPER_SIZE_TO_REPO
@@ -59,6 +66,9 @@ def default_model_dir_name(engine: str, model: str) -> str:
 
     if engine_n == "openvino" and model_s in OPENVINO_WHISPER_SIZE_TO_REPO:
         return OPENVINO_WHISPER_SIZE_TO_REPO[model_s].split("/", 1)[1]
+
+    if engine_n == "embedding" and model_s in EMBEDDING_MODEL_TO_REPO:
+        return EMBEDDING_MODEL_TO_REPO[model_s].split("/", 1)[1]
 
     return model_s.replace("/", "--")
 

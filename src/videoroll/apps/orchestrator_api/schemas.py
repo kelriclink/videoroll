@@ -168,6 +168,47 @@ class RemotePublishResponse(BaseModel):
     response: Optional[dict[str, Any]] = None
 
 
+class SystemCPURead(BaseModel):
+    percent: Optional[float] = None
+    cores: int = 0
+    load_average: Optional[list[float]] = None
+
+
+class SystemMemoryRead(BaseModel):
+    total_bytes: int = 0
+    used_bytes: int = 0
+    available_bytes: int = 0
+    percent: Optional[float] = None
+
+
+class SystemIntelGPUEngineRead(BaseModel):
+    name: str
+    percent: Optional[float] = None
+
+
+class SystemIntelGPURead(BaseModel):
+    enabled: bool = False
+    checked: bool = False
+    available: bool = False
+    render_device: str = ""
+    model_name: Optional[str] = None
+    driver: Optional[str] = None
+    pci_slot: Optional[str] = None
+    pci_id: Optional[str] = None
+    usage_supported: bool = False
+    usage_percent: Optional[float] = None
+    engines: list[SystemIntelGPUEngineRead] = Field(default_factory=list)
+    detail: str = ""
+
+
+class SystemResourcesRead(BaseModel):
+    sampled_at: str
+    cpu: SystemCPURead
+    memory: SystemMemoryRead
+    cgroup_memory: Optional[SystemMemoryRead] = None
+    intel_gpu: Optional[SystemIntelGPURead] = None
+
+
 class SubtitleJobSummary(BaseModel):
     id: uuid.UUID
     task_id: uuid.UUID

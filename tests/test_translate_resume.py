@@ -263,6 +263,77 @@ class TranslateResumeTests(unittest.TestCase):
         self.assertIn('"summary": "summary-start"', str(second_prompt))
         self.assertIn('"idx": 3', str(second_prompt))
 
+    def test_rag_context_provider_is_included_in_prompt(self) -> None:
+        source_segments = [Segment(start=0.0, end=1.0, text="Rush B with an AWP")]
+        seen_requests: list[dict[str, object]] = []
+        responses = [
+            _FakeResponse(
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": json.dumps(
+                                    {
+                                        "updated_summary": "cs2",
+                                        "translations": [{"idx": 1, "text": "快冲 B 点，带着 AWP 狙击枪"}],
+                                    },
+                                    ensure_ascii=False,
+                                )
+                            }
+                        }
+                    ]
+                }
+            )
+        ]
+
+        class FakeClient:
+            def __init__(self, *_args: object, **_kwargs: object) -> None:
+                pass
+
+            def __enter__(self) -> "FakeClient":
+                return self
+
+            def __exit__(self, _exc_type: object, _exc: object, _tb: object) -> None:
+                return None
+
+            def post(self, _url: str, *, headers: dict[str, str], json: dict[str, object]) -> _FakeResponse:
+                del headers
+                seen_requests.append(json)
+                return responses.pop(0)
+
+        def rag_context_provider(batch: list[Segment], start_idx: int, summary: str) -> dict[str, object]:
+            self.assertEqual([seg.text for seg in batch], ["Rush B with an AWP"])
+            self.assertEqual(start_idx, 0)
+            self.assertEqual(summary, "")
+            return {
+                "term_cards": [
+                    {
+                        "term": "AWP",
+                        "translation": "AWP 狙击枪",
+                        "domain": "CS2",
+                        "description": "Counter-Strike 系列中的狙击枪。",
+                    }
+                ]
+            }
+
+        with patch.object(processing, "create_openai_http_client", lambda _timeout: FakeClient()):
+            translated, summary = processing.translate_segments_openai_with_summary(
+                source_segments,
+                target_lang="zh",
+                style="自然",
+                api_key="test-key",
+                base_url="https://example.invalid/v1",
+                model="fake-model",
+                batch_size=1,
+                rag_context_provider=rag_context_provider,
+            )
+
+        self.assertEqual([seg.text for seg in translated], ["快冲 B 点，带着 AWP 狙击枪"])
+        self.assertEqual(summary, "cs2")
+        prompt = str(seen_requests[0]["messages"][1]["content"])
+        self.assertIn("rag_context", prompt)
+        self.assertIn("AWP 狙击枪", prompt)
+
 
 if __name__ == "__main__":
     unittest.main()

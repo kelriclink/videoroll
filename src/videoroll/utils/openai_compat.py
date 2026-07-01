@@ -55,3 +55,20 @@ def build_openai_chat_completions_url(base_url: str) -> str:
     base = normalize_openai_base_url(raw)
     return base.rstrip("/") + "/chat/completions"
 
+
+def build_openai_embeddings_url(base_url: str) -> str:
+    """
+    Accepts either:
+    - a base URL (e.g. https://api.openai.com/v1), or
+    - a full endpoint URL ending with /embeddings.
+    """
+    raw = (base_url or "").strip()
+    if not raw:
+        raw = DEFAULT_OPENAI_BASE_URL
+    raw = _ensure_scheme(raw).rstrip("/")
+
+    if raw.endswith("/embeddings"):
+        return raw
+
+    base = normalize_openai_base_url(raw)
+    return base.rstrip("/") + "/embeddings"

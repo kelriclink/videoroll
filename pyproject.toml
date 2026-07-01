@@ -25,6 +25,8 @@ dependencies = [
   "defusedxml>=0.7.1",
   "yt-dlp[default]>=2026.2.4",
   "deno>=2.6.9",
+  "sentence-transformers>=3.0.0",
+  "optimum-intel[openvino]>=1.20.0",
 ]
 
 [project.optional-dependencies]

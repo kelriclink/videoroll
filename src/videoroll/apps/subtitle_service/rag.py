@@ -1,0 +1,2216 @@
+from __future__ import annotations
+
+import hashlib
+import html
+import ipaddress
+import json
+import re
+import socket
+import time
+import uuid
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Any, Iterable
+from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
+
+import httpx
+from sqlalchemy import text
+from sqlalchemy.orm import Session
+
+from videoroll.ai.client import OpenAIChatConfig, request_openai_json_object
+from videoroll.apps.subtitle_service.embeddings import EmbeddingSettings, assert_embedding_dimensions, embed_text
+from videoroll.apps.subtitle_service.processing import Segment
+
+
+_TERM_SPLIT_RE = re.compile(r"[\s\-_]+")
+_CANDIDATE_RE = re.compile(r"\b[A-Za-z][A-Za-z0-9][A-Za-z0-9'._:+#/-]*(?:\s+[A-Za-z0-9][A-Za-z0-9'._:+#/-]*){0,3}\b")
+_SCRIPT_STYLE_RE = re.compile(r"<(script|style|noscript)\b[^>]*>.*?</\1>", re.IGNORECASE | re.DOTALL)
+_TAG_RE = re.compile(r"<[^>]+>")
+_ARTICLE_RE = re.compile(r"<(?:article|div)\b[^>]*class=[\"'][^\"']*\bresult\b[^\"']*[\"'][^>]*>.*?</(?:article|div)>", re.IGNORECASE | re.DOTALL)
+_ANCHOR_RE = re.compile(r"<a\b[^>]*href=[\"']([^\"']+)[\"'][^>]*>(.*?)</a>", re.IGNORECASE | re.DOTALL)
+_SINGLE_LETTER_RE = re.compile(r"^[A-Za-z]$")
+_MATH_LOGIC_DOMAIN_RE = re.compile(r"(logic|math|数学|逻辑|命题|proposition|propositional)", re.IGNORECASE)
+_AUTO_APPROVE_CONFIDENCE_THRESHOLD = 0.9
+_COMMON_CONTEXT_TRANSLATIONS: dict[str, dict[str, str]] = {
+    "truth table": {
+        "translation": "真值表",
+        "domain": "技术/逻辑",
+        "description": "命题逻辑中列出命题变量所有取值组合及表达式真假结果的表格。",
+    },
+    "propositional logic": {
+        "translation": "命题逻辑",
+        "domain": "技术/逻辑",
+        "description": "研究命题及命题连接词推理关系的逻辑分支。",
+    },
+}
+
+
+@dataclass(frozen=True)
+class RagSettings:
+    enabled: bool = False
+    top_k: int = 8
+    min_score: float = 0.68
+    embedding_provider: str = "openai"
+    embedding_model: str = "text-embedding-3-small"
+    embedding_dimensions: int = 1536
+    embedding_model_dir: str = "/models/embeddings"
+    embedding_device: str = "cpu"
+    auto_discover_terms: bool = False
+    auto_learn_terms: bool = False
+    search_enabled: bool = False
+    search_url: str = ""
+    domain: str = ""
+
+
+@dataclass(frozen=True)
+class RagHit:
+    id: str
+    item_type: str
+    term: str
+    translation: str
+    target_lang: str
+    domain: str
+    aliases: list[str]
+    title: str
+    content: str
+    description: str
+    sources: list[dict[str, Any]]
+    confidence: float
+    status: str
+    score: float
+
+
+@dataclass(frozen=True)
+class RagContext:
+    term_cards: list[dict[str, Any]]
+    knowledge_cards: list[dict[str, Any]]
+    hits: list[RagHit]
+
+
+@dataclass(frozen=True)
+class ToolSpec:
+    tool_name: str
+    input_schema: dict[str, Any]
+    output_schema: dict[str, Any]
+    timeout_seconds: float = 20.0
+    retry_count: int = 0
+    cost: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True)
+class ToolResult:
+    spec: ToolSpec
+    input: dict[str, Any]
+    output: dict[str, Any]
+    ok: bool
+    duration_ms: int
+    error_type: str = ""
+    error: str = ""
+
+    def to_step(self, *, action: str) -> dict[str, Any]:
+        step: dict[str, Any] = {
+            "kind": "tool",
+            "action": action,
+            "tool": self.spec.tool_name,
+            "tool_name": self.spec.tool_name,
+            "input_schema": self.spec.input_schema,
+            "output_schema": self.spec.output_schema,
+            "input": self.input,
+            "output": self.output,
+            "ok": self.ok,
+            "duration_ms": self.duration_ms,
+            "timeout_seconds": self.spec.timeout_seconds,
+            "retry_count": self.spec.retry_count,
+            "cost": self.spec.cost or {},
+        }
+        if self.error_type:
+            step["error_type"] = self.error_type
+        if self.error:
+            step["error"] = self.error
+        return step
+
+
+_SEARCH_TOOL_SPEC = ToolSpec(
+    tool_name="search",
+    input_schema={"type": "object", "required": ["query"], "properties": {"query": {"type": "string"}, "url": {"type": "string"}}},
+    output_schema={"type": "object", "properties": {"count": {"type": "integer"}, "results": {"type": "array"}}},
+    timeout_seconds=20.0,
+    retry_count=0,
+    cost={"network_requests": 1},
+)
+
+_FETCH_TOOL_SPEC = ToolSpec(
+    tool_name="fetch",
+    input_schema={"type": "object", "required": ["url"], "properties": {"url": {"type": "string"}, "title": {"type": "string"}}},
+    output_schema={"type": "object", "properties": {"chars": {"type": "integer"}, "excerpt": {"type": "string"}}},
+    timeout_seconds=20.0,
+    retry_count=0,
+    cost={"network_requests": 1},
+)
+
+
+def rag_settings_from_translate_settings(settings: dict[str, Any]) -> RagSettings:
+    return RagSettings(
+        enabled=bool(settings.get("rag_enabled")),
+        top_k=max(0, min(30, int(settings.get("rag_top_k") or 8))),
+        min_score=max(0.0, min(1.0, float(settings.get("rag_min_score") or 0.68))),
+        embedding_provider=str(settings.get("rag_embedding_provider") or "openai").strip().lower() or "openai",
+        embedding_model=str(settings.get("rag_embedding_model") or "text-embedding-3-small").strip() or "text-embedding-3-small",
+        embedding_dimensions=max(1, min(4096, int(settings.get("rag_embedding_dimensions") or 1536))),
+        embedding_model_dir=str(settings.get("rag_embedding_model_dir") or "/models/embeddings").strip() or "/models/embeddings",
+        embedding_device=str(settings.get("rag_embedding_device") or "cpu").strip() or "cpu",
+        auto_discover_terms=bool(settings.get("rag_auto_discover_terms")),
+        auto_learn_terms=bool(settings.get("rag_auto_learn_terms")),
+        search_enabled=bool(settings.get("rag_search_enabled")),
+        search_url=str(settings.get("rag_search_url") or "").strip(),
+        domain=str(settings.get("rag_domain") or "").strip(),
+    )
+
+
+def normalize_term(term: str) -> str:
+    s = str(term or "").strip().lower()
+    s = _TERM_SPLIT_RE.sub(" ", s)
+    return s
+
+
+def build_knowledge_embedding_text(
+    *,
+    item_type: str,
+    term: str = "",
+    translation: str = "",
+    domain: str = "",
+    aliases: Iterable[str] | None = None,
+    title: str = "",
+    content: str = "",
+    description: str = "",
+) -> str:
+    parts = [
+        f"type: {item_type}",
+        f"domain: {domain}".strip(),
+        f"term: {term}".strip(),
+        f"translation: {translation}".strip(),
+        f"aliases: {', '.join([a for a in aliases or [] if a])}".strip(),
+        f"title: {title}".strip(),
+        f"description: {description}".strip(),
+        f"content: {content}".strip(),
+    ]
+    return "\n".join([p for p in parts if p and not p.endswith(":")]).strip()
+
+
+def _hash_text(text_value: str) -> str:
+    return hashlib.sha256(str(text_value or "").encode("utf-8")).hexdigest()
+
+
+def _vector_literal(values: list[float]) -> str:
+    if not values:
+        raise ValueError("embedding vector is empty")
+    return "[" + ",".join(f"{float(v):.8g}" for v in values) + "]"
+
+
+def embedding_model_key(rag_settings: RagSettings) -> str:
+    provider = str(rag_settings.embedding_provider or "openai").strip().lower() or "openai"
+    model = str(rag_settings.embedding_model or "").strip()
+    return f"{provider}:{model}" if model else provider
+
+
+def _json_list(value: Any) -> list[Any]:
+    if isinstance(value, list):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+            return parsed if isinstance(parsed, list) else []
+        except Exception:
+            return []
+    return []
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _duration_ms(start: float) -> int:
+    return max(0, int((time.perf_counter() - start) * 1000))
+
+
+def _strip_html(value: str) -> str:
+    text_value = _SCRIPT_STYLE_RE.sub(" ", str(value or ""))
+    text_value = re.sub(r"<br\s*/?>", "\n", text_value, flags=re.IGNORECASE)
+    text_value = _TAG_RE.sub(" ", text_value)
+    text_value = html.unescape(text_value)
+    text_value = re.sub(r"[ \t\r\f\v]+", " ", text_value)
+    text_value = re.sub(r"\n\s+", "\n", text_value)
+    return text_value.strip()
+
+
+def _collapse_text(value: str, *, limit: int = 12000) -> str:
+    text_value = html.unescape(str(value or ""))
+    text_value = re.sub(r"[ \t\r\f\v]+", " ", text_value)
+    text_value = re.sub(r"\n{3,}", "\n\n", text_value)
+    text_value = text_value.strip()
+    return text_value[:limit]
+
+
+def _search_endpoint_from_base(search_base_url: str) -> str:
+    raw = str(search_base_url or "").strip()
+    if not raw:
+        return ""
+    if "://" not in raw:
+        raw = f"https://{raw}"
+    parsed = urlparse(raw)
+    params = [(k, v) for k, v in parse_qsl(parsed.query, keep_blank_values=True) if k not in {"q", "format"}]
+    path = parsed.path.rstrip("/")
+    if not path:
+        path = "/search"
+    elif path.endswith("/search"):
+        path = path
+    else:
+        path = f"{path}/search"
+    return urlunparse(parsed._replace(path=path, query=urlencode(params)))
+
+
+def _search_url_with_params(search_base_url: str, *, query: str, json_format: bool) -> str:
+    endpoint = _search_endpoint_from_base(search_base_url)
+    parsed = urlparse(endpoint)
+    params = [(k, v) for k, v in parse_qsl(parsed.query, keep_blank_values=True) if k not in {"q", "format"}]
+    params.append(("q", query))
+    if json_format:
+        params.append(("format", "json"))
+    return urlunparse(parsed._replace(query=urlencode(params)))
+
+
+def _normalize_result_url(raw_url: str, *, base_url: str) -> str:
+    url = html.unescape(str(raw_url or "").strip())
+    if not url:
+        return ""
+    parsed = urlparse(url)
+    if parsed.scheme in {"http", "https"}:
+        return url
+    if url.startswith("//"):
+        return f"https:{url}"
+    return urljoin(base_url, url)
+
+
+def _is_search_engine_internal_url(url: str, *, search_url: str) -> bool:
+    parsed = urlparse(str(url or "").strip())
+    search_parsed = urlparse(_search_endpoint_from_base(search_url))
+    if not parsed.netloc or not search_parsed.netloc:
+        return False
+    if parsed.netloc.lower() != search_parsed.netloc.lower():
+        return False
+    path = parsed.path.rstrip("/").lower()
+    search_path = search_parsed.path.rstrip("/").lower()
+    search_root = search_path[: -len("/search")] if search_path.endswith("/search") else ""
+    if path in {"", "/"}:
+        return True
+    if search_root and path == search_root:
+        return True
+    return (
+        path == search_path
+        or path.startswith(f"{search_root}/info")
+        or path.startswith(f"{search_root}/preferences")
+        or path.startswith(f"{search_root}/stats")
+        or path.startswith(f"{search_root}/config")
+        or path.startswith(f"{search_root}/about")
+    )
+
+
+def _is_private_host(hostname: str) -> bool:
+    host = str(hostname or "").strip().strip("[]")
+    if not host:
+        return True
+    if host.lower() in {"localhost", "localhost.localdomain"}:
+        return True
+    try:
+        ip = ipaddress.ip_address(host)
+        return bool(ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_reserved)
+    except ValueError:
+        pass
+    try:
+        for info in socket.getaddrinfo(host, None, proto=socket.IPPROTO_TCP):
+            addr = info[4][0]
+            ip = ipaddress.ip_address(addr)
+            if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_reserved:
+                return True
+    except Exception:
+        return False
+    return False
+
+
+def _is_fetchable_url(url: str) -> bool:
+    parsed = urlparse(str(url or "").strip())
+    if parsed.scheme not in {"http", "https"}:
+        return False
+    if _is_private_host(parsed.hostname or ""):
+        return False
+    return True
+
+
+def _parse_search_json(data: Any) -> list[dict[str, Any]]:
+    raw_results = data.get("results") if isinstance(data, dict) else None
+    if raw_results is None and isinstance(data, list):
+        raw_results = data
+    if not isinstance(raw_results, list):
+        return []
+
+    out: list[dict[str, Any]] = []
+    for item in raw_results[:10]:
+        if not isinstance(item, dict):
+            continue
+        title = str(item.get("title") or item.get("name") or "").strip()
+        url = str(item.get("url") or item.get("link") or "").strip()
+        snippet = str(item.get("snippet") or item.get("content") or item.get("description") or "").strip()
+        if not title and not snippet:
+            continue
+        out.append({"title": _strip_html(title), "url": url, "snippet": _strip_html(snippet)[:800]})
+    return out
+
+
+def _filter_search_results(results: list[dict[str, Any]], *, search_url: str) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in results:
+        url = str(item.get("url") or "").strip()
+        title = str(item.get("title") or "").strip()
+        snippet = str(item.get("snippet") or "").strip()
+        if not url:
+            continue
+        if _is_search_engine_internal_url(url, search_url=search_url):
+            continue
+        if title.lower() in {"about", "preferences", "search syntax"} and "searxng" in snippet.lower():
+            continue
+        if url in seen:
+            continue
+        seen.add(url)
+        out.append({"title": title, "url": url, "snippet": snippet[:800]})
+        if len(out) >= 8:
+            break
+    return out
+
+
+def _parse_search_html(html_value: str, *, base_url: str) -> list[dict[str, Any]]:
+    source = str(html_value or "")
+    chunks = _ARTICLE_RE.findall(source)
+    if not chunks:
+        chunks = re.findall(r"<article\b[^>]*>.*?</article>", source, flags=re.IGNORECASE | re.DOTALL)
+    if not chunks:
+        chunks = source.split("<h3")[:12]
+
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for chunk in chunks[:20]:
+        anchors = _ANCHOR_RE.findall(chunk)
+        if not anchors:
+            continue
+        title = ""
+        url = ""
+        for href, label_html in anchors:
+            candidate_url = _normalize_result_url(href, base_url=base_url)
+            if not candidate_url:
+                continue
+            if _is_search_engine_internal_url(candidate_url, search_url=base_url):
+                continue
+            parsed = urlparse(candidate_url)
+            if parsed.scheme not in {"http", "https"}:
+                continue
+            clean_label = _strip_html(label_html)
+            if not clean_label:
+                continue
+            if clean_label.lower() in {"about", "preferences", "search syntax"}:
+                continue
+            title = clean_label[:300]
+            url = candidate_url
+            break
+        if not title or not url or url in seen:
+            continue
+        seen.add(url)
+        text_value = _strip_html(chunk)
+        snippet = text_value.replace(title, "", 1).strip()
+        out.append({"title": title, "url": url, "snippet": snippet[:800]})
+        if len(out) >= 8:
+            break
+    return out
+
+
+def _extract_page_text(html_value: str) -> str:
+    source = _SCRIPT_STYLE_RE.sub(" ", str(html_value or ""))
+    title_match = re.search(r"<title\b[^>]*>(.*?)</title>", source, flags=re.IGNORECASE | re.DOTALL)
+    title = _strip_html(title_match.group(1)) if title_match else ""
+    main_match = re.search(r"<main\b[^>]*>(.*?)</main>", source, flags=re.IGNORECASE | re.DOTALL)
+    article_match = re.search(r"<article\b[^>]*>(.*?)</article>", source, flags=re.IGNORECASE | re.DOTALL)
+    body_match = re.search(r"<body\b[^>]*>(.*?)</body>", source, flags=re.IGNORECASE | re.DOTALL)
+    body = (article_match or main_match or body_match)
+    body_text = _strip_html(body.group(1) if body else source)
+    joined = "\n\n".join([x for x in [title, body_text] if x])
+    return _collapse_text(joined, limit=12000)
+
+
+def _start_agent_run(
+    db: Session,
+    *,
+    term: str,
+    domain: str,
+    target_lang: str,
+    query: str,
+    task_id: str | None = None,
+    subtitle_job_id: str | None = None,
+) -> str:
+    run_id = str(uuid.uuid4())
+    db.execute(
+        text(
+            """
+            INSERT INTO translation_agent_runs (
+                id, agent_type, status, term, normalized_term, domain, target_lang,
+                task_id, subtitle_job_id, query, steps, result, started_at, updated_at
+            )
+            VALUES (
+                CAST(:id AS uuid), 'rag_term_research', 'running', :term, :normalized_term,
+                :domain, :target_lang, CAST(:task_id AS uuid), CAST(:subtitle_job_id AS uuid),
+                :query, '[]'::jsonb, '{}'::jsonb, now(), now()
+            )
+            """
+        ),
+        {
+            "id": run_id,
+            "term": str(term or "").strip(),
+            "normalized_term": normalize_term(term),
+            "domain": str(domain or "").strip(),
+            "target_lang": str(target_lang or "zh").strip() or "zh",
+            "task_id": task_id,
+            "subtitle_job_id": subtitle_job_id,
+            "query": str(query or "").strip(),
+        },
+    )
+    db.commit()
+    return run_id
+
+
+def _append_agent_step(db: Session, run_id: str | None, step: dict[str, Any]) -> None:
+    if not run_id:
+        return
+    clean_step = dict(step)
+    clean_step.setdefault("at", _utc_now().isoformat())
+    try:
+        db.execute(
+            text(
+                """
+                UPDATE translation_agent_runs
+                SET steps = steps || CAST(:step AS jsonb),
+                    updated_at = now()
+                WHERE id = CAST(:id AS uuid)
+                """
+            ),
+            {"id": run_id, "step": json.dumps([clean_step], ensure_ascii=False)},
+        )
+        db.commit()
+    except Exception:
+        db.rollback()
+
+
+def _append_tool_result(db: Session | None, run_id: str | None, result: ToolResult, *, action: str) -> None:
+    if db is None:
+        return
+    _append_agent_step(db, run_id, result.to_step(action=action))
+
+
+def _append_llm_step(
+    db: Session | None,
+    run_id: str | None,
+    *,
+    action: str,
+    config: OpenAIChatConfig | None = None,
+    input_value: dict[str, Any] | None = None,
+    output_value: dict[str, Any] | None = None,
+    duration_ms: int | None = None,
+    error: str = "",
+    error_type: str = "",
+) -> None:
+    if db is None:
+        return
+    step: dict[str, Any] = {"kind": "llm", "action": action}
+    if config is not None:
+        step["model"] = config.model
+        step["tokens"] = None
+    if input_value is not None:
+        step["input"] = input_value
+    if output_value is not None:
+        step["output"] = output_value
+    if duration_ms is not None:
+        step["duration_ms"] = duration_ms
+    if error_type:
+        step["error_type"] = error_type
+    if error:
+        step["error"] = error[:1000]
+    _append_agent_step(db, run_id, step)
+
+
+def _finish_agent_run(
+    db: Session,
+    run_id: str | None,
+    *,
+    status: str,
+    result: dict[str, Any] | None = None,
+    error: str = "",
+    knowledge_item_id: str | None = None,
+) -> None:
+    if not run_id:
+        return
+    try:
+        db.execute(
+            text(
+                """
+                UPDATE translation_agent_runs
+                SET status = :status,
+                    result = CAST(:result AS jsonb),
+                    error = :error,
+                    knowledge_item_id = CAST(:knowledge_item_id AS uuid),
+                    finished_at = now(),
+                    updated_at = now()
+                WHERE id = CAST(:id AS uuid)
+                """
+            ),
+            {
+                "id": run_id,
+                "status": str(status or "succeeded").strip() or "succeeded",
+                "result": json.dumps(result or {}, ensure_ascii=False),
+                "error": str(error or "")[:4000],
+                "knowledge_item_id": knowledge_item_id,
+            },
+        )
+        db.commit()
+    except Exception:
+        db.rollback()
+
+
+def _row_to_hit(row: Any) -> RagHit:
+    mapping = getattr(row, "_mapping", row)
+    sources_raw = _json_list(mapping.get("sources"))
+    sources = [x for x in sources_raw if isinstance(x, dict)]
+    aliases = [str(x) for x in _json_list(mapping.get("aliases")) if str(x or "").strip()]
+    return RagHit(
+        id=str(mapping.get("id") or ""),
+        item_type=str(mapping.get("item_type") or ""),
+        term=str(mapping.get("term") or ""),
+        translation=str(mapping.get("translation") or ""),
+        target_lang=str(mapping.get("target_lang") or ""),
+        domain=str(mapping.get("domain") or ""),
+        aliases=aliases,
+        title=str(mapping.get("title") or ""),
+        content=str(mapping.get("content") or ""),
+        description=str(mapping.get("description") or ""),
+        sources=sources,
+        confidence=float(mapping.get("confidence") or 0.0),
+        status=str(mapping.get("status") or ""),
+        score=float(mapping.get("score") or 0.0),
+    )
+
+
+def _term_candidates_from_text(text_value: str, *, limit: int = 24) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for match in _CANDIDATE_RE.finditer(text_value or ""):
+        raw = match.group(0).strip(" .,:;!?()[]{}\"'")
+        if len(raw) < 2:
+            continue
+        if raw.lower() in {"the", "and", "you", "that", "this", "with", "have", "for"}:
+            continue
+        norm = normalize_term(raw)
+        if not norm or norm in seen:
+            continue
+        seen.add(norm)
+        out.append(raw)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def should_research_term(term: str, *, domain: str = "", context: str = "") -> dict[str, Any]:
+    clean = str(term or "").strip()
+    norm = normalize_term(clean)
+    domain_text = str(domain or "").strip()
+    if not clean or not norm:
+        return {
+            "should_research": False,
+            "should_persist": False,
+            "category": "empty",
+            "reason": "empty term",
+        }
+    if _SINGLE_LETTER_RE.fullmatch(clean):
+        category = "local_variable" if _MATH_LOGIC_DOMAIN_RE.search(domain_text) or _MATH_LOGIC_DOMAIN_RE.search(context or "") else "single_letter"
+        return {
+            "should_research": False,
+            "should_persist": False,
+            "category": category,
+            "reason": "single-letter symbols are treated as local variables unless manually added to the knowledge base",
+        }
+    context_term = _COMMON_CONTEXT_TRANSLATIONS.get(norm)
+    if context_term:
+        return {
+            "should_research": False,
+            "should_persist": False,
+            "category": "context_only",
+            "reason": "common foundational term; provide a temporary translation hint without long-term auto-learning",
+            "translation": context_term["translation"],
+            "domain": context_term.get("domain") or domain_text,
+            "description": context_term.get("description") or "",
+        }
+    if len(norm) <= 2 and clean.isalpha() and not clean.isupper():
+        return {
+            "should_research": False,
+            "should_persist": False,
+            "category": "short_token",
+            "reason": "short lowercase token is unlikely to be a reusable translation term",
+        }
+    if norm in {"the", "and", "or", "to", "of", "in", "this", "that", "you", "we", "they", "it"}:
+        return {
+            "should_research": False,
+            "should_persist": False,
+            "category": "common_word",
+            "reason": "common function word",
+        }
+    return {
+        "should_research": True,
+        "should_persist": True,
+        "category": "research",
+        "reason": "term may need external context",
+    }
+
+
+def _context_only_term_card(term: str, decision: dict[str, Any], *, target_lang: str, domain: str) -> dict[str, Any]:
+    return {
+        "term": str(term or "").strip(),
+        "translation": str(decision.get("translation") or "").strip(),
+        "domain": str(decision.get("domain") or domain or "").strip(),
+        "aliases": [],
+        "description": str(decision.get("description") or decision.get("reason") or "").strip(),
+        "confidence": 0.9,
+        "score": 0.9,
+        "sources": [],
+        "target_lang": target_lang,
+        "status": "context_only",
+    }
+
+
+def discover_terms_openai(
+    text_value: str,
+    *,
+    target_lang: str,
+    domain_hint: str,
+    config: OpenAIChatConfig,
+    client: httpx.Client | None = None,
+) -> list[dict[str, Any]]:
+    source = str(text_value or "").strip()
+    if not source:
+        return []
+    data = request_openai_json_object(
+        config=config,
+        system_prompt="You identify translation terms in subtitles. Return ONLY valid JSON.",
+        user_prompt=(
+            "请从下面字幕片段中识别会影响翻译质量的术语/专有名词/梗/黑话。\n"
+            "要求：\n"
+            "- 只输出 JSON 对象；\n"
+            "- terms 最多 20 个；\n"
+            "- term 保持原文；domain 如果能判断就给出游戏/动漫/技术领域；\n"
+            "- reason 用中文简短说明为什么它是术语。\n"
+            f"- 目标语言：{target_lang or 'zh'}\n"
+            f"- 领域提示：{domain_hint or '未知'}\n\n"
+            f"字幕片段：\n{source[:8000]}\n\n"
+            '输出 JSON：{"terms":[{"term":"","domain":"","reason":""}]}'
+        ),
+        client=client,
+    )
+    terms = data.get("terms")
+    if not isinstance(terms, list):
+        return []
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in terms:
+        if not isinstance(item, dict):
+            continue
+        term = str(item.get("term") or "").strip()
+        norm = normalize_term(term)
+        if not term or norm in seen:
+            continue
+        seen.add(norm)
+        out.append(
+            {
+                "term": term,
+                "domain": str(item.get("domain") or domain_hint or "").strip(),
+                "reason": str(item.get("reason") or "").strip(),
+            }
+        )
+    return out[:20]
+
+
+def _dedupe_search_queries(queries: Iterable[str], *, limit: int = 3) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for query in queries:
+        clean = re.sub(r"\s+", " ", str(query or "").strip())
+        if not clean:
+            continue
+        norm = clean.lower()
+        if norm in seen:
+            continue
+        seen.add(norm)
+        out.append(clean[:240])
+        if len(out) >= max(1, min(5, int(limit))):
+            break
+    return out
+
+
+def _fallback_search_queries(term: str, *, domain: str = "", target_lang: str = "zh", limit: int = 3) -> list[str]:
+    clean_term = str(term or "").strip()
+    clean_domain = str(domain or "").strip()
+    if not clean_term:
+        return []
+    queries = [
+        " ".join([p for p in [clean_domain, clean_term] if p]),
+        " ".join([p for p in [clean_term, clean_domain, "definition"] if p]),
+    ]
+    if str(target_lang or "").lower().startswith("zh"):
+        queries.append(" ".join([p for p in [clean_term, clean_domain, "中文 术语"] if p]))
+    return _dedupe_search_queries(queries, limit=limit)
+
+
+def generate_search_queries_openai(
+    *,
+    term: str,
+    context: str,
+    target_lang: str,
+    domain_hint: str,
+    config: OpenAIChatConfig,
+    client: httpx.Client | None = None,
+    max_queries: int = 3,
+) -> list[str]:
+    clean_term = str(term or "").strip()
+    if not clean_term:
+        return []
+    safe_max = max(1, min(5, int(max_queries)))
+    data = request_openai_json_object(
+        config=config,
+        system_prompt="You generate web search queries for a translation research agent. Return ONLY valid JSON.",
+        user_prompt=(
+            "请为字幕翻译术语研究生成高质量搜索 query。\n"
+            "要求：\n"
+            f"- queries 输出 2 到 {safe_max} 条；\n"
+            "- query 要能帮助判断术语在当前上下文里的含义；\n"
+            "- 优先加入领域关键词、definition/wiki/documentation 等有助于找到权威解释的词；\n"
+            "- 不要生成站内搜索语法，不要编造 URL。\n\n"
+            f"术语：{clean_term}\n"
+            f"目标语言：{target_lang or 'zh'}\n"
+            f"领域提示：{domain_hint or '未知'}\n\n"
+            f"字幕上下文：\n{context[:2500]}\n\n"
+            '输出 JSON：{"queries":[""]}'
+        ),
+        client=client,
+    )
+    raw_queries = data.get("queries")
+    if not isinstance(raw_queries, list):
+        return []
+    queries = _dedupe_search_queries([str(x or "") for x in raw_queries], limit=safe_max)
+    return queries or _fallback_search_queries(clean_term, domain=domain_hint, target_lang=target_lang, limit=safe_max)
+
+
+def decide_fetch_urls_openai(
+    *,
+    term: str,
+    context: str,
+    target_lang: str,
+    domain_hint: str,
+    search_results: list[dict[str, Any]],
+    config: OpenAIChatConfig,
+    client: httpx.Client | None = None,
+    max_pages: int = 4,
+) -> dict[str, Any]:
+    compact_results: list[dict[str, Any]] = []
+    for idx, item in enumerate(search_results[:8]):
+        compact_results.append(
+            {
+                "index": idx,
+                "title": str(item.get("title") or "")[:240],
+                "snippet": str(item.get("snippet") or "")[:700],
+                "url": str(item.get("url") or "")[:1000],
+            }
+        )
+    safe_max_pages = max(1, min(6, int(max_pages)))
+    data = request_openai_json_object(
+        config=config,
+        system_prompt="You decide whether a translation research agent should fetch pages. Return ONLY valid JSON.",
+        user_prompt=(
+            "你是字幕翻译术语研究 Agent。请根据字幕上下文和搜索结果，决定是否需要打开网页正文。\n"
+            "要求：\n"
+            "- 如果搜索标题和摘要已经足够判断术语含义，就不要打开网页；\n"
+            "- 如果摘要过短、来源不清、存在歧义，选择最有价值的 URL 打开；\n"
+            f"- 最多选择 {safe_max_pages} 个 URL；优先官方 Wiki、官方文档、百科、项目文档；\n"
+            "- 只从给定 search_results 里选择 URL，不要编造 URL；\n"
+            "- confidence 表示仅凭当前搜索摘要判断术语含义的把握。\n\n"
+            f"术语：{term}\n"
+            f"目标语言：{target_lang or 'zh'}\n"
+            f"领域提示：{domain_hint or '未知'}\n\n"
+            f"字幕上下文：\n{context[:2500]}\n\n"
+            f"search_results JSON：\n{json.dumps(compact_results, ensure_ascii=False)}\n\n"
+            '输出 JSON：{"summary_sufficient":true,"fetch_urls":[],"reason":"","confidence":0.0}'
+        ),
+        client=client,
+    )
+    allowed = {str(item.get("url") or "").strip() for item in search_results if str(item.get("url") or "").strip()}
+    urls: list[str] = []
+    raw_urls = data.get("fetch_urls")
+    if isinstance(raw_urls, list):
+        for value in raw_urls:
+            url = str(value or "").strip()
+            if url and url in allowed and url not in urls:
+                urls.append(url)
+    raw_indexes = data.get("fetch_indexes")
+    if isinstance(raw_indexes, list):
+        for value in raw_indexes:
+            try:
+                idx = int(value)
+            except Exception:
+                continue
+            if 0 <= idx < len(search_results):
+                url = str(search_results[idx].get("url") or "").strip()
+                if url and url in allowed and url not in urls:
+                    urls.append(url)
+    try:
+        confidence = float(data.get("confidence") or 0.0)
+    except Exception:
+        confidence = 0.0
+    raw_sufficient = data.get("summary_sufficient")
+    if isinstance(raw_sufficient, str):
+        summary_sufficient = raw_sufficient.strip().lower() in {"1", "true", "yes", "y"}
+    else:
+        summary_sufficient = bool(raw_sufficient)
+    return {
+        "summary_sufficient": summary_sufficient,
+        "fetch_urls": urls[: max(1, min(6, int(max_pages)))],
+        "reason": str(data.get("reason") or "").strip()[:1000],
+        "confidence": max(0.0, min(1.0, confidence)),
+    }
+
+
+def fetch_search_evidence(
+    term: str,
+    *,
+    domain: str,
+    search_url: str,
+    queries: list[str] | None = None,
+    context: str = "",
+    target_lang: str = "zh",
+    config: OpenAIChatConfig | None = None,
+    timeout_seconds: float = 20.0,
+    max_pages: int = 4,
+    db: Session | None = None,
+    agent_run_id: str | None = None,
+) -> list[dict[str, Any]]:
+    endpoint = str(search_url or "").strip()
+    if not endpoint:
+        return []
+    if queries is None:
+        search_queries = _dedupe_search_queries([" ".join([p for p in [str(domain or "").strip(), str(term or "").strip()] if p])], limit=1)
+    else:
+        search_queries = _dedupe_search_queries(queries, limit=3)
+    if not search_queries:
+        return []
+
+    search_results: list[dict[str, Any]] = []
+    seen_result_urls: set[str] = set()
+    try:
+        with httpx.Client(
+            timeout=timeout_seconds,
+            follow_redirects=True,
+            headers={"User-Agent": "VideoRoll-RAG-Agent/1.0"},
+        ) as client:
+            for query in search_queries:
+                json_url = _search_url_with_params(endpoint, query=query, json_format=True)
+                html_url = _search_url_with_params(endpoint, query=query, json_format=False)
+                started = time.perf_counter()
+                filtered_results: list[dict[str, Any]] = []
+                try:
+                    resp = client.get(json_url)
+                    resp.raise_for_status()
+                    content_type = resp.headers.get("content-type", "")
+                    if "json" in content_type.lower():
+                        filtered_results = _parse_search_json(resp.json())
+                    else:
+                        try:
+                            filtered_results = _parse_search_json(resp.json())
+                        except Exception:
+                            filtered_results = _parse_search_html(resp.text, base_url=str(resp.url))
+                    if not filtered_results:
+                        resp = client.get(html_url)
+                        resp.raise_for_status()
+                        filtered_results = _parse_search_html(resp.text, base_url=str(resp.url))
+                    filtered_results = _filter_search_results(filtered_results, search_url=endpoint)
+                    compact_results = [
+                        {"title": r.get("title", ""), "url": r.get("url", ""), "snippet": str(r.get("snippet") or "")[:240]}
+                        for r in filtered_results[:8]
+                    ]
+                    step = ToolResult(
+                        spec=_SEARCH_TOOL_SPEC,
+                        input={"query": query, "url": json_url},
+                        output={"count": len(filtered_results), "results": compact_results},
+                        ok=True,
+                        duration_ms=_duration_ms(started),
+                    ).to_step(action="search")
+                    step.update({"query": query, "url": json_url, "count": len(filtered_results), "results": compact_results})
+                    if db is not None:
+                        _append_agent_step(db, agent_run_id, step)
+                except Exception as e:
+                    step = ToolResult(
+                        spec=_SEARCH_TOOL_SPEC,
+                        input={"query": query, "url": json_url},
+                        output={"count": 0, "results": []},
+                        ok=False,
+                        duration_ms=_duration_ms(started),
+                        error_type=type(e).__name__,
+                        error=str(e)[:300],
+                    ).to_step(action="search_failed")
+                    step.update({"query": query, "url": json_url})
+                    if db is not None:
+                        _append_agent_step(db, agent_run_id, step)
+                    continue
+                for item in filtered_results:
+                    url = str(item.get("url") or "").strip()
+                    if not url or url in seen_result_urls:
+                        continue
+                    seen_result_urls.add(url)
+                    search_results.append(item)
+                    if len(search_results) >= 8:
+                        break
+                if len(search_results) >= 8:
+                    break
+
+            if not search_results:
+                if db is not None:
+                    _append_agent_step(
+                        db,
+                        agent_run_id,
+                        {
+                            "kind": "tool",
+                            "action": "search_no_valid_results",
+                            "tool": "search",
+                            "reason": "No usable external search results after filtering search engine internal pages.",
+                        },
+                    )
+                return []
+            fetch_decision = {
+                "summary_sufficient": False,
+                "fetch_urls": [],
+                "reason": "LLM fetch decision was not available; using compatibility fallback.",
+                "confidence": 0.0,
+            }
+            decision_failed = False
+            if config is not None and search_results:
+                started = time.perf_counter()
+                try:
+                    decision_input = {
+                        "term": term,
+                        "domain": domain,
+                        "target_lang": target_lang,
+                        "context_excerpt": str(context or "")[:500],
+                        "results": [
+                            {"title": r.get("title", ""), "url": r.get("url", ""), "snippet": r.get("snippet", "")[:240]}
+                            for r in search_results[:8]
+                        ],
+                    }
+                    fetch_decision = decide_fetch_urls_openai(
+                        term=term,
+                        context=context,
+                        target_lang=target_lang,
+                        domain_hint=domain,
+                        search_results=search_results,
+                        config=config,
+                        max_pages=max_pages,
+                    )
+                    _append_llm_step(
+                        db,
+                        agent_run_id,
+                        action="decide_fetch",
+                        config=config,
+                        input_value=decision_input,
+                        output_value=fetch_decision,
+                        duration_ms=_duration_ms(started),
+                    )
+                except Exception as e:
+                    decision_failed = True
+                    _append_llm_step(
+                        db,
+                        agent_run_id,
+                        action="decide_fetch_failed",
+                        config=config,
+                        duration_ms=_duration_ms(started),
+                        error=str(e)[:300],
+                        error_type=type(e).__name__,
+                    )
+            if config is None:
+                fetch_decision["fetch_urls"] = [
+                    str(r.get("url") or "").strip()
+                    for r in search_results[: max(1, min(6, int(max_pages)))]
+                    if str(r.get("url") or "").strip()
+                ]
+            elif decision_failed and not fetch_decision.get("fetch_urls"):
+                fetch_decision["fetch_urls"] = [
+                    str(r.get("url") or "").strip()
+                    for r in search_results[:1]
+                    if str(r.get("url") or "").strip()
+                ]
+                if db is not None:
+                    _append_agent_step(
+                        db,
+                        agent_run_id,
+                        {
+                            "kind": "policy",
+                            "action": "fetch_fallback",
+                            "reason": "LLM fetch decision failed; falling back to the first filtered external result.",
+                            "urls": fetch_decision["fetch_urls"],
+                        },
+                    )
+            selected_urls = {str(url or "").strip() for url in fetch_decision.get("fetch_urls") or [] if str(url or "").strip()}
+            out: list[dict[str, Any]] = []
+            fetched_count = 0
+            for item in search_results[:8]:
+                title = str(item.get("title") or "").strip()
+                url = str(item.get("url") or "").strip()
+                snippet = str(item.get("snippet") or "").strip()
+                page: dict[str, Any] = {"title": title, "url": url, "snippet": snippet[:800]}
+                if url and url in selected_urls and _is_fetchable_url(url) and fetched_count < max(1, min(6, int(max_pages))):
+                    started = time.perf_counter()
+                    try:
+                        page_resp = client.get(url)
+                        page_resp.raise_for_status()
+                        ctype = page_resp.headers.get("content-type", "").lower()
+                        body = page_resp.text[:500_000]
+                        if "html" in ctype or "<html" in body[:1000].lower():
+                            page_text = _extract_page_text(body)
+                        else:
+                            page_text = _collapse_text(body, limit=12000)
+                        page["content"] = page_text[:5000]
+                        fetched_count += 1
+                        step = ToolResult(
+                            spec=_FETCH_TOOL_SPEC,
+                            input={"url": url, "title": title},
+                            output={"url": url, "chars": len(page_text), "excerpt": page_text[:360]},
+                            ok=True,
+                            duration_ms=_duration_ms(started),
+                        ).to_step(action="read_url")
+                        step.update({"url": url, "title": title, "chars": len(page_text), "excerpt": page_text[:360]})
+                        if db is not None:
+                            _append_agent_step(db, agent_run_id, step)
+                    except Exception as e:
+                        page["fetch_error"] = str(e)[:300]
+                        step = ToolResult(
+                            spec=_FETCH_TOOL_SPEC,
+                            input={"url": url, "title": title},
+                            output={"url": url},
+                            ok=False,
+                            duration_ms=_duration_ms(started),
+                            error_type=type(e).__name__,
+                            error=str(e)[:300],
+                        ).to_step(action="read_url_failed")
+                        step.update({"url": url, "title": title})
+                        if db is not None:
+                            _append_agent_step(db, agent_run_id, step)
+                elif url:
+                    if url in selected_urls:
+                        page["fetch_skipped"] = "not_fetchable_or_page_limit"
+                    else:
+                        page["fetch_skipped"] = "not_selected_by_agent"
+                if title or snippet or page.get("content"):
+                    out.append(page)
+            return out
+    except Exception:
+        if db is not None:
+            _append_agent_step(
+                db,
+                agent_run_id,
+                {
+                    "kind": "tool",
+                    "action": "search_failed",
+                    "tool": "search",
+                    "tool_name": "search",
+                    "queries": search_queries,
+                    "error_type": "unexpected_error",
+                },
+            )
+        return []
+
+
+def explain_term_from_evidence_openai(
+    *,
+    term: str,
+    context: str,
+    target_lang: str,
+    domain_hint: str,
+    evidence: list[dict[str, Any]],
+    config: OpenAIChatConfig,
+    client: httpx.Client | None = None,
+) -> dict[str, Any] | None:
+    clean_term = str(term or "").strip()
+    if not clean_term:
+        return None
+    data = request_openai_json_object(
+        config=config,
+        system_prompt="You build a verified translation glossary. Return ONLY valid JSON.",
+        user_prompt=(
+            "请根据字幕上下文和检索资料，判断术语最贴切的中文译法。\n"
+            "要求：\n"
+            "- 不确定时 confidence 低于 0.7；\n"
+            "- 检索资料可能包含搜索结果摘要、url、以及打开网页后抽取的 content；优先使用 content 和可靠来源；\n"
+            "- 不要把无关网页、广告、导航文字当成术语依据；\n"
+            "- sources 只保留实际支持判断的来源；\n"
+            "- description 用中文说明语境；\n"
+            "- translation 是字幕翻译可直接使用的译法。\n\n"
+            f"术语：{clean_term}\n"
+            f"目标语言：{target_lang or 'zh'}\n"
+            f"领域提示：{domain_hint or '未知'}\n\n"
+            f"字幕上下文：\n{context[:3000]}\n\n"
+            f"检索资料 JSON：\n{json.dumps(evidence, ensure_ascii=False)[:6000]}\n\n"
+            '输出 JSON：{"term":"","translation":"","domain":"","aliases":[],"description":"","sources":[],"confidence":0.0}'
+        ),
+        client=client,
+    )
+    translation = str(data.get("translation") or "").strip()
+    if not translation:
+        return None
+    aliases = data.get("aliases")
+    sources = data.get("sources")
+    try:
+        confidence = float(data.get("confidence") or 0.0)
+    except Exception:
+        confidence = 0.0
+    return {
+        "term": str(data.get("term") or clean_term).strip(),
+        "translation": translation,
+        "domain": str(data.get("domain") or domain_hint or "").strip(),
+        "aliases": aliases if isinstance(aliases, list) else [],
+        "description": str(data.get("description") or "").strip(),
+        "sources": sources if isinstance(sources, list) else [],
+        "confidence": max(0.0, min(1.0, confidence)),
+    }
+
+
+def _json_bool(value: Any) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y"}
+    return bool(value)
+
+
+def _valid_external_evidence(evidence: list[dict[str, Any]], *, search_url: str = "") -> list[dict[str, str]]:
+    out: list[dict[str, str]] = []
+    for item in evidence:
+        if not isinstance(item, dict):
+            continue
+        url = str(item.get("url") or "").strip()
+        title = str(item.get("title") or "").strip()
+        snippet = str(item.get("snippet") or "").strip()
+        content = str(item.get("content") or "").strip()
+        if not url or item.get("fetch_error"):
+            continue
+        if search_url and _is_search_engine_internal_url(url, search_url=search_url):
+            continue
+        if not snippet and not content:
+            continue
+        snippet_norm = re.sub(r"[\W_]+", " ", snippet.lower()).strip()
+        if not content and (len(snippet) < 24 or snippet_norm in {"read more", "read more read more"}):
+            continue
+        out.append({"title": title, "url": url})
+    return out
+
+
+def verify_glossary_entry_openai(
+    *,
+    term: str,
+    context: str,
+    target_lang: str,
+    domain_hint: str,
+    evidence: list[dict[str, Any]],
+    candidate: dict[str, Any],
+    config: OpenAIChatConfig,
+    client: httpx.Client | None = None,
+) -> dict[str, Any]:
+    clean_term = str(term or "").strip()
+    compact_evidence = [
+        {
+            "title": str(item.get("title") or "")[:240],
+            "url": str(item.get("url") or "")[:1000],
+            "snippet": str(item.get("snippet") or "")[:700],
+            "content": str(item.get("content") or "")[:1200],
+            "fetch_error": str(item.get("fetch_error") or "")[:300],
+        }
+        for item in evidence[:8]
+        if isinstance(item, dict)
+    ]
+    compact_candidate = {
+        "term": str(candidate.get("term") or clean_term),
+        "translation": str(candidate.get("translation") or ""),
+        "domain": str(candidate.get("domain") or domain_hint or ""),
+        "aliases": candidate.get("aliases") if isinstance(candidate.get("aliases"), list) else [],
+        "description": str(candidate.get("description") or ""),
+        "sources": candidate.get("sources") if isinstance(candidate.get("sources"), list) else [],
+        "confidence": float(candidate.get("confidence") or 0.0),
+    }
+    data = request_openai_json_object(
+        config=config,
+        system_prompt="You verify a translation glossary candidate for a RAG knowledge base. Return ONLY valid JSON.",
+        user_prompt=(
+            "请作为独立 verifier，判断候选术语条目是否应该写入长期翻译知识库。\n"
+            "要求：\n"
+            "- 必须检查检索资料是否真正支持候选译法和描述；\n"
+            "- 必须检查候选解释是否符合字幕上下文；\n"
+            "- 搜索引擎 About/Preferences/导航页、广告页、无正文摘要不能作为有效来源；\n"
+            "- 单字母变量、局部变量、一次性占位符不应该写入长期知识库；\n"
+            "- 如果没有可靠外部来源，但译法只适合当前字幕，failure_category 使用 context_only，should_write=false；\n"
+            "- should_auto_approve 只有在来源明确、上下文一致、置信度很高时才为 true。\n\n"
+            f"术语：{clean_term}\n"
+            f"目标语言：{target_lang or 'zh'}\n"
+            f"领域提示：{domain_hint or '未知'}\n\n"
+            f"字幕上下文：\n{context[:3000]}\n\n"
+            f"候选条目 JSON：\n{json.dumps(compact_candidate, ensure_ascii=False)}\n\n"
+            f"检索资料 JSON：\n{json.dumps(compact_evidence, ensure_ascii=False)[:7000]}\n\n"
+            '输出 JSON：{"supported":true,"context_consistent":true,"should_write":true,'
+            '"should_auto_approve":false,"confidence":0.0,"reason":"","failure_category":""}'
+        ),
+        client=client,
+    )
+    try:
+        confidence = float(data.get("confidence") or 0.0)
+    except Exception:
+        confidence = 0.0
+    return {
+        "supported": _json_bool(data.get("supported")),
+        "context_consistent": _json_bool(data.get("context_consistent")),
+        "should_write": _json_bool(data.get("should_write")),
+        "should_auto_approve": _json_bool(data.get("should_auto_approve")),
+        "confidence": max(0.0, min(1.0, confidence)),
+        "reason": str(data.get("reason") or "").strip()[:1200],
+        "failure_category": str(data.get("failure_category") or "").strip()[:120],
+    }
+
+
+def upsert_knowledge_item(
+    db: Session,
+    *,
+    item_type: str,
+    target_lang: str,
+    term: str = "",
+    translation: str = "",
+    domain: str = "",
+    aliases: list[str] | None = None,
+    title: str = "",
+    content: str = "",
+    description: str = "",
+    sources: list[dict[str, Any]] | None = None,
+    confidence: float = 0.0,
+    status: str = "approved",
+    created_by: str = "manual",
+    embedding: list[float] | None = None,
+    embedding_model: str = "",
+) -> str:
+    item_id = str(uuid.uuid4())
+    clean_item_type = str(item_type or "document").strip() or "document"
+    clean_target_lang = str(target_lang or "zh").strip() or "zh"
+    clean_term = str(term or "").strip()
+    clean_domain = str(domain or "").strip()
+    norm = normalize_term(clean_term)
+    alias_list = [str(x).strip() for x in aliases or [] if str(x or "").strip()]
+    source_list = [x for x in sources or [] if isinstance(x, dict)]
+    emb_literal = _vector_literal(embedding) if embedding else None
+    embedding_text = build_knowledge_embedding_text(
+        item_type=clean_item_type,
+        term=clean_term,
+        translation=translation,
+        domain=clean_domain,
+        aliases=alias_list,
+        title=title,
+        content=content,
+        description=description,
+    )
+    embedding_hash = _hash_text(embedding_text) if embedding else ""
+
+    if clean_item_type == "term" and norm:
+        existing = db.execute(
+            text(
+                """
+                SELECT id FROM translation_knowledge_items
+                WHERE item_type = 'term'
+                  AND target_lang = :target_lang
+                  AND domain = :domain
+                  AND normalized_term = :normalized_term
+                LIMIT 1
+                """
+            ),
+            {"target_lang": clean_target_lang, "domain": clean_domain, "normalized_term": norm},
+        ).first()
+        if existing:
+            item_id = str(existing[0])
+            db.execute(
+                text(
+                    """
+                    UPDATE translation_knowledge_items
+                    SET term = :term,
+                        translation = :translation,
+                        aliases = CAST(:aliases AS jsonb),
+                        title = :title,
+                        content = :content,
+                        description = :description,
+                        sources = CAST(:sources AS jsonb),
+                        confidence = :confidence,
+                        status = :status,
+                        created_by = :created_by,
+                        embedding = COALESCE(CAST(:embedding AS vector), embedding),
+                        embedding_model = CASE WHEN :embedding_model <> '' THEN :embedding_model ELSE embedding_model END,
+                        embedding_text_hash = CASE WHEN :embedding_hash <> '' THEN :embedding_hash ELSE embedding_text_hash END,
+                        last_verified_at = :last_verified_at,
+                        updated_at = now()
+                    WHERE id = CAST(:id AS uuid)
+                    """
+                ),
+                {
+                    "id": item_id,
+                    "term": clean_term,
+                    "translation": str(translation or "").strip(),
+                    "aliases": json.dumps(alias_list, ensure_ascii=False),
+                    "title": str(title or "").strip(),
+                    "content": str(content or "").strip(),
+                    "description": str(description or "").strip(),
+                    "sources": json.dumps(source_list, ensure_ascii=False),
+                    "confidence": max(0.0, min(1.0, float(confidence or 0.0))),
+                    "status": str(status or "approved").strip() or "approved",
+                    "created_by": str(created_by or "manual").strip() or "manual",
+                    "embedding": emb_literal,
+                    "embedding_model": str(embedding_model or "").strip(),
+                    "embedding_hash": embedding_hash,
+                    "last_verified_at": datetime.now(timezone.utc),
+                },
+            )
+            return item_id
+
+    db.execute(
+        text(
+            """
+            INSERT INTO translation_knowledge_items (
+                id, item_type, term, normalized_term, translation, target_lang, domain,
+                aliases, title, content, description, sources, confidence, status,
+                created_by, embedding, embedding_model, embedding_text_hash, last_verified_at
+            )
+            VALUES (
+                CAST(:id AS uuid), :item_type, :term, :normalized_term, :translation, :target_lang, :domain,
+                CAST(:aliases AS jsonb), :title, :content, :description, CAST(:sources AS jsonb),
+                :confidence, :status, :created_by, CAST(:embedding AS vector), :embedding_model,
+                :embedding_hash, :last_verified_at
+            )
+            """
+        ),
+        {
+            "id": item_id,
+            "item_type": clean_item_type,
+            "term": clean_term,
+            "normalized_term": norm,
+            "translation": str(translation or "").strip(),
+            "target_lang": clean_target_lang,
+            "domain": clean_domain,
+            "aliases": json.dumps(alias_list, ensure_ascii=False),
+            "title": str(title or "").strip(),
+            "content": str(content or "").strip(),
+            "description": str(description or "").strip(),
+            "sources": json.dumps(source_list, ensure_ascii=False),
+            "confidence": max(0.0, min(1.0, float(confidence or 0.0))),
+            "status": str(status or "approved").strip() or "approved",
+            "created_by": str(created_by or "manual").strip() or "manual",
+            "embedding": emb_literal,
+            "embedding_model": str(embedding_model or "").strip(),
+            "embedding_hash": embedding_hash,
+            "last_verified_at": datetime.now(timezone.utc),
+        },
+    )
+    return item_id
+
+
+def search_knowledge(
+    db: Session,
+    *,
+    query_embedding: list[float],
+    target_lang: str,
+    domain: str = "",
+    embedding_model: str = "",
+    top_k: int = 8,
+    min_score: float = 0.68,
+) -> list[RagHit]:
+    if not query_embedding or top_k <= 0:
+        return []
+    params = {
+        "embedding": _vector_literal(query_embedding),
+        "dimensions": len(query_embedding),
+        "target_lang": str(target_lang or "zh").strip() or "zh",
+        "domain": str(domain or "").strip(),
+        "embedding_model": str(embedding_model or "").strip(),
+        "limit": max(1, min(30, int(top_k))),
+        "min_score": max(0.0, min(1.0, float(min_score))),
+    }
+    rows = db.execute(
+        text(
+            """
+            SELECT id, item_type, term, translation, target_lang, domain, aliases, title,
+                   content, description, sources, confidence, status,
+                   GREATEST(0, 1 - (embedding <=> CAST(:embedding AS vector))) AS score
+            FROM translation_knowledge_items
+            WHERE target_lang = :target_lang
+              AND status IN ('approved', 'auto_approved')
+              AND embedding IS NOT NULL
+              AND vector_dims(embedding) = :dimensions
+              AND (:embedding_model = '' OR embedding_model = :embedding_model)
+              AND (:domain = '' OR domain = '' OR domain = :domain)
+              AND GREATEST(0, 1 - (embedding <=> CAST(:embedding AS vector))) >= :min_score
+            ORDER BY embedding <=> CAST(:embedding AS vector)
+            LIMIT :limit
+            """
+        ),
+        params,
+    ).all()
+    return [_row_to_hit(row) for row in rows]
+
+
+def exact_term_hits(
+    db: Session,
+    *,
+    text_value: str,
+    target_lang: str,
+    domain: str = "",
+    limit: int = 20,
+) -> list[RagHit]:
+    candidates = _term_candidates_from_text(text_value, limit=limit)
+    norms = [normalize_term(x) for x in candidates]
+    if not norms:
+        return []
+    rows = db.execute(
+        text(
+            """
+            SELECT id, item_type, term, translation, target_lang, domain, aliases, title,
+                   content, description, sources, confidence, status, 1.0 AS score
+            FROM translation_knowledge_items
+            WHERE item_type = 'term'
+              AND target_lang = :target_lang
+              AND status IN ('approved', 'auto_approved')
+              AND normalized_term = ANY(:norms)
+              AND (:domain = '' OR domain = '' OR domain = :domain)
+            LIMIT :limit
+            """
+        ),
+        {
+            "target_lang": str(target_lang or "zh").strip() or "zh",
+            "domain": str(domain or "").strip(),
+            "norms": norms,
+            "limit": max(1, min(50, int(limit))),
+        },
+    ).all()
+    return [_row_to_hit(row) for row in rows]
+
+
+def build_rag_context(
+    db: Session,
+    *,
+    segments: list[Segment],
+    target_lang: str,
+    rag_settings: RagSettings,
+    embedding_settings: EmbeddingSettings,
+    chat_config: OpenAIChatConfig,
+    task_id: str | None = None,
+    subtitle_job_id: str | None = None,
+) -> RagContext:
+    if not rag_settings.enabled:
+        return RagContext(term_cards=[], knowledge_cards=[], hits=[])
+
+    text_value = "\n".join([str(s.text or "").strip() for s in segments if str(s.text or "").strip()])
+    if not text_value:
+        return RagContext(term_cards=[], knowledge_cards=[], hits=[])
+
+    hits: list[RagHit] = []
+    seen_ids: set[str] = set()
+    for hit in exact_term_hits(
+        db,
+        text_value=text_value,
+        target_lang=target_lang,
+        domain=rag_settings.domain,
+        limit=max(rag_settings.top_k * 2, 10),
+    ):
+        if hit.id not in seen_ids:
+            seen_ids.add(hit.id)
+            hits.append(hit)
+
+    try:
+        query_embedding = embed_text(text_value[:8000], settings=embedding_settings)
+        assert_embedding_dimensions(query_embedding, rag_settings.embedding_dimensions)
+        for hit in search_knowledge(
+            db,
+            query_embedding=query_embedding,
+            target_lang=target_lang,
+            domain=rag_settings.domain,
+            embedding_model=embedding_model_key(rag_settings),
+            top_k=rag_settings.top_k,
+            min_score=rag_settings.min_score,
+        ):
+            if hit.id not in seen_ids:
+                seen_ids.add(hit.id)
+                hits.append(hit)
+    except Exception:
+        query_embedding = []
+
+    context_only_cards: list[dict[str, Any]] = []
+
+    if rag_settings.auto_discover_terms:
+        try:
+            discovered = discover_terms_openai(
+                text_value,
+                target_lang=target_lang,
+                domain_hint=rag_settings.domain,
+                config=chat_config,
+            )
+        except Exception:
+            discovered = []
+        known_norms = {normalize_term(h.term) for h in hits if h.term}
+        for item in discovered:
+            term = str(item.get("term") or "").strip()
+            norm = normalize_term(term)
+            if not term or norm in known_norms:
+                continue
+            if not rag_settings.auto_learn_terms:
+                continue
+            domain_hint = str(item.get("domain") or rag_settings.domain or "").strip()
+            query = " ".join([p for p in [domain_hint, term] if p]).strip()
+            agent_run_id: str | None = None
+            try:
+                agent_run_id = _start_agent_run(
+                    db,
+                    term=term,
+                    domain=domain_hint,
+                    target_lang=target_lang,
+                    query=query,
+                    task_id=task_id,
+                    subtitle_job_id=subtitle_job_id,
+                )
+                _append_llm_step(
+                    db,
+                    agent_run_id,
+                    action="term_discovered",
+                    config=chat_config,
+                    output_value={
+                        "term": term,
+                        "domain": domain_hint,
+                        "reason": str(item.get("reason") or "").strip(),
+                    },
+                )
+            except Exception:
+                db.rollback()
+                agent_run_id = None
+
+            research_policy = should_research_term(term, domain=domain_hint, context=text_value)
+            _append_agent_step(
+                db,
+                agent_run_id,
+                {
+                    "kind": "policy",
+                    "action": "term_research_policy",
+                    "term": term,
+                    "domain": domain_hint,
+                    "decision": research_policy,
+                },
+            )
+            if not research_policy.get("should_research"):
+                if research_policy.get("category") == "context_only" and research_policy.get("translation"):
+                    context_only_cards.append(_context_only_term_card(term, research_policy, target_lang=target_lang, domain=domain_hint))
+                _finish_agent_run(
+                    db,
+                    agent_run_id,
+                    status="skipped",
+                    result={
+                        "term": term,
+                        "domain": domain_hint,
+                        "knowledge_status": str(research_policy.get("category") or "skipped"),
+                        "failure_category": str(research_policy.get("category") or "skipped"),
+                        "reason": str(research_policy.get("reason") or ""),
+                    },
+                )
+                known_norms.add(norm)
+                continue
+
+            search_queries: list[str] = []
+            if rag_settings.search_enabled:
+                started = time.perf_counter()
+                try:
+                    search_queries = generate_search_queries_openai(
+                        term=term,
+                        context=text_value,
+                        target_lang=target_lang,
+                        domain_hint=domain_hint,
+                        config=chat_config,
+                        max_queries=3,
+                    )
+                    _append_llm_step(
+                        db,
+                        agent_run_id,
+                        action="generate_search_queries",
+                        config=chat_config,
+                        input_value={"term": term, "domain": domain_hint, "context_excerpt": text_value[:500]},
+                        output_value={"queries": search_queries},
+                        duration_ms=_duration_ms(started),
+                    )
+                except Exception as e:
+                    search_queries = _fallback_search_queries(term, domain=domain_hint, target_lang=target_lang, limit=3)
+                    _append_llm_step(
+                        db,
+                        agent_run_id,
+                        action="generate_search_queries_failed",
+                        config=chat_config,
+                        duration_ms=_duration_ms(started),
+                        error=str(e)[:300],
+                        error_type=type(e).__name__,
+                    )
+                    _append_agent_step(
+                        db,
+                        agent_run_id,
+                        {
+                            "kind": "policy",
+                            "action": "search_query_fallback",
+                            "queries": search_queries,
+                            "reason": "LLM query generation failed; using deterministic fallback queries.",
+                        },
+                    )
+            evidence = []
+            if rag_settings.search_enabled:
+                evidence = fetch_search_evidence(
+                    term,
+                    domain=domain_hint,
+                    search_url=rag_settings.search_url,
+                    queries=search_queries,
+                    context=text_value,
+                    target_lang=target_lang,
+                    config=chat_config,
+                    db=db,
+                    agent_run_id=agent_run_id,
+                )
+            if not evidence:
+                _finish_agent_run(
+                    db,
+                    agent_run_id,
+                    status="failed",
+                    result={
+                        "term": term,
+                        "domain": domain_hint,
+                        "search_queries": search_queries,
+                        "failure_category": "no_search_evidence",
+                    },
+                    error="no search evidence",
+                )
+                continue
+            try:
+                summarize_started = time.perf_counter()
+                explained = explain_term_from_evidence_openai(
+                    term=term,
+                    context=text_value,
+                    target_lang=target_lang,
+                    domain_hint=domain_hint,
+                    evidence=evidence,
+                    config=chat_config,
+                )
+                _append_llm_step(
+                    db,
+                    agent_run_id,
+                    action="summarize_evidence",
+                    config=chat_config,
+                    input_value={"term": term, "domain": domain_hint, "evidence_count": len(evidence)},
+                    output_value={
+                        "term": str((explained or {}).get("term") or term),
+                        "translation": str((explained or {}).get("translation") or ""),
+                        "confidence": float((explained or {}).get("confidence") or 0.0),
+                    },
+                    duration_ms=_duration_ms(summarize_started),
+                )
+            except Exception as e:
+                _append_llm_step(
+                    db,
+                    agent_run_id,
+                    action="summarize_failed",
+                    config=chat_config,
+                    error=str(e)[:300],
+                    error_type=type(e).__name__,
+                )
+                explained = None
+            if not explained:
+                _finish_agent_run(
+                    db,
+                    agent_run_id,
+                    status="failed",
+                    result={"term": term, "domain": domain_hint, "evidence_count": len(evidence), "failure_category": "summarize_failed"},
+                    error="LLM did not produce a usable glossary entry",
+                )
+                continue
+
+            valid_sources = _valid_external_evidence(evidence, search_url=rag_settings.search_url)
+            try:
+                verify_started = time.perf_counter()
+                verification = verify_glossary_entry_openai(
+                    term=term,
+                    context=text_value,
+                    target_lang=target_lang,
+                    domain_hint=domain_hint,
+                    evidence=evidence,
+                    candidate=explained,
+                    config=chat_config,
+                )
+                _append_llm_step(
+                    db,
+                    agent_run_id,
+                    action="verify_glossary_entry",
+                    config=chat_config,
+                    input_value={
+                        "term": term,
+                        "candidate_confidence": float(explained.get("confidence") or 0.0),
+                        "valid_source_count": len(valid_sources),
+                    },
+                    output_value=verification,
+                    duration_ms=_duration_ms(verify_started),
+                )
+            except Exception as e:
+                verification = {
+                    "supported": False,
+                    "context_consistent": False,
+                    "should_write": False,
+                    "should_auto_approve": False,
+                    "confidence": 0.0,
+                    "reason": "verifier failed",
+                    "failure_category": "verify_failed",
+                }
+                _append_llm_step(
+                    db,
+                    agent_run_id,
+                    action="verify_failed",
+                    config=chat_config,
+                    error=str(e)[:300],
+                    error_type=type(e).__name__,
+                )
+
+            candidate_confidence = float(explained.get("confidence") or 0.0)
+            verifier_confidence = float(verification.get("confidence") or 0.0)
+            final_confidence = min(candidate_confidence, verifier_confidence) if verifier_confidence > 0 else candidate_confidence
+            should_write = (
+                bool(verification.get("supported"))
+                and bool(verification.get("context_consistent"))
+                and bool(verification.get("should_write"))
+                and bool(valid_sources)
+            )
+            if not should_write:
+                failure_category = str(verification.get("failure_category") or "")
+                if not valid_sources:
+                    failure_category = failure_category or "no_valid_external_source"
+                _finish_agent_run(
+                    db,
+                    agent_run_id,
+                    status="skipped",
+                    result={
+                        "term": str(explained.get("term") or term),
+                        "translation": str(explained.get("translation") or ""),
+                        "domain": str(explained.get("domain") or domain_hint or ""),
+                        "confidence": final_confidence,
+                        "knowledge_status": "context_only" if failure_category == "context_only" else "not_written",
+                        "failure_category": failure_category or "verify_rejected",
+                        "verification": verification,
+                        "valid_source_count": len(valid_sources),
+                        "search_queries": search_queries,
+                    },
+                    error=str(verification.get("reason") or "verifier rejected glossary entry")[:4000],
+                )
+                known_norms.add(norm)
+                continue
+
+            status = (
+                "auto_approved"
+                if bool(verification.get("should_auto_approve")) and final_confidence >= _AUTO_APPROVE_CONFIDENCE_THRESHOLD
+                else "pending"
+            )
+            source_list = [x for x in explained.get("sources") or [] if isinstance(x, dict)] or valid_sources
+            try:
+                _append_agent_step(
+                    db,
+                    agent_run_id,
+                    {
+                        "kind": "policy",
+                        "action": "knowledge_write_decision",
+                        "term": str(explained.get("term") or term),
+                        "translation": str(explained.get("translation") or ""),
+                        "confidence": final_confidence,
+                        "status": status,
+                        "auto_threshold": _AUTO_APPROVE_CONFIDENCE_THRESHOLD,
+                        "valid_source_count": len(valid_sources),
+                    },
+                )
+                emb_text = build_knowledge_embedding_text(
+                    item_type="term",
+                    term=str(explained.get("term") or term),
+                    translation=str(explained.get("translation") or ""),
+                    domain=str(explained.get("domain") or ""),
+                    aliases=[str(x) for x in explained.get("aliases") or []],
+                    description=str(explained.get("description") or ""),
+                )
+                emb = embed_text(emb_text, settings=embedding_settings)
+                assert_embedding_dimensions(emb, rag_settings.embedding_dimensions)
+                learned_id = upsert_knowledge_item(
+                    db,
+                    item_type="term",
+                    target_lang=target_lang,
+                    term=str(explained.get("term") or term),
+                    translation=str(explained.get("translation") or ""),
+                    domain=str(explained.get("domain") or rag_settings.domain or ""),
+                    aliases=[str(x) for x in explained.get("aliases") or []],
+                    description=str(explained.get("description") or ""),
+                    sources=source_list,
+                    confidence=final_confidence,
+                    status=status,
+                    created_by="agent",
+                    embedding=emb,
+                    embedding_model=embedding_model_key(rag_settings),
+                )
+                db.commit()
+                _finish_agent_run(
+                    db,
+                    agent_run_id,
+                    status="succeeded",
+                    result={
+                        "term": str(explained.get("term") or term),
+                        "translation": str(explained.get("translation") or ""),
+                        "domain": str(explained.get("domain") or rag_settings.domain or ""),
+                        "confidence": final_confidence,
+                        "knowledge_status": status,
+                        "verification": verification,
+                        "valid_source_count": len(valid_sources),
+                        "search_queries": search_queries,
+                        "sources": source_list[:5],
+                    },
+                    knowledge_item_id=learned_id,
+                )
+                known_norms.add(norm)
+                if status == "auto_approved":
+                    hits.append(
+                        RagHit(
+                            id=learned_id,
+                            item_type="term",
+                            term=str(explained.get("term") or term),
+                            translation=str(explained.get("translation") or ""),
+                            target_lang=target_lang,
+                            domain=str(explained.get("domain") or rag_settings.domain or ""),
+                            aliases=[str(x) for x in explained.get("aliases") or []],
+                            title="",
+                            content="",
+                            description=str(explained.get("description") or ""),
+                            sources=source_list,
+                            confidence=final_confidence,
+                            status=status,
+                            score=final_confidence,
+                        )
+                    )
+            except Exception as e:
+                db.rollback()
+                _finish_agent_run(
+                    db,
+                    agent_run_id,
+                    status="failed",
+                    result={
+                        "term": str(explained.get("term") or term),
+                        "translation": str(explained.get("translation") or ""),
+                        "confidence": final_confidence,
+                        "failure_category": "knowledge_save_failed",
+                    },
+                    error=f"knowledge save failed: {e}",
+                )
+
+    term_cards: list[dict[str, Any]] = list(context_only_cards)
+    knowledge_cards: list[dict[str, Any]] = []
+    for hit in hits[: rag_settings.top_k]:
+        if hit.item_type == "term":
+            term_cards.append(
+                {
+                    "term": hit.term,
+                    "translation": hit.translation,
+                    "domain": hit.domain,
+                    "aliases": hit.aliases,
+                    "description": hit.description,
+                    "confidence": hit.confidence,
+                    "score": round(hit.score, 4),
+                    "sources": hit.sources[:3],
+                }
+            )
+        else:
+            knowledge_cards.append(
+                {
+                    "title": hit.title or hit.term,
+                    "domain": hit.domain,
+                    "content": (hit.content or hit.description)[:1200],
+                    "score": round(hit.score, 4),
+                    "sources": hit.sources[:3],
+                }
+            )
+
+    if task_id or subtitle_job_id:
+        _record_matches(
+            db,
+            hits=hits[: rag_settings.top_k],
+            task_id=task_id,
+            subtitle_job_id=subtitle_job_id,
+            context=text_value[:2000],
+        )
+
+    return RagContext(term_cards=term_cards, knowledge_cards=knowledge_cards, hits=hits)
+
+
+def _record_matches(
+    db: Session,
+    *,
+    hits: list[RagHit],
+    task_id: str | None,
+    subtitle_job_id: str | None,
+    context: str,
+) -> None:
+    if not hits:
+        return
+    for hit in hits:
+        try:
+            db.execute(
+                text(
+                    """
+                    INSERT INTO translation_term_matches (
+                        id, task_id, subtitle_job_id, knowledge_item_id, term,
+                        normalized_term, raw_context, decision
+                    )
+                    VALUES (
+                        CAST(:id AS uuid),
+                        CAST(:task_id AS uuid),
+                        CAST(:subtitle_job_id AS uuid),
+                        CAST(:knowledge_item_id AS uuid),
+                        :term,
+                        :normalized_term,
+                        :raw_context,
+                        :decision
+                    )
+                    """
+                ),
+                {
+                    "id": str(uuid.uuid4()),
+                    "task_id": str(task_id) if task_id else None,
+                    "subtitle_job_id": str(subtitle_job_id) if subtitle_job_id else None,
+                    "knowledge_item_id": hit.id,
+                    "term": hit.term or hit.title,
+                    "normalized_term": normalize_term(hit.term or hit.title),
+                    "raw_context": context,
+                    "decision": f"score={hit.score:.4f}",
+                },
+            )
+            db.execute(
+                text("UPDATE translation_knowledge_items SET usage_count = usage_count + 1, updated_at = now() WHERE id = CAST(:id AS uuid)"),
+                {"id": hit.id},
+            )
+        except Exception:
+            continue
+
+
+def list_knowledge_items(db: Session, *, item_type: str | None = None, status: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
+    clauses = ["1=1"]
+    params: dict[str, Any] = {"limit": max(1, min(500, int(limit)))}
+    if item_type:
+        clauses.append("item_type = :item_type")
+        params["item_type"] = item_type
+    if status:
+        clauses.append("status = :status")
+        params["status"] = status
+    rows = db.execute(
+        text(
+            f"""
+            SELECT id, item_type, term, translation, target_lang, domain, aliases, title,
+                   content, description, sources, confidence, status, created_by,
+                   usage_count, embedding_model, last_verified_at, created_at, updated_at
+            FROM translation_knowledge_items
+            WHERE {' AND '.join(clauses)}
+            ORDER BY updated_at DESC, created_at DESC
+            LIMIT :limit
+            """
+        ),
+        params,
+    ).all()
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        m = row._mapping
+        out.append(
+            {
+                "id": str(m["id"]),
+                "item_type": m["item_type"],
+                "term": m["term"],
+                "translation": m["translation"],
+                "target_lang": m["target_lang"],
+                "domain": m["domain"],
+                "aliases": _json_list(m["aliases"]),
+                "title": m["title"],
+                "content": m["content"],
+                "description": m["description"],
+                "sources": _json_list(m["sources"]),
+                "confidence": float(m["confidence"] or 0.0),
+                "status": m["status"],
+                "created_by": m["created_by"],
+                "usage_count": int(m["usage_count"] or 0),
+                "embedding_model": m["embedding_model"],
+                "last_verified_at": m["last_verified_at"],
+                "created_at": m["created_at"],
+                "updated_at": m["updated_at"],
+            }
+        )
+    return out
+
+
+def list_agent_runs(db: Session, *, status: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
+    clauses = ["1=1"]
+    params: dict[str, Any] = {"limit": max(1, min(100, int(limit)))}
+    if status:
+        clauses.append("status = :status")
+        params["status"] = str(status).strip()
+    rows = db.execute(
+        text(
+            f"""
+            SELECT id, agent_type, status, term, domain, target_lang, task_id, subtitle_job_id,
+                   query, steps, result, error, knowledge_item_id,
+                   started_at, finished_at, created_at, updated_at
+            FROM translation_agent_runs
+            WHERE {' AND '.join(clauses)}
+            ORDER BY updated_at DESC, started_at DESC
+            LIMIT :limit
+            """
+        ),
+        params,
+    ).all()
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        m = row._mapping
+        result = m["result"]
+        steps = m["steps"]
+        if isinstance(result, str):
+            try:
+                result = json.loads(result)
+            except Exception:
+                result = {}
+        if isinstance(steps, str):
+            try:
+                steps = json.loads(steps)
+            except Exception:
+                steps = []
+        out.append(
+            {
+                "id": str(m["id"]),
+                "agent_type": m["agent_type"],
+                "status": m["status"],
+                "term": m["term"],
+                "domain": m["domain"],
+                "target_lang": m["target_lang"],
+                "task_id": str(m["task_id"]) if m["task_id"] else None,
+                "subtitle_job_id": str(m["subtitle_job_id"]) if m["subtitle_job_id"] else None,
+                "query": m["query"],
+                "steps": steps if isinstance(steps, list) else [],
+                "result": result if isinstance(result, dict) else {},
+                "error": m["error"],
+                "knowledge_item_id": str(m["knowledge_item_id"]) if m["knowledge_item_id"] else None,
+                "started_at": m["started_at"],
+                "finished_at": m["finished_at"],
+                "created_at": m["created_at"],
+                "updated_at": m["updated_at"],
+            }
+        )
+    return out
+
+
+def rebuild_knowledge_embeddings(
+    db: Session,
+    *,
+    rag_settings: RagSettings,
+    embedding_settings: EmbeddingSettings,
+    item_type: str | None = None,
+    status: str | None = None,
+    limit: int = 1000,
+) -> dict[str, Any]:
+    clauses = ["1=1"]
+    params: dict[str, Any] = {"limit": max(1, min(10000, int(limit)))}
+    if item_type:
+        clauses.append("item_type = :item_type")
+        params["item_type"] = str(item_type).strip()
+    if status:
+        clauses.append("status = :status")
+        params["status"] = str(status).strip()
+
+    rows = db.execute(
+        text(
+            f"""
+            SELECT id, item_type, term, translation, target_lang, domain, aliases, title,
+                   content, description
+            FROM translation_knowledge_items
+            WHERE {' AND '.join(clauses)}
+            ORDER BY updated_at DESC, created_at DESC
+            LIMIT :limit
+            """
+        ),
+        params,
+    ).all()
+
+    model_key = embedding_model_key(rag_settings)
+    updated = 0
+    failed = 0
+    skipped = 0
+    errors: list[dict[str, str]] = []
+    for row in rows:
+        m = row._mapping
+        embedding_text = build_knowledge_embedding_text(
+            item_type=str(m["item_type"] or ""),
+            term=str(m["term"] or ""),
+            translation=str(m["translation"] or ""),
+            domain=str(m["domain"] or ""),
+            aliases=[str(x) for x in _json_list(m["aliases"]) if str(x or "").strip()],
+            title=str(m["title"] or ""),
+            content=str(m["content"] or ""),
+            description=str(m["description"] or ""),
+        )
+        if not embedding_text.strip():
+            skipped += 1
+            continue
+        try:
+            embedding = embed_text(embedding_text, settings=embedding_settings)
+            assert_embedding_dimensions(embedding, rag_settings.embedding_dimensions)
+            with db.begin_nested():
+                db.execute(
+                    text(
+                        """
+                        UPDATE translation_knowledge_items
+                        SET embedding = CAST(:embedding AS vector),
+                            embedding_model = :embedding_model,
+                            embedding_text_hash = :embedding_text_hash,
+                            last_verified_at = :last_verified_at,
+                            updated_at = now()
+                        WHERE id = CAST(:id AS uuid)
+                        """
+                    ),
+                    {
+                        "id": str(m["id"]),
+                        "embedding": _vector_literal(embedding),
+                        "embedding_model": model_key,
+                        "embedding_text_hash": _hash_text(embedding_text),
+                        "last_verified_at": datetime.now(timezone.utc),
+                    },
+                )
+            updated += 1
+        except Exception as e:
+            failed += 1
+            if len(errors) < 20:
+                errors.append({"id": str(m["id"]), "error": str(e)})
+    return {
+        "total": len(rows),
+        "updated": updated,
+        "failed": failed,
+        "skipped": skipped,
+        "embedding_model": model_key,
+        "dimensions": rag_settings.embedding_dimensions,
+        "errors": errors,
+    }

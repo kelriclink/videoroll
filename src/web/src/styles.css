@@ -7,3 +7,247 @@ body {
   height: 100%;
 }
 
+@layer base {
+  :focus-visible {
+    outline: 2px solid rgb(15 23 42);
+    outline-offset: 2px;
+  }
+
+  .dark :focus-visible {
+    outline-color: rgb(226 232 240);
+  }
+}
+
+@layer components {
+  .vr-section {
+    @apply rounded-md border border-slate-200 bg-white p-4 shadow-sm;
+  }
+
+  .vr-table-wrap {
+    @apply overflow-auto rounded-md border border-slate-200;
+  }
+
+  .vr-table {
+    @apply min-w-full border-collapse text-left text-sm;
+  }
+
+  .vr-table thead {
+    @apply sticky top-0 z-10 bg-slate-50 text-xs font-medium uppercase tracking-normal text-slate-500;
+  }
+
+  .vr-table th {
+    @apply border-b border-slate-200 px-3 py-2 align-bottom;
+  }
+
+  .vr-table td {
+    @apply border-b border-slate-100 px-3 py-2 align-top;
+  }
+
+  .vr-table tbody tr {
+    @apply hover:bg-slate-50/70;
+  }
+
+  .vr-table tbody tr:last-child td {
+    @apply border-b-0;
+  }
+
+  .vr-input {
+    @apply rounded-md border border-slate-300 px-3 py-2 text-sm outline-none focus:border-slate-500;
+  }
+
+  .vr-chip {
+    @apply inline-flex items-center rounded-md border border-slate-200 bg-slate-50 px-2 py-1 text-xs text-slate-700;
+  }
+
+  main table {
+    @apply min-w-full border-collapse text-left text-sm;
+  }
+
+  main thead {
+    @apply sticky top-0 z-10 bg-slate-50 text-xs font-medium uppercase tracking-normal text-slate-500;
+  }
+
+  main th {
+    @apply border-b border-slate-200 px-3 py-2 align-bottom;
+  }
+
+  main td {
+    @apply border-b border-slate-100 px-3 py-2 align-top;
+  }
+
+  main tbody tr {
+    @apply hover:bg-slate-50/70;
+  }
+
+  main tbody tr:last-child td {
+    @apply border-b-0;
+  }
+}
+
+@layer utilities {
+  .dark body {
+    background: rgb(2 6 23);
+    color: rgb(226 232 240);
+  }
+
+  .dark .bg-white {
+    background-color: rgb(15 23 42);
+  }
+
+  .dark .bg-slate-50 {
+    background-color: rgb(2 6 23);
+  }
+
+  .dark .bg-slate-100 {
+    background-color: rgb(30 41 59);
+  }
+
+  .dark .bg-slate-200 {
+    background-color: rgb(51 65 85);
+  }
+
+  .dark .border,
+  .dark .border-slate-100,
+  .dark .border-slate-200,
+  .dark .border-slate-300 {
+    border-color: rgb(51 65 85);
+  }
+
+  .dark .shadow-sm,
+  .dark .shadow-lg,
+  .dark .shadow-xl {
+    box-shadow: none;
+  }
+
+  .dark .text-slate-950,
+  .dark .text-slate-900,
+  .dark .text-slate-800,
+  .dark .text-slate-700 {
+    color: rgb(226 232 240);
+  }
+
+  .dark .text-slate-600,
+  .dark .text-slate-500,
+  .dark .text-slate-400 {
+    color: rgb(148 163 184);
+  }
+
+  .dark .text-sky-700,
+  .dark .text-sky-900,
+  .dark .text-sky-950 {
+    color: rgb(125 211 252);
+  }
+
+  .dark .text-emerald-700,
+  .dark .text-emerald-900,
+  .dark .text-emerald-950 {
+    color: rgb(110 231 183);
+  }
+
+  .dark .text-rose-700,
+  .dark .text-rose-900,
+  .dark .text-rose-950 {
+    color: rgb(253 164 175);
+  }
+
+  .dark .text-amber-700,
+  .dark .text-amber-800,
+  .dark .text-amber-900,
+  .dark .text-amber-950 {
+    color: rgb(252 211 77);
+  }
+
+  .dark .bg-sky-50,
+  .dark .bg-sky-100 {
+    background-color: rgb(8 47 73);
+    border-color: rgb(14 116 144);
+  }
+
+  .dark .bg-emerald-50,
+  .dark .bg-emerald-100 {
+    background-color: rgb(6 78 59);
+    border-color: rgb(5 150 105);
+  }
+
+  .dark .bg-rose-50,
+  .dark .bg-rose-100 {
+    background-color: rgb(76 5 25);
+    border-color: rgb(190 18 60);
+  }
+
+  .dark .bg-amber-50,
+  .dark .bg-amber-100 {
+    background-color: rgb(69 26 3);
+    border-color: rgb(180 83 9);
+  }
+
+  .dark .bg-indigo-100 {
+    background-color: rgb(49 46 129);
+  }
+
+  .dark .bg-fuchsia-100 {
+    background-color: rgb(112 26 117);
+  }
+
+  .dark .text-indigo-800,
+  .dark .text-fuchsia-800 {
+    color: rgb(221 214 254);
+  }
+
+  .dark input,
+  .dark textarea,
+  .dark select {
+    background-color: rgb(15 23 42);
+    border-color: rgb(71 85 105);
+    color: rgb(226 232 240);
+  }
+
+  .dark input::placeholder,
+  .dark textarea::placeholder {
+    color: rgb(100 116 139);
+  }
+
+  .dark button:hover,
+  .dark a:hover {
+    text-decoration-color: currentColor;
+  }
+
+  .dark .hover\:bg-slate-50:hover,
+  .dark .hover\:bg-slate-100:hover {
+    background-color: rgb(30 41 59);
+  }
+
+  .dark main thead,
+  .dark .vr-table thead {
+    background-color: rgb(15 23 42);
+    color: rgb(148 163 184);
+  }
+
+  .dark main th,
+  .dark .vr-table th {
+    border-color: rgb(51 65 85);
+  }
+
+  .dark main td,
+  .dark .vr-table td {
+    border-color: rgb(30 41 59);
+  }
+
+  .dark main tbody tr:hover,
+  .dark .vr-table tbody tr:hover {
+    background-color: rgb(15 23 42 / 0.65);
+  }
+
+  .dark .vr-section,
+  .dark .vr-table-wrap {
+    border-color: rgb(51 65 85);
+    background-color: rgb(15 23 42);
+  }
+
+  .dark .vr-input,
+  .dark .vr-chip {
+    border-color: rgb(71 85 105);
+    background-color: rgb(15 23 42);
+    color: rgb(226 232 240);
+  }
+}

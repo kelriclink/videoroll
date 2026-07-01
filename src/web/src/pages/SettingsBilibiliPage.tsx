@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { useConfirm } from "../components/feedbackContext";
 import { fetchJson } from "../lib/http";
 import { BILIBILI_PUBLISHER_URL } from "../lib/urls";
 
@@ -21,6 +22,7 @@ type BilibiliMe = {
 };
 
 export default function SettingsBilibiliPage() {
+  const confirm = useConfirm();
   const [settings, setSettings] = useState<PublishSettings | null>(null);
   const [auth, setAuth] = useState<AuthSettings | null>(null);
   const [metaText, setMetaText] = useState<string>("{}");
@@ -117,7 +119,13 @@ export default function SettingsBilibiliPage() {
             disabled={busy || !auth?.cookie_set}
             className="rounded border border-rose-300 px-3 py-2 text-sm text-rose-700 hover:bg-rose-50 disabled:opacity-50"
             onClick={async () => {
-              if (!confirm("确定清除已保存的 Cookies 吗？")) return;
+              const ok = await confirm({
+                title: "清除 Bilibili Cookies",
+                message: "确定清除已保存的 Cookies 吗？清除后真实投稿不可用。",
+                confirmLabel: "清除",
+                tone: "danger",
+              });
+              if (!ok) return;
               setBusy(true);
               setError(null);
               try {
@@ -221,7 +229,13 @@ export default function SettingsBilibiliPage() {
                 disabled={busy}
                 className="rounded border border-rose-300 px-3 py-2 text-sm text-rose-700 hover:bg-rose-50 disabled:opacity-50"
                 onClick={async () => {
-                  if (!confirm("确定恢复内置默认模板吗？")) return;
+                  const ok = await confirm({
+                    title: "恢复默认模板",
+                    message: "确定恢复内置默认模板吗？当前 default_meta.json 会被覆盖。",
+                    confirmLabel: "恢复默认",
+                    tone: "warning",
+                  });
+                  if (!ok) return;
                   setBusy(true);
                   setError(null);
                   try {

@@ -9,6 +9,7 @@ from typing import Any, Mapping
 import httpx
 
 from videoroll.utils.openai_compat import build_openai_chat_completions_url
+from videoroll.utils.openai_compat import build_openai_embeddings_url
 
 _RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 
@@ -203,3 +204,93 @@ def request_openai_json_object(
             format_retries=format_retries,
             network_retries=network_retries,
         )
+
+
+def request_openai_embedding(
+    *,
+    config: OpenAIChatConfig,
+    text: str,
+    client: httpx.Client | None = None,
+    network_retries: int = 3,
+) -> list[float]:
+    if not config.api_key:
+        raise RuntimeError("OpenAI API key is not set")
+
+    source = str(text or "").strip()
+    if not source:
+        raise ValueError("embedding text is empty")
+
+    url = build_openai_embeddings_url(config.base_url)
+    headers = {"Authorization": f"Bearer {config.api_key}"}
+    req = {"model": config.model, "input": source}
+    attempts_network = max(1, int(network_retries))
+    last_err: Exception | None = None
+
+    def _with_client(c: httpx.Client) -> list[float]:
+        nonlocal last_err
+        for net_attempt in range(attempts_network):
+            try:
+                resp = c.post(url, headers=headers, json=req)
+                try:
+                    resp.raise_for_status()
+                except httpx.HTTPStatusError as e:
+                    status = resp.status_code
+                    if status in _RETRYABLE_STATUS_CODES and net_attempt < attempts_network - 1:
+                        retry_after = (resp.headers.get("retry-after") or "").strip()
+                        if retry_after:
+                            try:
+                                time.sleep(min(30.0, float(retry_after)))
+                            except Exception:
+                                _sleep_backoff(net_attempt)
+                        else:
+                            _sleep_backoff(net_attempt)
+                        continue
+
+                    ct = (resp.headers.get("content-type") or "").split(";")[0].strip()
+                    snippet = _resp_snippet(resp)
+                    raise RuntimeError(
+                        f"OpenAI embedding request failed (status={resp.status_code}, content-type={ct}, url={url}). {snippet}"
+                    ) from e
+
+                try:
+                    resp_json = resp.json()
+                except Exception as e:
+                    ct = (resp.headers.get("content-type") or "").split(";")[0].strip()
+                    hint = " (check openai_base_url; most providers require it to end with /v1)" if "text/html" in ct else ""
+                    raise RuntimeError(
+                        f"OpenAI embedding endpoint did not return JSON (status={resp.status_code}, content-type={ct}, url={url}){hint}."
+                    ) from e
+
+                try:
+                    raw = resp_json["data"][0]["embedding"]
+                except Exception as e:
+                    raise RuntimeError(f"unexpected OpenAI embedding response shape: {resp_json}") from e
+
+                if not isinstance(raw, list) or not raw:
+                    raise RuntimeError("OpenAI embedding output is empty")
+                return [float(x) for x in raw]
+            except httpx.TimeoutException as e:
+                last_err = e
+                if net_attempt < attempts_network - 1:
+                    _sleep_backoff(net_attempt)
+                    continue
+                break
+            except httpx.TransportError as e:
+                last_err = e
+                if net_attempt < attempts_network - 1:
+                    _sleep_backoff(net_attempt)
+                    continue
+                break
+            except Exception as e:
+                last_err = e
+                break
+
+        if last_err is not None:
+            raise last_err
+        raise RuntimeError("OpenAI embedding request failed")
+
+    if client is not None:
+        return _with_client(client)
+
+    with create_openai_http_client(config.timeout_seconds) as owned_client:
+        return _with_client(owned_client)

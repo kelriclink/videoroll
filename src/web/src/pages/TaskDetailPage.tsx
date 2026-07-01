@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import StatusBadge from "../components/StatusBadge";
+import { useConfirm, useToast } from "../components/feedbackContext";
+import { Button } from "../components/ui";
 import { fetchJson } from "../lib/http";
 import { BILIBILI_PUBLISHER_URL, ORCHESTRATOR_URL, SUBTITLE_SERVICE_URL } from "../lib/urls";
 import { Asset, PublishJob, SubtitleJob, Task } from "../lib/types";
@@ -66,6 +68,8 @@ type PublishReview = {
   checked_at?: string | null;
 };
 
+type TaskDetailTab = "overview" | "media" | "subtitle" | "publish" | "logs";
+
 function normalizeYouTubeSubtitleMode(value: unknown, legacyPrefer?: boolean | null): YouTubeSubtitleMode {
   const mode = String(value ?? "").trim().toLowerCase();
   if (mode === "off" || mode === "target" || mode === "auto_source") return mode;
@@ -75,6 +79,9 @@ function normalizeYouTubeSubtitleMode(value: unknown, legacyPrefer?: boolean | n
 
 export default function TaskDetailPage() {
   const { taskId } = useParams();
+  const toast = useToast();
+  const confirm = useConfirm();
+  const [activeTab, setActiveTab] = useState<TaskDetailTab>("overview");
   const [task, setTask] = useState<Task | null>(null);
   const [assets, setAssets] = useState<Asset[] | null>(null);
   const [subtitleJobs, setSubtitleJobs] = useState<SubtitleJob[] | null>(null);
@@ -388,6 +395,12 @@ export default function TaskDetailPage() {
     if (!Number.isFinite(tid) || tid <= 0) return "";
     return biliTypeOptions.find((o) => o.id === tid)?.label ?? String(tid);
   }, [biliTypeOptions, publishTypeid]);
+  const failedSubtitleJobs = useMemo(() => (subtitleJobs ?? []).filter((j) => j.status === "failed").length, [subtitleJobs]);
+  const runningSubtitleJobs = useMemo(
+    () => (subtitleJobs ?? []).filter((j) => j.status === "queued" || j.status === "running").length,
+    [subtitleJobs],
+  );
+  const failedPublishJobs = useMemo(() => (publishJobs ?? []).filter((j) => j.state === "failed").length, [publishJobs]);
 
   async function loadBilibiliTypes() {
     setBiliTypesBusy(true);
@@ -469,7 +482,7 @@ export default function TaskDetailPage() {
         }),
       });
       await refresh();
-      alert(`Publish state=${resp.state} bvid=${resp.bvid ?? "-"}`);
+      toast({ kind: "success", title: "投稿任务已提交", message: `state=${resp.state} bvid=${resp.bvid ?? "-"}` });
     } catch (e: unknown) {
       try {
         await refresh({ silent: true });
@@ -555,7 +568,7 @@ export default function TaskDetailPage() {
         });
       }
       await refresh();
-      alert(`${opts.resume ? "已继续字幕任务" : "已提交字幕任务"}：${resp.job_id}`);
+      toast({ kind: "success", title: opts.resume ? "已继续字幕任务" : "已提交字幕任务", message: resp.job_id });
     } catch (e: unknown) {
       try {
         await refresh({ silent: true });
@@ -691,17 +704,25 @@ export default function TaskDetailPage() {
 
   if (!taskId) return null;
 
+  const tabs: Array<{ id: TaskDetailTab; label: string; badge?: string | number | null }> = [
+    { id: "overview", label: "Overview" },
+    { id: "media", label: "Media & Assets", badge: assets?.length ?? null },
+    { id: "subtitle", label: "Subtitle / Render", badge: runningSubtitleJobs || failedSubtitleJobs || null },
+    { id: "publish", label: "Publish", badge: publishJobs?.length ?? null },
+    { id: "logs", label: "Logs", badge: logAssets.length || null },
+  ];
+
   return (
     <div className="space-y-4">
-      <div className="rounded border bg-white p-4">
+      <div className="vr-section">
         <div className="flex items-start justify-between gap-3">
           <div>
             <div className="text-lg font-semibold">Task Detail</div>
             <div className="mt-1 font-mono text-xs text-slate-600">{taskId}</div>
           </div>
-          <button onClick={() => refresh()} className="rounded border px-3 py-2 text-sm hover:bg-slate-50">
+          <Button onClick={() => refresh()}>
             刷新
-          </button>
+          </Button>
         </div>
 
         {error ? <div className="mt-3 whitespace-pre-wrap break-words text-sm text-rose-700">{error}</div> : null}
@@ -729,8 +750,91 @@ export default function TaskDetailPage() {
             <div className="mt-1 whitespace-pre-wrap break-words">{task.error_message}</div>
           </div>
         ) : null}
+
+        <div className="mt-4 flex gap-1 overflow-x-auto border-b border-slate-200">
+          {tabs.map((tab) => {
+            const active = activeTab === tab.id;
+            return (
+              <button
+                key={tab.id}
+                type="button"
+                onClick={() => setActiveTab(tab.id)}
+                className={[
+                  "mb-[-1px] inline-flex shrink-0 items-center gap-2 border-b-2 px-3 py-2 text-sm",
+                  active
+                    ? "border-slate-900 text-slate-950"
+                    : "border-transparent text-slate-600 hover:border-slate-300 hover:text-slate-950",
+                ].join(" ")}
+              >
+                {tab.label}
+                {tab.badge ? <span className="rounded-md bg-slate-100 px-1.5 py-0.5 text-[11px] text-slate-600">{tab.badge}</span> : null}
+              </button>
+            );
+          })}
+        </div>
       </div>
 
+      {activeTab === "overview" ? (
+        <div className="grid gap-4 lg:grid-cols-2">
+          <div className="vr-section">
+            <div className="text-sm font-semibold">Workflow</div>
+            <div className="mt-3 grid grid-cols-2 gap-2">
+              <button type="button" onClick={() => setActiveTab("media")} className="rounded-md border border-slate-200 p-3 text-left hover:bg-slate-50">
+                <div className="text-xs text-slate-500">Assets</div>
+                <div className="mt-1 text-xl font-semibold text-slate-950">{assets?.length ?? "-"}</div>
+              </button>
+              <button type="button" onClick={() => setActiveTab("subtitle")} className="rounded-md border border-slate-200 p-3 text-left hover:bg-slate-50">
+                <div className="text-xs text-slate-500">Subtitle Jobs</div>
+                <div className="mt-1 text-xl font-semibold text-slate-950">{subtitleJobs?.length ?? "-"}</div>
+              </button>
+              <button type="button" onClick={() => setActiveTab("publish")} className="rounded-md border border-slate-200 p-3 text-left hover:bg-slate-50">
+                <div className="text-xs text-slate-500">Publish Jobs</div>
+                <div className="mt-1 text-xl font-semibold text-slate-950">{publishJobs?.length ?? "-"}</div>
+              </button>
+              <button type="button" onClick={() => setActiveTab("logs")} className="rounded-md border border-slate-200 p-3 text-left hover:bg-slate-50">
+                <div className="text-xs text-slate-500">Logs</div>
+                <div className="mt-1 text-xl font-semibold text-slate-950">{logAssets.length}</div>
+              </button>
+            </div>
+            <div className="mt-3 flex flex-wrap gap-2">
+              <Button type="button" tone="primary" onClick={() => setActiveTab(rawAsset ? "subtitle" : "media")}>
+                {rawAsset || !isYouTubeTask ? "处理字幕" : "获取视频"}
+              </Button>
+              <Button type="button" onClick={() => setActiveTab("publish")}>
+                投稿设置
+              </Button>
+              <Button type="button" onClick={() => setActiveTab("logs")}>
+                查看日志
+              </Button>
+            </div>
+          </div>
+
+          <div className="vr-section">
+            <div className="text-sm font-semibold">Latest State</div>
+            <div className="mt-3 space-y-3 text-sm">
+              <div className="flex items-center justify-between gap-3">
+                <span className="text-slate-500">最终视频</span>
+                <span className="font-medium text-slate-950">{finalAssets.length}</span>
+              </div>
+              <div className="flex items-center justify-between gap-3">
+                <span className="text-slate-500">字幕运行 / 失败</span>
+                <span className="font-medium text-slate-950">{runningSubtitleJobs} / {failedSubtitleJobs}</span>
+              </div>
+              <div className="flex items-center justify-between gap-3">
+                <span className="text-slate-500">投稿失败</span>
+                <span className={failedPublishJobs ? "font-medium text-rose-700" : "font-medium text-slate-950"}>{failedPublishJobs}</span>
+              </div>
+              <div className="flex items-center justify-between gap-3">
+                <span className="text-slate-500">更新时间</span>
+                <span className="font-medium text-slate-950">{task ? new Date(task.updated_at).toLocaleString() : "-"}</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {activeTab === "media" ? (
+      <>
       <div className="rounded border bg-white p-4">
         <div className="text-sm font-semibold">Upload / Raw Video</div>
         <div className="mt-2 text-xs text-slate-500">已上传：{rawAsset ? rawAsset.storage_key : "无"}</div>
@@ -803,6 +907,94 @@ export default function TaskDetailPage() {
         </div>
       </div>
 
+      <div className="rounded border bg-white p-4">
+        <div className="text-sm font-semibold">Assets</div>
+        {!assets ? <div className="mt-2 text-sm text-slate-500">加载中…</div> : null}
+        {assets ? (
+          <div className="mt-2 overflow-auto">
+            <table className="min-w-full text-left text-sm">
+              <thead className="text-xs text-slate-500">
+                <tr>
+                  <th className="py-2 pr-3">Kind</th>
+                  <th className="py-2 pr-3">Key</th>
+                  <th className="py-2 pr-3">Created</th>
+                  <th className="py-2 pr-3">Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {assets.map((a) => (
+                  <tr key={a.id} className="border-t">
+                    <td className="py-2 pr-3 text-xs">{a.kind}</td>
+                    <td className="py-2 pr-3 font-mono text-xs">{a.storage_key}</td>
+                    <td className="py-2 pr-3 text-xs text-slate-600">{new Date(a.created_at).toLocaleString()}</td>
+                    <td className="py-2 pr-3">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <a
+                          className="rounded border px-2 py-1 text-xs hover:bg-slate-50"
+                          href={`${ORCHESTRATOR_URL}/tasks/${taskId}/assets/${a.id}/download`}
+                          target="_blank"
+                          rel="noreferrer"
+                        >
+                          Download
+                        </a>
+                        {a.kind === "video_final" ? (
+                          <button
+                            disabled={busy}
+                            className="rounded border border-rose-300 px-2 py-1 text-xs text-rose-700 hover:bg-rose-50 disabled:opacity-50"
+                            onClick={async () => {
+                              const ok = await confirm({
+                                title: "删除最终视频资产",
+                                message: "确定删除该最终视频资产？这会从存储中删除文件。",
+                                confirmLabel: "删除",
+                                tone: "danger",
+                              });
+                              if (!ok) return;
+                              setBusy(true);
+                              setError(null);
+                              try {
+                                await fetchJson(`${ORCHESTRATOR_URL}/tasks/${taskId}/assets/${a.id}`, { method: "DELETE" });
+                                await refresh();
+                              } catch (e: unknown) {
+                                setError(e instanceof Error ? e.message : String(e));
+                              } finally {
+                                setBusy(false);
+                              }
+                            }}
+                          >
+                            Delete
+                          </button>
+                        ) : null}
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        ) : null}
+        {finalAssets.length > 0 ? (
+          <div className="mt-3 rounded border bg-slate-50 p-3 text-xs text-slate-700">
+            <div className="font-semibold text-slate-700">最终视频</div>
+            <div className="mt-2 flex flex-wrap gap-2">
+              {finalAssets.map((a) => (
+                <a
+                  key={a.id}
+                  className="rounded bg-slate-900 px-2 py-1 text-xs text-white hover:bg-slate-800"
+                  href={`${ORCHESTRATOR_URL}/tasks/${taskId}/assets/${a.id}/download`}
+                  target="_blank"
+                  rel="noreferrer"
+                >
+                  下载：{a.storage_key.split("/").slice(-1)[0]}
+                </a>
+              ))}
+            </div>
+          </div>
+        ) : null}
+      </div>
+      </>
+      ) : null}
+
+      {activeTab === "subtitle" ? (
       <div className="rounded border bg-white p-4">
         <div className="text-sm font-semibold">Subtitle</div>
         <div className="mt-3 grid gap-3 md:grid-cols-2">
@@ -1070,7 +1262,9 @@ export default function TaskDetailPage() {
           ) : null}
         </div>
       </div>
+      ) : null}
 
+      {activeTab === "logs" ? (
       <div className="rounded border bg-white p-4">
         <div className="flex items-center justify-between gap-3">
           <div className="text-sm font-semibold">Logs</div>
@@ -1100,86 +1294,9 @@ export default function TaskDetailPage() {
           className="mt-2 h-72 w-full rounded border bg-slate-50 p-2 font-mono text-xs text-slate-800"
         />
       </div>
+      ) : null}
 
-      <div className="rounded border bg-white p-4">
-        <div className="text-sm font-semibold">Assets</div>
-        {!assets ? <div className="mt-2 text-sm text-slate-500">加载中…</div> : null}
-        {assets ? (
-          <div className="mt-2 overflow-auto">
-            <table className="min-w-full text-left text-sm">
-              <thead className="text-xs text-slate-500">
-                <tr>
-                  <th className="py-2 pr-3">Kind</th>
-                  <th className="py-2 pr-3">Key</th>
-                  <th className="py-2 pr-3">Created</th>
-                  <th className="py-2 pr-3">Actions</th>
-                </tr>
-              </thead>
-              <tbody>
-                {assets.map((a) => (
-                  <tr key={a.id} className="border-t">
-                    <td className="py-2 pr-3 text-xs">{a.kind}</td>
-                    <td className="py-2 pr-3 font-mono text-xs">{a.storage_key}</td>
-                    <td className="py-2 pr-3 text-xs text-slate-600">{new Date(a.created_at).toLocaleString()}</td>
-                    <td className="py-2 pr-3">
-                      <div className="flex flex-wrap items-center gap-2">
-                        <a
-                          className="rounded border px-2 py-1 text-xs hover:bg-slate-50"
-                          href={`${ORCHESTRATOR_URL}/tasks/${taskId}/assets/${a.id}/download`}
-                          target="_blank"
-                          rel="noreferrer"
-                        >
-                          Download
-                        </a>
-                        {a.kind === "video_final" ? (
-                          <button
-                            disabled={busy}
-                            className="rounded border border-rose-300 px-2 py-1 text-xs text-rose-700 hover:bg-rose-50 disabled:opacity-50"
-                            onClick={async () => {
-                              if (!confirm("确定删除该最终视频资产？（会从存储中删除）")) return;
-                              setBusy(true);
-                              setError(null);
-                              try {
-                                await fetchJson(`${ORCHESTRATOR_URL}/tasks/${taskId}/assets/${a.id}`, { method: "DELETE" });
-                                await refresh();
-                              } catch (e: unknown) {
-                                setError(e instanceof Error ? e.message : String(e));
-                              } finally {
-                                setBusy(false);
-                              }
-                            }}
-                          >
-                            Delete
-                          </button>
-                        ) : null}
-                      </div>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        ) : null}
-        {finalAssets.length > 0 ? (
-          <div className="mt-3 rounded border bg-slate-50 p-3 text-xs text-slate-700">
-            <div className="font-semibold text-slate-700">最终视频</div>
-            <div className="mt-2 flex flex-wrap gap-2">
-              {finalAssets.map((a) => (
-                <a
-                  key={a.id}
-                  className="rounded bg-slate-900 px-2 py-1 text-xs text-white hover:bg-slate-800"
-                  href={`${ORCHESTRATOR_URL}/tasks/${taskId}/assets/${a.id}/download`}
-                  target="_blank"
-                  rel="noreferrer"
-                >
-                  下载：{a.storage_key.split("/").slice(-1)[0]}
-                </a>
-              ))}
-            </div>
-          </div>
-        ) : null}
-      </div>
-
+      {activeTab === "publish" ? (
       <div className="rounded border bg-white p-4">
         <div className="text-sm font-semibold">Publish（Bilibili）</div>
         <div className="mt-2 text-xs text-slate-500">
@@ -1438,7 +1555,7 @@ export default function TaskDetailPage() {
                     const meta = JSON.parse(publishMetaText);
                     if (!meta || typeof meta !== "object" || Array.isArray(meta)) throw new Error("meta must be a JSON object");
                     await savePublishMetaFile(meta);
-                    alert("已保存到 publish_meta.json");
+                    toast({ kind: "success", title: "已保存", message: "publish_meta.json 已更新。" });
                   } catch (e: unknown) {
                     setError(e instanceof Error ? e.message : String(e));
                   } finally {
@@ -1536,6 +1653,7 @@ export default function TaskDetailPage() {
           ) : null}
         </div>
       </div>
+      ) : null}
     </div>
   );
 }

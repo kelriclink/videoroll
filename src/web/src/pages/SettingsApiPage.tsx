@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import { useConfirm } from "../components/feedbackContext";
 import { fetchJson } from "../lib/http";
 import { ORCHESTRATOR_URL } from "../lib/urls";
 
@@ -30,6 +31,7 @@ function orchestratorBaseUrl(): string {
 }
 
 export default function SettingsApiPage() {
+  const confirm = useConfirm();
   const [settings, setSettings] = useState<RemoteApiSettings | null>(null);
   const [tokenInput, setTokenInput] = useState("");
   const [error, setError] = useState<string | null>(null);
@@ -148,7 +150,13 @@ export default function SettingsApiPage() {
             disabled={busy || !settings?.token_set}
             className="rounded border px-3 py-2 text-sm hover:bg-slate-50 disabled:opacity-50"
             onClick={async () => {
-              if (!window.confirm("确认清空远程管理 token？清空后外部将无法再调用该接口。")) return;
+              const ok = await confirm({
+                title: "清空远程管理 token",
+                message: "清空后外部将无法再调用该接口。",
+                confirmLabel: "清空",
+                tone: "danger",
+              });
+              if (!ok) return;
               setBusy(true);
               setError(null);
               try {

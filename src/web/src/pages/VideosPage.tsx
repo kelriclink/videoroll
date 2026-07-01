@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import StatusBadge from "../components/StatusBadge";
+import { useConfirm, useToast } from "../components/feedbackContext";
+import { Button, PageHeader } from "../components/ui";
 import { fetchJson } from "../lib/http";
 import { ORCHESTRATOR_URL } from "../lib/urls";
 import { Asset, Task } from "../lib/types";
@@ -62,6 +64,8 @@ function formatWorkdirSummary(result: WorkdirMaintenance, mode: "scan" | "cleanu
 }
 
 export default function VideosPage() {
+  const confirm = useConfirm();
+  const toast = useToast();
   const [items, setItems] = useState<ConvertedVideoItem[] | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -110,19 +114,16 @@ export default function VideosPage() {
 
   return (
     <div className="space-y-4">
-      <div className="rounded border bg-white p-4">
-        <div className="flex items-center justify-between gap-3">
-          <div>
-            <div className="text-lg font-semibold">Videos</div>
-            <div className="text-sm text-slate-600">已经转换完成（存在 video_final）的任务列表</div>
-          </div>
-          <div className="flex items-center gap-2">
-            <button onClick={() => refresh()} className="rounded border px-3 py-2 text-sm hover:bg-slate-50">
+      <PageHeader
+        title="Videos"
+        description="已经转换完成（存在 video_final）的任务列表"
+        actions={
+          <>
+            <Button onClick={() => refresh()}>
               刷新
-            </button>
-            <button
+            </Button>
+            <Button
               disabled={busy}
-              className="rounded border px-3 py-2 text-sm hover:bg-slate-50 disabled:opacity-50"
               onClick={async () => {
                 setBusy(true);
                 setError(null);
@@ -138,12 +139,18 @@ export default function VideosPage() {
               }}
             >
               扫描临时目录
-            </button>
-            <button
+            </Button>
+            <Button
               disabled={busy}
-              className="rounded border border-amber-300 px-3 py-2 text-sm text-amber-800 hover:bg-amber-50 disabled:opacity-50"
+              tone="warning"
               onClick={async () => {
-                if (!confirm("确定清理可安全回收的临时目录吗？不会删除运行中的任务目录。")) return;
+                const ok = await confirm({
+                  title: "清理临时目录",
+                  message: "确定清理可安全回收的临时目录吗？不会删除运行中的任务目录。",
+                  confirmLabel: "清理",
+                  tone: "warning",
+                });
+                if (!ok) return;
                 setBusy(true);
                 setError(null);
                 setMaintenanceSummary(null);
@@ -160,7 +167,7 @@ export default function VideosPage() {
               }}
             >
               清理临时目录
-            </button>
+            </Button>
             <label className="flex items-center gap-2 rounded border px-3 py-2 text-sm text-slate-700 hover:bg-slate-50">
               <input
                 ref={selectAllRef}
@@ -177,12 +184,18 @@ export default function VideosPage() {
               />
               全选
             </label>
-            <button
+            <Button
               disabled={busy || selectedCount === 0}
-              className="rounded border border-rose-300 px-3 py-2 text-sm text-rose-700 hover:bg-rose-50 disabled:opacity-50"
+              tone="danger"
               onClick={async () => {
                 if (!items || selectedCount === 0) return;
-                if (!confirm(`确定删除选中的 ${selectedCount} 个最终视频（video_final）吗？`)) return;
+                const ok = await confirm({
+                  title: "删除最终视频",
+                  message: `确定删除选中的 ${selectedCount} 个最终视频（video_final）吗？`,
+                  confirmLabel: "删除",
+                  tone: "danger",
+                });
+                if (!ok) return;
                 setBusy(true);
                 setError(null);
                 setDeleteSummary(null);
@@ -206,6 +219,11 @@ export default function VideosPage() {
                     results,
                   );
                   setDeleteSummary(formatBulkDeleteSummary(summary));
+                  toast({
+                    kind: summary.failureCount === 0 ? "success" : "warning",
+                    title: "删除操作完成",
+                    message: formatBulkDeleteSummary(summary),
+                  });
                   setSelected(new Set(summary.failures.map((failure) => failure.assetId)));
                   await refresh();
                 } catch (e: unknown) {
@@ -216,12 +234,14 @@ export default function VideosPage() {
               }}
             >
               删除选中{selectedCount ? ` (${selectedCount})` : ""}
-            </button>
-            <Link to="/tasks/new" className="rounded bg-slate-900 px-3 py-2 text-sm text-white hover:bg-slate-800">
+            </Button>
+            <Link to="/tasks/new" className="rounded-md bg-slate-900 px-3 py-2 text-sm text-white hover:bg-slate-800">
               新建任务
             </Link>
-          </div>
-        </div>
+          </>
+        }
+      />
+      <div className="vr-section">
         {error ? <div className="mt-3 text-sm text-rose-700">{error}</div> : null}
         {deleteSummary ? <div className="mt-3 text-sm text-slate-700">{deleteSummary}</div> : null}
         {maintenanceSummary ? <div className="mt-3 text-sm text-slate-700">{maintenanceSummary}</div> : null}
@@ -230,7 +250,7 @@ export default function VideosPage() {
       <div className="rounded border bg-white p-4">
         {!items ? <div className="text-sm text-slate-500">加载中…</div> : null}
         {items ? (
-          <div className="overflow-auto">
+          <div className="overflow-auto rounded-md border border-slate-200">
             <table className="min-w-full text-left text-sm">
               <thead className="text-xs text-slate-500">
                 <tr>
@@ -310,7 +330,13 @@ export default function VideosPage() {
                           disabled={busy}
                           className="rounded border border-rose-300 px-2 py-1 text-xs text-rose-700 hover:bg-rose-50 disabled:opacity-50"
                           onClick={async () => {
-                            if (!confirm("确定删除这个最终视频（video_final）吗？")) return;
+                            const ok = await confirm({
+                              title: "删除最终视频",
+                              message: "确定删除这个最终视频（video_final）吗？",
+                              confirmLabel: "删除",
+                              tone: "danger",
+                            });
+                            if (!ok) return;
                             setBusy(true);
                             setError(null);
                             setDeleteSummary(null);

@@ -16,6 +16,7 @@ import httpx
 from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import ProgrammingError
 
 from videoroll.ai.client import openai_chat_config_from_settings
 from videoroll.ai.service import translate_text_openai
@@ -42,6 +43,17 @@ from videoroll.apps.subtitle_service.schemas import (
     WhisperSettingsRead,
     ModelDownloadProxyTestRequest,
     ModelDownloadProxyTestResponse,
+    KnowledgeItemRead,
+    KnowledgeEmbeddingRebuildRequest,
+    KnowledgeEmbeddingRebuildResponse,
+    KnowledgeItemUpsertRequest,
+    KnowledgeItemUpsertResponse,
+    AgentRunRead,
+    EmbeddingModelDownloadRequest,
+    EmbeddingModelListRequest,
+    EmbeddingModelInfo,
+    EmbeddingTestRequest,
+    EmbeddingTestResponse,
     TaskQueueItemRead,
     TaskQueueRead,
     TaskQueueSettingsRead,
@@ -55,6 +67,22 @@ from videoroll.apps.subtitle_service.model_downloads import (
     normalize_model_download_engine,
 )
 from videoroll.apps.subtitle_service.render_queue_store import get_task_queue_settings, update_task_queue_settings
+from videoroll.apps.subtitle_service.embeddings import (
+    assert_embedding_dimensions,
+    delete_local_embedding_model,
+    download_local_embedding_model,
+    embedding_settings_from_translate_settings,
+    embed_text,
+    list_local_embedding_models,
+)
+from videoroll.apps.subtitle_service.rag import (
+    build_knowledge_embedding_text,
+    list_agent_runs,
+    rebuild_knowledge_embeddings,
+    list_knowledge_items,
+    rag_settings_from_translate_settings,
+    upsert_knowledge_item,
+)
 from videoroll.apps.subtitle_service.translate_settings_store import get_translate_settings, update_translate_settings
 from videoroll.apps.subtitle_service.worker_concurrency import sync_subtitle_worker_concurrency_for_task_queue_settings
 from videoroll.apps.subtitle_service.worker import TASK_QUEUE_LOCK_OWNER, celery_app
@@ -76,6 +104,59 @@ def get_db(settings: SubtitleServiceSettings = Depends(get_settings)) -> Generat
 
 def _models_dir(settings: SubtitleServiceSettings) -> Path:
     return Path(settings.whisper_model_dir)
+
+
+def _embedding_models_dir(settings: SubtitleServiceSettings) -> Path:
+    return Path(settings.rag_embedding_model_dir)
+
+
+def _embedding_models_dir_from_translate_settings(cfg: dict[str, Any], settings: SubtitleServiceSettings) -> Path:
+    path = str(cfg.get("rag_embedding_model_dir") or "").strip()
+    if path:
+        return Path(path)
+    return _embedding_models_dir(settings)
+
+
+def _is_missing_knowledge_table_error(exc: Exception) -> bool:
+    orig = getattr(exc, "orig", None)
+    sqlstate = getattr(orig, "sqlstate", None) or getattr(orig, "pgcode", None)
+    if sqlstate == "42P01":  # PostgreSQL undefined_table
+        return True
+    msg = str(exc).lower()
+    return (
+        "does not exist" in msg
+        and any(
+            table in msg
+            for table in [
+                "translation_knowledge_items",
+                "translation_term_evidence",
+                "translation_term_matches",
+                "translation_agent_runs",
+            ]
+        )
+    )
+
+
+def _ensure_rag_schema(settings: SubtitleServiceSettings) -> None:
+    try:
+        auto_migrate(settings.database_url, force=True)
+    except Exception as e:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "RAG knowledge tables are not ready. Ensure PostgreSQL has pgvector installed "
+                f"and restart the app. Migration error: {e}"
+            ),
+        ) from e
+
+
+def _handle_knowledge_db_error(exc: Exception, settings: SubtitleServiceSettings) -> None:
+    if _is_missing_knowledge_table_error(exc):
+        _ensure_rag_schema(settings)
+        return
+    if isinstance(exc, ProgrammingError):
+        raise HTTPException(status_code=503, detail=f"RAG database schema is not ready: {exc}") from exc
+    raise HTTPException(status_code=500, detail=f"knowledge database error: {exc}") from exc
 
 
 _SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
@@ -254,6 +335,19 @@ def get_translate_settings_view(
         openai_model=cfg["openai_model"],
         openai_temperature=cfg["openai_temperature"],
         openai_timeout_seconds=cfg["openai_timeout_seconds"],
+        rag_enabled=cfg["rag_enabled"],
+        rag_top_k=cfg["rag_top_k"],
+        rag_min_score=cfg["rag_min_score"],
+        rag_embedding_provider=cfg["rag_embedding_provider"],
+        rag_embedding_model=cfg["rag_embedding_model"],
+        rag_embedding_dimensions=cfg["rag_embedding_dimensions"],
+        rag_embedding_model_dir=cfg["rag_embedding_model_dir"],
+        rag_embedding_device=cfg["rag_embedding_device"],
+        rag_auto_discover_terms=cfg["rag_auto_discover_terms"],
+        rag_auto_learn_terms=cfg["rag_auto_learn_terms"],
+        rag_search_enabled=cfg["rag_search_enabled"],
+        rag_search_url=cfg["rag_search_url"],
+        rag_domain=cfg["rag_domain"],
     )
 
 
@@ -276,6 +370,273 @@ def put_translate_settings_view(
         openai_model=cfg["openai_model"],
         openai_temperature=cfg["openai_temperature"],
         openai_timeout_seconds=cfg["openai_timeout_seconds"],
+        rag_enabled=cfg["rag_enabled"],
+        rag_top_k=cfg["rag_top_k"],
+        rag_min_score=cfg["rag_min_score"],
+        rag_embedding_provider=cfg["rag_embedding_provider"],
+        rag_embedding_model=cfg["rag_embedding_model"],
+        rag_embedding_dimensions=cfg["rag_embedding_dimensions"],
+        rag_embedding_model_dir=cfg["rag_embedding_model_dir"],
+        rag_embedding_device=cfg["rag_embedding_device"],
+        rag_auto_discover_terms=cfg["rag_auto_discover_terms"],
+        rag_auto_learn_terms=cfg["rag_auto_learn_terms"],
+        rag_search_enabled=cfg["rag_search_enabled"],
+        rag_search_url=cfg["rag_search_url"],
+        rag_domain=cfg["rag_domain"],
+    )
+
+
+@app.get("/subtitle/knowledge/items", response_model=list[KnowledgeItemRead])
+def list_knowledge_items_view(
+    item_type: str | None = None,
+    status: str | None = None,
+    limit: int = 100,
+    settings: SubtitleServiceSettings = Depends(get_settings),
+    db: Session = Depends(get_db),
+) -> list[KnowledgeItemRead]:
+    try:
+        rows = list_knowledge_items(db, item_type=item_type, status=status, limit=limit)
+    except Exception as e:
+        db.rollback()
+        if not _is_missing_knowledge_table_error(e):
+            _handle_knowledge_db_error(e, settings)
+        _ensure_rag_schema(settings)
+        try:
+            rows = list_knowledge_items(db, item_type=item_type, status=status, limit=limit)
+        except Exception as retry_error:
+            db.rollback()
+            raise HTTPException(status_code=503, detail=f"RAG knowledge tables are not ready: {retry_error}") from retry_error
+    return [KnowledgeItemRead(**row) for row in rows]
+
+
+@app.post("/subtitle/knowledge/items", response_model=KnowledgeItemUpsertResponse)
+def upsert_knowledge_item_view(
+    payload: KnowledgeItemUpsertRequest,
+    settings: SubtitleServiceSettings = Depends(get_settings),
+    db: Session = Depends(get_db),
+) -> KnowledgeItemUpsertResponse:
+    cfg = get_translate_settings(db, settings)
+    rag_cfg = rag_settings_from_translate_settings(cfg)
+
+    if payload.item_type == "term" and not payload.term.strip():
+        raise HTTPException(status_code=400, detail="term is required for term items")
+    if payload.item_type == "term" and not payload.translation.strip():
+        raise HTTPException(status_code=400, detail="translation is required for term items")
+    if payload.item_type == "document" and not (payload.title.strip() or payload.content.strip()):
+        raise HTTPException(status_code=400, detail="title or content is required for document items")
+
+    embedding_text = build_knowledge_embedding_text(
+        item_type=payload.item_type,
+        term=payload.term,
+        translation=payload.translation,
+        domain=payload.domain,
+        aliases=payload.aliases,
+        title=payload.title,
+        content=payload.content,
+        description=payload.description,
+    )
+
+    embedding: list[float] | None = None
+    if embedding_text.strip():
+        try:
+            embedding = embed_text(embedding_text, settings=embedding_settings_from_translate_settings(cfg))
+            assert_embedding_dimensions(embedding, rag_cfg.embedding_dimensions)
+        except Exception as e:
+            if payload.item_type == "document":
+                raise HTTPException(status_code=502, detail=f"embedding failed: {e}") from e
+            embedding = None
+
+    def _save_item() -> str:
+        item_id = upsert_knowledge_item(
+            db,
+            item_type=payload.item_type,
+            target_lang=payload.target_lang,
+            term=payload.term,
+            translation=payload.translation,
+            domain=payload.domain,
+            aliases=payload.aliases,
+            title=payload.title,
+            content=payload.content,
+            description=payload.description,
+            sources=payload.sources,
+            confidence=payload.confidence,
+            status=payload.status,
+            created_by=payload.created_by,
+            embedding=embedding,
+            embedding_model=f"{rag_cfg.embedding_provider}:{rag_cfg.embedding_model}" if embedding else "",
+        )
+        db.commit()
+        return item_id
+
+    try:
+        item_id = _save_item()
+    except Exception as e:
+        db.rollback()
+        if not _is_missing_knowledge_table_error(e):
+            raise HTTPException(status_code=500, detail=f"knowledge item save failed: {e}") from e
+        _ensure_rag_schema(settings)
+        try:
+            item_id = _save_item()
+        except Exception as retry_error:
+            db.rollback()
+            raise HTTPException(status_code=503, detail=f"knowledge item save failed after schema migration: {retry_error}") from retry_error
+
+    return KnowledgeItemUpsertResponse(id=uuid.UUID(item_id))
+
+
+@app.post("/subtitle/knowledge/rebuild-embeddings", response_model=KnowledgeEmbeddingRebuildResponse)
+def rebuild_knowledge_embeddings_view(
+    payload: KnowledgeEmbeddingRebuildRequest,
+    settings: SubtitleServiceSettings = Depends(get_settings),
+    db: Session = Depends(get_db),
+) -> KnowledgeEmbeddingRebuildResponse:
+    cfg = get_translate_settings(db, settings)
+    rag_cfg = rag_settings_from_translate_settings(cfg)
+    emb_cfg = embedding_settings_from_translate_settings(cfg)
+    def _rebuild() -> dict[str, Any]:
+        result = rebuild_knowledge_embeddings(
+            db,
+            rag_settings=rag_cfg,
+            embedding_settings=emb_cfg,
+            item_type=payload.item_type,
+            status=payload.status,
+            limit=payload.limit,
+        )
+        db.commit()
+        return result
+
+    try:
+        result = _rebuild()
+    except Exception as e:
+        db.rollback()
+        if not _is_missing_knowledge_table_error(e):
+            raise HTTPException(status_code=502, detail=f"knowledge embedding rebuild failed: {e}") from e
+        _ensure_rag_schema(settings)
+        try:
+            result = _rebuild()
+        except Exception as retry_error:
+            db.rollback()
+            raise HTTPException(status_code=503, detail=f"knowledge embedding rebuild failed after schema migration: {retry_error}") from retry_error
+    return KnowledgeEmbeddingRebuildResponse(**result)
+
+
+@app.get("/subtitle/agents/runs", response_model=list[AgentRunRead])
+def list_agent_runs_view(
+    status: str | None = None,
+    limit: int = 30,
+    settings: SubtitleServiceSettings = Depends(get_settings),
+    db: Session = Depends(get_db),
+) -> list[AgentRunRead]:
+    try:
+        rows = list_agent_runs(db, status=status, limit=limit)
+    except Exception as e:
+        db.rollback()
+        if not _is_missing_knowledge_table_error(e):
+            _handle_knowledge_db_error(e, settings)
+        _ensure_rag_schema(settings)
+        try:
+            rows = list_agent_runs(db, status=status, limit=limit)
+        except Exception as retry_error:
+            db.rollback()
+            raise HTTPException(status_code=503, detail=f"RAG agent tables are not ready: {retry_error}") from retry_error
+    return [AgentRunRead(**row) for row in rows]
+
+
+@app.get("/subtitle/embedding/models", response_model=list[EmbeddingModelInfo])
+def list_embedding_models(
+    settings: SubtitleServiceSettings = Depends(get_settings),
+    db: Session = Depends(get_db),
+) -> list[EmbeddingModelInfo]:
+    cfg = get_translate_settings(db, settings)
+    return [EmbeddingModelInfo(**item) for item in list_local_embedding_models(_embedding_models_dir_from_translate_settings(cfg, settings))]
+
+
+@app.post("/subtitle/embedding/models/list", response_model=list[EmbeddingModelInfo])
+def list_embedding_models_for_dir(
+    payload: EmbeddingModelListRequest,
+    settings: SubtitleServiceSettings = Depends(get_settings),
+    db: Session = Depends(get_db),
+) -> list[EmbeddingModelInfo]:
+    cfg = get_translate_settings(db, settings)
+    if payload.model_dir is not None:
+        cfg["rag_embedding_model_dir"] = payload.model_dir
+    return [EmbeddingModelInfo(**item) for item in list_local_embedding_models(_embedding_models_dir_from_translate_settings(cfg, settings))]
+
+
+@app.post("/subtitle/embedding/models/download", response_model=EmbeddingModelInfo)
+def download_embedding_model(
+    payload: EmbeddingModelDownloadRequest,
+    settings: SubtitleServiceSettings = Depends(get_settings),
+    db: Session = Depends(get_db),
+) -> EmbeddingModelInfo:
+    asr_cfg = get_asr_settings(db, settings)
+    cfg = get_translate_settings(db, settings)
+    if payload.model_dir is not None:
+        cfg["rag_embedding_model_dir"] = payload.model_dir
+    proxy = str(asr_cfg.get("model_download_proxy") or "").strip() or None
+    try:
+        dest = download_local_embedding_model(
+            model=payload.model,
+            model_dir=_embedding_models_dir_from_translate_settings(cfg, settings),
+            name=payload.name,
+            revision=payload.revision,
+            force=payload.force,
+            proxy=proxy,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+    size = sum(p.stat().st_size for p in dest.rglob("*") if p.is_file())
+    return EmbeddingModelInfo(name=dest.name, path=str(dest), size_bytes=size)
+
+
+@app.delete("/subtitle/embedding/models/{name}")
+def delete_embedding_model(
+    name: str,
+    settings: SubtitleServiceSettings = Depends(get_settings),
+    db: Session = Depends(get_db),
+) -> dict[str, bool]:
+    model_name = _validate_model_name(name)
+    cfg = get_translate_settings(db, settings)
+    delete_local_embedding_model(model_dir=_embedding_models_dir_from_translate_settings(cfg, settings), name=model_name)
+    return {"deleted": True}
+
+
+@app.post("/subtitle/embedding/test", response_model=EmbeddingTestResponse)
+def test_embedding(
+    payload: EmbeddingTestRequest,
+    settings: SubtitleServiceSettings = Depends(get_settings),
+    db: Session = Depends(get_db),
+) -> EmbeddingTestResponse:
+    text = str(payload.text or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="text is required")
+    if len(text) > 2000:
+        raise HTTPException(status_code=400, detail="text too long (max 2000 chars)")
+
+    cfg = get_translate_settings(db, settings)
+    if payload.provider is not None:
+        cfg["rag_embedding_provider"] = payload.provider
+    if payload.model is not None:
+        cfg["rag_embedding_model"] = payload.model
+    if payload.model_dir is not None:
+        cfg["rag_embedding_model_dir"] = payload.model_dir
+    if payload.dimensions is not None:
+        cfg["rag_embedding_dimensions"] = payload.dimensions
+    if payload.device is not None:
+        cfg["rag_embedding_device"] = payload.device
+
+    emb_settings = embedding_settings_from_translate_settings(cfg)
+    try:
+        vector = embed_text(text, settings=emb_settings)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e)) from e
+    expected = int(cfg.get("rag_embedding_dimensions") or len(vector))
+    return EmbeddingTestResponse(
+        provider=emb_settings.provider,
+        model=emb_settings.model,
+        dimensions=len(vector),
+        expected_dimensions=expected,
+        ok=len(vector) == expected,
     )
 
 

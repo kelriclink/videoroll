@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { useConfirm } from "../components/feedbackContext";
 import { fetchJson } from "../lib/http";
 import { ORCHESTRATOR_URL } from "../lib/urls";
 
@@ -66,6 +67,7 @@ type YouTubeHomeScanRunResponse = {
 };
 
 export default function SettingsYouTubePage() {
+  const confirm = useConfirm();
   const [settings, setSettings] = useState<YouTubeSettings | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -513,7 +515,13 @@ export default function SettingsYouTubePage() {
             disabled={cookiesBusy || !settings?.cookies_set}
             className="rounded border border-rose-300 px-3 py-2 text-sm text-rose-700 hover:bg-rose-50 disabled:opacity-50"
             onClick={async () => {
-              if (!confirm("确定清空已保存的 YouTube Cookies 吗？")) return;
+              const ok = await confirm({
+                title: "清空 YouTube Cookies",
+                message: "确定清空已保存的 YouTube Cookies 吗？",
+                confirmLabel: "清空",
+                tone: "danger",
+              });
+              if (!ok) return;
               setCookiesBusy(true);
               setError(null);
               try {

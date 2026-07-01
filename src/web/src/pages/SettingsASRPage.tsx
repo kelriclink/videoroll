@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import { useConfirm } from "../components/feedbackContext";
 import { fetchJson } from "../lib/http";
 import { SUBTITLE_SERVICE_URL } from "../lib/urls";
 
@@ -58,6 +59,7 @@ function formatBytes(n?: number | null): string {
 }
 
 export default function SettingsASRPage() {
+  const confirm = useConfirm();
   const [settings, setSettings] = useState<WhisperSettings | null>(null);
   const [asrDefaults, setAsrDefaults] = useState<ASRDefaults | null>(null);
   const [models, setModels] = useState<WhisperModelInfo[] | null>(null);
@@ -417,7 +419,13 @@ export default function SettingsASRPage() {
                         disabled={busy}
                         className="rounded border border-rose-300 px-2 py-1 text-xs text-rose-700 hover:bg-rose-50 disabled:opacity-50"
                         onClick={async () => {
-                          if (!confirm(`确定删除模型：${m.name} ?`)) return;
+                          const ok = await confirm({
+                            title: "删除模型",
+                            message: `确定删除模型：${m.name} ?`,
+                            confirmLabel: "删除",
+                            tone: "danger",
+                          });
+                          if (!ok) return;
                           setBusy(true);
                           setError(null);
                           try {

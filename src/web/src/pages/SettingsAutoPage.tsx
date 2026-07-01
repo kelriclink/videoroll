@@ -1,5 +1,6 @@
 import { Link } from "react-router-dom";
 import { useEffect, useMemo, useState } from "react";
+import { useConfirm } from "../components/feedbackContext";
 import { fetchJson } from "../lib/http";
 import { SUBTITLE_SERVICE_URL } from "../lib/urls";
 
@@ -57,6 +58,7 @@ function normalizeYouTubeSubtitleMode(value: unknown, legacyPrefer?: boolean | n
 }
 
 export default function SettingsAutoPage() {
+  const confirm = useConfirm();
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -605,8 +607,14 @@ export default function SettingsAutoPage() {
           <button
             disabled={busy}
             className="rounded border px-3 py-2 text-sm hover:bg-slate-50 disabled:opacity-50"
-            onClick={() => {
-              if (!confirm("确定恢复默认配置吗？")) return;
+            onClick={async () => {
+              const ok = await confirm({
+                title: "恢复默认配置",
+                message: "确定恢复默认配置吗？当前页面中尚未保存的修改会被覆盖。",
+                confirmLabel: "恢复默认",
+                tone: "warning",
+              });
+              if (!ok) return;
               setFormats({ srt: true, ass: true });
               setBurnIn(true);
               setSoftSub(false);

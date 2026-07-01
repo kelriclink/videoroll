@@ -686,6 +686,7 @@ def translate_segments_openai_with_summary(
     batch_size: int = 50,
     enable_summary: bool = True,
     glossary: dict[str, str] | None = None,
+    rag_context_provider: Callable[[list[Segment], int, str], dict[str, Any] | None] | None = None,
     resume_from: Iterable[Segment] | None = None,
     initial_summary: str = "",
     on_batch_done: Callable[[list[Segment], str, int], None] | None = None,
@@ -726,6 +727,10 @@ def translate_segments_openai_with_summary(
             payload_in["summary"] = summary
         if glossary:
             payload_in["glossary"] = glossary
+        if rag_context_provider is not None:
+            rag_context = rag_context_provider(batch, start_idx, summary)
+            if rag_context:
+                payload_in["rag_context"] = rag_context
 
         user_prompt = (
             "你将收到一批字幕 block。请按 block 为单位翻译。\n"
@@ -733,6 +738,8 @@ def translate_segments_openai_with_summary(
             "- 保留每个 block 的 idx 不变；不得增删 block，不得改变顺序；\n"
             "- 只翻译 text 字段；同一 block 内多行先合并理解再翻译；\n"
             "- 术语、人名保持一致；数字/单位尽量保留原格式；\n"
+            "- 如果输入包含 rag_context，请优先参考其中的 term_cards/knowledge_cards 来理解专有名词、梗、作品设定和技术背景；\n"
+            "- term_cards 中的 translation 是推荐译法，除非明显不符合当前上下文，否则保持一致；\n"
             "- 输出必须是 JSON 对象，且必须包含 translations 数组；不要输出任何解释。\n"
             f"- 目标语言：{tgt}\n"
             f"- 风格：{tone}\n\n"
@@ -859,6 +866,7 @@ def translate_segments_openai(
     batch_size: int = 50,
     enable_summary: bool = True,
     glossary: dict[str, str] | None = None,
+    rag_context_provider: Callable[[list[Segment], int, str], dict[str, Any] | None] | None = None,
 ) -> list[Segment]:
     out, _summary = translate_segments_openai_with_summary(
         segments,
@@ -872,6 +880,7 @@ def translate_segments_openai(
         batch_size=batch_size,
         enable_summary=enable_summary,
         glossary=glossary,
+        rag_context_provider=rag_context_provider,
     )
     return out
 def _srt_ts(seconds: float) -> str:

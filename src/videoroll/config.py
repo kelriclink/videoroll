@@ -81,6 +81,20 @@ class SubtitleServiceSettings(CommonSettings):
     openai_temperature: float = Field(0.2, alias="OPENAI_TEMPERATURE")
     openai_timeout_seconds: float = Field(180.0, alias="OPENAI_TIMEOUT_SECONDS")
 
+    rag_enabled: bool = Field(False, alias="SUBTITLE_RAG_ENABLED")
+    rag_top_k: int = Field(8, alias="SUBTITLE_RAG_TOP_K")
+    rag_min_score: float = Field(0.68, alias="SUBTITLE_RAG_MIN_SCORE")
+    rag_embedding_provider: str = Field("openai", alias="SUBTITLE_RAG_EMBEDDING_PROVIDER")
+    rag_embedding_model: str = Field("text-embedding-3-small", alias="SUBTITLE_RAG_EMBEDDING_MODEL")
+    rag_embedding_dimensions: int = Field(1536, alias="SUBTITLE_RAG_EMBEDDING_DIMENSIONS")
+    rag_embedding_model_dir: str = Field("/models/embeddings", alias="SUBTITLE_RAG_EMBEDDING_MODEL_DIR")
+    rag_embedding_device: str = Field("cpu", alias="SUBTITLE_RAG_EMBEDDING_DEVICE")
+    rag_auto_discover_terms: bool = Field(False, alias="SUBTITLE_RAG_AUTO_DISCOVER_TERMS")
+    rag_auto_learn_terms: bool = Field(False, alias="SUBTITLE_RAG_AUTO_LEARN_TERMS")
+    rag_search_enabled: bool = Field(False, alias="SUBTITLE_RAG_SEARCH_ENABLED")
+    rag_search_url: str = Field("", alias="SUBTITLE_RAG_SEARCH_URL")
+    rag_domain: str = Field("", alias="SUBTITLE_RAG_DOMAIN")
+
     # Orchestrator API (used by subtitle worker for auto pipelines).
     orchestrator_url: str = Field("http://localhost:8000", alias="ORCHESTRATOR_URL")
     orchestrator_timeout_seconds: float = Field(1800.0, alias="ORCHESTRATOR_TIMEOUT_SECONDS")

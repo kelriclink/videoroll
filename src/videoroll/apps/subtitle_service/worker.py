@@ -74,6 +74,8 @@ from videoroll.apps.subtitle_service.model_downloads import (
     download_model_snapshot,
     resolve_model_repo_id,
 )
+from videoroll.apps.subtitle_service.rag import build_rag_context, rag_settings_from_translate_settings
+from videoroll.apps.subtitle_service.embeddings import embedding_settings_from_translate_settings
 from videoroll.apps.subtitle_service.task_title_store import set_task_titles
 from videoroll.apps.subtitle_service.translate_settings_store import get_translate_settings
 from videoroll.apps.publish_meta_draft import apply_publish_source_overrides, default_publish_meta
@@ -1358,6 +1360,44 @@ def process_job(self: Any, job_id: str) -> dict[str, str]:
                             )
 
                         checkpoint_segments = list(resume_prefix)
+                        rag_settings = rag_settings_from_translate_settings(translate_settings)
+                        rag_chat_config = openai_chat_config_from_settings(translate_settings)
+                        rag_embedding_settings = embedding_settings_from_translate_settings(translate_settings)
+
+                        if rag_settings.enabled:
+                            _safe_append_log_line(
+                                log_path,
+                                "translate rag: "
+                                f"enabled top_k={rag_settings.top_k} min_score={rag_settings.min_score} "
+                                f"embedding_provider={rag_settings.embedding_provider} embedding_model={rag_settings.embedding_model} "
+                                f"domain={rag_settings.domain or '(any)'}",
+                            )
+
+                        def _rag_context_provider(batch_segments: list[Segment], start_idx: int, summary: str) -> dict[str, Any] | None:
+                            del start_idx, summary
+                            if not rag_settings.enabled:
+                                return None
+                            ctx = build_rag_context(
+                                db,
+                                segments=batch_segments,
+                                target_lang=target_lang,
+                                rag_settings=rag_settings,
+                                embedding_settings=rag_embedding_settings,
+                                chat_config=rag_chat_config,
+                                task_id=str(task.id),
+                                subtitle_job_id=str(job.id),
+                            )
+                            if ctx.hits:
+                                try:
+                                    db.commit()
+                                except Exception:
+                                    db.rollback()
+                            if not ctx.term_cards and not ctx.knowledge_cards:
+                                return None
+                            return {
+                                "term_cards": ctx.term_cards,
+                                "knowledge_cards": ctx.knowledge_cards,
+                            }
 
                         def _on_translate_batch_done(batch_segments: list[Segment], updated_summary: str, completed_count: int) -> None:
                             del completed_count
@@ -1375,6 +1415,7 @@ def process_job(self: Any, job_id: str) -> dict[str, str]:
                             timeout_seconds=translate_settings["openai_timeout_seconds"],
                             batch_size=batch_size,
                             enable_summary=enable_summary,
+                            rag_context_provider=_rag_context_provider,
                             resume_from=resume_prefix,
                             initial_summary=resume_summary,
                             on_batch_done=_on_translate_batch_done,

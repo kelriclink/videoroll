@@ -32,3 +32,4 @@ videoroll-prod-bundle-*.tar
 videoroll-prod-bundle-*.tar.sha256
 videoroll-deploy-*/
 videoroll-prod-deploy-*/
+docker_exports/

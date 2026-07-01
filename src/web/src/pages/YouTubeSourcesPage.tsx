@@ -1,4 +1,6 @@
 import { useEffect, useState } from "react";
+import { useConfirm, useToast } from "../components/feedbackContext";
+import { Button, PageHeader } from "../components/ui";
 import { fetchJson } from "../lib/http";
 import { YOUTUBE_INGEST_URL } from "../lib/urls";
 import { SourceLicense, YouTubeSource } from "../lib/types";
@@ -27,6 +29,8 @@ function currentValue<T>(source: YouTubeSource, draft: SourceDraft | undefined, 
 }
 
 export default function YouTubeSourcesPage() {
+  const confirm = useConfirm();
+  const toast = useToast();
   const [sources, setSources] = useState<YouTubeSource[] | null>(null);
   const [drafts, setDrafts] = useState<Record<string, SourceDraft>>({});
   const [busyMap, setBusyMap] = useState<Record<string, boolean>>({});
@@ -109,7 +113,11 @@ export default function YouTubeSourcesPage() {
       if (failures.length > 0) {
         setError(failures.slice(0, 3).join("\n"));
       }
-      alert(`已处理 ${items.length} 个输入，成功 ${success} 个，失败 ${failures.length} 个。`);
+      toast({
+        kind: failures.length > 0 ? "warning" : "success",
+        title: "订阅源已处理",
+        message: `已处理 ${items.length} 个输入，成功 ${success} 个，失败 ${failures.length} 个。`,
+      });
     } finally {
       setAdding(false);
     }
@@ -153,9 +161,11 @@ export default function YouTubeSourcesPage() {
         }),
       });
       await refresh();
-      alert(
-        `discovered=${res.discovered_count} created=${res.created_task_ids.length} skipped=${res.skipped_duplicates} started_pipeline=${(res.started_pipeline_job_ids ?? []).length}`,
-      );
+      toast({
+        kind: "info",
+        title: "扫描完成",
+        message: `discovered=${res.discovered_count} created=${res.created_task_ids.length} skipped=${res.skipped_duplicates} started_pipeline=${(res.started_pipeline_job_ids ?? []).length}`,
+      });
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -164,7 +174,13 @@ export default function YouTubeSourcesPage() {
   }
 
   async function deleteSource(source: YouTubeSource) {
-    if (!window.confirm(`删除订阅源？\n${source.display_name || source.source_url || source.source_id}`)) return;
+    const ok = await confirm({
+      title: "删除订阅源",
+      message: source.display_name || source.source_url || source.source_id,
+      confirmLabel: "删除",
+      tone: "danger",
+    });
+    if (!ok) return;
     setBusy(`delete:${source.id}`, true);
     setError(null);
     try {
@@ -186,16 +202,16 @@ export default function YouTubeSourcesPage() {
 
   return (
     <div className="space-y-4">
-      <div className="rounded border bg-white p-4">
-        <div className="flex items-center justify-between gap-4">
-          <div>
-            <div className="text-lg font-semibold">YouTube Sources</div>
-            <div className="text-sm text-slate-600">订阅 YouTube 频道 / 播放列表，后台按间隔自动扫描，新视频可直接进入自动模式。</div>
-          </div>
-          <button onClick={() => refresh()} className="rounded border px-3 py-2 text-sm hover:bg-slate-50">
+      <PageHeader
+        title="YouTube Sources"
+        description="订阅 YouTube 频道 / 播放列表，后台按间隔自动扫描，新视频可直接进入自动模式。"
+        actions={
+          <Button onClick={() => refresh()}>
             刷新
-          </button>
-        </div>
+          </Button>
+        }
+      />
+      <div className="vr-section">
         {error ? <div className="mt-3 whitespace-pre-wrap text-sm text-rose-700">{error}</div> : null}
       </div>
 
@@ -281,7 +297,7 @@ export default function YouTubeSourcesPage() {
         {!sources ? <div className="mt-2 text-sm text-slate-500">加载中...</div> : null}
         {sources && sources.length === 0 ? <div className="mt-2 text-sm text-slate-500">暂无订阅源。</div> : null}
         {sources ? (
-          <div className="mt-3 overflow-auto">
+          <div className="mt-3 overflow-auto rounded-md border border-slate-200">
             <table className="min-w-full text-left text-sm">
               <thead className="text-xs text-slate-500">
                 <tr>

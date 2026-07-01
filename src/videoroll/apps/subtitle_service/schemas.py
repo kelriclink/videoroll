@@ -202,6 +202,20 @@ class TranslateSettingsRead(BaseModel):
     openai_temperature: float
     openai_timeout_seconds: float
 
+    rag_enabled: bool = False
+    rag_top_k: int = 8
+    rag_min_score: float = 0.68
+    rag_embedding_provider: str = "openai"
+    rag_embedding_model: str = "text-embedding-3-small"
+    rag_embedding_dimensions: int = 1536
+    rag_embedding_model_dir: str = "/models/embeddings"
+    rag_embedding_device: str = "cpu"
+    rag_auto_discover_terms: bool = False
+    rag_auto_learn_terms: bool = False
+    rag_search_enabled: bool = False
+    rag_search_url: str = ""
+    rag_domain: str = ""
+
 
 class TranslateSettingsUpdate(BaseModel):
     default_provider: Optional[str] = None
@@ -218,6 +232,20 @@ class TranslateSettingsUpdate(BaseModel):
     openai_temperature: Optional[float] = None
     openai_timeout_seconds: Optional[float] = None
 
+    rag_enabled: Optional[bool] = None
+    rag_top_k: Optional[int] = Field(default=None, ge=0, le=30)
+    rag_min_score: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    rag_embedding_provider: Optional[str] = None
+    rag_embedding_model: Optional[str] = None
+    rag_embedding_dimensions: Optional[int] = Field(default=None, ge=1, le=4096)
+    rag_embedding_model_dir: Optional[str] = None
+    rag_embedding_device: Optional[str] = None
+    rag_auto_discover_terms: Optional[bool] = None
+    rag_auto_learn_terms: Optional[bool] = None
+    rag_search_enabled: Optional[bool] = None
+    rag_search_url: Optional[str] = None
+    rag_domain: Optional[str] = None
+
 
 class TranslateTestRequest(BaseModel):
     text: str = "Hello world."
@@ -227,6 +255,119 @@ class TranslateTestRequest(BaseModel):
 
 class TranslateTestResponse(BaseModel):
     translated_text: str
+
+
+class KnowledgeItemRead(BaseModel):
+    id: uuid.UUID
+    item_type: str
+    term: str = ""
+    translation: str = ""
+    target_lang: str = "zh"
+    domain: str = ""
+    aliases: list[Any] = Field(default_factory=list)
+    title: str = ""
+    content: str = ""
+    description: str = ""
+    sources: list[Any] = Field(default_factory=list)
+    confidence: float = 0.0
+    status: str = "approved"
+    created_by: str = "manual"
+    usage_count: int = 0
+    embedding_model: str = ""
+    last_verified_at: Optional[datetime] = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class KnowledgeItemUpsertRequest(BaseModel):
+    item_type: Literal["term", "document"] = "term"
+    target_lang: str = "zh"
+    term: str = ""
+    translation: str = ""
+    domain: str = ""
+    aliases: list[str] = Field(default_factory=list)
+    title: str = ""
+    content: str = ""
+    description: str = ""
+    sources: list[dict[str, Any]] = Field(default_factory=list)
+    confidence: float = Field(default=1.0, ge=0.0, le=1.0)
+    status: str = "approved"
+    created_by: str = "manual"
+
+
+class KnowledgeItemUpsertResponse(BaseModel):
+    id: uuid.UUID
+
+
+class KnowledgeEmbeddingRebuildRequest(BaseModel):
+    item_type: Optional[Literal["term", "document"]] = None
+    status: Optional[str] = None
+    limit: int = Field(default=1000, ge=1, le=10000)
+
+
+class KnowledgeEmbeddingRebuildResponse(BaseModel):
+    total: int
+    updated: int
+    failed: int
+    skipped: int
+    embedding_model: str
+    dimensions: int
+    errors: list[dict[str, str]] = Field(default_factory=list)
+
+
+class AgentRunRead(BaseModel):
+    id: uuid.UUID
+    agent_type: str
+    status: str
+    term: str = ""
+    domain: str = ""
+    target_lang: str = "zh"
+    task_id: Optional[uuid.UUID] = None
+    subtitle_job_id: Optional[uuid.UUID] = None
+    query: str = ""
+    steps: list[Any] = Field(default_factory=list)
+    result: dict[str, Any] = Field(default_factory=dict)
+    error: str = ""
+    knowledge_item_id: Optional[uuid.UUID] = None
+    started_at: datetime
+    finished_at: Optional[datetime] = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class EmbeddingModelInfo(BaseModel):
+    name: str
+    path: str
+    size_bytes: Optional[int] = None
+
+
+class EmbeddingModelListRequest(BaseModel):
+    model_dir: Optional[str] = None
+
+
+class EmbeddingModelDownloadRequest(BaseModel):
+    model: str = "BAAI/bge-small-zh-v1.5"
+    name: Optional[str] = None
+    model_dir: Optional[str] = None
+    revision: Optional[str] = None
+    force: bool = False
+
+
+class EmbeddingTestRequest(BaseModel):
+    text: str = "hello world"
+    provider: Optional[str] = None
+    model: Optional[str] = None
+    model_dir: Optional[str] = None
+    dimensions: Optional[int] = None
+    device: Optional[str] = None
+
+
+class EmbeddingTestResponse(BaseModel):
+    provider: str
+    model: str
+    dimensions: int
+    expected_dimensions: int
+    ok: bool
 
 
 class WhisperModelInfo(BaseModel):

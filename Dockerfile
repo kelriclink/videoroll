@@ -3,6 +3,8 @@ FROM ubuntu:24.04
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
+ENV PIP_DEFAULT_TIMEOUT=300
+ENV PIP_RETRIES=20
 ENV VIRTUAL_ENV=/opt/venv
 ENV PATH="/opt/venv/bin:${PATH}"
 
@@ -31,11 +33,13 @@ COPY pyproject.toml README.md ./
 
 ARG INSTALL_ASR=0
 ARG YTDLP_VERSION=latest
+ARG TORCH_CPU_INDEX_URL=https://download.pytorch.org/whl/cpu
 
 # Install dependencies in a cache-friendly layer so editing source code doesn't
 # force re-downloading everything on every docker build.
 RUN INSTALL_ASR="$INSTALL_ASR" python -c "import os, tomllib; from pathlib import Path; data=tomllib.loads(Path('pyproject.toml').read_text('utf-8')); deps=list(data.get('project', {}).get('dependencies', []) or []); opt=data.get('project', {}).get('optional-dependencies', {}) or {}; deps += list(opt.get('asr', []) or []) if os.getenv('INSTALL_ASR','0')=='1' else []; Path('/tmp/requirements.txt').write_text('\\n'.join(deps) + '\\n', encoding='utf-8')" \
   && pip install --no-cache-dir -U pip \
+  && pip install --no-cache-dir --index-url "$TORCH_CPU_INDEX_URL" "torch>=2.3,<3" \
   && pip install --no-cache-dir -r /tmp/requirements.txt
 
 COPY src/videoroll ./src/videoroll

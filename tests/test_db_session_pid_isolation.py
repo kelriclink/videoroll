@@ -53,3 +53,24 @@ def test_auto_migrate_cached_per_pid(monkeypatch) -> None:
         ("auto_migrate_engine", "engine-for-postgresql+psycopg://user:pass@db/app"),
         ("auto_migrate_engine", "engine-for-postgresql+psycopg://user:pass@db/app"),
     ]
+
+
+def test_auto_migrate_force_bypasses_process_cache(monkeypatch) -> None:
+    auto_migrate_module._auto_migrate_cached.cache_clear()
+    calls: list[tuple[str, object]] = []
+
+    monkeypatch.setattr(auto_migrate_module, "get_engine", lambda url: f"engine-for-{url}")
+    monkeypatch.setattr(
+        auto_migrate_module,
+        "auto_migrate_engine",
+        lambda engine: calls.append(("auto_migrate_engine", engine)),
+    )
+    monkeypatch.setattr(auto_migrate_module.os, "getpid", lambda: 3001)
+
+    auto_migrate_module.auto_migrate("postgresql+psycopg://user:pass@db/app")
+    auto_migrate_module.auto_migrate("postgresql+psycopg://user:pass@db/app", force=True)
+
+    assert calls == [
+        ("auto_migrate_engine", "engine-for-postgresql+psycopg://user:pass@db/app"),
+        ("auto_migrate_engine", "engine-for-postgresql+psycopg://user:pass@db/app"),
+    ]

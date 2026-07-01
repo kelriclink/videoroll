@@ -21,6 +21,10 @@ class ModelDownloadsTests(unittest.TestCase):
     def test_openvino_known_size_maps_to_official_repo(self) -> None:
         self.assertEqual(resolve_model_repo_id("openvino", "large-v3"), "OpenVINO/whisper-large-v3-fp16-ov")
 
+    def test_embedding_known_alias_maps_to_repo(self) -> None:
+        self.assertEqual(resolve_model_repo_id("embedding", "bge-small-zh-v1.5"), "BAAI/bge-small-zh-v1.5")
+        self.assertEqual(default_model_dir_name("embedding", "bge-small-zh-v1.5"), "bge-small-zh-v1.5")
+
     def test_download_model_snapshot_uses_repo_mapping_and_writes_dest(self) -> None:
         fake_hf = types.ModuleType("huggingface_hub")
         seen: dict[str, object] = {}
