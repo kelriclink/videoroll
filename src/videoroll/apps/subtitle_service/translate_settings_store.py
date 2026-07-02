@@ -40,6 +40,15 @@ def get_translate_settings(db: Session, defaults: SubtitleServiceSettings) -> di
             api_key = decrypt_str(api_key_enc)
         except Exception:
             api_key = ""
+    embedding_openai = _as_dict(stored.get("rag_embedding_openai"))
+    embedding_api_key = ""
+    embedding_api_key_enc = embedding_openai.get("api_key_enc")
+    if isinstance(embedding_api_key_enc, str) and embedding_api_key_enc.strip():
+        try:
+            embedding_api_key = decrypt_str(embedding_api_key_enc)
+        except Exception:
+            embedding_api_key = ""
+    default_embedding_base_url = str(defaults.rag_embedding_base_url or "").strip()
 
     return {
         "default_provider": str(stored.get("default_provider") or defaults.translate_default_provider),
@@ -64,13 +73,24 @@ def get_translate_settings(db: Session, defaults: SubtitleServiceSettings) -> di
         "rag_embedding_dimensions": int(stored.get("rag_embedding_dimensions") or defaults.rag_embedding_dimensions),
         "rag_embedding_model_dir": str(stored.get("rag_embedding_model_dir") or defaults.rag_embedding_model_dir),
         "rag_embedding_device": str(stored.get("rag_embedding_device") or defaults.rag_embedding_device),
+        "rag_embedding_api_key": embedding_api_key or str(defaults.rag_embedding_api_key or ""),
+        "rag_embedding_api_key_set": bool(embedding_api_key),
+        "rag_embedding_base_url": normalize_openai_base_url(str(embedding_openai.get("base_url") or default_embedding_base_url)),
+        "rag_embedding_timeout_seconds": float(
+            embedding_openai.get("timeout_seconds")
+            or stored.get("rag_embedding_timeout_seconds")
+            or defaults.rag_embedding_timeout_seconds
+        ),
         "rag_auto_discover_terms": bool(
             stored.get("rag_auto_discover_terms") if "rag_auto_discover_terms" in stored else defaults.rag_auto_discover_terms
         ),
         "rag_auto_learn_terms": bool(stored.get("rag_auto_learn_terms") if "rag_auto_learn_terms" in stored else defaults.rag_auto_learn_terms),
+        "rag_wiki_enabled": bool(stored.get("rag_wiki_enabled") if "rag_wiki_enabled" in stored else False),
         "rag_search_enabled": bool(stored.get("rag_search_enabled") if "rag_search_enabled" in stored else defaults.rag_search_enabled),
         "rag_search_url": str(stored.get("rag_search_url") or defaults.rag_search_url),
         "rag_domain": str(stored.get("rag_domain") or defaults.rag_domain),
+        "rag_agent_parallelism": int(stored.get("rag_agent_parallelism") or 1),
+        "rag_agent_timeout_seconds": float(stored.get("rag_agent_timeout_seconds") or 120.0),
     }
 
 
@@ -93,11 +113,15 @@ def update_translate_settings(db: Session, defaults: SubtitleServiceSettings, up
         "rag_embedding_dimensions",
         "rag_embedding_model_dir",
         "rag_embedding_device",
+        "rag_embedding_timeout_seconds",
         "rag_auto_discover_terms",
         "rag_auto_learn_terms",
+        "rag_wiki_enabled",
         "rag_search_enabled",
         "rag_search_url",
         "rag_domain",
+        "rag_agent_parallelism",
+        "rag_agent_timeout_seconds",
     ]:
         if key not in update:
             continue
@@ -137,6 +161,21 @@ def update_translate_settings(db: Session, defaults: SubtitleServiceSettings, up
 
     stored["openai"] = openai
 
+    embedding_openai = dict(_as_dict(stored.get("rag_embedding_openai")))
+    if "rag_embedding_api_key" in update:
+        key = update.get("rag_embedding_api_key")
+        if key is not None:
+            key = str(key).strip()
+            if not key:
+                embedding_openai.pop("api_key_enc", None)
+            else:
+                embedding_openai["api_key_enc"] = encrypt_str(key)
+    if "rag_embedding_base_url" in update and update.get("rag_embedding_base_url") is not None:
+        embedding_openai["base_url"] = normalize_openai_base_url(str(update.get("rag_embedding_base_url") or ""))
+    if "rag_embedding_timeout_seconds" in update and update.get("rag_embedding_timeout_seconds") is not None:
+        embedding_openai["timeout_seconds"] = update.get("rag_embedding_timeout_seconds")
+    stored["rag_embedding_openai"] = embedding_openai
+
     # Normalize a few types.
     try:
         if "default_batch_size" in stored and stored["default_batch_size"] is not None:
@@ -160,7 +199,22 @@ def update_translate_settings(db: Session, defaults: SubtitleServiceSettings, up
         stored["rag_embedding_dimensions"] = max(1, min(4096, int(stored.get("rag_embedding_dimensions") or defaults.rag_embedding_dimensions)))
     except Exception:
         stored["rag_embedding_dimensions"] = defaults.rag_embedding_dimensions
-    for bool_key in ["rag_enabled", "rag_auto_discover_terms", "rag_auto_learn_terms", "rag_search_enabled"]:
+    try:
+        stored["rag_agent_parallelism"] = max(1, min(8, int(stored.get("rag_agent_parallelism") or 1)))
+    except Exception:
+        stored["rag_agent_parallelism"] = 1
+    try:
+        stored["rag_agent_timeout_seconds"] = max(10.0, min(900.0, float(stored.get("rag_agent_timeout_seconds") or 120.0)))
+    except Exception:
+        stored["rag_agent_timeout_seconds"] = 120.0
+    try:
+        stored["rag_embedding_timeout_seconds"] = max(
+            1.0,
+            min(600.0, float(stored.get("rag_embedding_timeout_seconds") or defaults.rag_embedding_timeout_seconds)),
+        )
+    except Exception:
+        stored["rag_embedding_timeout_seconds"] = defaults.rag_embedding_timeout_seconds
+    for bool_key in ["rag_enabled", "rag_auto_discover_terms", "rag_auto_learn_terms", "rag_wiki_enabled", "rag_search_enabled"]:
         if bool_key in stored:
             stored[bool_key] = bool(stored[bool_key])
     provider = str(stored.get("rag_embedding_provider") or defaults.rag_embedding_provider).strip().lower()
@@ -168,6 +222,13 @@ def update_translate_settings(db: Session, defaults: SubtitleServiceSettings, up
     for str_key in ["rag_embedding_model", "rag_embedding_model_dir", "rag_embedding_device", "rag_search_url", "rag_domain"]:
         if str_key in stored and stored[str_key] is not None:
             stored[str_key] = str(stored[str_key]).strip()
+    if "base_url" in embedding_openai:
+        embedding_openai["base_url"] = normalize_openai_base_url(str(embedding_openai.get("base_url") or ""))
+    try:
+        if "timeout_seconds" in embedding_openai and embedding_openai["timeout_seconds"] is not None:
+            embedding_openai["timeout_seconds"] = max(1.0, min(600.0, float(embedding_openai.get("timeout_seconds"))))
+    except Exception:
+        embedding_openai["timeout_seconds"] = defaults.rag_embedding_timeout_seconds
     try:
         if "openai_temperature" in update and update["openai_temperature"] is not None:
             openai["temperature"] = float(openai.get("temperature"))

@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { Link } from "react-router-dom";
 import { useConfirm } from "../components/feedbackContext";
 import { Button, DataTable, EmptyState, PageHeader, Section } from "../components/ui";
 import { fetchJson } from "../lib/http";
@@ -24,26 +25,17 @@ type TranslateSettings = {
   rag_embedding_dimensions: number;
   rag_embedding_model_dir: string;
   rag_embedding_device: string;
+  rag_embedding_api_key_set: boolean;
+  rag_embedding_base_url: string;
+  rag_embedding_timeout_seconds: number;
   rag_auto_discover_terms: boolean;
   rag_auto_learn_terms: boolean;
+  rag_wiki_enabled: boolean;
   rag_search_enabled: boolean;
   rag_search_url: string;
   rag_domain: string;
-};
-
-type KnowledgeItem = {
-  id: string;
-  item_type: string;
-  term: string;
-  translation: string;
-  target_lang: string;
-  domain: string;
-  title: string;
-  description: string;
-  confidence: number;
-  status: string;
-  created_by: string;
-  usage_count: number;
+  rag_agent_parallelism: number;
+  rag_agent_timeout_seconds: number;
 };
 
 type EmbeddingModelInfo = {
@@ -60,7 +52,6 @@ function safeEmbeddingModelName(raw: string) {
 export default function SettingsTranslatePage() {
   const confirm = useConfirm();
   const [settings, setSettings] = useState<TranslateSettings | null>(null);
-  const [items, setItems] = useState<KnowledgeItem[]>([]);
   const [embeddingModels, setEmbeddingModels] = useState<EmbeddingModelInfo[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -86,24 +77,23 @@ export default function SettingsTranslatePage() {
   const [ragEmbeddingDimensions, setRagEmbeddingDimensions] = useState(1536);
   const [ragEmbeddingModelDir, setRagEmbeddingModelDir] = useState("/models/embeddings");
   const [ragEmbeddingDevice, setRagEmbeddingDevice] = useState("cpu");
+  const [ragEmbeddingApiKey, setRagEmbeddingApiKey] = useState("");
+  const [ragEmbeddingBaseUrl, setRagEmbeddingBaseUrl] = useState("https://api.openai.com/v1");
+  const [ragEmbeddingTimeoutSeconds, setRagEmbeddingTimeoutSeconds] = useState(60);
   const [ragAutoDiscoverTerms, setRagAutoDiscoverTerms] = useState(false);
   const [ragAutoLearnTerms, setRagAutoLearnTerms] = useState(false);
+  const [ragWikiEnabled, setRagWikiEnabled] = useState(false);
   const [ragSearchEnabled, setRagSearchEnabled] = useState(false);
   const [ragSearchUrl, setRagSearchUrl] = useState("");
   const [ragDomain, setRagDomain] = useState("");
+  const [ragAgentParallelism, setRagAgentParallelism] = useState(1);
+  const [ragAgentTimeoutSeconds, setRagAgentTimeoutSeconds] = useState(120);
 
   const [testText, setTestText] = useState("Hello world. This is a translation test.");
   const [testTargetLang, setTestTargetLang] = useState("zh");
   const [testStyle, setTestStyle] = useState("口语自然");
   const [testResult, setTestResult] = useState<string | null>(null);
 
-  const [knowledgeType, setKnowledgeType] = useState<"term" | "document">("term");
-  const [knowledgeTerm, setKnowledgeTerm] = useState("");
-  const [knowledgeTranslation, setKnowledgeTranslation] = useState("");
-  const [knowledgeDomain, setKnowledgeDomain] = useState("");
-  const [knowledgeTitle, setKnowledgeTitle] = useState("");
-  const [knowledgeContent, setKnowledgeContent] = useState("");
-  const [knowledgeDescription, setKnowledgeDescription] = useState("");
   const [embeddingDownloadModel, setEmbeddingDownloadModel] = useState("BAAI/bge-small-zh-v1.5");
   const [embeddingDownloadName, setEmbeddingDownloadName] = useState("");
   const [embeddingTestResult, setEmbeddingTestResult] = useState<string | null>(null);
@@ -112,10 +102,7 @@ export default function SettingsTranslatePage() {
   async function refresh() {
     setError(null);
     try {
-      const [s, knowledge] = await Promise.all([
-        fetchJson<TranslateSettings>(`${SUBTITLE_SERVICE_URL}/subtitle/translate/settings`),
-        fetchJson<KnowledgeItem[]>(`${SUBTITLE_SERVICE_URL}/subtitle/knowledge/items?limit=50`).catch(() => []),
-      ]);
+      const s = await fetchJson<TranslateSettings>(`${SUBTITLE_SERVICE_URL}/subtitle/translate/settings`);
       const localModels = await fetchJson<EmbeddingModelInfo[]>(`${SUBTITLE_SERVICE_URL}/subtitle/embedding/models/list`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -140,14 +127,18 @@ export default function SettingsTranslatePage() {
       setRagEmbeddingDimensions(s.rag_embedding_dimensions);
       setRagEmbeddingModelDir(s.rag_embedding_model_dir);
       setRagEmbeddingDevice(s.rag_embedding_device);
+      setRagEmbeddingBaseUrl(s.rag_embedding_base_url);
+      setRagEmbeddingTimeoutSeconds(s.rag_embedding_timeout_seconds);
       setRagAutoDiscoverTerms(s.rag_auto_discover_terms);
       setRagAutoLearnTerms(s.rag_auto_learn_terms);
+      setRagWikiEnabled(s.rag_wiki_enabled ?? false);
       setRagSearchEnabled(s.rag_search_enabled);
       setRagSearchUrl(s.rag_search_url);
       setRagDomain(s.rag_domain);
+      setRagAgentParallelism(s.rag_agent_parallelism ?? 1);
+      setRagAgentTimeoutSeconds(s.rag_agent_timeout_seconds ?? 120);
       setTestTargetLang(s.default_target_lang || "zh");
       setTestStyle(s.default_style || "口语自然");
-      setItems(knowledge);
       setEmbeddingModels(localModels);
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : String(e));
@@ -159,7 +150,7 @@ export default function SettingsTranslatePage() {
   }, []);
 
   async function persistSettings() {
-    const payload: Partial<TranslateSettings> & { openai_api_key?: string } = {
+    const payload: Partial<TranslateSettings> & { openai_api_key?: string; rag_embedding_api_key?: string } = {
       default_provider: defaultProvider,
       default_target_lang: defaultTargetLang,
       default_style: defaultStyle,
@@ -178,13 +169,19 @@ export default function SettingsTranslatePage() {
       rag_embedding_dimensions: ragEmbeddingDimensions,
       rag_embedding_model_dir: ragEmbeddingModelDir,
       rag_embedding_device: ragEmbeddingDevice,
+      rag_embedding_base_url: ragEmbeddingBaseUrl,
+      rag_embedding_timeout_seconds: ragEmbeddingTimeoutSeconds,
       rag_auto_discover_terms: ragAutoDiscoverTerms,
       rag_auto_learn_terms: ragAutoLearnTerms,
+      rag_wiki_enabled: ragWikiEnabled,
       rag_search_enabled: ragSearchEnabled,
       rag_search_url: ragSearchUrl,
       rag_domain: ragDomain,
+      rag_agent_parallelism: ragAgentParallelism,
+      rag_agent_timeout_seconds: ragAgentTimeoutSeconds,
     };
     if (openaiApiKey.trim()) payload.openai_api_key = openaiApiKey.trim();
+    if (ragEmbeddingApiKey.trim()) payload.rag_embedding_api_key = ragEmbeddingApiKey.trim();
     await fetchJson(`${SUBTITLE_SERVICE_URL}/subtitle/translate/settings`, {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
@@ -198,6 +195,7 @@ export default function SettingsTranslatePage() {
     try {
       await persistSettings();
       setOpenaiApiKey("");
+      setRagEmbeddingApiKey("");
       await refresh();
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : String(e));
@@ -219,6 +217,7 @@ export default function SettingsTranslatePage() {
     try {
       await persistSettings();
       setOpenaiApiKey("");
+      setRagEmbeddingApiKey("");
       const resp = await fetchJson<{
         total: number;
         updated: number;
@@ -234,40 +233,6 @@ export default function SettingsTranslatePage() {
       setEmbeddingRebuildResult(
         `${resp.embedding_model} / ${resp.dimensions} dims：共 ${resp.total} 条，更新 ${resp.updated}，跳过 ${resp.skipped}，失败 ${resp.failed}`,
       );
-      await refresh();
-    } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function saveKnowledgeItem() {
-    setBusy(true);
-    setError(null);
-    try {
-      await fetchJson(`${SUBTITLE_SERVICE_URL}/subtitle/knowledge/items`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          item_type: knowledgeType,
-          target_lang: defaultTargetLang || "zh",
-          term: knowledgeTerm,
-          translation: knowledgeTranslation,
-          domain: knowledgeDomain,
-          title: knowledgeTitle,
-          content: knowledgeContent,
-          description: knowledgeDescription,
-          confidence: 1,
-          status: "approved",
-          created_by: "manual",
-        }),
-      });
-      setKnowledgeTerm("");
-      setKnowledgeTranslation("");
-      setKnowledgeTitle("");
-      setKnowledgeContent("");
-      setKnowledgeDescription("");
       await refresh();
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : String(e));
@@ -315,6 +280,9 @@ export default function SettingsTranslatePage() {
             model_dir: ragEmbeddingModelDir,
             dimensions: ragEmbeddingDimensions,
             device: ragEmbeddingDevice,
+            api_key: ragEmbeddingApiKey.trim() || undefined,
+            base_url: ragEmbeddingBaseUrl,
+            timeout_seconds: ragEmbeddingTimeoutSeconds,
           }),
         },
       );
@@ -328,7 +296,18 @@ export default function SettingsTranslatePage() {
 
   return (
     <div className="space-y-4">
-      <PageHeader title="Settings · Translate" description="配置 OpenAI 翻译、pgvector RAG 和字幕术语知识库。" actions={<Button onClick={() => refresh()}>刷新</Button>} />
+      <PageHeader
+        title="Settings · Translate"
+        description="配置 OpenAI 翻译、RAG Gate、pgvector 和 embedding 模型。"
+        actions={
+          <>
+            <Link to="/knowledge" className="rounded-md border border-slate-300 px-3 py-2 text-sm text-slate-800 hover:bg-slate-50">
+              知识库
+            </Link>
+            <Button onClick={() => refresh()}>刷新</Button>
+          </>
+        }
+      />
       {error ? <div className="rounded-md border border-rose-200 bg-rose-50 p-3 text-sm text-rose-700">{error}</div> : null}
 
       <Section>
@@ -348,7 +327,10 @@ export default function SettingsTranslatePage() {
               ["batch", settings.default_batch_size],
               ["summary", settings.default_enable_summary ? "true" : "false"],
               ["rag", settings.rag_enabled ? "enabled" : "disabled"],
+              ["wiki", settings.rag_wiki_enabled ? "enabled" : "disabled"],
+              ["agents", `${settings.rag_agent_parallelism} / ${settings.rag_agent_timeout_seconds}s`],
               ["embedding", `${settings.rag_embedding_provider}:${settings.rag_embedding_model}`],
+              ["embedding key", settings.rag_embedding_api_key_set ? "set" : "unset"],
             ].map(([label, value]) => (
               <div key={label} className="rounded-md border border-slate-200 p-3">
                 <div className="text-xs text-slate-500">{label}</div>
@@ -434,6 +416,10 @@ export default function SettingsTranslatePage() {
             允许自动学习术语
           </label>
           <label className="flex items-center gap-2 text-sm">
+            <input type="checkbox" checked={ragWikiEnabled} onChange={(e) => setRagWikiEnabled(e.target.checked)} />
+            允许调用 Wikipedia Tool
+          </label>
+          <label className="flex items-center gap-2 text-sm">
             <input type="checkbox" checked={ragSearchEnabled} onChange={(e) => setRagSearchEnabled(e.target.checked)} />
             允许调用搜索服务
           </label>
@@ -444,6 +430,16 @@ export default function SettingsTranslatePage() {
           <label className="block">
             <div className="mb-1 text-xs text-slate-600">rag_min_score</div>
             <input type="number" step="0.01" min={0} max={1} className="w-full rounded border px-3 py-2 text-sm" value={ragMinScore} onChange={(e) => setRagMinScore(parseFloat(e.target.value || "0"))} />
+          </label>
+          <label className="block">
+            <div className="mb-1 text-xs text-slate-600">rag_agent_parallelism</div>
+            <input type="number" min={1} max={8} className="w-full rounded border px-3 py-2 text-sm" value={ragAgentParallelism} onChange={(e) => setRagAgentParallelism(parseInt(e.target.value || "1", 10))} />
+            <div className="mt-1 text-xs text-slate-500">同一个字幕 batch 内最多并行研究几个术语。</div>
+          </label>
+          <label className="block">
+            <div className="mb-1 text-xs text-slate-600">rag_agent_timeout_seconds</div>
+            <input type="number" min={10} max={900} className="w-full rounded border px-3 py-2 text-sm" value={ragAgentTimeoutSeconds} onChange={(e) => setRagAgentTimeoutSeconds(parseFloat(e.target.value || "120"))} />
+            <div className="mt-1 text-xs text-slate-500">并行 agent 等待预算，超时后继续翻译。</div>
           </label>
           <label className="block">
             <div className="mb-1 text-xs text-slate-600">embedding_model</div>
@@ -475,6 +471,28 @@ export default function SettingsTranslatePage() {
             <div className="mb-1 text-xs text-slate-600">embedding_dimensions</div>
             <input type="number" min={1} max={4096} className="w-full rounded border px-3 py-2 text-sm" value={ragEmbeddingDimensions} onChange={(e) => setRagEmbeddingDimensions(parseInt(e.target.value || "1536", 10))} />
           </label>
+          {ragEmbeddingProvider === "openai" ? (
+            <>
+              <label className="block md:col-span-2">
+                <div className="mb-1 text-xs text-slate-600">embedding_api_key（独立于翻译 API Key，不回显）</div>
+                <input
+                  type="password"
+                  className="w-full rounded border px-3 py-2 text-sm"
+                  placeholder={settings?.rag_embedding_api_key_set ? "已设置（留空则不修改）" : "embedding API key"}
+                  value={ragEmbeddingApiKey}
+                  onChange={(e) => setRagEmbeddingApiKey(e.target.value)}
+                />
+              </label>
+              <label className="block md:col-span-2">
+                <div className="mb-1 text-xs text-slate-600">embedding_base_url（独立于翻译 base URL）</div>
+                <input className="w-full rounded border px-3 py-2 text-sm" value={ragEmbeddingBaseUrl} onChange={(e) => setRagEmbeddingBaseUrl(e.target.value)} />
+              </label>
+              <label className="block">
+                <div className="mb-1 text-xs text-slate-600">embedding_timeout_seconds</div>
+                <input type="number" min={1} className="w-full rounded border px-3 py-2 text-sm" value={ragEmbeddingTimeoutSeconds} onChange={(e) => setRagEmbeddingTimeoutSeconds(parseFloat(e.target.value || "1"))} />
+              </label>
+            </>
+          ) : null}
           <label className="block">
             <div className="mb-1 text-xs text-slate-600">embedding_device</div>
             <select className="w-full rounded border px-3 py-2 text-sm" value={ragEmbeddingDevice} onChange={(e) => setRagEmbeddingDevice(e.target.value)}>
@@ -592,84 +610,31 @@ export default function SettingsTranslatePage() {
         >
           清除 Key
         </Button>
+        <Button
+          tone="danger"
+          disabled={busy || !settings?.rag_embedding_api_key_set}
+          onClick={async () => {
+            const ok = await confirm({ title: "清除 Embedding API Key", message: "确定清除 OpenAI 兼容 embedding 的 API Key 吗？", confirmLabel: "清除", tone: "danger" });
+            if (!ok) return;
+            setBusy(true);
+            setError(null);
+            try {
+              await fetchJson(`${SUBTITLE_SERVICE_URL}/subtitle/translate/settings`, {
+                method: "PUT",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ rag_embedding_api_key: "" }),
+              });
+              await refresh();
+            } catch (e: unknown) {
+              setError(e instanceof Error ? e.message : String(e));
+            } finally {
+              setBusy(false);
+            }
+          }}
+        >
+          清除 Embedding Key
+        </Button>
       </div>
-
-      <Section>
-        <div className="text-sm font-semibold text-slate-900">知识库导入</div>
-        <div className="mt-3 grid gap-3 md:grid-cols-2">
-          <label className="block">
-            <div className="mb-1 text-xs text-slate-600">type</div>
-            <select className="w-full rounded border px-3 py-2 text-sm" value={knowledgeType} onChange={(e) => setKnowledgeType(e.target.value as "term" | "document")}>
-              <option value="term">term</option>
-              <option value="document">document</option>
-            </select>
-          </label>
-          <label className="block">
-            <div className="mb-1 text-xs text-slate-600">domain</div>
-            <input className="w-full rounded border px-3 py-2 text-sm" value={knowledgeDomain} onChange={(e) => setKnowledgeDomain(e.target.value)} />
-          </label>
-          {knowledgeType === "term" ? (
-            <>
-              <label className="block">
-                <div className="mb-1 text-xs text-slate-600">term</div>
-                <input className="w-full rounded border px-3 py-2 text-sm" value={knowledgeTerm} onChange={(e) => setKnowledgeTerm(e.target.value)} />
-              </label>
-              <label className="block">
-                <div className="mb-1 text-xs text-slate-600">translation</div>
-                <input className="w-full rounded border px-3 py-2 text-sm" value={knowledgeTranslation} onChange={(e) => setKnowledgeTranslation(e.target.value)} />
-              </label>
-            </>
-          ) : (
-            <label className="block md:col-span-2">
-              <div className="mb-1 text-xs text-slate-600">title</div>
-              <input className="w-full rounded border px-3 py-2 text-sm" value={knowledgeTitle} onChange={(e) => setKnowledgeTitle(e.target.value)} />
-            </label>
-          )}
-          <label className="block md:col-span-2">
-            <div className="mb-1 text-xs text-slate-600">description</div>
-            <textarea className="h-20 w-full rounded border px-3 py-2 text-sm" value={knowledgeDescription} onChange={(e) => setKnowledgeDescription(e.target.value)} />
-          </label>
-          <label className="block md:col-span-2">
-            <div className="mb-1 text-xs text-slate-600">content</div>
-            <textarea className="h-28 w-full rounded border px-3 py-2 text-sm" value={knowledgeContent} onChange={(e) => setKnowledgeContent(e.target.value)} />
-          </label>
-        </div>
-        <div className="mt-3">
-          <Button tone="primary" disabled={busy} onClick={saveKnowledgeItem}>{busy ? "保存中..." : "写入知识库"}</Button>
-        </div>
-      </Section>
-
-      <Section>
-        <div className="text-sm font-semibold text-slate-900">最近知识条目</div>
-        {items.length === 0 ? (
-          <EmptyState>暂无知识条目</EmptyState>
-        ) : (
-          <DataTable>
-            <thead>
-              <tr>
-                <th className="py-2 pr-3 text-left">Type</th>
-                <th className="py-2 pr-3 text-left">Term / Title</th>
-                <th className="py-2 pr-3 text-left">Translation</th>
-                <th className="py-2 pr-3 text-left">Domain</th>
-                <th className="py-2 pr-3 text-left">Status</th>
-                <th className="py-2 pr-3 text-left">Used</th>
-              </tr>
-            </thead>
-            <tbody>
-              {items.map((item) => (
-                <tr key={item.id}>
-                  <td className="py-2 pr-3">{item.item_type}</td>
-                  <td className="py-2 pr-3">{item.term || item.title || "-"}</td>
-                  <td className="py-2 pr-3">{item.translation || "-"}</td>
-                  <td className="py-2 pr-3">{item.domain || "-"}</td>
-                  <td className="py-2 pr-3">{item.status}</td>
-                  <td className="py-2 pr-3">{item.usage_count}</td>
-                </tr>
-              ))}
-            </tbody>
-          </DataTable>
-        )}
-      </Section>
 
       <Section>
         <div className="text-sm font-semibold text-slate-900">测试翻译</div>

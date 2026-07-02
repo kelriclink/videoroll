@@ -77,6 +77,7 @@ from videoroll.apps.subtitle_service.embeddings import (
 )
 from videoroll.apps.subtitle_service.rag import (
     build_knowledge_embedding_text,
+    delete_knowledge_item,
     list_agent_runs,
     rebuild_knowledge_embeddings,
     list_knowledge_items,
@@ -343,11 +344,17 @@ def get_translate_settings_view(
         rag_embedding_dimensions=cfg["rag_embedding_dimensions"],
         rag_embedding_model_dir=cfg["rag_embedding_model_dir"],
         rag_embedding_device=cfg["rag_embedding_device"],
+        rag_embedding_api_key_set=cfg["rag_embedding_api_key_set"],
+        rag_embedding_base_url=cfg["rag_embedding_base_url"],
+        rag_embedding_timeout_seconds=cfg["rag_embedding_timeout_seconds"],
         rag_auto_discover_terms=cfg["rag_auto_discover_terms"],
         rag_auto_learn_terms=cfg["rag_auto_learn_terms"],
+        rag_wiki_enabled=cfg["rag_wiki_enabled"],
         rag_search_enabled=cfg["rag_search_enabled"],
         rag_search_url=cfg["rag_search_url"],
         rag_domain=cfg["rag_domain"],
+        rag_agent_parallelism=cfg["rag_agent_parallelism"],
+        rag_agent_timeout_seconds=cfg["rag_agent_timeout_seconds"],
     )
 
 
@@ -378,11 +385,17 @@ def put_translate_settings_view(
         rag_embedding_dimensions=cfg["rag_embedding_dimensions"],
         rag_embedding_model_dir=cfg["rag_embedding_model_dir"],
         rag_embedding_device=cfg["rag_embedding_device"],
+        rag_embedding_api_key_set=cfg["rag_embedding_api_key_set"],
+        rag_embedding_base_url=cfg["rag_embedding_base_url"],
+        rag_embedding_timeout_seconds=cfg["rag_embedding_timeout_seconds"],
         rag_auto_discover_terms=cfg["rag_auto_discover_terms"],
         rag_auto_learn_terms=cfg["rag_auto_learn_terms"],
+        rag_wiki_enabled=cfg["rag_wiki_enabled"],
         rag_search_enabled=cfg["rag_search_enabled"],
         rag_search_url=cfg["rag_search_url"],
         rag_domain=cfg["rag_domain"],
+        rag_agent_parallelism=cfg["rag_agent_parallelism"],
+        rag_agent_timeout_seconds=cfg["rag_agent_timeout_seconds"],
     )
 
 
@@ -482,6 +495,31 @@ def upsert_knowledge_item_view(
             raise HTTPException(status_code=503, detail=f"knowledge item save failed after schema migration: {retry_error}") from retry_error
 
     return KnowledgeItemUpsertResponse(id=uuid.UUID(item_id))
+
+
+@app.delete("/subtitle/knowledge/items/{item_id}")
+def delete_knowledge_item_view(
+    item_id: uuid.UUID,
+    settings: SubtitleServiceSettings = Depends(get_settings),
+    db: Session = Depends(get_db),
+) -> dict[str, bool]:
+    try:
+        deleted = delete_knowledge_item(db, str(item_id))
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        if not _is_missing_knowledge_table_error(e):
+            raise HTTPException(status_code=500, detail=f"knowledge item delete failed: {e}") from e
+        _ensure_rag_schema(settings)
+        try:
+            deleted = delete_knowledge_item(db, str(item_id))
+            db.commit()
+        except Exception as retry_error:
+            db.rollback()
+            raise HTTPException(status_code=503, detail=f"knowledge item delete failed after schema migration: {retry_error}") from retry_error
+    if not deleted:
+        raise HTTPException(status_code=404, detail="knowledge item not found")
+    return {"deleted": True}
 
 
 @app.post("/subtitle/knowledge/rebuild-embeddings", response_model=KnowledgeEmbeddingRebuildResponse)
@@ -618,6 +656,12 @@ def test_embedding(
         cfg["rag_embedding_provider"] = payload.provider
     if payload.model is not None:
         cfg["rag_embedding_model"] = payload.model
+    if payload.api_key is not None:
+        cfg["rag_embedding_api_key"] = payload.api_key
+    if payload.base_url is not None:
+        cfg["rag_embedding_base_url"] = payload.base_url
+    if payload.timeout_seconds is not None:
+        cfg["rag_embedding_timeout_seconds"] = payload.timeout_seconds
     if payload.model_dir is not None:
         cfg["rag_embedding_model_dir"] = payload.model_dir
     if payload.dimensions is not None:

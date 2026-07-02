@@ -218,7 +218,7 @@ function AgentRunDetail({ run, onClose }: { run: AgentRun; onClose: () => void }
                   {knowledgeStatus ? <div>knowledge: {knowledgeStatus}</div> : null}
                   {failureCategory ? <div>failure: {failureCategory}</div> : null}
                   {run.knowledge_item_id ? (
-                    <Link to={`/settings/translate?knowledgeItem=${run.knowledge_item_id}`} className="truncate font-mono text-sky-700 hover:underline">
+                    <Link to={`/knowledge?item=${run.knowledge_item_id}`} className="truncate font-mono text-sky-700 hover:underline">
                       item: {run.knowledge_item_id}
                     </Link>
                   ) : null}

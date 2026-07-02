@@ -2,12 +2,16 @@ from __future__ import annotations
 
 from videoroll.ai.client import OpenAIChatConfig
 from videoroll.apps.subtitle_service.rag import (
+    _run_research_agents,
     _fallback_search_queries,
     _search_url_with_params,
     build_knowledge_embedding_text,
     embedding_model_key,
     fetch_search_evidence,
+    fetch_wikipedia_evidence,
+    normalize_wiki_api_url,
     normalize_term,
+    pretranslation_rag_gate_openai,
     rag_settings_from_translate_settings,
     rebuild_knowledge_embeddings,
     search_knowledge,
@@ -37,11 +41,16 @@ def test_rag_settings_from_translate_settings_clamps_values() -> None:
             "rag_embedding_dimensions": 99999,
             "rag_embedding_model_dir": "/models/embeddings",
             "rag_embedding_device": "cpu",
+            "rag_embedding_base_url": "https://embedding.example/v1",
+            "rag_embedding_timeout_seconds": 15,
             "rag_auto_discover_terms": True,
             "rag_auto_learn_terms": True,
+            "rag_wiki_enabled": True,
             "rag_search_enabled": True,
             "rag_search_url": "https://search.example",
             "rag_domain": "CS2",
+            "rag_agent_parallelism": 99,
+            "rag_agent_timeout_seconds": 9999,
         }
     )
     assert cfg.enabled is True
@@ -54,9 +63,12 @@ def test_rag_settings_from_translate_settings_clamps_values() -> None:
     assert cfg.embedding_device == "cpu"
     assert cfg.auto_discover_terms is True
     assert cfg.auto_learn_terms is True
+    assert cfg.wiki_enabled is True
     assert cfg.search_enabled is True
     assert cfg.search_url == "https://search.example"
     assert cfg.domain == "CS2"
+    assert cfg.agent_parallelism == 8
+    assert cfg.agent_timeout_seconds == 900.0
 
 
 def test_build_knowledge_embedding_text_includes_term_fields() -> None:
@@ -91,6 +103,171 @@ def test_should_research_term_keeps_common_terms_context_only() -> None:
     assert decision["translation"] == "真值表"
 
 
+def test_should_research_term_uses_gate_category_to_skip_basic_terms() -> None:
+    decision = should_research_term(
+        "pixel",
+        domain="技术",
+        gate_item={
+            "category": "basic_dictionary",
+            "need_rag": False,
+            "need_search": False,
+            "scope": "none",
+            "reason": "basic visual unit",
+        },
+    )
+
+    assert decision["should_research"] is False
+    assert decision["category"] == "basic_dictionary"
+
+
+def test_should_research_term_uses_gate_category_to_allow_high_value_terms() -> None:
+    decision = should_research_term(
+        "AWP",
+        domain="CS2",
+        gate_item={
+            "category": "acronym",
+            "need_rag": True,
+            "need_search": True,
+            "scope": "global",
+            "reason": "game-specific weapon acronym",
+        },
+    )
+
+    assert decision["should_research"] is True
+    assert decision["should_persist"] is True
+    assert decision["category"] == "acronym"
+
+
+def test_pretranslation_rag_gate_parses_all_returned_terms(monkeypatch) -> None:
+    from videoroll.apps.subtitle_service import rag as rag_module
+
+    monkeypatch.setattr(
+        rag_module,
+        "request_openai_json_object",
+        lambda **_kwargs: {
+            "terms": [
+                {
+                    "term": "AWP",
+                    "category": "acronym",
+                    "domain": "CS2",
+                    "need_rag": True,
+                    "need_search": True,
+                    "scope": "global",
+                    "priority": 0.91,
+                    "reason": "weapon acronym",
+                },
+                {
+                    "term": "Rush B",
+                    "category": "domain_jargon",
+                    "domain": "CS2",
+                    "need_rag": True,
+                    "need_search": True,
+                    "scope": "global",
+                    "priority": 0.95,
+                    "reason": "strategy phrase",
+                },
+                {
+                    "term": "pixel",
+                    "category": "basic_dictionary",
+                    "domain": "technology",
+                    "need_rag": False,
+                    "need_search": False,
+                    "scope": "none",
+                    "priority": 0.1,
+                    "reason": "basic term",
+                },
+            ]
+        },
+    )
+
+    terms = pretranslation_rag_gate_openai(
+        "Rush B, AWP, pixel.",
+        target_lang="zh",
+        domain_hint="CS2",
+        config=OpenAIChatConfig(api_key="x", base_url="https://example.invalid/v1", model="demo"),
+    )
+
+    assert [item["term"] for item in terms] == ["Rush B", "AWP", "pixel"]
+    assert terms[0]["priority"] == 0.95
+    assert terms[2]["need_search"] is False
+
+
+def test_pretranslation_rag_gate_includes_previous_summary(monkeypatch) -> None:
+    from videoroll.apps.subtitle_service import rag as rag_module
+
+    captured: dict[str, str] = {}
+
+    def fake_request(**kwargs):
+        captured["user_prompt"] = kwargs["user_prompt"]
+        return {"terms": []}
+
+    monkeypatch.setattr(rag_module, "request_openai_json_object", fake_request)
+
+    pretranslation_rag_gate_openai(
+        "It contains a Lyman-alpha blob.",
+        target_lang="zh",
+        domain_hint="astrophysics",
+        previous_summary="The video is discussing TON618 and distant quasars.",
+        config=OpenAIChatConfig(api_key="x", base_url="https://example.invalid/v1", model="demo"),
+    )
+
+    assert "前文摘要" in captured["user_prompt"]
+    assert "TON618" in captured["user_prompt"]
+    assert "当前字幕 block" in captured["user_prompt"]
+
+
+def test_run_research_agents_uses_session_factory_for_parallel_terms(monkeypatch) -> None:
+    from videoroll.apps.subtitle_service import rag as rag_module
+
+    created_sessions: list[object] = []
+    calls: list[tuple[object, str]] = []
+
+    class _Session:
+        def close(self) -> None:
+            return None
+
+    def session_factory() -> _Session:
+        session = _Session()
+        created_sessions.append(session)
+        return session
+
+    def fake_research(db, *, item, **_kwargs):
+        term = item["term"]
+        calls.append((db, term))
+        return rag_module.AgentResearchResult(term=term, normalized_term=normalize_term(term))
+
+    monkeypatch.setattr(rag_module, "_research_discovered_term", fake_research)
+    rag_cfg = rag_settings_from_translate_settings(
+        {
+            "rag_enabled": True,
+            "rag_agent_parallelism": 2,
+            "rag_agent_timeout_seconds": 30,
+        }
+    )
+    emb_cfg = embedding_settings_from_translate_settings({"rag_embedding_provider": "local", "rag_embedding_dimensions": 2})
+
+    results = _run_research_agents(
+        db=object(),  # type: ignore[arg-type]
+        session_factory=session_factory,  # type: ignore[arg-type]
+        items=[{"term": "AWP"}, {"term": "Rush B"}],
+        target_lang="zh",
+        rag_settings=rag_cfg,
+        embedding_settings=emb_cfg,
+        chat_config=OpenAIChatConfig(api_key="x", base_url="https://example.invalid/v1", model="demo"),
+        text_value="AWP Rush B",
+        llm_context="AWP Rush B",
+        previous_summary="",
+        existing_term_cards=[],
+        gate_duration_ms=1,
+        task_id=None,
+        subtitle_job_id=None,
+    )
+
+    assert {item.term for item in results} == {"AWP", "Rush B"}
+    assert len(created_sessions) == 2
+    assert {id(db) for db, _term in calls} == {id(session) for session in created_sessions}
+
+
 def test_fallback_search_queries_include_definition_and_target_language() -> None:
     queries = _fallback_search_queries("Hopper Minecart", domain="Minecraft", target_lang="zh")
 
@@ -115,6 +292,45 @@ def test_embedding_settings_from_translate_settings_supports_local_provider() ->
     assert cfg.provider == "local"
     assert cfg.model == "BAAI--bge-small-zh-v1.5"
     assert cfg.dimensions == 512
+
+
+def test_embedding_settings_from_translate_settings_supports_openai_compatible_provider() -> None:
+    cfg = embedding_settings_from_translate_settings(
+        {
+            "rag_embedding_provider": "openai",
+            "rag_embedding_model": "vendor-embed",
+            "rag_embedding_dimensions": 1024,
+            "rag_embedding_api_key": "embed-key",
+            "rag_embedding_base_url": "https://embedding.example/v1",
+            "rag_embedding_timeout_seconds": 12,
+            "openai_api_key": "chat-key",
+            "openai_base_url": "https://chat.example/v1",
+            "openai_timeout_seconds": 60,
+        }
+    )
+
+    assert cfg.provider == "openai"
+    assert cfg.model == "vendor-embed"
+    assert cfg.openai_config.api_key == "embed-key"
+    assert cfg.openai_config.base_url == "https://embedding.example/v1"
+    assert cfg.openai_config.timeout_seconds == 12
+
+
+def test_embedding_settings_do_not_reuse_translation_openai_credentials() -> None:
+    cfg = embedding_settings_from_translate_settings(
+        {
+            "rag_embedding_provider": "openai",
+            "rag_embedding_model": "vendor-embed",
+            "rag_embedding_dimensions": 1024,
+            "openai_api_key": "chat-key",
+            "openai_base_url": "https://chat.example/v1",
+            "openai_timeout_seconds": 60,
+        }
+    )
+
+    assert cfg.openai_config.api_key is None
+    assert cfg.openai_config.base_url == ""
+    assert cfg.openai_config.timeout_seconds == 60
 
 
 def test_local_embedding_openvino_device_uses_openvino_backend(monkeypatch) -> None:
@@ -218,6 +434,84 @@ def test_search_url_accepts_base_url_and_legacy_search_url() -> None:
         _search_url_with_params("https://search.example/searxng", query="truth table", json_format=False)
         == "https://search.example/searxng/search?q=truth+table"
     )
+
+
+def test_normalize_wiki_api_url_accepts_wikipedia_page_url() -> None:
+    assert normalize_wiki_api_url("https://en.wikipedia.org/wiki/Wiki") == "https://en.wikipedia.org/w/api.php"
+    assert normalize_wiki_api_url("https://en.wikipedia.org") == "https://en.wikipedia.org/w/api.php"
+    assert normalize_wiki_api_url("https://en.wikipedia.org/w/api.php") == "https://en.wikipedia.org/w/api.php"
+
+
+def test_fetch_wikipedia_evidence_reads_page_extract(monkeypatch) -> None:
+    from videoroll.apps.subtitle_service import rag as rag_module
+
+    calls: list[dict[str, object]] = []
+
+    class _Response:
+        def __init__(self, data: object, *, url: str = "https://en.wikipedia.org/w/api.php") -> None:
+            self._data = data
+            self.url = url
+            self.headers = {"content-type": "application/json"}
+            self.text = ""
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> object:
+            return self._data
+
+    class _Client:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            return None
+
+        def __enter__(self) -> "_Client":
+            return self
+
+        def __exit__(self, exc_type: object, exc: object, tb: object) -> bool:
+            return False
+
+        def get(self, url: str, params: dict[str, object] | None = None) -> _Response:
+            calls.append({"url": url, "params": params or {}})
+            params = params or {}
+            if params.get("list") == "search":
+                return _Response(
+                    {
+                        "query": {
+                            "search": [
+                                {
+                                    "title": "Lyman-alpha blob",
+                                    "pageid": 123,
+                                    "snippet": "A <span>large concentration</span> of gas.",
+                                }
+                            ]
+                        }
+                    }
+                )
+            return _Response(
+                {
+                    "query": {
+                        "pages": [
+                            {
+                                "pageid": 123,
+                                "title": "Lyman-alpha blob",
+                                "extract": "A Lyman-alpha blob is a large concentration of gas emitting the Lyman-alpha emission line.",
+                            }
+                        ]
+                    }
+                }
+            )
+
+    monkeypatch.setattr(rag_module.httpx, "Client", _Client)
+
+    evidence = fetch_wikipedia_evidence("Lyman-alpha blob", domain="astrophysics", queries=["Lyman-alpha blob definition"])
+
+    assert calls[0]["params"]["list"] == "search"  # type: ignore[index]
+    assert any(call["params"].get("prop") == "extracts" for call in calls)  # type: ignore[union-attr]
+    assert evidence[0]["tool"] == "wiki"
+    assert evidence[0]["source"] == "Wikipedia"
+    assert evidence[0]["title"] == "Lyman-alpha blob"
+    assert evidence[0]["url"] == "https://en.wikipedia.org/wiki/Lyman-alpha_blob"
+    assert "large concentration of gas" in evidence[0]["content"]
 
 
 def test_fetch_search_evidence_reads_result_pages(monkeypatch) -> None:
@@ -396,6 +690,107 @@ def test_fetch_search_evidence_filters_searxng_internal_about(monkeypatch) -> No
 
     assert evidence == []
     assert len(calls) == 2
+
+
+def test_fetch_search_evidence_filters_searx_space_ui_result_from_json(monkeypatch) -> None:
+    from videoroll.apps.subtitle_service import rag as rag_module
+
+    class _Response:
+        def __init__(self, text: str = "", *, url: str, content_type: str = "application/json", data: object | None = None) -> None:
+            self.text = text
+            self.url = url
+            self.headers = {"content-type": content_type}
+            self._data = data
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> object:
+            if self._data is None:
+                raise ValueError("not json")
+            return self._data
+
+    class _Client:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            return None
+
+        def __enter__(self) -> "_Client":
+            return self
+
+        def __exit__(self, exc_type: object, exc: object, tb: object) -> bool:
+            return False
+
+        def get(self, url: str) -> _Response:
+            if "format=json" in url:
+                return _Response(
+                    url=url,
+                    data={
+                        "results": [
+                            {
+                                "title": "https://searx.space",
+                                "url": "https://searx.space",
+                                "content": "My SearXNG About Preferences SearXNG clear search general images videos",
+                            }
+                        ]
+                    },
+                )
+            return _Response("<html><body><a href=\"https://searx.space\">SearXNG</a></body></html>", url=url, content_type="text/html")
+
+    monkeypatch.setattr(rag_module.httpx, "Client", _Client)
+
+    evidence = fetch_search_evidence("Lyman-alpha blob", domain="astrophysics", search_url="https://search.example/search")
+
+    assert evidence == []
+
+
+def test_fetch_search_evidence_falls_back_to_html_when_json_format_fails(monkeypatch) -> None:
+    from videoroll.apps.subtitle_service import rag as rag_module
+
+    class _Response:
+        def __init__(self, text: str, *, url: str, content_type: str = "text/html", fail: bool = False) -> None:
+            self.text = text
+            self.url = url
+            self.headers = {"content-type": content_type}
+            self.fail = fail
+
+        def raise_for_status(self) -> None:
+            if self.fail:
+                raise RuntimeError("403 Forbidden")
+
+        def json(self) -> object:
+            raise ValueError("not json")
+
+    class _Client:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            return None
+
+        def __enter__(self) -> "_Client":
+            return self
+
+        def __exit__(self, exc_type: object, exc: object, tb: object) -> bool:
+            return False
+
+        def get(self, url: str) -> _Response:
+            if "format=json" in url:
+                return _Response("", url=url, fail=True)
+            return _Response(
+                """
+                <html><body>
+                  <article class="result">
+                    <h3><a href="https://example.com/wiki/lyman-alpha-blob">Lyman-alpha blob</a></h3>
+                    <p>A large concentration of gas emitting the Lyman-alpha line.</p>
+                  </article>
+                </body></html>
+                """,
+                url=url,
+            )
+
+    monkeypatch.setattr(rag_module.httpx, "Client", _Client)
+
+    evidence = fetch_search_evidence("Lyman-alpha blob", domain="astrophysics", search_url="https://search.example/search")
+
+    assert evidence[0]["url"] == "https://example.com/wiki/lyman-alpha-blob"
+    assert "Lyman-alpha" in evidence[0]["snippet"]
 
 
 def test_fetch_search_evidence_does_not_fallback_when_llm_selects_no_urls(monkeypatch) -> None:

@@ -4,14 +4,16 @@ import hashlib
 import html
 import ipaddress
 import json
+import math
 import re
 import socket
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Iterable
-from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
+from typing import Any, Callable, Iterable
+from urllib.parse import parse_qsl, quote, urlencode, urljoin, urlparse, urlunparse
 
 import httpx
 from sqlalchemy import text
@@ -28,9 +30,31 @@ _SCRIPT_STYLE_RE = re.compile(r"<(script|style|noscript)\b[^>]*>.*?</\1>", re.IG
 _TAG_RE = re.compile(r"<[^>]+>")
 _ARTICLE_RE = re.compile(r"<(?:article|div)\b[^>]*class=[\"'][^\"']*\bresult\b[^\"']*[\"'][^>]*>.*?</(?:article|div)>", re.IGNORECASE | re.DOTALL)
 _ANCHOR_RE = re.compile(r"<a\b[^>]*href=[\"']([^\"']+)[\"'][^>]*>(.*?)</a>", re.IGNORECASE | re.DOTALL)
+_SEARXNG_UI_TEXT_RE = re.compile(
+    r"(my searxng|about preferences|preferences\s+search syntax|default language|clear\s+search\s+general)",
+    re.IGNORECASE,
+)
 _SINGLE_LETTER_RE = re.compile(r"^[A-Za-z]$")
 _MATH_LOGIC_DOMAIN_RE = re.compile(r"(logic|math|数学|逻辑|命题|proposition|propositional)", re.IGNORECASE)
 _AUTO_APPROVE_CONFIDENCE_THRESHOLD = 0.9
+_SEARCHABLE_GATE_CATEGORIES = {
+    "proper_noun",
+    "acronym",
+    "domain_jargon",
+    "work_specific_term",
+    "ambiguous_term",
+    "community_meme",
+    "technical_standard",
+}
+_NON_SEARCH_GATE_CATEGORIES = {
+    "basic_dictionary",
+    "common_word",
+    "local_variable",
+    "unit_or_number",
+    "full_sentence",
+    "generic_action",
+    "greeting",
+}
 _COMMON_CONTEXT_TRANSLATIONS: dict[str, dict[str, str]] = {
     "truth table": {
         "translation": "真值表",
@@ -43,6 +67,9 @@ _COMMON_CONTEXT_TRANSLATIONS: dict[str, dict[str, str]] = {
         "description": "研究命题及命题连接词推理关系的逻辑分支。",
     },
 }
+_WIKIPEDIA_API_URL = "https://en.wikipedia.org/w/api.php"
+_WIKIPEDIA_SOURCE_NAME = "Wikipedia"
+_WIKIPEDIA_USER_AGENT = "VideoRoll-RAG-Agent/1.0 (https://github.com/kelriclink/videoroll)"
 
 
 @dataclass(frozen=True)
@@ -59,7 +86,10 @@ class RagSettings:
     auto_learn_terms: bool = False
     search_enabled: bool = False
     search_url: str = ""
+    wiki_enabled: bool = False
     domain: str = ""
+    agent_parallelism: int = 1
+    agent_timeout_seconds: float = 120.0
 
 
 @dataclass(frozen=True)
@@ -85,6 +115,14 @@ class RagContext:
     term_cards: list[dict[str, Any]]
     knowledge_cards: list[dict[str, Any]]
     hits: list[RagHit]
+
+
+@dataclass(frozen=True)
+class AgentResearchResult:
+    term: str
+    normalized_term: str
+    context_card: dict[str, Any] | None = None
+    hit: RagHit | None = None
 
 
 @dataclass(frozen=True)
@@ -148,6 +186,24 @@ _FETCH_TOOL_SPEC = ToolSpec(
     cost={"network_requests": 1},
 )
 
+_WIKI_SEARCH_TOOL_SPEC = ToolSpec(
+    tool_name="wiki_search",
+    input_schema={"type": "object", "required": ["query", "api_url"], "properties": {"query": {"type": "string"}, "api_url": {"type": "string"}}},
+    output_schema={"type": "object", "properties": {"count": {"type": "integer"}, "results": {"type": "array"}}},
+    timeout_seconds=20.0,
+    retry_count=0,
+    cost={"network_requests": 1},
+)
+
+_WIKI_READ_TOOL_SPEC = ToolSpec(
+    tool_name="wiki_read",
+    input_schema={"type": "object", "required": ["pageid", "api_url"], "properties": {"pageid": {"type": "integer"}, "api_url": {"type": "string"}}},
+    output_schema={"type": "object", "properties": {"title": {"type": "string"}, "chars": {"type": "integer"}, "excerpt": {"type": "string"}}},
+    timeout_seconds=20.0,
+    retry_count=0,
+    cost={"network_requests": 1},
+)
+
 
 def rag_settings_from_translate_settings(settings: dict[str, Any]) -> RagSettings:
     return RagSettings(
@@ -163,7 +219,10 @@ def rag_settings_from_translate_settings(settings: dict[str, Any]) -> RagSetting
         auto_learn_terms=bool(settings.get("rag_auto_learn_terms")),
         search_enabled=bool(settings.get("rag_search_enabled")),
         search_url=str(settings.get("rag_search_url") or "").strip(),
+        wiki_enabled=bool(settings.get("rag_wiki_enabled")),
         domain=str(settings.get("rag_domain") or "").strip(),
+        agent_parallelism=max(1, min(8, int(settings.get("rag_agent_parallelism") or 1))),
+        agent_timeout_seconds=max(10.0, min(900.0, float(settings.get("rag_agent_timeout_seconds") or 120.0))),
     )
 
 
@@ -171,6 +230,42 @@ def normalize_term(term: str) -> str:
     s = str(term or "").strip().lower()
     s = _TERM_SPLIT_RE.sub(" ", s)
     return s
+
+
+def normalize_wiki_api_url(raw_url: str) -> str:
+    raw = str(raw_url or "").strip()
+    if not raw:
+        return ""
+    if "://" not in raw:
+        raw = f"https://{raw}"
+    parsed = urlparse(raw)
+    path = parsed.path.rstrip("/")
+    if not path:
+        path = "/w/api.php"
+    elif path.endswith("/api.php"):
+        path = path
+    elif "/wiki/" in path:
+        prefix = path.split("/wiki/", 1)[0].rstrip("/")
+        path = f"{prefix}/w/api.php" if prefix else "/w/api.php"
+    elif path.endswith("/wiki"):
+        prefix = path[: -len("/wiki")].rstrip("/")
+        path = f"{prefix}/w/api.php" if prefix else "/w/api.php"
+    else:
+        path = f"{path}/w/api.php"
+    return urlunparse(parsed._replace(path=path, query="", fragment=""))
+
+
+def _wiki_page_url(api_url: str, title: str) -> str:
+    parsed = urlparse(normalize_wiki_api_url(api_url))
+    path = parsed.path
+    if path.endswith("/w/api.php"):
+        root = path[: -len("/w/api.php")]
+    elif path.endswith("/api.php"):
+        root = path[: -len("/api.php")]
+    else:
+        root = ""
+    page_path = f"{root.rstrip('/')}/wiki/{quote(str(title or '').strip().replace(' ', '_'))}"
+    return urlunparse(parsed._replace(path=page_path, query="", fragment=""))
 
 
 def build_knowledge_embedding_text(
@@ -251,6 +346,16 @@ def _collapse_text(value: str, *, limit: int = 12000) -> str:
     return text_value[:limit]
 
 
+def _context_for_llm(text_value: str, *, previous_summary: str = "", limit: int = 9000) -> str:
+    current = str(text_value or "").strip()
+    summary = str(previous_summary or "").strip()
+    if summary:
+        combined = f"前文摘要：\n{summary[:800]}\n\n当前字幕 block：\n{current}"
+    else:
+        combined = current
+    return combined[:limit]
+
+
 def _search_endpoint_from_base(search_base_url: str) -> str:
     raw = str(search_base_url or "").strip()
     if not raw:
@@ -294,6 +399,9 @@ def _normalize_result_url(raw_url: str, *, base_url: str) -> str:
 def _is_search_engine_internal_url(url: str, *, search_url: str) -> bool:
     parsed = urlparse(str(url or "").strip())
     search_parsed = urlparse(_search_endpoint_from_base(search_url))
+    hostname = (parsed.hostname or "").lower()
+    if hostname in {"searx.space", "www.searx.space"}:
+        return True
     if not parsed.netloc or not search_parsed.netloc:
         return False
     if parsed.netloc.lower() != search_parsed.netloc.lower():
@@ -362,6 +470,8 @@ def _parse_search_json(data: Any) -> list[dict[str, Any]]:
         snippet = str(item.get("snippet") or item.get("content") or item.get("description") or "").strip()
         if not title and not snippet:
             continue
+        if _SEARXNG_UI_TEXT_RE.search(" ".join([title, snippet])):
+            continue
         out.append({"title": _strip_html(title), "url": url, "snippet": _strip_html(snippet)[:800]})
     return out
 
@@ -376,6 +486,8 @@ def _filter_search_results(results: list[dict[str, Any]], *, search_url: str) ->
         if not url:
             continue
         if _is_search_engine_internal_url(url, search_url=search_url):
+            continue
+        if _SEARXNG_UI_TEXT_RE.search(" ".join([title, snippet])):
             continue
         if title.lower() in {"about", "preferences", "search syntax"} and "searxng" in snippet.lower():
             continue
@@ -393,8 +505,6 @@ def _parse_search_html(html_value: str, *, base_url: str) -> list[dict[str, Any]
     chunks = _ARTICLE_RE.findall(source)
     if not chunks:
         chunks = re.findall(r"<article\b[^>]*>.*?</article>", source, flags=re.IGNORECASE | re.DOTALL)
-    if not chunks:
-        chunks = source.split("<h3")[:12]
 
     out: list[dict[str, Any]] = []
     seen: set[str] = set()
@@ -624,10 +734,20 @@ def _term_candidates_from_text(text_value: str, *, limit: int = 24) -> list[str]
     return out
 
 
-def should_research_term(term: str, *, domain: str = "", context: str = "") -> dict[str, Any]:
+def should_research_term(
+    term: str,
+    *,
+    domain: str = "",
+    context: str = "",
+    gate_item: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     clean = str(term or "").strip()
     norm = normalize_term(clean)
     domain_text = str(domain or "").strip()
+    category_hint = str((gate_item or {}).get("category") or "").strip()
+    scope_hint = str((gate_item or {}).get("scope") or "").strip()
+    need_rag_hint = (gate_item or {}).get("need_rag")
+    need_search_hint = (gate_item or {}).get("need_search")
     if not clean or not norm:
         return {
             "should_research": False,
@@ -668,11 +788,45 @@ def should_research_term(term: str, *, domain: str = "", context: str = "") -> d
             "category": "common_word",
             "reason": "common function word",
         }
+    if category_hint in _NON_SEARCH_GATE_CATEGORIES:
+        return {
+            "should_research": False,
+            "should_persist": False,
+            "category": category_hint,
+            "scope": scope_hint or "none",
+            "reason": str((gate_item or {}).get("reason") or "RAG gate classified this as not requiring external knowledge"),
+        }
+    if need_rag_hint is False:
+        return {
+            "should_research": False,
+            "should_persist": False,
+            "category": category_hint or "gate_rejected",
+            "scope": scope_hint or "none",
+            "reason": str((gate_item or {}).get("reason") or "RAG gate decided this term does not need RAG"),
+        }
+    if category_hint and category_hint not in _SEARCHABLE_GATE_CATEGORIES and need_search_hint is not True:
+        return {
+            "should_research": False,
+            "should_persist": scope_hint in {"task", "series", "global"},
+            "category": category_hint,
+            "scope": scope_hint or "task",
+            "reason": str((gate_item or {}).get("reason") or "RAG gate did not classify this as external-search-worthy"),
+        }
+    if need_search_hint is False and category_hint not in _SEARCHABLE_GATE_CATEGORIES:
+        return {
+            "should_research": False,
+            "should_persist": scope_hint in {"task", "series", "global"},
+            "category": category_hint or "task_context",
+            "scope": scope_hint or "task",
+            "reason": str((gate_item or {}).get("reason") or "RAG gate requested local/task context only"),
+        }
     return {
         "should_research": True,
-        "should_persist": True,
-        "category": "research",
-        "reason": "term may need external context",
+        "should_persist": scope_hint != "task",
+        "category": category_hint or "research",
+        "scope": scope_hint or "global",
+        "reason": str((gate_item or {}).get("reason") or "term may need external context"),
+        "need_search": bool(need_search_hint) if need_search_hint is not None else True,
     }
 
 
@@ -696,12 +850,14 @@ def discover_terms_openai(
     *,
     target_lang: str,
     domain_hint: str,
+    previous_summary: str = "",
     config: OpenAIChatConfig,
     client: httpx.Client | None = None,
 ) -> list[dict[str, Any]]:
     source = str(text_value or "").strip()
     if not source:
         return []
+    llm_context = _context_for_llm(source, previous_summary=previous_summary, limit=8000)
     data = request_openai_json_object(
         config=config,
         system_prompt="You identify translation terms in subtitles. Return ONLY valid JSON.",
@@ -714,7 +870,7 @@ def discover_terms_openai(
             "- reason 用中文简短说明为什么它是术语。\n"
             f"- 目标语言：{target_lang or 'zh'}\n"
             f"- 领域提示：{domain_hint or '未知'}\n\n"
-            f"字幕片段：\n{source[:8000]}\n\n"
+            f"上下文：\n{llm_context}\n\n"
             '输出 JSON：{"terms":[{"term":"","domain":"","reason":""}]}'
         ),
         client=client,
@@ -740,6 +896,100 @@ def discover_terms_openai(
             }
         )
     return out[:20]
+
+
+def pretranslation_rag_gate_openai(
+    text_value: str,
+    *,
+    target_lang: str,
+    domain_hint: str,
+    existing_terms: list[dict[str, Any]] | None = None,
+    previous_summary: str = "",
+    config: OpenAIChatConfig,
+    client: httpx.Client | None = None,
+) -> list[dict[str, Any]]:
+    source = str(text_value or "").strip()
+    if not source:
+        return []
+    llm_context = _context_for_llm(source, previous_summary=previous_summary, limit=9000)
+    compact_existing = [
+        {
+            "term": str(item.get("term") or "")[:160],
+            "translation": str(item.get("translation") or "")[:160],
+            "domain": str(item.get("domain") or "")[:120],
+            "score": item.get("score"),
+        }
+        for item in (existing_terms or [])[:20]
+        if isinstance(item, dict)
+    ]
+    data = request_openai_json_object(
+        config=config,
+        system_prompt="You are a pre-translation RAG gate. Return ONLY valid JSON.",
+        user_prompt=(
+            "请在翻译这个字幕 block 之前，判断哪些词/短语如果不查资料或不查本地知识库，可能会翻错。\n"
+            "这不是普通 NER，也不是词典抽取；目标是筛出高价值 RAG 候选。\n\n"
+            "只返回满足以下至少一项的候选：\n"
+            "- 专有名词、人名、组织、作品、角色、品牌；\n"
+            "- 缩写或代号，且在当前语境可能有特定含义；\n"
+            "- 游戏/动漫/技术/社区黑话、梗、固定译法；\n"
+            "- 作品设定、领域标准、框架名、工具名、论文/协议/技术名词；\n"
+            "- 普通词但当前语境可能有特殊含义或歧义。\n\n"
+            "不要返回这些：\n"
+            "- 基础词典词、常见动词/名词、寒暄句；\n"
+            "- 数字、单位、尺寸、普通食材；\n"
+            "- true/false/condition/validate/pixel/salt 这类模型能稳定翻译的基础词；\n"
+            "- P/Q/R/x/y 这类局部变量；\n"
+            "- 整句普通表达，除非它是固定梗或固定术语。\n\n"
+            "category 只能使用：proper_noun, acronym, domain_jargon, work_specific_term, "
+            "ambiguous_term, community_meme, technical_standard, task_context, basic_dictionary, "
+            "common_word, local_variable, unit_or_number, full_sentence, generic_action, greeting。\n"
+            "scope 只能使用：global, series, task, none。\n"
+            "need_rag 表示是否需要本地 RAG/上下文辅助；need_search 表示本地未命中时是否值得外部搜索。\n"
+            "如果你认为没有值得查的词，返回空数组。不要为了凑数返回基础词。返回数量不设上限，但必须是高价值项。\n\n"
+            f"目标语言：{target_lang or 'zh'}\n"
+            f"领域提示：{domain_hint or '未知'}\n"
+            f"已有本地命中 JSON：\n{json.dumps(compact_existing, ensure_ascii=False)}\n\n"
+            f"上下文：\n{llm_context}\n\n"
+            '输出 JSON：{"terms":[{"term":"","category":"","domain":"","need_rag":true,'
+            '"need_search":true,"scope":"global","priority":0.0,"reason":""}]}'
+        ),
+        client=client,
+    )
+    terms = data.get("terms")
+    if not isinstance(terms, list):
+        return []
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in terms:
+        if not isinstance(item, dict):
+            continue
+        term = str(item.get("term") or "").strip()
+        norm = normalize_term(term)
+        if not term or norm in seen:
+            continue
+        seen.add(norm)
+        try:
+            priority = float(item.get("priority") or 0.0)
+        except Exception:
+            priority = 0.0
+        category = str(item.get("category") or "").strip()
+        scope = str(item.get("scope") or "").strip()
+        need_rag_raw = item.get("need_rag")
+        need_search_raw = item.get("need_search")
+        out.append(
+            {
+                "term": term,
+                "category": category,
+                "domain": str(item.get("domain") or domain_hint or "").strip(),
+                "need_rag": True if need_rag_raw is None else _json_bool(need_rag_raw),
+                "need_search": (category in _SEARCHABLE_GATE_CATEGORIES) if need_search_raw is None else _json_bool(need_search_raw),
+                "scope": scope if scope in {"global", "series", "task", "none"} else "global",
+                "priority": max(0.0, min(1.0, priority)),
+                "reason": str(item.get("reason") or "").strip(),
+            }
+        )
+    out.sort(key=lambda x: float(x.get("priority") or 0.0), reverse=True)
+    return out
 
 
 def _dedupe_search_queries(queries: Iterable[str], *, limit: int = 3) -> list[str]:
@@ -920,28 +1170,38 @@ def fetch_search_evidence(
         with httpx.Client(
             timeout=timeout_seconds,
             follow_redirects=True,
-            headers={"User-Agent": "VideoRoll-RAG-Agent/1.0"},
+            headers={"User-Agent": "VideoRoll-RAG-Agent/1.0", "Accept": "application/json, text/html;q=0.9,*/*;q=0.8"},
         ) as client:
             for query in search_queries:
                 json_url = _search_url_with_params(endpoint, query=query, json_format=True)
                 html_url = _search_url_with_params(endpoint, query=query, json_format=False)
                 started = time.perf_counter()
                 filtered_results: list[dict[str, Any]] = []
+                json_error = ""
                 try:
-                    resp = client.get(json_url)
-                    resp.raise_for_status()
-                    content_type = resp.headers.get("content-type", "")
-                    if "json" in content_type.lower():
-                        filtered_results = _parse_search_json(resp.json())
-                    else:
-                        try:
-                            filtered_results = _parse_search_json(resp.json())
-                        except Exception:
-                            filtered_results = _parse_search_html(resp.text, base_url=str(resp.url))
-                    if not filtered_results:
-                        resp = client.get(html_url)
+                    try:
+                        resp = client.get(json_url)
                         resp.raise_for_status()
-                        filtered_results = _parse_search_html(resp.text, base_url=str(resp.url))
+                        content_type = resp.headers.get("content-type", "")
+                        if "json" in content_type.lower():
+                            filtered_results = _parse_search_json(resp.json())
+                        else:
+                            try:
+                                filtered_results = _parse_search_json(resp.json())
+                            except Exception:
+                                filtered_results = _parse_search_html(resp.text, base_url=str(resp.url))
+                    except Exception as e:
+                        json_error = str(e)[:300]
+                        filtered_results = []
+                    if not filtered_results:
+                        try:
+                            resp = client.get(html_url)
+                            resp.raise_for_status()
+                            filtered_results = _parse_search_html(resp.text, base_url=str(resp.url))
+                        except Exception as e:
+                            if json_error:
+                                raise RuntimeError(f"json search failed: {json_error}; html search failed: {e}") from e
+                            raise
                     filtered_results = _filter_search_results(filtered_results, search_url=endpoint)
                     compact_results = [
                         {"title": r.get("title", ""), "url": r.get("url", ""), "snippet": str(r.get("snippet") or "")[:240]}
@@ -950,7 +1210,7 @@ def fetch_search_evidence(
                     step = ToolResult(
                         spec=_SEARCH_TOOL_SPEC,
                         input={"query": query, "url": json_url},
-                        output={"count": len(filtered_results), "results": compact_results},
+                        output={"count": len(filtered_results), "results": compact_results, "json_error": json_error},
                         ok=True,
                         duration_ms=_duration_ms(started),
                     ).to_step(action="search")
@@ -1130,6 +1390,197 @@ def fetch_search_evidence(
                     "action": "search_failed",
                     "tool": "search",
                     "tool_name": "search",
+                    "queries": search_queries,
+                    "error_type": "unexpected_error",
+                },
+            )
+        return []
+
+
+def fetch_wikipedia_evidence(
+    term: str,
+    *,
+    domain: str,
+    queries: list[str] | None = None,
+    timeout_seconds: float = 20.0,
+    max_pages: int = 3,
+    db: Session | None = None,
+    agent_run_id: str | None = None,
+) -> list[dict[str, Any]]:
+    clean_term = str(term or "").strip()
+    if not clean_term:
+        return []
+    raw_queries = [clean_term]
+    raw_queries.extend(queries or [])
+    search_queries = _dedupe_search_queries(raw_queries, limit=4)
+    if not search_queries:
+        return []
+
+    search_results: list[dict[str, Any]] = []
+    seen_pages: set[str] = set()
+    try:
+        with httpx.Client(
+            timeout=timeout_seconds,
+            follow_redirects=True,
+            headers={"User-Agent": _WIKIPEDIA_USER_AGENT, "Accept": "application/json"},
+        ) as client:
+            for query in search_queries:
+                started = time.perf_counter()
+                params = {
+                    "action": "query",
+                    "list": "search",
+                    "srsearch": query,
+                    "srlimit": 5,
+                    "format": "json",
+                    "formatversion": "2",
+                }
+                try:
+                    resp = client.get(_WIKIPEDIA_API_URL, params=params)
+                    resp.raise_for_status()
+                    data = resp.json()
+                    raw_items = data.get("query", {}).get("search", []) if isinstance(data, dict) else []
+                    results: list[dict[str, Any]] = []
+                    if isinstance(raw_items, list):
+                        for raw in raw_items[:5]:
+                            if not isinstance(raw, dict):
+                                continue
+                            title = _strip_html(str(raw.get("title") or "")).strip()
+                            pageid = raw.get("pageid")
+                            snippet = _strip_html(str(raw.get("snippet") or "")).strip()
+                            if not title or pageid is None:
+                                continue
+                            page_key = str(pageid)
+                            result = {
+                                "title": title,
+                                "pageid": pageid,
+                                "url": _wiki_page_url(_WIKIPEDIA_API_URL, title),
+                                "snippet": snippet[:800],
+                                "source": _WIKIPEDIA_SOURCE_NAME,
+                                "tool": "wiki",
+                            }
+                            results.append(result)
+                            if page_key not in seen_pages:
+                                seen_pages.add(page_key)
+                                search_results.append(result)
+                    compact_results = [
+                        {"title": r["title"], "pageid": r["pageid"], "url": r["url"], "snippet": str(r.get("snippet") or "")[:240]}
+                        for r in results[:5]
+                    ]
+                    step = ToolResult(
+                        spec=_WIKI_SEARCH_TOOL_SPEC,
+                        input={"query": query, "api_url": _WIKIPEDIA_API_URL},
+                        output={"count": len(results), "results": compact_results},
+                        ok=True,
+                        duration_ms=_duration_ms(started),
+                    ).to_step(action="wiki_search")
+                    step.update({"query": query, "api_url": _WIKIPEDIA_API_URL, "count": len(results), "results": compact_results})
+                    if db is not None:
+                        _append_agent_step(db, agent_run_id, step)
+                except Exception as e:
+                    step = ToolResult(
+                        spec=_WIKI_SEARCH_TOOL_SPEC,
+                        input={"query": query, "api_url": _WIKIPEDIA_API_URL},
+                        output={"count": 0, "results": []},
+                        ok=False,
+                        duration_ms=_duration_ms(started),
+                        error_type=type(e).__name__,
+                        error=str(e)[:300],
+                    ).to_step(action="wiki_search_failed")
+                    step.update({"query": query, "api_url": _WIKIPEDIA_API_URL})
+                    if db is not None:
+                        _append_agent_step(db, agent_run_id, step)
+                    continue
+                if len(search_results) >= 8:
+                    break
+
+            if not search_results:
+                if db is not None:
+                    _append_agent_step(
+                        db,
+                        agent_run_id,
+                        {
+                            "kind": "tool",
+                            "action": "wiki_no_results",
+                            "tool": "wiki_search",
+                            "tool_name": "wiki_search",
+                            "api_url": _WIKIPEDIA_API_URL,
+                            "queries": search_queries,
+                        },
+                    )
+                return []
+
+            out: list[dict[str, Any]] = []
+            read_limit = max(1, min(5, int(max_pages)))
+            for item in search_results[:read_limit]:
+                pageid = item.get("pageid")
+                title = str(item.get("title") or "").strip()
+                page: dict[str, Any] = {
+                    "title": title,
+                    "url": str(item.get("url") or "").strip(),
+                    "snippet": str(item.get("snippet") or "").strip()[:800],
+                    "source": _WIKIPEDIA_SOURCE_NAME,
+                    "tool": "wiki",
+                }
+                started = time.perf_counter()
+                params = {
+                    "action": "query",
+                    "prop": "extracts",
+                    "exintro": "1",
+                    "explaintext": "1",
+                    "pageids": str(pageid),
+                    "format": "json",
+                    "formatversion": "2",
+                }
+                try:
+                    resp = client.get(_WIKIPEDIA_API_URL, params=params)
+                    resp.raise_for_status()
+                    data = resp.json()
+                    pages = data.get("query", {}).get("pages", []) if isinstance(data, dict) else []
+                    wiki_page = pages[0] if isinstance(pages, list) and pages and isinstance(pages[0], dict) else {}
+                    extract = _collapse_text(str(wiki_page.get("extract") or ""), limit=5000)
+                    if extract:
+                        page["content"] = extract
+                    if wiki_page.get("title"):
+                        page["title"] = str(wiki_page.get("title") or title)
+                        page["url"] = _wiki_page_url(_WIKIPEDIA_API_URL, page["title"])
+                    step = ToolResult(
+                        spec=_WIKI_READ_TOOL_SPEC,
+                        input={"pageid": int(pageid), "api_url": _WIKIPEDIA_API_URL, "title": title},
+                        output={"title": page["title"], "chars": len(extract), "excerpt": extract[:360]},
+                        ok=True,
+                        duration_ms=_duration_ms(started),
+                    ).to_step(action="wiki_read")
+                    step.update({"pageid": pageid, "title": page["title"], "url": page["url"], "chars": len(extract), "excerpt": extract[:360]})
+                    if db is not None:
+                        _append_agent_step(db, agent_run_id, step)
+                except Exception as e:
+                    page["fetch_error"] = str(e)[:300]
+                    step = ToolResult(
+                        spec=_WIKI_READ_TOOL_SPEC,
+                        input={"pageid": pageid, "api_url": _WIKIPEDIA_API_URL, "title": title},
+                        output={"title": title, "chars": 0, "excerpt": ""},
+                        ok=False,
+                        duration_ms=_duration_ms(started),
+                        error_type=type(e).__name__,
+                        error=str(e)[:300],
+                    ).to_step(action="wiki_read_failed")
+                    step.update({"pageid": pageid, "title": title, "url": page["url"]})
+                    if db is not None:
+                        _append_agent_step(db, agent_run_id, step)
+                if page.get("snippet") or page.get("content"):
+                    out.append(page)
+            return out
+    except Exception:
+        if db is not None:
+            _append_agent_step(
+                db,
+                agent_run_id,
+                {
+                    "kind": "tool",
+                    "action": "wiki_failed",
+                    "tool": "wiki_search",
+                    "tool_name": "wiki_search",
+                    "api_url": _WIKIPEDIA_API_URL,
                     "queries": search_queries,
                     "error_type": "unexpected_error",
                 },
@@ -1508,6 +1959,581 @@ def exact_term_hits(
     return [_row_to_hit(row) for row in rows]
 
 
+def _research_discovered_term(
+    db: Session,
+    *,
+    item: dict[str, Any],
+    target_lang: str,
+    rag_settings: RagSettings,
+    embedding_settings: EmbeddingSettings,
+    chat_config: OpenAIChatConfig,
+    text_value: str,
+    llm_context: str,
+    previous_summary: str,
+    existing_term_cards: list[dict[str, Any]],
+    gate_duration_ms: int | None,
+    task_id: str | None,
+    subtitle_job_id: str | None,
+) -> AgentResearchResult | None:
+    term = str(item.get("term") or "").strip()
+    norm = normalize_term(term)
+    if not term or not norm:
+        return None
+
+    domain_hint = str(item.get("domain") or rag_settings.domain or "").strip()
+    query = " ".join([p for p in [domain_hint, term] if p]).strip()
+    agent_run_id: str | None = None
+    try:
+        agent_run_id = _start_agent_run(
+            db,
+            term=term,
+            domain=domain_hint,
+            target_lang=target_lang,
+            query=query,
+            task_id=task_id,
+            subtitle_job_id=subtitle_job_id,
+        )
+        _append_llm_step(
+            db,
+            agent_run_id,
+            action="pretranslation_rag_gate",
+            config=chat_config,
+            input_value={
+                "domain": rag_settings.domain,
+                "context_excerpt": text_value[:500],
+                "previous_summary": str(previous_summary or "").strip()[:500],
+                "existing_hit_count": len(existing_term_cards),
+            },
+            output_value={
+                "term": term,
+                "domain": domain_hint,
+                "category": str(item.get("category") or ""),
+                "need_rag": bool(item.get("need_rag")),
+                "need_search": bool(item.get("need_search")),
+                "scope": str(item.get("scope") or ""),
+                "priority": float(item.get("priority") or 0.0),
+                "reason": str(item.get("reason") or "").strip(),
+            },
+            duration_ms=gate_duration_ms,
+        )
+    except Exception:
+        db.rollback()
+        agent_run_id = None
+
+    research_policy = should_research_term(term, domain=domain_hint, context=text_value, gate_item=item)
+    _append_agent_step(
+        db,
+        agent_run_id,
+        {
+            "kind": "policy",
+            "action": "term_research_policy",
+            "term": term,
+            "domain": domain_hint,
+            "decision": research_policy,
+        },
+    )
+    if not research_policy.get("should_research"):
+        context_card: dict[str, Any] | None = None
+        if research_policy.get("category") == "context_only" and research_policy.get("translation"):
+            context_card = _context_only_term_card(term, research_policy, target_lang=target_lang, domain=domain_hint)
+        elif research_policy.get("scope") in {"task", "series"} or item.get("need_rag"):
+            hint = str(item.get("translation") or item.get("translation_hint") or "").strip()
+            if hint:
+                context_card = {
+                    "term": term,
+                    "translation": hint,
+                    "domain": domain_hint,
+                    "aliases": [],
+                    "description": str(item.get("reason") or research_policy.get("reason") or "").strip(),
+                    "confidence": float(item.get("priority") or 0.0) or 0.7,
+                    "score": float(item.get("priority") or 0.0) or 0.7,
+                    "sources": [],
+                    "target_lang": target_lang,
+                    "status": str(research_policy.get("scope") or "task_context"),
+                }
+        _finish_agent_run(
+            db,
+            agent_run_id,
+            status="skipped",
+            result={
+                "term": term,
+                "domain": domain_hint,
+                "knowledge_status": str(research_policy.get("category") or "skipped"),
+                "failure_category": str(research_policy.get("category") or "skipped"),
+                "reason": str(research_policy.get("reason") or ""),
+            },
+        )
+        return AgentResearchResult(term=term, normalized_term=norm, context_card=context_card)
+
+    if not bool(research_policy.get("need_search", True)):
+        _finish_agent_run(
+            db,
+            agent_run_id,
+            status="skipped",
+            result={
+                "term": term,
+                "domain": domain_hint,
+                "knowledge_status": "local_rag_only",
+                "failure_category": "no_external_search_requested",
+                "reason": str(research_policy.get("reason") or ""),
+            },
+        )
+        return AgentResearchResult(term=term, normalized_term=norm)
+
+    external_lookup_enabled = bool(rag_settings.wiki_enabled or rag_settings.search_enabled)
+    search_queries: list[str] = []
+    if external_lookup_enabled:
+        started = time.perf_counter()
+        try:
+            search_queries = generate_search_queries_openai(
+                term=term,
+                context=llm_context,
+                target_lang=target_lang,
+                domain_hint=domain_hint,
+                config=chat_config,
+                max_queries=3,
+            )
+            _append_llm_step(
+                db,
+                agent_run_id,
+                action="generate_search_queries",
+                config=chat_config,
+                input_value={
+                    "term": term,
+                    "domain": domain_hint,
+                    "context_excerpt": text_value[:500],
+                    "previous_summary": str(previous_summary or "").strip()[:500],
+                },
+                output_value={"queries": search_queries},
+                duration_ms=_duration_ms(started),
+            )
+        except Exception as e:
+            search_queries = _fallback_search_queries(term, domain=domain_hint, target_lang=target_lang, limit=3)
+            _append_llm_step(
+                db,
+                agent_run_id,
+                action="generate_search_queries_failed",
+                config=chat_config,
+                duration_ms=_duration_ms(started),
+                error=str(e)[:300],
+                error_type=type(e).__name__,
+            )
+            _append_agent_step(
+                db,
+                agent_run_id,
+                {
+                    "kind": "policy",
+                    "action": "search_query_fallback",
+                    "queries": search_queries,
+                    "reason": "LLM query generation failed; using deterministic fallback queries.",
+                },
+            )
+    evidence = []
+    if rag_settings.wiki_enabled:
+        evidence = fetch_wikipedia_evidence(
+            term,
+            domain=domain_hint,
+            queries=search_queries,
+            db=db,
+            agent_run_id=agent_run_id,
+        )
+    if not evidence and rag_settings.search_enabled:
+        evidence = fetch_search_evidence(
+            term,
+            domain=domain_hint,
+            search_url=rag_settings.search_url,
+            queries=search_queries,
+            context=llm_context,
+            target_lang=target_lang,
+            config=chat_config,
+            db=db,
+            agent_run_id=agent_run_id,
+        )
+    if not evidence:
+        _finish_agent_run(
+            db,
+            agent_run_id,
+            status="failed",
+            result={
+                "term": term,
+                "domain": domain_hint,
+                "search_queries": search_queries,
+                "failure_category": "no_search_evidence",
+                "tools": {
+                    "wikipedia": bool(rag_settings.wiki_enabled),
+                    "search": bool(rag_settings.search_enabled),
+                },
+            },
+            error="no search evidence",
+        )
+        return None
+
+    try:
+        summarize_started = time.perf_counter()
+        explained = explain_term_from_evidence_openai(
+            term=term,
+            context=llm_context,
+            target_lang=target_lang,
+            domain_hint=domain_hint,
+            evidence=evidence,
+            config=chat_config,
+        )
+        _append_llm_step(
+            db,
+            agent_run_id,
+            action="summarize_evidence",
+            config=chat_config,
+            input_value={"term": term, "domain": domain_hint, "evidence_count": len(evidence)},
+            output_value={
+                "term": str((explained or {}).get("term") or term),
+                "translation": str((explained or {}).get("translation") or ""),
+                "confidence": float((explained or {}).get("confidence") or 0.0),
+            },
+            duration_ms=_duration_ms(summarize_started),
+        )
+    except Exception as e:
+        _append_llm_step(
+            db,
+            agent_run_id,
+            action="summarize_failed",
+            config=chat_config,
+            error=str(e)[:300],
+            error_type=type(e).__name__,
+        )
+        explained = None
+    if not explained:
+        _finish_agent_run(
+            db,
+            agent_run_id,
+            status="failed",
+            result={"term": term, "domain": domain_hint, "evidence_count": len(evidence), "failure_category": "summarize_failed"},
+            error="LLM did not produce a usable glossary entry",
+        )
+        return None
+
+    valid_sources = _valid_external_evidence(evidence, search_url=rag_settings.search_url)
+    try:
+        verify_started = time.perf_counter()
+        verification = verify_glossary_entry_openai(
+            term=term,
+            context=llm_context,
+            target_lang=target_lang,
+            domain_hint=domain_hint,
+            evidence=evidence,
+            candidate=explained,
+            config=chat_config,
+        )
+        _append_llm_step(
+            db,
+            agent_run_id,
+            action="verify_glossary_entry",
+            config=chat_config,
+            input_value={
+                "term": term,
+                "candidate_confidence": float(explained.get("confidence") or 0.0),
+                "valid_source_count": len(valid_sources),
+            },
+            output_value=verification,
+            duration_ms=_duration_ms(verify_started),
+        )
+    except Exception as e:
+        verification = {
+            "supported": False,
+            "context_consistent": False,
+            "should_write": False,
+            "should_auto_approve": False,
+            "confidence": 0.0,
+            "reason": "verifier failed",
+            "failure_category": "verify_failed",
+        }
+        _append_llm_step(
+            db,
+            agent_run_id,
+            action="verify_failed",
+            config=chat_config,
+            error=str(e)[:300],
+            error_type=type(e).__name__,
+        )
+
+    candidate_confidence = float(explained.get("confidence") or 0.0)
+    verifier_confidence = float(verification.get("confidence") or 0.0)
+    final_confidence = min(candidate_confidence, verifier_confidence) if verifier_confidence > 0 else candidate_confidence
+    should_write = (
+        bool(verification.get("supported"))
+        and bool(verification.get("context_consistent"))
+        and bool(verification.get("should_write"))
+        and bool(valid_sources)
+    )
+    if not should_write:
+        failure_category = str(verification.get("failure_category") or "")
+        if not valid_sources:
+            failure_category = failure_category or "no_valid_external_source"
+        _finish_agent_run(
+            db,
+            agent_run_id,
+            status="skipped",
+            result={
+                "term": str(explained.get("term") or term),
+                "translation": str(explained.get("translation") or ""),
+                "domain": str(explained.get("domain") or domain_hint or ""),
+                "confidence": final_confidence,
+                "knowledge_status": "context_only" if failure_category == "context_only" else "not_written",
+                "failure_category": failure_category or "verify_rejected",
+                "verification": verification,
+                "valid_source_count": len(valid_sources),
+                "search_queries": search_queries,
+            },
+            error=str(verification.get("reason") or "verifier rejected glossary entry")[:4000],
+        )
+        return AgentResearchResult(term=term, normalized_term=norm)
+
+    status = (
+        "auto_approved"
+        if bool(verification.get("should_auto_approve")) and final_confidence >= _AUTO_APPROVE_CONFIDENCE_THRESHOLD
+        else "pending"
+    )
+    source_list = [x for x in explained.get("sources") or [] if isinstance(x, dict)] or valid_sources
+    try:
+        _append_agent_step(
+            db,
+            agent_run_id,
+            {
+                "kind": "policy",
+                "action": "knowledge_write_decision",
+                "term": str(explained.get("term") or term),
+                "translation": str(explained.get("translation") or ""),
+                "confidence": final_confidence,
+                "status": status,
+                "auto_threshold": _AUTO_APPROVE_CONFIDENCE_THRESHOLD,
+                "valid_source_count": len(valid_sources),
+            },
+        )
+        emb_text = build_knowledge_embedding_text(
+            item_type="term",
+            term=str(explained.get("term") or term),
+            translation=str(explained.get("translation") or ""),
+            domain=str(explained.get("domain") or ""),
+            aliases=[str(x) for x in explained.get("aliases") or []],
+            description=str(explained.get("description") or ""),
+        )
+        emb = embed_text(emb_text, settings=embedding_settings)
+        assert_embedding_dimensions(emb, rag_settings.embedding_dimensions)
+        learned_id = upsert_knowledge_item(
+            db,
+            item_type="term",
+            target_lang=target_lang,
+            term=str(explained.get("term") or term),
+            translation=str(explained.get("translation") or ""),
+            domain=str(explained.get("domain") or rag_settings.domain or ""),
+            aliases=[str(x) for x in explained.get("aliases") or []],
+            description=str(explained.get("description") or ""),
+            sources=source_list,
+            confidence=final_confidence,
+            status=status,
+            created_by="agent",
+            embedding=emb,
+            embedding_model=embedding_model_key(rag_settings),
+        )
+        db.commit()
+        _finish_agent_run(
+            db,
+            agent_run_id,
+            status="succeeded",
+            result={
+                "term": str(explained.get("term") or term),
+                "translation": str(explained.get("translation") or ""),
+                "domain": str(explained.get("domain") or rag_settings.domain or ""),
+                "confidence": final_confidence,
+                "knowledge_status": status,
+                "verification": verification,
+                "valid_source_count": len(valid_sources),
+                "search_queries": search_queries,
+                "sources": source_list[:5],
+            },
+            knowledge_item_id=learned_id,
+        )
+        if status == "auto_approved":
+            return AgentResearchResult(
+                term=term,
+                normalized_term=norm,
+                hit=RagHit(
+                    id=learned_id,
+                    item_type="term",
+                    term=str(explained.get("term") or term),
+                    translation=str(explained.get("translation") or ""),
+                    target_lang=target_lang,
+                    domain=str(explained.get("domain") or rag_settings.domain or ""),
+                    aliases=[str(x) for x in explained.get("aliases") or []],
+                    title="",
+                    content="",
+                    description=str(explained.get("description") or ""),
+                    sources=source_list,
+                    confidence=final_confidence,
+                    status=status,
+                    score=final_confidence,
+                ),
+            )
+        return AgentResearchResult(term=term, normalized_term=norm)
+    except Exception as e:
+        db.rollback()
+        _finish_agent_run(
+            db,
+            agent_run_id,
+            status="failed",
+            result={
+                "term": str(explained.get("term") or term),
+                "translation": str(explained.get("translation") or ""),
+                "confidence": final_confidence,
+                "failure_category": "knowledge_save_failed",
+            },
+            error=f"knowledge save failed: {e}",
+        )
+        return None
+
+
+def _run_research_agent(
+    *,
+    db: Session,
+    session_factory: Callable[[], Session] | None,
+    item: dict[str, Any],
+    target_lang: str,
+    rag_settings: RagSettings,
+    embedding_settings: EmbeddingSettings,
+    chat_config: OpenAIChatConfig,
+    text_value: str,
+    llm_context: str,
+    previous_summary: str,
+    existing_term_cards: list[dict[str, Any]],
+    gate_duration_ms: int | None,
+    task_id: str | None,
+    subtitle_job_id: str | None,
+) -> AgentResearchResult | None:
+    if session_factory is None:
+        return _research_discovered_term(
+            db,
+            item=item,
+            target_lang=target_lang,
+            rag_settings=rag_settings,
+            embedding_settings=embedding_settings,
+            chat_config=chat_config,
+            text_value=text_value,
+            llm_context=llm_context,
+            previous_summary=previous_summary,
+            existing_term_cards=existing_term_cards,
+            gate_duration_ms=gate_duration_ms,
+            task_id=task_id,
+            subtitle_job_id=subtitle_job_id,
+        )
+    worker_db = session_factory()
+    try:
+        return _research_discovered_term(
+            worker_db,
+            item=item,
+            target_lang=target_lang,
+            rag_settings=rag_settings,
+            embedding_settings=embedding_settings,
+            chat_config=chat_config,
+            text_value=text_value,
+            llm_context=llm_context,
+            previous_summary=previous_summary,
+            existing_term_cards=existing_term_cards,
+            gate_duration_ms=gate_duration_ms,
+            task_id=task_id,
+            subtitle_job_id=subtitle_job_id,
+        )
+    finally:
+        worker_db.close()
+
+
+def _run_research_agents(
+    *,
+    db: Session,
+    session_factory: Callable[[], Session] | None,
+    items: list[dict[str, Any]],
+    target_lang: str,
+    rag_settings: RagSettings,
+    embedding_settings: EmbeddingSettings,
+    chat_config: OpenAIChatConfig,
+    text_value: str,
+    llm_context: str,
+    previous_summary: str,
+    existing_term_cards: list[dict[str, Any]],
+    gate_duration_ms: int | None,
+    task_id: str | None,
+    subtitle_job_id: str | None,
+) -> list[AgentResearchResult]:
+    if not items:
+        return []
+    parallelism = max(1, min(8, int(rag_settings.agent_parallelism or 1)))
+    if session_factory is None:
+        parallelism = 1
+    timeout_seconds = max(10.0, min(900.0, float(rag_settings.agent_timeout_seconds or 120.0)))
+    if parallelism <= 1 or len(items) <= 1:
+        out: list[AgentResearchResult] = []
+        deadline = time.monotonic() + timeout_seconds * max(1, len(items))
+        for item in items:
+            if time.monotonic() >= deadline:
+                break
+            result = _run_research_agent(
+                db=db,
+                session_factory=None,
+                item=item,
+                target_lang=target_lang,
+                rag_settings=rag_settings,
+                embedding_settings=embedding_settings,
+                chat_config=chat_config,
+                text_value=text_value,
+                llm_context=llm_context,
+                previous_summary=previous_summary,
+                existing_term_cards=existing_term_cards,
+                gate_duration_ms=gate_duration_ms,
+                task_id=task_id,
+                subtitle_job_id=subtitle_job_id,
+            )
+            if result is not None:
+                out.append(result)
+        return out
+
+    out: list[AgentResearchResult] = []
+    max_workers = min(parallelism, len(items))
+    executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="rag-agent")
+    try:
+        futures = [
+            executor.submit(
+                _run_research_agent,
+                db=db,
+                session_factory=session_factory,
+                item=item,
+                target_lang=target_lang,
+                rag_settings=rag_settings,
+                embedding_settings=embedding_settings,
+                chat_config=chat_config,
+                text_value=text_value,
+                llm_context=llm_context,
+                previous_summary=previous_summary,
+                existing_term_cards=existing_term_cards,
+                gate_duration_ms=gate_duration_ms,
+                task_id=task_id,
+                subtitle_job_id=subtitle_job_id,
+            )
+            for item in items
+        ]
+        try:
+            for future in as_completed(futures, timeout=timeout_seconds * max(1, math.ceil(len(items) / max_workers))):
+                try:
+                    result = future.result()
+                except Exception:
+                    result = None
+                if result is not None:
+                    out.append(result)
+        except FuturesTimeoutError:
+            for future in futures:
+                future.cancel()
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+    return out
+
+
 def build_rag_context(
     db: Session,
     *,
@@ -1516,6 +2542,8 @@ def build_rag_context(
     rag_settings: RagSettings,
     embedding_settings: EmbeddingSettings,
     chat_config: OpenAIChatConfig,
+    previous_summary: str = "",
+    session_factory: Callable[[], Session] | None = None,
     task_id: str | None = None,
     subtitle_job_id: str | None = None,
 ) -> RagContext:
@@ -1525,9 +2553,31 @@ def build_rag_context(
     text_value = "\n".join([str(s.text or "").strip() for s in segments if str(s.text or "").strip()])
     if not text_value:
         return RagContext(term_cards=[], knowledge_cards=[], hits=[])
+    llm_context = _context_for_llm(text_value, previous_summary=previous_summary, limit=9000)
 
     hits: list[RagHit] = []
     seen_ids: set[str] = set()
+    gate_terms: list[dict[str, Any]] | None = None
+    gate_norms: set[str] = set()
+    gate_duration_ms: int | None = None
+
+    if rag_settings.auto_discover_terms:
+        gate_started = time.perf_counter()
+        try:
+            gate_terms = pretranslation_rag_gate_openai(
+                text_value,
+                target_lang=target_lang,
+                domain_hint=rag_settings.domain,
+                existing_terms=[],
+                previous_summary=previous_summary,
+                config=chat_config,
+            )
+            gate_norms = {normalize_term(str(item.get("term") or "")) for item in gate_terms if isinstance(item, dict)}
+            gate_norms.discard("")
+        except Exception:
+            gate_terms = None
+        gate_duration_ms = _duration_ms(gate_started)
+
     for hit in exact_term_hits(
         db,
         text_value=text_value,
@@ -1535,41 +2585,83 @@ def build_rag_context(
         domain=rag_settings.domain,
         limit=max(rag_settings.top_k * 2, 10),
     ):
+        if gate_terms is not None and normalize_term(hit.term) not in gate_norms:
+            continue
         if hit.id not in seen_ids:
             seen_ids.add(hit.id)
             hits.append(hit)
 
     try:
-        query_embedding = embed_text(text_value[:8000], settings=embedding_settings)
-        assert_embedding_dimensions(query_embedding, rag_settings.embedding_dimensions)
-        for hit in search_knowledge(
-            db,
-            query_embedding=query_embedding,
-            target_lang=target_lang,
-            domain=rag_settings.domain,
-            embedding_model=embedding_model_key(rag_settings),
-            top_k=rag_settings.top_k,
-            min_score=rag_settings.min_score,
-        ):
-            if hit.id not in seen_ids:
-                seen_ids.add(hit.id)
-                hits.append(hit)
+        rag_query_text = text_value[:8000]
+        if gate_terms is not None:
+            rag_query_text = "\n".join(
+                [
+                    " | ".join(
+                        [
+                            str(item.get("term") or "").strip(),
+                            str(item.get("category") or "").strip(),
+                            str(item.get("reason") or "").strip(),
+                        ]
+                    ).strip(" |")
+                    for item in gate_terms
+                    if isinstance(item, dict) and str(item.get("term") or "").strip()
+                ]
+            )
+        if rag_query_text.strip():
+            query_embedding = embed_text(rag_query_text[:8000], settings=embedding_settings)
+            assert_embedding_dimensions(query_embedding, rag_settings.embedding_dimensions)
+            for hit in search_knowledge(
+                db,
+                query_embedding=query_embedding,
+                target_lang=target_lang,
+                domain=rag_settings.domain,
+                embedding_model=embedding_model_key(rag_settings),
+                top_k=rag_settings.top_k,
+                min_score=rag_settings.min_score,
+            ):
+                if gate_terms is not None and hit.item_type == "term" and normalize_term(hit.term) not in gate_norms:
+                    continue
+                if hit.id not in seen_ids:
+                    seen_ids.add(hit.id)
+                    hits.append(hit)
     except Exception:
         query_embedding = []
 
     context_only_cards: list[dict[str, Any]] = []
 
     if rag_settings.auto_discover_terms:
-        try:
-            discovered = discover_terms_openai(
-                text_value,
-                target_lang=target_lang,
-                domain_hint=rag_settings.domain,
-                config=chat_config,
-            )
-        except Exception:
-            discovered = []
         known_norms = {normalize_term(h.term) for h in hits if h.term}
+        existing_term_cards = [
+            {
+                "term": hit.term,
+                "translation": hit.translation,
+                "domain": hit.domain,
+                "score": round(hit.score, 4),
+            }
+            for hit in hits
+            if hit.item_type == "term"
+        ]
+        discovered = gate_terms
+        if discovered is None:
+            fallback_started = time.perf_counter()
+            try:
+                discovered = discover_terms_openai(
+                    text_value,
+                    target_lang=target_lang,
+                    domain_hint=rag_settings.domain,
+                    previous_summary=previous_summary,
+                    config=chat_config,
+                )
+                for item in discovered:
+                    item.setdefault("need_rag", True)
+                    item.setdefault("need_search", True)
+                    item.setdefault("scope", "global")
+                    item.setdefault("category", "legacy_discovery")
+                    item.setdefault("priority", 0.5)
+            except Exception:
+                discovered = []
+            gate_duration_ms = _duration_ms(fallback_started)
+        research_items: list[dict[str, Any]] = []
         for item in discovered:
             term = str(item.get("term") or "").strip()
             norm = normalize_term(term)
@@ -1577,352 +2669,32 @@ def build_rag_context(
                 continue
             if not rag_settings.auto_learn_terms:
                 continue
-            domain_hint = str(item.get("domain") or rag_settings.domain or "").strip()
-            query = " ".join([p for p in [domain_hint, term] if p]).strip()
-            agent_run_id: str | None = None
-            try:
-                agent_run_id = _start_agent_run(
-                    db,
-                    term=term,
-                    domain=domain_hint,
-                    target_lang=target_lang,
-                    query=query,
-                    task_id=task_id,
-                    subtitle_job_id=subtitle_job_id,
-                )
-                _append_llm_step(
-                    db,
-                    agent_run_id,
-                    action="term_discovered",
-                    config=chat_config,
-                    output_value={
-                        "term": term,
-                        "domain": domain_hint,
-                        "reason": str(item.get("reason") or "").strip(),
-                    },
-                )
-            except Exception:
-                db.rollback()
-                agent_run_id = None
-
-            research_policy = should_research_term(term, domain=domain_hint, context=text_value)
-            _append_agent_step(
-                db,
-                agent_run_id,
-                {
-                    "kind": "policy",
-                    "action": "term_research_policy",
-                    "term": term,
-                    "domain": domain_hint,
-                    "decision": research_policy,
-                },
-            )
-            if not research_policy.get("should_research"):
-                if research_policy.get("category") == "context_only" and research_policy.get("translation"):
-                    context_only_cards.append(_context_only_term_card(term, research_policy, target_lang=target_lang, domain=domain_hint))
-                _finish_agent_run(
-                    db,
-                    agent_run_id,
-                    status="skipped",
-                    result={
-                        "term": term,
-                        "domain": domain_hint,
-                        "knowledge_status": str(research_policy.get("category") or "skipped"),
-                        "failure_category": str(research_policy.get("category") or "skipped"),
-                        "reason": str(research_policy.get("reason") or ""),
-                    },
-                )
-                known_norms.add(norm)
-                continue
-
-            search_queries: list[str] = []
-            if rag_settings.search_enabled:
-                started = time.perf_counter()
-                try:
-                    search_queries = generate_search_queries_openai(
-                        term=term,
-                        context=text_value,
-                        target_lang=target_lang,
-                        domain_hint=domain_hint,
-                        config=chat_config,
-                        max_queries=3,
-                    )
-                    _append_llm_step(
-                        db,
-                        agent_run_id,
-                        action="generate_search_queries",
-                        config=chat_config,
-                        input_value={"term": term, "domain": domain_hint, "context_excerpt": text_value[:500]},
-                        output_value={"queries": search_queries},
-                        duration_ms=_duration_ms(started),
-                    )
-                except Exception as e:
-                    search_queries = _fallback_search_queries(term, domain=domain_hint, target_lang=target_lang, limit=3)
-                    _append_llm_step(
-                        db,
-                        agent_run_id,
-                        action="generate_search_queries_failed",
-                        config=chat_config,
-                        duration_ms=_duration_ms(started),
-                        error=str(e)[:300],
-                        error_type=type(e).__name__,
-                    )
-                    _append_agent_step(
-                        db,
-                        agent_run_id,
-                        {
-                            "kind": "policy",
-                            "action": "search_query_fallback",
-                            "queries": search_queries,
-                            "reason": "LLM query generation failed; using deterministic fallback queries.",
-                        },
-                    )
-            evidence = []
-            if rag_settings.search_enabled:
-                evidence = fetch_search_evidence(
-                    term,
-                    domain=domain_hint,
-                    search_url=rag_settings.search_url,
-                    queries=search_queries,
-                    context=text_value,
-                    target_lang=target_lang,
-                    config=chat_config,
-                    db=db,
-                    agent_run_id=agent_run_id,
-                )
-            if not evidence:
-                _finish_agent_run(
-                    db,
-                    agent_run_id,
-                    status="failed",
-                    result={
-                        "term": term,
-                        "domain": domain_hint,
-                        "search_queries": search_queries,
-                        "failure_category": "no_search_evidence",
-                    },
-                    error="no search evidence",
-                )
-                continue
-            try:
-                summarize_started = time.perf_counter()
-                explained = explain_term_from_evidence_openai(
-                    term=term,
-                    context=text_value,
-                    target_lang=target_lang,
-                    domain_hint=domain_hint,
-                    evidence=evidence,
-                    config=chat_config,
-                )
-                _append_llm_step(
-                    db,
-                    agent_run_id,
-                    action="summarize_evidence",
-                    config=chat_config,
-                    input_value={"term": term, "domain": domain_hint, "evidence_count": len(evidence)},
-                    output_value={
-                        "term": str((explained or {}).get("term") or term),
-                        "translation": str((explained or {}).get("translation") or ""),
-                        "confidence": float((explained or {}).get("confidence") or 0.0),
-                    },
-                    duration_ms=_duration_ms(summarize_started),
-                )
-            except Exception as e:
-                _append_llm_step(
-                    db,
-                    agent_run_id,
-                    action="summarize_failed",
-                    config=chat_config,
-                    error=str(e)[:300],
-                    error_type=type(e).__name__,
-                )
-                explained = None
-            if not explained:
-                _finish_agent_run(
-                    db,
-                    agent_run_id,
-                    status="failed",
-                    result={"term": term, "domain": domain_hint, "evidence_count": len(evidence), "failure_category": "summarize_failed"},
-                    error="LLM did not produce a usable glossary entry",
-                )
-                continue
-
-            valid_sources = _valid_external_evidence(evidence, search_url=rag_settings.search_url)
-            try:
-                verify_started = time.perf_counter()
-                verification = verify_glossary_entry_openai(
-                    term=term,
-                    context=text_value,
-                    target_lang=target_lang,
-                    domain_hint=domain_hint,
-                    evidence=evidence,
-                    candidate=explained,
-                    config=chat_config,
-                )
-                _append_llm_step(
-                    db,
-                    agent_run_id,
-                    action="verify_glossary_entry",
-                    config=chat_config,
-                    input_value={
-                        "term": term,
-                        "candidate_confidence": float(explained.get("confidence") or 0.0),
-                        "valid_source_count": len(valid_sources),
-                    },
-                    output_value=verification,
-                    duration_ms=_duration_ms(verify_started),
-                )
-            except Exception as e:
-                verification = {
-                    "supported": False,
-                    "context_consistent": False,
-                    "should_write": False,
-                    "should_auto_approve": False,
-                    "confidence": 0.0,
-                    "reason": "verifier failed",
-                    "failure_category": "verify_failed",
-                }
-                _append_llm_step(
-                    db,
-                    agent_run_id,
-                    action="verify_failed",
-                    config=chat_config,
-                    error=str(e)[:300],
-                    error_type=type(e).__name__,
-                )
-
-            candidate_confidence = float(explained.get("confidence") or 0.0)
-            verifier_confidence = float(verification.get("confidence") or 0.0)
-            final_confidence = min(candidate_confidence, verifier_confidence) if verifier_confidence > 0 else candidate_confidence
-            should_write = (
-                bool(verification.get("supported"))
-                and bool(verification.get("context_consistent"))
-                and bool(verification.get("should_write"))
-                and bool(valid_sources)
-            )
-            if not should_write:
-                failure_category = str(verification.get("failure_category") or "")
-                if not valid_sources:
-                    failure_category = failure_category or "no_valid_external_source"
-                _finish_agent_run(
-                    db,
-                    agent_run_id,
-                    status="skipped",
-                    result={
-                        "term": str(explained.get("term") or term),
-                        "translation": str(explained.get("translation") or ""),
-                        "domain": str(explained.get("domain") or domain_hint or ""),
-                        "confidence": final_confidence,
-                        "knowledge_status": "context_only" if failure_category == "context_only" else "not_written",
-                        "failure_category": failure_category or "verify_rejected",
-                        "verification": verification,
-                        "valid_source_count": len(valid_sources),
-                        "search_queries": search_queries,
-                    },
-                    error=str(verification.get("reason") or "verifier rejected glossary entry")[:4000],
-                )
-                known_norms.add(norm)
-                continue
-
-            status = (
-                "auto_approved"
-                if bool(verification.get("should_auto_approve")) and final_confidence >= _AUTO_APPROVE_CONFIDENCE_THRESHOLD
-                else "pending"
-            )
-            source_list = [x for x in explained.get("sources") or [] if isinstance(x, dict)] or valid_sources
-            try:
-                _append_agent_step(
-                    db,
-                    agent_run_id,
-                    {
-                        "kind": "policy",
-                        "action": "knowledge_write_decision",
-                        "term": str(explained.get("term") or term),
-                        "translation": str(explained.get("translation") or ""),
-                        "confidence": final_confidence,
-                        "status": status,
-                        "auto_threshold": _AUTO_APPROVE_CONFIDENCE_THRESHOLD,
-                        "valid_source_count": len(valid_sources),
-                    },
-                )
-                emb_text = build_knowledge_embedding_text(
-                    item_type="term",
-                    term=str(explained.get("term") or term),
-                    translation=str(explained.get("translation") or ""),
-                    domain=str(explained.get("domain") or ""),
-                    aliases=[str(x) for x in explained.get("aliases") or []],
-                    description=str(explained.get("description") or ""),
-                )
-                emb = embed_text(emb_text, settings=embedding_settings)
-                assert_embedding_dimensions(emb, rag_settings.embedding_dimensions)
-                learned_id = upsert_knowledge_item(
-                    db,
-                    item_type="term",
-                    target_lang=target_lang,
-                    term=str(explained.get("term") or term),
-                    translation=str(explained.get("translation") or ""),
-                    domain=str(explained.get("domain") or rag_settings.domain or ""),
-                    aliases=[str(x) for x in explained.get("aliases") or []],
-                    description=str(explained.get("description") or ""),
-                    sources=source_list,
-                    confidence=final_confidence,
-                    status=status,
-                    created_by="agent",
-                    embedding=emb,
-                    embedding_model=embedding_model_key(rag_settings),
-                )
-                db.commit()
-                _finish_agent_run(
-                    db,
-                    agent_run_id,
-                    status="succeeded",
-                    result={
-                        "term": str(explained.get("term") or term),
-                        "translation": str(explained.get("translation") or ""),
-                        "domain": str(explained.get("domain") or rag_settings.domain or ""),
-                        "confidence": final_confidence,
-                        "knowledge_status": status,
-                        "verification": verification,
-                        "valid_source_count": len(valid_sources),
-                        "search_queries": search_queries,
-                        "sources": source_list[:5],
-                    },
-                    knowledge_item_id=learned_id,
-                )
-                known_norms.add(norm)
-                if status == "auto_approved":
-                    hits.append(
-                        RagHit(
-                            id=learned_id,
-                            item_type="term",
-                            term=str(explained.get("term") or term),
-                            translation=str(explained.get("translation") or ""),
-                            target_lang=target_lang,
-                            domain=str(explained.get("domain") or rag_settings.domain or ""),
-                            aliases=[str(x) for x in explained.get("aliases") or []],
-                            title="",
-                            content="",
-                            description=str(explained.get("description") or ""),
-                            sources=source_list,
-                            confidence=final_confidence,
-                            status=status,
-                            score=final_confidence,
-                        )
-                    )
-            except Exception as e:
-                db.rollback()
-                _finish_agent_run(
-                    db,
-                    agent_run_id,
-                    status="failed",
-                    result={
-                        "term": str(explained.get("term") or term),
-                        "translation": str(explained.get("translation") or ""),
-                        "confidence": final_confidence,
-                        "failure_category": "knowledge_save_failed",
-                    },
-                    error=f"knowledge save failed: {e}",
-                )
+            research_items.append(item)
+            known_norms.add(norm)
+        for result in _run_research_agents(
+            db=db,
+            session_factory=session_factory,
+            items=research_items,
+            target_lang=target_lang,
+            rag_settings=rag_settings,
+            embedding_settings=embedding_settings,
+            chat_config=chat_config,
+            text_value=text_value,
+            llm_context=llm_context,
+            previous_summary=previous_summary,
+            existing_term_cards=existing_term_cards,
+            gate_duration_ms=gate_duration_ms,
+            task_id=task_id,
+            subtitle_job_id=subtitle_job_id,
+        ):
+            if result.normalized_term:
+                known_norms.add(result.normalized_term)
+            if result.context_card:
+                context_only_cards.append(result.context_card)
+            if result.hit and result.hit.id not in seen_ids:
+                seen_ids.add(result.hit.id)
+                hits.append(result.hit)
+        discovered = []
 
     term_cards: list[dict[str, Any]] = list(context_only_cards)
     knowledge_cards: list[dict[str, Any]] = []
@@ -2063,6 +2835,14 @@ def list_knowledge_items(db: Session, *, item_type: str | None = None, status: s
             }
         )
     return out
+
+
+def delete_knowledge_item(db: Session, item_id: str) -> bool:
+    result = db.execute(
+        text("DELETE FROM translation_knowledge_items WHERE id = CAST(:id AS uuid)"),
+        {"id": str(item_id or "").strip()},
+    )
+    return int(getattr(result, "rowcount", 0) or 0) > 0
 
 
 def list_agent_runs(db: Session, *, status: str | None = None, limit: int = 50) -> list[dict[str, Any]]:

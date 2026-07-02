@@ -210,11 +210,17 @@ class TranslateSettingsRead(BaseModel):
     rag_embedding_dimensions: int = 1536
     rag_embedding_model_dir: str = "/models/embeddings"
     rag_embedding_device: str = "cpu"
+    rag_embedding_api_key_set: bool = False
+    rag_embedding_base_url: str = ""
+    rag_embedding_timeout_seconds: float = 60.0
     rag_auto_discover_terms: bool = False
     rag_auto_learn_terms: bool = False
+    rag_wiki_enabled: bool = False
     rag_search_enabled: bool = False
     rag_search_url: str = ""
     rag_domain: str = ""
+    rag_agent_parallelism: int = 1
+    rag_agent_timeout_seconds: float = 120.0
 
 
 class TranslateSettingsUpdate(BaseModel):
@@ -240,11 +246,17 @@ class TranslateSettingsUpdate(BaseModel):
     rag_embedding_dimensions: Optional[int] = Field(default=None, ge=1, le=4096)
     rag_embedding_model_dir: Optional[str] = None
     rag_embedding_device: Optional[str] = None
+    rag_embedding_api_key: Optional[str] = None
+    rag_embedding_base_url: Optional[str] = None
+    rag_embedding_timeout_seconds: Optional[float] = None
     rag_auto_discover_terms: Optional[bool] = None
     rag_auto_learn_terms: Optional[bool] = None
+    rag_wiki_enabled: Optional[bool] = None
     rag_search_enabled: Optional[bool] = None
     rag_search_url: Optional[str] = None
     rag_domain: Optional[str] = None
+    rag_agent_parallelism: Optional[int] = Field(default=None, ge=1, le=8)
+    rag_agent_timeout_seconds: Optional[float] = Field(default=None, ge=10.0, le=900.0)
 
 
 class TranslateTestRequest(BaseModel):
@@ -357,6 +369,9 @@ class EmbeddingTestRequest(BaseModel):
     text: str = "hello world"
     provider: Optional[str] = None
     model: Optional[str] = None
+    api_key: Optional[str] = None
+    base_url: Optional[str] = None
+    timeout_seconds: Optional[float] = None
     model_dir: Optional[str] = None
     dimensions: Optional[int] = None
     device: Optional[str] = None

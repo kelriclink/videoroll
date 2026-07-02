@@ -6,9 +6,41 @@
 
 ---
 
-## 1. 总体拆分：三大模块 + 一个编排层（Orchestrator）
+## 1. 当前显著能力
 
-### 1.1 模块列表与边界
+当前实现已经从“普通字幕翻译流水线”升级为带可观测 RAG Agent 的视频翻译系统，重点能力如下：
+
+- **字幕翻译 RAG gate**：每个翻译 block 开始前，LLM 先结合当前字幕和前文 summary 判断哪些术语真的需要检索，避免把基础词、局部变量、普通短语都塞进知识库。
+- **PostgreSQL + pgvector 知识库**：保存术语、译法、领域、别名、解释、来源、置信度、状态和 embedding，翻译时按向量相似度召回并注入上下文。
+- **单 Agent + 多 Tool 架构**：术语研究 Agent 统一调度 RAG、Wikipedia、SearXNG、网页读取、总结、验证和写库，不一开始拆成多个松散 Agent。
+- **Wikipedia Tool**：固定使用 English Wikipedia API，适合百科型专有名词和通用背景知识；不用在配置里维护各种不通用的 wiki 地址。
+- **SearXNG Tool**：可接入自建 SearXNG，配置填写 base URL，系统自动请求 `/search?q=...&format=json` 并过滤搜索引擎自身页面等无效结果。
+- **网页正文读取 Tool**：当搜索摘要不足时，Agent 可以打开候选链接抽取正文，再交给 LLM 总结证据。
+- **Verifier 入库保护**：候选术语会经过 verifier 判断来源是否支撑、是否和字幕上下文一致、置信度是否足够；不满足条件时不会污染长期知识库。
+- **并发术语研究**：翻译设置里可调整 RAG Agent 并发数和超时时间，让多个需要查证的术语同时研究，最后合并回当前翻译上下文。
+- **独立 embedding 配置**：翻译模型和 embedding 模型的 API key/base URL 分开；embedding 支持 OpenAI 兼容接口和本地模型目录。
+- **Web 管理与可观测性**：知识库页面支持查看、新增、删除条目；Dashboard 可查看资源监控、正在运行的 Agent、历史 trace 和每步 JSON 输入输出。
+
+核心翻译流程：
+
+```text
+字幕 block + 前文 summary
+  -> RAG gate 判断需要检索的术语
+  -> 查询 pgvector 知识库
+  -> 未命中时并发启动术语研究 Agent
+  -> Wikipedia / SearXNG / fetch tools 收集证据
+  -> LLM summarize 生成候选译法
+  -> verifier 校验来源和上下文
+  -> 写入知识库或标记为 pending/context_only/skipped
+  -> 将命中知识和本次研究结果注入翻译 prompt
+  -> 输出当前 block 翻译并更新 summary
+```
+
+---
+
+## 2. 总体拆分：三大模块 + 一个编排层（Orchestrator）
+
+### 2.1 模块列表与边界
 
 1) **subtitle-service（字幕/翻译模块）**
 - 只负责：从视频/音频生成字幕（转写 + 可选翻译 + 可选润色/术语表 + 排版对齐），并按配置输出字幕文件；可选产生“带字幕的视频”（硬字幕 burn-in / 软字幕 soft-sub）。
@@ -26,7 +58,7 @@
 - 负责：任务状态机、队列分发、产物索引（assets）、人工审核、模板管理、凭据加密存储、审计日志与告警。
 - 原则：不写平台/ASR 的细节逻辑，只调度模块并记录结果。
 
-### 1.2 两种落地方式（推荐先 1 后 2）
+### 2.2 两种落地方式（推荐先 1 后 2）
 
 **方式 A：Monorepo + 进程级解耦（推荐起步）**
 - 同仓库放四个服务/包，但每个模块都有自己的入口、配置、依赖、接口。
@@ -38,13 +70,13 @@
 
 ---
 
-## 2. 统一“产物契约”（Artifact Contract）：模块解耦关键
+## 3. 统一“产物契约”（Artifact Contract）：模块解耦关键
 
 模块之间只通过两类东西交互：
 1) **DB 里 task 的状态与元信息**
 2) **对象存储里的产物 key（S3/MinIO）**
 
-### 2.1 存储 Key 规范（示例）
+### 3.1 存储 Key 规范（示例）
 
 建议按 `tenant/account/task_id` 分层，便于多账号与隔离：
 
@@ -62,7 +94,7 @@
 - `meta/{task_id}/publish_result.json`
 - `logs/{task_id}/stage_{name}.log`
 
-### 2.2 产物对象最小字段（建议）
+### 3.2 产物对象最小字段（建议）
 
 每个产物在 DB 的 `assets` 表里记录：
 - `task_id`
@@ -75,11 +107,11 @@
 
 ---
 
-## 3. 任务状态机（由 Orchestrator 维护）
+## 4. 任务状态机（由 Orchestrator 维护）
 
 建议把任务拆成“内容接入/下载”、“字幕制作”、“发布”三段，每段内部再细分 stage；每个 stage 都是**幂等**、可重试、可断点续跑。
 
-### 3.1 建议状态枚举（可按需要裁剪）
+### 4.1 建议状态枚举（可按需要裁剪）
 
 - `CREATED`（任务创建）
 - `INGESTED`（已拉取元信息/已入库）
@@ -96,7 +128,7 @@
 - `FAILED`（带 error_code，可重试标记）
 - `CANCELED`
 
-### 3.2 幂等/重试原则
+### 4.2 幂等/重试原则
 
 - 每个 stage 以 `task_id + stage_name` 作为幂等键；产物存在则跳过或做一致性校验。
 - `FAILED` 不代表终止，保存 `error_code` 和 `is_retryable`，支持手动/自动重试。
@@ -104,9 +136,9 @@
 
 ---
 
-## 4. subtitle-service（字幕/翻译模块）设计（重点）
+## 5. subtitle-service（字幕/翻译模块）设计（重点）
 
-### 4.1 支持的业务场景
+### 5.1 支持的业务场景
 
 1) **仅生成字幕文件**
 - 输入：你的本地视频（上传到存储）、或系统已有 `raw/{task_id}/video.mp4`
@@ -123,7 +155,7 @@
 4) **双语字幕**
 - 输出：`subtitle_bi.srt` 或 `subtitle_bi.ass`（上/下行）
 
-### 4.2 内部流水线（可拆分 job）
+### 5.2 内部流水线（可拆分 job）
 
 **S1 音频提取（FFmpeg）**
 - 输入：视频文件
@@ -136,7 +168,10 @@
 **S3 翻译（可选）**
 - 输入：`segments.json` 或 `subtitle_src.srt`
 - 输出：`subtitle_zh.srt`
-- 可插拔 provider：LLM / 翻译引擎；支持 `glossary`（术语表）和 `do_not_translate`（专有名词表）。
+- 可插拔 provider：LLM / 翻译引擎。
+- 翻译前可启用 RAG gate：结合当前 block 和前文 summary 发现需要查询的术语，先查 PostgreSQL/pgvector，未命中时由 Agent 调用 Wikipedia、SearXNG 和网页读取工具补充证据。
+- RAG 结果不会无条件写入长期知识库；必须经过 verifier 校验来源、上下文一致性和置信度。
+- 支持手动知识库条目、自动学习条目、context_only 临时提示和 pending 待确认条目。
 
 **S4 字幕排版与对齐（强烈建议做）**
 目标：可读性与节奏一致
@@ -149,9 +184,9 @@
 - burn-in：FFmpeg + ASS（推荐用 ASS 样式作为输入，效果更好）
 - soft-sub：容器封装（建议 MKV，MP4 的字幕支持更有限）
 
-### 4.3 对外接口（建议：HTTP + Job 模式）
+### 5.3 对外接口（建议：HTTP + Job 模式）
 
-#### 4.3.1 创建字幕任务
+#### 5.3.1 创建字幕任务
 `POST /subtitle/jobs`
 
 请求（示例）：
@@ -180,7 +215,7 @@
 { "job_id": "uuid", "status": "queued" }
 ```
 
-#### 4.3.2 查询任务状态
+#### 5.3.2 查询任务状态
 `GET /subtitle/jobs/{job_id}`
 
 返回（示例）：
@@ -196,7 +231,7 @@
 }
 ```
 
-### 4.4 “只出字幕 vs 压制字幕”怎么落地（推荐的参数化）
+### 5.4 “只出字幕 vs 压制字幕”怎么落地（推荐的参数化）
 
 在同一条 API 里用 `output.render` 控制即可：
 - 只出字幕：`burn_in=false, soft_sub=false`
@@ -208,11 +243,11 @@
 
 ---
 
-## 5. youtube-ingest（YouTube 接入/抓取模块）设计（与发布解耦）
+## 6. youtube-ingest（YouTube 接入/抓取模块）设计（与发布解耦）
 
 > 合规核心：**只允许白名单源**（你自己的频道/你已获授权的频道或播放列表/CC 许可明确的源），并把许可信息写入任务，支持人工补证据。
 
-### 5.1 能力清单
+### 6.1 能力清单
 
 1) **Source 管理（白名单）**
 - `channel_id` 白名单（own/authorized）
@@ -229,9 +264,9 @@
   - `manual_only`：只写元信息，不自动下载（最稳、最不触碰平台条款）
   - `downloader_plugin`：仅对 `license=own/authorized` 开启；写清楚合规责任
 
-### 5.2 对外接口（示例）
+### 6.2 对外接口（示例）
 
-#### 5.2.1 手动入队单条视频
+#### 6.2.1 手动入队单条视频
 `POST /youtube/ingest`
 ```json
 {
@@ -242,7 +277,7 @@
 }
 ```
 
-#### 5.2.2 扫描频道/播放列表
+#### 6.2.2 扫描频道/播放列表
 `POST /youtube/scan`
 ```json
 {
@@ -259,15 +294,15 @@
 - `skipped_duplicates`
 - `skipped_not_whitelisted`
 
-### 5.3 与 subtitle-service 解耦的点
+### 6.3 与 subtitle-service 解耦的点
 - youtube-ingest 只产生 `raw/metadata.json`（以及可选 `raw/video.mp4`）
 - subtitle-service 不关心 YouTube，只关心 `raw/video.mp4` 是否存在
 
 ---
 
-## 6. bilibili-publisher（B 站上传投稿模块）设计（只接 final 包）
+## 7. bilibili-publisher（B 站上传投稿模块）设计（只接 final 包）
 
-### 6.1 输入契约：Publish Package
+### 7.1 输入契约：Publish Package
 
 `POST /bilibili/publish`
 ```json
@@ -288,7 +323,7 @@
 }
 ```
 
-### 6.2 输出：发布结果
+### 7.2 输出：发布结果
 
 ```json
 {
@@ -299,7 +334,7 @@
 }
 ```
 
-### 6.3 关键工程点（不涉及绕过风控）
+### 7.3 关键工程点（不涉及绕过风控）
 - 分片/断点续传：上传过程要可恢复（网络抖动常见）
 - 速率限制：同账号投稿间隔、每日上限（避免触发平台限制）
 - 凭据安全：cookie/csrf 不在日志里打印，DB 加密存储
@@ -307,16 +342,18 @@
 
 ---
 
-## 7. Orchestrator（编排层）要做的“产品能力”
+## 8. Orchestrator（编排层）要做的“产品能力”
 
-### 7.1 Web 管控台核心功能
+### 8.1 Web 管控台核心功能
 - 任务列表：状态筛选、搜索、批量重试/取消
 - 任务详情：查看每 stage 的日志与产物；字幕文件在线预览/编辑；投稿 meta 编辑；审核通过/驳回
+- Dashboard：任务状态、队列概览、CPU/内存/Intel GPU 资源监控、RAG Agent 运行状态和历史 trace
+- 知识库管理：查看、新增、删除 RAG 条目；触发 embedding 重建
 - 模板中心：标题/简介/标签/分区/动态文案模板，支持变量（如 `{source_title}`、`{publish_date}`）
 - 账号与凭据：B 站凭据录入与轮换提醒；权限控制
 - 系统设置：并发数、重试策略、队列开关、通知（Webhook/邮件等）
 
-### 7.2 队列编排建议
+### 8.2 队列编排建议
 如果用队列（推荐）：
 - `queue:ingest`（youtube-ingest 相关）
 - `queue:subtitle`（subtitle-service 相关）
@@ -327,7 +364,7 @@
 
 ---
 
-## 8. 最小可运行里程碑（建议）
+## 9. 最小可运行里程碑（建议）
 
 **M1：本地视频 → 中文字幕 SRT**
 - Web 创建任务 + 上传本地视频到存储
@@ -344,9 +381,16 @@
 **M4：YouTube 授权源扫描**
 - 只做白名单源发现 + 入队（download 先关）
 
+**M5：RAG Agent 翻译增强**
+- PostgreSQL + pgvector 知识库
+- RAG gate + 术语噪声过滤
+- Wikipedia / SearXNG / fetch tools
+- verifier 保守入库
+- Dashboard trace 与知识库管理页面
+
 ---
 
-## 9. 你需要提前确定的 5 个关键选项（决定代码形态）
+## 10. 你需要提前确定的 5 个关键选项（决定代码形态）
 
 1) 技术栈：**Python（FastAPI + Celery）** 还是 **Node（NestJS + BullMQ）**
 2) ASR：本地（faster-whisper）还是云（可插拔）

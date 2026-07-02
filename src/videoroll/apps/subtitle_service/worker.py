@@ -1374,7 +1374,7 @@ def process_job(self: Any, job_id: str) -> dict[str, str]:
                             )
 
                         def _rag_context_provider(batch_segments: list[Segment], start_idx: int, summary: str) -> dict[str, Any] | None:
-                            del start_idx, summary
+                            del start_idx
                             if not rag_settings.enabled:
                                 return None
                             ctx = build_rag_context(
@@ -1384,6 +1384,8 @@ def process_job(self: Any, job_id: str) -> dict[str, str]:
                                 rag_settings=rag_settings,
                                 embedding_settings=rag_embedding_settings,
                                 chat_config=rag_chat_config,
+                                previous_summary=summary,
+                                session_factory=lambda: get_sessionmaker(settings.database_url)(),
                                 task_id=str(task.id),
                                 subtitle_job_id=str(job.id),
                             )

@@ -255,6 +255,9 @@ def assert_embedding_dimensions(vector: list[float], expected: int) -> None:
 
 def embedding_settings_from_translate_settings(settings: dict[str, Any]) -> EmbeddingSettings:
     provider = normalize_embedding_provider(str(settings.get("rag_embedding_provider") or "openai"))
+    embedding_api_key = str(settings.get("rag_embedding_api_key") or "").strip() or None
+    embedding_base_url = str(settings.get("rag_embedding_base_url") or "").strip()
+    embedding_timeout = float(settings.get("rag_embedding_timeout_seconds") or 60.0)
     return EmbeddingSettings(
         provider=provider,
         model=str(settings.get("rag_embedding_model") or "text-embedding-3-small").strip() or "text-embedding-3-small",
@@ -262,10 +265,10 @@ def embedding_settings_from_translate_settings(settings: dict[str, Any]) -> Embe
         model_dir=str(settings.get("rag_embedding_model_dir") or "/models/embeddings").strip() or "/models/embeddings",
         device=str(settings.get("rag_embedding_device") or "cpu").strip() or "cpu",
         openai_config=OpenAIChatConfig(
-            api_key=str(settings.get("openai_api_key") or "").strip() or None,
-            base_url=str(settings.get("openai_base_url") or "").strip(),
+            api_key=embedding_api_key,
+            base_url=embedding_base_url,
             model=str(settings.get("rag_embedding_model") or "text-embedding-3-small").strip() or "text-embedding-3-small",
             temperature=0.0,
-            timeout_seconds=float(settings.get("openai_timeout_seconds") or 60.0),
+            timeout_seconds=embedding_timeout,
         ),
     )
