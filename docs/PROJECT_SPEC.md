@@ -8,33 +8,44 @@
 
 ## 1. 当前显著能力
 
-当前实现已经从“普通字幕翻译流水线”升级为带可观测 RAG Agent 的视频翻译系统，重点能力如下：
+当前实现已经从“普通字幕翻译流水线”升级为带可观测 RAG Agent 的视频翻译系统。重点不是把所有词都查一遍，而是在翻译前判断“哪些词确实需要外部知识”，再把可信知识注入翻译 prompt。
 
 - **字幕翻译 RAG gate**：每个翻译 block 开始前，LLM 先结合当前字幕和前文 summary 判断哪些术语真的需要检索，避免把基础词、局部变量、普通短语都塞进知识库。
 - **PostgreSQL + pgvector 知识库**：保存术语、译法、领域、别名、解释、来源、置信度、状态和 embedding，翻译时按向量相似度召回并注入上下文。
-- **单 Agent + 多 Tool 架构**：术语研究 Agent 统一调度 RAG、Wikipedia、SearXNG、网页读取、总结、验证和写库，不一开始拆成多个松散 Agent。
+- **主 Agent + 子 Agent 架构**：每个字幕 block 创建一个 `rag_master` 主 Agent；主 Agent 负责术语 gate、调度并发子 Agent、汇总结果；每个术语研究子 Agent 维护自己的 observation/evidence 上下文。
+- **工具调用循环**：子 Agent 可按需调用 `rag_lookup`、`wiki_search`、`search_web`、`fetch_url`、`finish`。工具选择由 LLM 根据当前 observation 决定，程序只做超时、重试、fallback 和写库安全控制。
 - **Wikipedia Tool**：固定使用 English Wikipedia API，适合百科型专有名词和通用背景知识；不用在配置里维护各种不通用的 wiki 地址。
 - **SearXNG Tool**：可接入自建 SearXNG，配置填写 base URL，系统自动请求 `/search?q=...&format=json` 并过滤搜索引擎自身页面等无效结果。
 - **网页正文读取 Tool**：当搜索摘要不足时，Agent 可以打开候选链接抽取正文，再交给 LLM 总结证据。
 - **Verifier 入库保护**：候选术语会经过 verifier 判断来源是否支撑、是否和字幕上下文一致、置信度是否足够；不满足条件时不会污染长期知识库。
-- **并发术语研究**：翻译设置里可调整 RAG Agent 并发数和超时时间，让多个需要查证的术语同时研究，最后合并回当前翻译上下文。
+- **并发术语研究**：翻译设置里可调整 RAG Agent 并发数和超时时间，让多个需要查证的术语同时研究；子 Agent 结束后返回结构化 `AgentResearchResult`，由主 Agent 合并回当前翻译上下文。
 - **独立 embedding 配置**：翻译模型和 embedding 模型的 API key/base URL 分开；embedding 支持 OpenAI 兼容接口和本地模型目录。
-- **Web 管理与可观测性**：知识库页面支持查看、新增、删除条目；Dashboard 可查看资源监控、正在运行的 Agent、历史 trace 和每步 JSON 输入输出。
+- **独立大模型重试配置**：翻译大模型请求的失败重试次数可在翻译设置中单独配置，不和 embedding 请求混用。
+- **Web 管理与可观测性**：知识库页面支持查看、新增、删除条目；Dashboard 可查看资源监控、主 Agent/子 Agent 运行树、历史 trace 和每步 JSON 输入输出。
 
 核心翻译流程：
 
 ```text
 字幕 block + 前文 summary
+  -> 创建 rag_master 主 Agent
   -> RAG gate 判断需要检索的术语
-  -> 查询 pgvector 知识库
-  -> 未命中时并发启动术语研究 Agent
-  -> Wikipedia / SearXNG / fetch tools 收集证据
+  -> 先查询 pgvector 知识库
+  -> 未命中时并发启动术语研究子 Agent
+  -> 子 Agent 按 observation 决定 rag/wiki/search/fetch/finish
   -> LLM summarize 生成候选译法
   -> verifier 校验来源和上下文
   -> 写入知识库或标记为 pending/context_only/skipped
-  -> 将命中知识和本次研究结果注入翻译 prompt
+  -> 子 Agent 返回 hit/context_card
+  -> 主 Agent 汇总 RagContext
+  -> 将精简后的术语卡片和知识卡片注入翻译 prompt
   -> 输出当前 block 翻译并更新 summary
 ```
+
+子 Agent 的 trace 用于调试和审计，不直接塞回翻译 prompt。最终进入翻译 prompt 的是主 Agent 汇总后的结构化上下文：
+
+- `term_cards`：术语、译法、领域、说明、来源、置信度。
+- `knowledge_cards`：文档型背景知识。
+- `hits`：原始知识库命中，用于记录匹配和使用次数。
 
 ---
 
@@ -169,7 +180,8 @@
 - 输入：`segments.json` 或 `subtitle_src.srt`
 - 输出：`subtitle_zh.srt`
 - 可插拔 provider：LLM / 翻译引擎。
-- 翻译前可启用 RAG gate：结合当前 block 和前文 summary 发现需要查询的术语，先查 PostgreSQL/pgvector，未命中时由 Agent 调用 Wikipedia、SearXNG 和网页读取工具补充证据。
+- 翻译前可启用 RAG gate：结合当前 block 和前文 summary 发现需要查询的术语；主 Agent 先查 PostgreSQL/pgvector，未命中时并发启动术语研究子 Agent。
+- 子 Agent 通过工具调用循环自行决定下一步：本地 RAG、Wikipedia、SearXNG、网页正文读取或结束研究。
 - RAG 结果不会无条件写入长期知识库；必须经过 verifier 校验来源、上下文一致性和置信度。
 - 支持手动知识库条目、自动学习条目、context_only 临时提示和 pending 待确认条目。
 
@@ -347,7 +359,7 @@
 ### 8.1 Web 管控台核心功能
 - 任务列表：状态筛选、搜索、批量重试/取消
 - 任务详情：查看每 stage 的日志与产物；字幕文件在线预览/编辑；投稿 meta 编辑；审核通过/驳回
-- Dashboard：任务状态、队列概览、CPU/内存/Intel GPU 资源监控、RAG Agent 运行状态和历史 trace
+- Dashboard：任务状态、队列概览、CPU/内存/Intel GPU 资源监控、RAG 主 Agent/子 Agent 运行树和历史 trace
 - 知识库管理：查看、新增、删除 RAG 条目；触发 embedding 重建
 - 模板中心：标题/简介/标签/分区/动态文案模板，支持变量（如 `{source_title}`、`{publish_date}`）
 - 账号与凭据：B 站凭据录入与轮换提醒；权限控制
@@ -383,8 +395,8 @@
 
 **M5：RAG Agent 翻译增强**
 - PostgreSQL + pgvector 知识库
-- RAG gate + 术语噪声过滤
-- Wikipedia / SearXNG / fetch tools
+- 主 Agent gate + 术语噪声过滤
+- 子 Agent 工具循环：RAG / Wikipedia / SearXNG / fetch URL
 - verifier 保守入库
 - Dashboard trace 与知识库管理页面
 

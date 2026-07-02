@@ -270,5 +270,6 @@ def embedding_settings_from_translate_settings(settings: dict[str, Any]) -> Embe
             model=str(settings.get("rag_embedding_model") or "text-embedding-3-small").strip() or "text-embedding-3-small",
             temperature=0.0,
             timeout_seconds=embedding_timeout,
+            embedding_dimensions=max(1, min(4096, int(settings.get("rag_embedding_dimensions") or 1536))),
         ),
     )

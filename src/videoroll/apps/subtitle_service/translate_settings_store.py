@@ -65,6 +65,7 @@ def get_translate_settings(db: Session, defaults: SubtitleServiceSettings) -> di
         "openai_model": str(openai.get("model") or defaults.openai_model),
         "openai_temperature": float(openai.get("temperature") or defaults.openai_temperature),
         "openai_timeout_seconds": float(openai.get("timeout_seconds") or defaults.openai_timeout_seconds),
+        "openai_max_retries": int(openai.get("max_retries") or stored.get("openai_max_retries") or 3),
         "rag_enabled": bool(stored.get("rag_enabled") if "rag_enabled" in stored else defaults.rag_enabled),
         "rag_top_k": int(stored.get("rag_top_k") or defaults.rag_top_k),
         "rag_min_score": float(stored.get("rag_min_score") or defaults.rag_min_score),
@@ -148,6 +149,7 @@ def update_translate_settings(db: Session, defaults: SubtitleServiceSettings, up
         ("openai_model", "model"),
         ("openai_temperature", "temperature"),
         ("openai_timeout_seconds", "timeout_seconds"),
+        ("openai_max_retries", "max_retries"),
     ]:
         if key not in update:
             continue
@@ -239,6 +241,11 @@ def update_translate_settings(db: Session, defaults: SubtitleServiceSettings, up
             openai["timeout_seconds"] = float(openai.get("timeout_seconds"))
     except Exception:
         openai["timeout_seconds"] = defaults.openai_timeout_seconds
+    try:
+        if "max_retries" in openai and openai["max_retries"] is not None:
+            openai["max_retries"] = max(1, min(10, int(openai.get("max_retries") or 3)))
+    except Exception:
+        openai["max_retries"] = 3
 
     row.value_json = stored
     db.add(row)

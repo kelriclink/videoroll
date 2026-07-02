@@ -201,6 +201,7 @@ class TranslateSettingsRead(BaseModel):
     openai_model: str
     openai_temperature: float
     openai_timeout_seconds: float
+    openai_max_retries: int = 3
 
     rag_enabled: bool = False
     rag_top_k: int = 8
@@ -237,6 +238,7 @@ class TranslateSettingsUpdate(BaseModel):
     openai_model: Optional[str] = None
     openai_temperature: Optional[float] = None
     openai_timeout_seconds: Optional[float] = None
+    openai_max_retries: Optional[int] = Field(default=None, ge=1, le=10)
 
     rag_enabled: Optional[bool] = None
     rag_top_k: Optional[int] = Field(default=None, ge=0, le=30)
@@ -341,6 +343,7 @@ class AgentRunRead(BaseModel):
     result: dict[str, Any] = Field(default_factory=dict)
     error: str = ""
     knowledge_item_id: Optional[uuid.UUID] = None
+    parent_agent_run_id: Optional[uuid.UUID] = None
     started_at: datetime
     finished_at: Optional[datetime] = None
     created_at: datetime

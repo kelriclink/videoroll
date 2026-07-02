@@ -1,11 +1,17 @@
 from __future__ import annotations
 
+import json
+
+import httpx
+
 from videoroll.ai.client import OpenAIChatConfig
+from videoroll.ai.client import request_openai_embedding
 from videoroll.apps.subtitle_service.rag import (
     _run_research_agents,
     _fallback_search_queries,
     _search_url_with_params,
     build_knowledge_embedding_text,
+    build_rag_context,
     embedding_model_key,
     fetch_search_evidence,
     fetch_wikipedia_evidence,
@@ -17,6 +23,7 @@ from videoroll.apps.subtitle_service.rag import (
     search_knowledge,
     should_research_term,
 )
+from videoroll.apps.subtitle_service.processing import Segment
 from videoroll.apps.subtitle_service.embeddings import (
     assert_embedding_dimensions,
     embed_text,
@@ -220,7 +227,7 @@ def test_run_research_agents_uses_session_factory_for_parallel_terms(monkeypatch
     from videoroll.apps.subtitle_service import rag as rag_module
 
     created_sessions: list[object] = []
-    calls: list[tuple[object, str]] = []
+    calls: list[tuple[object, str, str | None]] = []
 
     class _Session:
         def close(self) -> None:
@@ -231,9 +238,9 @@ def test_run_research_agents_uses_session_factory_for_parallel_terms(monkeypatch
         created_sessions.append(session)
         return session
 
-    def fake_research(db, *, item, **_kwargs):
+    def fake_research(db, *, item, **kwargs):
         term = item["term"]
-        calls.append((db, term))
+        calls.append((db, term, kwargs.get("parent_agent_run_id")))
         return rag_module.AgentResearchResult(term=term, normalized_term=normalize_term(term))
 
     monkeypatch.setattr(rag_module, "_research_discovered_term", fake_research)
@@ -259,13 +266,15 @@ def test_run_research_agents_uses_session_factory_for_parallel_terms(monkeypatch
         previous_summary="",
         existing_term_cards=[],
         gate_duration_ms=1,
+        parent_agent_run_id="master-run",
         task_id=None,
         subtitle_job_id=None,
     )
 
     assert {item.term for item in results} == {"AWP", "Rush B"}
     assert len(created_sessions) == 2
-    assert {id(db) for db, _term in calls} == {id(session) for session in created_sessions}
+    assert {id(db) for db, _term, _parent in calls} == {id(session) for session in created_sessions}
+    assert {parent for _db, _term, parent in calls} == {"master-run"}
 
 
 def test_fallback_search_queries_include_definition_and_target_language() -> None:
@@ -371,6 +380,33 @@ def test_assert_embedding_dimensions() -> None:
         raise AssertionError("expected dimension mismatch")
 
 
+def test_openai_embedding_request_sends_dimensions() -> None:
+    requests: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        data = dict(json.loads(request.content.decode("utf-8")))
+        requests.append(data)
+        assert data["model"] == "Qwen3-Embedding-8B"
+        assert data["input"] == "纳米"
+        assert data["dimensions"] == 4096
+        return httpx.Response(200, json={"data": [{"embedding": [0.1, 0.2]}]})
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    vector = request_openai_embedding(
+        config=OpenAIChatConfig(
+            api_key="embed-key",
+            base_url="https://embedding.example/v1",
+            model="Qwen3-Embedding-8B",
+            embedding_dimensions=4096,
+        ),
+        text="纳米",
+        client=client,
+    )
+
+    assert vector == [0.1, 0.2]
+    assert requests
+
+
 class _Result:
     def __init__(self, rows: list[object]) -> None:
         self._rows = rows
@@ -406,6 +442,176 @@ class _FakeKnowledgeDb:
 
     def begin_nested(self) -> _NestedTransaction:
         return _NestedTransaction()
+
+
+def test_research_falls_back_to_search_when_wiki_verification_rejects(monkeypatch) -> None:
+    from videoroll.apps.subtitle_service import rag as rag_module
+
+    tool_calls: list[str] = []
+    steps: list[dict[str, object]] = []
+    finished: dict[str, object] = {}
+
+    monkeypatch.setattr(rag_module, "_start_agent_run", lambda *_args, **_kwargs: "run-1")
+    monkeypatch.setattr(rag_module, "_append_llm_step", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(rag_module, "_append_agent_step", lambda _db, _run_id, step: steps.append(step))
+    monkeypatch.setattr(
+        rag_module,
+        "_finish_agent_run",
+        lambda _db, _run_id, **kwargs: finished.update(kwargs),
+    )
+    monkeypatch.setattr(rag_module, "existing_term_norms", lambda *_args, **_kwargs: set())
+    monkeypatch.setattr(rag_module, "generate_search_queries_openai", lambda **_kwargs: ["hobby knife definition"])
+    decisions = iter(
+        [
+            {"action": "wiki_search", "query": "hobby knife definition", "reason": "start with encyclopedic source"},
+            {"action": "finish", "reason": "wiki evidence collected", "final_answer_ready": True},
+        ]
+    )
+    monkeypatch.setattr(rag_module, "research_agent_next_action_openai", lambda **_kwargs: next(decisions))
+
+    def fake_wiki(*_args, **_kwargs):
+        tool_calls.append("wiki")
+        return [
+            {
+                "title": "Hobby knife",
+                "url": "https://en.wikipedia.org/wiki/Utility_knife",
+                "snippet": "A precision knife used for hobbies.",
+                "content": "A precision knife used for hobbies and model making.",
+            }
+        ]
+
+    def fake_search(*_args, **_kwargs):
+        tool_calls.append("search")
+        return [
+            {
+                "title": "Hobby knife definition",
+                "url": "https://example.com/hobby-knife",
+                "snippet": "Hobby knives are precision cutting tools.",
+                "content": "Hobby knives are precision cutting tools used by model makers.",
+            }
+        ]
+
+    monkeypatch.setattr(rag_module, "fetch_wikipedia_evidence", fake_wiki)
+    monkeypatch.setattr(rag_module, "fetch_search_evidence", fake_search)
+    monkeypatch.setattr(
+        rag_module,
+        "explain_term_from_evidence_openai",
+        lambda **_kwargs: {
+            "term": "hobby knife",
+            "translation": "模型刀",
+            "domain": "手工模型",
+            "aliases": [],
+            "description": "精细切割工具。",
+            "sources": [],
+            "confidence": 0.8,
+        },
+    )
+    monkeypatch.setattr(
+        rag_module,
+        "verify_glossary_entry_openai",
+        lambda **_kwargs: {
+            "supported": False,
+            "context_consistent": False,
+            "should_write": False,
+            "should_auto_approve": False,
+            "confidence": 0.0,
+            "reason": "unsupported",
+            "failure_category": "unsupported_translation_or_no_context",
+        },
+    )
+
+    result = rag_module._research_discovered_term(
+        object(),  # type: ignore[arg-type]
+        item={"term": "hobby knife", "category": "domain_jargon", "need_rag": True, "need_search": True, "scope": "global"},
+        target_lang="zh",
+        rag_settings=rag_settings_from_translate_settings(
+            {
+                "rag_enabled": True,
+                "rag_auto_learn_terms": True,
+                "rag_wiki_enabled": True,
+                "rag_search_enabled": True,
+                "rag_search_url": "https://search.example/search",
+                "rag_embedding_dimensions": 2,
+            }
+        ),
+        embedding_settings=embedding_settings_from_translate_settings({"rag_embedding_provider": "local", "rag_embedding_dimensions": 2}),
+        chat_config=OpenAIChatConfig(api_key="x", base_url="https://example.invalid/v1", model="demo"),
+        text_value="Use a hobby knife to cut the tape.",
+        llm_context="Use a hobby knife to cut the tape.",
+        previous_summary="",
+        existing_term_cards=[],
+        gate_duration_ms=1,
+        task_id=None,
+        subtitle_job_id=None,
+    )
+
+    assert result is not None
+    assert tool_calls == ["wiki", "search"]
+    assert any(step.get("action") == "evidence_tool_fallback" and step.get("tool") == "search" for step in steps)
+    assert finished["status"] == "skipped"
+    assert finished["result"]["tools_used"] == ["wikipedia", "search"]  # type: ignore[index]
+
+
+def test_build_rag_context_skips_research_for_existing_pending_term(monkeypatch) -> None:
+    from videoroll.apps.subtitle_service import rag as rag_module
+
+    research_items: list[dict[str, object]] = []
+
+    class _Db:
+        def execute(self, stmt: object, params: dict[str, object] | None = None) -> _Result:
+            sql = str(stmt)
+            if "SELECT DISTINCT normalized_term" in sql:
+                return _Result([_Row(normalized_term="hobby knife")])
+            return _Result([])
+
+        def rollback(self) -> None:
+            return None
+
+    monkeypatch.setattr(
+        rag_module,
+        "pretranslation_rag_gate_openai",
+        lambda *_args, **_kwargs: [
+            {
+                "term": "hobby knife",
+                "category": "domain_jargon",
+                "domain": "手工模型",
+                "need_rag": True,
+                "need_search": True,
+                "scope": "global",
+                "priority": 0.8,
+                "reason": "tool name",
+            }
+        ],
+    )
+    monkeypatch.setattr(rag_module, "exact_term_hits", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(rag_module, "embed_text", lambda *_args, **_kwargs: [0.1, 0.2])
+    monkeypatch.setattr(rag_module, "assert_embedding_dimensions", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(rag_module, "search_knowledge", lambda *_args, **_kwargs: [])
+
+    def fake_run_research_agents(*_args, **kwargs):
+        research_items.extend(kwargs["items"])
+        return []
+
+    monkeypatch.setattr(rag_module, "_run_research_agents", fake_run_research_agents)
+
+    ctx = build_rag_context(
+        _Db(),  # type: ignore[arg-type]
+        segments=[Segment(0, 1, "Use a hobby knife to cut the tape.")],
+        target_lang="zh",
+        rag_settings=rag_settings_from_translate_settings(
+            {
+                "rag_enabled": True,
+                "rag_auto_discover_terms": True,
+                "rag_auto_learn_terms": True,
+                "rag_embedding_dimensions": 2,
+            }
+        ),
+        embedding_settings=embedding_settings_from_translate_settings({"rag_embedding_provider": "local", "rag_embedding_dimensions": 2}),
+        chat_config=OpenAIChatConfig(api_key="x", base_url="https://example.invalid/v1", model="demo"),
+    )
+
+    assert ctx.term_cards == []
+    assert research_items == []
 
 
 def test_search_knowledge_filters_by_embedding_model() -> None:

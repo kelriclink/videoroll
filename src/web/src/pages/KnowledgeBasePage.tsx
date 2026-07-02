@@ -235,7 +235,7 @@ export default function KnowledgeBasePage() {
         {items.length === 0 ? (
           <EmptyState>暂无知识条目</EmptyState>
         ) : (
-          <DataTable>
+          <DataTable wrapClassName="max-h-[34rem]">
             <thead>
               <tr>
                 <th className="py-2 pr-3 text-left">Type</th>

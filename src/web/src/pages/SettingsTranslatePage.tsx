@@ -17,6 +17,7 @@ type TranslateSettings = {
   openai_model: string;
   openai_temperature: number;
   openai_timeout_seconds: number;
+  openai_max_retries: number;
   rag_enabled: boolean;
   rag_top_k: number;
   rag_min_score: number;
@@ -67,6 +68,7 @@ export default function SettingsTranslatePage() {
   const [openaiModel, setOpenaiModel] = useState("gpt-4o-mini");
   const [openaiTemperature, setOpenaiTemperature] = useState(0.2);
   const [openaiTimeoutSeconds, setOpenaiTimeoutSeconds] = useState(60);
+  const [openaiMaxRetries, setOpenaiMaxRetries] = useState(3);
   const [openaiApiKey, setOpenaiApiKey] = useState("");
 
   const [ragEnabled, setRagEnabled] = useState(false);
@@ -119,6 +121,7 @@ export default function SettingsTranslatePage() {
       setOpenaiModel(s.openai_model);
       setOpenaiTemperature(s.openai_temperature);
       setOpenaiTimeoutSeconds(s.openai_timeout_seconds);
+      setOpenaiMaxRetries(s.openai_max_retries ?? 3);
       setRagEnabled(s.rag_enabled);
       setRagTopK(s.rag_top_k);
       setRagMinScore(s.rag_min_score);
@@ -161,6 +164,7 @@ export default function SettingsTranslatePage() {
       openai_model: openaiModel,
       openai_temperature: openaiTemperature,
       openai_timeout_seconds: openaiTimeoutSeconds,
+      openai_max_retries: openaiMaxRetries,
       rag_enabled: ragEnabled,
       rag_top_k: ragTopK,
       rag_min_score: ragMinScore,
@@ -396,6 +400,11 @@ export default function SettingsTranslatePage() {
           <label className="block">
             <div className="mb-1 text-xs text-slate-600">openai_timeout_seconds</div>
             <input type="number" min={1} className="w-full rounded border px-3 py-2 text-sm" value={openaiTimeoutSeconds} onChange={(e) => setOpenaiTimeoutSeconds(parseFloat(e.target.value || "1"))} />
+          </label>
+          <label className="block">
+            <div className="mb-1 text-xs text-slate-600">openai_max_retries</div>
+            <input type="number" min={1} max={10} className="w-full rounded border px-3 py-2 text-sm" value={openaiMaxRetries} onChange={(e) => setOpenaiMaxRetries(parseInt(e.target.value || "3", 10))} />
+            <div className="mt-1 text-xs text-slate-500">LLM 请求的网络/5xx 重试次数；不影响 embedding 请求。</div>
           </label>
         </div>
       </Section>

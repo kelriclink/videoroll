@@ -201,11 +201,20 @@ def _ensure_pgvector_rag_tables(engine: Engine) -> None:
                     result JSONB NOT NULL DEFAULT '{}'::jsonb,
                     error TEXT NOT NULL DEFAULT '',
                     knowledge_item_id UUID REFERENCES translation_knowledge_items(id) ON DELETE SET NULL,
+                    parent_agent_run_id UUID,
                     started_at TIMESTAMPTZ NOT NULL DEFAULT now(),
                     finished_at TIMESTAMPTZ,
                     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
                     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
                 )
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                ALTER TABLE translation_agent_runs
+                ADD COLUMN IF NOT EXISTS parent_agent_run_id UUID
                 """
             )
         )
@@ -223,6 +232,14 @@ def _ensure_pgvector_rag_tables(engine: Engine) -> None:
                 """
                 CREATE INDEX IF NOT EXISTS ix_translation_agent_runs_status_updated
                 ON translation_agent_runs (status, updated_at DESC)
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                CREATE INDEX IF NOT EXISTS ix_translation_agent_runs_parent
+                ON translation_agent_runs (parent_agent_run_id, updated_at DESC)
                 """
             )
         )

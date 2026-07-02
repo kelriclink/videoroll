@@ -21,6 +21,8 @@ class OpenAIChatConfig:
     model: str
     temperature: float = 0.2
     timeout_seconds: float = 60.0
+    max_retries: int = 3
+    embedding_dimensions: int | None = None
 
 
 def openai_chat_config_from_settings(settings: Mapping[str, Any]) -> OpenAIChatConfig:
@@ -30,6 +32,7 @@ def openai_chat_config_from_settings(settings: Mapping[str, Any]) -> OpenAIChatC
         model=str(settings.get("openai_model") or "").strip(),
         temperature=float(settings.get("openai_temperature") or 0.2),
         timeout_seconds=float(settings.get("openai_timeout_seconds") or 60.0),
+        max_retries=max(1, min(10, int(settings.get("openai_max_retries") or 3))),
     )
 
 
@@ -180,7 +183,7 @@ def request_openai_json_object(
     user_prompt: str,
     format_retry_notice: str = "注意：上一次输出不符合 JSON/结构要求，请严格按 JSON 输出。",
     format_retries: int = 2,
-    network_retries: int = 3,
+    network_retries: int | None = None,
     client: httpx.Client | None = None,
 ) -> dict[str, Any]:
     if client is not None:
@@ -191,7 +194,7 @@ def request_openai_json_object(
             user_prompt=user_prompt,
             format_retry_notice=format_retry_notice,
             format_retries=format_retries,
-            network_retries=network_retries,
+            network_retries=max(1, int(network_retries if network_retries is not None else config.max_retries)),
         )
 
     with create_openai_http_client(config.timeout_seconds) as owned_client:
@@ -202,7 +205,7 @@ def request_openai_json_object(
             user_prompt=user_prompt,
             format_retry_notice=format_retry_notice,
             format_retries=format_retries,
-            network_retries=network_retries,
+            network_retries=max(1, int(network_retries if network_retries is not None else config.max_retries)),
         )
 
 
@@ -223,6 +226,8 @@ def request_openai_embedding(
     url = build_openai_embeddings_url(config.base_url)
     headers = {"Authorization": f"Bearer {config.api_key}"}
     req = {"model": config.model, "input": source}
+    if config.embedding_dimensions is not None and config.embedding_dimensions > 0:
+        req["dimensions"] = int(config.embedding_dimensions)
     attempts_network = max(1, int(network_retries))
     last_err: Exception | None = None
 

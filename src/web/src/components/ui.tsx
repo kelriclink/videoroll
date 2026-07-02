@@ -61,10 +61,14 @@ export function Section({ children, className = "" }: PropsWithChildren<{ classN
   return <div className={`vr-section ${className}`}>{children}</div>;
 }
 
-export function DataTable({ children }: PropsWithChildren) {
+export function DataTable({
+  children,
+  className = "",
+  wrapClassName = "",
+}: PropsWithChildren<{ className?: string; wrapClassName?: string }>) {
   return (
-    <div className="vr-table-wrap">
-      <table className="vr-table">{children}</table>
+    <div className={`vr-table-wrap ${wrapClassName}`}>
+      <table className={`vr-table ${className}`}>{children}</table>
     </div>
   );
 }

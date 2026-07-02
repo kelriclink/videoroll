@@ -56,6 +56,7 @@ type AgentRun = {
   result: Record<string, unknown>;
   error: string;
   knowledge_item_id?: string | null;
+  parent_agent_run_id?: string | null;
   started_at: string;
   finished_at?: string | null;
   created_at: string;
@@ -177,7 +178,17 @@ function AgentStep({ step, index }: { step: Record<string, unknown>; index: numb
   );
 }
 
-function AgentRunDetail({ run, onClose }: { run: AgentRun; onClose: () => void }) {
+function AgentRunDetail({
+  run,
+  childrenRuns = [],
+  onSelectRun,
+  onClose,
+}: {
+  run: AgentRun;
+  childrenRuns?: AgentRun[];
+  onSelectRun: (run: AgentRun) => void;
+  onClose: () => void;
+}) {
   const translation = textValue(run.result?.translation);
   const confidence = numberValue(run.result?.confidence);
   const knowledgeStatus = textValue(run.result?.knowledge_status);
@@ -234,6 +245,27 @@ function AgentRunDetail({ run, onClose }: { run: AgentRun; onClose: () => void }
                 <pre className="max-h-64 max-w-full overflow-auto whitespace-pre rounded bg-slate-950 p-3 text-xs leading-relaxed text-slate-100">{prettyJson(run.result)}</pre>
               </div>
             ) : null}
+            {childrenRuns.length ? (
+              <div className="min-w-0 rounded-md border border-slate-200 p-3">
+                <div className="mb-2 text-xs font-semibold text-slate-600">子 Agent</div>
+                <div className="max-h-64 space-y-1 overflow-auto pr-1">
+                  {childrenRuns.map((child) => (
+                    <button
+                      key={child.id}
+                      type="button"
+                      className="block w-full rounded border border-slate-200 px-2 py-1.5 text-left hover:bg-slate-50"
+                      onClick={() => onSelectRun(child)}
+                    >
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="min-w-0 truncate text-xs font-medium text-slate-800">{child.term || child.query || child.id}</span>
+                        <span className={`shrink-0 rounded border px-1.5 py-0.5 text-[11px] ${agentStatusClass(child.status)}`}>{child.status}</span>
+                      </div>
+                      <div className="mt-1 truncate font-mono text-[11px] text-slate-500">{child.agent_type} · {formatDate(child.updated_at)}</div>
+                    </button>
+                  ))}
+                </div>
+              </div>
+            ) : null}
           </div>
           <div className="min-w-0">
             <div className="mb-2 text-sm font-semibold text-slate-900">对话流</div>
@@ -248,7 +280,7 @@ function AgentRunDetail({ run, onClose }: { run: AgentRun; onClose: () => void }
   );
 }
 
-function AgentRunCard({ run, onSelect }: { run: AgentRun; onSelect: (run: AgentRun) => void }) {
+function AgentRunCard({ run, onSelect, childrenRuns = [] }: { run: AgentRun; onSelect: (run: AgentRun) => void; childrenRuns?: AgentRun[] }) {
   const translation = textValue(run.result?.translation);
   const confidence = numberValue(run.result?.confidence);
   const knowledgeStatus = textValue(run.result?.knowledge_status);
@@ -268,6 +300,7 @@ function AgentRunCard({ run, onSelect }: { run: AgentRun; onSelect: (run: AgentR
         {run.domain ? <div className="truncate">domain: {run.domain}</div> : null}
         {run.query ? <div className="truncate">query: {run.query}</div> : null}
         {opened ? <div>opened/read pages: {opened}</div> : null}
+        {childrenRuns.length ? <div>subagents: {childrenRuns.length}</div> : null}
         {latestStep?.action ? <div className="truncate">latest: {String(latestStep.action)}</div> : null}
         {translation ? (
           <div className="truncate">
@@ -279,6 +312,16 @@ function AgentRunCard({ run, onSelect }: { run: AgentRun; onSelect: (run: AgentR
         {failureCategory ? <div className="truncate text-amber-700">failure: {failureCategory}</div> : null}
         {run.error ? <div className="line-clamp-2 text-rose-700">{run.error}</div> : null}
       </div>
+      {childrenRuns.length ? (
+        <div className="mt-3 space-y-1 border-l border-slate-200 pl-3">
+          {childrenRuns.slice(0, 5).map((child) => (
+            <div key={child.id} className="flex items-center justify-between gap-2 text-xs text-slate-600">
+              <span className="min-w-0 truncate">{child.term || child.query || child.id}</span>
+              <span className={`shrink-0 rounded border px-1.5 py-0.5 ${agentStatusClass(child.status)}`}>{child.status}</span>
+            </div>
+          ))}
+        </div>
+      ) : null}
     </button>
   );
 }
@@ -385,8 +428,19 @@ export default function DashboardPage() {
   const total = tasks?.length ?? 0;
   const failedTasks = useMemo(() => (tasks ?? []).filter((t) => t.status === "FAILED").slice(0, 6), [tasks]);
   const runningTasks = useMemo(() => (tasks ?? []).filter((t) => runningStatuses.has(t.status)).slice(0, 6), [tasks]);
-  const runningAgents = useMemo(() => (agentRuns ?? []).filter((run) => run.status === "running"), [agentRuns]);
-  const recentFinishedAgents = useMemo(() => (agentRuns ?? []).filter((run) => run.status !== "running").slice(0, 6), [agentRuns]);
+  const agentChildren = useMemo(() => {
+    const out = new Map<string, AgentRun[]>();
+    for (const run of agentRuns ?? []) {
+      if (!run.parent_agent_run_id) continue;
+      const rows = out.get(run.parent_agent_run_id) ?? [];
+      rows.push(run);
+      out.set(run.parent_agent_run_id, rows);
+    }
+    return out;
+  }, [agentRuns]);
+  const topLevelAgents = useMemo(() => (agentRuns ?? []).filter((run) => !run.parent_agent_run_id), [agentRuns]);
+  const runningAgents = useMemo(() => topLevelAgents.filter((run) => run.status === "running"), [topLevelAgents]);
+  const recentFinishedAgents = useMemo(() => topLevelAgents.filter((run) => run.status !== "running").slice(0, 6), [topLevelAgents]);
   const selectedAgent = useMemo(() => (agentRuns ?? []).find((run) => run.id === selectedAgentId) ?? null, [agentRuns, selectedAgentId]);
   const publishedCount = counts.find(([status]) => status === "PUBLISHED")?.[1] ?? 0;
   const failedCount = counts.find(([status]) => status === "FAILED")?.[1] ?? 0;
@@ -522,14 +576,14 @@ export default function DashboardPage() {
               <div className="mb-2 text-xs font-semibold text-slate-600">正在工作</div>
               <div className="space-y-2">
                 {runningAgents.length === 0 ? <div className="text-sm text-slate-500">暂无运行中的 agent。</div> : null}
-                {runningAgents.map((run) => <AgentRunCard key={run.id} run={run} onSelect={(item) => setSelectedAgentId(item.id)} />)}
+                {runningAgents.map((run) => <AgentRunCard key={run.id} run={run} childrenRuns={agentChildren.get(run.id) ?? []} onSelect={(item) => setSelectedAgentId(item.id)} />)}
               </div>
             </div>
             <div>
               <div className="mb-2 text-xs font-semibold text-slate-600">最近结果</div>
               <div className="space-y-2">
                 {recentFinishedAgents.length === 0 ? <div className="text-sm text-slate-500">暂无 agent 结果。</div> : null}
-                {recentFinishedAgents.map((run) => <AgentRunCard key={run.id} run={run} onSelect={(item) => setSelectedAgentId(item.id)} />)}
+                {recentFinishedAgents.map((run) => <AgentRunCard key={run.id} run={run} childrenRuns={agentChildren.get(run.id) ?? []} onSelect={(item) => setSelectedAgentId(item.id)} />)}
               </div>
             </div>
           </div>
@@ -648,7 +702,14 @@ export default function DashboardPage() {
           </div>
         ) : null}
       </div>
-      {selectedAgent ? <AgentRunDetail run={selectedAgent} onClose={() => setSelectedAgentId(null)} /> : null}
+      {selectedAgent ? (
+        <AgentRunDetail
+          run={selectedAgent}
+          childrenRuns={agentChildren.get(selectedAgent.id) ?? []}
+          onSelectRun={(run) => setSelectedAgentId(run.id)}
+          onClose={() => setSelectedAgentId(null)}
+        />
+      ) : null}
     </div>
   );
 }
