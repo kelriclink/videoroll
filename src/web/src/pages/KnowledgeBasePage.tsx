@@ -43,6 +43,10 @@ export default function KnowledgeBasePage() {
   const [busy, setBusy] = useState(false);
   const [itemTypeFilter, setItemTypeFilter] = useState("");
   const [statusFilter, setStatusFilter] = useState("");
+  const [searchText, setSearchText] = useState("");
+  const [domainFilter, setDomainFilter] = useState("");
+  const [page, setPage] = useState(0);
+  const pageSize = 50;
 
   const [itemType, setItemType] = useState<"term" | "document">("term");
   const [targetLang, setTargetLang] = useState("zh");
@@ -54,14 +58,18 @@ export default function KnowledgeBasePage() {
   const [content, setContent] = useState("");
   const [status, setStatus] = useState("approved");
   const [confidence, setConfidence] = useState(1);
+  const [formError, setFormError] = useState<string | null>(null);
 
   const query = useMemo(() => {
     const params = new URLSearchParams();
-    params.set("limit", "200");
+    params.set("limit", String(pageSize));
+    params.set("offset", String(page * pageSize));
     if (itemTypeFilter) params.set("item_type", itemTypeFilter);
     if (statusFilter) params.set("status", statusFilter);
+    if (searchText.trim()) params.set("q", searchText.trim());
+    if (domainFilter.trim()) params.set("domain", domainFilter.trim());
     return params.toString();
-  }, [itemTypeFilter, statusFilter]);
+  }, [domainFilter, itemTypeFilter, page, statusFilter, searchText]);
 
   const refresh = useCallback(async () => {
     setError(null);
@@ -77,9 +85,30 @@ export default function KnowledgeBasePage() {
     refresh();
   }, [refresh]);
 
+  useEffect(() => {
+    setPage(0);
+  }, [domainFilter, itemTypeFilter, statusFilter, searchText]);
+
+  function validateForm(): string | null {
+    if (!targetLang.trim()) return "target_lang 不能为空";
+    if (!Number.isFinite(confidence) || confidence < 0 || confidence > 1) return "confidence 必须在 0 到 1 之间";
+    if (itemType === "term") {
+      if (!term.trim()) return "term 不能为空";
+      if (!translation.trim()) return "translation 不能为空";
+    }
+    if (itemType === "document" && !title.trim() && !content.trim()) return "document 至少需要 title 或 content";
+    return null;
+  }
+
   async function saveItem() {
+    const validationError = validateForm();
+    if (validationError) {
+      setFormError(validationError);
+      return;
+    }
     setBusy(true);
     setError(null);
+    setFormError(null);
     try {
       await fetchJson(`${SUBTITLE_SERVICE_URL}/subtitle/knowledge/items`, {
         method: "POST",
@@ -103,6 +132,7 @@ export default function KnowledgeBasePage() {
       setTitle("");
       setDescription("");
       setContent("");
+      setConfidence(1);
       await refresh();
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : String(e));
@@ -146,6 +176,7 @@ export default function KnowledgeBasePage() {
         }
       />
       {error ? <div className="rounded-md border border-rose-200 bg-rose-50 p-3 text-sm text-rose-700">{error}</div> : null}
+      {formError ? <div className="rounded-md border border-amber-200 bg-amber-50 p-3 text-sm text-amber-800">{formError}</div> : null}
 
       <Section>
         <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
@@ -154,11 +185,11 @@ export default function KnowledgeBasePage() {
             <div className="mt-1 text-xs text-slate-500">手动添加的条目会直接生成向量；如果 embedding 配置不可用，术语仍可保存但不会参与向量检索。</div>
           </div>
           <div className="flex flex-wrap gap-2">
-            <select className="rounded border px-3 py-2 text-sm" value={itemType} onChange={(e) => setItemType(e.target.value as "term" | "document")}>
+            <select className="vr-input" value={itemType} onChange={(e) => setItemType(e.target.value as "term" | "document")}>
               <option value="term">term</option>
               <option value="document">document</option>
             </select>
-            <select className="rounded border px-3 py-2 text-sm" value={status} onChange={(e) => setStatus(e.target.value)}>
+            <select className="vr-input" value={status} onChange={(e) => setStatus(e.target.value)}>
               <option value="approved">approved</option>
               <option value="pending">pending</option>
               <option value="auto_approved">auto_approved</option>
@@ -169,40 +200,40 @@ export default function KnowledgeBasePage() {
         <div className="mt-4 grid gap-3 md:grid-cols-2">
           <label className="block">
             <div className="mb-1 text-xs text-slate-600">target_lang</div>
-            <input className="w-full rounded border px-3 py-2 text-sm" value={targetLang} onChange={(e) => setTargetLang(e.target.value)} />
+            <input className="vr-input w-full" value={targetLang} onChange={(e) => setTargetLang(e.target.value)} />
           </label>
           <label className="block">
             <div className="mb-1 text-xs text-slate-600">domain</div>
-            <input className="w-full rounded border px-3 py-2 text-sm" value={domain} onChange={(e) => setDomain(e.target.value)} />
+            <input className="vr-input w-full" value={domain} onChange={(e) => setDomain(e.target.value)} />
           </label>
           {itemType === "term" ? (
             <>
               <label className="block">
                 <div className="mb-1 text-xs text-slate-600">term</div>
-                <input className="w-full rounded border px-3 py-2 text-sm" value={term} onChange={(e) => setTerm(e.target.value)} />
+                <input className="vr-input w-full" value={term} onChange={(e) => setTerm(e.target.value)} />
               </label>
               <label className="block">
                 <div className="mb-1 text-xs text-slate-600">translation</div>
-                <input className="w-full rounded border px-3 py-2 text-sm" value={translation} onChange={(e) => setTranslation(e.target.value)} />
+                <input className="vr-input w-full" value={translation} onChange={(e) => setTranslation(e.target.value)} />
               </label>
             </>
           ) : (
             <label className="block md:col-span-2">
               <div className="mb-1 text-xs text-slate-600">title</div>
-              <input className="w-full rounded border px-3 py-2 text-sm" value={title} onChange={(e) => setTitle(e.target.value)} />
+              <input className="vr-input w-full" value={title} onChange={(e) => setTitle(e.target.value)} />
             </label>
           )}
           <label className="block">
             <div className="mb-1 text-xs text-slate-600">confidence</div>
-            <input type="number" min={0} max={1} step="0.01" className="w-full rounded border px-3 py-2 text-sm" value={confidence} onChange={(e) => setConfidence(parseFloat(e.target.value || "1"))} />
+            <input type="number" min={0} max={1} step="0.01" className="vr-input w-full" value={confidence} onChange={(e) => setConfidence(parseFloat(e.target.value || "1"))} />
           </label>
           <label className="block md:col-span-2">
             <div className="mb-1 text-xs text-slate-600">description</div>
-            <textarea className="h-20 w-full rounded border px-3 py-2 text-sm" value={description} onChange={(e) => setDescription(e.target.value)} />
+            <textarea className="vr-input h-20 w-full" value={description} onChange={(e) => setDescription(e.target.value)} />
           </label>
           <label className="block md:col-span-2">
             <div className="mb-1 text-xs text-slate-600">content</div>
-            <textarea className="h-28 w-full rounded border px-3 py-2 text-sm" value={content} onChange={(e) => setContent(e.target.value)} />
+            <textarea className="vr-input h-28 w-full" value={content} onChange={(e) => setContent(e.target.value)} />
           </label>
         </div>
         <div className="mt-3">
@@ -214,21 +245,34 @@ export default function KnowledgeBasePage() {
         <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
           <div>
             <div className="text-sm font-semibold text-slate-900">知识条目</div>
-            <div className="mt-1 text-xs text-slate-500">共 {items.length} 条，最多显示 200 条。</div>
+            <div className="mt-1 text-xs text-slate-500">第 {page + 1} 页，每页 {pageSize} 条，当前 {items.length} 条。</div>
           </div>
           <div className="flex flex-wrap gap-2">
-            <select className="rounded border px-3 py-2 text-sm" value={itemTypeFilter} onChange={(e) => setItemTypeFilter(e.target.value)}>
+            <input className="vr-input" placeholder="搜索术语、译文、说明" value={searchText} onChange={(e) => setSearchText(e.target.value)} />
+            <input className="vr-input" placeholder="domain" value={domainFilter} onChange={(e) => setDomainFilter(e.target.value)} />
+            <select className="vr-input" value={itemTypeFilter} onChange={(e) => setItemTypeFilter(e.target.value)}>
               <option value="">全部类型</option>
               <option value="term">term</option>
               <option value="document">document</option>
             </select>
-            <select className="rounded border px-3 py-2 text-sm" value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)}>
+            <select className="vr-input" value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)}>
               <option value="">全部状态</option>
               <option value="approved">approved</option>
               <option value="auto_approved">auto_approved</option>
               <option value="pending">pending</option>
               <option value="archived">archived</option>
             </select>
+            <Button
+              disabled={!searchText && !domainFilter && !itemTypeFilter && !statusFilter}
+              onClick={() => {
+                setSearchText("");
+                setDomainFilter("");
+                setItemTypeFilter("");
+                setStatusFilter("");
+              }}
+            >
+              清空筛选
+            </Button>
           </div>
         </div>
 
@@ -271,6 +315,11 @@ export default function KnowledgeBasePage() {
             </tbody>
           </DataTable>
         )}
+        <div className="mt-3 flex items-center justify-between gap-3">
+          <Button disabled={page === 0 || busy} onClick={() => setPage((value) => Math.max(0, value - 1))}>上一页</Button>
+          <div className="text-xs text-slate-500">offset {page * pageSize}</div>
+          <Button disabled={items.length < pageSize || busy} onClick={() => setPage((value) => value + 1)}>下一页</Button>
+        </div>
       </Section>
     </div>
   );

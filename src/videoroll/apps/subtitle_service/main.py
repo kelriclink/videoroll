@@ -405,19 +405,22 @@ def put_translate_settings_view(
 def list_knowledge_items_view(
     item_type: str | None = None,
     status: str | None = None,
+    q: str | None = None,
+    domain: str | None = None,
     limit: int = 100,
+    offset: int = 0,
     settings: SubtitleServiceSettings = Depends(get_settings),
     db: Session = Depends(get_db),
 ) -> list[KnowledgeItemRead]:
     try:
-        rows = list_knowledge_items(db, item_type=item_type, status=status, limit=limit)
+        rows = list_knowledge_items(db, item_type=item_type, status=status, q=q, domain=domain, limit=limit, offset=offset)
     except Exception as e:
         db.rollback()
         if not _is_missing_knowledge_table_error(e):
             _handle_knowledge_db_error(e, settings)
         _ensure_rag_schema(settings)
         try:
-            rows = list_knowledge_items(db, item_type=item_type, status=status, limit=limit)
+            rows = list_knowledge_items(db, item_type=item_type, status=status, q=q, domain=domain, limit=limit, offset=offset)
         except Exception as retry_error:
             db.rollback()
             raise HTTPException(status_code=503, detail=f"RAG knowledge tables are not ready: {retry_error}") from retry_error

@@ -9,6 +9,7 @@ from videoroll.ai.client import request_openai_embedding
 from videoroll.apps.subtitle_service.rag import (
     _run_research_agents,
     _fallback_search_queries,
+    _parse_search_json,
     _search_url_with_params,
     build_knowledge_embedding_text,
     build_rag_context,
@@ -640,6 +641,37 @@ def test_search_url_accepts_base_url_and_legacy_search_url() -> None:
         _search_url_with_params("https://search.example/searxng", query="truth table", json_format=False)
         == "https://search.example/searxng/search?q=truth+table"
     )
+    assert (
+        _search_url_with_params("https://search.example", query="truth table", json_format=True, extra_params={"engines": "bing,baidu"})
+        == "https://search.example/search?engines=bing%2Cbaidu&q=truth+table&format=json"
+    )
+
+
+def test_parse_search_json_accepts_searxng_content_results() -> None:
+    rows = _parse_search_json(
+        {
+            "query": "VGA 红色 信号 中文 术语",
+            "results": [
+                {
+                    "url": "https://baike.baidu.com/item/VGA%E6%8E%A5%E5%8F%A3/909309",
+                    "title": "VGA接口_百度百科",
+                    "content": "视频图形阵列（VGA，Video Graphic Array）是一个使用模拟信号的电脑显示标准。",
+                    "engine": "bing",
+                },
+                {
+                    "title": "主板vga接线定义 - 百度文库",
+                    "url": "https://wenku.baidu.com/view/demo.html",
+                    "content": "红色信号（Red）：用于传输视频信号中的红色分量。",
+                    "engine": "baidu",
+                },
+            ],
+        }
+    )
+
+    assert len(rows) == 2
+    assert rows[0]["title"] == "VGA接口_百度百科"
+    assert "Video Graphic Array" in rows[0]["snippet"]
+    assert "红色信号" in rows[1]["snippet"]
 
 
 def test_normalize_wiki_api_url_accepts_wikipedia_page_url() -> None:
@@ -895,7 +927,8 @@ def test_fetch_search_evidence_filters_searxng_internal_about(monkeypatch) -> No
     evidence = fetch_search_evidence("truth table", domain="logic", search_url="https://search.example/search")
 
     assert evidence == []
-    assert len(calls) == 2
+    assert len(calls) == 4
+    assert "engines=bing%2Cbaidu" in calls[2]
 
 
 def test_fetch_search_evidence_filters_searx_space_ui_result_from_json(monkeypatch) -> None:
@@ -997,6 +1030,68 @@ def test_fetch_search_evidence_falls_back_to_html_when_json_format_fails(monkeyp
 
     assert evidence[0]["url"] == "https://example.com/wiki/lyman-alpha-blob"
     assert "Lyman-alpha" in evidence[0]["snippet"]
+
+
+def test_fetch_search_evidence_retries_with_default_engines_when_default_search_is_empty(monkeypatch) -> None:
+    from videoroll.apps.subtitle_service import rag as rag_module
+
+    calls: list[str] = []
+
+    class _Response:
+        def __init__(self, *, url: str, data: object) -> None:
+            self.text = ""
+            self.url = url
+            self.headers = {"content-type": "application/json"}
+            self._data = data
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> object:
+            return self._data
+
+    class _Client:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            return None
+
+        def __enter__(self) -> "_Client":
+            return self
+
+        def __exit__(self, exc_type: object, exc: object, tb: object) -> bool:
+            return False
+
+        def get(self, url: str) -> _Response:
+            calls.append(url)
+            if "engines=bing%2Cbaidu" in url:
+                return _Response(
+                    url=url,
+                    data={
+                        "results": [
+                            {
+                                "title": "VGA接口_百度百科",
+                                "url": "https://baike.baidu.com/item/VGA%E6%8E%A5%E5%8F%A3/909309",
+                                "content": "VGA 是一个使用模拟信号的电脑显示标准。",
+                            }
+                        ],
+                        "unresponsive_engines": [],
+                    },
+                )
+            return _Response(
+                url=url,
+                data={
+                    "results": [],
+                    "unresponsive_engines": [["google", "Suspended: CAPTCHA"], ["duckduckgo", "timeout"]],
+                },
+            )
+
+    monkeypatch.setattr(rag_module.httpx, "Client", _Client)
+
+    evidence = fetch_search_evidence("VGA", domain="display", search_url="https://search.example/search")
+
+    assert len(calls) == 3
+    assert "engines=bing%2Cbaidu" in calls[1]
+    assert evidence[0]["title"] == "VGA接口_百度百科"
+    assert "模拟信号" in evidence[0]["snippet"]
 
 
 def test_fetch_search_evidence_does_not_fallback_when_llm_selects_no_urls(monkeypatch) -> None:

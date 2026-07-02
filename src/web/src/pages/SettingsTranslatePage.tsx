@@ -45,6 +45,8 @@ type EmbeddingModelInfo = {
   size_bytes?: number | null;
 };
 
+type TranslateSettingsTab = "translation" | "rag" | "embedding" | "test";
+
 function safeEmbeddingModelName(raw: string) {
   const value = raw.trim().replace(/[\\/]/g, "--").replace(/[^A-Za-z0-9._-]/g, "-");
   return value.slice(0, 96) || "embedding-model";
@@ -56,6 +58,7 @@ export default function SettingsTranslatePage() {
   const [embeddingModels, setEmbeddingModels] = useState<EmbeddingModelInfo[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [activeTab, setActiveTab] = useState<TranslateSettingsTab>("translation");
 
   const [defaultProvider, setDefaultProvider] = useState("openai");
   const [defaultTargetLang, setDefaultTargetLang] = useState("zh");
@@ -345,6 +348,30 @@ export default function SettingsTranslatePage() {
         )}
       </Section>
 
+      <div className="vr-section">
+        <div className="flex flex-wrap gap-2">
+          {[
+            ["translation", "翻译模型"],
+            ["rag", "RAG Agent"],
+            ["embedding", "本地 Embedding"],
+            ["test", "测试维护"],
+          ].map(([id, label]) => (
+            <button
+              key={id}
+              type="button"
+              onClick={() => setActiveTab(id as TranslateSettingsTab)}
+              className={[
+                "rounded-md border px-3 py-2 text-sm",
+                activeTab === id ? "border-slate-900 bg-slate-900 text-white" : "border-slate-300 text-slate-700 hover:bg-slate-50",
+              ].join(" ")}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {activeTab === "translation" ? (
       <Section>
         <div className="text-sm font-semibold text-slate-900">翻译与模型</div>
         <div className="mt-3 grid gap-3 md:grid-cols-2">
@@ -408,7 +435,9 @@ export default function SettingsTranslatePage() {
           </label>
         </div>
       </Section>
+      ) : null}
 
+      {activeTab === "rag" ? (
       <Section>
         <div className="text-sm font-semibold text-slate-900">RAG / pgvector</div>
         <div className="mt-3 grid gap-3 md:grid-cols-2">
@@ -530,7 +559,9 @@ export default function SettingsTranslatePage() {
           {embeddingRebuildResult ? <div className="text-sm text-slate-700">{embeddingRebuildResult}</div> : null}
         </div>
       </Section>
+      ) : null}
 
+      {activeTab === "embedding" ? (
       <Section>
         <div className="text-sm font-semibold text-slate-900">本地 Embedding 模型</div>
         <div className="mt-3 grid gap-3 md:grid-cols-2">
@@ -553,7 +584,7 @@ export default function SettingsTranslatePage() {
               if (embeddingDownloadModel.includes("bge-small")) setRagEmbeddingDimensions(512);
             }}
           >
-            使用该模型
+            填入表单
           </Button>
         </div>
         {embeddingModels.length === 0 ? (
@@ -592,6 +623,7 @@ export default function SettingsTranslatePage() {
           </DataTable>
         )}
       </Section>
+      ) : null}
 
       <div className="flex flex-wrap items-center gap-2">
         <Button tone="primary" disabled={busy} onClick={saveSettings}>{busy ? "保存中..." : "保存配置"}</Button>
@@ -645,6 +677,7 @@ export default function SettingsTranslatePage() {
         </Button>
       </div>
 
+      {activeTab === "test" ? (
       <Section>
         <div className="text-sm font-semibold text-slate-900">测试翻译</div>
         <div className="mt-2 grid gap-3 md:grid-cols-2">
@@ -698,6 +731,7 @@ export default function SettingsTranslatePage() {
           </div>
         ) : null}
       </Section>
+      ) : null}
     </div>
   );
 }

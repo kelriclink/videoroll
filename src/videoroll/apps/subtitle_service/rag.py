@@ -374,14 +374,31 @@ def _search_endpoint_from_base(search_base_url: str) -> str:
     return urlunparse(parsed._replace(path=path, query=urlencode(params)))
 
 
-def _search_url_with_params(search_base_url: str, *, query: str, json_format: bool) -> str:
+def _search_url_with_params(
+    search_base_url: str,
+    *,
+    query: str,
+    json_format: bool,
+    extra_params: dict[str, str] | None = None,
+) -> str:
     endpoint = _search_endpoint_from_base(search_base_url)
     parsed = urlparse(endpoint)
     params = [(k, v) for k, v in parse_qsl(parsed.query, keep_blank_values=True) if k not in {"q", "format"}]
+    existing_names = {k for k, _v in params}
+    for key, value in (extra_params or {}).items():
+        if key in {"q", "format"} or key in existing_names:
+            continue
+        params.append((key, value))
     params.append(("q", query))
     if json_format:
         params.append(("format", "json"))
     return urlunparse(parsed._replace(query=urlencode(params)))
+
+
+def _search_endpoint_has_param(search_base_url: str, name: str) -> bool:
+    endpoint = _search_endpoint_from_base(search_base_url)
+    parsed = urlparse(endpoint)
+    return any(k == name for k, _v in parse_qsl(parsed.query, keep_blank_values=True))
 
 
 def _normalize_result_url(raw_url: str, *, base_url: str) -> str:
@@ -1177,65 +1194,120 @@ def fetch_search_evidence(
             follow_redirects=True,
             headers={"User-Agent": "VideoRoll-RAG-Agent/1.0", "Accept": "application/json, text/html;q=0.9,*/*;q=0.8"},
         ) as client:
+            has_configured_engines = _search_endpoint_has_param(endpoint, "engines")
             for query in search_queries:
-                json_url = _search_url_with_params(endpoint, query=query, json_format=True)
-                html_url = _search_url_with_params(endpoint, query=query, json_format=False)
-                started = time.perf_counter()
                 filtered_results: list[dict[str, Any]] = []
-                json_error = ""
-                try:
+                attempt_configs: list[dict[str, str] | None] = [None]
+                if not has_configured_engines:
+                    attempt_configs.append({"engines": "bing,baidu"})
+                for attempt_index, extra_params in enumerate(attempt_configs):
+                    json_url = _search_url_with_params(endpoint, query=query, json_format=True, extra_params=extra_params)
+                    html_url = _search_url_with_params(endpoint, query=query, json_format=False, extra_params=extra_params)
+                    started = time.perf_counter()
+                    json_error = ""
+                    raw_result_count: int | None = None
+                    parsed_result_count = 0
+                    unresponsive_engines: list[Any] = []
                     try:
-                        resp = client.get(json_url)
-                        resp.raise_for_status()
-                        content_type = resp.headers.get("content-type", "")
-                        if "json" in content_type.lower():
-                            filtered_results = _parse_search_json(resp.json())
-                        else:
-                            try:
-                                filtered_results = _parse_search_json(resp.json())
-                            except Exception:
-                                filtered_results = _parse_search_html(resp.text, base_url=str(resp.url))
-                    except Exception as e:
-                        json_error = str(e)[:300]
-                        filtered_results = []
-                    if not filtered_results:
                         try:
-                            resp = client.get(html_url)
+                            resp = client.get(json_url)
                             resp.raise_for_status()
-                            filtered_results = _parse_search_html(resp.text, base_url=str(resp.url))
+                            content_type = resp.headers.get("content-type", "")
+                            if "json" in content_type.lower():
+                                data = resp.json()
+                                raw_results = data.get("results") if isinstance(data, dict) else data if isinstance(data, list) else None
+                                raw_result_count = len(raw_results) if isinstance(raw_results, list) else None
+                                if isinstance(data, dict):
+                                    raw_unresponsive = data.get("unresponsive_engines")
+                                    unresponsive_engines = raw_unresponsive if isinstance(raw_unresponsive, list) else []
+                                filtered_results = _parse_search_json(data)
+                                parsed_result_count = len(filtered_results)
+                            else:
+                                try:
+                                    data = resp.json()
+                                    raw_results = data.get("results") if isinstance(data, dict) else data if isinstance(data, list) else None
+                                    raw_result_count = len(raw_results) if isinstance(raw_results, list) else None
+                                    if isinstance(data, dict):
+                                        raw_unresponsive = data.get("unresponsive_engines")
+                                        unresponsive_engines = raw_unresponsive if isinstance(raw_unresponsive, list) else []
+                                    filtered_results = _parse_search_json(data)
+                                    parsed_result_count = len(filtered_results)
+                                except Exception:
+                                    filtered_results = _parse_search_html(resp.text, base_url=str(resp.url))
+                                    parsed_result_count = len(filtered_results)
                         except Exception as e:
-                            if json_error:
-                                raise RuntimeError(f"json search failed: {json_error}; html search failed: {e}") from e
-                            raise
-                    filtered_results = _filter_search_results(filtered_results, search_url=endpoint)
-                    compact_results = [
-                        {"title": r.get("title", ""), "url": r.get("url", ""), "snippet": str(r.get("snippet") or "")[:240]}
-                        for r in filtered_results[:8]
-                    ]
-                    step = ToolResult(
-                        spec=_SEARCH_TOOL_SPEC,
-                        input={"query": query, "url": json_url},
-                        output={"count": len(filtered_results), "results": compact_results, "json_error": json_error},
-                        ok=True,
-                        duration_ms=_duration_ms(started),
-                    ).to_step(action="search")
-                    step.update({"query": query, "url": json_url, "count": len(filtered_results), "results": compact_results})
-                    if db is not None:
-                        _append_agent_step(db, agent_run_id, step)
-                except Exception as e:
-                    step = ToolResult(
-                        spec=_SEARCH_TOOL_SPEC,
-                        input={"query": query, "url": json_url},
-                        output={"count": 0, "results": []},
-                        ok=False,
-                        duration_ms=_duration_ms(started),
-                        error_type=type(e).__name__,
-                        error=str(e)[:300],
-                    ).to_step(action="search_failed")
-                    step.update({"query": query, "url": json_url})
-                    if db is not None:
-                        _append_agent_step(db, agent_run_id, step)
-                    continue
+                            json_error = str(e)[:300]
+                            filtered_results = []
+                        if not filtered_results and raw_result_count is None:
+                            try:
+                                resp = client.get(html_url)
+                                resp.raise_for_status()
+                                filtered_results = _parse_search_html(resp.text, base_url=str(resp.url))
+                                parsed_result_count = len(filtered_results)
+                            except Exception as e:
+                                if json_error:
+                                    raise RuntimeError(f"json search failed: {json_error}; html search failed: {e}") from e
+                                raise
+                        filtered_results = _filter_search_results(filtered_results, search_url=endpoint)
+                        compact_results = [
+                            {"title": r.get("title", ""), "url": r.get("url", ""), "snippet": str(r.get("snippet") or "")[:240]}
+                            for r in filtered_results[:8]
+                        ]
+                        output_value: dict[str, Any] = {
+                            "count": len(filtered_results),
+                            "raw_count": raw_result_count,
+                            "parsed_count": parsed_result_count,
+                            "filtered_count": len(filtered_results),
+                            "results": compact_results,
+                            "json_error": json_error,
+                        }
+                        if extra_params:
+                            output_value["fallback_params"] = extra_params
+                        if unresponsive_engines:
+                            output_value["unresponsive_engines"] = unresponsive_engines[:8]
+                        step = ToolResult(
+                            spec=_SEARCH_TOOL_SPEC,
+                            input={"query": query, "url": json_url, "fallback_params": extra_params or {}},
+                            output=output_value,
+                            ok=True,
+                            duration_ms=_duration_ms(started),
+                        ).to_step(action="search")
+                        step.update(
+                            {
+                                "query": query,
+                                "url": json_url,
+                                "count": len(filtered_results),
+                                "raw_count": raw_result_count,
+                                "parsed_count": parsed_result_count,
+                                "filtered_count": len(filtered_results),
+                                "results": compact_results,
+                                "retry_count": attempt_index,
+                            }
+                        )
+                        if extra_params:
+                            step["fallback_params"] = extra_params
+                        if unresponsive_engines:
+                            step["unresponsive_engines"] = unresponsive_engines[:8]
+                        if db is not None:
+                            _append_agent_step(db, agent_run_id, step)
+                    except Exception as e:
+                        step = ToolResult(
+                            spec=_SEARCH_TOOL_SPEC,
+                            input={"query": query, "url": json_url, "fallback_params": extra_params or {}},
+                            output={"count": 0, "results": []},
+                            ok=False,
+                            duration_ms=_duration_ms(started),
+                            error_type=type(e).__name__,
+                            error=str(e)[:300],
+                        ).to_step(action="search_failed")
+                        step.update({"query": query, "url": json_url, "retry_count": attempt_index})
+                        if extra_params:
+                            step["fallback_params"] = extra_params
+                        if db is not None:
+                            _append_agent_step(db, agent_run_id, step)
+                        continue
+                    if filtered_results:
+                        break
                 for item in filtered_results:
                     url = str(item.get("url") or "").strip()
                     if not url or url in seen_result_urls:
@@ -1762,6 +1834,7 @@ def _collect_evidence_with_tool_agent(
     evidence: list[dict[str, Any]] = []
     tools_used: list[str] = []
     used_actions: set[str] = set()
+    empty_search_count = 0
     rounds = 0
 
     for step_no in range(1, max(1, min(10, int(max_steps))) + 1):
@@ -1855,6 +1928,25 @@ def _collect_evidence_with_tool_agent(
             )
             evidence = _dedupe_evidence([*evidence, *extra])
             observations.append({"action": action, "query": query, "count": len(extra), "total_evidence": len(evidence)})
+            if not extra:
+                empty_search_count += 1
+                if empty_search_count >= 2:
+                    observations.append({"action": "finish", "reason": "search_web returned no evidence twice", "evidence_count": len(evidence)})
+                    _append_agent_step(
+                        db,
+                        agent_run_id,
+                        {
+                            "kind": "policy",
+                            "action": "search_exhausted",
+                            "tool": "search",
+                            "reason": "search_web returned no usable evidence twice; stopping this child agent search loop.",
+                            "empty_search_count": empty_search_count,
+                            "evidence_count": len(evidence),
+                        },
+                    )
+                    break
+            else:
+                empty_search_count = 0
             continue
 
         if action == "fetch_url":
@@ -3422,15 +3514,37 @@ def _record_matches(
             continue
 
 
-def list_knowledge_items(db: Session, *, item_type: str | None = None, status: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
+def list_knowledge_items(
+    db: Session,
+    *,
+    item_type: str | None = None,
+    status: str | None = None,
+    q: str | None = None,
+    domain: str | None = None,
+    limit: int = 100,
+    offset: int = 0,
+) -> list[dict[str, Any]]:
     clauses = ["1=1"]
-    params: dict[str, Any] = {"limit": max(1, min(500, int(limit)))}
+    params: dict[str, Any] = {"limit": max(1, min(500, int(limit))), "offset": max(0, int(offset))}
     if item_type:
         clauses.append("item_type = :item_type")
         params["item_type"] = item_type
     if status:
         clauses.append("status = :status")
         params["status"] = status
+    if domain:
+        clauses.append("domain ILIKE :domain")
+        params["domain"] = f"%{str(domain).strip()}%"
+    if q:
+        clauses.append(
+            """
+            (
+                term ILIKE :q OR translation ILIKE :q OR title ILIKE :q OR
+                description ILIKE :q OR content ILIKE :q OR domain ILIKE :q
+            )
+            """
+        )
+        params["q"] = f"%{str(q).strip()}%"
     rows = db.execute(
         text(
             f"""
@@ -3441,6 +3555,7 @@ def list_knowledge_items(db: Session, *, item_type: str | None = None, status: s
             WHERE {' AND '.join(clauses)}
             ORDER BY updated_at DESC, created_at DESC
             LIMIT :limit
+            OFFSET :offset
             """
         ),
         params,

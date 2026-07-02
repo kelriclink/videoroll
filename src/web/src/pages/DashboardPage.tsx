@@ -109,12 +109,62 @@ function formatDurationMs(value: unknown): string {
   return `${(n / 1000).toFixed(1)} s`;
 }
 
-function agentStatusClass(status: string): string {
-  if (status === "running") return "border-sky-200 bg-sky-50 text-sky-800";
-  if (status === "succeeded") return "border-emerald-200 bg-emerald-50 text-emerald-800";
-  if (status === "skipped") return "border-amber-200 bg-amber-50 text-amber-800";
-  if (status === "failed") return "border-rose-200 bg-rose-50 text-rose-800";
+type AgentDisplayStatus = {
+  label: string;
+  tone: "running" | "success" | "warning" | "failed" | "idle";
+  title: string;
+};
+
+function agentStatusClass(status: AgentDisplayStatus["tone"] | string): string {
+  if (status === "running" || status === "running_children") return "border-sky-200 bg-sky-50 text-sky-800";
+  if (status === "success" || status === "succeeded") return "border-emerald-200 bg-emerald-50 text-emerald-800";
+  if (status === "warning" || status === "skipped" || status === "partial") return "border-amber-200 bg-amber-50 text-amber-800";
+  if (status === "failed" || status === "error") return "border-rose-200 bg-rose-50 text-rose-800";
   return "border-slate-200 bg-slate-50 text-slate-700";
+}
+
+function agentFailureCategory(run: AgentRun): string {
+  return textValue(run.result?.failure_category);
+}
+
+function agentDisplayStatus(run: AgentRun, childrenRuns: AgentRun[] = []): AgentDisplayStatus {
+  const status = (run.status || "").toLowerCase();
+  const childStatuses = childrenRuns.map((child) => agentDisplayStatus(child));
+  const runningChildren = childStatuses.filter((child) => child.tone === "running").length;
+  const failedChildren = childStatuses.filter((child) => child.tone === "failed").length;
+  const warningChildren = childStatuses.filter((child) => child.tone === "warning").length;
+  const failureCategory = agentFailureCategory(run);
+  const knowledgeStatus = textValue(run.result?.knowledge_status);
+  const resultError = textValue(run.result?.error);
+  const hasError = Boolean(run.error) || Boolean(resultError) || status === "failed";
+
+  if (hasError) {
+    return { label: "failed", tone: "failed", title: run.error || resultError || failureCategory || "Agent failed" };
+  }
+  if (status === "running" || runningChildren > 0) {
+    return {
+      label: status === "running" ? "running" : "waiting",
+      tone: "running",
+      title: runningChildren > 0 ? `${runningChildren} 个子 Agent 仍在运行` : "Agent is running",
+    };
+  }
+  if (failedChildren > 0) {
+    return { label: "partial", tone: "warning", title: `${failedChildren} 个子 Agent 失败，主流程已继续` };
+  }
+  if (status === "skipped") {
+    return { label: "skipped", tone: "warning", title: failureCategory || knowledgeStatus || "Agent skipped writing knowledge" };
+  }
+  if (failureCategory || knowledgeStatus === "not_written" || knowledgeStatus === "context_only" || warningChildren > 0) {
+    return {
+      label: "partial",
+      tone: "warning",
+      title: failureCategory || knowledgeStatus || `${warningChildren} 个子 Agent 未写入长期知识库`,
+    };
+  }
+  if (status === "succeeded") {
+    return { label: "success", tone: "success", title: "Agent succeeded" };
+  }
+  return { label: run.status || "unknown", tone: "idle", title: run.status || "unknown" };
 }
 
 function stepToneClass(kind: unknown, action: unknown): string {
@@ -180,38 +230,57 @@ function AgentStep({ step, index }: { step: Record<string, unknown>; index: numb
 
 function AgentRunDetail({
   run,
+  parentRun,
   childrenRuns = [],
   onSelectRun,
+  onBackToParent,
   onClose,
 }: {
   run: AgentRun;
+  parentRun?: AgentRun | null;
   childrenRuns?: AgentRun[];
   onSelectRun: (run: AgentRun) => void;
+  onBackToParent?: () => void;
   onClose: () => void;
 }) {
   const translation = textValue(run.result?.translation);
   const confidence = numberValue(run.result?.confidence);
   const knowledgeStatus = textValue(run.result?.knowledge_status);
   const failureCategory = textValue(run.result?.failure_category);
+  const displayStatus = agentDisplayStatus(run, childrenRuns);
   return (
-    <div className="fixed inset-0 z-50 flex items-start justify-center overflow-auto bg-slate-950/45 p-4">
-      <div className="mt-8 w-full max-w-[min(64rem,calc(100vw-2rem))] overflow-hidden rounded-md bg-white shadow-xl">
-        <div className="flex items-start justify-between gap-4 border-b border-slate-200 p-4">
+    <div className="fixed inset-0 z-50 flex items-center justify-center overflow-hidden overscroll-contain bg-slate-950/45 p-4">
+      <div className="flex max-h-[calc(100vh-2rem)] w-full max-w-[min(72rem,calc(100vw-2rem))] flex-col overflow-hidden rounded-md bg-white shadow-xl">
+        <div className="flex shrink-0 items-start justify-between gap-4 border-b border-slate-200 p-4">
           <div className="min-w-0">
-            <div className="text-lg font-semibold text-slate-950">{run.term || run.query || run.id}</div>
+            <div className="flex min-w-0 flex-wrap items-center gap-2">
+              <div className="min-w-0 truncate text-lg font-semibold text-slate-950">{run.term || run.query || run.id}</div>
+              <span title={displayStatus.title} className={`shrink-0 rounded border px-2 py-0.5 text-xs ${agentStatusClass(displayStatus.tone)}`}>
+                {displayStatus.label}
+              </span>
+            </div>
             <div className="mt-1 truncate font-mono text-xs text-slate-500">{run.id}</div>
           </div>
-          <button className="rounded-md border border-slate-300 px-3 py-2 text-sm hover:bg-slate-50" onClick={onClose}>
-            关闭
-          </button>
+          <div className="flex shrink-0 items-center gap-2">
+            {parentRun && onBackToParent ? (
+              <button className="rounded-md border border-slate-300 px-3 py-2 text-sm hover:bg-slate-50" onClick={onBackToParent}>
+                返回主 Agent
+              </button>
+            ) : null}
+            <button className="rounded-md border border-slate-300 px-3 py-2 text-sm hover:bg-slate-50" onClick={onClose}>
+              关闭
+            </button>
+          </div>
         </div>
-        <div className="grid min-w-0 gap-4 p-4 lg:grid-cols-[280px_minmax(0,1fr)]">
-          <div className="min-w-0 space-y-3">
+        <div className="min-h-0 min-w-0 flex-1 gap-4 overflow-auto p-4 lg:grid lg:grid-cols-[300px_minmax(0,1fr)] lg:overflow-hidden">
+          <div className="min-h-0 min-w-0 space-y-3 pr-1 lg:overflow-auto">
             <div className="min-w-0 rounded-md border border-slate-200 p-3">
               <div className="mb-2 text-xs font-semibold text-slate-600">概览</div>
               <div className="grid gap-1 text-xs text-slate-600">
-                <div>status: <span className={`rounded border px-1.5 py-0.5 ${agentStatusClass(run.status)}`}>{run.status}</span></div>
+                <div>status: <span title={displayStatus.title} className={`rounded border px-1.5 py-0.5 ${agentStatusClass(displayStatus.tone)}`}>{displayStatus.label}</span></div>
+                <div>raw: <span className={`rounded border px-1.5 py-0.5 ${agentStatusClass(run.status)}`}>{run.status}</span></div>
                 <div className="truncate">type: {run.agent_type}</div>
+                {parentRun ? <div className="truncate">parent: {parentRun.term || parentRun.query || parentRun.id}</div> : null}
                 <div className="truncate">domain: {run.domain || "-"}</div>
                 <div className="truncate">target: {run.target_lang}</div>
                 <div className="truncate">query: {run.query || "-"}</div>
@@ -258,7 +327,14 @@ function AgentRunDetail({
                     >
                       <div className="flex items-center justify-between gap-2">
                         <span className="min-w-0 truncate text-xs font-medium text-slate-800">{child.term || child.query || child.id}</span>
-                        <span className={`shrink-0 rounded border px-1.5 py-0.5 text-[11px] ${agentStatusClass(child.status)}`}>{child.status}</span>
+                        {(() => {
+                          const childDisplayStatus = agentDisplayStatus(child);
+                          return (
+                            <span title={childDisplayStatus.title} className={`shrink-0 rounded border px-1.5 py-0.5 text-[11px] ${agentStatusClass(childDisplayStatus.tone)}`}>
+                              {childDisplayStatus.label}
+                            </span>
+                          );
+                        })()}
                       </div>
                       <div className="mt-1 truncate font-mono text-[11px] text-slate-500">{child.agent_type} · {formatDate(child.updated_at)}</div>
                     </button>
@@ -267,7 +343,7 @@ function AgentRunDetail({
               </div>
             ) : null}
           </div>
-          <div className="min-w-0">
+          <div className="mt-4 min-h-0 min-w-0 pr-1 lg:mt-0 lg:overflow-auto">
             <div className="mb-2 text-sm font-semibold text-slate-900">对话流</div>
             <div className="min-w-0 space-y-2">
               {run.steps.length === 0 ? <div className="text-sm text-slate-500">暂无步骤记录。</div> : null}
@@ -287,6 +363,10 @@ function AgentRunCard({ run, onSelect, childrenRuns = [] }: { run: AgentRun; onS
   const failureCategory = textValue(run.result?.failure_category);
   const opened = run.steps.filter((step) => step.action === "open_url" || step.action === "read_url").length;
   const latestStep = run.steps[run.steps.length - 1];
+  const displayStatus = agentDisplayStatus(run, childrenRuns);
+  const failedChildren = childrenRuns.filter((child) => agentDisplayStatus(child).tone === "failed").length;
+  const warningChildren = childrenRuns.filter((child) => agentDisplayStatus(child).tone === "warning").length;
+  const runningChildren = childrenRuns.filter((child) => agentDisplayStatus(child).tone === "running").length;
   return (
     <button type="button" className="block w-full rounded-md border border-slate-200 p-3 text-left hover:bg-slate-50" onClick={() => onSelect(run)}>
       <div className="flex items-start justify-between gap-3">
@@ -294,13 +374,20 @@ function AgentRunCard({ run, onSelect, childrenRuns = [] }: { run: AgentRun; onS
           <div className="truncate text-sm font-medium text-slate-950">{run.term || run.query || run.id}</div>
           <div className="mt-1 truncate font-mono text-xs text-slate-500">{run.agent_type} · {formatDate(run.updated_at)}</div>
         </div>
-        <span className={`shrink-0 rounded border px-2 py-0.5 text-xs ${agentStatusClass(run.status)}`}>{run.status}</span>
+        <span title={displayStatus.title} className={`shrink-0 rounded border px-2 py-0.5 text-xs ${agentStatusClass(displayStatus.tone)}`}>{displayStatus.label}</span>
       </div>
       <div className="mt-2 grid gap-1 text-xs text-slate-600">
         {run.domain ? <div className="truncate">domain: {run.domain}</div> : null}
         {run.query ? <div className="truncate">query: {run.query}</div> : null}
         {opened ? <div>opened/read pages: {opened}</div> : null}
-        {childrenRuns.length ? <div>subagents: {childrenRuns.length}</div> : null}
+        {childrenRuns.length ? (
+          <div>
+            subagents: {childrenRuns.length}
+            {runningChildren ? ` · running ${runningChildren}` : ""}
+            {failedChildren ? ` · failed ${failedChildren}` : ""}
+            {warningChildren ? ` · warning ${warningChildren}` : ""}
+          </div>
+        ) : null}
         {latestStep?.action ? <div className="truncate">latest: {String(latestStep.action)}</div> : null}
         {translation ? (
           <div className="truncate">
@@ -317,9 +404,17 @@ function AgentRunCard({ run, onSelect, childrenRuns = [] }: { run: AgentRun; onS
           {childrenRuns.slice(0, 5).map((child) => (
             <div key={child.id} className="flex items-center justify-between gap-2 text-xs text-slate-600">
               <span className="min-w-0 truncate">{child.term || child.query || child.id}</span>
-              <span className={`shrink-0 rounded border px-1.5 py-0.5 ${agentStatusClass(child.status)}`}>{child.status}</span>
+              {(() => {
+                const childDisplayStatus = agentDisplayStatus(child);
+                return (
+                  <span title={childDisplayStatus.title} className={`shrink-0 rounded border px-1.5 py-0.5 ${agentStatusClass(childDisplayStatus.tone)}`}>
+                    {childDisplayStatus.label}
+                  </span>
+                );
+              })()}
             </div>
           ))}
+          {childrenRuns.length > 5 ? <div className="text-xs text-slate-500">还有 {childrenRuns.length - 5} 个子 Agent，点开查看。</div> : null}
         </div>
       ) : null}
     </button>
@@ -401,7 +496,7 @@ export default function DashboardPage() {
     let timer: number | undefined;
     const load = async () => {
       try {
-        const data = await fetchJson<AgentRun[]>(`${SUBTITLE_SERVICE_URL}/subtitle/agents/runs?limit=12`);
+        const data = await fetchJson<AgentRun[]>(`${SUBTITLE_SERVICE_URL}/subtitle/agents/runs?limit=80`);
         if (cancelled) return;
         setAgentRuns(data);
         setAgentRunsError(null);
@@ -438,10 +533,37 @@ export default function DashboardPage() {
     }
     return out;
   }, [agentRuns]);
+  const agentById = useMemo(() => {
+    const out = new Map<string, AgentRun>();
+    for (const run of agentRuns ?? []) out.set(run.id, run);
+    return out;
+  }, [agentRuns]);
   const topLevelAgents = useMemo(() => (agentRuns ?? []).filter((run) => !run.parent_agent_run_id), [agentRuns]);
-  const runningAgents = useMemo(() => topLevelAgents.filter((run) => run.status === "running"), [topLevelAgents]);
-  const recentFinishedAgents = useMemo(() => topLevelAgents.filter((run) => run.status !== "running").slice(0, 6), [topLevelAgents]);
+  const runningAgents = useMemo(
+    () => topLevelAgents.filter((run) => agentDisplayStatus(run, agentChildren.get(run.id) ?? []).tone === "running"),
+    [agentChildren, topLevelAgents],
+  );
+  const recentFinishedAgents = useMemo(
+    () => topLevelAgents.filter((run) => agentDisplayStatus(run, agentChildren.get(run.id) ?? []).tone !== "running").slice(0, 6),
+    [agentChildren, topLevelAgents],
+  );
   const selectedAgent = useMemo(() => (agentRuns ?? []).find((run) => run.id === selectedAgentId) ?? null, [agentRuns, selectedAgentId]);
+  const selectedAgentParent = useMemo(
+    () => (selectedAgent?.parent_agent_run_id ? agentById.get(selectedAgent.parent_agent_run_id) ?? null : null),
+    [agentById, selectedAgent],
+  );
+  useEffect(() => {
+    if (!selectedAgentId || selectedAgent || !agentRuns) return;
+    setSelectedAgentId(null);
+  }, [agentRuns, selectedAgent, selectedAgentId]);
+  useEffect(() => {
+    if (!selectedAgent) return;
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    return () => {
+      document.body.style.overflow = previousOverflow;
+    };
+  }, [selectedAgent]);
   const publishedCount = counts.find(([status]) => status === "PUBLISHED")?.[1] ?? 0;
   const failedCount = counts.find(([status]) => status === "FAILED")?.[1] ?? 0;
   const runningCount = (tasks ?? []).filter((t) => runningStatuses.has(t.status)).length;
@@ -705,8 +827,10 @@ export default function DashboardPage() {
       {selectedAgent ? (
         <AgentRunDetail
           run={selectedAgent}
+          parentRun={selectedAgentParent}
           childrenRuns={agentChildren.get(selectedAgent.id) ?? []}
           onSelectRun={(run) => setSelectedAgentId(run.id)}
+          onBackToParent={selectedAgentParent ? () => setSelectedAgentId(selectedAgentParent.id) : undefined}
           onClose={() => setSelectedAgentId(null)}
         />
       ) : null}
