@@ -6,6 +6,8 @@ import httpx
 
 from videoroll.ai.client import OpenAIChatConfig
 from videoroll.ai.client import request_openai_embedding
+from videoroll.apps.subtitle_service.agent_runtime import AgentBudget, AgentBudgetExceeded, AgentRuntime, AgentTraceEvent
+from videoroll.apps.subtitle_service.retrieval import RetrievalPipeline
 from videoroll.apps.subtitle_service.rag import (
     _run_research_agents,
     _fallback_search_queries,
@@ -56,6 +58,13 @@ def test_rag_settings_from_translate_settings_clamps_values() -> None:
             "rag_wiki_enabled": True,
             "rag_search_enabled": True,
             "rag_search_url": "https://search.example",
+            "rag_search_categories": "general,it,general",
+            "rag_search_engines": "bing, baidu",
+            "rag_search_fallback_engines": "brave,duckduckgo",
+            "rag_search_language": "zh-CN",
+            "rag_search_safesearch": 2,
+            "rag_search_time_range": "month",
+            "rag_search_pageno": 3,
             "rag_domain": "CS2",
             "rag_agent_parallelism": 99,
             "rag_agent_timeout_seconds": 9999,
@@ -74,9 +83,86 @@ def test_rag_settings_from_translate_settings_clamps_values() -> None:
     assert cfg.wiki_enabled is True
     assert cfg.search_enabled is True
     assert cfg.search_url == "https://search.example"
+    assert cfg.search_categories == "general,it"
+    assert cfg.search_engines == "bing,baidu"
+    assert cfg.search_fallback_engines == "brave,duckduckgo"
+    assert cfg.search_language == "zh-CN"
+    assert cfg.search_safesearch == 2
+    assert cfg.search_time_range == "month"
+    assert cfg.search_pageno == 3
     assert cfg.domain == "CS2"
     assert cfg.agent_parallelism == 8
     assert cfg.agent_timeout_seconds == 900.0
+
+
+def test_agent_runtime_enforces_budget_and_records_normalized_steps() -> None:
+    steps: list[dict[str, object]] = []
+    runtime = AgentRuntime(
+        agent_name="rag_term_research",
+        run_id="run-1",
+        budget=AgentBudget(max_llm_calls=1, max_tool_calls=1, max_fetch_calls=0, timeout_seconds=30),
+        trace_recorder=steps.append,
+    )
+
+    runtime.before_llm()
+    runtime.record(AgentTraceEvent(kind="agent", action="started", output={"ok": True}))
+
+    try:
+        runtime.before_llm()
+    except AgentBudgetExceeded as e:
+        assert "LLM call budget" in str(e)
+    else:
+        raise AssertionError("expected LLM budget to stop the agent")
+
+    assert steps[0]["run_id"] == "run-1"
+    assert steps[0]["agent_name"] == "rag_term_research"
+    assert steps[0]["event_id"]
+    assert steps[0]["span_id"]
+    assert steps[0]["status"] == "ok"
+    assert steps[0]["budget"]["llm_calls"] == 1  # type: ignore[index]
+
+
+def test_retrieval_pipeline_dedupes_records_and_rolls_back_on_error() -> None:
+    events: list[dict[str, object]] = []
+    errors: list[str] = []
+
+    pipeline = RetrievalPipeline[dict[str, str]](
+        id_getter=lambda item: item["id"],
+        trace_recorder=events.append,
+        error_handler=lambda e: errors.append(type(e).__name__),
+    )
+
+    first = pipeline.run_stage("exact", "AWP", lambda: [{"id": "1"}, {"id": "1"}, {"id": "2"}])
+    second = pipeline.run_stage("vector", "AWP", lambda: (_ for _ in ()).throw(RuntimeError("db aborted")))
+
+    assert first == [{"id": "1"}, {"id": "1"}, {"id": "2"}]
+    assert second == []
+    assert pipeline.hits == [{"id": "1"}, {"id": "2"}]
+    assert events[0]["action"] == "exact"
+    assert events[0]["count"] == 2
+    assert events[1]["status"] == "failed"
+    assert events[1]["error_type"] == "RuntimeError"
+    assert errors == ["RuntimeError"]
+
+
+def test_research_tool_registry_exposes_enabled_tool_schemas() -> None:
+    from videoroll.apps.subtitle_service import rag as rag_module
+
+    cfg = rag_settings_from_translate_settings(
+        {
+            "rag_enabled": True,
+            "rag_wiki_enabled": True,
+            "rag_search_enabled": True,
+        }
+    )
+    specs = rag_module._ordered_tool_specs(rag_module._research_tool_registry(cfg))
+    names = [spec["name"] for spec in specs]
+
+    assert names == ["rag_lookup", "wiki_search", "search_web", "fetch_url", "finish"]
+    search_spec = next(spec for spec in specs if spec["name"] == "search_web")
+    assert "input_schema" in search_spec
+    assert "query" in search_spec["input_schema"]["properties"]
+    assert "filter_search_engine_internal_pages" in search_spec["guardrails"]
 
 
 def test_build_knowledge_embedding_text_includes_term_fields() -> None:
@@ -644,6 +730,22 @@ def test_search_url_accepts_base_url_and_legacy_search_url() -> None:
     assert (
         _search_url_with_params("https://search.example", query="truth table", json_format=True, extra_params={"engines": "bing,baidu"})
         == "https://search.example/search?engines=bing%2Cbaidu&q=truth+table&format=json"
+    )
+    assert (
+        _search_url_with_params(
+            "https://search.example",
+            query="VGA 红色信号",
+            json_format=True,
+            extra_params={
+                "categories": "general,it",
+                "engines": "bing,baidu",
+                "language": "zh-CN",
+                "safesearch": "0",
+                "time_range": "month",
+                "pageno": "2",
+            },
+        )
+        == "https://search.example/search?categories=general%2Cit&engines=bing%2Cbaidu&language=zh-CN&safesearch=0&time_range=month&pageno=2&q=VGA+%E7%BA%A2%E8%89%B2%E4%BF%A1%E5%8F%B7&format=json"
     )
 
 

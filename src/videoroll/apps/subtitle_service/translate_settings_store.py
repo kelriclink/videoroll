@@ -11,6 +11,37 @@ from videoroll.utils.openai_compat import normalize_openai_base_url
 
 
 TRANSLATE_SETTINGS_KEY = "subtitle.translate"
+_SEARXNG_TIME_RANGES = {"", "day", "month", "year"}
+
+
+def _clean_csv(value: Any, *, default: str = "", limit: int = 20) -> str:
+    raw_items = str(value or default or "").replace("\n", ",").split(",")
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in raw_items:
+        clean = " ".join(str(item or "").strip().split())
+        if not clean:
+            continue
+        key = clean.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(clean[:80])
+        if len(out) >= limit:
+            break
+    return ",".join(out)
+
+
+def _clean_search_language(value: Any, *, default: str = "all") -> str:
+    clean = str(value or default or "all").strip()
+    if not clean:
+        return "all"
+    return clean[:32]
+
+
+def _clean_search_time_range(value: Any) -> str:
+    clean = str(value or "").strip().lower()
+    return clean if clean in _SEARXNG_TIME_RANGES else ""
 
 
 def _get_row(db: Session) -> AppSetting:
@@ -89,6 +120,26 @@ def get_translate_settings(db: Session, defaults: SubtitleServiceSettings) -> di
         "rag_wiki_enabled": bool(stored.get("rag_wiki_enabled") if "rag_wiki_enabled" in stored else False),
         "rag_search_enabled": bool(stored.get("rag_search_enabled") if "rag_search_enabled" in stored else defaults.rag_search_enabled),
         "rag_search_url": str(stored.get("rag_search_url") or defaults.rag_search_url),
+        "rag_search_categories": _clean_csv(stored.get("rag_search_categories"), default=defaults.rag_search_categories or "general"),
+        "rag_search_engines": _clean_csv(stored.get("rag_search_engines"), default=defaults.rag_search_engines or ""),
+        "rag_search_fallback_engines": _clean_csv(
+            stored.get("rag_search_fallback_engines"),
+            default=defaults.rag_search_fallback_engines or "bing,baidu",
+        ),
+        "rag_search_language": _clean_search_language(stored.get("rag_search_language"), default=defaults.rag_search_language or "all"),
+        "rag_search_safesearch": max(
+            0,
+            min(
+                2,
+                int(
+                    stored.get("rag_search_safesearch")
+                    if stored.get("rag_search_safesearch") is not None
+                    else defaults.rag_search_safesearch
+                ),
+            ),
+        ),
+        "rag_search_time_range": _clean_search_time_range(stored.get("rag_search_time_range") or defaults.rag_search_time_range),
+        "rag_search_pageno": max(1, min(100, int(stored.get("rag_search_pageno") or defaults.rag_search_pageno or 1))),
         "rag_domain": str(stored.get("rag_domain") or defaults.rag_domain),
         "rag_agent_parallelism": int(stored.get("rag_agent_parallelism") or 1),
         "rag_agent_timeout_seconds": float(stored.get("rag_agent_timeout_seconds") or 120.0),
@@ -120,6 +171,13 @@ def update_translate_settings(db: Session, defaults: SubtitleServiceSettings, up
         "rag_wiki_enabled",
         "rag_search_enabled",
         "rag_search_url",
+        "rag_search_categories",
+        "rag_search_engines",
+        "rag_search_fallback_engines",
+        "rag_search_language",
+        "rag_search_safesearch",
+        "rag_search_time_range",
+        "rag_search_pageno",
         "rag_domain",
         "rag_agent_parallelism",
         "rag_agent_timeout_seconds",
@@ -221,9 +279,33 @@ def update_translate_settings(db: Session, defaults: SubtitleServiceSettings, up
             stored[bool_key] = bool(stored[bool_key])
     provider = str(stored.get("rag_embedding_provider") or defaults.rag_embedding_provider).strip().lower()
     stored["rag_embedding_provider"] = provider if provider in {"openai", "local"} else defaults.rag_embedding_provider
-    for str_key in ["rag_embedding_model", "rag_embedding_model_dir", "rag_embedding_device", "rag_search_url", "rag_domain"]:
+    for str_key in [
+        "rag_embedding_model",
+        "rag_embedding_model_dir",
+        "rag_embedding_device",
+        "rag_search_url",
+        "rag_search_language",
+        "rag_search_time_range",
+        "rag_domain",
+    ]:
         if str_key in stored and stored[str_key] is not None:
             stored[str_key] = str(stored[str_key]).strip()
+    stored["rag_search_categories"] = _clean_csv(stored.get("rag_search_categories"), default=defaults.rag_search_categories or "general")
+    stored["rag_search_engines"] = _clean_csv(stored.get("rag_search_engines"), default=defaults.rag_search_engines or "")
+    stored["rag_search_fallback_engines"] = _clean_csv(
+        stored.get("rag_search_fallback_engines"),
+        default=defaults.rag_search_fallback_engines or "bing,baidu",
+    )
+    stored["rag_search_language"] = _clean_search_language(stored.get("rag_search_language"), default=defaults.rag_search_language or "all")
+    try:
+        stored["rag_search_safesearch"] = max(0, min(2, int(stored.get("rag_search_safesearch") or defaults.rag_search_safesearch or 0)))
+    except Exception:
+        stored["rag_search_safesearch"] = 0
+    stored["rag_search_time_range"] = _clean_search_time_range(stored.get("rag_search_time_range") or defaults.rag_search_time_range)
+    try:
+        stored["rag_search_pageno"] = max(1, min(100, int(stored.get("rag_search_pageno") or defaults.rag_search_pageno or 1)))
+    except Exception:
+        stored["rag_search_pageno"] = 1
     if "base_url" in embedding_openai:
         embedding_openai["base_url"] = normalize_openai_base_url(str(embedding_openai.get("base_url") or ""))
     try:

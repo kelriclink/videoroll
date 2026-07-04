@@ -18,10 +18,27 @@ from urllib.parse import parse_qsl, quote, urlencode, urljoin, urlparse, urlunpa
 import httpx
 from sqlalchemy import text
 from sqlalchemy.orm import Session
+from pydantic import BaseModel
 
 from videoroll.ai.client import OpenAIChatConfig, request_openai_json_object
+from videoroll.apps.subtitle_service.agent_runtime import (
+    AgentBudget,
+    AgentBudgetExceeded,
+    AgentDecision,
+    AgentRuntime,
+    AgentTraceEvent,
+    GlossaryCandidate,
+    RegisteredTool,
+    SearchQueryPlan,
+    ToolRegistry,
+    ToolSpec as RuntimeToolSpec,
+    VerificationResult,
+    json_schema_for,
+    validate_model,
+)
 from videoroll.apps.subtitle_service.embeddings import EmbeddingSettings, assert_embedding_dimensions, embed_text
 from videoroll.apps.subtitle_service.processing import Segment
+from videoroll.apps.subtitle_service.retrieval import RetrievalPipeline
 
 
 _TERM_SPLIT_RE = re.compile(r"[\s\-_]+")
@@ -86,6 +103,13 @@ class RagSettings:
     auto_learn_terms: bool = False
     search_enabled: bool = False
     search_url: str = ""
+    search_categories: str = "general"
+    search_engines: str = ""
+    search_fallback_engines: str = "bing,baidu"
+    search_language: str = "all"
+    search_safesearch: int = 0
+    search_time_range: str = ""
+    search_pageno: int = 1
     wiki_enabled: bool = False
     domain: str = ""
     agent_parallelism: int = 1
@@ -130,9 +154,13 @@ class ToolSpec:
     tool_name: str
     input_schema: dict[str, Any]
     output_schema: dict[str, Any]
+    description: str = ""
     timeout_seconds: float = 20.0
     retry_count: int = 0
     cost: dict[str, Any] | None = None
+    rate_limit: dict[str, Any] | None = None
+    guardrails: list[str] | None = None
+    redact_fields: list[str] | None = None
 
 
 @dataclass(frozen=True)
@@ -146,11 +174,16 @@ class ToolResult:
     error: str = ""
 
     def to_step(self, *, action: str) -> dict[str, Any]:
+        status = "ok" if self.ok else "failed"
         step: dict[str, Any] = {
+            "event_id": str(uuid.uuid4()),
+            "span_id": str(uuid.uuid4()),
             "kind": "tool",
             "action": action,
             "tool": self.spec.tool_name,
             "tool_name": self.spec.tool_name,
+            "status": status,
+            "description": self.spec.description,
             "input_schema": self.spec.input_schema,
             "output_schema": self.spec.output_schema,
             "input": self.input,
@@ -160,6 +193,9 @@ class ToolResult:
             "timeout_seconds": self.spec.timeout_seconds,
             "retry_count": self.spec.retry_count,
             "cost": self.spec.cost or {},
+            "rate_limit": self.spec.rate_limit or {},
+            "guardrails": self.spec.guardrails or [],
+            "redact_fields": self.spec.redact_fields or [],
         }
         if self.error_type:
             step["error_type"] = self.error_type
@@ -172,37 +208,291 @@ _SEARCH_TOOL_SPEC = ToolSpec(
     tool_name="search",
     input_schema={"type": "object", "required": ["query"], "properties": {"query": {"type": "string"}, "url": {"type": "string"}}},
     output_schema={"type": "object", "properties": {"count": {"type": "integer"}, "results": {"type": "array"}}},
+    description="Search the configured SearXNG instance and return filtered external result summaries.",
     timeout_seconds=20.0,
     retry_count=0,
     cost={"network_requests": 1},
+    guardrails=["filter_search_engine_internal_pages", "dedupe_urls", "do_not_fetch_private_hosts"],
 )
 
 _FETCH_TOOL_SPEC = ToolSpec(
     tool_name="fetch",
     input_schema={"type": "object", "required": ["url"], "properties": {"url": {"type": "string"}, "title": {"type": "string"}}},
     output_schema={"type": "object", "properties": {"chars": {"type": "integer"}, "excerpt": {"type": "string"}}},
+    description="Fetch a public URL and extract compact readable text for evidence.",
     timeout_seconds=20.0,
     retry_count=0,
     cost={"network_requests": 1},
+    guardrails=["http_https_only", "block_private_hosts", "limit_response_chars"],
 )
 
 _WIKI_SEARCH_TOOL_SPEC = ToolSpec(
     tool_name="wiki_search",
     input_schema={"type": "object", "required": ["query", "api_url"], "properties": {"query": {"type": "string"}, "api_url": {"type": "string"}}},
     output_schema={"type": "object", "properties": {"count": {"type": "integer"}, "results": {"type": "array"}}},
+    description="Search English Wikipedia through the MediaWiki API.",
     timeout_seconds=20.0,
     retry_count=0,
     cost={"network_requests": 1},
+    guardrails=["fixed_english_wikipedia_api", "dedupe_pageids"],
 )
 
 _WIKI_READ_TOOL_SPEC = ToolSpec(
     tool_name="wiki_read",
     input_schema={"type": "object", "required": ["pageid", "api_url"], "properties": {"pageid": {"type": "integer"}, "api_url": {"type": "string"}}},
     output_schema={"type": "object", "properties": {"title": {"type": "string"}, "chars": {"type": "integer"}, "excerpt": {"type": "string"}}},
+    description="Read the lead extract for a Wikipedia page.",
     timeout_seconds=20.0,
     retry_count=0,
     cost={"network_requests": 1},
+    guardrails=["intro_extract_only", "limit_response_chars"],
 )
+
+
+class RagLookupInput(BaseModel):
+    term: str
+
+
+class RagLookupOutput(BaseModel):
+    exists: bool = False
+    normalized_term: str = ""
+
+
+class WikiSearchInput(BaseModel):
+    query: str
+    api_url: str = _WIKIPEDIA_API_URL
+
+
+class WikiSearchOutput(BaseModel):
+    count: int = 0
+    results: list[dict[str, Any]] = []
+
+
+class SearchWebInput(BaseModel):
+    query: str
+    url: str = ""
+
+
+class SearchWebOutput(BaseModel):
+    count: int = 0
+    results: list[dict[str, Any]] = []
+
+
+class FetchUrlInput(BaseModel):
+    url: str
+    title: str = ""
+
+
+class FetchUrlOutput(BaseModel):
+    chars: int = 0
+    excerpt: str = ""
+
+
+class FinishInput(BaseModel):
+    reason: str = ""
+    final_answer_ready: bool = False
+
+
+class FinishOutput(BaseModel):
+    finished: bool = True
+
+
+def _runtime_tool_spec(
+    *,
+    name: str,
+    description: str,
+    input_model: type[BaseModel],
+    output_model: type[BaseModel],
+    timeout_seconds: float = 20.0,
+    retry_count: int = 0,
+    cost: dict[str, Any] | None = None,
+    rate_limit: dict[str, Any] | None = None,
+    guardrails: list[str] | None = None,
+    redact_fields: list[str] | None = None,
+) -> RuntimeToolSpec:
+    return RuntimeToolSpec(
+        name=name,
+        description=description,
+        input_schema=json_schema_for(input_model),
+        output_schema=json_schema_for(output_model),
+        timeout_seconds=timeout_seconds,
+        retry_count=retry_count,
+        cost=cost or {},
+        rate_limit=rate_limit or {},
+        guardrails=guardrails or [],
+        redact_fields=redact_fields or [],
+    )
+
+
+def _research_tool_registry(rag_settings: RagSettings) -> ToolRegistry:
+    registry = ToolRegistry()
+    registry.register(
+        RegisteredTool(
+            spec=_runtime_tool_spec(
+                name="rag_lookup",
+                description="Check whether the local translation knowledge base already contains this term.",
+                input_model=RagLookupInput,
+                output_model=RagLookupOutput,
+                timeout_seconds=5.0,
+                guardrails=["read_only", "target_language_scoped"],
+            ),
+            input_model=RagLookupInput,
+            output_model=RagLookupOutput,
+        )
+    )
+    if rag_settings.wiki_enabled:
+        registry.register(
+            RegisteredTool(
+                spec=_runtime_tool_spec(
+                    name="wiki_search",
+                    description=_WIKI_SEARCH_TOOL_SPEC.description,
+                    input_model=WikiSearchInput,
+                    output_model=WikiSearchOutput,
+                    timeout_seconds=_WIKI_SEARCH_TOOL_SPEC.timeout_seconds,
+                    retry_count=_WIKI_SEARCH_TOOL_SPEC.retry_count,
+                    cost=_WIKI_SEARCH_TOOL_SPEC.cost,
+                    guardrails=_WIKI_SEARCH_TOOL_SPEC.guardrails,
+                ),
+                input_model=WikiSearchInput,
+                output_model=WikiSearchOutput,
+            )
+        )
+    if rag_settings.search_enabled:
+        registry.register(
+            RegisteredTool(
+                spec=_runtime_tool_spec(
+                    name="search_web",
+                    description=_SEARCH_TOOL_SPEC.description,
+                    input_model=SearchWebInput,
+                    output_model=SearchWebOutput,
+                    timeout_seconds=_SEARCH_TOOL_SPEC.timeout_seconds,
+                    retry_count=_SEARCH_TOOL_SPEC.retry_count,
+                    cost=_SEARCH_TOOL_SPEC.cost,
+                    guardrails=_SEARCH_TOOL_SPEC.guardrails,
+                ),
+                input_model=SearchWebInput,
+                output_model=SearchWebOutput,
+            )
+        )
+    registry.register(
+        RegisteredTool(
+            spec=_runtime_tool_spec(
+                name="fetch_url",
+                description=_FETCH_TOOL_SPEC.description,
+                input_model=FetchUrlInput,
+                output_model=FetchUrlOutput,
+                timeout_seconds=_FETCH_TOOL_SPEC.timeout_seconds,
+                retry_count=_FETCH_TOOL_SPEC.retry_count,
+                cost=_FETCH_TOOL_SPEC.cost,
+                guardrails=_FETCH_TOOL_SPEC.guardrails,
+            ),
+            input_model=FetchUrlInput,
+            output_model=FetchUrlOutput,
+        )
+    )
+    registry.register(
+        RegisteredTool(
+            spec=_runtime_tool_spec(
+                name="finish",
+                description="Stop the child agent when evidence is sufficient or further research is not useful.",
+                input_model=FinishInput,
+                output_model=FinishOutput,
+                timeout_seconds=1.0,
+                guardrails=["requires_reason"],
+            ),
+            input_model=FinishInput,
+            output_model=FinishOutput,
+        )
+    )
+    return registry
+
+
+def _ordered_tool_specs(registry: ToolRegistry) -> list[dict[str, Any]]:
+    order = ["rag_lookup", "wiki_search", "search_web", "fetch_url", "finish"]
+    out: list[dict[str, Any]] = []
+    for name in order:
+        try:
+            spec = registry.spec(name)
+        except KeyError:
+            continue
+        out.append(spec.model_dump())
+    return out
+
+
+_SEARXNG_TIME_RANGES = {"", "day", "month", "year"}
+
+
+def _clean_searxng_csv(value: Any, *, default: str = "", limit: int = 20) -> str:
+    raw_items = str(value or default or "").replace("\n", ",").split(",")
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in raw_items:
+        clean = " ".join(str(item or "").strip().split())
+        if not clean:
+            continue
+        key = clean.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(clean[:80])
+        if len(out) >= limit:
+            break
+    return ",".join(out)
+
+
+def _clean_searxng_language(value: Any) -> str:
+    clean = str(value or "all").strip()
+    return (clean or "all")[:32]
+
+
+def _clean_searxng_safesearch(value: Any) -> int:
+    try:
+        return max(0, min(2, int(value if value is not None else 0)))
+    except Exception:
+        return 0
+
+
+def _clean_searxng_time_range(value: Any) -> str:
+    clean = str(value or "").strip().lower()
+    return clean if clean in _SEARXNG_TIME_RANGES else ""
+
+
+def _searxng_search_params(
+    *,
+    categories: str = "general",
+    engines: str = "",
+    language: str = "all",
+    safesearch: int = 0,
+    time_range: str = "",
+    pageno: int = 1,
+) -> dict[str, str]:
+    params: dict[str, str] = {}
+    clean_categories = _clean_searxng_csv(categories, default="general")
+    clean_engines = _clean_searxng_csv(engines, default="")
+    clean_language = _clean_searxng_language(language)
+    clean_time_range = _clean_searxng_time_range(time_range)
+    if clean_categories:
+        params["categories"] = clean_categories
+    if clean_engines:
+        params["engines"] = clean_engines
+    if clean_language:
+        params["language"] = clean_language
+    params["safesearch"] = str(_clean_searxng_safesearch(safesearch))
+    if clean_time_range:
+        params["time_range"] = clean_time_range
+    try:
+        clean_pageno = max(1, min(100, int(pageno or 1)))
+    except Exception:
+        clean_pageno = 1
+    params["pageno"] = str(clean_pageno)
+    return params
+
+
+def _clean_searxng_pageno(value: Any) -> int:
+    try:
+        return max(1, min(100, int(value or 1)))
+    except Exception:
+        return 1
 
 
 def rag_settings_from_translate_settings(settings: dict[str, Any]) -> RagSettings:
@@ -219,6 +509,13 @@ def rag_settings_from_translate_settings(settings: dict[str, Any]) -> RagSetting
         auto_learn_terms=bool(settings.get("rag_auto_learn_terms")),
         search_enabled=bool(settings.get("rag_search_enabled")),
         search_url=str(settings.get("rag_search_url") or "").strip(),
+        search_categories=_clean_searxng_csv(settings.get("rag_search_categories"), default="general"),
+        search_engines=_clean_searxng_csv(settings.get("rag_search_engines"), default=""),
+        search_fallback_engines=_clean_searxng_csv(settings.get("rag_search_fallback_engines"), default="bing,baidu"),
+        search_language=_clean_searxng_language(settings.get("rag_search_language")),
+        search_safesearch=_clean_searxng_safesearch(settings.get("rag_search_safesearch")),
+        search_time_range=_clean_searxng_time_range(settings.get("rag_search_time_range")),
+        search_pageno=_clean_searxng_pageno(settings.get("rag_search_pageno")),
         wiki_enabled=bool(settings.get("rag_wiki_enabled")),
         domain=str(settings.get("rag_domain") or "").strip(),
         agent_parallelism=max(1, min(8, int(settings.get("rag_agent_parallelism") or 1))),
@@ -621,7 +918,12 @@ def _append_agent_step(db: Session, run_id: str | None, step: dict[str, Any]) ->
     if not run_id:
         return
     clean_step = dict(step)
+    clean_step.setdefault("event_id", str(uuid.uuid4()))
+    clean_step.setdefault("span_id", str(uuid.uuid4()))
     clean_step.setdefault("at", _utc_now().isoformat())
+    clean_step.setdefault("status", "failed" if clean_step.get("error") or clean_step.get("ok") is False else "ok")
+    if "tool" in clean_step and "tool_name" not in clean_step:
+        clean_step["tool_name"] = clean_step["tool"]
     try:
         db.execute(
             text(
@@ -659,7 +961,13 @@ def _append_llm_step(
 ) -> None:
     if db is None:
         return
-    step: dict[str, Any] = {"kind": "llm", "action": action}
+    step: dict[str, Any] = {
+        "event_id": str(uuid.uuid4()),
+        "span_id": str(uuid.uuid4()),
+        "kind": "llm",
+        "action": action,
+        "status": "failed" if error or error_type else "ok",
+    }
     if config is not None:
         step["model"] = config.model
         step["tokens"] = None
@@ -674,6 +982,41 @@ def _append_llm_step(
     if error:
         step["error"] = error[:1000]
     _append_agent_step(db, run_id, step)
+
+
+def _append_state_transition(
+    db: Session | None,
+    run_id: str | None,
+    *,
+    from_node: str,
+    to_node: str,
+    reason: str = "",
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    if db is None:
+        return
+    _append_agent_step(
+        db,
+        run_id,
+        {
+            "kind": "agent",
+            "action": "state_transition",
+            "from_node": from_node,
+            "to_node": to_node,
+            "reason": reason,
+            "metadata": metadata or {},
+        },
+    )
+
+
+def _agent_budget_for_rag(rag_settings: RagSettings, *, max_steps: int = 6) -> AgentBudget:
+    timeout_seconds = max(10.0, min(900.0, float(rag_settings.agent_timeout_seconds or 120.0)))
+    return AgentBudget(
+        max_llm_calls=max(4, min(24, int(max_steps) + 6)),
+        max_tool_calls=max(4, min(30, int(max_steps) * 2 + 4)),
+        max_fetch_calls=4,
+        timeout_seconds=timeout_seconds,
+    )
 
 
 def _finish_agent_run(
@@ -1077,10 +1420,11 @@ def generate_search_queries_openai(
         ),
         client=client,
     )
-    raw_queries = data.get("queries")
-    if not isinstance(raw_queries, list):
+    try:
+        plan = validate_model(SearchQueryPlan, data)
+    except Exception:
         return []
-    queries = _dedupe_search_queries([str(x or "") for x in raw_queries], limit=safe_max)
+    queries = _dedupe_search_queries([str(x or "") for x in plan.queries], limit=safe_max)
     return queries or _fallback_search_queries(clean_term, domain=domain_hint, target_lang=target_lang, limit=safe_max)
 
 
@@ -1167,6 +1511,13 @@ def fetch_search_evidence(
     *,
     domain: str,
     search_url: str,
+    search_categories: str = "general",
+    search_engines: str = "",
+    search_fallback_engines: str = "bing,baidu",
+    search_language: str = "all",
+    search_safesearch: int = 0,
+    search_time_range: str = "",
+    search_pageno: int = 1,
     queries: list[str] | None = None,
     context: str = "",
     target_lang: str = "zh",
@@ -1194,12 +1545,23 @@ def fetch_search_evidence(
             follow_redirects=True,
             headers={"User-Agent": "VideoRoll-RAG-Agent/1.0", "Accept": "application/json, text/html;q=0.9,*/*;q=0.8"},
         ) as client:
-            has_configured_engines = _search_endpoint_has_param(endpoint, "engines")
+            base_search_params = _searxng_search_params(
+                categories=search_categories,
+                engines=search_engines,
+                language=search_language,
+                safesearch=search_safesearch,
+                time_range=search_time_range,
+                pageno=search_pageno,
+            )
+            fallback_engines = _clean_searxng_csv(search_fallback_engines, default="")
+            has_configured_engines = _search_endpoint_has_param(endpoint, "engines") or bool(base_search_params.get("engines"))
             for query in search_queries:
                 filtered_results: list[dict[str, Any]] = []
-                attempt_configs: list[dict[str, str] | None] = [None]
-                if not has_configured_engines:
-                    attempt_configs.append({"engines": "bing,baidu"})
+                attempt_configs: list[dict[str, str]] = [dict(base_search_params)]
+                if not has_configured_engines and fallback_engines:
+                    fallback_params = dict(base_search_params)
+                    fallback_params["engines"] = fallback_engines
+                    attempt_configs.append(fallback_params)
                 for attempt_index, extra_params in enumerate(attempt_configs):
                     json_url = _search_url_with_params(endpoint, query=query, json_format=True, extra_params=extra_params)
                     html_url = _search_url_with_params(endpoint, query=query, json_format=False, extra_params=extra_params)
@@ -1260,8 +1622,9 @@ def fetch_search_evidence(
                             "filtered_count": len(filtered_results),
                             "results": compact_results,
                             "json_error": json_error,
+                            "search_params": extra_params,
                         }
-                        if extra_params:
+                        if attempt_index > 0:
                             output_value["fallback_params"] = extra_params
                         if unresponsive_engines:
                             output_value["unresponsive_engines"] = unresponsive_engines[:8]
@@ -1282,9 +1645,10 @@ def fetch_search_evidence(
                                 "filtered_count": len(filtered_results),
                                 "results": compact_results,
                                 "retry_count": attempt_index,
+                                "search_params": extra_params,
                             }
                         )
-                        if extra_params:
+                        if attempt_index > 0:
                             step["fallback_params"] = extra_params
                         if unresponsive_engines:
                             step["unresponsive_engines"] = unresponsive_engines[:8]
@@ -1732,6 +2096,7 @@ def research_agent_next_action_openai(
     target_lang: str,
     domain_hint: str,
     available_tools: list[str],
+    available_tool_specs: list[dict[str, Any]] | None = None,
     observations: list[dict[str, Any]],
     evidence: list[dict[str, Any]],
     config: OpenAIChatConfig,
@@ -1773,6 +2138,7 @@ def research_agent_next_action_openai(
             f"目标语言: {target_lang or 'zh'}\n"
             f"领域提示: {domain_hint or '未知'}\n"
             f"可用工具: {json.dumps(available_tools, ensure_ascii=False)}\n\n"
+            f"工具 schema JSON:\n{json.dumps(available_tool_specs or [], ensure_ascii=False)[:5000]}\n\n"
             f"字幕上下文:\n{context[:2600]}\n\n"
             f"observations JSON:\n{json.dumps(compact_observations, ensure_ascii=False)[:5000]}\n\n"
             f"evidence JSON:\n{json.dumps(compact_evidence, ensure_ascii=False)[:5000]}\n\n"
@@ -1784,13 +2150,18 @@ def research_agent_next_action_openai(
     action = str(data.get("action") or "").strip()
     if action not in {"rag_lookup", "wiki_search", "search_web", "fetch_url", "finish"}:
         action = "finish"
-    return {
-        "action": action,
-        "query": str(data.get("query") or "").strip()[:240],
-        "url": str(data.get("url") or "").strip()[:1000],
-        "reason": str(data.get("reason") or "").strip()[:1000],
-        "final_answer_ready": _json_bool(data.get("final_answer_ready")),
-    }
+    decision = validate_model(
+        AgentDecision,
+        {
+            "action": action,
+            "query": str(data.get("query") or "").strip()[:240],
+            "url": str(data.get("url") or "").strip()[:1000],
+            "reason": str(data.get("reason") or "").strip()[:1000],
+            "final_answer_ready": _json_bool(data.get("final_answer_ready")),
+        },
+        fallback=AgentDecision(action="finish", reason="invalid tool decision output"),
+    )
+    return decision.model_dump()
 
 
 def _dedupe_evidence(items: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1822,13 +2193,9 @@ def _collect_evidence_with_tool_agent(
     search_queries: list[str],
     max_steps: int = 6,
 ) -> tuple[list[dict[str, Any]], list[str], int]:
-    available_tools = ["rag_lookup"]
-    if rag_settings.wiki_enabled:
-        available_tools.append("wiki_search")
-    if rag_settings.search_enabled:
-        available_tools.append("search_web")
-    available_tools.append("fetch_url")
-    available_tools.append("finish")
+    tool_registry = _research_tool_registry(rag_settings)
+    available_tool_specs = _ordered_tool_specs(tool_registry)
+    available_tools = [str(spec.get("name") or "") for spec in available_tool_specs if str(spec.get("name") or "")]
 
     observations: list[dict[str, Any]] = []
     evidence: list[dict[str, Any]] = []
@@ -1836,10 +2203,35 @@ def _collect_evidence_with_tool_agent(
     used_actions: set[str] = set()
     empty_search_count = 0
     rounds = 0
+    runtime = AgentRuntime(
+        agent_name="rag_term_research",
+        run_id=agent_run_id,
+        budget=_agent_budget_for_rag(rag_settings, max_steps=max_steps),
+        trace_recorder=(lambda step: _append_agent_step(db, agent_run_id, step)) if db is not None else None,
+    )
+    runtime.record(
+        AgentTraceEvent(
+            kind="agent",
+            action="agent_runtime_start",
+            output={
+                "available_tools": available_tools,
+                "tool_specs": available_tool_specs,
+                "budget": runtime.budget.model_dump(),
+            },
+        )
+    )
+    runtime.record(
+        AgentTraceEvent(
+            kind="agent",
+            action="state_transition",
+            output={"from_node": "start", "to_node": "decide_tool", "reason": "child agent initialized"},
+        )
+    )
 
     for step_no in range(1, max(1, min(10, int(max_steps))) + 1):
         rounds = step_no
         try:
+            runtime.before_llm()
             started = time.perf_counter()
             decision = research_agent_next_action_openai(
                 term=term,
@@ -1847,6 +2239,7 @@ def _collect_evidence_with_tool_agent(
                 target_lang=target_lang,
                 domain_hint=domain_hint,
                 available_tools=available_tools,
+                available_tool_specs=available_tool_specs,
                 observations=observations,
                 evidence=evidence,
                 config=chat_config,
@@ -1867,6 +2260,19 @@ def _collect_evidence_with_tool_agent(
                 output_value=decision,
                 duration_ms=_duration_ms(started),
             )
+        except AgentBudgetExceeded as e:
+            observations.append({"action": "finish", "reason": str(e), "evidence_count": len(evidence)})
+            runtime.record(
+                AgentTraceEvent(
+                    kind="policy",
+                    action="agent_budget_exceeded",
+                    status="failed",
+                    error_type=type(e).__name__,
+                    error=str(e),
+                    output={"evidence_count": len(evidence), "round": step_no},
+                )
+            )
+            break
         except Exception as e:
             decision = {"action": "finish", "query": "", "url": "", "reason": f"tool decision failed: {e}", "final_answer_ready": False}
             _append_llm_step(
@@ -1883,9 +2289,29 @@ def _collect_evidence_with_tool_agent(
         if action == "finish":
             observations.append({"action": "finish", "reason": reason, "evidence_count": len(evidence)})
             _append_agent_step(db, agent_run_id, {"kind": "agent", "action": "agent_finish_decision", "reason": reason, "evidence_count": len(evidence)})
+            runtime.record(
+                AgentTraceEvent(
+                    kind="agent",
+                    action="state_transition",
+                    output={"from_node": "decide_tool", "to_node": "finish", "reason": reason},
+                )
+            )
             break
 
         if action == "rag_lookup":
+            try:
+                runtime.before_tool("rag_lookup")
+            except AgentBudgetExceeded as e:
+                runtime.record(
+                    AgentTraceEvent(
+                        kind="policy",
+                        action="agent_budget_exceeded",
+                        status="failed",
+                        error_type=type(e).__name__,
+                        error=str(e),
+                    )
+                )
+                break
             tools_used.append("rag_lookup")
             used_actions.add(action)
             norm_value = normalize_term(term)
@@ -1897,6 +2323,13 @@ def _collect_evidence_with_tool_agent(
                 {"kind": "tool", "action": "rag_lookup", "tool": "rag_lookup", "term": term, "exists": exists, "ok": True},
             )
             if exists:
+                runtime.record(
+                    AgentTraceEvent(
+                        kind="agent",
+                        action="state_transition",
+                        output={"from_node": "rag_lookup", "to_node": "finish", "reason": "local knowledge already exists"},
+                    )
+                )
                 break
             continue
 
@@ -1905,6 +2338,13 @@ def _collect_evidence_with_tool_agent(
             query = (search_queries[0] if search_queries else " ".join([p for p in [domain_hint, term] if p]).strip()) or term
 
         if action == "wiki_search" and rag_settings.wiki_enabled:
+            try:
+                runtime.before_tool("wiki_search")
+            except AgentBudgetExceeded as e:
+                runtime.record(
+                    AgentTraceEvent(kind="policy", action="agent_budget_exceeded", status="failed", error_type=type(e).__name__, error=str(e))
+                )
+                break
             tools_used.append("wikipedia")
             used_actions.add(action)
             extra = fetch_wikipedia_evidence(term, domain=domain_hint, queries=[query], db=db, agent_run_id=agent_run_id)
@@ -1913,12 +2353,26 @@ def _collect_evidence_with_tool_agent(
             continue
 
         if action == "search_web" and rag_settings.search_enabled:
+            try:
+                runtime.before_tool("search")
+            except AgentBudgetExceeded as e:
+                runtime.record(
+                    AgentTraceEvent(kind="policy", action="agent_budget_exceeded", status="failed", error_type=type(e).__name__, error=str(e))
+                )
+                break
             tools_used.append("search")
             used_actions.add(action)
             extra = fetch_search_evidence(
                 term,
                 domain=domain_hint,
                 search_url=rag_settings.search_url,
+                search_categories=rag_settings.search_categories,
+                search_engines=rag_settings.search_engines,
+                search_fallback_engines=rag_settings.search_fallback_engines,
+                search_language=rag_settings.search_language,
+                search_safesearch=rag_settings.search_safesearch,
+                search_time_range=rag_settings.search_time_range,
+                search_pageno=rag_settings.search_pageno,
                 queries=[query],
                 context=llm_context,
                 target_lang=target_lang,
@@ -1950,6 +2404,13 @@ def _collect_evidence_with_tool_agent(
             continue
 
         if action == "fetch_url":
+            try:
+                runtime.before_tool("fetch_url")
+            except AgentBudgetExceeded as e:
+                runtime.record(
+                    AgentTraceEvent(kind="policy", action="agent_budget_exceeded", status="failed", error_type=type(e).__name__, error=str(e))
+                )
+                break
             tools_used.append("fetch")
             used_actions.add(action)
             url = str(decision.get("url") or "").strip()
@@ -1969,6 +2430,13 @@ def _collect_evidence_with_tool_agent(
 
     # Safety fallback: if the model stopped too early, try enabled tools once.
     if not evidence:
+        runtime.record(
+            AgentTraceEvent(
+                kind="policy",
+                action="agent_evidence_fallback",
+                output={"reason": "no evidence collected in tool loop", "used_actions": sorted(used_actions)},
+            )
+        )
         if rag_settings.wiki_enabled and "wiki_search" not in used_actions:
             tools_used.append("wikipedia")
             evidence = _dedupe_evidence(fetch_wikipedia_evidence(term, domain=domain_hint, queries=search_queries, db=db, agent_run_id=agent_run_id))
@@ -1979,6 +2447,13 @@ def _collect_evidence_with_tool_agent(
                     term,
                     domain=domain_hint,
                     search_url=rag_settings.search_url,
+                    search_categories=rag_settings.search_categories,
+                    search_engines=rag_settings.search_engines,
+                    search_fallback_engines=rag_settings.search_fallback_engines,
+                    search_language=rag_settings.search_language,
+                    search_safesearch=rag_settings.search_safesearch,
+                    search_time_range=rag_settings.search_time_range,
+                    search_pageno=rag_settings.search_pageno,
                     queries=search_queries,
                     context=llm_context,
                     target_lang=target_lang,
@@ -2033,15 +2508,22 @@ def explain_term_from_evidence_openai(
         confidence = float(data.get("confidence") or 0.0)
     except Exception:
         confidence = 0.0
-    return {
-        "term": str(data.get("term") or clean_term).strip(),
-        "translation": translation,
-        "domain": str(data.get("domain") or domain_hint or "").strip(),
-        "aliases": aliases if isinstance(aliases, list) else [],
-        "description": str(data.get("description") or "").strip(),
-        "sources": sources if isinstance(sources, list) else [],
-        "confidence": max(0.0, min(1.0, confidence)),
-    }
+    try:
+        candidate = validate_model(
+            GlossaryCandidate,
+            {
+                "term": str(data.get("term") or clean_term).strip(),
+                "translation": translation,
+                "domain": str(data.get("domain") or domain_hint or "").strip(),
+                "aliases": aliases if isinstance(aliases, list) else [],
+                "description": str(data.get("description") or "").strip(),
+                "sources": sources if isinstance(sources, list) else [],
+                "confidence": max(0.0, min(1.0, confidence)),
+            },
+        )
+    except Exception:
+        return None
+    return candidate.model_dump()
 
 
 def _json_bool(value: Any) -> bool:
@@ -2131,15 +2613,19 @@ def verify_glossary_entry_openai(
         confidence = float(data.get("confidence") or 0.0)
     except Exception:
         confidence = 0.0
-    return {
-        "supported": _json_bool(data.get("supported")),
-        "context_consistent": _json_bool(data.get("context_consistent")),
-        "should_write": _json_bool(data.get("should_write")),
-        "should_auto_approve": _json_bool(data.get("should_auto_approve")),
-        "confidence": max(0.0, min(1.0, confidence)),
-        "reason": str(data.get("reason") or "").strip()[:1200],
-        "failure_category": str(data.get("failure_category") or "").strip()[:120],
-    }
+    verified = validate_model(
+        VerificationResult,
+        {
+            "supported": _json_bool(data.get("supported")),
+            "context_consistent": _json_bool(data.get("context_consistent")),
+            "should_write": _json_bool(data.get("should_write")),
+            "should_auto_approve": _json_bool(data.get("should_auto_approve")),
+            "confidence": max(0.0, min(1.0, confidence)),
+            "reason": str(data.get("reason") or "").strip()[:1200],
+            "failure_category": str(data.get("failure_category") or "").strip()[:120],
+        },
+    )
+    return verified.model_dump()
 
 
 def upsert_knowledge_item(
@@ -2508,6 +2994,14 @@ def _research_discovered_term(
             },
             duration_ms=gate_duration_ms,
         )
+        _append_state_transition(
+            db,
+            agent_run_id,
+            from_node="start",
+            to_node="policy",
+            reason="child agent received gate item",
+            metadata={"term": term, "category": str(item.get("category") or "")},
+        )
     except Exception:
         db.rollback()
         agent_run_id = None
@@ -2525,6 +3019,14 @@ def _research_discovered_term(
         },
     )
     if not research_policy.get("should_research"):
+        _append_state_transition(
+            db,
+            agent_run_id,
+            from_node="policy",
+            to_node="skipped",
+            reason=str(research_policy.get("reason") or "policy skipped research"),
+            metadata={"category": str(research_policy.get("category") or "")},
+        )
         context_card: dict[str, Any] | None = None
         if research_policy.get("category") == "context_only" and research_policy.get("translation"):
             context_card = _context_only_term_card(term, research_policy, target_lang=target_lang, domain=domain_hint)
@@ -2558,6 +3060,14 @@ def _research_discovered_term(
         return AgentResearchResult(term=term, normalized_term=norm, context_card=context_card)
 
     if not bool(research_policy.get("need_search", True)):
+        _append_state_transition(
+            db,
+            agent_run_id,
+            from_node="policy",
+            to_node="skipped",
+            reason=str(research_policy.get("reason") or "external lookup was not requested"),
+            metadata={"category": str(research_policy.get("category") or "")},
+        )
         _finish_agent_run(
             db,
             agent_run_id,
@@ -2573,6 +3083,14 @@ def _research_discovered_term(
         return AgentResearchResult(term=term, normalized_term=norm)
 
     if norm in existing_term_norms(db, terms=[term], target_lang=target_lang):
+        _append_state_transition(
+            db,
+            agent_run_id,
+            from_node="policy",
+            to_node="skipped",
+            reason="term already exists in knowledge base",
+            metadata={"normalized_term": norm},
+        )
         _finish_agent_run(
             db,
             agent_run_id,
@@ -2590,6 +3108,14 @@ def _research_discovered_term(
     external_lookup_enabled = bool(rag_settings.wiki_enabled or rag_settings.search_enabled)
     search_queries: list[str] = []
     if external_lookup_enabled:
+        _append_state_transition(
+            db,
+            agent_run_id,
+            from_node="policy",
+            to_node="query_planning",
+            reason="external lookup enabled",
+            metadata={"wiki": bool(rag_settings.wiki_enabled), "search": bool(rag_settings.search_enabled)},
+        )
         started = time.perf_counter()
         try:
             search_queries = generate_search_queries_openai(
@@ -2653,6 +3179,13 @@ def _research_discovered_term(
             term,
             domain=domain_hint,
             search_url=rag_settings.search_url,
+            search_categories=rag_settings.search_categories,
+            search_engines=rag_settings.search_engines,
+            search_fallback_engines=rag_settings.search_fallback_engines,
+            search_language=rag_settings.search_language,
+            search_safesearch=rag_settings.search_safesearch,
+            search_time_range=rag_settings.search_time_range,
+            search_pageno=rag_settings.search_pageno,
             queries=search_queries,
             context=llm_context,
             target_lang=target_lang,
@@ -2702,7 +3235,23 @@ def _research_discovered_term(
         max_steps=6,
     )
     tools_used.extend(agent_tools_used)
+    _append_state_transition(
+        db,
+        agent_run_id,
+        from_node="query_planning",
+        to_node="summarize",
+        reason="evidence collection finished",
+        metadata={"evidence_count": len(evidence), "tools_used": tools_used, "rounds": evidence_rounds},
+    )
     if not evidence:
+        _append_state_transition(
+            db,
+            agent_run_id,
+            from_node="summarize",
+            to_node="failed",
+            reason="no search evidence",
+            metadata={"tools_used": tools_used},
+        )
         _finish_agent_run(
             db,
             agent_run_id,
@@ -2805,6 +3354,14 @@ def _research_discovered_term(
             return None
 
         valid_sources = _valid_external_evidence(evidence, search_url=rag_settings.search_url)
+        _append_state_transition(
+            db,
+            agent_run_id,
+            from_node="summarize",
+            to_node="verify",
+            reason="candidate summary available",
+            metadata={"evidence_round": evidence_rounds, "valid_source_count": len(valid_sources)},
+        )
         try:
             verify_started = time.perf_counter()
             verification = verify_glossary_entry_openai(
@@ -2859,6 +3416,14 @@ def _research_discovered_term(
             and bool(valid_sources)
         )
         if should_write:
+            _append_state_transition(
+                db,
+                agent_run_id,
+                from_node="verify",
+                to_node="write_rag",
+                reason="verifier approved knowledge write",
+                metadata={"confidence": final_confidence, "valid_source_count": len(valid_sources)},
+            )
             break
         # Before finishing a rejected candidate, try another enabled evidence tool.
         # context_only is a semantic rejection rather than an evidence gap.
@@ -2881,6 +3446,14 @@ def _research_discovered_term(
         failure_category = str(verification.get("failure_category") or "")
         if not valid_sources:
             failure_category = failure_category or "no_valid_external_source"
+        _append_state_transition(
+            db,
+            agent_run_id,
+            from_node="verify",
+            to_node="skipped",
+            reason=str(verification.get("reason") or "verifier rejected glossary entry"),
+            metadata={"failure_category": failure_category or "verify_rejected", "confidence": final_confidence},
+        )
         _finish_agent_run(
             db,
             agent_run_id,
@@ -2909,6 +3482,14 @@ def _research_discovered_term(
     )
     source_list = [x for x in explained.get("sources") or [] if isinstance(x, dict)] or valid_sources
     try:
+        _append_state_transition(
+            db,
+            agent_run_id,
+            from_node="write_rag",
+            to_node="embedding",
+            reason="embedding verified glossary entry",
+            metadata={"status": status, "confidence": final_confidence},
+        )
         _append_agent_step(
             db,
             agent_run_id,
@@ -2951,6 +3532,14 @@ def _research_discovered_term(
             dedupe_any_domain=True,
         )
         db.commit()
+        _append_state_transition(
+            db,
+            agent_run_id,
+            from_node="embedding",
+            to_node="succeeded",
+            reason="knowledge item saved",
+            metadata={"knowledge_item_id": learned_id, "status": status},
+        )
         _finish_agent_run(
             db,
             agent_run_id,
@@ -2992,6 +3581,14 @@ def _research_discovered_term(
         return AgentResearchResult(term=term, normalized_term=norm)
     except Exception as e:
         db.rollback()
+        _append_state_transition(
+            db,
+            agent_run_id,
+            from_node="embedding",
+            to_node="failed",
+            reason="knowledge save failed",
+            metadata={"error_type": type(e).__name__},
+        )
         _finish_agent_run(
             db,
             agent_run_id,
@@ -3204,27 +3801,40 @@ def build_rag_context(
                 },
             },
         )
+        _append_state_transition(
+            db,
+            master_agent_run_id,
+            from_node="start",
+            to_node="retrieval_exact",
+            reason="master agent initialized",
+            metadata={"segment_count": len(segments)},
+        )
     except Exception:
         db.rollback()
         master_agent_run_id = None
 
-    hits: list[RagHit] = []
-    seen_ids: set[str] = set()
+    retrieval = RetrievalPipeline[RagHit](
+        id_getter=lambda hit: hit.id,
+        trace_recorder=(lambda step: _append_agent_step(db, master_agent_run_id, step)) if master_agent_run_id else None,
+        error_handler=lambda _e: db.rollback(),
+    )
     gate_terms: list[dict[str, Any]] | None = None
     gate_norms: set[str] = set()
     gate_duration_ms: int | None = None
     existing_gate_terms: list[dict[str, Any]] = []
 
-    for hit in exact_term_hits(
-        db,
-        text_value=text_value,
-        target_lang=target_lang,
-        domain=rag_settings.domain,
-        limit=max(rag_settings.top_k * 2, 10),
-    ):
-        if hit.id not in seen_ids:
-            seen_ids.add(hit.id)
-            hits.append(hit)
+    exact_hits = retrieval.run_stage(
+        "retrieval_exact_terms",
+        text_value[:240],
+        lambda: exact_term_hits(
+            db,
+            text_value=text_value,
+            target_lang=target_lang,
+            domain=rag_settings.domain,
+            limit=max(rag_settings.top_k * 2, 10),
+        ),
+    )
+    for hit in exact_hits:
         if hit.item_type == "term":
             existing_gate_terms.append(
                 {
@@ -3247,6 +3857,16 @@ def build_rag_context(
                 "ok": True,
             },
         )
+    hits: list[RagHit] = retrieval.hits
+    seen_ids: set[str] = {hit.id for hit in hits}
+    _append_state_transition(
+        db,
+        master_agent_run_id,
+        from_node="retrieval_exact",
+        to_node="rag_gate" if rag_settings.auto_discover_terms else "retrieval_pgvector",
+        reason="exact term retrieval finished",
+        metadata={"hit_count": len(hits), "existing_term_count": len(existing_gate_terms)},
+    )
 
     if rag_settings.auto_discover_terms:
         gate_started = time.perf_counter()
@@ -3286,27 +3906,35 @@ def build_rag_context(
                 error_type="gate_failed",
             )
         gate_duration_ms = _duration_ms(gate_started)
+        _append_state_transition(
+            db,
+            master_agent_run_id,
+            from_node="rag_gate",
+            to_node="retrieval_pgvector",
+            reason="pre-translation RAG gate finished",
+            metadata={"candidate_count": len(gate_terms or [])},
+        )
 
-    try:
-        rag_query_text = text_value[:8000]
-        if gate_terms is not None:
-            rag_query_text = "\n".join(
-                [
-                    " | ".join(
-                        [
-                            str(item.get("term") or "").strip(),
-                            str(item.get("category") or "").strip(),
-                            str(item.get("reason") or "").strip(),
-                        ]
-                    ).strip(" |")
-                    for item in gate_terms
-                    if isinstance(item, dict) and str(item.get("term") or "").strip()
-                ]
-            )
-        if rag_query_text.strip():
+    rag_query_text = text_value[:8000]
+    if gate_terms is not None:
+        rag_query_text = "\n".join(
+            [
+                " | ".join(
+                    [
+                        str(item.get("term") or "").strip(),
+                        str(item.get("category") or "").strip(),
+                        str(item.get("reason") or "").strip(),
+                    ]
+                ).strip(" |")
+                for item in gate_terms
+                if isinstance(item, dict) and str(item.get("term") or "").strip()
+            ]
+        )
+    if rag_query_text.strip():
+        def _vector_lookup() -> list[RagHit]:
             query_embedding = embed_text(rag_query_text[:8000], settings=embedding_settings)
             assert_embedding_dimensions(query_embedding, rag_settings.embedding_dimensions)
-            for hit in search_knowledge(
+            vector_hits = search_knowledge(
                 db,
                 query_embedding=query_embedding,
                 target_lang=target_lang,
@@ -3314,14 +3942,26 @@ def build_rag_context(
                 embedding_model=embedding_model_key(rag_settings),
                 top_k=rag_settings.top_k,
                 min_score=rag_settings.min_score,
-            ):
-                if gate_terms is not None and hit.item_type == "term" and normalize_term(hit.term) not in gate_norms:
-                    continue
-                if hit.id not in seen_ids:
-                    seen_ids.add(hit.id)
-                    hits.append(hit)
-    except Exception:
-        query_embedding = []
+            )
+            if gate_terms is None:
+                return vector_hits
+            return [
+                hit
+                for hit in vector_hits
+                if not (hit.item_type == "term" and normalize_term(hit.term) not in gate_norms)
+            ]
+
+        retrieval.run_stage("retrieval_pgvector", rag_query_text[:240], _vector_lookup)
+        hits = retrieval.hits
+        seen_ids = {hit.id for hit in hits}
+    _append_state_transition(
+        db,
+        master_agent_run_id,
+        from_node="retrieval_pgvector",
+        to_node="dispatch_subagents" if rag_settings.auto_discover_terms else "build_context",
+        reason="vector retrieval finished",
+        metadata={"hit_count": len(hits), "stage_count": len(retrieval.stages)},
+    )
 
     context_only_cards: list[dict[str, Any]] = []
     subagent_count = 0
@@ -3387,6 +4027,14 @@ def build_rag_context(
                 "parallelism": rag_settings.agent_parallelism,
             },
         )
+        _append_state_transition(
+            db,
+            master_agent_run_id,
+            from_node="dispatch_subagents",
+            to_node="wait_subagents",
+            reason="research children dispatched",
+            metadata={"research_count": len(research_items), "parallelism": rag_settings.agent_parallelism},
+        )
         for result in _run_research_agents(
             db=db,
             session_factory=session_factory,
@@ -3412,6 +4060,14 @@ def build_rag_context(
                 seen_ids.add(result.hit.id)
                 hits.append(result.hit)
         discovered = []
+        _append_state_transition(
+            db,
+            master_agent_run_id,
+            from_node="wait_subagents",
+            to_node="build_context",
+            reason="child agents returned",
+            metadata={"context_only_cards": len(context_only_cards), "hit_count": len(hits)},
+        )
 
     term_cards: list[dict[str, Any]] = list(context_only_cards)
     knowledge_cards: list[dict[str, Any]] = []
@@ -3449,6 +4105,14 @@ def build_rag_context(
             context=text_value[:2000],
         )
 
+    _append_state_transition(
+        db,
+        master_agent_run_id,
+        from_node="build_context",
+        to_node="succeeded",
+        reason="RagContext built",
+        metadata={"term_cards": len(term_cards), "knowledge_cards": len(knowledge_cards), "hits": len(hits)},
+    )
     _finish_agent_run(
         db,
         master_agent_run_id,

@@ -34,6 +34,13 @@ type TranslateSettings = {
   rag_wiki_enabled: boolean;
   rag_search_enabled: boolean;
   rag_search_url: string;
+  rag_search_categories: string;
+  rag_search_engines: string;
+  rag_search_fallback_engines: string;
+  rag_search_language: string;
+  rag_search_safesearch: number;
+  rag_search_time_range: string;
+  rag_search_pageno: number;
   rag_domain: string;
   rag_agent_parallelism: number;
   rag_agent_timeout_seconds: number;
@@ -46,6 +53,51 @@ type EmbeddingModelInfo = {
 };
 
 type TranslateSettingsTab = "translation" | "rag" | "embedding" | "test";
+
+const SEARXNG_CATEGORY_PRESETS = ["general", "it", "science", "news", "videos", "images", "files", "social media"];
+const SEARXNG_ENGINE_PRESETS = [
+  "bing",
+  "baidu",
+  "brave",
+  "duckduckgo",
+  "google",
+  "startpage",
+  "qwant",
+  "mojeek",
+  "wikipedia",
+  "wikidata",
+  "arxiv",
+  "crossref",
+  "pubmed",
+  "semantic scholar",
+  "github",
+  "stackoverflow",
+  "reddit",
+  "youtube",
+];
+
+function csvItems(value: string) {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  value
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean)
+    .forEach((item) => {
+      const key = item.toLowerCase();
+      if (seen.has(key)) return;
+      seen.add(key);
+      out.push(item);
+    });
+  return out;
+}
+
+function toggleCsvItem(value: string, item: string) {
+  const clean = item.trim();
+  const current = csvItems(value);
+  const exists = current.some((x) => x.toLowerCase() === clean.toLowerCase());
+  return exists ? current.filter((x) => x.toLowerCase() !== clean.toLowerCase()).join(",") : [...current, clean].join(",");
+}
 
 function safeEmbeddingModelName(raw: string) {
   const value = raw.trim().replace(/[\\/]/g, "--").replace(/[^A-Za-z0-9._-]/g, "-");
@@ -90,6 +142,13 @@ export default function SettingsTranslatePage() {
   const [ragWikiEnabled, setRagWikiEnabled] = useState(false);
   const [ragSearchEnabled, setRagSearchEnabled] = useState(false);
   const [ragSearchUrl, setRagSearchUrl] = useState("");
+  const [ragSearchCategories, setRagSearchCategories] = useState("general");
+  const [ragSearchEngines, setRagSearchEngines] = useState("");
+  const [ragSearchFallbackEngines, setRagSearchFallbackEngines] = useState("bing,baidu");
+  const [ragSearchLanguage, setRagSearchLanguage] = useState("all");
+  const [ragSearchSafesearch, setRagSearchSafesearch] = useState(0);
+  const [ragSearchTimeRange, setRagSearchTimeRange] = useState("");
+  const [ragSearchPageno, setRagSearchPageno] = useState(1);
   const [ragDomain, setRagDomain] = useState("");
   const [ragAgentParallelism, setRagAgentParallelism] = useState(1);
   const [ragAgentTimeoutSeconds, setRagAgentTimeoutSeconds] = useState(120);
@@ -140,6 +199,13 @@ export default function SettingsTranslatePage() {
       setRagWikiEnabled(s.rag_wiki_enabled ?? false);
       setRagSearchEnabled(s.rag_search_enabled);
       setRagSearchUrl(s.rag_search_url);
+      setRagSearchCategories(s.rag_search_categories || "general");
+      setRagSearchEngines(s.rag_search_engines || "");
+      setRagSearchFallbackEngines(s.rag_search_fallback_engines || "bing,baidu");
+      setRagSearchLanguage(s.rag_search_language || "all");
+      setRagSearchSafesearch(s.rag_search_safesearch ?? 0);
+      setRagSearchTimeRange(s.rag_search_time_range || "");
+      setRagSearchPageno(s.rag_search_pageno ?? 1);
       setRagDomain(s.rag_domain);
       setRagAgentParallelism(s.rag_agent_parallelism ?? 1);
       setRagAgentTimeoutSeconds(s.rag_agent_timeout_seconds ?? 120);
@@ -183,6 +249,13 @@ export default function SettingsTranslatePage() {
       rag_wiki_enabled: ragWikiEnabled,
       rag_search_enabled: ragSearchEnabled,
       rag_search_url: ragSearchUrl,
+      rag_search_categories: ragSearchCategories,
+      rag_search_engines: ragSearchEngines,
+      rag_search_fallback_engines: ragSearchFallbackEngines,
+      rag_search_language: ragSearchLanguage,
+      rag_search_safesearch: ragSearchSafesearch,
+      rag_search_time_range: ragSearchTimeRange,
+      rag_search_pageno: ragSearchPageno,
       rag_domain: ragDomain,
       rag_agent_parallelism: ragAgentParallelism,
       rag_agent_timeout_seconds: ragAgentTimeoutSeconds,
@@ -335,6 +408,7 @@ export default function SettingsTranslatePage() {
               ["summary", settings.default_enable_summary ? "true" : "false"],
               ["rag", settings.rag_enabled ? "enabled" : "disabled"],
               ["wiki", settings.rag_wiki_enabled ? "enabled" : "disabled"],
+              ["search", settings.rag_search_enabled ? `${settings.rag_search_categories || "general"} / ${settings.rag_search_language || "all"}` : "disabled"],
               ["agents", `${settings.rag_agent_parallelism} / ${settings.rag_agent_timeout_seconds}s`],
               ["embedding", `${settings.rag_embedding_provider}:${settings.rag_embedding_model}`],
               ["embedding key", settings.rag_embedding_api_key_set ? "set" : "unset"],
@@ -550,6 +624,80 @@ export default function SettingsTranslatePage() {
           <label className="block">
             <div className="mb-1 text-xs text-slate-600">SearXNG Base URL</div>
             <input className="w-full rounded border px-3 py-2 text-sm" placeholder="https://search.linvk.com" value={ragSearchUrl} onChange={(e) => setRagSearchUrl(e.target.value)} />
+          </label>
+          <div className="block md:col-span-2">
+            <div className="mb-1 text-xs text-slate-600">SearXNG categories</div>
+            <input className="w-full rounded border px-3 py-2 text-sm" value={ragSearchCategories} onChange={(e) => setRagSearchCategories(e.target.value)} />
+            <div className="mt-2 flex flex-wrap gap-1.5">
+              {SEARXNG_CATEGORY_PRESETS.map((item) => {
+                const selected = csvItems(ragSearchCategories).some((x) => x.toLowerCase() === item.toLowerCase());
+                return (
+                  <button
+                    key={item}
+                    type="button"
+                    className={`rounded border px-2 py-1 text-xs ${selected ? "border-sky-400 bg-sky-50 text-sky-800" : "border-slate-200 text-slate-600 hover:bg-slate-50"}`}
+                    onClick={() => setRagSearchCategories(toggleCsvItem(ragSearchCategories, item))}
+                  >
+                    {item}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+          <div className="block md:col-span-2">
+            <div className="mb-1 text-xs text-slate-600">SearXNG engines</div>
+            <input className="w-full rounded border px-3 py-2 text-sm" placeholder="留空则使用实例默认引擎" value={ragSearchEngines} onChange={(e) => setRagSearchEngines(e.target.value)} />
+            <div className="mt-2 flex flex-wrap gap-1.5">
+              {SEARXNG_ENGINE_PRESETS.map((item) => {
+                const selected = csvItems(ragSearchEngines).some((x) => x.toLowerCase() === item.toLowerCase());
+                return (
+                  <button
+                    key={item}
+                    type="button"
+                    className={`rounded border px-2 py-1 text-xs ${selected ? "border-sky-400 bg-sky-50 text-sky-800" : "border-slate-200 text-slate-600 hover:bg-slate-50"}`}
+                    onClick={() => setRagSearchEngines(toggleCsvItem(ragSearchEngines, item))}
+                  >
+                    {item}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+          <label className="block md:col-span-2">
+            <div className="mb-1 text-xs text-slate-600">SearXNG fallback_engines</div>
+            <input className="w-full rounded border px-3 py-2 text-sm" value={ragSearchFallbackEngines} onChange={(e) => setRagSearchFallbackEngines(e.target.value)} />
+          </label>
+          <label className="block">
+            <div className="mb-1 text-xs text-slate-600">SearXNG language</div>
+            <select className="w-full rounded border px-3 py-2 text-sm" value={ragSearchLanguage} onChange={(e) => setRagSearchLanguage(e.target.value)}>
+              <option value="all">all</option>
+              <option value="zh-CN">zh-CN</option>
+              <option value="zh-TW">zh-TW</option>
+              <option value="en-US">en-US</option>
+              <option value="ja-JP">ja-JP</option>
+              <option value="ko-KR">ko-KR</option>
+            </select>
+          </label>
+          <label className="block">
+            <div className="mb-1 text-xs text-slate-600">SearXNG safesearch</div>
+            <select className="w-full rounded border px-3 py-2 text-sm" value={ragSearchSafesearch} onChange={(e) => setRagSearchSafesearch(parseInt(e.target.value || "0", 10))}>
+              <option value={0}>0</option>
+              <option value={1}>1</option>
+              <option value={2}>2</option>
+            </select>
+          </label>
+          <label className="block">
+            <div className="mb-1 text-xs text-slate-600">SearXNG time_range</div>
+            <select className="w-full rounded border px-3 py-2 text-sm" value={ragSearchTimeRange} onChange={(e) => setRagSearchTimeRange(e.target.value)}>
+              <option value="">不限</option>
+              <option value="day">day</option>
+              <option value="month">month</option>
+              <option value="year">year</option>
+            </select>
+          </label>
+          <label className="block">
+            <div className="mb-1 text-xs text-slate-600">SearXNG pageno</div>
+            <input type="number" min={1} max={100} className="w-full rounded border px-3 py-2 text-sm" value={ragSearchPageno} onChange={(e) => setRagSearchPageno(parseInt(e.target.value || "1", 10))} />
           </label>
         </div>
         <div className="mt-3 flex flex-wrap items-center gap-2">

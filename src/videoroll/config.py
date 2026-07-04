@@ -96,6 +96,13 @@ class SubtitleServiceSettings(CommonSettings):
     rag_auto_learn_terms: bool = Field(False, alias="SUBTITLE_RAG_AUTO_LEARN_TERMS")
     rag_search_enabled: bool = Field(False, alias="SUBTITLE_RAG_SEARCH_ENABLED")
     rag_search_url: str = Field("", alias="SUBTITLE_RAG_SEARCH_URL")
+    rag_search_categories: str = Field("general", alias="SUBTITLE_RAG_SEARCH_CATEGORIES")
+    rag_search_engines: str = Field("", alias="SUBTITLE_RAG_SEARCH_ENGINES")
+    rag_search_fallback_engines: str = Field("bing,baidu", alias="SUBTITLE_RAG_SEARCH_FALLBACK_ENGINES")
+    rag_search_language: str = Field("all", alias="SUBTITLE_RAG_SEARCH_LANGUAGE")
+    rag_search_safesearch: int = Field(0, alias="SUBTITLE_RAG_SEARCH_SAFESEARCH")
+    rag_search_time_range: str = Field("", alias="SUBTITLE_RAG_SEARCH_TIME_RANGE")
+    rag_search_pageno: int = Field(1, alias="SUBTITLE_RAG_SEARCH_PAGENO")
     rag_domain: str = Field("", alias="SUBTITLE_RAG_DOMAIN")
 
     # Orchestrator API (used by subtitle worker for auto pipelines).

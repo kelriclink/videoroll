@@ -219,6 +219,13 @@ class TranslateSettingsRead(BaseModel):
     rag_wiki_enabled: bool = False
     rag_search_enabled: bool = False
     rag_search_url: str = ""
+    rag_search_categories: str = "general"
+    rag_search_engines: str = ""
+    rag_search_fallback_engines: str = "bing,baidu"
+    rag_search_language: str = "all"
+    rag_search_safesearch: int = 0
+    rag_search_time_range: str = ""
+    rag_search_pageno: int = 1
     rag_domain: str = ""
     rag_agent_parallelism: int = 1
     rag_agent_timeout_seconds: float = 120.0
@@ -256,6 +263,13 @@ class TranslateSettingsUpdate(BaseModel):
     rag_wiki_enabled: Optional[bool] = None
     rag_search_enabled: Optional[bool] = None
     rag_search_url: Optional[str] = None
+    rag_search_categories: Optional[str] = None
+    rag_search_engines: Optional[str] = None
+    rag_search_fallback_engines: Optional[str] = None
+    rag_search_language: Optional[str] = None
+    rag_search_safesearch: Optional[int] = Field(default=None, ge=0, le=2)
+    rag_search_time_range: Optional[str] = None
+    rag_search_pageno: Optional[int] = Field(default=None, ge=1, le=100)
     rag_domain: Optional[str] = None
     rag_agent_parallelism: Optional[int] = Field(default=None, ge=1, le=8)
     rag_agent_timeout_seconds: Optional[float] = Field(default=None, ge=10.0, le=900.0)
