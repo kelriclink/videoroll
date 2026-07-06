@@ -1,0 +1,35 @@
+{
+  "name": "wikipedia-encyclopedia-research",
+  "description": "Use encyclopedic evidence for named concepts, people, places, works, and scientific terms.",
+  "domain": [
+    "science",
+    "astronomy",
+    "astrophysics",
+    "history",
+    "biography",
+    "game",
+    "anime"
+  ],
+  "triggers": [
+    "Wikipedia",
+    "wiki",
+    "Lyman-alpha",
+    "Minecraft",
+    "Mojang",
+    "character",
+    "planet",
+    "galaxy",
+    "person"
+  ],
+  "allowed_tools": [],
+  "runnable": true,
+  "run_mode": "agent_guidance",
+  "instructions": "Use this skill when the term looks like an encyclopedic topic. Start with wiki_search when Wikipedia is enabled. Use the wiki snippet or extract only if it matches the subtitle sense. If the term needs a Chinese conventional name and Wikipedia evidence is English-only or ambiguous, continue with search_web. If the page is about the wrong sense, do not force the result into RAG.",
+  "resources": [
+    {
+      "name": "wiki-strategy",
+      "path": "wiki-strategy.md",
+      "description": "When Wikipedia is enough and when web search is still required."
+    }
+  ]
+}

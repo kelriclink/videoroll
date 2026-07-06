@@ -18,8 +18,7 @@ from redis import Redis
 from redis.exceptions import RedisError
 from sqlalchemy.orm import Session
 
-from videoroll.ai.client import openai_chat_config_from_settings
-from videoroll.ai.service import recommend_typeid_openai
+from videoroll.ai.service import AIService
 from videoroll.apps.bilibili_publisher.auth_settings_store import get_bilibili_cookie_header, get_bilibili_csrf_token
 from celery.exceptions import Retry
 
@@ -59,6 +58,19 @@ celery_app.conf.update(
 def _db() -> Session:
     SessionLocal = get_sessionmaker(settings.database_url)
     return SessionLocal()
+
+
+def _fresh_translate_settings() -> dict[str, Any]:
+    SessionLocal = get_sessionmaker(settings.database_url)
+    db = SessionLocal()
+    try:
+        return get_translate_settings(db, get_subtitle_settings())
+    finally:
+        db.close()
+
+
+def _ai_service() -> AIService:
+    return AIService(_fresh_translate_settings)
 
 
 def _ensure_db() -> None:
@@ -713,10 +725,9 @@ def process_job(self, job_id: str) -> dict[str, Any]:
                                 ai_info["reason"] = "bilibili typelist is empty"
                             else:
                                 id_to_path = {int(o.get("id") or 0): str(o.get("path") or "").strip() for o in options}
-                                obj = recommend_typeid_openai(
+                                obj = _ai_service().recommend_typeid(
                                     text_for_ai,
                                     options=options,
-                                    config=openai_chat_config_from_settings(translate_settings),
                                 )
                                 tid_ai = int(obj.get("typeid") or 0)
                                 ai_info["typeid"] = tid_ai or None

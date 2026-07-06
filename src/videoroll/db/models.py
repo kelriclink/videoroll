@@ -118,6 +118,7 @@ class Task(Base):
 
     __table_args__ = (
         Index("ix_tasks_status_created_at", "status", "created_at"),
+        Index("ix_tasks_lock_until", "lock_owner", "lock_until"),
     )
 
 
@@ -269,6 +270,7 @@ class SubtitleJob(Base):
 
     __table_args__ = (
         Index("ix_subtitle_jobs_task_status", "task_id", "status"),
+        Index("ix_subtitle_jobs_status_created_at", "status", "created_at"),
     )
 
 

@@ -69,12 +69,44 @@ type PublishReview = {
 };
 
 type TaskDetailTab = "overview" | "media" | "subtitle" | "publish" | "logs";
+type WorkflowStepState = "done" | "active" | "pending" | "failed";
+
+type WorkflowStep = {
+  label: string;
+  detail: string;
+  state: WorkflowStepState;
+};
 
 function normalizeYouTubeSubtitleMode(value: unknown, legacyPrefer?: boolean | null): YouTubeSubtitleMode {
   const mode = String(value ?? "").trim().toLowerCase();
   if (mode === "off" || mode === "target" || mode === "auto_source") return mode;
   if (legacyPrefer === false) return "off";
   return "target";
+}
+
+function workflowStepClass(state: WorkflowStepState): string {
+  if (state === "done") return "border-emerald-200 bg-emerald-50 text-emerald-800";
+  if (state === "active") return "border-sky-200 bg-sky-50 text-sky-800";
+  if (state === "failed") return "border-rose-200 bg-rose-50 text-rose-800";
+  return "border-slate-200 bg-slate-50 text-slate-600";
+}
+
+function WorkflowStepper({ steps }: { steps: WorkflowStep[] }) {
+  return (
+    <div className="grid gap-2 md:grid-cols-3 xl:grid-cols-6">
+      {steps.map((step, index) => (
+        <div key={step.label} className={`rounded-md border p-3 ${workflowStepClass(step.state)}`}>
+          <div className="flex items-center gap-2">
+            <span className="inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-full border border-current text-xs font-semibold">
+              {index + 1}
+            </span>
+            <span className="truncate text-sm font-semibold">{step.label}</span>
+          </div>
+          <div className="mt-2 min-h-8 text-xs leading-4">{step.detail}</div>
+        </div>
+      ))}
+    </div>
+  );
 }
 
 export default function TaskDetailPage() {
@@ -371,6 +403,7 @@ export default function TaskDetailPage() {
     return metas.length ? metas[metas.length - 1] : null;
   }, [assets]);
   const finalAssets = useMemo(() => (assets ?? []).filter((x) => x.kind === "video_final"), [assets]);
+  const subtitleAssets = useMemo(() => (assets ?? []).filter((x) => x.kind === "subtitle_srt" || x.kind === "subtitle_ass"), [assets]);
   const coverAssets = useMemo(() => (assets ?? []).filter((x) => x.kind === "cover_image"), [assets]);
   const logAssets = useMemo(() => (assets ?? []).filter((x) => x.kind === "log"), [assets]);
   const youtubeDownloadLogAssets = useMemo(() => logAssets.filter((x) => x.storage_key.includes("/youtube_download_")), [logAssets]);
@@ -401,6 +434,51 @@ export default function TaskDetailPage() {
     [subtitleJobs],
   );
   const failedPublishJobs = useMemo(() => (publishJobs ?? []).filter((j) => j.state === "failed").length, [publishJobs]);
+  const runningPublishJobs = useMemo(
+    () => (publishJobs ?? []).filter((j) => j.state === "submitting" || j.state === "submitted").length,
+    [publishJobs],
+  );
+  const workflowSteps = useMemo<WorkflowStep[]>(() => {
+    if (!task) return [];
+    const failed = task.status === "FAILED";
+    const hasRawVideo = Boolean(rawAsset);
+    const hasSubtitle = subtitleAssets.length > 0 || ["SUBTITLE_READY", "RENDERED", "READY_FOR_REVIEW", "APPROVED", "PUBLISHING", "PUBLISHED"].includes(task.status);
+    const hasFinalVideo = finalAssets.length > 0 || ["RENDERED", "READY_FOR_REVIEW", "APPROVED", "PUBLISHING", "PUBLISHED"].includes(task.status);
+    const reviewDone = ["APPROVED", "PUBLISHING", "PUBLISHED"].includes(task.status);
+    const published = task.status === "PUBLISHED";
+    return [
+      {
+        label: "入库",
+        detail: task.created_at ? new Date(task.created_at).toLocaleString() : "任务已创建",
+        state: "done",
+      },
+      {
+        label: "获取视频",
+        detail: hasRawVideo ? "已获取原始视频" : task.source_type === "youtube" ? "等待下载或复用源视频" : "等待上传原始视频",
+        state: hasRawVideo ? "done" : failed ? "failed" : "active",
+      },
+      {
+        label: "字幕",
+        detail: hasSubtitle ? `${subtitleAssets.length || 1} 个字幕产物` : runningSubtitleJobs ? `${runningSubtitleJobs} 个任务运行中` : "等待生成字幕",
+        state: hasSubtitle ? "done" : failed && hasRawVideo ? "failed" : hasRawVideo || runningSubtitleJobs ? "active" : "pending",
+      },
+      {
+        label: "渲染",
+        detail: hasFinalVideo ? `${finalAssets.length || 1} 个最终视频` : hasSubtitle ? "等待压制最终视频" : "等待字幕阶段完成",
+        state: hasFinalVideo ? "done" : failed && hasSubtitle ? "failed" : hasSubtitle ? "active" : "pending",
+      },
+      {
+        label: "审核",
+        detail: reviewDone ? "已通过或进入投稿阶段" : hasFinalVideo ? "等待审核或确认投稿信息" : "等待最终视频",
+        state: reviewDone ? "done" : failed && hasFinalVideo ? "failed" : hasFinalVideo ? "active" : "pending",
+      },
+      {
+        label: "投稿",
+        detail: published ? "已发布" : runningPublishJobs ? `${runningPublishJobs} 个投稿任务运行中` : failedPublishJobs ? `${failedPublishJobs} 个投稿失败` : "等待提交投稿",
+        state: published ? "done" : failedPublishJobs ? "failed" : runningPublishJobs ? "active" : reviewDone ? "active" : "pending",
+      },
+    ];
+  }, [failedPublishJobs, finalAssets.length, rawAsset, runningPublishJobs, runningSubtitleJobs, subtitleAssets.length, task]);
 
   async function loadBilibiliTypes() {
     setBiliTypesBusy(true);
@@ -592,6 +670,96 @@ export default function TaskDetailPage() {
     return hasSubtitleInFlight || hasPublishInFlight;
   }, [subtitleJobs, publishJobs]);
 
+  const nextAction = (() => {
+    if (!task) return null;
+    if (task.status === "PUBLISHED") {
+      return {
+        title: "流程已完成",
+        description: "任务已经发布。可以回到媒体页下载最终视频，或查看投稿记录。",
+        primaryLabel: "查看成品",
+        primaryTone: "primary" as const,
+        onPrimary: () => setActiveTab("media"),
+        secondaryLabel: "投稿记录",
+        onSecondary: () => setActiveTab("publish"),
+      };
+    }
+    if (runningSubtitleJobs > 0 || runningPublishJobs > 0) {
+      return {
+        title: "正在处理",
+        description: runningPublishJobs > 0 ? "投稿任务正在提交，日志会自动刷新。" : "字幕或渲染任务正在运行，日志会自动刷新。",
+        primaryLabel: "查看日志",
+        primaryTone: "primary" as const,
+        onPrimary: () => setActiveTab("logs"),
+        secondaryLabel: "刷新状态",
+        onSecondary: () => refresh({ silent: true }),
+      };
+    }
+    if (task.status === "FAILED" && canResumeSubtitle) {
+      return {
+        title: "任务失败，可继续",
+        description: "检测到失败任务或失败字幕作业。优先从已有产物继续，避免重复下载和重复处理。",
+        primaryLabel: "从失败处继续",
+        primaryTone: "warning" as const,
+        onPrimary: () => submitSubtitleJob({ resume: true }),
+        secondaryLabel: "查看日志",
+        onSecondary: () => setActiveTab("logs"),
+      };
+    }
+    if (task.status === "FAILED") {
+      return {
+        title: "任务失败",
+        description: "当前没有可自动继续的字幕作业。先查看日志定位失败阶段。",
+        primaryLabel: "查看日志",
+        primaryTone: "primary" as const,
+        onPrimary: () => setActiveTab("logs"),
+        secondaryLabel: "媒体资产",
+        onSecondary: () => setActiveTab("media"),
+      };
+    }
+    if (!rawAsset) {
+      return {
+        title: task.source_type === "youtube" ? "获取源视频" : "上传源视频",
+        description: task.source_type === "youtube" ? "还没有原始视频资产。先下载 YouTube 视频和元信息。" : "还没有原始视频资产。先上传本地视频文件。",
+        primaryLabel: task.source_type === "youtube" ? "去下载视频" : "去上传视频",
+        primaryTone: "primary" as const,
+        onPrimary: () => setActiveTab("media"),
+        secondaryLabel: "查看任务信息",
+        onSecondary: () => setActiveTab("overview"),
+      };
+    }
+    if (finalAssets.length === 0) {
+      return {
+        title: "生成字幕和最终视频",
+        description: "源视频已就绪。下一步配置字幕、翻译和渲染参数，然后提交处理。",
+        primaryLabel: "去生成字幕",
+        primaryTone: "primary" as const,
+        onPrimary: () => setActiveTab("subtitle"),
+        secondaryLabel: "查看资产",
+        onSecondary: () => setActiveTab("media"),
+      };
+    }
+    if (publishReview?.checked && publishReview.ok === false) {
+      return {
+        title: "审核未通过",
+        description: publishReview.reason || "投稿前审核未通过。请调整标题、简介或审核设置后重试。",
+        primaryLabel: "处理投稿信息",
+        primaryTone: "warning" as const,
+        onPrimary: () => setActiveTab("publish"),
+        secondaryLabel: "查看日志",
+        onSecondary: () => setActiveTab("logs"),
+      };
+    }
+    return {
+      title: "配置并提交投稿",
+      description: "最终视频已生成。下一步确认封面、标题、分区和审核结果后提交。",
+      primaryLabel: "去投稿",
+      primaryTone: "primary" as const,
+      onPrimary: () => setActiveTab("publish"),
+      secondaryLabel: "下载成品",
+      onSecondary: () => setActiveTab("media"),
+    };
+  })();
+
   const loadLogs = useCallback(
     async (opts?: { silent?: boolean }) => {
       if (!taskId) return;
@@ -705,11 +873,11 @@ export default function TaskDetailPage() {
   if (!taskId) return null;
 
   const tabs: Array<{ id: TaskDetailTab; label: string; badge?: string | number | null }> = [
-    { id: "overview", label: "Overview" },
-    { id: "media", label: "Media & Assets", badge: assets?.length ?? null },
-    { id: "subtitle", label: "Subtitle / Render", badge: runningSubtitleJobs || failedSubtitleJobs || null },
-    { id: "publish", label: "Publish", badge: publishJobs?.length ?? null },
-    { id: "logs", label: "Logs", badge: logAssets.length || null },
+    { id: "overview", label: "概览" },
+    { id: "media", label: "媒体与资产", badge: assets?.length ?? null },
+    { id: "subtitle", label: "字幕 / 渲染", badge: runningSubtitleJobs || failedSubtitleJobs || null },
+    { id: "publish", label: "投稿", badge: publishJobs?.length ?? null },
+    { id: "logs", label: "日志", badge: logAssets.length || null },
   ];
 
   return (
@@ -717,7 +885,7 @@ export default function TaskDetailPage() {
       <div className="vr-section">
         <div className="flex items-start justify-between gap-3">
           <div>
-            <div className="text-lg font-semibold">Task Detail</div>
+            <div className="text-lg font-semibold">任务详情</div>
             <div className="mt-1 font-mono text-xs text-slate-600">{taskId}</div>
           </div>
           <Button onClick={() => refresh()}>
@@ -730,13 +898,13 @@ export default function TaskDetailPage() {
         {task ? (
           <div className="mt-3 grid gap-3 md:grid-cols-2">
             <div className="rounded border p-3">
-              <div className="text-xs text-slate-500">Status</div>
+              <div className="text-xs text-slate-500">状态</div>
               <div className="mt-1">
                 <StatusBadge status={task.status} />
               </div>
             </div>
             <div className="rounded border p-3">
-              <div className="text-xs text-slate-500">Source</div>
+              <div className="text-xs text-slate-500">来源</div>
               <div className="mt-1 text-sm text-slate-800">
                 {task.source_type} · {task.source_license}
               </div>
@@ -775,58 +943,64 @@ export default function TaskDetailPage() {
       </div>
 
       {activeTab === "overview" ? (
-        <div className="grid gap-4 lg:grid-cols-2">
+        <div className="space-y-4">
           <div className="vr-section">
-            <div className="text-sm font-semibold">Workflow</div>
-            <div className="mt-3 grid grid-cols-2 gap-2">
-              <button type="button" onClick={() => setActiveTab("media")} className="rounded-md border border-slate-200 p-3 text-left hover:bg-slate-50">
-                <div className="text-xs text-slate-500">Assets</div>
-                <div className="mt-1 text-xl font-semibold text-slate-950">{assets?.length ?? "-"}</div>
-              </button>
-              <button type="button" onClick={() => setActiveTab("subtitle")} className="rounded-md border border-slate-200 p-3 text-left hover:bg-slate-50">
-                <div className="text-xs text-slate-500">Subtitle Jobs</div>
-                <div className="mt-1 text-xl font-semibold text-slate-950">{subtitleJobs?.length ?? "-"}</div>
-              </button>
-              <button type="button" onClick={() => setActiveTab("publish")} className="rounded-md border border-slate-200 p-3 text-left hover:bg-slate-50">
-                <div className="text-xs text-slate-500">Publish Jobs</div>
-                <div className="mt-1 text-xl font-semibold text-slate-950">{publishJobs?.length ?? "-"}</div>
-              </button>
-              <button type="button" onClick={() => setActiveTab("logs")} className="rounded-md border border-slate-200 p-3 text-left hover:bg-slate-50">
-                <div className="text-xs text-slate-500">Logs</div>
-                <div className="mt-1 text-xl font-semibold text-slate-950">{logAssets.length}</div>
-              </button>
+            <div className="flex items-center justify-between gap-3">
+              <div>
+                <div className="text-sm font-semibold">处理流程</div>
+                <div className="mt-1 text-xs text-slate-500">按当前任务状态、资产和远程作业推断。</div>
+              </div>
+              {task ? <StatusBadge status={task.status} /> : null}
             </div>
-            <div className="mt-3 flex flex-wrap gap-2">
-              <Button type="button" tone="primary" onClick={() => setActiveTab(rawAsset ? "subtitle" : "media")}>
-                {rawAsset || !isYouTubeTask ? "处理字幕" : "获取视频"}
-              </Button>
-              <Button type="button" onClick={() => setActiveTab("publish")}>
-                投稿设置
-              </Button>
-              <Button type="button" onClick={() => setActiveTab("logs")}>
-                查看日志
-              </Button>
-            </div>
+            <div className="mt-3">{workflowSteps.length ? <WorkflowStepper steps={workflowSteps} /> : <div className="text-sm text-slate-500">等待任务加载。</div>}</div>
           </div>
 
-          <div className="vr-section">
-            <div className="text-sm font-semibold">Latest State</div>
-            <div className="mt-3 space-y-3 text-sm">
-              <div className="flex items-center justify-between gap-3">
-                <span className="text-slate-500">最终视频</span>
-                <span className="font-medium text-slate-950">{finalAssets.length}</span>
-              </div>
-              <div className="flex items-center justify-between gap-3">
-                <span className="text-slate-500">字幕运行 / 失败</span>
-                <span className="font-medium text-slate-950">{runningSubtitleJobs} / {failedSubtitleJobs}</span>
-              </div>
-              <div className="flex items-center justify-between gap-3">
-                <span className="text-slate-500">投稿失败</span>
-                <span className={failedPublishJobs ? "font-medium text-rose-700" : "font-medium text-slate-950"}>{failedPublishJobs}</span>
-              </div>
-              <div className="flex items-center justify-between gap-3">
-                <span className="text-slate-500">更新时间</span>
-                <span className="font-medium text-slate-950">{task ? new Date(task.updated_at).toLocaleString() : "-"}</span>
+          <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_24rem]">
+            <div className="vr-section">
+              <div className="text-sm font-semibold">下一步</div>
+              {nextAction ? (
+                <>
+                  <div className="mt-3 text-base font-semibold text-slate-950">{nextAction.title}</div>
+                  <div className="mt-1 max-w-3xl text-sm text-slate-600">{nextAction.description}</div>
+                  <div className="mt-4 flex flex-wrap items-center gap-2">
+                    <Button type="button" tone={nextAction.primaryTone} disabled={busy} onClick={nextAction.onPrimary}>
+                      {nextAction.primaryLabel}
+                    </Button>
+                    {nextAction.secondaryLabel ? (
+                      <Button type="button" disabled={busy} onClick={nextAction.onSecondary}>
+                        {nextAction.secondaryLabel}
+                      </Button>
+                    ) : null}
+                  </div>
+                </>
+              ) : (
+                <div className="mt-3 text-sm text-slate-500">等待任务加载。</div>
+              )}
+            </div>
+
+            <div className="vr-section">
+              <div className="text-sm font-semibold">当前摘要</div>
+              <div className="mt-3 space-y-3 text-sm">
+                <button type="button" onClick={() => setActiveTab("media")} className="flex w-full items-center justify-between gap-3 text-left">
+                  <span className="text-slate-500">资产</span>
+                  <span className="font-medium text-slate-950">{assets?.length ?? "-"}</span>
+                </button>
+                <button type="button" onClick={() => setActiveTab("subtitle")} className="flex w-full items-center justify-between gap-3 text-left">
+                  <span className="text-slate-500">字幕运行 / 失败</span>
+                  <span className="font-medium text-slate-950">{runningSubtitleJobs} / {failedSubtitleJobs}</span>
+                </button>
+                <button type="button" onClick={() => setActiveTab("media")} className="flex w-full items-center justify-between gap-3 text-left">
+                  <span className="text-slate-500">最终视频</span>
+                  <span className="font-medium text-slate-950">{finalAssets.length}</span>
+                </button>
+                <button type="button" onClick={() => setActiveTab("publish")} className="flex w-full items-center justify-between gap-3 text-left">
+                  <span className="text-slate-500">投稿运行 / 失败</span>
+                  <span className={failedPublishJobs ? "font-medium text-rose-700" : "font-medium text-slate-950"}>{runningPublishJobs} / {failedPublishJobs}</span>
+                </button>
+                <div className="flex items-center justify-between gap-3">
+                  <span className="text-slate-500">更新时间</span>
+                  <span className="font-medium text-slate-950">{task ? new Date(task.updated_at).toLocaleString() : "-"}</span>
+                </div>
               </div>
             </div>
           </div>

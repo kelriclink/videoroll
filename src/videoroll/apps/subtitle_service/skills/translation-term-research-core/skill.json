@@ -1,0 +1,17 @@
+{
+  "name": "translation-term-research-core",
+  "description": "Default research policy for subtitle translation terms before RAG injection.",
+  "domain": [],
+  "triggers": [],
+  "allowed_tools": [],
+  "runnable": true,
+  "run_mode": "agent_guidance",
+  "instructions": "Use this skill for every subtitle term research run. Treat the subtitle block and previous summary as the primary context. Research only terms whose meaning or target-language wording is likely to affect translation quality. Prefer current-block context over generic web knowledge. Do not turn local variables, ordinary sentences, greetings, units, or basic dictionary words into durable RAG knowledge. If existing local RAG already answers the term, finish instead of searching. If the term is useful only for the current block, return context-only guidance and do not write long-term knowledge.",
+  "resources": [
+    {
+      "name": "term-policy",
+      "path": "term-policy.md",
+      "description": "Operational rules for deciding what deserves research and RAG persistence."
+    }
+  ]
+}

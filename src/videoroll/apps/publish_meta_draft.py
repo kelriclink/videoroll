@@ -8,7 +8,7 @@ from botocore.exceptions import ClientError
 from sqlalchemy.orm import Session
 
 from videoroll.ai.client import openai_chat_config_from_settings
-from videoroll.ai.service import translate_text_openai
+from videoroll.ai.service import AIService, translate_text_openai
 from videoroll.apps.bilibili_publisher.publish_settings_store import get_bilibili_publish_settings
 from videoroll.apps.bilibili_publisher.schemas import BilibiliPublishMeta
 from videoroll.apps.orchestrator_api.youtube_downloader import summarize_info
@@ -45,6 +45,7 @@ def translate_publish_title(
     *,
     profile: dict[str, Any],
     translate_settings: dict[str, Any],
+    ai_service: AIService | None = None,
 ) -> str:
     title_in = str(title or "").strip()
     if not title_in:
@@ -59,6 +60,12 @@ def translate_publish_title(
         return title_in
 
     try:
+        if ai_service is not None:
+            return ai_service.translate_text(
+                title_in,
+                target_lang=str(profile.get("target_lang") or translate_settings.get("default_target_lang") or "zh"),
+                style=str(profile.get("translate_style") or translate_settings.get("default_style") or "口语自然"),
+            )
         return translate_text_openai(
             title_in,
             target_lang=str(profile.get("target_lang") or translate_settings.get("default_target_lang") or "zh"),
@@ -79,6 +86,7 @@ def apply_publish_source_overrides(
     profile: dict[str, Any],
     translate_settings: dict[str, Any],
     translated_title: str | None = None,
+    ai_service: AIService | None = None,
 ) -> dict[str, Any]:
     return _normalize_publish_meta_draft(
         apply_publish_source_overrides_rules(
@@ -90,7 +98,12 @@ def apply_publish_source_overrides(
             source_uploader=source_uploader,
             title_prefix=str(profile.get("publish_title_prefix") or "").strip(),
             enable_reprint=bool(profile.get("publish_enable_reprint", True)),
-            title_transform=lambda title: translate_publish_title(title, profile=profile, translate_settings=translate_settings),
+            title_transform=lambda title: translate_publish_title(
+                title,
+                profile=profile,
+                translate_settings=translate_settings,
+                ai_service=ai_service,
+            ),
         )
     )
 
@@ -175,6 +188,7 @@ def build_task_publish_meta_draft(
 
     profile = get_auto_profile(db)
     translate_settings = get_translate_settings(db, get_subtitle_settings())
+    ai_service = AIService(lambda: get_translate_settings(db, get_subtitle_settings()))
     return apply_publish_source_overrides(
         meta_out,
         source_title=source_title,
@@ -184,4 +198,5 @@ def build_task_publish_meta_draft(
         source_uploader=source_uploader,
         profile=profile,
         translate_settings=translate_settings,
+        ai_service=ai_service,
     )

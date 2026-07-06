@@ -94,6 +94,11 @@ class SubtitleServiceSettings(CommonSettings):
     rag_embedding_timeout_seconds: float = Field(60.0, alias="SUBTITLE_RAG_EMBEDDING_TIMEOUT_SECONDS")
     rag_auto_discover_terms: bool = Field(False, alias="SUBTITLE_RAG_AUTO_DISCOVER_TERMS")
     rag_auto_learn_terms: bool = Field(False, alias="SUBTITLE_RAG_AUTO_LEARN_TERMS")
+    rag_dictionary_enabled: bool = Field(True, alias="SUBTITLE_RAG_DICTIONARY_ENABLED")
+    rag_dictionary_top_k: int = Field(8, alias="SUBTITLE_RAG_DICTIONARY_TOP_K")
+    rag_dictionary_min_quality: float = Field(0.0, alias="SUBTITLE_RAG_DICTIONARY_MIN_QUALITY")
+    rag_dictionary_auto_promote: bool = Field(False, alias="SUBTITLE_RAG_DICTIONARY_AUTO_PROMOTE")
+    dictionary_data_dir: str = Field("data/dictionaries", alias="SUBTITLE_DICTIONARY_DATA_DIR")
     rag_search_enabled: bool = Field(False, alias="SUBTITLE_RAG_SEARCH_ENABLED")
     rag_search_url: str = Field("", alias="SUBTITLE_RAG_SEARCH_URL")
     rag_search_categories: str = Field("general", alias="SUBTITLE_RAG_SEARCH_CATEGORIES")
@@ -104,6 +109,9 @@ class SubtitleServiceSettings(CommonSettings):
     rag_search_time_range: str = Field("", alias="SUBTITLE_RAG_SEARCH_TIME_RANGE")
     rag_search_pageno: int = Field(1, alias="SUBTITLE_RAG_SEARCH_PAGENO")
     rag_domain: str = Field("", alias="SUBTITLE_RAG_DOMAIN")
+    rag_agent_skills_enabled: bool = Field(False, alias="SUBTITLE_RAG_AGENT_SKILLS_ENABLED")
+    rag_agent_builtin_skills_enabled: bool = Field(True, alias="SUBTITLE_RAG_AGENT_BUILTIN_SKILLS_ENABLED")
+    rag_agent_user_skills_enabled: bool = Field(True, alias="SUBTITLE_RAG_AGENT_USER_SKILLS_ENABLED")
 
     # Orchestrator API (used by subtitle worker for auto pipelines).
     orchestrator_url: str = Field("http://localhost:8000", alias="ORCHESTRATOR_URL")

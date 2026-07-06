@@ -4,7 +4,7 @@ import re
 from typing import Any, Iterable
 
 from videoroll.ai.client import OpenAIChatConfig
-from videoroll.ai.service import review_publish_content_openai
+from videoroll.ai.service import AIService, review_publish_content_openai
 
 
 _SPLIT_WORDS_RE = re.compile(r"[\n,，;；]+")
@@ -96,7 +96,8 @@ def review_publish_materials(
     subtitle_text: str,
     blocked_words: Iterable[str] | str | None,
     reject_rules: str,
-    config: OpenAIChatConfig | None,
+    config: OpenAIChatConfig | None = None,
+    ai_service: AIService | None = None,
 ) -> dict[str, Any]:
     title_out = clamp_review_text(title, _REVIEW_TITLE_MAX_CHARS)
     summary_out = clamp_review_text(summary, _REVIEW_SUMMARY_MAX_CHARS)
@@ -129,7 +130,7 @@ def review_publish_materials(
             "subtitle_chars": 0,
         }
 
-    if config is None:
+    if config is None and ai_service is None:
         return {
             "ok": False,
             "reason": "AI 审核已启用，但未配置 OpenAI API Key",
@@ -141,13 +142,21 @@ def review_publish_materials(
             "subtitle_chars": len(subtitle_plain),
         }
 
-    data = review_publish_content_openai(
-        title=title_out,
-        summary=summary_out,
-        subtitle_excerpt=subtitle_excerpt,
-        reject_rules=rules_out,
-        config=config,
-    )
+    if ai_service is not None:
+        data = ai_service.review_publish_content(
+            title=title_out,
+            summary=summary_out,
+            subtitle_excerpt=subtitle_excerpt,
+            reject_rules=rules_out,
+        )
+    else:
+        data = review_publish_content_openai(
+            title=title_out,
+            summary=summary_out,
+            subtitle_excerpt=subtitle_excerpt,
+            reject_rules=rules_out,
+            config=config,
+        )
     ok = bool(data.get("approved"))
     reason = str(data.get("reason") or "").strip() or ("审核通过" if ok else "AI 未提供不通过原因")
 

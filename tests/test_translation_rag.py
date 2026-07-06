@@ -7,6 +7,7 @@ import httpx
 from videoroll.ai.client import OpenAIChatConfig
 from videoroll.ai.client import request_openai_embedding
 from videoroll.apps.subtitle_service.agent_runtime import AgentBudget, AgentBudgetExceeded, AgentRuntime, AgentTraceEvent
+from videoroll.apps.subtitle_service.agent_skills import AgentSkill, SkillRegistry
 from videoroll.apps.subtitle_service.retrieval import RetrievalPipeline
 from videoroll.apps.subtitle_service.rag import (
     _run_research_agents,
@@ -55,6 +56,10 @@ def test_rag_settings_from_translate_settings_clamps_values() -> None:
             "rag_embedding_timeout_seconds": 15,
             "rag_auto_discover_terms": True,
             "rag_auto_learn_terms": True,
+            "rag_dictionary_enabled": True,
+            "rag_dictionary_top_k": 99,
+            "rag_dictionary_min_quality": -1,
+            "rag_dictionary_auto_promote": True,
             "rag_wiki_enabled": True,
             "rag_search_enabled": True,
             "rag_search_url": "https://search.example",
@@ -68,6 +73,9 @@ def test_rag_settings_from_translate_settings_clamps_values() -> None:
             "rag_domain": "CS2",
             "rag_agent_parallelism": 99,
             "rag_agent_timeout_seconds": 9999,
+            "rag_agent_skills_enabled": True,
+            "rag_agent_builtin_skills_enabled": False,
+            "rag_agent_user_skills_enabled": True,
         }
     )
     assert cfg.enabled is True
@@ -80,6 +88,10 @@ def test_rag_settings_from_translate_settings_clamps_values() -> None:
     assert cfg.embedding_device == "cpu"
     assert cfg.auto_discover_terms is True
     assert cfg.auto_learn_terms is True
+    assert cfg.dictionary_enabled is True
+    assert cfg.dictionary_top_k == 30
+    assert cfg.dictionary_min_quality == 0.0
+    assert cfg.dictionary_auto_promote is True
     assert cfg.wiki_enabled is True
     assert cfg.search_enabled is True
     assert cfg.search_url == "https://search.example"
@@ -93,6 +105,9 @@ def test_rag_settings_from_translate_settings_clamps_values() -> None:
     assert cfg.domain == "CS2"
     assert cfg.agent_parallelism == 8
     assert cfg.agent_timeout_seconds == 900.0
+    assert cfg.agent_skills_enabled is True
+    assert cfg.agent_builtin_skills_enabled is False
+    assert cfg.agent_user_skills_enabled is True
 
 
 def test_agent_runtime_enforces_budget_and_records_normalized_steps() -> None:
@@ -158,11 +173,123 @@ def test_research_tool_registry_exposes_enabled_tool_schemas() -> None:
     specs = rag_module._ordered_tool_specs(rag_module._research_tool_registry(cfg))
     names = [spec["name"] for spec in specs]
 
-    assert names == ["rag_lookup", "wiki_search", "search_web", "fetch_url", "finish"]
+    assert names == ["rag_lookup", "dictionary_lookup", "wiki_search", "search_web", "fetch_url", "finish"]
     search_spec = next(spec for spec in specs if spec["name"] == "search_web")
     assert "input_schema" in search_spec
     assert "query" in search_spec["input_schema"]["properties"]
     assert "filter_search_engine_internal_pages" in search_spec["guardrails"]
+    dictionary_spec = next(spec for spec in specs if spec["name"] == "dictionary_lookup")
+    assert "source_license_preserved" in dictionary_spec["guardrails"]
+
+
+def test_skill_registry_loads_json_markdown_and_selects(tmp_path) -> None:
+    json_skill = tmp_path / "tech"
+    json_skill.mkdir()
+    (json_skill / "notes.md").write_text("Prefer official manuals.", encoding="utf-8")
+    (json_skill / "skill.json").write_text(
+        json.dumps(
+            {
+                "name": "technical-term-research",
+                "description": "Research hardware terms.",
+                "domain": ["hardware"],
+                "triggers": ["VGA"],
+                "allowed_tools": ["search_web", "fetch_url"],
+                "instructions": "Use Chinese technical terminology.",
+                "resources": [{"name": "notes", "path": "notes.md"}],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    md_skill = tmp_path / "wiki"
+    md_skill.mkdir()
+    (md_skill / "SKILL.md").write_text(
+        "---\n"
+        "name: wiki-check\n"
+        "description: Verify encyclopedia terms.\n"
+        "domain: astrophysics\n"
+        "triggers:\n"
+        "  - Lyman-alpha\n"
+        "allowed_tools:\n"
+        "  - wiki_search\n"
+        "---\n"
+        "# Wiki Check\n"
+        "Check stable terminology before writing RAG.",
+        encoding="utf-8",
+    )
+
+    registry = SkillRegistry.load(include_builtin=False, include_user=True, user_dir=tmp_path)
+    names = [skill.name for skill in registry.list()]
+    selected = registry.select(term="VGA red signal", domain="hardware", context="VGA connector pinout")
+
+    assert names == ["technical-term-research", "wiki-check"]
+    assert selected[0].name == "technical-term-research"
+    assert selected[0].resources[0].content == "Prefer official manuals."
+
+
+def test_builtin_skills_are_discoverable() -> None:
+    registry = SkillRegistry.load(include_builtin=True, include_user=False)
+    names = {skill.name for skill in registry.list()}
+    searxng_skill = next(skill for skill in registry.list() if skill.name == "searxng-web-research")
+
+    assert "translation-term-research-core" in names
+    assert "source-verification-rag-write" in names
+    assert "wikipedia-encyclopedia-research" in names
+    assert "searxng-web-research" in names
+    assert searxng_skill.resources
+    assert "Query patterns" in searxng_skill.resources[0].content
+
+
+def test_active_skill_is_passed_to_child_agent_and_filters_tools(monkeypatch) -> None:
+    from videoroll.apps.subtitle_service import rag as rag_module
+
+    captured: dict[str, object] = {}
+    steps: list[dict[str, object]] = []
+
+    monkeypatch.setattr(rag_module, "_append_agent_step", lambda _db, _run_id, step: steps.append(step))
+    monkeypatch.setattr(rag_module, "_append_llm_step", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(rag_module, "fetch_search_evidence", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(rag_module, "fetch_wikipedia_evidence", lambda *_args, **_kwargs: [])
+
+    def fake_decision(**kwargs):
+        captured.update(kwargs)
+        return {"action": "finish", "reason": "done", "skill_name": "web-only"}
+
+    monkeypatch.setattr(rag_module, "research_agent_next_action_openai", fake_decision)
+
+    skill = AgentSkill(
+        name="web-only",
+        description="Use web search only.",
+        allowed_tools=["search_web"],
+        instructions="Prefer search snippets first.",
+    )
+    evidence, tools_used, rounds = rag_module._collect_evidence_with_tool_agent(
+        object(),  # type: ignore[arg-type]
+        agent_run_id="run-1",
+        term="VGA",
+        domain_hint="hardware",
+        target_lang="zh",
+        rag_settings=rag_settings_from_translate_settings(
+            {
+                "rag_enabled": True,
+                "rag_wiki_enabled": True,
+                "rag_search_enabled": True,
+                "rag_search_url": "https://search.example",
+            }
+        ),
+        chat_config=OpenAIChatConfig(api_key="x", base_url="https://example.invalid/v1", model="demo"),
+        llm_context="VGA red signal",
+        search_queries=["VGA 红色 信号"],
+        active_skills=[skill],
+        max_steps=1,
+    )
+
+    assert evidence == []
+    assert tools_used == ["search"]
+    assert rounds == 1
+    assert captured["available_tools"] == ["rag_lookup", "search_web", "finish"]
+    assert captured["active_skills"][0]["name"] == "web-only"  # type: ignore[index]
+    assert any(step.get("action") == "skill_activated" for step in steps)
 
 
 def test_build_knowledge_embedding_text_includes_term_fields() -> None:
@@ -301,6 +428,15 @@ def test_pretranslation_rag_gate_includes_previous_summary(monkeypatch) -> None:
         "It contains a Lyman-alpha blob.",
         target_lang="zh",
         domain_hint="astrophysics",
+        local_context=[
+            {
+                "source": "dictionary",
+                "term": "Lyman-alpha blob",
+                "translation": "莱曼阿尔法斑点",
+                "description": "astronomy dictionary entry",
+                "score": 0.92,
+            }
+        ],
         previous_summary="The video is discussing TON618 and distant quasars.",
         config=OpenAIChatConfig(api_key="x", base_url="https://example.invalid/v1", model="demo"),
     )
@@ -308,6 +444,8 @@ def test_pretranslation_rag_gate_includes_previous_summary(monkeypatch) -> None:
     assert "前文摘要" in captured["user_prompt"]
     assert "TON618" in captured["user_prompt"]
     assert "当前字幕 block" in captured["user_prompt"]
+    assert "已有本地上下文 JSON" in captured["user_prompt"]
+    assert "need_search=false" in captured["user_prompt"]
 
 
 def test_run_research_agents_uses_session_factory_for_parallel_terms(monkeypatch) -> None:
@@ -701,6 +839,96 @@ def test_build_rag_context_skips_research_for_existing_pending_term(monkeypatch)
     assert research_items == []
 
 
+def test_build_rag_context_prefetches_dictionary_before_gate_and_skips_child_agent(monkeypatch) -> None:
+    from videoroll.apps.subtitle_service import rag as rag_module
+
+    captured_gate: dict[str, object] = {}
+    lookup_terms: list[str] = []
+    research_items: list[dict[str, object]] = []
+
+    class _Db:
+        def execute(self, stmt: object, params: dict[str, object] | None = None) -> _Result:
+            return _Result([])
+
+        def rollback(self) -> None:
+            return None
+
+    def fake_dictionary_lookup(_db, *, term: str, **_kwargs):
+        lookup_terms.append(term)
+        if normalize_term(term) != "hobby knife":
+            return []
+        return [
+            {
+                "id": "dict-1",
+                "source_name": "ECDICT",
+                "source_slug": "ecdict",
+                "source_url": "https://example.test/ecdict",
+                "license": "MIT",
+                "license_url": "",
+                "term": "hobby knife",
+                "translations": ["模型刀", "美工刀"],
+                "definition": "A small craft knife.",
+                "pos": "n.",
+                "domain": "手工模型",
+                "aliases": [],
+                "quality": 0.95,
+            }
+        ]
+
+    def fake_gate(*_args, **kwargs):
+        captured_gate.update(kwargs)
+        return [
+            {
+                "term": "hobby knife",
+                "category": "domain_jargon",
+                "domain": "手工模型",
+                "need_rag": True,
+                "need_search": True,
+                "scope": "global",
+                "priority": 0.8,
+                "reason": "tool name",
+            }
+        ]
+
+    def fake_run_research_agents(*_args, **kwargs):
+        research_items.extend(kwargs["items"])
+        return []
+
+    monkeypatch.setattr(rag_module, "lookup_dictionary_entries", fake_dictionary_lookup)
+    monkeypatch.setattr(rag_module, "pretranslation_rag_gate_openai", fake_gate)
+    monkeypatch.setattr(rag_module, "exact_term_hits", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(rag_module, "embed_text", lambda *_args, **_kwargs: [0.1, 0.2])
+    monkeypatch.setattr(rag_module, "assert_embedding_dimensions", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(rag_module, "search_knowledge", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(rag_module, "_run_research_agents", fake_run_research_agents)
+
+    ctx = build_rag_context(
+        _Db(),  # type: ignore[arg-type]
+        segments=[Segment(0, 1, "Use a hobby knife to cut the tape.")],
+        target_lang="zh",
+        rag_settings=rag_settings_from_translate_settings(
+            {
+                "rag_enabled": True,
+                "rag_auto_discover_terms": True,
+                "rag_auto_learn_terms": True,
+                "rag_dictionary_enabled": True,
+                "rag_dictionary_top_k": 8,
+                "rag_embedding_dimensions": 2,
+            }
+        ),
+        embedding_settings=embedding_settings_from_translate_settings({"rag_embedding_provider": "local", "rag_embedding_dimensions": 2}),
+        chat_config=OpenAIChatConfig(api_key="x", base_url="https://example.invalid/v1", model="demo"),
+    )
+
+    local_context = captured_gate["local_context"]
+    assert "hobby knife" in [normalize_term(term) for term in lookup_terms]
+    assert isinstance(local_context, list)
+    assert local_context[0]["source"] == "dictionary"  # type: ignore[index]
+    assert local_context[0]["translation"] == "模型刀"  # type: ignore[index]
+    assert ctx.term_cards[0]["translation"] == "模型刀"
+    assert research_items == []
+
+
 def test_search_knowledge_filters_by_embedding_model() -> None:
     db = _FakeKnowledgeDb([])
     search_knowledge(
@@ -911,6 +1139,31 @@ def test_fetch_search_evidence_reads_result_pages(monkeypatch) -> None:
     assert evidence[0]["title"] == "AWP - Wiki"
     assert evidence[0]["url"] == "https://example.com/wiki/awp"
     assert "powerful sniper rifle" in evidence[0]["content"]
+
+
+def test_safe_public_get_rejects_redirect_to_private_host() -> None:
+    from videoroll.apps.subtitle_service import rag as rag_module
+
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(str(request.url))
+        if request.url.host == "public.example":
+            return httpx.Response(302, headers={"location": "http://127.0.0.1/admin"}, request=request)
+        return httpx.Response(200, text="internal", request=request)
+
+    client = httpx.Client(transport=httpx.MockTransport(handler), follow_redirects=True)
+    try:
+        try:
+            rag_module._safe_public_get(client, "https://public.example/start")
+        except RuntimeError as e:
+            assert "non-public URL" in str(e)
+        else:
+            raise AssertionError("expected redirect to private host to be rejected")
+    finally:
+        client.close()
+
+    assert calls == ["https://public.example/start"]
 
 
 def test_fetch_search_evidence_skips_pages_when_llm_says_summary_is_enough(monkeypatch) -> None:

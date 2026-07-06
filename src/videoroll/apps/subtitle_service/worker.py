@@ -22,7 +22,7 @@ from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from videoroll.ai.client import openai_chat_config_from_settings
-from videoroll.ai.service import generate_bilibili_tags_openai, translate_text_openai
+from videoroll.ai.service import AIService, translate_text_openai
 from videoroll.config import get_subtitle_settings
 from videoroll.db.base import Base
 from videoroll.db.auto_migrate import auto_migrate
@@ -204,6 +204,19 @@ def _db() -> Session:
     return SessionLocal()
 
 
+def _fresh_translate_settings() -> dict[str, Any]:
+    SessionLocal = get_sessionmaker(settings.database_url)
+    db = SessionLocal()
+    try:
+        return get_translate_settings(db, settings)
+    finally:
+        db.close()
+
+
+def _ai_service() -> AIService:
+    return AIService(_fresh_translate_settings)
+
+
 def _ensure_db() -> None:
     global _DB_READY_PID
     pid = os.getpid()
@@ -267,6 +280,7 @@ def _build_after_render_publish_action(
         source_uploader=yt_uploader,
         profile=profile,
         translate_settings=translate_settings,
+        ai_service=_ai_service(),
     )
 
     publish_meta_key = f"meta/{task_id}/publish_meta.json"
@@ -451,18 +465,21 @@ def _translate_title_openai(
     *,
     target_lang: str,
     style: str,
-    translate_settings: dict[str, Any],
+    translate_settings: dict[str, Any] | None = None,
+    ai_service: AIService | None = None,
 ) -> str:
     if not title.strip():
         return title
-    if not translate_settings.get("openai_api_key"):
+    if ai_service is None and not (translate_settings or {}).get("openai_api_key"):
         return title
     try:
+        if ai_service is not None:
+            return ai_service.translate_text(title, target_lang=target_lang, style=style)
         return translate_text_openai(
             title,
             target_lang=target_lang,
             style=style,
-            config=openai_chat_config_from_settings(translate_settings),
+            config=openai_chat_config_from_settings(translate_settings or {}),
         )
     except Exception:
         return title
@@ -1327,7 +1344,8 @@ def process_job(self: Any, job_id: str) -> dict[str, str]:
         translation_summary = ""
         if translate_enabled:
             _safe_append_log_line(log_path, f"translate: provider={provider} target_lang={target_lang} bilingual={bilingual}")
-            translate_settings = get_translate_settings(db, settings)
+            ai_service = _ai_service()
+            translate_settings = _fresh_translate_settings()
             style = (translate_cfg.get("style") or translate_settings["default_style"]).strip() or translate_settings["default_style"]
             batch_size = int(translate_cfg.get("batch_size") or translate_settings["default_batch_size"])
             enable_summary_val = translate_cfg.get("enable_summary")
@@ -1361,8 +1379,6 @@ def process_job(self: Any, job_id: str) -> dict[str, str]:
 
                         checkpoint_segments = list(resume_prefix)
                         rag_settings = rag_settings_from_translate_settings(translate_settings)
-                        rag_chat_config = openai_chat_config_from_settings(translate_settings)
-                        rag_embedding_settings = embedding_settings_from_translate_settings(translate_settings)
 
                         if rag_settings.enabled:
                             _safe_append_log_line(
@@ -1375,8 +1391,12 @@ def process_job(self: Any, job_id: str) -> dict[str, str]:
 
                         def _rag_context_provider(batch_segments: list[Segment], start_idx: int, summary: str) -> dict[str, Any] | None:
                             del start_idx
+                            current_translate_settings = _fresh_translate_settings()
+                            rag_settings = rag_settings_from_translate_settings(current_translate_settings)
                             if not rag_settings.enabled:
                                 return None
+                            rag_chat_config = openai_chat_config_from_settings(current_translate_settings)
+                            rag_embedding_settings = embedding_settings_from_translate_settings(current_translate_settings)
                             ctx = build_rag_context(
                                 db,
                                 segments=batch_segments,
@@ -1410,9 +1430,9 @@ def process_job(self: Any, job_id: str) -> dict[str, str]:
                             segments,
                             target_lang=target_lang,
                             style=style,
-                            api_key=translate_settings["openai_api_key"],
-                            base_url=translate_settings["openai_base_url"],
-                            model=translate_settings["openai_model"],
+                            api_key=None,
+                            base_url="",
+                            model="",
                             temperature=translate_settings["openai_temperature"],
                             timeout_seconds=translate_settings["openai_timeout_seconds"],
                             batch_size=batch_size,
@@ -1421,6 +1441,7 @@ def process_job(self: Any, job_id: str) -> dict[str, str]:
                             resume_from=resume_prefix,
                             initial_summary=resume_summary,
                             on_batch_done=_on_translate_batch_done,
+                            ai_service=ai_service,
                         )
                     else:
                         raise ValueError(f"unsupported translate provider: {provider}")
@@ -1454,7 +1475,7 @@ def process_job(self: Any, job_id: str) -> dict[str, str]:
                                 title_src,
                                 target_lang=target_lang,
                                 style=style,
-                                translate_settings=translate_settings,
+                                ai_service=ai_service,
                             )
                         except Exception:
                             title_out = title_src
@@ -1469,11 +1490,10 @@ def process_job(self: Any, job_id: str) -> dict[str, str]:
                 tags: list[str] = []
                 if provider == "openai":
                     try:
-                        tags = generate_bilibili_tags_openai(
+                        tags = ai_service.generate_bilibili_tags(
                             title=title_hint,
                             summary=translation_summary,
                             transcript=transcript_excerpt,
-                            config=openai_chat_config_from_settings(translate_settings),
                             n_tags=6,
                         )
                     except Exception:
@@ -2689,6 +2709,7 @@ def auto_youtube_pipeline(self: Any, task_id: str, overrides: dict[str, Any] | N
                 source_uploader=yt_uploader,
                 profile=profile,
                 translate_settings=translate_settings,
+                ai_service=_ai_service(),
             )
 
             publish_meta_key = f"meta/{tid}/publish_meta.json"

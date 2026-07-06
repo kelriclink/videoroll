@@ -216,6 +216,10 @@ class TranslateSettingsRead(BaseModel):
     rag_embedding_timeout_seconds: float = 60.0
     rag_auto_discover_terms: bool = False
     rag_auto_learn_terms: bool = False
+    rag_dictionary_enabled: bool = True
+    rag_dictionary_top_k: int = 8
+    rag_dictionary_min_quality: float = 0.0
+    rag_dictionary_auto_promote: bool = False
     rag_wiki_enabled: bool = False
     rag_search_enabled: bool = False
     rag_search_url: str = ""
@@ -229,6 +233,9 @@ class TranslateSettingsRead(BaseModel):
     rag_domain: str = ""
     rag_agent_parallelism: int = 1
     rag_agent_timeout_seconds: float = 120.0
+    rag_agent_skills_enabled: bool = False
+    rag_agent_builtin_skills_enabled: bool = True
+    rag_agent_user_skills_enabled: bool = True
 
 
 class TranslateSettingsUpdate(BaseModel):
@@ -260,6 +267,10 @@ class TranslateSettingsUpdate(BaseModel):
     rag_embedding_timeout_seconds: Optional[float] = None
     rag_auto_discover_terms: Optional[bool] = None
     rag_auto_learn_terms: Optional[bool] = None
+    rag_dictionary_enabled: Optional[bool] = None
+    rag_dictionary_top_k: Optional[int] = Field(default=None, ge=0, le=30)
+    rag_dictionary_min_quality: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    rag_dictionary_auto_promote: Optional[bool] = None
     rag_wiki_enabled: Optional[bool] = None
     rag_search_enabled: Optional[bool] = None
     rag_search_url: Optional[str] = None
@@ -273,6 +284,9 @@ class TranslateSettingsUpdate(BaseModel):
     rag_domain: Optional[str] = None
     rag_agent_parallelism: Optional[int] = Field(default=None, ge=1, le=8)
     rag_agent_timeout_seconds: Optional[float] = Field(default=None, ge=10.0, le=900.0)
+    rag_agent_skills_enabled: Optional[bool] = None
+    rag_agent_builtin_skills_enabled: Optional[bool] = None
+    rag_agent_user_skills_enabled: Optional[bool] = None
 
 
 class TranslateTestRequest(BaseModel):
@@ -343,6 +357,106 @@ class KnowledgeEmbeddingRebuildResponse(BaseModel):
     errors: list[dict[str, str]] = Field(default_factory=list)
 
 
+class DictionarySourceRead(BaseModel):
+    id: uuid.UUID
+    name: str
+    slug: str
+    description: str = ""
+    source_lang: str = ""
+    target_lang: str = "zh"
+    format: str = "csv"
+    license: str = ""
+    license_url: str = ""
+    source_url: str = ""
+    version: str = ""
+    attribution: str = ""
+    domain: str = ""
+    priority: int = 0
+    enabled: bool = True
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    entry_count: int = 0
+    created_at: datetime
+    updated_at: datetime
+
+
+class DictionarySourceUpdate(BaseModel):
+    enabled: Optional[bool] = None
+    priority: Optional[int] = Field(default=None, ge=-1000, le=1000)
+    domain: Optional[str] = None
+    description: Optional[str] = None
+
+
+class DictionaryEntryRead(BaseModel):
+    id: uuid.UUID
+    source_id: uuid.UUID
+    source_name: str = ""
+    source_slug: str = ""
+    source_lang: str = ""
+    target_lang: str = "zh"
+    term: str
+    normalized_term: str = ""
+    translations: list[str] = Field(default_factory=list)
+    translation: str = ""
+    translation_text: str = ""
+    pos: str = ""
+    definition: str = ""
+    domain: str = ""
+    tags: list[Any] = Field(default_factory=list)
+    aliases: list[Any] = Field(default_factory=list)
+    examples: list[Any] = Field(default_factory=list)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    quality: float = 0.0
+    enabled: bool = True
+    usage_count: int = 0
+    license: str = ""
+    license_url: str = ""
+    source_url: str = ""
+    attribution: str = ""
+    created_at: datetime
+    updated_at: datetime
+
+
+class DictionaryEntryUpdate(BaseModel):
+    enabled: bool
+
+
+class DictionaryImportResponse(BaseModel):
+    source_id: uuid.UUID
+    batch_id: uuid.UUID
+    status: str
+    parsed: int = 0
+    upserted: int = 0
+    skipped: int = 0
+    max_entries: int = 0
+    full_import: bool = False
+    sha256: str = ""
+
+
+class DictionaryLookupRequest(BaseModel):
+    term: str
+    source_lang: str = ""
+    target_lang: str = "zh"
+    domain: str = ""
+    exact: bool = True
+    min_quality: float = Field(default=0.0, ge=0.0, le=1.0)
+    limit: int = Field(default=8, ge=1, le=50)
+
+
+class DictionaryLookupResponse(BaseModel):
+    count: int
+    results: list[DictionaryEntryRead] = Field(default_factory=list)
+
+
+class DictionaryPromoteRequest(BaseModel):
+    entry_id: uuid.UUID
+    status: str = "approved"
+    confidence: float = Field(default=0.85, ge=0.0, le=1.0)
+
+
+class DictionaryPromoteResponse(BaseModel):
+    knowledge_item_id: uuid.UUID
+
+
 class AgentRunRead(BaseModel):
     id: uuid.UUID
     agent_type: str
@@ -358,6 +472,19 @@ class AgentRunRead(BaseModel):
     error: str = ""
     knowledge_item_id: Optional[uuid.UUID] = None
     parent_agent_run_id: Optional[uuid.UUID] = None
+
+
+class AgentSkillRead(BaseModel):
+    name: str
+    description: str = ""
+    domain: list[str] = Field(default_factory=list)
+    triggers: list[str] = Field(default_factory=list)
+    allowed_tools: list[str] = Field(default_factory=list)
+    runnable: bool = True
+    run_mode: str = "agent_guidance"
+    source: str = "user"
+    path: str = ""
+    resource_count: int = 0
     started_at: datetime
     finished_at: Optional[datetime] = None
     created_at: datetime

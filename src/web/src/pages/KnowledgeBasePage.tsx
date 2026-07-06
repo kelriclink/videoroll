@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { useConfirm } from "../components/feedbackContext";
-import { Button, DataTable, EmptyState, PageHeader, Section } from "../components/ui";
+import { Button, DataTable, EmptyState, PageHeader, PaginationControls, Section, TableToolbar } from "../components/ui";
 import { fetchJson } from "../lib/http";
 import { SUBTITLE_SERVICE_URL } from "../lib/urls";
 
@@ -41,6 +41,8 @@ export default function KnowledgeBasePage() {
   const [items, setItems] = useState<KnowledgeItem[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
   const [itemTypeFilter, setItemTypeFilter] = useState("");
   const [statusFilter, setStatusFilter] = useState("");
   const [searchText, setSearchText] = useState("");
@@ -71,13 +73,18 @@ export default function KnowledgeBasePage() {
     return params.toString();
   }, [domainFilter, itemTypeFilter, page, statusFilter, searchText]);
 
-  const refresh = useCallback(async () => {
+  const refresh = useCallback(async (opts?: { silent?: boolean }) => {
+    if (opts?.silent) setRefreshing(true);
+    else setLoading(true);
     setError(null);
     try {
       const rows = await fetchJson<KnowledgeItem[]>(`${SUBTITLE_SERVICE_URL}/subtitle/knowledge/items?${query}`);
       setItems(rows);
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setLoading(false);
+      setRefreshing(false);
     }
   }, [query]);
 
@@ -171,7 +178,6 @@ export default function KnowledgeBasePage() {
             <Link to="/settings/translate" className="rounded-md border border-slate-300 px-3 py-2 text-sm text-slate-800 hover:bg-slate-50">
               RAG 设置
             </Link>
-            <Button onClick={refresh}>刷新</Button>
           </>
         }
       />
@@ -242,44 +248,51 @@ export default function KnowledgeBasePage() {
       </Section>
 
       <Section>
-        <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
-          <div>
-            <div className="text-sm font-semibold text-slate-900">知识条目</div>
-            <div className="mt-1 text-xs text-slate-500">第 {page + 1} 页，每页 {pageSize} 条，当前 {items.length} 条。</div>
-          </div>
-          <div className="flex flex-wrap gap-2">
-            <input className="vr-input" placeholder="搜索术语、译文、说明" value={searchText} onChange={(e) => setSearchText(e.target.value)} />
-            <input className="vr-input" placeholder="domain" value={domainFilter} onChange={(e) => setDomainFilter(e.target.value)} />
-            <select className="vr-input" value={itemTypeFilter} onChange={(e) => setItemTypeFilter(e.target.value)}>
-              <option value="">全部类型</option>
-              <option value="term">term</option>
-              <option value="document">document</option>
-            </select>
-            <select className="vr-input" value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)}>
-              <option value="">全部状态</option>
-              <option value="approved">approved</option>
-              <option value="auto_approved">auto_approved</option>
-              <option value="pending">pending</option>
-              <option value="archived">archived</option>
-            </select>
-            <Button
-              disabled={!searchText && !domainFilter && !itemTypeFilter && !statusFilter}
-              onClick={() => {
-                setSearchText("");
-                setDomainFilter("");
-                setItemTypeFilter("");
-                setStatusFilter("");
-              }}
-            >
-              清空筛选
+        <TableToolbar
+          title="知识条目"
+          description="按服务端分页读取，每页 50 条。"
+          meta={`第 ${page + 1} 页，当前 ${items.length} 条${refreshing ? "，刷新中..." : ""}`}
+          actions={
+            <Button disabled={loading || refreshing} onClick={() => refresh({ silent: true })}>
+              {refreshing ? "刷新中..." : "刷新"}
             </Button>
-          </div>
-        </div>
+          }
+          filters={
+            <>
+              <input className="vr-input w-full lg:w-72" placeholder="搜索术语、译文、说明" value={searchText} onChange={(e) => setSearchText(e.target.value)} />
+              <input className="vr-input w-full lg:w-40" placeholder="domain" value={domainFilter} onChange={(e) => setDomainFilter(e.target.value)} />
+              <select className="vr-input" value={itemTypeFilter} onChange={(e) => setItemTypeFilter(e.target.value)}>
+                <option value="">全部类型</option>
+                <option value="term">term</option>
+                <option value="document">document</option>
+              </select>
+              <select className="vr-input" value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)}>
+                <option value="">全部状态</option>
+                <option value="approved">approved</option>
+                <option value="auto_approved">auto_approved</option>
+                <option value="pending">pending</option>
+                <option value="archived">archived</option>
+              </select>
+              <Button
+                disabled={!searchText && !domainFilter && !itemTypeFilter && !statusFilter}
+                onClick={() => {
+                  setSearchText("");
+                  setDomainFilter("");
+                  setItemTypeFilter("");
+                  setStatusFilter("");
+                }}
+              >
+                清空筛选
+              </Button>
+            </>
+          }
+        />
 
-        {items.length === 0 ? (
+        {loading ? <div className="mt-3 text-sm text-slate-500">加载中...</div> : null}
+        {loading ? null : items.length === 0 ? (
           <EmptyState>暂无知识条目</EmptyState>
         ) : (
-          <DataTable wrapClassName="max-h-[34rem]">
+          <DataTable wrapClassName="mt-3 max-h-[34rem]">
             <thead>
               <tr>
                 <th className="py-2 pr-3 text-left">Type</th>
@@ -315,11 +328,15 @@ export default function KnowledgeBasePage() {
             </tbody>
           </DataTable>
         )}
-        <div className="mt-3 flex items-center justify-between gap-3">
-          <Button disabled={page === 0 || busy} onClick={() => setPage((value) => Math.max(0, value - 1))}>上一页</Button>
-          <div className="text-xs text-slate-500">offset {page * pageSize}</div>
-          <Button disabled={items.length < pageSize || busy} onClick={() => setPage((value) => value + 1)}>下一页</Button>
-        </div>
+        <PaginationControls
+          page={page}
+          pageSize={pageSize}
+          currentCount={items.length}
+          hasNext={items.length >= pageSize}
+          disabled={busy || loading}
+          onPrev={() => setPage((value) => Math.max(0, value - 1))}
+          onNext={() => setPage((value) => value + 1)}
+        />
       </Section>
     </div>
   );

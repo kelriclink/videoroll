@@ -117,6 +117,22 @@ def get_translate_settings(db: Session, defaults: SubtitleServiceSettings) -> di
             stored.get("rag_auto_discover_terms") if "rag_auto_discover_terms" in stored else defaults.rag_auto_discover_terms
         ),
         "rag_auto_learn_terms": bool(stored.get("rag_auto_learn_terms") if "rag_auto_learn_terms" in stored else defaults.rag_auto_learn_terms),
+        "rag_dictionary_enabled": bool(
+            stored.get("rag_dictionary_enabled")
+            if "rag_dictionary_enabled" in stored
+            else getattr(defaults, "rag_dictionary_enabled", True)
+        ),
+        "rag_dictionary_top_k": int(stored.get("rag_dictionary_top_k") or getattr(defaults, "rag_dictionary_top_k", 8)),
+        "rag_dictionary_min_quality": float(
+            stored.get("rag_dictionary_min_quality")
+            if stored.get("rag_dictionary_min_quality") is not None
+            else getattr(defaults, "rag_dictionary_min_quality", 0.0)
+        ),
+        "rag_dictionary_auto_promote": bool(
+            stored.get("rag_dictionary_auto_promote")
+            if "rag_dictionary_auto_promote" in stored
+            else getattr(defaults, "rag_dictionary_auto_promote", False)
+        ),
         "rag_wiki_enabled": bool(stored.get("rag_wiki_enabled") if "rag_wiki_enabled" in stored else False),
         "rag_search_enabled": bool(stored.get("rag_search_enabled") if "rag_search_enabled" in stored else defaults.rag_search_enabled),
         "rag_search_url": str(stored.get("rag_search_url") or defaults.rag_search_url),
@@ -143,6 +159,21 @@ def get_translate_settings(db: Session, defaults: SubtitleServiceSettings) -> di
         "rag_domain": str(stored.get("rag_domain") or defaults.rag_domain),
         "rag_agent_parallelism": int(stored.get("rag_agent_parallelism") or 1),
         "rag_agent_timeout_seconds": float(stored.get("rag_agent_timeout_seconds") or 120.0),
+        "rag_agent_skills_enabled": bool(
+            stored.get("rag_agent_skills_enabled")
+            if "rag_agent_skills_enabled" in stored
+            else getattr(defaults, "rag_agent_skills_enabled", False)
+        ),
+        "rag_agent_builtin_skills_enabled": bool(
+            stored.get("rag_agent_builtin_skills_enabled")
+            if "rag_agent_builtin_skills_enabled" in stored
+            else getattr(defaults, "rag_agent_builtin_skills_enabled", True)
+        ),
+        "rag_agent_user_skills_enabled": bool(
+            stored.get("rag_agent_user_skills_enabled")
+            if "rag_agent_user_skills_enabled" in stored
+            else getattr(defaults, "rag_agent_user_skills_enabled", True)
+        ),
     }
 
 
@@ -168,6 +199,10 @@ def update_translate_settings(db: Session, defaults: SubtitleServiceSettings, up
         "rag_embedding_timeout_seconds",
         "rag_auto_discover_terms",
         "rag_auto_learn_terms",
+        "rag_dictionary_enabled",
+        "rag_dictionary_top_k",
+        "rag_dictionary_min_quality",
+        "rag_dictionary_auto_promote",
         "rag_wiki_enabled",
         "rag_search_enabled",
         "rag_search_url",
@@ -181,6 +216,9 @@ def update_translate_settings(db: Session, defaults: SubtitleServiceSettings, up
         "rag_domain",
         "rag_agent_parallelism",
         "rag_agent_timeout_seconds",
+        "rag_agent_skills_enabled",
+        "rag_agent_builtin_skills_enabled",
+        "rag_agent_user_skills_enabled",
     ]:
         if key not in update:
             continue
@@ -268,13 +306,42 @@ def update_translate_settings(db: Session, defaults: SubtitleServiceSettings, up
     except Exception:
         stored["rag_agent_timeout_seconds"] = 120.0
     try:
+        stored["rag_dictionary_top_k"] = max(0, min(30, int(stored.get("rag_dictionary_top_k") or getattr(defaults, "rag_dictionary_top_k", 8))))
+    except Exception:
+        stored["rag_dictionary_top_k"] = getattr(defaults, "rag_dictionary_top_k", 8)
+    try:
+        stored["rag_dictionary_min_quality"] = max(
+            0.0,
+            min(
+                1.0,
+                float(
+                    stored.get("rag_dictionary_min_quality")
+                    if stored.get("rag_dictionary_min_quality") is not None
+                    else getattr(defaults, "rag_dictionary_min_quality", 0.0)
+                ),
+            ),
+        )
+    except Exception:
+        stored["rag_dictionary_min_quality"] = getattr(defaults, "rag_dictionary_min_quality", 0.0)
+    try:
         stored["rag_embedding_timeout_seconds"] = max(
             1.0,
             min(600.0, float(stored.get("rag_embedding_timeout_seconds") or defaults.rag_embedding_timeout_seconds)),
         )
     except Exception:
         stored["rag_embedding_timeout_seconds"] = defaults.rag_embedding_timeout_seconds
-    for bool_key in ["rag_enabled", "rag_auto_discover_terms", "rag_auto_learn_terms", "rag_wiki_enabled", "rag_search_enabled"]:
+    for bool_key in [
+        "rag_enabled",
+        "rag_auto_discover_terms",
+        "rag_auto_learn_terms",
+        "rag_dictionary_enabled",
+        "rag_dictionary_auto_promote",
+        "rag_wiki_enabled",
+        "rag_search_enabled",
+        "rag_agent_skills_enabled",
+        "rag_agent_builtin_skills_enabled",
+        "rag_agent_user_skills_enabled",
+    ]:
         if bool_key in stored:
             stored[bool_key] = bool(stored[bool_key])
     provider = str(stored.get("rag_embedding_provider") or defaults.rag_embedding_provider).strip().lower()

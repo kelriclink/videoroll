@@ -31,6 +31,10 @@ type TranslateSettings = {
   rag_embedding_timeout_seconds: number;
   rag_auto_discover_terms: boolean;
   rag_auto_learn_terms: boolean;
+  rag_dictionary_enabled: boolean;
+  rag_dictionary_top_k: number;
+  rag_dictionary_min_quality: number;
+  rag_dictionary_auto_promote: boolean;
   rag_wiki_enabled: boolean;
   rag_search_enabled: boolean;
   rag_search_url: string;
@@ -44,12 +48,28 @@ type TranslateSettings = {
   rag_domain: string;
   rag_agent_parallelism: number;
   rag_agent_timeout_seconds: number;
+  rag_agent_skills_enabled: boolean;
+  rag_agent_builtin_skills_enabled: boolean;
+  rag_agent_user_skills_enabled: boolean;
 };
 
 type EmbeddingModelInfo = {
   name: string;
   path: string;
   size_bytes?: number | null;
+};
+
+type AgentSkillInfo = {
+  name: string;
+  description: string;
+  domain: string[];
+  triggers: string[];
+  allowed_tools: string[];
+  runnable: boolean;
+  run_mode: string;
+  source: string;
+  path: string;
+  resource_count: number;
 };
 
 type TranslateSettingsTab = "translation" | "rag" | "embedding" | "test";
@@ -108,6 +128,7 @@ export default function SettingsTranslatePage() {
   const confirm = useConfirm();
   const [settings, setSettings] = useState<TranslateSettings | null>(null);
   const [embeddingModels, setEmbeddingModels] = useState<EmbeddingModelInfo[]>([]);
+  const [agentSkills, setAgentSkills] = useState<AgentSkillInfo[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [activeTab, setActiveTab] = useState<TranslateSettingsTab>("translation");
@@ -139,6 +160,10 @@ export default function SettingsTranslatePage() {
   const [ragEmbeddingTimeoutSeconds, setRagEmbeddingTimeoutSeconds] = useState(60);
   const [ragAutoDiscoverTerms, setRagAutoDiscoverTerms] = useState(false);
   const [ragAutoLearnTerms, setRagAutoLearnTerms] = useState(false);
+  const [ragDictionaryEnabled, setRagDictionaryEnabled] = useState(true);
+  const [ragDictionaryTopK, setRagDictionaryTopK] = useState(8);
+  const [ragDictionaryMinQuality, setRagDictionaryMinQuality] = useState(0);
+  const [ragDictionaryAutoPromote, setRagDictionaryAutoPromote] = useState(false);
   const [ragWikiEnabled, setRagWikiEnabled] = useState(false);
   const [ragSearchEnabled, setRagSearchEnabled] = useState(false);
   const [ragSearchUrl, setRagSearchUrl] = useState("");
@@ -152,6 +177,9 @@ export default function SettingsTranslatePage() {
   const [ragDomain, setRagDomain] = useState("");
   const [ragAgentParallelism, setRagAgentParallelism] = useState(1);
   const [ragAgentTimeoutSeconds, setRagAgentTimeoutSeconds] = useState(120);
+  const [ragAgentSkillsEnabled, setRagAgentSkillsEnabled] = useState(false);
+  const [ragAgentBuiltinSkillsEnabled, setRagAgentBuiltinSkillsEnabled] = useState(true);
+  const [ragAgentUserSkillsEnabled, setRagAgentUserSkillsEnabled] = useState(true);
 
   const [testText, setTestText] = useState("Hello world. This is a translation test.");
   const [testTargetLang, setTestTargetLang] = useState("zh");
@@ -172,6 +200,7 @@ export default function SettingsTranslatePage() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ model_dir: s.rag_embedding_model_dir }),
       }).catch(() => []);
+      const skills = await fetchJson<AgentSkillInfo[]>(`${SUBTITLE_SERVICE_URL}/subtitle/agent/skills`).catch(() => []);
       setSettings(s);
       setDefaultProvider(s.default_provider);
       setDefaultTargetLang(s.default_target_lang);
@@ -196,6 +225,10 @@ export default function SettingsTranslatePage() {
       setRagEmbeddingTimeoutSeconds(s.rag_embedding_timeout_seconds);
       setRagAutoDiscoverTerms(s.rag_auto_discover_terms);
       setRagAutoLearnTerms(s.rag_auto_learn_terms);
+      setRagDictionaryEnabled(s.rag_dictionary_enabled ?? true);
+      setRagDictionaryTopK(s.rag_dictionary_top_k ?? 8);
+      setRagDictionaryMinQuality(s.rag_dictionary_min_quality ?? 0);
+      setRagDictionaryAutoPromote(s.rag_dictionary_auto_promote ?? false);
       setRagWikiEnabled(s.rag_wiki_enabled ?? false);
       setRagSearchEnabled(s.rag_search_enabled);
       setRagSearchUrl(s.rag_search_url);
@@ -209,9 +242,13 @@ export default function SettingsTranslatePage() {
       setRagDomain(s.rag_domain);
       setRagAgentParallelism(s.rag_agent_parallelism ?? 1);
       setRagAgentTimeoutSeconds(s.rag_agent_timeout_seconds ?? 120);
+      setRagAgentSkillsEnabled(s.rag_agent_skills_enabled ?? false);
+      setRagAgentBuiltinSkillsEnabled(s.rag_agent_builtin_skills_enabled ?? true);
+      setRagAgentUserSkillsEnabled(s.rag_agent_user_skills_enabled ?? true);
       setTestTargetLang(s.default_target_lang || "zh");
       setTestStyle(s.default_style || "口语自然");
       setEmbeddingModels(localModels);
+      setAgentSkills(skills);
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : String(e));
     }
@@ -246,6 +283,10 @@ export default function SettingsTranslatePage() {
       rag_embedding_timeout_seconds: ragEmbeddingTimeoutSeconds,
       rag_auto_discover_terms: ragAutoDiscoverTerms,
       rag_auto_learn_terms: ragAutoLearnTerms,
+      rag_dictionary_enabled: ragDictionaryEnabled,
+      rag_dictionary_top_k: ragDictionaryTopK,
+      rag_dictionary_min_quality: ragDictionaryMinQuality,
+      rag_dictionary_auto_promote: ragDictionaryAutoPromote,
       rag_wiki_enabled: ragWikiEnabled,
       rag_search_enabled: ragSearchEnabled,
       rag_search_url: ragSearchUrl,
@@ -259,6 +300,9 @@ export default function SettingsTranslatePage() {
       rag_domain: ragDomain,
       rag_agent_parallelism: ragAgentParallelism,
       rag_agent_timeout_seconds: ragAgentTimeoutSeconds,
+      rag_agent_skills_enabled: ragAgentSkillsEnabled,
+      rag_agent_builtin_skills_enabled: ragAgentBuiltinSkillsEnabled,
+      rag_agent_user_skills_enabled: ragAgentUserSkillsEnabled,
     };
     if (openaiApiKey.trim()) payload.openai_api_key = openaiApiKey.trim();
     if (ragEmbeddingApiKey.trim()) payload.rag_embedding_api_key = ragEmbeddingApiKey.trim();
@@ -407,9 +451,11 @@ export default function SettingsTranslatePage() {
               ["batch", settings.default_batch_size],
               ["summary", settings.default_enable_summary ? "true" : "false"],
               ["rag", settings.rag_enabled ? "enabled" : "disabled"],
+              ["dictionary", settings.rag_dictionary_enabled ? `${settings.rag_dictionary_top_k} / ${settings.rag_dictionary_min_quality}` : "disabled"],
               ["wiki", settings.rag_wiki_enabled ? "enabled" : "disabled"],
               ["search", settings.rag_search_enabled ? `${settings.rag_search_categories || "general"} / ${settings.rag_search_language || "all"}` : "disabled"],
               ["agents", `${settings.rag_agent_parallelism} / ${settings.rag_agent_timeout_seconds}s`],
+              ["skills", settings.rag_agent_skills_enabled ? `${agentSkills.length} available` : "disabled"],
               ["embedding", `${settings.rag_embedding_provider}:${settings.rag_embedding_model}`],
               ["embedding key", settings.rag_embedding_api_key_set ? "set" : "unset"],
             ].map(([label, value]) => (
@@ -528,6 +574,14 @@ export default function SettingsTranslatePage() {
             允许自动学习术语
           </label>
           <label className="flex items-center gap-2 text-sm">
+            <input type="checkbox" checked={ragDictionaryEnabled} onChange={(e) => setRagDictionaryEnabled(e.target.checked)} />
+            启用导入词典查找
+          </label>
+          <label className="flex items-center gap-2 text-sm">
+            <input type="checkbox" checked={ragDictionaryAutoPromote} onChange={(e) => setRagDictionaryAutoPromote(e.target.checked)} />
+            允许词典证据自动入库
+          </label>
+          <label className="flex items-center gap-2 text-sm">
             <input type="checkbox" checked={ragWikiEnabled} onChange={(e) => setRagWikiEnabled(e.target.checked)} />
             允许调用 Wikipedia Tool
           </label>
@@ -544,6 +598,14 @@ export default function SettingsTranslatePage() {
             <input type="number" step="0.01" min={0} max={1} className="w-full rounded border px-3 py-2 text-sm" value={ragMinScore} onChange={(e) => setRagMinScore(parseFloat(e.target.value || "0"))} />
           </label>
           <label className="block">
+            <div className="mb-1 text-xs text-slate-600">rag_dictionary_top_k</div>
+            <input type="number" min={0} max={30} className="w-full rounded border px-3 py-2 text-sm" value={ragDictionaryTopK} onChange={(e) => setRagDictionaryTopK(parseInt(e.target.value || "0", 10))} />
+          </label>
+          <label className="block">
+            <div className="mb-1 text-xs text-slate-600">rag_dictionary_min_quality</div>
+            <input type="number" step="0.01" min={0} max={1} className="w-full rounded border px-3 py-2 text-sm" value={ragDictionaryMinQuality} onChange={(e) => setRagDictionaryMinQuality(parseFloat(e.target.value || "0"))} />
+          </label>
+          <label className="block">
             <div className="mb-1 text-xs text-slate-600">rag_agent_parallelism</div>
             <input type="number" min={1} max={8} className="w-full rounded border px-3 py-2 text-sm" value={ragAgentParallelism} onChange={(e) => setRagAgentParallelism(parseInt(e.target.value || "1", 10))} />
             <div className="mt-1 text-xs text-slate-500">同一个字幕 batch 内最多并行研究几个术语。</div>
@@ -553,6 +615,60 @@ export default function SettingsTranslatePage() {
             <input type="number" min={10} max={900} className="w-full rounded border px-3 py-2 text-sm" value={ragAgentTimeoutSeconds} onChange={(e) => setRagAgentTimeoutSeconds(parseFloat(e.target.value || "120"))} />
             <div className="mt-1 text-xs text-slate-500">并行 agent 等待预算，超时后继续翻译。</div>
           </label>
+          <div className="md:col-span-2 rounded-md border border-slate-200 p-3">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <div className="text-sm font-semibold text-slate-900">Agent Skills</div>
+                <div className="mt-1 text-xs text-slate-500">内置目录：src/videoroll/apps/subtitle_service/skills；用户目录：data/agent_skills。</div>
+              </div>
+              <div className="text-xs text-slate-500">{agentSkills.length} skills</div>
+            </div>
+            <div className="mt-3 grid gap-2 md:grid-cols-3">
+              <label className="flex items-center gap-2 text-sm">
+                <input type="checkbox" checked={ragAgentSkillsEnabled} onChange={(e) => setRagAgentSkillsEnabled(e.target.checked)} />
+                启用 Agent Skills
+              </label>
+              <label className="flex items-center gap-2 text-sm">
+                <input type="checkbox" checked={ragAgentBuiltinSkillsEnabled} onChange={(e) => setRagAgentBuiltinSkillsEnabled(e.target.checked)} />
+                读取内置 Skills
+              </label>
+              <label className="flex items-center gap-2 text-sm">
+                <input type="checkbox" checked={ragAgentUserSkillsEnabled} onChange={(e) => setRagAgentUserSkillsEnabled(e.target.checked)} />
+                读取用户 Skills
+              </label>
+            </div>
+            <div className="mt-3 max-h-64 overflow-auto rounded border border-slate-200">
+              {agentSkills.length === 0 ? (
+                <div className="p-3 text-sm text-slate-500">未发现 skill。每个 skill 使用独立目录，并放入 skill.json 或 SKILL.md。</div>
+              ) : (
+                <DataTable>
+                  <thead>
+                    <tr>
+                      <th className="py-2 pr-3 text-left">Name</th>
+                      <th className="py-2 pr-3 text-left">Source</th>
+                      <th className="py-2 pr-3 text-left">Tools</th>
+                      <th className="py-2 pr-3 text-left">Triggers</th>
+                      <th className="py-2 pr-3 text-left">Resources</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {agentSkills.map((skill) => (
+                      <tr key={`${skill.source}:${skill.name}`}>
+                        <td className="py-2 pr-3">
+                          <div className="font-mono text-xs text-slate-900">{skill.name}</div>
+                          <div className="mt-1 max-w-md truncate text-xs text-slate-500">{skill.description || "-"}</div>
+                        </td>
+                        <td className="py-2 pr-3 text-xs">{skill.source}</td>
+                        <td className="py-2 pr-3 text-xs">{skill.allowed_tools.length ? skill.allowed_tools.join(", ") : "all"}</td>
+                        <td className="py-2 pr-3 text-xs">{[...skill.domain, ...skill.triggers].slice(0, 6).join(", ") || "-"}</td>
+                        <td className="py-2 pr-3 text-xs">{skill.resource_count}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </DataTable>
+              )}
+            </div>
+          </div>
           <label className="block">
             <div className="mb-1 text-xs text-slate-600">embedding_model</div>
             <input className="w-full rounded border px-3 py-2 text-sm" value={ragEmbeddingModel} onChange={(e) => setRagEmbeddingModel(e.target.value)} />

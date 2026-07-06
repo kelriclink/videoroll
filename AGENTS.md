@@ -1,27 +1,27 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-`src/videoroll/` contains the Python 3.12 backend: FastAPI apps under `apps/`, shared DB models in `db/`, S3/MinIO access in `storage/`, and cross-cutting helpers in `utils/` and `ai/`. `src/web/` is the React 18 + Vite frontend. Backend tests live in `tests/` as `test_*.py`; frontend tests are colocated as `*.test.ts`. Use `scripts/` for common local workflows, `docs/` for specs, and `data/` for local state. `biliup-master/` and `bilibili-API-collect-main/` are vendored/reference trees; avoid casual edits there.
+`src/videoroll/` is the Python 3.12 backend. `apps/monolith` exposes `/api`; `apps/subtitle_service` owns ASR, translation, render queues, and the RAG Agent runtime; `apps/youtube_ingest` and `apps/bilibili_publisher` handle ingest and publishing. Shared config, DB, storage, AI, and utilities live in `config.py`, `db/`, `storage/`, `ai/`, and `utils/`. `src/web/` is React 18 + Vite + Tailwind, with pages, helpers, and tests in `src/web/src/pages/`. Backend tests are `tests/test_*.py`. Specs live in `docs/PROJECT_SPEC.md`; local state lives in `data/`. Avoid casual edits to vendored `biliup-master/` and `bilibili-API-collect-main/`.
 
 ## Build, Test, and Development Commands
-Use Docker Compose for the default stack:
+Compose starts `app`, `web`, Redis, and MinIO. PostgreSQL 16+ is external; configure `DATABASE_URL`.
 
-- `./scripts/dev_up.sh`: build and start `app`, `web`, Redis, and MinIO.
-- `./scripts/dev_down.sh`: stop the stack.
-- `./scripts/dev_health.sh`: check published endpoints.
-- `./scripts/dev_logs.sh`: tail service logs.
-- `./scripts/dev_web.sh`: run only the Vite dev server on port `3000`.
+- `./scripts/dev_up.sh`: create `.env` if missing, build, and start locally.
+- `./scripts/dev_down.sh`, `./scripts/dev_logs.sh`, `./scripts/dev_health.sh`: stop, inspect logs, or check health.
+- `./scripts/dev_web.sh`: run only Vite on port `3000`.
 - `python -m pytest tests/`: run backend tests.
-- `cd src/web && npm run lint && npm run test && npm run build`: validate the frontend.
+- `cd src/web && npm run lint && npm run test && npm run build`: lint, test, and build the frontend.
+- `./scripts/smoke_local.sh [video.mp4]`: run an upload/subtitle smoke flow.
+- `./scripts/build_export_prod.sh`: build and export Docker images.
 
 ## Coding Style & Naming Conventions
-Follow the existing code style rather than introducing a new formatter. Python uses 4-space indentation, explicit type hints, `snake_case` for modules/functions, and `PascalCase` for classes and Pydantic models. Keep service-specific code inside the matching `apps/*` package. In the frontend, React components use `PascalCase`, shared helpers use descriptive filenames such as `videosPage.helpers.ts`, and tests use `*.test.ts`. Run `src/web` ESLint before opening a PR.
+Follow the existing style; do not introduce a new formatter. Python uses 4-space indentation, type hints, `snake_case` for modules/functions, and `PascalCase` for classes and Pydantic models. Keep service code in the matching `apps/*` package and prefer structured DB/API helpers. Frontend components use `PascalCase`, helpers use names like `videosPage.helpers.ts`, and tests use `*.test.ts`. Run ESLint for UI changes.
 
 ## Testing Guidelines
-Backend tests run under `pytest`, with a mix of `unittest.TestCase` and plain pytest functions. Add new backend coverage in `tests/test_<feature>.py` and mock network, `yt-dlp`, and external APIs instead of hitting live services. Keep frontend tests beside the code they cover. For targeted runs, use commands like `python -m pytest tests/test_publish_meta_draft.py` or `cd src/web && npm run test`.
+Backend tests use `pytest`, with `unittest.TestCase` and plain pytest functions. Add coverage in `tests/test_<feature>.py`, especially for queues, RAG retrieval/agent budgets, publishing retries, and parsing. Mock network, `yt-dlp`, LLMs, and external APIs. Keep frontend tests colocated. Targeted examples: `python -m pytest tests/test_translation_rag.py` or `cd src/web && npm run test`.
 
 ## Commit & Pull Request Guidelines
-Recent history favors short imperative subjects, often with Conventional Commit prefixes, for example `feat: add AI publish review workflow` and `Fix auto pipeline resume...`. Keep commits focused and explain the affected flow. PRs should include a concise summary, linked issue when applicable, config or schema changes, and screenshots for UI work. List the verification commands you ran.
+Recent history favors short imperative subjects with Conventional Commit prefixes, for example `feat: add tool-driven RAG agents` or `fix: harden publish retry and proxy checks`. Keep commits focused. PRs should include a summary, linked issue when applicable, config/schema notes, UI screenshots, and verification commands.
 
 ## Security & Configuration Tips
-Start from `.env.example`. Never commit real cookies, API keys, or `data/secrets/fernet.key`. Treat changes touching downloader, auth, or publishing code as security-sensitive and document any new environment variables.
+Start from `.env.example`. Never commit real cookies, API keys, generated model data, or `data/secrets/fernet.key`; losing that key makes encrypted DB settings unreadable. RAG vector search may require pgvector. Treat downloader, auth, publishing, LLM tools, URL fetching, and secret storage as security-sensitive. Document new env vars and keep tests offline with bounded tool/fetch budgets.

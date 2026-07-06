@@ -25,7 +25,7 @@ from starlette.types import ASGIApp
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from videoroll.ai.client import openai_chat_config_from_settings
+from videoroll.ai.service import AIService
 from videoroll.config import OrchestratorSettings, get_orchestrator_settings
 from videoroll.config import get_subtitle_settings
 from videoroll.db.base import Base
@@ -166,6 +166,8 @@ from videoroll.apps.youtube_settings_store import (
 )
 
 logger = logging.getLogger(__name__)
+_UPLOAD_VIDEO_MAX_BYTES = 8 * 1024 * 1024 * 1024
+_UPLOAD_COVER_MAX_BYTES = 50 * 1024 * 1024
 
 
 def get_settings() -> OrchestratorSettings:
@@ -605,7 +607,7 @@ def _run_task_publish_review(task: Task, *, meta: dict[str, Any], db: Session, s
 
     translate_settings = get_translate_settings(db, get_subtitle_settings())
     api_key = str(translate_settings.get("openai_api_key") or "").strip()
-    config = openai_chat_config_from_settings(translate_settings) if api_key else None
+    ai_service = AIService(lambda: get_translate_settings(db, get_subtitle_settings())) if api_key else None
 
     result = review_publish_materials(
         title=str(meta.get("title") or "").strip(),
@@ -613,7 +615,7 @@ def _run_task_publish_review(task: Task, *, meta: dict[str, Any], db: Session, s
         subtitle_text=_read_latest_task_subtitle_text(task.id, db, s3),
         blocked_words=settings["blocked_words"],
         reject_rules=settings["ai_rules"],
-        config=config,
+        ai_service=ai_service,
     )
     stored = set_task_publish_review(
         db,
@@ -748,15 +750,21 @@ def _load_task_display_titles(
     return title_map
 
 
+class UploadTooLargeError(ValueError):
+    pass
+
+
 def _stream_upload_to_tempfile(
     file_obj: Any,
     *,
     prefix: str,
     suffix: str,
+    max_bytes: int | None = None,
 ) -> tuple[Path, str, int]:
     tmp_path: Path | None = None
     sha256 = hashlib.sha256()
     size_bytes = 0
+    limit = int(max_bytes or 0)
     try:
         with tempfile.NamedTemporaryFile(prefix=prefix, suffix=suffix, delete=False) as tmp:
             tmp_path = Path(tmp.name)
@@ -768,6 +776,8 @@ def _stream_upload_to_tempfile(
                     raise TypeError("uploaded file stream returned non-bytes content")
                 sha256.update(chunk)
                 size_bytes += len(chunk)
+                if limit > 0 and size_bytes > limit:
+                    raise UploadTooLargeError(f"upload too large: max {limit} bytes")
                 tmp.write(chunk)
         return tmp_path, sha256.hexdigest(), size_bytes
     except Exception:
@@ -800,6 +810,7 @@ async def _store_uploaded_task_asset(
     object_name_prefix: str,
     asset_kind: AssetKind,
     update_task_status: TaskStatus | None = None,
+    max_bytes: int | None = None,
 ) -> Asset:
     suffix = Path(file.filename or "").suffix or default_suffix
     tmp_path: Path | None = None
@@ -812,6 +823,7 @@ async def _store_uploaded_task_asset(
             file.file,
             prefix=temp_prefix,
             suffix=suffix,
+            max_bytes=max_bytes,
         )
         uploaded_key = f"{key_prefix}/{task.id}/{object_name_prefix}_{sha256[:16]}{suffix}"
         await run_in_threadpool(s3.upload_file, tmp_path, uploaded_key, file.content_type or None)
@@ -832,6 +844,9 @@ async def _store_uploaded_task_asset(
         return asset
     except HTTPException:
         raise
+    except UploadTooLargeError as e:
+        db.rollback()
+        raise HTTPException(status_code=413, detail=str(e)) from e
     except Exception as e:
         db.rollback()
         if uploaded_key:
@@ -1901,6 +1916,7 @@ def auto_youtube(
 @app.get(REMOTE_AUTO_YOUTUBE_PATH, response_model=AutoYouTubeResponse)
 @app.post(REMOTE_AUTO_YOUTUBE_PATH, response_model=AutoYouTubeResponse)
 def remote_auto_youtube(
+    request: Request,
     url: str | None = Query(default=None),
     token: str | None = Query(default=None, alias=REMOTE_API_TOKEN_QUERY_PARAM),
     license: SourceLicense = Query(default=SourceLicense.authorized),
@@ -1911,7 +1927,10 @@ def remote_auto_youtube(
 ) -> AutoYouTubeResponse:
     if not remote_api_token_is_configured(db):
         raise HTTPException(status_code=403, detail="remote api token is not set")
-    if not verify_remote_api_token(db, str(token or "")):
+    auth_header = str(request.headers.get("authorization") or "").strip()
+    bearer_token = auth_header[7:].strip() if auth_header.lower().startswith("bearer ") else ""
+    effective_token = bearer_token or str(token or "")
+    if not verify_remote_api_token(db, effective_token):
         raise HTTPException(status_code=401, detail="invalid remote api token")
     return _start_auto_youtube_pipeline(
         url=str(url or ""),
@@ -2272,6 +2291,8 @@ async def upload_task_video(
     task = db.get(Task, task_id)
     if not task:
         raise HTTPException(status_code=404, detail="task not found")
+    if file.content_type and not (file.content_type.startswith("video/") or file.content_type == "application/octet-stream"):
+        raise HTTPException(status_code=400, detail="video upload must be a video file")
     return await _store_uploaded_task_asset(
         task=task,
         file=file,
@@ -2283,6 +2304,7 @@ async def upload_task_video(
         object_name_prefix="video",
         asset_kind=AssetKind.video_raw,
         update_task_status=TaskStatus.downloaded,
+        max_bytes=_UPLOAD_VIDEO_MAX_BYTES,
     )
 
 
@@ -2309,6 +2331,7 @@ async def upload_task_cover(
         key_prefix="final",
         object_name_prefix="cover",
         asset_kind=AssetKind.cover_image,
+        max_bytes=_UPLOAD_COVER_MAX_BYTES,
     )
 
 

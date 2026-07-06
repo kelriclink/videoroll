@@ -9,17 +9,16 @@ import time
 import uuid
 import zipfile
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Generator
 
 import httpx
-from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import ProgrammingError
 
-from videoroll.ai.client import openai_chat_config_from_settings
-from videoroll.ai.service import translate_text_openai
+from videoroll.ai.service import AIService
 from videoroll.config import SubtitleServiceSettings, get_subtitle_settings
 from videoroll.db.base import Base
 from videoroll.db.auto_migrate import auto_migrate
@@ -48,7 +47,17 @@ from videoroll.apps.subtitle_service.schemas import (
     KnowledgeEmbeddingRebuildResponse,
     KnowledgeItemUpsertRequest,
     KnowledgeItemUpsertResponse,
+    DictionaryEntryRead,
+    DictionaryEntryUpdate,
+    DictionaryImportResponse,
+    DictionaryLookupRequest,
+    DictionaryLookupResponse,
+    DictionaryPromoteRequest,
+    DictionaryPromoteResponse,
+    DictionarySourceRead,
+    DictionarySourceUpdate,
     AgentRunRead,
+    AgentSkillRead,
     EmbeddingModelDownloadRequest,
     EmbeddingModelListRequest,
     EmbeddingModelInfo,
@@ -79,10 +88,24 @@ from videoroll.apps.subtitle_service.rag import (
     build_knowledge_embedding_text,
     delete_knowledge_item,
     list_agent_runs,
+    load_agent_skill_registry,
     rebuild_knowledge_embeddings,
     list_knowledge_items,
     rag_settings_from_translate_settings,
     upsert_knowledge_item,
+)
+from videoroll.apps.subtitle_service.dictionaries import (
+    delete_dictionary_entry,
+    delete_dictionary_source,
+    dictionary_import_presets,
+    get_dictionary_entry,
+    get_dictionary_import_preset,
+    import_dictionary_file,
+    list_dictionary_entries,
+    list_dictionary_sources,
+    lookup_dictionary_entries,
+    set_dictionary_entry_enabled,
+    update_dictionary_source,
 )
 from videoroll.apps.subtitle_service.translate_settings_store import get_translate_settings, update_translate_settings
 from videoroll.apps.subtitle_service.worker_concurrency import sync_subtitle_worker_concurrency_for_task_queue_settings
@@ -93,6 +116,9 @@ from videoroll.utils.httpx_proxy import HTTPX_PROXY_KWARG_UNSUPPORTED, format_ht
 from videoroll.utils.intel_gpu import detect_intel_hardware
 
 logger = logging.getLogger(__name__)
+_WHISPER_MODEL_ZIP_MAX_BYTES = 20 * 1024 * 1024 * 1024
+_WHISPER_MODEL_ZIP_MAX_FILES = 100_000
+_WHISPER_MODEL_ZIP_MAX_UNCOMPRESSED_BYTES = 40 * 1024 * 1024 * 1024
 
 
 def get_settings() -> SubtitleServiceSettings:
@@ -118,6 +144,26 @@ def _embedding_models_dir_from_translate_settings(cfg: dict[str, Any], settings:
     return _embedding_models_dir(settings)
 
 
+def _dictionary_imports_dir(settings: SubtitleServiceSettings) -> Path:
+    return Path(getattr(settings, "dictionary_data_dir", "data/dictionaries") or "data/dictionaries") / "imports"
+
+
+def _safe_upload_filename(filename: str) -> str:
+    name = Path(str(filename or "dictionary.dat")).name
+    name = re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip(".-")
+    return name[:180] or "dictionary.dat"
+
+
+def _archive_dictionary_upload(settings: SubtitleServiceSettings, upload: UploadFile) -> Path:
+    root = _dictionary_imports_dir(settings)
+    archive_dir = root / datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S") / uuid.uuid4().hex[:12]
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    dest = archive_dir / _safe_upload_filename(upload.filename or "dictionary.dat")
+    with dest.open("wb") as out:
+        shutil.copyfileobj(upload.file, out)
+    return dest
+
+
 def _is_missing_knowledge_table_error(exc: Exception) -> bool:
     orig = getattr(exc, "orig", None)
     sqlstate = getattr(orig, "sqlstate", None) or getattr(orig, "pgcode", None)
@@ -133,6 +179,9 @@ def _is_missing_knowledge_table_error(exc: Exception) -> bool:
                 "translation_term_evidence",
                 "translation_term_matches",
                 "translation_agent_runs",
+                "translation_dictionary_sources",
+                "translation_dictionary_import_batches",
+                "translation_dictionary_entries",
             ]
         )
     )
@@ -163,6 +212,10 @@ def _handle_knowledge_db_error(exc: Exception, settings: SubtitleServiceSettings
 _SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
 
+class UploadTooLargeError(ValueError):
+    pass
+
+
 def _validate_model_name(name: str) -> str:
     name = (name or "").strip()
     if not _SAFE_NAME_RE.match(name):
@@ -182,16 +235,49 @@ def _dir_size_bytes(root: Path) -> int:
     return total
 
 
-def _safe_extract_zip(zip_path: Path, dest_dir: Path) -> None:
-    dest_dir.mkdir(parents=True, exist_ok=True)
+def _is_safe_zip_entry_name(name: str) -> bool:
+    if not name or name.startswith("/") or name.startswith("\\"):
+        return False
+    path = PurePosixPath(name.replace("\\", "/"))
+    if path.is_absolute():
+        return False
+    return all(part not in {"", ".", ".."} for part in path.parts)
+
+
+def _safe_extract_zip(
+    zip_path: Path,
+    dest_dir: Path,
+    *,
+    max_files: int,
+    max_uncompressed_bytes: int,
+) -> None:
+    max_files = max(1, int(max_files or 1))
+    max_uncompressed_bytes = max(1, int(max_uncompressed_bytes or 1))
+    tmp_dir = dest_dir.parent / f".{dest_dir.name}.extract-{uuid.uuid4().hex}"
     with zipfile.ZipFile(zip_path) as zf:
-        for info in zf.infolist():
+        infos = zf.infolist()
+        if len(infos) > max_files:
+            raise HTTPException(status_code=413, detail=f"zip contains too many entries (max {max_files})")
+        total_uncompressed = 0
+        for info in infos:
             name = info.filename
             if not name or name.endswith("/"):
                 continue
-            if name.startswith("/") or name.startswith("\\") or ".." in Path(name).parts:
+            if not _is_safe_zip_entry_name(name):
                 raise HTTPException(status_code=400, detail=f"unsafe zip entry: {name}")
-        zf.extractall(dest_dir)
+            total_uncompressed += int(info.file_size or 0)
+            if total_uncompressed > max_uncompressed_bytes:
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"zip uncompressed size too large (max {max_uncompressed_bytes} bytes)",
+                )
+        try:
+            tmp_dir.mkdir(parents=True, exist_ok=False)
+            zf.extractall(tmp_dir)
+            tmp_dir.rename(dest_dir)
+        except Exception:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            raise
 
 
 app = FastAPI(title="videoroll-subtitle-service", version="0.1.0")
@@ -217,6 +303,7 @@ def _startup() -> None:
     auto_migrate(settings.database_url)
     S3Store(settings).ensure_bucket()
     _models_dir(settings).mkdir(parents=True, exist_ok=True)
+    _dictionary_imports_dir(settings).mkdir(parents=True, exist_ok=True)
 
 
 @app.get("/health")
@@ -350,6 +437,10 @@ def get_translate_settings_view(
         rag_embedding_timeout_seconds=cfg["rag_embedding_timeout_seconds"],
         rag_auto_discover_terms=cfg["rag_auto_discover_terms"],
         rag_auto_learn_terms=cfg["rag_auto_learn_terms"],
+        rag_dictionary_enabled=cfg["rag_dictionary_enabled"],
+        rag_dictionary_top_k=cfg["rag_dictionary_top_k"],
+        rag_dictionary_min_quality=cfg["rag_dictionary_min_quality"],
+        rag_dictionary_auto_promote=cfg["rag_dictionary_auto_promote"],
         rag_wiki_enabled=cfg["rag_wiki_enabled"],
         rag_search_enabled=cfg["rag_search_enabled"],
         rag_search_url=cfg["rag_search_url"],
@@ -363,6 +454,9 @@ def get_translate_settings_view(
         rag_domain=cfg["rag_domain"],
         rag_agent_parallelism=cfg["rag_agent_parallelism"],
         rag_agent_timeout_seconds=cfg["rag_agent_timeout_seconds"],
+        rag_agent_skills_enabled=cfg["rag_agent_skills_enabled"],
+        rag_agent_builtin_skills_enabled=cfg["rag_agent_builtin_skills_enabled"],
+        rag_agent_user_skills_enabled=cfg["rag_agent_user_skills_enabled"],
     )
 
 
@@ -399,6 +493,10 @@ def put_translate_settings_view(
         rag_embedding_timeout_seconds=cfg["rag_embedding_timeout_seconds"],
         rag_auto_discover_terms=cfg["rag_auto_discover_terms"],
         rag_auto_learn_terms=cfg["rag_auto_learn_terms"],
+        rag_dictionary_enabled=cfg["rag_dictionary_enabled"],
+        rag_dictionary_top_k=cfg["rag_dictionary_top_k"],
+        rag_dictionary_min_quality=cfg["rag_dictionary_min_quality"],
+        rag_dictionary_auto_promote=cfg["rag_dictionary_auto_promote"],
         rag_wiki_enabled=cfg["rag_wiki_enabled"],
         rag_search_enabled=cfg["rag_search_enabled"],
         rag_search_url=cfg["rag_search_url"],
@@ -412,6 +510,9 @@ def put_translate_settings_view(
         rag_domain=cfg["rag_domain"],
         rag_agent_parallelism=cfg["rag_agent_parallelism"],
         rag_agent_timeout_seconds=cfg["rag_agent_timeout_seconds"],
+        rag_agent_skills_enabled=cfg["rag_agent_skills_enabled"],
+        rag_agent_builtin_skills_enabled=cfg["rag_agent_builtin_skills_enabled"],
+        rag_agent_user_skills_enabled=cfg["rag_agent_user_skills_enabled"],
     )
 
 
@@ -577,6 +678,381 @@ def rebuild_knowledge_embeddings_view(
     return KnowledgeEmbeddingRebuildResponse(**result)
 
 
+@app.get("/subtitle/dictionaries/sources", response_model=list[DictionarySourceRead])
+def list_dictionary_sources_view(
+    enabled: bool | None = None,
+    q: str | None = None,
+    limit: int = 100,
+    settings: SubtitleServiceSettings = Depends(get_settings),
+    db: Session = Depends(get_db),
+) -> list[DictionarySourceRead]:
+    try:
+        rows = list_dictionary_sources(db, enabled=enabled, q=q, limit=limit)
+    except Exception as e:
+        db.rollback()
+        if not _is_missing_knowledge_table_error(e):
+            raise HTTPException(status_code=500, detail=f"dictionary source list failed: {e}") from e
+        _ensure_rag_schema(settings)
+        rows = list_dictionary_sources(db, enabled=enabled, q=q, limit=limit)
+    return [DictionarySourceRead(**row) for row in rows]
+
+
+@app.put("/subtitle/dictionaries/sources/{source_id}", response_model=DictionarySourceRead)
+def update_dictionary_source_view(
+    source_id: uuid.UUID,
+    payload: DictionarySourceUpdate,
+    settings: SubtitleServiceSettings = Depends(get_settings),
+    db: Session = Depends(get_db),
+) -> DictionarySourceRead:
+    try:
+        row = update_dictionary_source(db, str(source_id), **payload.model_dump(exclude_unset=True))
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        if not _is_missing_knowledge_table_error(e):
+            raise HTTPException(status_code=500, detail=f"dictionary source update failed: {e}") from e
+        _ensure_rag_schema(settings)
+        row = update_dictionary_source(db, str(source_id), **payload.model_dump(exclude_unset=True))
+        db.commit()
+    if not row:
+        raise HTTPException(status_code=404, detail="dictionary source not found")
+    return DictionarySourceRead(**row)
+
+
+@app.delete("/subtitle/dictionaries/sources/{source_id}")
+def delete_dictionary_source_view(
+    source_id: uuid.UUID,
+    settings: SubtitleServiceSettings = Depends(get_settings),
+    db: Session = Depends(get_db),
+) -> dict[str, bool]:
+    try:
+        deleted = delete_dictionary_source(db, str(source_id))
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        if not _is_missing_knowledge_table_error(e):
+            raise HTTPException(status_code=500, detail=f"dictionary source delete failed: {e}") from e
+        _ensure_rag_schema(settings)
+        deleted = delete_dictionary_source(db, str(source_id))
+        db.commit()
+    if not deleted:
+        raise HTTPException(status_code=404, detail="dictionary source not found")
+    return {"deleted": True}
+
+
+@app.get("/subtitle/dictionaries/import-presets")
+def list_dictionary_import_presets_view() -> list[dict[str, Any]]:
+    return dictionary_import_presets()
+
+
+@app.post("/subtitle/dictionaries/import", response_model=DictionaryImportResponse)
+def import_dictionary_view(
+    file: UploadFile = File(...),
+    dictionary_preset: str = Form(""),
+    name: str = Form(""),
+    slug: str = Form(""),
+    description: str = Form(""),
+    source_lang: str = Form(""),
+    target_lang: str = Form("zh"),
+    format_name: str = Form("auto"),
+    license: str = Form(""),
+    license_url: str = Form(""),
+    source_url: str = Form(""),
+    version: str = Form(""),
+    attribution: str = Form(""),
+    domain: str = Form(""),
+    priority: int = Form(0),
+    enabled: bool = Form(True),
+    import_mode: str = Form("upsert"),
+    full_import: bool = Form(False),
+    max_entries: int = Form(250000),
+    settings: SubtitleServiceSettings = Depends(get_settings),
+    db: Session = Depends(get_db),
+) -> DictionaryImportResponse:
+    archive_path = _archive_dictionary_upload(settings, file)
+    preset = get_dictionary_import_preset(dictionary_preset)
+    if dictionary_preset.strip() and preset is None:
+        raise HTTPException(status_code=400, detail=f"unsupported dictionary_preset: {dictionary_preset}")
+    if preset:
+        format_name = str(preset.get("format_name") or format_name or "auto")
+        source_lang = source_lang.strip() or str(preset.get("source_lang") or "")
+        target_lang = target_lang.strip() or str(preset.get("target_lang") or "zh")
+        slug = slug.strip() or str(preset.get("slug") or "")
+        description = description.strip() or str(preset.get("description") or "")
+        license = license.strip() or str(preset.get("license") or "")
+        license_url = license_url.strip() or str(preset.get("license_url") or "")
+        source_url = source_url.strip() or str(preset.get("source_url") or "")
+        version = version.strip() or str(preset.get("version") or "")
+        domain = domain.strip() or str(preset.get("domain") or "")
+        if priority == 0:
+            priority = int(preset.get("priority") or 0)
+        if bool(preset.get("recommended_full_import")) and max_entries == 250000:
+            full_import = True
+    source_name = name.strip() or str((preset or {}).get("name") or "").strip() or Path(file.filename or archive_path.name).stem or "Dictionary"
+    clean_mode = import_mode.strip().lower() or "upsert"
+    if clean_mode not in {"upsert", "replace"}:
+        raise HTTPException(status_code=400, detail="import_mode must be upsert or replace")
+    clean_max_entries = 0 if full_import else max(1, min(1_000_000, int(max_entries or 250000)))
+
+    def _run_import() -> dict[str, Any]:
+        result = import_dictionary_file(
+            db,
+            path=archive_path,
+            filename=file.filename or archive_path.name,
+            archive_path=str(archive_path),
+            source_name=source_name,
+            slug=slug,
+            description=description,
+            source_lang=source_lang,
+            target_lang=target_lang,
+            format_name=format_name,
+            license=license,
+            license_url=license_url,
+            source_url=source_url,
+            version=version,
+            attribution=attribution,
+            domain=domain,
+            priority=priority,
+            enabled=enabled,
+            import_mode=clean_mode,
+            max_entries=clean_max_entries,
+        )
+        db.commit()
+        return result
+
+    try:
+        result = _run_import()
+    except ValueError as e:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except Exception as e:
+        db.rollback()
+        if not _is_missing_knowledge_table_error(e):
+            raise HTTPException(status_code=500, detail=f"dictionary import failed: {e}") from e
+        _ensure_rag_schema(settings)
+        try:
+            result = _run_import()
+        except Exception as retry_error:
+            db.rollback()
+            raise HTTPException(status_code=503, detail=f"dictionary import failed after schema migration: {retry_error}") from retry_error
+    return DictionaryImportResponse(**result)
+
+
+@app.get("/subtitle/dictionaries/entries", response_model=list[DictionaryEntryRead])
+def list_dictionary_entries_view(
+    source_id: uuid.UUID | None = None,
+    q: str | None = None,
+    source_lang: str | None = None,
+    target_lang: str | None = None,
+    domain: str | None = None,
+    enabled: bool | None = None,
+    limit: int = 100,
+    offset: int = 0,
+    settings: SubtitleServiceSettings = Depends(get_settings),
+    db: Session = Depends(get_db),
+) -> list[DictionaryEntryRead]:
+    try:
+        rows = list_dictionary_entries(
+            db,
+            source_id=str(source_id) if source_id else None,
+            q=q,
+            source_lang=source_lang,
+            target_lang=target_lang,
+            domain=domain,
+            enabled=enabled,
+            limit=limit,
+            offset=offset,
+        )
+    except Exception as e:
+        db.rollback()
+        if not _is_missing_knowledge_table_error(e):
+            raise HTTPException(status_code=500, detail=f"dictionary entry list failed: {e}") from e
+        _ensure_rag_schema(settings)
+        rows = list_dictionary_entries(
+            db,
+            source_id=str(source_id) if source_id else None,
+            q=q,
+            source_lang=source_lang,
+            target_lang=target_lang,
+            domain=domain,
+            enabled=enabled,
+            limit=limit,
+            offset=offset,
+        )
+    return [DictionaryEntryRead(**row) for row in rows]
+
+
+@app.put("/subtitle/dictionaries/entries/{entry_id}", response_model=DictionaryEntryRead)
+def update_dictionary_entry_view(
+    entry_id: uuid.UUID,
+    payload: DictionaryEntryUpdate,
+    settings: SubtitleServiceSettings = Depends(get_settings),
+    db: Session = Depends(get_db),
+) -> DictionaryEntryRead:
+    try:
+        row = set_dictionary_entry_enabled(db, str(entry_id), payload.enabled)
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        if not _is_missing_knowledge_table_error(e):
+            raise HTTPException(status_code=500, detail=f"dictionary entry update failed: {e}") from e
+        _ensure_rag_schema(settings)
+        row = set_dictionary_entry_enabled(db, str(entry_id), payload.enabled)
+        db.commit()
+    if not row:
+        raise HTTPException(status_code=404, detail="dictionary entry not found")
+    return DictionaryEntryRead(**row)
+
+
+@app.delete("/subtitle/dictionaries/entries/{entry_id}")
+def delete_dictionary_entry_view(
+    entry_id: uuid.UUID,
+    settings: SubtitleServiceSettings = Depends(get_settings),
+    db: Session = Depends(get_db),
+) -> dict[str, bool]:
+    try:
+        deleted = delete_dictionary_entry(db, str(entry_id))
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        if not _is_missing_knowledge_table_error(e):
+            raise HTTPException(status_code=500, detail=f"dictionary entry delete failed: {e}") from e
+        _ensure_rag_schema(settings)
+        deleted = delete_dictionary_entry(db, str(entry_id))
+        db.commit()
+    if not deleted:
+        raise HTTPException(status_code=404, detail="dictionary entry not found")
+    return {"deleted": True}
+
+
+@app.post("/subtitle/dictionaries/lookup", response_model=DictionaryLookupResponse)
+def lookup_dictionary_view(
+    payload: DictionaryLookupRequest,
+    settings: SubtitleServiceSettings = Depends(get_settings),
+    db: Session = Depends(get_db),
+) -> DictionaryLookupResponse:
+    try:
+        rows = lookup_dictionary_entries(
+            db,
+            term=payload.term,
+            source_lang=payload.source_lang,
+            target_lang=payload.target_lang,
+            domain=payload.domain,
+            limit=payload.limit,
+            min_quality=payload.min_quality,
+            exact=payload.exact,
+        )
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        if not _is_missing_knowledge_table_error(e):
+            raise HTTPException(status_code=500, detail=f"dictionary lookup failed: {e}") from e
+        _ensure_rag_schema(settings)
+        rows = lookup_dictionary_entries(
+            db,
+            term=payload.term,
+            source_lang=payload.source_lang,
+            target_lang=payload.target_lang,
+            domain=payload.domain,
+            limit=payload.limit,
+            min_quality=payload.min_quality,
+            exact=payload.exact,
+        )
+        db.commit()
+    return DictionaryLookupResponse(count=len(rows), results=[DictionaryEntryRead(**row) for row in rows])
+
+
+@app.post("/subtitle/dictionaries/promote", response_model=DictionaryPromoteResponse)
+def promote_dictionary_entry_view(
+    payload: DictionaryPromoteRequest,
+    settings: SubtitleServiceSettings = Depends(get_settings),
+    db: Session = Depends(get_db),
+) -> DictionaryPromoteResponse:
+    try:
+        entry = get_dictionary_entry(db, str(payload.entry_id))
+    except Exception as e:
+        db.rollback()
+        if not _is_missing_knowledge_table_error(e):
+            raise HTTPException(status_code=500, detail=f"dictionary entry read failed: {e}") from e
+        _ensure_rag_schema(settings)
+        entry = get_dictionary_entry(db, str(payload.entry_id))
+    if not entry:
+        raise HTTPException(status_code=404, detail="dictionary entry not found")
+    translations = [str(x) for x in entry.get("translations") or [] if str(x or "").strip()]
+    if not translations:
+        raise HTTPException(status_code=400, detail="dictionary entry has no translation")
+    cfg = get_translate_settings(db, settings)
+    rag_cfg = rag_settings_from_translate_settings(cfg)
+    sources = [
+        {
+            "source": entry.get("source_name") or entry.get("source_slug") or "dictionary",
+            "url": entry.get("source_url") or entry.get("license_url") or "",
+            "license": entry.get("license") or "",
+            "attribution": entry.get("attribution") or "",
+            "dictionary_entry_id": str(payload.entry_id),
+        }
+    ]
+    aliases = [str(x) for x in entry.get("aliases") or [] if str(x or "").strip()]
+    embedding_text = build_knowledge_embedding_text(
+        item_type="term",
+        term=str(entry.get("term") or ""),
+        translation=translations[0],
+        domain=str(entry.get("domain") or rag_cfg.domain or ""),
+        aliases=aliases,
+        description=str(entry.get("definition") or entry.get("pos") or ""),
+    )
+    embedding: list[float] | None = None
+    if embedding_text.strip():
+        try:
+            embedding = embed_text(embedding_text, settings=embedding_settings_from_translate_settings(cfg))
+            assert_embedding_dimensions(embedding, rag_cfg.embedding_dimensions)
+        except Exception:
+            embedding = None
+    try:
+        item_id = upsert_knowledge_item(
+            db,
+            item_type="term",
+            target_lang=str(entry.get("target_lang") or "zh"),
+            term=str(entry.get("term") or ""),
+            translation=translations[0],
+            domain=str(entry.get("domain") or rag_cfg.domain or ""),
+            aliases=aliases,
+            description=str(entry.get("definition") or entry.get("pos") or ""),
+            sources=sources,
+            confidence=max(float(entry.get("quality") or 0.0), float(payload.confidence or 0.0)),
+            status=payload.status,
+            created_by="dictionary_import",
+            embedding=embedding,
+            embedding_model=f"{rag_cfg.embedding_provider}:{rag_cfg.embedding_model}" if embedding else "",
+            dedupe_any_domain=True,
+        )
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        if not _is_missing_knowledge_table_error(e):
+            raise HTTPException(status_code=500, detail=f"dictionary promote failed: {e}") from e
+        _ensure_rag_schema(settings)
+        item_id = upsert_knowledge_item(
+            db,
+            item_type="term",
+            target_lang=str(entry.get("target_lang") or "zh"),
+            term=str(entry.get("term") or ""),
+            translation=translations[0],
+            domain=str(entry.get("domain") or rag_cfg.domain or ""),
+            aliases=aliases,
+            description=str(entry.get("definition") or entry.get("pos") or ""),
+            sources=sources,
+            confidence=max(float(entry.get("quality") or 0.0), float(payload.confidence or 0.0)),
+            status=payload.status,
+            created_by="dictionary_import",
+            embedding=embedding,
+            embedding_model=f"{rag_cfg.embedding_provider}:{rag_cfg.embedding_model}" if embedding else "",
+            dedupe_any_domain=True,
+        )
+        db.commit()
+    return DictionaryPromoteResponse(knowledge_item_id=uuid.UUID(item_id))
+
+
 @app.get("/subtitle/agents/runs", response_model=list[AgentRunRead])
 def list_agent_runs_view(
     status: str | None = None,
@@ -597,6 +1073,16 @@ def list_agent_runs_view(
             db.rollback()
             raise HTTPException(status_code=503, detail=f"RAG agent tables are not ready: {retry_error}") from retry_error
     return [AgentRunRead(**row) for row in rows]
+
+
+@app.get("/subtitle/agent/skills", response_model=list[AgentSkillRead])
+def list_agent_skills_view(
+    settings: SubtitleServiceSettings = Depends(get_settings),
+    db: Session = Depends(get_db),
+) -> list[AgentSkillRead]:
+    cfg = get_translate_settings(db, settings)
+    registry = load_agent_skill_registry(rag_settings_from_translate_settings(cfg), force=True)
+    return [AgentSkillRead(**item) for item in registry.summaries()]
 
 
 @app.get("/subtitle/embedding/models", response_model=list[EmbeddingModelInfo])
@@ -716,12 +1202,11 @@ def translate_test(
         raise HTTPException(status_code=400, detail="text too long (max 2000 chars)")
 
     try:
-        cfg = get_translate_settings(db, settings)
-        translated = translate_text_openai(
+        ai_service = AIService(lambda: get_translate_settings(db, settings))
+        translated = ai_service.translate_text(
             text,
             target_lang=payload.target_lang,
             style=payload.style,
-            config=openai_chat_config_from_settings(cfg),
         )
     except Exception as e:
         raise HTTPException(status_code=502, detail=str(e)) from e
@@ -799,16 +1284,32 @@ async def upload_whisper_model(
     if dest.exists():
         raise HTTPException(status_code=400, detail="model already exists; delete it first")
 
+    max_zip_bytes = _WHISPER_MODEL_ZIP_MAX_BYTES
+    read_bytes = 0
     with tempfile.NamedTemporaryFile(prefix="whisper_model_", suffix=".zip", delete=False) as tmp:
         tmp_path = Path(tmp.name)
-        while True:
-            chunk = await file.read(1024 * 1024)
-            if not chunk:
-                break
-            tmp.write(chunk)
+        try:
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                read_bytes += len(chunk)
+                if read_bytes > max_zip_bytes:
+                    raise UploadTooLargeError(f"model zip too large: max {max_zip_bytes} bytes")
+                tmp.write(chunk)
+        except UploadTooLargeError as e:
+            tmp_path.unlink(missing_ok=True)
+            raise HTTPException(status_code=413, detail=str(e)) from e
 
     try:
-        _safe_extract_zip(tmp_path, dest)
+        _safe_extract_zip(
+            tmp_path,
+            dest,
+            max_files=_WHISPER_MODEL_ZIP_MAX_FILES,
+            max_uncompressed_bytes=_WHISPER_MODEL_ZIP_MAX_UNCOMPRESSED_BYTES,
+        )
+    except UploadTooLargeError as e:
+        raise HTTPException(status_code=413, detail=str(e)) from e
     finally:
         try:
             tmp_path.unlink(missing_ok=True)

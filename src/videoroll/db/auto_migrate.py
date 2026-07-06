@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+from contextlib import contextmanager
 from functools import lru_cache
 
 from sqlalchemy import inspect, text
@@ -11,6 +12,7 @@ from videoroll.db.session import get_engine
 
 
 logger = logging.getLogger(__name__)
+_AUTO_MIGRATE_ADVISORY_LOCK_KEY = 0x564944454F524F4C
 
 
 def _is_duplicate_column_error(exc: Exception) -> bool:
@@ -89,6 +91,64 @@ def _ensure_youtube_sources_columns(engine: Engine) -> None:
             continue
         _add_column(engine, "youtube_sources", column, column_type_sql)
         logger.warning("auto-migrated DB: added youtube_sources.%s", column)
+
+
+def _ensure_scheduler_indexes(engine: Engine) -> None:
+    insp = inspect(engine)
+    tables = set(insp.get_table_names())
+    with engine.begin() as conn:
+        if "tasks" in tables:
+            conn.execute(text("CREATE INDEX IF NOT EXISTS ix_tasks_lock_until ON tasks (lock_owner, lock_until)"))
+        if "subtitle_jobs" in tables:
+            conn.execute(
+                text("CREATE INDEX IF NOT EXISTS ix_subtitle_jobs_status_created_at ON subtitle_jobs (status, created_at)")
+            )
+        if "render_jobs" in tables:
+            conn.execute(text("CREATE INDEX IF NOT EXISTS ix_render_jobs_status_created_at ON render_jobs (status, created_at)"))
+
+
+def _ensure_pgvector_ann_indexes(conn) -> None:
+    conn.execute(
+        text(
+            """
+            CREATE INDEX IF NOT EXISTS ix_translation_knowledge_vector_filter
+            ON translation_knowledge_items (target_lang, embedding_model, status, domain)
+            WHERE embedding IS NOT NULL
+            """
+        )
+    )
+    try:
+        with conn.begin_nested():
+            conn.execute(
+                text(
+                    """
+                    CREATE INDEX IF NOT EXISTS ix_translation_knowledge_embedding_hnsw
+                    ON translation_knowledge_items
+                    USING hnsw (embedding vector_cosine_ops)
+                    WHERE embedding IS NOT NULL
+                    """
+                )
+            )
+    except Exception as e:
+        logger.warning("pgvector HNSW index is unavailable; vector search will use exact scan: %s", e)
+
+
+@contextmanager
+def _auto_migrate_lock(engine: Engine):
+    if (engine.dialect.name or "").lower() != "postgresql":
+        yield
+        return
+    conn = engine.connect()
+    try:
+        conn.execute(text("SELECT pg_advisory_lock(:key)"), {"key": _AUTO_MIGRATE_ADVISORY_LOCK_KEY})
+        conn.commit()
+        yield
+    finally:
+        try:
+            conn.execute(text("SELECT pg_advisory_unlock(:key)"), {"key": _AUTO_MIGRATE_ADVISORY_LOCK_KEY})
+            conn.commit()
+        finally:
+            conn.close()
 
 
 def _ensure_pgvector_rag_tables(engine: Engine) -> None:
@@ -275,6 +335,128 @@ def _ensure_pgvector_rag_tables(engine: Engine) -> None:
                 """
             )
         )
+        _ensure_pgvector_ann_indexes(conn)
+        conn.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS translation_dictionary_sources (
+                    id UUID PRIMARY KEY,
+                    name TEXT NOT NULL DEFAULT '',
+                    slug TEXT NOT NULL,
+                    description TEXT NOT NULL DEFAULT '',
+                    source_lang VARCHAR(16) NOT NULL DEFAULT '',
+                    target_lang VARCHAR(16) NOT NULL DEFAULT 'zh',
+                    format VARCHAR(32) NOT NULL DEFAULT 'csv',
+                    license TEXT NOT NULL DEFAULT '',
+                    license_url TEXT NOT NULL DEFAULT '',
+                    source_url TEXT NOT NULL DEFAULT '',
+                    version TEXT NOT NULL DEFAULT '',
+                    attribution TEXT NOT NULL DEFAULT '',
+                    domain TEXT NOT NULL DEFAULT '',
+                    priority INTEGER NOT NULL DEFAULT 0,
+                    enabled BOOLEAN NOT NULL DEFAULT TRUE,
+                    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    entry_count INTEGER NOT NULL DEFAULT 0,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                )
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS translation_dictionary_import_batches (
+                    id UUID PRIMARY KEY,
+                    source_id UUID REFERENCES translation_dictionary_sources(id) ON DELETE CASCADE,
+                    status VARCHAR(32) NOT NULL DEFAULT 'running',
+                    filename TEXT NOT NULL DEFAULT '',
+                    archive_path TEXT NOT NULL DEFAULT '',
+                    file_sha256 VARCHAR(64) NOT NULL DEFAULT '',
+                    file_size_bytes BIGINT NOT NULL DEFAULT 0,
+                    format VARCHAR(32) NOT NULL DEFAULT 'csv',
+                    import_mode VARCHAR(32) NOT NULL DEFAULT 'upsert',
+                    requested_by VARCHAR(64) NOT NULL DEFAULT 'manual',
+                    stats JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    error TEXT NOT NULL DEFAULT '',
+                    started_at TIMESTAMPTZ,
+                    finished_at TIMESTAMPTZ,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                )
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS translation_dictionary_entries (
+                    id UUID PRIMARY KEY,
+                    source_id UUID NOT NULL REFERENCES translation_dictionary_sources(id) ON DELETE CASCADE,
+                    batch_id UUID REFERENCES translation_dictionary_import_batches(id) ON DELETE SET NULL,
+                    source_lang VARCHAR(16) NOT NULL DEFAULT '',
+                    target_lang VARCHAR(16) NOT NULL DEFAULT 'zh',
+                    term TEXT NOT NULL DEFAULT '',
+                    normalized_term TEXT NOT NULL DEFAULT '',
+                    translations JSONB NOT NULL DEFAULT '[]'::jsonb,
+                    translation_text TEXT NOT NULL DEFAULT '',
+                    pos TEXT NOT NULL DEFAULT '',
+                    definition TEXT NOT NULL DEFAULT '',
+                    domain TEXT NOT NULL DEFAULT '',
+                    tags JSONB NOT NULL DEFAULT '[]'::jsonb,
+                    aliases JSONB NOT NULL DEFAULT '[]'::jsonb,
+                    examples JSONB NOT NULL DEFAULT '[]'::jsonb,
+                    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    quality DOUBLE PRECISION NOT NULL DEFAULT 0,
+                    enabled BOOLEAN NOT NULL DEFAULT TRUE,
+                    usage_count INTEGER NOT NULL DEFAULT 0,
+                    last_lookup_at TIMESTAMPTZ,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                )
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS uq_translation_dictionary_sources_slug
+                ON translation_dictionary_sources (slug)
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS uq_translation_dictionary_entry_norm
+                ON translation_dictionary_entries (source_id, source_lang, target_lang, normalized_term, domain)
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                CREATE INDEX IF NOT EXISTS ix_translation_dictionary_entries_lookup
+                ON translation_dictionary_entries (target_lang, source_lang, normalized_term)
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                CREATE INDEX IF NOT EXISTS ix_translation_dictionary_entries_source_enabled
+                ON translation_dictionary_entries (source_id, enabled, updated_at DESC)
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                CREATE INDEX IF NOT EXISTS ix_translation_dictionary_sources_enabled_priority
+                ON translation_dictionary_sources (enabled, priority DESC, updated_at DESC)
+                """
+            )
+        )
 
 
 def auto_migrate_engine(engine: Engine) -> None:
@@ -284,9 +466,11 @@ def auto_migrate_engine(engine: Engine) -> None:
     Today it ensures columns required by the task-level queue and youtube
     source subscriptions exist.
     """
-    _ensure_tasks_lock_columns(engine)
-    _ensure_youtube_sources_columns(engine)
-    _ensure_pgvector_rag_tables(engine)
+    with _auto_migrate_lock(engine):
+        _ensure_tasks_lock_columns(engine)
+        _ensure_youtube_sources_columns(engine)
+        _ensure_scheduler_indexes(engine)
+        _ensure_pgvector_rag_tables(engine)
 
 
 @lru_cache

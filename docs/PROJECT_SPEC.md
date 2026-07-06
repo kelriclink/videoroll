@@ -15,6 +15,7 @@
 - **主 Agent + 子 Agent 架构**：每个字幕 block 创建一个 `rag_master` 主 Agent；主 Agent 负责术语 gate、调度并发子 Agent、汇总结果；每个术语研究子 Agent 维护自己的 observation/evidence 上下文。
 - **工具调用循环**：子 Agent 可按需调用 `rag_lookup`、`wiki_search`、`search_web`、`fetch_url`、`finish`。工具选择由 LLM 根据当前 observation 决定，程序只做超时、重试、fallback 和写库安全控制。
 - **轻量 Agent Runtime**：借鉴 LangGraph/OpenAI Agents SDK/PydanticAI 一类框架的核心做法，但不引入重依赖；内部统一 tool schema、结构化输出校验、预算控制、状态迁移、错误分类和 trace 事件。
+- **Agent Skills**：支持从 `src/videoroll/apps/subtitle_service/skills/` 和 `data/agent_skills/` 加载 skill 能力包。当前内置通用术语研究、来源验证/写库、Wikipedia 百科研究和 SearXNG 网页研究。Skill 通过 `instructions/resources/allowed_tools` 影响子 Agent 的执行策略，但具体动作仍通过已注册 tool 完成，避免任意脚本执行。格式见 `docs/AGENT_SKILLS.md`。
 - **Wikipedia Tool**：固定使用 English Wikipedia API，适合百科型专有名词和通用背景知识；不用在配置里维护各种不通用的 wiki 地址。
 - **SearXNG Tool**：可接入自建 SearXNG，配置填写 base URL，系统自动请求 `/search?q=...&format=json` 并过滤搜索引擎自身页面等无效结果。
 - **SearXNG 参数配置**：翻译设置支持配置 `categories`、`engines`、`fallback_engines`、`language`、`safesearch`、`time_range` 和 `pageno`。不指定 `engines` 时使用实例默认引擎，默认搜索为空时使用 fallback 引擎再次尝试。

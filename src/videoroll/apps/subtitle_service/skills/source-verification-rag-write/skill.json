@@ -1,0 +1,17 @@
+{
+  "name": "source-verification-rag-write",
+  "description": "Guidance for deciding whether evidence is strong enough to summarize and write RAG knowledge.",
+  "domain": [],
+  "triggers": [],
+  "allowed_tools": [],
+  "runnable": true,
+  "run_mode": "agent_guidance",
+  "instructions": "Use this skill after at least one evidence source has been found. Before finishing, check whether the source actually supports the candidate term meaning in the subtitle context. If sources are search engine pages, preferences pages, login pages, unrelated pages, or generic snippets, continue searching or finish without writing. Prefer at least one credible external source and context consistency before long-term persistence. If English-only evidence explains the object but does not support the Chinese term, be conservative.",
+  "resources": [
+    {
+      "name": "verification-rules",
+      "path": "verification-rules.md",
+      "description": "Evidence quality and write-gate checklist."
+    }
+  ]
+}

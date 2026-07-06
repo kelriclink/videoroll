@@ -1,5 +1,5 @@
 import { ReactNode, useEffect, useState } from "react";
-import { Link, NavLink, Route, Routes } from "react-router-dom";
+import { Link, NavLink, Route, Routes, useLocation } from "react-router-dom";
 import AuthGate from "./components/AuthGate";
 import { FeedbackProvider } from "./components/Feedback";
 import { fetchJson } from "./lib/http";
@@ -20,11 +20,13 @@ import SettingsAutoPage from "./pages/SettingsAutoPage";
 import SettingsReviewPage from "./pages/SettingsReviewPage";
 import RenderQueuePage from "./pages/RenderQueuePage";
 import KnowledgeBasePage from "./pages/KnowledgeBasePage";
+import DictionaryPage from "./pages/DictionaryPage";
 
-function NavItem({ to, label }: { to: string; label: string }) {
+function NavItem({ to, label, onNavigate }: { to: string; label: string; onNavigate?: () => void }) {
   return (
     <NavLink
       to={to}
+      onClick={onNavigate}
       className={({ isActive }) =>
         [
           "block rounded-md px-3 py-2 text-sm",
@@ -48,7 +50,37 @@ function NavGroup({ title, children }: { title: string; children: ReactNode }) {
   );
 }
 
+function Navigation({ onNavigate }: { onNavigate?: () => void }) {
+  return (
+    <div className="rounded-md border border-slate-200 bg-white p-2 shadow-sm dark:border-slate-800 dark:bg-slate-900">
+      <NavGroup title="工作台">
+        <NavItem to="/" label="仪表盘" onNavigate={onNavigate} />
+        <NavItem to="/tasks" label="任务" onNavigate={onNavigate} />
+        <NavItem to="/videos" label="视频成品" onNavigate={onNavigate} />
+        <NavItem to="/queue/render" label="处理队列" onNavigate={onNavigate} />
+        <NavItem to="/knowledge" label="知识库" onNavigate={onNavigate} />
+        <NavItem to="/dictionaries" label="词典" onNavigate={onNavigate} />
+      </NavGroup>
+      <NavGroup title="来源">
+        <NavItem to="/tasks/new" label="新建任务" onNavigate={onNavigate} />
+        <NavItem to="/youtube/sources" label="YouTube 来源" onNavigate={onNavigate} />
+      </NavGroup>
+      <NavGroup title="配置">
+        <NavItem to="/settings/auto" label="自动模式" onNavigate={onNavigate} />
+        <NavItem to="/settings/youtube" label="YouTube" onNavigate={onNavigate} />
+        <NavItem to="/settings/bilibili" label="Bilibili" onNavigate={onNavigate} />
+        <NavItem to="/settings/asr" label="ASR" onNavigate={onNavigate} />
+        <NavItem to="/settings/translate" label="翻译 / RAG" onNavigate={onNavigate} />
+        <NavItem to="/settings/review" label="审核" onNavigate={onNavigate} />
+        <NavItem to="/settings/storage" label="存储" onNavigate={onNavigate} />
+        <NavItem to="/settings/api" label="API" onNavigate={onNavigate} />
+      </NavGroup>
+    </div>
+  );
+}
+
 export default function App() {
+  const location = useLocation();
   const orchestratorDisplay =
     ORCHESTRATOR_URL.startsWith("http://") || ORCHESTRATOR_URL.startsWith("https://")
       ? ORCHESTRATOR_URL
@@ -57,6 +89,7 @@ export default function App() {
         : ORCHESTRATOR_URL;
 
   const [loggingOut, setLoggingOut] = useState(false);
+  const [mobileNavOpen, setMobileNavOpen] = useState(false);
   const [darkMode, setDarkMode] = useState(() => {
     if (typeof window === "undefined") return false;
     const stored = window.localStorage.getItem("videoroll-theme");
@@ -70,6 +103,10 @@ export default function App() {
     root.classList.toggle("dark", darkMode);
     window.localStorage.setItem("videoroll-theme", darkMode ? "dark" : "light");
   }, [darkMode]);
+
+  useEffect(() => {
+    setMobileNavOpen(false);
+  }, [location.pathname]);
 
   async function logout() {
     if (loggingOut) return;
@@ -90,12 +127,23 @@ export default function App() {
       <AuthGate>
       <div className="min-h-screen bg-slate-50 transition-colors dark:bg-slate-950">
         <header className="border-b bg-white transition-colors dark:border-slate-800 dark:bg-slate-950">
-          <div className="mx-auto flex max-w-6xl items-center justify-between px-4 py-3">
-            <Link to="/" className="font-semibold">
-              VideoRoll
-            </Link>
+          <div className="mx-auto flex max-w-7xl items-center justify-between px-4 py-3">
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                className="inline-flex h-8 w-8 items-center justify-center rounded-md border border-slate-300 text-sm text-slate-700 hover:bg-slate-50 md:hidden"
+                aria-label="打开导航"
+                title="打开导航"
+                onClick={() => setMobileNavOpen(true)}
+              >
+                ☰
+              </button>
+              <Link to="/" className="font-semibold">
+                VideoRoll
+              </Link>
+            </div>
             <div className="flex items-center gap-3">
-              <div className="text-xs text-slate-500">合规版 · MVP</div>
+              <div className="hidden text-xs text-slate-500 sm:block">合规处理台</div>
               <button
                 type="button"
                 onClick={() => setDarkMode((value) => !value)}
@@ -118,42 +166,47 @@ export default function App() {
               </button>
             </div>
           </div>
-          <div className="mx-auto max-w-6xl px-4 pb-3 text-xs text-slate-600">
+          <div className="mx-auto max-w-7xl px-4 pb-3 text-xs text-slate-600">
             仅用于处理你拥有版权/已获授权/允许再分发的内容。
           </div>
         </header>
 
-        <div className="mx-auto grid max-w-6xl grid-cols-12 gap-4 px-4 py-4">
-          <aside className="col-span-12 md:col-span-3">
-            <div className="rounded-md border border-slate-200 bg-white p-2 shadow-sm dark:border-slate-800 dark:bg-slate-900">
-              <NavGroup title="工作台">
-                <NavItem to="/" label="Dashboard" />
-                <NavItem to="/tasks" label="Tasks" />
-                <NavItem to="/videos" label="Videos" />
-                <NavItem to="/queue/render" label="Queue · Task" />
-                <NavItem to="/knowledge" label="Knowledge Base" />
-              </NavGroup>
-              <NavGroup title="来源">
-                <NavItem to="/tasks/new" label="New Task" />
-                <NavItem to="/youtube/sources" label="YouTube Sources" />
-              </NavGroup>
-              <NavGroup title="配置">
-                <NavItem to="/settings/auto" label="Settings · Auto" />
-                <NavItem to="/settings/youtube" label="Settings · YouTube" />
-                <NavItem to="/settings/bilibili" label="Settings · Bilibili" />
-                <NavItem to="/settings/asr" label="Settings · ASR" />
-                <NavItem to="/settings/translate" label="Settings · Translate" />
-                <NavItem to="/settings/review" label="Settings · Review" />
-                <NavItem to="/settings/storage" label="Settings · Storage" />
-                <NavItem to="/settings/api" label="Settings · API" />
-              </NavGroup>
+        {mobileNavOpen ? (
+          <div className="fixed inset-0 z-40 md:hidden">
+            <button
+              type="button"
+              className="absolute inset-0 bg-slate-950/40"
+              aria-label="关闭导航"
+              onClick={() => setMobileNavOpen(false)}
+            />
+            <div className="relative h-full w-[min(20rem,calc(100vw-3rem))] overflow-auto bg-slate-50 p-4 shadow-xl dark:bg-slate-950">
+              <div className="mb-3 flex items-center justify-between gap-3">
+                <div className="font-semibold">VideoRoll</div>
+                <button
+                  type="button"
+                  className="rounded-md border border-slate-300 px-2 py-1 text-sm text-slate-700 hover:bg-slate-100"
+                  onClick={() => setMobileNavOpen(false)}
+                >
+                  关闭
+                </button>
+              </div>
+              <Navigation onNavigate={() => setMobileNavOpen(false)} />
+              <div className="mt-3 rounded-md border border-slate-200 bg-white p-3 text-xs text-slate-600 shadow-sm dark:border-slate-800 dark:bg-slate-900 dark:text-slate-400">
+                后端：{orchestratorDisplay}
+              </div>
             </div>
+          </div>
+        ) : null}
+
+        <div className="mx-auto grid max-w-7xl grid-cols-12 gap-4 px-4 py-4">
+          <aside className="hidden md:col-span-3 md:block lg:col-span-2">
+            <Navigation />
             <div className="mt-3 rounded-md border border-slate-200 bg-white p-3 text-xs text-slate-600 shadow-sm dark:border-slate-800 dark:bg-slate-900 dark:text-slate-400">
-              后端（Orchestrator）：{orchestratorDisplay}
+              后端：{orchestratorDisplay}
             </div>
           </aside>
 
-          <main className="col-span-12 md:col-span-9">
+          <main className="col-span-12 md:col-span-9 lg:col-span-10">
             <Routes>
               <Route path="/" element={<DashboardPage />} />
               <Route path="/tasks" element={<TasksPage />} />
@@ -163,6 +216,7 @@ export default function App() {
               <Route path="/youtube/sources" element={<YouTubeSourcesPage />} />
               <Route path="/queue/render" element={<RenderQueuePage />} />
               <Route path="/knowledge" element={<KnowledgeBasePage />} />
+              <Route path="/dictionaries" element={<DictionaryPage />} />
               <Route path="/settings/asr" element={<SettingsASRPage />} />
               <Route path="/settings/youtube" element={<SettingsYouTubePage />} />
               <Route path="/settings/storage" element={<SettingsStoragePage />} />

@@ -41,6 +41,7 @@ except ModuleNotFoundError:
 
 from videoroll.apps.subtitle_service import processing
 from videoroll.apps.subtitle_service.processing import Segment
+from videoroll.ai.service import AIService
 
 
 class _FakeResponse:
@@ -333,6 +334,93 @@ class TranslateResumeTests(unittest.TestCase):
         prompt = str(seen_requests[0]["messages"][1]["content"])
         self.assertIn("rag_context", prompt)
         self.assertIn("AWP 狙击枪", prompt)
+
+    def test_ai_service_resolves_model_for_each_batch(self) -> None:
+        source_segments = [
+            Segment(start=0.0, end=1.0, text="one"),
+            Segment(start=1.0, end=2.0, text="two"),
+        ]
+        seen_requests: list[dict[str, object]] = []
+        responses = [
+            _FakeResponse(
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": json.dumps(
+                                    {
+                                        "updated_summary": "summary-1",
+                                        "translations": [{"idx": 1, "text": "一"}],
+                                    },
+                                    ensure_ascii=False,
+                                )
+                            }
+                        }
+                    ]
+                }
+            ),
+            _FakeResponse(
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": json.dumps(
+                                    {
+                                        "updated_summary": "summary-2",
+                                        "translations": [{"idx": 2, "text": "二"}],
+                                    },
+                                    ensure_ascii=False,
+                                )
+                            }
+                        }
+                    ]
+                }
+            ),
+        ]
+
+        class FakeClient:
+            def __init__(self, *_args: object, **_kwargs: object) -> None:
+                pass
+
+            def __enter__(self) -> "FakeClient":
+                return self
+
+            def __exit__(self, _exc_type: object, _exc: object, _tb: object) -> None:
+                return None
+
+            def post(self, _url: str, *, headers: dict[str, str], json: dict[str, object]) -> _FakeResponse:
+                del headers
+                seen_requests.append(json)
+                if not responses:
+                    raise AssertionError("unexpected extra OpenAI request")
+                return responses.pop(0)
+
+        settings_calls = 0
+
+        def settings_provider() -> dict[str, object]:
+            nonlocal settings_calls
+            settings_calls += 1
+            return {
+                "openai_api_key": "test-key",
+                "openai_base_url": "https://example.invalid/v1",
+                "openai_model": "old-model" if settings_calls == 1 else "new-model",
+                "openai_temperature": 0.2,
+                "openai_timeout_seconds": 30.0,
+                "openai_max_retries": 3,
+            }
+
+        with patch("videoroll.ai.client.httpx.Client", FakeClient):
+            translated, summary = processing.translate_segments_openai_with_summary(
+                source_segments,
+                target_lang="zh",
+                style="自然",
+                batch_size=1,
+                ai_service=AIService(settings_provider),
+            )
+
+        self.assertEqual([seg.text for seg in translated], ["一", "二"])
+        self.assertEqual(summary, "summary-2")
+        self.assertEqual([req["model"] for req in seen_requests], ["old-model", "new-model"])
 
 
 if __name__ == "__main__":

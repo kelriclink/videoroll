@@ -41,6 +41,9 @@ except ModuleNotFoundError:
 
 from videoroll.ai.client import OpenAIChatConfig, openai_chat_config_from_settings
 from videoroll.ai import service
+from videoroll.ai.providers import AIProviderRegistry
+from videoroll.ai.prompts import AIJsonPrompt
+from videoroll.ai.runtime import AIRuntime
 
 
 class _FakeResponse:
@@ -262,6 +265,74 @@ class AIServiceTests(unittest.TestCase):
         self.assertEqual(obj["approved"], False)
         self.assertEqual(obj["reason"], "包含危险内容")
         self.assertIn("危险教程一律不通过", str(seen_requests[0]["messages"][1]["content"]))
+
+    def test_ai_service_routes_model_by_purpose_override(self) -> None:
+        responses = [
+            _FakeResponse(
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": json.dumps({"translation": "你好"}, ensure_ascii=False)
+                            }
+                        }
+                    ]
+                }
+            )
+        ]
+        seen_requests: list[dict[str, object]] = []
+
+        class FakeClient:
+            def __init__(self, *_args: object, **_kwargs: object) -> None:
+                pass
+
+            def __enter__(self) -> "FakeClient":
+                return self
+
+            def __exit__(self, _exc_type: object, _exc: object, _tb: object) -> None:
+                return None
+
+            def post(self, _url: str, *, headers: dict[str, str], json: dict[str, object]) -> _FakeResponse:
+                del headers
+                seen_requests.append(json)
+                return responses.pop(0)
+
+        ai = service.AIService(
+            lambda: {
+                "openai_api_key": "test-key",
+                "openai_base_url": "https://example.invalid/v1",
+                "openai_model": "base-model",
+                "ai_purpose_overrides": {"text_translation": {"openai_model": "translation-model"}},
+            }
+        )
+
+        with patch("videoroll.ai.client.httpx.Client", FakeClient):
+            translated = ai.translate_text("hello", target_lang="zh", style="自然")
+
+        self.assertEqual(translated, "你好")
+        self.assertEqual(seen_requests[0]["model"], "translation-model")
+
+    def test_ai_service_can_use_custom_provider(self) -> None:
+        calls: list[tuple[str, str, str]] = []
+
+        class FakeProvider:
+            name = "fake"
+
+            def request_json(self, runtime: AIRuntime, prompt: AIJsonPrompt, *, client: object | None = None) -> dict[str, object]:
+                del client
+                calls.append((runtime.purpose, runtime.provider, prompt.system_prompt))
+                return {"translation": "自定义"}
+
+        ai = service.AIService(
+            lambda: {"ai_provider": "fake", "openai_model": "ignored"},
+            provider_registry=AIProviderRegistry([FakeProvider()]),
+        )
+
+        translated = ai.translate_text("hello", target_lang="zh", style="自然")
+
+        self.assertEqual(translated, "自定义")
+        self.assertEqual(calls[0][0], "text_translation")
+        self.assertEqual(calls[0][1], "fake")
 
 
 if __name__ == "__main__":

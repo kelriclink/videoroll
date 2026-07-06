@@ -20,9 +20,10 @@ class AgentBudget(BaseModel):
 
 
 class AgentDecision(BaseModel):
-    action: Literal["rag_lookup", "wiki_search", "search_web", "fetch_url", "finish"]
+    action: Literal["rag_lookup", "dictionary_lookup", "wiki_search", "search_web", "fetch_url", "finish"]
     query: str = ""
     url: str = ""
+    skill_name: str = ""
     reason: str = ""
     final_answer_ready: bool = False
 
@@ -225,4 +226,3 @@ def validate_model(model: type[TOut], data: Any, *, fallback: TOut | None = None
 
 def json_schema_for(model: type[BaseModel]) -> dict[str, Any]:
     return json.loads(json.dumps(model.model_json_schema(), ensure_ascii=False))
-

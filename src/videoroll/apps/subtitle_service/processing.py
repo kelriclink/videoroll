@@ -10,6 +10,7 @@ import threading
 import time
 import unicodedata
 import wave
+from contextlib import nullcontext
 from functools import lru_cache
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,6 +19,7 @@ from typing import Any, Callable, Iterable
 import httpx
 
 from videoroll.ai.client import OpenAIChatConfig, create_openai_http_client, request_openai_json_object
+from videoroll.ai.service import AIService
 
 logger = logging.getLogger(__name__)
 
@@ -678,9 +680,9 @@ def translate_segments_openai_with_summary(
     segments: Iterable[Segment],
     target_lang: str,
     style: str,
-    api_key: str | None,
-    base_url: str,
-    model: str,
+    api_key: str | None = None,
+    base_url: str = "",
+    model: str = "",
     temperature: float = 0.2,
     timeout_seconds: float = 60.0,
     batch_size: int = 50,
@@ -690,22 +692,25 @@ def translate_segments_openai_with_summary(
     resume_from: Iterable[Segment] | None = None,
     initial_summary: str = "",
     on_batch_done: Callable[[list[Segment], str, int], None] | None = None,
+    ai_service: AIService | None = None,
 ) -> tuple[list[Segment], str]:
     segs = list(segments)
     if not segs:
         return [], ""
-    if not api_key:
+    if ai_service is None and not api_key:
         raise RuntimeError("OpenAI API key is not set")
     resumed = list(resume_from or [])
     if len(resumed) > len(segs):
         raise ValueError("translation resume checkpoint is longer than the source segments")
-    cfg = OpenAIChatConfig(
-        api_key=api_key,
-        base_url=base_url,
-        model=model,
-        temperature=float(temperature),
-        timeout_seconds=float(timeout_seconds),
-    )
+    cfg: OpenAIChatConfig | None = None
+    if ai_service is None:
+        cfg = OpenAIChatConfig(
+            api_key=api_key,
+            base_url=base_url,
+            model=model,
+            temperature=float(temperature),
+            timeout_seconds=float(timeout_seconds),
+        )
 
     tgt = (target_lang or "zh").strip() or "zh"
     tone = (style or "").strip() or "口语自然"
@@ -713,6 +718,7 @@ def translate_segments_openai_with_summary(
     system_prompt = "You are a professional subtitle translator. Return ONLY valid JSON (no markdown, no code fences, no extra text)."
 
     def _client() -> httpx.Client:
+        assert cfg is not None
         return create_openai_http_client(cfg.timeout_seconds)
 
     class _PartialBatchTranslationError(RuntimeError):
@@ -720,7 +726,7 @@ def translate_segments_openai_with_summary(
             super().__init__(message)
             self.translated_prefix = translated_prefix
 
-    def _translate_batch(client: httpx.Client, batch: list[Segment], *, start_idx: int, summary: str) -> tuple[list[Segment], str]:
+    def _translate_batch(client: httpx.Client | None, batch: list[Segment], *, start_idx: int, summary: str) -> tuple[list[Segment], str]:
         blocks = [{"idx": start_idx + i + 1, "text": s.text} for i, s in enumerate(batch)]
         payload_in: dict[str, Any] = {"target_lang": tgt, "style": tone, "blocks": blocks}
         if enable_summary:
@@ -732,33 +738,47 @@ def translate_segments_openai_with_summary(
             if rag_context:
                 payload_in["rag_context"] = rag_context
 
-        user_prompt = (
-            "你将收到一批字幕 block。请按 block 为单位翻译。\n"
-            "要求：\n"
-            "- 保留每个 block 的 idx 不变；不得增删 block，不得改变顺序；\n"
-            "- 只翻译 text 字段；同一 block 内多行先合并理解再翻译；\n"
-            "- 术语、人名保持一致；数字/单位尽量保留原格式；\n"
-            "- 如果输入包含 rag_context，请优先参考其中的 term_cards/knowledge_cards 来理解专有名词、梗、作品设定和技术背景；\n"
-            "- term_cards 中的 translation 是推荐译法，除非明显不符合当前上下文，否则保持一致；\n"
-            "- 输出必须是 JSON 对象，且必须包含 translations 数组；不要输出任何解释。\n"
-            f"- 目标语言：{tgt}\n"
-            f"- 风格：{tone}\n\n"
-            "如果输入里带 summary，请在翻译时参考它保持前后一致，并输出 updated_summary（<= 500 字符）。\n\n"
-            "输入 JSON：\n"
-            f"{json.dumps(payload_in, ensure_ascii=False)}\n\n"
-            "输出 JSON 结构（必须严格遵守）：\n"
-            '{ "updated_summary": "...", "translations": [ {"idx": 1, "text": "..."}, ... ] }'
-        )
-
-        data = request_openai_json_object(
-            config=cfg,
-            system_prompt=system_prompt,
-            user_prompt=user_prompt,
-            client=client,
-            format_retry_notice="注意：上一次输出不符合 JSON/结构要求，请严格按 JSON 输出。",
-            format_retries=2,
-            network_retries=3,
-        )
+        if ai_service is not None:
+            data = ai_service.translate_subtitle_batch(
+                blocks=blocks,
+                target_lang=tgt,
+                style=tone,
+                summary=summary,
+                enable_summary=enable_summary,
+                glossary=glossary,
+                rag_context=payload_in.get("rag_context") if isinstance(payload_in.get("rag_context"), dict) else None,
+                network_retries=3,
+            )
+        else:
+            assert cfg is not None
+            assert client is not None
+            user_prompt = (
+                "你将收到一批字幕 block。请按 block 为单位翻译。\n"
+                "要求：\n"
+                "- 保留每个 block 的 idx 不变；不得增删 block，不得改变顺序；\n"
+                "- 只翻译 text 字段；同一 block 内多行先合并理解再翻译；\n"
+                "- 术语、人名保持一致；数字/单位尽量保留原格式；\n"
+                "- 如果输入包含 rag_context，请优先参考其中的 term_cards/knowledge_cards 来理解专有名词、梗、作品设定和技术背景；\n"
+                "- term_cards 中的 translation 是推荐译法，除非明显不符合当前上下文，否则保持一致；\n"
+                "- rag_context 来自主 agent 对当前 block 的本地 RAG/词典预检和必要研究；如果其中已有与当前 block 和 summary 贴切的译法或解释，直接据此翻译，不要假设还必须继续搜索；\n"
+                "- 输出必须是 JSON 对象，且必须包含 translations 数组；不要输出任何解释。\n"
+                f"- 目标语言：{tgt}\n"
+                f"- 风格：{tone}\n\n"
+                "如果输入里带 summary，请在翻译时参考它保持前后一致，并输出 updated_summary（<= 500 字符）。\n\n"
+                "输入 JSON：\n"
+                f"{json.dumps(payload_in, ensure_ascii=False)}\n\n"
+                "输出 JSON 结构（必须严格遵守）：\n"
+                '{ "updated_summary": "...", "translations": [ {"idx": 1, "text": "..."}, ... ] }'
+            )
+            data = request_openai_json_object(
+                config=cfg,
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                client=client,
+                format_retry_notice="注意：上一次输出不符合 JSON/结构要求，请严格按 JSON 输出。",
+                format_retries=2,
+                network_retries=3,
+            )
 
         translations = data.get("translations")
         if not isinstance(translations, list):
@@ -821,7 +841,8 @@ def translate_segments_openai_with_summary(
     out: list[Segment] = list(resumed)
     cur_batch_size = batch_size
     idx = len(out)
-    with _client() as client:
+    client_context = _client() if ai_service is None else nullcontext(None)
+    with client_context as client:
         while idx < len(segs):
             size = min(cur_batch_size, len(segs) - idx)
             batch = segs[idx : idx + size]

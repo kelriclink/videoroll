@@ -1,0 +1,36 @@
+{
+  "name": "searxng-web-research",
+  "description": "Search and fetch strategy for technical terms, standards, tools, hardware, software, and domain jargon.",
+  "domain": [
+    "technology",
+    "technical",
+    "hardware",
+    "electronics",
+    "software",
+    "chemistry",
+    "engineering"
+  ],
+  "triggers": [
+    "VGA",
+    "HDMI",
+    "pinout",
+    "datasheet",
+    "standard",
+    "hobby knife",
+    "SEM",
+    "TEM",
+    "GPU",
+    "API"
+  ],
+  "allowed_tools": [],
+  "runnable": true,
+  "run_mode": "agent_guidance",
+  "instructions": "Use this skill when web search is likely more useful than an encyclopedia. Build focused queries with the English term, domain clue, and target-language wording. Prefer official docs, standards, manuals, vendor docs, dictionaries, or high-quality technical references. If SearXNG returns zero results, try a shorter English query or a target-language query. If snippets are enough, do not fetch pages; if snippets only hint at the answer, fetch the best URL.",
+  "resources": [
+    {
+      "name": "search-query-patterns",
+      "path": "search-query-patterns.md",
+      "description": "Query patterns and source ranking for SearXNG research."
+    }
+  ]
+}

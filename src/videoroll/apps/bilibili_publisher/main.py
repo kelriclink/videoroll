@@ -11,8 +11,7 @@ from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 
-from videoroll.ai.client import openai_chat_config_from_settings
-from videoroll.ai.service import recommend_typeid_openai
+from videoroll.ai.service import AIService
 from videoroll.config import BilibiliPublisherSettings, get_bilibili_publisher_settings, get_subtitle_settings
 from videoroll.db.base import Base
 from videoroll.db.auto_migrate import auto_migrate
@@ -138,10 +137,10 @@ def recommend_archive_type(
     by_id = {k: v for k, v in by_id.items() if k > 0 and v}
 
     try:
-        obj = recommend_typeid_openai(
+        ai_service = AIService(lambda: get_translate_settings(db, get_subtitle_settings()))
+        obj = ai_service.recommend_typeid(
             text,
             options=options,
-            config=openai_chat_config_from_settings(translate_settings),
         )
         try:
             tid = int(obj.get("typeid") or 0)

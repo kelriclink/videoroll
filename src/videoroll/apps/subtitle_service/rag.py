@@ -36,6 +36,12 @@ from videoroll.apps.subtitle_service.agent_runtime import (
     json_schema_for,
     validate_model,
 )
+from videoroll.apps.subtitle_service.agent_skills import AgentSkill, SkillRegistry
+from videoroll.apps.subtitle_service.dictionaries import (
+    dictionary_entries_to_context_cards,
+    dictionary_entries_to_evidence,
+    lookup_dictionary_entries,
+)
 from videoroll.apps.subtitle_service.embeddings import EmbeddingSettings, assert_embedding_dimensions, embed_text
 from videoroll.apps.subtitle_service.processing import Segment
 from videoroll.apps.subtitle_service.retrieval import RetrievalPipeline
@@ -43,6 +49,8 @@ from videoroll.apps.subtitle_service.retrieval import RetrievalPipeline
 
 _TERM_SPLIT_RE = re.compile(r"[\s\-_]+")
 _CANDIDATE_RE = re.compile(r"\b[A-Za-z][A-Za-z0-9][A-Za-z0-9'._:+#/-]*(?:\s+[A-Za-z0-9][A-Za-z0-9'._:+#/-]*){0,3}\b")
+_WORD_TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9'._:+#/-]*")
+_CJK_TOKEN_RE = re.compile(r"[\u3400-\u9fff]{2,}")
 _SCRIPT_STYLE_RE = re.compile(r"<(script|style|noscript)\b[^>]*>.*?</\1>", re.IGNORECASE | re.DOTALL)
 _TAG_RE = re.compile(r"<[^>]+>")
 _ARTICLE_RE = re.compile(r"<(?:article|div)\b[^>]*class=[\"'][^\"']*\bresult\b[^\"']*[\"'][^>]*>.*?</(?:article|div)>", re.IGNORECASE | re.DOTALL)
@@ -71,6 +79,45 @@ _NON_SEARCH_GATE_CATEGORIES = {
     "full_sentence",
     "generic_action",
     "greeting",
+}
+_TERM_STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "are",
+    "as",
+    "at",
+    "be",
+    "but",
+    "by",
+    "for",
+    "from",
+    "have",
+    "he",
+    "her",
+    "his",
+    "i",
+    "in",
+    "is",
+    "it",
+    "its",
+    "me",
+    "my",
+    "of",
+    "on",
+    "or",
+    "our",
+    "she",
+    "that",
+    "the",
+    "their",
+    "this",
+    "to",
+    "use",
+    "we",
+    "with",
+    "you",
+    "your",
 }
 _COMMON_CONTEXT_TRANSLATIONS: dict[str, dict[str, str]] = {
     "truth table": {
@@ -101,6 +148,10 @@ class RagSettings:
     embedding_device: str = "cpu"
     auto_discover_terms: bool = False
     auto_learn_terms: bool = False
+    dictionary_enabled: bool = True
+    dictionary_top_k: int = 8
+    dictionary_min_quality: float = 0.0
+    dictionary_auto_promote: bool = False
     search_enabled: bool = False
     search_url: str = ""
     search_categories: str = "general"
@@ -114,6 +165,9 @@ class RagSettings:
     domain: str = ""
     agent_parallelism: int = 1
     agent_timeout_seconds: float = 120.0
+    agent_skills_enabled: bool = False
+    agent_builtin_skills_enabled: bool = True
+    agent_user_skills_enabled: bool = True
 
 
 @dataclass(frozen=True)
@@ -258,6 +312,17 @@ class RagLookupOutput(BaseModel):
     normalized_term: str = ""
 
 
+class DictionaryLookupInput(BaseModel):
+    term: str
+    source_lang: str = ""
+    target_lang: str = ""
+
+
+class DictionaryLookupOutput(BaseModel):
+    count: int = 0
+    results: list[dict[str, Any]] = []
+
+
 class WikiSearchInput(BaseModel):
     query: str
     api_url: str = _WIKIPEDIA_API_URL
@@ -340,6 +405,21 @@ def _research_tool_registry(rag_settings: RagSettings) -> ToolRegistry:
             output_model=RagLookupOutput,
         )
     )
+    if rag_settings.dictionary_enabled:
+        registry.register(
+            RegisteredTool(
+                spec=_runtime_tool_spec(
+                    name="dictionary_lookup",
+                    description="Look up imported dictionary and terminology sources without writing to the knowledge base.",
+                    input_model=DictionaryLookupInput,
+                    output_model=DictionaryLookupOutput,
+                    timeout_seconds=5.0,
+                    guardrails=["read_only", "source_license_preserved", "do_not_auto_write_knowledge"],
+                ),
+                input_model=DictionaryLookupInput,
+                output_model=DictionaryLookupOutput,
+            )
+        )
     if rag_settings.wiki_enabled:
         registry.register(
             RegisteredTool(
@@ -408,7 +488,7 @@ def _research_tool_registry(rag_settings: RagSettings) -> ToolRegistry:
 
 
 def _ordered_tool_specs(registry: ToolRegistry) -> list[dict[str, Any]]:
-    order = ["rag_lookup", "wiki_search", "search_web", "fetch_url", "finish"]
+    order = ["rag_lookup", "dictionary_lookup", "wiki_search", "search_web", "fetch_url", "finish"]
     out: list[dict[str, Any]] = []
     for name in order:
         try:
@@ -417,6 +497,31 @@ def _ordered_tool_specs(registry: ToolRegistry) -> list[dict[str, Any]]:
             continue
         out.append(spec.model_dump())
     return out
+
+
+def load_agent_skill_registry(rag_settings: RagSettings, *, force: bool = False) -> SkillRegistry:
+    if not force and not rag_settings.agent_skills_enabled:
+        return SkillRegistry(())
+    return SkillRegistry.load(
+        include_builtin=bool(rag_settings.agent_builtin_skills_enabled),
+        include_user=bool(rag_settings.agent_user_skills_enabled),
+    )
+
+
+def _active_skill_payloads(skills: list[AgentSkill]) -> list[dict[str, Any]]:
+    return [skill.prompt_payload() for skill in skills if skill.runnable]
+
+
+def _tool_specs_for_active_skills(registry: ToolRegistry, active_skills: list[AgentSkill]) -> tuple[list[dict[str, Any]], list[str]]:
+    available_tool_specs = _ordered_tool_specs(registry)
+    allowed_by_skill: set[str] = set()
+    for skill in active_skills:
+        allowed_by_skill.update(name for name in skill.allowed_tools if name)
+    if allowed_by_skill:
+        allowed_by_skill.update({"rag_lookup", "finish"})
+        available_tool_specs = [spec for spec in available_tool_specs if str(spec.get("name") or "") in allowed_by_skill]
+    available_tools = [str(spec.get("name") or "") for spec in available_tool_specs if str(spec.get("name") or "")]
+    return available_tool_specs, available_tools
 
 
 _SEARXNG_TIME_RANGES = {"", "day", "month", "year"}
@@ -507,6 +612,10 @@ def rag_settings_from_translate_settings(settings: dict[str, Any]) -> RagSetting
         embedding_device=str(settings.get("rag_embedding_device") or "cpu").strip() or "cpu",
         auto_discover_terms=bool(settings.get("rag_auto_discover_terms")),
         auto_learn_terms=bool(settings.get("rag_auto_learn_terms")),
+        dictionary_enabled=bool(settings.get("rag_dictionary_enabled") if "rag_dictionary_enabled" in settings else True),
+        dictionary_top_k=max(0, min(30, int(settings.get("rag_dictionary_top_k") or 8))),
+        dictionary_min_quality=max(0.0, min(1.0, float(settings.get("rag_dictionary_min_quality") or 0.0))),
+        dictionary_auto_promote=bool(settings.get("rag_dictionary_auto_promote")),
         search_enabled=bool(settings.get("rag_search_enabled")),
         search_url=str(settings.get("rag_search_url") or "").strip(),
         search_categories=_clean_searxng_csv(settings.get("rag_search_categories"), default="general"),
@@ -520,6 +629,17 @@ def rag_settings_from_translate_settings(settings: dict[str, Any]) -> RagSetting
         domain=str(settings.get("rag_domain") or "").strip(),
         agent_parallelism=max(1, min(8, int(settings.get("rag_agent_parallelism") or 1))),
         agent_timeout_seconds=max(10.0, min(900.0, float(settings.get("rag_agent_timeout_seconds") or 120.0))),
+        agent_skills_enabled=bool(settings.get("rag_agent_skills_enabled")),
+        agent_builtin_skills_enabled=bool(
+            settings.get("rag_agent_builtin_skills_enabled")
+            if "rag_agent_builtin_skills_enabled" in settings
+            else True
+        ),
+        agent_user_skills_enabled=bool(
+            settings.get("rag_agent_user_skills_enabled")
+            if "rag_agent_user_skills_enabled" in settings
+            else True
+        ),
     )
 
 
@@ -527,6 +647,61 @@ def normalize_term(term: str) -> str:
     s = str(term or "").strip().lower()
     s = _TERM_SPLIT_RE.sub(" ", s)
     return s
+
+
+def _add_unique_term_candidate(out: list[str], seen: set[str], raw: str, *, limit: int) -> bool:
+    clean = " ".join(str(raw or "").strip(" .,:;!?()[]{}\"'“”‘’").split())
+    if len(clean) < 2:
+        return False
+    norm = normalize_term(clean)
+    if not norm or norm in seen:
+        return False
+    seen.add(norm)
+    out.append(clean)
+    return len(out) >= limit
+
+
+def _block_lookup_candidates_from_text(text_value: str, *, limit: int = 96) -> list[str]:
+    text = str(text_value or "")
+    limit = max(1, min(200, int(limit)))
+    seen: set[str] = set()
+    out: list[str] = []
+
+    tokens = [match.group(0).strip(" .,:;!?()[]{}\"'") for match in _WORD_TOKEN_RE.finditer(text)]
+    tokens = [token for token in tokens if token]
+    max_ngram = 4
+    for size in range(max_ngram, 0, -1):
+        for start in range(0, max(0, len(tokens) - size + 1)):
+            phrase_tokens = tokens[start : start + size]
+            lower_tokens = [token.lower() for token in phrase_tokens]
+            if size == 1:
+                token = phrase_tokens[0]
+                if lower_tokens[0] in _TERM_STOPWORDS:
+                    continue
+                if len(token) <= 2 and not token.isupper():
+                    continue
+            else:
+                if lower_tokens[0] in _TERM_STOPWORDS or lower_tokens[-1] in _TERM_STOPWORDS:
+                    continue
+                if all(token in _TERM_STOPWORDS for token in lower_tokens):
+                    continue
+            if _add_unique_term_candidate(out, seen, " ".join(phrase_tokens), limit=limit):
+                return out
+
+    for match in _CJK_TOKEN_RE.finditer(text):
+        chunk = match.group(0)
+        if _add_unique_term_candidate(out, seen, chunk, limit=limit):
+            return out
+        for size in range(min(6, len(chunk)), 1, -1):
+            for start in range(0, len(chunk) - size + 1):
+                if _add_unique_term_candidate(out, seen, chunk[start : start + size], limit=limit):
+                    return out
+
+    for match in _CANDIDATE_RE.finditer(text):
+        if _add_unique_term_candidate(out, seen, match.group(0), limit=limit):
+            return out
+
+    return out
 
 
 def normalize_wiki_api_url(raw_url: str) -> str:
@@ -766,6 +941,32 @@ def _is_fetchable_url(url: str) -> bool:
     if _is_private_host(parsed.hostname or ""):
         return False
     return True
+
+
+def _client_get_no_redirects(client: httpx.Client, url: str) -> httpx.Response:
+    try:
+        return client.get(url, follow_redirects=False)
+    except TypeError:
+        # Test doubles and older compatible clients may not accept per-request
+        # redirect flags; production httpx does.
+        return client.get(url)
+
+
+def _safe_public_get(client: httpx.Client, url: str, *, max_redirects: int = 5) -> httpx.Response:
+    current = str(url or "").strip()
+    for _redirect_no in range(max(0, int(max_redirects)) + 1):
+        if not _is_fetchable_url(current):
+            raise RuntimeError(f"refusing to fetch non-public URL: {current}")
+        resp = _client_get_no_redirects(client, current)
+        status_code = int(getattr(resp, "status_code", 200) or 200)
+        if status_code not in {301, 302, 303, 307, 308}:
+            return resp
+        location = str(resp.headers.get("location") or "").strip()
+        if not location:
+            return resp
+        base_url = str(getattr(resp, "url", current) or current)
+        current = urljoin(base_url, location)
+    raise RuntimeError("too many redirects while fetching URL")
 
 
 def _parse_search_json(data: Any) -> list[dict[str, Any]]:
@@ -1081,19 +1282,134 @@ def _row_to_hit(row: Any) -> RagHit:
 
 
 def _term_candidates_from_text(text_value: str, *, limit: int = 24) -> list[str]:
-    seen: set[str] = set()
-    out: list[str] = []
-    for match in _CANDIDATE_RE.finditer(text_value or ""):
-        raw = match.group(0).strip(" .,:;!?()[]{}\"'")
-        if len(raw) < 2:
+    return _block_lookup_candidates_from_text(text_value, limit=limit)
+
+
+def _lookup_dictionary_entries_for_terms(
+    db: Session,
+    *,
+    terms: Iterable[str],
+    target_lang: str,
+    domain: str,
+    per_term_limit: int,
+    total_limit: int,
+    min_quality: float,
+    seen_entry_ids: set[str] | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    entries: list[dict[str, Any]] = []
+    errors: list[dict[str, Any]] = []
+    seen_ids = seen_entry_ids if seen_entry_ids is not None else set()
+    seen_terms: set[str] = set()
+    total_limit = max(1, min(80, int(total_limit)))
+    per_term_limit = max(1, min(8, int(per_term_limit)))
+    for term in terms:
+        clean = " ".join(str(term or "").strip().split())
+        norm = normalize_term(clean)
+        if not clean or not norm or norm in seen_terms:
             continue
-        if raw.lower() in {"the", "and", "you", "that", "this", "with", "have", "for"}:
+        seen_terms.add(norm)
+        try:
+            hits = lookup_dictionary_entries(
+                db,
+                term=clean,
+                source_lang="",
+                target_lang=target_lang,
+                domain=domain,
+                limit=per_term_limit,
+                min_quality=min_quality,
+                exact=True,
+            )
+        except Exception as e:
+            try:
+                db.rollback()
+            except Exception:
+                pass
+            errors.append(
+                {
+                    "term": clean,
+                    "error_type": type(e).__name__,
+                    "error": str(e)[:500],
+                }
+            )
+            break
+        for entry in hits:
+            entry_id = str(entry.get("id") or "")
+            if not entry_id or entry_id in seen_ids:
+                continue
+            seen_ids.add(entry_id)
+            entries.append(entry)
+            if len(entries) >= total_limit:
+                return entries, errors
+    return entries, errors
+
+
+def _context_card_norms(cards: Iterable[dict[str, Any]]) -> set[str]:
+    norms: set[str] = set()
+    for card in cards:
+        if not isinstance(card, dict):
             continue
-        norm = normalize_term(raw)
-        if not norm or norm in seen:
+        for value in [card.get("term"), *(card.get("aliases") or [])]:
+            norm = normalize_term(str(value or ""))
+            if norm:
+                norms.add(norm)
+    return norms
+
+
+def _rag_hit_to_local_context(hit: RagHit) -> dict[str, Any]:
+    return {
+        "source": "rag_knowledge_base",
+        "term": hit.term or hit.title,
+        "translation": hit.translation,
+        "domain": hit.domain,
+        "description": hit.description or hit.content,
+        "score": round(hit.score, 4),
+        "confidence": hit.confidence,
+        "status": hit.status,
+    }
+
+
+def _dictionary_card_to_local_context(card: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "source": "dictionary",
+        "term": str(card.get("term") or ""),
+        "translation": str(card.get("translation") or ""),
+        "alternatives": [str(x) for x in card.get("alternatives") or [] if str(x or "").strip()][:5],
+        "domain": str(card.get("domain") or ""),
+        "description": str(card.get("description") or ""),
+        "score": card.get("score"),
+        "confidence": card.get("confidence"),
+        "status": str(card.get("knowledge_status") or "dictionary_context"),
+    }
+
+
+def _compact_local_context_for_gate(items: Iterable[dict[str, Any]], *, limit: int = 40) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for item in items:
+        if not isinstance(item, dict):
             continue
-        seen.add(norm)
-        out.append(raw)
+        term = str(item.get("term") or "").strip()
+        translation = str(item.get("translation") or "").strip()
+        norm = normalize_term(term)
+        if not norm or not translation:
+            continue
+        key = (str(item.get("source") or ""), norm)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(
+            {
+                "source": str(item.get("source") or "")[:60],
+                "term": term[:160],
+                "translation": translation[:160],
+                "alternatives": [str(x)[:120] for x in item.get("alternatives") or [] if str(x or "").strip()][:5],
+                "domain": str(item.get("domain") or "")[:120],
+                "description": str(item.get("description") or "")[:400],
+                "score": item.get("score"),
+                "confidence": item.get("confidence"),
+                "status": str(item.get("status") or "")[:80],
+            }
+        )
         if len(out) >= limit:
             break
     return out
@@ -1269,6 +1585,7 @@ def pretranslation_rag_gate_openai(
     target_lang: str,
     domain_hint: str,
     existing_terms: list[dict[str, Any]] | None = None,
+    local_context: list[dict[str, Any]] | None = None,
     previous_summary: str = "",
     config: OpenAIChatConfig,
     client: httpx.Client | None = None,
@@ -1287,6 +1604,7 @@ def pretranslation_rag_gate_openai(
         for item in (existing_terms or [])[:20]
         if isinstance(item, dict)
     ]
+    compact_local_context = _compact_local_context_for_gate(local_context or [], limit=40)
     data = request_openai_json_object(
         config=config,
         system_prompt="You are a pre-translation RAG gate. Return ONLY valid JSON.",
@@ -1310,10 +1628,16 @@ def pretranslation_rag_gate_openai(
             "common_word, local_variable, unit_or_number, full_sentence, generic_action, greeting。\n"
             "scope 只能使用：global, series, task, none。\n"
             "need_rag 表示是否需要本地 RAG/上下文辅助；need_search 表示本地未命中时是否值得外部搜索。\n"
+            "如果“已有本地上下文 JSON”里的 RAG 或词典命中与当前字幕 block 和前文摘要贴切，"
+            "应优先复用该译法/解释；这种情况下不需要外部搜索，need_search=false。"
+            "如果本地上下文已经足够支持直接翻译，也可以不返回该词。\n"
+            "只有当本地上下文缺失、明显不贴合、或仍无法判断固定译法时，才把 need_search 设为 true。\n"
             "如果你认为没有值得查的词，返回空数组。不要为了凑数返回基础词。返回数量不设上限，但必须是高价值项。\n\n"
             f"目标语言：{target_lang or 'zh'}\n"
             f"领域提示：{domain_hint or '未知'}\n"
-            f"已有本地命中 JSON：\n{json.dumps(compact_existing, ensure_ascii=False)}\n\n"
+            f"已有 RAG 术语命中 JSON：\n{json.dumps(compact_existing, ensure_ascii=False)}\n\n"
+            f"已有本地上下文 JSON（来自 RAG 知识库或已导入词典）：\n"
+            f"{json.dumps(compact_local_context, ensure_ascii=False)}\n\n"
             f"上下文：\n{llm_context}\n\n"
             '输出 JSON：{"terms":[{"term":"","category":"","domain":"","need_rag":true,'
             '"need_search":true,"scope":"global","priority":0.0,"reason":""}]}'
@@ -1779,7 +2103,7 @@ def fetch_search_evidence(
                 if url and url in selected_urls and _is_fetchable_url(url) and fetched_count < max(1, min(6, int(max_pages))):
                     started = time.perf_counter()
                     try:
-                        page_resp = client.get(url)
+                        page_resp = _safe_public_get(client, url)
                         page_resp.raise_for_status()
                         ctype = page_resp.headers.get("content-type", "").lower()
                         body = page_resp.text[:500_000]
@@ -2047,7 +2371,7 @@ def fetch_url_evidence(
             follow_redirects=True,
             headers={"User-Agent": "VideoRoll-RAG-Agent/1.0", "Accept": "text/html, text/plain;q=0.9,*/*;q=0.8"},
         ) as client:
-            resp = client.get(clean_url)
+            resp = _safe_public_get(client, clean_url)
             resp.raise_for_status()
             ctype = resp.headers.get("content-type", "").lower()
             body = resp.text[:500_000]
@@ -2097,6 +2421,7 @@ def research_agent_next_action_openai(
     domain_hint: str,
     available_tools: list[str],
     available_tool_specs: list[dict[str, Any]] | None = None,
+    active_skills: list[dict[str, Any]] | None = None,
     observations: list[dict[str, Any]],
     evidence: list[dict[str, Any]],
     config: OpenAIChatConfig,
@@ -2123,12 +2448,17 @@ def research_agent_next_action_openai(
             "目标：找到术语在当前字幕上下文中最贴切的含义和中文译法，并收集足够证据。\n\n"
             "可用工具：\n"
             "- rag_lookup: 查询本地知识库是否已有该术语。输入 term。\n"
+            "- dictionary_lookup: 查询已导入词典/术语库。输入 term，可选 source_lang/target_lang。\n"
             "- wiki_search: 查询 English Wikipedia。输入 query。\n"
             "- search_web: 调用配置的 SearXNG 搜索。输入 query。\n"
             "- fetch_url: 打开一个 URL 抽取正文。输入 url。\n"
             "- finish: 认为证据足够或无需继续。\n\n"
+            "可用 Skill：\n"
+            "- Skill 是可运行的能力包：它会给你额外 instructions/resources，并可能限制推荐工具。\n"
+            "- 如果某一步是按某个 Skill 执行，请在输出里填写 skill_name。\n\n"
             "决策要求：\n"
             "- 不要一开始机械调用所有工具；根据 observation 判断下一步。\n"
+            "- 如果是普通词义或导入术语表可能覆盖的固定译法，优先 dictionary_lookup。\n"
             "- Wikipedia 不足、无中文译名支撑、或上下文不一致时，应继续 search_web 或 fetch_url。\n"
             "- 如果本地知识库已命中，通常 finish。\n"
             "- 如果证据明显和字幕无关，也可以 finish 并说明无法入库。\n"
@@ -2139,16 +2469,17 @@ def research_agent_next_action_openai(
             f"领域提示: {domain_hint or '未知'}\n"
             f"可用工具: {json.dumps(available_tools, ensure_ascii=False)}\n\n"
             f"工具 schema JSON:\n{json.dumps(available_tool_specs or [], ensure_ascii=False)[:5000]}\n\n"
+            f"active skills JSON:\n{json.dumps(active_skills or [], ensure_ascii=False)[:7000]}\n\n"
             f"字幕上下文:\n{context[:2600]}\n\n"
             f"observations JSON:\n{json.dumps(compact_observations, ensure_ascii=False)[:5000]}\n\n"
             f"evidence JSON:\n{json.dumps(compact_evidence, ensure_ascii=False)[:5000]}\n\n"
-            '输出 JSON：{"action":"rag_lookup|wiki_search|search_web|fetch_url|finish",'
-            '"query":"","url":"","reason":"","final_answer_ready":false}'
+            '输出 JSON：{"action":"rag_lookup|dictionary_lookup|wiki_search|search_web|fetch_url|finish",'
+            '"query":"","url":"","skill_name":"","reason":"","final_answer_ready":false}'
         ),
         client=client,
     )
     action = str(data.get("action") or "").strip()
-    if action not in {"rag_lookup", "wiki_search", "search_web", "fetch_url", "finish"}:
+    if action not in {"rag_lookup", "dictionary_lookup", "wiki_search", "search_web", "fetch_url", "finish"}:
         action = "finish"
     decision = validate_model(
         AgentDecision,
@@ -2156,6 +2487,7 @@ def research_agent_next_action_openai(
             "action": action,
             "query": str(data.get("query") or "").strip()[:240],
             "url": str(data.get("url") or "").strip()[:1000],
+            "skill_name": str(data.get("skill_name") or "").strip()[:120],
             "reason": str(data.get("reason") or "").strip()[:1000],
             "final_answer_ready": _json_bool(data.get("final_answer_ready")),
         },
@@ -2191,11 +2523,13 @@ def _collect_evidence_with_tool_agent(
     chat_config: OpenAIChatConfig,
     llm_context: str,
     search_queries: list[str],
+    active_skills: list[AgentSkill] | None = None,
     max_steps: int = 6,
 ) -> tuple[list[dict[str, Any]], list[str], int]:
+    active_skills = active_skills or []
     tool_registry = _research_tool_registry(rag_settings)
-    available_tool_specs = _ordered_tool_specs(tool_registry)
-    available_tools = [str(spec.get("name") or "") for spec in available_tool_specs if str(spec.get("name") or "")]
+    available_tool_specs, available_tools = _tool_specs_for_active_skills(tool_registry, active_skills)
+    active_skill_payloads = _active_skill_payloads(active_skills)
 
     observations: list[dict[str, Any]] = []
     evidence: list[dict[str, Any]] = []
@@ -2216,10 +2550,19 @@ def _collect_evidence_with_tool_agent(
             output={
                 "available_tools": available_tools,
                 "tool_specs": available_tool_specs,
+                "active_skills": [skill.summary() for skill in active_skills],
                 "budget": runtime.budget.model_dump(),
             },
         )
     )
+    for skill in active_skills:
+        runtime.record(
+            AgentTraceEvent(
+                kind="agent",
+                action="skill_activated",
+                output=skill.summary(),
+            )
+        )
     runtime.record(
         AgentTraceEvent(
             kind="agent",
@@ -2240,6 +2583,7 @@ def _collect_evidence_with_tool_agent(
                 domain_hint=domain_hint,
                 available_tools=available_tools,
                 available_tool_specs=available_tool_specs,
+                active_skills=active_skill_payloads,
                 observations=observations,
                 evidence=evidence,
                 config=chat_config,
@@ -2254,6 +2598,7 @@ def _collect_evidence_with_tool_agent(
                     "term": term,
                     "step_no": step_no,
                     "available_tools": available_tools,
+                    "active_skills": [skill.name for skill in active_skills],
                     "observation_count": len(observations),
                     "evidence_count": len(evidence),
                 },
@@ -2274,7 +2619,7 @@ def _collect_evidence_with_tool_agent(
             )
             break
         except Exception as e:
-            decision = {"action": "finish", "query": "", "url": "", "reason": f"tool decision failed: {e}", "final_answer_ready": False}
+            decision = {"action": "finish", "query": "", "url": "", "skill_name": "", "reason": f"tool decision failed: {e}", "final_answer_ready": False}
             _append_llm_step(
                 db,
                 agent_run_id,
@@ -2286,9 +2631,14 @@ def _collect_evidence_with_tool_agent(
 
         action = str(decision.get("action") or "finish")
         reason = str(decision.get("reason") or "")
+        skill_name = str(decision.get("skill_name") or "").strip()
         if action == "finish":
-            observations.append({"action": "finish", "reason": reason, "evidence_count": len(evidence)})
-            _append_agent_step(db, agent_run_id, {"kind": "agent", "action": "agent_finish_decision", "reason": reason, "evidence_count": len(evidence)})
+            observations.append({"action": "finish", "reason": reason, "skill_name": skill_name, "evidence_count": len(evidence)})
+            _append_agent_step(
+                db,
+                agent_run_id,
+                {"kind": "agent", "action": "agent_finish_decision", "skill_name": skill_name, "reason": reason, "evidence_count": len(evidence)},
+            )
             runtime.record(
                 AgentTraceEvent(
                     kind="agent",
@@ -2316,11 +2666,11 @@ def _collect_evidence_with_tool_agent(
             used_actions.add(action)
             norm_value = normalize_term(term)
             exists = norm_value in existing_term_norms(db, terms=[term], target_lang=target_lang)
-            observations.append({"action": "rag_lookup", "term": term, "exists": exists, "normalized_term": norm_value})
+            observations.append({"action": "rag_lookup", "term": term, "skill_name": skill_name, "exists": exists, "normalized_term": norm_value})
             _append_agent_step(
                 db,
                 agent_run_id,
-                {"kind": "tool", "action": "rag_lookup", "tool": "rag_lookup", "term": term, "exists": exists, "ok": True},
+                {"kind": "tool", "action": "rag_lookup", "tool": "rag_lookup", "skill_name": skill_name, "term": term, "exists": exists, "ok": True},
             )
             if exists:
                 runtime.record(
@@ -2331,6 +2681,64 @@ def _collect_evidence_with_tool_agent(
                     )
                 )
                 break
+            continue
+
+        if action == "dictionary_lookup" and rag_settings.dictionary_enabled:
+            try:
+                runtime.before_tool("dictionary_lookup")
+            except AgentBudgetExceeded as e:
+                runtime.record(
+                    AgentTraceEvent(
+                        kind="policy",
+                        action="agent_budget_exceeded",
+                        status="failed",
+                        error_type=type(e).__name__,
+                        error=str(e),
+                    )
+                )
+                break
+            tools_used.append("dictionary")
+            used_actions.add(action)
+            try:
+                dictionary_hits = lookup_dictionary_entries(
+                    db,
+                    term=term,
+                    source_lang="",
+                    target_lang=target_lang,
+                    domain=domain_hint,
+                    limit=rag_settings.dictionary_top_k,
+                    min_quality=rag_settings.dictionary_min_quality,
+                    exact=True,
+                )
+            except Exception as e:
+                db.rollback()
+                dictionary_hits = []
+                observations.append({"action": action, "term": term, "skill_name": skill_name, "error": str(e)[:300]})
+            dictionary_evidence = dictionary_entries_to_evidence(dictionary_hits)
+            evidence = _dedupe_evidence([*evidence, *dictionary_evidence])
+            observations.append(
+                {
+                    "action": action,
+                    "term": term,
+                    "skill_name": skill_name,
+                    "count": len(dictionary_hits),
+                    "total_evidence": len(evidence),
+                }
+            )
+            _append_agent_step(
+                db,
+                agent_run_id,
+                {
+                    "kind": "tool",
+                    "action": "dictionary_lookup",
+                    "tool": "dictionary_lookup",
+                    "skill_name": skill_name,
+                    "term": term,
+                    "count": len(dictionary_hits),
+                    "results": dictionary_hits[:8],
+                    "ok": True,
+                },
+            )
             continue
 
         query = str(decision.get("query") or "").strip()
@@ -2349,7 +2757,7 @@ def _collect_evidence_with_tool_agent(
             used_actions.add(action)
             extra = fetch_wikipedia_evidence(term, domain=domain_hint, queries=[query], db=db, agent_run_id=agent_run_id)
             evidence = _dedupe_evidence([*evidence, *extra])
-            observations.append({"action": action, "query": query, "count": len(extra), "total_evidence": len(evidence)})
+            observations.append({"action": action, "query": query, "skill_name": skill_name, "count": len(extra), "total_evidence": len(evidence)})
             continue
 
         if action == "search_web" and rag_settings.search_enabled:
@@ -2381,7 +2789,7 @@ def _collect_evidence_with_tool_agent(
                 agent_run_id=agent_run_id,
             )
             evidence = _dedupe_evidence([*evidence, *extra])
-            observations.append({"action": action, "query": query, "count": len(extra), "total_evidence": len(evidence)})
+            observations.append({"action": action, "query": query, "skill_name": skill_name, "count": len(extra), "total_evidence": len(evidence)})
             if not extra:
                 empty_search_count += 1
                 if empty_search_count >= 2:
@@ -2423,10 +2831,10 @@ def _collect_evidence_with_tool_agent(
             page = fetch_url_evidence(url=url, db=db, agent_run_id=agent_run_id) if url else None
             if page:
                 evidence = _dedupe_evidence([*evidence, page])
-            observations.append({"action": action, "url": url, "ok": bool(page), "total_evidence": len(evidence)})
+            observations.append({"action": action, "url": url, "skill_name": skill_name, "ok": bool(page), "total_evidence": len(evidence)})
             continue
 
-        observations.append({"action": action, "reason": f"tool unavailable or disabled: {action}"})
+        observations.append({"action": action, "skill_name": skill_name, "reason": f"tool unavailable or disabled: {action}"})
 
     # Safety fallback: if the model stopped too early, try enabled tools once.
     if not evidence:
@@ -2437,10 +2845,27 @@ def _collect_evidence_with_tool_agent(
                 output={"reason": "no evidence collected in tool loop", "used_actions": sorted(used_actions)},
             )
         )
-        if rag_settings.wiki_enabled and "wiki_search" not in used_actions:
+        if rag_settings.dictionary_enabled and "dictionary_lookup" in available_tools and "dictionary_lookup" not in used_actions:
+            tools_used.append("dictionary")
+            try:
+                dictionary_hits = lookup_dictionary_entries(
+                    db,
+                    term=term,
+                    source_lang="",
+                    target_lang=target_lang,
+                    domain=domain_hint,
+                    limit=rag_settings.dictionary_top_k,
+                    min_quality=rag_settings.dictionary_min_quality,
+                    exact=True,
+                )
+            except Exception:
+                db.rollback()
+                dictionary_hits = []
+            evidence = _dedupe_evidence(dictionary_entries_to_evidence(dictionary_hits))
+        if not evidence and rag_settings.wiki_enabled and "wiki_search" in available_tools and "wiki_search" not in used_actions:
             tools_used.append("wikipedia")
             evidence = _dedupe_evidence(fetch_wikipedia_evidence(term, domain=domain_hint, queries=search_queries, db=db, agent_run_id=agent_run_id))
-        if not evidence and rag_settings.search_enabled and "search_web" not in used_actions:
+        if not evidence and rag_settings.search_enabled and "search_web" in available_tools and "search_web" not in used_actions:
             tools_used.append("search")
             evidence = _dedupe_evidence(
                 fetch_search_evidence(
@@ -2947,6 +3372,7 @@ def _research_discovered_term(
     previous_summary: str,
     existing_term_cards: list[dict[str, Any]],
     gate_duration_ms: int | None,
+    skill_registry: SkillRegistry | None = None,
     parent_agent_run_id: str | None = None,
     task_id: str | None = None,
     subtitle_job_id: str | None = None,
@@ -3007,6 +3433,24 @@ def _research_discovered_term(
         agent_run_id = None
 
     research_policy = should_research_term(term, domain=domain_hint, context=text_value, gate_item=item)
+    active_skills: list[AgentSkill] = []
+    if rag_settings.agent_skills_enabled:
+        try:
+            registry = skill_registry or load_agent_skill_registry(rag_settings)
+            active_skills = registry.select(term=term, domain=domain_hint or rag_settings.domain, context=llm_context, limit=4)
+        except Exception:
+            active_skills = []
+    if active_skills:
+        _append_agent_step(
+            db,
+            agent_run_id,
+            {
+                "kind": "agent",
+                "action": "skills_selected",
+                "term": term,
+                "skills": [skill.summary() for skill in active_skills],
+            },
+        )
     _append_agent_step(
         db,
         agent_run_id,
@@ -3232,6 +3676,7 @@ def _research_discovered_term(
         chat_config=chat_config,
         llm_context=llm_context,
         search_queries=search_queries,
+        active_skills=active_skills,
         max_steps=6,
     )
     tools_used.extend(agent_tools_used)
@@ -3353,7 +3798,8 @@ def _research_discovered_term(
             )
             return None
 
-        valid_sources = _valid_external_evidence(evidence, search_url=rag_settings.search_url)
+        promotion_evidence = evidence if rag_settings.dictionary_auto_promote else [item for item in evidence if item.get("tool") != "dictionary_lookup"]
+        valid_sources = _valid_external_evidence(promotion_evidence, search_url=rag_settings.search_url)
         _append_state_transition(
             db,
             agent_run_id,
@@ -3618,6 +4064,7 @@ def _run_research_agent(
     previous_summary: str,
     existing_term_cards: list[dict[str, Any]],
     gate_duration_ms: int | None,
+    skill_registry: SkillRegistry | None = None,
     parent_agent_run_id: str | None = None,
     task_id: str | None = None,
     subtitle_job_id: str | None = None,
@@ -3635,6 +4082,7 @@ def _run_research_agent(
             previous_summary=previous_summary,
             existing_term_cards=existing_term_cards,
             gate_duration_ms=gate_duration_ms,
+            skill_registry=skill_registry,
             parent_agent_run_id=parent_agent_run_id,
             task_id=task_id,
             subtitle_job_id=subtitle_job_id,
@@ -3653,6 +4101,7 @@ def _run_research_agent(
             previous_summary=previous_summary,
             existing_term_cards=existing_term_cards,
             gate_duration_ms=gate_duration_ms,
+            skill_registry=skill_registry,
             parent_agent_run_id=parent_agent_run_id,
             task_id=task_id,
             subtitle_job_id=subtitle_job_id,
@@ -3675,6 +4124,7 @@ def _run_research_agents(
     previous_summary: str,
     existing_term_cards: list[dict[str, Any]],
     gate_duration_ms: int | None,
+    skill_registry: SkillRegistry | None = None,
     parent_agent_run_id: str | None = None,
     task_id: str | None = None,
     subtitle_job_id: str | None = None,
@@ -3704,6 +4154,7 @@ def _run_research_agents(
                 previous_summary=previous_summary,
                 existing_term_cards=existing_term_cards,
                 gate_duration_ms=gate_duration_ms,
+                skill_registry=skill_registry,
                 parent_agent_run_id=parent_agent_run_id,
                 task_id=task_id,
                 subtitle_job_id=subtitle_job_id,
@@ -3731,6 +4182,7 @@ def _run_research_agents(
                 previous_summary=previous_summary,
                 existing_term_cards=existing_term_cards,
                 gate_duration_ms=gate_duration_ms,
+                skill_registry=skill_registry,
                 parent_agent_run_id=parent_agent_run_id,
                 task_id=task_id,
                 subtitle_job_id=subtitle_job_id,
@@ -3773,6 +4225,11 @@ def build_rag_context(
     if not text_value:
         return RagContext(term_cards=[], knowledge_cards=[], hits=[])
     llm_context = _context_for_llm(text_value, previous_summary=previous_summary, limit=9000)
+    try:
+        skill_registry = load_agent_skill_registry(rag_settings)
+    except Exception:
+        skill_registry = SkillRegistry(())
+    skill_summaries = skill_registry.summaries()
     master_agent_run_id: str | None = None
     try:
         master_agent_run_id = _start_agent_run(
@@ -3799,6 +4256,11 @@ def build_rag_context(
                     "search": bool(rag_settings.search_enabled),
                     "fetch_url": True,
                 },
+                "skills": {
+                    "enabled": bool(rag_settings.agent_skills_enabled),
+                    "available_count": len(skill_summaries),
+                    "available": skill_summaries[:20],
+                },
             },
         )
         _append_state_transition(
@@ -3822,6 +4284,12 @@ def build_rag_context(
     gate_norms: set[str] = set()
     gate_duration_ms: int | None = None
     existing_gate_terms: list[dict[str, Any]] = []
+    dictionary_context_cards: list[dict[str, Any]] = []
+    dictionary_entry_ids: set[str] = set()
+    dictionary_card_norms: set[str] = set()
+    local_context_items: list[dict[str, Any]] = []
+    local_lookup_terms = _block_lookup_candidates_from_text(text_value, limit=96)
+    local_lookup_norms = {normalize_term(term) for term in local_lookup_terms if normalize_term(term)}
 
     exact_hits = retrieval.run_stage(
         "retrieval_exact_terms",
@@ -3831,7 +4299,7 @@ def build_rag_context(
             text_value=text_value,
             target_lang=target_lang,
             domain=rag_settings.domain,
-            limit=max(rag_settings.top_k * 2, 10),
+            limit=max(rag_settings.top_k * 4, 50),
         ),
     )
     for hit in exact_hits:
@@ -3844,6 +4312,7 @@ def build_rag_context(
                     "score": round(hit.score, 4),
                 }
             )
+            local_context_items.append(_rag_hit_to_local_context(hit))
     if existing_gate_terms:
         _append_agent_step(
             db,
@@ -3857,6 +4326,36 @@ def build_rag_context(
                 "ok": True,
             },
         )
+    if rag_settings.dictionary_enabled and rag_settings.dictionary_top_k > 0:
+        dictionary_total_limit = max(1, min(50, max(rag_settings.dictionary_top_k, rag_settings.dictionary_top_k * 4)))
+        dictionary_entries, dictionary_errors = _lookup_dictionary_entries_for_terms(
+            db,
+            terms=local_lookup_terms,
+            target_lang=target_lang,
+            domain=rag_settings.domain,
+            per_term_limit=max(1, min(3, rag_settings.dictionary_top_k)),
+            total_limit=dictionary_total_limit,
+            min_quality=rag_settings.dictionary_min_quality,
+            seen_entry_ids=dictionary_entry_ids,
+        )
+        dictionary_context_cards = dictionary_entries_to_context_cards(dictionary_entries)
+        dictionary_card_norms = _context_card_norms(dictionary_context_cards)
+        local_context_items.extend(_dictionary_card_to_local_context(card) for card in dictionary_context_cards)
+        if dictionary_context_cards or dictionary_errors:
+            _append_agent_step(
+                db,
+                master_agent_run_id,
+                {
+                    "kind": "tool",
+                    "action": "master_dictionary_block_lookup",
+                    "tool": "dictionary_lookup",
+                    "term_count": len(local_lookup_terms),
+                    "count": len(dictionary_context_cards),
+                    "results": dictionary_context_cards[:10],
+                    "errors": dictionary_errors[:3],
+                    "ok": not dictionary_errors,
+                },
+            )
     hits: list[RagHit] = retrieval.hits
     seen_ids: set[str] = {hit.id for hit in hits}
     _append_state_transition(
@@ -3876,6 +4375,7 @@ def build_rag_context(
                 target_lang=target_lang,
                 domain_hint=rag_settings.domain,
                 existing_terms=existing_gate_terms,
+                local_context=local_context_items,
                 previous_summary=previous_summary,
                 config=chat_config,
             )
@@ -3891,6 +4391,8 @@ def build_rag_context(
                     "context_excerpt": text_value[:500],
                     "previous_summary": str(previous_summary or "")[:500],
                     "existing_hit_count": len(existing_gate_terms),
+                    "local_context_count": len(local_context_items),
+                    "dictionary_context_count": len(dictionary_context_cards),
                 },
                 output_value={"terms": gate_terms},
                 duration_ms=_duration_ms(gate_started),
@@ -3930,6 +4432,47 @@ def build_rag_context(
                 if isinstance(item, dict) and str(item.get("term") or "").strip()
             ]
         )
+    if rag_settings.dictionary_enabled and rag_settings.dictionary_top_k > 0 and gate_terms:
+        gate_dictionary_terms = [
+            str(item.get("term") or "").strip()
+            for item in gate_terms
+            if (
+                isinstance(item, dict)
+                and str(item.get("term") or "").strip()
+                and normalize_term(str(item.get("term") or "")) not in local_lookup_norms
+            )
+        ]
+        remaining_dictionary_limit = max(0, min(50, rag_settings.dictionary_top_k * 4) - len(dictionary_context_cards))
+        if gate_dictionary_terms and remaining_dictionary_limit > 0:
+            extra_entries, dictionary_errors = _lookup_dictionary_entries_for_terms(
+                db,
+                terms=gate_dictionary_terms,
+                target_lang=target_lang,
+                domain=rag_settings.domain,
+                per_term_limit=max(1, min(3, rag_settings.dictionary_top_k)),
+                total_limit=remaining_dictionary_limit,
+                min_quality=rag_settings.dictionary_min_quality,
+                seen_entry_ids=dictionary_entry_ids,
+            )
+            extra_cards = dictionary_entries_to_context_cards(extra_entries)
+            if extra_cards:
+                dictionary_context_cards.extend(extra_cards)
+                dictionary_card_norms.update(_context_card_norms(extra_cards))
+                local_context_items.extend(_dictionary_card_to_local_context(card) for card in extra_cards)
+            _append_agent_step(
+                db,
+                master_agent_run_id,
+                {
+                    "kind": "tool",
+                    "action": "master_dictionary_gate_lookup",
+                    "tool": "dictionary_lookup",
+                    "term_count": len(gate_dictionary_terms),
+                    "count": len(extra_cards),
+                    "results": extra_cards[:10],
+                    "errors": dictionary_errors[:3],
+                    "ok": not dictionary_errors,
+                },
+            )
     if rag_query_text.strip():
         def _vector_lookup() -> list[RagHit]:
             query_embedding = embed_text(rag_query_text[:8000], settings=embedding_settings)
@@ -3963,11 +4506,12 @@ def build_rag_context(
         metadata={"hit_count": len(hits), "stage_count": len(retrieval.stages)},
     )
 
-    context_only_cards: list[dict[str, Any]] = []
+    context_only_cards: list[dict[str, Any]] = list(dictionary_context_cards)
     subagent_count = 0
 
     if rag_settings.auto_discover_terms:
         known_norms = {normalize_term(h.term) for h in hits if h.term}
+        known_norms.update(dictionary_card_norms)
         existing_term_cards = [
             {
                 "term": hit.term,
@@ -4005,10 +4549,40 @@ def build_rag_context(
         ]
         known_norms.update(existing_term_norms(db, terms=discovered_terms, target_lang=target_lang))
         research_items: list[dict[str, Any]] = []
+        skipped_by_local_context = 0
+        skipped_by_policy = 0
         for item in discovered:
             term = str(item.get("term") or "").strip()
             norm = normalize_term(term)
             if not term or norm in known_norms:
+                if term and norm in known_norms:
+                    skipped_by_local_context += 1
+                continue
+            domain_hint = str(item.get("domain") or rag_settings.domain or "").strip()
+            research_policy = should_research_term(term, domain=domain_hint, context=text_value, gate_item=item)
+            if not research_policy.get("should_research") or not bool(research_policy.get("need_search", True)):
+                skipped_by_policy += 1
+                context_card: dict[str, Any] | None = None
+                if research_policy.get("category") == "context_only" and research_policy.get("translation"):
+                    context_card = _context_only_term_card(term, research_policy, target_lang=target_lang, domain=domain_hint)
+                else:
+                    hint = str(item.get("translation") or item.get("translation_hint") or "").strip()
+                    if hint:
+                        context_card = {
+                            "term": term,
+                            "translation": hint,
+                            "domain": domain_hint,
+                            "aliases": [],
+                            "description": str(item.get("reason") or research_policy.get("reason") or "").strip(),
+                            "confidence": float(item.get("priority") or 0.0) or 0.7,
+                            "score": float(item.get("priority") or 0.0) or 0.7,
+                            "sources": [],
+                            "target_lang": target_lang,
+                            "status": str(research_policy.get("scope") or "task_context"),
+                        }
+                if context_card:
+                    context_only_cards.append(context_card)
+                    known_norms.add(norm)
                 continue
             if not rag_settings.auto_learn_terms:
                 continue
@@ -4023,6 +4597,8 @@ def build_rag_context(
                 "action": "master_dispatch_subagents",
                 "candidate_count": len(discovered),
                 "research_count": len(research_items),
+                "skipped_by_local_context": skipped_by_local_context,
+                "skipped_by_policy": skipped_by_policy,
                 "terms": [str(item.get("term") or "") for item in research_items[:20] if isinstance(item, dict)],
                 "parallelism": rag_settings.agent_parallelism,
             },
@@ -4048,6 +4624,7 @@ def build_rag_context(
             previous_summary=previous_summary,
             existing_term_cards=existing_term_cards,
             gate_duration_ms=gate_duration_ms,
+            skill_registry=skill_registry,
             parent_agent_run_id=master_agent_run_id,
             task_id=task_id,
             subtitle_job_id=subtitle_job_id,
