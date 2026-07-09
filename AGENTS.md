@@ -1,7 +1,7 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-`src/videoroll/` is the Python 3.12 backend. `apps/monolith` exposes `/api`; `apps/subtitle_service` owns ASR, translation, render queues, and the RAG Agent runtime; `apps/youtube_ingest` and `apps/bilibili_publisher` handle ingest and publishing. Shared config, DB, storage, AI, and utilities live in `config.py`, `db/`, `storage/`, `ai/`, and `utils/`. `src/web/` is React 18 + Vite + Tailwind, with pages, helpers, and tests in `src/web/src/pages/`. Backend tests are `tests/test_*.py`. Specs live in `docs/PROJECT_SPEC.md`; local state lives in `data/`. Avoid casual edits to vendored `biliup-master/` and `bilibili-API-collect-main/`.
+`src/videoroll/` is the Python 3.12 backend. `apps/monolith` exposes `/api`; `apps/subtitle_service` owns ASR, translation, render queues, and the RAG Agent runtime; `apps/youtube_ingest` and `apps/bilibili_publisher` handle ingest and publishing. Shared config, DB, storage, AI, and utilities live in `config.py`, `db/`, `storage/`, `ai/`, and `utils/`. `src/web/` is React 18 + Vite + Tailwind, with pages, helpers, and tests in `src/web/src/pages/`. Backend tests are `tests/test_*.py`. Docs live in `docs/`; local state in `data/`. Avoid casual edits to vendored `biliup-master/` and `bilibili-API-collect-main/`.
 
 ## Build, Test, and Development Commands
 Compose starts `app`, `web`, Redis, and MinIO. PostgreSQL 16+ is external; configure `DATABASE_URL`.
