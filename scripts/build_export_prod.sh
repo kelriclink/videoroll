@@ -22,9 +22,8 @@ set +a
 
 DOCKER_BIN="${DOCKER_BIN:-docker}"
 if ! "$DOCKER_BIN" info >/dev/null 2>&1; then
-  if command -v sudo >/dev/null 2>&1; then
-    DOCKER_BIN="sudo docker"
-  fi
+  echo "docker daemon not reachable via '$DOCKER_BIN'. Set DOCKER_BIN or DOCKER_HOST env to override." >&2
+  exit 1
 fi
 
 docker_run() {
