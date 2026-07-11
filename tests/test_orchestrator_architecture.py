@@ -108,6 +108,16 @@ class OrchestratorArchitectureTests(unittest.TestCase):
             self.assertNotIn("orchestrator_api.main", source, path.as_posix())
             self.assertNotIn("orchestrator_api.routers", source, path.as_posix())
 
+    def test_application_factory_creates_distinct_apps_without_routes_missing(self) -> None:
+        from videoroll.apps.orchestrator_api.app import create_app
+
+        first = create_app(install_lifecycle=False)
+        second = create_app(install_lifecycle=False)
+
+        self.assertIsNot(first, second)
+        self.assertEqual(route_manifest(first), EXPECTED_ORCHESTRATOR_ROUTES)
+        self.assertEqual(route_manifest(second), EXPECTED_ORCHESTRATOR_ROUTES)
+
 
 if __name__ == "__main__":
     unittest.main()
