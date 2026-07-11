@@ -6,12 +6,14 @@ import { Button } from "../components/ui";
 import { fetchJson } from "../lib/http";
 import { BILIBILI_PUBLISHER_URL, ORCHESTRATOR_URL, SUBTITLE_SERVICE_URL } from "../lib/urls";
 import { Asset, PublishJob, SubtitleJob, Task } from "../lib/types";
-import { createTaskDetailPollPlan } from "./taskDetailPage.helpers";
+import { activeAccountsForPlatform, PublishPlatformSettings, SocialAccount } from "./settingsPublishPage.helpers";
+import { buildPublishActionPayload, createTaskDetailPollPlan, PublishPlatform, socialPublishBrowserUrl } from "./taskDetailPage.helpers";
 
 type SubtitleActionResponse = { job_id: string; status: string };
-type PublishResponse = { state: string; aid?: string | null; bvid?: string | null; response?: any };
+type PublishResponse = { state: string; platform?: string | null; aid?: string | null; bvid?: string | null; external_id?: string | null; external_url?: string | null; response?: any };
 type PublishMetaDraftResponse = { meta: any };
 type PublishMetaStoreResponse = { stored: boolean; key: string; meta?: any };
+type PublishPlatformSettingsResponse = { platforms: PublishPlatformSettings };
 type YouTubeMeta = {
   title: string;
   description: string;
@@ -148,8 +150,13 @@ export default function TaskDetailPage() {
   const [openaiKeySet, setOpenaiKeySet] = useState<boolean | null>(null);
 
   const [publishMetaText, setPublishMetaText] = useState<string>("{}");
+  const [publishPlatform, setPublishPlatform] = useState<PublishPlatform>("bilibili");
   const [publishVideoKey, setPublishVideoKey] = useState<string>("");
   const [publishCoverKey, setPublishCoverKey] = useState<string>("");
+  const [publishAccountId, setPublishAccountId] = useState<string>("");
+  const [publishSchedule, setPublishSchedule] = useState<string>("");
+  const [socialAccounts, setSocialAccounts] = useState<SocialAccount[]>([]);
+  const [publishPlatformSettings, setPublishPlatformSettings] = useState<PublishPlatformSettings | null>(null);
   const [coverFile, setCoverFile] = useState<File | null>(null);
   const [publishTypeidMode, setPublishTypeidMode] = useState<string>("ai_summary");
   const [publishTypeid, setPublishTypeid] = useState<number | "">("");
@@ -169,18 +176,22 @@ export default function TaskDetailPage() {
       if (!taskId) return;
       if (!opts?.silent) setError(null);
       try {
-        const [t, a, sj, pj, pr] = await Promise.all([
+        const [t, a, sj, pj, pr, accounts, platforms] = await Promise.all([
           fetchJson<Task>(`${ORCHESTRATOR_URL}/tasks/${taskId}`),
           fetchJson<Asset[]>(`${ORCHESTRATOR_URL}/tasks/${taskId}/assets`),
           fetchJson<SubtitleJob[]>(`${ORCHESTRATOR_URL}/tasks/${taskId}/subtitle_jobs`),
           fetchJson<PublishJob[]>(`${ORCHESTRATOR_URL}/tasks/${taskId}/publish_jobs`),
           fetchJson<PublishReview>(`${ORCHESTRATOR_URL}/tasks/${taskId}/publish_review`),
+          fetchJson<SocialAccount[]>(`${ORCHESTRATOR_URL}/settings/publish/social/accounts`),
+          fetchJson<PublishPlatformSettingsResponse>(`${ORCHESTRATOR_URL}/settings/publish/platforms`),
         ]);
         setTask(t);
         setAssets(a);
         setSubtitleJobs(sj);
         setPublishJobs(pj);
         setPublishReview(pr);
+        setSocialAccounts(accounts);
+        setPublishPlatformSettings(platforms.platforms);
       } catch (e: unknown) {
         if (!opts?.silent) setError(e instanceof Error ? e.message : String(e));
       }
@@ -222,7 +233,10 @@ export default function TaskDetailPage() {
   useEffect(() => {
     if (!taskId) return;
     setPublishVideoKey("");
+    setPublishPlatform("bilibili");
     setPublishCoverKey("");
+    setPublishAccountId("");
+    setPublishSchedule("");
     setCoverFile(null);
     setPublishTypeidMode("ai_summary");
     setPublishTypeid("");
@@ -244,6 +258,25 @@ export default function TaskDetailPage() {
       }
     })();
   }, [taskId, loadPublishDraft]);
+
+  useEffect(() => {
+    if (publishPlatform === "bilibili") {
+      setPublishAccountId("");
+      return;
+    }
+    const accounts = activeAccountsForPlatform(socialAccounts, publishPlatform).filter((account) => account.check_state === "valid");
+    setPublishAccountId((current) => (accounts.some((account) => account.id === current) ? current : accounts[0]?.id ?? ""));
+  }, [publishPlatform, socialAccounts]);
+
+  useEffect(() => {
+    if (!publishPlatformSettings || publishPlatformSettings[publishPlatform]) return;
+    const firstEnabled = (["bilibili", "douyin", "xiaohongshu", "kuaishou"] as PublishPlatform[]).find(
+      (platform) => publishPlatformSettings[platform],
+    );
+    if (firstEnabled) setPublishPlatform(firstEnabled);
+  }, [publishPlatform, publishPlatformSettings]);
+
+  const publishPlatformEnabled = Boolean(publishPlatformSettings?.[publishPlatform]);
 
   useEffect(() => {
     fetchJson<Array<{ name: string; path: string }>>(`${SUBTITLE_SERVICE_URL}/subtitle/models`)
@@ -433,9 +466,9 @@ export default function TaskDetailPage() {
     () => (subtitleJobs ?? []).filter((j) => j.status === "queued" || j.status === "running").length,
     [subtitleJobs],
   );
-  const failedPublishJobs = useMemo(() => (publishJobs ?? []).filter((j) => j.state === "failed").length, [publishJobs]);
+  const failedPublishJobs = useMemo(() => (publishJobs ?? []).filter((j) => j.state === "failed" || j.state === "unknown").length, [publishJobs]);
   const runningPublishJobs = useMemo(
-    () => (publishJobs ?? []).filter((j) => j.state === "submitting" || j.state === "submitted").length,
+    () => (publishJobs ?? []).filter((j) => j.state === "submitting").length,
     [publishJobs],
   );
   const workflowSteps = useMemo<WorkflowStep[]>(() => {
@@ -540,27 +573,36 @@ export default function TaskDetailPage() {
     }
   }
 
-  async function submitPublish(opts?: { skipReview?: boolean }) {
+  async function submitPublish(opts?: { skipReview?: boolean; forceRetry?: boolean; platform?: PublishPlatform; accountId?: string }) {
     if (!taskId) return;
     setBusy(true);
     setError(null);
     try {
       const meta = buildCurrentPublishMeta();
-      await savePublishMetaFile(meta);
+      const platform = opts?.platform ?? publishPlatform;
+      const accountId = opts?.accountId ?? publishAccountId;
+      if (!publishPlatformSettings?.[platform]) {
+        throw new Error(`投稿方式 ${platform} 尚未启用，请先到“投稿设置”勾选启用`);
+      }
+      if (platform === "bilibili") await savePublishMetaFile(meta);
+      const payload = buildPublishActionPayload({
+        platform,
+        accountId,
+        videoKey: publishVideoKey,
+        coverKey: publishCoverKey,
+        meta,
+        schedule: publishSchedule.replace("T", " "),
+        typeidMode: publishTypeidMode,
+        skipReview: Boolean(opts?.skipReview),
+        forceRetry: Boolean(opts?.forceRetry),
+      });
       const resp = await fetchJson<PublishResponse>(`${ORCHESTRATOR_URL}/tasks/${taskId}/actions/publish`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          account_id: null,
-          video_key: publishVideoKey || null,
-          cover_key: publishCoverKey || null,
-          typeid_mode: publishTypeidMode,
-          meta: null,
-          skip_review: Boolean(opts?.skipReview),
-        }),
+        body: JSON.stringify(payload),
       });
       await refresh();
-      toast({ kind: "success", title: "投稿任务已提交", message: `state=${resp.state} bvid=${resp.bvid ?? "-"}` });
+      toast({ kind: "success", title: "投稿任务已提交", message: `platform=${resp.platform ?? platform} state=${resp.state}` });
     } catch (e: unknown) {
       try {
         await refresh({ silent: true });
@@ -666,7 +708,7 @@ export default function TaskDetailPage() {
 
   const shouldPoll = useMemo(() => {
     const hasSubtitleInFlight = (subtitleJobs ?? []).some((j) => j.status === "queued" || j.status === "running");
-    const hasPublishInFlight = (publishJobs ?? []).some((j) => j.state === "submitting" || j.state === "submitted");
+    const hasPublishInFlight = (publishJobs ?? []).some((j) => j.state === "submitting");
     return hasSubtitleInFlight || hasPublishInFlight;
   }, [subtitleJobs, publishJobs]);
 
@@ -1472,9 +1514,39 @@ export default function TaskDetailPage() {
 
       {activeTab === "publish" ? (
       <div className="rounded border bg-white p-4">
-        <div className="text-sm font-semibold">Publish（Bilibili）</div>
+        <div className="text-sm font-semibold">投稿</div>
         <div className="mt-2 text-xs text-slate-500">
-          当后端 <span className="font-mono">BILIBILI_PUBLISH_MODE=mock</span> 时仅返回模拟结果；设置为 <span className="font-mono">web</span>（或任意非 mock）则走真实投稿（需先在 Settings · Bilibili 保存 Cookies 并测试登录）。
+          哔哩哔哩使用现有接口发布；抖音、小红书和快手由独立 SAU 无头浏览器服务发布。
+        </div>
+        <div className="mt-3 rounded border p-3">
+          <div className="mb-2 text-xs text-slate-500">平台策略</div>
+          <div className="flex flex-wrap gap-2">
+            {([
+              ["bilibili", "哔哩哔哩"],
+              ["douyin", "抖音"],
+              ["xiaohongshu", "小红书"],
+              ["kuaishou", "快手"],
+            ] as Array<[PublishPlatform, string]>).map(([platform, label]) => {
+              const enabled = Boolean(publishPlatformSettings?.[platform]);
+              return (
+                <button
+                  key={platform}
+                  type="button"
+                  disabled={!enabled}
+                  title={enabled ? `选择${label}` : `请先到投稿设置启用${label}`}
+                  onClick={() => setPublishPlatform(platform)}
+                  className={`rounded border px-3 py-2 text-sm disabled:cursor-not-allowed disabled:opacity-50 ${publishPlatform === platform && enabled ? "border-slate-900 bg-slate-900 text-white" : "hover:bg-slate-50"}`}
+                >
+                  {label}{enabled ? "" : "（未启用）"}
+                </button>
+              );
+            })}
+          </div>
+          {publishPlatformSettings && !Object.values(publishPlatformSettings).some(Boolean) ? (
+            <div className="mt-2 text-xs text-amber-700">
+              当前没有启用任何投稿方式，请先到 <Link className="underline" to="/settings/publish">投稿设置</Link> 勾选启用。
+            </div>
+          ) : null}
         </div>
         <div className="mt-3 grid gap-3 md:grid-cols-2">
           <label className="block">
@@ -1541,8 +1613,14 @@ export default function TaskDetailPage() {
           </button>
         </div>
 
+        {publishPlatform === "bilibili" ? (
+        <>
         <div className="mt-3 rounded border p-3">
-          <div className="text-xs text-slate-500">分区（tid/typeid）</div>
+          <div className="text-sm font-semibold text-slate-700">哔哩哔哩策略</div>
+          <div className="mt-1 text-xs text-slate-500">
+            当后端 <span className="font-mono">BILIBILI_PUBLISH_MODE=mock</span> 时仅返回模拟结果；真实投稿需先在投稿设置中保存 Cookies 并测试登录。
+          </div>
+          <div className="mt-3 text-xs text-slate-500">分区（tid/typeid）</div>
           <div className="mt-3 grid gap-2 md:grid-cols-2">
             <label className="block">
               <div className="mb-1 text-xs text-slate-600">typeid_mode</div>
@@ -1610,6 +1688,66 @@ export default function TaskDetailPage() {
             启用转载（开启=copyright=2；关闭=自制）
           </label>
         </div>
+        </>
+        ) : (
+          <div className="mt-3 rounded border p-3">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div className="text-sm font-semibold text-slate-700">SAU 浏览器发布策略</div>
+              {socialPublishBrowserUrl(publishPlatform) ? (
+                <button
+                  type="button"
+                  className="rounded border border-indigo-300 px-3 py-1.5 text-xs text-indigo-700 hover:bg-indigo-50"
+                  onClick={() => {
+                    const browserUrl = socialPublishBrowserUrl(publishPlatform);
+                    if (!browserUrl) return;
+                    window.open(
+                      new URL(browserUrl, window.location.origin).toString(),
+                      "social-publish-douyin",
+                      "popup,width=1280,height=860,resizable=yes,scrollbars=yes",
+                    );
+                  }}
+                >
+                  打开自动化窗口
+                </button>
+              ) : null}
+            </div>
+            <div className="mt-1 text-xs text-amber-700">
+              submitted 表示已执行提交但尚未取得平台作品 ID；unknown 表示结果不确定，请先到平台后台确认，避免重复投稿。
+            </div>
+            {publishPlatform === "douyin" ? (
+              <div className="mt-1 text-xs text-slate-500">
+                可先打开自动化窗口，再点击投稿；窗口会实时显示 worker 中的抖音浏览器上传和发布过程。
+              </div>
+            ) : null}
+            <div className="mt-3 grid gap-3 md:grid-cols-2">
+              <label className="block">
+                <div className="mb-1 text-xs text-slate-600">账号</div>
+                <select
+                  className="w-full rounded border px-3 py-2 text-sm"
+                  value={publishAccountId}
+                  onChange={(event) => setPublishAccountId(event.target.value)}
+                >
+                  <option value="">请选择已校验账号</option>
+                  {activeAccountsForPlatform(socialAccounts, publishPlatform)
+                    .filter((account) => account.check_state === "valid")
+                    .map((account) => (
+                      <option key={account.id} value={account.id}>{account.name}</option>
+                    ))}
+                </select>
+                <div className="mt-1 text-xs text-slate-500">账号需先在“投稿设置”中导入 storage_state JSON 并校验成功。</div>
+              </label>
+              <label className="block">
+                <div className="mb-1 text-xs text-slate-600">定时发布（可选）</div>
+                <input
+                  type="datetime-local"
+                  className="w-full rounded border px-3 py-2 text-sm"
+                  value={publishSchedule}
+                  onChange={(event) => setPublishSchedule(event.target.value)}
+                />
+              </label>
+            </div>
+          </div>
+        )}
 
         <div className="mt-3 rounded border p-3">
           <div className="text-xs text-slate-500">AI 审核</div>
@@ -1720,7 +1858,7 @@ export default function TaskDetailPage() {
                 格式化
               </button>
               <button
-                disabled={busy || !taskId}
+                disabled={busy || !taskId || publishPlatform !== "bilibili"}
                 className="rounded border px-2 py-1 text-xs hover:bg-slate-50 disabled:opacity-50"
                 onClick={async () => {
                   setBusy(true);
@@ -1749,7 +1887,7 @@ export default function TaskDetailPage() {
         </div>
         <div className="mt-3 flex items-center gap-2">
           <button
-            disabled={busy}
+            disabled={busy || !publishPlatformEnabled || (publishPlatform !== "bilibili" && !publishAccountId)}
             onClick={() => submitPublish()}
             className="rounded bg-slate-900 px-3 py-2 text-sm text-white hover:bg-slate-800 disabled:opacity-50"
           >
@@ -1757,7 +1895,7 @@ export default function TaskDetailPage() {
           </button>
           {publishReview?.enabled && publishReview.ok === false ? (
             <button
-              disabled={busy}
+              disabled={busy || !publishPlatformEnabled || (publishPlatform !== "bilibili" && !publishAccountId)}
               onClick={() => submitPublish({ skipReview: true })}
               className="rounded border border-amber-300 px-3 py-2 text-sm text-amber-800 hover:bg-amber-50 disabled:opacity-50"
             >
@@ -1779,11 +1917,16 @@ export default function TaskDetailPage() {
                 <thead className="text-xs text-slate-500">
                   <tr>
                     <th className="py-2 pr-3">ID</th>
+                    <th className="py-2 pr-3">Platform</th>
+                    <th className="py-2 pr-3">Account</th>
                     <th className="py-2 pr-3">State</th>
-                    <th className="py-2 pr-3">bvid</th>
+                    <th className="py-2 pr-3">External</th>
                     <th className="py-2 pr-3">tid</th>
                     <th className="py-2 pr-3">typeid</th>
                     <th className="py-2 pr-3">Error</th>
+                    <th className="py-2 pr-3">Started</th>
+                    <th className="py-2 pr-3">Finished</th>
+                    <th className="py-2 pr-3">Action</th>
                     <th className="py-2 pr-3">Updated</th>
                   </tr>
                 </thead>
@@ -1791,8 +1934,18 @@ export default function TaskDetailPage() {
                   {publishJobs.map((j) => (
                     <tr key={j.id} className="border-t">
                       <td className="py-2 pr-3 font-mono text-xs">{j.id.slice(0, 8)}</td>
-                      <td className="py-2 pr-3">{j.state}</td>
-                      <td className="py-2 pr-3 font-mono text-xs">{j.bvid ?? "-"}</td>
+                      <td className="py-2 pr-3">{j.platform ?? "bilibili"}</td>
+                      <td className="py-2 pr-3 font-mono text-xs">{j.account_id?.slice(0, 8) ?? "-"}</td>
+                      <td className={`py-2 pr-3 ${j.state === "unknown" || j.state === "submitted" ? "text-amber-700" : ""}`}>{j.state}</td>
+                      <td className="py-2 pr-3 font-mono text-xs">
+                        {j.external_url ? (
+                          <a className="underline" href={j.external_url} target="_blank" rel="noreferrer">
+                            {j.external_id ?? j.bvid ?? j.external_url}
+                          </a>
+                        ) : (
+                          j.external_id ?? j.bvid ?? "-"
+                        )}
+                      </td>
                       <td className="py-2 pr-3 font-mono text-xs">{j.tid ?? "-"}</td>
                       <td
                         className="py-2 pr-3 text-xs text-slate-600"
@@ -1817,6 +1970,31 @@ export default function TaskDetailPage() {
                         ) : (
                           <span className="text-xs text-slate-400">-</span>
                         )}
+                      </td>
+                      <td className="py-2 pr-3 text-xs text-slate-600">{j.started_at ? new Date(j.started_at).toLocaleString() : "-"}</td>
+                      <td className="py-2 pr-3 text-xs text-slate-600">{j.finished_at ? new Date(j.finished_at).toLocaleString() : "-"}</td>
+                      <td className="py-2 pr-3">
+                        {j.account_id && ["douyin", "xiaohongshu", "kuaishou"].includes(j.platform ?? "") && (j.state === "submitted" || j.state === "unknown") ? (
+                          <button
+                            className="rounded border border-amber-300 px-2 py-1 text-xs text-amber-800"
+                            onClick={async () => {
+                              const ok = await confirm({
+                                title: "确认后重试投稿",
+                                message: "请确认平台创作者后台没有对应作品。继续可能造成重复投稿。",
+                                confirmLabel: "确认重试",
+                                tone: "warning",
+                              });
+                              if (!ok) return;
+                              await submitPublish({
+                                forceRetry: true,
+                                platform: j.platform as PublishPlatform,
+                                accountId: j.account_id ?? "",
+                              });
+                            }}
+                          >
+                            确认后重试
+                          </button>
+                        ) : "-"}
                       </td>
                       <td className="py-2 pr-3 text-xs text-slate-600">{new Date(j.updated_at).toLocaleString()}</td>
                     </tr>

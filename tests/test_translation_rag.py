@@ -1141,7 +1141,7 @@ def test_fetch_search_evidence_reads_result_pages(monkeypatch) -> None:
     assert "powerful sniper rifle" in evidence[0]["content"]
 
 
-def test_safe_public_get_rejects_redirect_to_private_host() -> None:
+def test_safe_public_get_rejects_redirect_to_private_host(monkeypatch) -> None:
     from videoroll.apps.subtitle_service import rag as rag_module
 
     calls: list[str] = []
@@ -1153,6 +1153,11 @@ def test_safe_public_get_rejects_redirect_to_private_host() -> None:
         return httpx.Response(200, text="internal", request=request)
 
     client = httpx.Client(transport=httpx.MockTransport(handler), follow_redirects=True)
+    monkeypatch.setattr(
+        rag_module,
+        "_is_fetchable_url",
+        lambda url: not str(url).startswith("http://127.0.0.1"),
+    )
     try:
         try:
             rag_module._safe_public_get(client, "https://public.example/start")
@@ -1440,6 +1445,7 @@ def test_fetch_search_evidence_retries_with_default_engines_when_default_search_
             )
 
     monkeypatch.setattr(rag_module.httpx, "Client", _Client)
+    monkeypatch.setattr(rag_module, "_is_fetchable_url", lambda _url: True)
 
     evidence = fetch_search_evidence("VGA", domain="display", search_url="https://search.example/search")
 

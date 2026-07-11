@@ -4,9 +4,15 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
+if [[ ! -f social-auto-upload/sau_cli.py ]]; then
+  echo "social-auto-upload submodule is missing; run: git submodule update --init --recursive" >&2
+  exit 1
+fi
+
 ENV_FILE="${ENV_FILE:-deploy_compose/.env}"
 APP_IMAGE="${APP_IMAGE:-videoroll:prod}"
 WEB_IMAGE="${WEB_IMAGE:-videoroll-web:prod}"
+SOCIAL_IMAGE="${SOCIAL_IMAGE:-videoroll-social-publisher:prod}"
 INCLUDE_BASE_IMAGES="${INCLUDE_BASE_IMAGES:-1}"
 TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
 OUTPUT_TAR="${OUTPUT_TAR:-$ROOT_DIR/videoroll-prod-bundle-${TIMESTAMP}.tar}"
@@ -50,7 +56,13 @@ docker_run build \
   -f src/web/Dockerfile \
   src/web
 
-IMAGES=("$APP_IMAGE" "$WEB_IMAGE")
+echo "Building social publisher image: $SOCIAL_IMAGE"
+docker_run build \
+  -t "$SOCIAL_IMAGE" \
+  -f docker/social-publisher.Dockerfile \
+  .
+
+IMAGES=("$APP_IMAGE" "$WEB_IMAGE" "$SOCIAL_IMAGE")
 if [[ "$INCLUDE_BASE_IMAGES" == "1" ]]; then
   echo "Pulling base service images"
   docker_run pull redis:7

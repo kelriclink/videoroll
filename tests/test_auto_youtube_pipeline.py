@@ -84,7 +84,7 @@ class AutoYouTubePipelineTests(unittest.TestCase):
     def test_remote_auto_youtube_accepts_bearer_token_before_query_token(self) -> None:
         from starlette.requests import Request
 
-        from videoroll.apps.orchestrator_api import main as orchestrator_main
+        from videoroll.apps.orchestrator_api.routers import youtube as youtube_router
         from videoroll.db.models import SourceLicense
 
         task_id = uuid.uuid4()
@@ -104,14 +104,14 @@ class AutoYouTubePipelineTests(unittest.TestCase):
             return token == "header-token"
 
         with (
-            patch("videoroll.apps.orchestrator_api.main.remote_api_token_is_configured", return_value=True),
-            patch("videoroll.apps.orchestrator_api.main.verify_remote_api_token", side_effect=verify_token),
+            patch("videoroll.apps.orchestrator_api.routers.youtube.remote_api_token_is_configured", return_value=True),
+            patch("videoroll.apps.orchestrator_api.routers.youtube.verify_remote_api_token", side_effect=verify_token),
             patch(
-                "videoroll.apps.orchestrator_api.main._start_auto_youtube_pipeline",
-                return_value=orchestrator_main.AutoYouTubeResponse(task_id=task_id, pipeline_job_id="job-1"),
+                "videoroll.apps.orchestrator_api.routers.youtube.youtube_service.start_auto_youtube_pipeline",
+                return_value=youtube_router.AutoYouTubeResponse(task_id=task_id, pipeline_job_id="job-1"),
             ) as start_pipeline,
         ):
-            result = orchestrator_main.remote_auto_youtube(
+            result = youtube_router.remote_auto_youtube(
                 request,
                 url="https://www.youtube.com/watch?v=demo",
                 token="query-token",

@@ -26,6 +26,7 @@ from videoroll.apps.bilibili_publisher.bilibili_web_client import BilibiliDescTo
 from videoroll.apps.bilibili_publisher.constants import BILIBILI_DESC_RETRY_MAX_CHARS
 from videoroll.apps.orchestrator_api.youtube_downloader import extract_youtube_channel_info, pick_thumbnail_url
 from videoroll.apps.bilibili_publisher.schemas import BilibiliPublishMeta
+from videoroll.apps.bilibili_publisher.storage_keys import unique_publish_result_key
 from videoroll.apps.bilibili_publisher.typeid_recommender import flatten_typelist
 from videoroll.apps.publish_meta_rules import bilibili_text_units, clamp_bilibili_text
 from videoroll.config import get_bilibili_publisher_settings, get_subtitle_settings
@@ -538,7 +539,11 @@ def _publish_meta_with_retry_desc_limit(meta: BilibiliPublishMeta) -> BilibiliPu
 def _latest_published_job(db: Session, task_id: uuid.UUID) -> PublishJob | None:
     return (
         db.query(PublishJob)
-        .filter(PublishJob.task_id == task_id, PublishJob.state == PublishState.published)
+        .filter(
+            PublishJob.task_id == task_id,
+            PublishJob.platform == Platform.bilibili,
+            PublishJob.state == PublishState.published,
+        )
         .order_by(PublishJob.updated_at.desc(), PublishJob.created_at.desc())
         .first()
     )
@@ -556,6 +561,8 @@ def _mirror_published_job(job: PublishJob, published_job: PublishJob | None, tas
     job.state = PublishState.published
     job.aid = published_job.aid if published_job else job.aid
     job.bvid = published_job.bvid if published_job else job.bvid
+    job.external_id = published_job.external_id if published_job else job.external_id
+    job.external_url = published_job.external_url if published_job else job.external_url
     job.response_json = {
         **_as_dict(published_job.response_json if published_job else job.response_json),
         "skipped_duplicate_publish": True,
@@ -830,6 +837,8 @@ def process_job(self, job_id: str) -> dict[str, Any]:
         job.state = PublishState.published
         job.aid = aid_str or None
         job.bvid = bvid_str or None
+        job.external_id = bvid_str or aid_str or None
+        job.external_url = f"https://www.bilibili.com/video/{bvid_str}" if bvid_str else None
         job.response_json = {
             "mode": "web",
             "cover_url": cover_url or None,
@@ -852,7 +861,7 @@ def process_job(self, job_id: str) -> dict[str, Any]:
         task.error_message = None
         db.add(task)
 
-        result_key = f"meta/{task.id}/publish_result.json"
+        result_key = unique_publish_result_key(task.id)
         result_bytes = json.dumps(job.response_json, ensure_ascii=False, indent=2).encode("utf-8")
         store.put_bytes(result_bytes, result_key, content_type="application/json")
         _ensure_publish_result_asset(db, task.id, result_key)
@@ -921,7 +930,7 @@ def process_job(self, job_id: str) -> dict[str, Any]:
                 store = S3Store(settings)
                 store.ensure_bucket()
             if store and task:
-                result_key = f"meta/{task.id}/publish_result.json"
+                result_key = unique_publish_result_key(task.id)
                 result_bytes = json.dumps(job.response_json or {"error": str(e)}, ensure_ascii=False, indent=2).encode("utf-8")
                 store.put_bytes(result_bytes, result_key, content_type="application/json")
                 _ensure_publish_result_asset(db, task.id, result_key)
@@ -973,7 +982,7 @@ def process_job(self, job_id: str) -> dict[str, Any]:
                     store = S3Store(settings)
                     store.ensure_bucket()
                 if store and task and job and job.response_json:
-                    result_key = f"meta/{task.id}/publish_result.json"
+                    result_key = unique_publish_result_key(task.id)
                     store.put_bytes(
                         json.dumps(job.response_json, ensure_ascii=False, indent=2).encode("utf-8"),
                         result_key,
@@ -1010,7 +1019,7 @@ def process_job(self, job_id: str) -> dict[str, Any]:
                 store = S3Store(settings)
                 store.ensure_bucket()
             if store and task:
-                result_key = f"meta/{task.id}/publish_result.json"
+                result_key = unique_publish_result_key(task.id)
                 result_bytes = json.dumps(
                     {"error": str(e), "exception_type": type(e).__name__, "traceback": tb},
                     ensure_ascii=False,

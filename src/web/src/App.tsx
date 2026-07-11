@@ -15,7 +15,7 @@ import SettingsYouTubePage from "./pages/SettingsYouTubePage";
 import SettingsStoragePage from "./pages/SettingsStoragePage";
 import SettingsApiPage from "./pages/SettingsApiPage";
 import SettingsTranslatePage from "./pages/SettingsTranslatePage";
-import SettingsBilibiliPage from "./pages/SettingsBilibiliPage";
+import SettingsPublishPage from "./pages/SettingsPublishPage";
 import SettingsAutoPage from "./pages/SettingsAutoPage";
 import SettingsReviewPage from "./pages/SettingsReviewPage";
 import RenderQueuePage from "./pages/RenderQueuePage";
@@ -68,7 +68,7 @@ function Navigation({ onNavigate }: { onNavigate?: () => void }) {
       <NavGroup title="配置">
         <NavItem to="/settings/auto" label="自动模式" onNavigate={onNavigate} />
         <NavItem to="/settings/youtube" label="YouTube" onNavigate={onNavigate} />
-        <NavItem to="/settings/bilibili" label="Bilibili" onNavigate={onNavigate} />
+        <NavItem to="/settings/publish" label="投稿设置" onNavigate={onNavigate} />
         <NavItem to="/settings/asr" label="ASR" onNavigate={onNavigate} />
         <NavItem to="/settings/translate" label="翻译 / RAG" onNavigate={onNavigate} />
         <NavItem to="/settings/review" label="审核" onNavigate={onNavigate} />
@@ -224,7 +224,8 @@ export default function App() {
               <Route path="/settings/review" element={<SettingsReviewPage />} />
               <Route path="/settings/auto" element={<SettingsAutoPage />} />
               <Route path="/settings/translate" element={<SettingsTranslatePage />} />
-              <Route path="/settings/bilibili" element={<SettingsBilibiliPage />} />
+              <Route path="/settings/publish" element={<SettingsPublishPage />} />
+              <Route path="/settings/bilibili" element={<SettingsPublishPage />} />
             </Routes>
           </main>
         </div>

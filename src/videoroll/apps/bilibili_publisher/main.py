@@ -15,7 +15,7 @@ from videoroll.ai.service import AIService
 from videoroll.config import BilibiliPublisherSettings, get_bilibili_publisher_settings, get_subtitle_settings
 from videoroll.db.base import Base
 from videoroll.db.auto_migrate import auto_migrate
-from videoroll.db.models import Asset, AssetKind, PublishJob, PublishState, Task, TaskStatus
+from videoroll.db.models import Asset, AssetKind, Platform, PublishJob, PublishState, Task, TaskStatus
 from videoroll.db.session import db_session, get_engine
 from videoroll.storage.s3 import S3Store
 from videoroll.apps.bilibili_publisher.auth_settings_store import get_bilibili_auth_settings, get_bilibili_cookie_header, update_bilibili_auth_settings
@@ -36,6 +36,7 @@ from videoroll.apps.bilibili_publisher.schemas import (
     PublishRequest,
     PublishResponse,
 )
+from videoroll.apps.bilibili_publisher.storage_keys import unique_publish_result_key
 from videoroll.apps.subtitle_service.bilibili_tags_store import get_task_bilibili_summary
 from videoroll.apps.subtitle_service.translate_settings_store import get_translate_settings
 
@@ -229,7 +230,11 @@ def _utcnow() -> datetime:
 def _latest_publish_job(db: Session, task_id: uuid.UUID, states: set[PublishState]) -> PublishJob | None:
     return (
         db.query(PublishJob)
-        .filter(PublishJob.task_id == task_id, PublishJob.state.in_(list(states)))
+        .filter(
+            PublishJob.task_id == task_id,
+            PublishJob.platform == Platform.bilibili,
+            PublishJob.state.in_(list(states)),
+        )
         .order_by(PublishJob.updated_at.desc(), PublishJob.created_at.desc())
         .first()
     )
@@ -269,10 +274,14 @@ def publish(payload: PublishRequest, settings: BilibiliPublisherSettings = Depen
 
     job = PublishJob(
         task_id=payload.task_id,
+        platform=Platform.bilibili,
+        account_id=uuid.UUID(str(payload.account_id)) if payload.account_id else None,
+        bili_account_id=uuid.UUID(str(payload.account_id)) if payload.account_id else None,
         meta_json={
             "meta": payload.meta.model_dump(),
             "video": payload.video.model_dump(),
             "account_id": payload.account_id,
+            "platform": "bilibili",
             "typeid_mode": payload.typeid_mode,
         },
         cover_key=payload.cover.key if payload.cover else None,
@@ -296,6 +305,8 @@ def publish(payload: PublishRequest, settings: BilibiliPublisherSettings = Depen
     job.state = PublishState.published
     job.aid = aid
     job.bvid = bvid
+    job.external_id = bvid
+    job.external_url = f"https://www.bilibili.com/video/{bvid}"
     job.response_json = response
     db.add(job)
 
@@ -304,7 +315,7 @@ def publish(payload: PublishRequest, settings: BilibiliPublisherSettings = Depen
 
     store = S3Store(settings)
     store.ensure_bucket()
-    result_key = f"meta/{task.id}/publish_result.json"
+    result_key = unique_publish_result_key(task.id)
     store.put_bytes(json.dumps(response, ensure_ascii=False, indent=2).encode("utf-8"), result_key, content_type="application/json")
     db.add(Asset(task_id=task.id, kind=AssetKind.publish_result, storage_key=result_key))
 

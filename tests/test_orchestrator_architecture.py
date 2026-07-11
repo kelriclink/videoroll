@@ -107,6 +107,8 @@ class OrchestratorArchitectureTests(unittest.TestCase):
             source = path.read_text(encoding="utf-8")
             self.assertNotIn("orchestrator_api.main", source, path.as_posix())
             self.assertNotIn("orchestrator_api.routers", source, path.as_posix())
+        subtitle_source = (root / "services" / "subtitle_service.py").read_text(encoding="utf-8")
+        self.assertNotIn("publishing_service.internal_http_headers", subtitle_source)
 
     def test_application_factory_creates_distinct_apps_without_routes_missing(self) -> None:
         from videoroll.apps.orchestrator_api.app import create_app
@@ -117,6 +119,77 @@ class OrchestratorArchitectureTests(unittest.TestCase):
         self.assertIsNot(first, second)
         self.assertEqual(route_manifest(first), EXPECTED_ORCHESTRATOR_ROUTES)
         self.assertEqual(route_manifest(second), EXPECTED_ORCHESTRATOR_ROUTES)
+
+    def test_auth_and_system_routes_are_owned_by_domain_routers(self) -> None:
+        owners = {route.path: route.endpoint.__module__ for route in app.routes if hasattr(route, "endpoint")}
+
+        self.assertEqual(owners["/auth/login"], "videoroll.apps.orchestrator_api.routers.auth")
+        self.assertEqual(owners["/system/resources"], "videoroll.apps.orchestrator_api.routers.system")
+
+    def test_settings_and_maintenance_routes_are_owned_by_domain_routers(self) -> None:
+        owners = {route.path: route.endpoint.__module__ for route in app.routes if hasattr(route, "endpoint")}
+
+        self.assertEqual(owners["/settings/storage"], "videoroll.apps.orchestrator_api.routers.settings")
+        self.assertEqual(owners["/maintenance/workdir"], "videoroll.apps.orchestrator_api.routers.maintenance")
+
+    def test_asset_routes_are_owned_by_asset_router(self) -> None:
+        owners = {route.path: route.endpoint.__module__ for route in app.routes if hasattr(route, "endpoint")}
+
+        self.assertEqual(owners["/tasks/{task_id}/upload/video"], "videoroll.apps.orchestrator_api.routers.assets")
+
+    def test_publishing_routes_are_owned_by_publishing_router(self) -> None:
+        owners = {route.path: route.endpoint.__module__ for route in app.routes if hasattr(route, "endpoint")}
+
+        self.assertEqual(
+            owners["/tasks/{task_id}/actions/publish"],
+            "videoroll.apps.orchestrator_api.routers.publishing",
+        )
+        self.assertEqual(
+            owners["/settings/publish/platforms"],
+            "videoroll.apps.orchestrator_api.routers.publishing",
+        )
+
+    def test_youtube_routes_are_owned_by_youtube_router(self) -> None:
+        owners = {route.path: route.endpoint.__module__ for route in app.routes if hasattr(route, "endpoint")}
+
+        for path in (
+            "/auto/youtube",
+            "/remote/auto/youtube",
+            "/settings/youtube/home_scan/run",
+            "/settings/youtube/test",
+            "/tasks/{task_id}/youtube_meta",
+            "/tasks/{task_id}/actions/auto_youtube_start",
+            "/tasks/{task_id}/actions/youtube_meta",
+            "/tasks/{task_id}/actions/youtube_download",
+        ):
+            self.assertEqual(owners[path], "videoroll.apps.orchestrator_api.routers.youtube")
+
+    def test_task_and_subtitle_routes_are_owned_by_tasks_router(self) -> None:
+        owners = {route.path: route.endpoint.__module__ for route in app.routes if hasattr(route, "endpoint")}
+
+        for path in (
+            "/tasks",
+            "/tasks/{task_id}",
+            "/videos/converted",
+            "/tasks/{task_id}/subtitle_jobs",
+            "/tasks/{task_id}/actions/subtitle",
+            "/tasks/{task_id}/actions/subtitle_resume",
+            "/tasks/actions/resume_failed_recent",
+        ):
+            self.assertEqual(owners[path], "videoroll.apps.orchestrator_api.routers.tasks")
+
+    def test_range_parser_is_owned_by_asset_service(self) -> None:
+        from videoroll.apps.orchestrator_api.services.asset_service import parse_range_header
+
+        self.assertEqual(parse_range_header("bytes=2-5", 10), (2, 5))
+
+    def test_asset_router_delegates_storage_and_database_work_to_service(self) -> None:
+        source = Path("src/videoroll/apps/orchestrator_api/routers/assets.py").read_text(encoding="utf-8")
+
+        self.assertNotIn("db.query(", source)
+        self.assertNotIn("db.get(", source)
+        self.assertNotIn("s3.get_object(", source)
+        self.assertNotIn("s3.head_object(", source)
 
 
 if __name__ == "__main__":

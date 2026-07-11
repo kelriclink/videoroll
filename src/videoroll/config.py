@@ -30,6 +30,7 @@ class OrchestratorSettings(CommonSettings):
     subtitle_service_url: str = Field("http://subtitle-service:8001", alias="SUBTITLE_SERVICE_URL")
     youtube_ingest_url: str = Field("http://youtube-ingest:8002", alias="YOUTUBE_INGEST_URL")
     bilibili_publisher_url: str = Field("http://bilibili-publisher:8003", alias="BILIBILI_PUBLISHER_URL")
+    social_publisher_url: str = Field("http://social-publisher-api:8010", alias="SOCIAL_PUBLISHER_URL")
 
     # Shared runtime settings (used by orchestrator actions).
     work_dir: str = Field("/tmp/videoroll", alias="WORK_DIR")
@@ -127,6 +128,24 @@ class BilibiliPublisherSettings(CommonSettings):
     publish_mode: str = Field("mock", alias="BILIBILI_PUBLISH_MODE")
 
 
+class SocialPublisherSettings(CommonSettings):
+    work_dir: str = Field("/work/social-publisher", alias="SOCIAL_PUBLISH_WORK_DIR")
+    sau_executable: str = Field("sau", alias="SAU_EXECUTABLE")
+    sau_runtime_dir: str = Field("/opt/social-auto-upload", alias="SAU_RUNTIME_DIR")
+    sau_cookies_dir: str = Field("/opt/social-auto-upload/cookies", alias="SAU_COOKIES_DIR")
+    sau_headless: bool = Field(True, alias="SAU_HEADLESS")
+    account_check_timeout_seconds: float = Field(120.0, alias="SAU_ACCOUNT_CHECK_TIMEOUT_SECONDS")
+    upload_timeout_seconds: float = Field(3600.0, alias="SAU_UPLOAD_TIMEOUT_SECONDS")
+    output_max_bytes: int = Field(65536, alias="SAU_OUTPUT_MAX_BYTES")
+    lock_margin_seconds: int = Field(600, alias="SAU_LOCK_MARGIN_SECONDS")
+    login_timeout_seconds: float = Field(900.0, alias="SOCIAL_LOGIN_TIMEOUT_SECONDS")
+    login_display: str = Field(":99", alias="SOCIAL_LOGIN_DISPLAY")
+    login_browser_url: str = Field(
+        "/social-login/vnc.html?autoconnect=1&resize=scale&path=social-login/websockify",
+        alias="SOCIAL_LOGIN_BROWSER_URL",
+    )
+
+
 @lru_cache
 def get_orchestrator_settings() -> OrchestratorSettings:
     return OrchestratorSettings()
@@ -145,3 +164,8 @@ def get_youtube_ingest_settings() -> YouTubeIngestSettings:
 @lru_cache
 def get_bilibili_publisher_settings() -> BilibiliPublisherSettings:
     return BilibiliPublisherSettings()
+
+
+@lru_cache
+def get_social_publisher_settings() -> SocialPublisherSettings:
+    return SocialPublisherSettings()

@@ -93,12 +93,23 @@ class SubtitleActionRequest(BaseModel):
 
 
 class PublishActionRequest(BaseModel):
+    platform: str = "bilibili"
     account_id: Optional[str] = None
     video_key: Optional[str] = None
     cover_key: Optional[str] = None
     typeid_mode: Optional[str] = None
     meta: Optional[dict[str, Any]] = None
+    platform_options: dict[str, dict[str, Any]] = Field(default_factory=dict)
     skip_review: bool = False
+    force_retry: bool = False
+
+
+class PublishPlatformSettingsRead(BaseModel):
+    platforms: dict[str, bool] = Field(default_factory=dict)
+
+
+class PublishPlatformSettingUpdate(BaseModel):
+    enabled: bool
 
 
 class PublishMetaDraftRequest(BaseModel):
@@ -163,8 +174,12 @@ class RecentFailedResumeResponse(BaseModel):
 
 class RemotePublishResponse(BaseModel):
     state: str
+    platform: str = "bilibili"
+    job_id: Optional[uuid.UUID] = None
     aid: Optional[str] = None
     bvid: Optional[str] = None
+    external_id: Optional[str] = None
+    external_url: Optional[str] = None
     response: Optional[dict[str, Any]] = None
 
 
@@ -225,9 +240,15 @@ class SubtitleJobSummary(BaseModel):
 class PublishJobSummary(BaseModel):
     id: uuid.UUID
     task_id: uuid.UUID
+    platform: str = "bilibili"
     state: str
     aid: Optional[str]
     bvid: Optional[str]
+    external_id: Optional[str] = None
+    external_url: Optional[str] = None
+    account_id: Optional[uuid.UUID] = None
+    started_at: Optional[datetime] = None
+    finished_at: Optional[datetime] = None
     tid: Optional[int] = None
     typeid_mode: Optional[str] = None
     typeid_selected_by: Optional[str] = None

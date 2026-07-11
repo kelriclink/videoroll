@@ -72,6 +72,7 @@ services:
       SUBTITLE_SERVICE_URL: ${SUBTITLE_SERVICE_URL:-http://localhost:8000/subtitle-service}
       YOUTUBE_INGEST_URL: ${YOUTUBE_INGEST_URL:-http://localhost:8000/youtube-ingest}
       BILIBILI_PUBLISHER_URL: ${BILIBILI_PUBLISHER_URL:-http://localhost:8000/bilibili-publisher}
+      SOCIAL_PUBLISHER_URL: ${SOCIAL_PUBLISHER_URL:-http://social-publisher-api:8010}
       STORAGE_CLEANUP_INTERVAL_SECONDS: ${STORAGE_CLEANUP_INTERVAL_SECONDS:-3600}
       INTEL_GPU_RENDER_DEVICE: ${INTEL_GPU_RENDER_DEVICE:-/dev/dri/renderD128}
     volumes:
@@ -82,6 +83,76 @@ services:
     # runtimes can discover the render device and initialize compute contexts.
     devices:
       - "/dev/dri:/dev/dri"
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    depends_on:
+      redis:
+        condition: service_started
+      minio:
+        condition: service_started
+      minio-init:
+        condition: service_completed_successfully
+      social-publisher-api:
+        condition: service_healthy
+    restart: unless-stopped
+
+  social-publisher-api:
+    build:
+      context: .
+      dockerfile: docker/social-publisher.Dockerfile
+    image: videoroll-social-publisher:prod
+    environment: &social-publisher-env
+      DATABASE_URL: ${DATABASE_URL}
+      REDIS_URL: ${REDIS_URL}
+      S3_ENDPOINT_URL: ${S3_ENDPOINT_URL}
+      S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID}
+      S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY}
+      S3_BUCKET: ${S3_BUCKET}
+      S3_REGION_NAME: ${S3_REGION_NAME:-us-east-1}
+      S3_USE_SSL: ${S3_USE_SSL:-false}
+      SOCIAL_PUBLISH_WORK_DIR: ${SOCIAL_PUBLISH_WORK_DIR:-/work/social-publisher}
+      SAU_EXECUTABLE: ${SAU_EXECUTABLE:-sau}
+      SAU_RUNTIME_DIR: ${SAU_RUNTIME_DIR:-/opt/social-auto-upload}
+      SAU_COOKIES_DIR: ${SAU_COOKIES_DIR:-/opt/social-auto-upload/cookies}
+      SAU_HEADLESS: ${SAU_HEADLESS:-true}
+      DOUYIN_COOKIE_AUTH_HEADLESS: ${DOUYIN_COOKIE_AUTH_HEADLESS:-true}
+      SAU_ACCOUNT_CHECK_TIMEOUT_SECONDS: ${SAU_ACCOUNT_CHECK_TIMEOUT_SECONDS:-120}
+      SAU_UPLOAD_TIMEOUT_SECONDS: ${SAU_UPLOAD_TIMEOUT_SECONDS:-3600}
+      SAU_OUTPUT_MAX_BYTES: ${SAU_OUTPUT_MAX_BYTES:-65536}
+      SAU_LOCK_MARGIN_SECONDS: ${SAU_LOCK_MARGIN_SECONDS:-600}
+      SOCIAL_LOGIN_TIMEOUT_SECONDS: ${SOCIAL_LOGIN_TIMEOUT_SECONDS:-900}
+      SOCIAL_LOGIN_DISPLAY: ${SOCIAL_LOGIN_DISPLAY:-:99}
+    volumes:
+      - ./data/secrets:/secrets
+      - ./data/social-publisher:/work/social-publisher
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    depends_on:
+      redis:
+        condition: service_started
+      minio:
+        condition: service_started
+      minio-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8010/health', timeout=5)"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+    restart: unless-stopped
+
+  social-publisher-worker:
+    build:
+      context: .
+      dockerfile: docker/social-publisher.Dockerfile
+    image: videoroll-social-publisher:prod
+    command: ["celery", "-A", "videoroll.apps.social_publisher.worker:celery_app", "worker", "-B", "--schedule", "/tmp/celerybeat-schedule", "-Q", "social_publish", "-l", "INFO", "--concurrency", "${SOCIAL_PUBLISH_CONCURRENCY:-1}"]
+    environment: *social-publisher-env
+    volumes:
+      - ./data/secrets:/secrets
+      - ./data/social-publisher:/work/social-publisher
+    tmpfs:
+      - /opt/social-auto-upload/cookies:mode=0700,uid=10001,gid=10001
     extra_hosts:
       - host.docker.internal:host-gateway
     depends_on:
@@ -106,5 +177,9 @@ services:
       - "${PUBLISH_ADDR:-127.0.0.1}:${WEB_PORT:-3000}:80"
     depends_on:
       app:
+        condition: service_started
+      social-publisher-api:
+        condition: service_healthy
+      social-publisher-worker:
         condition: service_started
     restart: unless-stopped

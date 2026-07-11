@@ -460,7 +460,7 @@ export default function SettingsAutoPage() {
         </div>
 
         <div className="mt-4 rounded border p-3">
-          <div className="text-xs font-semibold text-slate-700">Publish（Bilibili）</div>
+          <div className="text-xs font-semibold text-slate-700">投稿（当前默认：哔哩哔哩）</div>
           <div className="mt-2 grid gap-2 md:grid-cols-2">
             <label className="flex items-center gap-2 text-sm">
               <input type="checkbox" checked={autoPublish} onChange={(e) => setAutoPublish(e.target.checked)} />
@@ -491,7 +491,7 @@ export default function SettingsAutoPage() {
               >
                 <option value="ai_summary">AI（根据字幕总结）</option>
                 <option value="bilibili_predict">B站预测（标题/文件）</option>
-                <option value="meta">手动（使用 Settings · Bilibili 的 meta.typeid）</option>
+                <option value="meta">手动（使用投稿设置里的 meta.typeid）</option>
               </select>
               {publishTypeidMode === "ai_summary" && (!translateEnableSummary || translateProvider !== "openai" || openaiKeySet === false) ? (
                 <div className="mt-2 text-xs text-rose-700">
@@ -520,7 +520,7 @@ export default function SettingsAutoPage() {
             </label>
           </div>
           <div className="mt-2 text-xs text-slate-500">
-            投稿 meta 的默认值（标题/简介/tags 等）请到 <Link className="underline" to="/settings/bilibili">Settings · Bilibili</Link> 配置；分区由上面的 “分区模式” 决定。
+            投稿 meta 的默认值（标题/简介/tags 等）请到 <Link className="underline" to="/settings/publish">投稿设置</Link> 配置；分区由上面的 “分区模式” 决定。
           </div>
           <div className="mt-1 text-xs text-slate-500">
             投稿前 AI 审核规则请到 <Link className="underline" to="/settings/review">Settings · Review</Link> 配置。

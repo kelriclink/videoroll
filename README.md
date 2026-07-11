@@ -1,6 +1,6 @@
 # VideoRoll
 
-模块化视频处理流水线：YouTube 接入 → 语音识别/翻译 → 压制封装 → B 站投稿。
+模块化视频处理流水线：YouTube 接入 → 语音识别/翻译 → 压制封装 → 多平台投稿。
 
 核心特性是 **RAG Agent 驱动的翻译知识库**：翻译每个字幕前，LLM 自动判断哪些术语需要外部查证，检索可信来源后注入翻译上下文。解决动漫、游戏实况、技术讲解等视频中“模型缺上下文”的问题。
 
@@ -13,6 +13,7 @@
 - **字幕翻译 + 压制** — 硬字幕 burn-in 或软字幕 soft-sub，多语言支持
 - **YouTube 自动流水线** — 下载 → 字幕 → 翻译 → 压制 → 可选投稿 B 站，一键完成
 - **Bilibili 投稿** — Web UI 配置 Cookie、投稿模板，支持分区/标签/封面
+- **社交平台投稿** — 独立 SAU 浏览器服务支持抖音、小红书、快手视频投稿，账号状态加密保存
 - **Web 管理面板** — 任务管理、Dashboard 资源监控、Agent 运行树、RAG 知识库管理、全局设置
 - **词典导入** — 支持 CSV、TSV、TMX、TBX、JSONL、CC-CEDICT、ECDICT 等格式，导入术语到 pgvector 知识库
 
@@ -27,6 +28,7 @@
 │      ├─ youtube-ingest   (频道扫描 / 下载)               │
 │      └─ bilibili-publisher (投稿 / 上传)                 │
 │      + 2 Celery workers (subtitle / publish)             │
+│  social-publisher-api + worker (SAU / Patchright)         │
 │  Redis (broker)          MinIO (对象存储)                │
 └──────────────────────────────────────────────────────────┘
 ```
@@ -48,6 +50,7 @@
 ```bash
 git clone git@github.com:kelriclink/videoroll.git
 cd videoroll
+git submodule update --init --recursive
 ```
 
 ### 2. 准备 PostgreSQL
@@ -98,7 +101,7 @@ docker compose -f deploy_compose/docker-compose.yml up -d
 
 - **Translate** — LLM API key、翻译模型、embedding、RAG Agent 参数
 - **YouTube** — 可选代理、cookies
-- **Bilibili** — Cookie、投稿模板
+- **投稿设置** — Bilibili Cookie/模板，以及抖音、小红书、快手 storage_state JSON
 - **Auto** — 自动模式默认参数（一键完成全流程）
 
 ## 文档索引
@@ -110,6 +113,7 @@ docker compose -f deploy_compose/docker-compose.yml up -d
 | [Agent Skills](docs/AGENT_SKILLS.md) | Agent 能力包格式与自定义指南 |
 | [开发者指南](docs/DEVELOPER_GUIDE.md) | 本地开发、调试、代码组织 |
 | [远程 API](docs/REMOTE_API.md) | 远程自动提交 API 说明 |
+| [社交平台投稿](docs/social-publisher.md) | SAU Docker 部署、账号导入和安全状态说明 |
 
 ## 合规声明
 

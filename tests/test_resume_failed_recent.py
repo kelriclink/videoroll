@@ -6,7 +6,7 @@ from unittest.mock import MagicMock
 
 from fastapi import HTTPException
 
-from videoroll.apps.orchestrator_api import main
+from videoroll.apps.orchestrator_api.services import publishing_service, subtitle_service, youtube_service
 from videoroll.db.models import SourceLicense, SourceType, Task, TaskStatus
 
 
@@ -54,23 +54,27 @@ def test_resume_failed_recent_restarts_youtube_pipeline_when_no_subtitle_job(mon
 
     set_created_by_calls: list[tuple[uuid.UUID, str]] = []
 
-    monkeypatch.setattr(main, "_build_auto_publish_after_render", lambda *args, **kwargs: {"publish": True})
+    monkeypatch.setattr(publishing_service, "build_auto_publish_after_render", lambda *args, **kwargs: {"publish": True})
     monkeypatch.setattr(
-        main,
-        "_build_resume_subtitle_request",
+        subtitle_service,
+        "build_resume_subtitle_request",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(
             HTTPException(status_code=400, detail="no subtitle job found to resume")
         ),
     )
-    monkeypatch.setattr(main, "get_auto_profile", lambda _db: {"auto_publish": True})
+    monkeypatch.setattr(subtitle_service, "get_auto_profile", lambda _db: {"auto_publish": True})
     monkeypatch.setattr(
-        main,
-        "_set_task_created_by",
+        youtube_service,
+        "set_task_created_by",
         lambda _settings, *, task_id, created_by: set_created_by_calls.append((task_id, created_by)),
     )
-    monkeypatch.setattr(main, "_enqueue_auto_youtube_pipeline", lambda task_id, auto_publish: f"pipeline:{task_id}:{auto_publish}")
+    monkeypatch.setattr(
+        youtube_service,
+        "enqueue_auto_youtube_pipeline",
+        lambda task_id, auto_publish: f"pipeline:{task_id}:{auto_publish}",
+    )
 
-    resp = main.resume_recent_failed_tasks(
+    resp = subtitle_service.resume_recent_failed_tasks(
         window_hours=24,
         limit=200,
         settings=SimpleNamespace(),
@@ -96,16 +100,16 @@ def test_resume_failed_recent_skips_non_youtube_task_without_subtitle_job(monkey
         _FakeQuery(count_result=0),
     ]
 
-    monkeypatch.setattr(main, "_build_auto_publish_after_render", lambda *args, **kwargs: {"publish": True})
+    monkeypatch.setattr(publishing_service, "build_auto_publish_after_render", lambda *args, **kwargs: {"publish": True})
     monkeypatch.setattr(
-        main,
-        "_build_resume_subtitle_request",
+        subtitle_service,
+        "build_resume_subtitle_request",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(
             HTTPException(status_code=400, detail="no subtitle job found to resume")
         ),
     )
 
-    resp = main.resume_recent_failed_tasks(
+    resp = subtitle_service.resume_recent_failed_tasks(
         window_hours=24,
         limit=200,
         settings=SimpleNamespace(),

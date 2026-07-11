@@ -42,6 +42,25 @@ def _add_column(engine: Engine, table: str, column: str, column_type_sql: str) -
             raise
 
 
+def _ensure_postgres_enum_values(engine: Engine) -> None:
+    if (engine.dialect.name or "").lower() != "postgresql":
+        return
+    required = {
+        "platform": ["douyin", "xiaohongshu", "kuaishou", "tencent"],
+        "publish_state": ["unknown"],
+    }
+    with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+        for enum_name, values in required.items():
+            exists = conn.execute(
+                text("SELECT 1 FROM pg_type WHERE typname = :enum_name"),
+                {"enum_name": enum_name},
+            ).scalar()
+            if not exists:
+                continue
+            for value in values:
+                conn.execute(text(f"ALTER TYPE {enum_name} ADD VALUE IF NOT EXISTS '{value}'"))
+
+
 def _ensure_tasks_lock_columns(engine: Engine) -> None:
     insp = inspect(engine)
     if "tasks" not in set(insp.get_table_names()):
@@ -105,6 +124,51 @@ def _ensure_scheduler_indexes(engine: Engine) -> None:
             )
         if "render_jobs" in tables:
             conn.execute(text("CREATE INDEX IF NOT EXISTS ix_render_jobs_status_created_at ON render_jobs (status, created_at)"))
+
+
+def _ensure_publish_jobs_generic_columns(engine: Engine) -> None:
+    insp = inspect(engine)
+    if "publish_jobs" not in set(insp.get_table_names()):
+        return
+
+    cols = {c.get("name") for c in insp.get_columns("publish_jobs")}
+    dialect = (engine.dialect.name or "").lower()
+    ts_type = "TIMESTAMPTZ" if dialect == "postgresql" else "TIMESTAMP"
+    required_columns = {
+        "platform": "VARCHAR(32) DEFAULT 'bilibili' NOT NULL",
+        "account_id": "UUID",
+        "external_id": "VARCHAR(128)",
+        "external_url": "TEXT",
+        "started_at": ts_type,
+        "finished_at": ts_type,
+    }
+    for column, column_type_sql in required_columns.items():
+        if column in cols:
+            continue
+        _add_column(engine, "publish_jobs", column, column_type_sql)
+        logger.warning("auto-migrated DB: added publish_jobs.%s", column)
+
+    with engine.begin() as conn:
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_publish_jobs_platform_state ON publish_jobs (platform, state)"))
+
+
+def _ensure_account_check_columns(engine: Engine) -> None:
+    insp = inspect(engine)
+    if "accounts" not in set(insp.get_table_names()):
+        return
+    cols = {c.get("name") for c in insp.get_columns("accounts")}
+    dialect = (engine.dialect.name or "").lower()
+    ts_type = "TIMESTAMPTZ" if dialect == "postgresql" else "TIMESTAMP"
+    required_columns = {
+        "check_state": "VARCHAR(16) DEFAULT 'unchecked' NOT NULL",
+        "last_checked_at": ts_type,
+        "last_check_message": "TEXT",
+    }
+    for column, column_type_sql in required_columns.items():
+        if column in cols:
+            continue
+        _add_column(engine, "accounts", column, column_type_sql)
+        logger.warning("auto-migrated DB: added accounts.%s", column)
 
 
 def _ensure_pgvector_ann_indexes(conn) -> None:
@@ -467,8 +531,11 @@ def auto_migrate_engine(engine: Engine) -> None:
     source subscriptions exist.
     """
     with _auto_migrate_lock(engine):
+        _ensure_postgres_enum_values(engine)
         _ensure_tasks_lock_columns(engine)
         _ensure_youtube_sources_columns(engine)
+        _ensure_publish_jobs_generic_columns(engine)
+        _ensure_account_check_columns(engine)
         _ensure_scheduler_indexes(engine)
         _ensure_pgvector_rag_tables(engine)
 

@@ -57,9 +57,15 @@ export type SubtitleJob = {
 export type PublishJob = {
   id: string;
   task_id: string;
+  platform?: string | null;
   state: string;
   aid?: string | null;
   bvid?: string | null;
+  external_id?: string | null;
+  external_url?: string | null;
+  account_id?: string | null;
+  started_at?: string | null;
+  finished_at?: string | null;
   tid?: number | null;
   typeid_mode?: string | null;
   typeid_selected_by?: string | null;

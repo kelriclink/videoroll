@@ -6,4 +6,4 @@ cd "$ROOT_DIR"
 
 ENV_FILE="${ENV_FILE:-.env}"
 docker compose -f docker-compose.yml --env-file "$ENV_FILE" logs -f --tail=200 \
-  app web redis minio
+  app web social-publisher-api social-publisher-worker redis minio

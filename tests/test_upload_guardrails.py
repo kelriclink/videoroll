@@ -6,21 +6,21 @@ import zipfile
 import pytest
 from fastapi import HTTPException
 
-from videoroll.apps.orchestrator_api import main as orchestrator_main
+from videoroll.apps.orchestrator_api.services import asset_service
 from videoroll.apps.subtitle_service import main as subtitle_main
 
 
 def test_stream_upload_to_tempfile_rejects_oversize_and_removes_temp(tmp_path, monkeypatch) -> None:
-    real_named_temporary_file = orchestrator_main.tempfile.NamedTemporaryFile
+    real_named_temporary_file = asset_service.tempfile.NamedTemporaryFile
 
     def named_temporary_file(*args: object, **kwargs: object):
         kwargs["dir"] = tmp_path
         return real_named_temporary_file(*args, **kwargs)
 
-    monkeypatch.setattr(orchestrator_main.tempfile, "NamedTemporaryFile", named_temporary_file)
+    monkeypatch.setattr(asset_service.tempfile, "NamedTemporaryFile", named_temporary_file)
 
-    with pytest.raises(orchestrator_main.UploadTooLargeError):
-        orchestrator_main._stream_upload_to_tempfile(
+    with pytest.raises(asset_service.UploadTooLargeError):
+        asset_service.stream_upload_to_tempfile(
             io.BytesIO(b"abcdef"),
             prefix="upload_",
             suffix=".bin",

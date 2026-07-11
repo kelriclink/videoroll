@@ -94,6 +94,10 @@ from videoroll.apps.youtube_settings_store import (
 from videoroll.utils.cpu import process_cpu_count
 
 
+def _unique_storage_key(prefix: str, digest: str, suffix: str) -> str:
+    return f"{prefix}_{digest[:16]}_{uuid.uuid4().hex[:12]}{suffix}"
+
+
 def _positive_int_env(name: str, default: int) -> int:
     try:
         value = int(os.getenv(name, str(default)) or default)
@@ -1014,13 +1018,21 @@ def process_job(self: Any, job_id: str) -> dict[str, str]:
             )
             ass_path.write_text(ass_text, encoding="utf-8")
             ass_sha = sha256_file(ass_path)
-            ass_key_local = f"sub/{task.id}/subtitle_zh_{ass_sha[:16]}.ass"
             existing_asset = (
                 db.query(Asset)
-                .filter(Asset.task_id == task.id, Asset.kind == AssetKind.subtitle_ass, Asset.storage_key == ass_key_local)
+                .filter(
+                    Asset.task_id == task.id,
+                    Asset.kind == AssetKind.subtitle_ass,
+                    Asset.sha256 == ass_sha,
+                )
                 .first()
             )
             if existing_asset is None:
+                ass_key_local = _unique_storage_key(
+                    f"sub/{task.id}/subtitle_zh",
+                    ass_sha,
+                    ".ass",
+                )
                 store.upload_file(ass_path, ass_key_local, content_type="text/plain")
                 db.add(
                     Asset(
@@ -1045,13 +1057,18 @@ def process_job(self: Any, job_id: str) -> dict[str, str]:
                     db.add(Subtitle(task_id=task.id, version=1, format=SubtitleFormat.ass, language="zh", storage_key=ass_key_local))
                 _safe_append_log_line(log_path, f"{log_prefix}: {ass_key_local} ({play_res_x}x{play_res_y})")
             else:
+                ass_key_local = existing_asset.storage_key
                 _safe_append_log_line(log_path, f"{log_prefix} unchanged: {ass_key_local} ({play_res_x}x{play_res_y})")
             return ass_key_local
 
         def _store_final_subtitle_segments(segs: list[Segment]) -> str:
             write_json(subtitle_segments_path, segments_to_json_data(segs))
             subtitle_segments_sha = sha256_file(subtitle_segments_path)
-            key = f"sub/{task.id}/subtitle_segments_{subtitle_segments_sha[:16]}.json"
+            key = _unique_storage_key(
+                f"sub/{task.id}/subtitle_segments",
+                subtitle_segments_sha,
+                ".json",
+            )
             store.upload_file(subtitle_segments_path, key, content_type="application/json")
             _set_final_subtitle_segments_key(key)
             db.commit()
@@ -1062,7 +1079,11 @@ def process_job(self: Any, job_id: str) -> dict[str, str]:
             nonlocal segments_key
             write_json(segments_path, segments_to_json_data(segs))
             segments_sha = sha256_file(segments_path)
-            segments_key = f"sub/{task.id}/segments_{segments_sha[:16]}.json"
+            segments_key = _unique_storage_key(
+                f"sub/{task.id}/segments",
+                segments_sha,
+                ".json",
+            )
             store.upload_file(segments_path, segments_key, content_type="application/json")
             db.add(
                 Asset(
@@ -1263,7 +1284,11 @@ def process_job(self: Any, job_id: str) -> dict[str, str]:
                 extract_audio(settings.ffmpeg_path, video_path, audio_path, log_path=log_path)
                 _safe_upload_log(store, log_path, log_key)
                 audio_sha = sha256_file(audio_path)
-                audio_key = f"work/{task.id}/audio_{audio_sha[:16]}.wav"
+                audio_key = _unique_storage_key(
+                    f"work/{task.id}/audio",
+                    audio_sha,
+                    ".wav",
+                )
                 store.upload_file(audio_path, audio_key, content_type="audio/wav")
                 db.add(
                     Asset(
@@ -1523,7 +1548,11 @@ def process_job(self: Any, job_id: str) -> dict[str, str]:
         srt_path.write_text(srt_text, encoding="utf-8")
         _store_final_subtitle_segments(segments_out)
         srt_sha = sha256_file(srt_path)
-        srt_key = f"sub/{task.id}/subtitle_zh_{srt_sha[:16]}.srt"
+        srt_key = _unique_storage_key(
+            f"sub/{task.id}/subtitle_zh",
+            srt_sha,
+            ".srt",
+        )
         store.upload_file(srt_path, srt_key, content_type="text/plain")
         _clear_translation_checkpoint()
         db.add(
@@ -2169,7 +2198,11 @@ def process_render_job(self: Any, render_job_id: str) -> dict[str, Any]:
             )
             _safe_upload_log(store, log_path, log_key)
             final_sha = sha256_file(out_video)
-            final_key = f"final/{task.id}/video_burnin_{final_sha[:16]}.mp4"
+            final_key = _unique_storage_key(
+                f"final/{task.id}/video_burnin",
+                final_sha,
+                ".mp4",
+            )
             store.upload_file(out_video, final_key, content_type="video/mp4")
             db.add(
                 Asset(
@@ -2194,7 +2227,11 @@ def process_render_job(self: Any, render_job_id: str) -> dict[str, Any]:
             mux_soft_sub(settings.ffmpeg_path, video_path, srt_path, out_video, log_path=log_path, live_upload_cb=_live_upload_log)
             _safe_upload_log(store, log_path, log_key)
             final_sha = sha256_file(out_video)
-            final_key = f"final/{task.id}/video_softsub_{final_sha[:16]}.mkv"
+            final_key = _unique_storage_key(
+                f"final/{task.id}/video_softsub",
+                final_sha,
+                ".mkv",
+            )
             store.upload_file(out_video, final_key, content_type="video/x-matroska")
             db.add(
                 Asset(

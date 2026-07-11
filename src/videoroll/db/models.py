@@ -78,12 +78,17 @@ class PublishState(str, enum.Enum):
     submitting = "submitting"
     submitted = "submitted"
     published = "published"
+    unknown = "unknown"
     failed = "failed"
 
 
 class Platform(str, enum.Enum):
     bilibili = "bilibili"
     youtube = "youtube"
+    douyin = "douyin"
+    xiaohongshu = "xiaohongshu"
+    kuaishou = "kuaishou"
+    tencent = "tencent"
 
 
 class Task(Base):
@@ -171,24 +176,33 @@ class PublishJob(Base):
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     task_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("tasks.id", ondelete="CASCADE"), nullable=False)
 
+    platform: Mapped[Platform] = mapped_column(Enum(Platform, name="platform"), nullable=False, default=Platform.bilibili)
+    account_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), ForeignKey("accounts.id", ondelete="SET NULL"), nullable=True)
     bili_account_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), ForeignKey("accounts.id", ondelete="SET NULL"), nullable=True)
 
     meta_json: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
     cover_key: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
     state: Mapped[PublishState] = mapped_column(Enum(PublishState, name="publish_state"), nullable=False, default=PublishState.draft)
+    external_id: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    external_url: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     bvid: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
     aid: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
     response_json: Mapped[Optional[dict[str, Any]]] = mapped_column(JSONB, nullable=True)
+
+    started_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
 
     task: Mapped["Task"] = relationship(back_populates="publish_jobs")
-    account: Mapped[Optional["Account"]] = relationship()
+    account: Mapped[Optional["Account"]] = relationship(foreign_keys=[account_id])
+    bili_account: Mapped[Optional["Account"]] = relationship(foreign_keys=[bili_account_id])
 
     __table_args__ = (
         Index("ix_publish_jobs_task_state", "task_id", "state"),
+        Index("ix_publish_jobs_platform_state", "platform", "state"),
     )
 
 
@@ -202,6 +216,9 @@ class Account(Base):
     secrets_encrypted: Mapped[str] = mapped_column(Text, nullable=False, default="")
     rotated_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    check_state: Mapped[str] = mapped_column(String(16), nullable=False, default="unchecked")
+    last_checked_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_check_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
     __table_args__ = (

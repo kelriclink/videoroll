@@ -1,27 +1,58 @@
 from __future__ import annotations
 
+import os
+
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+
+from videoroll.apps.orchestrator_api.infrastructure.lifecycle import orchestrator_lifespan
+from videoroll.apps.orchestrator_api.middleware import AdminAuthMiddleware
+from videoroll.apps.orchestrator_api.routers.assets import router as assets_router
+from videoroll.apps.orchestrator_api.routers.auth import router as auth_router
+from videoroll.apps.orchestrator_api.routers.maintenance import router as maintenance_router
+from videoroll.apps.orchestrator_api.routers.publishing import router as publishing_router
+from videoroll.apps.orchestrator_api.routers.settings import router as settings_router
+from videoroll.apps.orchestrator_api.routers.system import router as system_router
+from videoroll.apps.orchestrator_api.routers.tasks import router as tasks_router
+from videoroll.apps.orchestrator_api.routers.youtube import router as youtube_router
 
 
-_DOC_PATHS = {"/openapi.json", "/docs", "/docs/oauth2-redirect", "/redoc"}
+def _value_error_handler(_request, exc: ValueError) -> JSONResponse:
+    return JSONResponse(status_code=400, content={"detail": str(exc)})
 
 
 def create_app(*, install_lifecycle: bool = True) -> FastAPI:
-    """Create an orchestrator app while routes are migrated out of the legacy module.
+    application = FastAPI(
+        title="videoroll-orchestrator",
+        version="0.1.0",
+        lifespan=orchestrator_lifespan if install_lifecycle else None,
+    )
 
-    The legacy bridge is intentionally isolated here and will be removed after all
-    domain routers and lifecycle hooks have moved to their owning modules.
-    """
-    from videoroll.apps.orchestrator_api.main import app as legacy_app
+    application.add_middleware(AdminAuthMiddleware)
+    cors_origins = [
+        origin.strip()
+        for origin in os.getenv(
+            "CORS_ALLOW_ORIGINS",
+            "http://localhost:3000,http://127.0.0.1:3000",
+        ).split(",")
+        if origin.strip()
+    ]
+    application.add_middleware(
+        CORSMiddleware,
+        allow_origins=cors_origins,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
-    application = FastAPI(title="videoroll-orchestrator", version="0.1.0")
-    application.router.routes.extend(route for route in legacy_app.routes if route.path not in _DOC_PATHS)
-    application.exception_handlers.update(legacy_app.exception_handlers)
-    application.user_middleware = list(legacy_app.user_middleware)
-    application.middleware_stack = None
-
-    if install_lifecycle:
-        application.router.on_startup.extend(legacy_app.router.on_startup)
-        application.router.on_shutdown.extend(legacy_app.router.on_shutdown)
-
+    application.include_router(auth_router)
+    application.include_router(system_router)
+    application.include_router(settings_router)
+    application.include_router(maintenance_router)
+    application.include_router(assets_router)
+    application.include_router(youtube_router)
+    application.include_router(publishing_router)
+    application.include_router(tasks_router)
+    application.add_exception_handler(ValueError, _value_error_handler)
     return application
