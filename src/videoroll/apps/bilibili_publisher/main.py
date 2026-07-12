@@ -227,21 +227,26 @@ def _utcnow() -> datetime:
     return datetime.now(tz=timezone.utc)
 
 
-def _latest_publish_job(db: Session, task_id: uuid.UUID, states: set[PublishState]) -> PublishJob | None:
-    return (
-        db.query(PublishJob)
-        .filter(
-            PublishJob.task_id == task_id,
-            PublishJob.platform == Platform.bilibili,
-            PublishJob.state.in_(list(states)),
-        )
-        .order_by(PublishJob.updated_at.desc(), PublishJob.created_at.desc())
-        .first()
+def _latest_publish_job(
+    db: Session,
+    task_id: uuid.UUID,
+    states: set[PublishState],
+    *,
+    batch_id: uuid.UUID | None = None,
+) -> PublishJob | None:
+    query = db.query(PublishJob).filter(
+        PublishJob.task_id == task_id,
+        PublishJob.platform == Platform.bilibili,
+        PublishJob.state.in_(list(states)),
     )
+    if batch_id is not None:
+        query = query.filter(PublishJob.batch_id == batch_id)
+    return query.order_by(PublishJob.updated_at.desc(), PublishJob.created_at.desc()).first()
 
 
 def _publish_response_from_job(job: PublishJob) -> PublishResponse:
     return PublishResponse(
+        job_id=job.id,
         state=job.state.value,
         aid=job.aid,
         bvid=job.bvid,
@@ -255,18 +260,51 @@ def publish(payload: PublishRequest, settings: BilibiliPublisherSettings = Depen
     if not task:
         raise HTTPException(status_code=404, detail="task not found")
 
-    published_job = _latest_publish_job(db, payload.task_id, {PublishState.published})
+    published_job = _latest_publish_job(
+        db, payload.task_id, {PublishState.published}, batch_id=payload.batch_id
+    )
+    if payload.batch_id and not published_job:
+        previous_published_job = _latest_publish_job(db, payload.task_id, {PublishState.published})
+        if previous_published_job:
+            published_job = PublishJob(
+                task_id=payload.task_id,
+                batch_id=payload.batch_id,
+                platform=Platform.bilibili,
+                account_id=previous_published_job.account_id,
+                bili_account_id=previous_published_job.bili_account_id,
+                meta_json=dict(previous_published_job.meta_json or {}),
+                cover_key=previous_published_job.cover_key,
+                state=PublishState.published,
+                external_id=previous_published_job.external_id,
+                external_url=previous_published_job.external_url,
+                bvid=previous_published_job.bvid,
+                aid=previous_published_job.aid,
+                response_json={**dict(previous_published_job.response_json or {}), "reused_from_job_id": str(previous_published_job.id)},
+                started_at=previous_published_job.started_at,
+                finished_at=previous_published_job.finished_at,
+            )
+            db.add(published_job)
+            db.commit()
     if published_job:
-        task.status = TaskStatus.published
-        task.error_code = None
-        task.error_message = None
-        db.add(task)
-        db.commit()
+        if payload.batch_id is None:
+            task.status = TaskStatus.published
+            task.error_code = None
+            task.error_message = None
+            db.add(task)
+            db.commit()
         return _publish_response_from_job(published_job)
 
-    active_job = _latest_publish_job(db, payload.task_id, {PublishState.submitting, PublishState.submitted})
+    active_job = _latest_publish_job(
+        db, payload.task_id, {PublishState.submitting, PublishState.submitted}, batch_id=payload.batch_id
+    )
+    if payload.batch_id and not active_job:
+        active_job = _latest_publish_job(db, payload.task_id, {PublishState.submitting, PublishState.submitted})
+        if active_job and active_job.batch_id is None:
+            active_job.batch_id = payload.batch_id
+            db.add(active_job)
+            db.commit()
     if active_job:
-        if settings.publish_mode != "mock":
+        if settings.publish_mode != "mock" and payload.batch_id is None:
             task.status = TaskStatus.publishing
             db.add(task)
             db.commit()
@@ -274,6 +312,7 @@ def publish(payload: PublishRequest, settings: BilibiliPublisherSettings = Depen
 
     job = PublishJob(
         task_id=payload.task_id,
+        batch_id=payload.batch_id,
         platform=Platform.bilibili,
         account_id=uuid.UUID(str(payload.account_id)) if payload.account_id else None,
         bili_account_id=uuid.UUID(str(payload.account_id)) if payload.account_id else None,
@@ -292,11 +331,12 @@ def publish(payload: PublishRequest, settings: BilibiliPublisherSettings = Depen
     db.refresh(job)
 
     if settings.publish_mode != "mock":
-        task.status = TaskStatus.publishing
-        db.add(task)
-        db.commit()
+        if payload.batch_id is None:
+            task.status = TaskStatus.publishing
+            db.add(task)
+            db.commit()
         celery_app.send_task("bilibili_publisher.process_job", args=[str(job.id)], queue="publish")
-        return PublishResponse(state=job.state.value)
+        return _publish_response_from_job(job)
 
     aid = str(int(uuid.uuid4().int % 1_000_000_000))
     bvid = "BV" + uuid.uuid4().hex[:10]
@@ -310,8 +350,9 @@ def publish(payload: PublishRequest, settings: BilibiliPublisherSettings = Depen
     job.response_json = response
     db.add(job)
 
-    task.status = TaskStatus.published
-    db.add(task)
+    if payload.batch_id is None:
+        task.status = TaskStatus.published
+        db.add(task)
 
     store = S3Store(settings)
     store.ensure_bucket()
@@ -320,11 +361,7 @@ def publish(payload: PublishRequest, settings: BilibiliPublisherSettings = Depen
     db.add(Asset(task_id=task.id, kind=AssetKind.publish_result, storage_key=result_key))
 
     db.commit()
-    try:
-        celery_app.send_task("subtitle_service.cleanup_task", args=[str(task.id)], queue="subtitle")
-    except Exception:
-        pass
-    return PublishResponse(state=job.state.value, aid=aid, bvid=bvid, response=response)
+    return _publish_response_from_job(job)
 
 
 @app.get("/bilibili/publish/jobs/{job_id}", response_model=PublishJobRead)

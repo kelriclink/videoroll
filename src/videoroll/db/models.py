@@ -82,6 +82,32 @@ class PublishState(str, enum.Enum):
     failed = "failed"
 
 
+class PublishBatch(Base):
+    __tablename__ = "publish_batches"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    task_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("tasks.id", ondelete="CASCADE"), nullable=False)
+
+    # Kept as strings instead of a database enum so a new deployment does not
+    # need an enum migration before it can create the batch table.
+    state: Mapped[str] = mapped_column(String(32), nullable=False, default="active")
+    expected_targets: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, nullable=False, default=list)
+    request_json: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    outcomes_json: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+
+    cleanup_enqueued_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+
+    task: Mapped["Task"] = relationship(back_populates="publish_batches")
+    publish_jobs: Mapped[list["PublishJob"]] = relationship(back_populates="batch")
+
+    __table_args__ = (
+        Index("ix_publish_batches_task_state", "task_id", "state"),
+    )
+
+
 class Platform(str, enum.Enum):
     bilibili = "bilibili"
     youtube = "youtube"
@@ -120,6 +146,7 @@ class Task(Base):
     assets: Mapped[list["Asset"]] = relationship(back_populates="task", cascade="all, delete-orphan")
     subtitles: Mapped[list["Subtitle"]] = relationship(back_populates="task", cascade="all, delete-orphan")
     publish_jobs: Mapped[list["PublishJob"]] = relationship(back_populates="task", cascade="all, delete-orphan")
+    publish_batches: Mapped[list["PublishBatch"]] = relationship(back_populates="task", cascade="all, delete-orphan")
 
     __table_args__ = (
         Index("ix_tasks_status_created_at", "status", "created_at"),
@@ -175,6 +202,9 @@ class PublishJob(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     task_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("tasks.id", ondelete="CASCADE"), nullable=False)
+    batch_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("publish_batches.id", ondelete="SET NULL"), nullable=True
+    )
 
     platform: Mapped[Platform] = mapped_column(Enum(Platform, name="platform"), nullable=False, default=Platform.bilibili)
     account_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), ForeignKey("accounts.id", ondelete="SET NULL"), nullable=True)
@@ -197,12 +227,14 @@ class PublishJob(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
 
     task: Mapped["Task"] = relationship(back_populates="publish_jobs")
+    batch: Mapped[Optional["PublishBatch"]] = relationship(back_populates="publish_jobs")
     account: Mapped[Optional["Account"]] = relationship(foreign_keys=[account_id])
     bili_account: Mapped[Optional["Account"]] = relationship(foreign_keys=[bili_account_id])
 
     __table_args__ = (
         Index("ix_publish_jobs_task_state", "task_id", "state"),
         Index("ix_publish_jobs_platform_state", "platform", "state"),
+        Index("ix_publish_jobs_batch_platform_account", "batch_id", "platform", "account_id"),
     )
 
 

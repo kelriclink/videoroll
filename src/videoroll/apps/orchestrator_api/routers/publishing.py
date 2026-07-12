@@ -3,12 +3,13 @@ from __future__ import annotations
 import uuid
 from typing import Any
 
-from fastapi import APIRouter, Depends, File, Form, Query, UploadFile
+from fastapi import APIRouter, Body, Depends, File, Form, Query, UploadFile
 from sqlalchemy.orm import Session
 
 from videoroll.apps.orchestrator_api.dependencies import get_db, get_s3, get_settings
 from videoroll.apps.orchestrator_api.schemas import (
     PublishActionRequest,
+    PublishAllRequest,
     PublishAllResultResponse,
     PublishJobSummary,
     PublishMetaDraftRequest,
@@ -152,7 +153,7 @@ def delete_social_publish_account(
 @router.post("/tasks/{task_id}/actions/publish_all", response_model=PublishAllResultResponse)
 def publish_all_platforms(
     task_id: uuid.UUID,
-    payload: dict[str, Any] | None = None,
+    payload: PublishAllRequest = Body(default_factory=PublishAllRequest),
     settings: OrchestratorSettings = Depends(get_settings),
     db: Session = Depends(get_db),
     s3: S3Store = Depends(get_s3),

@@ -2,6 +2,7 @@
 
 import uuid
 from unittest.mock import MagicMock, patch
+from pathlib import Path
 
 import httpx
 
@@ -77,7 +78,36 @@ def test_skipped_counts_as_non_ok():
     assert r.errors == {"douyin": "already published"}
 
 
+def test_accepted_results_are_not_reported_as_published() -> None:
+    r = PublishAllResult(
+        results={
+            "bilibili": {"status": "accepted", "state": "published"},
+            "douyin": {"status": "accepted", "state": "submitting"},
+        }
+    )
+
+    assert r.all_accepted is True
+    assert r.has_any_accepted is True
+    assert r.all_published is False
+
+
+def test_publish_service_does_not_import_orchestrator_api() -> None:
+    source = Path("src/videoroll/apps/publish_service.py").read_text(encoding="utf-8")
+
+    assert "orchestrator_api" not in source
+
+
 # ── PublishService.publish() ──────────────────────────────────
+
+
+def _publish_batch(*targets: tuple[str, str | None]) -> tuple[MagicMock, list[dict[str, str | None]]]:
+    batch = MagicMock()
+    batch.id = uuid.uuid4()
+    batch.request_json = {}
+    return batch, [
+        {"platform": platform, "account_id": account_id, "key": f"{platform}:{account_id or 'default'}"}
+        for platform, account_id in targets
+    ]
 
 
 @patch("videoroll.apps.publish_service.get_publish_platform_settings")
@@ -112,7 +142,14 @@ def test_publish_calls_all_enabled_platforms(mock_client_cls, mock_build, mock_g
     db.get.return_value = task
 
     svc = PublishService(db, MagicMock(), MagicMock())
-    result = svc.publish(uuid.uuid4())
+    batch, targets = _publish_batch(("bilibili", None), ("douyin", None))
+    reconciliation = MagicMock(cleanup_enqueued=False)
+    with (
+        patch.object(svc, "_get_or_create_batch", return_value=(batch, targets)),
+        patch.object(svc, "_latest_batch_target_job", return_value=None),
+        patch("videoroll.apps.publish_service.reconcile_publish_batch", return_value=reconciliation),
+    ):
+        result = svc.publish(uuid.uuid4())
 
     assert result.platform_count == 2
     assert "bilibili" in result.results
@@ -178,7 +215,15 @@ def test_publish_isolates_errors(mock_client_cls, mock_build, mock_get_settings)
     db.get.return_value = task
 
     svc = PublishService(db, MagicMock(), MagicMock())
-    result = svc.publish(uuid.uuid4())
+    batch, targets = _publish_batch(("bilibili", None), ("douyin", None))
+    reconciliation = MagicMock(cleanup_enqueued=False)
+    with (
+        patch.object(svc, "_get_or_create_batch", return_value=(batch, targets)),
+        patch.object(svc, "_latest_batch_target_job", return_value=None),
+        patch("videoroll.apps.publish_service.reconcile_publish_batch", return_value=reconciliation),
+        patch("videoroll.apps.publish_service.record_publish_batch_dispatch_error", return_value=reconciliation),
+    ):
+        result = svc.publish(uuid.uuid4())
 
     assert result.has_any_ok is True
     assert result.all_ok is False
@@ -218,16 +263,20 @@ def test_publish_rechecks_platform_when_task_is_already_published(
     mock_client_cls.return_value = client
 
     svc = PublishService(db, MagicMock(), MagicMock())
-    result = svc.publish(uuid.uuid4())
+    batch, targets = _publish_batch(("bilibili", None))
+    reconciliation = MagicMock(cleanup_enqueued=False)
+    with (
+        patch.object(svc, "_get_or_create_batch", return_value=(batch, targets)),
+        patch.object(svc, "_latest_batch_target_job", return_value=None),
+        patch("videoroll.apps.publish_service.reconcile_publish_batch", return_value=reconciliation),
+    ):
+        result = svc.publish(uuid.uuid4())
 
-    assert result.results["bilibili"]["status"] == "ok"
+    assert result.results["bilibili"]["status"] == "accepted"
     client.post.assert_called_once()
 
 
-@patch(
-    "videoroll.apps.orchestrator_api.services.publishing_service."
-    "build_publish_gateway_request"
-)
+@patch("videoroll.apps.publish_service.build_publish_gateway_request")
 def test_build_backend_request_converts_auto_payload_to_gateway_request(mock_build):
     task_id = uuid.uuid4()
     task = MagicMock()
@@ -252,17 +301,14 @@ def test_build_backend_request_converts_auto_payload_to_gateway_request(mock_bui
     )
 
     request_payload = mock_build.call_args.kwargs["payload"]
-    assert request_payload.platform == "bilibili"
-    assert request_payload.video_key == "final.mp4"
-    assert request_payload.cover_key == "cover.jpg"
-    assert request_payload.typeid_mode == "ai_summary"
+    assert request_payload["platform"] == "bilibili"
+    assert request_payload["video_key"] == "final.mp4"
+    assert request_payload["cover_key"] == "cover.jpg"
+    assert request_payload["typeid_mode"] == "ai_summary"
     assert result["video"] == {"type": "s3", "key": "final.mp4"}
 
 
-@patch(
-    "videoroll.apps.orchestrator_api.services.publishing_service."
-    "build_publish_gateway_request"
-)
+@patch("videoroll.apps.publish_service.build_publish_gateway_request")
 def test_build_backend_request_selects_valid_social_account(mock_build):
     task_id = uuid.uuid4()
     account_id = uuid.uuid4()
@@ -288,8 +334,8 @@ def test_build_backend_request_selects_valid_social_account(mock_build):
     )
 
     request_payload = mock_build.call_args.kwargs["payload"]
-    assert request_payload.platform == "douyin"
-    assert request_payload.account_id == str(account_id)
+    assert request_payload["platform"] == "douyin"
+    assert request_payload["account_id"] == str(account_id)
     db.query.assert_called_once_with(Account)
 
 

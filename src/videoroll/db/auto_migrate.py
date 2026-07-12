@@ -135,6 +135,7 @@ def _ensure_publish_jobs_generic_columns(engine: Engine) -> None:
     dialect = (engine.dialect.name or "").lower()
     ts_type = "TIMESTAMPTZ" if dialect == "postgresql" else "TIMESTAMP"
     required_columns = {
+        "batch_id": "UUID",
         "platform": "VARCHAR(32) DEFAULT 'bilibili' NOT NULL",
         "account_id": "UUID",
         "external_id": "VARCHAR(128)",
@@ -150,6 +151,26 @@ def _ensure_publish_jobs_generic_columns(engine: Engine) -> None:
 
     with engine.begin() as conn:
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_publish_jobs_platform_state ON publish_jobs (platform, state)"))
+        conn.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_publish_jobs_batch_platform_account "
+                "ON publish_jobs (batch_id, platform, account_id)"
+            )
+        )
+
+
+def _ensure_publish_batch_columns(engine: Engine) -> None:
+    insp = inspect(engine)
+    if "publish_batches" not in set(insp.get_table_names()):
+        return
+    cols = {c.get("name") for c in insp.get_columns("publish_batches")}
+    required_columns = {
+        "request_json": "JSONB NOT NULL DEFAULT '{}'::jsonb" if (engine.dialect.name or "").lower() == "postgresql" else "JSON NOT NULL DEFAULT '{}'",
+    }
+    for column, column_type_sql in required_columns.items():
+        if column not in cols:
+            _add_column(engine, "publish_batches", column, column_type_sql)
+            logger.warning("auto-migrated DB: added publish_batches.%s", column)
 
 
 def _ensure_account_check_columns(engine: Engine) -> None:
@@ -535,6 +556,7 @@ def auto_migrate_engine(engine: Engine) -> None:
         _ensure_tasks_lock_columns(engine)
         _ensure_youtube_sources_columns(engine)
         _ensure_publish_jobs_generic_columns(engine)
+        _ensure_publish_batch_columns(engine)
         _ensure_account_check_columns(engine)
         _ensure_scheduler_indexes(engine)
         _ensure_pgvector_rag_tables(engine)

@@ -29,6 +29,7 @@ from videoroll.apps.bilibili_publisher.schemas import BilibiliPublishMeta
 from videoroll.apps.bilibili_publisher.storage_keys import unique_publish_result_key
 from videoroll.apps.bilibili_publisher.typeid_recommender import flatten_typelist
 from videoroll.apps.publish_meta_rules import bilibili_text_units, clamp_bilibili_text
+from videoroll.apps.publish_lifecycle import enqueue_publish_batch_cleanup, reconcile_publish_batch
 from videoroll.config import get_bilibili_publisher_settings, get_subtitle_settings
 from videoroll.db.base import Base
 from videoroll.db.auto_migrate import auto_migrate
@@ -557,6 +558,12 @@ def _can_mark_task_publish_failed(db: Session, task: Task) -> bool:
     return task.status != TaskStatus.published and not _task_has_published_job(db, task.id)
 
 
+def _reconcile_batch_after_publish_job(db: Session, job: PublishJob) -> bool:
+    if job.batch_id is None:
+        return False
+    return reconcile_publish_batch(db, job.batch_id).cleanup_enqueued
+
+
 def _mirror_published_job(job: PublishJob, published_job: PublishJob | None, task: Task) -> None:
     job.state = PublishState.published
     job.aid = published_job.aid if published_job else job.aid
@@ -569,9 +576,10 @@ def _mirror_published_job(job: PublishJob, published_job: PublishJob | None, tas
         "reason": "task already published",
     }
     job.updated_at = _utcnow()
-    task.status = TaskStatus.published
-    task.error_code = None
-    task.error_message = None
+    if job.batch_id is None:
+        task.status = TaskStatus.published
+        task.error_code = None
+        task.error_message = None
 
 
 def _add_archive_with_desc_retry(
@@ -642,7 +650,10 @@ def process_job(self, job_id: str) -> dict[str, Any]:
             _mirror_published_job(job, published_job, task)
             db.add(job)
             db.add(task)
+            cleanup_enqueued = _reconcile_batch_after_publish_job(db, job)
             db.commit()
+            if job.batch_id is not None:
+                enqueue_publish_batch_cleanup(task.id, job.batch_id, needed=cleanup_enqueued)
             return {"status": "skipped", "detail": "task already published", "aid": job.aid, "bvid": job.bvid}
 
         cookie = (get_bilibili_cookie_header(db) or "").strip()
@@ -856,10 +867,14 @@ def process_job(self, job_id: str) -> dict[str, Any]:
         job.updated_at = _utcnow()
         db.add(job)
 
-        task.status = TaskStatus.published
-        task.error_code = None
-        task.error_message = None
-        db.add(task)
+        cleanup_enqueued = False
+        if job.batch_id is not None:
+            cleanup_enqueued = _reconcile_batch_after_publish_job(db, job)
+        else:
+            task.status = TaskStatus.published
+            task.error_code = None
+            task.error_message = None
+            db.add(task)
 
         result_key = unique_publish_result_key(task.id)
         result_bytes = json.dumps(job.response_json, ensure_ascii=False, indent=2).encode("utf-8")
@@ -868,9 +883,9 @@ def process_job(self, job_id: str) -> dict[str, Any]:
 
         db.commit()
         try:
-            celery_app.send_task("subtitle_service.cleanup_task", args=[str(task.id)], queue="subtitle")
+            enqueue_publish_batch_cleanup(task.id, job.batch_id, needed=cleanup_enqueued) if job.batch_id else None
         except Exception:
-            logger.exception("failed to enqueue cleanup task (task_id=%s)", task.id)
+            logger.exception("failed to enqueue batch cleanup task (task_id=%s batch_id=%s)", task.id, job.batch_id)
         return {"status": "ok", "aid": aid_str or None, "bvid": bvid_str or None}
     except Retry:
         raise
@@ -923,7 +938,9 @@ def process_job(self, job_id: str) -> dict[str, Any]:
                 db.add(job)
             if task is None and job:
                 task = db.get(Task, job.task_id)
-            if task:
+            if job and job.batch_id is not None:
+                _reconcile_batch_after_publish_job(db, job)
+            elif task:
                 task.status = TaskStatus.publishing
                 db.add(task)
             if store is None:
@@ -973,7 +990,10 @@ def process_job(self, job_id: str) -> dict[str, Any]:
                     db.add(job)
                 if task is None and job:
                     task = db.get(Task, job.task_id)
-                if task and _can_mark_task_publish_failed(db, task):
+                cleanup_enqueued = False
+                if job and job.batch_id is not None:
+                    cleanup_enqueued = _reconcile_batch_after_publish_job(db, job)
+                elif task and _can_mark_task_publish_failed(db, task):
                     task.status = TaskStatus.failed
                     task.error_code = "PUBLISH_RATE_LIMITED"
                     task.error_message = e.message or str(e)
@@ -990,6 +1010,8 @@ def process_job(self, job_id: str) -> dict[str, Any]:
                     )
                     _ensure_publish_result_asset(db, task.id, result_key)
                 db.commit()
+                if job and job.batch_id is not None:
+                    enqueue_publish_batch_cleanup(task.id, job.batch_id, needed=cleanup_enqueued)
             except Exception:
                 pass
             return {"status": "error", "detail": "rate limited; max retries exceeded"}
@@ -1010,7 +1032,10 @@ def process_job(self, job_id: str) -> dict[str, Any]:
                 db.add(job)
             if task is None and job:
                 task = db.get(Task, job.task_id)
-            if task and _can_mark_task_publish_failed(db, task):
+            cleanup_enqueued = False
+            if job and job.batch_id is not None:
+                cleanup_enqueued = _reconcile_batch_after_publish_job(db, job)
+            elif task and _can_mark_task_publish_failed(db, task):
                 task.status = TaskStatus.failed
                 task.error_code = "PUBLISH_FAILED"
                 task.error_message = str(e)
@@ -1028,6 +1053,8 @@ def process_job(self, job_id: str) -> dict[str, Any]:
                 store.put_bytes(result_bytes, result_key, content_type="application/json")
                 _ensure_publish_result_asset(db, task.id, result_key)
             db.commit()
+            if job and job.batch_id is not None:
+                enqueue_publish_batch_cleanup(task.id, job.batch_id, needed=cleanup_enqueued)
         except Exception:
             pass
         return {"status": "error", "detail": str(e)}

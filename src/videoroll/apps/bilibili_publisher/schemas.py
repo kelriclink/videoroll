@@ -180,6 +180,7 @@ class InputRef(BaseModel):
 
 class PublishRequest(BaseModel):
     task_id: uuid.UUID
+    batch_id: Optional[uuid.UUID] = None
     account_id: Optional[str] = None
     typeid_mode: Literal["meta", "bilibili_predict", "ai_summary"] = "bilibili_predict"
     video: InputRef
@@ -213,6 +214,7 @@ class BilibiliTypeRecommendResponse(BaseModel):
 
 
 class PublishResponse(BaseModel):
+    job_id: Optional[uuid.UUID] = None
     state: str
     aid: Optional[str] = None
     bvid: Optional[str] = None

@@ -20,6 +20,7 @@ from videoroll.apps.social_publisher.sau_cli import (
     build_upload_video_command,
     run_sau_command,
 )
+from videoroll.apps.publish_lifecycle import enqueue_publish_batch_cleanup, reconcile_publish_batch
 from videoroll.config import get_social_publisher_settings
 from videoroll.db.auto_migrate import auto_migrate
 from videoroll.db.models import Account, Platform, PublishJob, PublishState, Task, TaskStatus
@@ -80,6 +81,12 @@ def _mark_task_error(task: Task | None, code: str, message: str) -> None:
     task.error_message = _clean_message(message)
     if code == "SOCIAL_PUBLISH_FAILED":
         task.status = TaskStatus.failed
+
+
+def _reconcile_batch_after_publish_job(db: Session, job: PublishJob) -> bool:
+    if job.batch_id is None:
+        return False
+    return reconcile_publish_batch(db, job.batch_id).cleanup_enqueued
 
 
 @celery_app.task(name="social_publisher.check_account", bind=True, max_retries=20)
@@ -218,13 +225,18 @@ def process_job(self, job_id: str) -> dict[str, Any]:
             "stdout": result.stdout,
             "stderr": result.stderr,
         }
-        if task and task.status not in {TaskStatus.published, TaskStatus.canceled}:
+        cleanup_enqueued = False
+        if job.batch_id is not None:
+            cleanup_enqueued = _reconcile_batch_after_publish_job(db, job)
+        elif task and task.status not in {TaskStatus.published, TaskStatus.canceled}:
             task.status = TaskStatus.publishing
             task.error_code = None if job.state == PublishState.submitted else "SOCIAL_PUBLISH_UNKNOWN"
             task.error_message = None if job.state == PublishState.submitted else "social publish result is unknown; check platform backend before retrying"
             db.add(task)
         db.add(job)
         db.commit()
+        if job.batch_id is not None:
+            enqueue_publish_batch_cleanup(task.id, job.batch_id, needed=cleanup_enqueued)
         return {"status": job.state.value, "job_id": str(job.id)}
     except Retry:
         raise
@@ -235,11 +247,17 @@ def process_job(self, job_id: str) -> dict[str, Any]:
             job.state = PublishState.unknown if started else PublishState.failed
             job.finished_at = datetime.now(timezone.utc)
             job.response_json = {"error": _clean_message(exc), "started": started}
-            _mark_task_error(task, "SOCIAL_PUBLISH_UNKNOWN" if started else "SOCIAL_PUBLISH_FAILED", _clean_message(exc))
+            cleanup_enqueued = False
+            if job.batch_id is not None:
+                cleanup_enqueued = _reconcile_batch_after_publish_job(db, job)
+            else:
+                _mark_task_error(task, "SOCIAL_PUBLISH_UNKNOWN" if started else "SOCIAL_PUBLISH_FAILED", _clean_message(exc))
             db.add(job)
             if task is not None:
                 db.add(task)
             db.commit()
+            if job.batch_id is not None and task is not None:
+                enqueue_publish_batch_cleanup(task.id, job.batch_id, needed=cleanup_enqueued)
             return {"status": job.state.value, "detail": _clean_message(exc)}
         return {"status": "error", "detail": _clean_message(exc)}
     finally:
@@ -281,13 +299,19 @@ def mark_stale_jobs_unknown() -> dict[str, int]:
             )
             .all()
         )
+        cleanup_batches: list[tuple[uuid.UUID, uuid.UUID]] = []
         for job in running:
             job.state = PublishState.unknown
             job.finished_at = now
             job.response_json = {**_as_dict(job.response_json), "error": "worker execution timed out"}
             db.add(job)
             task = db.get(Task, job.task_id)
-            _mark_task_error(task, "SOCIAL_PUBLISH_UNKNOWN", "worker execution timed out; check platform backend before retrying")
+            if job.batch_id is not None:
+                result = reconcile_publish_batch(db, job.batch_id)
+                if result.cleanup_enqueued:
+                    cleanup_batches.append((job.task_id, job.batch_id))
+            else:
+                _mark_task_error(task, "SOCIAL_PUBLISH_UNKNOWN", "worker execution timed out; check platform backend before retrying")
             if task is not None:
                 db.add(task)
         for job in queued:
@@ -296,10 +320,17 @@ def mark_stale_jobs_unknown() -> dict[str, int]:
             job.response_json = {**_as_dict(job.response_json), "error": "job expired before browser execution"}
             db.add(job)
             task = db.get(Task, job.task_id)
-            _mark_task_error(task, "SOCIAL_PUBLISH_FAILED", "job expired before browser execution")
+            if job.batch_id is not None:
+                result = reconcile_publish_batch(db, job.batch_id)
+                if result.cleanup_enqueued:
+                    cleanup_batches.append((job.task_id, job.batch_id))
+            else:
+                _mark_task_error(task, "SOCIAL_PUBLISH_FAILED", "job expired before browser execution")
             if task is not None:
                 db.add(task)
         db.commit()
+        for task_id, batch_id in cleanup_batches:
+            enqueue_publish_batch_cleanup(task_id, batch_id, needed=True)
         return {"unknown": len(running), "failed": len(queued)}
     finally:
         db.close()

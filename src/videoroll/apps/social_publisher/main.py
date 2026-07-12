@@ -221,17 +221,52 @@ def publish(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     active_states = [PublishState.submitting, PublishState.submitted, PublishState.unknown, PublishState.published]
-    existing = (
-        db.query(PublishJob)
-        .filter(
-            PublishJob.task_id == payload.task_id,
-            PublishJob.platform == Platform(value),
-            PublishJob.account_id == payload.account_id,
-            PublishJob.state.in_(active_states),
-        )
-        .order_by(PublishJob.created_at.desc())
-        .first()
+    existing_query = db.query(PublishJob).filter(
+        PublishJob.task_id == payload.task_id,
+        PublishJob.platform == Platform(value),
+        PublishJob.account_id == payload.account_id,
+        PublishJob.state.in_(active_states),
     )
+    if payload.batch_id is not None:
+        existing_query = existing_query.filter(PublishJob.batch_id == payload.batch_id)
+    existing = existing_query.order_by(PublishJob.created_at.desc()).first()
+    if payload.batch_id is not None and existing is None:
+        prior = (
+            db.query(PublishJob)
+            .filter(
+                PublishJob.task_id == payload.task_id,
+                PublishJob.platform == Platform(value),
+                PublishJob.account_id == payload.account_id,
+                PublishJob.state.in_(active_states),
+            )
+            .order_by(PublishJob.created_at.desc())
+            .first()
+        )
+        if prior and prior.state in {PublishState.submitted, PublishState.published}:
+            existing = PublishJob(
+                task_id=task.id,
+                batch_id=payload.batch_id,
+                platform=prior.platform,
+                account_id=prior.account_id,
+                bili_account_id=prior.bili_account_id,
+                cover_key=prior.cover_key,
+                meta_json={**_as_dict(prior.meta_json), "reused_from_job_id": str(prior.id)},
+                state=prior.state,
+                external_id=prior.external_id,
+                external_url=prior.external_url,
+                bvid=prior.bvid,
+                aid=prior.aid,
+                response_json=prior.response_json,
+                started_at=prior.started_at,
+                finished_at=prior.finished_at,
+            )
+            db.add(existing)
+            db.commit()
+        elif prior and prior.batch_id is None and prior.state in {PublishState.submitting, PublishState.unknown}:
+            prior.batch_id = payload.batch_id
+            db.add(prior)
+            db.commit()
+            existing = prior
     if existing and not (payload.force_retry and existing.state in {PublishState.submitted, PublishState.unknown}):
         return _response_from_job(existing)
 
@@ -248,6 +283,7 @@ def publish(
         meta_json["retry_of_job_id"] = str(existing.id)
     job = PublishJob(
         task_id=task.id,
+        batch_id=payload.batch_id,
         platform=Platform(value),
         account_id=account.id,
         cover_key=payload.cover.key if payload.cover else None,
@@ -255,7 +291,7 @@ def publish(
         state=PublishState.submitting,
     )
     db.add(job)
-    if task.status not in {TaskStatus.published, TaskStatus.canceled}:
+    if payload.batch_id is None and task.status not in {TaskStatus.published, TaskStatus.canceled}:
         task.status = TaskStatus.publishing
         task.error_code = None
         task.error_message = None

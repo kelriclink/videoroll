@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 from videoroll.ai.service import AIService
 from videoroll.apps.bilibili_publisher.schemas import BilibiliPublishMeta
 from videoroll.apps.orchestrator_api.infrastructure.internal_http import internal_http_headers
-from videoroll.apps.orchestrator_api.schemas import PublishActionRequest, RemotePublishResponse
+from videoroll.apps.orchestrator_api.schemas import PublishActionRequest, PublishAllRequest, RemotePublishResponse
 from videoroll.apps.orchestrator_api.services.asset_service import (
     as_dict,
     read_s3_bytes,
@@ -640,7 +640,7 @@ def enqueue_publish_job(
 
 def publish_all(
     task_id: uuid.UUID,
-    publish_payload: dict[str, Any] | None,
+    publish_payload: PublishAllRequest,
     settings: OrchestratorSettings,
     db: Session,
     s3: S3Store,
@@ -654,16 +654,18 @@ def publish_all(
     if task.source_license.value == "unknown":
         raise HTTPException(status_code=400, detail="source_license=unknown; add proof before publishing")
 
-    payload = dict(publish_payload or {})
+    payload = publish_payload.model_dump()
+    platform_meta = payload.get("platform_meta")
+    bilibili_meta = platform_meta.get("bilibili") if isinstance(platform_meta, dict) else None
     meta = prepare_publish_meta(
         task=task,
-        payload_meta=as_dict(payload.get("meta")) or None,
+        payload_meta=as_dict(bilibili_meta or payload.get("meta")) or None,
         db=db,
         s3=s3,
         allow_auto_draft=False,
     )
     payload["meta"] = meta
-    if not bool(payload.get("skip_review")):
+    if not publish_payload.skip_review:
         review_result = run_task_publish_review(task, meta=meta, db=db, s3=s3)
         if not bool(review_result.get("ok")):
             raise HTTPException(
@@ -680,8 +682,11 @@ def publish_all(
         raise HTTPException(status_code=409, detail="no publish platforms are enabled")
     return {
         "results": result.results,
-        "all_ok": result.all_ok,
-        "has_any_ok": result.has_any_ok,
+        "batch_id": result.batch_id,
+        "all_accepted": result.all_accepted,
+        "has_any_accepted": result.has_any_accepted,
+        "all_published": result.all_published,
+        "all_succeeded": result.all_succeeded,
         "platform_count": result.platform_count,
         "ok_count": result.ok_count,
         "error_count": result.error_count,

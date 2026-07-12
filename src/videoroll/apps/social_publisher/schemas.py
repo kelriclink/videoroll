@@ -49,6 +49,7 @@ class InputRef(BaseModel):
 class SocialPublishRequest(BaseModel):
     platform: SocialPlatform
     task_id: uuid.UUID
+    batch_id: uuid.UUID | None = None
     account_id: uuid.UUID
     video: InputRef
     cover: InputRef | None = None

@@ -104,14 +104,36 @@ class PublishActionRequest(BaseModel):
     force_retry: bool = False
 
 
+class PublishAllRequest(BaseModel):
+    """Validated multi-platform publish input.
+
+    ``meta`` remains the shared/Bilibili fallback.  ``platform_meta`` takes
+    precedence for an individual platform and is normalized before dispatch.
+    """
+
+    account_id: Optional[str] = None
+    account_ids: dict[str, str] = Field(default_factory=dict)
+    video_key: Optional[str] = None
+    cover_key: Optional[str] = None
+    typeid_mode: Optional[str] = None
+    meta: Optional[dict[str, Any]] = None
+    platform_meta: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    platform_options: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    skip_review: bool = False
+    force_retry: bool = False
+
+
 class PublishPlatformSettingsRead(BaseModel):
     platforms: dict[str, bool] = Field(default_factory=dict)
 
 
 class PublishAllResultResponse(BaseModel):
+    batch_id: Optional[uuid.UUID] = None
     results: dict[str, dict[str, Any]] = Field(default_factory=dict)
-    all_ok: bool = False
-    has_any_ok: bool = False
+    all_accepted: bool = False
+    has_any_accepted: bool = False
+    all_published: bool = False
+    all_succeeded: bool = False
     platform_count: int = 0
     ok_count: int = 0
     error_count: int = 0

@@ -30,6 +30,7 @@ from videoroll.db.models import (
     AppSetting,
     Asset,
     AssetKind,
+    PublishBatch,
     RenderJob,
     RenderJobStatus,
     SourceType,
@@ -2314,7 +2315,6 @@ def process_render_job(self: Any, render_job_id: str) -> dict[str, Any]:
 def after_render_publish(render_job_id: str) -> dict[str, Any]:
     _ensure_db()
     db = _db()
-    orch_base = str(settings.orchestrator_url or "").strip().rstrip("/") or "http://localhost:8000"
     try:
         rid = uuid.UUID(render_job_id)
         rj = db.get(RenderJob, rid)
@@ -2324,9 +2324,6 @@ def after_render_publish(render_job_id: str) -> dict[str, Any]:
         task = db.get(Task, rj.task_id)
         if not task:
             return {"status": "error", "detail": "task not found"}
-        if task.status == TaskStatus.published:
-            return {"status": "skipped", "detail": "already published"}
-
         req = rj.request_json if isinstance(rj.request_json, dict) else {}
         after_render = req.get("after_render") if isinstance(req.get("after_render"), dict) else {}
         if not after_render.get("publish"):
@@ -2341,18 +2338,24 @@ def after_render_publish(render_job_id: str) -> dict[str, Any]:
         if publish_payload.get("video_key") in {"", None}:
             publish_payload["video_key"] = None
 
-        with httpx.Client(timeout=60.0, headers=_ORCH_INTERNAL_HEADERS) as client:
-            resp = client.post(f"{orch_base}/tasks/{task.id}/actions/publish_all", json=publish_payload)
-            resp.raise_for_status()
-            result_data = resp.json() if resp.content else {}
+        from videoroll.apps.orchestrator_api.schemas import PublishAllRequest
+        from videoroll.apps.orchestrator_api.services.publishing_service import publish_all
+
+        result_data = publish_all(
+            task.id,
+            PublishAllRequest.model_validate(publish_payload),
+            settings,
+            db,
+            S3Store(settings),
+        )
 
         # Log partial failures but don't fail the task if at least one platform succeeded.
         errors = result_data.get("errors", {}) if isinstance(result_data, dict) else {}
         if errors:
             logger.warning("after_render_publish partial failure for task %s: %s", task.id, errors)
-        if not result_data.get("has_any_ok", False) and errors:
+        if not result_data.get("has_any_accepted", False) and errors:
             error_details = "; ".join(f"{p}: {msg}" for p, msg in errors.items())
-            raise RuntimeError(f"all platforms failed: {error_details}")
+            return {"status": "error", "detail": f"all platforms failed: {error_details}", "platforms": result_data}
 
         return {"status": "ok", "platforms": result_data}
     except Exception as e:
@@ -2370,7 +2373,7 @@ def after_render_publish(render_job_id: str) -> dict[str, Any]:
 
 
 @celery_app.task(name="subtitle_service.cleanup_task")
-def cleanup_task(task_id: str) -> dict[str, Any]:
+def cleanup_task(task_id: str, batch_id: str | None = None) -> dict[str, Any]:
     """
     Best-effort cleanup after a task is published:
       - delete local WORK_DIR temp dirs for subtitle/render/youtube
@@ -2390,7 +2393,13 @@ def cleanup_task(task_id: str) -> dict[str, Any]:
         task = db.get(Task, tid)
         if not task:
             return {"status": "error", "detail": "task not found"}
-        if task.status != TaskStatus.published:
+        if batch_id:
+            batch = db.get(PublishBatch, uuid.UUID(batch_id))
+            if not batch or batch.task_id != tid:
+                return {"status": "skipped", "detail": "publish batch not found for task"}
+            if batch.state != "succeeded":
+                return {"status": "skipped", "detail": f"publish batch state is {batch.state}"}
+        elif task.status != TaskStatus.published:
             return {"status": "skipped", "detail": f"task status is {task.status.value}"}
 
         in_flight_sub = (
@@ -2737,11 +2746,9 @@ def auto_youtube_pipeline(self: Any, task_id: str, overrides: dict[str, Any] | N
             celery_app.send_task("subtitle_service.task_queue_tick", args=[], queue="subtitle")
             return {"status": "ok", "task_id": str(tid), "detail": f"queued subtitle job {job.id}"}
 
+        result_data: dict[str, Any] = {}
         if profile.get("auto_publish"):
             task = db.get(Task, tid)
-            if task and task.status == TaskStatus.published:
-                return {"status": "ok", "task_id": str(tid), "detail": "already published"}
-
             if not final_asset:
                 raise RuntimeError("no final video asset found; enable burn_in/soft_sub in auto profile")
 
@@ -2773,18 +2780,29 @@ def auto_youtube_pipeline(self: Any, task_id: str, overrides: dict[str, Any] | N
                 "meta": None,
             }
 
-            with httpx.Client(timeout=60.0, headers=_ORCH_INTERNAL_HEADERS) as client:
-                resp = client.post(f"{orch_base}/tasks/{tid}/actions/publish_all", json=publish_payload)
-                resp.raise_for_status()
-                result_data = resp.json() if resp.content else {}
+            from videoroll.apps.orchestrator_api.schemas import PublishAllRequest
+            from videoroll.apps.orchestrator_api.services.publishing_service import publish_all
+
+            result_data = publish_all(
+                tid,
+                PublishAllRequest.model_validate(publish_payload),
+                settings,
+                db,
+                store,
+            )
 
             # Log partial failures but don't fail the task if at least one platform succeeded.
             errors = result_data.get("errors", {}) if isinstance(result_data, dict) else {}
             if errors:
                 logger.warning("auto_youtube_pipeline partial failure for task %s: %s", tid, errors)
-            if not result_data.get("has_any_ok", False) and errors:
+            if not result_data.get("has_any_accepted", False) and errors:
                 error_details = "; ".join(f"{p}: {msg}" for p, msg in errors.items())
-                raise RuntimeError(f"all platforms failed: {error_details}")
+                return {
+                    "status": "error",
+                    "task_id": str(tid),
+                    "detail": f"all platforms failed: {error_details}",
+                    "platforms": result_data,
+                }
 
         return {"status": "ok", "task_id": str(tid), "platforms": result_data}
     except Retry:
