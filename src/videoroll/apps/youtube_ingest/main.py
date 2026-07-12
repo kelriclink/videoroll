@@ -10,6 +10,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from videoroll.config import YouTubeIngestSettings, get_youtube_ingest_settings
+from videoroll.apps.security.service_auth import install_internal_service_auth, service_token
 from videoroll.db.base import Base
 from videoroll.db.auto_migrate import auto_migrate
 from videoroll.db.models import (
@@ -61,11 +62,13 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+install_internal_service_auth(app, get_youtube_ingest_settings)
 
 
 @app.on_event("startup")
 def _startup() -> None:
     settings = get_youtube_ingest_settings()
+    app.state.internal_service_token = service_token(settings)
     engine = get_engine(settings.database_url)
     Base.metadata.create_all(engine)
     auto_migrate(settings.database_url)

@@ -13,6 +13,7 @@ from sqlalchemy import and_, or_
 from sqlalchemy.orm import Session
 
 from videoroll.ai.service import AIService
+from videoroll.apps.security.service_auth import install_internal_service_auth, service_token
 from videoroll.config import BilibiliPublisherSettings, get_bilibili_publisher_settings, get_subtitle_settings
 from videoroll.db.base import Base
 from videoroll.db.auto_migrate import auto_migrate
@@ -68,11 +69,13 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+install_internal_service_auth(app, get_bilibili_publisher_settings)
 
 
 @app.on_event("startup")
 def _startup() -> None:
     settings = get_bilibili_publisher_settings()
+    app.state.internal_service_token = service_token(settings)
     engine = get_engine(settings.database_url)
     Base.metadata.create_all(engine)
     auto_migrate(settings.database_url)

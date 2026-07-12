@@ -18,13 +18,23 @@ class CommonSettings(BaseSettings):
     database_url: str = Field(..., alias="DATABASE_URL")
     redis_url: str = Field(..., alias="REDIS_URL")
 
+    development_mode: bool = Field(False, alias="DEVELOPMENT_MODE")
+    trust_proxy_headers: bool = Field(False, alias="TRUST_PROXY_HEADERS")
+    internal_api_secret: str = Field(
+        "videoroll-development-internal-secret",
+        alias="INTERNAL_API_SECRET",
+    )
+    admin_bootstrap_secret: str = Field(
+        "videoroll-development-bootstrap-secret",
+        alias="ADMIN_BOOTSTRAP_SECRET",
+    )
+
     s3_endpoint_url: str = Field(..., alias="S3_ENDPOINT_URL")
     s3_access_key_id: str = Field(..., alias="S3_ACCESS_KEY_ID")
     s3_secret_access_key: str = Field(..., alias="S3_SECRET_ACCESS_KEY")
     s3_bucket: str = Field(..., alias="S3_BUCKET")
     s3_region_name: str = Field("us-east-1", alias="S3_REGION_NAME")
     s3_use_ssl: bool = Field(False, alias="S3_USE_SSL")
-
 
 class OrchestratorSettings(CommonSettings):
     subtitle_service_url: str = Field("http://subtitle-service:8001", alias="SUBTITLE_SERVICE_URL")

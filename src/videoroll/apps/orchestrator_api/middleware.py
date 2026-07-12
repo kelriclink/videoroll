@@ -13,6 +13,18 @@ from videoroll.apps.orchestrator_api.admin_auth_store import (
 )
 from videoroll.apps.orchestrator_api.remote_api_settings_store import REMOTE_AUTO_YOUTUBE_PATH
 from videoroll.apps.orchestrator_api.services.auth_service import get_admin_password_hash
+from videoroll.apps.security.service_auth import INTERNAL_TOKEN_HEADER as SERVICE_TOKEN_HEADER
+
+
+def _inject_internal_header(request: Request, token: str) -> None:
+    header_name = SERVICE_TOKEN_HEADER.lower().encode("ascii")
+    headers = [
+        (name, value)
+        for name, value in request.scope.get("headers", [])
+        if name.lower() != header_name
+    ]
+    headers.append((header_name, token.encode("ascii")))
+    request.scope["headers"] = headers
 
 
 class AdminAuthMiddleware(BaseHTTPMiddleware):
@@ -48,6 +60,8 @@ class AdminAuthMiddleware(BaseHTTPMiddleware):
             internal_secret=cookie_secret,
             password_hash=password_hash,
         ):
+            if internal_header_token:
+                _inject_internal_header(request, internal_header_token)
             return await call_next(request)
 
         return JSONResponse(status_code=401, content={"detail": "unauthorized"})

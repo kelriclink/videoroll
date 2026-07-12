@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import ipaddress
+
 from fastapi import HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
@@ -20,6 +22,18 @@ from videoroll.apps.orchestrator_api.schemas import (
     AdminAuthSetupRequest,
     AdminAuthStatusRead,
 )
+from videoroll.apps.security.audit import write_security_audit
+from videoroll.apps.security.rate_limits import (
+    RateLimitDecision,
+    RateLimitUnavailable,
+    check_login_rate_limit,
+    clear_login_rate_limit,
+    record_login_failure,
+)
+from videoroll.apps.security.service_auth import (
+    ADMIN_BOOTSTRAP_HEADER,
+    consume_bootstrap_secret,
+)
 from videoroll.db.session import get_sessionmaker
 
 
@@ -38,6 +52,148 @@ def set_device_cookie(response: Response, value: str, *, secure: bool) -> None:
         secure=bool(secure),
         path="/",
     )
+
+
+def _source_ip(request: Request) -> str:
+    trust_proxy_headers = bool(
+        getattr(getattr(getattr(request, "app", None), "state", None), "trust_proxy_headers", False)
+    )
+    forwarded = ""
+    if trust_proxy_headers:
+        forwarded = str(request.headers.get("x-forwarded-for") or "").split(",", 1)[0].strip()
+    candidate = forwarded or str(getattr(request.client, "host", "") or "").strip()
+    try:
+        return ipaddress.ip_address(candidate).compressed
+    except ValueError:
+        return "unknown"
+
+
+def _request_id(request: Request) -> str | None:
+    value = str(request.headers.get("x-request-id") or "").strip()
+    return value[:128] or None
+
+
+def _rate_limit_key(request: Request, endpoint: str) -> str:
+    return f"{endpoint}:{_source_ip(request)}"
+
+
+def _redis_url(request: Request) -> str:
+    return str(getattr(request.app.state, "redis_url", "") or "").strip()
+
+
+def _audit(
+    db: Session,
+    request: Request,
+    *,
+    event_type: str,
+    outcome: str,
+    error_code: str | None = None,
+    error_message: str | None = None,
+    payload: dict[str, object] | None = None,
+) -> None:
+    bounded_payload = dict(payload or {})
+    bounded_payload["user_agent"] = str(request.headers.get("user-agent") or "")[:256]
+    write_security_audit(
+        db,
+        event_type=event_type,
+        outcome=outcome,
+        request_id=_request_id(request),
+        source_ip=_source_ip(request),
+        error_code=error_code,
+        error_message=error_message,
+        payload=bounded_payload,
+    )
+
+
+def _check_rate_limit(request: Request, db: Session, endpoint: str) -> str:
+    redis_url = _redis_url(request)
+    if not redis_url:
+        _audit(
+            db,
+            request,
+            event_type=f"admin.{endpoint}.failure",
+            outcome="failure",
+            error_code="rate_limiter_unavailable",
+        )
+        raise HTTPException(status_code=503, detail="authentication rate limiter unavailable")
+    key = _rate_limit_key(request, endpoint)
+    try:
+        decision = check_login_rate_limit(redis_url, key)
+    except RateLimitUnavailable as exc:
+        _audit(
+            db,
+            request,
+            event_type=f"admin.{endpoint}.failure",
+            outcome="failure",
+            error_code="rate_limiter_unavailable",
+            error_message=str(exc),
+        )
+        raise HTTPException(status_code=503, detail="authentication rate limiter unavailable") from exc
+    if not decision.allowed:
+        _audit(
+            db,
+            request,
+            event_type=f"admin.{endpoint}.throttle",
+            outcome="throttled",
+            error_code="rate_limited",
+            payload={"attempts": decision.attempts, "retry_after": decision.retry_after},
+        )
+        raise HTTPException(
+            status_code=429,
+            detail="too many authentication attempts",
+            headers={"Retry-After": str(decision.retry_after)},
+        )
+    return key
+
+
+def _record_failure(request: Request, db: Session, endpoint: str, key: str, error_code: str) -> None:
+    decision = RateLimitDecision(allowed=True)
+    try:
+        decision = record_login_failure(_redis_url(request), key)
+    except RateLimitUnavailable as exc:
+        _audit(
+            db,
+            request,
+            event_type=f"admin.{endpoint}.failure",
+            outcome="failure",
+            error_code="rate_limiter_unavailable",
+            error_message=str(exc),
+        )
+        raise HTTPException(status_code=503, detail="authentication rate limiter unavailable") from exc
+    if not decision.allowed:
+        _audit(
+            db,
+            request,
+            event_type=f"admin.{endpoint}.throttle",
+            outcome="throttled",
+            error_code="rate_limited",
+            payload={"attempts": decision.attempts, "retry_after": decision.retry_after},
+        )
+        raise HTTPException(
+            status_code=429,
+            detail="too many authentication attempts",
+            headers={"Retry-After": str(decision.retry_after)},
+        )
+    _audit(
+        db,
+        request,
+        event_type=f"admin.{endpoint}.failure",
+        outcome="failure",
+        error_code=error_code,
+        payload={"attempts": decision.attempts},
+    )
+
+
+def _clear_rate_limit(request: Request, key: str) -> None:
+    try:
+        clear_login_rate_limit(_redis_url(request), key)
+    except RateLimitUnavailable:
+        pass
+
+
+def require_bootstrap_secret(request: Request) -> None:
+    presented = str(request.headers.get(ADMIN_BOOTSTRAP_HEADER) or "").strip()
+    consume_bootstrap_secret(request, presented)
 
 
 def get_admin_password_hash(request: Request, db: Session | None = None) -> str:
@@ -83,13 +239,31 @@ def auth_status(request: Request, db: Session) -> AdminAuthStatusRead:
 
 
 def setup_auth(payload: AdminAuthSetupRequest, request: Request, db: Session) -> JSONResponse:
+    rate_key = _check_rate_limit(request, db, "setup")
     if get_admin_password_hash(request, db):
+        _record_failure(request, db, "setup", rate_key, "password_already_set")
         raise HTTPException(status_code=400, detail="admin password already set")
 
-    password = validate_new_password(payload.password)
-    encoded = encode_password_hash(password)
-    set_password_hash(db, encoded)
+    try:
+        password = validate_new_password(payload.password)
+    except ValueError:
+        _record_failure(request, db, "setup", rate_key, "invalid_password")
+        raise
+
+    request.state.bootstrap_db = db
+    try:
+        require_bootstrap_secret(request)
+        encoded = encode_password_hash(password)
+        set_password_hash(db, encoded)
+    except HTTPException:
+        db.rollback()
+        _record_failure(request, db, "setup", rate_key, "invalid_bootstrap_secret")
+        raise
+    finally:
+        request.state.bootstrap_db = None
     request.app.state.admin_password_hash = encoded
+    _clear_rate_limit(request, rate_key)
+    _audit(db, request, event_type="admin.setup.success", outcome="success")
 
     cookie_secret = str(getattr(request.app.state, "admin_cookie_secret", "") or "").strip()
     cookie_value = mint_device_cookie_value(internal_secret=cookie_secret, password_hash=encoded)
@@ -100,12 +274,17 @@ def setup_auth(payload: AdminAuthSetupRequest, request: Request, db: Session) ->
 
 
 def login(payload: AdminAuthLoginRequest, request: Request, db: Session) -> JSONResponse:
+    rate_key = _check_rate_limit(request, db, "login")
     password_hash = get_admin_password_hash(request, db)
     if not password_hash:
+        _record_failure(request, db, "login", rate_key, "password_not_set")
         raise HTTPException(status_code=400, detail="admin password is not set")
     if not verify_password_hash(str(payload.password or ""), password_hash):
+        _record_failure(request, db, "login", rate_key, "invalid_password")
         raise HTTPException(status_code=401, detail="invalid password")
 
+    _clear_rate_limit(request, rate_key)
+    _audit(db, request, event_type="admin.login.success", outcome="success")
     cookie_secret = str(getattr(request.app.state, "admin_cookie_secret", "") or "").strip()
     cookie_value = mint_device_cookie_value(internal_secret=cookie_secret, password_hash=password_hash)
     body = AdminAuthStatusRead(password_set=True, trusted=True).model_dump(mode="json")

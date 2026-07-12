@@ -9,6 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 
 from videoroll.apps.publish_gateway import SUPPORTED_SOCIAL_PLATFORMS, normalize_publish_platform, normalize_social_publish_meta
+from videoroll.apps.security.service_auth import install_internal_service_auth, service_token
 from videoroll.apps.publish_lifecycle import publish_batch_has_target
 from videoroll.apps.social_publisher.account_store import (
     MAX_STORAGE_STATE_BYTES,
@@ -55,11 +56,13 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+install_internal_service_auth(app, get_social_publisher_settings)
 
 
 @app.on_event("startup")
 def _startup() -> None:
     settings = get_social_publisher_settings()
+    app.state.internal_service_token = service_token(settings)
     engine = get_engine(settings.database_url)
     Base.metadata.create_all(engine)
     auto_migrate(settings.database_url)
