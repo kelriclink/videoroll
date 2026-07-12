@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import uuid
 import json
+import logging
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -11,6 +12,7 @@ from sqlalchemy.orm import Session
 from videoroll.apps.publish_gateway import normalize_publish_platform, publish_backend_url, publish_meta_key
 from videoroll.apps.publish_lifecycle import (
     PublishBatchState,
+    bind_unresolved_social_publish_target,
     enqueue_publish_batch_cleanup,
     publish_target_key,
     record_publish_batch_dispatch_error,
@@ -20,6 +22,9 @@ from videoroll.apps.publish_platform_settings_store import get_publish_platform_
 from videoroll.apps.publish_request_builder import build_publish_gateway_request
 from videoroll.db.models import Account, Asset, AssetKind, Platform, PublishBatch, PublishJob, PublishState, Task
 from videoroll.storage.s3 import S3Store
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -96,6 +101,12 @@ class PublishService:
     自动模式和手动模式都通过它来投稿，不再直接 httpx 调后端。
     """
 
+    _REUSABLE_BATCH_STATES = {
+        PublishBatchState.active.value,
+        PublishBatchState.partial_failed.value,
+        PublishBatchState.failed.value,
+    }
+
     def __init__(
         self,
         db: Session,
@@ -136,25 +147,35 @@ class PublishService:
         request = dict(payload or {})
         batch_id = request.get("batch_id")
         if batch_id:
-            batch = self._db.get(PublishBatch, uuid.UUID(str(batch_id)))
+            try:
+                batch_uuid = uuid.UUID(str(batch_id))
+            except (TypeError, ValueError) as exc:
+                raise ValueError("invalid publish batch id") from exc
+            batch = self._db.get(PublishBatch, batch_uuid)
             if not batch:
                 raise ValueError("publish batch not found")
+            task = self._db.get(Task, task_id, with_for_update=True)
+            if not task or batch.task_id != task_id:
+                raise ValueError("publish batch does not belong to this task")
+            if task.active_publish_batch_id != batch.id:
+                raise ValueError("publish batch is not the current batch for this task")
+            target_key = publish_target_key(platform, request.get("account_id"))
+            expected_keys = {
+                str(target.get("key") or publish_target_key(target.get("platform"), target.get("account_id")))
+                for target in (batch.expected_targets or [])
+            }
+            if target_key not in expected_keys:
+                raise ValueError("publish target is not part of this batch")
+            # Do not hold the task-row lock while calling a publisher over HTTP.
+            self._db.commit()
         else:
             account_id = request.get("account_id")
-            batch = self._create_batch(
-                task_id,
-                [{
-                    "key": publish_target_key(platform, account_id),
-                    "platform": platform,
-                    "account_id": str(account_id) if account_id else None,
-                }],
-                request,
-            )
+            batch = self._get_or_create_single_target_batch(task_id, platform, account_id, request)
         request["batch_id"] = str(batch.id)
         data = self._publish_single(task_id, platform, request)
         reconciliation = reconcile_publish_batch(self._db, batch.id)
         self._db.commit()
-        self._schedule_cleanup(task_id, reconciliation.cleanup_enqueued, batch.id)
+        self._schedule_cleanup(task_id, reconciliation.cleanup_needed, batch.id)
         return self._accepted_response(platform, data)
 
     # ── 内部实现 ──────────────────────────────────────────────
@@ -178,15 +199,42 @@ class PublishService:
         if not task:
             raise ValueError("task not found")
         batch = PublishBatch(
+            id=uuid.uuid4(),
             task_id=task_id,
             expected_targets=targets,
             request_json=payload,
             state=PublishBatchState.active.value,
         )
         self._db.add(batch)
+        task.active_publish_batch_id = batch.id
+        self._db.add(task)
         self._db.commit()
         self._db.refresh(batch)
         return batch
+
+    def _current_batch_for_locked_task(self, task: Task) -> PublishBatch | None:
+        """Resolve the one batch authorized by ``Task.active_publish_batch_id``.
+
+        The null-pointer fallback only adopts the newest historical batch for
+        a pre-pointer deployment.  It never searches for an older failed batch
+        after a newer batch has completed.
+        """
+        if task.active_publish_batch_id is not None:
+            batch = self._db.get(PublishBatch, task.active_publish_batch_id)
+            if batch and batch.task_id == task.id:
+                return batch
+            task.active_publish_batch_id = None
+            self._db.add(task)
+        latest_batch = (
+            self._db.query(PublishBatch)
+            .filter(PublishBatch.task_id == task.id)
+            .order_by(PublishBatch.created_at.desc())
+            .first()
+        )
+        if latest_batch:
+            task.active_publish_batch_id = latest_batch.id
+            self._db.add(task)
+        return latest_batch
 
     def _get_or_create_batch(
         self,
@@ -196,19 +244,30 @@ class PublishService:
         task = self._db.get(Task, task_id, with_for_update=True)
         if not task:
             raise ValueError("task not found")
-        force_retry = bool(payload.get("force_retry"))
-        active_batch = (
-            self._db.query(PublishBatch)
-            .filter(
-                PublishBatch.task_id == task_id,
-                PublishBatch.state.in_([PublishBatchState.active.value, PublishBatchState.partial_failed.value]),
-            )
-            .order_by(PublishBatch.created_at.desc())
-            .first()
-        )
-        if active_batch and not force_retry:
-            return active_batch, list(active_batch.expected_targets or [])
+        current_batch = self._current_batch_for_locked_task(task)
+        if current_batch and current_batch.state == PublishBatchState.active.value:
+            self._db.commit()
+            return current_batch, list(current_batch.expected_targets or [])
 
+        targets = self._build_enabled_targets(payload)
+        if (
+            current_batch
+            and current_batch.state in {
+                PublishBatchState.partial_failed.value,
+                PublishBatchState.failed.value,
+            }
+            and self._target_keys(current_batch.expected_targets or []) == self._target_keys(targets)
+        ):
+            self._db.commit()
+            return current_batch, list(current_batch.expected_targets or [])
+
+        # Keep the task-row lock held until the replacement batch and pointer
+        # are committed together. This prevents two callers from both replacing
+        # the same terminal batch.
+        batch = self._create_batch(task_id, targets, payload)
+        return batch, targets
+
+    def _build_enabled_targets(self, payload: dict[str, Any]) -> list[dict[str, Any]]:
         targets: list[dict[str, Any]] = []
         for platform in self._get_enabled_platforms():
             account_id: str | None = None
@@ -238,8 +297,49 @@ class PublishService:
             )
         if not targets:
             raise ValueError("no publish platforms are enabled")
-        batch = self._create_batch(task_id, targets, payload)
-        return batch, targets
+        return targets
+
+    @staticmethod
+    def _target_keys(targets: list[dict[str, Any]]) -> set[str]:
+        return {
+            str(target.get("key") or publish_target_key(target.get("platform"), target.get("account_id")))
+            for target in targets
+        }
+
+    def _get_or_create_single_target_batch(
+        self,
+        task_id: uuid.UUID,
+        platform: str,
+        account_id: str | None,
+        payload: dict[str, Any],
+    ) -> PublishBatch:
+        """Use the active batch when it owns this target; never fork it."""
+        task = self._db.get(Task, task_id, with_for_update=True)
+        if not task:
+            raise ValueError("task not found")
+        active_batch = self._current_batch_for_locked_task(task)
+        target_key = publish_target_key(platform, account_id)
+        if active_batch and active_batch.state in self._REUSABLE_BATCH_STATES:
+            for target in active_batch.expected_targets or []:
+                key = str(target.get("key") or publish_target_key(target.get("platform"), target.get("account_id")))
+                if key == target_key:
+                    if task.active_publish_batch_id != active_batch.id:
+                        task.active_publish_batch_id = active_batch.id
+                        self._db.add(task)
+                    self._db.commit()
+                    return active_batch
+            if active_batch.state == PublishBatchState.active.value:
+                self._db.commit()
+                raise ValueError("an active publish batch already owns this task; retry one of its expected targets")
+        return self._create_batch(
+            task_id,
+            [{
+                "key": target_key,
+                "platform": platform,
+                "account_id": str(account_id) if account_id else None,
+            }],
+            payload,
+        )
 
     def _publish_to_platforms(
         self,
@@ -255,6 +355,18 @@ class PublishService:
         for target in targets:
             platform = str(target["platform"])
             account_id = target.get("account_id")
+            if platform != "bilibili" and not account_id:
+                # Initial dispatch can legitimately fail before an account is
+                # configured.  Once one becomes valid, bind the still-jobless
+                # placeholder target so job aggregation uses the same key.
+                try:
+                    resolved_account_id = self._resolve_social_account_id(platform, payload)
+                except ValueError:
+                    resolved_account_id = None
+                if resolved_account_id and self._latest_batch_target_job(batch, platform, None) is None:
+                    rebound = self._bind_unresolved_social_target(batch, target, resolved_account_id)
+                    target.update(rebound)
+                    account_id = resolved_account_id
             existing = self._latest_batch_target_job(batch, platform, account_id)
             if existing and existing.state in {PublishState.submitting, PublishState.submitted, PublishState.published}:
                 results[platform] = self._accepted_response(
@@ -286,7 +398,7 @@ class PublishService:
                     self._db, batch.id, platform=platform, account_id=account_id, detail=detail
                 )
                 self._db.commit()
-                self._schedule_cleanup(task_id, reconciliation.cleanup_enqueued, batch.id)
+                self._schedule_cleanup(task_id, reconciliation.cleanup_needed, batch.id)
             except Exception as exc:
                 detail = str(exc)
                 results[platform] = {"status": "error", "detail": detail}
@@ -294,11 +406,27 @@ class PublishService:
                     self._db, batch.id, platform=platform, account_id=account_id, detail=detail
                 )
                 self._db.commit()
-                self._schedule_cleanup(task_id, reconciliation.cleanup_enqueued, batch.id)
+                self._schedule_cleanup(task_id, reconciliation.cleanup_needed, batch.id)
         reconciliation = reconcile_publish_batch(self._db, batch.id)
         self._db.commit()
-        self._schedule_cleanup(task_id, reconciliation.cleanup_enqueued, batch.id)
+        self._schedule_cleanup(task_id, reconciliation.cleanup_needed, batch.id)
         return PublishAllResult(results=results, batch_id=str(batch.id))
+
+    def _bind_unresolved_social_target(
+        self,
+        batch: PublishBatch,
+        target: dict[str, Any],
+        account_id: str,
+    ) -> dict[str, Any]:
+        """Replace an accountless target and release its lifecycle locks."""
+        rebound = bind_unresolved_social_publish_target(
+            self._db,
+            batch.id,
+            platform=str(target["platform"]),
+            account_id=account_id,
+        )
+        self._db.commit()
+        return rebound
 
     def _latest_batch_target_job(
         self,
@@ -334,14 +462,21 @@ class PublishService:
         result["status"] = "accepted"
         return result
 
-    @staticmethod
-    def _schedule_cleanup(task_id: uuid.UUID, cleanup_enqueued: bool, batch_id: uuid.UUID) -> None:
+    def _schedule_cleanup(self, task_id: uuid.UUID, cleanup_needed: bool, batch_id: uuid.UUID) -> None:
+        if not cleanup_needed:
+            return
         try:
-            enqueue_publish_batch_cleanup(task_id, batch_id, needed=cleanup_enqueued)
+            from videoroll.apps.publish_cleanup_queue import get_publish_cleanup_sender
+
+            enqueue_publish_batch_cleanup(
+                self._db,
+                get_publish_cleanup_sender(str(self._settings.redis_url)),
+                task_id,
+                batch_id,
+                needed=True,
+            )
         except Exception:
-            # The state marker prevents duplicates; the periodic/manual cleanup
-            # path can safely retry if the broker is temporarily unavailable.
-            pass
+            logger.exception("failed to enqueue batch cleanup task (task_id=%s batch_id=%s)", task_id, batch_id)
 
     @staticmethod
     def _http_status_error_detail(exc: httpx.HTTPStatusError) -> str:

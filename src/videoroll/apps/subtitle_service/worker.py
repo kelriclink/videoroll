@@ -23,7 +23,7 @@ from sqlalchemy.orm import Session
 
 from videoroll.ai.client import openai_chat_config_from_settings
 from videoroll.ai.service import AIService, translate_text_openai
-from videoroll.config import get_subtitle_settings
+from videoroll.config import get_orchestrator_settings, get_subtitle_settings
 from videoroll.db.base import Base
 from videoroll.db.auto_migrate import auto_migrate
 from videoroll.db.models import (
@@ -31,6 +31,8 @@ from videoroll.db.models import (
     Asset,
     AssetKind,
     PublishBatch,
+    PublishJob,
+    PublishState,
     RenderJob,
     RenderJobStatus,
     SourceType,
@@ -80,6 +82,7 @@ from videoroll.apps.subtitle_service.embeddings import embedding_settings_from_t
 from videoroll.apps.subtitle_service.task_title_store import set_task_titles
 from videoroll.apps.subtitle_service.translate_settings_store import get_translate_settings
 from videoroll.apps.publish_meta_draft import apply_publish_source_overrides, default_publish_meta
+from videoroll.apps.publish_lifecycle import enqueue_publish_batch_cleanup
 from videoroll.apps.orchestrator_api.youtube_downloader import (
     download_youtube_subtitle,
     extract_youtube_metadata,
@@ -125,6 +128,12 @@ celery_app.conf.update(
         "subtitle-service-task-queue-tick": {
             "task": "subtitle_service.task_queue_tick",
             "schedule": _TASK_QUEUE_TICK_INTERVAL_SECONDS,
+            "args": (),
+            "options": {"queue": "subtitle"},
+        },
+        "subtitle-service-publish-cleanup-retry": {
+            "task": "subtitle_service.enqueue_pending_publish_batch_cleanups",
+            "schedule": 60.0,
             "args": (),
             "options": {"queue": "subtitle"},
         },
@@ -2344,7 +2353,7 @@ def after_render_publish(render_job_id: str) -> dict[str, Any]:
         result_data = publish_all(
             task.id,
             PublishAllRequest.model_validate(publish_payload),
-            settings,
+            get_orchestrator_settings(),
             db,
             S3Store(settings),
         )
@@ -2372,8 +2381,8 @@ def after_render_publish(render_job_id: str) -> dict[str, Any]:
         db.close()
 
 
-@celery_app.task(name="subtitle_service.cleanup_task")
-def cleanup_task(task_id: str, batch_id: str | None = None) -> dict[str, Any]:
+@celery_app.task(name="subtitle_service.cleanup_task", bind=True, max_retries=20)
+def cleanup_task(self: Any, task_id: str, batch_id: str | None = None) -> dict[str, Any]:
     """
     Best-effort cleanup after a task is published:
       - delete local WORK_DIR temp dirs for subtitle/render/youtube
@@ -2390,17 +2399,38 @@ def cleanup_task(task_id: str, batch_id: str | None = None) -> dict[str, Any]:
     tid: uuid.UUID | None = None
     try:
         tid = uuid.UUID(task_id)
-        task = db.get(Task, tid)
+        # Hold the same task-row lock used when a new publish batch/job is
+        # created.  The asset decision and deletion must be one critical
+        # section, otherwise a new job can lose its cover between the check.
+        task = db.get(Task, tid, with_for_update=True)
         if not task:
             return {"status": "error", "detail": "task not found"}
         if batch_id:
-            batch = db.get(PublishBatch, uuid.UUID(batch_id))
+            batch = db.get(PublishBatch, uuid.UUID(batch_id), with_for_update=True)
             if not batch or batch.task_id != tid:
                 return {"status": "skipped", "detail": "publish batch not found for task"}
             if batch.state != "succeeded":
                 return {"status": "skipped", "detail": f"publish batch state is {batch.state}"}
+            if task.active_publish_batch_id != batch.id:
+                return {"status": "skipped", "detail": "publish batch is no longer active for task"}
         elif task.status != TaskStatus.published:
             return {"status": "skipped", "detail": f"task status is {task.status.value}"}
+
+        in_flight_publish = (
+            db.query(PublishJob)
+            .filter(PublishJob.task_id == tid, PublishJob.state == PublishState.submitting)
+            .count()
+        )
+        if in_flight_publish:
+            # Clear the outbox marker before Celery retry.  If retry delivery
+            # itself fails, the periodic repair task can still enqueue cleanup.
+            if batch_id:
+                batch = db.get(PublishBatch, uuid.UUID(batch_id), with_for_update=True)
+                if batch:
+                    batch.cleanup_enqueued_at = None
+                    db.add(batch)
+                    db.commit()
+            raise self.retry(countdown=60)
 
         in_flight_sub = (
             db.query(SubtitleJob)
@@ -2413,7 +2443,11 @@ def cleanup_task(task_id: str, batch_id: str | None = None) -> dict[str, Any]:
             .count()
         )
         if in_flight_sub or in_flight_render:
-            return {"status": "skipped", "detail": f"in-flight jobs: subtitle={in_flight_sub} render={in_flight_render}"}
+            if batch_id:
+                batch.cleanup_enqueued_at = None
+                db.add(batch)
+                db.commit()
+            raise self.retry(countdown=60)
 
         subtitle_job_ids = [row[0] for row in db.query(SubtitleJob.id).filter(SubtitleJob.task_id == tid).all()]
         render_job_ids = [row[0] for row in db.query(RenderJob.id).filter(RenderJob.task_id == tid).all()]
@@ -2476,9 +2510,48 @@ def cleanup_task(task_id: str, batch_id: str | None = None) -> dict[str, Any]:
             pass
 
         return {"status": "ok", "deleted_objects": str(len(deleted_keys)), "removed_dirs": str(removed_dirs)}
+    except Retry:
+        raise
     except Exception as e:
         logger.exception("cleanup task failed (task_id=%s)", task_id)
         return {"status": "error", "detail": f"{type(e).__name__}: {e}"}
+    finally:
+        db.close()
+
+
+@celery_app.task(name="subtitle_service.enqueue_pending_publish_batch_cleanups")
+def enqueue_pending_publish_batch_cleanups() -> dict[str, int]:
+    """Repair cleanup delivery after a temporary broker failure.
+
+    ``cleanup_enqueued_at`` is written only after ``send_task`` succeeds, so
+    this idempotently retries the small durable outbox represented by the
+    successful batches themselves.
+    """
+    _ensure_db()
+    db = _db()
+    enqueued = 0
+    failed = 0
+    try:
+        batches = (
+            db.query(PublishBatch)
+            .filter(PublishBatch.state == "succeeded", PublishBatch.cleanup_enqueued_at.is_(None))
+            .all()
+        )
+        for batch in batches:
+            task = db.get(Task, batch.task_id)
+            if not task or task.active_publish_batch_id != batch.id:
+                continue
+            try:
+                if enqueue_publish_batch_cleanup(db, celery_app, task.id, batch.id, needed=True):
+                    enqueued += 1
+            except Exception:
+                failed += 1
+                logger.exception(
+                    "failed to retry publish cleanup delivery (task_id=%s batch_id=%s)",
+                    task.id,
+                    batch.id,
+                )
+        return {"enqueued": enqueued, "failed": failed}
     finally:
         db.close()
 
@@ -2786,7 +2859,7 @@ def auto_youtube_pipeline(self: Any, task_id: str, overrides: dict[str, Any] | N
             result_data = publish_all(
                 tid,
                 PublishAllRequest.model_validate(publish_payload),
-                settings,
+                get_orchestrator_settings(),
                 db,
                 store,
             )

@@ -9,6 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 
 from videoroll.apps.publish_gateway import SUPPORTED_SOCIAL_PLATFORMS, normalize_publish_platform, normalize_social_publish_meta
+from videoroll.apps.publish_lifecycle import publish_batch_has_target
 from videoroll.apps.social_publisher.account_store import (
     MAX_STORAGE_STATE_BYTES,
     account_read,
@@ -29,7 +30,7 @@ from videoroll.apps.social_publisher.worker import celery_app
 from videoroll.config import SocialPublisherSettings, get_social_publisher_settings
 from videoroll.db.auto_migrate import auto_migrate
 from videoroll.db.base import Base
-from videoroll.db.models import Account, Platform, PublishJob, PublishState, Task, TaskStatus
+from videoroll.db.models import Account, Platform, PublishBatch, PublishJob, PublishState, Task, TaskStatus
 from videoroll.db.session import db_session, get_engine
 
 
@@ -210,6 +211,14 @@ def publish(
     task = db.get(Task, payload.task_id, with_for_update=True)
     if not task:
         raise HTTPException(status_code=404, detail="task not found")
+    if payload.batch_id is not None:
+        batch = db.get(PublishBatch, payload.batch_id)
+        if not batch or batch.task_id != task.id:
+            raise HTTPException(status_code=400, detail="publish batch does not belong to this task")
+        if task.active_publish_batch_id != batch.id:
+            raise HTTPException(status_code=409, detail="publish batch is not the current batch for this task")
+        if not publish_batch_has_target(batch, Platform(value), payload.account_id):
+            raise HTTPException(status_code=400, detail="publish target is not part of this batch")
     account = db.get(Account, payload.account_id, with_for_update=True)
     if not account or account.platform != Platform(value) or not account.is_active:
         raise HTTPException(status_code=400, detail="active account for platform not found")
@@ -267,7 +276,11 @@ def publish(
             db.add(prior)
             db.commit()
             existing = prior
-    if existing and not (payload.force_retry and existing.state in {PublishState.submitted, PublishState.unknown}):
+    if existing and existing.state != PublishState.unknown:
+        # ``submitted`` is a successful terminal state for this service.  A
+        # force retry may resolve an unknown delivery, never duplicate it.
+        return _response_from_job(existing)
+    if existing and existing.state == PublishState.unknown and not payload.force_retry:
         return _response_from_job(existing)
 
     meta_json = {

@@ -9,13 +9,14 @@ from typing import Generator
 import httpx
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy import and_, or_
 from sqlalchemy.orm import Session
 
 from videoroll.ai.service import AIService
 from videoroll.config import BilibiliPublisherSettings, get_bilibili_publisher_settings, get_subtitle_settings
 from videoroll.db.base import Base
 from videoroll.db.auto_migrate import auto_migrate
-from videoroll.db.models import Asset, AssetKind, Platform, PublishJob, PublishState, Task, TaskStatus
+from videoroll.db.models import Asset, AssetKind, Platform, PublishBatch, PublishJob, PublishState, Task, TaskStatus
 from videoroll.db.session import db_session, get_engine
 from videoroll.storage.s3 import S3Store
 from videoroll.apps.bilibili_publisher.auth_settings_store import get_bilibili_auth_settings, get_bilibili_cookie_header, update_bilibili_auth_settings
@@ -37,6 +38,7 @@ from videoroll.apps.bilibili_publisher.schemas import (
     PublishResponse,
 )
 from videoroll.apps.bilibili_publisher.storage_keys import unique_publish_result_key
+from videoroll.apps.publish_lifecycle import publish_batch_has_target
 from videoroll.apps.subtitle_service.bilibili_tags_store import get_task_bilibili_summary
 from videoroll.apps.subtitle_service.translate_settings_store import get_translate_settings
 
@@ -233,6 +235,7 @@ def _latest_publish_job(
     states: set[PublishState],
     *,
     batch_id: uuid.UUID | None = None,
+    account_id: uuid.UUID | None = None,
 ) -> PublishJob | None:
     query = db.query(PublishJob).filter(
         PublishJob.task_id == task_id,
@@ -241,6 +244,15 @@ def _latest_publish_job(
     )
     if batch_id is not None:
         query = query.filter(PublishJob.batch_id == batch_id)
+    if account_id is None:
+        query = query.filter(PublishJob.account_id.is_(None))
+    else:
+        query = query.filter(
+            or_(
+                PublishJob.account_id == account_id,
+                and_(PublishJob.account_id.is_(None), PublishJob.bili_account_id == account_id),
+            )
+        )
     return query.order_by(PublishJob.updated_at.desc(), PublishJob.created_at.desc()).first()
 
 
@@ -259,12 +271,29 @@ def publish(payload: PublishRequest, settings: BilibiliPublisherSettings = Depen
     task = db.get(Task, payload.task_id, with_for_update=True)
     if not task:
         raise HTTPException(status_code=404, detail="task not found")
+    if payload.batch_id is not None:
+        batch = db.get(PublishBatch, payload.batch_id)
+        if not batch or batch.task_id != task.id:
+            raise HTTPException(status_code=400, detail="publish batch does not belong to this task")
+        if task.active_publish_batch_id != batch.id:
+            raise HTTPException(status_code=409, detail="publish batch is not the current batch for this task")
+        if not publish_batch_has_target(batch, Platform.bilibili, payload.account_id):
+            raise HTTPException(status_code=400, detail="publish target is not part of this batch")
 
     published_job = _latest_publish_job(
-        db, payload.task_id, {PublishState.published}, batch_id=payload.batch_id
+        db,
+        payload.task_id,
+        {PublishState.published},
+        batch_id=payload.batch_id,
+        account_id=payload.account_id,
     )
     if payload.batch_id and not published_job:
-        previous_published_job = _latest_publish_job(db, payload.task_id, {PublishState.published})
+        previous_published_job = _latest_publish_job(
+            db,
+            payload.task_id,
+            {PublishState.published},
+            account_id=payload.account_id,
+        )
         if previous_published_job:
             published_job = PublishJob(
                 task_id=payload.task_id,
@@ -295,10 +324,19 @@ def publish(payload: PublishRequest, settings: BilibiliPublisherSettings = Depen
         return _publish_response_from_job(published_job)
 
     active_job = _latest_publish_job(
-        db, payload.task_id, {PublishState.submitting, PublishState.submitted}, batch_id=payload.batch_id
+        db,
+        payload.task_id,
+        {PublishState.submitting, PublishState.submitted},
+        batch_id=payload.batch_id,
+        account_id=payload.account_id,
     )
     if payload.batch_id and not active_job:
-        active_job = _latest_publish_job(db, payload.task_id, {PublishState.submitting, PublishState.submitted})
+        active_job = _latest_publish_job(
+            db,
+            payload.task_id,
+            {PublishState.submitting, PublishState.submitted},
+            account_id=payload.account_id,
+        )
         if active_job and active_job.batch_id is None:
             active_job.batch_id = payload.batch_id
             db.add(active_job)

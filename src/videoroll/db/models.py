@@ -96,6 +96,9 @@ class PublishBatch(Base):
     outcomes_json: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
 
     cleanup_enqueued_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Versioned so deployment can safely replay cleanup markers produced by the
+    # earlier best-effort dispatcher once, without replaying every restart.
+    cleanup_delivery_version: Mapped[int] = mapped_column(Integer, nullable=False, default=2)
     finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
@@ -137,6 +140,11 @@ class Task(Base):
     error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     retry_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 
+    # The only batch allowed to aggregate this task's publish status or remove
+    # its source assets.  Keeping the pointer on the task prevents late workers
+    # from an older batch from overwriting a newer retry.
+    active_publish_batch_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), nullable=True)
+
     lock_owner: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
     lock_until: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
@@ -151,6 +159,7 @@ class Task(Base):
     __table_args__ = (
         Index("ix_tasks_status_created_at", "status", "created_at"),
         Index("ix_tasks_lock_until", "lock_owner", "lock_until"),
+        Index("ix_tasks_active_publish_batch_id", "active_publish_batch_id"),
     )
 
 

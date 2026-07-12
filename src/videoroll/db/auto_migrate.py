@@ -79,6 +79,67 @@ def _ensure_tasks_lock_columns(engine: Engine) -> None:
         logger.warning("auto-migrated DB: added tasks.lock_until")
 
 
+def _ensure_tasks_publish_batch_columns(engine: Engine) -> None:
+    insp = inspect(engine)
+    if "tasks" not in set(insp.get_table_names()):
+        return
+    cols = {c.get("name") for c in insp.get_columns("tasks")}
+    if "active_publish_batch_id" not in cols:
+        _add_column(engine, "tasks", "active_publish_batch_id", "UUID")
+        logger.warning("auto-migrated DB: added tasks.active_publish_batch_id")
+    with engine.begin() as conn:
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_tasks_active_publish_batch_id ON tasks (active_publish_batch_id)"))
+
+
+def _backfill_publish_batch_lifecycle(engine: Engine) -> None:
+    insp = inspect(engine)
+    tables = set(insp.get_table_names())
+    if "tasks" not in tables or "publish_batches" not in tables:
+        return
+    task_columns = {column.get("name") for column in insp.get_columns("tasks")}
+    batch_columns = {column.get("name") for column in insp.get_columns("publish_batches")}
+    if "active_publish_batch_id" not in task_columns or "cleanup_delivery_version" not in batch_columns:
+        return
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                """
+                UPDATE tasks
+                SET active_publish_batch_id = (
+                    SELECT publish_batches.id
+                    FROM publish_batches
+                    WHERE publish_batches.task_id = tasks.id
+                    ORDER BY publish_batches.created_at DESC, publish_batches.id DESC
+                    LIMIT 1
+                )
+                WHERE active_publish_batch_id IS NULL
+                  AND EXISTS (
+                    SELECT 1 FROM publish_batches WHERE publish_batches.task_id = tasks.id
+                  )
+                """
+            )
+        )
+        # Markers written before reliable broker delivery cannot prove that a
+        # cleanup message was accepted.  Replay them once through the v2 outbox.
+        conn.execute(
+            text(
+                """
+                UPDATE publish_batches
+                SET cleanup_enqueued_at = CASE
+                        WHEN EXISTS (
+                            SELECT 1
+                            FROM tasks
+                            WHERE tasks.active_publish_batch_id = publish_batches.id
+                        ) THEN NULL
+                        ELSE cleanup_enqueued_at
+                    END,
+                    cleanup_delivery_version = 2
+                WHERE cleanup_delivery_version < 2
+                """
+            )
+        )
+
+
 def _ensure_youtube_sources_columns(engine: Engine) -> None:
     insp = inspect(engine)
     if "youtube_sources" not in set(insp.get_table_names()):
@@ -159,6 +220,27 @@ def _ensure_publish_jobs_generic_columns(engine: Engine) -> None:
         )
 
 
+def _backfill_bilibili_publish_account_ids(engine: Engine) -> None:
+    insp = inspect(engine)
+    if "publish_jobs" not in set(insp.get_table_names()):
+        return
+    cols = {column.get("name") for column in insp.get_columns("publish_jobs")}
+    if not {"platform", "account_id", "bili_account_id"}.issubset(cols):
+        return
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                """
+                UPDATE publish_jobs
+                SET account_id = bili_account_id
+                WHERE platform = 'bilibili'
+                  AND account_id IS NULL
+                  AND bili_account_id IS NOT NULL
+                """
+            )
+        )
+
+
 def _ensure_publish_batch_columns(engine: Engine) -> None:
     insp = inspect(engine)
     if "publish_batches" not in set(insp.get_table_names()):
@@ -166,6 +248,7 @@ def _ensure_publish_batch_columns(engine: Engine) -> None:
     cols = {c.get("name") for c in insp.get_columns("publish_batches")}
     required_columns = {
         "request_json": "JSONB NOT NULL DEFAULT '{}'::jsonb" if (engine.dialect.name or "").lower() == "postgresql" else "JSON NOT NULL DEFAULT '{}'",
+        "cleanup_delivery_version": "INTEGER NOT NULL DEFAULT 0",
     }
     for column, column_type_sql in required_columns.items():
         if column not in cols:
@@ -554,9 +637,12 @@ def auto_migrate_engine(engine: Engine) -> None:
     with _auto_migrate_lock(engine):
         _ensure_postgres_enum_values(engine)
         _ensure_tasks_lock_columns(engine)
+        _ensure_tasks_publish_batch_columns(engine)
         _ensure_youtube_sources_columns(engine)
         _ensure_publish_jobs_generic_columns(engine)
+        _backfill_bilibili_publish_account_ids(engine)
         _ensure_publish_batch_columns(engine)
+        _backfill_publish_batch_lifecycle(engine)
         _ensure_account_check_columns(engine)
         _ensure_scheduler_indexes(engine)
         _ensure_pgvector_rag_tables(engine)

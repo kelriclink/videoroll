@@ -6,7 +6,10 @@ from pathlib import Path
 
 import httpx
 
+from videoroll.apps.orchestrator_api.schemas import PublishAllRequest
+from videoroll.apps.orchestrator_api.services.publishing_service import publish_all
 from videoroll.apps.publish_service import PublishAllResult, PublishService
+from videoroll.apps.publish_lifecycle import PublishBatchState
 from videoroll.db.models import Account, Platform, TaskStatus
 
 
@@ -95,6 +98,7 @@ def test_publish_service_does_not_import_orchestrator_api() -> None:
     source = Path("src/videoroll/apps/publish_service.py").read_text(encoding="utf-8")
 
     assert "orchestrator_api" not in source
+    assert "subtitle_service.worker" not in source
 
 
 # ── PublishService.publish() ──────────────────────────────────
@@ -143,10 +147,11 @@ def test_publish_calls_all_enabled_platforms(mock_client_cls, mock_build, mock_g
 
     svc = PublishService(db, MagicMock(), MagicMock())
     batch, targets = _publish_batch(("bilibili", None), ("douyin", None))
-    reconciliation = MagicMock(cleanup_enqueued=False)
+    reconciliation = MagicMock(cleanup_needed=False)
     with (
         patch.object(svc, "_get_or_create_batch", return_value=(batch, targets)),
         patch.object(svc, "_latest_batch_target_job", return_value=None),
+        patch.object(svc, "_resolve_social_account_id", side_effect=ValueError("no account")),
         patch("videoroll.apps.publish_service.reconcile_publish_batch", return_value=reconciliation),
     ):
         result = svc.publish(uuid.uuid4())
@@ -171,6 +176,230 @@ def test_publish_no_enabled_platforms(mock_get_settings):
     result = svc.publish(uuid.uuid4())
     assert result.platform_count == 0
     assert result.has_any_ok is False
+
+
+def test_publish_all_social_only_does_not_require_bilibili_meta() -> None:
+    task_id = uuid.uuid4()
+    task = MagicMock(id=task_id)
+    task.source_license.value = "own"
+    db = MagicMock()
+    db.get.return_value = task
+    result = PublishAllResult(
+        batch_id=str(uuid.uuid4()),
+        results={"douyin": {"status": "accepted", "state": "submitting"}},
+    )
+
+    with (
+        patch(
+            "videoroll.apps.orchestrator_api.services.publishing_service.get_publish_platform_settings",
+            return_value={"bilibili": False, "douyin": True},
+        ),
+        patch(
+            "videoroll.apps.orchestrator_api.services.publishing_service.prepare_publish_meta",
+            side_effect=AssertionError("social-only publishing must not validate Bilibili meta"),
+        ),
+        patch.object(PublishService, "publish", return_value=result),
+    ):
+        response = publish_all(
+            task_id,
+            PublishAllRequest(
+                platform_meta={"douyin": {"title": "title", "tags": ["tag"]}},
+                skip_review=True,
+            ),
+            MagicMock(),
+            db,
+            MagicMock(),
+        )
+
+    assert response["results"]["douyin"]["status"] == "accepted"
+
+
+def test_publish_all_social_only_reviews_stored_platform_meta() -> None:
+    task_id = uuid.uuid4()
+    task = MagicMock(id=task_id)
+    task.source_license.value = "own"
+    db = MagicMock()
+    db.get.return_value = task
+    stored_meta = {"title": "stored title", "tags": ["tag"]}
+    result = PublishAllResult(
+        batch_id=str(uuid.uuid4()),
+        results={"douyin": {"status": "accepted", "state": "submitting"}},
+    )
+
+    with (
+        patch(
+            "videoroll.apps.orchestrator_api.services.publishing_service.get_publish_platform_settings",
+            return_value={"bilibili": False, "douyin": True},
+        ),
+        patch(
+            "videoroll.apps.orchestrator_api.services.publishing_service.read_s3_json_object",
+            return_value=stored_meta,
+        ),
+        patch(
+            "videoroll.apps.orchestrator_api.services.publishing_service.run_task_publish_review",
+            return_value={"ok": True},
+        ) as review,
+        patch.object(PublishService, "publish", return_value=result),
+    ):
+        publish_all(
+            task_id,
+            PublishAllRequest(),
+            MagicMock(),
+            db,
+            MagicMock(),
+        )
+
+    assert review.call_args.kwargs["meta"] == stored_meta
+
+
+def test_force_retry_reuses_the_current_publish_batch() -> None:
+    """A retry must not race an in-flight or partially failed batch."""
+    task_id = uuid.uuid4()
+    batch_id = uuid.uuid4()
+    task = MagicMock(id=task_id, active_publish_batch_id=batch_id)
+    batch = MagicMock(id=batch_id, task_id=task_id, state=PublishBatchState.failed.value)
+    batch.expected_targets = [{"key": "bilibili:default", "platform": "bilibili", "account_id": None}]
+
+    db = MagicMock()
+    db.get.side_effect = lambda model, _id, **_kwargs: task if model.__name__ == "Task" else batch
+    service = PublishService(db, MagicMock(), MagicMock())
+
+    with patch.object(service, "_get_enabled_platforms", return_value=["bilibili"]):
+        actual_batch, targets = service._get_or_create_batch(task_id, {"force_retry": True})
+
+    assert actual_batch is batch
+    assert targets == batch.expected_targets
+    db.add.assert_not_called()
+    db.query.assert_not_called()
+
+
+def test_new_batch_assigns_a_real_id_to_the_task_before_commit() -> None:
+    task_id = uuid.uuid4()
+    task = MagicMock(active_publish_batch_id=None)
+    db = MagicMock()
+    db.get.return_value = task
+    service = PublishService(db, MagicMock(), MagicMock())
+
+    batch = service._create_batch(
+        task_id,
+        [{"key": "bilibili:default", "platform": "bilibili", "account_id": None}],
+        {},
+    )
+
+    assert isinstance(batch.id, uuid.UUID)
+    assert task.active_publish_batch_id == batch.id
+
+
+def test_publish_one_rejects_a_batch_owned_by_another_task() -> None:
+    task_id = uuid.uuid4()
+    batch = MagicMock(id=uuid.uuid4(), task_id=uuid.uuid4())
+    db = MagicMock()
+    db.get.return_value = batch
+    service = PublishService(db, MagicMock(), MagicMock())
+
+    try:
+        service.publish_one(task_id, platform="bilibili", payload={"batch_id": str(batch.id)})
+    except ValueError as exc:
+        assert str(exc) == "publish batch does not belong to this task"
+    else:
+        raise AssertionError("cross-task batch id must be rejected")
+
+    db.commit.assert_not_called()
+
+
+def test_completed_current_batch_does_not_revive_an_older_failed_batch() -> None:
+    task_id = uuid.uuid4()
+    completed = MagicMock(id=uuid.uuid4(), task_id=task_id, state=PublishBatchState.succeeded.value)
+    task = MagicMock(id=task_id, active_publish_batch_id=completed.id)
+    replacement = MagicMock(id=uuid.uuid4())
+    db = MagicMock()
+    db.get.side_effect = lambda model, _id, **_kwargs: task if model.__name__ == "Task" else completed
+    service = PublishService(db, MagicMock(), MagicMock())
+
+    def create_replacement(*_args, **_kwargs):
+        assert db.commit.call_count == 0
+        return replacement
+
+    with (
+        patch.object(service, "_get_enabled_platforms", return_value=["bilibili"]),
+        patch.object(service, "_create_batch", side_effect=create_replacement) as create_batch,
+    ):
+        batch, _targets = service._get_or_create_batch(task_id, {})
+
+    assert batch is replacement
+    create_batch.assert_called_once()
+    db.query.assert_not_called()
+
+
+def test_failed_batch_with_changed_targets_creates_a_replacement() -> None:
+    task_id = uuid.uuid4()
+    failed = MagicMock(id=uuid.uuid4(), task_id=task_id, state=PublishBatchState.failed.value)
+    failed.expected_targets = [{"key": "bilibili:default", "platform": "bilibili", "account_id": None}]
+    task = MagicMock(id=task_id, active_publish_batch_id=failed.id)
+    replacement = MagicMock(id=uuid.uuid4())
+    db = MagicMock()
+    db.get.side_effect = lambda model, _id, **_kwargs: task if model.__name__ == "Task" else failed
+    service = PublishService(db, MagicMock(), MagicMock())
+
+    with (
+        patch.object(service, "_get_enabled_platforms", return_value=["douyin"]),
+        patch.object(service, "_resolve_social_account_id", return_value=str(uuid.uuid4())),
+        patch.object(service, "_create_batch", return_value=replacement) as create_batch,
+    ):
+        batch, targets = service._get_or_create_batch(task_id, {})
+
+    assert batch is replacement
+    assert targets[0]["platform"] == "douyin"
+    create_batch.assert_called_once()
+
+
+def test_failed_single_target_batch_allows_a_replacement_account() -> None:
+    task_id = uuid.uuid4()
+    old_account_id = uuid.uuid4()
+    new_account_id = uuid.uuid4()
+    failed = MagicMock(id=uuid.uuid4(), task_id=task_id, state=PublishBatchState.failed.value)
+    failed.expected_targets = [
+        {"key": f"douyin:{old_account_id}", "platform": "douyin", "account_id": str(old_account_id)}
+    ]
+    task = MagicMock(id=task_id, active_publish_batch_id=failed.id)
+    replacement = MagicMock(id=uuid.uuid4())
+    db = MagicMock()
+    db.get.side_effect = lambda model, _id, **_kwargs: task if model.__name__ == "Task" else failed
+    service = PublishService(db, MagicMock(), MagicMock())
+
+    with patch.object(service, "_create_batch", return_value=replacement) as create_batch:
+        batch = service._get_or_create_single_target_batch(
+            task_id,
+            "douyin",
+            str(new_account_id),
+            {"account_id": str(new_account_id)},
+        )
+
+    assert batch is replacement
+    create_batch.assert_called_once()
+
+
+def test_retry_binds_an_unresolved_social_target_to_the_newly_valid_account() -> None:
+    task_id = uuid.uuid4()
+    account_id = uuid.uuid4()
+    batch = MagicMock(id=uuid.uuid4())
+    target = {"key": "douyin:default", "platform": "douyin", "account_id": None}
+    batch.expected_targets = [target]
+    batch.outcomes_json = {"douyin:default": {"state": "failed", "detail": "no valid account"}}
+    db = MagicMock()
+    service = PublishService(db, MagicMock(), MagicMock())
+
+    expected = {
+        "key": f"douyin:{account_id}",
+        "platform": "douyin",
+        "account_id": str(account_id),
+    }
+    with patch("videoroll.apps.publish_service.bind_unresolved_social_publish_target", return_value=expected) as bind:
+        rebound = service._bind_unresolved_social_target(batch, target, str(account_id))
+
+    assert rebound == expected
+    bind.assert_called_once_with(db, batch.id, platform="douyin", account_id=str(account_id))
+    db.commit.assert_called_once()
 
 
 @patch("videoroll.apps.publish_service.get_publish_platform_settings")
@@ -216,10 +445,11 @@ def test_publish_isolates_errors(mock_client_cls, mock_build, mock_get_settings)
 
     svc = PublishService(db, MagicMock(), MagicMock())
     batch, targets = _publish_batch(("bilibili", None), ("douyin", None))
-    reconciliation = MagicMock(cleanup_enqueued=False)
+    reconciliation = MagicMock(cleanup_needed=False)
     with (
         patch.object(svc, "_get_or_create_batch", return_value=(batch, targets)),
         patch.object(svc, "_latest_batch_target_job", return_value=None),
+        patch.object(svc, "_resolve_social_account_id", side_effect=ValueError("no account")),
         patch("videoroll.apps.publish_service.reconcile_publish_batch", return_value=reconciliation),
         patch("videoroll.apps.publish_service.record_publish_batch_dispatch_error", return_value=reconciliation),
     ):
@@ -264,7 +494,7 @@ def test_publish_rechecks_platform_when_task_is_already_published(
 
     svc = PublishService(db, MagicMock(), MagicMock())
     batch, targets = _publish_batch(("bilibili", None))
-    reconciliation = MagicMock(cleanup_enqueued=False)
+    reconciliation = MagicMock(cleanup_needed=False)
     with (
         patch.object(svc, "_get_or_create_batch", return_value=(batch, targets)),
         patch.object(svc, "_latest_batch_target_job", return_value=None),

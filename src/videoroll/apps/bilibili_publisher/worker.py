@@ -16,6 +16,7 @@ from typing import Any
 from celery import Celery
 from redis import Redis
 from redis.exceptions import RedisError
+from sqlalchemy import and_, or_
 from sqlalchemy.orm import Session
 
 from videoroll.ai.service import AIService
@@ -537,17 +538,26 @@ def _publish_meta_with_retry_desc_limit(meta: BilibiliPublishMeta) -> BilibiliPu
     return BilibiliPublishMeta.model_validate(payload)
 
 
-def _latest_published_job(db: Session, task_id: uuid.UUID) -> PublishJob | None:
-    return (
-        db.query(PublishJob)
-        .filter(
-            PublishJob.task_id == task_id,
-            PublishJob.platform == Platform.bilibili,
-            PublishJob.state == PublishState.published,
-        )
-        .order_by(PublishJob.updated_at.desc(), PublishJob.created_at.desc())
-        .first()
+def _latest_published_job(
+    db: Session,
+    task_id: uuid.UUID,
+    account_id: uuid.UUID | None = None,
+) -> PublishJob | None:
+    query = db.query(PublishJob).filter(
+        PublishJob.task_id == task_id,
+        PublishJob.platform == Platform.bilibili,
+        PublishJob.state == PublishState.published,
     )
+    if account_id is None:
+        query = query.filter(PublishJob.account_id.is_(None))
+    else:
+        query = query.filter(
+            or_(
+                PublishJob.account_id == account_id,
+                and_(PublishJob.account_id.is_(None), PublishJob.bili_account_id == account_id),
+            )
+        )
+    return query.order_by(PublishJob.updated_at.desc(), PublishJob.created_at.desc()).first()
 
 
 def _task_has_published_job(db: Session, task_id: uuid.UUID) -> bool:
@@ -561,7 +571,7 @@ def _can_mark_task_publish_failed(db: Session, task: Task) -> bool:
 def _reconcile_batch_after_publish_job(db: Session, job: PublishJob) -> bool:
     if job.batch_id is None:
         return False
-    return reconcile_publish_batch(db, job.batch_id).cleanup_enqueued
+    return reconcile_publish_batch(db, job.batch_id).cleanup_needed
 
 
 def _mirror_published_job(job: PublishJob, published_job: PublishJob | None, task: Task) -> None:
@@ -645,15 +655,15 @@ def process_job(self, job_id: str) -> dict[str, Any]:
             db.commit()
             return {"status": "error", "detail": "task not found"}
 
-        published_job = _latest_published_job(db, task.id)
-        if task.status == TaskStatus.published or published_job is not None:
+        published_job = _latest_published_job(db, task.id, job.account_id)
+        if published_job is not None or (job.batch_id is None and task.status == TaskStatus.published):
             _mirror_published_job(job, published_job, task)
             db.add(job)
             db.add(task)
             cleanup_enqueued = _reconcile_batch_after_publish_job(db, job)
             db.commit()
             if job.batch_id is not None:
-                enqueue_publish_batch_cleanup(task.id, job.batch_id, needed=cleanup_enqueued)
+                enqueue_publish_batch_cleanup(db, celery_app, task.id, job.batch_id, needed=cleanup_enqueued)
             return {"status": "skipped", "detail": "task already published", "aid": job.aid, "bvid": job.bvid}
 
         cookie = (get_bilibili_cookie_header(db) or "").strip()
@@ -883,7 +893,7 @@ def process_job(self, job_id: str) -> dict[str, Any]:
 
         db.commit()
         try:
-            enqueue_publish_batch_cleanup(task.id, job.batch_id, needed=cleanup_enqueued) if job.batch_id else None
+            enqueue_publish_batch_cleanup(db, celery_app, task.id, job.batch_id, needed=cleanup_enqueued) if job.batch_id else None
         except Exception:
             logger.exception("failed to enqueue batch cleanup task (task_id=%s batch_id=%s)", task.id, job.batch_id)
         return {"status": "ok", "aid": aid_str or None, "bvid": bvid_str or None}
@@ -1011,7 +1021,7 @@ def process_job(self, job_id: str) -> dict[str, Any]:
                     _ensure_publish_result_asset(db, task.id, result_key)
                 db.commit()
                 if job and job.batch_id is not None:
-                    enqueue_publish_batch_cleanup(task.id, job.batch_id, needed=cleanup_enqueued)
+                    enqueue_publish_batch_cleanup(db, celery_app, task.id, job.batch_id, needed=cleanup_enqueued)
             except Exception:
                 pass
             return {"status": "error", "detail": "rate limited; max retries exceeded"}
@@ -1054,7 +1064,7 @@ def process_job(self, job_id: str) -> dict[str, Any]:
                 _ensure_publish_result_asset(db, task.id, result_key)
             db.commit()
             if job and job.batch_id is not None:
-                enqueue_publish_batch_cleanup(task.id, job.batch_id, needed=cleanup_enqueued)
+                enqueue_publish_batch_cleanup(db, celery_app, task.id, job.batch_id, needed=cleanup_enqueued)
         except Exception:
             pass
         return {"status": "error", "detail": str(e)}

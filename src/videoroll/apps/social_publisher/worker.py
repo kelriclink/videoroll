@@ -86,7 +86,20 @@ def _mark_task_error(task: Task | None, code: str, message: str) -> None:
 def _reconcile_batch_after_publish_job(db: Session, job: PublishJob) -> bool:
     if job.batch_id is None:
         return False
-    return reconcile_publish_batch(db, job.batch_id).cleanup_enqueued
+    return reconcile_publish_batch(db, job.batch_id).cleanup_needed
+
+
+def _enqueue_batch_cleanup_best_effort(
+    db: Session,
+    task_id: uuid.UUID,
+    batch_id: uuid.UUID,
+    *,
+    needed: bool,
+) -> None:
+    try:
+        enqueue_publish_batch_cleanup(db, celery_app, task_id, batch_id, needed=needed)
+    except Exception:
+        logger.exception("failed to enqueue batch cleanup task (task_id=%s batch_id=%s)", task_id, batch_id)
 
 
 @celery_app.task(name="social_publisher.check_account", bind=True, max_retries=20)
@@ -236,7 +249,7 @@ def process_job(self, job_id: str) -> dict[str, Any]:
         db.add(job)
         db.commit()
         if job.batch_id is not None:
-            enqueue_publish_batch_cleanup(task.id, job.batch_id, needed=cleanup_enqueued)
+            _enqueue_batch_cleanup_best_effort(db, task.id, job.batch_id, needed=cleanup_enqueued)
         return {"status": job.state.value, "job_id": str(job.id)}
     except Retry:
         raise
@@ -257,7 +270,7 @@ def process_job(self, job_id: str) -> dict[str, Any]:
                 db.add(task)
             db.commit()
             if job.batch_id is not None and task is not None:
-                enqueue_publish_batch_cleanup(task.id, job.batch_id, needed=cleanup_enqueued)
+                _enqueue_batch_cleanup_best_effort(db, task.id, job.batch_id, needed=cleanup_enqueued)
             return {"status": job.state.value, "detail": _clean_message(exc)}
         return {"status": "error", "detail": _clean_message(exc)}
     finally:
@@ -308,7 +321,7 @@ def mark_stale_jobs_unknown() -> dict[str, int]:
             task = db.get(Task, job.task_id)
             if job.batch_id is not None:
                 result = reconcile_publish_batch(db, job.batch_id)
-                if result.cleanup_enqueued:
+                if result.cleanup_needed:
                     cleanup_batches.append((job.task_id, job.batch_id))
             else:
                 _mark_task_error(task, "SOCIAL_PUBLISH_UNKNOWN", "worker execution timed out; check platform backend before retrying")
@@ -322,7 +335,7 @@ def mark_stale_jobs_unknown() -> dict[str, int]:
             task = db.get(Task, job.task_id)
             if job.batch_id is not None:
                 result = reconcile_publish_batch(db, job.batch_id)
-                if result.cleanup_enqueued:
+                if result.cleanup_needed:
                     cleanup_batches.append((job.task_id, job.batch_id))
             else:
                 _mark_task_error(task, "SOCIAL_PUBLISH_FAILED", "job expired before browser execution")
@@ -330,7 +343,7 @@ def mark_stale_jobs_unknown() -> dict[str, int]:
                 db.add(task)
         db.commit()
         for task_id, batch_id in cleanup_batches:
-            enqueue_publish_batch_cleanup(task_id, batch_id, needed=True)
+            _enqueue_batch_cleanup_best_effort(db, task_id, batch_id, needed=True)
         return {"unknown": len(running), "failed": len(queued)}
     finally:
         db.close()

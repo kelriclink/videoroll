@@ -29,6 +29,7 @@ EXPECTED_ORCHESTRATOR_ROUTES: set[tuple[str, str]] = {
     ("GET", "/tasks/{task_id}/assets"),
     ("GET", "/tasks/{task_id}/assets/{asset_id}/download"),
     ("GET", "/tasks/{task_id}/assets/{asset_id}/stream"),
+    ("GET", "/tasks/{task_id}/publish_batches"),
     ("GET", "/tasks/{task_id}/publish_jobs"),
     ("GET", "/tasks/{task_id}/publish_meta"),
     ("GET", "/tasks/{task_id}/publish_meta/draft"),

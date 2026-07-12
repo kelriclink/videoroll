@@ -5,7 +5,7 @@ import { useConfirm, useToast } from "../components/feedbackContext";
 import { Button } from "../components/ui";
 import { fetchJson } from "../lib/http";
 import { BILIBILI_PUBLISHER_URL, ORCHESTRATOR_URL, SUBTITLE_SERVICE_URL } from "../lib/urls";
-import { Asset, PublishJob, SubtitleJob, Task } from "../lib/types";
+import { Asset, PublishBatch, PublishJob, SubtitleJob, Task } from "../lib/types";
 import { activeAccountsForPlatform, PublishPlatformSettings, SocialAccount } from "./settingsPublishPage.helpers";
 import { buildPublishActionPayload, createTaskDetailPollPlan, PublishPlatform, socialPublishBrowserUrl } from "./taskDetailPage.helpers";
 
@@ -120,6 +120,7 @@ export default function TaskDetailPage() {
   const [assets, setAssets] = useState<Asset[] | null>(null);
   const [subtitleJobs, setSubtitleJobs] = useState<SubtitleJob[] | null>(null);
   const [publishJobs, setPublishJobs] = useState<PublishJob[] | null>(null);
+  const [publishBatches, setPublishBatches] = useState<PublishBatch[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [logSelection, setLogSelection] = useState<string>("combined");
   const [logText, setLogText] = useState<string>("");
@@ -176,11 +177,12 @@ export default function TaskDetailPage() {
       if (!taskId) return;
       if (!opts?.silent) setError(null);
       try {
-        const [t, a, sj, pj, pr, accounts, platforms] = await Promise.all([
+        const [t, a, sj, pj, pb, pr, accounts, platforms] = await Promise.all([
           fetchJson<Task>(`${ORCHESTRATOR_URL}/tasks/${taskId}`),
           fetchJson<Asset[]>(`${ORCHESTRATOR_URL}/tasks/${taskId}/assets`),
           fetchJson<SubtitleJob[]>(`${ORCHESTRATOR_URL}/tasks/${taskId}/subtitle_jobs`),
           fetchJson<PublishJob[]>(`${ORCHESTRATOR_URL}/tasks/${taskId}/publish_jobs`),
+          fetchJson<PublishBatch[]>(`${ORCHESTRATOR_URL}/tasks/${taskId}/publish_batches`),
           fetchJson<PublishReview>(`${ORCHESTRATOR_URL}/tasks/${taskId}/publish_review`),
           fetchJson<SocialAccount[]>(`${ORCHESTRATOR_URL}/settings/publish/social/accounts`),
           fetchJson<PublishPlatformSettingsResponse>(`${ORCHESTRATOR_URL}/settings/publish/platforms`),
@@ -189,6 +191,7 @@ export default function TaskDetailPage() {
         setAssets(a);
         setSubtitleJobs(sj);
         setPublishJobs(pj);
+        setPublishBatches(pb);
         setPublishReview(pr);
         setSocialAccounts(accounts);
         setPublishPlatformSettings(platforms.platforms);
@@ -1908,6 +1911,36 @@ export default function TaskDetailPage() {
         </div>
 
         <div className="mt-4">
+          <div className="text-xs font-semibold text-slate-700">Publish Batches</div>
+          {!publishBatches ? <div className="mt-2 text-sm text-slate-500">加载中…</div> : null}
+          {publishBatches && publishBatches.length === 0 ? <div className="mt-2 text-sm text-slate-500">暂无</div> : null}
+          {publishBatches && publishBatches.length > 0 ? (
+            <div className="mt-2 space-y-2">
+              {publishBatches.map((batch) => {
+                const targets = batch.expected_targets
+                  .map((target) => target.key ?? `${target.platform ?? "unknown"}:${target.account_id ?? "default"}`)
+                  .join(", ");
+                const failures = Object.entries(batch.outcomes)
+                  .filter(([, outcome]) => outcome.state === "failed" || outcome.state === "unknown")
+                  .map(([key, outcome]) => `${key}: ${outcome.detail ?? outcome.state}`)
+                  .join("; ");
+                return (
+                  <div key={batch.id} className="rounded border border-slate-200 bg-slate-50 p-2 text-xs">
+                    <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+                      <span className="font-mono">{batch.id}</span>
+                      <span className="font-semibold">{batch.state}</span>
+                      <span className="text-slate-600">目标：{targets || "-"}</span>
+                      <span className="text-slate-600">
+                        清理：{batch.cleanup_enqueued_at ? "已投递" : batch.state === "succeeded" ? "待补偿投递" : "未满足条件"}
+                      </span>
+                    </div>
+                    {failures ? <div className="mt-1 text-rose-700">失败：{failures}</div> : null}
+                  </div>
+                );
+              })}
+            </div>
+          ) : null}
+
           <div className="text-xs font-semibold text-slate-700">Publish Jobs</div>
           {!publishJobs ? <div className="mt-2 text-sm text-slate-500">加载中…</div> : null}
           {publishJobs && publishJobs.length === 0 ? <div className="mt-2 text-sm text-slate-500">暂无</div> : null}
@@ -1917,6 +1950,7 @@ export default function TaskDetailPage() {
                 <thead className="text-xs text-slate-500">
                   <tr>
                     <th className="py-2 pr-3">ID</th>
+                    <th className="py-2 pr-3">Batch</th>
                     <th className="py-2 pr-3">Platform</th>
                     <th className="py-2 pr-3">Account</th>
                     <th className="py-2 pr-3">State</th>
@@ -1934,6 +1968,7 @@ export default function TaskDetailPage() {
                   {publishJobs.map((j) => (
                     <tr key={j.id} className="border-t">
                       <td className="py-2 pr-3 font-mono text-xs">{j.id.slice(0, 8)}</td>
+                      <td className="py-2 pr-3 font-mono text-xs">{j.batch_id?.slice(0, 8) ?? "-"}</td>
                       <td className="py-2 pr-3">{j.platform ?? "bilibili"}</td>
                       <td className="py-2 pr-3 font-mono text-xs">{j.account_id?.slice(0, 8) ?? "-"}</td>
                       <td className={`py-2 pr-3 ${j.state === "unknown" || j.state === "submitted" ? "text-amber-700" : ""}`}>{j.state}</td>
@@ -1974,13 +2009,13 @@ export default function TaskDetailPage() {
                       <td className="py-2 pr-3 text-xs text-slate-600">{j.started_at ? new Date(j.started_at).toLocaleString() : "-"}</td>
                       <td className="py-2 pr-3 text-xs text-slate-600">{j.finished_at ? new Date(j.finished_at).toLocaleString() : "-"}</td>
                       <td className="py-2 pr-3">
-                        {j.account_id && ["douyin", "xiaohongshu", "kuaishou"].includes(j.platform ?? "") && (j.state === "submitted" || j.state === "unknown") ? (
+                        {["failed", "unknown"].includes(j.state) ? (
                           <button
                             className="rounded border border-amber-300 px-2 py-1 text-xs text-amber-800"
                             onClick={async () => {
                               const ok = await confirm({
                                 title: "确认后重试投稿",
-                                message: "请确认平台创作者后台没有对应作品。继续可能造成重复投稿。",
+                                message: j.state === "unknown" ? "请确认平台创作者后台没有对应作品。继续可能造成重复投稿。" : "将只重试这个失败渠道。",
                                 confirmLabel: "确认重试",
                                 tone: "warning",
                               });
@@ -1988,7 +2023,7 @@ export default function TaskDetailPage() {
                               await submitPublish({
                                 forceRetry: true,
                                 platform: j.platform as PublishPlatform,
-                                accountId: j.account_id ?? "",
+                                accountId: j.account_id ?? undefined,
                               });
                             }}
                           >

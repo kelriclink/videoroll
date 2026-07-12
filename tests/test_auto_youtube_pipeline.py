@@ -3,9 +3,12 @@ from __future__ import annotations
 import json
 import unittest
 import uuid
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
-from videoroll.apps.subtitle_service.worker import _build_after_render_publish_action
+from videoroll.apps.subtitle_service.worker import (
+    _build_after_render_publish_action,
+    after_render_publish,
+)
 
 
 class _FakeStore:
@@ -23,6 +26,38 @@ class _FakeStore:
 
 
 class AutoYouTubePipelineTests(unittest.TestCase):
+
+    def test_after_render_publish_uses_orchestrator_publisher_configuration(self) -> None:
+        """Automatic publishing must receive the publisher endpoint settings."""
+        task_id = uuid.uuid4()
+        render_job_id = uuid.uuid4()
+        render_job = MagicMock(task_id=task_id)
+        render_job.request_json = {
+            "after_render": {
+                "publish": True,
+                "publish_payload": {"skip_review": True},
+            }
+        }
+        task = MagicMock(id=task_id)
+        db = MagicMock()
+        db.get.side_effect = lambda model, _id: render_job if _id == render_job_id else task
+
+        with (
+            patch("videoroll.apps.subtitle_service.worker._ensure_db"),
+            patch("videoroll.apps.subtitle_service.worker._db", return_value=db),
+            patch("videoroll.apps.subtitle_service.worker.S3Store"),
+            patch(
+                "videoroll.apps.orchestrator_api.services.publishing_service.publish_all",
+                return_value={"has_any_accepted": True, "errors": {}},
+            ) as publish_all,
+        ):
+            result = after_render_publish.run(str(render_job_id))
+
+        self.assertEqual(result["status"], "ok")
+        publisher_settings = publish_all.call_args.args[2]
+        self.assertTrue(hasattr(publisher_settings, "bilibili_publisher_url"))
+        self.assertTrue(hasattr(publisher_settings, "social_publisher_url"))
+
     def test_build_after_render_publish_action_returns_none_when_disabled(self) -> None:
         action = _build_after_render_publish_action(
             task_id=uuid.uuid4(),

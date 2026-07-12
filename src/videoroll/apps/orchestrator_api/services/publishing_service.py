@@ -23,6 +23,7 @@ from videoroll.apps.publish_gateway import (
     publish_backend_url,
     publish_meta_key,
 )
+from videoroll.apps.publish_lifecycle import publish_target_key
 from videoroll.apps.publish_meta_draft import build_task_publish_meta_draft
 from videoroll.apps.publish_platform_settings_store import (
     get_publish_platform_settings,
@@ -39,7 +40,7 @@ from videoroll.apps.subtitle_service.auto_profile_store import get_auto_profile
 from videoroll.apps.subtitle_service.bilibili_tags_store import get_task_bilibili_summary, get_task_bilibili_tags
 from videoroll.apps.subtitle_service.translate_settings_store import get_translate_settings
 from videoroll.config import OrchestratorSettings, get_subtitle_settings
-from videoroll.db.models import Asset, AssetKind, PublishJob, PublishState, Task, TaskStatus
+from videoroll.db.models import Asset, AssetKind, PublishBatch, PublishJob, PublishState, Task, TaskStatus
 from videoroll.storage.s3 import S3Store
 
 
@@ -80,7 +81,11 @@ def published_publish_job_task_ids(db: Session, task_ids: list[uuid.UUID]) -> se
         return set()
     rows = (
         db.query(PublishJob.task_id)
-        .filter(PublishJob.task_id.in_(task_ids), PublishJob.state == PublishState.published)
+        .filter(
+            PublishJob.task_id.in_(task_ids),
+            PublishJob.batch_id.is_(None),
+            PublishJob.state == PublishState.published,
+        )
         .all()
     )
     return {row[0] for row in rows}
@@ -92,11 +97,19 @@ def reconcile_published_task_state(
     *,
     published_task_ids: set[uuid.UUID] | None = None,
 ) -> bool:
+    # Batch-managed tasks are aggregated exclusively by publish_lifecycle.
+    # This fallback is retained only for jobs written before batches existed.
+    if task.active_publish_batch_id is not None:
+        return False
     if task.status in {TaskStatus.published, TaskStatus.canceled}:
         return False
     has_published_job = task.id in published_task_ids if published_task_ids is not None else bool(
         db.query(PublishJob.id)
-        .filter(PublishJob.task_id == task.id, PublishJob.state == PublishState.published)
+        .filter(
+            PublishJob.task_id == task.id,
+            PublishJob.batch_id.is_(None),
+            PublishJob.state == PublishState.published,
+        )
         .first()
     )
     if not has_published_job:
@@ -532,6 +545,7 @@ def list_task_publish_jobs(task_id: uuid.UUID, limit: int, db: Session) -> list[
             {
                 "id": job.id,
                 "task_id": job.task_id,
+                "batch_id": job.batch_id,
                 "platform": str(getattr(job.platform, "value", job.platform) or "bilibili"),
                 "state": job.state.value,
                 "aid": job.aid,
@@ -552,6 +566,56 @@ def list_task_publish_jobs(task_id: uuid.UUID, limit: int, db: Session) -> list[
             }
         )
     return output
+
+
+def list_task_publish_batches(task_id: uuid.UUID, limit: int, db: Session) -> list[dict[str, Any]]:
+    if not db.get(Task, task_id):
+        raise HTTPException(status_code=404, detail="task not found")
+    batches = (
+        db.query(PublishBatch)
+        .filter(PublishBatch.task_id == task_id)
+        .order_by(PublishBatch.created_at.desc())
+        .limit(limit)
+        .all()
+    )
+    batch_ids = [batch.id for batch in batches]
+    jobs = (
+        db.query(PublishJob)
+        .filter(PublishJob.batch_id.in_(batch_ids))
+        .order_by(PublishJob.updated_at.desc(), PublishJob.created_at.desc())
+        .all()
+        if batch_ids
+        else []
+    )
+    latest_job_outcomes: dict[uuid.UUID, dict[str, dict[str, Any]]] = {}
+    for job in jobs:
+        if job.batch_id is None:
+            continue
+        by_target = latest_job_outcomes.setdefault(job.batch_id, {})
+        key = publish_target_key(job.platform, job.account_id)
+        if key not in by_target:
+            by_target[key] = {
+                "state": job.state.value,
+                "detail": publish_job_error_message(job),
+                "job_id": str(job.id),
+            }
+    return [
+        {
+            "id": batch.id,
+            "task_id": batch.task_id,
+            "state": batch.state,
+            "expected_targets": list(batch.expected_targets or []),
+            "outcomes": {
+                **dict(batch.outcomes_json or {}),
+                **latest_job_outcomes.get(batch.id, {}),
+            },
+            "cleanup_enqueued_at": batch.cleanup_enqueued_at,
+            "finished_at": batch.finished_at,
+            "created_at": batch.created_at,
+            "updated_at": batch.updated_at,
+        }
+        for batch in batches
+    ]
 
 
 def enqueue_publish_job(
@@ -654,19 +718,41 @@ def publish_all(
     if task.source_license.value == "unknown":
         raise HTTPException(status_code=400, detail="source_license=unknown; add proof before publishing")
 
+    platform_settings = get_publish_platform_settings(db)
+    enabled_platforms = [platform for platform, enabled in platform_settings.items() if enabled]
+    if not enabled_platforms:
+        raise HTTPException(status_code=409, detail="no publish platforms are enabled")
+
     payload = publish_payload.model_dump()
     platform_meta = payload.get("platform_meta")
-    bilibili_meta = platform_meta.get("bilibili") if isinstance(platform_meta, dict) else None
-    meta = prepare_publish_meta(
-        task=task,
-        payload_meta=as_dict(bilibili_meta or payload.get("meta")) or None,
-        db=db,
-        s3=s3,
-        allow_auto_draft=False,
-    )
-    payload["meta"] = meta
+    review_meta = as_dict(payload.get("meta"))
+    if "bilibili" in enabled_platforms:
+        bilibili_meta = platform_meta.get("bilibili") if isinstance(platform_meta, dict) else None
+        meta = prepare_publish_meta(
+            task=task,
+            payload_meta=as_dict(bilibili_meta or payload.get("meta")) or None,
+            db=db,
+            s3=s3,
+            allow_auto_draft=False,
+        )
+        payload["meta"] = meta
+        review_meta = meta
+    elif isinstance(platform_meta, dict):
+        for platform in enabled_platforms:
+            candidate = as_dict(platform_meta.get(platform))
+            if candidate:
+                review_meta = candidate
+                break
+    if not review_meta:
+        for platform in enabled_platforms:
+            stored_meta = read_s3_json_object(s3, publish_meta_key(task_id, platform))
+            if stored_meta is None:
+                stored_meta = read_s3_json_object(s3, publish_meta_s3_key(task_id))
+            if stored_meta:
+                review_meta = stored_meta
+                break
     if not publish_payload.skip_review:
-        review_result = run_task_publish_review(task, meta=meta, db=db, s3=s3)
+        review_result = run_task_publish_review(task, meta=review_meta, db=db, s3=s3)
         if not bool(review_result.get("ok")):
             raise HTTPException(
                 status_code=409,
@@ -678,8 +764,6 @@ def publish_all(
         http_headers=lambda: internal_http_headers(settings),
     )
     result = svc.publish(task_id, publish_payload=payload)
-    if result.platform_count == 0:
-        raise HTTPException(status_code=409, detail="no publish platforms are enabled")
     return {
         "results": result.results,
         "batch_id": result.batch_id,

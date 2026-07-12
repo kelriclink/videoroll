@@ -57,6 +57,7 @@ export type SubtitleJob = {
 export type PublishJob = {
   id: string;
   task_id: string;
+  batch_id?: string | null;
   platform?: string | null;
   state: string;
   aid?: string | null;
@@ -72,6 +73,18 @@ export type PublishJob = {
   typeid_ai_ok?: boolean | null;
   typeid_ai_reason?: string | null;
   error_message?: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+export type PublishBatch = {
+  id: string;
+  task_id: string;
+  state: string;
+  expected_targets: Array<{ key?: string; platform?: string; account_id?: string | null }>;
+  outcomes: Record<string, { state?: string; detail?: string }>;
+  cleanup_enqueued_at?: string | null;
+  finished_at?: string | null;
   created_at: string;
   updated_at: string;
 };

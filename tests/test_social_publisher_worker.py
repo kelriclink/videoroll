@@ -1,4 +1,5 @@
 import uuid
+from unittest.mock import MagicMock, patch
 
 from videoroll.apps.social_publisher.runtime import social_lock_key
 from videoroll.apps.social_publisher.sau_cli import SauCommandResult
@@ -30,3 +31,17 @@ def test_account_check_message_marks_timeout() -> None:
     result = SauCommandResult(returncode=-15, stdout="", stderr="", timed_out=True)
     assert hasattr(worker, "account_check_message")
     assert worker.account_check_message(result) == "SAU check timed out (exit=-15)"
+
+
+def test_cleanup_delivery_failure_is_isolated_from_publish_result() -> None:
+    assert hasattr(worker, "_enqueue_batch_cleanup_best_effort")
+    with patch(
+        "videoroll.apps.social_publisher.worker.enqueue_publish_batch_cleanup",
+        side_effect=RuntimeError("broker unavailable"),
+    ):
+        worker._enqueue_batch_cleanup_best_effort(
+            MagicMock(),
+            uuid.uuid4(),
+            uuid.uuid4(),
+            needed=True,
+        )

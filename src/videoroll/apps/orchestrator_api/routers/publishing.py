@@ -11,6 +11,7 @@ from videoroll.apps.orchestrator_api.schemas import (
     PublishActionRequest,
     PublishAllRequest,
     PublishAllResultResponse,
+    PublishBatchSummary,
     PublishJobSummary,
     PublishMetaDraftRequest,
     PublishMetaDraftResponse,
@@ -82,6 +83,15 @@ def list_task_publish_jobs(
     db: Session = Depends(get_db),
 ) -> list[dict[str, Any]]:
     return publishing_service.list_task_publish_jobs(task_id, limit, db)
+
+
+@router.get("/tasks/{task_id}/publish_batches", response_model=list[PublishBatchSummary])
+def list_task_publish_batches(
+    task_id: uuid.UUID,
+    limit: int = Query(default=20, ge=1, le=100),
+    db: Session = Depends(get_db),
+) -> list[dict[str, Any]]:
+    return publishing_service.list_task_publish_batches(task_id, limit, db)
 
 
 @router.get("/settings/publish/platforms", response_model=PublishPlatformSettingsRead)

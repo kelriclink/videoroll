@@ -272,6 +272,7 @@ class SubtitleJobSummary(BaseModel):
 class PublishJobSummary(BaseModel):
     id: uuid.UUID
     task_id: uuid.UUID
+    batch_id: Optional[uuid.UUID] = None
     platform: str = "bilibili"
     state: str
     aid: Optional[str]
@@ -287,6 +288,21 @@ class PublishJobSummary(BaseModel):
     typeid_ai_ok: Optional[bool] = None
     typeid_ai_reason: Optional[str] = None
     error_message: Optional[str] = None
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class PublishBatchSummary(BaseModel):
+    id: uuid.UUID
+    task_id: uuid.UUID
+    state: str
+    expected_targets: list[dict[str, Any]] = Field(default_factory=list)
+    outcomes: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    cleanup_enqueued_at: Optional[datetime] = None
+    finished_at: Optional[datetime] = None
     created_at: datetime
     updated_at: datetime
 
