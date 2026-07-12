@@ -2773,11 +2773,20 @@ def auto_youtube_pipeline(self: Any, task_id: str, overrides: dict[str, Any] | N
                 "meta": None,
             }
 
-            with httpx.Client(timeout=30.0, headers=_ORCH_INTERNAL_HEADERS) as client:
-                resp = client.post(f"{orch_base}/tasks/{tid}/actions/publish", json=publish_payload)
+            with httpx.Client(timeout=60.0, headers=_ORCH_INTERNAL_HEADERS) as client:
+                resp = client.post(f"{orch_base}/tasks/{tid}/actions/publish_all", json=publish_payload)
                 resp.raise_for_status()
+                result_data = resp.json() if resp.content else {}
 
-        return {"status": "ok", "task_id": str(tid)}
+            # Log partial failures but don't fail the task if at least one platform succeeded.
+            errors = result_data.get("errors", {}) if isinstance(result_data, dict) else {}
+            if errors:
+                logger.warning("auto_youtube_pipeline partial failure for task %s: %s", tid, errors)
+            if not result_data.get("has_any_ok", False) and errors:
+                error_details = "; ".join(f"{p}: {msg}" for p, msg in errors.items())
+                raise RuntimeError(f"all platforms failed: {error_details}")
+
+        return {"status": "ok", "task_id": str(tid), "platforms": result_data}
     except Retry:
         raise
     except Exception as e:
