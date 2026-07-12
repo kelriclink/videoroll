@@ -1069,7 +1069,7 @@ def test_fetch_wikipedia_evidence_reads_page_extract(monkeypatch) -> None:
                 }
             )
 
-    monkeypatch.setattr(rag_module.httpx, "Client", _Client)
+    monkeypatch.setattr(rag_module, "_PublicFetchClient", _Client)
 
     evidence = fetch_wikipedia_evidence("Lyman-alpha blob", domain="astrophysics", queries=["Lyman-alpha blob definition"])
 
@@ -1131,7 +1131,7 @@ def test_fetch_search_evidence_reads_result_pages(monkeypatch) -> None:
                 url=url,
             )
 
-    monkeypatch.setattr(rag_module.httpx, "Client", _Client)
+    monkeypatch.setattr(rag_module, "_PublicFetchClient", _Client)
     monkeypatch.setattr(rag_module, "_is_fetchable_url", lambda _url: True)
 
     evidence = fetch_search_evidence("AWP", domain="CS2", search_url="https://search.example/search?q=")
@@ -1141,34 +1141,35 @@ def test_fetch_search_evidence_reads_result_pages(monkeypatch) -> None:
     assert "powerful sniper rifle" in evidence[0]["content"]
 
 
-def test_safe_public_get_rejects_redirect_to_private_host(monkeypatch) -> None:
+def test_fetch_url_evidence_routes_arbitrary_urls_through_egress(monkeypatch) -> None:
     from videoroll.apps.subtitle_service import rag as rag_module
 
     calls: list[str] = []
 
-    def handler(request: httpx.Request) -> httpx.Response:
-        calls.append(str(request.url))
-        if request.url.host == "public.example":
-            return httpx.Response(302, headers={"location": "http://127.0.0.1/admin"}, request=request)
-        return httpx.Response(200, text="internal", request=request)
+    class _Response:
+        status_code = 200
+        headers = {"content-type": "text/html"}
+        text = "<html><body><main>Verified public evidence.</main></body></html>"
 
-    client = httpx.Client(transport=httpx.MockTransport(handler), follow_redirects=True)
-    monkeypatch.setattr(
-        rag_module,
-        "_is_fetchable_url",
-        lambda url: not str(url).startswith("http://127.0.0.1"),
-    )
-    try:
-        try:
-            rag_module._safe_public_get(client, "https://public.example/start")
-        except RuntimeError as e:
-            assert "non-public URL" in str(e)
-        else:
-            raise AssertionError("expected redirect to private host to be rejected")
-    finally:
-        client.close()
+        def raise_for_status(self) -> None:
+            return None
+
+    def fake_fetch(url: str, **kwargs: object) -> _Response:
+        calls.append(url)
+        return _Response()
+
+    class _ForbiddenClient:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            raise AssertionError("RAG arbitrary URL fetches must not create httpx.Client")
+
+    monkeypatch.setattr(rag_module, "fetch_public", fake_fetch)
+    monkeypatch.setattr(rag_module.httpx, "Client", _ForbiddenClient)
+
+    page = rag_module.fetch_url_evidence(url="https://public.example/start")
 
     assert calls == ["https://public.example/start"]
+    assert page is not None
+    assert "Verified public evidence" in page["content"]
 
 
 def test_fetch_search_evidence_skips_pages_when_llm_says_summary_is_enough(monkeypatch) -> None:
@@ -1214,7 +1215,7 @@ def test_fetch_search_evidence_skips_pages_when_llm_says_summary_is_enough(monke
                 )
             return _Response("<html><body>should not fetch</body></html>", url=url)
 
-    monkeypatch.setattr(rag_module.httpx, "Client", _Client)
+    monkeypatch.setattr(rag_module, "_PublicFetchClient", _Client)
     monkeypatch.setattr(
         rag_module,
         "request_openai_json_object",
@@ -1282,7 +1283,7 @@ def test_fetch_search_evidence_filters_searxng_internal_about(monkeypatch) -> No
                 url=url,
             )
 
-    monkeypatch.setattr(rag_module.httpx, "Client", _Client)
+    monkeypatch.setattr(rag_module, "_PublicFetchClient", _Client)
 
     evidence = fetch_search_evidence("truth table", domain="logic", search_url="https://search.example/search")
 
@@ -1335,7 +1336,7 @@ def test_fetch_search_evidence_filters_searx_space_ui_result_from_json(monkeypat
                 )
             return _Response("<html><body><a href=\"https://searx.space\">SearXNG</a></body></html>", url=url, content_type="text/html")
 
-    monkeypatch.setattr(rag_module.httpx, "Client", _Client)
+    monkeypatch.setattr(rag_module, "_PublicFetchClient", _Client)
 
     evidence = fetch_search_evidence("Lyman-alpha blob", domain="astrophysics", search_url="https://search.example/search")
 
@@ -1384,7 +1385,7 @@ def test_fetch_search_evidence_falls_back_to_html_when_json_format_fails(monkeyp
                 url=url,
             )
 
-    monkeypatch.setattr(rag_module.httpx, "Client", _Client)
+    monkeypatch.setattr(rag_module, "_PublicFetchClient", _Client)
 
     evidence = fetch_search_evidence("Lyman-alpha blob", domain="astrophysics", search_url="https://search.example/search")
 
@@ -1444,7 +1445,7 @@ def test_fetch_search_evidence_retries_with_default_engines_when_default_search_
                 },
             )
 
-    monkeypatch.setattr(rag_module.httpx, "Client", _Client)
+    monkeypatch.setattr(rag_module, "_PublicFetchClient", _Client)
     monkeypatch.setattr(rag_module, "_is_fetchable_url", lambda _url: True)
 
     evidence = fetch_search_evidence("VGA", domain="display", search_url="https://search.example/search")
@@ -1498,7 +1499,7 @@ def test_fetch_search_evidence_does_not_fallback_when_llm_selects_no_urls(monkey
                 )
             return _Response("<html><body>should not fetch</body></html>", url=url)
 
-    monkeypatch.setattr(rag_module.httpx, "Client", _Client)
+    monkeypatch.setattr(rag_module, "_PublicFetchClient", _Client)
     monkeypatch.setattr(
         rag_module,
         "request_openai_json_object",
@@ -1583,7 +1584,7 @@ def test_fetch_search_evidence_merges_multiple_queries(monkeypatch) -> None:
                 content_type="text/html",
             )
 
-    monkeypatch.setattr(rag_module.httpx, "Client", _Client)
+    monkeypatch.setattr(rag_module, "_PublicFetchClient", _Client)
     monkeypatch.setattr(rag_module, "_is_fetchable_url", lambda _url: True)
 
     evidence = fetch_search_evidence(

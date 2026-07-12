@@ -30,6 +30,26 @@ services:
       "
     restart: "no"
 
+  egress-gateway:
+    build:
+      context: .
+      args:
+        INSTALL_ASR: "0"
+        YTDLP_VERSION: ${YTDLP_VERSION:-latest}
+    image: videoroll:prod
+    command: ["uvicorn", "videoroll.apps.egress_gateway.main:app", "--host", "0.0.0.0", "--port", "8020"]
+    environment:
+      INTERNAL_API_SECRET: ${INTERNAL_API_SECRET}
+    networks:
+      - internal
+      - egress
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8020/health', timeout=5)"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+    restart: unless-stopped
+
   app:
     build:
       context: .
@@ -72,6 +92,7 @@ services:
       BILIBILI_PUBLISHER_URL: ${BILIBILI_PUBLISHER_URL:-http://localhost:8000/bilibili-publisher}
       SOCIAL_PUBLISHER_URL: ${SOCIAL_PUBLISHER_URL:-http://social-publisher-api:8010}
       STORAGE_CLEANUP_INTERVAL_SECONDS: ${STORAGE_CLEANUP_INTERVAL_SECONDS:-3600}
+      INTERNAL_API_SECRET: ${INTERNAL_API_SECRET}
     volumes:
       - ./data/models:/models
       - ./data/secrets:/secrets
@@ -85,8 +106,13 @@ services:
         condition: service_started
       minio-init:
         condition: service_completed_successfully
+      egress-gateway:
+        condition: service_healthy
       social-publisher-api:
         condition: service_healthy
+    networks:
+      - default
+      - internal
     restart: unless-stopped
 
   social-publisher-api:
@@ -176,3 +202,8 @@ services:
       social-publisher-worker:
         condition: service_started
     restart: unless-stopped
+
+networks:
+  internal:
+    internal: true
+  egress:

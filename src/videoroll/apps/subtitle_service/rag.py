@@ -2,11 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import html
-import ipaddress
 import json
 import math
 import re
-import socket
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError, as_completed
@@ -21,6 +19,7 @@ from sqlalchemy.orm import Session
 from pydantic import BaseModel
 
 from videoroll.ai.client import OpenAIChatConfig, request_openai_json_object
+from videoroll.apps.egress_gateway.client import EgressResponse, fetch_public
 from videoroll.apps.subtitle_service.agent_runtime import (
     AgentBudget,
     AgentBudgetExceeded,
@@ -912,61 +911,76 @@ def _is_search_engine_internal_url(url: str, *, search_url: str) -> bool:
     )
 
 
-def _is_private_host(hostname: str) -> bool:
-    host = str(hostname or "").strip().strip("[]")
-    if not host:
-        return True
-    if host.lower() in {"localhost", "localhost.localdomain"}:
-        return True
-    try:
-        ip = ipaddress.ip_address(host)
-        return bool(ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_reserved)
-    except ValueError:
-        pass
-    try:
-        for info in socket.getaddrinfo(host, None, proto=socket.IPPROTO_TCP):
-            addr = info[4][0]
-            ip = ipaddress.ip_address(addr)
-            if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_reserved:
-                return True
-    except Exception:
-        return False
-    return False
-
-
 def _is_fetchable_url(url: str) -> bool:
-    parsed = urlparse(str(url or "").strip())
-    if parsed.scheme not in {"http", "https"}:
+    try:
+        parsed = urlparse(str(url or "").strip())
+        port = parsed.port
+    except ValueError:
         return False
-    if _is_private_host(parsed.hostname or ""):
+    expected_port = {"http": 80, "https": 443}.get(parsed.scheme.lower())
+    if expected_port is None or not parsed.hostname:
+        return False
+    if parsed.username is not None or parsed.password is not None:
+        return False
+    if port is not None and port != expected_port:
         return False
     return True
 
 
-def _client_get_no_redirects(client: httpx.Client, url: str) -> httpx.Response:
+def _url_with_params(url: str, params: dict[str, Any] | None) -> str:
+    if not params:
+        return url
+    parsed = urlparse(url)
+    pairs = list(parse_qsl(parsed.query, keep_blank_values=True))
+    for name, value in params.items():
+        if isinstance(value, (list, tuple)):
+            pairs.extend((str(name), str(item)) for item in value)
+        else:
+            pairs.append((str(name), str(value)))
+    return urlunparse(parsed._replace(query=urlencode(pairs, doseq=True)))
+
+
+class _PublicFetchClient:
+    def __init__(
+        self,
+        *,
+        timeout: float = 20.0,
+        headers: dict[str, str] | None = None,
+        follow_redirects: bool = True,
+    ) -> None:
+        self.timeout = timeout
+        self.headers = headers or {}
+        self.redirects = 5 if follow_redirects else 0
+
+    def __enter__(self) -> _PublicFetchClient:
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> bool:
+        return False
+
+    def get(
+        self,
+        url: str,
+        params: dict[str, Any] | None = None,
+        *,
+        redirects: int | None = None,
+    ) -> EgressResponse:
+        return fetch_public(
+            _url_with_params(url, params),
+            timeout=self.timeout,
+            max_bytes=500_000,
+            redirects=self.redirects if redirects is None else redirects,
+            headers=self.headers,
+        )
+
+
+def _safe_public_get(client: Any, url: str, *, max_redirects: int = 5) -> Any:
+    if not _is_fetchable_url(url):
+        raise RuntimeError(f"refusing to fetch invalid public URL: {url}")
     try:
-        return client.get(url, follow_redirects=False)
+        return client.get(url, redirects=max_redirects)
     except TypeError:
-        # Test doubles and older compatible clients may not accept per-request
-        # redirect flags; production httpx does.
         return client.get(url)
-
-
-def _safe_public_get(client: httpx.Client, url: str, *, max_redirects: int = 5) -> httpx.Response:
-    current = str(url or "").strip()
-    for _redirect_no in range(max(0, int(max_redirects)) + 1):
-        if not _is_fetchable_url(current):
-            raise RuntimeError(f"refusing to fetch non-public URL: {current}")
-        resp = _client_get_no_redirects(client, current)
-        status_code = int(getattr(resp, "status_code", 200) or 200)
-        if status_code not in {301, 302, 303, 307, 308}:
-            return resp
-        location = str(resp.headers.get("location") or "").strip()
-        if not location:
-            return resp
-        base_url = str(getattr(resp, "url", current) or current)
-        current = urljoin(base_url, location)
-    raise RuntimeError("too many redirects while fetching URL")
 
 
 def _parse_search_json(data: Any) -> list[dict[str, Any]]:
@@ -1864,7 +1878,7 @@ def fetch_search_evidence(
     search_results: list[dict[str, Any]] = []
     seen_result_urls: set[str] = set()
     try:
-        with httpx.Client(
+        with _PublicFetchClient(
             timeout=timeout_seconds,
             follow_redirects=True,
             headers={"User-Agent": "VideoRoll-RAG-Agent/1.0", "Accept": "application/json, text/html;q=0.9,*/*;q=0.8"},
@@ -2184,7 +2198,7 @@ def fetch_wikipedia_evidence(
     search_results: list[dict[str, Any]] = []
     seen_pages: set[str] = set()
     try:
-        with httpx.Client(
+        with _PublicFetchClient(
             timeout=timeout_seconds,
             follow_redirects=True,
             headers={"User-Agent": _WIKIPEDIA_USER_AGENT, "Accept": "application/json"},
@@ -2366,7 +2380,7 @@ def fetch_url_evidence(
         return None
     started = time.perf_counter()
     try:
-        with httpx.Client(
+        with _PublicFetchClient(
             timeout=timeout_seconds,
             follow_redirects=True,
             headers={"User-Agent": "VideoRoll-RAG-Agent/1.0", "Accept": "text/html, text/plain;q=0.9,*/*;q=0.8"},
