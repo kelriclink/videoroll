@@ -43,6 +43,8 @@ RUN INSTALL_ASR="$INSTALL_ASR" python -c "import os, tomllib; from pathlib impor
   && pip install --no-cache-dir -r /tmp/requirements.txt
 
 COPY src/videoroll ./src/videoroll
+COPY alembic.ini ./alembic.ini
+COPY migrations ./migrations
 COPY docs ./docs
 COPY docker ./docker
 

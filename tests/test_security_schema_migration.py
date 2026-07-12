@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import importlib
+import json
 import os
 import subprocess
 import sys
@@ -8,6 +8,7 @@ from pathlib import Path
 
 from sqlalchemy import JSON, Column, MetaData, String, Table, create_engine, inspect
 from sqlalchemy.dialects import postgresql
+from sqlalchemy.engine import Engine
 from sqlalchemy.schema import CreateTable
 
 from videoroll.db import models as db_models
@@ -31,6 +32,87 @@ def _unique_column_sets(table_name: str) -> set[tuple[str, ...]]:
         for constraint in table.constraints
         if constraint.__class__.__name__ == "UniqueConstraint"
     }
+
+
+def _migration_env(database_url: str, pythonpath: Path) -> dict[str, str]:
+    env = os.environ.copy()
+    env.update(
+        {
+            "DATABASE_URL": database_url,
+            "PYTHONPATH": str(pythonpath),
+            "REDIS_URL": "redis://localhost:6379/0",
+            "S3_ENDPOINT_URL": "http://localhost:9000",
+            "S3_ACCESS_KEY_ID": "test-access-key",
+            "S3_SECRET_ACCESS_KEY": "test-secret-key",
+            "S3_BUCKET": "test-bucket",
+        }
+    )
+    return env
+
+
+def _create_legacy_database(database_path: Path) -> tuple[str, Engine]:
+    database_url = f"sqlite:///{database_path}"
+    engine = create_engine(database_url)
+    legacy = MetaData()
+    for table_name in ("subtitle_jobs", "render_jobs"):
+        Table(
+            table_name,
+            legacy,
+            Column("id", String(36), primary_key=True),
+            Column("status", String(32), nullable=False),
+            Column("created_at", String(64), nullable=False),
+        )
+    Table(
+        "publish_jobs",
+        legacy,
+        Column("id", String(36), primary_key=True),
+        Column("state", String(32), nullable=False),
+        Column("created_at", String(64), nullable=False),
+    )
+    Table(
+        "app_settings",
+        legacy,
+        Column("key", String(128), primary_key=True),
+        Column("value_json", JSON, nullable=False),
+    )
+    legacy.create_all(engine)
+
+    with engine.begin() as connection:
+        connection.execute(
+            legacy.tables["subtitle_jobs"].insert(),
+            {"id": "subtitle-legacy", "status": "queued", "created_at": "2026-01-01T00:00:00Z"},
+        )
+        connection.execute(
+            legacy.tables["render_jobs"].insert(),
+            {"id": "render-legacy", "status": "running", "created_at": "2026-01-02T00:00:00Z"},
+        )
+        connection.execute(
+            legacy.tables["publish_jobs"].insert(),
+            {"id": "publish-legacy", "state": "draft", "created_at": "2026-01-03T00:00:00Z"},
+        )
+        connection.execute(
+            legacy.tables["app_settings"].insert(),
+            {"key": "legacy.settings", "value_json": {"enabled": True}},
+        )
+    return database_url, engine
+
+
+def _assert_legacy_rows_survive(engine: Engine) -> None:
+    with engine.connect() as connection:
+        assert connection.exec_driver_sql(
+            "SELECT status FROM subtitle_jobs WHERE id = 'subtitle-legacy'"
+        ).scalar_one() == "queued"
+        assert connection.exec_driver_sql(
+            "SELECT status FROM render_jobs WHERE id = 'render-legacy'"
+        ).scalar_one() == "running"
+        assert connection.exec_driver_sql(
+            "SELECT state FROM publish_jobs WHERE id = 'publish-legacy'"
+        ).scalar_one() == "draft"
+        value_json, version = connection.exec_driver_sql(
+            "SELECT value_json, version FROM app_settings WHERE key = 'legacy.settings'"
+        ).one()
+    assert json.loads(value_json) == {"enabled": True}
+    assert version == 1
 
 
 def test_security_tables_and_unique_operation_keys_exist() -> None:
@@ -75,6 +157,13 @@ def test_migration_does_not_depend_on_auto_migrate() -> None:
         assert table_name not in source
 
 
+def test_docker_image_contains_migration_resources() -> None:
+    dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+
+    assert "COPY alembic.ini ./alembic.ini" in dockerfile
+    assert "COPY migrations ./migrations" in dockerfile
+
+
 def test_alembic_offline_sql_contains_security_schema() -> None:
     assert (ROOT / "alembic.ini").is_file()
     assert (ROOT / "migrations/env.py").is_file()
@@ -101,40 +190,11 @@ def test_alembic_offline_sql_contains_security_schema() -> None:
 
 def test_sqlite_migration_smoke(tmp_path: Path) -> None:
     assert (ROOT / "alembic.ini").is_file()
-    database_path = tmp_path / "security-schema.sqlite3"
-    database_url = f"sqlite:///{database_path}"
-    engine = create_engine(database_url)
-    legacy = MetaData()
-    for table_name in ("subtitle_jobs", "render_jobs"):
-        Table(
-            table_name,
-            legacy,
-            Column("id", String(36), primary_key=True),
-            Column("status", String(32), nullable=False),
-            Column("created_at", String(64), nullable=False),
-        )
-    Table(
-        "publish_jobs",
-        legacy,
-        Column("id", String(36), primary_key=True),
-        Column("state", String(32), nullable=False),
-        Column("created_at", String(64), nullable=False),
-    )
-    Table(
-        "app_settings",
-        legacy,
-        Column("key", String(128), primary_key=True),
-        Column("value_json", JSON, nullable=False),
-    )
-    legacy.create_all(engine)
-
-    env = os.environ.copy()
-    env["DATABASE_URL"] = database_url
-    env["PYTHONPATH"] = str(ROOT / "src")
+    database_url, engine = _create_legacy_database(tmp_path / "source-security-schema.sqlite3")
     result = subprocess.run(
-        [sys.executable, "-m", "alembic", "-c", "alembic.ini", "upgrade", "head"],
+        [sys.executable, "-m", "videoroll.db.migrate", "upgrade"],
         cwd=ROOT,
-        env=env,
+        env=_migration_env(database_url, ROOT / "src"),
         capture_output=True,
         text=True,
         check=False,
@@ -145,17 +205,66 @@ def test_sqlite_migration_smoke(tmp_path: Path) -> None:
     assert SECURITY_TABLES.issubset(inspector.get_table_names())
     assert "version" in {column["name"] for column in inspector.get_columns("app_settings")}
     assert "lease_owner" in {column["name"] for column in inspector.get_columns("subtitle_jobs")}
+    _assert_legacy_rows_survive(engine)
 
 
-def test_migration_runner_returns_nonzero_on_failure(monkeypatch) -> None:
-    assert (ROOT / "src/videoroll/db/migrate.py").is_file()
-    migrate = importlib.import_module("videoroll.db.migrate")
+def test_installed_wheel_migration_cli_upgrades_legacy_database(tmp_path: Path) -> None:
+    wheel_dir = tmp_path / "wheel"
+    wheel_dir.mkdir()
+    build = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pip",
+            "wheel",
+            "--no-deps",
+            "--no-build-isolation",
+            "--wheel-dir",
+            str(wheel_dir),
+            str(ROOT),
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert build.returncode == 0, build.stderr
+    wheel_path = next(wheel_dir.glob("videoroll-*.whl"))
 
-    monkeypatch.setattr(migrate.command, "upgrade", lambda *_args, **_kwargs: None)
-    assert migrate.main(["upgrade"]) == 0
+    site_packages = tmp_path / "site-packages"
+    install = subprocess.run(
+        [sys.executable, "-m", "pip", "install", "--no-deps", "--target", str(site_packages), str(wheel_path)],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert install.returncode == 0, install.stderr
 
-    def fail(*_args, **_kwargs) -> None:
-        raise RuntimeError("migration failed")
+    database_url, engine = _create_legacy_database(tmp_path / "installed-security-schema.sqlite3")
+    result = subprocess.run(
+        [sys.executable, "-m", "videoroll.db.migrate", "upgrade"],
+        cwd=tmp_path,
+        env=_migration_env(database_url, site_packages),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
 
-    monkeypatch.setattr(migrate.command, "upgrade", fail)
-    assert migrate.main(["upgrade"]) != 0
+    assert result.returncode == 0, result.stderr
+    assert SECURITY_TABLES.issubset(inspect(engine).get_table_names())
+    _assert_legacy_rows_survive(engine)
+
+
+def test_migration_runner_returns_nonzero_on_failure(tmp_path: Path) -> None:
+    database_url = f"sqlite:///{tmp_path / 'empty.sqlite3'}"
+    result = subprocess.run(
+        [sys.executable, "-m", "videoroll.db.migrate", "upgrade"],
+        cwd=ROOT,
+        env=_migration_env(database_url, ROOT / "src"),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode != 0

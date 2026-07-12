@@ -3,8 +3,10 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
+from importlib.resources import as_file, files
 from pathlib import Path
-from typing import Sequence
 
 from alembic import command
 from alembic.config import Config
@@ -13,9 +15,18 @@ from alembic.config import Config
 logger = logging.getLogger(__name__)
 
 
-def _alembic_config() -> Config:
+@contextmanager
+def _alembic_config() -> Iterator[Config]:
     root = Path(__file__).resolve().parents[3]
-    return Config(str(root / "alembic.ini"))
+    source_config = root / "alembic.ini"
+    source_migrations = root / "migrations"
+    if source_config.is_file() and source_migrations.is_dir():
+        yield Config(str(source_config))
+        return
+
+    packaged_root = files("videoroll").joinpath("_migration")
+    with as_file(packaged_root) as migration_root:
+        yield Config(str(migration_root / "alembic.ini"))
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -25,7 +36,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     try:
-        command.upgrade(_alembic_config(), args.revision)
+        with _alembic_config() as config:
+            command.upgrade(config, args.revision)
     except Exception:
         logger.exception("database migration failed")
         return 1
