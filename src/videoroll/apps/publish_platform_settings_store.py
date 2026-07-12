@@ -17,7 +17,9 @@ def _as_dict(value: Any) -> dict[str, Any]:
 
 
 def _defaults() -> dict[str, bool]:
-    return {platform: False for platform in sorted(SUPPORTED_PUBLISH_PLATFORMS)}
+    # bilibili was the only supported platform before the multi-platform refactor;
+    # default it to True so existing installations keep working after upgrade.
+    return {"bilibili": True, **{platform: False for platform in sorted(SUPPORTED_PUBLISH_PLATFORMS) if platform != "bilibili"}}
 
 
 def _get_row(db: Session) -> AppSetting:

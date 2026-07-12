@@ -32,7 +32,7 @@ from videoroll.apps.publish_meta_rules import bilibili_text_units, clamp_bilibil
 from videoroll.config import get_bilibili_publisher_settings, get_subtitle_settings
 from videoroll.db.base import Base
 from videoroll.db.auto_migrate import auto_migrate
-from videoroll.db.models import Asset, AssetKind, PublishJob, PublishState, Task, TaskStatus
+from videoroll.db.models import Asset, AssetKind, Platform, PublishJob, PublishState, Task, TaskStatus
 from videoroll.db.session import get_engine, get_sessionmaker
 from videoroll.storage.s3 import S3Store
 from videoroll.apps.subtitle_service.bilibili_tags_store import get_task_bilibili_summary
