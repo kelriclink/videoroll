@@ -2,6 +2,7 @@ import { Link } from "react-router-dom";
 import { useEffect, useMemo, useState } from "react";
 import { useConfirm } from "../components/feedbackContext";
 import { fetchJson } from "../lib/http";
+import { ORCHESTRATOR_URL } from "../lib/urls";
 import { SUBTITLE_SERVICE_URL } from "../lib/urls";
 
 type YouTubeSubtitleMode = "off" | "target" | "auto_source";
@@ -91,6 +92,7 @@ export default function SettingsAutoPage() {
   const [translateEnableSummary, setTranslateEnableSummary] = useState(true);
 
   const [autoPublish, setAutoPublish] = useState(true);
+  const [enabledPlatforms, setEnabledPlatforms] = useState<string[]>([]);
   const [publishTypeidMode, setPublishTypeidMode] = useState("ai_summary");
   const [publishTranslateTitle, setPublishTranslateTitle] = useState(true);
   const [publishTitlePrefix, setPublishTitlePrefix] = useState("【熟肉】");
@@ -100,14 +102,18 @@ export default function SettingsAutoPage() {
   async function refresh() {
     setError(null);
     try {
-      const [profile, models, translateSettings] = await Promise.all([
+      const [profile, models, translateSettings, platformSettingsResp] = await Promise.all([
         fetchJson<AutoProfile>(`${SUBTITLE_SERVICE_URL}/subtitle/auto/profile`),
         fetchJson<Array<{ name: string; path: string }>>(`${SUBTITLE_SERVICE_URL}/subtitle/models`).catch(() => null),
         fetchJson<{ openai_api_key_set: boolean }>(`${SUBTITLE_SERVICE_URL}/subtitle/translate/settings`).catch(() => null),
+        fetchJson<{ platforms: Record<string, boolean> }>(`${ORCHESTRATOR_URL}/settings/publish/platforms`).catch(() => null),
       ]);
 
       if (models) setWhisperModels(models);
       if (translateSettings) setOpenaiKeySet(Boolean(translateSettings.openai_api_key_set));
+      if (platformSettingsResp?.platforms) {
+        setEnabledPlatforms(Object.entries(platformSettingsResp.platforms).filter(([, v]) => v).map(([k]) => k));
+      }
 
       const f = Array.isArray(profile.formats) ? profile.formats : [];
       setFormats({ srt: f.includes("srt"), ass: f.includes("ass") });
@@ -460,7 +466,20 @@ export default function SettingsAutoPage() {
         </div>
 
         <div className="mt-4 rounded border p-3">
-          <div className="text-xs font-semibold text-slate-700">投稿（当前默认：哔哩哔哩）</div>
+          <div className="text-xs font-semibold text-slate-700">投稿（多平台）</div>
+          {enabledPlatforms.length > 0 && (
+            <div className="mt-1 flex flex-wrap gap-1">
+              {enabledPlatforms.map((p) => (
+                <span key={p} className="inline-flex items-center rounded-full bg-green-100 px-2 py-0.5 text-xs text-green-800">
+                  {p === "bilibili" ? "哔哩哔哩" : p === "douyin" ? "抖音" : p === "xiaohongshu" ? "小红书" : p === "kuaishou" ? "快手" : p}
+                </span>
+              ))}
+              <span className="text-xs text-slate-500">自动模式将投稿到以上平台</span>
+            </div>
+          )}
+          {enabledPlatforms.length === 0 && (
+            <div className="mt-1 text-xs text-amber-600">未启用任何投稿平台，请先到投稿设置中勾选</div>
+          )}
           <div className="mt-2 grid gap-2 md:grid-cols-2">
             <label className="flex items-center gap-2 text-sm">
               <input type="checkbox" checked={autoPublish} onChange={(e) => setAutoPublish(e.target.checked)} />
