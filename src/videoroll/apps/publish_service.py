@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 
 from videoroll.apps.publish_gateway import normalize_publish_platform, publish_backend_url
 from videoroll.apps.publish_platform_settings_store import get_publish_platform_settings
-from videoroll.db.models import Task, TaskStatus
+from videoroll.db.models import Account, Asset, AssetKind, Platform, Task
 from videoroll.storage.s3 import S3Store
 
 
@@ -94,7 +94,7 @@ class PublishService:
         platform: str,
         payload: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """只投指定平台。返回该平台的 publish 结果 dict。"""
+        """只投指定平台。payload 应为已构建好的 gateway request dict。"""
         platform = normalize_publish_platform(platform)
         return self._publish_single(task_id, platform, payload)
 
@@ -118,11 +118,146 @@ class PublishService:
         results: dict[str, dict[str, Any]] = {}
         for platform in platforms:
             try:
-                result = self._publish_single(task_id, platform, base_payload)
+                request = self._build_backend_request(task_id, platform, base_payload)
+                result = self._publish_single(task_id, platform, request)
                 results[platform] = result
+            except httpx.HTTPStatusError as exc:
+                results[platform] = {
+                    "status": "error",
+                    "detail": self._http_status_error_detail(exc),
+                }
             except Exception as exc:
                 results[platform] = {"status": "error", "detail": str(exc)}
         return PublishAllResult(results=results)
+
+    @staticmethod
+    def _http_status_error_detail(exc: httpx.HTTPStatusError) -> str:
+        response = exc.response
+        try:
+            body = response.json()
+        except ValueError:
+            body = None
+        if isinstance(body, dict):
+            detail = body.get("detail") or body.get("message")
+            if isinstance(detail, list):
+                messages = []
+                for item in detail:
+                    if not isinstance(item, dict):
+                        messages.append(str(item))
+                        continue
+                    location = ".".join(
+                        str(part) for part in item.get("loc", []) if part != "body"
+                    )
+                    message = str(item.get("msg") or item)
+                    messages.append(f"{location}: {message}" if location else message)
+                detail = "; ".join(messages)
+            if detail:
+                return f"HTTP {response.status_code}: {detail}"
+        text = response.text.strip()
+        if text:
+            return f"HTTP {response.status_code}: {text}"
+        return f"HTTP {response.status_code}"
+
+    def _resolve_social_account_id(
+        self,
+        platform: str,
+        payload: dict[str, Any],
+    ) -> str:
+        account_ids = payload.get("account_ids")
+        requested_account_id = None
+        if isinstance(account_ids, dict):
+            requested_account_id = account_ids.get(platform)
+        if requested_account_id is None:
+            requested_account_id = payload.get("account_id")
+
+        if requested_account_id:
+            try:
+                account_uuid = uuid.UUID(str(requested_account_id))
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"invalid account_id configured for {platform}") from exc
+            account = self._db.get(Account, account_uuid)
+            if (
+                not account
+                or account.platform != Platform(platform)
+                or not account.is_active
+                or account.check_state != "valid"
+            ):
+                raise ValueError(f"active validated account not found for {platform}")
+            return str(account.id)
+
+        account = (
+            self._db.query(Account)
+            .filter(
+                Account.platform == Platform(platform),
+                Account.is_active.is_(True),
+                Account.check_state == "valid",
+            )
+            .order_by(Account.created_at.desc())
+            .first()
+        )
+        if not account:
+            raise ValueError(f"no active validated account configured for {platform}")
+        return str(account.id)
+
+    def _build_backend_request(
+        self,
+        task_id: uuid.UUID,
+        platform: str,
+        base_payload: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        """
+        将 auto mode 的原始 publish_payload 转换为后端期望的 gateway request 格式。
+        复用 build_publish_gateway_request 的核心逻辑。
+        """
+        from videoroll.apps.orchestrator_api.services.publishing_service import (
+            build_publish_gateway_request,
+        )
+        from videoroll.apps.orchestrator_api.schemas import PublishActionRequest
+
+        task = self._db.get(Task, task_id)
+        if not task:
+            raise ValueError("task not found")
+
+        payload = base_payload or {}
+
+        # 解析 video_key：优先用传入的，否则找最新的 final video asset
+        video_key = payload.get("video_key")
+        if not video_key:
+            final_asset = (
+                self._db.query(Asset)
+                .filter(Asset.task_id == task_id, Asset.kind == AssetKind.video_final)
+                .order_by(Asset.created_at.desc())
+                .first()
+            )
+            if not final_asset:
+                raise ValueError("no final video asset found")
+            video_key = final_asset.storage_key
+
+        # 构造 PublishActionRequest 供 build_publish_gateway_request 使用
+        account_id = payload.get("account_id")
+        if platform != "bilibili":
+            account_id = self._resolve_social_account_id(platform, payload)
+
+        action_req = PublishActionRequest(
+            platform=platform,
+            account_id=account_id,
+            video_key=video_key,
+            cover_key=payload.get("cover_key"),
+            typeid_mode=payload.get("typeid_mode"),
+            meta=payload.get("meta"),
+            platform_options=payload.get("platform_options") or {},
+            skip_review=bool(payload.get("skip_review")),
+            force_retry=bool(payload.get("force_retry")),
+        )
+
+        return build_publish_gateway_request(
+            task=task,
+            task_id=task_id,
+            payload=action_req,
+            video_key=video_key,
+            db=self._db,
+            s3=self._s3,
+        )
 
     def _publish_single(
         self,
@@ -130,13 +265,10 @@ class PublishService:
         platform: str,
         base_payload: dict[str, Any] | None,
     ) -> dict[str, Any]:
-        """调用单个平台的 publish API。"""
+        """调用单个平台的 publish API。payload 应为 gateway request 格式。"""
         task = self._db.get(Task, task_id)
         if not task:
             raise ValueError("task not found")
-        if task.status == TaskStatus.published:
-            return {"status": "skipped", "detail": "already published"}
-
         url = publish_backend_url(self._settings, platform)
 
         payload: dict[str, Any] = dict(base_payload or {})

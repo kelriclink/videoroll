@@ -651,12 +651,33 @@ def publish_all(
     task = db.get(Task, task_id)
     if not task:
         raise HTTPException(status_code=404, detail="task not found")
+    if task.source_license.value == "unknown":
+        raise HTTPException(status_code=400, detail="source_license=unknown; add proof before publishing")
+
+    payload = dict(publish_payload or {})
+    meta = prepare_publish_meta(
+        task=task,
+        payload_meta=as_dict(payload.get("meta")) or None,
+        db=db,
+        s3=s3,
+        allow_auto_draft=False,
+    )
+    payload["meta"] = meta
+    if not bool(payload.get("skip_review")):
+        review_result = run_task_publish_review(task, meta=meta, db=db, s3=s3)
+        if not bool(review_result.get("ok")):
+            raise HTTPException(
+                status_code=409,
+                detail=str(review_result.get("reason") or "AI 审核未通过"),
+            )
 
     svc = PublishService(
         db, settings, s3,
         http_headers=lambda: internal_http_headers(settings),
     )
-    result = svc.publish(task_id, publish_payload=publish_payload)
+    result = svc.publish(task_id, publish_payload=payload)
+    if result.platform_count == 0:
+        raise HTTPException(status_code=409, detail="no publish platforms are enabled")
     return {
         "results": result.results,
         "all_ok": result.all_ok,
