@@ -616,16 +616,14 @@ def enqueue_publish_job(
         db.add(task)
         db.commit()
 
+    from videoroll.apps.publish_service import PublishService
+
+    svc = PublishService(
+        db, settings, s3,
+        http_headers=lambda: internal_http_headers(settings),
+    )
     try:
-        with httpx.Client(timeout=30.0, headers=internal_http_headers(settings)) as client:
-            response = client.post(publish_backend_url(settings, platform), json=request)
-            response.raise_for_status()
-            data = response.json()
-            if isinstance(data, dict):
-                data.setdefault("platform", platform)
-                data.setdefault("external_id", data.get("bvid") or data.get("aid"))
-                if data.get("bvid") and not data.get("external_url"):
-                    data["external_url"] = f"https://www.bilibili.com/video/{data['bvid']}"
+        data = svc.publish_one(task_id, platform=platform, payload=request)
     except httpx.HTTPStatusError as exc:
         try:
             body = exc.response.json()
@@ -654,7 +652,10 @@ def publish_all(
     if not task:
         raise HTTPException(status_code=404, detail="task not found")
 
-    svc = PublishService(db, settings, s3)
+    svc = PublishService(
+        db, settings, s3,
+        http_headers=lambda: internal_http_headers(settings),
+    )
     result = svc.publish(task_id, publish_payload=publish_payload)
     return {
         "results": result.results,

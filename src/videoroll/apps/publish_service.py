@@ -2,14 +2,14 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
 import httpx
 from sqlalchemy.orm import Session
 
 from videoroll.apps.publish_gateway import normalize_publish_platform, publish_backend_url
 from videoroll.apps.publish_platform_settings_store import get_publish_platform_settings
-from videoroll.db.models import PublishJob, PublishState, Task, TaskStatus
+from videoroll.db.models import Task, TaskStatus
 from videoroll.storage.s3 import S3Store
 
 
@@ -60,10 +60,18 @@ class PublishService:
     自动模式和手动模式都通过它来投稿，不再直接 httpx 调后端。
     """
 
-    def __init__(self, db: Session, settings: Any, s3: S3Store):
+    def __init__(
+        self,
+        db: Session,
+        settings: Any,
+        s3: S3Store,
+        *,
+        http_headers: dict[str, str] | Callable[[], dict[str, str]] | None = None,
+    ):
         self._db = db
         self._settings = settings
         self._s3 = s3
+        self._http_headers = http_headers
 
     # ── 公开 API ──────────────────────────────────────────────
 
@@ -91,6 +99,11 @@ class PublishService:
         return self._publish_single(task_id, platform, payload)
 
     # ── 内部实现 ──────────────────────────────────────────────
+
+    def _get_headers(self) -> dict[str, str]:
+        if callable(self._http_headers):
+            return self._http_headers()
+        return self._http_headers or {}
 
     def _get_enabled_platforms(self) -> list[str]:
         settings_map = get_publish_platform_settings(self._db)
@@ -129,10 +142,7 @@ class PublishService:
         payload: dict[str, Any] = dict(base_payload or {})
         payload.setdefault("platform", platform)
 
-        # 延迟导入避免循环依赖（orchestrator_api → publish_service）
-        from videoroll.apps.orchestrator_api.infrastructure.internal_http import internal_http_headers
-
-        headers = internal_http_headers(self._settings)
+        headers = self._get_headers()
 
         with httpx.Client(timeout=60.0, headers=headers) as client:
             resp = client.post(url, json=payload)
@@ -142,7 +152,6 @@ class PublishService:
         if isinstance(data, dict):
             data.setdefault("platform", platform)
             data.setdefault("status", "ok")
-            # 为 bilibili 生成 external_url
             if platform == "bilibili" and data.get("bvid") and not data.get("external_url"):
                 data["external_url"] = f"https://www.bilibili.com/video/{data['bvid']}"
         return data
