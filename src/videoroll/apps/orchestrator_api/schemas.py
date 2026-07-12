@@ -108,6 +108,16 @@ class PublishPlatformSettingsRead(BaseModel):
     platforms: dict[str, bool] = Field(default_factory=dict)
 
 
+class PublishAllResultResponse(BaseModel):
+    results: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    all_ok: bool = False
+    has_any_ok: bool = False
+    platform_count: int = 0
+    ok_count: int = 0
+    error_count: int = 0
+    errors: dict[str, str] = Field(default_factory=dict)
+
+
 class PublishPlatformSettingUpdate(BaseModel):
     enabled: bool
 

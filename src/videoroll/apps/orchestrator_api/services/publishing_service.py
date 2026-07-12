@@ -638,3 +638,30 @@ def enqueue_publish_job(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return RemotePublishResponse(**data)
+
+
+def publish_all(
+    task_id: uuid.UUID,
+    publish_payload: dict[str, Any] | None,
+    settings: OrchestratorSettings,
+    db: Session,
+    s3: S3Store,
+) -> dict[str, Any]:
+    """多平台投稿：读取已启用平台，逐个投稿。"""
+    from videoroll.apps.publish_service import PublishService
+
+    task = db.get(Task, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="task not found")
+
+    svc = PublishService(db, settings, s3)
+    result = svc.publish(task_id, publish_payload=publish_payload)
+    return {
+        "results": result.results,
+        "all_ok": result.all_ok,
+        "has_any_ok": result.has_any_ok,
+        "platform_count": result.platform_count,
+        "ok_count": result.ok_count,
+        "error_count": result.error_count,
+        "errors": result.errors,
+    }

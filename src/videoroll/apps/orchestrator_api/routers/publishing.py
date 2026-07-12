@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 from videoroll.apps.orchestrator_api.dependencies import get_db, get_s3, get_settings
 from videoroll.apps.orchestrator_api.schemas import (
     PublishActionRequest,
+    PublishAllResultResponse,
     PublishJobSummary,
     PublishMetaDraftRequest,
     PublishMetaDraftResponse,
@@ -147,6 +148,16 @@ def delete_social_publish_account(
 ) -> Any:
     return publishing_service.delete_social_publish_account(account_id, settings)
 
+
+@router.post("/tasks/{task_id}/actions/publish_all", response_model=PublishAllResultResponse)
+def publish_all_platforms(
+    task_id: uuid.UUID,
+    payload: dict[str, Any] | None = None,
+    settings: OrchestratorSettings = Depends(get_settings),
+    db: Session = Depends(get_db),
+    s3: S3Store = Depends(get_s3),
+) -> PublishAllResultResponse:
+    return PublishAllResultResponse(**publishing_service.publish_all(task_id, payload, settings, db, s3))
 
 @router.post("/tasks/{task_id}/actions/publish", response_model=RemotePublishResponse)
 def enqueue_publish_job(
