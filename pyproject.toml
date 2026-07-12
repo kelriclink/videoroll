@@ -9,6 +9,7 @@ description = "Modular video processing pipeline (compliance-first)"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+  "alembic>=1.13,<2",
   "fastapi>=0.115.0",
   "uvicorn[standard]>=0.30.0",
   "pydantic>=2.7.0",
@@ -37,3 +38,6 @@ asr = [
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/videoroll"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]

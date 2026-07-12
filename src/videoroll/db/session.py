@@ -9,6 +9,12 @@ from sqlalchemy.engine import Engine, make_url
 from sqlalchemy.orm import Session, sessionmaker
 
 
+def get_configured_database_url() -> str:
+    from videoroll.config import get_orchestrator_settings
+
+    return get_orchestrator_settings().database_url
+
+
 def _engine_connect_args(database_url: str) -> dict[str, object]:
     try:
         url = make_url(database_url)

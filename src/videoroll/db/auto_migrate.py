@@ -629,10 +629,9 @@ def _ensure_pgvector_rag_tables(engine: Engine) -> None:
 
 def auto_migrate_engine(engine: Engine) -> None:
     """
-    Small, targeted "auto migration" for deployments without Alembic.
+    Legacy additive compatibility checks for deployments without Alembic.
 
-    Today it ensures columns required by the task-level queue and youtube
-    source subscriptions exist.
+    Versioned, security-critical schema changes belong in Alembic revisions.
     """
     with _auto_migrate_lock(engine):
         _ensure_postgres_enum_values(engine)

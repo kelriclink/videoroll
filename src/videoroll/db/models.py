@@ -13,15 +13,21 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    JSON,
     String,
     Text,
     UniqueConstraint,
+    Uuid,
     func,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from videoroll.db.base import Base
+
+
+JSON_PAYLOAD = JSON().with_variant(JSONB(), "postgresql")
 
 
 class SourceType(str, enum.Enum):
@@ -231,6 +237,10 @@ class PublishJob(Base):
 
     started_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    lease_owner: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    lease_until: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    heartbeat_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    operation_key: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
@@ -244,6 +254,8 @@ class PublishJob(Base):
         Index("ix_publish_jobs_task_state", "task_id", "state"),
         Index("ix_publish_jobs_platform_state", "platform", "state"),
         Index("ix_publish_jobs_batch_platform_account", "batch_id", "platform", "account_id"),
+        Index("ix_publish_jobs_state_lease_until", "state", "lease_until", "created_at"),
+        Index("ix_publish_jobs_operation_key", "operation_key"),
     )
 
 
@@ -299,6 +311,10 @@ class RenderJob(Base):
     error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     started_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    lease_owner: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    lease_until: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    heartbeat_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    operation_key: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
@@ -307,6 +323,8 @@ class RenderJob(Base):
         Index("ix_render_jobs_status_created_at", "status", "created_at"),
         Index("ix_render_jobs_task_status", "task_id", "status"),
         Index("ix_render_jobs_subtitle_job", "subtitle_job_id"),
+        Index("ix_render_jobs_status_lease_until", "status", "lease_until", "created_at"),
+        Index("ix_render_jobs_operation_key", "operation_key"),
     )
 
 
@@ -322,6 +340,10 @@ class SubtitleJob(Base):
 
     error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     logs_key: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    lease_owner: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    lease_until: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    heartbeat_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    operation_key: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
@@ -329,6 +351,8 @@ class SubtitleJob(Base):
     __table_args__ = (
         Index("ix_subtitle_jobs_task_status", "task_id", "status"),
         Index("ix_subtitle_jobs_status_created_at", "status", "created_at"),
+        Index("ix_subtitle_jobs_status_lease_until", "status", "lease_until", "created_at"),
+        Index("ix_subtitle_jobs_operation_key", "operation_key"),
     )
 
 
@@ -375,7 +399,123 @@ class AppSetting(Base):
 
     key: Mapped[str] = mapped_column(String(128), primary_key=True)
     value_json: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default=text("1"))
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+
+
+class OutboxEvent(Base):
+    __tablename__ = "outbox_events"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    event_type: Mapped[str] = mapped_column(String(128), nullable=False)
+    aggregate_type: Mapped[str] = mapped_column(String(128), nullable=False)
+    aggregate_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    task_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    args_json: Mapped[dict[str, Any]] = mapped_column(JSON_PAYLOAD, nullable=False, default=dict)
+    operation_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending", server_default="pending")
+    available_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    lease_owner: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    lease_until: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    heartbeat_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_error: Mapped[Optional[str]] = mapped_column(String(1024), nullable=True)
+    delivered_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+
+    __table_args__ = (
+        Index("ix_outbox_events_pending_lease", "status", "available_at", "lease_until"),
+        Index("ix_outbox_events_operation_key", "operation_key"),
+    )
+
+
+class OperationInbox(Base):
+    __tablename__ = "operation_inbox"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    operation_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending", server_default="pending")
+    request_json: Mapped[dict[str, Any]] = mapped_column(JSON_PAYLOAD, nullable=False, default=dict)
+    result_json: Mapped[Optional[dict[str, Any]]] = mapped_column(JSON_PAYLOAD, nullable=True)
+    lease_owner: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    lease_until: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    heartbeat_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_error: Mapped[Optional[str]] = mapped_column(String(1024), nullable=True)
+    completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("operation_key", name="uq_operation_inbox_operation_key"),
+        Index("ix_operation_inbox_pending_lease", "status", "lease_until", "created_at"),
+    )
+
+
+class RemoteAPIRequest(Base):
+    __tablename__ = "remote_api_requests"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    token_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    idempotency_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    request_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    request_json: Mapped[dict[str, Any]] = mapped_column(JSON_PAYLOAD, nullable=False, default=dict)
+    response_json: Mapped[Optional[dict[str, Any]]] = mapped_column(JSON_PAYLOAD, nullable=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending", server_default="pending")
+    lease_owner: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    lease_until: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    heartbeat_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_error: Mapped[Optional[str]] = mapped_column(String(1024), nullable=True)
+    completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("token_hash", "idempotency_key", name="uq_remote_api_requests_token_idempotency"),
+        Index("ix_remote_api_requests_pending_lease", "status", "lease_until", "created_at"),
+    )
+
+
+class DesktopAccessGrant(Base):
+    __tablename__ = "desktop_access_grants"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    token_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    subject: Mapped[str] = mapped_column(String(128), nullable=False)
+    scope_json: Mapped[dict[str, Any]] = mapped_column(JSON_PAYLOAD, nullable=False, default=dict)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="active", server_default="active")
+    last_error: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    consumed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    revoked_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("token_hash", name="uq_desktop_access_grants_token_hash"),
+        Index("ix_desktop_access_grants_active_expiry", "status", "expires_at"),
+    )
+
+
+class SecurityAuditEvent(Base):
+    __tablename__ = "security_audit_events"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    event_type: Mapped[str] = mapped_column(String(128), nullable=False)
+    actor_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    actor_id: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    outcome: Mapped[str] = mapped_column(String(32), nullable=False)
+    request_id: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    source_ip: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    payload_json: Mapped[dict[str, Any]] = mapped_column(JSON_PAYLOAD, nullable=False, default=dict)
+    error_code: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    error_message: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        Index("ix_security_audit_events_type_created", "event_type", "created_at"),
+        Index("ix_security_audit_events_actor_created", "actor_type", "actor_id", "created_at"),
+    )
 
 
 class IngestedVideo(Base):
