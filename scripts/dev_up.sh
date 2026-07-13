@@ -10,20 +10,45 @@ if [[ ! -f social-auto-upload/sau_cli.py ]]; then
 fi
 
 ENV_FILE="${ENV_FILE:-.env}"
+
+random_secret() {
+  if command -v openssl >/dev/null 2>&1; then
+    openssl rand -hex 32
+  else
+    od -An -N32 -tx1 /dev/urandom | tr -d ' \n'
+  fi
+}
+
+set_env_value() {
+  local key="$1"
+  local value="$2"
+  if grep -q "^${key}=" "$ENV_FILE"; then
+    sed -i "s|^${key}=.*$|${key}=${value}|" "$ENV_FILE"
+  else
+    printf '%s=%s\n' "$key" "$value" >>"$ENV_FILE"
+  fi
+}
+
 if [[ ! -f "$ENV_FILE" ]]; then
+  umask 077
   cp .env.example "$ENV_FILE"
-  echo "Created $ENV_FILE from .env.example"
+  set_env_value DEVELOPMENT_MODE true
+  set_env_value S3_ACCESS_KEY_ID "dev-$(random_secret)"
+  set_env_value S3_SECRET_ACCESS_KEY "$(random_secret)"
+  set_env_value INTERNAL_API_SECRET "$(random_secret)"
+  set_env_value ADMIN_BOOTSTRAP_SECRET "$(random_secret)"
+  set_env_value APP_UID "$(id -u)"
+  set_env_value APP_GID "$(id -g)"
+  chmod 600 "$ENV_FILE"
+  echo "Created $ENV_FILE with unique local development secrets"
 fi
+
+install -d -m 0700 data/secrets data/social-publisher data/work data/models data/minio data/redis
 
 docker compose -f docker-compose.yml --env-file "$ENV_FILE" up --build -d
 
 echo ""
-echo "Web UI:              http://localhost:3000"
-echo "API (monolith):      http://localhost:3000/api/docs"
-echo "Subtitle Service:    http://localhost:3000/api/subtitle-service/docs"
-echo "YouTube Ingest:      http://localhost:3000/api/youtube-ingest/docs"
-echo "Bilibili Publisher:  http://localhost:3000/api/bilibili-publisher/docs"
-echo "Social Publisher:     internal Docker service (managed from 投稿设置)"
-echo "MinIO Console:       http://localhost:9001 (user/pass from .env)"
+echo "Web UI: http://localhost:${WEB_PORT:-3000}"
+echo "API:    http://localhost:${WEB_PORT:-3000}/api/docs"
 echo ""
 docker compose -f docker-compose.yml --env-file "$ENV_FILE" ps

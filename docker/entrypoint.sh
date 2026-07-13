@@ -1,65 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-UVICORN_APP="${UVICORN_APP:-videoroll.apps.monolith.main:app}"
-UVICORN_HOST="${UVICORN_HOST:-0.0.0.0}"
-UVICORN_PORT="${UVICORN_PORT:-8000}"
-UVICORN_ROOT_PATH="${UVICORN_ROOT_PATH:-}"
+role="${DEPLOYMENT_ROLE:-application}"
+python -m videoroll.deployment --role "$role"
 
-CELERY_SUB_APP="${CELERY_SUB_APP:-${CELERY_APP:-videoroll.apps.subtitle_service.worker:celery_app}}"
-CELERY_SUB_QUEUE="${CELERY_SUB_QUEUE:-${CELERY_QUEUE:-subtitle}}"
-CELERY_PUB_APP="${CELERY_PUB_APP:-videoroll.apps.bilibili_publisher.worker:celery_app}"
-CELERY_PUB_QUEUE="${CELERY_PUB_QUEUE:-publish}"
-CELERY_PUB_CONCURRENCY="${CELERY_PUB_CONCURRENCY:-1}"
-CELERY_SUB_CONCURRENCY_FALLBACK="${CELERY_SUB_CONCURRENCY_FALLBACK:-1}"
-CELERY_BEAT_ENABLED="${CELERY_BEAT_ENABLED:-true}"
-
-if ! CELERY_SUB_CONCURRENCY="$(CELERY_SUB_CONCURRENCY_FALLBACK="$CELERY_SUB_CONCURRENCY_FALLBACK" python -m videoroll.apps.subtitle_service.worker_concurrency)"; then
-  CELERY_SUB_CONCURRENCY="$CELERY_SUB_CONCURRENCY_FALLBACK"
-fi
-if ! [[ "$CELERY_SUB_CONCURRENCY" =~ ^[0-9]+$ ]] || [[ "$CELERY_SUB_CONCURRENCY" -lt 1 ]]; then
-  CELERY_SUB_CONCURRENCY="$CELERY_SUB_CONCURRENCY_FALLBACK"
+if [[ "${1:-}" == "outbox-dispatcher" ]]; then
+  # Celery Beat owns periodic queue ticks and the durable-outbox wake-up.  It
+  # is intentionally a distinct PID 1 from every worker and HTTP server.
+  touch /tmp/outbox-dispatcher-ready
+  exec celery -A videoroll.apps.subtitle_service.worker:celery_app beat \
+    -l INFO --schedule /tmp/celerybeat-schedule
 fi
 
-echo "Starting celery worker (subtitle): $CELERY_SUB_APP queue=$CELERY_SUB_QUEUE concurrency=$CELERY_SUB_CONCURRENCY"
-celery -A "$CELERY_SUB_APP" worker -Q "$CELERY_SUB_QUEUE" -l INFO --concurrency "$CELERY_SUB_CONCURRENCY" &
-CELERY_SUB_PID=$!
-
-CELERY_BEAT_PID=""
-if [[ "$CELERY_BEAT_ENABLED" == "true" || "$CELERY_BEAT_ENABLED" == "1" || "$CELERY_BEAT_ENABLED" == "yes" ]]; then
-  echo "Starting celery beat (subtitle): $CELERY_SUB_APP"
-  celery -A "$CELERY_SUB_APP" beat -l INFO &
-  CELERY_BEAT_PID=$!
-fi
-
-echo "Starting celery worker (publish): $CELERY_PUB_APP queue=$CELERY_PUB_QUEUE concurrency=$CELERY_PUB_CONCURRENCY"
-celery -A "$CELERY_PUB_APP" worker -Q "$CELERY_PUB_QUEUE" -l INFO --concurrency "$CELERY_PUB_CONCURRENCY" &
-CELERY_PUB_PID=$!
-
-echo "Starting uvicorn: $UVICORN_APP on $UVICORN_HOST:$UVICORN_PORT (root_path=${UVICORN_ROOT_PATH:-/})"
-uvicorn_cmd=(uvicorn "$UVICORN_APP" --host "$UVICORN_HOST" --port "$UVICORN_PORT")
-if [[ -n "$UVICORN_ROOT_PATH" ]]; then
-  uvicorn_cmd+=(--root-path "$UVICORN_ROOT_PATH")
-fi
-"${uvicorn_cmd[@]}" &
-UVICORN_PID=$!
-
-term_handler() {
-  echo "Stopping..."
-  if [[ -n "$CELERY_BEAT_PID" ]]; then
-    kill -TERM "$UVICORN_PID" "$CELERY_SUB_PID" "$CELERY_BEAT_PID" "$CELERY_PUB_PID" 2>/dev/null || true
-    wait "$UVICORN_PID" "$CELERY_SUB_PID" "$CELERY_BEAT_PID" "$CELERY_PUB_PID" 2>/dev/null || true
-  else
-    kill -TERM "$UVICORN_PID" "$CELERY_SUB_PID" "$CELERY_PUB_PID" 2>/dev/null || true
-    wait "$UVICORN_PID" "$CELERY_SUB_PID" "$CELERY_PUB_PID" 2>/dev/null || true
-  fi
-}
-
-trap term_handler SIGINT SIGTERM
-
-if [[ -n "$CELERY_BEAT_PID" ]]; then
-  wait -n "$UVICORN_PID" "$CELERY_SUB_PID" "$CELERY_BEAT_PID" "$CELERY_PUB_PID"
-else
-  wait -n "$UVICORN_PID" "$CELERY_SUB_PID" "$CELERY_PUB_PID"
-fi
-term_handler
+exec "$@"

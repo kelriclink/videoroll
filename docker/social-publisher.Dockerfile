@@ -3,6 +3,7 @@ FROM python:3.12-slim
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
+    HOME=/tmp \
     SAU_RUNTIME_DIR=/opt/social-auto-upload \
     SAU_COOKIES_DIR=/opt/social-auto-upload/cookies \
     DISPLAY=:99 \
@@ -38,7 +39,8 @@ RUN chmod +x /app/docker/social-publisher-entrypoint.sh \
     && python /app/docker/verify-social-browser.py
 
 RUN useradd --create-home --uid 10001 videoroll \
-    && chown -R videoroll:videoroll /ms-playwright /work/social-publisher /opt/social-auto-upload
+    && chown -R videoroll:videoroll /ms-playwright /work/social-publisher /opt/social-auto-upload \
+    && install -d --owner=videoroll --group=videoroll --mode=0700 /secrets /tmp/videoroll-vnc
 
 USER videoroll
 

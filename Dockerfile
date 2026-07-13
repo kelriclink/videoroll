@@ -55,10 +55,17 @@ RUN if [ -n "$YTDLP_VERSION" ]; then \
         pip install --no-cache-dir -U "yt-dlp[default]"; \
       else \
         pip install --no-cache-dir -U "yt-dlp[default]==${YTDLP_VERSION}"; \
-      fi; \
-    fi
+    fi; \
+  fi
+
+RUN groupadd --gid 10001 videoroll \
+  && useradd --uid 10001 --gid videoroll --create-home --shell /usr/sbin/nologin videoroll \
+  && install -d --owner=videoroll --group=videoroll --mode=0700 /models /secrets /work
 
 RUN sed -i 's/\r$//' /app/docker/entrypoint.sh \
   && chmod +x /app/docker/entrypoint.sh
 
-CMD ["/app/docker/entrypoint.sh"]
+USER videoroll
+
+ENTRYPOINT ["/app/docker/entrypoint.sh"]
+CMD ["uvicorn", "videoroll.apps.orchestrator_api.main:app", "--host", "0.0.0.0", "--port", "8000"]

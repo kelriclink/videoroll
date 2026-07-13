@@ -1,6 +1,8 @@
 #!/bin/sh
 set -eu
 
+python -m videoroll.deployment
+
 display="${SOCIAL_LOGIN_DISPLAY:-:99}"
 screen="${SOCIAL_LOGIN_SCREEN:-1440x900x24}"
 display_number="${display#:}"

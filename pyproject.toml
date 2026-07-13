@@ -36,6 +36,9 @@ asr = [
   "faster-whisper>=1.0.0",
   "openvino-genai>=2025.4.0.0",
 ]
+dev = [
+  "PyYAML>=6,<7",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/videoroll"]

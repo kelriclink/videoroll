@@ -1,5 +1,10 @@
 services:
-  app:
+  subtitle-service:
+    devices:
+      - "/dev/dri:/dev/dri"
+    environment:
+      INTEL_GPU_RENDER_DEVICE: ${INTEL_GPU_RENDER_DEVICE:-/dev/dri/renderD128}
+  subtitle-worker:
     devices:
       - "/dev/dri:/dev/dri"
     environment:
