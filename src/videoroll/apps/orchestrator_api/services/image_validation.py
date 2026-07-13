@@ -12,7 +12,9 @@ from PIL import Image, UnidentifiedImageError
 ALLOWED_IMAGE_FORMATS = frozenset({"JPEG", "PNG", "WEBP"})
 MAX_COVER_INPUT_BYTES = 50 * 1024 * 1024
 MAX_IMAGE_DIMENSION = 8192
-MAX_IMAGE_PIXELS = 40_000_000
+# A 16MP RGB/RGBA canvas occupies roughly 46/61 MiB.  Keeping this below the
+# input limit leaves headroom for decoder state and the canonical encoder.
+MAX_IMAGE_PIXELS = 16_000_000
 
 _FORMAT_PROPERTIES = {
     "JPEG": ("image/jpeg", ".jpg"),
@@ -53,10 +55,12 @@ def _canonical_mode(image: Image.Image, image_format: str) -> str:
 
 def validate_and_reencode_cover(file_obj: Any) -> ValidatedImage:
     payload = _read_bounded(file_obj)
+    source = io.BytesIO(payload)
+    del payload
     try:
         with warnings.catch_warnings():
             warnings.simplefilter("error", Image.DecompressionBombWarning)
-            with Image.open(io.BytesIO(payload)) as decoded:
+            with Image.open(source) as decoded:
                 image_format = str(decoded.format or "").upper()
                 if image_format not in ALLOWED_IMAGE_FORMATS:
                     raise HTTPException(
@@ -77,21 +81,24 @@ def validate_and_reencode_cover(file_obj: Any) -> ValidatedImage:
                     )
                 decoded.seek(0)
                 decoded.load()
+                source.close()
                 mode = _canonical_mode(decoded, image_format)
-                pixels = decoded.convert(mode)
-                canonical = Image.new(mode, decoded.size)
-                canonical.paste(pixels)
-
-        output = io.BytesIO()
-        if image_format == "JPEG":
-            canonical.save(output, format="JPEG", quality=90, optimize=True)
-        elif image_format == "PNG":
-            canonical.save(output, format="PNG", optimize=True)
-        else:
-            canonical.save(output, format="WEBP", lossless=True, method=6)
+                canonical = decoded if decoded.mode == mode else decoded.convert(mode)
+                try:
+                    output = io.BytesIO()
+                    if image_format == "JPEG":
+                        canonical.save(output, format="JPEG", quality=90, optimize=True)
+                    elif image_format == "PNG":
+                        canonical.save(output, format="PNG", optimize=True)
+                    else:
+                        canonical.save(output, format="WEBP", lossless=True, method=6)
+                    data = output.getvalue()
+                finally:
+                    if canonical is not decoded:
+                        canonical.close()
         content_type, extension = _FORMAT_PROPERTIES[image_format]
         return ValidatedImage(
-            data=output.getvalue(),
+            data=data,
             content_type=content_type,
             extension=extension,
             width=width,
@@ -103,3 +110,5 @@ def validate_and_reencode_cover(file_obj: Any) -> ValidatedImage:
         raise HTTPException(status_code=413, detail="cover image dimensions are too large") from exc
     except (UnidentifiedImageError, OSError, SyntaxError, ValueError) as exc:
         raise HTTPException(status_code=400, detail="invalid cover image") from exc
+    finally:
+        source.close()

@@ -33,6 +33,11 @@ def _image_bytes(
         pnginfo = PngImagePlugin.PngInfo()
         pnginfo.add_text("private", "secret metadata")
         save_options["pnginfo"] = pnginfo
+    if metadata and image_format == "WEBP":
+        exif = Image.Exif()
+        exif[0x010E] = "private description"
+        save_options["exif"] = exif.tobytes()
+        save_options["xmp"] = b"<x:xmpmeta>private metadata</x:xmpmeta>"
     image.save(output, format=image_format, **save_options)
     return output.getvalue()
 
@@ -88,6 +93,23 @@ def test_cover_reencoding_strips_metadata(image_format: str) -> None:
         assert "private" not in decoded.info
 
 
+def test_webp_cover_reencoding_strips_exif_and_xmp_metadata() -> None:
+    from videoroll.apps.orchestrator_api.services.image_validation import (
+        validate_and_reencode_cover,
+    )
+
+    result = validate_and_reencode_cover(
+        io.BytesIO(_image_bytes("WEBP", metadata=True))
+    )
+
+    with Image.open(io.BytesIO(result.data)) as decoded:
+        assert decoded.format == "WEBP"
+        assert decoded.getexif() == {}
+        assert "exif" not in decoded.info
+        assert "xmp" not in decoded.info
+        assert "icc_profile" not in decoded.info
+
+
 def test_cover_rejects_dimensions_above_limit() -> None:
     from videoroll.apps.orchestrator_api.services.image_validation import (
         validate_and_reencode_cover,
@@ -97,6 +119,23 @@ def test_cover_rejects_dimensions_above_limit() -> None:
 
     with pytest.raises(HTTPException) as exc:
         validate_and_reencode_cover(io.BytesIO(payload))
+
+    assert exc.value.status_code == 413
+
+
+def test_cover_rejects_image_just_above_the_safe_16_megapixel_budget() -> None:
+    from videoroll.apps.orchestrator_api.services.image_validation import (
+        validate_and_reencode_cover,
+    )
+
+    width = 4096
+    height = (16_000_000 // width) + 1
+    assert width * height > 16_000_000
+
+    with pytest.raises(HTTPException) as exc:
+        validate_and_reencode_cover(
+            io.BytesIO(_image_bytes("PNG", size=(width, height)))
+        )
 
     assert exc.value.status_code == 413
 
@@ -112,6 +151,29 @@ def test_cover_rejects_decompression_bomb_pixel_budget(monkeypatch) -> None:
         )
 
     assert exc.value.status_code == 413
+
+
+@pytest.mark.parametrize("image_format", ["BMP", "GIF", "TIFF"])
+def test_cover_rejects_raster_formats_outside_the_allow_list(image_format: str) -> None:
+    from videoroll.apps.orchestrator_api.services.image_validation import (
+        validate_and_reencode_cover,
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        validate_and_reencode_cover(io.BytesIO(_image_bytes(image_format)))
+
+    assert exc.value.status_code == 400
+
+
+def test_cover_rejects_corrupt_image_payload() -> None:
+    from videoroll.apps.orchestrator_api.services.image_validation import (
+        validate_and_reencode_cover,
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        validate_and_reencode_cover(io.BytesIO(b"\x89PNG\r\n\x1a\nnot-a-real-image"))
+
+    assert exc.value.status_code == 400
 
 
 def test_cover_upload_uses_decoded_format_not_filename_or_claimed_type(monkeypatch) -> None:

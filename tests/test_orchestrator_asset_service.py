@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, Mock, patch
 import pytest
 
 from videoroll.apps.orchestrator_api.services import asset_service
+from videoroll.apps.orchestrator_api.routers.assets import _stream_response
 from videoroll.db.models import AppSetting, Asset, AssetKind
 
 
@@ -64,6 +65,62 @@ def test_video_asset_with_active_content_type_is_not_inline() -> None:
 
     assert headers["X-Content-Type-Options"] == "nosniff"
     assert headers["Content-Disposition"].startswith("attachment")
+
+
+def _unsafe_cover_asset_stream_dependencies() -> tuple[Mock, Mock, uuid.UUID, uuid.UUID]:
+    task_id = uuid.uuid4()
+    asset_id = uuid.uuid4()
+    asset = Mock(
+        id=asset_id,
+        task_id=task_id,
+        kind=AssetKind.cover_image,
+        storage_key="final/cover.svg",
+        size_bytes=24,
+    )
+    db = Mock()
+    db.get.side_effect = lambda model, key: asset if model is Asset and key == asset_id else None
+    s3 = Mock()
+    s3.head_object.return_value = {
+        "ContentLength": 24,
+        "ContentType": "image/svg+xml",
+    }
+    s3.get_object.return_value = {
+        "Body": io.BytesIO(b"<svg/onload=alert(1)>"),
+        "ContentLength": 24,
+        "ContentType": "image/svg+xml",
+    }
+    return db, s3, task_id, asset_id
+
+
+@pytest.mark.parametrize("request_kind", ["download", "range", "invalid_range"])
+def test_actual_asset_responses_always_harden_unsafe_cover_headers(
+    request_kind: str,
+) -> None:
+    db, s3, task_id, asset_id = _unsafe_cover_asset_stream_dependencies()
+
+    if request_kind == "download":
+        result = asset_service.prepare_asset_download(
+            db,
+            s3,
+            task_id=task_id,
+            asset_id=asset_id,
+        )
+        expected_status = 200
+    else:
+        result = asset_service.prepare_asset_stream(
+            db,
+            s3,
+            task_id=task_id,
+            asset_id=asset_id,
+            range_header="bytes=0-3" if request_kind == "range" else "bytes=24-",
+        )
+        expected_status = 206 if request_kind == "range" else 416
+
+    response = _stream_response(result)
+
+    assert response.status_code == expected_status
+    assert response.headers["x-content-type-options"] == "nosniff"
+    assert response.headers["content-disposition"].startswith("attachment")
 
 
 def test_delete_final_asset_defers_object_delete_until_a_later_retry() -> None:

@@ -539,7 +539,7 @@ async def upload_task_cover(
             await file.close()
         except Exception:
             pass
-    canonical_file = tempfile.SpooledTemporaryFile(max_size=UPLOAD_COVER_MAX_BYTES)
+    canonical_file = tempfile.TemporaryFile()
     canonical_file.write(validated.data)
     canonical_file.seek(0)
     canonical_upload = UploadFile(
