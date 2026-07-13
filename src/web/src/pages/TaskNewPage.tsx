@@ -1,7 +1,7 @@
 import { useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { fetchJson } from "../lib/http";
-import { ORCHESTRATOR_URL } from "../lib/urls";
+import { orchestratorUrl } from "../lib/urls";
 import { SourceLicense, SourceType, Task } from "../lib/types";
 
 export default function TaskNewPage() {
@@ -21,7 +21,7 @@ export default function TaskNewPage() {
   }, [busy, mode, file, youtubeUrl]);
 
   async function createLocalTaskAndUpload() {
-    const task = await fetchJson<Task>(`${ORCHESTRATOR_URL}/tasks`, {
+    const task = await fetchJson<Task>(orchestratorUrl("/tasks"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -38,7 +38,7 @@ export default function TaskNewPage() {
     if (!file) throw new Error("no file selected");
     fd.append("file", file, file.name);
 
-    await fetchJson(`${ORCHESTRATOR_URL}/tasks/${task.id}/upload/video`, {
+    await fetchJson(orchestratorUrl(`/tasks/${task.id}/upload/video`), {
       method: "POST",
       body: fd,
     });
@@ -47,7 +47,7 @@ export default function TaskNewPage() {
   }
 
   async function createYouTubeTask() {
-    const resp = await fetchJson<{ task_id: string }>(`${ORCHESTRATOR_URL}/youtube/ingest`, {
+    const resp = await fetchJson<{ task_id: string }>(orchestratorUrl("/youtube/ingest"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -60,7 +60,7 @@ export default function TaskNewPage() {
   }
 
   async function createYouTubeTaskAndAutoRun() {
-    const resp = await fetchJson<{ task_id: string; pipeline_job_id: string }>(`${ORCHESTRATOR_URL}/auto/youtube`, {
+    const resp = await fetchJson<{ task_id: string; pipeline_job_id: string }>(orchestratorUrl("/auto/youtube"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({

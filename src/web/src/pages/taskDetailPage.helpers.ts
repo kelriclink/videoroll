@@ -17,7 +17,7 @@ export function buildPublishActionPayload(args: {
   typeidMode: string;
   skipReview: boolean;
   forceRetry?: boolean;
-}) {
+}): PublishActionPayload {
   if (args.platform === "bilibili") {
     return {
       platform: args.platform,
@@ -28,6 +28,7 @@ export function buildPublishActionPayload(args: {
       meta: args.meta,
       platform_options: { bilibili: { typeid_mode: args.typeidMode } },
       skip_review: args.skipReview,
+      force_retry: Boolean(args.forceRetry),
     };
   }
   return {
@@ -67,3 +68,4 @@ export function createTaskDetailPollPlan(args: {
     nextDelayMs: TASK_DETAIL_POLL_INTERVAL_MS,
   };
 }
+import { PublishActionPayload } from "../lib/types";

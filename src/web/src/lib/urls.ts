@@ -13,6 +13,13 @@ function defaultOrchestratorUrl(): string {
 
 export const ORCHESTRATOR_URL = env("VITE_ORCHESTRATOR_URL") ?? defaultOrchestratorUrl();
 
+/** Build an orchestrator URL without hand-rolled slash handling in pages. */
+export function orchestratorUrl(path: string): string {
+  const base = ORCHESTRATOR_URL.replace(/\/+$/, "");
+  const suffix = path.startsWith("/") ? path : `/${path}`;
+  return `${base}${suffix}`;
+}
+
 undefined
 undefined
 undefined

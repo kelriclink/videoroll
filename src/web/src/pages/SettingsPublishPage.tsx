@@ -1,7 +1,16 @@
 import { useEffect, useState } from "react";
 import { useConfirm } from "../components/feedbackContext";
-import { fetchJson } from "../lib/http";
+import { fetchJson, HttpError } from "../lib/http";
+import {
+  applyServerValue,
+  createDirtyFieldState,
+  editDirtyField,
+  markDirtyFieldConflict,
+  markDirtyFieldSaved,
+  reloadDirtyField,
+} from "../lib/requestState";
 import { ORCHESTRATOR_URL } from "../lib/urls";
+import { VersionedPublishSettings } from "../lib/types";
 import {
   activeAccountsForPlatform,
   loginSessionLabel,
@@ -13,9 +22,7 @@ import {
   storageStateGuidance,
 } from "./settingsPublishPage.helpers";
 
-type PublishSettings = {
-  default_meta: any;
-};
+type PublishSettings = VersionedPublishSettings;
 
 type AuthSettings = {
   cookie_set: boolean;
@@ -64,7 +71,7 @@ export default function SettingsPublishPage() {
   const confirm = useConfirm();
   const [settings, setSettings] = useState<PublishSettings | null>(null);
   const [auth, setAuth] = useState<AuthSettings | null>(null);
-  const [metaText, setMetaText] = useState<string>("{}");
+  const [metaEditor, setMetaEditor] = useState(() => createDirtyFieldState("{}"));
   const [cookieText, setCookieText] = useState<string>("");
   const [me, setMe] = useState<BilibiliMe | null>(null);
   const [socialAccounts, setSocialAccounts] = useState<SocialAccount[]>([]);
@@ -79,6 +86,7 @@ export default function SettingsPublishPage() {
   const [loginSessions, setLoginSessions] = useState<Partial<Record<SocialPlatform, SocialLoginSession>>>({});
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const metaText = metaEditor.value;
 
   async function refresh() {
     setError(null);
@@ -94,7 +102,7 @@ export default function SettingsPublishPage() {
       setMe(null);
       setSocialAccounts(accounts);
       setPlatformSettings(platforms.platforms);
-      setMetaText(JSON.stringify(s.default_meta ?? {}, null, 2));
+      setMetaEditor((current) => applyServerValue(current, JSON.stringify(s.default_meta ?? {}, null, 2), s.version ?? null));
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : String(e));
     }
@@ -165,6 +173,41 @@ export default function SettingsPublishPage() {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
       setSavingPlatform(null);
+    }
+  }
+
+  function recordPublishSettingsConflict(error: unknown) {
+    if (!(error instanceof HttpError) || error.status !== 409) return false;
+    const body = error.body && typeof error.body === "object" ? error.body as Record<string, unknown> : {};
+    const current = body.current && typeof body.current === "object" ? body.current as Record<string, unknown> : body;
+    const remoteMeta = current.default_meta && typeof current.default_meta === "object" ? current.default_meta : null;
+    const remoteVersion = typeof current.version === "string" || typeof current.version === "number" ? current.version : null;
+    setMetaEditor((state) => markDirtyFieldConflict(
+      state,
+      JSON.stringify(remoteMeta ?? state.serverValue, null, 2),
+      remoteVersion ?? state.serverVersion,
+    ));
+    setError("默认投稿模板已被其他会话修改。请重新加载，或确认后覆盖服务器版本。");
+    return true;
+  }
+
+  async function saveDefaultMeta(options?: { overwrite?: boolean; reset?: boolean }) {
+    const meta = options?.reset ? {} : JSON.parse(metaText);
+    const version = options?.overwrite ? null : metaEditor.serverVersion;
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (options?.overwrite) headers["If-Match"] = "*";
+    else if (version !== null) headers["If-Match"] = String(version);
+    try {
+      const response = await fetchJson<PublishSettings>(`${ORCHESTRATOR_URL}/bilibili/publish/settings`, {
+        method: "PUT",
+        headers,
+        body: JSON.stringify({ default_meta: meta, version, force: Boolean(options?.overwrite) }),
+      });
+      const savedText = JSON.stringify(response.default_meta ?? meta, null, 2);
+      setMetaEditor((state) => markDirtyFieldSaved(state, savedText, response.version ?? version));
+      await refresh();
+    } catch (e: unknown) {
+      if (!recordPublishSettingsConflict(e)) throw e;
     }
   }
 
@@ -551,8 +594,34 @@ export default function SettingsPublishPage() {
               <textarea
                 className="h-96 w-full rounded border p-3 font-mono text-xs"
                 value={metaText}
-                onChange={(e) => setMetaText(e.target.value)}
+                onChange={(e) => setMetaEditor((state) => editDirtyField(state, e.target.value))}
               />
+              {metaEditor.dirty ? <div className="mt-2 text-xs text-amber-700">本地修改尚未保存；后台状态刷新不会覆盖此内容。</div> : null}
+              {metaEditor.conflict ? (
+                <div className="mt-2 rounded border border-amber-200 bg-amber-50 p-2 text-xs text-amber-900">
+                  <div>检测到服务器版本冲突（服务器版本：{String(metaEditor.conflict.serverVersion ?? "未知")}）。</div>
+                  <div className="mt-2 flex flex-wrap gap-2">
+                    <button className="rounded border border-amber-300 px-2 py-1 hover:bg-amber-100" onClick={() => setMetaEditor((state) => reloadDirtyField(state))}>重新加载服务器版本</button>
+                    <button
+                      disabled={busy}
+                      className="rounded border border-amber-300 px-2 py-1 hover:bg-amber-100 disabled:opacity-50"
+                      onClick={async () => {
+                        setBusy(true);
+                        setError(null);
+                        try {
+                          await saveDefaultMeta({ overwrite: true });
+                        } catch (e: unknown) {
+                          setError(e instanceof Error ? e.message : String(e));
+                        } finally {
+                          setBusy(false);
+                        }
+                      }}
+                    >
+                      确认覆盖服务器版本
+                    </button>
+                  </div>
+                </div>
+              ) : null}
               <div className="mt-2 text-xs text-slate-500">
                 说明：这里保存的是“默认模板”。实际投稿时仍可在任务详情页按需修改。
               </div>
@@ -566,13 +635,7 @@ export default function SettingsPublishPage() {
                   setBusy(true);
                   setError(null);
                   try {
-                    const meta = JSON.parse(metaText);
-                    await fetchJson(`${ORCHESTRATOR_URL}/bilibili/publish/settings`, {
-                      method: "PUT",
-                      headers: { "Content-Type": "application/json" },
-                      body: JSON.stringify({ default_meta: meta }),
-                    });
-                    await refresh();
+                    await saveDefaultMeta();
                   } catch (e: unknown) {
                     setError(e instanceof Error ? e.message : String(e));
                   } finally {
@@ -597,12 +660,7 @@ export default function SettingsPublishPage() {
                   setBusy(true);
                   setError(null);
                   try {
-                    await fetchJson(`${ORCHESTRATOR_URL}/bilibili/publish/settings`, {
-                      method: "PUT",
-                      headers: { "Content-Type": "application/json" },
-                      body: JSON.stringify({ default_meta: {} }),
-                    });
-                    await refresh();
+                    await saveDefaultMeta({ reset: true });
                   } catch (e: unknown) {
                     setError(e instanceof Error ? e.message : String(e));
                   } finally {

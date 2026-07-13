@@ -1,24 +1,18 @@
 import { useEffect, useMemo, useState } from "react";
 import { useConfirm } from "../components/feedbackContext";
 import { fetchJson } from "../lib/http";
-import { ORCHESTRATOR_URL } from "../lib/urls";
+import { ORCHESTRATOR_URL, orchestratorUrl } from "../lib/urls";
 
 type RemoteApiSettings = {
   token_set: boolean;
   token_updated_at?: string | null;
   endpoint_path: string;
-  http_method: string;
-  authorization_header: string;
-  idempotency_header: string;
 };
 
 const DEFAULT_SETTINGS: RemoteApiSettings = {
   token_set: false,
   token_updated_at: null,
   endpoint_path: "/remote/auto/youtube",
-  http_method: "POST",
-  authorization_header: "Authorization",
-  idempotency_header: "Idempotency-Key",
 };
 
 function orchestratorBaseUrl(): string {
@@ -38,7 +32,7 @@ export default function SettingsApiPage() {
   async function refresh() {
     setError(null);
     try {
-      const s = await fetchJson<RemoteApiSettings>(`${ORCHESTRATOR_URL}/settings/api`);
+      const s = await fetchJson<RemoteApiSettings>(orchestratorUrl("/settings/api"));
       setSettings(s);
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : String(e));
@@ -55,13 +49,13 @@ export default function SettingsApiPage() {
   const sampleCurl = useMemo(
     () =>
       [
-        `curl -X ${effective.http_method} "${remoteEndpoint}" \\`,
-        `  -H "${effective.authorization_header}: Bearer YOUR_TOKEN" \\`,
-        `  -H "${effective.idempotency_header}: YOUR_STABLE_REQUEST_ID" \\`,
+        `curl -X POST "${remoteEndpoint}" \\`,
+        "  -H \"Authorization: Bearer YOUR_TOKEN\" \\",
+        "  -H \"Idempotency-Key: YOUR_STABLE_REQUEST_ID\" \\",
         `  -H "Content-Type: application/json" \\`,
         "  --data '{\"url\":\"https://www.youtube.com/watch?v=dQw4w9WgXcQ\",\"license\":\"authorized\",\"auto_publish\":true}'",
       ].join("\n"),
-    [effective.authorization_header, effective.http_method, effective.idempotency_header, remoteEndpoint],
+    [remoteEndpoint],
   );
 
   return (
@@ -91,10 +85,6 @@ export default function SettingsApiPage() {
               <div className="text-xs text-slate-500">token_updated_at</div>
               <div className="mt-1 font-mono text-sm">{settings.token_updated_at || "-"}</div>
             </div>
-            <div className="rounded border p-3 md:col-span-2">
-              <div className="text-xs text-slate-500">remote endpoint</div>
-              <div className="mt-1 break-all font-mono text-sm">{remoteEndpoint}</div>
-            </div>
           </div>
         )}
         <div className="mt-3 text-xs text-slate-500">说明：当前远程入口仅支持 YouTube 视频链接，行为等价于网页里的 “YouTube 自动模式”。每个逻辑请求必须携带稳定且唯一的幂等键；网络重试时复用同一个键。</div>
@@ -122,7 +112,7 @@ export default function SettingsApiPage() {
               setBusy(true);
               setError(null);
               try {
-                await fetchJson(`${ORCHESTRATOR_URL}/settings/api`, {
+                await fetchJson(orchestratorUrl("/settings/api"), {
                   method: "PUT",
                   headers: { "Content-Type": "application/json" },
                   body: JSON.stringify({ token: tokenInput.trim() }),
@@ -152,7 +142,7 @@ export default function SettingsApiPage() {
               setBusy(true);
               setError(null);
               try {
-                await fetchJson(`${ORCHESTRATOR_URL}/settings/api`, {
+                await fetchJson(orchestratorUrl("/settings/api"), {
                   method: "PUT",
                   headers: { "Content-Type": "application/json" },
                   body: JSON.stringify({ token: "" }),
@@ -176,12 +166,8 @@ export default function SettingsApiPage() {
       <div className="rounded border bg-white p-4">
         <div className="text-sm font-semibold">调用示例</div>
         <div className="mt-2 text-xs text-slate-500">
-          仅支持 <span className="font-mono">{effective.http_method}</span> JSON 请求。必填请求头：<span className="font-mono">{effective.authorization_header}</span>（Bearer token）和 <span className="font-mono">{effective.idempotency_header}</span>。
+          仅支持 <span className="font-mono">POST</span> JSON 请求。必填请求头：<span className="font-mono">Authorization: Bearer</span> 和 <span className="font-mono">Idempotency-Key</span>。
           请求体必填 <span className="font-mono">url</span>；可选 <span className="font-mono">license</span>、<span className="font-mono">proof_url</span>、<span className="font-mono">auto_publish</span>。
-        </div>
-        <div className="mt-3 rounded border bg-slate-50 p-3">
-          <div className="text-xs text-slate-500">端点</div>
-          <pre className="mt-2 whitespace-pre-wrap break-all font-mono text-xs text-slate-800">{remoteEndpoint}</pre>
         </div>
         <div className="mt-3 rounded border bg-slate-50 p-3">
           <div className="text-xs text-slate-500">curl</div>

@@ -1,5 +1,5 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
-import { Link } from "react-router-dom";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Link, useSearchParams } from "react-router-dom";
 import { useConfirm } from "../components/feedbackContext";
 import { Button, DataTable, EmptyState, PageHeader, PaginationControls, Section, TableToolbar } from "../components/ui";
 import { fetchJson } from "../lib/http";
@@ -38,6 +38,7 @@ function statusClass(status: string) {
 
 export default function KnowledgeBasePage() {
   const confirm = useConfirm();
+  const [searchParams] = useSearchParams();
   const [items, setItems] = useState<KnowledgeItem[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -61,6 +62,9 @@ export default function KnowledgeBasePage() {
   const [status, setStatus] = useState("approved");
   const [confidence, setConfidence] = useState(1);
   const [formError, setFormError] = useState<string | null>(null);
+  const requestControllerRef = useRef<AbortController | null>(null);
+  const requestGenerationRef = useRef(0);
+  const focusedItemId = searchParams.get("item")?.trim() || null;
 
   const query = useMemo(() => {
     const params = new URLSearchParams();
@@ -70,19 +74,30 @@ export default function KnowledgeBasePage() {
     if (statusFilter) params.set("status", statusFilter);
     if (searchText.trim()) params.set("q", searchText.trim());
     if (domainFilter.trim()) params.set("domain", domainFilter.trim());
+    // Preserve the focused item in the request for API versions that support
+    // direct item lookup; this UI also highlights it when it is in the page.
+    if (focusedItemId) params.set("item", focusedItemId);
     return params.toString();
-  }, [domainFilter, itemTypeFilter, page, statusFilter, searchText]);
+  }, [domainFilter, focusedItemId, itemTypeFilter, page, statusFilter, searchText]);
 
   const refresh = useCallback(async (opts?: { silent?: boolean }) => {
+    requestControllerRef.current?.abort();
+    const controller = new AbortController();
+    requestControllerRef.current = controller;
+    const generation = requestGenerationRef.current + 1;
+    requestGenerationRef.current = generation;
     if (opts?.silent) setRefreshing(true);
     else setLoading(true);
     setError(null);
     try {
-      const rows = await fetchJson<KnowledgeItem[]>(`${ORCHESTRATOR_URL}/subtitle/knowledge/items?${query}`);
+      const rows = await fetchJson<KnowledgeItem[]>(`${ORCHESTRATOR_URL}/subtitle/knowledge/items?${query}`, { signal: controller.signal });
+      if (generation !== requestGenerationRef.current) return;
       setItems(rows);
     } catch (e: unknown) {
+      if (controller.signal.aborted || generation !== requestGenerationRef.current) return;
       setError(e instanceof Error ? e.message : String(e));
     } finally {
+      if (generation !== requestGenerationRef.current) return;
       setLoading(false);
       setRefreshing(false);
     }
@@ -91,6 +106,8 @@ export default function KnowledgeBasePage() {
   useEffect(() => {
     refresh();
   }, [refresh]);
+
+  useEffect(() => () => requestControllerRef.current?.abort(), []);
 
   useEffect(() => {
     setPage(0);
@@ -250,7 +267,7 @@ export default function KnowledgeBasePage() {
       <Section>
         <TableToolbar
           title="知识条目"
-          description="按服务端分页读取，每页 50 条。"
+          description={focusedItemId ? `已从仪表盘定位知识项 ${focusedItemId}；按服务端分页读取，每页 50 条。` : "按服务端分页读取，每页 50 条。"}
           meta={`第 ${page + 1} 页，当前 ${items.length} 条${refreshing ? "，刷新中..." : ""}`}
           actions={
             <Button disabled={loading || refreshing} onClick={() => refresh({ silent: true })}>
@@ -307,7 +324,7 @@ export default function KnowledgeBasePage() {
             </thead>
             <tbody>
               {items.map((item) => (
-                <tr key={item.id}>
+                <tr key={item.id} className={item.id === focusedItemId ? "bg-sky-50" : undefined}>
                   <td className="py-2 pr-3 align-top">{item.item_type}</td>
                   <td className="max-w-56 py-2 pr-3 align-top">
                     <div className="font-medium text-slate-900">{item.term || item.title || "-"}</div>

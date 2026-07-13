@@ -30,6 +30,22 @@ describe("createTaskDetailPollPlan", () => {
 });
 
 describe("buildPublishActionPayload", () => {
+  it("includes force_retry for Bilibili retries", () => {
+    expect(
+      buildPublishActionPayload({
+        platform: "bilibili",
+        accountId: "",
+        videoKey: "final/video.mp4",
+        coverKey: "cover.jpg",
+        meta: { title: "标题" },
+        schedule: "",
+        typeidMode: "ai_summary",
+        skipReview: false,
+        forceRetry: true,
+      }),
+    ).toMatchObject({ force_retry: true });
+  });
+
   it("builds a social request without Bilibili typeid options", () => {
     expect(
       buildPublishActionPayload({

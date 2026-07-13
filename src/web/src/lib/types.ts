@@ -89,6 +89,29 @@ export type PublishBatch = {
   updated_at: string;
 };
 
+export type TaskCoreSnapshot = {
+  task: Task;
+  assets: Asset[];
+  subtitleJobs: SubtitleJob[];
+};
+
+export type PublishActionPayload = {
+  platform: "bilibili" | "douyin" | "xiaohongshu" | "kuaishou";
+  account_id: string | null;
+  video_key: string | null;
+  cover_key: string | null;
+  typeid_mode?: string;
+  meta: Record<string, unknown>;
+  platform_options: Record<string, Record<string, unknown>>;
+  skip_review: boolean;
+  force_retry: boolean;
+};
+
+export type VersionedPublishSettings = {
+  default_meta: Record<string, unknown>;
+  version?: string | number | null;
+};
+
 export type YouTubeSource = {
   id: string;
   source_type: "channel" | "playlist";

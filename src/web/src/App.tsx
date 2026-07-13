@@ -79,6 +79,18 @@ function Navigation({ onNavigate }: { onNavigate?: () => void }) {
   );
 }
 
+function NotFoundPage() {
+  return (
+    <div className="rounded-md border border-amber-200 bg-amber-50 p-5 text-slate-900">
+      <div className="text-lg font-semibold">页面不存在</div>
+      <div className="mt-1 text-sm text-slate-600">此地址没有对应功能，请返回仪表盘继续操作。</div>
+      <Link to="/" className="mt-4 inline-block rounded-md border border-slate-300 bg-white px-3 py-2 text-sm hover:bg-slate-50">
+        返回仪表盘
+      </Link>
+    </div>
+  );
+}
+
 export default function App() {
   const location = useLocation();
   const orchestratorDisplay =
@@ -226,6 +238,7 @@ export default function App() {
               <Route path="/settings/translate" element={<SettingsTranslatePage />} />
               <Route path="/settings/publish" element={<SettingsPublishPage />} />
               <Route path="/settings/bilibili" element={<SettingsPublishPage />} />
+              <Route path="*" element={<NotFoundPage />} />
             </Routes>
           </main>
         </div>

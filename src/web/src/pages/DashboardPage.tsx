@@ -72,6 +72,10 @@ function formatDate(value: string): string {
   return new Date(value).toLocaleString();
 }
 
+export function knowledgeItemHref(itemId: string): string {
+  return `/knowledge?${new URLSearchParams({ item: itemId }).toString()}`;
+}
+
 function clampPercent(value?: number | null): number {
   if (!Number.isFinite(Number(value))) return 0;
   return Math.max(0, Math.min(100, Number(value)));
@@ -298,7 +302,7 @@ function AgentRunDetail({
                   {knowledgeStatus ? <div>knowledge: {knowledgeStatus}</div> : null}
                   {failureCategory ? <div>failure: {failureCategory}</div> : null}
                   {run.knowledge_item_id ? (
-                    <Link to={`/knowledge?item=${run.knowledge_item_id}`} className="truncate font-mono text-sky-700 hover:underline">
+                    <Link to={knowledgeItemHref(run.knowledge_item_id)} className="truncate font-mono text-sky-700 hover:underline">
                       item: {run.knowledge_item_id}
                     </Link>
                   ) : null}

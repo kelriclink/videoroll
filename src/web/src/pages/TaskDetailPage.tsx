@@ -4,8 +4,9 @@ import StatusBadge from "../components/StatusBadge";
 import { useConfirm, useToast } from "../components/feedbackContext";
 import { Button } from "../components/ui";
 import { fetchJson } from "../lib/http";
+import { loadSlices } from "../lib/requestState";
 import { ORCHESTRATOR_URL } from "../lib/urls";
-import { Asset, PublishBatch, PublishJob, SubtitleJob, Task } from "../lib/types";
+import { Asset, PublishBatch, PublishJob, SubtitleJob, Task, TaskCoreSnapshot } from "../lib/types";
 import { activeAccountsForPlatform, PublishPlatformSettings, SocialAccount } from "./settingsPublishPage.helpers";
 import { buildPublishActionPayload, createTaskDetailPollPlan, PublishPlatform, socialPublishBrowserUrl } from "./taskDetailPage.helpers";
 
@@ -140,6 +141,8 @@ export default function TaskDetailPage() {
   const [publishJobs, setPublishJobs] = useState<PublishJob[] | null>(null);
   const [publishBatches, setPublishBatches] = useState<PublishBatch[] | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [coreError, setCoreError] = useState<string | null>(null);
+  const [publisherErrors, setPublisherErrors] = useState<Record<string, string>>({});
   const [logSelection, setLogSelection] = useState<string>("combined");
   const [logText, setLogText] = useState<string>("");
   const [logBusy, setLogBusy] = useState(false);
@@ -193,28 +196,53 @@ export default function TaskDetailPage() {
   const refresh = useCallback(
     async (opts?: { silent?: boolean }) => {
       if (!taskId) return;
-      if (!opts?.silent) setError(null);
-      try {
-        const [t, a, sj, pj, pb, pr, accounts, platforms] = await Promise.all([
-          fetchJson<Task>(`${ORCHESTRATOR_URL}/tasks/${taskId}`),
-          fetchJson<Asset[]>(`${ORCHESTRATOR_URL}/tasks/${taskId}/assets`),
-          fetchJson<SubtitleJob[]>(`${ORCHESTRATOR_URL}/tasks/${taskId}/subtitle_jobs`),
-          fetchJson<PublishJob[]>(`${ORCHESTRATOR_URL}/tasks/${taskId}/publish_jobs`),
-          fetchJson<PublishBatch[]>(`${ORCHESTRATOR_URL}/tasks/${taskId}/publish_batches`),
-          fetchJson<PublishReview>(`${ORCHESTRATOR_URL}/tasks/${taskId}/publish_review`),
-          fetchJson<SocialAccount[]>(`${ORCHESTRATOR_URL}/settings/publish/social/accounts`),
-          fetchJson<PublishPlatformSettingsResponse>(`${ORCHESTRATOR_URL}/settings/publish/platforms`),
-        ]);
-        setTask(t);
-        setAssets(a);
-        setSubtitleJobs(sj);
-        setPublishJobs(pj);
-        setPublishBatches(pb);
-        setPublishReview(pr);
-        setSocialAccounts(accounts);
-        setPublishPlatformSettings(platforms.platforms);
-      } catch (e: unknown) {
-        if (!opts?.silent) setError(e instanceof Error ? e.message : String(e));
+      const result = await loadSlices<
+        TaskCoreSnapshot,
+        {
+          publishJobs: PublishJob[];
+          publishBatches: PublishBatch[];
+          publishReview: PublishReview;
+          socialAccounts: SocialAccount[];
+          publishPlatforms: PublishPlatformSettingsResponse;
+        }
+      >(
+        async () => {
+          const [task, assets, subtitleJobs] = await Promise.all([
+            fetchJson<Task>(`${ORCHESTRATOR_URL}/tasks/${taskId}`),
+            fetchJson<Asset[]>(`${ORCHESTRATOR_URL}/tasks/${taskId}/assets`),
+            fetchJson<SubtitleJob[]>(`${ORCHESTRATOR_URL}/tasks/${taskId}/subtitle_jobs`),
+          ]);
+          return { task, assets, subtitleJobs };
+        },
+        {
+          publishJobs: () => fetchJson<PublishJob[]>(`${ORCHESTRATOR_URL}/tasks/${taskId}/publish_jobs`),
+          publishBatches: () => fetchJson<PublishBatch[]>(`${ORCHESTRATOR_URL}/tasks/${taskId}/publish_batches`),
+          publishReview: () => fetchJson<PublishReview>(`${ORCHESTRATOR_URL}/tasks/${taskId}/publish_review`),
+          socialAccounts: () => fetchJson<SocialAccount[]>(`${ORCHESTRATOR_URL}/settings/publish/social/accounts`),
+          publishPlatforms: () => fetchJson<PublishPlatformSettingsResponse>(`${ORCHESTRATOR_URL}/settings/publish/platforms`),
+        },
+      );
+
+      if (result.core.ok) {
+        setTask(result.core.value.task);
+        setAssets(result.core.value.assets);
+        setSubtitleJobs(result.core.value.subtitleJobs);
+        setCoreError(null);
+      } else {
+        setCoreError(result.core.error.message);
+      }
+
+      if (result.optional.publishJobs.ok) setPublishJobs(result.optional.publishJobs.value);
+      if (result.optional.publishBatches.ok) setPublishBatches(result.optional.publishBatches.value);
+      if (result.optional.publishReview.ok) setPublishReview(result.optional.publishReview.value);
+      if (result.optional.socialAccounts.ok) setSocialAccounts(result.optional.socialAccounts.value);
+      if (result.optional.publishPlatforms.ok) setPublishPlatformSettings(result.optional.publishPlatforms.value.platforms);
+      const nextErrors = Object.fromEntries(
+        Object.entries(result.errors.optional).map(([key, value]) => [key, value?.message ?? "请求失败"]),
+      );
+      setPublisherErrors(nextErrors);
+      if (!opts?.silent && result.core.ok) {
+        setError(null);
       }
     },
     [taskId],
@@ -973,6 +1001,7 @@ export default function TaskDetailPage() {
         </div>
 
         {error ? <div className="mt-3 whitespace-pre-wrap break-words text-sm text-rose-700">{error}</div> : null}
+        {coreError ? <div className="mt-3 whitespace-pre-wrap break-words text-sm text-rose-700">任务核心数据加载失败：{coreError}</div> : null}
         {!task ? <div className="mt-3 text-sm text-slate-500">加载中…</div> : null}
         {task ? (
           <div className="mt-3 grid gap-3 md:grid-cols-2">
@@ -1555,6 +1584,14 @@ export default function TaskDetailPage() {
         <div className="mt-2 text-xs text-slate-500">
           哔哩哔哩使用现有接口发布；抖音、小红书和快手由独立 SAU 无头浏览器服务发布。
         </div>
+        {Object.keys(publisherErrors).length ? (
+          <div className="mt-3 rounded border border-amber-200 bg-amber-50 p-3 text-xs text-amber-900">
+            <div className="font-semibold">投稿附加数据部分不可用</div>
+            {Object.entries(publisherErrors).map(([slice, message]) => (
+              <div key={slice} className="mt-1 break-words">{slice}: {message}</div>
+            ))}
+          </div>
+        ) : null}
         <div className="mt-3 rounded border p-3">
           <div className="mb-2 text-xs text-slate-500">平台策略</div>
           <div className="flex flex-wrap gap-2">
