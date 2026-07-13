@@ -10,10 +10,17 @@ import { activeAccountsForPlatform, PublishPlatformSettings, SocialAccount } fro
 import { buildPublishActionPayload, createTaskDetailPollPlan, PublishPlatform, socialPublishBrowserUrl } from "./taskDetailPage.helpers";
 
 type SubtitleActionResponse = { job_id: string; status: string };
-type PublishResponse = { state: string; platform?: string | null; aid?: string | null; bvid?: string | null; external_id?: string | null; external_url?: string | null; response?: any };
+type PublishResponse = { job_id?: string | null; state: string; platform?: string | null; aid?: string | null; bvid?: string | null; external_id?: string | null; external_url?: string | null; response?: any };
 type PublishMetaDraftResponse = { meta: any };
 type PublishMetaStoreResponse = { stored: boolean; key: string; meta?: any };
 type PublishPlatformSettingsResponse = { platforms: PublishPlatformSettings };
+type DesktopGrant = {
+  token: string;
+  desktop_type: "login" | "publish";
+  resource_id: string;
+  expires_at: string;
+  reconnect_limit: number;
+};
 type YouTubeMeta = {
   title: string;
   description: string;
@@ -91,6 +98,17 @@ function workflowStepClass(state: WorkflowStepState): string {
   if (state === "active") return "border-sky-200 bg-sky-50 text-sky-800";
   if (state === "failed") return "border-rose-200 bg-rose-50 text-rose-800";
   return "border-slate-200 bg-slate-50 text-slate-600";
+}
+
+function scopedDesktopUrl(browserUrl: string, grant: DesktopGrant): string {
+  const url = new URL(browserUrl, window.location.origin);
+  const noVncPath = url.searchParams.get("path");
+  if (!noVncPath) throw new Error("noVNC desktop path is missing");
+  const separator = noVncPath.includes("?") ? "&" : "?";
+  url.searchParams.set("grant", grant.token);
+  url.searchParams.set("resource", grant.resource_id);
+  url.searchParams.set("path", `${noVncPath}${separator}grant=${grant.token}&resource=${grant.resource_id}`);
+  return url.toString();
 }
 
 function WorkflowStepper({ steps }: { steps: WorkflowStep[] }) {
@@ -613,6 +631,22 @@ export default function TaskDetailPage() {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
       setBusy(false);
+    }
+  }
+
+  async function openPublishDesktop(browserUrl: string, resourceId: string) {
+    const popup = window.open("about:blank", "social-publish-douyin", "popup,width=1280,height=860,resizable=yes,scrollbars=yes");
+    if (!popup) throw new Error("浏览器阻止了自动化窗口，请允许弹出窗口后重试");
+    try {
+      const grant = await fetchJson<DesktopGrant>(`${ORCHESTRATOR_URL}/desktop/grants`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ desktop_type: "publish", resource_id: resourceId }),
+      });
+      popup.location.replace(scopedDesktopUrl(browserUrl, grant));
+    } catch (e) {
+      popup.close();
+      throw e;
     }
   }
 
@@ -1700,14 +1734,21 @@ export default function TaskDetailPage() {
                 <button
                   type="button"
                   className="rounded border border-indigo-300 px-3 py-1.5 text-xs text-indigo-700 hover:bg-indigo-50"
-                  onClick={() => {
+                  onClick={async () => {
                     const browserUrl = socialPublishBrowserUrl(publishPlatform);
                     if (!browserUrl) return;
-                    window.open(
-                      new URL(browserUrl, window.location.origin).toString(),
-                      "social-publish-douyin",
-                      "popup,width=1280,height=860,resizable=yes,scrollbars=yes",
+                    const job = (publishJobs ?? []).find(
+                      (candidate) => candidate.platform === publishPlatform && candidate.state === "submitting",
                     );
+                    if (!job?.id) {
+                      setError("请先提交抖音投稿任务；自动化窗口只在该投稿任务执行期间开放");
+                      return;
+                    }
+                    try {
+                      await openPublishDesktop(browserUrl, job.id);
+                    } catch (e: unknown) {
+                      setError(e instanceof Error ? e.message : String(e));
+                    }
                   }}
                 >
                   打开自动化窗口

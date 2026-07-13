@@ -60,6 +60,7 @@ class AdminAuthMiddleware(BaseHTTPMiddleware):
             internal_secret=cookie_secret,
             password_hash=password_hash,
         ):
+            request.state.admin_session = cookie_value
             if internal_header_token:
                 _inject_internal_header(request, internal_header_token)
             return await call_next(request)

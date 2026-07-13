@@ -35,6 +35,25 @@ type PublishPlatformSettingsResponse = {
   platforms: PublishPlatformSettings;
 };
 
+type DesktopGrant = {
+  token: string;
+  desktop_type: "login" | "publish";
+  resource_id: string;
+  expires_at: string;
+  reconnect_limit: number;
+};
+
+function scopedDesktopUrl(browserUrl: string, grant: DesktopGrant): string {
+  const url = new URL(browserUrl, window.location.origin);
+  const noVncPath = url.searchParams.get("path");
+  if (!noVncPath) throw new Error("noVNC desktop path is missing");
+  const separator = noVncPath.includes("?") ? "&" : "?";
+  url.searchParams.set("grant", grant.token);
+  url.searchParams.set("resource", grant.resource_id);
+  url.searchParams.set("path", `${noVncPath}${separator}grant=${grant.token}&resource=${grant.resource_id}`);
+  return url.toString();
+}
+
 const SOCIAL_PLATFORMS: Array<{ id: SocialPlatform; label: string }> = [
   { id: "douyin", label: "抖音" },
   { id: "xiaohongshu", label: "小红书" },
@@ -149,6 +168,18 @@ export default function SettingsPublishPage() {
     }
   }
 
+  async function openLoginDesktop(
+    popup: Window,
+    session: SocialLoginSession,
+  ) {
+    const grant = await fetchJson<DesktopGrant>(`${ORCHESTRATOR_URL}/desktop/grants`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ desktop_type: "login", resource_id: session.id }),
+    });
+    popup.location.replace(scopedDesktopUrl(session.browser_url, grant));
+  }
+
   return (
     <div className="space-y-4">
       <div className="rounded border bg-white p-4">
@@ -212,6 +243,10 @@ export default function SettingsPublishPage() {
                 className="rounded bg-indigo-600 px-3 py-2 text-sm text-white disabled:opacity-50"
                 onClick={async () => {
                   const popup = window.open("about:blank", `social-login-${id}`, "popup,width=1280,height=860,resizable=yes,scrollbars=yes");
+                  if (!popup) {
+                    setError("浏览器阻止了登录窗口，请允许弹出窗口后重试");
+                    return;
+                  }
                   setBusy(true);
                   setError(null);
                   try {
@@ -224,7 +259,7 @@ export default function SettingsPublishPage() {
                       },
                     );
                     setLoginSessions((current) => ({ ...current, [id]: session }));
-                    if (popup) popup.location.replace(new URL(session.browser_url, window.location.origin).toString());
+                    await openLoginDesktop(popup, session);
                   } catch (e: unknown) {
                     popup?.close();
                     setError(e instanceof Error ? e.message : String(e));
@@ -267,7 +302,19 @@ export default function SettingsPublishPage() {
                   {loginSession.state === "running" ? (
                     <button
                       className="rounded border border-indigo-300 px-3 py-1.5 text-xs"
-                      onClick={() => window.open(new URL(loginSession.browser_url, window.location.origin).toString(), `social-login-${id}`, "popup,width=1280,height=860,resizable=yes,scrollbars=yes")}
+                      onClick={async () => {
+                        const popup = window.open("about:blank", `social-login-${id}`, "popup,width=1280,height=860,resizable=yes,scrollbars=yes");
+                        if (!popup) {
+                          setError("浏览器阻止了登录窗口，请允许弹出窗口后重试");
+                          return;
+                        }
+                        try {
+                          await openLoginDesktop(popup, loginSession);
+                        } catch (e: unknown) {
+                          popup.close();
+                          setError(e instanceof Error ? e.message : String(e));
+                        }
+                      }}
                     >
                       打开登录窗口
                     </button>

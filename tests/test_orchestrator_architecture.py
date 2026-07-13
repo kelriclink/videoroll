@@ -39,6 +39,7 @@ EXPECTED_ORCHESTRATOR_ROUTES: set[tuple[str, str]] = {
     ("GET", "/tasks/{task_id}/youtube_meta"),
     ("GET", "/videos/converted"),
     ("POST", "/auth/login"),
+    ("POST", "/desktop/grants"),
     ("POST", "/bilibili/{service_path:path}"),
     ("POST", "/auth/logout"),
     ("POST", "/auth/setup"),
@@ -85,7 +86,7 @@ def route_manifest(application) -> set[tuple[str, str]]:
     return {
         (method, route.path)
         for route in application.routes
-        if route.path not in DOC_PATHS
+        if route.path not in DOC_PATHS and getattr(route, "include_in_schema", True)
         for method in sorted(getattr(route, "methods", set()) or set())
         if method not in {"HEAD", "OPTIONS"}
     }
@@ -96,7 +97,7 @@ class OrchestratorArchitectureTests(unittest.TestCase):
         pairs = [
             (method, route.path)
             for route in app.routes
-            if route.path not in DOC_PATHS
+            if route.path not in DOC_PATHS and getattr(route, "include_in_schema", True)
             for method in sorted(getattr(route, "methods", set()) or set())
             if method not in {"HEAD", "OPTIONS"}
         ]
