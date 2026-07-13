@@ -64,6 +64,51 @@ docker load -i videoroll-prod-bundle-*.tar
 
 详细 Docker 部署见 [README.md](../README.md)。
 
+## 安全上线与运行
+
+生产部署只公开 `web` 的 `${PUBLISH_ADDR}:${WEB_PORT}`。`orchestrator`、四个内部 API、Redis、MinIO、outbox dispatcher 和 egress gateway 都在 Compose 的 `internal` 网络中，不能添加 `ports:` 映射；需要诊断时使用受控的 `docker compose exec`，不要临时暴露内部端口。
+
+### 必需环境变量
+
+| 变量 | 生产要求 | 用途 |
+|---|---|---|
+| `DEVELOPMENT_MODE` | `false` | 仅本地开发可设为 `true`；不是关闭认证的开关。 |
+| `INTERNAL_API_SECRET` | 随机、非空、非默认值 | 派生内部服务请求 token 和管理员 cookie 密钥。 |
+| `ADMIN_BOOTSTRAP_SECRET` | 随机、非空、非默认值 | 一次性初始化管理员账户；成功使用后会被数据库标记为已消费。 |
+| `EGRESS_GATEWAY_URL` | `http://egress-gateway:8020` | RAG/网页抓取唯一允许使用的出站网关。 |
+| `ORCHESTRATOR_URL` | `http://orchestrator:8000` | 内部 worker 回调地址，不能指向公网 URL。 |
+| `PUBLISH_ADDR` | 通常 `127.0.0.1` | 唯一允许的 Web 宿主机绑定地址。 |
+
+从 `.env.example` 开始，使用密码管理器或部署系统注入两个 secret；不要将真实值提交到仓库。`./scripts/dev_up.sh` 仅为首次本地开发生成唯一 secret，不能替代生产密钥管理。
+
+### 上线阶段与回退边界
+
+1. 备份数据库，并确认现有任务、publish jobs 与发布批次可读。
+2. 运行 `python -m videoroll.db.migrate upgrade`，再启动 `egress-gateway`、内部 API/worker、`outbox-dispatcher` 和最后的 `web`。
+3. 运行 `./scripts/security_smoke.sh`；该检查不联网、不启动容器。
+4. 观察 outbox pending 年龄、失败重试、内部鉴权失败、egress 拒绝和 desktop grant 拒绝日志，再允许生产流量。
+
+当前没有允许降级到旧安全模型的 feature flag。`DEVELOPMENT_MODE`、`DEPLOYMENT_ROLE`、服务副本数和 dispatcher 启停只能控制本地开发或部署拓扑，不能恢复 query-token、未认证 noVNC、直接内部端口或任意出站请求。出现问题时可以回退应用版本、停止新流量或扩容 dispatcher，但保留 schema 与安全边界。
+
+### Outbox 观察与修复
+
+所有可恢复的异步副作用首先写入 `outbox_events`，再由 `outbox-dispatcher` 投递。broker 失败会释放事件并以指数退避重试；dispatcher lease 过期可被其他 dispatcher 认领。
+
+- 首先确认 `outbox-dispatcher` 健康且 Redis 可用：`docker compose ps outbox-dispatcher redis`。
+- 查看 `outbox_events` 中的 `status`、`attempt_count`、`available_at`、`lease_until` 和 `last_error`，不要直接删除 pending/failed 行。
+- 修复 broker 或 worker 后重启/扩容 dispatcher；正常调度会重新认领到期事件。
+- 仅当确认 worker 从未达到外部副作用边界时，才能对已投递但未启动的操作执行受控重投；`unknown` 发布状态必须由管理员确认，不能靠重启或 SQL 强行重试。
+
+### Desktop 授权
+
+管理员先通过 `POST /api/desktop/grants` 创建 login 或 publish grant；grant 绑定管理员会话、desktop 类型和资源 UUID，默认 5 分钟有效，WebSocket 重连次数受限。浏览器 URL 中的 grant 是短期授权材料，不是 VNC 密码：不要复制到工单、日志或 Referer。Nginx 会对 noVNC landing page 与 WebSocket 发起授权子请求；没有管理员会话、过期 grant、错误资源或超出重连上限都会被拒绝。
+
+VNC 进程密码只存在容器 tmpfs；它不应出现在 URL、数据库、前端配置或日志。部署 interactive desktop 前，应额外验证 noVNC 的受信任密码握手路径已随当前镜像启用。
+
+### Egress 私网要求
+
+RAG/页面抓取只能调用 egress gateway。网关对每次 DNS 结果、重定向目标和实际连接 peer 都要求全局可路由地址，拒绝 loopback、RFC1918、link-local、metadata 与混合 DNS 结果；不能通过 hosts、代理或 URL 凭证绕过。应用容器不应直接获得任意公网出口。
+
 ## 架构要点
 
 ### Monolith 组装

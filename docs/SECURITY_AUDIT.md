@@ -1,5 +1,36 @@
 # VideoRoll 项目审计报告
 
+## 2026-07 安全架构上线状态
+
+本节覆盖本轮上线已落实的边界，并替代下文与其矛盾的历史风险描述。历史条目仍保留，供追踪尚未处理的风险。
+
+| 边界 | 当前状态 | 验证 |
+|---|---|---|
+| 内部服务 | 所有非 `/health` 请求需要 `X-Videoroll-Internal-Token`，服务仅在 internal Compose 网络 | `scripts/security_smoke.sh` |
+| Remote API | 只接受 Bearer `POST` JSON 与 `Idempotency-Key`；旧 GET/query-token 为 `410` | `tests/test_security_rollout.py` |
+| 异步副作用 | domain 事务与 outbox 事件同事务提交，broker 失败保留为可重试状态 | `tests/test_security_rollout.py` |
+| noVNC | 短期、会话/资源绑定的 desktop grant 保护 landing page 与 WebSocket | `tests/test_security_rollout.py` |
+| 外部抓取 | egress gateway 复核 DNS、redirect 和连接 peer，拒绝私网/非全局地址 | `tests/test_security_rollout.py` |
+
+### 上线前检查
+
+```bash
+./scripts/security_smoke.sh
+```
+
+该脚本不启动 Compose，也不访问外网；它验证内部认证、内部服务未发布宿主机端口、URL 凭证拒绝、desktop grant 作用域、outbox 重试和私网 egress 拒绝。完整回归仍按 CI 流程执行。
+
+### 回滚限制
+
+可以停止入口流量、回退应用镜像、修复 Redis/worker 并让 outbox 重试，或暂停 interactive desktop 的业务入口。不得通过任何环境变量、nginx 临时规则或旧镜像恢复以下能力：
+
+- Remote API 的 GET 或 query-token；
+- 未认证 noVNC 或公开 VNC/websockify 端口；
+- 内部 API 的宿主机端口映射或无内部 service token 调用；
+- 绕过 egress gateway 的私网/任意目标抓取。
+
+Schema 增量应保留以维护历史任务、outbox 和授权记录；数据库降级需要单独的备份恢复计划，不能作为事故中的即时回退动作。
+
 ## 需要立即修复 (Critical)
 
 ### 1. Fernet 密钥管理缺失
@@ -15,11 +46,11 @@
 - PBKDF2 200k 迭代提供了一定的单次计算成本，但不足以作为唯一防线
 - **改进**: 加入 `slowapi` 或类似限流库，限制同一 IP 的登录尝试频率
 
-### 3. Remote API token 通过 query 参数传递
+### 3. Remote API token 通过 query 参数传递（已修复）
 - **文件**: `src/videoroll/apps/orchestrator_api/remote_api_settings_store.py`
 - `?token=` 出现在 access log、代理日志、浏览器历史、Referer header 中
 - token 虽然在存储时做了 PBKDF2 hash，但传输过程中明文暴露
-- **改进**: 改用 `Authorization: Bearer` header 传递 token
+- **现状**: 仅接受 `Authorization: Bearer` 的 JSON `POST`；旧 GET/query 合约返回 `410 Gone`
 
 ---
 
@@ -45,12 +76,12 @@
 - 应用被攻破后攻击者拥有完整 root 权限
 - **改进**: 加 `RUN useradd -r -s /usr/sbin/nologin videoroll` 和 `USER videoroll`
 
-### 7. 内部服务间认证 token 从 S3 secret 派生
+### 7. 内部服务间认证 token 从 S3 secret 派生（已修复）
 - **文件**: `src/videoroll/utils/internal_api_token.py`
 - token = `SHA256("videoroll-internal-token:v1:" + s3_secret_access_key)`
 - S3 secret 轮转后所有内部认证同时失效，无独立的内部密钥配置
 - 无 HMAC、无 per-service nonce、无过期机制
-- **改进**: 独立的 `INTERNAL_API_SECRET` 环境变量，不与 S3 secret 绑定
+- **现状**: 独立的 `INTERNAL_API_SECRET` 经版本化 HMAC 派生，生产环境拒绝空值和已知默认值
 
 ### 8. 安全相关 cookie 配置问题
 - **文件**: `src/videoroll/apps/orchestrator_api/main.py`

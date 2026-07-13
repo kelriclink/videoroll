@@ -67,7 +67,24 @@ curl -X POST "https://your-host/api/remote/auto/youtube" \
 
 ## 迁移旧调用
 
-旧的 `GET /api/remote/auto/youtube?token=...&url=...` 合约已废弃，当前返回 `410 Gone`。请迁移为本页的 Bearer `POST` JSON 合约。幂等记录会保留 24 小时；在该时间窗内重试同一逻辑请求时必须复用原 `Idempotency-Key`。
+旧的 `GET /api/remote/auto/youtube?token=...&url=...` 合约已移除，当前固定返回 `410 Gone`。即使把 `token` 放到新的 `POST` 查询字符串中也不会被读取，结果是 `401`。请迁移为本页的 Bearer `POST` JSON 合约。
+
+迁移顺序：
+
+1. 先在调用端支持 JSON 请求体和 `Idempotency-Key`，但保留原调用的观测。
+2. 将 token 从配置、URL 模板、代理参数和日志字段中删除，只在进程内构造 `Authorization` header。
+3. 用同一个逻辑请求重复调用一次，确认返回同一结果且未重复创建流水线。
+4. 删除旧 GET 调用；不要把 `410` 当作可重试错误。
+
+幂等记录保留 24 小时；在该时间窗内重试同一逻辑请求时必须复用原 `Idempotency-Key`。超过窗口后，调用方必须使用新的键并自行决定是否仍应提交。
+
+## 日志与泄露处理
+
+- 不要把 token 放进 URL、query、shell 历史、截图、任务描述或异常文本。
+- 反向代理和调用方日志只记录请求 ID、HTTP 状态和 token 指纹，不能记录 `Authorization` 值。
+- 怀疑 token 出现在 URL 或日志中时，立即在 `Settings → API` 轮换 token，清理相关日志副本，并将旧 token 视为失效。
+
+Remote API 没有兼容开关；回滚部署也不得恢复 query-token 或 GET 写入语义。
 
 ## 注意事项
 
