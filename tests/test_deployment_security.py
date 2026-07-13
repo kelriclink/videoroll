@@ -53,6 +53,26 @@ def test_minio_healthcheck_uses_supported_readiness_endpoint() -> None:
         assert healthcheck["test"] == expected
 
 
+def test_application_roles_resolve_host_database_gateway() -> None:
+    application_roles = {
+        "orchestrator",
+        "subtitle-service",
+        "youtube-ingest",
+        "bilibili-publisher",
+        "subtitle-worker",
+        "outbox-dispatcher",
+        "publish-worker",
+        "social-publisher-api",
+        "social-publisher-worker",
+        "social-publisher-scheduler",
+    }
+
+    for path in COMPOSE_FILES:
+        services = _compose(path)["services"]
+        for name in application_roles:
+            assert "host.docker.internal:host-gateway" in services[name].get("extra_hosts", [])
+
+
 def test_rag_processes_have_no_direct_egress_network() -> None:
     for path in COMPOSE_FILES:
         compose = _compose(path)

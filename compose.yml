@@ -8,6 +8,8 @@ x-application-build: &application-build
 x-application-security: &application-security
   user: "${APP_UID:-10001}:${APP_GID:-10001}"
   init: true
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
   security_opt:
     - no-new-privileges:true
   cap_drop:
