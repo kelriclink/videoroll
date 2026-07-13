@@ -21,6 +21,8 @@ RUN pip install --no-cache-dir -U pip \
 
 COPY pyproject.toml README.md ./
 COPY src/videoroll ./src/videoroll
+COPY alembic.ini ./alembic.ini
+COPY migrations ./migrations
 RUN pip install --no-cache-dir -e . --no-deps
 
 COPY social-auto-upload /opt/social-auto-upload

@@ -164,6 +164,16 @@ def test_docker_image_contains_migration_resources() -> None:
     assert "COPY migrations ./migrations" in dockerfile
 
 
+def test_social_publisher_image_includes_packaging_migration_resources() -> None:
+    dockerfile = (ROOT / "docker/social-publisher.Dockerfile").read_text(encoding="utf-8")
+
+    assert "COPY alembic.ini ./alembic.ini" in dockerfile
+    assert "COPY migrations ./migrations" in dockerfile
+    assert dockerfile.index("COPY migrations ./migrations") < dockerfile.index(
+        "RUN pip install --no-cache-dir -e . --no-deps"
+    )
+
+
 def test_alembic_offline_sql_contains_security_schema() -> None:
     assert (ROOT / "alembic.ini").is_file()
     assert (ROOT / "migrations/env.py").is_file()
