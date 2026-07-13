@@ -84,3 +84,11 @@ def test_entrypoints_do_not_start_passwordless_vnc_or_multiple_roles() -> None:
     assert "-nopw" not in social_entrypoint
     assert "-rfbauth" in social_entrypoint
     assert "/dev/shm" in social_entrypoint
+
+
+def test_offline_bundle_includes_egress_gateway_image() -> None:
+    script = (ROOT / "scripts" / "build_export_prod.sh").read_text(encoding="utf-8")
+
+    assert 'EGRESS_IMAGE="${EGRESS_IMAGE:-videoroll-egress:prod}"' in script
+    assert '-t "$EGRESS_IMAGE"' in script
+    assert 'IMAGES=("$APP_IMAGE" "$EGRESS_IMAGE" "$WEB_IMAGE" "$SOCIAL_IMAGE")' in script

@@ -11,6 +11,7 @@ fi
 
 ENV_FILE="${ENV_FILE:-deploy_compose/.env}"
 APP_IMAGE="${APP_IMAGE:-videoroll:prod}"
+EGRESS_IMAGE="${EGRESS_IMAGE:-videoroll-egress:prod}"
 WEB_IMAGE="${WEB_IMAGE:-videoroll-web:prod}"
 SOCIAL_IMAGE="${SOCIAL_IMAGE:-videoroll-social-publisher:prod}"
 INCLUDE_BASE_IMAGES="${INCLUDE_BASE_IMAGES:-1}"
@@ -46,6 +47,14 @@ docker_run build \
   -f Dockerfile \
   .
 
+echo "Building egress gateway image: $EGRESS_IMAGE"
+docker_run build \
+  -t "$EGRESS_IMAGE" \
+  --build-arg INSTALL_ASR=0 \
+  --build-arg YTDLP_VERSION="${YTDLP_VERSION:-latest}" \
+  -f Dockerfile \
+  .
+
 echo "Building web image: $WEB_IMAGE"
 docker_run build \
   -t "$WEB_IMAGE" \
@@ -59,7 +68,7 @@ docker_run build \
   -f docker/social-publisher.Dockerfile \
   .
 
-IMAGES=("$APP_IMAGE" "$WEB_IMAGE" "$SOCIAL_IMAGE")
+IMAGES=("$APP_IMAGE" "$EGRESS_IMAGE" "$WEB_IMAGE" "$SOCIAL_IMAGE")
 if [[ "$INCLUDE_BASE_IMAGES" == "1" ]]; then
   echo "Pulling base service images"
   docker_run pull redis:7
