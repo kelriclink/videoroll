@@ -6,6 +6,19 @@
 
 ---
 
+## 0. 2026-07 当前实现基线
+
+本文档保留产品能力、产物契约和任务模型。当前运行拓扑已从早期“同进程模块组装”升级为独立 Compose 进程：Orchestrator、字幕 API/worker、YouTube 接入、Bilibili 投稿 API/worker、社交发布 API/worker/scheduler、outbox dispatcher 和 egress gateway 分别运行。
+
+- 浏览器只经 Web 与 Orchestrator 访问业务能力；内部服务不公开宿主机端口。
+- 异步副作用使用 outbox/inbox、操作键、lease 和 heartbeat 恢复；发布的未知状态必须人工对账。
+- RAG/网页抓取只可经 egress gateway 出网；内部调用需要服务身份 token。
+- schema 使用 Alembic 迁移；交互式浏览器使用短期 desktop grant。
+
+实现细节以[架构指南](ARCHITECTURE.md)和[部署指南](DEPLOYMENT.md)为准。本文件中标记为“建议”或“方式 A/B”的内容是产品演进设计，不表示生产进程仍按旧单体模式运行。
+
+---
+
 ## 1. 当前显著能力
 
 当前实现已经从“普通字幕翻译流水线”升级为带可观测 RAG Agent 的视频翻译系统。重点不是把所有词都查一遍，而是在翻译前判断“哪些词确实需要外部知识”，再把可信知识注入翻译 prompt。

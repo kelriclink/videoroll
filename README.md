@@ -1,120 +1,104 @@
 # VideoRoll
 
-模块化视频处理流水线：YouTube 接入 → 语音识别/翻译 → 压制封装 → 多平台投稿。
+VideoRoll 是用于处理已获授权视频的流水线：YouTube 接入、语音识别、字幕翻译、压制封装，以及 Bilibili、抖音、小红书和快手投稿。它采用进程隔离的编排架构：浏览器只访问 Web 与 Orchestrator，任务副作用由独立 worker 和 durable outbox 处理。
 
-核心特性是 **RAG Agent 驱动的翻译知识库**：翻译每个字幕前，LLM 自动判断哪些术语需要外部查证，检索可信来源后注入翻译上下文。解决动漫、游戏实况、技术讲解等视频中“模型缺上下文”的问题。
+只可处理你拥有版权、已获授权或明确允许再分发的内容；不得用来绕过平台规则或批量搬运未授权内容。
 
----
+## 核心能力
 
-## 功能概览
+- RAG Agent 翻译：术语 gate、可信来源检索、verifier 校验和 pgvector 知识库。
+- ASR、翻译、字幕压制与自动流水线；Intel iGPU 可通过 OpenVINO 加速 ASR。
+- 受白名单和许可信息约束的 YouTube 接入。
+- Bilibili 与社交平台投稿，社交浏览器运行时与主应用隔离。
+- 管理员认证、短期 desktop grant、内部服务身份认证与审计记录。
+- outbox/inbox、租约和发布状态恢复，避免 broker 故障或 worker 重启导致重复副作用。
 
-- **RAG Agent 翻译** — 主 Agent 术语 gate → 子 Agent 并发研究（Wikipedia / 网络搜索 / 网页抓取）→ verifier 校验 → 写入 pgvector 知识库 → 精简术语卡片注入翻译 prompt
-- **多格式 ASR** — faster-whisper（CPU/OpenVINO）、OpenVINO GPU 加速，可在 Web UI 切换
-- **字幕翻译 + 压制** — 硬字幕 burn-in 或软字幕 soft-sub，多语言支持
-- **YouTube 自动流水线** — 下载 → 字幕 → 翻译 → 压制 → 可选投稿 B 站，一键完成
-- **Bilibili 投稿** — Web UI 配置 Cookie、投稿模板，支持分区/标签/封面
-- **社交平台投稿** — 独立 SAU 浏览器服务支持抖音、小红书、快手视频投稿，账号状态加密保存
-- **Web 管理面板** — 任务管理、Dashboard 资源监控、Agent 运行树、RAG 知识库管理、全局设置
-- **词典导入** — 支持 CSV、TSV、TMX、TBX、JSONL、CC-CEDICT、ECDICT 等格式，导入术语到 pgvector 知识库
+## 运行架构
 
-## 架构
+```text
+浏览器
+  │  仅访问 Web（唯一宿主机端口）
+  ▼
+web / nginx ──► orchestrator
+                    ├── subtitle-service + subtitle-worker
+                    ├── youtube-ingest
+                    ├── bilibili-publisher + publish-worker
+                    ├── social-publisher-api + worker + scheduler
+                    └── outbox-dispatcher
 
+Redis / MinIO / PostgreSQL（外部） ◄── 所有任务与产物状态
+egress-gateway（唯一允许访问公网的抓取出口）
 ```
-┌──────────────────────────────────────────────────────────┐
-│  web (React + nginx)            PostgreSQL 16+ (外部)    │
-│  └─ /api → app (FastAPI monolith)                        │
-│      ├─ orchestrator    (任务 / 资产 / 认证 / 设置)      │
-│      ├─ subtitle-service (ASR / 翻译 / RAG / 压制)      │
-│      ├─ youtube-ingest   (频道扫描 / 下载)               │
-│      └─ bilibili-publisher (投稿 / 上传)                 │
-│      + 2 Celery workers (subtitle / publish)             │
-│  social-publisher-api + worker (SAU / Patchright)         │
-│  Redis (broker)          MinIO (对象存储)                │
-└──────────────────────────────────────────────────────────┘
-```
+
+除 Web 外的服务均不发布宿主机端口；内部请求使用服务身份 token。完整说明见[架构指南](docs/ARCHITECTURE.md)。
 
 ## 环境要求
 
-- Docker Engine + Docker Compose Plugin
-- PostgreSQL 16+（需启用 `pgvector` 扩展）
-- 可访问 YouTube 的网络环境
+- Docker Engine 与 Docker Compose Plugin
+- PostgreSQL 16+，启用 `pgvector`
+- 可用的网络和对象存储凭据
+- 可选：Intel iGPU 与 `/dev/dri/renderD128`（OpenVINO ASR）
 
-可选：
-
-- Intel iGPU（用于 OpenVINO ASR / 硬件转码加速）
-
-## 快速开始
-
-### 1. 克隆仓库
+## 本地开发
 
 ```bash
 git clone git@github.com:kelriclink/videoroll.git
 cd videoroll
 git submodule update --init --recursive
-```
 
-### 2. 准备 PostgreSQL
-
-```sql
-CREATE DATABASE videoroll;
-CREATE EXTENSION IF NOT EXISTS vector;
-```
-
-### 3. 配置环境变量
-
-```bash
-cp deploy_compose/.env.example deploy_compose/.env
-# 编辑 deploy_compose/.env
-# 至少修改 DATABASE_URL 指向你的 PostgreSQL
-```
-
-关键配置：
-
-| 变量 | 说明 |
-|---|---|
-| `DATABASE_URL` | 数据库连接，Docker 环境用 `host.docker.internal` |
-| `SUBTITLE_ASR_ENGINE` | ASR 引擎：`faster-whisper`（默认）、`openvino`、`mock` |
-| `SUBTITLE_WHISPER_MODEL` | Whisper 模型：`tiny`、`base`、`small`、`medium`、`large` |
-
-完整配置见 `deploy_compose/.env.example`。
-
-### 4. Docker 部署
-
-```bash
-# 本地开发
+# 首次运行会创建带随机开发密钥的 .env
 ./scripts/dev_up.sh
 
-# 构建生产镜像
-bash scripts/build_export_prod.sh
-# 输出: videoroll-prod-bundle-<timestamp>.tar
-
-# 在目标机器导入镜像
-docker load -i videoroll-prod-bundle-*.tar
-
-# 使用 compose 启动
-docker compose -f deploy_compose/docker-compose.yml up -d
+# 检查服务与日志
+./scripts/dev_health.sh
+./scripts/dev_logs.sh
 ```
 
-### 5. 初始化
+首次打开 Web 后创建管理员账户，再在设置页配置 LLM、RAG、YouTube、投稿平台和 ASR 参数。
 
-首次访问 Web UI 会要求设置管理员密码。然后在 `Settings` 中配置：
+## 生产离线部署
 
-- **Translate** — LLM API key、翻译模型、embedding、RAG Agent 参数
-- **YouTube** — 可选代理、cookies
-- **投稿设置** — Bilibili Cookie/模板，以及抖音、小红书、快手 storage_state JSON
-- **Auto** — 自动模式默认参数（一键完成全流程）
+构建机生成完整离线包：
 
-## 文档索引
+```bash
+git submodule update --init --recursive
+ENV_FILE=/path/to/production.env INCLUDE_BASE_IMAGES=1 ./scripts/build_export_prod.sh
+```
 
-| 文档 | 说明 |
+包内包含应用、egress gateway、Web、社交发布器、Redis、MinIO 和 MinIO Client 镜像。目标机只需保留 Compose、私有 `.env` 和现有 `data/` 目录：
+
+```bash
+sha256sum -c videoroll-prod-bundle-*.tar.sha256
+docker load -i videoroll-prod-bundle-*.tar
+docker compose --env-file .env up -d --no-build
+```
+
+不要覆盖已有的 `data/minio`、`data/models`、`data/work`、`data/secrets` 或 `data/social-publisher`；数据库连接也应保留。完整上线、迁移、GPU 和回退步骤见[部署指南](docs/DEPLOYMENT.md)。
+
+## 关键生产变量
+
+| 变量 | 要求 |
 |---|---|
-| [项目规格](docs/PROJECT_SPEC.md) | 详细能力说明、模块拆分、RAG 翻译流程 |
-| [安全审计](docs/SECURITY_AUDIT.md) | 安全审计报告及改进建议 |
-| [Agent Skills](docs/AGENT_SKILLS.md) | Agent 能力包格式与自定义指南 |
-| [开发者指南](docs/DEVELOPER_GUIDE.md) | 本地开发、调试、代码组织 |
-| [远程 API](docs/REMOTE_API.md) | 远程自动提交 API 说明 |
-| [社交平台投稿](docs/social-publisher.md) | SAU Docker 部署、账号导入和安全状态说明 |
+| `DATABASE_URL` | 指向外部 PostgreSQL，生产已有连接应保持不变。 |
+| `S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY` | 随机、私有的 MinIO/S3 凭据。 |
+| `INTERNAL_API_SECRET` | 随机且非空，用于内部服务身份与管理员 cookie 密钥派生。 |
+| `ADMIN_BOOTSTRAP_SECRET` | 随机且非空，仅用于首次管理员初始化。 |
+| `PUBLISH_ADDR` | Web 唯一宿主机绑定地址；通常先使用 `127.0.0.1` 并由反向代理公开。 |
+| `SUBTITLE_ASR_ENGINE=openvino` | Intel GPU ASR 使用 OpenVINO。 |
+| `SUBTITLE_OPENVINO_DEVICE=GPU` | Intel GPU OpenVINO 设备名。 |
+| `INTEL_GPU_RENDER_GID` | 宿主机 `/dev/dri/renderD128` 的组 ID。 |
 
-## 合规声明
+从[.env.example](.env.example)开始配置；真实密钥、Cookie、数据库密码和 `data/secrets/fernet.key` 永远不能提交到 Git。
 
-本项目仅用于处理你拥有版权、已获授权、或明确允许再分发的视频内容。不要将其用于批量搬运、绕过平台限制、或处理无授权内容。
+## 文档
+
+| 文档 | 内容 |
+|---|---|
+| [架构指南](docs/ARCHITECTURE.md) | 进程边界、网络、内部认证、outbox/inbox 与恢复语义。 |
+| [部署指南](docs/DEPLOYMENT.md) | 在线/离线部署、迁移、Intel GPU、验证与回退。 |
+| [开发者指南](docs/DEVELOPER_GUIDE.md) | 代码组织、调试与测试命令。 |
+| [远程 API](docs/REMOTE_API.md) | Bearer `POST`、JSON 与幂等键合约。 |
+| [社交平台投稿](docs/social-publisher.md) | SAU、账号导入和受控浏览器登录。 |
+| [安全审计](docs/SECURITY_AUDIT.md) | 安全上线边界与历史审计记录。 |
+| [项目规格](docs/PROJECT_SPEC.md) | 产品能力、产物契约与任务模型。 |
+| [Agent Skills](docs/AGENT_SKILLS.md) | RAG Agent skill 能力包格式。 |
