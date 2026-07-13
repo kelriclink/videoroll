@@ -92,6 +92,12 @@ from videoroll.apps.orchestrator_api.youtube_downloader import (
     pick_preferred_youtube_subtitle,
 )
 from videoroll.apps.subtitle_service.render_queue_store import TASK_QUEUE_SETTINGS_KEY, get_task_queue_settings
+from videoroll.apps.subtitle_service.worker_concurrency import (
+    JobLeaseHeartbeat,
+    acquire_job_lease,
+    recover_expired_leases,
+    release_job_lease,
+)
 from videoroll.apps.youtube_settings_store import (
     get_youtube_cookies_txt,
     get_youtube_settings,
@@ -262,6 +268,7 @@ TASK_QUEUE_LOCK_OWNER = "subtitle_service.task_queue"
 _TASK_QUEUE_LOCK_TTL = timedelta(seconds=300)
 _TASK_QUEUE_HEARTBEAT_INTERVAL_SECONDS = 30.0
 _TASK_QUEUE_REQUEUE_COUNTDOWN_SECONDS = 10
+_JOB_LEASE_TTL_SECONDS = 900
 
 
 def _task_queue_expires_at(now: datetime) -> datetime:
@@ -731,101 +738,14 @@ def _fallback_bilibili_tags(*, title: str, summary: str, transcript: str, n: int
     return out[:n]
 
 
-def _recover_interrupted_subtitle_jobs() -> None:
-    """
-    Best-effort recovery for jobs that were marked as running but got interrupted
-    by an external restart/crash (e.g. host reboot, container restart, SIGKILL).
-
-    Strategy:
-      - Put the old running job back into the queue with resume enabled.
-      - Release the task queue lock so beat can schedule it again.
-    """
-    _ensure_db()
-    db = _db()
-    recovered = 0
-    try:
-        running = (
-            db.query(SubtitleJob)
-            .filter(SubtitleJob.status == SubtitleJobStatus.running)
-            .order_by(SubtitleJob.updated_at.asc())
-            .with_for_update(skip_locked=True)
-            .all()
-        )
-        for old in running:
-            try:
-                req = dict(old.request_json) if isinstance(old.request_json, dict) else {}
-                req["resume"] = True
-                old.request_json = req
-                old.status = SubtitleJobStatus.queued
-                old.progress = 0
-                old.error_message = _task_queue_join_message(
-                    old.error_message,
-                    "Detected worker restart/crash while this subtitle job was running; requeued with resume enabled.",
-                )
-                db.add(old)
-                task = db.get(Task, old.task_id)
-                if task and task.status not in {TaskStatus.published, TaskStatus.canceled}:
-                    if task.lock_owner == TASK_QUEUE_LOCK_OWNER:
-                        _task_queue_unlock(task)
-                    if task.error_code == "SUBTITLE_CRASHED":
-                        task.error_code = None
-                    if task.error_message == "subtitle job crashed; manual resume required":
-                        task.error_message = None
-                    db.add(task)
-                db.commit()
-                recovered += 1
-            except Exception:
-                logger.exception("failed to recover interrupted subtitle job (job_id=%s)", getattr(old, "id", None))
-                db.rollback()
-        if recovered:
-            logger.warning("recovered %s interrupted subtitle job(s)", recovered)
-    finally:
-        db.close()
-
-
-def _recover_interrupted_render_jobs() -> None:
-    _ensure_db()
-    db = _db()
-    recovered = 0
-    try:
-        running = (
-            db.query(RenderJob)
-            .filter(RenderJob.status == RenderJobStatus.running)
-            .order_by(RenderJob.updated_at.asc())
-            .with_for_update(skip_locked=True)
-            .all()
-        )
-        for j in running:
-            try:
-                msg = (j.error_message or "").strip()
-                detail = "检测到 Worker 重启/崩溃：ffmpeg 压制中断。已自动重新排队。"
-                j.error_message = f"{msg}\n{detail}" if msg else detail
-                j.retry_count = int(j.retry_count or 0) + 1
-                j.status = RenderJobStatus.queued
-                j.progress = 0
-                j.started_at = None
-                j.finished_at = None
-                db.add(j)
-                db.commit()
-                recovered += 1
-            except Exception:
-                logger.exception("failed to recover render job (render_job_id=%s)", getattr(j, "id", None))
-                db.rollback()
-        if recovered:
-            logger.warning("recovered %s interrupted render job(s)", recovered)
-    finally:
-        db.close()
-
-
 @worker_init.connect
 def _on_worker_init(**_kwargs: Any) -> None:
-    # Only runs in the celery worker process.
+    """Initialize runtime state and let the scheduler recover expired leases."""
     try:
-        _recover_interrupted_subtitle_jobs()
-        _recover_interrupted_render_jobs()
+        _ensure_db()
         celery_app.send_task("subtitle_service.task_queue_tick", args=[], queue="subtitle")
     except Exception:
-        logger.exception("subtitle job recovery failed")
+        logger.exception("subtitle worker initialization failed")
 
 
 @celery_app.task(name="subtitle_service.process_job", bind=True, acks_late=True, reject_on_worker_lost=True)
@@ -839,6 +759,8 @@ def process_job(self: Any, job_id: str) -> dict[str, str]:
     log_path: Path | None = None
     log_key: str | None = None
     hb: _TaskQueueHeartbeat | None = None
+    job_hb: JobLeaseHeartbeat | None = None
+    lease_owner: str | None = None
     work_root: Path | None = None
     try:
         job = db.get(SubtitleJob, jid)
@@ -859,11 +781,13 @@ def process_job(self: Any, job_id: str) -> dict[str, str]:
             return {"status": "error", "detail": "task not found"}
 
         now = _now()
+        if job.status == SubtitleJobStatus.running and job.lease_until is not None and job.lease_until > now:
+            return {"status": "in_progress", "detail": "job has a live worker lease"}
         if task.lock_owner != TASK_QUEUE_LOCK_OWNER:
-            # Not claimed by the task-level scheduler; put it back and wait.
-            job.status = SubtitleJobStatus.queued
-            db.add(job)
-            db.commit()
+            # Do not rewrite an existing running row here.  Only the lease
+            # recovery scheduler may decide that a worker is dead.
+            if job.status == SubtitleJobStatus.running:
+                return {"status": "in_progress", "detail": "running job awaits lease recovery"}
             celery_app.send_task(
                 "subtitle_service.task_queue_tick",
                 args=[],
@@ -879,10 +803,18 @@ def process_job(self: Any, job_id: str) -> dict[str, str]:
         job.status = SubtitleJobStatus.running
         job.progress = max(int(job.progress or 0), 2)
         db.add(job)
+        db.flush()
+        candidate_owner = f"subtitle_service.process_job:{os.getpid()}:{uuid.uuid4().hex[:12]}"
+        if not acquire_job_lease(db, job, candidate_owner, _JOB_LEASE_TTL_SECONDS):
+            db.rollback()
+            return {"status": "in_progress", "detail": "job lease is held by another worker"}
         db.commit()
+        lease_owner = candidate_owner
 
         hb = _TaskQueueHeartbeat(task.id)
         hb.start()
+        job_hb = JobLeaseHeartbeat(lambda: _db(), job.id, lease_owner, _JOB_LEASE_TTL_SECONDS)
+        job_hb.start()
 
         req = dict(job.request_json) if isinstance(job.request_json, dict) else {}
         input_key = (req.get("input") or {}).get("key")
@@ -1647,6 +1579,11 @@ def process_job(self: Any, job_id: str) -> dict[str, str]:
         celery_app.send_task("subtitle_service.task_queue_tick", args=[], queue="subtitle")
         return {"status": "ok", "detail": "render queued"}
     except Retry:
+        retry_job = db.get(SubtitleJob, jid)
+        if retry_job and retry_job.status == SubtitleJobStatus.running:
+            retry_job.status = SubtitleJobStatus.queued
+            db.add(retry_job)
+            db.commit()
         raise
     except Exception as e:
         job = db.get(SubtitleJob, uuid.UUID(job_id))
@@ -1670,8 +1607,20 @@ def process_job(self: Any, job_id: str) -> dict[str, str]:
         celery_app.send_task("subtitle_service.task_queue_tick", args=[], queue="subtitle")
         return {"status": "error", "detail": str(e)}
     finally:
+        if job_hb is not None:
+            job_hb.stop()
         if hb is not None:
             hb.stop()
+        if lease_owner is not None:
+            lease_db = _db()
+            try:
+                release_job_lease(lease_db, jid, lease_owner)
+                lease_db.commit()
+            except Exception:
+                lease_db.rollback()
+                logger.exception("failed to release subtitle job lease (job_id=%s)", jid)
+            finally:
+                lease_db.close()
         db.close()
         _cleanup_local_work_root(work_root)
 
@@ -1707,8 +1656,17 @@ def task_queue_tick() -> dict[str, Any]:
             max_conc = 1
         if max_conc < 0:
             max_conc = 0
+        recovery = recover_expired_leases(db, now=now, limit=100)
+        recovered_subtitle = recovery.subtitle_requeued
+        recovered_render = recovery.render_requeued
         if max_conc == 0:
-            return {"status": "paused", "max_concurrency": str(max_conc)}
+            db.commit()
+            return {
+                "status": "paused",
+                "max_concurrency": str(max_conc),
+                "recovered_subtitle": str(recovered_subtitle),
+                "recovered_render": str(recovered_render),
+            }
 
         # Clear expired locks to avoid permanent stalls after crashes.
         try:
@@ -1726,98 +1684,6 @@ def task_queue_tick() -> dict[str, Any]:
             Task.lock_until.is_(None),
             Task.lock_until <= now,
         )
-
-        # Recover jobs that were actively running but lost their task slot/heartbeat.
-        # This is the "ghost running" case: task disappears from the queue while the job row
-        # still says running forever.
-        orphaned_subtitle = (
-            db.query(SubtitleJob)
-            .join(Task, Task.id == SubtitleJob.task_id)
-            .filter(SubtitleJob.status == SubtitleJobStatus.running, unlocked)
-            .order_by(SubtitleJob.updated_at.asc(), SubtitleJob.created_at.asc())
-            .with_for_update(skip_locked=True)
-            .all()
-        )
-        for j in orphaned_subtitle:
-            detail = "检测到任务队列锁已丢失：subtitle job 已自动按 resume 方式重新排队。"
-            req = dict(j.request_json) if isinstance(j.request_json, dict) else {}
-            req["resume"] = True
-            j.request_json = req
-            j.error_message = _task_queue_join_message(j.error_message, detail)
-            j.status = SubtitleJobStatus.queued
-            j.progress = 0
-            db.add(j)
-            recovered_subtitle += 1
-
-        orphaned_render = (
-            db.query(RenderJob)
-            .join(Task, Task.id == RenderJob.task_id)
-            .filter(RenderJob.status == RenderJobStatus.running, unlocked)
-            .order_by(RenderJob.updated_at.asc(), RenderJob.created_at.asc())
-            .with_for_update(skip_locked=True)
-            .all()
-        )
-        for j in orphaned_render:
-            detail = "检测到任务队列锁已丢失：render job 已自动重新排队。"
-            j.error_message = _task_queue_join_message(j.error_message, detail)
-            j.retry_count = int(j.retry_count or 0) + 1
-            j.status = RenderJobStatus.queued
-            j.progress = 0
-            j.started_at = None
-            j.finished_at = None
-            db.add(j)
-            recovered_render += 1
-
-        # Recover render jobs that were marked as running by the scheduler but never claimed by a worker.
-        cutoff = now - timedelta(seconds=60)
-        # Subtitle jobs: scheduler sets progress=1; worker bumps it to >=2 once claimed.
-        stuck_subtitle = (
-            db.query(SubtitleJob)
-            .filter(
-                SubtitleJob.status == SubtitleJobStatus.running,
-                SubtitleJob.progress <= 1,
-                # If the worker actually started, it sets logs_key very early. Treat jobs without logs_key
-                # as "scheduler started but worker never claimed".
-                SubtitleJob.logs_key.is_(None),
-                SubtitleJob.updated_at.is_not(None),
-                SubtitleJob.updated_at < cutoff,
-            )
-            .order_by(SubtitleJob.updated_at.asc(), SubtitleJob.created_at.asc())
-            .with_for_update(skip_locked=True)
-            .all()
-        )
-        for j in stuck_subtitle:
-            msg = (j.error_message or "").strip()
-            detail = "检测到疑似 Worker 未消费：subtitle job 长时间停留在 running(1%)。已自动重新排队。"
-            j.error_message = f"{msg}\n{detail}" if msg else detail
-            j.status = SubtitleJobStatus.queued
-            j.progress = 0
-            db.add(j)
-            recovered_subtitle += 1
-
-        stuck = (
-            db.query(RenderJob)
-            .filter(
-                RenderJob.status == RenderJobStatus.running,
-                RenderJob.progress <= 1,
-                RenderJob.started_at.is_not(None),
-                RenderJob.started_at < cutoff,
-            )
-            .order_by(RenderJob.started_at.asc(), RenderJob.created_at.asc())
-            .with_for_update(skip_locked=True)
-            .all()
-        )
-        for j in stuck:
-            msg = (j.error_message or "").strip()
-            detail = "检测到疑似 Worker 未消费：render job 长时间停留在 running(1%)。已自动重新排队。"
-            j.error_message = f"{msg}\n{detail}" if msg else detail
-            j.retry_count = int(j.retry_count or 0) + 1
-            j.status = RenderJobStatus.queued
-            j.progress = 0
-            j.started_at = None
-            j.finished_at = None
-            db.add(j)
-            recovered_render += 1
 
         locked_tasks = (
             db.query(Task)
@@ -1844,10 +1710,6 @@ def task_queue_tick() -> dict[str, Any]:
                 .first()
             )
             if rj:
-                rj.status = RenderJobStatus.running
-                rj.progress = max(int(rj.progress or 0), 1)
-                rj.started_at = now
-                db.add(rj)
                 to_start.append(("render", str(rj.id)))
                 started_render += 1
                 continue
@@ -1860,9 +1722,6 @@ def task_queue_tick() -> dict[str, Any]:
                 .first()
             )
             if sj:
-                sj.status = SubtitleJobStatus.running
-                sj.progress = max(int(sj.progress or 0), 1)
-                db.add(sj)
                 to_start.append(("subtitle", str(sj.id)))
                 started_subtitle += 1
 
@@ -1896,11 +1755,7 @@ def task_queue_tick() -> dict[str, Any]:
                     continue
                 task.lock_owner = TASK_QUEUE_LOCK_OWNER
                 task.lock_until = _task_queue_expires_at(now)
-                rj.status = RenderJobStatus.running
-                rj.progress = max(int(rj.progress or 0), 1)
-                rj.started_at = now
                 db.add(task)
-                db.add(rj)
                 to_start.append(("render", str(rj.id)))
                 started_render += 1
                 running_tasks += 1
@@ -1934,10 +1789,7 @@ def task_queue_tick() -> dict[str, Any]:
 
             task.lock_owner = TASK_QUEUE_LOCK_OWNER
             task.lock_until = _task_queue_expires_at(now)
-            sj.status = SubtitleJobStatus.running
-            sj.progress = max(int(sj.progress or 0), 1)
             db.add(task)
-            db.add(sj)
             to_start.append(("subtitle", str(sj.id)))
             started_subtitle += 1
             running_tasks += 1
@@ -2032,6 +1884,8 @@ def process_render_job(self: Any, render_job_id: str) -> dict[str, Any]:
     log_path: Path | None = None
     log_key: str | None = None
     hb: _TaskQueueHeartbeat | None = None
+    job_hb: JobLeaseHeartbeat | None = None
+    lease_owner: str | None = None
     work_root: Path | None = None
     try:
         rj = db.get(RenderJob, rid)
@@ -2048,14 +1902,13 @@ def process_render_job(self: Any, render_job_id: str) -> dict[str, Any]:
             return {"status": "error", "detail": "task not found"}
 
         now = _now()
+        if rj.status == RenderJobStatus.running and rj.lease_until is not None and rj.lease_until > now:
+            return {"status": "in_progress", "detail": "render job has a live worker lease"}
         if task.lock_owner != TASK_QUEUE_LOCK_OWNER:
-            # Not claimed by the task-level scheduler; put it back and wait.
-            if rj.status != RenderJobStatus.succeeded:
-                rj.status = RenderJobStatus.queued
-                rj.started_at = None
-                rj.progress = 0
-                db.add(rj)
-                db.commit()
+            # As with subtitle work, only expired leases may move a running
+            # render back to queued.
+            if rj.status == RenderJobStatus.running:
+                return {"status": "in_progress", "detail": "running render awaits lease recovery"}
             celery_app.send_task(
                 "subtitle_service.task_queue_tick",
                 args=[],
@@ -2068,10 +1921,7 @@ def process_render_job(self: Any, render_job_id: str) -> dict[str, Any]:
             db.add(task)
             db.commit()
 
-        hb = _TaskQueueHeartbeat(task.id)
-        hb.start()
-
-        # Best-effort: if called directly, try to claim it.
+        # Best-effort: if called directly, atomically claim it before render work.
         if rj.status == RenderJobStatus.queued:
             rj.status = RenderJobStatus.running
             rj.started_at = _now()
@@ -2084,7 +1934,18 @@ def process_render_job(self: Any, render_job_id: str) -> dict[str, Any]:
         # Mark as claimed by a worker ASAP so the scheduler can detect orphaned jobs.
         rj.progress = max(int(rj.progress or 0), 2)
         db.add(rj)
+        db.flush()
+        candidate_owner = f"subtitle_service.process_render_job:{os.getpid()}:{uuid.uuid4().hex[:12]}"
+        if not acquire_job_lease(db, rj, candidate_owner, _JOB_LEASE_TTL_SECONDS):
+            db.rollback()
+            return {"status": "in_progress", "detail": "render job lease is held by another worker"}
         db.commit()
+        lease_owner = candidate_owner
+
+        hb = _TaskQueueHeartbeat(task.id)
+        hb.start()
+        job_hb = JobLeaseHeartbeat(lambda: _db(), rj.id, lease_owner, _JOB_LEASE_TTL_SECONDS)
+        job_hb.start()
 
         req = rj.request_json if isinstance(rj.request_json, dict) else {}
         input_key = str(req.get("input_key") or "").strip()
@@ -2301,6 +2162,11 @@ def process_render_job(self: Any, render_job_id: str) -> dict[str, Any]:
         celery_app.send_task("subtitle_service.task_queue_tick", args=[], queue="subtitle")
         return {"status": "ok"}
     except Retry:
+        retry_job = db.get(RenderJob, rid)
+        if retry_job and retry_job.status == RenderJobStatus.running:
+            retry_job.status = RenderJobStatus.queued
+            db.add(retry_job)
+            db.commit()
         raise
     except Exception as e:
         rj = db.get(RenderJob, rid)
@@ -2331,8 +2197,20 @@ def process_render_job(self: Any, render_job_id: str) -> dict[str, Any]:
         celery_app.send_task("subtitle_service.task_queue_tick", args=[], queue="subtitle")
         return {"status": "error", "detail": str(e)}
     finally:
+        if job_hb is not None:
+            job_hb.stop()
         if hb is not None:
             hb.stop()
+        if lease_owner is not None:
+            lease_db = _db()
+            try:
+                release_job_lease(lease_db, rid, lease_owner)
+                lease_db.commit()
+            except Exception:
+                lease_db.rollback()
+                logger.exception("failed to release render job lease (job_id=%s)", rid)
+            finally:
+                lease_db.close()
         db.close()
         _cleanup_local_work_root(work_root)
 

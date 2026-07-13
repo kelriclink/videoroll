@@ -11,6 +11,7 @@ from sqlalchemy import func
 
 from videoroll.apps.orchestrator_api.services import asset_service, maintenance_service, youtube_service
 from videoroll.apps.orchestrator_api.storage_retention_store import get_storage_retention_settings
+from videoroll.apps.subtitle_service.worker_concurrency import RecoverySummary, recover_expired_leases
 from videoroll.apps.youtube_ingest.source_service import (
     DEFAULT_SOURCE_SCAN_LOCK_TTL_SECONDS,
     get_due_youtube_source_ids,
@@ -33,6 +34,7 @@ class OrchestratorScheduler:
         self._source_scan_stop = threading.Event()
         self._threads: list[threading.Thread] = []
         self._cleanup_interval_seconds = int(os.getenv("STORAGE_CLEANUP_INTERVAL_SECONDS", "3600") or "3600")
+        self._lease_recovery_interval_seconds = int(os.getenv("WORKER_LEASE_RECOVERY_INTERVAL_SECONDS", "30") or "30")
         self._home_scan_tick_seconds = int(os.getenv("YOUTUBE_HOME_SCAN_TICK_SECONDS", "30") or "30")
         self._source_scan_tick_seconds = int(os.getenv("YOUTUBE_SOURCE_SCAN_TICK_SECONDS", "30") or "30")
         self._shutdown_timeout_seconds = max(
@@ -60,6 +62,7 @@ class OrchestratorScheduler:
             self._start_thread("videoroll-youtube-home-scan", self._home_scan_loop),
             self._start_thread("videoroll-youtube-source-scan", self._source_scan_loop),
             self._start_thread("videoroll-workdir-startup-cleanup", self._workdir_startup_cleanup),
+            self._start_thread("videoroll-worker-lease-recovery", self._worker_lease_recovery_loop),
         ]
 
     def stop(self) -> None:
@@ -154,6 +157,34 @@ class OrchestratorScheduler:
             except Exception:
                 logger.exception("storage cleanup loop failed")
             self._cleanup_stop.wait(timeout=max(30, self._cleanup_interval_seconds))
+
+    def _recover_worker_leases_once(self) -> RecoverySummary:
+        """Repair only jobs whose database owner lease actually expired."""
+        session_local = get_sessionmaker(self.settings.database_url)
+        db = session_local()
+        try:
+            result = recover_expired_leases(db, now=datetime.now(timezone.utc), limit=100)
+            db.commit()
+            return result
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+
+    def _worker_lease_recovery_loop(self) -> None:
+        while not self._cleanup_stop.is_set():
+            try:
+                result = self._recover_worker_leases_once()
+                if result.total_recovered:
+                    logger.warning(
+                        "recovered expired worker leases: subtitle=%s render=%s",
+                        result.subtitle_requeued,
+                        result.render_requeued,
+                    )
+            except Exception:
+                logger.exception("worker lease recovery loop failed")
+            self._cleanup_stop.wait(timeout=max(5, self._lease_recovery_interval_seconds))
 
     def _home_scan_loop(self) -> None:
         while not self._home_scan_stop.is_set():

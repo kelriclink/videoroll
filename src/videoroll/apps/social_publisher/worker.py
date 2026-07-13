@@ -27,6 +27,7 @@ from videoroll.apps.outbox.worker_inbox import (
     finish_operation,
     release_operation,
 )
+from videoroll.apps.subtitle_service.worker_concurrency import JobLeaseHeartbeat, acquire_job_lease, release_job_lease
 from videoroll.config import get_social_publisher_settings
 from videoroll.db.auto_migrate import auto_migrate
 from videoroll.db.models import Account, Platform, PublishJob, PublishState, Task, TaskStatus
@@ -36,6 +37,7 @@ from videoroll.storage.s3 import S3Store
 
 settings = get_social_publisher_settings()
 logger = logging.getLogger(__name__)
+_JOB_LEASE_TTL_SECONDS = 1800
 celery_app = Celery("social_publisher", broker=settings.redis_url, backend=settings.redis_url)
 celery_app.conf.beat_schedule = {
     "social-publisher-mark-stale": {
@@ -179,12 +181,24 @@ def _process_job_impl(self, job_id: str) -> dict[str, Any]:
     job: PublishJob | None = None
     task: Task | None = None
     work_dir: Path | None = None
+    job_hb: JobLeaseHeartbeat | None = None
+    lease_owner: str | None = None
     try:
         job = db.get(PublishJob, uuid.UUID(job_id))
         if not job:
             return {"status": "not_found"}
         if job.state in {PublishState.submitted, PublishState.published, PublishState.unknown, PublishState.failed}:
             return {"status": "skipped", "state": job.state.value}
+
+        candidate_owner = f"social_publisher.process_job:{uuid.uuid4().hex[:12]}"
+        if not acquire_job_lease(db, job, candidate_owner, _JOB_LEASE_TTL_SECONDS):
+            db.rollback()
+            return {"status": "in_progress", "detail": "publish job lease is held by another worker"}
+        db.commit()
+        lease_owner = candidate_owner
+        job_hb = JobLeaseHeartbeat(lambda: _db(), job.id, lease_owner, _JOB_LEASE_TTL_SECONDS)
+        job_hb.start()
+
         task = db.get(Task, job.task_id)
         account = db.get(Account, job.account_id) if job.account_id else None
         if not account or not account.is_active:
@@ -279,6 +293,8 @@ def _process_job_impl(self, job_id: str) -> dict[str, Any]:
             return {"status": job.state.value, "detail": _clean_message(exc)}
         return {"status": "error", "detail": _clean_message(exc)}
     finally:
+        if job_hb is not None:
+            job_hb.stop()
         if lock is not None:
             try:
                 lock.release()
@@ -286,6 +302,16 @@ def _process_job_impl(self, job_id: str) -> dict[str, Any]:
                 pass
         if work_dir is not None:
             shutil.rmtree(work_dir, ignore_errors=True)
+        if lease_owner is not None and job is not None:
+            lease_db = _db()
+            try:
+                release_job_lease(lease_db, job.id, lease_owner)
+                lease_db.commit()
+            except Exception:
+                lease_db.rollback()
+                logger.exception("failed to release social publish job lease (job_id=%s)", job.id)
+            finally:
+                lease_db.close()
         db.close()
 
 

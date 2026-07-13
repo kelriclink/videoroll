@@ -37,6 +37,7 @@ from videoroll.apps.outbox.worker_inbox import (
     finish_operation,
     release_operation,
 )
+from videoroll.apps.subtitle_service.worker_concurrency import JobLeaseHeartbeat, acquire_job_lease, release_job_lease
 from videoroll.config import get_bilibili_publisher_settings, get_subtitle_settings
 from videoroll.db.base import Base
 from videoroll.db.auto_migrate import auto_migrate
@@ -62,6 +63,7 @@ celery_app.conf.update(
     timezone="UTC",
     enable_utc=True,
 )
+_JOB_LEASE_TTL_SECONDS = 1800
 
 
 def _db() -> Session:
@@ -638,18 +640,29 @@ def _process_job_impl(self, job_id: str) -> dict[str, Any]:
     upload_throttle: dict[str, Any] | None = None
     submit_throttle: dict[str, Any] | None = None
     job_lock: Any = None
+    job_hb: JobLeaseHeartbeat | None = None
+    lease_owner: str | None = None
     try:
         job_uuid = uuid.UUID(job_id)
-        job_lock = _try_acquire_publish_job_lock(job_id)
-        if job_lock is False:
-            return {"status": "skipped", "detail": "publish job already running"}
-
         job = db.get(PublishJob, job_uuid)
         if not job:
             return {"status": "not_found"}
 
         if job.state in (PublishState.published, PublishState.failed):
             return {"status": "skipped", "state": job.state.value}
+
+        candidate_owner = f"bilibili_publisher.process_job:{os.getpid()}:{uuid.uuid4().hex[:12]}"
+        if not acquire_job_lease(db, job, candidate_owner, _JOB_LEASE_TTL_SECONDS):
+            db.rollback()
+            return {"status": "in_progress", "detail": "publish job lease is held by another worker"}
+        db.commit()
+        lease_owner = candidate_owner
+        job_hb = JobLeaseHeartbeat(lambda: _db(), job.id, lease_owner, _JOB_LEASE_TTL_SECONDS)
+        job_hb.start()
+
+        job_lock = _try_acquire_publish_job_lock(job_id)
+        if job_lock is False:
+            return {"status": "skipped", "detail": "publish job already running"}
 
         task = db.get(Task, job.task_id)
         if not task:
@@ -1074,11 +1087,23 @@ def _process_job_impl(self, job_id: str) -> dict[str, Any]:
             pass
         return {"status": "error", "detail": str(e)}
     finally:
+        if job_hb is not None:
+            job_hb.stop()
         if job_lock not in (None, False):
             try:
                 job_lock.release()
             except Exception:
                 pass
+        if lease_owner is not None and job_uuid is not None:
+            lease_db = _db()
+            try:
+                release_job_lease(lease_db, job_uuid, lease_owner)
+                lease_db.commit()
+            except Exception:
+                lease_db.rollback()
+                logger.exception("failed to release Bilibili publish job lease (job_id=%s)", job_uuid)
+            finally:
+                lease_db.close()
         db.close()
 
 
