@@ -12,6 +12,8 @@ async def main() -> None:
             channel="chrome",
             args=["--no-sandbox", "--disable-blink-features=AutomationControlled"],
         )
+        page = await browser.new_page()
+        await page.goto("about:blank")
         print(f"social-publisher browser compatibility OK: {browser.version}")
         await browser.close()
 

@@ -3,7 +3,6 @@ FROM python:3.12-slim
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
-    HOME=/tmp \
     SAU_RUNTIME_DIR=/opt/social-auto-upload \
     SAU_COOKIES_DIR=/opt/social-auto-upload/cookies \
     DISPLAY=:99 \
@@ -37,14 +36,17 @@ RUN cp /opt/social-auto-upload/conf.example.py /opt/social-auto-upload/conf.py \
 
 COPY docker/social-publisher-entrypoint.sh /app/docker/social-publisher-entrypoint.sh
 COPY docker/verify-social-browser.py /app/docker/verify-social-browser.py
-RUN chmod +x /app/docker/social-publisher-entrypoint.sh \
-    && python /app/docker/verify-social-browser.py
+RUN chmod +x /app/docker/social-publisher-entrypoint.sh
 
 RUN useradd --create-home --uid 10001 videoroll \
     && chown -R videoroll:videoroll /ms-playwright /work/social-publisher /opt/social-auto-upload \
-    && install -d --owner=videoroll --group=videoroll --mode=0700 /secrets /tmp/videoroll-vnc
+    && install -d --owner=videoroll --group=videoroll --mode=0700 /secrets /tmp/videoroll-vnc \
+    && install -d --owner=videoroll --group=videoroll --mode=0700 /tmp/videoroll-home
 
+ENV HOME=/tmp/videoroll-home
 USER videoroll
+
+RUN python /app/docker/verify-social-browser.py
 
 ENTRYPOINT ["/app/docker/social-publisher-entrypoint.sh"]
 CMD ["uvicorn", "videoroll.apps.social_publisher.main:app", "--host", "0.0.0.0", "--port", "8010"]

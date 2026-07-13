@@ -12,6 +12,19 @@ def test_social_publisher_image_provides_chrome_compatibility_and_novnc() -> Non
     assert (ROOT / "docker" / "social-publisher-entrypoint.sh").exists()
 
 
+def test_browser_smoke_runs_as_runtime_user_with_private_home() -> None:
+    dockerfile = (ROOT / "docker" / "social-publisher.Dockerfile").read_text(encoding="utf-8")
+    verifier = (ROOT / "docker" / "verify-social-browser.py").read_text(encoding="utf-8")
+
+    assert "HOME=/tmp/videoroll-home" in dockerfile
+    assert "install -d --owner=videoroll --group=videoroll --mode=0700 /tmp/videoroll-home" in dockerfile
+    assert dockerfile.index("USER videoroll") < dockerfile.index(
+        "RUN python /app/docker/verify-social-browser.py"
+    )
+    assert "await browser.new_page()" in verifier
+    assert 'await page.goto("about:blank")' in verifier
+
+
 def test_worker_starts_display_stack_and_web_proxies_its_novnc_desktop() -> None:
     dockerfile = (ROOT / "docker" / "social-publisher.Dockerfile").read_text(encoding="utf-8")
     entrypoint = (ROOT / "docker" / "social-publisher-entrypoint.sh").read_text(encoding="utf-8")
