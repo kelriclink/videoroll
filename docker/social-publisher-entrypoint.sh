@@ -33,7 +33,7 @@ vnc_password_secret_file="$(mktemp "$vnc_password_dir/bridge-password.XXXXXX")"
 vnc_password="$(dd if=/dev/urandom bs=12 count=1 2>/dev/null | base64 | tr -d '\n' | cut -c1-8)"
 printf '%s' "$vnc_password" >"$vnc_password_secret_file"
 chmod 600 "$vnc_password_secret_file"
-printf '%s\n%s\n' "$vnc_password" "$vnc_password" | x11vnc -storepasswd "$vnc_password_file" >/tmp/x11vnc-password.log 2>&1
+x11vnc -storepasswd "$vnc_password" "$vnc_password_file" >/tmp/x11vnc-password.log 2>&1
 unset vnc_password
 chmod 600 "$vnc_password_file"
 x11vnc -display "$display" -forever -shared -rfbauth "$vnc_password_file" -localhost -rfbport 5900 >/tmp/x11vnc.log 2>&1 &

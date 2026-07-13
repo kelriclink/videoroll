@@ -79,6 +79,17 @@ def _ensure_tasks_lock_columns(engine: Engine) -> None:
         logger.warning("auto-migrated DB: added tasks.lock_until")
 
 
+def _ensure_app_settings_version_column(engine: Engine) -> None:
+    insp = inspect(engine)
+    if "app_settings" not in set(insp.get_table_names()):
+        return
+
+    columns = {column.get("name") for column in insp.get_columns("app_settings")}
+    if "version" not in columns:
+        _add_column(engine, "app_settings", "version", "INTEGER NOT NULL DEFAULT 1")
+        logger.warning("auto-migrated DB: added app_settings.version")
+
+
 def _ensure_tasks_publish_batch_columns(engine: Engine) -> None:
     insp = inspect(engine)
     if "tasks" not in set(insp.get_table_names()):
@@ -645,6 +656,7 @@ def auto_migrate_engine(engine: Engine) -> None:
     """
     with _auto_migrate_lock(engine):
         _ensure_postgres_enum_values(engine)
+        _ensure_app_settings_version_column(engine)
         _ensure_tasks_lock_columns(engine)
         _ensure_tasks_publish_batch_columns(engine)
         _ensure_youtube_sources_columns(engine)

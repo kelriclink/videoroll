@@ -46,6 +46,13 @@ def test_nginx_authorizes_every_novnc_request_and_vnc_uses_a_tmpfs_password_file
     assert "-rfbauth" in entrypoint
 
 
+def test_vnc_password_hash_generation_is_non_interactive() -> None:
+    entrypoint = (ROOT / "docker" / "social-publisher-entrypoint.sh").read_text(encoding="utf-8")
+
+    assert 'x11vnc -storepasswd "$vnc_password" "$vnc_password_file"' in entrypoint
+    assert 'printf \'%s\\n%s\\n\' "$vnc_password" "$vnc_password" | x11vnc' not in entrypoint
+
+
 def test_compose_passes_douyin_headless_cookie_check_setting() -> None:
     for relative_path in ("compose.yml", "docker-compose.yml", "fromprod/docker-compose.yml"):
         compose = (ROOT / relative_path).read_text(encoding="utf-8")
