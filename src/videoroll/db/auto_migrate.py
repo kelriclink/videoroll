@@ -90,6 +90,41 @@ def _ensure_app_settings_version_column(engine: Engine) -> None:
         logger.warning("auto-migrated DB: added app_settings.version")
 
 
+def _ensure_job_lease_columns(engine: Engine) -> None:
+    insp = inspect(engine)
+    tables = set(insp.get_table_names())
+    lease_until_type = "TIMESTAMPTZ" if (engine.dialect.name or "").lower() == "postgresql" else "TIMESTAMP"
+    required_columns = {
+        "lease_owner": "VARCHAR(128)",
+        "lease_until": lease_until_type,
+        "heartbeat_at": lease_until_type,
+        "operation_key": "VARCHAR(255)",
+    }
+
+    for table_name in ("subtitle_jobs", "render_jobs", "publish_jobs"):
+        if table_name not in tables:
+            continue
+        columns = {column.get("name") for column in insp.get_columns(table_name)}
+        for column, column_type_sql in required_columns.items():
+            if column not in columns:
+                _add_column(engine, table_name, column, column_type_sql)
+                logger.warning("auto-migrated DB: added %s.%s", table_name, column)
+
+        status_column = "state" if "state" in columns else "status" if "status" in columns else None
+        if status_column is None or "created_at" not in columns:
+            continue
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    f"CREATE INDEX IF NOT EXISTS ix_{table_name}_{status_column}_lease_until "
+                    f"ON {table_name} ({status_column}, lease_until, created_at)"
+                )
+            )
+            conn.execute(
+                text(f"CREATE INDEX IF NOT EXISTS ix_{table_name}_operation_key ON {table_name} (operation_key)")
+            )
+
+
 def _ensure_tasks_publish_batch_columns(engine: Engine) -> None:
     insp = inspect(engine)
     if "tasks" not in set(insp.get_table_names()):
@@ -657,6 +692,7 @@ def auto_migrate_engine(engine: Engine) -> None:
     with _auto_migrate_lock(engine):
         _ensure_postgres_enum_values(engine)
         _ensure_app_settings_version_column(engine)
+        _ensure_job_lease_columns(engine)
         _ensure_tasks_lock_columns(engine)
         _ensure_tasks_publish_batch_columns(engine)
         _ensure_youtube_sources_columns(engine)
