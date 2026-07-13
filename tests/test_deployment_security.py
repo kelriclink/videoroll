@@ -45,6 +45,14 @@ def test_process_roles_are_not_combined() -> None:
             assert services[name].get("healthcheck"), f"{path.name}:{name} lacks a health check"
 
 
+def test_minio_healthcheck_uses_supported_readiness_endpoint() -> None:
+    expected = ["CMD", "curl", "-fsS", "http://127.0.0.1:9000/minio/health/ready"]
+
+    for path in COMPOSE_FILES:
+        healthcheck = _compose(path)["services"]["minio"]["healthcheck"]
+        assert healthcheck["test"] == expected
+
+
 def test_rag_processes_have_no_direct_egress_network() -> None:
     for path in COMPOSE_FILES:
         compose = _compose(path)
