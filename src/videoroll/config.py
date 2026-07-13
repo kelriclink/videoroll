@@ -152,7 +152,7 @@ class SocialPublisherSettings(CommonSettings):
     login_timeout_seconds: float = Field(900.0, alias="SOCIAL_LOGIN_TIMEOUT_SECONDS")
     login_display: str = Field(":99", alias="SOCIAL_LOGIN_DISPLAY")
     login_browser_url: str = Field(
-        "/social-login/vnc.html?autoconnect=1&resize=scale&path=social-login/websockify",
+        "/social-login/vnc.html?autoconnect=1&resize=scale&path=/social-login/websockify",
         alias="SOCIAL_LOGIN_BROWSER_URL",
     )
 

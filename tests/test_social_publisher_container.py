@@ -1,7 +1,15 @@
+import re
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def _compose_service_block(compose: str, service: str) -> str:
+    start = re.search(rf"(?m)^  {re.escape(service)}:\n", compose)
+    assert start is not None
+    end = re.search(r"(?m)^  [a-z0-9][a-z0-9-]*:\n", compose[start.end() :])
+    return compose[start.start() : start.end() + end.start() if end else len(compose)]
 
 
 def test_social_publisher_image_provides_chrome_compatibility_and_novnc() -> None:
@@ -36,6 +44,24 @@ def test_worker_starts_display_stack_and_web_proxies_its_novnc_desktop() -> None
     assert "proxy_pass http://social-publisher-worker:6080/;" in nginx
 
 
+def test_novnc_uses_root_absolute_websocket_paths() -> None:
+    config = (ROOT / "src" / "videoroll" / "config.py").read_text(encoding="utf-8")
+    task_helpers = (ROOT / "src" / "web" / "src" / "pages" / "taskDetailPage.helpers.ts").read_text(
+        encoding="utf-8"
+    )
+
+    assert "path=/social-login/websockify" in config
+    assert "path=/social-publish/websockify" in task_helpers
+
+
+def test_bilibili_publishers_share_the_persistent_fernet_key() -> None:
+    for relative_path in ("compose.yml", "docker-compose.yml"):
+        compose = (ROOT / relative_path).read_text(encoding="utf-8")
+        for service in ("bilibili-publisher", "publish-worker"):
+            block = _compose_service_block(compose, service)
+            assert "./data/secrets:/secrets" in block
+
+
 def test_nginx_authorizes_every_novnc_request_and_vnc_uses_a_tmpfs_password_file() -> None:
     entrypoint = (ROOT / "docker" / "social-publisher-entrypoint.sh").read_text(encoding="utf-8")
     nginx = (ROOT / "src" / "web" / "nginx.conf").read_text(encoding="utf-8")
@@ -67,6 +93,8 @@ def test_vnc_password_hash_generation_is_non_interactive() -> None:
 
 
 def test_compose_passes_douyin_headless_cookie_check_setting() -> None:
-    for relative_path in ("compose.yml", "docker-compose.yml", "fromprod/docker-compose.yml"):
+    for relative_path in ("compose.yml", "docker-compose.yml"):
         compose = (ROOT / relative_path).read_text(encoding="utf-8")
         assert "DOUYIN_COOKIE_AUTH_HEADLESS" in compose
+        assert "SOCIAL_LOGIN_BROWSER_URL" in compose
+        assert "path=/social-login/websockify" in compose

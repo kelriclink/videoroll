@@ -75,9 +75,12 @@ describe("socialPublishBrowserUrl", () => {
   it("exposes the worker noVNC desktop only for Douyin", () => {
     const socialPublishBrowserUrl = (helpers as any).socialPublishBrowserUrl;
     expect(typeof socialPublishBrowserUrl).toBe("function");
-    expect(socialPublishBrowserUrl("douyin")).toBe(
-      "/social-publish/vnc.html?autoconnect=1&resize=scale&path=social-publish/websockify",
+    const browserUrl = socialPublishBrowserUrl("douyin");
+    expect(browserUrl).toBe(
+      "/social-publish/vnc.html?autoconnect=1&resize=scale&path=/social-publish/websockify",
     );
+    const pageUrl = new URL(browserUrl, "http://videoroll.test");
+    expect(new URL(pageUrl.searchParams.get("path")!, pageUrl).pathname).toBe("/social-publish/websockify");
     expect(socialPublishBrowserUrl("xiaohongshu")).toBeNull();
     expect(socialPublishBrowserUrl("kuaishou")).toBeNull();
     expect(socialPublishBrowserUrl("bilibili")).toBeNull();

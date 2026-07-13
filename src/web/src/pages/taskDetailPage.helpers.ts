@@ -4,7 +4,7 @@ export type PublishPlatform = "bilibili" | "douyin" | "xiaohongshu" | "kuaishou"
 
 export function socialPublishBrowserUrl(platform: PublishPlatform): string | null {
   if (platform !== "douyin") return null;
-  return "/social-publish/vnc.html?autoconnect=1&resize=scale&path=social-publish/websockify";
+  return "/social-publish/vnc.html?autoconnect=1&resize=scale&path=/social-publish/websockify";
 }
 
 export function buildPublishActionPayload(args: {

@@ -65,6 +65,7 @@ x-social-publisher-environment: &social-publisher-environment
   SAU_LOCK_MARGIN_SECONDS: ${SAU_LOCK_MARGIN_SECONDS:-600}
   SOCIAL_LOGIN_TIMEOUT_SECONDS: ${SOCIAL_LOGIN_TIMEOUT_SECONDS:-900}
   SOCIAL_LOGIN_DISPLAY: ${SOCIAL_LOGIN_DISPLAY:-:99}
+  SOCIAL_LOGIN_BROWSER_URL: "${SOCIAL_LOGIN_BROWSER_URL:-/social-login/vnc.html?autoconnect=1&resize=scale&path=/social-login/websockify}"
 
 services:
   redis:
@@ -237,6 +238,8 @@ services:
       <<: *internal-environment
       DEPLOYMENT_ROLE: bilibili-publisher-api
       BILIBILI_PUBLISH_MODE: ${BILIBILI_PUBLISH_MODE:-web}
+    volumes:
+      - ./data/secrets:/secrets
     depends_on:
       redis:
         condition: service_healthy
@@ -314,6 +317,8 @@ services:
       <<: *internal-environment
       DEPLOYMENT_ROLE: publish-worker
       BILIBILI_PUBLISH_MODE: ${BILIBILI_PUBLISH_MODE:-web}
+    volumes:
+      - ./data/secrets:/secrets
     depends_on:
       redis:
         condition: service_healthy
