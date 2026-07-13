@@ -54,6 +54,7 @@ class OrchestratorSettings(CommonSettings):
 
 
 class SubtitleServiceSettings(CommonSettings):
+    egress_gateway_url: str = Field("http://egress-gateway:8020", alias="EGRESS_GATEWAY_URL")
     asr_engine: str = Field("faster-whisper", alias="SUBTITLE_ASR_ENGINE")
     whisper_model: str = Field("tiny", alias="SUBTITLE_WHISPER_MODEL")
     whisper_device: str = Field("cpu", alias="SUBTITLE_WHISPER_DEVICE")
