@@ -338,9 +338,18 @@ class AutoYouTubeRequest(BaseModel):
     auto_publish: Optional[bool] = None
 
 
+class RemoteAutoYouTubeRequest(BaseModel):
+    """JSON contract for the public, token-authenticated YouTube intake."""
+
+    url: str
+    license: SourceLicense = SourceLicense.authorized
+    proof_url: Optional[str] = None
+    auto_publish: Optional[bool] = None
+
+
 class AutoYouTubeResponse(BaseModel):
     task_id: uuid.UUID
-    pipeline_job_id: str
+    pipeline_job_id: Optional[str] = None
     deduped: bool = False
     source_id: Optional[str] = None
 
@@ -369,10 +378,9 @@ class RemoteAPISettingsRead(BaseModel):
     token_set: bool = False
     token_updated_at: Optional[str] = None
     endpoint_path: str = "/remote/auto/youtube"
-    token_query_param: str = "token"
-    url_query_param: str = "url"
-    license_query_param: str = "license"
-    proof_url_query_param: str = "proof_url"
+    http_method: str = "POST"
+    authorization_header: str = "Authorization"
+    idempotency_header: str = "Idempotency-Key"
 
 
 class RemoteAPISettingsUpdate(BaseModel):

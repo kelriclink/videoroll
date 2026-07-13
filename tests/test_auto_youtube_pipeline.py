@@ -116,51 +116,33 @@ class AutoYouTubePipelineTests(unittest.TestCase):
         self.assertEqual(store.calls[0]["content_type"], "application/json")
         self.assertEqual(json.loads(store.calls[0]["data"].decode("utf-8")), final_meta)
 
-    def test_remote_auto_youtube_accepts_bearer_token_before_query_token(self) -> None:
-        from starlette.requests import Request
-
-        from videoroll.apps.orchestrator_api.routers import youtube as youtube_router
+    def test_deduped_auto_youtube_does_not_enqueue_a_second_pipeline(self) -> None:
+        from videoroll.apps.orchestrator_api.services import youtube_service
         from videoroll.db.models import SourceLicense
 
         task_id = uuid.uuid4()
-        seen_tokens: list[str] = []
-        request = Request(
-            {
-                "type": "http",
-                "method": "GET",
-                "path": "/remote/auto/youtube",
-                "headers": [(b"authorization", b"Bearer header-token")],
-                "query_string": b"",
-            }
-        )
-
-        def verify_token(_db: object, token: str) -> bool:
-            seen_tokens.append(token)
-            return token == "header-token"
-
         with (
-            patch("videoroll.apps.orchestrator_api.routers.youtube.remote_api_token_is_configured", return_value=True),
-            patch("videoroll.apps.orchestrator_api.routers.youtube.verify_remote_api_token", side_effect=verify_token),
-            patch(
-                "videoroll.apps.orchestrator_api.routers.youtube.youtube_service.start_auto_youtube_pipeline",
-                return_value=youtube_router.AutoYouTubeResponse(task_id=task_id, pipeline_job_id="job-1"),
-            ) as start_pipeline,
+            patch.object(
+                youtube_service,
+                "ingest_youtube_source",
+                return_value=(task_id, True, "source-1"),
+            ),
+            patch.object(youtube_service, "enqueue_auto_youtube_pipeline") as enqueue,
+            patch.object(youtube_service, "set_task_created_by") as set_created_by,
         ):
-            result = youtube_router.remote_auto_youtube(
-                request,
+            result = youtube_service.start_auto_youtube_pipeline(
                 url="https://www.youtube.com/watch?v=demo",
-                token="query-token",
                 license=SourceLicense.authorized,
                 proof_url="https://example.com/proof",
                 auto_publish=True,
                 settings=object(),  # type: ignore[arg-type]
-                db=object(),  # type: ignore[arg-type]
             )
 
-        self.assertEqual(seen_tokens, ["header-token"])
         self.assertEqual(result.task_id, task_id)
-        start_pipeline.assert_called_once()
-        self.assertEqual(start_pipeline.call_args.kwargs["auto_publish"], True)
+        self.assertTrue(result.deduped)
+        self.assertIsNone(result.pipeline_job_id)
+        enqueue.assert_not_called()
+        set_created_by.assert_not_called()
 
 
 if __name__ == "__main__":

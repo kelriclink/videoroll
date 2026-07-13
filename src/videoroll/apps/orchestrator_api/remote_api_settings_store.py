@@ -13,10 +13,9 @@ from videoroll.db.models import AppSetting
 REMOTE_API_SETTINGS_KEY = "remote.api"
 
 REMOTE_AUTO_YOUTUBE_PATH = "/remote/auto/youtube"
-REMOTE_API_TOKEN_QUERY_PARAM = "token"
-REMOTE_AUTO_URL_QUERY_PARAM = "url"
-REMOTE_AUTO_LICENSE_QUERY_PARAM = "license"
-REMOTE_AUTO_PROOF_URL_QUERY_PARAM = "proof_url"
+REMOTE_API_HTTP_METHOD = "POST"
+REMOTE_API_AUTHORIZATION_HEADER = "Authorization"
+REMOTE_API_IDEMPOTENCY_HEADER = "Idempotency-Key"
 
 _MIN_TOKEN_LEN = 8
 _MAX_TOKEN_LEN = 512
@@ -64,10 +63,9 @@ def get_remote_api_settings(db: Session) -> dict[str, Any]:
         "token_set": bool(token_hash),
         "token_updated_at": token_updated_at,
         "endpoint_path": REMOTE_AUTO_YOUTUBE_PATH,
-        "token_query_param": REMOTE_API_TOKEN_QUERY_PARAM,
-        "url_query_param": REMOTE_AUTO_URL_QUERY_PARAM,
-        "license_query_param": REMOTE_AUTO_LICENSE_QUERY_PARAM,
-        "proof_url_query_param": REMOTE_AUTO_PROOF_URL_QUERY_PARAM,
+        "http_method": REMOTE_API_HTTP_METHOD,
+        "authorization_header": REMOTE_API_AUTHORIZATION_HEADER,
+        "idempotency_header": REMOTE_API_IDEMPOTENCY_HEADER,
     }
 
 
@@ -100,6 +98,7 @@ def remote_api_token_is_configured(db: Session) -> bool:
 
 
 def verify_remote_api_token(db: Session, token: str) -> bool:
+    """Verify a presented token through PBKDF2 plus constant-time digest comparison."""
     value = str(token or "").strip()
     if not value:
         return False

@@ -3,21 +3,25 @@ from __future__ import annotations
 import uuid
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from fastapi.responses import Response
 from sqlalchemy.orm import Session
 
 from videoroll.apps.orchestrator_api.dependencies import get_db, get_s3, get_settings
 from videoroll.apps.orchestrator_api.remote_api_settings_store import (
-    REMOTE_API_TOKEN_QUERY_PARAM,
+    REMOTE_API_IDEMPOTENCY_HEADER,
     REMOTE_AUTO_YOUTUBE_PATH,
-    remote_api_token_is_configured,
-    verify_remote_api_token,
+)
+from videoroll.apps.orchestrator_api.remote_api import (
+    accept_remote_request,
+    authenticate_remote_request,
+    reserve_remote_dispatch_capacity,
 )
 from videoroll.apps.orchestrator_api.schemas import (
     AutoYouTubeRequest,
     AutoYouTubeResponse,
     AutoYouTubeTaskStartResponse,
+    RemoteAutoYouTubeRequest,
     YouTubeDownloadActionResponse,
     YouTubeHomeScanRunResponse,
     YouTubeMetaActionResponse,
@@ -28,7 +32,6 @@ from videoroll.apps.orchestrator_api.schemas import (
 from videoroll.apps.orchestrator_api.services import youtube_service
 from videoroll.apps.youtube_settings_store import get_youtube_settings
 from videoroll.config import OrchestratorSettings
-from videoroll.db.models import SourceLicense
 from videoroll.storage.s3 import S3Store
 
 
@@ -60,16 +63,46 @@ def auto_youtube(payload: AutoYouTubeRequest, settings: OrchestratorSettings = D
     return youtube_service.start_auto_youtube_pipeline(url=payload.url, license=payload.license, proof_url=payload.proof_url, auto_publish=payload.auto_publish, settings=settings)
 
 
-@router.get(REMOTE_AUTO_YOUTUBE_PATH, response_model=AutoYouTubeResponse)
 @router.post(REMOTE_AUTO_YOUTUBE_PATH, response_model=AutoYouTubeResponse)
-def remote_auto_youtube(request: Request, url: str | None = Query(default=None), token: str | None = Query(default=None, alias=REMOTE_API_TOKEN_QUERY_PARAM), license: SourceLicense = Query(default=SourceLicense.authorized), proof_url: str | None = Query(default=None), auto_publish: bool | None = Query(default=None), settings: OrchestratorSettings = Depends(get_settings), db: Session = Depends(get_db)) -> AutoYouTubeResponse:
-    if not remote_api_token_is_configured(db):
-        raise HTTPException(status_code=403, detail="remote api token is not set")
-    auth = str(request.headers.get("authorization") or "").strip()
-    effective_token = (auth[7:].strip() if auth.lower().startswith("bearer ") else "") or str(token or "")
-    if not verify_remote_api_token(db, effective_token):
-        raise HTTPException(status_code=401, detail="invalid remote api token")
-    return youtube_service.start_auto_youtube_pipeline(url=str(url or ""), license=license, proof_url=proof_url, auto_publish=auto_publish, settings=settings)
+def remote_auto_youtube(
+    payload: RemoteAutoYouTubeRequest,
+    request: Request,
+    idempotency_key: str | None = Header(default=None, alias=REMOTE_API_IDEMPOTENCY_HEADER),
+    settings: OrchestratorSettings = Depends(get_settings),
+    db: Session = Depends(get_db),
+) -> AutoYouTubeResponse:
+    principal = authenticate_remote_request(request, db)
+    release_capacity = reserve_remote_dispatch_capacity(
+        request,
+        principal,
+        redis_url=settings.redis_url,
+    )
+    try:
+        accepted = accept_remote_request(
+            principal,
+            idempotency_key,
+            payload,
+            db,
+            dispatch=lambda: youtube_service.start_auto_youtube_pipeline(
+                url=payload.url,
+                license=payload.license,
+                proof_url=payload.proof_url,
+                auto_publish=payload.auto_publish,
+                settings=settings,
+            ),
+        )
+    finally:
+        release_capacity()
+    return accepted.response
+
+
+@router.get(REMOTE_AUTO_YOUTUBE_PATH, include_in_schema=False)
+def remote_auto_youtube_legacy() -> None:
+    """Keep the former query-string endpoint discoverable for one release."""
+    raise HTTPException(
+        status_code=410,
+        detail="Remote API query-token requests were removed; use POST JSON with Authorization: Bearer and Idempotency-Key.",
+    )
 
 
 @router.post("/tasks/{task_id}/actions/auto_youtube_start", response_model=AutoYouTubeTaskStartResponse)

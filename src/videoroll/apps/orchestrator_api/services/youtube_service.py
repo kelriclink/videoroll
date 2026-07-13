@@ -203,6 +203,15 @@ def enqueue_auto_youtube_pipeline(task_id: uuid.UUID, *, auto_publish: bool | No
 
 def start_auto_youtube_pipeline(*, url: str, license: SourceLicense, proof_url: str | None, auto_publish: bool | None, settings: OrchestratorSettings) -> AutoYouTubeResponse:
     task_id, deduped, source_id = ingest_youtube_source(url=url, license=license, proof_url=proof_url, settings=settings)
+    if deduped:
+        # The source service has already associated this URL with an existing
+        # task.  Only an explicit, authenticated task restart may enqueue it.
+        return AutoYouTubeResponse(
+            task_id=task_id,
+            pipeline_job_id=None,
+            deduped=True,
+            source_id=source_id,
+        )
     set_task_created_by(
         settings,
         task_id=task_id,

@@ -7,20 +7,18 @@ type RemoteApiSettings = {
   token_set: boolean;
   token_updated_at?: string | null;
   endpoint_path: string;
-  token_query_param: string;
-  url_query_param: string;
-  license_query_param: string;
-  proof_url_query_param: string;
+  http_method: string;
+  authorization_header: string;
+  idempotency_header: string;
 };
 
 const DEFAULT_SETTINGS: RemoteApiSettings = {
   token_set: false,
   token_updated_at: null,
   endpoint_path: "/remote/auto/youtube",
-  token_query_param: "token",
-  url_query_param: "url",
-  license_query_param: "license",
-  proof_url_query_param: "proof_url",
+  http_method: "POST",
+  authorization_header: "Authorization",
+  idempotency_header: "Idempotency-Key",
 };
 
 function orchestratorBaseUrl(): string {
@@ -54,29 +52,23 @@ export default function SettingsApiPage() {
   const effective = settings ?? DEFAULT_SETTINGS;
   const baseUrl = useMemo(() => orchestratorBaseUrl(), []);
   const remoteEndpoint = useMemo(() => `${baseUrl}${effective.endpoint_path}`, [baseUrl, effective.endpoint_path]);
-  const sampleUrl = useMemo(() => {
-    const qs = new URLSearchParams();
-    qs.set(effective.token_query_param, tokenInput.trim() || "YOUR_TOKEN");
-    qs.set(effective.url_query_param, "https://www.youtube.com/watch?v=dQw4w9WgXcQ");
-    qs.set(effective.license_query_param, "authorized");
-    return `${remoteEndpoint}?${qs.toString()}`;
-  }, [effective.license_query_param, effective.token_query_param, effective.url_query_param, remoteEndpoint, tokenInput]);
   const sampleCurl = useMemo(
     () =>
       [
-        `curl -G "${remoteEndpoint}" \\`,
-        `  --data-urlencode "${effective.token_query_param}=${tokenInput.trim() || "YOUR_TOKEN"}" \\`,
-        `  --data-urlencode "${effective.url_query_param}=https://www.youtube.com/watch?v=dQw4w9WgXcQ" \\`,
-        `  --data-urlencode "${effective.license_query_param}=authorized"`,
+        `curl -X ${effective.http_method} "${remoteEndpoint}" \\`,
+        `  -H "${effective.authorization_header}: Bearer YOUR_TOKEN" \\`,
+        `  -H "${effective.idempotency_header}: YOUR_STABLE_REQUEST_ID" \\`,
+        `  -H "Content-Type: application/json" \\`,
+        "  --data '{\"url\":\"https://www.youtube.com/watch?v=dQw4w9WgXcQ\",\"license\":\"authorized\",\"auto_publish\":true}'",
       ].join("\n"),
-    [effective.license_query_param, effective.token_query_param, effective.url_query_param, remoteEndpoint, tokenInput],
+    [effective.authorization_header, effective.http_method, effective.idempotency_header, remoteEndpoint],
   );
 
   return (
     <div className="space-y-4">
       <div className="rounded border bg-white p-4">
         <div className="text-lg font-semibold">Settings · API</div>
-        <div className="mt-1 text-sm text-slate-600">配置远程管理 token。外部请求带上 token 和 YouTube `url` 参数后，会直接按 Auto Mode 自动创建任务并开始处理。</div>
+        <div className="mt-1 text-sm text-slate-600">配置远程管理 token。外部请求使用 Bearer 鉴权、JSON 请求体和幂等键后，会按 Auto Mode 创建任务并开始处理。</div>
         {error ? <div className="mt-3 whitespace-pre-wrap break-words text-sm text-rose-700">{error}</div> : null}
       </div>
 
@@ -105,7 +97,7 @@ export default function SettingsApiPage() {
             </div>
           </div>
         )}
-        <div className="mt-3 text-xs text-slate-500">说明：当前远程入口仅支持 YouTube 视频链接，行为等价于网页里的 “YouTube 自动模式”。</div>
+        <div className="mt-3 text-xs text-slate-500">说明：当前远程入口仅支持 YouTube 视频链接，行为等价于网页里的 “YouTube 自动模式”。每个逻辑请求必须携带稳定且唯一的幂等键；网络重试时复用同一个键。</div>
       </div>
 
       <div className="rounded border bg-white p-4">
@@ -184,12 +176,12 @@ export default function SettingsApiPage() {
       <div className="rounded border bg-white p-4">
         <div className="text-sm font-semibold">调用示例</div>
         <div className="mt-2 text-xs text-slate-500">
-          必填参数：<span className="font-mono">{effective.token_query_param}</span>、<span className="font-mono">{effective.url_query_param}</span>
-          。可选参数：<span className="font-mono">{effective.license_query_param}</span>、<span className="font-mono">{effective.proof_url_query_param}</span>。
+          仅支持 <span className="font-mono">{effective.http_method}</span> JSON 请求。必填请求头：<span className="font-mono">{effective.authorization_header}</span>（Bearer token）和 <span className="font-mono">{effective.idempotency_header}</span>。
+          请求体必填 <span className="font-mono">url</span>；可选 <span className="font-mono">license</span>、<span className="font-mono">proof_url</span>、<span className="font-mono">auto_publish</span>。
         </div>
         <div className="mt-3 rounded border bg-slate-50 p-3">
-          <div className="text-xs text-slate-500">示例 URL</div>
-          <pre className="mt-2 whitespace-pre-wrap break-all font-mono text-xs text-slate-800">{sampleUrl}</pre>
+          <div className="text-xs text-slate-500">端点</div>
+          <pre className="mt-2 whitespace-pre-wrap break-all font-mono text-xs text-slate-800">{remoteEndpoint}</pre>
         </div>
         <div className="mt-3 rounded border bg-slate-50 p-3">
           <div className="text-xs text-slate-500">curl</div>
