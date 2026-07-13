@@ -50,3 +50,24 @@ def test_douyin_upload_uses_headed_browser_for_live_observation() -> None:
 
     assert command[-1] == "--headed"
     assert "--headless" not in command
+
+
+def test_douyin_upload_clamps_description_and_topics() -> None:
+    command = build_upload_video_command(
+        _settings(),
+        platform="douyin",
+        account_name="creator",
+        video_path=Path("/work/video.mp4"),
+        cover_path=None,
+        meta={
+            "title": "标题",
+            "desc": "原作者：" + ("作者" * 600),
+            "tags": ["videoroll", "一", "二", "三", "四", "五"],
+        },
+        platform_options={},
+    )
+
+    desc = command[command.index("--desc") + 1]
+    tags = command[command.index("--tags") + 1]
+    assert len(desc) == 1000
+    assert tags == "一,二,三,四"

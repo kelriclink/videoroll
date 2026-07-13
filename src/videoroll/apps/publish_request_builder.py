@@ -14,6 +14,7 @@ from videoroll.apps.publish_gateway import (
     publish_meta_key,
 )
 from videoroll.apps.subtitle_service.bilibili_tags_store import get_task_bilibili_tags
+from videoroll.apps.youtube_meta_store import get_task_youtube_meta
 from videoroll.db.models import Task
 from videoroll.storage.s3 import S3Store
 
@@ -149,7 +150,13 @@ def build_publish_gateway_request(
         if meta_source is None:
             raise ValueError("meta is missing and platform publish meta is not found")
         try:
-            meta = normalize_social_publish_meta(_as_dict(meta_source), platform)
+            youtube_meta = get_task_youtube_meta(db, task_id) if platform == "douyin" else None
+            original_author = str(getattr(youtube_meta, "uploader", "") or "").strip()
+            meta = normalize_social_publish_meta(
+                _as_dict(meta_source),
+                platform,
+                original_author=original_author,
+            )
         except ValueError as exc:
             raise ValueError(f"invalid publish meta: {exc}") from exc
 

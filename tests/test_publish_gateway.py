@@ -7,6 +7,7 @@ import pytest
 
 from videoroll.apps.orchestrator_api.services.publishing_service import build_publish_gateway_request
 from videoroll.apps.publish_gateway import normalize_social_publish_meta, publish_backend_url, publish_meta_key
+from videoroll.apps.publish_request_builder import build_publish_gateway_request as build_queued_publish_gateway_request
 from videoroll.db.models import SourceLicense, SourceType, Task
 
 
@@ -60,8 +61,78 @@ def test_publish_backend_url_rejects_unknown_platform() -> None:
 def test_social_publish_meta_does_not_require_bilibili_typeid() -> None:
     assert normalize_social_publish_meta(
         {"title": " Demo ", "description": " Body ", "tags": ["#one", "one", "two"]},
-        "douyin",
+        "kuaishou",
     ) == {"title": "Demo", "desc": "Body", "tags": ["one", "two"]}
+
+
+def test_douyin_meta_uses_short_author_credit_and_four_non_videoroll_topics() -> None:
+    assert normalize_social_publish_meta(
+        {
+            "title": "翻译标题 - Original Creator",
+            "description": "原视频：https://example.test/watch\n博主：Original Creator\n\n很长的 B 站简介",
+            "tags": ["videoroll", "#AI", "AI", "科技", "资讯", "剪辑", "额外"],
+        },
+        "douyin",
+        original_author="Original Creator",
+    ) == {
+        "title": "翻译标题",
+        "desc": "原作者：Original Creator",
+        "tags": ["AI", "科技", "资讯", "剪辑"],
+    }
+
+
+def test_douyin_meta_can_recover_author_from_existing_credit() -> None:
+    assert normalize_social_publish_meta(
+        {"title": "翻译标题 - Original Creator", "desc": "原作者：Original Creator", "tags": []},
+        "douyin",
+    ) == {"title": "翻译标题", "desc": "原作者：Original Creator", "tags": []}
+
+
+def test_direct_douyin_publish_uses_stored_youtube_uploader() -> None:
+    task = Task(id=uuid.uuid4(), source_type=SourceType.youtube, source_license=SourceLicense.own)
+    payload = Mock(
+        platform="douyin",
+        account_id=str(uuid.uuid4()),
+        cover_key=None,
+        typeid_mode=None,
+        force_retry=False,
+        meta={"title": "翻译标题", "description": "B 站长简介", "tags": ["AI"]},
+        platform_options={},
+    )
+    db = Mock()
+    db.get.return_value = Mock(uploader="Original Creator")
+
+    request = build_publish_gateway_request(
+        task=task,
+        task_id=task.id,
+        payload=payload,
+        video_key="final/video.mp4",
+        db=db,
+        s3=object(),  # type: ignore[arg-type]
+    )
+
+    assert request["meta"]["desc"] == "原作者：Original Creator"
+
+
+def test_queued_douyin_publish_uses_stored_youtube_uploader() -> None:
+    task = Task(id=uuid.uuid4(), source_type=SourceType.youtube, source_license=SourceLicense.own)
+    db = Mock()
+    db.get.return_value = Mock(uploader="Original Creator")
+
+    request = build_queued_publish_gateway_request(
+        task=task,
+        task_id=task.id,
+        payload={
+            "platform": "douyin",
+            "account_id": str(uuid.uuid4()),
+            "meta": {"title": "翻译标题", "description": "B 站长简介", "tags": ["AI"]},
+        },
+        video_key="final/video.mp4",
+        db=db,
+        s3=object(),  # type: ignore[arg-type]
+    )
+
+    assert request["meta"]["desc"] == "原作者：Original Creator"
 
 
 def test_xiaohongshu_publish_meta_rejects_more_than_ten_tags() -> None:

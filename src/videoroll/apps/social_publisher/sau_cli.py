@@ -51,6 +51,22 @@ def build_upload_video_command(
     title = str(meta.get("title") or "").strip()
     if not title:
         raise ValueError("meta.title is required")
+    description = str(meta.get("desc") or "")
+    tags = [str(tag).strip() for tag in meta.get("tags", []) if str(tag).strip()]
+    if value == "douyin":
+        description = description[:1000]
+        normalized_tags: list[str] = []
+        seen: set[str] = set()
+        for item in tags:
+            tag = item.lstrip("#").strip()
+            key = tag.casefold()
+            if not tag or key == "videoroll" or key in seen:
+                continue
+            seen.add(key)
+            normalized_tags.append(tag)
+            if len(normalized_tags) >= 4:
+                break
+        tags = normalized_tags
     command = [
         settings.sau_executable,
         value,
@@ -62,9 +78,8 @@ def build_upload_video_command(
         "--title",
         title,
         "--desc",
-        str(meta.get("desc") or ""),
+        description,
     ]
-    tags = [str(tag).strip() for tag in meta.get("tags", []) if str(tag).strip()]
     if tags:
         command.extend(["--tags", ",".join(tags)])
     if cover_path is not None:
