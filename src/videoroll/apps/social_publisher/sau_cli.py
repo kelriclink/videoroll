@@ -82,7 +82,10 @@ def build_upload_video_command(
     ]
     if tags:
         command.extend(["--tags", ",".join(tags)])
-    if cover_path is not None:
+    # Douyin's current custom-cover modal is unstable across creator-center
+    # variants. Let Douyin use its generated/recommended cover instead of
+    # aborting an otherwise completed video upload.
+    if cover_path is not None and value != "douyin":
         command.extend(["--thumbnail", str(cover_path)])
     schedule = str(platform_options.get("schedule") or "").strip()
     if schedule:

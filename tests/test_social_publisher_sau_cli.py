@@ -71,3 +71,17 @@ def test_douyin_upload_clamps_description_and_topics() -> None:
     tags = command[command.index("--tags") + 1]
     assert len(desc) == 1000
     assert tags == "一,二,三,四"
+
+
+def test_douyin_upload_skips_custom_thumbnail_when_cover_flow_is_incompatible() -> None:
+    command = build_upload_video_command(
+        _settings(),
+        platform="douyin",
+        account_name="creator",
+        video_path=Path("/work/video.mp4"),
+        cover_path=Path("/work/cover.jpg"),
+        meta={"title": "标题", "desc": "原作者：作者", "tags": ["一"]},
+        platform_options={},
+    )
+
+    assert "--thumbnail" not in command
