@@ -14,6 +14,7 @@ from videoroll.apps.outbox.service import (
     claim_outbox_events,
     create_outbox_event,
     mark_outbox_dispatch_failed,
+    redeliver_dispatched_event,
 )
 from videoroll.db.models import OutboxEvent
 
@@ -87,6 +88,19 @@ def test_broker_failure_releases_event_with_exponential_retry(db: Session) -> No
     assert event.lease_owner is None
     assert event.available_at == now + timedelta(seconds=2)
     assert event.last_error == "broker down"
+
+
+def test_safe_worker_nonstart_can_redeliver_an_already_dispatched_event(db: Session) -> None:
+    event = _pending_event(db)
+    event.status = "dispatched"
+    event.lease_owner = None
+    event.lease_until = None
+    now = event.available_at + timedelta(seconds=1)
+
+    assert redeliver_dispatched_event(db, event.operation_key, now=now) is True
+    assert event.status == "pending"
+    assert event.available_at == now
+    assert event.last_error == "publisher worker never started; redelivering durable intent"
 
 
 def test_dispatcher_sends_worker_args_and_outbox_event_id(db: Session) -> None:

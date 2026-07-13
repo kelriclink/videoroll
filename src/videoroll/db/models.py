@@ -255,7 +255,7 @@ class PublishJob(Base):
         Index("ix_publish_jobs_platform_state", "platform", "state"),
         Index("ix_publish_jobs_batch_platform_account", "batch_id", "platform", "account_id"),
         Index("ix_publish_jobs_state_lease_until", "state", "lease_until", "created_at"),
-        Index("ix_publish_jobs_operation_key", "operation_key"),
+        UniqueConstraint("operation_key", name="uq_publish_jobs_operation_key"),
     )
 
 

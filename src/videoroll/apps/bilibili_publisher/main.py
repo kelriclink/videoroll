@@ -39,7 +39,7 @@ from videoroll.apps.bilibili_publisher.schemas import (
     PublishResponse,
 )
 from videoroll.apps.bilibili_publisher.storage_keys import unique_publish_result_key
-from videoroll.apps.publish_lifecycle import publish_batch_has_target
+from videoroll.apps.publish_lifecycle import enqueue_publish_job_dispatch, publish_batch_has_target
 from videoroll.apps.subtitle_service.bilibili_tags_store import get_task_bilibili_summary
 from videoroll.apps.subtitle_service.translate_settings_store import get_translate_settings
 
@@ -345,13 +345,37 @@ def publish(payload: PublishRequest, settings: BilibiliPublisherSettings = Depen
             db.add(active_job)
             db.commit()
     if active_job:
+        # Older HTTP callers could have inserted an active row without a
+        # durable dispatcher event.  Repair that intent while holding the
+        # task lock; normal duplicate calls merely reuse the same event key.
+        if active_job.state == PublishState.submitting:
+            enqueue_publish_job_dispatch(db, active_job)
+            db.commit()
         if settings.publish_mode != "mock" and payload.batch_id is None:
             task.status = TaskStatus.publishing
             db.add(task)
             db.commit()
         return _publish_response_from_job(active_job)
 
+    unknown_job = _latest_publish_job(
+        db,
+        payload.task_id,
+        {PublishState.unknown},
+        batch_id=payload.batch_id,
+        account_id=payload.account_id,
+    )
+    if payload.batch_id and unknown_job is None:
+        unknown_job = _latest_publish_job(
+            db,
+            payload.task_id,
+            {PublishState.unknown},
+            account_id=payload.account_id,
+        )
+    if unknown_job is not None and not payload.force_retry:
+        return _publish_response_from_job(unknown_job)
+
     job = PublishJob(
+        id=uuid.uuid4(),
         task_id=payload.task_id,
         batch_id=payload.batch_id,
         platform=Platform.bilibili,
@@ -368,15 +392,18 @@ def publish(payload: PublishRequest, settings: BilibiliPublisherSettings = Depen
         state=PublishState.submitting,
     )
     db.add(job)
+    if settings.publish_mode != "mock":
+        # Persist the job and the broker-independent dispatch intent together.
+        enqueue_publish_job_dispatch(db, job)
+        if payload.batch_id is None:
+            task.status = TaskStatus.publishing
+            task.error_code = None
+            task.error_message = None
+            db.add(task)
     db.commit()
     db.refresh(job)
 
     if settings.publish_mode != "mock":
-        if payload.batch_id is None:
-            task.status = TaskStatus.publishing
-            db.add(task)
-            db.commit()
-        celery_app.send_task("bilibili_publisher.process_job", args=[str(job.id)], queue="publish")
         return _publish_response_from_job(job)
 
     aid = str(int(uuid.uuid4().int % 1_000_000_000))

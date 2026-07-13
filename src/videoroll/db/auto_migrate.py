@@ -203,6 +203,10 @@ def _ensure_publish_jobs_generic_columns(engine: Engine) -> None:
         "external_url": "TEXT",
         "started_at": ts_type,
         "finished_at": ts_type,
+        "lease_owner": "VARCHAR(128)",
+        "lease_until": ts_type,
+        "heartbeat_at": ts_type,
+        "operation_key": "VARCHAR(255)",
     }
     for column, column_type_sql in required_columns.items():
         if column in cols:
@@ -216,6 +220,12 @@ def _ensure_publish_jobs_generic_columns(engine: Engine) -> None:
             text(
                 "CREATE INDEX IF NOT EXISTS ix_publish_jobs_batch_platform_account "
                 "ON publish_jobs (batch_id, platform, account_id)"
+            )
+        )
+        conn.execute(
+            text(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_publish_jobs_operation_key "
+                "ON publish_jobs (operation_key) WHERE operation_key IS NOT NULL"
             )
         )
 

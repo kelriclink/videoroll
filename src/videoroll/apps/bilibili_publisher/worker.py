@@ -639,7 +639,6 @@ def _process_job_impl(self, job_id: str) -> dict[str, Any]:
     store: S3Store | None = None
     upload_throttle: dict[str, Any] | None = None
     submit_throttle: dict[str, Any] | None = None
-    job_lock: Any = None
     job_hb: JobLeaseHeartbeat | None = None
     lease_owner: str | None = None
     try:
@@ -660,9 +659,9 @@ def _process_job_impl(self, job_id: str) -> dict[str, Any]:
         job_hb = JobLeaseHeartbeat(lambda: _db(), job.id, lease_owner, _JOB_LEASE_TTL_SECONDS)
         job_hb.start()
 
-        job_lock = _try_acquire_publish_job_lock(job_id)
-        if job_lock is False:
-            return {"status": "skipped", "detail": "publish job already running"}
+        # The database lease above is the sole duplicate-side-effect guard.
+        # Redis may still be used for best-effort rate throttling below, but a
+        # transient Redis failure must never decide whether this job runs.
 
         task = db.get(Task, job.task_id)
         if not task:
@@ -724,6 +723,12 @@ def _process_job_impl(self, job_id: str) -> dict[str, Any]:
             collection_result: dict[str, Any] | None = None
             desc_retry: dict[str, Any] | None = None
             with BilibiliWebClient(cookie) as client:
+                # From this point Bilibili may have accepted an upload or
+                # archive request.  Recovery must require explicit operator
+                # confirmation instead of sending a duplicate automatically.
+                job.started_at = _utcnow()
+                db.add(job)
+                db.commit()
                 if cover_path:
                     cover_url = client.upload_cover(cover_path, csrf=csrf)
 
@@ -1089,11 +1094,6 @@ def _process_job_impl(self, job_id: str) -> dict[str, Any]:
     finally:
         if job_hb is not None:
             job_hb.stop()
-        if job_lock not in (None, False):
-            try:
-                job_lock.release()
-            except Exception:
-                pass
         if lease_owner is not None and job_uuid is not None:
             lease_db = _db()
             try:

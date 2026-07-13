@@ -151,6 +151,12 @@ celery_app.conf.update(
             "args": (),
             "options": {"queue": "subtitle"},
         },
+        "subtitle-service-publish-dispatch-recovery": {
+            "task": "subtitle_service.recover_publish_dispatches",
+            "schedule": 30.0,
+            "args": (),
+            "options": {"queue": "subtitle"},
+        },
     },
 )
 
@@ -2552,6 +2558,24 @@ def dispatch_outbox() -> dict[str, int]:
             limit=50,
         )
         return {"claimed": result.claimed, "dispatched": result.dispatched, "failed": result.failed}
+    finally:
+        db.close()
+
+
+@celery_app.task(name="subtitle_service.recover_publish_dispatches")
+def recover_publish_dispatches() -> dict[str, int]:
+    """Repair lost publisher delivery without guessing external outcomes."""
+    _ensure_db()
+    from videoroll.apps.publish_lifecycle import recover_stale_publish_dispatches
+
+    db = _db()
+    try:
+        result = recover_stale_publish_dispatches(db, limit=100)
+        db.commit()
+        return {"requeued": result.requeued, "unknown": result.unknown}
+    except Exception:
+        db.rollback()
+        raise
     finally:
         db.close()
 

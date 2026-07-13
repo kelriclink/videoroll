@@ -29,12 +29,18 @@ vnc_password_dir="${VNC_PASSWORD_DIR:-/dev/shm/videoroll-vnc}"
 mkdir -p "$vnc_password_dir"
 chmod 700 "$vnc_password_dir"
 vnc_password_file="$(mktemp "$vnc_password_dir/password.XXXXXX")"
-vnc_password="$(dd if=/dev/urandom bs=24 count=1 2>/dev/null | base64 | tr -d '\n' | cut -c1-24)"
+vnc_password_secret_file="$(mktemp "$vnc_password_dir/bridge-password.XXXXXX")"
+vnc_password="$(dd if=/dev/urandom bs=12 count=1 2>/dev/null | base64 | tr -d '\n' | cut -c1-8)"
+printf '%s' "$vnc_password" >"$vnc_password_secret_file"
+chmod 600 "$vnc_password_secret_file"
 printf '%s\n%s\n' "$vnc_password" "$vnc_password" | x11vnc -storepasswd "$vnc_password_file" >/tmp/x11vnc-password.log 2>&1
 unset vnc_password
 chmod 600 "$vnc_password_file"
 x11vnc -display "$display" -forever -shared -rfbauth "$vnc_password_file" -localhost -rfbport 5900 >/tmp/x11vnc.log 2>&1 &
-websockify --web=/usr/share/novnc 0.0.0.0:6080 localhost:5900 >/tmp/websockify.log 2>&1 &
+# Browser traffic terminates at websockify.  The bridge below authenticates to
+# the loopback-only x11vnc server so the VNC password never reaches noVNC.
+python -m videoroll.apps.social_publisher.vnc_bridge --password-file "$vnc_password_secret_file" >/tmp/vnc-bridge.log 2>&1 &
+websockify --web=/usr/share/novnc 0.0.0.0:6080 localhost:5901 >/tmp/websockify.log 2>&1 &
 
 export DISPLAY="$display"
 

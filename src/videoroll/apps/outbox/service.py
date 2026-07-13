@@ -79,6 +79,38 @@ def create_outbox_event(
     return event
 
 
+def redeliver_dispatched_event(db: Session, operation_key: str, *, now: datetime | None = None) -> bool:
+    """Make a broker-accepted-but-unstarted operation deliverable again.
+
+    Callers must first prove that the domain operation did not reach its
+    external side-effect boundary.  This intentionally does not disturb a
+    live dispatcher lease; doing so would turn a broker optimisation into a
+    correctness dependency.
+    """
+    key = str(operation_key or "").strip()
+    if not key:
+        return False
+    event = (
+        db.query(OutboxEvent)
+        .filter(OutboxEvent.operation_key == key)
+        .with_for_update()
+        .order_by(OutboxEvent.created_at.desc())
+        .first()
+    )
+    if event is None or event.status != "dispatched":
+        return False
+    now = now or utcnow()
+    event.status = "pending"
+    event.available_at = now
+    event.lease_owner = None
+    event.lease_until = None
+    event.heartbeat_at = now
+    event.last_error = "publisher worker never started; redelivering durable intent"
+    db.add(event)
+    db.flush()
+    return True
+
+
 def claim_outbox_events(
     db: Session,
     owner: str,

@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 
 from videoroll.apps.publish_gateway import SUPPORTED_SOCIAL_PLATFORMS, normalize_publish_platform, normalize_social_publish_meta
 from videoroll.apps.security.service_auth import install_internal_service_auth, service_token
-from videoroll.apps.publish_lifecycle import publish_batch_has_target
+from videoroll.apps.publish_lifecycle import enqueue_publish_job_dispatch, publish_batch_has_target
 from videoroll.apps.social_publisher.account_store import (
     MAX_STORAGE_STATE_BYTES,
     account_read,
@@ -282,6 +282,11 @@ def publish(
     if existing and existing.state != PublishState.unknown:
         # ``submitted`` is a successful terminal state for this service.  A
         # force retry may resolve an unknown delivery, never duplicate it.
+        if existing.state == PublishState.submitting:
+            # Legacy rows may predate outbox delivery.  The stable operation
+            # key means this can be safely repeated on every HTTP retry.
+            enqueue_publish_job_dispatch(db, existing)
+            db.commit()
         return _response_from_job(existing)
     if existing and existing.state == PublishState.unknown and not payload.force_retry:
         return _response_from_job(existing)
@@ -298,6 +303,7 @@ def publish(
     if existing:
         meta_json["retry_of_job_id"] = str(existing.id)
     job = PublishJob(
+        id=uuid.uuid4(),
         task_id=task.id,
         batch_id=payload.batch_id,
         platform=Platform(value),
@@ -307,6 +313,9 @@ def publish(
         state=PublishState.submitting,
     )
     db.add(job)
+    # No direct Celery call here: the publish job and its dispatch intent
+    # either commit together or neither is visible to a worker.
+    enqueue_publish_job_dispatch(db, job)
     if payload.batch_id is None and task.status not in {TaskStatus.published, TaskStatus.canceled}:
         task.status = TaskStatus.publishing
         task.error_code = None
@@ -314,5 +323,4 @@ def publish(
         db.add(task)
     db.commit()
     db.refresh(job)
-    celery_app.send_task("social_publisher.process_job", args=[str(job.id)], queue="social_publish")
     return _response_from_job(job)

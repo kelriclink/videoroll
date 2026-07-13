@@ -4,7 +4,7 @@ import json
 import logging
 import shutil
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -20,7 +20,11 @@ from videoroll.apps.social_publisher.sau_cli import (
     build_upload_video_command,
     run_sau_command,
 )
-from videoroll.apps.publish_lifecycle import enqueue_publish_batch_cleanup, reconcile_publish_batch
+from videoroll.apps.publish_lifecycle import (
+    enqueue_publish_batch_cleanup,
+    reconcile_publish_batch,
+    recover_stale_publish_dispatches,
+)
 from videoroll.apps.outbox.worker_inbox import (
     OperationHeartbeat,
     claim_outbox_operation,
@@ -205,13 +209,23 @@ def _process_job_impl(self, job_id: str) -> dict[str, Any]:
             raise ValueError("active social account not found")
         if account.check_state != "valid":
             raise ValueError("social account is not validated")
-        lock = _redis_client().lock(
-            social_lock_key(job.platform.value, account.id),
-            timeout=int(settings.upload_timeout_seconds + settings.lock_margin_seconds),
-            blocking_timeout=0,
-        )
-        if not lock.acquire(blocking=False):
-            raise self.retry(countdown=30)
+        # Browser-account serialization is only an optimisation.  The job
+        # lease is the correctness boundary; Redis unavailability must not
+        # strand a durable publish intent or turn it into a duplicate path.
+        try:
+            lock = _redis_client().lock(
+                social_lock_key(job.platform.value, account.id),
+                timeout=int(settings.upload_timeout_seconds + settings.lock_margin_seconds),
+                blocking_timeout=0,
+            )
+            if not lock.acquire(blocking=False):
+                raise self.retry(countdown=30)
+        except redis.RedisError:
+            lock = None
+            logger.warning(
+                "social publish account lock unavailable; continuing under database job lease (job_id=%s)",
+                job.id,
+            )
 
         request = _as_dict(job.meta_json)
         video = _as_dict(request.get("video"))
@@ -368,64 +382,18 @@ def process_job(self, job_id: str, outbox_event_id: str | None = None) -> dict[s
 
 @celery_app.task(name="social_publisher.mark_stale_jobs_unknown")
 def mark_stale_jobs_unknown() -> dict[str, int]:
+    """Compatibility task for safe publish-dispatch recovery.
+
+    Historical code guessed that a queued browser job had failed.  A missing
+    worker heartbeat proves no browser side effect happened, so it is now
+    redelivered through the outbox instead.  Expired leases and started jobs
+    remain deliberately unknown until an explicit retry is requested.
+    """
     _ensure_db()
     db = _db()
     try:
-        now = datetime.now(timezone.utc)
-        running_cutoff = now - timedelta(seconds=settings.upload_timeout_seconds + settings.lock_margin_seconds)
-        queued_cutoff = now - timedelta(minutes=30)
-        running = (
-            db.query(PublishJob)
-            .filter(
-                PublishJob.platform.in_([Platform.douyin, Platform.xiaohongshu, Platform.kuaishou]),
-                PublishJob.state == PublishState.submitting,
-                PublishJob.started_at.is_not(None),
-                PublishJob.started_at < running_cutoff,
-            )
-            .all()
-        )
-        queued = (
-            db.query(PublishJob)
-            .filter(
-                PublishJob.platform.in_([Platform.douyin, Platform.xiaohongshu, Platform.kuaishou]),
-                PublishJob.state == PublishState.submitting,
-                PublishJob.started_at.is_(None),
-                PublishJob.created_at < queued_cutoff,
-            )
-            .all()
-        )
-        cleanup_batches: list[tuple[uuid.UUID, uuid.UUID]] = []
-        for job in running:
-            job.state = PublishState.unknown
-            job.finished_at = now
-            job.response_json = {**_as_dict(job.response_json), "error": "worker execution timed out"}
-            db.add(job)
-            task = db.get(Task, job.task_id)
-            if job.batch_id is not None:
-                result = reconcile_publish_batch(db, job.batch_id)
-                if result.cleanup_needed:
-                    cleanup_batches.append((job.task_id, job.batch_id))
-            else:
-                _mark_task_error(task, "SOCIAL_PUBLISH_UNKNOWN", "worker execution timed out; check platform backend before retrying")
-            if task is not None:
-                db.add(task)
-        for job in queued:
-            job.state = PublishState.failed
-            job.finished_at = now
-            job.response_json = {**_as_dict(job.response_json), "error": "job expired before browser execution"}
-            db.add(job)
-            task = db.get(Task, job.task_id)
-            if job.batch_id is not None:
-                result = reconcile_publish_batch(db, job.batch_id)
-                if result.cleanup_needed:
-                    cleanup_batches.append((job.task_id, job.batch_id))
-            else:
-                _mark_task_error(task, "SOCIAL_PUBLISH_FAILED", "job expired before browser execution")
-            if task is not None:
-                db.add(task)
+        result = recover_stale_publish_dispatches(db, limit=100)
         db.commit()
-        for task_id, batch_id in cleanup_batches:
-            _enqueue_batch_cleanup_best_effort(db, task_id, batch_id, needed=True)
-        return {"unknown": len(running), "failed": len(queued)}
+        return {"unknown": result.unknown, "requeued": result.requeued}
     finally:
         db.close()

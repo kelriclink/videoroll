@@ -198,6 +198,14 @@ class PublishService:
         task = self._db.get(Task, task_id, with_for_update=True)
         if not task:
             raise ValueError("task not found")
+        # The task row is the serialization point for publishing.  Recheck
+        # after acquiring it: callers may have read a terminal batch before a
+        # concurrent caller installed an active replacement.
+        current_batch = self._current_batch_for_locked_task(task)
+        if current_batch and current_batch.state == PublishBatchState.active.value:
+            self._db.commit()
+            return current_batch
+
         batch = PublishBatch(
             id=uuid.uuid4(),
             task_id=task_id,
@@ -265,7 +273,7 @@ class PublishService:
         # are committed together. This prevents two callers from both replacing
         # the same terminal batch.
         batch = self._create_batch(task_id, targets, payload)
-        return batch, targets
+        return batch, list(batch.expected_targets or targets)
 
     def _build_enabled_targets(self, payload: dict[str, Any]) -> list[dict[str, Any]]:
         targets: list[dict[str, Any]] = []

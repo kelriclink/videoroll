@@ -182,6 +182,7 @@ class PublishRequest(BaseModel):
     task_id: uuid.UUID
     batch_id: Optional[uuid.UUID] = None
     account_id: Optional[str] = None
+    force_retry: bool = False
     typeid_mode: Literal["meta", "bilibili_predict", "ai_summary"] = "bilibili_predict"
     video: InputRef
     cover: Optional[InputRef] = None
