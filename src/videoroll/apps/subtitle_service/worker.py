@@ -81,7 +81,10 @@ from videoroll.apps.subtitle_service.embeddings import embedding_settings_from_t
 from videoroll.apps.subtitle_service.task_title_store import set_task_titles
 from videoroll.apps.subtitle_service.translate_settings_store import get_translate_settings
 from videoroll.apps.publish_meta_draft import apply_publish_source_overrides, default_publish_meta
-from videoroll.apps.publish_lifecycle import enqueue_publish_batch_cleanup
+from videoroll.apps.outbox.dispatcher import dispatch_outbox_events
+from videoroll.apps.outbox.service import create_outbox_event
+from videoroll.apps.outbox.worker_inbox import claim_outbox_operation, finish_operation, release_operation
+from videoroll.apps.publish_lifecycle import enqueue_publish_batch_cleanup, mark_publish_batch_cleanup_enqueued
 from videoroll.apps.orchestrator_api.youtube_downloader import (
     download_youtube_subtitle,
     extract_youtube_metadata,
@@ -133,6 +136,12 @@ celery_app.conf.update(
         "subtitle-service-publish-cleanup-retry": {
             "task": "subtitle_service.enqueue_pending_publish_batch_cleanups",
             "schedule": 60.0,
+            "args": (),
+            "options": {"queue": "subtitle"},
+        },
+        "subtitle-service-outbox-dispatch": {
+            "task": "subtitle_service.dispatch_outbox",
+            "schedule": 5.0,
             "args": (),
             "options": {"queue": "subtitle"},
         },
@@ -2266,6 +2275,20 @@ def process_render_job(self: Any, render_job_id: str) -> dict[str, Any]:
         rj.progress = 100
         rj.finished_at = _now()
         db.add(rj)
+        # The completed render and its auto-publish instruction are one
+        # transaction.  The dispatcher, rather than this worker, performs the
+        # broker delivery so a broker outage cannot lose auto publishing.
+        after_render = req.get("after_render") if isinstance(req, dict) else None
+        if isinstance(after_render, dict) and after_render.get("publish"):
+            create_outbox_event(
+                db,
+                event_type="render.after_publish",
+                aggregate_type="render_job",
+                aggregate_id=rj.id,
+                task_name="subtitle_service.after_render_publish",
+                args={"args": [str(rj.id)], "queue": "subtitle"},
+                operation_key=f"after-render-publish:{rj.id}",
+            )
         db.commit()
         _safe_append_log_line(log_path, "render job done")
         _safe_upload_log(store, log_path, log_key)
@@ -2274,11 +2297,6 @@ def process_render_job(self: Any, render_job_id: str) -> dict[str, Any]:
             _task_queue_unlock(task)
             db.add(task)
             db.commit()
-
-        # Trigger optional after_render actions (e.g. auto publish).
-        after_render = req.get("after_render") if isinstance(req, dict) else None
-        if isinstance(after_render, dict) and after_render.get("publish"):
-            celery_app.send_task("subtitle_service.after_render_publish", args=[str(rj.id)], queue="subtitle")
 
         celery_app.send_task("subtitle_service.task_queue_tick", args=[], queue="subtitle")
         return {"status": "ok"}
@@ -2319,8 +2337,7 @@ def process_render_job(self: Any, render_job_id: str) -> dict[str, Any]:
         _cleanup_local_work_root(work_root)
 
 
-@celery_app.task(name="subtitle_service.after_render_publish")
-def after_render_publish(render_job_id: str) -> dict[str, Any]:
+def _after_render_publish_impl(render_job_id: str) -> dict[str, Any]:
     _ensure_db()
     db = _db()
     try:
@@ -2380,8 +2397,102 @@ def after_render_publish(render_job_id: str) -> dict[str, Any]:
         db.close()
 
 
+def _claim_outbox_worker_operation(
+    event_id: str | None,
+    *,
+    worker_name: str,
+    lease_seconds: int,
+) -> tuple[str, str] | dict[str, Any] | None:
+    if event_id is None:
+        return None
+    owner = f"{worker_name}:{os.getpid()}:{uuid.uuid4().hex[:12]}"
+    db = _db()
+    try:
+        claim = claim_outbox_operation(db, event_id, owner, lease_seconds)
+        if claim is None:
+            return {"status": "error", "detail": "outbox event not found"}
+        if not claim.acquired:
+            if claim.result_json is not None:
+                return claim.result_json
+            return {"status": "in_progress", "operation_key": claim.operation.operation_key}
+        db.commit()
+        return claim.operation.operation_key, owner
+    finally:
+        db.close()
+
+
+def _finish_outbox_worker_operation(operation_key: str, result: dict[str, Any]) -> None:
+    db = _db()
+    try:
+        finish_operation(db, operation_key, result)
+        db.commit()
+    finally:
+        db.close()
+
+
+def _release_outbox_worker_operation(operation_key: str, owner: str, error: object) -> None:
+    db = _db()
+    try:
+        release_operation(db, operation_key, owner, error)
+        db.commit()
+    finally:
+        db.close()
+
+
+@celery_app.task(name="subtitle_service.after_render_publish")
+def after_render_publish(render_job_id: str, outbox_event_id: str | None = None) -> dict[str, Any]:
+    """Compatibility task name with optional durable-outbox consumption."""
+    _ensure_db()
+    operation = _claim_outbox_worker_operation(
+        outbox_event_id,
+        worker_name="subtitle_service.after_render_publish",
+        lease_seconds=600,
+    )
+    if isinstance(operation, dict):
+        return operation
+    if operation is None:
+        return _after_render_publish_impl(render_job_id)
+    operation_key, owner = operation
+    try:
+        result = _after_render_publish_impl(render_job_id)
+    except Retry as exc:
+        _release_outbox_worker_operation(operation_key, owner, exc)
+        raise
+    _finish_outbox_worker_operation(operation_key, result)
+    return result
+
+
 @celery_app.task(name="subtitle_service.cleanup_task", bind=True, max_retries=20)
-def cleanup_task(self: Any, task_id: str, batch_id: str | None = None) -> dict[str, Any]:
+def cleanup_task(self: Any, task_id: str, batch_id: str | None = None, outbox_event_id: str | None = None) -> dict[str, Any]:
+    """Compatibility task name with an inbox claim for outbox deliveries."""
+    _ensure_db()
+    operation = _claim_outbox_worker_operation(
+        outbox_event_id,
+        worker_name="subtitle_service.cleanup_task",
+        lease_seconds=600,
+    )
+    if isinstance(operation, dict):
+        return operation
+    if operation is None:
+        return _cleanup_task_impl(self, task_id, batch_id)
+    operation_key, owner = operation
+    try:
+        result = _cleanup_task_impl(self, task_id, batch_id)
+    except Retry as exc:
+        _release_outbox_worker_operation(operation_key, owner, exc)
+        raise
+    if result.get("status") == "ok" and batch_id:
+        db = _db()
+        try:
+            if mark_publish_batch_cleanup_enqueued(db, uuid.UUID(batch_id)):
+                db.commit()
+        finally:
+            db.close()
+    _finish_outbox_worker_operation(operation_key, result)
+    return result
+
+
+def _cleanup_task_impl(self: Any, task_id: str, batch_id: str | None = None) -> dict[str, Any]:
     """
     Best-effort cleanup after a task is published:
       - delete local WORK_DIR temp dirs for subtitle/render/youtube
@@ -2520,12 +2631,7 @@ def cleanup_task(self: Any, task_id: str, batch_id: str | None = None) -> dict[s
 
 @celery_app.task(name="subtitle_service.enqueue_pending_publish_batch_cleanups")
 def enqueue_pending_publish_batch_cleanups() -> dict[str, int]:
-    """Repair cleanup delivery after a temporary broker failure.
-
-    ``cleanup_enqueued_at`` is written only after ``send_task`` succeeds, so
-    this idempotently retries the small durable outbox represented by the
-    successful batches themselves.
-    """
+    """Repair legacy cleanup rows by inserting their idempotent outbox event."""
     _ensure_db()
     db = _db()
     enqueued = 0
@@ -2551,6 +2657,23 @@ def enqueue_pending_publish_batch_cleanups() -> dict[str, int]:
                     batch.id,
                 )
         return {"enqueued": enqueued, "failed": failed}
+    finally:
+        db.close()
+
+
+@celery_app.task(name="subtitle_service.dispatch_outbox")
+def dispatch_outbox() -> dict[str, int]:
+    """Deliver every due durable event while retaining existing queue names."""
+    _ensure_db()
+    db = _db()
+    try:
+        result = dispatch_outbox_events(
+            db,
+            celery_app,
+            owner=f"subtitle_service.dispatcher:{os.getpid()}:{uuid.uuid4().hex[:12]}",
+            limit=50,
+        )
+        return {"claimed": result.claimed, "dispatched": result.dispatched, "failed": result.failed}
     finally:
         db.close()
 

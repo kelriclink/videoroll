@@ -155,8 +155,22 @@ def _reconcile_locked_publish_batch(
         db.add(task)
 
     # Do not mark delivery before the configured Celery app has accepted the
-    # task.  A duplicate cleanup is harmless; a lost cleanup is not.
+    # task.  A duplicate cleanup is harmless; a lost cleanup is not.  The
+    # durable event is inserted in this same transaction as the terminal batch
+    # state; the marker itself is written only when cleanup completes.
     cleanup_needed = bool(is_active_batch and evaluation.cleanup_ready and batch.cleanup_enqueued_at is None)
+    if cleanup_needed:
+        from videoroll.apps.outbox.service import create_outbox_event
+
+        create_outbox_event(
+            db,
+            event_type="publish.cleanup",
+            aggregate_type="publish_batch",
+            aggregate_id=batch.id,
+            task_name="subtitle_service.cleanup_task",
+            args={"args": [str(task.id), str(batch.id)], "queue": "subtitle"},
+            operation_key=f"publish-cleanup:{batch.id}",
+        )
 
     return PublishBatchReconciliation(
         batch_id=batch.id,
@@ -242,7 +256,11 @@ def bind_unresolved_social_publish_target(
 
 
 def mark_publish_batch_cleanup_enqueued(db: Session, batch_id: uuid.UUID) -> bool:
-    """Persist cleanup delivery only after ``send_task`` succeeded."""
+    """Persist the terminal cleanup marker after cleanup work completes.
+
+    The historical public name is retained for callers during the rolling
+    deployment; durable delivery is now tracked by ``OutboxEvent`` instead.
+    """
     try:
         task, batch = _lock_task_and_batch(db, batch_id)
     except ValueError:
@@ -265,15 +283,30 @@ def enqueue_publish_batch_cleanup(
     *,
     needed: bool,
 ) -> bool:
-    """Dispatch cleanup with the configured app and record accepted delivery."""
+    """Persist cleanup dispatch and optionally wake the shared dispatcher.
+
+    ``celery_app`` remains in the public signature for legacy callers.  It is
+    only used for a best-effort wake-up; the outbox row is the authoritative
+    record and survives a broker outage.
+    """
     if not needed:
         return False
-    celery_app.send_task(
-        "subtitle_service.cleanup_task",
-        args=[str(task_id), str(batch_id)],
-        queue="subtitle",
+    from videoroll.apps.outbox.service import create_outbox_event
+
+    event = create_outbox_event(
+        db,
+        event_type="publish.cleanup",
+        aggregate_type="publish_batch",
+        aggregate_id=batch_id,
+        task_name="subtitle_service.cleanup_task",
+        args={"args": [str(task_id), str(batch_id)], "queue": "subtitle"},
+        operation_key=f"publish-cleanup:{batch_id}",
     )
-    marked = mark_publish_batch_cleanup_enqueued(db, batch_id)
-    if marked:
-        db.commit()
-    return marked
+    db.commit()
+    try:
+        celery_app.send_task("subtitle_service.dispatch_outbox", args=[], queue="subtitle")
+    except Exception:
+        # The event is already committed and will be picked up by the periodic
+        # dispatcher.  Preserve the old caller signal for diagnostics.
+        raise
+    return event is not None

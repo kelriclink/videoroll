@@ -31,6 +31,12 @@ from videoroll.apps.bilibili_publisher.storage_keys import unique_publish_result
 from videoroll.apps.bilibili_publisher.typeid_recommender import flatten_typelist
 from videoroll.apps.publish_meta_rules import bilibili_text_units, clamp_bilibili_text
 from videoroll.apps.publish_lifecycle import enqueue_publish_batch_cleanup, reconcile_publish_batch
+from videoroll.apps.outbox.worker_inbox import (
+    OperationHeartbeat,
+    claim_outbox_operation,
+    finish_operation,
+    release_operation,
+)
 from videoroll.config import get_bilibili_publisher_settings, get_subtitle_settings
 from videoroll.db.base import Base
 from videoroll.db.auto_migrate import auto_migrate
@@ -622,8 +628,7 @@ def _add_archive_with_desc_retry(
         return client.add_archive(retry_meta, csrf=csrf, tid=tid, uploaded=uploaded, cover_url=cover_url), retry_meta, retry_info
 
 
-@celery_app.task(name="bilibili_publisher.process_job", bind=True, max_retries=5)
-def process_job(self, job_id: str) -> dict[str, Any]:
+def _process_job_impl(self, job_id: str) -> dict[str, Any]:
     _ensure_db()
     db = _db()
     job_uuid: uuid.UUID | None = None
@@ -1075,3 +1080,49 @@ def process_job(self, job_id: str) -> dict[str, Any]:
             except Exception:
                 pass
         db.close()
+
+
+@celery_app.task(name="bilibili_publisher.process_job", bind=True, max_retries=5)
+def process_job(self, job_id: str, outbox_event_id: str | None = None) -> dict[str, Any]:
+    """Consume durable events while preserving the legacy task name/arguments."""
+    _ensure_db()
+    if outbox_event_id is None:
+        return _process_job_impl(self, job_id)
+
+    owner = f"bilibili_publisher.process_job:{os.getpid()}:{uuid.uuid4().hex[:12]}"
+    claim_db = _db()
+    try:
+        claim = claim_outbox_operation(claim_db, outbox_event_id, owner, lease_seconds=1800)
+        if claim is None:
+            return {"status": "error", "detail": "outbox event not found"}
+        if not claim.acquired:
+            if claim.result_json is not None:
+                return claim.result_json
+            return {"status": "in_progress", "operation_key": claim.operation.operation_key}
+        operation_key = claim.operation.operation_key
+        claim_db.commit()
+    finally:
+        claim_db.close()
+
+    heartbeat = OperationHeartbeat(lambda: _db(), operation_key, owner, lease_seconds=1800)
+    heartbeat.start()
+    try:
+        result = _process_job_impl(self, job_id)
+    except Retry as exc:
+        retry_db = _db()
+        try:
+            release_operation(retry_db, operation_key, owner, exc)
+            retry_db.commit()
+        finally:
+            retry_db.close()
+        raise
+    finally:
+        heartbeat.stop()
+
+    finish_db = _db()
+    try:
+        finish_operation(finish_db, operation_key, result)
+        finish_db.commit()
+    finally:
+        finish_db.close()
+    return result
