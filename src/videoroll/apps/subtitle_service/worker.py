@@ -1192,9 +1192,9 @@ def process_job(self: Any, job_id: str) -> dict[str, str]:
                 if after_render:
                     payload["after_render"] = after_render
                 db.add(RenderJob(task_id=task.id, subtitle_job_id=job.id, status=RenderJobStatus.queued, progress=0, request_json=payload))
-                db.commit()
 
-            job.status = SubtitleJobStatus.queued
+            job.status = SubtitleJobStatus.succeeded
+            job.progress = 100
             db.add(job)
             db.commit()
             _safe_append_log_line(log_path, "render queued; waiting for task queue")
@@ -1588,9 +1588,9 @@ def process_job(self: Any, job_id: str) -> dict[str, str]:
             if after_render:
                 payload["after_render"] = after_render
             db.add(RenderJob(task_id=task.id, subtitle_job_id=job.id, status=RenderJobStatus.queued, progress=0, request_json=payload))
-            db.commit()
 
-        job.status = SubtitleJobStatus.queued
+        job.status = SubtitleJobStatus.succeeded
+        job.progress = 100
         db.add(job)
         db.commit()
         _safe_append_log_line(log_path, "render queued; waiting for task queue")
