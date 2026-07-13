@@ -5,6 +5,10 @@ from types import SimpleNamespace
 import pytest
 import httpx
 from fastapi import FastAPI, HTTPException, Request
+from sqlalchemy import create_engine
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.ext.compiler import compiles
+from sqlalchemy.orm import sessionmaker
 
 from videoroll.apps.orchestrator_api import middleware as auth_middleware
 from videoroll.apps.orchestrator_api.services import auth_service
@@ -29,11 +33,24 @@ class _FakeRedis:
     def ttl(self, key: str) -> int:
         return self.ttls.get(key, -2)
 
-    def eval(self, _script: str, _keys: int, key: str, window_seconds: int) -> list[int]:
+    def eval(
+        self,
+        _script: str,
+        _keys: int,
+        key: str,
+        _limit: int,
+        burst_seconds: int,
+        _lockout_base: int,
+        _lockout_max: int,
+    ) -> list[int]:
         count = self.values.get(key, 0) + 1
         self.values[key] = count
-        self.ttls.setdefault(key, int(window_seconds))
+        self.ttls.setdefault(key, int(burst_seconds))
         return [count, self.ttls[key]]
+
+    def expire(self, key: str, seconds: int) -> bool:
+        self.ttls[key] = seconds
+        return True
 
     def delete(self, key: str) -> None:
         self.values.pop(key, None)
@@ -98,6 +115,44 @@ def test_bootstrap_consume_refreshes_state_after_acquiring_row_lock(monkeypatch:
     assert exc_info.value.status_code == 403
 
 
+@compiles(JSONB, "sqlite")
+def _compile_jsonb_for_sqlite(_type: JSONB, _compiler: object, **_kwargs: object) -> str:
+    return "JSON"
+
+
+def test_bootstrap_consumption_refreshes_a_stale_real_sqlite_session() -> None:
+    from videoroll.db.models import AppSetting
+
+    engine = create_engine("sqlite:///:memory:")
+    AppSetting.__table__.create(engine)
+    sessions = sessionmaker(bind=engine, expire_on_commit=False)
+    seed = sessions()
+    seed.add(AppSetting(key="admin.auth", value_json={"bootstrap_consumed": False}))
+    seed.commit()
+    seed.close()
+
+    first = sessions()
+    second = sessions()
+    first.get(AppSetting, "admin.auth")
+    request = SimpleNamespace(
+        app=SimpleNamespace(state=SimpleNamespace(admin_bootstrap_secret="one-time-secret")),
+        state=SimpleNamespace(bootstrap_db=second),
+    )
+    consume_bootstrap_secret(request, "one-time-secret")
+    second.commit()
+
+    stale_request = SimpleNamespace(
+        app=SimpleNamespace(state=SimpleNamespace(admin_bootstrap_secret="one-time-secret")),
+        state=SimpleNamespace(bootstrap_db=first),
+    )
+    with pytest.raises(HTTPException) as exc_info:
+        consume_bootstrap_secret(stale_request, "one-time-secret")
+
+    assert exc_info.value.status_code == 403
+    first.close()
+    second.close()
+
+
 def test_login_rate_limit_returns_retry_after_after_failures(monkeypatch: pytest.MonkeyPatch) -> None:
     fake_redis = _FakeRedis()
     monkeypatch.setattr(
@@ -112,6 +167,38 @@ def test_login_rate_limit_returns_retry_after_after_failures(monkeypatch: pytest
     assert decision.allowed is False
     assert decision.retry_after > 0
     assert check_login_rate_limit("redis://unused", key).allowed is False
+
+
+def test_login_rate_limit_uses_short_burst_and_exponential_lockout() -> None:
+    from videoroll.apps.security.rate_limits import _lockout_seconds
+
+    assert _lockout_seconds(1) < _lockout_seconds(5) < _lockout_seconds(6)
+    assert _lockout_seconds(6) == _lockout_seconds(5) * 2
+
+
+def test_login_rate_limit_repairs_missing_redis_expiry(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _NoExpiryRedis:
+        def __init__(self) -> None:
+            self.expiry: int | None = None
+
+        def eval(self, *_args: object) -> list[int]:
+            return [5, -1]
+
+        def expire(self, _key: str, seconds: int) -> bool:
+            self.expiry = seconds
+            return True
+
+    fake_redis = _NoExpiryRedis()
+    monkeypatch.setattr(
+        "videoroll.apps.security.rate_limits.Redis.from_url",
+        lambda *_args, **_kwargs: fake_redis,
+    )
+
+    decision = record_login_failure("redis://unused", "login:203.0.113.7")
+
+    assert decision.allowed is False
+    assert decision.retry_after > 0
+    assert fake_redis.expiry == decision.retry_after
 
 
 def test_threshold_crossing_failure_returns_retry_after(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -145,6 +232,37 @@ def test_source_ip_ignores_forwarded_header_from_untrusted_client() -> None:
     )
 
     assert auth_service._source_ip(request) == "203.0.113.7"
+
+
+def test_source_ip_uses_xff_only_from_trusted_proxy_and_strips_trusted_hops() -> None:
+    request = SimpleNamespace(
+        app=SimpleNamespace(state=SimpleNamespace(trusted_proxy_cidrs="10.0.0.0/8,172.16.0.0/12")),
+        headers={"x-forwarded-for": "198.51.100.8, 10.1.2.3"},
+        client=SimpleNamespace(host="172.18.0.5"),
+    )
+
+    assert auth_service._source_ip(request) == "198.51.100.8"
+
+
+def test_source_ip_does_not_trust_spoofed_xff_from_public_peer() -> None:
+    request = SimpleNamespace(
+        app=SimpleNamespace(state=SimpleNamespace(trusted_proxy_cidrs="10.0.0.0/8")),
+        headers={"x-forwarded-for": "198.51.100.8"},
+        client=SimpleNamespace(host="8.8.8.8"),
+    )
+
+    assert auth_service._source_ip(request) == "8.8.8.8"
+
+
+def test_internal_http_headers_use_dedicated_service_secret() -> None:
+    from videoroll.apps.orchestrator_api.infrastructure.internal_http import internal_http_headers
+    from videoroll.apps.security.service_auth import INTERNAL_TOKEN_HEADER, service_token
+
+    settings = SimpleNamespace(
+        internal_api_secret="internal-secret",
+        s3_secret_access_key="s3-secret-a",
+    )
+    assert internal_http_headers(settings) == {INTERNAL_TOKEN_HEADER: service_token(settings)}
 
 
 def test_security_audit_event_drops_sensitive_values_and_bounds_text() -> None:

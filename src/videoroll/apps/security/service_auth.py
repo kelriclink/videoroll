@@ -41,7 +41,7 @@ def _derive_secret(secret: str, context: bytes) -> str:
 
 def _validate_runtime_secret(settings: Any, name: str, env_name: str) -> str:
     value = _secret_value(settings, name)
-    development_mode = bool(getattr(settings, "development_mode", True))
+    development_mode = getattr(settings, "development_mode", False) is True
     if not development_mode and value.lower() in _KNOWN_DEFAULT_SECRETS:
         raise ValueError(f"{env_name} must be set to a non-default value outside development mode")
     return value
@@ -66,7 +66,12 @@ def validate_bootstrap_secret(settings: Any) -> None:
 
 
 def require_internal_service(request: Request) -> None:
-    if request.url.path == "/health":
+    scope_path = str(request.scope.get("path") or request.url.path or "/")
+    root_path = str(request.scope.get("root_path") or "").rstrip("/")
+    normalized_path = scope_path
+    if root_path and normalized_path.startswith(root_path):
+        normalized_path = normalized_path[len(root_path) :] or "/"
+    if normalized_path == "/health":
         return
 
     expected = str(getattr(request.app.state, "internal_service_token", "") or "").strip()

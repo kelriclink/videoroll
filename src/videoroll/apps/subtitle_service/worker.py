@@ -45,11 +45,10 @@ from videoroll.db.models import (
 )
 from videoroll.db.session import get_engine, get_sessionmaker
 from videoroll.storage.s3 import S3Store
-from videoroll.utils.internal_api_token import internal_api_token
+from videoroll.apps.security.service_auth import INTERNAL_TOKEN_HEADER, service_token
 from videoroll.utils.auto_youtube import parse_auto_youtube_created_by
 from videoroll.utils.hashing import sha256_file
 from videoroll.utils.task_queue import available_task_queue_capacity, task_queue_slot_reserved_for
-from videoroll.apps.orchestrator_api.admin_auth_store import INTERNAL_TOKEN_HEADER
 from videoroll.apps.subtitle_service.processing import (
     Segment,
     convert_subtitle_to_srt,
@@ -111,7 +110,7 @@ def _positive_int_env(name: str, default: int) -> int:
 
 
 settings = get_subtitle_settings()
-_ORCH_INTERNAL_TOKEN = internal_api_token(settings.s3_secret_access_key)
+_ORCH_INTERNAL_TOKEN = service_token(settings)
 _ORCH_INTERNAL_HEADERS = {INTERNAL_TOKEN_HEADER: _ORCH_INTERNAL_TOKEN} if _ORCH_INTERNAL_TOKEN else {}
 logger = logging.getLogger(__name__)
 _DB_READY_LOCK = threading.Lock()

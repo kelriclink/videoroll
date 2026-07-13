@@ -1,6 +1,7 @@
 import { PropsWithChildren, useEffect, useMemo, useState } from "react";
 import { fetchJson } from "../lib/http";
 import { ORCHESTRATOR_URL } from "../lib/urls";
+import { buildSetupAuthRequest } from "./AuthGate.helpers";
 
 type AuthStatus = {
   password_set: boolean;
@@ -19,12 +20,11 @@ async function getAuthStatus(): Promise<AuthStatus> {
   return await fetchJson<AuthStatus>(`${ORCHESTRATOR_URL}/auth/status`);
 }
 
-async function setupPassword(password: string): Promise<AuthStatus> {
-  return await fetchJson<AuthStatus>(`${ORCHESTRATOR_URL}/auth/setup`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ password }),
-  });
+async function setupPassword(password: string, bootstrapSecret: string): Promise<AuthStatus> {
+  return await fetchJson<AuthStatus>(
+    `${ORCHESTRATOR_URL}/auth/setup`,
+    buildSetupAuthRequest(password, bootstrapSecret),
+  );
 }
 
 async function login(password: string): Promise<AuthStatus> {
@@ -45,6 +45,7 @@ export default function AuthGate({ children }: PropsWithChildren) {
 
   const [password, setPassword] = useState("");
   const [password2, setPassword2] = useState("");
+  const [bootstrapSecret, setBootstrapSecret] = useState("");
   const [submitError, setSubmitError] = useState("");
   const [submitting, setSubmitting] = useState(false);
 
@@ -82,7 +83,8 @@ export default function AuthGate({ children }: PropsWithChildren) {
       if (mode === "setup") {
         if (password.length < 8) throw new Error("Password too short (min 8 chars)");
         if (password !== password2) throw new Error("Passwords do not match");
-        const s = await setupPassword(password);
+        if (!bootstrapSecret) throw new Error("Bootstrap secret is required");
+        const s = await setupPassword(password, bootstrapSecret);
         setStatus(s);
       } else {
         const s = await login(password);
@@ -90,6 +92,7 @@ export default function AuthGate({ children }: PropsWithChildren) {
       }
       setPassword("");
       setPassword2("");
+      setBootstrapSecret("");
     } catch (e) {
       setSubmitError(clampError(e));
     } finally {
@@ -150,27 +153,39 @@ export default function AuthGate({ children }: PropsWithChildren) {
           </div>
 
           {mode === "setup" ? (
-            <div className="mt-4">
-              <label className="block text-sm font-medium text-slate-700">Confirm password</label>
-              <input
-                type="password"
-                value={password2}
-                onChange={(e) => setPassword2(e.target.value)}
-                className="mt-1 w-full rounded border px-3 py-2 text-sm outline-none focus:border-slate-500"
-                placeholder="••••••••"
-              />
-            </div>
+            <>
+              <div className="mt-4">
+                <label className="block text-sm font-medium text-slate-700">Confirm password</label>
+                <input
+                  type="password"
+                  value={password2}
+                  onChange={(e) => setPassword2(e.target.value)}
+                  className="mt-1 w-full rounded border px-3 py-2 text-sm outline-none focus:border-slate-500"
+                  placeholder="••••••••"
+                />
+              </div>
+              <div className="mt-4">
+                <label className="block text-sm font-medium text-slate-700">Bootstrap secret</label>
+                <input
+                  type="password"
+                  value={bootstrapSecret}
+                  onChange={(e) => setBootstrapSecret(e.target.value)}
+                  className="mt-1 w-full rounded border px-3 py-2 text-sm outline-none focus:border-slate-500"
+                  autoComplete="off"
+                />
+              </div>
+            </>
           ) : null}
 
           {submitError ? <div className="mt-4 text-sm text-red-700">{submitError}</div> : null}
 
           <button
             type="button"
-            disabled={submitting || !password}
+            disabled={submitting || !password || (mode === "setup" && !bootstrapSecret)}
             onClick={submit}
             className={[
               "mt-6 inline-flex w-full items-center justify-center rounded px-4 py-2 text-sm font-medium",
-              submitting || !password
+              submitting || !password || (mode === "setup" && !bootstrapSecret)
                 ? "cursor-not-allowed bg-slate-200 text-slate-500"
                 : "bg-slate-900 text-white hover:bg-slate-800",
             ].join(" ")}
@@ -186,4 +201,3 @@ export default function AuthGate({ children }: PropsWithChildren) {
     </div>
   );
 }
-

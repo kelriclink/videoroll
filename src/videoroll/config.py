@@ -19,7 +19,7 @@ class CommonSettings(BaseSettings):
     redis_url: str = Field(..., alias="REDIS_URL")
 
     development_mode: bool = Field(False, alias="DEVELOPMENT_MODE")
-    trust_proxy_headers: bool = Field(False, alias="TRUST_PROXY_HEADERS")
+    trusted_proxy_cidrs: str = Field("", alias="TRUSTED_PROXY_CIDRS")
     internal_api_secret: str = Field(
         "videoroll-development-internal-secret",
         alias="INTERNAL_API_SECRET",

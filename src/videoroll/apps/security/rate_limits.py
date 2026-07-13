@@ -7,14 +7,22 @@ from redis.exceptions import RedisError
 
 
 LOGIN_FAILURE_LIMIT = 5
-LOGIN_WINDOW_SECONDS = 15 * 60
+LOGIN_BURST_WINDOW_SECONDS = 60
+LOGIN_LOCKOUT_BASE_SECONDS = 120
+LOGIN_LOCKOUT_MAX_SECONDS = 60 * 60
 _KEY_PREFIX = "videoroll:auth-rate-limit:"
 
 _RECORD_FAILURE_SCRIPT = """
 local count = redis.call('INCR', KEYS[1])
-if count == 1 then
-  redis.call('EXPIRE', KEYS[1], ARGV[1])
+local limit = tonumber(ARGV[1])
+local burst_window = tonumber(ARGV[2])
+local lockout_base = tonumber(ARGV[3])
+local lockout_max = tonumber(ARGV[4])
+local expiry = burst_window
+if count >= limit then
+  expiry = math.min(lockout_max, lockout_base * (2 ^ (count - limit)))
 end
+redis.call('EXPIRE', KEYS[1], expiry)
 local ttl = redis.call('TTL', KEYS[1])
 return {count, ttl}
 """
@@ -47,8 +55,20 @@ def _redis_key(key: str) -> str:
     return _KEY_PREFIX + normalized
 
 
-def _retry_after(ttl: int) -> int:
-    return ttl if ttl > 0 else LOGIN_WINDOW_SECONDS
+def _lockout_seconds(attempts: int) -> int:
+    count = max(0, int(attempts))
+    if count < LOGIN_FAILURE_LIMIT:
+        return LOGIN_BURST_WINDOW_SECONDS
+    exponent = min(16, count - LOGIN_FAILURE_LIMIT)
+    return min(LOGIN_LOCKOUT_MAX_SECONDS, LOGIN_LOCKOUT_BASE_SECONDS * (2**exponent))
+
+
+def _ensure_expiry(client: Redis, redis_key: str, attempts: int, ttl: int) -> int:
+    if ttl > 0:
+        return ttl
+    expiry = _lockout_seconds(attempts)
+    client.expire(redis_key, expiry)
+    return expiry
 
 
 def check_login_rate_limit(redis_url: str, key: str) -> RateLimitDecision:
@@ -57,12 +77,14 @@ def check_login_rate_limit(redis_url: str, key: str) -> RateLimitDecision:
         client = _client(redis_url)
         raw_count = client.get(redis_key)
         count = int(raw_count or 0)
+        ttl = int(client.ttl(redis_key)) if count else 0
+        if count and ttl <= 0:
+            ttl = _ensure_expiry(client, redis_key, count, ttl)
         if count < LOGIN_FAILURE_LIMIT:
             return RateLimitDecision(allowed=True, attempts=count)
-        ttl = int(client.ttl(redis_key))
         return RateLimitDecision(
             allowed=False,
-            retry_after=_retry_after(ttl),
+            retry_after=ttl,
             attempts=count,
         )
     except (RedisError, OSError, ValueError) as exc:
@@ -72,16 +94,21 @@ def check_login_rate_limit(redis_url: str, key: str) -> RateLimitDecision:
 def record_login_failure(redis_url: str, key: str) -> RateLimitDecision:
     redis_key = _redis_key(key)
     try:
-        count, ttl = _client(redis_url).eval(
+        client = _client(redis_url)
+        count, ttl = client.eval(
             _RECORD_FAILURE_SCRIPT,
             1,
             redis_key,
-            LOGIN_WINDOW_SECONDS,
+            LOGIN_FAILURE_LIMIT,
+            LOGIN_BURST_WINDOW_SECONDS,
+            LOGIN_LOCKOUT_BASE_SECONDS,
+            LOGIN_LOCKOUT_MAX_SECONDS,
         )
         count_i = int(count)
+        ttl_i = _ensure_expiry(client, redis_key, count_i, int(ttl))
         return RateLimitDecision(
             allowed=count_i < LOGIN_FAILURE_LIMIT,
-            retry_after=0 if count_i < LOGIN_FAILURE_LIMIT else _retry_after(int(ttl)),
+            retry_after=0 if count_i < LOGIN_FAILURE_LIMIT else ttl_i,
             attempts=count_i,
         )
     except (RedisError, OSError, ValueError, TypeError) as exc:

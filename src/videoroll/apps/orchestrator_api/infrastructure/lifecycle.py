@@ -31,7 +31,7 @@ def initialize_runtime(app: FastAPI) -> OrchestratorScheduler:
 
     app.state.database_url = settings.database_url
     app.state.redis_url = settings.redis_url
-    app.state.trust_proxy_headers = settings.trust_proxy_headers
+    app.state.trusted_proxy_cidrs = settings.trusted_proxy_cidrs
     app.state.internal_header_token = service_token(settings)
     app.state.internal_service_token = service_token(settings)
     app.state.admin_cookie_secret = admin_cookie_secret(settings)

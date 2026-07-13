@@ -55,17 +55,49 @@ def set_device_cookie(response: Response, value: str, *, secure: bool) -> None:
 
 
 def _source_ip(request: Request) -> str:
-    trust_proxy_headers = bool(
-        getattr(getattr(getattr(request, "app", None), "state", None), "trust_proxy_headers", False)
-    )
-    forwarded = ""
-    if trust_proxy_headers:
-        forwarded = str(request.headers.get("x-forwarded-for") or "").split(",", 1)[0].strip()
-    candidate = forwarded or str(getattr(request.client, "host", "") or "").strip()
+    peer_text = str(getattr(request.client, "host", "") or "").strip()
     try:
-        return ipaddress.ip_address(candidate).compressed
+        peer = ipaddress.ip_address(peer_text)
     except ValueError:
         return "unknown"
+
+    raw_cidrs = str(
+        getattr(getattr(getattr(request, "app", None), "state", None), "trusted_proxy_cidrs", "")
+        or ""
+    )
+    trusted_networks: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
+    for raw_cidr in raw_cidrs.split(",")[:32]:
+        cidr = raw_cidr.strip()
+        if not cidr:
+            continue
+        try:
+            trusted_networks.append(ipaddress.ip_network(cidr, strict=False))
+        except ValueError:
+            continue
+
+    def is_trusted(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+        return any(address.version == network.version and address in network for network in trusted_networks)
+
+    if not trusted_networks or not is_trusted(peer):
+        return peer.compressed
+
+    forwarded_values = [
+        part.strip()
+        for part in str(request.headers.get("x-forwarded-for") or "").split(",")
+    ]
+    if not forwarded_values or not all(forwarded_values):
+        return peer.compressed
+    try:
+        forwarded = [ipaddress.ip_address(value) for value in forwarded_values]
+    except ValueError:
+        return peer.compressed
+
+    candidate = peer
+    for hop in reversed(forwarded):
+        if not is_trusted(candidate):
+            break
+        candidate = hop
+    return candidate.compressed
 
 
 def _request_id(request: Request) -> str | None:
@@ -130,6 +162,12 @@ def _check_rate_limit(request: Request, db: Session, endpoint: str) -> str:
         )
         raise HTTPException(status_code=503, detail="authentication rate limiter unavailable") from exc
     if not decision.allowed:
+        try:
+            extended = record_login_failure(redis_url, key)
+            if not extended.allowed:
+                decision = extended
+        except RateLimitUnavailable:
+            pass
         _audit(
             db,
             request,
