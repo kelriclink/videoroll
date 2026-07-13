@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import io
 from pathlib import Path
 import uuid
 from unittest.mock import AsyncMock, Mock, patch
@@ -9,6 +10,60 @@ import pytest
 
 from videoroll.apps.orchestrator_api.services import asset_service
 from videoroll.db.models import AppSetting, Asset, AssetKind
+
+
+def test_inline_cover_asset_has_nosniff_and_is_forced_to_attachment() -> None:
+    task_id = uuid.uuid4()
+    asset_id = uuid.uuid4()
+    asset = Mock(
+        id=asset_id,
+        task_id=task_id,
+        kind=AssetKind.cover_image,
+        storage_key="final/cover.svg",
+        size_bytes=24,
+    )
+    db = Mock()
+    db.get.side_effect = lambda model, key: asset if model is Asset and key == asset_id else None
+    s3 = Mock()
+    s3.head_object.return_value = {
+        "ContentLength": 24,
+        "ContentType": "image/svg+xml",
+    }
+    s3.get_object.return_value = {
+        "Body": io.BytesIO(b"<svg/onload=alert(1)>"),
+        "ContentLength": 24,
+        "ContentType": "image/svg+xml",
+    }
+
+    result = asset_service.prepare_asset_stream(
+        db,
+        s3,
+        task_id=task_id,
+        asset_id=asset_id,
+        range_header="",
+    )
+
+    assert result.media_type == "application/octet-stream"
+    assert result.headers["X-Content-Type-Options"] == "nosniff"
+    assert result.headers["Content-Disposition"].startswith("attachment")
+
+
+def test_video_asset_with_safe_type_remains_inline() -> None:
+    asset = Mock(kind=AssetKind.video_final, storage_key="final/video.mp4")
+
+    headers = asset_service.safe_asset_headers(asset, "video/mp4", inline=True)
+
+    assert headers["X-Content-Type-Options"] == "nosniff"
+    assert headers["Content-Disposition"].startswith("inline")
+
+
+def test_video_asset_with_active_content_type_is_not_inline() -> None:
+    asset = Mock(kind=AssetKind.video_final, storage_key="final/video.mp4")
+
+    headers = asset_service.safe_asset_headers(asset, "text/html", inline=True)
+
+    assert headers["X-Content-Type-Options"] == "nosniff"
+    assert headers["Content-Disposition"].startswith("attachment")
 
 
 def test_delete_final_asset_defers_object_delete_until_a_later_retry() -> None:

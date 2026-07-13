@@ -15,7 +15,11 @@ from botocore.exceptions import ClientError
 from fastapi import HTTPException, UploadFile
 from sqlalchemy.orm import Session
 from starlette.concurrency import run_in_threadpool
+from starlette.datastructures import Headers
 
+from videoroll.apps.orchestrator_api.services.image_validation import (
+    validate_and_reencode_cover,
+)
 from videoroll.apps.subtitle_service.task_title_store import get_task_display_title_with_s3
 from videoroll.db.models import AppSetting, Asset, AssetKind, Subtitle, Task, TaskStatus
 from videoroll.storage.s3 import S3Store
@@ -37,6 +41,27 @@ class AssetStreamResult:
     media_type: str | None
     headers: dict[str, str]
     status_code: int = 200
+
+
+_SAFE_CONTENT_TYPES_BY_KIND: dict[AssetKind, frozenset[str]] = {
+    AssetKind.video_raw: frozenset(
+        {"video/mp4", "video/webm", "video/quicktime", "video/x-matroska"}
+    ),
+    AssetKind.video_final: frozenset(
+        {"video/mp4", "video/webm", "video/quicktime", "video/x-matroska"}
+    ),
+    AssetKind.audio_wav: frozenset({"audio/wav", "audio/x-wav"}),
+    AssetKind.cover_image: frozenset({"image/jpeg", "image/png", "image/webp"}),
+    AssetKind.metadata_json: frozenset({"application/json"}),
+    AssetKind.segments_json: frozenset({"application/json"}),
+    AssetKind.publish_result: frozenset({"application/json"}),
+    AssetKind.subtitle_srt: frozenset({"application/x-subrip", "text/plain"}),
+    AssetKind.subtitle_ass: frozenset({"text/plain"}),
+    AssetKind.log: frozenset({"text/plain"}),
+}
+_INLINE_ASSET_KINDS = frozenset(
+    {AssetKind.video_raw, AssetKind.video_final, AssetKind.audio_wav}
+)
 
 
 def as_dict(value: Any) -> dict[str, Any]:
@@ -61,6 +86,34 @@ def content_disposition(filename: str, *, inline: bool) -> str:
     fallback = fallback.replace("\\", "_").replace('"', "_").strip() or "download.bin"
     encoded = quote(cleaned, safe="")
     return f"{disposition}; filename=\"{fallback}\"; filename*=UTF-8''{encoded}"
+
+
+def safe_asset_content_type(asset: Asset, content_type: str | None) -> str:
+    normalized = str(content_type or "").split(";", 1)[0].strip().lower()
+    allowed = _SAFE_CONTENT_TYPES_BY_KIND.get(asset.kind, frozenset())
+    return normalized if normalized in allowed else "application/octet-stream"
+
+
+def safe_asset_headers(
+    asset: Asset,
+    content_type: str | None,
+    inline: bool,
+    *,
+    filename: str | None = None,
+) -> dict[str, str]:
+    safe_type = safe_asset_content_type(asset, content_type)
+    allow_inline = (
+        inline
+        and asset.kind in _INLINE_ASSET_KINDS
+        and safe_type != "application/octet-stream"
+    )
+    return {
+        "X-Content-Type-Options": "nosniff",
+        "Content-Disposition": content_disposition(
+            filename or Path(asset.storage_key).name or "download.bin",
+            inline=allow_inline,
+        ),
+    }
 
 
 def suggest_asset_filename(db: Session, task_id: uuid.UUID, asset: Asset, *, s3: S3Store | None) -> str:
@@ -254,13 +307,14 @@ def prepare_asset_download(
             raise HTTPException(status_code=404, detail="asset object not found") from exc
         raise
     filename = suggest_asset_filename(db, task_id, asset, s3=s3)
-    headers = {"Content-Disposition": content_disposition(filename, inline=False)}
+    content_type = response.get("ContentType") or "application/octet-stream"
+    headers = safe_asset_headers(asset, content_type, False, filename=filename)
     length = response.get("ContentLength") or asset.size_bytes
     if isinstance(length, int):
         headers["Content-Length"] = str(length)
     return AssetStreamResult(
         body=response["Body"],
-        media_type=response.get("ContentType") or "application/octet-stream",
+        media_type=safe_asset_content_type(asset, content_type),
         headers=headers,
     )
 
@@ -276,18 +330,18 @@ def prepare_asset_stream(
     asset = get_task_asset(db, task_id, asset_id)
     filename = suggest_asset_filename(db, task_id, asset, s3=s3)
     total_size: int | None = None
-    media_type = "application/octet-stream"
+    stored_content_type = "application/octet-stream"
     try:
         head = s3.head_object(asset.storage_key)
         if isinstance(head.get("ContentLength"), int):
             total_size = int(head["ContentLength"])
         if head.get("ContentType"):
-            media_type = str(head["ContentType"]) or media_type
+            stored_content_type = str(head["ContentType"]) or stored_content_type
     except Exception:
         total_size = asset.size_bytes if isinstance(asset.size_bytes, int) else None
     base_headers = {
         "Accept-Ranges": "bytes",
-        "Content-Disposition": content_disposition(filename, inline=True),
+        **safe_asset_headers(asset, stored_content_type, True, filename=filename),
     }
     if range_header and isinstance(total_size, int) and total_size > 0:
         parsed = parse_range_header(range_header, total_size)
@@ -295,7 +349,7 @@ def prepare_asset_stream(
             return AssetStreamResult(
                 body=None,
                 media_type=None,
-                headers={"Content-Range": f"bytes */{total_size}"},
+                headers={**base_headers, "Content-Range": f"bytes */{total_size}"},
                 status_code=416,
             )
         start, end = parsed
@@ -307,7 +361,7 @@ def prepare_asset_stream(
             raise
         return AssetStreamResult(
             body=response["Body"],
-            media_type=media_type,
+            media_type=safe_asset_content_type(asset, stored_content_type),
             headers={
                 **base_headers,
                 "Content-Range": f"bytes {start}-{end}/{total_size}",
@@ -321,13 +375,17 @@ def prepare_asset_stream(
         if is_s3_object_missing(exc):
             raise HTTPException(status_code=404, detail="asset object not found") from exc
         raise
-    headers = dict(base_headers)
+    response_content_type = response.get("ContentType") or stored_content_type
+    headers = {
+        "Accept-Ranges": "bytes",
+        **safe_asset_headers(asset, response_content_type, True, filename=filename),
+    }
     length = response.get("ContentLength") or asset.size_bytes
     if isinstance(length, int):
         headers["Content-Length"] = str(length)
     return AssetStreamResult(
         body=response["Body"],
-        media_type=response.get("ContentType") or media_type,
+        media_type=safe_asset_content_type(asset, response_content_type),
         headers=headers,
     )
 
@@ -473,11 +531,25 @@ async def upload_task_cover(
     s3: S3Store,
 ) -> Asset:
     task = get_task(db, task_id)
-    if file.content_type and not file.content_type.startswith("image/"):
-        raise HTTPException(status_code=400, detail="cover must be an image")
+    try:
+        await file.seek(0)
+        validated = await run_in_threadpool(validate_and_reencode_cover, file.file)
+    finally:
+        try:
+            await file.close()
+        except Exception:
+            pass
+    canonical_file = tempfile.SpooledTemporaryFile(max_size=UPLOAD_COVER_MAX_BYTES)
+    canonical_file.write(validated.data)
+    canonical_file.seek(0)
+    canonical_upload = UploadFile(
+        canonical_file,
+        filename=f"cover{validated.extension}",
+        headers=Headers({"content-type": validated.content_type}),
+    )
     return await store_uploaded_task_asset(
         task=task,
-        file=file,
+        file=canonical_upload,
         s3=s3,
         db=db,
         temp_prefix="videoroll_cover_",
