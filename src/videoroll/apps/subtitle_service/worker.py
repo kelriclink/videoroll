@@ -119,12 +119,22 @@ def _positive_int_env(name: str, default: int) -> int:
 
 
 settings = get_subtitle_settings()
-_ORCH_INTERNAL_TOKEN = service_token(settings)
-_ORCH_INTERNAL_HEADERS = {INTERNAL_TOKEN_HEADER: _ORCH_INTERNAL_TOKEN} if _ORCH_INTERNAL_TOKEN else {}
 logger = logging.getLogger(__name__)
 _DB_READY_LOCK = threading.Lock()
 _DB_READY_PID: int | None = None
 _TASK_QUEUE_TICK_INTERVAL_SECONDS = _positive_int_env("TASK_QUEUE_TICK_INTERVAL_SECONDS", 10)
+
+
+def _orchestrator_internal_headers() -> dict[str, str]:
+    """Derive the service credential at the side-effect boundary.
+
+    Importing a worker is not a service start and must remain possible for
+    offline tooling and tests.  A real worker start and every orchestrator
+    request still validate the dedicated production secret fail-closed.
+    """
+    return {INTERNAL_TOKEN_HEADER: service_token(settings)}
+
+
 celery_app = Celery("subtitle_service", broker=settings.redis_url, backend=settings.redis_url)
 celery_app.conf.update(
     task_serializer="json",
@@ -747,6 +757,9 @@ def _fallback_bilibili_tags(*, title: str, summary: str, transcript: str, n: int
 @worker_init.connect
 def _on_worker_init(**_kwargs: Any) -> None:
     """Initialize runtime state and let the scheduler recover expired leases."""
+    # Validate production service identity during an actual worker start, not
+    # while this module is imported by offline tooling or tests.
+    _orchestrator_internal_headers()
     try:
         _ensure_db()
         celery_app.send_task("subtitle_service.task_queue_tick", args=[], queue="subtitle")
@@ -2694,7 +2707,10 @@ def auto_youtube_pipeline(self: Any, task_id: str, overrides: dict[str, Any] | N
         while True:
             try:
                 timeout_seconds = float(getattr(settings, "orchestrator_timeout_seconds", 1800.0) or 1800.0)
-                with httpx.Client(timeout=httpx.Timeout(timeout_seconds, connect=10.0), headers=_ORCH_INTERNAL_HEADERS) as client:
+                with httpx.Client(
+                    timeout=httpx.Timeout(timeout_seconds, connect=10.0),
+                    headers=_orchestrator_internal_headers(),
+                ) as client:
                     resp = client.post(f"{orch_base}/tasks/{tid}/actions/youtube_download")
                     resp.raise_for_status()
                     yt = resp.json() if resp.content else {}
