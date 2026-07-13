@@ -1,13 +1,20 @@
 from __future__ import annotations
 
+import base64
 import ipaddress
 import json
+import queue
 import socket
+import time
 from dataclasses import dataclass
+from threading import BoundedSemaphore, Thread
 from typing import Any, Mapping
 from urllib.parse import urljoin, urlsplit
 
 import httpcore
+import httpx
+
+from videoroll.apps.security.service_auth import INTERNAL_TOKEN_HEADER
 
 
 _ALLOWED_SCHEMES = {"http": 80, "https": 443}
@@ -15,6 +22,8 @@ _REDIRECT_STATUSES = {301, 302, 303, 307, 308}
 _MAX_TIMEOUT_SECONDS = 60.0
 _MAX_RESPONSE_BYTES = 2_000_000
 _MAX_REDIRECTS = 5
+_RESOLVER_SLOTS = BoundedSemaphore(16)
+_DEFAULT_GATEWAY_HOSTNAMES = frozenset({"egress-gateway"})
 _DEFAULT_HEADERS = {
     "accept": "application/json, text/html;q=0.9, text/plain;q=0.8, */*;q=0.1",
     "user-agent": "VideoRoll-Egress-Gateway/1.0",
@@ -29,6 +38,14 @@ _FORBIDDEN_REQUEST_HEADERS = {
 
 
 class EgressDenied(RuntimeError):
+    pass
+
+
+class EgressGatewayError(RuntimeError):
+    pass
+
+
+class EgressTimeout(TimeoutError):
     pass
 
 
@@ -71,6 +88,101 @@ class EgressResponse:
             raise RuntimeError(f"egress request returned HTTP {self.status_code}")
 
 
+class EgressGatewayClient:
+    def __init__(
+        self,
+        gateway_url: str,
+        token: str,
+        *,
+        timeout: float = 20.0,
+        transport: httpx.BaseTransport | None = None,
+    ) -> None:
+        parsed = urlsplit(str(gateway_url or "").strip())
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            raise EgressGatewayError("egress gateway URL must be HTTP or HTTPS")
+        if parsed.username is not None or parsed.password is not None or parsed.query or parsed.fragment:
+            raise EgressGatewayError("egress gateway URL is invalid")
+        hostname = str(parsed.hostname).strip().rstrip(".").lower()
+        if hostname not in _DEFAULT_GATEWAY_HOSTNAMES:
+            raise EgressGatewayError("egress gateway URL must use an explicitly allowed hostname")
+        clean_token = str(token or "").strip()
+        if not clean_token:
+            raise EgressGatewayError("egress gateway service token is unavailable")
+        base_path = parsed.path.rstrip("/")
+        self.fetch_url = parsed._replace(path=f"{base_path}/fetch", query="", fragment="").geturl()
+        self.client = httpx.Client(
+            timeout=httpx.Timeout(max(1.0, min(65.0, float(timeout) + 5.0))),
+            follow_redirects=False,
+            trust_env=False,
+            headers={INTERNAL_TOKEN_HEADER: clean_token},
+            transport=transport,
+        )
+
+    def __enter__(self) -> EgressGatewayClient:
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> bool:
+        self.close()
+        return False
+
+    def close(self) -> None:
+        self.client.close()
+
+    def fetch(
+        self,
+        url: str,
+        *,
+        timeout: float,
+        max_bytes: int,
+        redirects: int,
+    ) -> EgressResponse:
+        try:
+            response = self.client.post(
+                self.fetch_url,
+                json={
+                    "url": str(url or "").strip(),
+                    "timeout": float(timeout),
+                    "max_bytes": int(max_bytes),
+                    "redirects": int(redirects),
+                },
+            )
+        except httpx.HTTPError as exc:
+            raise EgressGatewayError(f"egress gateway request failed: {type(exc).__name__}") from exc
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise EgressGatewayError("egress gateway returned invalid JSON") from exc
+        if response.status_code >= 400:
+            detail = (
+                str(payload.get("detail") or "egress gateway rejected the request")
+                if isinstance(payload, dict)
+                else "egress gateway rejected the request"
+            )
+            if response.status_code in {401, 403}:
+                raise EgressDenied(detail[:300])
+            raise EgressGatewayError(detail[:300])
+        if not isinstance(payload, dict):
+            raise EgressGatewayError("egress gateway response must be an object")
+        try:
+            content = base64.b64decode(str(payload.get("body_base64") or ""), validate=True)
+            status_code = int(payload["status_code"])
+            response_url = str(payload["url"])
+            response_headers = payload["headers"]
+        except (KeyError, TypeError, ValueError) as exc:
+            raise EgressGatewayError("egress gateway response is malformed") from exc
+        if len(content) > max(1, int(max_bytes)):
+            raise EgressGatewayError("egress gateway response exceeded the requested byte limit")
+        if not isinstance(response_headers, dict):
+            raise EgressGatewayError("egress gateway response headers are malformed")
+        return EgressResponse(
+            status_code=status_code,
+            headers={str(name).lower(): str(value) for name, value in response_headers.items()},
+            content=content,
+            url=response_url,
+            truncated=bool(payload.get("truncated")),
+        )
+
+
 def _normalized_hostname(raw_hostname: str) -> str:
     hostname = str(raw_hostname or "").strip().rstrip(".")
     if not hostname or "%" in hostname:
@@ -88,7 +200,44 @@ def _is_global_address(value: str) -> bool:
         return False
 
 
-def resolve_public_endpoint(url: str) -> ResolvedEndpoint:
+def _getaddrinfo_with_deadline(hostname: str, port: int, deadline: float | None) -> list[tuple[Any, ...]]:
+    if deadline is None:
+        return socket.getaddrinfo(
+            hostname,
+            port,
+            type=socket.SOCK_STREAM,
+            proto=socket.IPPROTO_TCP,
+        )
+
+    if not _RESOLVER_SLOTS.acquire(timeout=_remaining_time(deadline)):
+        raise EgressTimeout("egress total deadline exceeded during DNS resolution")
+    results: queue.Queue[tuple[bool, Any]] = queue.Queue(maxsize=1)
+
+    def resolve() -> None:
+        try:
+            value = socket.getaddrinfo(
+                hostname,
+                port,
+                type=socket.SOCK_STREAM,
+                proto=socket.IPPROTO_TCP,
+            )
+            results.put((True, value))
+        except Exception as exc:
+            results.put((False, exc))
+        finally:
+            _RESOLVER_SLOTS.release()
+
+    Thread(target=resolve, name="videoroll-egress-dns", daemon=True).start()
+    try:
+        ok, value = results.get(timeout=_remaining_time(deadline))
+    except queue.Empty as exc:
+        raise EgressTimeout("egress total deadline exceeded during DNS resolution") from exc
+    if not ok:
+        raise value
+    return value
+
+
+def resolve_public_endpoint(url: str, *, deadline: float | None = None) -> ResolvedEndpoint:
     raw_url = str(url or "").strip()
     try:
         parsed = urlsplit(raw_url)
@@ -111,12 +260,9 @@ def resolve_public_endpoint(url: str) -> ResolvedEndpoint:
         raise EgressDenied(f"egress URL port {port} is not allowed for {scheme}")
 
     try:
-        answers = socket.getaddrinfo(
-            hostname,
-            port,
-            type=socket.SOCK_STREAM,
-            proto=socket.IPPROTO_TCP,
-        )
+        answers = _getaddrinfo_with_deadline(hostname, port, deadline)
+    except EgressTimeout:
+        raise
     except (OSError, socket.gaierror) as exc:
         raise EgressDenied(f"DNS resolution failed for {hostname}") from exc
     if not answers:
@@ -145,10 +291,67 @@ def resolve_public_endpoint(url: str) -> ResolvedEndpoint:
     )
 
 
+def _remaining_time(deadline: float) -> float:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise EgressTimeout("egress total deadline exceeded")
+    return remaining
+
+
+def _operation_timeout(timeout: float | None, deadline: float) -> float:
+    remaining = _remaining_time(deadline)
+    return remaining if timeout is None else min(float(timeout), remaining)
+
+
+class _DeadlineStream(httpcore.NetworkStream):
+    def __init__(self, stream: httpcore.NetworkStream, deadline: float) -> None:
+        self.stream = stream
+        self.deadline = deadline
+
+    def read(self, max_bytes: int, timeout: float | None = None) -> bytes:
+        chunk = self.stream.read(max_bytes, timeout=_operation_timeout(timeout, self.deadline))
+        _remaining_time(self.deadline)
+        return chunk
+
+    def write(self, buffer: bytes, timeout: float | None = None) -> None:
+        self.stream.write(buffer, timeout=_operation_timeout(timeout, self.deadline))
+        _remaining_time(self.deadline)
+
+    def close(self) -> None:
+        self.stream.close()
+
+    def start_tls(
+        self,
+        ssl_context,
+        server_hostname: str | None = None,
+        timeout: float | None = None,
+    ) -> httpcore.NetworkStream:
+        stream = self.stream.start_tls(
+            ssl_context,
+            server_hostname=server_hostname,
+            timeout=_operation_timeout(timeout, self.deadline),
+        )
+        try:
+            _remaining_time(self.deadline)
+        except EgressTimeout:
+            stream.close()
+            raise
+        return _DeadlineStream(stream, self.deadline)
+
+    def get_extra_info(self, info: str) -> Any:
+        return self.stream.get_extra_info(info)
+
+
 class _FixedEndpointBackend(httpcore.NetworkBackend):
-    def __init__(self, endpoint: ResolvedEndpoint, delegate: httpcore.NetworkBackend) -> None:
+    def __init__(
+        self,
+        endpoint: ResolvedEndpoint,
+        delegate: httpcore.NetworkBackend,
+        deadline: float,
+    ) -> None:
         self.endpoint = endpoint
         self.delegate = delegate
+        self.deadline = deadline
 
     def connect_tcp(
         self,
@@ -161,10 +364,15 @@ class _FixedEndpointBackend(httpcore.NetworkBackend):
         stream = self.delegate.connect_tcp(
             host=self.endpoint.verified_ip,
             port=self.endpoint.port,
-            timeout=timeout,
+            timeout=_operation_timeout(timeout, self.deadline),
             local_address=local_address,
             socket_options=socket_options,
         )
+        try:
+            _remaining_time(self.deadline)
+        except EgressTimeout:
+            stream.close()
+            raise
         peer = stream.get_extra_info("server_addr")
         try:
             peer_ip = str(ipaddress.ip_address(str(peer[0]).split("%", 1)[0]))
@@ -174,13 +382,14 @@ class _FixedEndpointBackend(httpcore.NetworkBackend):
         if peer_ip != self.endpoint.verified_ip:
             stream.close()
             raise EgressDenied("egress socket peer does not match the verified IP")
-        return stream
+        return _DeadlineStream(stream, self.deadline)
 
     def connect_unix_socket(self, path: str, timeout: float | None = None, socket_options=None):
         raise EgressDenied("egress gateway does not allow unix socket destinations")
 
     def sleep(self, seconds: float) -> None:
-        self.delegate.sleep(seconds)
+        self.delegate.sleep(min(float(seconds), _remaining_time(self.deadline)))
+        _remaining_time(self.deadline)
 
 
 def _network_backend_factory(endpoint: ResolvedEndpoint) -> httpcore.NetworkBackend:
@@ -215,7 +424,7 @@ def _response_headers(raw_headers: list[tuple[bytes, bytes]]) -> dict[str, str]:
 def _content_type_allowed(headers: Mapping[str, str]) -> bool:
     content_type = str(headers.get("content-type") or "").split(";", 1)[0].strip().lower()
     if not content_type:
-        return True
+        return False
     return bool(
         content_type.startswith("text/")
         or content_type == "application/json"
@@ -252,17 +461,20 @@ def fetch_public(
     response_limit = max(1, min(_MAX_RESPONSE_BYTES, int(max_bytes)))
     redirect_limit = max(0, min(_MAX_REDIRECTS, int(redirects)))
     current_url = str(url or "").strip()
+    deadline = time.monotonic() + request_timeout
 
     for redirect_number in range(redirect_limit + 1):
-        endpoint = resolve_public_endpoint(current_url)
+        _remaining_time(deadline)
+        endpoint = resolve_public_endpoint(current_url, deadline=deadline)
+        remaining = _remaining_time(deadline)
         delegate = _network_backend_factory(endpoint)
-        backend = _FixedEndpointBackend(endpoint, delegate)
+        backend = _FixedEndpointBackend(endpoint, delegate, deadline)
         timeout_extensions = {
             "timeout": {
-                "connect": request_timeout,
-                "read": request_timeout,
-                "write": request_timeout,
-                "pool": request_timeout,
+                "connect": remaining,
+                "read": remaining,
+                "write": remaining,
+                "pool": remaining,
             },
             "sni_hostname": endpoint.sni_name,
         }
@@ -305,7 +517,7 @@ def fetch_public(
                         url=current_url,
                         truncated=truncated,
                     )
-        except EgressDenied:
+        except (EgressDenied, EgressTimeout):
             raise
         except (httpcore.TimeoutException, httpcore.NetworkError, httpcore.ProtocolError) as exc:
             raise RuntimeError(f"egress request failed: {type(exc).__name__}") from exc

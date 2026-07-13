@@ -1,19 +1,27 @@
 from __future__ import annotations
 
 import base64
+from contextlib import asynccontextmanager
+from functools import partial
+from typing import AsyncIterator
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from starlette.concurrency import run_in_threadpool
 
-from videoroll.apps.egress_gateway.client import EgressDenied, fetch_public
+from videoroll.apps.egress_gateway.client import EgressDenied, EgressResponse, fetch_public
 from videoroll.apps.security.service_auth import require_internal_service, service_token
 
 
 class EgressGatewaySettings(BaseSettings):
     model_config = SettingsConfigDict(extra="ignore")
 
-    internal_api_secret: str = Field("", alias="INTERNAL_API_SECRET")
+    development_mode: bool = Field(False, alias="DEVELOPMENT_MODE")
+    internal_api_secret: str = Field(
+        "videoroll-development-internal-secret",
+        alias="INTERNAL_API_SECRET",
+    )
 
 
 class FetchRequest(BaseModel):
@@ -39,8 +47,14 @@ def internal_service_token(settings: EgressGatewaySettings | None = None) -> str
     return service_token(settings or get_settings())
 
 
-app = FastAPI(title="videoroll-egress-gateway", version="0.1.0")
-app.state.internal_service_token = internal_service_token()
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    app.state.internal_service_token = internal_service_token()
+    yield
+
+
+app = FastAPI(title="videoroll-egress-gateway", version="0.1.0", lifespan=lifespan)
+app.state.internal_service_token = ""
 
 
 @app.get("/health")
@@ -48,18 +62,26 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
-@app.post("/fetch", response_model=FetchResponse)
-def fetch(
-    payload: FetchRequest,
-    _: None = Depends(require_internal_service),
-) -> FetchResponse:
-    try:
-        response = fetch_public(
+async def require_gateway_service(request: Request) -> None:
+    require_internal_service(request)
+
+
+async def fetch_public_async(payload: FetchRequest) -> EgressResponse:
+    return await run_in_threadpool(
+        partial(
+            fetch_public,
             payload.url,
             timeout=payload.timeout,
             max_bytes=payload.max_bytes,
             redirects=payload.redirects,
         )
+    )
+
+
+@app.post("/fetch", response_model=FetchResponse)
+async def fetch(payload: FetchRequest, _: None = Depends(require_gateway_service)) -> FetchResponse:
+    try:
+        response = await fetch_public_async(payload)
     except EgressDenied as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
     except Exception as exc:

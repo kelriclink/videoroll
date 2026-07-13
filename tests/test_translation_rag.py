@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import json
+from types import SimpleNamespace
 
 import httpx
 
@@ -1141,29 +1143,79 @@ def test_fetch_search_evidence_reads_result_pages(monkeypatch) -> None:
     assert "powerful sniper rifle" in evidence[0]["content"]
 
 
-def test_fetch_url_evidence_routes_arbitrary_urls_through_egress(monkeypatch) -> None:
+class _SyncASGITransport(httpx.BaseTransport):
+    def __init__(self, app: object) -> None:
+        self.app = app
+
+    def handle_request(self, request: httpx.Request) -> httpx.Response:
+        body = request.read()
+
+        async def send() -> httpx.Response:
+            transport = httpx.ASGITransport(app=self.app)  # type: ignore[arg-type]
+            async with httpx.AsyncClient(transport=transport) as client:
+                response = await client.request(
+                    request.method,
+                    str(request.url),
+                    headers=request.headers,
+                    content=body,
+                )
+                content = await response.aread()
+                return httpx.Response(
+                    response.status_code,
+                    headers=response.headers,
+                    content=content,
+                    request=request,
+                )
+
+        return asyncio.run(send())
+
+
+def test_egress_gateway_url_falls_back_to_exact_compose_alias(monkeypatch) -> None:
     from videoroll.apps.subtitle_service import rag as rag_module
 
+    monkeypatch.delenv("EGRESS_GATEWAY_URL", raising=False)
+
+    assert rag_module._egress_gateway_url(SimpleNamespace()) == "http://egress-gateway:8020"
+
+
+def test_fetch_url_evidence_routes_through_authenticated_gateway_endpoint(monkeypatch) -> None:
+    from videoroll.apps.subtitle_service import rag as rag_module
+    from videoroll.apps.egress_gateway import main as gateway_main
+    from videoroll.apps.egress_gateway.client import EgressResponse
+    from videoroll.apps.security.service_auth import service_token
+
     calls: list[str] = []
+    settings = SimpleNamespace(
+        egress_gateway_url="http://egress-gateway:8020",
+        internal_api_secret="internal-secret",
+        development_mode=False,
+    )
+    gateway_main.app.state.internal_service_token = service_token(settings)
 
-    class _Response:
-        status_code = 200
-        headers = {"content-type": "text/html"}
-        text = "<html><body><main>Verified public evidence.</main></body></html>"
-
-        def raise_for_status(self) -> None:
-            return None
-
-    def fake_fetch(url: str, **kwargs: object) -> _Response:
+    async def fake_fetch(payload: object) -> EgressResponse:
+        url = str(getattr(payload, "url"))
         calls.append(url)
-        return _Response()
+        return EgressResponse(
+            status_code=200,
+            headers={"content-type": "text/html"},
+            content=b"<html><body><main>Verified public evidence.</main></body></html>",
+            url=url,
+            truncated=False,
+        )
 
-    class _ForbiddenClient:
-        def __init__(self, *args: object, **kwargs: object) -> None:
-            raise AssertionError("RAG arbitrary URL fetches must not create httpx.Client")
+    monkeypatch.setattr(gateway_main, "fetch_public_async", fake_fetch)
+    monkeypatch.setattr(rag_module, "get_subtitle_settings", lambda: settings, raising=False)
+    monkeypatch.setattr(
+        rag_module,
+        "_gateway_transport_factory",
+        lambda: _SyncASGITransport(gateway_main.app),
+        raising=False,
+    )
 
-    monkeypatch.setattr(rag_module, "fetch_public", fake_fetch)
-    monkeypatch.setattr(rag_module.httpx, "Client", _ForbiddenClient)
+    def forbid_in_process_fetch(*args: object, **kwargs: object) -> object:
+        raise AssertionError("RAG must not call fetch_public in-process")
+
+    monkeypatch.setattr(rag_module, "fetch_public", forbid_in_process_fetch, raising=False)
 
     page = rag_module.fetch_url_evidence(url="https://public.example/start")
 

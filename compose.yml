@@ -39,6 +39,7 @@ services:
     image: videoroll:prod
     command: ["uvicorn", "videoroll.apps.egress_gateway.main:app", "--host", "0.0.0.0", "--port", "8020"]
     environment:
+      DEVELOPMENT_MODE: ${DEVELOPMENT_MODE:-false}
       INTERNAL_API_SECRET: ${INTERNAL_API_SECRET}
     networks:
       - internal
@@ -92,7 +93,9 @@ services:
       BILIBILI_PUBLISHER_URL: ${BILIBILI_PUBLISHER_URL:-http://localhost:8000/bilibili-publisher}
       SOCIAL_PUBLISHER_URL: ${SOCIAL_PUBLISHER_URL:-http://social-publisher-api:8010}
       STORAGE_CLEANUP_INTERVAL_SECONDS: ${STORAGE_CLEANUP_INTERVAL_SECONDS:-3600}
+      DEVELOPMENT_MODE: ${DEVELOPMENT_MODE:-false}
       INTERNAL_API_SECRET: ${INTERNAL_API_SECRET}
+      EGRESS_GATEWAY_URL: ${EGRESS_GATEWAY_URL:-http://egress-gateway:8020}
     volumes:
       - ./data/models:/models
       - ./data/secrets:/secrets

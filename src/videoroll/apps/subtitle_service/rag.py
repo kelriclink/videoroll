@@ -4,6 +4,7 @@ import hashlib
 import html
 import json
 import math
+import os
 import re
 import time
 import uuid
@@ -19,7 +20,8 @@ from sqlalchemy.orm import Session
 from pydantic import BaseModel
 
 from videoroll.ai.client import OpenAIChatConfig, request_openai_json_object
-from videoroll.apps.egress_gateway.client import EgressResponse, fetch_public
+from videoroll.apps.egress_gateway.client import EgressGatewayClient, EgressResponse
+from videoroll.apps.security.service_auth import service_token
 from videoroll.apps.subtitle_service.agent_runtime import (
     AgentBudget,
     AgentBudgetExceeded,
@@ -44,6 +46,7 @@ from videoroll.apps.subtitle_service.dictionaries import (
 from videoroll.apps.subtitle_service.embeddings import EmbeddingSettings, assert_embedding_dimensions, embed_text
 from videoroll.apps.subtitle_service.processing import Segment
 from videoroll.apps.subtitle_service.retrieval import RetrievalPipeline
+from videoroll.config import get_subtitle_settings
 
 
 _TERM_SPLIT_RE = re.compile(r"[\s\-_]+")
@@ -951,11 +954,19 @@ class _PublicFetchClient:
         self.timeout = timeout
         self.headers = headers or {}
         self.redirects = 5 if follow_redirects else 0
+        settings = get_subtitle_settings()
+        self.gateway = EgressGatewayClient(
+            _egress_gateway_url(settings),
+            service_token(settings),
+            timeout=timeout,
+            transport=_gateway_transport_factory(),
+        )
 
     def __enter__(self) -> _PublicFetchClient:
         return self
 
     def __exit__(self, exc_type: object, exc: object, tb: object) -> bool:
+        self.gateway.close()
         return False
 
     def get(
@@ -965,13 +976,21 @@ class _PublicFetchClient:
         *,
         redirects: int | None = None,
     ) -> EgressResponse:
-        return fetch_public(
+        return self.gateway.fetch(
             _url_with_params(url, params),
             timeout=self.timeout,
             max_bytes=500_000,
             redirects=self.redirects if redirects is None else redirects,
-            headers=self.headers,
         )
+
+
+def _egress_gateway_url(settings: Any) -> str:
+    configured = str(getattr(settings, "egress_gateway_url", "") or "").strip()
+    return configured or str(os.getenv("EGRESS_GATEWAY_URL") or "http://egress-gateway:8020").strip()
+
+
+def _gateway_transport_factory() -> httpx.BaseTransport | None:
+    return None
 
 
 def _safe_public_get(client: Any, url: str, *, max_redirects: int = 5) -> Any:

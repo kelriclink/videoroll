@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import socket
+import time
+from threading import Event
 from dataclasses import dataclass, field
 
+import httpx
 import pytest
-from fastapi import HTTPException
-from starlette.requests import Request
 
 
 PUBLIC_IP = "93.184.216.34"
@@ -23,10 +24,15 @@ class _FakeStream:
     peer_ip: str = PUBLIC_IP
     writes: list[bytes] = field(default_factory=list)
     server_hostname: str | None = None
+    max_chunk_bytes: int | None = None
+    on_read: object | None = None
     _offset: int = 0
 
     def read(self, max_bytes: int, timeout: float | None = None) -> bytes:
-        chunk = self.response[self._offset : self._offset + max_bytes]
+        if callable(self.on_read):
+            self.on_read()
+        chunk_limit = min(max_bytes, self.max_chunk_bytes or max_bytes)
+        chunk = self.response[self._offset : self._offset + chunk_limit]
         self._offset += len(chunk)
         return chunk
 
@@ -54,6 +60,7 @@ class _FakeStream:
 class _FakeBackend:
     stream: _FakeStream
     connections: list[tuple[str, int]] = field(default_factory=list)
+    timeouts: list[float | None] = field(default_factory=list)
 
     def connect_tcp(
         self,
@@ -64,6 +71,7 @@ class _FakeBackend:
         socket_options=None,
     ) -> _FakeStream:
         self.connections.append((host, port))
+        self.timeouts.append(timeout)
         return self.stream
 
     def connect_unix_socket(self, path: str, timeout: float | None = None, socket_options=None):
@@ -78,14 +86,16 @@ def _http_response(
     *,
     status: int = 200,
     headers: dict[str, str] | None = None,
+    content_type: str | None = "text/plain; charset=utf-8",
 ) -> bytes:
     reason = "OK" if status == 200 else "Found"
     response_headers = {
         "Content-Length": str(len(body)),
-        "Content-Type": "text/plain; charset=utf-8",
         "Connection": "close",
         **(headers or {}),
     }
+    if content_type is not None:
+        response_headers["Content-Type"] = content_type
     lines = [f"HTTP/1.1 {status} {reason}"]
     lines.extend(f"{name}: {value}" for name, value in response_headers.items())
     return ("\r\n".join(lines) + "\r\n\r\n").encode("ascii") + body
@@ -101,6 +111,26 @@ def test_dns_resolution_failure_is_denied(monkeypatch) -> None:
 
     with pytest.raises(EgressDenied, match="DNS"):
         resolve_public_endpoint("https://example.test/page")
+
+
+def test_dns_resolution_obeys_total_deadline(monkeypatch) -> None:
+    from videoroll.apps.egress_gateway import client as client_module
+
+    release = Event()
+
+    def blocked_dns(*args: object, **kwargs: object) -> list[object]:
+        release.wait(1.0)
+        return []
+
+    monkeypatch.setattr(socket, "getaddrinfo", blocked_dns)
+    started = time.perf_counter()
+    try:
+        with pytest.raises(client_module.EgressTimeout, match="deadline"):
+            client_module.fetch_public("https://blocked-dns.test/page", timeout=0.05)
+    finally:
+        release.set()
+
+    assert time.perf_counter() - started < 0.2
 
 
 def test_private_dns_answer_is_denied(monkeypatch) -> None:
@@ -211,6 +241,83 @@ def test_response_body_is_bounded(monkeypatch) -> None:
     assert response.truncated is True
 
 
+def test_missing_content_type_is_denied(monkeypatch) -> None:
+    from videoroll.apps.egress_gateway import client as client_module
+
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda host, port, **kwargs: [_addrinfo(PUBLIC_IP, port)],
+    )
+    backend = _FakeBackend(_FakeStream(_http_response(content_type=None)))
+    monkeypatch.setattr(client_module, "_network_backend_factory", lambda endpoint: backend)
+
+    with pytest.raises(client_module.EgressDenied, match="content type"):
+        client_module.fetch_public("https://public.test/no-content-type")
+
+
+class _Clock:
+    def __init__(self) -> None:
+        self.now = 100.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
+def test_redirects_share_one_total_deadline(monkeypatch) -> None:
+    from videoroll.apps.egress_gateway import client as client_module
+
+    clock = _Clock()
+    monkeypatch.setattr(time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda host, port, **kwargs: [_addrinfo(PUBLIC_IP, port)],
+    )
+    first = _FakeBackend(
+        _FakeStream(
+            _http_response(b"", status=302, headers={"Location": "https://public.test/final"}),
+            on_read=lambda: clock.advance(0.3),
+        )
+    )
+    second = _FakeBackend(
+        _FakeStream(
+            _http_response(b"done"),
+            on_read=lambda: clock.advance(0.3),
+        )
+    )
+    backends = iter([first, second])
+    monkeypatch.setattr(client_module, "_network_backend_factory", lambda endpoint: next(backends))
+
+    with pytest.raises(client_module.EgressTimeout, match="deadline"):
+        client_module.fetch_public("https://public.test/start", timeout=0.5)
+
+
+def test_slow_trickle_cannot_extend_total_deadline(monkeypatch) -> None:
+    from videoroll.apps.egress_gateway import client as client_module
+
+    clock = _Clock()
+    monkeypatch.setattr(time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda host, port, **kwargs: [_addrinfo(PUBLIC_IP, port)],
+    )
+    stream = _FakeStream(
+        _http_response(b"x" * 256),
+        max_chunk_bytes=32,
+        on_read=lambda: clock.advance(0.2),
+    )
+    backend = _FakeBackend(stream)
+    monkeypatch.setattr(client_module, "_network_backend_factory", lambda endpoint: backend)
+
+    with pytest.raises(client_module.EgressTimeout, match="deadline"):
+        client_module.fetch_public("https://public.test/trickle", timeout=0.5)
+
+
 @pytest.mark.parametrize(
     "url",
     [
@@ -226,56 +333,40 @@ def test_unsafe_url_forms_are_denied(url: str) -> None:
         resolve_public_endpoint(url)
 
 
-def test_gateway_endpoint_requires_internal_service_token(monkeypatch) -> None:
+@pytest.mark.anyio
+async def test_gateway_endpoint_requires_internal_service_token(monkeypatch) -> None:
     from videoroll.apps.egress_gateway import main as gateway_main
     from videoroll.apps.egress_gateway.client import EgressResponse
-    from videoroll.apps.security.service_auth import INTERNAL_TOKEN_HEADER, require_internal_service
+    from videoroll.apps.security.service_auth import INTERNAL_TOKEN_HEADER
 
     gateway_main.app.state.internal_service_token = "service-token"
-    monkeypatch.setattr(
-        gateway_main,
-        "fetch_public",
-        lambda *args, **kwargs: EgressResponse(
+    async def fake_fetch_public(payload: object) -> EgressResponse:
+        return EgressResponse(
             status_code=200,
             headers={"content-type": "text/plain"},
             content=b"ok",
             url="https://public.test/page",
             truncated=False,
-        ),
-    )
-    def request_with_token(token: str = "") -> Request:
-        headers = []
-        if token:
-            headers.append((INTERNAL_TOKEN_HEADER.lower().encode("ascii"), token.encode("ascii")))
-        return Request(
-            {
-                "type": "http",
-                "method": "POST",
-                "scheme": "http",
-                "path": "/fetch",
-                "raw_path": b"/fetch",
-                "query_string": b"",
-                "headers": headers,
-                "client": ("127.0.0.1", 12345),
-                "server": ("testserver", 80),
-                "app": gateway_main.app,
-            }
         )
 
-    with pytest.raises(HTTPException) as missing:
-        require_internal_service(request_with_token())
-    assert missing.value.status_code == 401
-    with pytest.raises(HTTPException) as wrong:
-        require_internal_service(request_with_token("wrong"))
-    assert wrong.value.status_code == 403
-
-    request = request_with_token("service-token")
-    require_internal_service(request)
-    response = gateway_main.fetch(
-        gateway_main.FetchRequest(url="https://public.test/page"),
-    )
+    monkeypatch.setattr(gateway_main, "fetch_public_async", fake_fetch_public)
+    transport = httpx.ASGITransport(app=gateway_main.app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://gateway.test") as client:
+        assert (await client.post("/fetch", json={"url": "https://public.test/page"})).status_code == 401
+        assert (
+            await client.post(
+                "/fetch",
+                json={"url": "https://public.test/page"},
+                headers={INTERNAL_TOKEN_HEADER: "wrong"},
+            )
+        ).status_code == 403
+        response = await client.post(
+            "/fetch",
+            json={"url": "https://public.test/page"},
+            headers={INTERNAL_TOKEN_HEADER: "service-token"},
+        )
     assert response.status_code == 200
-    assert response.body_base64 == "b2s="
+    assert response.json()["body_base64"] == "b2s="
 
 
 def test_gateway_token_is_derived_from_internal_api_secret() -> None:
@@ -285,3 +376,49 @@ def test_gateway_token_is_derived_from_internal_api_secret() -> None:
     settings = gateway_main.EgressGatewaySettings(INTERNAL_API_SECRET="internal-secret")
 
     assert gateway_main.internal_service_token(settings) == service_token(settings)
+
+
+def test_gateway_rejects_known_default_secret_outside_development() -> None:
+    from videoroll.apps.egress_gateway import main as gateway_main
+
+    settings = gateway_main.EgressGatewaySettings(
+        INTERNAL_API_SECRET="videoroll-development-internal-secret",
+        DEVELOPMENT_MODE=False,
+    )
+
+    with pytest.raises(ValueError, match="non-default"):
+        gateway_main.internal_service_token(settings)
+
+
+def test_internal_gateway_client_rejects_public_gateway_hostname() -> None:
+    from videoroll.apps.egress_gateway.client import EgressGatewayClient, EgressGatewayError
+
+    with pytest.raises(EgressGatewayError, match="allowed hostname"):
+        EgressGatewayClient("https://gateway.example.com", "service-token")
+
+
+def test_internal_gateway_client_rejects_unexpected_dotless_hostname() -> None:
+    from videoroll.apps.egress_gateway.client import EgressGatewayClient, EgressGatewayError
+
+    with pytest.raises(EgressGatewayError, match="allowed hostname"):
+        EgressGatewayClient("http://attacker:8020", "service-token")
+
+
+@pytest.mark.parametrize(
+    "gateway_url",
+    [
+        "http://10.0.0.8:8020",
+        "http://127.0.0.1:8020",
+        "http://localhost:8020",
+    ],
+)
+def test_internal_gateway_client_rejects_hosts_outside_exact_allowlist(gateway_url: str) -> None:
+    from videoroll.apps.egress_gateway.client import EgressGatewayClient, EgressGatewayError
+
+    with pytest.raises(EgressGatewayError, match="allowed hostname"):
+        EgressGatewayClient(gateway_url, "service-token")
+
+
+@pytest.fixture
+def anyio_backend() -> str:
+    return "asyncio"
