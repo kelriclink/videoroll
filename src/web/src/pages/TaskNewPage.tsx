@@ -1,7 +1,7 @@
 import { useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { fetchJson } from "../lib/http";
-import { ORCHESTRATOR_URL, YOUTUBE_INGEST_URL } from "../lib/urls";
+import { ORCHESTRATOR_URL } from "../lib/urls";
 import { SourceLicense, SourceType, Task } from "../lib/types";
 
 export default function TaskNewPage() {
@@ -47,7 +47,7 @@ export default function TaskNewPage() {
   }
 
   async function createYouTubeTask() {
-    const resp = await fetchJson<{ task_id: string }>(`${YOUTUBE_INGEST_URL}/youtube/ingest`, {
+    const resp = await fetchJson<{ task_id: string }>(`${ORCHESTRATOR_URL}/youtube/ingest`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({

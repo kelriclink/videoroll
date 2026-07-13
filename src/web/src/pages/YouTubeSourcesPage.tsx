@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { useConfirm, useToast } from "../components/feedbackContext";
 import { Button, PageHeader } from "../components/ui";
 import { fetchJson } from "../lib/http";
-import { YOUTUBE_INGEST_URL } from "../lib/urls";
+import { ORCHESTRATOR_URL } from "../lib/urls";
 import { SourceLicense, YouTubeSource } from "../lib/types";
 
 type SourceDraft = Partial<
@@ -48,7 +48,7 @@ export default function YouTubeSourcesPage() {
   async function refresh() {
     setError(null);
     try {
-      const data = await fetchJson<YouTubeSource[]>(`${YOUTUBE_INGEST_URL}/youtube/sources`);
+      const data = await fetchJson<YouTubeSource[]>(`${ORCHESTRATOR_URL}/youtube/sources`);
       setSources(data);
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : String(e));
@@ -88,7 +88,7 @@ export default function YouTubeSourcesPage() {
     try {
       for (const item of items) {
         try {
-          await fetchJson(`${YOUTUBE_INGEST_URL}/youtube/sources`, {
+          await fetchJson(`${ORCHESTRATOR_URL}/youtube/sources`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
@@ -129,7 +129,7 @@ export default function YouTubeSourcesPage() {
     setBusy(`save:${source.id}`, true);
     setError(null);
     try {
-      await fetchJson(`${YOUTUBE_INGEST_URL}/youtube/sources/${source.id}`, {
+      await fetchJson(`${ORCHESTRATOR_URL}/youtube/sources/${source.id}`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(draft),
@@ -152,7 +152,7 @@ export default function YouTubeSourcesPage() {
     setBusy(`scan:${source.id}`, true);
     setError(null);
     try {
-      const res = await fetchJson<ScanResponse>(`${YOUTUBE_INGEST_URL}/youtube/sources/${source.id}/scan`, {
+      const res = await fetchJson<ScanResponse>(`${ORCHESTRATOR_URL}/youtube/sources/${source.id}/scan`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -184,7 +184,7 @@ export default function YouTubeSourcesPage() {
     setBusy(`delete:${source.id}`, true);
     setError(null);
     try {
-      await fetchJson(`${YOUTUBE_INGEST_URL}/youtube/sources/${source.id}`, {
+      await fetchJson(`${ORCHESTRATOR_URL}/youtube/sources/${source.id}`, {
         method: "DELETE",
       });
       setDrafts((prev) => {

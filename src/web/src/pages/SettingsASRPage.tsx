@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { useConfirm } from "../components/feedbackContext";
 import { fetchJson } from "../lib/http";
-import { SUBTITLE_SERVICE_URL } from "../lib/urls";
+import { ORCHESTRATOR_URL } from "../lib/urls";
 
 type WhisperSettings = {
   asr_engine: string;
@@ -89,9 +89,9 @@ export default function SettingsASRPage() {
     setError(null);
     try {
       const [s, m, a] = await Promise.all([
-        fetchJson<WhisperSettings>(`${SUBTITLE_SERVICE_URL}/subtitle/settings`),
-        fetchJson<WhisperModelInfo[]>(`${SUBTITLE_SERVICE_URL}/subtitle/models`),
-        fetchJson<ASRDefaults>(`${SUBTITLE_SERVICE_URL}/subtitle/asr/settings`),
+        fetchJson<WhisperSettings>(`${ORCHESTRATOR_URL}/subtitle/settings`),
+        fetchJson<WhisperModelInfo[]>(`${ORCHESTRATOR_URL}/subtitle/models`),
+        fetchJson<ASRDefaults>(`${ORCHESTRATOR_URL}/subtitle/asr/settings`),
       ]);
       setSettings(s);
       setModels(m);
@@ -320,7 +320,7 @@ export default function SettingsASRPage() {
                   setProxyTestResult(null);
                   setError(null);
                   try {
-                    const res = await fetchJson<ModelProxyTestResponse>(`${SUBTITLE_SERVICE_URL}/subtitle/models/proxy/test`, {
+                    const res = await fetchJson<ModelProxyTestResponse>(`${ORCHESTRATOR_URL}/subtitle/models/proxy/test`, {
                       method: "POST",
                       headers: { "Content-Type": "application/json" },
                       body: JSON.stringify({
@@ -367,7 +367,7 @@ export default function SettingsASRPage() {
               try {
                 const openvinoNumBeamsValue = Math.max(1, Number.parseInt(openvinoNumBeams || "1", 10) || 1);
                 const openvinoMaxNewTokensValue = Math.max(1, Number.parseInt(openvinoMaxNewTokens || "448", 10) || 448);
-                await fetchJson(`${SUBTITLE_SERVICE_URL}/subtitle/asr/settings`, {
+                await fetchJson(`${ORCHESTRATOR_URL}/subtitle/asr/settings`, {
                   method: "PUT",
                   headers: { "Content-Type": "application/json" },
                   body: JSON.stringify({
@@ -429,7 +429,7 @@ export default function SettingsASRPage() {
                           setBusy(true);
                           setError(null);
                           try {
-                            await fetchJson(`${SUBTITLE_SERVICE_URL}/subtitle/models/${encodeURIComponent(m.name)}`, { method: "DELETE" });
+                            await fetchJson(`${ORCHESTRATOR_URL}/subtitle/models/${encodeURIComponent(m.name)}`, { method: "DELETE" });
                             await refresh();
                           } catch (e: unknown) {
                             setError(e instanceof Error ? e.message : String(e));
@@ -504,7 +504,7 @@ export default function SettingsASRPage() {
               setBusy(true);
               setError(null);
               try {
-                await fetchJson(`${SUBTITLE_SERVICE_URL}/subtitle/models/download`, {
+                await fetchJson(`${ORCHESTRATOR_URL}/subtitle/models/download`, {
                   method: "POST",
                   headers: { "Content-Type": "application/json" },
                   body: JSON.stringify({
@@ -556,7 +556,7 @@ export default function SettingsASRPage() {
                 const fd = new FormData();
                 if (!uploadFile) throw new Error("no file selected");
                 fd.append("file", uploadFile, uploadFile.name);
-                await fetchJson(`${SUBTITLE_SERVICE_URL}/subtitle/models/upload?name=${encodeURIComponent(uploadName.trim())}`, {
+                await fetchJson(`${ORCHESTRATOR_URL}/subtitle/models/upload?name=${encodeURIComponent(uploadName.trim())}`, {
                   method: "POST",
                   body: fd,
                 });

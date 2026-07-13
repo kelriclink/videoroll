@@ -1,7 +1,7 @@
 import { Link } from "react-router-dom";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { fetchJson } from "../lib/http";
-import { SUBTITLE_SERVICE_URL } from "../lib/urls";
+import { ORCHESTRATOR_URL } from "../lib/urls";
 
 type TaskQueueItem = {
   task_id: string;
@@ -40,7 +40,7 @@ export default function RenderQueuePage() {
   const refresh = useCallback(async () => {
     setError(null);
     try {
-      const q = await fetchJson<TaskQueue>(`${SUBTITLE_SERVICE_URL}/subtitle/task_queue`);
+      const q = await fetchJson<TaskQueue>(`${ORCHESTRATOR_URL}/subtitle/task_queue`);
       setQueue(q);
       if (!maxConcDirty) setMaxConcText(String(q?.settings?.max_concurrency ?? 1));
     } catch (e: unknown) {
@@ -81,7 +81,7 @@ export default function RenderQueuePage() {
       const n = Number(raw);
       if (!Number.isFinite(n) || !Number.isInteger(n)) throw new Error("max_concurrency 必须是整数");
       if (n < 0 || n > 32) throw new Error("max_concurrency 范围：0..32（0=暂停）");
-      const saved = await fetchJson<TaskQueueSettingsSaveResponse>(`${SUBTITLE_SERVICE_URL}/subtitle/task_queue/settings`, {
+      const saved = await fetchJson<TaskQueueSettingsSaveResponse>(`${ORCHESTRATOR_URL}/subtitle/task_queue/settings`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ max_concurrency: n }),

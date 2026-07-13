@@ -3,7 +3,7 @@ import { Link } from "react-router-dom";
 import { useConfirm } from "../components/feedbackContext";
 import { Button, DataTable, EmptyState, PageHeader, PaginationControls, Section, TableToolbar } from "../components/ui";
 import { fetchJson } from "../lib/http";
-import { SUBTITLE_SERVICE_URL } from "../lib/urls";
+import { ORCHESTRATOR_URL } from "../lib/urls";
 
 type KnowledgeItem = {
   id: string;
@@ -78,7 +78,7 @@ export default function KnowledgeBasePage() {
     else setLoading(true);
     setError(null);
     try {
-      const rows = await fetchJson<KnowledgeItem[]>(`${SUBTITLE_SERVICE_URL}/subtitle/knowledge/items?${query}`);
+      const rows = await fetchJson<KnowledgeItem[]>(`${ORCHESTRATOR_URL}/subtitle/knowledge/items?${query}`);
       setItems(rows);
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : String(e));
@@ -117,7 +117,7 @@ export default function KnowledgeBasePage() {
     setError(null);
     setFormError(null);
     try {
-      await fetchJson(`${SUBTITLE_SERVICE_URL}/subtitle/knowledge/items`, {
+      await fetchJson(`${ORCHESTRATOR_URL}/subtitle/knowledge/items`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -159,7 +159,7 @@ export default function KnowledgeBasePage() {
     setBusy(true);
     setError(null);
     try {
-      await fetchJson(`${SUBTITLE_SERVICE_URL}/subtitle/knowledge/items/${item.id}`, { method: "DELETE" });
+      await fetchJson(`${ORCHESTRATOR_URL}/subtitle/knowledge/items/${item.id}`, { method: "DELETE" });
       await refresh();
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : String(e));

@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, HTTPException
+import httpx
+from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import Response
 from sqlalchemy.orm import Session
 
 from videoroll.apps.orchestrator_api.dependencies import get_db, get_settings
@@ -24,12 +26,33 @@ from videoroll.apps.orchestrator_api.storage_retention_store import (
     get_storage_retention_settings,
     update_storage_retention_settings,
 )
+from videoroll.apps.orchestrator_api.services import subtitle_service
 from videoroll.apps.publish_review_store import get_publish_review_settings, update_publish_review_settings
 from videoroll.apps.youtube_settings_store import get_youtube_settings, update_youtube_settings
 from videoroll.config import OrchestratorSettings
 
 
 router = APIRouter()
+
+
+@router.api_route("/subtitle/{service_path:path}", methods=["GET", "POST", "PUT", "DELETE"])
+async def proxy_subtitle_browser_operation(
+    service_path: str,
+    request: Request,
+    settings: OrchestratorSettings = Depends(get_settings),
+) -> Response:
+    try:
+        response = await subtitle_service.proxy_browser_request(
+            settings,
+            service_path=f"subtitle/{service_path}",
+            method=request.method,
+            query_string=request.url.query,
+            body=await request.body(),
+            content_type=request.headers.get("content-type"),
+        )
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"subtitle-service request failed: {exc}") from exc
+    return Response(content=response.content, status_code=response.status_code, headers=response.headers)
 
 
 def _youtube_cookie_file_status(settings: OrchestratorSettings) -> tuple[bool, bool]:

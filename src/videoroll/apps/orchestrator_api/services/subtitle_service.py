@@ -8,7 +8,11 @@ import httpx
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
-from videoroll.apps.orchestrator_api.infrastructure.internal_http import internal_http_headers
+from videoroll.apps.orchestrator_api.infrastructure.internal_http import (
+    InternalServiceResponse,
+    internal_http_headers,
+    proxy_internal_service_request,
+)
 from videoroll.apps.orchestrator_api.schemas import (
     RecentFailedResumeItem,
     RecentFailedResumeResponse,
@@ -32,6 +36,85 @@ from videoroll.db.models import (
 )
 from videoroll.storage.s3 import S3Store
 from videoroll.utils.auto_youtube import encode_auto_youtube_created_by
+
+
+_BROWSER_PROXY_PATHS: dict[str, set[str]] = {
+    "GET": {
+        "subtitle/settings",
+        "subtitle/models",
+        "subtitle/asr/settings",
+        "subtitle/auto/profile",
+        "subtitle/translate/settings",
+        "subtitle/hardware/intel",
+        "subtitle/agents/runs",
+        "subtitle/agent/skills",
+        "subtitle/dictionaries/sources",
+        "subtitle/dictionaries/entries",
+        "subtitle/dictionaries/import-presets",
+        "subtitle/knowledge/items",
+        "subtitle/task_queue",
+    },
+    "POST": {
+        "subtitle/models/proxy/test",
+        "subtitle/models/download",
+        "subtitle/models/upload",
+        "subtitle/embedding/models/list",
+        "subtitle/embedding/models/download",
+        "subtitle/embedding/test",
+        "subtitle/translate/test",
+        "subtitle/knowledge/items",
+        "subtitle/knowledge/rebuild-embeddings",
+        "subtitle/dictionaries/import",
+        "subtitle/dictionaries/lookup",
+        "subtitle/dictionaries/promote",
+    },
+    "PUT": {
+        "subtitle/asr/settings",
+        "subtitle/auto/profile",
+        "subtitle/translate/settings",
+        "subtitle/task_queue/settings",
+    },
+}
+
+
+def _is_browser_proxy_path_allowed(method: str, service_path: str) -> bool:
+    normalized_method = method.upper()
+    if service_path in _BROWSER_PROXY_PATHS.get(normalized_method, set()):
+        return True
+    if normalized_method in {"PUT", "DELETE"}:
+        dynamic_path_depths = {
+            "subtitle/models/": 2,
+            "subtitle/dictionaries/sources/": 3,
+            "subtitle/dictionaries/entries/": 3,
+            "subtitle/knowledge/items/": 3,
+        }
+        return any(
+            service_path.startswith(prefix) and service_path.count("/") == depth
+            for prefix, depth in dynamic_path_depths.items()
+        )
+    return False
+
+
+async def proxy_browser_request(
+    settings: OrchestratorSettings,
+    *,
+    service_path: str,
+    method: str,
+    query_string: str,
+    body: bytes,
+    content_type: str | None,
+) -> InternalServiceResponse:
+    if not _is_browser_proxy_path_allowed(method, service_path):
+        raise HTTPException(status_code=404, detail="subtitle browser operation not found")
+    return await proxy_internal_service_request(
+        settings,
+        service_url=settings.subtitle_service_url,
+        service_path=service_path,
+        method=method,
+        query_string=query_string,
+        body=body,
+        content_type=content_type,
+    )
 
 
 def utcnow() -> datetime:

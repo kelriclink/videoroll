@@ -3,7 +3,6 @@ import { useEffect, useMemo, useState } from "react";
 import { useConfirm } from "../components/feedbackContext";
 import { fetchJson } from "../lib/http";
 import { ORCHESTRATOR_URL } from "../lib/urls";
-import { SUBTITLE_SERVICE_URL } from "../lib/urls";
 
 type YouTubeSubtitleMode = "off" | "target" | "auto_source";
 
@@ -103,9 +102,9 @@ export default function SettingsAutoPage() {
     setError(null);
     try {
       const [profile, models, translateSettings, platformSettingsResp] = await Promise.all([
-        fetchJson<AutoProfile>(`${SUBTITLE_SERVICE_URL}/subtitle/auto/profile`),
-        fetchJson<Array<{ name: string; path: string }>>(`${SUBTITLE_SERVICE_URL}/subtitle/models`).catch(() => null),
-        fetchJson<{ openai_api_key_set: boolean }>(`${SUBTITLE_SERVICE_URL}/subtitle/translate/settings`).catch(() => null),
+        fetchJson<AutoProfile>(`${ORCHESTRATOR_URL}/subtitle/auto/profile`),
+        fetchJson<Array<{ name: string; path: string }>>(`${ORCHESTRATOR_URL}/subtitle/models`).catch(() => null),
+        fetchJson<{ openai_api_key_set: boolean }>(`${ORCHESTRATOR_URL}/subtitle/translate/settings`).catch(() => null),
         fetchJson<{ platforms: Record<string, boolean> }>(`${ORCHESTRATOR_URL}/settings/publish/platforms`).catch(() => null),
       ]);
 
@@ -166,7 +165,7 @@ export default function SettingsAutoPage() {
   async function detectIntelHardware() {
     setIntelProbeBusy(true);
     try {
-      const probe = await fetchJson<IntelHardwareProbe>(`${SUBTITLE_SERVICE_URL}/subtitle/hardware/intel`);
+      const probe = await fetchJson<IntelHardwareProbe>(`${ORCHESTRATOR_URL}/subtitle/hardware/intel`);
       setIntelProbe(probe);
     } catch (e: unknown) {
       setIntelProbe({
@@ -579,7 +578,7 @@ export default function SettingsAutoPage() {
                   throw new Error("辅字幕字号百分比必须在 25~300 之间");
                 }
                 const presetRaw = videoPresetText.trim();
-                await fetchJson(`${SUBTITLE_SERVICE_URL}/subtitle/auto/profile`, {
+                await fetchJson(`${ORCHESTRATOR_URL}/subtitle/auto/profile`, {
                   method: "PUT",
                   headers: { "Content-Type": "application/json" },
                   body: JSON.stringify({

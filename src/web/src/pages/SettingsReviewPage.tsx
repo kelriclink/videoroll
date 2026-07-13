@@ -1,7 +1,7 @@
 import { Link } from "react-router-dom";
 import { useEffect, useState } from "react";
 import { fetchJson } from "../lib/http";
-import { ORCHESTRATOR_URL, SUBTITLE_SERVICE_URL } from "../lib/urls";
+import { ORCHESTRATOR_URL } from "../lib/urls";
 
 type ReviewSettings = {
   enabled: boolean;
@@ -23,7 +23,7 @@ export default function SettingsReviewPage() {
     try {
       const [cfg, translateCfg] = await Promise.all([
         fetchJson<ReviewSettings>(`${ORCHESTRATOR_URL}/settings/review`),
-        fetchJson<{ openai_api_key_set: boolean }>(`${SUBTITLE_SERVICE_URL}/subtitle/translate/settings`).catch(() => null),
+        fetchJson<{ openai_api_key_set: boolean }>(`${ORCHESTRATOR_URL}/subtitle/translate/settings`).catch(() => null),
       ]);
       setSettings(cfg);
       setEnabled(Boolean(cfg.enabled));

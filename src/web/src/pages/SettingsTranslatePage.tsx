@@ -3,7 +3,7 @@ import { Link } from "react-router-dom";
 import { useConfirm } from "../components/feedbackContext";
 import { Button, DataTable, EmptyState, PageHeader, Section } from "../components/ui";
 import { fetchJson } from "../lib/http";
-import { SUBTITLE_SERVICE_URL } from "../lib/urls";
+import { ORCHESTRATOR_URL } from "../lib/urls";
 
 type TranslateSettings = {
   default_provider: string;
@@ -194,13 +194,13 @@ export default function SettingsTranslatePage() {
   async function refresh() {
     setError(null);
     try {
-      const s = await fetchJson<TranslateSettings>(`${SUBTITLE_SERVICE_URL}/subtitle/translate/settings`);
-      const localModels = await fetchJson<EmbeddingModelInfo[]>(`${SUBTITLE_SERVICE_URL}/subtitle/embedding/models/list`, {
+      const s = await fetchJson<TranslateSettings>(`${ORCHESTRATOR_URL}/subtitle/translate/settings`);
+      const localModels = await fetchJson<EmbeddingModelInfo[]>(`${ORCHESTRATOR_URL}/subtitle/embedding/models/list`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ model_dir: s.rag_embedding_model_dir }),
       }).catch(() => []);
-      const skills = await fetchJson<AgentSkillInfo[]>(`${SUBTITLE_SERVICE_URL}/subtitle/agent/skills`).catch(() => []);
+      const skills = await fetchJson<AgentSkillInfo[]>(`${ORCHESTRATOR_URL}/subtitle/agent/skills`).catch(() => []);
       setSettings(s);
       setDefaultProvider(s.default_provider);
       setDefaultTargetLang(s.default_target_lang);
@@ -306,7 +306,7 @@ export default function SettingsTranslatePage() {
     };
     if (openaiApiKey.trim()) payload.openai_api_key = openaiApiKey.trim();
     if (ragEmbeddingApiKey.trim()) payload.rag_embedding_api_key = ragEmbeddingApiKey.trim();
-    await fetchJson(`${SUBTITLE_SERVICE_URL}/subtitle/translate/settings`, {
+    await fetchJson(`${ORCHESTRATOR_URL}/subtitle/translate/settings`, {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
@@ -349,7 +349,7 @@ export default function SettingsTranslatePage() {
         skipped: number;
         embedding_model: string;
         dimensions: number;
-      }>(`${SUBTITLE_SERVICE_URL}/subtitle/knowledge/rebuild-embeddings`, {
+      }>(`${ORCHESTRATOR_URL}/subtitle/knowledge/rebuild-embeddings`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ limit: 10000 }),
@@ -369,7 +369,7 @@ export default function SettingsTranslatePage() {
     setBusy(true);
     setError(null);
     try {
-      await fetchJson(`${SUBTITLE_SERVICE_URL}/subtitle/embedding/models/download`, {
+      await fetchJson(`${ORCHESTRATOR_URL}/subtitle/embedding/models/download`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -393,7 +393,7 @@ export default function SettingsTranslatePage() {
     setEmbeddingTestResult(null);
     try {
       const resp = await fetchJson<{ provider: string; model: string; dimensions: number; expected_dimensions: number; ok: boolean }>(
-        `${SUBTITLE_SERVICE_URL}/subtitle/embedding/test`,
+        `${ORCHESTRATOR_URL}/subtitle/embedding/test`,
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -900,7 +900,7 @@ export default function SettingsTranslatePage() {
             setBusy(true);
             setError(null);
             try {
-              await fetchJson(`${SUBTITLE_SERVICE_URL}/subtitle/translate/settings`, {
+              await fetchJson(`${ORCHESTRATOR_URL}/subtitle/translate/settings`, {
                 method: "PUT",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({ openai_api_key: "" }),
@@ -924,7 +924,7 @@ export default function SettingsTranslatePage() {
             setBusy(true);
             setError(null);
             try {
-              await fetchJson(`${SUBTITLE_SERVICE_URL}/subtitle/translate/settings`, {
+              await fetchJson(`${ORCHESTRATOR_URL}/subtitle/translate/settings`, {
                 method: "PUT",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({ rag_embedding_api_key: "" }),
@@ -971,7 +971,7 @@ export default function SettingsTranslatePage() {
               setError(null);
               setTestResult(null);
               try {
-                const resp = await fetchJson<{ translated_text: string }>(`${SUBTITLE_SERVICE_URL}/subtitle/translate/test`, {
+                const resp = await fetchJson<{ translated_text: string }>(`${ORCHESTRATOR_URL}/subtitle/translate/test`, {
                   method: "POST",
                   headers: { "Content-Type": "application/json" },
                   body: JSON.stringify({ text: testText, target_lang: testTargetLang, style: testStyle }),

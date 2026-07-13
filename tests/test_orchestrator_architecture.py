@@ -13,6 +13,7 @@ EXPECTED_ORCHESTRATOR_ROUTES: set[tuple[str, str]] = {
     ("DELETE", "/settings/publish/social/login-sessions/{session_id}"),
     ("DELETE", "/tasks/{task_id}/assets/{asset_id}"),
     ("GET", "/auth/status"),
+    ("GET", "/bilibili/{service_path:path}"),
     ("GET", "/health"),
     ("GET", "/maintenance/workdir"),
     ("GET", "/remote/auto/youtube"),
@@ -38,6 +39,7 @@ EXPECTED_ORCHESTRATOR_ROUTES: set[tuple[str, str]] = {
     ("GET", "/tasks/{task_id}/youtube_meta"),
     ("GET", "/videos/converted"),
     ("POST", "/auth/login"),
+    ("POST", "/bilibili/{service_path:path}"),
     ("POST", "/auth/logout"),
     ("POST", "/auth/setup"),
     ("POST", "/auto/youtube"),
@@ -62,11 +64,20 @@ EXPECTED_ORCHESTRATOR_ROUTES: set[tuple[str, str]] = {
     ("POST", "/tasks/{task_id}/upload/cover"),
     ("POST", "/tasks/{task_id}/upload/video"),
     ("PUT", "/settings/api"),
+    ("PUT", "/bilibili/{service_path:path}"),
     ("PUT", "/settings/publish/platforms/{platform}"),
     ("PUT", "/settings/review"),
     ("PUT", "/settings/storage"),
     ("PUT", "/settings/youtube"),
     ("PUT", "/tasks/{task_id}/publish_meta"),
+    ("PATCH", "/youtube/{service_path:path}"),
+    ("DELETE", "/subtitle/{service_path:path}"),
+    ("GET", "/subtitle/{service_path:path}"),
+    ("POST", "/subtitle/{service_path:path}"),
+    ("PUT", "/subtitle/{service_path:path}"),
+    ("DELETE", "/youtube/{service_path:path}"),
+    ("GET", "/youtube/{service_path:path}"),
+    ("POST", "/youtube/{service_path:path}"),
 }
 
 
@@ -163,8 +174,15 @@ class OrchestratorArchitectureTests(unittest.TestCase):
             "/tasks/{task_id}/actions/auto_youtube_start",
             "/tasks/{task_id}/actions/youtube_meta",
             "/tasks/{task_id}/actions/youtube_download",
+            "/youtube/{service_path:path}",
         ):
             self.assertEqual(owners[path], "videoroll.apps.orchestrator_api.routers.youtube")
+
+    def test_internal_service_proxy_routes_are_owned_by_their_domains(self) -> None:
+        owners = {route.path: route.endpoint.__module__ for route in app.routes if hasattr(route, "endpoint")}
+
+        self.assertEqual(owners["/subtitle/{service_path:path}"], "videoroll.apps.orchestrator_api.routers.settings")
+        self.assertEqual(owners["/bilibili/{service_path:path}"], "videoroll.apps.orchestrator_api.routers.publishing")
 
     def test_task_and_subtitle_routes_are_owned_by_tasks_router(self) -> None:
         owners = {route.path: route.endpoint.__module__ for route in app.routes if hasattr(route, "endpoint")}

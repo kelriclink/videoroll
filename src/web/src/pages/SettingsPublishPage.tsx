@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { useConfirm } from "../components/feedbackContext";
 import { fetchJson } from "../lib/http";
-import { BILIBILI_PUBLISHER_URL, ORCHESTRATOR_URL } from "../lib/urls";
+import { ORCHESTRATOR_URL } from "../lib/urls";
 import {
   activeAccountsForPlatform,
   loginSessionLabel,
@@ -65,8 +65,8 @@ export default function SettingsPublishPage() {
     setError(null);
     try {
       const [s, a, accounts, platforms] = await Promise.all([
-        fetchJson<PublishSettings>(`${BILIBILI_PUBLISHER_URL}/bilibili/publish/settings`),
-        fetchJson<AuthSettings>(`${BILIBILI_PUBLISHER_URL}/bilibili/auth/settings`),
+        fetchJson<PublishSettings>(`${ORCHESTRATOR_URL}/bilibili/publish/settings`),
+        fetchJson<AuthSettings>(`${ORCHESTRATOR_URL}/bilibili/auth/settings`),
         fetchJson<SocialAccount[]>(`${ORCHESTRATOR_URL}/settings/publish/social/accounts`),
         fetchJson<PublishPlatformSettingsResponse>(`${ORCHESTRATOR_URL}/settings/publish/platforms`),
       ]);
@@ -409,7 +409,7 @@ export default function SettingsPublishPage() {
               setBusy(true);
               setError(null);
               try {
-                await fetchJson(`${BILIBILI_PUBLISHER_URL}/bilibili/auth/settings`, {
+                await fetchJson(`${ORCHESTRATOR_URL}/bilibili/auth/settings`, {
                   method: "PUT",
                   headers: { "Content-Type": "application/json" },
                   body: JSON.stringify({ cookie: cookieText.trim() }),
@@ -440,7 +440,7 @@ export default function SettingsPublishPage() {
               setBusy(true);
               setError(null);
               try {
-                await fetchJson(`${BILIBILI_PUBLISHER_URL}/bilibili/auth/settings`, {
+                await fetchJson(`${ORCHESTRATOR_URL}/bilibili/auth/settings`, {
                   method: "PUT",
                   headers: { "Content-Type": "application/json" },
                   body: JSON.stringify({ cookie: "" }),
@@ -464,7 +464,7 @@ export default function SettingsPublishPage() {
               setBusy(true);
               setError(null);
               try {
-                const info = await fetchJson<BilibiliMe>(`${BILIBILI_PUBLISHER_URL}/bilibili/auth/me`);
+                const info = await fetchJson<BilibiliMe>(`${ORCHESTRATOR_URL}/bilibili/auth/me`);
                 setMe(info);
               } catch (e: unknown) {
                 setMe(null);
@@ -520,7 +520,7 @@ export default function SettingsPublishPage() {
                   setError(null);
                   try {
                     const meta = JSON.parse(metaText);
-                    await fetchJson(`${BILIBILI_PUBLISHER_URL}/bilibili/publish/settings`, {
+                    await fetchJson(`${ORCHESTRATOR_URL}/bilibili/publish/settings`, {
                       method: "PUT",
                       headers: { "Content-Type": "application/json" },
                       body: JSON.stringify({ default_meta: meta }),
@@ -550,7 +550,7 @@ export default function SettingsPublishPage() {
                   setBusy(true);
                   setError(null);
                   try {
-                    await fetchJson(`${BILIBILI_PUBLISHER_URL}/bilibili/publish/settings`, {
+                    await fetchJson(`${ORCHESTRATOR_URL}/bilibili/publish/settings`, {
                       method: "PUT",
                       headers: { "Content-Type": "application/json" },
                       body: JSON.stringify({ default_meta: {} }),

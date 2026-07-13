@@ -3,7 +3,9 @@ from __future__ import annotations
 import uuid
 from typing import Any
 
-from fastapi import APIRouter, Body, Depends, File, Form, Query, UploadFile
+import httpx
+from fastapi import APIRouter, Body, Depends, File, Form, Query, Request, UploadFile
+from fastapi.responses import Response
 from sqlalchemy.orm import Session
 
 from videoroll.apps.orchestrator_api.dependencies import get_db, get_s3, get_settings
@@ -27,6 +29,26 @@ from videoroll.storage.s3 import S3Store
 
 
 router = APIRouter()
+
+
+@router.api_route("/bilibili/{service_path:path}", methods=["GET", "POST", "PUT"])
+async def proxy_bilibili_browser_operation(
+    service_path: str,
+    request: Request,
+    settings: OrchestratorSettings = Depends(get_settings),
+) -> Response:
+    try:
+        response = await publishing_service.proxy_browser_request(
+            settings,
+            service_path=f"bilibili/{service_path}",
+            method=request.method,
+            query_string=request.url.query,
+            body=await request.body(),
+            content_type=request.headers.get("content-type"),
+        )
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"bilibili-publisher request failed: {exc}") from exc
+    return Response(content=response.content, status_code=response.status_code, headers=response.headers)
 
 
 @router.get("/tasks/{task_id}/publish_meta")

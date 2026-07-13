@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { fetchJson } from "../lib/http";
-import { ORCHESTRATOR_URL, SUBTITLE_SERVICE_URL } from "../lib/urls";
+import { ORCHESTRATOR_URL } from "../lib/urls";
 import StatusBadge from "../components/StatusBadge";
 import { Asset, Task } from "../lib/types";
 import { PageHeader } from "../components/ui";
@@ -496,7 +496,7 @@ export default function DashboardPage() {
     let timer: number | undefined;
     const load = async () => {
       try {
-        const data = await fetchJson<AgentRun[]>(`${SUBTITLE_SERVICE_URL}/subtitle/agents/runs?limit=80`);
+        const data = await fetchJson<AgentRun[]>(`${ORCHESTRATOR_URL}/subtitle/agents/runs?limit=80`);
         if (cancelled) return;
         setAgentRuns(data);
         setAgentRunsError(null);

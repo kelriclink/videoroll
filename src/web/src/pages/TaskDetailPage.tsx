@@ -4,7 +4,7 @@ import StatusBadge from "../components/StatusBadge";
 import { useConfirm, useToast } from "../components/feedbackContext";
 import { Button } from "../components/ui";
 import { fetchJson } from "../lib/http";
-import { BILIBILI_PUBLISHER_URL, ORCHESTRATOR_URL, SUBTITLE_SERVICE_URL } from "../lib/urls";
+import { ORCHESTRATOR_URL } from "../lib/urls";
 import { Asset, PublishBatch, PublishJob, SubtitleJob, Task } from "../lib/types";
 import { activeAccountsForPlatform, PublishPlatformSettings, SocialAccount } from "./settingsPublishPage.helpers";
 import { buildPublishActionPayload, createTaskDetailPollPlan, PublishPlatform, socialPublishBrowserUrl } from "./taskDetailPage.helpers";
@@ -282,7 +282,7 @@ export default function TaskDetailPage() {
   const publishPlatformEnabled = Boolean(publishPlatformSettings?.[publishPlatform]);
 
   useEffect(() => {
-    fetchJson<Array<{ name: string; path: string }>>(`${SUBTITLE_SERVICE_URL}/subtitle/models`)
+    fetchJson<Array<{ name: string; path: string }>>(`${ORCHESTRATOR_URL}/subtitle/models`)
       .then((m) => setWhisperModels(m))
       .catch(() => setWhisperModels(null));
   }, []);
@@ -292,8 +292,8 @@ export default function TaskDetailPage() {
     (async () => {
       try {
         const [profile, translateSettings] = await Promise.all([
-          fetchJson<SubtitleAutoProfile>(`${SUBTITLE_SERVICE_URL}/subtitle/auto/profile`),
-          fetchJson<{ openai_api_key_set: boolean }>(`${SUBTITLE_SERVICE_URL}/subtitle/translate/settings`),
+          fetchJson<SubtitleAutoProfile>(`${ORCHESTRATOR_URL}/subtitle/auto/profile`),
+          fetchJson<{ openai_api_key_set: boolean }>(`${ORCHESTRATOR_URL}/subtitle/translate/settings`),
         ]);
 
         const formats = Array.isArray(profile.formats) ? profile.formats : [];
@@ -322,7 +322,7 @@ export default function TaskDetailPage() {
       } catch {
         // Fallback: only fetch OpenAI key status so UI can show guidance.
         try {
-          const s = await fetchJson<{ openai_api_key_set: boolean }>(`${SUBTITLE_SERVICE_URL}/subtitle/translate/settings`);
+          const s = await fetchJson<{ openai_api_key_set: boolean }>(`${ORCHESTRATOR_URL}/subtitle/translate/settings`);
           setOpenaiKeySet(Boolean(s.openai_api_key_set));
         } catch {}
       }
@@ -520,7 +520,7 @@ export default function TaskDetailPage() {
     setBiliTypesBusy(true);
     setError(null);
     try {
-      const resp = await fetchJson<BilibiliArchiveTypesResponse>(`${BILIBILI_PUBLISHER_URL}/bilibili/archive/types`);
+      const resp = await fetchJson<BilibiliArchiveTypesResponse>(`${ORCHESTRATOR_URL}/bilibili/archive/types`);
       setBiliTypes(Array.isArray(resp.typelist) ? resp.typelist : []);
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : String(e));
@@ -535,7 +535,7 @@ export default function TaskDetailPage() {
     setError(null);
     setTypeRecommend(null);
     try {
-      const resp = await fetchJson<BilibiliTypeRecommendResponse>(`${BILIBILI_PUBLISHER_URL}/bilibili/archive/type/recommend`, {
+      const resp = await fetchJson<BilibiliTypeRecommendResponse>(`${ORCHESTRATOR_URL}/bilibili/archive/type/recommend`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ task_id: taskId }),

@@ -4,6 +4,7 @@ import uuid
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi.responses import Response
 from sqlalchemy.orm import Session
 
 from videoroll.apps.orchestrator_api.dependencies import get_db, get_s3, get_settings
@@ -32,6 +33,26 @@ from videoroll.storage.s3 import S3Store
 
 
 router = APIRouter()
+
+
+@router.api_route("/youtube/{service_path:path}", methods=["GET", "POST", "PATCH", "DELETE"])
+async def proxy_youtube_browser_operation(
+    service_path: str,
+    request: Request,
+    settings: OrchestratorSettings = Depends(get_settings),
+) -> Response:
+    try:
+        response = await youtube_service.proxy_browser_request(
+            settings,
+            service_path=f"youtube/{service_path}",
+            method=request.method,
+            query_string=request.url.query,
+            body=await request.body(),
+            content_type=request.headers.get("content-type"),
+        )
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"youtube-ingest request failed: {exc}") from exc
+    return Response(content=response.content, status_code=response.status_code, headers=response.headers)
 
 
 @router.post("/auto/youtube", response_model=AutoYouTubeResponse)

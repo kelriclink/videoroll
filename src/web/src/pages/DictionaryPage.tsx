@@ -3,7 +3,7 @@ import { Link } from "react-router-dom";
 import { useConfirm } from "../components/feedbackContext";
 import { Button, DataTable, EmptyState, PageHeader, Section } from "../components/ui";
 import { fetchJson } from "../lib/http";
-import { SUBTITLE_SERVICE_URL } from "../lib/urls";
+import { ORCHESTRATOR_URL } from "../lib/urls";
 
 type DictionarySource = {
   id: string;
@@ -128,12 +128,12 @@ export default function DictionaryPage() {
   }, [entryDomain, entryPage, entrySearch, entryTargetLang, sourceFilter]);
 
   const refreshSources = useCallback(async () => {
-    const rows = await fetchJson<DictionarySource[]>(`${SUBTITLE_SERVICE_URL}/subtitle/dictionaries/sources`);
+    const rows = await fetchJson<DictionarySource[]>(`${ORCHESTRATOR_URL}/subtitle/dictionaries/sources`);
     setSources(rows);
   }, []);
 
   const refreshEntries = useCallback(async () => {
-    const rows = await fetchJson<DictionaryEntry[]>(`${SUBTITLE_SERVICE_URL}/subtitle/dictionaries/entries?${entryQuery}`);
+    const rows = await fetchJson<DictionaryEntry[]>(`${ORCHESTRATOR_URL}/subtitle/dictionaries/entries?${entryQuery}`);
     setEntries(rows);
   }, [entryQuery]);
 
@@ -151,7 +151,7 @@ export default function DictionaryPage() {
   }, [refreshAll]);
 
   useEffect(() => {
-    fetchJson<DictionaryImportPreset[]>(`${SUBTITLE_SERVICE_URL}/subtitle/dictionaries/import-presets`)
+    fetchJson<DictionaryImportPreset[]>(`${ORCHESTRATOR_URL}/subtitle/dictionaries/import-presets`)
       .then(setImportPresets)
       .catch(() => setImportPresets([]));
   }, []);
@@ -201,7 +201,7 @@ export default function DictionaryPage() {
       form.append("import_mode", importMode);
       form.append("full_import", String(fullImport));
       form.append("max_entries", String(fullImport ? 0 : maxEntries));
-      const result = await fetchJson<DictionaryImportResponse>(`${SUBTITLE_SERVICE_URL}/subtitle/dictionaries/import`, {
+      const result = await fetchJson<DictionaryImportResponse>(`${ORCHESTRATOR_URL}/subtitle/dictionaries/import`, {
         method: "POST",
         body: form,
       });
@@ -219,7 +219,7 @@ export default function DictionaryPage() {
     setBusy(true);
     setError(null);
     try {
-      await fetchJson(`${SUBTITLE_SERVICE_URL}/subtitle/dictionaries/sources/${source.id}`, {
+      await fetchJson(`${ORCHESTRATOR_URL}/subtitle/dictionaries/sources/${source.id}`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(patch),
@@ -243,7 +243,7 @@ export default function DictionaryPage() {
     setBusy(true);
     setError(null);
     try {
-      await fetchJson(`${SUBTITLE_SERVICE_URL}/subtitle/dictionaries/sources/${source.id}`, { method: "DELETE" });
+      await fetchJson(`${ORCHESTRATOR_URL}/subtitle/dictionaries/sources/${source.id}`, { method: "DELETE" });
       if (sourceFilter === source.id) setSourceFilter("");
       await refreshAll();
     } catch (e: unknown) {
@@ -257,7 +257,7 @@ export default function DictionaryPage() {
     setBusy(true);
     setError(null);
     try {
-      await fetchJson(`${SUBTITLE_SERVICE_URL}/subtitle/dictionaries/entries/${entry.id}`, {
+      await fetchJson(`${ORCHESTRATOR_URL}/subtitle/dictionaries/entries/${entry.id}`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ enabled }),
@@ -281,7 +281,7 @@ export default function DictionaryPage() {
     setBusy(true);
     setError(null);
     try {
-      await fetchJson(`${SUBTITLE_SERVICE_URL}/subtitle/dictionaries/entries/${entry.id}`, { method: "DELETE" });
+      await fetchJson(`${ORCHESTRATOR_URL}/subtitle/dictionaries/entries/${entry.id}`, { method: "DELETE" });
       await refreshEntries();
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : String(e));
@@ -295,7 +295,7 @@ export default function DictionaryPage() {
     setError(null);
     setMessage(null);
     try {
-      const resp = await fetchJson<{ knowledge_item_id: string }>(`${SUBTITLE_SERVICE_URL}/subtitle/dictionaries/promote`, {
+      const resp = await fetchJson<{ knowledge_item_id: string }>(`${ORCHESTRATOR_URL}/subtitle/dictionaries/promote`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ entry_id: entry.id, status: "approved", confidence: Math.max(0.85, entry.quality || 0) }),
@@ -313,7 +313,7 @@ export default function DictionaryPage() {
     setBusy(true);
     setError(null);
     try {
-      const resp = await fetchJson<{ count: number; results: DictionaryEntry[] }>(`${SUBTITLE_SERVICE_URL}/subtitle/dictionaries/lookup`, {
+      const resp = await fetchJson<{ count: number; results: DictionaryEntry[] }>(`${ORCHESTRATOR_URL}/subtitle/dictionaries/lookup`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({

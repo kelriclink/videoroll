@@ -24,7 +24,11 @@ from videoroll.apps.orchestrator_api.schemas import (
     YouTubeMetaRead,
     YouTubeProxyTestResponse,
 )
-from videoroll.apps.orchestrator_api.infrastructure.internal_http import internal_http_headers
+from videoroll.apps.orchestrator_api.infrastructure.internal_http import (
+    InternalServiceResponse,
+    internal_http_headers,
+    proxy_internal_service_request,
+)
 from videoroll.apps.orchestrator_api.services.asset_service import (
     queue_pending_s3_delete,
     read_s3_bytes,
@@ -69,6 +73,44 @@ from videoroll.utils.youtube_urls import canonicalize_youtube_url, is_youtube_ur
 
 
 logger = logging.getLogger(__name__)
+
+
+_BROWSER_PROXY_PATHS: dict[str, set[str]] = {
+    "GET": {"youtube/sources"},
+    "POST": {"youtube/ingest", "youtube/sources"},
+}
+
+
+async def proxy_browser_request(
+    settings: OrchestratorSettings,
+    *,
+    service_path: str,
+    method: str,
+    query_string: str,
+    body: bytes,
+    content_type: str | None,
+) -> InternalServiceResponse:
+    normalized_method = method.upper()
+    allowed = service_path in _BROWSER_PROXY_PATHS.get(normalized_method, set())
+    if normalized_method in {"PATCH", "DELETE"}:
+        allowed = service_path.startswith("youtube/sources/") and service_path.count("/") == 2
+    if normalized_method == "POST":
+        allowed = allowed or (
+            service_path.startswith("youtube/sources/")
+            and service_path.endswith("/scan")
+            and service_path.count("/") == 3
+        )
+    if not allowed:
+        raise HTTPException(status_code=404, detail="youtube browser operation not found")
+    return await proxy_internal_service_request(
+        settings,
+        service_url=settings.youtube_ingest_url,
+        service_path=service_path,
+        method=normalized_method,
+        query_string=query_string,
+        body=body,
+        content_type=content_type,
+    )
 
 
 def _sha256_bytes(data: bytes) -> str:

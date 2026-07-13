@@ -9,7 +9,11 @@ from sqlalchemy.orm import Session
 
 from videoroll.ai.service import AIService
 from videoroll.apps.bilibili_publisher.schemas import BilibiliPublishMeta
-from videoroll.apps.orchestrator_api.infrastructure.internal_http import internal_http_headers
+from videoroll.apps.orchestrator_api.infrastructure.internal_http import (
+    InternalServiceResponse,
+    internal_http_headers,
+    proxy_internal_service_request,
+)
 from videoroll.apps.orchestrator_api.schemas import PublishActionRequest, PublishAllRequest, RemotePublishResponse
 from videoroll.apps.orchestrator_api.services.asset_service import (
     as_dict,
@@ -42,6 +46,40 @@ from videoroll.apps.subtitle_service.translate_settings_store import get_transla
 from videoroll.config import OrchestratorSettings, get_subtitle_settings
 from videoroll.db.models import Asset, AssetKind, PublishBatch, PublishJob, PublishState, Task, TaskStatus
 from videoroll.storage.s3 import S3Store
+
+
+_BROWSER_PROXY_PATHS: dict[str, set[str]] = {
+    "GET": {
+        "bilibili/archive/types",
+        "bilibili/publish/settings",
+        "bilibili/auth/settings",
+        "bilibili/auth/me",
+    },
+    "POST": {"bilibili/archive/type/recommend"},
+    "PUT": {"bilibili/publish/settings", "bilibili/auth/settings"},
+}
+
+
+async def proxy_browser_request(
+    settings: OrchestratorSettings,
+    *,
+    service_path: str,
+    method: str,
+    query_string: str,
+    body: bytes,
+    content_type: str | None,
+) -> InternalServiceResponse:
+    if service_path not in _BROWSER_PROXY_PATHS.get(method.upper(), set()):
+        raise HTTPException(status_code=404, detail="bilibili browser operation not found")
+    return await proxy_internal_service_request(
+        settings,
+        service_url=settings.bilibili_publisher_url,
+        service_path=service_path,
+        method=method,
+        query_string=query_string,
+        body=body,
+        content_type=content_type,
+    )
 
 
 def publish_meta_s3_key(task_id: uuid.UUID) -> str:

@@ -50,9 +50,6 @@ echo "Building web image: $WEB_IMAGE"
 docker_run build \
   -t "$WEB_IMAGE" \
   --build-arg VITE_ORCHESTRATOR_URL="${VITE_ORCHESTRATOR_URL:-}" \
-  --build-arg VITE_SUBTITLE_SERVICE_URL="${VITE_SUBTITLE_SERVICE_URL:-}" \
-  --build-arg VITE_YOUTUBE_INGEST_URL="${VITE_YOUTUBE_INGEST_URL:-}" \
-  --build-arg VITE_BILIBILI_PUBLISHER_URL="${VITE_BILIBILI_PUBLISHER_URL:-}" \
   -f src/web/Dockerfile \
   src/web
 
