@@ -31,7 +31,10 @@ def test_nginx_authorizes_every_novnc_request_and_vnc_uses_a_tmpfs_password_file
     assert "internal;" in nginx
     assert "proxy_pass http://app:8000/desktop/authorize;" in nginx
     assert "proxy_set_header Cookie $http_cookie;" in nginx
-    assert "proxy_set_header X-Desktop-Grant $arg_grant;" in nginx
+    assert "proxy_set_header X-Desktop-Grant $desktop_grant;" in nginx
+    assert "proxy_set_header X-Desktop-Resource $desktop_resource;" in nginx
+    assert "$cookie_videoroll_desktop_grant" in nginx
+    assert "HttpOnly; SameSite=Strict" in nginx
     assert "location = /api/desktop/authorize" in nginx
     for location in ("location /social-login/", "location /social-publish/"):
         block = nginx.split(location, 1)[1].split("\n  }", 1)[0]

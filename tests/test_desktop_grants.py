@@ -28,8 +28,18 @@ def _desktop_request(
     desktop_path: str,
     token: str,
     resource_id: str,
+    query_credentials: bool = True,
 ) -> Request:
     app = FastAPI()
+    original_uri = f"{desktop_path}?grant={token}&resource={resource_id}" if query_credentials else desktop_path
+    headers = [(b"x-original-uri", original_uri.encode("ascii"))]
+    if not query_credentials:
+        headers.extend(
+            [
+                (b"x-desktop-grant", token.encode("ascii")),
+                (b"x-desktop-resource", resource_id.encode("ascii")),
+            ]
+        )
     request = Request(
         {
             "type": "http",
@@ -37,7 +47,7 @@ def _desktop_request(
             "scheme": "http",
             "path": "/desktop/authorize",
             "query_string": b"",
-            "headers": [(b"x-original-uri", f"{desktop_path}?grant={token}&resource={resource_id}".encode("ascii"))],
+            "headers": headers,
             "app": app,
         }
     )
@@ -145,6 +155,7 @@ def test_novnc_http_assets_are_authorized_without_spending_reconnects() -> None:
             desktop_path="/social-login/app/ui.css",
             token=grant.token,
             resource_id=grant.resource_id,
+            query_credentials=False,
         )
     )
     assert db.query(DesktopAccessGrant).one().scope_json["reconnect_count"] == 0

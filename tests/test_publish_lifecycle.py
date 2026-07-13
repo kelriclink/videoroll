@@ -136,21 +136,16 @@ def test_batch_managed_task_skips_legacy_any_published_job_compensation() -> Non
     db.query.assert_not_called()
 
 
-def test_cleanup_delivery_failure_does_not_mark_batch_as_enqueued() -> None:
+def test_cleanup_broker_failure_keeps_durable_dispatch_intent() -> None:
     db = MagicMock()
     celery_app = MagicMock()
     celery_app.send_task.side_effect = RuntimeError("broker unavailable")
 
     with patch("videoroll.apps.publish_lifecycle.mark_publish_batch_cleanup_enqueued") as mark:
-        try:
-            enqueue_publish_batch_cleanup(db, celery_app, uuid.uuid4(), uuid.uuid4(), needed=True)
-        except RuntimeError:
-            pass
-        else:
-            raise AssertionError("broker failure must be propagated to the caller")
+        assert enqueue_publish_batch_cleanup(db, celery_app, uuid.uuid4(), uuid.uuid4(), needed=True) is True
 
     mark.assert_not_called()
-    db.commit.assert_not_called()
+    db.commit.assert_called_once()
 
 
 def test_binding_unresolved_social_target_uses_current_batch_under_task_lock() -> None:

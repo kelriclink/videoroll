@@ -273,7 +273,10 @@ class PublishService:
         # are committed together. This prevents two callers from both replacing
         # the same terminal batch.
         batch = self._create_batch(task_id, targets, payload)
-        return batch, list(batch.expected_targets or targets)
+        # ``targets`` is the immutable snapshot passed to ``_create_batch``.
+        # Returning it avoids depending on ORM refresh timing while retaining
+        # the exact target set that was atomically persisted with the batch.
+        return batch, targets
 
     def _build_enabled_targets(self, payload: dict[str, Any]) -> list[dict[str, Any]]:
         targets: list[dict[str, Any]] = []

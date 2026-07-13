@@ -85,6 +85,7 @@ def acquire_job_lease(db: Session, job: object, owner: str, ttl_seconds: int) ->
             lease_until=now + timedelta(seconds=_lease_seconds(ttl_seconds)),
             heartbeat_at=now,
         )
+        .execution_options(synchronize_session=False)
     )
     if not bool(result.rowcount):
         return False
@@ -127,6 +128,7 @@ def heartbeat_job_lease(db: Session, job_id: uuid.UUID | str, owner: str, ttl_se
                 model.lease_until > now,
             )
             .values(**values)
+            .execution_options(synchronize_session=False)
         )
         updated += int(result.rowcount or 0)
     if not updated:
@@ -145,6 +147,7 @@ def release_job_lease(db: Session, job_id: uuid.UUID | str, owner: str) -> bool:
             update(model)
             .where(model.id == job_id, model.lease_owner == owner)
             .values(lease_owner=None, lease_until=None, heartbeat_at=now)
+            .execution_options(synchronize_session=False)
         )
         updated += int(result.rowcount or 0)
     if not updated:

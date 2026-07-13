@@ -448,7 +448,11 @@ async def store_uploaded_task_asset(
     temp_path: Path | None = None
     uploaded_key: str | None = None
     try:
-        await file.seek(0)
+        # Keep all blocking file operations behind the service's injectable
+        # thread-pool boundary.  Starlette's UploadFile delegates disk-backed
+        # seeks/closes to its own pool, which makes canonical cover uploads
+        # difficult to control and test consistently.
+        await run_in_threadpool(file.file.seek, 0)
         temp_path, sha256, size_bytes = await run_in_threadpool(
             stream_upload_to_tempfile,
             file.file,
@@ -491,7 +495,7 @@ async def store_uploaded_task_asset(
     finally:
         await run_in_threadpool(safe_unlink, temp_path)
         try:
-            await file.close()
+            await run_in_threadpool(file.file.close)
         except Exception:
             pass
 
@@ -532,11 +536,11 @@ async def upload_task_cover(
 ) -> Asset:
     task = get_task(db, task_id)
     try:
-        await file.seek(0)
+        await run_in_threadpool(file.file.seek, 0)
         validated = await run_in_threadpool(validate_and_reencode_cover, file.file)
     finally:
         try:
-            await file.close()
+            await run_in_threadpool(file.file.close)
         except Exception:
             pass
     canonical_file = tempfile.TemporaryFile()

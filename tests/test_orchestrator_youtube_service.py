@@ -11,14 +11,19 @@ from videoroll.apps.orchestrator_api.services import youtube_service
 from videoroll.db.models import SourceLicense
 
 
-def test_ingest_uses_shared_internal_secret_without_legacy_setting() -> None:
+def test_ingest_uses_dedicated_internal_secret_not_s3_secret() -> None:
     response = Mock()
     response.json.return_value = {"task_id": str(uuid.uuid4()), "deduped": False, "source_id": "video-1"}
     client = Mock()
     client.__enter__ = Mock(return_value=client)
     client.__exit__ = Mock(return_value=False)
     client.post.return_value = response
-    settings = SimpleNamespace(s3_secret_access_key="secret", youtube_ingest_url="http://youtube-ingest")
+    settings = SimpleNamespace(
+        internal_api_secret="internal-secret",
+        s3_secret_access_key="unrelated-s3-secret",
+        youtube_ingest_url="http://youtube-ingest",
+        development_mode=False,
+    )
 
     with patch.object(youtube_service.httpx, "Client", return_value=client) as client_factory:
         youtube_service.ingest_youtube_source(

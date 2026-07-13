@@ -84,8 +84,14 @@ class _RecordingAsyncClient:
 
 @pytest.mark.anyio
 async def test_subtitle_browser_proxy_uses_server_derived_service_token(monkeypatch) -> None:
-    client = _RecordingAsyncClient()
-    monkeypatch.setattr(internal_http.httpx, "AsyncClient", lambda **_kwargs: client)
+    clients: list[_RecordingAsyncClient] = []
+
+    def create_client(**kwargs) -> _RecordingAsyncClient:
+        client = _RecordingAsyncClient(**kwargs)
+        clients.append(client)
+        return client
+
+    monkeypatch.setattr(internal_http.httpx, "AsyncClient", create_client)
     settings = SimpleNamespace(
         subtitle_service_url="http://subtitle-service:8001",
         internal_api_secret="internal-secret",
@@ -104,6 +110,8 @@ async def test_subtitle_browser_proxy_uses_server_derived_service_token(monkeypa
     assert response.status_code == 201
     assert response.content == b'{"ok":true}'
     assert response.headers["content-type"] == "application/json"
+    assert len(clients) == 1
+    client = clients[0]
     assert client.headers[INTERNAL_TOKEN_HEADER] == service_token(settings)
     assert client.headers["content-type"] == "application/json"
     assert client.requests == [

@@ -419,6 +419,7 @@ def enqueue_publish_batch_cleanup(
         celery_app.send_task("subtitle_service.dispatch_outbox", args=[], queue="subtitle")
     except Exception:
         # The event is already committed and will be picked up by the periodic
-        # dispatcher.  Preserve the old caller signal for diagnostics.
-        raise
+        # dispatcher.  Do not turn a durable pending event into a failed
+        # domain transition merely because the best-effort wake-up is down.
+        pass
     return event is not None

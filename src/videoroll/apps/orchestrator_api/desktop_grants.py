@@ -151,8 +151,8 @@ def _desktop_scope_from_original_uri(request: Request) -> tuple[DesktopType, str
         raise HTTPException(status_code=403, detail="desktop path is not authorized")
 
     query = parse_qs(parsed.query, keep_blank_values=False)
-    token = str((query.get("grant") or [""])[0]).strip()
-    resource_id = str((query.get("resource") or [""])[0]).strip()
+    token = str((query.get("grant") or [request.headers.get("x-desktop-grant") or ""])[0]).strip()
+    resource_id = str((query.get("resource") or [request.headers.get("x-desktop-resource") or ""])[0]).strip()
     if not token or not resource_id:
         raise HTTPException(status_code=403, detail="desktop grant is required")
     try:

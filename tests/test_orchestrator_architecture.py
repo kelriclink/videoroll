@@ -16,7 +16,6 @@ EXPECTED_ORCHESTRATOR_ROUTES: set[tuple[str, str]] = {
     ("GET", "/bilibili/{service_path:path}"),
     ("GET", "/health"),
     ("GET", "/maintenance/workdir"),
-    ("GET", "/remote/auto/youtube"),
     ("GET", "/settings/api"),
     ("GET", "/settings/publish/platforms"),
     ("GET", "/settings/publish/social/accounts"),

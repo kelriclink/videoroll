@@ -211,6 +211,8 @@ def test_sqlite_migration_smoke(tmp_path: Path) -> None:
 def test_installed_wheel_migration_cli_upgrades_legacy_database(tmp_path: Path) -> None:
     wheel_dir = tmp_path / "wheel"
     wheel_dir.mkdir()
+    build_env = os.environ.copy()
+    build_env["PIP_CACHE_DIR"] = str(tmp_path / "pip-cache")
     build = subprocess.run(
         [
             sys.executable,
@@ -224,6 +226,7 @@ def test_installed_wheel_migration_cli_upgrades_legacy_database(tmp_path: Path) 
             str(ROOT),
         ],
         cwd=tmp_path,
+        env=build_env,
         capture_output=True,
         text=True,
         check=False,

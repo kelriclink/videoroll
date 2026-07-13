@@ -18,6 +18,7 @@ from videoroll.db.base import Base
 from videoroll.db.models import (
     RenderJob,
     RenderJobStatus,
+    PublishJob,
     SourceLicense,
     SourceType,
     SubtitleJob,
@@ -34,13 +35,19 @@ def _compile_jsonb_for_sqlite(_type: JSONB, _compiler: object, **_kwargs: object
 @pytest.fixture
 def db() -> Session:
     engine = create_engine("sqlite:///:memory:")
-    Base.metadata.create_all(engine, tables=[Task.__table__, SubtitleJob.__table__, RenderJob.__table__])
+    Base.metadata.create_all(
+        engine,
+        tables=[Task.__table__, SubtitleJob.__table__, RenderJob.__table__, PublishJob.__table__],
+    )
     session = sessionmaker(bind=engine)()
     try:
         yield session
     finally:
         session.close()
-        Base.metadata.drop_all(engine, tables=[RenderJob.__table__, SubtitleJob.__table__, Task.__table__])
+        Base.metadata.drop_all(
+            engine,
+            tables=[PublishJob.__table__, RenderJob.__table__, SubtitleJob.__table__, Task.__table__],
+        )
 
 
 def _task(db: Session) -> Task:
