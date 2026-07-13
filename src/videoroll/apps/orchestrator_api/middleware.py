@@ -37,7 +37,7 @@ class AdminAuthMiddleware(BaseHTTPMiddleware):
         path = scope_path
         if root_path and path.startswith(root_path):
             path = path[len(root_path) :] or "/"
-        if path == "/health" or path.endswith("/health"):
+        if path == "/health":
             return await call_next(request)
         if path.startswith("/auth"):
             return await call_next(request)

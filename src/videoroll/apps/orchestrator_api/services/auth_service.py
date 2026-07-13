@@ -124,15 +124,12 @@ def _audit(
     payload: dict[str, object] | None = None,
 ) -> None:
     bounded_payload = dict(payload or {})
-    bounded_payload["user_agent"] = str(request.headers.get("user-agent") or "")[:256]
     write_security_audit(
         db,
         event_type=event_type,
         outcome=outcome,
-        request_id=_request_id(request),
         source_ip=_source_ip(request),
         error_code=error_code,
-        error_message=error_message,
         payload=bounded_payload,
     )
 

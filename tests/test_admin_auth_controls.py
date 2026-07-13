@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -265,26 +266,107 @@ def test_internal_http_headers_use_dedicated_service_secret() -> None:
     assert internal_http_headers(settings) == {INTERNAL_TOKEN_HEADER: service_token(settings)}
 
 
-def test_security_audit_event_drops_sensitive_values_and_bounds_text() -> None:
+def test_security_audit_event_keeps_only_allowlisted_counter_payload() -> None:
     event = build_security_audit_event(
         event_type="admin.login.failure",
         outcome="failure",
         source_ip="203.0.113.7",
+        request_id="token=request-token",
         payload={
             "password": "password-123",
             "authorization": "Bearer top-secret",
             "cookie": "session=top-secret",
+            "attempts": 2,
+            "retry_after": 30,
             "reason": "x" * 1000,
         },
-        error_message="y" * 1000,
+        error_message="Bearer error-token",
     )
 
-    assert "password" not in event.payload_json
-    assert "authorization" not in event.payload_json
-    assert "cookie" not in event.payload_json
-    assert len(event.payload_json["reason"]) <= 256
-    assert event.error_message is not None
-    assert len(event.error_message) <= 512
+    assert event.payload_json == {"attempts": 2, "retry_after": 30}
+    assert event.request_id is None
+    assert event.error_message is None
+
+
+def test_security_audit_storage_drops_attacker_controlled_credentials() -> None:
+    from videoroll.db.models import SecurityAuditEvent
+
+    engine = create_engine("sqlite:///:memory:")
+    SecurityAuditEvent.__table__.create(engine)
+    sessions = sessionmaker(bind=engine)
+    db = sessions()
+    app = FastAPI()
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "scheme": "http",
+            "path": "/auth/login",
+            "query_string": b"",
+            "headers": [
+                (b"user-agent", b"Bearer ua-bearer-value; password=ua-password-value"),
+                (b"x-request-id", b"cookie=request-cookie-value; token=request-token-value"),
+            ],
+            "client": ("203.0.113.7", 12345),
+            "app": app,
+        }
+    )
+    leaked_values = {
+        "ua-bearer-value",
+        "ua-password-value",
+        "request-cookie-value",
+        "request-token-value",
+        "payload-secret-value",
+        "error-bearer-value",
+    }
+
+    auth_service._audit(
+        db,
+        request,
+        event_type="admin.login.failure",
+        outcome="failure",
+        error_message="authorization: Bearer error-bearer-value",
+        payload={"detail": "secret=payload-secret-value"},
+    )
+
+    stored = db.query(SecurityAuditEvent).one()
+    stored_text = json.dumps(
+        {
+            "request_id": stored.request_id,
+            "payload": stored.payload_json,
+            "error_message": stored.error_message,
+        }
+    )
+    assert not any(value in stored_text for value in leaked_values)
+    db.close()
+
+
+@pytest.mark.anyio
+async def test_admin_auth_only_exempts_normalized_root_health_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(auth_middleware, "get_admin_password_hash", lambda _request: "password-hash")
+    child = FastAPI()
+    child.add_middleware(auth_middleware.AdminAuthMiddleware)
+
+    @child.get("/health")
+    async def health() -> dict[str, str]:
+        return {"status": "ok"}
+
+    @child.get("/private/health")
+    async def private_health() -> dict[str, str]:
+        return {"status": "private"}
+
+    from starlette.applications import Starlette
+    from starlette.routing import Mount
+
+    root = Starlette(routes=[Mount("/admin", app=child)])
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=root),
+        base_url="http://test",
+    ) as client:
+        assert (await client.get("/admin/health")).status_code == 200
+        assert (await client.get("/admin/private/health")).status_code == 401
 
 
 @pytest.mark.anyio
