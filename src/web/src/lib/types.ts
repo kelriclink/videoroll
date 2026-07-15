@@ -30,6 +30,10 @@ export type Task = {
   error_code?: string | null;
   error_message?: string | null;
   retry_count: number;
+  bilibili_upload?: {
+    job_id: string;
+    progress: number;
+  } | null;
   created_at: string;
   updated_at: string;
 };
@@ -65,6 +69,8 @@ export type PublishJob = {
   external_id?: string | null;
   external_url?: string | null;
   account_id?: string | null;
+  upload_progress?: number | null;
+  upload_active?: boolean;
   started_at?: string | null;
   finished_at?: string | null;
   tid?: number | null;

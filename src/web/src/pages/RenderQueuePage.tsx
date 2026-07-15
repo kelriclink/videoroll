@@ -1,6 +1,7 @@
 import { Link } from "react-router-dom";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { fetchJson } from "../lib/http";
+import { RealtimeEvent, useRealtimeSubscription } from "../lib/realtime";
 import { ORCHESTRATOR_URL } from "../lib/urls";
 
 type TaskQueueItem = {
@@ -36,11 +37,14 @@ export default function RenderQueuePage() {
   const [busy, setBusy] = useState(false);
   const [maxConcText, setMaxConcText] = useState("1");
   const [maxConcDirty, setMaxConcDirty] = useState(false);
+  const queueRef = useRef<TaskQueue | null>(null);
+  const refreshTimerRef = useRef<number | undefined>();
 
   const refresh = useCallback(async () => {
     setError(null);
     try {
       const q = await fetchJson<TaskQueue>(`${ORCHESTRATOR_URL}/subtitle/task_queue`);
+      queueRef.current = q;
       setQueue(q);
       if (!maxConcDirty) setMaxConcText(String(q?.settings?.max_concurrency ?? 1));
     } catch (e: unknown) {
@@ -52,24 +56,68 @@ export default function RenderQueuePage() {
     refresh();
   }, [refresh]);
 
-  const shouldPoll = useMemo(() => (queue?.tasks ?? []).some((t) => t.state === "queued" || t.state === "running"), [queue]);
+  const scheduleRefresh = useCallback(() => {
+    if (refreshTimerRef.current) return;
+    refreshTimerRef.current = window.setTimeout(() => {
+      refreshTimerRef.current = undefined;
+      void refresh();
+    }, 250);
+  }, [refresh]);
 
-  useEffect(() => {
-    if (!shouldPoll) return;
-    let cancelled = false;
-    let timer: number | undefined;
-    const tick = async () => {
-      if (cancelled) return;
-      await refresh();
-      if (cancelled) return;
-      timer = window.setTimeout(tick, 1500);
+  const handleJobEvent = useCallback((event: RealtimeEvent) => {
+    const data = event.data;
+    const jobId = String(data.id ?? event.entity_id ?? "");
+    const taskId = String(data.task_id ?? "");
+    const status = String(data.status ?? "");
+    const current = queueRef.current;
+    const index = current?.tasks.findIndex((item) => {
+      if (item.task_id !== taskId) return false;
+      return event.name.startsWith("subtitle_job.") ? item.subtitle_job_id === jobId : item.render_job_id === jobId;
+    }) ?? -1;
+    if (!current || index < 0 || !["queued", "running"].includes(status)) {
+      scheduleRefresh();
+      return;
+    }
+    const item = current.tasks[index];
+    const nextState = status === "running" ? "running" : item.state;
+    const nextItem: TaskQueueItem = {
+      ...item,
+      state: nextState,
+      stage: status === "running" ? (event.name.startsWith("subtitle_job.") ? "subtitle" : "render") : item.stage,
+      progress: Number(data.progress ?? item.progress),
+      error_message: typeof data.error_message === "string" ? data.error_message : null,
+      updated_at: String(data.updated_at ?? item.updated_at),
     };
-    tick();
-    return () => {
-      cancelled = true;
-      if (timer) window.clearTimeout(timer);
+    const tasks = [...current.tasks];
+    tasks[index] = nextItem;
+    const nextQueue = {
+      ...current,
+      running_count: current.running_count + (item.state !== "running" && nextState === "running" ? 1 : 0),
+      queued_count: Math.max(0, current.queued_count - (item.state === "queued" && nextState === "running" ? 1 : 0)),
+      tasks,
     };
-  }, [shouldPoll, refresh]);
+    queueRef.current = nextQueue;
+    setQueue(nextQueue);
+  }, [scheduleRefresh]);
+
+  const handleRealtimeEvent = useCallback((event: RealtimeEvent) => {
+    if (event.name.startsWith("subtitle_job.") || event.name.startsWith("render_job.")) {
+      handleJobEvent(event);
+      return;
+    }
+    if (event.name === "task.updated" || event.name === "task.deleted" || event.name === "task_queue.changed") {
+      scheduleRefresh();
+    }
+  }, [handleJobEvent, scheduleRefresh]);
+
+  useRealtimeSubscription(["queue"], handleRealtimeEvent, () => {
+    void refresh();
+  });
+
+  useEffect(() => () => {
+    if (refreshTimerRef.current) window.clearTimeout(refreshTimerRef.current);
+    refreshTimerRef.current = undefined;
+  }, []);
 
   async function saveMaxConcurrency() {
     setBusy(true);

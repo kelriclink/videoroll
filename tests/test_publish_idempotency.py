@@ -77,7 +77,7 @@ def test_bilibili_publish_rejects_a_batch_owned_by_another_task() -> None:
     db.query.assert_not_called()
 
 
-def test_social_publish_rejects_an_inactive_batch() -> None:
+def test_social_publish_rejects_a_target_outside_its_batch() -> None:
     task_id = uuid.uuid4()
     batch_id = uuid.uuid4()
     account_id = uuid.uuid4()
@@ -111,7 +111,7 @@ def test_social_publish_rejects_an_inactive_batch() -> None:
             db=db,
         )
 
-    assert exc_info.value.status_code == 409
+    assert exc_info.value.status_code == 400
     db.query.assert_not_called()
 
 

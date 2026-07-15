@@ -122,6 +122,7 @@ async def test_subtitle_browser_proxy_uses_server_derived_service_token(monkeypa
 @pytest.mark.parametrize(
     ("method", "service_path"),
     [
+        ("GET", "subtitle/agents/runs/5d7db7cf-1a7d-4d77-9335-cf39bbbcb9a4"),
         ("DELETE", "subtitle/models/model-name"),
         ("PUT", "subtitle/dictionaries/sources/source-id"),
         ("DELETE", "subtitle/dictionaries/entries/entry-id"),
@@ -130,3 +131,7 @@ async def test_subtitle_browser_proxy_uses_server_derived_service_token(monkeypa
 )
 def test_subtitle_proxy_allows_each_dynamic_browser_operation(method: str, service_path: str) -> None:
     assert subtitle_service._is_browser_proxy_path_allowed(method, service_path)
+
+
+def test_subtitle_proxy_rejects_invalid_agent_run_id() -> None:
+    assert not subtitle_service._is_browser_proxy_path_allowed("GET", "subtitle/agents/runs/not-a-uuid")

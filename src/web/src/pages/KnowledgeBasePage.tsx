@@ -97,9 +97,10 @@ export default function KnowledgeBasePage() {
       if (controller.signal.aborted || generation !== requestGenerationRef.current) return;
       setError(e instanceof Error ? e.message : String(e));
     } finally {
-      if (generation !== requestGenerationRef.current) return;
-      setLoading(false);
-      setRefreshing(false);
+      if (generation === requestGenerationRef.current) {
+        setLoading(false);
+        setRefreshing(false);
+      }
     }
   }, [query]);
 

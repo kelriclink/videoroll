@@ -472,6 +472,10 @@ class AgentRunRead(BaseModel):
     error: str = ""
     knowledge_item_id: Optional[uuid.UUID] = None
     parent_agent_run_id: Optional[uuid.UUID] = None
+    started_at: datetime
+    finished_at: Optional[datetime] = None
+    created_at: datetime
+    updated_at: datetime
 
 
 class AgentSkillRead(BaseModel):
@@ -485,10 +489,6 @@ class AgentSkillRead(BaseModel):
     source: str = "user"
     path: str = ""
     resource_count: int = 0
-    started_at: datetime
-    finished_at: Optional[datetime] = None
-    created_at: datetime
-    updated_at: datetime
 
 
 class EmbeddingModelInfo(BaseModel):

@@ -47,6 +47,7 @@ from videoroll.apps.subtitle_service.embeddings import EmbeddingSettings, assert
 from videoroll.apps.subtitle_service.processing import Segment
 from videoroll.apps.subtitle_service.retrieval import RetrievalPipeline
 from videoroll.config import get_subtitle_settings
+from videoroll.realtime import publish_agent_event
 
 
 _TERM_SPLIT_RE = re.compile(r"[\s\-_]+")
@@ -1145,6 +1146,23 @@ def _start_agent_run(
         },
     )
     db.commit()
+    publish_agent_event(
+        get_subtitle_settings().redis_url,
+        run_id=run_id,
+        name="agent_run.started",
+        data={
+            "id": run_id,
+            "agent_type": str(agent_type or "rag_term_research").strip()[:64] or "rag_term_research",
+            "status": "running",
+            "term": str(term or "").strip(),
+            "domain": str(domain or "").strip(),
+            "target_lang": str(target_lang or "zh").strip() or "zh",
+            "task_id": task_id,
+            "subtitle_job_id": subtitle_job_id,
+            "query": str(query or "").strip(),
+            "parent_agent_run_id": parent_agent_run_id,
+        },
+    )
     return run_id
 
 
@@ -1171,6 +1189,30 @@ def _append_agent_step(db: Session, run_id: str | None, step: dict[str, Any]) ->
             {"id": run_id, "step": json.dumps([clean_step], ensure_ascii=False)},
         )
         db.commit()
+        publish_agent_event(
+            get_subtitle_settings().redis_url,
+            run_id=run_id,
+            name="agent_run.step_appended",
+            data={
+                "id": run_id,
+                "step": {
+                    key: clean_step.get(key)
+                    for key in (
+                        "event_id",
+                        "kind",
+                        "action",
+                        "at",
+                        "status",
+                        "tool_name",
+                        "model",
+                        "duration_ms",
+                        "ok",
+                        "error_type",
+                    )
+                    if clean_step.get(key) is not None
+                },
+            },
+        )
     except Exception:
         db.rollback()
 
@@ -1287,6 +1329,17 @@ def _finish_agent_run(
             },
         )
         db.commit()
+        publish_agent_event(
+            get_subtitle_settings().redis_url,
+            run_id=run_id,
+            name="agent_run.finished",
+            data={
+                "id": run_id,
+                "status": str(status or "succeeded").strip() or "succeeded",
+                "error": str(error or "")[:1000],
+                "knowledge_item_id": knowledge_item_id,
+            },
+        )
     except Exception:
         db.rollback()
 
@@ -4871,6 +4924,42 @@ def delete_knowledge_item(db: Session, item_id: str) -> bool:
     return int(getattr(result, "rowcount", 0) or 0) > 0
 
 
+def _agent_run_row_to_dict(row: Any) -> dict[str, Any]:
+    m = row._mapping
+    result = m["result"]
+    steps = m["steps"]
+    if isinstance(result, str):
+        try:
+            result = json.loads(result)
+        except Exception:
+            result = {}
+    if isinstance(steps, str):
+        try:
+            steps = json.loads(steps)
+        except Exception:
+            steps = []
+    return {
+        "id": str(m["id"]),
+        "agent_type": m["agent_type"],
+        "status": m["status"],
+        "term": m["term"],
+        "domain": m["domain"],
+        "target_lang": m["target_lang"],
+        "task_id": str(m["task_id"]) if m["task_id"] else None,
+        "subtitle_job_id": str(m["subtitle_job_id"]) if m["subtitle_job_id"] else None,
+        "query": m["query"],
+        "steps": steps if isinstance(steps, list) else [],
+        "result": result if isinstance(result, dict) else {},
+        "error": m["error"],
+        "knowledge_item_id": str(m["knowledge_item_id"]) if m["knowledge_item_id"] else None,
+        "parent_agent_run_id": str(m["parent_agent_run_id"]) if m["parent_agent_run_id"] else None,
+        "started_at": m["started_at"],
+        "finished_at": m["finished_at"],
+        "created_at": m["created_at"],
+        "updated_at": m["updated_at"],
+    }
+
+
 def list_agent_runs(db: Session, *, status: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
     clauses = ["1=1"]
     params: dict[str, Any] = {"limit": max(1, min(100, int(limit)))}
@@ -4891,44 +4980,23 @@ def list_agent_runs(db: Session, *, status: str | None = None, limit: int = 50) 
         ),
         params,
     ).all()
-    out: list[dict[str, Any]] = []
-    for row in rows:
-        m = row._mapping
-        result = m["result"]
-        steps = m["steps"]
-        if isinstance(result, str):
-            try:
-                result = json.loads(result)
-            except Exception:
-                result = {}
-        if isinstance(steps, str):
-            try:
-                steps = json.loads(steps)
-            except Exception:
-                steps = []
-        out.append(
-            {
-                "id": str(m["id"]),
-                "agent_type": m["agent_type"],
-                "status": m["status"],
-                "term": m["term"],
-                "domain": m["domain"],
-                "target_lang": m["target_lang"],
-                "task_id": str(m["task_id"]) if m["task_id"] else None,
-                "subtitle_job_id": str(m["subtitle_job_id"]) if m["subtitle_job_id"] else None,
-                "query": m["query"],
-                "steps": steps if isinstance(steps, list) else [],
-                "result": result if isinstance(result, dict) else {},
-                "error": m["error"],
-                "knowledge_item_id": str(m["knowledge_item_id"]) if m["knowledge_item_id"] else None,
-                "parent_agent_run_id": str(m["parent_agent_run_id"]) if m["parent_agent_run_id"] else None,
-                "started_at": m["started_at"],
-                "finished_at": m["finished_at"],
-                "created_at": m["created_at"],
-                "updated_at": m["updated_at"],
-            }
-        )
-    return out
+    return [_agent_run_row_to_dict(row) for row in rows]
+
+
+def get_agent_run(db: Session, run_id: str) -> dict[str, Any] | None:
+    row = db.execute(
+        text(
+            """
+            SELECT id, agent_type, status, term, domain, target_lang, task_id, subtitle_job_id,
+                   query, steps, result, error, knowledge_item_id, parent_agent_run_id,
+                   started_at, finished_at, created_at, updated_at
+            FROM translation_agent_runs
+            WHERE id = CAST(:id AS uuid)
+            """
+        ),
+        {"id": str(run_id or "").strip()},
+    ).first()
+    return _agent_run_row_to_dict(row) if row is not None else None
 
 
 def rebuild_knowledge_embeddings(

@@ -14,6 +14,7 @@ from videoroll.apps.social_publisher.account_store import canonicalize_storage_s
 from videoroll.apps.social_publisher.sau_cli import build_login_command
 from videoroll.config import SocialPublisherSettings
 from videoroll.db.session import db_session
+from videoroll.realtime import publish_login_session_updated
 
 
 ACTIVE_STATES = {"starting", "running", "canceling"}
@@ -60,6 +61,7 @@ class BrowserLoginManager:
                 browser_url=self.settings.login_browser_url,
             )
             self._sessions[session.id] = session
+        publish_login_session_updated(self.settings.redis_url, session)
         threading.Thread(target=self._run, args=(session.id,), daemon=True, name=f"social-login-{session.id}").start()
         return session
 
@@ -78,14 +80,16 @@ class BrowserLoginManager:
                 process = session.process
                 if process is not None and process.poll() is None:
                     process.terminate()
-            return session
+        publish_login_session_updated(self.settings.redis_url, session)
+        return session
 
     def _update(self, session_id: uuid.UUID, **changes: object) -> BrowserLoginSession:
         with self._lock:
             session = self._sessions[session_id]
             for key, value in changes.items():
                 setattr(session, key, value)
-            return session
+        publish_login_session_updated(self.settings.redis_url, session)
+        return session
 
     def _run(self, session_id: uuid.UUID) -> None:
         session = self.get(session_id)

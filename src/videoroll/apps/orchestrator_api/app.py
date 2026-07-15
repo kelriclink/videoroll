@@ -8,6 +8,7 @@ from fastapi.responses import JSONResponse
 
 from videoroll.apps.orchestrator_api.infrastructure.lifecycle import orchestrator_lifespan
 from videoroll.apps.orchestrator_api.middleware import AdminAuthMiddleware
+from videoroll.apps.orchestrator_api.realtime import router as realtime_router
 from videoroll.apps.orchestrator_api.routers.assets import router as assets_router
 from videoroll.apps.orchestrator_api.routers.auth import router as auth_router
 from videoroll.apps.orchestrator_api.routers.desktop import router as desktop_router
@@ -46,8 +47,10 @@ def create_app(*, install_lifecycle: bool = True) -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+    application.state.cors_origins = tuple(cors_origins)
 
     application.include_router(auth_router)
+    application.include_router(realtime_router)
     application.include_router(desktop_router)
     application.include_router(system_router)
     application.include_router(settings_router)

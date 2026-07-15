@@ -253,6 +253,8 @@ def _ensure_publish_jobs_generic_columns(engine: Engine) -> None:
         "lease_until": ts_type,
         "heartbeat_at": ts_type,
         "operation_key": "VARCHAR(255)",
+        "upload_progress": "INTEGER NOT NULL DEFAULT 0",
+        "upload_active": "BOOLEAN NOT NULL DEFAULT FALSE",
     }
     for column, column_type_sql in required_columns.items():
         if column in cols:

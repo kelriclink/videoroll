@@ -4,11 +4,12 @@ import StatusBadge from "../components/StatusBadge";
 import { useConfirm, useToast } from "../components/feedbackContext";
 import { Button } from "../components/ui";
 import { fetchJson } from "../lib/http";
+import { RealtimeEvent, useRealtimeSubscription } from "../lib/realtime";
 import { loadSlices } from "../lib/requestState";
 import { ORCHESTRATOR_URL } from "../lib/urls";
 import { Asset, PublishBatch, PublishJob, SubtitleJob, Task, TaskCoreSnapshot } from "../lib/types";
 import { activeAccountsForPlatform, PublishPlatformSettings, SocialAccount } from "./settingsPublishPage.helpers";
-import { buildPublishActionPayload, createTaskDetailPollPlan, PublishPlatform, socialPublishBrowserUrl } from "./taskDetailPage.helpers";
+import { buildPublishActionPayload, PublishPlatform, socialPublishBrowserUrl } from "./taskDetailPage.helpers";
 
 type SubtitleActionResponse = { job_id: string; status: string };
 type PublishResponse = { job_id?: string | null; state: string; platform?: string | null; aid?: string | null; bvid?: string | null; external_id?: string | null; external_url?: string | null; response?: any };
@@ -86,6 +87,25 @@ type WorkflowStep = {
   detail: string;
   state: WorkflowStepState;
 };
+
+function clampUploadProgress(value: number | null | undefined): number {
+  const progress = Number(value);
+  if (!Number.isFinite(progress)) return 0;
+  return Math.max(0, Math.min(100, Math.floor(progress)));
+}
+
+function upsertById<T extends { id: string }>(current: T[] | null, item: T): T[] {
+  const rows = current ?? [];
+  const index = rows.findIndex((row) => row.id === item.id);
+  if (index < 0) return [...rows, item];
+  const next = [...rows];
+  next[index] = { ...rows[index], ...item };
+  return next;
+}
+
+function removeById<T extends { id: string }>(current: T[] | null, id: string): T[] | null {
+  return current ? current.filter((row) => row.id !== id) : current;
+}
 
 function normalizeYouTubeSubtitleMode(value: unknown, legacyPrefer?: boolean | null): YouTubeSubtitleMode {
   const mode = String(value ?? "").trim().toLowerCase();
@@ -192,6 +212,8 @@ export default function TaskDetailPage() {
   const [youtubeMeta, setYoutubeMeta] = useState<YouTubeMeta | null>(null);
   const [didAutoPickCover, setDidAutoPickCover] = useState(false);
   const loadedPublishMetaTextRef = useRef<string>("{}");
+  const logEventTimerRef = useRef<number | undefined>();
+  const lastLogEventFetchAtRef = useRef(0);
 
   const refresh = useCallback(
     async (opts?: { silent?: boolean }) => {
@@ -247,6 +269,34 @@ export default function TaskDetailPage() {
     },
     [taskId],
   );
+
+  const refreshRealtimeSnapshot = useCallback(async () => {
+    if (!taskId) return;
+    const result = await loadSlices<TaskCoreSnapshot, { publishJobs: PublishJob[]; publishBatches: PublishBatch[] }>(
+      async () => {
+        const [nextTask, nextAssets, nextSubtitleJobs] = await Promise.all([
+          fetchJson<Task>(`${ORCHESTRATOR_URL}/tasks/${taskId}`),
+          fetchJson<Asset[]>(`${ORCHESTRATOR_URL}/tasks/${taskId}/assets`),
+          fetchJson<SubtitleJob[]>(`${ORCHESTRATOR_URL}/tasks/${taskId}/subtitle_jobs`),
+        ]);
+        return { task: nextTask, assets: nextAssets, subtitleJobs: nextSubtitleJobs };
+      },
+      {
+        publishJobs: () => fetchJson<PublishJob[]>(`${ORCHESTRATOR_URL}/tasks/${taskId}/publish_jobs`),
+        publishBatches: () => fetchJson<PublishBatch[]>(`${ORCHESTRATOR_URL}/tasks/${taskId}/publish_batches`),
+      },
+    );
+    if (result.core.ok) {
+      setTask(result.core.value.task);
+      setAssets(result.core.value.assets);
+      setSubtitleJobs(result.core.value.subtitleJobs);
+      setCoreError(null);
+    } else {
+      setCoreError(result.core.error.message);
+    }
+    if (result.optional.publishJobs.ok) setPublishJobs(result.optional.publishJobs.value);
+    if (result.optional.publishBatches.ok) setPublishBatches(result.optional.publishBatches.value);
+  }, [taskId]);
 
   useEffect(() => {
     refresh();
@@ -520,6 +570,10 @@ export default function TaskDetailPage() {
     () => (publishJobs ?? []).filter((j) => j.state === "submitting").length,
     [publishJobs],
   );
+  const activeBilibiliUpload = useMemo(
+    () => (publishJobs ?? []).find((j) => (j.platform ?? "bilibili") === "bilibili" && Boolean(j.upload_active)) ?? null,
+    [publishJobs],
+  );
   const workflowSteps = useMemo<WorkflowStep[]>(() => {
     if (!task) return [];
     const failed = task.status === "FAILED";
@@ -771,12 +825,6 @@ export default function TaskDetailPage() {
     return hasFailedJob || isTaskFailed;
   }, [subtitleJobs, task]);
 
-  const shouldPoll = useMemo(() => {
-    const hasSubtitleInFlight = (subtitleJobs ?? []).some((j) => j.status === "queued" || j.status === "running");
-    const hasPublishInFlight = (publishJobs ?? []).some((j) => j.state === "submitting");
-    return hasSubtitleInFlight || hasPublishInFlight;
-  }, [subtitleJobs, publishJobs]);
-
   const nextAction = (() => {
     if (!task) return null;
     if (task.status === "PUBLISHED") {
@@ -942,40 +990,95 @@ export default function TaskDetailPage() {
     setDidAutoPickCover(true);
   }, [isYouTubeTask, didAutoPickCover, publishCoverKey, coverAssets]);
 
-  useEffect(() => {
-    if (!taskId) return;
-    if (shouldPoll) return;
-    void loadLogs({ silent: true });
-  }, [taskId, shouldPoll, logSnapshotKey, loadLogs]);
+  const scheduleLogEventRefresh = useCallback(() => {
+    if (activeTab !== "logs") return;
+    const elapsed = Date.now() - lastLogEventFetchAtRef.current;
+    const run = () => {
+      logEventTimerRef.current = undefined;
+      lastLogEventFetchAtRef.current = Date.now();
+      void loadLogs({ silent: true });
+    };
+    if (elapsed >= 2000 && !logEventTimerRef.current) {
+      run();
+      return;
+    }
+    if (!logEventTimerRef.current) {
+      logEventTimerRef.current = window.setTimeout(run, Math.max(0, 2000 - elapsed));
+    }
+  }, [activeTab, loadLogs]);
 
-  useEffect(() => {
-    if (!taskId) return;
-    if (!shouldPoll) return;
-
-    let cancelled = false;
-    let timer: number | undefined;
-
-    const tick = async () => {
-      if (cancelled) return;
-      const plan = createTaskDetailPollPlan({
-        shouldPoll,
-      });
-      const jobs: Array<Promise<unknown>> = [];
-      if (plan.shouldRefreshTask) jobs.push(refresh({ silent: true }));
-      if (plan.shouldLoadLogs) jobs.push(loadLogs({ silent: true }));
-      await Promise.allSettled(jobs);
-      if (cancelled) return;
-      if (plan.nextDelayMs !== null) {
-        timer = window.setTimeout(tick, plan.nextDelayMs);
+  const handleRealtimeEvent = useCallback((event: RealtimeEvent) => {
+    const data = event.data;
+    const id = String(data.id ?? event.entity_id ?? "");
+    if (event.name === "task.updated" && id === taskId) {
+      setTask((current) => ({ ...(current ?? {}), ...data } as Task));
+      return;
+    }
+    if (event.name === "task.deleted" && id === taskId) {
+      setTask(null);
+      setError("任务已被删除");
+      return;
+    }
+    if (event.name === "subtitle_job.updated" && String(data.task_id ?? "") === taskId) {
+      setSubtitleJobs((current) => upsertById(current, data as SubtitleJob));
+      return;
+    }
+    if (event.name === "subtitle_job.deleted") {
+      setSubtitleJobs((current) => removeById(current, id));
+      return;
+    }
+    if (event.name === "publish_job.updated" && String(data.task_id ?? "") === taskId) {
+      const job = data as PublishJob;
+      setPublishJobs((current) => upsertById(current, job));
+      if (job.platform === "bilibili") {
+        setTask((current) => {
+          if (!current) return current;
+          if (job.upload_active) {
+            return { ...current, bilibili_upload: { job_id: job.id, progress: clampUploadProgress(job.upload_progress) } };
+          }
+          return current.bilibili_upload?.job_id === job.id ? { ...current, bilibili_upload: null } : current;
+        });
       }
-    };
+      return;
+    }
+    if (event.name === "publish_job.deleted") {
+      setPublishJobs((current) => removeById(current, id));
+      setTask((current) => current?.bilibili_upload?.job_id === id ? { ...current, bilibili_upload: null } : current);
+      return;
+    }
+    if (event.name === "publish_batch.updated" && String(data.task_id ?? "") === taskId) {
+      setPublishBatches((current) => upsertById(current, data as PublishBatch));
+      return;
+    }
+    if (event.name === "publish_batch.deleted") {
+      setPublishBatches((current) => removeById(current, id));
+      return;
+    }
+    if (event.name === "asset.updated" && String(data.task_id ?? "") === taskId) {
+      setAssets((current) => upsertById(current, data as Asset));
+      return;
+    }
+    if (event.name === "asset.deleted") {
+      setAssets((current) => removeById(current, id));
+      return;
+    }
+    if (event.name === "log.updated") scheduleLogEventRefresh();
+  }, [scheduleLogEventRefresh, taskId]);
 
-    tick();
-    return () => {
-      cancelled = true;
-      if (timer) window.clearTimeout(timer);
-    };
-  }, [taskId, shouldPoll, refresh, loadLogs]);
+  useRealtimeSubscription(taskId ? [`task:${taskId}`] : [], handleRealtimeEvent, () => {
+    void refreshRealtimeSnapshot();
+  });
+
+  useEffect(() => {
+    if (!taskId || activeTab !== "logs") return;
+    lastLogEventFetchAtRef.current = Date.now();
+    void loadLogs({ silent: true });
+  }, [activeTab, taskId, logSnapshotKey, loadLogs]);
+
+  useEffect(() => () => {
+    if (logEventTimerRef.current) window.clearTimeout(logEventTimerRef.current);
+    logEventTimerRef.current = undefined;
+  }, [taskId]);
 
   if (!taskId) return null;
 
@@ -1584,6 +1687,20 @@ export default function TaskDetailPage() {
         <div className="mt-2 text-xs text-slate-500">
           哔哩哔哩使用现有接口发布；抖音、小红书和快手由独立 SAU 无头浏览器服务发布。
         </div>
+        {activeBilibiliUpload ? (
+          <div className="mt-3 rounded border border-sky-200 bg-sky-50 p-3">
+            <div className="flex items-center justify-between gap-3 text-sm text-sky-900">
+              <span className="font-medium">哔哩哔哩视频上传中</span>
+              <span className="font-mono">{clampUploadProgress(activeBilibiliUpload.upload_progress)}%</span>
+            </div>
+            <div className="mt-2 h-2 overflow-hidden rounded bg-sky-100">
+              <div
+                className="h-full bg-sky-500 transition-[width] duration-300"
+                style={{ width: `${clampUploadProgress(activeBilibiliUpload.upload_progress)}%` }}
+              />
+            </div>
+          </div>
+        ) : null}
         {Object.keys(publisherErrors).length ? (
           <div className="mt-3 rounded border border-amber-200 bg-amber-50 p-3 text-xs text-amber-900">
             <div className="font-semibold">投稿附加数据部分不可用</div>
@@ -2042,14 +2159,32 @@ export default function TaskDetailPage() {
                     <th className="py-2 pr-3">Updated</th>
                   </tr>
                 </thead>
-                <tbody>
-                  {publishJobs.map((j) => (
+                  <tbody>
+                  {publishJobs.map((j) => {
+                    const isActiveBilibiliUpload = (j.platform ?? "bilibili") === "bilibili" && Boolean(j.upload_active);
+                    return (
                     <tr key={j.id} className="border-t">
                       <td className="py-2 pr-3 font-mono text-xs">{j.id.slice(0, 8)}</td>
                       <td className="py-2 pr-3 font-mono text-xs">{j.batch_id?.slice(0, 8) ?? "-"}</td>
                       <td className="py-2 pr-3">{j.platform ?? "bilibili"}</td>
                       <td className="py-2 pr-3 font-mono text-xs">{j.account_id?.slice(0, 8) ?? "-"}</td>
-                      <td className={`py-2 pr-3 ${j.state === "unknown" || j.state === "submitted" ? "text-amber-700" : ""}`}>{j.state}</td>
+                      <td className={`py-2 pr-3 ${j.state === "unknown" || j.state === "submitted" ? "text-amber-700" : ""}`}>
+                        <div>{j.state}</div>
+                        {isActiveBilibiliUpload ? (
+                          <div className="mt-1 min-w-32 text-xs text-sky-800">
+                            <div className="flex items-center justify-between gap-2">
+                              <span>上传中</span>
+                              <span className="font-mono">{clampUploadProgress(j.upload_progress)}%</span>
+                            </div>
+                            <div className="mt-1 h-1.5 overflow-hidden rounded bg-sky-100">
+                              <div
+                                className="h-full bg-sky-500 transition-[width] duration-300"
+                                style={{ width: `${clampUploadProgress(j.upload_progress)}%` }}
+                              />
+                            </div>
+                          </div>
+                        ) : null}
+                      </td>
                       <td className="py-2 pr-3 font-mono text-xs">
                         {j.external_url ? (
                           <a className="underline" href={j.external_url} target="_blank" rel="noreferrer">
@@ -2111,7 +2246,8 @@ export default function TaskDetailPage() {
                       </td>
                       <td className="py-2 pr-3 text-xs text-slate-600">{new Date(j.updated_at).toLocaleString()}</td>
                     </tr>
-                  ))}
+                    );
+                  })}
                 </tbody>
               </table>
             </div>

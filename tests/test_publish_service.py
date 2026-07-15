@@ -146,10 +146,11 @@ def test_publish_calls_all_enabled_platforms(mock_client_cls, mock_build, mock_g
     db.get.return_value = task
 
     svc = PublishService(db, MagicMock(), MagicMock())
-    batch, targets = _publish_batch(("bilibili", None), ("douyin", None))
+    bilibili_batch, _ = _publish_batch(("bilibili", None))
+    douyin_batch, _ = _publish_batch(("douyin", None))
     reconciliation = MagicMock(cleanup_needed=False)
     with (
-        patch.object(svc, "_get_or_create_batch", return_value=(batch, targets)),
+        patch.object(svc, "_get_or_create_single_target_batch", side_effect=[bilibili_batch, douyin_batch]) as get_batch,
         patch.object(svc, "_latest_batch_target_job", return_value=None),
         patch.object(svc, "_resolve_social_account_id", side_effect=ValueError("no account")),
         patch("videoroll.apps.publish_service.reconcile_publish_batch", return_value=reconciliation),
@@ -161,6 +162,30 @@ def test_publish_calls_all_enabled_platforms(mock_client_cls, mock_build, mock_g
     assert "douyin" in result.results
     assert mock_client.post.call_count == 2
     assert mock_build.call_count == 2
+    assert get_batch.call_count == 2
+    assert get_batch.call_args_list[0].args[1] == "bilibili"
+    assert get_batch.call_args_list[1].args[1] == "douyin"
+
+
+def test_single_platform_batch_is_not_blocked_by_a_different_platform_batch() -> None:
+    task_id = uuid.uuid4()
+    task = MagicMock(id=task_id)
+    new_batch = MagicMock(id=uuid.uuid4())
+    db = MagicMock()
+    db.get.return_value = task
+    service = PublishService(db, MagicMock(), MagicMock())
+
+    with (
+        patch("videoroll.apps.publish_service.latest_publish_batch_for_target", return_value=None) as latest,
+        patch.object(service, "_create_batch", return_value=new_batch) as create_batch,
+    ):
+        result = service._get_or_create_single_target_batch(task_id, "bilibili", None, {})
+
+    assert result is new_batch
+    latest.assert_called_once_with(db, task_id, platform="bilibili", account_id=None)
+    assert create_batch.call_args.args[1] == [
+        {"key": "bilibili:default", "platform": "bilibili", "account_id": None}
+    ]
 
 
 @patch("videoroll.apps.publish_service.get_publish_platform_settings")
@@ -444,10 +469,11 @@ def test_publish_isolates_errors(mock_client_cls, mock_build, mock_get_settings)
     db.get.return_value = task
 
     svc = PublishService(db, MagicMock(), MagicMock())
-    batch, targets = _publish_batch(("bilibili", None), ("douyin", None))
+    bilibili_batch, _ = _publish_batch(("bilibili", None))
+    douyin_batch, _ = _publish_batch(("douyin", None))
     reconciliation = MagicMock(cleanup_needed=False)
     with (
-        patch.object(svc, "_get_or_create_batch", return_value=(batch, targets)),
+        patch.object(svc, "_get_or_create_single_target_batch", side_effect=[bilibili_batch, douyin_batch]),
         patch.object(svc, "_latest_batch_target_job", return_value=None),
         patch.object(svc, "_resolve_social_account_id", side_effect=ValueError("no account")),
         patch("videoroll.apps.publish_service.reconcile_publish_batch", return_value=reconciliation),
@@ -493,10 +519,10 @@ def test_publish_rechecks_platform_when_task_is_already_published(
     mock_client_cls.return_value = client
 
     svc = PublishService(db, MagicMock(), MagicMock())
-    batch, targets = _publish_batch(("bilibili", None))
+    batch, _ = _publish_batch(("bilibili", None))
     reconciliation = MagicMock(cleanup_needed=False)
     with (
-        patch.object(svc, "_get_or_create_batch", return_value=(batch, targets)),
+        patch.object(svc, "_get_or_create_single_target_batch", return_value=batch),
         patch.object(svc, "_latest_batch_target_job", return_value=None),
         patch("videoroll.apps.publish_service.reconcile_publish_batch", return_value=reconciliation),
     ):

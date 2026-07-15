@@ -14,6 +14,7 @@ from videoroll.apps.publish_lifecycle import (
     PublishBatchState,
     bind_unresolved_social_publish_target,
     enqueue_publish_batch_cleanup,
+    latest_publish_batch_for_target,
     publish_target_key,
     record_publish_batch_dispatch_error,
     reconcile_publish_batch,
@@ -132,8 +133,18 @@ class PublishService:
         payload = dict(publish_payload or {})
         if not self._get_enabled_platforms():
             return PublishAllResult(results={})
-        batch, targets = self._get_or_create_batch(task_id, payload)
-        return self._publish_to_platforms(task_id, batch, targets, payload)
+        targets = self._build_enabled_targets(payload)
+        results: dict[str, dict[str, Any]] = {}
+        batch_ids: list[str] = []
+        for target in targets:
+            platform = str(target["platform"])
+            account_id = target.get("account_id")
+            batch = self._get_or_create_single_target_batch(task_id, platform, account_id, payload)
+            result = self._publish_to_platforms(task_id, batch, [target], payload)
+            results.update(result.results)
+            if result.batch_id:
+                batch_ids.append(result.batch_id)
+        return PublishAllResult(results=results, batch_id=batch_ids[0] if batch_ids else None)
 
     def publish_one(
         self,
@@ -157,8 +168,6 @@ class PublishService:
             task = self._db.get(Task, task_id, with_for_update=True)
             if not task or batch.task_id != task_id:
                 raise ValueError("publish batch does not belong to this task")
-            if task.active_publish_batch_id != batch.id:
-                raise ValueError("publish batch is not the current batch for this task")
             target_key = publish_target_key(platform, request.get("account_id"))
             expected_keys = {
                 str(target.get("key") or publish_target_key(target.get("platform"), target.get("account_id")))
@@ -198,14 +207,6 @@ class PublishService:
         task = self._db.get(Task, task_id, with_for_update=True)
         if not task:
             raise ValueError("task not found")
-        # The task row is the serialization point for publishing.  Recheck
-        # after acquiring it: callers may have read a terminal batch before a
-        # concurrent caller installed an active replacement.
-        current_batch = self._current_batch_for_locked_task(task)
-        if current_batch and current_batch.state == PublishBatchState.active.value:
-            self._db.commit()
-            return current_batch
-
         batch = PublishBatch(
             id=uuid.uuid4(),
             task_id=task_id,
@@ -214,6 +215,8 @@ class PublishService:
             state=PublishBatchState.active.value,
         )
         self._db.add(batch)
+        # Kept for backward compatibility with older rows and readers.  New
+        # publishing authorization is per target, not this task-wide pointer.
         task.active_publish_batch_id = batch.id
         self._db.add(task)
         self._db.commit()
@@ -324,24 +327,20 @@ class PublishService:
         account_id: str | None,
         payload: dict[str, Any],
     ) -> PublishBatch:
-        """Use the active batch when it owns this target; never fork it."""
+        """Get the current batch for one channel/account, independently."""
         task = self._db.get(Task, task_id, with_for_update=True)
         if not task:
             raise ValueError("task not found")
-        active_batch = self._current_batch_for_locked_task(task)
         target_key = publish_target_key(platform, account_id)
+        active_batch = latest_publish_batch_for_target(
+            self._db,
+            task_id,
+            platform=platform,
+            account_id=account_id,
+        )
         if active_batch and active_batch.state in self._REUSABLE_BATCH_STATES:
-            for target in active_batch.expected_targets or []:
-                key = str(target.get("key") or publish_target_key(target.get("platform"), target.get("account_id")))
-                if key == target_key:
-                    if task.active_publish_batch_id != active_batch.id:
-                        task.active_publish_batch_id = active_batch.id
-                        self._db.add(task)
-                    self._db.commit()
-                    return active_batch
-            if active_batch.state == PublishBatchState.active.value:
-                self._db.commit()
-                raise ValueError("an active publish batch already owns this task; retry one of its expected targets")
+            self._db.commit()
+            return active_batch
         return self._create_batch(
             task_id,
             [{

@@ -18,6 +18,12 @@ def test_publish_job_exposes_execution_timestamps() -> None:
     assert "finished_at" in columns
 
 
+def test_publish_job_exposes_bilibili_upload_progress() -> None:
+    columns = PublishJob.__table__.c
+    assert "upload_progress" in columns
+    assert "upload_active" in columns
+
+
 def test_publish_requests_and_responses_carry_batch_and_job_identifiers() -> None:
     batch_id = uuid.uuid4()
     payload = SocialPublishRequest.model_validate(

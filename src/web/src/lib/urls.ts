@@ -20,9 +20,15 @@ export function orchestratorUrl(path: string): string {
   return `${base}${suffix}`;
 }
 
-undefined
-undefined
-undefined
-undefined
-undefined
-undefined
+export function toWebSocketUrl(httpUrlOrPath: string, origin = "http://localhost:8000"): string {
+  const httpUrl = new URL(httpUrlOrPath, origin);
+  httpUrl.protocol = httpUrl.protocol === "https:" ? "wss:" : "ws:";
+  return httpUrl.toString();
+}
+
+export function orchestratorWebSocketUrl(path = "/ws/events"): string {
+  return toWebSocketUrl(
+    orchestratorUrl(path),
+    typeof window !== "undefined" ? window.location.origin : "http://localhost:8000",
+  );
+}

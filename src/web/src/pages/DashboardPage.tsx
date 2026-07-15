@@ -1,10 +1,11 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import { fetchJson } from "../lib/http";
 import { ORCHESTRATOR_URL } from "../lib/urls";
 import StatusBadge from "../components/StatusBadge";
 import { Asset, Task } from "../lib/types";
 import { PageHeader } from "../components/ui";
+import { RealtimeEvent, useRealtimeSubscription } from "../lib/realtime";
 
 type ConvertedVideoItem = {
   task: Task;
@@ -449,8 +450,37 @@ function ResourceBar({ label, value, detail, tone = "sky" }: { label: string; va
 
 const runningStatuses = new Set(["INGESTED", "DOWNLOADED", "AUDIO_EXTRACTED", "ASR_DONE", "TRANSLATED", "SUBTITLE_READY", "RENDERED", "READY_FOR_REVIEW", "APPROVED", "PUBLISHING"]);
 
+function upsertTask(current: Task[] | null, task: Task, limit: number): Task[] {
+  const rows = current ?? [];
+  const index = rows.findIndex((item) => item.id === task.id);
+  if (index < 0) return [task, ...rows].slice(0, limit);
+  const next = [...rows];
+  next[index] = { ...rows[index], ...task };
+  return next;
+}
+
+function updateTaskUpload(current: Task[] | null, job: Record<string, unknown>): Task[] | null {
+  if (!current) return current;
+  const taskId = String(job.task_id ?? "");
+  const jobId = String(job.id ?? "");
+  return current.map((task) => {
+    if (task.id !== taskId) return task;
+    if (job.upload_active) {
+      return {
+        ...task,
+        bilibili_upload: {
+          job_id: jobId,
+          progress: Math.floor(clampPercent(Number(job.upload_progress ?? 0))),
+        },
+      };
+    }
+    return task.bilibili_upload?.job_id === jobId ? { ...task, bilibili_upload: null } : task;
+  });
+}
+
 export default function DashboardPage() {
   const [tasks, setTasks] = useState<Task[] | null>(null);
+  const [publishingTasks, setPublishingTasks] = useState<Task[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [videos, setVideos] = useState<ConvertedVideoItem[] | null>(null);
   const [videosError, setVideosError] = useState<string | null>(null);
@@ -459,12 +489,53 @@ export default function DashboardPage() {
   const [agentRuns, setAgentRuns] = useState<AgentRun[] | null>(null);
   const [agentRunsError, setAgentRunsError] = useState<string | null>(null);
   const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null);
+  const agentListTimerRef = useRef<number | undefined>();
+  const selectedAgentTimerRef = useRef<number | undefined>();
+  const uploadByTaskRef = useRef(new Map<string, Task["bilibili_upload"]>());
+
+  const loadTasks = useCallback(async () => {
+    try {
+      const data = await fetchJson<Task[]>(`${ORCHESTRATOR_URL}/tasks?limit=200`);
+      for (const task of data) uploadByTaskRef.current.set(task.id, task.bilibili_upload ?? null);
+      setTasks(data);
+      setError(null);
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  }, []);
+
+  const loadPublishingTasks = useCallback(async () => {
+    try {
+      setPublishingTasks(await fetchJson<Task[]>(`${ORCHESTRATOR_URL}/tasks?status=PUBLISHING&limit=6`));
+    } catch {
+      // Keep the last successful snapshot; the regular task list remains available.
+    }
+  }, []);
+
+  const loadResources = useCallback(async () => {
+    try {
+      setResources(await fetchJson<ResourceSnapshot>(`${ORCHESTRATOR_URL}/system/resources`));
+      setResourcesError(null);
+    } catch (e: unknown) {
+      setResourcesError(e instanceof Error ? e.message : String(e));
+    }
+  }, []);
+
+  const loadAgentRuns = useCallback(async () => {
+    try {
+      setAgentRuns(await fetchJson<AgentRun[]>(`${ORCHESTRATOR_URL}/subtitle/agents/runs?limit=80`));
+      setAgentRunsError(null);
+    } catch (e: unknown) {
+      setAgentRunsError(e instanceof Error ? e.message : String(e));
+    }
+  }, []);
 
   useEffect(() => {
-    fetchJson<Task[]>(`${ORCHESTRATOR_URL}/tasks?limit=200`)
-      .then((data) => setTasks(data))
-      .catch((e: unknown) => setError(e instanceof Error ? e.message : String(e)));
-  }, []);
+    void loadTasks();
+    void loadPublishingTasks();
+    void loadResources();
+    void loadAgentRuns();
+  }, [loadAgentRuns, loadPublishingTasks, loadResources, loadTasks]);
 
   useEffect(() => {
     fetchJson<ConvertedVideoItem[]>(`${ORCHESTRATOR_URL}/videos/converted?limit=12`)
@@ -472,50 +543,96 @@ export default function DashboardPage() {
       .catch((e: unknown) => setVideosError(e instanceof Error ? e.message : String(e)));
   }, []);
 
-  useEffect(() => {
-    let cancelled = false;
-    let timer: number | undefined;
-    const load = async () => {
+  const scheduleAgentListRefresh = useCallback(() => {
+    if (agentListTimerRef.current) return;
+    agentListTimerRef.current = window.setTimeout(() => {
+      agentListTimerRef.current = undefined;
+      void loadAgentRuns();
+    }, 150);
+  }, [loadAgentRuns]);
+
+  const scheduleSelectedAgentRefresh = useCallback((runId: string) => {
+    if (!runId || selectedAgentTimerRef.current) return;
+    selectedAgentTimerRef.current = window.setTimeout(async () => {
+      selectedAgentTimerRef.current = undefined;
       try {
-        const data = await fetchJson<ResourceSnapshot>(`${ORCHESTRATOR_URL}/system/resources`);
-        if (cancelled) return;
-        setResources(data);
-        setResourcesError(null);
+        const run = await fetchJson<AgentRun>(`${ORCHESTRATOR_URL}/subtitle/agents/runs/${runId}`);
+        setAgentRuns((current) => {
+          const rows = current ?? [];
+          const index = rows.findIndex((item) => item.id === run.id);
+          if (index < 0) return [run, ...rows];
+          const next = [...rows];
+          next[index] = run;
+          return next;
+        });
       } catch (e: unknown) {
-        if (cancelled) return;
-        setResourcesError(e instanceof Error ? e.message : String(e));
-      } finally {
-        if (!cancelled) timer = window.setTimeout(load, 3000);
+        setAgentRunsError(e instanceof Error ? e.message : String(e));
       }
-    };
-    load();
-    return () => {
-      cancelled = true;
-      if (timer) window.clearTimeout(timer);
-    };
+    }, 150);
   }, []);
 
-  useEffect(() => {
-    let cancelled = false;
-    let timer: number | undefined;
-    const load = async () => {
-      try {
-        const data = await fetchJson<AgentRun[]>(`${ORCHESTRATOR_URL}/subtitle/agents/runs?limit=80`);
-        if (cancelled) return;
-        setAgentRuns(data);
-        setAgentRunsError(null);
-      } catch (e: unknown) {
-        if (cancelled) return;
-        setAgentRunsError(e instanceof Error ? e.message : String(e));
-      } finally {
-        if (!cancelled) timer = window.setTimeout(load, 5000);
-      }
-    };
-    load();
-    return () => {
-      cancelled = true;
-      if (timer) window.clearTimeout(timer);
-    };
+  const handleRealtimeEvent = useCallback((event: RealtimeEvent) => {
+    const data = event.data;
+    const id = String(data.id ?? event.entity_id ?? "");
+    if (event.name === "system.resources.sample") {
+      setResources(data as unknown as ResourceSnapshot);
+      setResourcesError(null);
+      return;
+    }
+    if (event.name === "task.updated") {
+      const taskId = String(data.id ?? "");
+      const trackedUpload = uploadByTaskRef.current.get(taskId);
+      const nextTask = {
+        ...data,
+        ...(uploadByTaskRef.current.has(taskId) ? { bilibili_upload: trackedUpload ?? null } : {}),
+      } as unknown as Task;
+      setTasks((current) => upsertTask(current, nextTask, 200));
+      setPublishingTasks((current) => nextTask.status === "PUBLISHING"
+        ? upsertTask(current, nextTask, 6)
+        : current?.filter((task) => task.id !== nextTask.id) ?? current);
+      return;
+    }
+    if (event.name === "task.deleted") {
+      uploadByTaskRef.current.delete(id);
+      setTasks((current) => current?.filter((task) => task.id !== id) ?? current);
+      setPublishingTasks((current) => current?.filter((task) => task.id !== id) ?? current);
+      return;
+    }
+    if (event.name === "publish_job.updated" && String(data.platform ?? "") === "bilibili") {
+      const taskId = String(data.task_id ?? "");
+      uploadByTaskRef.current.set(taskId, data.upload_active
+        ? { job_id: String(data.id ?? ""), progress: Math.floor(clampPercent(Number(data.upload_progress ?? 0))) }
+        : null);
+      setTasks((current) => updateTaskUpload(current, data));
+      setPublishingTasks((current) => updateTaskUpload(current, data));
+      return;
+    }
+    if (event.name === "publish_job.deleted") {
+      const deleted = { ...data, id, upload_active: false };
+      uploadByTaskRef.current.set(String(data.task_id ?? ""), null);
+      setTasks((current) => updateTaskUpload(current, deleted));
+      setPublishingTasks((current) => updateTaskUpload(current, deleted));
+      return;
+    }
+    if (event.name === "agent_run.started" || event.name === "agent_run.finished") {
+      scheduleAgentListRefresh();
+      return;
+    }
+    if (event.name === "agent_run.step_appended" && id === selectedAgentId) {
+      scheduleSelectedAgentRefresh(id);
+    }
+  }, [scheduleAgentListRefresh, scheduleSelectedAgentRefresh, selectedAgentId]);
+
+  useRealtimeSubscription(["tasks", "publishing", "resources", "agents"], handleRealtimeEvent, () => {
+    void loadTasks();
+    void loadPublishingTasks();
+    void loadResources();
+    void loadAgentRuns();
+  });
+
+  useEffect(() => () => {
+    if (agentListTimerRef.current) window.clearTimeout(agentListTimerRef.current);
+    if (selectedAgentTimerRef.current) window.clearTimeout(selectedAgentTimerRef.current);
   }, []);
 
   const counts = useMemo(() => {
@@ -526,7 +643,22 @@ export default function DashboardPage() {
 
   const total = tasks?.length ?? 0;
   const failedTasks = useMemo(() => (tasks ?? []).filter((t) => t.status === "FAILED").slice(0, 6), [tasks]);
-  const runningTasks = useMemo(() => (tasks ?? []).filter((t) => runningStatuses.has(t.status)).slice(0, 6), [tasks]);
+  const runningTasks = useMemo(() => {
+    // Uploading is the highest-priority current work.  A task can still have
+    // another subtitle/render action attached, so do not rely on task.status
+    // alone to decide whether its Bilibili transfer is visible here.
+    const liveBilibiliUploads = (tasks ?? []).filter((task) => task.bilibili_upload);
+    const latestPublishing = publishingTasks ?? (tasks ?? []).filter((t) => t.status === "PUBLISHING");
+    const otherRunning = (tasks ?? []).filter((t) => runningStatuses.has(t.status) && t.status !== "PUBLISHING");
+    const seen = new Set<string>();
+    return [...liveBilibiliUploads, ...latestPublishing, ...otherRunning]
+      .filter((task) => {
+        if (seen.has(task.id)) return false;
+        seen.add(task.id);
+        return true;
+      })
+      .slice(0, 6);
+  }, [publishingTasks, tasks]);
   const agentChildren = useMemo(() => {
     const out = new Map<string, AgentRun[]>();
     for (const run of agentRuns ?? []) {
@@ -736,6 +868,17 @@ export default function DashboardPage() {
                   </div>
                   <StatusBadge status={t.status} />
                 </div>
+                {t.bilibili_upload ? (
+                  <div className="mt-3">
+                    <div className="flex items-center justify-between gap-3 text-xs text-sky-800">
+                      <span>哔哩哔哩上传中</span>
+                      <span className="font-mono">{clampPercent(t.bilibili_upload.progress).toFixed(0)}%</span>
+                    </div>
+                    <div className="mt-1.5 h-1.5 overflow-hidden rounded bg-sky-100">
+                      <div className="h-full bg-sky-500 transition-[width] duration-300" style={{ width: `${clampPercent(t.bilibili_upload.progress)}%` }} />
+                    </div>
+                  </div>
+                ) : null}
               </Link>
             ))}
           </div>

@@ -44,6 +44,7 @@ from videoroll.db.models import (
     TaskStatus,
 )
 from videoroll.db.session import get_engine, get_sessionmaker
+from videoroll.realtime import publish_log_updated, publish_queue_changed
 from videoroll.storage.s3 import S3Store
 from videoroll.apps.security.service_auth import INTERNAL_TOKEN_HEADER, service_token
 from videoroll.utils.auto_youtube import parse_auto_youtube_created_by
@@ -84,7 +85,11 @@ from videoroll.apps.publish_meta_draft import apply_publish_source_overrides, de
 from videoroll.apps.outbox.dispatcher import dispatch_outbox_events
 from videoroll.apps.outbox.service import create_outbox_event
 from videoroll.apps.outbox.worker_inbox import claim_outbox_operation, finish_operation, release_operation
-from videoroll.apps.publish_lifecycle import enqueue_publish_batch_cleanup, mark_publish_batch_cleanup_enqueued
+from videoroll.apps.publish_lifecycle import (
+    current_publish_batches_for_task,
+    enqueue_publish_batch_cleanup,
+    mark_publish_batch_cleanup_enqueued,
+)
 from videoroll.apps.orchestrator_api.youtube_downloader import (
     download_youtube_subtitle,
     extract_youtube_metadata,
@@ -461,6 +466,9 @@ def _safe_upload_log(store: S3Store, log_path: Path | None, log_key: str | None)
     try:
         if log_path.exists():
             store.upload_file(log_path, log_key, content_type="text/plain")
+            key_parts = log_key.split("/", 2)
+            if len(key_parts) >= 3 and key_parts[0] == "log" and key_parts[1]:
+                publish_log_updated(settings.redis_url, task_id=key_parts[1], storage_key=log_key)
     except Exception:
         pass
 
@@ -1863,6 +1871,9 @@ def task_queue_tick() -> dict[str, Any]:
     finally:
         db.close()
 
+    if unlocked_expired:
+        publish_queue_changed(settings.redis_url)
+
     for kind, jid in to_start:
         if kind == "subtitle":
             celery_app.send_task("subtitle_service.process_job", args=[jid], queue="subtitle")
@@ -2418,8 +2429,8 @@ def _cleanup_task_impl(self: Any, task_id: str, batch_id: str | None = None) -> 
                 return {"status": "skipped", "detail": "publish batch not found for task"}
             if batch.state != "succeeded":
                 return {"status": "skipped", "detail": f"publish batch state is {batch.state}"}
-            if task.active_publish_batch_id != batch.id:
-                return {"status": "skipped", "detail": "publish batch is no longer active for task"}
+            if task.status != TaskStatus.published:
+                return {"status": "skipped", "detail": f"task publish state is {task.status.value}"}
         elif task.status != TaskStatus.published:
             return {"status": "skipped", "detail": f"task status is {task.status.value}"}
 
@@ -2541,7 +2552,9 @@ def enqueue_pending_publish_batch_cleanups() -> dict[str, int]:
         )
         for batch in batches:
             task = db.get(Task, batch.task_id)
-            if not task or task.active_publish_batch_id != batch.id:
+            if not task or task.status != TaskStatus.published:
+                continue
+            if not any(current.id == batch.id for current in current_publish_batches_for_task(db, task.id)):
                 continue
             try:
                 if enqueue_publish_batch_cleanup(db, celery_app, task.id, batch.id, needed=True):

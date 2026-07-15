@@ -8,6 +8,11 @@ from sqlalchemy import create_engine
 from sqlalchemy.engine import Engine, make_url
 from sqlalchemy.orm import Session, sessionmaker
 
+from videoroll.realtime import install_session_event_emitter
+
+
+install_session_event_emitter()
+
 
 def get_configured_database_url() -> str:
     from videoroll.config import get_orchestrator_settings

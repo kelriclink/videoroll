@@ -81,6 +81,12 @@ def _is_browser_proxy_path_allowed(method: str, service_path: str) -> bool:
     normalized_method = method.upper()
     if service_path in _BROWSER_PROXY_PATHS.get(normalized_method, set()):
         return True
+    if normalized_method == "GET" and service_path.startswith("subtitle/agents/runs/") and service_path.count("/") == 3:
+        try:
+            uuid.UUID(service_path.rsplit("/", 1)[1])
+        except (TypeError, ValueError):
+            return False
+        return True
     if normalized_method in {"PUT", "DELETE"}:
         dynamic_path_depths = {
             "subtitle/models/": 2,

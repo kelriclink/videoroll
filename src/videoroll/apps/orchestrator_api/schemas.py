@@ -18,6 +18,11 @@ class TaskCreate(BaseModel):
     created_by: Optional[str] = None
 
 
+class BilibiliUploadProgressRead(BaseModel):
+    job_id: uuid.UUID
+    progress: int = Field(ge=0, le=100)
+
+
 class TaskRead(BaseModel):
     id: uuid.UUID
     source_type: SourceType
@@ -31,6 +36,7 @@ class TaskRead(BaseModel):
     error_code: Optional[str]
     error_message: Optional[str]
     retry_count: int
+    bilibili_upload: Optional[BilibiliUploadProgressRead] = None
     created_at: datetime
     updated_at: datetime
 
@@ -280,6 +286,8 @@ class PublishJobSummary(BaseModel):
     external_id: Optional[str] = None
     external_url: Optional[str] = None
     account_id: Optional[uuid.UUID] = None
+    upload_progress: int = 0
+    upload_active: bool = False
     started_at: Optional[datetime] = None
     finished_at: Optional[datetime] = None
     tid: Optional[int] = None

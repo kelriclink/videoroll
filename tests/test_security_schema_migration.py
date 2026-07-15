@@ -196,6 +196,7 @@ def test_alembic_offline_sql_contains_security_schema() -> None:
         assert f"CREATE TABLE {table_name}" in result.stdout
     assert "ALTER TABLE app_settings ADD COLUMN version" in result.stdout
     assert "ALTER TABLE subtitle_jobs ADD COLUMN lease_owner" in result.stdout
+    assert "ALTER TABLE publish_jobs ADD COLUMN upload_progress" in result.stdout
 
 
 def test_sqlite_migration_smoke(tmp_path: Path) -> None:
@@ -215,6 +216,7 @@ def test_sqlite_migration_smoke(tmp_path: Path) -> None:
     assert SECURITY_TABLES.issubset(inspector.get_table_names())
     assert "version" in {column["name"] for column in inspector.get_columns("app_settings")}
     assert "lease_owner" in {column["name"] for column in inspector.get_columns("subtitle_jobs")}
+    assert "upload_progress" in {column["name"] for column in inspector.get_columns("publish_jobs")}
     _assert_legacy_rows_survive(engine)
 
 

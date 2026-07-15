@@ -7,7 +7,7 @@ import mimetypes
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import httpx
 
@@ -425,6 +425,7 @@ class BilibiliWebClient:
         video_path: Path,
         *,
         profile: str = "ugcupos/bup",
+        on_progress: Callable[[int, int], None] | None = None,
     ) -> tuple[UploadedVideo, dict[str, Any]]:
         _require(video_path.exists(), f"video file not found: {video_path}")
         filesize = video_path.stat().st_size
@@ -470,6 +471,8 @@ class BilibiliWebClient:
                 else:
                     etag = hashlib.md5(buf).hexdigest()  # noqa: S324
                 parts.append({"partNumber": chunk + 1, "eTag": etag or "etag"})
+                if on_progress is not None:
+                    on_progress(end, filesize)
 
         resp = self._upos.post(
             url,

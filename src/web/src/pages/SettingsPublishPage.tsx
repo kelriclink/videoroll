@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useConfirm } from "../components/feedbackContext";
 import { fetchJson, HttpError } from "../lib/http";
 import {
@@ -10,6 +10,7 @@ import {
   reloadDirtyField,
 } from "../lib/requestState";
 import { ORCHESTRATOR_URL } from "../lib/urls";
+import { RealtimeEvent, useRealtimeSubscription } from "../lib/realtime";
 import { VersionedPublishSettings } from "../lib/types";
 import {
   activeAccountsForPlatform,
@@ -86,9 +87,10 @@ export default function SettingsPublishPage() {
   const [loginSessions, setLoginSessions] = useState<Partial<Record<SocialPlatform, SocialLoginSession>>>({});
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const refreshedLoginSessionsRef = useRef(new Set<string>());
   const metaText = metaEditor.value;
 
-  async function refresh() {
+  const refresh = useCallback(async () => {
     setError(null);
     try {
       const [s, a, accounts, platforms] = await Promise.all([
@@ -106,44 +108,45 @@ export default function SettingsPublishPage() {
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : String(e));
     }
-  }
-
-  useEffect(() => {
-    refresh();
   }, []);
 
   useEffect(() => {
-    if (!socialAccounts.some((account) => account.check_state === "queued" || account.check_state === "checking")) return;
-    const timer = window.setInterval(() => refresh(), 2500);
-    return () => window.clearInterval(timer);
-  }, [socialAccounts]);
+    refresh();
+  }, [refresh]);
 
-  useEffect(() => {
-    const active = Object.values(loginSessions).filter(
-      (session): session is SocialLoginSession => Boolean(session && ["starting", "running", "canceling"].includes(session.state)),
-    );
-    if (active.length === 0) return;
-    const timer = window.setInterval(async () => {
-      const updates = await Promise.all(
-        active.map(async (session) => {
-          try {
-            return await fetchJson<SocialLoginSession>(
-              `${ORCHESTRATOR_URL}/settings/publish/social/login-sessions/${session.id}`,
-            );
-          } catch {
-            return session;
-          }
-        }),
-      );
-      setLoginSessions((current) => {
-        const next = { ...current };
-        for (const session of updates) next[session.platform] = session;
+  const handleRealtimeEvent = useCallback((event: RealtimeEvent) => {
+    const data = event.data;
+    const id = String(data.id ?? event.entity_id ?? "");
+    const platform = String(data.platform ?? "") as SocialPlatform;
+    if (!SOCIAL_PLATFORMS.some((item) => item.id === platform)) return;
+    if (event.name === "publish_account.updated") {
+      const account = data as unknown as SocialAccount;
+      setSocialAccounts((current) => {
+        const index = current.findIndex((item) => item.id === account.id);
+        if (index < 0) return [...current, account];
+        const next = [...current];
+        next[index] = { ...current[index], ...account };
         return next;
       });
-      if (updates.some((session) => session.state === "succeeded")) await refresh();
-    }, 2000);
-    return () => window.clearInterval(timer);
-  }, [loginSessions]);
+      return;
+    }
+    if (event.name === "publish_account.deleted") {
+      setSocialAccounts((current) => current.filter((account) => account.id !== id));
+      return;
+    }
+    if (event.name === "login_session.updated") {
+      const session = data as unknown as SocialLoginSession;
+      setLoginSessions((current) => ({ ...current, [platform]: session }));
+      if (session.state === "succeeded" && !refreshedLoginSessionsRef.current.has(session.id)) {
+        refreshedLoginSessionsRef.current.add(session.id);
+        void refresh();
+      }
+    }
+  }, [refresh]);
+
+  useRealtimeSubscription(["publishing"], handleRealtimeEvent, () => {
+    void refresh();
+  });
 
   async function importSocialAccount(platform: SocialPlatform) {
     const file = socialFiles[platform];

@@ -7,6 +7,7 @@ from videoroll.apps.publish_lifecycle import (
     PublishBatchState,
     bind_unresolved_social_publish_target,
     enqueue_publish_batch_cleanup,
+    evaluate_task_publish_batches,
     evaluate_publish_batch,
     publish_target_key,
     reconcile_publish_batch,
@@ -84,6 +85,28 @@ def test_all_terminal_failures_mark_task_failed() -> None:
     assert result.batch_state == PublishBatchState.failed
     assert result.task_status == TaskStatus.failed
     assert result.cleanup_ready is False
+
+
+def test_task_status_waits_for_every_current_channel_batch() -> None:
+    bilibili = MagicMock(state=PublishBatchState.succeeded.value)
+    douyin = MagicMock(state=PublishBatchState.active.value)
+
+    result = evaluate_task_publish_batches([bilibili, douyin])
+
+    assert result.batch_state == PublishBatchState.active
+    assert result.task_status == TaskStatus.publishing
+    assert result.cleanup_ready is False
+
+
+def test_task_status_is_published_only_after_all_current_channel_batches_succeed() -> None:
+    bilibili = MagicMock(state=PublishBatchState.succeeded.value)
+    douyin = MagicMock(state=PublishBatchState.succeeded.value)
+
+    result = evaluate_task_publish_batches([bilibili, douyin])
+
+    assert result.batch_state == PublishBatchState.succeeded
+    assert result.task_status == TaskStatus.published
+    assert result.cleanup_ready is True
 
 
 def test_dispatch_error_is_a_terminal_failure_without_a_publish_job() -> None:

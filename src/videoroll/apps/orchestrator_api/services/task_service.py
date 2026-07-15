@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 from videoroll.apps.orchestrator_api.schemas import TaskCreate, TaskRead
 from videoroll.apps.orchestrator_api.services import asset_service, publishing_service
 from videoroll.apps.subtitle_service.task_title_store import get_task_display_title_with_s3
-from videoroll.db.models import AppSetting, Asset, AssetKind, Task, TaskStatus
+from videoroll.db.models import AppSetting, Asset, AssetKind, Platform, PublishJob, PublishState, Task, TaskStatus
 from videoroll.storage.s3 import S3Store
 
 
@@ -91,6 +91,32 @@ def create_task(payload: TaskCreate, *, db: Session) -> Task:
     return task
 
 
+def active_bilibili_uploads(db: Session, task_ids: list[uuid.UUID]) -> dict[uuid.UUID, dict[str, Any]]:
+    """Return the one live Bilibili video transfer for each task, if any."""
+    if not task_ids:
+        return {}
+    jobs = (
+        db.query(PublishJob)
+        .filter(
+            PublishJob.task_id.in_(task_ids),
+            PublishJob.platform == Platform.bilibili,
+            PublishJob.state == PublishState.submitting,
+            PublishJob.upload_active.is_(True),
+        )
+        .order_by(PublishJob.updated_at.desc())
+        .all()
+    )
+    uploads: dict[uuid.UUID, dict[str, Any]] = {}
+    for job in jobs:
+        if job.task_id in uploads:
+            continue
+        uploads[job.task_id] = {
+            "job_id": job.id,
+            "progress": max(0, min(100, int(job.upload_progress or 0))),
+        }
+    return uploads
+
+
 def list_converted_videos(*, limit: int, db: Session) -> list[dict[str, Any]]:
     fetch_n = min(1000, max(limit, 1) * 5)
     assets = (
@@ -161,12 +187,14 @@ def list_tasks(
     if reconciled:
         db.commit()
     title_map = load_task_display_titles(db, task_ids, s3=s3, allow_s3_fallback=True)
+    uploads_by_task = active_bilibili_uploads(db, task_ids)
     output: list[dict[str, Any]] = []
     for task in tasks:
         if status is not None and task.status != status:
             continue
         item = TaskRead.model_validate(task).model_dump()
         item["display_title"] = str(title_map.get(task.id) or "").strip() or None
+        item["bilibili_upload"] = uploads_by_task.get(task.id)
         output.append(item)
     return output
 
@@ -180,4 +208,5 @@ def get_task(task_id: uuid.UUID, *, db: Session, s3: S3Store) -> dict[str, Any]:
     item = TaskRead.model_validate(task).model_dump()
     title = get_task_display_title_with_s3(db, str(task_id), s3=s3).strip()
     item["display_title"] = title or None
+    item["bilibili_upload"] = active_bilibili_uploads(db, [task_id]).get(task_id)
     return item

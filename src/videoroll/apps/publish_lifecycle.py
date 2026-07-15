@@ -170,6 +170,54 @@ def publish_batch_has_target(
     )
 
 
+def publish_batch_target_keys(batch: PublishBatch) -> list[str]:
+    return [
+        str(target.get("key") or publish_target_key(target.get("platform"), target.get("account_id")))
+        for target in list(batch.expected_targets or [])
+    ]
+
+
+def current_publish_batches_for_task(db: Session, task_id: uuid.UUID) -> list[PublishBatch]:
+    """Return the newest batch for every channel/account target on a task.
+
+    A task may publish to Bilibili and Douyin at the same time.  The old
+    single ``Task.active_publish_batch_id`` pointer cannot represent that, so
+    currentness is resolved independently for each target.
+    """
+    batches = (
+        db.query(PublishBatch)
+        .filter(PublishBatch.task_id == task_id)
+        .order_by(PublishBatch.created_at.desc(), PublishBatch.id.desc())
+        .all()
+    )
+    latest_by_target: dict[str, PublishBatch] = {}
+    for batch in batches:
+        for key in publish_batch_target_keys(batch):
+            latest_by_target.setdefault(key, batch)
+
+    unique: list[PublishBatch] = []
+    seen: set[uuid.UUID] = set()
+    for batch in latest_by_target.values():
+        if batch.id not in seen:
+            seen.add(batch.id)
+            unique.append(batch)
+    return unique
+
+
+def latest_publish_batch_for_target(
+    db: Session,
+    task_id: uuid.UUID,
+    *,
+    platform: object,
+    account_id: uuid.UUID | str | None,
+) -> PublishBatch | None:
+    key = publish_target_key(platform, account_id)
+    for batch in current_publish_batches_for_task(db, task_id):
+        if key in publish_batch_target_keys(batch):
+            return batch
+    return None
+
+
 def _state(value: object) -> PublishState | None:
     if isinstance(value, PublishState):
         return value
@@ -206,6 +254,18 @@ def evaluate_publish_batch(
     if has_pending:
         return PublishBatchEvaluation(PublishBatchState.active, TaskStatus.publishing, False)
     if has_success:
+        return PublishBatchEvaluation(PublishBatchState.partial_failed, TaskStatus.publishing, False)
+    return PublishBatchEvaluation(PublishBatchState.failed, TaskStatus.failed, False)
+
+
+def evaluate_task_publish_batches(batches: list[PublishBatch]) -> PublishBatchEvaluation:
+    """Aggregate the independent current channel batches into task status."""
+    states = {str(batch.state or "") for batch in batches}
+    if PublishBatchState.active.value in states:
+        return PublishBatchEvaluation(PublishBatchState.active, TaskStatus.publishing, False)
+    if states and states <= {PublishBatchState.succeeded.value}:
+        return PublishBatchEvaluation(PublishBatchState.succeeded, TaskStatus.published, True)
+    if PublishBatchState.succeeded.value in states or PublishBatchState.partial_failed.value in states:
         return PublishBatchEvaluation(PublishBatchState.partial_failed, TaskStatus.publishing, False)
     return PublishBatchEvaluation(PublishBatchState.failed, TaskStatus.failed, False)
 
@@ -252,16 +312,21 @@ def _reconcile_locked_publish_batch(
 
     db.add(batch)
 
-    is_active_batch = task.active_publish_batch_id == batch.id
-    if is_active_batch and task.status != TaskStatus.canceled:
-        task.status = evaluation.task_status
-        if evaluation.batch_state == PublishBatchState.succeeded:
+    # Flush this batch before resolving the task's current batch per target.
+    # The task may have several active channel batches at once.
+    db.flush()
+    current_batches = current_publish_batches_for_task(db, task.id)
+    is_current_batch = any(current.id == batch.id for current in current_batches)
+    task_evaluation = evaluate_task_publish_batches(current_batches)
+    if is_current_batch and task.status != TaskStatus.canceled:
+        task.status = task_evaluation.task_status
+        if task_evaluation.batch_state == PublishBatchState.succeeded:
             task.error_code = None
             task.error_message = None
-        elif evaluation.batch_state == PublishBatchState.partial_failed:
+        elif task_evaluation.batch_state == PublishBatchState.partial_failed:
             task.error_code = "PUBLISH_PARTIAL_FAILURE"
             task.error_message = "one or more publish targets failed; retry only failed targets"
-        elif evaluation.batch_state == PublishBatchState.failed:
+        elif task_evaluation.batch_state == PublishBatchState.failed:
             task.error_code = "PUBLISH_FAILED"
             task.error_message = "all publish targets failed"
         db.add(task)
@@ -270,7 +335,7 @@ def _reconcile_locked_publish_batch(
     # task.  A duplicate cleanup is harmless; a lost cleanup is not.  The
     # durable event is inserted in this same transaction as the terminal batch
     # state; the marker itself is written only when cleanup completes.
-    cleanup_needed = bool(is_active_batch and evaluation.cleanup_ready and batch.cleanup_enqueued_at is None)
+    cleanup_needed = bool(is_current_batch and task_evaluation.cleanup_ready and batch.cleanup_enqueued_at is None)
     if cleanup_needed:
         from videoroll.apps.outbox.service import create_outbox_event
 
@@ -287,7 +352,7 @@ def _reconcile_locked_publish_batch(
     return PublishBatchReconciliation(
         batch_id=batch.id,
         batch_state=evaluation.batch_state,
-        task_status=evaluation.task_status,
+        task_status=task_evaluation.task_status,
         cleanup_needed=cleanup_needed,
     )
 
@@ -323,8 +388,6 @@ def bind_unresolved_social_publish_target(
 ) -> dict[str, Any]:
     """Bind an accountless social target under the standard Task→Batch lock."""
     task, batch = _lock_task_and_batch(db, batch_id)
-    if task.active_publish_batch_id != batch.id:
-        raise ValueError("publish batch is not the current batch for this task")
     platform_value = _value(platform)
     try:
         platform_enum = Platform(platform_value)
@@ -379,7 +442,7 @@ def mark_publish_batch_cleanup_enqueued(db: Session, batch_id: uuid.UUID) -> boo
         return False
     if batch.state != PublishBatchState.succeeded.value or batch.cleanup_enqueued_at is not None:
         return False
-    if task.active_publish_batch_id != batch.id:
+    if not any(current.id == batch.id for current in current_publish_batches_for_task(db, task.id)):
         return False
     batch.cleanup_enqueued_at = datetime.now(timezone.utc)
     batch.cleanup_delivery_version = 2

@@ -146,9 +146,9 @@ class Task(Base):
     error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     retry_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 
-    # The only batch allowed to aggregate this task's publish status or remove
-    # its source assets.  Keeping the pointer on the task prevents late workers
-    # from an older batch from overwriting a newer retry.
+    # Compatibility pointer for legacy rows.  New publishing resolves the
+    # current batch per platform/account target so Bilibili and social
+    # platforms can run at the same time.
     active_publish_batch_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), nullable=True)
 
     lock_owner: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
@@ -234,6 +234,12 @@ class PublishJob(Base):
     bvid: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
     aid: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
     response_json: Mapped[Optional[dict[str, Any]]] = mapped_column(JSONB, nullable=True)
+
+    # These fields track only the Bilibili video transfer.  They deliberately
+    # do not represent the overall publish lifecycle, which also includes
+    # metadata selection and archive submission.
+    upload_progress: Mapped[int] = mapped_column(Integer, nullable=False, default=0)  # 0..100
+    upload_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
 
     started_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)

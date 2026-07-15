@@ -7,13 +7,13 @@ import pytest
 from celery.exceptions import Retry
 
 from videoroll.apps.subtitle_service.worker import cleanup_task
-from videoroll.db.models import PublishBatch, RenderJob, SubtitleJob, Task
+from videoroll.db.models import PublishBatch, RenderJob, SubtitleJob, Task, TaskStatus
 
 
 def test_cleanup_retries_and_clears_marker_when_subtitle_work_is_in_flight() -> None:
     task_id = uuid.uuid4()
     batch_id = uuid.uuid4()
-    task = MagicMock(id=task_id, active_publish_batch_id=batch_id)
+    task = MagicMock(id=task_id, active_publish_batch_id=batch_id, status=TaskStatus.published)
     batch = MagicMock(id=batch_id, task_id=task_id, state="succeeded", cleanup_enqueued_at=MagicMock())
 
     publish_query = MagicMock()

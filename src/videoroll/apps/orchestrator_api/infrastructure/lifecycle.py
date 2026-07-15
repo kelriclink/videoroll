@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -7,6 +8,8 @@ from fastapi import FastAPI
 
 from videoroll.apps.orchestrator_api.admin_auth_store import get_password_hash
 from videoroll.apps.orchestrator_api.infrastructure.scheduler import OrchestratorScheduler
+from videoroll.apps.orchestrator_api.realtime import RealtimeHub
+from videoroll.apps.orchestrator_api.services.system_service import collect_system_resources
 from videoroll.apps.security.service_auth import (
     admin_cookie_secret,
     ensure_bootstrap_state,
@@ -46,14 +49,29 @@ def initialize_runtime(app: FastAPI) -> OrchestratorScheduler:
 
     scheduler = OrchestratorScheduler(settings)
     app.state.orchestrator_scheduler = scheduler
+
+    async def sample_resources() -> dict:
+        def collect() -> dict:
+            resource_db = session_local()
+            try:
+                return collect_system_resources(resource_db).model_dump(mode="json")
+            finally:
+                resource_db.close()
+
+        return await asyncio.to_thread(collect)
+
+    app.state.realtime_hub = RealtimeHub(settings.redis_url, resource_sampler=sample_resources)
     return scheduler
 
 
 @asynccontextmanager
 async def orchestrator_lifespan(app: FastAPI):
     scheduler = initialize_runtime(app)
+    realtime_hub: RealtimeHub = app.state.realtime_hub
     scheduler.start()
+    await realtime_hub.start()
     try:
         yield
     finally:
+        await realtime_hub.stop()
         scheduler.stop()

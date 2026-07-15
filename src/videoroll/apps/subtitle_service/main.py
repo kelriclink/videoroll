@@ -88,6 +88,7 @@ from videoroll.apps.subtitle_service.embeddings import (
 from videoroll.apps.subtitle_service.rag import (
     build_knowledge_embedding_text,
     delete_knowledge_item,
+    get_agent_run,
     list_agent_runs,
     load_agent_skill_registry,
     rebuild_knowledge_embeddings,
@@ -115,6 +116,7 @@ from videoroll.utils.auto_youtube import parse_auto_youtube_created_by
 from videoroll.utils.cpu import process_cpu_count
 from videoroll.utils.httpx_proxy import HTTPX_PROXY_KWARG_UNSUPPORTED, format_httpx_proxy_error
 from videoroll.utils.intel_gpu import detect_intel_hardware
+from videoroll.realtime import publish_queue_changed
 
 logger = logging.getLogger(__name__)
 _WHISPER_MODEL_ZIP_MAX_BYTES = 20 * 1024 * 1024 * 1024
@@ -1078,6 +1080,29 @@ def list_agent_runs_view(
     return [AgentRunRead(**row) for row in rows]
 
 
+@app.get("/subtitle/agents/runs/{run_id}", response_model=AgentRunRead)
+def get_agent_run_view(
+    run_id: uuid.UUID,
+    settings: SubtitleServiceSettings = Depends(get_settings),
+    db: Session = Depends(get_db),
+) -> AgentRunRead:
+    try:
+        row = get_agent_run(db, str(run_id))
+    except Exception as e:
+        db.rollback()
+        if not _is_missing_knowledge_table_error(e):
+            _handle_knowledge_db_error(e, settings)
+        _ensure_rag_schema(settings)
+        try:
+            row = get_agent_run(db, str(run_id))
+        except Exception as retry_error:
+            db.rollback()
+            raise HTTPException(status_code=503, detail=f"RAG agent tables are not ready: {retry_error}") from retry_error
+    if row is None:
+        raise HTTPException(status_code=404, detail="agent run not found")
+    return AgentRunRead(**row)
+
+
 @app.get("/subtitle/agent/skills", response_model=list[AgentSkillRead])
 def list_agent_skills_view(
     settings: SubtitleServiceSettings = Depends(get_settings),
@@ -1789,6 +1814,7 @@ def get_render_queue_legacy(limit: int = 200, db: Session = Depends(get_db)) -> 
 @app.put("/subtitle/task_queue/settings", response_model=TaskQueueSettingsRead)
 def put_task_queue_settings_view(payload: TaskQueueSettingsUpdate, db: Session = Depends(get_db)) -> TaskQueueSettingsRead:
     cfg = update_task_queue_settings(db, payload.model_dump(exclude_unset=True))
+    publish_queue_changed(get_subtitle_settings().redis_url)
     runtime_sync = sync_subtitle_worker_concurrency_for_task_queue_settings(celery_app, cfg, queue="subtitle")
     if not bool(runtime_sync.get("ok")):
         logger.warning(

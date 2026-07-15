@@ -598,6 +598,8 @@ def list_task_publish_jobs(task_id: uuid.UUID, limit: int, db: Session) -> list[
                 "external_id": job.external_id,
                 "external_url": job.external_url,
                 "account_id": job.account_id,
+                "upload_progress": max(0, min(100, int(job.upload_progress or 0))),
+                "upload_active": bool(job.upload_active),
                 "started_at": job.started_at,
                 "finished_at": job.finished_at,
                 "tid": tid,

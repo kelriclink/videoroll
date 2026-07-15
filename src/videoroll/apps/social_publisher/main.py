@@ -218,8 +218,6 @@ def publish(
         batch = db.get(PublishBatch, payload.batch_id)
         if not batch or batch.task_id != task.id:
             raise HTTPException(status_code=400, detail="publish batch does not belong to this task")
-        if task.active_publish_batch_id != batch.id:
-            raise HTTPException(status_code=409, detail="publish batch is not the current batch for this task")
         if not publish_batch_has_target(batch, Platform(value), payload.account_id):
             raise HTTPException(status_code=400, detail="publish target is not part of this batch")
     account = db.get(Account, payload.account_id, with_for_update=True)

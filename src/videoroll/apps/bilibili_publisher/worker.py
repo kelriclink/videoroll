@@ -530,6 +530,24 @@ def _rate_limit_stage(error: BilibiliRateLimitError) -> str:
     return "submit"
 
 
+def _set_bilibili_upload_progress(
+    db: Session,
+    job: PublishJob,
+    *,
+    active: bool,
+    progress: int,
+) -> None:
+    """Persist the actual video-transfer state for realtime browser updates."""
+    next_progress = max(0, min(100, int(progress)))
+    if bool(job.upload_active) == bool(active) and int(job.upload_progress or 0) == next_progress:
+        return
+    job.upload_active = bool(active)
+    job.upload_progress = next_progress
+    job.updated_at = _utcnow()
+    db.add(job)
+    db.commit()
+
+
 def _rate_limit_retry_countdown(*, stage: str, retries_done: int) -> float:
     exp = (2 ** (retries_done + 1)) + random.random()
     if stage == "upload":
@@ -707,6 +725,10 @@ def _process_job_impl(self, job_id: str) -> dict[str, Any]:
         job.updated_at = _utcnow()
         db.add(job)
         db.commit()
+        # A worker can be restarted while a transfer is in progress.  Do not
+        # leave the UI showing a stale upload indicator before this attempt
+        # actually starts sending video bytes again.
+        _set_bilibili_upload_progress(db, job, active=False, progress=0)
 
         with tempfile.TemporaryDirectory(prefix="videoroll_bili_") as td:
             workdir = Path(td)
@@ -733,7 +755,21 @@ def _process_job_impl(self, job_id: str) -> dict[str, Any]:
                     cover_url = client.upload_cover(cover_path, csrf=csrf)
 
                 upload_throttle = _apply_publish_stage_throttle(db, stage="upload", job_id=job_id)
-                uploaded, upload_debug = client.upload_video_file(video_path)
+                _set_bilibili_upload_progress(db, job, active=True, progress=0)
+                last_upload_progress = -1
+
+                def persist_upload_progress(uploaded_bytes: int, total_bytes: int) -> None:
+                    nonlocal last_upload_progress
+                    if total_bytes <= 0:
+                        return
+                    progress = max(0, min(100, int(uploaded_bytes * 100 / total_bytes)))
+                    if progress == last_upload_progress:
+                        return
+                    last_upload_progress = progress
+                    _set_bilibili_upload_progress(db, job, active=True, progress=progress)
+
+                uploaded, upload_debug = client.upload_video_file(video_path, on_progress=persist_upload_progress)
+                _set_bilibili_upload_progress(db, job, active=False, progress=100)
                 predicted_tid: int | None = None
                 tid_meta = int(meta.typeid)
                 tid = tid_meta
@@ -947,6 +983,7 @@ def _process_job_impl(self, job_id: str) -> dict[str, Any]:
                 job = db.get(PublishJob, job_uuid)
             if job:
                 job.state = PublishState.submitting
+                job.upload_active = False
                 job.response_json = {
                     "error": str(e),
                     "exception_type": type(e).__name__,
@@ -1060,6 +1097,7 @@ def _process_job_impl(self, job_id: str) -> dict[str, Any]:
                 job = db.get(PublishJob, job_uuid)
             if job:
                 job.state = PublishState.failed
+                job.upload_active = False
                 job.response_json = {"error": str(e), "exception_type": type(e).__name__, "traceback": tb}
                 job.updated_at = _utcnow()
                 db.add(job)

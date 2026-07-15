@@ -4,6 +4,7 @@ import AuthGate from "./components/AuthGate";
 import { FeedbackProvider } from "./components/Feedback";
 import { fetchJson } from "./lib/http";
 import { ORCHESTRATOR_URL } from "./lib/urls";
+import { RealtimeProvider } from "./lib/realtime";
 import DashboardPage from "./pages/DashboardPage";
 import TaskDetailPage from "./pages/TaskDetailPage";
 import TaskNewPage from "./pages/TaskNewPage";
@@ -137,7 +138,8 @@ export default function App() {
   return (
     <FeedbackProvider>
       <AuthGate>
-      <div className="min-h-screen bg-slate-50 transition-colors dark:bg-slate-950">
+        <RealtimeProvider>
+          <div className="min-h-screen bg-slate-50 transition-colors dark:bg-slate-950">
         <header className="border-b bg-white transition-colors dark:border-slate-800 dark:bg-slate-950">
           <div className="mx-auto flex max-w-7xl items-center justify-between px-4 py-3">
             <div className="flex items-center gap-2">
@@ -242,7 +244,8 @@ export default function App() {
             </Routes>
           </main>
         </div>
-      </div>
+          </div>
+        </RealtimeProvider>
       </AuthGate>
     </FeedbackProvider>
   );
