@@ -24,6 +24,7 @@ export type Task = {
   source_license: SourceLicense;
   source_proof_url?: string | null;
   status: TaskStatus;
+  stopped_status?: TaskStatus | null;
   priority: number;
   created_by?: string | null;
   display_title?: string | null;

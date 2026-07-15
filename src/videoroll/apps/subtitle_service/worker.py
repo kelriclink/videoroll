@@ -305,6 +305,69 @@ def _task_queue_unlock(task: Task) -> None:
     task.lock_until = None
 
 
+class _TaskStopped(Exception):
+    """Raised at a safe boundary when a user has stopped a task."""
+
+
+def _task_is_stopped(db: Session, task_id: uuid.UUID) -> bool:
+    return db.query(Task.status).filter(Task.id == task_id).scalar() == TaskStatus.canceled
+
+
+def _raise_if_task_stopped(db: Session, task_id: uuid.UUID) -> None:
+    if _task_is_stopped(db, task_id):
+        raise _TaskStopped("task stopped by user")
+
+
+def _pause_subtitle_job_if_task_stopped(db: Session, job_id: uuid.UUID) -> bool:
+    job = db.get(SubtitleJob, job_id)
+    if not job:
+        return False
+    if not _task_is_stopped(db, job.task_id):
+        return False
+    task = db.get(Task, job.task_id)
+    if not task:
+        return False
+    db.refresh(task)
+    if job.status == SubtitleJobStatus.running:
+        request = dict(job.request_json) if isinstance(job.request_json, dict) else {}
+        request["resume"] = True
+        job.request_json = request
+        job.status = SubtitleJobStatus.queued
+        job.progress = 0
+        job.error_message = _task_queue_join_message(job.error_message, "Task stopped by user; waiting for resume.")
+        db.add(job)
+    if task.lock_owner == TASK_QUEUE_LOCK_OWNER:
+        _task_queue_unlock(task)
+        db.add(task)
+    db.commit()
+    celery_app.send_task("subtitle_service.task_queue_tick", args=[], queue="subtitle")
+    return True
+
+
+def _pause_render_job_if_task_stopped(db: Session, job_id: uuid.UUID) -> bool:
+    job = db.get(RenderJob, job_id)
+    if not job:
+        return False
+    if not _task_is_stopped(db, job.task_id):
+        return False
+    task = db.get(Task, job.task_id)
+    if not task:
+        return False
+    db.refresh(task)
+    if job.status == RenderJobStatus.running:
+        job.status = RenderJobStatus.queued
+        job.progress = 0
+        job.started_at = None
+        job.error_message = _task_queue_join_message(job.error_message, "Task stopped by user; waiting for resume.")
+        db.add(job)
+    if task.lock_owner == TASK_QUEUE_LOCK_OWNER:
+        _task_queue_unlock(task)
+        db.add(task)
+    db.commit()
+    celery_app.send_task("subtitle_service.task_queue_tick", args=[], queue="subtitle")
+    return True
+
+
 def _build_after_render_publish_action(
     *,
     task_id: uuid.UUID,
@@ -806,6 +869,8 @@ def process_job(self: Any, job_id: str) -> dict[str, str]:
             db.add(job)
             db.commit()
             return {"status": "error", "detail": "task not found"}
+        if _pause_subtitle_job_if_task_stopped(db, jid):
+            return {"status": "stopped", "detail": "task stopped by user"}
 
         now = _now()
         if job.status == SubtitleJobStatus.running and job.lease_until is not None and job.lease_until > now:
@@ -842,6 +907,8 @@ def process_job(self: Any, job_id: str) -> dict[str, str]:
         hb.start()
         job_hb = JobLeaseHeartbeat(lambda: _db(), job.id, lease_owner, _JOB_LEASE_TTL_SECONDS)
         job_hb.start()
+
+        _raise_if_task_stopped(db, task.id)
 
         req = dict(job.request_json) if isinstance(job.request_json, dict) else {}
         input_key = (req.get("input") or {}).get("key")
@@ -1071,6 +1138,7 @@ def process_job(self: Any, job_id: str) -> dict[str, str]:
                     size_bytes=segments_path.stat().st_size,
                 )
             )
+            _raise_if_task_stopped(db, task.id)
             task.status = TaskStatus.asr_done
             db.add(task)
             db.commit()
@@ -1158,6 +1226,7 @@ def process_job(self: Any, job_id: str) -> dict[str, str]:
                 db.commit()
                 _safe_upload_log(store, log_path, log_key)
 
+            _raise_if_task_stopped(db, task.id)
             if not burn_in and not soft_sub:
                 job.status = SubtitleJobStatus.succeeded
                 job.progress = 100
@@ -1276,9 +1345,10 @@ def process_job(self: Any, job_id: str) -> dict[str, str]:
                         size_bytes=audio_path.stat().st_size,
                     )
                 )
-                task.status = TaskStatus.audio_extracted
-                db.add(task)
-                db.commit()
+            _raise_if_task_stopped(db, task.id)
+            task.status = TaskStatus.audio_extracted
+            db.add(task)
+            db.commit()
 
             asr_cfg = req.get("asr") or {}
             asr_defaults = get_asr_settings(db, settings)
@@ -1463,6 +1533,7 @@ def process_job(self: Any, job_id: str) -> dict[str, str]:
                     _safe_append_log_line(log_path, f"translate retry {retry_no}/{max_retries}: {type(e).__name__}: {e}")
                     _safe_upload_log(store, log_path, log_key)
                     raise self.retry(exc=e, countdown=_translate_retry_countdown(retry_no), max_retries=max_retries)
+            _raise_if_task_stopped(db, task.id)
             task.status = TaskStatus.translated
             db.add(task)
 
@@ -1547,6 +1618,7 @@ def process_job(self: Any, job_id: str) -> dict[str, str]:
         if need_ass:
             ass_key = _store_ass_from_segments(segments_out, log_prefix="subtitle ass uploaded")
 
+        _raise_if_task_stopped(db, task.id)
         task.status = TaskStatus.subtitle_ready
         db.add(task)
         job.progress = 80
@@ -1554,6 +1626,7 @@ def process_job(self: Any, job_id: str) -> dict[str, str]:
         db.commit()
         _safe_upload_log(store, log_path, log_key)
 
+        _raise_if_task_stopped(db, task.id)
         if not burn_in and not soft_sub:
             job.status = SubtitleJobStatus.succeeded
             job.progress = 100
@@ -1605,6 +1678,9 @@ def process_job(self: Any, job_id: str) -> dict[str, str]:
         _safe_upload_log(store, log_path, log_key)
         celery_app.send_task("subtitle_service.task_queue_tick", args=[], queue="subtitle")
         return {"status": "ok", "detail": "render queued"}
+    except _TaskStopped:
+        _pause_subtitle_job_if_task_stopped(db, jid)
+        return {"status": "stopped", "detail": "task stopped by user"}
     except Retry:
         retry_job = db.get(SubtitleJob, jid)
         if retry_job and retry_job.status == SubtitleJobStatus.running:
@@ -1622,7 +1698,7 @@ def process_job(self: Any, job_id: str) -> dict[str, str]:
             if task and task.lock_owner == TASK_QUEUE_LOCK_OWNER:
                 _task_queue_unlock(task)
                 db.add(task)
-            if task and task.status not in {TaskStatus.published, TaskStatus.canceled}:
+            if task and not _task_is_stopped(db, task.id) and task.status != TaskStatus.published:
                 task.status = TaskStatus.failed
                 task.error_code = task.error_code or "SUBTITLE_FAILED"
                 task.error_message = str(e)
@@ -1726,6 +1802,11 @@ def task_queue_tick() -> dict[str, Any]:
                 db.query(SubtitleJob).filter(SubtitleJob.task_id == tid, SubtitleJob.status == SubtitleJobStatus.running).count()
                 + db.query(RenderJob).filter(RenderJob.task_id == tid, RenderJob.status == RenderJobStatus.running).count()
             )
+            if t.status == TaskStatus.canceled:
+                if not has_running:
+                    _task_queue_unlock(t)
+                    db.add(t)
+                continue
             if has_running:
                 continue
 
@@ -1762,6 +1843,7 @@ def task_queue_tick() -> dict[str, Any]:
                 .join(Task, Task.id == RenderJob.task_id)
                 .filter(
                     RenderJob.status == RenderJobStatus.queued,
+                    Task.status != TaskStatus.canceled,
                     or_(
                         Task.lock_owner != TASK_QUEUE_LOCK_OWNER,
                         Task.lock_until.is_(None),
@@ -1793,6 +1875,7 @@ def task_queue_tick() -> dict[str, Any]:
                 .join(Task, Task.id == SubtitleJob.task_id)
                 .filter(
                     SubtitleJob.status == SubtitleJobStatus.queued,
+                    Task.status != TaskStatus.canceled,
                     or_(
                         Task.lock_owner != TASK_QUEUE_LOCK_OWNER,
                         Task.lock_until.is_(None),
@@ -1930,6 +2013,8 @@ def process_render_job(self: Any, render_job_id: str) -> dict[str, Any]:
         task = db.get(Task, rj.task_id)
         if not task:
             return {"status": "error", "detail": "task not found"}
+        if _pause_render_job_if_task_stopped(db, rid):
+            return {"status": "stopped", "detail": "task stopped by user"}
 
         now = _now()
         if rj.status == RenderJobStatus.running and rj.lease_until is not None and rj.lease_until > now:
@@ -1976,6 +2061,8 @@ def process_render_job(self: Any, render_job_id: str) -> dict[str, Any]:
         hb.start()
         job_hb = JobLeaseHeartbeat(lambda: _db(), rj.id, lease_owner, _JOB_LEASE_TTL_SECONDS)
         job_hb.start()
+
+        _raise_if_task_stopped(db, task.id)
 
         req = rj.request_json if isinstance(rj.request_json, dict) else {}
         input_key = str(req.get("input_key") or "").strip()
@@ -2152,6 +2239,7 @@ def process_render_job(self: Any, render_job_id: str) -> dict[str, Any]:
                 )
             )
 
+        _raise_if_task_stopped(db, task.id)
         if burn_in or soft_sub:
             task.status = TaskStatus.rendered
             db.add(task)
@@ -2191,6 +2279,9 @@ def process_render_job(self: Any, render_job_id: str) -> dict[str, Any]:
 
         celery_app.send_task("subtitle_service.task_queue_tick", args=[], queue="subtitle")
         return {"status": "ok"}
+    except _TaskStopped:
+        _pause_render_job_if_task_stopped(db, rid)
+        return {"status": "stopped", "detail": "task stopped by user"}
     except Retry:
         retry_job = db.get(RenderJob, rid)
         if retry_job and retry_job.status == RenderJobStatus.running:
@@ -2207,7 +2298,7 @@ def process_render_job(self: Any, render_job_id: str) -> dict[str, Any]:
             db.add(rj)
             task = db.get(Task, rj.task_id)
             if task:
-                if task.status not in {TaskStatus.published, TaskStatus.canceled}:
+                if not _task_is_stopped(db, task.id) and task.status != TaskStatus.published:
                     task.status = TaskStatus.failed
                     task.error_code = task.error_code or "RENDER_FAILED"
                     task.error_message = str(e)
@@ -2634,6 +2725,7 @@ def auto_youtube_pipeline(self: Any, task_id: str, overrides: dict[str, Any] | N
             raise RuntimeError("task not found")
         if task.source_type.value != "youtube":
             raise RuntimeError("task is not a youtube source")
+        _raise_if_task_stopped(db, task.id)
 
         now = _now()
         _task_queue_lock_settings_row(db)
@@ -2765,6 +2857,8 @@ def auto_youtube_pipeline(self: Any, task_id: str, overrides: dict[str, Any] | N
             except Exception:
                 db.rollback()
 
+        _raise_if_task_stopped(db, task.id)
+
         yt_meta = yt.get("metadata") if isinstance(yt, dict) else {}
         if not isinstance(yt_meta, dict):
             yt_meta = {}
@@ -2875,6 +2969,7 @@ def auto_youtube_pipeline(self: Any, task_id: str, overrides: dict[str, Any] | N
         result_data: dict[str, Any] = {}
         if profile.get("auto_publish"):
             task = db.get(Task, tid)
+            _raise_if_task_stopped(db, tid)
             if not final_asset:
                 raise RuntimeError("no final video asset found; enable burn_in/soft_sub in auto profile")
 
@@ -2931,11 +3026,22 @@ def auto_youtube_pipeline(self: Any, task_id: str, overrides: dict[str, Any] | N
                 }
 
         return {"status": "ok", "task_id": str(tid), "platforms": result_data}
+    except _TaskStopped:
+        task = db.get(Task, uuid.UUID(task_id))
+        if task and task.lock_owner == TASK_QUEUE_LOCK_OWNER:
+            _task_queue_unlock(task)
+            db.add(task)
+            db.commit()
+        celery_app.send_task("subtitle_service.task_queue_tick", args=[], queue="subtitle")
+        return {"status": "stopped", "task_id": task_id, "detail": "task stopped by user"}
     except Retry:
         raise
     except Exception as e:
         task = db.get(Task, uuid.UUID(task_id))
         if task:
+            if _task_is_stopped(db, task.id):
+                celery_app.send_task("subtitle_service.task_queue_tick", args=[], queue="subtitle")
+                return {"status": "stopped", "task_id": str(task.id), "detail": "task stopped by user"}
             if task.status == TaskStatus.ready_for_review and task.error_code == "AI_REVIEW_REJECTED":
                 celery_app.send_task("subtitle_service.task_queue_tick", args=[], queue="subtitle")
                 return {"status": "review_rejected", "task_id": str(task.id), "detail": task.error_message or str(e)}

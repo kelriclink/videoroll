@@ -18,6 +18,7 @@ type RecentFailedResumeResponse = {
   failed_count: number;
   results: RecentFailedResumeResult[];
 };
+type TaskBulkControlResponse = { matched_count: number; changed_count: number };
 
 const PAGE_SIZE = 25;
 
@@ -32,6 +33,20 @@ const statusOptions: Array<{ value: TaskStatus | null; label: string }> = [
   { value: "APPROVED", label: "已批准" },
   { value: "PUBLISHED", label: "已发布" },
   { value: "FAILED", label: "失败" },
+  { value: "CANCELED", label: "已停止" },
+];
+
+const stoppableStatuses: TaskStatus[] = [
+  "CREATED",
+  "INGESTED",
+  "DOWNLOADED",
+  "AUDIO_EXTRACTED",
+  "ASR_DONE",
+  "TRANSLATED",
+  "SUBTITLE_READY",
+  "RENDERED",
+  "READY_FOR_REVIEW",
+  "APPROVED",
 ];
 
 function formatRecentFailedResumeSummary(resp: RecentFailedResumeResponse): string {
@@ -72,6 +87,7 @@ export default function TasksPage() {
   const [error, setError] = useState<string | null>(null);
   const [actionBusyId, setActionBusyId] = useState<string | null>(null);
   const [bulkResumeBusy, setBulkResumeBusy] = useState(false);
+  const [bulkControlBusy, setBulkControlBusy] = useState<"stop" | "resume" | null>(null);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [searchText, setSearchText] = useState("");
@@ -210,13 +226,89 @@ export default function TasksPage() {
     }
   }
 
+  async function stopTask(task: Task) {
+    const ok = await confirm({
+      title: "停止任务",
+      message: "停止后不会再启动后续字幕或渲染步骤；正在执行的工作会在当前安全检查点暂停。",
+      confirmLabel: "停止",
+      tone: "danger",
+    });
+    if (!ok) return;
+    setActionBusyId(task.id);
+    setError(null);
+    try {
+      await fetchJson<Task>(`${ORCHESTRATOR_URL}/tasks/${task.id}/actions/stop`, { method: "POST" });
+      toast({ kind: "success", title: "任务已停止" });
+      await reloadTasks({ silent: true });
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setActionBusyId(null);
+    }
+  }
+
+  async function resumeStoppedTask(task: Task) {
+    const ok = await confirm({
+      title: "恢复任务",
+      message: "将从停止前的阶段继续，已保存的字幕和渲染产物会被复用。",
+      confirmLabel: "恢复",
+    });
+    if (!ok) return;
+    setActionBusyId(task.id);
+    setError(null);
+    try {
+      await fetchJson<Task>(`${ORCHESTRATOR_URL}/tasks/${task.id}/actions/resume`, { method: "POST" });
+      toast({ kind: "success", title: "任务已恢复" });
+      await reloadTasks({ silent: true });
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setActionBusyId(null);
+    }
+  }
+
+  async function controlAllTasks(action: "stop" | "resume") {
+    const stopping = action === "stop";
+    const ok = await confirm({
+      title: stopping ? "停止全部任务" : "恢复全部已停止任务",
+      message: stopping
+        ? "会停止所有可暂停的处理任务；正在执行的工作会在当前安全检查点暂停。为避免重复发布，正在投稿提交的任务不在此操作范围。"
+        : "会恢复所有通过“停止”操作暂停的任务。",
+      confirmLabel: stopping ? "停止全部" : "全部恢复",
+      tone: stopping ? "danger" : "warning",
+    });
+    if (!ok) return;
+    setBulkControlBusy(action);
+    setError(null);
+    try {
+      const endpoint = stopping ? "stop_all" : "resume_stopped";
+      const resp = await fetchJson<TaskBulkControlResponse>(`${ORCHESTRATOR_URL}/tasks/actions/${endpoint}`, { method: "POST" });
+      toast({
+        kind: "success",
+        title: stopping ? "全部任务已停止" : "已恢复停止任务",
+        message: `已处理 ${resp.changed_count} / ${resp.matched_count} 个任务。`,
+      });
+      await reloadTasks({ silent: true });
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBulkControlBusy(null);
+    }
+  }
+
   return (
     <div className="space-y-4">
       <PageHeader
         title="任务"
-        description="查看处理状态、恢复失败任务，或进入任务详情继续操作。"
+        description="查看处理状态，停止或恢复单个任务，也可批量停止与恢复。"
         actions={
           <>
+            <Button disabled={bulkControlBusy !== null} tone="danger" onClick={() => controlAllTasks("stop")}>
+              {bulkControlBusy === "stop" ? "停止中..." : "停止全部"}
+            </Button>
+            <Button disabled={bulkControlBusy !== null} onClick={() => controlAllTasks("resume")}>
+              {bulkControlBusy === "resume" ? "恢复中..." : "恢复全部已停止"}
+            </Button>
             <Button disabled={bulkResumeBusy} tone="warning" onClick={resumeRecentFailed}>
               {bulkResumeBusy ? "处理中..." : "继续 24h 失败任务"}
             </Button>
@@ -297,6 +389,8 @@ export default function TasksPage() {
                     const isBusy = actionBusyId === task.id;
                     const canRetryDownload = task.status === "FAILED" && task.source_type === "youtube" && !!(task.source_url ?? "").trim();
                     const canStartAuto = ["INGESTED", "DOWNLOADED"].includes(task.status) && task.source_type === "youtube" && !!(task.source_url ?? "").trim();
+                    const canStop = stoppableStatuses.includes(task.status);
+                    const canResumeStopped = task.status === "CANCELED";
                     const primaryAction =
                       task.status === "FAILED"
                         ? "resume"
@@ -347,6 +441,15 @@ export default function TasksPage() {
                                 详情
                               </Link>
                             )}
+                            {canResumeStopped ? (
+                              <Button size="xs" disabled={isBusy} onClick={() => resumeStoppedTask(task)}>
+                                恢复
+                              </Button>
+                            ) : canStop ? (
+                              <Button size="xs" tone="danger" disabled={isBusy} onClick={() => stopTask(task)}>
+                                停止
+                              </Button>
+                            ) : null}
                             {hasMoreActions ? (
                               <MoreMenu>
                                 {primaryAction !== "detail" ? (

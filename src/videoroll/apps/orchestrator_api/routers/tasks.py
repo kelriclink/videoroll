@@ -14,9 +14,10 @@ from videoroll.apps.orchestrator_api.schemas import (
     SubtitleActionRequest,
     SubtitleJobSummary,
     TaskCreate,
+    TaskBulkControlResponse,
     TaskRead,
 )
-from videoroll.apps.orchestrator_api.services import subtitle_service, task_service
+from videoroll.apps.orchestrator_api.services import subtitle_service, task_service, youtube_service
 from videoroll.config import OrchestratorSettings
 from videoroll.db.models import SubtitleJob, Task, TaskStatus
 from videoroll.storage.s3 import S3Store
@@ -55,6 +56,57 @@ def get_task(
     s3: S3Store = Depends(get_s3),
 ) -> dict[str, Any]:
     return task_service.get_task(task_id, db=db, s3=s3)
+
+
+def _restart_resumed_auto_youtube_task(task: Task, *, db: Session) -> None:
+    should_restart_auto_youtube, auto_publish = task_service.auto_youtube_restart_options(task, db=db)
+    if should_restart_auto_youtube:
+        youtube_service.enqueue_auto_youtube_pipeline(task.id, auto_publish=auto_publish)
+
+
+@router.post("/tasks/{task_id}/actions/stop", response_model=TaskRead)
+def stop_task(
+    task_id: uuid.UUID,
+    settings: OrchestratorSettings = Depends(get_settings),
+    db: Session = Depends(get_db),
+) -> Task:
+    task = task_service.stop_task(task_id, db=db)
+    subtitle_service.kick_task_queue(settings)
+    return task
+
+
+@router.post("/tasks/{task_id}/actions/resume", response_model=TaskRead)
+def resume_stopped_task(
+    task_id: uuid.UUID,
+    settings: OrchestratorSettings = Depends(get_settings),
+    db: Session = Depends(get_db),
+) -> Task:
+    task = task_service.resume_stopped_task(task_id, db=db)
+    _restart_resumed_auto_youtube_task(task, db=db)
+    subtitle_service.kick_task_queue(settings)
+    return task
+
+
+@router.post("/tasks/actions/stop_all", response_model=TaskBulkControlResponse)
+def stop_all_tasks(
+    settings: OrchestratorSettings = Depends(get_settings),
+    db: Session = Depends(get_db),
+) -> TaskBulkControlResponse:
+    matched_count, changed_count = task_service.stop_all_tasks(db=db)
+    subtitle_service.kick_task_queue(settings)
+    return TaskBulkControlResponse(matched_count=matched_count, changed_count=changed_count)
+
+
+@router.post("/tasks/actions/resume_stopped", response_model=TaskBulkControlResponse)
+def resume_all_stopped_tasks(
+    settings: OrchestratorSettings = Depends(get_settings),
+    db: Session = Depends(get_db),
+) -> TaskBulkControlResponse:
+    matched_count, changed_count, tasks = task_service.resume_all_stopped_tasks(db=db)
+    for task in tasks:
+        _restart_resumed_auto_youtube_task(task, db=db)
+    subtitle_service.kick_task_queue(settings)
+    return TaskBulkControlResponse(matched_count=matched_count, changed_count=changed_count)
 
 
 @router.get("/tasks/{task_id}/subtitle_jobs", response_model=list[SubtitleJobSummary])

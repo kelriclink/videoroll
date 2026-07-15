@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import HTTPException
@@ -10,8 +11,36 @@ from sqlalchemy.orm import Session
 from videoroll.apps.orchestrator_api.schemas import TaskCreate, TaskRead
 from videoroll.apps.orchestrator_api.services import asset_service, publishing_service
 from videoroll.apps.subtitle_service.task_title_store import get_task_display_title_with_s3
-from videoroll.db.models import AppSetting, Asset, AssetKind, Platform, PublishJob, PublishState, Task, TaskStatus
+from videoroll.db.models import (
+    AppSetting,
+    Asset,
+    AssetKind,
+    Platform,
+    PublishJob,
+    PublishState,
+    RenderJob,
+    RenderJobStatus,
+    SubtitleJob,
+    SubtitleJobStatus,
+    Task,
+    TaskStatus,
+)
 from videoroll.storage.s3 import S3Store
+from videoroll.utils.auto_youtube import parse_auto_youtube_created_by
+
+
+STOPPABLE_TASK_STATUSES = (
+    TaskStatus.created,
+    TaskStatus.ingested,
+    TaskStatus.downloaded,
+    TaskStatus.audio_extracted,
+    TaskStatus.asr_done,
+    TaskStatus.translated,
+    TaskStatus.subtitle_ready,
+    TaskStatus.rendered,
+    TaskStatus.ready_for_review,
+    TaskStatus.approved,
+)
 
 
 def task_title_key(task_id: uuid.UUID) -> str:
@@ -89,6 +118,94 @@ def create_task(payload: TaskCreate, *, db: Session) -> Task:
     db.commit()
     db.refresh(task)
     return task
+
+
+def stop_task(task_id: uuid.UUID, *, db: Session) -> Task:
+    task = db.get(Task, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="task not found")
+    if task.status == TaskStatus.canceled and task.stopped_status is not None:
+        return task
+    if task.status not in STOPPABLE_TASK_STATUSES:
+        raise HTTPException(status_code=409, detail=f"task status={task.status.value.lower()} cannot be stopped")
+
+    task.stopped_status = task.status
+    task.status = TaskStatus.canceled
+    db.add(task)
+    db.commit()
+    db.refresh(task)
+    return task
+
+
+def resume_stopped_task(task_id: uuid.UUID, *, db: Session) -> Task:
+    task = db.get(Task, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="task not found")
+    if task.status != TaskStatus.canceled or task.stopped_status is None:
+        raise HTTPException(status_code=409, detail="task was not stopped by the task controls")
+
+    task.status = task.stopped_status
+    task.stopped_status = None
+    db.add(task)
+    db.commit()
+    db.refresh(task)
+    return task
+
+
+def stop_all_tasks(*, db: Session) -> tuple[int, int]:
+    tasks = db.query(Task).filter(Task.status.in_(STOPPABLE_TASK_STATUSES)).all()
+    for task in tasks:
+        task.stopped_status = task.status
+        task.status = TaskStatus.canceled
+        db.add(task)
+    db.commit()
+    return len(tasks), len(tasks)
+
+
+def resume_all_stopped_tasks(*, db: Session) -> tuple[int, int, list[Task]]:
+    tasks = (
+        db.query(Task)
+        .filter(Task.status == TaskStatus.canceled, Task.stopped_status.is_not(None))
+        .order_by(Task.updated_at.asc(), Task.created_at.asc())
+        .all()
+    )
+    for task in tasks:
+        task.status = task.stopped_status
+        task.stopped_status = None
+        db.add(task)
+    db.commit()
+    for task in tasks:
+        db.refresh(task)
+    return len(tasks), len(tasks), tasks
+
+
+def auto_youtube_restart_options(task: Task, *, db: Session) -> tuple[bool, bool | None]:
+    """Return the auto-publish option when a fully stopped pipeline must restart.
+
+    A pipeline that still owns a live task lock will observe the restored state
+    itself, so sending another Celery task would duplicate work.
+    """
+    if task.source_type.value != "youtube" or task.status not in {TaskStatus.ingested, TaskStatus.downloaded}:
+        return False, None
+    marker = parse_auto_youtube_created_by(task.created_by)
+    if marker is None:
+        return False, None
+    now = datetime.now(timezone.utc)
+    if task.lock_owner and task.lock_until and task.lock_until > now:
+        return False, None
+    subtitle_active = (
+        db.query(SubtitleJob)
+        .filter(SubtitleJob.task_id == task.id, SubtitleJob.status.in_([SubtitleJobStatus.queued, SubtitleJobStatus.running]))
+        .count()
+    )
+    render_active = (
+        db.query(RenderJob)
+        .filter(RenderJob.task_id == task.id, RenderJob.status.in_([RenderJobStatus.queued, RenderJobStatus.running]))
+        .count()
+    )
+    if subtitle_active or render_active:
+        return False, None
+    return True, marker.get("auto_publish")
 
 
 def active_bilibili_uploads(db: Session, task_ids: list[uuid.UUID]) -> dict[uuid.UUID, dict[str, Any]]:

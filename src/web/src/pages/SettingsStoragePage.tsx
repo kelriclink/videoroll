@@ -1,15 +1,29 @@
 import { useEffect, useState } from "react";
+import { useConfirm, useToast } from "../components/feedbackContext";
 import { fetchJson } from "../lib/http";
 import { ORCHESTRATOR_URL } from "../lib/urls";
 
 type StorageRetentionSettings = {
   asset_ttl_days: number;
 };
+type StorageResourceCleanupResult = {
+  matched_tasks: number;
+  matched_assets: number;
+  matched_subtitles: number;
+  deleted_assets: number;
+  deleted_subtitles: number;
+  deleted_objects: number;
+  pending_objects: number;
+};
 
 export default function SettingsStoragePage() {
+  const confirm = useConfirm();
+  const toast = useToast();
   const [settings, setSettings] = useState<StorageRetentionSettings | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [cleanupBusy, setCleanupBusy] = useState(false);
+  const [cleanupResult, setCleanupResult] = useState<StorageResourceCleanupResult | null>(null);
 
   const [assetTtlDays, setAssetTtlDays] = useState(0);
 
@@ -58,7 +72,7 @@ export default function SettingsStoragePage() {
           </div>
         )}
         <div className="mt-3 text-xs text-slate-500">
-          提示：当 <span className="font-mono">asset_ttl_days &gt; 0</span> 时，后端会按周期清理过期资源（raw/sub/final 等资产文件）。
+          提示：<span className="font-mono">asset_ttl_days</span> 控制已发布和永久取消任务的资源保留期；失败任务资源固定在失败 48 小时后清理。任务记录和发布记录会保留。
         </div>
       </div>
 
@@ -103,7 +117,50 @@ export default function SettingsStoragePage() {
           </button>
         </div>
       </div>
+
+      <div className="rounded border border-rose-200 bg-rose-50 p-4">
+        <div className="text-sm font-semibold text-rose-900">立即清理已结束任务资源</div>
+        <div className="mt-1 text-sm text-rose-800">
+          一键删除所有已发布、失败或永久取消任务的 MinIO/S3 资源文件，包括原视频、成品、字幕、日志和元数据；保留任务、发布和去重记录。已停止且可恢复的任务不会被清理。
+        </div>
+        <div className="mt-3 flex flex-wrap items-center gap-2">
+          <button
+            disabled={cleanupBusy}
+            className="rounded border border-rose-300 bg-white px-3 py-2 text-sm font-medium text-rose-700 hover:bg-rose-100 disabled:opacity-50"
+            onClick={async () => {
+              const ok = await confirm({
+                title: "清理全部已结束任务资源",
+                message: "会永久删除 MinIO/S3 中所有已结束任务的原视频、成品、字幕、日志和元数据，任务记录仍会保留用于去重。此操作不可撤销。",
+                confirmLabel: "确认清理",
+                tone: "danger",
+              });
+              if (!ok) return;
+              setCleanupBusy(true);
+              setError(null);
+              try {
+                const result = await fetchJson<StorageResourceCleanupResult>(`${ORCHESTRATOR_URL}/maintenance/storage/cleanup-terminal`, {
+                  method: "POST",
+                });
+                setCleanupResult(result);
+                toast({ kind: "success", title: "资源清理已完成", message: `删除对象 ${result.deleted_objects} 个。` });
+                await refresh();
+              } catch (e: unknown) {
+                setError(e instanceof Error ? e.message : String(e));
+              } finally {
+                setCleanupBusy(false);
+              }
+            }}
+          >
+            {cleanupBusy ? "清理中..." : "一键清理全部已结束任务资源"}
+          </button>
+          {cleanupResult ? (
+            <span className="text-xs text-rose-800">
+              已匹配 {cleanupResult.matched_tasks} 个任务，删除 {cleanupResult.deleted_objects} 个对象、{cleanupResult.deleted_assets} 条资产记录。
+              {cleanupResult.pending_objects ? ` 仍有 ${cleanupResult.pending_objects} 个对象等待重试。` : ""}
+            </span>
+          ) : null}
+        </div>
+      </div>
     </div>
   );
 }
-

@@ -138,6 +138,9 @@ class Task(Base):
     source_proof_url: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
     status: Mapped[TaskStatus] = mapped_column(Enum(TaskStatus, name="task_status"), nullable=False, default=TaskStatus.created)
+    # A stopped task uses the existing CANCELED state while retaining the
+    # workflow stage it should return to when the user resumes it.
+    stopped_status: Mapped[Optional[TaskStatus]] = mapped_column(Enum(TaskStatus, name="task_status"), nullable=True)
     priority: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 
     created_by: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)

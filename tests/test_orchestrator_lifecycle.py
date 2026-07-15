@@ -46,11 +46,23 @@ class OrchestratorLifecycleTests(unittest.TestCase):
             patch.object(scheduler_module, "get_storage_retention_settings", return_value={"asset_ttl_days": 0}),
             patch.object(scheduler_module, "S3Store", return_value=store),
             patch.object(scheduler_module.asset_service, "retry_pending_s3_deletes", return_value=2) as retry,
+            patch.object(scheduler_module.maintenance_service, "expire_stale_publishing_tasks", return_value=1) as expire,
+            patch.object(scheduler_module.maintenance_service, "cleanup_terminal_task_resources") as cleanup,
         ):
+            cleanup.return_value = Mock(deleted_objects=3, deleted_assets=4, deleted_subtitles=5)
             result = scheduler._cleanup_storage_once()
 
+        expire.assert_called_once_with(db, timeout_hours=48)
         retry.assert_called_once_with(db, store)
-        self.assertEqual(result["deleted_objects"], 2)
+        cleanup.assert_called_once_with(
+            settings,
+            db,
+            published_older_than_days=None,
+            failed_older_than_hours=48,
+            owner_prefix="retention",
+        )
+        self.assertEqual(result["timed_out_tasks"], 1)
+        self.assertEqual(result["deleted_objects"], 5)
 
 
 if __name__ == "__main__":

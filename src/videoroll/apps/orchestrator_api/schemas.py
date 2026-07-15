@@ -30,6 +30,7 @@ class TaskRead(BaseModel):
     source_license: SourceLicense
     source_proof_url: Optional[str]
     status: TaskStatus
+    stopped_status: Optional[TaskStatus] = None
     priority: int
     created_by: Optional[str]
     display_title: Optional[str] = None
@@ -192,6 +193,11 @@ class TaskPublishReviewRead(BaseModel):
 class RemoteJobResponse(BaseModel):
     job_id: uuid.UUID
     status: str
+
+
+class TaskBulkControlResponse(BaseModel):
+    matched_count: int
+    changed_count: int
 
 
 class RecentFailedResumeItem(BaseModel):
@@ -380,6 +386,16 @@ class StorageRetentionSettingsRead(BaseModel):
 
 class StorageRetentionSettingsUpdate(BaseModel):
     asset_ttl_days: Optional[int] = None
+
+
+class StorageResourceCleanupRead(BaseModel):
+    matched_tasks: int = 0
+    matched_assets: int = 0
+    matched_subtitles: int = 0
+    deleted_assets: int = 0
+    deleted_subtitles: int = 0
+    deleted_objects: int = 0
+    pending_objects: int = 0
 
 
 class RemoteAPISettingsRead(BaseModel):

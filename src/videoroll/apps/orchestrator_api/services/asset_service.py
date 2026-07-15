@@ -230,8 +230,8 @@ def write_s3_text(s3: S3Store, key: str, value: str) -> bytes:
     return payload
 
 
-def pending_s3_delete_key(storage_key: str) -> str:
-    digest = hashlib.sha256(str(storage_key).encode("utf-8")).hexdigest()
+def pending_s3_delete_key(storage_key: str, *, bucket: str | None = None) -> str:
+    digest = hashlib.sha256(f"{str(bucket or '')}\0{str(storage_key)}".encode("utf-8")).hexdigest()
     return f"{PENDING_S3_DELETE_PREFIX}{digest}"
 
 
@@ -240,14 +240,16 @@ def queue_pending_s3_delete(
     storage_key: str,
     *,
     reason: str,
+    bucket: str | None = None,
     commit: bool = True,
 ) -> AppSetting:
-    row_key = pending_s3_delete_key(storage_key)
+    row_key = pending_s3_delete_key(storage_key, bucket=bucket)
     row = db.get(AppSetting, row_key)
     if row is None:
         row = AppSetting(key=row_key, value_json={})
     row.value_json = {
         "storage_key": str(storage_key),
+        "bucket": str(bucket or "").strip() or None,
         "reason": str(reason),
         "requested_at": datetime.now(tz=timezone.utc).isoformat(),
     }
@@ -275,6 +277,7 @@ def retry_pending_s3_deletes(db: Session, s3: S3Store, *, limit: int = 200) -> i
     deleted = 0
     for row in rows:
         storage_key = str((row.value_json or {}).get("storage_key") or "").strip()
+        bucket = str((row.value_json or {}).get("bucket") or "").strip() or None
         if not storage_key:
             db.delete(row)
             continue
@@ -282,7 +285,7 @@ def retry_pending_s3_deletes(db: Session, s3: S3Store, *, limit: int = 200) -> i
             db.delete(row)
             continue
         try:
-            s3.delete_object(storage_key)
+            s3.delete_object(storage_key, bucket=bucket)
         except Exception:
             logger.warning("pending S3 delete retry failed", extra={"storage_key": storage_key})
             continue

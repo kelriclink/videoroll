@@ -819,6 +819,51 @@ export default function TaskDetailPage() {
     }
   }
 
+  async function stopTask() {
+    if (!taskId) return;
+    const ok = await confirm({
+      title: "停止任务",
+      message: "停止后不会再启动后续字幕或渲染步骤；正在执行的工作会在当前安全检查点暂停。",
+      confirmLabel: "停止",
+      tone: "danger",
+    });
+    if (!ok) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const updated = await fetchJson<Task>(`${ORCHESTRATOR_URL}/tasks/${taskId}/actions/stop`, { method: "POST" });
+      setTask(updated);
+      await refresh({ silent: true });
+      toast({ kind: "success", title: "任务已停止" });
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function resumeStoppedTask() {
+    if (!taskId) return;
+    const ok = await confirm({
+      title: "恢复任务",
+      message: "将从停止前的阶段继续，已保存的字幕和渲染产物会被复用。",
+      confirmLabel: "恢复",
+    });
+    if (!ok) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const updated = await fetchJson<Task>(`${ORCHESTRATOR_URL}/tasks/${taskId}/actions/resume`, { method: "POST" });
+      setTask(updated);
+      await refresh({ silent: true });
+      toast({ kind: "success", title: "任务已恢复" });
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   const canResumeSubtitle = useMemo(() => {
     const hasFailedJob = (subtitleJobs ?? []).some((j) => j.status === "failed");
     const isTaskFailed = task?.status === "FAILED";
@@ -827,6 +872,17 @@ export default function TaskDetailPage() {
 
   const nextAction = (() => {
     if (!task) return null;
+    if (task.status === "CANCELED") {
+      return {
+        title: "任务已停止",
+        description: "恢复后会从停止前的阶段继续处理。",
+        primaryLabel: "恢复任务",
+        primaryTone: "primary" as const,
+        onPrimary: resumeStoppedTask,
+        secondaryLabel: "查看日志",
+        onSecondary: () => setActiveTab("logs"),
+      };
+    }
     if (task.status === "PUBLISHED") {
       return {
         title: "流程已完成",
@@ -1098,9 +1154,20 @@ export default function TaskDetailPage() {
             <div className="text-lg font-semibold">任务详情</div>
             <div className="mt-1 font-mono text-xs text-slate-600">{taskId}</div>
           </div>
-          <Button onClick={() => refresh()}>
-            刷新
-          </Button>
+          <div className="flex flex-wrap items-center gap-2">
+            {task?.status === "CANCELED" ? (
+              <Button disabled={busy} onClick={resumeStoppedTask}>
+                恢复任务
+              </Button>
+            ) : task && ["CREATED", "INGESTED", "DOWNLOADED", "AUDIO_EXTRACTED", "ASR_DONE", "TRANSLATED", "SUBTITLE_READY", "RENDERED", "READY_FOR_REVIEW", "APPROVED"].includes(task.status) ? (
+              <Button disabled={busy} tone="danger" onClick={stopTask}>
+                停止任务
+              </Button>
+            ) : null}
+            <Button disabled={busy} onClick={() => refresh()}>
+              刷新
+            </Button>
+          </div>
         </div>
 
         {error ? <div className="mt-3 whitespace-pre-wrap break-words text-sm text-rose-700">{error}</div> : null}

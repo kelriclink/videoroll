@@ -79,6 +79,19 @@ def _ensure_tasks_lock_columns(engine: Engine) -> None:
         logger.warning("auto-migrated DB: added tasks.lock_until")
 
 
+def _ensure_tasks_stop_columns(engine: Engine) -> None:
+    insp = inspect(engine)
+    if "tasks" not in set(insp.get_table_names()):
+        return
+
+    cols = {c.get("name") for c in insp.get_columns("tasks")}
+    if "stopped_status" in cols:
+        return
+    column_type = "task_status" if (engine.dialect.name or "").lower() == "postgresql" else "VARCHAR(32)"
+    _add_column(engine, "tasks", "stopped_status", column_type)
+    logger.warning("auto-migrated DB: added tasks.stopped_status")
+
+
 def _ensure_app_settings_version_column(engine: Engine) -> None:
     insp = inspect(engine)
     if "app_settings" not in set(insp.get_table_names()):
@@ -696,6 +709,7 @@ def auto_migrate_engine(engine: Engine) -> None:
         _ensure_app_settings_version_column(engine)
         _ensure_job_lease_columns(engine)
         _ensure_tasks_lock_columns(engine)
+        _ensure_tasks_stop_columns(engine)
         _ensure_tasks_publish_batch_columns(engine)
         _ensure_youtube_sources_columns(engine)
         _ensure_publish_jobs_generic_columns(engine)

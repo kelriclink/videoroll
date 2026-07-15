@@ -3,6 +3,7 @@ from __future__ import annotations
 import mimetypes
 from dataclasses import dataclass
 from pathlib import Path
+from collections.abc import Iterator
 from typing import Optional
 
 import boto3
@@ -98,8 +99,48 @@ class S3Store:
             args["Range"] = range_bytes
         return self._client.get_object(**args)
 
-    def delete_object(self, key: str) -> None:
-        self._client.delete_object(Bucket=self._bucket, Key=key)
+    def delete_object(self, key: str, *, bucket: str | None = None) -> None:
+        self._client.delete_object(Bucket=bucket or self._bucket, Key=key)
+
+    def list_bucket_names(self) -> list[str]:
+        return [
+            str(item.get("Name") or "").strip()
+            for item in self._client.list_buckets().get("Buckets") or []
+            if str(item.get("Name") or "").strip()
+        ]
+
+    def iter_object_keys(self, prefix: str = "", *, bucket: str | None = None) -> Iterator[str]:
+        paginator = self._client.get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=bucket or self._bucket, Prefix=prefix):
+            for item in page.get("Contents") or []:
+                key = str(item.get("Key") or "").strip()
+                if key:
+                    yield key
+
+    def delete_objects(self, keys: list[str], *, bucket: str | None = None) -> tuple[set[str], set[str]]:
+        """Delete up to 1,000 objects and return (deleted, failed) keys.
+
+        S3 bulk deletes are idempotent: a key that is already absent is
+        considered deleted, which makes retention retries safe.
+        """
+        unique_keys = list(dict.fromkeys(str(key).strip() for key in keys if str(key).strip()))
+        if not unique_keys:
+            return set(), set()
+        if len(unique_keys) > 1000:
+            raise ValueError("delete_objects accepts at most 1000 keys")
+        try:
+            response = self._client.delete_objects(
+                Bucket=bucket or self._bucket,
+                Delete={"Objects": [{"Key": key} for key in unique_keys], "Quiet": True},
+            )
+        except Exception:
+            return set(), set(unique_keys)
+        failed = {
+            str(item.get("Key") or "").strip()
+            for item in response.get("Errors") or []
+            if str(item.get("Key") or "").strip()
+        }
+        return set(unique_keys) - failed, failed
 
     @staticmethod
     def iter_body(body: StreamingBody, chunk_size: int = 1024 * 1024):

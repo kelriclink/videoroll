@@ -17,8 +17,11 @@ const colors: Record<string, string> = {
   CANCELED: "bg-slate-100 text-slate-700",
 };
 
+const labels: Record<string, string> = {
+  CANCELED: "已停止",
+};
+
 export default function StatusBadge({ status }: { status: TaskStatus | string }) {
   const cls = colors[status] ?? "bg-slate-100 text-slate-700";
-  return <span className={`inline-flex rounded px-2 py-0.5 text-xs font-medium ${cls}`}>{status}</span>;
+  return <span className={`inline-flex rounded px-2 py-0.5 text-xs font-medium ${cls}`}>{labels[status] ?? status}</span>;
 }
-

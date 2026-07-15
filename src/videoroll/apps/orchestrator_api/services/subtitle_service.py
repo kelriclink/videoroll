@@ -141,6 +141,16 @@ def enqueue_subtitle_service_job_request(
     return RemoteJobResponse(job_id=uuid.UUID(data["job_id"]), status=str(data.get("status", "queued")))
 
 
+def kick_task_queue(settings: OrchestratorSettings) -> bool:
+    """Ask the subtitle service to re-evaluate queued work without failing UI actions."""
+    try:
+        with httpx.Client(timeout=5.0, headers=internal_http_headers(settings)) as client:
+            client.post(f"{settings.subtitle_service_url}/subtitle/task_queue/tick").raise_for_status()
+        return True
+    except httpx.HTTPError:
+        return False
+
+
 def build_resume_subtitle_request(
     task_id: uuid.UUID,
     db: Session,
@@ -235,6 +245,8 @@ def enqueue_subtitle_job(
     task = db.get(Task, task_id)
     if not task:
         raise HTTPException(status_code=404, detail="task not found")
+    if task.status == TaskStatus.canceled:
+        raise HTTPException(status_code=409, detail="task is stopped; resume it before submitting subtitle work")
     in_flight = (
         db.query(SubtitleJob)
         .filter(
@@ -245,11 +257,7 @@ def enqueue_subtitle_job(
         .first()
     )
     if in_flight:
-        try:
-            with httpx.Client(timeout=5.0, headers=internal_http_headers(settings)) as client:
-                client.post(f"{settings.subtitle_service_url}/subtitle/task_queue/tick")
-        except httpx.HTTPError:
-            pass
+        kick_task_queue(settings)
         return RemoteJobResponse(job_id=in_flight.id, status=in_flight.status.value)
     raw_asset = (
         db.query(Asset)
@@ -285,8 +293,11 @@ def resume_subtitle_job(
     settings: OrchestratorSettings,
     db: Session,
 ) -> RemoteJobResponse:
-    if not db.get(Task, task_id):
+    task = db.get(Task, task_id)
+    if not task:
         raise HTTPException(status_code=404, detail="task not found")
+    if task.status == TaskStatus.canceled:
+        raise HTTPException(status_code=409, detail="task is stopped; resume it before continuing subtitle work")
     in_flight = (
         db.query(SubtitleJob)
         .filter(

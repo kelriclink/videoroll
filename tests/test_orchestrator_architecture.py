@@ -44,6 +44,7 @@ EXPECTED_ORCHESTRATOR_ROUTES: set[tuple[str, str]] = {
     ("POST", "/auth/setup"),
     ("POST", "/auto/youtube"),
     ("POST", "/maintenance/workdir/cleanup"),
+    ("POST", "/maintenance/storage/cleanup-terminal"),
     ("POST", "/remote/auto/youtube"),
     ("POST", "/settings/publish/social/accounts/{account_id}/check"),
     ("POST", "/settings/publish/social/accounts/{platform}"),
@@ -144,6 +145,7 @@ class OrchestratorArchitectureTests(unittest.TestCase):
 
         self.assertEqual(owners["/settings/storage"], "videoroll.apps.orchestrator_api.routers.settings")
         self.assertEqual(owners["/maintenance/workdir"], "videoroll.apps.orchestrator_api.routers.maintenance")
+        self.assertEqual(owners["/maintenance/storage/cleanup-terminal"], "videoroll.apps.orchestrator_api.routers.maintenance")
 
     def test_asset_routes_are_owned_by_asset_router(self) -> None:
         owners = {route.path: route.endpoint.__module__ for route in app.routes if hasattr(route, "endpoint")}
@@ -194,6 +196,10 @@ class OrchestratorArchitectureTests(unittest.TestCase):
             "/tasks/{task_id}/subtitle_jobs",
             "/tasks/{task_id}/actions/subtitle",
             "/tasks/{task_id}/actions/subtitle_resume",
+            "/tasks/{task_id}/actions/stop",
+            "/tasks/{task_id}/actions/resume",
+            "/tasks/actions/stop_all",
+            "/tasks/actions/resume_stopped",
             "/tasks/actions/resume_failed_recent",
         ):
             self.assertEqual(owners[path], "videoroll.apps.orchestrator_api.routers.tasks")

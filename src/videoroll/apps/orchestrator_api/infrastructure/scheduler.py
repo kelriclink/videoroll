@@ -5,9 +5,7 @@ import os
 import threading
 import time
 import uuid
-from datetime import datetime, timedelta, timezone
-
-from sqlalchemy import func
+from datetime import datetime, timezone
 
 from videoroll.apps.orchestrator_api.services import asset_service, maintenance_service, youtube_service
 from videoroll.apps.orchestrator_api.storage_retention_store import get_storage_retention_settings
@@ -18,7 +16,6 @@ from videoroll.apps.youtube_ingest.source_service import (
     scan_youtube_source_by_id,
 )
 from videoroll.config import OrchestratorSettings
-from videoroll.db.models import Asset, Subtitle
 from videoroll.db.session import get_sessionmaker
 from videoroll.storage.s3 import S3Store
 
@@ -34,6 +31,11 @@ class OrchestratorScheduler:
         self._source_scan_stop = threading.Event()
         self._threads: list[threading.Thread] = []
         self._cleanup_interval_seconds = int(os.getenv("STORAGE_CLEANUP_INTERVAL_SECONDS", "3600") or "3600")
+        self._publishing_timeout_hours = max(1, int(os.getenv("PUBLISHING_TASK_TIMEOUT_HOURS", "48") or "48"))
+        self._failed_resource_retention_hours = max(
+            1,
+            int(os.getenv("FAILED_TASK_RESOURCE_RETENTION_HOURS", "48") or "48"),
+        )
         self._lease_recovery_interval_seconds = int(os.getenv("WORKER_LEASE_RECOVERY_INTERVAL_SECONDS", "30") or "30")
         self._home_scan_tick_seconds = int(os.getenv("YOUTUBE_HOME_SCAN_TICK_SECONDS", "30") or "30")
         self._source_scan_tick_seconds = int(os.getenv("YOUTUBE_SOURCE_SCAN_TICK_SECONDS", "30") or "30")
@@ -91,61 +93,33 @@ class OrchestratorScheduler:
         session_local = get_sessionmaker(self.settings.database_url)
         db = session_local()
         try:
+            timed_out_tasks = maintenance_service.expire_stale_publishing_tasks(
+                db,
+                timeout_hours=self._publishing_timeout_hours,
+            )
             config = get_storage_retention_settings(db)
             store = S3Store(self.settings)
             deleted_objects = asset_service.retry_pending_s3_deletes(db, store)
             ttl_days = int(config.get("asset_ttl_days") or 0)
-            if ttl_days <= 0:
+            retention = maintenance_service.cleanup_terminal_task_resources(
+                self.settings,
+                db,
+                published_older_than_days=ttl_days if ttl_days > 0 else None,
+                failed_older_than_hours=self._failed_resource_retention_hours,
+                owner_prefix="retention",
+            )
+            if retention is None:
                 return {
+                    "timed_out_tasks": timed_out_tasks,
                     "deleted_objects": deleted_objects,
                     "deleted_assets": 0,
                     "deleted_subtitles": 0,
                 }
-
-            cutoff = datetime.now(tz=timezone.utc) - timedelta(days=ttl_days)
-            deleted_assets = 0
-            deleted_subtitles = 0
-
-            while True:
-                query = db.query(Asset.storage_key).group_by(Asset.storage_key).having(func.max(Asset.created_at) < cutoff)
-                keys = [row[0] for row in query.limit(200).all() if row and row[0]]
-                if not keys:
-                    break
-                for key in keys:
-                    asset_service.queue_pending_s3_delete(
-                        db,
-                        key,
-                        reason="retention_expired",
-                        commit=False,
-                    )
-                deleted_assets += db.query(Asset).filter(Asset.storage_key.in_(keys)).delete(
-                    synchronize_session=False
-                )
-                deleted_subtitles += db.query(Subtitle).filter(Subtitle.storage_key.in_(keys)).delete(
-                    synchronize_session=False
-                )
-                db.commit()
-
-            active_keys = (
-                db.query(Asset.storage_key.label("storage_key"))
-                .group_by(Asset.storage_key)
-                .having(func.max(Asset.created_at) >= cutoff)
-                .subquery()
-            )
-            active_key_query = db.query(active_keys.c.storage_key)
-            deleted_assets += db.query(Asset).filter(
-                Asset.created_at < cutoff,
-                Asset.storage_key.in_(active_key_query),
-            ).delete(synchronize_session=False)
-            deleted_subtitles += db.query(Subtitle).filter(
-                Subtitle.created_at < cutoff,
-                Subtitle.storage_key.in_(active_key_query),
-            ).delete(synchronize_session=False)
-            db.commit()
             return {
-                "deleted_objects": deleted_objects,
-                "deleted_assets": deleted_assets,
-                "deleted_subtitles": deleted_subtitles,
+                "timed_out_tasks": timed_out_tasks,
+                "deleted_objects": deleted_objects + retention.deleted_objects,
+                "deleted_assets": retention.deleted_assets,
+                "deleted_subtitles": retention.deleted_subtitles,
             }
         finally:
             db.close()
