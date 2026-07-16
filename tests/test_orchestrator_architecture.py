@@ -8,13 +8,30 @@ from videoroll.apps.orchestrator_api.main import app
 
 DOC_PATHS = {"/openapi.json", "/docs", "/docs/oauth2-redirect", "/redoc"}
 
+
+def application_routes(application):
+    """Flatten FastAPI 0.139+ included routers while supporting older releases."""
+    pending = list(application.routes)
+    while pending:
+        route = pending.pop(0)
+        if hasattr(route, "path"):
+            yield route
+            continue
+        original_router = getattr(route, "original_router", None)
+        if original_router is not None:
+            pending.extend(getattr(original_router, "routes", []))
+
 EXPECTED_ORCHESTRATOR_ROUTES: set[tuple[str, str]] = {
     ("DELETE", "/settings/publish/social/accounts/{account_id}"),
     ("DELETE", "/settings/publish/social/login-sessions/{session_id}"),
+    ("DELETE", "/live/media/{media_id}"),
     ("DELETE", "/tasks/{task_id}/assets/{asset_id}"),
     ("GET", "/auth/status"),
     ("GET", "/bilibili/{service_path:path}"),
     ("GET", "/health"),
+    ("GET", "/live"),
+    ("GET", "/live/media/{media_id}/stream"),
+    ("GET", "/live/settings"),
     ("GET", "/maintenance/workdir"),
     ("GET", "/settings/api"),
     ("GET", "/settings/publish/platforms"),
@@ -45,6 +62,12 @@ EXPECTED_ORCHESTRATOR_ROUTES: set[tuple[str, str]] = {
     ("POST", "/auto/youtube"),
     ("POST", "/maintenance/workdir/cleanup"),
     ("POST", "/maintenance/storage/cleanup-terminal"),
+    ("POST", "/live/actions/pause"),
+    ("POST", "/live/actions/resume"),
+    ("POST", "/live/actions/start"),
+    ("POST", "/live/actions/stop"),
+    ("POST", "/live/media/audio"),
+    ("POST", "/live/media/video"),
     ("POST", "/remote/auto/youtube"),
     ("POST", "/settings/publish/social/accounts/{account_id}/check"),
     ("POST", "/settings/publish/social/accounts/{platform}"),
@@ -52,19 +75,25 @@ EXPECTED_ORCHESTRATOR_ROUTES: set[tuple[str, str]] = {
     ("POST", "/settings/youtube/home_scan/run"),
     ("POST", "/settings/youtube/test"),
     ("POST", "/tasks"),
+    ("POST", "/tasks/actions/resume_stopped"),
     ("POST", "/tasks/actions/resume_failed_recent"),
+    ("POST", "/tasks/actions/stop_all"),
     ("POST", "/tasks/{task_id}/actions/auto_youtube_start"),
     ("POST", "/tasks/{task_id}/actions/publish"),
     ("POST", "/tasks/{task_id}/actions/publish_all"),
     ("POST", "/tasks/{task_id}/actions/publish_review"),
     ("POST", "/tasks/{task_id}/actions/subtitle"),
     ("POST", "/tasks/{task_id}/actions/subtitle_resume"),
+    ("POST", "/tasks/{task_id}/actions/stop"),
+    ("POST", "/tasks/{task_id}/actions/resume"),
     ("POST", "/tasks/{task_id}/actions/youtube_download"),
     ("POST", "/tasks/{task_id}/actions/youtube_meta"),
     ("POST", "/tasks/{task_id}/publish_meta/draft"),
     ("POST", "/tasks/{task_id}/upload/cover"),
     ("POST", "/tasks/{task_id}/upload/video"),
     ("PUT", "/settings/api"),
+    ("PUT", "/live/playlist"),
+    ("PUT", "/live/settings"),
     ("PUT", "/bilibili/{service_path:path}"),
     ("PUT", "/settings/publish/platforms/{platform}"),
     ("PUT", "/settings/review"),
@@ -85,7 +114,7 @@ EXPECTED_ORCHESTRATOR_ROUTES: set[tuple[str, str]] = {
 def route_manifest(application) -> set[tuple[str, str]]:
     return {
         (method, route.path)
-        for route in application.routes
+        for route in application_routes(application)
         if route.path not in DOC_PATHS and getattr(route, "include_in_schema", True)
         for method in sorted(getattr(route, "methods", set()) or set())
         if method not in {"HEAD", "OPTIONS"}
@@ -96,7 +125,7 @@ class OrchestratorArchitectureTests(unittest.TestCase):
     def test_route_manifest_has_no_duplicate_method_path_pairs(self) -> None:
         pairs = [
             (method, route.path)
-            for route in app.routes
+            for route in application_routes(app)
             if route.path not in DOC_PATHS and getattr(route, "include_in_schema", True)
             for method in sorted(getattr(route, "methods", set()) or set())
             if method not in {"HEAD", "OPTIONS"}
@@ -135,25 +164,32 @@ class OrchestratorArchitectureTests(unittest.TestCase):
         self.assertEqual(route_manifest(second), EXPECTED_ORCHESTRATOR_ROUTES)
 
     def test_auth_and_system_routes_are_owned_by_domain_routers(self) -> None:
-        owners = {route.path: route.endpoint.__module__ for route in app.routes if hasattr(route, "endpoint")}
+        owners = {route.path: route.endpoint.__module__ for route in application_routes(app) if hasattr(route, "endpoint")}
 
         self.assertEqual(owners["/auth/login"], "videoroll.apps.orchestrator_api.routers.auth")
         self.assertEqual(owners["/system/resources"], "videoroll.apps.orchestrator_api.routers.system")
 
     def test_settings_and_maintenance_routes_are_owned_by_domain_routers(self) -> None:
-        owners = {route.path: route.endpoint.__module__ for route in app.routes if hasattr(route, "endpoint")}
+        owners = {route.path: route.endpoint.__module__ for route in application_routes(app) if hasattr(route, "endpoint")}
 
         self.assertEqual(owners["/settings/storage"], "videoroll.apps.orchestrator_api.routers.settings")
         self.assertEqual(owners["/maintenance/workdir"], "videoroll.apps.orchestrator_api.routers.maintenance")
         self.assertEqual(owners["/maintenance/storage/cleanup-terminal"], "videoroll.apps.orchestrator_api.routers.maintenance")
 
+    def test_live_routes_are_owned_by_live_router(self) -> None:
+        owners = {route.path: route.endpoint.__module__ for route in application_routes(app) if hasattr(route, "endpoint")}
+
+        self.assertEqual(owners["/live"], "videoroll.apps.orchestrator_api.routers.live")
+        self.assertEqual(owners["/live/actions/start"], "videoroll.apps.orchestrator_api.routers.live")
+        self.assertEqual(owners["/live/media/{media_id}/stream"], "videoroll.apps.orchestrator_api.routers.live")
+
     def test_asset_routes_are_owned_by_asset_router(self) -> None:
-        owners = {route.path: route.endpoint.__module__ for route in app.routes if hasattr(route, "endpoint")}
+        owners = {route.path: route.endpoint.__module__ for route in application_routes(app) if hasattr(route, "endpoint")}
 
         self.assertEqual(owners["/tasks/{task_id}/upload/video"], "videoroll.apps.orchestrator_api.routers.assets")
 
     def test_publishing_routes_are_owned_by_publishing_router(self) -> None:
-        owners = {route.path: route.endpoint.__module__ for route in app.routes if hasattr(route, "endpoint")}
+        owners = {route.path: route.endpoint.__module__ for route in application_routes(app) if hasattr(route, "endpoint")}
 
         self.assertEqual(
             owners["/tasks/{task_id}/actions/publish"],
@@ -165,7 +201,7 @@ class OrchestratorArchitectureTests(unittest.TestCase):
         )
 
     def test_youtube_routes_are_owned_by_youtube_router(self) -> None:
-        owners = {route.path: route.endpoint.__module__ for route in app.routes if hasattr(route, "endpoint")}
+        owners = {route.path: route.endpoint.__module__ for route in application_routes(app) if hasattr(route, "endpoint")}
 
         for path in (
             "/auto/youtube",
@@ -181,13 +217,13 @@ class OrchestratorArchitectureTests(unittest.TestCase):
             self.assertEqual(owners[path], "videoroll.apps.orchestrator_api.routers.youtube")
 
     def test_internal_service_proxy_routes_are_owned_by_their_domains(self) -> None:
-        owners = {route.path: route.endpoint.__module__ for route in app.routes if hasattr(route, "endpoint")}
+        owners = {route.path: route.endpoint.__module__ for route in application_routes(app) if hasattr(route, "endpoint")}
 
         self.assertEqual(owners["/subtitle/{service_path:path}"], "videoroll.apps.orchestrator_api.routers.settings")
         self.assertEqual(owners["/bilibili/{service_path:path}"], "videoroll.apps.orchestrator_api.routers.publishing")
 
     def test_task_and_subtitle_routes_are_owned_by_tasks_router(self) -> None:
-        owners = {route.path: route.endpoint.__module__ for route in app.routes if hasattr(route, "endpoint")}
+        owners = {route.path: route.endpoint.__module__ for route in application_routes(app) if hasattr(route, "endpoint")}
 
         for path in (
             "/tasks",

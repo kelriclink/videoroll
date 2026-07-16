@@ -13,6 +13,7 @@ from videoroll.apps.orchestrator_api.routers.assets import router as assets_rout
 from videoroll.apps.orchestrator_api.routers.auth import router as auth_router
 from videoroll.apps.orchestrator_api.routers.desktop import router as desktop_router
 from videoroll.apps.orchestrator_api.routers.maintenance import router as maintenance_router
+from videoroll.apps.orchestrator_api.routers.live import router as live_router
 from videoroll.apps.orchestrator_api.routers.publishing import router as publishing_router
 from videoroll.apps.orchestrator_api.routers.settings import router as settings_router
 from videoroll.apps.orchestrator_api.routers.system import router as system_router
@@ -55,6 +56,7 @@ def create_app(*, install_lifecycle: bool = True) -> FastAPI:
     application.include_router(system_router)
     application.include_router(settings_router)
     application.include_router(maintenance_router)
+    application.include_router(live_router)
     application.include_router(assets_router)
     application.include_router(youtube_router)
     application.include_router(publishing_router)

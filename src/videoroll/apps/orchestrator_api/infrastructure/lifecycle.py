@@ -10,6 +10,7 @@ from videoroll.apps.orchestrator_api.admin_auth_store import get_password_hash
 from videoroll.apps.orchestrator_api.infrastructure.scheduler import OrchestratorScheduler
 from videoroll.apps.orchestrator_api.realtime import RealtimeHub
 from videoroll.apps.orchestrator_api.services.system_service import collect_system_resources
+from videoroll.apps.orchestrator_api.services.live_service import recover_interrupted_live_stream
 from videoroll.apps.security.service_auth import (
     admin_cookie_secret,
     ensure_bootstrap_state,
@@ -43,6 +44,7 @@ def initialize_runtime(app: FastAPI) -> OrchestratorScheduler:
     db = session_local()
     try:
         ensure_bootstrap_state(db)
+        recover_interrupted_live_stream(db)
         app.state.admin_password_hash = get_password_hash(db)
     finally:
         db.close()

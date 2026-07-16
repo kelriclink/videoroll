@@ -398,6 +398,93 @@ class StorageResourceCleanupRead(BaseModel):
     pending_objects: int = 0
 
 
+class LiveStreamSettingsRead(BaseModel):
+    rtmp_url: str = ""
+    stream_key_set: bool = False
+    video_bitrate_kbps: int = Field(default=4500, ge=500, le=20000)
+    audio_bitrate_kbps: int = Field(default=160, ge=32, le=512)
+    fps: int = Field(default=30, ge=15, le=60)
+    keyframe_interval_seconds: int = Field(default=2, ge=1, le=10)
+
+
+class LiveStreamSettingsUpdate(BaseModel):
+    rtmp_url: Optional[str] = None
+    # Never returned by the API. An empty string deliberately clears it.
+    stream_key: Optional[str] = Field(default=None, max_length=1024)
+    video_bitrate_kbps: Optional[int] = Field(default=None, ge=500, le=20000)
+    audio_bitrate_kbps: Optional[int] = Field(default=None, ge=32, le=512)
+    fps: Optional[int] = Field(default=None, ge=15, le=60)
+    keyframe_interval_seconds: Optional[int] = Field(default=None, ge=1, le=10)
+
+
+class LivePlaylistItem(BaseModel):
+    source: Literal["library", "task_asset"]
+    id: uuid.UUID
+
+
+class LivePlaylistRead(BaseModel):
+    video_items: list[LivePlaylistItem] = Field(default_factory=list)
+    audio_items: list[LivePlaylistItem] = Field(default_factory=list)
+    playback_mode: Literal["sequential", "shuffle"] = "sequential"
+    loop_playlist: bool = True
+
+
+class LivePlaylistUpdate(BaseModel):
+    video_items: Optional[list[LivePlaylistItem]] = None
+    audio_items: Optional[list[LivePlaylistItem]] = None
+    playback_mode: Optional[Literal["sequential", "shuffle"]] = None
+    loop_playlist: Optional[bool] = None
+
+
+class LiveMediaRead(BaseModel):
+    id: uuid.UUID
+    media_type: Literal["video", "audio"]
+    origin: Literal["upload", "completed_video"] = "upload"
+    source_task_id: Optional[uuid.UUID] = None
+    source_asset_id: Optional[uuid.UUID] = None
+    display_name: str
+    storage_key: str
+    content_type: str
+    size_bytes: int = 0
+    sha256: Optional[str] = None
+    created_at: Optional[str] = None
+
+
+class CompletedLiveVideoRead(BaseModel):
+    id: uuid.UUID
+    task_id: uuid.UUID
+    display_name: str
+    storage_key: str
+    size_bytes: Optional[int] = None
+    duration_ms: Optional[int] = None
+    created_at: datetime
+
+
+class LiveCurrentMediaRead(BaseModel):
+    source: Literal["library", "task_asset"]
+    id: uuid.UUID
+    display_name: str
+
+
+class LiveSessionRead(BaseModel):
+    status: Literal["idle", "starting", "running", "paused", "stopped", "failed"] = "idle"
+    session_id: Optional[str] = None
+    started_at: Optional[str] = None
+    updated_at: Optional[str] = None
+    stopped_at: Optional[str] = None
+    current_video: Optional[LiveCurrentMediaRead] = None
+    current_audio: Optional[LiveCurrentMediaRead] = None
+    last_error: Optional[str] = None
+
+
+class LiveDashboardRead(BaseModel):
+    settings: LiveStreamSettingsRead
+    session: LiveSessionRead
+    playlist: LivePlaylistRead
+    library_media: list[LiveMediaRead] = Field(default_factory=list)
+    completed_videos: list[CompletedLiveVideoRead] = Field(default_factory=list)
+
+
 class RemoteAPISettingsRead(BaseModel):
     token_set: bool = False
     token_updated_at: Optional[str] = None

@@ -526,10 +526,8 @@ export default function TaskDetailPage() {
     } catch {}
   }, [publishMetaText]);
 
-  const rawAsset = useMemo(() => {
-    const raws = (assets ?? []).filter((x) => x.kind === "video_raw");
-    return raws.length ? raws[raws.length - 1] : null;
-  }, [assets]);
+  const rawAssets = useMemo(() => (assets ?? []).filter((x) => x.kind === "video_raw"), [assets]);
+  const rawAsset = useMemo(() => (rawAssets.length ? rawAssets[rawAssets.length - 1] : null), [rawAssets]);
   const metadataAsset = useMemo(() => {
     const metas = (assets ?? []).filter((x) => x.kind === "metadata_json");
     return metas.length ? metas[metas.length - 1] : null;
@@ -1808,18 +1806,31 @@ export default function TaskDetailPage() {
         </div>
         <div className="mt-3 grid gap-3 md:grid-cols-2">
           <label className="block">
-            <div className="mb-1 text-xs text-slate-600">video_key（可选）</div>
+            <div className="mb-1 text-xs text-slate-600">投稿视频（video_key，可选）</div>
             <select
               className="w-full rounded border px-3 py-2 text-sm"
               value={publishVideoKey}
               onChange={(e) => setPublishVideoKey(e.target.value)}
             >
-              <option value="">自动（最新 video_final）</option>
-              {[...finalAssets].reverse().map((a) => (
-                <option key={a.id} value={a.storage_key}>
-                  {a.storage_key}
-                </option>
-              ))}
+              <option value="">自动选择最新最终视频</option>
+              {rawAssets.length ? (
+                <optgroup label="原视频">
+                  {[...rawAssets].reverse().map((a) => (
+                    <option key={a.id} value={a.storage_key}>
+                      原视频 · {a.storage_key}
+                    </option>
+                  ))}
+                </optgroup>
+              ) : null}
+              {finalAssets.length ? (
+                <optgroup label="压制完成视频">
+                  {[...finalAssets].reverse().map((a) => (
+                    <option key={a.id} value={a.storage_key}>
+                      最终视频 · {a.storage_key}
+                    </option>
+                  ))}
+                </optgroup>
+              ) : null}
             </select>
           </label>
 

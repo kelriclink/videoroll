@@ -19,6 +19,7 @@ import SettingsTranslatePage from "./pages/SettingsTranslatePage";
 import SettingsPublishPage from "./pages/SettingsPublishPage";
 import SettingsAutoPage from "./pages/SettingsAutoPage";
 import SettingsReviewPage from "./pages/SettingsReviewPage";
+import LivePage from "./pages/LivePage";
 import RenderQueuePage from "./pages/RenderQueuePage";
 import KnowledgeBasePage from "./pages/KnowledgeBasePage";
 import DictionaryPage from "./pages/DictionaryPage";
@@ -58,6 +59,7 @@ function Navigation({ onNavigate }: { onNavigate?: () => void }) {
         <NavItem to="/" label="仪表盘" onNavigate={onNavigate} />
         <NavItem to="/tasks" label="任务" onNavigate={onNavigate} />
         <NavItem to="/videos" label="视频成品" onNavigate={onNavigate} />
+        <NavItem to="/live" label="直播推流" onNavigate={onNavigate} />
         <NavItem to="/queue/render" label="处理队列" onNavigate={onNavigate} />
         <NavItem to="/knowledge" label="知识库" onNavigate={onNavigate} />
         <NavItem to="/dictionaries" label="词典" onNavigate={onNavigate} />
@@ -225,6 +227,7 @@ export default function App() {
               <Route path="/" element={<DashboardPage />} />
               <Route path="/tasks" element={<TasksPage />} />
               <Route path="/videos" element={<VideosPage />} />
+              <Route path="/live" element={<LivePage />} />
               <Route path="/tasks/new" element={<TaskNewPage />} />
               <Route path="/tasks/:taskId" element={<TaskDetailPage />} />
               <Route path="/youtube/sources" element={<YouTubeSourcesPage />} />

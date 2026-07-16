@@ -90,6 +90,23 @@ class S3Store:
         path.parent.mkdir(parents=True, exist_ok=True)
         self._client.download_file(self._bucket, key, str(path))
 
+    def copy_object(
+        self,
+        source_key: str,
+        destination_key: str,
+        *,
+        source_bucket: str | None = None,
+        destination_bucket: str | None = None,
+    ) -> PutResult:
+        """Copy an object inside S3/MinIO, using multipart copy when needed."""
+        target_bucket = destination_bucket or self._bucket
+        self._client.copy(
+            {"Bucket": source_bucket or self._bucket, "Key": source_key},
+            target_bucket,
+            destination_key,
+        )
+        return PutResult(bucket=target_bucket, key=destination_key)
+
     def head_object(self, key: str) -> dict:
         return self._client.head_object(Bucket=self._bucket, Key=key)
 
