@@ -85,12 +85,12 @@ class _FakeDb:
 class OpenVinoAsrTests(unittest.TestCase):
     def _defaults(self, *, database_url: str) -> SubtitleServiceSettings:
         return SubtitleServiceSettings(
-            database_url=database_url,
-            redis_url="redis://localhost:6379/0",
-            s3_endpoint_url="http://localhost:9000",
-            s3_access_key_id="key",
-            s3_secret_access_key="secret",
-            s3_bucket="bucket",
+            DATABASE_URL=database_url,
+            REDIS_URL="redis://localhost:6379/0",
+            S3_ENDPOINT_URL="http://localhost:9000",
+            S3_ACCESS_KEY_ID="key",
+            S3_SECRET_ACCESS_KEY="secret",
+            S3_BUCKET="bucket",
             SUBTITLE_OPENVINO_MODEL="/models/whisper/whisper-large-v3-ov",
             SUBTITLE_OPENVINO_DEVICE="GPU.0",
             SUBTITLE_OPENVINO_NUM_BEAMS=2,
@@ -109,6 +109,8 @@ class OpenVinoAsrTests(unittest.TestCase):
         self.assertEqual(current["openvino_device"], "GPU.0")
         self.assertEqual(current["openvino_num_beams"], 2)
         self.assertEqual(current["openvino_max_new_tokens"], 640)
+        self.assertTrue(current["openvino_vad_enabled"])
+        self.assertEqual(current["openvino_vad_threshold"], 0.5)
 
         updated = update_asr_settings(
             db,
@@ -119,12 +121,16 @@ class OpenVinoAsrTests(unittest.TestCase):
                 "openvino_device": "GPU",
                 "openvino_num_beams": 3,
                 "openvino_max_new_tokens": 512,
+                "openvino_vad_enabled": False,
+                "openvino_vad_threshold": 0.6,
             },
         )
         self.assertEqual(updated["default_model"], "/models/whisper/custom-ov")
         self.assertEqual(updated["openvino_device"], "GPU")
         self.assertEqual(updated["openvino_num_beams"], 3)
         self.assertEqual(updated["openvino_max_new_tokens"], 512)
+        self.assertFalse(updated["openvino_vad_enabled"])
+        self.assertEqual(updated["openvino_vad_threshold"], 0.6)
 
     def test_transcribe_openvino_whisper_builds_segments_from_chunks(self) -> None:
         fake_pipeline = _FakePipeline(_FakeResult([_FakeChunk(0.25, 1.5, " Hello Intel Arc ")]))
@@ -140,6 +146,7 @@ class OpenVinoAsrTests(unittest.TestCase):
                 device="GPU",
                 num_beams=2,
                 max_new_tokens=256,
+                vad_enabled=False,
             )
 
         self.assertEqual(len(segments), 1)
@@ -152,6 +159,38 @@ class OpenVinoAsrTests(unittest.TestCase):
         self.assertEqual(fake_pipeline.cfg.num_beams, 2)
         self.assertEqual(fake_pipeline.cfg.max_new_tokens, 256)
         self.assertEqual(len(fake_pipeline.calls), 1)
+
+    def test_transcribe_openvino_whisper_skips_pipeline_when_vad_finds_no_speech(self) -> None:
+        with (
+            patch.object(processing, "_read_wav_as_float_mono_16k", return_value=([0.1] * 16000, 1.0)),
+            patch.object(processing, "_detect_openvino_speech_spans", return_value=[]),
+            patch.object(processing, "_get_openvino_pipeline", side_effect=AssertionError("pipeline should not be created")),
+        ):
+            segments = processing.transcribe_openvino_whisper(
+                Path("/tmp/no-speech.wav"),
+                model_name="/models/whisper/whisper-large-v3-ov",
+            )
+
+        self.assertEqual(segments, [])
+
+    def test_transcribe_openvino_whisper_offsets_vad_span_timestamps(self) -> None:
+        fake_pipeline = _FakePipeline(_FakeResult([_FakeChunk(0.25, 1.5, " Hello Intel Arc ")]))
+        spans = [
+            processing._OpenVinoSpeechSpan(start_sample=16000, end_sample=32000),
+            processing._OpenVinoSpeechSpan(start_sample=48000, end_sample=64000),
+        ]
+        with (
+            patch.object(processing, "_read_wav_as_float_mono_16k", return_value=([0.1] * 80000, 5.0)),
+            patch.object(processing, "_detect_openvino_speech_spans", return_value=spans),
+            patch.object(processing, "_get_openvino_pipeline", return_value=fake_pipeline),
+        ):
+            segments = processing.transcribe_openvino_whisper(
+                Path("/tmp/speech-spans.wav"),
+                model_name="/models/whisper/whisper-large-v3-ov",
+            )
+
+        self.assertEqual([(seg.start, seg.end) for seg in segments], [(1.25, 2.5), (3.25, 4.5)])
+        self.assertEqual([len(call["raw_speech_input"]) for call in fake_pipeline.calls], [16000, 16000])
 
 
 if __name__ == "__main__":

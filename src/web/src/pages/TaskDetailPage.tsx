@@ -34,6 +34,19 @@ type YouTubeMeta = {
 type YouTubeSubtitleMode = "off" | "target" | "auto_source";
 type YouTubeMetaActionResponse = { metadata: YouTubeMeta };
 type YouTubeDownloadActionResponse = { metadata: YouTubeMeta; video_asset: Asset; metadata_asset: Asset; cover_asset?: Asset | null };
+type YouTubeDownloadProgress = {
+  task_id: string;
+  status: "idle" | "preparing" | "downloading" | "processing" | "uploading" | "completed" | "failed";
+  active: boolean;
+  progress: number;
+  downloaded_bytes: number;
+  total_bytes?: number | null;
+  speed_bytes_per_second?: number | null;
+  eta_seconds?: number | null;
+  filename?: string | null;
+  error?: string | null;
+  updated_at?: string | null;
+};
 type SubtitleAutoProfile = {
   formats: string[];
   burn_in: boolean;
@@ -92,6 +105,31 @@ function clampUploadProgress(value: number | null | undefined): number {
   const progress = Number(value);
   if (!Number.isFinite(progress)) return 0;
   return Math.max(0, Math.min(100, Math.floor(progress)));
+}
+
+function formatDownloadBytes(value?: number | null): string {
+  const bytes = Number(value);
+  if (!Number.isFinite(bytes) || bytes <= 0) return "-";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let size = bytes;
+  let unit = 0;
+  while (size >= 1024 && unit < units.length - 1) {
+    size /= 1024;
+    unit += 1;
+  }
+  return `${size >= 100 || unit === 0 ? size.toFixed(0) : size.toFixed(1)} ${units[unit]}`;
+}
+
+function youtubeDownloadStatusLabel(status: YouTubeDownloadProgress["status"]): string {
+  return {
+    idle: "等待下载",
+    preparing: "正在准备",
+    downloading: "正在下载",
+    processing: "正在合并与校验",
+    uploading: "正在保存到媒体库",
+    completed: "下载完成",
+    failed: "下载失败",
+  }[status];
 }
 
 function upsertById<T extends { id: string }>(current: T[] | null, item: T): T[] {
@@ -210,6 +248,7 @@ export default function TaskDetailPage() {
   const [publishReview, setPublishReview] = useState<PublishReview | null>(null);
   const [reviewBusy, setReviewBusy] = useState(false);
   const [youtubeMeta, setYoutubeMeta] = useState<YouTubeMeta | null>(null);
+  const [youtubeDownloadProgress, setYoutubeDownloadProgress] = useState<YouTubeDownloadProgress | null>(null);
   const [didAutoPickCover, setDidAutoPickCover] = useState(false);
   const loadedPublishMetaTextRef = useRef<string>("{}");
   const logEventTimerRef = useRef<number | undefined>();
@@ -297,6 +336,20 @@ export default function TaskDetailPage() {
     if (result.optional.publishJobs.ok) setPublishJobs(result.optional.publishJobs.value);
     if (result.optional.publishBatches.ok) setPublishBatches(result.optional.publishBatches.value);
   }, [taskId]);
+
+  const refreshYoutubeDownloadProgress = useCallback(async () => {
+    if (!taskId) return;
+    try {
+      const progress = await fetchJson<YouTubeDownloadProgress>(`${ORCHESTRATOR_URL}/tasks/${taskId}/youtube_download_progress`);
+      setYoutubeDownloadProgress(progress);
+    } catch {
+      setYoutubeDownloadProgress(null);
+    }
+  }, [taskId]);
+
+  useEffect(() => {
+    void refreshYoutubeDownloadProgress();
+  }, [refreshYoutubeDownloadProgress]);
 
   useEffect(() => {
     refresh();
@@ -1068,6 +1121,10 @@ export default function TaskDetailPage() {
       setTask((current) => ({ ...(current ?? {}), ...data } as Task));
       return;
     }
+    if (event.name === "youtube_download.progress" && String(data.task_id ?? event.entity_id ?? "") === taskId) {
+      setYoutubeDownloadProgress(data as unknown as YouTubeDownloadProgress);
+      return;
+    }
     if (event.name === "task.deleted" && id === taskId) {
       setTask(null);
       setError("任务已被删除");
@@ -1121,6 +1178,7 @@ export default function TaskDetailPage() {
 
   useRealtimeSubscription(taskId ? [`task:${taskId}`] : [], handleRealtimeEvent, () => {
     void refreshRealtimeSnapshot();
+    void refreshYoutubeDownloadProgress();
   });
 
   useEffect(() => {
@@ -1289,6 +1347,27 @@ export default function TaskDetailPage() {
         <div className="text-sm font-semibold">Upload / Raw Video</div>
         <div className="mt-2 text-xs text-slate-500">已上传：{rawAsset ? rawAsset.storage_key : "无"}</div>
         <div className="mt-1 text-xs text-slate-500">metadata：{metadataAsset ? metadataAsset.storage_key : "无"}</div>
+        {isYouTubeTask && youtubeDownloadProgress && youtubeDownloadProgress.status !== "idle" ? (
+          <div className={`mt-3 rounded border p-3 ${youtubeDownloadProgress.status === "failed" ? "border-rose-200 bg-rose-50" : "border-sky-200 bg-sky-50"}`}>
+            <div className="flex items-center justify-between gap-3 text-sm text-slate-900">
+              <span className="font-medium">下载视频 {clampUploadProgress(youtubeDownloadProgress.progress)}%</span>
+              <span>{youtubeDownloadStatusLabel(youtubeDownloadProgress.status)}</span>
+            </div>
+            <div className="mt-2 h-2 overflow-hidden rounded bg-white/80">
+              <div
+                className={`h-full transition-[width] duration-300 ${youtubeDownloadProgress.status === "failed" ? "bg-rose-500" : "bg-sky-500"}`}
+                style={{ width: `${clampUploadProgress(youtubeDownloadProgress.progress)}%` }}
+              />
+            </div>
+            <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-xs text-slate-600">
+              <span>{formatDownloadBytes(youtubeDownloadProgress.downloaded_bytes)}{youtubeDownloadProgress.total_bytes ? ` / ${formatDownloadBytes(youtubeDownloadProgress.total_bytes)}` : ""}</span>
+              {youtubeDownloadProgress.speed_bytes_per_second ? <span>{formatDownloadBytes(youtubeDownloadProgress.speed_bytes_per_second)}/s</span> : null}
+              {youtubeDownloadProgress.eta_seconds != null && youtubeDownloadProgress.active ? <span>剩余约 {youtubeDownloadProgress.eta_seconds}s</span> : null}
+              {youtubeDownloadProgress.filename ? <span className="max-w-full truncate">{youtubeDownloadProgress.filename}</span> : null}
+            </div>
+            {youtubeDownloadProgress.error ? <div className="mt-2 break-words text-xs text-rose-700">{youtubeDownloadProgress.error}</div> : null}
+          </div>
+        ) : null}
         <div className="mt-3 flex flex-wrap items-center gap-2">
           <input type="file" accept="video/*" onChange={(e) => setVideoFile(e.target.files?.[0] ?? null)} />
           <button
@@ -1318,6 +1397,13 @@ export default function TaskDetailPage() {
               onClick={async () => {
                 setBusy(true);
                 setError(null);
+                setYoutubeDownloadProgress({
+                  task_id: taskId,
+                  status: "preparing",
+                  active: true,
+                  progress: 0,
+                  downloaded_bytes: 0,
+                });
                 try {
                   const draftWasPristine = publishMetaText === loadedPublishMetaTextRef.current;
                   let metaForDraft: any = null;
@@ -1338,9 +1424,11 @@ export default function TaskDetailPage() {
                   if (draftWasPristine) {
                     await generatePublishDraft("source", metaForDraft);
                   }
+                  await refreshYoutubeDownloadProgress();
                   await refresh();
                 } catch (e: unknown) {
                   try {
+                    await refreshYoutubeDownloadProgress();
                     await refresh({ silent: true });
                     await loadLogs({ silent: true });
                   } catch {}
@@ -1351,7 +1439,7 @@ export default function TaskDetailPage() {
               }}
               className="rounded border px-3 py-2 text-sm hover:bg-slate-50 disabled:opacity-50"
             >
-              从 YouTube 下载
+              {youtubeDownloadProgress?.active ? `下载中 ${clampUploadProgress(youtubeDownloadProgress.progress)}%` : "从 YouTube 下载"}
             </button>
           ) : null}
         </div>

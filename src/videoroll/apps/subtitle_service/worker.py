@@ -380,7 +380,8 @@ def _build_after_render_publish_action(
     db: Session,
     store: S3Store,
 ) -> dict[str, Any] | None:
-    if not profile.get("auto_publish"):
+    auto_publish_platforms = list(profile.get("auto_publish_platforms") or [])
+    if not profile.get("auto_publish") or not auto_publish_platforms:
         return None
 
     meta = default_publish_meta(db)
@@ -405,6 +406,7 @@ def _build_after_render_publish_action(
 
     publish_payload = {
         "account_id": None,
+        "platforms": auto_publish_platforms,
         "video_key": None,
         "cover_key": cover_key,
         "typeid_mode": profile.get("publish_typeid_mode") or "ai_summary",
@@ -1388,11 +1390,14 @@ def process_job(self: Any, job_id: str) -> dict[str, str]:
                 openvino_device = str(asr_defaults.get("openvino_device") or settings.openvino_device).strip() or settings.openvino_device
                 openvino_num_beams = int(asr_defaults.get("openvino_num_beams") or settings.openvino_num_beams or 1)
                 openvino_max_new_tokens = int(asr_defaults.get("openvino_max_new_tokens") or settings.openvino_max_new_tokens or 448)
+                openvino_vad_enabled = bool(asr_defaults.get("openvino_vad_enabled", settings.openvino_vad_enabled))
+                openvino_vad_threshold = float(asr_defaults.get("openvino_vad_threshold") or settings.openvino_vad_threshold or 0.5)
                 _safe_append_log_line(
                     log_path,
                     "asr: "
                     f"engine=openvino model={model_name} language={language} "
-                    f"device={openvino_device} num_beams={openvino_num_beams} max_new_tokens={openvino_max_new_tokens}",
+                    f"device={openvino_device} num_beams={openvino_num_beams} max_new_tokens={openvino_max_new_tokens} "
+                    f"vad_enabled={openvino_vad_enabled} vad_threshold={openvino_vad_threshold}",
                 )
                 segments = transcribe_openvino_whisper(
                     audio_path,
@@ -1401,6 +1406,8 @@ def process_job(self: Any, job_id: str) -> dict[str, str]:
                     device=openvino_device,
                     num_beams=openvino_num_beams,
                     max_new_tokens=openvino_max_new_tokens,
+                    vad_enabled=openvino_vad_enabled,
+                    vad_threshold=openvino_vad_threshold,
                 )
             else:
                 raise ValueError(f"unsupported ASR engine: {engine}")
@@ -2967,7 +2974,8 @@ def auto_youtube_pipeline(self: Any, task_id: str, overrides: dict[str, Any] | N
             return {"status": "ok", "task_id": str(tid), "detail": f"queued subtitle job {job.id}"}
 
         result_data: dict[str, Any] = {}
-        if profile.get("auto_publish"):
+        auto_publish_platforms = list(profile.get("auto_publish_platforms") or [])
+        if profile.get("auto_publish") and auto_publish_platforms:
             task = db.get(Task, tid)
             _raise_if_task_stopped(db, tid)
             if not final_asset:
@@ -2995,6 +3003,7 @@ def auto_youtube_pipeline(self: Any, task_id: str, overrides: dict[str, Any] | N
 
             publish_payload = {
                 "account_id": None,
+                "platforms": auto_publish_platforms,
                 "video_key": final_asset.storage_key,
                 "cover_key": cover_key,
                 "typeid_mode": profile.get("publish_typeid_mode") or "ai_summary",

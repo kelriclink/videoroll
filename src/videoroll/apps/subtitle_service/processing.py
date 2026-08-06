@@ -32,6 +32,12 @@ _ASR_SILENCE_PEAK_THRESHOLD = 0.005
 _ASR_SILENCE_RMS_THRESHOLD = 0.0008
 _ASR_SILENCE_ACTIVE_THRESHOLD = 0.015
 _ASR_SILENCE_ACTIVE_RATIO_THRESHOLD = 0.0005
+_ASR_SAMPLE_RATE = 16000
+_OPENVINO_VAD_THRESHOLD = 0.5
+_OPENVINO_VAD_MIN_SPEECH_MS = 250
+_OPENVINO_VAD_MAX_SPEECH_SECONDS = 30.0
+_OPENVINO_VAD_MIN_SILENCE_MS = 500
+_OPENVINO_VAD_SPEECH_PAD_MS = 180
 _OPENVINO_PIPELINE_CACHE: dict[tuple[str, str], Any] = {}
 _OPENVINO_PIPELINE_CACHE_LOCK = threading.Lock()
 
@@ -324,6 +330,16 @@ class _OpenVinoChunk:
     text: str
 
 
+@dataclass(frozen=True)
+class _OpenVinoSpeechSpan:
+    start_sample: int
+    end_sample: int
+
+    @property
+    def duration_seconds(self) -> float:
+        return max(0, self.end_sample - self.start_sample) / float(_ASR_SAMPLE_RATE)
+
+
 def _read_wav_as_float_mono_16k(audio_path: Path) -> tuple[list[float], float]:
     with wave.open(str(audio_path), "rb") as wf:
         channels = int(wf.getnchannels() or 0)
@@ -401,6 +417,86 @@ def _audio_path_is_effectively_silent(audio_path: Path) -> bool:
     return _audio_is_effectively_silent(audio_data)
 
 
+def _detect_openvino_speech_spans(
+    audio_data: list[float],
+    *,
+    threshold: float = _OPENVINO_VAD_THRESHOLD,
+) -> list[_OpenVinoSpeechSpan] | None:
+    """Return Silero VAD speech spans, or None when VAD is unavailable.
+
+    ``None`` deliberately falls back to the legacy full-audio OpenVINO path so a
+    partial ASR installation does not turn real speech into an empty subtitle.
+    An empty list means VAD ran successfully and found no human speech.
+    """
+    try:
+        import numpy as np  # type: ignore
+        from faster_whisper.vad import VadOptions, get_speech_timestamps  # type: ignore
+    except Exception as e:  # pragma: no cover - depends on optional ASR packages
+        logger.warning(
+            "OpenVINO ASR VAD is unavailable (%s); falling back to full-audio transcription",
+            type(e).__name__,
+        )
+        return None
+
+    try:
+        samples = np.asarray(audio_data, dtype=np.float32)
+        raw_spans = get_speech_timestamps(
+            samples,
+            vad_options=VadOptions(
+                threshold=max(0.01, min(0.99, float(threshold))),
+                min_speech_duration_ms=_OPENVINO_VAD_MIN_SPEECH_MS,
+                max_speech_duration_s=_OPENVINO_VAD_MAX_SPEECH_SECONDS,
+                min_silence_duration_ms=_OPENVINO_VAD_MIN_SILENCE_MS,
+                speech_pad_ms=_OPENVINO_VAD_SPEECH_PAD_MS,
+            ),
+            sampling_rate=_ASR_SAMPLE_RATE,
+        )
+    except Exception as e:  # pragma: no cover - runtime/model dependent
+        logger.warning(
+            "OpenVINO ASR VAD failed for %d samples (%s); falling back to full-audio transcription",
+            len(audio_data),
+            type(e).__name__,
+        )
+        return None
+
+    spans: list[_OpenVinoSpeechSpan] = []
+    sample_count = len(audio_data)
+    for raw_span in raw_spans:
+        if not isinstance(raw_span, dict):
+            continue
+        start = max(0, min(sample_count, int(raw_span.get("start") or 0)))
+        end = max(start, min(sample_count, int(raw_span.get("end") or 0)))
+        if end > start:
+            spans.append(_OpenVinoSpeechSpan(start_sample=start, end_sample=end))
+    return spans
+
+
+def _offset_openvino_chunks(chunks: Iterable[_OpenVinoChunk], *, offset_seconds: float) -> list[_OpenVinoChunk]:
+    offset = max(0.0, float(offset_seconds))
+    return [
+        _OpenVinoChunk(
+            start=max(0.0, offset + float(chunk.start)),
+            end=max(offset + float(chunk.start), offset + float(chunk.end)),
+            text=chunk.text,
+        )
+        for chunk in chunks
+    ]
+
+
+def _dedupe_overlapping_asr_segments(segments: Iterable[Segment]) -> list[Segment]:
+    """Drop duplicate captions caused by padded VAD spans overlapping at an edge."""
+    out: list[Segment] = []
+    for segment in sorted(segments, key=lambda item: (item.start, item.end, item.text)):
+        if (
+            out
+            and _normalize_asr_text(out[-1].text).casefold() == _normalize_asr_text(segment.text).casefold()
+            and segment.start < out[-1].end
+        ):
+            continue
+        out.append(segment)
+    return out
+
+
 def _normalize_openvino_language(language: str) -> str | None:
     lang = str(language or "").strip()
     if not lang or lang.lower() == "auto":
@@ -469,6 +565,8 @@ def transcribe_openvino_whisper(
     device: str = "GPU",
     num_beams: int = 1,
     max_new_tokens: int = 448,
+    vad_enabled: bool = True,
+    vad_threshold: float = _OPENVINO_VAD_THRESHOLD,
 ) -> list[Segment]:
     model_name = str(model_name or "").strip()
     if not model_name:
@@ -480,6 +578,22 @@ def transcribe_openvino_whisper(
     if _audio_is_effectively_silent(audio_data):
         logger.info("skipping openvino-whisper for effectively silent audio %s", audio_path)
         return []
+
+    spans: list[_OpenVinoSpeechSpan] | None = None
+    if vad_enabled:
+        spans = _detect_openvino_speech_spans(audio_data, threshold=vad_threshold)
+        if spans == []:
+            logger.info("skipping openvino-whisper because VAD found no speech in %s", audio_path)
+            return []
+        if spans is not None:
+            speech_seconds = sum(span.duration_seconds for span in spans)
+            logger.info(
+                "openvino-whisper VAD selected %d speech spans (%.2fs / %.2fs) for %s",
+                len(spans),
+                speech_seconds,
+                audio_duration,
+                audio_path,
+            )
 
     pipeline = _get_openvino_pipeline(model_name, str(device or "GPU").strip() or "GPU")
     generation_config = None
@@ -524,13 +638,33 @@ def transcribe_openvino_whisper(
         if lang_token is not None:
             generate_kwargs["language"] = lang_token
 
-    if generation_config is not None:
-        result = pipeline.generate(audio_data, generation_config=generation_config, **generate_kwargs)
+    work_items: list[tuple[list[float], float]]
+    if spans is None:
+        work_items = [(audio_data, 0.0)]
     else:
-        result = pipeline.generate(audio_data, **generate_kwargs)
+        work_items = [
+            (audio_data[span.start_sample : span.end_sample], span.start_sample / float(_ASR_SAMPLE_RATE))
+            for span in spans
+            if span.end_sample > span.start_sample
+        ]
 
-    chunks = _openvino_result_chunks(result, audio_duration=audio_duration)
-    out = _filter_faster_whisper_segments(chunks)
+    chunks: list[_OpenVinoChunk] = []
+    for speech_audio, offset_seconds in work_items:
+        if not speech_audio:
+            continue
+        if generation_config is not None:
+            result = pipeline.generate(speech_audio, generation_config=generation_config, **generate_kwargs)
+        else:
+            result = pipeline.generate(speech_audio, **generate_kwargs)
+        local_duration = len(speech_audio) / float(_ASR_SAMPLE_RATE)
+        chunks.extend(
+            _offset_openvino_chunks(
+                _openvino_result_chunks(result, audio_duration=local_duration),
+                offset_seconds=offset_seconds,
+            )
+        )
+
+    out = _dedupe_overlapping_asr_segments(_filter_faster_whisper_segments(chunks))
     if chunks:
         logger.info("openvino-whisper kept %d/%d segments for %s", len(out), len(chunks), audio_path)
     return out

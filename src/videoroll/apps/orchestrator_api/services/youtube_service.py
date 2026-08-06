@@ -53,6 +53,7 @@ from videoroll.apps.youtube_settings_store import (
 )
 from videoroll.config import OrchestratorSettings
 from videoroll.db.models import (
+    AppSetting,
     Asset,
     AssetKind,
     IngestedVideo,
@@ -66,6 +67,7 @@ from videoroll.db.models import (
 )
 from videoroll.db.session import get_sessionmaker
 from videoroll.storage.s3 import S3Store
+from videoroll.realtime import publish_ui_event
 from videoroll.utils.auto_youtube import encode_auto_youtube_created_by
 from videoroll.utils.hashing import sha256_file
 from videoroll.utils.httpx_proxy import HTTPX_PROXY_KWARG_UNSUPPORTED, format_httpx_proxy_error
@@ -73,6 +75,7 @@ from videoroll.utils.youtube_urls import canonicalize_youtube_url, is_youtube_ur
 
 
 logger = logging.getLogger(__name__)
+YOUTUBE_DOWNLOAD_PROGRESS_PREFIX = "youtube.download_progress."
 
 
 _BROWSER_PROXY_PATHS: dict[str, set[str]] = {
@@ -362,7 +365,169 @@ def _store_failure_log(db: Session, s3: S3Store, task_id: uuid.UUID, url: str, e
     db.commit()
 
 
-def download(task_id: uuid.UUID, *, settings: OrchestratorSettings, db: Session, s3: S3Store) -> YouTubeDownloadActionResponse:
+def _download_progress_defaults(task_id: uuid.UUID) -> dict[str, Any]:
+    return {
+        "task_id": str(task_id),
+        "status": "idle",
+        "active": False,
+        "progress": 0,
+        "downloaded_bytes": 0,
+        "total_bytes": None,
+        "speed_bytes_per_second": None,
+        "eta_seconds": None,
+        "filename": None,
+        "error": None,
+        "updated_at": None,
+    }
+
+
+def get_download_progress(task_id: uuid.UUID, *, db: Session) -> dict[str, Any]:
+    if db.get(Task, task_id) is None:
+        raise HTTPException(status_code=404, detail="task not found")
+    row = db.get(AppSetting, f"{YOUTUBE_DOWNLOAD_PROGRESS_PREFIX}{task_id}")
+    data = dict(row.value_json or {}) if row else {}
+    return {**_download_progress_defaults(task_id), **data, "task_id": str(task_id)}
+
+
+class _YouTubeDownloadProgressReporter:
+    def __init__(self, task_id: uuid.UUID, *, db: Session, redis_url: str) -> None:
+        self.task_id = task_id
+        self.db = db
+        self.redis_url = str(redis_url or "").strip()
+        self.started = False
+        self.last_emit_at = 0.0
+        self.last_progress = 0
+        self.completed_bytes: dict[str, int] = {}
+        self.current_data = _download_progress_defaults(task_id)
+
+    @staticmethod
+    def _number(value: object) -> int | None:
+        try:
+            parsed = int(float(value))
+        except (TypeError, ValueError):
+            return None
+        return max(0, parsed)
+
+    @staticmethod
+    def _float(value: object) -> float | None:
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            return None
+        return max(0.0, parsed)
+
+    @staticmethod
+    def _download_key(event: dict[str, Any]) -> str:
+        info = event.get("info_dict") if isinstance(event.get("info_dict"), dict) else {}
+        return str(info.get("format_id") or event.get("filename") or event.get("tmpfilename") or "download")
+
+    @staticmethod
+    def _requested_total(event: dict[str, Any]) -> int | None:
+        info = event.get("info_dict") if isinstance(event.get("info_dict"), dict) else {}
+        requested = info.get("requested_downloads")
+        if not isinstance(requested, list):
+            return None
+        totals: list[int] = []
+        for item in requested:
+            if not isinstance(item, dict):
+                continue
+            value = _YouTubeDownloadProgressReporter._number(item.get("filesize") or item.get("filesize_approx"))
+            if value:
+                totals.append(value)
+        return sum(totals) or None
+
+    def _persist(self, payload: dict[str, Any], *, force: bool = False) -> None:
+        now = time.monotonic()
+        progress = max(0, min(100, int(payload.get("progress") or 0)))
+        if not force and now - self.last_emit_at < 0.5:
+            return
+        data = {**self.current_data, **payload}
+        data["task_id"] = str(self.task_id)
+        data["progress"] = progress
+        data["updated_at"] = datetime.now(timezone.utc).isoformat()
+        row = self.db.get(AppSetting, f"{YOUTUBE_DOWNLOAD_PROGRESS_PREFIX}{self.task_id}")
+        if row is None:
+            row = AppSetting(key=f"{YOUTUBE_DOWNLOAD_PROGRESS_PREFIX}{self.task_id}", value_json={})
+        row.value_json = data
+        try:
+            self.db.add(row)
+            self.db.commit()
+        except Exception:
+            self.db.rollback()
+            logger.exception("failed to persist YouTube download progress", extra={"task_id": str(self.task_id)})
+        if self.redis_url:
+            publish_ui_event(
+                self.redis_url,
+                topics=[f"task:{self.task_id}"],
+                name="youtube_download.progress",
+                entity_id=self.task_id,
+                data=data,
+            )
+        self.current_data = data
+        self.last_emit_at = now
+        self.last_progress = progress
+
+    def update(self, status: str, progress: int, **values: Any) -> None:
+        self.started = True
+        self._persist(
+            {
+                "status": status,
+                "active": status not in {"completed", "failed"},
+                "progress": progress,
+                "error": None,
+                **values,
+            },
+            force=status in {"preparing", "processing", "uploading", "completed", "failed"},
+        )
+
+    def hook(self, event: dict[str, Any]) -> None:
+        status = str(event.get("status") or "").lower()
+        if status not in {"downloading", "finished"}:
+            return
+        downloaded = self._number(event.get("downloaded_bytes")) or 0
+        current_total = self._number(event.get("total_bytes") or event.get("total_bytes_estimate"))
+        requested_total = self._requested_total(event)
+        key = self._download_key(event)
+        if status == "finished":
+            self.completed_bytes[key] = current_total or downloaded
+        aggregate_downloaded = sum(value for item_key, value in self.completed_bytes.items() if item_key != key) + downloaded
+        total = requested_total or current_total
+        if requested_total:
+            ratio = aggregate_downloaded / requested_total
+        elif current_total:
+            ratio = downloaded / current_total
+        else:
+            ratio = 0.0
+        progress = min(95, max(self.last_progress, int(max(0.0, min(1.0, ratio)) * 95)))
+        filename = Path(str(event.get("filename") or event.get("tmpfilename") or "")).name or None
+        self._persist(
+            {
+                "status": "processing" if status == "finished" else "downloading",
+                "active": True,
+                "progress": max(progress, 95) if status == "finished" and not requested_total else progress,
+                "downloaded_bytes": aggregate_downloaded if requested_total else downloaded,
+                "total_bytes": total,
+                "speed_bytes_per_second": self._float(event.get("speed")),
+                "eta_seconds": self._number(event.get("eta")),
+                "filename": filename,
+                "error": None,
+            },
+            force=status == "finished",
+        )
+
+    def fail(self, exc: Exception) -> None:
+        if self.started:
+            self.update("failed", self.last_progress, error=str(exc)[:500])
+
+
+def _download(
+    task_id: uuid.UUID,
+    *,
+    settings: OrchestratorSettings,
+    db: Session,
+    s3: S3Store,
+    reporter: _YouTubeDownloadProgressReporter,
+) -> YouTubeDownloadActionResponse:
     task = db.get(Task, task_id)
     if not task:
         raise HTTPException(status_code=404, detail="task not found")
@@ -371,6 +536,7 @@ def download(task_id: uuid.UUID, *, settings: OrchestratorSettings, db: Session,
         raise HTTPException(status_code=400, detail="task is not a youtube source")
     if not url or not is_youtube_url(url):
         raise HTTPException(status_code=400, detail="task.source_url is empty" if not url else "task.source_url is not a valid youtube url")
+    reporter.update("preparing", 0)
     video_asset = db.query(Asset).filter(Asset.task_id == task_id, Asset.kind == AssetKind.video_raw).order_by(Asset.created_at.desc()).first()
     uploaded_keys: list[str] = []
     root = Path(settings.work_dir) / "youtube" / str(task_id); root.mkdir(parents=True, exist_ok=True)
@@ -383,7 +549,12 @@ def download(task_id: uuid.UUID, *, settings: OrchestratorSettings, db: Session,
         info: dict[str, Any] = {}; meta: Any = None
         if video_asset is None:
             try:
-                video_path, info, meta = download_youtube_video(url, yt_settings, work_dir=temp_dir)
+                video_path, info, meta = download_youtube_video(
+                    url,
+                    yt_settings,
+                    work_dir=temp_dir,
+                    progress_hook=reporter.hook,
+                )
             except Exception as exc:
                 hint = youtube_bot_check_hint(str(exc), yt_settings=yt_settings, db=db)
                 try:
@@ -391,6 +562,7 @@ def download(task_id: uuid.UUID, *, settings: OrchestratorSettings, db: Session,
                 except Exception:
                     db.rollback()
                 raise HTTPException(status_code=502, detail=f"youtube download failed: {exc}" + (f"\n\n{hint}" if hint else "")) from exc
+            reporter.update("processing", max(95, reporter.last_progress))
             digest = sha256_file(video_path)
             key = _unique_storage_key(
                 f"raw/{task_id}/video",
@@ -398,6 +570,7 @@ def download(task_id: uuid.UUID, *, settings: OrchestratorSettings, db: Session,
                 video_path.suffix.lower() or ".mp4",
             )
             key_was_referenced = _storage_key_is_referenced(db, key)
+            reporter.update("uploading", 99, downloaded_bytes=video_path.stat().st_size, total_bytes=video_path.stat().st_size)
             s3.upload_file(video_path, key)
             if not key_was_referenced:
                 uploaded_keys.append(key)
@@ -449,7 +622,17 @@ def download(task_id: uuid.UUID, *, settings: OrchestratorSettings, db: Session,
             db.rollback()
             _queue_uploaded_objects_for_cleanup(db, uploaded_keys)
             raise
+    reporter.update("completed", 100, speed_bytes_per_second=None, eta_seconds=0)
     return YouTubeDownloadActionResponse(metadata=youtube_meta_to_read(meta), metadata_asset=meta_asset, video_asset=video_asset, cover_asset=cover_asset)
+
+
+def download(task_id: uuid.UUID, *, settings: OrchestratorSettings, db: Session, s3: S3Store) -> YouTubeDownloadActionResponse:
+    reporter = _YouTubeDownloadProgressReporter(task_id, db=db, redis_url=str(getattr(settings, "redis_url", "") or ""))
+    try:
+        return _download(task_id, settings=settings, db=db, s3=s3, reporter=reporter)
+    except Exception as exc:
+        reporter.fail(exc)
+        raise
 
 
 def test_proxy(*, url: str, proxy: str, settings: OrchestratorSettings) -> YouTubeProxyTestResponse:

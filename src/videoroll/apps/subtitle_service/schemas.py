@@ -83,6 +83,8 @@ class WhisperSettingsRead(BaseModel):
     openvino_device: str
     openvino_num_beams: int = 1
     openvino_max_new_tokens: int = 448
+    openvino_vad_enabled: bool = True
+    openvino_vad_threshold: float = 0.5
     whisper_cpu_threads: int = 0
     whisper_num_workers: int = 1
     whisper_cpu_threads_effective: int = 0
@@ -109,6 +111,8 @@ class ASRDefaultsRead(BaseModel):
     openvino_device: str = "GPU"
     openvino_num_beams: int = 1
     openvino_max_new_tokens: int = 448
+    openvino_vad_enabled: bool = True
+    openvino_vad_threshold: float = 0.5
     model_download_proxy: str = ""
 
 
@@ -119,6 +123,8 @@ class ASRDefaultsUpdate(BaseModel):
     openvino_device: Optional[str] = None
     openvino_num_beams: Optional[int] = Field(default=None, ge=1, le=16)
     openvino_max_new_tokens: Optional[int] = Field(default=None, ge=1, le=4096)
+    openvino_vad_enabled: Optional[bool] = None
+    openvino_vad_threshold: Optional[float] = Field(default=None, ge=0.1, le=0.95)
     model_download_proxy: Optional[str] = None
 
 
@@ -148,6 +154,7 @@ class SubtitleAutoProfileRead(BaseModel):
     bilingual: bool = False
 
     auto_publish: bool = True
+    auto_publish_platforms: list[Literal["bilibili", "douyin", "xiaohongshu", "kuaishou"]] = Field(default_factory=list)
     publish_typeid_mode: str = "ai_summary"
     publish_title_prefix: str = "【熟肉】"
     publish_translate_title: bool = True
@@ -181,6 +188,7 @@ class SubtitleAutoProfileUpdate(BaseModel):
     bilingual: Optional[bool] = None
 
     auto_publish: Optional[bool] = None
+    auto_publish_platforms: Optional[list[Literal["bilibili", "douyin", "xiaohongshu", "kuaishou"]]] = None
     publish_typeid_mode: Optional[str] = None
     publish_title_prefix: Optional[str] = None
     publish_translate_title: Optional[bool] = None

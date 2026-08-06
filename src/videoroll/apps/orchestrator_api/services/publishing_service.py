@@ -196,12 +196,16 @@ def build_auto_publish_after_render(
     publish_payload_overrides: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     auto_profile = get_auto_profile(db)
+    auto_publish_platforms = list(auto_profile.get("auto_publish_platforms") or [])
+    if not auto_publish_platforms:
+        raise HTTPException(status_code=409, detail="no automatic publish platforms are selected")
     stored_meta = read_s3_json_object(s3, publish_meta_s3_key(task.id))
     meta = build_task_publish_meta_draft(task, db=db, s3=s3, mode="source", base_meta=stored_meta)
     write_s3_json(s3, publish_meta_s3_key(task.id), meta)
     cover_key = latest_task_cover_key(task.id, db) if bool(auto_profile.get("publish_use_youtube_cover")) else None
     publish_payload: dict[str, Any] = {
         "account_id": None,
+        "platforms": auto_publish_platforms,
         "video_key": None,
         "cover_key": cover_key,
         "typeid_mode": auto_profile.get("publish_typeid_mode") or "ai_summary",
@@ -209,6 +213,7 @@ def build_auto_publish_after_render(
     }
     if isinstance(publish_payload_overrides, dict):
         publish_payload.update(publish_payload_overrides)
+    publish_payload["platforms"] = auto_publish_platforms
     return {"publish": True, "publish_payload": publish_payload}
 
 
@@ -766,11 +771,22 @@ def publish_all(
         raise HTTPException(status_code=400, detail="source_license=unknown; add proof before publishing")
 
     platform_settings = get_publish_platform_settings(db)
-    enabled_platforms = [platform for platform, enabled in platform_settings.items() if enabled]
+    requested_platforms = publish_payload.platforms
+    enabled_platforms = [
+        platform
+        for platform, enabled in platform_settings.items()
+        if enabled and (requested_platforms is None or platform in requested_platforms)
+    ]
     if not enabled_platforms:
-        raise HTTPException(status_code=409, detail="no publish platforms are enabled")
+        detail = (
+            "no requested publish platforms are enabled"
+            if requested_platforms is not None
+            else "no publish platforms are enabled"
+        )
+        raise HTTPException(status_code=409, detail=detail)
 
     payload = publish_payload.model_dump()
+    payload["platforms"] = enabled_platforms
     platform_meta = payload.get("platform_meta")
     review_meta = as_dict(payload.get("meta"))
     if "bilibili" in enabled_platforms:

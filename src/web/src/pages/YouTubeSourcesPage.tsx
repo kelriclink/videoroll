@@ -204,7 +204,7 @@ export default function YouTubeSourcesPage() {
     <div className="space-y-4">
       <PageHeader
         title="YouTube Sources"
-        description="订阅 YouTube 频道 / 播放列表，后台按间隔自动扫描，新视频可直接进入自动模式。"
+        description="订阅 YouTube 频道 / 播放列表；频道默认合并扫描视频与 Shorts，新内容可直接进入自动模式。"
         actions={
           <Button onClick={() => refresh()}>
             刷新

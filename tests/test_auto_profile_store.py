@@ -21,6 +21,14 @@ class AutoProfileStoreTests(unittest.TestCase):
 
         self.assertEqual(profile["primary_font_scale_percent"], 100)
         self.assertEqual(profile["secondary_font_scale_percent"], 100)
+        self.assertEqual(profile["auto_publish_platforms"], [])
+
+    def test_get_auto_profile_normalizes_auto_publish_platforms(self) -> None:
+        profile = get_auto_profile(
+            _FakeDb({"auto_publish_platforms": ["douyin", "invalid", "bilibili", "douyin"]})
+        )
+
+        self.assertEqual(profile["auto_publish_platforms"], ["douyin", "bilibili"])
 
     def test_get_auto_profile_clamps_and_normalizes_font_scale_percent(self) -> None:
         profile = get_auto_profile(

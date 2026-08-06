@@ -96,7 +96,7 @@ class PublishService:
     """
     统一投稿编排层。
 
-    - publish():       读取投稿设置里所有已启用平台，逐个投稿（自动模式用）
+    - publish():       投稿到请求的平台，并受投稿设置的启用状态约束（自动模式用）
     - publish_one():   只投指定平台（手动模式用）
 
     自动模式和手动模式都通过它来投稿，不再直接 httpx 调后端。
@@ -129,11 +129,12 @@ class PublishService:
         *,
         publish_payload: dict[str, Any] | None = None,
     ) -> PublishAllResult:
-        """读取投稿设置里所有已启用平台，逐个投稿。"""
+        """Publish to the requested platforms that are enabled in publish settings."""
         payload = dict(publish_payload or {})
-        if not self._get_enabled_platforms():
+        enabled_platforms = self._get_enabled_platforms(payload)
+        if not enabled_platforms:
             return PublishAllResult(results={})
-        targets = self._build_enabled_targets(payload)
+        targets = self._build_enabled_targets(payload, enabled_platforms)
         results: dict[str, dict[str, Any]] = {}
         batch_ids: list[str] = []
         for target in targets:
@@ -194,9 +195,14 @@ class PublishService:
             return self._http_headers()
         return self._http_headers or {}
 
-    def _get_enabled_platforms(self) -> list[str]:
+    def _get_enabled_platforms(self, payload: dict[str, Any] | None = None) -> list[str]:
         settings_map = get_publish_platform_settings(self._db)
-        return [p for p, enabled in settings_map.items() if enabled]
+        enabled_platforms = [p for p, enabled in settings_map.items() if enabled]
+        requested = (payload or {}).get("platforms")
+        if requested is None:
+            return enabled_platforms
+        requested_platforms = {normalize_publish_platform(platform) for platform in requested}
+        return [platform for platform in enabled_platforms if platform in requested_platforms]
 
     def _create_batch(
         self,
@@ -281,9 +287,13 @@ class PublishService:
         # the exact target set that was atomically persisted with the batch.
         return batch, targets
 
-    def _build_enabled_targets(self, payload: dict[str, Any]) -> list[dict[str, Any]]:
+    def _build_enabled_targets(
+        self,
+        payload: dict[str, Any],
+        enabled_platforms: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
         targets: list[dict[str, Any]] = []
-        for platform in self._get_enabled_platforms():
+        for platform in enabled_platforms if enabled_platforms is not None else self._get_enabled_platforms(payload):
             account_id: str | None = None
             if platform == "bilibili":
                 account_ids = payload.get("account_ids")

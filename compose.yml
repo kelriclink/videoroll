@@ -42,6 +42,8 @@ x-subtitle-environment: &subtitle-environment
   SUBTITLE_OPENVINO_DEVICE: ${SUBTITLE_OPENVINO_DEVICE:-GPU}
   SUBTITLE_OPENVINO_NUM_BEAMS: ${SUBTITLE_OPENVINO_NUM_BEAMS:-1}
   SUBTITLE_OPENVINO_MAX_NEW_TOKENS: ${SUBTITLE_OPENVINO_MAX_NEW_TOKENS:-448}
+  SUBTITLE_OPENVINO_VAD_ENABLED: ${SUBTITLE_OPENVINO_VAD_ENABLED:-true}
+  SUBTITLE_OPENVINO_VAD_THRESHOLD: ${SUBTITLE_OPENVINO_VAD_THRESHOLD:-0.5}
   FFMPEG_PATH: ${FFMPEG_PATH:-ffmpeg}
   WORK_DIR: ${WORK_DIR:-/work/videoroll}
   YOUTUBE_USER_AGENT: "${YOUTUBE_USER_AGENT:-Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36}"
@@ -146,6 +148,8 @@ services:
       SOCIAL_PUBLISHER_URL: http://social-publisher-api:8010
       WORK_DIR: ${WORK_DIR:-/work/videoroll}
       FFMPEG_PATH: ${FFMPEG_PATH:-ffmpeg}
+      LIVE_INTERNAL_STREAM_BASE_URL: ${LIVE_INTERNAL_STREAM_BASE_URL:-http://127.0.0.1:8000}
+      INTEL_GPU_RENDER_DEVICE: ${INTEL_GPU_RENDER_DEVICE:-/dev/dri/renderD128}
       YOUTUBE_USER_AGENT: "${YOUTUBE_USER_AGENT:-Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36}"
       YOUTUBE_COOKIE_FILE: ${YOUTUBE_COOKIE_FILE:-}
       YOUTUBE_PROXY: ${YOUTUBE_PROXY:-}
@@ -154,6 +158,10 @@ services:
     volumes:
       - ./data/secrets:/secrets
       - ./data/work:/work
+    devices:
+      - "/dev/dri:/dev/dri"
+    group_add:
+      - "${INTEL_GPU_RENDER_GID:-107}"
     depends_on:
       redis:
         condition: service_healthy

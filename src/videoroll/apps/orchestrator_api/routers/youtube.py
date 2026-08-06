@@ -23,6 +23,7 @@ from videoroll.apps.orchestrator_api.schemas import (
     AutoYouTubeTaskStartResponse,
     RemoteAutoYouTubeRequest,
     YouTubeDownloadActionResponse,
+    YouTubeDownloadProgressRead,
     YouTubeHomeScanRunResponse,
     YouTubeMetaActionResponse,
     YouTubeMetaRead,
@@ -147,3 +148,8 @@ def fetch_youtube_meta(task_id: uuid.UUID, settings: OrchestratorSettings = Depe
 @router.post("/tasks/{task_id}/actions/youtube_download", response_model=YouTubeDownloadActionResponse)
 def download_youtube(task_id: uuid.UUID, settings: OrchestratorSettings = Depends(get_settings), db: Session = Depends(get_db), s3: S3Store = Depends(get_s3)) -> YouTubeDownloadActionResponse:
     return youtube_service.download(task_id, settings=settings, db=db, s3=s3)
+
+
+@router.get("/tasks/{task_id}/youtube_download_progress", response_model=YouTubeDownloadProgressRead)
+def get_youtube_download_progress(task_id: uuid.UUID, db: Session = Depends(get_db)) -> YouTubeDownloadProgressRead:
+    return YouTubeDownloadProgressRead(**youtube_service.get_download_progress(task_id, db=db))

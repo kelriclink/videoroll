@@ -12,6 +12,8 @@ ASR_SETTINGS_KEY = "subtitle.asr"
 
 _ALLOWED_ENGINES = {"mock", "faster-whisper", "openvino"}
 _MAX_PROXY_LEN = 2048
+_MIN_OPENVINO_VAD_THRESHOLD = 0.1
+_MAX_OPENVINO_VAD_THRESHOLD = 0.95
 
 
 def _get_row(db: Session) -> AppSetting:
@@ -49,6 +51,18 @@ def get_asr_settings(db: Session, defaults: SubtitleServiceSettings) -> dict[str
     openvino_max_new_tokens = int(stored.get("openvino_max_new_tokens") or defaults.openvino_max_new_tokens or 448)
     if openvino_max_new_tokens <= 0:
         openvino_max_new_tokens = int(defaults.openvino_max_new_tokens or 448) or 448
+    stored_vad_enabled = stored.get("openvino_vad_enabled")
+    openvino_vad_enabled = (
+        bool(stored_vad_enabled)
+        if isinstance(stored_vad_enabled, bool)
+        else bool(defaults.openvino_vad_enabled)
+    )
+    try:
+        openvino_vad_threshold = float(stored.get("openvino_vad_threshold") or defaults.openvino_vad_threshold or 0.5)
+    except (TypeError, ValueError):
+        openvino_vad_threshold = float(defaults.openvino_vad_threshold or 0.5)
+    if not _MIN_OPENVINO_VAD_THRESHOLD <= openvino_vad_threshold <= _MAX_OPENVINO_VAD_THRESHOLD:
+        openvino_vad_threshold = float(defaults.openvino_vad_threshold or 0.5)
 
     proxy = str(stored.get("model_download_proxy") or "").strip()
     if len(proxy) > _MAX_PROXY_LEN:
@@ -61,6 +75,8 @@ def get_asr_settings(db: Session, defaults: SubtitleServiceSettings) -> dict[str
         "openvino_device": openvino_device,
         "openvino_num_beams": openvino_num_beams,
         "openvino_max_new_tokens": openvino_max_new_tokens,
+        "openvino_vad_enabled": openvino_vad_enabled,
+        "openvino_vad_threshold": openvino_vad_threshold,
         "model_download_proxy": proxy,
     }
 
@@ -110,6 +126,17 @@ def update_asr_settings(db: Session, defaults: SubtitleServiceSettings, update: 
         if val <= 0:
             raise ValueError("openvino_max_new_tokens must be >= 1")
         stored["openvino_max_new_tokens"] = val
+
+    if "openvino_vad_enabled" in update and update["openvino_vad_enabled"] is not None:
+        stored["openvino_vad_enabled"] = bool(update["openvino_vad_enabled"])
+
+    if "openvino_vad_threshold" in update and update["openvino_vad_threshold"] is not None:
+        val = float(update["openvino_vad_threshold"])
+        if not _MIN_OPENVINO_VAD_THRESHOLD <= val <= _MAX_OPENVINO_VAD_THRESHOLD:
+            raise ValueError(
+                f"openvino_vad_threshold must be between {_MIN_OPENVINO_VAD_THRESHOLD} and {_MAX_OPENVINO_VAD_THRESHOLD}"
+            )
+        stored["openvino_vad_threshold"] = val
 
     if "model_download_proxy" in update and update["model_download_proxy"] is not None:
         val = str(update["model_download_proxy"] or "").strip()

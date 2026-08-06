@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from dataclasses import dataclass
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from yt_dlp.utils import DownloadError
 
@@ -23,6 +23,7 @@ class _Settings:
 class YouTubeDownloaderTests(unittest.TestCase):
     def test_download_retries_with_fallback_clients_when_format_unavailable(self) -> None:
         settings = _Settings()
+        progress_hook = Mock()
         expected = (
             Path("/tmp/video.mp4"),
             {"id": "demo1234567", "title": "Demo"},
@@ -41,6 +42,7 @@ class YouTubeDownloaderTests(unittest.TestCase):
                 "https://www.youtube.com/watch?v=demo1234567",
                 settings,
                 work_dir=Path(tmp),
+                progress_hook=progress_hook,
             )
 
         self.assertEqual(result, expected)
@@ -50,6 +52,7 @@ class YouTubeDownloaderTests(unittest.TestCase):
             mock_download.call_args_list[1].kwargs.get("extractor_args_override"),
             yd._FORMAT_UNAVAILABLE_FALLBACKS[0][1],
         )
+        self.assertTrue(all(call.kwargs.get("progress_hook") is progress_hook for call in mock_download.call_args_list))
 
     def test_download_does_not_retry_on_unrelated_error(self) -> None:
         settings = _Settings()

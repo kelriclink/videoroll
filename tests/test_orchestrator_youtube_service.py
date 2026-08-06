@@ -6,9 +6,33 @@ from unittest.mock import Mock, patch
 import uuid
 
 import pytest
+from fastapi import HTTPException
 
 from videoroll.apps.orchestrator_api.services import youtube_service
-from videoroll.db.models import SourceLicense
+from videoroll.db.models import AppSetting, SourceLicense, Task
+
+
+class _ProgressDb:
+    def __init__(self, task_id: uuid.UUID | None = None) -> None:
+        self.tasks = {task_id: object()} if task_id else {}
+        self.settings: dict[str, AppSetting] = {}
+
+    def get(self, model: object, key: object) -> object | None:
+        if model is Task:
+            return self.tasks.get(key)  # type: ignore[arg-type]
+        if model is AppSetting:
+            return self.settings.get(str(key))
+        raise AssertionError(f"unexpected model: {model}")
+
+    def add(self, row: object) -> None:
+        if isinstance(row, AppSetting):
+            self.settings[row.key] = row
+
+    def commit(self) -> None:
+        return None
+
+    def rollback(self) -> None:
+        return None
 
 
 def test_ingest_uses_dedicated_internal_secret_not_s3_secret() -> None:
@@ -46,6 +70,119 @@ def test_home_scan_due_respects_last_finished_and_interval() -> None:
     }
 
     assert youtube_service.home_scan_is_due(config, now=now) is False
+
+
+def test_download_progress_returns_idle_for_task_without_saved_progress() -> None:
+    task_id = uuid.uuid4()
+    progress = youtube_service.get_download_progress(task_id, db=_ProgressDb(task_id))  # type: ignore[arg-type]
+
+    assert progress == {
+        "task_id": str(task_id),
+        "status": "idle",
+        "active": False,
+        "progress": 0,
+        "downloaded_bytes": 0,
+        "total_bytes": None,
+        "speed_bytes_per_second": None,
+        "eta_seconds": None,
+        "filename": None,
+        "error": None,
+        "updated_at": None,
+    }
+
+
+def test_download_progress_returns_404_for_missing_task() -> None:
+    with pytest.raises(HTTPException) as exc_info:
+        youtube_service.get_download_progress(uuid.uuid4(), db=_ProgressDb())  # type: ignore[arg-type]
+
+    assert exc_info.value.status_code == 404
+
+
+def test_download_progress_reporter_persists_and_publishes_updates() -> None:
+    task_id = uuid.uuid4()
+    db = _ProgressDb(task_id)
+    reporter = youtube_service._YouTubeDownloadProgressReporter(
+        task_id,
+        db=db,  # type: ignore[arg-type]
+        redis_url="redis://localhost:6379/0",
+    )
+
+    with (
+        patch.object(youtube_service.time, "monotonic", side_effect=[0.0, 0.6, 1.2]),
+        patch.object(youtube_service, "publish_ui_event") as publish_event,
+    ):
+        reporter.update("preparing", 0)
+        reporter.hook(
+            {
+                "status": "downloading",
+                "downloaded_bytes": 25,
+                "total_bytes": 100,
+                "speed": 10,
+                "eta": 8,
+                "filename": "/tmp/demo.mp4.part",
+                "info_dict": {"format_id": "video"},
+            }
+        )
+        reporter.update("completed", 100, speed_bytes_per_second=None, eta_seconds=0)
+
+    saved = db.settings[f"{youtube_service.YOUTUBE_DOWNLOAD_PROGRESS_PREFIX}{task_id}"].value_json
+    assert saved["status"] == "completed"
+    assert saved["active"] is False
+    assert saved["progress"] == 100
+    assert saved["downloaded_bytes"] == 25
+    assert saved["total_bytes"] == 100
+    assert saved["filename"] == "demo.mp4.part"
+    assert saved["updated_at"]
+    assert publish_event.call_args.kwargs["topics"] == [f"task:{task_id}"]
+    assert publish_event.call_args.kwargs["name"] == "youtube_download.progress"
+
+
+def test_download_progress_reporter_keeps_last_progress_when_download_fails() -> None:
+    task_id = uuid.uuid4()
+    db = _ProgressDb(task_id)
+    reporter = youtube_service._YouTubeDownloadProgressReporter(task_id, db=db, redis_url="")  # type: ignore[arg-type]
+    with patch.object(youtube_service.time, "monotonic", side_effect=[0.0, 0.6, 1.2]):
+        reporter.update("preparing", 0)
+        reporter.hook(
+            {
+                "status": "downloading",
+                "downloaded_bytes": 50,
+                "total_bytes": 100,
+                "filename": "demo.webm.part",
+            }
+        )
+        reporter.fail(RuntimeError("connection reset"))
+
+    saved = db.settings[f"{youtube_service.YOUTUBE_DOWNLOAD_PROGRESS_PREFIX}{task_id}"].value_json
+    assert saved["status"] == "failed"
+    assert saved["active"] is False
+    assert saved["progress"] == 47
+    assert saved["downloaded_bytes"] == 50
+    assert saved["filename"] == "demo.webm.part"
+    assert saved["error"] == "connection reset"
+
+
+def test_download_progress_reporter_throttles_frequent_download_hooks() -> None:
+    task_id = uuid.uuid4()
+    db = _ProgressDb(task_id)
+    reporter = youtube_service._YouTubeDownloadProgressReporter(
+        task_id,
+        db=db,  # type: ignore[arg-type]
+        redis_url="redis://localhost:6379/0",
+    )
+
+    with (
+        patch.object(youtube_service.time, "monotonic", side_effect=[0.0, 0.1, 0.6]),
+        patch.object(youtube_service, "publish_ui_event") as publish_event,
+    ):
+        reporter.update("preparing", 0)
+        reporter.hook({"status": "downloading", "downloaded_bytes": 10, "total_bytes": 100})
+        reporter.hook({"status": "downloading", "downloaded_bytes": 20, "total_bytes": 100})
+
+    saved = db.settings[f"{youtube_service.YOUTUBE_DOWNLOAD_PROGRESS_PREFIX}{task_id}"].value_json
+    assert saved["progress"] == 19
+    assert saved["downloaded_bytes"] == 20
+    assert publish_event.call_count == 2
 
 
 def test_fetch_meta_queues_uploaded_object_when_db_commit_fails(tmp_path) -> None:

@@ -77,6 +77,7 @@ class AutoYouTubePipelineTests(unittest.TestCase):
         store = _FakeStore()
         profile = {
             "auto_publish": True,
+            "auto_publish_platforms": ["bilibili", "douyin"],
             "publish_typeid_mode": "ai_summary",
             "publish_title_prefix": "【熟肉】",
         }
@@ -104,6 +105,7 @@ class AutoYouTubePipelineTests(unittest.TestCase):
                 "publish": True,
                 "publish_payload": {
                     "account_id": None,
+                    "platforms": ["bilibili", "douyin"],
                     "video_key": None,
                     "cover_key": "cover/key.jpg",
                     "typeid_mode": "ai_summary",
@@ -115,6 +117,20 @@ class AutoYouTubePipelineTests(unittest.TestCase):
         self.assertEqual(store.calls[0]["key"], f"meta/{task_id}/publish_meta.json")
         self.assertEqual(store.calls[0]["content_type"], "application/json")
         self.assertEqual(json.loads(store.calls[0]["data"].decode("utf-8")), final_meta)
+
+    def test_build_after_render_publish_action_requires_an_auto_publish_platform(self) -> None:
+        action = _build_after_render_publish_action(
+            task_id=uuid.uuid4(),
+            cover_key=None,
+            profile={"auto_publish": True, "auto_publish_platforms": []},
+            yt_title="",
+            yt_desc="",
+            webpage_url="",
+            db=object(),  # type: ignore[arg-type]
+            store=_FakeStore(),  # type: ignore[arg-type]
+        )
+
+        self.assertIsNone(action)
 
     def test_deduped_auto_youtube_does_not_enqueue_a_second_pipeline(self) -> None:
         from videoroll.apps.orchestrator_api.services import youtube_service

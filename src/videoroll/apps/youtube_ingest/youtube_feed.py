@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Iterable, Optional
@@ -7,6 +8,9 @@ from typing import Any, Iterable, Optional
 import httpx
 import yt_dlp
 from defusedxml.ElementTree import fromstring
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -54,9 +58,13 @@ def _fetch_feed_ytdlp(
     *,
     proxy: Optional[str] = None,
     limit: Optional[int] = None,
+    channel_tab: str | None = None,
 ) -> list[FeedEntry]:
     if source_type == "channel":
-        url = f"https://www.youtube.com/channel/{source_id}/videos"
+        tab = str(channel_tab or "videos").strip().lower()
+        if tab not in {"videos", "shorts"}:
+            raise ValueError("invalid YouTube channel tab")
+        url = f"https://www.youtube.com/channel/{source_id}/{tab}"
     elif source_type == "playlist":
         url = f"https://www.youtube.com/playlist?list={source_id}"
     else:
@@ -110,6 +118,59 @@ def _fetch_feed_ytdlp(
         title = str(e.get("title") or "").strip()
         out.append(FeedEntry(video_id=vid, title=title, published_at=_parse_ytdlp_entry_datetime(e)))
     return out
+
+
+def _merge_channel_entries(*entry_sets: Iterable[FeedEntry]) -> list[FeedEntry]:
+    """Combine the Videos and Shorts tabs into one newest-first source feed."""
+    merged: list[FeedEntry] = []
+    seen_video_ids: set[str] = set()
+    for entries in entry_sets:
+        for entry in entries:
+            video_id = str(entry.video_id or "").strip()
+            if not video_id or video_id in seen_video_ids:
+                continue
+            seen_video_ids.add(video_id)
+            merged.append(entry)
+    return sorted(merged, key=lambda entry: entry.published_at, reverse=True)
+
+
+def _fetch_channel_uploads_ytdlp(
+    source_id: str,
+    user_agent: str,
+    *,
+    proxy: Optional[str] = None,
+    limit: Optional[int] = None,
+) -> list[FeedEntry]:
+    """Enumerate both public channel upload tabs without letting one hide the other."""
+    feeds: list[list[FeedEntry]] = []
+    failures: list[str] = []
+    for tab in ("videos", "shorts"):
+        try:
+            feeds.append(
+                _fetch_feed_ytdlp(
+                    "channel",
+                    source_id,
+                    user_agent,
+                    proxy=proxy,
+                    limit=limit,
+                    channel_tab=tab,
+                )
+            )
+        except Exception as exc:
+            failures.append(f"{tab}: {type(exc).__name__}")
+    combined = _merge_channel_entries(*feeds)
+    if limit is not None:
+        try:
+            combined = combined[: max(1, int(limit))]
+        except Exception:
+            pass
+    if combined:
+        if failures:
+            logger.warning("YouTube channel %s scan was partial (%s)", source_id, ", ".join(failures))
+        return combined
+    if failures:
+        raise RuntimeError("; ".join(failures))
+    return []
 
 
 def _fetch_feed_rss(
@@ -191,9 +252,35 @@ def fetch_youtube_feed(
     proxy: Optional[str] = None,
     limit: Optional[int] = None,
 ) -> Iterable[FeedEntry]:
-    # YouTube's RSS feed exposes only the most recent 15 uploads. For source scans
-    # that need to enumerate deeper history, prefer yt-dlp's paginated channel/tab
-    # extraction and keep RSS only as a fallback.
+    # YouTube's RSS feed exposes only the most recent 15 uploads and does not
+    # reliably expose the full Shorts tab. Channels therefore use yt-dlp first
+    # and merge their Videos and Shorts tabs; RSS remains an outage fallback.
+    if source_type == "channel":
+        try:
+            entries = _fetch_channel_uploads_ytdlp(
+                source_id,
+                user_agent,
+                proxy=proxy,
+                limit=limit,
+            )
+        except Exception:
+            entries = []
+        if entries:
+            for entry in entries:
+                yield entry
+            return
+
+        try:
+            entries = _fetch_feed_rss(source_type, source_id, user_agent, timeout_s, proxy=proxy)
+        except Exception:
+            entries = []
+        if entries:
+            for entry in entries:
+                yield entry
+            return
+        return
+
+    # Playlists may be represented by RSS, and do not have a separate Shorts tab.
     prefer_rss_first = False
     if limit is not None:
         try:

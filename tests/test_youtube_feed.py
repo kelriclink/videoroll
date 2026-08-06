@@ -79,6 +79,26 @@ class _FailingYdl(_FakeYdl):
         raise RuntimeError("yt-dlp failed")
 
 
+class _ChannelTabsYdl(_FakeYdl):
+    def extract_info(self, url: str, download: bool = False) -> dict[str, object]:
+        assert download is False
+        if url.endswith("/videos"):
+            return {
+                "entries": [
+                    {"id": "regular-new", "title": "Regular newest", "timestamp": 1_700_000_200},
+                    {"id": "shared", "title": "Shared", "timestamp": 1_700_000_100},
+                ]
+            }
+        if url.endswith("/shorts"):
+            return {
+                "entries": [
+                    {"id": "short-new", "title": "Short newest", "timestamp": 1_700_000_300},
+                    {"id": "shared", "title": "Shared duplicate", "timestamp": 1_700_000_100},
+                ]
+            }
+        raise AssertionError(f"unexpected URL: {url}")
+
+
 class YouTubeFeedTests(TestCase):
     def test_fetch_youtube_feed_prefers_ytdlp_when_limit_exceeds_rss_cap(self) -> None:
         with (
@@ -88,8 +108,8 @@ class YouTubeFeedTests(TestCase):
             entries = list(fetch_youtube_feed("channel", "UCexample1234567890", user_agent="UA/1.0", limit=20))
 
         self.assertEqual(len(entries), 20)
-        self.assertEqual(entries[0].video_id, "yt-000")
-        self.assertEqual(entries[-1].video_id, "yt-019")
+        self.assertEqual(entries[0].video_id, "yt-019")
+        self.assertEqual(entries[-1].video_id, "yt-000")
 
     def test_fetch_youtube_feed_falls_back_to_rss_when_ytdlp_fails(self) -> None:
         with (
@@ -101,3 +121,9 @@ class YouTubeFeedTests(TestCase):
         self.assertEqual(len(entries), 15)
         self.assertEqual(entries[0].video_id, "rss-000")
         self.assertEqual(entries[-1].video_id, "rss-014")
+
+    def test_channel_feed_merges_videos_and_shorts_newest_first(self) -> None:
+        with patch("videoroll.apps.youtube_ingest.youtube_feed.yt_dlp.YoutubeDL", _ChannelTabsYdl):
+            entries = list(fetch_youtube_feed("channel", "UCexample1234567890", user_agent="UA/1.0"))
+
+        self.assertEqual([entry.video_id for entry in entries], ["short-new", "regular-new", "shared"])

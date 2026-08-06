@@ -8,7 +8,7 @@ import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal, Optional, Protocol
+from typing import Any, Callable, Literal, Optional, Protocol
 from urllib.parse import urlparse, urlsplit, urlunsplit
 
 import httpx
@@ -610,6 +610,7 @@ def _download_once(
     work_dir: Path,
     diagnostics: list[str] | None = None,
     extractor_args_override: dict[str, Any] | None = None,
+    progress_hook: Callable[[dict[str, Any]], None] | None = None,
 ) -> tuple[Path, dict[str, Any], YouTubeMeta]:
     work_dir.mkdir(parents=True, exist_ok=True)
     outtmpl = str(work_dir / "%(id)s.%(ext)s")
@@ -618,16 +619,17 @@ def _download_once(
     if diagnostics is not None:
         diagnostics.extend(_yt_dlp_diagnostics_header(url=url, settings=settings, outtmpl=outtmpl, extractor_args=extractor_args))
         ydl_logger = _DiagnosticsLogger(diagnostics, proxy=settings.youtube_proxy)
-    with yt_dlp.YoutubeDL(
-        build_ydl_opts(
-            settings,
-            outtmpl=outtmpl,
-            for_download=True,
-            logger=ydl_logger,
-            verbose=diagnostics is not None,
-            extractor_args_override=extractor_args_override,
-        )
-    ) as ydl:
+    options = build_ydl_opts(
+        settings,
+        outtmpl=outtmpl,
+        for_download=True,
+        logger=ydl_logger,
+        verbose=diagnostics is not None,
+        extractor_args_override=extractor_args_override,
+    )
+    if progress_hook is not None:
+        options["progress_hooks"] = [progress_hook]
+    with yt_dlp.YoutubeDL(options) as ydl:
         info_raw = ydl.extract_info(url, download=True)
         info = _pick_video_info(info_raw)
         if not info:
@@ -728,6 +730,7 @@ def download_youtube_video(
     settings: YouTubeDownloaderSettings,
     *,
     work_dir: Path,
+    progress_hook: Callable[[dict[str, Any]], None] | None = None,
 ) -> tuple[Path, dict[str, Any], YouTubeMeta]:
     """
     Downloads the best quality video to work_dir and returns:
@@ -751,6 +754,7 @@ def download_youtube_video(
                 work_dir=work_dir,
                 diagnostics=diagnostics,
                 extractor_args_override=extractor_args_override,
+                progress_hook=progress_hook,
             )
         except DownloadError as e:
             last_error = e

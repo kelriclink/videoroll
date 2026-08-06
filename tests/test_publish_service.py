@@ -5,9 +5,10 @@ from unittest.mock import MagicMock, patch
 from pathlib import Path
 
 import httpx
+from fastapi import HTTPException
 
 from videoroll.apps.orchestrator_api.schemas import PublishAllRequest
-from videoroll.apps.orchestrator_api.services.publishing_service import publish_all
+from videoroll.apps.orchestrator_api.services.publishing_service import build_auto_publish_after_render, publish_all
 from videoroll.apps.publish_service import PublishAllResult, PublishService
 from videoroll.apps.publish_lifecycle import PublishBatchState
 from videoroll.db.models import Account, Platform, TaskStatus
@@ -203,6 +204,63 @@ def test_publish_no_enabled_platforms(mock_get_settings):
     assert result.has_any_ok is False
 
 
+@patch("videoroll.apps.publish_service.get_publish_platform_settings")
+def test_publish_service_limits_targets_to_requested_enabled_platforms(mock_get_settings) -> None:
+    mock_get_settings.return_value = {
+        "bilibili": True,
+        "douyin": True,
+        "xiaohongshu": False,
+        "kuaishou": False,
+    }
+    service = PublishService(MagicMock(), MagicMock(), MagicMock())
+
+    assert service._get_enabled_platforms({"platforms": ["douyin"]}) == ["douyin"]
+
+
+def test_build_auto_publish_after_render_uses_profile_platforms() -> None:
+    task = MagicMock(id=uuid.uuid4())
+    with (
+        patch(
+            "videoroll.apps.orchestrator_api.services.publishing_service.get_auto_profile",
+            return_value={
+                "auto_publish_platforms": ["douyin"],
+                "publish_use_youtube_cover": False,
+                "publish_typeid_mode": "ai_summary",
+            },
+        ),
+        patch(
+            "videoroll.apps.orchestrator_api.services.publishing_service.read_s3_json_object",
+            return_value=None,
+        ),
+        patch(
+            "videoroll.apps.orchestrator_api.services.publishing_service.build_task_publish_meta_draft",
+            return_value={"title": "title"},
+        ),
+        patch("videoroll.apps.orchestrator_api.services.publishing_service.write_s3_json"),
+    ):
+        action = build_auto_publish_after_render(
+            task,
+            db=MagicMock(),
+            s3=MagicMock(),
+            publish_payload_overrides={"platforms": ["bilibili"]},
+        )
+
+    assert action["publish_payload"]["platforms"] == ["douyin"]
+
+
+def test_build_auto_publish_after_render_requires_selected_platforms() -> None:
+    with patch(
+        "videoroll.apps.orchestrator_api.services.publishing_service.get_auto_profile",
+        return_value={"auto_publish_platforms": []},
+    ):
+        try:
+            build_auto_publish_after_render(MagicMock(), db=MagicMock(), s3=MagicMock())
+        except HTTPException as exc:
+            assert exc.status_code == 409
+        else:
+            raise AssertionError("automatic publishing without selected platforms must be rejected")
+
+
 def test_publish_all_social_only_does_not_require_bilibili_meta() -> None:
     task_id = uuid.uuid4()
     task = MagicMock(id=task_id)
@@ -237,6 +295,36 @@ def test_publish_all_social_only_does_not_require_bilibili_meta() -> None:
         )
 
     assert response["results"]["douyin"]["status"] == "accepted"
+
+
+def test_publish_all_limits_automatic_publish_to_requested_enabled_platforms() -> None:
+    task_id = uuid.uuid4()
+    task = MagicMock(id=task_id)
+    task.source_license.value = "own"
+    db = MagicMock()
+    db.get.return_value = task
+    result = PublishAllResult(results={"douyin": {"status": "accepted"}})
+
+    with (
+        patch(
+            "videoroll.apps.orchestrator_api.services.publishing_service.get_publish_platform_settings",
+            return_value={"bilibili": True, "douyin": True, "xiaohongshu": False, "kuaishou": False},
+        ),
+        patch(
+            "videoroll.apps.orchestrator_api.services.publishing_service.prepare_publish_meta",
+            side_effect=AssertionError("unrequested Bilibili must not be prepared"),
+        ),
+        patch.object(PublishService, "publish", return_value=result) as publish,
+    ):
+        publish_all(
+            task_id,
+            PublishAllRequest(platforms=["douyin"], skip_review=True),
+            MagicMock(),
+            db,
+            MagicMock(),
+        )
+
+    assert publish.call_args.kwargs["publish_payload"]["platforms"] == ["douyin"]
 
 
 def test_publish_all_social_only_reviews_stored_platform_meta() -> None:

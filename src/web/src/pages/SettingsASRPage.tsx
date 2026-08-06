@@ -13,6 +13,8 @@ type WhisperSettings = {
   openvino_device: string;
   openvino_num_beams: number;
   openvino_max_new_tokens: number;
+  openvino_vad_enabled: boolean;
+  openvino_vad_threshold: number;
   whisper_cpu_threads: number;
   whisper_num_workers: number;
   whisper_cpu_threads_effective: number;
@@ -28,6 +30,8 @@ type ASRDefaults = {
   openvino_device: string;
   openvino_num_beams: number;
   openvino_max_new_tokens: number;
+  openvino_vad_enabled: boolean;
+  openvino_vad_threshold: number;
   model_download_proxy?: string;
 };
 
@@ -81,6 +85,8 @@ export default function SettingsASRPage() {
   const [openvinoDevice, setOpenvinoDevice] = useState("GPU");
   const [openvinoNumBeams, setOpenvinoNumBeams] = useState("1");
   const [openvinoMaxNewTokens, setOpenvinoMaxNewTokens] = useState("448");
+  const [openvinoVadEnabled, setOpenvinoVadEnabled] = useState(true);
+  const [openvinoVadThreshold, setOpenvinoVadThreshold] = useState("0.5");
   const [modelDownloadProxy, setModelDownloadProxy] = useState("");
   const [proxyTestBusy, setProxyTestBusy] = useState(false);
   const [proxyTestResult, setProxyTestResult] = useState<ModelProxyTestResponse | null>(null);
@@ -102,6 +108,8 @@ export default function SettingsASRPage() {
       if (typeof a.openvino_device === "string" && a.openvino_device.trim()) setOpenvinoDevice(a.openvino_device);
       if (typeof a.openvino_num_beams === "number" && a.openvino_num_beams > 0) setOpenvinoNumBeams(String(a.openvino_num_beams));
       if (typeof a.openvino_max_new_tokens === "number" && a.openvino_max_new_tokens > 0) setOpenvinoMaxNewTokens(String(a.openvino_max_new_tokens));
+      if (typeof a.openvino_vad_enabled === "boolean") setOpenvinoVadEnabled(a.openvino_vad_enabled);
+      if (typeof a.openvino_vad_threshold === "number") setOpenvinoVadThreshold(String(a.openvino_vad_threshold));
       if (typeof a.model_download_proxy === "string") setModelDownloadProxy(a.model_download_proxy);
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : String(e));
@@ -265,6 +273,34 @@ export default function SettingsASRPage() {
             </div>
           </label>
 
+          <div className="rounded border border-sky-100 bg-sky-50/50 p-3 md:col-span-2">
+            <label className="flex cursor-pointer items-center gap-2 text-sm font-medium text-slate-800">
+              <input
+                type="checkbox"
+                checked={openvinoVadEnabled}
+                onChange={(e) => setOpenvinoVadEnabled(e.target.checked)}
+              />
+              OpenVINO 启用人声检测（推荐）
+            </label>
+            <div className="mt-1 text-xs text-slate-600">
+              先用 Silero VAD 找出人声片段；没有人声时直接输出空字幕，不会调用 Whisper，可避免无声视频产生幻觉字幕。
+            </div>
+            <label className="mt-3 block max-w-xs">
+              <div className="mb-1 text-xs text-slate-600">人声检测阈值（0.5 平衡；0.6 更严格）</div>
+              <input
+                type="number"
+                min={0.1}
+                max={0.95}
+                step={0.05}
+                disabled={!openvinoVadEnabled}
+                className="w-full rounded border px-3 py-2 text-sm disabled:bg-slate-100"
+                value={openvinoVadThreshold}
+                onChange={(e) => setOpenvinoVadThreshold(e.target.value)}
+              />
+            </label>
+            <div className="mt-1 text-xs text-slate-500">阈值越高越不容易把背景音误认成人声，但极轻、较远的人声更可能漏掉。</div>
+          </div>
+
           <label className="block">
             <div className="mb-1 text-xs text-slate-600">openvino_device</div>
             <input
@@ -367,6 +403,8 @@ export default function SettingsASRPage() {
               try {
                 const openvinoNumBeamsValue = Math.max(1, Number.parseInt(openvinoNumBeams || "1", 10) || 1);
                 const openvinoMaxNewTokensValue = Math.max(1, Number.parseInt(openvinoMaxNewTokens || "448", 10) || 448);
+                const parsedOpenvinoVadThreshold = Number.parseFloat(openvinoVadThreshold || "0.5");
+                const openvinoVadThresholdValue = Math.min(0.95, Math.max(0.1, Number.isFinite(parsedOpenvinoVadThreshold) ? parsedOpenvinoVadThreshold : 0.5));
                 await fetchJson(`${ORCHESTRATOR_URL}/subtitle/asr/settings`, {
                   method: "PUT",
                   headers: { "Content-Type": "application/json" },
@@ -377,6 +415,8 @@ export default function SettingsASRPage() {
                     openvino_device: openvinoDevice,
                     openvino_num_beams: openvinoNumBeamsValue,
                     openvino_max_new_tokens: openvinoMaxNewTokensValue,
+                    openvino_vad_enabled: openvinoVadEnabled,
+                    openvino_vad_threshold: openvinoVadThresholdValue,
                     model_download_proxy: modelDownloadProxy,
                   }),
                 });

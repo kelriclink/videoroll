@@ -45,6 +45,12 @@ class OrchestratorSettings(CommonSettings):
     # Shared runtime settings (used by orchestrator actions).
     work_dir: str = Field("/tmp/videoroll", alias="WORK_DIR")
     ffmpeg_path: str = Field("ffmpeg", alias="FFMPEG_PATH")
+    # The live controller calls Uvicorn directly over loopback, not the external
+    # Nginx /api proxy. Uvicorn's root path owns that public prefix.
+    live_internal_stream_base_url: str = Field(
+        "http://127.0.0.1:8000",
+        alias="LIVE_INTERNAL_STREAM_BASE_URL",
+    )
 
     # YouTube downloader (yt-dlp) settings.
     youtube_user_agent: str = Field(DEFAULT_YOUTUBE_USER_AGENT, alias="YOUTUBE_USER_AGENT")
@@ -64,6 +70,8 @@ class SubtitleServiceSettings(CommonSettings):
     openvino_device: str = Field("GPU", alias="SUBTITLE_OPENVINO_DEVICE")
     openvino_num_beams: int = Field(1, alias="SUBTITLE_OPENVINO_NUM_BEAMS")
     openvino_max_new_tokens: int = Field(448, alias="SUBTITLE_OPENVINO_MAX_NEW_TOKENS")
+    openvino_vad_enabled: bool = Field(True, alias="SUBTITLE_OPENVINO_VAD_ENABLED")
+    openvino_vad_threshold: float = Field(0.5, alias="SUBTITLE_OPENVINO_VAD_THRESHOLD")
     # faster-whisper runtime parallelism (CPU only):
     # - cpu_threads=0 means "auto" (use available CPUs).
     # - num_workers defaults to 1 to avoid memory spikes.

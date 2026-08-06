@@ -5,6 +5,14 @@ import { fetchJson } from "../lib/http";
 import { ORCHESTRATOR_URL } from "../lib/urls";
 
 type YouTubeSubtitleMode = "off" | "target" | "auto_source";
+type PublishPlatform = "bilibili" | "douyin" | "xiaohongshu" | "kuaishou";
+
+const PUBLISH_PLATFORMS: Array<{ id: PublishPlatform; label: string }> = [
+  { id: "bilibili", label: "哔哩哔哩" },
+  { id: "douyin", label: "抖音" },
+  { id: "xiaohongshu", label: "小红书" },
+  { id: "kuaishou", label: "快手" },
+];
 
 type AutoProfile = {
   formats: string[];
@@ -32,6 +40,7 @@ type AutoProfile = {
   bilingual: boolean;
 
   auto_publish: boolean;
+  auto_publish_platforms: PublishPlatform[];
   publish_typeid_mode: string;
   publish_title_prefix: string;
   publish_translate_title: boolean;
@@ -91,7 +100,8 @@ export default function SettingsAutoPage() {
   const [translateEnableSummary, setTranslateEnableSummary] = useState(true);
 
   const [autoPublish, setAutoPublish] = useState(true);
-  const [enabledPlatforms, setEnabledPlatforms] = useState<string[]>([]);
+  const [enabledPlatforms, setEnabledPlatforms] = useState<PublishPlatform[]>([]);
+  const [autoPublishPlatforms, setAutoPublishPlatforms] = useState<PublishPlatform[]>([]);
   const [publishTypeidMode, setPublishTypeidMode] = useState("ai_summary");
   const [publishTranslateTitle, setPublishTranslateTitle] = useState(true);
   const [publishTitlePrefix, setPublishTitlePrefix] = useState("【熟肉】");
@@ -111,7 +121,9 @@ export default function SettingsAutoPage() {
       if (models) setWhisperModels(models);
       if (translateSettings) setOpenaiKeySet(Boolean(translateSettings.openai_api_key_set));
       if (platformSettingsResp?.platforms) {
-        setEnabledPlatforms(Object.entries(platformSettingsResp.platforms).filter(([, v]) => v).map(([k]) => k));
+        setEnabledPlatforms(
+          PUBLISH_PLATFORMS.filter(({ id }) => platformSettingsResp.platforms[id] === true).map(({ id }) => id),
+        );
       }
 
       const f = Array.isArray(profile.formats) ? profile.formats : [];
@@ -139,6 +151,7 @@ export default function SettingsAutoPage() {
       setTranslateEnableSummary(Boolean(profile.translate_enable_summary));
 
       setAutoPublish(Boolean(profile.auto_publish));
+      setAutoPublishPlatforms(Array.isArray(profile.auto_publish_platforms) ? profile.auto_publish_platforms : []);
       setPublishTypeidMode((profile.publish_typeid_mode || "ai_summary").toLowerCase());
       setPublishTranslateTitle(Boolean(profile.publish_translate_title));
       setPublishTitlePrefix((profile.publish_title_prefix ?? "【熟肉】").trim() || "【熟肉】");
@@ -466,16 +479,6 @@ export default function SettingsAutoPage() {
 
         <div className="mt-4 rounded border p-3">
           <div className="text-xs font-semibold text-slate-700">投稿（多平台）</div>
-          {enabledPlatforms.length > 0 && (
-            <div className="mt-1 flex flex-wrap gap-1">
-              {enabledPlatforms.map((p) => (
-                <span key={p} className="inline-flex items-center rounded-full bg-green-100 px-2 py-0.5 text-xs text-green-800">
-                  {p === "bilibili" ? "哔哩哔哩" : p === "douyin" ? "抖音" : p === "xiaohongshu" ? "小红书" : p === "kuaishou" ? "快手" : p}
-                </span>
-              ))}
-              <span className="text-xs text-slate-500">自动模式将投稿到以上平台</span>
-            </div>
-          )}
           {enabledPlatforms.length === 0 && (
             <div className="mt-1 text-xs text-amber-600">未启用任何投稿平台，请先到投稿设置中勾选</div>
           )}
@@ -484,6 +487,37 @@ export default function SettingsAutoPage() {
               <input type="checkbox" checked={autoPublish} onChange={(e) => setAutoPublish(e.target.checked)} />
               自动投稿
             </label>
+            <div className="md:col-span-2">
+              <div className="mb-2 text-xs text-slate-600">自动投稿通道</div>
+              <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
+                {PUBLISH_PLATFORMS.map(({ id, label }) => {
+                  const globallyEnabled = enabledPlatforms.includes(id);
+                  return (
+                    <label key={id} className={`flex items-center gap-2 text-sm ${globallyEnabled ? "" : "text-slate-400"}`}>
+                      <input
+                        type="checkbox"
+                        checked={autoPublishPlatforms.includes(id)}
+                        disabled={!globallyEnabled}
+                        onChange={(event) => {
+                          setAutoPublishPlatforms((current) =>
+                            event.target.checked
+                              ? [...current.filter((platform) => platform !== id), id]
+                              : current.filter((platform) => platform !== id),
+                          );
+                        }}
+                      />
+                      {label}{globallyEnabled ? "" : "（未启用）"}
+                    </label>
+                  );
+                })}
+              </div>
+              <div className="mt-2 text-xs text-slate-500">
+                只有此处勾选且在 <Link className="underline" to="/settings/publish">投稿设置</Link> 中启用的通道，才会接收自动模式投稿。
+              </div>
+              {autoPublish && autoPublishPlatforms.filter((platform) => enabledPlatforms.includes(platform)).length === 0 ? (
+                <div className="mt-1 text-xs text-amber-600">当前未选择可用通道，自动模式将跳过投稿。</div>
+              ) : null}
+            </div>
             <label className="flex items-center gap-2 text-sm">
               <input
                 type="checkbox"
@@ -554,6 +588,7 @@ export default function SettingsAutoPage() {
               setError(null);
               try {
                 if (!formatsOut.length) throw new Error("至少选择一种输出格式");
+                const availableAutoPublishPlatforms = autoPublishPlatforms.filter((platform) => enabledPlatforms.includes(platform));
                 const crfRaw = videoCrfText.trim();
                 let video_crf: number | null = null;
                 if (crfRaw) {
@@ -604,6 +639,7 @@ export default function SettingsAutoPage() {
                     translate_enable_summary: translateEnableSummary,
                     bilingual,
                     auto_publish: autoPublish,
+                    auto_publish_platforms: availableAutoPublishPlatforms,
                     publish_typeid_mode: publishTypeidMode,
                     publish_title_prefix: publishTitlePrefix,
                     publish_translate_title: publishTranslateTitle,
@@ -653,6 +689,7 @@ export default function SettingsAutoPage() {
               setTranslateStyle("口语自然");
               setTranslateEnableSummary(true);
               setAutoPublish(true);
+              setAutoPublishPlatforms([]);
               setPublishTypeidMode("ai_summary");
               setPublishTranslateTitle(true);
               setPublishTitlePrefix("【熟肉】");

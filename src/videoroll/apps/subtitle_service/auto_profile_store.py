@@ -30,6 +30,7 @@ _ALLOWED_H264_PRESETS = {
 _AV1_PRESET_MIN = 0
 _AV1_PRESET_MAX = 13
 _ALLOWED_PUBLISH_TYPEID_MODES = {"ai_summary", "bilibili_predict", "meta"}
+_ALLOWED_PUBLISH_PLATFORMS = {"bilibili", "douyin", "xiaohongshu", "kuaishou"}
 _VIDEO_CRF_MIN = 0
 _VIDEO_CRF_MAX = 63
 _FONT_SCALE_PERCENT_MIN = 25
@@ -63,6 +64,9 @@ def _default_profile() -> dict[str, Any]:
         "translate_enable_summary": True,
         "bilingual": False,
         "auto_publish": True,
+        # Auto publishing is opt-in per platform. Enabling a platform in the
+        # publish settings only makes it available for manual/automatic use.
+        "auto_publish_platforms": [],
         "publish_typeid_mode": "ai_summary",
         "publish_title_prefix": "【熟肉】",
         "publish_translate_title": True,
@@ -157,6 +161,17 @@ def _normalize_font_scale_percent(val: Any, *, fallback: int) -> int:
     return n
 
 
+def _normalize_publish_platforms(val: Any) -> list[str]:
+    if not isinstance(val, list):
+        return []
+    out: list[str] = []
+    for item in val:
+        platform = str(item or "").strip().lower()
+        if platform in _ALLOWED_PUBLISH_PLATFORMS and platform not in out:
+            out.append(platform)
+    return out
+
+
 def get_auto_profile(db: Session) -> dict[str, Any]:
     row = db.get(AppSetting, AUTO_PROFILE_KEY)
     stored = dict(_as_dict(row.value_json)) if row else {}
@@ -207,6 +222,7 @@ def get_auto_profile(db: Session) -> dict[str, Any]:
     merged["bilingual"] = bool(merged.get("bilingual"))
 
     merged["auto_publish"] = bool(merged.get("auto_publish"))
+    merged["auto_publish_platforms"] = _normalize_publish_platforms(merged.get("auto_publish_platforms"))
     publish_typeid_mode = str(merged.get("publish_typeid_mode") or baseline["publish_typeid_mode"]).strip() or baseline["publish_typeid_mode"]
     merged["publish_typeid_mode"] = publish_typeid_mode if publish_typeid_mode in _ALLOWED_PUBLISH_TYPEID_MODES else baseline["publish_typeid_mode"]
     merged["publish_title_prefix"] = str(merged.get("publish_title_prefix") or baseline["publish_title_prefix"]).strip() or baseline[
@@ -224,6 +240,8 @@ def update_auto_profile(db: Session, update: dict[str, Any]) -> dict[str, Any]:
 
     if "formats" in update and update["formats"] is not None:
         stored["formats"] = update["formats"]
+    if "auto_publish_platforms" in update and update["auto_publish_platforms"] is not None:
+        stored["auto_publish_platforms"] = update["auto_publish_platforms"]
     for k in [
         "burn_in",
         "soft_sub",

@@ -147,16 +147,20 @@ services:
       SOCIAL_PUBLISHER_URL: http://social-publisher-api:8010
       WORK_DIR: ${WORK_DIR:-/work/videoroll}
       FFMPEG_PATH: ${FFMPEG_PATH:-ffmpeg}
+      LIVE_INTERNAL_STREAM_BASE_URL: ${LIVE_INTERNAL_STREAM_BASE_URL:-http://127.0.0.1:8000}
+      INTEL_GPU_RENDER_DEVICE: ${INTEL_GPU_RENDER_DEVICE:-/dev/dri/renderD128}
       YOUTUBE_USER_AGENT: "${YOUTUBE_USER_AGENT:-Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36}"
       YOUTUBE_COOKIE_FILE: ${YOUTUBE_COOKIE_FILE:-}
       YOUTUBE_PROXY: ${YOUTUBE_PROXY:-}
       YOUTUBE_EXTRACTOR_ARGS_JSON: ${YOUTUBE_EXTRACTOR_ARGS_JSON:-}
       STORAGE_CLEANUP_INTERVAL_SECONDS: ${STORAGE_CLEANUP_INTERVAL_SECONDS:-3600}
-      PUBLISHING_TASK_TIMEOUT_HOURS: ${PUBLISHING_TASK_TIMEOUT_HOURS:-48}
-      FAILED_TASK_RESOURCE_RETENTION_HOURS: ${FAILED_TASK_RESOURCE_RETENTION_HOURS:-48}
     volumes:
       - ./data/secrets:/secrets
       - ./data/work:/work
+    devices:
+      - "/dev/dri:/dev/dri"
+    group_add:
+      - "${INTEL_GPU_RENDER_GID:-992}"
     depends_on:
       redis:
         condition: service_healthy
