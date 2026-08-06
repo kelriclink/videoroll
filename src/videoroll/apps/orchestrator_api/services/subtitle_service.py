@@ -56,6 +56,7 @@ _BROWSER_PROXY_PATHS: dict[str, set[str]] = {
     },
     "POST": {
         "subtitle/models/proxy/test",
+        "subtitle/asr/external/test",
         "subtitle/models/download",
         "subtitle/models/upload",
         "subtitle/embedding/models/list",

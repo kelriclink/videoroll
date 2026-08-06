@@ -77,6 +77,9 @@ class SubtitleServiceSettings(CommonSettings):
     # - num_workers defaults to 1 to avoid memory spikes.
     whisper_cpu_threads: int = Field(0, alias="SUBTITLE_WHISPER_CPU_THREADS")
     whisper_num_workers: int = Field(1, alias="SUBTITLE_WHISPER_NUM_WORKERS")
+    external_whisper_base_url: str = Field("", alias="SUBTITLE_EXTERNAL_WHISPER_BASE_URL")
+    external_whisper_api_key: str | None = Field(None, alias="SUBTITLE_EXTERNAL_WHISPER_API_KEY")
+    external_whisper_model: str = Field("whisper-1", alias="SUBTITLE_EXTERNAL_WHISPER_MODEL")
     ffmpeg_path: str = Field("ffmpeg", alias="FFMPEG_PATH")
     work_dir: str = Field("/tmp/videoroll", alias="WORK_DIR")
     intel_gpu_render_device: str = Field("/dev/dri/renderD128", alias="INTEL_GPU_RENDER_DEVICE")

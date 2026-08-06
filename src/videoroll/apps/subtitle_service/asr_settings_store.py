@@ -6,12 +6,16 @@ from sqlalchemy.orm import Session
 
 from videoroll.config import SubtitleServiceSettings
 from videoroll.db.models import AppSetting
+from videoroll.utils.fernet import decrypt_str, encrypt_str
+from videoroll.utils.openai_compat import normalize_openai_base_url
 
 
 ASR_SETTINGS_KEY = "subtitle.asr"
 
-_ALLOWED_ENGINES = {"mock", "faster-whisper", "openvino"}
+_ALLOWED_ENGINES = {"mock", "faster-whisper", "openvino", "external-whisper"}
 _MAX_PROXY_LEN = 2048
+_MAX_EXTERNAL_BASE_URL_LEN = 2048
+_MAX_EXTERNAL_MODEL_LEN = 256
 _MIN_OPENVINO_VAD_THRESHOLD = 0.1
 _MAX_OPENVINO_VAD_THRESHOLD = 0.95
 
@@ -31,6 +35,16 @@ def _as_dict(v: Any) -> dict[str, Any]:
     return v if isinstance(v, dict) else {}
 
 
+def _decrypt_api_key(value: Any) -> str:
+    token = str(value or "").strip()
+    if not token:
+        return ""
+    try:
+        return decrypt_str(token).strip()
+    except Exception:
+        return ""
+
+
 def get_asr_settings(db: Session, defaults: SubtitleServiceSettings) -> dict[str, Any]:
     row = db.get(AppSetting, ASR_SETTINGS_KEY)
     stored = dict(_as_dict(row.value_json)) if row else {}
@@ -43,6 +57,8 @@ def get_asr_settings(db: Session, defaults: SubtitleServiceSettings) -> dict[str
     engine_default_model = defaults.whisper_model
     if engine == "openvino":
         engine_default_model = str(defaults.openvino_model or "").strip()
+    elif engine == "external-whisper":
+        engine_default_model = str(defaults.external_whisper_model or "").strip()
     model = str(stored.get("default_model") or engine_default_model).strip() or engine_default_model
     openvino_device = str(stored.get("openvino_device") or defaults.openvino_device).strip() or defaults.openvino_device
     openvino_num_beams = int(stored.get("openvino_num_beams") or defaults.openvino_num_beams or 1)
@@ -68,6 +84,13 @@ def get_asr_settings(db: Session, defaults: SubtitleServiceSettings) -> dict[str
     if len(proxy) > _MAX_PROXY_LEN:
         proxy = proxy[:_MAX_PROXY_LEN]
 
+    external = _as_dict(stored.get("external_whisper"))
+    external_base_url = str(external.get("base_url") or defaults.external_whisper_base_url or "").strip()
+    if external_base_url:
+        external_base_url = normalize_openai_base_url(external_base_url)[:_MAX_EXTERNAL_BASE_URL_LEN]
+    external_model = str(external.get("model") or defaults.external_whisper_model or "whisper-1").strip()[:_MAX_EXTERNAL_MODEL_LEN]
+    external_api_key = _decrypt_api_key(external.get("api_key_enc")) or str(defaults.external_whisper_api_key or "").strip()
+
     return {
         "default_engine": engine,
         "default_language": language,
@@ -78,12 +101,17 @@ def get_asr_settings(db: Session, defaults: SubtitleServiceSettings) -> dict[str
         "openvino_vad_enabled": openvino_vad_enabled,
         "openvino_vad_threshold": openvino_vad_threshold,
         "model_download_proxy": proxy,
+        "external_whisper_base_url": external_base_url,
+        "external_whisper_model": external_model,
+        "external_whisper_api_key": external_api_key,
+        "external_whisper_api_key_set": bool(external_api_key),
     }
 
 
 def update_asr_settings(db: Session, defaults: SubtitleServiceSettings, update: dict[str, Any]) -> dict[str, Any]:
     row = _get_row(db)
     stored = dict(_as_dict(row.value_json))
+    external = dict(_as_dict(stored.get("external_whisper")))
 
     if "default_engine" in update and update["default_engine"] is not None:
         val = str(update["default_engine"]).strip()
@@ -146,6 +174,37 @@ def update_asr_settings(db: Session, defaults: SubtitleServiceSettings, update: 
             stored.pop("model_download_proxy", None)
         else:
             stored["model_download_proxy"] = val
+
+    if "external_whisper_base_url" in update and update["external_whisper_base_url"] is not None:
+        val = str(update["external_whisper_base_url"] or "").strip()
+        if not val:
+            external.pop("base_url", None)
+        else:
+            normalized = normalize_openai_base_url(val)
+            if len(normalized) > _MAX_EXTERNAL_BASE_URL_LEN:
+                raise ValueError(f"external_whisper_base_url is too long (max {_MAX_EXTERNAL_BASE_URL_LEN} chars)")
+            external["base_url"] = normalized
+
+    if "external_whisper_model" in update and update["external_whisper_model"] is not None:
+        val = str(update["external_whisper_model"] or "").strip()
+        if len(val) > _MAX_EXTERNAL_MODEL_LEN:
+            raise ValueError(f"external_whisper_model is too long (max {_MAX_EXTERNAL_MODEL_LEN} chars)")
+        if not val:
+            external.pop("model", None)
+        else:
+            external["model"] = val
+
+    if "external_whisper_api_key" in update and update["external_whisper_api_key"] is not None:
+        val = str(update["external_whisper_api_key"] or "").strip()
+        if val:
+            external["api_key_enc"] = encrypt_str(val)
+        else:
+            external.pop("api_key_enc", None)
+
+    if external:
+        stored["external_whisper"] = external
+    else:
+        stored.pop("external_whisper", None)
 
     row.value_json = stored
     db.add(row)

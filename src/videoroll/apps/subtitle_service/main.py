@@ -7,6 +7,7 @@ import shutil
 import tempfile
 import time
 import uuid
+import wave
 import zipfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
@@ -29,6 +30,8 @@ from videoroll.storage.s3 import S3Store
 from videoroll.apps.subtitle_service.schemas import (
     ASRDefaultsRead,
     ASRDefaultsUpdate,
+    ExternalWhisperTestRequest,
+    ExternalWhisperTestResponse,
     IntelHardwareProbeRead,
     SubtitleJobCreate,
     SubtitleJobRead,
@@ -112,6 +115,7 @@ from videoroll.apps.subtitle_service.dictionaries import (
 from videoroll.apps.subtitle_service.translate_settings_store import get_translate_settings, update_translate_settings
 from videoroll.apps.subtitle_service.worker_concurrency import sync_subtitle_worker_concurrency_for_task_queue_settings
 from videoroll.apps.subtitle_service.worker import TASK_QUEUE_LOCK_OWNER, celery_app
+from videoroll.apps.subtitle_service.processing import transcribe_external_whisper
 from videoroll.utils.auto_youtube import parse_auto_youtube_created_by
 from videoroll.utils.cpu import process_cpu_count
 from videoroll.utils.httpx_proxy import HTTPX_PROXY_KWARG_UNSUPPORTED, format_httpx_proxy_error
@@ -348,6 +352,9 @@ def get_subtitle_settings_view(settings: SubtitleServiceSettings = Depends(get_s
         openvino_max_new_tokens=int(settings.openvino_max_new_tokens or 448),
         openvino_vad_enabled=bool(settings.openvino_vad_enabled),
         openvino_vad_threshold=float(settings.openvino_vad_threshold or 0.5),
+        external_whisper_base_url=str(settings.external_whisper_base_url or ""),
+        external_whisper_model=str(settings.external_whisper_model or ""),
+        external_whisper_api_key_set=bool(settings.external_whisper_api_key),
         whisper_cpu_threads=cpu_threads,
         whisper_num_workers=num_workers,
         whisper_cpu_threads_effective=int(effective_threads),
@@ -395,6 +402,47 @@ def put_asr_settings_view(
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     return ASRDefaultsRead(**cfg)
+
+
+@app.post("/subtitle/asr/external/test", response_model=ExternalWhisperTestResponse)
+def test_external_whisper(
+    payload: ExternalWhisperTestRequest,
+) -> ExternalWhisperTestResponse:
+    """Send a short generated WAV to an external Whisper API to verify settings."""
+    started = time.perf_counter()
+    temp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(prefix="external-whisper-test-", suffix=".wav", delete=False) as handle:
+            temp_path = Path(handle.name)
+        with wave.open(str(temp_path), "wb") as wav_file:
+            wav_file.setnchannels(1)
+            wav_file.setsampwidth(2)
+            wav_file.setframerate(16000)
+            wav_file.writeframes(b"\x00\x00" * 16000)
+        segments = transcribe_external_whisper(
+            temp_path,
+            base_url=payload.base_url,
+            api_key=payload.api_key,
+            model_name=payload.model,
+            timeout_seconds=30.0,
+        )
+        return ExternalWhisperTestResponse(
+            ok=True,
+            elapsed_ms=int((time.perf_counter() - started) * 1000),
+            text=" ".join(segment.text for segment in segments),
+        )
+    except Exception as exc:
+        return ExternalWhisperTestResponse(
+            ok=False,
+            elapsed_ms=int((time.perf_counter() - started) * 1000),
+            error=str(exc),
+        )
+    finally:
+        if temp_path is not None:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except Exception:
+                logger.debug("failed to remove external Whisper test audio", exc_info=True)
 
 
 @app.get("/subtitle/auto/profile", response_model=SubtitleAutoProfileRead)

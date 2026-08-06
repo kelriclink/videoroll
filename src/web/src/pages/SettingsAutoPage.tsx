@@ -453,6 +453,7 @@ export default function SettingsAutoPage() {
                   <option value="mock">mock</option>
                   <option value="faster-whisper">faster-whisper</option>
                   <option value="openvino">openvino（方案2 / Intel Arc）</option>
+                  <option value="external-whisper">external-whisper（外部 API）</option>
                 </select>
               </label>
               <label className="block">
@@ -470,7 +471,7 @@ export default function SettingsAutoPage() {
                   ))}
                 </select>
                 <div className="mt-2 text-xs text-slate-500">
-                  提示：留空表示使用 Settings · ASR 中的默认模型。若选择 `openvino`，这里应指向已导出的 OpenVINO Whisper 模型目录。
+                  提示：留空表示使用 Settings · ASR 中的默认模型；选择 `openvino` 或 `external-whisper` 时使用对应引擎配置。
                 </div>
               </label>
             </div>

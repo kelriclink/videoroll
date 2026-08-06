@@ -91,6 +91,9 @@ class WhisperSettingsRead(BaseModel):
     whisper_num_workers_effective: int = 1
     faster_whisper_installed: bool = False
     openvino_installed: bool = False
+    external_whisper_base_url: str = ""
+    external_whisper_model: str = ""
+    external_whisper_api_key_set: bool = False
 
 
 class IntelHardwareProbeRead(BaseModel):
@@ -114,6 +117,9 @@ class ASRDefaultsRead(BaseModel):
     openvino_vad_enabled: bool = True
     openvino_vad_threshold: float = 0.5
     model_download_proxy: str = ""
+    external_whisper_base_url: str = ""
+    external_whisper_model: str = "whisper-1"
+    external_whisper_api_key_set: bool = False
 
 
 class ASRDefaultsUpdate(BaseModel):
@@ -126,6 +132,23 @@ class ASRDefaultsUpdate(BaseModel):
     openvino_vad_enabled: Optional[bool] = None
     openvino_vad_threshold: Optional[float] = Field(default=None, ge=0.1, le=0.95)
     model_download_proxy: Optional[str] = None
+    external_whisper_base_url: Optional[str] = Field(default=None, max_length=2048)
+    external_whisper_model: Optional[str] = Field(default=None, max_length=256)
+    external_whisper_api_key: Optional[str] = Field(default=None, max_length=4096)
+
+
+class ExternalWhisperTestRequest(BaseModel):
+    base_url: str = Field(min_length=1, max_length=2048)
+    api_key: str = Field(min_length=1, max_length=4096)
+    model: str = Field(min_length=1, max_length=256)
+
+
+class ExternalWhisperTestResponse(BaseModel):
+    ok: bool
+    status_code: Optional[int] = None
+    elapsed_ms: int = 0
+    text: str = ""
+    error: Optional[str] = None
 
 
 class SubtitleAutoProfileRead(BaseModel):

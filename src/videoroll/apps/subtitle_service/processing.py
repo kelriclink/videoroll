@@ -20,6 +20,7 @@ import httpx
 
 from videoroll.ai.client import OpenAIChatConfig, create_openai_http_client, request_openai_json_object
 from videoroll.ai.service import AIService
+from videoroll.utils.openai_compat import build_openai_audio_transcriptions_url
 
 logger = logging.getLogger(__name__)
 
@@ -321,6 +322,77 @@ def transcribe_faster_whisper(
             audio_path,
         )
     return out
+
+
+def transcribe_external_whisper(
+    audio_path: Path,
+    *,
+    base_url: str,
+    api_key: str,
+    model_name: str,
+    language: str = "auto",
+    timeout_seconds: float = 180.0,
+) -> list[Segment]:
+    """Transcribe audio through an OpenAI-compatible Whisper API."""
+    key = str(api_key or "").strip()
+    model = str(model_name or "").strip()
+    if not key:
+        raise RuntimeError("external Whisper API key is not set")
+    if not model:
+        raise RuntimeError("external Whisper model is not set")
+    url = build_openai_audio_transcriptions_url(base_url)
+    data: dict[str, str] = {"model": model, "response_format": "verbose_json"}
+    lang = str(language or "").strip()
+    if lang and lang.lower() != "auto":
+        data["language"] = lang
+    timeout = max(1.0, min(600.0, float(timeout_seconds)))
+    headers = {"Authorization": f"Bearer {key}"}
+    try:
+        with audio_path.open("rb") as audio_file:
+            response = httpx.post(
+                url,
+                headers=headers,
+                data=data,
+                files={"file": (audio_path.name, audio_file, "audio/wav")},
+                timeout=timeout,
+            )
+        response.raise_for_status()
+        payload = response.json()
+    except httpx.HTTPStatusError as exc:
+        detail = (exc.response.text or "").strip().replace("\n", " ")[:500]
+        raise RuntimeError(f"external Whisper API failed (status={exc.response.status_code}): {detail}") from exc
+    except httpx.HTTPError as exc:
+        raise RuntimeError(f"external Whisper API request failed: {exc}") from exc
+    except ValueError as exc:
+        raise RuntimeError("external Whisper API returned invalid JSON") from exc
+
+    if not isinstance(payload, dict):
+        raise RuntimeError("external Whisper API response must be an object")
+    segments_raw = payload.get("segments")
+    out: list[Segment] = []
+    if isinstance(segments_raw, list):
+        for item in segments_raw:
+            if not isinstance(item, dict):
+                continue
+            text = _normalize_asr_text(str(item.get("text") or ""))
+            if not text:
+                continue
+            try:
+                start = max(0.0, float(item.get("start") or 0.0))
+                end = max(start, float(item.get("end") or start))
+            except (TypeError, ValueError):
+                start, end = 0.0, 0.0
+            out.append(Segment(start=start, end=end, text=text))
+    if out:
+        return out
+    text = _normalize_asr_text(str(payload.get("text") or ""))
+    if not text:
+        return []
+    try:
+        _audio, duration = _read_wav_as_float_mono_16k(audio_path)
+    except Exception:
+        duration = 0.0
+    return [Segment(start=0.0, end=max(0.0, float(duration)), text=text)]
 
 
 @dataclass(frozen=True)

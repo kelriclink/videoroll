@@ -21,6 +21,9 @@ type WhisperSettings = {
   whisper_num_workers_effective: number;
   faster_whisper_installed: boolean;
   openvino_installed: boolean;
+  external_whisper_base_url: string;
+  external_whisper_model: string;
+  external_whisper_api_key_set: boolean;
 };
 
 type ASRDefaults = {
@@ -33,6 +36,17 @@ type ASRDefaults = {
   openvino_vad_enabled: boolean;
   openvino_vad_threshold: number;
   model_download_proxy?: string;
+  external_whisper_base_url: string;
+  external_whisper_model: string;
+  external_whisper_api_key_set: boolean;
+};
+
+type ExternalWhisperTestResponse = {
+  ok: boolean;
+  status_code?: number | null;
+  elapsed_ms: number;
+  text: string;
+  error?: string | null;
 };
 
 type WhisperModelInfo = {
@@ -90,6 +104,11 @@ export default function SettingsASRPage() {
   const [modelDownloadProxy, setModelDownloadProxy] = useState("");
   const [proxyTestBusy, setProxyTestBusy] = useState(false);
   const [proxyTestResult, setProxyTestResult] = useState<ModelProxyTestResponse | null>(null);
+  const [externalWhisperBaseUrl, setExternalWhisperBaseUrl] = useState("");
+  const [externalWhisperModel, setExternalWhisperModel] = useState("whisper-1");
+  const [externalWhisperApiKey, setExternalWhisperApiKey] = useState("");
+  const [externalWhisperTestBusy, setExternalWhisperTestBusy] = useState(false);
+  const [externalWhisperTestResult, setExternalWhisperTestResult] = useState<ExternalWhisperTestResponse | null>(null);
 
   async function refresh() {
     setError(null);
@@ -111,6 +130,8 @@ export default function SettingsASRPage() {
       if (typeof a.openvino_vad_enabled === "boolean") setOpenvinoVadEnabled(a.openvino_vad_enabled);
       if (typeof a.openvino_vad_threshold === "number") setOpenvinoVadThreshold(String(a.openvino_vad_threshold));
       if (typeof a.model_download_proxy === "string") setModelDownloadProxy(a.model_download_proxy);
+      if (typeof a.external_whisper_base_url === "string") setExternalWhisperBaseUrl(a.external_whisper_base_url);
+      if (typeof a.external_whisper_model === "string" && a.external_whisper_model.trim()) setExternalWhisperModel(a.external_whisper_model);
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : String(e));
     }
@@ -220,6 +241,7 @@ export default function SettingsASRPage() {
             <select className="w-full rounded border px-3 py-2 text-sm" value={defaultEngine} onChange={(e) => setDefaultEngine(e.target.value)}>
               <option value="faster-whisper">faster-whisper</option>
               <option value="openvino">openvino（方案2 / Intel Arc）</option>
+              <option value="external-whisper">external-whisper（外部 API）</option>
               <option value="mock">mock</option>
             </select>
           </label>
@@ -269,9 +291,63 @@ export default function SettingsASRPage() {
               </div>
             ) : null}
             <div className="mt-2 text-xs text-slate-500">
-              `faster-whisper` 可用 size/repo id/本地路径；`openvino` 需要填写一个已导出的 OpenVINO Whisper 模型目录路径。
+              `faster-whisper` 可用 size/repo id/本地路径；`openvino` 需要填写一个已导出的 OpenVINO Whisper 模型目录路径；外部 API 模式使用下方配置的模型。
             </div>
           </label>
+
+          {defaultEngine === "external-whisper" ? (
+            <div className="rounded border border-amber-100 bg-amber-50/60 p-3 md:col-span-2">
+              <div className="text-sm font-medium text-slate-800">外部 Whisper API（OpenAI 兼容接口）</div>
+              <div className="mt-1 text-xs text-slate-600">请求地址应为服务的 base URL，例如 `https://api.openai.com/v1`；后端会调用 `/audio/transcriptions`。</div>
+              <div className="mt-3 grid gap-3 md:grid-cols-2">
+                <label className="block md:col-span-2">
+                  <div className="mb-1 text-xs text-slate-600">external_whisper_base_url</div>
+                  <input className="w-full rounded border px-3 py-2 text-sm" value={externalWhisperBaseUrl} onChange={(e) => setExternalWhisperBaseUrl(e.target.value)} placeholder="https://api.openai.com/v1" />
+                </label>
+                <label className="block md:col-span-2">
+                  <div className="mb-1 text-xs text-slate-600">external_whisper_api_key（仅保存，不回显）</div>
+                  <input type="password" className="w-full rounded border px-3 py-2 text-sm" value={externalWhisperApiKey} onChange={(e) => setExternalWhisperApiKey(e.target.value)} placeholder={asrDefaults?.external_whisper_api_key_set ? "已设置（留空则不修改）" : "API key"} />
+                </label>
+                <label className="block">
+                  <div className="mb-1 text-xs text-slate-600">external_whisper_model</div>
+                  <input className="w-full rounded border px-3 py-2 text-sm" value={externalWhisperModel} onChange={(e) => setExternalWhisperModel(e.target.value)} placeholder="whisper-1" />
+                </label>
+                <div className="flex items-end">
+                  <button
+                    type="button"
+                    disabled={externalWhisperTestBusy}
+                    className="rounded border px-3 py-2 text-sm hover:bg-white disabled:opacity-50"
+                    onClick={async () => {
+                      setExternalWhisperTestBusy(true);
+                      setExternalWhisperTestResult(null);
+                      setError(null);
+                      try {
+                        const result = await fetchJson<ExternalWhisperTestResponse>(`${ORCHESTRATOR_URL}/subtitle/asr/external/test`, {
+                          method: "POST",
+                          headers: { "Content-Type": "application/json" },
+                          body: JSON.stringify({ base_url: externalWhisperBaseUrl, api_key: externalWhisperApiKey, model: externalWhisperModel }),
+                        });
+                        setExternalWhisperTestResult(result);
+                      } catch (e: unknown) {
+                        setExternalWhisperTestResult({ ok: false, elapsed_ms: 0, text: "", error: e instanceof Error ? e.message : String(e) });
+                      } finally {
+                        setExternalWhisperTestBusy(false);
+                      }
+                    }}
+                  >
+                    {externalWhisperTestBusy ? "测试中…" : "测试外部 Whisper"}
+                  </button>
+                </div>
+              </div>
+              {externalWhisperTestResult ? (
+                <div className="mt-3 rounded border bg-white p-3 text-xs">
+                  <div className={externalWhisperTestResult.ok ? "text-emerald-700" : "text-rose-700"}>{externalWhisperTestResult.ok ? "连接成功" : "测试失败"} · {externalWhisperTestResult.elapsed_ms}ms</div>
+                  {externalWhisperTestResult.text ? <div className="mt-1 break-all text-slate-700">返回：{externalWhisperTestResult.text}</div> : null}
+                  {externalWhisperTestResult.error ? <div className="mt-1 break-all text-rose-700">{externalWhisperTestResult.error}</div> : null}
+                </div>
+              ) : null}
+            </div>
+          ) : null}
 
           <div className="rounded border border-sky-100 bg-sky-50/50 p-3 md:col-span-2">
             <label className="flex cursor-pointer items-center gap-2 text-sm font-medium text-slate-800">
@@ -411,13 +487,16 @@ export default function SettingsASRPage() {
                   body: JSON.stringify({
                     default_engine: defaultEngine,
                     default_language: defaultLanguage,
-                    default_model: defaultModel,
+                    default_model: defaultEngine === "external-whisper" ? externalWhisperModel : defaultModel,
                     openvino_device: openvinoDevice,
                     openvino_num_beams: openvinoNumBeamsValue,
                     openvino_max_new_tokens: openvinoMaxNewTokensValue,
                     openvino_vad_enabled: openvinoVadEnabled,
                     openvino_vad_threshold: openvinoVadThresholdValue,
                     model_download_proxy: modelDownloadProxy,
+                    external_whisper_base_url: externalWhisperBaseUrl,
+                    external_whisper_model: externalWhisperModel,
+                    ...(externalWhisperApiKey.trim() ? { external_whisper_api_key: externalWhisperApiKey.trim() } : {}),
                   }),
                 });
                 await refresh();

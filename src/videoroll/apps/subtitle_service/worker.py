@@ -62,6 +62,7 @@ from videoroll.apps.subtitle_service.processing import (
     segments_to_ass,
     segments_to_json_data,
     segments_to_srt,
+    transcribe_external_whisper,
     transcribe_faster_whisper,
     transcribe_mock,
     transcribe_openvino_whisper,
@@ -1408,6 +1409,21 @@ def process_job(self: Any, job_id: str) -> dict[str, str]:
                     max_new_tokens=openvino_max_new_tokens,
                     vad_enabled=openvino_vad_enabled,
                     vad_threshold=openvino_vad_threshold,
+                )
+            elif engine == "external-whisper":
+                external_base_url = str(asr_defaults.get("external_whisper_base_url") or "").strip()
+                external_api_key = str(asr_defaults.get("external_whisper_api_key") or "").strip()
+                external_model = str(model_name or asr_defaults.get("external_whisper_model") or "").strip()
+                _safe_append_log_line(
+                    log_path,
+                    f"asr: engine=external-whisper model={external_model} base_url={external_base_url or '(empty)'} language={language}",
+                )
+                segments = transcribe_external_whisper(
+                    audio_path,
+                    base_url=external_base_url,
+                    api_key=external_api_key,
+                    model_name=external_model,
+                    language=language,
                 )
             else:
                 raise ValueError(f"unsupported ASR engine: {engine}")

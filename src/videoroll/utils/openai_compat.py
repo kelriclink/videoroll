@@ -72,3 +72,14 @@ def build_openai_embeddings_url(base_url: str) -> str:
 
     base = normalize_openai_base_url(raw)
     return base.rstrip("/") + "/embeddings"
+
+
+def build_openai_audio_transcriptions_url(base_url: str) -> str:
+    """Build the OpenAI-compatible audio transcription endpoint URL."""
+    raw = (base_url or "").strip()
+    if not raw:
+        raw = DEFAULT_OPENAI_BASE_URL
+    raw = _ensure_scheme(raw).rstrip("/")
+    if raw.endswith("/audio/transcriptions"):
+        return raw
+    return normalize_openai_base_url(raw).rstrip("/") + "/audio/transcriptions"
