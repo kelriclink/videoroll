@@ -74,6 +74,14 @@ def _strip_author_suffix(title: str, author: str) -> str:
     return title
 
 
+def _strip_douyin_title_prefix(title: str) -> str:
+    clean = str(title or "").strip()
+    prefix = "【熟肉】"
+    while clean.startswith(prefix):
+        clean = clean[len(prefix) :].lstrip()
+    return clean or "未命名"
+
+
 def normalize_social_publish_meta(
     meta: Mapping[str, Any],
     platform: object,
@@ -89,8 +97,9 @@ def normalize_social_publish_meta(
     tags = _normalize_tags(meta.get("tags"))
     if value == "douyin":
         author = _douyin_original_author(meta, original_author)
+        douyin_title = _strip_douyin_title_prefix(title)
         return {
-            "title": _strip_author_suffix(title, author),
+            "title": _strip_author_suffix(douyin_title, author),
             "desc": f"原作者：{author or '未提供'}"[:1000],
             "tags": [tag for tag in tags if tag.casefold() != "videoroll"][:4],
         }

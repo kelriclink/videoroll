@@ -43,6 +43,11 @@ class AutoProfileStoreTests(unittest.TestCase):
         self.assertEqual(profile["primary_font_scale_percent"], 180)
         self.assertEqual(profile["secondary_font_scale_percent"], 300)
 
+    def test_get_auto_profile_accepts_cloudflare_workers_ai(self) -> None:
+        profile = get_auto_profile(_FakeDb({"asr_engine": "cloudflare-workers-ai"}))
+
+        self.assertEqual(profile["asr_engine"], "cloudflare-workers-ai")
+
 
 if __name__ == "__main__":
     unittest.main()

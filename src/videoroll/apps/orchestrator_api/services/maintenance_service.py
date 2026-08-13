@@ -24,7 +24,7 @@ from videoroll.db.models import (
     TaskStatus,
 )
 from videoroll.db.session import get_sessionmaker
-from videoroll.storage.s3 import S3Store
+from videoroll.storage.filesystem import FileStore
 from videoroll.utils.workdir_maintenance import WorkdirJobState, cleanup_reclaimable_dirs, scan_workdir
 
 
@@ -209,8 +209,8 @@ def _scheduled_resource_cleanup_filter(
     return or_(*filters)
 
 
-def _task_resource_objects(s3: S3Store, task_ids: set[uuid.UUID]) -> set[tuple[str, str]]:
-    """Find current and namespaced legacy MinIO objects belonging to task IDs."""
+def _task_resource_objects(s3: FileStore, task_ids: set[uuid.UUID]) -> set[tuple[str, str]]:
+    """Find stored files belonging to task IDs."""
     if not task_ids:
         return set()
     try:
@@ -221,8 +221,8 @@ def _task_resource_objects(s3: S3Store, task_ids: set[uuid.UUID]) -> set[tuple[s
 
     objects: set[tuple[str, str]] = set()
     for bucket in buckets:
-        # Current layouts use bucket/raw/<task-id>/..., while an older
-        # deployment wrote the same application paths under minio/videoroll/.
+        # Keep the namespace loop so retention remains compatible with old
+        # database cleanup records while the active backend is filesystem-only.
         namespace = "" if bucket == s3.bucket else f"{s3.bucket}/"
         for prefix in TASK_RESOURCE_PREFIXES:
             for key in s3.iter_object_keys(f"{namespace}{prefix}/", bucket=bucket):
@@ -232,7 +232,7 @@ def _task_resource_objects(s3: S3Store, task_ids: set[uuid.UUID]) -> set[tuple[s
     return objects
 
 
-def _delete_s3_objects(s3: S3Store, objects: set[tuple[str, str]]) -> tuple[set[tuple[str, str]], set[tuple[str, str]]]:
+def _delete_s3_objects(s3: FileStore, objects: set[tuple[str, str]]) -> tuple[set[tuple[str, str]], set[tuple[str, str]]]:
     deleted: set[tuple[str, str]] = set()
     failed: set[tuple[str, str]] = set()
     by_bucket: dict[str, list[str]] = {}
@@ -258,11 +258,11 @@ def cleanup_terminal_task_resources(
     cleanup_all_terminal: bool = False,
     now: datetime | None = None,
 ) -> StorageResourceCleanupRead | None:
-    """Delete every MinIO/S3 resource for completed tasks, retaining task rows.
+    """Delete every stored file for completed tasks, retaining task rows.
 
     Prefix scanning removes old orphan objects too.  Older cleanup versions
-    removed database asset rows without reliably deleting their MinIO objects;
-    those orphaned raw/final files cannot be found by querying ``assets``.
+    removed database asset rows without reliably deleting their files; those
+    orphaned raw/final files cannot be found by querying ``assets``.
     """
     owner = f"{owner_prefix}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
     if not _try_acquire_resource_cleanup_lock(db, owner=owner, ttl_seconds=STORAGE_RESOURCE_CLEANUP_LOCK_TTL_SECONDS):
@@ -290,8 +290,8 @@ def cleanup_terminal_task_resources(
         matched_assets = db.query(Asset).filter(Asset.task_id.in_(task_ids)).count()
         matched_subtitles = db.query(Subtitle).filter(Subtitle.task_id.in_(task_ids)).count()
 
-        s3 = S3Store(settings)
-        s3.ensure_bucket()
+        s3 = FileStore(settings)
+        s3.ensure_ready()
         object_locations = _task_resource_objects(s3, task_ids)
         object_locations.update((s3.bucket, key) for key in asset_keys)
         deleted_keys, failed_keys = _delete_s3_objects(s3, object_locations)

@@ -33,7 +33,7 @@ from videoroll.apps.orchestrator_api.schemas import (
 from videoroll.apps.orchestrator_api.services import youtube_service
 from videoroll.apps.youtube_settings_store import get_youtube_settings
 from videoroll.config import OrchestratorSettings
-from videoroll.storage.s3 import S3Store
+from videoroll.storage.filesystem import FileStore
 
 
 router = APIRouter()
@@ -136,17 +136,17 @@ def test_youtube_proxy(payload: YouTubeProxyTestRequest, settings: OrchestratorS
 
 
 @router.get("/tasks/{task_id}/youtube_meta", response_model=YouTubeMetaRead)
-def get_cached_youtube_meta(task_id: uuid.UUID, db: Session = Depends(get_db), s3: S3Store = Depends(get_s3)) -> YouTubeMetaRead:
+def get_cached_youtube_meta(task_id: uuid.UUID, db: Session = Depends(get_db), s3: FileStore = Depends(get_s3)) -> YouTubeMetaRead:
     return youtube_service.get_cached_meta(task_id, db=db, s3=s3)
 
 
 @router.post("/tasks/{task_id}/actions/youtube_meta", response_model=YouTubeMetaActionResponse)
-def fetch_youtube_meta(task_id: uuid.UUID, settings: OrchestratorSettings = Depends(get_settings), db: Session = Depends(get_db), s3: S3Store = Depends(get_s3)) -> YouTubeMetaActionResponse:
+def fetch_youtube_meta(task_id: uuid.UUID, settings: OrchestratorSettings = Depends(get_settings), db: Session = Depends(get_db), s3: FileStore = Depends(get_s3)) -> YouTubeMetaActionResponse:
     return youtube_service.fetch_meta(task_id, settings=settings, db=db, s3=s3)
 
 
 @router.post("/tasks/{task_id}/actions/youtube_download", response_model=YouTubeDownloadActionResponse)
-def download_youtube(task_id: uuid.UUID, settings: OrchestratorSettings = Depends(get_settings), db: Session = Depends(get_db), s3: S3Store = Depends(get_s3)) -> YouTubeDownloadActionResponse:
+def download_youtube(task_id: uuid.UUID, settings: OrchestratorSettings = Depends(get_settings), db: Session = Depends(get_db), s3: FileStore = Depends(get_s3)) -> YouTubeDownloadActionResponse:
     return youtube_service.download(task_id, settings=settings, db=db, s3=s3)
 
 

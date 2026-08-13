@@ -44,7 +44,7 @@ class OrchestratorLifecycleTests(unittest.TestCase):
         with (
             patch.object(scheduler_module, "get_sessionmaker", return_value=session_local),
             patch.object(scheduler_module, "get_storage_retention_settings", return_value={"asset_ttl_days": 0}),
-            patch.object(scheduler_module, "S3Store", return_value=store),
+            patch.object(scheduler_module, "FileStore", return_value=store),
             patch.object(scheduler_module.asset_service, "retry_pending_s3_deletes", return_value=2) as retry,
             patch.object(scheduler_module.maintenance_service, "expire_stale_publishing_tasks", return_value=1) as expire,
             patch.object(scheduler_module.maintenance_service, "cleanup_terminal_task_resources") as cleanup,

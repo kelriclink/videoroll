@@ -4,11 +4,10 @@ import json
 import uuid
 from typing import Any, Literal
 
-from botocore.exceptions import ClientError
 from sqlalchemy.orm import Session
 
 from videoroll.ai.client import openai_chat_config_from_settings
-from videoroll.ai.service import AIService, translate_text_openai
+from videoroll.ai.service import AIService, translate_title_openai
 from videoroll.apps.bilibili_publisher.publish_settings_store import get_bilibili_publish_settings
 from videoroll.apps.bilibili_publisher.schemas import BilibiliPublishMeta
 from videoroll.apps.orchestrator_api.youtube_downloader import summarize_info
@@ -18,11 +17,12 @@ from videoroll.apps.publish_meta_rules import (
     has_cjk,
 )
 from videoroll.apps.subtitle_service.auto_profile_store import get_auto_profile
+from videoroll.apps.subtitle_service.bilibili_tags_store import get_task_bilibili_summary
 from videoroll.apps.subtitle_service.task_title_store import get_task_titles
 from videoroll.apps.subtitle_service.translate_settings_store import get_translate_settings
 from videoroll.config import get_subtitle_settings
 from videoroll.db.models import Asset, AssetKind, Task
-from videoroll.storage.s3 import S3Store
+from videoroll.storage.filesystem import FileStore, StorageObjectNotFound
 
 
 PublishMetaDraftMode = Literal["auto", "default", "source"]
@@ -45,6 +45,7 @@ def translate_publish_title(
     *,
     profile: dict[str, Any],
     translate_settings: dict[str, Any],
+    summary: str = "",
     ai_service: AIService | None = None,
 ) -> str:
     title_in = str(title or "").strip()
@@ -61,16 +62,20 @@ def translate_publish_title(
 
     try:
         if ai_service is not None:
-            return ai_service.translate_text(
+            return ai_service.translate_title(
                 title_in,
                 target_lang=str(profile.get("target_lang") or translate_settings.get("default_target_lang") or "zh"),
                 style=str(profile.get("translate_style") or translate_settings.get("default_style") or "口语自然"),
+                summary=summary,
+                retry_count=4,
             )
-        return translate_text_openai(
+        return translate_title_openai(
             title_in,
             target_lang=str(profile.get("target_lang") or translate_settings.get("default_target_lang") or "zh"),
             style=str(profile.get("translate_style") or translate_settings.get("default_style") or "口语自然"),
+            summary=summary,
             config=openai_chat_config_from_settings(translate_settings),
+            retry_count=4,
         )
     except Exception:
         return title_in
@@ -86,6 +91,7 @@ def apply_publish_source_overrides(
     profile: dict[str, Any],
     translate_settings: dict[str, Any],
     translated_title: str | None = None,
+    summary: str = "",
     ai_service: AIService | None = None,
 ) -> dict[str, Any]:
     return _normalize_publish_meta_draft(
@@ -102,13 +108,14 @@ def apply_publish_source_overrides(
                 title,
                 profile=profile,
                 translate_settings=translate_settings,
+                summary=summary,
                 ai_service=ai_service,
             ),
         )
     )
 
 
-def _read_s3_bytes(store: S3Store, key: str) -> bytes:
+def _read_s3_bytes(store: FileStore, key: str) -> bytes:
     obj = store.get_object(key)
     body = obj.get("Body")
     if not body:
@@ -122,7 +129,7 @@ def _read_s3_bytes(store: S3Store, key: str) -> bytes:
             pass
 
 
-def _read_latest_youtube_meta(task_id: uuid.UUID, db: Session, s3: S3Store, *, fallback_url: str) -> dict[str, str] | None:
+def _read_latest_youtube_meta(task_id: uuid.UUID, db: Session, s3: FileStore, *, fallback_url: str) -> dict[str, str] | None:
     asset = (
         db.query(Asset)
         .filter(Asset.task_id == task_id, Asset.kind == AssetKind.metadata_json)
@@ -136,7 +143,7 @@ def _read_latest_youtube_meta(task_id: uuid.UUID, db: Session, s3: S3Store, *, f
         raw = _read_s3_bytes(s3, asset.storage_key)
         parsed = json.loads(raw.decode("utf-8")) if raw else {}
         meta = summarize_info(_as_dict(parsed), fallback_url=fallback_url)
-    except (ClientError, ValueError, TypeError):
+    except (StorageObjectNotFound, ValueError, TypeError):
         return None
     except Exception:
         return None
@@ -158,7 +165,7 @@ def build_task_publish_meta_draft(
     task: Task,
     *,
     db: Session,
-    s3: S3Store,
+    s3: FileStore,
     mode: PublishMetaDraftMode = "auto",
     base_meta: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -185,6 +192,7 @@ def build_task_publish_meta_draft(
     source_description = str(yt_meta.get("description") or "").strip()
     source_url = str(yt_meta.get("webpage_url") or fallback_url or "").strip()
     source_uploader = str(yt_meta.get("uploader") or "").strip()
+    summary = get_task_bilibili_summary(db, str(task.id))
 
     profile = get_auto_profile(db)
     translate_settings = get_translate_settings(db, get_subtitle_settings())
@@ -198,5 +206,6 @@ def build_task_publish_meta_draft(
         source_uploader=source_uploader,
         profile=profile,
         translate_settings=translate_settings,
+        summary=summary,
         ai_service=ai_service,
     )

@@ -18,6 +18,10 @@ type TranslateSettings = {
   openai_temperature: number;
   openai_timeout_seconds: number;
   openai_max_retries: number;
+  openai_api_type: "openai" | "cerebras";
+  openai_enable_thinking: boolean;
+  cerebras_reasoning_effort: "low" | "medium" | "high";
+  cerebras_reasoning_format: "parsed" | "raw" | "hidden";
   rag_enabled: boolean;
   rag_top_k: number;
   rag_min_score: number;
@@ -145,6 +149,10 @@ export default function SettingsTranslatePage() {
   const [openaiTemperature, setOpenaiTemperature] = useState(0.2);
   const [openaiTimeoutSeconds, setOpenaiTimeoutSeconds] = useState(60);
   const [openaiMaxRetries, setOpenaiMaxRetries] = useState(3);
+  const [openaiApiType, setOpenaiApiType] = useState<"openai" | "cerebras">("openai");
+  const [openaiEnableThinking, setOpenaiEnableThinking] = useState(false);
+  const [cerebrasReasoningEffort, setCerebrasReasoningEffort] = useState<"low" | "medium" | "high">("medium");
+  const [cerebrasReasoningFormat, setCerebrasReasoningFormat] = useState<"parsed" | "raw" | "hidden">("parsed");
   const [openaiApiKey, setOpenaiApiKey] = useState("");
 
   const [ragEnabled, setRagEnabled] = useState(false);
@@ -213,6 +221,10 @@ export default function SettingsTranslatePage() {
       setOpenaiTemperature(s.openai_temperature);
       setOpenaiTimeoutSeconds(s.openai_timeout_seconds);
       setOpenaiMaxRetries(s.openai_max_retries ?? 3);
+      setOpenaiApiType(s.openai_api_type ?? "openai");
+      setOpenaiEnableThinking(s.openai_enable_thinking ?? false);
+      setCerebrasReasoningEffort(s.cerebras_reasoning_effort ?? "medium");
+      setCerebrasReasoningFormat(s.cerebras_reasoning_format ?? "parsed");
       setRagEnabled(s.rag_enabled);
       setRagTopK(s.rag_top_k);
       setRagMinScore(s.rag_min_score);
@@ -271,6 +283,10 @@ export default function SettingsTranslatePage() {
       openai_temperature: openaiTemperature,
       openai_timeout_seconds: openaiTimeoutSeconds,
       openai_max_retries: openaiMaxRetries,
+      openai_api_type: openaiApiType,
+      openai_enable_thinking: openaiEnableThinking,
+      cerebras_reasoning_effort: cerebrasReasoningEffort,
+      cerebras_reasoning_format: cerebrasReasoningFormat,
       rag_enabled: ragEnabled,
       rag_top_k: ragTopK,
       rag_min_score: ragMinScore,
@@ -450,6 +466,8 @@ export default function SettingsTranslatePage() {
               ["target", settings.default_target_lang],
               ["batch", settings.default_batch_size],
               ["summary", settings.default_enable_summary ? "true" : "false"],
+              ["API type", settings.openai_api_type === "cerebras" ? "Cerebras" : "OpenAI compatible"],
+              ["think", settings.openai_enable_thinking ? "enabled" : "disabled"],
               ["rag", settings.rag_enabled ? "enabled" : "disabled"],
               ["dictionary", settings.rag_dictionary_enabled ? `${settings.rag_dictionary_top_k} / ${settings.rag_dictionary_min_quality}` : "disabled"],
               ["wiki", settings.rag_wiki_enabled ? "enabled" : "disabled"],
@@ -529,6 +547,20 @@ export default function SettingsTranslatePage() {
           </label>
           <div className="md:col-span-2 pt-2 text-xs font-semibold text-slate-700">OpenAI（标准接口）</div>
           <label className="block md:col-span-2">
+            <div className="mb-1 text-xs text-slate-600">接口类型</div>
+            <select
+              className="w-full rounded border px-3 py-2 text-sm"
+              value={openaiApiType}
+              onChange={(e) => setOpenaiApiType(e.target.value as "openai" | "cerebras")}
+            >
+              <option value="openai">OpenAI 标准兼容接口</option>
+              <option value="cerebras">Cerebras（gpt-oss / reasoning）</option>
+            </select>
+            <div className="mt-1 text-xs text-slate-500">
+              通过 New API 转发 Cerebras 时也请选择 Cerebras；系统会使用 Cerebras 的 reasoning 参数，而不是 <code>enable_thinking</code>。
+            </div>
+          </label>
+          <label className="block md:col-span-2">
             <div className="mb-1 text-xs text-slate-600">openai_api_key（仅保存，不回显）</div>
             <input type="password" className="w-full rounded border px-3 py-2 text-sm" placeholder={settings?.openai_api_key_set ? "已设置（留空则不修改）" : "sk-..."} value={openaiApiKey} onChange={(e) => setOpenaiApiKey(e.target.value)} />
           </label>
@@ -552,6 +584,50 @@ export default function SettingsTranslatePage() {
             <div className="mb-1 text-xs text-slate-600">openai_max_retries</div>
             <input type="number" min={1} max={10} className="w-full rounded border px-3 py-2 text-sm" value={openaiMaxRetries} onChange={(e) => setOpenaiMaxRetries(parseInt(e.target.value || "3", 10))} />
             <div className="mt-1 text-xs text-slate-500">LLM 请求的网络/5xx 重试次数；不影响 embedding 请求。</div>
+          </label>
+          {openaiApiType === "cerebras" ? (
+            <div className="grid gap-3 rounded border border-orange-200 bg-orange-50 p-3 md:col-span-2 md:grid-cols-2">
+              <label className="block">
+                <div className="mb-1 text-xs text-orange-900">cerebras_reasoning_effort</div>
+                <select
+                  className="w-full rounded border px-3 py-2 text-sm"
+                  value={cerebrasReasoningEffort}
+                  onChange={(e) => setCerebrasReasoningEffort(e.target.value as "low" | "medium" | "high")}
+                >
+                  <option value="low">low（更快）</option>
+                  <option value="medium">medium（推荐）</option>
+                  <option value="high">high（更充分）</option>
+                </select>
+              </label>
+              <label className="block">
+                <div className="mb-1 text-xs text-orange-900">cerebras_reasoning_format</div>
+                <select
+                  className="w-full rounded border px-3 py-2 text-sm"
+                  value={cerebrasReasoningFormat}
+                  onChange={(e) => setCerebrasReasoningFormat(e.target.value as "parsed" | "raw" | "hidden")}
+                >
+                  <option value="parsed">parsed（推荐，可显示思考流）</option>
+                  <option value="raw">raw（思考拼入正文）</option>
+                  <option value="hidden">hidden（隐藏思考）</option>
+                </select>
+              </label>
+              <div className="text-xs text-orange-800 md:col-span-2">
+                推荐使用 <code>medium + parsed</code>。选择 <code>hidden</code> 后模型仍会思考并计费，但仪表盘看不到思考内容；<code>raw</code> 可能干扰翻译 JSON 解析。
+              </div>
+            </div>
+          ) : null}
+          <label className="flex items-start gap-2 rounded border border-violet-200 bg-violet-50 p-3 text-sm md:col-span-2">
+            <input className="mt-0.5" type="checkbox" checked={openaiEnableThinking} onChange={(e) => setOpenaiEnableThinking(e.target.checked)} />
+            <span>
+              <span className="font-medium text-violet-950">启用翻译 Think（流式思考）</span>
+              <span className="mt-1 block text-xs text-violet-800">
+                {openaiApiType === "cerebras" ? (
+                  <>字幕翻译会发送 <code>reasoning_effort</code> 与 <code>reasoning_format</code> 并使用 SSE；选择 parsed 时，思考增量会显示在仪表盘的最近 Agent／对话流。</>
+                ) : (
+                  <>字幕翻译会发送 <code>enable_thinking: true</code> 并使用 SSE；思考增量会显示在仪表盘的最近 Agent／对话流。仅适用于支持该参数的 OpenAI 兼容上游。</>
+                )}
+              </span>
+            </span>
           </label>
         </div>
       </Section>

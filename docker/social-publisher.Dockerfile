@@ -40,7 +40,7 @@ RUN chmod +x /app/docker/social-publisher-entrypoint.sh
 
 RUN useradd --create-home --uid 10001 videoroll \
     && chown -R videoroll:videoroll /ms-playwright /work/social-publisher /opt/social-auto-upload \
-    && install -d --owner=videoroll --group=videoroll --mode=0700 /secrets /tmp/videoroll-vnc \
+    && install -d --owner=videoroll --group=videoroll --mode=0700 /secrets /storage /tmp/videoroll-vnc \
     && install -d --owner=videoroll --group=videoroll --mode=0700 /tmp/videoroll-home
 
 ENV HOME=/tmp/videoroll-home

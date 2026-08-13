@@ -46,7 +46,7 @@ from videoroll.apps.subtitle_service.translate_settings_store import get_transla
 from videoroll.apps.youtube_meta_store import get_task_youtube_meta
 from videoroll.config import OrchestratorSettings, get_subtitle_settings
 from videoroll.db.models import Asset, AssetKind, PublishBatch, PublishJob, PublishState, Task, TaskStatus
-from videoroll.storage.s3 import S3Store
+from videoroll.storage.filesystem import FileStore
 
 
 _BROWSER_PROXY_PATHS: dict[str, set[str]] = {
@@ -192,7 +192,7 @@ def build_auto_publish_after_render(
     task: Task,
     *,
     db: Session,
-    s3: S3Store,
+    s3: FileStore,
     publish_payload_overrides: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     auto_profile = get_auto_profile(db)
@@ -232,7 +232,7 @@ def apply_task_review_result(db: Session, task: Task, review_result: dict[str, A
     db.add(task)
 
 
-def read_latest_task_subtitle_text(task_id: uuid.UUID, db: Session, s3: S3Store) -> str:
+def read_latest_task_subtitle_text(task_id: uuid.UUID, db: Session, s3: FileStore) -> str:
     asset = (
         db.query(Asset)
         .filter(Asset.task_id == task_id, Asset.kind.in_([AssetKind.subtitle_srt, AssetKind.subtitle_ass]))
@@ -252,7 +252,7 @@ def prepare_publish_meta(
     task: Task,
     payload_meta: dict[str, Any] | None,
     db: Session,
-    s3: S3Store,
+    s3: FileStore,
     allow_auto_draft: bool,
 ) -> dict[str, Any]:
     if payload_meta is None:
@@ -292,7 +292,7 @@ def prepare_publish_meta(
         raise HTTPException(status_code=400, detail=f"invalid publish meta: {exc}") from exc
 
 
-def run_task_publish_review(task: Task, *, meta: dict[str, Any], db: Session, s3: S3Store) -> dict[str, Any]:
+def run_task_publish_review(task: Task, *, meta: dict[str, Any], db: Session, s3: FileStore) -> dict[str, Any]:
     settings = get_publish_review_settings(db)
     current = get_task_publish_review_record(db, str(task.id))
     if not settings["enabled"]:
@@ -333,7 +333,12 @@ def run_task_publish_review(task: Task, *, meta: dict[str, Any], db: Session, s3
     return {"enabled": True, **stored}
 
 
-def get_task_publish_meta(task_id: uuid.UUID, db: Session, s3: S3Store) -> dict[str, Any]:
+def _publish_review_blocks_publish(review_result: dict[str, Any]) -> bool:
+    """Only an enabled, failed review may block a publish request."""
+    return bool(review_result.get("enabled")) and not bool(review_result.get("ok"))
+
+
+def get_task_publish_meta(task_id: uuid.UUID, db: Session, s3: FileStore) -> dict[str, Any]:
     if not db.get(Task, task_id):
         raise HTTPException(status_code=404, detail="task not found")
     value = read_s3_json_object(s3, publish_meta_s3_key(task_id))
@@ -342,7 +347,7 @@ def get_task_publish_meta(task_id: uuid.UUID, db: Session, s3: S3Store) -> dict[
     return value
 
 
-def get_task_publish_meta_draft(task_id: uuid.UUID, db: Session, s3: S3Store) -> dict[str, Any]:
+def get_task_publish_meta_draft(task_id: uuid.UUID, db: Session, s3: FileStore) -> dict[str, Any]:
     task = db.get(Task, task_id)
     if not task:
         raise HTTPException(status_code=404, detail="task not found")
@@ -356,7 +361,7 @@ def generate_task_publish_meta_draft(
     mode: str,
     base_meta: dict[str, Any] | None,
     db: Session,
-    s3: S3Store,
+    s3: FileStore,
 ) -> dict[str, Any]:
     task = db.get(Task, task_id)
     if not task:
@@ -364,7 +369,7 @@ def generate_task_publish_meta_draft(
     return build_task_publish_meta_draft(task, db=db, s3=s3, mode=mode, base_meta=base_meta)
 
 
-def put_task_publish_meta(task_id: uuid.UUID, meta: dict[str, Any], db: Session, s3: S3Store) -> dict[str, Any]:
+def put_task_publish_meta(task_id: uuid.UUID, meta: dict[str, Any], db: Session, s3: FileStore) -> dict[str, Any]:
     if not db.get(Task, task_id):
         raise HTTPException(status_code=404, detail="task not found")
     if not isinstance(meta, dict):
@@ -388,7 +393,7 @@ def get_task_publish_review(task_id: uuid.UUID, db: Session) -> dict[str, Any]:
     return {"enabled": settings["enabled"], **get_task_publish_review_record(db, str(task_id))}
 
 
-def review_task_publish(task_id: uuid.UUID, meta: dict[str, Any] | None, db: Session, s3: S3Store) -> dict[str, Any]:
+def review_task_publish(task_id: uuid.UUID, meta: dict[str, Any] | None, db: Session, s3: FileStore) -> dict[str, Any]:
     task = db.get(Task, task_id)
     if not task:
         raise HTTPException(status_code=404, detail="task not found")
@@ -414,7 +419,7 @@ def build_publish_gateway_request(
     payload: PublishActionRequest,
     video_key: str,
     db: Session,
-    s3: S3Store,
+    s3: FileStore,
 ) -> dict[str, Any]:
     platform = normalize_publish_platform(payload.platform)
     if platform != "bilibili":
@@ -448,8 +453,8 @@ def build_publish_gateway_request(
         "platform": platform,
         "task_id": str(task_id),
         "account_id": payload.account_id,
-        "video": {"type": "s3", "key": video_key},
-        "cover": {"type": "s3", "key": payload.cover_key} if payload.cover_key else None,
+        "video": {"type": "storage", "key": video_key},
+        "cover": {"type": "storage", "key": payload.cover_key} if payload.cover_key else None,
         "meta": meta,
         "platform_options": platform_options,
     }
@@ -675,7 +680,7 @@ def enqueue_publish_job(
     payload: PublishActionRequest,
     settings: OrchestratorSettings,
     db: Session,
-    s3: S3Store,
+    s3: FileStore,
 ) -> RemotePublishResponse:
     task = db.get(Task, task_id)
     if not task:
@@ -722,7 +727,7 @@ def enqueue_publish_job(
 
     if not bool(payload.skip_review):
         review_result = run_task_publish_review(task, meta=as_dict(request.get("meta")), db=db, s3=s3)
-        if not bool(review_result.get("ok")):
+        if _publish_review_blocks_publish(review_result):
             raise HTTPException(status_code=409, detail=str(review_result.get("reason") or "AI 审核未通过"))
     elif task.error_code == "AI_REVIEW_REJECTED":
         task.error_code = None
@@ -759,7 +764,7 @@ def publish_all(
     publish_payload: PublishAllRequest,
     settings: OrchestratorSettings,
     db: Session,
-    s3: S3Store,
+    s3: FileStore,
 ) -> dict[str, Any]:
     """多平台投稿：读取已启用平台，逐个投稿。"""
     from videoroll.apps.publish_service import PublishService
@@ -816,7 +821,7 @@ def publish_all(
                 break
     if not publish_payload.skip_review:
         review_result = run_task_publish_review(task, meta=review_meta, db=db, s3=s3)
-        if not bool(review_result.get("ok")):
+        if _publish_review_blocks_publish(review_result):
             raise HTTPException(
                 status_code=409,
                 detail=str(review_result.get("reason") or "AI 审核未通过"),

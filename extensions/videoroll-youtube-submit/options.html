@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>VideoRoll YouTube Submit 设置</title>
+    <link rel="stylesheet" href="options.css" />
+  </head>
+  <body>
+    <main>
+      <header>
+        <h1>VideoRoll YouTube Submit</h1>
+        <p>在 YouTube 视频页面或缩略图链接上右键，直接提交到 VideoRoll 自动模式。</p>
+      </header>
+
+      <form id="settings-form">
+        <label>
+          <span>VideoRoll 地址或 Remote API 地址</span>
+          <input id="endpoint" type="url" required placeholder="http://192.168.1.9:3001" autocomplete="url" />
+          <small>可填写站点根地址、以 /api 结尾的地址，或完整的 /api/remote/auto/youtube 地址。</small>
+        </label>
+
+        <label>
+          <span>Remote API Token</span>
+          <input id="token" type="password" placeholder="已保存时留空表示保持不变" autocomplete="off" />
+          <small>请先在 VideoRoll 的“设置 → API”中保存同一个 Token。Token 仅保存在本机浏览器扩展存储中。</small>
+        </label>
+
+        <div class="grid">
+          <label>
+            <span>授权类型</span>
+            <select id="license">
+              <option value="authorized">authorized（已授权）</option>
+              <option value="own">own（自有）</option>
+              <option value="cc">cc（可再分发）</option>
+              <option value="unknown">unknown（未知）</option>
+            </select>
+          </label>
+
+          <label>
+            <span>自动投稿</span>
+            <select id="auto-publish-mode">
+              <option value="inherit">按 VideoRoll 自动模式设置</option>
+              <option value="enabled">强制开启</option>
+              <option value="disabled">强制关闭</option>
+            </select>
+          </label>
+        </div>
+
+        <div class="actions">
+          <button type="submit">保存并授权访问</button>
+          <button id="clear-token" type="button" class="secondary">清除本地 Token</button>
+        </div>
+        <div id="status" role="status" aria-live="polite"></div>
+      </form>
+
+      <section>
+        <h2>使用方法</h2>
+        <ol>
+          <li>打开任意 YouTube 视频页面，或找到一个视频缩略图。</li>
+          <li>在页面、播放器或缩略图链接上右键。</li>
+          <li>点击“提交到 VideoRoll 自动模式”。</li>
+          <li>YouTube 页面右上角会显示成功或失败结果。</li>
+        </ol>
+        <p class="hint">播放器有时会先显示 YouTube 自己的菜单，再右键一次即可看到浏览器扩展菜单。</p>
+      </section>
+    </main>
+    <script type="module" src="options.js"></script>
+  </body>
+</html>

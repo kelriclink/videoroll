@@ -7,6 +7,7 @@ type YouTubeSettings = {
   proxy: string;
   cookies_set?: boolean;
   cookies_enabled?: boolean;
+  compatibility_mode_enabled?: boolean;
   cookies_updated_at?: string | null;
   cookies_count?: number;
   cookies_domains_count?: number;
@@ -76,6 +77,8 @@ export default function SettingsYouTubePage() {
   const [cookiesTxt, setCookiesTxt] = useState("");
   const [cookiesBusy, setCookiesBusy] = useState(false);
   const [cookiesEnabled, setCookiesEnabled] = useState(false);
+  const [compatibilityModeEnabled, setCompatibilityModeEnabled] = useState(false);
+  const [compatibilityBusy, setCompatibilityBusy] = useState(false);
   const [testUrl, setTestUrl] = useState("https://www.youtube.com/robots.txt");
   const [testBusy, setTestBusy] = useState(false);
   const [testResult, setTestResult] = useState<YouTubeProxyTestResponse | null>(null);
@@ -95,6 +98,7 @@ export default function SettingsYouTubePage() {
       setSettings(s);
       setProxy((s.proxy ?? "").toString());
       setCookiesEnabled(Boolean(s.cookies_enabled));
+      setCompatibilityModeEnabled(Boolean(s.compatibility_mode_enabled));
       setHomeScanEnabled(Boolean(s.home_scan_enabled));
       setHomeScanIntervalMinutes(Math.max(1, Number(s.home_scan_interval_minutes ?? 60) || 60));
       setHomeScanLimit(Math.max(1, Number(s.home_scan_limit ?? 10) || 10));
@@ -169,8 +173,60 @@ export default function SettingsYouTubePage() {
                 </div>
               ) : null}
             </div>
+            <div className="rounded border p-3 md:col-span-2">
+              <div className="text-xs text-slate-500">YouTube 兼容模式</div>
+              <div className="mt-1 text-sm">{settings.compatibility_mode_enabled ? "已启用" : "未启用"}</div>
+            </div>
           </div>
         )}
+      </div>
+
+      <div className="rounded border bg-white p-4">
+        <div className="text-sm font-semibold">YouTube 兼容模式</div>
+        <div className="mt-2 text-xs text-slate-600 space-y-1">
+          <div>
+            开启后，普通视频下载、元信息和 YouTube 字幕探测会使用 yt-dlp 社区建议的
+            <span className="font-mono"> player_client=default,web_embedded</span>。
+          </div>
+          <div>
+            适用于启用登录 Cookies 后出现 <span className="font-mono">The page needs to be reloaded</span> 的近期 YouTube 兼容问题；官方修复后可以关闭。
+          </div>
+          <div className="text-amber-700">
+            该模式可能改变可用格式或画质列表。它不会应用到直播录制，因为社区反馈兼容客户端用于长时间直播时可能出现 403。
+          </div>
+        </div>
+        <label className="mt-3 flex items-center gap-2 text-sm">
+          <input
+            type="checkbox"
+            checked={compatibilityModeEnabled}
+            onChange={(e) => setCompatibilityModeEnabled(e.target.checked)}
+          />
+          使用兼容性 YouTube 客户端
+        </label>
+        <div className="mt-3">
+          <button
+            disabled={compatibilityBusy}
+            className="rounded bg-slate-900 px-3 py-2 text-sm text-white hover:bg-slate-800 disabled:opacity-50"
+            onClick={async () => {
+              setCompatibilityBusy(true);
+              setError(null);
+              try {
+                await fetchJson(`${ORCHESTRATOR_URL}/settings/youtube`, {
+                  method: "PUT",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({ compatibility_mode_enabled: compatibilityModeEnabled }),
+                });
+                await refresh();
+              } catch (e: unknown) {
+                setError(e instanceof Error ? e.message : String(e));
+              } finally {
+                setCompatibilityBusy(false);
+              }
+            }}
+          >
+            保存兼容模式
+          </button>
+        </div>
       </div>
 
       <div className="rounded border bg-white p-4">

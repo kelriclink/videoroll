@@ -4,7 +4,6 @@ import json
 import logging
 import os
 import random
-import tempfile
 import threading
 import time
 import traceback
@@ -43,7 +42,7 @@ from videoroll.db.base import Base
 from videoroll.db.auto_migrate import auto_migrate
 from videoroll.db.models import Asset, AssetKind, Platform, PublishJob, PublishState, Task, TaskStatus
 from videoroll.db.session import get_engine, get_sessionmaker
-from videoroll.storage.s3 import S3Store
+from videoroll.storage.filesystem import FileStore
 from videoroll.apps.subtitle_service.bilibili_tags_store import get_task_bilibili_summary
 from videoroll.apps.subtitle_service.translate_settings_store import get_translate_settings
 
@@ -129,7 +128,7 @@ def _extract_video_key(meta_json: dict[str, Any]) -> str:
     return ""
 
 
-def _read_s3_json(store: S3Store, key: str) -> dict[str, Any]:
+def _read_s3_json(store: FileStore, key: str) -> dict[str, Any]:
     obj = store.get_object(key)
     body = obj.get("Body")
     if not body:
@@ -150,7 +149,7 @@ def _read_s3_json(store: S3Store, key: str) -> dict[str, Any]:
     return parsed if isinstance(parsed, dict) else {}
 
 
-def _read_latest_youtube_info(task: Task, db: Session, store: S3Store) -> dict[str, Any]:
+def _read_latest_youtube_info(task: Task, db: Session, store: FileStore) -> dict[str, Any]:
     if task.source_type.value != "youtube":
         return {}
 
@@ -198,7 +197,7 @@ def _youtube_channel_url_from_info(info: dict[str, Any]) -> str:
 def _pick_youtube_collection_cover(
     *,
     task: Task,
-    store: S3Store,
+    store: FileStore,
     db: Session,
     fallback_cover_url: str,
 ) -> tuple[str, dict[str, Any]]:
@@ -228,7 +227,7 @@ def _attach_youtube_uploader_collection(
     aid: int,
     csrf: str,
     cover_url: str,
-    store: S3Store,
+    store: FileStore,
     db: Session,
 ) -> dict[str, Any]:
     info = _read_latest_youtube_info(task, db, store)
@@ -654,7 +653,7 @@ def _process_job_impl(self, job_id: str) -> dict[str, Any]:
     job_uuid: uuid.UUID | None = None
     job: PublishJob | None = None
     task: Task | None = None
-    store: S3Store | None = None
+    store: FileStore | None = None
     upload_throttle: dict[str, Any] | None = None
     submit_throttle: dict[str, Any] | None = None
     job_hb: JobLeaseHeartbeat | None = None
@@ -718,8 +717,8 @@ def _process_job_impl(self, job_id: str) -> dict[str, Any]:
         if not video_key:
             raise RuntimeError("publish job missing video key")
 
-        store = S3Store(settings)
-        store.ensure_bucket()
+        store = FileStore(settings)
+        store.ensure_ready()
 
         job.state = PublishState.submitting
         job.updated_at = _utcnow()
@@ -730,181 +729,177 @@ def _process_job_impl(self, job_id: str) -> dict[str, Any]:
         # actually starts sending video bytes again.
         _set_bilibili_upload_progress(db, job, active=False, progress=0)
 
-        with tempfile.TemporaryDirectory(prefix="videoroll_bili_") as td:
-            workdir = Path(td)
-            video_path = workdir / Path(video_key).name
-            store.download_file(video_key, video_path)
+        video_path = store.path_for(video_key)
 
-            cover_url = ""
-            cover_path: Path | None = None
-            cover_key = str(job.cover_key or "").strip()
-            if cover_key:
-                cover_path = workdir / Path(cover_key).name
-                store.download_file(cover_key, cover_path)
+        cover_url = ""
+        cover_path: Path | None = None
+        cover_key = str(job.cover_key or "").strip()
+        if cover_key:
+            cover_path = store.path_for(cover_key)
 
-            collection_result: dict[str, Any] | None = None
-            desc_retry: dict[str, Any] | None = None
-            with BilibiliWebClient(cookie) as client:
-                # From this point Bilibili may have accepted an upload or
-                # archive request.  Recovery must require explicit operator
-                # confirmation instead of sending a duplicate automatically.
-                job.started_at = _utcnow()
-                db.add(job)
-                db.commit()
-                if cover_path:
-                    cover_url = client.upload_cover(cover_path, csrf=csrf)
+        collection_result: dict[str, Any] | None = None
+        desc_retry: dict[str, Any] | None = None
+        with BilibiliWebClient(cookie) as client:
+            # From this point Bilibili may have accepted an upload or
+            # archive request.  Recovery must require explicit operator
+            # confirmation instead of sending a duplicate automatically.
+            job.started_at = _utcnow()
+            db.add(job)
+            db.commit()
+            if cover_path:
+                cover_url = client.upload_cover(cover_path, csrf=csrf)
 
-                upload_throttle = _apply_publish_stage_throttle(db, stage="upload", job_id=job_id)
-                _set_bilibili_upload_progress(db, job, active=True, progress=0)
-                last_upload_progress = -1
+            upload_throttle = _apply_publish_stage_throttle(db, stage="upload", job_id=job_id)
+            _set_bilibili_upload_progress(db, job, active=True, progress=0)
+            last_upload_progress = -1
 
-                def persist_upload_progress(uploaded_bytes: int, total_bytes: int) -> None:
-                    nonlocal last_upload_progress
-                    if total_bytes <= 0:
-                        return
-                    progress = max(0, min(100, int(uploaded_bytes * 100 / total_bytes)))
-                    if progress == last_upload_progress:
-                        return
-                    last_upload_progress = progress
-                    _set_bilibili_upload_progress(db, job, active=True, progress=progress)
+            def persist_upload_progress(uploaded_bytes: int, total_bytes: int) -> None:
+                nonlocal last_upload_progress
+                if total_bytes <= 0:
+                    return
+                progress = max(0, min(100, int(uploaded_bytes * 100 / total_bytes)))
+                if progress == last_upload_progress:
+                    return
+                last_upload_progress = progress
+                _set_bilibili_upload_progress(db, job, active=True, progress=progress)
 
-                uploaded, upload_debug = client.upload_video_file(video_path, on_progress=persist_upload_progress)
-                _set_bilibili_upload_progress(db, job, active=False, progress=100)
-                predicted_tid: int | None = None
-                tid_meta = int(meta.typeid)
-                tid = tid_meta
-                selected_by = "meta"
+            uploaded, upload_debug = client.upload_video_file(video_path, on_progress=persist_upload_progress)
+            _set_bilibili_upload_progress(db, job, active=False, progress=100)
+            predicted_tid: int | None = None
+            tid_meta = int(meta.typeid)
+            tid = tid_meta
+            selected_by = "meta"
 
-                ai_info: dict[str, Any] = {
-                    "ok": False,
-                    "typeid": None,
-                    "path": None,
-                    "reason": "",
-                    "text_source": "",
-                    "text_chars": 0,
-                    "candidate_count": 0,
-                }
-                if typeid_mode == "ai_summary":
-                    summary = get_task_bilibili_summary(db, str(task.id))
-                    text_for_ai = (summary or "").strip()
-                    text_source = "summary"
-                    if not text_for_ai:
-                        text_for_ai = f"{meta.title}\n{meta.desc}".strip()
-                        text_source = "meta"
+            ai_info: dict[str, Any] = {
+                "ok": False,
+                "typeid": None,
+                "path": None,
+                "reason": "",
+                "text_source": "",
+                "text_chars": 0,
+                "candidate_count": 0,
+            }
+            if typeid_mode == "ai_summary":
+                summary = get_task_bilibili_summary(db, str(task.id))
+                text_for_ai = (summary or "").strip()
+                text_source = "summary"
+                if not text_for_ai:
+                    text_for_ai = f"{meta.title}\n{meta.desc}".strip()
+                    text_source = "meta"
 
-                    translate_settings = get_translate_settings(db, get_subtitle_settings())
-                    api_key = str(translate_settings.get("openai_api_key") or "").strip()
-                    ai_info["text_source"] = text_source
-                    ai_info["text_chars"] = len(text_for_ai)
+                translate_settings = get_translate_settings(db, get_subtitle_settings())
+                api_key = str(translate_settings.get("openai_api_key") or "").strip()
+                ai_info["text_source"] = text_source
+                ai_info["text_chars"] = len(text_for_ai)
 
-                    if not api_key:
-                        ai_info["reason"] = "openai api key not set"
-                    elif not text_for_ai:
-                        ai_info["reason"] = "text is empty"
-                    else:
-                        try:
-                            pre = client.archive_pre()
-                            data = _as_dict(pre.get("data"))
-                            typelist = data.get("typelist")
-                            options = flatten_typelist(typelist)
-                            ai_info["candidate_count"] = len(options)
-                            if not options:
-                                ai_info["reason"] = "bilibili typelist is empty"
-                            else:
-                                id_to_path = {int(o.get("id") or 0): str(o.get("path") or "").strip() for o in options}
-                                obj = _ai_service().recommend_typeid(
-                                    text_for_ai,
-                                    options=options,
-                                )
-                                tid_ai = int(obj.get("typeid") or 0)
-                                ai_info["typeid"] = tid_ai or None
-                                ai_info["reason"] = str(obj.get("reason") or "").strip()
-                                if tid_ai in id_to_path:
-                                    tid = tid_ai
-                                    selected_by = "ai_summary"
-                                    ai_info["ok"] = True
-                                    ai_info["path"] = id_to_path.get(tid_ai) or None
-                        except Exception as e:
-                            ai_info["reason"] = f"ai failed: {type(e).__name__}"
-
-                    if selected_by != "ai_summary":
-                        try:
-                            predicted_tid = client.predict_type(
-                                csrf=csrf,
-                                filename=uploaded.filename_no_suffix,
-                                title=meta.title,
-                                upload_id=uploaded.upload_id,
+                if not api_key:
+                    ai_info["reason"] = "openai api key not set"
+                elif not text_for_ai:
+                    ai_info["reason"] = "text is empty"
+                else:
+                    try:
+                        pre = client.archive_pre()
+                        data = _as_dict(pre.get("data"))
+                        typelist = data.get("typelist")
+                        options = flatten_typelist(typelist)
+                        ai_info["candidate_count"] = len(options)
+                        if not options:
+                            ai_info["reason"] = "bilibili typelist is empty"
+                        else:
+                            id_to_path = {int(o.get("id") or 0): str(o.get("path") or "").strip() for o in options}
+                            obj = _ai_service().recommend_typeid(
+                                text_for_ai,
+                                options=options,
                             )
-                        except Exception:
-                            predicted_tid = None
-                        if predicted_tid:
-                            tid = int(predicted_tid)
-                            selected_by = "bilibili_predict"
-                elif typeid_mode == "bilibili_predict":
-                    predicted_tid = client.predict_type(
-                        csrf=csrf,
-                        filename=uploaded.filename_no_suffix,
-                        title=meta.title,
-                        upload_id=uploaded.upload_id,
-                    )
+                            tid_ai = int(obj.get("typeid") or 0)
+                            ai_info["typeid"] = tid_ai or None
+                            ai_info["reason"] = str(obj.get("reason") or "").strip()
+                            if tid_ai in id_to_path:
+                                tid = tid_ai
+                                selected_by = "ai_summary"
+                                ai_info["ok"] = True
+                                ai_info["path"] = id_to_path.get(tid_ai) or None
+                    except Exception as e:
+                        ai_info["reason"] = f"ai failed: {type(e).__name__}"
+
+                if selected_by != "ai_summary":
+                    try:
+                        predicted_tid = client.predict_type(
+                            csrf=csrf,
+                            filename=uploaded.filename_no_suffix,
+                            title=meta.title,
+                            upload_id=uploaded.upload_id,
+                        )
+                    except Exception:
+                        predicted_tid = None
                     if predicted_tid:
                         tid = int(predicted_tid)
                         selected_by = "bilibili_predict"
-
-                typeid_debug = {
-                    "mode": typeid_mode,
-                    "selected": tid,
-                    "selected_by": selected_by,
-                    "meta": tid_meta,
-                    "predicted": predicted_tid,
-                    "ai": ai_info,
-                }
-                logger.info(
-                    "select tid (mode=%s selected=%s by=%s meta=%s predicted=%s ai_ok=%s ai_tid=%s)",
-                    typeid_mode,
-                    tid,
-                    selected_by,
-                    tid_meta,
-                    predicted_tid,
-                    bool(ai_info.get("ok")),
-                    ai_info.get("typeid"),
-                )
-
-                submit_throttle = _apply_publish_stage_throttle(db, stage="submit", job_id=job_id)
-                add_resp, meta, desc_retry = _add_archive_with_desc_retry(
-                    client=client,
-                    meta=meta,
+            elif typeid_mode == "bilibili_predict":
+                predicted_tid = client.predict_type(
                     csrf=csrf,
-                    tid=tid,
-                    uploaded=uploaded,
-                    cover_url=cover_url,
+                    filename=uploaded.filename_no_suffix,
+                    title=meta.title,
+                    upload_id=uploaded.upload_id,
                 )
-                add_data = _as_dict(add_resp.get("data"))
-                try:
-                    aid_int = int(add_data.get("aid") or 0)
-                except Exception:
-                    aid_int = 0
-                if task.source_type.value == "youtube":
-                    if aid_int > 0:
-                        collection_result = _attach_youtube_uploader_collection(
-                            client=client,
-                            task=task,
-                            meta=meta,
-                            uploaded_cid=uploaded.cid,
-                            aid=aid_int,
-                            csrf=csrf,
-                            cover_url=cover_url,
-                            store=store,
-                            db=db,
-                        )
-                    else:
-                        collection_result = {
-                            "ok": False,
-                            "skipped": True,
-                            "reason": "publish response missing aid; cannot attach collection",
-                        }
-                    if collection_result and not bool(collection_result.get("ok")) and not bool(collection_result.get("skipped")):
-                        logger.warning("youtube uploader collection attach failed (task_id=%s): %s", task.id, collection_result)
+                if predicted_tid:
+                    tid = int(predicted_tid)
+                    selected_by = "bilibili_predict"
+
+            typeid_debug = {
+                "mode": typeid_mode,
+                "selected": tid,
+                "selected_by": selected_by,
+                "meta": tid_meta,
+                "predicted": predicted_tid,
+                "ai": ai_info,
+            }
+            logger.info(
+                "select tid (mode=%s selected=%s by=%s meta=%s predicted=%s ai_ok=%s ai_tid=%s)",
+                typeid_mode,
+                tid,
+                selected_by,
+                tid_meta,
+                predicted_tid,
+                bool(ai_info.get("ok")),
+                ai_info.get("typeid"),
+            )
+
+            submit_throttle = _apply_publish_stage_throttle(db, stage="submit", job_id=job_id)
+            add_resp, meta, desc_retry = _add_archive_with_desc_retry(
+                client=client,
+                meta=meta,
+                csrf=csrf,
+                tid=tid,
+                uploaded=uploaded,
+                cover_url=cover_url,
+            )
+            add_data = _as_dict(add_resp.get("data"))
+            try:
+                aid_int = int(add_data.get("aid") or 0)
+            except Exception:
+                aid_int = 0
+            if task.source_type.value == "youtube":
+                if aid_int > 0:
+                    collection_result = _attach_youtube_uploader_collection(
+                        client=client,
+                        task=task,
+                        meta=meta,
+                        uploaded_cid=uploaded.cid,
+                        aid=aid_int,
+                        csrf=csrf,
+                        cover_url=cover_url,
+                        store=store,
+                        db=db,
+                    )
+                else:
+                    collection_result = {
+                        "ok": False,
+                        "skipped": True,
+                        "reason": "publish response missing aid; cannot attach collection",
+                    }
+                if collection_result and not bool(collection_result.get("ok")) and not bool(collection_result.get("skipped")):
+                    logger.warning("youtube uploader collection attach failed (task_id=%s): %s", task.id, collection_result)
 
         data = _as_dict(add_resp.get("data"))
         aid = data.get("aid")
@@ -1014,8 +1009,8 @@ def _process_job_impl(self, job_id: str) -> dict[str, Any]:
                 task.status = TaskStatus.publishing
                 db.add(task)
             if store is None:
-                store = S3Store(settings)
-                store.ensure_bucket()
+                store = FileStore(settings)
+                store.ensure_ready()
             if store and task:
                 result_key = unique_publish_result_key(task.id)
                 result_bytes = json.dumps(job.response_json or {"error": str(e)}, ensure_ascii=False, indent=2).encode("utf-8")
@@ -1069,8 +1064,8 @@ def _process_job_impl(self, job_id: str) -> dict[str, Any]:
                     task.error_message = e.message or str(e)
                     db.add(task)
                 if store is None:
-                    store = S3Store(settings)
-                    store.ensure_bucket()
+                    store = FileStore(settings)
+                    store.ensure_ready()
                 if store and task and job and job.response_json:
                     result_key = unique_publish_result_key(task.id)
                     store.put_bytes(
@@ -1112,8 +1107,8 @@ def _process_job_impl(self, job_id: str) -> dict[str, Any]:
                 task.error_message = str(e)
                 db.add(task)
             if store is None:
-                store = S3Store(settings)
-                store.ensure_bucket()
+                store = FileStore(settings)
+                store.ensure_ready()
             if store and task:
                 result_key = unique_publish_result_key(task.id)
                 result_bytes = json.dumps(

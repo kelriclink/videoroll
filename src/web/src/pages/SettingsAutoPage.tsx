@@ -454,6 +454,8 @@ export default function SettingsAutoPage() {
                   <option value="faster-whisper">faster-whisper</option>
                   <option value="openvino">openvino（方案2 / Intel Arc）</option>
                   <option value="external-whisper">external-whisper（外部 API）</option>
+                  <option value="groq-whisper">groq-whisper（GroqCloud，自动切片）</option>
+                  <option value="cloudflare-workers-ai">cloudflare-workers-ai（原生时间轴）</option>
                 </select>
               </label>
               <label className="block">
@@ -464,6 +466,15 @@ export default function SettingsAutoPage() {
                 <div className="mb-1 text-xs text-slate-600">model（可选：本地模型目录路径）</div>
                 <select className="w-full rounded border px-3 py-2 text-sm" value={asrModel} onChange={(e) => setAsrModel(e.target.value)}>
                   <option value="">(use default)</option>
+                  {asrEngine === "cloudflare-workers-ai" ? (
+                    <option value="@cf/openai/whisper-large-v3-turbo">@cf/openai/whisper-large-v3-turbo</option>
+                  ) : null}
+                  {asrEngine === "groq-whisper" ? (
+                    <>
+                      <option value="whisper-large-v3-turbo">whisper-large-v3-turbo</option>
+                      <option value="whisper-large-v3">whisper-large-v3</option>
+                    </>
+                  ) : null}
                   {(whisperModels ?? []).map((m) => (
                     <option key={m.name} value={m.path}>
                       {m.name} · {m.path}
@@ -471,7 +482,7 @@ export default function SettingsAutoPage() {
                   ))}
                 </select>
                 <div className="mt-2 text-xs text-slate-500">
-                  提示：留空表示使用 Settings · ASR 中的默认模型；选择 `openvino` 或 `external-whisper` 时使用对应引擎配置。
+                  提示：留空表示使用 Settings · ASR 中的默认模型；选择 `openvino`、`external-whisper`、`groq-whisper` 或 `cloudflare-workers-ai` 时使用对应引擎配置。
                 </div>
               </label>
             </div>

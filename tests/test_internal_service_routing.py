@@ -135,3 +135,7 @@ def test_subtitle_proxy_allows_each_dynamic_browser_operation(method: str, servi
 
 def test_subtitle_proxy_rejects_invalid_agent_run_id() -> None:
     assert not subtitle_service._is_browser_proxy_path_allowed("GET", "subtitle/agents/runs/not-a-uuid")
+
+
+def test_subtitle_proxy_allows_groq_asr_test() -> None:
+    assert subtitle_service._is_browser_proxy_path_allowed("POST", "subtitle/asr/groq/test")

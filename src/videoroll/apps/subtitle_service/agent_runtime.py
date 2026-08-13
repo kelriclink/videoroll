@@ -148,8 +148,30 @@ class ToolRegistry:
     def spec(self, name: str) -> ToolSpec:
         return self._tools[name].spec
 
+    def get(self, name: str) -> RegisteredTool[Any, Any]:
+        return self._tools[name]
+
     def specs(self) -> list[ToolSpec]:
         return [tool.spec for tool in self._tools.values()]
+
+    def invoke(self, name: str, arguments: Any) -> tuple[dict[str, Any], Any]:
+        """Validate and execute a registered tool, returning wire output and model output."""
+
+        tool = self.get(name)
+        if tool.handler is None:
+            raise RuntimeError(f"tool has no server handler: {name}")
+        validated_input = validate_model(tool.input_model, arguments)
+        raw_output = tool.handler(validated_input)
+        validated_output = (
+            validate_model(tool.output_model, raw_output)
+            if tool.output_model is not None
+            else raw_output
+        )
+        if isinstance(validated_output, BaseModel):
+            return validated_output.model_dump(mode="json"), validated_output
+        if isinstance(validated_output, dict):
+            return dict(validated_output), validated_output
+        raise RuntimeError(f"tool returned unsupported output type: {name}")
 
 
 class AgentBudgetExceeded(RuntimeError):

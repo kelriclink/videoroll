@@ -18,12 +18,8 @@ x-application-security: &application-security
 x-internal-environment: &internal-environment
   DATABASE_URL: ${DATABASE_URL:?DATABASE_URL must be set}
   REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
-  S3_ENDPOINT_URL: ${S3_ENDPOINT_URL:-http://minio:9000}
-  S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID:?S3_ACCESS_KEY_ID must be set}
-  S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:?S3_SECRET_ACCESS_KEY must be set}
-  S3_BUCKET: ${S3_BUCKET:-videoroll}
-  S3_REGION_NAME: ${S3_REGION_NAME:-us-east-1}
-  S3_USE_SSL: ${S3_USE_SSL:-false}
+  STORAGE_ROOT: ${STORAGE_ROOT:-/storage/objects}
+  TMPDIR: ${TMPDIR:-/storage/.partial}
   DEVELOPMENT_MODE: ${DEVELOPMENT_MODE:-false}
   INTERNAL_API_SECRET: ${INTERNAL_API_SECRET:?INTERNAL_API_SECRET must be set}
   ADMIN_BOOTSTRAP_SECRET: ${ADMIN_BOOTSTRAP_SECRET:?ADMIN_BOOTSTRAP_SECRET must be set}
@@ -42,20 +38,26 @@ x-subtitle-environment: &subtitle-environment
   SUBTITLE_OPENVINO_DEVICE: ${SUBTITLE_OPENVINO_DEVICE:-GPU}
   SUBTITLE_OPENVINO_NUM_BEAMS: ${SUBTITLE_OPENVINO_NUM_BEAMS:-1}
   SUBTITLE_OPENVINO_MAX_NEW_TOKENS: ${SUBTITLE_OPENVINO_MAX_NEW_TOKENS:-448}
+  SUBTITLE_GROQ_WHISPER_API_KEY: ${SUBTITLE_GROQ_WHISPER_API_KEY:-}
+  SUBTITLE_GROQ_WHISPER_MODEL: ${SUBTITLE_GROQ_WHISPER_MODEL:-whisper-large-v3-turbo}
+  SUBTITLE_CLOUDFLARE_ACCOUNT_ID: ${SUBTITLE_CLOUDFLARE_ACCOUNT_ID:-}
+  SUBTITLE_CLOUDFLARE_API_KEY: ${SUBTITLE_CLOUDFLARE_API_KEY:-}
+  SUBTITLE_CLOUDFLARE_MODEL: ${SUBTITLE_CLOUDFLARE_MODEL:-@cf/openai/whisper-large-v3-turbo}
   SUBTITLE_OPENVINO_VAD_ENABLED: ${SUBTITLE_OPENVINO_VAD_ENABLED:-true}
   SUBTITLE_OPENVINO_VAD_THRESHOLD: ${SUBTITLE_OPENVINO_VAD_THRESHOLD:-0.5}
   FFMPEG_PATH: ${FFMPEG_PATH:-ffmpeg}
-  WORK_DIR: ${WORK_DIR:-/work/videoroll}
+  WORK_DIR: ${WORK_DIR:-/storage/work/videoroll}
   YOUTUBE_USER_AGENT: "${YOUTUBE_USER_AGENT:-Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36}"
   YOUTUBE_COOKIE_FILE: ${YOUTUBE_COOKIE_FILE:-}
   YOUTUBE_PROXY: ${YOUTUBE_PROXY:-}
   YOUTUBE_EXTRACTOR_ARGS_JSON: ${YOUTUBE_EXTRACTOR_ARGS_JSON:-}
   TASK_QUEUE_TICK_INTERVAL_SECONDS: ${TASK_QUEUE_TICK_INTERVAL_SECONDS:-10}
+  SUBTITLE_DICTIONARY_DATA_DIR: ${SUBTITLE_DICTIONARY_DATA_DIR:-/storage/state/dictionaries}
   INTEL_GPU_RENDER_DEVICE: ${INTEL_GPU_RENDER_DEVICE:-/dev/dri/renderD128}
 
 x-social-publisher-environment: &social-publisher-environment
   <<: *internal-environment
-  SOCIAL_PUBLISH_WORK_DIR: ${SOCIAL_PUBLISH_WORK_DIR:-/work/social-publisher}
+  SOCIAL_PUBLISH_WORK_DIR: ${SOCIAL_PUBLISH_WORK_DIR:-/storage/work/social-publisher}
   SAU_EXECUTABLE: ${SAU_EXECUTABLE:-sau}
   SAU_RUNTIME_DIR: ${SAU_RUNTIME_DIR:-/opt/social-auto-upload}
   SAU_COOKIES_DIR: ${SAU_COOKIES_DIR:-/opt/social-auto-upload/cookies}
@@ -82,34 +84,6 @@ services:
       timeout: 5s
       retries: 10
     restart: unless-stopped
-
-  minio:
-    image: minio/minio:latest
-    command: server /data --console-address ":9001"
-    environment:
-      MINIO_ROOT_USER: ${S3_ACCESS_KEY_ID:?S3_ACCESS_KEY_ID must be set}
-      MINIO_ROOT_PASSWORD: ${S3_SECRET_ACCESS_KEY:?S3_SECRET_ACCESS_KEY must be set}
-    volumes:
-      - ./data/minio:/data
-    networks: [internal]
-    healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:9000/minio/health/ready"]
-      interval: 15s
-      timeout: 10s
-      retries: 10
-    restart: unless-stopped
-
-  minio-init:
-    image: minio/mc:latest
-    depends_on:
-      minio:
-        condition: service_healthy
-    entrypoint: /bin/sh
-    command: >
-      -c "until mc alias set local http://minio:9000 ${S3_ACCESS_KEY_ID:?S3_ACCESS_KEY_ID must be set} ${S3_SECRET_ACCESS_KEY:?S3_SECRET_ACCESS_KEY must be set}; do
-      echo 'waiting for minio...'; sleep 1; done && mc mb -p local/${S3_BUCKET:-videoroll} || true"
-    networks: [internal]
-    restart: "no"
 
   egress-gateway:
     build:
@@ -146,7 +120,7 @@ services:
       YOUTUBE_INGEST_URL: http://youtube-ingest:8002
       BILIBILI_PUBLISHER_URL: http://bilibili-publisher:8003
       SOCIAL_PUBLISHER_URL: http://social-publisher-api:8010
-      WORK_DIR: ${WORK_DIR:-/work/videoroll}
+      WORK_DIR: ${WORK_DIR:-/storage/work/videoroll}
       FFMPEG_PATH: ${FFMPEG_PATH:-ffmpeg}
       LIVE_INTERNAL_STREAM_BASE_URL: ${LIVE_INTERNAL_STREAM_BASE_URL:-http://127.0.0.1:8000}
       INTEL_GPU_RENDER_DEVICE: ${INTEL_GPU_RENDER_DEVICE:-/dev/dri/renderD128}
@@ -157,7 +131,7 @@ services:
       STORAGE_CLEANUP_INTERVAL_SECONDS: ${STORAGE_CLEANUP_INTERVAL_SECONDS:-3600}
     volumes:
       - ./data/secrets:/secrets
-      - ./data/work:/work
+      - ${STORAGE_HOST_ROOT:-./data/storage}:/storage
     devices:
       - "/dev/dri:/dev/dri"
     group_add:
@@ -165,8 +139,6 @@ services:
     depends_on:
       redis:
         condition: service_healthy
-      minio-init:
-        condition: service_completed_successfully
       egress-gateway:
         condition: service_healthy
       subtitle-service:
@@ -198,12 +170,10 @@ services:
     volumes:
       - ./data/models:/models
       - ./data/secrets:/secrets
-      - ./data/work:/work
+      - ${STORAGE_HOST_ROOT:-./data/storage}:/storage
     depends_on:
       redis:
         condition: service_healthy
-      minio-init:
-        condition: service_completed_successfully
       egress-gateway:
         condition: service_healthy
     networks: [internal]
@@ -224,11 +194,11 @@ services:
       DEPLOYMENT_ROLE: youtube-ingest-api
       YOUTUBE_USER_AGENT: "${YOUTUBE_USER_AGENT:-Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36}"
       YOUTUBE_PROXY: ${YOUTUBE_PROXY:-}
+    volumes:
+      - ${STORAGE_HOST_ROOT:-./data/storage}:/storage
     depends_on:
       redis:
         condition: service_healthy
-      minio-init:
-        condition: service_completed_successfully
     networks: [internal]
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8002/health', timeout=5)"]
@@ -248,11 +218,10 @@ services:
       BILIBILI_PUBLISH_MODE: ${BILIBILI_PUBLISH_MODE:-web}
     volumes:
       - ./data/secrets:/secrets
+      - ${STORAGE_HOST_ROOT:-./data/storage}:/storage
     depends_on:
       redis:
         condition: service_healthy
-      minio-init:
-        condition: service_completed_successfully
     networks: [internal]
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8003/health', timeout=5)"]
@@ -273,12 +242,10 @@ services:
     volumes:
       - ./data/models:/models
       - ./data/secrets:/secrets
-      - ./data/work:/work
+      - ${STORAGE_HOST_ROOT:-./data/storage}:/storage
     depends_on:
       redis:
         condition: service_healthy
-      minio-init:
-        condition: service_completed_successfully
       egress-gateway:
         condition: service_healthy
     networks: [internal]
@@ -297,11 +264,11 @@ services:
     environment:
       <<: *subtitle-environment
       DEPLOYMENT_ROLE: outbox-dispatcher
+    volumes:
+      - ${STORAGE_HOST_ROOT:-./data/storage}:/storage
     depends_on:
       redis:
         condition: service_healthy
-      minio-init:
-        condition: service_completed_successfully
       subtitle-worker:
         condition: service_healthy
       publish-worker:
@@ -327,11 +294,10 @@ services:
       BILIBILI_PUBLISH_MODE: ${BILIBILI_PUBLISH_MODE:-web}
     volumes:
       - ./data/secrets:/secrets
+      - ${STORAGE_HOST_ROOT:-./data/storage}:/storage
     depends_on:
       redis:
         condition: service_healthy
-      minio-init:
-        condition: service_completed_successfully
     networks: [internal]
     healthcheck:
       test: ["CMD-SHELL", "celery -A videoroll.apps.bilibili_publisher.worker:celery_app inspect ping --timeout=3 --destination=celery@$${HOSTNAME} | grep -q pong"]
@@ -352,15 +318,13 @@ services:
       DEPLOYMENT_ROLE: social-publisher-api
     volumes:
       - ./data/secrets:/secrets
-      - ./data/social-publisher:/work/social-publisher
+      - ${STORAGE_HOST_ROOT:-./data/storage}:/storage
     tmpfs:
       - /opt/social-auto-upload/cookies:mode=0700,uid=${APP_UID:-10001},gid=${APP_GID:-10001}
       - /dev/shm:mode=1777
     depends_on:
       redis:
         condition: service_healthy
-      minio-init:
-        condition: service_completed_successfully
     networks: [internal]
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8010/health', timeout=5)"]
@@ -381,15 +345,13 @@ services:
       DEPLOYMENT_ROLE: social-publisher-worker
     volumes:
       - ./data/secrets:/secrets
-      - ./data/social-publisher:/work/social-publisher
+      - ${STORAGE_HOST_ROOT:-./data/storage}:/storage
     tmpfs:
       - /opt/social-auto-upload/cookies:mode=0700,uid=${APP_UID:-10001},gid=${APP_GID:-10001}
       - /dev/shm:mode=1777
     depends_on:
       redis:
         condition: service_healthy
-      minio-init:
-        condition: service_completed_successfully
     networks: [internal]
     healthcheck:
       test: ["CMD-SHELL", "celery -A videoroll.apps.social_publisher.worker:celery_app inspect ping --timeout=3 --destination=celery@$${HOSTNAME} | grep -q pong"]
@@ -410,6 +372,7 @@ services:
       DEPLOYMENT_ROLE: social-publisher-scheduler
     volumes:
       - ./data/secrets:/secrets
+      - ${STORAGE_HOST_ROOT:-./data/storage}:/storage
     depends_on:
       redis:
         condition: service_healthy

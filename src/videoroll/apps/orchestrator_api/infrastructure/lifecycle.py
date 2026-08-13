@@ -21,7 +21,7 @@ from videoroll.config import get_orchestrator_settings
 from videoroll.db.auto_migrate import auto_migrate
 from videoroll.db.base import Base
 from videoroll.db.session import get_engine, get_sessionmaker
-from videoroll.storage.s3 import S3Store
+from videoroll.storage.filesystem import FileStore
 
 
 def initialize_runtime(app: FastAPI) -> OrchestratorScheduler:
@@ -30,7 +30,7 @@ def initialize_runtime(app: FastAPI) -> OrchestratorScheduler:
     engine = get_engine(settings.database_url)
     Base.metadata.create_all(engine)
     auto_migrate(settings.database_url)
-    S3Store(settings).ensure_bucket()
+    FileStore(settings).ensure_ready()
     Path(settings.work_dir).mkdir(parents=True, exist_ok=True)
 
     app.state.database_url = settings.database_url

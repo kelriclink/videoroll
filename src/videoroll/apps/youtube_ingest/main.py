@@ -21,7 +21,7 @@ from videoroll.db.models import (
     YouTubeSource,
 )
 from videoroll.db.session import db_session, get_engine
-from videoroll.storage.s3 import S3Store
+from videoroll.storage.filesystem import FileStore
 from videoroll.apps.youtube_ingest.schemas import (
     YouTubeIngestRequest,
     YouTubeIngestResponse,
@@ -72,7 +72,7 @@ def _startup() -> None:
     engine = get_engine(settings.database_url)
     Base.metadata.create_all(engine)
     auto_migrate(settings.database_url)
-    S3Store(settings).ensure_bucket()
+    FileStore(settings).ensure_ready()
 
 
 @app.get("/health")

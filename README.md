@@ -26,7 +26,8 @@ web / nginx ──► orchestrator
                     ├── social-publisher-api + worker + scheduler
                     └── outbox-dispatcher
 
-Redis / MinIO / PostgreSQL（外部） ◄── 所有任务与产物状态
+Redis / PostgreSQL（外部） ◄── 队列、任务与产物状态
+共享文件系统 `/storage` ◄── 所有视频、音频、字幕和日志
 egress-gateway（唯一允许访问公网的抓取出口）
 ```
 
@@ -36,7 +37,7 @@ egress-gateway（唯一允许访问公网的抓取出口）
 
 - Docker Engine 与 Docker Compose Plugin
 - PostgreSQL 16+，启用 `pgvector`
-- 可用的网络和对象存储凭据
+- 可用的网络和一个可写的共享存储目录
 - 可选：Intel iGPU 与 `/dev/dri/renderD128`（OpenVINO ASR）
 
 ## 本地开发
@@ -65,22 +66,23 @@ git submodule update --init --recursive
 ENV_FILE=/path/to/production.env INCLUDE_BASE_IMAGES=1 ./scripts/build_export_prod.sh
 ```
 
-包内包含应用、egress gateway、Web、社交发布器、Redis、MinIO 和 MinIO Client 镜像。目标机只需保留 Compose、私有 `.env` 和现有 `data/` 目录：
+包内包含应用、egress gateway、Web、社交发布器和 Redis 镜像。目标机只需保留 Compose、私有 `.env` 和共享存储目录：
 
 ```bash
 sha256sum -c videoroll-prod-bundle-*.tar.sha256
 docker load -i videoroll-prod-bundle-*.tar
-docker compose --env-file .env up -d --no-build
+docker compose --env-file .env up -d --no-build --remove-orphans
 ```
 
-不要覆盖已有的 `data/minio`、`data/models`、`data/work`、`data/secrets` 或 `data/social-publisher`；数据库连接也应保留。完整上线、迁移、GPU 和回退步骤见[部署指南](docs/DEPLOYMENT.md)。
+不要覆盖已有的 `STORAGE_HOST_ROOT`、`data/models`、`data/secrets` 或 `data/redis`；数据库连接也应保留。完整上线、GPU 和回退步骤见[部署指南](docs/DEPLOYMENT.md)。
 
 ## 关键生产变量
 
 | 变量 | 要求 |
 |---|---|
 | `DATABASE_URL` | 指向外部 PostgreSQL，生产已有连接应保持不变。 |
-| `S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY` | 随机、私有的 MinIO/S3 凭据。 |
+| `STORAGE_HOST_ROOT` | 宿主机共享文件根目录，默认使用部署目录下的 `./data/storage`。 |
+| `STORAGE_ROOT` | 容器内对象目录，默认 `/storage/objects`。 |
 | `INTERNAL_API_SECRET` | 随机且非空，用于内部服务身份与管理员 cookie 密钥派生。 |
 | `ADMIN_BOOTSTRAP_SECRET` | 随机且非空，仅用于首次管理员初始化。 |
 | `PUBLISH_ADDR` | Web 唯一宿主机绑定地址；通常先使用 `127.0.0.1` 并由反向代理公开。 |

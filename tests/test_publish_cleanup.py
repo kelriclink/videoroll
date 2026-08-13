@@ -30,7 +30,7 @@ def test_cleanup_retries_and_clears_marker_when_subtitle_work_is_in_flight() -> 
     with (
         patch("videoroll.apps.subtitle_service.worker._ensure_db"),
         patch("videoroll.apps.subtitle_service.worker._db", return_value=db),
-        patch("videoroll.apps.subtitle_service.worker.S3Store") as store_cls,
+        patch("videoroll.apps.subtitle_service.worker.FileStore") as store_cls,
         patch.object(cleanup_task, "retry", side_effect=Retry()),
     ):
         store_cls.return_value.ensure_bucket.return_value = None

@@ -174,6 +174,18 @@ export default function SettingsApiPage() {
           <pre className="mt-2 whitespace-pre-wrap break-all font-mono text-xs text-slate-800">{sampleCurl}</pre>
         </div>
       </div>
+
+      <div className="rounded border bg-white p-4">
+        <div className="text-sm font-semibold">Chrome / Edge 右键扩展</div>
+        <div className="mt-2 text-sm text-slate-600">
+          仓库中的 <span className="font-mono">extensions/videoroll-youtube-submit</span> 可以在 YouTube 视频页或缩略图上右键，将视频直接提交到自动模式。
+          扩展设置中的 API 地址填写下面的完整地址，Token 使用本页保存的同一个 Token。
+        </div>
+        <div className="mt-3 rounded border bg-slate-50 p-3 font-mono text-xs text-slate-800 break-all">{remoteEndpoint}</div>
+        <div className="mt-2 text-xs text-slate-500">
+          执行 <span className="font-mono">./scripts/build_browser_extension.sh</span> 可生成 <span className="font-mono">dist/videoroll-youtube-submit.zip</span>；解压后在浏览器扩展管理页选择“加载已解压的扩展程序”。
+        </div>
+      </div>
     </div>
   );
 }

@@ -12,6 +12,9 @@ from videoroll.utils.openai_compat import normalize_openai_base_url
 
 TRANSLATE_SETTINGS_KEY = "subtitle.translate"
 _SEARXNG_TIME_RANGES = {"", "day", "month", "year"}
+_OPENAI_API_TYPES = {"openai", "cerebras"}
+_CEREBRAS_REASONING_EFFORTS = {"low", "medium", "high"}
+_CEREBRAS_REASONING_FORMATS = {"parsed", "raw", "hidden"}
 
 
 def _clean_csv(value: Any, *, default: str = "", limit: int = 20) -> str:
@@ -97,6 +100,12 @@ def get_translate_settings(db: Session, defaults: SubtitleServiceSettings) -> di
         "openai_temperature": float(openai.get("temperature") or defaults.openai_temperature),
         "openai_timeout_seconds": float(openai.get("timeout_seconds") or defaults.openai_timeout_seconds),
         "openai_max_retries": int(openai.get("max_retries") or stored.get("openai_max_retries") or 3),
+        "openai_api_type": str(openai.get("api_type") or "openai"),
+        "openai_enable_thinking": bool(
+            openai.get("enable_thinking") if "enable_thinking" in openai else False
+        ),
+        "cerebras_reasoning_effort": str(openai.get("cerebras_reasoning_effort") or "medium"),
+        "cerebras_reasoning_format": str(openai.get("cerebras_reasoning_format") or "parsed"),
         "rag_enabled": bool(stored.get("rag_enabled") if "rag_enabled" in stored else defaults.rag_enabled),
         "rag_top_k": int(stored.get("rag_top_k") or defaults.rag_top_k),
         "rag_min_score": float(stored.get("rag_min_score") or defaults.rag_min_score),
@@ -246,6 +255,10 @@ def update_translate_settings(db: Session, defaults: SubtitleServiceSettings, up
         ("openai_temperature", "temperature"),
         ("openai_timeout_seconds", "timeout_seconds"),
         ("openai_max_retries", "max_retries"),
+        ("openai_api_type", "api_type"),
+        ("openai_enable_thinking", "enable_thinking"),
+        ("cerebras_reasoning_effort", "cerebras_reasoning_effort"),
+        ("cerebras_reasoning_format", "cerebras_reasoning_format"),
     ]:
         if key not in update:
             continue
@@ -331,6 +344,7 @@ def update_translate_settings(db: Session, defaults: SubtitleServiceSettings, up
     except Exception:
         stored["rag_embedding_timeout_seconds"] = defaults.rag_embedding_timeout_seconds
     for bool_key in [
+        "default_enable_summary",
         "rag_enabled",
         "rag_auto_discover_terms",
         "rag_auto_learn_terms",
@@ -344,6 +358,19 @@ def update_translate_settings(db: Session, defaults: SubtitleServiceSettings, up
     ]:
         if bool_key in stored:
             stored[bool_key] = bool(stored[bool_key])
+    if "enable_thinking" in openai:
+        openai["enable_thinking"] = bool(openai["enable_thinking"])
+    api_type = str(openai.get("api_type") or "openai").strip().lower()
+    openai["api_type"] = api_type if api_type in _OPENAI_API_TYPES else "openai"
+    reasoning_effort = str(openai.get("cerebras_reasoning_effort") or "medium").strip().lower()
+    openai["cerebras_reasoning_effort"] = (
+        reasoning_effort if reasoning_effort in _CEREBRAS_REASONING_EFFORTS else "medium"
+    )
+    reasoning_format = str(openai.get("cerebras_reasoning_format") or "parsed").strip().lower()
+    openai["cerebras_reasoning_format"] = (
+        reasoning_format if reasoning_format in _CEREBRAS_REASONING_FORMATS else "parsed"
+    )
+    stored["openai"] = openai
     provider = str(stored.get("rag_embedding_provider") or defaults.rag_embedding_provider).strip().lower()
     stored["rag_embedding_provider"] = provider if provider in {"openai", "local"} else defaults.rag_embedding_provider
     for str_key in [

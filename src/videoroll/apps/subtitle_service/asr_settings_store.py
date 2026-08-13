@@ -12,10 +12,13 @@ from videoroll.utils.openai_compat import normalize_openai_base_url
 
 ASR_SETTINGS_KEY = "subtitle.asr"
 
-_ALLOWED_ENGINES = {"mock", "faster-whisper", "openvino", "external-whisper"}
+_ALLOWED_ENGINES = {"mock", "faster-whisper", "openvino", "external-whisper", "groq-whisper", "cloudflare-workers-ai"}
 _MAX_PROXY_LEN = 2048
 _MAX_EXTERNAL_BASE_URL_LEN = 2048
 _MAX_EXTERNAL_MODEL_LEN = 256
+_MAX_GROQ_MODEL_LEN = 256
+_MAX_CLOUDFLARE_ACCOUNT_ID_LEN = 128
+_MAX_CLOUDFLARE_MODEL_LEN = 256
 _MIN_OPENVINO_VAD_THRESHOLD = 0.1
 _MAX_OPENVINO_VAD_THRESHOLD = 0.95
 
@@ -59,7 +62,15 @@ def get_asr_settings(db: Session, defaults: SubtitleServiceSettings) -> dict[str
         engine_default_model = str(defaults.openvino_model or "").strip()
     elif engine == "external-whisper":
         engine_default_model = str(defaults.external_whisper_model or "").strip()
+    elif engine == "groq-whisper":
+        engine_default_model = str(getattr(defaults, "groq_whisper_model", "") or "whisper-large-v3-turbo").strip()
+    elif engine == "cloudflare-workers-ai":
+        engine_default_model = str(
+            getattr(defaults, "cloudflare_workers_ai_model", "") or "@cf/openai/whisper-large-v3-turbo"
+        ).strip()
     model = str(stored.get("default_model") or engine_default_model).strip() or engine_default_model
+    if engine == "groq-whisper" and model not in {"whisper-large-v3", "whisper-large-v3-turbo"}:
+        model = engine_default_model
     openvino_device = str(stored.get("openvino_device") or defaults.openvino_device).strip() or defaults.openvino_device
     openvino_num_beams = int(stored.get("openvino_num_beams") or defaults.openvino_num_beams or 1)
     if openvino_num_beams <= 0:
@@ -91,6 +102,27 @@ def get_asr_settings(db: Session, defaults: SubtitleServiceSettings) -> dict[str
     external_model = str(external.get("model") or defaults.external_whisper_model or "whisper-1").strip()[:_MAX_EXTERNAL_MODEL_LEN]
     external_api_key = _decrypt_api_key(external.get("api_key_enc")) or str(defaults.external_whisper_api_key or "").strip()
 
+    groq = _as_dict(stored.get("groq_whisper"))
+    groq_model = str(
+        groq.get("model") or getattr(defaults, "groq_whisper_model", "") or "whisper-large-v3-turbo"
+    ).strip()[:_MAX_GROQ_MODEL_LEN]
+    groq_api_key = _decrypt_api_key(groq.get("api_key_enc")) or str(
+        getattr(defaults, "groq_whisper_api_key", "") or ""
+    ).strip()
+
+    cloudflare = _as_dict(stored.get("cloudflare_workers_ai"))
+    cloudflare_account_id = str(
+        cloudflare.get("account_id") or getattr(defaults, "cloudflare_workers_ai_account_id", "") or ""
+    ).strip()[:_MAX_CLOUDFLARE_ACCOUNT_ID_LEN]
+    cloudflare_model = str(
+        cloudflare.get("model")
+        or getattr(defaults, "cloudflare_workers_ai_model", "")
+        or "@cf/openai/whisper-large-v3-turbo"
+    ).strip()[:_MAX_CLOUDFLARE_MODEL_LEN]
+    cloudflare_api_key = _decrypt_api_key(cloudflare.get("api_key_enc")) or str(
+        getattr(defaults, "cloudflare_workers_ai_api_key", "") or ""
+    ).strip()
+
     return {
         "default_engine": engine,
         "default_language": language,
@@ -105,6 +137,13 @@ def get_asr_settings(db: Session, defaults: SubtitleServiceSettings) -> dict[str
         "external_whisper_model": external_model,
         "external_whisper_api_key": external_api_key,
         "external_whisper_api_key_set": bool(external_api_key),
+        "groq_whisper_model": groq_model,
+        "groq_whisper_api_key": groq_api_key,
+        "groq_whisper_api_key_set": bool(groq_api_key),
+        "cloudflare_workers_ai_account_id": cloudflare_account_id,
+        "cloudflare_workers_ai_model": cloudflare_model,
+        "cloudflare_workers_ai_api_key": cloudflare_api_key,
+        "cloudflare_workers_ai_api_key_set": bool(cloudflare_api_key),
     }
 
 
@@ -112,6 +151,8 @@ def update_asr_settings(db: Session, defaults: SubtitleServiceSettings, update: 
     row = _get_row(db)
     stored = dict(_as_dict(row.value_json))
     external = dict(_as_dict(stored.get("external_whisper")))
+    groq = dict(_as_dict(stored.get("groq_whisper")))
+    cloudflare = dict(_as_dict(stored.get("cloudflare_workers_ai")))
 
     if "default_engine" in update and update["default_engine"] is not None:
         val = str(update["default_engine"]).strip()
@@ -201,10 +242,63 @@ def update_asr_settings(db: Session, defaults: SubtitleServiceSettings, update: 
         else:
             external.pop("api_key_enc", None)
 
+    if "groq_whisper_model" in update and update["groq_whisper_model"] is not None:
+        val = str(update["groq_whisper_model"] or "").strip()
+        if len(val) > _MAX_GROQ_MODEL_LEN:
+            raise ValueError(f"groq_whisper_model is too long (max {_MAX_GROQ_MODEL_LEN} chars)")
+        if not val:
+            groq.pop("model", None)
+        else:
+            if val not in {"whisper-large-v3", "whisper-large-v3-turbo"}:
+                raise ValueError("groq_whisper_model must be whisper-large-v3 or whisper-large-v3-turbo")
+            groq["model"] = val
+
+    if "groq_whisper_api_key" in update and update["groq_whisper_api_key"] is not None:
+        val = str(update["groq_whisper_api_key"] or "").strip()
+        if val:
+            groq["api_key_enc"] = encrypt_str(val)
+        else:
+            groq.pop("api_key_enc", None)
+
+    if "cloudflare_workers_ai_account_id" in update and update["cloudflare_workers_ai_account_id"] is not None:
+        val = str(update["cloudflare_workers_ai_account_id"] or "").strip()
+        if len(val) > _MAX_CLOUDFLARE_ACCOUNT_ID_LEN:
+            raise ValueError(
+                f"cloudflare_workers_ai_account_id is too long (max {_MAX_CLOUDFLARE_ACCOUNT_ID_LEN} chars)"
+            )
+        if not val:
+            cloudflare.pop("account_id", None)
+        else:
+            cloudflare["account_id"] = val
+
+    if "cloudflare_workers_ai_model" in update and update["cloudflare_workers_ai_model"] is not None:
+        val = str(update["cloudflare_workers_ai_model"] or "").strip()
+        if len(val) > _MAX_CLOUDFLARE_MODEL_LEN:
+            raise ValueError(f"cloudflare_workers_ai_model is too long (max {_MAX_CLOUDFLARE_MODEL_LEN} chars)")
+        if not val:
+            cloudflare.pop("model", None)
+        else:
+            cloudflare["model"] = val
+
+    if "cloudflare_workers_ai_api_key" in update and update["cloudflare_workers_ai_api_key"] is not None:
+        val = str(update["cloudflare_workers_ai_api_key"] or "").strip()
+        if val:
+            cloudflare["api_key_enc"] = encrypt_str(val)
+        else:
+            cloudflare.pop("api_key_enc", None)
+
     if external:
         stored["external_whisper"] = external
     else:
         stored.pop("external_whisper", None)
+    if groq:
+        stored["groq_whisper"] = groq
+    else:
+        stored.pop("groq_whisper", None)
+    if cloudflare:
+        stored["cloudflare_workers_ai"] = cloudflare
+    else:
+        stored.pop("cloudflare_workers_ai", None)
 
     row.value_json = stored
     db.add(row)

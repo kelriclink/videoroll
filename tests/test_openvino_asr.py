@@ -163,7 +163,7 @@ class OpenVinoAsrTests(unittest.TestCase):
     def test_transcribe_openvino_whisper_skips_pipeline_when_vad_finds_no_speech(self) -> None:
         with (
             patch.object(processing, "_read_wav_as_float_mono_16k", return_value=([0.1] * 16000, 1.0)),
-            patch.object(processing, "_detect_openvino_speech_spans", return_value=[]),
+            patch.object(processing, "_detect_silero_speech_spans", return_value=[]),
             patch.object(processing, "_get_openvino_pipeline", side_effect=AssertionError("pipeline should not be created")),
         ):
             segments = processing.transcribe_openvino_whisper(
@@ -181,7 +181,7 @@ class OpenVinoAsrTests(unittest.TestCase):
         ]
         with (
             patch.object(processing, "_read_wav_as_float_mono_16k", return_value=([0.1] * 80000, 5.0)),
-            patch.object(processing, "_detect_openvino_speech_spans", return_value=spans),
+            patch.object(processing, "_detect_silero_speech_spans", return_value=spans),
             patch.object(processing, "_get_openvino_pipeline", return_value=fake_pipeline),
         ):
             segments = processing.transcribe_openvino_whisper(

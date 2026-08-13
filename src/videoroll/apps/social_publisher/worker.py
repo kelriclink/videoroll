@@ -2,10 +2,8 @@ from __future__ import annotations
 
 import json
 import logging
-import shutil
 import uuid
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any
 
 import redis
@@ -36,7 +34,7 @@ from videoroll.config import get_social_publisher_settings
 from videoroll.db.auto_migrate import auto_migrate
 from videoroll.db.models import Account, Platform, PublishJob, PublishState, Task, TaskStatus
 from videoroll.db.session import db_session, get_sessionmaker
-from videoroll.storage.s3 import S3Store
+from videoroll.storage.filesystem import FileStore
 
 
 settings = get_social_publisher_settings()
@@ -184,7 +182,6 @@ def _process_job_impl(self, job_id: str) -> dict[str, Any]:
     lock = None
     job: PublishJob | None = None
     task: Task | None = None
-    work_dir: Path | None = None
     job_hb: JobLeaseHeartbeat | None = None
     lease_owner: str | None = None
     try:
@@ -234,16 +231,11 @@ def _process_job_impl(self, job_id: str) -> dict[str, Any]:
         platform_options = _as_dict(request.get("platform_options"))
         video_key = str(video.get("key") or "").strip()
         if not video_key:
-            raise ValueError("video S3 key is missing")
-        work_dir = Path(settings.work_dir) / str(job.id)
-        work_dir.mkdir(parents=True, exist_ok=True)
-        video_path = work_dir / (Path(video_key).name or "video.mp4")
+            raise ValueError("video storage key is missing")
         cover_key = str(cover.get("key") or "").strip()
-        cover_path = work_dir / (Path(cover_key).name or "cover.jpg") if cover_key else None
-        store = S3Store(settings)
-        store.download_file(video_key, video_path)
-        if cover_path is not None:
-            store.download_file(cover_key, cover_path)
+        store = FileStore(settings)
+        video_path = store.path_for(video_key)
+        cover_path = store.path_for(cover_key) if cover_key else None
 
         with materialized_account_state(account, settings):
             command = build_upload_video_command(
@@ -314,8 +306,6 @@ def _process_job_impl(self, job_id: str) -> dict[str, Any]:
                 lock.release()
             except Exception:
                 pass
-        if work_dir is not None:
-            shutil.rmtree(work_dir, ignore_errors=True)
         if lease_owner is not None and job is not None:
             lease_db = _db()
             try:

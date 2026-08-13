@@ -29,12 +29,7 @@ class CommonSettings(BaseSettings):
         alias="ADMIN_BOOTSTRAP_SECRET",
     )
 
-    s3_endpoint_url: str = Field(..., alias="S3_ENDPOINT_URL")
-    s3_access_key_id: str = Field(..., alias="S3_ACCESS_KEY_ID")
-    s3_secret_access_key: str = Field(..., alias="S3_SECRET_ACCESS_KEY")
-    s3_bucket: str = Field(..., alias="S3_BUCKET")
-    s3_region_name: str = Field("us-east-1", alias="S3_REGION_NAME")
-    s3_use_ssl: bool = Field(False, alias="S3_USE_SSL")
+    storage_root: str = Field("/storage/objects", alias="STORAGE_ROOT")
 
 class OrchestratorSettings(CommonSettings):
     subtitle_service_url: str = Field("http://subtitle-service:8001", alias="SUBTITLE_SERVICE_URL")
@@ -57,6 +52,7 @@ class OrchestratorSettings(CommonSettings):
     youtube_cookie_file: str | None = Field(None, alias="YOUTUBE_COOKIE_FILE")
     youtube_proxy: str | None = Field(None, alias="YOUTUBE_PROXY")
     youtube_extractor_args_json: str | None = Field(None, alias="YOUTUBE_EXTRACTOR_ARGS_JSON")
+    youtube_compatibility_mode_enabled: bool = False
 
 
 class SubtitleServiceSettings(CommonSettings):
@@ -80,6 +76,13 @@ class SubtitleServiceSettings(CommonSettings):
     external_whisper_base_url: str = Field("", alias="SUBTITLE_EXTERNAL_WHISPER_BASE_URL")
     external_whisper_api_key: str | None = Field(None, alias="SUBTITLE_EXTERNAL_WHISPER_API_KEY")
     external_whisper_model: str = Field("whisper-1", alias="SUBTITLE_EXTERNAL_WHISPER_MODEL")
+    groq_whisper_api_key: str | None = Field(None, alias="SUBTITLE_GROQ_WHISPER_API_KEY")
+    groq_whisper_model: str = Field("whisper-large-v3-turbo", alias="SUBTITLE_GROQ_WHISPER_MODEL")
+    cloudflare_workers_ai_account_id: str = Field("", alias="SUBTITLE_CLOUDFLARE_ACCOUNT_ID")
+    cloudflare_workers_ai_api_key: str | None = Field(None, alias="SUBTITLE_CLOUDFLARE_API_KEY")
+    cloudflare_workers_ai_model: str = Field(
+        "@cf/openai/whisper-large-v3-turbo", alias="SUBTITLE_CLOUDFLARE_MODEL"
+    )
     ffmpeg_path: str = Field("ffmpeg", alias="FFMPEG_PATH")
     work_dir: str = Field("/tmp/videoroll", alias="WORK_DIR")
     intel_gpu_render_device: str = Field("/dev/dri/renderD128", alias="INTEL_GPU_RENDER_DEVICE")
@@ -90,6 +93,7 @@ class SubtitleServiceSettings(CommonSettings):
     youtube_cookie_file: str | None = Field(None, alias="YOUTUBE_COOKIE_FILE")
     youtube_proxy: str | None = Field(None, alias="YOUTUBE_PROXY")
     youtube_extractor_args_json: str | None = Field(None, alias="YOUTUBE_EXTRACTOR_ARGS_JSON")
+    youtube_compatibility_mode_enabled: bool = False
 
     translate_default_provider: str = Field("openai", alias="SUBTITLE_TRANSLATE_DEFAULT_PROVIDER")
     translate_default_target_lang: str = Field("zh", alias="SUBTITLE_TRANSLATE_DEFAULT_TARGET_LANG")

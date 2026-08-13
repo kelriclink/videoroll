@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import httpx
 
-from videoroll.ai.client import OpenAIChatConfig
+from videoroll.ai.client import OpenAIChatConfig, OpenAIToolCall, OpenAIToolTurn
 from videoroll.ai.client import request_openai_embedding
 from videoroll.apps.subtitle_service.agent_runtime import AgentBudget, AgentBudgetExceeded, AgentRuntime, AgentTraceEvent
 from videoroll.apps.subtitle_service.agent_skills import AgentSkill, SkillRegistry
@@ -253,11 +253,16 @@ def test_active_skill_is_passed_to_child_agent_and_filters_tools(monkeypatch) ->
     monkeypatch.setattr(rag_module, "fetch_search_evidence", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(rag_module, "fetch_wikipedia_evidence", lambda *_args, **_kwargs: [])
 
-    def fake_decision(**kwargs):
+    def fake_turn(**kwargs):
         captured.update(kwargs)
-        return {"action": "finish", "reason": "done", "skill_name": "web-only"}
+        return OpenAIToolTurn(
+            content="done",
+            assistant_message={"role": "assistant", "content": "done"},
+            tool_calls=[],
+            finish_reason="stop",
+        )
 
-    monkeypatch.setattr(rag_module, "research_agent_next_action_openai", fake_decision)
+    monkeypatch.setattr(rag_module, "request_openai_tool_turn", fake_turn)
 
     skill = AgentSkill(
         name="web-only",
@@ -287,10 +292,11 @@ def test_active_skill_is_passed_to_child_agent_and_filters_tools(monkeypatch) ->
     )
 
     assert evidence == []
-    assert tools_used == ["search"]
+    assert tools_used == []
     assert rounds == 1
-    assert captured["available_tools"] == ["rag_lookup", "search_web", "finish"]
-    assert captured["active_skills"][0]["name"] == "web-only"  # type: ignore[index]
+    tool_names = [tool["function"]["name"] for tool in captured["tools"]]  # type: ignore[index,union-attr]
+    assert tool_names == ["rag_lookup", "search_web", "finish"]
+    assert "web-only" in captured["messages"][1]["content"]  # type: ignore[index,operator]
     assert any(step.get("action") == "skill_activated" for step in steps)
 
 
@@ -688,13 +694,55 @@ def test_research_falls_back_to_search_when_wiki_verification_rejects(monkeypatc
     )
     monkeypatch.setattr(rag_module, "existing_term_norms", lambda *_args, **_kwargs: set())
     monkeypatch.setattr(rag_module, "generate_search_queries_openai", lambda **_kwargs: ["hobby knife definition"])
-    decisions = iter(
+    turns = iter(
         [
-            {"action": "wiki_search", "query": "hobby knife definition", "reason": "start with encyclopedic source"},
-            {"action": "finish", "reason": "wiki evidence collected", "final_answer_ready": True},
+            OpenAIToolTurn(
+                content="",
+                assistant_message={
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "wiki-1",
+                            "type": "function",
+                            "function": {"name": "wiki_search", "arguments": '{"query":"hobby knife definition"}'},
+                        }
+                    ],
+                },
+                tool_calls=[
+                    OpenAIToolCall(
+                        id="wiki-1",
+                        name="wiki_search",
+                        arguments={"query": "hobby knife definition"},
+                    )
+                ],
+                finish_reason="tool_calls",
+            ),
+            OpenAIToolTurn(
+                content="",
+                assistant_message={
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "finish-1",
+                            "type": "function",
+                            "function": {"name": "finish", "arguments": '{"reason":"wiki evidence collected"}'},
+                        }
+                    ],
+                },
+                tool_calls=[
+                    OpenAIToolCall(
+                        id="finish-1",
+                        name="finish",
+                        arguments={"reason": "wiki evidence collected"},
+                    )
+                ],
+                finish_reason="tool_calls",
+            ),
         ]
     )
-    monkeypatch.setattr(rag_module, "research_agent_next_action_openai", lambda **_kwargs: next(decisions))
+    monkeypatch.setattr(rag_module, "request_openai_tool_turn", lambda **_kwargs: next(turns))
 
     def fake_wiki(*_args, **_kwargs):
         tool_calls.append("wiki")
@@ -776,7 +824,7 @@ def test_research_falls_back_to_search_when_wiki_verification_rejects(monkeypatc
     assert tool_calls == ["wiki", "search"]
     assert any(step.get("action") == "evidence_tool_fallback" and step.get("tool") == "search" for step in steps)
     assert finished["status"] == "skipped"
-    assert finished["result"]["tools_used"] == ["wikipedia", "search"]  # type: ignore[index]
+    assert finished["result"]["tools_used"] == ["wiki_search", "search"]  # type: ignore[index]
 
 
 def test_build_rag_context_skips_research_for_existing_pending_term(monkeypatch) -> None:

@@ -95,6 +95,61 @@ def test_publish_action_rejects_a_platform_that_is_not_checked() -> None:
     assert "publish platform is disabled: douyin" in str(exc_info.value.detail)
 
 
+def test_disabled_publish_review_does_not_block_manual_publish_with_failed_history() -> None:
+    from videoroll.apps.orchestrator_api.services.publishing_service import enqueue_publish_job
+
+    task = Task(id=uuid.uuid4(), source_type=SourceType.youtube, source_license=SourceLicense.own)
+    account_id = str(uuid.uuid4())
+    db = Mock()
+    db.get.return_value = task
+    request = {
+        "platform": "douyin",
+        "task_id": str(task.id),
+        "account_id": account_id,
+        "video": {"type": "s3", "key": "tasks/final.mp4"},
+        "cover": None,
+        "meta": {"title": "title"},
+        "platform_options": {},
+        "force_retry": False,
+    }
+
+    with (
+        patch(
+            "videoroll.apps.orchestrator_api.services.publishing_service.is_publish_platform_enabled",
+            return_value=True,
+        ),
+        patch(
+            "videoroll.apps.orchestrator_api.services.publishing_service.build_publish_gateway_request",
+            return_value=request,
+        ),
+        patch("videoroll.apps.orchestrator_api.services.publishing_service.write_s3_json"),
+        patch(
+            "videoroll.apps.orchestrator_api.services.publishing_service.run_task_publish_review",
+            return_value={"enabled": False, "checked": True, "ok": False, "reason": "old rejection"},
+        ),
+        patch(
+            "videoroll.apps.publish_service.PublishService.publish_one",
+            return_value={"state": "submitted", "platform": "douyin"},
+        ) as publish_one,
+    ):
+        response = enqueue_publish_job(
+            task.id,
+            PublishActionRequest(
+                platform="douyin",
+                account_id=account_id,
+                video_key="tasks/final.mp4",
+                meta={"title": "title"},
+            ),
+            settings=Mock(),
+            db=db,
+            s3=Mock(),
+        )
+
+    assert response.state == "submitted"
+    assert response.platform == "douyin"
+    publish_one.assert_called_once_with(task.id, platform="douyin", payload=request)
+
+
 def test_social_publish_mode_is_removed_from_runtime_configuration() -> None:
     paths = [
         ROOT / "src" / "videoroll" / "config.py",

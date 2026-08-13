@@ -27,7 +27,7 @@ from videoroll.apps.orchestrator_api.schemas import (
 )
 from videoroll.apps.orchestrator_api.services import live_service
 from videoroll.config import OrchestratorSettings
-from videoroll.storage.s3 import S3Store
+from videoroll.storage.filesystem import FileStore
 
 
 router = APIRouter()
@@ -38,7 +38,7 @@ async def _upload_live_media_batch(
     files: list[UploadFile],
     *,
     db: Session,
-    s3: S3Store,
+    s3: FileStore,
     audio_playlist_id: uuid.UUID | None = None,
 ) -> list[LiveMediaRead]:
     uploaded: list[LiveMediaRead] = []
@@ -87,7 +87,7 @@ def put_live_settings(
 def put_live_playlist(
     payload: LivePlaylistUpdate,
     db: Session = Depends(get_db),
-    s3: S3Store = Depends(get_s3),
+    s3: FileStore = Depends(get_s3),
 ) -> LivePlaylistRead:
     return LivePlaylistRead(
         **live_service.update_live_playlist(
@@ -102,7 +102,7 @@ def put_live_playlist(
 async def upload_live_video(
     files: list[UploadFile] = File(...),
     db: Session = Depends(get_db),
-    s3: S3Store = Depends(get_s3),
+    s3: FileStore = Depends(get_s3),
 ) -> list[LiveMediaRead]:
     return await _upload_live_media_batch("video", files, db=db, s3=s3)
 
@@ -112,7 +112,7 @@ async def upload_live_audio(
     files: list[UploadFile] = File(...),
     audio_playlist_id: uuid.UUID | None = Form(default=None),
     db: Session = Depends(get_db),
-    s3: S3Store = Depends(get_s3),
+    s3: FileStore = Depends(get_s3),
 ) -> list[LiveMediaRead]:
     return await _upload_live_media_batch(
         "audio",
@@ -127,7 +127,7 @@ async def upload_live_audio(
 def import_live_task_videos(
     payload: LiveMediaImportRequest,
     db: Session = Depends(get_db),
-    s3: S3Store = Depends(get_s3),
+    s3: FileStore = Depends(get_s3),
 ) -> list[LiveMediaRead]:
     return [
         LiveMediaRead(**media)
@@ -140,7 +140,7 @@ def stream_live_media(
     media_id: uuid.UUID,
     request: Request,
     db: Session = Depends(get_db),
-    s3: S3Store = Depends(get_s3),
+    s3: FileStore = Depends(get_s3),
 ) -> Response:
     result = live_service.prepare_live_media_stream(
         db,
@@ -151,7 +151,7 @@ def stream_live_media(
     if result.body is None:
         return Response(status_code=result.status_code, headers=result.headers)
     return StreamingResponse(
-        S3Store.iter_body(result.body),
+        FileStore.iter_body(result.body),
         status_code=result.status_code,
         media_type=result.media_type,
         headers=result.headers,

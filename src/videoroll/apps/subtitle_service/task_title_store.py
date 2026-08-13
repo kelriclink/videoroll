@@ -7,7 +7,7 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from videoroll.db.models import AppSetting, Asset, AssetKind
-from videoroll.storage.s3 import S3Store
+from videoroll.storage.filesystem import FileStore
 
 
 def _as_dict(v: Any) -> dict[str, Any]:
@@ -35,7 +35,7 @@ def get_task_display_title(db: Session, task_id: str) -> str:
     return get_task_display_title_with_s3(db, task_id, s3=None)
 
 
-def get_task_display_title_with_s3(db: Session, task_id: str, *, s3: S3Store | None) -> str:
+def get_task_display_title_with_s3(db: Session, task_id: str, *, s3: FileStore | None) -> str:
     t = get_task_titles(db, task_id)
     out = str(t.get("translated_title") or t.get("source_title") or "").strip()
     if out:

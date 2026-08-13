@@ -11,7 +11,6 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
-from botocore.exceptions import ClientError
 from fastapi import HTTPException, UploadFile
 from sqlalchemy.orm import Session
 from starlette.concurrency import run_in_threadpool
@@ -22,7 +21,7 @@ from videoroll.apps.orchestrator_api.services.image_validation import (
 )
 from videoroll.apps.subtitle_service.task_title_store import get_task_display_title_with_s3
 from videoroll.db.models import AppSetting, Asset, AssetKind, Subtitle, Task, TaskStatus
-from videoroll.storage.s3 import S3Store
+from videoroll.storage.filesystem import FileStore, StorageObjectNotFound
 
 
 logger = logging.getLogger(__name__)
@@ -116,7 +115,7 @@ def safe_asset_headers(
     }
 
 
-def suggest_asset_filename(db: Session, task_id: uuid.UUID, asset: Asset, *, s3: S3Store | None) -> str:
+def suggest_asset_filename(db: Session, task_id: uuid.UUID, asset: Asset, *, s3: FileStore | None) -> str:
     base = Path(asset.storage_key).name or "download.bin"
     if asset.kind == AssetKind.video_final:
         title = get_task_display_title_with_s3(db, str(task_id), s3=s3).strip()
@@ -183,7 +182,7 @@ def parse_range_header(range_header: str, total_size: int) -> tuple[int, int] | 
     return start, min(end, total_size - 1)
 
 
-def read_s3_bytes(s3: S3Store, key: str) -> bytes:
+def read_s3_bytes(s3: FileStore, key: str) -> bytes:
     obj = s3.get_object(key)
     body = obj.get("Body")
     if not body:
@@ -197,13 +196,11 @@ def read_s3_bytes(s3: S3Store, key: str) -> bytes:
             pass
 
 
-def read_s3_json_object(s3: S3Store, key: str) -> dict[str, Any] | None:
+def read_s3_json_object(s3: FileStore, key: str) -> dict[str, Any] | None:
     try:
         raw = read_s3_bytes(s3, key)
-    except ClientError as exc:
-        if is_s3_object_missing(exc):
-            return None
-        raise
+    except StorageObjectNotFound:
+        return None
     if not raw:
         return None
     try:
@@ -213,18 +210,13 @@ def read_s3_json_object(s3: S3Store, key: str) -> dict[str, Any] | None:
     return parsed if isinstance(parsed, dict) else None
 
 
-def is_s3_object_missing(exc: ClientError) -> bool:
-    code = str((as_dict(exc.response.get("Error")).get("Code") or "")).strip()
-    return code in {"NoSuchKey", "404", "NotFound"}
-
-
-def write_s3_json(s3: S3Store, key: str, value: dict[str, Any]) -> bytes:
+def write_s3_json(s3: FileStore, key: str, value: dict[str, Any]) -> bytes:
     payload = json.dumps(value, ensure_ascii=False, indent=2).encode("utf-8")
     s3.put_bytes(payload, key, content_type="application/json")
     return payload
 
 
-def write_s3_text(s3: S3Store, key: str, value: str) -> bytes:
+def write_s3_text(s3: FileStore, key: str, value: str) -> bytes:
     payload = str(value).encode("utf-8")
     s3.put_bytes(payload, key, content_type="text/plain; charset=utf-8")
     return payload
@@ -266,7 +258,7 @@ def storage_key_is_referenced(db: Session, storage_key: str) -> bool:
     )
 
 
-def retry_pending_s3_deletes(db: Session, s3: S3Store, *, limit: int = 200) -> int:
+def retry_pending_s3_deletes(db: Session, s3: FileStore, *, limit: int = 200) -> int:
     rows = (
         db.query(AppSetting)
         .filter(AppSetting.key.like(f"{PENDING_S3_DELETE_PREFIX}%"))
@@ -287,7 +279,7 @@ def retry_pending_s3_deletes(db: Session, s3: S3Store, *, limit: int = 200) -> i
         try:
             s3.delete_object(storage_key, bucket=bucket)
         except Exception:
-            logger.warning("pending S3 delete retry failed", extra={"storage_key": storage_key})
+            logger.warning("pending storage delete retry failed", extra={"storage_key": storage_key})
             continue
         db.delete(row)
         deleted += 1
@@ -297,7 +289,7 @@ def retry_pending_s3_deletes(db: Session, s3: S3Store, *, limit: int = 200) -> i
 
 def prepare_asset_download(
     db: Session,
-    s3: S3Store,
+    s3: FileStore,
     *,
     task_id: uuid.UUID,
     asset_id: uuid.UUID,
@@ -305,10 +297,8 @@ def prepare_asset_download(
     asset = get_task_asset(db, task_id, asset_id)
     try:
         response = s3.get_object(asset.storage_key)
-    except ClientError as exc:
-        if is_s3_object_missing(exc):
-            raise HTTPException(status_code=404, detail="asset object not found") from exc
-        raise
+    except StorageObjectNotFound as exc:
+        raise HTTPException(status_code=404, detail="asset object not found") from exc
     filename = suggest_asset_filename(db, task_id, asset, s3=s3)
     content_type = response.get("ContentType") or "application/octet-stream"
     headers = safe_asset_headers(asset, content_type, False, filename=filename)
@@ -324,7 +314,7 @@ def prepare_asset_download(
 
 def prepare_asset_stream(
     db: Session,
-    s3: S3Store,
+    s3: FileStore,
     *,
     task_id: uuid.UUID,
     asset_id: uuid.UUID,
@@ -358,10 +348,8 @@ def prepare_asset_stream(
         start, end = parsed
         try:
             response = s3.get_object(asset.storage_key, range_bytes=f"bytes={start}-{end}")
-        except ClientError as exc:
-            if is_s3_object_missing(exc):
-                raise HTTPException(status_code=404, detail="asset object not found") from exc
-            raise
+        except StorageObjectNotFound as exc:
+            raise HTTPException(status_code=404, detail="asset object not found") from exc
         return AssetStreamResult(
             body=response["Body"],
             media_type=safe_asset_content_type(asset, stored_content_type),
@@ -374,10 +362,8 @@ def prepare_asset_stream(
         )
     try:
         response = s3.get_object(asset.storage_key)
-    except ClientError as exc:
-        if is_s3_object_missing(exc):
-            raise HTTPException(status_code=404, detail="asset object not found") from exc
-        raise
+    except StorageObjectNotFound as exc:
+        raise HTTPException(status_code=404, detail="asset object not found") from exc
     response_content_type = response.get("ContentType") or stored_content_type
     headers = {
         "Accept-Ranges": "bytes",
@@ -399,13 +385,19 @@ def stream_upload_to_tempfile(
     prefix: str,
     suffix: str,
     max_bytes: int | None = None,
+    directory: Path | None = None,
 ) -> tuple[Path, str, int]:
     temp_path: Path | None = None
     digest = hashlib.sha256()
     size_bytes = 0
     limit = int(max_bytes or 0)
     try:
-        with tempfile.NamedTemporaryFile(prefix=prefix, suffix=suffix, delete=False) as temp_file:
+        with tempfile.NamedTemporaryFile(
+            prefix=prefix,
+            suffix=f"{suffix}.partial",
+            dir=directory,
+            delete=False,
+        ) as temp_file:
             temp_path = Path(temp_file.name)
             while True:
                 chunk = file_obj.read(1024 * 1024)
@@ -437,7 +429,7 @@ async def store_uploaded_task_asset(
     *,
     task: Task,
     file: UploadFile,
-    s3: S3Store,
+    s3: FileStore,
     db: Session,
     temp_prefix: str,
     default_suffix: str,
@@ -462,11 +454,15 @@ async def store_uploaded_task_asset(
             prefix=temp_prefix,
             suffix=suffix,
             max_bytes=max_bytes,
+            directory=s3.partial_root if isinstance(s3, FileStore) else None,
         )
         uploaded_key = (
             f"{key_prefix}/{task.id}/{object_name_prefix}_{sha256[:16]}_{uuid.uuid4().hex[:12]}{suffix}"
         )
-        await run_in_threadpool(s3.upload_file, temp_path, uploaded_key, file.content_type or None)
+        if isinstance(s3, FileStore):
+            await run_in_threadpool(s3.promote_file, temp_path, uploaded_key)
+        else:
+            await run_in_threadpool(s3.upload_file, temp_path, uploaded_key, file.content_type or None)
         asset = Asset(
             task_id=task.id,
             kind=asset_kind,
@@ -508,7 +504,7 @@ async def upload_task_video(
     file: UploadFile,
     *,
     db: Session,
-    s3: S3Store,
+    s3: FileStore,
 ) -> Asset:
     task = get_task(db, task_id)
     if file.content_type and not (
@@ -535,7 +531,7 @@ async def upload_task_cover(
     file: UploadFile,
     *,
     db: Session,
-    s3: S3Store,
+    s3: FileStore,
 ) -> Asset:
     task = get_task(db, task_id)
     try:
@@ -573,7 +569,7 @@ def delete_final_asset(
     task_id: uuid.UUID,
     asset_id: uuid.UUID,
     db: Session,
-    s3: S3Store,
+    s3: FileStore,
 ) -> dict[str, bool]:
     asset = db.get(Asset, asset_id)
     if not asset or asset.task_id != task_id:

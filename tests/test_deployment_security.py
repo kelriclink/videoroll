@@ -45,12 +45,14 @@ def test_process_roles_are_not_combined() -> None:
             assert services[name].get("healthcheck"), f"{path.name}:{name} lacks a health check"
 
 
-def test_minio_healthcheck_uses_supported_readiness_endpoint() -> None:
-    expected = ["CMD", "curl", "-fsS", "http://127.0.0.1:9000/minio/health/ready"]
-
+def test_production_compose_uses_shared_filesystem_storage() -> None:
     for path in COMPOSE_FILES:
-        healthcheck = _compose(path)["services"]["minio"]["healthcheck"]
-        assert healthcheck["test"] == expected
+        compose = _compose(path)
+        assert "minio" not in compose["services"]
+        internal_env = compose["x-internal-environment"]
+        assert internal_env["STORAGE_ROOT"] == "${STORAGE_ROOT:-/storage/objects}"
+        for name in ("orchestrator", "subtitle-service", "subtitle-worker", "publish-worker"):
+            assert any("/storage" in str(item) for item in compose["services"][name].get("volumes", ()))
 
 
 def test_application_roles_resolve_host_database_gateway() -> None:
@@ -73,10 +75,10 @@ def test_application_roles_resolve_host_database_gateway() -> None:
             assert "host.docker.internal:host-gateway" in services[name].get("extra_hosts", [])
 
 
-def test_rag_processes_have_no_direct_egress_network() -> None:
+def test_rag_processes_stay_on_the_application_network() -> None:
     for path in COMPOSE_FILES:
         compose = _compose(path)
-        assert compose["networks"]["internal"]["internal"] is True
+        assert not (compose["networks"]["internal"] or {}).get("internal", False)
         assert set(compose["services"]["egress-gateway"]["networks"]) == {"internal", "egress"}
         for name in ("subtitle-service", "subtitle-worker"):
             assert compose["services"][name]["networks"] == ["internal"]

@@ -3,22 +3,25 @@ import { useNavigate } from "react-router-dom";
 import { fetchJson } from "../lib/http";
 import { orchestratorUrl } from "../lib/urls";
 import { SourceLicense, SourceType, Task } from "../lib/types";
+import { formatYouTubeBatchFailure, parseYouTubeUrlLines, YouTubeBatchFailure } from "./taskNewPage.helpers";
 
 export default function TaskNewPage() {
   const nav = useNavigate();
-  const [mode, setMode] = useState<"local" | "youtube" | "youtube-auto">("local");
+  const [mode, setMode] = useState<"local" | "youtube" | "youtube-auto">("youtube-auto");
   const [license, setLicense] = useState<SourceLicense>("own");
   const [proofUrl, setProofUrl] = useState<string>("");
   const [youtubeUrl, setYoutubeUrl] = useState<string>("");
   const [file, setFile] = useState<File | null>(null);
   const [busy, setBusy] = useState(false);
+  const [batchProgress, setBatchProgress] = useState<{ completed: number; total: number } | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const youtubeUrls = useMemo(() => parseYouTubeUrlLines(youtubeUrl), [youtubeUrl]);
 
   const canSubmit = useMemo(() => {
     if (busy) return false;
     if (mode === "local") return !!file;
-    return youtubeUrl.trim().length > 0;
-  }, [busy, mode, file, youtubeUrl]);
+    return youtubeUrls.length > 0;
+  }, [busy, mode, file, youtubeUrls]);
 
   async function createLocalTaskAndUpload() {
     const task = await fetchJson<Task>(orchestratorUrl("/tasks"), {
@@ -46,12 +49,12 @@ export default function TaskNewPage() {
     return task.id;
   }
 
-  async function createYouTubeTask() {
+  async function createYouTubeTask(url: string) {
     const resp = await fetchJson<{ task_id: string }>(orchestratorUrl("/youtube/ingest"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        url: youtubeUrl.trim(),
+        url,
         license,
         proof_url: proofUrl.trim() ? proofUrl.trim() : null,
       }),
@@ -59,17 +62,46 @@ export default function TaskNewPage() {
     return resp.task_id;
   }
 
-  async function createYouTubeTaskAndAutoRun() {
+  async function createYouTubeTaskAndAutoRun(url: string) {
     const resp = await fetchJson<{ task_id: string; pipeline_job_id: string }>(orchestratorUrl("/auto/youtube"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        url: youtubeUrl.trim(),
+        url,
         license,
         proof_url: proofUrl.trim() ? proofUrl.trim() : null,
       }),
     });
     return resp.task_id;
+  }
+
+  async function createYouTubeTasks() {
+    const taskIds: string[] = [];
+    const failures: YouTubeBatchFailure[] = [];
+    setBatchProgress({ completed: 0, total: youtubeUrls.length });
+
+    for (const [index, url] of youtubeUrls.entries()) {
+      try {
+        const taskId = mode === "youtube-auto" ? await createYouTubeTaskAndAutoRun(url) : await createYouTubeTask(url);
+        taskIds.push(taskId);
+      } catch (e: unknown) {
+        failures.push({ url, message: e instanceof Error ? e.message : String(e) });
+      } finally {
+        setBatchProgress({ completed: index + 1, total: youtubeUrls.length });
+      }
+    }
+
+    if (failures.length > 0) {
+      setYoutubeUrl(failures.map((failure) => failure.url).join("\n"));
+      setError(formatYouTubeBatchFailure(youtubeUrls.length, taskIds.length, failures));
+      return;
+    }
+
+    if (taskIds.length === 1) {
+      nav(`/tasks/${taskIds[0]}`);
+      return;
+    }
+    nav("/tasks");
   }
 
   return (
@@ -84,11 +116,11 @@ export default function TaskNewPage() {
           <button
             className={[
               "rounded border px-3 py-2 text-sm",
-              mode === "local" ? "border-slate-900 bg-slate-900 text-white" : "bg-white hover:bg-slate-50",
+              mode === "youtube-auto" ? "border-slate-900 bg-slate-900 text-white" : "bg-white hover:bg-slate-50",
             ].join(" ")}
-            onClick={() => setMode("local")}
+            onClick={() => setMode("youtube-auto")}
           >
-            本地上传
+            YouTube 自动模式
           </button>
           <button
             className={[
@@ -102,11 +134,11 @@ export default function TaskNewPage() {
           <button
             className={[
               "rounded border px-3 py-2 text-sm",
-              mode === "youtube-auto" ? "border-slate-900 bg-slate-900 text-white" : "bg-white hover:bg-slate-50",
+              mode === "local" ? "border-slate-900 bg-slate-900 text-white" : "bg-white hover:bg-slate-50",
             ].join(" ")}
-            onClick={() => setMode("youtube-auto")}
+            onClick={() => setMode("local")}
           >
-            YouTube 自动模式
+            本地上传
           </button>
         </div>
 
@@ -150,19 +182,20 @@ export default function TaskNewPage() {
         ) : (
           <div className="mt-4">
             <label className="block">
-              <div className="mb-1 text-xs text-slate-600">YouTube 视频链接</div>
-              <input
-                className="w-full rounded border px-3 py-2 text-sm"
-                placeholder="https://www.youtube.com/watch?v=... 或 https://youtube.com/shorts/..."
+              <div className="mb-1 text-xs text-slate-600">YouTube 视频链接（每行一个）</div>
+              <textarea
+                className="min-h-36 w-full rounded border px-3 py-2 text-sm"
+                placeholder={"https://www.youtube.com/watch?v=...\nhttps://youtu.be/...\nhttps://youtube.com/shorts/..."}
                 value={youtubeUrl}
                 onChange={(e) => setYoutubeUrl(e.target.value)}
               />
             </label>
             <div className="mt-2 text-xs text-slate-500">
               {mode === "youtube-auto"
-                ? "自动模式：会按 Settings 中的默认参数执行（下载→字幕/翻译→硬字幕 burn-in→自动投稿 Bilibili）。支持 watch / youtu.be / shorts 链接。"
-                : "说明：创建后可在任务详情页一键下载视频，并自动填充投稿标题/简介/转载来源（支持 watch / youtu.be / shorts 链接；请确保你拥有版权/已获授权/可再分发）。"}
+                ? "自动模式：每个链接会分别创建任务，并按自动模式设置执行下载、字幕/翻译、压制和已勾选渠道的投稿。支持 watch / youtu.be / shorts 链接。"
+                : "说明：每个链接会分别创建任务；创建后可在任务详情页下载视频，并自动填充投稿标题、简介和转载来源。"}
             </div>
+            {youtubeUrls.length > 0 ? <div className="mt-1 text-xs text-sky-700">已识别 {youtubeUrls.length} 个链接</div> : null}
           </div>
         )}
 
@@ -174,23 +207,32 @@ export default function TaskNewPage() {
             onClick={async () => {
               setError(null);
               setBusy(true);
+              setBatchProgress(null);
               try {
-                const taskId =
-                  mode === "local"
-                    ? await createLocalTaskAndUpload()
-                    : mode === "youtube-auto"
-                      ? await createYouTubeTaskAndAutoRun()
-                      : await createYouTubeTask();
-                nav(`/tasks/${taskId}`);
+                if (mode === "local") {
+                  const taskId = await createLocalTaskAndUpload();
+                  nav(`/tasks/${taskId}`);
+                } else {
+                  await createYouTubeTasks();
+                }
               } catch (e: unknown) {
                 setError(e instanceof Error ? e.message : String(e));
               } finally {
                 setBusy(false);
+                setBatchProgress(null);
               }
             }}
             className="rounded bg-slate-900 px-3 py-2 text-sm text-white hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-50"
           >
-            {busy ? "处理中…" : mode === "youtube-auto" ? "开始自动处理" : "创建任务"}
+            {busy
+              ? batchProgress
+                ? `处理中 ${batchProgress.completed}/${batchProgress.total}…`
+                : "处理中…"
+              : mode === "youtube-auto"
+                ? `开始自动处理${youtubeUrls.length > 1 ? `（${youtubeUrls.length} 个）` : ""}`
+                : mode === "youtube"
+                  ? `创建任务${youtubeUrls.length > 1 ? `（${youtubeUrls.length} 个）` : ""}`
+                  : "创建任务"}
           </button>
         </div>
       </div>

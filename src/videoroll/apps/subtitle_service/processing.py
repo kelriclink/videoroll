@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import base64
+import io
 import inspect
 import json
 import logging
+import os
+import random
 import re
 import shutil
 import subprocess
+import tempfile
 import threading
 import time
 import unicodedata
@@ -18,7 +23,12 @@ from typing import Any, Callable, Iterable
 
 import httpx
 
-from videoroll.ai.client import OpenAIChatConfig, create_openai_http_client, request_openai_json_object
+from videoroll.ai.client import (
+    OpenAIChatConfig,
+    create_openai_http_client,
+    request_openai_json_object,
+    request_openai_json_object_with_thinking,
+)
 from videoroll.ai.service import AIService
 from videoroll.utils.openai_compat import build_openai_audio_transcriptions_url
 
@@ -41,6 +51,16 @@ _OPENVINO_VAD_MIN_SILENCE_MS = 500
 _OPENVINO_VAD_SPEECH_PAD_MS = 180
 _OPENVINO_PIPELINE_CACHE: dict[tuple[str, str], Any] = {}
 _OPENVINO_PIPELINE_CACHE_LOCK = threading.Lock()
+_GROQ_DEFAULT_BASE_URL = "https://api.groq.com/openai/v1"
+# Groq accepts FLAC and its synchronous endpoint is more reliable when each
+# request contains a short, fixed amount of audio. FLAC roughly halves the
+# upload size of 16 kHz mono PCM without sacrificing ASR quality or timestamps.
+_GROQ_CHUNK_SECONDS = 45.0
+_GROQ_CHUNK_OVERLAP_SECONDS = 5.0
+_GROQ_MAX_REQUEST_ATTEMPTS = 5
+_GROQ_RETRY_BASE_SECONDS = 3.0
+_GROQ_RETRY_MAX_SECONDS = 45.0
+_GROQ_CHECKPOINT_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -395,6 +415,645 @@ def transcribe_external_whisper(
     return [Segment(start=0.0, end=max(0.0, float(duration)), text=text)]
 
 
+def _groq_chunk_windows(
+    audio_path: Path,
+    *,
+    chunk_seconds: float = _GROQ_CHUNK_SECONDS,
+    overlap_seconds: float = _GROQ_CHUNK_OVERLAP_SECONDS,
+) -> list[tuple[float, float]]:
+    """Return deterministic fixed-duration windows for a PCM WAV."""
+    try:
+        with wave.open(str(audio_path), "rb") as source:
+            channels = source.getnchannels()
+            sample_width = source.getsampwidth()
+            sample_rate = source.getframerate()
+            total_frames = source.getnframes()
+            if channels <= 0 or sample_width <= 0 or sample_rate <= 0 or total_frames <= 0:
+                raise ValueError("invalid WAV format")
+            chunk_frames = max(1, int(max(1.0, float(chunk_seconds)) * sample_rate))
+            overlap_frames = min(
+                max(0, chunk_frames - 1),
+                max(0, int(max(0.0, float(overlap_seconds)) * sample_rate)),
+            )
+            windows: list[tuple[float, float]] = []
+            start_frame = 0
+            while start_frame < total_frames:
+                frame_count = min(chunk_frames, total_frames - start_frame)
+                duration = frame_count / sample_rate
+                windows.append((start_frame / sample_rate, duration))
+                if start_frame + frame_count >= total_frames:
+                    break
+                start_frame += max(1, frame_count - overlap_frames)
+            return windows
+    except (EOFError, OSError, ValueError, wave.Error) as exc:
+        raise RuntimeError(f"Groq Whisper requires a valid WAV audio file: {exc}") from exc
+
+
+def _encode_groq_flac_chunk(
+    audio_path: Path,
+    *,
+    offset: float,
+    duration: float,
+    ffmpeg_path: str,
+) -> bytes:
+    """Encode one source window as lossless 16 kHz mono FLAC."""
+    temp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(prefix="groq-whisper-", suffix=".flac", delete=False) as handle:
+            temp_path = Path(handle.name)
+        cmd = [
+            str(ffmpeg_path or "ffmpeg"),
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-ss",
+            f"{max(0.0, float(offset)):.6f}",
+            "-t",
+            f"{max(0.001, float(duration)):.6f}",
+            "-i",
+            str(audio_path),
+            "-vn",
+            "-ac",
+            "1",
+            "-ar",
+            "16000",
+            "-c:a",
+            "flac",
+            "-compression_level",
+            "8",
+            str(temp_path),
+        ]
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        data = temp_path.read_bytes()
+    except FileNotFoundError as exc:
+        raise RuntimeError(f"ffmpeg executable not found: {ffmpeg_path}") from exc
+    except subprocess.CalledProcessError as exc:
+        detail = exc.stderr.decode("utf-8", errors="replace").strip()[-500:]
+        raise RuntimeError(f"failed to encode Groq FLAC chunk: {detail or exc}") from exc
+    finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
+    if not data:
+        raise RuntimeError("failed to encode Groq FLAC chunk: ffmpeg returned an empty file")
+    return data
+
+
+def _groq_checkpoint_identity(
+    *,
+    audio_identity: str,
+    model: str,
+    language: str,
+    chunk_seconds: float,
+    overlap_seconds: float,
+    chunk_count: int,
+    vad_enabled: bool,
+    vad_threshold: float,
+) -> dict[str, Any]:
+    return {
+        "version": _GROQ_CHECKPOINT_VERSION,
+        "audio_identity": str(audio_identity or "").strip(),
+        "model": model,
+        "language": language,
+        "format": "flac",
+        "chunk_seconds": float(chunk_seconds),
+        "overlap_seconds": float(overlap_seconds),
+        "chunk_count": int(chunk_count),
+        "vad_enabled": bool(vad_enabled),
+        "vad_threshold": float(vad_threshold) if vad_enabled else None,
+    }
+
+
+def _load_groq_checkpoint(
+    checkpoint_path: Path | None,
+    *,
+    identity: dict[str, Any],
+    windows: list[tuple[float, float]],
+) -> dict[int, list[Segment]]:
+    if checkpoint_path is None:
+        return {}
+    try:
+        payload = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    for key, value in identity.items():
+        if payload.get(key) != value:
+            return {}
+    completed = payload.get("completed_chunks")
+    if not isinstance(completed, dict):
+        return {}
+    restored: dict[int, list[Segment]] = {}
+    for raw_index, item in completed.items():
+        if not isinstance(item, dict):
+            continue
+        try:
+            index = int(raw_index)
+        except (TypeError, ValueError):
+            continue
+        if index < 1 or index > len(windows):
+            continue
+        offset, duration = windows[index - 1]
+        try:
+            stored_offset = float(item.get("offset"))
+            stored_duration = float(item.get("duration"))
+        except (TypeError, ValueError):
+            continue
+        if abs(stored_offset - offset) > 0.001 or abs(stored_duration - duration) > 0.001:
+            continue
+        segments = segments_from_json_data(item.get("segments"))
+        restored[index] = segments
+    return restored
+
+
+def _save_groq_checkpoint(
+    checkpoint_path: Path | None,
+    *,
+    identity: dict[str, Any],
+    windows: list[tuple[float, float]],
+    completed: dict[int, list[Segment]],
+) -> None:
+    if checkpoint_path is None:
+        return
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        **identity,
+        "completed_chunks": {
+            str(index): {
+                "offset": windows[index - 1][0],
+                "duration": windows[index - 1][1],
+                "segments": segments_to_json_data(segments),
+            }
+            for index, segments in sorted(completed.items())
+        },
+    }
+    temp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            prefix=f".{checkpoint_path.name}.",
+            suffix=".partial",
+            dir=checkpoint_path.parent,
+            delete=False,
+        ) as handle:
+            temp_path = Path(handle.name)
+            handle.write(json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8"))
+            handle.flush()
+            os.fsync(handle.fileno())
+        temp_path.replace(checkpoint_path)
+        temp_path = None
+    finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
+
+
+def _segments_from_groq_result(result: dict[str, Any], *, fallback_duration: float) -> list[Segment]:
+    out: list[Segment] = []
+    segments_raw = result.get("segments")
+    if isinstance(segments_raw, list):
+        for item in segments_raw:
+            if not isinstance(item, dict):
+                continue
+            text = _normalize_asr_text(str(item.get("text") or ""))
+            if not text:
+                continue
+            try:
+                start = max(0.0, float(item.get("start") or 0.0))
+                end = max(start, float(item.get("end") or start))
+            except (TypeError, ValueError):
+                continue
+            out.append(Segment(start=start, end=end, text=text))
+    if out:
+        return out
+
+    words = result.get("words")
+    if isinstance(words, list):
+        timed_words: list[tuple[float, float, str]] = []
+        for item in words:
+            if not isinstance(item, dict):
+                continue
+            word = _normalize_asr_text(str(item.get("word") or ""))
+            if not word:
+                continue
+            try:
+                start = max(0.0, float(item.get("start") or 0.0))
+                end = max(start, float(item.get("end") or start))
+            except (TypeError, ValueError):
+                continue
+            timed_words.append((start, end, word))
+        if timed_words:
+            return [
+                Segment(
+                    start=timed_words[0][0],
+                    end=timed_words[-1][1],
+                    text=_normalize_asr_text(" ".join(word for _, _, word in timed_words)),
+                )
+            ]
+
+    text = _normalize_asr_text(str(result.get("text") or ""))
+    return [Segment(start=0.0, end=max(0.0, float(fallback_duration)), text=text)] if text else []
+
+
+def _merge_groq_segments(chunks: Iterable[tuple[float, Iterable[Segment]]]) -> list[Segment]:
+    """Apply chunk offsets and remove repeated text from overlap windows."""
+    candidates: list[Segment] = []
+    for offset, segments in chunks:
+        for segment in segments:
+            candidates.append(
+                Segment(
+                    start=max(0.0, float(segment.start) + float(offset)),
+                    end=max(float(segment.start) + float(offset), float(segment.end) + float(offset)),
+                    text=segment.text,
+                    confidence=segment.confidence,
+                    secondary_text=segment.secondary_text,
+                )
+            )
+    candidates.sort(key=lambda item: (item.start, item.end))
+    merged: list[Segment] = []
+    for segment in candidates:
+        if not merged:
+            merged.append(segment)
+            continue
+        previous = merged[-1]
+        previous_norm = re.sub(r"\s+", " ", previous.text).strip().casefold()
+        current_norm = re.sub(r"\s+", " ", segment.text).strip().casefold()
+        if current_norm and current_norm == previous_norm and segment.start <= previous.end + 1.5:
+            if segment.end > previous.end:
+                merged[-1] = Segment(
+                    start=previous.start,
+                    end=segment.end,
+                    text=previous.text,
+                    confidence=previous.confidence,
+                    secondary_text=previous.secondary_text,
+                )
+            continue
+        merged.append(segment)
+    return merged
+
+
+def _groq_status_is_retryable(status_code: int) -> bool:
+    return status_code in {408, 409, 425, 429} or 500 <= status_code <= 599
+
+
+def _groq_retry_delay(response: httpx.Response | None, attempt: int) -> float:
+    """Return a bounded backoff, honoring a numeric Retry-After header."""
+    if response is not None:
+        retry_after = str(response.headers.get("retry-after") or "").strip()
+        try:
+            if retry_after:
+                return min(_GROQ_RETRY_MAX_SECONDS, max(0.5, float(retry_after)))
+        except (TypeError, ValueError):
+            pass
+    exponential = _GROQ_RETRY_BASE_SECONDS * (2 ** max(0, attempt - 1))
+    return min(_GROQ_RETRY_MAX_SECONDS, random.uniform(exponential * 0.75, exponential * 1.25))
+
+
+def transcribe_groq_whisper(
+    audio_path: Path,
+    *,
+    api_key: str,
+    model_name: str = "whisper-large-v3-turbo",
+    language: str = "auto",
+    base_url: str = _GROQ_DEFAULT_BASE_URL,
+    timeout_seconds: float = 180.0,
+    chunk_seconds: float = _GROQ_CHUNK_SECONDS,
+    overlap_seconds: float = _GROQ_CHUNK_OVERLAP_SECONDS,
+    ffmpeg_path: str = "ffmpeg",
+    checkpoint_path: Path | None = None,
+    audio_identity: str = "",
+    vad_enabled: bool = True,
+    vad_threshold: float = _OPENVINO_VAD_THRESHOLD,
+) -> list[Segment]:
+    """Transcribe through Groq using resumable, VAD-gated FLAC chunks."""
+    key = str(api_key or "").strip()
+    model = str(model_name or "").strip()
+    if not key:
+        raise RuntimeError("Groq Whisper API key is not set")
+    if model not in {"whisper-large-v3", "whisper-large-v3-turbo"}:
+        raise RuntimeError("Groq Whisper model must be whisper-large-v3 or whisper-large-v3-turbo")
+    url = build_openai_audio_transcriptions_url(base_url or _GROQ_DEFAULT_BASE_URL)
+    timeout = max(1.0, min(600.0, float(timeout_seconds)))
+    lang = str(language or "").strip()
+    normalized_lang = "" if lang.lower() == "auto" else lang
+    normalized_chunk_seconds = max(1.0, float(chunk_seconds))
+    normalized_overlap_seconds = min(
+        max(0.0, float(overlap_seconds)),
+        max(0.0, normalized_chunk_seconds - 0.001),
+    )
+    normalized_vad_threshold = max(0.01, min(0.99, float(vad_threshold)))
+    windows = _groq_chunk_windows(
+        audio_path,
+        chunk_seconds=normalized_chunk_seconds,
+        overlap_seconds=normalized_overlap_seconds,
+    )
+    identity = _groq_checkpoint_identity(
+        audio_identity=str(audio_identity or audio_path.resolve()),
+        model=model,
+        language=normalized_lang,
+        chunk_seconds=normalized_chunk_seconds,
+        overlap_seconds=normalized_overlap_seconds,
+        chunk_count=len(windows),
+        vad_enabled=bool(vad_enabled),
+        vad_threshold=normalized_vad_threshold,
+    )
+    completed = _load_groq_checkpoint(checkpoint_path, identity=identity, windows=windows)
+    results: list[tuple[float, Iterable[Segment]]] = []
+    if completed:
+        logger.info("Groq Whisper restored %d/%d chunks from checkpoint", len(completed), len(windows))
+    for index, (offset, duration) in enumerate(windows, start=1):
+        restored_segments = completed.get(index)
+        if restored_segments is not None:
+            results.append((offset, restored_segments))
+            continue
+        if vad_enabled:
+            has_speech = _groq_window_has_speech(
+                audio_path,
+                offset=offset,
+                duration=duration,
+                threshold=normalized_vad_threshold,
+            )
+            if has_speech is False:
+                logger.info(
+                    "Groq Whisper skipped chunk %d/%d (offset=%.2fs duration=%.2fs): Silero VAD found no speech",
+                    index,
+                    len(windows),
+                    offset,
+                    duration,
+                )
+                completed[index] = []
+                _save_groq_checkpoint(checkpoint_path, identity=identity, windows=windows, completed=completed)
+                results.append((offset, []))
+                continue
+        audio_bytes = _encode_groq_flac_chunk(
+            audio_path,
+            offset=offset,
+            duration=duration,
+            ffmpeg_path=ffmpeg_path,
+        )
+        data: dict[str, str] = {
+            "model": model,
+            "response_format": "verbose_json",
+            # Groq defaults verbose_json timestamps to segment granularity.
+            # Its live multipart endpoint rejects the unbracketed parameter
+            # shown in part of the documentation, so omit this optional field.
+            "temperature": "0",
+        }
+        if normalized_lang:
+            data["language"] = normalized_lang
+        payload: Any = None
+        for attempt in range(1, _GROQ_MAX_REQUEST_ATTEMPTS + 1):
+            try:
+                response = httpx.post(
+                    url,
+                    headers={"Authorization": f"Bearer {key}"},
+                    data=data,
+                    files={"file": (f"{audio_path.stem}-part-{index}.flac", audio_bytes, "audio/flac")},
+                    timeout=timeout,
+                )
+                response.raise_for_status()
+                payload = response.json()
+                break
+            except httpx.HTTPStatusError as exc:
+                status = int(exc.response.status_code)
+                detail = (exc.response.text or "").strip().replace("\n", " ")[:500]
+                retryable = _groq_status_is_retryable(status)
+                if retryable and attempt < _GROQ_MAX_REQUEST_ATTEMPTS:
+                    delay = _groq_retry_delay(exc.response, attempt)
+                    logger.warning(
+                        "Groq Whisper chunk %d/%d attempt %d/%d failed with HTTP %d; retrying in %.1fs",
+                        index,
+                        len(windows),
+                        attempt,
+                        _GROQ_MAX_REQUEST_ATTEMPTS,
+                        status,
+                        delay,
+                    )
+                    time.sleep(delay)
+                    continue
+                if status == 413:
+                    detail = f"Groq audio chunk is still too large; lower the chunk limit. {detail}".strip()
+                elif status == 524:
+                    detail = (
+                        "Cloudflare 524: Groq did not finish this audio chunk before its upstream gateway timeout; "
+                        "the chunk was retried automatically. "
+                        f"{detail}"
+                    ).strip()
+                raise RuntimeError(
+                    f"Groq Whisper API failed on chunk {index}/{len(windows)} after {attempt} attempt(s) "
+                    f"(status={status}): {detail}"
+                ) from exc
+            except httpx.HTTPError as exc:
+                if attempt < _GROQ_MAX_REQUEST_ATTEMPTS:
+                    delay = _groq_retry_delay(None, attempt)
+                    logger.warning(
+                        "Groq Whisper chunk %d/%d attempt %d/%d failed with %s; retrying in %.1fs",
+                        index,
+                        len(windows),
+                        attempt,
+                        _GROQ_MAX_REQUEST_ATTEMPTS,
+                        type(exc).__name__,
+                        delay,
+                    )
+                    time.sleep(delay)
+                    continue
+                raise RuntimeError(
+                    f"Groq Whisper API request failed on chunk {index}/{len(windows)} after {attempt} attempt(s): {exc}"
+                ) from exc
+            except ValueError as exc:
+                if attempt < _GROQ_MAX_REQUEST_ATTEMPTS:
+                    delay = _groq_retry_delay(None, attempt)
+                    logger.warning(
+                        "Groq Whisper chunk %d/%d attempt %d/%d returned invalid JSON; retrying in %.1fs",
+                        index,
+                        len(windows),
+                        attempt,
+                        _GROQ_MAX_REQUEST_ATTEMPTS,
+                        delay,
+                    )
+                    time.sleep(delay)
+                    continue
+                raise RuntimeError(
+                    f"Groq Whisper API returned invalid JSON on chunk {index}/{len(windows)} "
+                    f"after {attempt} attempt(s)"
+                ) from exc
+        if not isinstance(payload, dict):
+            raise RuntimeError("Groq Whisper API response must be an object")
+        chunk_segments = _segments_from_groq_result(payload, fallback_duration=duration)
+        completed[index] = chunk_segments
+        _save_groq_checkpoint(checkpoint_path, identity=identity, windows=windows, completed=completed)
+        results.append((offset, chunk_segments))
+    return _merge_groq_segments(results)
+
+
+def _cloudflare_wav_chunks(audio_path: Path, *, chunk_seconds: float = 30.0) -> list[tuple[float, float, bytes]]:
+    try:
+        with wave.open(str(audio_path), "rb") as source:
+            channels = source.getnchannels()
+            sample_width = source.getsampwidth()
+            sample_rate = source.getframerate()
+            compression_type = source.getcomptype()
+            compression_name = source.getcompname()
+            if channels <= 0 or sample_width <= 0 or sample_rate <= 0:
+                raise ValueError("invalid WAV format")
+            frames_per_chunk = max(1, int(sample_rate * max(1.0, chunk_seconds)))
+            chunks: list[tuple[float, float, bytes]] = []
+            frame_offset = 0
+            while True:
+                frames = source.readframes(frames_per_chunk)
+                if not frames:
+                    break
+                frame_count = len(frames) // (channels * sample_width)
+                duration = frame_count / sample_rate
+                buffer = io.BytesIO()
+                with wave.open(buffer, "wb") as target:
+                    target.setnchannels(channels)
+                    target.setsampwidth(sample_width)
+                    target.setframerate(sample_rate)
+                    target.setcomptype(compression_type, compression_name)
+                    target.writeframes(frames)
+                chunks.append((frame_offset / sample_rate, duration, buffer.getvalue()))
+                frame_offset += frame_count
+            if chunks:
+                return chunks
+    except (EOFError, OSError, ValueError, wave.Error):
+        pass
+    return [(0.0, 0.0, audio_path.read_bytes())]
+
+
+def _segments_from_cloudflare_result(result: dict[str, Any], *, fallback_duration: float) -> list[Segment]:
+    out: list[Segment] = []
+    segments_raw = result.get("segments")
+    if isinstance(segments_raw, list):
+        for item in segments_raw:
+            if not isinstance(item, dict):
+                continue
+            text = _normalize_asr_text(str(item.get("text") or ""))
+            if not text:
+                continue
+            try:
+                start = max(0.0, float(item.get("start") or 0.0))
+                end = max(start, float(item.get("end") or start))
+            except (TypeError, ValueError):
+                continue
+            out.append(Segment(start=start, end=end, text=text))
+    if out:
+        return out
+
+    # The original @cf/openai/whisper model exposes word timestamps instead
+    # of segments. Keep a bounded speech span rather than stretching text to
+    # the full file duration.
+    words = result.get("words")
+    if isinstance(words, list):
+        timed_words: list[tuple[float, float, str]] = []
+        for item in words:
+            if not isinstance(item, dict):
+                continue
+            word = _normalize_asr_text(str(item.get("word") or ""))
+            if not word:
+                continue
+            try:
+                start = max(0.0, float(item.get("start") or 0.0))
+                end = max(start, float(item.get("end") or start))
+            except (TypeError, ValueError):
+                continue
+            timed_words.append((start, end, word))
+        if timed_words:
+            return [
+                Segment(
+                    start=timed_words[0][0],
+                    end=timed_words[-1][1],
+                    text=_normalize_asr_text(" ".join(word for _, _, word in timed_words)),
+                )
+            ]
+
+    text = _normalize_asr_text(str(result.get("text") or ""))
+    if not text:
+        return []
+    return [Segment(start=0.0, end=max(0.0, fallback_duration), text=text)]
+
+
+def transcribe_cloudflare_workers_ai(
+    audio_path: Path,
+    *,
+    account_id: str,
+    api_key: str,
+    model_name: str = "@cf/openai/whisper-large-v3-turbo",
+    language: str = "auto",
+    timeout_seconds: float = 180.0,
+) -> list[Segment]:
+    """Transcribe audio through Cloudflare Workers AI's native /ai/run API."""
+    account = str(account_id or "").strip()
+    key = str(api_key or "").strip()
+    model = str(model_name or "").strip()
+    if not account:
+        raise RuntimeError("Cloudflare Workers AI account ID is not set")
+    if not key:
+        raise RuntimeError("Cloudflare Workers AI API key is not set")
+    if not model:
+        raise RuntimeError("Cloudflare Workers AI model is not set")
+    if any(ch not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-" for ch in account):
+        raise RuntimeError("Cloudflare Workers AI account ID contains invalid characters")
+    if not model.startswith("@cf/") or any(
+        ch not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789@/_.-" for ch in model
+    ):
+        raise RuntimeError("Cloudflare Workers AI model must be a valid @cf/ model ID")
+
+    lang = str(language or "").strip()
+    timeout = max(1.0, min(600.0, float(timeout_seconds)))
+    url = f"https://api.cloudflare.com/client/v4/accounts/{account}/ai/run/{model}"
+    out: list[Segment] = []
+    chunks = _cloudflare_wav_chunks(audio_path)
+    for chunk_index, (offset, duration, audio_bytes) in enumerate(chunks, start=1):
+        payload: dict[str, Any] = {
+            "audio": base64.b64encode(audio_bytes).decode("ascii"),
+            "task": "transcribe",
+        }
+        if lang and lang.lower() != "auto":
+            payload["language"] = lang
+        try:
+            response = httpx.post(
+                url,
+                headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                json=payload,
+                timeout=timeout,
+            )
+            response.raise_for_status()
+            raw_payload = response.json()
+        except httpx.HTTPStatusError as exc:
+            detail = (exc.response.text or "").strip().replace("\n", " ")[:500]
+            raise RuntimeError(
+                f"Cloudflare Workers AI request failed on chunk {chunk_index}/{len(chunks)} "
+                f"(status={exc.response.status_code}): {detail}"
+            ) from exc
+        except httpx.HTTPError as exc:
+            raise RuntimeError(
+                f"Cloudflare Workers AI request failed on chunk {chunk_index}/{len(chunks)}: {exc}"
+            ) from exc
+        except ValueError as exc:
+            raise RuntimeError("Cloudflare Workers AI returned invalid JSON") from exc
+
+        if not isinstance(raw_payload, dict):
+            raise RuntimeError("Cloudflare Workers AI response must be an object")
+        if raw_payload.get("success") is False:
+            errors = raw_payload.get("errors")
+            detail = json.dumps(errors, ensure_ascii=False)[:500] if errors else "unknown Cloudflare error"
+            raise RuntimeError(f"Cloudflare Workers AI request failed: {detail}")
+        result = raw_payload.get("result")
+        result = result if isinstance(result, dict) else raw_payload
+        chunk_segments = _segments_from_cloudflare_result(result, fallback_duration=duration)
+        out.extend(
+            Segment(
+                start=segment.start + offset,
+                end=segment.end + offset,
+                text=segment.text,
+                confidence=segment.confidence,
+                secondary_text=segment.secondary_text,
+            )
+            for segment in chunk_segments
+        )
+    return out
+
+
 @dataclass(frozen=True)
 class _OpenVinoChunk:
     start: float
@@ -489,7 +1148,79 @@ def _audio_path_is_effectively_silent(audio_path: Path) -> bool:
     return _audio_is_effectively_silent(audio_data)
 
 
-def _detect_openvino_speech_spans(
+def _read_wav_window_as_float_mono_16k(
+    audio_path: Path,
+    *,
+    offset: float,
+    duration: float,
+) -> list[float]:
+    """Read one bounded WAV window without loading the complete source audio."""
+    with wave.open(str(audio_path), "rb") as wf:
+        channels = int(wf.getnchannels() or 0)
+        sample_rate = int(wf.getframerate() or 0)
+        sample_width = int(wf.getsampwidth() or 0)
+        total_frames = int(wf.getnframes() or 0)
+        if channels != 1:
+            raise RuntimeError(f"Groq VAD expects mono WAV, got channels={channels}")
+        if sample_rate != _ASR_SAMPLE_RATE:
+            raise RuntimeError(f"Groq VAD expects 16k WAV, got sample_rate={sample_rate}")
+        start_frame = max(0, min(total_frames, int(max(0.0, float(offset)) * sample_rate)))
+        frame_count = max(0, min(total_frames - start_frame, int(max(0.0, float(duration)) * sample_rate)))
+        wf.setpos(start_frame)
+        raw = wf.readframes(frame_count)
+
+    if sample_width == 2:
+        import array
+
+        ints = array.array("h")
+        ints.frombytes(raw)
+        return [max(-1.0, min(1.0, sample / 32768.0)) for sample in ints]
+    if sample_width == 1:
+        return [((byte - 128) / 128.0) for byte in raw]
+    if sample_width == 4:
+        import array
+
+        ints = array.array("i")
+        ints.frombytes(raw)
+        return [max(-1.0, min(1.0, sample / 2147483648.0)) for sample in ints]
+    raise RuntimeError(f"unsupported WAV sample width for Groq VAD: {sample_width} bytes")
+
+
+def _groq_window_has_speech(
+    audio_path: Path,
+    *,
+    offset: float,
+    duration: float,
+    threshold: float,
+) -> bool | None:
+    """Return False for a confirmed non-speech window, None to upload safely."""
+    try:
+        audio_data = _read_wav_window_as_float_mono_16k(
+            audio_path,
+            offset=offset,
+            duration=duration,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Groq Whisper VAD could not read window offset=%.2fs duration=%.2fs (%s); uploading it normally",
+            offset,
+            duration,
+            type(exc).__name__,
+        )
+        return None
+    if _audio_is_effectively_silent(audio_data):
+        return False
+    spans = _detect_silero_speech_spans(audio_data, threshold=threshold)
+    if spans is None:
+        logger.warning(
+            "Groq Whisper Silero VAD is unavailable for window offset=%.2fs; uploading it normally",
+            offset,
+        )
+        return None
+    return bool(spans)
+
+
+def _detect_silero_speech_spans(
     audio_data: list[float],
     *,
     threshold: float = _OPENVINO_VAD_THRESHOLD,
@@ -505,7 +1236,7 @@ def _detect_openvino_speech_spans(
         from faster_whisper.vad import VadOptions, get_speech_timestamps  # type: ignore
     except Exception as e:  # pragma: no cover - depends on optional ASR packages
         logger.warning(
-            "OpenVINO ASR VAD is unavailable (%s); falling back to full-audio transcription",
+            "Silero VAD is unavailable (%s); falling back to full-audio transcription",
             type(e).__name__,
         )
         return None
@@ -525,7 +1256,7 @@ def _detect_openvino_speech_spans(
         )
     except Exception as e:  # pragma: no cover - runtime/model dependent
         logger.warning(
-            "OpenVINO ASR VAD failed for %d samples (%s); falling back to full-audio transcription",
+            "Silero VAD failed for %d samples (%s); falling back to full-audio transcription",
             len(audio_data),
             type(e).__name__,
         )
@@ -653,7 +1384,7 @@ def transcribe_openvino_whisper(
 
     spans: list[_OpenVinoSpeechSpan] | None = None
     if vad_enabled:
-        spans = _detect_openvino_speech_spans(audio_data, threshold=vad_threshold)
+        spans = _detect_silero_speech_spans(audio_data, threshold=vad_threshold)
         if spans == []:
             logger.info("skipping openvino-whisper because VAD found no speech in %s", audio_path)
             return []
@@ -899,6 +1630,13 @@ def translate_segments_openai_with_summary(
     initial_summary: str = "",
     on_batch_done: Callable[[list[Segment], str, int], None] | None = None,
     ai_service: AIService | None = None,
+    enable_thinking: bool = False,
+    on_thinking_delta: Callable[[str, int, int], None] | None = None,
+    on_batch_start: Callable[[list[Segment], int, str], Any] | None = None,
+    rag_context_provider_with_context: Callable[[list[Segment], int, str, Any], dict[str, Any] | None] | None = None,
+    on_batch_done_with_context: Callable[[Any, list[Segment], str, int], None] | None = None,
+    on_batch_error: Callable[[Any, Exception], None] | None = None,
+    on_thinking_delta_with_context: Callable[[str, int, int, Any], None] | None = None,
 ) -> tuple[list[Segment], str]:
     segs = list(segments)
     if not segs:
@@ -932,17 +1670,34 @@ def translate_segments_openai_with_summary(
             super().__init__(message)
             self.translated_prefix = translated_prefix
 
-    def _translate_batch(client: httpx.Client | None, batch: list[Segment], *, start_idx: int, summary: str) -> tuple[list[Segment], str]:
+    def _translate_batch(
+        client: httpx.Client | None,
+        batch: list[Segment],
+        *,
+        start_idx: int,
+        summary: str,
+        batch_context: Any,
+    ) -> tuple[list[Segment], str]:
         blocks = [{"idx": start_idx + i + 1, "text": s.text} for i, s in enumerate(batch)]
         payload_in: dict[str, Any] = {"target_lang": tgt, "style": tone, "blocks": blocks}
         if enable_summary:
             payload_in["summary"] = summary
         if glossary:
             payload_in["glossary"] = glossary
-        if rag_context_provider is not None:
+        if rag_context_provider_with_context is not None:
+            rag_context = rag_context_provider_with_context(batch, start_idx, summary, batch_context)
+            if rag_context:
+                payload_in["rag_context"] = rag_context
+        elif rag_context_provider is not None:
             rag_context = rag_context_provider(batch, start_idx, summary)
             if rag_context:
                 payload_in["rag_context"] = rag_context
+
+        def _thinking_callback(delta: str) -> None:
+            if on_thinking_delta_with_context is not None:
+                on_thinking_delta_with_context(delta, start_idx + 1, len(batch), batch_context)
+            elif on_thinking_delta is not None:
+                on_thinking_delta(delta, start_idx + 1, len(batch))
 
         if ai_service is not None:
             data = ai_service.translate_subtitle_batch(
@@ -954,6 +1709,10 @@ def translate_segments_openai_with_summary(
                 glossary=glossary,
                 rag_context=payload_in.get("rag_context") if isinstance(payload_in.get("rag_context"), dict) else None,
                 network_retries=3,
+                enable_thinking=enable_thinking,
+                on_thinking_delta=_thinking_callback
+                if on_thinking_delta_with_context is not None or on_thinking_delta is not None
+                else None,
             )
         else:
             assert cfg is not None
@@ -976,15 +1735,24 @@ def translate_segments_openai_with_summary(
                 "输出 JSON 结构（必须严格遵守）：\n"
                 '{ "updated_summary": "...", "translations": [ {"idx": 1, "text": "..."}, ... ] }'
             )
-            data = request_openai_json_object(
-                config=cfg,
-                system_prompt=system_prompt,
-                user_prompt=user_prompt,
-                client=client,
-                format_retry_notice="注意：上一次输出不符合 JSON/结构要求，请严格按 JSON 输出。",
-                format_retries=2,
-                network_retries=3,
-            )
+            request_kwargs = {
+                "config": cfg,
+                "system_prompt": system_prompt,
+                "user_prompt": user_prompt,
+                "client": client,
+                "format_retry_notice": "注意：上一次输出不符合 JSON/结构要求，请严格按 JSON 输出。",
+                "format_retries": 2,
+                "network_retries": 3,
+            }
+            if enable_thinking:
+                data = request_openai_json_object_with_thinking(
+                    **request_kwargs,
+                    on_thinking_delta=_thinking_callback
+                    if on_thinking_delta_with_context is not None or on_thinking_delta is not None
+                    else None,
+                )
+            else:
+                data = request_openai_json_object(**request_kwargs)
 
         translations = data.get("translations")
         if not isinstance(translations, list):
@@ -1052,31 +1820,54 @@ def translate_segments_openai_with_summary(
         while idx < len(segs):
             size = min(cur_batch_size, len(segs) - idx)
             batch = segs[idx : idx + size]
+            batch_context = on_batch_start(batch, idx, summary) if on_batch_start is not None else None
             try:
-                translated, summary = _translate_batch(client, batch, start_idx=idx, summary=summary)
+                translated, summary = _translate_batch(
+                    client,
+                    batch,
+                    start_idx=idx,
+                    summary=summary,
+                    batch_context=batch_context,
+                )
                 out.extend(translated)
                 idx += size
                 if on_batch_done is not None:
                     on_batch_done(translated, summary, idx)
+                if on_batch_done_with_context is not None:
+                    on_batch_done_with_context(batch_context, translated, summary, idx)
             except _PartialBatchTranslationError as e:
                 if not e.translated_prefix:
+                    if on_batch_error is not None:
+                        on_batch_error(batch_context, e)
                     raise
                 out.extend(e.translated_prefix)
                 idx += len(e.translated_prefix)
                 if on_batch_done is not None:
                     on_batch_done(e.translated_prefix, summary, idx)
+                if on_batch_done_with_context is not None:
+                    on_batch_done_with_context(batch_context, e.translated_prefix, summary, idx)
                 if cur_batch_size > 1:
                     cur_batch_size = max(1, cur_batch_size // 2)
                     continue
+                if on_batch_error is not None:
+                    on_batch_error(batch_context, e)
                 raise RuntimeError(str(e)) from e
-            except httpx.TimeoutException:
+            except httpx.TimeoutException as e:
+                if on_batch_error is not None:
+                    on_batch_error(batch_context, e)
                 if cur_batch_size <= 1:
                     raise
                 cur_batch_size = max(1, cur_batch_size // 2)
-            except httpx.TransportError:
+            except httpx.TransportError as e:
+                if on_batch_error is not None:
+                    on_batch_error(batch_context, e)
                 if cur_batch_size <= 1:
                     raise
                 cur_batch_size = max(1, cur_batch_size // 2)
+            except Exception as e:
+                if on_batch_error is not None:
+                    on_batch_error(batch_context, e)
+                raise
 
     return out, summary
 

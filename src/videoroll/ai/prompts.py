@@ -33,6 +33,46 @@ def build_text_translation_prompt(text: str, *, target_lang: str, style: str) ->
     )
 
 
+def build_title_translation_prompt(
+    title: str,
+    *,
+    target_lang: str,
+    style: str,
+    summary: str = "",
+) -> AIJsonPrompt:
+    source = str(title or "").strip()
+    tgt = (target_lang or "zh").strip() or "zh"
+    tone = (style or "").strip() or "口语自然"
+    context = str(summary or "").strip()[:2000]
+    context_block = (
+        "视频内容总结（仅作为理解标题的上文，不要把总结内容添加到标题中）：\n"
+        f"{context}\n\n"
+        if context
+        else ""
+    )
+    return AIJsonPrompt(
+        system_prompt="You are a professional video title translator. Return ONLY valid JSON.",
+        user_prompt=(
+            "请结合视频内容总结翻译下面的视频标题。\n"
+            "要求：\n"
+            "- 总结只用于判断标题中的语境、专有名词和歧义；\n"
+            "- 不要把总结中的额外信息、标题前缀或解释添加到译文；\n"
+            "- 保留人名、品牌、型号和作品名的准确性；\n"
+            "- 译文适合作为视频平台标题，简洁、自然；\n"
+            "- 只输出 JSON 对象，不要输出解释；\n"
+            f"- 目标语言：{tgt}\n"
+            f"- 风格：{tone}\n\n"
+            f"{context_block}"
+            f"原标题：\n{source}\n\n"
+            '输出 JSON：{"translation":""}'
+        ),
+        # Title retries are managed by the title-specific caller so exactly
+        # four retries means at most five upstream requests.
+        format_retries=1,
+        network_retries=1,
+    )
+
+
 def build_subtitle_translation_prompt(
     *,
     blocks: list[dict[str, Any]],

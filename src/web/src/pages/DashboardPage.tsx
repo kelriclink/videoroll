@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { Link } from "react-router-dom";
 import { fetchJson } from "../lib/http";
 import { ORCHESTRATOR_URL } from "../lib/urls";
@@ -172,6 +172,84 @@ function agentDisplayStatus(run: AgentRun, childrenRuns: AgentRun[] = []): Agent
   return { label: run.status || "unknown", tone: "idle", title: run.status || "unknown" };
 }
 
+function agentTreeDisplayStatus(
+  run: AgentRun,
+  childrenByParent: Map<string, AgentRun[]>,
+  visiting: Set<string> = new Set(),
+): AgentDisplayStatus {
+  if (visiting.has(run.id)) return agentDisplayStatus(run);
+  const nextVisiting = new Set(visiting);
+  nextVisiting.add(run.id);
+  const children = childrenByParent.get(run.id) ?? [];
+  const childStatuses = children.map((child) => agentTreeDisplayStatus(child, childrenByParent, nextVisiting));
+  const runningChildren = childStatuses.filter((child) => child.tone === "running").length;
+  const failedChildren = childStatuses.filter((child) => child.tone === "failed").length;
+  const warningChildren = childStatuses.filter((child) => child.tone === "warning").length;
+  const own = agentDisplayStatus(run);
+  if (own.tone === "failed") return own;
+  if (own.tone === "running" || runningChildren > 0) {
+    return {
+      label: own.tone === "running" ? "running" : "waiting",
+      tone: "running",
+      title: runningChildren > 0 ? `${runningChildren} 个分支仍在运行` : own.title,
+    };
+  }
+  if (failedChildren > 0) return { label: "partial", tone: "warning", title: `${failedChildren} 个下级分支失败` };
+  if (own.tone === "warning" || warningChildren > 0) {
+    return { label: "partial", tone: "warning", title: own.tone === "warning" ? own.title : `${warningChildren} 个下级分支部分完成` };
+  }
+  return own;
+}
+
+function collectAgentTree(root: AgentRun, childrenByParent: Map<string, AgentRun[]>): Array<{ run: AgentRun; depth: number }> {
+  const rows: Array<{ run: AgentRun; depth: number }> = [];
+  const visited = new Set<string>();
+  const visit = (run: AgentRun, depth: number) => {
+    if (visited.has(run.id)) return;
+    visited.add(run.id);
+    rows.push({ run, depth });
+    for (const child of childrenByParent.get(run.id) ?? []) visit(child, depth + 1);
+  };
+  visit(root, 0);
+  return rows;
+}
+
+function latestAgentInTree(root: AgentRun, childrenByParent: Map<string, AgentRun[]>): AgentRun {
+  const rows = collectAgentTree(root, childrenByParent);
+  const descendants = rows.filter((row) => row.depth > 0);
+  const candidates = descendants.length ? descendants : rows;
+  return [...candidates].sort((a, b) => {
+    const aRunning = (a.run.status || "").toLowerCase() === "running" ? 1 : 0;
+    const bRunning = (b.run.status || "").toLowerCase() === "running" ? 1 : 0;
+    if (aRunning !== bRunning) return bRunning - aRunning;
+    const timeDiff = new Date(b.run.updated_at).getTime() - new Date(a.run.updated_at).getTime();
+    if (timeDiff !== 0) return timeDiff;
+    return b.depth - a.depth;
+  })[0]?.run ?? root;
+}
+
+function agentTypeLabel(run: AgentRun): string {
+  if (run.agent_type === "subtitle_translation_session") return "翻译 Session";
+  if (run.agent_type === "subtitle_translation_batch") return "翻译 Batch";
+  if (run.agent_type === "rag_master") return "RAG Master";
+  if (run.agent_type === "rag_term_research") return "RAG 子 Agent";
+  if (run.agent_type === "subtitle_translation_thinking") return "翻译 Think";
+  return run.agent_type;
+}
+
+function translationSessionStats(run: AgentRun, childrenByParent: Map<string, AgentRun[]>) {
+  const batches = (childrenByParent.get(run.id) ?? []).filter((child) => child.agent_type === "subtitle_translation_batch");
+  const completedFromBatches = batches.reduce((max, batch) => Math.max(max, numberValue(batch.result?.completed_segments) ?? 0), 0);
+  const total = numberValue(run.result?.total_segments)
+    ?? numberValue(recordValue(run.steps[0]?.input).segment_count)
+    ?? 0;
+  const completed = numberValue(run.result?.completed_segments) ?? completedFromBatches;
+  const failed = batches.filter((batch) => agentTreeDisplayStatus(batch, childrenByParent).tone === "failed").length;
+  const running = batches.filter((batch) => agentTreeDisplayStatus(batch, childrenByParent).tone === "running").length;
+  const succeeded = batches.filter((batch) => agentTreeDisplayStatus(batch, childrenByParent).tone === "success").length;
+  return { batches, total, completed, failed, running, succeeded };
+}
+
 function stepToneClass(kind: unknown, action: unknown): string {
   const k = String(kind || "");
   const a = String(action || "");
@@ -192,6 +270,14 @@ function prettyJson(value: unknown): string {
   }
 }
 
+function recordValue(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
+}
+
+function thinkingDelta(step: Record<string, unknown>): string {
+  return textValue(recordValue(step.output).thinking_delta);
+}
+
 function AgentStep({ step, index }: { step: Record<string, unknown>; index: number }) {
   const kind = textValue(step.kind) || "event";
   const action = textValue(step.action) || "step";
@@ -201,11 +287,18 @@ function AgentStep({ step, index }: { step: Record<string, unknown>; index: numb
   const errorType = textValue(step.error_type);
   const duration = formatDurationMs(step.duration_ms);
   const ok = typeof step.ok === "boolean" ? step.ok : null;
+  const thinking = thinkingDelta(step);
+  const batchStart = numberValue(recordValue(step.input).batch_start);
+  const batchSize = numberValue(recordValue(step.input).batch_size);
+  const output = recordValue(step.output);
+  const finalTranslations = action === "translation_batch.completed" && Array.isArray(output.translations)
+    ? output.translations.map(recordValue).filter((item) => textValue(item.text))
+    : [];
   const body = Object.fromEntries(
-    Object.entries(step).filter(([key]) => !["kind", "action", "at", "tool", "tool_name", "model", "tokens", "duration_ms", "ok", "error_type"].includes(key)),
+    Object.entries(step).filter(([key]) => !["kind", "action", "at", "tool", "tool_name", "model", "tokens", "duration_ms", "ok", "error_type"].includes(key) && !(thinking && key === "output")),
   );
   const hasBody = Object.keys(body).length > 0;
-  const defaultOpen = index < 2 || action.includes("failed") || Boolean(errorType);
+  const defaultOpen = index < 2 || action.includes("failed") || Boolean(errorType) || Boolean(thinking);
   return (
     <div className="min-w-0 overflow-hidden rounded-md border border-slate-200 p-3">
       <div className="flex flex-wrap items-center justify-between gap-2">
@@ -223,6 +316,27 @@ function AgentStep({ step, index }: { step: Record<string, unknown>; index: numb
           {at ? <span>{new Date(at).toLocaleTimeString()}</span> : null}
         </div>
       </div>
+      {thinking ? (
+        <div className="mt-2 rounded border border-violet-200 bg-violet-50 p-3">
+          <div className="mb-1 text-xs font-medium text-violet-900">
+            Think 流{batchStart !== null ? ` · 字幕 ${batchStart}${batchSize && batchSize > 1 ? `-${batchStart + batchSize - 1}` : ""}` : ""}
+          </div>
+          <pre className="max-h-72 max-w-full overflow-auto whitespace-pre-wrap break-words text-xs leading-relaxed text-violet-950">{thinking}</pre>
+        </div>
+      ) : null}
+      {finalTranslations.length ? (
+        <div className="mt-2 rounded-lg border border-emerald-200 bg-emerald-50/70 p-3">
+          <div className="mb-2 text-xs font-semibold text-emerald-900">最终翻译 · {finalTranslations.length} 段</div>
+          <div className="max-h-96 space-y-2 overflow-auto pr-1">
+            {finalTranslations.map((item, itemIndex) => (
+              <div key={`${String(item.idx || itemIndex)}-${itemIndex}`} className="grid grid-cols-[auto_minmax(0,1fr)] gap-2 text-sm leading-relaxed text-slate-900">
+                <span className="font-mono text-xs text-emerald-700">#{String(item.idx || itemIndex + 1)}</span>
+                <span className="whitespace-pre-wrap">{textValue(item.text)}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      ) : null}
       {hasBody ? (
         <details className="mt-2 min-w-0" open={defaultOpen}>
           <summary className="cursor-pointer select-none text-xs font-medium text-slate-600">JSON</summary>
@@ -233,126 +347,189 @@ function AgentStep({ step, index }: { step: Record<string, unknown>; index: numb
   );
 }
 
+type AgentStepGroup =
+  | { type: "reasoning"; steps: Array<Record<string, unknown>> }
+  | { type: "tools"; steps: Array<Record<string, unknown>> }
+  | { type: "step"; step: Record<string, unknown> };
+
+function groupedAgentSteps(steps: Array<Record<string, unknown>>): AgentStepGroup[] {
+  const groups: AgentStepGroup[] = [];
+  for (const step of steps) {
+    const action = textValue(step.action);
+    const kind = textValue(step.kind);
+    const type = action === "translation_thinking.delta" ? "reasoning" : kind === "tool" ? "tools" : "step";
+    const last = groups[groups.length - 1];
+    if (type === "reasoning" && last?.type === "reasoning") last.steps.push(step);
+    else if (type === "tools" && last?.type === "tools") last.steps.push(step);
+    else if (type === "reasoning" || type === "tools") groups.push({ type, steps: [step] });
+    else groups.push({ type: "step", step });
+  }
+  return groups;
+}
+
+function AgentFlowDisclosure({
+  title,
+  tone,
+  active,
+  children,
+}: {
+  title: string;
+  tone: "reasoning" | "tools";
+  active: boolean;
+  children: ReactNode;
+}) {
+  const [open, setOpen] = useState(active);
+  const [manuallyToggled, setManuallyToggled] = useState(false);
+  useEffect(() => {
+    if (!manuallyToggled) setOpen(active);
+  }, [active, manuallyToggled]);
+  const classes = tone === "reasoning"
+    ? "border-violet-200 bg-violet-50/70 text-violet-800"
+    : "border-sky-200 bg-sky-50/60 text-sky-800";
+  return (
+    <div className={`rounded-lg border p-3 ${classes}`}>
+      <button type="button" className="flex w-full items-center justify-between gap-3 text-left text-xs font-semibold" onClick={() => {
+        setManuallyToggled(true);
+        setOpen((value) => !value);
+      }}>
+        <span>{title}</span>
+        <span className="shrink-0 text-[11px] opacity-70">{open ? "收起" : "展开"}</span>
+      </button>
+      {open ? <div className="mt-3">{children}</div> : null}
+    </div>
+  );
+}
+
+function AgentExecutionFlow({ run, followLatest, endRef }: { run: AgentRun; followLatest: boolean; endRef: { current: HTMLDivElement | null } }) {
+  const groups = groupedAgentSteps(run.steps);
+  const running = (run.status || "").toLowerCase() === "running";
+  const groupStartIndices: number[] = [];
+  let nextStepIndex = 0;
+  for (const group of groups) {
+    groupStartIndices.push(nextStepIndex);
+    nextStepIndex += group.type === "step" ? 1 : group.steps.length;
+  }
+  return (
+    <div className="min-w-0 space-y-2">
+      {groups.length === 0 ? <div className="rounded-lg border border-dashed border-slate-200 p-8 text-center text-sm text-slate-500">等待此节点产生执行记录…</div> : null}
+      {groups.map((group, groupIndex) => {
+        if (group.type === "reasoning") {
+          const text = group.steps.map(thinkingDelta).filter(Boolean).join("");
+          return (
+            <AgentFlowDisclosure key={`reasoning-${groupIndex}`} tone="reasoning" active={running && followLatest} title={`${running ? "正在思考…" : "思考过程"} · ${text.length} 字符`}>
+              <pre className="mt-3 max-h-96 overflow-auto whitespace-pre-wrap break-words text-xs leading-relaxed text-violet-950">{text}</pre>
+            </AgentFlowDisclosure>
+          );
+        }
+        if (group.type === "tools") {
+          const names = group.steps.map((step) => textValue(step.tool_name) || textValue(step.action) || "tool");
+          const startIndex = groupStartIndices[groupIndex];
+          return (
+            <AgentFlowDisclosure key={`tools-${groupIndex}`} tone="tools" active={running && followLatest} title={`${running ? "正在调用工具" : "已调用工具"} · ${names.length} 次 · ${Array.from(new Set(names)).slice(0, 3).join("、")}`}>
+              <div className="mt-3 space-y-2">{group.steps.map((step, index) => <AgentStep key={`${run.id}-tool-${groupIndex}-${index}`} step={step} index={startIndex + index} />)}</div>
+            </AgentFlowDisclosure>
+          );
+        }
+        return <AgentStep key={`${run.id}-step-${groupIndex}`} step={group.step} index={groupStartIndices[groupIndex]} />;
+      })}
+      <div ref={endRef} />
+    </div>
+  );
+}
+
 function AgentRunDetail({
-  run,
-  parentRun,
-  childrenRuns = [],
+  rootRun,
+  activeRun,
+  childrenByParent,
+  followLatest,
   onSelectRun,
-  onBackToParent,
+  onToggleFollowLatest,
   onClose,
 }: {
-  run: AgentRun;
-  parentRun?: AgentRun | null;
-  childrenRuns?: AgentRun[];
+  rootRun: AgentRun;
+  activeRun: AgentRun;
+  childrenByParent: Map<string, AgentRun[]>;
+  followLatest: boolean;
   onSelectRun: (run: AgentRun) => void;
-  onBackToParent?: () => void;
+  onToggleFollowLatest: () => void;
   onClose: () => void;
 }) {
-  const translation = textValue(run.result?.translation);
-  const confidence = numberValue(run.result?.confidence);
-  const knowledgeStatus = textValue(run.result?.knowledge_status);
-  const failureCategory = textValue(run.result?.failure_category);
-  const displayStatus = agentDisplayStatus(run, childrenRuns);
+  const displayStatus = agentTreeDisplayStatus(rootRun, childrenByParent);
+  const activeStatus = agentTreeDisplayStatus(activeRun, childrenByParent);
+  const treeRows = collectAgentTree(rootRun, childrenByParent);
+  const flowEndRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    if (followLatest) flowEndRef.current?.scrollIntoView({ block: "end" });
+  }, [activeRun.id, activeRun.steps.length, followLatest]);
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center overflow-hidden overscroll-contain bg-slate-950/45 p-4">
-      <div className="flex max-h-[calc(100vh-2rem)] w-full max-w-[min(72rem,calc(100vw-2rem))] flex-col overflow-hidden rounded-md bg-white shadow-xl">
+      <div className="flex max-h-[calc(100vh-2rem)] w-full max-w-[min(86rem,calc(100vw-2rem))] flex-col overflow-hidden rounded-xl bg-white shadow-2xl">
         <div className="flex shrink-0 items-start justify-between gap-4 border-b border-slate-200 p-4">
           <div className="min-w-0">
             <div className="flex min-w-0 flex-wrap items-center gap-2">
-              <div className="min-w-0 truncate text-lg font-semibold text-slate-950">{run.term || run.query || run.id}</div>
-              <span title={displayStatus.title} className={`shrink-0 rounded border px-2 py-0.5 text-xs ${agentStatusClass(displayStatus.tone)}`}>
-                {displayStatus.label}
-              </span>
+              <div className="min-w-0 truncate text-lg font-semibold text-slate-950">{rootRun.term || rootRun.query || rootRun.id}</div>
+              <span title={displayStatus.title} className={`shrink-0 rounded border px-2 py-0.5 text-xs ${agentStatusClass(displayStatus.tone)}`}>{displayStatus.label}</span>
             </div>
-            <div className="mt-1 truncate font-mono text-xs text-slate-500">{run.id}</div>
+            <div className="mt-1 truncate text-xs text-slate-500">当前：{activeRun.term || activeRun.query || activeRun.id} · {agentTypeLabel(activeRun)}</div>
           </div>
           <div className="flex shrink-0 items-center gap-2">
-            {parentRun && onBackToParent ? (
-              <button className="rounded-md border border-slate-300 px-3 py-2 text-sm hover:bg-slate-50" onClick={onBackToParent}>
-                返回主 Agent
-              </button>
-            ) : null}
-            <button className="rounded-md border border-slate-300 px-3 py-2 text-sm hover:bg-slate-50" onClick={onClose}>
-              关闭
+            <button className={`rounded-md border px-3 py-2 text-sm ${followLatest ? "border-violet-200 bg-violet-50 text-violet-800" : "border-slate-300 hover:bg-slate-50"}`} onClick={onToggleFollowLatest}>
+              {followLatest ? "正在跟随最新" : "跟随最新"}
             </button>
+            <button className="rounded-md border border-slate-300 px-3 py-2 text-sm hover:bg-slate-50" onClick={onClose}>关闭</button>
           </div>
         </div>
-        <div className="min-h-0 min-w-0 flex-1 gap-4 overflow-auto p-4 lg:grid lg:grid-cols-[300px_minmax(0,1fr)] lg:overflow-hidden">
-          <div className="min-h-0 min-w-0 space-y-3 pr-1 lg:overflow-auto">
-            <div className="min-w-0 rounded-md border border-slate-200 p-3">
-              <div className="mb-2 text-xs font-semibold text-slate-600">概览</div>
+        <div className="min-h-0 min-w-0 flex-1 overflow-auto lg:grid lg:grid-cols-[360px_minmax(0,1fr)] lg:overflow-hidden">
+          <div className="min-h-0 min-w-0 border-r border-slate-200 bg-slate-50/70 p-4 lg:overflow-auto">
+            <div className="mb-2 flex items-center justify-between gap-2">
+              <div className="text-xs font-semibold uppercase tracking-wide text-slate-500">执行树</div>
+              <div className="text-[11px] text-slate-400">{treeRows.length} 个节点</div>
+            </div>
+            <div className="mb-4 space-y-1">
+              {treeRows.map(({ run, depth }) => {
+                const status = agentTreeDisplayStatus(run, childrenByParent);
+                const selected = run.id === activeRun.id;
+                return (
+                  <button key={run.id} type="button" className={`block w-full rounded-lg border px-2.5 py-2 text-left transition ${selected ? "border-violet-300 bg-white shadow-sm ring-1 ring-violet-100" : "border-transparent hover:border-slate-200 hover:bg-white"}`} style={{ paddingLeft: `${10 + Math.min(depth, 5) * 16}px` }} onClick={() => onSelectRun(run)}>
+                    <div className="flex items-center gap-2">
+                      <span className={`h-2 w-2 shrink-0 rounded-full ${status.tone === "running" ? "animate-pulse bg-sky-500" : status.tone === "success" ? "bg-emerald-500" : status.tone === "failed" ? "bg-rose-500" : status.tone === "warning" ? "bg-amber-500" : "bg-slate-400"}`} />
+                      <span className="min-w-0 flex-1 truncate text-xs font-medium text-slate-800">{run.term || run.query || run.id}</span>
+                      <span className="shrink-0 text-[10px] text-slate-400">{agentTypeLabel(run)}</span>
+                    </div>
+                  </button>
+                );
+              })}
+            </div>
+            <div className="rounded-lg border border-slate-200 bg-white p-3">
+              <div className="mb-2 flex items-center justify-between gap-2 text-xs font-semibold text-slate-600">
+                <span>当前节点</span>
+                <span title={activeStatus.title} className={`rounded border px-1.5 py-0.5 font-normal ${agentStatusClass(activeStatus.tone)}`}>{activeStatus.label}</span>
+              </div>
               <div className="grid gap-1 text-xs text-slate-600">
-                <div>status: <span title={displayStatus.title} className={`rounded border px-1.5 py-0.5 ${agentStatusClass(displayStatus.tone)}`}>{displayStatus.label}</span></div>
-                <div>raw: <span className={`rounded border px-1.5 py-0.5 ${agentStatusClass(run.status)}`}>{run.status}</span></div>
-                <div className="truncate">type: {run.agent_type}</div>
-                {parentRun ? <div className="truncate">parent: {parentRun.term || parentRun.query || parentRun.id}</div> : null}
-                <div className="truncate">domain: {run.domain || "-"}</div>
-                <div className="truncate">target: {run.target_lang}</div>
-                <div className="truncate">query: {run.query || "-"}</div>
-                <div>started: {formatDate(run.started_at)}</div>
-                <div>updated: {formatDate(run.updated_at)}</div>
-                {run.finished_at ? <div>finished: {formatDate(run.finished_at)}</div> : null}
+                <div className="font-medium text-slate-900">{activeRun.term || activeRun.query || activeRun.id}</div>
+                <div className="truncate">type: {agentTypeLabel(activeRun)}</div>
+                <div className="truncate">query: {activeRun.query || "-"}</div>
+                <div>updated: {formatDate(activeRun.updated_at)}</div>
               </div>
+              {activeRun.error ? <div className="mt-3 max-h-32 overflow-auto rounded bg-rose-50 p-2 text-xs text-rose-700">{activeRun.error}</div> : null}
             </div>
-            <div className="min-w-0 rounded-md border border-slate-200 p-3">
-              <div className="mb-2 text-xs font-semibold text-slate-600">结果</div>
-              {translation ? (
-                <div className="grid gap-1 text-xs text-slate-600">
-                  <div className="text-sm font-medium text-slate-900">{translation}</div>
-                  {confidence !== null ? <div>confidence: {(confidence * 100).toFixed(0)}%</div> : null}
-                  {knowledgeStatus ? <div>knowledge: {knowledgeStatus}</div> : null}
-                  {failureCategory ? <div>failure: {failureCategory}</div> : null}
-                  {run.knowledge_item_id ? (
-                    <Link to={knowledgeItemHref(run.knowledge_item_id)} className="truncate font-mono text-sky-700 hover:underline">
-                      item: {run.knowledge_item_id}
-                    </Link>
-                  ) : null}
-                </div>
-              ) : (
-                <div className="text-sm text-slate-500">暂无结果。</div>
-              )}
-              {run.error ? <div className="mt-2 max-h-32 overflow-auto rounded bg-rose-50 p-2 text-xs text-rose-700">{run.error}</div> : null}
-            </div>
-            {Object.keys(run.result || {}).length ? (
-              <div className="min-w-0 rounded-md border border-slate-200 p-3">
-                <div className="mb-2 text-xs font-semibold text-slate-600">Result JSON</div>
-                <pre className="max-h-64 max-w-full overflow-auto whitespace-pre rounded bg-slate-950 p-3 text-xs leading-relaxed text-slate-100">{prettyJson(run.result)}</pre>
-              </div>
-            ) : null}
-            {childrenRuns.length ? (
-              <div className="min-w-0 rounded-md border border-slate-200 p-3">
-                <div className="mb-2 text-xs font-semibold text-slate-600">子 Agent</div>
-                <div className="max-h-64 space-y-1 overflow-auto pr-1">
-                  {childrenRuns.map((child) => (
-                    <button
-                      key={child.id}
-                      type="button"
-                      className="block w-full rounded border border-slate-200 px-2 py-1.5 text-left hover:bg-slate-50"
-                      onClick={() => onSelectRun(child)}
-                    >
-                      <div className="flex items-center justify-between gap-2">
-                        <span className="min-w-0 truncate text-xs font-medium text-slate-800">{child.term || child.query || child.id}</span>
-                        {(() => {
-                          const childDisplayStatus = agentDisplayStatus(child);
-                          return (
-                            <span title={childDisplayStatus.title} className={`shrink-0 rounded border px-1.5 py-0.5 text-[11px] ${agentStatusClass(childDisplayStatus.tone)}`}>
-                              {childDisplayStatus.label}
-                            </span>
-                          );
-                        })()}
-                      </div>
-                      <div className="mt-1 truncate font-mono text-[11px] text-slate-500">{child.agent_type} · {formatDate(child.updated_at)}</div>
-                    </button>
-                  ))}
-                </div>
-              </div>
+            {Object.keys(activeRun.result || {}).length ? (
+              <details className="mt-3 rounded-lg border border-slate-200 bg-white p-3">
+                <summary className="cursor-pointer text-xs font-semibold text-slate-600">结果数据</summary>
+                <pre className="mt-2 max-h-64 max-w-full overflow-auto whitespace-pre rounded bg-slate-950 p-3 text-xs leading-relaxed text-slate-100">{prettyJson(activeRun.result)}</pre>
+              </details>
             ) : null}
           </div>
-          <div className="mt-4 min-h-0 min-w-0 pr-1 lg:mt-0 lg:overflow-auto">
-            <div className="mb-2 text-sm font-semibold text-slate-900">对话流</div>
-            <div className="min-w-0 space-y-2">
-              {run.steps.length === 0 ? <div className="text-sm text-slate-500">暂无步骤记录。</div> : null}
-              {run.steps.map((step, index) => <AgentStep key={`${run.id}-${index}`} step={step} index={index} />)}
+          <div className="min-h-0 min-w-0 bg-white p-4 lg:flex lg:flex-col lg:overflow-hidden">
+            <div className="mb-3 flex shrink-0 items-start justify-between gap-3 border-b border-slate-100 pb-3">
+              <div className="min-w-0">
+                <div className="text-sm font-semibold text-slate-900">最新执行流</div>
+                <div className="mt-1 truncate text-xs text-slate-500">{activeRun.term || activeRun.query || activeRun.id}</div>
+              </div>
+              <span className="rounded-full bg-violet-50 px-2 py-1 text-[11px] text-violet-700">{activeRun.steps.length} steps</span>
+            </div>
+            <div className="min-w-0 lg:min-h-0 lg:flex-1 lg:overflow-auto lg:pr-1">
+              <AgentExecutionFlow run={activeRun} followLatest={followLatest} endRef={flowEndRef} />
             </div>
           </div>
         </div>
@@ -361,29 +538,45 @@ function AgentRunDetail({
   );
 }
 
-function AgentRunCard({ run, onSelect, childrenRuns = [] }: { run: AgentRun; onSelect: (run: AgentRun) => void; childrenRuns?: AgentRun[] }) {
+function AgentRunCard({ run, onSelect, childrenByParent }: { run: AgentRun; onSelect: (run: AgentRun) => void; childrenByParent: Map<string, AgentRun[]> }) {
+  const childrenRuns = childrenByParent.get(run.id) ?? [];
   const translation = textValue(run.result?.translation);
   const confidence = numberValue(run.result?.confidence);
   const knowledgeStatus = textValue(run.result?.knowledge_status);
   const failureCategory = textValue(run.result?.failure_category);
   const opened = run.steps.filter((step) => step.action === "open_url" || step.action === "read_url").length;
   const latestStep = run.steps[run.steps.length - 1];
-  const displayStatus = agentDisplayStatus(run, childrenRuns);
-  const failedChildren = childrenRuns.filter((child) => agentDisplayStatus(child).tone === "failed").length;
-  const warningChildren = childrenRuns.filter((child) => agentDisplayStatus(child).tone === "warning").length;
-  const runningChildren = childrenRuns.filter((child) => agentDisplayStatus(child).tone === "running").length;
+  const latestThinking = [...run.steps].reverse().map(thinkingDelta).find(Boolean) || "";
+  const displayStatus = agentTreeDisplayStatus(run, childrenByParent);
+  const failedChildren = childrenRuns.filter((child) => agentTreeDisplayStatus(child, childrenByParent).tone === "failed").length;
+  const warningChildren = childrenRuns.filter((child) => agentTreeDisplayStatus(child, childrenByParent).tone === "warning").length;
+  const runningChildren = childrenRuns.filter((child) => agentTreeDisplayStatus(child, childrenByParent).tone === "running").length;
+  const sessionStats = run.agent_type === "subtitle_translation_session" ? translationSessionStats(run, childrenByParent) : null;
+  const latestNode = latestAgentInTree(run, childrenByParent);
+  const progress = sessionStats?.total ? Math.max(0, Math.min(100, (sessionStats.completed / sessionStats.total) * 100)) : 0;
   return (
     <button type="button" className="block w-full rounded-md border border-slate-200 p-3 text-left hover:bg-slate-50" onClick={() => onSelect(run)}>
       <div className="flex items-start justify-between gap-3">
         <div className="min-w-0">
           <div className="truncate text-sm font-medium text-slate-950">{run.term || run.query || run.id}</div>
-          <div className="mt-1 truncate font-mono text-xs text-slate-500">{run.agent_type} · {formatDate(run.updated_at)}</div>
+          <div className="mt-1 truncate text-xs text-slate-500">{agentTypeLabel(run)} · {formatDate(run.updated_at)}</div>
         </div>
         <span title={displayStatus.title} className={`shrink-0 rounded border px-2 py-0.5 text-xs ${agentStatusClass(displayStatus.tone)}`}>{displayStatus.label}</span>
       </div>
       <div className="mt-2 grid gap-1 text-xs text-slate-600">
-        {run.domain ? <div className="truncate">domain: {run.domain}</div> : null}
-        {run.query ? <div className="truncate">query: {run.query}</div> : null}
+        {sessionStats ? (
+          <>
+            <div className="flex items-center justify-between gap-2">
+              <span>进度：{sessionStats.completed}/{sessionStats.total || "-"} 段</span>
+              <span>{progress.toFixed(0)}%</span>
+            </div>
+            <div className="h-1.5 overflow-hidden rounded-full bg-slate-100"><div className="h-full rounded-full bg-violet-500 transition-all" style={{ width: `${progress}%` }} /></div>
+            <div>Batch：{sessionStats.batches.length}{sessionStats.running ? ` · 运行 ${sessionStats.running}` : ""}{sessionStats.succeeded ? ` · 成功 ${sessionStats.succeeded}` : ""}{sessionStats.failed ? ` · 失败 ${sessionStats.failed}` : ""}</div>
+            <div className="truncate text-violet-700">当前：{latestNode.term || latestNode.query || latestNode.id}</div>
+          </>
+        ) : null}
+        {!sessionStats && run.domain ? <div className="truncate">domain: {run.domain}</div> : null}
+        {!sessionStats && run.query ? <div className="truncate">query: {run.query}</div> : null}
         {opened ? <div>opened/read pages: {opened}</div> : null}
         {childrenRuns.length ? (
           <div>
@@ -394,6 +587,7 @@ function AgentRunCard({ run, onSelect, childrenRuns = [] }: { run: AgentRun; onS
           </div>
         ) : null}
         {latestStep?.action ? <div className="truncate">latest: {String(latestStep.action)}</div> : null}
+        {latestThinking ? <div className="line-clamp-2 text-violet-800">think: {latestThinking}</div> : null}
         {translation ? (
           <div className="truncate">
             result: {translation}
@@ -410,7 +604,7 @@ function AgentRunCard({ run, onSelect, childrenRuns = [] }: { run: AgentRun; onS
             <div key={child.id} className="flex items-center justify-between gap-2 text-xs text-slate-600">
               <span className="min-w-0 truncate">{child.term || child.query || child.id}</span>
               {(() => {
-                const childDisplayStatus = agentDisplayStatus(child);
+                const childDisplayStatus = agentTreeDisplayStatus(child, childrenByParent);
                 return (
                   <span title={childDisplayStatus.title} className={`shrink-0 rounded border px-1.5 py-0.5 ${agentStatusClass(childDisplayStatus.tone)}`}>
                     {childDisplayStatus.label}
@@ -488,7 +682,9 @@ export default function DashboardPage() {
   const [resourcesError, setResourcesError] = useState<string | null>(null);
   const [agentRuns, setAgentRuns] = useState<AgentRun[] | null>(null);
   const [agentRunsError, setAgentRunsError] = useState<string | null>(null);
-  const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null);
+  const [selectedAgentRootId, setSelectedAgentRootId] = useState<string | null>(null);
+  const [selectedAgentNodeId, setSelectedAgentNodeId] = useState<string | null>(null);
+  const [followLatestAgent, setFollowLatestAgent] = useState(true);
   const agentListTimerRef = useRef<number | undefined>();
   const selectedAgentTimerRef = useRef<number | undefined>();
   const uploadByTaskRef = useRef(new Map<string, Task["bilibili_upload"]>());
@@ -523,7 +719,7 @@ export default function DashboardPage() {
 
   const loadAgentRuns = useCallback(async () => {
     try {
-      setAgentRuns(await fetchJson<AgentRun[]>(`${ORCHESTRATOR_URL}/subtitle/agents/runs?limit=80`));
+      setAgentRuns(await fetchJson<AgentRun[]>(`${ORCHESTRATOR_URL}/subtitle/agents/runs?limit=12&include_descendants=true`));
       setAgentRunsError(null);
     } catch (e: unknown) {
       setAgentRunsError(e instanceof Error ? e.message : String(e));
@@ -618,10 +814,33 @@ export default function DashboardPage() {
       scheduleAgentListRefresh();
       return;
     }
-    if (event.name === "agent_run.step_appended" && id === selectedAgentId) {
-      scheduleSelectedAgentRefresh(id);
+    if (event.name === "agent_run.step_appended") {
+      const step = recordValue(data.step);
+      if (Object.keys(step).length > 0) {
+        setAgentRuns((current) => {
+          if (!current) return current;
+          const index = current.findIndex((run) => run.id === id);
+          if (index < 0) return current;
+          const run = current[index];
+          const eventId = textValue(step.event_id);
+          if (eventId && run.steps.some((item) => textValue(item.event_id) === eventId)) return current;
+          const next = [...current];
+          next[index] = {
+            ...run,
+            steps: [...run.steps, step],
+            updated_at: event.occurred_at || run.updated_at,
+          };
+          return next;
+        });
+      }
+      // RAG's normal step event carries only metadata. Keep the old detail
+      // refresh for a selected run, while Think deltas render immediately
+      // from the full event payload above.
+      if (id === selectedAgentNodeId && textValue(step.action) !== "translation_thinking.delta") {
+        scheduleSelectedAgentRefresh(id);
+      }
     }
-  }, [scheduleAgentListRefresh, scheduleSelectedAgentRefresh, selectedAgentId]);
+  }, [scheduleAgentListRefresh, scheduleSelectedAgentRefresh, selectedAgentNodeId]);
 
   useRealtimeSubscription(["tasks", "publishing", "resources", "agents"], handleRealtimeEvent, () => {
     void loadTasks();
@@ -667,6 +886,9 @@ export default function DashboardPage() {
       rows.push(run);
       out.set(run.parent_agent_run_id, rows);
     }
+    for (const rows of out.values()) {
+      rows.sort((a, b) => new Date(a.started_at).getTime() - new Date(b.started_at).getTime());
+    }
     return out;
   }, [agentRuns]);
   const agentById = useMemo(() => {
@@ -676,22 +898,45 @@ export default function DashboardPage() {
   }, [agentRuns]);
   const topLevelAgents = useMemo(() => (agentRuns ?? []).filter((run) => !run.parent_agent_run_id), [agentRuns]);
   const runningAgents = useMemo(
-    () => topLevelAgents.filter((run) => agentDisplayStatus(run, agentChildren.get(run.id) ?? []).tone === "running"),
+    () => topLevelAgents.filter((run) => agentTreeDisplayStatus(run, agentChildren).tone === "running"),
     [agentChildren, topLevelAgents],
   );
   const recentFinishedAgents = useMemo(
-    () => topLevelAgents.filter((run) => agentDisplayStatus(run, agentChildren.get(run.id) ?? []).tone !== "running").slice(0, 6),
+    () => topLevelAgents.filter((run) => agentTreeDisplayStatus(run, agentChildren).tone !== "running").slice(0, 6),
     [agentChildren, topLevelAgents],
   );
-  const selectedAgent = useMemo(() => (agentRuns ?? []).find((run) => run.id === selectedAgentId) ?? null, [agentRuns, selectedAgentId]);
-  const selectedAgentParent = useMemo(
-    () => (selectedAgent?.parent_agent_run_id ? agentById.get(selectedAgent.parent_agent_run_id) ?? null : null),
-    [agentById, selectedAgent],
+  const selectedAgentRoot = useMemo(() => (selectedAgentRootId ? agentById.get(selectedAgentRootId) ?? null : null), [agentById, selectedAgentRootId]);
+  const latestSelectedAgent = useMemo(
+    () => (selectedAgentRoot ? latestAgentInTree(selectedAgentRoot, agentChildren) : null),
+    [agentChildren, selectedAgentRoot],
   );
+  const selectedAgent = useMemo(() => {
+    if (!selectedAgentRoot) return null;
+    if (followLatestAgent) return latestSelectedAgent ?? selectedAgentRoot;
+    return (selectedAgentNodeId ? agentById.get(selectedAgentNodeId) : null) ?? latestSelectedAgent ?? selectedAgentRoot;
+  }, [agentById, followLatestAgent, latestSelectedAgent, selectedAgentNodeId, selectedAgentRoot]);
+  const openAgentSession = useCallback((run: AgentRun) => {
+    let root = run;
+    const visited = new Set<string>();
+    while (root.parent_agent_run_id && !visited.has(root.id)) {
+      visited.add(root.id);
+      const parent = agentById.get(root.parent_agent_run_id);
+      if (!parent) break;
+      root = parent;
+    }
+    setSelectedAgentRootId(root.id);
+    setSelectedAgentNodeId(latestAgentInTree(root, agentChildren).id);
+    setFollowLatestAgent(true);
+  }, [agentById, agentChildren]);
   useEffect(() => {
-    if (!selectedAgentId || selectedAgent || !agentRuns) return;
-    setSelectedAgentId(null);
-  }, [agentRuns, selectedAgent, selectedAgentId]);
+    if (!selectedAgentRootId || selectedAgentRoot || !agentRuns) return;
+    setSelectedAgentRootId(null);
+    setSelectedAgentNodeId(null);
+  }, [agentRuns, selectedAgentRoot, selectedAgentRootId]);
+  useEffect(() => {
+    if (!followLatestAgent || !latestSelectedAgent) return;
+    setSelectedAgentNodeId(latestSelectedAgent.id);
+  }, [followLatestAgent, latestSelectedAgent]);
   useEffect(() => {
     if (!selectedAgent) return;
     const previousOverflow = document.body.style.overflow;
@@ -821,8 +1066,8 @@ export default function DashboardPage() {
       <div className="vr-section">
         <div className="flex items-center justify-between gap-3">
           <div>
-            <div className="text-sm font-semibold">RAG Agent</div>
-            <div className="mt-1 text-xs text-slate-500">显示术语发现、搜索、网页读取、总结入库的运行记录。</div>
+            <div className="text-sm font-semibold">Agent 运行</div>
+            <div className="mt-1 text-xs text-slate-500">显示 RAG 的术语发现、搜索、网页读取与总结，以及启用 Think 的字幕翻译思考流。</div>
           </div>
           {agentRuns ? <div className="text-xs text-slate-500">运行中 {runningAgents.length}</div> : null}
         </div>
@@ -834,14 +1079,14 @@ export default function DashboardPage() {
               <div className="mb-2 text-xs font-semibold text-slate-600">正在工作</div>
               <div className="space-y-2">
                 {runningAgents.length === 0 ? <div className="text-sm text-slate-500">暂无运行中的 agent。</div> : null}
-                {runningAgents.map((run) => <AgentRunCard key={run.id} run={run} childrenRuns={agentChildren.get(run.id) ?? []} onSelect={(item) => setSelectedAgentId(item.id)} />)}
+                {runningAgents.map((run) => <AgentRunCard key={run.id} run={run} childrenByParent={agentChildren} onSelect={openAgentSession} />)}
               </div>
             </div>
             <div>
-              <div className="mb-2 text-xs font-semibold text-slate-600">最近结果</div>
+              <div className="mb-2 text-xs font-semibold text-slate-600">最近 Agent</div>
               <div className="space-y-2">
                 {recentFinishedAgents.length === 0 ? <div className="text-sm text-slate-500">暂无 agent 结果。</div> : null}
-                {recentFinishedAgents.map((run) => <AgentRunCard key={run.id} run={run} childrenRuns={agentChildren.get(run.id) ?? []} onSelect={(item) => setSelectedAgentId(item.id)} />)}
+                {recentFinishedAgents.map((run) => <AgentRunCard key={run.id} run={run} childrenByParent={agentChildren} onSelect={openAgentSession} />)}
               </div>
             </div>
           </div>
@@ -971,14 +1216,22 @@ export default function DashboardPage() {
           </div>
         ) : null}
       </div>
-      {selectedAgent ? (
+      {selectedAgentRoot && selectedAgent ? (
         <AgentRunDetail
-          run={selectedAgent}
-          parentRun={selectedAgentParent}
-          childrenRuns={agentChildren.get(selectedAgent.id) ?? []}
-          onSelectRun={(run) => setSelectedAgentId(run.id)}
-          onBackToParent={selectedAgentParent ? () => setSelectedAgentId(selectedAgentParent.id) : undefined}
-          onClose={() => setSelectedAgentId(null)}
+          rootRun={selectedAgentRoot}
+          activeRun={selectedAgent}
+          childrenByParent={agentChildren}
+          followLatest={followLatestAgent}
+          onSelectRun={(run) => {
+            setSelectedAgentNodeId(run.id);
+            setFollowLatestAgent(false);
+          }}
+          onToggleFollowLatest={() => setFollowLatestAgent((value) => !value)}
+          onClose={() => {
+            setSelectedAgentRootId(null);
+            setSelectedAgentNodeId(null);
+            setFollowLatestAgent(true);
+          }}
         />
       ) : null}
     </div>

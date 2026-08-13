@@ -66,7 +66,8 @@ from videoroll.db.models import (
     TaskStatus,
 )
 from videoroll.db.session import get_sessionmaker
-from videoroll.storage.s3 import S3Store
+from videoroll.storage.filesystem import FileStore, StorageObjectNotFound
+from videoroll.storage.recovery import reset_task_for_source_recovery
 from videoroll.realtime import publish_ui_event
 from videoroll.utils.auto_youtube import encode_auto_youtube_created_by
 from videoroll.utils.hashing import sha256_file
@@ -264,7 +265,13 @@ def effective_youtube_settings(settings: OrchestratorSettings, db: Session, *, c
             except Exception:
                 pass
             cookie_file = str(path)
-    return settings.model_copy(update={"youtube_proxy": proxy or None, "youtube_cookie_file": cookie_file})
+    return settings.model_copy(
+        update={
+            "youtube_proxy": proxy or None,
+            "youtube_cookie_file": cookie_file,
+            "youtube_compatibility_mode_enabled": bool(config.get("compatibility_mode_enabled")),
+        }
+    )
 
 
 def youtube_bot_check_hint(message: str, *, yt_settings: OrchestratorSettings, db: Session) -> str | None:
@@ -287,7 +294,7 @@ def youtube_bot_check_hint(message: str, *, yt_settings: OrchestratorSettings, d
     return "\n".join(lines)
 
 
-def get_cached_meta(task_id: uuid.UUID, *, db: Session, s3: S3Store) -> YouTubeMetaRead:
+def get_cached_meta(task_id: uuid.UUID, *, db: Session, s3: FileStore) -> YouTubeMetaRead:
     task = db.get(Task, task_id)
     if not task:
         raise HTTPException(status_code=404, detail="task not found")
@@ -305,7 +312,7 @@ def get_cached_meta(task_id: uuid.UUID, *, db: Session, s3: S3Store) -> YouTubeM
     return youtube_meta_to_read(meta)
 
 
-def fetch_meta(task_id: uuid.UUID, *, settings: OrchestratorSettings, db: Session, s3: S3Store) -> YouTubeMetaActionResponse:
+def fetch_meta(task_id: uuid.UUID, *, settings: OrchestratorSettings, db: Session, s3: FileStore) -> YouTubeMetaActionResponse:
     task = db.get(Task, task_id)
     if not task:
         raise HTTPException(status_code=404, detail="task not found")
@@ -352,7 +359,7 @@ def fetch_meta(task_id: uuid.UUID, *, settings: OrchestratorSettings, db: Sessio
     return YouTubeMetaActionResponse(metadata=youtube_meta_to_read(meta), metadata_asset=asset)
 
 
-def _store_failure_log(db: Session, s3: S3Store, task_id: uuid.UUID, url: str, exc: Exception, hint: str | None) -> None:
+def _store_failure_log(db: Session, s3: FileStore, task_id: uuid.UUID, url: str, exc: Exception, hint: str | None) -> None:
     diagnostics = exc.diagnostics if isinstance(exc, YtDlpRuntimeError) else []
     text = "\n".join(diagnostics).strip() or "videoroll yt-dlp diagnostics unavailable"
     text += f"\n\n---- videoroll error summary ----\ntask_id={task_id}\nurl={url}\nerror={exc}\n"
@@ -525,7 +532,7 @@ def _download(
     *,
     settings: OrchestratorSettings,
     db: Session,
-    s3: S3Store,
+    s3: FileStore,
     reporter: _YouTubeDownloadProgressReporter,
 ) -> YouTubeDownloadActionResponse:
     task = db.get(Task, task_id)
@@ -538,6 +545,19 @@ def _download(
         raise HTTPException(status_code=400, detail="task.source_url is empty" if not url else "task.source_url is not a valid youtube url")
     reporter.update("preparing", 0)
     video_asset = db.query(Asset).filter(Asset.task_id == task_id, Asset.kind == AssetKind.video_raw).order_by(Asset.created_at.desc()).first()
+    if video_asset is not None:
+        try:
+            s3.head_object(video_asset.storage_key)
+        except (StorageObjectNotFound, OSError, ValueError):
+            # A legacy MinIO key can remain in the database after the storage
+            # switch. Remove the whole unfinished working graph so a retry
+            # cannot mistake stale subtitles/render output for valid input.
+            if task.status not in {TaskStatus.published, TaskStatus.publishing, TaskStatus.canceled}:
+                reset_task_for_source_recovery(db, task)
+                db.commit()
+                video_asset = None
+            else:
+                raise HTTPException(status_code=409, detail="task source asset is unavailable; task state is not recoverable automatically")
     uploaded_keys: list[str] = []
     root = Path(settings.work_dir) / "youtube" / str(task_id); root.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="ytdlp_", dir=str(root)) as temp:
@@ -570,11 +590,12 @@ def _download(
                 video_path.suffix.lower() or ".mp4",
             )
             key_was_referenced = _storage_key_is_referenced(db, key)
-            reporter.update("uploading", 99, downloaded_bytes=video_path.stat().st_size, total_bytes=video_path.stat().st_size)
-            s3.upload_file(video_path, key)
+            video_size = video_path.stat().st_size
+            reporter.update("storing", 99, downloaded_bytes=video_size, total_bytes=video_size)
+            s3.promote_file(video_path, key)
             if not key_was_referenced:
                 uploaded_keys.append(key)
-            video_asset = Asset(task_id=task_id, kind=AssetKind.video_raw, storage_key=key, sha256=digest, size_bytes=video_path.stat().st_size); db.add(video_asset)
+            video_asset = Asset(task_id=task_id, kind=AssetKind.video_raw, storage_key=key, sha256=digest, size_bytes=video_size); db.add(video_asset)
         else:
             latest = db.query(Asset).filter(Asset.task_id == task_id, Asset.kind == AssetKind.metadata_json).order_by(Asset.created_at.desc()).first()
             try:
@@ -626,7 +647,7 @@ def _download(
     return YouTubeDownloadActionResponse(metadata=youtube_meta_to_read(meta), metadata_asset=meta_asset, video_asset=video_asset, cover_asset=cover_asset)
 
 
-def download(task_id: uuid.UUID, *, settings: OrchestratorSettings, db: Session, s3: S3Store) -> YouTubeDownloadActionResponse:
+def download(task_id: uuid.UUID, *, settings: OrchestratorSettings, db: Session, s3: FileStore) -> YouTubeDownloadActionResponse:
     reporter = _YouTubeDownloadProgressReporter(task_id, db=db, redis_url=str(getattr(settings, "redis_url", "") or ""))
     try:
         return _download(task_id, settings=settings, db=db, s3=s3, reporter=reporter)

@@ -150,7 +150,7 @@ def test_cleanup_terminal_resources_deletes_orphans_but_preserves_task_history_a
 
     orphan_key = f"raw/{published.id}/orphan.mp4"
     fake_s3 = _FakeS3({published_key, failed_key, paused_key, orphan_key, f"sub/{published.id}/subtitle.srt"})
-    with patch.object(maintenance_service, "S3Store", return_value=fake_s3):
+    with patch.object(maintenance_service, "FileStore", return_value=fake_s3):
         result = maintenance_service.cleanup_terminal_task_resources(
             MagicMock(),
             db,
@@ -195,7 +195,7 @@ def test_scheduled_cleanup_waits_48_hours_after_failure_even_when_published_rete
     db.commit()
 
     fake_s3 = _FakeS3({old_failed_key, recent_failed_key, published_key})
-    with patch.object(maintenance_service, "S3Store", return_value=fake_s3):
+    with patch.object(maintenance_service, "FileStore", return_value=fake_s3):
         result = maintenance_service.cleanup_terminal_task_resources(
             MagicMock(),
             db,

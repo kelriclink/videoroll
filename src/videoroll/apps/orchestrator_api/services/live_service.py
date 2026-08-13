@@ -31,7 +31,7 @@ from videoroll.apps.subtitle_service.auto_profile_store import get_auto_profile
 from videoroll.config import get_subtitle_settings
 from videoroll.db.models import AppSetting, Asset, AssetKind, Task
 from videoroll.db.session import get_sessionmaker
-from videoroll.storage.s3 import S3Store
+from videoroll.storage.filesystem import FileStore
 from videoroll.utils.fernet import decrypt_str, encrypt_str
 
 
@@ -376,7 +376,7 @@ def _existing_task_video_import(db: Session, asset_id: uuid.UUID) -> LiveSource 
 
 def _import_task_video(
     db: Session,
-    s3: S3Store,
+    s3: FileStore,
     source: LiveSource,
     *,
     copied_keys: list[str],
@@ -435,7 +435,7 @@ def _import_task_video(
     return LiveSource(source="library", id=str(media_id))
 
 
-def import_task_videos(asset_ids: list[uuid.UUID], *, db: Session, s3: S3Store) -> list[dict[str, Any]]:
+def import_task_videos(asset_ids: list[uuid.UUID], *, db: Session, s3: FileStore) -> list[dict[str, Any]]:
     if _session_status(db).get("status") in LIVE_ACTIVE_STATES:
         raise HTTPException(status_code=409, detail="直播中不能导入媒体资源")
     unique_asset_ids = list(dict.fromkeys(asset_ids))
@@ -471,7 +471,7 @@ def import_task_videos(asset_ids: list[uuid.UUID], *, db: Session, s3: S3Store) 
     return [media_by_id[source.id] for source in sources if source.id in media_by_id]
 
 
-def update_live_playlist(db: Session, update: dict[str, Any], *, s3: S3Store | None = None) -> dict[str, Any]:
+def update_live_playlist(db: Session, update: dict[str, Any], *, s3: FileStore | None = None) -> dict[str, Any]:
     if _session_status(db).get("status") in LIVE_ACTIVE_STATES:
         raise HTTPException(status_code=409, detail="直播中不能修改播放列表，请先暂停或停止推流")
     current = get_live_playlist(db)
@@ -503,7 +503,7 @@ def update_live_playlist(db: Session, update: dict[str, Any], *, s3: S3Store | N
 
         video_sources = [_normalize_source(raw) for raw in current["video_items"]]
         if any(item.source == "task_asset" for item in video_sources) and s3 is None:
-            raise ValueError("导入任务视频需要可用的 S3/MinIO 存储")
+            raise ValueError("导入任务视频需要可用的共享文件存储")
         materialized_videos = video_sources
         if s3 is not None:
             materialized_videos = [
@@ -878,7 +878,7 @@ async def upload_live_media(
     file: UploadFile,
     *,
     db: Session,
-    s3: S3Store,
+    s3: FileStore,
     audio_playlist_id: uuid.UUID | None = None,
 ) -> dict[str, Any]:
     if media_type not in {"video", "audio"}:
@@ -899,11 +899,15 @@ async def upload_live_media(
             asset_service.stream_upload_to_tempfile,
             file.file,
             prefix=f"videoroll_live_{media_type}_",
-            suffix=suffix,
+            suffix=f"{suffix}.partial" if isinstance(s3, FileStore) else suffix,
             max_bytes=LIVE_MEDIA_MAX_BYTES if media_type == "video" else LIVE_AUDIO_MAX_BYTES,
+            directory=s3.partial_root if isinstance(s3, FileStore) else None,
         )
         storage_key = f"live/{media_type}/{media_id}/{digest[:16]}_{filename}"
-        await run_in_threadpool(s3.upload_file, temp_path, storage_key, content_type)
+        if isinstance(s3, FileStore):
+            await run_in_threadpool(s3.promote_file, temp_path, storage_key)
+        else:
+            await run_in_threadpool(s3.upload_file, temp_path, storage_key, content_type)
         row = AppSetting(
             key=f"{LIVE_MEDIA_PREFIX}{media_id}",
             value_json={
@@ -993,7 +997,7 @@ def get_live_media(db: Session, media_id: uuid.UUID) -> dict[str, Any]:
 
 def prepare_live_media_stream(
     db: Session,
-    s3: S3Store,
+    s3: FileStore,
     media_id: uuid.UUID,
     *,
     range_header: str = "",
@@ -2817,7 +2821,7 @@ def start_live_stream(settings: Any, *, db: Session) -> dict[str, Any]:
     config, target = _live_output_config(settings, db=db)
     playlist = get_live_playlist(db)
     if any(item.get("source") == "task_asset" for item in playlist["video_items"]):
-        playlist = update_live_playlist(db, playlist, s3=S3Store(settings))
+        playlist = update_live_playlist(db, playlist, s3=FileStore(settings))
     video_items = [_normalize_source(item) for item in playlist["video_items"]]
     if not video_items:
         raise HTTPException(status_code=400, detail="请至少选择一个视频资源")

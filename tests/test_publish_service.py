@@ -8,7 +8,12 @@ import httpx
 from fastapi import HTTPException
 
 from videoroll.apps.orchestrator_api.schemas import PublishAllRequest
-from videoroll.apps.orchestrator_api.services.publishing_service import build_auto_publish_after_render, publish_all
+from videoroll.apps.orchestrator_api.services.publishing_service import (
+    _publish_review_blocks_publish,
+    build_auto_publish_after_render,
+    publish_all,
+    run_task_publish_review,
+)
 from videoroll.apps.publish_service import PublishAllResult, PublishService
 from videoroll.apps.publish_lifecycle import PublishBatchState
 from videoroll.db.models import Account, Platform, TaskStatus
@@ -363,6 +368,67 @@ def test_publish_all_social_only_reviews_stored_platform_meta() -> None:
         )
 
     assert review.call_args.kwargs["meta"] == stored_meta
+
+
+def test_disabled_publish_review_does_not_block_publish_all_even_with_failed_history() -> None:
+    task_id = uuid.uuid4()
+    task = MagicMock(id=task_id)
+    task.source_license.value = "own"
+    db = MagicMock()
+    db.get.return_value = task
+    result = PublishAllResult(results={"douyin": {"status": "accepted"}})
+
+    with (
+        patch(
+            "videoroll.apps.orchestrator_api.services.publishing_service.get_publish_platform_settings",
+            return_value={"bilibili": False, "douyin": True},
+        ),
+        patch(
+            "videoroll.apps.orchestrator_api.services.publishing_service.run_task_publish_review",
+            return_value={"enabled": False, "checked": True, "ok": False, "reason": "old rejection"},
+        ),
+        patch.object(PublishService, "publish", return_value=result) as publish,
+    ):
+        response = publish_all(
+            task_id,
+            PublishAllRequest(platforms=["douyin"], platform_meta={"douyin": {"title": "title"}}),
+            MagicMock(),
+            db,
+            MagicMock(),
+        )
+
+    assert response["results"]["douyin"]["status"] == "accepted"
+    publish.assert_called_once()
+
+
+def test_disabled_publish_review_skips_ai_even_with_failed_history() -> None:
+    task = MagicMock(id=uuid.uuid4(), error_code=None)
+    history = {"checked": True, "ok": False, "reason": "old rejection"}
+
+    with (
+        patch(
+            "videoroll.apps.orchestrator_api.services.publishing_service.get_publish_review_settings",
+            return_value={"enabled": False, "blocked_words": [], "ai_rules": ""},
+        ),
+        patch(
+            "videoroll.apps.orchestrator_api.services.publishing_service.get_task_publish_review_record",
+            return_value=history,
+        ),
+        patch(
+            "videoroll.apps.orchestrator_api.services.publishing_service.review_publish_materials",
+        ) as review,
+    ):
+        result = run_task_publish_review(task, meta={"title": "title"}, db=MagicMock(), s3=MagicMock())
+
+    assert result == {"enabled": False, **history}
+    review.assert_not_called()
+
+
+def test_publish_review_blocks_only_when_enabled() -> None:
+    assert _publish_review_blocks_publish({"enabled": False, "ok": None}) is False
+    assert _publish_review_blocks_publish({"enabled": False, "ok": False}) is False
+    assert _publish_review_blocks_publish({"enabled": True, "ok": False}) is True
+    assert _publish_review_blocks_publish({"enabled": True, "ok": True}) is False
 
 
 def test_force_retry_reuses_the_current_publish_batch() -> None:

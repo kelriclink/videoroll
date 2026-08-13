@@ -60,7 +60,7 @@ RUN if [ -n "$YTDLP_VERSION" ]; then \
 
 RUN groupadd --gid 10001 videoroll \
   && useradd --uid 10001 --gid videoroll --create-home --shell /usr/sbin/nologin videoroll \
-  && install -d --owner=videoroll --group=videoroll --mode=0700 /models /secrets /work
+  && install -d --owner=videoroll --group=videoroll --mode=0700 /models /secrets /storage /work
 
 RUN sed -i 's/\r$//' /app/docker/entrypoint.sh \
   && chmod +x /app/docker/entrypoint.sh

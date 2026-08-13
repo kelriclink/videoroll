@@ -7,7 +7,7 @@ from sqlalchemy.orm import Session
 
 from videoroll.config import OrchestratorSettings, get_orchestrator_settings
 from videoroll.db.session import db_session
-from videoroll.storage.s3 import S3Store
+from videoroll.storage.filesystem import FileStore
 
 
 def get_settings() -> OrchestratorSettings:
@@ -18,5 +18,7 @@ def get_db(settings: OrchestratorSettings = Depends(get_settings)) -> Generator[
     yield from db_session(settings.database_url)
 
 
-def get_s3(settings: OrchestratorSettings = Depends(get_settings)) -> S3Store:
-    return S3Store(settings)
+def get_s3(settings: OrchestratorSettings = Depends(get_settings)) -> FileStore:
+    store = FileStore(settings)
+    store.ensure_ready()
+    return store

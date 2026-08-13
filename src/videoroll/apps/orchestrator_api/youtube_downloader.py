@@ -43,6 +43,9 @@ _FORMAT_UNAVAILABLE_FALLBACKS: tuple[tuple[str, dict[str, Any]], ...] = (
         {"youtube": {"player_client": ["android", "web"]}},
     ),
 )
+_YOUTUBE_COMPATIBILITY_EXTRACTOR_ARGS: dict[str, Any] = {
+    "youtube": {"player_client": ["default", "web_embedded"]},
+}
 
 
 class YouTubeDownloaderSettings(Protocol):
@@ -50,6 +53,7 @@ class YouTubeDownloaderSettings(Protocol):
     youtube_cookie_file: str | None
     youtube_proxy: str | None
     youtube_extractor_args_json: str | None
+    youtube_compatibility_mode_enabled: bool
     ffmpeg_path: str
 
 
@@ -121,10 +125,21 @@ def _merged_extractor_args(
     extractor_args_override: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     base = _extractor_args(settings) or {}
+    if _compatibility_mode_enabled(settings):
+        base = copy.deepcopy(base)
+        youtube_args = _as_dict(base.get("youtube"))
+        base["youtube"] = {
+            **youtube_args,
+            "player_client": list(_YOUTUBE_COMPATIBILITY_EXTRACTOR_ARGS["youtube"]["player_client"]),
+        }
     if not extractor_args_override:
         return base or None
     merged = _deep_merge(base, extractor_args_override)
     return merged if isinstance(merged, dict) and merged else None
+
+
+def _compatibility_mode_enabled(settings: YouTubeDownloaderSettings) -> bool:
+    return bool(getattr(settings, "youtube_compatibility_mode_enabled", False))
 
 
 def _redact_url(value: str) -> str:
@@ -179,6 +194,7 @@ def _yt_dlp_diagnostics_header(
         f"ffmpeg_location={(str(settings.ffmpeg_path or '').strip() or '(default PATH)')}",
         f"outtmpl={outtmpl or '(none)'}",
         f"extractor_args={json.dumps(extractor_args, ensure_ascii=False, sort_keys=True) if extractor_args else '(none)'}",
+        f"compatibility_mode_enabled={_compatibility_mode_enabled(settings)}",
         "---- yt-dlp verbose ----",
     ]
 
@@ -740,7 +756,8 @@ def download_youtube_video(
     """
     diagnostics: list[str] = []
     attempts: list[tuple[str, dict[str, Any] | None]] = [("default", None)]
-    attempts.extend(_FORMAT_UNAVAILABLE_FALLBACKS)
+    if not _compatibility_mode_enabled(settings):
+        attempts.extend(_FORMAT_UNAVAILABLE_FALLBACKS)
 
     last_error: Exception | None = None
     for idx, (label, extractor_args_override) in enumerate(attempts, start=1):

@@ -9,7 +9,7 @@ if [[ ! -f social-auto-upload/sau_cli.py ]]; then
   exit 1
 fi
 
-ENV_FILE="${ENV_FILE:-deploy_compose/.env}"
+ENV_FILE="${ENV_FILE:-fromprod/.env}"
 APP_IMAGE="${APP_IMAGE:-videoroll:prod}"
 EGRESS_IMAGE="${EGRESS_IMAGE:-videoroll-egress:prod}"
 WEB_IMAGE="${WEB_IMAGE:-videoroll-web:prod}"
@@ -72,9 +72,7 @@ IMAGES=("$APP_IMAGE" "$EGRESS_IMAGE" "$WEB_IMAGE" "$SOCIAL_IMAGE")
 if [[ "$INCLUDE_BASE_IMAGES" == "1" ]]; then
   echo "Pulling base service images"
   docker_run pull redis:7
-  docker_run pull minio/minio:latest
-  docker_run pull minio/mc:latest
-  IMAGES+=("redis:7" "minio/minio:latest" "minio/mc:latest")
+  IMAGES+=("redis:7")
 fi
 
 echo "Exporting images to: $OUTPUT_TAR"

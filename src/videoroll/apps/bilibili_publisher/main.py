@@ -19,7 +19,7 @@ from videoroll.db.base import Base
 from videoroll.db.auto_migrate import auto_migrate
 from videoroll.db.models import Asset, AssetKind, Platform, PublishBatch, PublishJob, PublishState, Task, TaskStatus
 from videoroll.db.session import db_session, get_engine
-from videoroll.storage.s3 import S3Store
+from videoroll.storage.filesystem import FileStore
 from videoroll.apps.bilibili_publisher.auth_settings_store import get_bilibili_auth_settings, get_bilibili_cookie_header, update_bilibili_auth_settings
 from videoroll.apps.bilibili_publisher.bilibili_web_client import BilibiliWebClient
 from videoroll.apps.bilibili_publisher.typeid_recommender import flatten_typelist
@@ -79,7 +79,7 @@ def _startup() -> None:
     engine = get_engine(settings.database_url)
     Base.metadata.create_all(engine)
     auto_migrate(settings.database_url)
-    S3Store(settings).ensure_bucket()
+    FileStore(settings).ensure_ready()
 
 
 @app.get("/health")
@@ -420,8 +420,8 @@ def publish(payload: PublishRequest, settings: BilibiliPublisherSettings = Depen
         task.status = TaskStatus.published
         db.add(task)
 
-    store = S3Store(settings)
-    store.ensure_bucket()
+    store = FileStore(settings)
+    store.ensure_ready()
     result_key = unique_publish_result_key(task.id)
     store.put_bytes(json.dumps(response, ensure_ascii=False, indent=2).encode("utf-8"), result_key, content_type="application/json")
     db.add(Asset(task_id=task.id, kind=AssetKind.publish_result, storage_key=result_key))

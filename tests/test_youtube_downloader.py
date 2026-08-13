@@ -17,6 +17,7 @@ class _Settings:
     youtube_cookie_file: str | None = None
     youtube_proxy: str | None = None
     youtube_extractor_args_json: str | None = None
+    youtube_compatibility_mode_enabled: bool = False
     ffmpeg_path: str = "ffmpeg"
 
 
@@ -70,6 +71,34 @@ class YouTubeDownloaderTests(unittest.TestCase):
                 )
 
         self.assertIn("network timeout", str(ctx.exception))
+        self.assertEqual(mock_download.call_count, 1)
+
+    def test_compatibility_mode_uses_community_player_clients(self) -> None:
+        settings = _Settings(
+            youtube_extractor_args_json='{"youtube":{"skip":["translated_subs"],"player_client":["tv"]}}',
+            youtube_compatibility_mode_enabled=True,
+        )
+
+        opts = yd.build_ydl_opts(settings, for_download=False)
+
+        self.assertEqual(opts["extractor_args"]["youtube"]["player_client"], ["default", "web_embedded"])
+        self.assertEqual(opts["extractor_args"]["youtube"]["skip"], ["translated_subs"])
+
+    def test_compatibility_mode_does_not_fall_back_to_tv_clients(self) -> None:
+        settings = _Settings(youtube_compatibility_mode_enabled=True)
+
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            yd,
+            "_download_once",
+            side_effect=DownloadError("Requested format is not available"),
+        ) as mock_download:
+            with self.assertRaises(yd.YtDlpRuntimeError):
+                yd.download_youtube_video(
+                    "https://www.youtube.com/watch?v=demo1234567",
+                    settings,
+                    work_dir=Path(tmp),
+                )
+
         self.assertEqual(mock_download.call_count, 1)
 
     def test_detects_requested_format_unavailable_message(self) -> None:

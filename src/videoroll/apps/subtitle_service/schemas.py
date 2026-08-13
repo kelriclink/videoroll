@@ -8,7 +8,7 @@ from pydantic import BaseModel, Field
 
 
 class InputRef(BaseModel):
-    type: Literal["s3"]
+    type: Literal["storage", "s3"] = "storage"
     key: str
 
 
@@ -94,6 +94,11 @@ class WhisperSettingsRead(BaseModel):
     external_whisper_base_url: str = ""
     external_whisper_model: str = ""
     external_whisper_api_key_set: bool = False
+    groq_whisper_model: str = "whisper-large-v3-turbo"
+    groq_whisper_api_key_set: bool = False
+    cloudflare_workers_ai_account_id: str = ""
+    cloudflare_workers_ai_model: str = ""
+    cloudflare_workers_ai_api_key_set: bool = False
 
 
 class IntelHardwareProbeRead(BaseModel):
@@ -120,6 +125,11 @@ class ASRDefaultsRead(BaseModel):
     external_whisper_base_url: str = ""
     external_whisper_model: str = "whisper-1"
     external_whisper_api_key_set: bool = False
+    groq_whisper_model: str = "whisper-large-v3-turbo"
+    groq_whisper_api_key_set: bool = False
+    cloudflare_workers_ai_account_id: str = ""
+    cloudflare_workers_ai_model: str = "@cf/openai/whisper-large-v3-turbo"
+    cloudflare_workers_ai_api_key_set: bool = False
 
 
 class ASRDefaultsUpdate(BaseModel):
@@ -135,6 +145,11 @@ class ASRDefaultsUpdate(BaseModel):
     external_whisper_base_url: Optional[str] = Field(default=None, max_length=2048)
     external_whisper_model: Optional[str] = Field(default=None, max_length=256)
     external_whisper_api_key: Optional[str] = Field(default=None, max_length=4096)
+    groq_whisper_model: Optional[str] = Field(default=None, max_length=256)
+    groq_whisper_api_key: Optional[str] = Field(default=None, max_length=4096)
+    cloudflare_workers_ai_account_id: Optional[str] = Field(default=None, max_length=128)
+    cloudflare_workers_ai_model: Optional[str] = Field(default=None, max_length=256)
+    cloudflare_workers_ai_api_key: Optional[str] = Field(default=None, max_length=4096)
 
 
 class ExternalWhisperTestRequest(BaseModel):
@@ -148,6 +163,35 @@ class ExternalWhisperTestResponse(BaseModel):
     status_code: Optional[int] = None
     elapsed_ms: int = 0
     text: str = ""
+    error: Optional[str] = None
+
+
+class GroqWhisperTestRequest(BaseModel):
+    api_key: Optional[str] = Field(default=None, max_length=4096)
+    model: str = Field(default="whisper-large-v3-turbo", min_length=1, max_length=256)
+
+
+class GroqWhisperTestResponse(BaseModel):
+    ok: bool
+    status_code: Optional[int] = None
+    elapsed_ms: int = 0
+    text: str = ""
+    segments: int = 0
+    error: Optional[str] = None
+
+
+class CloudflareWorkersAITestRequest(BaseModel):
+    account_id: str = Field(min_length=1, max_length=128)
+    api_key: Optional[str] = Field(default=None, max_length=4096)
+    model: str = Field(min_length=1, max_length=256)
+
+
+class CloudflareWorkersAITestResponse(BaseModel):
+    ok: bool
+    status_code: Optional[int] = None
+    elapsed_ms: int = 0
+    text: str = ""
+    segments: int = 0
     error: Optional[str] = None
 
 
@@ -233,6 +277,10 @@ class TranslateSettingsRead(BaseModel):
     openai_temperature: float
     openai_timeout_seconds: float
     openai_max_retries: int = 3
+    openai_api_type: Literal["openai", "cerebras"] = "openai"
+    openai_enable_thinking: bool = False
+    cerebras_reasoning_effort: Literal["low", "medium", "high"] = "medium"
+    cerebras_reasoning_format: Literal["parsed", "raw", "hidden"] = "parsed"
 
     rag_enabled: bool = False
     rag_top_k: int = 8
@@ -284,6 +332,10 @@ class TranslateSettingsUpdate(BaseModel):
     openai_temperature: Optional[float] = None
     openai_timeout_seconds: Optional[float] = None
     openai_max_retries: Optional[int] = Field(default=None, ge=1, le=10)
+    openai_api_type: Optional[Literal["openai", "cerebras"]] = None
+    openai_enable_thinking: Optional[bool] = None
+    cerebras_reasoning_effort: Optional[Literal["low", "medium", "high"]] = None
+    cerebras_reasoning_format: Optional[Literal["parsed", "raw", "hidden"]] = None
 
     rag_enabled: Optional[bool] = None
     rag_top_k: Optional[int] = Field(default=None, ge=0, le=30)

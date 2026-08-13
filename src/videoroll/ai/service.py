@@ -1,13 +1,15 @@
 from __future__ import annotations
 
-from typing import Any
+import time
+from typing import Any, Callable
 
-from videoroll.ai.client import OpenAIChatConfig, request_openai_json_object
+from videoroll.ai.client import OpenAIChatConfig, request_openai_json_object, request_openai_json_object_with_thinking
 from videoroll.ai.prompts import (
     AIJsonPrompt,
     build_bilibili_tags_prompt,
     build_publish_review_prompt,
     build_subtitle_translation_prompt,
+    build_title_translation_prompt,
     build_text_translation_prompt,
     build_typeid_prompt,
 )
@@ -50,6 +52,8 @@ class AIService:
         format_retries: int = 2,
         network_retries: int | None = None,
         client: Any | None = None,
+        enable_thinking: bool = False,
+        on_thinking_delta: Callable[[str], None] | None = None,
     ) -> dict[str, Any]:
         prompt = AIJsonPrompt(
             system_prompt=system_prompt,
@@ -58,23 +62,99 @@ class AIService:
             format_retries=format_retries,
             network_retries=network_retries,
         )
-        return self._request_json_prompt(purpose, prompt, client=client)
+        return self._request_json_prompt(
+            purpose,
+            prompt,
+            client=client,
+            enable_thinking=enable_thinking,
+            on_thinking_delta=on_thinking_delta,
+        )
 
-    def _request_json_prompt(self, purpose: str, prompt: AIJsonPrompt, *, client: Any | None = None) -> dict[str, Any]:
+    def _request_json_prompt(
+        self,
+        purpose: str,
+        prompt: AIJsonPrompt,
+        *,
+        client: Any | None = None,
+        enable_thinking: bool = False,
+        on_thinking_delta: Callable[[str], None] | None = None,
+    ) -> dict[str, Any]:
         runtime = self.resolve_current_runtime(purpose)
+        if enable_thinking:
+            if runtime.provider != "openai":
+                raise RuntimeError(f"Think mode is only supported by OpenAI-compatible providers (got {runtime.provider})")
+            return request_openai_json_object_with_thinking(
+                config=runtime.config,
+                system_prompt=prompt.system_prompt,
+                user_prompt=prompt.user_prompt,
+                format_retry_notice=prompt.format_retry_notice,
+                format_retries=prompt.format_retries,
+                network_retries=prompt.network_retries,
+                client=client,
+                on_thinking_delta=on_thinking_delta,
+            )
         provider = self._providers.get(runtime.provider)
         return provider.request_json(runtime, prompt, client=client)
 
-    def translate_text(self, text: str, *, target_lang: str, style: str) -> str:
+    def translate_text(
+        self,
+        text: str,
+        *,
+        target_lang: str,
+        style: str,
+        enable_thinking: bool = False,
+        on_thinking_delta: Callable[[str], None] | None = None,
+    ) -> str:
         source = str(text or "").strip()
         if not source:
             return text
         data = self._request_json_prompt(
             "text_translation",
             build_text_translation_prompt(source, target_lang=target_lang, style=style),
+            enable_thinking=enable_thinking,
+            on_thinking_delta=on_thinking_delta,
         )
         translated = str(data.get("translation") or "").strip()
         return translated or source
+
+    def translate_title(
+        self,
+        title: str,
+        *,
+        target_lang: str,
+        style: str,
+        summary: str = "",
+        retry_count: int = 4,
+        retry_delay_seconds: float = 1.0,
+    ) -> str:
+        source = str(title or "").strip()
+        if not source:
+            return title
+        prompt = build_title_translation_prompt(
+            source,
+            target_lang=target_lang,
+            style=style,
+            summary=summary,
+        )
+        attempts = max(1, min(10, int(retry_count) + 1))
+        last_error: Exception | None = None
+        for attempt in range(attempts):
+            try:
+                data = self._request_json_prompt("title_translation", prompt)
+                translated = str(data.get("translation") or "").strip()
+                if not translated:
+                    raise RuntimeError("OpenAI title translation output is empty")
+                return translated
+            except Exception as error:
+                last_error = error
+                if attempt >= attempts - 1:
+                    break
+                delay = max(0.0, float(retry_delay_seconds)) * min(8.0, float(2**attempt))
+                if delay > 0:
+                    time.sleep(delay)
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("OpenAI title translation failed")
 
     def translate_subtitle_batch(
         self,
@@ -87,6 +167,8 @@ class AIService:
         glossary: dict[str, str] | None = None,
         rag_context: dict[str, Any] | None = None,
         network_retries: int = 3,
+        enable_thinking: bool = False,
+        on_thinking_delta: Callable[[str], None] | None = None,
     ) -> dict[str, Any]:
         return self._request_json_prompt(
             "subtitle_translation",
@@ -100,6 +182,8 @@ class AIService:
                 rag_context=rag_context,
                 network_retries=network_retries,
             ),
+            enable_thinking=enable_thinking,
+            on_thinking_delta=on_thinking_delta,
         )
 
     def generate_bilibili_tags(self, *, title: str, summary: str, transcript: str, n_tags: int = 6) -> list[str]:
@@ -176,6 +260,53 @@ def translate_text_openai(
     )
     translated = str(data.get("translation") or "").strip()
     return translated or source
+
+
+def translate_title_openai(
+    title: str,
+    *,
+    target_lang: str,
+    style: str,
+    summary: str,
+    config: OpenAIChatConfig,
+    retry_count: int = 4,
+    retry_delay_seconds: float = 1.0,
+) -> str:
+    source = str(title or "").strip()
+    if not source:
+        return title
+    prompt = build_title_translation_prompt(
+        source,
+        target_lang=target_lang,
+        style=style,
+        summary=summary,
+    )
+    attempts = max(1, min(10, int(retry_count) + 1))
+    last_error: Exception | None = None
+    for attempt in range(attempts):
+        try:
+            data = request_openai_json_object(
+                config=config,
+                system_prompt=prompt.system_prompt,
+                user_prompt=prompt.user_prompt,
+                format_retry_notice=prompt.format_retry_notice,
+                format_retries=prompt.format_retries,
+                network_retries=prompt.network_retries,
+            )
+            translated = str(data.get("translation") or "").strip()
+            if not translated:
+                raise RuntimeError("OpenAI title translation output is empty")
+            return translated
+        except Exception as error:
+            last_error = error
+            if attempt >= attempts - 1:
+                break
+            delay = max(0.0, float(retry_delay_seconds)) * min(8.0, float(2**attempt))
+            if delay > 0:
+                time.sleep(delay)
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("OpenAI title translation failed")
 
 
 def generate_bilibili_tags_openai(

@@ -24,6 +24,11 @@ type WhisperSettings = {
   external_whisper_base_url: string;
   external_whisper_model: string;
   external_whisper_api_key_set: boolean;
+  groq_whisper_model: string;
+  groq_whisper_api_key_set: boolean;
+  cloudflare_workers_ai_account_id: string;
+  cloudflare_workers_ai_model: string;
+  cloudflare_workers_ai_api_key_set: boolean;
 };
 
 type ASRDefaults = {
@@ -39,6 +44,11 @@ type ASRDefaults = {
   external_whisper_base_url: string;
   external_whisper_model: string;
   external_whisper_api_key_set: boolean;
+  groq_whisper_model: string;
+  groq_whisper_api_key_set: boolean;
+  cloudflare_workers_ai_account_id: string;
+  cloudflare_workers_ai_model: string;
+  cloudflare_workers_ai_api_key_set: boolean;
 };
 
 type ExternalWhisperTestResponse = {
@@ -46,6 +56,24 @@ type ExternalWhisperTestResponse = {
   status_code?: number | null;
   elapsed_ms: number;
   text: string;
+  error?: string | null;
+};
+
+type CloudflareWorkersAITestResponse = {
+  ok: boolean;
+  status_code?: number | null;
+  elapsed_ms: number;
+  text: string;
+  segments: number;
+  error?: string | null;
+};
+
+type GroqWhisperTestResponse = {
+  ok: boolean;
+  status_code?: number | null;
+  elapsed_ms: number;
+  text: string;
+  segments: number;
   error?: string | null;
 };
 
@@ -109,6 +137,15 @@ export default function SettingsASRPage() {
   const [externalWhisperApiKey, setExternalWhisperApiKey] = useState("");
   const [externalWhisperTestBusy, setExternalWhisperTestBusy] = useState(false);
   const [externalWhisperTestResult, setExternalWhisperTestResult] = useState<ExternalWhisperTestResponse | null>(null);
+  const [groqWhisperModel, setGroqWhisperModel] = useState("whisper-large-v3-turbo");
+  const [groqWhisperApiKey, setGroqWhisperApiKey] = useState("");
+  const [groqWhisperTestBusy, setGroqWhisperTestBusy] = useState(false);
+  const [groqWhisperTestResult, setGroqWhisperTestResult] = useState<GroqWhisperTestResponse | null>(null);
+  const [cloudflareAccountId, setCloudflareAccountId] = useState("");
+  const [cloudflareModel, setCloudflareModel] = useState("@cf/openai/whisper-large-v3-turbo");
+  const [cloudflareApiKey, setCloudflareApiKey] = useState("");
+  const [cloudflareTestBusy, setCloudflareTestBusy] = useState(false);
+  const [cloudflareTestResult, setCloudflareTestResult] = useState<CloudflareWorkersAITestResponse | null>(null);
 
   async function refresh() {
     setError(null);
@@ -132,6 +169,9 @@ export default function SettingsASRPage() {
       if (typeof a.model_download_proxy === "string") setModelDownloadProxy(a.model_download_proxy);
       if (typeof a.external_whisper_base_url === "string") setExternalWhisperBaseUrl(a.external_whisper_base_url);
       if (typeof a.external_whisper_model === "string" && a.external_whisper_model.trim()) setExternalWhisperModel(a.external_whisper_model);
+      if (typeof a.groq_whisper_model === "string" && a.groq_whisper_model.trim()) setGroqWhisperModel(a.groq_whisper_model);
+      if (typeof a.cloudflare_workers_ai_account_id === "string") setCloudflareAccountId(a.cloudflare_workers_ai_account_id);
+      if (typeof a.cloudflare_workers_ai_model === "string" && a.cloudflare_workers_ai_model.trim()) setCloudflareModel(a.cloudflare_workers_ai_model);
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : String(e));
     }
@@ -242,6 +282,8 @@ export default function SettingsASRPage() {
               <option value="faster-whisper">faster-whisper</option>
               <option value="openvino">openvino（方案2 / Intel Arc）</option>
               <option value="external-whisper">external-whisper（外部 API）</option>
+              <option value="groq-whisper">groq-whisper（GroqCloud，自动切片）</option>
+              <option value="cloudflare-workers-ai">cloudflare-workers-ai（原生时间轴）</option>
               <option value="mock">mock</option>
             </select>
           </label>
@@ -349,6 +391,117 @@ export default function SettingsASRPage() {
             </div>
           ) : null}
 
+          {defaultEngine === "cloudflare-workers-ai" ? (
+            <div className="rounded border border-sky-100 bg-sky-50/60 p-3 md:col-span-2">
+              <div className="text-sm font-medium text-slate-800">Cloudflare Workers AI（原生 ASR）</div>
+              <div className="mt-1 text-xs text-slate-600">
+                直接调用 Cloudflare `/ai/run`，解析模型返回的 segments；推荐使用 `@cf/openai/whisper-large-v3-turbo` 以获得时间轴。
+              </div>
+              <div className="mt-3 grid gap-3 md:grid-cols-2">
+                <label className="block">
+                  <div className="mb-1 text-xs text-slate-600">cloudflare_workers_ai_account_id</div>
+                  <input className="w-full rounded border px-3 py-2 text-sm" value={cloudflareAccountId} onChange={(e) => setCloudflareAccountId(e.target.value)} placeholder="Cloudflare Account ID" />
+                </label>
+                <label className="block">
+                  <div className="mb-1 text-xs text-slate-600">cloudflare_workers_ai_model</div>
+                  <input className="w-full rounded border px-3 py-2 text-sm" value={cloudflareModel} onChange={(e) => setCloudflareModel(e.target.value)} placeholder="@cf/openai/whisper-large-v3-turbo" />
+                </label>
+                <label className="block md:col-span-2">
+                  <div className="mb-1 text-xs text-slate-600">cloudflare_workers_ai_api_key（仅保存，不回显）</div>
+                  <input type="password" className="w-full rounded border px-3 py-2 text-sm" value={cloudflareApiKey} onChange={(e) => setCloudflareApiKey(e.target.value)} placeholder={asrDefaults?.cloudflare_workers_ai_api_key_set ? "已设置（留空则不修改）" : "Cloudflare API Token"} />
+                </label>
+                <div className="flex items-end">
+                  <button
+                    type="button"
+                    disabled={cloudflareTestBusy}
+                    className="rounded border px-3 py-2 text-sm hover:bg-white disabled:opacity-50"
+                    onClick={async () => {
+                      setCloudflareTestBusy(true);
+                      setCloudflareTestResult(null);
+                      setError(null);
+                      try {
+                        const result = await fetchJson<CloudflareWorkersAITestResponse>(`${ORCHESTRATOR_URL}/subtitle/asr/cloudflare/test`, {
+                          method: "POST",
+                          headers: { "Content-Type": "application/json" },
+                          body: JSON.stringify({ account_id: cloudflareAccountId, api_key: cloudflareApiKey, model: cloudflareModel }),
+                        });
+                        setCloudflareTestResult(result);
+                      } catch (e: unknown) {
+                        setCloudflareTestResult({ ok: false, elapsed_ms: 0, text: "", segments: 0, error: e instanceof Error ? e.message : String(e) });
+                      } finally {
+                        setCloudflareTestBusy(false);
+                      }
+                    }}
+                  >
+                    {cloudflareTestBusy ? "测试中…" : "测试 Cloudflare ASR"}
+                  </button>
+                </div>
+              </div>
+              {cloudflareTestResult ? (
+                <div className="mt-3 rounded border bg-white p-3 text-xs">
+                  <div className={cloudflareTestResult.ok ? "text-emerald-700" : "text-rose-700"}>{cloudflareTestResult.ok ? "连接成功" : "测试失败"} · {cloudflareTestResult.elapsed_ms}ms · segments={cloudflareTestResult.segments}</div>
+                  {cloudflareTestResult.text ? <div className="mt-1 break-all text-slate-700">返回：{cloudflareTestResult.text}</div> : null}
+                  {cloudflareTestResult.error ? <div className="mt-1 break-all text-rose-700">{cloudflareTestResult.error}</div> : null}
+                </div>
+              ) : null}
+            </div>
+          ) : null}
+
+          {defaultEngine === "groq-whisper" ? (
+            <div className="rounded border border-orange-100 bg-orange-50/60 p-3 md:col-span-2">
+              <div className="text-sm font-medium text-slate-800">GroqCloud Whisper（专用接入）</div>
+              <div className="mt-1 text-xs text-slate-600">
+                调用 Groq 的 `/openai/v1/audio/transcriptions`。音频会按固定 45 秒转为无损 FLAC 分片，并保留 5 秒重叠；网络断开或上游 5xx/524 时每片最多重试 5 次。成功分片会保存检查点，点击“继续字幕”可从失败分片继续，并合并原始时间轴。
+              </div>
+              <div className="mt-3 grid gap-3 md:grid-cols-2">
+                <label className="block md:col-span-2">
+                  <div className="mb-1 text-xs text-slate-600">groq_whisper_api_key（仅保存，不回显）</div>
+                  <input type="password" className="w-full rounded border px-3 py-2 text-sm" value={groqWhisperApiKey} onChange={(e) => setGroqWhisperApiKey(e.target.value)} placeholder={asrDefaults?.groq_whisper_api_key_set ? "已设置（留空则不修改）" : "gsk_..."} />
+                </label>
+                <label className="block">
+                  <div className="mb-1 text-xs text-slate-600">groq_whisper_model</div>
+                  <select className="w-full rounded border px-3 py-2 text-sm" value={groqWhisperModel} onChange={(e) => setGroqWhisperModel(e.target.value)}>
+                    <option value="whisper-large-v3-turbo">whisper-large-v3-turbo（推荐）</option>
+                    <option value="whisper-large-v3">whisper-large-v3（高准确率）</option>
+                  </select>
+                </label>
+                <div className="flex items-end">
+                  <button
+                    type="button"
+                    disabled={groqWhisperTestBusy}
+                    className="rounded border px-3 py-2 text-sm hover:bg-white disabled:opacity-50"
+                    onClick={async () => {
+                      setGroqWhisperTestBusy(true);
+                      setGroqWhisperTestResult(null);
+                      setError(null);
+                      try {
+                        const result = await fetchJson<GroqWhisperTestResponse>(`${ORCHESTRATOR_URL}/subtitle/asr/groq/test`, {
+                          method: "POST",
+                          headers: { "Content-Type": "application/json" },
+                          body: JSON.stringify({ api_key: groqWhisperApiKey, model: groqWhisperModel }),
+                        });
+                        setGroqWhisperTestResult(result);
+                      } catch (e: unknown) {
+                        setGroqWhisperTestResult({ ok: false, elapsed_ms: 0, text: "", segments: 0, error: e instanceof Error ? e.message : String(e) });
+                      } finally {
+                        setGroqWhisperTestBusy(false);
+                      }
+                    }}
+                  >
+                    {groqWhisperTestBusy ? "测试中…" : "测试 Groq ASR"}
+                  </button>
+                </div>
+              </div>
+              {groqWhisperTestResult ? (
+                <div className="mt-3 rounded border bg-white p-3 text-xs">
+                  <div className={groqWhisperTestResult.ok ? "text-emerald-700" : "text-rose-700"}>{groqWhisperTestResult.ok ? "连接成功" : "测试失败"} · {groqWhisperTestResult.elapsed_ms}ms · segments={groqWhisperTestResult.segments}</div>
+                  {groqWhisperTestResult.text ? <div className="mt-1 break-all text-slate-700">返回：{groqWhisperTestResult.text}</div> : null}
+                  {groqWhisperTestResult.error ? <div className="mt-1 break-all text-rose-700">{groqWhisperTestResult.error}</div> : null}
+                </div>
+              ) : null}
+            </div>
+          ) : null}
+
           <div className="rounded border border-sky-100 bg-sky-50/50 p-3 md:col-span-2">
             <label className="flex cursor-pointer items-center gap-2 text-sm font-medium text-slate-800">
               <input
@@ -356,10 +509,10 @@ export default function SettingsASRPage() {
                 checked={openvinoVadEnabled}
                 onChange={(e) => setOpenvinoVadEnabled(e.target.checked)}
               />
-              OpenVINO 启用人声检测（推荐）
+              OpenVINO / Groq 启用人声检测（推荐）
             </label>
             <div className="mt-1 text-xs text-slate-600">
-              先用 Silero VAD 找出人声片段；没有人声时直接输出空字幕，不会调用 Whisper，可避免无声视频产生幻觉字幕。
+              OpenVINO 会只处理 Silero VAD 找到的人声片段；Groq 会在每个 45 秒切片上传前检测，无人声切片保存为空检查点并跳过上传，可减少请求和无声幻觉字幕。
             </div>
             <label className="mt-3 block max-w-xs">
               <div className="mb-1 text-xs text-slate-600">人声检测阈值（0.5 平衡；0.6 更严格）</div>
@@ -487,7 +640,7 @@ export default function SettingsASRPage() {
                   body: JSON.stringify({
                     default_engine: defaultEngine,
                     default_language: defaultLanguage,
-                    default_model: defaultEngine === "external-whisper" ? externalWhisperModel : defaultModel,
+                    default_model: defaultEngine === "external-whisper" ? externalWhisperModel : defaultEngine === "groq-whisper" ? groqWhisperModel : defaultEngine === "cloudflare-workers-ai" ? cloudflareModel : defaultModel,
                     openvino_device: openvinoDevice,
                     openvino_num_beams: openvinoNumBeamsValue,
                     openvino_max_new_tokens: openvinoMaxNewTokensValue,
@@ -497,6 +650,11 @@ export default function SettingsASRPage() {
                     external_whisper_base_url: externalWhisperBaseUrl,
                     external_whisper_model: externalWhisperModel,
                     ...(externalWhisperApiKey.trim() ? { external_whisper_api_key: externalWhisperApiKey.trim() } : {}),
+                    groq_whisper_model: groqWhisperModel,
+                    ...(groqWhisperApiKey.trim() ? { groq_whisper_api_key: groqWhisperApiKey.trim() } : {}),
+                    cloudflare_workers_ai_account_id: cloudflareAccountId,
+                    cloudflare_workers_ai_model: cloudflareModel,
+                    ...(cloudflareApiKey.trim() ? { cloudflare_workers_ai_api_key: cloudflareApiKey.trim() } : {}),
                   }),
                 });
                 await refresh();

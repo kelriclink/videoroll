@@ -26,12 +26,16 @@ from videoroll.db.base import Base
 from videoroll.db.auto_migrate import auto_migrate
 from videoroll.db.models import Asset, AssetKind, RenderJob, RenderJobStatus, SourceType, SubtitleJob, SubtitleJobStatus, Task, TaskStatus
 from videoroll.db.session import db_session, get_engine
-from videoroll.storage.s3 import S3Store
+from videoroll.storage.filesystem import FileStore
 from videoroll.apps.subtitle_service.schemas import (
     ASRDefaultsRead,
     ASRDefaultsUpdate,
+    CloudflareWorkersAITestRequest,
+    CloudflareWorkersAITestResponse,
     ExternalWhisperTestRequest,
     ExternalWhisperTestResponse,
+    GroqWhisperTestRequest,
+    GroqWhisperTestResponse,
     IntelHardwareProbeRead,
     SubtitleJobCreate,
     SubtitleJobRead,
@@ -115,7 +119,11 @@ from videoroll.apps.subtitle_service.dictionaries import (
 from videoroll.apps.subtitle_service.translate_settings_store import get_translate_settings, update_translate_settings
 from videoroll.apps.subtitle_service.worker_concurrency import sync_subtitle_worker_concurrency_for_task_queue_settings
 from videoroll.apps.subtitle_service.worker import TASK_QUEUE_LOCK_OWNER, celery_app
-from videoroll.apps.subtitle_service.processing import transcribe_external_whisper
+from videoroll.apps.subtitle_service.processing import (
+    transcribe_cloudflare_workers_ai,
+    transcribe_external_whisper,
+    transcribe_groq_whisper,
+)
 from videoroll.utils.auto_youtube import parse_auto_youtube_created_by
 from videoroll.utils.cpu import process_cpu_count
 from videoroll.utils.httpx_proxy import HTTPX_PROXY_KWARG_UNSUPPORTED, format_httpx_proxy_error
@@ -310,7 +318,7 @@ def _startup() -> None:
     engine = get_engine(settings.database_url)
     Base.metadata.create_all(engine)
     auto_migrate(settings.database_url)
-    S3Store(settings).ensure_bucket()
+    FileStore(settings).ensure_ready()
     _models_dir(settings).mkdir(parents=True, exist_ok=True)
     _dictionary_imports_dir(settings).mkdir(parents=True, exist_ok=True)
 
@@ -355,6 +363,11 @@ def get_subtitle_settings_view(settings: SubtitleServiceSettings = Depends(get_s
         external_whisper_base_url=str(settings.external_whisper_base_url or ""),
         external_whisper_model=str(settings.external_whisper_model or ""),
         external_whisper_api_key_set=bool(settings.external_whisper_api_key),
+        groq_whisper_model=str(settings.groq_whisper_model or "whisper-large-v3-turbo"),
+        groq_whisper_api_key_set=bool(settings.groq_whisper_api_key),
+        cloudflare_workers_ai_account_id=str(settings.cloudflare_workers_ai_account_id or ""),
+        cloudflare_workers_ai_model=str(settings.cloudflare_workers_ai_model or ""),
+        cloudflare_workers_ai_api_key_set=bool(settings.cloudflare_workers_ai_api_key),
         whisper_cpu_threads=cpu_threads,
         whisper_num_workers=num_workers,
         whisper_cpu_threads_effective=int(effective_threads),
@@ -445,6 +458,102 @@ def test_external_whisper(
                 logger.debug("failed to remove external Whisper test audio", exc_info=True)
 
 
+@app.post("/subtitle/asr/cloudflare/test", response_model=CloudflareWorkersAITestResponse)
+def test_cloudflare_workers_ai(
+    payload: CloudflareWorkersAITestRequest,
+    settings: SubtitleServiceSettings = Depends(get_settings),
+    db: Session = Depends(get_db),
+) -> CloudflareWorkersAITestResponse:
+    """Send a short generated WAV to Cloudflare Workers AI to verify settings."""
+    started = time.perf_counter()
+    temp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(prefix="cloudflare-whisper-test-", suffix=".wav", delete=False) as handle:
+            temp_path = Path(handle.name)
+        with wave.open(str(temp_path), "wb") as wav_file:
+            wav_file.setnchannels(1)
+            wav_file.setsampwidth(2)
+            wav_file.setframerate(16000)
+            wav_file.writeframes(b"\x00\x00" * 16000)
+        stored = get_asr_settings(db, settings)
+        api_key = str(payload.api_key or "").strip() or str(
+            stored.get("cloudflare_workers_ai_api_key") or ""
+        ).strip()
+        segments = transcribe_cloudflare_workers_ai(
+            temp_path,
+            account_id=payload.account_id,
+            api_key=api_key,
+            model_name=payload.model,
+            timeout_seconds=30.0,
+        )
+        return CloudflareWorkersAITestResponse(
+            ok=True,
+            elapsed_ms=int((time.perf_counter() - started) * 1000),
+            text=" ".join(segment.text for segment in segments),
+            segments=len(segments),
+        )
+    except Exception as exc:
+        return CloudflareWorkersAITestResponse(
+            ok=False,
+            elapsed_ms=int((time.perf_counter() - started) * 1000),
+            error=str(exc),
+        )
+    finally:
+        if temp_path is not None:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except Exception:
+                logger.debug("failed to remove Cloudflare Workers AI test audio", exc_info=True)
+
+
+@app.post("/subtitle/asr/groq/test", response_model=GroqWhisperTestResponse)
+def test_groq_whisper(
+    payload: GroqWhisperTestRequest,
+    settings: SubtitleServiceSettings = Depends(get_settings),
+    db: Session = Depends(get_db),
+) -> GroqWhisperTestResponse:
+    """Send a short WAV to Groq Whisper to verify the API key and model."""
+    started = time.perf_counter()
+    temp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(prefix="groq-whisper-test-", suffix=".wav", delete=False) as handle:
+            temp_path = Path(handle.name)
+        with wave.open(str(temp_path), "wb") as wav_file:
+            wav_file.setnchannels(1)
+            wav_file.setsampwidth(2)
+            wav_file.setframerate(16000)
+            wav_file.writeframes(b"\x00\x00" * 16000)
+        stored = get_asr_settings(db, settings)
+        api_key = str(payload.api_key or "").strip() or str(stored.get("groq_whisper_api_key") or "").strip()
+        segments = transcribe_groq_whisper(
+            temp_path,
+            api_key=api_key,
+            model_name=payload.model,
+            timeout_seconds=30.0,
+            # This endpoint validates Groq connectivity with a generated
+            # silent sample, so bypass local VAD to ensure a real API call.
+            vad_enabled=False,
+        )
+        return GroqWhisperTestResponse(
+            ok=True,
+            elapsed_ms=int((time.perf_counter() - started) * 1000),
+            text=" ".join(segment.text for segment in segments),
+            segments=len(segments),
+        )
+    except Exception as exc:
+        return GroqWhisperTestResponse(
+            ok=False,
+            elapsed_ms=int((time.perf_counter() - started) * 1000),
+            error=str(exc),
+        )
+    finally:
+        if temp_path is not None:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except Exception:
+                logger.debug("failed to remove Groq Whisper test audio", exc_info=True)
+
+
 @app.get("/subtitle/auto/profile", response_model=SubtitleAutoProfileRead)
 def get_subtitle_auto_profile(db: Session = Depends(get_db)) -> SubtitleAutoProfileRead:
     cfg = get_auto_profile(db)
@@ -479,6 +588,10 @@ def get_translate_settings_view(
         openai_temperature=cfg["openai_temperature"],
         openai_timeout_seconds=cfg["openai_timeout_seconds"],
         openai_max_retries=cfg["openai_max_retries"],
+        openai_api_type=cfg["openai_api_type"],
+        openai_enable_thinking=cfg["openai_enable_thinking"],
+        cerebras_reasoning_effort=cfg["cerebras_reasoning_effort"],
+        cerebras_reasoning_format=cfg["cerebras_reasoning_format"],
         rag_enabled=cfg["rag_enabled"],
         rag_top_k=cfg["rag_top_k"],
         rag_min_score=cfg["rag_min_score"],
@@ -535,6 +648,10 @@ def put_translate_settings_view(
         openai_temperature=cfg["openai_temperature"],
         openai_timeout_seconds=cfg["openai_timeout_seconds"],
         openai_max_retries=cfg["openai_max_retries"],
+        openai_api_type=cfg["openai_api_type"],
+        openai_enable_thinking=cfg["openai_enable_thinking"],
+        cerebras_reasoning_effort=cfg["cerebras_reasoning_effort"],
+        cerebras_reasoning_format=cfg["cerebras_reasoning_format"],
         rag_enabled=cfg["rag_enabled"],
         rag_top_k=cfg["rag_top_k"],
         rag_min_score=cfg["rag_min_score"],
@@ -1112,18 +1229,19 @@ def promote_dictionary_entry_view(
 def list_agent_runs_view(
     status: str | None = None,
     limit: int = 30,
+    include_descendants: bool = False,
     settings: SubtitleServiceSettings = Depends(get_settings),
     db: Session = Depends(get_db),
 ) -> list[AgentRunRead]:
     try:
-        rows = list_agent_runs(db, status=status, limit=limit)
+        rows = list_agent_runs(db, status=status, limit=limit, include_descendants=include_descendants)
     except Exception as e:
         db.rollback()
         if not _is_missing_knowledge_table_error(e):
             _handle_knowledge_db_error(e, settings)
         _ensure_rag_schema(settings)
         try:
-            rows = list_agent_runs(db, status=status, limit=limit)
+            rows = list_agent_runs(db, status=status, limit=limit, include_descendants=include_descendants)
         except Exception as retry_error:
             db.rollback()
             raise HTTPException(status_code=503, detail=f"RAG agent tables are not ready: {retry_error}") from retry_error
@@ -1285,6 +1403,7 @@ def translate_test(
             text,
             target_lang=payload.target_lang,
             style=payload.style,
+            enable_thinking=bool(get_translate_settings(db, settings).get("openai_enable_thinking")),
         )
     except Exception as e:
         raise HTTPException(status_code=502, detail=str(e)) from e
@@ -1534,7 +1653,12 @@ def _read_task_queue(db: Session, *, limit: int) -> TaskQueueRead:
     cfg = get_task_queue_settings(db)
     now = datetime.now(tz=timezone.utc)
 
-    locked_q = db.query(Task).filter(Task.lock_owner == TASK_QUEUE_LOCK_OWNER, Task.lock_until.is_not(None), Task.lock_until > now)
+    locked_q = db.query(Task).filter(
+        Task.status != TaskStatus.canceled,
+        Task.lock_owner == TASK_QUEUE_LOCK_OWNER,
+        Task.lock_until.is_not(None),
+        Task.lock_until > now,
+    )
     running_count = int(locked_q.count() or 0)
     locked = locked_q.order_by(Task.lock_until.asc()).limit(limit).all()
     locked_ids = [t.id for t in locked]
@@ -1653,7 +1777,17 @@ def _read_task_queue(db: Session, *, limit: int) -> TaskQueueRead:
             )
         )
 
-    unlocked = (Task.lock_owner != TASK_QUEUE_LOCK_OWNER) | (Task.lock_until.is_(None)) | (Task.lock_until <= now)
+    # Stopped tasks retain their jobs for a later resume, but never belong in
+    # the live queue.  Keep this predicate explicit on every queue query so a
+    # stale queued/running job cannot make the dashboard show a stopped task.
+    unlocked = (
+        (Task.status != TaskStatus.canceled)
+        & (
+            (Task.lock_owner != TASK_QUEUE_LOCK_OWNER)
+            | (Task.lock_until.is_(None))
+            | (Task.lock_until <= now)
+        )
+    )
     orphaned_render_by_task: dict[uuid.UUID, RenderJob] = {}
     orphaned_subtitle_by_task: dict[uuid.UUID, SubtitleJob] = {}
     for rj in (

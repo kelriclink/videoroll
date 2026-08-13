@@ -46,7 +46,7 @@ export default function SettingsStoragePage() {
     <div className="space-y-4">
       <div className="rounded border bg-white p-4">
         <div className="text-lg font-semibold">Settings · Storage</div>
-        <div className="mt-1 text-sm text-slate-600">设置资源自动清理（MinIO/S3）保留时间。</div>
+        <div className="mt-1 text-sm text-slate-600">设置共享文件存储的资源自动清理保留时间。</div>
         {error ? <div className="mt-3 text-sm text-rose-700">{error}</div> : null}
       </div>
 
@@ -121,7 +121,7 @@ export default function SettingsStoragePage() {
       <div className="rounded border border-rose-200 bg-rose-50 p-4">
         <div className="text-sm font-semibold text-rose-900">立即清理已结束任务资源</div>
         <div className="mt-1 text-sm text-rose-800">
-          一键删除所有已发布、失败或永久取消任务的 MinIO/S3 资源文件，包括原视频、成品、字幕、日志和元数据；保留任务、发布和去重记录。已停止且可恢复的任务不会被清理。
+          一键删除所有已发布、失败或永久取消任务的共享存储文件，包括原视频、成品、字幕、日志和元数据；保留任务、发布和去重记录。已停止且可恢复的任务不会被清理。
         </div>
         <div className="mt-3 flex flex-wrap items-center gap-2">
           <button
@@ -130,7 +130,7 @@ export default function SettingsStoragePage() {
             onClick={async () => {
               const ok = await confirm({
                 title: "清理全部已结束任务资源",
-                message: "会永久删除 MinIO/S3 中所有已结束任务的原视频、成品、字幕、日志和元数据，任务记录仍会保留用于去重。此操作不可撤销。",
+                message: "会永久删除共享存储中所有已结束任务的原视频、成品、字幕、日志和元数据，任务记录仍会保留用于去重。此操作不可撤销。",
                 confirmLabel: "确认清理",
                 tone: "danger",
               });

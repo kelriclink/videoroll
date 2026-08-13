@@ -7,7 +7,7 @@
 ```
 src/videoroll/apps/   Orchestrator、字幕、接入、投稿与 egress 服务
 src/videoroll/db/     SQLAlchemy 模型、Alembic 迁移与 outbox/inbox
-src/videoroll/storage/ S3/MinIO 封装
+src/videoroll/storage/ 共享文件存储封装
 src/videoroll/ai/     翻译、embedding、RAG 与模型客户端
 src/videoroll/utils/  加密、内部 token 与共享工具
 src/web/              React 18 + Vite + Tailwind 前端
@@ -59,7 +59,7 @@ ENV_FILE=.env INCLUDE_BASE_IMAGES=1 ./scripts/build_export_prod.sh
 
 ## 安全上线与运行
 
-生产部署只公开 `web` 的 `${PUBLISH_ADDR}:${WEB_PORT}`。`orchestrator`、四个内部 API、Redis、MinIO、outbox dispatcher 和 egress gateway 都在 Compose 的 `internal` 网络中，不能添加 `ports:` 映射；需要诊断时使用受控的 `docker compose exec`，不要临时暴露内部端口。
+生产部署只公开 `web` 的 `${PUBLISH_ADDR}:${WEB_PORT}`。`orchestrator`、四个内部 API、Redis、outbox dispatcher 和 egress gateway 都在 Compose 的 `internal` 网络中，不能添加 `ports:` 映射；需要诊断时使用受控的 `docker compose exec`，不要临时暴露内部端口。
 
 ### 必需环境变量
 
@@ -145,7 +145,7 @@ React 18 + TypeScript + Vite + Tailwind + react-router-dom v6。生产环境 ngi
 ### 外部服务
 
 - **Redis** — Celery broker/backend
-- **MinIO** — S3 兼容对象存储
+- **共享文件存储** — `/storage/objects` 下的相对 key 与原子文件操作
 - **PostgreSQL 16+** — 需外部提供
 
 ## 编码约定

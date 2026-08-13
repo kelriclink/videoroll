@@ -23,7 +23,6 @@ _KNOWN_DEFAULTS = frozenset(
         "videoroll-development-bootstrap-secret",
     }
 )
-_S3_KEYS = ("S3_ACCESS_KEY_ID", "S3_SECRET_ACCESS_KEY")
 _INTERNAL_KEYS = ("INTERNAL_API_SECRET", "ADMIN_BOOTSTRAP_SECRET")
 
 
@@ -35,17 +34,15 @@ def validate_deployment_secrets(values: Mapping[str, object], *, production: boo
     """Return whether a full application deployment has safe credentials."""
     if not production:
         return True
-    return all(_is_non_default(values.get(name)) for name in (*_S3_KEYS, *_INTERNAL_KEYS))
+    return all(_is_non_default(values.get(name)) for name in _INTERNAL_KEYS)
 
 
 def validate_runtime_environment(values: Mapping[str, object], *, role: str, production: bool) -> bool:
     """Validate only credentials the selected process role is expected to have."""
     if not production:
         return True
-    required = list(_INTERNAL_KEYS)
-    if role != "egress-gateway":
-        required.extend(_S3_KEYS)
-    return all(_is_non_default(values.get(name)) for name in required)
+    del role
+    return all(_is_non_default(values.get(name)) for name in _INTERNAL_KEYS)
 
 
 def _development_mode(value: object) -> bool:

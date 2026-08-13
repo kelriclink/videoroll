@@ -22,7 +22,7 @@ from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from videoroll.ai.client import openai_chat_config_from_settings
-from videoroll.ai.service import AIService, translate_text_openai
+from videoroll.ai.service import AIService, translate_title_openai
 from videoroll.config import get_orchestrator_settings, get_subtitle_settings
 from videoroll.db.base import Base
 from videoroll.db.auto_migrate import auto_migrate
@@ -45,7 +45,7 @@ from videoroll.db.models import (
 )
 from videoroll.db.session import get_engine, get_sessionmaker
 from videoroll.realtime import publish_log_updated, publish_queue_changed
-from videoroll.storage.s3 import S3Store
+from videoroll.storage.filesystem import FileStore
 from videoroll.apps.security.service_auth import INTERNAL_TOKEN_HEADER, service_token
 from videoroll.utils.auto_youtube import parse_auto_youtube_created_by
 from videoroll.utils.hashing import sha256_file
@@ -63,6 +63,8 @@ from videoroll.apps.subtitle_service.processing import (
     segments_to_json_data,
     segments_to_srt,
     transcribe_external_whisper,
+    transcribe_groq_whisper,
+    transcribe_cloudflare_workers_ai,
     transcribe_faster_whisper,
     transcribe_mock,
     transcribe_openvino_whisper,
@@ -72,17 +74,25 @@ from videoroll.apps.subtitle_service.processing import (
 )
 from videoroll.apps.subtitle_service.asr_settings_store import get_asr_settings
 from videoroll.apps.subtitle_service.auto_profile_store import get_auto_profile
-from videoroll.apps.subtitle_service.bilibili_tags_store import set_task_bilibili_tags
+from videoroll.apps.subtitle_service.bilibili_tags_store import get_task_bilibili_summary, set_task_bilibili_tags
 from videoroll.apps.subtitle_service.model_downloads import (
     default_model_dir_name,
     download_model_snapshot,
     resolve_model_repo_id,
 )
-from videoroll.apps.subtitle_service.rag import build_rag_context, rag_settings_from_translate_settings
+from videoroll.apps.subtitle_service.rag import (
+    append_translation_batch_thinking_delta,
+    build_rag_context,
+    finish_translation_batch,
+    finish_translation_session,
+    rag_settings_from_translate_settings,
+    start_translation_batch,
+    start_translation_session,
+)
 from videoroll.apps.subtitle_service.embeddings import embedding_settings_from_translate_settings
 from videoroll.apps.subtitle_service.task_title_store import set_task_titles
 from videoroll.apps.subtitle_service.translate_settings_store import get_translate_settings
-from videoroll.apps.publish_meta_draft import apply_publish_source_overrides, default_publish_meta
+from videoroll.apps.publish_meta_draft import apply_publish_source_overrides, build_task_publish_meta_draft, default_publish_meta
 from videoroll.apps.outbox.dispatcher import dispatch_outbox_events
 from videoroll.apps.outbox.service import create_outbox_event
 from videoroll.apps.outbox.worker_inbox import claim_outbox_operation, finish_operation, release_operation
@@ -379,7 +389,7 @@ def _build_after_render_publish_action(
     webpage_url: str,
     yt_uploader: str = "",
     db: Session,
-    store: S3Store,
+    store: FileStore,
 ) -> dict[str, Any] | None:
     auto_publish_platforms = list(profile.get("auto_publish_platforms") or [])
     if not profile.get("auto_publish") or not auto_publish_platforms:
@@ -387,14 +397,21 @@ def _build_after_render_publish_action(
 
     meta = default_publish_meta(db)
     translate_settings = get_translate_settings(db, settings)
+    draft_profile = dict(profile)
+    if bool(profile.get("translate_enabled")) and bool(profile.get("publish_translate_title")):
+        # The final title is generated after subtitle translation, when the
+        # rolling summary is available. Keep this preliminary draft cheap and
+        # overwrite it before the render-triggered publish action runs.
+        draft_profile["publish_translate_title"] = False
     meta = apply_publish_source_overrides(
         meta,
         source_title=yt_title,
         source_description=yt_desc,
         source_url=webpage_url,
         source_uploader=yt_uploader,
-        profile=profile,
+        profile=draft_profile,
         translate_settings=translate_settings,
+        summary=get_task_bilibili_summary(db, str(task_id)),
         ai_service=_ai_service(),
     )
 
@@ -526,7 +543,7 @@ def _safe_append_log_block(log_path: Path | None, text: str) -> None:
         pass
 
 
-def _safe_upload_log(store: S3Store, log_path: Path | None, log_key: str | None) -> None:
+def _safe_upload_log(store: FileStore, log_path: Path | None, log_key: str | None) -> None:
     if log_path is None or not log_key:
         return
     try:
@@ -548,7 +565,7 @@ def _cleanup_local_work_root(path: Path | None) -> None:
         pass
 
 
-def _seed_log_from_store(store: S3Store, log_key: str, log_path: Path) -> None:
+def _seed_log_from_store(store: FileStore, log_key: str, log_path: Path) -> None:
     try:
         if log_path.exists() and log_path.stat().st_size > 0:
             return
@@ -584,6 +601,7 @@ def _translate_title_openai(
     *,
     target_lang: str,
     style: str,
+    summary: str = "",
     translate_settings: dict[str, Any] | None = None,
     ai_service: AIService | None = None,
 ) -> str:
@@ -593,18 +611,26 @@ def _translate_title_openai(
         return title
     try:
         if ai_service is not None:
-            return ai_service.translate_text(title, target_lang=target_lang, style=style)
-        return translate_text_openai(
+            return ai_service.translate_title(
+                title,
+                target_lang=target_lang,
+                style=style,
+                summary=summary,
+                retry_count=4,
+            )
+        return translate_title_openai(
             title,
             target_lang=target_lang,
             style=style,
+            summary=summary,
             config=openai_chat_config_from_settings(translate_settings or {}),
+            retry_count=4,
         )
     except Exception:
         return title
 
 
-def _read_s3_bytes(store: S3Store, key: str) -> bytes:
+def _read_s3_bytes(store: FileStore, key: str) -> bytes:
     obj = store.get_object(key)
     body = obj.get("Body")
     if not body:
@@ -647,7 +673,13 @@ def _effective_subtitle_worker_youtube_settings(db: Session, *, cookie_dir: Path
             except Exception:
                 cookie_file = None
 
-    return settings.model_copy(update={"youtube_proxy": proxy or None, "youtube_cookie_file": cookie_file})
+    return settings.model_copy(
+        update={
+            "youtube_proxy": proxy or None,
+            "youtube_cookie_file": cookie_file,
+            "youtube_compatibility_mode_enabled": bool(cfg.get("compatibility_mode_enabled")),
+        }
+    )
 
 
 def _download_youtube_subtitle_segments(
@@ -657,7 +689,7 @@ def _download_youtube_subtitle_segments(
     work_root: Path,
     log_path: Path | None,
     log_key: str | None,
-    store: S3Store,
+    store: FileStore,
     target_lang: str,
     youtube_subtitle_mode: str,
 ) -> tuple[list[Segment] | None, dict[str, str] | None]:
@@ -727,7 +759,7 @@ def _download_youtube_subtitle_segments(
         return None, None
 
 
-def _latest_youtube_title(db: Session, store: S3Store, task_id: uuid.UUID) -> str:
+def _latest_youtube_title(db: Session, store: FileStore, task_id: uuid.UUID) -> str:
     asset = (
         db.query(Asset)
         .filter(Asset.task_id == task_id, Asset.kind == AssetKind.metadata_json)
@@ -844,8 +876,8 @@ def _on_worker_init(**_kwargs: Any) -> None:
 @celery_app.task(name="subtitle_service.process_job", bind=True, acks_late=True, reject_on_worker_lost=True)
 def process_job(self: Any, job_id: str) -> dict[str, str]:
     _ensure_db()
-    store = S3Store(settings)
-    store.ensure_bucket()
+    store = FileStore(settings)
+    store.ensure_ready()
 
     jid = uuid.UUID(job_id)
     db = _db()
@@ -921,7 +953,7 @@ def process_job(self: Any, job_id: str) -> dict[str, str]:
         work_root = Path(settings.work_dir) / "subtitle" / str(job.id)
         work_root.mkdir(parents=True, exist_ok=True)
 
-        video_path = work_root / "input.mp4"
+        video_path = store.path_for(input_key)
         audio_path = work_root / "audio.wav"
         segments_path = work_root / "segments.json"
         subtitle_segments_path = work_root / "subtitle_segments.json"
@@ -976,7 +1008,7 @@ def process_job(self: Any, job_id: str) -> dict[str, str]:
         )
         _safe_upload_log(store, log_path, log_key)
 
-        def _download_latest_asset(kind: AssetKind, dest: Path) -> Asset | None:
+        def _download_latest_asset(kind: AssetKind, dest: Path, *, direct: bool = False) -> Asset | None:
             row = (
                 db.query(Asset)
                 .filter(Asset.task_id == task.id, Asset.kind == kind)
@@ -986,6 +1018,9 @@ def process_job(self: Any, job_id: str) -> dict[str, str]:
             if not row:
                 return None
             try:
+                if direct:
+                    source = store.path_for(row.storage_key)
+                    return row if source.stat().st_size > 0 else None
                 store.download_file(row.storage_key, dest)
                 if dest.exists() and dest.stat().st_size > 0:
                     return row
@@ -1034,14 +1069,9 @@ def process_job(self: Any, job_id: str) -> dict[str, str]:
             segs = _load_segments_json(subtitle_segments_path)
             return segs or None
 
-        video_downloaded = False
-
         def _ensure_video() -> None:
-            nonlocal video_downloaded
-            if video_downloaded:
-                return
-            store.download_file(input_key, video_path)
-            video_downloaded = True
+            if not video_path.is_file():
+                raise FileNotFoundError(video_path)
 
         def _ass_resolution() -> tuple[int, int]:
             try:
@@ -1145,11 +1175,24 @@ def process_job(self: Any, job_id: str) -> dict[str, str]:
             task.status = TaskStatus.asr_done
             db.add(task)
             db.commit()
+            _clear_groq_asr_checkpoint()
             _safe_append_log_line(log_path, f"{source_label}: segments={len(segs)}")
             _safe_upload_log(store, log_path, log_key)
 
         def _translation_checkpoint_key() -> str:
             return f"sub/{task.id}/translation_checkpoint.json"
+
+        def _groq_asr_checkpoint_key() -> str:
+            return f"sub/{task.id}/groq_asr_checkpoint.json"
+
+        def _groq_asr_checkpoint_path() -> Path:
+            return store.path_for(_groq_asr_checkpoint_key(), require_exists=False)
+
+        def _clear_groq_asr_checkpoint() -> None:
+            try:
+                store.delete_object(_groq_asr_checkpoint_key())
+            except Exception:
+                pass
 
         def _translation_checkpoint_matches(source: list[Segment], translated_prefix: list[Segment]) -> bool:
             if len(translated_prefix) > len(source):
@@ -1204,11 +1247,13 @@ def process_job(self: Any, job_id: str) -> dict[str, str]:
 
         if not resume:
             _clear_translation_checkpoint()
+            _clear_groq_asr_checkpoint()
 
         srt_asset = _download_latest_asset(AssetKind.subtitle_srt, srt_path) if resume else None
         if resume and srt_asset:
             srt_key = srt_asset.storage_key
             _clear_translation_checkpoint()
+            _clear_groq_asr_checkpoint()
             _safe_append_log_line(log_path, f"resume: found existing subtitle_srt asset: {srt_key}")
             _safe_upload_log(store, log_path, log_key)
             if task.status in {TaskStatus.failed, TaskStatus.created, TaskStatus.ingested, TaskStatus.downloaded, TaskStatus.audio_extracted, TaskStatus.asr_done, TaskStatus.translated}:
@@ -1287,6 +1332,8 @@ def process_job(self: Any, job_id: str) -> dict[str, str]:
         if resume and segments_asset:
             segments_key = segments_asset.storage_key
             segments = _load_segments_json(segments_path)
+            if segments is not None:
+                _clear_groq_asr_checkpoint()
 
         youtube_subtitle_info: dict[str, str] | None = None
         if segments is None:
@@ -1324,9 +1371,10 @@ def process_job(self: Any, job_id: str) -> dict[str, str]:
                     _store_source_segments(segments, source_label="youtube subtitles ready")
 
         if segments is None:
-            audio_asset = _download_latest_asset(AssetKind.audio_wav, audio_path) if resume else None
+            audio_asset = _download_latest_asset(AssetKind.audio_wav, audio_path, direct=True) if resume else None
             if resume and audio_asset:
                 audio_key = audio_asset.storage_key
+                audio_path = store.path_for(audio_key)
             else:
                 _ensure_video()
                 _safe_append_log_line(log_path, "ffmpeg: extract audio")
@@ -1338,14 +1386,16 @@ def process_job(self: Any, job_id: str) -> dict[str, str]:
                     audio_sha,
                     ".wav",
                 )
-                store.upload_file(audio_path, audio_key, content_type="audio/wav")
+                audio_size = audio_path.stat().st_size
+                store.promote_file(audio_path, audio_key)
+                audio_path = store.path_for(audio_key)
                 db.add(
                     Asset(
                         task_id=task.id,
                         kind=AssetKind.audio_wav,
                         storage_key=audio_key,
                         sha256=audio_sha,
-                        size_bytes=audio_path.stat().st_size,
+                        size_bytes=audio_size,
                     )
                 )
             _raise_if_task_stopped(db, task.id)
@@ -1425,6 +1475,54 @@ def process_job(self: Any, job_id: str) -> dict[str, str]:
                     model_name=external_model,
                     language=language,
                 )
+            elif engine == "groq-whisper":
+                groq_api_key = str(asr_defaults.get("groq_whisper_api_key") or "").strip()
+                # A legacy database row may still contain a local model such
+                # as "tiny" in default_model after switching engines. Groq
+                # must resolve its own configured model unless the task
+                # explicitly supplied one.
+                groq_model = str(
+                    requested_model or asr_defaults.get("groq_whisper_model") or "whisper-large-v3-turbo"
+                ).strip()
+                groq_vad_enabled = bool(asr_defaults.get("openvino_vad_enabled", settings.openvino_vad_enabled))
+                groq_vad_threshold = float(
+                    asr_defaults.get("openvino_vad_threshold") or settings.openvino_vad_threshold or 0.5
+                )
+                _safe_append_log_line(
+                    log_path,
+                    f"asr: engine=groq-whisper model={groq_model} language={language} "
+                    "format=flac chunk=45s overlap=5s retries=5 checkpoint=enabled "
+                    f"vad_enabled={groq_vad_enabled} vad_threshold={groq_vad_threshold}",
+                )
+                segments = transcribe_groq_whisper(
+                    audio_path,
+                    api_key=groq_api_key,
+                    model_name=groq_model,
+                    language=language,
+                    ffmpeg_path=settings.ffmpeg_path,
+                    checkpoint_path=_groq_asr_checkpoint_path(),
+                    audio_identity=str(audio_key or audio_path),
+                    vad_enabled=groq_vad_enabled,
+                    vad_threshold=groq_vad_threshold,
+                )
+            elif engine == "cloudflare-workers-ai":
+                cloudflare_account_id = str(asr_defaults.get("cloudflare_workers_ai_account_id") or "").strip()
+                cloudflare_api_key = str(asr_defaults.get("cloudflare_workers_ai_api_key") or "").strip()
+                cloudflare_model = str(
+                    model_name or asr_defaults.get("cloudflare_workers_ai_model") or ""
+                ).strip()
+                _safe_append_log_line(
+                    log_path,
+                    f"asr: engine=cloudflare-workers-ai model={cloudflare_model} "
+                    f"account_id={cloudflare_account_id or '(empty)'} language={language}",
+                )
+                segments = transcribe_cloudflare_workers_ai(
+                    audio_path,
+                    account_id=cloudflare_account_id,
+                    api_key=cloudflare_api_key,
+                    model_name=cloudflare_model,
+                    language=language,
+                )
             else:
                 raise ValueError(f"unsupported ASR engine: {engine}")
             _store_source_segments(segments, source_label="asr done")
@@ -1447,6 +1545,105 @@ def process_job(self: Any, job_id: str) -> dict[str, str]:
             enable_summary = translate_settings["default_enable_summary"] if enable_summary_val is None else bool(enable_summary_val)
 
             max_retries = max(0, int(translate_settings.get("default_max_retries") or 0))
+            thinking_enabled = provider == "openai" and bool(translate_settings.get("openai_enable_thinking"))
+            thinking_model = str(translate_settings.get("openai_model") or "").strip()
+            translation_session_run_id: str | None = None
+            translation_session_resumed_segments = 0
+            translation_batch_count = 0
+            translation_succeeded_batches = 0
+            translation_failed_batches = 0
+            translation_completed_segments = 0
+            translation_thought_characters = 0
+
+            def _flush_batch_thinking(batch_context: Any, *, force: bool = False) -> None:
+                if not isinstance(batch_context, dict):
+                    return
+                pending = str(batch_context.get("thinking_pending") or "")
+                run_id = str(batch_context.get("run_id") or "")
+                if not run_id or not pending:
+                    return
+                last_flush_at = float(batch_context.get("thinking_last_flush_at") or 0.0)
+                if not force and len(pending) < 800 and time.monotonic() - last_flush_at < 0.25:
+                    return
+                batch_context["thinking_pending"] = ""
+                batch_context["thinking_last_flush_at"] = time.monotonic()
+                append_translation_batch_thinking_delta(
+                    db,
+                    run_id,
+                    model=thinking_model,
+                    delta=pending,
+                    batch_start=int(batch_context.get("segment_start") or 1),
+                    batch_size=int(batch_context.get("requested_segments") or 1),
+                    truncated=bool(batch_context.get("thinking_storage_limited")),
+                )
+                batch_context["thinking_stored_characters"] = int(batch_context.get("thinking_stored_characters") or 0) + len(pending)
+
+            def _on_translate_batch_start(batch_segments: list[Segment], start_idx: int, summary: str) -> dict[str, Any]:
+                nonlocal translation_batch_count
+                translation_batch_count += 1
+                batch_context: dict[str, Any] = {
+                    "run_id": None,
+                    "batch_number": translation_batch_count,
+                    "segment_start": start_idx + 1,
+                    "requested_segments": len(batch_segments),
+                    "started_at": time.monotonic(),
+                    "thinking_pending": "",
+                    "thinking_last_flush_at": time.monotonic(),
+                    "thinking_received_characters": 0,
+                    "thinking_stored_characters": 0,
+                    "thinking_storage_limited": False,
+                    "finished": False,
+                }
+                if translation_session_run_id:
+                    try:
+                        batch_context["run_id"] = start_translation_batch(
+                            db,
+                            parent_session_run_id=translation_session_run_id,
+                            task_id=str(task.id),
+                            subtitle_job_id=str(job.id),
+                            target_lang=target_lang,
+                            model=thinking_model,
+                            batch_number=translation_batch_count,
+                            segment_start=start_idx + 1,
+                            source_segments=batch_segments,
+                            previous_summary=summary,
+                            thinking_enabled=thinking_enabled,
+                        )
+                    except Exception as trace_error:
+                        db.rollback()
+                        _safe_append_log_line(
+                            log_path,
+                            f"translate batch trace unavailable: {type(trace_error).__name__}: {trace_error}",
+                        )
+                return batch_context
+
+            def _on_translate_thinking(
+                delta: str,
+                batch_start: int,
+                batch_size: int,
+                batch_context: Any,
+            ) -> None:
+                nonlocal translation_thought_characters
+                del batch_start, batch_size
+                if not isinstance(batch_context, dict):
+                    return
+                clean_delta = str(delta or "")
+                if not clean_delta:
+                    return
+                translation_thought_characters += len(clean_delta)
+                batch_context["thinking_received_characters"] = int(batch_context.get("thinking_received_characters") or 0) + len(clean_delta)
+                max_stored_characters = 32_000
+                stored = int(batch_context.get("thinking_stored_characters") or 0)
+                pending = str(batch_context.get("thinking_pending") or "")
+                remaining = max_stored_characters - stored - len(pending)
+                if remaining <= 0:
+                    batch_context["thinking_storage_limited"] = True
+                    return
+                if len(clean_delta) > remaining:
+                    clean_delta = clean_delta[:remaining]
+                    batch_context["thinking_storage_limited"] = True
+                batch_context["thinking_pending"] = pending + clean_delta
+                _flush_batch_thinking(batch_context)
 
             def _is_retryable_translate_error(err: Exception) -> bool:
                 msg = str(err or "")
@@ -1466,11 +1663,33 @@ def process_job(self: Any, job_id: str) -> dict[str, str]:
                         segments_out = segments
                     elif provider == "openai":
                         resume_prefix, resume_summary = _load_translation_checkpoint(segments, source_segments_key=segments_key)
+                        translation_session_resumed_segments = len(resume_prefix)
+                        translation_completed_segments = len(resume_prefix)
                         if resume_prefix:
                             _safe_append_log_line(
                                 log_path,
                                 f"translate: resuming from checkpoint at segment {len(resume_prefix)}/{len(segments)}",
                             )
+
+                        if translation_session_run_id is None:
+                            try:
+                                translation_session_run_id = start_translation_session(
+                                    db,
+                                    task_id=str(task.id),
+                                    subtitle_job_id=str(job.id),
+                                    target_lang=target_lang,
+                                    model=thinking_model,
+                                    segment_count=len(segments),
+                                    resumed_segments=len(resume_prefix),
+                                    retry_attempt=int(getattr(self.request, "retries", 0) or 0),
+                                    thinking_enabled=thinking_enabled,
+                                )
+                            except Exception as trace_error:
+                                db.rollback()
+                                _safe_append_log_line(
+                                    log_path,
+                                    f"translate session trace unavailable: {type(trace_error).__name__}: {trace_error}",
+                                )
 
                         checkpoint_segments = list(resume_prefix)
                         rag_settings = rag_settings_from_translate_settings(translate_settings)
@@ -1484,7 +1703,12 @@ def process_job(self: Any, job_id: str) -> dict[str, str]:
                                 f"domain={rag_settings.domain or '(any)'}",
                             )
 
-                        def _rag_context_provider(batch_segments: list[Segment], start_idx: int, summary: str) -> dict[str, Any] | None:
+                        def _rag_context_provider(
+                            batch_segments: list[Segment],
+                            start_idx: int,
+                            summary: str,
+                            batch_context: Any,
+                        ) -> dict[str, Any] | None:
                             del start_idx
                             current_translate_settings = _fresh_translate_settings()
                             rag_settings = rag_settings_from_translate_settings(current_translate_settings)
@@ -1503,6 +1727,11 @@ def process_job(self: Any, job_id: str) -> dict[str, str]:
                                 session_factory=lambda: get_sessionmaker(settings.database_url)(),
                                 task_id=str(task.id),
                                 subtitle_job_id=str(job.id),
+                                parent_agent_run_id=(
+                                    str(batch_context.get("run_id") or "")
+                                    if isinstance(batch_context, dict) and batch_context.get("run_id")
+                                    else None
+                                ),
                             )
                             if ctx.hits:
                                 try:
@@ -1516,10 +1745,57 @@ def process_job(self: Any, job_id: str) -> dict[str, str]:
                                 "knowledge_cards": ctx.knowledge_cards,
                             }
 
-                        def _on_translate_batch_done(batch_segments: list[Segment], updated_summary: str, completed_count: int) -> None:
-                            del completed_count
+                        def _on_translate_batch_done(
+                            batch_context: Any,
+                            batch_segments: list[Segment],
+                            updated_summary: str,
+                            completed_count: int,
+                        ) -> None:
+                            nonlocal translation_completed_segments, translation_succeeded_batches
                             checkpoint_segments.extend(batch_segments)
                             _save_translation_checkpoint(segments_key, checkpoint_segments, summary=updated_summary)
+                            translation_completed_segments = completed_count
+                            translation_succeeded_batches += 1
+                            _flush_batch_thinking(batch_context, force=True)
+                            if isinstance(batch_context, dict):
+                                finish_translation_batch(
+                                    db,
+                                    str(batch_context.get("run_id") or "") or None,
+                                    parent_session_run_id=translation_session_run_id,
+                                    status="succeeded" if len(batch_segments) == int(batch_context.get("requested_segments") or 0) else "partial",
+                                    batch_number=int(batch_context.get("batch_number") or 1),
+                                    segment_start=int(batch_context.get("segment_start") or 1),
+                                    requested_segments=int(batch_context.get("requested_segments") or len(batch_segments)),
+                                    translated_segments=batch_segments,
+                                    completed_segments=completed_count,
+                                    updated_summary=updated_summary,
+                                    thought_characters=int(batch_context.get("thinking_received_characters") or 0),
+                                    thought_truncated=bool(batch_context.get("thinking_storage_limited")),
+                                    duration_ms=int((time.monotonic() - float(batch_context.get("started_at") or time.monotonic())) * 1000),
+                                )
+                                batch_context["finished"] = True
+
+                        def _on_translate_batch_error(batch_context: Any, error: Exception) -> None:
+                            nonlocal translation_failed_batches
+                            if not isinstance(batch_context, dict) or bool(batch_context.get("finished")):
+                                return
+                            translation_failed_batches += 1
+                            _flush_batch_thinking(batch_context, force=True)
+                            finish_translation_batch(
+                                db,
+                                str(batch_context.get("run_id") or "") or None,
+                                parent_session_run_id=translation_session_run_id,
+                                status="failed",
+                                batch_number=int(batch_context.get("batch_number") or 1),
+                                segment_start=int(batch_context.get("segment_start") or 1),
+                                requested_segments=int(batch_context.get("requested_segments") or 0),
+                                completed_segments=translation_completed_segments,
+                                thought_characters=int(batch_context.get("thinking_received_characters") or 0),
+                                thought_truncated=bool(batch_context.get("thinking_storage_limited")),
+                                duration_ms=int((time.monotonic() - float(batch_context.get("started_at") or time.monotonic())) * 1000),
+                                error=str(error),
+                            )
+                            batch_context["finished"] = True
 
                         segments_out, translation_summary = translate_segments_openai_with_summary(
                             segments,
@@ -1532,19 +1808,51 @@ def process_job(self: Any, job_id: str) -> dict[str, str]:
                             timeout_seconds=translate_settings["openai_timeout_seconds"],
                             batch_size=batch_size,
                             enable_summary=enable_summary,
-                            rag_context_provider=_rag_context_provider,
                             resume_from=resume_prefix,
                             initial_summary=resume_summary,
-                            on_batch_done=_on_translate_batch_done,
                             ai_service=ai_service,
+                            enable_thinking=thinking_enabled,
+                            on_batch_start=_on_translate_batch_start,
+                            rag_context_provider_with_context=_rag_context_provider,
+                            on_batch_done_with_context=_on_translate_batch_done,
+                            on_batch_error=_on_translate_batch_error,
+                            on_thinking_delta_with_context=_on_translate_thinking if thinking_enabled else None,
                         )
                     else:
                         raise ValueError(f"unsupported translate provider: {provider}")
+                    translation_completed_segments = len(segments_out)
+                    if translation_session_run_id:
+                        finish_translation_session(
+                            db,
+                            translation_session_run_id,
+                            status="succeeded",
+                            total_segments=len(segments),
+                            completed_segments=translation_completed_segments,
+                            resumed_segments=translation_session_resumed_segments,
+                            batch_count=translation_batch_count,
+                            succeeded_batches=translation_succeeded_batches,
+                            failed_batches=translation_failed_batches,
+                            thought_characters=translation_thought_characters,
+                        )
                     job.error_message = None
                     db.add(job)
                     db.commit()
                     break
                 except Exception as e:
+                    if translation_session_run_id:
+                        finish_translation_session(
+                            db,
+                            translation_session_run_id,
+                            status="failed",
+                            total_segments=len(segments),
+                            completed_segments=translation_completed_segments,
+                            resumed_segments=translation_session_resumed_segments,
+                            batch_count=translation_batch_count,
+                            succeeded_batches=translation_succeeded_batches,
+                            failed_batches=translation_failed_batches,
+                            thought_characters=translation_thought_characters,
+                            error=str(e),
+                        )
                     retry_no = int(getattr(self.request, "retries", 0) or 0) + 1
                     if provider != "openai" or retry_no > max_retries or not _is_retryable_translate_error(e):
                         raise
@@ -1571,6 +1879,7 @@ def process_job(self: Any, job_id: str) -> dict[str, str]:
                                 title_src,
                                 target_lang=target_lang,
                                 style=style,
+                                summary=translation_summary,
                                 ai_service=ai_service,
                             )
                         except Exception:
@@ -1600,6 +1909,22 @@ def process_job(self: Any, job_id: str) -> dict[str, str]:
                     set_task_bilibili_tags(db, str(task.id), tags=tags[:6], title=title_hint, summary=translation_summary)
             except Exception:
                 pass
+
+            # The automatic publish draft may have been created before the
+            # subtitle job started. Rebuild it now so the final submission
+            # uses the title translated with the completed video summary.
+            try:
+                after_render_cfg = req.get("after_render") if isinstance(req.get("after_render"), dict) else {}
+                if after_render_cfg.get("publish"):
+                    final_publish_meta = build_task_publish_meta_draft(task, db=db, s3=store, mode="source")
+                    store.put_bytes(
+                        json.dumps(final_publish_meta, ensure_ascii=False, indent=2).encode("utf-8"),
+                        f"meta/{task.id}/publish_meta.json",
+                        content_type="application/json",
+                    )
+                    _safe_append_log_line(log_path, "publish meta refreshed after summary-aware title translation")
+            except Exception as meta_error:
+                _safe_append_log_line(log_path, f"publish meta refresh skipped: {type(meta_error).__name__}: {meta_error}")
 
             if bilingual:
                 merged: list[Segment] = []
@@ -1805,6 +2130,18 @@ def task_queue_tick() -> dict[str, Any]:
         except Exception:
             unlocked_expired = 0
 
+        # A stop request clears the lock in the orchestrator, but this also
+        # repairs locks left by an older deployment or an in-flight tick.
+        try:
+            unlocked_expired += int(
+                db.query(Task)
+                .filter(Task.status == TaskStatus.canceled, Task.lock_owner == TASK_QUEUE_LOCK_OWNER)
+                .update({"lock_owner": None, "lock_until": None}, synchronize_session=False)
+                or 0
+            )
+        except Exception:
+            pass
+
         unlocked = or_(
             Task.lock_owner != TASK_QUEUE_LOCK_OWNER,
             Task.lock_until.is_(None),
@@ -1813,7 +2150,12 @@ def task_queue_tick() -> dict[str, Any]:
 
         locked_tasks = (
             db.query(Task)
-            .filter(Task.lock_owner == TASK_QUEUE_LOCK_OWNER, Task.lock_until.is_not(None), Task.lock_until > now)
+            .filter(
+                Task.status != TaskStatus.canceled,
+                Task.lock_owner == TASK_QUEUE_LOCK_OWNER,
+                Task.lock_until.is_not(None),
+                Task.lock_until > now,
+            )
             .order_by(Task.lock_until.asc())
             .all()
         )
@@ -1825,11 +2167,6 @@ def task_queue_tick() -> dict[str, Any]:
                 db.query(SubtitleJob).filter(SubtitleJob.task_id == tid, SubtitleJob.status == SubtitleJobStatus.running).count()
                 + db.query(RenderJob).filter(RenderJob.task_id == tid, RenderJob.status == RenderJobStatus.running).count()
             )
-            if t.status == TaskStatus.canceled:
-                if not has_running:
-                    _task_queue_unlock(t)
-                    db.add(t)
-                continue
             if has_running:
                 continue
 
@@ -2012,8 +2349,8 @@ def render_queue_tick() -> dict[str, Any]:
 @celery_app.task(name="subtitle_service.process_render_job", bind=True, acks_late=True, reject_on_worker_lost=True)
 def process_render_job(self: Any, render_job_id: str) -> dict[str, Any]:
     _ensure_db()
-    store = S3Store(settings)
-    store.ensure_bucket()
+    store = FileStore(settings)
+    store.ensure_ready()
 
     rid = uuid.UUID(render_job_id)
     db = _db()
@@ -2161,24 +2498,21 @@ def process_render_job(self: Any, render_job_id: str) -> dict[str, Any]:
             except Exception:
                 pass
 
-        video_path = work_root / "input.mp4"
-        srt_path = work_root / "subtitle_zh.srt"
-        ass_path = work_root / "subtitle_zh.ass"
+        video_path = store.path_for(input_key)
+        srt_path = store.path_for(srt_key)
+        ass_path = store.path_for(ass_key) if burn_in and ass_key else work_root / "subtitle_zh.ass"
 
-        _safe_append_log_line(log_path, f"download: input_key={input_key}")
+        _safe_append_log_line(log_path, f"storage input ready: input_key={input_key}")
         _safe_upload_log(store, log_path, log_key)
         rj.progress = max(int(rj.progress or 0), 5)
         db.add(rj)
         db.commit()
-        store.download_file(input_key, video_path)
-        _safe_append_log_line(log_path, f"download: srt_key={srt_key}")
+        _safe_append_log_line(log_path, f"storage subtitle ready: srt_key={srt_key}")
         _safe_upload_log(store, log_path, log_key)
-        store.download_file(srt_key, srt_path)
         if burn_in and ass_key:
-            _safe_append_log_line(log_path, f"download: ass_key={ass_key}")
+            _safe_append_log_line(log_path, f"storage ASS ready: ass_key={ass_key}")
             _safe_upload_log(store, log_path, log_key)
-            store.download_file(ass_key, ass_path)
-        _safe_append_log_line(log_path, "inputs downloaded")
+        _safe_append_log_line(log_path, "storage inputs ready")
         _safe_upload_log(store, log_path, log_key)
 
         subtitle_job: SubtitleJob | None = None
@@ -2222,14 +2556,15 @@ def process_render_job(self: Any, render_job_id: str) -> dict[str, Any]:
                 final_sha,
                 ".mp4",
             )
-            store.upload_file(out_video, final_key, content_type="video/mp4")
+            final_size = out_video.stat().st_size
+            store.promote_file(out_video, final_key)
             db.add(
                 Asset(
                     task_id=task.id,
                     kind=AssetKind.video_final,
                     storage_key=final_key,
                     sha256=final_sha,
-                    size_bytes=out_video.stat().st_size,
+                    size_bytes=final_size,
                 )
             )
 
@@ -2251,14 +2586,15 @@ def process_render_job(self: Any, render_job_id: str) -> dict[str, Any]:
                 final_sha,
                 ".mkv",
             )
-            store.upload_file(out_video, final_key, content_type="video/x-matroska")
+            final_size = out_video.stat().st_size
+            store.promote_file(out_video, final_key)
             db.add(
                 Asset(
                     task_id=task.id,
                     kind=AssetKind.video_final,
                     storage_key=final_key,
                     sha256=final_sha,
-                    size_bytes=out_video.stat().st_size,
+                    size_bytes=final_size,
                 )
             )
 
@@ -2393,7 +2729,7 @@ def _after_render_publish_impl(render_job_id: str) -> dict[str, Any]:
             PublishAllRequest.model_validate(publish_payload),
             get_orchestrator_settings(),
             db,
-            S3Store(settings),
+            FileStore(settings),
         )
 
         # Log partial failures but don't fail the task if at least one platform succeeded.
@@ -2524,8 +2860,8 @@ def _cleanup_task_impl(self: Any, task_id: str, batch_id: str | None = None) -> 
       - AssetKind.publish_result
     """
     _ensure_db()
-    store = S3Store(settings)
-    store.ensure_bucket()
+    store = FileStore(settings)
+    store.ensure_ready()
 
     db = _db()
     tid: uuid.UUID | None = None
@@ -2613,6 +2949,15 @@ def _cleanup_task_impl(self: Any, task_id: str, batch_id: str | None = None) -> 
             db.query(Subtitle).filter(Subtitle.task_id == tid, Subtitle.storage_key.in_(deleted_keys)).delete(synchronize_session=False)
             db.query(Asset).filter(Asset.task_id == tid, Asset.storage_key.in_(deleted_keys)).delete(synchronize_session=False)
             db.commit()
+
+        for checkpoint_key in (
+            f"sub/{tid}/translation_checkpoint.json",
+            f"sub/{tid}/groq_asr_checkpoint.json",
+        ):
+            try:
+                store.delete_object(checkpoint_key)
+            except Exception:
+                pass
 
         # Local temp dirs (WORK_DIR).
         work_dir = Path(settings.work_dir)
@@ -2730,8 +3075,8 @@ def auto_youtube_pipeline(self: Any, task_id: str, overrides: dict[str, Any] | N
       - publish to bilibili (optional, according to auto profile)
     """
     _ensure_db()
-    store = S3Store(settings)
-    store.ensure_bucket()
+    store = FileStore(settings)
+    store.ensure_ready()
 
     orch_base = str(settings.orchestrator_url or "").strip().rstrip("/") or "http://localhost:8000"
 
@@ -2936,7 +3281,7 @@ def auto_youtube_pipeline(self: Any, task_id: str, overrides: dict[str, Any] | N
                     profile.get("youtube_subtitle_mode"),
                     prefer_youtube_subtitles=profile.get("prefer_youtube_subtitles", True),
                 ),
-                "input": {"type": "s3", "key": video_key},
+                "input": {"type": "storage", "key": video_key},
                 "asr": {
                     "engine": profile.get("asr_engine") or "auto",
                     "language": profile.get("asr_language") or "auto",
@@ -3007,6 +3352,7 @@ def auto_youtube_pipeline(self: Any, task_id: str, overrides: dict[str, Any] | N
                 source_uploader=yt_uploader,
                 profile=profile,
                 translate_settings=translate_settings,
+                summary=get_task_bilibili_summary(db, str(tid)),
                 ai_service=_ai_service(),
             )
 

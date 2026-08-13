@@ -596,6 +596,7 @@ class YouTubeSettingsRead(BaseModel):
     proxy: str = ""
     cookies_set: bool = False
     cookies_enabled: bool = False
+    compatibility_mode_enabled: bool = False
     cookies_updated_at: Optional[str] = None
     cookies_count: int = 0
     cookies_domains_count: int = 0
@@ -632,6 +633,7 @@ class YouTubeSettingsUpdate(BaseModel):
     proxy: Optional[str] = None
     cookies_txt: Optional[str] = None
     cookies_enabled: Optional[bool] = None
+    compatibility_mode_enabled: Optional[bool] = None
     home_scan_enabled: Optional[bool] = None
     home_scan_interval_minutes: Optional[int] = Field(default=None, ge=1, le=1440)
     home_scan_limit: Optional[int] = Field(default=None, ge=1, le=100)

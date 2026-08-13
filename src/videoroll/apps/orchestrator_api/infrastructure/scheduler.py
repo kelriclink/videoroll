@@ -17,7 +17,7 @@ from videoroll.apps.youtube_ingest.source_service import (
 )
 from videoroll.config import OrchestratorSettings
 from videoroll.db.session import get_sessionmaker
-from videoroll.storage.s3 import S3Store
+from videoroll.storage.filesystem import FileStore
 
 
 logger = logging.getLogger(__name__)
@@ -98,7 +98,10 @@ class OrchestratorScheduler:
                 timeout_hours=self._publishing_timeout_hours,
             )
             config = get_storage_retention_settings(db)
-            store = S3Store(self.settings)
+            store = FileStore(self.settings)
+            deleted_partials = store.cleanup_partials(
+                older_than_seconds=int(os.getenv("STORAGE_PARTIAL_RETENTION_SECONDS", "86400") or "86400")
+            )
             deleted_objects = asset_service.retry_pending_s3_deletes(db, store)
             ttl_days = int(config.get("asset_ttl_days") or 0)
             retention = maintenance_service.cleanup_terminal_task_resources(
@@ -112,12 +115,14 @@ class OrchestratorScheduler:
                 return {
                     "timed_out_tasks": timed_out_tasks,
                     "deleted_objects": deleted_objects,
+                    "deleted_partials": deleted_partials,
                     "deleted_assets": 0,
                     "deleted_subtitles": 0,
                 }
             return {
                 "timed_out_tasks": timed_out_tasks,
                 "deleted_objects": deleted_objects + retention.deleted_objects,
+                "deleted_partials": deleted_partials,
                 "deleted_assets": retention.deleted_assets,
                 "deleted_subtitles": retention.deleted_subtitles,
             }

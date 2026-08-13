@@ -45,7 +45,7 @@ class AutoYouTubePipelineTests(unittest.TestCase):
         with (
             patch("videoroll.apps.subtitle_service.worker._ensure_db"),
             patch("videoroll.apps.subtitle_service.worker._db", return_value=db),
-            patch("videoroll.apps.subtitle_service.worker.S3Store"),
+            patch("videoroll.apps.subtitle_service.worker.FileStore"),
             patch(
                 "videoroll.apps.orchestrator_api.services.publishing_service.publish_all",
                 return_value={"has_any_accepted": True, "errors": {}},

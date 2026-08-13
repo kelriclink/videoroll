@@ -22,7 +22,7 @@ from videoroll.apps.publish_lifecycle import (
 from videoroll.apps.publish_platform_settings_store import get_publish_platform_settings
 from videoroll.apps.publish_request_builder import build_publish_gateway_request
 from videoroll.db.models import Account, Asset, AssetKind, Platform, PublishBatch, PublishJob, PublishState, Task
-from videoroll.storage.s3 import S3Store
+from videoroll.storage.filesystem import FileStore
 
 
 logger = logging.getLogger(__name__)
@@ -112,7 +112,7 @@ class PublishService:
         self,
         db: Session,
         settings: Any,
-        s3: S3Store,
+        s3: FileStore,
         *,
         http_headers: dict[str, str] | Callable[[], dict[str, str]] | None = None,
     ):

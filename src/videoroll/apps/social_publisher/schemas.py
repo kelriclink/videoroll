@@ -42,7 +42,7 @@ class SocialLoginSessionRead(BaseModel):
 
 
 class InputRef(BaseModel):
-    type: Literal["s3"] = "s3"
+    type: Literal["storage", "s3"] = "storage"
     key: str
 
 

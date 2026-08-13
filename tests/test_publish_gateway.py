@@ -68,7 +68,7 @@ def test_social_publish_meta_does_not_require_bilibili_typeid() -> None:
 def test_douyin_meta_uses_short_author_credit_and_four_non_videoroll_topics() -> None:
     assert normalize_social_publish_meta(
         {
-            "title": "翻译标题 - Original Creator",
+            "title": "【熟肉】翻译标题 - Original Creator",
             "description": "原视频：https://example.test/watch\n博主：Original Creator\n\n很长的 B 站简介",
             "tags": ["videoroll", "#AI", "AI", "科技", "资讯", "剪辑", "额外"],
         },

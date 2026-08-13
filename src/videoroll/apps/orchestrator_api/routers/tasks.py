@@ -20,7 +20,8 @@ from videoroll.apps.orchestrator_api.schemas import (
 from videoroll.apps.orchestrator_api.services import subtitle_service, task_service, youtube_service
 from videoroll.config import OrchestratorSettings
 from videoroll.db.models import SubtitleJob, Task, TaskStatus
-from videoroll.storage.s3 import S3Store
+from videoroll.realtime import publish_queue_changed
+from videoroll.storage.filesystem import FileStore
 
 
 router = APIRouter()
@@ -44,7 +45,7 @@ def list_tasks(
     status: TaskStatus | None = Query(default=None),
     limit: int = Query(default=50, ge=1, le=500),
     db: Session = Depends(get_db),
-    s3: S3Store = Depends(get_s3),
+    s3: FileStore = Depends(get_s3),
 ) -> list[dict[str, Any]]:
     return task_service.list_tasks(status=status, limit=limit, db=db, s3=s3)
 
@@ -53,7 +54,7 @@ def list_tasks(
 def get_task(
     task_id: uuid.UUID,
     db: Session = Depends(get_db),
-    s3: S3Store = Depends(get_s3),
+    s3: FileStore = Depends(get_s3),
 ) -> dict[str, Any]:
     return task_service.get_task(task_id, db=db, s3=s3)
 
@@ -71,6 +72,7 @@ def stop_task(
     db: Session = Depends(get_db),
 ) -> Task:
     task = task_service.stop_task(task_id, db=db)
+    publish_queue_changed(settings.redis_url, task_id=task.id)
     subtitle_service.kick_task_queue(settings)
     return task
 
@@ -93,6 +95,7 @@ def stop_all_tasks(
     db: Session = Depends(get_db),
 ) -> TaskBulkControlResponse:
     matched_count, changed_count = task_service.stop_all_tasks(db=db)
+    publish_queue_changed(settings.redis_url)
     subtitle_service.kick_task_queue(settings)
     return TaskBulkControlResponse(matched_count=matched_count, changed_count=changed_count)
 
@@ -124,7 +127,7 @@ def enqueue_subtitle_job(
     payload: SubtitleActionRequest,
     settings: OrchestratorSettings = Depends(get_settings),
     db: Session = Depends(get_db),
-    s3: S3Store = Depends(get_s3),
+    s3: FileStore = Depends(get_s3),
 ) -> RemoteJobResponse:
     return subtitle_service.enqueue_subtitle_job(task_id, payload, settings=settings, db=db, s3=s3)
 
@@ -144,7 +147,7 @@ def resume_recent_failed_tasks(
     limit: int = Query(default=200, ge=1, le=500),
     settings: OrchestratorSettings = Depends(get_settings),
     db: Session = Depends(get_db),
-    s3: S3Store = Depends(get_s3),
+    s3: FileStore = Depends(get_s3),
 ) -> RecentFailedResumeResponse:
     return subtitle_service.resume_recent_failed_tasks(
         window_hours=window_hours,

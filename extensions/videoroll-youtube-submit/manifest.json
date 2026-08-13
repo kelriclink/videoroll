@@ -1,0 +1,35 @@
+{
+  "manifest_version": 3,
+  "name": "VideoRoll YouTube Submit",
+  "version": "0.1.0",
+  "description": "从 YouTube 右键菜单将视频提交到 VideoRoll 自动模式。",
+  "permissions": [
+    "activeTab",
+    "contextMenus",
+    "storage"
+  ],
+  "optional_host_permissions": [
+    "http://*/*",
+    "https://*/*"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_title": "配置 VideoRoll YouTube Submit"
+  },
+  "options_page": "options.html",
+  "content_scripts": [
+    {
+      "matches": [
+        "https://*.youtube.com/*",
+        "https://youtu.be/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ]
+}

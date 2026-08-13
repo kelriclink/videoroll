@@ -15,9 +15,9 @@
 | `social-publisher-api` / `worker` / `scheduler` | SAU 账号、浏览器投稿和周期调度 | internal |
 | `outbox-dispatcher` | 投递 durable outbox，独立于业务 worker | internal |
 | `egress-gateway` | RAG 与网页抓取的唯一公网出口 | internal + egress |
-| `redis` / `minio` / `minio-init` | 队列、对象存储与存储桶初始化 | internal |
+| `redis` | 队列与调度状态 | internal |
 
-`minio-init` 是一次性服务，成功完成后退出。其余服务使用健康检查和 `restart: unless-stopped` 运行。
+所有需要处理媒体的服务共享同一个只写入 `/storage` 的宿主机挂载；对象 key 是相对于 `/storage/objects` 的路径。
 
 ## 网络与访问边界
 
@@ -28,13 +28,13 @@ host ── published port ──► web
                            orchestrator
                      ┌──────────┼──────────┐
                      ▼          ▼          ▼
-                internal APIs  workers  Redis / MinIO
+                internal APIs  workers  Redis / shared storage
                      │
                      └──► egress-gateway ──► public Internet
 ```
 
-- `internal` Docker 网络标记为 `internal: true`；除 `egress-gateway` 外，应用进程不应加入可出网网络。
-- 只能为 `web` 配置 `ports:`。禁止通过临时端口映射公开 Redis、MinIO、内部 API、noVNC 或 VNC。
+- 应用服务共享 `internal` Docker 网络，该网络允许访问宿主机上的 PostgreSQL；公网抓取仍统一通过 `egress-gateway` 的受控接口完成。
+- 只能为 `web` 配置 `ports:`。禁止通过临时端口映射公开 Redis、内部 API、noVNC 或 VNC。
 - 浏览器只能请求 Orchestrator 的 `/api` 路由。Orchestrator 使用服务 DNS 与内部 token 转发受允许的请求。
 
 ## 身份与交互式桌面
@@ -67,7 +67,7 @@ outbox-dispatcher ──► Redis / Celery
 ## 数据与迁移
 
 - PostgreSQL 是任务、设置、审计、outbox/inbox 和发布状态的事实来源；启用 `pgvector`。
-- MinIO/S3 保存视频、字幕、封面、日志等产物；数据库仅保存元数据与对象键。
+- 共享文件系统保存视频、字幕、封面、日志等产物；数据库仅保存元数据与相对存储键。
 - schema 使用 Alembic。上线前运行 `python -m videoroll.db.migrate upgrade`；不要依赖旧的自动加列逻辑完成安全 schema 迁移。
 - `data/secrets/fernet.key` 用于加密数据库内的敏感设置。丢失该文件会使已有加密数据不可读。
 

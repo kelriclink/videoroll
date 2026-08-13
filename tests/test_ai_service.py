@@ -334,6 +334,40 @@ class AIServiceTests(unittest.TestCase):
         self.assertEqual(calls[0][0], "text_translation")
         self.assertEqual(calls[0][1], "fake")
 
+    def test_title_translation_uses_summary_and_retries_four_times(self) -> None:
+        calls: list[str] = []
+
+        class FlakyProvider:
+            name = "flaky"
+
+            def request_json(self, runtime: AIRuntime, prompt: AIJsonPrompt, *, client: object | None = None) -> dict[str, object]:
+                del client
+                self_outer.assertEqual(runtime.purpose, "title_translation")
+                calls.append(prompt.user_prompt)
+                if len(calls) < 5:
+                    raise RuntimeError("temporary title translation failure")
+                return {"translation": "模拟数据采样效应详解"}
+
+        self_outer = self
+        ai = service.AIService(
+            lambda: {"ai_provider": "flaky", "openai_model": "ignored"},
+            provider_registry=AIProviderRegistry([FlakyProvider()]),
+        )
+
+        translated = ai.translate_title(
+            "The Effects of Sampling on Analog Data",
+            target_lang="zh",
+            style="自然",
+            summary="本期介绍模拟信号采样，以及采样率对还原效果的影响。",
+            retry_count=4,
+            retry_delay_seconds=0,
+        )
+
+        self.assertEqual(translated, "模拟数据采样效应详解")
+        self.assertEqual(len(calls), 5)
+        self.assertIn("模拟信号采样", calls[0])
+        self.assertIn("仅作为理解标题的上文", calls[0])
+
 
 if __name__ == "__main__":
     unittest.main()

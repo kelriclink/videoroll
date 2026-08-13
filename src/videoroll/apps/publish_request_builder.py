@@ -4,7 +4,6 @@ import json
 import uuid
 from typing import Any
 
-from botocore.exceptions import ClientError
 from sqlalchemy.orm import Session
 
 from videoroll.apps.bilibili_publisher.schemas import BilibiliPublishMeta
@@ -16,7 +15,7 @@ from videoroll.apps.publish_gateway import (
 from videoroll.apps.subtitle_service.bilibili_tags_store import get_task_bilibili_tags
 from videoroll.apps.youtube_meta_store import get_task_youtube_meta
 from videoroll.db.models import Task
-from videoroll.storage.s3 import S3Store
+from videoroll.storage.filesystem import FileStore, StorageObjectNotFound
 
 
 def publish_meta_s3_key(task_id: uuid.UUID) -> str:
@@ -33,14 +32,11 @@ def _value(payload: Any, name: str, default: Any = None) -> Any:
     return getattr(payload, name, default)
 
 
-def _read_json(s3: S3Store, key: str) -> dict[str, Any] | None:
+def _read_json(s3: FileStore, key: str) -> dict[str, Any] | None:
     try:
         obj = s3.get_object(key)
-    except ClientError as exc:
-        code = str((_as_dict(exc.response.get("Error")).get("Code") or "")).strip()
-        if code in {"NoSuchKey", "404", "NotFound"}:
-            return None
-        raise
+    except StorageObjectNotFound:
+        return None
     body = obj.get("Body")
     if not body:
         return None
@@ -76,7 +72,7 @@ def prepare_bilibili_publish_meta(
     task: Task,
     payload_meta: dict[str, Any] | None,
     db: Session,
-    s3: S3Store,
+    s3: FileStore,
     allow_auto_draft: bool = False,
 ) -> dict[str, Any]:
     """Validate Bilibili metadata without importing the orchestrator layer."""
@@ -122,7 +118,7 @@ def build_publish_gateway_request(
     payload: Any,
     video_key: str,
     db: Session,
-    s3: S3Store,
+    s3: FileStore,
 ) -> dict[str, Any]:
     """Build a publisher request from a plain dict or API request model."""
     platform = normalize_publish_platform(_value(payload, "platform"))
@@ -166,8 +162,8 @@ def build_publish_gateway_request(
         "platform": platform,
         "task_id": str(task_id),
         "account_id": account_id,
-        "video": {"type": "s3", "key": video_key},
-        "cover": {"type": "s3", "key": _value(payload, "cover_key")} if _value(payload, "cover_key") else None,
+        "video": {"type": "storage", "key": video_key},
+        "cover": {"type": "storage", "key": _value(payload, "cover_key")} if _value(payload, "cover_key") else None,
         "meta": meta,
         "platform_options": platform_options,
     }

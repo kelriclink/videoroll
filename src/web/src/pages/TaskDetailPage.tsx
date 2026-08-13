@@ -1000,7 +1000,7 @@ export default function TaskDetailPage() {
         onSecondary: () => setActiveTab("media"),
       };
     }
-    if (publishReview?.checked && publishReview.ok === false) {
+    if (publishReview?.enabled && publishReview.checked && publishReview.ok === false) {
       return {
         title: "审核未通过",
         description: publishReview.reason || "投稿前审核未通过。请调整标题、简介或审核设置后重试。",
@@ -1715,6 +1715,9 @@ export default function TaskDetailPage() {
                   <option value="mock">mock</option>
                   <option value="faster-whisper">faster-whisper</option>
                   <option value="openvino">openvino（方案2 / Intel Arc）</option>
+                  <option value="external-whisper">external-whisper（外部 API）</option>
+                  <option value="groq-whisper">groq-whisper（GroqCloud，自动切片）</option>
+                  <option value="cloudflare-workers-ai">cloudflare-workers-ai（原生时间轴）</option>
                 </select>
               </label>
               <label className="block">
@@ -1729,6 +1732,15 @@ export default function TaskDetailPage() {
                   onChange={(e) => setAsrModel(e.target.value)}
                 >
                   <option value="">(use env default)</option>
+                  {asrEngine === "cloudflare-workers-ai" ? (
+                    <option value="@cf/openai/whisper-large-v3-turbo">@cf/openai/whisper-large-v3-turbo</option>
+                  ) : null}
+                  {asrEngine === "groq-whisper" ? (
+                    <>
+                      <option value="whisper-large-v3-turbo">whisper-large-v3-turbo</option>
+                      <option value="whisper-large-v3">whisper-large-v3</option>
+                    </>
+                  ) : null}
                   {(whisperModels ?? []).map((m) => (
                     <option key={m.name} value={m.path}>
                       {m.name} · {m.path}
@@ -1736,7 +1748,7 @@ export default function TaskDetailPage() {
                   ))}
                 </select>
                 <div className="mt-2 text-xs text-slate-500">
-                  提示：`faster-whisper` 和 `openvino` 都可以传本地模型目录路径；OpenVINO 需要先准备好已导出的 Whisper 模型目录。
+                  提示：`faster-whisper` 和 `openvino` 可以传本地模型目录路径；Groq 使用 `whisper-large-v3(-turbo)`，Cloudflare 使用 `@cf/` 模型 ID。
                 </div>
               </label>
             </div>

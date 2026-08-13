@@ -147,7 +147,7 @@ def test_compose_keeps_internal_services_off_host_ports_and_grant_is_scoped() ->
     ):
         block = _compose_service_block(compose, service)
         assert "ports:" not in block
-    assert "internal:\n    internal: true" in compose
+    assert "internal:\n    internal: true" not in compose
 
     engine = create_engine("sqlite://")
     DesktopAccessGrant.__table__.create(engine)

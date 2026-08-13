@@ -33,8 +33,6 @@ if [[ ! -f "$ENV_FILE" ]]; then
   umask 077
   cp .env.example "$ENV_FILE"
   set_env_value DEVELOPMENT_MODE true
-  set_env_value S3_ACCESS_KEY_ID "dev-$(random_secret)"
-  set_env_value S3_SECRET_ACCESS_KEY "$(random_secret)"
   set_env_value INTERNAL_API_SECRET "$(random_secret)"
   set_env_value ADMIN_BOOTSTRAP_SECRET "$(random_secret)"
   set_env_value APP_UID "$(id -u)"
@@ -43,7 +41,7 @@ if [[ ! -f "$ENV_FILE" ]]; then
   echo "Created $ENV_FILE with unique local development secrets"
 fi
 
-install -d -m 0700 data/secrets data/social-publisher data/work data/models data/minio data/redis
+install -d -m 0700 data/secrets data/models data/storage data/redis
 
 docker compose -f docker-compose.yml --env-file "$ENV_FILE" up --build -d
 

@@ -34,7 +34,7 @@ from videoroll.db.models import (
     Task,
     TaskStatus,
 )
-from videoroll.storage.s3 import S3Store
+from videoroll.storage.filesystem import FileStore
 from videoroll.utils.auto_youtube import encode_auto_youtube_created_by
 
 
@@ -57,6 +57,8 @@ _BROWSER_PROXY_PATHS: dict[str, set[str]] = {
     "POST": {
         "subtitle/models/proxy/test",
         "subtitle/asr/external/test",
+        "subtitle/asr/groq/test",
+        "subtitle/asr/cloudflare/test",
         "subtitle/models/download",
         "subtitle/models/upload",
         "subtitle/embedding/models/list",
@@ -204,7 +206,7 @@ def build_subtitle_job_request(
         "resume": bool(payload.resume),
         "prefer_youtube_subtitles": youtube_subtitle_mode != "off",
         "youtube_subtitle_mode": youtube_subtitle_mode,
-        "input": {"type": "s3", "key": raw_asset.storage_key},
+        "input": {"type": "storage", "key": raw_asset.storage_key},
         "asr": {"engine": payload.asr_engine, "language": payload.asr_language, "model": payload.asr_model},
         "translate": translate,
         "output": {
@@ -241,7 +243,7 @@ def enqueue_subtitle_job(
     *,
     settings: OrchestratorSettings,
     db: Session,
-    s3: S3Store,
+    s3: FileStore,
 ) -> RemoteJobResponse:
     task = db.get(Task, task_id)
     if not task:
@@ -318,7 +320,7 @@ def resume_recent_failed_tasks(
     limit: int,
     settings: OrchestratorSettings,
     db: Session,
-    s3: S3Store,
+    s3: FileStore,
 ) -> RecentFailedResumeResponse:
     cutoff = utcnow() - timedelta(hours=window_hours)
     tasks = (

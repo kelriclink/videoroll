@@ -48,6 +48,18 @@ curl -X POST "https://your-host/api/remote/auto/youtube" \
   }'
 ```
 
+## Chrome / Edge 右键扩展
+
+仓库内置 `extensions/videoroll-youtube-submit/` 扩展。安装后可在 YouTube 视频页或缩略图链接上右键，选择“提交到 VideoRoll 自动模式”。
+
+```bash
+./scripts/build_browser_extension.sh
+```
+
+命令会生成 `dist/videoroll-youtube-submit.zip`。解压后通过 Chrome 的 `chrome://extensions/` 或 Edge 的 `edge://extensions/` 以“加载已解压的扩展程序”方式安装。
+
+扩展会把 Token 存储在浏览器扩展本地存储中，并为不确定的网络失败保留幂等键；再次提交同一视频时会复用原键，避免重复派发。
+
 ## 响应
 
 ```json

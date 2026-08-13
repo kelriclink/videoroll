@@ -25,7 +25,7 @@ from videoroll.db.models import (
     Task,
     TaskStatus,
 )
-from videoroll.storage.s3 import S3Store
+from videoroll.storage.filesystem import FileStore
 from videoroll.utils.auto_youtube import parse_auto_youtube_created_by
 
 
@@ -62,7 +62,7 @@ def load_task_display_titles(
     db: Session,
     task_ids: list[uuid.UUID],
     *,
-    s3: S3Store | None = None,
+    s3: FileStore | None = None,
     allow_s3_fallback: bool,
 ) -> dict[uuid.UUID, str]:
     title_map: dict[uuid.UUID, str] = {}
@@ -131,6 +131,11 @@ def stop_task(task_id: uuid.UUID, *, db: Session) -> Task:
 
     task.stopped_status = task.status
     task.status = TaskStatus.canceled
+    # A stopped task must release its task-level queue slot immediately.  The
+    # worker will safely return any in-flight job to queued at its next stop
+    # check, while the queue UI/scheduler no longer treats this task as active.
+    task.lock_owner = None
+    task.lock_until = None
     db.add(task)
     db.commit()
     db.refresh(task)
@@ -154,10 +159,49 @@ def resume_stopped_task(task_id: uuid.UUID, *, db: Session) -> Task:
 
 def stop_all_tasks(*, db: Session) -> tuple[int, int]:
     tasks = db.query(Task).filter(Task.status.in_(STOPPABLE_TASK_STATUSES)).all()
+
+    # A failed worker can leave a recoverable job behind.  These tasks are
+    # normally terminal and therefore are not in STOPPABLE_TASK_STATUSES, but
+    # they still need to be included in a bulk stop so the queue is truly
+    # drained.  Keep failed tasks with no live jobs untouched in history.
+    failed_task_ids = {
+        task_id
+        for task_id, in db.query(SubtitleJob.task_id)
+        .join(Task, Task.id == SubtitleJob.task_id)
+        .filter(
+            Task.status == TaskStatus.failed,
+            SubtitleJob.status.in_([SubtitleJobStatus.queued, SubtitleJobStatus.running]),
+        )
+        .distinct()
+        .all()
+    }
+    failed_task_ids.update(
+        task_id
+        for task_id, in db.query(RenderJob.task_id)
+        .join(Task, Task.id == RenderJob.task_id)
+        .filter(
+            Task.status == TaskStatus.failed,
+            RenderJob.status.in_([RenderJobStatus.queued, RenderJobStatus.running]),
+        )
+        .distinct()
+        .all()
+    )
+    if failed_task_ids:
+        tasks.extend(db.query(Task).filter(Task.id.in_(failed_task_ids)).all())
+
     for task in tasks:
         task.stopped_status = task.status
         task.status = TaskStatus.canceled
+        task.lock_owner = None
+        task.lock_until = None
         db.add(task)
+
+    # Also repair stale queue locks on tasks that were already stopped by a
+    # previous request.  They are not counted as changed tasks, but must never
+    # reserve a concurrency slot.
+    db.query(Task).filter(Task.status == TaskStatus.canceled).update(
+        {"lock_owner": None, "lock_until": None}, synchronize_session=False
+    )
     db.commit()
     return len(tasks), len(tasks)
 
@@ -283,7 +327,7 @@ def list_tasks(
     status: TaskStatus | None,
     limit: int,
     db: Session,
-    s3: S3Store,
+    s3: FileStore,
 ) -> list[dict[str, Any]]:
     query = db.query(Task).order_by(Task.created_at.desc())
     if status is not None:
@@ -316,7 +360,7 @@ def list_tasks(
     return output
 
 
-def get_task(task_id: uuid.UUID, *, db: Session, s3: S3Store) -> dict[str, Any]:
+def get_task(task_id: uuid.UUID, *, db: Session, s3: FileStore) -> dict[str, Any]:
     task = db.get(Task, task_id)
     if not task:
         raise HTTPException(status_code=404, detail="task not found")
