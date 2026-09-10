@@ -31,7 +31,8 @@ RUN apt-get update \
 
 COPY pyproject.toml README.md ./
 
-ARG INSTALL_ASR=0
+# Normal application builds must include the ASR engines selectable at runtime.
+ARG INSTALL_ASR=1
 ARG YTDLP_VERSION=latest
 ARG TORCH_CPU_INDEX_URL=https://download.pytorch.org/whl/cpu
 
