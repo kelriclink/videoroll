@@ -19,11 +19,11 @@ STORAGE_ROOT=/storage/objects
 TMPDIR=/storage/.partial
 INTERNAL_API_SECRET=...
 ADMIN_BOOTSTRAP_SECRET=...
-# The browser-facing playout hostname and URL.  Both must be set before the
-# Web image is built.
-PLAYOUT_HOST=playout.example.com
-VITE_FFPLAYOUT_URL=https://playout.example.com
-VIDEOROLL_PUBLIC_ORIGIN=https://app.example.com
+WEB_PORT=3001
+PLAYOUT_PORT=3003
+VITE_FFPLAYOUT_PORT=3003
+# Optional. Leave empty to follow the current browser hostname automatically.
+VITE_FFPLAYOUT_URL=
 LEGACY_LIVE_ENABLED=false
 ```
 
@@ -115,29 +115,32 @@ VideoRoll Orchestrator 同时将该宿主机目录作为 `/storage/playout-media
 不会写入 VideoRoll 字段。升级时必须同时保留 `data/storage/playout-media`，
 并确保 Orchestrator 与 ffplayout 使用相同的 `STORAGE_HOST_ROOT`。
 
-`PLAYOUT_HOST` 是 Web nginx 为 ffplayout 配置的专用虚拟主机名，
-`VITE_FFPLAYOUT_URL` 是编译进 SPA 的浏览器访问地址。生产反向代理应将应用域名
-和播控域名都转发到 Web 的唯一宿主机端口，并保留原始 `Host`，例如：
+ffplayout 使用 Web/Nginx 的独立监听端口，默认宿主机 `PLAYOUT_PORT=3003`。
+SPA 默认沿用当前浏览器 hostname，只切换到 `VITE_FFPLAYOUT_PORT`，因此同一个
+Web 镜像可以通过多个 IP、VPN 地址或 DNS 名称访问。例如：
 
 ```dotenv
-PLAYOUT_HOST=playout.example.com
-VITE_FFPLAYOUT_URL=https://playout.example.com
-VIDEOROLL_PUBLIC_ORIGIN=https://app.example.com
+WEB_PORT=3001
+PLAYOUT_PORT=3003
+VITE_FFPLAYOUT_PORT=3003
+VITE_FFPLAYOUT_URL=
 LEGACY_LIVE_ENABLED=false
 ```
 
-修改 `VITE_FFPLAYOUT_URL` 后必须重新构建 Web 镜像；它不是运行时变量。浏览器
-不得访问 Docker DNS 名称 `ffplayout:8787`，宿主机也不应发布 8787。
+从 `http://192.168.5.23:3001` 打开 VideoRoll 时，播控页自动加载
+`http://192.168.5.23:3003`。只有特殊反向代理拓扑才需要设置完整
+`VITE_FFPLAYOUT_URL`；修改该覆盖值仍需重建 Web 镜像。浏览器不得访问 Docker
+DNS 名称 `ffplayout:8787`，宿主机也不应发布 8787。
 
 **首次 setup 不得直接暴露到公网。** ffplayout 尚未初始化时 `/api/setup` 无需
-登录，因此上线顺序必须是：先启动容器并让 `PLAYOUT_HOST` 仅管理员 IP、临时
+登录，因此上线顺序必须是：先启动容器并让 `PLAYOUT_PORT` 仅管理员 IP、临时
 Basic Auth 或内网可访问；按上面的容器内路径完成 setup；确认
 `GET /api/setup` 已返回 `required=false` 后，再移除临时访问限制并开放播控域名。
 不要先公开域名再创建 Global Admin。
 
-如果使用 Nginx、Caddy 或 Traefik 等外部反向代理，应用域名和
-`PLAYOUT_HOST` 对应的域名都应指向同一个 Web 端口；TLS 在外部代理终止时，
-`VITE_FFPLAYOUT_URL` 仍应使用浏览器实际访问的 `https://` 地址。
+如果使用 Nginx、Caddy 或 Traefik 等外部反向代理，应同时代理 VideoRoll 的
+`WEB_PORT` 和播控 `PLAYOUT_PORT`。如果外部拓扑无法保持“同 hostname + 不同端口”，
+再使用 `VITE_FFPLAYOUT_URL` 显式覆盖浏览器播控地址。
 
 基础 Compose 不要求 GPU。使用 `docker-compose.intel.yml` 时，才会向
 ffplayout 添加 `/dev/dri` 和 `INTEL_GPU_RENDER_GID`。生产离线导出脚本会额外

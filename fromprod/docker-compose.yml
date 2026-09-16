@@ -458,14 +458,16 @@ services:
       context: ./src/web
       args:
         VITE_ORCHESTRATOR_URL: ${VITE_ORCHESTRATOR_URL:-}
-        VITE_FFPLAYOUT_URL: ${VITE_FFPLAYOUT_URL:?VITE_FFPLAYOUT_URL must be set}
+        VITE_FFPLAYOUT_URL: ${VITE_FFPLAYOUT_URL:-}
+        VITE_FFPLAYOUT_PORT: ${VITE_FFPLAYOUT_PORT:-3003}
     image: videoroll-web:prod
     environment:
-      PLAYOUT_HOST: ${PLAYOUT_HOST:?PLAYOUT_HOST must be set}
-      VIDEOROLL_PUBLIC_ORIGIN: ${VIDEOROLL_PUBLIC_ORIGIN:?VIDEOROLL_PUBLIC_ORIGIN must be set}
+      PLAYOUT_HOST: ${PLAYOUT_HOST:-playout.localhost}
+      VIDEOROLL_PUBLIC_ORIGIN: ${VIDEOROLL_PUBLIC_ORIGIN:-http://localhost:3000}
       NGINX_ENVSUBST_FILTER: "PLAYOUT_HOST|VIDEOROLL_PUBLIC_ORIGIN"
     ports:
       - "${PUBLISH_ADDR:-127.0.0.1}:${WEB_PORT:-3000}:80"
+      - "${PUBLISH_ADDR:-127.0.0.1}:${PLAYOUT_PORT:-3003}:81"
     networks: [internal]
     depends_on:
       orchestrator:

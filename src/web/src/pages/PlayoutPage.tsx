@@ -25,7 +25,7 @@ export default function PlayoutPage() {
 
       {!FFPLAYOUT_URL ? (
         <div className="rounded-md border border-amber-200 bg-amber-50 p-4 text-sm text-amber-900">
-          尚未配置 ffplayout 地址，请设置构建变量 <code>VITE_FFPLAYOUT_URL</code>。
+          无法确定 ffplayout 地址。浏览器默认使用当前 hostname 的播控端口，也可通过构建变量 <code>VITE_FFPLAYOUT_URL</code> 覆盖。
         </div>
       ) : null}
 

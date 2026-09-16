@@ -64,7 +64,8 @@ echo "Building web image: $WEB_IMAGE"
 docker_run build \
   -t "$WEB_IMAGE" \
   --build-arg VITE_ORCHESTRATOR_URL="${VITE_ORCHESTRATOR_URL:-}" \
-  --build-arg VITE_FFPLAYOUT_URL="${VITE_FFPLAYOUT_URL:?VITE_FFPLAYOUT_URL must be set}" \
+  --build-arg VITE_FFPLAYOUT_URL="${VITE_FFPLAYOUT_URL:-}" \
+  --build-arg VITE_FFPLAYOUT_PORT="${VITE_FFPLAYOUT_PORT:-3003}" \
   -f src/web/Dockerfile \
   src/web
 

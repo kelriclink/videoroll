@@ -60,8 +60,8 @@ git submodule update --init --recursive
 首次打开 Web 后创建管理员账户，再在设置页配置 LLM、RAG、YouTube、投稿平台和 ASR 参数。
 
 本地默认入口为 `http://localhost:3000`，登录后从左侧“播控中心”进入
-ffplayout；该页面加载的是 `http://playout.localhost:3000`。如果浏览器或本地
-代理不解析 `playout.localhost`，可在 hosts 中将它指向 `127.0.0.1`。
+ffplayout。默认情况下播控地址自动沿用当前浏览器 hostname，只切换到专用端口
+`3003`，因此通过 LAN IP、VPN 地址或不同 DNS 名称访问时不需要重建 Web 镜像。
 
 ## 生产离线部署
 
@@ -92,9 +92,9 @@ docker compose --env-file .env up -d --no-build --remove-orphans
 | `INTERNAL_API_SECRET` | 随机且非空，用于内部服务身份与管理员 cookie 密钥派生。 |
 | `ADMIN_BOOTSTRAP_SECRET` | 随机且非空，仅用于首次管理员初始化。 |
 | `PUBLISH_ADDR` | Web 唯一宿主机绑定地址；通常先使用 `127.0.0.1` 并由反向代理公开。 |
-| `PLAYOUT_HOST` | ffplayout 专用虚拟主机名；必须与外部反向代理的 Host 路由一致。 |
-| `VITE_FFPLAYOUT_URL` | 编译进 Web 的浏览器访问地址，例如 `https://playout.example.com`；修改后需重建 Web 镜像。 |
-| `VIDEOROLL_PUBLIC_ORIGIN` | 允许嵌入 ffplayout 的 VideoRoll 正式 Origin，例如 `https://app.example.com`。 |
+| `PLAYOUT_PORT` | ffplayout 浏览器入口端口，默认 `3003`；宿主机映射到 Web/Nginx 的专用监听端口。 |
+| `VITE_FFPLAYOUT_PORT` | 前端默认使用的播控端口，默认 `3003`；通常与 `PLAYOUT_PORT` 保持一致。 |
+| `VITE_FFPLAYOUT_URL` | 可选的完整播控 URL 覆盖值；留空时自动使用当前浏览器 hostname + `VITE_FFPLAYOUT_PORT`。 |
 | `LEGACY_LIVE_ENABLED` | 旧 VideoRoll Live 引擎紧急回退开关；生产默认 `false`。 |
 | `SUBTITLE_ASR_ENGINE=openvino` | Intel GPU ASR 使用 OpenVINO。 |
 | `SUBTITLE_OPENVINO_DEVICE=GPU` | Intel GPU OpenVINO 设备名。 |
@@ -102,19 +102,21 @@ docker compose --env-file .env up -d --no-build --remove-orphans
 
 从[.env.example](.env.example)开始配置；真实密钥、Cookie、数据库密码和 `data/secrets/fernet.key` 永远不能提交到 Git。
 
-生产环境通常将应用域名和播控域名都反代到 Web 的唯一端口，并保留原始
-`Host`，例如 `app.example.com` 与 `playout.example.com` 都转发到
-`127.0.0.1:3000`。同时设置：
+默认生产部署不要求固定播控域名。Web 入口使用 `WEB_PORT`，播控入口使用
+`PLAYOUT_PORT`；前端会根据当前浏览器 hostname 自动生成播控地址。例如：
 
 ```dotenv
-PLAYOUT_HOST=playout.example.com
-VITE_FFPLAYOUT_URL=https://playout.example.com
-VIDEOROLL_PUBLIC_ORIGIN=https://app.example.com
+WEB_PORT=3001
+PLAYOUT_PORT=3003
+VITE_FFPLAYOUT_PORT=3003
+VITE_FFPLAYOUT_URL=
 LEGACY_LIVE_ENABLED=false
 ```
 
-不要把 `ffplayout:8787` 写入 `VITE_FFPLAYOUT_URL`，也不要向宿主机发布 8787；
-该端口只在 Compose `internal` 网络中供 Web nginx 访问。
+因此从 `http://192.168.5.23:3001` 进入时播控自动使用
+`http://192.168.5.23:3003`；从其他 IP/DNS 名称进入时也自动跟随相同 hostname。
+不要向宿主机发布 ffplayout 的 8787；它只在 Compose `internal` 网络中供 Web
+nginx 访问。
 
 任务详情的“媒体与资产”页只允许将 `video_final` 成品加入播控。该操作只提交
 `task_id` 和 `asset_id`，由 Orchestrator 在服务端把文件链接/复制到
