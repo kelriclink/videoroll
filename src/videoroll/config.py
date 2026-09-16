@@ -20,6 +20,7 @@ class CommonSettings(BaseSettings):
 
     development_mode: bool = Field(False, alias="DEVELOPMENT_MODE")
     trusted_proxy_cidrs: str = Field("", alias="TRUSTED_PROXY_CIDRS")
+    trusted_proxy_hosts: str = Field("", alias="TRUSTED_PROXY_HOSTS")
     internal_api_secret: str = Field(
         "videoroll-development-internal-secret",
         alias="INTERNAL_API_SECRET",
@@ -40,12 +41,14 @@ class OrchestratorSettings(CommonSettings):
     # Shared runtime settings (used by orchestrator actions).
     work_dir: str = Field("/tmp/videoroll", alias="WORK_DIR")
     ffmpeg_path: str = Field("ffmpeg", alias="FFMPEG_PATH")
+    playout_media_root: str = Field("/storage/playout-media", alias="PLAYOUT_MEDIA_ROOT")
     # The live controller calls Uvicorn directly over loopback, not the external
     # Nginx /api proxy. Uvicorn's root path owns that public prefix.
     live_internal_stream_base_url: str = Field(
         "http://127.0.0.1:8000",
         alias="LIVE_INTERNAL_STREAM_BASE_URL",
     )
+    legacy_live_enabled: bool = Field(False, alias="LEGACY_LIVE_ENABLED")
 
     # YouTube downloader (yt-dlp) settings.
     youtube_user_agent: str = Field(DEFAULT_YOUTUBE_USER_AGENT, alias="YOUTUBE_USER_AGENT")
@@ -69,10 +72,16 @@ class SubtitleServiceSettings(CommonSettings):
     openvino_vad_enabled: bool = Field(True, alias="SUBTITLE_OPENVINO_VAD_ENABLED")
     openvino_vad_threshold: float = Field(0.5, alias="SUBTITLE_OPENVINO_VAD_THRESHOLD")
     # faster-whisper runtime parallelism (CPU only):
-    # - cpu_threads=0 means "auto" (use available CPUs).
+    # - cpu_threads=0 divides available CPUs by the configured task concurrency.
     # - num_workers defaults to 1 to avoid memory spikes.
     whisper_cpu_threads: int = Field(0, alias="SUBTITLE_WHISPER_CPU_THREADS")
     whisper_num_workers: int = Field(1, alias="SUBTITLE_WHISPER_NUM_WORKERS")
+    # MiB per admitted local ASR pipeline. Zero selects a conservative model tier.
+    local_asr_memory_mb: int = Field(0, ge=0, alias="SUBTITLE_LOCAL_ASR_MEMORY_MB")
+    memory_reserve_mb: int = Field(1536, ge=0, alias="SUBTITLE_MEMORY_RESERVE_MB")
+    # Celery checks RSS after completion; this is not a live task memory limit.
+    celery_sub_max_memory_mb: int = Field(1536, ge=1, alias="CELERY_SUB_MAX_MEMORY_MB")
+    celery_sub_max_tasks_per_child: int = Field(20, ge=1, alias="CELERY_SUB_MAX_TASKS_PER_CHILD")
     external_whisper_base_url: str = Field("", alias="SUBTITLE_EXTERNAL_WHISPER_BASE_URL")
     external_whisper_api_key: str | None = Field(None, alias="SUBTITLE_EXTERNAL_WHISPER_API_KEY")
     external_whisper_model: str = Field("whisper-1", alias="SUBTITLE_EXTERNAL_WHISPER_MODEL")

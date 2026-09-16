@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import tempfile
 from functools import lru_cache
 from pathlib import Path
 
@@ -40,14 +42,31 @@ def _fernet():
         raise RuntimeError("cryptography is not installed") from e
 
     key_path = _key_path()
-    if key_path.exists():
-        key = key_path.read_bytes()
-        if key:
-            return Fernet(key)
+    try:
+        return Fernet(key_path.read_bytes())
+    except FileNotFoundError:
+        pass
 
+    # Publish a complete, private file without replacing another process's key.
+    # Exclusive creation of the final path alone would expose an empty file
+    # between open() and write(); linking a flushed temporary file avoids that.
     key = Fernet.generate_key()
-    key_path.write_bytes(key)
-    return Fernet(key)
+    fd, temporary_name = tempfile.mkstemp(prefix=".fernet-", dir=key_path.parent)
+    temporary_path = Path(temporary_name)
+    try:
+        with os.fdopen(fd, "wb") as temporary_file:
+            temporary_file.write(key)
+            temporary_file.flush()
+            os.fsync(temporary_file.fileno())
+        try:
+            os.link(temporary_path, key_path)
+        except FileExistsError:
+            pass
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+    # Every contender caches the winner, including the process that created it.
+    return Fernet(key_path.read_bytes())
 
 
 def encrypt_str(value: str) -> str:
@@ -64,4 +83,3 @@ def decrypt_str(token: str) -> str:
         return ""
     f = _fernet()
     return f.decrypt(token.encode("utf-8")).decode("utf-8")
-

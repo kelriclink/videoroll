@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import sys
+import tempfile
 import types
 import unittest
+import wave
 from pathlib import Path
 from unittest.mock import patch
 
@@ -83,6 +85,19 @@ class _FakeDb:
 
 
 class OpenVinoAsrTests(unittest.TestCase):
+    def setUp(self) -> None:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.audio_path = Path(directory.name) / "audio.wav"
+
+    def _write_audio(self, seconds: int) -> Path:
+        with wave.open(str(self.audio_path), "wb") as target:
+            target.setnchannels(1)
+            target.setsampwidth(2)
+            target.setframerate(16000)
+            target.writeframes(b"\x00\x08" * (16000 * seconds))
+        return self.audio_path
+
     def _defaults(self, *, database_url: str) -> SubtitleServiceSettings:
         return SubtitleServiceSettings(
             DATABASE_URL=database_url,
@@ -134,13 +149,13 @@ class OpenVinoAsrTests(unittest.TestCase):
 
     def test_transcribe_openvino_whisper_builds_segments_from_chunks(self) -> None:
         fake_pipeline = _FakePipeline(_FakeResult([_FakeChunk(0.25, 1.5, " Hello Intel Arc ")]))
+        audio_path = self._write_audio(2)
 
         with (
-            patch.object(processing, "_read_wav_as_float_mono_16k", return_value=([0.1, -0.1], 2.0)),
             patch.object(processing, "_get_openvino_pipeline", return_value=fake_pipeline),
         ):
             segments = processing.transcribe_openvino_whisper(
-                Path("/tmp/fake.wav"),
+                audio_path,
                 model_name="/models/whisper/whisper-large-v3-ov",
                 language="en",
                 device="GPU",
@@ -161,13 +176,13 @@ class OpenVinoAsrTests(unittest.TestCase):
         self.assertEqual(len(fake_pipeline.calls), 1)
 
     def test_transcribe_openvino_whisper_skips_pipeline_when_vad_finds_no_speech(self) -> None:
+        audio_path = self._write_audio(1)
         with (
-            patch.object(processing, "_read_wav_as_float_mono_16k", return_value=([0.1] * 16000, 1.0)),
             patch.object(processing, "_detect_silero_speech_spans", return_value=[]),
             patch.object(processing, "_get_openvino_pipeline", side_effect=AssertionError("pipeline should not be created")),
         ):
             segments = processing.transcribe_openvino_whisper(
-                Path("/tmp/no-speech.wav"),
+                audio_path,
                 model_name="/models/whisper/whisper-large-v3-ov",
             )
 
@@ -179,13 +194,13 @@ class OpenVinoAsrTests(unittest.TestCase):
             processing._OpenVinoSpeechSpan(start_sample=16000, end_sample=32000),
             processing._OpenVinoSpeechSpan(start_sample=48000, end_sample=64000),
         ]
+        audio_path = self._write_audio(5)
         with (
-            patch.object(processing, "_read_wav_as_float_mono_16k", return_value=([0.1] * 80000, 5.0)),
             patch.object(processing, "_detect_silero_speech_spans", return_value=spans),
             patch.object(processing, "_get_openvino_pipeline", return_value=fake_pipeline),
         ):
             segments = processing.transcribe_openvino_whisper(
-                Path("/tmp/speech-spans.wav"),
+                audio_path,
                 model_name="/models/whisper/whisper-large-v3-ov",
             )
 

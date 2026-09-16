@@ -25,7 +25,7 @@ class _FakeS3:
         self.keys = set(keys)
         self.deleted: set[str] = set()
 
-    def ensure_bucket(self) -> None:
+    def ensure_ready(self) -> None:
         return None
 
     @property

@@ -1,0 +1,74 @@
+FROM rust:slim-trixie AS builder
+
+ARG NODE_MAJOR=24
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        clang \
+        curl \
+        gnupg \
+        libavcodec-dev \
+        libavdevice-dev \
+        libavfilter-dev \
+        libavformat-dev \
+        libavutil-dev \
+        libasound2-dev \
+        libclang-dev \
+        libsqlite3-dev \
+        libswresample-dev \
+        libswscale-dev \
+        pkg-config \
+    && curl -fsSL "https://deb.nodesource.com/setup_${NODE_MAJOR}.x" | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+COPY package*.json ./
+RUN npm ci --no-fund --no-audit
+
+COPY . .
+RUN npm run build-only
+RUN cargo build --release --package ffplayout --no-default-features --features embed_frontend
+
+FROM debian:trixie-slim AS runtime
+
+ARG APP_UID=10001
+ARG APP_GID=10001
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        ffmpeg \
+        fonts-dejavu \
+        intel-media-va-driver \
+        libasound2t64 \
+        libmfx-gen1.2 \
+        libsqlite3-0 \
+        libva-drm2 \
+        libva2 \
+        libvpl2 \
+        vainfo \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --non-unique --gid "$APP_GID" ffplayout \
+    && useradd --non-unique --create-home --uid "$APP_UID" --gid ffplayout --shell /usr/sbin/nologin ffplayout \
+    && install -d --owner=ffplayout --group=ffplayout /var/lib/ffplayout/db \
+        /var/lib/ffplayout/logs \
+        /var/lib/ffplayout/playlists \
+        /var/lib/ffplayout/public \
+        /var/lib/ffplayout/media
+
+COPY --from=builder /src/target/release/ffplayout /usr/local/bin/ffplayout
+COPY --from=builder /src/assets/dummy.vtt /usr/share/ffplayout/dummy.vtt
+COPY --from=builder /src/assets/logo.png /usr/share/ffplayout/logo.png
+RUN chown ffplayout:ffplayout /usr/local/bin/ffplayout /usr/share/ffplayout/dummy.vtt /usr/share/ffplayout/logo.png
+
+USER ffplayout
+WORKDIR /var/lib/ffplayout
+EXPOSE 8787
+HEALTHCHECK --interval=30s --timeout=5s --retries=10 CMD curl -fsS http://127.0.0.1:8787/api/setup >/dev/null || exit 1
+
+CMD ["ffplayout", "--listen", "0.0.0.0:8787", "--db", "/var/lib/ffplayout/db/ffplayout.db", "--log-to-console"]

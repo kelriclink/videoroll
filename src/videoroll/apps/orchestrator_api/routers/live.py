@@ -33,6 +33,16 @@ from videoroll.storage.filesystem import FileStore
 router = APIRouter()
 
 
+def _legacy_live_mutation_guard(
+    settings: OrchestratorSettings = Depends(get_settings),
+) -> None:
+    if not settings.legacy_live_enabled:
+        raise HTTPException(
+            status_code=410,
+            detail="旧直播系统已停用，请使用播控中心",
+        )
+
+
 async def _upload_live_media_batch(
     media_type: str,
     files: list[UploadFile],
@@ -70,6 +80,13 @@ def get_live_dashboard(db: Session = Depends(get_db)) -> LiveDashboardRead:
     return LiveDashboardRead(**live_service.get_live_dashboard(db))
 
 
+@router.get("/live/legacy-status")
+def get_legacy_live_status(
+    settings: OrchestratorSettings = Depends(get_settings),
+) -> dict[str, bool]:
+    return {"enabled": settings.legacy_live_enabled}
+
+
 @router.get("/live/settings", response_model=LiveStreamSettingsRead)
 def get_live_settings(db: Session = Depends(get_db)) -> LiveStreamSettingsRead:
     return LiveStreamSettingsRead(**live_service.get_live_settings(db))
@@ -79,6 +96,7 @@ def get_live_settings(db: Session = Depends(get_db)) -> LiveStreamSettingsRead:
 def put_live_settings(
     payload: LiveStreamSettingsUpdate,
     db: Session = Depends(get_db),
+    _legacy_guard: None = Depends(_legacy_live_mutation_guard),
 ) -> LiveStreamSettingsRead:
     return LiveStreamSettingsRead(**live_service.update_live_settings(db, payload.model_dump(exclude_unset=True)))
 
@@ -88,6 +106,7 @@ def put_live_playlist(
     payload: LivePlaylistUpdate,
     db: Session = Depends(get_db),
     s3: FileStore = Depends(get_s3),
+    _legacy_guard: None = Depends(_legacy_live_mutation_guard),
 ) -> LivePlaylistRead:
     return LivePlaylistRead(
         **live_service.update_live_playlist(
@@ -103,6 +122,7 @@ async def upload_live_video(
     files: list[UploadFile] = File(...),
     db: Session = Depends(get_db),
     s3: FileStore = Depends(get_s3),
+    _legacy_guard: None = Depends(_legacy_live_mutation_guard),
 ) -> list[LiveMediaRead]:
     return await _upload_live_media_batch("video", files, db=db, s3=s3)
 
@@ -113,6 +133,7 @@ async def upload_live_audio(
     audio_playlist_id: uuid.UUID | None = Form(default=None),
     db: Session = Depends(get_db),
     s3: FileStore = Depends(get_s3),
+    _legacy_guard: None = Depends(_legacy_live_mutation_guard),
 ) -> list[LiveMediaRead]:
     return await _upload_live_media_batch(
         "audio",
@@ -128,6 +149,7 @@ def import_live_task_videos(
     payload: LiveMediaImportRequest,
     db: Session = Depends(get_db),
     s3: FileStore = Depends(get_s3),
+    _legacy_guard: None = Depends(_legacy_live_mutation_guard),
 ) -> list[LiveMediaRead]:
     return [
         LiveMediaRead(**media)
@@ -171,7 +193,11 @@ def stream_live_preview(
 
 
 @router.delete("/live/media/{media_id}")
-def delete_live_media(media_id: uuid.UUID, db: Session = Depends(get_db)) -> dict[str, bool]:
+def delete_live_media(
+    media_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    _legacy_guard: None = Depends(_legacy_live_mutation_guard),
+) -> dict[str, bool]:
     return live_service.delete_live_media(media_id, db=db)
 
 
@@ -180,6 +206,7 @@ def rename_live_video_media(
     media_id: uuid.UUID,
     payload: LiveMediaRenameRequest,
     db: Session = Depends(get_db),
+    _legacy_guard: None = Depends(_legacy_live_mutation_guard),
 ) -> LiveMediaRead:
     return LiveMediaRead(**live_service.rename_live_video_media(media_id, payload.display_name, db=db))
 
@@ -188,12 +215,17 @@ def rename_live_video_media(
 def create_live_audio_playlist(
     payload: LiveAudioPlaylistCreate,
     db: Session = Depends(get_db),
+    _legacy_guard: None = Depends(_legacy_live_mutation_guard),
 ) -> LiveAudioPlaylistRead:
     return LiveAudioPlaylistRead(**live_service.create_live_audio_playlist(db, payload.model_dump(mode="json")))
 
 
 @router.delete("/live/audio-playlists/{playlist_id}")
-def delete_live_audio_playlist(playlist_id: uuid.UUID, db: Session = Depends(get_db)) -> dict[str, bool]:
+def delete_live_audio_playlist(
+    playlist_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    _legacy_guard: None = Depends(_legacy_live_mutation_guard),
+) -> dict[str, bool]:
     return live_service.delete_live_audio_playlist(playlist_id, db=db)
 
 
@@ -201,6 +233,7 @@ def delete_live_audio_playlist(playlist_id: uuid.UUID, db: Session = Depends(get
 def create_live_source(
     payload: LiveInputSourceCreate,
     db: Session = Depends(get_db),
+    _legacy_guard: None = Depends(_legacy_live_mutation_guard),
 ) -> LiveInputSourceRead:
     return LiveInputSourceRead(**live_service.create_live_input_source(db, payload.model_dump(mode="json")))
 
@@ -210,6 +243,7 @@ def update_live_source(
     source_id: uuid.UUID,
     payload: LiveInputSourceUpdate,
     db: Session = Depends(get_db),
+    _legacy_guard: None = Depends(_legacy_live_mutation_guard),
 ) -> LiveInputSourceRead:
     return LiveInputSourceRead(
         **live_service.update_live_input_source(
@@ -221,7 +255,11 @@ def update_live_source(
 
 
 @router.delete("/live/sources/{source_id}")
-def delete_live_source(source_id: uuid.UUID, db: Session = Depends(get_db)) -> dict[str, bool]:
+def delete_live_source(
+    source_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    _legacy_guard: None = Depends(_legacy_live_mutation_guard),
+) -> dict[str, bool]:
     return live_service.delete_live_input_source(source_id, db=db)
 
 
@@ -229,6 +267,7 @@ def delete_live_source(source_id: uuid.UUID, db: Session = Depends(get_db)) -> d
 def start_live_stream(
     settings: OrchestratorSettings = Depends(get_settings),
     db: Session = Depends(get_db),
+    _legacy_guard: None = Depends(_legacy_live_mutation_guard),
 ) -> LiveSessionRead:
     return LiveSessionRead(**live_service.start_live_stream(settings, db=db))
 
@@ -238,6 +277,7 @@ def play_live_selection(
     payload: LiveManualPlayRequest,
     settings: OrchestratorSettings = Depends(get_settings),
     db: Session = Depends(get_db),
+    _legacy_guard: None = Depends(_legacy_live_mutation_guard),
 ) -> LiveSessionRead:
     return LiveSessionRead(
         **live_service.play_live_selection(
@@ -252,20 +292,30 @@ def play_live_selection(
 def control_live_audio(
     payload: LiveAudioControlRequest,
     db: Session = Depends(get_db),
+    _legacy_guard: None = Depends(_legacy_live_mutation_guard),
 ) -> LiveSessionRead:
     return LiveSessionRead(**live_service.control_live_audio(payload.model_dump(mode="json"), db=db))
 
 
 @router.post("/live/actions/pause", response_model=LiveSessionRead)
-def pause_live_stream(db: Session = Depends(get_db)) -> LiveSessionRead:
+def pause_live_stream(
+    db: Session = Depends(get_db),
+    _legacy_guard: None = Depends(_legacy_live_mutation_guard),
+) -> LiveSessionRead:
     return LiveSessionRead(**live_service.pause_live_stream(db=db))
 
 
 @router.post("/live/actions/resume", response_model=LiveSessionRead)
-def resume_live_stream(db: Session = Depends(get_db)) -> LiveSessionRead:
+def resume_live_stream(
+    db: Session = Depends(get_db),
+    _legacy_guard: None = Depends(_legacy_live_mutation_guard),
+) -> LiveSessionRead:
     return LiveSessionRead(**live_service.resume_live_stream(db=db))
 
 
 @router.post("/live/actions/stop", response_model=LiveSessionRead)
-def stop_live_stream(db: Session = Depends(get_db)) -> LiveSessionRead:
+def stop_live_stream(
+    db: Session = Depends(get_db),
+    _legacy_guard: None = Depends(_legacy_live_mutation_guard),
+) -> LiveSessionRead:
     return LiveSessionRead(**live_service.stop_live_stream(db=db))

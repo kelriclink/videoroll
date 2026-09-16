@@ -77,3 +77,46 @@ def test_task_queue_does_not_show_stopped_tasks_or_count_their_locks(db: Session
     assert queue.running_count == 0
     assert queue.queued_count == 0
     assert queue.tasks == []
+
+
+def test_task_queue_does_not_show_published_tasks_or_count_their_jobs(db: Session) -> None:
+    now = datetime.now(timezone.utc)
+    published = _task(TaskStatus.published)
+    published.lock_owner = TASK_QUEUE_LOCK_OWNER
+    published.lock_until = now + timedelta(minutes=5)
+    db.add(published)
+    db.flush()
+    db.add(RenderJob(task_id=published.id, status=RenderJobStatus.queued, request_json={}))
+    db.commit()
+
+    queue = _read_task_queue(db, limit=200)
+
+    assert queue.running_count == 0
+    assert queue.queued_count == 0
+    assert queue.tasks == []
+
+
+def test_task_queue_shows_live_leased_job_as_running_after_task_lock_expires(db: Session) -> None:
+    now = datetime.now(timezone.utc)
+    task = _task(TaskStatus.subtitle_ready)
+    db.add(task)
+    db.flush()
+    job = RenderJob(
+        task_id=task.id,
+        status=RenderJobStatus.running,
+        progress=42,
+        request_json={},
+        lease_owner="worker-a",
+        lease_until=now + timedelta(minutes=5),
+    )
+    db.add(job)
+    db.commit()
+
+    queue = _read_task_queue(db, limit=200)
+
+    assert queue.running_count == 1
+    assert queue.queued_count == 0
+    assert len(queue.tasks) == 1
+    assert queue.tasks[0].state == "running"
+    assert queue.tasks[0].stage == "render"
+    assert queue.tasks[0].render_job_id == job.id

@@ -11,10 +11,12 @@ from videoroll.apps.subtitle_service.worker_concurrency import (
     main,
     normalize_subtitle_worker_concurrency,
     resolve_subtitle_worker_concurrency,
+    resolve_subtitle_worker_concurrency_with_retry,
     sync_subtitle_worker_concurrency,
     sync_subtitle_worker_concurrency_for_task_queue_settings,
     subtitle_worker_concurrency_for_task_queue_settings,
 )
+from videoroll.apps.subtitle_service.queues import SUBTITLE_CONTROL_QUEUE
 
 
 class _FakeSession:
@@ -169,7 +171,7 @@ class WorkerConcurrencyTests(unittest.TestCase):
         self.assertEqual(len(response.runtime_sync_workers), 1)
         self.assertEqual(
             fake_celery.control.send_task_calls,
-            [{"name": "subtitle_service.task_queue_tick", "args": [], "queue": "subtitle"}],
+            [{"name": "subtitle_service.task_queue_tick", "args": [], "queue": SUBTITLE_CONTROL_QUEUE}],
         )
 
     def test_resolve_reads_task_queue_settings_from_db(self) -> None:
@@ -183,20 +185,44 @@ class WorkerConcurrencyTests(unittest.TestCase):
 
         self.assertEqual(resolved, 2)
 
-    def test_main_falls_back_when_db_lookup_fails(self) -> None:
+    def test_resolve_retries_until_database_becomes_ready(self) -> None:
+        sleeps: list[float] = []
+        with patch(
+            "videoroll.apps.subtitle_service.worker_concurrency.resolve_subtitle_worker_concurrency",
+            side_effect=[RuntimeError("db starting"), 4],
+        ):
+            resolved = resolve_subtitle_worker_concurrency_with_retry(
+                "postgresql://demo",
+                attempts=3,
+                delay_seconds=0.25,
+                sleep=sleeps.append,
+            )
+
+        self.assertEqual(resolved, 4)
+        self.assertEqual(sleeps, [0.25])
+
+    def test_main_exits_nonzero_when_database_never_becomes_ready(self) -> None:
         stdout = io.StringIO()
         stderr = io.StringIO()
         with (
-            patch("videoroll.apps.subtitle_service.worker_concurrency.os.getenv", side_effect=lambda key, default=None: {"DATABASE_URL": "postgresql://demo", "CELERY_SUB_CONCURRENCY_FALLBACK": "3"}.get(key, default)),
+            patch(
+                "videoroll.apps.subtitle_service.worker_concurrency.os.getenv",
+                side_effect=lambda key, default=None: {
+                    "DATABASE_URL": "postgresql://demo",
+                    "CELERY_SUB_CONCURRENCY_FALLBACK": "3",
+                    "CELERY_SUB_CONCURRENCY_DB_ATTEMPTS": "1",
+                    "CELERY_SUB_CONCURRENCY_DB_DELAY_SECONDS": "0",
+                }.get(key, default),
+            ),
             patch("videoroll.apps.subtitle_service.worker_concurrency.resolve_subtitle_worker_concurrency", side_effect=RuntimeError("db down")),
             redirect_stdout(stdout),
             redirect_stderr(stderr),
         ):
             code = main()
 
-        self.assertEqual(code, 0)
-        self.assertEqual(stdout.getvalue().strip(), "3")
-        self.assertIn("failed to resolve subtitle worker concurrency", stderr.getvalue())
+        self.assertEqual(code, 1)
+        self.assertEqual(stdout.getvalue().strip(), "")
+        self.assertIn("database stayed unavailable", stderr.getvalue())
 
 
 if __name__ == "__main__":

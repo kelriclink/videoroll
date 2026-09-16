@@ -31,7 +31,7 @@ from videoroll.apps.outbox.worker_inbox import (
 )
 from videoroll.apps.subtitle_service.worker_concurrency import JobLeaseHeartbeat, acquire_job_lease, release_job_lease
 from videoroll.config import get_social_publisher_settings
-from videoroll.db.auto_migrate import auto_migrate
+from videoroll.db.migrate import initialize_database
 from videoroll.db.models import Account, Platform, PublishJob, PublishState, Task, TaskStatus
 from videoroll.db.session import db_session, get_sessionmaker
 from videoroll.storage.filesystem import FileStore
@@ -54,7 +54,7 @@ def _db() -> Session:
 
 
 def _ensure_db() -> None:
-    auto_migrate(settings.database_url)
+    initialize_database(settings.database_url)
 
 
 def _redis_client():

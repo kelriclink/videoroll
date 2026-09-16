@@ -18,7 +18,7 @@ RUN apt-get update \
     python-is-python3 \
     ffmpeg \
     fonts-noto-cjk \
-    intel-media-va-driver \
+    intel-media-va-driver-non-free \
     i965-va-driver \
     pciutils \
     ocl-icd-libopencl1 \
@@ -59,8 +59,12 @@ RUN if [ -n "$YTDLP_VERSION" ]; then \
     fi; \
   fi
 
-RUN groupadd --gid 10001 videoroll \
-  && useradd --uid 10001 --gid videoroll --create-home --shell /usr/sbin/nologin videoroll \
+ARG APP_UID=10001
+ARG APP_GID=10001
+# Ubuntu may already have the host's numeric UID/GID; keep our named account
+# while assigning the same IDs used by Compose and the mounted directories.
+RUN groupadd --non-unique --gid "$APP_GID" videoroll \
+  && useradd --non-unique --uid "$APP_UID" --gid videoroll --create-home --shell /usr/sbin/nologin videoroll \
   && install -d --owner=videoroll --group=videoroll --mode=0700 /models /secrets /storage /work
 
 RUN sed -i 's/\r$//' /app/docker/entrypoint.sh \

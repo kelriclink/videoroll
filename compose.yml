@@ -4,6 +4,8 @@ x-application-build: &application-build
   args:
     INSTALL_ASR: ${INSTALL_ASR:-1}
     YTDLP_VERSION: ${YTDLP_VERSION:-latest}
+    APP_UID: ${APP_UID:-10001}
+    APP_GID: ${APP_GID:-10001}
 
 x-application-security: &application-security
   user: "${APP_UID:-10001}:${APP_GID:-10001}"
@@ -34,6 +36,12 @@ x-subtitle-environment: &subtitle-environment
   SUBTITLE_WHISPER_DEVICE: ${SUBTITLE_WHISPER_DEVICE:-cpu}
   SUBTITLE_WHISPER_COMPUTE_TYPE: ${SUBTITLE_WHISPER_COMPUTE_TYPE:-int8}
   SUBTITLE_WHISPER_MODEL_DIR: ${SUBTITLE_WHISPER_MODEL_DIR:-/models/whisper}
+  SUBTITLE_WHISPER_CPU_THREADS: ${SUBTITLE_WHISPER_CPU_THREADS:-0}
+  SUBTITLE_WHISPER_NUM_WORKERS: ${SUBTITLE_WHISPER_NUM_WORKERS:-1}
+  SUBTITLE_LOCAL_ASR_MEMORY_MB: ${SUBTITLE_LOCAL_ASR_MEMORY_MB:-0}
+  SUBTITLE_MEMORY_RESERVE_MB: ${SUBTITLE_MEMORY_RESERVE_MB:-1536}
+  CELERY_SUB_MAX_MEMORY_MB: ${CELERY_SUB_MAX_MEMORY_MB:-1536}
+  CELERY_SUB_MAX_TASKS_PER_CHILD: ${CELERY_SUB_MAX_TASKS_PER_CHILD:-20}
   SUBTITLE_OPENVINO_MODEL: ${SUBTITLE_OPENVINO_MODEL:-}
   SUBTITLE_OPENVINO_DEVICE: ${SUBTITLE_OPENVINO_DEVICE:-GPU}
   SUBTITLE_OPENVINO_NUM_BEAMS: ${SUBTITLE_OPENVINO_NUM_BEAMS:-1}
@@ -85,13 +93,52 @@ services:
       retries: 10
     restart: unless-stopped
 
+  ffplayout:
+    build:
+      context: ./services/ffplayout
+      dockerfile: Dockerfile.videoroll
+      args:
+        APP_UID: ${APP_UID:-10001}
+        APP_GID: ${APP_GID:-10001}
+    image: videoroll-ffplayout:prod
+    user: "${APP_UID:-10001}:${APP_GID:-10001}"
+    init: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    command:
+      - ffplayout
+      - --listen
+      - 0.0.0.0:8787
+      - --db
+      - /var/lib/ffplayout/db/ffplayout.db
+      - --log-to-console
+    volumes:
+      - ./data/ffplayout/db:/var/lib/ffplayout/db
+      - ./data/ffplayout/logs:/var/lib/ffplayout/logs
+      - ./data/ffplayout/playlists:/var/lib/ffplayout/playlists
+      - ./data/ffplayout/public:/var/lib/ffplayout/public
+      - ${STORAGE_HOST_ROOT:-./data/storage}/playout-media:/var/lib/ffplayout/media
+    expose:
+      - "8787"
+    networks: [internal]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8787/api/setup >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
   egress-gateway:
     build:
       context: .
       dockerfile: Dockerfile
       args:
-        INSTALL_ASR: "0"
+        INSTALL_ASR: ${INSTALL_ASR:-1}
         YTDLP_VERSION: ${YTDLP_VERSION:-latest}
+        APP_UID: ${APP_UID:-10001}
+        APP_GID: ${APP_GID:-10001}
     image: videoroll-egress:prod
     <<: *application-security
     command: ["uvicorn", "videoroll.apps.egress_gateway.main:app", "--host", "0.0.0.0", "--port", "8020"]
@@ -116,13 +163,17 @@ services:
     environment:
       <<: *internal-environment
       DEPLOYMENT_ROLE: orchestrator
+      TRUSTED_PROXY_HOSTS: ${TRUSTED_PROXY_HOSTS:-web}
+      TRUSTED_PROXY_CIDRS: ${TRUSTED_PROXY_CIDRS:-}
       SUBTITLE_SERVICE_URL: http://subtitle-service:8001
       YOUTUBE_INGEST_URL: http://youtube-ingest:8002
       BILIBILI_PUBLISHER_URL: http://bilibili-publisher:8003
       SOCIAL_PUBLISHER_URL: http://social-publisher-api:8010
       WORK_DIR: ${WORK_DIR:-/storage/work/videoroll}
       FFMPEG_PATH: ${FFMPEG_PATH:-ffmpeg}
+      PLAYOUT_MEDIA_ROOT: ${PLAYOUT_MEDIA_ROOT:-/storage/playout-media}
       LIVE_INTERNAL_STREAM_BASE_URL: ${LIVE_INTERNAL_STREAM_BASE_URL:-http://127.0.0.1:8000}
+      LEGACY_LIVE_ENABLED: ${LEGACY_LIVE_ENABLED:-false}
       INTEL_GPU_RENDER_DEVICE: ${INTEL_GPU_RENDER_DEVICE:-/dev/dri/renderD128}
       YOUTUBE_USER_AGENT: "${YOUTUBE_USER_AGENT:-Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36}"
       YOUTUBE_COOKIE_FILE: ${YOUTUBE_COOKIE_FILE:-}
@@ -132,10 +183,6 @@ services:
     volumes:
       - ./data/secrets:/secrets
       - ${STORAGE_HOST_ROOT:-./data/storage}:/storage
-    devices:
-      - "/dev/dri:/dev/dri"
-    group_add:
-      - "${INTEL_GPU_RENDER_GID:-107}"
     depends_on:
       redis:
         condition: service_healthy
@@ -234,13 +281,39 @@ services:
     build: *application-build
     image: videoroll:prod
     <<: *application-security
-    command: ["sh", "-c", "celery -A videoroll.apps.subtitle_service.worker:celery_app worker -Q subtitle -l INFO --concurrency $$(CELERY_SUB_CONCURRENCY_FALLBACK=\"$${CELERY_SUB_CONCURRENCY_FALLBACK:-1}\" python -m videoroll.apps.subtitle_service.worker_concurrency)"]
+    command: ["sh", "-ec", "worker_concurrency=$$(python -m videoroll.apps.subtitle_service.worker_concurrency); exec celery -A videoroll.apps.subtitle_service.worker:celery_app worker -Q subtitle -l INFO --concurrency \"$$worker_concurrency\""]
     environment:
       <<: *subtitle-environment
       DEPLOYMENT_ROLE: subtitle-worker
       CELERY_SUB_CONCURRENCY_FALLBACK: ${CELERY_SUB_CONCURRENCY_FALLBACK:-1}
+      CELERY_SUB_CONCURRENCY_DB_ATTEMPTS: ${CELERY_SUB_CONCURRENCY_DB_ATTEMPTS:-60}
+      CELERY_SUB_CONCURRENCY_DB_DELAY_SECONDS: ${CELERY_SUB_CONCURRENCY_DB_DELAY_SECONDS:-2}
     volumes:
       - ./data/models:/models
+      - ./data/secrets:/secrets
+      - ${STORAGE_HOST_ROOT:-./data/storage}:/storage
+    depends_on:
+      redis:
+        condition: service_healthy
+      egress-gateway:
+        condition: service_healthy
+    networks: [internal]
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A videoroll.apps.subtitle_service.worker:celery_app inspect ping --timeout=3 --destination=celery@$${HOSTNAME} | grep -q pong"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    restart: unless-stopped
+
+  subtitle-control-worker:
+    build: *application-build
+    image: videoroll:prod
+    <<: *application-security
+    command: ["celery", "-A", "videoroll.apps.subtitle_service.worker:celery_app", "worker", "-Q", "subtitle-control", "-l", "INFO", "--concurrency", "1"]
+    environment:
+      <<: *subtitle-environment
+      DEPLOYMENT_ROLE: subtitle-control-worker
+    volumes:
       - ./data/secrets:/secrets
       - ${STORAGE_HOST_ROOT:-./data/storage}:/storage
     depends_on:
@@ -269,7 +342,7 @@ services:
     depends_on:
       redis:
         condition: service_healthy
-      subtitle-worker:
+      subtitle-control-worker:
         condition: service_healthy
       publish-worker:
         condition: service_healthy
@@ -310,6 +383,9 @@ services:
     build:
       context: .
       dockerfile: docker/social-publisher.Dockerfile
+      args:
+        APP_UID: ${APP_UID:-10001}
+        APP_GID: ${APP_GID:-10001}
     image: videoroll-social-publisher:prod
     <<: *application-security
     command: ["uvicorn", "videoroll.apps.social_publisher.main:app", "--host", "0.0.0.0", "--port", "8010"]
@@ -337,6 +413,9 @@ services:
     build:
       context: .
       dockerfile: docker/social-publisher.Dockerfile
+      args:
+        APP_UID: ${APP_UID:-10001}
+        APP_GID: ${APP_GID:-10001}
     image: videoroll-social-publisher:prod
     <<: *application-security
     command: ["celery", "-A", "videoroll.apps.social_publisher.worker:celery_app", "worker", "-Q", "social_publish", "-l", "INFO", "--concurrency", "${SOCIAL_PUBLISH_CONCURRENCY:-1}"]
@@ -364,6 +443,9 @@ services:
     build:
       context: .
       dockerfile: docker/social-publisher.Dockerfile
+      args:
+        APP_UID: ${APP_UID:-10001}
+        APP_GID: ${APP_GID:-10001}
     image: videoroll-social-publisher:prod
     <<: *application-security
     command: ["celery", "-A", "videoroll.apps.social_publisher.worker:celery_app", "beat", "-l", "INFO", "--schedule", "/tmp/social-celerybeat-schedule"]
@@ -391,7 +473,12 @@ services:
       context: ./src/web
       args:
         VITE_ORCHESTRATOR_URL: ${VITE_ORCHESTRATOR_URL:-}
+        VITE_FFPLAYOUT_URL: ${VITE_FFPLAYOUT_URL:-http://playout.localhost:3000}
     image: videoroll-web:prod
+    environment:
+      PLAYOUT_HOST: ${PLAYOUT_HOST:-playout.localhost}
+      VIDEOROLL_PUBLIC_ORIGIN: ${VIDEOROLL_PUBLIC_ORIGIN:-http://localhost:3000}
+      NGINX_ENVSUBST_FILTER: "PLAYOUT_HOST|VIDEOROLL_PUBLIC_ORIGIN"
     ports:
       - "${PUBLISH_ADDR:-127.0.0.1}:${WEB_PORT:-3000}:80"
     networks: [internal]

@@ -1,11 +1,34 @@
 .git
-.venv
-__pycache__
-*.py[cod]
+# Nested checkouts can contain cached configuration and local environments.
+**/.venv
+**/__pycache__
+**/*.py[cod]
 
 # Local data / scratch
 data
 tmp
+
+# The social image is built from this root, not the submodule directory.
+# Keep host login state and runtime artifacts out of every image layer.
+social-auto-upload/.git
+social-auto-upload/.env
+social-auto-upload/.env.*
+social-auto-upload/conf.py
+social-auto-upload/cookies
+social-auto-upload/cookiesFile
+social-auto-upload/logs
+social-auto-upload/db/*.db
+social-auto-upload/db/*.db-*
+social-auto-upload/uploadFile
+social-auto-upload/videoFile
+
+# ffplayout is built from its own Docker context and is never copied by the
+# main/social application images. Exclude the whole vendor tree here; its own
+# services/ffplayout/.dockerignore governs the dedicated ffplayout build.
+services/ffplayout
+
+# Local alternate SAU checkout; production uses the social-auto-upload path.
+social-auto-upload-kelric
 
 # Frontend lives under src/ but isn't needed for backend image builds
 src/web

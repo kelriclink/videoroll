@@ -58,6 +58,23 @@ class AssetRead(BaseModel):
         from_attributes = True
 
 
+class PlayoutAssetLinkRead(BaseModel):
+    id: uuid.UUID
+    status: Literal["ready"] = "ready"
+    task_id: uuid.UUID
+    asset_id: uuid.UUID
+    ffplayout_channel_id: int
+    playout_path: str
+    relative_media_path: str
+    transfer_mode: Literal["hardlink", "copy"]
+    source_checksum: str
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
 class AdminAuthStatusRead(BaseModel):
     password_set: bool
     trusted: bool

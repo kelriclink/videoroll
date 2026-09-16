@@ -12,6 +12,7 @@ type TaskQueueItem = {
   render_job_id?: string | null;
   progress: number;
   error_message?: string | null;
+  waiting_reason?: string | null;
   created_at: string;
   updated_at: string;
 };
@@ -21,6 +22,13 @@ type TaskQueue = {
   running_count: number;
   queued_count: number;
   tasks: TaskQueueItem[];
+  admission?: {
+    effective_max_concurrency: number;
+    available_memory_mb: number | null;
+    reserve_memory_mb: number;
+    local_asr_memory_mb: number;
+    waiting_reason?: string | null;
+  } | null;
 };
 
 type TaskQueueSettingsSaveResponse = {
@@ -119,6 +127,12 @@ export default function RenderQueuePage() {
     refreshTimerRef.current = undefined;
   }, []);
 
+  useEffect(() => {
+    // Resource availability can change without any job event.
+    const timer = window.setInterval(() => { void refresh(); }, 10000);
+    return () => window.clearInterval(timer);
+  }, [refresh]);
+
   async function saveMaxConcurrency() {
     setBusy(true);
     setError(null);
@@ -190,6 +204,18 @@ export default function RenderQueuePage() {
         <div className="mt-3 text-xs text-slate-600">
           running: {queue?.running_count ?? 0} · queued: {queue?.queued_count ?? 0}
         </div>
+        {queue?.admission ? (
+          <div className="mt-2 space-y-1 text-xs text-slate-600">
+            <div>
+              已保存上限：{queue.settings.max_concurrency} · 当前内存允许并发：{queue.admission.effective_max_concurrency}
+            </div>
+            <div>
+              本地 ASR 每任务预算：{queue.admission.local_asr_memory_mb} MiB · 预留内存：{queue.admission.reserve_memory_mb} MiB。
+              内存不足时任务继续排队，已运行任务继续完成；worker 启动前也会检查执行容器的可用内存。
+            </div>
+            {queue.admission.waiting_reason ? <div className="text-amber-700">{queue.admission.waiting_reason}</div> : null}
+          </div>
+        ) : null}
       </div>
 
       <div className="rounded border bg-white p-4">
@@ -209,7 +235,7 @@ export default function RenderQueuePage() {
                   <th className="py-2 pr-3">Subtitle Job</th>
                   <th className="py-2 pr-3">Render Job</th>
                   <th className="py-2 pr-3">Updated</th>
-                  <th className="py-2 pr-3">Error</th>
+                  <th className="py-2 pr-3">等待原因 / Error</th>
                 </tr>
               </thead>
               <tbody>
@@ -227,12 +253,15 @@ export default function RenderQueuePage() {
                     <td className="py-2 pr-3 font-mono text-xs">{t.render_job_id ? t.render_job_id.slice(0, 8) : "-"}</td>
                     <td className="py-2 pr-3 text-xs text-slate-600">{new Date(t.updated_at).toLocaleString()}</td>
                     <td className="py-2 pr-3">
+                      {t.waiting_reason ? (
+                        <div className="max-w-[36rem] text-xs text-amber-700">{t.waiting_reason}</div>
+                      ) : null}
                       {t.error_message ? (
                         <div className="max-w-[36rem] truncate text-xs text-rose-700" title={t.error_message}>
                           {t.error_message}
                         </div>
                       ) : (
-                        <span className="text-xs text-slate-400">-</span>
+                        t.waiting_reason ? null : <span className="text-xs text-slate-400">-</span>
                       )}
                     </td>
                   </tr>

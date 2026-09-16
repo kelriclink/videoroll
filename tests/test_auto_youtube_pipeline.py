@@ -75,6 +75,8 @@ class AutoYouTubePipelineTests(unittest.TestCase):
     def test_build_after_render_publish_action_persists_meta_and_returns_payload(self) -> None:
         task_id = uuid.uuid4()
         store = _FakeStore()
+        db = MagicMock()
+        db.get.return_value = None
         profile = {
             "auto_publish": True,
             "auto_publish_platforms": ["bilibili", "douyin"],
@@ -95,7 +97,7 @@ class AutoYouTubePipelineTests(unittest.TestCase):
                 yt_title="Source Title",
                 yt_desc="Source Description",
                 webpage_url="https://www.youtube.com/watch?v=demo",
-                db=object(),  # type: ignore[arg-type]
+                db=db,
                 store=store,  # type: ignore[arg-type]
             )
 

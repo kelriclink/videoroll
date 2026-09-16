@@ -140,6 +140,15 @@ def enqueue_subtitle_service_job_request(
             response.raise_for_status()
             data = response.json()
     except httpx.HTTPError as exc:
+        if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code == 409:
+            detail = "task no longer accepts subtitle work"
+            try:
+                error = exc.response.json()
+                if isinstance(error, dict) and isinstance(error.get("detail"), str):
+                    detail = error["detail"][:2000]
+            except ValueError:
+                pass
+            raise HTTPException(status_code=409, detail=detail) from exc
         raise HTTPException(status_code=502, detail=f"subtitle-service request failed: {exc}") from exc
     return RemoteJobResponse(job_id=uuid.UUID(data["job_id"]), status=str(data.get("status", "queued")))
 
@@ -250,6 +259,8 @@ def enqueue_subtitle_job(
         raise HTTPException(status_code=404, detail="task not found")
     if task.status == TaskStatus.canceled:
         raise HTTPException(status_code=409, detail="task is stopped; resume it before submitting subtitle work")
+    if task.status == TaskStatus.published:
+        raise HTTPException(status_code=409, detail="task is already published; create a new task to generate subtitles")
     in_flight = (
         db.query(SubtitleJob)
         .filter(
@@ -301,6 +312,8 @@ def resume_subtitle_job(
         raise HTTPException(status_code=404, detail="task not found")
     if task.status == TaskStatus.canceled:
         raise HTTPException(status_code=409, detail="task is stopped; resume it before continuing subtitle work")
+    if task.status == TaskStatus.published:
+        raise HTTPException(status_code=409, detail="task is already published; create a new task to generate subtitles")
     in_flight = (
         db.query(SubtitleJob)
         .filter(

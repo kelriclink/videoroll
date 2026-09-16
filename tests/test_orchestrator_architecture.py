@@ -32,6 +32,7 @@ EXPECTED_ORCHESTRATOR_ROUTES: set[tuple[str, str]] = {
     ("GET", "/bilibili/{service_path:path}"),
     ("GET", "/health"),
     ("GET", "/live"),
+    ("GET", "/live/legacy-status"),
     ("GET", "/live/media/{media_id}/stream"),
     ("GET", "/live/preview/{file_name}"),
     ("GET", "/live/settings"),
@@ -49,6 +50,7 @@ EXPECTED_ORCHESTRATOR_ROUTES: set[tuple[str, str]] = {
     ("GET", "/tasks/{task_id}/assets"),
     ("GET", "/tasks/{task_id}/assets/{asset_id}/download"),
     ("GET", "/tasks/{task_id}/assets/{asset_id}/stream"),
+    ("GET", "/tasks/{task_id}/playout-assets"),
     ("GET", "/tasks/{task_id}/publish_batches"),
     ("GET", "/tasks/{task_id}/publish_jobs"),
     ("GET", "/tasks/{task_id}/publish_meta"),
@@ -100,6 +102,7 @@ EXPECTED_ORCHESTRATOR_ROUTES: set[tuple[str, str]] = {
     ("POST", "/tasks/{task_id}/publish_meta/draft"),
     ("POST", "/tasks/{task_id}/upload/cover"),
     ("POST", "/tasks/{task_id}/upload/video"),
+    ("POST", "/tasks/{task_id}/assets/{asset_id}/playout"),
     ("PUT", "/settings/api"),
     ("PUT", "/live/playlist"),
     ("PUT", "/live/settings"),
@@ -198,6 +201,7 @@ class OrchestratorArchitectureTests(unittest.TestCase):
         owners = {route.path: route.endpoint.__module__ for route in application_routes(app) if hasattr(route, "endpoint")}
 
         self.assertEqual(owners["/tasks/{task_id}/upload/video"], "videoroll.apps.orchestrator_api.routers.assets")
+        self.assertEqual(owners["/tasks/{task_id}/assets/{asset_id}/playout"], "videoroll.apps.orchestrator_api.routers.assets")
 
     def test_publishing_routes_are_owned_by_publishing_router(self) -> None:
         owners = {route.path: route.endpoint.__module__ for route in application_routes(app) if hasattr(route, "endpoint")}

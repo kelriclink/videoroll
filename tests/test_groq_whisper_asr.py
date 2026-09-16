@@ -5,6 +5,8 @@ import json
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from videoroll.apps.subtitle_service import processing
 from videoroll.apps.subtitle_service.asr_settings_store import get_asr_settings
 
@@ -124,6 +126,178 @@ def test_groq_whisper_chunks_large_wav_and_offsets_results(tmp_path) -> None:
     # the first chunk's end.
     assert segments[1].start == 40.5
     assert segments[2].start == 80.5
+
+
+def test_groq_overlap_stitches_continuing_sentence_before_translation() -> None:
+    segments = processing._merge_groq_segments(
+        [
+            (
+                0.0,
+                [processing.Segment(start=39.0, end=44.0, text="The best way of making it square")],
+            ),
+            (
+                40.0,
+                [
+                    processing.Segment(
+                        start=0.5,
+                        end=6.0,
+                        text="making it square is to calculate the diagonal length",
+                    )
+                ],
+            ),
+        ]
+    )
+
+    assert segments == [
+        processing.Segment(
+            start=39.0,
+            end=46.0,
+            text="The best way of making it square is to calculate the diagonal length",
+        )
+    ]
+
+
+def test_groq_overlap_uses_more_complete_near_duplicate() -> None:
+    segments = processing._merge_groq_segments(
+        [
+            (0.0, [processing.Segment(start=40.0, end=44.0, text="then we install the panel")]),
+            (
+                40.0,
+                [
+                    processing.Segment(
+                        start=0.2,
+                        end=5.3,
+                        text="and then we install the panels here",
+                    )
+                ],
+            ),
+        ]
+    )
+
+    assert segments == [
+        processing.Segment(
+            start=40.0,
+            end=45.3,
+            text="and then we install the panels here",
+        )
+    ]
+
+
+def test_groq_overlap_reconciles_one_segment_against_multiple_previous_segments() -> None:
+    segments = processing._merge_groq_segments(
+        [
+            (
+                0.0,
+                [
+                    processing.Segment(start=39.0, end=41.0, text="the best way"),
+                    processing.Segment(start=41.0, end=44.0, text="is to calculate the diagonal"),
+                ],
+            ),
+            (
+                40.0,
+                [
+                    processing.Segment(
+                        start=0.2,
+                        end=5.5,
+                        text="the best way is to calculate the diagonal length",
+                    )
+                ],
+            ),
+        ]
+    )
+
+    assert segments == [
+        processing.Segment(
+            start=39.0,
+            end=45.5,
+            text="the best way is to calculate the diagonal length",
+        )
+    ]
+
+
+def test_asr_overlap_clips_unrelated_text_instead_of_dropping_it() -> None:
+    segments = processing.reconcile_overlapping_asr_segments(
+        [
+            processing.Segment(start=10.0, end=12.0, text="first unrelated sentence"),
+            processing.Segment(start=11.8, end=13.0, text="second different caption"),
+        ]
+    )
+
+    assert segments == [
+        processing.Segment(start=10.0, end=11.8, text="first unrelated sentence"),
+        processing.Segment(start=11.8, end=13.0, text="second different caption"),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("first", "second"),
+    [
+        ("Turn the valve on", "Turn the valve off"),
+        ("The answer is yes", "The answer is no"),
+        ("yes", "yes"),
+    ],
+)
+def test_asr_edge_overlap_preserves_each_spoken_caption(first: str, second: str) -> None:
+    segments = processing.reconcile_overlapping_asr_segments(
+        [
+            processing.Segment(start=10.0, end=12.0, text=first),
+            processing.Segment(start=11.99, end=14.0, text=second),
+        ]
+    )
+
+    assert segments == [
+        processing.Segment(start=10.0, end=11.99, text=first),
+        processing.Segment(start=11.99, end=14.0, text=second),
+    ]
+
+
+def test_asr_adjacent_repetitions_remain_separate() -> None:
+    segments = [
+        processing.Segment(start=10.0, end=12.0, text="yes"),
+        processing.Segment(start=12.0, end=14.0, text="yes"),
+    ]
+
+    assert processing.reconcile_overlapping_asr_segments(segments) == segments
+
+
+@pytest.mark.parametrize("duration", [0.20, 0.08])
+def test_groq_full_overlap_deduplicates_short_captions(duration: float) -> None:
+    segments = processing._merge_groq_segments(
+        [
+            (0.0, [processing.Segment(start=40.0, end=40.0 + duration, text="yes")]),
+            (40.0, [processing.Segment(start=0.0, end=duration, text="yes")]),
+        ]
+    )
+
+    assert segments == [processing.Segment(start=40.0, end=40.0 + duration, text="yes")]
+
+
+def test_asr_substantial_unrelated_overlap_preserves_both_texts_in_one_caption() -> None:
+    segments = processing.reconcile_overlapping_asr_segments(
+        [
+            processing.Segment(start=10.0, end=15.0, text="main speaker continues talking"),
+            processing.Segment(start=11.0, end=12.0, text="short audience response"),
+        ]
+    )
+
+    assert segments == [
+        processing.Segment(
+            start=10.0,
+            end=15.0,
+            text="main speaker continues talking short audience response",
+        )
+    ]
+
+
+def test_asr_repeated_text_without_time_overlap_remains_separate() -> None:
+    segments = processing.reconcile_overlapping_asr_segments(
+        [
+            processing.Segment(start=1.0, end=2.0, text="yes"),
+            processing.Segment(start=2.5, end=3.0, text="yes"),
+        ]
+    )
+
+    assert len(segments) == 2
 
 
 def test_groq_whisper_retries_transient_disconnect(tmp_path) -> None:

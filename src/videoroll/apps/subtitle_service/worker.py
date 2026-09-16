@@ -24,8 +24,7 @@ from sqlalchemy.orm import Session
 from videoroll.ai.client import openai_chat_config_from_settings
 from videoroll.ai.service import AIService, translate_title_openai
 from videoroll.config import get_orchestrator_settings, get_subtitle_settings
-from videoroll.db.base import Base
-from videoroll.db.auto_migrate import auto_migrate
+from videoroll.db.migrate import initialize_database
 from videoroll.db.models import (
     AppSetting,
     Asset,
@@ -43,7 +42,7 @@ from videoroll.db.models import (
     Task,
     TaskStatus,
 )
-from videoroll.db.session import get_engine, get_sessionmaker
+from videoroll.db.session import get_sessionmaker
 from videoroll.realtime import publish_log_updated, publish_queue_changed
 from videoroll.storage.filesystem import FileStore
 from videoroll.apps.security.service_auth import INTERNAL_TOKEN_HEADER, service_token
@@ -56,6 +55,7 @@ from videoroll.apps.subtitle_service.processing import (
     extract_audio,
     mux_soft_sub,
     probe_video_resolution,
+    reconcile_overlapping_asr_segments,
     render_burn_in,
     srt_to_segments,
     segments_from_json_data,
@@ -74,6 +74,12 @@ from videoroll.apps.subtitle_service.processing import (
 )
 from videoroll.apps.subtitle_service.asr_settings_store import get_asr_settings
 from videoroll.apps.subtitle_service.auto_profile_store import get_auto_profile
+from videoroll.apps.subtitle_service.memory_policy import (
+    MemoryAdmission,
+    load_memory_admission,
+    local_asr_budget_mb,
+    set_memory_wait_reason,
+)
 from videoroll.apps.subtitle_service.bilibili_tags_store import get_task_bilibili_summary, set_task_bilibili_tags
 from videoroll.apps.subtitle_service.model_downloads import (
     default_model_dir_name,
@@ -108,9 +114,11 @@ from videoroll.apps.orchestrator_api.youtube_downloader import (
     pick_preferred_youtube_subtitle,
 )
 from videoroll.apps.subtitle_service.render_queue_store import TASK_QUEUE_SETTINGS_KEY, get_task_queue_settings
+from videoroll.apps.subtitle_service.queues import SUBTITLE_CONTROL_QUEUE, SUBTITLE_WORK_QUEUE
 from videoroll.apps.subtitle_service.worker_concurrency import (
     JobLeaseHeartbeat,
     acquire_job_lease,
+    live_leased_task_ids,
     recover_expired_leases,
     release_job_lease,
 )
@@ -158,30 +166,37 @@ celery_app.conf.update(
     accept_content=["json"],
     timezone="UTC",
     enable_utc=True,
+    # Subtitle/render tasks are long-lived. Reserving four tasks per process
+    # makes one worker hoard dozens of jobs and amplifies restart recovery.
+    worker_prefetch_multiplier=1,
+    # Celery recycles the child only AFTER its current task returns. This
+    # releases cached native models/allocators without killing running work.
+    worker_max_memory_per_child=settings.celery_sub_max_memory_mb * 1024,
+    worker_max_tasks_per_child=settings.celery_sub_max_tasks_per_child,
     beat_schedule={
         "subtitle-service-task-queue-tick": {
             "task": "subtitle_service.task_queue_tick",
             "schedule": _TASK_QUEUE_TICK_INTERVAL_SECONDS,
             "args": (),
-            "options": {"queue": "subtitle"},
+            "options": {"queue": SUBTITLE_CONTROL_QUEUE},
         },
         "subtitle-service-publish-cleanup-retry": {
             "task": "subtitle_service.enqueue_pending_publish_batch_cleanups",
             "schedule": 60.0,
             "args": (),
-            "options": {"queue": "subtitle"},
+            "options": {"queue": SUBTITLE_CONTROL_QUEUE},
         },
         "subtitle-service-outbox-dispatch": {
             "task": "subtitle_service.dispatch_outbox",
             "schedule": 5.0,
             "args": (),
-            "options": {"queue": "subtitle"},
+            "options": {"queue": SUBTITLE_CONTROL_QUEUE},
         },
         "subtitle-service-publish-dispatch-recovery": {
             "task": "subtitle_service.recover_publish_dispatches",
             "schedule": 30.0,
             "args": (),
-            "options": {"queue": "subtitle"},
+            "options": {"queue": SUBTITLE_CONTROL_QUEUE},
         },
     },
 )
@@ -285,9 +300,7 @@ def _ensure_db() -> None:
     with _DB_READY_LOCK:
         if _DB_READY_PID == pid:
             return
-        engine = get_engine(settings.database_url)
-        Base.metadata.create_all(engine)
-        auto_migrate(settings.database_url)
+        initialize_database(settings.database_url)
         _DB_READY_PID = pid
 
 
@@ -301,6 +314,8 @@ _TASK_QUEUE_LOCK_TTL = timedelta(seconds=300)
 _TASK_QUEUE_HEARTBEAT_INTERVAL_SECONDS = 30.0
 _TASK_QUEUE_REQUEUE_COUNTDOWN_SECONDS = 10
 _JOB_LEASE_TTL_SECONDS = 900
+_JOB_DISPATCH_PROGRESS = 1
+_JOB_DISPATCH_RETRY_AFTER = timedelta(seconds=60)
 
 
 def _task_queue_expires_at(now: datetime) -> datetime:
@@ -314,6 +329,58 @@ def _task_queue_is_task_locked(task: Task, now: datetime) -> bool:
 def _task_queue_unlock(task: Task) -> None:
     task.lock_owner = None
     task.lock_until = None
+
+
+def _kick_task_queue(*, countdown: int | None = None) -> None:
+    options: dict[str, Any] = {"queue": SUBTITLE_CONTROL_QUEUE}
+    if countdown is not None:
+        options["countdown"] = countdown
+    celery_app.send_task("subtitle_service.task_queue_tick", args=[], **options)
+
+
+def _queued_job_dispatch_due(job: SubtitleJob | RenderJob, now: datetime) -> bool:
+    if int(job.progress or 0) != _JOB_DISPATCH_PROGRESS:
+        return True
+    updated_at = job.updated_at
+    if updated_at is None:
+        return True
+    if updated_at.tzinfo is None:
+        updated_at = updated_at.replace(tzinfo=timezone.utc)
+    return updated_at <= now - _JOB_DISPATCH_RETRY_AFTER
+
+
+def _mark_queued_job_dispatched(job: SubtitleJob | RenderJob) -> None:
+    job.progress = _JOB_DISPATCH_PROGRESS
+    # A retry already has progress=1, so SQLAlchemy's onupdate would otherwise
+    # see no change and leave the previous dispatch timestamp in place.
+    job.updated_at = _now()
+
+
+def _memory_admission(db: Session, now: datetime, *, scope: str = "scheduler") -> MemoryAdmission:
+    return load_memory_admission(
+        db, settings, now=now, task_lock_owner=TASK_QUEUE_LOCK_OWNER,
+        dispatched_progress=_JOB_DISPATCH_PROGRESS, scope=scope,
+    )
+
+
+def _reserve_subtitle_memory(admission: MemoryAdmission, job: SubtitleJob) -> str | None:
+    reason = admission.reserve(job.task_id, admission.budget_for(job))
+    set_memory_wait_reason(job, reason)
+    if reason:
+        # Only unclaimed queued work can lose a reservation. A broker delivery
+        # racing this update must pass the worker's transaction-protected check.
+        job.progress = 0
+        admission.reservations.pop(job.task_id, None)
+    return reason
+
+
+def _asr_cpu_threads(db: Session) -> int:
+    configured = get_task_queue_settings(db)
+    concurrency = max(1, min(32, int(configured.get("max_concurrency", 1))))
+    model_workers = max(1, int(settings.whisper_num_workers))
+    shared_budget = max(1, (process_cpu_count() or 1) // (concurrency * model_workers))
+    requested = int(settings.whisper_cpu_threads)
+    return min(requested, shared_budget) if requested > 0 else shared_budget
 
 
 class _TaskStopped(Exception):
@@ -351,7 +418,7 @@ def _pause_subtitle_job_if_task_stopped(db: Session, job_id: uuid.UUID) -> bool:
         _task_queue_unlock(task)
         db.add(task)
     db.commit()
-    celery_app.send_task("subtitle_service.task_queue_tick", args=[], queue="subtitle")
+    _kick_task_queue()
     return True
 
 
@@ -375,7 +442,7 @@ def _pause_render_job_if_task_stopped(db: Session, job_id: uuid.UUID) -> bool:
         _task_queue_unlock(task)
         db.add(task)
     db.commit()
-    celery_app.send_task("subtitle_service.task_queue_tick", args=[], queue="subtitle")
+    _kick_task_queue()
     return True
 
 
@@ -436,6 +503,8 @@ def _build_after_render_publish_action(
 def _task_queue_join_message(message: str | None, detail: str, *, limit: int = 2000) -> str:
     head = str(message or "").strip()
     tail = str(detail or "").strip()
+    if tail and tail in {line.strip() for line in head.splitlines()}:
+        return head[-limit:]
     if head and tail:
         out = f"{head}\n{tail}"
     else:
@@ -473,6 +542,57 @@ def _task_has_queued_or_running_jobs(db: Session, task_id: uuid.UUID) -> bool:
         .count()
     )
     return bool(int(render_jobs or 0) > 0)
+
+
+def _cancel_unclaimable_render_job(db: Session, job: RenderJob, task: Task, now: datetime) -> str | None:
+    """Cancel terminal-task renders and duplicate active renders before FFmpeg starts."""
+    if task.status == TaskStatus.published:
+        job.status = RenderJobStatus.canceled
+        job.progress = 0
+        job.finished_at = now
+        job.lease_owner = None
+        job.lease_until = None
+        job.heartbeat_at = now
+        job.error_message = _task_queue_join_message(
+            job.error_message,
+            "Task is already published; stale render job canceled.",
+        )
+        if task.lock_owner == TASK_QUEUE_LOCK_OWNER:
+            _task_queue_unlock(task)
+        db.add(job)
+        db.add(task)
+        return "task already published"
+
+    active_jobs = (
+        db.query(RenderJob)
+        .filter(
+            RenderJob.task_id == task.id,
+            RenderJob.status.in_([RenderJobStatus.queued, RenderJobStatus.running]),
+        )
+        .order_by(RenderJob.created_at.asc(), RenderJob.id.asc())
+        .all()
+    )
+    live_jobs = [
+        active
+        for active in active_jobs
+        if active.status == RenderJobStatus.running and active.lease_until is not None and active.lease_until > now
+    ]
+    canonical = live_jobs[0] if live_jobs else (active_jobs[0] if active_jobs else None)
+    if canonical is None or canonical.id == job.id:
+        return None
+
+    job.status = RenderJobStatus.canceled
+    job.progress = 0
+    job.finished_at = now
+    job.lease_owner = None
+    job.lease_until = None
+    job.heartbeat_at = now
+    job.error_message = _task_queue_join_message(
+        job.error_message,
+        f"Duplicate render job canceled; active render job is {canonical.id}.",
+    )
+    db.add(job)
+    return f"superseded by render job {canonical.id}"
 
 
 class _TaskQueueHeartbeat:
@@ -868,7 +988,7 @@ def _on_worker_init(**_kwargs: Any) -> None:
     _orchestrator_internal_headers()
     try:
         _ensure_db()
-        celery_app.send_task("subtitle_service.task_queue_tick", args=[], queue="subtitle")
+        _kick_task_queue()
     except Exception:
         logger.exception("subtitle worker initialization failed")
 
@@ -904,24 +1024,52 @@ def process_job(self: Any, job_id: str) -> dict[str, str]:
             db.add(job)
             db.commit()
             return {"status": "error", "detail": "task not found"}
+        if task.status == TaskStatus.published:
+            job.status = SubtitleJobStatus.failed
+            job.error_message = _task_queue_join_message(
+                job.error_message,
+                "Task is already published; stale subtitle job skipped.",
+            )
+            if task.lock_owner == TASK_QUEUE_LOCK_OWNER:
+                _task_queue_unlock(task)
+            db.add(job)
+            db.add(task)
+            db.commit()
+            return {"status": "skipped", "detail": "task already published"}
         if _pause_subtitle_job_if_task_stopped(db, jid):
             return {"status": "stopped", "detail": "task stopped by user"}
 
         now = _now()
-        if job.status == SubtitleJobStatus.running and job.lease_until is not None and job.lease_until > now:
-            return {"status": "in_progress", "detail": "job has a live worker lease"}
+        if job.status == SubtitleJobStatus.running:
+            return {"status": "in_progress", "detail": "running job awaits completion or lease recovery"}
+        # Serialize worker admission with dispatch, including duplicate broker
+        # deliveries and models whose settings changed after the dispatch tick.
+        _task_queue_lock_settings_row(db)
+        db.refresh(job)
+        db.refresh(task)
+        if job.status != SubtitleJobStatus.queued:
+            return {"status": "in_progress", "detail": "job was already claimed or completed"}
         if task.lock_owner != TASK_QUEUE_LOCK_OWNER:
             # Do not rewrite an existing running row here.  Only the lease
             # recovery scheduler may decide that a worker is dead.
             if job.status == SubtitleJobStatus.running:
                 return {"status": "in_progress", "detail": "running job awaits lease recovery"}
-            celery_app.send_task(
-                "subtitle_service.task_queue_tick",
-                args=[],
-                queue="subtitle",
-                countdown=_TASK_QUEUE_REQUEUE_COUNTDOWN_SECONDS,
-            )
+            _kick_task_queue(countdown=_TASK_QUEUE_REQUEUE_COUNTDOWN_SECONDS)
             return {"status": "queued", "detail": "waiting for task queue"}
+        admission = _memory_admission(db, now, scope="worker")
+        memory_reason = _reserve_subtitle_memory(admission, job)
+        if memory_reason:
+            _task_queue_unlock(task)
+            db.add(job)
+            db.add(task)
+            db.commit()
+            # A periodic tick retries queued work even if Redis is unavailable
+            # now. Broker failure must not turn memory waiting into job failure.
+            try:
+                _kick_task_queue(countdown=_TASK_QUEUE_REQUEUE_COUNTDOWN_SECONDS)
+            except Exception:
+                logger.warning("task queue wakeup failed while waiting for memory", exc_info=True)
+            return {"status": "queued", "detail": memory_reason}
         if task.lock_until is None or task.lock_until <= now:
             task.lock_until = _task_queue_expires_at(now)
             db.add(task)
@@ -1284,7 +1432,7 @@ def process_job(self: Any, job_id: str) -> dict[str, str]:
                 db.commit()
                 _safe_append_log_line(log_path, "subtitle job done (no render configured)")
                 _safe_upload_log(store, log_path, log_key)
-                celery_app.send_task("subtitle_service.task_queue_tick", args=[], queue="subtitle")
+                _kick_task_queue()
                 return {"status": "ok"}
 
             after_render = req.get("after_render") if isinstance(req, dict) else None
@@ -1324,7 +1472,7 @@ def process_job(self: Any, job_id: str) -> dict[str, str]:
             db.commit()
             _safe_append_log_line(log_path, "render queued; waiting for task queue")
             _safe_upload_log(store, log_path, log_key)
-            celery_app.send_task("subtitle_service.task_queue_tick", args=[], queue="subtitle")
+            _kick_task_queue()
             return {"status": "ok", "detail": "render queued"}
 
         segments: list[Segment] | None = None
@@ -1420,9 +1568,7 @@ def process_job(self: Any, job_id: str) -> dict[str, str]:
                 _safe_append_log_line(log_path, f"asr: engine=faster-whisper model={model_name} language={language}")
                 proxy = str(asr_defaults.get("model_download_proxy") or "").strip() or None
                 model_name = _resolve_faster_whisper_model(model_name, Path(settings.whisper_model_dir), proxy=proxy)
-                cpu_threads_cfg = int(getattr(settings, "whisper_cpu_threads", 0) or 0)
-                if cpu_threads_cfg <= 0:
-                    cpu_threads_cfg = process_cpu_count() or 4
+                cpu_threads_cfg = _asr_cpu_threads(db)
                 num_workers_cfg = int(getattr(settings, "whisper_num_workers", 1) or 1)
                 if num_workers_cfg <= 0:
                     num_workers_cfg = 1
@@ -1525,6 +1671,19 @@ def process_job(self: Any, job_id: str) -> dict[str, str]:
                 )
             else:
                 raise ValueError(f"unsupported ASR engine: {engine}")
+            raw_asr_segments = sorted(segments, key=lambda item: (item.start, item.end, item.text))
+            overlap_count = sum(
+                1
+                for previous, current in zip(raw_asr_segments, raw_asr_segments[1:])
+                if current.start < previous.end
+            )
+            segments = reconcile_overlapping_asr_segments(raw_asr_segments)
+            if overlap_count or len(segments) != len(raw_asr_segments):
+                _safe_append_log_line(
+                    log_path,
+                    "asr timeline reconciled before translation: "
+                    f"overlaps={overlap_count} segments={len(raw_asr_segments)}->{len(segments)}",
+                )
             _store_source_segments(segments, source_label="asr done")
 
         job.progress = 60
@@ -1984,7 +2143,7 @@ def process_job(self: Any, job_id: str) -> dict[str, str]:
             db.commit()
             _safe_append_log_line(log_path, "subtitle job done (no render configured)")
             _safe_upload_log(store, log_path, log_key)
-            celery_app.send_task("subtitle_service.task_queue_tick", args=[], queue="subtitle")
+            _kick_task_queue()
             return {"status": "ok"}
 
         after_render = req.get("after_render") if isinstance(req, dict) else None
@@ -2024,7 +2183,7 @@ def process_job(self: Any, job_id: str) -> dict[str, str]:
         db.commit()
         _safe_append_log_line(log_path, "render queued; waiting for task queue")
         _safe_upload_log(store, log_path, log_key)
-        celery_app.send_task("subtitle_service.task_queue_tick", args=[], queue="subtitle")
+        _kick_task_queue()
         return {"status": "ok", "detail": "render queued"}
     except _TaskStopped:
         _pause_subtitle_job_if_task_stopped(db, jid)
@@ -2055,7 +2214,7 @@ def process_job(self: Any, job_id: str) -> dict[str, str]:
         _safe_append_log_line(log_path, f"ERROR: {type(e).__name__}: {e}")
         _safe_append_log_block(log_path, traceback.format_exc())
         _safe_upload_log(store, log_path, log_key)
-        celery_app.send_task("subtitle_service.task_queue_tick", args=[], queue="subtitle")
+        _kick_task_queue()
         return {"status": "error", "detail": str(e)}
     finally:
         if job_hb is not None:
@@ -2110,6 +2269,7 @@ def task_queue_tick() -> dict[str, Any]:
         recovery = recover_expired_leases(db, now=now, limit=100)
         recovered_subtitle = recovery.subtitle_requeued
         recovered_render = recovery.render_requeued
+        live_job_task_ids = live_leased_task_ids(db, now)
         if max_conc == 0:
             db.commit()
             return {
@@ -2131,11 +2291,14 @@ def task_queue_tick() -> dict[str, Any]:
             unlocked_expired = 0
 
         # A stop request clears the lock in the orchestrator, but this also
-        # repairs locks left by an older deployment or an in-flight tick.
+        # repairs terminal-task locks left by an older deployment or tick.
         try:
             unlocked_expired += int(
                 db.query(Task)
-                .filter(Task.status == TaskStatus.canceled, Task.lock_owner == TASK_QUEUE_LOCK_OWNER)
+                .filter(
+                    Task.status.in_([TaskStatus.canceled, TaskStatus.published]),
+                    Task.lock_owner == TASK_QUEUE_LOCK_OWNER,
+                )
                 .update({"lock_owner": None, "lock_until": None}, synchronize_session=False)
                 or 0
             )
@@ -2147,11 +2310,14 @@ def task_queue_tick() -> dict[str, Any]:
             Task.lock_until.is_(None),
             Task.lock_until <= now,
         )
+        schedulable_unlocked = unlocked
+        if live_job_task_ids:
+            schedulable_unlocked = unlocked & Task.id.notin_(live_job_task_ids)
 
         locked_tasks = (
             db.query(Task)
             .filter(
-                Task.status != TaskStatus.canceled,
+                Task.status.notin_([TaskStatus.canceled, TaskStatus.published]),
                 Task.lock_owner == TASK_QUEUE_LOCK_OWNER,
                 Task.lock_until.is_not(None),
                 Task.lock_until > now,
@@ -2159,6 +2325,9 @@ def task_queue_tick() -> dict[str, Any]:
             .order_by(Task.lock_until.asc())
             .all()
         )
+        admission = _memory_admission(db, now)
+        memory_waiting = 0
+        dispatch_retry_cutoff = now - _JOB_DISPATCH_RETRY_AFTER
 
         # Phase 1: advance locked tasks (start their next queued job if nothing is running).
         for t in locked_tasks:
@@ -2178,8 +2347,11 @@ def task_queue_tick() -> dict[str, Any]:
                 .first()
             )
             if rj:
-                to_start.append(("render", str(rj.id)))
-                started_render += 1
+                if _queued_job_dispatch_due(rj, now):
+                    _mark_queued_job_dispatched(rj)
+                    db.add(rj)
+                    to_start.append(("render", str(rj.id)))
+                    started_render += 1
                 continue
 
             sj = (
@@ -2189,26 +2361,37 @@ def task_queue_tick() -> dict[str, Any]:
                 .with_for_update(skip_locked=True)
                 .first()
             )
-            if sj:
+            if sj and _queued_job_dispatch_due(sj, now):
+                if _reserve_subtitle_memory(admission, sj):
+                    db.add(sj)
+                    memory_waiting += 1
+                    continue
+                _mark_queued_job_dispatched(sj)
+                db.add(sj)
                 to_start.append(("subtitle", str(sj.id)))
                 started_subtitle += 1
 
         # Phase 2: lock and start new tasks up to max_concurrency.
-        running_tasks = len(locked_tasks)
+        running_tasks = len({task.id for task in locked_tasks} | live_job_task_ids)
         capacity = available_task_queue_capacity(max_conc, running_tasks)
-        for _ in range(capacity):
+        memory_blocked_job_ids: set[uuid.UUID] = set()
+        # Scan past memory-blocked local models so lightweight/remote work can
+        # still use a task slot. Keep the database scan bounded per tick.
+        for _ in range(max(32, capacity * 4) if capacity else 0):
+            if available_task_queue_capacity(max_conc, running_tasks) <= 0:
+                break
+            # Production sessions disable autoflush. Persist this tick's
+            # previous claims before selecting another unlocked candidate.
+            db.flush()
             # Prefer queued render jobs (rare, usually after an expired lock) so tasks can finish.
             rj = (
                 db.query(RenderJob)
                 .join(Task, Task.id == RenderJob.task_id)
                 .filter(
                     RenderJob.status == RenderJobStatus.queued,
-                    Task.status != TaskStatus.canceled,
-                    or_(
-                        Task.lock_owner != TASK_QUEUE_LOCK_OWNER,
-                        Task.lock_until.is_(None),
-                        Task.lock_until <= now,
-                    ),
+                    or_(RenderJob.progress != _JOB_DISPATCH_PROGRESS, RenderJob.updated_at <= dispatch_retry_cutoff),
+                    Task.status.notin_([TaskStatus.canceled, TaskStatus.published]),
+                    schedulable_unlocked,
                 )
                 .order_by(RenderJob.created_at.asc())
                 .with_for_update(skip_locked=True)
@@ -2224,6 +2407,8 @@ def task_queue_tick() -> dict[str, Any]:
                     continue
                 task.lock_owner = TASK_QUEUE_LOCK_OWNER
                 task.lock_until = _task_queue_expires_at(now)
+                _mark_queued_job_dispatched(rj)
+                db.add(rj)
                 db.add(task)
                 to_start.append(("render", str(rj.id)))
                 started_render += 1
@@ -2235,12 +2420,10 @@ def task_queue_tick() -> dict[str, Any]:
                 .join(Task, Task.id == SubtitleJob.task_id)
                 .filter(
                     SubtitleJob.status == SubtitleJobStatus.queued,
-                    Task.status != TaskStatus.canceled,
-                    or_(
-                        Task.lock_owner != TASK_QUEUE_LOCK_OWNER,
-                        Task.lock_until.is_(None),
-                        Task.lock_until <= now,
-                    ),
+                    SubtitleJob.id.notin_(memory_blocked_job_ids),
+                    or_(SubtitleJob.progress != _JOB_DISPATCH_PROGRESS, SubtitleJob.updated_at <= dispatch_retry_cutoff),
+                    Task.status.notin_([TaskStatus.canceled, TaskStatus.published]),
+                    schedulable_unlocked,
                 )
                 .order_by(SubtitleJob.created_at.asc())
                 .with_for_update(skip_locked=True)
@@ -2257,8 +2440,16 @@ def task_queue_tick() -> dict[str, Any]:
             if task.lock_until and task.lock_until > now and task.lock_owner and task.lock_owner != TASK_QUEUE_LOCK_OWNER:
                 continue
 
+            if _reserve_subtitle_memory(admission, sj):
+                db.add(sj)
+                memory_blocked_job_ids.add(sj.id)
+                memory_waiting += 1
+                continue
+
             task.lock_owner = TASK_QUEUE_LOCK_OWNER
             task.lock_until = _task_queue_expires_at(now)
+            _mark_queued_job_dispatched(sj)
+            db.add(sj)
             db.add(task)
             to_start.append(("subtitle", str(sj.id)))
             started_subtitle += 1
@@ -2273,7 +2464,7 @@ def task_queue_tick() -> dict[str, Any]:
                 .filter(
                     Task.source_type == SourceType.youtube,
                     Task.status.in_([TaskStatus.ingested, TaskStatus.downloaded]),
-                    unlocked,
+                    schedulable_unlocked,
                     Task.updated_at.is_not(None),
                     Task.updated_at < bootstrap_cutoff,
                 )
@@ -2291,6 +2482,11 @@ def task_queue_tick() -> dict[str, Any]:
                 if _task_has_queued_or_running_jobs(db, task.id):
                     continue
                 if _task_queue_is_task_locked(task, now):
+                    continue
+
+                bootstrap_budget = local_asr_budget_mb(admission.bootstrap_request, admission.defaults, settings)
+                if admission.reserve(task.id, bootstrap_budget):
+                    memory_waiting += 1
                     continue
 
                 task.lock_owner = TASK_QUEUE_LOCK_OWNER
@@ -2337,6 +2533,8 @@ def task_queue_tick() -> dict[str, Any]:
         "recovered_render": str(recovered_render),
         "recovered_pipeline": str(recovered_pipeline),
         "unlocked_expired": str(unlocked_expired),
+        "memory_waiting": str(memory_waiting),
+        "admission": admission.summary(max_conc),
     }
 
 
@@ -2365,18 +2563,22 @@ def process_render_job(self: Any, render_job_id: str) -> dict[str, Any]:
         if not rj:
             return {"status": "error", "detail": "render job not found"}
 
+        task = db.query(Task).filter(Task.id == rj.task_id).with_for_update().first()
+        if not task:
+            return {"status": "error", "detail": "task not found"}
+        db.refresh(rj)
         if rj.status == RenderJobStatus.succeeded:
             return {"status": "ok", "detail": "already succeeded"}
         if rj.status == RenderJobStatus.canceled:
             return {"status": "skipped", "detail": "canceled"}
-
-        task = db.get(Task, rj.task_id)
-        if not task:
-            return {"status": "error", "detail": "task not found"}
         if _pause_render_job_if_task_stopped(db, rid):
             return {"status": "stopped", "detail": "task stopped by user"}
 
         now = _now()
+        skip_detail = _cancel_unclaimable_render_job(db, rj, task, now)
+        if skip_detail:
+            db.commit()
+            return {"status": "skipped", "detail": skip_detail}
         if rj.status == RenderJobStatus.running and rj.lease_until is not None and rj.lease_until > now:
             return {"status": "in_progress", "detail": "render job has a live worker lease"}
         if task.lock_owner != TASK_QUEUE_LOCK_OWNER:
@@ -2384,12 +2586,7 @@ def process_render_job(self: Any, render_job_id: str) -> dict[str, Any]:
             # render back to queued.
             if rj.status == RenderJobStatus.running:
                 return {"status": "in_progress", "detail": "running render awaits lease recovery"}
-            celery_app.send_task(
-                "subtitle_service.task_queue_tick",
-                args=[],
-                queue="subtitle",
-                countdown=_TASK_QUEUE_REQUEUE_COUNTDOWN_SECONDS,
-            )
+            _kick_task_queue(countdown=_TASK_QUEUE_REQUEUE_COUNTDOWN_SECONDS)
             return {"status": "queued", "detail": "waiting for task queue"}
         if task.lock_until is None or task.lock_until <= now:
             task.lock_until = _task_queue_expires_at(now)
@@ -2636,7 +2833,7 @@ def process_render_job(self: Any, render_job_id: str) -> dict[str, Any]:
             db.add(task)
             db.commit()
 
-        celery_app.send_task("subtitle_service.task_queue_tick", args=[], queue="subtitle")
+        _kick_task_queue()
         return {"status": "ok"}
     except _TaskStopped:
         _pause_render_job_if_task_stopped(db, rid)
@@ -2674,7 +2871,7 @@ def process_render_job(self: Any, render_job_id: str) -> dict[str, Any]:
         _safe_append_log_line(log_path, f"ERROR: {type(e).__name__}: {e}")
         _safe_append_log_block(log_path, traceback.format_exc())
         _safe_upload_log(store, log_path, log_key)
-        celery_app.send_task("subtitle_service.task_queue_tick", args=[], queue="subtitle")
+        _kick_task_queue()
         return {"status": "error", "detail": str(e)}
     finally:
         if job_hb is not None:
@@ -3160,7 +3357,13 @@ def auto_youtube_pipeline(self: Any, task_id: str, overrides: dict[str, Any] | N
             # Refresh a stale/expired lock to avoid accidental eviction mid-pipeline.
             task.lock_until = _task_queue_expires_at(now)
             db.add(task)
-            db.commit()
+
+        # Release the settings-row FOR UPDATE lock before YouTube download or
+        # any other slow network work. Tasks dispatched by task_queue_tick
+        # already own their task slot, so the branches above may otherwise
+        # leave this transaction open for the full download and block every
+        # later queue tick.
+        db.commit()
 
         hb = _TaskQueueHeartbeat(task.id)
         hb.start()
@@ -3331,7 +3534,7 @@ def auto_youtube_pipeline(self: Any, task_id: str, overrides: dict[str, Any] | N
             db.commit()
             db.refresh(job)
 
-            celery_app.send_task("subtitle_service.task_queue_tick", args=[], queue="subtitle")
+            _kick_task_queue()
             return {"status": "ok", "task_id": str(tid), "detail": f"queued subtitle job {job.id}"}
 
         result_data: dict[str, Any] = {}
@@ -3403,7 +3606,7 @@ def auto_youtube_pipeline(self: Any, task_id: str, overrides: dict[str, Any] | N
             _task_queue_unlock(task)
             db.add(task)
             db.commit()
-        celery_app.send_task("subtitle_service.task_queue_tick", args=[], queue="subtitle")
+        _kick_task_queue()
         return {"status": "stopped", "task_id": task_id, "detail": "task stopped by user"}
     except Retry:
         raise
@@ -3411,16 +3614,16 @@ def auto_youtube_pipeline(self: Any, task_id: str, overrides: dict[str, Any] | N
         task = db.get(Task, uuid.UUID(task_id))
         if task:
             if _task_is_stopped(db, task.id):
-                celery_app.send_task("subtitle_service.task_queue_tick", args=[], queue="subtitle")
+                _kick_task_queue()
                 return {"status": "stopped", "task_id": str(task.id), "detail": "task stopped by user"}
             if task.status == TaskStatus.ready_for_review and task.error_code == "AI_REVIEW_REJECTED":
-                celery_app.send_task("subtitle_service.task_queue_tick", args=[], queue="subtitle")
+                _kick_task_queue()
                 return {"status": "review_rejected", "task_id": str(task.id), "detail": task.error_message or str(e)}
             task.status = TaskStatus.failed
             task.error_message = str(e)
             db.add(task)
             db.commit()
-        celery_app.send_task("subtitle_service.task_queue_tick", args=[], queue="subtitle")
+        _kick_task_queue()
         raise
     finally:
         if hb is not None:
@@ -3445,7 +3648,7 @@ def auto_youtube_pipeline(self: Any, task_id: str, overrides: dict[str, Any] | N
                         _task_queue_unlock(task2)
                         db.add(task2)
                         db.commit()
-                        celery_app.send_task("subtitle_service.task_queue_tick", args=[], queue="subtitle")
+                        _kick_task_queue()
         except Exception:
             try:
                 db.rollback()

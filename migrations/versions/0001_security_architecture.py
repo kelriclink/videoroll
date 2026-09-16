@@ -9,9 +9,12 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
-from alembic import op
+from alembic import context, op
 import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql
+
+from videoroll.db.legacy_schema import create_legacy_tables
+from videoroll.db.schema_compat import add_column_if_missing, create_index_if_missing, create_table_if_missing
 
 
 revision: str = "0001_security_architecture"
@@ -44,7 +47,10 @@ def _lease_columns() -> list[sa.Column]:
 
 
 def upgrade() -> None:
-    op.create_table(
+    # Online startup already bootstraps these under the shared schema lock.
+    # Include the same frozen baseline in SQL scripts for a genuinely empty DB.
+    create_legacy_tables(op.get_bind(), offline=context.is_offline_mode())
+    create_table_if_missing(
         "outbox_events",
         sa.Column("id", _uuid_type(), nullable=False),
         sa.Column("event_type", sa.String(length=128), nullable=False),
@@ -62,15 +68,15 @@ def upgrade() -> None:
         *_timestamps(),
         sa.PrimaryKeyConstraint("id"),
     )
-    op.create_index(
+    create_index_if_missing(
         "ix_outbox_events_pending_lease",
         "outbox_events",
         ["status", "available_at", "lease_until"],
         unique=False,
     )
-    op.create_index("ix_outbox_events_operation_key", "outbox_events", ["operation_key"], unique=False)
+    create_index_if_missing("ix_outbox_events_operation_key", "outbox_events", ["operation_key"], unique=False)
 
-    op.create_table(
+    create_table_if_missing(
         "operation_inbox",
         sa.Column("id", _uuid_type(), nullable=False),
         sa.Column("operation_key", sa.String(length=255), nullable=False),
@@ -84,14 +90,14 @@ def upgrade() -> None:
         sa.PrimaryKeyConstraint("id"),
         sa.UniqueConstraint("operation_key", name="uq_operation_inbox_operation_key"),
     )
-    op.create_index(
+    create_index_if_missing(
         "ix_operation_inbox_pending_lease",
         "operation_inbox",
         ["status", "lease_until", "created_at"],
         unique=False,
     )
 
-    op.create_table(
+    create_table_if_missing(
         "remote_api_requests",
         sa.Column("id", _uuid_type(), nullable=False),
         sa.Column("token_hash", sa.String(length=64), nullable=False),
@@ -111,14 +117,14 @@ def upgrade() -> None:
             name="uq_remote_api_requests_token_idempotency",
         ),
     )
-    op.create_index(
+    create_index_if_missing(
         "ix_remote_api_requests_pending_lease",
         "remote_api_requests",
         ["status", "lease_until", "created_at"],
         unique=False,
     )
 
-    op.create_table(
+    create_table_if_missing(
         "desktop_access_grants",
         sa.Column("id", _uuid_type(), nullable=False),
         sa.Column("token_hash", sa.String(length=64), nullable=False),
@@ -133,14 +139,14 @@ def upgrade() -> None:
         sa.PrimaryKeyConstraint("id"),
         sa.UniqueConstraint("token_hash", name="uq_desktop_access_grants_token_hash"),
     )
-    op.create_index(
+    create_index_if_missing(
         "ix_desktop_access_grants_active_expiry",
         "desktop_access_grants",
         ["status", "expires_at"],
         unique=False,
     )
 
-    op.create_table(
+    create_table_if_missing(
         "security_audit_events",
         sa.Column("id", _uuid_type(), nullable=False),
         sa.Column("event_type", sa.String(length=128), nullable=False),
@@ -155,13 +161,13 @@ def upgrade() -> None:
         sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
         sa.PrimaryKeyConstraint("id"),
     )
-    op.create_index(
+    create_index_if_missing(
         "ix_security_audit_events_type_created",
         "security_audit_events",
         ["event_type", "created_at"],
         unique=False,
     )
-    op.create_index(
+    create_index_if_missing(
         "ix_security_audit_events_actor_created",
         "security_audit_events",
         ["actor_type", "actor_id", "created_at"],
@@ -173,19 +179,19 @@ def upgrade() -> None:
         ("render_jobs", "status"),
         ("publish_jobs", "state"),
     ):
-        op.add_column(table_name, sa.Column("lease_owner", sa.String(length=128), nullable=True))
-        op.add_column(table_name, sa.Column("lease_until", sa.DateTime(timezone=True), nullable=True))
-        op.add_column(table_name, sa.Column("heartbeat_at", sa.DateTime(timezone=True), nullable=True))
-        op.add_column(table_name, sa.Column("operation_key", sa.String(length=255), nullable=True))
-        op.create_index(
+        add_column_if_missing(table_name, sa.Column("lease_owner", sa.String(length=128), nullable=True))
+        add_column_if_missing(table_name, sa.Column("lease_until", sa.DateTime(timezone=True), nullable=True))
+        add_column_if_missing(table_name, sa.Column("heartbeat_at", sa.DateTime(timezone=True), nullable=True))
+        add_column_if_missing(table_name, sa.Column("operation_key", sa.String(length=255), nullable=True))
+        create_index_if_missing(
             f"ix_{table_name}_{status_column}_lease_until",
             table_name,
             [status_column, "lease_until", "created_at"],
             unique=False,
         )
-        op.create_index(f"ix_{table_name}_operation_key", table_name, ["operation_key"], unique=False)
+        create_index_if_missing(f"ix_{table_name}_operation_key", table_name, ["operation_key"], unique=False)
 
-    op.add_column(
+    add_column_if_missing(
         "app_settings",
         sa.Column("version", sa.Integer(), server_default=sa.text("1"), nullable=False),
     )

@@ -14,6 +14,7 @@ APP_IMAGE="${APP_IMAGE:-videoroll:prod}"
 EGRESS_IMAGE="${EGRESS_IMAGE:-videoroll-egress:prod}"
 WEB_IMAGE="${WEB_IMAGE:-videoroll-web:prod}"
 SOCIAL_IMAGE="${SOCIAL_IMAGE:-videoroll-social-publisher:prod}"
+FFPLAYOUT_IMAGE="${FFPLAYOUT_IMAGE:-videoroll-ffplayout:prod}"
 INCLUDE_BASE_IMAGES="${INCLUDE_BASE_IMAGES:-1}"
 TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
 OUTPUT_TAR="${OUTPUT_TAR:-$ROOT_DIR/videoroll-prod-bundle-${TIMESTAMP}.tar}"
@@ -44,14 +45,18 @@ docker_run build \
   -t "$APP_IMAGE" \
   --build-arg INSTALL_ASR="${INSTALL_ASR:-1}" \
   --build-arg YTDLP_VERSION="${YTDLP_VERSION:-latest}" \
+  --build-arg APP_UID="${APP_UID:-10001}" \
+  --build-arg APP_GID="${APP_GID:-10001}" \
   -f Dockerfile \
   .
 
 echo "Building egress gateway image: $EGRESS_IMAGE"
 docker_run build \
   -t "$EGRESS_IMAGE" \
-  --build-arg INSTALL_ASR=0 \
+  --build-arg INSTALL_ASR="${INSTALL_ASR:-1}" \
   --build-arg YTDLP_VERSION="${YTDLP_VERSION:-latest}" \
+  --build-arg APP_UID="${APP_UID:-10001}" \
+  --build-arg APP_GID="${APP_GID:-10001}" \
   -f Dockerfile \
   .
 
@@ -59,16 +64,27 @@ echo "Building web image: $WEB_IMAGE"
 docker_run build \
   -t "$WEB_IMAGE" \
   --build-arg VITE_ORCHESTRATOR_URL="${VITE_ORCHESTRATOR_URL:-}" \
+  --build-arg VITE_FFPLAYOUT_URL="${VITE_FFPLAYOUT_URL:?VITE_FFPLAYOUT_URL must be set}" \
   -f src/web/Dockerfile \
   src/web
 
 echo "Building social publisher image: $SOCIAL_IMAGE"
 docker_run build \
   -t "$SOCIAL_IMAGE" \
+  --build-arg APP_UID="${APP_UID:-10001}" \
+  --build-arg APP_GID="${APP_GID:-10001}" \
   -f docker/social-publisher.Dockerfile \
   .
 
-IMAGES=("$APP_IMAGE" "$EGRESS_IMAGE" "$WEB_IMAGE" "$SOCIAL_IMAGE")
+echo "Building ffplayout image: $FFPLAYOUT_IMAGE"
+docker_run build \
+  -t "$FFPLAYOUT_IMAGE" \
+  --build-arg APP_UID="${APP_UID:-10001}" \
+  --build-arg APP_GID="${APP_GID:-10001}" \
+  -f services/ffplayout/Dockerfile.videoroll \
+  services/ffplayout
+
+IMAGES=("$APP_IMAGE" "$EGRESS_IMAGE" "$WEB_IMAGE" "$SOCIAL_IMAGE" "$FFPLAYOUT_IMAGE")
 if [[ "$INCLUDE_BASE_IMAGES" == "1" ]]; then
   echo "Pulling base service images"
   docker_run pull redis:7

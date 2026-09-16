@@ -16,6 +16,8 @@ type ScanResponse = {
   started_pipeline_job_ids?: string[];
 };
 
+type SourceInputType = "auto" | YouTubeSource["source_type"];
+
 function formatTime(value?: string | null): string {
   if (!value) return "-";
   const date = new Date(value);
@@ -37,6 +39,7 @@ export default function YouTubeSourcesPage() {
   const [error, setError] = useState<string | null>(null);
 
   const [sourceInputs, setSourceInputs] = useState("");
+  const [sourceInputType, setSourceInputType] = useState<SourceInputType>("auto");
   const [license, setLicense] = useState<SourceLicense>("authorized");
   const [proofUrl, setProofUrl] = useState("");
   const [enabled, setEnabled] = useState(true);
@@ -93,6 +96,7 @@ export default function YouTubeSourcesPage() {
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
               source_url: item,
+              source_type: sourceInputType === "auto" ? null : sourceInputType,
               license,
               proof_url: proofUrl.trim() ? proofUrl.trim() : null,
               enabled,
@@ -203,8 +207,8 @@ export default function YouTubeSourcesPage() {
   return (
     <div className="space-y-4">
       <PageHeader
-        title="YouTube Sources"
-        description="订阅 YouTube 频道 / 播放列表；频道默认合并扫描视频与 Shorts，新内容可直接进入自动模式。"
+        title="YouTube 频道 / 播放列表"
+        description="订阅 YouTube 频道或 Playlist；播放列表会完整枚举，并按设置的数量分批创建任务。"
         actions={
           <Button onClick={() => refresh()}>
             刷新
@@ -221,7 +225,7 @@ export default function YouTubeSourcesPage() {
           支持一行一个：频道主页、播放列表链接、<span className="font-mono">@handle</span>、<span className="font-mono">UC...</span>、<span className="font-mono">PL...</span>。
         </div>
         <label className="mt-3 block">
-          <div className="mb-1 text-xs text-slate-600">主页链接 / 来源</div>
+          <div className="mb-1 text-xs text-slate-600">频道 / Playlist 链接或 ID</div>
           <textarea
             className="min-h-32 w-full rounded border px-3 py-2 text-sm"
             placeholder={"https://www.youtube.com/@creator\nhttps://www.youtube.com/channel/UC...\nhttps://www.youtube.com/playlist?list=PL..."}
@@ -230,7 +234,19 @@ export default function YouTubeSourcesPage() {
           />
         </label>
 
-        <div className="mt-3 grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+        <div className="mt-3 grid gap-3 md:grid-cols-2 xl:grid-cols-5">
+          <label className="block">
+            <div className="mb-1 text-xs text-slate-600">来源类型</div>
+            <select
+              className="w-full rounded border px-3 py-2 text-sm"
+              value={sourceInputType}
+              onChange={(e) => setSourceInputType(e.target.value as SourceInputType)}
+            >
+              <option value="auto">自动识别</option>
+              <option value="channel">YouTube 频道</option>
+              <option value="playlist">YouTube Playlist</option>
+            </select>
+          </label>
           <label className="block">
             <div className="mb-1 text-xs text-slate-600">license</div>
             <select className="w-full rounded border px-3 py-2 text-sm" value={license} onChange={(e) => setLicense(e.target.value as SourceLicense)}>
@@ -279,7 +295,10 @@ export default function YouTubeSourcesPage() {
           </label>
         </div>
 
-        <div className="mt-3 text-xs text-slate-500">自动模式会继续走下载 → 字幕/翻译 → 烧录 → 投稿，具体参数按 Settings · Auto Mode。</div>
+        <div className="mt-3 space-y-1 text-xs text-slate-500">
+          <div>播放列表扫描会先获取完整条目，再按“每次新建上限”创建尚未入库的视频；下次扫描会自动跳过已有视频并继续补齐。</div>
+          <div>扫描间隔、单次数量和自动模式与普通 YouTube 频道来源完全相同。自动模式会继续走下载 → 字幕/翻译 → 烧录 → 投稿。</div>
+        </div>
 
         <div className="mt-4">
           <button
@@ -287,7 +306,7 @@ export default function YouTubeSourcesPage() {
             disabled={adding}
             className="rounded bg-slate-900 px-3 py-2 text-sm text-white hover:bg-slate-800 disabled:opacity-50"
           >
-            {adding ? "处理中..." : "添加 / 更新订阅"}
+            {adding ? "处理中..." : "添加 / 更新频道或播放列表"}
           </button>
         </div>
       </div>
@@ -333,7 +352,9 @@ export default function YouTubeSourcesPage() {
                           placeholder={source.display_name || "显示名（可选）"}
                           onChange={(e) => updateDraft(source.id, { display_name: e.target.value })}
                         />
-                        <div className="mt-2 text-xs text-slate-500">{source.source_type}</div>
+                        <div className="mt-2 text-xs text-slate-500">
+                          {source.source_type === "playlist" ? "YouTube Playlist" : "YouTube 频道"}
+                        </div>
                       </td>
                       <td className="py-3 pr-3">
                         <a className="break-all text-xs text-sky-700 underline" href={source.source_url} target="_blank" rel="noreferrer">

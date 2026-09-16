@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from array import array
 import base64
+from difflib import SequenceMatcher
 import io
 import inspect
 import json
@@ -10,6 +12,7 @@ import random
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -19,7 +22,7 @@ from contextlib import nullcontext
 from functools import lru_cache
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Iterator, Sequence
 
 import httpx
 
@@ -44,6 +47,12 @@ _ASR_SILENCE_RMS_THRESHOLD = 0.0008
 _ASR_SILENCE_ACTIVE_THRESHOLD = 0.015
 _ASR_SILENCE_ACTIVE_RATIO_THRESHOLD = 0.0005
 _ASR_SAMPLE_RATE = 16000
+_ASR_PCM_READ_FRAMES = 65536
+# Bound PCM, VAD and feature-extraction memory independently of video length.
+# The overlap preserves speech at an outer window boundary; captions are
+# reconciled with the same timeline logic used for the remote ASR chunks.
+_LOCAL_ASR_WINDOW_SECONDS = 120.0
+_LOCAL_ASR_OVERLAP_SECONDS = 5.0
 _OPENVINO_VAD_THRESHOLD = 0.5
 _OPENVINO_VAD_MIN_SPEECH_MS = 250
 _OPENVINO_VAD_MAX_SPEECH_SECONDS = 30.0
@@ -149,6 +158,17 @@ def _ffmpeg_supports_encoder(ffmpeg_path: str, encoder: str) -> bool:
         # If probing fails, let the real ffmpeg invocation surface the underlying error.
         return True
     return encoder in supported
+
+
+def _append_processing_log_note(log_path: Path | None, message: str) -> None:
+    if log_path is None:
+        return
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with log_path.open("ab") as handle:
+            handle.write((f"\n{message.strip()}\n").encode("utf-8", errors="replace"))
+    except Exception:
+        pass
 
 
 def _run_logged(
@@ -323,25 +343,54 @@ def transcribe_faster_whisper(
     if "compression_ratio_threshold" in supported:
         transcribe_kwargs["compression_ratio_threshold"] = _FW_COMPRESSION_RATIO_THRESHOLD
 
-    try:
-        seg_iter, _info = model.transcribe(str(audio_path), **transcribe_kwargs)
-    except ValueError as e:
-        # Some faster-whisper versions can raise on language detection if VAD removes all speech.
-        if "empty sequence" in str(e).lower():
-            logger.info("faster-whisper returned no speech after VAD for %s", audio_path)
-            return []
-        raise
+    def transcribe_window(audio: Any) -> list[Segment]:
+        try:
+            seg_iter, _info = model.transcribe(audio, **transcribe_kwargs)
+            raw_segments = list(seg_iter)
+        except ValueError as e:
+            # This can also be raised while consuming the lazy segment iterator.
+            if "empty sequence" in str(e).lower():
+                logger.info("faster-whisper returned no speech after VAD for %s", audio_path)
+                return []
+            raise
+        kept = _filter_faster_whisper_segments(raw_segments)
+        if raw_segments:
+            logger.info("faster-whisper kept %d/%d segments for %s", len(kept), len(raw_segments), audio_path)
+        return kept
 
-    raw_segments = list(seg_iter)
-    out = _filter_faster_whisper_segments(raw_segments)
-    if raw_segments:
-        logger.info(
-            "faster-whisper kept %d/%d segments for %s",
-            len(out),
-            len(raw_segments),
-            audio_path,
-        )
-    return out
+    try:
+        with wave.open(str(audio_path), "rb") as source:
+            _validate_asr_wav(source)
+            windowed = source.getnframes() > int(_LOCAL_ASR_WINDOW_SECONDS * _ASR_SAMPLE_RATE)
+    except (OSError, EOFError, wave.Error, RuntimeError):
+        # Keep faster-whisper's existing support for other input formats.
+        windowed = False
+    if not windowed:
+        return transcribe_window(str(audio_path))
+
+    import numpy as np  # type: ignore
+
+    out: list[Segment] = []
+    for audio_data, offset_seconds in _iter_wav_windows_as_float_mono_16k(audio_path):
+        # faster-whisper accepts ndarray inputs; a path makes it decode the
+        # entire file before its own internal 30-second decoding loop starts.
+        samples = np.frombuffer(audio_data, dtype=np.float32)
+        local_duration = len(audio_data) / float(_ASR_SAMPLE_RATE)
+        for segment in transcribe_window(samples):
+            start = min(local_duration, max(0.0, float(segment.start)))
+            end = min(local_duration, max(start, float(segment.end)))
+            if end > start:
+                out.append(
+                    Segment(
+                        start=offset_seconds + start,
+                        end=offset_seconds + end,
+                        text=segment.text,
+                        confidence=segment.confidence,
+                        secondary_text=segment.secondary_text,
+                    )
+                )
+        del samples, audio_data
+    return reconcile_overlapping_asr_segments(out)
 
 
 def transcribe_external_whisper(
@@ -409,7 +458,7 @@ def transcribe_external_whisper(
     if not text:
         return []
     try:
-        _audio, duration = _read_wav_as_float_mono_16k(audio_path)
+        duration = _wav_duration_seconds(audio_path)
     except Exception:
         duration = 0.0
     return [Segment(start=0.0, end=max(0.0, float(duration)), text=text)]
@@ -654,8 +703,211 @@ def _segments_from_groq_result(result: dict[str, Any], *, fallback_duration: flo
     return [Segment(start=0.0, end=max(0.0, float(fallback_duration)), text=text)] if text else []
 
 
+_ASR_ALIGNMENT_TOKEN_RE = re.compile(
+    r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]|[^\W_]+(?:['’][^\W_]+)?",
+    re.UNICODE,
+)
+
+
+def _asr_alignment_tokens(text: str) -> list[tuple[str, int, int]]:
+    out: list[tuple[str, int, int]] = []
+    for match in _ASR_ALIGNMENT_TOKEN_RE.finditer(str(text or "")):
+        token = unicodedata.normalize("NFKC", match.group(0)).casefold()
+        if token:
+            out.append((token, match.start(), match.end()))
+    return out
+
+
+def _join_asr_text(prefix: str, suffix: str) -> str:
+    left = str(prefix or "").rstrip()
+    right = str(suffix or "").lstrip()
+    if not left:
+        return right
+    if not right:
+        return left
+    if right[0] in ",.!?;:，。！？；：、)]}）】》」』”’":
+        return f"{left}{right}"
+    if (
+        "\u3040" <= left[-1] <= "\u30ff"
+        or "\u3400" <= left[-1] <= "\u9fff"
+        or "\u3040" <= right[0] <= "\u30ff"
+        or "\u3400" <= right[0] <= "\u9fff"
+    ):
+        return f"{left}{right}"
+    return f"{left} {right}"
+
+
+def _trim_asr_token_prefix(text: str, token_count: int) -> str:
+    tokens = _asr_alignment_tokens(text)
+    if token_count <= 0:
+        return str(text or "").strip()
+    if token_count >= len(tokens):
+        return ""
+    return str(text or "")[tokens[token_count - 1][2] :].lstrip()
+
+
+def _contains_token_sequence(haystack: list[str], needle: list[str]) -> bool:
+    if not needle or len(needle) > len(haystack):
+        return False
+    width = len(needle)
+    return any(haystack[index : index + width] == needle for index in range(len(haystack) - width + 1))
+
+
+def _meaningful_asr_token_match(tokens: list[str]) -> bool:
+    if len(tokens) >= 3:
+        return True
+    return len(tokens) >= 2 and sum(len(token) for token in tokens) >= 8
+
+
+def _stitch_related_asr_text(previous_text: str, current_text: str) -> str | None:
+    """Reconcile repeated or continuing text from overlapping ASR windows."""
+    previous_tokens_with_spans = _asr_alignment_tokens(previous_text)
+    current_tokens_with_spans = _asr_alignment_tokens(current_text)
+    previous_tokens = [token for token, _, _ in previous_tokens_with_spans]
+    current_tokens = [token for token, _, _ in current_tokens_with_spans]
+    if not previous_tokens or not current_tokens:
+        return None
+    if previous_tokens == current_tokens:
+        return previous_text if len(previous_text.strip()) >= len(current_text.strip()) else current_text
+    if _contains_token_sequence(current_tokens, previous_tokens):
+        return current_text
+    if _contains_token_sequence(previous_tokens, current_tokens):
+        return previous_text
+
+    max_overlap = min(len(previous_tokens), len(current_tokens))
+    for size in range(max_overlap, 0, -1):
+        overlap_tokens = previous_tokens[-size:]
+        if overlap_tokens != current_tokens[:size] or not _meaningful_asr_token_match(overlap_tokens):
+            continue
+        suffix = _trim_asr_token_prefix(current_text, size)
+        return _join_asr_text(previous_text, suffix)
+
+    matcher = SequenceMatcher(None, previous_tokens, current_tokens, autojunk=False)
+    anchored_matches = [
+        block
+        for block in matcher.get_matching_blocks()
+        if block.size > 0
+        and len(previous_tokens) - (block.a + block.size) <= 1
+        and block.b <= 1
+        and _meaningful_asr_token_match(previous_tokens[block.a : block.a + block.size])
+    ]
+    if anchored_matches:
+        block = max(anchored_matches, key=lambda item: item.size)
+        shorter_size = max(1, min(len(previous_tokens), len(current_tokens)))
+        if block.size / shorter_size >= 0.65:
+            if len(current_tokens) > len(previous_tokens):
+                return current_text
+            if len(previous_tokens) > len(current_tokens):
+                return previous_text
+            return previous_text if len(previous_text.strip()) >= len(current_text.strip()) else current_text
+        suffix = _trim_asr_token_prefix(current_text, block.b + block.size)
+        return _join_asr_text(previous_text, suffix)
+
+    if matcher.ratio() >= 0.78 and _meaningful_asr_token_match(previous_tokens[: min(len(previous_tokens), 3)]):
+        if len(current_tokens) > len(previous_tokens):
+            return current_text
+        return previous_text
+    return None
+
+
+def _combined_segment_confidence(previous: Segment, current: Segment) -> float | None:
+    values = [value for value in (previous.confidence, current.confidence) if value is not None]
+    return max(values) if values else None
+
+
+def reconcile_overlapping_asr_segments(
+    segments: Iterable[Segment],
+    *,
+    minimum_duration: float = 0.12,
+) -> list[Segment]:
+    """Stitch related ASR captions and guarantee a non-overlapping timeline."""
+    candidates = sorted(segments, key=lambda item: (float(item.start), float(item.end), item.text))
+    out: list[Segment] = []
+    min_duration = max(0.01, float(minimum_duration))
+    for raw_segment in candidates:
+        text = _normalize_asr_text(raw_segment.text)
+        if not text:
+            continue
+        segment = Segment(
+            start=max(0.0, float(raw_segment.start)),
+            end=max(max(0.0, float(raw_segment.start)), float(raw_segment.end)),
+            text=text,
+            confidence=raw_segment.confidence,
+            secondary_text=raw_segment.secondary_text,
+        )
+        if not out:
+            out.append(segment)
+            continue
+
+        previous = out[-1]
+        if segment.start >= previous.end:
+            out.append(segment)
+            continue
+
+        overlap_duration = max(0.0, min(previous.end, segment.end) - segment.start)
+        shorter_duration = max(
+            0.0,
+            min(previous.end - previous.start, segment.end - segment.start),
+        )
+        substantial_overlap = overlap_duration >= max(
+            min_duration * 2.0,
+            min(0.5, shorter_duration * 0.5),
+        )
+        # A complete short utterance can be shorter than the absolute overlap
+        # threshold; high coverage still identifies its duplicated chunk result.
+        if shorter_duration > 0:
+            substantial_overlap = substantial_overlap or overlap_duration >= shorter_duration * 0.8
+        if substantial_overlap:
+            # Similar words only indicate duplicate recognition when the
+            # captions also cover the same speech. At a slight timing overlap,
+            # even identical text may be a separate spoken repetition.
+            stitched_text = _stitch_related_asr_text(previous.text, segment.text)
+            out[-1] = Segment(
+                start=previous.start,
+                end=max(previous.end, segment.end),
+                text=stitched_text if stitched_text is not None else _join_asr_text(previous.text, segment.text),
+                confidence=_combined_segment_confidence(previous, segment),
+                secondary_text=previous.secondary_text or segment.secondary_text,
+            )
+            continue
+
+        clipped_previous_duration = segment.start - previous.start
+        if clipped_previous_duration >= min_duration:
+            out[-1] = Segment(
+                start=previous.start,
+                end=segment.start,
+                text=previous.text,
+                confidence=previous.confidence,
+                secondary_text=previous.secondary_text,
+            )
+            out.append(segment)
+            continue
+
+        shifted_start = previous.end
+        if segment.end - shifted_start >= min_duration:
+            out.append(
+                Segment(
+                    start=shifted_start,
+                    end=segment.end,
+                    text=segment.text,
+                    confidence=segment.confidence,
+                    secondary_text=segment.secondary_text,
+                )
+            )
+            continue
+
+        out[-1] = Segment(
+            start=previous.start,
+            end=max(previous.end, segment.end),
+            text=_join_asr_text(previous.text, segment.text),
+            confidence=_combined_segment_confidence(previous, segment),
+            secondary_text=previous.secondary_text or segment.secondary_text,
+        )
+    return out
+
+
 def _merge_groq_segments(chunks: Iterable[tuple[float, Iterable[Segment]]]) -> list[Segment]:
-    """Apply chunk offsets and remove repeated text from overlap windows."""
+    """Apply chunk offsets and reconcile text repeated across overlap windows."""
     candidates: list[Segment] = []
     for offset, segments in chunks:
         for segment in segments:
@@ -668,27 +920,7 @@ def _merge_groq_segments(chunks: Iterable[tuple[float, Iterable[Segment]]]) -> l
                     secondary_text=segment.secondary_text,
                 )
             )
-    candidates.sort(key=lambda item: (item.start, item.end))
-    merged: list[Segment] = []
-    for segment in candidates:
-        if not merged:
-            merged.append(segment)
-            continue
-        previous = merged[-1]
-        previous_norm = re.sub(r"\s+", " ", previous.text).strip().casefold()
-        current_norm = re.sub(r"\s+", " ", segment.text).strip().casefold()
-        if current_norm and current_norm == previous_norm and segment.start <= previous.end + 1.5:
-            if segment.end > previous.end:
-                merged[-1] = Segment(
-                    start=previous.start,
-                    end=segment.end,
-                    text=previous.text,
-                    confidence=previous.confidence,
-                    secondary_text=previous.secondary_text,
-                )
-            continue
-        merged.append(segment)
-    return merged
+    return reconcile_overlapping_asr_segments(candidates)
 
 
 def _groq_status_is_retryable(status_code: int) -> bool:
@@ -1071,38 +1303,62 @@ class _OpenVinoSpeechSpan:
         return max(0, self.end_sample - self.start_sample) / float(_ASR_SAMPLE_RATE)
 
 
-def _read_wav_as_float_mono_16k(audio_path: Path) -> tuple[list[float], float]:
-    with wave.open(str(audio_path), "rb") as wf:
-        channels = int(wf.getnchannels() or 0)
-        sample_rate = int(wf.getframerate() or 0)
-        sample_width = int(wf.getsampwidth() or 0)
-        frame_count = int(wf.getnframes() or 0)
-        raw = wf.readframes(frame_count)
-
+def _validate_asr_wav(source: wave.Wave_read) -> None:
+    channels = int(source.getnchannels() or 0)
+    sample_rate = int(source.getframerate() or 0)
+    sample_width = int(source.getsampwidth() or 0)
     if channels != 1:
-        raise RuntimeError(f"OpenVINO ASR expects mono WAV, got channels={channels}")
-    if sample_rate != 16000:
-        raise RuntimeError(f"OpenVINO ASR expects 16k WAV, got sample_rate={sample_rate}")
+        raise RuntimeError(f"ASR expects mono WAV, got channels={channels}")
+    if sample_rate != _ASR_SAMPLE_RATE:
+        raise RuntimeError(f"ASR expects 16k WAV, got sample_rate={sample_rate}")
+    if sample_width not in {1, 2, 4}:
+        raise RuntimeError(f"unsupported WAV sample width for ASR: {sample_width} bytes")
 
-    if sample_width == 2:
-        import array
 
-        ints = array.array("h")
-        ints.frombytes(raw)
-        data = [max(-1.0, min(1.0, sample / 32768.0)) for sample in ints]
-    elif sample_width == 1:
-        data = [((byte - 128) / 128.0) for byte in raw]
-    elif sample_width == 4:
-        import array
+def _wav_duration_seconds(audio_path: Path) -> float:
+    with wave.open(str(audio_path), "rb") as source:
+        sample_rate = int(source.getframerate() or 0)
+        return source.getnframes() / float(sample_rate) if sample_rate > 0 else 0.0
 
-        ints = array.array("i")
-        ints.frombytes(raw)
-        data = [max(-1.0, min(1.0, sample / 2147483648.0)) for sample in ints]
-    else:
-        raise RuntimeError(f"unsupported WAV sample width for OpenVINO ASR: {sample_width} bytes")
 
-    duration = (len(data) / float(sample_rate)) if sample_rate > 0 else 0.0
-    return data, duration
+def _pcm_samples(raw: bytes, sample_width: int) -> Iterator[float]:
+    """Decode one PCM buffer without allocating a Python object per sample."""
+    if sample_width == 1:
+        for sample in raw:
+            yield (sample - 128) / 128.0
+        return
+    if sample_width not in {2, 4}:
+        raise RuntimeError(f"unsupported WAV sample width for ASR: {sample_width} bytes")
+    ints = array("h" if sample_width == 2 else "i")
+    ints.frombytes(raw)
+    if sys.byteorder != "little":
+        ints.byteswap()
+    scale = 32768.0 if sample_width == 2 else 2147483648.0
+    for sample in ints:
+        yield sample / scale
+
+
+def _iter_wav_windows_as_float_mono_16k(audio_path: Path) -> Iterator[tuple[array, float]]:
+    """Yield a single packed float32 window at a time, with absolute offsets."""
+    with wave.open(str(audio_path), "rb") as source:
+        _validate_asr_wav(source)
+        total_frames = source.getnframes()
+        window_frames = max(1, int(_LOCAL_ASR_WINDOW_SECONDS * _ASR_SAMPLE_RATE))
+        overlap_frames = min(window_frames - 1, max(0, int(_LOCAL_ASR_OVERLAP_SECONDS * _ASR_SAMPLE_RATE)))
+        step_frames = window_frames - overlap_frames
+        for start_frame in range(0, total_frames, step_frames):
+            source.setpos(start_frame)
+            count = min(window_frames, total_frames - start_frame)
+            raw = source.readframes(count)
+            samples = array("f", _pcm_samples(raw, source.getsampwidth()))
+            del raw
+            actual_count = len(samples)
+            if not actual_count:
+                break
+            yield samples, start_frame / float(_ASR_SAMPLE_RATE)
+            del samples
+            if actual_count < count or start_frame + count >= total_frames:
+                break
 
 
 def _audio_signal_stats(audio_data: Iterable[float]) -> tuple[int, float, float, float]:
@@ -1141,11 +1397,31 @@ def _audio_is_effectively_silent(audio_data: Iterable[float]) -> bool:
 
 def _audio_path_is_effectively_silent(audio_path: Path) -> bool:
     try:
-        audio_data, _duration = _read_wav_as_float_mono_16k(audio_path)
+        with wave.open(str(audio_path), "rb") as source:
+            _validate_asr_wav(source)
+            sample_count = 0
+            sum_squares = 0.0
+            active = 0
+            while raw := source.readframes(_ASR_PCM_READ_FRAMES):
+                for raw_sample in _pcm_samples(raw, source.getsampwidth()):
+                    sample = abs(raw_sample)
+                    # A peak cannot decrease; RMS and active ratio can, so
+                    # those statistics must cover the complete recording.
+                    if sample > _ASR_SILENCE_PEAK_THRESHOLD:
+                        return False
+                    sample_count += 1
+                    sum_squares += sample * sample
+                    if sample >= _ASR_SILENCE_ACTIVE_THRESHOLD:
+                        active += 1
     except Exception as e:
         logger.debug("skipping WAV silence probe for %s: %s: %s", audio_path, type(e).__name__, e)
         return False
-    return _audio_is_effectively_silent(audio_data)
+    if sample_count <= 0:
+        return True
+    return (
+        (sum_squares / float(sample_count)) ** 0.5 <= _ASR_SILENCE_RMS_THRESHOLD
+        and active / float(sample_count) <= _ASR_SILENCE_ACTIVE_RATIO_THRESHOLD
+    )
 
 
 def _read_wav_window_as_float_mono_16k(
@@ -1153,37 +1429,19 @@ def _read_wav_window_as_float_mono_16k(
     *,
     offset: float,
     duration: float,
-) -> list[float]:
+) -> array:
     """Read one bounded WAV window without loading the complete source audio."""
     with wave.open(str(audio_path), "rb") as wf:
-        channels = int(wf.getnchannels() or 0)
+        _validate_asr_wav(wf)
         sample_rate = int(wf.getframerate() or 0)
         sample_width = int(wf.getsampwidth() or 0)
         total_frames = int(wf.getnframes() or 0)
-        if channels != 1:
-            raise RuntimeError(f"Groq VAD expects mono WAV, got channels={channels}")
-        if sample_rate != _ASR_SAMPLE_RATE:
-            raise RuntimeError(f"Groq VAD expects 16k WAV, got sample_rate={sample_rate}")
         start_frame = max(0, min(total_frames, int(max(0.0, float(offset)) * sample_rate)))
         frame_count = max(0, min(total_frames - start_frame, int(max(0.0, float(duration)) * sample_rate)))
         wf.setpos(start_frame)
         raw = wf.readframes(frame_count)
 
-    if sample_width == 2:
-        import array
-
-        ints = array.array("h")
-        ints.frombytes(raw)
-        return [max(-1.0, min(1.0, sample / 32768.0)) for sample in ints]
-    if sample_width == 1:
-        return [((byte - 128) / 128.0) for byte in raw]
-    if sample_width == 4:
-        import array
-
-        ints = array.array("i")
-        ints.frombytes(raw)
-        return [max(-1.0, min(1.0, sample / 2147483648.0)) for sample in ints]
-    raise RuntimeError(f"unsupported WAV sample width for Groq VAD: {sample_width} bytes")
+    return array("f", _pcm_samples(raw, sample_width))
 
 
 def _groq_window_has_speech(
@@ -1221,13 +1479,13 @@ def _groq_window_has_speech(
 
 
 def _detect_silero_speech_spans(
-    audio_data: list[float],
+    audio_data: Sequence[float],
     *,
     threshold: float = _OPENVINO_VAD_THRESHOLD,
 ) -> list[_OpenVinoSpeechSpan] | None:
     """Return Silero VAD speech spans, or None when VAD is unavailable.
 
-    ``None`` deliberately falls back to the legacy full-audio OpenVINO path so a
+    ``None`` deliberately falls back to transcribing the complete window so a
     partial ASR installation does not turn real speech into an empty subtitle.
     An empty list means VAD ran successfully and found no human speech.
     """
@@ -1236,7 +1494,7 @@ def _detect_silero_speech_spans(
         from faster_whisper.vad import VadOptions, get_speech_timestamps  # type: ignore
     except Exception as e:  # pragma: no cover - depends on optional ASR packages
         logger.warning(
-            "Silero VAD is unavailable (%s); falling back to full-audio transcription",
+            "Silero VAD is unavailable (%s); falling back to window transcription",
             type(e).__name__,
         )
         return None
@@ -1256,7 +1514,7 @@ def _detect_silero_speech_spans(
         )
     except Exception as e:  # pragma: no cover - runtime/model dependent
         logger.warning(
-            "Silero VAD failed for %d samples (%s); falling back to full-audio transcription",
+            "Silero VAD failed for %d samples (%s); falling back to window transcription",
             len(audio_data),
             type(e).__name__,
         )
@@ -1287,17 +1545,8 @@ def _offset_openvino_chunks(chunks: Iterable[_OpenVinoChunk], *, offset_seconds:
 
 
 def _dedupe_overlapping_asr_segments(segments: Iterable[Segment]) -> list[Segment]:
-    """Drop duplicate captions caused by padded VAD spans overlapping at an edge."""
-    out: list[Segment] = []
-    for segment in sorted(segments, key=lambda item: (item.start, item.end, item.text)):
-        if (
-            out
-            and _normalize_asr_text(out[-1].text).casefold() == _normalize_asr_text(segment.text).casefold()
-            and segment.start < out[-1].end
-        ):
-            continue
-        out.append(segment)
-    return out
+    """Reconcile captions caused by padded VAD spans overlapping at an edge."""
+    return reconcile_overlapping_asr_segments(segments)
 
 
 def _normalize_openvino_language(language: str) -> str | None:
@@ -1319,6 +1568,9 @@ def _get_openvino_pipeline(model_path: str, device: str) -> Any:
     with _OPENVINO_PIPELINE_CACHE_LOCK:
         pipeline = _OPENVINO_PIPELINE_CACHE.get(key)
         if pipeline is None:
+            # Release the previous cached model before allocating its replacement.
+            # A worker must not retain every model/device combination it has used.
+            _OPENVINO_PIPELINE_CACHE.clear()
             pipeline = WhisperPipeline(model_path, device=device)
             _OPENVINO_PIPELINE_CACHE[key] = pipeline
     return pipeline
@@ -1361,44 +1613,39 @@ def _openvino_result_chunks(result: Any, *, audio_duration: float) -> list[_Open
     return []
 
 
-def transcribe_openvino_whisper(
+def _iter_openvino_speech_windows(
     audio_path: Path,
-    model_name: str,
-    language: str = "auto",
-    device: str = "GPU",
-    num_beams: int = 1,
-    max_new_tokens: int = 448,
-    vad_enabled: bool = True,
-    vad_threshold: float = _OPENVINO_VAD_THRESHOLD,
-) -> list[Segment]:
-    model_name = str(model_name or "").strip()
-    if not model_name:
-        raise RuntimeError("OpenVINO ASR requires a converted Whisper model path")
+    *,
+    vad_enabled: bool,
+    vad_threshold: float,
+) -> Iterator[tuple[array, float]]:
+    for audio_data, window_offset in _iter_wav_windows_as_float_mono_16k(audio_path):
+        if not _audio_is_effectively_silent(audio_data):
+            spans = _detect_silero_speech_spans(audio_data, threshold=vad_threshold) if vad_enabled else None
+            if spans is None:
+                yield audio_data, window_offset
+            else:
+                logger.debug(
+                    "openvino-whisper VAD selected %d spans at offset %.2fs for %s",
+                    len(spans), window_offset, audio_path,
+                )
+                for span in spans:
+                    start = max(0, min(len(audio_data), span.start_sample))
+                    end = max(start, min(len(audio_data), span.end_sample))
+                    if end > start:
+                        # Materialize only the span being transcribed; never a
+                        # list of all audio slices selected by VAD.
+                        yield audio_data[start:end], window_offset + start / float(_ASR_SAMPLE_RATE)
+        del audio_data
 
-    audio_data, audio_duration = _read_wav_as_float_mono_16k(audio_path)
-    if not audio_data:
-        return []
-    if _audio_is_effectively_silent(audio_data):
-        logger.info("skipping openvino-whisper for effectively silent audio %s", audio_path)
-        return []
 
-    spans: list[_OpenVinoSpeechSpan] | None = None
-    if vad_enabled:
-        spans = _detect_silero_speech_spans(audio_data, threshold=vad_threshold)
-        if spans == []:
-            logger.info("skipping openvino-whisper because VAD found no speech in %s", audio_path)
-            return []
-        if spans is not None:
-            speech_seconds = sum(span.duration_seconds for span in spans)
-            logger.info(
-                "openvino-whisper VAD selected %d speech spans (%.2fs / %.2fs) for %s",
-                len(spans),
-                speech_seconds,
-                audio_duration,
-                audio_path,
-            )
-
-    pipeline = _get_openvino_pipeline(model_name, str(device or "GPU").strip() or "GPU")
+def _openvino_generation_options(
+    pipeline: Any,
+    *,
+    language: str,
+    num_beams: int,
+    max_new_tokens: int,
+) -> tuple[Any, dict[str, Any]]:
     generation_config = None
     if hasattr(pipeline, "get_generation_config"):
         try:
@@ -1441,20 +1688,37 @@ def transcribe_openvino_whisper(
         if lang_token is not None:
             generate_kwargs["language"] = lang_token
 
-    work_items: list[tuple[list[float], float]]
-    if spans is None:
-        work_items = [(audio_data, 0.0)]
-    else:
-        work_items = [
-            (audio_data[span.start_sample : span.end_sample], span.start_sample / float(_ASR_SAMPLE_RATE))
-            for span in spans
-            if span.end_sample > span.start_sample
-        ]
+    return generation_config, generate_kwargs
 
+
+def transcribe_openvino_whisper(
+    audio_path: Path,
+    model_name: str,
+    language: str = "auto",
+    device: str = "GPU",
+    num_beams: int = 1,
+    max_new_tokens: int = 448,
+    vad_enabled: bool = True,
+    vad_threshold: float = _OPENVINO_VAD_THRESHOLD,
+) -> list[Segment]:
+    model_name = str(model_name or "").strip()
+    if not model_name:
+        raise RuntimeError("OpenVINO ASR requires a converted Whisper model path")
+
+    pipeline = None
+    generation_config = None
+    generate_kwargs: dict[str, Any] = {}
     chunks: list[_OpenVinoChunk] = []
-    for speech_audio, offset_seconds in work_items:
-        if not speech_audio:
-            continue
+    for speech_audio, offset_seconds in _iter_openvino_speech_windows(
+        audio_path, vad_enabled=vad_enabled, vad_threshold=vad_threshold,
+    ):
+        if pipeline is None:
+            pipeline = _get_openvino_pipeline(model_name, str(device or "GPU").strip() or "GPU")
+            generation_config, generate_kwargs = _openvino_generation_options(
+                pipeline, language=language, num_beams=num_beams, max_new_tokens=max_new_tokens,
+            )
+        # OpenVINO GenAI's std::vector<float> binding accepts packed float
+        # sequences such as array('f'), without a Python float list conversion.
         if generation_config is not None:
             result = pipeline.generate(speech_audio, generation_config=generation_config, **generate_kwargs)
         else:
@@ -1466,6 +1730,7 @@ def transcribe_openvino_whisper(
                 offset_seconds=offset_seconds,
             )
         )
+        del result, speech_audio
 
     out = _dedupe_overlapping_asr_segments(_filter_faster_whisper_segments(chunks))
     if chunks:
@@ -2022,6 +2287,70 @@ def probe_video_resolution(ffmpeg_path: str, video_path: Path) -> tuple[int, int
     return 1920, 1080
 
 
+def _pixel_format_bit_depth(pixel_format: str) -> int:
+    value = str(pixel_format or "").strip().lower()
+    if not value:
+        return 8
+    match = re.search(r"(?:^p0|p)(9|10|12|14|16)(?:le|be)?$", value)
+    if match:
+        return int(match.group(1))
+    match = re.search(r"^(?:gray|ya)(9|10|12|14|16)(?:le|be)?$", value)
+    if match:
+        return int(match.group(1))
+    if re.match(r"^(?:rgb|bgr)48(?:le|be)?$", value):
+        return 16
+    if re.match(r"^(?:rgba|bgra)64(?:le|be)?$", value):
+        return 16
+    return 8
+
+
+def probe_video_bit_depth(ffmpeg_path: str, video_path: Path) -> int:
+    """Return the source video component depth, defaulting safely to 8-bit."""
+    ffmpeg_cmd = str(ffmpeg_path or "").strip() or "ffmpeg"
+    ffmpeg_bin = Path(ffmpeg_cmd)
+    ffprobe_name = "ffprobe" + ffmpeg_bin.suffix if ffmpeg_bin.suffix else "ffprobe"
+    candidates = dict.fromkeys((str(ffmpeg_bin.with_name(ffprobe_name)), shutil.which("ffprobe") or "ffprobe"))
+
+    for candidate in candidates:
+        if not candidate:
+            continue
+        try:
+            proc = subprocess.run(
+                [
+                    candidate,
+                    "-v",
+                    "error",
+                    "-select_streams",
+                    "v:0",
+                    "-show_entries",
+                    "stream=pix_fmt,bits_per_raw_sample",
+                    "-of",
+                    "json",
+                    str(video_path),
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            data = json.loads(proc.stdout or "{}")
+            streams = data.get("streams")
+            if not isinstance(streams, list) or not streams or not isinstance(streams[0], dict):
+                continue
+            stream = streams[0]
+            try:
+                raw_depth = int(str(stream.get("bits_per_raw_sample") or "").strip())
+            except (TypeError, ValueError):
+                raw_depth = 0
+            pixel_format_depth = _pixel_format_bit_depth(str(stream.get("pix_fmt") or ""))
+            if raw_depth > 0:
+                return max(raw_depth, pixel_format_depth)
+            return pixel_format_depth
+        except Exception:
+            continue
+
+    return 8
+
+
 def _char_width_units(ch: str) -> float:
     if not ch:
         return 0.0
@@ -2232,6 +2561,76 @@ def segments_to_ass(
     )
 
 
+def _intel_vaapi_device_args(device: str) -> list[str]:
+    return [
+        "-init_hw_device",
+        f"vaapi=va:{device}",
+        "-filter_hw_device",
+        "va",
+    ]
+
+
+def _intel_vaapi_decode_args() -> list[str]:
+    return [
+        "-hwaccel",
+        "vaapi",
+        "-hwaccel_device",
+        "va",
+        "-hwaccel_output_format",
+        "vaapi",
+    ]
+
+
+def _vaapi_hardware_decode_available(
+    ffmpeg_path: str,
+    video_path: Path,
+    *,
+    device: str,
+    vaapi_pixel_format: str,
+    software_pixel_format: str,
+    log_path: Path | None,
+    live_upload_cb: Callable[[], None] | None,
+) -> bool:
+    """Decode one frame through VAAPI before committing to a full render."""
+    cmd = [
+        ffmpeg_path,
+        "-hide_banner",
+        "-v",
+        "error",
+        *_intel_vaapi_device_args(device),
+        *_intel_vaapi_decode_args(),
+        "-i",
+        str(video_path),
+        "-map",
+        "0:v:0",
+        "-frames:v",
+        "1",
+        "-an",
+        "-sn",
+        "-dn",
+        "-vf",
+        f"scale_vaapi=format={vaapi_pixel_format},hwdownload,format={software_pixel_format}",
+        "-f",
+        "null",
+        "-",
+    ]
+    try:
+        _run_logged(cmd, log_path=log_path, live_upload_cb=live_upload_cb)
+    except (OSError, subprocess.CalledProcessError) as exc:
+        message = (
+            "VAAPI hardware decode preflight failed; falling back to software decode with VAAPI encode "
+            f"({type(exc).__name__})"
+        )
+        logger.warning("%s: %s", message, video_path)
+        _append_processing_log_note(log_path, message)
+        return False
+    _append_processing_log_note(
+        log_path,
+        f"VAAPI hardware decode preflight succeeded: format={software_pixel_format}",
+    )
+    return True
+
+
 def render_burn_in(
     ffmpeg_path: str,
     video_path: Path,
@@ -2300,8 +2699,40 @@ def render_burn_in(
             quality = _intel_av1_quality(preset)
         if quality is not None:
             video_args.extend(["-quality", str(quality)])
-        cmd.extend(["-vaapi_device", device])
-        filter_arg = f"{ass_filter},format=nv12,hwupload"
+        source_bit_depth = probe_video_bit_depth(ffmpeg_path, video_path)
+        preserve_10bit = codec == "av1" and source_bit_depth > 8
+        target_bit_depth = 10 if preserve_10bit else 8
+        vaapi_pixel_format = "p010" if preserve_10bit else "nv12"
+        software_pixel_format = "p010le" if preserve_10bit else "nv12"
+        cmd.extend(_intel_vaapi_device_args(device))
+        hardware_decode = _vaapi_hardware_decode_available(
+            ffmpeg_path,
+            video_path,
+            device=device,
+            vaapi_pixel_format=vaapi_pixel_format,
+            software_pixel_format=software_pixel_format,
+            log_path=log_path,
+            live_upload_cb=live_upload_cb,
+        )
+        if hardware_decode:
+            cmd.extend(_intel_vaapi_decode_args())
+            filter_arg = (
+                f"scale_vaapi=format={vaapi_pixel_format},"
+                f"hwdownload,format={software_pixel_format},"
+                f"{ass_filter},format={software_pixel_format},hwupload"
+            )
+            decode_mode = "vaapi"
+        else:
+            filter_arg = f"{ass_filter},format={software_pixel_format},hwupload"
+            decode_mode = "software-fallback"
+        bit_depth_note = (
+            f"Intel render pipeline: decode={decode_mode} source_bit_depth={source_bit_depth} "
+            f"output_bit_depth={target_bit_depth} software_format={software_pixel_format}"
+        )
+        if codec in {"h264", "avc"} and source_bit_depth > 8:
+            bit_depth_note += " (h264_vaapi output is limited to the 8-bit NV12 path)"
+        logger.info(bit_depth_note)
+        _append_processing_log_note(log_path, bit_depth_note)
     elif codec in {"h264", "avc"}:
         effective_crf = 18 if crf is None else max(0, min(51, int(crf)))
         allowed_presets = {
@@ -2336,14 +2767,14 @@ def render_burn_in(
 
     cmd.extend(
         [
-        "-i",
-        str(video_path),
-        "-vf",
-        filter_arg,
-        *video_args,
-        "-c:a",
-        "copy",
-        str(output_path),
+            "-i",
+            str(video_path),
+            "-vf",
+            filter_arg,
+            *video_args,
+            "-c:a",
+            "copy",
+            str(output_path),
         ]
     )
     _run_logged(cmd, log_path=log_path, live_upload_cb=live_upload_cb)

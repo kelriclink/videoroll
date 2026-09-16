@@ -12,12 +12,21 @@ from defusedxml.ElementTree import fromstring
 
 logger = logging.getLogger(__name__)
 
+MAX_FEED_FAILURE_REASON_LEN = 500
+MAX_FEED_ERROR_LEN = 2000
+
 
 @dataclass(frozen=True)
 class FeedEntry:
     video_id: str
     title: str
-    published_at: datetime
+    published_at: datetime | None
+
+
+def _bounded_error_message(message: str, *, limit: int) -> str:
+    if len(message) <= limit:
+        return message
+    return message[: limit - 1] + "…"
 
 
 def _parse_datetime(value: str) -> datetime:
@@ -26,11 +35,7 @@ def _parse_datetime(value: str) -> datetime:
     return datetime.fromisoformat(value)
 
 
-def _utcnow() -> datetime:
-    return datetime.now(tz=timezone.utc)
-
-
-def _parse_ytdlp_entry_datetime(entry: dict[str, Any]) -> datetime:
+def _parse_ytdlp_entry_datetime(entry: dict[str, Any]) -> datetime | None:
     ts = entry.get("timestamp") or entry.get("release_timestamp")
     if ts is not None:
         try:
@@ -48,7 +53,7 @@ def _parse_ytdlp_entry_datetime(entry: dict[str, Any]) -> datetime:
         except Exception:
             pass
 
-    return _utcnow()
+    return None
 
 
 def _fetch_feed_ytdlp(
@@ -94,12 +99,9 @@ def _fetch_feed_ytdlp(
     d = info if isinstance(info, dict) else {}
     entries = d.get("entries")
     if entries is None:
-        return []
+        raise RuntimeError("yt-dlp did not return a source listing")
     if not isinstance(entries, list):
-        try:
-            entries = list(entries)  # type: ignore[arg-type]
-        except Exception:
-            return []
+        entries = list(entries)
 
     out: list[FeedEntry] = []
     for item in entries:
@@ -121,7 +123,7 @@ def _fetch_feed_ytdlp(
 
 
 def _merge_channel_entries(*entry_sets: Iterable[FeedEntry]) -> list[FeedEntry]:
-    """Combine the Videos and Shorts tabs into one newest-first source feed."""
+    """Sort known dates newest first, keeping undated entries in discovery order."""
     merged: list[FeedEntry] = []
     seen_video_ids: set[str] = set()
     for entries in entry_sets:
@@ -131,7 +133,12 @@ def _merge_channel_entries(*entry_sets: Iterable[FeedEntry]) -> list[FeedEntry]:
                 continue
             seen_video_ids.add(video_id)
             merged.append(entry)
-    return sorted(merged, key=lambda entry: entry.published_at, reverse=True)
+    dated_entries = sorted(
+        (entry for entry in merged if entry.published_at is not None),
+        key=lambda entry: entry.published_at,
+        reverse=True,
+    )
+    return dated_entries + [entry for entry in merged if entry.published_at is None]
 
 
 def _fetch_channel_uploads_ytdlp(
@@ -157,20 +164,21 @@ def _fetch_channel_uploads_ytdlp(
                 )
             )
         except Exception as exc:
-            failures.append(f"{tab}: {type(exc).__name__}")
+            reason = _bounded_error_message(str(exc), limit=MAX_FEED_FAILURE_REASON_LEN)
+            failures.append(f"{tab}: {reason}")
     combined = _merge_channel_entries(*feeds)
     if limit is not None:
         try:
             combined = combined[: max(1, int(limit))]
         except Exception:
             pass
-    if combined:
-        if failures:
-            logger.warning("YouTube channel %s scan was partial (%s)", source_id, ", ".join(failures))
-        return combined
     if failures:
-        raise RuntimeError("; ".join(failures))
-    return []
+        message = _bounded_error_message("; ".join(failures), limit=MAX_FEED_ERROR_LEN)
+        if not feeds:
+            raise RuntimeError(message)
+        warning = f"YouTube channel {source_id} scan was partial ({message})"
+        logger.warning("%s", _bounded_error_message(warning, limit=MAX_FEED_ERROR_LEN))
+    return combined
 
 
 def _fetch_feed_rss(
@@ -193,54 +201,43 @@ def _fetch_feed_rss(
     proxy = (proxy or "").strip() or None
     client_kwargs: dict[str, Any] = {"timeout": timeout_s, "headers": headers, "follow_redirects": True}
     if proxy:
-        try:
-            client_kwargs["proxy"] = proxy
-        except Exception:
-            pass
+        client_kwargs["proxy"] = proxy
 
     # 2025+ YouTube RSS feeds are intermittently unavailable (often 404).
-    # Prefer RSS when it works (fast), but fall back to yt-dlp extraction when it doesn't.
-    text: Optional[str] = None
+    # Let the caller distinguish these failures from a valid, empty Atom feed.
     try:
-        try:
-            with httpx.Client(**client_kwargs) as client:
-                resp = client.get(url)
-                resp.raise_for_status()
-                text = resp.text
-        except TypeError:
-            with httpx.Client(timeout=timeout_s, headers=headers, follow_redirects=True) as client:
-                resp = client.get(url)
-                resp.raise_for_status()
-                text = resp.text
-    except Exception:
-        text = None
+        with httpx.Client(**client_kwargs) as client:
+            resp = client.get(url)
+            resp.raise_for_status()
+            text = resp.text
+    except TypeError:
+        with httpx.Client(timeout=timeout_s, headers=headers, follow_redirects=True) as client:
+            resp = client.get(url)
+            resp.raise_for_status()
+            text = resp.text
 
-    if text:
-        try:
-            root = fromstring(text)
-            ns = {
-                "atom": "http://www.w3.org/2005/Atom",
-                "yt": "http://www.youtube.com/xml/schemas/2015",
-            }
-            out: list[FeedEntry] = []
-            for entry in root.findall("atom:entry", ns):
-                video_id_el = entry.find("yt:videoId", ns)
-                title_el = entry.find("atom:title", ns)
-                published_el = entry.find("atom:published", ns)
-                if video_id_el is None or title_el is None or published_el is None:
-                    continue
-                out.append(
-                    FeedEntry(
-                        video_id=(video_id_el.text or "").strip(),
-                        title=(title_el.text or "").strip(),
-                        published_at=_parse_datetime((published_el.text or "").strip()),
-                    )
-                )
-            return out
-        except Exception:
-            return []
-
-    return []
+    root = fromstring(text)
+    ns = {
+        "atom": "http://www.w3.org/2005/Atom",
+        "yt": "http://www.youtube.com/xml/schemas/2015",
+    }
+    if root.tag != f"{{{ns['atom']}}}feed":
+        raise ValueError("YouTube RSS response is not an Atom feed")
+    out: list[FeedEntry] = []
+    for entry in root.findall("atom:entry", ns):
+        video_id_el = entry.find("yt:videoId", ns)
+        title_el = entry.find("atom:title", ns)
+        published_el = entry.find("atom:published", ns)
+        if video_id_el is None or title_el is None or published_el is None:
+            continue
+        out.append(
+            FeedEntry(
+                video_id=(video_id_el.text or "").strip(),
+                title=(title_el.text or "").strip(),
+                published_at=_parse_datetime((published_el.text or "").strip()),
+            )
+        )
+    return out
 
 
 def fetch_youtube_feed(
@@ -255,57 +252,39 @@ def fetch_youtube_feed(
     # YouTube's RSS feed exposes only the most recent 15 uploads and does not
     # reliably expose the full Shorts tab. Channels therefore use yt-dlp first
     # and merge their Videos and Shorts tabs; RSS remains an outage fallback.
+    attempts: list[tuple[str, Any]]
     if source_type == "channel":
-        try:
-            entries = _fetch_channel_uploads_ytdlp(
-                source_id,
-                user_agent,
-                proxy=proxy,
-                limit=limit,
-            )
-        except Exception:
-            entries = []
-        if entries:
-            for entry in entries:
-                yield entry
-            return
-
-        try:
-            entries = _fetch_feed_rss(source_type, source_id, user_agent, timeout_s, proxy=proxy)
-        except Exception:
-            entries = []
-        if entries:
-            for entry in entries:
-                yield entry
-            return
-        return
-
-    # Playlists may be represented by RSS, and do not have a separate Shorts tab.
-    prefer_rss_first = False
-    if limit is not None:
-        try:
-            prefer_rss_first = int(limit) <= 15
-        except Exception:
-            prefer_rss_first = False
-
-    attempts: list[tuple[str, Any]] = []
-    if prefer_rss_first:
         attempts = [
+            ("yt-dlp", lambda: _fetch_channel_uploads_ytdlp(source_id, user_agent, proxy=proxy, limit=limit)),
             ("rss", lambda: _fetch_feed_rss(source_type, source_id, user_agent, timeout_s, proxy=proxy)),
-            ("ytdlp", lambda: _fetch_feed_ytdlp(source_type, source_id, user_agent, proxy=proxy, limit=limit)),
         ]
     else:
+        # Playlists may be represented by RSS, and do not have a separate Shorts tab.
         attempts = [
-            ("ytdlp", lambda: _fetch_feed_ytdlp(source_type, source_id, user_agent, proxy=proxy, limit=limit)),
+            ("yt-dlp", lambda: _fetch_feed_ytdlp(source_type, source_id, user_agent, proxy=proxy, limit=limit)),
             ("rss", lambda: _fetch_feed_rss(source_type, source_id, user_agent, timeout_s, proxy=proxy)),
         ]
+        if limit is not None:
+            try:
+                if int(limit) <= 15:
+                    attempts.reverse()
+            except (TypeError, ValueError):
+                pass
 
-    for _name, loader in attempts:
+    failures: list[str] = []
+    successful_fetch = False
+    for name, loader in attempts:
         try:
             entries = loader()
-        except Exception:
-            entries = []
+        except Exception as exc:
+            reason = _bounded_error_message(str(exc), limit=MAX_FEED_FAILURE_REASON_LEN)
+            failures.append(f"{name}: {reason}")
+            continue
+        successful_fetch = True
         if entries:
             for entry in entries:
                 yield entry
             return
+    if not successful_fetch:
+        message = "all YouTube feed fetch attempts failed: " + "; ".join(failures)
+        raise RuntimeError(_bounded_error_message(message, limit=MAX_FEED_ERROR_LEN))

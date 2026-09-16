@@ -36,3 +36,12 @@ export async function fetchJson<T>(url: string, init?: RequestInit): Promise<T> 
   if (resp.status === 204) return undefined as T;
   return (await resp.json()) as T;
 }
+
+export async function fetchText(url: string, init?: RequestInit): Promise<string> {
+  const resp = await fetch(url, { credentials: "include", ...init });
+  if (!resp.ok) {
+    const text = await resp.text().catch(() => "");
+    throw new HttpError(resp, text || `${resp.status} ${resp.statusText}`, text || null);
+  }
+  return await resp.text();
+}

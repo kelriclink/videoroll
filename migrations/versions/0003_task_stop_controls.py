@@ -13,6 +13,8 @@ from alembic import op
 import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql
 
+from videoroll.db.schema_compat import add_column_if_missing
+
 
 revision: str = "0003_task_stop_controls"
 down_revision: str | None = "0002_bilibili_upload_progress"
@@ -21,9 +23,13 @@ depends_on: str | Sequence[str] | None = None
 
 
 def upgrade() -> None:
-    op.add_column(
+    add_column_if_missing(
         "tasks",
-        sa.Column("stopped_status", postgresql.ENUM(name="task_status", create_type=False), nullable=True),
+        sa.Column(
+            "stopped_status",
+            postgresql.ENUM(name="task_status", create_type=False).with_variant(sa.String(32), "sqlite"),
+            nullable=True,
+        ),
     )
 
 

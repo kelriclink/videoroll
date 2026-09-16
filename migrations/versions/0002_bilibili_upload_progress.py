@@ -12,6 +12,8 @@ from collections.abc import Sequence
 from alembic import op
 import sqlalchemy as sa
 
+from videoroll.db.schema_compat import add_column_if_missing
+
 
 revision: str = "0002_bilibili_upload_progress"
 down_revision: str | None = "0001_security_architecture"
@@ -20,11 +22,11 @@ depends_on: str | Sequence[str] | None = None
 
 
 def upgrade() -> None:
-    op.add_column(
+    add_column_if_missing(
         "publish_jobs",
         sa.Column("upload_progress", sa.Integer(), server_default=sa.text("0"), nullable=False),
     )
-    op.add_column(
+    add_column_if_missing(
         "publish_jobs",
         sa.Column("upload_active", sa.Boolean(), server_default=sa.false(), nullable=False),
     )

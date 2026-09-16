@@ -1,0 +1,14 @@
+.git
+.github
+target
+node_modules
+frontend/dist
+dist
+tests/assets
+*.db
+*.log
+data
+tmp
+*.tar
+*.tar.gz
+*.zip

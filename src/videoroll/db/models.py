@@ -194,6 +194,34 @@ class Asset(Base):
     )
 
 
+class PlayoutAssetLink(Base):
+    """Server-side mapping from a VideoRoll asset to ffplayout media."""
+
+    __tablename__ = "playout_asset_links"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    task_id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), ForeignKey("tasks.id", ondelete="CASCADE"), nullable=False)
+    asset_id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), ForeignKey("assets.id", ondelete="CASCADE"), nullable=False)
+
+    ffplayout_channel_id: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    relative_media_path: Mapped[str] = mapped_column(Text, nullable=False)
+    transfer_mode: Mapped[str] = mapped_column(String(16), nullable=False)
+    source_checksum: Mapped[str] = mapped_column(String(64), nullable=False)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("asset_id", name="uq_playout_asset_links_asset_id"),
+        UniqueConstraint(
+            "ffplayout_channel_id",
+            "relative_media_path",
+            name="uq_playout_asset_links_channel_path",
+        ),
+        Index("ix_playout_asset_links_task", "task_id"),
+    )
+
+
 class Subtitle(Base):
     __tablename__ = "subtitles"
 

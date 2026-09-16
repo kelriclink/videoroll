@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import sys
+import tempfile
 import types
 import unittest
+import wave
 from pathlib import Path
 from unittest.mock import patch
 
@@ -22,27 +24,32 @@ from videoroll.apps.subtitle_service import processing
 
 
 class ProcessingAsrSilenceTests(unittest.TestCase):
+    def setUp(self) -> None:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.audio_path = Path(directory.name) / "silent.wav"
+        with wave.open(str(self.audio_path), "wb") as target:
+            target.setnchannels(1)
+            target.setsampwidth(2)
+            target.setframerate(16000)
+            target.writeframes(b"\x00\x00" * 32000)
+
     def test_audio_silence_probe_distinguishes_real_signal(self) -> None:
         self.assertTrue(processing._audio_is_effectively_silent([0.0] * 128))
         self.assertTrue(processing._audio_is_effectively_silent([0.0005, -0.0005] * 128))
         self.assertFalse(processing._audio_is_effectively_silent([0.0, 0.03] * 128))
 
     def test_transcribe_faster_whisper_skips_model_for_effectively_silent_audio(self) -> None:
-        with patch.object(processing, "_read_wav_as_float_mono_16k", return_value=([0.0] * 320, 2.0)):
-            segments = processing.transcribe_faster_whisper(
-                Path("/tmp/silent.wav"),
-                model_name="tiny",
-            )
+        segments = processing.transcribe_faster_whisper(self.audio_path, model_name="tiny")
 
         self.assertEqual(segments, [])
 
     def test_transcribe_openvino_whisper_skips_pipeline_for_effectively_silent_audio(self) -> None:
         with (
-            patch.object(processing, "_read_wav_as_float_mono_16k", return_value=([0.0] * 320, 2.0)),
             patch.object(processing, "_get_openvino_pipeline", side_effect=AssertionError("pipeline should not be created")),
         ):
             segments = processing.transcribe_openvino_whisper(
-                Path("/tmp/silent.wav"),
+                self.audio_path,
                 model_name="/models/whisper/whisper-large-v3-ov",
                 language="auto",
                 device="GPU",

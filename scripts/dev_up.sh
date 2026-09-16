@@ -41,7 +41,9 @@ if [[ ! -f "$ENV_FILE" ]]; then
   echo "Created $ENV_FILE with unique local development secrets"
 fi
 
-install -d -m 0700 data/secrets data/models data/storage data/redis
+install -d -m 0700 data/secrets data/models data/storage data/redis \
+  data/storage/playout-media data/ffplayout/db data/ffplayout/logs \
+  data/ffplayout/playlists data/ffplayout/public
 
 docker compose -f docker-compose.yml --env-file "$ENV_FILE" up --build -d
 

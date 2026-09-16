@@ -11,8 +11,7 @@ from sqlalchemy.orm import Session
 
 from videoroll.config import YouTubeIngestSettings, get_youtube_ingest_settings
 from videoroll.apps.security.service_auth import install_internal_service_auth, service_token
-from videoroll.db.base import Base
-from videoroll.db.auto_migrate import auto_migrate
+from videoroll.db.migrate import initialize_database
 from videoroll.db.models import (
     IngestedVideo,
     SourceType,
@@ -20,7 +19,7 @@ from videoroll.db.models import (
     TaskStatus,
     YouTubeSource,
 )
-from videoroll.db.session import db_session, get_engine
+from videoroll.db.session import db_session
 from videoroll.storage.filesystem import FileStore
 from videoroll.apps.youtube_ingest.schemas import (
     YouTubeIngestRequest,
@@ -69,9 +68,7 @@ install_internal_service_auth(app, get_youtube_ingest_settings)
 def _startup() -> None:
     settings = get_youtube_ingest_settings()
     app.state.internal_service_token = service_token(settings)
-    engine = get_engine(settings.database_url)
-    Base.metadata.create_all(engine)
-    auto_migrate(settings.database_url)
+    initialize_database(settings.database_url)
     FileStore(settings).ensure_ready()
 
 

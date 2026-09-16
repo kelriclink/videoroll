@@ -22,10 +22,9 @@ from sqlalchemy.exc import ProgrammingError
 from videoroll.ai.service import AIService
 from videoroll.apps.security.service_auth import install_internal_service_auth, service_token
 from videoroll.config import SubtitleServiceSettings, get_subtitle_settings
-from videoroll.db.base import Base
-from videoroll.db.auto_migrate import auto_migrate
+from videoroll.db.migrate import initialize_database
 from videoroll.db.models import Asset, AssetKind, RenderJob, RenderJobStatus, SourceType, SubtitleJob, SubtitleJobStatus, Task, TaskStatus
-from videoroll.db.session import db_session, get_engine
+from videoroll.db.session import db_session
 from videoroll.storage.filesystem import FileStore
 from videoroll.apps.subtitle_service.schemas import (
     ASRDefaultsRead,
@@ -117,7 +116,12 @@ from videoroll.apps.subtitle_service.dictionaries import (
     update_dictionary_source,
 )
 from videoroll.apps.subtitle_service.translate_settings_store import get_translate_settings, update_translate_settings
-from videoroll.apps.subtitle_service.worker_concurrency import sync_subtitle_worker_concurrency_for_task_queue_settings
+from videoroll.apps.subtitle_service.memory_policy import load_memory_admission, local_asr_budget_mb, memory_wait_reason
+from videoroll.apps.subtitle_service.worker_concurrency import (
+    live_leased_task_ids,
+    sync_subtitle_worker_concurrency_for_task_queue_settings,
+)
+from videoroll.apps.subtitle_service.queues import SUBTITLE_CONTROL_QUEUE
 from videoroll.apps.subtitle_service.worker import TASK_QUEUE_LOCK_OWNER, celery_app
 from videoroll.apps.subtitle_service.processing import (
     transcribe_cloudflare_workers_ai,
@@ -204,7 +208,7 @@ def _is_missing_knowledge_table_error(exc: Exception) -> bool:
 
 def _ensure_rag_schema(settings: SubtitleServiceSettings) -> None:
     try:
-        auto_migrate(settings.database_url, force=True)
+        initialize_database(settings.database_url, force=True)
     except Exception as e:
         raise HTTPException(
             status_code=503,
@@ -315,9 +319,7 @@ install_internal_service_auth(app, get_subtitle_settings)
 def _startup() -> None:
     settings = get_subtitle_settings()
     app.state.internal_service_token = service_token(settings)
-    engine = get_engine(settings.database_url)
-    Base.metadata.create_all(engine)
-    auto_migrate(settings.database_url)
+    initialize_database(settings.database_url)
     FileStore(settings).ensure_ready()
     _models_dir(settings).mkdir(parents=True, exist_ok=True)
     _dictionary_imports_dir(settings).mkdir(parents=True, exist_ok=True)
@@ -1588,6 +1590,16 @@ def test_model_download_proxy(
 
 @app.post("/subtitle/jobs")
 def create_job(payload: SubtitleJobCreate, db: Session = Depends(get_db)) -> dict[str, str]:
+    # Publishing takes the same task-row lock. Recheck the state here even when
+    # the orchestrator already validated it before its internal HTTP request.
+    task = db.get(Task, payload.task_id, with_for_update=True, populate_existing=True)
+    if task is None:
+        raise HTTPException(status_code=404, detail="task not found")
+    if task.status == TaskStatus.published:
+        raise HTTPException(status_code=409, detail="task is already published; create a new task to generate subtitles")
+    if task.status == TaskStatus.canceled:
+        raise HTTPException(status_code=409, detail="task is stopped; resume it before submitting subtitle work")
+
     request_json = payload.model_dump(mode="json")
     if "youtube_subtitle_mode" not in payload.model_fields_set:
         request_json["youtube_subtitle_mode"] = "target" if payload.prefer_youtube_subtitles else "off"
@@ -1597,7 +1609,7 @@ def create_job(payload: SubtitleJobCreate, db: Session = Depends(get_db)) -> dic
     db.add(job)
     db.commit()
     db.refresh(job)
-    celery_app.send_task("subtitle_service.task_queue_tick", args=[], queue="subtitle")
+    celery_app.send_task("subtitle_service.task_queue_tick", args=[], queue=SUBTITLE_CONTROL_QUEUE)
     return {"job_id": str(job.id), "status": job.status.value}
 
 
@@ -1653,14 +1665,27 @@ def _read_task_queue(db: Session, *, limit: int) -> TaskQueueRead:
     cfg = get_task_queue_settings(db)
     now = datetime.now(tz=timezone.utc)
 
+    live_task = Task.status.notin_([TaskStatus.canceled, TaskStatus.published])
     locked_q = db.query(Task).filter(
-        Task.status != TaskStatus.canceled,
+        live_task,
         Task.lock_owner == TASK_QUEUE_LOCK_OWNER,
         Task.lock_until.is_not(None),
         Task.lock_until > now,
     )
-    running_count = int(locked_q.count() or 0)
+    live_job_task_ids = live_leased_task_ids(db, now)
+    locked_task_ids = {task_id for task_id, in locked_q.with_entities(Task.id).all()}
+    running_count = len(locked_task_ids | live_job_task_ids)
     locked = locked_q.order_by(Task.lock_until.asc()).limit(limit).all()
+    visible_task_ids = {task.id for task in locked}
+    if live_job_task_ids and len(locked) < limit:
+        missing_live_tasks = (
+            db.query(Task)
+            .filter(live_task, Task.id.in_(live_job_task_ids - visible_task_ids))
+            .order_by(Task.updated_at.asc(), Task.created_at.asc())
+            .limit(limit - len(locked))
+            .all()
+        )
+        locked.extend(missing_live_tasks)
     locked_ids = [t.id for t in locked]
 
     render_running_by_task: dict[uuid.UUID, RenderJob] = {}
@@ -1781,13 +1806,15 @@ def _read_task_queue(db: Session, *, limit: int) -> TaskQueueRead:
     # the live queue.  Keep this predicate explicit on every queue query so a
     # stale queued/running job cannot make the dashboard show a stopped task.
     unlocked = (
-        (Task.status != TaskStatus.canceled)
+        live_task
         & (
             (Task.lock_owner != TASK_QUEUE_LOCK_OWNER)
             | (Task.lock_until.is_(None))
             | (Task.lock_until <= now)
         )
     )
+    if live_job_task_ids:
+        unlocked = unlocked & Task.id.notin_(live_job_task_ids)
     orphaned_render_by_task: dict[uuid.UUID, RenderJob] = {}
     orphaned_subtitle_by_task: dict[uuid.UUID, SubtitleJob] = {}
     for rj in (
@@ -1977,11 +2004,31 @@ def _read_task_queue(db: Session, *, limit: int) -> TaskQueueRead:
             if len(queued_items) >= remaining:
                 break
 
+    admission = load_memory_admission(db, get_subtitle_settings(), now=now, task_lock_owner=TASK_QUEUE_LOCK_OWNER)
+    items = [*running_items, *queued_items]
+    waiting_job_ids = [
+        item.subtitle_job_id for item in items
+        if item.subtitle_job_id and item.stage in {"subtitle", "waiting_subtitle"}
+    ]
+    waiting_jobs = {
+        job.id: job for job in db.query(SubtitleJob).filter(
+            SubtitleJob.id.in_(waiting_job_ids), SubtitleJob.status == SubtitleJobStatus.queued,
+        ).all()
+    } if waiting_job_ids else {}
+    for item in items:
+        job = waiting_jobs.get(item.subtitle_job_id)
+        if job:
+            item.waiting_reason = memory_wait_reason(job) or admission.reason(item.task_id, admission.budget_for(job))
+        elif item.stage == "recover_pipeline":
+            budget = local_asr_budget_mb(admission.bootstrap_request, admission.defaults, admission.settings)
+            item.waiting_reason = admission.reason(item.task_id, budget)
+
     return TaskQueueRead(
         settings=TaskQueueSettingsRead(**cfg),
         running_count=running_count,
         queued_count=int(queued_count),
-        tasks=[*running_items, *queued_items],
+        tasks=items,
+        admission=admission.summary(int(cfg.get("max_concurrency", 1))),
     )
 
 
@@ -2005,7 +2052,7 @@ def put_task_queue_settings_view(payload: TaskQueueSettingsUpdate, db: Session =
             "subtitle worker concurrency runtime sync incomplete after task queue update: %s",
             runtime_sync.get("detail"),
         )
-    celery_app.send_task("subtitle_service.task_queue_tick", args=[], queue="subtitle")
+    celery_app.send_task("subtitle_service.task_queue_tick", args=[], queue=SUBTITLE_CONTROL_QUEUE)
     return TaskQueueSettingsRead(
         **cfg,
         runtime_worker_concurrency=runtime_sync.get("target_concurrency"),
@@ -2026,7 +2073,7 @@ def post_task_queue_tick() -> dict[str, str]:
     Best-effort scheduler kick.
     Useful when a job is queued but no tick was delivered/consumed.
     """
-    celery_app.send_task("subtitle_service.task_queue_tick", args=[], queue="subtitle")
+    celery_app.send_task("subtitle_service.task_queue_tick", args=[], queue=SUBTITLE_CONTROL_QUEUE)
     return {"status": "queued"}
 
 

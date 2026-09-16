@@ -38,10 +38,9 @@ from videoroll.apps.outbox.worker_inbox import (
 )
 from videoroll.apps.subtitle_service.worker_concurrency import JobLeaseHeartbeat, acquire_job_lease, release_job_lease
 from videoroll.config import get_bilibili_publisher_settings, get_subtitle_settings
-from videoroll.db.base import Base
-from videoroll.db.auto_migrate import auto_migrate
+from videoroll.db.migrate import initialize_database
 from videoroll.db.models import Asset, AssetKind, Platform, PublishJob, PublishState, Task, TaskStatus
-from videoroll.db.session import get_engine, get_sessionmaker
+from videoroll.db.session import get_sessionmaker
 from videoroll.storage.filesystem import FileStore
 from videoroll.apps.subtitle_service.bilibili_tags_store import get_task_bilibili_summary
 from videoroll.apps.subtitle_service.translate_settings_store import get_translate_settings
@@ -91,9 +90,7 @@ def _ensure_db() -> None:
     with _DB_READY_LOCK:
         if _DB_READY_PID == pid:
             return
-        engine = get_engine(settings.database_url)
-        Base.metadata.create_all(engine)
-        auto_migrate(settings.database_url)
+        initialize_database(settings.database_url)
         _DB_READY_PID = pid
 
 

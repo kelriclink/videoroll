@@ -19,6 +19,7 @@ from starlette.datastructures import Headers
 from videoroll.apps.orchestrator_api.services.image_validation import (
     validate_and_reencode_cover,
 )
+from videoroll.apps.orchestrator_api.services import playout_service
 from videoroll.apps.subtitle_service.task_title_store import get_task_display_title_with_s3
 from videoroll.db.models import AppSetting, Asset, AssetKind, Subtitle, Task, TaskStatus
 from videoroll.storage.filesystem import FileStore, StorageObjectNotFound
@@ -579,6 +580,7 @@ def delete_final_asset(
 
     storage_key = asset.storage_key
     try:
+        playout_service.remove_asset_link(asset_id, db=db, storage=s3)
         queue_pending_s3_delete(
             db,
             storage_key,

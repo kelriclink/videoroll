@@ -1,0 +1,284 @@
+import type { JwtPayload } from 'jwt-decode'
+import type { PlayoutConfig, Playlist as Ply } from './playout_config'
+
+export {}
+
+declare global {
+    interface JwtPayloadExt extends JwtPayload {
+        id: number
+        channels: number[]
+        role: string
+        token_type: 'access' | 'refresh'
+    }
+
+    interface PlaylistExt extends Ply {
+        startInSec: number
+        lengthInSec: number
+    }
+
+    interface PlayoutConfigExt extends PlayoutConfig {
+        playlist: PlaylistExt
+    }
+
+    interface PlayoutOutput {
+        id: number
+        name: string
+        hls_variants: string
+        stream_url: string
+        stream_type: 'rtmp' | 'srt' | 'udp' | 'custom' | null
+        stream_format: string | null
+        hls_playlist_name: string | null
+        hls_segment_duration: number | null
+        hls_list_size: number | null
+        desktop_fullscreen: boolean
+        width: number
+        height: number
+        fps: number
+        video_codec: string | null
+        video_options: string
+        protocol_options: string
+        muxer_options: string
+        audio_codec: string | null
+        audio_options: string
+        audio_bitrate: number | null
+        channel_id: number
+    }
+
+    interface CodecOption {
+        name: string
+        display_name: string
+        codec_id: string
+        hardware: boolean
+        uses_bitrate: boolean
+        settings: EncoderSetting[]
+    }
+
+    interface EncoderSetting {
+        key: string
+        label: string
+        kind: 'select' | 'number'
+        default: string
+        choices: EncoderSettingChoice[]
+        minimum: number | null
+        maximum: number | null
+        visible_when: EncoderSettingVisibility | null
+    }
+
+    interface EncoderSettingChoice {
+        value: string
+        label: string
+    }
+
+    interface EncoderSettingVisibility {
+        key: string
+        value: string
+    }
+
+    interface OutputCodecOptions {
+        video: CodecOption[]
+        audio: CodecOption[]
+    }
+
+    interface PlayoutCodecOptions {
+        hls: OutputCodecOptions
+        rtmp: OutputCodecOptions
+        srt: OutputCodecOptions
+        udp: OutputCodecOptions
+        custom: OutputCodecOptions
+        recording: OutputCodecOptions
+    }
+
+    interface TextPreset {
+        id: number
+        channel_id: number
+        persistent: boolean
+        name: string
+        text: string
+        use_filename: boolean
+        font_family: string
+        font_weight: 'normal' | 'semibold' | 'bold'
+        filename_regex: string
+        position_x: string
+        position_y: string
+        font_size: number
+        line_spacing: number
+        text_color: string
+        text_opacity: number
+        background_enabled: boolean
+        background_color: string
+        background_opacity: number
+        background_padding: number
+        opacity: number
+        scroll_direction: 'none' | 'left_to_right' | 'right_to_left'
+        scroll_speed: number
+        scroll_repeat: number
+        fade_in_seconds: number
+        fade_out_seconds: number
+    }
+
+    interface Token {
+        access: string
+        refresh: string
+    }
+
+    interface DataAuth {
+        uuid: string
+    }
+
+    interface Channel {
+        id: number
+        extra_extensions: string | string[]
+        name: string
+        preview_url: string
+        public: string
+        playlists: string
+        storage: string
+        timezone?: string
+    }
+
+    interface GlobalSettings {
+        smtp_server: string
+        smtp_user: string
+        smtp_password_set: boolean
+        smtp_starttls: boolean
+        smtp_port: number
+        notification_server: string
+        notification_token_set: boolean
+    }
+
+    interface User {
+        id: number
+        username: string
+        mail?: string
+        password?: string
+        confirm?: string
+        admin?: boolean
+        channel_ids?: number[]
+        role_id?: number
+        two_factor: boolean
+    }
+
+    interface Crumb {
+        text: string
+        path: string
+    }
+
+    interface Payload {
+        method: string
+        headers: any
+        body?: any
+    }
+
+    interface Playlist {
+        channel: string
+        date: string
+        program: PlaylistItem[]
+    }
+
+    interface PlaylistItem {
+        date?: string
+        uid: string
+        begin: number
+        title?: string | null
+        source: string
+        audio?: string
+        duration: number
+        in: number
+        out: number
+        ad?: boolean
+        overtime?: boolean
+    }
+
+    interface FileObject {
+        name: string
+        duration: number
+    }
+
+    interface Folder {
+        uid: string
+        name: string
+    }
+
+    interface FileFolderObject {
+        source: string
+        parent: string
+        parent_folders: Folder[]
+        folders: Folder[]
+        files: FileObject[]
+    }
+
+    interface FolderObject {
+        source: string
+        parent: string
+        folders: Folder[]
+    }
+
+    interface SourceObject {
+        type: string
+        src: string
+    }
+
+    interface TemplateItem {
+        start: string
+        duration: string
+        shuffle: boolean
+        paths: string[] | any[]
+    }
+
+    interface Template {
+        sources: TemplateItem[]
+    }
+
+    interface BodyObject {
+        paths?: string[]
+        shuffle?: boolean
+        template?: Template
+    }
+
+    interface SystemStatistics {
+        cpu: { cores: number; usage: number }
+        load: { one: number; five: number; fifteen: number }
+        memory: { total: number; used: number; process: number }
+        network?: { name: string; current_in: number; current_out: number; total_in: number; total_out: number }
+        storage?: { path: string; total: number; free: number }
+        swap: { total: number; used: number; free: number }
+        system: { name?: string; kernel?: string; version?: string; ffp_version?: string }
+    }
+
+    interface PlayoutStatus {
+        media: PlaylistItem
+        index: number
+        audio?: AudioLevel
+        loudness?: LiveLoudnessMetrics
+        ingest: boolean
+        mode: string
+        elapsed: number
+        shift: number
+        title?: string
+    }
+
+    interface AudioLevel {
+        rms_db: number
+        peak_db: number
+    }
+
+    interface LiveLoudnessMetrics {
+        momentary_lufs: number | null
+        short_term_lufs: number | null
+        integrated_lufs: number | null
+        true_peak_dbtp: number | null
+        rider_gain_db: number
+        limiter_gain_reduction_db: number
+    }
+
+    interface SplitTime {
+        id: number
+        val: number
+    }
+
+    declare namespace Intl {
+        type Key = 'calendar' | 'collation' | 'currency' | 'numberingSystem' | 'timeZone' | 'unit'
+
+        function supportedValuesOf(input: Key): string[]
+    }
+}

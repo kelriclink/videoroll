@@ -29,10 +29,9 @@ from videoroll.apps.social_publisher.schemas import (
 )
 from videoroll.apps.social_publisher.worker import celery_app
 from videoroll.config import SocialPublisherSettings, get_social_publisher_settings
-from videoroll.db.auto_migrate import auto_migrate
-from videoroll.db.base import Base
+from videoroll.db.migrate import initialize_database
 from videoroll.db.models import Account, Platform, PublishBatch, PublishJob, PublishState, Task, TaskStatus
-from videoroll.db.session import db_session, get_engine
+from videoroll.db.session import db_session
 
 
 def get_settings() -> SocialPublisherSettings:
@@ -63,9 +62,7 @@ install_internal_service_auth(app, get_social_publisher_settings)
 def _startup() -> None:
     settings = get_social_publisher_settings()
     app.state.internal_service_token = service_token(settings)
-    engine = get_engine(settings.database_url)
-    Base.metadata.create_all(engine)
-    auto_migrate(settings.database_url)
+    initialize_database(settings.database_url)
 
 
 @app.get("/health")

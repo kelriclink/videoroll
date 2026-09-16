@@ -49,6 +49,8 @@ def test_production_mode_rejects_known_default_security_secrets() -> None:
         S3_SECRET_ACCESS_KEY="minio-secret",
         S3_BUCKET="videoroll",
         DEVELOPMENT_MODE=False,
+        INTERNAL_API_SECRET="videoroll-development-internal-secret",
+        ADMIN_BOOTSTRAP_SECRET="videoroll-development-bootstrap-secret",
     )
 
     with pytest.raises(ValueError):
@@ -63,6 +65,8 @@ def test_development_mode_must_be_explicit_for_default_security_secrets() -> Non
         S3_ACCESS_KEY_ID="minio",
         S3_SECRET_ACCESS_KEY="minio-secret",
         S3_BUCKET="videoroll",
+        INTERNAL_API_SECRET="videoroll-development-internal-secret",
+        ADMIN_BOOTSTRAP_SECRET="videoroll-development-bootstrap-secret",
     )
 
     with pytest.raises(ValueError):

@@ -16,8 +16,12 @@
 | `outbox-dispatcher` | 投递 durable outbox，独立于业务 worker | internal |
 | `egress-gateway` | RAG 与网页抓取的唯一公网出口 | internal + egress |
 | `redis` | 队列与调度状态 | internal |
+| `ffplayout` | 独立 SQLite 播控、媒体与 HLS/RTMP/SRT 输出 | internal |
 
 所有需要处理媒体的服务共享同一个只写入 `/storage` 的宿主机挂载；对象 key 是相对于 `/storage/objects` 的路径。
+Orchestrator 将 `video_final` 资产以服务端 hardlink（失败时 `copy2`）加入
+`/storage/playout-media/VideoRoll/<task-id>/`，映射记录位于 PostgreSQL 的
+`playout_asset_links`；ffplayout SQLite 不保存 VideoRoll 业务字段。
 
 ## 网络与访问边界
 
@@ -68,6 +72,7 @@ outbox-dispatcher ──► Redis / Celery
 
 - PostgreSQL 是任务、设置、审计、outbox/inbox 和发布状态的事实来源；启用 `pgvector`。
 - 共享文件系统保存视频、字幕、封面、日志等产物；数据库仅保存元数据与相对存储键。
+- `playout_asset_links` 维护 VideoRoll 成品与 ffplayout 文件的映射；加入播控只接受 `task_id` 和 `asset_id`，不接受客户端路径。
 - schema 使用 Alembic。上线前运行 `python -m videoroll.db.migrate upgrade`；不要依赖旧的自动加列逻辑完成安全 schema 迁移。
 - `data/secrets/fernet.key` 用于加密数据库内的敏感设置。丢失该文件会使已有加密数据不可读。
 

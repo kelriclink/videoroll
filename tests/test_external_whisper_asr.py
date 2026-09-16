@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
+import wave
 
 from videoroll.apps.subtitle_service import processing
 from videoroll.apps.subtitle_service.asr_settings_store import get_asr_settings
@@ -65,14 +66,17 @@ def test_external_whisper_parses_verbose_segments(tmp_path) -> None:
 
 def test_external_whisper_falls_back_to_one_segment_for_plain_text_response(tmp_path) -> None:
     audio_path = tmp_path / "audio.wav"
-    audio_path.write_bytes(b"wav")
+    with wave.open(str(audio_path), "wb") as target:
+        target.setnchannels(1)
+        target.setsampwidth(2)
+        target.setframerate(16000)
+        target.writeframes(b"\x00\x00" * 32000)
     response = MagicMock()
     response.json.return_value = {"text": "Hello"}
     response.raise_for_status.return_value = None
 
     with (
         patch("videoroll.apps.subtitle_service.processing.httpx.post", return_value=response),
-        patch.object(processing, "_read_wav_as_float_mono_16k", return_value=([0.0], 2.0)),
     ):
         segments = processing.transcribe_external_whisper(
             audio_path,

@@ -13,6 +13,9 @@ function defaultOrchestratorUrl(): string {
 
 export const ORCHESTRATOR_URL = env("VITE_ORCHESTRATOR_URL") ?? defaultOrchestratorUrl();
 
+/** Public browser origin for the separately proxied ffplayout service. */
+export const FFPLAYOUT_URL = env("VITE_FFPLAYOUT_URL") ?? "";
+
 /** Build an orchestrator URL without hand-rolled slash handling in pages. */
 export function orchestratorUrl(path: string): string {
   const base = ORCHESTRATOR_URL.replace(/\/+$/, "");

@@ -34,6 +34,7 @@ from videoroll.apps.security.service_auth import (
     ADMIN_BOOTSTRAP_HEADER,
     consume_bootstrap_secret,
 )
+from videoroll.apps.security.trusted_proxies import trusted_proxy_addresses
 from videoroll.db.session import get_sessionmaker
 
 
@@ -61,10 +62,9 @@ def _source_ip(request: Request) -> str:
     except ValueError:
         return "unknown"
 
-    raw_cidrs = str(
-        getattr(getattr(getattr(request, "app", None), "state", None), "trusted_proxy_cidrs", "")
-        or ""
-    )
+    app_state = getattr(getattr(request, "app", None), "state", None)
+    raw_cidrs = str(getattr(app_state, "trusted_proxy_cidrs", "") or "")
+    proxy_addresses = trusted_proxy_addresses(str(getattr(app_state, "trusted_proxy_hosts", "") or ""))
     trusted_networks: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
     for raw_cidr in raw_cidrs.split(",")[:32]:
         cidr = raw_cidr.strip()
@@ -76,9 +76,11 @@ def _source_ip(request: Request) -> str:
             continue
 
     def is_trusted(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
-        return any(address.version == network.version and address in network for network in trusted_networks)
+        return address in proxy_addresses or any(
+            address.version == network.version and address in network for network in trusted_networks
+        )
 
-    if not trusted_networks or not is_trusted(peer):
+    if not is_trusted(peer):
         return peer.compressed
 
     forwarded_values = [

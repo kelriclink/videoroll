@@ -20,6 +20,7 @@ import SettingsPublishPage from "./pages/SettingsPublishPage";
 import SettingsAutoPage from "./pages/SettingsAutoPage";
 import SettingsReviewPage from "./pages/SettingsReviewPage";
 import LivePage from "./pages/LivePage";
+import PlayoutPage from "./pages/PlayoutPage";
 import RenderQueuePage from "./pages/RenderQueuePage";
 import KnowledgeBasePage from "./pages/KnowledgeBasePage";
 import DictionaryPage from "./pages/DictionaryPage";
@@ -59,7 +60,7 @@ function Navigation({ onNavigate }: { onNavigate?: () => void }) {
         <NavItem to="/" label="仪表盘" onNavigate={onNavigate} />
         <NavItem to="/tasks" label="任务" onNavigate={onNavigate} />
         <NavItem to="/videos" label="视频成品" onNavigate={onNavigate} />
-        <NavItem to="/live" label="直播推流" onNavigate={onNavigate} />
+        <NavItem to="/playout" label="播控中心" onNavigate={onNavigate} />
         <NavItem to="/queue/render" label="处理队列" onNavigate={onNavigate} />
         <NavItem to="/knowledge" label="知识库" onNavigate={onNavigate} />
         <NavItem to="/dictionaries" label="词典" onNavigate={onNavigate} />
@@ -96,6 +97,7 @@ function NotFoundPage() {
 
 export default function App() {
   const location = useLocation();
+  const isPlayoutRoute = location.pathname === "/playout";
   const orchestratorDisplay =
     ORCHESTRATOR_URL.startsWith("http://") || ORCHESTRATOR_URL.startsWith("https://")
       ? ORCHESTRATOR_URL
@@ -141,8 +143,18 @@ export default function App() {
     <FeedbackProvider>
       <AuthGate>
         <RealtimeProvider>
-          <div className="min-h-screen bg-slate-50 transition-colors dark:bg-slate-950">
-        <header className="border-b bg-white transition-colors dark:border-slate-800 dark:bg-slate-950">
+      <div
+        className={[
+          "bg-slate-50 transition-colors dark:bg-slate-950",
+          isPlayoutRoute ? "flex h-screen flex-col overflow-hidden" : "min-h-screen",
+        ].join(" ")}
+      >
+        <header
+          className={[
+            "border-b bg-white transition-colors dark:border-slate-800 dark:bg-slate-950",
+            isPlayoutRoute ? "flex-none" : "",
+          ].join(" ")}
+        >
           <div className="mx-auto flex max-w-7xl items-center justify-between px-4 py-3">
             <div className="flex items-center gap-2">
               <button
@@ -214,20 +226,36 @@ export default function App() {
           </div>
         ) : null}
 
-        <div className="mx-auto grid max-w-7xl grid-cols-12 gap-4 px-4 py-4">
-          <aside className="hidden md:col-span-3 md:block lg:col-span-2">
+        <div
+          className={[
+            "mx-auto grid max-w-7xl grid-cols-12 gap-4 px-4 py-4",
+            isPlayoutRoute ? "min-h-0 w-full flex-1 overflow-hidden" : "",
+          ].join(" ")}
+        >
+          <aside
+            className={[
+              "hidden md:col-span-3 md:block lg:col-span-2",
+              isPlayoutRoute ? "min-h-0 overflow-y-auto" : "",
+            ].join(" ")}
+          >
             <Navigation />
             <div className="mt-3 rounded-md border border-slate-200 bg-white p-3 text-xs text-slate-600 shadow-sm dark:border-slate-800 dark:bg-slate-900 dark:text-slate-400">
               后端：{orchestratorDisplay}
             </div>
           </aside>
 
-          <main className="col-span-12 md:col-span-9 lg:col-span-10">
+          <main
+            className={[
+              "col-span-12 md:col-span-9 lg:col-span-10",
+              isPlayoutRoute ? "min-h-0 overflow-hidden" : "",
+            ].join(" ")}
+          >
             <Routes>
               <Route path="/" element={<DashboardPage />} />
               <Route path="/tasks" element={<TasksPage />} />
               <Route path="/videos" element={<VideosPage />} />
               <Route path="/live" element={<LivePage />} />
+              <Route path="/playout" element={<PlayoutPage />} />
               <Route path="/tasks/new" element={<TaskNewPage />} />
               <Route path="/tasks/:taskId" element={<TaskDetailPage />} />
               <Route path="/youtube/sources" element={<YouTubeSourcesPage />} />

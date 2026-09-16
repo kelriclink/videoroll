@@ -38,7 +38,10 @@ COPY docker/social-publisher-entrypoint.sh /app/docker/social-publisher-entrypoi
 COPY docker/verify-social-browser.py /app/docker/verify-social-browser.py
 RUN chmod +x /app/docker/social-publisher-entrypoint.sh
 
-RUN useradd --create-home --uid 10001 videoroll \
+ARG APP_UID=10001
+ARG APP_GID=10001
+RUN groupadd --non-unique --gid "$APP_GID" videoroll \
+    && useradd --non-unique --create-home --uid "$APP_UID" --gid videoroll videoroll \
     && chown -R videoroll:videoroll /ms-playwright /work/social-publisher /opt/social-auto-upload \
     && install -d --owner=videoroll --group=videoroll --mode=0700 /secrets /storage /tmp/videoroll-vnc \
     && install -d --owner=videoroll --group=videoroll --mode=0700 /tmp/videoroll-home
@@ -47,6 +50,8 @@ ENV HOME=/tmp/videoroll-home
 USER videoroll
 
 RUN python /app/docker/verify-social-browser.py
+RUN DATABASE_URL=sqlite:///:memory: REDIS_URL=redis://127.0.0.1:1/0 DEVELOPMENT_MODE=true \
+    python -c "import videoroll.apps.social_publisher.main; import videoroll.apps.social_publisher.worker"
 
 ENTRYPOINT ["/app/docker/social-publisher-entrypoint.sh"]
 CMD ["uvicorn", "videoroll.apps.social_publisher.main:app", "--host", "0.0.0.0", "--port", "8010"]

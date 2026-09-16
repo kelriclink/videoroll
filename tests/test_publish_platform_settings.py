@@ -64,7 +64,7 @@ def test_publish_platforms_can_be_enabled_independently() -> None:
 def test_orchestrator_registers_publish_platform_settings_routes() -> None:
     from videoroll.apps.orchestrator_api.main import app
 
-    paths = {route.path for route in app.routes}
+    paths = app.openapi()["paths"]
     assert "/settings/publish/platforms" in paths
     assert "/settings/publish/platforms/{platform}" in paths
 

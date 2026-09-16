@@ -1,0 +1,203 @@
+name: Release
+
+on:
+  release:
+    types: [released, prereleased]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.platform }}-${{ matrix.variant }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: x86_64-unknown-linux-gnu
+            variant: server
+            features: embed_frontend
+            deb_arch: amd64
+            rpm_arch: x86_64
+          - os: ubuntu-latest
+            platform: x86_64-unknown-linux-gnu
+            variant: desktop
+            features: embed_frontend,desktop
+          - os: ubuntu-24.04-arm
+            platform: aarch64-unknown-linux-gnu
+            variant: server
+            features: embed_frontend
+            deb_arch: arm64
+            rpm_arch: aarch64
+          - os: ubuntu-24.04-arm
+            platform: aarch64-unknown-linux-gnu
+            variant: desktop
+            features: embed_frontend,desktop
+          - os: macos-15-intel
+            platform: x86_64-apple-darwin
+            variant: desktop
+            features: embed_frontend,desktop
+          - os: macos-14
+            platform: aarch64-apple-darwin
+            variant: desktop
+            features: embed_frontend,desktop
+          - os: windows-latest
+            platform: x86_64-pc-windows-msvc
+            variant: desktop
+            features: embed_frontend,desktop
+    runs-on: ${{ matrix.os }}
+
+    env:
+      CARGO_INCREMENTAL: 0
+      CARGO_BUILD_JOBS: 1
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Set up Rust
+        run: |
+          rustup update stable
+
+      - name: Set macOS Rust flags
+        if: runner.os == 'macOS'
+        run: echo 'RUSTFLAGS=-Csplit-debuginfo=packed' >> $GITHUB_ENV
+
+      - name: Install build dependencies on Linux
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y software-properties-common
+          sudo add-apt-repository -y ppa:ubuntuhandbook1/ffmpeg7
+          sudo apt-get update
+          packages=(
+            ffmpeg
+            libavcodec-dev
+            libavdevice-dev
+            libavfilter-dev
+            libavformat-dev
+            libavutil-dev
+            libswresample-dev
+            libswscale-dev
+            pandoc
+            pkg-config
+            rpm
+          )
+          if [[ "${{ matrix.variant }}" == "desktop" ]]; then
+            packages+=(libasound2-dev)
+          fi
+          sudo apt-get install -y "${packages[@]}"
+          ffmpeg -version
+          test "$(pkg-config --modversion libavformat | cut -d. -f1)" -ge 61
+
+      - name: Install build dependencies on macOS
+        if: runner.os == 'macOS'
+        run: |
+          brew update
+          packages=(ffmpeg pkg-config)
+          brew install "${packages[@]}"
+          brew_prefix="$(brew --prefix)"
+          {
+            echo "PKG_CONFIG_PATH=${brew_prefix}/lib/pkgconfig:${brew_prefix}/opt/ffmpeg/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+            echo "LIBRARY_PATH=${brew_prefix}/lib:${brew_prefix}/opt/ffmpeg/lib:${LIBRARY_PATH:-}"
+            echo "DYLD_FALLBACK_LIBRARY_PATH=${brew_prefix}/lib:${brew_prefix}/opt/ffmpeg/lib:${DYLD_FALLBACK_LIBRARY_PATH:-}"
+          } >> "$GITHUB_ENV"
+
+      - name: Download FFmpeg on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ffmpegName = "ffmpeg-n9.0-latest-win64-gpl-shared-9.0"
+          $ffmpegArchive = Join-Path $env:RUNNER_TEMP "$ffmpegName.zip"
+          $ffmpegDir = Join-Path $env:RUNNER_TEMP $ffmpegName
+          $ffmpegUrl = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/$ffmpegName.zip"
+
+          Invoke-WebRequest -Uri $ffmpegUrl -OutFile $ffmpegArchive
+          Expand-Archive -Path $ffmpegArchive -DestinationPath $env:RUNNER_TEMP
+
+          if (!(Test-Path "$ffmpegDir\include") -or
+              !(Test-Path "$ffmpegDir\lib") -or
+              !(Test-Path "$ffmpegDir\bin")) {
+            throw "Downloaded FFmpeg archive has an unexpected structure"
+          }
+
+          echo "FFMPEG_DIR=$ffmpegDir" >> $env:GITHUB_ENV
+          echo "$ffmpegDir\bin" >> $env:GITHUB_PATH
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build on Linux
+        if: runner.os == 'Linux'
+        run: |
+          ./scripts/man_create.sh
+          cargo build --release --no-default-features --features "${{ matrix.features }}"
+          mkdir -p dist
+          tar --transform 's#^target/release/##' \
+            -czf "dist/ffplayout-${{ github.ref_name }}_${{ matrix.variant }}_${{ matrix.platform }}.tar.gz" \
+            --exclude='*.db' \
+            --exclude='*.db-shm' \
+            --exclude='*.db-wal' \
+            assets docker docs migrations LICENSE README.md target/release/ffplayout
+          if [[ "${{ matrix.variant }}" == "server" ]]; then
+            cargo install cargo-deb --locked
+            cargo install cargo-generate-rpm --locked
+            package_version="${GITHUB_REF_NAME#v}"
+            package_version="$(printf '%s' "$package_version" | sed 's/-/~/g')"
+            cargo_deb_args=(
+              --no-build
+              -p ffplayout
+              --manifest-path backend/app/Cargo.toml
+              --deb-version "${package_version}-1"
+              -o "dist/ffplayout_${{ github.ref_name }}-1_${{ matrix.deb_arch }}.deb"
+            )
+            if [[ "${{ matrix.deb_arch }}" == "arm64" ]]; then
+              cargo_deb_args+=(--variant arm64)
+            fi
+            cargo deb "${cargo_deb_args[@]}"
+            cargo generate-rpm \
+              -p backend/app \
+              --set-metadata "version = \"${package_version}\"" \
+              --set-metadata "release = \"1\"" \
+              -o "dist/ffplayout-${{ github.ref_name }}-1.${{ matrix.rpm_arch }}.rpm"
+          fi
+
+      - name: Build on macOS
+        if: runner.os == 'macOS'
+        run: |
+          cargo build --release --no-default-features --features "${{ matrix.features }}"
+          mkdir -p dist
+          cp target/release/ffplayout .
+          zip -r "dist/ffplayout-${{ github.ref_name }}_${{ matrix.variant }}_${{ matrix.platform }}.zip" \
+            assets docker docs migrations LICENSE README.md ffplayout \
+            -x '*.db' '*.db-shm' '*.db-wal' '*.service'
+          rm -f ffplayout
+
+      - name: Build on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cargo build --release --no-default-features --features "${{ matrix.features }}"
+          New-Item -ItemType Directory -Force -Path dist, package, package\bin | Out-Null
+          Copy-Item target\release\ffplayout.exe package\bin\
+          Copy-Item assets package\assets -Recurse
+          Copy-Item docker package\docker -Recurse
+          Copy-Item docs package\docs -Recurse
+          Copy-Item migrations package\migrations -Recurse
+          Copy-Item LICENSE, README.md package\
+          Get-ChildItem package\assets -Include *.db,*.db-shm,*.db-wal,*.service -Recurse | Remove-Item -Force
+          Compress-Archive -Path package\* -DestinationPath "dist\ffplayout-${{ github.ref_name }}_${{ matrix.variant }}_${{ matrix.platform }}.zip"
+
+      - name: Upload release assets
+        uses: svenstaro/upload-release-action@v2
+        with:
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          file: dist/ffplayout*
+          tag: ${{ github.ref_name }}
+          overwrite: true
+          file_glob: true

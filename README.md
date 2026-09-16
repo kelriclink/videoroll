@@ -12,6 +12,7 @@ VideoRoll 是用于处理已获授权视频的流水线：YouTube 接入、语�
 - Bilibili 与社交平台投稿，社交浏览器运行时与主应用隔离。
 - 管理员认证、短期 desktop grant、内部服务身份认证与审计记录。
 - outbox/inbox、租约和发布状态恢复，避免 broker 故障或 worker 重启导致重复副作用。
+- 视频成品可在任务详情中直接加入 ffplayout 媒体库；服务端优先使用 hardlink，失败时才回退为 `copy2`。
 
 ## 运行架构
 
@@ -23,8 +24,9 @@ web / nginx ──► orchestrator
                     ├── subtitle-service + subtitle-worker
                     ├── youtube-ingest
                     ├── bilibili-publisher + publish-worker
-                    ├── social-publisher-api + worker + scheduler
-                    └── outbox-dispatcher
+    ├── social-publisher-api + worker + scheduler
+    ├── ffplayout（独立 SQLite 播控子系统）
+    └── outbox-dispatcher
 
 Redis / PostgreSQL（外部） ◄── 队列、任务与产物状态
 共享文件系统 `/storage` ◄── 所有视频、音频、字幕和日志
@@ -57,6 +59,10 @@ git submodule update --init --recursive
 
 首次打开 Web 后创建管理员账户，再在设置页配置 LLM、RAG、YouTube、投稿平台和 ASR 参数。
 
+本地默认入口为 `http://localhost:3000`，登录后从左侧“播控中心”进入
+ffplayout；该页面加载的是 `http://playout.localhost:3000`。如果浏览器或本地
+代理不解析 `playout.localhost`，可在 hosts 中将它指向 `127.0.0.1`。
+
 ## 生产离线部署
 
 构建机生成完整离线包：
@@ -66,7 +72,7 @@ git submodule update --init --recursive
 ENV_FILE=/path/to/production.env INCLUDE_BASE_IMAGES=1 ./scripts/build_export_prod.sh
 ```
 
-包内包含应用、egress gateway、Web、社交发布器和 Redis 镜像。目标机只需保留 Compose、私有 `.env` 和共享存储目录：
+包内包含应用、egress gateway、Web、社交发布器、ffplayout 和 Redis 镜像。目标机只需保留 Compose、私有 `.env` 和共享存储目录：
 
 ```bash
 sha256sum -c videoroll-prod-bundle-*.tar.sha256
@@ -86,11 +92,35 @@ docker compose --env-file .env up -d --no-build --remove-orphans
 | `INTERNAL_API_SECRET` | 随机且非空，用于内部服务身份与管理员 cookie 密钥派生。 |
 | `ADMIN_BOOTSTRAP_SECRET` | 随机且非空，仅用于首次管理员初始化。 |
 | `PUBLISH_ADDR` | Web 唯一宿主机绑定地址；通常先使用 `127.0.0.1` 并由反向代理公开。 |
+| `PLAYOUT_HOST` | ffplayout 专用虚拟主机名；必须与外部反向代理的 Host 路由一致。 |
+| `VITE_FFPLAYOUT_URL` | 编译进 Web 的浏览器访问地址，例如 `https://playout.example.com`；修改后需重建 Web 镜像。 |
+| `VIDEOROLL_PUBLIC_ORIGIN` | 允许嵌入 ffplayout 的 VideoRoll 正式 Origin，例如 `https://app.example.com`。 |
+| `LEGACY_LIVE_ENABLED` | 旧 VideoRoll Live 引擎紧急回退开关；生产默认 `false`。 |
 | `SUBTITLE_ASR_ENGINE=openvino` | Intel GPU ASR 使用 OpenVINO。 |
 | `SUBTITLE_OPENVINO_DEVICE=GPU` | Intel GPU OpenVINO 设备名。 |
 | `INTEL_GPU_RENDER_GID` | 宿主机 `/dev/dri/renderD128` 的组 ID。 |
 
 从[.env.example](.env.example)开始配置；真实密钥、Cookie、数据库密码和 `data/secrets/fernet.key` 永远不能提交到 Git。
+
+生产环境通常将应用域名和播控域名都反代到 Web 的唯一端口，并保留原始
+`Host`，例如 `app.example.com` 与 `playout.example.com` 都转发到
+`127.0.0.1:3000`。同时设置：
+
+```dotenv
+PLAYOUT_HOST=playout.example.com
+VITE_FFPLAYOUT_URL=https://playout.example.com
+VIDEOROLL_PUBLIC_ORIGIN=https://app.example.com
+LEGACY_LIVE_ENABLED=false
+```
+
+不要把 `ffplayout:8787` 写入 `VITE_FFPLAYOUT_URL`，也不要向宿主机发布 8787；
+该端口只在 Compose `internal` 网络中供 Web nginx 访问。
+
+任务详情的“媒体与资产”页只允许将 `video_final` 成品加入播控。该操作只提交
+`task_id` 和 `asset_id`，由 Orchestrator 在服务端把文件链接/复制到
+`/storage/playout-media/VideoRoll/<task-id>/`，不会经过浏览器重新下载和上传。
+加入成功后该文件归 ffplayout 播控媒体库管理；以后删除 VideoRoll 原成品不会
+自动删除播控媒体，避免正在使用的 Playlist 出现失效引用。
 
 ## 文档
 

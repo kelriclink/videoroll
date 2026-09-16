@@ -1,0 +1,107 @@
+name: Validate
+
+on:
+  push:
+    branches:
+      - '**'
+  pull_request:
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+
+    env:
+      CARGO_INCREMENTAL: 0
+      CARGO_BUILD_JOBS: 1
+      VCPKGRS_DYNAMIC: 1
+
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Set Build Tools and update Rust
+        run: |
+          rustup update stable
+          rustup component add rustfmt clippy
+
+      - name: Set macOS Rust flags
+        if: runner.os == 'macOS'
+        run: echo 'RUSTFLAGS=-Csplit-debuginfo=packed' >> $GITHUB_ENV
+
+      - name: Install FFmpeg libraries on Linux
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y software-properties-common
+          sudo add-apt-repository -y ppa:ubuntuhandbook1/ffmpeg7
+          sudo apt-get update
+          sudo apt-get install -y \
+            ffmpeg \
+            libasound2-dev \
+            libavcodec-dev \
+            libavdevice-dev \
+            libavfilter-dev \
+            libavformat-dev \
+            libavutil-dev \
+            libswresample-dev \
+            libswscale-dev \
+            pkg-config
+          ffmpeg -version
+          test "$(pkg-config --modversion libavformat | cut -d. -f1)" -ge 61
+
+      - name: Install FFmpeg libraries on macOS
+        if: runner.os == 'macOS'
+        run: |
+          brew update
+          brew install ffmpeg pkg-config
+
+      - name: Download FFmpeg on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ffmpegName = "ffmpeg-n9.0-latest-win64-gpl-shared-9.0"
+          $ffmpegArchive = Join-Path $env:RUNNER_TEMP "$ffmpegName.zip"
+          $ffmpegDir = Join-Path $env:RUNNER_TEMP $ffmpegName
+          $ffmpegUrl = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/$ffmpegName.zip"
+
+          Invoke-WebRequest -Uri $ffmpegUrl -OutFile $ffmpegArchive
+          Expand-Archive -Path $ffmpegArchive -DestinationPath $env:RUNNER_TEMP
+
+          if (!(Test-Path "$ffmpegDir\include") -or
+              !(Test-Path "$ffmpegDir\lib") -or
+              !(Test-Path "$ffmpegDir\bin")) {
+            throw "Downloaded FFmpeg archive has an unexpected structure"
+          }
+
+          echo "FFMPEG_DIR=$ffmpegDir" >> $env:GITHUB_ENV
+          echo "$ffmpegDir\bin" >> $env:GITHUB_PATH
+
+      - name: Frontend checks
+        if: runner.os == 'Linux'
+        run: |
+          npm ci
+          npm run type-check
+          npm run build
+
+      - name: Rust tests and lint on Linux
+        if: runner.os == 'Linux'
+        run: |
+          cargo test --no-default-features
+          cargo clippy --no-default-features --all-targets -- --deny warnings
+          cargo fmt --all -- --check
+          cargo build --no-default-features --features embed_frontend
+
+      - name: Rust build on macOS
+        if: runner.os == 'macOS'
+        run: cargo build --no-default-features --features embed_frontend
+
+      - name: Rust build on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: cargo build --release --no-default-features --features embed_frontend

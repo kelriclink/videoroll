@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import sys
 import threading
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -13,6 +14,7 @@ from sqlalchemy import or_, update
 from sqlalchemy.orm import Session
 
 from videoroll.apps.subtitle_service.render_queue_store import get_task_queue_settings
+from videoroll.apps.subtitle_service.queues import SUBTITLE_WORK_QUEUE
 from videoroll.db.models import (
     PublishJob,
     PublishState,
@@ -20,13 +22,15 @@ from videoroll.db.models import (
     RenderJobStatus,
     SubtitleJob,
     SubtitleJobStatus,
+    Task,
+    TaskStatus,
 )
 from videoroll.db.session import get_sessionmaker
 
 _MIN_WORKER_CONCURRENCY = 1
 _MAX_WORKER_CONCURRENCY = 32
 _RUNTIME_CONTROL_TIMEOUT_SECONDS = 1.5
-_SUBTITLE_QUEUE_NAME = "subtitle"
+_SUBTITLE_QUEUE_NAME = SUBTITLE_WORK_QUEUE
 _MIN_JOB_LEASE_SECONDS = 1
 _MAX_JOB_LEASE_SECONDS = 3600
 
@@ -156,8 +160,53 @@ def release_job_lease(db: Session, job_id: uuid.UUID | str, owner: str) -> bool:
     return True
 
 
+def live_leased_task_ids(db: Session, now: datetime) -> set[uuid.UUID]:
+    """Return non-terminal tasks whose running job still owns a live lease.
+
+    A task-level queue lock has a shorter TTL than a job lease. If a worker
+    disappears between those expirations, the live lease must keep reserving
+    the task's concurrency slot until recovery can safely requeue the job.
+    """
+    task_filter = Task.status.notin_([TaskStatus.canceled, TaskStatus.published])
+    task_ids = {
+        task_id
+        for task_id, in (
+            db.query(SubtitleJob.task_id)
+            .join(Task, Task.id == SubtitleJob.task_id)
+            .filter(
+                task_filter,
+                SubtitleJob.status == SubtitleJobStatus.running,
+                SubtitleJob.lease_until.is_not(None),
+                SubtitleJob.lease_until > now,
+            )
+            .distinct()
+            .all()
+        )
+    }
+    task_ids.update(
+        task_id
+        for task_id, in (
+            db.query(RenderJob.task_id)
+            .join(Task, Task.id == RenderJob.task_id)
+            .filter(
+                task_filter,
+                RenderJob.status == RenderJobStatus.running,
+                RenderJob.lease_until.is_not(None),
+                RenderJob.lease_until > now,
+            )
+            .distinct()
+            .all()
+        )
+    )
+    return task_ids
+
+
 def _recovery_message(message: str | None, detail: str) -> str:
-    combined = f"{str(message or '').strip()}\n{detail}".strip()
+    head = str(message or "").strip()
+    tail = str(detail or "").strip()
+    if tail and tail in {line.strip() for line in head.splitlines()}:
+        return head[-2000:]
+    combined = f"{head}\n{tail}".strip()
     return combined[-2000:]
 
 
@@ -176,7 +225,9 @@ def recover_expired_leases(db: Session, now: datetime, limit: int) -> RecoverySu
     render_requeued = 0
     subtitle_jobs = (
         db.query(SubtitleJob)
+        .join(Task, Task.id == SubtitleJob.task_id)
         .filter(
+            Task.status.notin_([TaskStatus.canceled, TaskStatus.published]),
             SubtitleJob.status == SubtitleJobStatus.running,
             SubtitleJob.lease_until.is_not(None),
             SubtitleJob.lease_until <= now,
@@ -206,7 +257,9 @@ def recover_expired_leases(db: Session, now: datetime, limit: int) -> RecoverySu
     if remaining:
         render_jobs = (
             db.query(RenderJob)
+            .join(Task, Task.id == RenderJob.task_id)
             .filter(
+                Task.status.notin_([TaskStatus.canceled, TaskStatus.published]),
                 RenderJob.status == RenderJobStatus.running,
                 RenderJob.lease_until.is_not(None),
                 RenderJob.lease_until <= now,
@@ -510,13 +563,57 @@ def resolve_subtitle_worker_concurrency(database_url: str, *, fallback: int = 1)
         db.close()
 
 
+def resolve_subtitle_worker_concurrency_with_retry(
+    database_url: str,
+    *,
+    fallback: int = 1,
+    attempts: int = 60,
+    delay_seconds: float = 2.0,
+    sleep: Callable[[float], None] = time.sleep,
+) -> int:
+    attempts = max(1, int(attempts or 1))
+    delay_seconds = max(0.0, float(delay_seconds or 0.0))
+    last_error: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return resolve_subtitle_worker_concurrency(database_url, fallback=fallback)
+        except Exception as exc:
+            last_error = exc
+            print(
+                "warning: failed to resolve subtitle worker concurrency from task queue settings "
+                f"(attempt {attempt}/{attempts}): {exc}",
+                file=sys.stderr,
+            )
+            if attempt < attempts and delay_seconds > 0:
+                sleep(delay_seconds)
+    assert last_error is not None
+    raise last_error
+
+
 def main() -> int:
     fallback = normalize_subtitle_worker_concurrency(os.getenv("CELERY_SUB_CONCURRENCY_FALLBACK", "1"))
+    database_url = str(os.getenv("DATABASE_URL", "") or "").strip()
+    if not database_url:
+        print(fallback)
+        return 0
     try:
-        resolved = resolve_subtitle_worker_concurrency(os.getenv("DATABASE_URL", ""), fallback=fallback)
+        attempts = max(1, int(os.getenv("CELERY_SUB_CONCURRENCY_DB_ATTEMPTS", "60") or "60"))
+    except Exception:
+        attempts = 60
+    try:
+        delay_seconds = max(0.0, float(os.getenv("CELERY_SUB_CONCURRENCY_DB_DELAY_SECONDS", "2") or "2"))
+    except Exception:
+        delay_seconds = 2.0
+    try:
+        resolved = resolve_subtitle_worker_concurrency_with_retry(
+            database_url,
+            fallback=fallback,
+            attempts=attempts,
+            delay_seconds=delay_seconds,
+        )
     except Exception as e:
-        print(f"warning: failed to resolve subtitle worker concurrency from task queue settings: {e}", file=sys.stderr)
-        resolved = fallback
+        print(f"error: database stayed unavailable while resolving subtitle worker concurrency: {e}", file=sys.stderr)
+        return 1
     print(resolved)
     return 0
 

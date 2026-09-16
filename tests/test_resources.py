@@ -30,3 +30,20 @@ def test_memory_stats_from_meminfo_uses_memavailable() -> None:
     assert stats["available_bytes"] == 250 * 1024
     assert stats["used_bytes"] == 750 * 1024
     assert stats["percent"] == 75.0
+
+
+def test_zero_memavailable_does_not_fall_back_to_reclaimable_cache() -> None:
+    stats = memory_stats_from_meminfo(
+        "MemTotal: 1000 kB\nMemAvailable: 0 kB\nMemFree: 50 kB\nBuffers: 50 kB\nCached: 600 kB\n"
+    )
+
+    assert stats is not None
+    assert stats["available_bytes"] == 0
+    assert stats["percent"] == 100.0
+
+
+def test_missing_memavailable_still_supports_older_kernels() -> None:
+    stats = memory_stats_from_meminfo("MemTotal: 1000 kB\nMemFree: 50 kB\nBuffers: 50 kB\nCached: 600 kB\n")
+
+    assert stats is not None
+    assert stats["available_bytes"] == 700 * 1024

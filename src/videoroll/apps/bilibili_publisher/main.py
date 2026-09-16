@@ -15,10 +15,9 @@ from sqlalchemy.orm import Session
 from videoroll.ai.service import AIService
 from videoroll.apps.security.service_auth import install_internal_service_auth, service_token
 from videoroll.config import BilibiliPublisherSettings, get_bilibili_publisher_settings, get_subtitle_settings
-from videoroll.db.base import Base
-from videoroll.db.auto_migrate import auto_migrate
+from videoroll.db.migrate import initialize_database
 from videoroll.db.models import Asset, AssetKind, Platform, PublishBatch, PublishJob, PublishState, Task, TaskStatus
-from videoroll.db.session import db_session, get_engine
+from videoroll.db.session import db_session
 from videoroll.storage.filesystem import FileStore
 from videoroll.apps.bilibili_publisher.auth_settings_store import get_bilibili_auth_settings, get_bilibili_cookie_header, update_bilibili_auth_settings
 from videoroll.apps.bilibili_publisher.bilibili_web_client import BilibiliWebClient
@@ -76,9 +75,7 @@ install_internal_service_auth(app, get_bilibili_publisher_settings)
 def _startup() -> None:
     settings = get_bilibili_publisher_settings()
     app.state.internal_service_token = service_token(settings)
-    engine = get_engine(settings.database_url)
-    Base.metadata.create_all(engine)
-    auto_migrate(settings.database_url)
+    initialize_database(settings.database_url)
     FileStore(settings).ensure_ready()
 
 

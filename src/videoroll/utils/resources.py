@@ -81,7 +81,7 @@ def memory_stats_from_meminfo(raw: str) -> dict[str, int | float] | None:
     if total <= 0:
         return None
     available = int(data.get("MemAvailable") or 0)
-    if available <= 0:
+    if "MemAvailable" not in data:
         available = int(data.get("MemFree") or 0) + int(data.get("Buffers") or 0) + int(data.get("Cached") or 0)
     available = max(0, min(total, available))
     used = max(0, total - available)
@@ -114,6 +114,35 @@ def read_cgroup_memory_stats() -> dict[str, int | float] | None:
     if current is not None and total is not None and 0 < total < 1 << 60:
         return _memory_stats_from_usage(current, total)
     return None
+
+
+def read_effective_memory_stats() -> dict[str, int | float] | None:
+    """Read this process's host/container budget, failing closed on broken stats.
+
+    A missing cgroup limit is normal on an uncontained host. A readable finite
+    limit with unavailable usage is not evidence that the container is unlimited.
+    """
+    try:
+        host = read_memory_stats()
+        if not host:
+            return None
+        container = read_cgroup_memory_stats()
+        if container is None:
+            for path in ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"):
+                raw = _read_text(Path(path))
+                if raw in (None, "", "max"):
+                    continue
+                limit = _parse_positive_int(raw)
+                if limit is None or 0 < limit < 1 << 60:
+                    return None
+        snapshots = [host, container] if container is not None else [host]
+        total = min(int(item["total_bytes"]) for item in snapshots)
+        available = min(int(item["available_bytes"]) for item in snapshots)
+        if total <= 0:
+            return None
+        return _memory_stats_from_usage(total - max(0, min(total, available)), total)
+    except (OSError, TypeError, ValueError, KeyError):
+        return None
 
 
 def _read_int(path: Path) -> int | None:

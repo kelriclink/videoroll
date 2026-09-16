@@ -39,7 +39,10 @@ def test_frontend_uses_only_the_orchestrator_api_base() -> None:
 
     urls_source = (WEB_ROOT / "lib" / "urls.ts").read_text(encoding="utf-8")
     assert "export const ORCHESTRATOR_URL" in urls_source
-    assert urls_source.count("export const ") == 1
+    # ffplayout is intentionally a separate browser origin behind the same Web
+    # ingress; no other internal service may be addressed directly by the SPA.
+    assert "export const FFPLAYOUT_URL" in urls_source
+    assert urls_source.count("export const ") == 2
 
 
 def test_frontend_image_build_has_no_child_service_url_arguments() -> None:

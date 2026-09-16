@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 import uuid
+from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, Request, UploadFile
 from fastapi.responses import Response, StreamingResponse
 from sqlalchemy.orm import Session
 
-from videoroll.apps.orchestrator_api.dependencies import get_db, get_s3
-from videoroll.apps.orchestrator_api.schemas import AssetRead
-from videoroll.apps.orchestrator_api.services import asset_service
+from videoroll.apps.orchestrator_api.dependencies import get_db, get_s3, get_settings
+from videoroll.apps.orchestrator_api.schemas import AssetRead, PlayoutAssetLinkRead
+from videoroll.apps.orchestrator_api.services import asset_service, playout_service
+from videoroll.config import OrchestratorSettings
 from videoroll.db.models import Asset
 from videoroll.storage.filesystem import FileStore
 
@@ -50,6 +52,28 @@ async def upload_task_cover(
 @router.get("/tasks/{task_id}/assets", response_model=list[AssetRead])
 def list_task_assets(task_id: uuid.UUID, db: Session = Depends(get_db)) -> list[Asset]:
     return asset_service.list_task_assets(db, task_id)
+
+
+@router.get("/tasks/{task_id}/playout-assets", response_model=list[PlayoutAssetLinkRead])
+def list_task_playout_assets(task_id: uuid.UUID, db: Session = Depends(get_db)) -> list[dict[str, object]]:
+    return playout_service.list_task_playout_links(db, task_id)
+
+
+@router.post("/tasks/{task_id}/assets/{asset_id}/playout", response_model=PlayoutAssetLinkRead)
+def add_task_asset_to_playout(
+    task_id: uuid.UUID,
+    asset_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    s3: FileStore = Depends(get_s3),
+    settings: OrchestratorSettings = Depends(get_settings),
+) -> dict[str, object]:
+    return playout_service.import_asset_to_playout(
+        task_id,
+        asset_id,
+        db=db,
+        storage=s3,
+        media_root=Path(settings.playout_media_root),
+    )
 
 
 @router.get("/tasks/{task_id}/assets/{asset_id}/download")

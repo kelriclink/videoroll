@@ -8,6 +8,7 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
+from videoroll.apps.subtitle_service.queues import SUBTITLE_CONTROL_QUEUE, SUBTITLE_WORK_QUEUE
 from videoroll.db.models import Platform, PublishBatch, PublishJob, PublishState, Task, TaskStatus
 
 
@@ -474,12 +475,12 @@ def enqueue_publish_batch_cleanup(
         aggregate_type="publish_batch",
         aggregate_id=batch_id,
         task_name="subtitle_service.cleanup_task",
-        args={"args": [str(task_id), str(batch_id)], "queue": "subtitle"},
+        args={"args": [str(task_id), str(batch_id)], "queue": SUBTITLE_WORK_QUEUE},
         operation_key=f"publish-cleanup:{batch_id}",
     )
     db.commit()
     try:
-        celery_app.send_task("subtitle_service.dispatch_outbox", args=[], queue="subtitle")
+        celery_app.send_task("subtitle_service.dispatch_outbox", args=[], queue=SUBTITLE_CONTROL_QUEUE)
     except Exception:
         # The event is already committed and will be picked up by the periodic
         # dispatcher.  Do not turn a durable pending event into a failed

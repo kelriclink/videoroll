@@ -46,12 +46,10 @@ def test_worker_starts_display_stack_and_web_proxies_its_novnc_desktop() -> None
 
 def test_novnc_uses_root_absolute_websocket_paths() -> None:
     config = (ROOT / "src" / "videoroll" / "config.py").read_text(encoding="utf-8")
-    task_helpers = (ROOT / "src" / "web" / "src" / "pages" / "taskDetailPage.helpers.ts").read_text(
-        encoding="utf-8"
-    )
+    publish_helpers = (ROOT / "src" / "web" / "src" / "lib" / "publish.ts").read_text(encoding="utf-8")
 
     assert "path=/social-login/websockify" in config
-    assert "path=/social-publish/websockify" in task_helpers
+    assert "path=/social-publish/websockify" in publish_helpers
 
 
 def test_bilibili_publishers_share_the_persistent_fernet_key() -> None:
@@ -74,6 +72,7 @@ def test_nginx_authorizes_every_novnc_request_and_vnc_uses_a_tmpfs_password_file
     assert "proxy_set_header X-Desktop-Resource $desktop_resource;" in nginx
     assert "$cookie_videoroll_desktop_grant" in nginx
     assert "HttpOnly; SameSite=Strict" in nginx
+    assert "$videoroll_secure_cookie" in nginx
     assert "location = /api/desktop/authorize" in nginx
     for location in ("location /social-login/", "location /social-publish/"):
         block = nginx.split(location, 1)[1].split("\n  }", 1)[0]

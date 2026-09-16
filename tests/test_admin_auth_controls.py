@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import socket
 from types import SimpleNamespace
 
 import pytest
@@ -253,6 +254,73 @@ def test_source_ip_does_not_trust_spoofed_xff_from_public_peer() -> None:
     )
 
     assert auth_service._source_ip(request) == "8.8.8.8"
+
+
+def _named_proxy_request(hostname: str, peer: str, forwarded: str) -> SimpleNamespace:
+    return SimpleNamespace(
+        app=SimpleNamespace(state=SimpleNamespace(trusted_proxy_hosts=hostname)),
+        headers={"x-forwarded-for": forwarded},
+        client=SimpleNamespace(host=peer),
+    )
+
+
+def test_source_ip_trusts_the_named_web_proxy_but_not_other_containers(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(socket, "getaddrinfo", lambda *_args, **_kwargs: [
+        (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("172.18.0.4", 0)),
+    ])
+    request = _named_proxy_request("web.identity.test", "172.18.0.4", "198.51.100.8, 203.0.113.7")
+    assert auth_service._source_ip(request) == "203.0.113.7"
+
+    request.client.host = "172.18.0.5"
+    assert auth_service._source_ip(request) == "172.18.0.5"
+
+
+def test_named_web_proxy_keeps_clients_in_separate_login_rate_limits(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(socket, "getaddrinfo", lambda *_args, **_kwargs: [
+        (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("172.18.0.4", 0)),
+    ])
+    fake_redis = _FakeRedis()
+    monkeypatch.setattr("videoroll.apps.security.rate_limits.Redis.from_url", lambda *_args, **_kwargs: fake_redis)
+    attacker = _named_proxy_request("web.rate-limit.test", "172.18.0.4", "198.51.100.8")
+    administrator = _named_proxy_request("web.rate-limit.test", "172.18.0.4", "203.0.113.7")
+    attacker_key = auth_service._rate_limit_key(attacker, "login")
+    for _ in range(5):
+        record_login_failure("redis://unused", attacker_key)
+
+    assert not check_login_rate_limit("redis://unused", attacker_key).allowed
+    assert check_login_rate_limit("redis://unused", auth_service._rate_limit_key(administrator, "login")).allowed
+
+
+def test_named_proxy_dns_failure_does_not_trust_forwarded_headers(monkeypatch: pytest.MonkeyPatch) -> None:
+    def unavailable(*_args: object, **_kwargs: object):
+        raise socket.gaierror("offline DNS")
+
+    monkeypatch.setattr(socket, "getaddrinfo", unavailable)
+    request = _named_proxy_request("web.unavailable.test", "172.18.0.4", "203.0.113.7")
+    assert auth_service._source_ip(request) == "172.18.0.4"
+
+
+def test_named_proxy_accepts_its_ipv6_address(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(socket, "getaddrinfo", lambda *_args, **_kwargs: [
+        (socket.AF_INET6, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("fd00::4", 0, 0, 0)),
+    ])
+    request = _named_proxy_request("web.ipv6.test", "fd00::4", "2001:db8::7")
+    assert auth_service._source_ip(request) == "2001:db8::7"
+
+
+def test_named_proxy_refreshes_its_address_after_a_container_replacement(monkeypatch: pytest.MonkeyPatch) -> None:
+    current = {"time": 0.0, "address": "172.18.0.4"}
+    monkeypatch.setattr("time.monotonic", lambda: current["time"])
+    monkeypatch.setattr(socket, "getaddrinfo", lambda *_args, **_kwargs: [
+        (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", (current["address"], 0)),
+    ])
+    request = _named_proxy_request("web.replaced.test", "172.18.0.4", "203.0.113.7")
+    assert auth_service._source_ip(request) == "203.0.113.7"
+
+    current.update(time=61.0, address="172.18.0.6")
+    assert auth_service._source_ip(request) == "172.18.0.4"
+    request.client.host = "172.18.0.6"
+    assert auth_service._source_ip(request) == "203.0.113.7"
 
 
 def test_internal_http_headers_use_dedicated_service_secret() -> None:

@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from videoroll.apps.subtitle_service.worker_concurrency import (
     acquire_job_lease,
     heartbeat_job_lease,
+    live_leased_task_ids,
     recover_expired_leases,
     release_job_lease,
 )
@@ -24,6 +25,7 @@ from videoroll.db.models import (
     SubtitleJob,
     SubtitleJobStatus,
     Task,
+    TaskStatus,
 )
 
 
@@ -98,6 +100,65 @@ def test_expired_render_lease_is_requeued_with_resume(db: Session) -> None:
     assert job.lease_owner is None
     assert job.lease_until is None
     assert summary.render_requeued == 1
+
+
+def test_recovery_does_not_requeue_published_render(db: Session) -> None:
+    task = _task(db)
+    task.status = TaskStatus.published
+    job = RenderJob(
+        task_id=task.id,
+        status=RenderJobStatus.running,
+        progress=58,
+        retry_count=2,
+        lease_owner="dead-worker",
+        lease_until=_now() - timedelta(seconds=1),
+    )
+    db.add(job)
+    db.flush()
+
+    summary = recover_expired_leases(db, now=_now(), limit=100)
+
+    assert job.status == RenderJobStatus.running
+    assert job.retry_count == 2
+    assert summary.render_requeued == 0
+
+
+def test_recovery_message_is_not_appended_twice(db: Session) -> None:
+    detail = "Worker lease expired while rendering; requeued for resume."
+    job = RenderJob(
+        task_id=_task(db).id,
+        status=RenderJobStatus.running,
+        lease_owner="dead-worker",
+        lease_until=_now() - timedelta(seconds=1),
+        error_message=detail,
+    )
+    db.add(job)
+    db.flush()
+
+    summary = recover_expired_leases(db, now=_now(), limit=100)
+
+    assert summary.render_requeued == 1
+    assert job.error_message == detail
+
+
+def test_live_job_lease_reserves_task_until_recovery(db: Session) -> None:
+    live_task = _task(db)
+    live = RenderJob(
+        task_id=live_task.id,
+        status=RenderJobStatus.running,
+        lease_owner="worker-a",
+        lease_until=_now() + timedelta(minutes=5),
+    )
+    expired = SubtitleJob(
+        task_id=_task(db).id,
+        status=SubtitleJobStatus.running,
+        lease_owner="dead-worker",
+        lease_until=_now() - timedelta(seconds=1),
+    )
+    db.add_all([live, expired])
+    db.flush()
+
+    assert live_leased_task_ids(db, _now()) == {live_task.id}
 
 
 def test_running_job_without_a_lease_is_not_recovered(db: Session) -> None:

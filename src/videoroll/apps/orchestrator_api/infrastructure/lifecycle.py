@@ -18,24 +18,22 @@ from videoroll.apps.security.service_auth import (
     validate_bootstrap_secret,
 )
 from videoroll.config import get_orchestrator_settings
-from videoroll.db.auto_migrate import auto_migrate
-from videoroll.db.base import Base
-from videoroll.db.session import get_engine, get_sessionmaker
+from videoroll.db.migrate import initialize_database
+from videoroll.db.session import get_sessionmaker
 from videoroll.storage.filesystem import FileStore
 
 
 def initialize_runtime(app: FastAPI) -> OrchestratorScheduler:
     settings = get_orchestrator_settings()
     validate_bootstrap_secret(settings)
-    engine = get_engine(settings.database_url)
-    Base.metadata.create_all(engine)
-    auto_migrate(settings.database_url)
+    initialize_database(settings.database_url)
     FileStore(settings).ensure_ready()
     Path(settings.work_dir).mkdir(parents=True, exist_ok=True)
 
     app.state.database_url = settings.database_url
     app.state.redis_url = settings.redis_url
     app.state.trusted_proxy_cidrs = settings.trusted_proxy_cidrs
+    app.state.trusted_proxy_hosts = settings.trusted_proxy_hosts
     app.state.internal_header_token = service_token(settings)
     app.state.internal_service_token = service_token(settings)
     app.state.admin_cookie_secret = admin_cookie_secret(settings)

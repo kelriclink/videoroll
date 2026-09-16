@@ -22,11 +22,11 @@ def test_application_dockerfiles_install_asr_by_default() -> None:
         assert "ARG INSTALL_ASR=1" in _text(relative_path)
 
 
-def test_default_build_paths_enable_asr_except_egress_gateway() -> None:
+def test_default_build_paths_enable_asr_including_egress_gateway() -> None:
     for relative_path in ("compose.yml", "docker-compose.yml"):
         compose = _text(relative_path)
         assert "INSTALL_ASR: ${INSTALL_ASR:-1}" in compose
-        assert 'INSTALL_ASR: "0"' in _service_block(compose, "egress-gateway")
+        assert "INSTALL_ASR: ${INSTALL_ASR:-1}" in _service_block(compose, "egress-gateway")
 
     export_script = _text("scripts/build_export_prod.sh")
     app_block = export_script[
@@ -40,4 +40,4 @@ def test_default_build_paths_enable_asr_except_egress_gateway() -> None:
         )
     ]
     assert '--build-arg INSTALL_ASR="${INSTALL_ASR:-1}"' in app_block
-    assert "--build-arg INSTALL_ASR=0" in egress_block
+    assert '--build-arg INSTALL_ASR="${INSTALL_ASR:-1}"' in egress_block

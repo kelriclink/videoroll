@@ -122,6 +122,17 @@ def _looks_like_channel_id(value: str) -> bool:
     return raw.startswith("UC") and len(raw) >= 16
 
 
+def _normalize_source_type(value: YouTubeSourceType | str | None) -> YouTubeSourceType | None:
+    if value is None:
+        return None
+    if isinstance(value, YouTubeSourceType):
+        return value
+    raw = str(value or "").strip().lower()
+    if not raw:
+        return None
+    return YouTubeSourceType(raw)
+
+
 def _start_auto_pipeline(task_id: uuid.UUID, *, auto_publish: bool | None = None) -> str:
     from videoroll.apps.subtitle_service.worker import celery_app as subtitle_celery_app
 
@@ -137,13 +148,15 @@ def _start_auto_pipeline(task_id: uuid.UUID, *, auto_publish: bool | None = None
 
 
 def _build_resolved_source(
-    source_type: str,
+    source_type: YouTubeSourceType | str,
     source_id: str,
     *,
     source_url: str | None = None,
     display_name: str | None = None,
 ) -> ResolvedYouTubeSource:
-    kind = YouTubeSourceType(str(source_type or "").strip().lower())
+    kind = _normalize_source_type(source_type)
+    if kind is None:
+        raise ValueError("source_type is required")
     sid = str(source_id or "").strip()
     return ResolvedYouTubeSource(
         source_type=kind,
@@ -350,14 +363,22 @@ def upsert_youtube_source(
     yt_cfg = get_youtube_settings(db, default_proxy=default_proxy)
     proxy = str(yt_cfg.get("proxy") or "").strip() or default_proxy or None
 
+    try:
+        requested_type = _normalize_source_type(source_type)
+    except ValueError as e:
+        raise ValueError("source_type must be channel or playlist") from e
+
     if str(source_input or "").strip():
         resolved = resolve_youtube_source_input(str(source_input or ""), user_agent, proxy=proxy)
+        if requested_type is not None and resolved.source_type != requested_type:
+            raise ValueError(
+                f"source_url resolved as {resolved.source_type.value}, but source_type is {requested_type.value}"
+            )
     else:
-        raw_type = str(source_type or "").strip().lower()
         raw_id = str(source_id or "").strip()
-        if raw_type not in {"channel", "playlist"} or not raw_id:
+        if requested_type is None or not raw_id:
             raise ValueError("source_type/source_id or source_url is required")
-        resolved = _build_resolved_source(raw_type, raw_id)
+        resolved = _build_resolved_source(requested_type, raw_id)
 
     src = (
         db.query(YouTubeSource)
@@ -431,7 +452,9 @@ def _prepare_scan_entries(
         if not video_id or video_id in seen_video_ids:
             continue
         published_at = getattr(entry, "published_at", None)
-        if since is not None and published_at is not None and published_at <= since:
+        # An explicit cutoff requires a known date; ordinary scans still ingest
+        # undated entries in their source order.
+        if since is not None and (published_at is None or published_at <= since):
             continue
         seen_video_ids.add(video_id)
         unique_entries.append(entry)
@@ -489,6 +512,10 @@ def scan_youtube_source_by_id(
 
     try:
         try:
+            # Enumerate the complete source before applying scan_limit. This is
+            # especially important for playlists: if the newest/list-leading
+            # items were already ingested, later playlist items still need to
+            # be discovered and backfilled over subsequent scans.
             entries = list(
                 fetch_youtube_feed(
                     locked.source_type.value,

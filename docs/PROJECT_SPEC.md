@@ -134,6 +134,16 @@ Agent trace 是规范化事件流，每步包含 `event_id`、`span_id`、`kind`
 - `duration_ms`（视频/音频）
 - `created_at`
 
+### 3.3 播控媒体映射
+
+`video_final` 成品通过 Orchestrator 的
+`POST /tasks/{task_id}/assets/{asset_id}/playout` 加入 ffplayout 媒体库。
+请求只携带 URL 路径中的任务和资产 ID；服务端验证资产归属并将对象从
+`/storage/objects` 优先 hardlink 到
+`/storage/playout-media/VideoRoll/{task_id}/`，跨文件系统时回退为 `copy2`。
+映射写入 PostgreSQL 的 `playout_asset_links`，不修改 ffplayout SQLite schema，
+也不经过浏览器二次下载/上传。第一版只导入媒体库，不自动编辑 ffplayout playlist。
+
 ---
 
 ## 4. 任务状态机（由 Orchestrator 维护）

@@ -6,13 +6,34 @@ from contextlib import contextmanager
 from functools import lru_cache
 
 from sqlalchemy import inspect, text
-from sqlalchemy.engine import Engine
+from sqlalchemy.engine import Connection, Engine
 
 from videoroll.db.session import get_engine
+from videoroll.db.schema_lock import schema_lock
 
 
 logger = logging.getLogger(__name__)
-_AUTO_MIGRATE_ADVISORY_LOCK_KEY = 0x564944454F524F4C
+Bind = Engine | Connection
+
+
+@contextmanager
+def _connection(bind: Bind):
+    if isinstance(bind, Connection):
+        yield bind
+    else:
+        with bind.connect() as connection:
+            yield connection
+
+
+@contextmanager
+def _transaction(bind: Bind):
+    if isinstance(bind, Connection):
+        transaction = bind.begin_nested() if bind.in_transaction() else bind.begin()
+        with transaction:
+            yield bind
+    else:
+        with bind.begin() as connection:
+            yield connection
 
 
 def _is_duplicate_column_error(exc: Exception) -> bool:
@@ -31,25 +52,25 @@ def _is_duplicate_column_error(exc: Exception) -> bool:
     return ("duplicate column" in msg) or ("already exists" in msg and "column" in msg)
 
 
-def _add_column(engine: Engine, table: str, column: str, column_type_sql: str) -> None:
+def _add_column(engine: Bind, table: str, column: str, column_type_sql: str) -> None:
     stmt = f"ALTER TABLE {table} ADD COLUMN {column} {column_type_sql}"
-    with engine.begin() as conn:
-        try:
+    try:
+        with _transaction(engine) as conn:
             conn.execute(text(stmt))
-        except Exception as e:
-            if _is_duplicate_column_error(e):
-                return
-            raise
+    except Exception as e:
+        if _is_duplicate_column_error(e):
+            return
+        raise
 
 
-def _ensure_postgres_enum_values(engine: Engine) -> None:
+def _ensure_postgres_enum_values(engine: Bind) -> None:
     if (engine.dialect.name or "").lower() != "postgresql":
         return
     required = {
         "platform": ["douyin", "xiaohongshu", "kuaishou", "tencent"],
         "publish_state": ["unknown"],
     }
-    with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+    with _transaction(engine) as conn:
         for enum_name, values in required.items():
             exists = conn.execute(
                 text("SELECT 1 FROM pg_type WHERE typname = :enum_name"),
@@ -61,7 +82,7 @@ def _ensure_postgres_enum_values(engine: Engine) -> None:
                 conn.execute(text(f"ALTER TYPE {enum_name} ADD VALUE IF NOT EXISTS '{value}'"))
 
 
-def _ensure_tasks_lock_columns(engine: Engine) -> None:
+def _ensure_tasks_lock_columns(engine: Bind) -> None:
     insp = inspect(engine)
     if "tasks" not in set(insp.get_table_names()):
         return
@@ -79,7 +100,7 @@ def _ensure_tasks_lock_columns(engine: Engine) -> None:
         logger.warning("auto-migrated DB: added tasks.lock_until")
 
 
-def _ensure_tasks_stop_columns(engine: Engine) -> None:
+def _ensure_tasks_stop_columns(engine: Bind) -> None:
     insp = inspect(engine)
     if "tasks" not in set(insp.get_table_names()):
         return
@@ -92,7 +113,7 @@ def _ensure_tasks_stop_columns(engine: Engine) -> None:
     logger.warning("auto-migrated DB: added tasks.stopped_status")
 
 
-def _ensure_app_settings_version_column(engine: Engine) -> None:
+def _ensure_app_settings_version_column(engine: Bind) -> None:
     insp = inspect(engine)
     if "app_settings" not in set(insp.get_table_names()):
         return
@@ -103,7 +124,7 @@ def _ensure_app_settings_version_column(engine: Engine) -> None:
         logger.warning("auto-migrated DB: added app_settings.version")
 
 
-def _ensure_job_lease_columns(engine: Engine) -> None:
+def _ensure_job_lease_columns(engine: Bind) -> None:
     insp = inspect(engine)
     tables = set(insp.get_table_names())
     lease_until_type = "TIMESTAMPTZ" if (engine.dialect.name or "").lower() == "postgresql" else "TIMESTAMP"
@@ -126,7 +147,7 @@ def _ensure_job_lease_columns(engine: Engine) -> None:
         status_column = "state" if "state" in columns else "status" if "status" in columns else None
         if status_column is None or "created_at" not in columns:
             continue
-        with engine.begin() as conn:
+        with _transaction(engine) as conn:
             conn.execute(
                 text(
                     f"CREATE INDEX IF NOT EXISTS ix_{table_name}_{status_column}_lease_until "
@@ -138,7 +159,7 @@ def _ensure_job_lease_columns(engine: Engine) -> None:
             )
 
 
-def _ensure_tasks_publish_batch_columns(engine: Engine) -> None:
+def _ensure_tasks_publish_batch_columns(engine: Bind) -> None:
     insp = inspect(engine)
     if "tasks" not in set(insp.get_table_names()):
         return
@@ -146,11 +167,11 @@ def _ensure_tasks_publish_batch_columns(engine: Engine) -> None:
     if "active_publish_batch_id" not in cols:
         _add_column(engine, "tasks", "active_publish_batch_id", "UUID")
         logger.warning("auto-migrated DB: added tasks.active_publish_batch_id")
-    with engine.begin() as conn:
+    with _transaction(engine) as conn:
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_tasks_active_publish_batch_id ON tasks (active_publish_batch_id)"))
 
 
-def _backfill_publish_batch_lifecycle(engine: Engine) -> None:
+def _backfill_publish_batch_lifecycle(engine: Bind) -> None:
     insp = inspect(engine)
     tables = set(insp.get_table_names())
     if "tasks" not in tables or "publish_batches" not in tables:
@@ -159,7 +180,7 @@ def _backfill_publish_batch_lifecycle(engine: Engine) -> None:
     batch_columns = {column.get("name") for column in insp.get_columns("publish_batches")}
     if "active_publish_batch_id" not in task_columns or "cleanup_delivery_version" not in batch_columns:
         return
-    with engine.begin() as conn:
+    with _transaction(engine) as conn:
         conn.execute(
             text(
                 """
@@ -199,7 +220,7 @@ def _backfill_publish_batch_lifecycle(engine: Engine) -> None:
         )
 
 
-def _ensure_youtube_sources_columns(engine: Engine) -> None:
+def _ensure_youtube_sources_columns(engine: Bind) -> None:
     insp = inspect(engine)
     if "youtube_sources" not in set(insp.get_table_names()):
         return
@@ -232,10 +253,10 @@ def _ensure_youtube_sources_columns(engine: Engine) -> None:
         logger.warning("auto-migrated DB: added youtube_sources.%s", column)
 
 
-def _ensure_scheduler_indexes(engine: Engine) -> None:
+def _ensure_scheduler_indexes(engine: Bind) -> None:
     insp = inspect(engine)
     tables = set(insp.get_table_names())
-    with engine.begin() as conn:
+    with _transaction(engine) as conn:
         if "tasks" in tables:
             conn.execute(text("CREATE INDEX IF NOT EXISTS ix_tasks_lock_until ON tasks (lock_owner, lock_until)"))
         if "subtitle_jobs" in tables:
@@ -246,7 +267,7 @@ def _ensure_scheduler_indexes(engine: Engine) -> None:
             conn.execute(text("CREATE INDEX IF NOT EXISTS ix_render_jobs_status_created_at ON render_jobs (status, created_at)"))
 
 
-def _ensure_publish_jobs_generic_columns(engine: Engine) -> None:
+def _ensure_publish_jobs_generic_columns(engine: Bind) -> None:
     insp = inspect(engine)
     if "publish_jobs" not in set(insp.get_table_names()):
         return
@@ -275,7 +296,7 @@ def _ensure_publish_jobs_generic_columns(engine: Engine) -> None:
         _add_column(engine, "publish_jobs", column, column_type_sql)
         logger.warning("auto-migrated DB: added publish_jobs.%s", column)
 
-    with engine.begin() as conn:
+    with _transaction(engine) as conn:
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_publish_jobs_platform_state ON publish_jobs (platform, state)"))
         conn.execute(
             text(
@@ -291,14 +312,14 @@ def _ensure_publish_jobs_generic_columns(engine: Engine) -> None:
         )
 
 
-def _backfill_bilibili_publish_account_ids(engine: Engine) -> None:
+def _backfill_bilibili_publish_account_ids(engine: Bind) -> None:
     insp = inspect(engine)
     if "publish_jobs" not in set(insp.get_table_names()):
         return
     cols = {column.get("name") for column in insp.get_columns("publish_jobs")}
     if not {"platform", "account_id", "bili_account_id"}.issubset(cols):
         return
-    with engine.begin() as conn:
+    with _transaction(engine) as conn:
         conn.execute(
             text(
                 """
@@ -312,7 +333,7 @@ def _backfill_bilibili_publish_account_ids(engine: Engine) -> None:
         )
 
 
-def _ensure_publish_batch_columns(engine: Engine) -> None:
+def _ensure_publish_batch_columns(engine: Bind) -> None:
     insp = inspect(engine)
     if "publish_batches" not in set(insp.get_table_names()):
         return
@@ -327,7 +348,7 @@ def _ensure_publish_batch_columns(engine: Engine) -> None:
             logger.warning("auto-migrated DB: added publish_batches.%s", column)
 
 
-def _ensure_account_check_columns(engine: Engine) -> None:
+def _ensure_account_check_columns(engine: Bind) -> None:
     insp = inspect(engine)
     if "accounts" not in set(insp.get_table_names()):
         return
@@ -372,45 +393,24 @@ def _ensure_pgvector_ann_indexes(conn) -> None:
         logger.warning("pgvector HNSW index is unavailable; vector search will use exact scan: %s", e)
 
 
-@contextmanager
-def _auto_migrate_lock(engine: Engine):
-    if (engine.dialect.name or "").lower() != "postgresql":
-        yield
-        return
-    conn = engine.connect()
-    try:
-        conn.execute(text("SELECT pg_advisory_lock(:key)"), {"key": _AUTO_MIGRATE_ADVISORY_LOCK_KEY})
-        conn.commit()
-        yield
-    finally:
-        try:
-            conn.execute(text("SELECT pg_advisory_unlock(:key)"), {"key": _AUTO_MIGRATE_ADVISORY_LOCK_KEY})
-            conn.commit()
-        finally:
-            conn.close()
 
-
-def _ensure_pgvector_rag_tables(engine: Engine) -> None:
+def _ensure_pgvector_rag_tables(engine: Bind) -> None:
     dialect = (engine.dialect.name or "").lower()
     if dialect != "postgresql":
         logger.warning("RAG tables require PostgreSQL/pgvector; skipping for dialect=%s", dialect)
         return
 
-    with engine.connect() as conn:
+    with _connection(engine) as conn:
         vector_type = conn.execute(text("SELECT to_regtype('vector')")).scalar()
-        try:
-            conn.commit()
-        except Exception:
-            pass
         if vector_type is None:
             try:
-                with engine.begin() as ext_conn:
+                with _transaction(engine) as ext_conn:
                     ext_conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
             except Exception as e:
                 logger.warning("pgvector extension is unavailable; skipping RAG table migration: %s", e)
                 return
 
-    with engine.begin() as conn:
+    with _transaction(engine) as conn:
         conn.execute(
             text(
                 f"""
@@ -442,7 +442,8 @@ def _ensure_pgvector_rag_tables(engine: Engine) -> None:
             )
         )
         try:
-            conn.execute(text("ALTER TABLE translation_knowledge_items ALTER COLUMN embedding TYPE vector"))
+            with conn.begin_nested():
+                conn.execute(text("ALTER TABLE translation_knowledge_items ALTER COLUMN embedding TYPE vector"))
         except Exception:
             pass
         conn.execute(
@@ -698,27 +699,34 @@ def _ensure_pgvector_rag_tables(engine: Engine) -> None:
         )
 
 
-def auto_migrate_engine(engine: Engine) -> None:
-    """
-    Legacy additive compatibility checks for deployments without Alembic.
+def apply_legacy_migrations(connection: Connection) -> None:
+    """Run historical additive checks inside the caller's schema transaction.
 
-    Versioned, security-critical schema changes belong in Alembic revisions.
+    The unified initializer already holds the schema lock. This deliberately
+    does not obtain another pooled connection or recursively acquire that lock.
     """
-    with _auto_migrate_lock(engine):
-        _ensure_postgres_enum_values(engine)
-        _ensure_app_settings_version_column(engine)
-        _ensure_job_lease_columns(engine)
-        _ensure_tasks_lock_columns(engine)
-        _ensure_tasks_stop_columns(engine)
-        _ensure_tasks_publish_batch_columns(engine)
-        _ensure_youtube_sources_columns(engine)
-        _ensure_publish_jobs_generic_columns(engine)
-        _backfill_bilibili_publish_account_ids(engine)
-        _ensure_publish_batch_columns(engine)
-        _backfill_publish_batch_lifecycle(engine)
-        _ensure_account_check_columns(engine)
-        _ensure_scheduler_indexes(engine)
-        _ensure_pgvector_rag_tables(engine)
+    _ensure_app_settings_version_column(connection)
+    _ensure_job_lease_columns(connection)
+    _ensure_tasks_lock_columns(connection)
+    _ensure_tasks_stop_columns(connection)
+    _ensure_tasks_publish_batch_columns(connection)
+    _ensure_youtube_sources_columns(connection)
+    _ensure_publish_jobs_generic_columns(connection)
+    _backfill_bilibili_publish_account_ids(connection)
+    _ensure_publish_batch_columns(connection)
+    _backfill_publish_batch_lifecycle(connection)
+    _ensure_account_check_columns(connection)
+    _ensure_scheduler_indexes(connection)
+    _ensure_pgvector_rag_tables(connection)
+
+
+def auto_migrate_engine(engine: Engine) -> None:
+    """Compatibility API for old callers; service startup uses initialize_database."""
+    with engine.connect() as connection, schema_lock(connection):
+        # Commit added PostgreSQL enum labels before later statements use them.
+        _ensure_postgres_enum_values(connection)
+        with connection.begin():
+            apply_legacy_migrations(connection)
 
 
 @lru_cache
