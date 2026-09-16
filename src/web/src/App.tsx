@@ -1,29 +1,31 @@
-import { ReactNode, useEffect, useState } from "react";
-import { Link, NavLink, Route, Routes, useLocation } from "react-router-dom";
+import { Suspense, lazy, type ReactNode, useEffect, useState } from "react";
+import { Link, NavLink, Navigate, Route, Routes, useLocation } from "react-router-dom";
 import AuthGate from "./components/AuthGate";
 import { FeedbackProvider } from "./components/Feedback";
+import SettingsLayout from "./components/SettingsLayout";
 import { fetchJson } from "./lib/http";
 import { ORCHESTRATOR_URL } from "./lib/urls";
 import { RealtimeProvider } from "./lib/realtime";
-import DashboardPage from "./pages/DashboardPage";
-import TaskDetailPage from "./pages/TaskDetailPage";
-import TaskNewPage from "./pages/TaskNewPage";
-import TasksPage from "./pages/TasksPage";
-import VideosPage from "./pages/VideosPage";
-import YouTubeSourcesPage from "./pages/YouTubeSourcesPage";
-import SettingsASRPage from "./pages/SettingsASRPage";
-import SettingsYouTubePage from "./pages/SettingsYouTubePage";
-import SettingsStoragePage from "./pages/SettingsStoragePage";
-import SettingsApiPage from "./pages/SettingsApiPage";
-import SettingsTranslatePage from "./pages/SettingsTranslatePage";
-import SettingsPublishPage from "./pages/SettingsPublishPage";
-import SettingsAutoPage from "./pages/SettingsAutoPage";
-import SettingsReviewPage from "./pages/SettingsReviewPage";
-import LivePage from "./pages/LivePage";
-import PlayoutPage from "./pages/PlayoutPage";
-import RenderQueuePage from "./pages/RenderQueuePage";
-import KnowledgeBasePage from "./pages/KnowledgeBasePage";
-import DictionaryPage from "./pages/DictionaryPage";
+
+const DashboardPage = lazy(() => import("./pages/DashboardPage"));
+const TaskDetailPage = lazy(() => import("./pages/TaskDetailPage"));
+const TaskNewPage = lazy(() => import("./pages/TaskNewPage"));
+const TasksPage = lazy(() => import("./pages/TasksPage"));
+const VideosPage = lazy(() => import("./pages/VideosPage"));
+const YouTubeSourcesPage = lazy(() => import("./pages/YouTubeSourcesPage"));
+const SettingsASRPage = lazy(() => import("./pages/SettingsASRPage"));
+const SettingsYouTubePage = lazy(() => import("./pages/SettingsYouTubePage"));
+const SettingsStoragePage = lazy(() => import("./pages/SettingsStoragePage"));
+const SettingsApiPage = lazy(() => import("./pages/SettingsApiPage"));
+const SettingsTranslatePage = lazy(() => import("./pages/SettingsTranslatePage"));
+const SettingsPublishPage = lazy(() => import("./pages/SettingsPublishPage"));
+const SettingsAutoPage = lazy(() => import("./pages/SettingsAutoPage"));
+const SettingsReviewPage = lazy(() => import("./pages/SettingsReviewPage"));
+const LivePage = lazy(() => import("./pages/LivePage"));
+const PlayoutPage = lazy(() => import("./pages/PlayoutPage"));
+const RenderQueuePage = lazy(() => import("./pages/RenderQueuePage"));
+const KnowledgeBasePage = lazy(() => import("./pages/KnowledgeBasePage"));
+const DictionaryPage = lazy(() => import("./pages/DictionaryPage"));
 
 function NavItem({ to, label, onNavigate }: { to: string; label: string; onNavigate?: () => void }) {
   return (
@@ -32,10 +34,10 @@ function NavItem({ to, label, onNavigate }: { to: string; label: string; onNavig
       onClick={onNavigate}
       className={({ isActive }) =>
         [
-          "block rounded-md px-3 py-2 text-sm",
+          "relative flex min-h-9 items-center rounded-lg px-3 py-2 text-sm transition-colors",
           isActive
-            ? "bg-slate-900 text-white dark:bg-slate-100 dark:text-slate-950"
-            : "text-slate-700 hover:bg-slate-100 dark:text-slate-300 dark:hover:bg-slate-800",
+            ? "bg-slate-100 font-medium text-slate-950 before:absolute before:bottom-2 before:left-0 before:top-2 before:w-0.5 before:rounded-full before:bg-slate-900 dark:bg-slate-800 dark:text-white dark:before:bg-slate-100"
+            : "text-slate-600 hover:bg-slate-100/80 hover:text-slate-950 dark:text-slate-400 dark:hover:bg-slate-800 dark:hover:text-slate-100",
         ].join(" ")
       }
     >
@@ -44,20 +46,59 @@ function NavItem({ to, label, onNavigate }: { to: string; label: string; onNavig
   );
 }
 
-function NavGroup({ title, children }: { title: string; children: ReactNode }) {
+function NavGroup({
+  title,
+  children,
+  collapsible = false,
+  open = true,
+  onToggle,
+}: {
+  title: string;
+  children: ReactNode;
+  collapsible?: boolean;
+  open?: boolean;
+  onToggle?: () => void;
+}) {
   return (
-    <div>
-      <div className="px-3 pb-1 pt-2 text-[11px] font-semibold uppercase tracking-normal text-slate-400">{title}</div>
-      <div className="space-y-1">{children}</div>
+    <div className="space-y-1">
+      {collapsible ? (
+        <button
+          type="button"
+          className="flex w-full items-center justify-between rounded-md px-3 py-1.5 text-[11px] font-semibold text-slate-400 hover:bg-slate-100 hover:text-slate-600 dark:hover:bg-slate-800 dark:hover:text-slate-300"
+          aria-expanded={open}
+          onClick={onToggle}
+        >
+          <span>{title}</span>
+          <span aria-hidden="true" className="text-[10px]">{open ? "−" : "+"}</span>
+        </button>
+      ) : (
+        <div className="px-3 py-1.5 text-[11px] font-semibold text-slate-400">{title}</div>
+      )}
+      {open ? <div className="space-y-0.5">{children}</div> : null}
     </div>
   );
 }
 
 function Navigation({ onNavigate }: { onNavigate?: () => void }) {
+  const location = useLocation();
+  const settingsActive = location.pathname.startsWith("/settings/");
+  const [settingsOpen, setSettingsOpen] = useState(settingsActive);
+
+  useEffect(() => {
+    if (settingsActive) setSettingsOpen(true);
+  }, [settingsActive]);
+
   return (
-    <div className="rounded-md border border-slate-200 bg-white p-2 shadow-sm dark:border-slate-800 dark:bg-slate-900">
+    <nav className="space-y-3" aria-label="主导航">
+      <Link
+        to="/tasks/new"
+        onClick={onNavigate}
+        className="flex items-center justify-center rounded-lg bg-slate-900 px-3 py-2 text-sm font-medium text-white transition hover:bg-slate-800 dark:bg-slate-100 dark:text-slate-950 dark:hover:bg-white"
+      >
+        ＋ 新建任务
+      </Link>
       <NavGroup title="工作台">
-        <NavItem to="/" label="仪表盘" onNavigate={onNavigate} />
+        <NavItem to="/" label="工作台" onNavigate={onNavigate} />
         <NavItem to="/tasks" label="任务" onNavigate={onNavigate} />
         <NavItem to="/videos" label="视频成品" onNavigate={onNavigate} />
         <NavItem to="/playout" label="播控中心" onNavigate={onNavigate} />
@@ -66,10 +107,9 @@ function Navigation({ onNavigate }: { onNavigate?: () => void }) {
         <NavItem to="/dictionaries" label="词典" onNavigate={onNavigate} />
       </NavGroup>
       <NavGroup title="来源">
-        <NavItem to="/tasks/new" label="新建任务" onNavigate={onNavigate} />
         <NavItem to="/youtube/sources" label="YouTube 来源" onNavigate={onNavigate} />
       </NavGroup>
-      <NavGroup title="配置">
+      <NavGroup title="配置" collapsible open={settingsOpen} onToggle={() => setSettingsOpen((value) => !value)}>
         <NavItem to="/settings/auto" label="自动模式" onNavigate={onNavigate} />
         <NavItem to="/settings/youtube" label="YouTube" onNavigate={onNavigate} />
         <NavItem to="/settings/publish" label="投稿设置" onNavigate={onNavigate} />
@@ -79,6 +119,17 @@ function Navigation({ onNavigate }: { onNavigate?: () => void }) {
         <NavItem to="/settings/storage" label="存储" onNavigate={onNavigate} />
         <NavItem to="/settings/api" label="API" onNavigate={onNavigate} />
       </NavGroup>
+    </nav>
+  );
+}
+
+function PageLoading() {
+  return (
+    <div className="space-y-3" role="status" aria-live="polite">
+      <div className="h-7 w-40 animate-pulse rounded bg-slate-200 dark:bg-slate-800" />
+      <div className="h-4 w-72 max-w-full animate-pulse rounded bg-slate-200 dark:bg-slate-800" />
+      <div className="mt-5 h-44 animate-pulse rounded-xl border border-slate-200 bg-white dark:border-slate-800 dark:bg-slate-900" />
+      <span className="sr-only">页面加载中</span>
     </div>
   );
 }
@@ -125,6 +176,20 @@ export default function App() {
     setMobileNavOpen(false);
   }, [location.pathname]);
 
+  useEffect(() => {
+    if (!mobileNavOpen) return undefined;
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setMobileNavOpen(false);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.removeEventListener("keydown", onKeyDown);
+      document.body.style.overflow = previousOverflow;
+    };
+  }, [mobileNavOpen]);
+
   async function logout() {
     if (loggingOut) return;
     setLoggingOut(true);
@@ -151,11 +216,11 @@ export default function App() {
       >
         <header
           className={[
-            "border-b bg-white transition-colors dark:border-slate-800 dark:bg-slate-950",
+            "sticky top-0 z-30 border-b bg-white/95 backdrop-blur transition-colors dark:border-slate-800 dark:bg-slate-950/95",
             isPlayoutRoute ? "flex-none" : "",
           ].join(" ")}
         >
-          <div className="mx-auto flex max-w-7xl items-center justify-between px-4 py-3">
+          <div className="mx-auto flex max-w-[1440px] items-center justify-between px-4 py-3 lg:px-6">
             <div className="flex items-center gap-2">
               <button
                 type="button"
@@ -166,16 +231,18 @@ export default function App() {
               >
                 ☰
               </button>
-              <Link to="/" className="font-semibold">
+              <Link to="/" className="text-[15px] font-semibold tracking-tight text-slate-950 dark:text-white">
                 VideoRoll
               </Link>
+              <span className="hidden rounded-full bg-slate-100 px-2 py-0.5 text-[11px] text-slate-500 dark:bg-slate-800 dark:text-slate-400 sm:inline-flex">
+                合规处理台
+              </span>
             </div>
             <div className="flex items-center gap-3">
-              <div className="hidden text-xs text-slate-500 sm:block">合规处理台</div>
               <button
                 type="button"
                 onClick={() => setDarkMode((value) => !value)}
-                className="inline-flex h-8 w-8 items-center justify-center rounded-md border border-slate-300 text-sm text-slate-700 hover:bg-slate-50 dark:border-slate-700 dark:text-slate-200 dark:hover:bg-slate-900"
+                className="inline-flex h-8 w-8 items-center justify-center rounded-lg border border-slate-200 text-sm text-slate-600 hover:bg-slate-50 hover:text-slate-950 dark:border-slate-800 dark:text-slate-300 dark:hover:bg-slate-900"
                 title={darkMode ? "切换到浅色模式" : "切换到黑暗模式"}
                 aria-label={darkMode ? "切换到浅色模式" : "切换到黑暗模式"}
               >
@@ -186,16 +253,13 @@ export default function App() {
                 onClick={logout}
                 disabled={loggingOut}
                 className={[
-                  "rounded border px-2 py-1 text-xs dark:border-slate-700 dark:text-slate-200",
+                  "rounded-lg border border-slate-200 px-2.5 py-1.5 text-xs text-slate-600 dark:border-slate-800 dark:text-slate-300",
                   loggingOut ? "cursor-not-allowed bg-slate-100 text-slate-400 dark:bg-slate-900 dark:text-slate-500" : "hover:bg-slate-50 dark:hover:bg-slate-900",
                 ].join(" ")}
               >
                 {loggingOut ? "退出中…" : "退出"}
               </button>
             </div>
-          </div>
-          <div className="mx-auto max-w-7xl px-4 pb-3 text-xs text-slate-600">
-            仅用于处理你拥有版权/已获授权/允许再分发的内容。
           </div>
         </header>
 
@@ -207,9 +271,17 @@ export default function App() {
               aria-label="关闭导航"
               onClick={() => setMobileNavOpen(false)}
             />
-            <div className="relative h-full w-[min(20rem,calc(100vw-3rem))] overflow-auto bg-slate-50 p-4 shadow-xl dark:bg-slate-950">
-              <div className="mb-3 flex items-center justify-between gap-3">
-                <div className="font-semibold">VideoRoll</div>
+            <div
+              className="relative h-full w-[min(20rem,calc(100vw-3rem))] overflow-auto bg-slate-50 p-4 shadow-xl dark:bg-slate-950"
+              role="dialog"
+              aria-modal="true"
+              aria-label="主导航"
+            >
+              <div className="mb-4 flex items-center justify-between gap-3 border-b border-slate-200 pb-3 dark:border-slate-800">
+                <div>
+                  <div className="font-semibold">VideoRoll</div>
+                  <div className="mt-0.5 text-xs text-slate-500">合规处理台</div>
+                </div>
                 <button
                   type="button"
                   className="rounded-md border border-slate-300 px-2 py-1 text-sm text-slate-700 hover:bg-slate-100"
@@ -219,8 +291,9 @@ export default function App() {
                 </button>
               </div>
               <Navigation onNavigate={() => setMobileNavOpen(false)} />
-              <div className="mt-3 rounded-md border border-slate-200 bg-white p-3 text-xs text-slate-600 shadow-sm dark:border-slate-800 dark:bg-slate-900 dark:text-slate-400">
-                后端：{orchestratorDisplay}
+              <div className="mt-5 flex items-center gap-2 px-3 py-2 text-xs text-slate-500" title={orchestratorDisplay}>
+                <span className="h-2 w-2 rounded-full bg-emerald-500" />
+                <span>后端已连接</span>
               </div>
             </div>
           </div>
@@ -228,51 +301,59 @@ export default function App() {
 
         <div
           className={[
-            "mx-auto grid max-w-7xl grid-cols-12 gap-4 px-4 py-4",
+            "mx-auto grid max-w-[1440px] grid-cols-1 gap-6 px-4 py-5 md:grid-cols-[220px_minmax(0,1fr)] lg:px-6",
             isPlayoutRoute ? "min-h-0 w-full flex-1 overflow-hidden" : "",
           ].join(" ")}
         >
           <aside
             className={[
-              "hidden md:col-span-3 md:block lg:col-span-2",
+              "hidden md:block",
               isPlayoutRoute ? "min-h-0 overflow-y-auto" : "",
             ].join(" ")}
           >
-            <Navigation />
-            <div className="mt-3 rounded-md border border-slate-200 bg-white p-3 text-xs text-slate-600 shadow-sm dark:border-slate-800 dark:bg-slate-900 dark:text-slate-400">
-              后端：{orchestratorDisplay}
+            <div className="sticky top-[69px] max-h-[calc(100vh-89px)] overflow-y-auto pr-2">
+              <Navigation />
+              <div className="mt-5 flex items-center gap-2 px-3 py-2 text-xs text-slate-500" title={orchestratorDisplay}>
+                <span className="h-2 w-2 rounded-full bg-emerald-500" />
+                <span>后端已连接</span>
+              </div>
             </div>
           </aside>
 
           <main
             className={[
-              "col-span-12 md:col-span-9 lg:col-span-10",
+              "min-w-0",
               isPlayoutRoute ? "min-h-0 overflow-hidden" : "",
             ].join(" ")}
           >
-            <Routes>
-              <Route path="/" element={<DashboardPage />} />
-              <Route path="/tasks" element={<TasksPage />} />
-              <Route path="/videos" element={<VideosPage />} />
-              <Route path="/live" element={<LivePage />} />
-              <Route path="/playout" element={<PlayoutPage />} />
-              <Route path="/tasks/new" element={<TaskNewPage />} />
-              <Route path="/tasks/:taskId" element={<TaskDetailPage />} />
-              <Route path="/youtube/sources" element={<YouTubeSourcesPage />} />
-              <Route path="/queue/render" element={<RenderQueuePage />} />
-              <Route path="/knowledge" element={<KnowledgeBasePage />} />
-              <Route path="/dictionaries" element={<DictionaryPage />} />
-              <Route path="/settings/asr" element={<SettingsASRPage />} />
-              <Route path="/settings/youtube" element={<SettingsYouTubePage />} />
-              <Route path="/settings/storage" element={<SettingsStoragePage />} />
-              <Route path="/settings/api" element={<SettingsApiPage />} />
-              <Route path="/settings/review" element={<SettingsReviewPage />} />
-              <Route path="/settings/auto" element={<SettingsAutoPage />} />
-              <Route path="/settings/translate" element={<SettingsTranslatePage />} />
-              <Route path="/settings/publish" element={<SettingsPublishPage />} />
-              <Route path="/settings/bilibili" element={<SettingsPublishPage />} />
-              <Route path="*" element={<NotFoundPage />} />
-            </Routes>
+            <Suspense fallback={<PageLoading />}>
+              <Routes>
+                <Route path="/" element={<DashboardPage />} />
+                <Route path="/tasks" element={<TasksPage />} />
+                <Route path="/videos" element={<VideosPage />} />
+                <Route path="/live" element={<LivePage />} />
+                <Route path="/playout" element={<PlayoutPage />} />
+                <Route path="/tasks/new" element={<TaskNewPage />} />
+                <Route path="/tasks/:taskId" element={<TaskDetailPage />} />
+                <Route path="/youtube/sources" element={<YouTubeSourcesPage />} />
+                <Route path="/queue/render" element={<RenderQueuePage />} />
+                <Route path="/knowledge" element={<KnowledgeBasePage />} />
+                <Route path="/dictionaries" element={<DictionaryPage />} />
+                <Route path="/settings" element={<SettingsLayout />}>
+                  <Route index element={<Navigate to="auto" replace />} />
+                  <Route path="auto" element={<SettingsAutoPage />} />
+                  <Route path="youtube" element={<SettingsYouTubePage />} />
+                  <Route path="publish" element={<SettingsPublishPage />} />
+                  <Route path="bilibili" element={<SettingsPublishPage />} />
+                  <Route path="asr" element={<SettingsASRPage />} />
+                  <Route path="translate" element={<SettingsTranslatePage />} />
+                  <Route path="review" element={<SettingsReviewPage />} />
+                  <Route path="storage" element={<SettingsStoragePage />} />
+                  <Route path="api" element={<SettingsApiPage />} />
+                </Route>
+                <Route path="*" element={<NotFoundPage />} />
+              </Routes>
+            </Suspense>
           </main>
         </div>
           </div>

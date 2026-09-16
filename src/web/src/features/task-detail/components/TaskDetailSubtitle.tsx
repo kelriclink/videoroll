@@ -213,7 +213,7 @@ export function TaskDetailSubtitle({ controller }: { controller: TaskDetailContr
 
               {translateEnabled && translateProvider === "openai" && openaiKeySet === false ? (
                 <div className="md:col-span-2 text-xs text-rose-700">
-                  OpenAI API Key 未设置，请先到 <Link className="underline" to="/settings/translate">Settings · Translate</Link> 保存配置。
+                  OpenAI API Key 未设置，请先到 <Link className="underline" to="/settings/translate">翻译 / RAG 设置</Link> 保存配置。
                 </div>
               ) : null}
             </div>

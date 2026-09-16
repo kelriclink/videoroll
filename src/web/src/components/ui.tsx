@@ -26,7 +26,7 @@ export function Button({ tone = "secondary", size = "sm", className = "", ...pro
     <button
       {...props}
       className={[
-        "inline-flex items-center justify-center rounded-md border font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-50",
+        "inline-flex items-center justify-center rounded-lg border font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-50",
         toneClasses[tone],
         sizeClasses[size],
         className,
@@ -45,11 +45,11 @@ export function PageHeader({
   actions?: ReactNode;
 }) {
   return (
-    <div className="vr-section">
+    <div className="px-1 py-1">
       <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
         <div>
-          <div className="text-lg font-semibold text-slate-950">{title}</div>
-          {description ? <div className="mt-1 text-sm text-slate-600">{description}</div> : null}
+          <h1 className="text-xl font-semibold tracking-tight text-slate-950 sm:text-2xl">{title}</h1>
+          {description ? <div className="mt-1.5 max-w-3xl text-sm text-slate-500">{description}</div> : null}
         </div>
         {actions ? <div className="flex flex-wrap items-center gap-2">{actions}</div> : null}
       </div>
@@ -75,12 +75,12 @@ export function TableToolbar({
   meta?: ReactNode;
 }) {
   return (
-    <div className="flex flex-col gap-3 border-b border-slate-200 pb-3">
+    <div className="flex flex-col gap-3 border-b border-slate-200 pb-4">
       {(title || description || actions || meta) ? (
         <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
           {(title || description || meta) ? (
             <div className="min-w-0">
-              {title ? <div className="text-sm font-semibold text-slate-900">{title}</div> : null}
+              {title ? <div className="text-sm font-semibold text-slate-950">{title}</div> : null}
               {description ? <div className="mt-1 text-xs text-slate-500">{description}</div> : null}
               {meta ? <div className="mt-1 text-xs text-slate-500">{meta}</div> : null}
             </div>
@@ -160,22 +160,30 @@ export function MoreMenu({ children, label = "更多操作" }: PropsWithChildren
       if (!ref.current?.contains(event.target as Node)) setOpen(false);
     }
     window.addEventListener("pointerdown", onPointerDown);
-    return () => window.removeEventListener("pointerdown", onPointerDown);
+    function onKeyDown(event: KeyboardEvent) {
+      if (event.key === "Escape") setOpen(false);
+    }
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.removeEventListener("pointerdown", onPointerDown);
+      window.removeEventListener("keydown", onKeyDown);
+    };
   }, [open]);
 
   return (
     <div ref={ref} className="relative inline-flex">
       <button
         type="button"
-        className="inline-flex h-8 w-8 items-center justify-center rounded-md border border-slate-300 bg-white text-lg leading-none text-slate-700 hover:bg-slate-50"
+        className="inline-flex h-8 w-8 items-center justify-center rounded-lg border border-slate-200 bg-white text-lg leading-none text-slate-600 hover:bg-slate-50 hover:text-slate-950"
         aria-label={label}
+        aria-expanded={open}
         title={label}
         onClick={() => setOpen((value) => !value)}
       >
         ...
       </button>
       {open ? (
-        <div className="absolute right-0 top-full z-30 mt-1 min-w-40 overflow-hidden rounded-md border border-slate-200 bg-white py-1 shadow-lg">
+        <div className="absolute right-0 top-full z-30 mt-1 min-w-44 overflow-hidden rounded-lg border border-slate-200 bg-white py-1 shadow-lg">
           {children}
         </div>
       ) : null}

@@ -185,13 +185,13 @@ export default function SettingsASRPage() {
 
   return (
     <div className="space-y-4">
-      <div className="rounded border bg-white p-4">
-        <div className="text-lg font-semibold">Settings · ASR / Whisper / OpenVINO</div>
+      <div className="px-1">
+        <h2 className="text-xl font-semibold tracking-tight text-slate-950">语音识别（ASR）</h2>
         <div className="mt-1 text-sm text-slate-600">管理默认 ASR 引擎、模型路径与 OpenVINO 参数；本地模型目录也可用于上传 OpenVINO Whisper 导出模型。</div>
         {error ? <div className="mt-3 text-sm text-rose-700">{error}</div> : null}
       </div>
 
-      <div className="rounded border bg-white p-4">
+      <div className="vr-section">
         <div className="flex items-center justify-between">
           <div className="text-sm font-semibold">当前配置（来自后端环境变量）</div>
           <button onClick={() => refresh()} className="rounded border px-3 py-2 text-sm hover:bg-slate-50">
@@ -267,7 +267,7 @@ export default function SettingsASRPage() {
         </div>
       </div>
 
-      <div className="rounded border bg-white p-4">
+      <div className="vr-section">
         <div className="text-sm font-semibold">默认 ASR 参数（存储在数据库）</div>
         <div className="mt-2 text-xs text-slate-500">
           当任务中选择 <span className="font-mono">engine=auto</span> / <span className="font-mono">language=auto</span> / 未指定 model 时，会使用这里的默认值。
@@ -382,7 +382,7 @@ export default function SettingsASRPage() {
                 </div>
               </div>
               {externalWhisperTestResult ? (
-                <div className="mt-3 rounded border bg-white p-3 text-xs">
+                <div className="mt-3 rounded-lg border border-slate-200 bg-slate-50 p-3 text-xs">
                   <div className={externalWhisperTestResult.ok ? "text-emerald-700" : "text-rose-700"}>{externalWhisperTestResult.ok ? "连接成功" : "测试失败"} · {externalWhisperTestResult.elapsed_ms}ms</div>
                   {externalWhisperTestResult.text ? <div className="mt-1 break-all text-slate-700">返回：{externalWhisperTestResult.text}</div> : null}
                   {externalWhisperTestResult.error ? <div className="mt-1 break-all text-rose-700">{externalWhisperTestResult.error}</div> : null}
@@ -438,7 +438,7 @@ export default function SettingsASRPage() {
                 </div>
               </div>
               {cloudflareTestResult ? (
-                <div className="mt-3 rounded border bg-white p-3 text-xs">
+                <div className="mt-3 rounded-lg border border-slate-200 bg-slate-50 p-3 text-xs">
                   <div className={cloudflareTestResult.ok ? "text-emerald-700" : "text-rose-700"}>{cloudflareTestResult.ok ? "连接成功" : "测试失败"} · {cloudflareTestResult.elapsed_ms}ms · segments={cloudflareTestResult.segments}</div>
                   {cloudflareTestResult.text ? <div className="mt-1 break-all text-slate-700">返回：{cloudflareTestResult.text}</div> : null}
                   {cloudflareTestResult.error ? <div className="mt-1 break-all text-rose-700">{cloudflareTestResult.error}</div> : null}
@@ -493,7 +493,7 @@ export default function SettingsASRPage() {
                 </div>
               </div>
               {groqWhisperTestResult ? (
-                <div className="mt-3 rounded border bg-white p-3 text-xs">
+                <div className="mt-3 rounded-lg border border-slate-200 bg-slate-50 p-3 text-xs">
                   <div className={groqWhisperTestResult.ok ? "text-emerald-700" : "text-rose-700"}>{groqWhisperTestResult.ok ? "连接成功" : "测试失败"} · {groqWhisperTestResult.elapsed_ms}ms · segments={groqWhisperTestResult.segments}</div>
                   {groqWhisperTestResult.text ? <div className="mt-1 break-all text-slate-700">返回：{groqWhisperTestResult.text}</div> : null}
                   {groqWhisperTestResult.error ? <div className="mt-1 break-all text-rose-700">{groqWhisperTestResult.error}</div> : null}
@@ -605,7 +605,7 @@ export default function SettingsASRPage() {
               </button>
             </div>
             <div className="mt-1 text-xs text-slate-500">
-              用于 Settings · ASR 的模型下载/任务自动下载模型。留空=不使用代理。
+              用于 ASR 设置 的模型下载/任务自动下载模型。留空=不使用代理。
             </div>
             {proxyTestResult ? (
               <div className="mt-2 rounded border p-3 text-sm">
@@ -670,7 +670,7 @@ export default function SettingsASRPage() {
         </div>
       </div>
 
-      <div className="rounded border bg-white p-4">
+      <div className="vr-section">
         <div className="text-sm font-semibold">本地模型（后端目录）</div>
         {!models ? <div className="mt-2 text-sm text-slate-500">加载中…</div> : null}
         {models && models.length === 0 ? <div className="mt-2 text-sm text-slate-500">暂无</div> : null}
@@ -726,7 +726,7 @@ export default function SettingsASRPage() {
         ) : null}
       </div>
 
-      <div className="rounded border bg-white p-4">
+      <div className="vr-section">
         <div className="text-sm font-semibold">下载模型（从 Hugging Face）</div>
         <div className="mt-2 text-xs text-slate-500">
           支持 `faster-whisper` 和 `openvino`。选择 `openvino` 时，`tiny/base/small/medium/large-v3` 会映射到 OpenVINO 官方预转换 Whisper 仓库。
@@ -807,7 +807,7 @@ export default function SettingsASRPage() {
         </div>
       </div>
 
-      <div className="rounded border bg-white p-4">
+      <div className="vr-section">
         <div className="text-sm font-semibold">上传模型（zip）</div>
         <div className="mt-2 text-xs text-slate-500">
           上传一个 zip 包。解压后可以是 `faster-whisper/ctranslate2` 模型目录，也可以是已导出的 OpenVINO Whisper 模型目录。目录名仅允许字母数字与 `._-`。
@@ -852,7 +852,7 @@ export default function SettingsASRPage() {
         </div>
       </div>
 
-      <div className="rounded border bg-white p-4 text-xs text-slate-600">
+      <div className="rounded-lg border border-slate-200 bg-slate-50 p-4 text-xs text-slate-600">
         <div className="font-semibold text-slate-700">如何在任务里使用本地模型？</div>
         <div className="mt-2">
           在任务详情页生成字幕时，可将 `asr_engine` 设为 `faster-whisper` 或 `openvino`；`asr_model` 支持模型目录路径（例如：`/models/whisper/tiny` 或 `/models/whisper/whisper-large-v3-ov`）。

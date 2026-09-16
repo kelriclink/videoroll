@@ -228,8 +228,8 @@ export default function SettingsPublishPage() {
 
   return (
     <div className="space-y-4">
-      <div className="rounded border bg-white p-4">
-        <div className="text-lg font-semibold">投稿设置</div>
+      <div className="px-1">
+        <h2 className="text-xl font-semibold tracking-tight text-slate-950">投稿与发布</h2>
         <div className="mt-1 text-sm text-slate-600">按平台配置投稿启用状态、登录凭据和默认投稿策略。</div>
         {error ? <div className="mt-3 text-sm text-rose-700">{error}</div> : null}
       </div>
@@ -239,7 +239,7 @@ export default function SettingsPublishPage() {
         const accounts = activeAccountsForPlatform(socialAccounts, id);
         const loginSession = loginSessions[id];
         return (
-          <div key={id} className="rounded border bg-white p-4">
+          <div key={id} className="vr-section">
             <div className="flex flex-wrap items-start justify-between gap-3">
               <div>
                 <div className="text-sm font-semibold">{label}</div>
@@ -447,7 +447,7 @@ export default function SettingsPublishPage() {
         );
       })}
 
-      <div className="rounded border bg-white p-4">
+      <div className="vr-section">
         <div className="flex items-start justify-between gap-3">
           <div>
             <div className="text-sm font-semibold">哔哩哔哩</div>
@@ -581,7 +581,7 @@ export default function SettingsPublishPage() {
         ) : null}
       </div>
 
-      <div className="rounded border bg-white p-4">
+      <div className="vr-section">
         <div className="flex items-center justify-between">
           <div className="text-sm font-semibold">default_meta.json</div>
           <button onClick={() => refresh()} className="rounded border px-3 py-2 text-sm hover:bg-slate-50">

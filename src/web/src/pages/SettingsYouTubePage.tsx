@@ -116,13 +116,13 @@ export default function SettingsYouTubePage() {
 
   return (
     <div className="space-y-4">
-      <div className="rounded border bg-white p-4">
-        <div className="text-lg font-semibold">Settings · YouTube</div>
+      <div className="px-1">
+        <h2 className="text-xl font-semibold tracking-tight text-slate-950">YouTube</h2>
         <div className="mt-1 text-sm text-slate-600">影响 YouTube 的下载、元信息、封面，以及首页推荐定时扫描请求。</div>
         {error ? <div className="mt-3 text-sm text-rose-700">{error}</div> : null}
       </div>
 
-      <div className="rounded border bg-white p-4">
+      <div className="vr-section">
         <div className="flex items-center justify-between">
           <div className="text-sm font-semibold">当前配置</div>
           <button onClick={() => refresh()} className="rounded border px-3 py-2 text-sm hover:bg-slate-50">
@@ -181,7 +181,7 @@ export default function SettingsYouTubePage() {
         )}
       </div>
 
-      <div className="rounded border bg-white p-4">
+      <div className="vr-section">
         <div className="text-sm font-semibold">YouTube 兼容模式</div>
         <div className="mt-2 text-xs text-slate-600 space-y-1">
           <div>
@@ -229,10 +229,10 @@ export default function SettingsYouTubePage() {
         </div>
       </div>
 
-      <div className="rounded border bg-white p-4">
+      <div className="vr-section">
         <div className="text-sm font-semibold">首页推荐定时扫描</div>
         <div className="mt-2 text-xs text-slate-500">
-          使用已保存的 YouTube 登录 cookies 扫描首页推荐视频；发现新链接后，直接进入现有 YouTube 自动模式，后续字幕生成和投稿参数继续按 <span className="font-mono">Settings · Auto Mode</span> 执行。
+          使用已保存的 YouTube 登录 cookies 扫描首页推荐视频；发现新链接后，直接进入现有 YouTube 自动模式，后续字幕生成和投稿参数继续按 <span className="font-mono">自动模式设置</span> 执行。
         </div>
         <div className="mt-2 text-xs text-slate-500">
           开启“仅抓长视频”后，系统会先额外抓一批候选，再过滤显式 Shorts；如果解析到了时长，还会按你设置的最短时长继续筛选。YouTube 首页里有些正常视频本身不带时长字段，这类候选会在日志里单独统计。
@@ -407,7 +407,7 @@ export default function SettingsYouTubePage() {
         ) : null}
       </div>
 
-      <div className="rounded border bg-white p-4">
+      <div className="vr-section">
         <div className="text-sm font-semibold">代理设置</div>
         <div className="mt-2 text-xs text-slate-500">
           支持 <span className="font-mono">http://</span> 和 <span className="font-mono">socks5://</span>，例如
@@ -496,7 +496,7 @@ export default function SettingsYouTubePage() {
         ) : null}
       </div>
 
-      <div className="rounded border bg-white p-4">
+      <div className="vr-section">
         <div className="text-sm font-semibold">Cookies 设置</div>
         <div className="mt-2 text-xs text-slate-500">
           将浏览器导出的 <span className="font-mono">cookies.txt</span>（Netscape 格式）粘贴到下面。保存后用于 yt-dlp 下载/元信息提取。

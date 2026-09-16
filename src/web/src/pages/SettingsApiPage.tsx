@@ -60,13 +60,13 @@ export default function SettingsApiPage() {
 
   return (
     <div className="space-y-4">
-      <div className="rounded border bg-white p-4">
-        <div className="text-lg font-semibold">Settings · API</div>
+      <div className="px-1">
+        <h2 className="text-xl font-semibold tracking-tight text-slate-950">远程 API</h2>
         <div className="mt-1 text-sm text-slate-600">配置远程管理 token。外部请求使用 Bearer 鉴权、JSON 请求体和幂等键后，会按 Auto Mode 创建任务并开始处理。</div>
         {error ? <div className="mt-3 whitespace-pre-wrap break-words text-sm text-rose-700">{error}</div> : null}
       </div>
 
-      <div className="rounded border bg-white p-4">
+      <div className="vr-section">
         <div className="flex items-center justify-between">
           <div className="text-sm font-semibold">当前配置</div>
           <button onClick={() => refresh()} className="rounded border px-3 py-2 text-sm hover:bg-slate-50">
@@ -90,7 +90,7 @@ export default function SettingsApiPage() {
         <div className="mt-3 text-xs text-slate-500">说明：当前远程入口仅支持 YouTube 视频链接，行为等价于网页里的 “YouTube 自动模式”。每个逻辑请求必须携带稳定且唯一的幂等键；网络重试时复用同一个键。</div>
       </div>
 
-      <div className="rounded border bg-white p-4">
+      <div className="vr-section">
         <div className="text-sm font-semibold">保存 token</div>
         <div className="mt-2 grid gap-3 md:grid-cols-2">
           <label className="block md:col-span-2">
@@ -163,7 +163,7 @@ export default function SettingsApiPage() {
         <div className="mt-3 text-xs text-slate-500">提示：保存后不会回显明文 token。请自行保管；需要更换时直接输入新 token 覆盖即可。</div>
       </div>
 
-      <div className="rounded border bg-white p-4">
+      <div className="vr-section">
         <div className="text-sm font-semibold">调用示例</div>
         <div className="mt-2 text-xs text-slate-500">
           仅支持 <span className="font-mono">POST</span> JSON 请求。必填请求头：<span className="font-mono">Authorization: Bearer</span> 和 <span className="font-mono">Idempotency-Key</span>。
@@ -175,7 +175,7 @@ export default function SettingsApiPage() {
         </div>
       </div>
 
-      <div className="rounded border bg-white p-4">
+      <div className="vr-section">
         <div className="text-sm font-semibold">Chrome / Edge 右键扩展</div>
         <div className="mt-2 text-sm text-slate-600">
           仓库中的 <span className="font-mono">extensions/videoroll-youtube-submit</span> 可以在 YouTube 视频页或缩略图上右键，将视频直接提交到自动模式。

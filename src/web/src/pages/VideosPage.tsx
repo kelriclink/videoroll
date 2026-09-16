@@ -6,6 +6,7 @@ import { Button, DataTable, EmptyState, MoreMenu, PageHeader, PaginationControls
 import { fetchJson } from "../lib/http";
 import { ORCHESTRATOR_URL } from "../lib/urls";
 import { Asset, Task } from "../lib/types";
+import { tasksApi, type PlayoutAssetLink } from "../api/tasks";
 import { formatBulkDeleteSummary, summarizeBulkDeleteResults } from "./videosPage.helpers";
 
 type ConvertedVideoItem = {
@@ -94,7 +95,11 @@ export default function VideosPage() {
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [searchText, setSearchText] = useState("");
   const [page, setPage] = useState(0);
+  const [playoutLinksByAsset, setPlayoutLinksByAsset] = useState<Record<string, PlayoutAssetLink>>({});
+  const [playoutTaskState, setPlayoutTaskState] = useState<Record<string, "loading" | "loaded" | "failed">>({});
+  const [playoutBusyAssets, setPlayoutBusyAssets] = useState<Set<string>>(new Set());
   const selectAllRef = useRef<HTMLInputElement | null>(null);
+  const playoutRequestedTasksRef = useRef<Set<string>>(new Set());
 
   const refresh = useCallback(async (opts?: { silent?: boolean }) => {
     if (opts?.silent) setRefreshing(true);
@@ -103,6 +108,9 @@ export default function VideosPage() {
     try {
       const data = await fetchJson<ConvertedVideoItem[]>(`${ORCHESTRATOR_URL}/videos/converted?limit=200`);
       setItems(data);
+      setPlayoutLinksByAsset({});
+      setPlayoutTaskState({});
+      playoutRequestedTasksRef.current.clear();
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -130,20 +138,68 @@ export default function VideosPage() {
 
   const filteredItems = useMemo(() => (items ?? []).filter((item) => matchesVideoSearch(item, searchText)), [items, searchText]);
   const pageItems = useMemo(() => filteredItems.slice(page * PAGE_SIZE, page * PAGE_SIZE + PAGE_SIZE), [filteredItems, page]);
-  const selectedCount = selected.size;
-  const allFilteredSelected = useMemo(
-    () => (filteredItems.length > 0 ? filteredItems.every((it) => selected.has(it.final_asset.id)) : false),
-    [filteredItems, selected],
+  const visiblePlayoutCount = useMemo(
+    () => pageItems.filter((item) => Boolean(playoutLinksByAsset[item.final_asset.id])).length,
+    [pageItems, playoutLinksByAsset],
   );
-  const someFilteredSelected = useMemo(
-    () => (filteredItems.length > 0 ? filteredItems.some((it) => selected.has(it.final_asset.id)) : false),
-    [filteredItems, selected],
+
+  useEffect(() => {
+    const taskIds = Array.from(new Set(pageItems.map((item) => item.task.id))).filter(
+      (taskId) => !playoutRequestedTasksRef.current.has(taskId),
+    );
+    if (taskIds.length === 0) return undefined;
+
+    for (const taskId of taskIds) playoutRequestedTasksRef.current.add(taskId);
+    let active = true;
+    setPlayoutTaskState((prev) => {
+      const next = { ...prev };
+      for (const taskId of taskIds) next[taskId] = "loading";
+      return next;
+    });
+
+    void Promise.all(
+      taskIds.map(async (taskId) => {
+        try {
+          const links = await tasksApi.playoutAssets(taskId);
+          return { taskId, links, state: "loaded" as const };
+        } catch {
+          return { taskId, links: [] as PlayoutAssetLink[], state: "failed" as const };
+        }
+      }),
+    ).then((results) => {
+      if (!active) return;
+      setPlayoutLinksByAsset((prev) => {
+        const next = { ...prev };
+        for (const result of results) {
+          for (const link of result.links) next[link.asset_id] = link;
+        }
+        return next;
+      });
+      setPlayoutTaskState((prev) => {
+        const next = { ...prev };
+        for (const result of results) next[result.taskId] = result.state;
+        return next;
+      });
+    });
+
+    return () => {
+      active = false;
+    };
+  }, [pageItems]);
+  const selectedCount = selected.size;
+  const allPageSelected = useMemo(
+    () => (pageItems.length > 0 ? pageItems.every((it) => selected.has(it.final_asset.id)) : false),
+    [pageItems, selected],
+  );
+  const somePageSelected = useMemo(
+    () => (pageItems.length > 0 ? pageItems.some((it) => selected.has(it.final_asset.id)) : false),
+    [pageItems, selected],
   );
 
   useEffect(() => {
     if (!selectAllRef.current) return;
-    selectAllRef.current.indeterminate = !allFilteredSelected && someFilteredSelected;
-  }, [allFilteredSelected, someFilteredSelected]);
+    selectAllRef.current.indeterminate = !allPageSelected && somePageSelected;
+  }, [allPageSelected, somePageSelected]);
 
   async function scanWorkdir() {
     setBusy(true);
@@ -179,6 +235,34 @@ export default function VideosPage() {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
       setBusy(false);
+    }
+  }
+
+  async function addVideoToPlayout(item: ConvertedVideoItem) {
+    const assetId = item.final_asset.id;
+    if (playoutLinksByAsset[assetId] || playoutBusyAssets.has(assetId)) return;
+
+    setPlayoutBusyAssets((prev) => new Set(prev).add(assetId));
+    setError(null);
+    try {
+      const link = await tasksApi.addToPlayout(item.task.id, assetId);
+      setPlayoutLinksByAsset((prev) => ({ ...prev, [assetId]: link }));
+      setPlayoutTaskState((prev) => ({ ...prev, [item.task.id]: "loaded" }));
+      toast({
+        kind: "success",
+        title: "已加入播控",
+        message: link.relative_media_path,
+      });
+    } catch (e: unknown) {
+      const message = e instanceof Error ? e.message : String(e);
+      setError(message);
+      toast({ kind: "error", title: "加入播控失败", message });
+    } finally {
+      setPlayoutBusyAssets((prev) => {
+        const next = new Set(prev);
+        next.delete(assetId);
+        return next;
+      });
     }
   }
 
@@ -253,10 +337,10 @@ export default function VideosPage() {
     }
   }
 
-  function setAllFilteredSelected(checked: boolean) {
+  function setAllPageSelected(checked: boolean) {
     setSelected((prev) => {
       const next = new Set(prev);
-      for (const item of filteredItems) {
+      for (const item of pageItems) {
         if (checked) next.add(item.final_asset.id);
         else next.delete(item.final_asset.id);
       }
@@ -268,9 +352,9 @@ export default function VideosPage() {
     <div className="space-y-4">
       <PageHeader
         title="视频成品"
-        description="管理已经转换完成的最终视频、封面和存储清理。"
+        description="集中管理最终视频、播控投放、下载与存储清理。"
         actions={
-          <Link to="/tasks/new" className="rounded-md bg-slate-900 px-3 py-2 text-sm text-white hover:bg-slate-800">
+          <Link to="/tasks/new" className="inline-flex items-center rounded-lg bg-slate-900 px-3 py-2 text-sm font-medium text-white hover:bg-slate-800">
             新建任务
           </Link>
         }
@@ -278,22 +362,17 @@ export default function VideosPage() {
 
       <Section>
         <TableToolbar
-          title="最终视频"
-          description="最多加载最近 200 条已生成 video_final 的任务。"
+          title="内容库"
+          description="最近生成的 video_final，可直接加入播控或进入任务继续处理。"
           meta={
             items
-              ? `已加载 ${items.length} 条，当前显示 ${filteredItems.length} 条${refreshing ? "，刷新中..." : ""}`
+              ? `共 ${items.length} 条 · 筛选后 ${filteredItems.length} 条 · 当前页 ${visiblePlayoutCount} 条已加入播控${refreshing ? " · 刷新中…" : ""}`
               : loading
                 ? "加载中..."
                 : undefined
           }
           actions={
             <>
-              {selectedCount > 0 ? (
-                <Button disabled={busy} tone="danger" onClick={deleteSelectedVideos}>
-                  删除选中 ({selectedCount})
-                </Button>
-              ) : null}
               <Button disabled={refreshing || loading} onClick={() => refresh({ silent: true })}>
                 {refreshing ? "刷新中..." : "刷新"}
               </Button>
@@ -309,25 +388,31 @@ export default function VideosPage() {
           }
           filters={
             <>
-              <input
-                className="vr-input w-full lg:w-80"
-                value={searchText}
-                onChange={(e) => setSearchText(e.target.value)}
-                placeholder="搜索标题、文件名、来源链接、任务 ID"
-              />
-              <label className="flex items-center gap-2 rounded-md border border-slate-300 bg-white px-3 py-2 text-sm text-slate-700 hover:bg-slate-50">
+              <div className="flex w-full items-center gap-2 lg:max-w-xl">
                 <input
-                  ref={selectAllRef}
-                  type="checkbox"
-                  checked={allFilteredSelected}
-                  disabled={busy || filteredItems.length === 0}
-                  onChange={(e) => setAllFilteredSelected(e.target.checked)}
+                  className="vr-input min-w-0 flex-1"
+                  value={searchText}
+                  onChange={(e) => setSearchText(e.target.value)}
+                  placeholder="搜索标题、文件名、来源链接、任务 ID"
+                  aria-label="搜索视频成品"
                 />
-                选中当前筛选
-              </label>
+                {searchText ? (
+                  <Button size="xs" tone="ghost" onClick={() => setSearchText("")}>清除</Button>
+                ) : null}
+              </div>
             </>
           }
         />
+
+        {selectedCount > 0 ? (
+          <div className="mt-3 flex flex-col gap-3 rounded-lg border border-sky-200 bg-sky-50 px-3 py-2.5 sm:flex-row sm:items-center sm:justify-between">
+            <div className="text-sm font-medium text-sky-950">已选择 {selectedCount} 个视频</div>
+            <div className="flex flex-wrap items-center gap-2">
+              <Button size="xs" tone="ghost" onClick={() => setSelected(new Set())}>取消选择</Button>
+              <Button size="xs" disabled={busy} tone="danger" onClick={deleteSelectedVideos}>删除选中</Button>
+            </div>
+          </div>
+        ) : null}
 
         {error ? <div className="mt-3 rounded-md border border-rose-200 bg-rose-50 p-3 text-sm text-rose-700">{error}</div> : null}
         {deleteSummary ? <div className="mt-3 rounded-md border border-slate-200 bg-slate-50 p-3 text-sm text-slate-700">{deleteSummary}</div> : null}
@@ -341,18 +426,32 @@ export default function VideosPage() {
               <DataTable wrapClassName="mt-3">
                 <thead>
                   <tr>
-                    <th className="w-10">选中</th>
+                    <th className="w-10">
+                      <input
+                        ref={selectAllRef}
+                        type="checkbox"
+                        checked={allPageSelected}
+                        disabled={busy || pageItems.length === 0}
+                        onChange={(e) => setAllPageSelected(e.target.checked)}
+                        aria-label="选择当前页"
+                        title="选择当前页"
+                      />
+                    </th>
                     <th>视频</th>
                     <th className="w-24">任务</th>
                     <th className="w-36">状态</th>
                     <th>来源</th>
                     <th className="w-44">生成时间</th>
-                    <th className="w-36 text-right">操作</th>
+                    <th className="w-56 text-right">操作</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {pageItems.map((item) => (
-                    <tr key={item.final_asset.id}>
+                  {pageItems.map((item) => {
+                    const playoutLink = playoutLinksByAsset[item.final_asset.id];
+                    const playoutState = playoutTaskState[item.task.id];
+                    const playoutBusy = playoutBusyAssets.has(item.final_asset.id);
+                    return (
+                    <tr key={item.final_asset.id} className={selected.has(item.final_asset.id) ? "bg-sky-50/60" : undefined}>
                       <td>
                         <input
                           type="checkbox"
@@ -370,9 +469,13 @@ export default function VideosPage() {
                         />
                       </td>
                       <td>
-                        <div className="max-w-[32rem] truncate text-sm font-semibold text-slate-900">
+                        <Link
+                          to={`/tasks/${item.task.id}`}
+                          className="block max-w-[32rem] truncate text-sm font-semibold text-slate-950 hover:underline"
+                          title={item.display_title?.trim() || fileNameFromKey(item.final_asset.storage_key)}
+                        >
                           {item.display_title?.trim() || fileNameFromKey(item.final_asset.storage_key)}
-                        </div>
+                        </Link>
                         <div className="max-w-[32rem] truncate font-mono text-[11px] text-slate-600">{fileNameFromKey(item.final_asset.storage_key)}</div>
                         <div className="max-w-[32rem] truncate font-mono text-[11px] text-slate-500">{item.final_asset.storage_key}</div>
                       </td>
@@ -386,7 +489,7 @@ export default function VideosPage() {
                       </td>
                       <td>
                         <div className="text-xs text-slate-500">{item.task.source_type}</div>
-                        <div className="max-w-[28rem] truncate text-xs text-slate-700">{item.task.source_url ?? "-"}</div>
+                        <div className="max-w-[28rem] truncate text-xs text-slate-700" title={item.task.source_url ?? undefined}>{item.task.source_url ?? "-"}</div>
                       </td>
                       <td>
                         <div className="text-xs text-slate-700">{new Date(item.final_asset.created_at).toLocaleString()}</div>
@@ -394,13 +497,31 @@ export default function VideosPage() {
                       <td>
                         <div className="flex items-center justify-end gap-2">
                           <a
-                            className="rounded-md border border-slate-300 px-2 py-1 text-xs text-slate-800 hover:bg-slate-50"
+                            className="inline-flex items-center rounded-lg border border-slate-200 px-2 py-1 text-xs font-medium text-slate-700 hover:bg-slate-50 hover:text-slate-950"
                             href={`${ORCHESTRATOR_URL}/tasks/${item.task.id}/assets/${item.final_asset.id}/stream`}
                             target="_blank"
                             rel="noreferrer"
                           >
                             播放
                           </a>
+                          {playoutLink ? (
+                            <Link
+                              to="/playout"
+                              className="inline-flex items-center rounded-lg border border-emerald-200 bg-emerald-50 px-2 py-1 text-xs font-medium text-emerald-700 hover:bg-emerald-100"
+                              title={playoutLink.relative_media_path}
+                            >
+                              已加入播控
+                            </Link>
+                          ) : (
+                            <button
+                              type="button"
+                              className="inline-flex items-center rounded-lg border border-sky-300 px-2 py-1 text-xs font-medium text-sky-700 hover:bg-sky-50 disabled:cursor-not-allowed disabled:opacity-50"
+                              disabled={busy || playoutBusy || playoutState === "loading"}
+                              onClick={() => addVideoToPlayout(item)}
+                            >
+                              {playoutBusy ? "加入中..." : playoutState === "loading" ? "查询播控..." : "加入播控"}
+                            </button>
+                          )}
                           <MoreMenu>
                             <a
                               className={menuItemClass}
@@ -426,7 +547,8 @@ export default function VideosPage() {
                         </div>
                       </td>
                     </tr>
-                  ))}
+                    );
+                  })}
                 </tbody>
               </DataTable>
             )}

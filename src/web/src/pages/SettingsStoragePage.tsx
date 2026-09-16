@@ -44,13 +44,13 @@ export default function SettingsStoragePage() {
 
   return (
     <div className="space-y-4">
-      <div className="rounded border bg-white p-4">
-        <div className="text-lg font-semibold">Settings · Storage</div>
+      <div className="px-1">
+        <h2 className="text-xl font-semibold tracking-tight text-slate-950">存储</h2>
         <div className="mt-1 text-sm text-slate-600">设置共享文件存储的资源自动清理保留时间。</div>
         {error ? <div className="mt-3 text-sm text-rose-700">{error}</div> : null}
       </div>
 
-      <div className="rounded border bg-white p-4">
+      <div className="vr-section">
         <div className="flex items-center justify-between">
           <div className="text-sm font-semibold">当前配置</div>
           <button onClick={() => refresh()} className="rounded border px-3 py-2 text-sm hover:bg-slate-50">
@@ -76,7 +76,7 @@ export default function SettingsStoragePage() {
         </div>
       </div>
 
-      <div className="rounded border bg-white p-4">
+      <div className="vr-section">
         <div className="text-sm font-semibold">保存配置</div>
         <div className="mt-2 grid gap-3 md:grid-cols-2">
           <label className="block">

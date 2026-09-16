@@ -41,10 +41,10 @@ export default function SettingsReviewPage() {
 
   return (
     <div className="space-y-4">
-      <div className="rounded border bg-white p-4">
+      <div className="px-1">
         <div className="flex items-center justify-between gap-3">
           <div>
-            <div className="text-lg font-semibold">Settings · Review</div>
+            <h2 className="text-xl font-semibold tracking-tight text-slate-950">投稿前审核</h2>
             <div className="mt-1 text-sm text-slate-600">投稿前先根据视频标题、AI 总结和字幕内容执行 AI 审核。</div>
           </div>
           <button onClick={() => refresh()} className="rounded border px-3 py-2 text-sm hover:bg-slate-50">
@@ -54,7 +54,7 @@ export default function SettingsReviewPage() {
         {error ? <div className="mt-3 text-sm text-rose-700">{error}</div> : null}
       </div>
 
-      <div className="rounded border bg-white p-4">
+      <div className="vr-section">
         {!settings ? <div className="text-sm text-slate-500">加载中…</div> : null}
         {settings ? (
           <>
@@ -89,7 +89,7 @@ export default function SettingsReviewPage() {
 
             {enabled && openaiKeySet === false ? (
               <div className="mt-4 rounded border border-rose-200 bg-rose-50 p-3 text-xs text-rose-700">
-                AI 审核已启用，但 OpenAI API Key 还没有配置。请先到 <Link className="underline" to="/settings/translate">Settings · Translate</Link> 保存，
+                AI 审核已启用，但 OpenAI API Key 还没有配置。请先到 <Link className="underline" to="/settings/translate">翻译 / RAG 设置</Link> 保存，
                 否则投稿前会被拦截。
               </div>
             ) : null}

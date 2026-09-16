@@ -194,13 +194,13 @@ export default function SettingsAutoPage() {
 
   return (
     <div className="space-y-4">
-      <div className="rounded border bg-white p-4">
-        <div className="text-lg font-semibold">Settings · Auto Mode</div>
+      <div className="px-1">
+        <h2 className="text-xl font-semibold tracking-tight text-slate-950">自动模式</h2>
         <div className="mt-1 text-sm text-slate-600">用于 “YouTube 自动模式” 的默认参数（下载→字幕/翻译→烧录→投稿）。</div>
         {error ? <div className="mt-3 text-sm text-rose-700">{error}</div> : null}
       </div>
 
-      <div className="rounded border bg-white p-4">
+      <div className="vr-section">
         <div className="flex items-center justify-between gap-2">
           <div className="text-sm font-semibold">Subtitle</div>
           <button onClick={() => refresh()} className="rounded border px-3 py-2 text-sm hover:bg-slate-50">
@@ -437,7 +437,7 @@ export default function SettingsAutoPage() {
 
               {translateEnabled && translateProvider === "openai" && openaiKeySet === false ? (
                 <div className="md:col-span-2 text-xs text-rose-700">
-                  OpenAI API Key 未设置，请先到 <Link className="underline" to="/settings/translate">Settings · Translate</Link> 保存配置。
+                  OpenAI API Key 未设置，请先到 <Link className="underline" to="/settings/translate">翻译 / RAG 设置</Link> 保存配置。
                 </div>
               ) : null}
             </div>
@@ -482,7 +482,7 @@ export default function SettingsAutoPage() {
                   ))}
                 </select>
                 <div className="mt-2 text-xs text-slate-500">
-                  提示：留空表示使用 Settings · ASR 中的默认模型；选择 `openvino`、`external-whisper`、`groq-whisper` 或 `cloudflare-workers-ai` 时使用对应引擎配置。
+                  提示：留空表示使用 ASR 设置 中的默认模型；选择 `openvino`、`external-whisper`、`groq-whisper` 或 `cloudflare-workers-ai` 时使用对应引擎配置。
                 </div>
               </label>
             </div>
@@ -559,7 +559,7 @@ export default function SettingsAutoPage() {
               </select>
               {publishTypeidMode === "ai_summary" && (!translateEnableSummary || translateProvider !== "openai" || openaiKeySet === false) ? (
                 <div className="mt-2 text-xs text-rose-700">
-                  提示：AI 分区需要启用 OpenAI summary，并在 Settings · Translate 保存 OpenAI API Key；否则会回退到 B 站预测/手动分区。
+                  提示：AI 分区需要启用 OpenAI summary，并在 翻译 / RAG 设置 保存 OpenAI API Key；否则会回退到 B 站预测/手动分区。
                 </div>
               ) : (
                 <div className="mt-2 text-xs text-slate-500">AI 分区会在投稿时自动拉取可用分区列表，让 AI 从候选中选择一个 typeid。</div>
@@ -587,7 +587,7 @@ export default function SettingsAutoPage() {
             投稿 meta 的默认值（标题/简介/tags 等）请到 <Link className="underline" to="/settings/publish">投稿设置</Link> 配置；分区由上面的 “分区模式” 决定。
           </div>
           <div className="mt-1 text-xs text-slate-500">
-            投稿前 AI 审核规则请到 <Link className="underline" to="/settings/review">Settings · Review</Link> 配置。
+            投稿前 AI 审核规则请到 <Link className="underline" to="/settings/review">审核设置</Link> 配置。
           </div>
         </div>
 
@@ -714,13 +714,13 @@ export default function SettingsAutoPage() {
         </div>
       </div>
 
-      <div className="rounded border bg-white p-4 text-xs text-slate-600">
+      <div className="rounded-lg border border-slate-200 bg-slate-50 p-4 text-xs text-slate-600">
         <div className="font-semibold text-slate-700">提示</div>
         <div className="mt-2">
-          - OpenAI 相关参数（base_url/model/timeout/api_key）在 <Link className="underline" to="/settings/translate">Settings · Translate</Link> 配置。
+          - OpenAI 相关参数（base_url/model/timeout/api_key）在 <Link className="underline" to="/settings/translate">翻译 / RAG 设置</Link> 配置。
         </div>
         <div className="mt-1">
-          - ASR 默认模型在 <Link className="underline" to="/settings/asr">Settings · ASR</Link> 配置。
+          - ASR 默认模型在 <Link className="underline" to="/settings/asr">ASR 设置</Link> 配置。
         </div>
       </div>
     </div>

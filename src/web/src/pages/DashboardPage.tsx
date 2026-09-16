@@ -950,162 +950,94 @@ export default function DashboardPage() {
   const runningCount = (tasks ?? []).filter((t) => runningStatuses.has(t.status)).length;
 
   return (
-    <div className="space-y-4">
+    <div className="space-y-5">
       <PageHeader
-        title="Dashboard"
-        description="快速查看任务状态、失败任务和最新产物。"
+        title="工作台"
+        description="优先查看需要处理的任务、实时流水线状态和最新视频成品。"
         actions={
           <>
-            <Link to="/tasks?status=FAILED" className="rounded-md border border-slate-300 px-3 py-2 text-sm text-slate-800 hover:bg-slate-50">
-              查看失败
+            <Link to="/videos" className="rounded-lg border border-slate-300 px-3 py-2 text-sm text-slate-700 hover:bg-white">
+              视频成品
             </Link>
-            <Link to="/tasks/new" className="rounded-md bg-slate-900 px-3 py-2 text-sm text-white hover:bg-slate-800">
-            新建任务
+            <Link to="/tasks/new" className="rounded-lg bg-slate-900 px-3 py-2 text-sm font-medium text-white hover:bg-slate-800">
+              新建任务
             </Link>
           </>
         }
       />
 
-      <div className="vr-section">
-        <div className="mb-3 flex items-center justify-between gap-3">
-          <div className="text-sm font-semibold">最近任务（200 条内）</div>
-          {tasks ? <div className="text-xs text-slate-500">共 {total} 条</div> : null}
-        </div>
-        {error ? <div className="text-sm text-rose-700">{error}</div> : null}
-        {!tasks ? <div className="text-sm text-slate-500">加载中…</div> : null}
+      {error ? <div className="rounded-lg border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700">{error}</div> : null}
+
+      <section aria-label="任务概览">
+        {!tasks ? <div className="vr-section text-sm text-slate-500">任务概览加载中…</div> : null}
         {tasks ? (
           <>
-            <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
-              <Link to="/tasks" className="rounded-md border border-slate-200 bg-slate-50 p-3 hover:bg-slate-100">
-                <div className="text-xs text-slate-500">全部任务</div>
-                <div className="mt-1 text-2xl font-semibold text-slate-950">{total}</div>
+            <div className="grid grid-cols-2 gap-3 xl:grid-cols-4">
+              <Link to="/tasks" className="group rounded-xl border border-slate-200 bg-white p-4 transition hover:border-slate-300 hover:shadow-sm">
+                <div className="text-xs font-medium text-slate-500">全部任务</div>
+                <div className="mt-2 flex items-end justify-between gap-2">
+                  <div className="text-3xl font-semibold tracking-tight text-slate-950">{total}</div>
+                  <span className="text-xs text-slate-400 group-hover:text-slate-600">查看 →</span>
+                </div>
               </Link>
-              <Link to="/queue/render" className="rounded-md border border-sky-200 bg-sky-50 p-3 hover:bg-sky-100">
-                <div className="text-xs text-sky-700">运行中</div>
-                <div className="mt-1 text-2xl font-semibold text-sky-950">{runningCount}</div>
+              <Link to="/queue/render" className="group rounded-xl border border-sky-200 bg-sky-50 p-4 transition hover:border-sky-300 hover:shadow-sm">
+                <div className="text-xs font-medium text-sky-700">正在处理</div>
+                <div className="mt-2 flex items-end justify-between gap-2">
+                  <div className="text-3xl font-semibold tracking-tight text-sky-950">{runningCount}</div>
+                  <span className="text-xs text-sky-600">队列 →</span>
+                </div>
               </Link>
-              <Link to="/tasks?status=FAILED" className="rounded-md border border-rose-200 bg-rose-50 p-3 hover:bg-rose-100">
-                <div className="text-xs text-rose-700">失败</div>
-                <div className="mt-1 text-2xl font-semibold text-rose-950">{failedCount}</div>
+              <Link to="/tasks?status=FAILED" className="group rounded-xl border border-rose-200 bg-rose-50 p-4 transition hover:border-rose-300 hover:shadow-sm">
+                <div className="text-xs font-medium text-rose-700">需要处理</div>
+                <div className="mt-2 flex items-end justify-between gap-2">
+                  <div className="text-3xl font-semibold tracking-tight text-rose-950">{failedCount}</div>
+                  <span className="text-xs text-rose-600">失败任务 →</span>
+                </div>
               </Link>
-              <Link to="/tasks?status=PUBLISHED" className="rounded-md border border-emerald-200 bg-emerald-50 p-3 hover:bg-emerald-100">
-                <div className="text-xs text-emerald-700">已发布</div>
-                <div className="mt-1 text-2xl font-semibold text-emerald-950">{publishedCount}</div>
+              <Link to="/tasks?status=PUBLISHED" className="group rounded-xl border border-emerald-200 bg-emerald-50 p-4 transition hover:border-emerald-300 hover:shadow-sm">
+                <div className="text-xs font-medium text-emerald-700">已发布</div>
+                <div className="mt-2 flex items-end justify-between gap-2">
+                  <div className="text-3xl font-semibold tracking-tight text-emerald-950">{publishedCount}</div>
+                  <span className="text-xs text-emerald-600">查看 →</span>
+                </div>
               </Link>
             </div>
-            <div className="mt-3 grid grid-cols-2 gap-2 md:grid-cols-4">
-            {counts.map(([status, n]) => (
-                <Link key={status} to={`/tasks?status=${status}`} className="rounded-md border border-slate-200 p-3 hover:bg-slate-50">
-                <div className="text-xs text-slate-500">{status}</div>
-                  <div className="text-xl font-semibold text-slate-900">{n}</div>
-                </Link>
-            ))}
-            </div>
-          </>
-        ) : null}
-      </div>
 
-      <div className="vr-section">
-        <div className="flex items-center justify-between gap-3">
-          <div>
-            <div className="text-sm font-semibold">资源监控</div>
-            <div className="mt-1 text-xs text-slate-500">每 3 秒刷新一次，数值来自当前运行后端的容器/主机视角。</div>
-          </div>
-          {resources?.sampled_at ? <div className="text-xs text-slate-500">{new Date(resources.sampled_at).toLocaleTimeString()}</div> : null}
-        </div>
-        {resourcesError ? <div className="mt-3 text-sm text-rose-700">{resourcesError}</div> : null}
-        {!resources ? <div className="mt-3 text-sm text-slate-500">加载中…</div> : null}
-        {resources ? (
-          <div className="mt-4 grid gap-4 lg:grid-cols-3">
-            <div className="rounded-md border border-slate-200 p-3 dark:border-slate-700">
-              <ResourceBar
-                label={`CPU${resources.cpu.cores ? ` · ${resources.cpu.cores} cores` : ""}`}
-                value={resources.cpu.percent}
-                detail={resources.cpu.load_average?.length ? `load ${resources.cpu.load_average.map((n) => n.toFixed(2)).join(" / ")}` : undefined}
-              />
-            </div>
-            <div className="rounded-md border border-slate-200 p-3 dark:border-slate-700">
-              <ResourceBar
-                label={resources.cgroup_memory ? "Memory · cgroup" : "Memory"}
-                value={(resources.cgroup_memory ?? resources.memory).percent}
-                detail={`${formatBytes((resources.cgroup_memory ?? resources.memory).used_bytes)} / ${formatBytes((resources.cgroup_memory ?? resources.memory).total_bytes)}`}
-                tone="emerald"
-              />
-              {resources.cgroup_memory ? (
-                <div className="mt-2 text-xs text-slate-500">host: {formatBytes(resources.memory.used_bytes)} / {formatBytes(resources.memory.total_bytes)}</div>
-              ) : null}
-            </div>
-            {resources.intel_gpu?.enabled ? (
-              <div className="rounded-md border border-slate-200 p-3 dark:border-slate-700">
-                <ResourceBar
-                  label="Intel GPU"
-                  value={resources.intel_gpu.usage_percent}
-                  detail={
-                    resources.intel_gpu.available
-                      ? `${resources.intel_gpu.model_name || resources.intel_gpu.render_device}${resources.intel_gpu.usage_supported ? "" : " · busy 不可读"}`
-                      : resources.intel_gpu.detail || "未检测到可用 Intel GPU"
-                  }
-                  tone="amber"
-                />
-                {resources.intel_gpu.engines?.length ? (
-                  <div className="mt-2 grid gap-1">
-                    {resources.intel_gpu.engines.slice(0, 4).map((engine) => (
-                      <div key={engine.name} className="flex items-center justify-between gap-2 text-[11px] text-slate-500">
-                        <span className="truncate">{engine.name}</span>
-                        <span className="font-mono">{formatPercent(engine.percent)}</span>
-                      </div>
-                    ))}
-                  </div>
-                ) : null}
+            {counts.length > 0 ? (
+              <div className="mt-3 flex flex-wrap items-center gap-2">
+                <span className="mr-1 text-xs font-medium text-slate-400">状态</span>
+                {counts.map(([status, n]) => (
+                  <Link
+                    key={status}
+                    to={`/tasks?status=${status}`}
+                    className="inline-flex items-center gap-1.5 rounded-full border border-slate-200 bg-white px-2.5 py-1 text-xs text-slate-600 hover:border-slate-300 hover:text-slate-950"
+                  >
+                    <span>{status}</span>
+                    <span className="font-mono text-slate-400">{n}</span>
+                  </Link>
+                ))}
               </div>
             ) : null}
-          </div>
+          </>
         ) : null}
-      </div>
-
-      <div className="vr-section">
-        <div className="flex items-center justify-between gap-3">
-          <div>
-            <div className="text-sm font-semibold">Agent 运行</div>
-            <div className="mt-1 text-xs text-slate-500">显示 RAG 的术语发现、搜索、网页读取与总结，以及启用 Think 的字幕翻译思考流。</div>
-          </div>
-          {agentRuns ? <div className="text-xs text-slate-500">运行中 {runningAgents.length}</div> : null}
-        </div>
-        {agentRunsError ? <div className="mt-3 text-sm text-rose-700">{agentRunsError}</div> : null}
-        {!agentRuns ? <div className="mt-3 text-sm text-slate-500">加载中…</div> : null}
-        {agentRuns ? (
-          <div className="mt-4 grid gap-4 lg:grid-cols-2">
-            <div>
-              <div className="mb-2 text-xs font-semibold text-slate-600">正在工作</div>
-              <div className="space-y-2">
-                {runningAgents.length === 0 ? <div className="text-sm text-slate-500">暂无运行中的 agent。</div> : null}
-                {runningAgents.map((run) => <AgentRunCard key={run.id} run={run} childrenByParent={agentChildren} onSelect={openAgentSession} />)}
-              </div>
-            </div>
-            <div>
-              <div className="mb-2 text-xs font-semibold text-slate-600">最近 Agent</div>
-              <div className="space-y-2">
-                {recentFinishedAgents.length === 0 ? <div className="text-sm text-slate-500">暂无 agent 结果。</div> : null}
-                {recentFinishedAgents.map((run) => <AgentRunCard key={run.id} run={run} childrenByParent={agentChildren} onSelect={openAgentSession} />)}
-              </div>
-            </div>
-          </div>
-        ) : null}
-      </div>
+      </section>
 
       <div className="grid gap-4 lg:grid-cols-2">
         <div className="vr-section">
           <div className="flex items-center justify-between gap-3">
-            <div className="text-sm font-semibold">正在处理</div>
-            <Link to="/queue/render" className="text-sm text-slate-700 hover:underline">
-              队列 →
+            <div>
+              <div className="text-sm font-semibold text-slate-950">正在处理</div>
+              <div className="mt-1 text-xs text-slate-500">上传、字幕、翻译、渲染与发布中的任务。</div>
+            </div>
+            <Link to="/queue/render" className="text-xs font-medium text-slate-500 hover:text-slate-950">
+              查看队列 →
             </Link>
           </div>
           <div className="mt-3 space-y-2">
             {!tasks ? <div className="text-sm text-slate-500">加载中…</div> : null}
             {tasks && runningTasks.length === 0 ? <div className="text-sm text-slate-500">暂无运行中任务。</div> : null}
             {runningTasks.map((t) => (
-              <Link key={t.id} to={`/tasks/${t.id}`} className="block rounded-md border border-slate-200 p-3 hover:bg-slate-50">
+              <Link key={t.id} to={`/tasks/${t.id}`} className="block rounded-lg border border-slate-200 p-3 transition hover:border-slate-300 hover:bg-slate-50">
                 <div className="flex items-center justify-between gap-3">
                   <div className="min-w-0">
                     <div className="truncate text-sm font-medium text-slate-950">{t.display_title?.trim() || t.source_url || t.id}</div>
@@ -1131,8 +1063,11 @@ export default function DashboardPage() {
 
         <div className="vr-section">
           <div className="flex items-center justify-between gap-3">
-            <div className="text-sm font-semibold">最近失败</div>
-            <Link to="/tasks?status=FAILED" className="text-sm text-slate-700 hover:underline">
+            <div>
+              <div className="text-sm font-semibold text-slate-950">最近失败</div>
+              <div className="mt-1 text-xs text-slate-500">优先处理会阻塞流水线的任务。</div>
+            </div>
+            <Link to="/tasks?status=FAILED" className="text-xs font-medium text-slate-500 hover:text-slate-950">
               全部失败 →
             </Link>
           </div>
@@ -1140,7 +1075,7 @@ export default function DashboardPage() {
             {!tasks ? <div className="text-sm text-slate-500">加载中…</div> : null}
             {tasks && failedTasks.length === 0 ? <div className="text-sm text-slate-500">暂无失败任务。</div> : null}
             {failedTasks.map((t) => (
-              <Link key={t.id} to={`/tasks/${t.id}`} className="block rounded-md border border-rose-100 p-3 hover:bg-rose-50">
+              <Link key={t.id} to={`/tasks/${t.id}`} className="block rounded-lg border border-rose-100 p-3 transition hover:border-rose-200 hover:bg-rose-50">
                 <div className="flex items-start justify-between gap-3">
                   <div className="min-w-0">
                     <div className="truncate text-sm font-medium text-slate-950">{t.display_title?.trim() || t.source_url || t.id}</div>
@@ -1154,51 +1089,139 @@ export default function DashboardPage() {
         </div>
       </div>
 
+      <div className="grid gap-4 xl:grid-cols-[minmax(0,2fr)_minmax(280px,1fr)]">
+        <div className="vr-section">
+          <div className="flex items-center justify-between gap-3">
+            <div>
+              <div className="text-sm font-semibold text-slate-950">Agent 运行</div>
+              <div className="mt-1 text-xs text-slate-500">RAG 术语发现、网页读取、总结与字幕翻译思考流。</div>
+            </div>
+            {agentRuns ? <div className="rounded-full bg-slate-100 px-2 py-1 text-xs text-slate-500">运行中 {runningAgents.length}</div> : null}
+          </div>
+          {agentRunsError ? <div className="mt-3 text-sm text-rose-700">{agentRunsError}</div> : null}
+          {!agentRuns ? <div className="mt-3 text-sm text-slate-500">加载中…</div> : null}
+          {agentRuns ? (
+            <div className="mt-4 grid gap-4 lg:grid-cols-2">
+              <div>
+                <div className="mb-2 text-xs font-semibold text-slate-500">正在工作</div>
+                <div className="space-y-2">
+                  {runningAgents.length === 0 ? <div className="rounded-lg border border-dashed border-slate-200 p-4 text-sm text-slate-500">暂无运行中的 Agent。</div> : null}
+                  {runningAgents.map((run) => <AgentRunCard key={run.id} run={run} childrenByParent={agentChildren} onSelect={openAgentSession} />)}
+                </div>
+              </div>
+              <div>
+                <div className="mb-2 text-xs font-semibold text-slate-500">最近完成</div>
+                <div className="space-y-2">
+                  {recentFinishedAgents.length === 0 ? <div className="rounded-lg border border-dashed border-slate-200 p-4 text-sm text-slate-500">暂无 Agent 结果。</div> : null}
+                  {recentFinishedAgents.map((run) => <AgentRunCard key={run.id} run={run} childrenByParent={agentChildren} onSelect={openAgentSession} />)}
+                </div>
+              </div>
+            </div>
+          ) : null}
+        </div>
+
+        <div className="vr-section">
+          <div className="flex items-start justify-between gap-3">
+            <div>
+              <div className="text-sm font-semibold text-slate-950">系统资源</div>
+              <div className="mt-1 text-xs text-slate-500">3 秒实时采样</div>
+            </div>
+            {resources?.sampled_at ? <div className="text-[11px] text-slate-400">{new Date(resources.sampled_at).toLocaleTimeString()}</div> : null}
+          </div>
+          {resourcesError ? <div className="mt-3 text-sm text-rose-700">{resourcesError}</div> : null}
+          {!resources ? <div className="mt-3 text-sm text-slate-500">加载中…</div> : null}
+          {resources ? (
+            <div className="mt-4 space-y-4">
+              <ResourceBar
+                label={`CPU${resources.cpu.cores ? ` · ${resources.cpu.cores} 核` : ""}`}
+                value={resources.cpu.percent}
+                detail={resources.cpu.load_average?.length ? `load ${resources.cpu.load_average.map((n) => n.toFixed(2)).join(" / ")}` : undefined}
+              />
+              <ResourceBar
+                label={resources.cgroup_memory ? "内存 · 容器" : "内存"}
+                value={(resources.cgroup_memory ?? resources.memory).percent}
+                detail={`${formatBytes((resources.cgroup_memory ?? resources.memory).used_bytes)} / ${formatBytes((resources.cgroup_memory ?? resources.memory).total_bytes)}`}
+                tone="emerald"
+              />
+              {resources.cgroup_memory ? <div className="-mt-2 text-[11px] text-slate-400">主机 {formatBytes(resources.memory.used_bytes)} / {formatBytes(resources.memory.total_bytes)}</div> : null}
+              {resources.intel_gpu?.enabled ? (
+                <div className="border-t border-slate-100 pt-4">
+                  <ResourceBar
+                    label="Intel GPU"
+                    value={resources.intel_gpu.usage_percent}
+                    detail={
+                      resources.intel_gpu.available
+                        ? `${resources.intel_gpu.model_name || resources.intel_gpu.render_device}${resources.intel_gpu.usage_supported ? "" : " · busy 不可读"}`
+                        : resources.intel_gpu.detail || "未检测到可用 Intel GPU"
+                    }
+                    tone="amber"
+                  />
+                  {resources.intel_gpu.engines?.length ? (
+                    <div className="mt-2 grid gap-1">
+                      {resources.intel_gpu.engines.slice(0, 4).map((engine) => (
+                        <div key={engine.name} className="flex items-center justify-between gap-2 text-[11px] text-slate-500">
+                          <span className="truncate">{engine.name}</span>
+                          <span className="font-mono">{formatPercent(engine.percent)}</span>
+                        </div>
+                      ))}
+                    </div>
+                  ) : null}
+                </div>
+              ) : null}
+            </div>
+          ) : null}
+        </div>
+      </div>
+
       <div className="vr-section">
         <div className="flex items-center justify-between gap-3">
-          <div className="text-sm font-semibold">已转换视频（video_final）</div>
-          <Link to="/videos" className="text-sm text-slate-700 hover:underline">
+          <div>
+            <div className="text-sm font-semibold text-slate-950">最新视频成品</div>
+            <div className="mt-1 text-xs text-slate-500">最近 12 条 video_final，可继续进入详情、下载或加入播控。</div>
+          </div>
+          <Link to="/videos" className="text-xs font-medium text-slate-500 hover:text-slate-950">
             管理全部 →
           </Link>
         </div>
-        <div className="mt-1 text-xs text-slate-500">展示最近 12 条已生成最终视频的任务，可下载/进入详情继续操作。</div>
         {videosError ? <div className="mt-2 text-sm text-rose-700">{videosError}</div> : null}
         {!videos ? <div className="mt-2 text-sm text-slate-500">加载中…</div> : null}
         {videos ? (
-          <div className="mt-3 overflow-auto rounded-md border border-slate-200">
-            <table className="min-w-full text-left text-sm">
-              <thead className="text-xs text-slate-500">
+          <div className="vr-table-wrap mt-4">
+            <table className="vr-table">
+              <thead>
                 <tr>
-                  <th className="py-2 pr-3">Video</th>
-                  <th className="py-2 pr-3">Task</th>
-                  <th className="py-2 pr-3">Status</th>
-                  <th className="py-2 pr-3">Actions</th>
+                  <th>视频</th>
+                  <th className="w-24">任务</th>
+                  <th className="w-36">状态</th>
+                  <th className="w-36 text-right">操作</th>
                 </tr>
               </thead>
               <tbody>
                 {videos.map((it) => (
-                  <tr key={it.final_asset.id} className="border-t">
-                    <td className="py-2 pr-3">
-                      <div className="font-mono text-xs">{fileNameFromKey(it.final_asset.storage_key)}</div>
+                  <tr key={it.final_asset.id}>
+                    <td>
+                      <Link to={`/tasks/${it.task.id}`} className="block max-w-[36rem] truncate text-sm font-medium text-slate-950 hover:underline">
+                        {fileNameFromKey(it.final_asset.storage_key)}
+                      </Link>
                     </td>
-                    <td className="py-2 pr-3">
+                    <td>
                       <Link to={`/tasks/${it.task.id}`} className="font-mono text-xs text-slate-900 hover:underline">
                         {it.task.id.slice(0, 8)}
                       </Link>
                     </td>
-                    <td className="py-2 pr-3">
+                    <td>
                       <StatusBadge status={it.task.status} />
                     </td>
-                    <td className="py-2 pr-3">
-                      <div className="flex flex-wrap items-center gap-2">
+                    <td>
+                      <div className="flex items-center justify-end gap-2">
                         <a
-                          className="rounded-md border border-slate-300 px-2 py-1 text-xs hover:bg-slate-50"
+                          className="rounded-lg border border-slate-200 px-2 py-1 text-xs text-slate-600 hover:bg-slate-50 hover:text-slate-950"
                           href={`${ORCHESTRATOR_URL}/tasks/${it.task.id}/assets/${it.final_asset.id}/download`}
                         >
-                          Download
+                          下载
                         </a>
-                        <Link className="rounded-md border border-slate-300 px-2 py-1 text-xs hover:bg-slate-50" to={`/tasks/${it.task.id}`}>
-                          Detail
+                        <Link className="rounded-lg border border-slate-200 px-2 py-1 text-xs text-slate-600 hover:bg-slate-50 hover:text-slate-950" to={`/tasks/${it.task.id}`}>
+                          详情
                         </Link>
                       </div>
                     </td>
