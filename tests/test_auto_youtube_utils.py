@@ -12,6 +12,17 @@ class AutoYouTubeUtilsTests(unittest.TestCase):
 
         self.assertEqual(parsed, {"origin": "youtube_home_scan", "auto_publish": True})
 
+    def test_encode_and_parse_run_id(self) -> None:
+        raw = encode_auto_youtube_created_by(
+            "auto_youtube",
+            auto_publish=None,
+            run_id="run_123-abc",
+        )
+        self.assertEqual(
+            parse_auto_youtube_created_by(raw),
+            {"origin": "auto_youtube", "auto_publish": None, "run_id": "run_123-abc"},
+        )
+
     def test_parse_rejects_non_auto_marker(self) -> None:
         self.assertIsNone(parse_auto_youtube_created_by("web"))
 

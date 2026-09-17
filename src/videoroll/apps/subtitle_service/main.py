@@ -12,6 +12,7 @@ import zipfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Generator
+from urllib.parse import urlsplit
 
 import httpx
 from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
@@ -1534,6 +1535,26 @@ def test_model_download_proxy(
     db: Session = Depends(get_db),
 ) -> ModelDownloadProxyTestResponse:
     url = str(payload.url or "").strip() or "https://huggingface.co/robots.txt"
+    try:
+        parsed_url = urlsplit(url)
+    except ValueError:
+        parsed_url = None
+    hostname = str(parsed_url.hostname or "").rstrip(".").lower() if parsed_url is not None else ""
+    if (
+        parsed_url is None
+        or parsed_url.scheme.lower() not in {"http", "https"}
+        or parsed_url.username is not None
+        or parsed_url.password is not None
+        or not (hostname == "huggingface.co" or hostname.endswith(".huggingface.co"))
+    ):
+        return ModelDownloadProxyTestResponse(
+            ok=False,
+            url=url,
+            used_proxy=str(payload.proxy or "").strip() or None,
+            status_code=None,
+            elapsed_ms=0,
+            error="model proxy test URL must be an HTTP(S) huggingface.co URL",
+        )
 
     if payload.proxy is not None:
         proxy = str(payload.proxy or "").strip()
@@ -1542,7 +1563,7 @@ def test_model_download_proxy(
         proxy = str(cfg.get("model_download_proxy") or "").strip()
 
     start = time.perf_counter()
-    client_kwargs: dict[str, Any] = {"timeout": 20.0, "follow_redirects": True}
+    client_kwargs: dict[str, Any] = {"timeout": 20.0, "follow_redirects": False}
     if proxy:
         try:
             client_kwargs["proxy"] = proxy
@@ -1563,7 +1584,7 @@ def test_model_download_proxy(
                     elapsed_ms=elapsed_ms,
                 )
         except TypeError:
-            with httpx.Client(timeout=20.0, follow_redirects=True) as client:
+            with httpx.Client(timeout=20.0, follow_redirects=False) as client:
                 resp = client.get(url)
                 ok = resp.status_code < 400
                 elapsed_ms = int((time.perf_counter() - start) * 1000)
@@ -1599,7 +1620,26 @@ def create_job(payload: SubtitleJobCreate, db: Session = Depends(get_db)) -> dic
     if task.status == TaskStatus.canceled:
         raise HTTPException(status_code=409, detail="task is stopped; resume it before submitting subtitle work")
 
+    # Re-check while holding the task row lock. The orchestrator-side check is
+    # only an optimization; without this guard two concurrent requests can both
+    # observe an empty queue before either insert becomes visible.
+    active_job = (
+        db.query(SubtitleJob)
+        .filter(
+            SubtitleJob.task_id == payload.task_id,
+            SubtitleJob.status.in_([SubtitleJobStatus.queued, SubtitleJobStatus.running]),
+        )
+        .order_by(SubtitleJob.created_at.asc(), SubtitleJob.id.asc())
+        .first()
+    )
+    if active_job is not None:
+        return {"job_id": str(active_job.id), "status": active_job.status.value}
+
     request_json = payload.model_dump(mode="json")
+    if "runtime_profile" not in payload.model_fields_set or payload.runtime_profile is None:
+        # Legacy automatic jobs have no explicit marker. Infer True only for
+        # those tasks; new manual orchestrator requests send False explicitly.
+        request_json["runtime_profile"] = parse_auto_youtube_created_by(task.created_by) is not None
     if "youtube_subtitle_mode" not in payload.model_fields_set:
         request_json["youtube_subtitle_mode"] = "target" if payload.prefer_youtube_subtitles else "off"
     request_json["prefer_youtube_subtitles"] = request_json.get("youtube_subtitle_mode") != "off"

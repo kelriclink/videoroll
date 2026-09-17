@@ -102,7 +102,7 @@ def test_expired_render_lease_is_requeued_with_resume(db: Session) -> None:
     assert summary.render_requeued == 1
 
 
-def test_recovery_does_not_requeue_published_render(db: Session) -> None:
+def test_recovery_reconciles_published_render_after_lease_expiry(db: Session) -> None:
     task = _task(db)
     task.status = TaskStatus.published
     job = RenderJob(
@@ -118,9 +118,10 @@ def test_recovery_does_not_requeue_published_render(db: Session) -> None:
 
     summary = recover_expired_leases(db, now=_now(), limit=100)
 
-    assert job.status == RenderJobStatus.running
+    assert job.status == RenderJobStatus.canceled
     assert job.retry_count == 2
     assert summary.render_requeued == 0
+    assert summary.terminal_render_reconciled == 1
 
 
 def test_recovery_message_is_not_appended_twice(db: Session) -> None:
@@ -170,6 +171,24 @@ def test_running_job_without_a_lease_is_not_recovered(db: Session) -> None:
 
     assert job.status == SubtitleJobStatus.running
     assert summary.total_recovered == 0
+
+
+def test_stale_legacy_running_job_without_lease_is_requeued(db: Session) -> None:
+    now = _now()
+    job = SubtitleJob(
+        task_id=_task(db).id,
+        status=SubtitleJobStatus.running,
+        updated_at=now - timedelta(hours=3),
+    )
+    db.add(job)
+    db.flush()
+
+    summary = recover_expired_leases(db, now=now, limit=100)
+
+    assert job.status == SubtitleJobStatus.queued
+    assert job.request_json.get("resume") is True
+    assert summary.subtitle_requeued == 1
+    assert summary.legacy_subtitle_requeued == 1
 
 
 def test_job_lease_is_owned_and_heartbeat_cannot_renew_after_expiry(db: Session) -> None:

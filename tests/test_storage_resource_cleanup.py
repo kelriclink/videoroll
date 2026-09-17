@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from videoroll.apps.orchestrator_api.services import maintenance_service
 from videoroll.db.base import Base
-from videoroll.db.models import AppSetting, Asset, AssetKind, SourceLicense, SourceType, Subtitle, SubtitleFormat, Task, TaskStatus
+from videoroll.db.models import AppSetting, Asset, AssetKind, PublishJob, PublishState, SourceLicense, SourceType, Subtitle, SubtitleFormat, Task, TaskStatus
 
 
 @compiles(JSONB, "sqlite")
@@ -69,13 +69,19 @@ class _LegacyNamespaceFakeS3:
 @pytest.fixture
 def db() -> Session:
     engine = create_engine("sqlite:///:memory:")
-    Base.metadata.create_all(engine, tables=[AppSetting.__table__, Task.__table__, Asset.__table__, Subtitle.__table__])
+    Base.metadata.create_all(
+        engine,
+        tables=[AppSetting.__table__, Task.__table__, Asset.__table__, Subtitle.__table__, PublishJob.__table__],
+    )
     session = sessionmaker(bind=engine)()
     try:
         yield session
     finally:
         session.close()
-        Base.metadata.drop_all(engine, tables=[Subtitle.__table__, Asset.__table__, Task.__table__, AppSetting.__table__])
+        Base.metadata.drop_all(
+            engine,
+            tables=[PublishJob.__table__, Subtitle.__table__, Asset.__table__, Task.__table__, AppSetting.__table__],
+        )
 
 
 def _task(status: TaskStatus) -> Task:
@@ -101,6 +107,30 @@ def test_expire_stale_publishing_tasks_marks_only_overdue_tasks_failed(db: Sessi
     assert overdue.error_message == "publishing status exceeded 48 hours"
     assert recent.status == TaskStatus.publishing
     assert already_failed.error_code is None
+
+
+def test_expire_stale_publishing_tasks_preserves_live_publish_job(db: Session) -> None:
+    now = datetime(2026, 7, 15, 12, tzinfo=timezone.utc)
+    task = _task(TaskStatus.publishing)
+    task.updated_at = now - timedelta(hours=72)
+    db.add(task)
+    db.flush()
+    db.add(
+        PublishJob(
+            task_id=task.id,
+            state=PublishState.submitting,
+            lease_owner="publish-worker:test",
+            lease_until=now + timedelta(minutes=30),
+            heartbeat_at=now - timedelta(minutes=1),
+        )
+    )
+    db.commit()
+
+    expired = maintenance_service.expire_stale_publishing_tasks(db, timeout_hours=48, now=now)
+
+    assert expired == 0
+    assert task.status == TaskStatus.publishing
+    assert task.error_code is None
 
 
 def test_task_id_from_resource_key_recognizes_only_owned_resource_prefixes() -> None:

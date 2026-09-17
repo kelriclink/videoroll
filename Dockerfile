@@ -29,19 +29,19 @@ RUN apt-get update \
   && python3 -m venv "${VIRTUAL_ENV}" \
   && rm -rf /var/lib/apt/lists/*
 
-COPY pyproject.toml README.md ./
+COPY pyproject.toml requirements.lock README.md ./
 
 # Normal application builds must include the ASR engines selectable at runtime.
 ARG INSTALL_ASR=1
-ARG YTDLP_VERSION=latest
+ARG YTDLP_VERSION=2026.8.19
 ARG TORCH_CPU_INDEX_URL=https://download.pytorch.org/whl/cpu
 
 # Install dependencies in a cache-friendly layer so editing source code doesn't
 # force re-downloading everything on every docker build.
 RUN INSTALL_ASR="$INSTALL_ASR" python -c "import os, tomllib; from pathlib import Path; data=tomllib.loads(Path('pyproject.toml').read_text('utf-8')); deps=list(data.get('project', {}).get('dependencies', []) or []); opt=data.get('project', {}).get('optional-dependencies', {}) or {}; deps += list(opt.get('asr', []) or []) if os.getenv('INSTALL_ASR','0')=='1' else []; Path('/tmp/requirements.txt').write_text('\\n'.join(deps) + '\\n', encoding='utf-8')" \
   && pip install --no-cache-dir -U pip \
-  && pip install --no-cache-dir --index-url "$TORCH_CPU_INDEX_URL" "torch>=2.3,<3" \
-  && pip install --no-cache-dir -r /tmp/requirements.txt
+  && pip install --no-cache-dir --index-url "$TORCH_CPU_INDEX_URL" "torch==2.14.0" \
+  && pip install --no-cache-dir -c requirements.lock -r /tmp/requirements.txt
 
 COPY src/videoroll ./src/videoroll
 COPY alembic.ini ./alembic.ini

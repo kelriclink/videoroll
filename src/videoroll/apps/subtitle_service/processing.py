@@ -33,6 +33,7 @@ from videoroll.ai.client import (
     request_openai_json_object_with_thinking,
 )
 from videoroll.ai.service import AIService
+from videoroll.apps.subtitle_service.provider_rate_limit import ProviderRateGate
 from videoroll.utils.openai_compat import build_openai_audio_transcriptions_url
 
 logger = logging.getLogger(__name__)
@@ -955,6 +956,8 @@ def transcribe_groq_whisper(
     audio_identity: str = "",
     vad_enabled: bool = True,
     vad_threshold: float = _OPENVINO_VAD_THRESHOLD,
+    redis_url: str = "",
+    provider_max_concurrency: int = 1,
 ) -> list[Segment]:
     """Transcribe through Groq using resumable, VAD-gated FLAC chunks."""
     key = str(api_key or "").strip()
@@ -989,6 +992,12 @@ def transcribe_groq_whisper(
         vad_threshold=normalized_vad_threshold,
     )
     completed = _load_groq_checkpoint(checkpoint_path, identity=identity, windows=windows)
+    provider_gate = ProviderRateGate(
+        redis_url,
+        "groq-whisper",
+        max_concurrency=provider_max_concurrency,
+        slot_ttl_seconds=timeout + 60.0,
+    )
     results: list[tuple[float, Iterable[Segment]]] = []
     if completed:
         logger.info("Groq Whisper restored %d/%d chunks from checkpoint", len(completed), len(windows))
@@ -1035,13 +1044,14 @@ def transcribe_groq_whisper(
         payload: Any = None
         for attempt in range(1, _GROQ_MAX_REQUEST_ATTEMPTS + 1):
             try:
-                response = httpx.post(
-                    url,
-                    headers={"Authorization": f"Bearer {key}"},
-                    data=data,
-                    files={"file": (f"{audio_path.stem}-part-{index}.flac", audio_bytes, "audio/flac")},
-                    timeout=timeout,
-                )
+                with provider_gate.slot(wait_seconds=min(120.0, timeout)):
+                    response = httpx.post(
+                        url,
+                        headers={"Authorization": f"Bearer {key}"},
+                        data=data,
+                        files={"file": (f"{audio_path.stem}-part-{index}.flac", audio_bytes, "audio/flac")},
+                        timeout=timeout,
+                    )
                 response.raise_for_status()
                 payload = response.json()
                 break
@@ -1051,6 +1061,8 @@ def transcribe_groq_whisper(
                 retryable = _groq_status_is_retryable(status)
                 if retryable and attempt < _GROQ_MAX_REQUEST_ATTEMPTS:
                     delay = _groq_retry_delay(exc.response, attempt)
+                    if status == 429:
+                        provider_gate.set_cooldown(delay)
                     logger.warning(
                         "Groq Whisper chunk %d/%d attempt %d/%d failed with HTTP %d; retrying in %.1fs",
                         index,
@@ -1212,6 +1224,8 @@ def transcribe_cloudflare_workers_ai(
     model_name: str = "@cf/openai/whisper-large-v3-turbo",
     language: str = "auto",
     timeout_seconds: float = 180.0,
+    redis_url: str = "",
+    provider_max_concurrency: int = 2,
 ) -> list[Segment]:
     """Transcribe audio through Cloudflare Workers AI's native /ai/run API."""
     account = str(account_id or "").strip()
@@ -1235,6 +1249,12 @@ def transcribe_cloudflare_workers_ai(
     url = f"https://api.cloudflare.com/client/v4/accounts/{account}/ai/run/{model}"
     out: list[Segment] = []
     chunks = _cloudflare_wav_chunks(audio_path)
+    provider_gate = ProviderRateGate(
+        redis_url,
+        "cloudflare-workers-ai",
+        max_concurrency=provider_max_concurrency,
+        slot_ttl_seconds=timeout + 60.0,
+    )
     for chunk_index, (offset, duration, audio_bytes) in enumerate(chunks, start=1):
         payload: dict[str, Any] = {
             "audio": base64.b64encode(audio_bytes).decode("ascii"),
@@ -1242,27 +1262,70 @@ def transcribe_cloudflare_workers_ai(
         }
         if lang and lang.lower() != "auto":
             payload["language"] = lang
-        try:
-            response = httpx.post(
-                url,
-                headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-                json=payload,
-                timeout=timeout,
-            )
-            response.raise_for_status()
-            raw_payload = response.json()
-        except httpx.HTTPStatusError as exc:
-            detail = (exc.response.text or "").strip().replace("\n", " ")[:500]
-            raise RuntimeError(
-                f"Cloudflare Workers AI request failed on chunk {chunk_index}/{len(chunks)} "
-                f"(status={exc.response.status_code}): {detail}"
-            ) from exc
-        except httpx.HTTPError as exc:
-            raise RuntimeError(
-                f"Cloudflare Workers AI request failed on chunk {chunk_index}/{len(chunks)}: {exc}"
-            ) from exc
-        except ValueError as exc:
-            raise RuntimeError("Cloudflare Workers AI returned invalid JSON") from exc
+        raw_payload: Any = None
+        for attempt in range(1, _GROQ_MAX_REQUEST_ATTEMPTS + 1):
+            try:
+                with provider_gate.slot(wait_seconds=min(120.0, timeout)):
+                    response = httpx.post(
+                        url,
+                        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                        json=payload,
+                        timeout=timeout,
+                    )
+                response.raise_for_status()
+                raw_payload = response.json()
+                break
+            except httpx.HTTPStatusError as exc:
+                status = int(exc.response.status_code)
+                detail = (exc.response.text or "").strip().replace("\n", " ")[:500]
+                if _groq_status_is_retryable(status) and attempt < _GROQ_MAX_REQUEST_ATTEMPTS:
+                    delay = _groq_retry_delay(exc.response, attempt)
+                    if status == 429:
+                        provider_gate.set_cooldown(delay)
+                    logger.warning(
+                        "Cloudflare Workers AI chunk %d/%d attempt %d/%d failed with HTTP %d; retrying in %.1fs",
+                        chunk_index,
+                        len(chunks),
+                        attempt,
+                        _GROQ_MAX_REQUEST_ATTEMPTS,
+                        status,
+                        delay,
+                    )
+                    time.sleep(delay)
+                    continue
+                raise RuntimeError(
+                    f"Cloudflare Workers AI request failed on chunk {chunk_index}/{len(chunks)} "
+                    f"after {attempt} attempt(s) (status={status}): {detail}"
+                ) from exc
+            except httpx.HTTPError as exc:
+                if attempt < _GROQ_MAX_REQUEST_ATTEMPTS:
+                    delay = _groq_retry_delay(None, attempt)
+                    logger.warning(
+                        "Cloudflare Workers AI chunk %d/%d attempt %d/%d failed with %s; retrying in %.1fs",
+                        chunk_index,
+                        len(chunks),
+                        attempt,
+                        _GROQ_MAX_REQUEST_ATTEMPTS,
+                        type(exc).__name__,
+                        delay,
+                    )
+                    time.sleep(delay)
+                    continue
+                raise RuntimeError(
+                    f"Cloudflare Workers AI request failed on chunk {chunk_index}/{len(chunks)} after {attempt} attempt(s): {exc}"
+                ) from exc
+            except ValueError as exc:
+                if attempt < _GROQ_MAX_REQUEST_ATTEMPTS:
+                    delay = _groq_retry_delay(None, attempt)
+                    logger.warning(
+                        "Cloudflare Workers AI chunk %d/%d returned invalid JSON; retrying in %.1fs",
+                        chunk_index,
+                        len(chunks),
+                        delay,
+                    )
+                    time.sleep(delay)
+                    continue
+                raise RuntimeError("Cloudflare Workers AI returned invalid JSON after retries") from exc
 
         if not isinstance(raw_payload, dict):
             raise RuntimeError("Cloudflare Workers AI response must be an object")

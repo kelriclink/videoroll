@@ -5,13 +5,17 @@ import json
 import logging
 import os
 import tempfile
+import threading
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from urllib.parse import urlsplit
 from typing import Any
 
 import httpx
+from redis import Redis
+from redis.exceptions import RedisError
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
@@ -42,10 +46,18 @@ from videoroll.apps.orchestrator_api.youtube_downloader import (
     summarize_info,
 )
 from videoroll.apps.orchestrator_api.youtube_home_feed import fetch_youtube_home_feed
+from videoroll.apps.outbox.worker_inbox import (
+    OperationHeartbeat,
+    claim_operation,
+    finish_operation,
+    release_operation,
+    reopen_completed_operation,
+)
 from videoroll.apps.subtitle_service.auto_profile_store import get_auto_profile
 from videoroll.apps.youtube_settings_store import (
     finish_youtube_home_scan_lock,
     get_youtube_cookies_txt,
+    heartbeat_youtube_home_scan_lock,
     get_youtube_settings,
     normalize_and_validate_netscape_cookies_txt,
     summarize_netscape_cookies_txt,
@@ -77,6 +89,9 @@ from videoroll.utils.youtube_urls import canonicalize_youtube_url, is_youtube_ur
 
 logger = logging.getLogger(__name__)
 YOUTUBE_DOWNLOAD_PROGRESS_PREFIX = "youtube.download_progress."
+YOUTUBE_DOWNLOAD_PROGRESS_REDIS_PREFIX = "videoroll:youtube-download-progress:"
+YOUTUBE_DOWNLOAD_PROGRESS_DB_CHECKPOINT_SECONDS = 10.0
+YOUTUBE_DOWNLOAD_PROGRESS_REDIS_TTL_SECONDS = 86400
 
 
 _BROWSER_PROXY_PATHS: dict[str, set[str]] = {
@@ -219,7 +234,11 @@ def start_auto_youtube_pipeline(*, url: str, license: SourceLicense, proof_url: 
     set_task_created_by(
         settings,
         task_id=task_id,
-        created_by=encode_auto_youtube_created_by("auto_youtube", auto_publish=auto_publish),
+        created_by=encode_auto_youtube_created_by(
+            "auto_youtube",
+            auto_publish=auto_publish,
+            run_id=uuid.uuid4().hex,
+        ),
     )
     return AutoYouTubeResponse(
         task_id=task_id,
@@ -241,9 +260,22 @@ def start_existing_task(task_id: uuid.UUID, *, settings: OrchestratorSettings, d
     render_inflight = db.query(RenderJob).filter(RenderJob.task_id == task_id, RenderJob.status.in_([RenderJobStatus.queued, RenderJobStatus.running])).count()
     if subtitle_inflight or render_inflight:
         raise HTTPException(status_code=409, detail="subtitle/render job already in progress for this task")
-    auto_publish = bool(get_auto_profile(db).get("auto_publish"))
-    set_task_created_by(settings, task_id=task_id, created_by=encode_auto_youtube_created_by("youtube_task_restart", auto_publish=auto_publish))
-    return AutoYouTubeTaskStartResponse(task_id=task_id, pipeline_job_id=enqueue_auto_youtube_pipeline(task_id, auto_publish=auto_publish))
+    # Restarting an automatic task starts a new pipeline launch, but future
+    # stages read their box configuration when they actually start.  Do not
+    # freeze the current auto-publish switch into this restart marker.
+    set_task_created_by(
+        settings,
+        task_id=task_id,
+        created_by=encode_auto_youtube_created_by(
+            "youtube_task_restart",
+            auto_publish=None,
+            run_id=uuid.uuid4().hex,
+        ),
+    )
+    return AutoYouTubeTaskStartResponse(
+        task_id=task_id,
+        pipeline_job_id=enqueue_auto_youtube_pipeline(task_id, auto_publish=None),
+    )
 
 
 def effective_youtube_settings(settings: OrchestratorSettings, db: Session, *, cookie_dir: Path | None = None) -> OrchestratorSettings:
@@ -388,11 +420,32 @@ def _download_progress_defaults(task_id: uuid.UUID) -> dict[str, Any]:
     }
 
 
-def get_download_progress(task_id: uuid.UUID, *, db: Session) -> dict[str, Any]:
+def _download_progress_redis_key(task_id: uuid.UUID) -> str:
+    return f"{YOUTUBE_DOWNLOAD_PROGRESS_REDIS_PREFIX}{task_id}"
+
+
+def get_download_progress(task_id: uuid.UUID, *, db: Session, redis_url: str = "") -> dict[str, Any]:
     if db.get(Task, task_id) is None:
         raise HTTPException(status_code=404, detail="task not found")
-    row = db.get(AppSetting, f"{YOUTUBE_DOWNLOAD_PROGRESS_PREFIX}{task_id}")
-    data = dict(row.value_json or {}) if row else {}
+    data: dict[str, Any] = {}
+    if str(redis_url or "").strip():
+        try:
+            client = Redis.from_url(
+                redis_url,
+                decode_responses=True,
+                socket_connect_timeout=0.2,
+                socket_timeout=0.2,
+            )
+            raw = client.get(_download_progress_redis_key(task_id))
+            if raw:
+                parsed = json.loads(raw)
+                if isinstance(parsed, dict):
+                    data = parsed
+        except (RedisError, OSError, ValueError, TypeError, json.JSONDecodeError):
+            data = {}
+    if not data:
+        row = db.get(AppSetting, f"{YOUTUBE_DOWNLOAD_PROGRESS_PREFIX}{task_id}")
+        data = dict(row.value_json or {}) if row else {}
     return {**_download_progress_defaults(task_id), **data, "task_id": str(task_id)}
 
 
@@ -403,6 +456,19 @@ class _YouTubeDownloadProgressReporter:
         self.redis_url = str(redis_url or "").strip()
         self.started = False
         self.last_emit_at = 0.0
+        self.last_db_persist_at = -YOUTUBE_DOWNLOAD_PROGRESS_DB_CHECKPOINT_SECONDS
+        self.last_db_progress_bucket = -1
+        self.redis_client = None
+        if self.redis_url:
+            try:
+                self.redis_client = Redis.from_url(
+                    self.redis_url,
+                    decode_responses=True,
+                    socket_connect_timeout=0.2,
+                    socket_timeout=0.2,
+                )
+            except (RedisError, OSError, ValueError, TypeError):
+                self.redis_client = None
         self.last_progress = 0
         self.completed_bytes: dict[str, int] = {}
         self.current_data = _download_progress_defaults(task_id)
@@ -452,16 +518,36 @@ class _YouTubeDownloadProgressReporter:
         data["task_id"] = str(self.task_id)
         data["progress"] = progress
         data["updated_at"] = datetime.now(timezone.utc).isoformat()
-        row = self.db.get(AppSetting, f"{YOUTUBE_DOWNLOAD_PROGRESS_PREFIX}{self.task_id}")
-        if row is None:
-            row = AppSetting(key=f"{YOUTUBE_DOWNLOAD_PROGRESS_PREFIX}{self.task_id}", value_json={})
-        row.value_json = data
-        try:
-            self.db.add(row)
-            self.db.commit()
-        except Exception:
-            self.db.rollback()
-            logger.exception("failed to persist YouTube download progress", extra={"task_id": str(self.task_id)})
+        progress_bucket = progress // 10
+        persist_db = (
+            force
+            or now - self.last_db_persist_at >= YOUTUBE_DOWNLOAD_PROGRESS_DB_CHECKPOINT_SECONDS
+            or progress_bucket > self.last_db_progress_bucket
+        )
+        if persist_db:
+            row = self.db.get(AppSetting, f"{YOUTUBE_DOWNLOAD_PROGRESS_PREFIX}{self.task_id}")
+            if row is None:
+                row = AppSetting(key=f"{YOUTUBE_DOWNLOAD_PROGRESS_PREFIX}{self.task_id}", value_json={})
+            row.value_json = data
+            try:
+                self.db.add(row)
+                self.db.commit()
+                self.last_db_persist_at = now
+                self.last_db_progress_bucket = progress_bucket
+            except Exception:
+                self.db.rollback()
+                logger.exception("failed to persist YouTube download progress", extra={"task_id": str(self.task_id)})
+        if self.redis_client is not None:
+            try:
+                self.redis_client.set(
+                    _download_progress_redis_key(self.task_id),
+                    json.dumps(data, ensure_ascii=False, separators=(",", ":")),
+                    ex=YOUTUBE_DOWNLOAD_PROGRESS_REDIS_TTL_SECONDS,
+                )
+            except (RedisError, OSError, ValueError, TypeError):
+                # Realtime progress is best-effort. PostgreSQL checkpoints remain
+                # the durable fallback used after Redis restarts.
+                self.redis_client = None
         if self.redis_url:
             publish_ui_event(
                 self.redis_url,
@@ -649,29 +735,111 @@ def _download(
 
 def download(task_id: uuid.UUID, *, settings: OrchestratorSettings, db: Session, s3: FileStore) -> YouTubeDownloadActionResponse:
     reporter = _YouTubeDownloadProgressReporter(task_id, db=db, redis_url=str(getattr(settings, "redis_url", "") or ""))
+    operation_key = f"youtube-download:{task_id}"
+    owner = f"orchestrator.youtube_download:{os.getpid()}:{uuid.uuid4().hex[:12]}"
+    heartbeat: OperationHeartbeat | None = None
+    operation_acquired = False
     try:
-        return _download(task_id, settings=settings, db=db, s3=s3, reporter=reporter)
+        claim = claim_operation(
+            db,
+            operation_key,
+            owner,
+            3600,
+            request_json={"task_id": str(task_id)},
+        )
+        db.commit()
+        operation_acquired = bool(claim.acquired)
+        if not claim.acquired:
+            if claim.result_json is None:
+                raise HTTPException(status_code=409, detail="youtube download is already in progress")
+            try:
+                replay = YouTubeDownloadActionResponse.model_validate(claim.result_json)
+                s3.head_object(replay.video_asset.storage_key)
+                return replay
+            except (StorageObjectNotFound, OSError, ValueError):
+                # The durable operation result outlived its source object. Reopen
+                # only after proving the cached artifact is unusable.
+                if not reopen_completed_operation(db, operation_key):
+                    db.rollback()
+                    raise HTTPException(status_code=409, detail="youtube download result is being recovered")
+                db.commit()
+                claim = claim_operation(
+                    db,
+                    operation_key,
+                    owner,
+                    3600,
+                    request_json={"task_id": str(task_id), "recovery": True},
+                )
+                db.commit()
+                if not claim.acquired:
+                    raise HTTPException(status_code=409, detail="youtube download recovery is already in progress")
+                operation_acquired = True
+
+        heartbeat = OperationHeartbeat(
+            get_sessionmaker(settings.database_url),
+            operation_key,
+            owner,
+            3600,
+        )
+        heartbeat.start()
+        result = _download(task_id, settings=settings, db=db, s3=s3, reporter=reporter)
+        finish_operation(db, operation_key, result.model_dump(mode="json"))
+        db.commit()
+        return result
     except Exception as exc:
-        reporter.fail(exc)
+        if operation_acquired:
+            try:
+                db.rollback()
+                release_operation(db, operation_key, owner, exc)
+                db.commit()
+            except Exception:
+                db.rollback()
+                logger.exception("failed to release YouTube download operation", extra={"task_id": str(task_id)})
+            reporter.fail(exc)
         raise
+    finally:
+        if heartbeat is not None:
+            heartbeat.stop()
 
 
 def test_proxy(*, url: str, proxy: str, settings: OrchestratorSettings) -> YouTubeProxyTestResponse:
-    started = time.perf_counter(); headers = {"User-Agent": settings.youtube_user_agent}
-    kwargs: dict[str, Any] = {"timeout": 20.0, "follow_redirects": True, "headers": headers}
+    started = time.perf_counter()
+    target = str(url or "").strip()
+    try:
+        parsed = urlsplit(target)
+    except ValueError:
+        parsed = None
+    if (
+        parsed is None
+        or parsed.scheme.lower() not in {"http", "https"}
+        or parsed.username is not None
+        or parsed.password is not None
+        or not is_youtube_url(target)
+    ):
+        return YouTubeProxyTestResponse(
+            ok=False,
+            url=target,
+            used_proxy=proxy or None,
+            elapsed_ms=int((time.perf_counter() - started) * 1000),
+            error="proxy test URL must be an HTTP(S) YouTube URL",
+        )
+    headers = {"User-Agent": settings.youtube_user_agent}
+    # This endpoint verifies proxy reachability; it does not need to follow a
+    # server-controlled redirect to an unvalidated host.
+    kwargs: dict[str, Any] = {"timeout": 20.0, "follow_redirects": False, "headers": headers}
     if proxy:
         kwargs["proxy"] = proxy
     try:
         try:
             with httpx.Client(**kwargs) as client:
-                response = client.get(url)
-                return YouTubeProxyTestResponse(ok=response.status_code < 400, url=url, used_proxy=proxy or None, status_code=response.status_code, elapsed_ms=int((time.perf_counter() - started) * 1000))
+                response = client.get(target)
+                return YouTubeProxyTestResponse(ok=response.status_code < 400, url=target, used_proxy=proxy or None, status_code=response.status_code, elapsed_ms=int((time.perf_counter() - started) * 1000))
         except TypeError:
-            with httpx.Client(timeout=20.0, follow_redirects=True, headers=headers) as client:
-                response = client.get(url)
-                return YouTubeProxyTestResponse(ok=response.status_code < 400, url=url, used_proxy=None, status_code=response.status_code, elapsed_ms=int((time.perf_counter() - started) * 1000), error=HTTPX_PROXY_KWARG_UNSUPPORTED)
+            with httpx.Client(timeout=20.0, follow_redirects=False, headers=headers) as client:
+                response = client.get(target)
+                return YouTubeProxyTestResponse(ok=response.status_code < 400, url=target, used_proxy=None, status_code=response.status_code, elapsed_ms=int((time.perf_counter() - started) * 1000), error=HTTPX_PROXY_KWARG_UNSUPPORTED)
     except Exception as exc:
-        return YouTubeProxyTestResponse(ok=False, url=url, used_proxy=proxy or None, elapsed_ms=int((time.perf_counter() - started) * 1000), error=format_httpx_proxy_error(exc, proxy=proxy))
+        return YouTubeProxyTestResponse(ok=False, url=target, used_proxy=proxy or None, elapsed_ms=int((time.perf_counter() - started) * 1000), error=format_httpx_proxy_error(exc, proxy=proxy))
 
 
 def _parse_iso_datetime(value: Any) -> datetime | None:
@@ -697,17 +865,58 @@ def home_scan_is_due(config: dict[str, Any], *, now: datetime | None = None) -> 
     return current >= baseline + timedelta(minutes=interval_minutes)
 
 
+class _YouTubeHomeScanHeartbeat:
+    def __init__(self, database_url: str, owner: str, ttl_seconds: int) -> None:
+        self._session_factory = get_sessionmaker(database_url)
+        self._owner = owner
+        self._ttl_seconds = max(30, int(ttl_seconds or 900))
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        self._thread = threading.Thread(target=self._run, name="youtube-home-scan-heartbeat", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+
+    def _run(self) -> None:
+        interval = max(5.0, self._ttl_seconds / 3)
+        while not self._stop.wait(interval):
+            heartbeat_db = self._session_factory()
+            try:
+                if not heartbeat_youtube_home_scan_lock(
+                    heartbeat_db,
+                    owner=self._owner,
+                    ttl_seconds=self._ttl_seconds,
+                ):
+                    return
+            except Exception:
+                heartbeat_db.rollback()
+                logger.exception("failed to heartbeat YouTube home scan lock")
+            finally:
+                heartbeat_db.close()
+
+
 def run_home_scan(settings: OrchestratorSettings, *, force: bool = False, raise_if_locked: bool = False) -> YouTubeHomeScanRunResponse | None:
     db = get_sessionmaker(settings.database_url)(); owner = f"youtube-router:{os.getpid()}:{uuid.uuid4().hex[:8]}"; acquired = False
+    heartbeat: _YouTubeHomeScanHeartbeat | None = None
     try:
         config = get_youtube_settings(db, default_proxy=settings.youtube_proxy)
         if not force and not home_scan_is_due(config):
             return None
-        if not try_acquire_youtube_home_scan_lock(db, owner=owner, ttl_seconds=int(os.getenv("YOUTUBE_HOME_SCAN_LOCK_TTL_SECONDS", "900"))):
+        home_scan_lock_ttl = int(os.getenv("YOUTUBE_HOME_SCAN_LOCK_TTL_SECONDS", "900"))
+        if not try_acquire_youtube_home_scan_lock(db, owner=owner, ttl_seconds=home_scan_lock_ttl):
             if raise_if_locked:
                 raise RuntimeError("youtube home scan is already running")
             return None
         acquired = True
+        heartbeat = _YouTubeHomeScanHeartbeat(settings.database_url, owner, home_scan_lock_ttl)
+        heartbeat.start()
         cookies = ""
         cookie_file = str(settings.youtube_cookie_file or "").strip()
         if cookie_file and Path(cookie_file).is_file():
@@ -718,7 +927,7 @@ def run_home_scan(settings: OrchestratorSettings, *, force: bool = False, raise_
             raise RuntimeError("youtube cookies are not configured; save cookies.txt or set YOUTUBE_COOKIE_FILE first")
         limit = max(1, min(int(config.get("home_scan_limit") or 10), 100))
         feed = fetch_youtube_home_feed(cookies, settings.youtube_user_agent, proxy=str(config.get("proxy") or "").strip() or None, limit=limit, long_videos_only=bool(config.get("home_scan_long_videos_only")), min_duration_seconds=max(0, int(config.get("home_scan_min_duration_seconds") or 0)), timezone_name=str(os.getenv("TZ") or "UTC"))
-        profile = get_auto_profile(db); auto_publish = bool(profile.get("auto_publish")); created = []; jobs = []; skipped = 0; failed = 0; errors = []
+        created = []; jobs = []; skipped = 0; failed = 0; errors = []
         for item in feed.videos:
             if db.query(IngestedVideo).filter(IngestedVideo.platform == "youtube", IngestedVideo.source_id == item.video_id).first():
                 skipped += 1; continue
@@ -726,8 +935,16 @@ def run_home_scan(settings: OrchestratorSettings, *, force: bool = False, raise_
                 task_id, deduped, _ = ingest_youtube_source(url=item.url, license=SourceLicense.authorized, proof_url=None, settings=settings)
                 if deduped:
                     skipped += 1; continue
-                set_task_created_by(settings, task_id=task_id, created_by=encode_auto_youtube_created_by("youtube_home_scan", auto_publish=auto_publish))
-                created.append(task_id); jobs.append(enqueue_auto_youtube_pipeline(task_id, auto_publish=auto_publish))
+                set_task_created_by(
+                    settings,
+                    task_id=task_id,
+                    created_by=encode_auto_youtube_created_by(
+                        "youtube_home_scan",
+                        auto_publish=None,
+                        run_id=uuid.uuid4().hex,
+                    ),
+                )
+                created.append(task_id); jobs.append(enqueue_auto_youtube_pipeline(task_id, auto_publish=None))
             except Exception as exc:
                 failed += 1; errors.append(f"{item.video_id}: {type(exc).__name__}: {exc}")
         stats = feed.stats
@@ -739,4 +956,6 @@ def run_home_scan(settings: OrchestratorSettings, *, force: bool = False, raise_
             db.rollback(); finish_youtube_home_scan_lock(db, owner=owner, error=f"{type(exc).__name__}: {exc}")
         raise
     finally:
+        if heartbeat is not None:
+            heartbeat.stop()
         db.close()

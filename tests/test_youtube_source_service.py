@@ -260,7 +260,6 @@ class YouTubePlaylistScanTests(TestCase):
 
         with (
             patch("videoroll.apps.youtube_ingest.source_service.fetch_youtube_feed", return_value=self._playlist_entries()) as fetch_feed,
-            patch("videoroll.apps.youtube_ingest.source_service.get_auto_profile", return_value={"auto_publish": False}),
             patch("videoroll.apps.youtube_ingest.source_service.get_youtube_settings", return_value={}),
             patch("videoroll.apps.youtube_ingest.source_service._start_auto_pipeline", side_effect=["job-1", "job-2", "job-3", "job-4", "job-5"]),
         ):

@@ -19,6 +19,7 @@ from videoroll.apps.orchestrator_api.remote_api_settings_store import (
     verify_remote_api_token,
 )
 from videoroll.apps.orchestrator_api.schemas import AutoYouTubeResponse, RemoteAutoYouTubeRequest
+from videoroll.apps.security.trusted_proxies import request_source_ip
 from videoroll.db.models import RemoteAPIRequest
 
 
@@ -238,9 +239,7 @@ def _redis_key(kind: str, digest: str) -> str:
 
 
 def _request_ip_hash(request: Request) -> str:
-    client = getattr(request, "client", None)
-    host = str(getattr(client, "host", "unknown") or "unknown")
-    return _sha256_text(host)
+    return _sha256_text(request_source_ip(request))
 
 
 def _increment_window(client: Redis, key: str) -> tuple[int, int]:

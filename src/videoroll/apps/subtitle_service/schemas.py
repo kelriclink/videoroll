@@ -50,6 +50,10 @@ class OutputOptions(BaseModel):
 
 class SubtitleJobCreate(BaseModel):
     task_id: uuid.UUID
+    # None means a legacy caller did not declare the execution policy. The API
+    # then infers it from the task's automatic-pipeline marker so old backlog
+    # jobs gain runtime box semantics. Explicit False preserves manual options.
+    runtime_profile: Optional[bool] = None
     resume: bool = False
     prefer_youtube_subtitles: bool = True
     youtube_subtitle_mode: Literal["off", "target", "auto_source"] = "target"

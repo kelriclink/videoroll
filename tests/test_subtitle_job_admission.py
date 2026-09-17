@@ -18,6 +18,7 @@ from videoroll.apps.subtitle_service.schemas import SubtitleJobCreate
 from videoroll.config import OrchestratorSettings
 from videoroll.db.base import Base
 from videoroll.db.models import Asset, AssetKind, SourceLicense, SourceType, SubtitleJob, SubtitleJobStatus, Task, TaskStatus
+from videoroll.utils.auto_youtube import encode_auto_youtube_created_by
 
 
 @compiles(JSONB, "sqlite")
@@ -101,6 +102,34 @@ def test_internal_subtitle_api_accepts_an_unfinished_task(db: Session, monkeypat
     job = db.get(SubtitleJob, uuid.UUID(response["job_id"]))
     assert response["status"] == "queued"
     assert job is not None and job.task_id == task.id
+
+
+def test_legacy_auto_job_infers_runtime_profile_but_explicit_manual_request_does_not(db: Session, monkeypatch) -> None:
+    task = _task(db, TaskStatus.downloaded)
+    task.created_by = encode_auto_youtube_created_by("auto_youtube", auto_publish=None)
+    db.add(task)
+    db.commit()
+    monkeypatch.setattr(subtitle_api.celery_app, "send_task", lambda *args, **kwargs: None)
+
+    legacy = subtitle_api.create_job(SubtitleJobCreate(task_id=task.id, input={"key": "raw/source.mp4"}), db)
+    legacy_job = db.get(SubtitleJob, uuid.UUID(legacy["job_id"]))
+    assert legacy_job is not None
+    assert legacy_job.request_json["runtime_profile"] is True
+
+    legacy_job.status = SubtitleJobStatus.failed
+    db.add(legacy_job)
+    db.commit()
+    manual_request = subtitle_service.build_subtitle_job_request(
+        task.id,
+        SubtitleActionRequest(asr_engine="openvino", video_codec="h264"),
+        db.query(Asset).filter(Asset.task_id == task.id, Asset.kind == AssetKind.video_raw).one(),
+    )
+    assert manual_request["runtime_profile"] is False
+    manual = subtitle_api.create_job(SubtitleJobCreate.model_validate(manual_request), db)
+    manual_job = db.get(SubtitleJob, uuid.UUID(manual["job_id"]))
+    assert manual_job is not None
+    assert manual_job.request_json["runtime_profile"] is False
+    assert manual_job.request_json["asr"]["engine"] == "openvino"
 
 
 def test_subtitle_relay_preserves_a_conflict_detected_by_the_internal_api() -> None:

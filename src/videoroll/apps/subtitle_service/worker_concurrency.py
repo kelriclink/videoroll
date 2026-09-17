@@ -41,10 +41,19 @@ class RecoverySummary:
 
     subtitle_requeued: int = 0
     render_requeued: int = 0
+    legacy_subtitle_requeued: int = 0
+    legacy_render_requeued: int = 0
+    terminal_subtitle_reconciled: int = 0
+    terminal_render_reconciled: int = 0
 
     @property
     def total_recovered(self) -> int:
-        return self.subtitle_requeued + self.render_requeued
+        return (
+            self.subtitle_requeued
+            + self.render_requeued
+            + self.terminal_subtitle_reconciled
+            + self.terminal_render_reconciled
+        )
 
 
 def _utcnow() -> datetime:
@@ -210,12 +219,18 @@ def _recovery_message(message: str | None, detail: str) -> str:
     return combined[-2000:]
 
 
-def recover_expired_leases(db: Session, now: datetime, limit: int) -> RecoverySummary:
-    """Requeue interrupted subtitle/render work whose owner lease expired.
+def recover_expired_leases(
+    db: Session,
+    now: datetime,
+    limit: int,
+    *,
+    legacy_orphan_after: timedelta = timedelta(hours=2),
+) -> RecoverySummary:
+    """Repair expired leases, stale legacy rows, and terminal-task leftovers.
 
-    Rows with no lease are intentionally ignored.  They predate lease-based
-    execution or are managed by another workflow; treating them as dead would
-    recreate the old global-running-row recovery bug.
+    Live leases are never stolen. Rows created before lease-based execution are
+    recoverable only after a conservative stale interval, so a newly started
+    worker cannot be mistaken for a legacy orphan.
     """
     remaining = max(0, int(limit or 0))
     if not remaining:
@@ -223,6 +238,10 @@ def recover_expired_leases(db: Session, now: datetime, limit: int) -> RecoverySu
 
     subtitle_requeued = 0
     render_requeued = 0
+    legacy_subtitle_requeued = 0
+    legacy_render_requeued = 0
+    terminal_subtitle_reconciled = 0
+    terminal_render_reconciled = 0
     subtitle_jobs = (
         db.query(SubtitleJob)
         .join(Task, Task.id == SubtitleJob.task_id)
@@ -285,8 +304,139 @@ def recover_expired_leases(db: Session, now: datetime, limit: int) -> RecoverySu
             db.add(job)
             render_requeued += 1
 
+    remaining -= render_requeued
+    legacy_cutoff = now - max(legacy_orphan_after, timedelta(minutes=30))
+    if remaining:
+        legacy_subtitles = (
+            db.query(SubtitleJob)
+            .join(Task, Task.id == SubtitleJob.task_id)
+            .filter(
+                Task.status.notin_([TaskStatus.canceled, TaskStatus.published]),
+                SubtitleJob.status == SubtitleJobStatus.running,
+                SubtitleJob.lease_owner.is_(None),
+                SubtitleJob.lease_until.is_(None),
+                SubtitleJob.updated_at <= legacy_cutoff,
+            )
+            .order_by(SubtitleJob.updated_at.asc(), SubtitleJob.created_at.asc())
+            .with_for_update(skip_locked=True)
+            .limit(remaining)
+            .all()
+        )
+        for job in legacy_subtitles:
+            request = dict(job.request_json) if isinstance(job.request_json, dict) else {}
+            request["resume"] = True
+            job.request_json = request
+            job.status = SubtitleJobStatus.queued
+            job.progress = 0
+            job.heartbeat_at = now
+            job.error_message = _recovery_message(
+                job.error_message,
+                "Legacy subtitle worker row had no lease and was stale; requeued with resume enabled.",
+            )
+            db.add(job)
+            subtitle_requeued += 1
+            legacy_subtitle_requeued += 1
+        remaining -= len(legacy_subtitles)
+
+    if remaining:
+        legacy_renders = (
+            db.query(RenderJob)
+            .join(Task, Task.id == RenderJob.task_id)
+            .filter(
+                Task.status.notin_([TaskStatus.canceled, TaskStatus.published]),
+                RenderJob.status == RenderJobStatus.running,
+                RenderJob.lease_owner.is_(None),
+                RenderJob.lease_until.is_(None),
+                RenderJob.updated_at <= legacy_cutoff,
+            )
+            .order_by(RenderJob.updated_at.asc(), RenderJob.created_at.asc())
+            .with_for_update(skip_locked=True)
+            .limit(remaining)
+            .all()
+        )
+        for job in legacy_renders:
+            job.status = RenderJobStatus.queued
+            job.progress = 0
+            job.retry_count = int(job.retry_count or 0) + 1
+            job.started_at = None
+            job.finished_at = None
+            job.heartbeat_at = now
+            job.error_message = _recovery_message(
+                job.error_message,
+                "Legacy render worker row had no lease and was stale; requeued for resume.",
+            )
+            db.add(job)
+            render_requeued += 1
+            legacy_render_requeued += 1
+        remaining -= len(legacy_renders)
+
+    # Terminal tasks must not leave dead queue rows forever.  Do not touch a
+    # still-live worker lease; once it expires, reconcile the stale row instead
+    # of restarting work for a task that can no longer advance.
+    if remaining:
+        terminal_subtitles = (
+            db.query(SubtitleJob)
+            .join(Task, Task.id == SubtitleJob.task_id)
+            .filter(
+                Task.status.in_([TaskStatus.canceled, TaskStatus.published]),
+                SubtitleJob.status.in_([SubtitleJobStatus.queued, SubtitleJobStatus.running]),
+                or_(SubtitleJob.lease_until.is_(None), SubtitleJob.lease_until <= now),
+            )
+            .order_by(SubtitleJob.updated_at.asc(), SubtitleJob.created_at.asc())
+            .with_for_update(skip_locked=True)
+            .limit(remaining)
+            .all()
+        )
+        for job in terminal_subtitles:
+            job.status = SubtitleJobStatus.failed
+            job.lease_owner = None
+            job.lease_until = None
+            job.heartbeat_at = now
+            job.error_message = _recovery_message(
+                job.error_message,
+                "Subtitle work reconciled because the parent task is terminal.",
+            )
+            db.add(job)
+            terminal_subtitle_reconciled += 1
+        remaining -= len(terminal_subtitles)
+
+    if remaining:
+        terminal_renders = (
+            db.query(RenderJob)
+            .join(Task, Task.id == RenderJob.task_id)
+            .filter(
+                Task.status.in_([TaskStatus.canceled, TaskStatus.published]),
+                RenderJob.status.in_([RenderJobStatus.queued, RenderJobStatus.running]),
+                or_(RenderJob.lease_until.is_(None), RenderJob.lease_until <= now),
+            )
+            .order_by(RenderJob.updated_at.asc(), RenderJob.created_at.asc())
+            .with_for_update(skip_locked=True)
+            .limit(remaining)
+            .all()
+        )
+        for job in terminal_renders:
+            job.status = RenderJobStatus.canceled
+            job.progress = 0
+            job.finished_at = now
+            job.lease_owner = None
+            job.lease_until = None
+            job.heartbeat_at = now
+            job.error_message = _recovery_message(
+                job.error_message,
+                "Render work reconciled because the parent task is terminal.",
+            )
+            db.add(job)
+            terminal_render_reconciled += 1
+
     db.flush()
-    return RecoverySummary(subtitle_requeued=subtitle_requeued, render_requeued=render_requeued)
+    return RecoverySummary(
+        subtitle_requeued=subtitle_requeued,
+        render_requeued=render_requeued,
+        legacy_subtitle_requeued=legacy_subtitle_requeued,
+        legacy_render_requeued=legacy_render_requeued,
+        terminal_subtitle_reconciled=terminal_subtitle_reconciled,
+        terminal_render_reconciled=terminal_render_reconciled,
+    )
 
 
 class JobLeaseHeartbeat:

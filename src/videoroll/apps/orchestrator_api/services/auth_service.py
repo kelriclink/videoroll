@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import ipaddress
-
 from fastapi import HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
@@ -34,7 +32,7 @@ from videoroll.apps.security.service_auth import (
     ADMIN_BOOTSTRAP_HEADER,
     consume_bootstrap_secret,
 )
-from videoroll.apps.security.trusted_proxies import trusted_proxy_addresses
+from videoroll.apps.security.trusted_proxies import request_source_ip
 from videoroll.db.session import get_sessionmaker
 
 
@@ -56,50 +54,7 @@ def set_device_cookie(response: Response, value: str, *, secure: bool) -> None:
 
 
 def _source_ip(request: Request) -> str:
-    peer_text = str(getattr(request.client, "host", "") or "").strip()
-    try:
-        peer = ipaddress.ip_address(peer_text)
-    except ValueError:
-        return "unknown"
-
-    app_state = getattr(getattr(request, "app", None), "state", None)
-    raw_cidrs = str(getattr(app_state, "trusted_proxy_cidrs", "") or "")
-    proxy_addresses = trusted_proxy_addresses(str(getattr(app_state, "trusted_proxy_hosts", "") or ""))
-    trusted_networks: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
-    for raw_cidr in raw_cidrs.split(",")[:32]:
-        cidr = raw_cidr.strip()
-        if not cidr:
-            continue
-        try:
-            trusted_networks.append(ipaddress.ip_network(cidr, strict=False))
-        except ValueError:
-            continue
-
-    def is_trusted(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
-        return address in proxy_addresses or any(
-            address.version == network.version and address in network for network in trusted_networks
-        )
-
-    if not is_trusted(peer):
-        return peer.compressed
-
-    forwarded_values = [
-        part.strip()
-        for part in str(request.headers.get("x-forwarded-for") or "").split(",")
-    ]
-    if not forwarded_values or not all(forwarded_values):
-        return peer.compressed
-    try:
-        forwarded = [ipaddress.ip_address(value) for value in forwarded_values]
-    except ValueError:
-        return peer.compressed
-
-    candidate = peer
-    for hop in reversed(forwarded):
-        if not is_trusted(candidate):
-            break
-        candidate = hop
-    return candidate.compressed
+    return request_source_ip(request)
 
 
 def _request_id(request: Request) -> str | None:

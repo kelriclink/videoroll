@@ -498,6 +498,30 @@ def try_acquire_youtube_home_scan_lock(
     return True
 
 
+def heartbeat_youtube_home_scan_lock(
+    db: Session,
+    *,
+    owner: str,
+    ttl_seconds: int,
+    now: Optional[datetime] = None,
+) -> bool:
+    lock_owner = str(owner or "").strip()
+    if not lock_owner:
+        return False
+    row = _get_locked_row(db)
+    stored = dict(_as_dict(row.value_json))
+    if str(stored.get("home_scan_lock_owner") or "").strip() != lock_owner:
+        db.rollback()
+        return False
+    ttl = max(30, int(ttl_seconds or 0))
+    now_dt = now or datetime.now(timezone.utc)
+    stored["home_scan_lock_until"] = (now_dt + timedelta(seconds=ttl)).isoformat()
+    row.value_json = stored
+    db.add(row)
+    db.commit()
+    return True
+
+
 def finish_youtube_home_scan_lock(
     db: Session,
     *,

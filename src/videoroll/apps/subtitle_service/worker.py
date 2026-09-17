@@ -95,7 +95,13 @@ from videoroll.apps.subtitle_service.translate_settings_store import get_transla
 from videoroll.apps.publish_meta_draft import apply_publish_source_overrides, build_task_publish_meta_draft, default_publish_meta
 from videoroll.apps.outbox.dispatcher import dispatch_outbox_events
 from videoroll.apps.outbox.service import create_outbox_event
-from videoroll.apps.outbox.worker_inbox import claim_outbox_operation, finish_operation, release_operation
+from videoroll.apps.outbox.worker_inbox import (
+    OperationHeartbeat,
+    claim_operation,
+    claim_outbox_operation,
+    finish_operation,
+    release_operation,
+)
 from videoroll.apps.publish_lifecycle import (
     current_publish_batches_for_task,
     enqueue_publish_batch_cleanup,
@@ -134,6 +140,47 @@ def _positive_int_env(name: str, default: int) -> int:
     except Exception:
         value = default
     return max(1, value)
+
+
+def _uses_runtime_auto_profile(task: Task, request_json: dict[str, Any], *nested: dict[str, Any]) -> bool:
+    """Resolve runtime-box policy while preserving explicit manual overrides.
+
+    New requests carry runtime_profile explicitly. Legacy automatic backlog rows
+    predate that field, so only those fall back to task.created_by.
+    """
+    if "runtime_profile" in request_json and request_json.get("runtime_profile") is not None:
+        return bool(request_json.get("runtime_profile"))
+    for item in nested:
+        if "runtime_profile" in item and item.get("runtime_profile") is not None:
+            return bool(item.get("runtime_profile"))
+    return parse_auto_youtube_created_by(task.created_by) is not None
+
+
+def _active_pipeline_job(db: Session, task_id: uuid.UUID) -> tuple[str, uuid.UUID] | None:
+    """Return existing active work so pipeline recovery never creates a duplicate stage."""
+    subtitle = (
+        db.query(SubtitleJob)
+        .filter(
+            SubtitleJob.task_id == task_id,
+            SubtitleJob.status.in_([SubtitleJobStatus.queued, SubtitleJobStatus.running]),
+        )
+        .order_by(SubtitleJob.created_at.desc())
+        .first()
+    )
+    if subtitle is not None:
+        return "subtitle", subtitle.id
+    render = (
+        db.query(RenderJob)
+        .filter(
+            RenderJob.task_id == task_id,
+            RenderJob.status.in_([RenderJobStatus.queued, RenderJobStatus.running]),
+        )
+        .order_by(RenderJob.created_at.desc())
+        .first()
+    )
+    if render is not None:
+        return "render", render.id
+    return None
 
 
 settings = get_subtitle_settings()
@@ -1076,9 +1123,32 @@ def process_job(self: Any, job_id: str) -> dict[str, str]:
         ass_key: str | None = None
 
         resume = bool(req.get("resume"))
+        auto_task_meta = parse_auto_youtube_created_by(task.created_by)
+        automatic_runtime_profile = _uses_runtime_auto_profile(task, req)
+
+        def _current_auto_profile() -> dict[str, Any]:
+            return dict(get_auto_profile(db)) if automatic_runtime_profile else {}
+
+        initial_profile = _current_auto_profile()
         output_cfg = (req.get("output") or {})
-        formats = output_cfg.get("formats") or []
-        render_cfg = output_cfg.get("render") or {}
+        formats = (
+            list(initial_profile.get("formats") or ["srt", "ass"])
+            if automatic_runtime_profile
+            else list(output_cfg.get("formats") or [])
+        )
+        render_cfg = dict(output_cfg.get("render") or {})
+        if automatic_runtime_profile:
+            render_cfg = {
+                "burn_in": bool(initial_profile.get("burn_in")),
+                "soft_sub": bool(initial_profile.get("soft_sub")),
+                "ass_style": initial_profile.get("ass_style") or "clean_white",
+                "video_codec": initial_profile.get("video_codec") or "av1",
+                "use_intel_gpu": bool(initial_profile.get("use_intel_gpu")),
+                "video_preset": initial_profile.get("video_preset"),
+                "video_crf": initial_profile.get("video_crf"),
+                "primary_font_scale_percent": initial_profile.get("primary_font_scale_percent") or 100,
+                "secondary_font_scale_percent": initial_profile.get("secondary_font_scale_percent") or 100,
+            }
         burn_in = bool(render_cfg.get("burn_in"))
         soft_sub = bool(render_cfg.get("soft_sub"))
         video_codec = str(render_cfg.get("video_codec") or "av1").strip().lower() or "av1"
@@ -1087,16 +1157,32 @@ def process_job(self: Any, job_id: str) -> dict[str, str]:
         video_preset = render_cfg.get("video_preset")
 
         want_ass = "ass" in formats
-        need_ass = want_ass or burn_in
-        youtube_subtitle_mode = normalize_youtube_subtitle_mode(
-            req.get("youtube_subtitle_mode"),
-            prefer_youtube_subtitles=req.get("prefer_youtube_subtitles", True),
-        )
+        # Automatic burn-in regenerates ASS inside the render box using the
+        # style/font settings current when rendering actually starts.
+        need_ass = want_ass or (burn_in and not automatic_runtime_profile)
+        if automatic_runtime_profile:
+            youtube_subtitle_mode = normalize_youtube_subtitle_mode(
+                initial_profile.get("youtube_subtitle_mode"),
+                prefer_youtube_subtitles=initial_profile.get("prefer_youtube_subtitles", True),
+            )
+            translate_cfg = {
+                "enabled": bool(initial_profile.get("translate_enabled")),
+                "target_lang": initial_profile.get("target_lang") or "zh",
+                "provider": initial_profile.get("translate_provider") or "openai",
+                "style": initial_profile.get("translate_style") or "口语自然",
+                "enable_summary": bool(initial_profile.get("translate_enable_summary")),
+                "bilingual": bool(initial_profile.get("bilingual")),
+            }
+        else:
+            youtube_subtitle_mode = normalize_youtube_subtitle_mode(
+                req.get("youtube_subtitle_mode"),
+                prefer_youtube_subtitles=req.get("prefer_youtube_subtitles", True),
+            )
+            translate_cfg = dict(req.get("translate") or {})
         prefer_youtube_subtitles = youtube_subtitle_mode != "off"
-        translate_cfg = req.get("translate") or {}
         translate_enabled = bool(translate_cfg.get("enabled"))
-        target_lang = (translate_cfg.get("target_lang") or "zh").strip() or "zh"
-        provider = (translate_cfg.get("provider") or "mock").strip() or "mock"
+        target_lang = str(translate_cfg.get("target_lang") or "zh").strip() or "zh"
+        provider = str(translate_cfg.get("provider") or "mock").strip() or "mock"
         bilingual = bool(translate_cfg.get("bilingual"))
 
         log_path = work_root / "job.log"
@@ -1160,6 +1246,34 @@ def process_job(self: Any, job_id: str) -> dict[str, str]:
             artifacts["youtube_subtitle"] = dict(info)
             req["artifacts"] = artifacts
             _save_job_request()
+
+        def _build_render_job_payload(*, srt_key_value: str, ass_key_value: str | None) -> dict[str, Any]:
+            if automatic_runtime_profile:
+                return {
+                    "input_key": input_key,
+                    "srt_key": srt_key_value,
+                    "ass_key": None,
+                    "runtime_profile": True,
+                    "after_render": {"publish": True, "runtime_profile": True},
+                }
+            payload: dict[str, Any] = {
+                "input_key": input_key,
+                "runtime_profile": False,
+                "srt_key": srt_key_value,
+                "ass_key": ass_key_value if burn_in else None,
+                "burn_in": bool(burn_in),
+                "soft_sub": bool(soft_sub),
+                "render": {
+                    "video_codec": video_codec,
+                    "use_intel_gpu": use_intel_gpu,
+                    "video_preset": video_preset,
+                    "video_crf": video_crf,
+                },
+            }
+            manual_after_render = req.get("after_render") if isinstance(req.get("after_render"), dict) else None
+            if manual_after_render:
+                payload["after_render"] = manual_after_render
+            return payload
 
         def _load_segments_json(path: Path) -> list[Segment] | None:
             try:
@@ -1372,6 +1486,9 @@ def process_job(self: Any, job_id: str) -> dict[str, str]:
             db.add(job)
             db.commit()
 
+            if automatic_runtime_profile:
+                output_profile = _current_auto_profile()
+                need_ass = "ass" in list(output_profile.get("formats") or ["srt", "ass"])
             if need_ass:
                 segs = _download_final_subtitle_segments()
                 if segs:
@@ -1384,7 +1501,7 @@ def process_job(self: Any, job_id: str) -> dict[str, str]:
                 _safe_upload_log(store, log_path, log_key)
 
             _raise_if_task_stopped(db, task.id)
-            if not burn_in and not soft_sub:
+            if not automatic_runtime_profile and not burn_in and not soft_sub:
                 job.status = SubtitleJobStatus.succeeded
                 job.progress = 100
                 _task_queue_unlock(task)
@@ -1396,10 +1513,6 @@ def process_job(self: Any, job_id: str) -> dict[str, str]:
                 _kick_task_queue()
                 return {"status": "ok"}
 
-            after_render = req.get("after_render") if isinstance(req, dict) else None
-            if not isinstance(after_render, dict):
-                after_render = None
-
             existing = (
                 db.query(RenderJob)
                 .filter(
@@ -1410,21 +1523,7 @@ def process_job(self: Any, job_id: str) -> dict[str, str]:
                 .first()
             )
             if not existing:
-                payload: dict[str, Any] = {
-                    "input_key": input_key,
-                    "srt_key": srt_key,
-                    "ass_key": ass_key if burn_in else None,
-                    "burn_in": bool(burn_in),
-                    "soft_sub": bool(soft_sub),
-                    "render": {
-                        "video_codec": video_codec,
-                        "use_intel_gpu": use_intel_gpu,
-                        "video_preset": video_preset,
-                        "video_crf": video_crf,
-                    },
-                }
-                if after_render:
-                    payload["after_render"] = after_render
+                payload = _build_render_job_payload(srt_key_value=srt_key, ass_key_value=ass_key)
                 db.add(RenderJob(task_id=task.id, subtitle_job_id=job.id, status=RenderJobStatus.queued, progress=0, request_json=payload))
 
             job.status = SubtitleJobStatus.succeeded
@@ -1445,10 +1544,26 @@ def process_job(self: Any, job_id: str) -> dict[str, str]:
                 _clear_groq_asr_checkpoint()
 
         youtube_subtitle_info: dict[str, str] | None = None
+        request_artifacts = req.get("artifacts") if isinstance(req.get("artifacts"), dict) else {}
+        existing_youtube_subtitle = (
+            request_artifacts.get("youtube_subtitle")
+            if isinstance(request_artifacts.get("youtube_subtitle"), dict)
+            else {}
+        )
+        skip_translation_for_target_subtitle = existing_youtube_subtitle.get("reason") == "target"
         if segments is None:
             job.progress = 25
             db.add(job)
             db.commit()
+
+            if automatic_runtime_profile:
+                subtitle_source_profile = _current_auto_profile()
+                youtube_subtitle_mode = normalize_youtube_subtitle_mode(
+                    subtitle_source_profile.get("youtube_subtitle_mode"),
+                    prefer_youtube_subtitles=subtitle_source_profile.get("prefer_youtube_subtitles", True),
+                )
+                prefer_youtube_subtitles = youtube_subtitle_mode != "off"
+                target_lang = str(subtitle_source_profile.get("target_lang") or "zh").strip() or "zh"
 
             if prefer_youtube_subtitles:
                 segments, youtube_subtitle_info = _download_youtube_subtitle_segments(
@@ -1465,9 +1580,11 @@ def process_job(self: Any, job_id: str) -> dict[str, str]:
                     if youtube_subtitle_info:
                         _set_youtube_subtitle_info(youtube_subtitle_info)
                     if youtube_subtitle_info and youtube_subtitle_info.get("reason") == "target":
-                        translate_cfg = dict(req.get("translate") or {})
-                        translate_cfg["enabled"] = False
-                        req["translate"] = translate_cfg
+                        skip_translation_for_target_subtitle = True
+                        if not automatic_runtime_profile:
+                            translate_cfg = dict(req.get("translate") or {})
+                            translate_cfg["enabled"] = False
+                            req["translate"] = translate_cfg
                         translate_enabled = False
                         _safe_append_log_line(log_path, "youtube subtitles: target language subtitle found; skipping translation")
                     elif youtube_subtitle_info and youtube_subtitle_info.get("reason") == "auto_source":
@@ -1512,11 +1629,22 @@ def process_job(self: Any, job_id: str) -> dict[str, str]:
             db.add(task)
             db.commit()
 
-            asr_cfg = req.get("asr") or {}
+            # ASR is a runtime-configured box for automatic tasks.  Read the
+            # auto profile only now, immediately before ASR starts; manual
+            # requests retain their explicit per-job options.
+            if automatic_runtime_profile:
+                asr_profile = _current_auto_profile()
+                asr_cfg = {
+                    "engine": asr_profile.get("asr_engine") or "auto",
+                    "language": asr_profile.get("asr_language") or "auto",
+                    "model": asr_profile.get("asr_model"),
+                }
+            else:
+                asr_cfg = dict(req.get("asr") or {})
             asr_defaults = get_asr_settings(db, settings)
-            requested_engine = (asr_cfg.get("engine") or "auto").strip()
-            requested_language = (asr_cfg.get("language") or "auto").strip()
-            requested_model = (asr_cfg.get("model") or "").strip() or None
+            requested_engine = str(asr_cfg.get("engine") or "auto").strip()
+            requested_language = str(asr_cfg.get("language") or "auto").strip()
+            requested_model = str(asr_cfg.get("model") or "").strip() or None
 
             engine = asr_defaults["default_engine"] if requested_engine in {"", "auto"} else requested_engine
             language = asr_defaults["default_language"] if requested_language in {"", "auto"} else requested_language
@@ -1611,6 +1739,8 @@ def process_job(self: Any, job_id: str) -> dict[str, str]:
                     audio_identity=str(audio_key or audio_path),
                     vad_enabled=groq_vad_enabled,
                     vad_threshold=groq_vad_threshold,
+                    redis_url=str(settings.redis_url or ""),
+                    provider_max_concurrency=_positive_int_env("GROQ_ASR_MAX_CONCURRENCY", 1),
                 )
             elif engine == "cloudflare-workers-ai":
                 cloudflare_account_id = str(asr_defaults.get("cloudflare_workers_ai_account_id") or "").strip()
@@ -1629,6 +1759,8 @@ def process_job(self: Any, job_id: str) -> dict[str, str]:
                     api_key=cloudflare_api_key,
                     model_name=cloudflare_model,
                     language=language,
+                    redis_url=str(settings.redis_url or ""),
+                    provider_max_concurrency=_positive_int_env("CLOUDFLARE_ASR_MAX_CONCURRENCY", 2),
                 )
             else:
                 raise ValueError(f"unsupported ASR engine: {engine}")
@@ -1651,15 +1783,33 @@ def process_job(self: Any, job_id: str) -> dict[str, str]:
         db.add(job)
         db.commit()
 
-        translate_cfg = req.get("translate") or {}
+        # Translation/RAG is a separate box: automatic backlog reads the
+        # latest auto profile and detailed translation settings only now.
+        if automatic_runtime_profile:
+            translate_profile = _current_auto_profile()
+            translate_cfg = {
+                "enabled": bool(translate_profile.get("translate_enabled")),
+                "target_lang": translate_profile.get("target_lang") or "zh",
+                "provider": translate_profile.get("translate_provider") or "openai",
+                "style": translate_profile.get("translate_style") or "口语自然",
+                "enable_summary": bool(translate_profile.get("translate_enable_summary")),
+                "bilingual": bool(translate_profile.get("bilingual")),
+            }
+        else:
+            translate_cfg = dict(req.get("translate") or {})
         translate_enabled = bool(translate_cfg.get("enabled"))
+        if skip_translation_for_target_subtitle:
+            translate_cfg["enabled"] = False
+        target_lang = str(translate_cfg.get("target_lang") or "zh").strip() or "zh"
+        provider = str(translate_cfg.get("provider") or "mock").strip() or "mock"
+        bilingual = bool(translate_cfg.get("bilingual"))
         segments_out = segments
         translation_summary = ""
         if translate_enabled:
             _safe_append_log_line(log_path, f"translate: provider={provider} target_lang={target_lang} bilingual={bilingual}")
             ai_service = _ai_service()
             translate_settings = _fresh_translate_settings()
-            style = (translate_cfg.get("style") or translate_settings["default_style"]).strip() or translate_settings["default_style"]
+            style = str(translate_cfg.get("style") or translate_settings["default_style"]).strip() or translate_settings["default_style"]
             batch_size = int(translate_cfg.get("batch_size") or translate_settings["default_batch_size"])
             enable_summary_val = translate_cfg.get("enable_summary")
             enable_summary = translate_settings["default_enable_summary"] if enable_summary_val is None else bool(enable_summary_val)
@@ -2083,6 +2233,9 @@ def process_job(self: Any, job_id: str) -> dict[str, str]:
         db.add(Subtitle(task_id=task.id, version=1, format=SubtitleFormat.srt, language="zh", storage_key=srt_key))
         _safe_append_log_line(log_path, f"subtitle srt uploaded: {srt_key}")
 
+        if automatic_runtime_profile:
+            output_profile = _current_auto_profile()
+            need_ass = "ass" in list(output_profile.get("formats") or ["srt", "ass"])
         if need_ass:
             ass_key = _store_ass_from_segments(segments_out, log_prefix="subtitle ass uploaded")
 
@@ -2095,7 +2248,7 @@ def process_job(self: Any, job_id: str) -> dict[str, str]:
         _safe_upload_log(store, log_path, log_key)
 
         _raise_if_task_stopped(db, task.id)
-        if not burn_in and not soft_sub:
+        if not automatic_runtime_profile and not burn_in and not soft_sub:
             job.status = SubtitleJobStatus.succeeded
             job.progress = 100
             _task_queue_unlock(task)
@@ -2107,10 +2260,6 @@ def process_job(self: Any, job_id: str) -> dict[str, str]:
             _kick_task_queue()
             return {"status": "ok"}
 
-        after_render = req.get("after_render") if isinstance(req, dict) else None
-        if not isinstance(after_render, dict):
-            after_render = None
-
         existing = (
             db.query(RenderJob)
             .filter(
@@ -2121,21 +2270,7 @@ def process_job(self: Any, job_id: str) -> dict[str, str]:
             .first()
         )
         if not existing:
-            payload: dict[str, Any] = {
-                "input_key": input_key,
-                "srt_key": srt_key,
-                "ass_key": ass_key if burn_in else None,
-                "burn_in": bool(burn_in),
-                "soft_sub": bool(soft_sub),
-                "render": {
-                    "video_codec": video_codec,
-                    "use_intel_gpu": use_intel_gpu,
-                    "video_preset": video_preset,
-                    "video_crf": video_crf,
-                },
-            }
-            if after_render:
-                payload["after_render"] = after_render
+            payload = _build_render_job_payload(srt_key_value=srt_key, ass_key_value=ass_key)
             db.add(RenderJob(task_id=task.id, subtitle_job_id=job.id, status=RenderJobStatus.queued, progress=0, request_json=payload))
 
         job.status = SubtitleJobStatus.succeeded
@@ -2563,20 +2698,40 @@ def process_render_job(self: Any, render_job_id: str) -> dict[str, Any]:
         input_key = str(req.get("input_key") or "").strip()
         srt_key = str(req.get("srt_key") or "").strip()
         ass_key = str(req.get("ass_key") or "").strip() or None
-        burn_in = bool(req.get("burn_in"))
-        soft_sub = bool(req.get("soft_sub"))
-        render_cfg = req.get("render") if isinstance(req.get("render"), dict) else {}
+        automatic_render = _uses_runtime_auto_profile(task, req)
+        if automatic_render:
+            # Render is its own configurable box.  Old queued render rows may
+            # contain stale snapshots; ignore them for automatic tasks and read
+            # the current profile exactly when this worker claims the stage.
+            render_profile = dict(get_auto_profile(db))
+            burn_in = bool(render_profile.get("burn_in"))
+            soft_sub = bool(render_profile.get("soft_sub"))
+            render_cfg = {
+                "video_codec": render_profile.get("video_codec") or "av1",
+                "use_intel_gpu": bool(render_profile.get("use_intel_gpu")),
+                "video_preset": render_profile.get("video_preset"),
+                "video_crf": render_profile.get("video_crf"),
+                "ass_style": render_profile.get("ass_style") or "clean_white",
+                "primary_font_scale_percent": render_profile.get("primary_font_scale_percent") or 100,
+                "secondary_font_scale_percent": render_profile.get("secondary_font_scale_percent") or 100,
+            }
+        else:
+            burn_in = bool(req.get("burn_in"))
+            soft_sub = bool(req.get("soft_sub"))
+            render_cfg = req.get("render") if isinstance(req.get("render"), dict) else {}
 
         video_codec = str(render_cfg.get("video_codec") or "av1").strip().lower() or "av1"
         use_intel_gpu = bool(render_cfg.get("use_intel_gpu"))
         video_preset = render_cfg.get("video_preset")
-        video_crf = render_cfg.get("video_crf")
+        # Wire compatibility keeps the historical video_crf name; internally it
+        # is encoder quality (CRF for software encoders, QP/global_quality for QSV).
+        video_quality = render_cfg.get("video_crf")
 
         if not input_key:
             raise ValueError("render job missing input_key")
         if not srt_key:
             raise ValueError("render job missing srt_key")
-        if burn_in and not ass_key:
+        if burn_in and not automatic_render and not ass_key:
             raise ValueError("render job missing ass_key for burn_in")
 
         work_root = Path(settings.work_dir) / "render" / str(rj.id)
@@ -2592,7 +2747,7 @@ def process_render_job(self: Any, render_job_id: str) -> dict[str, Any]:
         _seed_log_from_store(store, log_key, log_path)
         _safe_append_log_line(
             log_path,
-            f"render job start: render_job_id={rj.id} task_id={task.id} burn_in={burn_in} soft_sub={soft_sub} codec={video_codec} intel_gpu={use_intel_gpu} preset={video_preset} crf={video_crf}",
+            f"render job start: render_job_id={rj.id} task_id={task.id} burn_in={burn_in} soft_sub={soft_sub} codec={video_codec} intel_gpu={use_intel_gpu} preset={video_preset} quality={video_quality}",
         )
         _safe_upload_log(store, log_path, log_key)
 
@@ -2635,7 +2790,11 @@ def process_render_job(self: Any, render_job_id: str) -> dict[str, Any]:
 
         video_path = store.path_for(input_key)
         srt_path = store.path_for(srt_key)
-        ass_path = store.path_for(ass_key) if burn_in and ass_key else work_root / "subtitle_zh.ass"
+        ass_path = (
+            work_root / "subtitle_runtime.ass"
+            if automatic_render and burn_in
+            else (store.path_for(ass_key) if burn_in and ass_key else work_root / "subtitle_zh.ass")
+        )
 
         _safe_append_log_line(log_path, f"storage input ready: input_key={input_key}")
         _safe_upload_log(store, log_path, log_key)
@@ -2656,6 +2815,36 @@ def process_render_job(self: Any, render_job_id: str) -> dict[str, Any]:
             if subtitle_job:
                 subtitle_job.progress = max(int(subtitle_job.progress or 0), 81)
                 db.add(subtitle_job)
+
+        if automatic_render and burn_in:
+            runtime_segments: list[Segment] = []
+            if subtitle_job and isinstance(subtitle_job.request_json, dict):
+                artifacts = subtitle_job.request_json.get("artifacts")
+                if isinstance(artifacts, dict):
+                    segments_key = str(artifacts.get("final_subtitle_segments_key") or "").strip()
+                    if segments_key:
+                        try:
+                            segments_payload = json.loads(store.path_for(segments_key).read_text(encoding="utf-8"))
+                            runtime_segments = segments_from_json_data(segments_payload)
+                        except Exception:
+                            runtime_segments = []
+            if not runtime_segments:
+                runtime_segments = srt_to_segments(srt_path.read_text(encoding="utf-8"))
+            play_res_x, play_res_y = probe_video_resolution(settings.ffmpeg_path, video_path)
+            secondary_line_scale = 0.68 if any(seg.secondary_text for seg in runtime_segments) else None
+            ass_path.write_text(
+                segments_to_ass(
+                    runtime_segments,
+                    style_name=str(render_cfg.get("ass_style") or "clean_white"),
+                    play_res_x=play_res_x,
+                    play_res_y=play_res_y,
+                    secondary_line_scale=secondary_line_scale,
+                    primary_font_scale_percent=int(render_cfg.get("primary_font_scale_percent") or 100),
+                    secondary_font_scale_percent=int(render_cfg.get("secondary_font_scale_percent") or 100),
+                ),
+                encoding="utf-8",
+            )
+            _safe_append_log_line(log_path, "runtime ASS generated from current render box settings")
 
         rj.progress = max(int(rj.progress or 0), 10)
         db.add(rj)
@@ -2680,7 +2869,7 @@ def process_render_job(self: Any, render_job_id: str) -> dict[str, Any]:
                 use_intel_gpu=use_intel_gpu,
                 intel_gpu_render_device=settings.intel_gpu_render_device,
                 preset=video_preset,
-                crf=video_crf,
+                crf=video_quality,
                 log_path=log_path,
                 live_upload_cb=_live_upload_log,
             )
@@ -2752,7 +2941,7 @@ def process_render_job(self: Any, render_job_id: str) -> dict[str, Any]:
         # transaction.  The dispatcher, rather than this worker, performs the
         # broker delivery so a broker outage cannot lose auto publishing.
         after_render = req.get("after_render") if isinstance(req, dict) else None
-        if isinstance(after_render, dict) and after_render.get("publish"):
+        if automatic_render or (isinstance(after_render, dict) and after_render.get("publish")):
             create_outbox_event(
                 db,
                 event_type="render.after_publish",
@@ -2844,27 +3033,58 @@ def _after_render_publish_impl(render_job_id: str) -> dict[str, Any]:
             return {"status": "error", "detail": "task not found"}
         req = rj.request_json if isinstance(rj.request_json, dict) else {}
         after_render = req.get("after_render") if isinstance(req.get("after_render"), dict) else {}
-        if not after_render.get("publish"):
-            return {"status": "skipped"}
-
-        publish_payload = after_render.get("publish_payload") or after_render.get("payload") or {}
-        if not isinstance(publish_payload, dict):
-            return {"status": "error", "detail": "after_render.publish_payload must be an object"}
-        publish_payload = dict(publish_payload)
-
-        # Ensure we don't accidentally override the latest rendered asset selection.
-        if publish_payload.get("video_key") in {"", None}:
-            publish_payload["video_key"] = None
+        auto_meta = parse_auto_youtube_created_by(task.created_by)
+        automatic_publish = _uses_runtime_auto_profile(task, req, after_render)
+        store = FileStore(settings)
+        store.ensure_ready()
 
         from videoroll.apps.orchestrator_api.schemas import PublishAllRequest
-        from videoroll.apps.orchestrator_api.services.publishing_service import publish_all
+        from videoroll.apps.orchestrator_api.services.publishing_service import (
+            build_auto_publish_after_render,
+            publish_all,
+        )
+
+        if automatic_publish:
+            publish_profile = dict(get_auto_profile(db))
+            explicit_auto_publish = auto_meta.get("auto_publish") if auto_meta else None
+            publish_enabled = (
+                bool(explicit_auto_publish)
+                if explicit_auto_publish is not None
+                else bool(publish_profile.get("auto_publish"))
+            )
+            if not publish_enabled:
+                return {"status": "skipped", "detail": "automatic publishing is disabled in the current publish box"}
+            if not list(publish_profile.get("auto_publish_platforms") or []):
+                return {"status": "skipped", "detail": "no automatic publish platforms are selected"}
+            final_asset = (
+                db.query(Asset)
+                .filter(Asset.task_id == task.id, Asset.kind == AssetKind.video_final)
+                .order_by(Asset.created_at.desc())
+                .first()
+            )
+            if final_asset is None:
+                return {"status": "skipped", "detail": "current render box produced no final video"}
+            action = build_auto_publish_after_render(task, db=db, s3=store)
+            publish_payload = dict(action.get("publish_payload") or {})
+        else:
+            if not after_render.get("publish"):
+                return {"status": "skipped"}
+            publish_payload = after_render.get("publish_payload") or after_render.get("payload") or {}
+            if not isinstance(publish_payload, dict):
+                return {"status": "error", "detail": "after_render.publish_payload must be an object"}
+            publish_payload = dict(publish_payload)
+
+        # Let publish_all resolve the latest rendered asset unless a manual
+        # request explicitly pinned one.
+        if publish_payload.get("video_key") in {"", None}:
+            publish_payload["video_key"] = None
 
         result_data = publish_all(
             task.id,
             PublishAllRequest.model_validate(publish_payload),
             get_orchestrator_settings(),
             db,
-            FileStore(settings),
+            store,
         )
 
         # Log partial failures but don't fail the task if at least one platform succeeded.
@@ -3217,6 +3437,9 @@ def auto_youtube_pipeline(self: Any, task_id: str, overrides: dict[str, Any] | N
 
     db = _db()
     hb: _TaskQueueHeartbeat | None = None
+    pipeline_hb: OperationHeartbeat | None = None
+    pipeline_operation_key: str | None = None
+    pipeline_operation_owner: str | None = None
     acquired_lock = False
     try:
         tid = uuid.UUID(task_id)
@@ -3303,12 +3526,55 @@ def auto_youtube_pipeline(self: Any, task_id: str, overrides: dict[str, Any] | N
         # later queue tick.
         db.commit()
 
+        pipeline_meta = parse_auto_youtube_created_by(task.created_by) or {}
+        pipeline_run_id = str(pipeline_meta.get("run_id") or "legacy").strip() or "legacy"
+        pipeline_operation_key = f"auto-youtube-pipeline:{task.id}:{pipeline_run_id}"
+        pipeline_operation_owner = f"subtitle_service.auto_youtube_pipeline:{os.getpid()}:{uuid.uuid4().hex[:12]}"
+        claim = claim_operation(
+            db,
+            pipeline_operation_key,
+            pipeline_operation_owner,
+            3600,
+            request_json={"task_id": str(task.id), "run_id": pipeline_run_id},
+        )
+        db.commit()
+        if not claim.acquired:
+            if claim.result_json is not None:
+                return claim.result_json
+            return {"status": "in_progress", "task_id": str(tid), "detail": "automatic pipeline is already running"}
+
+        pipeline_hb = OperationHeartbeat(
+            lambda: _db(),
+            pipeline_operation_key,
+            pipeline_operation_owner,
+            3600,
+        )
+        pipeline_hb.start()
+
+        def _finish_pipeline(result: dict[str, Any]) -> dict[str, Any]:
+            finish_db = _db()
+            try:
+                finish_operation(finish_db, pipeline_operation_key, result)
+                finish_db.commit()
+            finally:
+                finish_db.close()
+            return result
+
+        def _release_pipeline(error: object) -> None:
+            release_db = _db()
+            try:
+                release_operation(release_db, pipeline_operation_key, pipeline_operation_owner, error)
+                release_db.commit()
+            finally:
+                release_db.close()
+
         hb = _TaskQueueHeartbeat(task.id)
         hb.start()
 
+        # Future boxes deliberately do not inherit this point-in-time profile.
+        # It is only a local snapshot for decisions made in this pipeline stage;
+        # ASR/translate/render/publish each reread the profile when they start.
         profile = dict(get_auto_profile(db))
-        if isinstance(overrides, dict) and overrides.get("auto_publish") is not None:
-            profile["auto_publish"] = bool(overrides.get("auto_publish"))
 
         # Download YouTube video + cover + metadata (idempotent).
         yt: dict[str, Any] = {}
@@ -3331,7 +3597,7 @@ def auto_youtube_pipeline(self: Any, task_id: str, overrides: dict[str, Any] | N
                 break
             except httpx.HTTPStatusError as e:
                 status_code = int(getattr(e.response, "status_code", 0) or 0)
-                if status_code in {429, 500, 502, 503, 504} and yt_retries_done < yt_max_retries:
+                if status_code in {409, 429, 500, 502, 503, 504} and yt_retries_done < yt_max_retries:
                     retry_no = yt_retries_done + 1
                     try:
                         task.retry_count = int(task.retry_count or 0) + 1
@@ -3397,7 +3663,7 @@ def auto_youtube_pipeline(self: Any, task_id: str, overrides: dict[str, Any] | N
             ca = yt.get("cover_asset")
             if isinstance(ca, dict):
                 cover_key = str(ca.get("storage_key") or "").strip() or None
-        if not cover_key and profile.get("publish_use_youtube_cover"):
+        if not cover_key:
             latest_cover = (
                 db.query(Asset)
                 .filter(Asset.task_id == tid, Asset.kind == AssetKind.cover_image)
@@ -3406,66 +3672,42 @@ def auto_youtube_pipeline(self: Any, task_id: str, overrides: dict[str, Any] | N
             )
             cover_key = latest_cover.storage_key if latest_cover else None
 
-        # Render subtitles (skip if a final video already exists).
+        # Queue the next box without freezing ASR/translation/render settings.
+        # The worker identifies this as an automatic task from task.created_by
+        # and reads the then-current profile at each stage boundary.
         final_asset = (
             db.query(Asset)
             .filter(Asset.task_id == tid, Asset.kind == AssetKind.video_final)
             .order_by(Asset.created_at.desc())
             .first()
         )
-        if not final_asset and (profile.get("burn_in") or profile.get("soft_sub")):
+        if not final_asset:
             req = {
                 "task_id": str(tid),
                 "resume": task.status == TaskStatus.failed,
-                "prefer_youtube_subtitles": bool(profile.get("prefer_youtube_subtitles", True)),
-                "youtube_subtitle_mode": normalize_youtube_subtitle_mode(
-                    profile.get("youtube_subtitle_mode"),
-                    prefer_youtube_subtitles=profile.get("prefer_youtube_subtitles", True),
-                ),
+                "runtime_profile": True,
                 "input": {"type": "storage", "key": video_key},
-                "asr": {
-                    "engine": profile.get("asr_engine") or "auto",
-                    "language": profile.get("asr_language") or "auto",
-                    "model": profile.get("asr_model"),
-                },
-                "translate": {
-                    "enabled": bool(profile.get("translate_enabled")),
-                    "target_lang": profile.get("target_lang") or "zh",
-                    "provider": profile.get("translate_provider") or "openai",
-                    "style": profile.get("translate_style") or "口语自然",
-                    "enable_summary": bool(profile.get("translate_enable_summary")),
-                    "bilingual": bool(profile.get("bilingual")),
-                },
-                "output": {
-                    "formats": profile.get("formats") or ["srt", "ass"],
-                    "render": {
-                        "burn_in": bool(profile.get("burn_in")),
-                        "soft_sub": bool(profile.get("soft_sub")),
-                        "ass_style": profile.get("ass_style") or "clean_white",
-                        "video_codec": profile.get("video_codec") or "av1",
-                        "use_intel_gpu": bool(profile.get("use_intel_gpu")),
-                        "video_preset": profile.get("video_preset"),
-                        "video_crf": profile.get("video_crf"),
-                        "primary_font_scale_percent": profile.get("primary_font_scale_percent") or 100,
-                        "secondary_font_scale_percent": profile.get("secondary_font_scale_percent") or 100,
-                    },
-                },
+                "asr": {"engine": "auto", "language": "auto", "model": None},
+                "translate": {},
+                "output": {"formats": ["srt"], "render": {}},
                 "output_prefix": f"sub/{tid}/",
+                # Always evaluate the publish box after the render boundary.
+                # Its current config (plus any explicit intake override) decides
+                # whether anything is actually submitted.
+                "after_render": {"publish": True, "runtime_profile": True},
             }
 
-            after_render = _build_after_render_publish_action(
-                task_id=tid,
-                cover_key=cover_key,
-                profile=profile,
-                yt_title=yt_title,
-                yt_desc=yt_desc,
-                webpage_url=webpage_url,
-                yt_uploader=yt_uploader,
-                db=db,
-                store=store,
-            )
-            if after_render:
-                req["after_render"] = after_render
+            active_job = _active_pipeline_job(db, tid)
+            if active_job is not None:
+                existing_kind, existing_job_id = active_job
+                _kick_task_queue()
+                return _finish_pipeline(
+                    {
+                        "status": "ok",
+                        "task_id": str(tid),
+                        "detail": f"reused active {existing_kind} job {existing_job_id}",
+                    }
+                )
 
             job = SubtitleJob(task_id=tid, request_json=req, status=SubtitleJobStatus.queued, progress=0)
             db.add(job)
@@ -3473,8 +3715,16 @@ def auto_youtube_pipeline(self: Any, task_id: str, overrides: dict[str, Any] | N
             db.refresh(job)
 
             _kick_task_queue()
-            return {"status": "ok", "task_id": str(tid), "detail": f"queued subtitle job {job.id}"}
+            return _finish_pipeline({"status": "ok", "task_id": str(tid), "detail": f"queued subtitle job {job.id}"})
 
+        # A pre-existing final video can jump straight to the publish box.  Read
+        # its configuration now, after download/recovery work has completed.
+        profile = dict(get_auto_profile(db))
+        explicit_auto_publish = pipeline_meta.get("auto_publish")
+        if explicit_auto_publish is not None:
+            profile["auto_publish"] = bool(explicit_auto_publish)
+        elif isinstance(overrides, dict) and overrides.get("auto_publish") is not None:
+            profile["auto_publish"] = bool(overrides.get("auto_publish"))
         result_data: dict[str, Any] = {}
         auto_publish_platforms = list(profile.get("auto_publish_platforms") or [])
         if profile.get("auto_publish") and auto_publish_platforms:
@@ -3530,14 +3780,14 @@ def auto_youtube_pipeline(self: Any, task_id: str, overrides: dict[str, Any] | N
                 logger.warning("auto_youtube_pipeline partial failure for task %s: %s", tid, errors)
             if not result_data.get("has_any_accepted", False) and errors:
                 error_details = "; ".join(f"{p}: {msg}" for p, msg in errors.items())
-                return {
+                return _finish_pipeline({
                     "status": "error",
                     "task_id": str(tid),
                     "detail": f"all platforms failed: {error_details}",
                     "platforms": result_data,
-                }
+                })
 
-        return {"status": "ok", "task_id": str(tid), "platforms": result_data}
+        return _finish_pipeline({"status": "ok", "task_id": str(tid), "platforms": result_data})
     except _TaskStopped:
         task = db.get(Task, uuid.UUID(task_id))
         if task and task.lock_owner == TASK_QUEUE_LOCK_OWNER:
@@ -3545,25 +3795,40 @@ def auto_youtube_pipeline(self: Any, task_id: str, overrides: dict[str, Any] | N
             db.add(task)
             db.commit()
         _kick_task_queue()
-        return {"status": "stopped", "task_id": task_id, "detail": "task stopped by user"}
-    except Retry:
+        result = {"status": "stopped", "task_id": task_id, "detail": "task stopped by user"}
+        if pipeline_operation_key and pipeline_operation_owner:
+            return _finish_pipeline(result)
+        return result
+    except Retry as exc:
+        if pipeline_operation_key and pipeline_operation_owner:
+            _release_pipeline(exc)
         raise
     except Exception as e:
         task = db.get(Task, uuid.UUID(task_id))
         if task:
             if _task_is_stopped(db, task.id):
                 _kick_task_queue()
-                return {"status": "stopped", "task_id": str(task.id), "detail": "task stopped by user"}
+                result = {"status": "stopped", "task_id": str(task.id), "detail": "task stopped by user"}
+                if pipeline_operation_key and pipeline_operation_owner:
+                    return _finish_pipeline(result)
+                return result
             if task.status == TaskStatus.ready_for_review and task.error_code == "AI_REVIEW_REJECTED":
                 _kick_task_queue()
-                return {"status": "review_rejected", "task_id": str(task.id), "detail": task.error_message or str(e)}
+                result = {"status": "review_rejected", "task_id": str(task.id), "detail": task.error_message or str(e)}
+                if pipeline_operation_key and pipeline_operation_owner:
+                    return _finish_pipeline(result)
+                return result
             task.status = TaskStatus.failed
             task.error_message = str(e)
             db.add(task)
             db.commit()
+        if pipeline_operation_key and pipeline_operation_owner:
+            _release_pipeline(e)
         _kick_task_queue()
         raise
     finally:
+        if pipeline_hb is not None:
+            pipeline_hb.stop()
         if hb is not None:
             hb.stop()
         try:

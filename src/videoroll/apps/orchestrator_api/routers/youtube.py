@@ -151,5 +151,11 @@ def download_youtube(task_id: uuid.UUID, settings: OrchestratorSettings = Depend
 
 
 @router.get("/tasks/{task_id}/youtube_download_progress", response_model=YouTubeDownloadProgressRead)
-def get_youtube_download_progress(task_id: uuid.UUID, db: Session = Depends(get_db)) -> YouTubeDownloadProgressRead:
-    return YouTubeDownloadProgressRead(**youtube_service.get_download_progress(task_id, db=db))
+def get_youtube_download_progress(
+    task_id: uuid.UUID,
+    settings: OrchestratorSettings = Depends(get_settings),
+    db: Session = Depends(get_db),
+) -> YouTubeDownloadProgressRead:
+    return YouTubeDownloadProgressRead(
+        **youtube_service.get_download_progress(task_id, db=db, redis_url=str(settings.redis_url or ""))
+    )

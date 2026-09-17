@@ -118,7 +118,7 @@ export function useTaskSubtitle({
         let video_crf: number | null = null;
         if (crfRaw) {
           const value = Number(crfRaw);
-          if (!Number.isFinite(value) || !Number.isInteger(value)) throw new Error("video_crf 必须是整数");
+          if (!Number.isFinite(value) || !Number.isInteger(value)) throw new Error("视频质量参数必须是整数");
           video_crf = value;
         }
         const presetRaw = videoPresetText.trim();

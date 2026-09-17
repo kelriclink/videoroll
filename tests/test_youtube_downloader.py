@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+import httpx
+
 from yt_dlp.utils import DownloadError
 
 from videoroll.apps.orchestrator_api import youtube_downloader as yd
@@ -100,6 +102,57 @@ class YouTubeDownloaderTests(unittest.TestCase):
                 )
 
         self.assertEqual(mock_download.call_count, 1)
+
+    def test_thumbnail_redirect_rejects_non_youtube_destination(self) -> None:
+        calls: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(str(request.url))
+            return httpx.Response(302, headers={"Location": "http://127.0.0.1/private"})
+
+        with tempfile.TemporaryDirectory() as tmp, httpx.Client(
+            transport=httpx.MockTransport(handler),
+            follow_redirects=False,
+        ) as client:
+            with self.assertRaisesRegex(RuntimeError, "host is not allowed"):
+                yd._stream_thumbnail(
+                    client,
+                    "https://i.ytimg.com/vi/demo/maxresdefault.jpg",
+                    Path(tmp) / "thumbnail.jpg",
+                    max_bytes=1024 * 1024,
+                )
+
+        self.assertEqual(calls, ["https://i.ytimg.com/vi/demo/maxresdefault.jpg"])
+
+    def test_thumbnail_redirect_validates_each_allowed_hop(self) -> None:
+        calls: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(str(request.url))
+            if len(calls) == 1:
+                return httpx.Response(302, headers={"Location": "https://img.youtube.com/vi/demo/0.jpg"})
+            return httpx.Response(200, content=b"jpeg-bytes")
+
+        with tempfile.TemporaryDirectory() as tmp, httpx.Client(
+            transport=httpx.MockTransport(handler),
+            follow_redirects=False,
+        ) as client:
+            destination = Path(tmp) / "thumbnail.jpg"
+            yd._stream_thumbnail(
+                client,
+                "https://i.ytimg.com/vi/demo/maxresdefault.jpg",
+                destination,
+                max_bytes=1024 * 1024,
+            )
+            self.assertEqual(destination.read_bytes(), b"jpeg-bytes")
+
+        self.assertEqual(
+            calls,
+            [
+                "https://i.ytimg.com/vi/demo/maxresdefault.jpg",
+                "https://img.youtube.com/vi/demo/0.jpg",
+            ],
+        )
 
     def test_detects_requested_format_unavailable_message(self) -> None:
         self.assertTrue(

@@ -39,10 +39,13 @@ class OperationClaim:
 
 
 def _operation_for_update(db: Session, operation_key: str) -> OperationInbox | None:
+    # One exact operation key is a serialization point. Do not use SKIP LOCKED:
+    # treating a concurrently locked row as absent can trigger a losing INSERT,
+    # then still hide the winner while handling the uniqueness race.
     return (
         db.query(OperationInbox)
         .filter(OperationInbox.operation_key == operation_key)
-        .with_for_update(skip_locked=True)
+        .with_for_update()
         .one_or_none()
     )
 
@@ -115,6 +118,27 @@ def claim_outbox_operation(
         lease_seconds,
         request_json={"outbox_event_id": str(event.id), "event_type": event.event_type},
     )
+
+
+def reopen_completed_operation(db: Session, operation_key: str) -> bool:
+    """Reset a completed operation when its durable result is proven stale.
+
+    Callers must verify the external/durable artifact is no longer usable before
+    invoking this helper.  A live processing operation is never disturbed.
+    """
+    operation = _operation_for_update(db, str(operation_key))
+    if operation is None or operation.status != "completed":
+        return False
+    operation.status = "pending"
+    operation.result_json = None
+    operation.lease_owner = None
+    operation.lease_until = None
+    operation.heartbeat_at = _now()
+    operation.completed_at = None
+    operation.last_error = "completed result reopened after artifact validation failed"
+    db.add(operation)
+    db.flush()
+    return True
 
 
 def heartbeat_operation(db: Session, operation_key: str, owner: str, lease_seconds: int) -> bool:

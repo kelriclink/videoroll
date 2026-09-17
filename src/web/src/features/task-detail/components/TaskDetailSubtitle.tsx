@@ -105,14 +105,29 @@ export function TaskDetailSubtitle({ controller }: { controller: TaskDetailContr
             </div>
             <div className="mt-3">
               <label className="block">
-                <div className="mb-1 text-xs text-slate-600">video_crf（可选：留空=默认）</div>
+                <div className="mb-1 text-xs text-slate-600">
+                  {useIntelGpu ? "视频质量（Intel QP/global_quality；兼容字段 video_crf）" : "video_crf（软件编码；可选：留空=默认）"}
+                </div>
                 <input
                   className="w-full rounded border px-3 py-2 text-sm"
                   value={videoCrfText}
                   onChange={(e) => setVideoCrfText(e.target.value)}
-                  placeholder={videoCodec === "h264" ? "默认 18（h264）" : "默认 24（av1）"}
+                  placeholder={
+                    useIntelGpu
+                      ? videoCodec === "h264"
+                        ? "默认 23（Intel h264 CQP）"
+                        : "默认 24（Intel av1 global_quality）"
+                      : videoCodec === "h264"
+                        ? "默认 18（h264 CRF）"
+                        : "默认 24（av1 CRF）"
+                  }
                 />
               </label>
+              <div className="mt-2 text-xs text-slate-500">
+                {useIntelGpu
+                  ? "Intel GPU 下该值按 CQP / global_quality 处理，不是 CRF；越小质量越高。"
+                  : "软件编码下该值按 CRF 处理；越小质量越高。"}
+              </div>
             </div>
             <div className="mt-3">
               <label className="block">

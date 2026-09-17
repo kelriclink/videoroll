@@ -212,6 +212,10 @@ def build_subtitle_job_request(
         translate["enable_summary"] = payload.translate_enable_summary
     return {
         "task_id": str(task_id),
+        # This endpoint represents an explicit one-shot user request. Even when
+        # the task originally came from an automatic source, these supplied
+        # options are intentional overrides for this run.
+        "runtime_profile": False,
         "resume": bool(payload.resume),
         "prefer_youtube_subtitles": youtube_subtitle_mode != "off",
         "youtube_subtitle_mode": youtube_subtitle_mode,
@@ -398,15 +402,18 @@ def resume_recent_failed_tasks(
                 and task.source_type == SourceType.youtube
                 and str(task.source_url or "").strip()
             ):
-                auto_publish = bool(get_auto_profile(db).get("auto_publish"))
                 youtube_service.set_task_created_by(
                     settings,
                     task_id=task.id,
-                    created_by=encode_auto_youtube_created_by("youtube_task_restart", auto_publish=auto_publish),
+                    created_by=encode_auto_youtube_created_by(
+                        "youtube_task_restart",
+                        auto_publish=None,
+                        run_id=uuid.uuid4().hex,
+                    ),
                 )
                 pipeline_job_id = youtube_service.enqueue_auto_youtube_pipeline(
                     task.id,
-                    auto_publish=auto_publish,
+                    auto_publish=None,
                 )
                 resumed_count += 1
                 results.append(

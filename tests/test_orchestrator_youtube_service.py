@@ -72,6 +72,20 @@ def test_home_scan_due_respects_last_finished_and_interval() -> None:
     assert youtube_service.home_scan_is_due(config, now=now) is False
 
 
+def test_proxy_test_rejects_non_youtube_target_before_network() -> None:
+    settings = SimpleNamespace(youtube_user_agent="UA/1.0")
+    with patch.object(youtube_service.httpx, "Client") as client:
+        result = youtube_service.test_proxy(
+            url="http://127.0.0.1:8000/private",
+            proxy="",
+            settings=settings,  # type: ignore[arg-type]
+        )
+
+    assert result.ok is False
+    assert "YouTube URL" in str(result.error)
+    client.assert_not_called()
+
+
 def test_download_progress_returns_idle_for_task_without_saved_progress() -> None:
     task_id = uuid.uuid4()
     progress = youtube_service.get_download_progress(task_id, db=_ProgressDb(task_id))  # type: ignore[arg-type]
@@ -91,6 +105,26 @@ def test_download_progress_returns_idle_for_task_without_saved_progress() -> Non
     }
 
 
+def test_duplicate_download_caller_does_not_mark_shared_progress_failed() -> None:
+    task_id = uuid.uuid4()
+    db = Mock()
+    reporter = Mock()
+    claim = SimpleNamespace(acquired=False, result_json=None)
+    settings = SimpleNamespace(redis_url="", database_url="sqlite:///:memory:")
+
+    with (
+        patch.object(youtube_service, "_YouTubeDownloadProgressReporter", return_value=reporter),
+        patch.object(youtube_service, "claim_operation", return_value=claim),
+        patch.object(youtube_service, "release_operation") as release_operation,
+        pytest.raises(HTTPException) as caught,
+    ):
+        youtube_service.download(task_id, settings=settings, db=db, s3=Mock())  # type: ignore[arg-type]
+
+    assert caught.value.status_code == 409
+    reporter.fail.assert_not_called()
+    release_operation.assert_not_called()
+
+
 def test_download_progress_returns_404_for_missing_task() -> None:
     with pytest.raises(HTTPException) as exc_info:
         youtube_service.get_download_progress(uuid.uuid4(), db=_ProgressDb())  # type: ignore[arg-type]
@@ -101,11 +135,13 @@ def test_download_progress_returns_404_for_missing_task() -> None:
 def test_download_progress_reporter_persists_and_publishes_updates() -> None:
     task_id = uuid.uuid4()
     db = _ProgressDb(task_id)
-    reporter = youtube_service._YouTubeDownloadProgressReporter(
-        task_id,
-        db=db,  # type: ignore[arg-type]
-        redis_url="redis://localhost:6379/0",
-    )
+    redis_client = Mock()
+    with patch.object(youtube_service.Redis, "from_url", return_value=redis_client):
+        reporter = youtube_service._YouTubeDownloadProgressReporter(
+            task_id,
+            db=db,  # type: ignore[arg-type]
+            redis_url="redis://localhost:6379/0",
+        )
 
     with (
         patch.object(youtube_service.time, "monotonic", side_effect=[0.0, 0.6, 1.2]),
@@ -135,6 +171,7 @@ def test_download_progress_reporter_persists_and_publishes_updates() -> None:
     assert saved["updated_at"]
     assert publish_event.call_args.kwargs["topics"] == [f"task:{task_id}"]
     assert publish_event.call_args.kwargs["name"] == "youtube_download.progress"
+    assert redis_client.set.call_count == 3
 
 
 def test_download_progress_reporter_keeps_last_progress_when_download_fails() -> None:
@@ -165,11 +202,13 @@ def test_download_progress_reporter_keeps_last_progress_when_download_fails() ->
 def test_download_progress_reporter_throttles_frequent_download_hooks() -> None:
     task_id = uuid.uuid4()
     db = _ProgressDb(task_id)
-    reporter = youtube_service._YouTubeDownloadProgressReporter(
-        task_id,
-        db=db,  # type: ignore[arg-type]
-        redis_url="redis://localhost:6379/0",
-    )
+    redis_client = Mock()
+    with patch.object(youtube_service.Redis, "from_url", return_value=redis_client):
+        reporter = youtube_service._YouTubeDownloadProgressReporter(
+            task_id,
+            db=db,  # type: ignore[arg-type]
+            redis_url="redis://localhost:6379/0",
+        )
 
     with (
         patch.object(youtube_service.time, "monotonic", side_effect=[0.0, 0.1, 0.6]),
@@ -250,7 +289,13 @@ def test_download_does_not_compensate_a_preexisting_metadata_key(tmp_path) -> No
         patch.object(youtube_service, "download_thumbnail_jpg", return_value=None),
         pytest.raises(RuntimeError, match="database unavailable"),
     ):
-        youtube_service.download(task_id, settings=settings, db=db, s3=s3)  # type: ignore[arg-type]
+        youtube_service._download(  # type: ignore[arg-type]
+            task_id,
+            settings=settings,
+            db=db,
+            s3=s3,
+            reporter=Mock(),
+        )
 
     deleted_keys = [call.args[0] for call in s3.delete_object.call_args_list]
     assert metadata_key not in deleted_keys

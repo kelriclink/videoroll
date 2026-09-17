@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -9,9 +10,8 @@ from typing import Any, Optional
 import yt_dlp
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, sessionmaker
 
-from videoroll.apps.subtitle_service.auto_profile_store import get_auto_profile
 from videoroll.apps.youtube_ingest.youtube_feed import fetch_youtube_feed
 from videoroll.apps.youtube_settings_store import get_youtube_settings
 from videoroll.db.models import (
@@ -284,6 +284,79 @@ def try_acquire_youtube_source_scan_lock(
     return row
 
 
+def heartbeat_youtube_source_scan_lock(
+    db: Session,
+    source_pk: uuid.UUID,
+    *,
+    owner: str,
+    ttl_seconds: int,
+) -> bool:
+    now_dt = _utcnow()
+    updated = (
+        db.query(YouTubeSource)
+        .filter(
+            YouTubeSource.id == source_pk,
+            YouTubeSource.scan_lock_owner == str(owner or "").strip(),
+        )
+        .update(
+            {"scan_lock_until": now_dt + timedelta(seconds=max(60, int(ttl_seconds or DEFAULT_SOURCE_SCAN_LOCK_TTL_SECONDS)))},
+            synchronize_session=False,
+        )
+    )
+    if not updated:
+        return False
+    db.flush()
+    return True
+
+
+class _YouTubeSourceScanHeartbeat:
+    def __init__(
+        self,
+        session_factory: sessionmaker[Session],
+        source_pk: uuid.UUID,
+        owner: str,
+        ttl_seconds: int,
+    ) -> None:
+        self._session_factory = session_factory
+        self._source_pk = source_pk
+        self._owner = owner
+        self._ttl_seconds = max(60, int(ttl_seconds or DEFAULT_SOURCE_SCAN_LOCK_TTL_SECONDS))
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        self._thread = threading.Thread(target=self._run, name=f"youtube-source-scan-hb-{self._source_pk}", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+
+    def _run(self) -> None:
+        interval = max(5.0, self._ttl_seconds / 3)
+        while not self._stop.wait(interval):
+            heartbeat_db = self._session_factory()
+            try:
+                if heartbeat_youtube_source_scan_lock(
+                    heartbeat_db,
+                    self._source_pk,
+                    owner=self._owner,
+                    ttl_seconds=self._ttl_seconds,
+                ):
+                    heartbeat_db.commit()
+                else:
+                    heartbeat_db.rollback()
+                    return
+            except Exception:
+                heartbeat_db.rollback()
+                logger.exception("failed to heartbeat YouTube source scan lock %s", self._source_pk)
+            finally:
+                heartbeat_db.close()
+
+
 def finish_youtube_source_scan_lock(
     db: Session,
     source_pk: uuid.UUID,
@@ -499,9 +572,19 @@ def scan_youtube_source_by_id(
             raise RuntimeError("youtube source scan is already running")
         return None
 
+    heartbeat = _YouTubeSourceScanHeartbeat(
+        sessionmaker(bind=db.get_bind()),
+        source_pk,
+        owner,
+        lock_ttl_seconds,
+    )
+    heartbeat.start()
+
     limit = normalize_source_scan_limit(limit_override if limit_override is not None else getattr(locked, "scan_limit", None))
     auto_process = bool(getattr(locked, "auto_process", True)) if auto_process_override is None else bool(auto_process_override)
-    auto_publish = bool(get_auto_profile(db).get("auto_publish")) if auto_process else None
+    # Automatic source scans deliberately do not snapshot auto-publish.  The
+    # publish box reads the current setting only when that stage starts.
+    auto_publish: bool | None = None
     yt_cfg = get_youtube_settings(db, default_proxy=default_proxy)
     proxy = str(yt_cfg.get("proxy") or "").strip() or default_proxy or None
 
@@ -552,7 +635,15 @@ def scan_youtube_source_by_id(
                 source_license=locked.license,
                 source_proof_url=locked.proof_url,
                 status=TaskStatus.ingested,
-                created_by=encode_auto_youtube_created_by("auto_youtube", auto_publish=auto_publish) if auto_process else None,
+                created_by=(
+                    encode_auto_youtube_created_by(
+                        "auto_youtube",
+                        auto_publish=None,
+                        run_id=uuid.uuid4().hex,
+                    )
+                    if auto_process
+                    else None
+                ),
             )
             db.add(task)
             db.flush()
@@ -619,3 +710,5 @@ def scan_youtube_source_by_id(
             error=_trim_error_message(str(e)),
         )
         raise
+    finally:
+        heartbeat.stop()

@@ -299,15 +299,29 @@ export default function SettingsAutoPage() {
             </div>
             <div className="mt-3">
               <label className="block">
-                <div className="mb-1 text-xs text-slate-600">video_crf（可选：留空=默认）</div>
+                <div className="mb-1 text-xs text-slate-600">
+                  {useIntelGpu ? "视频质量（Intel QP/global_quality；兼容字段 video_crf）" : "video_crf（软件编码；可选：留空=默认）"}
+                </div>
                 <input
                   className="w-full rounded border px-3 py-2 text-sm"
                   value={videoCrfText}
                   onChange={(e) => setVideoCrfText(e.target.value)}
-                  placeholder={videoCodec === "h264" ? "默认 18（h264）" : "默认 24（av1）"}
+                  placeholder={
+                    useIntelGpu
+                      ? videoCodec === "h264"
+                        ? "默认 23（Intel h264 CQP）"
+                        : "默认 24（Intel av1 global_quality）"
+                      : videoCodec === "h264"
+                        ? "默认 18（h264 CRF）"
+                        : "默认 24（av1 CRF）"
+                  }
                 />
               </label>
-              <div className="mt-2 text-xs text-slate-500">提示：CRF 越小质量越高、体积越大、编码越慢。常用范围：h264 18~28；av1 24~35。</div>
+              <div className="mt-2 text-xs text-slate-500">
+                {useIntelGpu
+                  ? "提示：Intel GPU 下该值是 CQP / global_quality，不是 CRF；越小质量越高、文件通常越大。"
+                  : "提示：软件编码下使用 CRF；越小质量越高、体积越大、编码通常越慢。常用范围：h264 18~28；av1 24~35。"}
+              </div>
             </div>
             <div className="mt-3">
               <label className="block">
@@ -605,7 +619,7 @@ export default function SettingsAutoPage() {
                 let video_crf: number | null = null;
                 if (crfRaw) {
                   const n = Number(crfRaw);
-                  if (!Number.isFinite(n) || !Number.isInteger(n)) throw new Error("video_crf 必须是整数");
+                  if (!Number.isFinite(n) || !Number.isInteger(n)) throw new Error("视频质量参数必须是整数");
                   video_crf = n;
                 }
                 const primaryFontScaleRaw = primaryFontScalePercentText.trim();

@@ -9,7 +9,7 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Literal, Optional, Protocol
-from urllib.parse import urlparse, urlsplit, urlunsplit
+from urllib.parse import urljoin, urlparse, urlsplit, urlunsplit
 
 import httpx
 import yt_dlp
@@ -33,6 +33,13 @@ class YouTubeSubtitleSelection:
 
 
 _YOUTUBE_SUBTITLE_MODES = {"off", "target", "auto_source"}
+_YOUTUBE_THUMBNAIL_HOST_SUFFIXES = (
+    "youtube.com",
+    "ytimg.com",
+    "googleusercontent.com",
+    "ggpht.com",
+)
+_YOUTUBE_THUMBNAIL_DEFAULT_MAX_BYTES = 20 * 1024 * 1024
 _FORMAT_UNAVAILABLE_FALLBACKS: tuple[tuple[str, dict[str, Any]], ...] = (
     (
         "player_client=tv,android_sdkless,web",
@@ -338,10 +345,80 @@ def pick_thumbnail_url(info: dict[str, Any]) -> Optional[str]:
     return None
 
 
+def _validate_youtube_thumbnail_url(url: str) -> None:
+    try:
+        parsed = urlsplit(str(url or "").strip())
+    except ValueError as exc:
+        raise RuntimeError("invalid YouTube thumbnail URL") from exc
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+        raise RuntimeError("YouTube thumbnail URL must use HTTP(S)")
+    hostname = parsed.hostname.rstrip(".").lower()
+    if not any(hostname == suffix or hostname.endswith(f".{suffix}") for suffix in _YOUTUBE_THUMBNAIL_HOST_SUFFIXES):
+        raise RuntimeError("YouTube thumbnail URL host is not allowed")
+
+
+def _thumbnail_max_bytes() -> int:
+    try:
+        configured = int(os.getenv("YOUTUBE_THUMBNAIL_MAX_BYTES", str(_YOUTUBE_THUMBNAIL_DEFAULT_MAX_BYTES)))
+    except (TypeError, ValueError):
+        configured = _YOUTUBE_THUMBNAIL_DEFAULT_MAX_BYTES
+    return max(1024 * 1024, min(50 * 1024 * 1024, configured))
+
+
+def _stream_thumbnail(
+    client: httpx.Client,
+    url: str,
+    destination: Path,
+    *,
+    max_bytes: int,
+    max_redirects: int = 5,
+) -> None:
+    current_url = str(url or "").strip()
+    redirect_statuses = {301, 302, 303, 307, 308}
+    for redirect_count in range(max(0, int(max_redirects)) + 1):
+        _validate_youtube_thumbnail_url(current_url)
+        total = 0
+        with client.stream("GET", current_url) as response:
+            if response.status_code in redirect_statuses:
+                location = str(response.headers.get("location") or "").strip()
+                if not location:
+                    raise RuntimeError("YouTube thumbnail redirect is missing Location")
+                if redirect_count >= max_redirects:
+                    raise RuntimeError("YouTube thumbnail exceeded redirect limit")
+                next_url = urljoin(current_url, location)
+                # Validate before issuing the next request. A trusted ytimg URL
+                # must never be able to redirect this server to loopback/RFC1918.
+                _validate_youtube_thumbnail_url(next_url)
+                current_url = next_url
+                continue
+
+            response.raise_for_status()
+            content_length = str(response.headers.get("content-length") or "").strip()
+            if content_length:
+                try:
+                    if int(content_length) > max_bytes:
+                        raise RuntimeError("YouTube thumbnail exceeds size limit")
+                except ValueError:
+                    pass
+            with destination.open("wb") as output:
+                for chunk in response.iter_bytes(chunk_size=256 * 1024):
+                    if not chunk:
+                        continue
+                    total += len(chunk)
+                    if total > max_bytes:
+                        raise RuntimeError("YouTube thumbnail exceeds size limit")
+                    output.write(chunk)
+        if total <= 0:
+            raise RuntimeError("YouTube thumbnail response was empty")
+        return
+    raise RuntimeError("YouTube thumbnail exceeded redirect limit")
+
+
 def download_thumbnail_jpg(info: dict[str, Any], settings: YouTubeDownloaderSettings, *, work_dir: Path) -> Optional[Path]:
     url = pick_thumbnail_url(info)
     if not url:
         return None
+    _validate_youtube_thumbnail_url(url)
 
     work_dir.mkdir(parents=True, exist_ok=True)
     parsed = urlparse(url)
@@ -355,24 +432,23 @@ def download_thumbnail_jpg(info: dict[str, Any], settings: YouTubeDownloaderSett
     headers = {"User-Agent": settings.youtube_user_agent}
     proxy = (settings.youtube_proxy or "").strip() or None
 
-    client_kwargs: dict[str, Any] = {"timeout": 30.0, "follow_redirects": True, "headers": headers}
+    # Redirects are followed manually by _stream_thumbnail so every hop is
+    # checked against the same YouTube image-host allowlist.
+    client_kwargs: dict[str, Any] = {"timeout": 30.0, "follow_redirects": False, "headers": headers}
     if proxy:
         try:
             client_kwargs["proxy"] = proxy
         except Exception:
             pass
 
+    max_bytes = _thumbnail_max_bytes()
     try:
         with httpx.Client(**client_kwargs) as client:
-            resp = client.get(url)
-            resp.raise_for_status()
-            in_path.write_bytes(resp.content)
+            _stream_thumbnail(client, url, in_path, max_bytes=max_bytes)
     except TypeError:
         # Older httpx versions may not support the "proxy" kwarg.
-        with httpx.Client(timeout=30.0, follow_redirects=True, headers=headers) as client:
-            resp = client.get(url)
-            resp.raise_for_status()
-            in_path.write_bytes(resp.content)
+        with httpx.Client(timeout=30.0, follow_redirects=False, headers=headers) as client:
+            _stream_thumbnail(client, url, in_path, max_bytes=max_bytes)
 
     # Convert to JPG so bilibili cover upload is more likely to accept it.
     # Also normalize to a common Bilibili-friendly cover ratio (16:10).

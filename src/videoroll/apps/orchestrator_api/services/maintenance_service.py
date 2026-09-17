@@ -15,6 +15,8 @@ from videoroll.config import OrchestratorSettings
 from videoroll.db.models import (
     AppSetting,
     Asset,
+    PublishJob,
+    PublishState,
     RenderJob,
     RenderJobStatus,
     Subtitle,
@@ -155,14 +157,32 @@ def expire_stale_publishing_tasks(
     effective_now = now or utcnow()
     effective_timeout_hours = max(1, int(timeout_hours or 0))
     cutoff = effective_now - timedelta(hours=effective_timeout_hours)
+    active_publish_job = (
+        db.query(PublishJob.id)
+        .filter(
+            PublishJob.task_id == Task.id,
+            PublishJob.state.in_([PublishState.draft, PublishState.submitting]),
+            or_(
+                PublishJob.lease_until > effective_now,
+                PublishJob.heartbeat_at >= cutoff,
+                PublishJob.updated_at >= cutoff,
+            ),
+        )
+        .exists()
+    )
     tasks = (
         db.query(Task)
-        .filter(Task.status == TaskStatus.publishing, Task.updated_at < cutoff)
+        .filter(
+            Task.status == TaskStatus.publishing,
+            Task.updated_at < cutoff,
+            ~active_publish_job,
+        )
         .order_by(Task.updated_at.asc(), Task.id.asc())
         .with_for_update(skip_locked=True)
         .limit(max(1, min(int(limit or 1), 5000)))
         .all()
     )
+    expired = 0
     for task in tasks:
         task.status = TaskStatus.failed
         task.error_code = PUBLISHING_TIMEOUT_ERROR_CODE
@@ -170,8 +190,9 @@ def expire_stale_publishing_tasks(
         task.lock_owner = None
         task.lock_until = None
         db.add(task)
+        expired += 1
     db.commit()
-    return len(tasks)
+    return expired
 
 
 def _all_terminal_task_filter() -> Any:

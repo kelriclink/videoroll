@@ -3,7 +3,7 @@ x-application-build: &application-build
   dockerfile: Dockerfile
   args:
     INSTALL_ASR: ${INSTALL_ASR:-1}
-    YTDLP_VERSION: ${YTDLP_VERSION:-latest}
+    YTDLP_VERSION: ${YTDLP_VERSION:-2026.8.19}
     APP_UID: ${APP_UID:-10001}
     APP_GID: ${APP_GID:-10001}
 
@@ -131,7 +131,7 @@ services:
       dockerfile: Dockerfile
       args:
         INSTALL_ASR: ${INSTALL_ASR:-1}
-        YTDLP_VERSION: ${YTDLP_VERSION:-latest}
+        YTDLP_VERSION: ${YTDLP_VERSION:-2026.8.19}
         APP_UID: ${APP_UID:-10001}
         APP_GID: ${APP_GID:-10001}
     image: videoroll-egress:prod
