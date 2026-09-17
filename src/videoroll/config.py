@@ -76,11 +76,8 @@ class SubtitleServiceSettings(CommonSettings):
     # - num_workers defaults to 1 to avoid memory spikes.
     whisper_cpu_threads: int = Field(0, alias="SUBTITLE_WHISPER_CPU_THREADS")
     whisper_num_workers: int = Field(1, alias="SUBTITLE_WHISPER_NUM_WORKERS")
-    # MiB per admitted local ASR pipeline. Zero selects a conservative model tier.
-    local_asr_memory_mb: int = Field(0, ge=0, alias="SUBTITLE_LOCAL_ASR_MEMORY_MB")
-    memory_reserve_mb: int = Field(1536, ge=0, alias="SUBTITLE_MEMORY_RESERVE_MB")
-    # Celery checks RSS after completion; this is not a live task memory limit.
-    celery_sub_max_memory_mb: int = Field(1536, ge=1, alias="CELERY_SUB_MAX_MEMORY_MB")
+    # Periodically recycle worker children after completed tasks to release
+    # cached native model/allocator state. This does not gate task admission.
     celery_sub_max_tasks_per_child: int = Field(20, ge=1, alias="CELERY_SUB_MAX_TASKS_PER_CHILD")
     external_whisper_base_url: str = Field("", alias="SUBTITLE_EXTERNAL_WHISPER_BASE_URL")
     external_whisper_api_key: str | None = Field(None, alias="SUBTITLE_EXTERNAL_WHISPER_API_KEY")

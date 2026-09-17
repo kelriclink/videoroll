@@ -227,11 +227,7 @@ def test_realtime_pages_have_no_periodic_api_polling() -> None:
         assert "setTimeout(load" not in source
 
 
-def test_render_queue_uses_only_a_bounded_admission_refresh_interval() -> None:
+def test_render_queue_uses_realtime_updates_without_resource_polling() -> None:
     source = Path("src/web/src/pages/RenderQueuePage.tsx").read_text(encoding="utf-8")
-    # Queue/job state is realtime. A low-frequency refresh remains necessary
-    # because memory admission is calculated inside the subtitle-service
-    # container and can change without a queue event.
-    assert source.count("setInterval") == 1
-    assert "10000" in source
-    assert "Resource availability can change without any job event" in source
+    assert "setInterval" not in source
+    assert "Resource availability can change without any job event" not in source

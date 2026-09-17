@@ -134,9 +134,6 @@ def test_offline_production_compose_keeps_runtime_tuning_environment() -> None:
     for key in (
         "SUBTITLE_WHISPER_CPU_THREADS",
         "SUBTITLE_WHISPER_NUM_WORKERS",
-        "SUBTITLE_LOCAL_ASR_MEMORY_MB",
-        "SUBTITLE_MEMORY_RESERVE_MB",
-        "CELERY_SUB_MAX_MEMORY_MB",
         "CELERY_SUB_MAX_TASKS_PER_CHILD",
     ):
         assert offline["x-subtitle-environment"][key] == normal["x-subtitle-environment"][key]
@@ -217,7 +214,7 @@ def test_playout_proxy_uses_dynamic_docker_dns_and_frame_ancestors() -> None:
     nginx = (ROOT / "src" / "web" / "nginx.conf").read_text(encoding="utf-8")
     assert "resolver 127.0.0.11" in nginx
     assert "proxy_pass $ffplayout_upstream;" in nginx
-    assert "frame-ancestors 'self' ${VIDEOROLL_PUBLIC_ORIGIN}" in nginx
+    assert "frame-ancestors 'self' http://$host:* https://$host:*" in nginx
 
 
 def test_web_proxy_preserves_outer_https_scheme_for_secure_cookies() -> None:

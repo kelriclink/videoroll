@@ -660,20 +660,8 @@ class TaskQueueItemRead(BaseModel):
     render_job_id: Optional[uuid.UUID] = None
     progress: int = 0
     error_message: Optional[str] = None
-    waiting_reason: Optional[str] = None
     created_at: datetime
     updated_at: datetime
-
-
-class TaskQueueAdmissionRead(BaseModel):
-    scope: str = Field("scheduler", description="Stats belong to this scheduler; workers also check their own containers")
-    effective_max_concurrency: int = 0
-    total_memory_mb: Optional[int] = None
-    available_memory_mb: Optional[int] = None
-    reserved_memory_mb: int = 0
-    reserve_memory_mb: int = 0
-    local_asr_memory_mb: int = 0
-    waiting_reason: Optional[str] = None
 
 
 class TaskQueueRead(BaseModel):
@@ -681,7 +669,6 @@ class TaskQueueRead(BaseModel):
     running_count: int = 0
     queued_count: int = 0
     tasks: list[TaskQueueItemRead] = Field(default_factory=list)
-    admission: Optional[TaskQueueAdmissionRead] = None
 
 
 class RenderQueueSettingsRead(BaseModel):

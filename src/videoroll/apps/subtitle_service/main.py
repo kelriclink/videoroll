@@ -116,7 +116,6 @@ from videoroll.apps.subtitle_service.dictionaries import (
     update_dictionary_source,
 )
 from videoroll.apps.subtitle_service.translate_settings_store import get_translate_settings, update_translate_settings
-from videoroll.apps.subtitle_service.memory_policy import load_memory_admission, local_asr_budget_mb, memory_wait_reason
 from videoroll.apps.subtitle_service.worker_concurrency import (
     live_leased_task_ids,
     sync_subtitle_worker_concurrency_for_task_queue_settings,
@@ -2004,31 +2003,11 @@ def _read_task_queue(db: Session, *, limit: int) -> TaskQueueRead:
             if len(queued_items) >= remaining:
                 break
 
-    admission = load_memory_admission(db, get_subtitle_settings(), now=now, task_lock_owner=TASK_QUEUE_LOCK_OWNER)
-    items = [*running_items, *queued_items]
-    waiting_job_ids = [
-        item.subtitle_job_id for item in items
-        if item.subtitle_job_id and item.stage in {"subtitle", "waiting_subtitle"}
-    ]
-    waiting_jobs = {
-        job.id: job for job in db.query(SubtitleJob).filter(
-            SubtitleJob.id.in_(waiting_job_ids), SubtitleJob.status == SubtitleJobStatus.queued,
-        ).all()
-    } if waiting_job_ids else {}
-    for item in items:
-        job = waiting_jobs.get(item.subtitle_job_id)
-        if job:
-            item.waiting_reason = memory_wait_reason(job) or admission.reason(item.task_id, admission.budget_for(job))
-        elif item.stage == "recover_pipeline":
-            budget = local_asr_budget_mb(admission.bootstrap_request, admission.defaults, admission.settings)
-            item.waiting_reason = admission.reason(item.task_id, budget)
-
     return TaskQueueRead(
         settings=TaskQueueSettingsRead(**cfg),
         running_count=running_count,
         queued_count=int(queued_count),
-        tasks=items,
-        admission=admission.summary(int(cfg.get("max_concurrency", 1))),
+        tasks=[*running_items, *queued_items],
     )
 
 

@@ -74,12 +74,6 @@ from videoroll.apps.subtitle_service.processing import (
 )
 from videoroll.apps.subtitle_service.asr_settings_store import get_asr_settings
 from videoroll.apps.subtitle_service.auto_profile_store import get_auto_profile
-from videoroll.apps.subtitle_service.memory_policy import (
-    MemoryAdmission,
-    load_memory_admission,
-    local_asr_budget_mb,
-    set_memory_wait_reason,
-)
 from videoroll.apps.subtitle_service.bilibili_tags_store import get_task_bilibili_summary, set_task_bilibili_tags
 from videoroll.apps.subtitle_service.model_downloads import (
     default_model_dir_name,
@@ -169,9 +163,8 @@ celery_app.conf.update(
     # Subtitle/render tasks are long-lived. Reserving four tasks per process
     # makes one worker hoard dozens of jobs and amplifies restart recovery.
     worker_prefetch_multiplier=1,
-    # Celery recycles the child only AFTER its current task returns. This
-    # releases cached native models/allocators without killing running work.
-    worker_max_memory_per_child=settings.celery_sub_max_memory_mb * 1024,
+    # Recycle children periodically so cached native models/allocators do not
+    # accumulate indefinitely across many completed tasks.
     worker_max_tasks_per_child=settings.celery_sub_max_tasks_per_child,
     beat_schedule={
         "subtitle-service-task-queue-tick": {
@@ -354,24 +347,6 @@ def _mark_queued_job_dispatched(job: SubtitleJob | RenderJob) -> None:
     # A retry already has progress=1, so SQLAlchemy's onupdate would otherwise
     # see no change and leave the previous dispatch timestamp in place.
     job.updated_at = _now()
-
-
-def _memory_admission(db: Session, now: datetime, *, scope: str = "scheduler") -> MemoryAdmission:
-    return load_memory_admission(
-        db, settings, now=now, task_lock_owner=TASK_QUEUE_LOCK_OWNER,
-        dispatched_progress=_JOB_DISPATCH_PROGRESS, scope=scope,
-    )
-
-
-def _reserve_subtitle_memory(admission: MemoryAdmission, job: SubtitleJob) -> str | None:
-    reason = admission.reserve(job.task_id, admission.budget_for(job))
-    set_memory_wait_reason(job, reason)
-    if reason:
-        # Only unclaimed queued work can lose a reservation. A broker delivery
-        # racing this update must pass the worker's transaction-protected check.
-        job.progress = 0
-        admission.reservations.pop(job.task_id, None)
-    return reason
 
 
 def _asr_cpu_threads(db: Session) -> int:
@@ -1042,8 +1017,8 @@ def process_job(self: Any, job_id: str) -> dict[str, str]:
         now = _now()
         if job.status == SubtitleJobStatus.running:
             return {"status": "in_progress", "detail": "running job awaits completion or lease recovery"}
-        # Serialize worker admission with dispatch, including duplicate broker
-        # deliveries and models whose settings changed after the dispatch tick.
+        # Serialize worker claiming with dispatch so duplicate broker deliveries
+        # cannot start the same queued job twice.
         _task_queue_lock_settings_row(db)
         db.refresh(job)
         db.refresh(task)
@@ -1056,20 +1031,6 @@ def process_job(self: Any, job_id: str) -> dict[str, str]:
                 return {"status": "in_progress", "detail": "running job awaits lease recovery"}
             _kick_task_queue(countdown=_TASK_QUEUE_REQUEUE_COUNTDOWN_SECONDS)
             return {"status": "queued", "detail": "waiting for task queue"}
-        admission = _memory_admission(db, now, scope="worker")
-        memory_reason = _reserve_subtitle_memory(admission, job)
-        if memory_reason:
-            _task_queue_unlock(task)
-            db.add(job)
-            db.add(task)
-            db.commit()
-            # A periodic tick retries queued work even if Redis is unavailable
-            # now. Broker failure must not turn memory waiting into job failure.
-            try:
-                _kick_task_queue(countdown=_TASK_QUEUE_REQUEUE_COUNTDOWN_SECONDS)
-            except Exception:
-                logger.warning("task queue wakeup failed while waiting for memory", exc_info=True)
-            return {"status": "queued", "detail": memory_reason}
         if task.lock_until is None or task.lock_until <= now:
             task.lock_until = _task_queue_expires_at(now)
             db.add(task)
@@ -2325,8 +2286,6 @@ def task_queue_tick() -> dict[str, Any]:
             .order_by(Task.lock_until.asc())
             .all()
         )
-        admission = _memory_admission(db, now)
-        memory_waiting = 0
         dispatch_retry_cutoff = now - _JOB_DISPATCH_RETRY_AFTER
 
         # Phase 1: advance locked tasks (start their next queued job if nothing is running).
@@ -2362,10 +2321,6 @@ def task_queue_tick() -> dict[str, Any]:
                 .first()
             )
             if sj and _queued_job_dispatch_due(sj, now):
-                if _reserve_subtitle_memory(admission, sj):
-                    db.add(sj)
-                    memory_waiting += 1
-                    continue
                 _mark_queued_job_dispatched(sj)
                 db.add(sj)
                 to_start.append(("subtitle", str(sj.id)))
@@ -2374,10 +2329,7 @@ def task_queue_tick() -> dict[str, Any]:
         # Phase 2: lock and start new tasks up to max_concurrency.
         running_tasks = len({task.id for task in locked_tasks} | live_job_task_ids)
         capacity = available_task_queue_capacity(max_conc, running_tasks)
-        memory_blocked_job_ids: set[uuid.UUID] = set()
-        # Scan past memory-blocked local models so lightweight/remote work can
-        # still use a task slot. Keep the database scan bounded per tick.
-        for _ in range(max(32, capacity * 4) if capacity else 0):
+        for _ in range(capacity):
             if available_task_queue_capacity(max_conc, running_tasks) <= 0:
                 break
             # Production sessions disable autoflush. Persist this tick's
@@ -2420,7 +2372,6 @@ def task_queue_tick() -> dict[str, Any]:
                 .join(Task, Task.id == SubtitleJob.task_id)
                 .filter(
                     SubtitleJob.status == SubtitleJobStatus.queued,
-                    SubtitleJob.id.notin_(memory_blocked_job_ids),
                     or_(SubtitleJob.progress != _JOB_DISPATCH_PROGRESS, SubtitleJob.updated_at <= dispatch_retry_cutoff),
                     Task.status.notin_([TaskStatus.canceled, TaskStatus.published]),
                     schedulable_unlocked,
@@ -2438,12 +2389,6 @@ def task_queue_tick() -> dict[str, Any]:
             if _task_queue_is_task_locked(task, now):
                 continue
             if task.lock_until and task.lock_until > now and task.lock_owner and task.lock_owner != TASK_QUEUE_LOCK_OWNER:
-                continue
-
-            if _reserve_subtitle_memory(admission, sj):
-                db.add(sj)
-                memory_blocked_job_ids.add(sj.id)
-                memory_waiting += 1
                 continue
 
             task.lock_owner = TASK_QUEUE_LOCK_OWNER
@@ -2482,11 +2427,6 @@ def task_queue_tick() -> dict[str, Any]:
                 if _task_has_queued_or_running_jobs(db, task.id):
                     continue
                 if _task_queue_is_task_locked(task, now):
-                    continue
-
-                bootstrap_budget = local_asr_budget_mb(admission.bootstrap_request, admission.defaults, settings)
-                if admission.reserve(task.id, bootstrap_budget):
-                    memory_waiting += 1
                     continue
 
                 task.lock_owner = TASK_QUEUE_LOCK_OWNER
@@ -2533,8 +2473,6 @@ def task_queue_tick() -> dict[str, Any]:
         "recovered_render": str(recovered_render),
         "recovered_pipeline": str(recovered_pipeline),
         "unlocked_expired": str(unlocked_expired),
-        "memory_waiting": str(memory_waiting),
-        "admission": admission.summary(max_conc),
     }
 
 
