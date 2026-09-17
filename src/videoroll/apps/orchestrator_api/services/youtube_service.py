@@ -214,10 +214,11 @@ def ingest_youtube_source(*, url: str, license: SourceLicense, proof_url: str | 
 def enqueue_auto_youtube_pipeline(task_id: uuid.UUID, *, auto_publish: bool | None) -> str:
     from videoroll.apps.subtitle_service.worker import celery_app
 
-    args: list[Any] = [str(task_id)]
-    if auto_publish is not None:
-        args.append({"auto_publish": bool(auto_publish)})
-    return str(celery_app.send_task("subtitle_service.auto_youtube_pipeline", args=args, queue="subtitle").id)
+    # auto_publish is retained in the public/internal call signature for
+    # compatibility, but automatic stages are runtime-configured boxes. Never
+    # freeze this intake value into the Celery message.
+    _ = auto_publish
+    return str(celery_app.send_task("subtitle_service.auto_youtube_pipeline", args=[str(task_id)], queue="subtitle").id)
 
 
 def start_auto_youtube_pipeline(*, url: str, license: SourceLicense, proof_url: str | None, auto_publish: bool | None, settings: OrchestratorSettings) -> AutoYouTubeResponse:
@@ -236,13 +237,13 @@ def start_auto_youtube_pipeline(*, url: str, license: SourceLicense, proof_url: 
         task_id=task_id,
         created_by=encode_auto_youtube_created_by(
             "auto_youtube",
-            auto_publish=auto_publish,
+            auto_publish=None,
             run_id=uuid.uuid4().hex,
         ),
     )
     return AutoYouTubeResponse(
         task_id=task_id,
-        pipeline_job_id=enqueue_auto_youtube_pipeline(task_id, auto_publish=auto_publish),
+        pipeline_job_id=enqueue_auto_youtube_pipeline(task_id, auto_publish=None),
         deduped=deduped,
         source_id=source_id,
     )

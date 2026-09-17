@@ -9,6 +9,7 @@ from videoroll.apps.subtitle_service.worker import (
     _build_after_render_publish_action,
     after_render_publish,
 )
+from videoroll.utils.auto_youtube import encode_auto_youtube_created_by, parse_auto_youtube_created_by
 
 
 class _FakeStore:
@@ -57,6 +58,39 @@ class AutoYouTubePipelineTests(unittest.TestCase):
         publisher_settings = publish_all.call_args.args[2]
         self.assertTrue(hasattr(publisher_settings, "bilibili_publisher_url"))
         self.assertTrue(hasattr(publisher_settings, "social_publisher_url"))
+
+    def test_after_render_publish_uses_current_box_not_legacy_auto_publish_snapshot(self) -> None:
+        task_id = uuid.uuid4()
+        render_job_id = uuid.uuid4()
+        render_job = MagicMock(task_id=task_id)
+        render_job.request_json = {
+            "runtime_profile": True,
+            "after_render": {"publish": True, "runtime_profile": True},
+        }
+        task = MagicMock(
+            id=task_id,
+            created_by=encode_auto_youtube_created_by("auto_youtube", auto_publish=True),
+        )
+        db = MagicMock()
+        db.get.side_effect = lambda model, _id: render_job if _id == render_job_id else task
+
+        with (
+            patch("videoroll.apps.subtitle_service.worker._ensure_db"),
+            patch("videoroll.apps.subtitle_service.worker._db", return_value=db),
+            patch("videoroll.apps.subtitle_service.worker.FileStore"),
+            patch(
+                "videoroll.apps.subtitle_service.worker.get_auto_profile",
+                return_value={"auto_publish": False, "auto_publish_platforms": ["bilibili"]},
+            ),
+            patch(
+                "videoroll.apps.orchestrator_api.services.publishing_service.publish_all",
+            ) as publish_all,
+        ):
+            result = after_render_publish.run(str(render_job_id))
+
+        self.assertEqual(result["status"], "skipped")
+        self.assertIn("current publish box", result["detail"])
+        publish_all.assert_not_called()
 
     def test_build_after_render_publish_action_returns_none_when_disabled(self) -> None:
         action = _build_after_render_publish_action(
@@ -133,6 +167,43 @@ class AutoYouTubePipelineTests(unittest.TestCase):
         )
 
         self.assertIsNone(action)
+
+    def test_auto_youtube_intake_does_not_freeze_auto_publish(self) -> None:
+        from videoroll.apps.orchestrator_api.services import youtube_service
+        from videoroll.db.models import SourceLicense
+
+        task_id = uuid.uuid4()
+        with (
+            patch.object(youtube_service, "ingest_youtube_source", return_value=(task_id, False, "source-1")),
+            patch.object(youtube_service, "enqueue_auto_youtube_pipeline", return_value="pipeline-1") as enqueue,
+            patch.object(youtube_service, "set_task_created_by") as set_created_by,
+        ):
+            result = youtube_service.start_auto_youtube_pipeline(
+                url="https://www.youtube.com/watch?v=demo",
+                license=SourceLicense.authorized,
+                proof_url="https://example.com/proof",
+                auto_publish=True,
+                settings=object(),  # type: ignore[arg-type]
+            )
+
+        self.assertEqual(result.pipeline_job_id, "pipeline-1")
+        created_by = set_created_by.call_args.kwargs["created_by"]
+        parsed = parse_auto_youtube_created_by(created_by)
+        self.assertIsNotNone(parsed)
+        self.assertIsNone(parsed["auto_publish"])
+        enqueue.assert_called_once_with(task_id, auto_publish=None)
+
+    def test_enqueue_auto_youtube_pipeline_never_sends_auto_publish_snapshot(self) -> None:
+        from videoroll.apps.orchestrator_api.services import youtube_service
+
+        task_id = uuid.uuid4()
+        with patch("videoroll.apps.subtitle_service.worker.celery_app.send_task") as send_task:
+            send_task.return_value.id = "celery-1"
+            result = youtube_service.enqueue_auto_youtube_pipeline(task_id, auto_publish=True)
+
+        self.assertEqual(result, "celery-1")
+        self.assertEqual(send_task.call_args.args[0], "subtitle_service.auto_youtube_pipeline")
+        self.assertEqual(send_task.call_args.kwargs["args"], [str(task_id)])
 
     def test_deduped_auto_youtube_does_not_enqueue_a_second_pipeline(self) -> None:
         from videoroll.apps.orchestrator_api.services import youtube_service

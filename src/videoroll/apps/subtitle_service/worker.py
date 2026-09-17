@@ -3033,7 +3033,6 @@ def _after_render_publish_impl(render_job_id: str) -> dict[str, Any]:
             return {"status": "error", "detail": "task not found"}
         req = rj.request_json if isinstance(rj.request_json, dict) else {}
         after_render = req.get("after_render") if isinstance(req.get("after_render"), dict) else {}
-        auto_meta = parse_auto_youtube_created_by(task.created_by)
         automatic_publish = _uses_runtime_auto_profile(task, req, after_render)
         store = FileStore(settings)
         store.ensure_ready()
@@ -3046,13 +3045,7 @@ def _after_render_publish_impl(render_job_id: str) -> dict[str, Any]:
 
         if automatic_publish:
             publish_profile = dict(get_auto_profile(db))
-            explicit_auto_publish = auto_meta.get("auto_publish") if auto_meta else None
-            publish_enabled = (
-                bool(explicit_auto_publish)
-                if explicit_auto_publish is not None
-                else bool(publish_profile.get("auto_publish"))
-            )
-            if not publish_enabled:
+            if not bool(publish_profile.get("auto_publish")):
                 return {"status": "skipped", "detail": "automatic publishing is disabled in the current publish box"}
             if not list(publish_profile.get("auto_publish_platforms") or []):
                 return {"status": "skipped", "detail": "no automatic publish platforms are selected"}
@@ -3692,8 +3685,7 @@ def auto_youtube_pipeline(self: Any, task_id: str, overrides: dict[str, Any] | N
                 "output": {"formats": ["srt"], "render": {}},
                 "output_prefix": f"sub/{tid}/",
                 # Always evaluate the publish box after the render boundary.
-                # Its current config (plus any explicit intake override) decides
-                # whether anything is actually submitted.
+                # Its current config decides whether anything is actually submitted.
                 "after_render": {"publish": True, "runtime_profile": True},
             }
 
@@ -3717,14 +3709,10 @@ def auto_youtube_pipeline(self: Any, task_id: str, overrides: dict[str, Any] | N
             _kick_task_queue()
             return _finish_pipeline({"status": "ok", "task_id": str(tid), "detail": f"queued subtitle job {job.id}"})
 
-        # A pre-existing final video can jump straight to the publish box.  Read
-        # its configuration now, after download/recovery work has completed.
+        # A pre-existing final video can jump straight to the publish box. Read
+        # only the configuration that exists when it reaches this box; legacy
+        # task metadata/Celery overrides are historical snapshots, not controls.
         profile = dict(get_auto_profile(db))
-        explicit_auto_publish = pipeline_meta.get("auto_publish")
-        if explicit_auto_publish is not None:
-            profile["auto_publish"] = bool(explicit_auto_publish)
-        elif isinstance(overrides, dict) and overrides.get("auto_publish") is not None:
-            profile["auto_publish"] = bool(overrides.get("auto_publish"))
         result_data: dict[str, Any] = {}
         auto_publish_platforms = list(profile.get("auto_publish_platforms") or [])
         if profile.get("auto_publish") and auto_publish_platforms:
