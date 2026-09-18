@@ -234,19 +234,19 @@ def test_build_auto_publish_after_render_uses_profile_platforms() -> None:
             },
         ),
         patch(
-            "videoroll.apps.orchestrator_api.services.publishing_service.read_s3_json_object",
+            "videoroll.apps.orchestrator_api.services.publishing_service.read_storage_json_object",
             return_value=None,
         ),
         patch(
             "videoroll.apps.orchestrator_api.services.publishing_service.build_task_publish_meta_draft",
             return_value={"title": "title"},
         ),
-        patch("videoroll.apps.orchestrator_api.services.publishing_service.write_s3_json"),
+        patch("videoroll.apps.orchestrator_api.services.publishing_service.write_storage_json"),
     ):
         action = build_auto_publish_after_render(
             task,
             db=MagicMock(),
-            s3=MagicMock(),
+            store=MagicMock(),
             publish_payload_overrides={"platforms": ["bilibili"]},
         )
 
@@ -259,7 +259,7 @@ def test_build_auto_publish_after_render_requires_selected_platforms() -> None:
         return_value={"auto_publish_platforms": []},
     ):
         try:
-            build_auto_publish_after_render(MagicMock(), db=MagicMock(), s3=MagicMock())
+            build_auto_publish_after_render(MagicMock(), db=MagicMock(), store=MagicMock())
         except HTTPException as exc:
             assert exc.status_code == 409
         else:
@@ -350,7 +350,7 @@ def test_publish_all_social_only_reviews_stored_platform_meta() -> None:
             return_value={"bilibili": False, "douyin": True},
         ),
         patch(
-            "videoroll.apps.orchestrator_api.services.publishing_service.read_s3_json_object",
+            "videoroll.apps.orchestrator_api.services.publishing_service.read_storage_json_object",
             return_value=stored_meta,
         ),
         patch(
@@ -418,7 +418,7 @@ def test_disabled_publish_review_skips_ai_even_with_failed_history() -> None:
             "videoroll.apps.orchestrator_api.services.publishing_service.review_publish_materials",
         ) as review,
     ):
-        result = run_task_publish_review(task, meta={"title": "title"}, db=MagicMock(), s3=MagicMock())
+        result = run_task_publish_review(task, meta={"title": "title"}, db=MagicMock(), store=MagicMock())
 
     assert result == {"enabled": False, **history}
     review.assert_not_called()

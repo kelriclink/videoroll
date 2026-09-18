@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
+
 import os
 import uuid
 from typing import Generator
@@ -42,7 +44,13 @@ def get_db(settings: SocialPublisherSettings = Depends(get_settings)) -> Generat
     yield from db_session(settings.database_url)
 
 
-app = FastAPI(title="videoroll-social-publisher", version="0.1.0")
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    _startup()
+    yield
+
+
+app = FastAPI(title="videoroll-social-publisher", version="0.1.0", lifespan=_lifespan)
 login_manager = BrowserLoginManager(get_social_publisher_settings())
 app.add_middleware(
     CORSMiddleware,
@@ -58,7 +66,6 @@ app.add_middleware(
 install_internal_service_auth(app, get_social_publisher_settings)
 
 
-@app.on_event("startup")
 def _startup() -> None:
     settings = get_social_publisher_settings()
     app.state.internal_service_token = service_token(settings)

@@ -8,7 +8,7 @@ from fastapi import APIRouter, Body, Depends, File, Form, Query, Request, Upload
 from fastapi.responses import Response
 from sqlalchemy.orm import Session
 
-from videoroll.apps.orchestrator_api.dependencies import get_db, get_s3, get_settings
+from videoroll.apps.orchestrator_api.dependencies import get_db, get_store, get_settings
 from videoroll.apps.orchestrator_api.schemas import (
     PublishActionRequest,
     PublishAllRequest,
@@ -31,7 +31,9 @@ from videoroll.storage.filesystem import FileStore
 router = APIRouter()
 
 
-@router.api_route("/bilibili/{service_path:path}", methods=["GET", "POST", "PUT"])
+@router.get("/bilibili/{service_path:path}", operation_id="proxy_bilibili_browser_get")
+@router.post("/bilibili/{service_path:path}", operation_id="proxy_bilibili_browser_post")
+@router.put("/bilibili/{service_path:path}", operation_id="proxy_bilibili_browser_put")
 async def proxy_bilibili_browser_operation(
     service_path: str,
     request: Request,
@@ -52,15 +54,15 @@ async def proxy_bilibili_browser_operation(
 
 
 @router.get("/tasks/{task_id}/publish_meta")
-def get_task_publish_meta(task_id: uuid.UUID, db: Session = Depends(get_db), s3: FileStore = Depends(get_s3)) -> dict[str, Any]:
-    return publishing_service.get_task_publish_meta(task_id, db, s3)
+def get_task_publish_meta(task_id: uuid.UUID, db: Session = Depends(get_db), store: FileStore = Depends(get_store)) -> dict[str, Any]:
+    return publishing_service.get_task_publish_meta(task_id, db, store)
 
 
 @router.get("/tasks/{task_id}/publish_meta/draft", response_model=PublishMetaDraftResponse)
 def get_task_publish_meta_draft(
-    task_id: uuid.UUID, db: Session = Depends(get_db), s3: FileStore = Depends(get_s3)
+    task_id: uuid.UUID, db: Session = Depends(get_db), store: FileStore = Depends(get_store)
 ) -> PublishMetaDraftResponse:
-    return PublishMetaDraftResponse(meta=publishing_service.get_task_publish_meta_draft(task_id, db, s3))
+    return PublishMetaDraftResponse(meta=publishing_service.get_task_publish_meta_draft(task_id, db, store))
 
 
 @router.post("/tasks/{task_id}/publish_meta/draft", response_model=PublishMetaDraftResponse)
@@ -68,19 +70,19 @@ def generate_task_publish_meta_draft(
     task_id: uuid.UUID,
     payload: PublishMetaDraftRequest,
     db: Session = Depends(get_db),
-    s3: FileStore = Depends(get_s3),
+    store: FileStore = Depends(get_store),
 ) -> PublishMetaDraftResponse:
     meta = publishing_service.generate_task_publish_meta_draft(
-        task_id, mode=payload.mode, base_meta=payload.meta, db=db, s3=s3
+        task_id, mode=payload.mode, base_meta=payload.meta, db=db, store=store
     )
     return PublishMetaDraftResponse(meta=meta)
 
 
 @router.put("/tasks/{task_id}/publish_meta")
 def put_task_publish_meta(
-    task_id: uuid.UUID, meta: dict[str, Any], db: Session = Depends(get_db), s3: FileStore = Depends(get_s3)
+    task_id: uuid.UUID, meta: dict[str, Any], db: Session = Depends(get_db), store: FileStore = Depends(get_store)
 ) -> dict[str, Any]:
-    return publishing_service.put_task_publish_meta(task_id, meta, db, s3)
+    return publishing_service.put_task_publish_meta(task_id, meta, db, store)
 
 
 @router.get("/tasks/{task_id}/publish_review", response_model=TaskPublishReviewRead)
@@ -93,9 +95,9 @@ def run_task_publish_review(
     task_id: uuid.UUID,
     payload: PublishReviewActionRequest,
     db: Session = Depends(get_db),
-    s3: FileStore = Depends(get_s3),
+    store: FileStore = Depends(get_store),
 ) -> TaskPublishReviewRead:
-    return TaskPublishReviewRead(**publishing_service.review_task_publish(task_id, payload.meta, db, s3))
+    return TaskPublishReviewRead(**publishing_service.review_task_publish(task_id, payload.meta, db, store))
 
 
 @router.get("/tasks/{task_id}/publish_jobs", response_model=list[PublishJobSummary])
@@ -188,9 +190,9 @@ def publish_all_platforms(
     payload: PublishAllRequest = Body(default_factory=PublishAllRequest),
     settings: OrchestratorSettings = Depends(get_settings),
     db: Session = Depends(get_db),
-    s3: FileStore = Depends(get_s3),
+    store: FileStore = Depends(get_store),
 ) -> PublishAllResultResponse:
-    return PublishAllResultResponse(**publishing_service.publish_all(task_id, payload, settings, db, s3))
+    return PublishAllResultResponse(**publishing_service.publish_all(task_id, payload, settings, db, store))
 
 @router.post("/tasks/{task_id}/actions/publish", response_model=RemotePublishResponse)
 def enqueue_publish_job(
@@ -198,6 +200,6 @@ def enqueue_publish_job(
     payload: PublishActionRequest,
     settings: OrchestratorSettings = Depends(get_settings),
     db: Session = Depends(get_db),
-    s3: FileStore = Depends(get_s3),
+    store: FileStore = Depends(get_store),
 ) -> RemotePublishResponse:
-    return publishing_service.enqueue_publish_job(task_id, payload, settings, db, s3)
+    return publishing_service.enqueue_publish_job(task_id, payload, settings, db, store)

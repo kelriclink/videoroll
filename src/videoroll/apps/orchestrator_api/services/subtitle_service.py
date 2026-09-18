@@ -256,7 +256,7 @@ def enqueue_subtitle_job(
     *,
     settings: OrchestratorSettings,
     db: Session,
-    s3: FileStore,
+    store: FileStore,
 ) -> RemoteJobResponse:
     task = db.get(Task, task_id)
     if not task:
@@ -299,7 +299,7 @@ def enqueue_subtitle_job(
         request["after_render"] = publishing_service.build_auto_publish_after_render(
             task,
             db=db,
-            s3=s3,
+            store=store,
             publish_payload_overrides=dict(payload.publish_payload or {}),
         )
     return enqueue_subtitle_service_job_request(settings, request)
@@ -337,7 +337,7 @@ def resume_recent_failed_tasks(
     limit: int,
     settings: OrchestratorSettings,
     db: Session,
-    s3: FileStore,
+    store: FileStore,
 ) -> RecentFailedResumeResponse:
     cutoff = utcnow() - timedelta(hours=window_hours)
     tasks = (
@@ -389,7 +389,7 @@ def resume_recent_failed_tasks(
             )
             continue
         try:
-            after_render = publishing_service.build_auto_publish_after_render(task, db=db, s3=s3)
+            after_render = publishing_service.build_auto_publish_after_render(task, db=db, store=store)
             request = build_resume_subtitle_request(task.id, db, after_render=after_render)
             remote = enqueue_subtitle_service_job_request(settings, request)
             resumed_count += 1

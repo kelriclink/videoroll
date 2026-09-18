@@ -43,7 +43,31 @@ from videoroll.apps.subtitle_service.dictionaries import (
     lookup_dictionary_entries,
 )
 from videoroll.apps.subtitle_service.embeddings import EmbeddingSettings, assert_embedding_dimensions, embed_text
+from videoroll.apps.subtitle_service.rag_evidence import (
+    clean_searxng_csv as _clean_searxng_csv,
+    clean_searxng_language as _clean_searxng_language,
+    clean_searxng_pageno as _clean_searxng_pageno,
+    clean_searxng_safesearch as _clean_searxng_safesearch,
+    clean_searxng_time_range as _clean_searxng_time_range,
+    collapse_text as _collapse_text,
+    extract_page_text as _extract_page_text,
+    filter_search_results as _filter_search_results,
+    is_fetchable_url as _is_fetchable_url,
+    is_search_engine_internal_url as _is_search_engine_internal_url,
+    normalize_result_url as _normalize_result_url,
+    normalize_wiki_api_url,
+    parse_search_html as _parse_search_html,
+    parse_search_json as _parse_search_json,
+    search_endpoint_from_base as _search_endpoint_from_base,
+    search_endpoint_has_param as _search_endpoint_has_param,
+    search_url_with_params as _search_url_with_params,
+    searxng_search_params as _searxng_search_params,
+    strip_html as _strip_html,
+    url_with_params as _url_with_params,
+    wiki_page_url as _wiki_page_url,
+)
 from videoroll.apps.subtitle_service.processing import Segment
+from videoroll.apps.subtitle_service.translation_trace import TranslationTraceRecorder
 from videoroll.apps.subtitle_service.retrieval import RetrievalPipeline
 from videoroll.config import get_subtitle_settings
 from videoroll.realtime import publish_agent_event
@@ -53,14 +77,6 @@ _TERM_SPLIT_RE = re.compile(r"[\s\-_]+")
 _CANDIDATE_RE = re.compile(r"\b[A-Za-z][A-Za-z0-9][A-Za-z0-9'._:+#/-]*(?:\s+[A-Za-z0-9][A-Za-z0-9'._:+#/-]*){0,3}\b")
 _WORD_TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9'._:+#/-]*")
 _CJK_TOKEN_RE = re.compile(r"[\u3400-\u9fff]{2,}")
-_SCRIPT_STYLE_RE = re.compile(r"<(script|style|noscript)\b[^>]*>.*?</\1>", re.IGNORECASE | re.DOTALL)
-_TAG_RE = re.compile(r"<[^>]+>")
-_ARTICLE_RE = re.compile(r"<(?:article|div)\b[^>]*class=[\"'][^\"']*\bresult\b[^\"']*[\"'][^>]*>.*?</(?:article|div)>", re.IGNORECASE | re.DOTALL)
-_ANCHOR_RE = re.compile(r"<a\b[^>]*href=[\"']([^\"']+)[\"'][^>]*>(.*?)</a>", re.IGNORECASE | re.DOTALL)
-_SEARXNG_UI_TEXT_RE = re.compile(
-    r"(my searxng|about preferences|preferences\s+search syntax|default language|clear\s+search\s+general)",
-    re.IGNORECASE,
-)
 _SINGLE_LETTER_RE = re.compile(r"^[A-Za-z]$")
 _MATH_LOGIC_DOMAIN_RE = re.compile(r"(logic|math|数学|逻辑|命题|proposition|propositional)", re.IGNORECASE)
 _AUTO_APPROVE_CONFIDENCE_THRESHOLD = 0.9
@@ -609,82 +625,6 @@ def _tool_specs_for_active_skills(registry: ToolRegistry, active_skills: list[Ag
     return available_tool_specs, available_tools
 
 
-_SEARXNG_TIME_RANGES = {"", "day", "month", "year"}
-
-
-def _clean_searxng_csv(value: Any, *, default: str = "", limit: int = 20) -> str:
-    raw_items = str(value or default or "").replace("\n", ",").split(",")
-    out: list[str] = []
-    seen: set[str] = set()
-    for item in raw_items:
-        clean = " ".join(str(item or "").strip().split())
-        if not clean:
-            continue
-        key = clean.lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(clean[:80])
-        if len(out) >= limit:
-            break
-    return ",".join(out)
-
-
-def _clean_searxng_language(value: Any) -> str:
-    clean = str(value or "all").strip()
-    return (clean or "all")[:32]
-
-
-def _clean_searxng_safesearch(value: Any) -> int:
-    try:
-        return max(0, min(2, int(value if value is not None else 0)))
-    except Exception:
-        return 0
-
-
-def _clean_searxng_time_range(value: Any) -> str:
-    clean = str(value or "").strip().lower()
-    return clean if clean in _SEARXNG_TIME_RANGES else ""
-
-
-def _searxng_search_params(
-    *,
-    categories: str = "general",
-    engines: str = "",
-    language: str = "all",
-    safesearch: int = 0,
-    time_range: str = "",
-    pageno: int = 1,
-) -> dict[str, str]:
-    params: dict[str, str] = {}
-    clean_categories = _clean_searxng_csv(categories, default="general")
-    clean_engines = _clean_searxng_csv(engines, default="")
-    clean_language = _clean_searxng_language(language)
-    clean_time_range = _clean_searxng_time_range(time_range)
-    if clean_categories:
-        params["categories"] = clean_categories
-    if clean_engines:
-        params["engines"] = clean_engines
-    if clean_language:
-        params["language"] = clean_language
-    params["safesearch"] = str(_clean_searxng_safesearch(safesearch))
-    if clean_time_range:
-        params["time_range"] = clean_time_range
-    try:
-        clean_pageno = max(1, min(100, int(pageno or 1)))
-    except Exception:
-        clean_pageno = 1
-    params["pageno"] = str(clean_pageno)
-    return params
-
-
-def _clean_searxng_pageno(value: Any) -> int:
-    try:
-        return max(1, min(100, int(value or 1)))
-    except Exception:
-        return 1
-
-
 def rag_settings_from_translate_settings(settings: dict[str, Any]) -> RagSettings:
     return RagSettings(
         enabled=bool(settings.get("rag_enabled")),
@@ -789,42 +729,6 @@ def _block_lookup_candidates_from_text(text_value: str, *, limit: int = 96) -> l
     return out
 
 
-def normalize_wiki_api_url(raw_url: str) -> str:
-    raw = str(raw_url or "").strip()
-    if not raw:
-        return ""
-    if "://" not in raw:
-        raw = f"https://{raw}"
-    parsed = urlparse(raw)
-    path = parsed.path.rstrip("/")
-    if not path:
-        path = "/w/api.php"
-    elif path.endswith("/api.php"):
-        path = path
-    elif "/wiki/" in path:
-        prefix = path.split("/wiki/", 1)[0].rstrip("/")
-        path = f"{prefix}/w/api.php" if prefix else "/w/api.php"
-    elif path.endswith("/wiki"):
-        prefix = path[: -len("/wiki")].rstrip("/")
-        path = f"{prefix}/w/api.php" if prefix else "/w/api.php"
-    else:
-        path = f"{path}/w/api.php"
-    return urlunparse(parsed._replace(path=path, query="", fragment=""))
-
-
-def _wiki_page_url(api_url: str, title: str) -> str:
-    parsed = urlparse(normalize_wiki_api_url(api_url))
-    path = parsed.path
-    if path.endswith("/w/api.php"):
-        root = path[: -len("/w/api.php")]
-    elif path.endswith("/api.php"):
-        root = path[: -len("/api.php")]
-    else:
-        root = ""
-    page_path = f"{root.rstrip('/')}/wiki/{quote(str(title or '').strip().replace(' ', '_'))}"
-    return urlunparse(parsed._replace(path=page_path, query="", fragment=""))
-
-
 def build_knowledge_embedding_text(
     *,
     item_type: str,
@@ -885,24 +789,6 @@ def _duration_ms(start: float) -> int:
     return max(0, int((time.perf_counter() - start) * 1000))
 
 
-def _strip_html(value: str) -> str:
-    text_value = _SCRIPT_STYLE_RE.sub(" ", str(value or ""))
-    text_value = re.sub(r"<br\s*/?>", "\n", text_value, flags=re.IGNORECASE)
-    text_value = _TAG_RE.sub(" ", text_value)
-    text_value = html.unescape(text_value)
-    text_value = re.sub(r"[ \t\r\f\v]+", " ", text_value)
-    text_value = re.sub(r"\n\s+", "\n", text_value)
-    return text_value.strip()
-
-
-def _collapse_text(value: str, *, limit: int = 12000) -> str:
-    text_value = html.unescape(str(value or ""))
-    text_value = re.sub(r"[ \t\r\f\v]+", " ", text_value)
-    text_value = re.sub(r"\n{3,}", "\n\n", text_value)
-    text_value = text_value.strip()
-    return text_value[:limit]
-
-
 def _context_for_llm(text_value: str, *, previous_summary: str = "", limit: int = 9000) -> str:
     current = str(text_value or "").strip()
     summary = str(previous_summary or "").strip()
@@ -911,119 +797,6 @@ def _context_for_llm(text_value: str, *, previous_summary: str = "", limit: int 
     else:
         combined = current
     return combined[:limit]
-
-
-def _search_endpoint_from_base(search_base_url: str) -> str:
-    raw = str(search_base_url or "").strip()
-    if not raw:
-        return ""
-    if "://" not in raw:
-        raw = f"https://{raw}"
-    parsed = urlparse(raw)
-    params = [(k, v) for k, v in parse_qsl(parsed.query, keep_blank_values=True) if k not in {"q", "format"}]
-    path = parsed.path.rstrip("/")
-    if not path:
-        path = "/search"
-    elif path.endswith("/search"):
-        path = path
-    else:
-        path = f"{path}/search"
-    return urlunparse(parsed._replace(path=path, query=urlencode(params)))
-
-
-def _search_url_with_params(
-    search_base_url: str,
-    *,
-    query: str,
-    json_format: bool,
-    extra_params: dict[str, str] | None = None,
-) -> str:
-    endpoint = _search_endpoint_from_base(search_base_url)
-    parsed = urlparse(endpoint)
-    params = [(k, v) for k, v in parse_qsl(parsed.query, keep_blank_values=True) if k not in {"q", "format"}]
-    existing_names = {k for k, _v in params}
-    for key, value in (extra_params or {}).items():
-        if key in {"q", "format"} or key in existing_names:
-            continue
-        params.append((key, value))
-    params.append(("q", query))
-    if json_format:
-        params.append(("format", "json"))
-    return urlunparse(parsed._replace(query=urlencode(params)))
-
-
-def _search_endpoint_has_param(search_base_url: str, name: str) -> bool:
-    endpoint = _search_endpoint_from_base(search_base_url)
-    parsed = urlparse(endpoint)
-    return any(k == name for k, _v in parse_qsl(parsed.query, keep_blank_values=True))
-
-
-def _normalize_result_url(raw_url: str, *, base_url: str) -> str:
-    url = html.unescape(str(raw_url or "").strip())
-    if not url:
-        return ""
-    parsed = urlparse(url)
-    if parsed.scheme in {"http", "https"}:
-        return url
-    if url.startswith("//"):
-        return f"https:{url}"
-    return urljoin(base_url, url)
-
-
-def _is_search_engine_internal_url(url: str, *, search_url: str) -> bool:
-    parsed = urlparse(str(url or "").strip())
-    search_parsed = urlparse(_search_endpoint_from_base(search_url))
-    hostname = (parsed.hostname or "").lower()
-    if hostname in {"searx.space", "www.searx.space"}:
-        return True
-    if not parsed.netloc or not search_parsed.netloc:
-        return False
-    if parsed.netloc.lower() != search_parsed.netloc.lower():
-        return False
-    path = parsed.path.rstrip("/").lower()
-    search_path = search_parsed.path.rstrip("/").lower()
-    search_root = search_path[: -len("/search")] if search_path.endswith("/search") else ""
-    if path in {"", "/"}:
-        return True
-    if search_root and path == search_root:
-        return True
-    return (
-        path == search_path
-        or path.startswith(f"{search_root}/info")
-        or path.startswith(f"{search_root}/preferences")
-        or path.startswith(f"{search_root}/stats")
-        or path.startswith(f"{search_root}/config")
-        or path.startswith(f"{search_root}/about")
-    )
-
-
-def _is_fetchable_url(url: str) -> bool:
-    try:
-        parsed = urlparse(str(url or "").strip())
-        port = parsed.port
-    except ValueError:
-        return False
-    expected_port = {"http": 80, "https": 443}.get(parsed.scheme.lower())
-    if expected_port is None or not parsed.hostname:
-        return False
-    if parsed.username is not None or parsed.password is not None:
-        return False
-    if port is not None and port != expected_port:
-        return False
-    return True
-
-
-def _url_with_params(url: str, params: dict[str, Any] | None) -> str:
-    if not params:
-        return url
-    parsed = urlparse(url)
-    pairs = list(parse_qsl(parsed.query, keep_blank_values=True))
-    for name, value in params.items():
-        if isinstance(value, (list, tuple)):
-            pairs.extend((str(name), str(item)) for item in value)
-        else:
-            pairs.append((str(name), str(value)))
-    return urlunparse(parsed._replace(query=urlencode(pairs, doseq=True)))
 
 
 class _PublicFetchClient:
@@ -1083,107 +856,6 @@ def _safe_public_get(client: Any, url: str, *, max_redirects: int = 5) -> Any:
         return client.get(url, redirects=max_redirects)
     except TypeError:
         return client.get(url)
-
-
-def _parse_search_json(data: Any) -> list[dict[str, Any]]:
-    raw_results = data.get("results") if isinstance(data, dict) else None
-    if raw_results is None and isinstance(data, list):
-        raw_results = data
-    if not isinstance(raw_results, list):
-        return []
-
-    out: list[dict[str, Any]] = []
-    for item in raw_results[:10]:
-        if not isinstance(item, dict):
-            continue
-        title = str(item.get("title") or item.get("name") or "").strip()
-        url = str(item.get("url") or item.get("link") or "").strip()
-        snippet = str(item.get("snippet") or item.get("content") or item.get("description") or "").strip()
-        if not title and not snippet:
-            continue
-        if _SEARXNG_UI_TEXT_RE.search(" ".join([title, snippet])):
-            continue
-        out.append({"title": _strip_html(title), "url": url, "snippet": _strip_html(snippet)[:800]})
-    return out
-
-
-def _filter_search_results(results: list[dict[str, Any]], *, search_url: str) -> list[dict[str, Any]]:
-    out: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    for item in results:
-        url = str(item.get("url") or "").strip()
-        title = str(item.get("title") or "").strip()
-        snippet = str(item.get("snippet") or "").strip()
-        if not url:
-            continue
-        if _is_search_engine_internal_url(url, search_url=search_url):
-            continue
-        if _SEARXNG_UI_TEXT_RE.search(" ".join([title, snippet])):
-            continue
-        if title.lower() in {"about", "preferences", "search syntax"} and "searxng" in snippet.lower():
-            continue
-        if url in seen:
-            continue
-        seen.add(url)
-        out.append({"title": title, "url": url, "snippet": snippet[:800]})
-        if len(out) >= 8:
-            break
-    return out
-
-
-def _parse_search_html(html_value: str, *, base_url: str) -> list[dict[str, Any]]:
-    source = str(html_value or "")
-    chunks = _ARTICLE_RE.findall(source)
-    if not chunks:
-        chunks = re.findall(r"<article\b[^>]*>.*?</article>", source, flags=re.IGNORECASE | re.DOTALL)
-
-    out: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    for chunk in chunks[:20]:
-        anchors = _ANCHOR_RE.findall(chunk)
-        if not anchors:
-            continue
-        title = ""
-        url = ""
-        for href, label_html in anchors:
-            candidate_url = _normalize_result_url(href, base_url=base_url)
-            if not candidate_url:
-                continue
-            if _is_search_engine_internal_url(candidate_url, search_url=base_url):
-                continue
-            parsed = urlparse(candidate_url)
-            if parsed.scheme not in {"http", "https"}:
-                continue
-            clean_label = _strip_html(label_html)
-            if not clean_label:
-                continue
-            if clean_label.lower() in {"about", "preferences", "search syntax"}:
-                continue
-            title = clean_label[:300]
-            url = candidate_url
-            break
-        if not title or not url or url in seen:
-            continue
-        seen.add(url)
-        text_value = _strip_html(chunk)
-        snippet = text_value.replace(title, "", 1).strip()
-        out.append({"title": title, "url": url, "snippet": snippet[:800]})
-        if len(out) >= 8:
-            break
-    return out
-
-
-def _extract_page_text(html_value: str) -> str:
-    source = _SCRIPT_STYLE_RE.sub(" ", str(html_value or ""))
-    title_match = re.search(r"<title\b[^>]*>(.*?)</title>", source, flags=re.IGNORECASE | re.DOTALL)
-    title = _strip_html(title_match.group(1)) if title_match else ""
-    main_match = re.search(r"<main\b[^>]*>(.*?)</main>", source, flags=re.IGNORECASE | re.DOTALL)
-    article_match = re.search(r"<article\b[^>]*>(.*?)</article>", source, flags=re.IGNORECASE | re.DOTALL)
-    body_match = re.search(r"<body\b[^>]*>(.*?)</body>", source, flags=re.IGNORECASE | re.DOTALL)
-    body = (article_match or main_match or body_match)
-    body_text = _strip_html(body.group(1) if body else source)
-    joined = "\n\n".join([x for x in [title, body_text] if x])
-    return _collapse_text(joined, limit=12000)
 
 
 def _start_agent_run(
@@ -1435,6 +1107,15 @@ def _finish_agent_run(
         db.rollback()
 
 
+def translation_trace_recorder(db: Session) -> TranslationTraceRecorder:
+    return TranslationTraceRecorder(
+        db=db,
+        start_run=_start_agent_run,
+        append_step=_append_agent_step,
+        finish_run=_finish_agent_run,
+    )
+
+
 def start_translation_thinking_run(
     db: Session,
     *,
@@ -1444,31 +1125,13 @@ def start_translation_thinking_run(
     model: str,
     segment_count: int,
 ) -> str:
-    """Create the persistent Dashboard run for a streaming subtitle Think call."""
-
-    run_id = _start_agent_run(
-        db,
-        agent_type="subtitle_translation_thinking",
-        term="字幕翻译 Think",
-        domain="subtitle_translation",
-        target_lang=target_lang,
+    return translation_trace_recorder(db).start_thinking_run(
         task_id=task_id,
         subtitle_job_id=subtitle_job_id,
-        query=f"{segment_count} segments · {model or 'OpenAI-compatible model'}",
+        target_lang=target_lang,
+        model=model,
+        segment_count=segment_count,
     )
-    _append_agent_step(
-        db,
-        run_id,
-        {
-            "kind": "llm",
-            "action": "translation_thinking.started",
-            "status": "running",
-            "model": model,
-            "input": {"segment_count": max(0, int(segment_count)), "thinking": True, "stream": True},
-            "metadata": {"thinking": True, "stream": True},
-        },
-    )
-    return run_id
 
 
 def append_translation_thinking_delta(
@@ -1481,21 +1144,13 @@ def append_translation_thinking_delta(
     batch_size: int,
     truncated: bool = False,
 ) -> None:
-    clean_delta = str(delta or "")
-    if not clean_delta:
-        return
-    _append_agent_step(
-        db,
+    translation_trace_recorder(db).append_thinking_delta(
         run_id,
-        {
-            "kind": "llm",
-            "action": "translation_thinking.delta",
-            "status": "running",
-            "model": model,
-            "input": {"batch_start": max(1, int(batch_start)), "batch_size": max(1, int(batch_size))},
-            "output": {"thinking_delta": clean_delta[:8000]},
-            "metadata": {"thinking": True, "stream": True, "truncated": bool(truncated)},
-        },
+        model=model,
+        delta=delta,
+        batch_start=batch_start,
+        batch_size=batch_size,
+        truncated=truncated,
     )
 
 
@@ -1508,311 +1163,45 @@ def finish_translation_thinking_run(
     thought_characters: int,
     error: str = "",
 ) -> None:
-    _finish_agent_run(
-        db,
+    translation_trace_recorder(db).finish_thinking_run(
         run_id,
         status=status,
+        completed_segments=completed_segments,
+        thought_characters=thought_characters,
         error=error,
-        result={
-            "completed_segments": max(0, int(completed_segments)),
-            "thought_characters": max(0, int(thought_characters)),
-            "thinking": True,
-        },
     )
 
 
-def _translation_trace_blocks(
-    segments: Iterable[Segment],
-    *,
-    start_index: int,
-    character_limit: int,
-) -> tuple[list[dict[str, Any]], bool]:
-    rows: list[dict[str, Any]] = []
-    used = 0
-    truncated = False
-    for offset, segment in enumerate(segments):
-        text_value = str(segment.text or "")
-        remaining = max(0, int(character_limit) - used)
-        if remaining <= 0:
-            truncated = True
-            break
-        if len(text_value) > remaining:
-            text_value = text_value[:remaining]
-            truncated = True
-        rows.append({"idx": int(start_index) + offset, "text": text_value})
-        used += len(text_value)
-    return rows, truncated
+def start_translation_session(db: Session, **kwargs: Any) -> str:
+    return translation_trace_recorder(db).start_session(**kwargs)
 
 
-def start_translation_session(
-    db: Session,
-    *,
-    task_id: str,
-    subtitle_job_id: str,
-    target_lang: str,
-    model: str,
-    segment_count: int,
-    resumed_segments: int = 0,
-    retry_attempt: int = 0,
-    thinking_enabled: bool = False,
-) -> str:
-    """Create the top-level run that owns one subtitle translation attempt."""
-
-    run_id = _start_agent_run(
-        db,
-        agent_type="subtitle_translation_session",
-        term=f"字幕翻译 Session · {max(0, int(segment_count))} 段",
-        domain="subtitle_translation",
-        target_lang=target_lang,
-        task_id=task_id,
-        subtitle_job_id=subtitle_job_id,
-        query=f"{max(0, int(segment_count))} segments · {model or 'OpenAI-compatible model'}",
-    )
-    _append_agent_step(
-        db,
-        run_id,
-        {
-            "kind": "agent",
-            "action": "translation_session.started",
-            "status": "running",
-            "model": model,
-            "input": {
-                "segment_count": max(0, int(segment_count)),
-                "resumed_segments": max(0, int(resumed_segments)),
-                "retry_attempt": max(0, int(retry_attempt)),
-                "thinking": bool(thinking_enabled),
-            },
-            "metadata": {"stream": bool(thinking_enabled), "thinking": bool(thinking_enabled)},
-        },
-    )
-    return run_id
-
-
-def start_translation_batch(
-    db: Session,
-    *,
-    parent_session_run_id: str,
-    task_id: str,
-    subtitle_job_id: str,
-    target_lang: str,
-    model: str,
-    batch_number: int,
-    segment_start: int,
-    source_segments: list[Segment],
-    previous_summary: str = "",
-    thinking_enabled: bool = False,
-) -> str:
-    """Create one real model-request batch below a translation session."""
-
-    segment_count = len(source_segments)
-    segment_end = max(int(segment_start), int(segment_start) + max(0, segment_count) - 1)
-    run_id = _start_agent_run(
-        db,
-        agent_type="subtitle_translation_batch",
-        term=f"Batch {max(1, int(batch_number))} · 字幕 {max(1, int(segment_start))}–{segment_end}",
-        domain="subtitle_translation",
-        target_lang=target_lang,
-        task_id=task_id,
-        subtitle_job_id=subtitle_job_id,
-        query=f"{segment_count} segments · {model or 'OpenAI-compatible model'}",
-        parent_agent_run_id=parent_session_run_id,
-    )
-    source_blocks, source_truncated = _translation_trace_blocks(
-        source_segments,
-        start_index=max(1, int(segment_start)),
-        character_limit=12_000,
-    )
-    _append_agent_step(
-        db,
-        run_id,
-        {
-            "kind": "agent",
-            "action": "translation_batch.started",
-            "status": "running",
-            "model": model,
-            "input": {
-                "batch_number": max(1, int(batch_number)),
-                "segment_start": max(1, int(segment_start)),
-                "segment_end": segment_end,
-                "segment_count": segment_count,
-                "source_blocks": source_blocks,
-                "previous_summary": str(previous_summary or "")[:500],
-            },
-            "metadata": {
-                "thinking": bool(thinking_enabled),
-                "stream": bool(thinking_enabled),
-                "source_truncated": source_truncated,
-            },
-        },
-    )
-    _append_agent_step(
-        db,
-        parent_session_run_id,
-        {
-            "kind": "agent",
-            "action": "translation_session.batch_started",
-            "status": "running",
-            "input": {
-                "batch_run_id": run_id,
-                "batch_number": max(1, int(batch_number)),
-                "segment_start": max(1, int(segment_start)),
-                "segment_end": segment_end,
-            },
-        },
-    )
-    return run_id
+def start_translation_batch(db: Session, **kwargs: Any) -> str:
+    return translation_trace_recorder(db).start_batch(**kwargs)
 
 
 def append_translation_batch_thinking_delta(
     db: Session,
     run_id: str | None,
-    *,
-    model: str,
-    delta: str,
-    batch_start: int,
-    batch_size: int,
-    truncated: bool = False,
+    **kwargs: Any,
 ) -> None:
-    append_translation_thinking_delta(
-        db,
-        run_id,
-        model=model,
-        delta=delta,
-        batch_start=batch_start,
-        batch_size=batch_size,
-        truncated=truncated,
-    )
+    translation_trace_recorder(db).append_batch_thinking_delta(run_id, **kwargs)
 
 
 def finish_translation_batch(
     db: Session,
     run_id: str | None,
-    *,
-    parent_session_run_id: str | None,
-    status: str,
-    batch_number: int,
-    segment_start: int,
-    requested_segments: int,
-    translated_segments: list[Segment] | None = None,
-    completed_segments: int = 0,
-    updated_summary: str = "",
-    thought_characters: int = 0,
-    thought_truncated: bool = False,
-    duration_ms: int | None = None,
-    error: str = "",
+    **kwargs: Any,
 ) -> None:
-    translated = list(translated_segments or [])
-    translation_blocks, translation_truncated = _translation_trace_blocks(
-        translated,
-        start_index=max(1, int(segment_start)),
-        character_limit=32_000,
-    )
-    action = "translation_batch.completed" if status == "succeeded" else "translation_batch.failed"
-    _append_agent_step(
-        db,
-        run_id,
-        {
-            "kind": "llm",
-            "action": action,
-            "status": "ok" if status == "succeeded" else "failed",
-            "duration_ms": duration_ms,
-            "output": {
-                "translations": translation_blocks,
-                "updated_summary": str(updated_summary or "")[:500],
-                "completed_segments": max(0, int(completed_segments)),
-            },
-            "error": str(error or "")[:1000],
-            "metadata": {
-                "requested_segments": max(0, int(requested_segments)),
-                "translated_segments": len(translated),
-                "translation_truncated": translation_truncated,
-                "thought_characters": max(0, int(thought_characters)),
-                "thought_truncated": bool(thought_truncated),
-            },
-        },
-    )
-    _finish_agent_run(
-        db,
-        run_id,
-        status=status,
-        error=error,
-        result={
-            "batch_number": max(1, int(batch_number)),
-            "segment_start": max(1, int(segment_start)),
-            "segment_end": max(0, int(segment_start) + len(translated) - 1),
-            "requested_segments": max(0, int(requested_segments)),
-            "translated_segments": len(translated),
-            "completed_segments": max(0, int(completed_segments)),
-            "thought_characters": max(0, int(thought_characters)),
-            "thought_truncated": bool(thought_truncated),
-            "updated_summary": str(updated_summary or "")[:500],
-        },
-    )
-    _append_agent_step(
-        db,
-        parent_session_run_id,
-        {
-            "kind": "agent",
-            "action": "translation_session.batch_completed" if status == "succeeded" else "translation_session.batch_failed",
-            "status": "ok" if status == "succeeded" else "failed",
-            "output": {
-                "batch_run_id": run_id,
-                "batch_number": max(1, int(batch_number)),
-                "completed_segments": max(0, int(completed_segments)),
-                "translated_segments": len(translated),
-            },
-            "error": str(error or "")[:1000],
-        },
-    )
+    translation_trace_recorder(db).finish_batch(run_id, **kwargs)
 
 
 def finish_translation_session(
     db: Session,
     run_id: str | None,
-    *,
-    status: str,
-    total_segments: int,
-    completed_segments: int,
-    resumed_segments: int,
-    batch_count: int,
-    succeeded_batches: int,
-    failed_batches: int,
-    thought_characters: int,
-    error: str = "",
+    **kwargs: Any,
 ) -> None:
-    _append_agent_step(
-        db,
-        run_id,
-        {
-            "kind": "agent",
-            "action": "translation_session.completed" if status == "succeeded" else "translation_session.failed",
-            "status": "ok" if status == "succeeded" else "failed",
-            "output": {
-                "total_segments": max(0, int(total_segments)),
-                "completed_segments": max(0, int(completed_segments)),
-                "batch_count": max(0, int(batch_count)),
-                "succeeded_batches": max(0, int(succeeded_batches)),
-                "failed_batches": max(0, int(failed_batches)),
-                "thought_characters": max(0, int(thought_characters)),
-            },
-            "error": str(error or "")[:1000],
-        },
-    )
-    _finish_agent_run(
-        db,
-        run_id,
-        status=status,
-        error=error,
-        result={
-            "total_segments": max(0, int(total_segments)),
-            "completed_segments": max(0, int(completed_segments)),
-            "resumed_segments": max(0, int(resumed_segments)),
-            "batch_count": max(0, int(batch_count)),
-            "succeeded_batches": max(0, int(succeeded_batches)),
-            "failed_batches": max(0, int(failed_batches)),
-            "thought_characters": max(0, int(thought_characters)),
-        },
-    )
+    translation_trace_recorder(db).finish_session(run_id, **kwargs)
 
 
 def _row_to_hit(row: Any) -> RagHit:

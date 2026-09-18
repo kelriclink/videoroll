@@ -88,7 +88,7 @@ def test_publish_action_rejects_a_platform_that_is_not_checked() -> None:
             PublishActionRequest(platform="douyin", account_id=str(uuid.uuid4())),
             settings=Mock(),
             db=db,
-            s3=Mock(),
+            store=Mock(),
         )
 
     assert exc_info.value.status_code == 409
@@ -122,7 +122,7 @@ def test_disabled_publish_review_does_not_block_manual_publish_with_failed_histo
             "videoroll.apps.orchestrator_api.services.publishing_service.build_publish_gateway_request",
             return_value=request,
         ),
-        patch("videoroll.apps.orchestrator_api.services.publishing_service.write_s3_json"),
+        patch("videoroll.apps.orchestrator_api.services.publishing_service.write_storage_json"),
         patch(
             "videoroll.apps.orchestrator_api.services.publishing_service.run_task_publish_review",
             return_value={"enabled": False, "checked": True, "ok": False, "reason": "old rejection"},
@@ -142,7 +142,7 @@ def test_disabled_publish_review_does_not_block_manual_publish_with_failed_histo
             ),
             settings=Mock(),
             db=db,
-            s3=Mock(),
+            store=Mock(),
         )
 
     assert response.state == "submitted"

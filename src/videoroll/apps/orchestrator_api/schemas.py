@@ -4,7 +4,7 @@ import uuid
 from datetime import datetime
 from typing import Any, Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from videoroll.db.models import SourceLicense, SourceType, TaskStatus
 
@@ -41,8 +41,7 @@ class TaskRead(BaseModel):
     created_at: datetime
     updated_at: datetime
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class AssetRead(BaseModel):
@@ -54,8 +53,7 @@ class AssetRead(BaseModel):
     duration_ms: Optional[int]
     created_at: datetime
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class PlayoutAssetLinkRead(BaseModel):
@@ -71,8 +69,7 @@ class PlayoutAssetLinkRead(BaseModel):
     created_at: datetime
     updated_at: datetime
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class AdminAuthStatusRead(BaseModel):
@@ -295,8 +292,7 @@ class SubtitleJobSummary(BaseModel):
     created_at: datetime
     updated_at: datetime
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class PublishJobSummary(BaseModel):
@@ -323,8 +319,7 @@ class PublishJobSummary(BaseModel):
     created_at: datetime
     updated_at: datetime
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class PublishBatchSummary(BaseModel):
@@ -338,8 +333,7 @@ class PublishBatchSummary(BaseModel):
     created_at: datetime
     updated_at: datetime
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class YouTubeMetaRead(BaseModel):
@@ -428,172 +422,6 @@ class StorageResourceCleanupRead(BaseModel):
     deleted_subtitles: int = 0
     deleted_objects: int = 0
     pending_objects: int = 0
-
-
-class LiveStreamSettingsRead(BaseModel):
-    rtmp_url: str = ""
-    stream_key_set: bool = False
-    video_bitrate_kbps: int = Field(default=4500, ge=500, le=20000)
-    audio_bitrate_kbps: int = Field(default=160, ge=32, le=512)
-    fps: int = Field(default=30, ge=15, le=60)
-    keyframe_interval_seconds: int = Field(default=2, ge=1, le=10)
-
-
-class LiveStreamSettingsUpdate(BaseModel):
-    rtmp_url: Optional[str] = None
-    # Never returned by the API. An empty string deliberately clears it.
-    stream_key: Optional[str] = Field(default=None, max_length=1024)
-    video_bitrate_kbps: Optional[int] = Field(default=None, ge=500, le=20000)
-    audio_bitrate_kbps: Optional[int] = Field(default=None, ge=32, le=512)
-    fps: Optional[int] = Field(default=None, ge=15, le=60)
-    keyframe_interval_seconds: Optional[int] = Field(default=None, ge=1, le=10)
-
-
-class LivePlaylistItem(BaseModel):
-    source: Literal["library", "task_asset", "live_source"]
-    id: uuid.UUID
-
-
-class LivePlaylistRead(BaseModel):
-    video_items: list[LivePlaylistItem] = Field(default_factory=list)
-    audio_items: list[LivePlaylistItem] = Field(default_factory=list)
-    playback_mode: Literal["sequential", "shuffle"] = "sequential"
-    audio_playback_mode: Literal["sequential", "shuffle"] = "sequential"
-    loop_playlist: bool = True
-    mix_audio: bool = False
-
-
-class LivePlaylistUpdate(BaseModel):
-    video_items: Optional[list[LivePlaylistItem]] = None
-    audio_items: Optional[list[LivePlaylistItem]] = None
-    playback_mode: Optional[Literal["sequential", "shuffle"]] = None
-    audio_playback_mode: Optional[Literal["sequential", "shuffle"]] = None
-    loop_playlist: Optional[bool] = None
-    mix_audio: Optional[bool] = None
-
-
-class LiveManualPlayRequest(BaseModel):
-    video_item: LivePlaylistItem
-    audio_item: Optional[LivePlaylistItem] = None
-    mix_audio: bool = False
-
-
-class LiveAudioControlRequest(BaseModel):
-    """A control command for the independent audio input of the live mixer."""
-
-    action: Literal[
-        "play",
-        "pause",
-        "resume",
-        "previous",
-        "next",
-        "seek",
-        "original",
-        "set_playback_mode",
-        "set_volume",
-    ]
-    audio_item: Optional[LivePlaylistItem] = None
-    # This is a transient player queue, not the persisted auto-play list.
-    # It must allow a complete "all songs" library when using previous/next.
-    audio_items: list[LivePlaylistItem] = Field(default_factory=list, max_length=1000)
-    position_seconds: Optional[float] = Field(default=None, ge=0)
-    playback_mode: Optional[Literal["sequential", "shuffle"]] = None
-    volume_percent: Optional[int] = Field(default=None, ge=0, le=200)
-
-
-class LiveMediaRead(BaseModel):
-    id: uuid.UUID
-    media_type: Literal["video", "audio"]
-    origin: Literal["upload", "completed_video", "raw_video"] = "upload"
-    source_task_id: Optional[uuid.UUID] = None
-    source_asset_id: Optional[uuid.UUID] = None
-    display_name: str
-    storage_key: str
-    content_type: str
-    size_bytes: int = 0
-    sha256: Optional[str] = None
-    created_at: Optional[str] = None
-
-
-class LiveMediaImportRequest(BaseModel):
-    asset_ids: list[uuid.UUID] = Field(min_length=1, max_length=100)
-
-
-class LiveMediaRenameRequest(BaseModel):
-    display_name: str = Field(min_length=1, max_length=180)
-
-
-class LiveAudioPlaylistCreate(BaseModel):
-    display_name: str = Field(min_length=1, max_length=180)
-
-
-class LiveAudioPlaylistRead(BaseModel):
-    id: uuid.UUID
-    display_name: str
-    audio_media_ids: list[uuid.UUID] = Field(default_factory=list)
-    created_at: Optional[str] = None
-    updated_at: Optional[str] = None
-
-
-class LiveInputSourceCreate(BaseModel):
-    url: str = Field(min_length=1, max_length=4096)
-    display_name: Optional[str] = Field(default=None, max_length=180)
-
-
-class LiveInputSourceUpdate(BaseModel):
-    url: Optional[str] = Field(default=None, min_length=1, max_length=4096)
-    display_name: Optional[str] = Field(default=None, max_length=180)
-
-
-class LiveInputSourceRead(BaseModel):
-    id: uuid.UUID
-    url: str
-    display_name: str
-    created_at: Optional[str] = None
-
-
-class LiveTaskVideoRead(BaseModel):
-    id: uuid.UUID
-    task_id: uuid.UUID
-    display_name: str
-    storage_key: str
-    size_bytes: Optional[int] = None
-    duration_ms: Optional[int] = None
-    created_at: datetime
-
-
-class LiveCurrentMediaRead(BaseModel):
-    source: Literal["library", "task_asset", "live_source"]
-    id: uuid.UUID
-    display_name: str
-
-
-class LiveSessionRead(BaseModel):
-    status: Literal["idle", "starting", "running", "paused", "stopped", "failed"] = "idle"
-    session_id: Optional[str] = None
-    started_at: Optional[str] = None
-    updated_at: Optional[str] = None
-    stopped_at: Optional[str] = None
-    current_video: Optional[LiveCurrentMediaRead] = None
-    current_audio: Optional[LiveCurrentMediaRead] = None
-    audio_player_status: Literal["idle", "playing", "paused"] = "idle"
-    audio_position_seconds: float = Field(default=0.0, ge=0)
-    audio_duration_seconds: Optional[float] = Field(default=None, gt=0)
-    audio_playback_mode: Literal["sequential", "shuffle"] = "sequential"
-    audio_volume_percent: int = Field(default=100, ge=0, le=200)
-    mix_audio: bool = False
-    last_error: Optional[str] = None
-
-
-class LiveDashboardRead(BaseModel):
-    settings: LiveStreamSettingsRead
-    session: LiveSessionRead
-    playlist: LivePlaylistRead
-    library_media: list[LiveMediaRead] = Field(default_factory=list)
-    audio_playlists: list[LiveAudioPlaylistRead] = Field(default_factory=list)
-    live_sources: list[LiveInputSourceRead] = Field(default_factory=list)
-    completed_videos: list[LiveTaskVideoRead] = Field(default_factory=list)
-    raw_videos: list[LiveTaskVideoRead] = Field(default_factory=list)
 
 
 class RemoteAPISettingsRead(BaseModel):

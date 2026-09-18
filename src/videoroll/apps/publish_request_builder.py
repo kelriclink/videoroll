@@ -18,7 +18,7 @@ from videoroll.db.models import Task
 from videoroll.storage.filesystem import FileStore, StorageObjectNotFound
 
 
-def publish_meta_s3_key(task_id: uuid.UUID) -> str:
+def publish_meta_storage_key(task_id: uuid.UUID) -> str:
     return f"meta/{task_id}/publish_meta.json"
 
 
@@ -32,9 +32,9 @@ def _value(payload: Any, name: str, default: Any = None) -> Any:
     return getattr(payload, name, default)
 
 
-def _read_json(s3: FileStore, key: str) -> dict[str, Any] | None:
+def _read_json(store: FileStore, key: str) -> dict[str, Any] | None:
     try:
-        obj = s3.get_object(key)
+        obj = store.get_object(key)
     except StorageObjectNotFound:
         return None
     body = obj.get("Body")
@@ -72,12 +72,12 @@ def prepare_bilibili_publish_meta(
     task: Task,
     payload_meta: dict[str, Any] | None,
     db: Session,
-    s3: FileStore,
+    store: FileStore,
     allow_auto_draft: bool = False,
 ) -> dict[str, Any]:
     """Validate Bilibili metadata without importing the orchestrator layer."""
     if payload_meta is None:
-        meta = _read_json(s3, publish_meta_s3_key(task.id))
+        meta = _read_json(store, publish_meta_storage_key(task.id))
         if meta is None:
             if allow_auto_draft:
                 raise ValueError("meta is missing and automatic draft generation is unavailable")
@@ -118,7 +118,7 @@ def build_publish_gateway_request(
     payload: Any,
     video_key: str,
     db: Session,
-    s3: FileStore,
+    store: FileStore,
 ) -> dict[str, Any]:
     """Build a publisher request from a plain dict or API request model."""
     platform = normalize_publish_platform(_value(payload, "platform"))
@@ -135,14 +135,14 @@ def build_publish_gateway_request(
             task=task,
             payload_meta=payload_meta,
             db=db,
-            s3=s3,
+            store=store,
         )
     else:
         meta_source = payload_meta
         if meta_source is None:
-            meta_source = _read_json(s3, publish_meta_key(task_id, platform))
+            meta_source = _read_json(store, publish_meta_key(task_id, platform))
         if meta_source is None:
-            meta_source = _read_json(s3, publish_meta_s3_key(task_id))
+            meta_source = _read_json(store, publish_meta_storage_key(task_id))
         if meta_source is None:
             raise ValueError("meta is missing and platform publish meta is not found")
         try:

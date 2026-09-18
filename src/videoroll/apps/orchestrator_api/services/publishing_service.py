@@ -17,9 +17,9 @@ from videoroll.apps.orchestrator_api.infrastructure.internal_http import (
 from videoroll.apps.orchestrator_api.schemas import PublishActionRequest, PublishAllRequest, RemotePublishResponse
 from videoroll.apps.orchestrator_api.services.asset_service import (
     as_dict,
-    read_s3_bytes,
-    read_s3_json_object,
-    write_s3_json,
+    read_storage_bytes,
+    read_storage_json_object,
+    write_storage_json,
 )
 from videoroll.apps.publish_gateway import (
     normalize_publish_platform,
@@ -83,7 +83,7 @@ async def proxy_browser_request(
     )
 
 
-def publish_meta_s3_key(task_id: uuid.UUID) -> str:
+def publish_meta_storage_key(task_id: uuid.UUID) -> str:
     return f"meta/{task_id}/publish_meta.json"
 
 
@@ -192,16 +192,16 @@ def build_auto_publish_after_render(
     task: Task,
     *,
     db: Session,
-    s3: FileStore,
+    store: FileStore,
     publish_payload_overrides: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     auto_profile = get_auto_profile(db)
     auto_publish_platforms = list(auto_profile.get("auto_publish_platforms") or [])
     if not auto_publish_platforms:
         raise HTTPException(status_code=409, detail="no automatic publish platforms are selected")
-    stored_meta = read_s3_json_object(s3, publish_meta_s3_key(task.id))
-    meta = build_task_publish_meta_draft(task, db=db, s3=s3, mode="source", base_meta=stored_meta)
-    write_s3_json(s3, publish_meta_s3_key(task.id), meta)
+    stored_meta = read_storage_json_object(store, publish_meta_storage_key(task.id))
+    meta = build_task_publish_meta_draft(task, db=db, store=store, mode="source", base_meta=stored_meta)
+    write_storage_json(store, publish_meta_storage_key(task.id), meta)
     cover_key = latest_task_cover_key(task.id, db) if bool(auto_profile.get("publish_use_youtube_cover")) else None
     publish_payload: dict[str, Any] = {
         "account_id": None,
@@ -232,7 +232,7 @@ def apply_task_review_result(db: Session, task: Task, review_result: dict[str, A
     db.add(task)
 
 
-def read_latest_task_subtitle_text(task_id: uuid.UUID, db: Session, s3: FileStore) -> str:
+def read_latest_task_subtitle_text(task_id: uuid.UUID, db: Session, store: FileStore) -> str:
     asset = (
         db.query(Asset)
         .filter(Asset.task_id == task_id, Asset.kind.in_([AssetKind.subtitle_srt, AssetKind.subtitle_ass]))
@@ -242,7 +242,7 @@ def read_latest_task_subtitle_text(task_id: uuid.UUID, db: Session, s3: FileStor
     if not asset:
         return ""
     try:
-        return read_s3_bytes(s3, asset.storage_key).decode("utf-8", errors="ignore")
+        return read_storage_bytes(store, asset.storage_key).decode("utf-8", errors="ignore")
     except Exception:
         return ""
 
@@ -252,15 +252,15 @@ def prepare_publish_meta(
     task: Task,
     payload_meta: dict[str, Any] | None,
     db: Session,
-    s3: FileStore,
+    store: FileStore,
     allow_auto_draft: bool,
 ) -> dict[str, Any]:
     if payload_meta is None:
-        stored = read_s3_json_object(s3, publish_meta_s3_key(task.id))
+        stored = read_storage_json_object(store, publish_meta_storage_key(task.id))
         if stored is None:
             if not allow_auto_draft:
                 raise HTTPException(status_code=400, detail="meta is missing and publish_meta is not found")
-            meta = build_task_publish_meta_draft(task, db=db, s3=s3, mode="auto")
+            meta = build_task_publish_meta_draft(task, db=db, store=store, mode="auto")
         else:
             meta = dict(stored)
     else:
@@ -292,7 +292,7 @@ def prepare_publish_meta(
         raise HTTPException(status_code=400, detail=f"invalid publish meta: {exc}") from exc
 
 
-def run_task_publish_review(task: Task, *, meta: dict[str, Any], db: Session, s3: FileStore) -> dict[str, Any]:
+def run_task_publish_review(task: Task, *, meta: dict[str, Any], db: Session, store: FileStore) -> dict[str, Any]:
     settings = get_publish_review_settings(db)
     current = get_task_publish_review_record(db, str(task.id))
     if not settings["enabled"]:
@@ -311,7 +311,7 @@ def run_task_publish_review(task: Task, *, meta: dict[str, Any], db: Session, s3
     result = review_publish_materials(
         title=str(meta.get("title") or "").strip(),
         summary=get_task_bilibili_summary(db, str(task.id)),
-        subtitle_text=read_latest_task_subtitle_text(task.id, db, s3),
+        subtitle_text=read_latest_task_subtitle_text(task.id, db, store),
         blocked_words=settings["blocked_words"],
         reject_rules=settings["ai_rules"],
         ai_service=ai_service,
@@ -338,21 +338,21 @@ def _publish_review_blocks_publish(review_result: dict[str, Any]) -> bool:
     return bool(review_result.get("enabled")) and not bool(review_result.get("ok"))
 
 
-def get_task_publish_meta(task_id: uuid.UUID, db: Session, s3: FileStore) -> dict[str, Any]:
+def get_task_publish_meta(task_id: uuid.UUID, db: Session, store: FileStore) -> dict[str, Any]:
     if not db.get(Task, task_id):
         raise HTTPException(status_code=404, detail="task not found")
-    value = read_s3_json_object(s3, publish_meta_s3_key(task_id))
+    value = read_storage_json_object(store, publish_meta_storage_key(task_id))
     if value is None:
         raise HTTPException(status_code=404, detail="publish_meta not found")
     return value
 
 
-def get_task_publish_meta_draft(task_id: uuid.UUID, db: Session, s3: FileStore) -> dict[str, Any]:
+def get_task_publish_meta_draft(task_id: uuid.UUID, db: Session, store: FileStore) -> dict[str, Any]:
     task = db.get(Task, task_id)
     if not task:
         raise HTTPException(status_code=404, detail="task not found")
-    stored = read_s3_json_object(s3, publish_meta_s3_key(task_id))
-    return build_task_publish_meta_draft(task, db=db, s3=s3, mode="auto", base_meta=stored)
+    stored = read_storage_json_object(store, publish_meta_storage_key(task_id))
+    return build_task_publish_meta_draft(task, db=db, store=store, mode="auto", base_meta=stored)
 
 
 def generate_task_publish_meta_draft(
@@ -361,15 +361,15 @@ def generate_task_publish_meta_draft(
     mode: str,
     base_meta: dict[str, Any] | None,
     db: Session,
-    s3: FileStore,
+    store: FileStore,
 ) -> dict[str, Any]:
     task = db.get(Task, task_id)
     if not task:
         raise HTTPException(status_code=404, detail="task not found")
-    return build_task_publish_meta_draft(task, db=db, s3=s3, mode=mode, base_meta=base_meta)
+    return build_task_publish_meta_draft(task, db=db, store=store, mode=mode, base_meta=base_meta)
 
 
-def put_task_publish_meta(task_id: uuid.UUID, meta: dict[str, Any], db: Session, s3: FileStore) -> dict[str, Any]:
+def put_task_publish_meta(task_id: uuid.UUID, meta: dict[str, Any], db: Session, store: FileStore) -> dict[str, Any]:
     if not db.get(Task, task_id):
         raise HTTPException(status_code=404, detail="task not found")
     if not isinstance(meta, dict):
@@ -378,9 +378,9 @@ def put_task_publish_meta(task_id: uuid.UUID, meta: dict[str, Any], db: Session,
         value = BilibiliPublishMeta.model_validate(meta).model_dump()
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"invalid publish_meta: {exc}") from exc
-    key = publish_meta_s3_key(task_id)
+    key = publish_meta_storage_key(task_id)
     try:
-        write_s3_json(s3, key, value)
+        write_storage_json(store, key, value)
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"failed to write publish_meta: {exc}") from exc
     return {"stored": True, "key": key, "meta": value}
@@ -393,12 +393,12 @@ def get_task_publish_review(task_id: uuid.UUID, db: Session) -> dict[str, Any]:
     return {"enabled": settings["enabled"], **get_task_publish_review_record(db, str(task_id))}
 
 
-def review_task_publish(task_id: uuid.UUID, meta: dict[str, Any] | None, db: Session, s3: FileStore) -> dict[str, Any]:
+def review_task_publish(task_id: uuid.UUID, meta: dict[str, Any] | None, db: Session, store: FileStore) -> dict[str, Any]:
     task = db.get(Task, task_id)
     if not task:
         raise HTTPException(status_code=404, detail="task not found")
-    prepared = prepare_publish_meta(task=task, payload_meta=meta, db=db, s3=s3, allow_auto_draft=True)
-    return run_task_publish_review(task, meta=prepared, db=db, s3=s3)
+    prepared = prepare_publish_meta(task=task, payload_meta=meta, db=db, store=store, allow_auto_draft=True)
+    return run_task_publish_review(task, meta=prepared, db=db, store=store)
 
 
 def read_publish_platform_settings(db: Session) -> dict[str, bool]:
@@ -419,7 +419,7 @@ def build_publish_gateway_request(
     payload: PublishActionRequest,
     video_key: str,
     db: Session,
-    s3: FileStore,
+    store: FileStore,
 ) -> dict[str, Any]:
     platform = normalize_publish_platform(payload.platform)
     if platform != "bilibili":
@@ -428,13 +428,13 @@ def build_publish_gateway_request(
         except (TypeError, ValueError) as exc:
             raise HTTPException(status_code=400, detail="social publish account_id must be a UUID") from exc
     if platform == "bilibili":
-        meta = prepare_publish_meta(task=task, payload_meta=payload.meta, db=db, s3=s3, allow_auto_draft=False)
+        meta = prepare_publish_meta(task=task, payload_meta=payload.meta, db=db, store=store, allow_auto_draft=False)
     else:
         meta_source = payload.meta
         if meta_source is None:
-            meta_source = read_s3_json_object(s3, publish_meta_key(task_id, platform))
+            meta_source = read_storage_json_object(store, publish_meta_key(task_id, platform))
         if meta_source is None:
-            meta_source = read_s3_json_object(s3, publish_meta_s3_key(task_id))
+            meta_source = read_storage_json_object(store, publish_meta_storage_key(task_id))
         if meta_source is None:
             raise HTTPException(status_code=400, detail="meta is missing and platform publish meta is not found")
         try:
@@ -680,7 +680,7 @@ def enqueue_publish_job(
     payload: PublishActionRequest,
     settings: OrchestratorSettings,
     db: Session,
-    s3: FileStore,
+    store: FileStore,
 ) -> RemotePublishResponse:
     task = db.get(Task, task_id)
     if not task:
@@ -715,18 +715,18 @@ def enqueue_publish_job(
         payload=payload,
         video_key=video_key,
         db=db,
-        s3=s3,
+        store=store,
     )
     platform = str(request.get("platform") or "bilibili")
     try:
-        write_s3_json(s3, publish_meta_key(task_id, platform), as_dict(request.get("meta")))
+        write_storage_json(store, publish_meta_key(task_id, platform), as_dict(request.get("meta")))
         if platform == "bilibili":
-            write_s3_json(s3, publish_meta_s3_key(task_id), as_dict(request.get("meta")))
+            write_storage_json(store, publish_meta_storage_key(task_id), as_dict(request.get("meta")))
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"failed to persist publish_meta: {exc}") from exc
 
     if not bool(payload.skip_review):
-        review_result = run_task_publish_review(task, meta=as_dict(request.get("meta")), db=db, s3=s3)
+        review_result = run_task_publish_review(task, meta=as_dict(request.get("meta")), db=db, store=store)
         if _publish_review_blocks_publish(review_result):
             raise HTTPException(status_code=409, detail=str(review_result.get("reason") or "AI 审核未通过"))
     elif task.error_code == "AI_REVIEW_REJECTED":
@@ -740,7 +740,7 @@ def enqueue_publish_job(
     from videoroll.apps.publish_service import PublishService
 
     svc = PublishService(
-        db, settings, s3,
+        db, settings, store,
         http_headers=lambda: internal_http_headers(settings),
     )
     try:
@@ -764,7 +764,7 @@ def publish_all(
     publish_payload: PublishAllRequest,
     settings: OrchestratorSettings,
     db: Session,
-    s3: FileStore,
+    store: FileStore,
 ) -> dict[str, Any]:
     """多平台投稿：读取已启用平台，逐个投稿。"""
     from videoroll.apps.publish_service import PublishService
@@ -800,7 +800,7 @@ def publish_all(
             task=task,
             payload_meta=as_dict(bilibili_meta or payload.get("meta")) or None,
             db=db,
-            s3=s3,
+            store=store,
             allow_auto_draft=False,
         )
         payload["meta"] = meta
@@ -813,14 +813,14 @@ def publish_all(
                 break
     if not review_meta:
         for platform in enabled_platforms:
-            stored_meta = read_s3_json_object(s3, publish_meta_key(task_id, platform))
+            stored_meta = read_storage_json_object(store, publish_meta_key(task_id, platform))
             if stored_meta is None:
-                stored_meta = read_s3_json_object(s3, publish_meta_s3_key(task_id))
+                stored_meta = read_storage_json_object(store, publish_meta_storage_key(task_id))
             if stored_meta:
                 review_meta = stored_meta
                 break
     if not publish_payload.skip_review:
-        review_result = run_task_publish_review(task, meta=review_meta, db=db, s3=s3)
+        review_result = run_task_publish_review(task, meta=review_meta, db=db, store=store)
         if _publish_review_blocks_publish(review_result):
             raise HTTPException(
                 status_code=409,
@@ -828,7 +828,7 @@ def publish_all(
             )
 
     svc = PublishService(
-        db, settings, s3,
+        db, settings, store,
         http_headers=lambda: internal_http_headers(settings),
     )
     result = svc.publish(task_id, publish_payload=payload)

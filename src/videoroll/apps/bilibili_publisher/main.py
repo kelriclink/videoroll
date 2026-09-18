@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
+
 import json
 import os
 import uuid
@@ -55,7 +57,13 @@ def get_db(settings: BilibiliPublisherSettings = Depends(get_settings)) -> Gener
     yield from db_session(settings.database_url)
 
 
-app = FastAPI(title="videoroll-bilibili-publisher", version="0.1.0")
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    _startup()
+    yield
+
+
+app = FastAPI(title="videoroll-bilibili-publisher", version="0.1.0", lifespan=_lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -71,7 +79,6 @@ app.add_middleware(
 install_internal_service_auth(app, get_bilibili_publisher_settings)
 
 
-@app.on_event("startup")
 def _startup() -> None:
     settings = get_bilibili_publisher_settings()
     app.state.internal_service_token = service_token(settings)

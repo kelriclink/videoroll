@@ -181,12 +181,12 @@ def test_cover_upload_uses_decoded_format_not_filename_or_claimed_type(monkeypat
     db = Mock()
     db.get.return_value = task
     uploaded: dict[str, object] = {}
-    s3 = Mock()
+    store = Mock()
 
     def capture_upload(path: Path, key: str, content_type: str | None) -> None:
         uploaded.update(data=path.read_bytes(), key=key, content_type=content_type)
 
-    s3.upload_file.side_effect = capture_upload
+    store.upload_file.side_effect = capture_upload
 
     async def immediate_threadpool(function, *args, **kwargs):
         return function(*args, **kwargs)
@@ -201,7 +201,7 @@ def test_cover_upload_uses_decoded_format_not_filename_or_claimed_type(monkeypat
         headers=Headers({"content-type": "image/svg+xml"}),
     )
 
-    asset = asyncio.run(asset_service.upload_task_cover(task.id, upload, db=db, s3=s3))
+    asset = asyncio.run(asset_service.upload_task_cover(task.id, upload, db=db, store=store))
 
     assert asset.kind == AssetKind.cover_image
     assert str(uploaded["key"]).endswith(".png")

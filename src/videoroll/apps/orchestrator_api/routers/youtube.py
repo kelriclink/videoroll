@@ -7,7 +7,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from fastapi.responses import Response
 from sqlalchemy.orm import Session
 
-from videoroll.apps.orchestrator_api.dependencies import get_db, get_s3, get_settings
+from videoroll.apps.orchestrator_api.dependencies import get_db, get_store, get_settings
 from videoroll.apps.orchestrator_api.remote_api_settings_store import (
     REMOTE_API_IDEMPOTENCY_HEADER,
     REMOTE_AUTO_YOUTUBE_PATH,
@@ -39,7 +39,10 @@ from videoroll.storage.filesystem import FileStore
 router = APIRouter()
 
 
-@router.api_route("/youtube/{service_path:path}", methods=["GET", "POST", "PATCH", "DELETE"])
+@router.get("/youtube/{service_path:path}", operation_id="proxy_youtube_browser_get")
+@router.post("/youtube/{service_path:path}", operation_id="proxy_youtube_browser_post")
+@router.patch("/youtube/{service_path:path}", operation_id="proxy_youtube_browser_patch")
+@router.delete("/youtube/{service_path:path}", operation_id="proxy_youtube_browser_delete")
 async def proxy_youtube_browser_operation(
     service_path: str,
     request: Request,
@@ -136,18 +139,18 @@ def test_youtube_proxy(payload: YouTubeProxyTestRequest, settings: OrchestratorS
 
 
 @router.get("/tasks/{task_id}/youtube_meta", response_model=YouTubeMetaRead)
-def get_cached_youtube_meta(task_id: uuid.UUID, db: Session = Depends(get_db), s3: FileStore = Depends(get_s3)) -> YouTubeMetaRead:
-    return youtube_service.get_cached_meta(task_id, db=db, s3=s3)
+def get_cached_youtube_meta(task_id: uuid.UUID, db: Session = Depends(get_db), store: FileStore = Depends(get_store)) -> YouTubeMetaRead:
+    return youtube_service.get_cached_meta(task_id, db=db, store=store)
 
 
 @router.post("/tasks/{task_id}/actions/youtube_meta", response_model=YouTubeMetaActionResponse)
-def fetch_youtube_meta(task_id: uuid.UUID, settings: OrchestratorSettings = Depends(get_settings), db: Session = Depends(get_db), s3: FileStore = Depends(get_s3)) -> YouTubeMetaActionResponse:
-    return youtube_service.fetch_meta(task_id, settings=settings, db=db, s3=s3)
+def fetch_youtube_meta(task_id: uuid.UUID, settings: OrchestratorSettings = Depends(get_settings), db: Session = Depends(get_db), store: FileStore = Depends(get_store)) -> YouTubeMetaActionResponse:
+    return youtube_service.fetch_meta(task_id, settings=settings, db=db, store=store)
 
 
 @router.post("/tasks/{task_id}/actions/youtube_download", response_model=YouTubeDownloadActionResponse)
-def download_youtube(task_id: uuid.UUID, settings: OrchestratorSettings = Depends(get_settings), db: Session = Depends(get_db), s3: FileStore = Depends(get_s3)) -> YouTubeDownloadActionResponse:
-    return youtube_service.download(task_id, settings=settings, db=db, s3=s3)
+def download_youtube(task_id: uuid.UUID, settings: OrchestratorSettings = Depends(get_settings), db: Session = Depends(get_db), store: FileStore = Depends(get_store)) -> YouTubeDownloadActionResponse:
+    return youtube_service.download(task_id, settings=settings, db=db, store=store)
 
 
 @router.get("/tasks/{task_id}/youtube_download_progress", response_model=YouTubeDownloadProgressRead)

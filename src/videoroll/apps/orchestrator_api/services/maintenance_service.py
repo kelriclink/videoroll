@@ -36,7 +36,7 @@ WORKDIR_RECENT_GRACE_SECONDS = int(os.getenv("WORKDIR_RECENT_GRACE_SECONDS", "90
 WORKDIR_LOCK_TTL_SECONDS = int(os.getenv("WORKDIR_MAINTENANCE_LOCK_TTL_SECONDS", "900") or "900")
 STORAGE_RESOURCE_CLEANUP_LOCK_TTL_SECONDS = int(os.getenv("STORAGE_RESOURCE_CLEANUP_LOCK_TTL_SECONDS", "3600") or "3600")
 TASK_RESOURCE_PREFIXES = ("raw", "final", "sub", "work", "log", "meta")
-S3_DELETE_BATCH_SIZE = 1000
+STORAGE_DELETE_BATCH_SIZE = 1000
 PUBLISHING_TIMEOUT_ERROR_CODE = "PUBLISHING_TIMEOUT"
 
 
@@ -230,30 +230,30 @@ def _scheduled_resource_cleanup_filter(
     return or_(*filters)
 
 
-def _task_resource_objects(s3: FileStore, task_ids: set[uuid.UUID]) -> set[tuple[str, str]]:
+def _task_resource_objects(store: FileStore, task_ids: set[uuid.UUID]) -> set[tuple[str, str]]:
     """Find stored files belonging to task IDs."""
     if not task_ids:
         return set()
     try:
-        buckets = set(s3.list_bucket_names())
+        buckets = set(store.list_bucket_names())
     except Exception:
         buckets = set()
-    buckets.add(s3.bucket)
+    buckets.add(store.bucket)
 
     objects: set[tuple[str, str]] = set()
     for bucket in buckets:
         # Keep the namespace loop so retention remains compatible with old
         # database cleanup records while the active backend is filesystem-only.
-        namespace = "" if bucket == s3.bucket else f"{s3.bucket}/"
+        namespace = "" if bucket == store.bucket else f"{store.bucket}/"
         for prefix in TASK_RESOURCE_PREFIXES:
-            for key in s3.iter_object_keys(f"{namespace}{prefix}/", bucket=bucket):
+            for key in store.iter_object_keys(f"{namespace}{prefix}/", bucket=bucket):
                 relative_key = key[len(namespace) :] if namespace and key.startswith(namespace) else key
                 if task_id_from_resource_key(relative_key) in task_ids:
                     objects.add((bucket, key))
     return objects
 
 
-def _delete_s3_objects(s3: FileStore, objects: set[tuple[str, str]]) -> tuple[set[tuple[str, str]], set[tuple[str, str]]]:
+def _delete_storage_objects(store: FileStore, objects: set[tuple[str, str]]) -> tuple[set[tuple[str, str]], set[tuple[str, str]]]:
     deleted: set[tuple[str, str]] = set()
     failed: set[tuple[str, str]] = set()
     by_bucket: dict[str, list[str]] = {}
@@ -261,9 +261,9 @@ def _delete_s3_objects(s3: FileStore, objects: set[tuple[str, str]]) -> tuple[se
         by_bucket.setdefault(bucket, []).append(key)
     for bucket, keys in by_bucket.items():
         ordered_keys = sorted(keys)
-        for offset in range(0, len(ordered_keys), S3_DELETE_BATCH_SIZE):
-            batch = ordered_keys[offset : offset + S3_DELETE_BATCH_SIZE]
-            batch_deleted, batch_failed = s3.delete_objects(batch, bucket=bucket)
+        for offset in range(0, len(ordered_keys), STORAGE_DELETE_BATCH_SIZE):
+            batch = ordered_keys[offset : offset + STORAGE_DELETE_BATCH_SIZE]
+            batch_deleted, batch_failed = store.delete_objects(batch, bucket=bucket)
             deleted.update((bucket, key) for key in batch_deleted)
             failed.update((bucket, key) for key in batch_failed)
     return deleted, failed
@@ -311,14 +311,14 @@ def cleanup_terminal_task_resources(
         matched_assets = db.query(Asset).filter(Asset.task_id.in_(task_ids)).count()
         matched_subtitles = db.query(Subtitle).filter(Subtitle.task_id.in_(task_ids)).count()
 
-        s3 = FileStore(settings)
-        s3.ensure_ready()
-        object_locations = _task_resource_objects(s3, task_ids)
-        object_locations.update((s3.bucket, key) for key in asset_keys)
-        deleted_keys, failed_keys = _delete_s3_objects(s3, object_locations)
+        store = FileStore(settings)
+        store.ensure_ready()
+        object_locations = _task_resource_objects(store, task_ids)
+        object_locations.update((store.bucket, key) for key in asset_keys)
+        deleted_keys, failed_keys = _delete_storage_objects(store, object_locations)
 
         for bucket, key in failed_keys:
-            asset_service.queue_pending_s3_delete(
+            asset_service.queue_pending_storage_delete(
                 db,
                 key,
                 bucket=bucket,
@@ -331,7 +331,7 @@ def cleanup_terminal_task_resources(
 
         retried_objects = 0
         if failed_keys:
-            retried_objects = asset_service.retry_pending_s3_deletes(db, s3, limit=len(failed_keys))
+            retried_objects = asset_service.retry_pending_storage_deletes(db, store, limit=len(failed_keys))
         return StorageResourceCleanupRead(
             matched_tasks=len(task_ids),
             matched_assets=matched_assets,

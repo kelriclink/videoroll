@@ -33,7 +33,7 @@ def test_build_publish_gateway_request_defaults_to_bilibili_and_platform_options
             payload=payload,
             video_key="final/video.mp4",
             db=object(),  # type: ignore[arg-type]
-            s3=object(),  # type: ignore[arg-type]
+            store=object(),  # type: ignore[arg-type]
         )
 
     assert req["platform"] == "bilibili"
@@ -108,7 +108,7 @@ def test_direct_douyin_publish_uses_stored_youtube_uploader() -> None:
         payload=payload,
         video_key="final/video.mp4",
         db=db,
-        s3=object(),  # type: ignore[arg-type]
+        store=object(),  # type: ignore[arg-type]
     )
 
     assert request["meta"]["desc"] == "原作者：Original Creator"
@@ -129,7 +129,7 @@ def test_queued_douyin_publish_uses_stored_youtube_uploader() -> None:
         },
         video_key="final/video.mp4",
         db=db,
-        s3=object(),  # type: ignore[arg-type]
+        store=object(),  # type: ignore[arg-type]
     )
 
     assert request["meta"]["desc"] == "原作者：Original Creator"

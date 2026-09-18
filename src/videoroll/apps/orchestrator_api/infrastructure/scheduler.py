@@ -102,7 +102,7 @@ class OrchestratorScheduler:
             deleted_partials = store.cleanup_partials(
                 older_than_seconds=int(os.getenv("STORAGE_PARTIAL_RETENTION_SECONDS", "86400") or "86400")
             )
-            deleted_objects = asset_service.retry_pending_s3_deletes(db, store)
+            deleted_objects = asset_service.retry_pending_storage_deletes(db, store)
             ttl_days = int(config.get("asset_ttl_days") or 0)
             retention = maintenance_service.cleanup_terminal_task_resources(
                 self.settings,

@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 
 from videoroll.apps.orchestrator_api.schemas import TaskCreate, TaskRead
 from videoroll.apps.orchestrator_api.services import asset_service, publishing_service
-from videoroll.apps.subtitle_service.task_title_store import get_task_display_title_with_s3
+from videoroll.apps.subtitle_service.task_title_store import get_task_display_title_with_storage
 from videoroll.db.models import (
     AppSetting,
     Asset,
@@ -62,8 +62,8 @@ def load_task_display_titles(
     db: Session,
     task_ids: list[uuid.UUID],
     *,
-    s3: FileStore | None = None,
-    allow_s3_fallback: bool,
+    store: FileStore | None = None,
+    allow_storage_fallback: bool,
 ) -> dict[uuid.UUID, str]:
     title_map: dict[uuid.UUID, str] = {}
     if not task_ids:
@@ -79,7 +79,7 @@ def load_task_display_titles(
                 title_map[task_id] = value.strip()
                 break
 
-    if not allow_s3_fallback or s3 is None:
+    if not allow_storage_fallback or store is None:
         return title_map
 
     missing = [task_id for task_id in task_ids if task_id not in title_map]
@@ -96,7 +96,7 @@ def load_task_display_titles(
         picked.setdefault(asset.task_id, asset)
     for task_id, asset in picked.items():
         try:
-            title = extract_metadata_title(asset_service.read_s3_bytes(s3, asset.storage_key))
+            title = extract_metadata_title(asset_service.read_storage_bytes(store, asset.storage_key))
         except Exception:
             continue
         if title:
@@ -309,7 +309,7 @@ def list_converted_videos(*, limit: int, db: Session) -> list[dict[str, Any]]:
     cover_by_task: dict[uuid.UUID, Asset] = {}
     for asset in cover_assets:
         cover_by_task.setdefault(asset.task_id, asset)
-    title_map = load_task_display_titles(db, task_ids, allow_s3_fallback=False)
+    title_map = load_task_display_titles(db, task_ids, allow_storage_fallback=False)
     return [
         {
             "task": task,
@@ -327,7 +327,7 @@ def list_tasks(
     status: TaskStatus | None,
     limit: int,
     db: Session,
-    s3: FileStore,
+    store: FileStore,
 ) -> list[dict[str, Any]]:
     query = db.query(Task).order_by(Task.created_at.desc())
     if status is not None:
@@ -347,7 +347,7 @@ def list_tasks(
         )
     if reconciled:
         db.commit()
-    title_map = load_task_display_titles(db, task_ids, s3=s3, allow_s3_fallback=True)
+    title_map = load_task_display_titles(db, task_ids, store=store, allow_storage_fallback=True)
     uploads_by_task = active_bilibili_uploads(db, task_ids)
     output: list[dict[str, Any]] = []
     for task in tasks:
@@ -360,14 +360,14 @@ def list_tasks(
     return output
 
 
-def get_task(task_id: uuid.UUID, *, db: Session, s3: FileStore) -> dict[str, Any]:
+def get_task(task_id: uuid.UUID, *, db: Session, store: FileStore) -> dict[str, Any]:
     task = db.get(Task, task_id)
     if not task:
         raise HTTPException(status_code=404, detail="task not found")
     if publishing_service.reconcile_published_task_state(db, task):
         db.commit()
     item = TaskRead.model_validate(task).model_dump()
-    title = get_task_display_title_with_s3(db, str(task_id), s3=s3).strip()
+    title = get_task_display_title_with_storage(db, str(task_id), store=store).strip()
     item["display_title"] = title or None
     item["bilibili_upload"] = active_bilibili_uploads(db, [task_id]).get(task_id)
     return item

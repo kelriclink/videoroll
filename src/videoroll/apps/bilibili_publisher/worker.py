@@ -125,7 +125,7 @@ def _extract_video_key(meta_json: dict[str, Any]) -> str:
     return ""
 
 
-def _read_s3_json(store: FileStore, key: str) -> dict[str, Any]:
+def _read_storage_json(store: FileStore, key: str) -> dict[str, Any]:
     obj = store.get_object(key)
     body = obj.get("Body")
     if not body:
@@ -159,7 +159,7 @@ def _read_latest_youtube_info(task: Task, db: Session, store: FileStore) -> dict
     if not asset:
         return {}
     try:
-        return _read_s3_json(store, asset.storage_key)
+        return _read_storage_json(store, asset.storage_key)
     except Exception:
         return {}
 

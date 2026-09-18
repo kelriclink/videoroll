@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import re
 import shutil
 import tempfile
 import threading
@@ -21,8 +20,7 @@ from celery.signals import worker_init
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
-from videoroll.ai.client import openai_chat_config_from_settings
-from videoroll.ai.service import AIService, translate_title_openai
+from videoroll.ai.service import AIService
 from videoroll.config import get_orchestrator_settings, get_subtitle_settings
 from videoroll.db.migrate import initialize_database
 from videoroll.db.models import (
@@ -36,7 +34,6 @@ from videoroll.db.models import (
     RenderJobStatus,
     SourceType,
     Subtitle,
-    SubtitleFormat,
     SubtitleJob,
     SubtitleJobStatus,
     Task,
@@ -61,38 +58,38 @@ from videoroll.apps.subtitle_service.processing import (
     segments_from_json_data,
     segments_to_ass,
     segments_to_json_data,
-    segments_to_srt,
     transcribe_external_whisper,
     transcribe_groq_whisper,
     transcribe_cloudflare_workers_ai,
     transcribe_faster_whisper,
     transcribe_mock,
     transcribe_openvino_whisper,
-    translate_segments_openai_with_summary,
-    translate_segments_mock,
     write_json,
 )
 from videoroll.apps.subtitle_service.asr_settings_store import get_asr_settings
 from videoroll.apps.subtitle_service.auto_profile_store import get_auto_profile
-from videoroll.apps.subtitle_service.bilibili_tags_store import get_task_bilibili_summary, set_task_bilibili_tags
+from videoroll.apps.subtitle_service.bilibili_tags_store import get_task_bilibili_summary
 from videoroll.apps.subtitle_service.model_downloads import (
     default_model_dir_name,
     download_model_snapshot,
     resolve_model_repo_id,
 )
-from videoroll.apps.subtitle_service.rag import (
-    append_translation_batch_thinking_delta,
-    build_rag_context,
-    finish_translation_batch,
-    finish_translation_session,
-    rag_settings_from_translate_settings,
-    start_translation_batch,
-    start_translation_session,
-)
-from videoroll.apps.subtitle_service.embeddings import embedding_settings_from_translate_settings
-from videoroll.apps.subtitle_service.task_title_store import set_task_titles
+from videoroll.apps.subtitle_service.rag import translation_trace_recorder
 from videoroll.apps.subtitle_service.translate_settings_store import get_translate_settings
-from videoroll.apps.publish_meta_draft import apply_publish_source_overrides, build_task_publish_meta_draft, default_publish_meta
+from videoroll.apps.subtitle_service.translation_checkpoint import TranslationCheckpointStore
+from videoroll.apps.subtitle_service.translation_stage import (
+    TranslationRetryRequired,
+    run_translation_stage,
+)
+from videoroll.apps.subtitle_service.translation_postprocess import postprocess_translation
+from videoroll.apps.subtitle_service.subtitle_finalization import (
+    build_render_job_payload,
+    complete_subtitle_handoff,
+    mark_subtitle_ready,
+    persist_subtitle_outputs,
+    store_ass_output,
+)
+from videoroll.apps.publish_meta_draft import apply_publish_source_overrides, default_publish_meta
 from videoroll.apps.outbox.dispatcher import dispatch_outbox_events
 from videoroll.apps.outbox.service import create_outbox_event
 from videoroll.apps.outbox.worker_inbox import (
@@ -403,6 +400,150 @@ def _asr_cpu_threads(db: Session) -> int:
     shared_budget = max(1, (process_cpu_count() or 1) // (concurrency * model_workers))
     requested = int(settings.whisper_cpu_threads)
     return min(requested, shared_budget) if requested > 0 else shared_budget
+
+
+def _run_asr_stage(
+    *,
+    db: Session,
+    audio_path: Path,
+    audio_key: str | None,
+    asr_cfg: dict[str, Any],
+    log_path: Path | None,
+    groq_checkpoint_path: Path,
+) -> list[Segment]:
+    """Resolve runtime ASR settings, execute one provider, and normalize its timeline."""
+
+    asr_defaults = get_asr_settings(db, settings)
+    requested_engine = str(asr_cfg.get("engine") or "auto").strip()
+    requested_language = str(asr_cfg.get("language") or "auto").strip()
+    requested_model = str(asr_cfg.get("model") or "").strip() or None
+
+    engine = asr_defaults["default_engine"] if requested_engine in {"", "auto"} else requested_engine
+    language = asr_defaults["default_language"] if requested_language in {"", "auto"} else requested_language
+    model_name = requested_model or asr_defaults["default_model"]
+
+    if engine == "mock":
+        _safe_append_log_line(log_path, "asr: engine=mock")
+        segments = transcribe_mock(audio_path)
+    elif engine == "faster-whisper":
+        _safe_append_log_line(log_path, f"asr: engine=faster-whisper model={model_name} language={language}")
+        proxy = str(asr_defaults.get("model_download_proxy") or "").strip() or None
+        model_name = _resolve_faster_whisper_model(model_name, Path(settings.whisper_model_dir), proxy=proxy)
+        cpu_threads_cfg = _asr_cpu_threads(db)
+        num_workers_cfg = max(1, int(getattr(settings, "whisper_num_workers", 1) or 1))
+        segments = transcribe_faster_whisper(
+            audio_path,
+            model_name=model_name,
+            language=language,
+            device=settings.whisper_device,
+            compute_type=settings.whisper_compute_type,
+            cpu_threads=cpu_threads_cfg,
+            num_workers=num_workers_cfg,
+        )
+    elif engine == "openvino":
+        proxy = str(asr_defaults.get("model_download_proxy") or "").strip() or None
+        model_name = _resolve_openvino_model(model_name, Path(settings.whisper_model_dir), proxy=proxy)
+        openvino_device = str(asr_defaults.get("openvino_device") or settings.openvino_device).strip() or settings.openvino_device
+        openvino_num_beams = int(asr_defaults.get("openvino_num_beams") or settings.openvino_num_beams or 1)
+        openvino_max_new_tokens = int(asr_defaults.get("openvino_max_new_tokens") or settings.openvino_max_new_tokens or 448)
+        openvino_vad_enabled = bool(asr_defaults.get("openvino_vad_enabled", settings.openvino_vad_enabled))
+        openvino_vad_threshold = float(asr_defaults.get("openvino_vad_threshold") or settings.openvino_vad_threshold or 0.5)
+        _safe_append_log_line(
+            log_path,
+            "asr: "
+            f"engine=openvino model={model_name} language={language} "
+            f"device={openvino_device} num_beams={openvino_num_beams} max_new_tokens={openvino_max_new_tokens} "
+            f"vad_enabled={openvino_vad_enabled} vad_threshold={openvino_vad_threshold}",
+        )
+        segments = transcribe_openvino_whisper(
+            audio_path,
+            model_name=model_name,
+            language=language,
+            device=openvino_device,
+            num_beams=openvino_num_beams,
+            max_new_tokens=openvino_max_new_tokens,
+            vad_enabled=openvino_vad_enabled,
+            vad_threshold=openvino_vad_threshold,
+        )
+    elif engine == "external-whisper":
+        external_base_url = str(asr_defaults.get("external_whisper_base_url") or "").strip()
+        external_api_key = str(asr_defaults.get("external_whisper_api_key") or "").strip()
+        external_model = str(model_name or asr_defaults.get("external_whisper_model") or "").strip()
+        _safe_append_log_line(
+            log_path,
+            f"asr: engine=external-whisper model={external_model} base_url={external_base_url or '(empty)'} language={language}",
+        )
+        segments = transcribe_external_whisper(
+            audio_path,
+            base_url=external_base_url,
+            api_key=external_api_key,
+            model_name=external_model,
+            language=language,
+        )
+    elif engine == "groq-whisper":
+        groq_api_key = str(asr_defaults.get("groq_whisper_api_key") or "").strip()
+        # Old rows may retain a local default_model after switching engines.
+        groq_model = str(
+            requested_model or asr_defaults.get("groq_whisper_model") or "whisper-large-v3-turbo"
+        ).strip()
+        groq_vad_enabled = bool(asr_defaults.get("openvino_vad_enabled", settings.openvino_vad_enabled))
+        groq_vad_threshold = float(
+            asr_defaults.get("openvino_vad_threshold") or settings.openvino_vad_threshold or 0.5
+        )
+        _safe_append_log_line(
+            log_path,
+            f"asr: engine=groq-whisper model={groq_model} language={language} "
+            "format=flac chunk=45s overlap=5s retries=5 checkpoint=enabled "
+            f"vad_enabled={groq_vad_enabled} vad_threshold={groq_vad_threshold}",
+        )
+        segments = transcribe_groq_whisper(
+            audio_path,
+            api_key=groq_api_key,
+            model_name=groq_model,
+            language=language,
+            ffmpeg_path=settings.ffmpeg_path,
+            checkpoint_path=groq_checkpoint_path,
+            audio_identity=str(audio_key or audio_path),
+            vad_enabled=groq_vad_enabled,
+            vad_threshold=groq_vad_threshold,
+            redis_url=str(settings.redis_url or ""),
+            provider_max_concurrency=_positive_int_env("GROQ_ASR_MAX_CONCURRENCY", 1),
+        )
+    elif engine == "cloudflare-workers-ai":
+        cloudflare_account_id = str(asr_defaults.get("cloudflare_workers_ai_account_id") or "").strip()
+        cloudflare_api_key = str(asr_defaults.get("cloudflare_workers_ai_api_key") or "").strip()
+        cloudflare_model = str(model_name or asr_defaults.get("cloudflare_workers_ai_model") or "").strip()
+        _safe_append_log_line(
+            log_path,
+            f"asr: engine=cloudflare-workers-ai model={cloudflare_model} "
+            f"account_id={cloudflare_account_id or '(empty)'} language={language}",
+        )
+        segments = transcribe_cloudflare_workers_ai(
+            audio_path,
+            account_id=cloudflare_account_id,
+            api_key=cloudflare_api_key,
+            model_name=cloudflare_model,
+            language=language,
+            redis_url=str(settings.redis_url or ""),
+            provider_max_concurrency=_positive_int_env("CLOUDFLARE_ASR_MAX_CONCURRENCY", 2),
+        )
+    else:
+        raise ValueError(f"unsupported ASR engine: {engine}")
+
+    raw_segments = sorted(segments, key=lambda item: (item.start, item.end, item.text))
+    overlap_count = sum(
+        1
+        for previous, current in zip(raw_segments, raw_segments[1:])
+        if current.start < previous.end
+    )
+    reconciled = reconcile_overlapping_asr_segments(raw_segments)
+    if overlap_count or len(reconciled) != len(raw_segments):
+        _safe_append_log_line(
+            log_path,
+            "asr timeline reconciled before translation: "
+            f"overlaps={overlap_count} segments={len(raw_segments)}->{len(reconciled)}",
+        )
+    return reconciled
 
 
 class _TaskStopped(Exception):
@@ -731,61 +872,6 @@ def _ensure_log_asset(db: Session, task_id: uuid.UUID, log_key: str) -> None:
     db.add(Asset(task_id=task_id, kind=AssetKind.log, storage_key=log_key))
 
 
-_CJK_RE = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uF900-\uFAFF]")
-
-
-def _has_cjk(text: str) -> bool:
-    return bool(_CJK_RE.search(text or ""))
-
-
-def _translate_title_openai(
-    title: str,
-    *,
-    target_lang: str,
-    style: str,
-    summary: str = "",
-    translate_settings: dict[str, Any] | None = None,
-    ai_service: AIService | None = None,
-) -> str:
-    if not title.strip():
-        return title
-    if ai_service is None and not (translate_settings or {}).get("openai_api_key"):
-        return title
-    try:
-        if ai_service is not None:
-            return ai_service.translate_title(
-                title,
-                target_lang=target_lang,
-                style=style,
-                summary=summary,
-                retry_count=4,
-            )
-        return translate_title_openai(
-            title,
-            target_lang=target_lang,
-            style=style,
-            summary=summary,
-            config=openai_chat_config_from_settings(translate_settings or {}),
-            retry_count=4,
-        )
-    except Exception:
-        return title
-
-
-def _read_s3_bytes(store: FileStore, key: str) -> bytes:
-    obj = store.get_object(key)
-    body = obj.get("Body")
-    if not body:
-        return b""
-    try:
-        return body.read() or b""
-    finally:
-        try:
-            body.close()
-        except Exception:
-            pass
-
-
 def _effective_subtitle_worker_youtube_settings(db: Session, *, cookie_dir: Path | None = None) -> Any:
     cfg = get_youtube_settings(db, default_proxy=settings.youtube_proxy)
     proxy = str(cfg.get("proxy") or "").strip()
@@ -843,7 +929,10 @@ def _download_youtube_subtitle_segments(
     if not source_url:
         return None, None
 
-    _safe_append_log_line(log_path, f"youtube subtitles: probing mode={normalized_mode} target_lang={target_lang or 'zh'}")
+    _safe_append_log_line(
+        log_path,
+        f"youtube subtitles: probing mode={normalized_mode} target_lang={target_lang or 'zh'}",
+    )
     _safe_upload_log(store, log_path, log_key)
 
     try:
@@ -858,19 +947,33 @@ def _download_youtube_subtitle_segments(
                 yt_settings,
                 extractor_args_override={"youtube": {"skip": ["translated_subs"]}},
             )
-            _safe_append_log_line(log_path, f"youtube subtitles: metadata fetched in {time.monotonic() - started_at:.1f}s")
+            _safe_append_log_line(
+                log_path,
+                f"youtube subtitles: metadata fetched in {time.monotonic() - started_at:.1f}s",
+            )
             _safe_upload_log(store, log_path, log_key)
-            selection = pick_preferred_youtube_subtitle(info, target_lang=target_lang, mode=normalized_mode)
+            selection = pick_preferred_youtube_subtitle(
+                info,
+                target_lang=target_lang,
+                mode=normalized_mode,
+            )
             if selection is None:
                 if normalized_mode == "auto_source":
-                    _safe_append_log_line(log_path, "youtube subtitles: no auto-generated source subtitles found; fallback to ASR")
+                    _safe_append_log_line(
+                        log_path,
+                        "youtube subtitles: no auto-generated source subtitles found; fallback to ASR",
+                    )
                 else:
-                    _safe_append_log_line(log_path, "youtube subtitles: no target-language subtitles found; fallback to ASR")
+                    _safe_append_log_line(
+                        log_path,
+                        "youtube subtitles: no target-language subtitles found; fallback to ASR",
+                    )
                 return None, None
 
             _safe_append_log_line(
                 log_path,
-                f"youtube subtitles: downloading track source={selection.source} language={selection.language} reason={selection.reason}",
+                f"youtube subtitles: downloading track source={selection.source} "
+                f"language={selection.language} reason={selection.reason}",
             )
             _safe_upload_log(store, log_path, log_key)
             subtitle_path, _subtitle_info, _subtitle_meta = download_youtube_subtitle(
@@ -882,124 +985,43 @@ def _download_youtube_subtitle_segments(
             srt_input_path = subtitle_path
             if subtitle_path.suffix.lower() != ".srt":
                 srt_input_path = tmp_dir / f"{subtitle_path.stem}.srt"
-                _safe_append_log_line(log_path, f"youtube subtitles: converting {subtitle_path.suffix.lower() or '(unknown)'} -> srt")
-                convert_subtitle_to_srt(settings.ffmpeg_path, subtitle_path, srt_input_path, log_path=log_path)
+                _safe_append_log_line(
+                    log_path,
+                    f"youtube subtitles: converting {subtitle_path.suffix.lower() or '(unknown)'} -> srt",
+                )
+                convert_subtitle_to_srt(
+                    settings.ffmpeg_path,
+                    subtitle_path,
+                    srt_input_path,
+                    log_path=log_path,
+                )
 
             segments = srt_to_segments(srt_input_path.read_text(encoding="utf-8"))
             if not segments:
-                _safe_append_log_line(log_path, "youtube subtitles: parsed 0 segments; fallback to ASR")
+                _safe_append_log_line(
+                    log_path,
+                    "youtube subtitles: parsed 0 segments; fallback to ASR",
+                )
                 return None, None
 
             _safe_append_log_line(
                 log_path,
-                f"youtube subtitles: selected {selection.source}:{selection.language} reason={selection.reason} segments={len(segments)}",
+                f"youtube subtitles: selected {selection.source}:{selection.language} "
+                f"reason={selection.reason} segments={len(segments)}",
             )
-            return segments, {"language": selection.language, "source": selection.source, "reason": selection.reason}
-    except Exception as e:
-        _safe_append_log_line(log_path, f"youtube subtitles: probe/download failed; fallback to ASR: {type(e).__name__}: {e}")
+            return segments, {
+                "language": selection.language,
+                "source": selection.source,
+                "reason": selection.reason,
+            }
+    except Exception as error:
+        _safe_append_log_line(
+            log_path,
+            f"youtube subtitles: probe/download failed; fallback to ASR: "
+            f"{type(error).__name__}: {error}",
+        )
         _safe_upload_log(store, log_path, log_key)
         return None, None
-
-
-def _latest_youtube_title(db: Session, store: FileStore, task_id: uuid.UUID) -> str:
-    asset = (
-        db.query(Asset)
-        .filter(Asset.task_id == task_id, Asset.kind == AssetKind.metadata_json)
-        .order_by(Asset.created_at.desc())
-        .first()
-    )
-    if not asset:
-        return ""
-    try:
-        raw = _read_s3_bytes(store, asset.storage_key)
-        info = json.loads(raw.decode("utf-8")) if raw else {}
-    except Exception:
-        return ""
-    if not isinstance(info, dict):
-        return ""
-    title = info.get("title") or info.get("fulltitle") or info.get("alt_title") or ""
-    return str(title or "").strip()
-
-
-def _segments_text_excerpt(segments: list[Segment], max_chars: int = 7000) -> str:
-    text = "\n".join((s.text or "").strip() for s in segments if (s.text or "").strip())
-    text = text.strip()
-    if not text:
-        return ""
-    if len(text) <= max_chars:
-        return text
-    half = max(1, max_chars // 2)
-    return (text[:half].rstrip() + "\n…\n" + text[-half:].lstrip()).strip()
-
-
-_EN_STOP = {
-    "the",
-    "a",
-    "an",
-    "and",
-    "or",
-    "to",
-    "of",
-    "in",
-    "on",
-    "for",
-    "with",
-    "this",
-    "that",
-    "is",
-    "are",
-    "be",
-    "as",
-    "it",
-    "we",
-    "you",
-    "i",
-}
-
-
-def _fallback_bilibili_tags(*, title: str, summary: str, transcript: str, n: int = 6) -> list[str]:
-    blob = "\n".join([title or "", summary or "", transcript or ""])
-    blob = blob.strip()
-    out: list[str] = []
-    seen: set[str] = set()
-
-    def _add(tag: str) -> None:
-        s = (tag or "").strip().lstrip("#").lstrip("＃")
-        s = "".join(s.split())
-        if not s:
-            return
-        if s.lower() == "videoroll":
-            return
-        if len(s) > 20:
-            s = s[:20]
-        k = s.lower()
-        if k in seen:
-            return
-        seen.add(k)
-        out.append(s)
-
-    # Prefer CJK chunks as tags.
-    for m in re.finditer(r"[\u4e00-\u9fff]{2,12}", blob):
-        _add(m.group(0))
-        if len(out) >= n:
-            return out[:n]
-
-    # Then English-ish words from title/summary.
-    for m in re.finditer(r"[A-Za-z][A-Za-z0-9+-]{2,15}", blob):
-        w = m.group(0)
-        if w.lower() in _EN_STOP:
-            continue
-        _add(w)
-        if len(out) >= n:
-            return out[:n]
-
-    # Generic fallback.
-    for t in ["熟肉", "字幕", "翻译", "科技", "教程", "YouTube", "搬运", "科普"]:
-        _add(t)
-        if len(out) >= n:
-            return out[:n]
-
-    return out[:n]
 
 
 @worker_init.connect
@@ -1247,34 +1269,6 @@ def process_job(self: Any, job_id: str) -> dict[str, str]:
             req["artifacts"] = artifacts
             _save_job_request()
 
-        def _build_render_job_payload(*, srt_key_value: str, ass_key_value: str | None) -> dict[str, Any]:
-            if automatic_runtime_profile:
-                return {
-                    "input_key": input_key,
-                    "srt_key": srt_key_value,
-                    "ass_key": None,
-                    "runtime_profile": True,
-                    "after_render": {"publish": True, "runtime_profile": True},
-                }
-            payload: dict[str, Any] = {
-                "input_key": input_key,
-                "runtime_profile": False,
-                "srt_key": srt_key_value,
-                "ass_key": ass_key_value if burn_in else None,
-                "burn_in": bool(burn_in),
-                "soft_sub": bool(soft_sub),
-                "render": {
-                    "video_codec": video_codec,
-                    "use_intel_gpu": use_intel_gpu,
-                    "video_preset": video_preset,
-                    "video_crf": video_crf,
-                },
-            }
-            manual_after_render = req.get("after_render") if isinstance(req.get("after_render"), dict) else None
-            if manual_after_render:
-                payload["after_render"] = manual_after_render
-            return payload
-
         def _load_segments_json(path: Path) -> list[Segment] | None:
             try:
                 return segments_from_json_data(json.loads(path.read_text(encoding="utf-8")))
@@ -1295,85 +1289,6 @@ def process_job(self: Any, job_id: str) -> dict[str, str]:
         def _ensure_video() -> None:
             if not video_path.is_file():
                 raise FileNotFoundError(video_path)
-
-        def _ass_resolution() -> tuple[int, int]:
-            try:
-                _ensure_video()
-                return probe_video_resolution(settings.ffmpeg_path, video_path)
-            except Exception as e:
-                _safe_append_log_line(log_path, f"subtitle ass resolution probe failed; fallback to 1920x1080: {e}")
-                return 1920, 1080
-
-        def _store_ass_from_segments(segs: list[Segment], *, log_prefix: str) -> str:
-            play_res_x, play_res_y = _ass_resolution()
-            secondary_line_scale = 0.68 if bool((req.get("translate") or {}).get("bilingual")) else None
-            ass_text = segments_to_ass(
-                segs,
-                style_name=render_cfg.get("ass_style", "clean_white"),
-                play_res_x=play_res_x,
-                play_res_y=play_res_y,
-                secondary_line_scale=secondary_line_scale,
-                primary_font_scale_percent=render_cfg.get("primary_font_scale_percent") or 100,
-                secondary_font_scale_percent=render_cfg.get("secondary_font_scale_percent") or 100,
-            )
-            ass_path.write_text(ass_text, encoding="utf-8")
-            ass_sha = sha256_file(ass_path)
-            existing_asset = (
-                db.query(Asset)
-                .filter(
-                    Asset.task_id == task.id,
-                    Asset.kind == AssetKind.subtitle_ass,
-                    Asset.sha256 == ass_sha,
-                )
-                .first()
-            )
-            if existing_asset is None:
-                ass_key_local = _unique_storage_key(
-                    f"sub/{task.id}/subtitle_zh",
-                    ass_sha,
-                    ".ass",
-                )
-                store.upload_file(ass_path, ass_key_local, content_type="text/plain")
-                db.add(
-                    Asset(
-                        task_id=task.id,
-                        kind=AssetKind.subtitle_ass,
-                        storage_key=ass_key_local,
-                        sha256=ass_sha,
-                        size_bytes=ass_path.stat().st_size,
-                    )
-                )
-                existing_subtitle = (
-                    db.query(Subtitle)
-                    .filter(
-                        Subtitle.task_id == task.id,
-                        Subtitle.format == SubtitleFormat.ass,
-                        Subtitle.language == "zh",
-                        Subtitle.storage_key == ass_key_local,
-                    )
-                    .first()
-                )
-                if existing_subtitle is None:
-                    db.add(Subtitle(task_id=task.id, version=1, format=SubtitleFormat.ass, language="zh", storage_key=ass_key_local))
-                _safe_append_log_line(log_path, f"{log_prefix}: {ass_key_local} ({play_res_x}x{play_res_y})")
-            else:
-                ass_key_local = existing_asset.storage_key
-                _safe_append_log_line(log_path, f"{log_prefix} unchanged: {ass_key_local} ({play_res_x}x{play_res_y})")
-            return ass_key_local
-
-        def _store_final_subtitle_segments(segs: list[Segment]) -> str:
-            write_json(subtitle_segments_path, segments_to_json_data(segs))
-            subtitle_segments_sha = sha256_file(subtitle_segments_path)
-            key = _unique_storage_key(
-                f"sub/{task.id}/subtitle_segments",
-                subtitle_segments_sha,
-                ".json",
-            )
-            store.upload_file(subtitle_segments_path, key, content_type="application/json")
-            _set_final_subtitle_segments_key(key)
-            db.commit()
-            _safe_append_log_line(log_path, f"subtitle segments uploaded: {key}")
-            return key
 
         def _store_source_segments(segs: list[Segment], *, source_label: str) -> None:
             nonlocal segments_key
@@ -1402,9 +1317,6 @@ def process_job(self: Any, job_id: str) -> dict[str, str]:
             _safe_append_log_line(log_path, f"{source_label}: segments={len(segs)}")
             _safe_upload_log(store, log_path, log_key)
 
-        def _translation_checkpoint_key() -> str:
-            return f"sub/{task.id}/translation_checkpoint.json"
-
         def _groq_asr_checkpoint_key() -> str:
             return f"sub/{task.id}/groq_asr_checkpoint.json"
 
@@ -1417,123 +1329,105 @@ def process_job(self: Any, job_id: str) -> dict[str, str]:
             except Exception:
                 pass
 
-        def _translation_checkpoint_matches(source: list[Segment], translated_prefix: list[Segment]) -> bool:
-            if len(translated_prefix) > len(source):
-                return False
-            for i, translated_seg in enumerate(translated_prefix):
-                source_seg = source[i]
-                if abs(float(translated_seg.start) - float(source_seg.start)) > 0.01:
-                    return False
-                if abs(float(translated_seg.end) - float(source_seg.end)) > 0.01:
-                    return False
-            return True
-
-        def _load_translation_checkpoint(source: list[Segment], *, source_segments_key: str | None) -> tuple[list[Segment], str]:
-            if not source or not source_segments_key:
-                return [], ""
-            try:
-                store.download_file(_translation_checkpoint_key(), translation_checkpoint_path)
-                payload = json.loads(translation_checkpoint_path.read_text(encoding="utf-8"))
-            except Exception:
-                return [], ""
-            if not isinstance(payload, dict):
-                return [], ""
-            if str(payload.get("source_segments_key") or "").strip() != str(source_segments_key or "").strip():
-                return [], ""
-            translated_prefix = segments_from_json_data(payload.get("translated_segments"))
-            if not translated_prefix:
-                return [], ""
-            if not _translation_checkpoint_matches(source, translated_prefix):
-                return [], ""
-            summary = str(payload.get("summary") or "").strip()[:500]
-            return translated_prefix, summary
-
-        def _save_translation_checkpoint(source_segments_key: str | None, translated_prefix: list[Segment], *, summary: str) -> None:
-            if not source_segments_key or not translated_prefix:
-                return
-            payload = {
-                "source_segments_key": str(source_segments_key or "").strip(),
-                "summary": str(summary or "").strip()[:500],
-                "translated_segments": segments_to_json_data(translated_prefix),
-            }
-            try:
-                write_json(translation_checkpoint_path, payload)
-                store.upload_file(translation_checkpoint_path, _translation_checkpoint_key(), content_type="application/json")
-            except Exception as e:
-                _safe_append_log_line(log_path, f"translation checkpoint save failed: {type(e).__name__}: {e}")
-
-        def _clear_translation_checkpoint() -> None:
-            try:
-                store.delete_object(_translation_checkpoint_key())
-            except Exception:
-                pass
+        translation_checkpoint = TranslationCheckpointStore(
+            store=store,
+            task_id=task.id,
+            local_path=translation_checkpoint_path,
+            log=lambda message: _safe_append_log_line(log_path, message),
+        )
 
         if not resume:
-            _clear_translation_checkpoint()
+            translation_checkpoint.clear()
             _clear_groq_asr_checkpoint()
 
         srt_asset = _download_latest_asset(AssetKind.subtitle_srt, srt_path) if resume else None
         if resume and srt_asset:
             srt_key = srt_asset.storage_key
-            _clear_translation_checkpoint()
+            translation_checkpoint.clear()
             _clear_groq_asr_checkpoint()
             _safe_append_log_line(log_path, f"resume: found existing subtitle_srt asset: {srt_key}")
             _safe_upload_log(store, log_path, log_key)
-            if task.status in {TaskStatus.failed, TaskStatus.created, TaskStatus.ingested, TaskStatus.downloaded, TaskStatus.audio_extracted, TaskStatus.asr_done, TaskStatus.translated}:
-                task.status = TaskStatus.subtitle_ready
-                db.add(task)
-            job.progress = 80
-            db.add(job)
-            db.commit()
+
+            mark_subtitle_ready(
+                db=db,
+                task=task,
+                job=job,
+                resume_existing=True,
+            )
 
             if automatic_runtime_profile:
                 output_profile = _current_auto_profile()
                 need_ass = "ass" in list(output_profile.get("formats") or ["srt", "ass"])
             if need_ass:
                 segs = _download_final_subtitle_segments()
+                ass_bilingual = bool(
+                    (req.get("translate") if isinstance(req.get("translate"), dict) else {}).get("bilingual")
+                )
                 if segs:
-                    ass_key = _store_ass_from_segments(segs, log_prefix="generated ass from resumed subtitle segments")
+                    ass_key = store_ass_output(
+                        db=db,
+                        store=store,
+                        task_id=task.id,
+                        segments=segs,
+                        ass_path=ass_path,
+                        video_path=video_path,
+                        ffmpeg_path=settings.ffmpeg_path,
+                        render_cfg=render_cfg,
+                        bilingual=ass_bilingual,
+                        unique_storage_key=_unique_storage_key,
+                        log=lambda message: _safe_append_log_line(log_path, message),
+                        log_prefix="generated ass from resumed subtitle segments",
+                    )
                 else:
                     segs = srt_to_segments(srt_path.read_text(encoding="utf-8"))
-                    ass_key = _store_ass_from_segments(segs, log_prefix="generated ass from resumed srt (fallback)")
-                    _safe_append_log_line(log_path, "resume: final subtitle segments not found; ass regenerated from srt without structured bilingual data")
+                    ass_key = store_ass_output(
+                        db=db,
+                        store=store,
+                        task_id=task.id,
+                        segments=segs,
+                        ass_path=ass_path,
+                        video_path=video_path,
+                        ffmpeg_path=settings.ffmpeg_path,
+                        render_cfg=render_cfg,
+                        bilingual=ass_bilingual,
+                        unique_storage_key=_unique_storage_key,
+                        log=lambda message: _safe_append_log_line(log_path, message),
+                        log_prefix="generated ass from resumed srt (fallback)",
+                    )
+                    _safe_append_log_line(
+                        log_path,
+                        "resume: final subtitle segments not found; ass regenerated from srt without structured bilingual data",
+                    )
                 db.commit()
                 _safe_upload_log(store, log_path, log_key)
 
-            _raise_if_task_stopped(db, task.id)
-            if not automatic_runtime_profile and not burn_in and not soft_sub:
-                job.status = SubtitleJobStatus.succeeded
-                job.progress = 100
-                _task_queue_unlock(task)
-                db.add(task)
-                db.add(job)
-                db.commit()
-                _safe_append_log_line(log_path, "subtitle job done (no render configured)")
-                _safe_upload_log(store, log_path, log_key)
-                _kick_task_queue()
-                return {"status": "ok"}
-
-            existing = (
-                db.query(RenderJob)
-                .filter(
-                    RenderJob.subtitle_job_id == job.id,
-                    RenderJob.status.in_([RenderJobStatus.queued, RenderJobStatus.running]),
-                )
-                .order_by(RenderJob.created_at.desc())
-                .first()
+            render_payload = build_render_job_payload(
+                request_json=req,
+                input_key=input_key,
+                srt_key=srt_key,
+                ass_key=ass_key,
+                automatic_runtime_profile=automatic_runtime_profile,
+                burn_in=burn_in,
+                soft_sub=soft_sub,
+                video_codec=video_codec,
+                use_intel_gpu=use_intel_gpu,
+                video_preset=video_preset,
+                video_crf=video_crf,
             )
-            if not existing:
-                payload = _build_render_job_payload(srt_key_value=srt_key, ass_key_value=ass_key)
-                db.add(RenderJob(task_id=task.id, subtitle_job_id=job.id, status=RenderJobStatus.queued, progress=0, request_json=payload))
-
-            job.status = SubtitleJobStatus.succeeded
-            job.progress = 100
-            db.add(job)
-            db.commit()
-            _safe_append_log_line(log_path, "render queued; waiting for task queue")
-            _safe_upload_log(store, log_path, log_key)
-            _kick_task_queue()
-            return {"status": "ok", "detail": "render queued"}
+            return complete_subtitle_handoff(
+                db=db,
+                task=task,
+                job=job,
+                automatic_runtime_profile=automatic_runtime_profile,
+                burn_in=burn_in,
+                soft_sub=soft_sub,
+                render_payload=render_payload,
+                ensure_not_stopped=lambda: _raise_if_task_stopped(db, task.id),
+                unlock_task=_task_queue_unlock,
+                kick_task_queue=_kick_task_queue,
+                log=lambda message: _safe_append_log_line(log_path, message),
+                upload_log=lambda: _safe_upload_log(store, log_path, log_key),
+            )
 
         segments: list[Segment] | None = None
         segments_asset = _download_latest_asset(AssetKind.segments_json, segments_path) if resume else None
@@ -1641,142 +1535,14 @@ def process_job(self: Any, job_id: str) -> dict[str, str]:
                 }
             else:
                 asr_cfg = dict(req.get("asr") or {})
-            asr_defaults = get_asr_settings(db, settings)
-            requested_engine = str(asr_cfg.get("engine") or "auto").strip()
-            requested_language = str(asr_cfg.get("language") or "auto").strip()
-            requested_model = str(asr_cfg.get("model") or "").strip() or None
-
-            engine = asr_defaults["default_engine"] if requested_engine in {"", "auto"} else requested_engine
-            language = asr_defaults["default_language"] if requested_language in {"", "auto"} else requested_language
-            model_name = requested_model or asr_defaults["default_model"]
-
-            if engine == "mock":
-                _safe_append_log_line(log_path, "asr: engine=mock")
-                segments = transcribe_mock(audio_path)
-            elif engine == "faster-whisper":
-                _safe_append_log_line(log_path, f"asr: engine=faster-whisper model={model_name} language={language}")
-                proxy = str(asr_defaults.get("model_download_proxy") or "").strip() or None
-                model_name = _resolve_faster_whisper_model(model_name, Path(settings.whisper_model_dir), proxy=proxy)
-                cpu_threads_cfg = _asr_cpu_threads(db)
-                num_workers_cfg = int(getattr(settings, "whisper_num_workers", 1) or 1)
-                if num_workers_cfg <= 0:
-                    num_workers_cfg = 1
-                segments = transcribe_faster_whisper(
-                    audio_path,
-                    model_name=model_name,
-                    language=language,
-                    device=settings.whisper_device,
-                    compute_type=settings.whisper_compute_type,
-                    cpu_threads=cpu_threads_cfg,
-                    num_workers=num_workers_cfg,
-                )
-            elif engine == "openvino":
-                proxy = str(asr_defaults.get("model_download_proxy") or "").strip() or None
-                model_name = _resolve_openvino_model(model_name, Path(settings.whisper_model_dir), proxy=proxy)
-                openvino_device = str(asr_defaults.get("openvino_device") or settings.openvino_device).strip() or settings.openvino_device
-                openvino_num_beams = int(asr_defaults.get("openvino_num_beams") or settings.openvino_num_beams or 1)
-                openvino_max_new_tokens = int(asr_defaults.get("openvino_max_new_tokens") or settings.openvino_max_new_tokens or 448)
-                openvino_vad_enabled = bool(asr_defaults.get("openvino_vad_enabled", settings.openvino_vad_enabled))
-                openvino_vad_threshold = float(asr_defaults.get("openvino_vad_threshold") or settings.openvino_vad_threshold or 0.5)
-                _safe_append_log_line(
-                    log_path,
-                    "asr: "
-                    f"engine=openvino model={model_name} language={language} "
-                    f"device={openvino_device} num_beams={openvino_num_beams} max_new_tokens={openvino_max_new_tokens} "
-                    f"vad_enabled={openvino_vad_enabled} vad_threshold={openvino_vad_threshold}",
-                )
-                segments = transcribe_openvino_whisper(
-                    audio_path,
-                    model_name=model_name,
-                    language=language,
-                    device=openvino_device,
-                    num_beams=openvino_num_beams,
-                    max_new_tokens=openvino_max_new_tokens,
-                    vad_enabled=openvino_vad_enabled,
-                    vad_threshold=openvino_vad_threshold,
-                )
-            elif engine == "external-whisper":
-                external_base_url = str(asr_defaults.get("external_whisper_base_url") or "").strip()
-                external_api_key = str(asr_defaults.get("external_whisper_api_key") or "").strip()
-                external_model = str(model_name or asr_defaults.get("external_whisper_model") or "").strip()
-                _safe_append_log_line(
-                    log_path,
-                    f"asr: engine=external-whisper model={external_model} base_url={external_base_url or '(empty)'} language={language}",
-                )
-                segments = transcribe_external_whisper(
-                    audio_path,
-                    base_url=external_base_url,
-                    api_key=external_api_key,
-                    model_name=external_model,
-                    language=language,
-                )
-            elif engine == "groq-whisper":
-                groq_api_key = str(asr_defaults.get("groq_whisper_api_key") or "").strip()
-                # A legacy database row may still contain a local model such
-                # as "tiny" in default_model after switching engines. Groq
-                # must resolve its own configured model unless the task
-                # explicitly supplied one.
-                groq_model = str(
-                    requested_model or asr_defaults.get("groq_whisper_model") or "whisper-large-v3-turbo"
-                ).strip()
-                groq_vad_enabled = bool(asr_defaults.get("openvino_vad_enabled", settings.openvino_vad_enabled))
-                groq_vad_threshold = float(
-                    asr_defaults.get("openvino_vad_threshold") or settings.openvino_vad_threshold or 0.5
-                )
-                _safe_append_log_line(
-                    log_path,
-                    f"asr: engine=groq-whisper model={groq_model} language={language} "
-                    "format=flac chunk=45s overlap=5s retries=5 checkpoint=enabled "
-                    f"vad_enabled={groq_vad_enabled} vad_threshold={groq_vad_threshold}",
-                )
-                segments = transcribe_groq_whisper(
-                    audio_path,
-                    api_key=groq_api_key,
-                    model_name=groq_model,
-                    language=language,
-                    ffmpeg_path=settings.ffmpeg_path,
-                    checkpoint_path=_groq_asr_checkpoint_path(),
-                    audio_identity=str(audio_key or audio_path),
-                    vad_enabled=groq_vad_enabled,
-                    vad_threshold=groq_vad_threshold,
-                    redis_url=str(settings.redis_url or ""),
-                    provider_max_concurrency=_positive_int_env("GROQ_ASR_MAX_CONCURRENCY", 1),
-                )
-            elif engine == "cloudflare-workers-ai":
-                cloudflare_account_id = str(asr_defaults.get("cloudflare_workers_ai_account_id") or "").strip()
-                cloudflare_api_key = str(asr_defaults.get("cloudflare_workers_ai_api_key") or "").strip()
-                cloudflare_model = str(
-                    model_name or asr_defaults.get("cloudflare_workers_ai_model") or ""
-                ).strip()
-                _safe_append_log_line(
-                    log_path,
-                    f"asr: engine=cloudflare-workers-ai model={cloudflare_model} "
-                    f"account_id={cloudflare_account_id or '(empty)'} language={language}",
-                )
-                segments = transcribe_cloudflare_workers_ai(
-                    audio_path,
-                    account_id=cloudflare_account_id,
-                    api_key=cloudflare_api_key,
-                    model_name=cloudflare_model,
-                    language=language,
-                    redis_url=str(settings.redis_url or ""),
-                    provider_max_concurrency=_positive_int_env("CLOUDFLARE_ASR_MAX_CONCURRENCY", 2),
-                )
-            else:
-                raise ValueError(f"unsupported ASR engine: {engine}")
-            raw_asr_segments = sorted(segments, key=lambda item: (item.start, item.end, item.text))
-            overlap_count = sum(
-                1
-                for previous, current in zip(raw_asr_segments, raw_asr_segments[1:])
-                if current.start < previous.end
+            segments = _run_asr_stage(
+                db=db,
+                audio_path=audio_path,
+                audio_key=audio_key,
+                asr_cfg=asr_cfg,
+                log_path=log_path,
+                groq_checkpoint_path=_groq_asr_checkpoint_path(),
             )
-            segments = reconcile_overlapping_asr_segments(raw_asr_segments)
-            if overlap_count or len(segments) != len(raw_asr_segments):
-                _safe_append_log_line(
-                    log_path,
-                    "asr timeline reconciled before translation: "
-                    f"overlaps={overlap_count} segments={len(raw_asr_segments)}->{len(segments)}",
-                )
             _store_source_segments(segments, source_label="asr done")
 
         job.progress = 60
@@ -1797,490 +1563,144 @@ def process_job(self: Any, job_id: str) -> dict[str, str]:
             }
         else:
             translate_cfg = dict(req.get("translate") or {})
-        translate_enabled = bool(translate_cfg.get("enabled"))
         if skip_translation_for_target_subtitle:
             translate_cfg["enabled"] = False
-        target_lang = str(translate_cfg.get("target_lang") or "zh").strip() or "zh"
-        provider = str(translate_cfg.get("provider") or "mock").strip() or "mock"
-        bilingual = bool(translate_cfg.get("bilingual"))
-        segments_out = segments
-        translation_summary = ""
+
+        try:
+            translation_result = run_translation_stage(
+                db=db,
+                task_id=str(task.id),
+                subtitle_job_id=str(job.id),
+                segments=segments,
+                source_segments_key=segments_key,
+                translate_cfg=translate_cfg,
+                checkpoint=translation_checkpoint,
+                trace=translation_trace_recorder(db),
+                retry_attempt=int(getattr(self.request, "retries", 0) or 0),
+                database_url=settings.database_url,
+                fresh_translate_settings=_fresh_translate_settings,
+                ai_service_factory=_ai_service,
+                log=lambda message: _safe_append_log_line(log_path, message),
+            )
+        except TranslationRetryRequired as retry:
+            req["resume"] = True
+            _save_job_request()
+            job.error_message = (
+                f"translate failed; celery retrying "
+                f"({retry.retry_no}/{retry.max_retries}): {retry.cause}"
+            )
+            db.add(job)
+            db.commit()
+            _safe_append_log_line(
+                log_path,
+                f"translate retry {retry.retry_no}/{retry.max_retries}: "
+                f"{type(retry.cause).__name__}: {retry.cause}",
+            )
+            _safe_upload_log(store, log_path, log_key)
+            raise self.retry(
+                exc=retry.cause,
+                countdown=retry.countdown,
+                max_retries=retry.max_retries,
+            )
+
+        translate_enabled = translation_result.enabled
+        provider = translation_result.provider
+        target_lang = translation_result.target_lang
+        bilingual = translation_result.bilingual
+        segments_out = translation_result.segments
+        translation_summary = translation_result.summary
         if translate_enabled:
-            _safe_append_log_line(log_path, f"translate: provider={provider} target_lang={target_lang} bilingual={bilingual}")
-            ai_service = _ai_service()
-            translate_settings = _fresh_translate_settings()
-            style = str(translate_cfg.get("style") or translate_settings["default_style"]).strip() or translate_settings["default_style"]
-            batch_size = int(translate_cfg.get("batch_size") or translate_settings["default_batch_size"])
-            enable_summary_val = translate_cfg.get("enable_summary")
-            enable_summary = translate_settings["default_enable_summary"] if enable_summary_val is None else bool(enable_summary_val)
-
-            max_retries = max(0, int(translate_settings.get("default_max_retries") or 0))
-            thinking_enabled = provider == "openai" and bool(translate_settings.get("openai_enable_thinking"))
-            thinking_model = str(translate_settings.get("openai_model") or "").strip()
-            translation_session_run_id: str | None = None
-            translation_session_resumed_segments = 0
-            translation_batch_count = 0
-            translation_succeeded_batches = 0
-            translation_failed_batches = 0
-            translation_completed_segments = 0
-            translation_thought_characters = 0
-
-            def _flush_batch_thinking(batch_context: Any, *, force: bool = False) -> None:
-                if not isinstance(batch_context, dict):
-                    return
-                pending = str(batch_context.get("thinking_pending") or "")
-                run_id = str(batch_context.get("run_id") or "")
-                if not run_id or not pending:
-                    return
-                last_flush_at = float(batch_context.get("thinking_last_flush_at") or 0.0)
-                if not force and len(pending) < 800 and time.monotonic() - last_flush_at < 0.25:
-                    return
-                batch_context["thinking_pending"] = ""
-                batch_context["thinking_last_flush_at"] = time.monotonic()
-                append_translation_batch_thinking_delta(
-                    db,
-                    run_id,
-                    model=thinking_model,
-                    delta=pending,
-                    batch_start=int(batch_context.get("segment_start") or 1),
-                    batch_size=int(batch_context.get("requested_segments") or 1),
-                    truncated=bool(batch_context.get("thinking_storage_limited")),
-                )
-                batch_context["thinking_stored_characters"] = int(batch_context.get("thinking_stored_characters") or 0) + len(pending)
-
-            def _on_translate_batch_start(batch_segments: list[Segment], start_idx: int, summary: str) -> dict[str, Any]:
-                nonlocal translation_batch_count
-                translation_batch_count += 1
-                batch_context: dict[str, Any] = {
-                    "run_id": None,
-                    "batch_number": translation_batch_count,
-                    "segment_start": start_idx + 1,
-                    "requested_segments": len(batch_segments),
-                    "started_at": time.monotonic(),
-                    "thinking_pending": "",
-                    "thinking_last_flush_at": time.monotonic(),
-                    "thinking_received_characters": 0,
-                    "thinking_stored_characters": 0,
-                    "thinking_storage_limited": False,
-                    "finished": False,
-                }
-                if translation_session_run_id:
-                    try:
-                        batch_context["run_id"] = start_translation_batch(
-                            db,
-                            parent_session_run_id=translation_session_run_id,
-                            task_id=str(task.id),
-                            subtitle_job_id=str(job.id),
-                            target_lang=target_lang,
-                            model=thinking_model,
-                            batch_number=translation_batch_count,
-                            segment_start=start_idx + 1,
-                            source_segments=batch_segments,
-                            previous_summary=summary,
-                            thinking_enabled=thinking_enabled,
-                        )
-                    except Exception as trace_error:
-                        db.rollback()
-                        _safe_append_log_line(
-                            log_path,
-                            f"translate batch trace unavailable: {type(trace_error).__name__}: {trace_error}",
-                        )
-                return batch_context
-
-            def _on_translate_thinking(
-                delta: str,
-                batch_start: int,
-                batch_size: int,
-                batch_context: Any,
-            ) -> None:
-                nonlocal translation_thought_characters
-                del batch_start, batch_size
-                if not isinstance(batch_context, dict):
-                    return
-                clean_delta = str(delta or "")
-                if not clean_delta:
-                    return
-                translation_thought_characters += len(clean_delta)
-                batch_context["thinking_received_characters"] = int(batch_context.get("thinking_received_characters") or 0) + len(clean_delta)
-                max_stored_characters = 32_000
-                stored = int(batch_context.get("thinking_stored_characters") or 0)
-                pending = str(batch_context.get("thinking_pending") or "")
-                remaining = max_stored_characters - stored - len(pending)
-                if remaining <= 0:
-                    batch_context["thinking_storage_limited"] = True
-                    return
-                if len(clean_delta) > remaining:
-                    clean_delta = clean_delta[:remaining]
-                    batch_context["thinking_storage_limited"] = True
-                batch_context["thinking_pending"] = pending + clean_delta
-                _flush_batch_thinking(batch_context)
-
-            def _is_retryable_translate_error(err: Exception) -> bool:
-                msg = str(err or "")
-                if "api key is not set" in msg.lower():
-                    return False
-                return True
-
-            def _translate_retry_countdown(attempt: int) -> float:
-                # Exponential backoff: 2s, 4s, 8s... capped at 30s.
-                return min(30.0, float(2 ** max(0, attempt)))
-
-            while True:
-                try:
-                    if provider == "mock":
-                        segments_out = translate_segments_mock(segments, target_lang=target_lang)
-                    elif provider in {"noop", "none"}:
-                        segments_out = segments
-                    elif provider == "openai":
-                        resume_prefix, resume_summary = _load_translation_checkpoint(segments, source_segments_key=segments_key)
-                        translation_session_resumed_segments = len(resume_prefix)
-                        translation_completed_segments = len(resume_prefix)
-                        if resume_prefix:
-                            _safe_append_log_line(
-                                log_path,
-                                f"translate: resuming from checkpoint at segment {len(resume_prefix)}/{len(segments)}",
-                            )
-
-                        if translation_session_run_id is None:
-                            try:
-                                translation_session_run_id = start_translation_session(
-                                    db,
-                                    task_id=str(task.id),
-                                    subtitle_job_id=str(job.id),
-                                    target_lang=target_lang,
-                                    model=thinking_model,
-                                    segment_count=len(segments),
-                                    resumed_segments=len(resume_prefix),
-                                    retry_attempt=int(getattr(self.request, "retries", 0) or 0),
-                                    thinking_enabled=thinking_enabled,
-                                )
-                            except Exception as trace_error:
-                                db.rollback()
-                                _safe_append_log_line(
-                                    log_path,
-                                    f"translate session trace unavailable: {type(trace_error).__name__}: {trace_error}",
-                                )
-
-                        checkpoint_segments = list(resume_prefix)
-                        rag_settings = rag_settings_from_translate_settings(translate_settings)
-
-                        if rag_settings.enabled:
-                            _safe_append_log_line(
-                                log_path,
-                                "translate rag: "
-                                f"enabled top_k={rag_settings.top_k} min_score={rag_settings.min_score} "
-                                f"embedding_provider={rag_settings.embedding_provider} embedding_model={rag_settings.embedding_model} "
-                                f"domain={rag_settings.domain or '(any)'}",
-                            )
-
-                        def _rag_context_provider(
-                            batch_segments: list[Segment],
-                            start_idx: int,
-                            summary: str,
-                            batch_context: Any,
-                        ) -> dict[str, Any] | None:
-                            del start_idx
-                            current_translate_settings = _fresh_translate_settings()
-                            rag_settings = rag_settings_from_translate_settings(current_translate_settings)
-                            if not rag_settings.enabled:
-                                return None
-                            rag_chat_config = openai_chat_config_from_settings(current_translate_settings)
-                            rag_embedding_settings = embedding_settings_from_translate_settings(current_translate_settings)
-                            ctx = build_rag_context(
-                                db,
-                                segments=batch_segments,
-                                target_lang=target_lang,
-                                rag_settings=rag_settings,
-                                embedding_settings=rag_embedding_settings,
-                                chat_config=rag_chat_config,
-                                previous_summary=summary,
-                                session_factory=lambda: get_sessionmaker(settings.database_url)(),
-                                task_id=str(task.id),
-                                subtitle_job_id=str(job.id),
-                                parent_agent_run_id=(
-                                    str(batch_context.get("run_id") or "")
-                                    if isinstance(batch_context, dict) and batch_context.get("run_id")
-                                    else None
-                                ),
-                            )
-                            if ctx.hits:
-                                try:
-                                    db.commit()
-                                except Exception:
-                                    db.rollback()
-                            if not ctx.term_cards and not ctx.knowledge_cards:
-                                return None
-                            return {
-                                "term_cards": ctx.term_cards,
-                                "knowledge_cards": ctx.knowledge_cards,
-                            }
-
-                        def _on_translate_batch_done(
-                            batch_context: Any,
-                            batch_segments: list[Segment],
-                            updated_summary: str,
-                            completed_count: int,
-                        ) -> None:
-                            nonlocal translation_completed_segments, translation_succeeded_batches
-                            checkpoint_segments.extend(batch_segments)
-                            _save_translation_checkpoint(segments_key, checkpoint_segments, summary=updated_summary)
-                            translation_completed_segments = completed_count
-                            translation_succeeded_batches += 1
-                            _flush_batch_thinking(batch_context, force=True)
-                            if isinstance(batch_context, dict):
-                                finish_translation_batch(
-                                    db,
-                                    str(batch_context.get("run_id") or "") or None,
-                                    parent_session_run_id=translation_session_run_id,
-                                    status="succeeded" if len(batch_segments) == int(batch_context.get("requested_segments") or 0) else "partial",
-                                    batch_number=int(batch_context.get("batch_number") or 1),
-                                    segment_start=int(batch_context.get("segment_start") or 1),
-                                    requested_segments=int(batch_context.get("requested_segments") or len(batch_segments)),
-                                    translated_segments=batch_segments,
-                                    completed_segments=completed_count,
-                                    updated_summary=updated_summary,
-                                    thought_characters=int(batch_context.get("thinking_received_characters") or 0),
-                                    thought_truncated=bool(batch_context.get("thinking_storage_limited")),
-                                    duration_ms=int((time.monotonic() - float(batch_context.get("started_at") or time.monotonic())) * 1000),
-                                )
-                                batch_context["finished"] = True
-
-                        def _on_translate_batch_error(batch_context: Any, error: Exception) -> None:
-                            nonlocal translation_failed_batches
-                            if not isinstance(batch_context, dict) or bool(batch_context.get("finished")):
-                                return
-                            translation_failed_batches += 1
-                            _flush_batch_thinking(batch_context, force=True)
-                            finish_translation_batch(
-                                db,
-                                str(batch_context.get("run_id") or "") or None,
-                                parent_session_run_id=translation_session_run_id,
-                                status="failed",
-                                batch_number=int(batch_context.get("batch_number") or 1),
-                                segment_start=int(batch_context.get("segment_start") or 1),
-                                requested_segments=int(batch_context.get("requested_segments") or 0),
-                                completed_segments=translation_completed_segments,
-                                thought_characters=int(batch_context.get("thinking_received_characters") or 0),
-                                thought_truncated=bool(batch_context.get("thinking_storage_limited")),
-                                duration_ms=int((time.monotonic() - float(batch_context.get("started_at") or time.monotonic())) * 1000),
-                                error=str(error),
-                            )
-                            batch_context["finished"] = True
-
-                        segments_out, translation_summary = translate_segments_openai_with_summary(
-                            segments,
-                            target_lang=target_lang,
-                            style=style,
-                            api_key=None,
-                            base_url="",
-                            model="",
-                            temperature=translate_settings["openai_temperature"],
-                            timeout_seconds=translate_settings["openai_timeout_seconds"],
-                            batch_size=batch_size,
-                            enable_summary=enable_summary,
-                            resume_from=resume_prefix,
-                            initial_summary=resume_summary,
-                            ai_service=ai_service,
-                            enable_thinking=thinking_enabled,
-                            on_batch_start=_on_translate_batch_start,
-                            rag_context_provider_with_context=_rag_context_provider,
-                            on_batch_done_with_context=_on_translate_batch_done,
-                            on_batch_error=_on_translate_batch_error,
-                            on_thinking_delta_with_context=_on_translate_thinking if thinking_enabled else None,
-                        )
-                    else:
-                        raise ValueError(f"unsupported translate provider: {provider}")
-                    translation_completed_segments = len(segments_out)
-                    if translation_session_run_id:
-                        finish_translation_session(
-                            db,
-                            translation_session_run_id,
-                            status="succeeded",
-                            total_segments=len(segments),
-                            completed_segments=translation_completed_segments,
-                            resumed_segments=translation_session_resumed_segments,
-                            batch_count=translation_batch_count,
-                            succeeded_batches=translation_succeeded_batches,
-                            failed_batches=translation_failed_batches,
-                            thought_characters=translation_thought_characters,
-                        )
-                    job.error_message = None
-                    db.add(job)
-                    db.commit()
-                    break
-                except Exception as e:
-                    if translation_session_run_id:
-                        finish_translation_session(
-                            db,
-                            translation_session_run_id,
-                            status="failed",
-                            total_segments=len(segments),
-                            completed_segments=translation_completed_segments,
-                            resumed_segments=translation_session_resumed_segments,
-                            batch_count=translation_batch_count,
-                            succeeded_batches=translation_succeeded_batches,
-                            failed_batches=translation_failed_batches,
-                            thought_characters=translation_thought_characters,
-                            error=str(e),
-                        )
-                    retry_no = int(getattr(self.request, "retries", 0) or 0) + 1
-                    if provider != "openai" or retry_no > max_retries or not _is_retryable_translate_error(e):
-                        raise
-                    req["resume"] = True
-                    _save_job_request()
-                    job.error_message = f"translate failed; celery retrying ({retry_no}/{max_retries}): {e}"
-                    db.add(job)
-                    db.commit()
-                    _safe_append_log_line(log_path, f"translate retry {retry_no}/{max_retries}: {type(e).__name__}: {e}")
-                    _safe_upload_log(store, log_path, log_key)
-                    raise self.retry(exc=e, countdown=_translate_retry_countdown(retry_no), max_retries=max_retries)
+            style = translation_result.style
+            ai_service = translation_result.ai_service
+            if ai_service is None:
+                raise RuntimeError("translation stage returned no AI service")
+            job.error_message = None
+            db.add(job)
+            db.commit()
             _raise_if_task_stopped(db, task.id)
             task.status = TaskStatus.translated
             db.add(task)
 
-            # Best-effort: store translated title for UI display / downloads.
-            try:
-                title_src = _latest_youtube_title(db, store, task.id)
-                if title_src:
-                    title_out = title_src
-                    if provider == "openai" and not _has_cjk(title_src):
-                        try:
-                            title_out = _translate_title_openai(
-                                title_src,
-                                target_lang=target_lang,
-                                style=style,
-                                summary=translation_summary,
-                                ai_service=ai_service,
-                            )
-                        except Exception:
-                            title_out = title_src
-                    set_task_titles(db, str(task.id), source_title=title_src, translated_title=title_out)
-            except Exception:
-                pass
-
-            # Best-effort: generate Bilibili tags from translation summary + transcript excerpt.
-            try:
-                title_hint = _latest_youtube_title(db, store, task.id)
-                transcript_excerpt = _segments_text_excerpt(segments_out, max_chars=7000)
-                tags: list[str] = []
-                if provider == "openai":
-                    try:
-                        tags = ai_service.generate_bilibili_tags(
-                            title=title_hint,
-                            summary=translation_summary,
-                            transcript=transcript_excerpt,
-                            n_tags=6,
-                        )
-                    except Exception:
-                        tags = []
-                if len(tags) < 6:
-                    tags = _fallback_bilibili_tags(title=title_hint, summary=translation_summary, transcript=transcript_excerpt, n=6)
-                if tags:
-                    set_task_bilibili_tags(db, str(task.id), tags=tags[:6], title=title_hint, summary=translation_summary)
-            except Exception:
-                pass
-
-            # The automatic publish draft may have been created before the
-            # subtitle job started. Rebuild it now so the final submission
-            # uses the title translated with the completed video summary.
-            try:
-                after_render_cfg = req.get("after_render") if isinstance(req.get("after_render"), dict) else {}
-                if after_render_cfg.get("publish"):
-                    final_publish_meta = build_task_publish_meta_draft(task, db=db, s3=store, mode="source")
-                    store.put_bytes(
-                        json.dumps(final_publish_meta, ensure_ascii=False, indent=2).encode("utf-8"),
-                        f"meta/{task.id}/publish_meta.json",
-                        content_type="application/json",
-                    )
-                    _safe_append_log_line(log_path, "publish meta refreshed after summary-aware title translation")
-            except Exception as meta_error:
-                _safe_append_log_line(log_path, f"publish meta refresh skipped: {type(meta_error).__name__}: {meta_error}")
-
-            if bilingual:
-                merged: list[Segment] = []
-                for src_seg, zh_seg in zip(segments, segments_out):
-                    merged.append(
-                        Segment(
-                            start=zh_seg.start,
-                            end=zh_seg.end,
-                            text=zh_seg.text,
-                            confidence=zh_seg.confidence,
-                            secondary_text=str(src_seg.text or "").strip() or None,
-                        )
-                    )
-                segments_out = merged
-
-        srt_text = segments_to_srt(segments_out)
-        srt_path.write_text(srt_text, encoding="utf-8")
-        _store_final_subtitle_segments(segments_out)
-        srt_sha = sha256_file(srt_path)
-        srt_key = _unique_storage_key(
-            f"sub/{task.id}/subtitle_zh",
-            srt_sha,
-            ".srt",
-        )
-        store.upload_file(srt_path, srt_key, content_type="text/plain")
-        _clear_translation_checkpoint()
-        db.add(
-            Asset(
-                task_id=task.id,
-                kind=AssetKind.subtitle_srt,
-                storage_key=srt_key,
-                sha256=srt_sha,
-                size_bytes=srt_path.stat().st_size,
+            segments_out = postprocess_translation(
+                db=db,
+                store=store,
+                task=task,
+                request_json=req,
+                source_segments=segments,
+                translated_segments=segments_out,
+                provider=provider,
+                target_lang=target_lang,
+                style=style,
+                summary=translation_summary,
+                bilingual=bilingual,
+                ai_service=ai_service,
+                log=lambda message: _safe_append_log_line(log_path, message),
             )
-        )
-        db.add(Subtitle(task_id=task.id, version=1, format=SubtitleFormat.srt, language="zh", storage_key=srt_key))
-        _safe_append_log_line(log_path, f"subtitle srt uploaded: {srt_key}")
 
         if automatic_runtime_profile:
             output_profile = _current_auto_profile()
             need_ass = "ass" in list(output_profile.get("formats") or ["srt", "ass"])
-        if need_ass:
-            ass_key = _store_ass_from_segments(segments_out, log_prefix="subtitle ass uploaded")
-
-        _raise_if_task_stopped(db, task.id)
-        task.status = TaskStatus.subtitle_ready
-        db.add(task)
-        job.progress = 80
-        db.add(job)
-        db.commit()
-        _safe_upload_log(store, log_path, log_key)
-
-        _raise_if_task_stopped(db, task.id)
-        if not automatic_runtime_profile and not burn_in and not soft_sub:
-            job.status = SubtitleJobStatus.succeeded
-            job.progress = 100
-            _task_queue_unlock(task)
-            db.add(task)
-            db.add(job)
-            db.commit()
-            _safe_append_log_line(log_path, "subtitle job done (no render configured)")
-            _safe_upload_log(store, log_path, log_key)
-            _kick_task_queue()
-            return {"status": "ok"}
-
-        existing = (
-            db.query(RenderJob)
-            .filter(
-                RenderJob.subtitle_job_id == job.id,
-                RenderJob.status.in_([RenderJobStatus.queued, RenderJobStatus.running]),
-            )
-            .order_by(RenderJob.created_at.desc())
-            .first()
+        ass_bilingual = bool(
+            (req.get("translate") if isinstance(req.get("translate"), dict) else {}).get("bilingual")
         )
-        if not existing:
-            payload = _build_render_job_payload(srt_key_value=srt_key, ass_key_value=ass_key)
-            db.add(RenderJob(task_id=task.id, subtitle_job_id=job.id, status=RenderJobStatus.queued, progress=0, request_json=payload))
+        outputs = persist_subtitle_outputs(
+            db=db,
+            store=store,
+            task=task,
+            job=job,
+            request_json=req,
+            segments=segments_out,
+            subtitle_segments_path=subtitle_segments_path,
+            srt_path=srt_path,
+            ass_path=ass_path,
+            video_path=video_path,
+            ffmpeg_path=settings.ffmpeg_path,
+            render_cfg=render_cfg,
+            need_ass=need_ass,
+            ass_bilingual=ass_bilingual,
+            unique_storage_key=_unique_storage_key,
+            clear_translation_checkpoint=translation_checkpoint.clear,
+            log=lambda message: _safe_append_log_line(log_path, message),
+        )
+        srt_key = outputs.srt_key
+        ass_key = outputs.ass_key
 
-        job.status = SubtitleJobStatus.succeeded
-        job.progress = 100
-        db.add(job)
-        db.commit()
-        _safe_append_log_line(log_path, "render queued; waiting for task queue")
+        _raise_if_task_stopped(db, task.id)
+        mark_subtitle_ready(
+            db=db,
+            task=task,
+            job=job,
+            resume_existing=False,
+        )
         _safe_upload_log(store, log_path, log_key)
-        _kick_task_queue()
-        return {"status": "ok", "detail": "render queued"}
+
+        render_payload = build_render_job_payload(
+            request_json=req,
+            input_key=input_key,
+            srt_key=srt_key,
+            ass_key=ass_key,
+            automatic_runtime_profile=automatic_runtime_profile,
+            burn_in=burn_in,
+            soft_sub=soft_sub,
+            video_codec=video_codec,
+            use_intel_gpu=use_intel_gpu,
+            video_preset=video_preset,
+            video_crf=video_crf,
+        )
+        return complete_subtitle_handoff(
+            db=db,
+            task=task,
+            job=job,
+            automatic_runtime_profile=automatic_runtime_profile,
+            burn_in=burn_in,
+            soft_sub=soft_sub,
+            render_payload=render_payload,
+            ensure_not_stopped=lambda: _raise_if_task_stopped(db, task.id),
+            unlock_task=_task_queue_unlock,
+            kick_task_queue=_kick_task_queue,
+            log=lambda message: _safe_append_log_line(log_path, message),
+            upload_log=lambda: _safe_upload_log(store, log_path, log_key),
+        )
     except _TaskStopped:
         _pause_subtitle_job_if_task_stopped(db, jid)
         return {"status": "stopped", "detail": "task stopped by user"}
@@ -3057,7 +2477,7 @@ def _after_render_publish_impl(render_job_id: str) -> dict[str, Any]:
             )
             if final_asset is None:
                 return {"status": "skipped", "detail": "current render box produced no final video"}
-            action = build_auto_publish_after_render(task, db=db, s3=store)
+            action = build_auto_publish_after_render(task, db=db, store=store)
             publish_payload = dict(action.get("publish_payload") or {})
         else:
             if not after_render.get("publish"):
@@ -3202,7 +2622,7 @@ def _cleanup_task_impl(self: Any, task_id: str, batch_id: str | None = None) -> 
     """
     Best-effort cleanup after a task is published:
       - delete local WORK_DIR temp dirs for subtitle/render/youtube
-      - delete non-final S3 assets to prevent storage from growing forever
+      - delete non-final stored assets to prevent storage from growing forever
     Keeps:
       - AssetKind.video_final
       - AssetKind.publish_result

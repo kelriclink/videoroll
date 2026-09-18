@@ -95,6 +95,75 @@ def _resp_snippet(resp: httpx.Response, limit: int = 200) -> str:
     return text
 
 
+def _content_type(resp: httpx.Response) -> str:
+    return (resp.headers.get("content-type") or "").split(";")[0].strip()
+
+
+def _sleep_before_retry(resp: httpx.Response | None, attempt: int) -> None:
+    retry_after = (resp.headers.get("retry-after") or "").strip() if resp is not None else ""
+    if retry_after:
+        try:
+            time.sleep(min(30.0, float(retry_after)))
+            return
+        except (TypeError, ValueError):
+            pass
+    _sleep_backoff(attempt)
+
+
+def _post_json_with_retries(
+    *,
+    client: httpx.Client,
+    url: str,
+    headers: dict[str, str],
+    payload: dict[str, Any],
+    network_retries: int,
+    request_label: str,
+    endpoint_label: str,
+    html_base_url_hint: bool = False,
+) -> Any:
+    attempts = max(1, int(network_retries))
+    last_err: Exception | None = None
+
+    for net_attempt in range(attempts):
+        try:
+            resp = client.post(url, headers=headers, json=payload)
+            try:
+                resp.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                if resp.status_code in _RETRYABLE_STATUS_CODES and net_attempt < attempts - 1:
+                    _sleep_before_retry(resp, net_attempt)
+                    continue
+                raise RuntimeError(
+                    f"{request_label} failed "
+                    f"(status={resp.status_code}, content-type={_content_type(resp)}, url={url}). "
+                    f"{_resp_snippet(resp)}"
+                ) from exc
+
+            try:
+                return resp.json()
+            except Exception as exc:
+                content_type = _content_type(resp)
+                hint = (
+                    " (check openai_base_url; most providers require it to end with /v1)"
+                    if html_base_url_hint and "text/html" in content_type
+                    else ""
+                )
+                raise RuntimeError(
+                    f"{endpoint_label} did not return JSON "
+                    f"(status={resp.status_code}, content-type={content_type}, url={url}){hint}."
+                ) from exc
+        except (httpx.TimeoutException, httpx.TransportError) as exc:
+            last_err = exc
+            if net_attempt < attempts - 1:
+                _sleep_backoff(net_attempt)
+                continue
+            break
+
+    if last_err is not None:
+        raise last_err
+    raise RuntimeError(f"{request_label} failed")
+
+
 def _strip_code_fence(text: str) -> str:
     out = (text or "").strip()
     if out.startswith("```"):
@@ -259,55 +328,20 @@ def _request_openai_json_object_with_client(
             "response_format": {"type": "json_object"},
         }
 
-        for net_attempt in range(attempts_network):
-            try:
-                resp = client.post(url, headers=headers, json=req)
-                try:
-                    resp.raise_for_status()
-                except httpx.HTTPStatusError as e:
-                    status = resp.status_code
-                    if status in _RETRYABLE_STATUS_CODES and net_attempt < attempts_network - 1:
-                        retry_after = (resp.headers.get("retry-after") or "").strip()
-                        if retry_after:
-                            try:
-                                time.sleep(min(30.0, float(retry_after)))
-                            except Exception:
-                                _sleep_backoff(net_attempt)
-                        else:
-                            _sleep_backoff(net_attempt)
-                        continue
-
-                    ct = (resp.headers.get("content-type") or "").split(";")[0].strip()
-                    snippet = _resp_snippet(resp)
-                    raise RuntimeError(
-                        f"OpenAI request failed (status={resp.status_code}, content-type={ct}, url={url}). {snippet}"
-                    ) from e
-
-                try:
-                    resp_json = resp.json()
-                except Exception as e:
-                    ct = (resp.headers.get("content-type") or "").split(";")[0].strip()
-                    hint = " (check openai_base_url; most providers require it to end with /v1)" if "text/html" in ct else ""
-                    raise RuntimeError(
-                        f"OpenAI endpoint did not return JSON (status={resp.status_code}, content-type={ct}, url={url}){hint}."
-                    ) from e
-
-                return _parse_json_object(resp_json)
-            except httpx.TimeoutException as e:
-                last_err = e
-                if net_attempt < attempts_network - 1:
-                    _sleep_backoff(net_attempt)
-                    continue
-                break
-            except httpx.TransportError as e:
-                last_err = e
-                if net_attempt < attempts_network - 1:
-                    _sleep_backoff(net_attempt)
-                    continue
-                break
-            except Exception as e:
-                last_err = e
-                break
+        try:
+            resp_json = _post_json_with_retries(
+                client=client,
+                url=url,
+                headers=headers,
+                payload=req,
+                network_retries=attempts_network,
+                request_label="OpenAI request",
+                endpoint_label="OpenAI endpoint",
+                html_base_url_hint=True,
+            )
+            return _parse_json_object(resp_json)
+        except Exception as e:
+            last_err = e
 
     if last_err is not None:
         raise last_err
@@ -408,14 +442,7 @@ def _request_openai_json_object_with_thinking_with_client(
                         raw_body = resp.read().decode("utf-8", errors="replace")
                         status = resp.status_code
                         if status in _RETRYABLE_STATUS_CODES and net_attempt < attempts_network - 1:
-                            retry_after = (resp.headers.get("retry-after") or "").strip()
-                            if retry_after:
-                                try:
-                                    time.sleep(min(30.0, float(retry_after)))
-                                except Exception:
-                                    _sleep_backoff(net_attempt)
-                            else:
-                                _sleep_backoff(net_attempt)
+                            _sleep_before_retry(resp, net_attempt)
                             continue
                         ct = (resp.headers.get("content-type") or "").split(";")[0].strip()
                         snippet = " ".join(raw_body.replace("\r", " ").replace("\n", " ").split())[:200]
@@ -559,51 +586,16 @@ def _request_openai_tool_turn_with_client(
         "tools": tools,
         "tool_choice": tool_choice,
     }
-    last_err: Exception | None = None
-    for net_attempt in range(max(1, int(network_retries))):
-        try:
-            resp = client.post(url, headers=headers, json=req)
-            try:
-                resp.raise_for_status()
-            except httpx.HTTPStatusError as e:
-                status = resp.status_code
-                if status in _RETRYABLE_STATUS_CODES and net_attempt < max(1, int(network_retries)) - 1:
-                    retry_after = (resp.headers.get("retry-after") or "").strip()
-                    if retry_after:
-                        try:
-                            time.sleep(min(30.0, float(retry_after)))
-                        except Exception:
-                            _sleep_backoff(net_attempt)
-                    else:
-                        _sleep_backoff(net_attempt)
-                    continue
-                ct = (resp.headers.get("content-type") or "").split(";")[0].strip()
-                raise RuntimeError(
-                    f"OpenAI tool request failed (status={resp.status_code}, content-type={ct}, url={url}). {_resp_snippet(resp)}"
-                ) from e
-            try:
-                payload = resp.json()
-            except Exception as e:
-                raise RuntimeError(f"OpenAI tool endpoint did not return JSON (status={resp.status_code}, url={url})") from e
-            return _parse_openai_tool_turn(payload)
-        except httpx.TimeoutException as e:
-            last_err = e
-            if net_attempt < max(1, int(network_retries)) - 1:
-                _sleep_backoff(net_attempt)
-                continue
-            break
-        except httpx.TransportError as e:
-            last_err = e
-            if net_attempt < max(1, int(network_retries)) - 1:
-                _sleep_backoff(net_attempt)
-                continue
-            break
-        except Exception as e:
-            last_err = e
-            break
-    if last_err is not None:
-        raise last_err
-    raise RuntimeError("OpenAI tool request failed")
+    payload = _post_json_with_retries(
+        client=client,
+        url=url,
+        headers=headers,
+        payload=req,
+        network_retries=network_retries,
+        request_label="OpenAI tool request",
+        endpoint_label="OpenAI tool endpoint",
+    )
+    return _parse_openai_tool_turn(payload)
 
 
 def request_openai_tool_turn(
@@ -650,70 +642,25 @@ def request_openai_embedding(
     if config.embedding_dimensions is not None and config.embedding_dimensions > 0:
         req["dimensions"] = int(config.embedding_dimensions)
     attempts_network = max(1, int(network_retries))
-    last_err: Exception | None = None
-
     def _with_client(c: httpx.Client) -> list[float]:
-        nonlocal last_err
-        for net_attempt in range(attempts_network):
-            try:
-                resp = c.post(url, headers=headers, json=req)
-                try:
-                    resp.raise_for_status()
-                except httpx.HTTPStatusError as e:
-                    status = resp.status_code
-                    if status in _RETRYABLE_STATUS_CODES and net_attempt < attempts_network - 1:
-                        retry_after = (resp.headers.get("retry-after") or "").strip()
-                        if retry_after:
-                            try:
-                                time.sleep(min(30.0, float(retry_after)))
-                            except Exception:
-                                _sleep_backoff(net_attempt)
-                        else:
-                            _sleep_backoff(net_attempt)
-                        continue
+        resp_json = _post_json_with_retries(
+            client=c,
+            url=url,
+            headers=headers,
+            payload=req,
+            network_retries=attempts_network,
+            request_label="OpenAI embedding request",
+            endpoint_label="OpenAI embedding endpoint",
+            html_base_url_hint=True,
+        )
+        try:
+            raw = resp_json["data"][0]["embedding"]
+        except Exception as e:
+            raise RuntimeError(f"unexpected OpenAI embedding response shape: {resp_json}") from e
 
-                    ct = (resp.headers.get("content-type") or "").split(";")[0].strip()
-                    snippet = _resp_snippet(resp)
-                    raise RuntimeError(
-                        f"OpenAI embedding request failed (status={resp.status_code}, content-type={ct}, url={url}). {snippet}"
-                    ) from e
-
-                try:
-                    resp_json = resp.json()
-                except Exception as e:
-                    ct = (resp.headers.get("content-type") or "").split(";")[0].strip()
-                    hint = " (check openai_base_url; most providers require it to end with /v1)" if "text/html" in ct else ""
-                    raise RuntimeError(
-                        f"OpenAI embedding endpoint did not return JSON (status={resp.status_code}, content-type={ct}, url={url}){hint}."
-                    ) from e
-
-                try:
-                    raw = resp_json["data"][0]["embedding"]
-                except Exception as e:
-                    raise RuntimeError(f"unexpected OpenAI embedding response shape: {resp_json}") from e
-
-                if not isinstance(raw, list) or not raw:
-                    raise RuntimeError("OpenAI embedding output is empty")
-                return [float(x) for x in raw]
-            except httpx.TimeoutException as e:
-                last_err = e
-                if net_attempt < attempts_network - 1:
-                    _sleep_backoff(net_attempt)
-                    continue
-                break
-            except httpx.TransportError as e:
-                last_err = e
-                if net_attempt < attempts_network - 1:
-                    _sleep_backoff(net_attempt)
-                    continue
-                break
-            except Exception as e:
-                last_err = e
-                break
-
-        if last_err is not None:
-            raise last_err
-        raise RuntimeError("OpenAI embedding request failed")
+        if not isinstance(raw, list) or not raw:
+            raise RuntimeError("OpenAI embedding output is empty")
+        return [float(x) for x in raw]
 
     if client is not None:
         return _with_client(client)

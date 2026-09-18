@@ -71,7 +71,7 @@ def test_orchestrator_rejects_published_subtitle_actions_before_forwarding(db: S
         if resume:
             subtitle_service.resume_subtitle_job(task.id, settings=_settings(), db=db)
         else:
-            subtitle_service.enqueue_subtitle_job(task.id, SubtitleActionRequest(), settings=_settings(), db=db, s3=object())
+            subtitle_service.enqueue_subtitle_job(task.id, SubtitleActionRequest(), settings=_settings(), db=db, store=object())
 
     assert caught.value.status_code == 409
     assert "published" in str(caught.value.detail)

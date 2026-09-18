@@ -35,7 +35,10 @@ from videoroll.config import OrchestratorSettings
 router = APIRouter()
 
 
-@router.api_route("/subtitle/{service_path:path}", methods=["GET", "POST", "PUT", "DELETE"])
+@router.get("/subtitle/{service_path:path}", operation_id="proxy_subtitle_browser_get")
+@router.post("/subtitle/{service_path:path}", operation_id="proxy_subtitle_browser_post")
+@router.put("/subtitle/{service_path:path}", operation_id="proxy_subtitle_browser_put")
+@router.delete("/subtitle/{service_path:path}", operation_id="proxy_subtitle_browser_delete")
 async def proxy_subtitle_browser_operation(
     service_path: str,
     request: Request,

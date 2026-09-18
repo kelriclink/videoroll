@@ -6,7 +6,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.orm import Session
 
-from videoroll.apps.orchestrator_api.dependencies import get_db, get_s3, get_settings
+from videoroll.apps.orchestrator_api.dependencies import get_db, get_store, get_settings
 from videoroll.apps.orchestrator_api.schemas import (
     ConvertedVideoItem,
     RecentFailedResumeResponse,
@@ -45,18 +45,18 @@ def list_tasks(
     status: TaskStatus | None = Query(default=None),
     limit: int = Query(default=50, ge=1, le=500),
     db: Session = Depends(get_db),
-    s3: FileStore = Depends(get_s3),
+    store: FileStore = Depends(get_store),
 ) -> list[dict[str, Any]]:
-    return task_service.list_tasks(status=status, limit=limit, db=db, s3=s3)
+    return task_service.list_tasks(status=status, limit=limit, db=db, store=store)
 
 
 @router.get("/tasks/{task_id}", response_model=TaskRead)
 def get_task(
     task_id: uuid.UUID,
     db: Session = Depends(get_db),
-    s3: FileStore = Depends(get_s3),
+    store: FileStore = Depends(get_store),
 ) -> dict[str, Any]:
-    return task_service.get_task(task_id, db=db, s3=s3)
+    return task_service.get_task(task_id, db=db, store=store)
 
 
 def _restart_resumed_auto_youtube_task(task: Task, *, db: Session) -> None:
@@ -127,9 +127,9 @@ def enqueue_subtitle_job(
     payload: SubtitleActionRequest,
     settings: OrchestratorSettings = Depends(get_settings),
     db: Session = Depends(get_db),
-    s3: FileStore = Depends(get_s3),
+    store: FileStore = Depends(get_store),
 ) -> RemoteJobResponse:
-    return subtitle_service.enqueue_subtitle_job(task_id, payload, settings=settings, db=db, s3=s3)
+    return subtitle_service.enqueue_subtitle_job(task_id, payload, settings=settings, db=db, store=store)
 
 
 @router.post("/tasks/{task_id}/actions/subtitle_resume", response_model=RemoteJobResponse)
@@ -147,12 +147,12 @@ def resume_recent_failed_tasks(
     limit: int = Query(default=200, ge=1, le=500),
     settings: OrchestratorSettings = Depends(get_settings),
     db: Session = Depends(get_db),
-    s3: FileStore = Depends(get_s3),
+    store: FileStore = Depends(get_store),
 ) -> RecentFailedResumeResponse:
     return subtitle_service.resume_recent_failed_tasks(
         window_hours=window_hours,
         limit=limit,
         settings=settings,
         db=db,
-        s3=s3,
+        store=store,
     )

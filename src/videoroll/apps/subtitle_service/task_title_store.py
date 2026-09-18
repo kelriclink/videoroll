@@ -32,16 +32,16 @@ def get_task_titles(db: Session, task_id: str) -> dict[str, str]:
 
 
 def get_task_display_title(db: Session, task_id: str) -> str:
-    return get_task_display_title_with_s3(db, task_id, s3=None)
+    return get_task_display_title_with_storage(db, task_id, store=None)
 
 
-def get_task_display_title_with_s3(db: Session, task_id: str, *, s3: FileStore | None) -> str:
+def get_task_display_title_with_storage(db: Session, task_id: str, *, store: FileStore | None) -> str:
     t = get_task_titles(db, task_id)
     out = str(t.get("translated_title") or t.get("source_title") or "").strip()
     if out:
         return out
 
-    if s3 is None:
+    if store is None:
         return ""
 
     try:
@@ -59,7 +59,7 @@ def get_task_display_title_with_s3(db: Session, task_id: str, *, s3: FileStore |
         return ""
 
     try:
-        obj = s3.get_object(asset.storage_key)
+        obj = store.get_object(asset.storage_key)
         body = obj.get("Body")
         raw = body.read() if body else b""
         try:

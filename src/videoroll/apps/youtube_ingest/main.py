@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
+
 import os
 import uuid
 from typing import Generator
@@ -48,7 +50,13 @@ def get_db(settings: YouTubeIngestSettings = Depends(get_settings)) -> Generator
     yield from db_session(settings.database_url)
 
 
-app = FastAPI(title="videoroll-youtube-ingest", version="0.1.0")
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    _startup()
+    yield
+
+
+app = FastAPI(title="videoroll-youtube-ingest", version="0.1.0", lifespan=_lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -64,7 +72,6 @@ app.add_middleware(
 install_internal_service_auth(app, get_youtube_ingest_settings)
 
 
-@app.on_event("startup")
 def _startup() -> None:
     settings = get_youtube_ingest_settings()
     app.state.internal_service_token = service_token(settings)

@@ -118,7 +118,7 @@ def test_duplicate_download_caller_does_not_mark_shared_progress_failed() -> Non
         patch.object(youtube_service, "release_operation") as release_operation,
         pytest.raises(HTTPException) as caught,
     ):
-        youtube_service.download(task_id, settings=settings, db=db, s3=Mock())  # type: ignore[arg-type]
+        youtube_service.download(task_id, settings=settings, db=db, store=Mock())  # type: ignore[arg-type]
 
     assert caught.value.status_code == 409
     reporter.fail.assert_not_called()
@@ -234,23 +234,23 @@ def test_fetch_meta_queues_uploaded_object_when_db_commit_fails(tmp_path) -> Non
     db.get.return_value = task
     db.query.return_value = query
     db.commit.side_effect = RuntimeError("database unavailable")
-    s3 = Mock()
+    store = Mock()
     settings = SimpleNamespace(work_dir=str(tmp_path))
     meta = SimpleNamespace(title="Demo", description="", webpage_url=task.source_url)
 
     with (
         patch.object(youtube_service, "effective_youtube_settings", return_value=settings),
         patch.object(youtube_service, "extract_youtube_metadata", return_value=({"title": "Demo"}, meta)),
-        patch.object(youtube_service, "queue_pending_s3_delete") as queue_delete,
+        patch.object(youtube_service, "queue_pending_storage_delete") as queue_delete,
         pytest.raises(RuntimeError, match="database unavailable"),
     ):
-        youtube_service.fetch_meta(task_id, settings=settings, db=db, s3=s3)  # type: ignore[arg-type]
+        youtube_service.fetch_meta(task_id, settings=settings, db=db, store=store)  # type: ignore[arg-type]
 
-    uploaded_key = s3.put_bytes.call_args.args[1]
+    uploaded_key = store.put_bytes.call_args.args[1]
     assert uploaded_key.startswith(f"raw/{task_id}/metadata_")
     assert uploaded_key.count("_") >= 2
     queue_delete.assert_called_once_with(db, uploaded_key, reason="failed_youtube_upload")
-    s3.delete_object.assert_not_called()
+    store.delete_object.assert_not_called()
 
 
 def test_download_does_not_compensate_a_preexisting_metadata_key(tmp_path) -> None:
@@ -276,10 +276,10 @@ def test_download_does_not_compensate_a_preexisting_metadata_key(tmp_path) -> No
     first_results = iter([video_asset, metadata_asset, metadata_asset, None])
     query.filter.return_value.order_by.return_value.first.side_effect = lambda: next(first_results)
     db.commit.side_effect = RuntimeError("database unavailable")
-    s3 = Mock()
+    store = Mock()
     body = Mock()
     body.read.return_value = payload
-    s3.get_object.return_value = {"Body": body}
+    store.get_object.return_value = {"Body": body}
     settings = SimpleNamespace(work_dir=str(tmp_path))
     meta = SimpleNamespace(title="Demo", description="", webpage_url=source_url)
 
@@ -293,11 +293,11 @@ def test_download_does_not_compensate_a_preexisting_metadata_key(tmp_path) -> No
             task_id,
             settings=settings,
             db=db,
-            s3=s3,
+            store=store,
             reporter=Mock(),
         )
 
-    deleted_keys = [call.args[0] for call in s3.delete_object.call_args_list]
+    deleted_keys = [call.args[0] for call in store.delete_object.call_args_list]
     assert metadata_key not in deleted_keys
 
 
@@ -310,16 +310,16 @@ def test_fetch_meta_never_immediately_deletes_a_deterministic_key(tmp_path) -> N
     query.filter.return_value.order_by.return_value.first.return_value = None
     db.query.return_value = query
     db.commit.side_effect = RuntimeError("database unavailable")
-    s3 = Mock()
+    store = Mock()
     settings = SimpleNamespace(work_dir=str(tmp_path))
     meta = SimpleNamespace(title="Demo", description="", webpage_url=task.source_url)
 
     with (
         patch.object(youtube_service, "effective_youtube_settings", return_value=settings),
         patch.object(youtube_service, "extract_youtube_metadata", return_value=({"title": "Demo"}, meta)),
-        patch.object(youtube_service, "queue_pending_s3_delete"),
+        patch.object(youtube_service, "queue_pending_storage_delete"),
         pytest.raises(RuntimeError, match="database unavailable"),
     ):
-        youtube_service.fetch_meta(task_id, settings=settings, db=db, s3=s3)  # type: ignore[arg-type]
+        youtube_service.fetch_meta(task_id, settings=settings, db=db, store=store)  # type: ignore[arg-type]
 
-    s3.delete_object.assert_not_called()
+    store.delete_object.assert_not_called()

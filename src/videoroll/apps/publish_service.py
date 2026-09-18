@@ -112,13 +112,13 @@ class PublishService:
         self,
         db: Session,
         settings: Any,
-        s3: FileStore,
+        store: FileStore,
         *,
         http_headers: dict[str, str] | Callable[[], dict[str, str]] | None = None,
     ):
         self._db = db
         self._settings = settings
-        self._s3 = s3
+        self._store = store
         self._http_headers = http_headers
 
     # ── 公开 API ──────────────────────────────────────────────
@@ -620,7 +620,7 @@ class PublishService:
             },
             video_key=video_key,
             db=self._db,
-            s3=self._s3,
+            store=self._store,
         )
         self._persist_platform_meta(task_id, platform, request.get("meta"))
         return request
@@ -628,7 +628,7 @@ class PublishService:
     def _persist_platform_meta(self, task_id: uuid.UUID, platform: str, meta: Any) -> None:
         if not isinstance(meta, dict):
             return
-        self._s3.put_bytes(
+        self._store.put_bytes(
             json.dumps(meta, ensure_ascii=False, indent=2).encode("utf-8"),
             publish_meta_key(task_id, platform),
             content_type="application/json",

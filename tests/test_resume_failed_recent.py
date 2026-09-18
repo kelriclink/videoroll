@@ -79,7 +79,7 @@ def test_resume_failed_recent_restarts_youtube_pipeline_when_no_subtitle_job(mon
         limit=200,
         settings=SimpleNamespace(),
         db=db,
-        s3=MagicMock(),
+        store=MagicMock(),
     )
 
     assert resp.resumed_count == 1
@@ -114,7 +114,7 @@ def test_resume_failed_recent_skips_non_youtube_task_without_subtitle_job(monkey
         limit=200,
         settings=SimpleNamespace(),
         db=db,
-        s3=MagicMock(),
+        store=MagicMock(),
     )
 
     assert resp.resumed_count == 0

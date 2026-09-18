@@ -18,7 +18,7 @@ def get_db(settings: OrchestratorSettings = Depends(get_settings)) -> Generator[
     yield from db_session(settings.database_url)
 
 
-def get_s3(settings: OrchestratorSettings = Depends(get_settings)) -> FileStore:
+def get_store(settings: OrchestratorSettings = Depends(get_settings)) -> FileStore:
     store = FileStore(settings)
     store.ensure_ready()
     return store

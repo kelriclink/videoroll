@@ -11,7 +11,7 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
 
 from videoroll.apps.orchestrator_api.services import playout_service
-from videoroll.apps.orchestrator_api.dependencies import get_db, get_s3, get_settings
+from videoroll.apps.orchestrator_api.dependencies import get_db, get_store, get_settings
 from videoroll.apps.orchestrator_api.routers.assets import router as assets_router
 from videoroll.db.base import Base
 from videoroll.db.models import Asset, AssetKind, PlayoutAssetLink, SourceLicense, SourceType, Task, TaskStatus
@@ -170,7 +170,7 @@ def test_playout_import_route_returns_the_id_only_contract(db: Session, tmp_path
     application = FastAPI()
     application.include_router(assets_router)
     application.dependency_overrides[get_db] = lambda: db
-    application.dependency_overrides[get_s3] = lambda: storage
+    application.dependency_overrides[get_store] = lambda: storage
     application.dependency_overrides[get_settings] = lambda: type(
         "Settings",
         (),

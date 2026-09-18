@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
+
 import logging
 import os
 import re
@@ -299,7 +301,13 @@ def _safe_extract_zip(
             raise
 
 
-app = FastAPI(title="videoroll-subtitle-service", version="0.1.0")
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    _startup()
+    yield
+
+
+app = FastAPI(title="videoroll-subtitle-service", version="0.1.0", lifespan=_lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -315,7 +323,6 @@ app.add_middleware(
 install_internal_service_auth(app, get_subtitle_settings)
 
 
-@app.on_event("startup")
 def _startup() -> None:
     settings = get_subtitle_settings()
     app.state.internal_service_token = service_token(settings)

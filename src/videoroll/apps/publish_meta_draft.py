@@ -115,7 +115,7 @@ def apply_publish_source_overrides(
     )
 
 
-def _read_s3_bytes(store: FileStore, key: str) -> bytes:
+def _read_storage_bytes(store: FileStore, key: str) -> bytes:
     obj = store.get_object(key)
     body = obj.get("Body")
     if not body:
@@ -129,7 +129,7 @@ def _read_s3_bytes(store: FileStore, key: str) -> bytes:
             pass
 
 
-def _read_latest_youtube_meta(task_id: uuid.UUID, db: Session, s3: FileStore, *, fallback_url: str) -> dict[str, str] | None:
+def _read_latest_youtube_meta(task_id: uuid.UUID, db: Session, store: FileStore, *, fallback_url: str) -> dict[str, str] | None:
     asset = (
         db.query(Asset)
         .filter(Asset.task_id == task_id, Asset.kind == AssetKind.metadata_json)
@@ -140,7 +140,7 @@ def _read_latest_youtube_meta(task_id: uuid.UUID, db: Session, s3: FileStore, *,
         return None
 
     try:
-        raw = _read_s3_bytes(s3, asset.storage_key)
+        raw = _read_storage_bytes(store, asset.storage_key)
         parsed = json.loads(raw.decode("utf-8")) if raw else {}
         meta = summarize_info(_as_dict(parsed), fallback_url=fallback_url)
     except (StorageObjectNotFound, ValueError, TypeError):
@@ -165,7 +165,7 @@ def build_task_publish_meta_draft(
     task: Task,
     *,
     db: Session,
-    s3: FileStore,
+    store: FileStore,
     mode: PublishMetaDraftMode = "auto",
     base_meta: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -186,7 +186,7 @@ def build_task_publish_meta_draft(
         return _normalize_publish_meta_draft(meta_out)
 
     fallback_url = str(task.source_url or "").strip()
-    yt_meta = _read_latest_youtube_meta(task.id, db, s3, fallback_url=fallback_url) or {}
+    yt_meta = _read_latest_youtube_meta(task.id, db, store, fallback_url=fallback_url) or {}
     source_title = str(titles.get("source_title") or yt_meta.get("title") or "").strip()
     translated_title = str(titles.get("translated_title") or "").strip() or None
     source_description = str(yt_meta.get("description") or "").strip()

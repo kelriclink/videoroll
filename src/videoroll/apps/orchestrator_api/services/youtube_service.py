@@ -34,9 +34,9 @@ from videoroll.apps.orchestrator_api.infrastructure.internal_http import (
     proxy_internal_service_request,
 )
 from videoroll.apps.orchestrator_api.services.asset_service import (
-    queue_pending_s3_delete,
-    read_s3_bytes,
-    write_s3_text,
+    queue_pending_storage_delete,
+    read_storage_bytes,
+    write_storage_text,
 )
 from videoroll.apps.orchestrator_api.youtube_downloader import (
     YtDlpRuntimeError,
@@ -143,7 +143,7 @@ def _unique_storage_key(prefix: str, digest: str, suffix: str) -> str:
 def _queue_uploaded_objects_for_cleanup(db: Session, storage_keys: list[str]) -> None:
     for storage_key in reversed(storage_keys):
         try:
-            queue_pending_s3_delete(db, storage_key, reason="failed_youtube_upload")
+            queue_pending_storage_delete(db, storage_key, reason="failed_youtube_upload")
         except Exception:
             db.rollback()
             logger.exception("failed to queue uploaded YouTube object cleanup", extra={"storage_key": storage_key})
@@ -327,7 +327,7 @@ def youtube_bot_check_hint(message: str, *, yt_settings: OrchestratorSettings, d
     return "\n".join(lines)
 
 
-def get_cached_meta(task_id: uuid.UUID, *, db: Session, s3: FileStore) -> YouTubeMetaRead:
+def get_cached_meta(task_id: uuid.UUID, *, db: Session, store: FileStore) -> YouTubeMetaRead:
     task = db.get(Task, task_id)
     if not task:
         raise HTTPException(status_code=404, detail="task not found")
@@ -337,7 +337,7 @@ def get_cached_meta(task_id: uuid.UUID, *, db: Session, s3: FileStore) -> YouTub
     if not asset:
         raise HTTPException(status_code=404, detail="youtube meta not found")
     try:
-        raw = read_s3_bytes(s3, asset.storage_key)
+        raw = read_storage_bytes(store, asset.storage_key)
         info = json.loads(raw.decode("utf-8")) if raw else {}
         meta = summarize_info(info if isinstance(info, dict) else {}, fallback_url=str(task.source_url or "").strip())
     except Exception as exc:
@@ -345,7 +345,7 @@ def get_cached_meta(task_id: uuid.UUID, *, db: Session, s3: FileStore) -> YouTub
     return youtube_meta_to_read(meta)
 
 
-def fetch_meta(task_id: uuid.UUID, *, settings: OrchestratorSettings, db: Session, s3: FileStore) -> YouTubeMetaActionResponse:
+def fetch_meta(task_id: uuid.UUID, *, settings: OrchestratorSettings, db: Session, store: FileStore) -> YouTubeMetaActionResponse:
     task = db.get(Task, task_id)
     if not task:
         raise HTTPException(status_code=404, detail="task not found")
@@ -357,7 +357,7 @@ def fetch_meta(task_id: uuid.UUID, *, settings: OrchestratorSettings, db: Sessio
     latest = db.query(Asset).filter(Asset.task_id == task_id, Asset.kind == AssetKind.metadata_json).order_by(Asset.created_at.desc()).first()
     if latest:
         try:
-            info = json.loads(read_s3_bytes(s3, latest.storage_key).decode("utf-8"))
+            info = json.loads(read_storage_bytes(store, latest.storage_key).decode("utf-8"))
             meta = summarize_info(info if isinstance(info, dict) else {}, fallback_url=url)
             return YouTubeMetaActionResponse(metadata=youtube_meta_to_read(meta), metadata_asset=latest)
         except Exception:
@@ -378,7 +378,7 @@ def fetch_meta(task_id: uuid.UUID, *, settings: OrchestratorSettings, db: Sessio
     digest = _sha256_bytes(payload)
     key = _unique_storage_key(f"raw/{task_id}/metadata", digest, ".json")
     key_was_referenced = _storage_key_is_referenced(db, key)
-    s3.put_bytes(payload, key, content_type="application/json")
+    store.put_bytes(payload, key, content_type="application/json")
     asset = Asset(task_id=task_id, kind=AssetKind.metadata_json, storage_key=key, sha256=digest, size_bytes=len(payload))
     db.add(asset)
     try:
@@ -392,7 +392,7 @@ def fetch_meta(task_id: uuid.UUID, *, settings: OrchestratorSettings, db: Sessio
     return YouTubeMetaActionResponse(metadata=youtube_meta_to_read(meta), metadata_asset=asset)
 
 
-def _store_failure_log(db: Session, s3: FileStore, task_id: uuid.UUID, url: str, exc: Exception, hint: str | None) -> None:
+def _store_failure_log(db: Session, store: FileStore, task_id: uuid.UUID, url: str, exc: Exception, hint: str | None) -> None:
     diagnostics = exc.diagnostics if isinstance(exc, YtDlpRuntimeError) else []
     text = "\n".join(diagnostics).strip() or "videoroll yt-dlp diagnostics unavailable"
     text += f"\n\n---- videoroll error summary ----\ntask_id={task_id}\nurl={url}\nerror={exc}\n"
@@ -400,7 +400,7 @@ def _store_failure_log(db: Session, s3: FileStore, task_id: uuid.UUID, url: str,
         text += f"\n---- videoroll hint ----\n{hint}\n"
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     key = f"log/{task_id}/youtube_download_{stamp}_{uuid.uuid4().hex[:8]}.log"
-    payload = write_s3_text(s3, key, text)
+    payload = write_storage_text(store, key, text)
     db.add(Asset(task_id=task_id, kind=AssetKind.log, storage_key=key, sha256=_sha256_bytes(payload), size_bytes=len(payload)))
     db.commit()
 
@@ -619,7 +619,7 @@ def _download(
     *,
     settings: OrchestratorSettings,
     db: Session,
-    s3: FileStore,
+    store: FileStore,
     reporter: _YouTubeDownloadProgressReporter,
 ) -> YouTubeDownloadActionResponse:
     task = db.get(Task, task_id)
@@ -634,7 +634,7 @@ def _download(
     video_asset = db.query(Asset).filter(Asset.task_id == task_id, Asset.kind == AssetKind.video_raw).order_by(Asset.created_at.desc()).first()
     if video_asset is not None:
         try:
-            s3.head_object(video_asset.storage_key)
+            store.head_object(video_asset.storage_key)
         except (StorageObjectNotFound, OSError, ValueError):
             # A legacy MinIO key can remain in the database after the storage
             # switch. Remove the whole unfinished working graph so a retry
@@ -665,7 +665,7 @@ def _download(
             except Exception as exc:
                 hint = youtube_bot_check_hint(str(exc), yt_settings=yt_settings, db=db)
                 try:
-                    _store_failure_log(db, s3, task_id, url, exc, hint)
+                    _store_failure_log(db, store, task_id, url, exc, hint)
                 except Exception:
                     db.rollback()
                 raise HTTPException(status_code=502, detail=f"youtube download failed: {exc}" + (f"\n\n{hint}" if hint else "")) from exc
@@ -679,14 +679,14 @@ def _download(
             key_was_referenced = _storage_key_is_referenced(db, key)
             video_size = video_path.stat().st_size
             reporter.update("storing", 99, downloaded_bytes=video_size, total_bytes=video_size)
-            s3.promote_file(video_path, key)
+            store.promote_file(video_path, key)
             if not key_was_referenced:
                 uploaded_keys.append(key)
             video_asset = Asset(task_id=task_id, kind=AssetKind.video_raw, storage_key=key, sha256=digest, size_bytes=video_size); db.add(video_asset)
         else:
             latest = db.query(Asset).filter(Asset.task_id == task_id, Asset.kind == AssetKind.metadata_json).order_by(Asset.created_at.desc()).first()
             try:
-                info = json.loads(read_s3_bytes(s3, latest.storage_key).decode()) if latest else {}
+                info = json.loads(read_storage_bytes(store, latest.storage_key).decode()) if latest else {}
                 if not isinstance(info, dict) or not info:
                     raise ValueError
                 meta = summarize_info(info, fallback_url=url)
@@ -695,7 +695,7 @@ def _download(
         payload = json.dumps(info, ensure_ascii=False, indent=2).encode(); digest = _sha256_bytes(payload)
         key = _unique_storage_key(f"raw/{task_id}/metadata", digest, ".json")
         key_was_referenced = _storage_key_is_referenced(db, key)
-        s3.put_bytes(payload, key, content_type="application/json")
+        store.put_bytes(payload, key, content_type="application/json")
         if not key_was_referenced:
             uploaded_keys.append(key)
         meta_asset = Asset(task_id=task_id, kind=AssetKind.metadata_json, storage_key=key, sha256=digest, size_bytes=len(payload)); db.add(meta_asset)
@@ -712,7 +712,7 @@ def _download(
                         ".jpg",
                     )
                     key_was_referenced = _storage_key_is_referenced(db, cover_key)
-                    s3.upload_file(cover_path, cover_key, content_type="image/jpeg")
+                    store.upload_file(cover_path, cover_key, content_type="image/jpeg")
                     if not key_was_referenced:
                         uploaded_keys.append(cover_key)
                     cover_asset = Asset(task_id=task_id, kind=AssetKind.cover_image, storage_key=cover_key, sha256=cover_digest, size_bytes=cover_path.stat().st_size); db.add(cover_asset)
@@ -734,7 +734,7 @@ def _download(
     return YouTubeDownloadActionResponse(metadata=youtube_meta_to_read(meta), metadata_asset=meta_asset, video_asset=video_asset, cover_asset=cover_asset)
 
 
-def download(task_id: uuid.UUID, *, settings: OrchestratorSettings, db: Session, s3: FileStore) -> YouTubeDownloadActionResponse:
+def download(task_id: uuid.UUID, *, settings: OrchestratorSettings, db: Session, store: FileStore) -> YouTubeDownloadActionResponse:
     reporter = _YouTubeDownloadProgressReporter(task_id, db=db, redis_url=str(getattr(settings, "redis_url", "") or ""))
     operation_key = f"youtube-download:{task_id}"
     owner = f"orchestrator.youtube_download:{os.getpid()}:{uuid.uuid4().hex[:12]}"
@@ -755,7 +755,7 @@ def download(task_id: uuid.UUID, *, settings: OrchestratorSettings, db: Session,
                 raise HTTPException(status_code=409, detail="youtube download is already in progress")
             try:
                 replay = YouTubeDownloadActionResponse.model_validate(claim.result_json)
-                s3.head_object(replay.video_asset.storage_key)
+                store.head_object(replay.video_asset.storage_key)
                 return replay
             except (StorageObjectNotFound, OSError, ValueError):
                 # The durable operation result outlived its source object. Reopen
@@ -783,7 +783,7 @@ def download(task_id: uuid.UUID, *, settings: OrchestratorSettings, db: Session,
             3600,
         )
         heartbeat.start()
-        result = _download(task_id, settings=settings, db=db, s3=s3, reporter=reporter)
+        result = _download(task_id, settings=settings, db=db, store=store, reporter=reporter)
         finish_operation(db, operation_key, result.model_dump(mode="json"))
         db.commit()
         return result

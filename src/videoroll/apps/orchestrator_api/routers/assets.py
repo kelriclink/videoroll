@@ -7,7 +7,7 @@ from fastapi import APIRouter, Depends, File, Request, UploadFile
 from fastapi.responses import Response, StreamingResponse
 from sqlalchemy.orm import Session
 
-from videoroll.apps.orchestrator_api.dependencies import get_db, get_s3, get_settings
+from videoroll.apps.orchestrator_api.dependencies import get_db, get_store, get_settings
 from videoroll.apps.orchestrator_api.schemas import AssetRead, PlayoutAssetLinkRead
 from videoroll.apps.orchestrator_api.services import asset_service, playout_service
 from videoroll.config import OrchestratorSettings
@@ -34,9 +34,9 @@ async def upload_task_video(
     task_id: uuid.UUID,
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
-    s3: FileStore = Depends(get_s3),
+    store: FileStore = Depends(get_store),
 ) -> Asset:
-    return await asset_service.upload_task_video(task_id, file, db=db, s3=s3)
+    return await asset_service.upload_task_video(task_id, file, db=db, store=store)
 
 
 @router.post("/tasks/{task_id}/upload/cover", response_model=AssetRead)
@@ -44,9 +44,9 @@ async def upload_task_cover(
     task_id: uuid.UUID,
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
-    s3: FileStore = Depends(get_s3),
+    store: FileStore = Depends(get_store),
 ) -> Asset:
-    return await asset_service.upload_task_cover(task_id, file, db=db, s3=s3)
+    return await asset_service.upload_task_cover(task_id, file, db=db, store=store)
 
 
 @router.get("/tasks/{task_id}/assets", response_model=list[AssetRead])
@@ -64,14 +64,14 @@ def add_task_asset_to_playout(
     task_id: uuid.UUID,
     asset_id: uuid.UUID,
     db: Session = Depends(get_db),
-    s3: FileStore = Depends(get_s3),
+    store: FileStore = Depends(get_store),
     settings: OrchestratorSettings = Depends(get_settings),
 ) -> dict[str, object]:
     return playout_service.import_asset_to_playout(
         task_id,
         asset_id,
         db=db,
-        storage=s3,
+        storage=store,
         media_root=Path(settings.playout_media_root),
     )
 
@@ -81,10 +81,10 @@ def download_task_asset(
     task_id: uuid.UUID,
     asset_id: uuid.UUID,
     db: Session = Depends(get_db),
-    s3: FileStore = Depends(get_s3),
+    store: FileStore = Depends(get_store),
 ) -> Response:
     return _stream_response(
-        asset_service.prepare_asset_download(db, s3, task_id=task_id, asset_id=asset_id)
+        asset_service.prepare_asset_download(db, store, task_id=task_id, asset_id=asset_id)
     )
 
 
@@ -94,12 +94,12 @@ def stream_task_asset(
     asset_id: uuid.UUID,
     request: Request,
     db: Session = Depends(get_db),
-    s3: FileStore = Depends(get_s3),
+    store: FileStore = Depends(get_store),
 ) -> Response:
     return _stream_response(
         asset_service.prepare_asset_stream(
             db,
-            s3,
+            store,
             task_id=task_id,
             asset_id=asset_id,
             range_header=request.headers.get("range") or "",
@@ -112,6 +112,6 @@ def delete_task_asset(
     task_id: uuid.UUID,
     asset_id: uuid.UUID,
     db: Session = Depends(get_db),
-    s3: FileStore = Depends(get_s3),
+    store: FileStore = Depends(get_store),
 ) -> dict[str, bool]:
-    return asset_service.delete_final_asset(task_id=task_id, asset_id=asset_id, db=db, s3=s3)
+    return asset_service.delete_final_asset(task_id=task_id, asset_id=asset_id, db=db, store=store)
