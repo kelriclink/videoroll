@@ -488,7 +488,7 @@ services:
       NGINX_ENVSUBST_FILTER: "VIDEOROLL_PUBLIC_ORIGIN"
     ports:
       - "${PUBLISH_ADDR:-127.0.0.1}:${WEB_PORT:-3000}:80"
-    networks: [internal]
+    networks: [internal, web-ingress]
     depends_on:
       orchestrator:
         condition: service_healthy
@@ -511,3 +511,4 @@ networks:
   platform-egress:
   playout-egress:
   infrastructure-egress:
+  web-ingress:

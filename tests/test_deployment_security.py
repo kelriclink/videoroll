@@ -99,6 +99,7 @@ def test_application_network_is_internal_and_egress_is_role_scoped() -> None:
         assert (compose["networks"]["internal"] or {}).get("internal", False) is True
         assert "playout-egress" in compose["networks"]
         assert "infrastructure-egress" in compose["networks"]
+        assert "web-ingress" in compose["networks"]
         assert set(compose["services"]["egress-gateway"]["networks"]) == {"internal", "egress"}
 
         for name in ("subtitle-service", "subtitle-worker", "subtitle-control-worker"):
@@ -122,8 +123,8 @@ def test_application_network_is_internal_and_egress_is_role_scoped() -> None:
             "infrastructure-egress",
         }
 
-        for name in ("redis", "web"):
-            assert compose["services"][name]["networks"] == ["internal"]
+        assert compose["services"]["redis"]["networks"] == ["internal"]
+        assert set(compose["services"]["web"]["networks"]) == {"internal", "web-ingress"}
 
 
 def test_subtitle_control_tasks_have_a_dedicated_worker_and_single_scheduler() -> None:
