@@ -24,18 +24,10 @@ def application_routes(application):
 EXPECTED_ORCHESTRATOR_ROUTES: set[tuple[str, str]] = {
     ("DELETE", "/settings/publish/social/accounts/{account_id}"),
     ("DELETE", "/settings/publish/social/login-sessions/{session_id}"),
-    ("DELETE", "/live/media/{media_id}"),
-    ("DELETE", "/live/audio-playlists/{playlist_id}"),
-    ("DELETE", "/live/sources/{source_id}"),
     ("DELETE", "/tasks/{task_id}/assets/{asset_id}"),
     ("GET", "/auth/status"),
     ("GET", "/bilibili/{service_path:path}"),
     ("GET", "/health"),
-    ("GET", "/live"),
-    ("GET", "/live/legacy-status"),
-    ("GET", "/live/media/{media_id}/stream"),
-    ("GET", "/live/preview/{file_name}"),
-    ("GET", "/live/settings"),
     ("GET", "/maintenance/workdir"),
     ("GET", "/settings/api"),
     ("GET", "/settings/publish/platforms"),
@@ -68,17 +60,6 @@ EXPECTED_ORCHESTRATOR_ROUTES: set[tuple[str, str]] = {
     ("POST", "/auto/youtube"),
     ("POST", "/maintenance/workdir/cleanup"),
     ("POST", "/maintenance/storage/cleanup-terminal"),
-    ("POST", "/live/actions/pause"),
-    ("POST", "/live/actions/audio"),
-    ("POST", "/live/actions/play"),
-    ("POST", "/live/actions/resume"),
-    ("POST", "/live/actions/start"),
-    ("POST", "/live/actions/stop"),
-    ("POST", "/live/media/audio"),
-    ("POST", "/live/audio-playlists"),
-    ("POST", "/live/media/import"),
-    ("POST", "/live/media/video"),
-    ("POST", "/live/sources"),
     ("POST", "/remote/auto/youtube"),
     ("POST", "/settings/publish/social/accounts/{account_id}/check"),
     ("POST", "/settings/publish/social/accounts/{platform}"),
@@ -104,9 +85,6 @@ EXPECTED_ORCHESTRATOR_ROUTES: set[tuple[str, str]] = {
     ("POST", "/tasks/{task_id}/upload/video"),
     ("POST", "/tasks/{task_id}/assets/{asset_id}/playout"),
     ("PUT", "/settings/api"),
-    ("PUT", "/live/playlist"),
-    ("PUT", "/live/settings"),
-    ("PUT", "/live/sources/{source_id}"),
     ("PUT", "/bilibili/{service_path:path}"),
     ("PUT", "/settings/publish/platforms/{platform}"),
     ("PUT", "/settings/review"),
@@ -114,7 +92,6 @@ EXPECTED_ORCHESTRATOR_ROUTES: set[tuple[str, str]] = {
     ("PUT", "/settings/youtube"),
     ("PUT", "/tasks/{task_id}/publish_meta"),
     ("PATCH", "/youtube/{service_path:path}"),
-    ("PATCH", "/live/media/{media_id}"),
     ("DELETE", "/subtitle/{service_path:path}"),
     ("GET", "/subtitle/{service_path:path}"),
     ("POST", "/subtitle/{service_path:path}"),
@@ -190,12 +167,15 @@ class OrchestratorArchitectureTests(unittest.TestCase):
         self.assertEqual(owners["/maintenance/workdir"], "videoroll.apps.orchestrator_api.routers.maintenance")
         self.assertEqual(owners["/maintenance/storage/cleanup-terminal"], "videoroll.apps.orchestrator_api.routers.maintenance")
 
-    def test_live_routes_are_owned_by_live_router(self) -> None:
-        owners = {route.path: route.endpoint.__module__ for route in application_routes(app) if hasattr(route, "endpoint")}
-
-        self.assertEqual(owners["/live"], "videoroll.apps.orchestrator_api.routers.live")
-        self.assertEqual(owners["/live/actions/start"], "videoroll.apps.orchestrator_api.routers.live")
-        self.assertEqual(owners["/live/media/{media_id}/stream"], "videoroll.apps.orchestrator_api.routers.live")
+    def test_legacy_live_routes_are_removed(self) -> None:
+        live_routes = {
+            (method, path)
+            for method, path in route_manifest(app)
+            if path == "/live" or path.startswith("/live/")
+        }
+        self.assertEqual(live_routes, set())
+        self.assertFalse(Path("src/videoroll/apps/orchestrator_api/routers/live.py").exists())
+        self.assertFalse(Path("src/videoroll/apps/orchestrator_api/services/live_service.py").exists())
 
     def test_asset_routes_are_owned_by_asset_router(self) -> None:
         owners = {route.path: route.endpoint.__module__ for route in application_routes(app) if hasattr(route, "endpoint")}

@@ -42,14 +42,6 @@ class OrchestratorSettings(CommonSettings):
     work_dir: str = Field("/tmp/videoroll", alias="WORK_DIR")
     ffmpeg_path: str = Field("ffmpeg", alias="FFMPEG_PATH")
     playout_media_root: str = Field("/storage/playout-media", alias="PLAYOUT_MEDIA_ROOT")
-    # The live controller calls Uvicorn directly over loopback, not the external
-    # Nginx /api proxy. Uvicorn's root path owns that public prefix.
-    live_internal_stream_base_url: str = Field(
-        "http://127.0.0.1:8000",
-        alias="LIVE_INTERNAL_STREAM_BASE_URL",
-    )
-    legacy_live_enabled: bool = Field(False, alias="LEGACY_LIVE_ENABLED")
-
     # YouTube downloader (yt-dlp) settings.
     youtube_user_agent: str = Field(DEFAULT_YOUTUBE_USER_AGENT, alias="YOUTUBE_USER_AGENT")
     youtube_cookie_file: str | None = Field(None, alias="YOUTUBE_COOKIE_FILE")

@@ -33,10 +33,6 @@ social-auto-upload-kelric
 # Frontend lives under src/ but isn't needed for backend image builds
 src/web
 
-# Large vendored folders not used in the backend image
-biliup-master
-bilibili-API-collect-main
-
 # Local deployment bundles and archives
 deploy_compose
 deploy_prod
