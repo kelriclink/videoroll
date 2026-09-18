@@ -5,7 +5,7 @@ import { FeedbackProvider } from "./components/Feedback";
 import SettingsLayout from "./components/SettingsLayout";
 import { fetchJson } from "./lib/http";
 import { ORCHESTRATOR_URL } from "./lib/urls";
-import { RealtimeProvider } from "./lib/realtime";
+import { RealtimeProvider } from "./lib/RealtimeProvider";
 
 const DashboardPage = lazy(() => import("./pages/DashboardPage"));
 const TaskDetailPage = lazy(() => import("./pages/TaskDetailPage"));
@@ -21,7 +21,6 @@ const SettingsTranslatePage = lazy(() => import("./pages/SettingsTranslatePage")
 const SettingsPublishPage = lazy(() => import("./pages/SettingsPublishPage"));
 const SettingsAutoPage = lazy(() => import("./pages/SettingsAutoPage"));
 const SettingsReviewPage = lazy(() => import("./pages/SettingsReviewPage"));
-const LivePage = lazy(() => import("./pages/LivePage"));
 const PlayoutPage = lazy(() => import("./pages/PlayoutPage"));
 const RenderQueuePage = lazy(() => import("./pages/RenderQueuePage"));
 const KnowledgeBasePage = lazy(() => import("./pages/KnowledgeBasePage"));
@@ -331,7 +330,7 @@ export default function App() {
                 <Route path="/" element={<DashboardPage />} />
                 <Route path="/tasks" element={<TasksPage />} />
                 <Route path="/videos" element={<VideosPage />} />
-                <Route path="/live" element={<LivePage />} />
+                <Route path="/live" element={<Navigate to="/playout" replace />} />
                 <Route path="/playout" element={<PlayoutPage />} />
                 <Route path="/tasks/new" element={<TaskNewPage />} />
                 <Route path="/tasks/:taskId" element={<TaskDetailPage />} />

@@ -274,7 +274,7 @@ export default function SettingsPublishPage() {
               <div className="mt-2 text-amber-700">
                 仅接受 SAU 生成的 Playwright/Patchright storage_state JSON。普通 Cookie 字符串可能缺少 localStorage/origins，不能替代该文件。
               </div>
-              <div className="mt-1">文件会使用 VideoRoll Fernet 密钥加密保存，网页不会回显内容，也不会上传到 S3。</div>
+              <div className="mt-1">文件会使用 VideoRoll Fernet 密钥加密保存，网页不会回显内容，也不会写入共享媒体存储。</div>
             </div>
 
             <div className="mt-3 grid gap-2 md:grid-cols-[14rem_auto_1fr_auto]">

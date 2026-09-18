@@ -13,29 +13,18 @@ function defaultOrchestratorUrl(): string {
 
 export const ORCHESTRATOR_URL = env("VITE_ORCHESTRATOR_URL") ?? defaultOrchestratorUrl();
 
-export function ffplayoutUrlForLocation(
-  location: Pick<Location, "protocol" | "hostname">,
-  port = "3003",
-): string {
-  const hostname = location.hostname;
-  const host = hostname.includes(":") ? `[${hostname}]` : hostname;
-  return `${location.protocol}//${host}:${port}`;
-}
-
 function defaultFfplayoutUrl(): string {
-  if (typeof window === "undefined") return "";
-
-  const configuredPort = env("VITE_FFPLAYOUT_PORT")?.trim() || "3003";
-  return ffplayoutUrlForLocation(window.location, configuredPort);
+  // ffplayout is reverse-proxied by the Web nginx on the same browser origin.
+  return "/playout/";
 }
 
 /**
- * Public browser origin for ffplayout.
+ * Browser URL for ffplayout.
  *
- * A fully-qualified VITE_FFPLAYOUT_URL can still override the default for
- * unusual reverse-proxy topologies. Otherwise ffplayout follows the hostname
- * used to open VideoRoll and only changes the port, so one Web image works via
- * LAN IPs, VPN addresses, and alternate DNS names.
+ * The default same-origin /playout/ path works through LAN IPs, VPN addresses,
+ * alternate DNS names, and an outer TLS reverse proxy without exposing a
+ * second browser port. VITE_FFPLAYOUT_URL remains available for unusual
+ * deployments that intentionally host ffplayout elsewhere.
  */
 export const FFPLAYOUT_URL = env("VITE_FFPLAYOUT_URL") ?? defaultFfplayoutUrl();
 

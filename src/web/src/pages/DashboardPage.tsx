@@ -73,10 +73,6 @@ function formatDate(value: string): string {
   return new Date(value).toLocaleString();
 }
 
-export function knowledgeItemHref(itemId: string): string {
-  return `/knowledge?${new URLSearchParams({ item: itemId }).toString()}`;
-}
-
 function clampPercent(value?: number | null): number {
   if (!Number.isFinite(Number(value))) return 0;
   return Math.max(0, Math.min(100, Number(value)));

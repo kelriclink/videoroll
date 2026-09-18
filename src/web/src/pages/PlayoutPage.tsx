@@ -25,7 +25,7 @@ export default function PlayoutPage() {
 
       {!FFPLAYOUT_URL ? (
         <div className="rounded-md border border-amber-200 bg-amber-50 p-4 text-sm text-amber-900">
-          无法确定 ffplayout 地址。浏览器默认使用当前 hostname 的播控端口，也可通过构建变量 <code>VITE_FFPLAYOUT_URL</code> 覆盖。
+          无法确定 ffplayout 地址。默认通过当前站点的 <code>/playout/</code> 路径访问，也可通过构建变量 <code>VITE_FFPLAYOUT_URL</code> 覆盖。
         </div>
       ) : null}
 
@@ -51,7 +51,7 @@ export default function PlayoutPage() {
             }}
             onError={() => {
               setLoading(false);
-              setError("请检查 PLAYOUT_HOST 反代和 ffplayout 容器状态。");
+              setError("请检查 /playout/ 反代和 ffplayout 容器状态。");
             }}
           />
         </div>

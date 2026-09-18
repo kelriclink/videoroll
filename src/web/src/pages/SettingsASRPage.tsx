@@ -1,5 +1,6 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { useConfirm } from "../components/feedbackContext";
+import { type ASRDefaults, useASRForm } from "../features/settings-asr/form";
 import { fetchJson } from "../lib/http";
 import { ORCHESTRATOR_URL } from "../lib/urls";
 
@@ -21,26 +22,6 @@ type WhisperSettings = {
   whisper_num_workers_effective: number;
   faster_whisper_installed: boolean;
   openvino_installed: boolean;
-  external_whisper_base_url: string;
-  external_whisper_model: string;
-  external_whisper_api_key_set: boolean;
-  groq_whisper_model: string;
-  groq_whisper_api_key_set: boolean;
-  cloudflare_workers_ai_account_id: string;
-  cloudflare_workers_ai_model: string;
-  cloudflare_workers_ai_api_key_set: boolean;
-};
-
-type ASRDefaults = {
-  default_engine: string;
-  default_language: string;
-  default_model: string;
-  openvino_device: string;
-  openvino_num_beams: number;
-  openvino_max_new_tokens: number;
-  openvino_vad_enabled: boolean;
-  openvino_vad_threshold: number;
-  model_download_proxy?: string;
   external_whisper_base_url: string;
   external_whisper_model: string;
   external_whisper_api_key_set: boolean;
@@ -106,48 +87,49 @@ function formatBytes(n?: number | null): string {
 
 export default function SettingsASRPage() {
   const confirm = useConfirm();
+  const {
+    downloadModel, setDownloadModel,
+    downloadEngine, setDownloadEngine,
+    downloadName, setDownloadName,
+    downloadRevision, setDownloadRevision,
+    downloadForce, setDownloadForce,
+    uploadName, setUploadName,
+    defaultEngine, setDefaultEngine,
+    defaultLanguage, setDefaultLanguage,
+    defaultModel, setDefaultModel,
+    openvinoDevice, setOpenvinoDevice,
+    openvinoNumBeams, setOpenvinoNumBeams,
+    openvinoMaxNewTokens, setOpenvinoMaxNewTokens,
+    openvinoVadEnabled, setOpenvinoVadEnabled,
+    openvinoVadThreshold, setOpenvinoVadThreshold,
+    modelDownloadProxy, setModelDownloadProxy,
+    externalWhisperBaseUrl, setExternalWhisperBaseUrl,
+    externalWhisperModel, setExternalWhisperModel,
+    externalWhisperApiKey, setExternalWhisperApiKey,
+    groqWhisperModel, setGroqWhisperModel,
+    groqWhisperApiKey, setGroqWhisperApiKey,
+    cloudflareAccountId, setCloudflareAccountId,
+    cloudflareModel, setCloudflareModel,
+    cloudflareApiKey, setCloudflareApiKey,
+    applyDefaults,
+  } = useASRForm();
   const [settings, setSettings] = useState<WhisperSettings | null>(null);
   const [asrDefaults, setAsrDefaults] = useState<ASRDefaults | null>(null);
   const [models, setModels] = useState<WhisperModelInfo[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
-  const [downloadModel, setDownloadModel] = useState("tiny");
-  const [downloadEngine, setDownloadEngine] = useState("faster-whisper");
-  const [downloadName, setDownloadName] = useState("");
-  const [downloadRevision, setDownloadRevision] = useState("");
-  const [downloadForce, setDownloadForce] = useState(false);
-
-  const [uploadName, setUploadName] = useState("");
   const [uploadFile, setUploadFile] = useState<File | null>(null);
-
-  const [defaultEngine, setDefaultEngine] = useState("faster-whisper");
-  const [defaultLanguage, setDefaultLanguage] = useState("auto");
-  const [defaultModel, setDefaultModel] = useState("");
-  const [openvinoDevice, setOpenvinoDevice] = useState("GPU");
-  const [openvinoNumBeams, setOpenvinoNumBeams] = useState("1");
-  const [openvinoMaxNewTokens, setOpenvinoMaxNewTokens] = useState("448");
-  const [openvinoVadEnabled, setOpenvinoVadEnabled] = useState(true);
-  const [openvinoVadThreshold, setOpenvinoVadThreshold] = useState("0.5");
-  const [modelDownloadProxy, setModelDownloadProxy] = useState("");
   const [proxyTestBusy, setProxyTestBusy] = useState(false);
   const [proxyTestResult, setProxyTestResult] = useState<ModelProxyTestResponse | null>(null);
-  const [externalWhisperBaseUrl, setExternalWhisperBaseUrl] = useState("");
-  const [externalWhisperModel, setExternalWhisperModel] = useState("whisper-1");
-  const [externalWhisperApiKey, setExternalWhisperApiKey] = useState("");
   const [externalWhisperTestBusy, setExternalWhisperTestBusy] = useState(false);
   const [externalWhisperTestResult, setExternalWhisperTestResult] = useState<ExternalWhisperTestResponse | null>(null);
-  const [groqWhisperModel, setGroqWhisperModel] = useState("whisper-large-v3-turbo");
-  const [groqWhisperApiKey, setGroqWhisperApiKey] = useState("");
   const [groqWhisperTestBusy, setGroqWhisperTestBusy] = useState(false);
   const [groqWhisperTestResult, setGroqWhisperTestResult] = useState<GroqWhisperTestResponse | null>(null);
-  const [cloudflareAccountId, setCloudflareAccountId] = useState("");
-  const [cloudflareModel, setCloudflareModel] = useState("@cf/openai/whisper-large-v3-turbo");
-  const [cloudflareApiKey, setCloudflareApiKey] = useState("");
   const [cloudflareTestBusy, setCloudflareTestBusy] = useState(false);
   const [cloudflareTestResult, setCloudflareTestResult] = useState<CloudflareWorkersAITestResponse | null>(null);
 
-  async function refresh() {
+  const refresh = useCallback(async () => {
     setError(null);
     try {
       const [s, m, a] = await Promise.all([
@@ -158,28 +140,15 @@ export default function SettingsASRPage() {
       setSettings(s);
       setModels(m);
       setAsrDefaults(a);
-      if (a.default_engine) setDefaultEngine(a.default_engine);
-      if (a.default_language) setDefaultLanguage(a.default_language);
-      if (typeof a.default_model === "string") setDefaultModel(a.default_model);
-      if (typeof a.openvino_device === "string" && a.openvino_device.trim()) setOpenvinoDevice(a.openvino_device);
-      if (typeof a.openvino_num_beams === "number" && a.openvino_num_beams > 0) setOpenvinoNumBeams(String(a.openvino_num_beams));
-      if (typeof a.openvino_max_new_tokens === "number" && a.openvino_max_new_tokens > 0) setOpenvinoMaxNewTokens(String(a.openvino_max_new_tokens));
-      if (typeof a.openvino_vad_enabled === "boolean") setOpenvinoVadEnabled(a.openvino_vad_enabled);
-      if (typeof a.openvino_vad_threshold === "number") setOpenvinoVadThreshold(String(a.openvino_vad_threshold));
-      if (typeof a.model_download_proxy === "string") setModelDownloadProxy(a.model_download_proxy);
-      if (typeof a.external_whisper_base_url === "string") setExternalWhisperBaseUrl(a.external_whisper_base_url);
-      if (typeof a.external_whisper_model === "string" && a.external_whisper_model.trim()) setExternalWhisperModel(a.external_whisper_model);
-      if (typeof a.groq_whisper_model === "string" && a.groq_whisper_model.trim()) setGroqWhisperModel(a.groq_whisper_model);
-      if (typeof a.cloudflare_workers_ai_account_id === "string") setCloudflareAccountId(a.cloudflare_workers_ai_account_id);
-      if (typeof a.cloudflare_workers_ai_model === "string" && a.cloudflare_workers_ai_model.trim()) setCloudflareModel(a.cloudflare_workers_ai_model);
+      applyDefaults(a);
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : String(e));
     }
-  }
+  }, [applyDefaults]);
 
   useEffect(() => {
     refresh();
-  }, []);
+  }, [refresh]);
 
   const knownSizes = useMemo(() => ["tiny", "base", "small", "medium", "large-v3"], []);
 

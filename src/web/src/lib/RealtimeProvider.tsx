@@ -1,30 +1,14 @@
-import { createContext, PropsWithChildren, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
+import { PropsWithChildren, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
+import {
+  RealtimeContext,
+  type RealtimeEvent,
+  type RealtimeEventHandler,
+  type RealtimeResyncHandler,
+  type RealtimeStatus,
+  type RealtimeSubscription,
+} from "./realtimeContext";
 import { orchestratorWebSocketUrl } from "./urls";
-
-
-export type RealtimeEvent = {
-  v?: number;
-  type: "event";
-  event_id: string;
-  topics: string[];
-  name: string;
-  occurred_at?: string;
-  entity_id?: string | null;
-  data: Record<string, unknown>;
-};
-
-type RealtimeStatus = "connecting" | "connected" | "reconnecting" | "offline";
-type EventHandler = (event: RealtimeEvent) => void;
-type ResyncHandler = () => void;
-type Subscription = { topics: Set<string>; onEvent: EventHandler; onResync?: ResyncHandler };
-
-type RealtimeContextValue = {
-  status: RealtimeStatus;
-  subscribe: (topics: string[], onEvent: EventHandler, onResync?: ResyncHandler) => () => void;
-};
-
-const RealtimeContext = createContext<RealtimeContextValue | null>(null);
 
 function intersects(left: Set<string>, right: string[]): boolean {
   return right.some((topic) => left.has(topic));
@@ -33,7 +17,7 @@ function intersects(left: Set<string>, right: string[]): boolean {
 export function RealtimeProvider({ children }: PropsWithChildren) {
   const [status, setStatus] = useState<RealtimeStatus>("connecting");
   const socketRef = useRef<WebSocket | null>(null);
-  const subscriptionsRef = useRef(new Map<number, Subscription>());
+  const subscriptionsRef = useRef(new Map<number, RealtimeSubscription>());
   const nextSubscriptionIdRef = useRef(1);
   const reconnectTimerRef = useRef<number | undefined>();
   const staleTimerRef = useRef<number | undefined>();
@@ -136,7 +120,7 @@ export function RealtimeProvider({ children }: PropsWithChildren) {
   }, [notifyResync, sendSubscriptions]);
 
   const subscribe = useCallback(
-    (topics: string[], onEvent: EventHandler, onResync?: ResyncHandler) => {
+    (topics: string[], onEvent: RealtimeEventHandler, onResync?: RealtimeResyncHandler) => {
       const id = nextSubscriptionIdRef.current++;
       subscriptionsRef.current.set(id, { topics: new Set(topics), onEvent, onResync });
       sendSubscriptions();
@@ -159,33 +143,4 @@ export function RealtimeProvider({ children }: PropsWithChildren) {
       {children}
     </RealtimeContext.Provider>
   );
-}
-
-export function useRealtimeSubscription(
-  topics: string[],
-  onEvent: EventHandler,
-  onResync?: ResyncHandler,
-): RealtimeStatus {
-  const context = useContext(RealtimeContext);
-  if (!context) throw new Error("useRealtimeSubscription must be used inside RealtimeProvider");
-  const { status, subscribe } = context;
-  const eventRef = useRef(onEvent);
-  const resyncRef = useRef(onResync);
-  const key = [...topics].sort().join("|");
-
-  useEffect(() => {
-    eventRef.current = onEvent;
-    resyncRef.current = onResync;
-  }, [onEvent, onResync]);
-
-  useEffect(() => {
-    const currentTopics = key ? key.split("|") : [];
-    return subscribe(
-      currentTopics,
-      (event) => eventRef.current(event),
-      () => resyncRef.current?.(),
-    );
-  }, [key, subscribe]);
-
-  return status;
 }

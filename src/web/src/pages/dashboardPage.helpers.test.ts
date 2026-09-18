@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { knowledgeItemHref } from "./DashboardPage";
+import { knowledgeItemHref } from "./dashboardPage.helpers";
 
 describe("knowledgeItemHref", () => {
   it("creates an item query deep link for the knowledge-base page", () => {
