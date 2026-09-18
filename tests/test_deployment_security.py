@@ -93,12 +93,36 @@ def test_application_roles_resolve_host_database_gateway() -> None:
             assert "host.docker.internal:host-gateway" in services[name].get("extra_hosts", [])
 
 
-def test_rag_processes_stay_on_the_application_network() -> None:
+def test_application_network_is_internal_and_egress_is_role_scoped() -> None:
     for path in COMPOSE_FILES:
         compose = _compose(path)
-        assert not (compose["networks"]["internal"] or {}).get("internal", False)
+        assert (compose["networks"]["internal"] or {}).get("internal", False) is True
+        assert "playout-egress" in compose["networks"]
+        assert "infrastructure-egress" in compose["networks"]
         assert set(compose["services"]["egress-gateway"]["networks"]) == {"internal", "egress"}
+
         for name in ("subtitle-service", "subtitle-worker", "subtitle-control-worker"):
+            assert set(compose["services"][name]["networks"]) == {"internal", "subtitle-egress"}
+
+        for name in (
+            "orchestrator",
+            "youtube-ingest",
+            "bilibili-publisher",
+            "publish-worker",
+            "social-publisher-api",
+            "social-publisher-worker",
+            "social-publisher-scheduler",
+        ):
+            assert "internal" in compose["services"][name]["networks"]
+            assert "platform-egress" in compose["services"][name]["networks"]
+
+        assert set(compose["services"]["ffplayout"]["networks"]) == {"internal", "playout-egress"}
+        assert set(compose["services"]["outbox-dispatcher"]["networks"]) == {
+            "internal",
+            "infrastructure-egress",
+        }
+
+        for name in ("redis", "web"):
             assert compose["services"][name]["networks"] == ["internal"]
 
 
@@ -137,7 +161,6 @@ def test_offline_production_compose_keeps_runtime_tuning_environment() -> None:
         "CELERY_SUB_MAX_TASKS_PER_CHILD",
     ):
         assert offline["x-subtitle-environment"][key] == normal["x-subtitle-environment"][key]
-    assert offline["services"]["orchestrator"]["environment"]["LIVE_INTERNAL_STREAM_BASE_URL"] == normal["services"]["orchestrator"]["environment"]["LIVE_INTERNAL_STREAM_BASE_URL"]
 
 
 def test_production_rejects_empty_or_known_default_secrets() -> None:
@@ -172,13 +195,15 @@ def test_entrypoints_do_not_start_passwordless_vnc_or_multiple_roles() -> None:
     assert "/dev/shm" in social_entrypoint
 
 
-def test_offline_bundle_includes_egress_gateway_image() -> None:
+def test_offline_bundle_includes_split_application_images() -> None:
     script = (ROOT / "scripts" / "build_export_prod.sh").read_text(encoding="utf-8")
 
+    assert 'SUBTITLE_IMAGE="${SUBTITLE_IMAGE:-videoroll-subtitle:prod}"' in script
     assert 'EGRESS_IMAGE="${EGRESS_IMAGE:-videoroll-egress:prod}"' in script
+    assert '-t "$SUBTITLE_IMAGE"' in script
     assert '-t "$EGRESS_IMAGE"' in script
     assert 'FFPLAYOUT_IMAGE="${FFPLAYOUT_IMAGE:-videoroll-ffplayout:prod}"' in script
-    assert 'IMAGES=("$APP_IMAGE" "$EGRESS_IMAGE" "$WEB_IMAGE" "$SOCIAL_IMAGE" "$FFPLAYOUT_IMAGE")' in script
+    assert 'IMAGES=("$APP_IMAGE" "$SUBTITLE_IMAGE" "$EGRESS_IMAGE" "$WEB_IMAGE" "$SOCIAL_IMAGE" "$FFPLAYOUT_IMAGE")' in script
 
 
 def test_web_is_not_hard_blocked_on_ffplayout_health() -> None:
@@ -204,10 +229,11 @@ def test_intel_override_owns_all_gpu_device_mappings() -> None:
         assert service.get("group_add") == ["${INTEL_GPU_RENDER_GID:-992}"]
 
 
-def test_legacy_live_is_disabled_by_default_in_compose() -> None:
+def test_legacy_live_environment_is_removed_from_compose() -> None:
     for path in COMPOSE_FILES:
         orchestrator = _compose(path)["services"]["orchestrator"]
-        assert orchestrator["environment"]["LEGACY_LIVE_ENABLED"] == "${LEGACY_LIVE_ENABLED:-false}"
+        assert "LEGACY_LIVE_ENABLED" not in orchestrator["environment"]
+        assert "LIVE_INTERNAL_STREAM_BASE_URL" not in orchestrator["environment"]
 
 
 def test_playout_proxy_uses_dynamic_docker_dns_and_frame_ancestors() -> None:

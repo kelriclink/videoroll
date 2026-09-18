@@ -20,11 +20,8 @@ TMPDIR=/storage/.partial
 INTERNAL_API_SECRET=...
 ADMIN_BOOTSTRAP_SECRET=...
 WEB_PORT=3001
-PLAYOUT_PORT=3003
-VITE_FFPLAYOUT_PORT=3003
-# Optional. Leave empty to follow the current browser hostname automatically.
+# Optional. Leave empty to use the same-origin /playout/ gateway.
 VITE_FFPLAYOUT_URL=
-LEGACY_LIVE_ENABLED=false
 ```
 
 `.env`、数据库密码、平台 Cookie 和 Fernet 密钥不得提交到仓库或随工单传播。
@@ -70,14 +67,15 @@ ENV_FILE=/secure/path/production.env INCLUDE_BASE_IMAGES=1 ./scripts/build_expor
 
 生成的 `videoroll-prod-bundle-<timestamp>.tar` 同时包含：
 
-- `videoroll:prod`（Orchestrator、内部 API、worker、dispatcher）
+- `videoroll:prod`（Orchestrator、YouTube ingest、Bilibili publisher、dispatcher 等 core 角色）
+- `videoroll-subtitle:prod`（Subtitle API/worker/control worker，包含 RAG/embedding/ASR 重依赖）
 - `videoroll-egress:prod`
 - `videoroll-web:prod`
 - `videoroll-social-publisher:prod`
 - `videoroll-ffplayout:prod`
 - `redis:7`
 
-主应用与 egress 网关都默认使用 `INSTALL_ASR=1` 构建，安装完整本地 ASR 依赖，不再为网关单独关闭 ASR。安装依赖不会让网关自动加载语音模型。
+core 与 egress 镜像固定使用 `INSTALL_SUBTITLE=0 INSTALL_ASR=0`；只有字幕镜像使用 `INSTALL_SUBTITLE=1`，并通过 `INSTALL_ASR` 控制本地 faster-whisper/OpenVINO ASR。这样 Torch、sentence-transformers、optimum-intel 和本地 ASR runtime 不再重复安装到 Orchestrator、ingest、publisher 与 egress gateway。
 
 根目录 `.dockerignore` 排除了 `social-auto-upload` 中的 Cookie、日志、本地配置与运行数据库；它们不会进入新构建的镜像。已生成的旧镜像和旧部署包不会因此被清理：如果曾在保存有账号登录状态的工作区构建过社交镜像，应停止分发旧包，重新构建，并在对应平台撤销其中可能包含的旧登录凭据。
 
@@ -87,7 +85,9 @@ ENV_FILE=/secure/path/production.env INCLUDE_BASE_IMAGES=1 ./scripts/build_expor
 都包含 `ffplayout` 服务。它使用 upstream `main` 的固定 commit，镜像由
 `services/ffplayout/Dockerfile.videoroll` 构建，Vue 前端嵌入 Rust binary。
 
-ffplayout 仅加入 `internal` 网络，不发布宿主机端口；数据目录分别持久化到
+`internal` 是 Docker `internal: true` 的东西向网络，不提供默认公网路由。ffplayout 同时加入 `playout-egress` 以访问 RTMP/SRT/UDP 外部推流地址；outbox-dispatcher 同时加入 `infrastructure-egress`，以连接宿主机或外部 PostgreSQL；字幕服务额外挂载 `subtitle-egress`，YouTube/Bilibili/社交平台角色使用独立的 `platform-egress`，RAG 公共网页抓取仍经 `egress-gateway` 的 `egress` 网络。所有内部服务仍不发布宿主机端口。
+
+ffplayout 数据目录分别持久化到
 `data/ffplayout/{db,logs,playlists,public}`，播控媒体位于
 `${STORAGE_HOST_ROOT}/playout-media`。首次完成 ffplayout setup 时使用容器内路径：
 
@@ -115,32 +115,26 @@ VideoRoll Orchestrator 同时将该宿主机目录作为 `/storage/playout-media
 不会写入 VideoRoll 字段。升级时必须同时保留 `data/storage/playout-media`，
 并确保 Orchestrator 与 ffplayout 使用相同的 `STORAGE_HOST_ROOT`。
 
-ffplayout 使用 Web/Nginx 的独立监听端口，默认宿主机 `PLAYOUT_PORT=3003`。
-SPA 默认沿用当前浏览器 hostname，只切换到 `VITE_FFPLAYOUT_PORT`，因此同一个
-Web 镜像可以通过多个 IP、VPN 地址或 DNS 名称访问。例如：
+ffplayout 由 Web/Nginx 挂载在同源 `/playout/` 路径，不再需要独立浏览器端口。
+同一个 Web 镜像可以通过多个 IP、VPN 地址或 DNS 名称访问。例如：
 
 ```dotenv
 WEB_PORT=3001
-PLAYOUT_PORT=3003
-VITE_FFPLAYOUT_PORT=3003
 VITE_FFPLAYOUT_URL=
-LEGACY_LIVE_ENABLED=false
 ```
 
 从 `http://192.168.5.23:3001` 打开 VideoRoll 时，播控页自动加载
-`http://192.168.5.23:3003`。只有特殊反向代理拓扑才需要设置完整
+`http://192.168.5.23:3001/playout/`。只有特殊反向代理拓扑才需要设置完整
 `VITE_FFPLAYOUT_URL`；修改该覆盖值仍需重建 Web 镜像。浏览器不得访问 Docker
 DNS 名称 `ffplayout:8787`，宿主机也不应发布 8787。
 
 **首次 setup 不得直接暴露到公网。** ffplayout 尚未初始化时 `/api/setup` 无需
-登录，因此上线顺序必须是：先启动容器并让 `PLAYOUT_PORT` 仅管理员 IP、临时
-Basic Auth 或内网可访问；按上面的容器内路径完成 setup；确认
-`GET /api/setup` 已返回 `required=false` 后，再移除临时访问限制并开放播控域名。
-不要先公开域名再创建 Global Admin。
+登录；首次部署应先把整个 VideoRoll Web 入口限制在管理员 IP、临时 Basic Auth
+或内网，完成 setup 并确认 `GET /api/setup` 已返回 `required=false` 后，再开放
+公网入口。不要先公开站点再创建 Global Admin。
 
-如果使用 Nginx、Caddy 或 Traefik 等外部反向代理，应同时代理 VideoRoll 的
-`WEB_PORT` 和播控 `PLAYOUT_PORT`。如果外部拓扑无法保持“同 hostname + 不同端口”，
-再使用 `VITE_FFPLAYOUT_URL` 显式覆盖浏览器播控地址。
+如果使用 Nginx、Caddy 或 Traefik 等外部反向代理，只需代理 VideoRoll 的
+`WEB_PORT`；`/playout/` 及 ffplayout 的兼容 API 路由由内部 Web/Nginx 处理。
 
 基础 Compose 不要求 GPU。使用 `docker-compose.intel.yml` 时，才会向
 ffplayout 添加 `/dev/dri` 和 `INTEL_GPU_RENDER_GID`。生产离线导出脚本会额外

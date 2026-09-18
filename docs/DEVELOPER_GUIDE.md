@@ -39,7 +39,7 @@ docker-compose.intel.yml  Intel iGPU 覆盖层
 ./scripts/dev_web.sh
 
 # 后端测试
-python -m pytest tests/
+python3 -m pytest tests/
 
 # 前端 lint / 构建
 cd src/web && npm run lint && npm run build
@@ -59,7 +59,7 @@ ENV_FILE=.env INCLUDE_BASE_IMAGES=1 ./scripts/build_export_prod.sh
 
 ## 安全上线与运行
 
-生产部署只公开 `web` 的 `${PUBLISH_ADDR}:${WEB_PORT}`。`orchestrator`、四个内部 API、Redis、outbox dispatcher 和 egress gateway 都在 Compose 的 `internal` 网络中，不能添加 `ports:` 映射；需要诊断时使用受控的 `docker compose exec`，不要临时暴露内部端口。
+生产部署只公开 `web` 的 `${PUBLISH_ADDR}:${WEB_PORT}`。`orchestrator`、内部 API、Redis、outbox dispatcher、egress gateway 和 ffplayout 都不得添加宿主机 `ports:` 映射；需要诊断时使用受控的 `docker compose exec`，不要临时暴露内部端口。公网出站权限按服务职责分区，详见架构指南。
 
 ### 必需环境变量
 
@@ -117,7 +117,7 @@ CREATED → INGESTED → DOWNLOADED → AUDIO_EXTRACTED → ASR_DONE → TRANSLA
 → SUBTITLE_READY → RENDERED → READY_FOR_REVIEW → APPROVED → PUBLISHING → PUBLISHED
 ```
 
-服务间仅通过 DB 任务状态 + S3 存储 key 通信，不直接传递数据。
+服务间仅通过 DB 任务状态 + 共享文件存储 key 通信，不直接传递大体积媒体数据。
 
 ### Celery、outbox 与恢复
 
@@ -145,7 +145,7 @@ React 18 + TypeScript + Vite + Tailwind + react-router-dom v6。生产环境 ngi
 ### 外部服务
 
 - **Redis** — Celery broker/backend
-- **共享文件存储** — `/storage/objects` 下的相对 key 与原子文件操作
+- **共享文件存储** — `/storage/objects` 下的相对 key、原子文件操作，以及独立的 `/storage/playout-media` 播控媒体目录
 - **PostgreSQL 16+** — 需外部提供
 
 ## 编码约定

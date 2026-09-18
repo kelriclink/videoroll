@@ -1,15 +1,15 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-`src/videoroll/` is the Python 3.12 backend. `apps/monolith` exposes `/api`; `apps/subtitle_service` owns ASR, translation, render queues, and the RAG Agent runtime; `apps/youtube_ingest` and `apps/bilibili_publisher` handle ingest and publishing. Shared config, DB, storage, AI, and utilities live in `config.py`, `db/`, `storage/`, `ai/`, and `utils/`. `src/web/` is React 18 + Vite + Tailwind, with pages, helpers, and tests in `src/web/src/pages/`. Backend tests are `tests/test_*.py`. Docs live in `docs/`; local state in `data/`. Avoid casual edits to vendored `biliup-master/` and `bilibili-API-collect-main/`.
+`src/videoroll/` is the Python 3.12 backend. `apps/orchestrator_api` exposes the browser-facing `/api`; `apps/subtitle_service` owns ASR, translation, render queues, and the RAG Agent runtime; `apps/youtube_ingest`, `apps/bilibili_publisher`, and `apps/social_publisher` handle ingest and publishing. Shared config, DB, filesystem storage, AI, and utilities live in `config.py`, `db/`, `storage/`, `ai/`, and `utils/`. `services/ffplayout/` is the integrated playout engine, while `social-auto-upload` is the external source submodule required for social publishing. `src/web/` is React 18 + Vite + Tailwind. Backend tests are `tests/test_*.py`; frontend tests are colocated under `src/web/src/`. Historical/reference upstream projects are documented in `docs/REFERENCES.md` rather than copied into the main source tree.
 
 ## Build, Test, and Development Commands
-Compose starts `app`, `web`, Redis, and MinIO. PostgreSQL 16+ is external; configure `DATABASE_URL`.
+Compose starts the Web gateway, Orchestrator, isolated internal APIs/workers, Redis, egress gateway, social publisher services, and ffplayout. PostgreSQL 16+ is external; configure `DATABASE_URL`. Media and artifacts use the shared filesystem rooted at `STORAGE_HOST_ROOT`/`STORAGE_ROOT`.
 
 - `./scripts/dev_up.sh`: create `.env` if missing, build, and start locally.
 - `./scripts/dev_down.sh`, `./scripts/dev_logs.sh`, `./scripts/dev_health.sh`: stop, inspect logs, or check health.
 - `./scripts/dev_web.sh`: run only Vite on port `3000`.
-- `python -m pytest tests/`: run backend tests.
+- `python3 -m pytest tests/` (or `python -m pytest tests/` in an activated venv): run backend tests.
 - `cd src/web && npm run lint && npm run test && npm run build`: lint, test, and build the frontend.
 - `./scripts/smoke_local.sh [video.mp4]`: run an upload/subtitle smoke flow.
 - `./scripts/build_export_prod.sh`: build and export Docker images.

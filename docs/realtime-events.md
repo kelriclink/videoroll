@@ -36,8 +36,8 @@ connection becomes stale.
 - `log.updated`
 
 Logs are deliberately not transported over WebSocket. When the task Logs tab
-is open, `log.updated` triggers a debounced S3 Range tail request, limited to
-one request every two seconds.
+is open, `log.updated` triggers a debounced ranged read through the storage API,
+limited to one request every two seconds.
 
 ## Delivery and deployment
 

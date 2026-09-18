@@ -1,0 +1,188 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    name: Backend pytest + migrations
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: videoroll_migration_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d videoroll_migration_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+    env:
+      DATABASE_URL: postgresql+psycopg://postgres:postgres@127.0.0.1:5432/videoroll_migration_test
+      VIDEOROLL_MIGRATION_TEST_DATABASE_URL: postgresql+psycopg://postgres:postgres@127.0.0.1:5432/videoroll_migration_test
+      REDIS_URL: redis://127.0.0.1:6379/0
+      INTERNAL_API_SECRET: ci-internal-secret-change-me
+      ADMIN_BOOTSTRAP_SECRET: ci-bootstrap-secret-change-me
+      DEVELOPMENT_MODE: "true"
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -c requirements.lock -e ".[dev]"
+
+      - name: Run backend test suite
+        run: python -m pytest -q
+
+      - name: Run ffplayout gateway contract tests
+        run: python -m pytest -q tests/test_ffplayout_gateway.py
+
+      - name: Run Alembic and schema migration tests
+        run: >-
+          python -m pytest -q
+          tests/test_database_initialization.py
+          tests/test_security_schema_migration.py
+          tests/test_database_initialization_postgresql.py
+
+      - name: Run security smoke
+        run: ./scripts/security_smoke.sh
+
+  frontend:
+    name: Frontend lint + test + build
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: src/web
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: src/web/package-lock.json
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: ESLint
+        run: npm run lint
+
+      - name: Vitest
+        run: npm test -- --run
+
+      - name: Production build
+        run: npm run build
+
+  compose:
+    name: Compose configuration
+    runs-on: ubuntu-24.04
+    env:
+      DATABASE_URL: postgresql+psycopg://videoroll:videoroll@postgres:5432/videoroll
+      REDIS_URL: redis://redis:6379/0
+      INTERNAL_API_SECRET: ci-internal-secret-change-me
+      ADMIN_BOOTSTRAP_SECRET: ci-bootstrap-secret-change-me
+      DEVELOPMENT_MODE: "false"
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Validate default Compose
+        run: docker compose -f docker-compose.yml config --quiet
+
+      - name: Validate alternate Compose
+        run: docker compose -f compose.yml config --quiet
+
+      - name: Validate offline-production Compose
+        run: docker compose -f fromprod/docker-compose.yml config --quiet
+
+
+  images:
+    name: Docker core + subtitle smoke
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Check application Dockerfile
+        run: docker build --check -f Dockerfile .
+
+      - name: Build core image
+        run: >-
+          docker build
+          -t videoroll-core:ci
+          --build-arg INSTALL_SUBTITLE=0
+          --build-arg INSTALL_ASR=0
+          -f Dockerfile
+          .
+
+      - name: Verify core dependency boundary
+        run: |
+          docker run --rm --entrypoint python videoroll-core:ci -c '
+          import importlib.util
+          required = ["yt_dlp", "PIL"]
+          forbidden = ["torch", "sentence_transformers", "optimum", "faster_whisper", "openvino_genai", "huggingface_hub"]
+          missing = [name for name in required if importlib.util.find_spec(name) is None]
+          leaked = [name for name in forbidden if importlib.util.find_spec(name) is not None]
+          assert not missing, f"core image missing dependencies: {missing}"
+          assert not leaked, f"core image leaked subtitle dependencies: {leaked}"
+          '
+
+      - name: Build subtitle smoke image
+        run: >-
+          docker build
+          -t videoroll-subtitle:ci
+          --build-arg INSTALL_SUBTITLE=1
+          --build-arg INSTALL_ASR=0
+          -f Dockerfile
+          .
+
+      - name: Verify subtitle dependency boundary
+        run: |
+          docker run --rm --entrypoint python videoroll-subtitle:ci -c '
+          import importlib.util
+          required = ["torch", "huggingface_hub", "sentence_transformers", "optimum"]
+          forbidden = ["faster_whisper", "openvino_genai"]
+          missing = [name for name in required if importlib.util.find_spec(name) is None]
+          unexpected = [name for name in forbidden if importlib.util.find_spec(name) is not None]
+          assert not missing, f"subtitle image missing dependencies: {missing}"
+          assert not unexpected, f"subtitle smoke image unexpectedly contains ASR dependencies: {unexpected}"
+          '

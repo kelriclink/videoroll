@@ -1,18 +1,18 @@
 # 架构指南
 
-本文档描述当前生产拓扑，而不是早期单进程原型。Compose 将 HTTP API、worker、调度器和出站访问分成独立进程；同一个 `videoroll:prod` 镜像按不同命令承担多个角色。
+本文档描述当前生产拓扑，而不是早期单进程原型。Compose 将 HTTP API、worker、调度器和出站访问分成独立进程；core 角色使用精简的 `videoroll:prod`，Subtitle API/worker 使用包含 RAG、embedding 与本地 ASR 依赖的 `videoroll-subtitle:prod`。
 
 ## 服务与职责
 
 | 服务 | 职责 | 网络暴露 |
 |---|---|---|
 | `web` | SPA、Nginx 反向代理与 desktop 授权入口 | 唯一的宿主机端口 |
-| `orchestrator` | 管理员认证、任务状态机、资产、设置、浏览器代理 | internal |
-| `subtitle-service` | ASR、翻译、RAG、字幕和渲染 HTTP API | internal |
-| `subtitle-worker` | 执行 subtitle 队列与租约恢复 | internal |
-| `youtube-ingest` | 受授权来源接入与扫描 | internal |
-| `bilibili-publisher` / `publish-worker` | Bilibili 投稿 API 与 publish 队列 | internal |
-| `social-publisher-api` / `worker` / `scheduler` | SAU 账号、浏览器投稿和周期调度 | internal |
+| `orchestrator` | 管理员认证、任务状态机、资产、设置、浏览器代理 | internal + platform-egress |
+| `subtitle-service` | ASR、翻译、RAG、字幕和渲染 HTTP API | internal + subtitle-egress |
+| `subtitle-worker` | 执行 subtitle 队列与租约恢复 | internal + subtitle-egress |
+| `youtube-ingest` | 受授权来源接入与扫描 | internal + platform-egress |
+| `bilibili-publisher` / `publish-worker` | Bilibili 投稿 API 与 publish 队列 | internal + platform-egress |
+| `social-publisher-api` / `worker` / `scheduler` | SAU 账号、浏览器投稿和周期调度 | internal + platform-egress |
 | `outbox-dispatcher` | 投递 durable outbox，独立于业务 worker | internal |
 | `egress-gateway` | RAG 与网页抓取的唯一公网出口 | internal + egress |
 | `redis` | 队列与调度状态 | internal |
@@ -30,14 +30,23 @@ host ── published port ──► web
                                 │
                                 ▼
                            orchestrator
-                     ┌──────────┼──────────┐
-                     ▼          ▼          ▼
-                internal APIs  workers  Redis / shared storage
-                     │
-                     └──► egress-gateway ──► public Internet
+                                │
+                  ┌─────────────┴─────────────┐
+                  ▼                           ▼
+         internal: true                 platform-egress
+       APIs / Redis / DB                   │
+            │                              └──► YouTube / Bilibili / social platforms
+            ├──► subtitle roles ──► subtitle-egress ──► AI / ASR providers
+            ├──► ffplayout ───────► playout-egress ───► RTMP / public stream endpoints
+            ├──► outbox ──────────► infrastructure-egress ─► external PostgreSQL / host services
+            │
+            └──► egress-gateway ──► validated public fetches
 ```
 
-- 应用服务共享 `internal` Docker 网络，该网络允许访问宿主机上的 PostgreSQL；公网抓取仍统一通过 `egress-gateway` 的受控接口完成。
+- `internal` 是 `internal: true` 的东西向 Docker 网络，本身没有默认公网路由；它只承担容器间 API、Redis 等内部通信。
+- Subtitle 角色按需加入 `subtitle-egress` 访问 OpenAI/Groq/Cloudflare/Hugging Face 等 provider；平台采集/发布角色加入独立的 `platform-egress`。
+- ffplayout 同时加入 `playout-egress`，用于 RTMP/SRT/UDP 等外部推流；outbox-dispatcher 同时加入 `infrastructure-egress`，用于连接宿主机或外部 PostgreSQL。
+- RAG 的任意公共网页/Wikipedia/SearXNG 抓取继续通过 `egress-gateway`，由网关执行 URL、DNS、redirect 与连接 peer 校验。
 - 只能为 `web` 配置 `ports:`。禁止通过临时端口映射公开 Redis、内部 API、noVNC 或 VNC。
 - 浏览器只能请求 Orchestrator 的 `/api` 路由。Orchestrator 使用服务 DNS 与内部 token 转发受允许的请求。
 

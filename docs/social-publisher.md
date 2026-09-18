@@ -85,7 +85,7 @@ cookies/kuaishou_creator.json
 3. 将账号校验任务发送给独立 worker。
 4. 在网页显示 `queued`、`checking`、`valid`、`invalid` 或 `error`。
 
-账号 JSON 不进入 S3，API 不会回显内容。worker 只在 tmpfs 中临时解密，并在命令结束后删除明文文件。
+账号 JSON 不进入共享媒体文件系统，API 不会回显内容。worker 只在 tmpfs 中临时解密，并在命令结束后删除明文文件。
 
 不要删除或替换 `data/secrets/fernet.key`；否则已加密的账号和其他加密设置将无法读取。
 

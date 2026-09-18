@@ -1,5 +1,8 @@
 FROM ubuntu:24.04
 
+ARG INSTALL_SUBTITLE=0
+ARG INSTALL_ASR=0
+
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
@@ -15,26 +18,27 @@ RUN apt-get update \
     python3-venv \
     python-is-python3 \
     ffmpeg \
-    fonts-noto-cjk \
-    intel-media-va-driver \
-    i965-va-driver \
-    pciutils \
-    ocl-icd-libopencl1 \
-    intel-opencl-icd \
-    libze1 \
-    clinfo \
+  && if [ "$INSTALL_SUBTITLE" = "1" ]; then \
+       apt-get install -y --no-install-recommends \
+         fonts-noto-cjk \
+         intel-media-va-driver \
+         i965-va-driver \
+         pciutils \
+         ocl-icd-libopencl1 \
+         intel-opencl-icd \
+         libze1 \
+         clinfo; \
+     fi \
   && python3 -m venv "${VIRTUAL_ENV}" \
   && rm -rf /var/lib/apt/lists/*
 
 COPY pyproject.toml README.md ./
 
-# Normal application builds must include the ASR engines selectable at runtime.
-ARG INSTALL_ASR=1
 ARG YTDLP_VERSION=latest
 
 # Install dependencies in a cache-friendly layer so editing source code doesn't
 # force re-downloading everything on every docker build.
-RUN INSTALL_ASR="$INSTALL_ASR" python -c "import os, tomllib; from pathlib import Path; data=tomllib.loads(Path('pyproject.toml').read_text('utf-8')); deps=list(data.get('project', {}).get('dependencies', []) or []); opt=data.get('project', {}).get('optional-dependencies', {}) or {}; deps += list(opt.get('asr', []) or []) if os.getenv('INSTALL_ASR','0')=='1' else []; Path('/tmp/requirements.txt').write_text('\\n'.join(deps) + '\\n', encoding='utf-8')" \
+RUN INSTALL_SUBTITLE="$INSTALL_SUBTITLE" INSTALL_ASR="$INSTALL_ASR" python -c "import os, tomllib; from pathlib import Path; data=tomllib.loads(Path('pyproject.toml').read_text('utf-8')); deps=list(data.get('project', {}).get('dependencies', []) or []); opt=data.get('project', {}).get('optional-dependencies', {}) or {}; deps += list(opt.get('subtitle', []) or []) if os.getenv('INSTALL_SUBTITLE','0')=='1' else []; deps += list(opt.get('asr', []) or []) if os.getenv('INSTALL_ASR','0')=='1' else []; Path('/tmp/requirements.txt').write_text('\\n'.join(deps) + '\\n', encoding='utf-8')" \
   && pip install --no-cache-dir -U pip \
   && pip install --no-cache-dir -r /tmp/requirements.txt
 

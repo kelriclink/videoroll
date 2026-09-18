@@ -29,7 +29,10 @@ COPY package*.json ./
 RUN npm ci --no-fund --no-audit
 
 COPY . .
-RUN npm run build-only
+# VideoRoll serves ffplayout under the same origin at /playout/. ffplayout's
+# release build.rs runs `npm run build` again, so patch only this image's npm
+# script before Cargo invokes it. The vendored source tree stays upstream-like.
+RUN npm pkg set 'scripts.build-only=vite build --base=/playout/'
 RUN cargo build --release --package ffplayout --no-default-features --features embed_frontend
 
 FROM debian:trixie-slim AS runtime

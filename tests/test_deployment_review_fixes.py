@@ -231,7 +231,7 @@ def test_export_script_passes_the_same_uid_and_gid_to_all_application_builds(
     assert result.returncode == 0, result.stderr
     commands = [json.loads(line) for line in command_log.read_text(encoding="utf-8").splitlines()]
     application_builds = [args for args in commands if args[0] == "build" and args[args.index("-f") + 1] != "src/web/Dockerfile"]
-    assert len(application_builds) == 4
+    assert len(application_builds) == 5
     for args in application_builds:
         build_args = {args[index + 1] for index, value in enumerate(args) if value == "--build-arg"}
         assert f"APP_UID={uid or '10001'}" in build_args

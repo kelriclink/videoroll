@@ -6,7 +6,7 @@
 
 | 边界 | 当前状态 | 验证 |
 |---|---|---|
-| 内部服务 | 所有非 `/health` 请求需要 `X-Videoroll-Internal-Token`，服务仅在 internal Compose 网络 | `scripts/security_smoke.sh` |
+| 内部服务 | 所有非 `/health` 请求需要 `X-Videoroll-Internal-Token`；东西向流量使用 `internal: true` 网络，公网出站按 subtitle/platform/egress-gateway 职责分区 | `scripts/security_smoke.sh` |
 | Remote API | 只接受 Bearer `POST` JSON 与 `Idempotency-Key`；旧 GET/query-token 为 `410` | `tests/test_security_rollout.py` |
 | 异步副作用 | domain 事务与 outbox 事件同事务提交，broker 失败保留为可重试状态 | `tests/test_security_rollout.py` |
 | noVNC | 短期、会话/资源绑定的 desktop grant 保护 landing page 与 WebSocket | `tests/test_security_rollout.py` |

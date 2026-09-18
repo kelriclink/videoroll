@@ -42,7 +42,7 @@ const ALLOWED_MIME_TYPES: &[&str] = &[
     "video/webm",
 ];
 
-pub(crate) const MAX_UPLOAD_SIZE: u64 = 4096 * 1024 * 1024;
+pub(crate) const MAX_UPLOAD_SIZE: u64 = 128 * 1024 * 1024 * 1024;
 pub(crate) const MAX_CHUNK_SIZE: u64 = 10 * 1024 * 1024;
 pub(crate) const MAX_UPLOAD_REQUEST_SIZE: usize = MAX_CHUNK_SIZE as usize + 64 * 1024;
 const ACTIVE_UPLOAD_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
@@ -520,6 +520,8 @@ mod tests {
     #[test]
     fn rejects_invalid_upload_metadata_and_ranges() {
         assert!(validate_upload_metadata(0, "batch").is_err());
+        assert!(validate_upload_metadata(MAX_UPLOAD_SIZE, "batch").is_ok());
+        assert!(validate_upload_metadata(MAX_UPLOAD_SIZE + 1, "batch").is_err());
         assert!(validate_upload_metadata(1, "").is_err());
         assert!(validate_chunk(3, 3, 6, 0).is_err());
         assert!(validate_chunk(0, 4, 6, 3).is_err());

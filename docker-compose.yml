@@ -1,7 +1,18 @@
-x-application-build: &application-build
+x-core-build: &core-build
   context: .
   dockerfile: Dockerfile
   args:
+    INSTALL_SUBTITLE: "0"
+    INSTALL_ASR: "0"
+    YTDLP_VERSION: ${YTDLP_VERSION:-2026.8.19}
+    APP_UID: ${APP_UID:-10001}
+    APP_GID: ${APP_GID:-10001}
+
+x-subtitle-build: &subtitle-build
+  context: .
+  dockerfile: Dockerfile
+  args:
+    INSTALL_SUBTITLE: "1"
     INSTALL_ASR: ${INSTALL_ASR:-1}
     YTDLP_VERSION: ${YTDLP_VERSION:-2026.8.19}
     APP_UID: ${APP_UID:-10001}
@@ -117,7 +128,7 @@ services:
       - ${STORAGE_HOST_ROOT:-./data/storage}/playout-media:/var/lib/ffplayout/media
     expose:
       - "8787"
-    networks: [internal]
+    networks: [internal, playout-egress]
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8787/api/setup >/dev/null || exit 1"]
       interval: 30s
@@ -130,7 +141,8 @@ services:
       context: .
       dockerfile: Dockerfile
       args:
-        INSTALL_ASR: ${INSTALL_ASR:-1}
+        INSTALL_SUBTITLE: "0"
+        INSTALL_ASR: "0"
         YTDLP_VERSION: ${YTDLP_VERSION:-2026.8.19}
         APP_UID: ${APP_UID:-10001}
         APP_GID: ${APP_GID:-10001}
@@ -151,7 +163,7 @@ services:
     restart: unless-stopped
 
   orchestrator:
-    build: *application-build
+    build: *core-build
     image: videoroll:prod
     <<: *application-security
     command: ["uvicorn", "videoroll.apps.orchestrator_api.main:app", "--host", "0.0.0.0", "--port", "8000", "--root-path", "/api"]
@@ -167,8 +179,6 @@ services:
       WORK_DIR: ${WORK_DIR:-/storage/work/videoroll}
       FFMPEG_PATH: ${FFMPEG_PATH:-ffmpeg}
       PLAYOUT_MEDIA_ROOT: ${PLAYOUT_MEDIA_ROOT:-/storage/playout-media}
-      LIVE_INTERNAL_STREAM_BASE_URL: ${LIVE_INTERNAL_STREAM_BASE_URL:-http://127.0.0.1:8000}
-      LEGACY_LIVE_ENABLED: ${LEGACY_LIVE_ENABLED:-false}
       INTEL_GPU_RENDER_DEVICE: ${INTEL_GPU_RENDER_DEVICE:-/dev/dri/renderD128}
       YOUTUBE_USER_AGENT: "${YOUTUBE_USER_AGENT:-Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36}"
       YOUTUBE_COOKIE_FILE: ${YOUTUBE_COOKIE_FILE:-}
@@ -194,6 +204,7 @@ services:
     networks:
       internal:
         aliases: [app]
+      platform-egress:
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=5)"]
       interval: 15s
@@ -202,8 +213,8 @@ services:
     restart: unless-stopped
 
   subtitle-service:
-    build: *application-build
-    image: videoroll:prod
+    build: *subtitle-build
+    image: videoroll-subtitle:prod
     <<: *application-security
     command: ["uvicorn", "videoroll.apps.subtitle_service.main:app", "--host", "0.0.0.0", "--port", "8001"]
     environment:
@@ -218,7 +229,7 @@ services:
         condition: service_healthy
       egress-gateway:
         condition: service_healthy
-    networks: [internal]
+    networks: [internal, subtitle-egress]
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/health', timeout=5)"]
       interval: 15s
@@ -227,7 +238,7 @@ services:
     restart: unless-stopped
 
   youtube-ingest:
-    build: *application-build
+    build: *core-build
     image: videoroll:prod
     <<: *application-security
     command: ["uvicorn", "videoroll.apps.youtube_ingest.main:app", "--host", "0.0.0.0", "--port", "8002"]
@@ -241,7 +252,7 @@ services:
     depends_on:
       redis:
         condition: service_healthy
-    networks: [internal]
+    networks: [internal, platform-egress]
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8002/health', timeout=5)"]
       interval: 15s
@@ -250,7 +261,7 @@ services:
     restart: unless-stopped
 
   bilibili-publisher:
-    build: *application-build
+    build: *core-build
     image: videoroll:prod
     <<: *application-security
     command: ["uvicorn", "videoroll.apps.bilibili_publisher.main:app", "--host", "0.0.0.0", "--port", "8003"]
@@ -264,7 +275,7 @@ services:
     depends_on:
       redis:
         condition: service_healthy
-    networks: [internal]
+    networks: [internal, platform-egress]
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8003/health', timeout=5)"]
       interval: 15s
@@ -273,8 +284,8 @@ services:
     restart: unless-stopped
 
   subtitle-worker:
-    build: *application-build
-    image: videoroll:prod
+    build: *subtitle-build
+    image: videoroll-subtitle:prod
     <<: *application-security
     command: ["sh", "-ec", "worker_concurrency=$$(python -m videoroll.apps.subtitle_service.worker_concurrency); exec celery -A videoroll.apps.subtitle_service.worker:celery_app worker -Q subtitle -l INFO --concurrency \"$$worker_concurrency\""]
     environment:
@@ -292,7 +303,7 @@ services:
         condition: service_healthy
       egress-gateway:
         condition: service_healthy
-    networks: [internal]
+    networks: [internal, subtitle-egress]
     healthcheck:
       test: ["CMD-SHELL", "celery -A videoroll.apps.subtitle_service.worker:celery_app inspect ping --timeout=3 --destination=celery@$${HOSTNAME} | grep -q pong"]
       interval: 30s
@@ -301,8 +312,8 @@ services:
     restart: unless-stopped
 
   subtitle-control-worker:
-    build: *application-build
-    image: videoroll:prod
+    build: *subtitle-build
+    image: videoroll-subtitle:prod
     <<: *application-security
     command: ["celery", "-A", "videoroll.apps.subtitle_service.worker:celery_app", "worker", "-Q", "subtitle-control", "-l", "INFO", "--concurrency", "1"]
     environment:
@@ -316,7 +327,7 @@ services:
         condition: service_healthy
       egress-gateway:
         condition: service_healthy
-    networks: [internal]
+    networks: [internal, subtitle-egress]
     healthcheck:
       test: ["CMD-SHELL", "celery -A videoroll.apps.subtitle_service.worker:celery_app inspect ping --timeout=3 --destination=celery@$${HOSTNAME} | grep -q pong"]
       interval: 30s
@@ -325,12 +336,12 @@ services:
     restart: unless-stopped
 
   outbox-dispatcher:
-    build: *application-build
+    build: *core-build
     image: videoroll:prod
     <<: *application-security
     command: ["outbox-dispatcher"]
     environment:
-      <<: *subtitle-environment
+      <<: *internal-environment
       DEPLOYMENT_ROLE: outbox-dispatcher
     volumes:
       - ${STORAGE_HOST_ROOT:-./data/storage}:/storage
@@ -343,7 +354,7 @@ services:
         condition: service_healthy
       social-publisher-worker:
         condition: service_healthy
-    networks: [internal]
+    networks: [internal, infrastructure-egress]
     healthcheck:
       test: ["CMD-SHELL", "test -f /tmp/outbox-dispatcher-ready"]
       interval: 30s
@@ -352,7 +363,7 @@ services:
     restart: unless-stopped
 
   publish-worker:
-    build: *application-build
+    build: *core-build
     image: videoroll:prod
     <<: *application-security
     command: ["celery", "-A", "videoroll.apps.bilibili_publisher.worker:celery_app", "worker", "-Q", "publish", "-l", "INFO", "--concurrency", "${CELERY_PUB_CONCURRENCY:-1}"]
@@ -366,7 +377,7 @@ services:
     depends_on:
       redis:
         condition: service_healthy
-    networks: [internal]
+    networks: [internal, platform-egress]
     healthcheck:
       test: ["CMD-SHELL", "celery -A videoroll.apps.bilibili_publisher.worker:celery_app inspect ping --timeout=3 --destination=celery@$${HOSTNAME} | grep -q pong"]
       interval: 30s
@@ -396,7 +407,7 @@ services:
     depends_on:
       redis:
         condition: service_healthy
-    networks: [internal]
+    networks: [internal, platform-egress]
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8010/health', timeout=5)"]
       interval: 15s
@@ -426,7 +437,7 @@ services:
     depends_on:
       redis:
         condition: service_healthy
-    networks: [internal]
+    networks: [internal, platform-egress]
     healthcheck:
       test: ["CMD-SHELL", "celery -A videoroll.apps.social_publisher.worker:celery_app inspect ping --timeout=3 --destination=celery@$${HOSTNAME} | grep -q pong"]
       interval: 30s
@@ -455,7 +466,7 @@ services:
         condition: service_healthy
       social-publisher-worker:
         condition: service_healthy
-    networks: [internal]
+    networks: [internal, platform-egress]
     healthcheck:
       test: ["CMD-SHELL", "test -e /tmp/social-celerybeat-schedule"]
       interval: 30s
@@ -469,15 +480,12 @@ services:
       args:
         VITE_ORCHESTRATOR_URL: ${VITE_ORCHESTRATOR_URL:-}
         VITE_FFPLAYOUT_URL: ${VITE_FFPLAYOUT_URL:-}
-        VITE_FFPLAYOUT_PORT: ${VITE_FFPLAYOUT_PORT:-3003}
     image: videoroll-web:prod
     environment:
-      PLAYOUT_HOST: ${PLAYOUT_HOST:-playout.localhost}
       VIDEOROLL_PUBLIC_ORIGIN: ${VIDEOROLL_PUBLIC_ORIGIN:-http://localhost:3000}
-      NGINX_ENVSUBST_FILTER: "PLAYOUT_HOST|VIDEOROLL_PUBLIC_ORIGIN"
+      NGINX_ENVSUBST_FILTER: "VIDEOROLL_PUBLIC_ORIGIN"
     ports:
       - "${PUBLISH_ADDR:-127.0.0.1}:${WEB_PORT:-3000}:80"
-      - "${PUBLISH_ADDR:-127.0.0.1}:${PLAYOUT_PORT:-3003}:81"
     networks: [internal]
     depends_on:
       orchestrator:
@@ -495,4 +503,9 @@ services:
 
 networks:
   internal:
+    internal: true
   egress:
+  subtitle-egress:
+  platform-egress:
+  playout-egress:
+  infrastructure-egress:

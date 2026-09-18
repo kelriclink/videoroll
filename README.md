@@ -92,31 +92,26 @@ docker compose --env-file .env up -d --no-build --remove-orphans
 | `INTERNAL_API_SECRET` | 随机且非空，用于内部服务身份与管理员 cookie 密钥派生。 |
 | `ADMIN_BOOTSTRAP_SECRET` | 随机且非空，仅用于首次管理员初始化。 |
 | `PUBLISH_ADDR` | Web 唯一宿主机绑定地址；通常先使用 `127.0.0.1` 并由反向代理公开。 |
-| `PLAYOUT_PORT` | ffplayout 浏览器入口端口，默认 `3003`；宿主机映射到 Web/Nginx 的专用监听端口。 |
-| `VITE_FFPLAYOUT_PORT` | 前端默认使用的播控端口，默认 `3003`；通常与 `PLAYOUT_PORT` 保持一致。 |
-| `VITE_FFPLAYOUT_URL` | 可选的完整播控 URL 覆盖值；留空时自动使用当前浏览器 hostname + `VITE_FFPLAYOUT_PORT`。 |
-| `LEGACY_LIVE_ENABLED` | 旧 VideoRoll Live 引擎紧急回退开关；生产默认 `false`。 |
+| `VITE_FFPLAYOUT_URL` | 可选的完整播控 URL 覆盖值；留空时通过当前 VideoRoll 站点的 `/playout/` 路径访问。 |
 | `SUBTITLE_ASR_ENGINE=openvino` | Intel GPU ASR 使用 OpenVINO。 |
 | `SUBTITLE_OPENVINO_DEVICE=GPU` | Intel GPU OpenVINO 设备名。 |
 | `INTEL_GPU_RENDER_GID` | 宿主机 `/dev/dri/renderD128` 的组 ID。 |
 
 从[.env.example](.env.example)开始配置；真实密钥、Cookie、数据库密码和 `data/secrets/fernet.key` 永远不能提交到 Git。
 
-默认生产部署不要求固定播控域名。Web 入口使用 `WEB_PORT`，播控入口使用
-`PLAYOUT_PORT`；前端会根据当前浏览器 hostname 自动生成播控地址。例如：
+默认生产部署只需要一个 Web 入口。ffplayout 由同一个 Web/Nginx 挂载在
+`/playout/`，因此无论通过 LAN IP、VPN 地址还是外部域名访问，播控都保持同源、
+同端口。例如：
 
 ```dotenv
 WEB_PORT=3001
-PLAYOUT_PORT=3003
-VITE_FFPLAYOUT_PORT=3003
 VITE_FFPLAYOUT_URL=
-LEGACY_LIVE_ENABLED=false
 ```
 
-因此从 `http://192.168.5.23:3001` 进入时播控自动使用
-`http://192.168.5.23:3003`；从其他 IP/DNS 名称进入时也自动跟随相同 hostname。
-不要向宿主机发布 ffplayout 的 8787；它只在 Compose `internal` 网络中供 Web
-nginx 访问。
+从 `http://192.168.5.23:3001` 进入时播控使用
+`http://192.168.5.23:3001/playout/`；外部 Caddy/Nginx 只需要代理 VideoRoll 的
+Web 端口。不要向宿主机发布 ffplayout 的 8787；它只在 Compose `internal`
+网络中供 Web nginx 访问。
 
 任务详情的“媒体与资产”页只允许将 `video_final` 成品加入播控。该操作只提交
 `task_id` 和 `asset_id`，由 Orchestrator 在服务端把文件链接/复制到

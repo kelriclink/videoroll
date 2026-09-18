@@ -1,5 +1,8 @@
 FROM ubuntu:24.04
 
+ARG INSTALL_SUBTITLE=0
+ARG INSTALL_ASR=0
+
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
@@ -17,30 +20,33 @@ RUN apt-get update \
     python3-venv \
     python-is-python3 \
     ffmpeg \
-    fonts-noto-cjk \
-    intel-media-va-driver-non-free \
-    i965-va-driver \
-    pciutils \
-    ocl-icd-libopencl1 \
-    intel-opencl-icd \
-    libze-intel-gpu1 \
-    libze1 \
-    clinfo \
+  && if [ "$INSTALL_SUBTITLE" = "1" ]; then \
+       apt-get install -y --no-install-recommends \
+         fonts-noto-cjk \
+         intel-media-va-driver-non-free \
+         i965-va-driver \
+         pciutils \
+         ocl-icd-libopencl1 \
+         intel-opencl-icd \
+         libze-intel-gpu1 \
+         libze1 \
+         clinfo; \
+     fi \
   && python3 -m venv "${VIRTUAL_ENV}" \
   && rm -rf /var/lib/apt/lists/*
 
 COPY pyproject.toml requirements.lock README.md ./
 
-# Normal application builds must include the ASR engines selectable at runtime.
-ARG INSTALL_ASR=1
 ARG YTDLP_VERSION=2026.8.19
 ARG TORCH_CPU_INDEX_URL=https://download.pytorch.org/whl/cpu
 
 # Install dependencies in a cache-friendly layer so editing source code doesn't
 # force re-downloading everything on every docker build.
-RUN INSTALL_ASR="$INSTALL_ASR" python -c "import os, tomllib; from pathlib import Path; data=tomllib.loads(Path('pyproject.toml').read_text('utf-8')); deps=list(data.get('project', {}).get('dependencies', []) or []); opt=data.get('project', {}).get('optional-dependencies', {}) or {}; deps += list(opt.get('asr', []) or []) if os.getenv('INSTALL_ASR','0')=='1' else []; Path('/tmp/requirements.txt').write_text('\\n'.join(deps) + '\\n', encoding='utf-8')" \
+RUN INSTALL_SUBTITLE="$INSTALL_SUBTITLE" INSTALL_ASR="$INSTALL_ASR" python -c "import os, tomllib; from pathlib import Path; data=tomllib.loads(Path('pyproject.toml').read_text('utf-8')); deps=list(data.get('project', {}).get('dependencies', []) or []); opt=data.get('project', {}).get('optional-dependencies', {}) or {}; deps += list(opt.get('subtitle', []) or []) if os.getenv('INSTALL_SUBTITLE','0')=='1' else []; deps += list(opt.get('asr', []) or []) if os.getenv('INSTALL_ASR','0')=='1' else []; Path('/tmp/requirements.txt').write_text('\\n'.join(deps) + '\\n', encoding='utf-8')" \
   && pip install --no-cache-dir -U pip \
-  && pip install --no-cache-dir --index-url "$TORCH_CPU_INDEX_URL" "torch==2.14.0" \
+  && if [ "$INSTALL_SUBTITLE" = "1" ] || [ "$INSTALL_ASR" = "1" ]; then \
+       pip install --no-cache-dir --index-url "$TORCH_CPU_INDEX_URL" "torch==2.14.0"; \
+     fi \
   && pip install --no-cache-dir -c requirements.lock -r /tmp/requirements.txt
 
 COPY src/videoroll ./src/videoroll
