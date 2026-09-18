@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from videoroll.ai.client import OpenAIRequestError
 from videoroll.apps.subtitle_service import translation_stage
 from videoroll.apps.subtitle_service.processing import Segment
 from videoroll.apps.subtitle_service.translation_stage import (
@@ -157,8 +158,25 @@ def test_openai_failure_requests_celery_retry(monkeypatch: pytest.MonkeyPatch) -
     assert fake_trace.finished[-1]["status"] == "failed"
 
 
-def test_translation_retry_policy_rejects_missing_api_key() -> None:
+def test_translation_retry_policy_rejects_permanent_http_errors() -> None:
     assert is_retryable_translation_error(RuntimeError("API key is not set")) is False
-    assert is_retryable_translation_error(RuntimeError("timeout")) is True
+    for status in (400, 401, 403, 404, 422):
+        assert (
+            is_retryable_translation_error(
+                OpenAIRequestError(f"request failed with {status}", status_code=status)
+            )
+            is False
+        )
+
+
+def test_translation_retry_policy_accepts_transient_failures() -> None:
+    assert is_retryable_translation_error(RuntimeError("temporary provider outage")) is True
+    for status in (408, 409, 425, 429, 500, 502, 503, 504):
+        assert (
+            is_retryable_translation_error(
+                OpenAIRequestError(f"request failed with {status}", status_code=status)
+            )
+            is True
+        )
     assert translation_retry_countdown(1) == 2.0
     assert translation_retry_countdown(10) == 30.0

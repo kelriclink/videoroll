@@ -6,7 +6,7 @@ from typing import Any, Callable
 
 from sqlalchemy.orm import Session
 
-from videoroll.ai.client import openai_chat_config_from_settings
+from videoroll.ai.client import is_retryable_openai_error, openai_chat_config_from_settings
 from videoroll.ai.service import AIService
 from videoroll.apps.subtitle_service.embeddings import embedding_settings_from_translate_settings
 from videoroll.apps.subtitle_service.processing import (
@@ -54,7 +54,7 @@ class TranslationRetryRequired(RuntimeError):
 
 
 def is_retryable_translation_error(error: Exception) -> bool:
-    return "api key is not set" not in str(error or "").lower()
+    return is_retryable_openai_error(error)
 
 
 def translation_retry_countdown(attempt: int) -> float:

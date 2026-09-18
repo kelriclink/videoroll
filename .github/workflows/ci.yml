@@ -47,7 +47,6 @@ jobs:
       REDIS_URL: redis://127.0.0.1:6379/0
       INTERNAL_API_SECRET: ci-internal-secret-change-me
       ADMIN_BOOTSTRAP_SECRET: ci-bootstrap-secret-change-me
-      DEVELOPMENT_MODE: "true"
 
     steps:
       - uses: actions/checkout@v4

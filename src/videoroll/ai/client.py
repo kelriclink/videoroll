@@ -14,6 +14,27 @@ from videoroll.utils.openai_compat import build_openai_embeddings_url
 _RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 
 
+class OpenAIRequestError(RuntimeError):
+    """HTTP-level failure from an OpenAI-compatible endpoint."""
+
+    def __init__(self, message: str, *, status_code: int) -> None:
+        super().__init__(message)
+        self.status_code = int(status_code)
+
+
+def is_retryable_openai_error(error: Exception) -> bool:
+    if isinstance(error, OpenAIRequestError):
+        status = int(error.status_code)
+        return status in {408, 409, 425, 429} or 500 <= status <= 599
+    if isinstance(error, (httpx.TimeoutException, httpx.TransportError)):
+        return True
+    if "api key is not set" in str(error or "").lower():
+        return False
+    # Preserve retries for non-HTTP provider/format failures after the
+    # request helper has already exhausted its own bounded retries.
+    return True
+
+
 @dataclass(frozen=True)
 class OpenAIChatConfig:
     api_key: str | None
@@ -133,10 +154,11 @@ def _post_json_with_retries(
                 if resp.status_code in _RETRYABLE_STATUS_CODES and net_attempt < attempts - 1:
                     _sleep_before_retry(resp, net_attempt)
                     continue
-                raise RuntimeError(
+                raise OpenAIRequestError(
                     f"{request_label} failed "
                     f"(status={resp.status_code}, content-type={_content_type(resp)}, url={url}). "
-                    f"{_resp_snippet(resp)}"
+                    f"{_resp_snippet(resp)}",
+                    status_code=resp.status_code,
                 ) from exc
 
             try:
@@ -452,10 +474,11 @@ def _request_openai_json_object_with_thinking_with_client(
                             if api_type == "cerebras"
                             else "The configured model or gateway may not support enable_thinking."
                         )
-                        raise RuntimeError(
+                        raise OpenAIRequestError(
                             "OpenAI Think request failed "
                             f"(status={resp.status_code}, content-type={ct}, url={url}). {snippet} "
-                            f"{protocol_hint}"
+                            f"{protocol_hint}",
+                            status_code=resp.status_code,
                         ) from e
 
                     content_type = (resp.headers.get("content-type") or "").lower()

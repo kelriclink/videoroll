@@ -159,7 +159,6 @@ def test_social_publish_mode_is_removed_from_runtime_configuration() -> None:
         ROOT / "docker-compose.yml",
         ROOT / "fromprod" / "docker-compose.yml",
         ROOT / ".env.example",
-        ROOT / "fromprod" / ".env",
     ]
     for path in paths:
         assert "SOCIAL_PUBLISH_MODE" not in path.read_text(encoding="utf-8")

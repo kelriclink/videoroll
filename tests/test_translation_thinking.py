@@ -6,6 +6,7 @@ import httpx
 
 from videoroll.ai.client import (
     OpenAIChatConfig,
+    OpenAIRequestError,
     openai_chat_config_from_settings,
     request_openai_json_object,
     request_openai_json_object_with_thinking,
@@ -43,6 +44,46 @@ def test_openai_thinking_streams_reasoning_and_collects_json() -> None:
     assert seen_request["stream"] is True
     assert seen_request["enable_thinking"] is True
     assert seen_request["response_format"] == {"type": "json_object"}
+
+
+def test_normal_request_preserves_http_status_for_retry_policy() -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(403, json={"error": {"message": "forbidden"}})
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        try:
+            request_openai_json_object(
+                config=OpenAIChatConfig(api_key="test", base_url="https://llm.example/v1", model="plain-model"),
+                system_prompt="json only",
+                user_prompt="plain",
+                format_retries=1,
+                network_retries=1,
+                client=client,
+            )
+        except OpenAIRequestError as error:
+            assert error.status_code == 403
+        else:
+            raise AssertionError("expected OpenAIRequestError")
+
+
+def test_thinking_request_preserves_http_status_for_retry_policy() -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(429, headers={"content-type": "application/json"}, json={"error": {"message": "busy"}})
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        try:
+            request_openai_json_object_with_thinking(
+                config=OpenAIChatConfig(api_key="test", base_url="https://llm.example/v1", model="think-model"),
+                system_prompt="json only",
+                user_prompt="translate",
+                format_retries=1,
+                network_retries=1,
+                client=client,
+            )
+        except OpenAIRequestError as error:
+            assert error.status_code == 429
+        else:
+            raise AssertionError("expected OpenAIRequestError")
 
 
 def test_cerebras_thinking_uses_reasoning_protocol_and_streams_reasoning() -> None:
