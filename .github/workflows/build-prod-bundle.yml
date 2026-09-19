@@ -46,7 +46,7 @@ jobs:
           ENV_FILE="${RUNNER_TEMP}/videoroll-build.env" \
           INCLUDE_BASE_IMAGES=1 \
           OUTPUT_TAR="${bundle}" \
-          ./scripts/build_export_prod.sh
+          bash ./scripts/build_export_prod.sh
           echo "short_sha=${short_sha}" >> "${GITHUB_OUTPUT}"
           echo "bundle=${bundle}" >> "${GITHUB_OUTPUT}"
           echo "checksum=${bundle}.sha256" >> "${GITHUB_OUTPUT}"
