@@ -3234,27 +3234,11 @@ def upsert_knowledge_item(
             ),
             {"target_lang": clean_target_lang, "domain": clean_domain, "normalized_term": norm},
         ).first()
-        if not existing and dedupe_any_domain:
-            existing = db.execute(
-                text(
-                    """
-                    SELECT id FROM translation_knowledge_items
-                    WHERE item_type = 'term'
-                      AND target_lang = :target_lang
-                      AND normalized_term = :normalized_term
-                      AND status <> 'archived'
-                    ORDER BY
-                      CASE
-                        WHEN domain = :domain THEN 0
-                        WHEN domain = '' THEN 1
-                        ELSE 2
-                      END,
-                      updated_at DESC
-                    LIMIT 1
-                    """
-                ),
-                {"target_lang": clean_target_lang, "domain": clean_domain, "normalized_term": norm},
-            ).first()
+        # Domain is part of a glossary term's identity.  The legacy
+        # dedupe_any_domain flag is retained for call compatibility, but it
+        # must never cause a write to reuse and overwrite a row from another
+        # domain.
+        _ = dedupe_any_domain
         if existing:
             item_id = str(existing[0])
             db.execute(
@@ -5102,7 +5086,11 @@ def rebuild_knowledge_embeddings(
                    content, description
             FROM translation_knowledge_items
             WHERE {' AND '.join(clauses)}
-            ORDER BY updated_at DESC, created_at DESC
+            ORDER BY
+                CASE WHEN last_verified_at IS NULL THEN 0 ELSE 1 END,
+                last_verified_at ASC,
+                created_at ASC,
+                id ASC
             LIMIT :limit
             """
         ),

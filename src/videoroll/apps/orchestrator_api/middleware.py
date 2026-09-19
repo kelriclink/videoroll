@@ -44,14 +44,14 @@ class AdminAuthMiddleware(BaseHTTPMiddleware):
         if path.rstrip("/") == REMOTE_AUTO_YOUTUBE_PATH:
             return await call_next(request)
 
-        password_hash = get_admin_password_hash(request)
-        if not password_hash:
-            return JSONResponse(status_code=403, content={"detail": "admin password not set"})
-
         internal_header_token = str(getattr(request.app.state, "internal_header_token", "") or "").strip()
         header_token = str(request.headers.get(INTERNAL_TOKEN_HEADER) or "").strip()
         if internal_header_token and header_token and hmac.compare_digest(header_token, internal_header_token):
             return await call_next(request)
+
+        password_hash = get_admin_password_hash(request)
+        if not password_hash:
+            return JSONResponse(status_code=403, content={"detail": "admin password not set"})
 
         cookie_value = str(request.cookies.get(DEVICE_COOKIE_NAME) or "").strip()
         cookie_secret = str(getattr(request.app.state, "admin_cookie_secret", "") or "").strip()

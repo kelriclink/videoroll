@@ -540,3 +540,90 @@ class WorkdirMaintenanceRead(BaseModel):
     deleted_paths: list[str] = Field(default_factory=list)
     errors: list[str] = Field(default_factory=list)
     entries: list[WorkdirMaintenanceEntryRead] = Field(default_factory=list)
+
+
+class AIUsageModelRead(BaseModel):
+    provider: str
+    model: str
+    requests: int = 0
+    failures: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    total_tokens: int = 0
+    estimated_cost_usd: Optional[float] = None
+
+
+class AIUsageStatusRead(BaseModel):
+    status_code: Optional[int] = None
+    count: int = 0
+
+
+class AIUsageRecentRead(BaseModel):
+    id: uuid.UUID
+    task_id: Optional[uuid.UUID] = None
+    provider: str
+    model: str
+    operation: str
+    success: bool
+    status_code: Optional[int] = None
+    input_tokens: int = 0
+    output_tokens: int = 0
+    total_tokens: int = 0
+    latency_ms: int = 0
+    estimated_cost_usd: Optional[float] = None
+    error_type: Optional[str] = None
+    error_message: Optional[str] = None
+    created_at: datetime
+
+
+class AIUsageSummaryRead(BaseModel):
+    hours: int
+    requests: int = 0
+    successes: int = 0
+    failures: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    total_tokens: int = 0
+    priced_requests: int = 0
+    estimated_cost_usd: Optional[float] = None
+    by_model: list[AIUsageModelRead] = Field(default_factory=list)
+    by_status: list[AIUsageStatusRead] = Field(default_factory=list)
+    recent: list[AIUsageRecentRead] = Field(default_factory=list)
+
+
+class AIUsagePricingRead(BaseModel):
+    models: dict[str, dict[str, float]] = Field(default_factory=dict)
+
+
+class AlertRead(BaseModel):
+    id: uuid.UUID
+    fingerprint: str
+    source: str
+    severity: str
+    status: str
+    title: str
+    message: str
+    details: dict[str, Any] = Field(default_factory=dict)
+    occurrence_count: int = 1
+    first_seen_at: datetime
+    last_seen_at: datetime
+    acknowledged_at: Optional[datetime] = None
+    resolved_at: Optional[datetime] = None
+
+
+class AlertReportRequest(BaseModel):
+    fingerprint: str = Field(min_length=1, max_length=255)
+    source: str = Field(min_length=1, max_length=64)
+    severity: Literal["info", "warning", "critical"] = "warning"
+    title: str = Field(min_length=1, max_length=255)
+    message: str = ""
+    details: dict[str, Any] = Field(default_factory=dict)
+    resolved: bool = False
+
+
+class AlertScanResponse(BaseModel):
+    scanned_at: datetime
+    active: int = 0
+    opened_or_updated: int = 0
+    resolved: int = 0
+    alerts: list[AlertRead] = Field(default_factory=list)

@@ -77,7 +77,7 @@ jobs:
           tests/test_database_initialization_postgresql.py
 
       - name: Run security smoke
-        run: ./scripts/security_smoke.sh
+        run: bash ./scripts/security_smoke.sh
 
   frontend:
     name: Frontend lint + test + build

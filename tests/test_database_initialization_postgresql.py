@@ -73,7 +73,7 @@ def test_concurrent_postgres_runtime_and_cli_initialization(database_url, tmp_pa
             connection.execute(text("INSERT INTO app_settings (key, value_json, version) VALUES ('keep', '{}', 9)"))
         _concurrent_startup(database_url, tmp_path)
         with engine.connect() as connection:
-            assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0004_playout_asset_links"
+            assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0005_operations_center"
             assert connection.execute(text("SELECT version FROM app_settings WHERE key = 'keep'")).scalar_one() == 9
     finally:
         engine.dispose()
@@ -90,7 +90,7 @@ def test_postgres_offline_sql_bootstraps_an_empty_database(database_url, tmp_pat
     try:
         with engine.connect() as connection:
             connection.exec_driver_sql(result.stdout)
-            assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0004_playout_asset_links"
+            assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0005_operations_center"
         assert set(Base.metadata.tables).issubset(inspect(engine).get_table_names())
     finally:
         engine.dispose()
@@ -120,7 +120,7 @@ def test_postgres_adopts_legacy_or_unversioned_schema_under_one_connection_lock(
         assert len(ddl_connections) == 1
         with engine.connect() as connection:
             assert connection.execute(text("SELECT value_json FROM app_settings WHERE key = 'keep'")).scalar_one() == {"preserved": True}
-            assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0004_playout_asset_links"
+            assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0005_operations_center"
             assert not connection.execute(text("SELECT EXISTS (SELECT 1 FROM pg_locks WHERE pid = pg_backend_pid() AND locktype = 'advisory')")).scalar_one()
     finally:
         event.remove(engine, "before_cursor_execute", check_lock)

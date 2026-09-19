@@ -20,6 +20,7 @@ pub mod generator;
 pub mod logging;
 pub mod mail;
 pub mod notification;
+pub mod operations_alert;
 pub mod paths;
 pub mod playlist;
 pub mod system;

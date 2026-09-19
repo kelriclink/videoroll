@@ -444,6 +444,16 @@ class KnowledgeEmbeddingRebuildResponse(BaseModel):
     errors: list[dict[str, str]] = Field(default_factory=list)
 
 
+class KnowledgeBulkImportResponse(BaseModel):
+    format: str
+    parsed: int = 0
+    imported: int = 0
+    failed: int = 0
+    skipped: int = 0
+    ids: list[uuid.UUID] = Field(default_factory=list)
+    errors: list[dict[str, str]] = Field(default_factory=list)
+
+
 class DictionarySourceRead(BaseModel):
     id: uuid.UUID
     name: str
@@ -656,10 +666,20 @@ class TaskQueueSettingsUpdate(BaseModel):
     max_concurrency: Optional[int] = Field(default=None, ge=0, le=32)
 
 
+class TaskQueuePriorityUpdate(BaseModel):
+    priority: int = Field(default=0, ge=-100, le=100)
+
+
+class TaskQueueReorderRequest(BaseModel):
+    task_ids: list[uuid.UUID] = Field(default_factory=list, min_length=1, max_length=2000)
+
+
 class TaskQueueItemRead(BaseModel):
     task_id: uuid.UUID
     state: str
     stage: str
+    priority: int = 0
+    queue_position: Optional[int] = None
     subtitle_job_id: Optional[uuid.UUID] = None
     render_job_id: Optional[uuid.UUID] = None
     progress: int = 0

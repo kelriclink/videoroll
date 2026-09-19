@@ -8,6 +8,8 @@ type TaskQueueItem = {
   task_id: string;
   state: string;
   stage: string;
+  priority: number;
+  queue_position?: number | null;
   subtitle_job_id?: string | null;
   render_job_id?: string | null;
   progress: number;
@@ -37,13 +39,15 @@ export default function RenderQueuePage() {
   const [busy, setBusy] = useState(false);
   const [maxConcText, setMaxConcText] = useState("1");
   const [maxConcDirty, setMaxConcDirty] = useState(false);
+  const [dragTaskId, setDragTaskId] = useState<string | null>(null);
+  const [queueActionBusy, setQueueActionBusy] = useState<string | null>(null);
   const queueRef = useRef<TaskQueue | null>(null);
   const refreshTimerRef = useRef<number | undefined>();
 
   const refresh = useCallback(async () => {
     setError(null);
     try {
-      const q = await fetchJson<TaskQueue>(`${ORCHESTRATOR_URL}/subtitle/task_queue`);
+      const q = await fetchJson<TaskQueue>(`${ORCHESTRATOR_URL}/subtitle/task_queue?limit=2000`);
       queueRef.current = q;
       setQueue(q);
       if (!maxConcDirty) setMaxConcText(String(q?.settings?.max_concurrency ?? 1));
@@ -146,6 +150,57 @@ export default function RenderQueuePage() {
     }
   }
 
+  async function updatePriority(taskId: string, priority: number) {
+    setQueueActionBusy(taskId);
+    setError(null);
+    try {
+      await fetchJson<TaskQueueItem>(`${ORCHESTRATOR_URL}/subtitle/task_queue/tasks/${taskId}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ priority }),
+      });
+      await refresh();
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setQueueActionBusy(null);
+    }
+  }
+
+  async function reorderQueued(draggedId: string, targetId: string) {
+    if (!queue || draggedId === targetId) return;
+    const dragged = queue.tasks.find((item) => item.task_id === draggedId);
+    const target = queue.tasks.find((item) => item.task_id === targetId);
+    if (!dragged || !target || dragged.priority !== target.priority) {
+      setNotice("拖拽排序只在相同优先级内生效；跨优先级请先修改优先级。");
+      setDragTaskId(null);
+      return;
+    }
+    const queued = queue.tasks.filter((item) => item.state === "queued" && item.priority === dragged.priority);
+    const from = queued.findIndex((item) => item.task_id === draggedId);
+    const to = queued.findIndex((item) => item.task_id === targetId);
+    if (from < 0 || to < 0) return;
+    const next = [...queued];
+    const [moved] = next.splice(from, 1);
+    next.splice(to, 0, moved);
+    setQueueActionBusy("reorder");
+    setError(null);
+    try {
+      const updated = await fetchJson<TaskQueue>(`${ORCHESTRATOR_URL}/subtitle/task_queue/reorder`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ task_ids: next.map((item) => item.task_id) }),
+      });
+      queueRef.current = updated;
+      setQueue(updated);
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setQueueActionBusy(null);
+      setDragTaskId(null);
+    }
+  }
+
   return (
     <div className="space-y-4">
       <div className="rounded border bg-white p-4">
@@ -194,7 +249,7 @@ export default function RenderQueuePage() {
 
       <div className="rounded border bg-white p-4">
         <div className="text-sm font-semibold">Current Queue</div>
-        <div className="mt-1 text-xs text-slate-600">仅显示 running/queued（按 Task 去重）。</div>
+        <div className="mt-1 text-xs text-slate-600">仅显示 running/queued（按 Task 去重）。优先级始终优先；拖拽用于调整同优先级任务的先后顺序。</div>
         {!queue ? <div className="mt-2 text-sm text-slate-500">加载中…</div> : null}
         {queue && (queue.tasks ?? []).length === 0 ? <div className="mt-2 text-sm text-slate-500">暂无</div> : null}
         {queue && (queue.tasks ?? []).length > 0 ? (
@@ -202,6 +257,8 @@ export default function RenderQueuePage() {
             <table className="min-w-full text-left text-sm">
               <thead className="text-xs text-slate-500">
                 <tr>
+                  <th className="py-2 pr-3">排序</th>
+                  <th className="py-2 pr-3">优先级</th>
                   <th className="py-2 pr-3">State</th>
                   <th className="py-2 pr-3">Stage</th>
                   <th className="py-2 pr-3">Progress</th>
@@ -214,7 +271,35 @@ export default function RenderQueuePage() {
               </thead>
               <tbody>
                 {(queue.tasks ?? []).map((t) => (
-                  <tr key={t.task_id} className="border-t">
+                  <tr
+                    key={t.task_id}
+                    className={`border-t ${dragTaskId === t.task_id ? "bg-sky-50" : ""}`}
+                    draggable={t.state === "queued" && queueActionBusy === null}
+                    onDragStart={() => setDragTaskId(t.task_id)}
+                    onDragEnd={() => setDragTaskId(null)}
+                    onDragOver={(event) => {
+                      if (t.state === "queued" && dragTaskId) event.preventDefault();
+                    }}
+                    onDrop={(event) => {
+                      event.preventDefault();
+                      if (dragTaskId) void reorderQueued(dragTaskId, t.task_id);
+                    }}
+                  >
+                    <td className="py-2 pr-3 text-slate-400">{t.state === "queued" ? "⋮⋮" : "—"}</td>
+                    <td className="py-2 pr-3">
+                      <select
+                        className="rounded border border-slate-300 bg-white px-2 py-1 text-xs"
+                        value={t.priority}
+                        disabled={queueActionBusy !== null}
+                        onChange={(event) => void updatePriority(t.task_id, Number(event.target.value))}
+                      >
+                        {[100, 50, 0, -50].includes(t.priority) ? null : <option value={t.priority}>自定义 {t.priority}</option>}
+                        <option value={100}>P0 紧急</option>
+                        <option value={50}>P1 高</option>
+                        <option value={0}>P2 普通</option>
+                        <option value={-50}>P3 后台</option>
+                      </select>
+                    </td>
                     <td className="py-2 pr-3 font-mono text-xs">{t.state}</td>
                     <td className="py-2 pr-3 font-mono text-xs">{t.stage}</td>
                     <td className="py-2 pr-3 font-mono text-xs">{t.progress}%</td>

@@ -7,7 +7,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 
-from videoroll.apps.orchestrator_api.services import asset_service, maintenance_service, youtube_service
+from videoroll.apps.orchestrator_api.services import asset_service, maintenance_service, operations_service, youtube_service
 from videoroll.apps.orchestrator_api.storage_retention_store import get_storage_retention_settings
 from videoroll.apps.subtitle_service.worker_concurrency import RecoverySummary, recover_expired_leases
 from videoroll.apps.youtube_ingest.source_service import (
@@ -29,6 +29,7 @@ class OrchestratorScheduler:
         self._cleanup_stop = threading.Event()
         self._home_scan_stop = threading.Event()
         self._source_scan_stop = threading.Event()
+        self._alert_scan_stop = threading.Event()
         self._threads: list[threading.Thread] = []
         self._cleanup_interval_seconds = int(os.getenv("STORAGE_CLEANUP_INTERVAL_SECONDS", "3600") or "3600")
         self._publishing_timeout_hours = max(1, int(os.getenv("PUBLISHING_TASK_TIMEOUT_HOURS", "48") or "48"))
@@ -39,6 +40,7 @@ class OrchestratorScheduler:
         self._lease_recovery_interval_seconds = int(os.getenv("WORKER_LEASE_RECOVERY_INTERVAL_SECONDS", "30") or "30")
         self._home_scan_tick_seconds = int(os.getenv("YOUTUBE_HOME_SCAN_TICK_SECONDS", "30") or "30")
         self._source_scan_tick_seconds = int(os.getenv("YOUTUBE_SOURCE_SCAN_TICK_SECONDS", "30") or "30")
+        self._alert_scan_tick_seconds = int(os.getenv("OPERATIONS_ALERT_SCAN_SECONDS", "60") or "60")
         self._shutdown_timeout_seconds = max(
             1.0,
             float(os.getenv("ORCHESTRATOR_SHUTDOWN_TIMEOUT_SECONDS", "30") or "30"),
@@ -59,18 +61,21 @@ class OrchestratorScheduler:
         self._cleanup_stop.clear()
         self._home_scan_stop.clear()
         self._source_scan_stop.clear()
+        self._alert_scan_stop.clear()
         self._threads = [
             self._start_thread("videoroll-storage-cleanup", self._cleanup_loop),
             self._start_thread("videoroll-youtube-home-scan", self._home_scan_loop),
             self._start_thread("videoroll-youtube-source-scan", self._source_scan_loop),
             self._start_thread("videoroll-workdir-startup-cleanup", self._workdir_startup_cleanup),
             self._start_thread("videoroll-worker-lease-recovery", self._worker_lease_recovery_loop),
+            self._start_thread("videoroll-operations-alert-scan", self._alert_scan_loop),
         ]
 
     def stop(self) -> None:
         self._cleanup_stop.set()
         self._home_scan_stop.set()
         self._source_scan_stop.set()
+        self._alert_scan_stop.set()
         deadline = time.monotonic() + self._shutdown_timeout_seconds
         remaining: list[threading.Thread] = []
         for thread in self._threads:
@@ -212,6 +217,25 @@ class OrchestratorScheduler:
             except Exception:
                 logger.exception("youtube source scan loop failed")
             self._source_scan_stop.wait(timeout=max(15, self._source_scan_tick_seconds))
+
+    def _scan_alerts_once(self) -> dict[str, object]:
+        session_local = get_sessionmaker(self.settings.database_url)
+        db = session_local()
+        try:
+            return operations_service.scan_alerts(self.settings, db)
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+
+    def _alert_scan_loop(self) -> None:
+        while not self._alert_scan_stop.is_set():
+            try:
+                self._scan_alerts_once()
+            except Exception:
+                logger.exception("operations alert scan failed")
+            self._alert_scan_stop.wait(timeout=max(15, self._alert_scan_tick_seconds))
 
     def _workdir_startup_cleanup(self) -> None:
         try:

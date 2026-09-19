@@ -116,6 +116,9 @@ services:
       - --db
       - /var/lib/ffplayout/db/ffplayout.db
       - --log-to-console
+    environment:
+      ORCHESTRATOR_URL: http://orchestrator:8000
+      INTERNAL_API_SECRET: ${INTERNAL_API_SECRET:?INTERNAL_API_SECRET must be set}
     volumes:
       - ./data/ffplayout/db:/var/lib/ffplayout/db
       - ./data/ffplayout/logs:/var/lib/ffplayout/logs

@@ -24,6 +24,7 @@ use crate::{
         config::{ENGINE_AUDIO_SAMPLE_RATE, OutputMode, PlayoutConfig, RecordingSource},
         control::{PlayerCtl, control_state},
         errors::ServiceError,
+        operations_alert::report_rtmp_output_state,
     },
 };
 
@@ -36,6 +37,7 @@ const HLS_RATE_CORRECTION_MAX_DELTA_FACTOR: f64 = 1.0;
 pub async fn player(manager: ChannelManager) -> Result<(), ServiceError> {
     let config = manager.config.read().await.clone();
     validate_supported_config(&config)?;
+    let report_rtmp_output = config.output.mode == OutputMode::Stream;
 
     manager
         .audio_effects
@@ -53,7 +55,28 @@ pub async fn player(manager: ChannelManager) -> Result<(), ServiceError> {
         manager.text_overlay.clone(),
         desktop_control_callback(manager.clone()),
     )?;
-    let playout = open_playout(&config, output_config.clone()).await?;
+    let playout = match open_playout(&config, output_config.clone()).await {
+        Ok(playout) => {
+            if report_rtmp_output {
+                report_rtmp_output_state(
+                    config.general.channel_id,
+                    &config.output.stream_url,
+                    true,
+                );
+            }
+            playout
+        }
+        Err(error) => {
+            if report_rtmp_output {
+                report_rtmp_output_state(
+                    config.general.channel_id,
+                    &config.output.stream_url,
+                    false,
+                );
+            }
+            return Err(error);
+        }
+    };
     *manager.playback_control.lock().await = playout.playback_control();
     if config.output.mode == OutputMode::Desktop {
         #[cfg(feature = "desktop-cpu")]
@@ -83,8 +106,15 @@ pub async fn player(manager: ChannelManager) -> Result<(), ServiceError> {
     };
 
     let finish_result = playout.finish().await.map_err(engine_error);
-    result?;
-    finish_result
+    let final_result = result.and(finish_result);
+    if report_rtmp_output && final_result.is_err() {
+        report_rtmp_output_state(
+            config.general.channel_id,
+            &config.output.stream_url,
+            false,
+        );
+    }
+    final_result
 }
 
 async fn play_hls(

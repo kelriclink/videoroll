@@ -1,0 +1,68 @@
+name: Build production bundle
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: production-bundle-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  bundle:
+    name: Build full production image bundle
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Reclaim runner disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup || true
+          docker system prune -af || true
+          df -h /
+
+      - name: Create build-only environment
+        run: |
+          cat > "${RUNNER_TEMP}/videoroll-build.env" <<'EOF'
+          APP_UID=10001
+          APP_GID=10001
+          INSTALL_ASR=1
+          YTDLP_VERSION=2026.8.19
+          VITE_ORCHESTRATOR_URL=
+          VITE_FFPLAYOUT_URL=
+          EOF
+
+      - name: Build and export full production images
+        id: build
+        run: |
+          short_sha="$(git rev-parse --short=7 HEAD)"
+          bundle="${RUNNER_TEMP}/videoroll-prod-bundle-${short_sha}.tar"
+          ENV_FILE="${RUNNER_TEMP}/videoroll-build.env" \
+          INCLUDE_BASE_IMAGES=1 \
+          OUTPUT_TAR="${bundle}" \
+          ./scripts/build_export_prod.sh
+          echo "short_sha=${short_sha}" >> "${GITHUB_OUTPUT}"
+          echo "bundle=${bundle}" >> "${GITHUB_OUTPUT}"
+          echo "checksum=${bundle}.sha256" >> "${GITHUB_OUTPUT}"
+          ls -lh "${bundle}" "${bundle}.sha256"
+          df -h /
+
+      - name: Verify exported bundle checksum
+        run: sha256sum -c "${{ steps.build.outputs.checksum }}"
+
+      - name: Upload production bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: videoroll-prod-bundle-${{ steps.build.outputs.short_sha }}
+          path: |
+            ${{ steps.build.outputs.bundle }}
+            ${{ steps.build.outputs.checksum }}
+          compression-level: 0
+          retention-days: 2
+          if-no-files-found: error

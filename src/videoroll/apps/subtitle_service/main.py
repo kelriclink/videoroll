@@ -2,6 +2,10 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 
+import csv
+import io
+import json
+
 import logging
 import os
 import re
@@ -55,6 +59,7 @@ from videoroll.apps.subtitle_service.schemas import (
     KnowledgeItemRead,
     KnowledgeEmbeddingRebuildRequest,
     KnowledgeEmbeddingRebuildResponse,
+    KnowledgeBulkImportResponse,
     KnowledgeItemUpsertRequest,
     KnowledgeItemUpsertResponse,
     DictionaryEntryRead,
@@ -74,6 +79,8 @@ from videoroll.apps.subtitle_service.schemas import (
     EmbeddingTestRequest,
     EmbeddingTestResponse,
     TaskQueueItemRead,
+    TaskQueuePriorityUpdate,
+    TaskQueueReorderRequest,
     TaskQueueRead,
     TaskQueueSettingsRead,
     TaskQueueSettingsUpdate,
@@ -857,6 +864,210 @@ def rebuild_knowledge_embeddings_view(
             db.rollback()
             raise HTTPException(status_code=503, detail=f"knowledge embedding rebuild failed after schema migration: {retry_error}") from retry_error
     return KnowledgeEmbeddingRebuildResponse(**result)
+
+
+def _parse_knowledge_import(
+    *,
+    filename: str,
+    raw: bytes,
+    import_format: str,
+    target_lang: str,
+    domain: str,
+) -> list[dict[str, Any]]:
+    fmt = str(import_format or "").strip().lower()
+    if fmt in {"", "auto"}:
+        suffix = Path(filename or "").suffix.lower().lstrip(".")
+        fmt = "json" if suffix == "json" else "csv" if suffix == "csv" else "srt" if suffix == "srt" else ""
+    if fmt not in {"csv", "json", "srt"}:
+        raise HTTPException(status_code=400, detail="knowledge import format must be csv, json, or srt")
+
+    try:
+        text_value = raw.decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        raise HTTPException(status_code=400, detail="knowledge import file must be UTF-8") from exc
+
+    if fmt == "json":
+        try:
+            payload = json.loads(text_value)
+        except json.JSONDecodeError as exc:
+            raise HTTPException(status_code=400, detail=f"invalid JSON: {exc}") from exc
+        rows = payload.get("items") if isinstance(payload, dict) else payload
+        if not isinstance(rows, list):
+            raise HTTPException(status_code=400, detail="JSON import must be an array or an object with an items array")
+        return [dict(row) for row in rows if isinstance(row, dict)]
+
+    if fmt == "csv":
+        reader = csv.DictReader(io.StringIO(text_value))
+        if not reader.fieldnames:
+            raise HTTPException(status_code=400, detail="CSV import has no header")
+        rows: list[dict[str, Any]] = []
+        for row in reader:
+            item = {str(key or "").strip(): str(value or "").strip() for key, value in row.items()}
+            aliases = [part.strip() for part in re.split(r"[|;]", item.get("aliases", "")) if part.strip()]
+            item["aliases"] = aliases
+            rows.append(item)
+        return rows
+
+    # SRT is imported as chunked document knowledge. Keeping chunks bounded
+    # avoids a single hour-long subtitle file producing an oversized embedding
+    # request while preserving useful neighboring subtitle context.
+    cues: list[str] = []
+    for block in re.split(r"\r?\n\s*\r?\n", text_value):
+        lines = [line.strip() for line in block.splitlines() if line.strip()]
+        if not lines:
+            continue
+        if lines and lines[0].isdigit():
+            lines = lines[1:]
+        if lines and "-->" in lines[0]:
+            lines = lines[1:]
+        cue = " ".join(lines).strip()
+        if cue:
+            cues.append(cue)
+
+    rows = []
+    chunk: list[str] = []
+    chunk_len = 0
+    part = 1
+    for cue in cues:
+        if chunk and (len(chunk) >= 50 or chunk_len + len(cue) + 1 > 4000):
+            rows.append(
+                {
+                    "item_type": "document",
+                    "target_lang": target_lang,
+                    "domain": domain,
+                    "title": f"{Path(filename or 'subtitle.srt').name} · part {part}",
+                    "content": "\n".join(chunk),
+                    "created_by": "bulk:srt",
+                }
+            )
+            part += 1
+            chunk = []
+            chunk_len = 0
+        chunk.append(cue)
+        chunk_len += len(cue) + 1
+    if chunk:
+        rows.append(
+            {
+                "item_type": "document",
+                "target_lang": target_lang,
+                "domain": domain,
+                "title": f"{Path(filename or 'subtitle.srt').name} · part {part}",
+                "content": "\n".join(chunk),
+                "created_by": "bulk:srt",
+            }
+        )
+    return rows
+
+
+@app.post("/subtitle/knowledge/import", response_model=KnowledgeBulkImportResponse)
+async def import_knowledge_items_view(
+    file: UploadFile = File(...),
+    import_format: str = Form("auto"),
+    target_lang: str = Form("zh"),
+    domain: str = Form(""),
+    settings: SubtitleServiceSettings = Depends(get_settings),
+    db: Session = Depends(get_db),
+) -> KnowledgeBulkImportResponse:
+    raw = await file.read(5 * 1024 * 1024 + 1)
+    if len(raw) > 5 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="knowledge import file exceeds 5 MiB")
+
+    rows = _parse_knowledge_import(
+        filename=file.filename or "knowledge",
+        raw=raw,
+        import_format=import_format,
+        target_lang=target_lang,
+        domain=domain,
+    )
+    if len(rows) > 2000:
+        raise HTTPException(status_code=400, detail="knowledge import contains more than 2000 items")
+
+    cfg = get_translate_settings(db, settings)
+    rag_cfg = rag_settings_from_translate_settings(cfg)
+    emb_cfg = embedding_settings_from_translate_settings(cfg)
+    imported_ids: list[uuid.UUID] = []
+    errors: list[dict[str, str]] = []
+    skipped = 0
+    failed = 0
+
+    for index, raw_item in enumerate(rows):
+        data = dict(raw_item)
+        data.setdefault("target_lang", target_lang)
+        data.setdefault("domain", domain)
+        data.setdefault("created_by", "bulk:import")
+        if isinstance(data.get("aliases"), str):
+            data["aliases"] = [part.strip() for part in re.split(r"[|;]", str(data["aliases"])) if part.strip()]
+        try:
+            item = KnowledgeItemUpsertRequest.model_validate(data)
+            if item.item_type == "term" and (not item.term.strip() or not item.translation.strip()):
+                skipped += 1
+                continue
+            if item.item_type == "document" and not (item.title.strip() or item.content.strip()):
+                skipped += 1
+                continue
+
+            embedding_text = build_knowledge_embedding_text(
+                item_type=item.item_type,
+                term=item.term,
+                translation=item.translation,
+                domain=item.domain,
+                aliases=item.aliases,
+                title=item.title,
+                content=item.content,
+                description=item.description,
+            )
+            embedding: list[float] | None = None
+            if embedding_text.strip():
+                try:
+                    embedding = embed_text(embedding_text, settings=emb_cfg)
+                    assert_embedding_dimensions(embedding, rag_cfg.embedding_dimensions)
+                except Exception:
+                    # Term rows remain useful for exact dictionary-style
+                    # matching even when the embedding provider is temporarily
+                    # unavailable. Documents require vectors to be useful.
+                    if item.item_type == "document":
+                        raise
+
+            item_id = upsert_knowledge_item(
+                db,
+                item_type=item.item_type,
+                target_lang=item.target_lang,
+                term=item.term,
+                translation=item.translation,
+                domain=item.domain,
+                aliases=item.aliases,
+                title=item.title,
+                content=item.content,
+                description=item.description,
+                sources=item.sources,
+                confidence=item.confidence,
+                status=item.status,
+                created_by=item.created_by,
+                embedding=embedding,
+                embedding_model=f"{rag_cfg.embedding_provider}:{rag_cfg.embedding_model}" if embedding else "",
+                dedupe_any_domain=False,
+            )
+            db.commit()
+            imported_ids.append(uuid.UUID(item_id))
+        except Exception as exc:
+            db.rollback()
+            failed += 1
+            if len(errors) < 50:
+                errors.append({"row": str(index + 1), "error": f"{type(exc).__name__}: {exc}"[:1000]})
+
+    suffix = Path(file.filename or "").suffix.lower().lstrip(".")
+    resolved_format = import_format.strip().lower()
+    if resolved_format in {"", "auto"}:
+        resolved_format = suffix
+    return KnowledgeBulkImportResponse(
+        format=resolved_format,
+        parsed=len(rows),
+        imported=len(imported_ids),
+        failed=failed,
+        skipped=skipped,
+        ids=imported_ids,
+        errors=errors,
+    )
 
 
 @app.get("/subtitle/dictionaries/sources", response_model=list[DictionarySourceRead])
@@ -1706,6 +1917,14 @@ def _clamp_queue_limit(v: int) -> int:
     return v
 
 
+def _task_queue_order_columns() -> tuple[Any, ...]:
+    return (
+        Task.priority.desc(),
+        Task.queue_position.asc().nullslast(),
+        Task.created_at.asc(),
+    )
+
+
 def _read_task_queue(db: Session, *, limit: int) -> TaskQueueRead:
     limit = _clamp_queue_limit(limit)
     cfg = get_task_queue_settings(db)
@@ -1867,7 +2086,7 @@ def _read_task_queue(db: Session, *, limit: int) -> TaskQueueRead:
         db.query(RenderJob)
         .join(Task, Task.id == RenderJob.task_id)
         .filter(RenderJob.status == RenderJobStatus.running, unlocked)
-        .order_by(RenderJob.updated_at.asc(), RenderJob.created_at.asc())
+        .order_by(Task.priority.desc(), Task.queue_position.asc().nullslast(), RenderJob.updated_at.asc(), RenderJob.created_at.asc())
         .limit(5000)
         .all()
     ):
@@ -1876,7 +2095,7 @@ def _read_task_queue(db: Session, *, limit: int) -> TaskQueueRead:
         db.query(SubtitleJob)
         .join(Task, Task.id == SubtitleJob.task_id)
         .filter(SubtitleJob.status == SubtitleJobStatus.running, unlocked)
-        .order_by(SubtitleJob.updated_at.asc(), SubtitleJob.created_at.asc())
+        .order_by(Task.priority.desc(), Task.queue_position.asc().nullslast(), SubtitleJob.updated_at.asc(), SubtitleJob.created_at.asc())
         .limit(5000)
         .all()
     ):
@@ -1914,7 +2133,7 @@ def _read_task_queue(db: Session, *, limit: int) -> TaskQueueRead:
             Task.updated_at.is_not(None),
             Task.updated_at < bootstrap_cutoff,
         )
-        .order_by(Task.updated_at.asc(), Task.created_at.asc())
+        .order_by(*_task_queue_order_columns())
         .limit(5000)
         .all()
     ):
@@ -2000,7 +2219,7 @@ def _read_task_queue(db: Session, *, limit: int) -> TaskQueueRead:
             db.query(SubtitleJob)
             .join(Task, Task.id == SubtitleJob.task_id)
             .filter(SubtitleJob.status == SubtitleJobStatus.queued, unlocked)
-            .order_by(SubtitleJob.created_at.asc())
+            .order_by(Task.priority.desc(), Task.queue_position.asc().nullslast(), SubtitleJob.created_at.asc())
             .limit(fetch_n)
             .all()
         ):
@@ -2027,7 +2246,7 @@ def _read_task_queue(db: Session, *, limit: int) -> TaskQueueRead:
             db.query(RenderJob)
             .join(Task, Task.id == RenderJob.task_id)
             .filter(RenderJob.status == RenderJobStatus.queued, unlocked)
-            .order_by(RenderJob.created_at.asc())
+            .order_by(Task.priority.desc(), Task.queue_position.asc().nullslast(), RenderJob.created_at.asc())
             .limit(fetch_n)
             .all()
         ):
@@ -2050,11 +2269,33 @@ def _read_task_queue(db: Session, *, limit: int) -> TaskQueueRead:
             if len(queued_items) >= remaining:
                 break
 
+    all_items = [*running_items, *queued_items]
+    item_task_ids = {item.task_id for item in all_items}
+    task_meta = {
+        task.id: task
+        for task in db.query(Task).filter(Task.id.in_(item_task_ids)).all()
+    } if item_task_ids else {}
+    for item in all_items:
+        task = task_meta.get(item.task_id)
+        if task is not None:
+            item.priority = int(task.priority or 0)
+            item.queue_position = task.queue_position
+
+    queued_items.sort(
+        key=lambda item: (
+            -int(item.priority or 0),
+            item.queue_position is None,
+            int(item.queue_position or 0),
+            item.created_at,
+        )
+    )
+    all_items = [*running_items, *queued_items]
+
     return TaskQueueRead(
         settings=TaskQueueSettingsRead(**cfg),
         running_count=running_count,
         queued_count=int(queued_count),
-        tasks=[*running_items, *queued_items],
+        tasks=all_items,
     )
 
 
@@ -2091,6 +2332,82 @@ def put_task_queue_settings_view(payload: TaskQueueSettingsUpdate, db: Session =
 @app.put("/subtitle/render_queue/settings", response_model=TaskQueueSettingsRead)
 def put_render_queue_settings_legacy(payload: TaskQueueSettingsUpdate, db: Session = Depends(get_db)) -> TaskQueueSettingsRead:
     return put_task_queue_settings_view(payload, db=db)
+
+
+@app.put("/subtitle/task_queue/tasks/{task_id}", response_model=TaskQueueItemRead)
+def patch_task_queue_priority(
+    task_id: uuid.UUID,
+    payload: TaskQueuePriorityUpdate,
+    db: Session = Depends(get_db),
+) -> TaskQueueItemRead:
+    task = db.query(Task).filter(Task.id == task_id).with_for_update().one_or_none()
+    if task is None:
+        raise HTTPException(status_code=404, detail="task not found")
+    previous_priority = int(task.priority or 0)
+    task.priority = int(payload.priority)
+    if task.priority != previous_priority:
+        # queue_position is meaningful only inside one priority bucket.  Carrying
+        # it into another bucket can create duplicate positions and unstable
+        # ordering, so a priority change rejoins the tail of that bucket.
+        task.queue_position = None
+    db.add(task)
+    db.flush()
+    queue = _read_task_queue(db, limit=2000)
+    item = next((row for row in queue.tasks if row.task_id == task_id), None)
+    if item is None:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="task is not currently queued or running")
+    db.commit()
+    publish_queue_changed(get_subtitle_settings().redis_url)
+    celery_app.send_task("subtitle_service.task_queue_tick", args=[], queue=SUBTITLE_CONTROL_QUEUE)
+    return item
+
+
+@app.post("/subtitle/task_queue/reorder", response_model=TaskQueueRead)
+def reorder_task_queue(payload: TaskQueueReorderRequest, db: Session = Depends(get_db)) -> TaskQueueRead:
+    ordered_ids = list(dict.fromkeys(payload.task_ids))
+    if len(ordered_ids) != len(payload.task_ids):
+        raise HTTPException(status_code=400, detail="task_ids contains duplicates")
+    tasks = db.query(Task).filter(Task.id.in_(ordered_ids)).with_for_update().all()
+    by_id = {task.id: task for task in tasks}
+    missing = [str(task_id) for task_id in ordered_ids if task_id not in by_id]
+    if missing:
+        raise HTTPException(status_code=404, detail=f"tasks not found: {', '.join(missing[:5])}")
+
+    priorities = {int(task.priority or 0) for task in tasks}
+    if len(priorities) != 1:
+        raise HTTPException(status_code=400, detail="reorder only supports tasks with the same priority")
+
+    visible_queue = _read_task_queue(db, limit=2000)
+    visible_queued = [item for item in visible_queue.tasks if item.state == "queued"]
+    if visible_queue.queued_count != len(visible_queued):
+        raise HTTPException(
+            status_code=409,
+            detail="queue is too large to reorder safely; narrow the queue before reordering",
+        )
+    queued_ids = {item.task_id for item in visible_queued}
+    not_queued = [str(task_id) for task_id in ordered_ids if task_id not in queued_ids]
+    if not_queued:
+        raise HTTPException(status_code=409, detail=f"tasks are not currently queued: {', '.join(not_queued[:5])}")
+
+    priority = next(iter(priorities))
+    bucket_ids = [item.task_id for item in visible_queued if int(item.priority or 0) == priority]
+    if len(bucket_ids) != len(ordered_ids) or set(bucket_ids) != set(ordered_ids):
+        raise HTTPException(
+            status_code=409,
+            detail="reorder must include every queued task in the selected priority bucket",
+        )
+
+    for index, task_id in enumerate(ordered_ids, start=1):
+        task = by_id[task_id]
+        task.queue_position = index * 1000
+        db.add(task)
+    db.flush()
+    result = _read_task_queue(db, limit=2000)
+    db.commit()
+    publish_queue_changed(get_subtitle_settings().redis_url)
+    celery_app.send_task("subtitle_service.task_queue_tick", args=[], queue=SUBTITLE_CONTROL_QUEUE)
+    return result
 
 
 @app.post("/subtitle/task_queue/tick")

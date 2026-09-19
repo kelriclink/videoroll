@@ -8,6 +8,8 @@ from typing import Any, Callable, Mapping
 
 import httpx
 
+from videoroll.ai.usage import record_ai_usage
+
 from videoroll.utils.openai_compat import build_openai_chat_completions_url
 from videoroll.utils.openai_compat import build_openai_embeddings_url
 
@@ -144,25 +146,47 @@ def _post_json_with_retries(
 ) -> Any:
     attempts = max(1, int(network_retries))
     last_err: Exception | None = None
+    model = str(payload.get("model") or "")
 
     for net_attempt in range(attempts):
+        attempt_started_at = time.perf_counter()
         try:
             resp = client.post(url, headers=headers, json=payload)
             try:
                 resp.raise_for_status()
             except httpx.HTTPStatusError as exc:
-                if resp.status_code in _RETRYABLE_STATUS_CODES and net_attempt < attempts - 1:
-                    _sleep_before_retry(resp, net_attempt)
-                    continue
-                raise OpenAIRequestError(
+                error = OpenAIRequestError(
                     f"{request_label} failed "
                     f"(status={resp.status_code}, content-type={_content_type(resp)}, url={url}). "
                     f"{_resp_snippet(resp)}",
                     status_code=resp.status_code,
-                ) from exc
+                )
+                record_ai_usage(
+                    url=url,
+                    model=model,
+                    operation=request_label,
+                    success=False,
+                    status_code=resp.status_code,
+                    latency_ms=int((time.perf_counter() - attempt_started_at) * 1000),
+                    error=error,
+                )
+                if resp.status_code in _RETRYABLE_STATUS_CODES and net_attempt < attempts - 1:
+                    _sleep_before_retry(resp, net_attempt)
+                    continue
+                raise error from exc
 
             try:
-                return resp.json()
+                data = resp.json()
+                record_ai_usage(
+                    url=url,
+                    model=model,
+                    operation=request_label,
+                    success=True,
+                    status_code=resp.status_code,
+                    usage=data.get("usage") if isinstance(data, dict) else None,
+                    latency_ms=int((time.perf_counter() - attempt_started_at) * 1000),
+                )
+                return data
             except Exception as exc:
                 content_type = _content_type(resp)
                 hint = (
@@ -170,12 +194,31 @@ def _post_json_with_retries(
                     if html_base_url_hint and "text/html" in content_type
                     else ""
                 )
-                raise RuntimeError(
+                error = RuntimeError(
                     f"{endpoint_label} did not return JSON "
                     f"(status={resp.status_code}, content-type={content_type}, url={url}){hint}."
-                ) from exc
+                )
+                record_ai_usage(
+                    url=url,
+                    model=model,
+                    operation=request_label,
+                    success=False,
+                    status_code=resp.status_code,
+                    latency_ms=int((time.perf_counter() - attempt_started_at) * 1000),
+                    error=error,
+                )
+                raise error from exc
         except (httpx.TimeoutException, httpx.TransportError) as exc:
             last_err = exc
+            record_ai_usage(
+                url=url,
+                model=model,
+                operation=request_label,
+                success=False,
+                status_code=None,
+                latency_ms=int((time.perf_counter() - attempt_started_at) * 1000),
+                error=exc,
+            )
             if net_attempt < attempts - 1:
                 _sleep_backoff(net_attempt)
                 continue
@@ -183,6 +226,7 @@ def _post_json_with_retries(
 
     if last_err is not None:
         raise last_err
+
     raise RuntimeError(f"{request_label} failed")
 
 
@@ -454,6 +498,8 @@ def _request_openai_json_object_with_thinking_with_client(
 
         for net_attempt in range(attempts_network):
             content_parts: list[str] = []
+            attempt_started_at = time.perf_counter()
+            stream_usage: dict[str, Any] | None = None
             try:
                 with client.stream("POST", url, headers=headers, json=req) as resp:
                     try:
@@ -463,9 +509,6 @@ def _request_openai_json_object_with_thinking_with_client(
                         # .text while a response is still in streaming mode.
                         raw_body = resp.read().decode("utf-8", errors="replace")
                         status = resp.status_code
-                        if status in _RETRYABLE_STATUS_CODES and net_attempt < attempts_network - 1:
-                            _sleep_before_retry(resp, net_attempt)
-                            continue
                         ct = (resp.headers.get("content-type") or "").split(";")[0].strip()
                         snippet = " ".join(raw_body.replace("\r", " ").replace("\n", " ").split())[:200]
                         protocol_hint = (
@@ -474,12 +517,26 @@ def _request_openai_json_object_with_thinking_with_client(
                             if api_type == "cerebras"
                             else "The configured model or gateway may not support enable_thinking."
                         )
-                        raise OpenAIRequestError(
+                        error = OpenAIRequestError(
                             "OpenAI Think request failed "
                             f"(status={resp.status_code}, content-type={ct}, url={url}). {snippet} "
                             f"{protocol_hint}",
                             status_code=resp.status_code,
-                        ) from e
+                        )
+                        record_ai_usage(
+                            url=url,
+                            model=config.model,
+                            operation="OpenAI Think request",
+                            success=False,
+                            status_code=resp.status_code,
+                            latency_ms=int((time.perf_counter() - attempt_started_at) * 1000),
+                            error=error,
+                        )
+                        if status in _RETRYABLE_STATUS_CODES and net_attempt < attempts_network - 1:
+                            _sleep_before_retry(resp, net_attempt)
+                            continue
+                        last_err = error
+                        break
 
                     content_type = (resp.headers.get("content-type") or "").lower()
                     if "text/event-stream" not in content_type:
@@ -506,6 +563,15 @@ def _request_openai_json_object_with_thinking_with_client(
                         data = json.loads(_strip_code_fence(content))
                         if not isinstance(data, dict):
                             raise RuntimeError("OpenAI Think output is not a JSON object")
+                        record_ai_usage(
+                            url=url,
+                            model=config.model,
+                            operation="OpenAI Think request",
+                            success=True,
+                            status_code=resp.status_code,
+                            usage=regular_payload.get("usage") if isinstance(regular_payload, dict) else None,
+                            latency_ms=int((time.perf_counter() - attempt_started_at) * 1000),
+                        )
                         return data
 
                     for raw_line in resp.iter_lines():
@@ -524,6 +590,8 @@ def _request_openai_json_object_with_thinking_with_client(
                             continue
                         if not isinstance(payload, dict):
                             continue
+                        if isinstance(payload.get("usage"), dict):
+                            stream_usage = payload["usage"]
                         if isinstance(payload.get("error"), dict):
                             error = payload["error"]
                             raise RuntimeError(str(error.get("message") or error))
@@ -537,25 +605,62 @@ def _request_openai_json_object_with_thinking_with_client(
                 data = json.loads(_strip_code_fence(content))
                 if not isinstance(data, dict):
                     raise RuntimeError("OpenAI Think output is not a JSON object")
+                record_ai_usage(
+                    url=url,
+                    model=config.model,
+                    operation="OpenAI Think request",
+                    success=True,
+                    status_code=200,
+                    usage=stream_usage,
+                    latency_ms=int((time.perf_counter() - attempt_started_at) * 1000),
+                )
                 return data
             except httpx.TimeoutException as e:
                 last_err = e
+                record_ai_usage(
+                    url=url,
+                    model=config.model,
+                    operation="OpenAI Think request",
+                    success=False,
+                    status_code=None,
+                    latency_ms=int((time.perf_counter() - attempt_started_at) * 1000),
+                    error=e,
+                )
                 if net_attempt < attempts_network - 1:
                     _sleep_backoff(net_attempt)
                     continue
                 break
             except httpx.TransportError as e:
                 last_err = e
+                record_ai_usage(
+                    url=url,
+                    model=config.model,
+                    operation="OpenAI Think request",
+                    success=False,
+                    status_code=None,
+                    latency_ms=int((time.perf_counter() - attempt_started_at) * 1000),
+                    error=e,
+                )
                 if net_attempt < attempts_network - 1:
                     _sleep_backoff(net_attempt)
                     continue
                 break
             except Exception as e:
                 last_err = e
+                record_ai_usage(
+                    url=url,
+                    model=config.model,
+                    operation="OpenAI Think request",
+                    success=False,
+                    status_code=getattr(e, "status_code", None),
+                    latency_ms=int((time.perf_counter() - attempt_started_at) * 1000),
+                    error=e,
+                )
                 break
 
     if last_err is not None:
         raise last_err
+
     raise RuntimeError("OpenAI Think request failed")
 
 

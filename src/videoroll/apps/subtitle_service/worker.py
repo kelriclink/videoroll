@@ -21,6 +21,7 @@ from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from videoroll.ai.service import AIService
+from videoroll.ai.usage import reset_ai_usage_context, set_ai_usage_context
 from videoroll.config import get_orchestrator_settings, get_subtitle_settings
 from videoroll.db.migrate import initialize_database
 from videoroll.db.models import (
@@ -1051,6 +1052,7 @@ def process_job(self: Any, job_id: str) -> dict[str, str]:
     job_hb: JobLeaseHeartbeat | None = None
     lease_owner: str | None = None
     work_root: Path | None = None
+    ai_usage_tokens: tuple[Any, Any] | None = None
     try:
         job = db.get(SubtitleJob, jid)
         if not job:
@@ -1068,6 +1070,7 @@ def process_job(self: Any, job_id: str) -> dict[str, str]:
             db.add(job)
             db.commit()
             return {"status": "error", "detail": "task not found"}
+        ai_usage_tokens = set_ai_usage_context(task_id=task.id, operation="subtitle")
         if task.status == TaskStatus.published:
             job.status = SubtitleJobStatus.failed
             job.error_message = _task_queue_join_message(
@@ -1747,6 +1750,7 @@ def process_job(self: Any, job_id: str) -> dict[str, str]:
                 logger.exception("failed to release subtitle job lease (job_id=%s)", jid)
             finally:
                 lease_db.close()
+        reset_ai_usage_context(ai_usage_tokens)
         db.close()
         _cleanup_local_work_root(work_root)
 
@@ -1881,119 +1885,134 @@ def task_queue_tick() -> dict[str, Any]:
                 to_start.append(("subtitle", str(sj.id)))
                 started_subtitle += 1
 
-        # Phase 2: lock and start new tasks up to max_concurrency.
+        # Phase 2: choose the next *task* globally, then advance that task's
+        # next stage.  Priority therefore works across subtitle, render, and
+        # recoverable auto-YouTube pipelines instead of only within one job
+        # type.
         running_tasks = len({task.id for task in locked_tasks} | live_job_task_ids)
         capacity = available_task_queue_capacity(max_conc, running_tasks)
+        bootstrap_cutoff = now - timedelta(seconds=60)
+
+        render_due_exists = (
+            db.query(RenderJob.id)
+            .filter(
+                RenderJob.task_id == Task.id,
+                RenderJob.status == RenderJobStatus.queued,
+                or_(RenderJob.progress != _JOB_DISPATCH_PROGRESS, RenderJob.updated_at <= dispatch_retry_cutoff),
+            )
+            .exists()
+        )
+        subtitle_due_exists = (
+            db.query(SubtitleJob.id)
+            .filter(
+                SubtitleJob.task_id == Task.id,
+                SubtitleJob.status == SubtitleJobStatus.queued,
+                or_(SubtitleJob.progress != _JOB_DISPATCH_PROGRESS, SubtitleJob.updated_at <= dispatch_retry_cutoff),
+            )
+            .exists()
+        )
+        any_subtitle_job_exists = db.query(SubtitleJob.id).filter(SubtitleJob.task_id == Task.id).exists()
+        any_render_job_exists = db.query(RenderJob.id).filter(RenderJob.task_id == Task.id).exists()
+        auto_youtube_origin = or_(
+            Task.created_by == "auto_youtube",
+            Task.created_by.like("auto_youtube;%"),
+            Task.created_by == "youtube_home_scan",
+            Task.created_by.like("youtube_home_scan;%"),
+            Task.created_by == "youtube_task_restart",
+            Task.created_by.like("youtube_task_restart;%"),
+        )
+        recoverable_pipeline = (
+            (Task.source_type == SourceType.youtube)
+            & Task.status.in_([TaskStatus.ingested, TaskStatus.downloaded])
+            & Task.updated_at.is_not(None)
+            & (Task.updated_at < bootstrap_cutoff)
+            & auto_youtube_origin
+            & ~any_subtitle_job_exists
+            & ~any_render_job_exists
+        )
+
         for _ in range(capacity):
             if available_task_queue_capacity(max_conc, running_tasks) <= 0:
                 break
             # Production sessions disable autoflush. Persist this tick's
             # previous claims before selecting another unlocked candidate.
             db.flush()
-            # Prefer queued render jobs (rare, usually after an expired lock) so tasks can finish.
-            rj = (
-                db.query(RenderJob)
-                .join(Task, Task.id == RenderJob.task_id)
+            task = (
+                db.query(Task)
                 .filter(
-                    RenderJob.status == RenderJobStatus.queued,
-                    or_(RenderJob.progress != _JOB_DISPATCH_PROGRESS, RenderJob.updated_at <= dispatch_retry_cutoff),
                     Task.status.notin_([TaskStatus.canceled, TaskStatus.published]),
                     schedulable_unlocked,
+                    or_(render_due_exists, subtitle_due_exists, recoverable_pipeline),
                 )
-                .order_by(RenderJob.created_at.asc())
+                .order_by(Task.priority.desc(), Task.queue_position.asc().nullslast(), Task.created_at.asc())
                 .with_for_update(skip_locked=True)
                 .first()
             )
-            if rj:
-                task = db.query(Task).filter(Task.id == rj.task_id).with_for_update(skip_locked=True).first()
-                if not task:
-                    continue
-                if _task_queue_is_task_locked(task, now):
-                    continue
-                if task.lock_until and task.lock_until > now and task.lock_owner and task.lock_owner != TASK_QUEUE_LOCK_OWNER:
-                    continue
-                task.lock_owner = TASK_QUEUE_LOCK_OWNER
-                task.lock_until = _task_queue_expires_at(now)
-                _mark_queued_job_dispatched(rj)
-                db.add(rj)
-                db.add(task)
-                to_start.append(("render", str(rj.id)))
-                started_render += 1
-                running_tasks += 1
-                continue
-
-            sj = (
-                db.query(SubtitleJob)
-                .join(Task, Task.id == SubtitleJob.task_id)
-                .filter(
-                    SubtitleJob.status == SubtitleJobStatus.queued,
-                    or_(SubtitleJob.progress != _JOB_DISPATCH_PROGRESS, SubtitleJob.updated_at <= dispatch_retry_cutoff),
-                    Task.status.notin_([TaskStatus.canceled, TaskStatus.published]),
-                    schedulable_unlocked,
-                )
-                .order_by(SubtitleJob.created_at.asc())
-                .with_for_update(skip_locked=True)
-                .first()
-            )
-            if not sj:
+            if task is None:
                 break
-
-            task = db.query(Task).filter(Task.id == sj.task_id).with_for_update(skip_locked=True).first()
-            if not task:
-                continue
             if _task_queue_is_task_locked(task, now):
                 continue
             if task.lock_until and task.lock_until > now and task.lock_owner and task.lock_owner != TASK_QUEUE_LOCK_OWNER:
                 continue
 
+            rj = (
+                db.query(RenderJob)
+                .filter(
+                    RenderJob.task_id == task.id,
+                    RenderJob.status == RenderJobStatus.queued,
+                    or_(RenderJob.progress != _JOB_DISPATCH_PROGRESS, RenderJob.updated_at <= dispatch_retry_cutoff),
+                )
+                .order_by(RenderJob.created_at.asc())
+                .with_for_update(skip_locked=True)
+                .first()
+            )
+            sj = None
+            if rj is None:
+                sj = (
+                    db.query(SubtitleJob)
+                    .filter(
+                        SubtitleJob.task_id == task.id,
+                        SubtitleJob.status == SubtitleJobStatus.queued,
+                        or_(SubtitleJob.progress != _JOB_DISPATCH_PROGRESS, SubtitleJob.updated_at <= dispatch_retry_cutoff),
+                    )
+                    .order_by(SubtitleJob.created_at.asc())
+                    .with_for_update(skip_locked=True)
+                    .first()
+                )
+
             task.lock_owner = TASK_QUEUE_LOCK_OWNER
             task.lock_until = _task_queue_expires_at(now)
-            _mark_queued_job_dispatched(sj)
-            db.add(sj)
             db.add(task)
-            to_start.append(("subtitle", str(sj.id)))
-            started_subtitle += 1
-            running_tasks += 1
 
-        # Phase 3: bootstrap auto-YouTube tasks only with remaining task slots.
-        bootstrap_capacity = available_task_queue_capacity(max_conc, running_tasks)
-        if bootstrap_capacity > 0:
-            bootstrap_cutoff = now - timedelta(seconds=60)
-            bootstrap_candidates = (
-                db.query(Task)
-                .filter(
-                    Task.source_type == SourceType.youtube,
-                    Task.status.in_([TaskStatus.ingested, TaskStatus.downloaded]),
-                    schedulable_unlocked,
-                    Task.updated_at.is_not(None),
-                    Task.updated_at < bootstrap_cutoff,
-                )
-                .order_by(Task.updated_at.asc(), Task.created_at.asc())
-                .with_for_update(skip_locked=True)
-                .limit(max(bootstrap_capacity * 4, bootstrap_capacity))
-                .all()
-            )
-            for task in bootstrap_candidates:
-                if available_task_queue_capacity(max_conc, running_tasks) <= 0:
-                    break
-                meta = parse_auto_youtube_created_by(task.created_by)
-                if meta is None:
-                    continue
-                if _task_has_queued_or_running_jobs(db, task.id):
-                    continue
-                if _task_queue_is_task_locked(task, now):
-                    continue
-
-                task.lock_owner = TASK_QUEUE_LOCK_OWNER
-                task.lock_until = _task_queue_expires_at(now)
-                db.add(task)
-
-                overrides: dict[str, Any] | None = None
-                if meta.get("auto_publish") is not None:
-                    overrides = {"auto_publish": bool(meta["auto_publish"])}
-                to_bootstrap.append((str(task.id), overrides))
-                recovered_pipeline += 1
+            if rj is not None:
+                _mark_queued_job_dispatched(rj)
+                db.add(rj)
+                to_start.append(("render", str(rj.id)))
+                started_render += 1
                 running_tasks += 1
+                continue
+
+            if sj is not None:
+                _mark_queued_job_dispatched(sj)
+                db.add(sj)
+                to_start.append(("subtitle", str(sj.id)))
+                started_subtitle += 1
+                running_tasks += 1
+                continue
+
+            meta = parse_auto_youtube_created_by(task.created_by)
+            if meta is None:
+                # Defensive: the SQL candidate predicate should make this
+                # impossible, but never reserve a slot for an invalid source.
+                _task_queue_unlock(task)
+                db.add(task)
+                continue
+            overrides: dict[str, Any] | None = None
+            if meta.get("auto_publish") is not None:
+                overrides = {"auto_publish": bool(meta["auto_publish"])}
+            to_bootstrap.append((str(task.id), overrides))
+            recovered_pipeline += 1
+            running_tasks += 1
 
         db.commit()
     except Exception:
@@ -2854,6 +2873,7 @@ def auto_youtube_pipeline(self: Any, task_id: str, overrides: dict[str, Any] | N
     pipeline_operation_key: str | None = None
     pipeline_operation_owner: str | None = None
     acquired_lock = False
+    ai_usage_tokens: tuple[Any, Any] | None = None
     try:
         tid = uuid.UUID(task_id)
         pipeline_args: list[Any] = [str(tid)]
@@ -2862,6 +2882,7 @@ def auto_youtube_pipeline(self: Any, task_id: str, overrides: dict[str, Any] | N
         task = db.get(Task, tid)
         if not task:
             raise RuntimeError("task not found")
+        ai_usage_tokens = set_ai_usage_context(task_id=task.id, operation="auto_youtube")
         if task.source_type.value != "youtube":
             raise RuntimeError("task is not a youtube source")
         _raise_if_task_stopped(db, task.id)
@@ -3265,4 +3286,5 @@ def auto_youtube_pipeline(self: Any, task_id: str, overrides: dict[str, Any] | N
                 db.rollback()
             except Exception:
                 pass
+        reset_ai_usage_context(ai_usage_tokens)
         db.close()

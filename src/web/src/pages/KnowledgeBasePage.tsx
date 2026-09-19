@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
-import { useConfirm } from "../components/feedbackContext";
+import { useConfirm, useToast } from "../components/feedbackContext";
 import { Button, DataTable, EmptyState, PageHeader, PaginationControls, Section, TableToolbar } from "../components/ui";
 import { fetchJson } from "../lib/http";
 import { ORCHESTRATOR_URL } from "../lib/urls";
@@ -38,6 +38,7 @@ function statusClass(status: string) {
 
 export default function KnowledgeBasePage() {
   const confirm = useConfirm();
+  const toast = useToast();
   const [searchParams] = useSearchParams();
   const [items, setItems] = useState<KnowledgeItem[]>([]);
   const [error, setError] = useState<string | null>(null);
@@ -63,6 +64,9 @@ export default function KnowledgeBasePage() {
   const [confidence, setConfidence] = useState(1);
   const [formError, setFormError] = useState<string | null>(null);
   const requestControllerRef = useRef<AbortController | null>(null);
+  const importInputRef = useRef<HTMLInputElement | null>(null);
+  const [importBusy, setImportBusy] = useState(false);
+  const [rebuildBusy, setRebuildBusy] = useState(false);
   const requestGenerationRef = useRef(0);
   const focusedItemId = searchParams.get("item")?.trim() || null;
 
@@ -166,6 +170,65 @@ export default function KnowledgeBasePage() {
     }
   }
 
+  async function importKnowledge(file: File) {
+    setImportBusy(true);
+    setError(null);
+    try {
+      const form = new FormData();
+      form.append("file", file);
+      form.append("import_format", "auto");
+      form.append("target_lang", targetLang.trim() || "zh");
+      form.append("domain", domain.trim());
+      const result = await fetchJson<{ parsed: number; imported: number; failed: number; skipped: number }>(
+        `${ORCHESTRATOR_URL}/subtitle/knowledge/import`,
+        { method: "POST", body: form },
+      );
+      toast({
+        kind: result.failed > 0 ? "warning" : "success",
+        title: "知识库批量导入完成",
+        message: `解析 ${result.parsed}，导入 ${result.imported}，跳过 ${result.skipped}，失败 ${result.failed}。`,
+      });
+      await refresh({ silent: true });
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setImportBusy(false);
+      if (importInputRef.current) importInputRef.current.value = "";
+    }
+  }
+
+  async function rebuildEmbeddings() {
+    const ok = await confirm({
+      title: "重新向量化知识库",
+      message: "将使用当前 RAG embedding 配置重新生成最多 10000 条知识向量。切换 embedding 模型后建议执行。",
+      confirmLabel: "开始重建",
+      tone: "warning",
+    });
+    if (!ok) return;
+    setRebuildBusy(true);
+    setError(null);
+    try {
+      const result = await fetchJson<{ total: number; updated: number; failed: number; skipped: number; embedding_model: string; dimensions: number }>(
+        `${ORCHESTRATOR_URL}/subtitle/knowledge/rebuild-embeddings`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ limit: 10000 }),
+        },
+      );
+      toast({
+        kind: result.failed > 0 ? "warning" : "success",
+        title: "向量重建完成",
+        message: `模型 ${result.embedding_model} (${result.dimensions}d)：更新 ${result.updated}/${result.total}，跳过 ${result.skipped}，失败 ${result.failed}。`,
+      });
+      await refresh({ silent: true });
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setRebuildBusy(false);
+    }
+  }
+
   async function deleteItem(item: KnowledgeItem) {
     const ok = await confirm({
       title: "删除知识条目",
@@ -193,6 +256,22 @@ export default function KnowledgeBasePage() {
         description="管理翻译 RAG 使用的术语和文档。基础词、局部变量和一次性表达建议删除或保持未批准。"
         actions={
           <>
+            <input
+              ref={importInputRef}
+              type="file"
+              accept=".csv,.json,.srt,text/csv,application/json,application/x-subrip"
+              className="hidden"
+              onChange={(event) => {
+                const file = event.target.files?.[0];
+                if (file) void importKnowledge(file);
+              }}
+            />
+            <Button disabled={importBusy || rebuildBusy} onClick={() => importInputRef.current?.click()}>
+              {importBusy ? "导入中..." : "批量导入 CSV/JSON/SRT"}
+            </Button>
+            <Button disabled={importBusy || rebuildBusy} onClick={() => void rebuildEmbeddings()}>
+              {rebuildBusy ? "重建中..." : "重新向量化"}
+            </Button>
             <Link to="/settings/translate" className="rounded-md border border-slate-300 px-3 py-2 text-sm text-slate-800 hover:bg-slate-50">
               RAG 设置
             </Link>

@@ -438,6 +438,28 @@ async def test_admin_auth_only_exempts_normalized_root_health_path(
 
 
 @pytest.mark.anyio
+async def test_internal_service_token_is_accepted_before_admin_password_setup(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(auth_middleware, "get_admin_password_hash", lambda _request: None)
+    app = FastAPI()
+    app.state.internal_header_token = "internal-token"
+    app.add_middleware(auth_middleware.AdminAuthMiddleware)
+
+    @app.post("/operations/alerts/report")
+    async def report() -> dict[str, bool]:
+        return {"ok": True}
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post(
+            "/operations/alerts/report",
+            headers={auth_middleware.INTERNAL_TOKEN_HEADER: "internal-token"},
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {"ok": True}
+
+
+@pytest.mark.anyio
 async def test_admin_session_injects_internal_header_for_downstream(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(auth_middleware, "get_admin_password_hash", lambda _request: "password-hash")
     monkeypatch.setattr(auth_middleware, "verify_device_cookie_value", lambda *_args, **_kwargs: True)

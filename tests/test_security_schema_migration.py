@@ -331,7 +331,7 @@ def _assert_complete_schema(engine: Engine) -> None:
     for table in Base.metadata.tables.values():
         assert set(table.columns.keys()).issubset({column["name"] for column in inspector.get_columns(table.name)})
     with engine.connect() as connection:
-        assert connection.exec_driver_sql("SELECT version_num FROM alembic_version").scalar_one() == "0004_playout_asset_links"
+        assert connection.exec_driver_sql("SELECT version_num FROM alembic_version").scalar_one() == "0005_operations_center"
 
 
 def test_migration_initializes_empty_database_and_can_run_again(tmp_path: Path) -> None:

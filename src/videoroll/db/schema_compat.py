@@ -89,7 +89,7 @@ def validate_application_schema(connection: Connection) -> None:
     legacy_tables = set(legacy_metadata().tables)
     revision_columns = {
         "app_settings": {"version"},
-        "tasks": {"stopped_status"},
+        "tasks": {"stopped_status", "queue_position"},
         "subtitle_jobs": {"lease_owner", "lease_until", "heartbeat_at", "operation_key"},
         "render_jobs": {"lease_owner", "lease_until", "heartbeat_at", "operation_key"},
         "publish_jobs": {"lease_owner", "lease_until", "heartbeat_at", "operation_key", "upload_progress", "upload_active"},

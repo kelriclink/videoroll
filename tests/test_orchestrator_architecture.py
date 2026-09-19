@@ -29,6 +29,9 @@ EXPECTED_ORCHESTRATOR_ROUTES: set[tuple[str, str]] = {
     ("GET", "/bilibili/{service_path:path}"),
     ("GET", "/health"),
     ("GET", "/maintenance/workdir"),
+    ("GET", "/operations/ai-usage"),
+    ("GET", "/operations/ai-usage/pricing"),
+    ("GET", "/operations/alerts"),
     ("GET", "/settings/api"),
     ("GET", "/settings/publish/platforms"),
     ("GET", "/settings/publish/social/accounts"),
@@ -60,6 +63,10 @@ EXPECTED_ORCHESTRATOR_ROUTES: set[tuple[str, str]] = {
     ("POST", "/auto/youtube"),
     ("POST", "/maintenance/workdir/cleanup"),
     ("POST", "/maintenance/storage/cleanup-terminal"),
+    ("POST", "/operations/alerts/scan"),
+    ("POST", "/operations/alerts/report"),
+    ("POST", "/operations/alerts/{alert_id}/ack"),
+    ("POST", "/operations/alerts/{alert_id}/resolve"),
     ("POST", "/remote/auto/youtube"),
     ("POST", "/settings/publish/social/accounts/{account_id}/check"),
     ("POST", "/settings/publish/social/accounts/{platform}"),
@@ -85,6 +92,7 @@ EXPECTED_ORCHESTRATOR_ROUTES: set[tuple[str, str]] = {
     ("POST", "/tasks/{task_id}/upload/video"),
     ("POST", "/tasks/{task_id}/assets/{asset_id}/playout"),
     ("PUT", "/settings/api"),
+    ("PUT", "/operations/ai-usage/pricing"),
     ("PUT", "/bilibili/{service_path:path}"),
     ("PUT", "/settings/publish/platforms/{platform}"),
     ("PUT", "/settings/review"),
@@ -159,6 +167,8 @@ class OrchestratorArchitectureTests(unittest.TestCase):
 
         self.assertEqual(owners["/auth/login"], "videoroll.apps.orchestrator_api.routers.auth")
         self.assertEqual(owners["/system/resources"], "videoroll.apps.orchestrator_api.routers.system")
+        self.assertEqual(owners["/operations/alerts"], "videoroll.apps.orchestrator_api.routers.operations")
+        self.assertEqual(owners["/operations/ai-usage"], "videoroll.apps.orchestrator_api.routers.operations")
 
     def test_settings_and_maintenance_routes_are_owned_by_domain_routers(self) -> None:
         owners = {route.path: route.endpoint.__module__ for route in application_routes(app) if hasattr(route, "endpoint")}

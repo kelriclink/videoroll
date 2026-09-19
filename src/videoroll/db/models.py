@@ -142,6 +142,9 @@ class Task(Base):
     # workflow stage it should return to when the user resumes it.
     stopped_status: Mapped[Optional[TaskStatus]] = mapped_column(Enum(TaskStatus, name="task_status"), nullable=True)
     priority: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # Optional user-controlled ordering within the same priority bucket.
+    # NULL means "use the natural created_at order".
+    queue_position: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
 
     created_by: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
 
@@ -167,6 +170,7 @@ class Task(Base):
 
     __table_args__ = (
         Index("ix_tasks_status_created_at", "status", "created_at"),
+        Index("ix_tasks_queue_priority_position", "priority", "queue_position", "created_at"),
         Index("ix_tasks_lock_until", "lock_owner", "lock_until"),
         Index("ix_tasks_active_publish_batch_id", "active_publish_batch_id"),
     )
@@ -510,6 +514,67 @@ class RemoteAPIRequest(Base):
     __table_args__ = (
         UniqueConstraint("token_hash", "idempotency_key", name="uq_remote_api_requests_token_idempotency"),
         Index("ix_remote_api_requests_pending_lease", "status", "lease_until", "created_at"),
+    )
+
+
+class AIUsageEvent(Base):
+    """One terminal OpenAI-compatible request attempt used for operations telemetry."""
+
+    __tablename__ = "ai_usage_events"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    task_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("tasks.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    provider: Mapped[str] = mapped_column(String(64), nullable=False, default="openai")
+    model: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    operation: Mapped[str] = mapped_column(String(96), nullable=False, default="chat")
+    success: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    status_code: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    input_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    output_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    total_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    latency_ms: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    estimated_cost_microusd: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+    error_type: Mapped[Optional[str]] = mapped_column(String(96), nullable=True)
+    error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        Index("ix_ai_usage_events_created", "created_at"),
+        Index("ix_ai_usage_events_model_created", "model", "created_at"),
+        Index("ix_ai_usage_events_status_created", "status_code", "created_at"),
+        Index("ix_ai_usage_events_task_created", "task_id", "created_at"),
+    )
+
+
+class AlertEvent(Base):
+    """Deduplicated operational alert visible in the unified alert center."""
+
+    __tablename__ = "alert_events"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    fingerprint: Mapped[str] = mapped_column(String(255), nullable=False)
+    source: Mapped[str] = mapped_column(String(64), nullable=False)
+    severity: Mapped[str] = mapped_column(String(16), nullable=False, default="warning")
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="open")
+    title: Mapped[str] = mapped_column(String(255), nullable=False)
+    message: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    details_json: Mapped[dict[str, Any]] = mapped_column(JSON_PAYLOAD, nullable=False, default=dict)
+    occurrence_count: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    acknowledged_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    resolved_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("fingerprint", name="uq_alert_events_fingerprint"),
+        Index("ix_alert_events_status_severity_seen", "status", "severity", "last_seen_at"),
+        Index("ix_alert_events_source_status", "source", "status"),
     )
 
 
