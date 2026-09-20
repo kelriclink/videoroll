@@ -61,6 +61,44 @@ export function Section({ children, className = "" }: PropsWithChildren<{ classN
   return <div className={`vr-section ${className}`}>{children}</div>;
 }
 
+export function SettingsSaveBar({
+  dirty,
+  busy,
+  onSave,
+  onDiscard,
+  saveLabel = "保存配置",
+  cleanLabel = "配置已与后端同步",
+  dirtyLabel = "有未保存的配置修改",
+  extraActions,
+}: {
+  dirty: boolean;
+  busy: boolean;
+  onSave: () => void | Promise<void>;
+  onDiscard?: () => void;
+  saveLabel?: string;
+  cleanLabel?: string;
+  dirtyLabel?: string;
+  extraActions?: ReactNode;
+}) {
+  return (
+    <div className="sticky bottom-3 z-20 rounded-xl border border-slate-200 bg-white/95 p-3 shadow-lg backdrop-blur">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div className="flex items-center gap-2 text-sm">
+          <span className={["h-2 w-2 rounded-full", dirty ? "bg-amber-500" : "bg-emerald-500"].join(" ")} />
+          <span className={dirty ? "text-slate-800" : "text-slate-500"}>{dirty ? dirtyLabel : cleanLabel}</span>
+        </div>
+        <div className="flex flex-wrap items-center gap-2">
+          {extraActions}
+          {onDiscard ? <Button disabled={busy || !dirty} onClick={onDiscard}>放弃修改</Button> : null}
+          <Button tone="primary" disabled={busy || !dirty} onClick={onSave}>
+            {busy ? "保存中..." : saveLabel}
+          </Button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export function TableToolbar({
   title,
   description,

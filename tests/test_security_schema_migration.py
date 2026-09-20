@@ -331,7 +331,7 @@ def _assert_complete_schema(engine: Engine) -> None:
     for table in Base.metadata.tables.values():
         assert set(table.columns.keys()).issubset({column["name"] for column in inspector.get_columns(table.name)})
     with engine.connect() as connection:
-        assert connection.exec_driver_sql("SELECT version_num FROM alembic_version").scalar_one() == "0005_operations_center"
+        assert connection.exec_driver_sql("SELECT version_num FROM alembic_version").scalar_one() == "0006_agent_runtime"
 
 
 def test_migration_initializes_empty_database_and_can_run_again(tmp_path: Path) -> None:
@@ -372,6 +372,56 @@ def test_versioned_database_with_auto_migrated_columns_upgrades_again(tmp_path: 
         assert result.returncode == 0, result.stderr
     _assert_complete_schema(engine)
     _assert_legacy_rows_survive(engine)
+
+
+def test_agent_runtime_migration_upgrades_precheckpoint_agent_run_table(tmp_path: Path) -> None:
+    database_url = f"sqlite:///{tmp_path / 'old-agent-runtime.sqlite3'}"
+    engine = create_engine(database_url)
+    first = _run_upgrade(database_url, revision="0005_operations_center")
+    assert first.returncode == 0, first.stderr
+    run_id = uuid.uuid4().hex
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            """
+            CREATE TABLE translation_agent_runs (
+                id CHAR(32) NOT NULL PRIMARY KEY,
+                agent_type VARCHAR(64) NOT NULL DEFAULT 'rag_term_research',
+                status VARCHAR(32) NOT NULL DEFAULT 'running',
+                term TEXT NOT NULL DEFAULT '',
+                normalized_term TEXT NOT NULL DEFAULT '',
+                domain TEXT NOT NULL DEFAULT '',
+                target_lang VARCHAR(16) NOT NULL DEFAULT 'zh',
+                task_id CHAR(32),
+                subtitle_job_id CHAR(32),
+                query TEXT NOT NULL DEFAULT '',
+                steps JSON NOT NULL DEFAULT '[]',
+                result JSON NOT NULL DEFAULT '{}',
+                error TEXT NOT NULL DEFAULT '',
+                knowledge_item_id CHAR(32),
+                parent_agent_run_id CHAR(32),
+                started_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                finished_at DATETIME,
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        connection.exec_driver_sql(
+            "INSERT INTO translation_agent_runs (id, term, normalized_term) VALUES (?, ?, ?)",
+            (run_id, "keep-term", "keep-term"),
+        )
+
+    result = _run_upgrade(database_url)
+    assert result.returncode == 0, result.stderr
+    columns = {column["name"] for column in inspect(engine).get_columns("translation_agent_runs")}
+    assert {"checkpoint", "checkpoint_version", "checkpointed_at", "lease_owner", "lease_until"}.issubset(columns)
+    assert "translation_agent_events" in inspect(engine).get_table_names()
+    with engine.connect() as connection:
+        row = connection.exec_driver_sql(
+            "SELECT term, checkpoint_version FROM translation_agent_runs WHERE id = ?",
+            (run_id,),
+        ).one()
+    assert row == ("keep-term", 0)
 
 
 def test_migration_does_not_version_an_incompatible_unversioned_schema(tmp_path: Path) -> None:

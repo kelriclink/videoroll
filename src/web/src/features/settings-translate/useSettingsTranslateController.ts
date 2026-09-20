@@ -1,6 +1,13 @@
 import { useCallback, useEffect, useReducer, useRef, useState } from "react";
 import { useConfirm } from "../../components/feedbackContext";
-import { translateApi, type AgentSkillInfo, type EmbeddingModelInfo, type TranslateSettings } from "../../api/translate";
+import { useUnsavedChangesGuard } from "../../hooks/useUnsavedChangesGuard";
+import {
+  translateApi,
+  type AgentSkillInfo,
+  type EmbeddingModelInfo,
+  type EmbeddingRuntimeStatus,
+  type TranslateSettings,
+} from "../../api/translate";
 import {
   formToUpdatePayload,
   initialTranslateForm,
@@ -13,10 +20,20 @@ import {
 
 type ResultState = { translation: string | null; embedding: string | null; rebuild: string | null };
 
+function persistedFormSnapshot(form: typeof initialTranslateForm): string {
+  return JSON.stringify({
+    translation: form.translation,
+    llm: form.llm,
+    rag: form.rag,
+    embedding: form.embedding,
+  });
+}
+
 export function useSettingsTranslateController() {
   const confirm = useConfirm();
   const [settings, setSettings] = useState<TranslateSettings | null>(null);
   const [embeddingModels, setEmbeddingModels] = useState<EmbeddingModelInfo[]>([]);
+  const [embeddingRuntime, setEmbeddingRuntime] = useState<EmbeddingRuntimeStatus | null>(null);
   const [agentSkills, setAgentSkills] = useState<AgentSkillInfo[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -25,6 +42,7 @@ export function useSettingsTranslateController() {
   const [secrets, setSecrets] = useState<SecretDraft>({ openaiApiKey: "", embeddingApiKey: "" });
   const [results, setResults] = useState<ResultState>({ translation: null, embedding: null, rebuild: null });
   const formRef = useRef(form);
+  const savedFormSnapshotRef = useRef("");
   formRef.current = form;
 
   const update = useCallback((type: TranslateFormAction["type"], patch: Record<string, unknown>) => {
@@ -35,20 +53,24 @@ export function useSettingsTranslateController() {
     setError(null);
     try {
       const nextSettings = await translateApi.settings();
-      const [localModels, skills] = await Promise.all([
+      const [localModels, skills, runtime] = await Promise.all([
         translateApi.embeddingModels(nextSettings.rag_embedding_model_dir).catch(() => []),
         translateApi.agentSkills().catch(() => []),
+        translateApi.embeddingRuntime().catch(() => null),
       ]);
+      const nextForm = settingsToForm(nextSettings, {
+        test: formRef.current.test,
+        embeddingDownload: formRef.current.embeddingDownload,
+      });
       setSettings(nextSettings);
+      savedFormSnapshotRef.current = persistedFormSnapshot(nextForm);
       dispatch({
         type: "replace",
-        value: settingsToForm(nextSettings, {
-          test: formRef.current.test,
-          embeddingDownload: formRef.current.embeddingDownload,
-        }),
+        value: nextForm,
       });
       setEmbeddingModels(localModels);
       setAgentSkills(skills);
+      setEmbeddingRuntime(runtime);
     } catch (error: unknown) {
       setError(error instanceof Error ? error.message : String(error));
     }
@@ -57,6 +79,31 @@ export function useSettingsTranslateController() {
   useEffect(() => {
     void refresh();
   }, [refresh]);
+
+  const isDirty =
+    Boolean(settings) &&
+    (
+      savedFormSnapshotRef.current !== persistedFormSnapshot(form) ||
+      Boolean(secrets.openaiApiKey.trim()) ||
+      Boolean(secrets.embeddingApiKey.trim())
+    );
+
+  useUnsavedChangesGuard(isDirty, {
+    message: "离开当前页面会丢失尚未保存的翻译 / RAG 配置。",
+  });
+
+  function discardChanges() {
+    if (!settings) return;
+    dispatch({
+      type: "replace",
+      value: settingsToForm(settings, {
+        test: formRef.current.test,
+        embeddingDownload: formRef.current.embeddingDownload,
+      }),
+    });
+    setSecrets({ openaiApiKey: "", embeddingApiKey: "" });
+    setError(null);
+  }
 
   const persistSettings = useCallback(async () => {
     await translateApi.updateSettings(formToUpdatePayload(form, secrets));
@@ -255,13 +302,16 @@ export function useSettingsTranslateController() {
   return {
     settings,
     embeddingModels,
+    embeddingRuntime,
     agentSkills,
     error,
     busy,
+    isDirty,
     activeTab,
     setActiveTab,
     refresh,
     saveSettings,
+    discardChanges,
     rebuildKnowledgeEmbeddings,
     downloadEmbeddingModel,
     testEmbedding,

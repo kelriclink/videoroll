@@ -86,6 +86,36 @@ def _estimate_cost_microusd(db: Any, *, provider: str, model: str, input_tokens:
     return max(0, int(round(input_tokens * input_per_million + output_tokens * output_per_million)))
 
 
+def estimate_ai_cost_microusd(
+    db: Any,
+    *,
+    url: str,
+    model: str,
+    usage: Mapping[str, Any] | None = None,
+    input_tokens: int | None = None,
+    output_tokens: int | None = None,
+) -> int | None:
+    """Estimate request cost from the configured AI pricing table.
+
+    This intentionally reuses the same provider/model lookup as usage
+    telemetry so budget enforcement and reporting cannot drift apart.
+    """
+
+    if usage is not None:
+        usage_input, usage_output, _ = _usage_counts(usage)
+        if input_tokens is None:
+            input_tokens = usage_input
+        if output_tokens is None:
+            output_tokens = usage_output
+    return _estimate_cost_microusd(
+        db,
+        provider=_provider_from_url(url),
+        model=str(model or ""),
+        input_tokens=max(0, int(input_tokens or 0)),
+        output_tokens=max(0, int(output_tokens or 0)),
+    )
+
+
 def record_ai_usage(
     *,
     url: str,

@@ -46,6 +46,7 @@ _BROWSER_PROXY_PATHS: dict[str, set[str]] = {
         "subtitle/auto/profile",
         "subtitle/translate/settings",
         "subtitle/hardware/intel",
+        "subtitle/embedding/runtime",
         "subtitle/agents/runs",
         "subtitle/agent/skills",
         "subtitle/dictionaries/sources",

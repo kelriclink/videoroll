@@ -51,8 +51,13 @@ class AgentSkill(BaseModel):
         }
 
     def prompt_payload(self, *, max_instruction_chars: int = 3200, max_resource_chars: int = 1200) -> dict[str, Any]:
+        summary = self.summary()
+        # Filesystem locations are operational metadata, not model context.
+        # Do not disclose host/container paths to the LLM.
+        summary.pop("path", None)
         return {
-            **self.summary(),
+            **summary,
+            "trust": "trusted_builtin" if self.source == "builtin" else "untrusted_user_guidance",
             "instructions": self.instructions[:max_instruction_chars],
             "resources": [
                 {
@@ -279,6 +284,8 @@ class SkillRegistry:
         context_l = context.lower()
         scored: list[tuple[int, AgentSkill]] = []
         for skill in self.skills:
+            if not skill.runnable or str(skill.run_mode or "").strip().lower() != "agent_guidance":
+                continue
             score = 0
             for value in skill.domain:
                 value_l = value.lower()
@@ -301,9 +308,20 @@ class SkillRegistry:
 def _load_skills_from_root(root: Path, *, source: str, max_resource_chars: int) -> list[AgentSkill]:
     if not root.exists() or not root.is_dir():
         return []
+    try:
+        root_resolved = root.resolve()
+    except Exception:
+        return []
     out: list[AgentSkill] = []
     for child in sorted(root.iterdir(), key=lambda item: item.name.lower()):
         if not child.is_dir():
+            continue
+        try:
+            # Reject a skill directory symlink that escapes the configured
+            # skill root. Resource paths already apply the same containment
+            # rule inside an accepted skill directory.
+            child.resolve().relative_to(root_resolved)
+        except Exception:
             continue
         json_path = child / "skill.json"
         md_path = child / "SKILL.md"

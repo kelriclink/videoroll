@@ -32,8 +32,14 @@ from videoroll.ai.client import (
     request_openai_json_object,
     request_openai_json_object_with_thinking,
 )
+from videoroll.ai.prompts import build_subtitle_repair_prompt, build_subtitle_translation_prompt
 from videoroll.ai.service import AIService
 from videoroll.apps.subtitle_service.provider_rate_limit import ProviderRateGate
+from videoroll.apps.subtitle_service.translation_quality import (
+    blocking_translation_issues,
+    build_translation_plan,
+    validate_translation_mapping,
+)
 from videoroll.utils.openai_compat import build_openai_audio_transcriptions_url
 
 logger = logging.getLogger(__name__)
@@ -80,6 +86,16 @@ class Segment:
     text: str
     confidence: float | None = None
     secondary_text: str | None = None
+
+
+class TranslationValidationError(RuntimeError):
+    def __init__(self, issues: list[dict[str, Any]]) -> None:
+        self.issues = list(issues)
+        preview = ", ".join(
+            f"idx={issue.get('idx')}:{issue.get('type')}"
+            for issue in self.issues[:6]
+        )
+        super().__init__(f"translation validation failed: {preview or 'unknown issue'}")
 
 
 def segment_to_dict(seg: Segment) -> dict[str, Any]:
@@ -1987,8 +2003,6 @@ def translate_segments_openai_with_summary(
     tgt = (target_lang or "zh").strip() or "zh"
     tone = (style or "").strip() or "口语自然"
     batch_size = max(1, int(batch_size))
-    system_prompt = "You are a professional subtitle translator. Return ONLY valid JSON (no markdown, no code fences, no extra text)."
-
     def _client() -> httpx.Client:
         assert cfg is not None
         return create_openai_http_client(cfg.timeout_seconds)
@@ -2007,19 +2021,29 @@ def translate_segments_openai_with_summary(
         batch_context: Any,
     ) -> tuple[list[Segment], str]:
         blocks = [{"idx": start_idx + i + 1, "text": s.text} for i, s in enumerate(batch)]
-        payload_in: dict[str, Any] = {"target_lang": tgt, "style": tone, "blocks": blocks}
-        if enable_summary:
-            payload_in["summary"] = summary
-        if glossary:
-            payload_in["glossary"] = glossary
+        rag_context: dict[str, Any] | None = None
         if rag_context_provider_with_context is not None:
-            rag_context = rag_context_provider_with_context(batch, start_idx, summary, batch_context)
-            if rag_context:
-                payload_in["rag_context"] = rag_context
+            value = rag_context_provider_with_context(batch, start_idx, summary, batch_context)
+            if isinstance(value, dict):
+                rag_context = value
         elif rag_context_provider is not None:
-            rag_context = rag_context_provider(batch, start_idx, summary)
-            if rag_context:
-                payload_in["rag_context"] = rag_context
+            value = rag_context_provider(batch, start_idx, summary)
+            if isinstance(value, dict):
+                rag_context = value
+        translation_plan = build_translation_plan(
+            blocks=blocks,
+            glossary=glossary,
+            rag_context=rag_context,
+        )
+        if not translation_plan.get("constraints") and not translation_plan.get("translation_examples"):
+            translation_plan = {}
+        rag_context_for_prompt = dict(rag_context) if isinstance(rag_context, dict) else None
+        if rag_context_for_prompt is not None:
+            # Translation-memory examples are normalized into translation_plan.
+            # Avoid sending the same examples twice and wasting context tokens.
+            rag_context_for_prompt.pop("translation_examples", None)
+            if not rag_context_for_prompt:
+                rag_context_for_prompt = None
 
         def _thinking_callback(delta: str) -> None:
             if on_thinking_delta_with_context is not None:
@@ -2035,7 +2059,8 @@ def translate_segments_openai_with_summary(
                 summary=summary,
                 enable_summary=enable_summary,
                 glossary=glossary,
-                rag_context=payload_in.get("rag_context") if isinstance(payload_in.get("rag_context"), dict) else None,
+                rag_context=rag_context_for_prompt,
+                translation_plan=translation_plan or None,
                 network_retries=3,
                 enable_thinking=enable_thinking,
                 on_thinking_delta=_thinking_callback
@@ -2045,32 +2070,25 @@ def translate_segments_openai_with_summary(
         else:
             assert cfg is not None
             assert client is not None
-            user_prompt = (
-                "你将收到一批字幕 block。请按 block 为单位翻译。\n"
-                "要求：\n"
-                "- 保留每个 block 的 idx 不变；不得增删 block，不得改变顺序；\n"
-                "- 只翻译 text 字段；同一 block 内多行先合并理解再翻译；\n"
-                "- 术语、人名保持一致；数字/单位尽量保留原格式；\n"
-                "- 如果输入包含 rag_context，请优先参考其中的 term_cards/knowledge_cards 来理解专有名词、梗、作品设定和技术背景；\n"
-                "- term_cards 中的 translation 是推荐译法，除非明显不符合当前上下文，否则保持一致；\n"
-                "- rag_context 来自主 agent 对当前 block 的本地 RAG/词典预检和必要研究；如果其中已有与当前 block 和 summary 贴切的译法或解释，直接据此翻译，不要假设还必须继续搜索；\n"
-                "- 输出必须是 JSON 对象，且必须包含 translations 数组；不要输出任何解释。\n"
-                f"- 目标语言：{tgt}\n"
-                f"- 风格：{tone}\n\n"
-                "如果输入里带 summary，请在翻译时参考它保持前后一致，并输出 updated_summary（<= 500 字符）。\n\n"
-                "输入 JSON：\n"
-                f"{json.dumps(payload_in, ensure_ascii=False)}\n\n"
-                "输出 JSON 结构（必须严格遵守）：\n"
-                '{ "updated_summary": "...", "translations": [ {"idx": 1, "text": "..."}, ... ] }'
+            prompt = build_subtitle_translation_prompt(
+                blocks=blocks,
+                target_lang=tgt,
+                style=tone,
+                summary=summary,
+                enable_summary=enable_summary,
+                glossary=glossary,
+                rag_context=rag_context_for_prompt,
+                translation_plan=translation_plan or None,
+                network_retries=3,
             )
             request_kwargs = {
                 "config": cfg,
-                "system_prompt": system_prompt,
-                "user_prompt": user_prompt,
+                "system_prompt": prompt.system_prompt,
+                "user_prompt": prompt.user_prompt,
                 "client": client,
-                "format_retry_notice": "注意：上一次输出不符合 JSON/结构要求，请严格按 JSON 输出。",
-                "format_retries": 2,
-                "network_retries": 3,
+                "format_retry_notice": prompt.format_retry_notice,
+                "format_retries": prompt.format_retries,
+                "network_retries": prompt.network_retries or 3,
             }
             if enable_thinking:
                 data = request_openai_json_object_with_thinking(
@@ -2121,6 +2139,88 @@ def translate_segments_openai_with_summary(
                     translated_prefix=partial_prefix,
                 )
             raise RuntimeError(f"OpenAI output missing translations for idx: {missing[:5]}")
+
+        validation_issues = validate_translation_mapping(
+            blocks=blocks,
+            translations=mapping,
+            translation_plan=translation_plan,
+        )
+        validation_issues_before = list(validation_issues)
+        repaired = False
+        if validation_issues:
+            affected = sorted(
+                {
+                    int(issue["idx"])
+                    for issue in validation_issues
+                    if isinstance(issue, dict)
+                    and issue.get("idx") is not None
+                    and int(issue["idx"]) in expected
+                }
+            )
+            source_blocks = [block for block in blocks if int(block["idx"]) in affected]
+            draft_translations = [{"idx": idx, "text": mapping[idx]} for idx in affected]
+            blocking_before = blocking_translation_issues(validation_issues)
+            repair_data: dict[str, Any] | None = None
+            try:
+                if ai_service is not None:
+                    repair_data = ai_service.repair_subtitle_batch(
+                        source_blocks=source_blocks,
+                        draft_translations=draft_translations,
+                        issues=validation_issues,
+                        target_lang=tgt,
+                        style=tone,
+                        translation_plan=translation_plan or None,
+                    )
+                else:
+                    assert cfg is not None
+                    assert client is not None
+                    repair_prompt = build_subtitle_repair_prompt(
+                        source_blocks=source_blocks,
+                        draft_translations=draft_translations,
+                        issues=validation_issues,
+                        target_lang=tgt,
+                        style=tone,
+                        translation_plan=translation_plan or None,
+                    )
+                    repair_data = request_openai_json_object(
+                        config=cfg,
+                        system_prompt=repair_prompt.system_prompt,
+                        user_prompt=repair_prompt.user_prompt,
+                        client=client,
+                        format_retry_notice=repair_prompt.format_retry_notice,
+                        format_retries=repair_prompt.format_retries,
+                        network_retries=repair_prompt.network_retries or 2,
+                    )
+            except Exception:
+                if blocking_before:
+                    raise
+                logger.warning("subtitle preferred-term repair failed", exc_info=True)
+
+            repair_rows = repair_data.get("translations") if isinstance(repair_data, dict) else None
+            if isinstance(repair_rows, list):
+                affected_set = set(affected)
+                for item in repair_rows:
+                    if not isinstance(item, dict) or "idx" not in item or "text" not in item:
+                        continue
+                    try:
+                        repair_idx = int(item["idx"])
+                    except (TypeError, ValueError):
+                        continue
+                    if repair_idx not in affected_set:
+                        continue
+                    repaired_text = str(item["text"] or "").strip()
+                    if repaired_text:
+                        mapping[repair_idx] = repaired_text
+                        repaired = True
+            validation_issues = validate_translation_mapping(
+                blocks=blocks,
+                translations=mapping,
+                translation_plan=translation_plan,
+            )
+
+        remaining_blocking = blocking_translation_issues(validation_issues)
+        if remaining_blocking:
+            raise TranslationValidationError(remaining_blocking)
 
         updated_summary = summary
         if enable_summary and isinstance(data.get("updated_summary"), str):
@@ -2180,6 +2280,12 @@ def translate_segments_openai_with_summary(
                 if on_batch_error is not None:
                     on_batch_error(batch_context, e)
                 raise RuntimeError(str(e)) from e
+            except TranslationValidationError as e:
+                if on_batch_error is not None:
+                    on_batch_error(batch_context, e)
+                if cur_batch_size <= 1:
+                    raise
+                cur_batch_size = max(1, cur_batch_size // 2)
             except httpx.TimeoutException as e:
                 if on_batch_error is not None:
                     on_batch_error(batch_context, e)

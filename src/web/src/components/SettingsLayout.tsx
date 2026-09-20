@@ -22,7 +22,7 @@ export default function SettingsLayout() {
           </div>
           <div className="hidden text-xs text-slate-500 sm:block">修改后仅影响后续任务，除非页面另有说明</div>
         </div>
-        <nav className="-mb-3 flex gap-1 overflow-x-auto pb-px" aria-label="设置导航">
+        <nav className="-mb-3 flex gap-1 overflow-x-auto pb-px md:hidden" aria-label="设置导航">
           {settingsItems.map(([to, label]) => (
             <NavLink
               key={to}

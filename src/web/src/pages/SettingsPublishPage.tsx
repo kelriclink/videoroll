@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useConfirm } from "../components/feedbackContext";
+import { Button } from "../components/ui";
+import { useUnsavedChangesGuard } from "../hooks/useUnsavedChangesGuard";
 import { fetchJson, HttpError } from "../lib/http";
 import {
   applyServerValue,
@@ -89,6 +91,10 @@ export default function SettingsPublishPage() {
   const [busy, setBusy] = useState(false);
   const refreshedLoginSessionsRef = useRef(new Set<string>());
   const metaText = metaEditor.value;
+  const hasUnsavedPublishDraft = metaEditor.dirty || Boolean(cookieText.trim());
+  useUnsavedChangesGuard(hasUnsavedPublishDraft, {
+    message: "离开当前页面会丢失尚未保存的投稿模板或 Bilibili Cookie 草稿。",
+  });
 
   const refresh = useCallback(async () => {
     setError(null);
@@ -277,7 +283,7 @@ export default function SettingsPublishPage() {
               <div className="mt-1">文件会使用 VideoRoll Fernet 密钥加密保存，网页不会回显内容，也不会写入共享媒体存储。</div>
             </div>
 
-            <div className="mt-3 grid gap-2 md:grid-cols-[14rem_auto_1fr_auto]">
+            <div className="mt-3 grid gap-2 lg:grid-cols-[14rem_auto_1fr_auto]">
               <input
                 className="rounded border px-3 py-2 text-sm"
                 value={socialNames[id]}
@@ -469,10 +475,10 @@ export default function SettingsPublishPage() {
           说明：此处保存的是用于 B 站接口调用的 Cookie（加密存储，后端不会回显）。请从浏览器开发者工具复制整段 Cookie。
         </div>
 
-        <div className="mt-3 grid gap-3 md:grid-cols-2">
+        <div className="mt-3 grid gap-3 lg:grid-cols-2">
           <div className="rounded border p-3">
-            <div className="text-xs text-slate-500">cookie_set</div>
-            <div className="mt-1 text-sm">{auth?.cookie_set ? "true" : "false"}</div>
+            <div className="text-xs text-slate-500">Bilibili Cookies</div>
+            <div className={["mt-1 text-sm font-medium", auth?.cookie_set ? "text-emerald-700" : "text-slate-500"].join(" ")}>{auth?.cookie_set ? "已设置" : "未设置"}</div>
           </div>
           <div className="rounded border p-3">
             <div className="text-xs text-slate-500">解析</div>
@@ -495,9 +501,9 @@ export default function SettingsPublishPage() {
         </div>
 
         <div className="mt-3 flex flex-wrap items-center gap-2">
-          <button
+          <Button
+            tone="primary"
             disabled={busy || !cookieText.trim()}
-            className="rounded bg-slate-900 px-3 py-2 text-sm text-white hover:bg-slate-800 disabled:opacity-50"
             onClick={async () => {
               setBusy(true);
               setError(null);
@@ -517,11 +523,11 @@ export default function SettingsPublishPage() {
             }}
           >
             {busy ? "保存中…" : "保存 Cookies"}
-          </button>
+          </Button>
 
-          <button
+          <Button
+            tone="danger"
             disabled={busy || !auth?.cookie_set}
-            className="rounded border border-rose-300 px-3 py-2 text-sm text-rose-700 hover:bg-rose-50 disabled:opacity-50"
             onClick={async () => {
               const ok = await confirm({
                 title: "清除 Bilibili Cookies",
@@ -548,11 +554,10 @@ export default function SettingsPublishPage() {
             }}
           >
             清除 Cookies
-          </button>
+          </Button>
 
-          <button
+          <Button
             disabled={busy || !(auth?.sessdata_set || auth?.cookie_set)}
-            className="rounded border px-3 py-2 text-sm hover:bg-slate-50 disabled:opacity-50"
             onClick={async () => {
               setBusy(true);
               setError(null);
@@ -568,7 +573,7 @@ export default function SettingsPublishPage() {
             }}
           >
             测试登录
-          </button>
+          </Button>
         </div>
 
         {me ? (
@@ -583,10 +588,11 @@ export default function SettingsPublishPage() {
 
       <div className="vr-section">
         <div className="flex items-center justify-between">
-          <div className="text-sm font-semibold">default_meta.json</div>
-          <button onClick={() => refresh()} className="rounded border px-3 py-2 text-sm hover:bg-slate-50">
-            刷新
-          </button>
+          <div>
+            <div className="text-sm font-semibold">默认投稿模板</div>
+            <div className="mt-0.5 font-mono text-[11px] text-slate-400">default_meta.json</div>
+          </div>
+          <Button onClick={() => void refresh()}>刷新</Button>
         </div>
 
         {!settings ? (
@@ -631,9 +637,9 @@ export default function SettingsPublishPage() {
             </div>
 
             <div className="mt-3 flex flex-wrap items-center gap-2">
-              <button
-                disabled={busy}
-                className="rounded bg-slate-900 px-3 py-2 text-sm text-white hover:bg-slate-800 disabled:opacity-50"
+              <Button
+                tone="primary"
+                disabled={busy || !metaEditor.dirty}
                 onClick={async () => {
                   setBusy(true);
                   setError(null);
@@ -646,12 +652,12 @@ export default function SettingsPublishPage() {
                   }
                 }}
               >
-                {busy ? "保存中…" : "保存"}
-              </button>
+                {busy ? "保存中…" : "保存模板"}
+              </Button>
 
-              <button
+              <Button
+                tone="warning"
                 disabled={busy}
-                className="rounded border border-rose-300 px-3 py-2 text-sm text-rose-700 hover:bg-rose-50 disabled:opacity-50"
                 onClick={async () => {
                   const ok = await confirm({
                     title: "恢复默认模板",
@@ -672,7 +678,7 @@ export default function SettingsPublishPage() {
                 }}
               >
                 恢复默认
-              </button>
+              </Button>
             </div>
           </>
         )}

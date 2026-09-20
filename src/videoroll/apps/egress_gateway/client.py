@@ -45,6 +45,13 @@ class EgressGatewayError(RuntimeError):
     pass
 
 
+class EgressHTTPStatusError(RuntimeError):
+    def __init__(self, status_code: int, *, retry_after: float | None = None) -> None:
+        self.status_code = int(status_code)
+        self.retry_after = retry_after
+        super().__init__(f"egress request returned HTTP {self.status_code}")
+
+
 class EgressTimeout(TimeoutError):
     pass
 
@@ -85,7 +92,14 @@ class EgressResponse:
 
     def raise_for_status(self) -> None:
         if self.status_code >= 400:
-            raise RuntimeError(f"egress request returned HTTP {self.status_code}")
+            retry_after: float | None = None
+            raw_retry_after = str(self.headers.get("retry-after") or "").strip()
+            if raw_retry_after:
+                try:
+                    retry_after = max(0.0, float(raw_retry_after))
+                except (TypeError, ValueError):
+                    retry_after = None
+            raise EgressHTTPStatusError(self.status_code, retry_after=retry_after)
 
 
 class EgressGatewayClient:
@@ -135,6 +149,7 @@ class EgressGatewayClient:
         timeout: float,
         max_bytes: int,
         redirects: int,
+        headers: Mapping[str, str] | None = None,
     ) -> EgressResponse:
         try:
             response = self.client.post(
@@ -144,6 +159,7 @@ class EgressGatewayClient:
                     "timeout": float(timeout),
                     "max_bytes": int(max_bytes),
                     "redirects": int(redirects),
+                    "headers": dict(headers or {}),
                 },
             )
         except httpx.HTTPError as exc:

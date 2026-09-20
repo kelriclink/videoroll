@@ -4,6 +4,8 @@ import json
 import random
 import time
 from dataclasses import dataclass
+from datetime import timezone
+from email.utils import parsedate_to_datetime
 from typing import Any, Callable, Mapping
 
 import httpx
@@ -102,9 +104,20 @@ def create_openai_http_client(timeout_seconds: float) -> httpx.Client:
     return httpx.Client(timeout=timeout)
 
 
-def _sleep_backoff(attempt: int) -> None:
+def _interruptible_sleep(seconds: float, *, cancel_check: Callable[[], None] | None = None) -> None:
+    deadline = time.monotonic() + max(0.0, float(seconds))
+    while True:
+        if cancel_check is not None:
+            cancel_check()
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        time.sleep(min(0.1, remaining))
+
+
+def _sleep_backoff(attempt: int, *, cancel_check: Callable[[], None] | None = None) -> None:
     base = min(8.0, float(2**attempt))
-    time.sleep(base + random.random() * 0.25)
+    _interruptible_sleep(base + random.random() * 0.25, cancel_check=cancel_check)
 
 
 def _resp_snippet(resp: httpx.Response, limit: int = 200) -> str:
@@ -122,15 +135,28 @@ def _content_type(resp: httpx.Response) -> str:
     return (resp.headers.get("content-type") or "").split(";")[0].strip()
 
 
-def _sleep_before_retry(resp: httpx.Response | None, attempt: int) -> None:
+def _sleep_before_retry(
+    resp: httpx.Response | None,
+    attempt: int,
+    *,
+    cancel_check: Callable[[], None] | None = None,
+) -> None:
     retry_after = (resp.headers.get("retry-after") or "").strip() if resp is not None else ""
     if retry_after:
         try:
-            time.sleep(min(30.0, float(retry_after)))
+            _interruptible_sleep(min(30.0, float(retry_after)), cancel_check=cancel_check)
             return
         except (TypeError, ValueError):
-            pass
-    _sleep_backoff(attempt)
+            try:
+                when = parsedate_to_datetime(retry_after)
+                if when.tzinfo is None:
+                    when = when.replace(tzinfo=timezone.utc)
+                delay = max(0.0, min(30.0, when.timestamp() - time.time()))
+                _interruptible_sleep(delay, cancel_check=cancel_check)
+                return
+            except Exception:
+                pass
+    _sleep_backoff(attempt, cancel_check=cancel_check)
 
 
 def _post_json_with_retries(
@@ -143,6 +169,8 @@ def _post_json_with_retries(
     request_label: str,
     endpoint_label: str,
     html_base_url_hint: bool = False,
+    before_request: Callable[[], None] | None = None,
+    cancel_check: Callable[[], None] | None = None,
 ) -> Any:
     attempts = max(1, int(network_retries))
     last_err: Exception | None = None
@@ -151,6 +179,10 @@ def _post_json_with_retries(
     for net_attempt in range(attempts):
         attempt_started_at = time.perf_counter()
         try:
+            if cancel_check is not None:
+                cancel_check()
+            if before_request is not None:
+                before_request()
             resp = client.post(url, headers=headers, json=payload)
             try:
                 resp.raise_for_status()
@@ -171,7 +203,7 @@ def _post_json_with_retries(
                     error=error,
                 )
                 if resp.status_code in _RETRYABLE_STATUS_CODES and net_attempt < attempts - 1:
-                    _sleep_before_retry(resp, net_attempt)
+                    _sleep_before_retry(resp, net_attempt, cancel_check=cancel_check)
                     continue
                 raise error from exc
 
@@ -220,7 +252,7 @@ def _post_json_with_retries(
                 error=exc,
             )
             if net_attempt < attempts - 1:
-                _sleep_backoff(net_attempt)
+                _sleep_backoff(net_attempt, cancel_check=cancel_check)
                 continue
             break
 
@@ -367,6 +399,9 @@ def _request_openai_json_object_with_client(
     format_retry_notice: str,
     format_retries: int,
     network_retries: int,
+    before_request: Callable[[], None] | None,
+    cancel_check: Callable[[], None] | None,
+    max_completion_tokens: int | None,
 ) -> dict[str, Any]:
     if not config.api_key:
         raise RuntimeError("OpenAI API key is not set")
@@ -393,6 +428,8 @@ def _request_openai_json_object_with_client(
             ],
             "response_format": {"type": "json_object"},
         }
+        if max_completion_tokens is not None:
+            req["max_completion_tokens"] = max(1, int(max_completion_tokens))
 
         try:
             resp_json = _post_json_with_retries(
@@ -404,6 +441,8 @@ def _request_openai_json_object_with_client(
                 request_label="OpenAI request",
                 endpoint_label="OpenAI endpoint",
                 html_base_url_hint=True,
+                before_request=before_request,
+                cancel_check=cancel_check,
             )
             return _parse_json_object(resp_json)
         except Exception as e:
@@ -423,6 +462,9 @@ def request_openai_json_object(
     format_retries: int = 2,
     network_retries: int | None = None,
     client: httpx.Client | None = None,
+    before_request: Callable[[], None] | None = None,
+    cancel_check: Callable[[], None] | None = None,
+    max_completion_tokens: int | None = None,
 ) -> dict[str, Any]:
     if client is not None:
         return _request_openai_json_object_with_client(
@@ -433,6 +475,9 @@ def request_openai_json_object(
             format_retry_notice=format_retry_notice,
             format_retries=format_retries,
             network_retries=max(1, int(network_retries if network_retries is not None else config.max_retries)),
+            before_request=before_request,
+            cancel_check=cancel_check,
+            max_completion_tokens=max_completion_tokens,
         )
     with create_openai_http_client(config.timeout_seconds) as owned_client:
         return _request_openai_json_object_with_client(
@@ -443,6 +488,9 @@ def request_openai_json_object(
             format_retry_notice=format_retry_notice,
             format_retries=format_retries,
             network_retries=max(1, int(network_retries if network_retries is not None else config.max_retries)),
+            before_request=before_request,
+            cancel_check=cancel_check,
+            max_completion_tokens=max_completion_tokens,
         )
 
 
@@ -456,6 +504,9 @@ def _request_openai_json_object_with_thinking_with_client(
     format_retries: int,
     network_retries: int,
     on_thinking_delta: Callable[[str], None] | None,
+    before_request: Callable[[], None] | None,
+    cancel_check: Callable[[], None] | None,
+    max_completion_tokens: int | None,
 ) -> dict[str, Any]:
     """Request JSON through SSE and forward reasoning deltas as they arrive.
 
@@ -488,6 +539,8 @@ def _request_openai_json_object_with_thinking_with_client(
             ],
             "stream": True,
         }
+        if max_completion_tokens is not None:
+            req["max_completion_tokens"] = max(1, int(max_completion_tokens))
         api_type = str(config.api_type or "openai").strip().lower()
         if api_type == "cerebras":
             req["reasoning_effort"] = config.cerebras_reasoning_effort
@@ -501,6 +554,10 @@ def _request_openai_json_object_with_thinking_with_client(
             attempt_started_at = time.perf_counter()
             stream_usage: dict[str, Any] | None = None
             try:
+                if cancel_check is not None:
+                    cancel_check()
+                if before_request is not None:
+                    before_request()
                 with client.stream("POST", url, headers=headers, json=req) as resp:
                     try:
                         resp.raise_for_status()
@@ -533,7 +590,7 @@ def _request_openai_json_object_with_thinking_with_client(
                             error=error,
                         )
                         if status in _RETRYABLE_STATUS_CODES and net_attempt < attempts_network - 1:
-                            _sleep_before_retry(resp, net_attempt)
+                            _sleep_before_retry(resp, net_attempt, cancel_check=cancel_check)
                             continue
                         last_err = error
                         break
@@ -627,7 +684,7 @@ def _request_openai_json_object_with_thinking_with_client(
                     error=e,
                 )
                 if net_attempt < attempts_network - 1:
-                    _sleep_backoff(net_attempt)
+                    _sleep_backoff(net_attempt, cancel_check=cancel_check)
                     continue
                 break
             except httpx.TransportError as e:
@@ -642,7 +699,7 @@ def _request_openai_json_object_with_thinking_with_client(
                     error=e,
                 )
                 if net_attempt < attempts_network - 1:
-                    _sleep_backoff(net_attempt)
+                    _sleep_backoff(net_attempt, cancel_check=cancel_check)
                     continue
                 break
             except Exception as e:
@@ -674,6 +731,9 @@ def request_openai_json_object_with_thinking(
     format_retries: int = 2,
     network_retries: int | None = None,
     client: httpx.Client | None = None,
+    before_request: Callable[[], None] | None = None,
+    cancel_check: Callable[[], None] | None = None,
+    max_completion_tokens: int | None = None,
 ) -> dict[str, Any]:
     """OpenAI-compatible JSON request with protocol-aware reasoning and SSE parsing."""
 
@@ -685,6 +745,9 @@ def request_openai_json_object_with_thinking(
         "format_retries": format_retries,
         "network_retries": max(1, int(network_retries if network_retries is not None else config.max_retries)),
         "on_thinking_delta": on_thinking_delta,
+        "before_request": before_request,
+        "cancel_check": cancel_check,
+        "max_completion_tokens": max_completion_tokens,
     }
     if client is not None:
         return _request_openai_json_object_with_thinking_with_client(client=client, **kwargs)
@@ -700,6 +763,9 @@ def _request_openai_tool_turn_with_client(
     tools: list[dict[str, Any]],
     tool_choice: str | dict[str, Any] = "auto",
     network_retries: int,
+    before_request: Callable[[], None] | None,
+    cancel_check: Callable[[], None] | None,
+    max_completion_tokens: int | None,
 ) -> OpenAIToolTurn:
     if not config.api_key:
         raise RuntimeError("OpenAI API key is not set")
@@ -714,6 +780,8 @@ def _request_openai_tool_turn_with_client(
         "tools": tools,
         "tool_choice": tool_choice,
     }
+    if max_completion_tokens is not None:
+        req["max_completion_tokens"] = max(1, int(max_completion_tokens))
     payload = _post_json_with_retries(
         client=client,
         url=url,
@@ -722,6 +790,8 @@ def _request_openai_tool_turn_with_client(
         network_retries=network_retries,
         request_label="OpenAI tool request",
         endpoint_label="OpenAI tool endpoint",
+        before_request=before_request,
+        cancel_check=cancel_check,
     )
     return _parse_openai_tool_turn(payload)
 
@@ -734,6 +804,9 @@ def request_openai_tool_turn(
     tool_choice: str | dict[str, Any] = "auto",
     network_retries: int | None = None,
     client: httpx.Client | None = None,
+    before_request: Callable[[], None] | None = None,
+    cancel_check: Callable[[], None] | None = None,
+    max_completion_tokens: int | None = None,
 ) -> OpenAIToolTurn:
     """Request one native OpenAI-compatible function-calling turn."""
 
@@ -743,6 +816,9 @@ def request_openai_tool_turn(
         "tools": tools,
         "tool_choice": tool_choice,
         "network_retries": max(1, int(network_retries if network_retries is not None else config.max_retries)),
+        "before_request": before_request,
+        "cancel_check": cancel_check,
+        "max_completion_tokens": max_completion_tokens,
     }
     if client is not None:
         return _request_openai_tool_turn_with_client(client=client, **kwargs)
@@ -756,6 +832,8 @@ def request_openai_embedding(
     text: str,
     client: httpx.Client | None = None,
     network_retries: int = 3,
+    before_request: Callable[[], None] | None = None,
+    cancel_check: Callable[[], None] | None = None,
 ) -> list[float]:
     if not config.api_key:
         raise RuntimeError("OpenAI API key is not set")
@@ -780,6 +858,8 @@ def request_openai_embedding(
             request_label="OpenAI embedding request",
             endpoint_label="OpenAI embedding endpoint",
             html_base_url_hint=True,
+            before_request=before_request,
+            cancel_check=cancel_check,
         )
         try:
             raw = resp_json["data"][0]["embedding"]

@@ -86,6 +86,27 @@ export type EmbeddingTestResponse = {
   expected_dimensions: number;
   ok: boolean;
 };
+export type EmbeddingRuntimeBucket = {
+  embedding_model: string;
+  dimensions: number;
+  count: number;
+};
+export type EmbeddingRuntimeStatus = {
+  supported: boolean;
+  provider: string;
+  model: string;
+  configured_dimensions: number;
+  device: string;
+  pgvector_version: string;
+  column_type: string;
+  total_embeddings: number;
+  active_embeddings: number;
+  buckets: EmbeddingRuntimeBucket[];
+  hnsw_index_present: boolean;
+  hnsw_usable_for_current_query: boolean;
+  search_mode: "hnsw" | "exact_scan" | "unavailable";
+  detail: string;
+};
 
 export const translateApi = {
   settings() {
@@ -110,6 +131,10 @@ export const translateApi = {
 
   agentSkills() {
     return fetchJson<AgentSkillInfo[]>(orchestratorUrl("/subtitle/agent/skills"));
+  },
+
+  embeddingRuntime() {
+    return fetchJson<EmbeddingRuntimeStatus>(orchestratorUrl("/subtitle/embedding/runtime"));
   },
 
   rebuildEmbeddings(limit = 10000) {

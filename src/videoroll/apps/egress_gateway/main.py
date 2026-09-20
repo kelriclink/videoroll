@@ -29,6 +29,7 @@ class FetchRequest(BaseModel):
     timeout: float = Field(20.0, ge=0.1, le=60.0)
     max_bytes: int = Field(500_000, ge=1, le=2_000_000)
     redirects: int = Field(5, ge=0, le=5)
+    headers: dict[str, str] = Field(default_factory=dict)
 
 
 class FetchResponse(BaseModel):
@@ -74,6 +75,7 @@ async def fetch_public_async(payload: FetchRequest) -> EgressResponse:
             timeout=payload.timeout,
             max_bytes=payload.max_bytes,
             redirects=payload.redirects,
+            headers=dict(list(payload.headers.items())[:16]),
         )
     )
 

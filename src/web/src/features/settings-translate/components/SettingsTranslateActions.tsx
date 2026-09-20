@@ -1,30 +1,37 @@
 import type { SettingsTranslateController } from "../useSettingsTranslateController";
-import { Button } from "../../../components/ui";
+import { Button, SettingsSaveBar } from "../../../components/ui";
 export function SettingsTranslateActions({ controller }: { controller: SettingsTranslateController }) {
   const {
     settings,
     busy,
+    isDirty,
+    activeTab,
     saveSettings,
+    discardChanges,
     clearOpenAiKey,
     clearEmbeddingKey,
   } = controller;
+  if (activeTab === "test") return null;
   return (
-<div className="flex flex-wrap items-center gap-2">
-        <Button tone="primary" disabled={busy} onClick={saveSettings}>{busy ? "保存中..." : "保存配置"}</Button>
-        <Button
-          tone="danger"
-          disabled={busy || !settings?.openai_api_key_set}
-          onClick={clearOpenAiKey}
-        >
-          清除 Key
-        </Button>
-        <Button
-          tone="danger"
-          disabled={busy || !settings?.rag_embedding_api_key_set}
-          onClick={clearEmbeddingKey}
-        >
-          清除 Embedding Key
-        </Button>
-      </div>
+    <SettingsSaveBar
+      dirty={isDirty}
+      busy={busy}
+      onSave={saveSettings}
+      onDiscard={discardChanges}
+      extraActions={
+        <>
+          {activeTab === "translation" ? (
+            <Button tone="danger" size="xs" disabled={busy || !settings?.openai_api_key_set} onClick={clearOpenAiKey}>
+              清除翻译 Key
+            </Button>
+          ) : null}
+          {activeTab === "embedding" ? (
+            <Button tone="danger" size="xs" disabled={busy || !settings?.rag_embedding_api_key_set} onClick={clearEmbeddingKey}>
+              清除 Embedding Key
+            </Button>
+          ) : null}
+        </>
+      }
+    />
   );
 }

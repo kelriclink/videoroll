@@ -1,5 +1,7 @@
 import { useEffect, useState } from "react";
 import { useConfirm, useToast } from "../components/feedbackContext";
+import { Button, Section, SettingsSaveBar } from "../components/ui";
+import { useUnsavedChangesGuard } from "../hooks/useUnsavedChangesGuard";
 import { fetchJson } from "../lib/http";
 import { ORCHESTRATOR_URL } from "../lib/urls";
 
@@ -42,6 +44,26 @@ export default function SettingsStoragePage() {
     refresh();
   }, []);
 
+  const isDirty = Boolean(settings) && assetTtlDays !== settings?.asset_ttl_days;
+  useUnsavedChangesGuard(isDirty, { message: "离开当前页面会丢失尚未保存的存储保留策略。" });
+
+  async function saveRetention() {
+    setBusy(true);
+    setError(null);
+    try {
+      await fetchJson(`${ORCHESTRATOR_URL}/settings/storage`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ asset_ttl_days: assetTtlDays }),
+      });
+      await refresh();
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   return (
     <div className="space-y-4">
       <div className="px-1">
@@ -60,14 +82,14 @@ export default function SettingsStoragePage() {
         {!settings ? (
           <div className="mt-2 text-sm text-slate-500">加载中…</div>
         ) : (
-          <div className="mt-3 grid gap-3 md:grid-cols-2">
+          <div className="mt-3 grid gap-3 lg:grid-cols-2">
             <div className="rounded border p-3">
-              <div className="text-xs text-slate-500">asset_ttl_days</div>
-              <div className="mt-1 font-mono text-sm">{settings.asset_ttl_days}</div>
+              <div className="text-xs text-slate-500">资源保留时间</div>
+              <div className="mt-1 text-sm">{settings.asset_ttl_days === 0 ? "永久保留" : `${settings.asset_ttl_days} 天`}</div>
             </div>
             <div className="rounded border p-3">
               <div className="text-xs text-slate-500">自动清理</div>
-              <div className="mt-1 text-sm">{settings.asset_ttl_days > 0 ? "enabled" : "disabled"}</div>
+              <div className="mt-1 text-sm">{settings.asset_ttl_days > 0 ? "已启用" : "已关闭"}</div>
             </div>
           </div>
         )}
@@ -76,11 +98,12 @@ export default function SettingsStoragePage() {
         </div>
       </div>
 
-      <div className="vr-section">
-        <div className="text-sm font-semibold">保存配置</div>
-        <div className="mt-2 grid gap-3 md:grid-cols-2">
+      <Section>
+        <div className="text-sm font-semibold">资源保留策略</div>
+        <div className="mt-1 text-xs text-slate-500">修改后通过页面底部保存栏提交；0 表示永久保留。</div>
+        <div className="mt-2 grid gap-3 lg:grid-cols-2">
           <label className="block">
-            <div className="mb-1 text-xs text-slate-600">asset_ttl_days（0=永不删除）</div>
+            <div className="mb-1 text-xs text-slate-600">资源保留天数（0 = 永久保留）</div>
             <input
               type="number"
               min={0}
@@ -91,32 +114,7 @@ export default function SettingsStoragePage() {
             />
           </label>
         </div>
-
-        <div className="mt-3 flex items-center gap-2">
-          <button
-            disabled={busy}
-            className="rounded bg-slate-900 px-3 py-2 text-sm text-white hover:bg-slate-800 disabled:opacity-50"
-            onClick={async () => {
-              setBusy(true);
-              setError(null);
-              try {
-                await fetchJson(`${ORCHESTRATOR_URL}/settings/storage`, {
-                  method: "PUT",
-                  headers: { "Content-Type": "application/json" },
-                  body: JSON.stringify({ asset_ttl_days: assetTtlDays }),
-                });
-                await refresh();
-              } catch (e: unknown) {
-                setError(e instanceof Error ? e.message : String(e));
-              } finally {
-                setBusy(false);
-              }
-            }}
-          >
-            保存
-          </button>
-        </div>
-      </div>
+      </Section>
 
       <div className="rounded border border-rose-200 bg-rose-50 p-4">
         <div className="text-sm font-semibold text-rose-900">立即清理已结束任务资源</div>
@@ -124,9 +122,9 @@ export default function SettingsStoragePage() {
           一键删除所有已发布、失败或永久取消任务的共享存储文件，包括原视频、成品、字幕、日志和元数据；保留任务、发布和去重记录。已停止且可恢复的任务不会被清理。
         </div>
         <div className="mt-3 flex flex-wrap items-center gap-2">
-          <button
+          <Button
+            tone="danger"
             disabled={cleanupBusy}
-            className="rounded border border-rose-300 bg-white px-3 py-2 text-sm font-medium text-rose-700 hover:bg-rose-100 disabled:opacity-50"
             onClick={async () => {
               const ok = await confirm({
                 title: "清理全部已结束任务资源",
@@ -152,7 +150,7 @@ export default function SettingsStoragePage() {
             }}
           >
             {cleanupBusy ? "清理中..." : "一键清理全部已结束任务资源"}
-          </button>
+          </Button>
           {cleanupResult ? (
             <span className="text-xs text-rose-800">
               已匹配 {cleanupResult.matched_tasks} 个任务，删除 {cleanupResult.deleted_objects} 个对象、{cleanupResult.deleted_assets} 条资产记录。
@@ -161,6 +159,16 @@ export default function SettingsStoragePage() {
           ) : null}
         </div>
       </div>
+      <SettingsSaveBar
+        dirty={isDirty}
+        busy={busy}
+        onSave={saveRetention}
+        onDiscard={() => {
+          if (settings) setAssetTtlDays(settings.asset_ttl_days);
+          setError(null);
+        }}
+        dirtyLabel="有未保存的存储策略修改"
+      />
     </div>
   );
 }

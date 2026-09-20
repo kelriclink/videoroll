@@ -39,9 +39,11 @@ export function TranslationTab({ controller }: { controller: SettingsTranslateCo
   return (
 <Section>
         <div className="text-sm font-semibold text-slate-900">翻译与模型</div>
-        <div className="mt-3 grid gap-3 md:grid-cols-2">
+        <div className="mt-1 text-xs text-slate-500">默认翻译行为与 LLM 接口集中在这里；RAG 和 Embedding 使用各自独立页面。</div>
+        <div className="mt-3 grid gap-3 lg:grid-cols-2">
+          <div className="lg:col-span-2 border-b border-slate-100 pb-2 text-xs font-semibold uppercase tracking-wide text-slate-400">默认翻译</div>
           <label className="block">
-            <div className="mb-1 text-xs text-slate-600">default_provider</div>
+            <div className="mb-1 text-xs text-slate-600">默认 Provider</div>
             <select className="w-full rounded border px-3 py-2 text-sm" value={defaultProvider} onChange={(e) => setDefaultProvider(e.target.value)}>
               <option value="openai">openai</option>
               <option value="mock">mock</option>
@@ -49,11 +51,11 @@ export function TranslationTab({ controller }: { controller: SettingsTranslateCo
             </select>
           </label>
           <label className="block">
-            <div className="mb-1 text-xs text-slate-600">default_target_lang</div>
+            <div className="mb-1 text-xs text-slate-600">目标语言</div>
             <input className="w-full rounded border px-3 py-2 text-sm" value={defaultTargetLang} onChange={(e) => setDefaultTargetLang(e.target.value)} />
           </label>
-          <label className="block md:col-span-2">
-            <div className="mb-1 text-xs text-slate-600">default_style</div>
+          <label className="block lg:col-span-2">
+            <div className="mb-1 text-xs text-slate-600">默认翻译风格</div>
             <select className="w-full rounded border px-3 py-2 text-sm" value={defaultStyle} onChange={(e) => setDefaultStyle(e.target.value)}>
               <option value="口语自然">口语自然</option>
               <option value="正式严谨">正式严谨</option>
@@ -61,19 +63,19 @@ export function TranslationTab({ controller }: { controller: SettingsTranslateCo
             </select>
           </label>
           <label className="block">
-            <div className="mb-1 text-xs text-slate-600">default_batch_size</div>
+            <div className="mb-1 text-xs text-slate-600">Batch 大小</div>
             <input type="number" min={1} className="w-full rounded border px-3 py-2 text-sm" value={defaultBatchSize} onChange={(e) => setDefaultBatchSize(parseInt(e.target.value || "1", 10))} />
           </label>
           <label className="block">
-            <div className="mb-1 text-xs text-slate-600">default_max_retries</div>
+            <div className="mb-1 text-xs text-slate-600">翻译批次最大重试</div>
             <input type="number" min={0} max={10} className="w-full rounded border px-3 py-2 text-sm" value={defaultMaxRetries} onChange={(e) => setDefaultMaxRetries(parseInt(e.target.value || "0", 10))} />
           </label>
           <label className="flex items-center gap-2 text-sm">
             <input type="checkbox" checked={defaultEnableSummary} onChange={(e) => setDefaultEnableSummary(e.target.checked)} />
-            default_enable_summary
+            启用批次摘要上下文
           </label>
-          <div className="md:col-span-2 pt-2 text-xs font-semibold text-slate-700">OpenAI（标准接口）</div>
-          <label className="block md:col-span-2">
+          <div className="lg:col-span-2 mt-1 border-b border-slate-100 pb-2 text-xs font-semibold uppercase tracking-wide text-slate-400">模型接口</div>
+          <label className="block lg:col-span-2">
             <div className="mb-1 text-xs text-slate-600">接口类型</div>
             <select
               className="w-full rounded border px-3 py-2 text-sm"
@@ -87,11 +89,11 @@ export function TranslationTab({ controller }: { controller: SettingsTranslateCo
               通过 New API 转发 Cerebras 时也请选择 Cerebras；系统会使用 Cerebras 的 reasoning 参数，而不是 <code>enable_thinking</code>。
             </div>
           </label>
-          <label className="block md:col-span-2">
+          <label className="block lg:col-span-2">
             <div className="mb-1 text-xs text-slate-600">openai_api_key（仅保存，不回显）</div>
             <input type="password" className="w-full rounded border px-3 py-2 text-sm" placeholder={settings?.openai_api_key_set ? "已设置（留空则不修改）" : "sk-..."} value={openaiApiKey} onChange={(e) => setOpenaiApiKey(e.target.value)} />
           </label>
-          <label className="block md:col-span-2">
+          <label className="block lg:col-span-2">
             <div className="mb-1 text-xs text-slate-600">openai_base_url</div>
             <input className="w-full rounded border px-3 py-2 text-sm" value={openaiBaseUrl} onChange={(e) => setOpenaiBaseUrl(e.target.value)} />
           </label>
@@ -113,7 +115,7 @@ export function TranslationTab({ controller }: { controller: SettingsTranslateCo
             <div className="mt-1 text-xs text-slate-500">LLM 请求的网络/5xx 重试次数；不影响 embedding 请求。</div>
           </label>
           {openaiApiType === "cerebras" ? (
-            <div className="grid gap-3 rounded border border-orange-200 bg-orange-50 p-3 md:col-span-2 md:grid-cols-2">
+            <div className="grid gap-3 rounded border border-orange-200 bg-orange-50 p-3 lg:col-span-2 lg:grid-cols-2">
               <label className="block">
                 <div className="mb-1 text-xs text-orange-900">cerebras_reasoning_effort</div>
                 <select
@@ -138,12 +140,12 @@ export function TranslationTab({ controller }: { controller: SettingsTranslateCo
                   <option value="hidden">hidden（隐藏思考）</option>
                 </select>
               </label>
-              <div className="text-xs text-orange-800 md:col-span-2">
+              <div className="text-xs text-orange-800 lg:col-span-2">
                 推荐使用 <code>medium + parsed</code>。选择 <code>hidden</code> 后模型仍会思考并计费，但仪表盘看不到思考内容；<code>raw</code> 可能干扰翻译 JSON 解析。
               </div>
             </div>
           ) : null}
-          <label className="flex items-start gap-2 rounded border border-violet-200 bg-violet-50 p-3 text-sm md:col-span-2">
+          <label className="flex items-start gap-2 rounded border border-violet-200 bg-violet-50 p-3 text-sm lg:col-span-2">
             <input className="mt-0.5" type="checkbox" checked={openaiEnableThinking} onChange={(e) => setOpenaiEnableThinking(e.target.checked)} />
             <span>
               <span className="font-medium text-violet-950">启用翻译 Think（流式思考）</span>

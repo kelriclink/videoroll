@@ -121,3 +121,4 @@ fi
 echo
 echo "Import on target machine:"
 echo "  docker load -i $(basename "$OUTPUT_TAR")"
+echo "  ./scripts/prod_compose.sh up -d --no-build --remove-orphans"

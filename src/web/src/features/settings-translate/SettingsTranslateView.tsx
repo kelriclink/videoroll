@@ -17,8 +17,8 @@ export function SettingsTranslateView({ controller }: { controller: SettingsTran
       {controller.activeTab === "translation" ? <TranslationTab controller={controller} /> : null}
       {controller.activeTab === "rag" ? <RagTab controller={controller} /> : null}
       {controller.activeTab === "embedding" ? <EmbeddingTab controller={controller} /> : null}
-      <SettingsTranslateActions controller={controller} />
       {controller.activeTab === "test" ? <TranslationTestTab controller={controller} /> : null}
+      <SettingsTranslateActions controller={controller} />
     </div>
   );
 }

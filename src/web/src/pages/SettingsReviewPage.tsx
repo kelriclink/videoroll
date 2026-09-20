@@ -1,5 +1,8 @@
 import { Link } from "react-router-dom";
 import { useEffect, useState } from "react";
+import { useConfirm } from "../components/feedbackContext";
+import { Button, Section, SettingsSaveBar } from "../components/ui";
+import { useUnsavedChangesGuard } from "../hooks/useUnsavedChangesGuard";
 import { fetchJson } from "../lib/http";
 import { ORCHESTRATOR_URL } from "../lib/urls";
 
@@ -10,6 +13,7 @@ type ReviewSettings = {
 };
 
 export default function SettingsReviewPage() {
+  const confirm = useConfirm();
   const [settings, setSettings] = useState<ReviewSettings | null>(null);
   const [enabled, setEnabled] = useState(true);
   const [blockedWordsText, setBlockedWordsText] = useState("");
@@ -39,6 +43,57 @@ export default function SettingsReviewPage() {
     refresh();
   }, []);
 
+  const normalizedBlockedWords = blockedWordsText
+    .split(/\r?\n/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+  const isDirty =
+    Boolean(settings) &&
+    (
+      enabled !== Boolean(settings?.enabled) ||
+      JSON.stringify(normalizedBlockedWords) !== JSON.stringify(settings?.blocked_words ?? []) ||
+      aiRules !== (settings?.ai_rules || "")
+    );
+  useUnsavedChangesGuard(isDirty, { message: "离开当前页面会丢失尚未保存的审核规则。" });
+
+  async function reloadFromServer() {
+    if (isDirty) {
+      const ok = await confirm({
+        title: "刷新并放弃未保存修改",
+        message: "刷新会重新载入审核配置，并覆盖当前尚未保存的规则。",
+        confirmLabel: "刷新并放弃",
+        cancelLabel: "继续编辑",
+        tone: "warning",
+      });
+      if (!ok) return;
+    }
+    await refresh();
+  }
+
+  async function saveReviewSettings() {
+    setBusy(true);
+    setError(null);
+    try {
+      const saved = await fetchJson<ReviewSettings>(`${ORCHESTRATOR_URL}/settings/review`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          enabled,
+          blocked_words: normalizedBlockedWords,
+          ai_rules: aiRules,
+        }),
+      });
+      setSettings(saved);
+      setEnabled(Boolean(saved.enabled));
+      setBlockedWordsText((saved.blocked_words ?? []).join("\n"));
+      setAiRules(saved.ai_rules || "");
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   return (
     <div className="space-y-4">
       <div className="px-1">
@@ -47,14 +102,12 @@ export default function SettingsReviewPage() {
             <h2 className="text-xl font-semibold tracking-tight text-slate-950">投稿前审核</h2>
             <div className="mt-1 text-sm text-slate-600">投稿前先根据视频标题、AI 总结和字幕内容执行 AI 审核。</div>
           </div>
-          <button onClick={() => refresh()} className="rounded border px-3 py-2 text-sm hover:bg-slate-50">
-            刷新
-          </button>
+          <Button onClick={() => void reloadFromServer()}>刷新</Button>
         </div>
         {error ? <div className="mt-3 text-sm text-rose-700">{error}</div> : null}
       </div>
 
-      <div className="vr-section">
+      <Section>
         {!settings ? <div className="text-sm text-slate-500">加载中…</div> : null}
         {settings ? (
           <>
@@ -94,43 +147,22 @@ export default function SettingsReviewPage() {
               </div>
             ) : null}
 
-            <div className="mt-4 flex items-center gap-2">
-              <button
-                disabled={busy}
-                className="rounded bg-slate-900 px-3 py-2 text-sm text-white hover:bg-slate-800 disabled:opacity-50"
-                onClick={async () => {
-                  setBusy(true);
-                  setError(null);
-                  try {
-                    const blocked_words = blockedWordsText
-                      .split(/\r?\n/)
-                      .map((item) => item.trim())
-                      .filter(Boolean);
-                    const saved = await fetchJson<ReviewSettings>(`${ORCHESTRATOR_URL}/settings/review`, {
-                      method: "PUT",
-                      headers: { "Content-Type": "application/json" },
-                      body: JSON.stringify({
-                        enabled,
-                        blocked_words,
-                        ai_rules: aiRules,
-                      }),
-                    });
-                    setSettings(saved);
-                    setBlockedWordsText((saved.blocked_words ?? []).join("\n"));
-                    setAiRules(saved.ai_rules || "");
-                  } catch (e: unknown) {
-                    setError(e instanceof Error ? e.message : String(e));
-                  } finally {
-                    setBusy(false);
-                  }
-                }}
-              >
-                {busy ? "保存中…" : "保存"}
-              </button>
-            </div>
           </>
         ) : null}
-      </div>
+      </Section>
+      <SettingsSaveBar
+        dirty={isDirty}
+        busy={busy}
+        onSave={saveReviewSettings}
+        onDiscard={() => {
+          if (!settings) return;
+          setEnabled(Boolean(settings.enabled));
+          setBlockedWordsText((settings.blocked_words ?? []).join("\n"));
+          setAiRules(settings.ai_rules || "");
+          setError(null);
+        }}
+        dirtyLabel="有未保存的审核规则"
+      />
     </div>
   );
 }

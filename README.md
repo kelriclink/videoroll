@@ -77,7 +77,7 @@ ENV_FILE=/path/to/production.env INCLUDE_BASE_IMAGES=1 ./scripts/build_export_pr
 ```bash
 sha256sum -c videoroll-prod-bundle-*.tar.sha256
 docker load -i videoroll-prod-bundle-*.tar
-docker compose --env-file .env up -d --no-build --remove-orphans
+./scripts/prod_compose.sh up -d --no-build --remove-orphans
 ```
 
 不要覆盖已有的 `STORAGE_HOST_ROOT`、`data/models`、`data/secrets` 或 `data/redis`；数据库连接也应保留。完整上线、GPU 和回退步骤见[部署指南](docs/DEPLOYMENT.md)。
@@ -96,6 +96,11 @@ docker compose --env-file .env up -d --no-build --remove-orphans
 | `SUBTITLE_ASR_ENGINE=openvino` | Intel GPU ASR 使用 OpenVINO。 |
 | `SUBTITLE_OPENVINO_DEVICE=GPU` | Intel GPU OpenVINO 设备名。 |
 | `INTEL_GPU_RENDER_GID` | 宿主机 `/dev/dri/renderD128` 的组 ID。 |
+
+生产环境统一通过 `scripts/prod_compose.sh` 调用 Compose。脚本在检测到
+`/dev/dri/renderD128` 且配置使用 OpenVINO/Intel GPU 时，会自动合并
+`docker-compose.intel.yml`，避免普通 `docker compose up` 重建容器后丢失
+`/dev/dri` 和 render 组权限。
 
 从[.env.example](.env.example)开始配置；真实密钥、Cookie、数据库密码和 `data/secrets/fernet.key` 永远不能提交到 Git。
 

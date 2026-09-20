@@ -1,6 +1,8 @@
 import { Link } from "react-router-dom";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useConfirm } from "../components/feedbackContext";
+import { Button, SettingsSaveBar } from "../components/ui";
+import { useUnsavedChangesGuard } from "../hooks/useUnsavedChangesGuard";
 import { fetchJson } from "../lib/http";
 import { ORCHESTRATOR_URL } from "../lib/urls";
 
@@ -66,8 +68,47 @@ function normalizeYouTubeSubtitleMode(value: unknown, legacyPrefer?: boolean | n
   return "target";
 }
 
+function autoProfileSnapshotFromServer(profile: AutoProfile, enabledPlatforms: PublishPlatform[] | null): string {
+  const formats = Array.isArray(profile.formats) ? profile.formats : [];
+  const platforms = Array.isArray(profile.auto_publish_platforms) ? profile.auto_publish_platforms : [];
+  return JSON.stringify({
+    formats: { srt: formats.includes("srt"), ass: formats.includes("ass") },
+    burnIn: Boolean(profile.burn_in),
+    softSub: Boolean(profile.soft_sub),
+    assStyle: profile.ass_style || "clean_white",
+    videoCodec: (profile.video_codec || "av1").toLowerCase(),
+    useIntelGpu: Boolean(profile.use_intel_gpu),
+    videoPresetText: typeof profile.video_preset === "string" ? profile.video_preset : "",
+    videoCrfText: typeof profile.video_crf === "number" ? String(profile.video_crf) : "",
+    primaryFontScalePercentText:
+      typeof profile.primary_font_scale_percent === "number" ? String(profile.primary_font_scale_percent) : "100",
+    secondaryFontScalePercentText:
+      typeof profile.secondary_font_scale_percent === "number" ? String(profile.secondary_font_scale_percent) : "100",
+    asrEngine: profile.asr_engine || "auto",
+    asrLanguage: profile.asr_language || "auto",
+    asrModel: (profile.asr_model ?? "").trim(),
+    youtubeSubtitleMode: normalizeYouTubeSubtitleMode(profile.youtube_subtitle_mode, profile.prefer_youtube_subtitles),
+    translateEnabled: Boolean(profile.translate_enabled),
+    bilingual: Boolean(profile.bilingual),
+    targetLang: profile.target_lang || "zh",
+    translateProvider: profile.translate_provider || "openai",
+    translateStyle: profile.translate_style || "口语自然",
+    translateEnableSummary: Boolean(profile.translate_enable_summary),
+    autoPublish: Boolean(profile.auto_publish),
+    autoPublishPlatforms: platforms
+      .filter((platform) => enabledPlatforms === null || enabledPlatforms.includes(platform))
+      .sort(),
+    publishTypeidMode: (profile.publish_typeid_mode || "ai_summary").toLowerCase(),
+    publishTranslateTitle: Boolean(profile.publish_translate_title),
+    publishTitlePrefix: (profile.publish_title_prefix ?? "【熟肉】").trim() || "【熟肉】",
+    publishUseYouTubeCover: Boolean(profile.publish_use_youtube_cover),
+    publishEnableReprint: Boolean(profile.publish_enable_reprint),
+  });
+}
+
 export default function SettingsAutoPage() {
   const confirm = useConfirm();
+  const savedSnapshotRef = useRef("");
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -101,6 +142,7 @@ export default function SettingsAutoPage() {
 
   const [autoPublish, setAutoPublish] = useState(true);
   const [enabledPlatforms, setEnabledPlatforms] = useState<PublishPlatform[]>([]);
+  const [enabledPlatformsLoaded, setEnabledPlatformsLoaded] = useState(false);
   const [autoPublishPlatforms, setAutoPublishPlatforms] = useState<PublishPlatform[]>([]);
   const [publishTypeidMode, setPublishTypeidMode] = useState("ai_summary");
   const [publishTranslateTitle, setPublishTranslateTitle] = useState(true);
@@ -120,10 +162,11 @@ export default function SettingsAutoPage() {
 
       if (models) setWhisperModels(models);
       if (translateSettings) setOpenaiKeySet(Boolean(translateSettings.openai_api_key_set));
+      let enabledPlatformIds: PublishPlatform[] | null = null;
       if (platformSettingsResp?.platforms) {
-        setEnabledPlatforms(
-          PUBLISH_PLATFORMS.filter(({ id }) => platformSettingsResp.platforms[id] === true).map(({ id }) => id),
-        );
+        enabledPlatformIds = PUBLISH_PLATFORMS.filter(({ id }) => platformSettingsResp.platforms[id] === true).map(({ id }) => id);
+        setEnabledPlatforms(enabledPlatformIds);
+        setEnabledPlatformsLoaded(true);
       }
 
       const f = Array.isArray(profile.formats) ? profile.formats : [];
@@ -157,6 +200,7 @@ export default function SettingsAutoPage() {
       setPublishTitlePrefix((profile.publish_title_prefix ?? "【熟肉】").trim() || "【熟肉】");
       setPublishUseYouTubeCover(Boolean(profile.publish_use_youtube_cover));
       setPublishEnableReprint(Boolean(profile.publish_enable_reprint));
+      savedSnapshotRef.current = autoProfileSnapshotFromServer(profile, enabledPlatformIds);
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : String(e));
     }
@@ -174,6 +218,147 @@ export default function SettingsAutoPage() {
     () => [formats.srt ? "srt" : null, formats.ass ? "ass" : null].filter(Boolean) as string[],
     [formats],
   );
+
+  const currentSnapshot = JSON.stringify({
+    formats,
+    burnIn,
+    softSub,
+    assStyle,
+    videoCodec,
+    useIntelGpu,
+    videoPresetText,
+    videoCrfText,
+    primaryFontScalePercentText,
+    secondaryFontScalePercentText,
+    asrEngine,
+    asrLanguage,
+    asrModel: asrModel.trim(),
+    youtubeSubtitleMode,
+    translateEnabled,
+    bilingual,
+    targetLang,
+    translateProvider,
+    translateStyle,
+    translateEnableSummary,
+    autoPublish,
+    autoPublishPlatforms: [...(enabledPlatformsLoaded ? autoPublishPlatforms.filter((platform) => enabledPlatforms.includes(platform)) : autoPublishPlatforms)].sort(),
+    publishTypeidMode,
+    publishTranslateTitle,
+    publishTitlePrefix: publishTitlePrefix.trim() || "【熟肉】",
+    publishUseYouTubeCover,
+    publishEnableReprint,
+  });
+  const isDirty = Boolean(savedSnapshotRef.current) && savedSnapshotRef.current !== currentSnapshot;
+  useUnsavedChangesGuard(isDirty, { message: "离开当前页面会丢失尚未保存的自动模式配置。" });
+
+  async function saveProfile() {
+    setBusy(true);
+    setError(null);
+    try {
+      if (!formatsOut.length) throw new Error("至少选择一种输出格式");
+      const availableAutoPublishPlatforms = enabledPlatformsLoaded
+        ? autoPublishPlatforms.filter((platform) => enabledPlatforms.includes(platform))
+        : autoPublishPlatforms;
+      const crfRaw = videoCrfText.trim();
+      let video_crf: number | null = null;
+      if (crfRaw) {
+        const n = Number(crfRaw);
+        if (!Number.isFinite(n) || !Number.isInteger(n)) throw new Error("视频质量参数必须是整数");
+        video_crf = n;
+      }
+      const primary_font_scale_percent = Number(primaryFontScalePercentText.trim() || "100");
+      if (!Number.isFinite(primary_font_scale_percent) || !Number.isInteger(primary_font_scale_percent)) {
+        throw new Error("主字幕字号必须是整数百分比");
+      }
+      if (primary_font_scale_percent < 25 || primary_font_scale_percent > 300) {
+        throw new Error("主字幕字号百分比必须在 25~300 之间");
+      }
+      const secondary_font_scale_percent = Number(secondaryFontScalePercentText.trim() || "100");
+      if (!Number.isFinite(secondary_font_scale_percent) || !Number.isInteger(secondary_font_scale_percent)) {
+        throw new Error("辅字幕字号必须是整数百分比");
+      }
+      if (secondary_font_scale_percent < 25 || secondary_font_scale_percent > 300) {
+        throw new Error("辅字幕字号百分比必须在 25~300 之间");
+      }
+      const presetRaw = videoPresetText.trim();
+      await fetchJson(`${ORCHESTRATOR_URL}/subtitle/auto/profile`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          formats: formatsOut,
+          burn_in: burnIn,
+          soft_sub: softSub,
+          ass_style: assStyle,
+          video_codec: videoCodec,
+          use_intel_gpu: useIntelGpu,
+          video_preset: presetRaw ? presetRaw : null,
+          video_crf,
+          primary_font_scale_percent,
+          secondary_font_scale_percent,
+          asr_engine: asrEngine,
+          asr_language: asrLanguage,
+          asr_model: asrModel.trim() ? asrModel.trim() : "",
+          prefer_youtube_subtitles: youtubeSubtitleMode !== "off",
+          youtube_subtitle_mode: youtubeSubtitleMode,
+          translate_enabled: translateEnabled,
+          translate_provider: translateProvider,
+          target_lang: targetLang,
+          translate_style: translateStyle,
+          translate_enable_summary: translateEnableSummary,
+          bilingual,
+          auto_publish: autoPublish,
+          auto_publish_platforms: availableAutoPublishPlatforms,
+          publish_typeid_mode: publishTypeidMode,
+          publish_title_prefix: publishTitlePrefix,
+          publish_translate_title: publishTranslateTitle,
+          publish_use_youtube_cover: publishUseYouTubeCover,
+          publish_enable_reprint: publishEnableReprint,
+        }),
+      });
+      await refresh();
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function restoreDefaults() {
+    const ok = await confirm({
+      title: "恢复默认配置",
+      message: "恢复默认只修改当前表单，仍需点击保存才会写入后端。",
+      confirmLabel: "恢复默认",
+      tone: "warning",
+    });
+    if (!ok) return;
+    setFormats({ srt: true, ass: true });
+    setBurnIn(true);
+    setSoftSub(false);
+    setAssStyle("clean_white");
+    setVideoCodec("av1");
+    setUseIntelGpu(false);
+    setVideoPresetText("");
+    setVideoCrfText("");
+    setPrimaryFontScalePercentText("100");
+    setSecondaryFontScalePercentText("100");
+    setAsrEngine("auto");
+    setAsrLanguage("auto");
+    setAsrModel("");
+    setYouTubeSubtitleMode("target");
+    setTranslateEnabled(true);
+    setBilingual(false);
+    setTargetLang("zh");
+    setTranslateProvider("openai");
+    setTranslateStyle("口语自然");
+    setTranslateEnableSummary(true);
+    setAutoPublish(true);
+    setAutoPublishPlatforms([]);
+    setPublishTypeidMode("ai_summary");
+    setPublishTranslateTitle(true);
+    setPublishTitlePrefix("【熟肉】");
+    setPublishUseYouTubeCover(true);
+    setPublishEnableReprint(true);
+  }
 
   async function detectIntelHardware() {
     setIntelProbeBusy(true);
@@ -208,7 +393,7 @@ export default function SettingsAutoPage() {
           </button>
         </div>
 
-        <div className="mt-3 grid gap-3 md:grid-cols-2">
+        <div className="mt-3 grid gap-3 lg:grid-cols-2">
           <div className="rounded border p-3">
             <div className="text-xs text-slate-500">输出格式</div>
             <div className="mt-2 flex items-center gap-3 text-sm">
@@ -241,7 +426,7 @@ export default function SettingsAutoPage() {
             </div>
             <div className="mt-3">
               <label className="block">
-                <div className="mb-1 text-xs text-slate-600">video_codec（硬字幕输出编码）</div>
+                <div className="mb-1 text-xs text-slate-600">视频编码</div>
                 <select className="w-full rounded border px-3 py-2 text-sm" value={videoCodec} onChange={(e) => setVideoCodec(e.target.value)}>
                   <option value="av1">av1（体积更小，编码更慢）</option>
                   <option value="h264">h264（兼容更好，编码更快）</option>
@@ -300,7 +485,7 @@ export default function SettingsAutoPage() {
             <div className="mt-3">
               <label className="block">
                 <div className="mb-1 text-xs text-slate-600">
-                  {useIntelGpu ? "视频质量（Intel QP/global_quality；兼容字段 video_crf）" : "video_crf（软件编码；可选：留空=默认）"}
+                  {useIntelGpu ? "视频质量（Intel QP / global_quality）" : "视频质量（CRF，可留空使用默认值）"}
                 </div>
                 <input
                   className="w-full rounded border px-3 py-2 text-sm"
@@ -325,7 +510,7 @@ export default function SettingsAutoPage() {
             </div>
             <div className="mt-3">
               <label className="block">
-                <div className="mb-1 text-xs text-slate-600">video_preset（可选：留空=默认）</div>
+                <div className="mb-1 text-xs text-slate-600">编码预设（可选）</div>
                 <input
                   className="w-full rounded border px-3 py-2 text-sm"
                   value={videoPresetText}
@@ -345,7 +530,7 @@ export default function SettingsAutoPage() {
                 提示：CPU h264 可用 ultrafast..veryslow；CPU av1（SVT）为 0..13。Intel GPU 开启时，h264 文本 preset 和 av1 的 0..13 都会映射到 VAAPI quality。
               </div>
             </div>
-            <div className="mt-3 grid gap-3 md:grid-cols-2">
+            <div className="mt-3 grid gap-3 lg:grid-cols-2">
               <label className="block">
                 <div className="mb-1 text-xs text-slate-600">主字幕字号（%）</div>
                 <input
@@ -376,7 +561,7 @@ export default function SettingsAutoPage() {
             </div>
             <div className="mt-3">
               <label className="block">
-                <div className="mb-1 text-xs text-slate-600">ass_style</div>
+                <div className="mb-1 text-xs text-slate-600">字幕样式</div>
                 <select className="w-full rounded border px-3 py-2 text-sm" value={assStyle} onChange={(e) => setAssStyle(e.target.value)}>
                   <option value="clean_white">clean_white</option>
                 </select>
@@ -408,13 +593,13 @@ export default function SettingsAutoPage() {
                 双语
               </label>
             </div>
-            <div className="mt-3 grid gap-2 md:grid-cols-2">
+            <div className="mt-3 grid gap-2 lg:grid-cols-2">
               <label className="block">
-                <div className="mb-1 text-xs text-slate-600">target_lang</div>
+                <div className="mb-1 text-xs text-slate-600">目标语言</div>
                 <input className="w-full rounded border px-3 py-2 text-sm" value={targetLang} onChange={(e) => setTargetLang(e.target.value)} />
               </label>
               <label className="block">
-                <div className="mb-1 text-xs text-slate-600">provider</div>
+                <div className="mb-1 text-xs text-slate-600">翻译 Provider</div>
                 <select className="w-full rounded border px-3 py-2 text-sm" value={translateProvider} onChange={(e) => setTranslateProvider(e.target.value)}>
                   <option value="mock">mock</option>
                   <option value="noop">noop</option>
@@ -422,8 +607,8 @@ export default function SettingsAutoPage() {
                 </select>
               </label>
 
-              <label className="block md:col-span-2">
-                <div className="mb-1 text-xs text-slate-600">style</div>
+              <label className="block lg:col-span-2">
+                <div className="mb-1 text-xs text-slate-600">翻译风格</div>
                 <select className="w-full rounded border px-3 py-2 text-sm" value={translateStyle} onChange={(e) => setTranslateStyle(e.target.value)}>
                   <option value="口语自然">口语自然</option>
                   <option value="正式严谨">正式严谨</option>
@@ -431,17 +616,17 @@ export default function SettingsAutoPage() {
                 </select>
               </label>
 
-              <label className="flex items-center gap-2 text-sm md:col-span-2">
+              <label className="flex items-center gap-2 text-sm lg:col-span-2">
                 <input
                   type="checkbox"
                   checked={translateEnableSummary}
                   onChange={(e) => setTranslateEnableSummary(e.target.checked)}
                   disabled={translateProvider !== "openai"}
                 />
-                dynamic summary（仅 openai）
+                启用动态摘要上下文（仅 OpenAI）
               </label>
 
-              <div className="md:col-span-2 text-xs text-slate-500">
+              <div className="lg:col-span-2 text-xs text-slate-500">
                 {youtubeSubtitleMode === "off"
                   ? "逻辑：不复用 YouTube 字幕，直接进入 ASR；若启用翻译，则在 ASR 结果上继续翻译。"
                   : youtubeSubtitleMode === "auto_source"
@@ -450,18 +635,18 @@ export default function SettingsAutoPage() {
               </div>
 
               {translateEnabled && translateProvider === "openai" && openaiKeySet === false ? (
-                <div className="md:col-span-2 text-xs text-rose-700">
+                <div className="lg:col-span-2 text-xs text-rose-700">
                   OpenAI API Key 未设置，请先到 <Link className="underline" to="/settings/translate">翻译 / RAG 设置</Link> 保存配置。
                 </div>
               ) : null}
             </div>
           </div>
 
-          <div className="rounded border p-3 md:col-span-2">
+          <div className="rounded border p-3 lg:col-span-2">
             <div className="text-xs text-slate-500">ASR（语音识别）</div>
-            <div className="mt-3 grid gap-2 md:grid-cols-2">
+            <div className="mt-3 grid gap-2 lg:grid-cols-2">
               <label className="block">
-                <div className="mb-1 text-xs text-slate-600">engine</div>
+                <div className="mb-1 text-xs text-slate-600">ASR 引擎</div>
                 <select className="w-full rounded border px-3 py-2 text-sm" value={asrEngine} onChange={(e) => setAsrEngine(e.target.value)}>
                   <option value="auto">auto（使用后端默认）</option>
                   <option value="mock">mock</option>
@@ -473,11 +658,11 @@ export default function SettingsAutoPage() {
                 </select>
               </label>
               <label className="block">
-                <div className="mb-1 text-xs text-slate-600">language</div>
+                <div className="mb-1 text-xs text-slate-600">识别语言</div>
                 <input className="w-full rounded border px-3 py-2 text-sm" value={asrLanguage} onChange={(e) => setAsrLanguage(e.target.value)} placeholder="auto / zh / en ..." />
               </label>
-              <label className="block md:col-span-2">
-                <div className="mb-1 text-xs text-slate-600">model（可选：本地模型目录路径）</div>
+              <label className="block lg:col-span-2">
+                <div className="mb-1 text-xs text-slate-600">ASR 模型（可选）</div>
                 <select className="w-full rounded border px-3 py-2 text-sm" value={asrModel} onChange={(e) => setAsrModel(e.target.value)}>
                   <option value="">(use default)</option>
                   {asrEngine === "cloudflare-workers-ai" ? (
@@ -508,12 +693,12 @@ export default function SettingsAutoPage() {
           {enabledPlatforms.length === 0 && (
             <div className="mt-1 text-xs text-amber-600">未启用任何投稿平台，请先到投稿设置中勾选</div>
           )}
-          <div className="mt-2 grid gap-2 md:grid-cols-2">
+          <div className="mt-2 grid gap-2 lg:grid-cols-2">
             <label className="flex items-center gap-2 text-sm">
               <input type="checkbox" checked={autoPublish} onChange={(e) => setAutoPublish(e.target.checked)} />
               自动投稿
             </label>
-            <div className="md:col-span-2">
+            <div className="lg:col-span-2">
               <div className="mb-2 text-xs text-slate-600">自动投稿通道</div>
               <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
                 {PUBLISH_PLATFORMS.map(({ id, label }) => {
@@ -560,8 +745,8 @@ export default function SettingsAutoPage() {
               />
               使用 YouTube 封面
             </label>
-            <label className="block md:col-span-2">
-              <div className="mb-1 text-xs text-slate-600">分区模式（typeid_mode）</div>
+            <label className="block lg:col-span-2">
+              <div className="mb-1 text-xs text-slate-600">投稿分区策略</div>
               <select
                 className="w-full rounded border px-3 py-2 text-sm"
                 value={publishTypeidMode}
@@ -605,127 +790,6 @@ export default function SettingsAutoPage() {
           </div>
         </div>
 
-        <div className="mt-3 flex flex-wrap items-center gap-2">
-          <button
-            disabled={busy}
-            className="rounded bg-slate-900 px-3 py-2 text-sm text-white hover:bg-slate-800 disabled:opacity-50"
-            onClick={async () => {
-              setBusy(true);
-              setError(null);
-              try {
-                if (!formatsOut.length) throw new Error("至少选择一种输出格式");
-                const availableAutoPublishPlatforms = autoPublishPlatforms.filter((platform) => enabledPlatforms.includes(platform));
-                const crfRaw = videoCrfText.trim();
-                let video_crf: number | null = null;
-                if (crfRaw) {
-                  const n = Number(crfRaw);
-                  if (!Number.isFinite(n) || !Number.isInteger(n)) throw new Error("视频质量参数必须是整数");
-                  video_crf = n;
-                }
-                const primaryFontScaleRaw = primaryFontScalePercentText.trim();
-                const primary_font_scale_percent = Number(primaryFontScaleRaw || "100");
-                if (!Number.isFinite(primary_font_scale_percent) || !Number.isInteger(primary_font_scale_percent)) {
-                  throw new Error("主字幕字号必须是整数百分比");
-                }
-                if (primary_font_scale_percent < 25 || primary_font_scale_percent > 300) {
-                  throw new Error("主字幕字号百分比必须在 25~300 之间");
-                }
-                const secondaryFontScaleRaw = secondaryFontScalePercentText.trim();
-                const secondary_font_scale_percent = Number(secondaryFontScaleRaw || "100");
-                if (!Number.isFinite(secondary_font_scale_percent) || !Number.isInteger(secondary_font_scale_percent)) {
-                  throw new Error("辅字幕字号必须是整数百分比");
-                }
-                if (secondary_font_scale_percent < 25 || secondary_font_scale_percent > 300) {
-                  throw new Error("辅字幕字号百分比必须在 25~300 之间");
-                }
-                const presetRaw = videoPresetText.trim();
-                await fetchJson(`${ORCHESTRATOR_URL}/subtitle/auto/profile`, {
-                  method: "PUT",
-                  headers: { "Content-Type": "application/json" },
-                  body: JSON.stringify({
-                    formats: formatsOut,
-                    burn_in: burnIn,
-                    soft_sub: softSub,
-                    ass_style: assStyle,
-                    video_codec: videoCodec,
-                    use_intel_gpu: useIntelGpu,
-                    video_preset: presetRaw ? presetRaw : null,
-                    video_crf,
-                    primary_font_scale_percent,
-                    secondary_font_scale_percent,
-                    asr_engine: asrEngine,
-                    asr_language: asrLanguage,
-                    asr_model: asrModel.trim() ? asrModel.trim() : "",
-                    prefer_youtube_subtitles: youtubeSubtitleMode !== "off",
-                    youtube_subtitle_mode: youtubeSubtitleMode,
-                    translate_enabled: translateEnabled,
-                    translate_provider: translateProvider,
-                    target_lang: targetLang,
-                    translate_style: translateStyle,
-                    translate_enable_summary: translateEnableSummary,
-                    bilingual,
-                    auto_publish: autoPublish,
-                    auto_publish_platforms: availableAutoPublishPlatforms,
-                    publish_typeid_mode: publishTypeidMode,
-                    publish_title_prefix: publishTitlePrefix,
-                    publish_translate_title: publishTranslateTitle,
-                    publish_use_youtube_cover: publishUseYouTubeCover,
-                    publish_enable_reprint: publishEnableReprint,
-                  }),
-                });
-                await refresh();
-              } catch (e: unknown) {
-                setError(e instanceof Error ? e.message : String(e));
-              } finally {
-                setBusy(false);
-              }
-            }}
-          >
-            {busy ? "保存中…" : "保存"}
-          </button>
-
-          <button
-            disabled={busy}
-            className="rounded border px-3 py-2 text-sm hover:bg-slate-50 disabled:opacity-50"
-            onClick={async () => {
-              const ok = await confirm({
-                title: "恢复默认配置",
-                message: "确定恢复默认配置吗？当前页面中尚未保存的修改会被覆盖。",
-                confirmLabel: "恢复默认",
-                tone: "warning",
-              });
-              if (!ok) return;
-              setFormats({ srt: true, ass: true });
-              setBurnIn(true);
-              setSoftSub(false);
-              setAssStyle("clean_white");
-              setVideoCodec("av1");
-              setVideoPresetText("");
-              setVideoCrfText("");
-              setPrimaryFontScalePercentText("100");
-              setSecondaryFontScalePercentText("100");
-              setAsrEngine("auto");
-              setAsrLanguage("auto");
-              setAsrModel("");
-              setYouTubeSubtitleMode("target");
-              setTranslateEnabled(true);
-              setBilingual(false);
-              setTargetLang("zh");
-              setTranslateProvider("openai");
-              setTranslateStyle("口语自然");
-              setTranslateEnableSummary(true);
-              setAutoPublish(true);
-              setAutoPublishPlatforms([]);
-              setPublishTypeidMode("ai_summary");
-              setPublishTranslateTitle(true);
-              setPublishTitlePrefix("【熟肉】");
-              setPublishUseYouTubeCover(true);
-              setPublishEnableReprint(true);
-            }}
-          >
-            恢复默认（未保存）
-          </button>
-        </div>
       </div>
 
       <div className="rounded-lg border border-slate-200 bg-slate-50 p-4 text-xs text-slate-600">
@@ -737,6 +801,17 @@ export default function SettingsAutoPage() {
           - ASR 默认模型在 <Link className="underline" to="/settings/asr">ASR 设置</Link> 配置。
         </div>
       </div>
+      <SettingsSaveBar
+        dirty={isDirty}
+        busy={busy}
+        onSave={saveProfile}
+        onDiscard={() => void refresh()}
+        extraActions={
+          <Button tone="warning" disabled={busy} onClick={() => void restoreDefaults()}>
+            恢复默认
+          </Button>
+        }
+      />
     </div>
   );
 }

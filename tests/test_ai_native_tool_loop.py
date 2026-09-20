@@ -51,9 +51,11 @@ def test_openai_tool_turn_uses_native_chat_protocol() -> None:
                 }
             ],
             client=client,
+            max_completion_tokens=123,
         )
 
     assert captured["tool_choice"] == "auto"
+    assert captured["max_completion_tokens"] == 123
     assert captured["tools"][0]["function"]["name"] == "search_web"  # type: ignore[index]
     assert turn.tool_calls[0].id == "call-search"
     assert turn.tool_calls[0].arguments == {"query": "VGA red signal"}

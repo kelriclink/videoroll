@@ -1,33 +1,15 @@
 import type { SettingsTranslateController } from "../useSettingsTranslateController";
-import { Button, DataTable, Section } from "../../../components/ui";
+import { DataTable, Section } from "../../../components/ui";
 import { csvItems, SEARXNG_CATEGORY_PRESETS, SEARXNG_ENGINE_PRESETS, toggleCsvItem } from "../form";
 export function RagTab({ controller }: { controller: SettingsTranslateController }) {
   const {
-    settings,
     agentSkills,
-    busy,
     ragEnabled,
     setRagEnabled,
     ragTopK,
     setRagTopK,
     ragMinScore,
     setRagMinScore,
-    ragEmbeddingProvider,
-    setRagEmbeddingProvider,
-    ragEmbeddingModel,
-    setRagEmbeddingModel,
-    ragEmbeddingDimensions,
-    setRagEmbeddingDimensions,
-    ragEmbeddingModelDir,
-    setRagEmbeddingModelDir,
-    ragEmbeddingDevice,
-    setRagEmbeddingDevice,
-    ragEmbeddingApiKey,
-    setRagEmbeddingApiKey,
-    ragEmbeddingBaseUrl,
-    setRagEmbeddingBaseUrl,
-    ragEmbeddingTimeoutSeconds,
-    setRagEmbeddingTimeoutSeconds,
     ragAutoDiscoverTerms,
     setRagAutoDiscoverTerms,
     ragAutoLearnTerms,
@@ -71,16 +53,14 @@ export function RagTab({ controller }: { controller: SettingsTranslateController
     ragAgentBuiltinSkillsEnabled,
     setRagAgentBuiltinSkillsEnabled,
     ragAgentUserSkillsEnabled,
-    setRagAgentUserSkillsEnabled,
-    embeddingTestResult,
-    embeddingRebuildResult,
-    rebuildKnowledgeEmbeddings,
-    testEmbedding
+    setRagAgentUserSkillsEnabled
   } = controller;
   return (
 <Section>
-        <div className="text-sm font-semibold text-slate-900">RAG / pgvector</div>
-        <div className="mt-3 grid gap-3 md:grid-cols-2">
+        <div className="text-sm font-semibold text-slate-900">RAG Agent</div>
+        <div className="mt-1 text-xs text-slate-500">控制术语研究、词典证据、Agent Skills 与外部搜索。Embedding 单独在 Embedding 页配置。</div>
+        <div className="mt-3 grid gap-3 lg:grid-cols-2">
+          <div className="lg:col-span-2 border-b border-slate-100 pb-2 text-xs font-semibold uppercase tracking-wide text-slate-400">基础与术语</div>
           <label className="flex items-center gap-2 text-sm">
             <input type="checkbox" checked={ragEnabled} onChange={(e) => setRagEnabled(e.target.checked)} />
             启用 RAG 翻译增强
@@ -125,6 +105,7 @@ export function RagTab({ controller }: { controller: SettingsTranslateController
             <div className="mb-1 text-xs text-slate-600">rag_dictionary_min_quality</div>
             <input type="number" step="0.01" min={0} max={1} className="w-full rounded border px-3 py-2 text-sm" value={ragDictionaryMinQuality} onChange={(e) => setRagDictionaryMinQuality(parseFloat(e.target.value || "0"))} />
           </label>
+          <div className="lg:col-span-2 mt-1 border-b border-slate-100 pb-2 text-xs font-semibold uppercase tracking-wide text-slate-400">Agent</div>
           <label className="block">
             <div className="mb-1 text-xs text-slate-600">rag_agent_parallelism</div>
             <input type="number" min={1} max={8} className="w-full rounded border px-3 py-2 text-sm" value={ragAgentParallelism} onChange={(e) => setRagAgentParallelism(parseInt(e.target.value || "1", 10))} />
@@ -135,7 +116,7 @@ export function RagTab({ controller }: { controller: SettingsTranslateController
             <input type="number" min={10} max={900} className="w-full rounded border px-3 py-2 text-sm" value={ragAgentTimeoutSeconds} onChange={(e) => setRagAgentTimeoutSeconds(parseFloat(e.target.value || "120"))} />
             <div className="mt-1 text-xs text-slate-500">并行 agent 等待预算，超时后继续翻译。</div>
           </label>
-          <div className="md:col-span-2 rounded-md border border-slate-200 p-3">
+          <div className="lg:col-span-2 rounded-md border border-slate-200 p-3">
             <div className="flex flex-wrap items-center justify-between gap-3">
               <div>
                 <div className="text-sm font-semibold text-slate-900">Agent Skills</div>
@@ -143,7 +124,7 @@ export function RagTab({ controller }: { controller: SettingsTranslateController
               </div>
               <div className="text-xs text-slate-500">{agentSkills.length} skills</div>
             </div>
-            <div className="mt-3 grid gap-2 md:grid-cols-3">
+            <div className="mt-3 grid gap-2 lg:grid-cols-3">
               <label className="flex items-center gap-2 text-sm">
                 <input type="checkbox" checked={ragAgentSkillsEnabled} onChange={(e) => setRagAgentSkillsEnabled(e.target.checked)} />
                 启用 Agent Skills
@@ -189,70 +170,7 @@ export function RagTab({ controller }: { controller: SettingsTranslateController
               )}
             </div>
           </div>
-          <label className="block">
-            <div className="mb-1 text-xs text-slate-600">embedding_model</div>
-            <input className="w-full rounded border px-3 py-2 text-sm" value={ragEmbeddingModel} onChange={(e) => setRagEmbeddingModel(e.target.value)} />
-          </label>
-          <label className="block">
-            <div className="mb-1 text-xs text-slate-600">embedding_provider</div>
-            <select
-              className="w-full rounded border px-3 py-2 text-sm"
-              value={ragEmbeddingProvider}
-              onChange={(e) => {
-                const provider = e.target.value;
-                setRagEmbeddingProvider(provider);
-                if (provider === "local" && ragEmbeddingModel === "text-embedding-3-small") {
-                  setRagEmbeddingModel("BAAI/bge-small-zh-v1.5");
-                  setRagEmbeddingDimensions(512);
-                }
-                if (provider === "openai" && ragEmbeddingModel === "BAAI/bge-small-zh-v1.5") {
-                  setRagEmbeddingModel("text-embedding-3-small");
-                  setRagEmbeddingDimensions(1536);
-                }
-              }}
-            >
-              <option value="openai">openai</option>
-              <option value="local">local</option>
-            </select>
-          </label>
-          <label className="block">
-            <div className="mb-1 text-xs text-slate-600">embedding_dimensions</div>
-            <input type="number" min={1} max={4096} className="w-full rounded border px-3 py-2 text-sm" value={ragEmbeddingDimensions} onChange={(e) => setRagEmbeddingDimensions(parseInt(e.target.value || "1536", 10))} />
-          </label>
-          {ragEmbeddingProvider === "openai" ? (
-            <>
-              <label className="block md:col-span-2">
-                <div className="mb-1 text-xs text-slate-600">embedding_api_key（独立于翻译 API Key，不回显）</div>
-                <input
-                  type="password"
-                  className="w-full rounded border px-3 py-2 text-sm"
-                  placeholder={settings?.rag_embedding_api_key_set ? "已设置（留空则不修改）" : "embedding API key"}
-                  value={ragEmbeddingApiKey}
-                  onChange={(e) => setRagEmbeddingApiKey(e.target.value)}
-                />
-              </label>
-              <label className="block md:col-span-2">
-                <div className="mb-1 text-xs text-slate-600">embedding_base_url（独立于翻译 base URL）</div>
-                <input className="w-full rounded border px-3 py-2 text-sm" value={ragEmbeddingBaseUrl} onChange={(e) => setRagEmbeddingBaseUrl(e.target.value)} />
-              </label>
-              <label className="block">
-                <div className="mb-1 text-xs text-slate-600">embedding_timeout_seconds</div>
-                <input type="number" min={1} className="w-full rounded border px-3 py-2 text-sm" value={ragEmbeddingTimeoutSeconds} onChange={(e) => setRagEmbeddingTimeoutSeconds(parseFloat(e.target.value || "1"))} />
-              </label>
-            </>
-          ) : null}
-          <label className="block">
-            <div className="mb-1 text-xs text-slate-600">embedding_device</div>
-            <select className="w-full rounded border px-3 py-2 text-sm" value={ragEmbeddingDevice} onChange={(e) => setRagEmbeddingDevice(e.target.value)}>
-              <option value="cpu">CPU（PyTorch）</option>
-              <option value="openvino:CPU">CPU（OpenVINO）</option>
-              <option value="openvino:GPU">Intel GPU（OpenVINO）</option>
-            </select>
-          </label>
-          <label className="block md:col-span-2">
-            <div className="mb-1 text-xs text-slate-600">embedding_model_dir</div>
-            <input className="w-full rounded border px-3 py-2 text-sm" value={ragEmbeddingModelDir} onChange={(e) => setRagEmbeddingModelDir(e.target.value)} />
-          </label>
+          <div className="lg:col-span-2 mt-1 border-b border-slate-100 pb-2 text-xs font-semibold uppercase tracking-wide text-slate-400">Web research</div>
           <label className="block">
             <div className="mb-1 text-xs text-slate-600">domain</div>
             <input className="w-full rounded border px-3 py-2 text-sm" placeholder="例如 Minecraft / CS2 / Anime" value={ragDomain} onChange={(e) => setRagDomain(e.target.value)} />
@@ -261,7 +179,7 @@ export function RagTab({ controller }: { controller: SettingsTranslateController
             <div className="mb-1 text-xs text-slate-600">SearXNG Base URL</div>
             <input className="w-full rounded border px-3 py-2 text-sm" placeholder="https://search.linvk.com" value={ragSearchUrl} onChange={(e) => setRagSearchUrl(e.target.value)} />
           </label>
-          <div className="block md:col-span-2">
+          <div className="block lg:col-span-2">
             <div className="mb-1 text-xs text-slate-600">SearXNG categories</div>
             <input className="w-full rounded border px-3 py-2 text-sm" value={ragSearchCategories} onChange={(e) => setRagSearchCategories(e.target.value)} />
             <div className="mt-2 flex flex-wrap gap-1.5">
@@ -280,7 +198,7 @@ export function RagTab({ controller }: { controller: SettingsTranslateController
               })}
             </div>
           </div>
-          <div className="block md:col-span-2">
+          <div className="block lg:col-span-2">
             <div className="mb-1 text-xs text-slate-600">SearXNG engines</div>
             <input className="w-full rounded border px-3 py-2 text-sm" placeholder="留空则使用实例默认引擎" value={ragSearchEngines} onChange={(e) => setRagSearchEngines(e.target.value)} />
             <div className="mt-2 flex flex-wrap gap-1.5">
@@ -299,7 +217,7 @@ export function RagTab({ controller }: { controller: SettingsTranslateController
               })}
             </div>
           </div>
-          <label className="block md:col-span-2">
+          <label className="block lg:col-span-2">
             <div className="mb-1 text-xs text-slate-600">SearXNG fallback_engines</div>
             <input className="w-full rounded border px-3 py-2 text-sm" value={ragSearchFallbackEngines} onChange={(e) => setRagSearchFallbackEngines(e.target.value)} />
           </label>
@@ -335,12 +253,6 @@ export function RagTab({ controller }: { controller: SettingsTranslateController
             <div className="mb-1 text-xs text-slate-600">SearXNG pageno</div>
             <input type="number" min={1} max={100} className="w-full rounded border px-3 py-2 text-sm" value={ragSearchPageno} onChange={(e) => setRagSearchPageno(parseInt(e.target.value || "1", 10))} />
           </label>
-        </div>
-        <div className="mt-3 flex flex-wrap items-center gap-2">
-          <Button disabled={busy} onClick={testEmbedding}>测试 Embedding</Button>
-          <Button tone="primary" disabled={busy} onClick={rebuildKnowledgeEmbeddings}>{busy ? "处理中..." : "重建知识库向量"}</Button>
-          {embeddingTestResult ? <div className="text-sm text-slate-700">{embeddingTestResult}</div> : null}
-          {embeddingRebuildResult ? <div className="text-sm text-slate-700">{embeddingRebuildResult}</div> : null}
         </div>
       </Section>
   );

@@ -12,7 +12,7 @@ export function SettingsTranslateHeader({ controller }: { controller: SettingsTr
       <div className="flex flex-col gap-3 px-1 sm:flex-row sm:items-start sm:justify-between">
         <div>
           <h2 className="text-xl font-semibold tracking-tight text-slate-950">翻译 / RAG</h2>
-          <div className="mt-1 text-sm text-slate-500">配置 OpenAI 翻译、RAG Gate、pgvector 和 embedding 模型。</div>
+          <div className="mt-1 text-sm text-slate-500">配置翻译模型、RAG Agent、Embedding 与诊断工具。</div>
         </div>
         <div className="flex items-center gap-2">
           <Link to="/knowledge" className="rounded-lg border border-slate-300 px-3 py-2 text-sm text-slate-700 hover:bg-white">

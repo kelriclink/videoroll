@@ -4,7 +4,7 @@ import shutil
 import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from videoroll.ai.client import OpenAIChatConfig, request_openai_embedding
 from videoroll.apps.subtitle_service.model_downloads import download_model_snapshot
@@ -224,14 +224,25 @@ def _normalize_vector(values: Any) -> list[float]:
     return [float(x) for x in raw]
 
 
-def embed_text(text: str, *, settings: EmbeddingSettings) -> list[float]:
+def embed_text(
+    text: str,
+    *,
+    settings: EmbeddingSettings,
+    before_request: Callable[[], None] | None = None,
+    cancel_check: Callable[[], None] | None = None,
+) -> list[float]:
     provider = normalize_embedding_provider(settings.provider)
     source = str(text or "").strip()
     if not source:
         raise ValueError("embedding text is empty")
 
     if provider == "openai":
-        return request_openai_embedding(config=settings.openai_config, text=source)
+        return request_openai_embedding(
+            config=settings.openai_config,
+            text=source,
+            before_request=before_request,
+            cancel_check=cancel_check,
+        )
 
     model_path = embedding_model_path(settings.model_dir, settings.model)
     backend, device = _parse_local_device(settings.device)

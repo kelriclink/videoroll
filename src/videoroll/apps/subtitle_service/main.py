@@ -23,6 +23,7 @@ from urllib.parse import urlsplit
 import httpx
 from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import ProgrammingError
 
@@ -78,6 +79,7 @@ from videoroll.apps.subtitle_service.schemas import (
     EmbeddingModelInfo,
     EmbeddingTestRequest,
     EmbeddingTestResponse,
+    EmbeddingRuntimeStatusRead,
     TaskQueueItemRead,
     TaskQueuePriorityUpdate,
     TaskQueueReorderRequest,
@@ -408,6 +410,17 @@ def get_intel_hardware_view(settings: SubtitleServiceSettings = Depends(get_sett
             "pci_id": None,
             "detail": str(e),
         }
+    openvino_devices: list[str] = []
+    openvino_error = ""
+    try:
+        import openvino as ov  # type: ignore
+
+        openvino_devices = [str(device) for device in ov.Core().available_devices]
+    except Exception as exc:
+        openvino_error = f"{type(exc).__name__}: {exc}"
+    info["openvino_devices"] = openvino_devices
+    info["openvino_gpu_available"] = any(device.upper().startswith("GPU") for device in openvino_devices)
+    info["openvino_error"] = openvino_error
     return IntelHardwareProbeRead(**info)
 
 
@@ -1603,6 +1616,127 @@ def test_embedding(
         expected_dimensions=expected,
         ok=len(vector) == expected,
     )
+
+
+@app.get("/subtitle/embedding/runtime", response_model=EmbeddingRuntimeStatusRead)
+def get_embedding_runtime_status(
+    settings: SubtitleServiceSettings = Depends(get_settings),
+    db: Session = Depends(get_db),
+) -> EmbeddingRuntimeStatusRead:
+    cfg = get_translate_settings(db, settings)
+    provider = str(cfg.get("rag_embedding_provider") or "").strip()
+    model = str(cfg.get("rag_embedding_model") or "").strip()
+    dimensions = max(1, int(cfg.get("rag_embedding_dimensions") or 1))
+    device = str(cfg.get("rag_embedding_device") or "").strip()
+    base = {
+        "provider": provider,
+        "model": model,
+        "configured_dimensions": dimensions,
+        "device": device,
+    }
+    try:
+        bind = db.get_bind()
+        if bind.dialect.name != "postgresql":
+            return EmbeddingRuntimeStatusRead(
+                **base,
+                supported=False,
+                search_mode="unavailable",
+                detail=f"runtime vector diagnostics require PostgreSQL/pgvector (current dialect: {bind.dialect.name})",
+            )
+
+        pgvector_version = str(
+            db.execute(text("SELECT COALESCE((SELECT extversion FROM pg_extension WHERE extname = 'vector'), '')")).scalar()
+            or ""
+        )
+        column_type = str(
+            db.execute(
+                text(
+                    """
+                    SELECT format_type(a.atttypid, a.atttypmod)
+                    FROM pg_attribute a
+                    JOIN pg_class t ON t.oid = a.attrelid
+                    JOIN pg_namespace n ON n.oid = t.relnamespace
+                    WHERE n.nspname = current_schema()
+                      AND t.relname = 'translation_knowledge_items'
+                      AND a.attname = 'embedding'
+                      AND NOT a.attisdropped
+                    """
+                )
+            ).scalar()
+            or ""
+        )
+        rows = db.execute(
+            text(
+                """
+                SELECT COALESCE(embedding_model, '') AS embedding_model,
+                       vector_dims(embedding) AS dimensions,
+                       COUNT(*) AS count
+                FROM translation_knowledge_items
+                WHERE embedding IS NOT NULL
+                GROUP BY 1, 2
+                ORDER BY count DESC, embedding_model, dimensions
+                """
+            )
+        ).all()
+        buckets = [
+            {"embedding_model": str(row[0] or ""), "dimensions": int(row[1]), "count": int(row[2])}
+            for row in rows
+        ]
+        total_embeddings = sum(bucket["count"] for bucket in buckets)
+        active_embeddings = sum(
+            bucket["count"]
+            for bucket in buckets
+            if bucket["dimensions"] == dimensions and (not model or bucket["embedding_model"] == model or bucket["embedding_model"].endswith(f":{model}"))
+        )
+        hnsw_rows = db.execute(
+            text(
+                """
+                SELECT indexname, indexdef
+                FROM pg_indexes
+                WHERE schemaname = current_schema()
+                  AND tablename = 'translation_knowledge_items'
+                  AND lower(indexdef) LIKE '% using hnsw %'
+                """
+            )
+        ).all()
+        hnsw_index_present = bool(hnsw_rows)
+        fixed_dimension_type = column_type.lower() == f"vector({dimensions})"
+        hnsw_usable = hnsw_index_present and fixed_dimension_type
+        detail = ""
+        if not pgvector_version:
+            detail = "pgvector extension is not installed"
+        elif not hnsw_usable:
+            if column_type.lower() == "vector":
+                detail = "embedding column has variable dimensions; current raw-vector HNSW query is unavailable"
+            elif hnsw_index_present:
+                detail = "HNSW index exists but does not match the configured vector dimension/query shape"
+            else:
+                detail = "no usable HNSW index for the current embedding query"
+        return EmbeddingRuntimeStatusRead(
+            **base,
+            supported=bool(pgvector_version),
+            pgvector_version=pgvector_version,
+            column_type=column_type,
+            total_embeddings=total_embeddings,
+            active_embeddings=active_embeddings,
+            buckets=buckets,
+            hnsw_index_present=hnsw_index_present,
+            hnsw_usable_for_current_query=hnsw_usable,
+            search_mode="hnsw" if hnsw_usable else ("exact_scan" if pgvector_version else "unavailable"),
+            detail=detail,
+        )
+    except Exception as exc:
+        logger.warning("embedding runtime diagnostics failed: %s", exc)
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        return EmbeddingRuntimeStatusRead(
+            **base,
+            supported=False,
+            search_mode="unavailable",
+            detail=f"{type(exc).__name__}: {exc}",
+        )
 
 
 @app.post("/subtitle/translate/test", response_model=TranslateTestResponse)

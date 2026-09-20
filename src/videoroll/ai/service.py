@@ -8,6 +8,7 @@ from videoroll.ai.prompts import (
     AIJsonPrompt,
     build_bilibili_tags_prompt,
     build_publish_review_prompt,
+    build_subtitle_repair_prompt,
     build_subtitle_translation_prompt,
     build_title_translation_prompt,
     build_text_translation_prompt,
@@ -166,6 +167,7 @@ class AIService:
         enable_summary: bool = True,
         glossary: dict[str, str] | None = None,
         rag_context: dict[str, Any] | None = None,
+        translation_plan: dict[str, Any] | None = None,
         network_retries: int = 3,
         enable_thinking: bool = False,
         on_thinking_delta: Callable[[str], None] | None = None,
@@ -180,10 +182,33 @@ class AIService:
                 enable_summary=enable_summary,
                 glossary=glossary,
                 rag_context=rag_context,
+                translation_plan=translation_plan,
                 network_retries=network_retries,
             ),
             enable_thinking=enable_thinking,
             on_thinking_delta=on_thinking_delta,
+        )
+
+    def repair_subtitle_batch(
+        self,
+        *,
+        source_blocks: list[dict[str, Any]],
+        draft_translations: list[dict[str, Any]],
+        issues: list[dict[str, Any]],
+        target_lang: str,
+        style: str,
+        translation_plan: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        return self._request_json_prompt(
+            "subtitle_translation_repair",
+            build_subtitle_repair_prompt(
+                source_blocks=source_blocks,
+                draft_translations=draft_translations,
+                issues=issues,
+                target_lang=target_lang,
+                style=style,
+                translation_plan=translation_plan,
+            ),
         )
 
     def generate_bilibili_tags(self, *, title: str, summary: str, transcript: str, n_tags: int = 6) -> list[str]:

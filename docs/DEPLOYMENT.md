@@ -147,27 +147,32 @@ ffplayout runtime 安装 Intel media/VPL 用户态组件，但 `ffmpeg -encoders
 5–10 秒 QSV/VAAPI encode smoke test；失败时保持 CPU encoder 可用并排查设备组、
 驱动和 runtime，不要把“encoder 名称存在”当作 GPU 验收通过。
 
-将 tar、同名 `.sha256`、生产 `docker-compose.yml`、私有 `.env`，以及 `scripts/prepare_prod_dirs.sh` 传到目标机，并保持脚本位于目标部署目录的 `scripts/` 子目录。目标机不需要其余源代码；不要传输开发机的 `data/`。首次启动前先执行 `sudo env ENV_FILE=.env ./scripts/prepare_prod_dirs.sh`，再执行下面的 `docker load` / `docker compose up` 流程。
+将 tar、同名 `.sha256`、生产 `docker-compose.yml`、`docker-compose.intel.yml`、
+私有 `.env`，以及 `scripts/prepare_prod_dirs.sh`、`scripts/prod_compose.sh`
+传到目标机，并保持脚本位于目标部署目录的 `scripts/` 子目录。目标机不需要其余
+源代码；不要传输开发机的 `data/`。首次启动前先执行
+`sudo env ENV_FILE=.env ./scripts/prepare_prod_dirs.sh`，再执行下面的
+`docker load` / Compose 流程。
 
 ```bash
 sha256sum -c videoroll-prod-bundle-<timestamp>.tar.sha256
 docker load -i videoroll-prod-bundle-<timestamp>.tar
-docker compose --env-file .env config -q
-docker compose --env-file .env up -d --no-build --remove-orphans
-docker compose --env-file .env ps
+./scripts/prod_compose.sh config -q
+./scripts/prod_compose.sh up -d --no-build --remove-orphans
+./scripts/prod_compose.sh ps
 ```
 
 如果这是从 MinIO 切换到共享文件系统的已有数据库，先执行一次 dry-run：
 
 ```bash
-docker compose --env-file .env run --rm orchestrator \
+./scripts/prod_compose.sh run --rm orchestrator \
   python -m videoroll.storage.recovery
 ```
 
 确认统计后再应用：
 
 ```bash
-docker compose --env-file .env run --rm orchestrator \
+./scripts/prod_compose.sh run --rm orchestrator \
   python -m videoroll.storage.recovery --apply
 ```
 
@@ -180,10 +185,10 @@ docker compose --env-file .env run --rm orchestrator \
 升级前备份数据库。导入镜像后、接收生产流量前执行：
 
 ```bash
-docker compose --env-file .env run --rm orchestrator \
+./scripts/prod_compose.sh run --rm orchestrator \
   python -m videoroll.db.migrate upgrade
-docker compose --env-file .env up -d --no-build --remove-orphans
-docker compose --env-file .env ps
+./scripts/prod_compose.sh up -d --no-build --remove-orphans
+./scripts/prod_compose.sh ps
 ```
 
 迁移命令与各 API/worker 的启动初始化使用同一入口，支持空库、旧版库和曾由应用自动建表但尚无 Alembic 版本记录的库，也可重复执行。PostgreSQL 的结构变更在同一连接的 advisory lock 内串行完成，已有业务数据保留。
@@ -223,12 +228,18 @@ INTEL_GPU_RENDER_DEVICE=/dev/dri/renderD128
 INTEL_GPU_RENDER_GID=<上一步 stat 输出的数字>
 ```
 
-仓库提供 `docker-compose.intel.yml` 作为标准覆盖层；专用生产 Compose 也可以把上述内容直接合并。OpenVINO Whisper 模型放在 `data/models/whisper/`；若已有数据库内的 ASR 设置，它会优先于环境默认值，因此还需在 Web 的 ASR 设置中确认引擎为 `openvino`、设备为 `GPU`。
+仓库提供 `docker-compose.intel.yml` 作为标准覆盖层。生产环境应通过
+`scripts/prod_compose.sh` 启停服务；脚本会核对 render device 与
+`INTEL_GPU_RENDER_GID`，并在 Intel GPU 配置生效时自动合并该覆盖层。不要在
+Intel GPU 生产机上改回裸 `docker compose up`，否则重建后的容器不会获得
+`/dev/dri`。OpenVINO Whisper 模型放在 `data/models/whisper/`；若已有数据库内
+的 ASR 设置，它会优先于环境默认值，因此还需在 Web 的 ASR 设置中确认引擎为
+`openvino`、设备为 `GPU`。
 
 部署后检查：
 
 ```bash
-docker compose --env-file .env exec subtitle-worker \
+./scripts/prod_compose.sh exec subtitle-worker \
   test -r /dev/dri/renderD128
 ```
 

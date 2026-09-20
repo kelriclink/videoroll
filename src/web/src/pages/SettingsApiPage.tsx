@@ -1,5 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { useConfirm } from "../components/feedbackContext";
+import { Button, Section, SettingsSaveBar } from "../components/ui";
+import { useUnsavedChangesGuard } from "../hooks/useUnsavedChangesGuard";
 import { fetchJson } from "../lib/http";
 import { ORCHESTRATOR_URL, orchestratorUrl } from "../lib/urls";
 
@@ -43,6 +45,53 @@ export default function SettingsApiPage() {
     refresh();
   }, []);
 
+  const isDirty = Boolean(tokenInput.trim());
+  useUnsavedChangesGuard(isDirty, { message: "离开当前页面会丢失尚未保存的新远程 API Token。" });
+
+  async function saveToken() {
+    if (!tokenInput.trim()) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await fetchJson(orchestratorUrl("/settings/api"), {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ token: tokenInput.trim() }),
+      });
+      setTokenInput("");
+      await refresh();
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function clearToken() {
+    const ok = await confirm({
+      title: "清空远程管理 token",
+      message: "清空后外部将无法再调用该接口。",
+      confirmLabel: "清空",
+      tone: "danger",
+    });
+    if (!ok) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await fetchJson(orchestratorUrl("/settings/api"), {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ token: "" }),
+      });
+      setTokenInput("");
+      await refresh();
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   const effective = settings ?? DEFAULT_SETTINGS;
   const baseUrl = useMemo(() => orchestratorBaseUrl(), []);
   const remoteEndpoint = useMemo(() => `${baseUrl}${effective.endpoint_path}`, [baseUrl, effective.endpoint_path]);
@@ -76,13 +125,13 @@ export default function SettingsApiPage() {
         {!settings ? (
           <div className="mt-2 text-sm text-slate-500">加载中…</div>
         ) : (
-          <div className="mt-3 grid gap-3 md:grid-cols-2">
+          <div className="mt-3 grid gap-3 lg:grid-cols-2">
             <div className="rounded border p-3">
-              <div className="text-xs text-slate-500">remote token</div>
+              <div className="text-xs text-slate-500">远程调用 Token</div>
               <div className="mt-1 text-sm">{settings.token_set ? "已设置" : "未设置"}</div>
             </div>
             <div className="rounded border p-3">
-              <div className="text-xs text-slate-500">token_updated_at</div>
+              <div className="text-xs text-slate-500">最后更新时间</div>
               <div className="mt-1 font-mono text-sm">{settings.token_updated_at || "-"}</div>
             </div>
           </div>
@@ -90,78 +139,22 @@ export default function SettingsApiPage() {
         <div className="mt-3 text-xs text-slate-500">说明：当前远程入口仅支持 YouTube 视频链接，行为等价于网页里的 “YouTube 自动模式”。每个逻辑请求必须携带稳定且唯一的幂等键；网络重试时复用同一个键。</div>
       </div>
 
-      <div className="vr-section">
-        <div className="text-sm font-semibold">保存 token</div>
-        <div className="mt-2 grid gap-3 md:grid-cols-2">
-          <label className="block md:col-span-2">
-            <div className="mb-1 text-xs text-slate-600">token（最少 8 个字符）</div>
+      <Section>
+        <div className="text-sm font-semibold">更新 Token</div>
+        <div className="mt-1 text-xs text-slate-500">输入新 Token 后通过页面底部保存栏提交；保存后不会回显明文。</div>
+        <div className="mt-2 grid gap-3 lg:grid-cols-2">
+          <label className="block lg:col-span-2">
+            <div className="mb-1 text-xs text-slate-600">Token（最少 8 个字符）</div>
             <input
               className="w-full rounded border px-3 py-2 text-sm"
               value={tokenInput}
               onChange={(e) => setTokenInput(e.target.value)}
-              placeholder={settings?.token_set ? "已设置（输入新 token 会覆盖旧值）" : "输入新的远程调用 token"}
+              placeholder={settings?.token_set ? "已设置（输入新 Token 会覆盖旧值）" : "输入新的远程调用 Token"}
             />
           </label>
         </div>
-
-        <div className="mt-3 flex flex-wrap items-center gap-2">
-          <button
-            disabled={busy || !tokenInput.trim()}
-            className="rounded bg-slate-900 px-3 py-2 text-sm text-white hover:bg-slate-800 disabled:opacity-50"
-            onClick={async () => {
-              setBusy(true);
-              setError(null);
-              try {
-                await fetchJson(orchestratorUrl("/settings/api"), {
-                  method: "PUT",
-                  headers: { "Content-Type": "application/json" },
-                  body: JSON.stringify({ token: tokenInput.trim() }),
-                });
-                setTokenInput("");
-                await refresh();
-              } catch (e: unknown) {
-                setError(e instanceof Error ? e.message : String(e));
-              } finally {
-                setBusy(false);
-              }
-            }}
-          >
-            保存
-          </button>
-          <button
-            disabled={busy || !settings?.token_set}
-            className="rounded border px-3 py-2 text-sm hover:bg-slate-50 disabled:opacity-50"
-            onClick={async () => {
-              const ok = await confirm({
-                title: "清空远程管理 token",
-                message: "清空后外部将无法再调用该接口。",
-                confirmLabel: "清空",
-                tone: "danger",
-              });
-              if (!ok) return;
-              setBusy(true);
-              setError(null);
-              try {
-                await fetchJson(orchestratorUrl("/settings/api"), {
-                  method: "PUT",
-                  headers: { "Content-Type": "application/json" },
-                  body: JSON.stringify({ token: "" }),
-                });
-                setTokenInput("");
-                await refresh();
-              } catch (e: unknown) {
-                setError(e instanceof Error ? e.message : String(e));
-              } finally {
-                setBusy(false);
-              }
-            }}
-          >
-            清空 token
-          </button>
-        </div>
-
-        <div className="mt-3 text-xs text-slate-500">提示：保存后不会回显明文 token。请自行保管；需要更换时直接输入新 token 覆盖即可。</div>
-      </div>
+        <div className="mt-3 text-xs text-slate-500">提示：保存后不会回显明文 Token。请自行保管；需要更换时直接输入新 Token 覆盖即可。</div>
+      </Section>
 
       <div className="vr-section">
         <div className="text-sm font-semibold">调用示例</div>
@@ -186,6 +179,21 @@ export default function SettingsApiPage() {
           执行 <span className="font-mono">./scripts/build_browser_extension.sh</span> 可生成 <span className="font-mono">dist/videoroll-youtube-submit.zip</span>；解压后在浏览器扩展管理页选择“加载已解压的扩展程序”。
         </div>
       </div>
+      <SettingsSaveBar
+        dirty={isDirty}
+        busy={busy}
+        onSave={saveToken}
+        onDiscard={() => {
+          setTokenInput("");
+          setError(null);
+        }}
+        dirtyLabel="有尚未保存的新远程 API Token"
+        extraActions={
+          <Button tone="danger" disabled={busy || !settings?.token_set} onClick={() => void clearToken()}>
+            清空已保存 Token
+          </Button>
+        }
+      />
     </div>
   );
 }

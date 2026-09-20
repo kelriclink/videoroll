@@ -1,6 +1,8 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useConfirm } from "../components/feedbackContext";
+import { SettingsSaveBar } from "../components/ui";
 import { type ASRDefaults, useASRForm } from "../features/settings-asr/form";
+import { useUnsavedChangesGuard } from "../hooks/useUnsavedChangesGuard";
 import { fetchJson } from "../lib/http";
 import { ORCHESTRATOR_URL } from "../lib/urls";
 
@@ -64,6 +66,20 @@ type WhisperModelInfo = {
   size_bytes?: number | null;
 };
 
+type IntelHardwareProbe = {
+  checked: boolean;
+  available: boolean;
+  render_device: string;
+  model_name?: string | null;
+  driver?: string | null;
+  pci_slot?: string | null;
+  pci_id?: string | null;
+  detail?: string;
+  openvino_devices?: string[];
+  openvino_gpu_available?: boolean;
+  openvino_error?: string;
+};
+
 type ModelProxyTestResponse = {
   ok: boolean;
   url: string;
@@ -85,8 +101,28 @@ function formatBytes(n?: number | null): string {
   return `${v.toFixed(u === 0 ? 0 : 1)} ${units[u]}`;
 }
 
+function asrDefaultsSnapshot(defaults: ASRDefaults): string {
+  return JSON.stringify({
+    defaultEngine: defaults.default_engine || "faster-whisper",
+    defaultLanguage: defaults.default_language || "auto",
+    effectiveDefaultModel: defaults.default_model || "",
+    openvinoDevice: defaults.openvino_device?.trim() || "GPU",
+    openvinoNumBeams: String(Math.max(1, Number(defaults.openvino_num_beams || 1))),
+    openvinoMaxNewTokens: String(Math.max(1, Number(defaults.openvino_max_new_tokens || 448))),
+    openvinoVadEnabled: Boolean(defaults.openvino_vad_enabled),
+    openvinoVadThreshold: String(defaults.openvino_vad_threshold ?? 0.5),
+    modelDownloadProxy: defaults.model_download_proxy || "",
+    externalWhisperBaseUrl: defaults.external_whisper_base_url || "",
+    externalWhisperModel: defaults.external_whisper_model || "whisper-1",
+    groqWhisperModel: defaults.groq_whisper_model || "whisper-large-v3-turbo",
+    cloudflareAccountId: defaults.cloudflare_workers_ai_account_id || "",
+    cloudflareModel: defaults.cloudflare_workers_ai_model || "@cf/openai/whisper-large-v3-turbo",
+  });
+}
+
 export default function SettingsASRPage() {
   const confirm = useConfirm();
+  const savedDefaultsSnapshotRef = useRef("");
   const {
     downloadModel, setDownloadModel,
     downloadEngine, setDownloadEngine,
@@ -116,6 +152,7 @@ export default function SettingsASRPage() {
   const [settings, setSettings] = useState<WhisperSettings | null>(null);
   const [asrDefaults, setAsrDefaults] = useState<ASRDefaults | null>(null);
   const [models, setModels] = useState<WhisperModelInfo[] | null>(null);
+  const [intelHardware, setIntelHardware] = useState<IntelHardwareProbe | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -132,14 +169,17 @@ export default function SettingsASRPage() {
   const refresh = useCallback(async () => {
     setError(null);
     try {
-      const [s, m, a] = await Promise.all([
+      const [s, m, a, intel] = await Promise.all([
         fetchJson<WhisperSettings>(`${ORCHESTRATOR_URL}/subtitle/settings`),
         fetchJson<WhisperModelInfo[]>(`${ORCHESTRATOR_URL}/subtitle/models`),
         fetchJson<ASRDefaults>(`${ORCHESTRATOR_URL}/subtitle/asr/settings`),
+        fetchJson<IntelHardwareProbe>(`${ORCHESTRATOR_URL}/subtitle/hardware/intel`).catch(() => null),
       ]);
       setSettings(s);
       setModels(m);
       setAsrDefaults(a);
+      setIntelHardware(intel);
+      savedDefaultsSnapshotRef.current = asrDefaultsSnapshot(a);
       applyDefaults(a);
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : String(e));
@@ -151,6 +191,96 @@ export default function SettingsASRPage() {
   }, [refresh]);
 
   const knownSizes = useMemo(() => ["tiny", "base", "small", "medium", "large-v3"], []);
+
+  const effectiveDefaultModel =
+    defaultEngine === "external-whisper"
+      ? externalWhisperModel
+      : defaultEngine === "groq-whisper"
+        ? groqWhisperModel
+        : defaultEngine === "cloudflare-workers-ai"
+          ? cloudflareModel
+          : defaultModel;
+  const currentDefaultsSnapshot = JSON.stringify({
+    defaultEngine,
+    defaultLanguage,
+    effectiveDefaultModel,
+    openvinoDevice,
+    openvinoNumBeams: String(Math.max(1, Number.parseInt(openvinoNumBeams || "1", 10) || 1)),
+    openvinoMaxNewTokens: String(Math.max(1, Number.parseInt(openvinoMaxNewTokens || "448", 10) || 448)),
+    openvinoVadEnabled,
+    openvinoVadThreshold: String(
+      Math.min(0.95, Math.max(0.1, Number.isFinite(Number.parseFloat(openvinoVadThreshold || "0.5")) ? Number.parseFloat(openvinoVadThreshold || "0.5") : 0.5)),
+    ),
+    modelDownloadProxy,
+    externalWhisperBaseUrl,
+    externalWhisperModel,
+    groqWhisperModel,
+    cloudflareAccountId,
+    cloudflareModel,
+  });
+  const isDefaultsDirty =
+    Boolean(asrDefaults) &&
+    (
+      savedDefaultsSnapshotRef.current !== currentDefaultsSnapshot ||
+      Boolean(externalWhisperApiKey.trim()) ||
+      Boolean(groqWhisperApiKey.trim()) ||
+      Boolean(cloudflareApiKey.trim())
+    );
+  useUnsavedChangesGuard(isDefaultsDirty, { message: "离开当前页面会丢失尚未保存的 ASR 默认配置。" });
+
+  const discardDefaults = useCallback(() => {
+    if (!asrDefaults) return;
+    applyDefaults(asrDefaults);
+    setExternalWhisperApiKey("");
+    setGroqWhisperApiKey("");
+    setCloudflareApiKey("");
+    setError(null);
+  }, [applyDefaults, asrDefaults, setCloudflareApiKey, setExternalWhisperApiKey, setGroqWhisperApiKey]);
+
+  async function saveDefaults() {
+    setBusy(true);
+    setError(null);
+    try {
+      const openvinoNumBeamsValue = Math.max(1, Number.parseInt(openvinoNumBeams || "1", 10) || 1);
+      const openvinoMaxNewTokensValue = Math.max(1, Number.parseInt(openvinoMaxNewTokens || "448", 10) || 448);
+      const parsedOpenvinoVadThreshold = Number.parseFloat(openvinoVadThreshold || "0.5");
+      const openvinoVadThresholdValue = Math.min(
+        0.95,
+        Math.max(0.1, Number.isFinite(parsedOpenvinoVadThreshold) ? parsedOpenvinoVadThreshold : 0.5),
+      );
+      await fetchJson(`${ORCHESTRATOR_URL}/subtitle/asr/settings`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          default_engine: defaultEngine,
+          default_language: defaultLanguage,
+          default_model: effectiveDefaultModel,
+          openvino_device: openvinoDevice,
+          openvino_num_beams: openvinoNumBeamsValue,
+          openvino_max_new_tokens: openvinoMaxNewTokensValue,
+          openvino_vad_enabled: openvinoVadEnabled,
+          openvino_vad_threshold: openvinoVadThresholdValue,
+          model_download_proxy: modelDownloadProxy,
+          external_whisper_base_url: externalWhisperBaseUrl,
+          external_whisper_model: externalWhisperModel,
+          ...(externalWhisperApiKey.trim() ? { external_whisper_api_key: externalWhisperApiKey.trim() } : {}),
+          groq_whisper_model: groqWhisperModel,
+          ...(groqWhisperApiKey.trim() ? { groq_whisper_api_key: groqWhisperApiKey.trim() } : {}),
+          cloudflare_workers_ai_account_id: cloudflareAccountId,
+          cloudflare_workers_ai_model: cloudflareModel,
+          ...(cloudflareApiKey.trim() ? { cloudflare_workers_ai_api_key: cloudflareApiKey.trim() } : {}),
+        }),
+      });
+      setExternalWhisperApiKey("");
+      setGroqWhisperApiKey("");
+      setCloudflareApiKey("");
+      await refresh();
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
 
   return (
     <div className="space-y-4">
@@ -170,63 +300,109 @@ export default function SettingsASRPage() {
         {!settings ? (
           <div className="mt-2 text-sm text-slate-500">加载中…</div>
         ) : (
-          <div className="mt-3 grid gap-3 md:grid-cols-2">
-            <div className="rounded border p-3">
-              <div className="text-xs text-slate-500">SUBTITLE_ASR_ENGINE</div>
-              <div className="mt-1 font-mono text-sm">{settings.asr_engine}</div>
+          <div className="mt-3 grid gap-3 lg:grid-cols-2">
+            <div className="rounded border border-slate-200 p-3 lg:col-span-2">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div>
+                  <div className="text-xs text-slate-500">Intel GPU 运行设备</div>
+                  <div className="mt-1 text-sm font-medium">
+                    {intelHardware?.available ? intelHardware.model_name || "Intel GPU detected" : "未检测到可用 Intel GPU"}
+                  </div>
+                </div>
+                <span
+                  className={[
+                    "rounded-full px-2 py-1 text-xs",
+                    intelHardware?.available && intelHardware?.openvino_gpu_available
+                      ? "bg-emerald-50 text-emerald-700"
+                      : intelHardware?.available
+                        ? "bg-amber-50 text-amber-700"
+                        : "bg-rose-50 text-rose-700",
+                  ].join(" ")}
+                >
+                  {intelHardware?.available && intelHardware?.openvino_gpu_available
+                    ? "GPU runtime ready"
+                    : intelHardware?.available
+                      ? "DRM only"
+                      : "Unavailable"}
+                </span>
+              </div>
+              <div className="mt-2 grid gap-1 text-xs text-slate-500 sm:grid-cols-2">
+                <div className="break-all">DRM：{intelHardware?.render_device || "-"}</div>
+                <div>Driver：{intelHardware?.driver || "-"}</div>
+                {intelHardware?.pci_slot ? <div>PCI：{intelHardware.pci_slot}</div> : null}
+                {intelHardware?.pci_id ? <div>PCI ID：{intelHardware.pci_id}</div> : null}
+                <div>OpenVINO devices：{intelHardware?.openvino_devices?.join(", ") || "-"}</div>
+                <div>
+                  OpenVINO GPU：
+                  <span className={intelHardware?.openvino_gpu_available ? "text-emerald-700" : "text-rose-700"}>
+                    {intelHardware?.openvino_gpu_available ? "可用" : "不可用"}
+                  </span>
+                </div>
+              </div>
+              {!intelHardware?.available && intelHardware?.detail ? (
+                <div className="mt-2 break-words text-xs text-rose-700">{intelHardware.detail}</div>
+              ) : null}
+              {intelHardware?.openvino_error ? (
+                <div className="mt-2 break-words text-xs text-rose-700">OpenVINO：{intelHardware.openvino_error}</div>
+              ) : null}
             </div>
             <div className="rounded border p-3">
-              <div className="text-xs text-slate-500">faster-whisper</div>
-              <div className="mt-1 text-sm">{settings.faster_whisper_installed ? "installed" : "not installed"}</div>
+              <div className="text-xs text-slate-500">默认 ASR 引擎</div>
+              <div className="mt-1 text-sm font-medium">{settings.asr_engine}</div>
+              <div className="mt-1 font-mono text-[11px] text-slate-400">SUBTITLE_ASR_ENGINE</div>
             </div>
             <div className="rounded border p-3">
-              <div className="text-xs text-slate-500">openvino-genai</div>
-              <div className="mt-1 text-sm">{settings.openvino_installed ? "installed" : "not installed"}</div>
+              <div className="text-xs text-slate-500">faster-whisper Runtime</div>
+              <div className={["mt-1 text-sm font-medium", settings.faster_whisper_installed ? "text-emerald-700" : "text-rose-700"].join(" ")}>{settings.faster_whisper_installed ? "已安装" : "未安装"}</div>
             </div>
             <div className="rounded border p-3">
-              <div className="text-xs text-slate-500">SUBTITLE_WHISPER_MODEL</div>
+              <div className="text-xs text-slate-500">OpenVINO GenAI Runtime</div>
+              <div className={["mt-1 text-sm font-medium", settings.openvino_installed ? "text-emerald-700" : "text-rose-700"].join(" ")}>{settings.openvino_installed ? "已安装" : "未安装"}</div>
+            </div>
+            <div className="rounded border p-3">
+              <div className="text-xs text-slate-500">Whisper 默认模型 <span className="font-mono text-[10px] text-slate-400">SUBTITLE_WHISPER_MODEL</span></div>
               <div className="mt-1 font-mono text-sm">{settings.whisper_model}</div>
             </div>
-            <div className="rounded border p-3 md:col-span-2">
-              <div className="text-xs text-slate-500">SUBTITLE_WHISPER_MODEL_DIR（ASR 模型目录）</div>
+            <div className="rounded border p-3 lg:col-span-2">
+              <div className="text-xs text-slate-500">ASR 模型目录 <span className="font-mono text-[10px] text-slate-400">SUBTITLE_WHISPER_MODEL_DIR</span></div>
               <div className="mt-1 font-mono text-sm">{settings.whisper_model_dir}</div>
             </div>
             <div className="rounded border p-3">
-              <div className="text-xs text-slate-500">device</div>
+              <div className="text-xs text-slate-500">faster-whisper 设备</div>
               <div className="mt-1 font-mono text-sm">{settings.whisper_device}</div>
             </div>
             <div className="rounded border p-3">
-              <div className="text-xs text-slate-500">compute_type</div>
+              <div className="text-xs text-slate-500">计算精度</div>
               <div className="mt-1 font-mono text-sm">{settings.whisper_compute_type}</div>
             </div>
             <div className="rounded border p-3">
-              <div className="text-xs text-slate-500">SUBTITLE_WHISPER_CPU_THREADS</div>
+              <div className="text-xs text-slate-500">CPU 线程 <span className="font-mono text-[10px] text-slate-400">SUBTITLE_WHISPER_CPU_THREADS</span></div>
               <div className="mt-1 font-mono text-sm">
                 {settings.whisper_cpu_threads}{" "}
                 {settings.whisper_cpu_threads !== settings.whisper_cpu_threads_effective ? `(effective: ${settings.whisper_cpu_threads_effective})` : null}
               </div>
             </div>
             <div className="rounded border p-3">
-              <div className="text-xs text-slate-500">SUBTITLE_WHISPER_NUM_WORKERS</div>
+              <div className="text-xs text-slate-500">ASR Worker 数 <span className="font-mono text-[10px] text-slate-400">SUBTITLE_WHISPER_NUM_WORKERS</span></div>
               <div className="mt-1 font-mono text-sm">
                 {settings.whisper_num_workers}{" "}
                 {settings.whisper_num_workers !== settings.whisper_num_workers_effective ? `(effective: ${settings.whisper_num_workers_effective})` : null}
               </div>
             </div>
-            <div className="rounded border p-3 md:col-span-2">
-              <div className="text-xs text-slate-500">SUBTITLE_OPENVINO_MODEL</div>
+            <div className="rounded border p-3 lg:col-span-2">
+              <div className="text-xs text-slate-500">OpenVINO 模型 <span className="font-mono text-[10px] text-slate-400">SUBTITLE_OPENVINO_MODEL</span></div>
               <div className="mt-1 font-mono text-sm break-all">{settings.openvino_model || "(empty)"}</div>
             </div>
             <div className="rounded border p-3">
-              <div className="text-xs text-slate-500">SUBTITLE_OPENVINO_DEVICE</div>
+              <div className="text-xs text-slate-500">OpenVINO 设备 <span className="font-mono text-[10px] text-slate-400">SUBTITLE_OPENVINO_DEVICE</span></div>
               <div className="mt-1 font-mono text-sm">{settings.openvino_device}</div>
             </div>
             <div className="rounded border p-3">
-              <div className="text-xs text-slate-500">SUBTITLE_OPENVINO_NUM_BEAMS</div>
+              <div className="text-xs text-slate-500">Beam 数 <span className="font-mono text-[10px] text-slate-400">SUBTITLE_OPENVINO_NUM_BEAMS</span></div>
               <div className="mt-1 font-mono text-sm">{settings.openvino_num_beams}</div>
             </div>
             <div className="rounded border p-3">
-              <div className="text-xs text-slate-500">SUBTITLE_OPENVINO_MAX_NEW_TOKENS</div>
+              <div className="text-xs text-slate-500">最大生成 Tokens <span className="font-mono text-[10px] text-slate-400">SUBTITLE_OPENVINO_MAX_NEW_TOKENS</span></div>
               <div className="mt-1 font-mono text-sm">{settings.openvino_max_new_tokens}</div>
             </div>
           </div>
@@ -244,9 +420,9 @@ export default function SettingsASRPage() {
 
         {!asrDefaults ? <div className="mt-2 text-sm text-slate-500">加载中…</div> : null}
 
-        <div className="mt-3 grid gap-3 md:grid-cols-2">
+        <div className="mt-3 grid gap-3 lg:grid-cols-2">
           <label className="block">
-            <div className="mb-1 text-xs text-slate-600">default_engine</div>
+            <div className="mb-1 text-xs text-slate-600">默认引擎</div>
             <select className="w-full rounded border px-3 py-2 text-sm" value={defaultEngine} onChange={(e) => setDefaultEngine(e.target.value)}>
               <option value="faster-whisper">faster-whisper</option>
               <option value="openvino">openvino（方案2 / Intel Arc）</option>
@@ -258,12 +434,12 @@ export default function SettingsASRPage() {
           </label>
 
           <label className="block">
-            <div className="mb-1 text-xs text-slate-600">default_language</div>
+            <div className="mb-1 text-xs text-slate-600">默认语言 <span className="font-mono text-[10px] text-slate-400">default_language</span></div>
             <input className="w-full rounded border px-3 py-2 text-sm" value={defaultLanguage} onChange={(e) => setDefaultLanguage(e.target.value)} placeholder="auto / zh / en ..." />
           </label>
 
-          <label className="block md:col-span-2">
-            <div className="mb-1 text-xs text-slate-600">default_model（size/repo id/本地路径）</div>
+          <label className="block lg:col-span-2">
+            <div className="mb-1 text-xs text-slate-600">默认模型（size / repo id / 本地路径） <span className="font-mono text-[10px] text-slate-400">default_model</span></div>
             <input
               className="w-full rounded border px-3 py-2 text-sm"
               value={defaultModel}
@@ -307,20 +483,20 @@ export default function SettingsASRPage() {
           </label>
 
           {defaultEngine === "external-whisper" ? (
-            <div className="rounded border border-amber-100 bg-amber-50/60 p-3 md:col-span-2">
+            <div className="rounded border border-amber-100 bg-amber-50/60 p-3 lg:col-span-2">
               <div className="text-sm font-medium text-slate-800">外部 Whisper API（OpenAI 兼容接口）</div>
               <div className="mt-1 text-xs text-slate-600">请求地址应为服务的 base URL，例如 `https://api.openai.com/v1`；后端会调用 `/audio/transcriptions`。</div>
-              <div className="mt-3 grid gap-3 md:grid-cols-2">
-                <label className="block md:col-span-2">
-                  <div className="mb-1 text-xs text-slate-600">external_whisper_base_url</div>
+              <div className="mt-3 grid gap-3 lg:grid-cols-2">
+                <label className="block lg:col-span-2">
+                  <div className="mb-1 text-xs text-slate-600">Base URL <span className="font-mono text-[10px] text-slate-400">external_whisper_base_url</span></div>
                   <input className="w-full rounded border px-3 py-2 text-sm" value={externalWhisperBaseUrl} onChange={(e) => setExternalWhisperBaseUrl(e.target.value)} placeholder="https://api.openai.com/v1" />
                 </label>
-                <label className="block md:col-span-2">
-                  <div className="mb-1 text-xs text-slate-600">external_whisper_api_key（仅保存，不回显）</div>
+                <label className="block lg:col-span-2">
+                  <div className="mb-1 text-xs text-slate-600">API Key（仅保存，不回显） <span className="font-mono text-[10px] text-slate-400">external_whisper_api_key</span></div>
                   <input type="password" className="w-full rounded border px-3 py-2 text-sm" value={externalWhisperApiKey} onChange={(e) => setExternalWhisperApiKey(e.target.value)} placeholder={asrDefaults?.external_whisper_api_key_set ? "已设置（留空则不修改）" : "API key"} />
                 </label>
                 <label className="block">
-                  <div className="mb-1 text-xs text-slate-600">external_whisper_model</div>
+                  <div className="mb-1 text-xs text-slate-600">模型 <span className="font-mono text-[10px] text-slate-400">external_whisper_model</span></div>
                   <input className="w-full rounded border px-3 py-2 text-sm" value={externalWhisperModel} onChange={(e) => setExternalWhisperModel(e.target.value)} placeholder="whisper-1" />
                 </label>
                 <div className="flex items-end">
@@ -361,22 +537,22 @@ export default function SettingsASRPage() {
           ) : null}
 
           {defaultEngine === "cloudflare-workers-ai" ? (
-            <div className="rounded border border-sky-100 bg-sky-50/60 p-3 md:col-span-2">
+            <div className="rounded border border-sky-100 bg-sky-50/60 p-3 lg:col-span-2">
               <div className="text-sm font-medium text-slate-800">Cloudflare Workers AI（原生 ASR）</div>
               <div className="mt-1 text-xs text-slate-600">
                 直接调用 Cloudflare `/ai/run`，解析模型返回的 segments；推荐使用 `@cf/openai/whisper-large-v3-turbo` 以获得时间轴。
               </div>
-              <div className="mt-3 grid gap-3 md:grid-cols-2">
+              <div className="mt-3 grid gap-3 lg:grid-cols-2">
                 <label className="block">
-                  <div className="mb-1 text-xs text-slate-600">cloudflare_workers_ai_account_id</div>
+                  <div className="mb-1 text-xs text-slate-600">Cloudflare Account ID</div>
                   <input className="w-full rounded border px-3 py-2 text-sm" value={cloudflareAccountId} onChange={(e) => setCloudflareAccountId(e.target.value)} placeholder="Cloudflare Account ID" />
                 </label>
                 <label className="block">
-                  <div className="mb-1 text-xs text-slate-600">cloudflare_workers_ai_model</div>
+                  <div className="mb-1 text-xs text-slate-600">Cloudflare ASR 模型</div>
                   <input className="w-full rounded border px-3 py-2 text-sm" value={cloudflareModel} onChange={(e) => setCloudflareModel(e.target.value)} placeholder="@cf/openai/whisper-large-v3-turbo" />
                 </label>
-                <label className="block md:col-span-2">
-                  <div className="mb-1 text-xs text-slate-600">cloudflare_workers_ai_api_key（仅保存，不回显）</div>
+                <label className="block lg:col-span-2">
+                  <div className="mb-1 text-xs text-slate-600">Cloudflare API Token（仅保存，不回显）</div>
                   <input type="password" className="w-full rounded border px-3 py-2 text-sm" value={cloudflareApiKey} onChange={(e) => setCloudflareApiKey(e.target.value)} placeholder={asrDefaults?.cloudflare_workers_ai_api_key_set ? "已设置（留空则不修改）" : "Cloudflare API Token"} />
                 </label>
                 <div className="flex items-end">
@@ -417,18 +593,18 @@ export default function SettingsASRPage() {
           ) : null}
 
           {defaultEngine === "groq-whisper" ? (
-            <div className="rounded border border-orange-100 bg-orange-50/60 p-3 md:col-span-2">
+            <div className="rounded border border-orange-100 bg-orange-50/60 p-3 lg:col-span-2">
               <div className="text-sm font-medium text-slate-800">GroqCloud Whisper（专用接入）</div>
               <div className="mt-1 text-xs text-slate-600">
                 调用 Groq 的 `/openai/v1/audio/transcriptions`。音频会按固定 45 秒转为无损 FLAC 分片，并保留 5 秒重叠；网络断开或上游 5xx/524 时每片最多重试 5 次。成功分片会保存检查点，点击“继续字幕”可从失败分片继续，并合并原始时间轴。
               </div>
-              <div className="mt-3 grid gap-3 md:grid-cols-2">
-                <label className="block md:col-span-2">
-                  <div className="mb-1 text-xs text-slate-600">groq_whisper_api_key（仅保存，不回显）</div>
+              <div className="mt-3 grid gap-3 lg:grid-cols-2">
+                <label className="block lg:col-span-2">
+                  <div className="mb-1 text-xs text-slate-600">Groq API Key（仅保存，不回显）</div>
                   <input type="password" className="w-full rounded border px-3 py-2 text-sm" value={groqWhisperApiKey} onChange={(e) => setGroqWhisperApiKey(e.target.value)} placeholder={asrDefaults?.groq_whisper_api_key_set ? "已设置（留空则不修改）" : "gsk_..."} />
                 </label>
                 <label className="block">
-                  <div className="mb-1 text-xs text-slate-600">groq_whisper_model</div>
+                  <div className="mb-1 text-xs text-slate-600">Groq Whisper 模型</div>
                   <select className="w-full rounded border px-3 py-2 text-sm" value={groqWhisperModel} onChange={(e) => setGroqWhisperModel(e.target.value)}>
                     <option value="whisper-large-v3-turbo">whisper-large-v3-turbo（推荐）</option>
                     <option value="whisper-large-v3">whisper-large-v3（高准确率）</option>
@@ -471,7 +647,7 @@ export default function SettingsASRPage() {
             </div>
           ) : null}
 
-          <div className="rounded border border-sky-100 bg-sky-50/50 p-3 md:col-span-2">
+          <div className="rounded border border-sky-100 bg-sky-50/50 p-3 lg:col-span-2">
             <label className="flex cursor-pointer items-center gap-2 text-sm font-medium text-slate-800">
               <input
                 type="checkbox"
@@ -500,7 +676,7 @@ export default function SettingsASRPage() {
           </div>
 
           <label className="block">
-            <div className="mb-1 text-xs text-slate-600">openvino_device</div>
+            <div className="mb-1 text-xs text-slate-600">OpenVINO 设备</div>
             <input
               className="w-full rounded border px-3 py-2 text-sm"
               value={openvinoDevice}
@@ -510,7 +686,7 @@ export default function SettingsASRPage() {
           </label>
 
           <label className="block">
-            <div className="mb-1 text-xs text-slate-600">openvino_num_beams</div>
+            <div className="mb-1 text-xs text-slate-600">OpenVINO Beam 数</div>
             <input
               type="number"
               min={1}
@@ -521,8 +697,8 @@ export default function SettingsASRPage() {
             />
           </label>
 
-          <label className="block md:col-span-2">
-            <div className="mb-1 text-xs text-slate-600">openvino_max_new_tokens</div>
+          <label className="block lg:col-span-2">
+            <div className="mb-1 text-xs text-slate-600">OpenVINO 最大生成 Tokens</div>
             <input
               type="number"
               min={1}
@@ -536,8 +712,8 @@ export default function SettingsASRPage() {
             </div>
           </label>
 
-          <label className="block md:col-span-2">
-            <div className="mb-1 text-xs text-slate-600">model_download_proxy（仅用于模型下载）</div>
+          <label className="block lg:col-span-2">
+            <div className="mb-1 text-xs text-slate-600">模型下载代理</div>
             <div className="flex items-center gap-2">
               <input
                 className="w-full flex-1 rounded border px-3 py-2 text-sm"
@@ -591,52 +767,6 @@ export default function SettingsASRPage() {
           </label>
         </div>
 
-        <div className="mt-3">
-          <button
-            disabled={busy}
-            className="rounded bg-slate-900 px-3 py-2 text-sm text-white hover:bg-slate-800 disabled:opacity-50"
-            onClick={async () => {
-              setBusy(true);
-              setError(null);
-              try {
-                const openvinoNumBeamsValue = Math.max(1, Number.parseInt(openvinoNumBeams || "1", 10) || 1);
-                const openvinoMaxNewTokensValue = Math.max(1, Number.parseInt(openvinoMaxNewTokens || "448", 10) || 448);
-                const parsedOpenvinoVadThreshold = Number.parseFloat(openvinoVadThreshold || "0.5");
-                const openvinoVadThresholdValue = Math.min(0.95, Math.max(0.1, Number.isFinite(parsedOpenvinoVadThreshold) ? parsedOpenvinoVadThreshold : 0.5));
-                await fetchJson(`${ORCHESTRATOR_URL}/subtitle/asr/settings`, {
-                  method: "PUT",
-                  headers: { "Content-Type": "application/json" },
-                  body: JSON.stringify({
-                    default_engine: defaultEngine,
-                    default_language: defaultLanguage,
-                    default_model: defaultEngine === "external-whisper" ? externalWhisperModel : defaultEngine === "groq-whisper" ? groqWhisperModel : defaultEngine === "cloudflare-workers-ai" ? cloudflareModel : defaultModel,
-                    openvino_device: openvinoDevice,
-                    openvino_num_beams: openvinoNumBeamsValue,
-                    openvino_max_new_tokens: openvinoMaxNewTokensValue,
-                    openvino_vad_enabled: openvinoVadEnabled,
-                    openvino_vad_threshold: openvinoVadThresholdValue,
-                    model_download_proxy: modelDownloadProxy,
-                    external_whisper_base_url: externalWhisperBaseUrl,
-                    external_whisper_model: externalWhisperModel,
-                    ...(externalWhisperApiKey.trim() ? { external_whisper_api_key: externalWhisperApiKey.trim() } : {}),
-                    groq_whisper_model: groqWhisperModel,
-                    ...(groqWhisperApiKey.trim() ? { groq_whisper_api_key: groqWhisperApiKey.trim() } : {}),
-                    cloudflare_workers_ai_account_id: cloudflareAccountId,
-                    cloudflare_workers_ai_model: cloudflareModel,
-                    ...(cloudflareApiKey.trim() ? { cloudflare_workers_ai_api_key: cloudflareApiKey.trim() } : {}),
-                  }),
-                });
-                await refresh();
-              } catch (e: unknown) {
-                setError(e instanceof Error ? e.message : String(e));
-              } finally {
-                setBusy(false);
-              }
-            }}
-          >
-            {busy ? "保存中…" : "保存默认 ASR"}
-          </button>
-        </div>
       </div>
 
       <div className="vr-section">
@@ -700,7 +830,7 @@ export default function SettingsASRPage() {
         <div className="mt-2 text-xs text-slate-500">
           支持 `faster-whisper` 和 `openvino`。选择 `openvino` 时，`tiny/base/small/medium/large-v3` 会映射到 OpenVINO 官方预转换 Whisper 仓库。
         </div>
-        <div className="mt-3 grid gap-3 md:grid-cols-2">
+        <div className="mt-3 grid gap-3 lg:grid-cols-2">
           <label className="block">
             <div className="mb-1 text-xs text-slate-600">engine</div>
             <select className="w-full rounded border px-3 py-2 text-sm" value={downloadEngine} onChange={(e) => setDownloadEngine(e.target.value)}>
@@ -781,7 +911,7 @@ export default function SettingsASRPage() {
         <div className="mt-2 text-xs text-slate-500">
           上传一个 zip 包。解压后可以是 `faster-whisper/ctranslate2` 模型目录，也可以是已导出的 OpenVINO Whisper 模型目录。目录名仅允许字母数字与 `._-`。
         </div>
-        <div className="mt-3 grid gap-3 md:grid-cols-2">
+        <div className="mt-3 grid gap-3 lg:grid-cols-2">
           <label className="block">
             <div className="mb-1 text-xs text-slate-600">name</div>
             <input className="w-full rounded border px-3 py-2 text-sm" value={uploadName} onChange={(e) => setUploadName(e.target.value)} />
@@ -827,6 +957,14 @@ export default function SettingsASRPage() {
           在任务详情页生成字幕时，可将 `asr_engine` 设为 `faster-whisper` 或 `openvino`；`asr_model` 支持模型目录路径（例如：`/models/whisper/tiny` 或 `/models/whisper/whisper-large-v3-ov`）。
         </div>
       </div>
+      <SettingsSaveBar
+        dirty={isDefaultsDirty}
+        busy={busy}
+        onSave={saveDefaults}
+        onDiscard={discardDefaults}
+        saveLabel="保存默认 ASR"
+        dirtyLabel="有未保存的 ASR 默认配置"
+      />
     </div>
   );
 }

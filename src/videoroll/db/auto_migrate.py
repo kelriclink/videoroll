@@ -521,6 +521,85 @@ def _ensure_pgvector_rag_tables(engine: Bind) -> None:
         conn.execute(
             text(
                 """
+                ALTER TABLE translation_agent_runs
+                ADD COLUMN IF NOT EXISTS checkpoint JSONB NOT NULL DEFAULT '{}'::jsonb
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                ALTER TABLE translation_agent_runs
+                ADD COLUMN IF NOT EXISTS checkpoint_version INTEGER NOT NULL DEFAULT 0
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                ALTER TABLE translation_agent_runs
+                ADD COLUMN IF NOT EXISTS checkpointed_at TIMESTAMPTZ
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                ALTER TABLE translation_agent_runs
+                ADD COLUMN IF NOT EXISTS lease_owner VARCHAR(128)
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                ALTER TABLE translation_agent_runs
+                ADD COLUMN IF NOT EXISTS lease_until TIMESTAMPTZ
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS translation_agent_events (
+                    id UUID PRIMARY KEY,
+                    run_id UUID NOT NULL REFERENCES translation_agent_runs(id) ON DELETE CASCADE,
+                    kind VARCHAR(32) NOT NULL DEFAULT 'agent',
+                    action VARCHAR(128) NOT NULL DEFAULT '',
+                    status VARCHAR(32) NOT NULL DEFAULT 'ok',
+                    event JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                )
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                CREATE INDEX IF NOT EXISTS ix_translation_agent_events_run_created
+                ON translation_agent_events (run_id, created_at)
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                CREATE INDEX IF NOT EXISTS ix_translation_agent_events_kind_action
+                ON translation_agent_events (kind, action)
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                CREATE INDEX IF NOT EXISTS ix_translation_agent_runs_lease
+                ON translation_agent_runs (status, lease_until)
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
                 CREATE UNIQUE INDEX IF NOT EXISTS uq_translation_terms_lang_domain_norm
                 ON translation_knowledge_items (target_lang, domain, normalized_term)
                 WHERE item_type = 'term' AND normalized_term <> ''
@@ -572,6 +651,52 @@ def _ensure_pgvector_rag_tables(engine: Bind) -> None:
                 """
                 CREATE INDEX IF NOT EXISTS ix_translation_matches_task
                 ON translation_term_matches (task_id, subtitle_job_id)
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS translation_memory_entries (
+                    id UUID PRIMARY KEY,
+                    source_text TEXT NOT NULL,
+                    source_norm TEXT NOT NULL,
+                    target_text TEXT NOT NULL,
+                    target_lang VARCHAR(16) NOT NULL DEFAULT 'zh',
+                    domain TEXT NOT NULL DEFAULT '',
+                    task_id UUID,
+                    subtitle_job_id UUID,
+                    source_kind VARCHAR(32) NOT NULL DEFAULT 'machine',
+                    status VARCHAR(32) NOT NULL DEFAULT 'machine',
+                    quality_score DOUBLE PRECISION NOT NULL DEFAULT 0,
+                    usage_count INTEGER NOT NULL DEFAULT 0,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                )
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                CREATE INDEX IF NOT EXISTS ix_translation_memory_target_task
+                ON translation_memory_entries (target_lang, task_id, updated_at DESC)
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                CREATE INDEX IF NOT EXISTS ix_translation_memory_target_status
+                ON translation_memory_entries (target_lang, status, updated_at DESC)
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                CREATE INDEX IF NOT EXISTS ix_translation_memory_source_norm
+                ON translation_memory_entries (source_norm)
                 """
             )
         )

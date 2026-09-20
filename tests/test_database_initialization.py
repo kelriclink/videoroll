@@ -54,6 +54,7 @@ def test_initializer_does_not_borrow_another_connection_during_upgrade(tmp_path)
     migrate.upgrade_database(engine)
     migrate.upgrade_database(engine)
     assert inspect(engine).has_table("alembic_version")
+    assert inspect(engine).has_table("translation_memory_entries")
 
 
 def test_initializer_cache_is_per_process_and_force_rechecks(monkeypatch):
@@ -105,7 +106,7 @@ def test_concurrent_initializers_do_not_share_alembic_global_context(monkeypatch
         try:
             migrate.upgrade_database(engine)
             with engine.connect() as connection:
-                assert connection.exec_driver_sql("SELECT version_num FROM alembic_version").scalar_one() == "0005_operations_center"
+                assert connection.exec_driver_sql("SELECT version_num FROM alembic_version").scalar_one() == "0006_agent_runtime"
         finally:
             engine.dispose()
 

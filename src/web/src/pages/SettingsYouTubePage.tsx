@@ -1,5 +1,7 @@
 import { useEffect, useState } from "react";
 import { useConfirm } from "../components/feedbackContext";
+import { Button } from "../components/ui";
+import { useUnsavedChangesGuard } from "../hooks/useUnsavedChangesGuard";
 import { fetchJson } from "../lib/http";
 import { ORCHESTRATOR_URL } from "../lib/urls";
 
@@ -91,20 +93,22 @@ export default function SettingsYouTubePage() {
   const [homeScanRunBusy, setHomeScanRunBusy] = useState(false);
   const [homeScanResult, setHomeScanResult] = useState<YouTubeHomeScanRunResponse | null>(null);
 
-  async function refresh() {
+  async function refresh(syncDrafts = true) {
     setError(null);
     try {
       const s = await fetchJson<YouTubeSettings>(`${ORCHESTRATOR_URL}/settings/youtube`);
       setSettings(s);
-      setProxy((s.proxy ?? "").toString());
-      setCookiesEnabled(Boolean(s.cookies_enabled));
-      setCompatibilityModeEnabled(Boolean(s.compatibility_mode_enabled));
-      setHomeScanEnabled(Boolean(s.home_scan_enabled));
-      setHomeScanIntervalMinutes(Math.max(1, Number(s.home_scan_interval_minutes ?? 60) || 60));
-      setHomeScanLimit(Math.max(1, Number(s.home_scan_limit ?? 10) || 10));
-      setHomeScanLongVideosOnly(Boolean(s.home_scan_long_videos_only));
-      setHomeScanMinDurationSeconds(Math.max(0, Number(s.home_scan_min_duration_seconds ?? 180) || 0));
-      setCookiesTxt("");
+      if (syncDrafts) {
+        setProxy((s.proxy ?? "").toString());
+        setCookiesEnabled(Boolean(s.cookies_enabled));
+        setCompatibilityModeEnabled(Boolean(s.compatibility_mode_enabled));
+        setHomeScanEnabled(Boolean(s.home_scan_enabled));
+        setHomeScanIntervalMinutes(Math.max(1, Number(s.home_scan_interval_minutes ?? 60) || 60));
+        setHomeScanLimit(Math.max(1, Number(s.home_scan_limit ?? 10) || 10));
+        setHomeScanLongVideosOnly(Boolean(s.home_scan_long_videos_only));
+        setHomeScanMinDurationSeconds(Math.max(0, Number(s.home_scan_min_duration_seconds ?? 180) || 0));
+        setCookiesTxt("");
+      }
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : String(e));
     }
@@ -113,6 +117,36 @@ export default function SettingsYouTubePage() {
   useEffect(() => {
     refresh();
   }, []);
+
+  const compatibilityDirty = Boolean(settings) && compatibilityModeEnabled !== Boolean(settings?.compatibility_mode_enabled);
+  const homeScanDirty =
+    Boolean(settings) &&
+    (
+      homeScanEnabled !== Boolean(settings?.home_scan_enabled) ||
+      homeScanIntervalMinutes !== Math.max(1, Number(settings?.home_scan_interval_minutes ?? 60) || 60) ||
+      homeScanLimit !== Math.max(1, Number(settings?.home_scan_limit ?? 10) || 10) ||
+      homeScanLongVideosOnly !== Boolean(settings?.home_scan_long_videos_only) ||
+      homeScanMinDurationSeconds !== Math.max(0, Number(settings?.home_scan_min_duration_seconds ?? 180) || 0)
+    );
+  const proxyDirty = Boolean(settings) && proxy !== String(settings?.proxy ?? "");
+  const cookiesToggleDirty = Boolean(settings) && cookiesEnabled !== Boolean(settings?.cookies_enabled);
+  const cookiesContentDirty = Boolean(cookiesTxt.trim());
+  const isDirty = compatibilityDirty || homeScanDirty || proxyDirty || cookiesToggleDirty || cookiesContentDirty;
+  useUnsavedChangesGuard(isDirty, { message: "离开当前页面会丢失尚未保存的 YouTube 配置草稿。" });
+
+  async function reloadFromServer() {
+    if (isDirty) {
+      const ok = await confirm({
+        title: "刷新并放弃未保存修改",
+        message: "刷新会重新载入 YouTube 配置，并覆盖当前页面所有尚未保存的草稿。",
+        confirmLabel: "刷新并放弃",
+        cancelLabel: "继续编辑",
+        tone: "warning",
+      });
+      if (!ok) return;
+    }
+    await refresh(true);
+  }
 
   return (
     <div className="space-y-4">
@@ -125,19 +159,17 @@ export default function SettingsYouTubePage() {
       <div className="vr-section">
         <div className="flex items-center justify-between">
           <div className="text-sm font-semibold">当前配置</div>
-          <button onClick={() => refresh()} className="rounded border px-3 py-2 text-sm hover:bg-slate-50">
-            刷新
-          </button>
+          <Button onClick={() => void reloadFromServer()}>刷新</Button>
         </div>
         {!settings ? (
           <div className="mt-2 text-sm text-slate-500">加载中…</div>
         ) : (
-          <div className="mt-3 grid gap-3 md:grid-cols-2">
-            <div className="rounded border p-3 md:col-span-2">
+          <div className="mt-3 grid gap-3 lg:grid-cols-2">
+            <div className="rounded border p-3 lg:col-span-2">
               <div className="text-xs text-slate-500">proxy</div>
               <div className="mt-1 font-mono text-sm break-all">{settings.proxy || "-"}</div>
             </div>
-            <div className="rounded border p-3 md:col-span-2">
+            <div className="rounded border p-3 lg:col-span-2">
               <div className="text-xs text-slate-500">cookies</div>
               <div className="mt-1 text-sm">
                 {settings.cookies_set ? "已设置" : "未设置"}
@@ -160,7 +192,7 @@ export default function SettingsYouTubePage() {
                 </div>
               ) : null}
             </div>
-            <div className="rounded border p-3 md:col-span-2">
+            <div className="rounded border p-3 lg:col-span-2">
               <div className="text-xs text-slate-500">cookies 文件（YOUTUBE_COOKIE_FILE）</div>
               <div className="mt-1 text-sm">
                 {settings.cookie_file_configured
@@ -173,7 +205,7 @@ export default function SettingsYouTubePage() {
                 </div>
               ) : null}
             </div>
-            <div className="rounded border p-3 md:col-span-2">
+            <div className="rounded border p-3 lg:col-span-2">
               <div className="text-xs text-slate-500">YouTube 兼容模式</div>
               <div className="mt-1 text-sm">{settings.compatibility_mode_enabled ? "已启用" : "未启用"}</div>
             </div>
@@ -182,7 +214,10 @@ export default function SettingsYouTubePage() {
       </div>
 
       <div className="vr-section">
-        <div className="text-sm font-semibold">YouTube 兼容模式</div>
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div className="text-sm font-semibold">YouTube 兼容模式</div>
+          {compatibilityDirty ? <span className="rounded-full bg-amber-50 px-2 py-0.5 text-xs text-amber-700">未保存</span> : null}
+        </div>
         <div className="mt-2 text-xs text-slate-600 space-y-1">
           <div>
             开启后，普通视频下载、元信息和 YouTube 字幕探测会使用 yt-dlp 社区建议的
@@ -204,9 +239,9 @@ export default function SettingsYouTubePage() {
           使用兼容性 YouTube 客户端
         </label>
         <div className="mt-3">
-          <button
-            disabled={compatibilityBusy}
-            className="rounded bg-slate-900 px-3 py-2 text-sm text-white hover:bg-slate-800 disabled:opacity-50"
+          <Button
+            tone="primary"
+            disabled={compatibilityBusy || !compatibilityDirty}
             onClick={async () => {
               setCompatibilityBusy(true);
               setError(null);
@@ -216,7 +251,7 @@ export default function SettingsYouTubePage() {
                   headers: { "Content-Type": "application/json" },
                   body: JSON.stringify({ compatibility_mode_enabled: compatibilityModeEnabled }),
                 });
-                await refresh();
+                await refresh(false);
               } catch (e: unknown) {
                 setError(e instanceof Error ? e.message : String(e));
               } finally {
@@ -225,20 +260,23 @@ export default function SettingsYouTubePage() {
             }}
           >
             保存兼容模式
-          </button>
+          </Button>
         </div>
       </div>
 
       <div className="vr-section">
-        <div className="text-sm font-semibold">首页推荐定时扫描</div>
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div className="text-sm font-semibold">首页推荐定时扫描</div>
+          {homeScanDirty ? <span className="rounded-full bg-amber-50 px-2 py-0.5 text-xs text-amber-700">未保存</span> : null}
+        </div>
         <div className="mt-2 text-xs text-slate-500">
           使用已保存的 YouTube 登录 cookies 扫描首页推荐视频；发现新链接后，直接进入现有 YouTube 自动模式，后续字幕生成和投稿参数继续按 <span className="font-mono">自动模式设置</span> 执行。
         </div>
         <div className="mt-2 text-xs text-slate-500">
           开启“仅抓长视频”后，系统会先额外抓一批候选，再过滤显式 Shorts；如果解析到了时长，还会按你设置的最短时长继续筛选。YouTube 首页里有些正常视频本身不带时长字段，这类候选会在日志里单独统计。
         </div>
-        <div className="mt-3 grid gap-3 md:grid-cols-3">
-          <div className="block md:col-span-3">
+        <div className="mt-3 grid gap-3 lg:grid-cols-3">
+          <div className="block lg:col-span-3">
             <div className="mb-1 text-xs text-slate-600">开关</div>
             <label className="flex items-center gap-2 text-sm">
               <input type="checkbox" checked={homeScanEnabled} onChange={(e) => setHomeScanEnabled(e.target.checked)} />
@@ -319,9 +357,9 @@ export default function SettingsYouTubePage() {
           </div>
         ) : null}
         <div className="mt-3 flex flex-wrap items-center gap-2">
-          <button
-            disabled={homeScanBusy}
-            className="rounded bg-slate-900 px-3 py-2 text-sm text-white hover:bg-slate-800 disabled:opacity-50"
+          <Button
+            tone="primary"
+            disabled={homeScanBusy || !homeScanDirty}
             onClick={async () => {
               setHomeScanBusy(true);
               setError(null);
@@ -337,7 +375,7 @@ export default function SettingsYouTubePage() {
                     home_scan_min_duration_seconds: homeScanMinDurationSeconds,
                   }),
                 });
-                await refresh();
+                await refresh(false);
               } catch (e: unknown) {
                 setError(e instanceof Error ? e.message : String(e));
               } finally {
@@ -346,10 +384,9 @@ export default function SettingsYouTubePage() {
             }}
           >
             保存扫描设置
-          </button>
-          <button
+          </Button>
+          <Button
             disabled={homeScanRunBusy}
-            className="rounded border px-3 py-2 text-sm hover:bg-slate-50 disabled:opacity-50"
             onClick={async () => {
               setHomeScanRunBusy(true);
               setHomeScanResult(null);
@@ -359,7 +396,7 @@ export default function SettingsYouTubePage() {
                   method: "POST",
                 });
                 setHomeScanResult(res);
-                await refresh();
+                await refresh(false);
               } catch (e: unknown) {
                 setError(e instanceof Error ? e.message : String(e));
               } finally {
@@ -368,7 +405,7 @@ export default function SettingsYouTubePage() {
             }}
           >
             立即扫描一次
-          </button>
+          </Button>
         </div>
         {homeScanResult ? (
           <div className="mt-3 rounded border p-3 text-sm">
@@ -408,7 +445,10 @@ export default function SettingsYouTubePage() {
       </div>
 
       <div className="vr-section">
-        <div className="text-sm font-semibold">代理设置</div>
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div className="text-sm font-semibold">代理设置</div>
+          {proxyDirty ? <span className="rounded-full bg-amber-50 px-2 py-0.5 text-xs text-amber-700">未保存</span> : null}
+        </div>
         <div className="mt-2 text-xs text-slate-500">
           支持 <span className="font-mono">http://</span> 和 <span className="font-mono">socks5://</span>，例如
           <span className="font-mono"> http://127.0.0.1:7890 </span> /
@@ -417,9 +457,9 @@ export default function SettingsYouTubePage() {
         <div className="mt-1 text-xs text-slate-500">
           SOCKS5 检测和抓取依赖后端安装 SOCKS 支持；当前生产镜像已内置该依赖。
         </div>
-        <div className="mt-3 grid gap-3 md:grid-cols-2">
-          <label className="block md:col-span-2">
-            <div className="mb-1 text-xs text-slate-600">proxy</div>
+        <div className="mt-3 grid gap-3 lg:grid-cols-2">
+          <label className="block lg:col-span-2">
+            <div className="mb-1 text-xs text-slate-600">代理地址</div>
             <input
               className="w-full rounded border px-3 py-2 text-sm"
               placeholder="http://host:port 或 socks5://host:port"
@@ -427,16 +467,16 @@ export default function SettingsYouTubePage() {
               onChange={(e) => setProxy(e.target.value)}
             />
           </label>
-          <label className="block md:col-span-2">
+          <label className="block lg:col-span-2">
             <div className="mb-1 text-xs text-slate-600">测试链接</div>
             <input className="w-full rounded border px-3 py-2 text-sm" value={testUrl} onChange={(e) => setTestUrl(e.target.value)} />
           </label>
         </div>
 
         <div className="mt-3 flex flex-wrap items-center gap-2">
-          <button
-            disabled={busy}
-            className="rounded bg-slate-900 px-3 py-2 text-sm text-white hover:bg-slate-800 disabled:opacity-50"
+          <Button
+            tone="primary"
+            disabled={busy || !proxyDirty}
             onClick={async () => {
               setBusy(true);
               setError(null);
@@ -446,7 +486,7 @@ export default function SettingsYouTubePage() {
                   headers: { "Content-Type": "application/json" },
                   body: JSON.stringify({ proxy }),
                 });
-                await refresh();
+                await refresh(false);
               } catch (e: unknown) {
                 setError(e instanceof Error ? e.message : String(e));
               } finally {
@@ -455,11 +495,10 @@ export default function SettingsYouTubePage() {
             }}
           >
             保存
-          </button>
+          </Button>
 
-          <button
+          <Button
             disabled={testBusy}
-            className="rounded border px-3 py-2 text-sm hover:bg-slate-50 disabled:opacity-50"
             onClick={async () => {
               setTestBusy(true);
               setTestResult(null);
@@ -479,7 +518,7 @@ export default function SettingsYouTubePage() {
             }}
           >
             测试链接
-          </button>
+          </Button>
         </div>
 
         {testResult ? (
@@ -497,7 +536,10 @@ export default function SettingsYouTubePage() {
       </div>
 
       <div className="vr-section">
-        <div className="text-sm font-semibold">Cookies 设置</div>
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div className="text-sm font-semibold">Cookies 设置</div>
+          {cookiesToggleDirty || cookiesContentDirty ? <span className="rounded-full bg-amber-50 px-2 py-0.5 text-xs text-amber-700">未保存</span> : null}
+        </div>
         <div className="mt-2 text-xs text-slate-500">
           将浏览器导出的 <span className="font-mono">cookies.txt</span>（Netscape 格式）粘贴到下面。保存后用于 yt-dlp 下载/元信息提取。
         </div>
@@ -523,9 +565,9 @@ export default function SettingsYouTubePage() {
           />
         </label>
         <div className="mt-3 flex flex-wrap items-center gap-2">
-          <button
-            disabled={cookiesBusy || !(cookiesTxt ?? "").trim()}
-            className="rounded bg-slate-900 px-3 py-2 text-sm text-white hover:bg-slate-800 disabled:opacity-50"
+          <Button
+            tone="primary"
+            disabled={cookiesBusy || !cookiesContentDirty}
             onClick={async () => {
               setCookiesBusy(true);
               setError(null);
@@ -535,7 +577,8 @@ export default function SettingsYouTubePage() {
                   headers: { "Content-Type": "application/json" },
                   body: JSON.stringify({ cookies_txt: cookiesTxt, cookies_enabled: cookiesEnabled }),
                 });
-                await refresh();
+                setCookiesTxt("");
+                await refresh(false);
               } catch (e: unknown) {
                 setError(e instanceof Error ? e.message : String(e));
               } finally {
@@ -544,10 +587,9 @@ export default function SettingsYouTubePage() {
             }}
           >
             保存 Cookies
-          </button>
-          <button
-            disabled={cookiesBusy}
-            className="rounded border px-3 py-2 text-sm hover:bg-slate-50 disabled:opacity-50"
+          </Button>
+          <Button
+            disabled={cookiesBusy || !cookiesToggleDirty}
             onClick={async () => {
               setCookiesBusy(true);
               setError(null);
@@ -557,7 +599,7 @@ export default function SettingsYouTubePage() {
                   headers: { "Content-Type": "application/json" },
                   body: JSON.stringify({ cookies_enabled: cookiesEnabled }),
                 });
-                await refresh();
+                await refresh(false);
               } catch (e: unknown) {
                 setError(e instanceof Error ? e.message : String(e));
               } finally {
@@ -566,10 +608,10 @@ export default function SettingsYouTubePage() {
             }}
           >
             保存开关
-          </button>
-          <button
+          </Button>
+          <Button
+            tone="danger"
             disabled={cookiesBusy || !settings?.cookies_set}
-            className="rounded border border-rose-300 px-3 py-2 text-sm text-rose-700 hover:bg-rose-50 disabled:opacity-50"
             onClick={async () => {
               const ok = await confirm({
                 title: "清空 YouTube Cookies",
@@ -586,7 +628,8 @@ export default function SettingsYouTubePage() {
                   headers: { "Content-Type": "application/json" },
                   body: JSON.stringify({ cookies_txt: "" }),
                 });
-                await refresh();
+                setCookiesTxt("");
+                await refresh(false);
               } catch (e: unknown) {
                 setError(e instanceof Error ? e.message : String(e));
               } finally {
@@ -595,7 +638,7 @@ export default function SettingsYouTubePage() {
             }}
           >
             清空 Cookies
-          </button>
+          </Button>
         </div>
       </div>
     </div>

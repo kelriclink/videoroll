@@ -15,6 +15,13 @@ install_session_event_emitter()
 
 
 def get_configured_database_url() -> str:
+    # Database tooling (notably Alembic offline SQL generation) should not
+    # require unrelated service settings such as Redis/S3 just to resolve the
+    # database URL. Runtime services still fall back to the validated settings
+    # object when DATABASE_URL is not explicitly present.
+    direct = str(os.getenv("DATABASE_URL") or "").strip()
+    if direct:
+        return direct
     from videoroll.config import get_orchestrator_settings
 
     return get_orchestrator_settings().database_url

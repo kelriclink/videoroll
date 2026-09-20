@@ -16,6 +16,10 @@ from videoroll.apps.subtitle_service.processing import (
 )
 from videoroll.apps.subtitle_service.rag import build_rag_context, rag_settings_from_translate_settings
 from videoroll.apps.subtitle_service.translation_checkpoint import TranslationCheckpointStore
+from videoroll.apps.subtitle_service.translation_memory import (
+    recall_translation_examples,
+    remember_translation_pairs,
+)
 from videoroll.apps.subtitle_service.translation_trace import TranslationTraceRecorder
 from videoroll.db.session import get_sessionmaker
 
@@ -150,6 +154,7 @@ def run_translation_stage(
             "batch_number": batch_count,
             "segment_start": start_idx + 1,
             "requested_segments": len(batch_segments),
+            "source_segments": list(batch_segments),
             "started_at": time.monotonic(),
             "thinking_pending": "",
             "thinking_last_flush_at": time.monotonic(),
@@ -256,39 +261,64 @@ def run_translation_stage(
                 summary: str,
                 batch_context: Any,
             ) -> dict[str, Any] | None:
-                del start_idx
                 current_settings = fresh_translate_settings()
                 current_rag_settings = rag_settings_from_translate_settings(current_settings)
-                if not current_rag_settings.enabled:
-                    return None
-                ctx = build_rag_context(
-                    db,
-                    segments=batch_segments,
-                    target_lang=target_lang,
-                    rag_settings=current_rag_settings,
-                    embedding_settings=embedding_settings_from_translate_settings(current_settings),
-                    chat_config=openai_chat_config_from_settings(current_settings),
-                    previous_summary=summary,
-                    session_factory=lambda: get_sessionmaker(database_url)(),
-                    task_id=task_id,
-                    subtitle_job_id=subtitle_job_id,
-                    parent_agent_run_id=(
-                        str(batch_context.get("run_id") or "")
-                        if isinstance(batch_context, dict) and batch_context.get("run_id")
-                        else None
-                    ),
-                )
-                if ctx.hits:
+                if isinstance(batch_context, dict):
+                    batch_context["translation_domain"] = current_rag_settings.domain
+
+                translation_examples: list[dict[str, Any]] = []
+                try:
+                    translation_examples = recall_translation_examples(
+                        db,
+                        source_segments=batch_segments,
+                        start_idx=start_idx,
+                        target_lang=target_lang,
+                        task_id=task_id,
+                        domain=current_rag_settings.domain,
+                    )
+                except (AttributeError, NotImplementedError):
+                    # Lightweight test/fallback sessions may not provide SQL
+                    # execution. Translation memory is an optimization, not a
+                    # prerequisite for translation.
+                    translation_examples = []
+                except Exception as memory_error:
                     try:
-                        db.commit()
-                    except Exception:
                         db.rollback()
-                if not ctx.term_cards and not ctx.knowledge_cards:
-                    return None
-                return {
-                    "term_cards": ctx.term_cards,
-                    "knowledge_cards": ctx.knowledge_cards,
-                }
+                    except Exception:
+                        pass
+                    log(f"translate memory recall unavailable: {type(memory_error).__name__}: {memory_error}")
+
+                payload: dict[str, Any] = {}
+                if current_rag_settings.enabled:
+                    ctx = build_rag_context(
+                        db,
+                        segments=batch_segments,
+                        target_lang=target_lang,
+                        rag_settings=current_rag_settings,
+                        embedding_settings=embedding_settings_from_translate_settings(current_settings),
+                        chat_config=openai_chat_config_from_settings(current_settings),
+                        previous_summary=summary,
+                        session_factory=lambda: get_sessionmaker(database_url)(),
+                        task_id=task_id,
+                        subtitle_job_id=subtitle_job_id,
+                        parent_agent_run_id=(
+                            str(batch_context.get("run_id") or "")
+                            if isinstance(batch_context, dict) and batch_context.get("run_id")
+                            else None
+                        ),
+                    )
+                    if ctx.hits:
+                        try:
+                            db.commit()
+                        except Exception:
+                            db.rollback()
+                    if ctx.term_cards:
+                        payload["term_cards"] = ctx.term_cards
+                    if ctx.knowledge_cards:
+                        payload["knowledge_cards"] = ctx.knowledge_cards
+                if translation_examples:
+                    payload["translation_examples"] = translation_examples
+                return payload or None
 
             def on_batch_done(
                 batch_context: Any,
@@ -332,6 +362,35 @@ def run_translation_stage(
                         ),
                     )
                     batch_context["finished"] = True
+                    source_segments = batch_context.get("source_segments")
+                    if isinstance(source_segments, list) and source_segments:
+                        try:
+                            written = remember_translation_pairs(
+                                db,
+                                source_segments=[
+                                    segment
+                                    for segment in source_segments[: len(batch_segments)]
+                                    if isinstance(segment, Segment)
+                                ],
+                                translated_segments=batch_segments,
+                                target_lang=target_lang,
+                                task_id=task_id,
+                                subtitle_job_id=subtitle_job_id,
+                                domain=str(batch_context.get("translation_domain") or ""),
+                            )
+                            if written:
+                                db.commit()
+                        except (AttributeError, NotImplementedError):
+                            pass
+                        except Exception as memory_error:
+                            try:
+                                db.rollback()
+                            except Exception:
+                                pass
+                            log(
+                                "translate memory write unavailable: "
+                                f"{type(memory_error).__name__}: {memory_error}"
+                            )
 
             def on_batch_error(batch_context: Any, error: Exception) -> None:
                 nonlocal failed_batches

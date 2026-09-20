@@ -114,6 +114,9 @@ class IntelHardwareProbeRead(BaseModel):
     pci_slot: Optional[str] = None
     pci_id: Optional[str] = None
     detail: str = ""
+    openvino_devices: list[str] = Field(default_factory=list)
+    openvino_gpu_available: bool = False
+    openvino_error: str = ""
 
 
 class ASRDefaultsRead(BaseModel):
@@ -624,6 +627,29 @@ class EmbeddingTestResponse(BaseModel):
     dimensions: int
     expected_dimensions: int
     ok: bool
+
+
+class EmbeddingRuntimeBucket(BaseModel):
+    embedding_model: str = ""
+    dimensions: int
+    count: int
+
+
+class EmbeddingRuntimeStatusRead(BaseModel):
+    supported: bool = True
+    provider: str
+    model: str
+    configured_dimensions: int
+    device: str
+    pgvector_version: str = ""
+    column_type: str = ""
+    total_embeddings: int = 0
+    active_embeddings: int = 0
+    buckets: list[EmbeddingRuntimeBucket] = Field(default_factory=list)
+    hnsw_index_present: bool = False
+    hnsw_usable_for_current_query: bool = False
+    search_mode: Literal["hnsw", "exact_scan", "unavailable"] = "unavailable"
+    detail: str = ""
 
 
 class WhisperModelInfo(BaseModel):
