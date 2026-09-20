@@ -60,10 +60,46 @@ def test_get_agent_run_returns_one_full_run() -> None:
     assert result["id"] == str(run_id)
     assert result["steps"] == [{"kind": "search"}]
     assert result["result"] == {"knowledge_status": "pending"}
+    assert result["subtitle_job_status"] is None
 
 
 def test_get_agent_run_returns_none_when_missing() -> None:
     assert get_agent_run(_Db(None), str(uuid.uuid4())) is None  # type: ignore[arg-type]
+
+
+def test_get_agent_run_keeps_linked_subtitle_job_status() -> None:
+    run_id = uuid.uuid4()
+    job_id = uuid.uuid4()
+    now = datetime.now(tz=timezone.utc)
+    row = SimpleNamespace(
+        _mapping={
+            "id": run_id,
+            "agent_type": "subtitle_translation_session",
+            "status": "running",
+            "term": "字幕翻译 Session",
+            "domain": "subtitle_translation",
+            "target_lang": "zh",
+            "task_id": uuid.uuid4(),
+            "subtitle_job_id": job_id,
+            "subtitle_job_status": "succeeded",
+            "query": "20 segments",
+            "steps": "[]",
+            "result": "{}",
+            "error": "",
+            "knowledge_item_id": None,
+            "parent_agent_run_id": None,
+            "started_at": now,
+            "finished_at": None,
+            "created_at": now,
+            "updated_at": now,
+        }
+    )
+
+    result = get_agent_run(_Db(row), str(run_id))  # type: ignore[arg-type]
+
+    assert result is not None
+    assert result["subtitle_job_id"] == str(job_id)
+    assert result["subtitle_job_status"] == "succeeded"
 
 
 def test_agent_run_schema_keeps_timestamps_without_requiring_them_for_skills() -> None:

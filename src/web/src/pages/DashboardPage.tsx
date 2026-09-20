@@ -6,6 +6,7 @@ import StatusBadge from "../components/StatusBadge";
 import { Asset, Task } from "../lib/types";
 import { PageHeader } from "../components/ui";
 import { RealtimeEvent, useRealtimeSubscription } from "../lib/realtime";
+import { reconcileAgentRunStatuses } from "./dashboardPage.helpers";
 
 type ConvertedVideoItem = {
   task: Task;
@@ -52,6 +53,8 @@ type AgentRun = {
   target_lang: string;
   task_id?: string | null;
   subtitle_job_id?: string | null;
+  subtitle_job_status?: string | null;
+  display_status_reason?: string;
   query: string;
   steps: Array<Record<string, unknown>>;
   result: Record<string, unknown>;
@@ -128,6 +131,15 @@ function agentFailureCategory(run: AgentRun): string {
   return textValue(run.result?.failure_category);
 }
 
+function agentInterruptedTitle(reason: string | undefined): string {
+  if (reason === "superseded") return "同一字幕任务已有更新的翻译 Session，此执行记录已被替代";
+  if (reason === "finished_at") return "此执行记录已有结束时间，但状态没有正常收尾";
+  if (reason === "subtitle_job:queued") return "父字幕任务已重新排队，此执行记录已中断";
+  if (reason === "subtitle_job:succeeded") return "父字幕任务已经完成，此执行记录没有正常收尾";
+  if (reason === "subtitle_job:failed") return "父字幕任务已经失败结束，此执行记录没有正常收尾";
+  return "此 Agent 执行记录已不再运行";
+}
+
 function agentDisplayStatus(run: AgentRun, childrenRuns: AgentRun[] = []): AgentDisplayStatus {
   const status = (run.status || "").toLowerCase();
   const childStatuses = childrenRuns.map((child) => agentDisplayStatus(child));
@@ -141,6 +153,9 @@ function agentDisplayStatus(run: AgentRun, childrenRuns: AgentRun[] = []): Agent
 
   if (hasError) {
     return { label: "failed", tone: "failed", title: run.error || resultError || failureCategory || "Agent failed" };
+  }
+  if (status === "interrupted") {
+    return { label: "interrupted", tone: "warning", title: agentInterruptedTitle(run.display_status_reason) };
   }
   if (status === "running" || runningChildren > 0) {
     return {
@@ -715,7 +730,8 @@ export default function DashboardPage() {
 
   const loadAgentRuns = useCallback(async () => {
     try {
-      setAgentRuns(await fetchJson<AgentRun[]>(`${ORCHESTRATOR_URL}/subtitle/agents/runs?limit=12&include_descendants=true`));
+      const data = await fetchJson<AgentRun[]>(`${ORCHESTRATOR_URL}/subtitle/agents/runs?limit=12&include_descendants=true`);
+      setAgentRuns(reconcileAgentRunStatuses(data));
       setAgentRunsError(null);
     } catch (e: unknown) {
       setAgentRunsError(e instanceof Error ? e.message : String(e));
@@ -752,10 +768,10 @@ export default function DashboardPage() {
         setAgentRuns((current) => {
           const rows = current ?? [];
           const index = rows.findIndex((item) => item.id === run.id);
-          if (index < 0) return [run, ...rows];
+          if (index < 0) return reconcileAgentRunStatuses([run, ...rows]);
           const next = [...rows];
           next[index] = run;
-          return next;
+          return reconcileAgentRunStatuses(next);
         });
       } catch (e: unknown) {
         setAgentRunsError(e instanceof Error ? e.message : String(e));

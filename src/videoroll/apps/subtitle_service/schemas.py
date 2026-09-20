@@ -566,6 +566,7 @@ class AgentRunRead(BaseModel):
     target_lang: str = "zh"
     task_id: Optional[uuid.UUID] = None
     subtitle_job_id: Optional[uuid.UUID] = None
+    subtitle_job_status: Optional[str] = None
     query: str = ""
     steps: list[Any] = Field(default_factory=list)
     result: dict[str, Any] = Field(default_factory=dict)

@@ -6608,6 +6608,7 @@ def _agent_run_row_to_dict(row: Any) -> dict[str, Any]:
         "target_lang": m["target_lang"],
         "task_id": str(m["task_id"]) if m["task_id"] else None,
         "subtitle_job_id": str(m["subtitle_job_id"]) if m["subtitle_job_id"] else None,
+        "subtitle_job_status": str(m.get("subtitle_job_status")) if m.get("subtitle_job_status") is not None else None,
         "query": m["query"],
         "steps": steps if isinstance(steps, list) else [],
         "result": result if isinstance(result, dict) else {},
@@ -6654,6 +6655,9 @@ def list_agent_runs(
                     JOIN agent_tree parent ON child.parent_agent_run_id = parent.id
                 )
                 SELECT id, agent_type, status, term, domain, target_lang, task_id, subtitle_job_id,
+                       (SELECT CAST(job.status AS text)
+                        FROM subtitle_jobs job
+                        WHERE job.id = agent_tree.subtitle_job_id) AS subtitle_job_status,
                        query, steps, result, error, knowledge_item_id, parent_agent_run_id,
                        started_at, finished_at, created_at, updated_at
                 FROM agent_tree
@@ -6674,6 +6678,9 @@ def list_agent_runs(
         text(
             f"""
             SELECT id, agent_type, status, term, domain, target_lang, task_id, subtitle_job_id,
+                   (SELECT CAST(job.status AS text)
+                    FROM subtitle_jobs job
+                    WHERE job.id = translation_agent_runs.subtitle_job_id) AS subtitle_job_status,
                    query, steps, result, error, knowledge_item_id, parent_agent_run_id,
                    started_at, finished_at, created_at, updated_at
             FROM translation_agent_runs
@@ -6699,6 +6706,9 @@ def get_agent_run(db: Session, run_id: str) -> dict[str, Any] | None:
         text(
             """
             SELECT id, agent_type, status, term, domain, target_lang, task_id, subtitle_job_id,
+                   (SELECT CAST(job.status AS text)
+                    FROM subtitle_jobs job
+                    WHERE job.id = translation_agent_runs.subtitle_job_id) AS subtitle_job_status,
                    query, steps, result, error, knowledge_item_id, parent_agent_run_id,
                    started_at, finished_at, created_at, updated_at
             FROM translation_agent_runs
