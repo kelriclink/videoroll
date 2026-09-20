@@ -4,6 +4,7 @@ import base64
 import hashlib
 import html
 import json
+import logging
 import math
 import os
 import re
@@ -86,6 +87,8 @@ from videoroll.apps.subtitle_service.retrieval import RetrievalPipeline
 from videoroll.config import get_subtitle_settings
 from videoroll.realtime import publish_agent_event
 
+
+logger = logging.getLogger(__name__)
 
 _TERM_SPLIT_RE = re.compile(r"[\s\-_]+")
 _CANDIDATE_RE = re.compile(r"\b[A-Za-z][A-Za-z0-9][A-Za-z0-9'._:+#/-]*(?:\s+[A-Za-z0-9][A-Za-z0-9'._:+#/-]*){0,3}\b")
@@ -1957,8 +1960,23 @@ def _finish_agent_run(
 ) -> None:
     if not run_id:
         return
+    trace_db: Session = db
+    owns_trace_db = False
     try:
-        update_result = db.execute(
+        bind = db.get_bind()
+        dialect_name = str(getattr(getattr(bind, "dialect", None), "name", "") or "").lower()
+        if dialect_name == "postgresql":
+            # Agent telemetry must finish independently from the caller's
+            # business transaction. A rollback elsewhere in translation/RAG
+            # must not leave a completed trace permanently marked "running".
+            trace_db = Session(bind=bind)
+            owns_trace_db = True
+    except Exception:
+        trace_db = db
+        owns_trace_db = False
+
+    try:
+        update_result = trace_db.execute(
             text(
                 """
                 UPDATE translation_agent_runs
@@ -1986,10 +2004,10 @@ def _finish_agent_run(
             },
         )
         if runtime is not None and runtime.lease_owner and int(getattr(update_result, "rowcount", 0) or 0) != 1:
-            db.rollback()
+            trace_db.rollback()
             runtime.cancel("agent lease lost")
             raise AgentCancelled("agent lease lost")
-        db.commit()
+        trace_db.commit()
         publish_agent_event(
             get_subtitle_settings().redis_url,
             run_id=run_id,
@@ -2004,7 +2022,17 @@ def _finish_agent_run(
     except AgentCancelled:
         raise
     except Exception:
-        db.rollback()
+        try:
+            trace_db.rollback()
+        except Exception:
+            pass
+        logger.exception("failed to finish agent run %s", run_id)
+    finally:
+        if owns_trace_db:
+            try:
+                trace_db.close()
+            except Exception:
+                pass
 
 
 def translation_trace_recorder(db: Session) -> TranslationTraceRecorder:
@@ -6622,6 +6650,114 @@ def _agent_run_row_to_dict(row: Any) -> dict[str, Any]:
     }
 
 
+def _agent_event_int(value: Any) -> int:
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _reconcile_agent_run_status_from_steps(value: dict[str, Any]) -> None:
+    steps = value.get("steps")
+    if not isinstance(steps, list):
+        return
+
+    terminal_step: dict[str, Any] | None = None
+    terminal_action = ""
+    for step in reversed(steps):
+        if not isinstance(step, dict):
+            continue
+        action = str(step.get("action") or "").strip()
+        if action in {
+            "translation_batch.completed",
+            "translation_batch.failed",
+            "translation_session.completed",
+            "translation_session.failed",
+        }:
+            terminal_step = step
+            terminal_action = action
+            break
+    if terminal_step is None:
+        return
+
+    result = dict(value.get("result") or {}) if isinstance(value.get("result"), dict) else {}
+    output = terminal_step.get("output") if isinstance(terminal_step.get("output"), dict) else {}
+    metadata = terminal_step.get("metadata") if isinstance(terminal_step.get("metadata"), dict) else {}
+
+    if terminal_action.startswith("translation_batch."):
+        started_step = next(
+            (
+                step
+                for step in steps
+                if isinstance(step, dict) and str(step.get("action") or "") == "translation_batch.started"
+            ),
+            {},
+        )
+        started_input = started_step.get("input") if isinstance(started_step.get("input"), dict) else {}
+        requested = _agent_event_int(metadata.get("requested_segments") or started_input.get("segment_count"))
+        translated = _agent_event_int(metadata.get("translated_segments"))
+        result.update(
+            {
+                "batch_number": _agent_event_int(started_input.get("batch_number")),
+                "segment_start": _agent_event_int(started_input.get("segment_start")),
+                "segment_end": _agent_event_int(started_input.get("segment_end")),
+                "requested_segments": requested,
+                "translated_segments": translated,
+                "completed_segments": _agent_event_int(output.get("completed_segments")),
+                "thought_characters": _agent_event_int(metadata.get("thought_characters")),
+                "thought_truncated": bool(metadata.get("thought_truncated")),
+                "updated_summary": str(output.get("updated_summary") or "")[:500],
+            }
+        )
+        if str(value.get("status") or "").strip().lower() == "running":
+            value["status"] = (
+                "failed"
+                if terminal_action == "translation_batch.failed"
+                else ("partial" if requested > 0 and translated < requested else "succeeded")
+            )
+    else:
+        started_step = next(
+            (
+                step
+                for step in steps
+                if isinstance(step, dict) and str(step.get("action") or "") == "translation_session.started"
+            ),
+            {},
+        )
+        started_input = started_step.get("input") if isinstance(started_step.get("input"), dict) else {}
+        result.update(
+            {
+                "total_segments": _agent_event_int(output.get("total_segments") or started_input.get("segment_count")),
+                "completed_segments": _agent_event_int(output.get("completed_segments")),
+                "resumed_segments": _agent_event_int(started_input.get("resumed_segments")),
+                "batch_count": _agent_event_int(output.get("batch_count")),
+                "succeeded_batches": _agent_event_int(output.get("succeeded_batches")),
+                "failed_batches": _agent_event_int(output.get("failed_batches")),
+                "thought_characters": _agent_event_int(output.get("thought_characters")),
+            }
+        )
+        if str(value.get("status") or "").strip().lower() == "running":
+            value["status"] = "failed" if terminal_action == "translation_session.failed" else "succeeded"
+
+    value["result"] = result
+    terminal_error = str(terminal_step.get("error") or "").strip()
+    if terminal_error and not str(value.get("error") or "").strip():
+        value["error"] = terminal_error[:4000]
+    if value.get("finished_at") is None and terminal_step.get("at"):
+        value["finished_at"] = terminal_step.get("at")
+
+
+def _hydrate_agent_run_events(db: Session, values: list[dict[str, Any]]) -> None:
+    missing_ids = [value["id"] for value in values if not value["steps"]]
+    if missing_ids:
+        events = _load_agent_events(db, missing_ids)
+        for value in values:
+            if not value["steps"]:
+                value["steps"] = events.get(value["id"], [])
+    for value in values:
+        _reconcile_agent_run_status_from_steps(value)
+
+
 def list_agent_runs(
     db: Session,
     *,
@@ -6667,12 +6803,7 @@ def list_agent_runs(
             params,
         ).all()
         values = [_agent_run_row_to_dict(row) for row in rows]
-        missing_ids = [value["id"] for value in values if not value["steps"]]
-        if missing_ids:
-            events = _load_agent_events(db, missing_ids)
-            for value in values:
-                if not value["steps"]:
-                    value["steps"] = events.get(value["id"], [])
+        _hydrate_agent_run_events(db, values)
         return values
     rows = db.execute(
         text(
@@ -6692,12 +6823,7 @@ def list_agent_runs(
         params,
     ).all()
     values = [_agent_run_row_to_dict(row) for row in rows]
-    missing_ids = [value["id"] for value in values if not value["steps"]]
-    if missing_ids:
-        events = _load_agent_events(db, missing_ids)
-        for value in values:
-            if not value["steps"]:
-                value["steps"] = events.get(value["id"], [])
+    _hydrate_agent_run_events(db, values)
     return values
 
 
@@ -6720,8 +6846,7 @@ def get_agent_run(db: Session, run_id: str) -> dict[str, Any] | None:
     if row is None:
         return None
     value = _agent_run_row_to_dict(row)
-    if not value["steps"]:
-        value["steps"] = _load_agent_events(db, [value["id"]]).get(value["id"], [])
+    _hydrate_agent_run_events(db, [value])
     return value
 
 

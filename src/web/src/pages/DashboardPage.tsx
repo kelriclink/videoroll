@@ -746,6 +746,15 @@ export default function DashboardPage() {
   }, [loadAgentRuns, loadPublishingTasks, loadResources, loadTasks]);
 
   useEffect(() => {
+    // WebSocket is the fast path, but a missed/drop-overflowed event must not
+    // leave Agent state stale indefinitely. The backend remains authoritative.
+    const timer = window.setInterval(() => {
+      void loadAgentRuns();
+    }, 15_000);
+    return () => window.clearInterval(timer);
+  }, [loadAgentRuns]);
+
+  useEffect(() => {
     fetchJson<ConvertedVideoItem[]>(`${ORCHESTRATOR_URL}/videos/converted?limit=12`)
       .then((data) => setVideos(data))
       .catch((e: unknown) => setVideosError(e instanceof Error ? e.message : String(e)));
@@ -822,7 +831,11 @@ export default function DashboardPage() {
       setPublishingTasks((current) => updateTaskUpload(current, deleted));
       return;
     }
-    if (event.name === "agent_run.started" || event.name === "agent_run.finished") {
+    if (
+      event.name === "agent_run.started"
+      || event.name === "agent_run.resumed"
+      || event.name === "agent_run.finished"
+    ) {
       scheduleAgentListRefresh();
       return;
     }
@@ -844,6 +857,18 @@ export default function DashboardPage() {
           };
           return next;
         });
+      }
+      const stepAction = textValue(step.action);
+      if (
+        stepAction === "translation_batch.completed"
+        || stepAction === "translation_batch.failed"
+        || stepAction === "translation_session.completed"
+        || stepAction === "translation_session.failed"
+      ) {
+        // The terminal trace event is persisted before the run-row status update.
+        // If that status write fails, the API can still reconcile from the
+        // append-only event, so immediately fetch the authoritative snapshot.
+        scheduleAgentListRefresh();
       }
       // RAG's normal step event carries only metadata. Keep the old detail
       // refresh for a selected run, while Think deltas render immediately

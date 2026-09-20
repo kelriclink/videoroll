@@ -764,6 +764,60 @@ def test_finish_fence_rejects_stale_worker(monkeypatch) -> None:
     assert not db.committed
 
 
+def test_finish_agent_run_uses_independent_postgres_trace_session(monkeypatch) -> None:
+    from types import SimpleNamespace
+
+    from videoroll.apps.subtitle_service import rag as rag_module
+
+    class _OuterDb:
+        def __init__(self) -> None:
+            self.committed = False
+            self.rolled_back = False
+
+        def get_bind(self):
+            return SimpleNamespace(dialect=SimpleNamespace(name="postgresql"))
+
+        def commit(self) -> None:
+            self.committed = True
+
+        def rollback(self) -> None:
+            self.rolled_back = True
+
+    class _TraceDb:
+        def __init__(self) -> None:
+            self.committed = False
+            self.closed = False
+
+        def execute(self, *_args, **_kwargs):
+            return SimpleNamespace(rowcount=1)
+
+        def commit(self) -> None:
+            self.committed = True
+
+        def rollback(self) -> None:
+            pass
+
+        def close(self) -> None:
+            self.closed = True
+
+    outer = _OuterDb()
+    trace = _TraceDb()
+    monkeypatch.setattr(rag_module, "Session", lambda *, bind: trace)
+    monkeypatch.setattr(rag_module, "publish_agent_event", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(rag_module, "get_subtitle_settings", lambda: SimpleNamespace(redis_url="redis://test"))
+
+    rag_module._finish_agent_run(
+        outer,  # type: ignore[arg-type]
+        "00000000-0000-0000-0000-000000000001",
+        status="succeeded",
+    )
+
+    assert trace.committed
+    assert trace.closed
+    assert not outer.committed
+    assert not outer.rolled_back
+
+
 def test_openai_retry_observer_counts_each_physical_attempt(monkeypatch) -> None:
     from videoroll.ai import client as client_module
 

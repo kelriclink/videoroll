@@ -4,7 +4,7 @@ import uuid
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
-from videoroll.apps.subtitle_service.rag import get_agent_run
+from videoroll.apps.subtitle_service.rag import _reconcile_agent_run_status_from_steps, get_agent_run
 from videoroll.apps.subtitle_service.schemas import AgentRunRead, AgentSkillRead
 
 
@@ -100,6 +100,100 @@ def test_get_agent_run_keeps_linked_subtitle_job_status() -> None:
     assert result is not None
     assert result["subtitle_job_id"] == str(job_id)
     assert result["subtitle_job_status"] == "succeeded"
+
+
+def test_terminal_batch_event_repairs_stale_running_status() -> None:
+    value = {
+        "status": "running",
+        "finished_at": None,
+        "steps": [
+            {
+                "action": "translation_batch.started",
+                "input": {
+                    "batch_number": 7,
+                    "segment_start": 301,
+                    "segment_end": 350,
+                    "segment_count": 50,
+                },
+            },
+            {
+                "action": "translation_batch.completed",
+                "at": "2026-09-20T14:30:00+00:00",
+                "metadata": {
+                    "requested_segments": 50,
+                    "translated_segments": 50,
+                    "thought_characters": 1234,
+                    "thought_truncated": False,
+                },
+                "output": {
+                    "completed_segments": 350,
+                    "updated_summary": "summary",
+                },
+            },
+        ],
+    }
+
+    _reconcile_agent_run_status_from_steps(value)
+
+    assert value["status"] == "succeeded"
+    assert value["finished_at"] == "2026-09-20T14:30:00+00:00"
+    assert value["result"]["batch_number"] == 7
+    assert value["result"]["segment_start"] == 301
+    assert value["result"]["segment_end"] == 350
+    assert value["result"]["translated_segments"] == 50
+    assert value["result"]["completed_segments"] == 350
+    assert value["result"]["updated_summary"] == "summary"
+
+
+def test_partial_batch_event_repairs_stale_running_status() -> None:
+    value = {
+        "status": "running",
+        "finished_at": None,
+        "steps": [
+            {
+                "action": "translation_batch.completed",
+                "metadata": {"requested_segments": 50, "translated_segments": 17},
+            }
+        ],
+    }
+
+    _reconcile_agent_run_status_from_steps(value)
+
+    assert value["status"] == "partial"
+
+
+def test_terminal_session_failure_repairs_stale_running_status() -> None:
+    value = {
+        "status": "running",
+        "finished_at": None,
+        "steps": [
+            {
+                "action": "translation_session.started",
+                "input": {"segment_count": 240, "resumed_segments": 50},
+            },
+            {
+                "action": "translation_session.failed",
+                "error": "provider failed",
+                "output": {
+                    "total_segments": 240,
+                    "completed_segments": 150,
+                    "batch_count": 4,
+                    "succeeded_batches": 3,
+                    "failed_batches": 1,
+                    "thought_characters": 9000,
+                },
+            },
+        ],
+    }
+
+    _reconcile_agent_run_status_from_steps(value)
+
+    assert value["status"] == "failed"
+    assert value["result"]["total_segments"] == 240
+    assert value["result"]["completed_segments"] == 150
+    assert value["result"]["resumed_segments"] == 50
+    assert value["result"]["failed_batches"] == 1
+    assert value["error"] == "provider failed"
 
 
 def test_agent_run_schema_keeps_timestamps_without_requiring_them_for_skills() -> None:
