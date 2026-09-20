@@ -1,168 +1,482 @@
-# 开发者指南
+# VideoRoll 开发者指南
 
-本文档面向需要在本地开发、调试或扩展 VideoRoll 的开发者。
+当前基线：2026-09-20。
 
-## 仓库结构
+## 1. 仓库结构
 
+```text
+.
+├── src/videoroll/
+│   ├── ai/
+│   ├── apps/
+│   │   ├── orchestrator_api/
+│   │   ├── subtitle_service/
+│   │   ├── youtube_ingest/
+│   │   ├── bilibili_publisher/
+│   │   ├── social_publisher/
+│   │   ├── egress_gateway/
+│   │   └── outbox/
+│   ├── db/
+│   ├── storage/
+│   └── realtime.py
+├── src/web/
+├── migrations/
+├── tests/
+├── scripts/
+├── docker/
+├── services/ffplayout/
+├── social-auto-upload/
+├── docker-compose.yml
+├── docker-compose.intel.yml
+└── docs/
 ```
-src/videoroll/apps/   Orchestrator、字幕、接入、投稿与 egress 服务
-src/videoroll/db/     SQLAlchemy 模型、Alembic 迁移与 outbox/inbox
-src/videoroll/storage/ 共享文件存储封装
-src/videoroll/ai/     翻译、embedding、RAG 与模型客户端
-src/videoroll/utils/  加密、内部 token 与共享工具
-src/web/              React 18 + Vite + Tailwind 前端
-tests/                后端测试（pytest）
-docs/                 架构、部署、接口与开发文档
-scripts/              开发、检查、镜像构建与导出脚本
-Dockerfile            应用与 egress gateway 镜像
-docker/               entrypoint、社交发布器镜像与运行脚本
-docker-compose.yml    进程隔离的默认 Compose 拓扑
-docker-compose.intel.yml  Intel iGPU 覆盖层
+
+## 2. Python 环境
+
+要求：
+
+```text
+Python >= 3.12
 ```
 
-## 开发环境命令
+主依赖在 `pyproject.toml` 固定版本。
+
+开发安装：
 
 ```bash
-# 启动全部服务（含 Intel GPU 透传）
+python -m venv venv
+venv/bin/pip install -c requirements.lock -e '.[dev]'
+```
+
+字幕依赖：
+
+```bash
+venv/bin/pip install -c requirements.lock -e '.[subtitle]'
+```
+
+ASR：
+
+```bash
+venv/bin/pip install -c requirements.lock -e '.[subtitle,asr]'
+```
+
+## 3. Frontend
+
+要求：
+
+```text
+Node >=22 <23
+```
+
+```bash
+cd src/web
+npm ci
+npm run dev
+```
+
+验证：
+
+```bash
+npm run lint
+npm test
+npm run build
+```
+
+## 4. 一键开发环境
+
+```bash
+git submodule update --init --recursive
 ./scripts/dev_up.sh
-
-# 停止服务
-./scripts/dev_down.sh
-
-# 健康检查
-./scripts/dev_health.sh
-
-# 查看日志
-./scripts/dev_logs.sh
-
-# 仅前端开发服务器（Vite, port 3000）
-./scripts/dev_web.sh
-
-# 后端测试
-python3 -m pytest tests/
-
-# 前端 lint / 构建
-cd src/web && npm run lint && npm run build
-
-# 本地冒烟测试
-./scripts/smoke_local.sh [video.mp4]
 ```
 
-## 构建与部署
+辅助：
 
 ```bash
-# 构建并导出完整离线生产包（包含 egress gateway）
-ENV_FILE=.env INCLUDE_BASE_IMAGES=1 ./scripts/build_export_prod.sh
+./scripts/dev_health.sh
+./scripts/dev_logs.sh
+./scripts/dev_down.sh
+./scripts/dev_web.sh
+./scripts/smoke_local.sh
+./scripts/security_smoke.sh
 ```
 
-生产离线部署、GPU、迁移与回退见[部署指南](DEPLOYMENT.md)。
+## 5. Compose 文件
 
-## 安全上线与运行
+主文件：
 
-生产部署只公开 `web` 的 `${PUBLISH_ADDR}:${WEB_PORT}`。`orchestrator`、内部 API、Redis、outbox dispatcher、egress gateway 和 ffplayout 都不得添加宿主机 `ports:` 映射；需要诊断时使用受控的 `docker compose exec`，不要临时暴露内部端口。公网出站权限按服务职责分区，详见架构指南。
-
-### 必需环境变量
-
-| 变量 | 生产要求 | 用途 |
-|---|---|---|
-| `DEVELOPMENT_MODE` | `false` | 仅本地开发可设为 `true`；不是关闭认证的开关。 |
-| `INTERNAL_API_SECRET` | 随机、非空、非默认值 | 派生内部服务请求 token 和管理员 cookie 密钥。 |
-| `ADMIN_BOOTSTRAP_SECRET` | 随机、非空、非默认值 | 一次性初始化管理员账户；成功使用后会被数据库标记为已消费。 |
-| `EGRESS_GATEWAY_URL` | `http://egress-gateway:8020` | RAG/网页抓取唯一允许使用的出站网关。 |
-| `ORCHESTRATOR_URL` | `http://orchestrator:8000` | 内部 worker 回调地址，不能指向公网 URL。 |
-| `PUBLISH_ADDR` | 通常 `127.0.0.1` | 唯一允许的 Web 宿主机绑定地址。 |
-
-从 `.env.example` 开始，使用密码管理器或部署系统注入两个 secret；不要将真实值提交到仓库。`./scripts/dev_up.sh` 仅为首次本地开发生成唯一 secret，不能替代生产密钥管理。
-
-### 上线阶段与回退边界
-
-1. 备份数据库，并确认现有任务、publish jobs 与发布批次可读。
-2. 运行 `python -m videoroll.db.migrate upgrade`，再启动 `egress-gateway`、内部 API/worker、`outbox-dispatcher` 和最后的 `web`。
-3. 运行 `./scripts/security_smoke.sh`；该检查不联网、不启动容器。
-4. 观察 outbox pending 年龄、失败重试、内部鉴权失败、egress 拒绝和 desktop grant 拒绝日志，再允许生产流量。
-
-当前没有允许降级到旧安全模型的 feature flag。`DEVELOPMENT_MODE`、`DEPLOYMENT_ROLE`、服务副本数和 dispatcher 启停只能控制本地开发或部署拓扑，不能恢复 query-token、未认证 noVNC、直接内部端口或任意出站请求。出现问题时可以回退应用版本、停止新流量或扩容 dispatcher，但保留 schema 与安全边界。
-
-### Outbox 观察与修复
-
-所有可恢复的异步副作用首先写入 `outbox_events`，再由 `outbox-dispatcher` 投递。broker 失败会释放事件并以指数退避重试；dispatcher lease 过期可被其他 dispatcher 认领。
-
-- 首先确认 `outbox-dispatcher` 健康且 Redis 可用：`docker compose ps outbox-dispatcher redis`。
-- 查看 `outbox_events` 中的 `status`、`attempt_count`、`available_at`、`lease_until` 和 `last_error`，不要直接删除 pending/failed 行。
-- 修复 broker 或 worker 后重启/扩容 dispatcher；正常调度会重新认领到期事件。
-- 仅当确认 worker 从未达到外部副作用边界时，才能对已投递但未启动的操作执行受控重投；`unknown` 发布状态必须由管理员确认，不能靠重启或 SQL 强行重试。
-
-### Desktop 授权
-
-管理员先通过 `POST /api/desktop/grants` 创建 login 或 publish grant；grant 绑定管理员会话、desktop 类型和资源 UUID，默认 5 分钟有效，WebSocket 重连次数受限。浏览器 URL 中的 grant 是短期授权材料，不是 VNC 密码：不要复制到工单、日志或 Referer。Nginx 会对 noVNC landing page 与 WebSocket 发起授权子请求；没有管理员会话、过期 grant、错误资源或超出重连上限都会被拒绝。
-
-VNC 进程密码只存在容器 tmpfs；它不应出现在 URL、数据库、前端配置或日志。部署 interactive desktop 前，应额外验证 noVNC 的受信任密码握手路径已随当前镜像启用。
-
-### Egress 私网要求
-
-RAG/页面抓取只能调用 egress gateway。网关对每次 DNS 结果、重定向目标和实际连接 peer 都要求全局可路由地址，拒绝 loopback、RFC1918、link-local、metadata 与混合 DNS 结果；不能通过 hosts、代理或 URL 凭证绕过。应用容器不应直接获得任意公网出口。
-
-## 架构要点
-
-### 进程角色
-
-Compose 不再把多个 API 或 worker 组合进同一 PID。`orchestrator`、内部 API、发布器进程、worker、dispatcher 和 `egress-gateway` 都是独立容器进程；相同应用镜像通过不同 `command` 与 `DEPLOYMENT_ROLE` 启动。服务边界和网络图见[架构指南](ARCHITECTURE.md)。
-
-浏览器只与 `web` 和 Orchestrator 合约交互，不能直接调用子服务。内部调用通过 Docker DNS、`X-Videoroll-Internal-Token` 与受限代理路径完成。
-
-### 任务状态机
-
-```
-CREATED → INGESTED → DOWNLOADED → AUDIO_EXTRACTED → ASR_DONE → TRANSLATED
-→ SUBTITLE_READY → RENDERED → READY_FOR_REVIEW → APPROVED → PUBLISHING → PUBLISHED
+```text
+docker-compose.yml
 ```
 
-服务间仅通过 DB 任务状态 + 共享文件存储 key 通信，不直接传递大体积媒体数据。
+Intel GPU override：
 
-### Celery、outbox 与恢复
+```text
+docker-compose.intel.yml
+```
 
-| 角色 | 队列/职责 | 关键任务 |
-|---|---|---|
-| `subtitle_service.worker` | `subtitle` | `task_queue_tick`（调度器）、`process_job`（ASR+翻译）、`process_render_job`（ffmpeg 压制）、`auto_youtube_pipeline`、`after_render_publish`、`cleanup_task` |
-| `bilibili_publisher.worker` | `publish` | `process_job`（上传 B 站） |
-| `social_publisher.worker` | `social_publish` | 账号校验、受控浏览器投稿与状态回写 |
-| `outbox-dispatcher` | durable outbox | 认领、投递和重试副作用事件 |
+仓库另有 `compose.yml` 和 `fromprod/docker-compose.yml` 用于兼容/生产工作流。
 
-worker 使用 operation key、inbox 和 lease/heartbeat，过期任务可恢复。外部发布状态必须先对账，不能把 `unknown` 直接重试。
+脚本和 CI 应显式传 `-f`，不要依赖 Compose 自动选文件。
 
-### 数据库
+## 6. Orchestrator
 
-PostgreSQL + psycopg 3 与 SQLAlchemy 2 ORM。生产 schema 由 Alembic 管理：`python -m videoroll.db.migrate upgrade`。旧 `auto_migrate` 仅用于有限兼容路径，不能替代升级迁移。
+入口：
 
-### 配置
+```text
+src/videoroll/apps/orchestrator_api/app.py
+```
 
-每个服务一个 pydantic-settings `Settings` 类，继承 `CommonSettings`。环境变量驱动，支持 `.env` 文件，`@lru_cache` 缓存。
+Router：
 
-### 前端
+```text
+routers/
+├── auth.py
+├── desktop.py
+├── system.py
+├── settings.py
+├── maintenance.py
+├── operations.py
+├── assets.py
+├── youtube.py
+├── publishing.py
+└── tasks.py
+```
 
-React 18 + TypeScript + Vite + Tailwind + react-router-dom v6。生产环境 nginx 托管 SPA 并反代 `/api/`。开发时 Vite 反代 `/api` 到 `localhost:8000`；前端只保留 Orchestrator API base URL，子服务地址不会注入浏览器构建产物。
+新路由优先进入对应 router/service，不要重新扩大单个 God file。
 
-### 外部服务
+## 7. Subtitle Service
 
-- **Redis** — Celery broker/backend
-- **共享文件存储** — `/storage/objects` 下的相对 key、原子文件操作，以及独立的 `/storage/playout-media` 播控媒体目录
-- **PostgreSQL 16+** — 需外部提供
+入口：
 
-## 编码约定
+```text
+src/videoroll/apps/subtitle_service/main.py
+```
 
-- Python ≥3.12，`snake_case` 模块/函数，`PascalCase` 类/Pydantic 模型
-- 4 空格缩进，类型注解
-- 前端组件 `PascalCase`，helpers 命名如 `videosPage.helpers.ts`
-- 测试文件 `*.test.ts`（前端）或 `tests/test_<feature>.py`（后端）
-- 提交信息使用 Conventional Commit 前缀：`feat:`、`fix:` 等
+关键模块：
 
-## 安全注意事项
+| 文件 | 职责 |
+|---|---|
+| `processing.py` | ASR、字幕、渲染主处理 |
+| `translation_stage.py` | 翻译阶段协调 |
+| `rag.py` | RAG / Agent research |
+| `agent_runtime.py` | budget、tool policy、cancel、trace |
+| `agent_skills.py` | Skill loader / selection |
+| `translation_quality.py` | Translation Plan / validator |
+| `translation_memory.py` | TM write / recall |
+| `translation_checkpoint.py` | 翻译断点 |
+| `translation_trace.py` | Agent / translation trace |
+| `embeddings.py` | Embedding provider / device |
+| `provider_rate_limit.py` | provider rate/concurrency gate |
+| `render_queue_store.py` | 渲染队列 |
+| `worker.py` | Celery tasks |
 
-详见 [docs/SECURITY_AUDIT.md](SECURITY_AUDIT.md)。
+## 8. AI Client
 
-要点：
+统一 AI 请求逻辑位于：
 
-- 不要提交真实的 cookies、API keys 或 `data/secrets/fernet.key`
-- 密钥丢失 = 所有加密设置不可恢复
-- RAG 向量搜索需要 pgvector 扩展
-- 新环境变量需记录在 `.env.example`
+```text
+src/videoroll/ai/
+```
+
+业务代码不要重复实现：
+
+- Retry-After；
+- HTTP retry；
+- SSE；
+- native tools；
+- usage parsing；
+- token accounting；
+- cost estimation；
+- provider error mapping。
+
+新增 provider 行为优先扩展统一 AI Client。
+
+## 9. Agent Tool 规则
+
+Tool 必须：
+
+1. 注册到 `ToolRegistry`；
+2. 定义 Pydantic input/output schema；
+3. 通过 `AgentRuntime` / `ToolExecutor`；
+4. 接受 budget、cancel、policy、rate-limit 控制。
+
+禁止无 Runtime 直接执行 registry tool。
+
+User Skill 不是可执行脚本插件，只能影响 prompt 和允许的工具集合。
+
+## 10. 数据库
+
+Model：
+
+```text
+src/videoroll/db/models.py
+```
+
+Migration：
+
+```text
+migrations/versions/
+```
+
+新增数据库字段时：
+
+1. 修改 SQLAlchemy model；
+2. 新建 Alembic migration；
+3. 如需兼容 legacy schema，使用 schema compatibility helper；
+4. 更新 PostgreSQL migration tests；
+5. 更新相关 docs。
+
+当前 head：
+
+```text
+0006_agent_runtime
+```
+
+运行：
+
+```bash
+DATABASE_URL=postgresql+psycopg://... \
+python -m videoroll.db.migrate upgrade
+```
+
+## 11. PostgreSQL 与 pgvector
+
+CI 使用：
+
+```text
+pgvector/pgvector:pg16
+```
+
+Embedding 数据允许不同模型和维度共存。
+
+不要在代码里假设：
+
+```text
+embedding column == vector(当前配置维度)
+```
+
+查询必须考虑：
+
+- `embedding_model`；
+- `vector_dims`；
+- target language；
+- domain/status。
+
+修改 ANN 查询或索引时，同时检查 `/subtitle/embedding/runtime` 的运行事实。
+
+## 12. Durable Outbox
+
+涉及外部副作用时，不应简单：
+
+```python
+db.commit()
+celery_task.delay(...)
+```
+
+优先在同一 transaction 写：
+
+- domain state；
+- outbox event。
+
+Worker 使用 operation inbox / operation key 防止重复消息造成重复外部副作用。
+
+相关代码：
+
+```text
+src/videoroll/apps/outbox/
+```
+
+## 13. Realtime
+
+Backend：
+
+```text
+src/videoroll/realtime.py
+src/videoroll/apps/orchestrator_api/realtime.py
+```
+
+Frontend：
+
+```text
+src/web/src/lib/RealtimeProvider.tsx
+src/web/src/lib/realtime.ts
+```
+
+实时 event 不是数据库替代品。页面初始状态必须来自 REST snapshot。
+
+## 14. Frontend
+
+主要页面：
+
+- Dashboard；
+- Tasks；
+- Videos；
+- Task Detail；
+- YouTube Sources；
+- Render Queue；
+- Knowledge Base；
+- Dictionary；
+- Operations；
+- Playout；
+- Settings。
+
+Settings 公共模式：
+
+- `SettingsLayout`；
+- `SettingsSaveBar`；
+- `useUnsavedChangesGuard`。
+
+可编辑配置页应避免：
+
+- 改完直接切页丢失；
+- 保存一个 section 时全页 refresh 覆盖其他草稿；
+- 把数据库 key / env key 当主 UI label；
+- 把危险操作混入普通保存按钮组。
+
+## 15. Settings UI 原则
+
+推荐：
+
+```text
+用户可读名称
+  ↓
+内部 key 作为次级辅助
+
+配置值
+  ≠
+真实运行状态
+```
+
+例如 OpenVINO：
+
+- 配置可以是 `GPU`；
+- 运行状态必须额外检查 DRM 和 `ov.Core().available_devices`。
+
+Embedding 同理：
+
+- 配置维度不等于数据库列固定维度；
+- UI 应显示 vector buckets 和实际 search mode。
+
+## 16. 测试
+
+全套：
+
+```bash
+python -m pytest -q
+```
+
+迁移专项：
+
+```bash
+python -m pytest -q \
+  tests/test_database_initialization.py \
+  tests/test_security_schema_migration.py \
+  tests/test_database_initialization_postgresql.py
+```
+
+前端：
+
+```bash
+cd src/web
+npm run lint
+npm test
+npm run build
+```
+
+Compose：
+
+```bash
+docker compose -f docker-compose.yml config --quiet
+docker compose -f compose.yml config --quiet
+docker compose -f fromprod/docker-compose.yml config --quiet
+```
+
+## 17. CI
+
+`.github/workflows/ci.yml` 当前包含：
+
+- Backend pytest；
+- PostgreSQL + pgvector migration tests；
+- Redis service；
+- ffplayout gateway contract；
+- security smoke；
+- frontend ESLint；
+- Vitest；
+- frontend production build；
+- Compose config；
+- Docker core/subtitle dependency-boundary smoke。
+
+Core image 不应泄漏重型 subtitle 依赖，例如：
+
+- torch；
+- sentence-transformers；
+- optimum；
+- faster-whisper；
+- openvino-genai。
+
+## 18. 日志与错误
+
+原则：
+
+- provider error 保留 status/error type；
+- 不记录完整 API Key/Cookie；
+- Agent trace 使用结构化 event；
+- task log 正文由 storage 管理；
+- WebSocket 只发 `log.updated`，不推整个日志；
+- “unknown external side effect”不能自动当作“确定失败”。
+
+## 19. 修改发布链
+
+新增平台时同时评估：
+
+- `Platform`；
+- settings；
+- account；
+- PublishBatch target；
+- worker queue；
+- idempotency；
+- outcome semantics；
+- cleanup；
+- UI；
+- alerts。
+
+外部发布超时可能代表平台已经完成副作用，不能机械自动重试。
+
+## 20. 文档同步
+
+以下改动必须同步文档：
+
+- 新 service / port / network；
+- route contract；
+- migration；
+- environment variable；
+- production directory；
+- security boundary；
+- task status；
+- Agent/translation pipeline。
+
+## 21. 提交前检查
+
+至少：
+
+```bash
+git diff --check
+python -m pytest -q
+
+cd src/web
+npm run lint
+npm test
+npm run build
+```
+
+涉及 Compose：
+
+```bash
+docker compose -f docker-compose.yml config --quiet
+```
+
+涉及 migration：
+
+```bash
+python -m pytest -q tests/test_database_initialization_postgresql.py
+```

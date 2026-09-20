@@ -1,167 +1,341 @@
-# VideoRoll 项目审计报告
+# VideoRoll 安全架构与剩余风险
 
-## 2026-07 安全架构上线状态
+基线：2026-09-20。
 
-本节覆盖本轮上线已落实的边界，并替代下文与其矛盾的历史风险描述。历史条目仍保留，供追踪尚未处理的风险。
+本文说明**当前工程安全边界**。它不是第三方渗透测试报告，也不继续把旧版本已经修复的问题列成“当前 Critical”。
 
-| 边界 | 当前状态 | 验证 |
-|---|---|---|
-| 内部服务 | 所有非 `/health` 请求需要 `X-Videoroll-Internal-Token`；东西向流量使用 `internal: true` 网络，公网出站按 subtitle/platform/egress-gateway 职责分区 | `scripts/security_smoke.sh` |
-| Remote API | 只接受 Bearer `POST` JSON 与 `Idempotency-Key`；旧 GET/query-token 为 `410` | `tests/test_security_rollout.py` |
-| 异步副作用 | domain 事务与 outbox 事件同事务提交，broker 失败保留为可重试状态 | `tests/test_security_rollout.py` |
-| noVNC | 短期、会话/资源绑定的 desktop grant 保护 landing page 与 WebSocket | `tests/test_security_rollout.py` |
-| 外部抓取 | egress gateway 复核 DNS、redirect 和连接 peer，拒绝私网/非全局地址 | `tests/test_security_rollout.py` |
+## 1. 管理员认证
 
-### 上线前检查
+当前管理员密码：
 
-```bash
-./scripts/security_smoke.sh
+- PBKDF2-HMAC-SHA256；
+- 200,000 iterations；
+- 随机 16-byte salt；
+- 长度限制 8..128。
+
+管理员登录后使用：
+
+```text
+videoroll_admin_device
 ```
 
-该脚本不启动 Compose，也不访问外网；它验证内部认证、内部服务未发布宿主机端口、URL 凭证拒绝、desktop grant 作用域、outbox 重试和私网 egress 拒绝。完整回归仍按 CI 流程执行。
+trusted-device cookie。
 
-### 回滚限制
+Cookie signing key 派生自：
 
-可以停止入口流量、回退应用镜像、修复 Redis/worker 并让 outbox 重试，或暂停 interactive desktop 的业务入口。不得通过任何环境变量、nginx 临时规则或旧镜像恢复以下能力：
+- internal secret；
+- 当前管理员 password hash。
 
-- Remote API 的 GET 或 query-token；
-- 未认证 noVNC 或公开 VNC/websockify 端口；
-- 内部 API 的宿主机端口映射或无内部 service token 调用；
-- 绕过 egress gateway 的私网/任意目标抓取。
+因此管理员修改密码后，旧 device cookie 不再通过验证。
 
-Schema 增量应保留以维护历史任务、outbox 和授权记录；数据库降级需要单独的备份恢复计划，不能作为事故中的即时回退动作。
+当前 device cookie 最大寿命约 180 天，这是易用性取舍。
 
-## 需要立即修复 (Critical)
+## 2. 内部服务认证
 
-### 1. Fernet 密钥管理缺失
-- **文件**: `src/videoroll/utils/fernet.py`
-- 密钥文件不存在时自动生成新密钥，无备份/轮转机制
-- 密钥丢失 = 所有加密的 YouTube cookies、Bilibili tokens、OpenAI API keys 永久不可恢复
-- 无密钥轮转支持，`@lru_cache` 使密钥在进程生命周期内无法刷新
-- **改进**: 启动时检查密钥是否存在，不存在则报错退出而非静默生成；支持密钥轮转
+内部请求使用：
 
-### 2. 登录接口无防暴力破解
-- **文件**: `src/videoroll/apps/orchestrator_api/main.py` (`/auth/login`)
-- 无速率限制，可无限次尝试密码
-- PBKDF2 200k 迭代提供了一定的单次计算成本，但不足以作为唯一防线
-- **改进**: 加入 `slowapi` 或类似限流库，限制同一 IP 的登录尝试频率
+```text
+X-Videoroll-Internal-Token
+```
 
-### 3. Remote API token 通过 query 参数传递（已修复）
-- **文件**: `src/videoroll/apps/orchestrator_api/remote_api_settings_store.py`
-- `?token=` 出现在 access log、代理日志、浏览器历史、Referer header 中
-- token 虽然在存储时做了 PBKDF2 hash，但传输过程中明文暴露
-- **现状**: 仅接受 `Authorization: Bearer` 的 JSON `POST`；旧 GET/query 合约返回 `410 Gone`
+并依赖：
 
----
+- Docker internal network；
+- 不公开内部服务 host port；
+- shared internal secret。
 
-## 高优先级 (High)
+风险：单个内部容器完全失陷后，共享 secret 的横向影响仍然存在。
 
-### 4. orchestrator_api/main.py 是 God File
-- **文件**: `src/videoroll/apps/orchestrator_api/main.py` (2900+ 行)
-- 80+ 路由、CORS 配置、认证中间件、后台线程（清理、YouTube 扫描）全部在一个文件中
-- 错误处理不统一：有的直接 `raise HTTPException`，有的 `try/except httpx.HTTPError`，有的 `except Exception: pass`
-- `_ingest_youtube_source` 在多处被调用，但内部自行创建 `httpx.Client` 和 `SessionLocal`，无法参与外部事务
-- **改进**: 按职责拆分为独立 router 模块（auth、tasks、settings、youtube、maintenance）；统一错误处理中间件
+长期增强方向：
 
-### 5. Celery worker 无重试和确认机制
-- **文件**: `src/videoroll/apps/subtitle_service/worker.py`
-- `process_job`、`process_render_job`、`task_queue_tick` 均未使用 `autoretry_for`、`retry()`、`acks_late`
-- worker 被 OOM/SIGKILL 杀掉后任务直接丢失，仅有的恢复逻辑 `_recover_interrupted_subtitle_jobs()` 将任务标记为 FAILED 而非重试
-- 翻译重试使用 `while True` + `time.sleep()` 阻塞 worker 线程
-- **改进**: 加 `acks_late=True` + `autoretry_for` 或手动 `retry()`；翻译重试改用 Celery 内置 retry 机制
+- per-service identity；
+- short-lived signed token；
+- mTLS / service mesh。
 
-### 6. 容器以 root 运行
-- **文件**: `Dockerfile`
-- 无 `USER` 指令，容器进程以 root 身份运行
-- 应用被攻破后攻击者拥有完整 root 权限
-- **改进**: 加 `RUN useradd -r -s /usr/sbin/nologin videoroll` 和 `USER videoroll`
+## 3. 容器基线
 
-### 7. 内部服务间认证 token 从 S3 secret 派生（已修复）
-- **文件**: `src/videoroll/utils/internal_api_token.py`
-- token = `SHA256("videoroll-internal-token:v1:" + s3_secret_access_key)`
-- S3 secret 轮转后所有内部认证同时失效，无独立的内部密钥配置
-- 无 HMAC、无 per-service nonce、无过期机制
-- **现状**: 独立的 `INTERNAL_API_SECRET` 经版本化 HMAC 派生，生产环境拒绝空值和已知默认值
+应用服务普遍使用：
 
-### 8. 安全相关 cookie 配置问题
-- **文件**: `src/videoroll/apps/orchestrator_api/main.py`
-- 设备 cookie 有效期 180 天，无会话撤销机制，被盗 cookie 可用半年
-- 非 HTTPS 时不设 `Secure` 标志，cookie 以明文传输
-- `allow_methods=["*"]` + `allow_credentials=True` 配置过于宽松
-- 密码 hash 缓存在 app.state 中，改密码后旧 hash 不会立即失效
-- **改进**: 缩短 cookie 有效期；始终设 `Secure`；限制 CORS methods/headers；密码变更时清理缓存
+```text
+non-root UID/GID
+no-new-privileges
+cap_drop: ALL
+init: true
+```
 
----
+这降低容器进程权限，但不代表容器逃逸或依赖漏洞不可发生。
 
-## 中优先级 (Medium)
+## 4. 网络出口
 
-### 9. Auto-migration 功能受限
-- **文件**: `src/videoroll/db/auto_migrate.py`
-- 只能 `ALTER TABLE ADD COLUMN`，无法处理：重命名列、改类型、建新表、加约束/索引、删列、数据迁移
-- `@lru_cache` 使 rolling deploy 时旧进程不会执行新 migration
-- `_add_column` 使用字符串拼接构造 SQL，虽然当前是硬编码值但存在注入隐患
-- **改进**: 如果 schema 变更频繁，考虑引入 Alembic；至少将 SQL 构造改为参数化
+Compose 将外网能力按角色拆分：
 
-### 10. 代码重复
-- `_effective_youtube_settings` 在 `orchestrator_api/main.py` 和 `subtitle_service/worker.py` 中重复
-- `_read_s3_bytes` 在两个文件中几乎完全相同
-- `_safe_append_log_line`、`_safe_append_log_block`、`_cleanup_local_work_root` 等辅助函数仅存在于 worker.py 但其他模块也需要
-- **改进**: 提取到 `videoroll/utils/` 共享模块
+- egress；
+- subtitle-egress；
+- platform-egress；
+- playout-egress；
+- infrastructure-egress；
+- web-ingress。
 
-### 11. Docker entrypoint 单点故障
-- **文件**: `docker/entrypoint.sh`
-- 三个进程并行运行（uvicorn + 2 celery workers），一个挂了整个容器退出，无重启逻辑
-- 没有 `exec` 启动 uvicorn，SIGTERM 发给 bash 而非 uvicorn，信号处理可能异常
-- 无健康检查 / readiness probe
-- **改进**: 考虑用 supervisord 或拆分为独立容器；对 uvicorn 使用 `exec`
+RAG Agent 不获得通用 shell/socket 工具；网页访问通过注册 tool 和受控 egress 路径。
 
-### 12. 前端类型安全弱
-- **文件**: `src/web/src/lib/types.ts`, `src/web/src/lib/http.ts`
-- `Asset.kind`、`SubtitleJob.status`、`PublishJob.state` 用 `string` 而非联合类型
-- `fetchJson` 做 `as T` 强转，无运行时校验，API 响应变化时静默产生错误数据
-- 部分页面用 `alert()`/`confirm()` 做用户反馈
-- **改进**: 将已知枚举定义为 union types；关键 API 响应加 zod 运行时校验
+## 5. Remote API
 
-### 13. 依赖版本只有下限没有上限
-- **文件**: `pyproject.toml`
-- `cryptography>=42.0.0`、`fastapi>=0.115.0`、`yt-dlp>=2026.2.4` 等均无上界
-- 未来 `pip install` 可能拉入不兼容或有安全问题的版本
-- **改进**: 对安全敏感的包（cryptography、sqlalchemy、psycopg）加 `<next_major` 上界
+控制：
 
-### 14. 大量错误被静默吞掉
-- 散布在 `orchestrator_api/main.py` 和 `subtitle_service/worker.py` 中的 `except Exception: pass`
-- cookie 文件处理、S3 操作等关键路径中的异常被忽略，生产环境排查困难
-- **改进**: 至少加 `logger.warning()` 记录被吞掉的异常；关键路径不吞异常
+- Bearer header only；
+- query token 不接受；
+- durable Idempotency-Key；
+- DB request hash；
+- token/IP rate limit；
+- per-token concurrent dispatch limit。
 
-### 15. S3_USE_SSL 默认关闭
-- **文件**: `src/videoroll/config.py`
-- `s3_use_ssl: bool = Field(False, ...)` 导致默认情况下数据在网络上明文传输
-- **改进**: 生产环境默认 `True`，仅在开发配置中显式关闭
+Remote API 的 durable 事实保存在 PostgreSQL，而不是 Redis。
 
----
+详细见 [REMOTE_API.md](REMOTE_API.md)。
 
-## 低优先级 (Low)
+## 6. WebSocket
 
-### 16. 测试覆盖不足
-- 纯函数（`publish_meta_rules`、`publish_review`）测试质量好
-- 缺少：API 层集成测试、Celery 任务测试、auth 中间件测试、错误路径测试
-- `test_translate_resume.py` 手动构造假 `httpx` 模块，脆弱易碎
-- **改进**: 补充 API endpoint 测试（用 `TestClient`）；增加 Celery 任务的单元测试
+WebSocket 要求：
 
-### 17. `lru_cache` 导致测试间状态泄漏
-- `get_orchestrator_settings()` 等被 `@lru_cache` 住，测试间无法重置配置
-- **改进**: 提供 `clear_settings_cache()` 辅助函数，或在测试中使用 `@pytest.fixture` 管理 cache
+- 管理员 device cookie；
+- Origin 校验；
+- topic 校验；
+- client message size limit；
+- per-connection event queue limit。
 
-### 18. 硬编码超时和魔法数字
-- `_TASK_QUEUE_LOCK_TTL = 300`、`_TASK_QUEUE_HEARTBEAT_INTERVAL_SECONDS = 30` 等散布在代码中
-- 环境变量解析 `int(value)` 无校验，非法值会在导入时崩溃
-- **改进**: 将可配置值移入 pydantic Settings；加 `Field(gt=0)` 校验
+Realtime event 本身不提供额外授权能力。
 
-### 19. Dockerfile 安装了不必要的系统包
-- `pciutils`、`clinfo`、Intel GPU 驱动无条件安装，增加镜像体积和攻击面
-- **改进**: 将 Intel GPU 相关包改为可选的 build arg 控制
+## 7. Desktop / noVNC
 
-### 20. 密码复杂度要求过低
-- **文件**: `src/videoroll/apps/orchestrator_api/admin_auth_store.py`
-- `validate_new_password()` 仅检查长度 8-128 字符，无复杂度要求
-- **改进**: 加入基本复杂度校验（大小写+数字+特殊字符）或常见密码检查
+`/social-login/` 和 `/social-publish/`：
+
+- 不直接公开 upstream host port；
+- 使用短期 DesktopAccessGrant；
+- grant 绑定 resource scope；
+- Nginx auth subrequest；
+- path-scoped HttpOnly grant cookie；
+- grant-bearing path 关闭 access log。
+
+外层 proxy 不应绕过 Web 直接公开 6080。
+
+## 8. 平台凭据
+
+Social storage_state / Bilibili credential 等敏感信息：
+
+- 保存时加密；
+- Web 不回显明文；
+- social worker 仅在 tmpfs 临时解密；
+- worker 任务结束清理临时文件。
+
+必须保护：
+
+```text
+data/secrets/fernet.key
+```
+
+## 9. Security Audit
+
+数据库 `SecurityAuditEvent` 保存：
+
+- event type；
+- actor type/id；
+- outcome；
+- request id；
+- source IP；
+- bounded payload；
+- error code/message。
+
+Audit 不应包含完整 API Key、Cookie 或 Authorization header。
+
+## 10. Trusted Proxy
+
+部署可配置：
+
+- `TRUSTED_PROXY_HOSTS`；
+- `TRUSTED_PROXY_CIDRS`。
+
+只有可信外层 proxy 的 Forwarded 信息才应影响 source IP/proto 识别。
+
+错误的 trusted-proxy 配置会影响：
+
+- audit source IP；
+- Remote API IP rate limit；
+- secure cookie/proto；
+- 日志定位。
+
+## 11. 外部网页与 Prompt Injection
+
+RAG Agent 读取的：
+
+- 搜索结果；
+- Wikipedia；
+-网页正文；
+
+都属于**外部不可信证据**。
+
+它们不能被视为 system/developer instruction。
+
+User Agent Skill 同样在 prompt 中标记为：
+
+```text
+untrusted_user_guidance
+```
+
+当前主要防线：
+
+- fixed tool registry；
+- allowed tool policy；
+- input/output schema；
+- runtime budget；
+- egress control；
+- system prompt trust distinction。
+
+## 12. Browser Automation 风险
+
+social publisher 必须运行 Chromium/Patchright。
+
+风险包括：
+
+- 平台页面本身不可信；
+- selector / DOM 频繁变化；
+- browser dependency 漏洞；
+- storage_state 权限较高；
+- “超时”不代表“没有发出去”。
+
+因此：
+
+- 浏览器自动化独立容器；
+- 推荐专门发布账号；
+- `unknown` 不自动重试。
+
+## 13. PostgreSQL
+
+生产数据库在 Compose 外。
+
+部署者负责：
+
+- TLS；
+- private network / firewall；
+- DB user 最小权限；
+- backup；
+- restore drill；
+- retention。
+
+业务状态不能只备份 `data/` 而忽略 PostgreSQL。
+
+## 14. Redis
+
+Redis 用于：
+
+- Celery broker/backend；
+- realtime Pub/Sub；
+- rate/concurrency辅助。
+
+不要直接暴露 Redis 到公网。
+
+业务幂等和最终状态不应只依赖 Redis。
+
+## 15. ffplayout
+
+ffplayout 内部端口：
+
+```text
+8787
+```
+
+默认不映射到宿主机。
+
+浏览器通过 Web 的 `/playout/` 同源入口访问。
+
+额外公开 8787 会绕过 VideoRoll 入口边界。
+
+## 16. Secret 管理
+
+禁止进入 Git：
+
+- `.env`；
+- DB password；
+- LLM/ASR API Key；
+- Remote API Token；
+- Bilibili Cookie；
+- social storage_state；
+- Fernet key；
+- 含凭据的生产日志/dump。
+
+怀疑泄漏时：
+
+1. 轮换上游凭据；
+2. 更新 VideoRoll setting/env；
+3. 重启相关服务；
+4. 清理日志/CI artifact；
+5. 检查 audit/event 时间窗口。
+
+## 17. 当前剩余风险
+
+### 17.1 无内建 MFA
+
+VideoRoll 自身当前是管理员密码 + trusted device，不含 MFA。
+
+公网部署推荐外层增加：
+
+- VPN；
+- SSO；
+- Access proxy；
+- MFA gateway。
+
+### 17.2 Trusted-device 生命周期较长
+
+180 天适合内网管理，但高安全环境可以考虑：
+
+- 缩短有效期；
+- 设备列表；
+- 单设备撤销；
+- 登录活动页面。
+
+### 17.3 Shared internal secret
+
+当前内部服务身份没有 per-service cryptographic isolation。
+
+### 17.4 第三方平台与浏览器依赖
+
+SAU、Chromium、yt-dlp、平台 API 都是快速变化依赖，需要持续更新和 smoke test。
+
+### 17.5 LLM / Search provider
+
+外部 provider 可能记录请求，部署者需要根据数据敏感性选择供应商和保留策略。
+
+## 18. 安全验证
+
+开发/CI：
+
+```bash
+bash ./scripts/security_smoke.sh
+docker compose -f docker-compose.yml config --quiet
+git diff --check
+```
+
+生产：
+
+```bash
+./scripts/prod_compose.sh ps
+./scripts/prod_compose.sh logs --since 10m
+```
+
+同时检查 Web 没有暴露内部服务端口。
+
+## 19. 推荐公网边界
+
+```text
+Internet
+   │
+   ▼
+TLS + SSO/VPN/Access/MFA
+   │
+   ▼
+VideoRoll Web
+   │
+   ▼
+internal services
+```
+
+不推荐直接把 Docker host 的 8000/8001/8002/8003/8010/8787/6379 暴露公网。
