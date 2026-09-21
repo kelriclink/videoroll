@@ -351,3 +351,17 @@ def test_cancellable_process_runner_terminates_child() -> None:
             log_path=None,
             cancel_event=cancel,
         )
+
+
+def test_process_runner_surfaces_stdin_producer_failure() -> None:
+    from videoroll.apps.subtitle_service.processing import _run_logged
+
+    def producer(_handle, _stop_event: threading.Event) -> None:
+        raise RuntimeError("producer boom")
+
+    with pytest.raises(RuntimeError, match="producer boom"):
+        _run_logged(
+            [sys.executable, "-c", "import sys; sys.stdin.buffer.read()"],
+            log_path=None,
+            stdin_producer=producer,
+        )

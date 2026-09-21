@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import io
 import subprocess
 import sys
 import tempfile
+import threading
 import types
 import unittest
 from pathlib import Path
@@ -21,9 +23,16 @@ except ModuleNotFoundError:
     sys.modules["httpx"] = fake_httpx
 
 from videoroll.apps.subtitle_service.processing import (
+    AssEventCache,
+    AssEventCachePlan,
     Segment,
     _ass_can_use_reduced_overlay_rate,
+    _ass_event_boundaries,
+    _make_ass_event_cache_producer,
+    _parse_ass_timestamp,
+    _plan_ass_event_cache,
     _prepare_ass_overlay_band,
+    _prepare_ass_event_cache,
     _reduced_overlay_frame_rate,
     probe_video_bit_depth,
     render_burn_in,
@@ -32,6 +41,146 @@ from videoroll.apps.subtitle_service.processing import (
 
 
 class ProcessingRenderTests(unittest.TestCase):
+    def test_ass_event_boundaries_include_overlaps_gaps_and_zero(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "subtitle.ass"
+            source.write_text(
+                "[Events]\n"
+                "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
+                "Dialogue: 0,0:00:00.20,0:00:01.00,Default,,0,0,0,,First\n"
+                "Dialogue: 0,0:00:00.50,0:00:01.50,Default,,0,0,0,,Overlap\n"
+                "Dialogue: 0,0:00:03.00,0:00:05.00,Default,,0,0,0,,After gap\n",
+                encoding="utf-8",
+            )
+
+            self.assertEqual(_parse_ass_timestamp("1:02:03.45"), 3723.45)
+            self.assertEqual(
+                _ass_event_boundaries(source),
+                (0.0, 0.2, 0.5, 1.0, 1.5, 3.0, 5.0),
+            )
+
+    def test_event_cache_plan_rejects_complex_and_high_churn_ass(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            complex_ass = root / "complex.ass"
+            complex_ass.write_text(
+                "[Events]\n"
+                "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
+                "Dialogue: 0,0:00:00.00,0:00:10.00,Default,,0,0,0,,{\\move(0,0,100,100)}Move\n",
+                encoding="utf-8",
+            )
+            plan, reason = _plan_ass_event_cache(complex_ass, "15/1")
+            self.assertIsNone(plan)
+            self.assertEqual(reason, "complex-or-animated-ass")
+
+            churn = root / "churn.ass"
+            lines = [
+                "[Events]",
+                "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
+            ]
+            for index in range(40):
+                start = index * 0.05
+                end = start + 0.04
+                lines.append(
+                    f"Dialogue: 0,0:00:{start:05.2f},0:00:{end:05.2f},Default,,0,0,0,,{index}"
+                )
+            churn.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            plan, reason = _plan_ass_event_cache(
+                churn,
+                "15/1",
+                min_output_frames=1,
+                max_state_ratio=0.20,
+            )
+            self.assertIsNone(plan)
+            self.assertTrue(reason.startswith("high-churn:"), reason)
+
+    def test_event_cache_producer_reuses_latest_state_and_honors_stop(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            frames = []
+            for index, blob in enumerate((b"A", b"B", b"C"), start=1):
+                path = root / f"state_{index:06d}.png"
+                path.write_bytes(blob)
+                frames.append(path)
+            cache = AssEventCache(
+                plan=AssEventCachePlan(
+                    boundaries=(0.0, 1.0, 2.0),
+                    overlay_fps=2.0,
+                    output_frame_count=5,
+                    savings_ratio=0.6,
+                ),
+                directory=root,
+                frame_paths=tuple(frames),
+                total_bytes=3,
+                build_seconds=0.01,
+            )
+            producer = _make_ass_event_cache_producer(cache)
+            output = io.BytesIO()
+            producer(output, threading.Event())
+            self.assertEqual(output.getvalue(), b"AABBC")
+
+            stopped = threading.Event()
+            stopped.set()
+            output = io.BytesIO()
+            producer(output, stopped)
+            self.assertEqual(output.getvalue(), b"")
+
+            class BrokenPipe:
+                def write(self, _blob: bytes) -> None:
+                    raise BrokenPipeError()
+
+                def flush(self) -> None:
+                    raise AssertionError("flush should not be reached")
+
+            producer(BrokenPipe(), threading.Event())
+
+    def test_prepare_ass_event_cache_builds_one_png_per_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "subtitle.ass"
+            source.write_text(
+                "[Events]\n"
+                "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
+                "Dialogue: 0,0:00:01.00,0:00:04.00,Default,,0,0,0,,One\n"
+                "Dialogue: 0,0:00:05.00,0:00:10.00,Default,,0,0,0,,Two\n",
+                encoding="utf-8",
+            )
+            seen: list[list[str]] = []
+
+            def fake_run(cmd: list[str], **_kwargs: object) -> None:
+                seen.append(cmd)
+                if "-frames:v" in cmd:
+                    Path(cmd[-1]).write_bytes(b"blank")
+                    return
+                output_pattern = str(cmd[-1])
+                cache_dir = Path(output_pattern).parent
+                boundaries = _ass_event_boundaries(source)
+                for index in range(1, len(boundaries) + 1):
+                    (cache_dir / f"state_{index:06d}.png").write_bytes(bytes([index]) * 5)
+
+            with patch("videoroll.apps.subtitle_service.processing._run_logged", side_effect=fake_run):
+                cache, reason = _prepare_ass_event_cache(
+                    "ffmpeg",
+                    source,
+                    video_width=3840,
+                    overlay_height=916,
+                    overlay_frame_rate="15/1",
+                    output_dir=root,
+                    log_path=None,
+                    live_upload_cb=None,
+                    cancel_event=None,
+                )
+
+            self.assertEqual(reason, "built")
+            self.assertIsNotNone(cache)
+            assert cache is not None
+            self.assertEqual(len(cache.frame_paths), 5)
+            self.assertEqual(cache.total_bytes, 25)
+            self.assertEqual(len(seen), 2)
+            self.assertIn("concat", seen[1])
+            shutil_target = cache.directory
+            self.assertTrue(shutil_target.exists())
+
     def test_render_burn_in_cpu_h264_uses_libx264(self) -> None:
         calls: list[list[str]] = []
 
@@ -184,6 +333,191 @@ class ProcessingRenderTests(unittest.TestCase):
         self.assertNotIn("hwdownload", graph)
         self.assertIn("[out]", cmd)
         self.assertIn("0:a?", cmd)
+
+    def test_render_burn_in_static_ass_uses_event_cache_image_pipe(self) -> None:
+        calls: list[tuple[list[str], dict[str, object]]] = []
+        sentinel_producer = object()
+
+        def fake_run_logged(cmd: list[str], **kwargs: object) -> None:
+            calls.append((cmd, kwargs))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            band_ass = root / "subtitle-band.ass"
+            band_ass.write_text("[Events]\n", encoding="utf-8")
+            cache_dir = root / "cache"
+            cache_dir.mkdir()
+            cache = AssEventCache(
+                plan=AssEventCachePlan(
+                    boundaries=(0.0, 1.0, 4.0),
+                    overlay_fps=15.0,
+                    output_frame_count=61,
+                    savings_ratio=3 / 61,
+                ),
+                directory=cache_dir,
+                frame_paths=(cache_dir / "1.png", cache_dir / "2.png", cache_dir / "3.png"),
+                total_bytes=1234,
+                build_seconds=0.25,
+            )
+
+            with (
+                patch("videoroll.apps.subtitle_service.processing._run_logged", side_effect=fake_run_logged),
+                patch("videoroll.apps.subtitle_service.processing.Path.exists", return_value=True),
+                patch("videoroll.apps.subtitle_service.processing._ffmpeg_supports_encoder", return_value=True),
+                patch("videoroll.apps.subtitle_service.processing._ffmpeg_supports_filter", return_value=True),
+                patch("videoroll.apps.subtitle_service.processing.probe_video_bit_depth", return_value=8),
+                patch("videoroll.apps.subtitle_service.processing.probe_video_resolution", return_value=(3840, 2160)),
+                patch("videoroll.apps.subtitle_service.processing.probe_video_frame_rate", return_value="60/1"),
+                patch(
+                    "videoroll.apps.subtitle_service.processing._prepare_ass_overlay_band",
+                    return_value=(band_ass, 916),
+                ),
+                patch("videoroll.apps.subtitle_service.processing._ass_can_use_reduced_overlay_rate", return_value=True),
+                patch(
+                    "videoroll.apps.subtitle_service.processing._prepare_ass_event_cache",
+                    return_value=(cache, "built"),
+                ),
+                patch(
+                    "videoroll.apps.subtitle_service.processing._make_ass_event_cache_producer",
+                    return_value=sentinel_producer,
+                ),
+            ):
+                render_burn_in(
+                    "ffmpeg",
+                    Path("/tmp/input.webm"),
+                    Path("/tmp/subtitle.ass"),
+                    root / "out.mp4",
+                    video_codec="av1",
+                    use_intel_gpu=True,
+                    intel_gpu_render_device="/dev/dri/renderD128",
+                )
+
+        self.assertEqual(len(calls), 2)
+        cmd, kwargs = calls[-1]
+        self.assertIn("image2pipe", cmd)
+        self.assertIn("pipe:0", cmd)
+        graph = cmd[cmd.index("-filter_complex") + 1]
+        self.assertNotIn("ass=", graph)
+        self.assertIn("shortest=0:repeatlast=1", graph)
+        self.assertIs(kwargs.get("stdin_producer"), sentinel_producer)
+
+    def test_event_cache_overlay_failure_retries_live_vaapi_overlay(self) -> None:
+        calls: list[list[str]] = []
+
+        def fake_run_logged(cmd: list[str], **_kwargs: object) -> None:
+            calls.append(cmd)
+            if len(calls) == 2:
+                raise subprocess.CalledProcessError(1, cmd)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            band_ass = root / "subtitle-band.ass"
+            band_ass.write_text("[Events]\n", encoding="utf-8")
+            cache_dir = root / "cache"
+            cache_dir.mkdir()
+            cache = AssEventCache(
+                plan=AssEventCachePlan((0.0, 1.0, 4.0), 15.0, 61, 3 / 61),
+                directory=cache_dir,
+                frame_paths=(),
+                total_bytes=1,
+                build_seconds=0.01,
+            )
+            with (
+                patch("videoroll.apps.subtitle_service.processing._run_logged", side_effect=fake_run_logged),
+                patch("videoroll.apps.subtitle_service.processing.Path.exists", return_value=True),
+                patch("videoroll.apps.subtitle_service.processing._ffmpeg_supports_encoder", return_value=True),
+                patch("videoroll.apps.subtitle_service.processing._ffmpeg_supports_filter", return_value=True),
+                patch("videoroll.apps.subtitle_service.processing.probe_video_bit_depth", return_value=8),
+                patch("videoroll.apps.subtitle_service.processing.probe_video_resolution", return_value=(3840, 2160)),
+                patch("videoroll.apps.subtitle_service.processing.probe_video_frame_rate", return_value="60/1"),
+                patch(
+                    "videoroll.apps.subtitle_service.processing._prepare_ass_overlay_band",
+                    return_value=(band_ass, 916),
+                ),
+                patch("videoroll.apps.subtitle_service.processing._ass_can_use_reduced_overlay_rate", return_value=True),
+                patch(
+                    "videoroll.apps.subtitle_service.processing._prepare_ass_event_cache",
+                    return_value=(cache, "built"),
+                ),
+                patch(
+                    "videoroll.apps.subtitle_service.processing._make_ass_event_cache_producer",
+                    return_value=lambda _handle, _stop: None,
+                ),
+            ):
+                render_burn_in(
+                    "ffmpeg",
+                    Path("/tmp/input.webm"),
+                    Path("/tmp/subtitle.ass"),
+                    root / "out.mp4",
+                    video_codec="av1",
+                    use_intel_gpu=True,
+                    intel_gpu_render_device="/dev/dri/renderD128",
+                )
+
+        self.assertEqual(len(calls), 3)
+        self.assertIn("image2pipe", calls[1])
+        self.assertIn("lavfi", calls[2])
+        graph = calls[2][calls[2].index("-filter_complex") + 1]
+        self.assertIn("ass=", graph)
+
+    def test_event_cache_and_live_overlay_failure_retries_legacy(self) -> None:
+        calls: list[list[str]] = []
+
+        def fake_run_logged(cmd: list[str], **_kwargs: object) -> None:
+            calls.append(cmd)
+            if len(calls) in {2, 3}:
+                raise subprocess.CalledProcessError(1, cmd)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            band_ass = root / "subtitle-band.ass"
+            band_ass.write_text("[Events]\n", encoding="utf-8")
+            cache_dir = root / "cache"
+            cache_dir.mkdir()
+            cache = AssEventCache(
+                plan=AssEventCachePlan((0.0, 1.0, 4.0), 15.0, 61, 3 / 61),
+                directory=cache_dir,
+                frame_paths=(),
+                total_bytes=1,
+                build_seconds=0.01,
+            )
+            with (
+                patch("videoroll.apps.subtitle_service.processing._run_logged", side_effect=fake_run_logged),
+                patch("videoroll.apps.subtitle_service.processing.Path.exists", return_value=True),
+                patch("videoroll.apps.subtitle_service.processing._ffmpeg_supports_encoder", return_value=True),
+                patch("videoroll.apps.subtitle_service.processing._ffmpeg_supports_filter", return_value=True),
+                patch("videoroll.apps.subtitle_service.processing.probe_video_bit_depth", return_value=8),
+                patch("videoroll.apps.subtitle_service.processing.probe_video_resolution", return_value=(3840, 2160)),
+                patch("videoroll.apps.subtitle_service.processing.probe_video_frame_rate", return_value="60/1"),
+                patch(
+                    "videoroll.apps.subtitle_service.processing._prepare_ass_overlay_band",
+                    return_value=(band_ass, 916),
+                ),
+                patch("videoroll.apps.subtitle_service.processing._ass_can_use_reduced_overlay_rate", return_value=True),
+                patch(
+                    "videoroll.apps.subtitle_service.processing._prepare_ass_event_cache",
+                    return_value=(cache, "built"),
+                ),
+                patch(
+                    "videoroll.apps.subtitle_service.processing._make_ass_event_cache_producer",
+                    return_value=lambda _handle, _stop: None,
+                ),
+            ):
+                render_burn_in(
+                    "ffmpeg",
+                    Path("/tmp/input.webm"),
+                    Path("/tmp/subtitle.ass"),
+                    root / "out.mp4",
+                    video_codec="av1",
+                    use_intel_gpu=True,
+                    intel_gpu_render_device="/dev/dri/renderD128",
+                )
+
+        self.assertEqual(len(calls), 4)
+        self.assertIn("image2pipe", calls[1])
+        self.assertIn("lavfi", calls[2])
+        self.assertIn("-vf", calls[3])
+        self.assertTrue(any("ass=/tmp/subtitle.ass" in part for part in calls[3]))
 
     def test_render_burn_in_intel_av1_10bit_uses_p010_vaapi_overlay(self) -> None:
         calls: list[list[str]] = []

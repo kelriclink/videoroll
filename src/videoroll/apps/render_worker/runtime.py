@@ -490,6 +490,11 @@ class RenderWorkerRuntime:
         heartbeat_stop = threading.Event()
         cancel_event = threading.Event()
         cancel_reason: list[str] = []
+        execution_metrics: dict[str, Any] = {
+            "device_id": device.id,
+            "device_name": device.name,
+            "backend": device.backend,
+        }
 
         def heartbeat_loop() -> None:
             heartbeat_interval = max(5.0, min(float(self.settings.heartbeat_interval_seconds), 15.0))
@@ -507,11 +512,7 @@ class RenderWorkerRuntime:
                             {
                                 "fence_token": fence,
                                 "progress": None,
-                                "metrics": {
-                                    "device_id": device.id,
-                                    "device_name": device.name,
-                                    "backend": device.backend,
-                                },
+                                "metrics": dict(execution_metrics),
                             },
                             timeout_seconds=request_timeout,
                         )
@@ -585,7 +586,11 @@ class RenderWorkerRuntime:
             if spec.mode == "soft_sub" and srt_path is None:
                 raise RuntimeError("soft-sub render requires an SRT artifact")
 
-            self._execution_post(execution_id, "progress", {"fence_token": fence, "progress": 20, "metrics": {"device_id": device.id, "device_name": device.name, "backend": device.backend}})
+            self._execution_post(
+                execution_id,
+                "progress",
+                {"fence_token": fence, "progress": 20, "metrics": dict(execution_metrics)},
+            )
             if spec.mode == "burn_in":
                 output = root / "video_burnin.mp4"
                 backend = device.backend
@@ -604,6 +609,7 @@ class RenderWorkerRuntime:
                     preset=render_cfg.get("video_preset"),
                     crf=render_cfg.get("video_crf"),
                     cancel_event=cancel_event,
+                    render_metrics=execution_metrics,
                 )
             elif spec.mode == "soft_sub":
                 output = root / "video_softsub.mkv"
@@ -620,7 +626,11 @@ class RenderWorkerRuntime:
 
             if cancel_event.is_set():
                 raise RuntimeError(cancel_reason[-1] if cancel_reason else "render execution canceled")
-            self._execution_post(execution_id, "progress", {"fence_token": fence, "progress": 90, "metrics": {"device_id": device.id, "device_name": device.name, "backend": device.backend}})
+            self._execution_post(
+                execution_id,
+                "progress",
+                {"fence_token": fence, "progress": 90, "metrics": dict(execution_metrics)},
+            )
             output_asset_id = self._upload_output(execution_id, fence, output)
             self._execution_post(
                 execution_id,

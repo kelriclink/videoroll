@@ -2,11 +2,13 @@ from __future__ import annotations
 
 from array import array
 import base64
+from bisect import bisect_right
 from difflib import SequenceMatcher
 import io
 import inspect
 import json
 import logging
+import math
 import os
 import random
 import re
@@ -87,6 +89,23 @@ class Segment:
     text: str
     confidence: float | None = None
     secondary_text: str | None = None
+
+
+@dataclass(frozen=True)
+class AssEventCachePlan:
+    boundaries: tuple[float, ...]
+    overlay_fps: float
+    output_frame_count: int
+    savings_ratio: float
+
+
+@dataclass(frozen=True)
+class AssEventCache:
+    plan: AssEventCachePlan
+    directory: Path
+    frame_paths: tuple[Path, ...]
+    total_bytes: int
+    build_seconds: float
 
 
 class TranslationValidationError(RuntimeError):
@@ -226,8 +245,9 @@ def _run_logged(
     live_upload_cb: Callable[[], None] | None = None,
     live_upload_interval_seconds: float = 3.0,
     cancel_event: threading.Event | None = None,
+    stdin_producer: Callable[[Any, threading.Event], None] | None = None,
 ) -> None:
-    if log_path is None and live_upload_cb is None and cancel_event is None:
+    if log_path is None and live_upload_cb is None and cancel_event is None and stdin_producer is None:
         _run(cmd)
         return
 
@@ -253,12 +273,44 @@ def _run_logged(
             "stdout": f if f is not None else None,
             "stderr": f if f is not None else None,
         }
+        if stdin_producer is not None:
+            popen_kwargs["stdin"] = subprocess.PIPE
         if os.name == "nt":
             popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
         else:
             popen_kwargs["start_new_session"] = True
 
         proc = subprocess.Popen(cmd, **popen_kwargs)
+        producer_stop = threading.Event()
+        producer_errors: list[BaseException] = []
+        producer_thread: threading.Thread | None = None
+
+        if stdin_producer is not None:
+            def _produce_stdin() -> None:
+                try:
+                    if proc.stdin is None:
+                        raise RuntimeError("render process stdin is unavailable")
+                    stdin_producer(proc.stdin, producer_stop)
+                except BrokenPipeError:
+                    # The consumer may finish naturally before the producer
+                    # reaches the end of its synthetic subtitle stream.
+                    pass
+                except BaseException as exc:  # surfaced by the coordinator loop below
+                    producer_errors.append(exc)
+                finally:
+                    try:
+                        if proc.stdin is not None:
+                            proc.stdin.close()
+                    except Exception:
+                        pass
+
+            producer_thread = threading.Thread(
+                target=_produce_stdin,
+                name="videoroll-ffmpeg-stdin",
+                daemon=True,
+            )
+            producer_thread.start()
+
         interval = float(live_upload_interval_seconds or 0)
         if interval <= 0:
             interval = 3.0
@@ -271,8 +323,20 @@ def _run_logged(
             if rc is not None:
                 break
 
+            if producer_errors:
+                producer_stop.set()
+                try:
+                    if os.name == "nt":
+                        proc.terminate()
+                    else:
+                        os.killpg(proc.pid, signal.SIGTERM)
+                except Exception:
+                    pass
+                break
+
             if cancel_event is not None and cancel_event.is_set():
                 cancelled = True
+                producer_stop.set()
                 try:
                     if os.name == "nt":
                         proc.terminate()
@@ -304,6 +368,25 @@ def _run_logged(
                 next_upload_at = now + interval
             time.sleep(tick_sleep)
 
+        producer_stop.set()
+        if producer_errors and proc.poll() is None:
+            try:
+                rc = proc.wait(timeout=5)
+            except Exception:
+                try:
+                    if os.name == "nt":
+                        proc.kill()
+                    else:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                except Exception:
+                    pass
+                try:
+                    rc = proc.wait(timeout=5)
+                except Exception:
+                    rc = -1
+        if producer_thread is not None:
+            producer_thread.join(timeout=5)
+
         if live_upload_cb is not None:
             try:
                 live_upload_cb()
@@ -312,6 +395,11 @@ def _run_logged(
 
         if cancelled:
             raise RuntimeError("render process canceled")
+        if producer_errors:
+            error = producer_errors[0]
+            if isinstance(error, Exception):
+                raise error
+            raise RuntimeError(f"render stdin producer failed: {error}")
         if rc != 0:
             raise subprocess.CalledProcessError(int(rc), cmd)
 
@@ -2717,6 +2805,238 @@ def _reduced_overlay_frame_rate(frame_rate: str, *, cap_fps: float = 15.0) -> st
     return f"{int(cap_fps)}/1"
 
 
+def _frame_rate_value(frame_rate: str) -> float:
+    value = str(frame_rate or "").strip()
+    match = re.fullmatch(r"(\d+)/(\d+)", value)
+    if not match:
+        return 0.0
+    numerator = int(match.group(1))
+    denominator = int(match.group(2))
+    if numerator <= 0 or denominator <= 0:
+        return 0.0
+    return numerator / denominator
+
+
+def _parse_ass_timestamp(value: str) -> float | None:
+    parts = str(value or "").strip().split(":")
+    if len(parts) != 3:
+        return None
+    try:
+        hours = int(parts[0])
+        minutes = int(parts[1])
+        seconds = float(parts[2])
+    except (TypeError, ValueError):
+        return None
+    if hours < 0 or minutes < 0 or minutes >= 60 or seconds < 0 or seconds >= 60:
+        return None
+    return hours * 3600.0 + minutes * 60.0 + seconds
+
+
+def _ass_event_boundaries(ass_path: Path) -> tuple[float, ...]:
+    try:
+        ass_text = ass_path.read_text(encoding="utf-8")
+    except Exception:
+        return ()
+
+    boundaries: set[float] = {0.0}
+    for raw_line in ass_text.splitlines():
+        if not raw_line.startswith("Dialogue:"):
+            continue
+        fields = raw_line.split(",", 9)
+        if len(fields) < 10:
+            continue
+        start = _parse_ass_timestamp(fields[1])
+        end = _parse_ass_timestamp(fields[2])
+        if start is None or end is None or end <= start:
+            continue
+        boundaries.add(round(start, 6))
+        boundaries.add(round(end, 6))
+    return tuple(sorted(boundaries))
+
+
+def _plan_ass_event_cache(
+    ass_path: Path,
+    overlay_frame_rate: str,
+    *,
+    max_states: int = 4096,
+    max_state_ratio: float = 0.20,
+    min_output_frames: int = 90,
+) -> tuple[AssEventCachePlan | None, str]:
+    if not _ass_can_use_reduced_overlay_rate(ass_path):
+        return None, "complex-or-animated-ass"
+
+    boundaries = _ass_event_boundaries(ass_path)
+    if len(boundaries) < 2:
+        return None, "insufficient-event-boundaries"
+    if len(boundaries) > max_states:
+        return None, f"too-many-states:{len(boundaries)}>{max_states}"
+
+    overlay_fps = _frame_rate_value(overlay_frame_rate)
+    if overlay_fps <= 0:
+        return None, "invalid-overlay-frame-rate"
+
+    last_boundary = boundaries[-1]
+    if last_boundary <= 0:
+        return None, "zero-duration-events"
+    output_frame_count = int(math.ceil(last_boundary * overlay_fps)) + 1
+    if output_frame_count < min_output_frames:
+        return None, f"too-short:{output_frame_count}<{min_output_frames}"
+
+    savings_ratio = len(boundaries) / max(1, output_frame_count)
+    if savings_ratio > max_state_ratio:
+        return None, f"high-churn:{savings_ratio:.3f}>{max_state_ratio:.3f}"
+
+    return (
+        AssEventCachePlan(
+            boundaries=boundaries,
+            overlay_fps=overlay_fps,
+            output_frame_count=output_frame_count,
+            savings_ratio=savings_ratio,
+        ),
+        "eligible",
+    )
+
+
+def _prepare_ass_event_cache(
+    ffmpeg_path: str,
+    ass_path: Path,
+    *,
+    video_width: int,
+    overlay_height: int,
+    overlay_frame_rate: str,
+    output_dir: Path,
+    log_path: Path | None,
+    live_upload_cb: Callable[[], None] | None,
+    cancel_event: threading.Event | None,
+    max_cache_bytes: int = 256 * 1024 * 1024,
+) -> tuple[AssEventCache | None, str]:
+    plan, reason = _plan_ass_event_cache(ass_path, overlay_frame_rate)
+    if plan is None:
+        return None, reason
+
+    cache_dir = Path(tempfile.mkdtemp(prefix="subtitle_event_cache_", dir=str(output_dir)))
+    blank_path = cache_dir / "blank.png"
+    clock_path = cache_dir / "clock.ffconcat"
+    frame_pattern = cache_dir / "state_%06d.png"
+    started = time.monotonic()
+
+    try:
+        blank_cmd = [
+            ffmpeg_path,
+            "-nostdin",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            f"color=c=black@0.0:s={video_width}x{overlay_height}:r=1,format=rgba",
+            "-frames:v",
+            "1",
+            str(blank_path),
+        ]
+        _run_logged(
+            blank_cmd,
+            log_path=log_path,
+            live_upload_cb=live_upload_cb,
+            cancel_event=cancel_event,
+        )
+
+        clock_lines = ["ffconcat version 1.0"]
+        for index, boundary in enumerate(plan.boundaries):
+            clock_lines.append(f"file {blank_path.name}")
+            clock_lines.append("option framerate 1000")
+            if index + 1 < len(plan.boundaries):
+                duration = max(0.001, plan.boundaries[index + 1] - boundary)
+                clock_lines.append(f"duration {duration:.6f}")
+        clock_path.write_text("\n".join(clock_lines) + "\n", encoding="utf-8")
+
+        escaped_ass = str(ass_path).replace(":", r"\:")
+        render_cmd = [
+            ffmpeg_path,
+            "-nostdin",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            str(clock_path),
+            "-vf",
+            f"ass={escaped_ass}:alpha=1,format=rgba",
+            "-fps_mode",
+            "passthrough",
+            str(frame_pattern),
+        ]
+        _run_logged(
+            render_cmd,
+            log_path=log_path,
+            live_upload_cb=live_upload_cb,
+            cancel_event=cancel_event,
+        )
+
+        frame_paths = tuple(sorted(cache_dir.glob("state_*.png")))
+        if len(frame_paths) != len(plan.boundaries):
+            raise RuntimeError(
+                "subtitle event cache frame count mismatch: "
+                f"expected={len(plan.boundaries)} actual={len(frame_paths)}"
+            )
+
+        total_bytes = sum(path.stat().st_size for path in frame_paths)
+        if total_bytes > max_cache_bytes:
+            shutil.rmtree(cache_dir, ignore_errors=True)
+            return None, f"cache-too-large:{total_bytes}>{max_cache_bytes}"
+
+        return (
+            AssEventCache(
+                plan=plan,
+                directory=cache_dir,
+                frame_paths=frame_paths,
+                total_bytes=total_bytes,
+                build_seconds=max(0.0, time.monotonic() - started),
+            ),
+            "built",
+        )
+    except Exception:
+        shutil.rmtree(cache_dir, ignore_errors=True)
+        raise
+
+
+def _make_ass_event_cache_producer(
+    cache: AssEventCache,
+) -> Callable[[Any, threading.Event], None]:
+    boundaries = cache.plan.boundaries
+    frame_paths = cache.frame_paths
+    overlay_fps = cache.plan.overlay_fps
+    output_frame_count = cache.plan.output_frame_count
+
+    def _producer(handle: Any, stop_event: threading.Event) -> None:
+        active_index = -1
+        active_blob = b""
+        for frame_number in range(output_frame_count):
+            if stop_event.is_set():
+                return
+            timestamp = frame_number / overlay_fps
+            state_index = max(0, bisect_right(boundaries, timestamp + 1e-9) - 1)
+            if state_index != active_index:
+                active_blob = frame_paths[state_index].read_bytes()
+                active_index = state_index
+            try:
+                handle.write(active_blob)
+            except BrokenPipeError:
+                return
+        try:
+            handle.flush()
+        except BrokenPipeError:
+            return
+
+    return _producer
+
+
 def _pixel_format_bit_depth(pixel_format: str) -> int:
     value = str(pixel_format or "").strip().lower()
     if not value:
@@ -3079,6 +3399,7 @@ def render_burn_in(
     log_path: Path | None = None,
     live_upload_cb: Callable[[], None] | None = None,
     cancel_event: threading.Event | None = None,
+    render_metrics: dict[str, Any] | None = None,
 ) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     codec = str(video_codec or "").strip().lower() or "av1"
@@ -3111,9 +3432,13 @@ def render_burn_in(
         return 1 + round((preset_n * 7) / 13)
 
     overlay_ass_path: Path | None = None
+    event_cache: AssEventCache | None = None
+    overlay_stdin_producer: Callable[[Any, threading.Event], None] | None = None
     filter_complex: str | None = None
     extra_input_args: list[str] = []
     map_args: list[str] = []
+    live_overlay_extra_input_args: list[str] = []
+    live_overlay_filter_complex: str | None = None
 
     if sum(bool(value) for value in (use_intel_gpu, use_intel_qsv, use_nvidia_gpu)) > 1:
         raise ValueError("render backend cannot use multiple hardware backends at the same time")
@@ -3274,13 +3599,14 @@ def render_burn_in(
 
             frame_rate = probe_video_frame_rate(ffmpeg_path, video_path)
             overlay_frame_rate = frame_rate
-            if overlay_band is not None and _ass_can_use_reduced_overlay_rate(ass_path):
+            static_overlay = overlay_band is not None and _ass_can_use_reduced_overlay_rate(ass_path)
+            if static_overlay:
                 overlay_frame_rate = _reduced_overlay_frame_rate(frame_rate)
                 compose_mode += f" static-overlay-fps={overlay_frame_rate}"
             else:
                 compose_mode += f" overlay-fps={frame_rate}"
             overlay_ass_filter = f"ass={str(overlay_render_ass_path).replace(':', r'\:')}:alpha=1"
-            extra_input_args = [
+            live_overlay_extra_input_args = [
                 "-f",
                 "lavfi",
                 "-i",
@@ -3293,16 +3619,111 @@ def render_burn_in(
                 main_filter = f"scale_vaapi=format={vaapi_pixel_format}"
             else:
                 main_filter = f"format={software_pixel_format},hwupload"
-            filter_complex = (
+            live_overlay_filter_complex = (
                 f"[0:v]{main_filter}[main];"
                 f"[1:v]{overlay_ass_filter},format=bgra,hwupload[sub];"
                 f"[main][sub]overlay_vaapi=x=0:y={overlay_y}:shortest=1[out]"
             )
+
+            if static_overlay:
+                try:
+                    event_cache, cache_reason = _prepare_ass_event_cache(
+                        ffmpeg_path,
+                        overlay_render_ass_path,
+                        video_width=video_width,
+                        overlay_height=overlay_height,
+                        overlay_frame_rate=overlay_frame_rate,
+                        output_dir=output_path.parent,
+                        log_path=log_path,
+                        live_upload_cb=live_upload_cb,
+                        cancel_event=cancel_event,
+                    )
+                except Exception as exc:
+                    if cancel_event is not None and cancel_event.is_set():
+                        raise
+                    event_cache = None
+                    cache_reason = f"build-failed:{type(exc).__name__}"
+                    logger.warning("ASS event cache build failed; using live overlay: %s", exc)
+
+                if event_cache is not None:
+                    overlay_stdin_producer = _make_ass_event_cache_producer(event_cache)
+                    extra_input_args = [
+                        "-f",
+                        "image2pipe",
+                        "-framerate",
+                        overlay_frame_rate,
+                        "-vcodec",
+                        "png",
+                        "-i",
+                        "pipe:0",
+                    ]
+                    filter_complex = (
+                        f"[0:v]{main_filter}[main];"
+                        f"[1:v]format=bgra,hwupload[sub];"
+                        f"[main][sub]overlay_vaapi=x=0:y={overlay_y}:"
+                        "shortest=0:repeatlast=1[out]"
+                    )
+                    compose_mode += (
+                        f" event-cache states={len(event_cache.plan.boundaries)}"
+                        f" frames={event_cache.plan.output_frame_count}"
+                        f" bytes={event_cache.total_bytes}"
+                        f" build={event_cache.build_seconds:.3f}s"
+                    )
+                    cache_note = (
+                        "ASS event cache enabled: "
+                        f"states={len(event_cache.plan.boundaries)} "
+                        f"output_frames={event_cache.plan.output_frame_count} "
+                        f"overlay_fps={event_cache.plan.overlay_fps:.3f} "
+                        f"savings_ratio={event_cache.plan.savings_ratio:.4f} "
+                        f"cache_bytes={event_cache.total_bytes} "
+                        f"build_seconds={event_cache.build_seconds:.3f}"
+                    )
+                    logger.info(cache_note)
+                    _append_processing_log_note(log_path, cache_note)
+                    if render_metrics is not None:
+                        render_metrics.update(
+                            {
+                                "subtitle_overlay_mode": "event-cache",
+                                "subtitle_overlay_fps": round(event_cache.plan.overlay_fps, 3),
+                                "subtitle_cache_states": len(event_cache.plan.boundaries),
+                                "subtitle_cache_frames": event_cache.plan.output_frame_count,
+                                "subtitle_cache_bytes": event_cache.total_bytes,
+                                "subtitle_cache_build_seconds": round(event_cache.build_seconds, 3),
+                                "subtitle_cache_savings_ratio": round(event_cache.plan.savings_ratio, 6),
+                            }
+                        )
+                else:
+                    extra_input_args = live_overlay_extra_input_args
+                    filter_complex = live_overlay_filter_complex
+                    cache_note = f"ASS event cache skipped: {cache_reason}"
+                    logger.info(cache_note)
+                    _append_processing_log_note(log_path, cache_note)
+                    if render_metrics is not None:
+                        render_metrics.update(
+                            {
+                                "subtitle_overlay_mode": "live-static",
+                                "subtitle_overlay_fps": round(_frame_rate_value(overlay_frame_rate), 3),
+                                "subtitle_event_cache_skip": cache_reason,
+                            }
+                        )
+            else:
+                extra_input_args = live_overlay_extra_input_args
+                filter_complex = live_overlay_filter_complex
+                if render_metrics is not None:
+                    render_metrics.update(
+                        {
+                            "subtitle_overlay_mode": "live-full",
+                            "subtitle_overlay_fps": round(_frame_rate_value(overlay_frame_rate), 3),
+                        }
+                    )
+
             map_args = ["-map", "[out]", "-map", "0:a?"]
             filter_arg = ""
         else:
             filter_arg = legacy_filter_arg
             compose_mode = "legacy-full-frame"
+            if render_metrics is not None:
+                render_metrics["subtitle_overlay_mode"] = "legacy-full-frame"
 
         bit_depth_note = (
             f"Intel render pipeline: decode={decode_mode} compose={compose_mode} "
@@ -3345,59 +3766,106 @@ def render_burn_in(
         video_args = ["-c:v", "libsvtav1", "-preset", str(effective_preset_n), "-crf", str(effective_crf)]
         filter_arg = ass_filter
 
+    def _build_overlay_command(input_args: list[str], graph: str) -> list[str]:
+        return [
+            *cmd,
+            "-i",
+            str(video_path),
+            *input_args,
+            "-filter_complex",
+            graph,
+            *map_args,
+            *video_args,
+            "-c:a",
+            "copy",
+            str(output_path),
+        ]
+
+    def _remove_partial_output() -> None:
+        try:
+            output_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    def _run_legacy_fallback(reason: BaseException) -> None:
+        if cancel_event is not None and cancel_event.is_set():
+            raise RuntimeError("render process canceled") from reason
+        message = (
+            "VAAPI subtitle overlay failed; retrying with legacy full-frame composition "
+            f"({type(reason).__name__})"
+        )
+        logger.warning("%s: %s", message, video_path)
+        _append_processing_log_note(log_path, message)
+        if render_metrics is not None:
+            render_metrics.update(
+                {
+                    "subtitle_overlay_mode": "legacy-full-frame-fallback",
+                    "subtitle_overlay_failure": type(reason).__name__,
+                }
+            )
+        _remove_partial_output()
+        legacy_cmd = [
+            *cmd,
+            "-i",
+            str(video_path),
+            "-vf",
+            legacy_filter_arg,
+            *video_args,
+            "-c:a",
+            "copy",
+            str(output_path),
+        ]
+        _run_logged(
+            legacy_cmd,
+            log_path=log_path,
+            live_upload_cb=live_upload_cb,
+            cancel_event=cancel_event,
+        )
+
     try:
         if filter_complex is not None:
-            overlay_cmd = [
-                *cmd,
-                "-i",
-                str(video_path),
-                *extra_input_args,
-                "-filter_complex",
-                filter_complex,
-                *map_args,
-                *video_args,
-                "-c:a",
-                "copy",
-                str(output_path),
-            ]
+            overlay_cmd = _build_overlay_command(extra_input_args, filter_complex)
             try:
                 _run_logged(
                     overlay_cmd,
                     log_path=log_path,
                     live_upload_cb=live_upload_cb,
                     cancel_event=cancel_event,
+                    stdin_producer=overlay_stdin_producer,
                 )
-            except (OSError, subprocess.CalledProcessError) as exc:
-                # Driver/format support varies across Intel generations. The fast
-                # overlay path is attempted for 8/10-bit and hardware/software
-                # decode, but a runtime incompatibility must never break rendering.
-                message = (
-                    "VAAPI subtitle overlay failed; retrying with legacy full-frame composition "
-                    f"({type(exc).__name__})"
-                )
-                logger.warning("%s: %s", message, video_path)
-                _append_processing_log_note(log_path, message)
-                try:
-                    output_path.unlink(missing_ok=True)
-                except Exception:
-                    pass
-                legacy_cmd = [
-                    *cmd,
-                    "-i",
-                    str(video_path),
-                    "-vf",
-                    legacy_filter_arg,
-                    *video_args,
-                    "-c:a",
-                    "copy",
-                    str(output_path),
-                ]
-                _run_logged(
-                    legacy_cmd,
-                    log_path=log_path,
-                    live_upload_cb=live_upload_cb,
-                    cancel_event=cancel_event,
-                )
+            except (OSError, subprocess.CalledProcessError, RuntimeError) as exc:
+                if cancel_event is not None and cancel_event.is_set():
+                    raise
+                if event_cache is not None and live_overlay_filter_complex is not None:
+                    message = (
+                        "ASS event-cache overlay failed; retrying live VAAPI subtitle overlay "
+                        f"({type(exc).__name__})"
+                    )
+                    logger.warning("%s: %s", message, video_path)
+                    _append_processing_log_note(log_path, message)
+                    if render_metrics is not None:
+                        render_metrics.update(
+                            {
+                                "subtitle_overlay_mode": "live-static-fallback",
+                                "subtitle_event_cache_failure": type(exc).__name__,
+                            }
+                        )
+                    _remove_partial_output()
+                    live_overlay_cmd = _build_overlay_command(
+                        live_overlay_extra_input_args,
+                        live_overlay_filter_complex,
+                    )
+                    try:
+                        _run_logged(
+                            live_overlay_cmd,
+                            log_path=log_path,
+                            live_upload_cb=live_upload_cb,
+                            cancel_event=cancel_event,
+                        )
+                    except (OSError, subprocess.CalledProcessError, RuntimeError) as live_exc:
+                        _run_legacy_fallback(live_exc)
+                else:
+                    _run_legacy_fallback(exc)
         else:
             cmd.extend(
                 [
@@ -3418,6 +3886,8 @@ def render_burn_in(
                 cancel_event=cancel_event,
             )
     finally:
+        if event_cache is not None:
+            shutil.rmtree(event_cache.directory, ignore_errors=True)
         if overlay_ass_path is not None:
             try:
                 overlay_ass_path.unlink(missing_ok=True)
