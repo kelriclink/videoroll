@@ -258,6 +258,12 @@ class RenderWorkerRuntime:
         )
         with httpx.Client(timeout=self.settings.request_timeout_seconds) as client:
             response = client.post(f"{self.api_base}/{endpoint}", json=body, headers=headers)
+            if response.is_error:
+                logger.error(
+                    "render worker enrollment failed: status=%s body=%s",
+                    response.status_code,
+                    response.text[:1000],
+                )
             response.raise_for_status()
             enrolled = WorkerEnrollResponse.model_validate(response.json())
         stored = json.dumps({"worker_id": str(enrolled.worker.id), "credential": enrolled.credential})
