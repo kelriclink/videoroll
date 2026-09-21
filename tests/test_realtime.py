@@ -219,12 +219,20 @@ def test_frontend_proxies_websocket_upgrades() -> None:
 def test_realtime_pages_have_no_periodic_api_polling() -> None:
     for page in (
         "TaskDetailPage.tsx",
-        "DashboardPage.tsx",
         "SettingsPublishPage.tsx",
     ):
         source = Path("src/web/src/pages", page).read_text(encoding="utf-8")
         assert "setInterval" not in source
         assert "setTimeout(load" not in source
+
+    # Agent status has a bounded reconciliation poll in addition to WebSocket
+    # events so a dropped/overflowed terminal event cannot leave the dashboard
+    # permanently showing a stale running state.
+    dashboard = Path("src/web/src/pages/DashboardPage.tsx").read_text(encoding="utf-8")
+    assert dashboard.count("setInterval") == 1
+    assert "void loadAgentRuns();" in dashboard
+    assert "15_000" in dashboard
+    assert "setTimeout(load" not in dashboard
 
 
 def test_render_queue_uses_realtime_updates_without_resource_polling() -> None:

@@ -5957,7 +5957,7 @@ def build_rag_context(
                 base_url=chat_config.base_url,
                 model=chat_config.model,
                 input_chars=len(text_value) + len(previous_summary) + len(json.dumps(local_context_items, ensure_ascii=False)[:8000]),
-                completion_cap=1024,
+                completion_cap=max(10_000, int(rag_settings.agent_max_total_tokens or 500_000)),
             )
             master_runtime.before_llm()
             gate_terms = pretranslation_rag_gate_openai(
@@ -6010,7 +6010,7 @@ def build_rag_context(
                 error=str(e)[:300],
                 error_type=type(e).__name__,
             )
-        except Exception:
+        except Exception as e:
             gate_terms = None
             _append_llm_step(
                 db,
@@ -6018,7 +6018,8 @@ def build_rag_context(
                 action="master_pretranslation_rag_gate_failed",
                 config=chat_config,
                 duration_ms=_duration_ms(gate_started),
-                error_type="gate_failed",
+                error=str(e),
+                error_type=type(e).__name__,
             )
         gate_duration_ms = _duration_ms(gate_started)
         _append_state_transition(

@@ -33,6 +33,16 @@ def upgrade() -> None:
     # run table yet. Create the compatible base shape first, then use
     # add_column_if_missing below to upgrade installations where the table was
     # already created by auto_migrate.
+    # The knowledge table predates Alembic. Revision 0006 is the first
+    # versioned migration that references it, so provide the minimal compatible
+    # parent table before creating the foreign key below. The runtime
+    # compatibility migration fills out the remaining RAG columns/indexes.
+    create_table_if_missing(
+        "translation_knowledge_items",
+        sa.Column("id", _uuid_type(), nullable=False),
+        sa.PrimaryKeyConstraint("id"),
+    )
+
     create_table_if_missing(
         "translation_agent_runs",
         sa.Column("id", _uuid_type(), nullable=False),
