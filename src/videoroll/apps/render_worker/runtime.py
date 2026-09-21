@@ -116,7 +116,17 @@ def _nvidia_devices(encoders: set[str], *, max_concurrency: int) -> list[RenderD
     nvenc = tuple(sorted(x for x in encoders if x.endswith("_nvenc")))
     if not nvenc:
         return []
-    command = ["nvidia-smi", "--query-gpu=index,uuid,name,memory.total", "--format=csv,noheader,nounits"]
+    nvidia_smi = shutil.which("nvidia-smi")
+    if not nvidia_smi and os.name == "nt":
+        windows_dir = Path(os.getenv("WINDIR") or r"C:\\Windows")
+        candidates = [
+            windows_dir / "System32" / "nvidia-smi.exe",
+            Path(os.getenv("ProgramW6432") or r"C:\\Program Files") / "NVIDIA Corporation" / "NVSMI" / "nvidia-smi.exe",
+        ]
+        nvidia_smi = next((str(path) for path in candidates if path.is_file()), None)
+    if not nvidia_smi:
+        return []
+    command = [nvidia_smi, "--query-gpu=index,uuid,name,memory.total", "--format=csv,noheader,nounits"]
     try:
         output = subprocess.run(command, capture_output=True, text=True, timeout=5, check=True).stdout
     except (OSError, subprocess.SubprocessError):
@@ -217,6 +227,10 @@ class RenderWorkerRuntime:
         if self.identity is None:
             raise RuntimeError("render worker is not enrolled")
         return {"Authorization": f"Bearer {self.identity.credential}"}
+
+    def stop(self) -> None:
+        """Stop claiming new work while allowing accepted executions to settle."""
+        self._stop.set()
 
     def enroll(self) -> WorkerIdentity:
         credential = _load_credential(self.settings)

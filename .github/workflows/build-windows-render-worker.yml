@@ -1,0 +1,63 @@
+name: Build Windows Render Worker
+
+on:
+  push:
+    branches:
+      - windows-render-worker
+    paths:
+      - "src/videoroll/apps/render_worker/**"
+      - "src/videoroll/apps/subtitle_service/processing.py"
+      - "src/videoroll/config.py"
+      - "src/videoroll/apps/orchestrator_api/render_worker_schemas.py"
+      - "scripts/build_windows_render_worker.ps1"
+      - "pyproject.toml"
+      - ".github/workflows/build-windows-render-worker.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Windows x64 portable client
+    runs-on: windows-2025
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install worker build dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install .
+          python -m pip install pytest pyinstaller==6.16.0
+
+      - name: Run render worker tests
+        shell: pwsh
+        run: python -m pytest -q tests/test_render_worker_runtime.py tests/test_render_worker_server.py
+
+      - name: Build portable Windows client
+        shell: pwsh
+        run: ./scripts/build_windows_render_worker.ps1
+
+      - name: Smoke test packaged files
+        shell: pwsh
+        run: |
+          $dir = "dist\VideoRollRenderWorker"
+          if (-not (Test-Path "$dir\VideoRollRenderWorker.exe")) { throw "client exe missing" }
+          if (-not (Test-Path "$dir\ffmpeg.exe")) { throw "ffmpeg.exe missing" }
+          if (-not (Test-Path "$dir\ffprobe.exe")) { throw "ffprobe.exe missing" }
+          & "$dir\ffmpeg.exe" -hide_banner -encoders 2>&1 | Select-String "av1_nvenc" | Out-Null
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: VideoRollRenderWorker-windows-x64
+          path: dist/VideoRollRenderWorker-windows-x64.zip
+          if-no-files-found: error
+          retention-days: 14
