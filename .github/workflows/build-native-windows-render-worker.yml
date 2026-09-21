@@ -1,0 +1,64 @@
+name: Build Native Windows Render Worker
+
+on:
+  push:
+    branches:
+      - windows-render-worker
+    paths:
+      - "native/windows-render-worker/**"
+      - "scripts/build_native_windows_render_worker.ps1"
+      - ".github/workflows/build-native-windows-render-worker.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Rust x64 worker + installer
+    runs-on: windows-2025
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: native/windows-render-worker
+
+      - name: Rust tests
+        shell: pwsh
+        run: cargo test --manifest-path native/windows-render-worker/Cargo.toml
+
+      - name: Build native client and installer
+        shell: pwsh
+        run: ./scripts/build_native_windows_render_worker.ps1
+
+      - name: Verify package
+        shell: pwsh
+        run: |
+          $stage = "dist\native-windows-render-worker"
+          foreach ($file in @(
+            "$stage\VideoRollRenderWorker.exe",
+            "$stage\bin\ffmpeg.exe",
+            "$stage\bin\ffprobe.exe",
+            "dist\VideoRollRenderWorker-Native-Portable-x64.zip",
+            "dist\VideoRollRenderWorker-Setup-x64.exe"
+          )) {
+            if (-not (Test-Path $file)) { throw "missing package file: $file" }
+          }
+          Get-FileHash "dist\VideoRollRenderWorker-Setup-x64.exe" -Algorithm SHA256
+          Get-FileHash "dist\VideoRollRenderWorker-Native-Portable-x64.zip" -Algorithm SHA256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: VideoRollRenderWorker-Native-Windows-x64
+          path: |
+            dist/VideoRollRenderWorker-Setup-x64.exe
+            dist/VideoRollRenderWorker-Native-Portable-x64.zip
+          if-no-files-found: error
+          retention-days: 14
