@@ -9,7 +9,7 @@ $FfmpegZip = Join-Path $Vendor "ffmpeg.zip"
 New-Item -ItemType Directory -Force -Path $FfmpegRoot | Out-Null
 
 Write-Host "Downloading FFmpeg Windows build..."
-Invoke-WebRequest -Uri "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip" -OutFile $FfmpegZip
+Invoke-WebRequest -Uri "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip" -OutFile $FfmpegZip
 
 $Extracted = Join-Path $Vendor "ffmpeg-extracted"
 Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $Extracted
