@@ -2634,7 +2634,10 @@ def _prepare_ass_overlay_band(
             line_height_sum += font_size * 1.22 + outline * 2.0
         required_height = max(required_height, line_height_sum + margin_v + 32.0)
 
-    min_band = max(192, int(round(video_height * 0.24)))
+    # The event geometry above is the real safety bound. Do not reserve a
+    # fixed 24% of a 4K frame when the subtitles themselves need much less:
+    # that needlessly expands every BGRA subtitle upload for the whole video.
+    min_band = max(96, min(192, int(round(video_height * 0.12))))
     band_height = max(min_band, int(required_height + 1))
     band_height = min(int(video_height), band_height)
     if band_height % 2:
@@ -2663,6 +2666,55 @@ def _prepare_ass_overlay_band(
         return Path(handle.name), band_height
     finally:
         handle.close()
+
+
+def _ass_can_use_reduced_overlay_rate(ass_path: Path) -> bool:
+    """Return whether a subtitle plane can safely refresh below video FPS.
+
+    Plain dialogue subtitles are piecewise static: libass only needs a new
+    raster when the displayed subtitle state changes. FFmpeg's overlay
+    framesync repeats the latest overlay frame between refreshes, so rendering
+    the transparent plane at a modest rate avoids rasterizing/uploading a
+    large 4K BGRA surface for every video frame.
+
+    Animated/timeline-sensitive ASS stays on the source frame rate.
+    """
+    try:
+        ass_text = ass_path.read_text(encoding="utf-8")
+    except Exception:
+        return False
+
+    # 	 / move / fades / karaoke tags change within an event and therefore
+    # require the subtitle plane to advance at the source frame rate.
+    if re.search(r"\\(?:t|move|fad|fade)\s*\(", ass_text, flags=re.IGNORECASE):
+        return False
+    if re.search(r"\\(?:k|K|kf|ko|kt)\s*\d", ass_text):
+        return False
+
+    # ASS Effects such as Banner / Scroll up / Scroll down are animated even
+    # when no override animation tag is present.
+    for raw_line in ass_text.splitlines():
+        if not raw_line.startswith("Dialogue:"):
+            continue
+        fields = raw_line.split(",", 9)
+        if len(fields) >= 9 and fields[8].strip():
+            return False
+    return True
+
+
+def _reduced_overlay_frame_rate(frame_rate: str, *, cap_fps: float = 15.0) -> str:
+    """Cap a rational FFmpeg frame rate while preserving slower sources."""
+    value = str(frame_rate or "").strip()
+    match = re.fullmatch(r"(\d+)/(\d+)", value)
+    if not match:
+        return value or "15/1"
+    numerator = int(match.group(1))
+    denominator = int(match.group(2))
+    if numerator <= 0 or denominator <= 0:
+        return value
+    if numerator / denominator <= cap_fps:
+        return value
+    return f"{int(cap_fps)}/1"
 
 
 def _pixel_format_bit_depth(pixel_format: str) -> int:
@@ -3221,6 +3273,12 @@ def render_burn_in(
                 compose_mode = f"vaapi-overlay-full {video_width}x{video_height}"
 
             frame_rate = probe_video_frame_rate(ffmpeg_path, video_path)
+            overlay_frame_rate = frame_rate
+            if overlay_band is not None and _ass_can_use_reduced_overlay_rate(ass_path):
+                overlay_frame_rate = _reduced_overlay_frame_rate(frame_rate)
+                compose_mode += f" static-overlay-fps={overlay_frame_rate}"
+            else:
+                compose_mode += f" overlay-fps={frame_rate}"
             overlay_ass_filter = f"ass={str(overlay_render_ass_path).replace(':', r'\:')}:alpha=1"
             extra_input_args = [
                 "-f",
@@ -3228,7 +3286,7 @@ def render_burn_in(
                 "-i",
                 (
                     f"color=c=black@0.0:s={video_width}x{overlay_height}:"
-                    f"r={frame_rate},format=yuva420p"
+                    f"r={overlay_frame_rate},format=yuva420p"
                 ),
             ]
             if hardware_decode:

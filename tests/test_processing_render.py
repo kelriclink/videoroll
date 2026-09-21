@@ -22,7 +22,9 @@ except ModuleNotFoundError:
 
 from videoroll.apps.subtitle_service.processing import (
     Segment,
+    _ass_can_use_reduced_overlay_rate,
     _prepare_ass_overlay_band,
+    _reduced_overlay_frame_rate,
     probe_video_bit_depth,
     render_burn_in,
     segments_to_ass,
@@ -158,6 +160,7 @@ class ProcessingRenderTests(unittest.TestCase):
                 "videoroll.apps.subtitle_service.processing._prepare_ass_overlay_band",
                 return_value=(Path("/tmp/subtitle-band.ass"), 760),
             ),
+            patch("videoroll.apps.subtitle_service.processing._ass_can_use_reduced_overlay_rate", return_value=True),
             patch("videoroll.apps.subtitle_service.processing.Path.unlink"),
         ):
             render_burn_in(
@@ -174,7 +177,7 @@ class ProcessingRenderTests(unittest.TestCase):
         self.assertEqual(len(calls), 2)
         cmd = calls[-1]
         self.assertIn("-filter_complex", cmd)
-        self.assertIn("color=c=black@0.0:s=3840x760:r=60/1,format=yuva420p", cmd)
+        self.assertIn("color=c=black@0.0:s=3840x760:r=15/1,format=yuva420p", cmd)
         graph = cmd[cmd.index("-filter_complex") + 1]
         self.assertIn("ass=/tmp/subtitle-band.ass:alpha=1,format=bgra,hwupload", graph)
         self.assertIn("overlay_vaapi=x=0:y=1400:shortest=1", graph)
@@ -384,6 +387,113 @@ class ProcessingRenderTests(unittest.TestCase):
             self.assertLess(band_height, 2160)
             self.assertIn(f"PlayResY: {band_height}", band_text)
             self.assertIn("Style: Default,Noto Sans CJK SC,149", band_text)
+
+    def test_prepare_ass_overlay_band_does_not_reserve_quarter_of_4k_frame(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "subtitle.ass"
+            source.write_text(
+                """[Script Info]
+PlayResX: 3840
+PlayResY: 2160
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,Noto Sans CJK SC,96,&H00FFFFFF,&H000000FF,&H00000000,&H64000000,0,0,0,0,100,100,0,0,1,4,0,2,160,160,80,1
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 0,0:00:00.00,0:00:04.00,Default,,0,0,0,,普通单行字幕
+""",
+                encoding="utf-8",
+            )
+
+            prepared = _prepare_ass_overlay_band(
+                source,
+                video_width=3840,
+                video_height=2160,
+                output_dir=root,
+            )
+
+            self.assertIsNotNone(prepared)
+            assert prepared is not None
+            _band_path, band_height = prepared
+            self.assertGreaterEqual(band_height, 192)
+            self.assertLess(band_height, int(2160 * 0.24))
+
+    def test_static_ass_can_use_reduced_overlay_rate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "subtitle.ass"
+            source.write_text(
+                """[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 0,0:00:00.20,0:00:05.96,Default,,0,0,0,,{\\rDefault}中文\\N{\\rSecondary}English
+""",
+                encoding="utf-8",
+            )
+            self.assertTrue(_ass_can_use_reduced_overlay_rate(source))
+            self.assertEqual(_reduced_overlay_frame_rate("60/1"), "15/1")
+            self.assertEqual(_reduced_overlay_frame_rate("30000/1001"), "15/1")
+            self.assertEqual(_reduced_overlay_frame_rate("12/1"), "12/1")
+
+    def test_animated_ass_keeps_source_overlay_rate(self) -> None:
+        animated_texts = [
+            r"{\t(0,500,\alpha&H80&)}Animated",
+            r"{\fad(200,200)}Fade",
+            r"{\k20}Ka{\kf30}raoke",
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for index, text in enumerate(animated_texts):
+                source = root / f"animated-{index}.ass"
+                source.write_text(
+                    "[Events]\n"
+                    "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
+                    f"Dialogue: 0,0:00:00.00,0:00:04.00,Default,,0,0,0,,{text}\n",
+                    encoding="utf-8",
+                )
+                self.assertFalse(_ass_can_use_reduced_overlay_rate(source), text)
+
+            effect = root / "effect.ass"
+            effect.write_text(
+                "[Events]\n"
+                "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
+                "Dialogue: 0,0:00:00.00,0:00:04.00,Default,,0,0,0,Banner,Scrolling\n",
+                encoding="utf-8",
+            )
+            self.assertFalse(_ass_can_use_reduced_overlay_rate(effect))
+
+    def test_render_burn_in_animated_ass_keeps_video_frame_rate(self) -> None:
+        calls: list[list[str]] = []
+
+        def fake_run_logged(cmd: list[str], **_kwargs: object) -> None:
+            calls.append(cmd)
+
+        with (
+            patch("videoroll.apps.subtitle_service.processing._run_logged", side_effect=fake_run_logged),
+            patch("videoroll.apps.subtitle_service.processing.Path.exists", return_value=True),
+            patch("videoroll.apps.subtitle_service.processing._ffmpeg_supports_encoder", return_value=True),
+            patch("videoroll.apps.subtitle_service.processing._ffmpeg_supports_filter", return_value=True),
+            patch("videoroll.apps.subtitle_service.processing.probe_video_bit_depth", return_value=8),
+            patch("videoroll.apps.subtitle_service.processing.probe_video_resolution", return_value=(3840, 2160)),
+            patch("videoroll.apps.subtitle_service.processing.probe_video_frame_rate", return_value="60/1"),
+            patch(
+                "videoroll.apps.subtitle_service.processing._prepare_ass_overlay_band",
+                return_value=(Path("/tmp/subtitle-band.ass"), 760),
+            ),
+            patch("videoroll.apps.subtitle_service.processing._ass_can_use_reduced_overlay_rate", return_value=False),
+            patch("videoroll.apps.subtitle_service.processing.Path.unlink"),
+        ):
+            render_burn_in(
+                "ffmpeg",
+                Path("/tmp/input.webm"),
+                Path("/tmp/subtitle.ass"),
+                Path("/tmp/out.mp4"),
+                video_codec="av1",
+                use_intel_gpu=True,
+                intel_gpu_render_device="/dev/dri/renderD128",
+            )
+
+        cmd = calls[-1]
+        self.assertIn("color=c=black@0.0:s=3840x760:r=60/1,format=yuva420p", cmd)
 
     def test_render_burn_in_intel_av1_requires_ffmpeg_encoder(self) -> None:
         with (
