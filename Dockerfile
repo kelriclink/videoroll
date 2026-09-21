@@ -71,7 +71,7 @@ ARG APP_GID=10001
 # while assigning the same IDs used by Compose and the mounted directories.
 RUN groupadd --non-unique --gid "$APP_GID" videoroll \
   && useradd --non-unique --uid "$APP_UID" --gid videoroll --create-home --shell /usr/sbin/nologin videoroll \
-  && install -d --owner=videoroll --group=videoroll --mode=0700 /models /secrets /storage /work
+  && install -d --owner=videoroll --group=videoroll --mode=0700 /models /secrets /storage /work /state /work/render-worker
 
 RUN sed -i 's/\r$//' /app/docker/entrypoint.sh \
   && chmod +x /app/docker/entrypoint.sh
