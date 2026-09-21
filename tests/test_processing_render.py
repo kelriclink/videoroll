@@ -68,6 +68,7 @@ class ProcessingRenderTests(unittest.TestCase):
             patch("videoroll.apps.subtitle_service.processing.Path.exists", return_value=True),
             patch("videoroll.apps.subtitle_service.processing._ffmpeg_supports_encoder", return_value=True),
             patch("videoroll.apps.subtitle_service.processing.probe_video_bit_depth", return_value=10),
+            patch("videoroll.apps.subtitle_service.processing._ffmpeg_supports_filter", return_value=False),
         ):
             render_burn_in(
                 "ffmpeg",
@@ -110,6 +111,7 @@ class ProcessingRenderTests(unittest.TestCase):
             patch("videoroll.apps.subtitle_service.processing.Path.exists", return_value=True),
             patch("videoroll.apps.subtitle_service.processing._ffmpeg_supports_encoder", return_value=True),
             patch("videoroll.apps.subtitle_service.processing.probe_video_bit_depth", return_value=8),
+            patch("videoroll.apps.subtitle_service.processing._ffmpeg_supports_filter", return_value=False),
         ):
             render_burn_in(
                 "ffmpeg",
@@ -180,7 +182,7 @@ class ProcessingRenderTests(unittest.TestCase):
         self.assertIn("[out]", cmd)
         self.assertIn("0:a?", cmd)
 
-    def test_render_burn_in_intel_av1_preserves_10bit_input(self) -> None:
+    def test_render_burn_in_intel_av1_10bit_uses_p010_vaapi_overlay(self) -> None:
         calls: list[list[str]] = []
 
         def fake_run_logged(cmd: list[str], **_kwargs: object) -> None:
@@ -190,7 +192,15 @@ class ProcessingRenderTests(unittest.TestCase):
             patch("videoroll.apps.subtitle_service.processing._run_logged", side_effect=fake_run_logged),
             patch("videoroll.apps.subtitle_service.processing.Path.exists", return_value=True),
             patch("videoroll.apps.subtitle_service.processing._ffmpeg_supports_encoder", return_value=True),
+            patch("videoroll.apps.subtitle_service.processing._ffmpeg_supports_filter", return_value=True),
             patch("videoroll.apps.subtitle_service.processing.probe_video_bit_depth", return_value=10),
+            patch("videoroll.apps.subtitle_service.processing.probe_video_resolution", return_value=(3840, 2160)),
+            patch("videoroll.apps.subtitle_service.processing.probe_video_frame_rate", return_value="60/1"),
+            patch(
+                "videoroll.apps.subtitle_service.processing._prepare_ass_overlay_band",
+                return_value=(Path("/tmp/subtitle-band.ass"), 1008),
+            ),
+            patch("videoroll.apps.subtitle_service.processing.Path.unlink"),
         ):
             render_burn_in(
                 "ffmpeg",
@@ -205,12 +215,14 @@ class ProcessingRenderTests(unittest.TestCase):
         self.assertEqual(len(calls), 2)
         preflight, cmd = calls
         self.assertIn("scale_vaapi=format=p010,hwdownload,format=p010le", preflight)
-        self.assertIn(
-            "scale_vaapi=format=p010,hwdownload,format=p010le,ass=/tmp/subtitle.ass,format=p010le,hwupload",
-            cmd,
-        )
+        graph = cmd[cmd.index("-filter_complex") + 1]
+        self.assertIn("[0:v]scale_vaapi=format=p010[main]", graph)
+        self.assertIn("ass=/tmp/subtitle-band.ass:alpha=1,format=bgra,hwupload", graph)
+        self.assertIn("overlay_vaapi=x=0:y=1152:shortest=1", graph)
+        self.assertNotIn("hwdownload", graph)
 
-    def test_render_burn_in_falls_back_to_software_decode_and_keeps_vaapi_encode(self) -> None:
+
+    def test_render_burn_in_software_decode_still_uses_gpu_subtitle_overlay(self) -> None:
         calls: list[list[str]] = []
 
         def fake_run_logged(cmd: list[str], **_kwargs: object) -> None:
@@ -222,7 +234,15 @@ class ProcessingRenderTests(unittest.TestCase):
             patch("videoroll.apps.subtitle_service.processing._run_logged", side_effect=fake_run_logged),
             patch("videoroll.apps.subtitle_service.processing.Path.exists", return_value=True),
             patch("videoroll.apps.subtitle_service.processing._ffmpeg_supports_encoder", return_value=True),
+            patch("videoroll.apps.subtitle_service.processing._ffmpeg_supports_filter", return_value=True),
             patch("videoroll.apps.subtitle_service.processing.probe_video_bit_depth", return_value=10),
+            patch("videoroll.apps.subtitle_service.processing.probe_video_resolution", return_value=(3840, 2160)),
+            patch("videoroll.apps.subtitle_service.processing.probe_video_frame_rate", return_value="60/1"),
+            patch(
+                "videoroll.apps.subtitle_service.processing._prepare_ass_overlay_band",
+                return_value=(Path("/tmp/subtitle-band.ass"), 1008),
+            ),
+            patch("videoroll.apps.subtitle_service.processing.Path.unlink"),
         ):
             render_burn_in(
                 "ffmpeg",
@@ -238,8 +258,84 @@ class ProcessingRenderTests(unittest.TestCase):
         cmd = calls[-1]
         self.assertNotIn("-hwaccel", cmd)
         self.assertNotIn("-hwaccel_output_format", cmd)
-        self.assertIn("ass=/tmp/subtitle.ass,format=p010le,hwupload", cmd)
+        graph = cmd[cmd.index("-filter_complex") + 1]
+        self.assertIn("[0:v]format=p010le,hwupload[main]", graph)
+        self.assertIn("overlay_vaapi", graph)
         self.assertIn("av1_vaapi", cmd)
+
+
+    def test_render_burn_in_complex_ass_uses_full_frame_gpu_overlay(self) -> None:
+        calls: list[list[str]] = []
+
+        def fake_run_logged(cmd: list[str], **_kwargs: object) -> None:
+            calls.append(cmd)
+
+        with (
+            patch("videoroll.apps.subtitle_service.processing._run_logged", side_effect=fake_run_logged),
+            patch("videoroll.apps.subtitle_service.processing.Path.exists", return_value=True),
+            patch("videoroll.apps.subtitle_service.processing._ffmpeg_supports_encoder", return_value=True),
+            patch("videoroll.apps.subtitle_service.processing._ffmpeg_supports_filter", return_value=True),
+            patch("videoroll.apps.subtitle_service.processing.probe_video_bit_depth", return_value=8),
+            patch("videoroll.apps.subtitle_service.processing.probe_video_resolution", return_value=(1920, 1080)),
+            patch("videoroll.apps.subtitle_service.processing.probe_video_frame_rate", return_value="30/1"),
+            patch("videoroll.apps.subtitle_service.processing._prepare_ass_overlay_band", return_value=None),
+        ):
+            render_burn_in(
+                "ffmpeg",
+                Path("/tmp/input.webm"),
+                Path("/tmp/subtitle.ass"),
+                Path("/tmp/out.mp4"),
+                video_codec="av1",
+                use_intel_gpu=True,
+            )
+
+        self.assertEqual(len(calls), 2)
+        cmd = calls[-1]
+        self.assertIn("color=c=black@0.0:s=1920x1080:r=30/1,format=yuva420p", cmd)
+        graph = cmd[cmd.index("-filter_complex") + 1]
+        self.assertIn("ass=/tmp/subtitle.ass:alpha=1,format=bgra,hwupload", graph)
+        self.assertIn("overlay_vaapi=x=0:y=0:shortest=1", graph)
+        self.assertNotIn("hwdownload", graph)
+
+    def test_render_burn_in_overlay_runtime_failure_retries_legacy_path(self) -> None:
+        calls: list[list[str]] = []
+
+        def fake_run_logged(cmd: list[str], **_kwargs: object) -> None:
+            calls.append(cmd)
+            if len(calls) == 2:
+                raise subprocess.CalledProcessError(1, cmd)
+
+        with (
+            patch("videoroll.apps.subtitle_service.processing._run_logged", side_effect=fake_run_logged),
+            patch("videoroll.apps.subtitle_service.processing.Path.exists", return_value=True),
+            patch("videoroll.apps.subtitle_service.processing._ffmpeg_supports_encoder", return_value=True),
+            patch("videoroll.apps.subtitle_service.processing._ffmpeg_supports_filter", return_value=True),
+            patch("videoroll.apps.subtitle_service.processing.probe_video_bit_depth", return_value=10),
+            patch("videoroll.apps.subtitle_service.processing.probe_video_resolution", return_value=(3840, 2160)),
+            patch("videoroll.apps.subtitle_service.processing.probe_video_frame_rate", return_value="60/1"),
+            patch(
+                "videoroll.apps.subtitle_service.processing._prepare_ass_overlay_band",
+                return_value=(Path("/tmp/subtitle-band.ass"), 1008),
+            ),
+            patch("videoroll.apps.subtitle_service.processing.Path.unlink"),
+        ):
+            render_burn_in(
+                "ffmpeg",
+                Path("/tmp/input.webm"),
+                Path("/tmp/subtitle.ass"),
+                Path("/tmp/out.mp4"),
+                video_codec="av1",
+                use_intel_gpu=True,
+            )
+
+        self.assertEqual(len(calls), 3)
+        overlay_cmd = calls[1]
+        legacy_cmd = calls[2]
+        self.assertIn("-filter_complex", overlay_cmd)
+        self.assertIn(
+            "scale_vaapi=format=p010,hwdownload,format=p010le,ass=/tmp/subtitle.ass,format=p010le,hwupload",
+            legacy_cmd,
+        )
 
     def test_probe_video_bit_depth_reads_ffprobe_pixel_format(self) -> None:
         result = types.SimpleNamespace(

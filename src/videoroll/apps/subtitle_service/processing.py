@@ -3069,53 +3069,61 @@ def render_burn_in(
         if hardware_decode:
             cmd.extend(_intel_vaapi_decode_args())
 
-        overlay_band: tuple[Path, int] | None = None
-        video_width = 0
-        video_height = 0
-        if (
-            hardware_decode
-            and target_bit_depth == 8
-            and _ffmpeg_supports_filter(ffmpeg_path, "overlay_vaapi")
-        ):
-            video_width, video_height = probe_video_resolution(ffmpeg_path, video_path)
+        if hardware_decode:
+            legacy_filter_arg = (
+                f"scale_vaapi=format={vaapi_pixel_format},"
+                f"hwdownload,format={software_pixel_format},"
+                f"{ass_filter},format={software_pixel_format},hwupload"
+            )
+        else:
+            legacy_filter_arg = f"{ass_filter},format={software_pixel_format},hwupload"
+
+        video_width, video_height = probe_video_resolution(ffmpeg_path, video_path)
+        if _ffmpeg_supports_filter(ffmpeg_path, "overlay_vaapi"):
             overlay_band = _prepare_ass_overlay_band(
                 ass_path,
                 video_width=video_width,
                 video_height=video_height,
                 output_dir=output_path.parent,
             )
+            if overlay_band is not None:
+                overlay_ass_path, overlay_height = overlay_band
+                overlay_render_ass_path = overlay_ass_path
+                overlay_y = max(0, video_height - overlay_height)
+                compose_mode = f"vaapi-overlay-band {video_width}x{overlay_height}@y{overlay_y}"
+            else:
+                # Complex/positioned ASS still keeps the main video on the GPU:
+                # render a full-frame transparent subtitle plane and compose it
+                # with VAAPI instead of downloading the video to system RAM.
+                overlay_render_ass_path = ass_path
+                overlay_height = video_height
+                overlay_y = 0
+                compose_mode = f"vaapi-overlay-full {video_width}x{video_height}"
 
-        if overlay_band is not None:
-            overlay_ass_path, band_height = overlay_band
             frame_rate = probe_video_frame_rate(ffmpeg_path, video_path)
-            overlay_y = max(0, video_height - band_height)
-            overlay_ass_filter = f"ass={str(overlay_ass_path).replace(':', r'\:')}:alpha=1"
+            overlay_ass_filter = f"ass={str(overlay_render_ass_path).replace(':', r'\:')}:alpha=1"
             extra_input_args = [
                 "-f",
                 "lavfi",
                 "-i",
                 (
-                    f"color=c=black@0.0:s={video_width}x{band_height}:"
+                    f"color=c=black@0.0:s={video_width}x{overlay_height}:"
                     f"r={frame_rate},format=yuva420p"
                 ),
             ]
+            if hardware_decode:
+                main_filter = f"scale_vaapi=format={vaapi_pixel_format}"
+            else:
+                main_filter = f"format={software_pixel_format},hwupload"
             filter_complex = (
-                f"[0:v]scale_vaapi=format={vaapi_pixel_format}[main];"
+                f"[0:v]{main_filter}[main];"
                 f"[1:v]{overlay_ass_filter},format=bgra,hwupload[sub];"
                 f"[main][sub]overlay_vaapi=x=0:y={overlay_y}:shortest=1[out]"
             )
             map_args = ["-map", "[out]", "-map", "0:a?"]
             filter_arg = ""
-            compose_mode = f"vaapi-overlay band={video_width}x{band_height}@y{overlay_y}"
-        elif hardware_decode:
-            filter_arg = (
-                f"scale_vaapi=format={vaapi_pixel_format},"
-                f"hwdownload,format={software_pixel_format},"
-                f"{ass_filter},format={software_pixel_format},hwupload"
-            )
-            compose_mode = "legacy-full-frame"
         else:
-            filter_arg = f"{ass_filter},format={software_pixel_format},hwupload"
+            filter_arg = legacy_filter_arg
             compose_mode = "legacy-full-frame"
 
         bit_depth_note = (
@@ -3159,9 +3167,10 @@ def render_burn_in(
         video_args = ["-c:v", "libsvtav1", "-preset", str(effective_preset_n), "-crf", str(effective_crf)]
         filter_arg = ass_filter
 
-    if filter_complex is not None:
-        cmd.extend(
-            [
+    try:
+        if filter_complex is not None:
+            overlay_cmd = [
+                *cmd,
                 "-i",
                 str(video_path),
                 *extra_input_args,
@@ -3173,22 +3182,48 @@ def render_burn_in(
                 "copy",
                 str(output_path),
             ]
-        )
-    else:
-        cmd.extend(
-            [
-                "-i",
-                str(video_path),
-                "-vf",
-                filter_arg,
-                *video_args,
-                "-c:a",
-                "copy",
-                str(output_path),
-            ]
-        )
-    try:
-        _run_logged(cmd, log_path=log_path, live_upload_cb=live_upload_cb)
+            try:
+                _run_logged(overlay_cmd, log_path=log_path, live_upload_cb=live_upload_cb)
+            except (OSError, subprocess.CalledProcessError) as exc:
+                # Driver/format support varies across Intel generations. The fast
+                # overlay path is attempted for 8/10-bit and hardware/software
+                # decode, but a runtime incompatibility must never break rendering.
+                message = (
+                    "VAAPI subtitle overlay failed; retrying with legacy full-frame composition "
+                    f"({type(exc).__name__})"
+                )
+                logger.warning("%s: %s", message, video_path)
+                _append_processing_log_note(log_path, message)
+                try:
+                    output_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                legacy_cmd = [
+                    *cmd,
+                    "-i",
+                    str(video_path),
+                    "-vf",
+                    legacy_filter_arg,
+                    *video_args,
+                    "-c:a",
+                    "copy",
+                    str(output_path),
+                ]
+                _run_logged(legacy_cmd, log_path=log_path, live_upload_cb=live_upload_cb)
+        else:
+            cmd.extend(
+                [
+                    "-i",
+                    str(video_path),
+                    "-vf",
+                    filter_arg,
+                    *video_args,
+                    "-c:a",
+                    "copy",
+                    str(output_path),
+                ]
+            )
+            _run_logged(cmd, log_path=log_path, live_upload_cb=live_upload_cb)
     finally:
         if overlay_ass_path is not None:
             try:
