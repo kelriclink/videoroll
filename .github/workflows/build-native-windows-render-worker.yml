@@ -57,7 +57,7 @@ jobs:
       - name: Smoke test self-contained installer
         shell: pwsh
         run: |
-          $install = Join-Path $env:RUNNER_TEMP "VideoRoll Render Worker"
+          $install = Join-Path $env:RUNNER_TEMP "VideoRollRenderWorkerSmoke"
           Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $install
           $installer = Resolve-Path "dist\VideoRollRenderWorker-Setup-x64.exe"
           $process = Start-Process -FilePath $installer -ArgumentList @(
