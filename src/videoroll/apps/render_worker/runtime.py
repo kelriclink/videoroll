@@ -38,9 +38,7 @@ class WorkerIdentity:
 
 def _api_base(settings: RenderWorkerSettings) -> str:
     base = settings.server_url.strip().rstrip("/")
-    if base.endswith("/api"):
-        return f"{base}/render-workers/v1"
-    return f"{base}/api/render-workers/v1"
+    return f"{base}/render-workers/v1"
 
 
 def _credential_path(settings: RenderWorkerSettings) -> Path:

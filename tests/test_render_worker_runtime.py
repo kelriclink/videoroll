@@ -11,7 +11,7 @@ from videoroll.config import RenderWorkerSettings
 
 def settings(tmp_path: Path, **overrides) -> RenderWorkerSettings:
     values = {
-        "RENDER_WORKER_SERVER_URL": "https://video.example.com",
+        "RENDER_WORKER_SERVER_URL": "https://video.example.com/api",
         "RENDER_WORKER_CREDENTIAL_FILE": str(tmp_path / "credential.json"),
         "RENDER_WORKER_KEY": "a380-1",
         "RENDER_WORKER_NAME": "A380 #1",
