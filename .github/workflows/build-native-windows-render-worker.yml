@@ -54,6 +54,46 @@ jobs:
           Get-FileHash "dist\VideoRollRenderWorker-Setup-x64.exe" -Algorithm SHA256
           Get-FileHash "dist\VideoRollRenderWorker-Native-Portable-x64.zip" -Algorithm SHA256
 
+      - name: Smoke test self-contained installer
+        shell: pwsh
+        run: |
+          $install = Join-Path $env:RUNNER_TEMP "VideoRoll Render Worker"
+          Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $install
+          $installer = Resolve-Path "dist\VideoRollRenderWorker-Setup-x64.exe"
+          $process = Start-Process -FilePath $installer -ArgumentList @(
+            "/VERYSILENT",
+            "/SUPPRESSMSGBOXES",
+            "/NORESTART",
+            "/DIR=$install"
+          ) -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "installer exited with $($process.ExitCode)" }
+
+          foreach ($path in @(
+            "$install\VideoRollRenderWorker.exe",
+            "$install\bin\ffmpeg.exe",
+            "$install\bin\ffprobe.exe",
+            "$install\config",
+            "$install\logs",
+            "$install\cache",
+            "$install\work",
+            "$install\unins000.exe"
+          )) {
+            if (-not (Test-Path $path)) { throw "installed layout missing: $path" }
+          }
+
+          $uninstaller = Join-Path $install "unins000.exe"
+          $process = Start-Process -FilePath $uninstaller -ArgumentList @(
+            "/VERYSILENT",
+            "/SUPPRESSMSGBOXES",
+            "/NORESTART"
+          ) -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "uninstaller exited with $($process.ExitCode)" }
+          Start-Sleep -Seconds 2
+          if (Test-Path $install) {
+            $leftovers = Get-ChildItem -Force $install -ErrorAction SilentlyContinue
+            if ($leftovers) { throw "uninstall left files in $install" }
+          }
+
       - uses: actions/upload-artifact@v4
         with:
           name: VideoRollRenderWorker-Native-Windows-x64
