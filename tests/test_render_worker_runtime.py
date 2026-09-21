@@ -112,15 +112,61 @@ def test_nvidia_render_rejects_missing_codec_encoder(tmp_path: Path, monkeypatch
         )
 
 
+def test_intel_qsv_render_uses_hardware_encoder(tmp_path: Path, monkeypatch) -> None:
+    from videoroll.apps.subtitle_service import processing
+
+    video = tmp_path / "input.mp4"
+    ass = tmp_path / "subtitle.ass"
+    output = tmp_path / "output.mp4"
+    video.touch()
+    ass.write_text("[Script Info]\n", encoding="utf-8")
+    commands: list[list[str]] = []
+    monkeypatch.setattr(processing, "_ffmpeg_supports_encoder", lambda _ffmpeg, encoder: encoder == "h264_qsv")
+    monkeypatch.setattr(processing, "_run_logged", lambda command, **_kwargs: commands.append(command))
+
+    processing.render_burn_in(
+        "ffmpeg", video, ass, output,
+        video_codec="h264",
+        use_intel_qsv=True,
+        preset="fast",
+        crf=21,
+    )
+
+    command = commands[0]
+    assert command[command.index("-c:v") + 1] == "h264_qsv"
+    assert command[command.index("-preset") + 1] == "fast"
+    assert command[command.index("-global_quality") + 1] == "21"
+
+
+def test_windows_intel_device_reports_only_working_qsv_encoders(monkeypatch) -> None:
+    from videoroll.apps.render_worker import runtime
+
+    monkeypatch.setattr(runtime.shutil, "which", lambda _name: None)
+    monkeypatch.setattr(
+        runtime,
+        "_hardware_encoder_available",
+        lambda _ffmpeg, encoder, **_kwargs: encoder in {"h264_qsv", "hevc_qsv"},
+    )
+    devices = runtime._windows_intel_devices(
+        {"h264_qsv", "hevc_qsv", "av1_qsv"},
+        max_concurrency=2,
+        ffmpeg_path="ffmpeg.exe",
+    )
+    assert len(devices) == 1
+    assert devices[0].backend == "qsv"
+    assert devices[0].encoders == ("h264_qsv", "hevc_qsv")
+    assert devices[0].max_concurrency == 2
+
+
 def test_probe_assigns_node_concurrency_to_each_gpu(tmp_path: Path, monkeypatch) -> None:
     from videoroll.apps.render_worker import runtime
 
     monkeypatch.setattr(runtime, "_ffmpeg_supported_encoders", lambda _path: {"av1_nvenc"})
     monkeypatch.setattr(runtime, "_ffmpeg_supported_filters", lambda _path: set())
-    monkeypatch.setattr(runtime, "_intel_devices", lambda _encoders, max_concurrency: [])
+    monkeypatch.setattr(runtime, "_intel_devices", lambda _encoders, max_concurrency, ffmpeg_path: [])
     monkeypatch.setattr(
         runtime, "_nvidia_devices",
-        lambda _encoders, max_concurrency: [
+        lambda _encoders, max_concurrency, ffmpeg_path: [
             runtime.RenderDevice(
                 id="nvidia:0", name="GPU 0", backend="nvidia", index=0,
                 encoders=("av1_nvenc",), max_concurrency=max_concurrency,

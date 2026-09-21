@@ -54,6 +54,7 @@ jobs:
           if (-not (Test-Path "$dir\ffmpeg.exe")) { throw "ffmpeg.exe missing" }
           if (-not (Test-Path "$dir\ffprobe.exe")) { throw "ffprobe.exe missing" }
           & "$dir\ffmpeg.exe" -hide_banner -encoders 2>&1 | Select-String "av1_nvenc" | Out-Null
+          & "$dir\ffmpeg.exe" -hide_banner -encoders 2>&1 | Select-String "h264_qsv" | Out-Null
 
       - uses: actions/upload-artifact@v4
         with:

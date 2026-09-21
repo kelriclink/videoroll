@@ -101,9 +101,86 @@ class ActiveExecution:
     device: RenderDevice
 
 
-def _intel_devices(encoders: set[str], *, max_concurrency: int) -> list[RenderDevice]:
-    if os.name == "nt":
+def _hardware_encoder_available(
+    ffmpeg_path: str,
+    encoder: str,
+    *,
+    backend: str,
+    index: int | None = None,
+) -> bool:
+    command = [
+        ffmpeg_path,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+        "color=c=black:s=64x64:r=1",
+        "-frames:v",
+        "1",
+        "-c:v",
+        encoder,
+    ]
+    if backend == "nvidia" and index is not None:
+        command.extend(["-gpu", str(index)])
+    command.extend(["-f", "null", "-"])
+    try:
+        subprocess.run(command, capture_output=True, text=True, timeout=8, check=True)
+        return True
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def _windows_intel_devices(
+    encoders: set[str],
+    *,
+    max_concurrency: int,
+    ffmpeg_path: str,
+) -> list[RenderDevice]:
+    qsv_candidates = tuple(sorted(x for x in encoders if x.endswith("_qsv")))
+    if not qsv_candidates:
         return []
+    name = "Intel Quick Sync Video"
+    powershell = shutil.which("powershell") or shutil.which("powershell.exe")
+    detected_intel = False
+    if powershell:
+        command = [
+            powershell,
+            "-NoProfile",
+            "-Command",
+            "Get-CimInstance Win32_VideoController | Where-Object {$_.Name -match 'Intel'} | Select-Object -First 1 -ExpandProperty Name",
+        ]
+        try:
+            detected = subprocess.run(command, capture_output=True, text=True, timeout=5, check=True).stdout.strip()
+            if detected:
+                name = detected
+                detected_intel = True
+        except (OSError, subprocess.SubprocessError):
+            pass
+    qsv = tuple(
+        encoder
+        for encoder in qsv_candidates
+        if _hardware_encoder_available(ffmpeg_path, encoder, backend="qsv")
+    )
+    if not qsv:
+        return []
+    if not detected_intel:
+        name = "Intel Quick Sync Video"
+    return [
+        RenderDevice(
+            id="qsv:intel",
+            name=name,
+            backend="qsv",
+            encoders=qsv,
+            max_concurrency=max_concurrency,
+        )
+    ]
+
+
+def _intel_devices(encoders: set[str], *, max_concurrency: int, ffmpeg_path: str) -> list[RenderDevice]:
+    if os.name == "nt":
+        return _windows_intel_devices(encoders, max_concurrency=max_concurrency, ffmpeg_path=ffmpeg_path)
     paths = sorted(Path("/dev/dri").glob("renderD*")) if Path("/dev/dri").is_dir() else []
     vaapi = tuple(sorted(x for x in encoders if x.endswith("_vaapi")))
     return [
@@ -112,7 +189,7 @@ def _intel_devices(encoders: set[str], *, max_concurrency: int) -> list[RenderDe
     ]
 
 
-def _nvidia_devices(encoders: set[str], *, max_concurrency: int) -> list[RenderDevice]:
+def _nvidia_devices(encoders: set[str], *, max_concurrency: int, ffmpeg_path: str) -> list[RenderDevice]:
     nvenc = tuple(sorted(x for x in encoders if x.endswith("_nvenc")))
     if not nvenc:
         return []
@@ -141,7 +218,14 @@ def _nvidia_devices(encoders: set[str], *, max_concurrency: int) -> list[RenderD
         except ValueError:
             continue
         gpu_uuid = parts[1] or f"gpu-{index}"
-        devices.append(RenderDevice(id=f"nvidia:{gpu_uuid}", name=parts[2], backend="nvidia", index=index, encoders=nvenc, max_concurrency=max_concurrency))
+        supported = tuple(
+            encoder
+            for encoder in nvenc
+            if _hardware_encoder_available(ffmpeg_path, encoder, backend="nvidia", index=index)
+        )
+        if not supported:
+            continue
+        devices.append(RenderDevice(id=f"nvidia:{gpu_uuid}", name=parts[2], backend="nvidia", index=index, encoders=supported, max_concurrency=max_concurrency))
     return devices
 
 
@@ -164,8 +248,8 @@ def probe_capabilities(settings: RenderWorkerSettings) -> tuple[dict[str, Any], 
             max_concurrency=settings.max_concurrency,
         ))
     else:
-        devices.extend(_intel_devices(encoders, max_concurrency=settings.max_concurrency))
-        devices.extend(_nvidia_devices(encoders, max_concurrency=settings.max_concurrency))
+        devices.extend(_intel_devices(encoders, max_concurrency=settings.max_concurrency, ffmpeg_path=settings.ffmpeg_path))
+        devices.extend(_nvidia_devices(encoders, max_concurrency=settings.max_concurrency, ffmpeg_path=settings.ffmpeg_path))
     if not devices:
         software = tuple(sorted(x for x in encoders if x in {"libx264", "libx265", "libsvtav1", "libaom-av1"}))
         devices.append(RenderDevice(id="software:cpu", name=platform.processor() or "CPU", backend="software", encoders=software, max_concurrency=settings.max_concurrency))
@@ -428,6 +512,8 @@ class RenderWorkerRuntime:
                     video_codec=str(render_cfg.get("video_codec") or "av1"),
                     use_intel_gpu=backend in {"intel", "vaapi"},
                     intel_gpu_render_device=device.path or "/dev/dri/renderD128",
+                    use_intel_qsv=backend == "qsv",
+                    intel_qsv_device_index=device.index,
                     use_nvidia_gpu=backend == "nvidia",
                     nvidia_gpu_index=device.index,
                     preset=render_cfg.get("video_preset"),

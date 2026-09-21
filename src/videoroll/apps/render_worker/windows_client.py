@@ -173,7 +173,7 @@ class WindowsRenderWorkerApp:
         ttk.Label(outer, text="VideoRoll Windows 渲染节点", font=("Segoe UI", 16, "bold")).pack(anchor=tk.W)
         ttk.Label(
             outer,
-            text="节点自动扫描 NVIDIA GPU，并自行选择空闲且支持目标编码器的显卡。",
+            text="节点自动扫描 Intel QSV / NVIDIA NVENC，并自行选择空闲且支持目标编码器的显卡。",
         ).pack(anchor=tk.W, pady=(4, 14))
 
         form = ttk.LabelFrame(outer, text="连接与节点配置", padding=12)
