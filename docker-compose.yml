@@ -298,6 +298,7 @@ services:
       RENDER_WORKER_CREDENTIAL: ${RENDER_WORKER_CREDENTIAL:-}
       RENDER_WORKER_CREDENTIAL_FILE: /state/credential
       INTERNAL_API_SECRET: ${INTERNAL_API_SECRET:-videoroll-development-internal-secret}
+      ADMIN_BOOTSTRAP_SECRET: ${ADMIN_BOOTSTRAP_SECRET:-videoroll-development-bootstrap-secret}
       RENDER_WORKER_KEY: ${RENDER_WORKER_KEY:-local-render}
       RENDER_WORKER_NAME: ${RENDER_WORKER_NAME:-本机渲染节点}
       RENDER_WORKER_BACKEND: ${RENDER_WORKER_BACKEND:-auto}
