@@ -351,6 +351,11 @@ def complete_subtitle_handoff(
     # the scheduler must never observe an incomplete handoff.
     job.status = SubtitleJobStatus.succeeded
     job.progress = 100
+    # Subtitle scheduling no longer owns the render stage. Release its task
+    # lock in the same transaction so the Render Coordinator can claim the
+    # freshly queued RenderJob immediately.
+    unlock_task(task)
+    db.add(task)
     db.add(job)
     db.commit()
     log("render queued; waiting for task queue")

@@ -369,6 +369,85 @@ class RenderJob(Base):
     )
 
 
+class RenderWorker(Base):
+    __tablename__ = "render_workers"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    worker_key: Mapped[str] = mapped_column(String(128), nullable=False, unique=True)
+    name: Mapped[str] = mapped_column(String(128), nullable=False)
+    platform: Mapped[str] = mapped_column(String(32), nullable=False)
+    architecture: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    version: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    protocol_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    render_spec_versions: Mapped[list[int]] = mapped_column(JSON_PAYLOAD, nullable=False, default=lambda: [1])
+    capabilities: Mapped[dict[str, Any]] = mapped_column(JSON_PAYLOAD, nullable=False, default=dict)
+    resources: Mapped[dict[str, Any]] = mapped_column(JSON_PAYLOAD, nullable=False, default=dict)
+    labels: Mapped[dict[str, Any]] = mapped_column(JSON_PAYLOAD, nullable=False, default=dict)
+    status: Mapped[str] = mapped_column(String(24), nullable=False, default="online")
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    draining: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    max_concurrency: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    active_jobs: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    credential_hash: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, unique=True)
+    credential_issued_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    credential_revoked_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+
+    __table_args__ = (
+        Index("ix_render_workers_status_seen", "status", "last_seen_at"),
+        Index("ix_render_workers_enabled_draining", "enabled", "draining"),
+    )
+
+
+class RenderWorkerEnrollment(Base):
+    __tablename__ = "render_worker_enrollments"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    token_hash: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+    label: Mapped[str] = mapped_column(String(128), nullable=False, default="")
+    status: Mapped[str] = mapped_column(String(24), nullable=False, default="active")
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    consumed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    worker_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), ForeignKey("render_workers.id", ondelete="SET NULL"), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    __table_args__ = (Index("ix_render_worker_enrollments_status_expiry", "status", "expires_at"),)
+
+
+class RenderExecution(Base):
+    __tablename__ = "render_executions"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    render_job_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("render_jobs.id", ondelete="CASCADE"), nullable=False)
+    worker_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("render_workers.id", ondelete="CASCADE"), nullable=False)
+    attempt: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    fence_token: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+    state: Mapped[str] = mapped_column(String(24), nullable=False, default="claimed")
+    render_spec: Mapped[dict[str, Any]] = mapped_column(JSON_PAYLOAD, nullable=False, default=dict)
+    capability_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON_PAYLOAD, nullable=False, default=dict)
+    transfer_mode: Mapped[str] = mapped_column(String(24), nullable=False, default="http")
+    progress: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    metrics: Mapped[dict[str, Any]] = mapped_column(JSON_PAYLOAD, nullable=False, default=dict)
+    log_tail: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    output_json: Mapped[dict[str, Any]] = mapped_column(JSON_PAYLOAD, nullable=False, default=dict)
+    lease_until: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    heartbeat_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("render_job_id", "attempt", name="uq_render_executions_job_attempt"),
+        Index("ix_render_executions_worker_state", "worker_id", "state", "created_at"),
+        Index("ix_render_executions_job_state", "render_job_id", "state"),
+        Index("ix_render_executions_lease", "state", "lease_until"),
+    )
+
+
 class SubtitleJob(Base):
     __tablename__ = "subtitle_jobs"
 

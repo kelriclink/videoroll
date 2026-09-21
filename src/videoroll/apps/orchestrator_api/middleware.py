@@ -41,6 +41,9 @@ class AdminAuthMiddleware(BaseHTTPMiddleware):
             return await call_next(request)
         if path.startswith("/auth"):
             return await call_next(request)
+        # Native render workers use a dedicated Bearer token in their router.
+        if path.startswith("/render-workers/v1"):
+            return await call_next(request)
         if path.rstrip("/") == REMOTE_AUTO_YOUTUBE_PATH:
             return await call_next(request)
 

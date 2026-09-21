@@ -23,6 +23,7 @@ const SettingsAutoPage = lazy(() => import("./pages/SettingsAutoPage"));
 const SettingsReviewPage = lazy(() => import("./pages/SettingsReviewPage"));
 const PlayoutPage = lazy(() => import("./pages/PlayoutPage"));
 const RenderQueuePage = lazy(() => import("./pages/RenderQueuePage"));
+const RenderManagementPage = lazy(() => import("./pages/RenderManagementPage"));
 const KnowledgeBasePage = lazy(() => import("./pages/KnowledgeBasePage"));
 const DictionaryPage = lazy(() => import("./pages/DictionaryPage"));
 const OperationsPage = lazy(() => import("./pages/OperationsPage"));
@@ -103,6 +104,7 @@ function Navigation({ onNavigate }: { onNavigate?: () => void }) {
         <NavItem to="/videos" label="视频成品" onNavigate={onNavigate} />
         <NavItem to="/playout" label="播控中心" onNavigate={onNavigate} />
         <NavItem to="/queue/render" label="处理队列" onNavigate={onNavigate} />
+        <NavItem to="/render" label="渲染管理" onNavigate={onNavigate} />
         <NavItem to="/knowledge" label="知识库" onNavigate={onNavigate} />
         <NavItem to="/dictionaries" label="词典" onNavigate={onNavigate} />
         <NavItem to="/operations" label="运维中心" onNavigate={onNavigate} />
@@ -338,6 +340,7 @@ export default function App() {
                 <Route path="/tasks/:taskId" element={<TaskDetailPage />} />
                 <Route path="/youtube/sources" element={<YouTubeSourcesPage />} />
                 <Route path="/queue/render" element={<RenderQueuePage />} />
+                <Route path="/render" element={<RenderManagementPage />} />
                 <Route path="/knowledge" element={<KnowledgeBasePage />} />
                 <Route path="/dictionaries" element={<DictionaryPage />} />
                 <Route path="/operations" element={<OperationsPage />} />

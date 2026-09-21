@@ -67,6 +67,7 @@ from videoroll.apps.subtitle_service.processing import (
     transcribe_openvino_whisper,
     write_json,
 )
+from videoroll.apps.subtitle_service.processing import _ffmpeg_supported_encoders, _ffmpeg_supported_filters
 from videoroll.apps.subtitle_service.asr_settings_store import get_asr_settings
 from videoroll.apps.subtitle_service.auto_profile_store import get_auto_profile
 from videoroll.apps.subtitle_service.bilibili_tags_store import get_task_bilibili_summary
@@ -112,6 +113,8 @@ from videoroll.apps.orchestrator_api.youtube_downloader import (
     pick_preferred_youtube_subtitle,
 )
 from videoroll.apps.subtitle_service.render_queue_store import TASK_QUEUE_SETTINGS_KEY, get_task_queue_settings
+from videoroll.apps.orchestrator_api.services import render_worker_service
+from videoroll.apps.orchestrator_api.render_worker_schemas import ExecutionFailRequest, ExecutionHeartbeatRequest
 from videoroll.apps.subtitle_service.queues import SUBTITLE_CONTROL_QUEUE, SUBTITLE_WORK_QUEUE
 from videoroll.apps.subtitle_service.worker_concurrency import (
     JobLeaseHeartbeat,
@@ -214,6 +217,12 @@ celery_app.conf.update(
     beat_schedule={
         "subtitle-service-task-queue-tick": {
             "task": "subtitle_service.task_queue_tick",
+            "schedule": _TASK_QUEUE_TICK_INTERVAL_SECONDS,
+            "args": (),
+            "options": {"queue": SUBTITLE_CONTROL_QUEUE},
+        },
+        "subtitle-service-render-coordinator-tick": {
+            "task": "subtitle_service.render_coordinator_tick",
             "schedule": _TASK_QUEUE_TICK_INTERVAL_SECONDS,
             "args": (),
             "options": {"queue": SUBTITLE_CONTROL_QUEUE},
@@ -794,6 +803,45 @@ class _TaskQueueHeartbeat:
                 db.close()
 
 
+class _RenderExecutionHeartbeat:
+    def __init__(self, execution_id: uuid.UUID, fence_token: str):
+        self._execution_id = execution_id
+        self._fence_token = fence_token
+        self._stop = threading.Event()
+        self._thr = threading.Thread(target=self._run, name=f"render-exec-hb-{execution_id}", daemon=True)
+
+    def start(self) -> None:
+        self._thr.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        try:
+            self._thr.join(timeout=5.0)
+        except Exception:
+            pass
+
+    def _run(self) -> None:
+        while not self._stop.wait(30.0):
+            db = _db()
+            try:
+                execution = render_worker_service.get_execution(db, self._execution_id)
+                job = db.get(RenderJob, execution.render_job_id)
+                render_worker_service.heartbeat_execution(
+                    db, self._execution_id,
+                    ExecutionHeartbeatRequest(
+                        fence_token=self._fence_token,
+                        progress=int(job.progress or 0) if job is not None else None,
+                        metrics={},
+                    ),
+                )
+            except Exception:
+                try: db.rollback()
+                except Exception: pass
+                logger.exception("failed to heartbeat local render execution %s", self._execution_id)
+            finally:
+                db.close()
+
+
 def _append_log_line(log_path: Path, message: str) -> None:
     log_path.parent.mkdir(parents=True, exist_ok=True)
     msg = (message or "").rstrip("\n")
@@ -1050,7 +1098,10 @@ def process_job(self: Any, job_id: str) -> dict[str, str]:
     log_key: str | None = None
     hb: _TaskQueueHeartbeat | None = None
     job_hb: JobLeaseHeartbeat | None = None
+    execution_hb: _RenderExecutionHeartbeat | None = None
     lease_owner: str | None = None
+    execution_uuid = uuid.UUID(execution_id) if execution_id else None
+    coordinator_owned = execution_uuid is not None and bool(fence_token)
     work_root: Path | None = None
     ai_usage_tokens: tuple[Any, Any] | None = None
     try:
@@ -1103,7 +1154,7 @@ def process_job(self: Any, job_id: str) -> dict[str, str]:
                 return {"status": "in_progress", "detail": "running job awaits lease recovery"}
             _kick_task_queue(countdown=_TASK_QUEUE_REQUEUE_COUNTDOWN_SECONDS)
             return {"status": "queued", "detail": "waiting for task queue"}
-        if task.lock_until is None or task.lock_until <= now:
+        if not coordinator_owned and (task.lock_until is None or task.lock_until <= now):
             task.lock_until = _task_queue_expires_at(now)
             db.add(task)
 
@@ -1730,17 +1781,27 @@ def process_job(self: Any, job_id: str) -> dict[str, str]:
                 task.error_message = str(e)
                 db.add(task)
         db.commit()
+        if coordinator_owned:
+            if execution_hb is not None:
+                execution_hb.stop()
+                execution_hb = None
+            try:
+                render_worker_service.settle_local_execution(db, execution_uuid, str(fence_token), succeeded=False, error=str(e))
+            except Exception:
+                logger.exception("failed to settle local render execution %s", execution_uuid)
         _safe_append_log_line(log_path, f"ERROR: {type(e).__name__}: {e}")
         _safe_append_log_block(log_path, traceback.format_exc())
         _safe_upload_log(store, log_path, log_key)
         _kick_task_queue()
         return {"status": "error", "detail": str(e)}
     finally:
+        if execution_hb is not None:
+            execution_hb.stop()
         if job_hb is not None:
             job_hb.stop()
         if hb is not None:
             hb.stop()
-        if lease_owner is not None:
+        if lease_owner is not None and not coordinator_owned:
             lease_db = _db()
             try:
                 release_job_lease(lease_db, jid, lease_owner)
@@ -1857,21 +1918,6 @@ def task_queue_tick() -> dict[str, Any]:
             if has_running:
                 continue
 
-            rj = (
-                db.query(RenderJob)
-                .filter(RenderJob.task_id == tid, RenderJob.status == RenderJobStatus.queued)
-                .order_by(RenderJob.created_at.asc())
-                .with_for_update(skip_locked=True)
-                .first()
-            )
-            if rj:
-                if _queued_job_dispatch_due(rj, now):
-                    _mark_queued_job_dispatched(rj)
-                    db.add(rj)
-                    to_start.append(("render", str(rj.id)))
-                    started_render += 1
-                continue
-
             sj = (
                 db.query(SubtitleJob)
                 .filter(SubtitleJob.task_id == tid, SubtitleJob.status == SubtitleJobStatus.queued)
@@ -1942,7 +1988,7 @@ def task_queue_tick() -> dict[str, Any]:
                 .filter(
                     Task.status.notin_([TaskStatus.canceled, TaskStatus.published]),
                     schedulable_unlocked,
-                    or_(render_due_exists, subtitle_due_exists, recoverable_pipeline),
+                    or_(subtitle_due_exists, recoverable_pipeline),
                 )
                 .order_by(Task.priority.desc(), Task.queue_position.asc().nullslast(), Task.created_at.asc())
                 .with_for_update(skip_locked=True)
@@ -1955,42 +2001,21 @@ def task_queue_tick() -> dict[str, Any]:
             if task.lock_until and task.lock_until > now and task.lock_owner and task.lock_owner != TASK_QUEUE_LOCK_OWNER:
                 continue
 
-            rj = (
-                db.query(RenderJob)
+            sj = (
+                db.query(SubtitleJob)
                 .filter(
-                    RenderJob.task_id == task.id,
-                    RenderJob.status == RenderJobStatus.queued,
-                    or_(RenderJob.progress != _JOB_DISPATCH_PROGRESS, RenderJob.updated_at <= dispatch_retry_cutoff),
+                    SubtitleJob.task_id == task.id,
+                    SubtitleJob.status == SubtitleJobStatus.queued,
+                    or_(SubtitleJob.progress != _JOB_DISPATCH_PROGRESS, SubtitleJob.updated_at <= dispatch_retry_cutoff),
                 )
-                .order_by(RenderJob.created_at.asc())
+                .order_by(SubtitleJob.created_at.asc())
                 .with_for_update(skip_locked=True)
                 .first()
             )
-            sj = None
-            if rj is None:
-                sj = (
-                    db.query(SubtitleJob)
-                    .filter(
-                        SubtitleJob.task_id == task.id,
-                        SubtitleJob.status == SubtitleJobStatus.queued,
-                        or_(SubtitleJob.progress != _JOB_DISPATCH_PROGRESS, SubtitleJob.updated_at <= dispatch_retry_cutoff),
-                    )
-                    .order_by(SubtitleJob.created_at.asc())
-                    .with_for_update(skip_locked=True)
-                    .first()
-                )
 
             task.lock_owner = TASK_QUEUE_LOCK_OWNER
             task.lock_until = _task_queue_expires_at(now)
             db.add(task)
-
-            if rj is not None:
-                _mark_queued_job_dispatched(rj)
-                db.add(rj)
-                to_start.append(("render", str(rj.id)))
-                started_render += 1
-                running_tasks += 1
-                continue
 
             if sj is not None:
                 _mark_queued_job_dispatched(sj)
@@ -2030,8 +2055,6 @@ def task_queue_tick() -> dict[str, Any]:
     for kind, jid in to_start:
         if kind == "subtitle":
             celery_app.send_task("subtitle_service.process_job", args=[jid], queue="subtitle")
-        else:
-            celery_app.send_task("subtitle_service.process_render_job", args=[jid], queue="subtitle")
     for task_id, overrides in to_bootstrap:
         task_args: list[Any] = [task_id]
         if isinstance(overrides, dict) and overrides:
@@ -2050,14 +2073,50 @@ def task_queue_tick() -> dict[str, Any]:
     }
 
 
+@celery_app.task(name="subtitle_service.render_coordinator_tick")
+def render_coordinator_tick() -> dict[str, Any]:
+    """Sole local dispatcher for RenderJob; remote workers use the same claim path."""
+    _ensure_db()
+    db = _db()
+    store = FileStore(settings)
+    store.ensure_ready()
+    claimed: list[tuple[str, str, str]] = []
+    try:
+        supported_encoders = _ffmpeg_supported_encoders(settings.ffmpeg_path)
+        supported_filters = _ffmpeg_supported_filters(settings.ffmpeg_path)
+        worker = render_worker_service.ensure_local_worker(
+            db,
+            capabilities={
+                "gpu_model": "Local VAAPI",
+                "encoders": sorted(supported_encoders),
+                "filters": sorted(supported_filters),
+                "backend": "vaapi",
+            },
+            resources={"render_device": settings.intel_gpu_render_device},
+        )
+        if not worker.enabled or worker.draining:
+            return {"status": "paused", "claimed": "0"}
+        slots = max(0, int(worker.max_concurrency or 0) - int(worker.active_jobs or 0))
+        for _ in range(slots):
+            execution, _spec = render_worker_service.claim_job(db, store, worker.id, ["http"])
+            if execution is None:
+                break
+            claimed.append((str(execution.render_job_id), str(execution.id), str(execution.fence_token)))
+    finally:
+        db.close()
+    for render_job_id, execution_id, fence_token in claimed:
+        celery_app.send_task("subtitle_service.process_render_job", args=[render_job_id, execution_id, fence_token], queue=SUBTITLE_WORK_QUEUE)
+    return {"status": "ok", "claimed": str(len(claimed))}
+
+
 @celery_app.task(name="subtitle_service.render_queue_tick")
 def render_queue_tick() -> dict[str, Any]:
-    # Legacy alias.
-    return task_queue_tick()
+    # Legacy entrypoint is retained, but it delegates to the render coordinator.
+    return render_coordinator_tick()
 
 
 @celery_app.task(name="subtitle_service.process_render_job", bind=True, acks_late=True, reject_on_worker_lost=True)
-def process_render_job(self: Any, render_job_id: str) -> dict[str, Any]:
+def process_render_job(self: Any, render_job_id: str, execution_id: str | None = None, fence_token: str | None = None) -> dict[str, Any]:
     _ensure_db()
     store = FileStore(settings)
     store.ensure_ready()
@@ -2074,6 +2133,10 @@ def process_render_job(self: Any, render_job_id: str) -> dict[str, Any]:
         rj = db.get(RenderJob, rid)
         if not rj:
             return {"status": "error", "detail": "render job not found"}
+        if not coordinator_owned:
+            # Old deployments may still have a queued Celery render message.
+            # Never let it bypass the Render Coordinator after the cutover.
+            return {"status": "skipped", "detail": "render job must be assigned by render coordinator"}
 
         task = db.query(Task).filter(Task.id == rj.task_id).with_for_update().first()
         if not task:
@@ -2091,9 +2154,12 @@ def process_render_job(self: Any, render_job_id: str) -> dict[str, Any]:
         if skip_detail:
             db.commit()
             return {"status": "skipped", "detail": skip_detail}
-        if rj.status == RenderJobStatus.running and rj.lease_until is not None and rj.lease_until > now:
+        expected_owner = f"{render_worker_service.REMOTE_LOCK_PREFIX}{execution_uuid}" if coordinator_owned else None
+        if coordinator_owned and rj.lease_owner != expected_owner:
+            return {"status": "skipped", "detail": "render coordinator ownership lost"}
+        if not coordinator_owned and rj.status == RenderJobStatus.running and rj.lease_until is not None and rj.lease_until > now:
             return {"status": "in_progress", "detail": "render job has a live worker lease"}
-        if task.lock_owner != TASK_QUEUE_LOCK_OWNER:
+        if not coordinator_owned and task.lock_owner != TASK_QUEUE_LOCK_OWNER:
             # As with subtitle work, only expired leases may move a running
             # render back to queued.
             if rj.status == RenderJobStatus.running:
@@ -2106,7 +2172,7 @@ def process_render_job(self: Any, render_job_id: str) -> dict[str, Any]:
             db.commit()
 
         # Best-effort: if called directly, atomically claim it before render work.
-        if rj.status == RenderJobStatus.queued:
+        if not coordinator_owned and rj.status == RenderJobStatus.queued:
             rj.status = RenderJobStatus.running
             rj.started_at = _now()
         if rj.status == RenderJobStatus.running and rj.started_at is None:
@@ -2119,17 +2185,28 @@ def process_render_job(self: Any, render_job_id: str) -> dict[str, Any]:
         rj.progress = max(int(rj.progress or 0), 2)
         db.add(rj)
         db.flush()
-        candidate_owner = f"subtitle_service.process_render_job:{os.getpid()}:{uuid.uuid4().hex[:12]}"
-        if not acquire_job_lease(db, rj, candidate_owner, _JOB_LEASE_TTL_SECONDS):
-            db.rollback()
-            return {"status": "in_progress", "detail": "render job lease is held by another worker"}
-        db.commit()
-        lease_owner = candidate_owner
+        if coordinator_owned:
+            lease_owner = expected_owner
+            render_worker_service.heartbeat_execution(
+                db, execution_uuid,
+                ExecutionHeartbeatRequest(fence_token=str(fence_token), progress=max(int(rj.progress or 0), 2), metrics={}),
+            )
+        else:
+            candidate_owner = f"subtitle_service.process_render_job:{os.getpid()}:{uuid.uuid4().hex[:12]}"
+            if not acquire_job_lease(db, rj, candidate_owner, _JOB_LEASE_TTL_SECONDS):
+                db.rollback()
+                return {"status": "in_progress", "detail": "render job lease is held by another worker"}
+            db.commit()
+            lease_owner = candidate_owner
 
         hb = _TaskQueueHeartbeat(task.id)
         hb.start()
-        job_hb = JobLeaseHeartbeat(lambda: _db(), rj.id, lease_owner, _JOB_LEASE_TTL_SECONDS)
-        job_hb.start()
+        if not coordinator_owned:
+            job_hb = JobLeaseHeartbeat(lambda: _db(), rj.id, lease_owner, _JOB_LEASE_TTL_SECONDS)
+            job_hb.start()
+        else:
+            execution_hb = _RenderExecutionHeartbeat(execution_uuid, str(fence_token))
+            execution_hb.start()
 
         _raise_if_task_stopped(db, task.id)
 
@@ -2391,6 +2468,11 @@ def process_render_job(self: Any, render_job_id: str) -> dict[str, Any]:
                 operation_key=f"after-render-publish:{rj.id}",
             )
         db.commit()
+        if coordinator_owned:
+            if execution_hb is not None:
+                execution_hb.stop()
+                execution_hb = None
+            render_worker_service.settle_local_execution(db, execution_uuid, str(fence_token), succeeded=True)
         _safe_append_log_line(log_path, "render job done")
         _safe_upload_log(store, log_path, log_key)
 

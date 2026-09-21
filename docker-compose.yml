@@ -182,6 +182,7 @@ services:
       WORK_DIR: ${WORK_DIR:-/storage/work/videoroll}
       FFMPEG_PATH: ${FFMPEG_PATH:-ffmpeg}
       PLAYOUT_MEDIA_ROOT: ${PLAYOUT_MEDIA_ROOT:-/storage/playout-media}
+      RENDER_WORKER_TOKEN: ${RENDER_WORKER_TOKEN:-}
       INTEL_GPU_RENDER_DEVICE: ${INTEL_GPU_RENDER_DEVICE:-/dev/dri/renderD128}
       YOUTUBE_USER_AGENT: "${YOUTUBE_USER_AGENT:-Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36}"
       YOUTUBE_COOKIE_FILE: ${YOUTUBE_COOKIE_FILE:-}

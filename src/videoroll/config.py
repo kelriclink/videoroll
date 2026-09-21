@@ -42,6 +42,7 @@ class OrchestratorSettings(CommonSettings):
     work_dir: str = Field("/tmp/videoroll", alias="WORK_DIR")
     ffmpeg_path: str = Field("ffmpeg", alias="FFMPEG_PATH")
     playout_media_root: str = Field("/storage/playout-media", alias="PLAYOUT_MEDIA_ROOT")
+    render_worker_token: str = Field("", alias="RENDER_WORKER_TOKEN")
     # YouTube downloader (yt-dlp) settings.
     youtube_user_agent: str = Field(DEFAULT_YOUTUBE_USER_AGENT, alias="YOUTUBE_USER_AGENT")
     youtube_cookie_file: str | None = Field(None, alias="YOUTUBE_COOKIE_FILE")
