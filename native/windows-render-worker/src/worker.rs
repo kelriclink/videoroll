@@ -20,6 +20,35 @@ use uuid::Uuid;
 
 const WORKER_VERSION: &str = "0.1.0";
 
+#[derive(Debug, Clone)]
+pub struct JobTelemetry {
+    pub execution_id: Uuid,
+    pub task_id: Uuid,
+    pub render_job_id: Uuid,
+    pub mode: String,
+    pub codec: String,
+    pub device_id: String,
+    pub device_name: String,
+    pub backend: String,
+    pub encoder: String,
+    pub pipeline: String,
+    pub stage: String,
+    pub frame: u64,
+    pub fps: f64,
+    pub speed: f64,
+    pub percent: f64,
+    pub out_time_seconds: f64,
+    pub duration_seconds: Option<f64>,
+    pub elapsed_seconds: f64,
+    pub bitrate: String,
+    pub total_size: u64,
+    pub source_codec: String,
+    pub source_width: u32,
+    pub source_height: u32,
+    pub source_pix_fmt: String,
+}
+
+
 #[derive(Debug, Clone, Default)]
 pub struct WorkerStatus {
     pub running: bool,
@@ -30,6 +59,7 @@ pub struct WorkerStatus {
     pub phase: String,
     pub last_error: String,
     pub devices: Vec<Device>,
+    pub jobs: Vec<JobTelemetry>,
 }
 
 pub struct WorkerHandle {
@@ -167,13 +197,15 @@ fn run_worker(
     }
 
     let active: Arc<Mutex<HashMap<Uuid, Device>>> = Arc::new(Mutex::new(HashMap::new()));
+    let job_details: Arc<Mutex<HashMap<Uuid, Arc<Mutex<JobTelemetry>>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
     let mut next_worker_heartbeat = Instant::now();
     let mut next_claim = Instant::now();
 
     loop {
         let stopping = stop_accepting.load(Ordering::Relaxed);
         let active_count = active.lock().map(|items| items.len()).unwrap_or(0);
-        update_active_status(&status, active_count, stopping);
+        update_active_status(&status, active_count, stopping, &job_details);
 
         if stopping && active_count == 0 {
             log.info("worker drained; exiting");
@@ -225,6 +257,7 @@ fn run_worker(
                                 &credential,
                                 claim,
                                 Arc::clone(&active),
+                                Arc::clone(&job_details),
                                 log.clone(),
                             ) {
                                 log.error(format!("cannot start claimed execution: {error:#}"));
@@ -352,6 +385,7 @@ fn start_execution(
     credential: &Credential,
     claim: ClaimResponse,
     active: Arc<Mutex<HashMap<Uuid, Device>>>,
+    job_details: Arc<Mutex<HashMap<Uuid, Arc<Mutex<JobTelemetry>>>>>,
     log: SharedLog,
 ) -> Result<()> {
     let execution = claim
@@ -363,6 +397,43 @@ fn start_execution(
         .clone()
         .context("claim response is missing render spec")?;
     let device = select_device(devices, &active, &spec)?;
+    let codec = spec
+        .request
+        .get("render")
+        .and_then(Value::as_object)
+        .and_then(|render| render.get("video_codec"))
+        .and_then(Value::as_str)
+        .unwrap_or("av1")
+        .to_string();
+    let telemetry = Arc::new(Mutex::new(JobTelemetry {
+        execution_id: execution.id,
+        task_id: spec.task_id,
+        render_job_id: spec.render_job_id,
+        mode: spec.mode.clone(),
+        codec,
+        device_id: device.id.clone(),
+        device_name: device.name.clone(),
+        backend: device.backend.clone(),
+        encoder: String::new(),
+        pipeline: String::new(),
+        stage: "claimed".to_string(),
+        frame: 0,
+        fps: 0.0,
+        speed: 0.0,
+        percent: 0.0,
+        out_time_seconds: 0.0,
+        duration_seconds: None,
+        elapsed_seconds: 0.0,
+        bitrate: String::new(),
+        total_size: 0,
+        source_codec: String::new(),
+        source_width: 0,
+        source_height: 0,
+        source_pix_fmt: String::new(),
+    }));
+    if let Ok(mut jobs) = job_details.lock() {
+        jobs.insert(execution.id, Arc::clone(&telemetry));
+    }
     if let Ok(mut items) = active.lock() {
         items.insert(execution.id, device.clone());
     }
@@ -372,6 +443,8 @@ fn start_execution(
     let paths = paths.clone();
     let config = config.clone();
     let active_for_thread = Arc::clone(&active);
+    let jobs_for_thread = Arc::clone(&job_details);
+    let telemetry_for_thread = Arc::clone(&telemetry);
     thread::spawn(move || {
         let execution_id = execution.id;
         let result = run_execution(
@@ -381,6 +454,7 @@ fn start_execution(
             &credential,
             claim,
             device.clone(),
+            Arc::clone(&telemetry_for_thread),
             log.clone(),
         );
         if let Err(error) = result {
@@ -388,6 +462,9 @@ fn start_execution(
         }
         if let Ok(mut items) = active_for_thread.lock() {
             items.remove(&execution_id);
+        }
+        if let Ok(mut jobs) = jobs_for_thread.lock() {
+            jobs.remove(&execution_id);
         }
     });
     Ok(())
@@ -445,6 +522,7 @@ fn run_execution(
     credential: &Credential,
     claim: ClaimResponse,
     device: Device,
+    telemetry: Arc<Mutex<JobTelemetry>>,
     log: SharedLog,
 ) -> Result<()> {
     let execution = claim.execution.context("execution missing")?;
@@ -456,6 +534,7 @@ fn run_execution(
     let execution_id = execution.id;
     let fence = execution.fence_token.clone();
     let root = paths.work.join(execution_id.to_string());
+    set_job_stage(&telemetry, "downloading");
     fs::create_dir_all(&root)
         .with_context(|| format!("cannot create execution work directory {}", root.display()))?;
 
@@ -472,6 +551,7 @@ fn run_execution(
         execution_id,
         fence.clone(),
         device.clone(),
+        Arc::clone(&telemetry),
         Arc::clone(&heartbeat_stop),
         Arc::clone(&cancel),
         log.clone(),
@@ -512,6 +592,29 @@ fn run_execution(
             .and_then(|value| value.get("video_crf"))
             .and_then(Value::as_i64);
 
+        let telemetry_for_progress = Arc::clone(&telemetry);
+        let progress_callback: ffmpeg::ProgressCallback = Arc::new(move |progress| {
+            if let Ok(mut job) = telemetry_for_progress.lock() {
+                job.pipeline = progress.pipeline;
+                job.encoder = progress.encoder;
+                job.frame = progress.frame;
+                job.fps = progress.fps;
+                job.speed = progress.speed;
+                job.percent = progress.percent;
+                job.out_time_seconds = progress.out_time_seconds;
+                job.duration_seconds = progress.duration_seconds;
+                job.elapsed_seconds = progress.elapsed_seconds;
+                job.bitrate = progress.bitrate;
+                job.total_size = progress.total_size;
+                job.source_codec = progress.source_codec;
+                job.source_width = progress.source_width;
+                job.source_height = progress.source_height;
+                job.source_pix_fmt = progress.source_pix_fmt;
+                job.stage = "rendering".to_string();
+            }
+        });
+        set_job_stage(&telemetry, "rendering");
+
         api.execution_post(
             execution_id,
             "progress",
@@ -519,7 +622,7 @@ fn run_execution(
             &json!({
                 "fence_token": fence,
                 "progress": 20,
-                "metrics": metrics(&device),
+                "metrics": metrics(&device, &telemetry),
                 "stage": "rendering",
             }),
         )?;
@@ -539,6 +642,7 @@ fn run_execution(
             let ass = artifacts.get("ass").context("burn-in ASS artifact missing")?;
             ffmpeg::render_burn_in(
                 &paths.ffmpeg(),
+                &paths.ffprobe(),
                 input,
                 ass,
                 &output,
@@ -548,16 +652,19 @@ fn run_execution(
                 quality,
                 Arc::clone(&cancel),
                 &log,
+                Some(Arc::clone(&progress_callback)),
             )?;
         } else if spec.mode == "soft_sub" {
             let srt = artifacts.get("srt").context("soft-sub SRT artifact missing")?;
             ffmpeg::mux_soft_sub(
                 &paths.ffmpeg(),
+                &paths.ffprobe(),
                 input,
                 srt,
                 &output,
                 Arc::clone(&cancel),
                 &log,
+                Some(Arc::clone(&progress_callback)),
             )?;
         } else {
             anyhow::bail!("unsupported render mode {}", spec.mode);
@@ -567,6 +674,7 @@ fn run_execution(
             anyhow::bail!("render execution canceled by coordinator");
         }
 
+        set_job_stage(&telemetry, "uploading");
         api.execution_post(
             execution_id,
             "progress",
@@ -574,7 +682,7 @@ fn run_execution(
             &json!({
                 "fence_token": fence,
                 "progress": 90,
-                "metrics": metrics(&device),
+                "metrics": metrics(&device, &telemetry),
                 "stage": "uploading",
             }),
         )?;
@@ -598,6 +706,10 @@ fn run_execution(
             }),
         )?;
         log.info(format!("execution complete: id={} bytes={}", execution_id, size));
+        if let Ok(mut job) = telemetry.lock() {
+            job.stage = "complete".to_string();
+            job.percent = 100.0;
+        }
         Ok(())
     })();
 
@@ -629,6 +741,7 @@ fn start_execution_heartbeat(
     execution_id: Uuid,
     fence: String,
     device: Device,
+    telemetry: Arc<Mutex<JobTelemetry>>,
     stop: Arc<AtomicBool>,
     cancel: Arc<AtomicBool>,
     log: SharedLog,
@@ -642,8 +755,8 @@ fn start_execution_heartbeat(
                 &credential.credential,
                 &json!({
                     "fence_token": fence,
-                    "progress": null,
-                    "metrics": metrics(&device),
+                    "progress": execution_progress(&telemetry),
+                    "metrics": metrics(&device, &telemetry),
                 }),
             );
             if let Err(error) = heartbeat {
@@ -687,12 +800,42 @@ fn start_execution_heartbeat(
     })
 }
 
-fn metrics(device: &Device) -> Value {
+fn metrics(device: &Device, telemetry: &Arc<Mutex<JobTelemetry>>) -> Value {
+    let job = telemetry.lock().ok().map(|value| value.clone());
     json!({
         "device_id": device.id,
         "device_name": device.name,
         "backend": device.backend,
+        "encoder": job.as_ref().map(|value| value.encoder.as_str()).unwrap_or(""),
+        "pipeline": job.as_ref().map(|value| value.pipeline.as_str()).unwrap_or(""),
+        "stage": job.as_ref().map(|value| value.stage.as_str()).unwrap_or(""),
+        "frame": job.as_ref().map(|value| value.frame).unwrap_or(0),
+        "fps": job.as_ref().map(|value| value.fps).unwrap_or(0.0),
+        "speed": job.as_ref().map(|value| value.speed).unwrap_or(0.0),
+        "render_percent": job.as_ref().map(|value| value.percent).unwrap_or(0.0),
+        "out_time_seconds": job.as_ref().map(|value| value.out_time_seconds).unwrap_or(0.0),
+        "elapsed_seconds": job.as_ref().map(|value| value.elapsed_seconds).unwrap_or(0.0),
+        "source_codec": job.as_ref().map(|value| value.source_codec.as_str()).unwrap_or(""),
+        "source_width": job.as_ref().map(|value| value.source_width).unwrap_or(0),
+        "source_height": job.as_ref().map(|value| value.source_height).unwrap_or(0),
+        "source_pix_fmt": job.as_ref().map(|value| value.source_pix_fmt.as_str()).unwrap_or(""),
     })
+}
+
+fn execution_progress(telemetry: &Arc<Mutex<JobTelemetry>>) -> Option<i32> {
+    telemetry.lock().ok().map(|job| match job.stage.as_str() {
+        "downloading" | "claimed" => 10,
+        "rendering" => (20.0 + job.percent.clamp(0.0, 100.0) * 0.7).round() as i32,
+        "uploading" => 90,
+        "complete" => 100,
+        _ => 5,
+    })
+}
+
+fn set_job_stage(telemetry: &Arc<Mutex<JobTelemetry>>, stage: &str) {
+    if let Ok(mut job) = telemetry.lock() {
+        job.stage = stage.to_string();
+    }
 }
 
 fn artifact_target(root: &Path, role: &str, storage_key: &str) -> PathBuf {
@@ -715,9 +858,25 @@ fn set_phase(status: &Arc<Mutex<WorkerStatus>>, phase: &str) {
     }
 }
 
-fn update_active_status(status: &Arc<Mutex<WorkerStatus>>, active: usize, draining: bool) {
+fn update_active_status(
+    status: &Arc<Mutex<WorkerStatus>>,
+    active: usize,
+    draining: bool,
+    job_details: &Arc<Mutex<HashMap<Uuid, Arc<Mutex<JobTelemetry>>>>>,
+) {
+    let mut jobs = job_details
+        .lock()
+        .map(|items| {
+            items
+                .values()
+                .filter_map(|item| item.lock().ok().map(|value| value.clone()))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    jobs.sort_by_key(|job| job.execution_id);
     if let Ok(mut state) = status.lock() {
         state.active_jobs = active;
+        state.jobs = jobs;
         state.draining = draining;
         state.phase = if draining {
             "draining".to_string()

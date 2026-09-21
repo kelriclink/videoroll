@@ -17,7 +17,7 @@ use paths::AppPaths;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
-use worker::WorkerHandle;
+use worker::{JobTelemetry, WorkerHandle};
 
 const APP_TITLE: &str = "VideoRoll Render Worker";
 
@@ -36,8 +36,8 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title(APP_TITLE)
-            .with_inner_size([940.0, 720.0])
-            .with_min_inner_size([760.0, 560.0]),
+            .with_inner_size([1120.0, 860.0])
+            .with_min_inner_size([900.0, 680.0]),
         ..Default::default()
     };
 
@@ -198,6 +198,123 @@ impl RenderWorkerApp {
     }
 }
 
+fn short_id(value: uuid::Uuid) -> String {
+    value.to_string().chars().take(8).collect()
+}
+
+fn format_duration(seconds: f64) -> String {
+    if !seconds.is_finite() || seconds <= 0.0 {
+        return "-".to_string();
+    }
+    let total = seconds.round() as u64;
+    let hours = total / 3600;
+    let minutes = (total % 3600) / 60;
+    let secs = total % 60;
+    if hours > 0 {
+        format!("{hours:02}:{minutes:02}:{secs:02}")
+    } else {
+        format!("{minutes:02}:{secs:02}")
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    let value = bytes as f64;
+    if bytes >= 1024 * 1024 * 1024 {
+        format!("{:.2} GiB", value / 1024.0 / 1024.0 / 1024.0)
+    } else if bytes >= 1024 * 1024 {
+        format!("{:.1} MiB", value / 1024.0 / 1024.0)
+    } else if bytes >= 1024 {
+        format!("{:.1} KiB", value / 1024.0)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+fn render_job_details(ui: &mut egui::Ui, job: &JobTelemetry) {
+    ui.group(|ui| {
+        ui.horizontal(|ui| {
+            ui.strong(format!(
+                "{} · {} · {}",
+                short_id(job.task_id),
+                job.mode,
+                job.codec.to_ascii_uppercase()
+            ));
+            ui.separator();
+            ui.label(format!("Stage: {}", job.stage));
+            ui.separator();
+            ui.label(format!("Device: {}", job.device_name));
+            ui.separator();
+            ui.monospace(format!("{:.1} FPS", job.fps));
+            ui.separator();
+            ui.monospace(format!("{:.2}x", job.speed));
+        });
+
+        ui.add(
+            egui::ProgressBar::new((job.percent / 100.0).clamp(0.0, 1.0) as f32)
+                .show_percentage()
+                .text(format!(
+                    "{} / {}",
+                    format_duration(job.out_time_seconds),
+                    job.duration_seconds
+                        .map(format_duration)
+                        .unwrap_or_else(|| "-".to_string())
+                )),
+        );
+
+        egui::Grid::new(format!("job-details-{}", job.execution_id))
+            .num_columns(4)
+            .striped(true)
+            .spacing([10.0, 4.0])
+            .show(ui, |ui| {
+                ui.label("Execution");
+                ui.monospace(short_id(job.execution_id));
+                ui.label("Render job");
+                ui.monospace(short_id(job.render_job_id));
+                ui.end_row();
+
+                ui.label("Backend");
+                ui.monospace(&job.backend);
+                ui.label("Encoder");
+                ui.monospace(if job.encoder.is_empty() { "-" } else { &job.encoder });
+                ui.end_row();
+
+                ui.label("Pipeline");
+                ui.monospace(if job.pipeline.is_empty() { "-" } else { &job.pipeline });
+                ui.label("Frame");
+                ui.monospace(job.frame.to_string());
+                ui.end_row();
+
+                ui.label("Source");
+                if job.source_width > 0 {
+                    ui.monospace(format!(
+                        "{} {}x{} {}",
+                        if job.source_codec.is_empty() { "?" } else { &job.source_codec },
+                        job.source_width,
+                        job.source_height,
+                        if job.source_pix_fmt.is_empty() { "?" } else { &job.source_pix_fmt }
+                    ));
+                } else {
+                    ui.monospace("-");
+                }
+                ui.label("Bitrate");
+                ui.monospace(if job.bitrate.is_empty() { "-" } else { &job.bitrate });
+                ui.end_row();
+
+                ui.label("Rendered time");
+                ui.monospace(format_duration(job.out_time_seconds));
+                ui.label("Elapsed");
+                ui.monospace(format_duration(job.elapsed_seconds));
+                ui.end_row();
+
+                ui.label("Output");
+                ui.monospace(format_bytes(job.total_size));
+                ui.label("Device id");
+                ui.monospace(&job.device_id);
+                ui.end_row();
+            });
+    });
+}
+
 impl eframe::App for RenderWorkerApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.consume_scan();
@@ -208,13 +325,16 @@ impl eframe::App for RenderWorkerApp {
             if !state.last_error.is_empty() {
                 self.ui_message = state.last_error.clone();
             }
+            if state.connected && self.ui_message == "Worker starting..." {
+                self.ui_message.clear();
+            }
             if !state.devices.is_empty() {
                 self.detected_devices = state.devices.clone();
             }
         }
 
             ui.heading("VideoRoll Native Render Worker");
-            ui.label("Rust worker · self-contained install directory · Intel QSV / NVIDIA NVENC / CPU fallback");
+            ui.label("Rust worker · QSV hardware decode / GPU overlay · NVENC · CPU fallback · live FFmpeg telemetry");
             ui.add_space(8.0);
 
             egui::Grid::new("configuration")
@@ -326,21 +446,54 @@ impl eframe::App for RenderWorkerApp {
             }
 
             ui.separator();
+            ui.heading("Active rendering");
+            match &status {
+                Some(state) if !state.jobs.is_empty() => {
+                    for job in &state.jobs {
+                        render_job_details(ui, job);
+                        ui.add_space(6.0);
+                    }
+                }
+                Some(state) if state.running => {
+                    ui.label("Node is online. Waiting for render jobs.");
+                }
+                _ => {
+                    ui.label("Worker is stopped.");
+                }
+            }
+
+            ui.separator();
             ui.heading("Render devices");
             if self.detected_devices.is_empty() {
                 ui.label("No scan result yet.");
             } else {
                 egui::Grid::new("devices")
                     .striped(true)
-                    .num_columns(4)
+                    .num_columns(5)
                     .show(ui, |ui| {
                         ui.strong("Device");
+                        ui.strong("State");
                         ui.strong("Backend");
                         ui.strong("Index");
                         ui.strong("Encoders");
                         ui.end_row();
                         for device in &self.detected_devices {
+                            let active_on_device = status
+                                .as_ref()
+                                .map(|state| {
+                                    state
+                                        .jobs
+                                        .iter()
+                                        .filter(|job| job.device_id == device.id)
+                                        .count()
+                                })
+                                .unwrap_or(0);
                             ui.label(&device.name);
+                            ui.label(if active_on_device > 0 {
+                                format!("busy ({active_on_device})")
+                            } else {
+                                "idle".to_string()
+                            });
                             ui.label(&device.backend);
                             ui.label(
                                 device
@@ -355,23 +508,29 @@ impl eframe::App for RenderWorkerApp {
             }
 
             ui.separator();
-            ui.heading("Runtime files");
-            ui.monospace("bin/     ffmpeg.exe, ffprobe.exe");
-            ui.monospace("config/  config.json, credential.json");
-            ui.monospace("logs/    render-worker.log");
-            ui.monospace("cache/   local cache");
-            ui.monospace("work/    active execution scratch space");
+            egui::CollapsingHeader::new("Runtime files")
+                .default_open(false)
+                .show(ui, |ui| {
+                    ui.monospace("bin/     ffmpeg.exe, ffprobe.exe");
+                    ui.monospace("config/  config.json, credential.json");
+                    ui.monospace("logs/    render-worker.log");
+                    ui.monospace("cache/   local cache");
+                    ui.monospace("work/    active execution scratch space");
+                });
 
             ui.separator();
-            ui.heading("Recent log");
-            let lines = self.log.snapshot();
-            egui::ScrollArea::vertical()
-                .max_height(220.0)
-                .stick_to_bottom(true)
+            egui::CollapsingHeader::new("Recent log")
+                .default_open(true)
                 .show(ui, |ui| {
-                    for line in lines.iter().rev().take(100).rev() {
-                        ui.monospace(line);
-                    }
+                    let lines = self.log.snapshot();
+                    egui::ScrollArea::vertical()
+                        .max_height(240.0)
+                        .stick_to_bottom(true)
+                        .show(ui, |ui| {
+                            for line in lines.iter().rev().take(120).rev() {
+                                ui.monospace(line);
+                            }
+                        });
                 });
     }
 
