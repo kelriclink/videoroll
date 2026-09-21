@@ -251,7 +251,11 @@ class RenderWorkerRuntime:
         endpoint = "enroll" if token else "local-enroll"
         if token:
             body["enrollment_token"] = token
-        headers = {} if token else {"X-Internal-Secret": self.settings.admin_bootstrap_secret}
+        headers = (
+            {}
+            if token
+            else {"Authorization": f"Bearer {self.settings.admin_bootstrap_secret}"}
+        )
         with httpx.Client(timeout=self.settings.request_timeout_seconds) as client:
             response = client.post(f"{self.api_base}/{endpoint}", json=body, headers=headers)
             response.raise_for_status()

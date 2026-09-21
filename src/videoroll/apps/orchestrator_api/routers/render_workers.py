@@ -64,7 +64,7 @@ def enroll(payload: WorkerEnrollRequest, db: Session = Depends(get_db)) -> Worke
 def local_enroll(
     payload: LocalWorkerEnrollRequest,
     request: Request,
-    x_internal_secret: str = Header(default="", alias="X-Internal-Secret"),
+    authorization: str = Header(default=""),
     db: Session = Depends(get_db),
     settings: OrchestratorSettings = Depends(get_settings),
 ) -> WorkerEnrollResponse:
@@ -72,7 +72,12 @@ def local_enroll(
     # Remote machines must use a one-time enrollment token.
     if request.client is None or not render_worker_service.is_private_worker_bootstrap_address(request.client.host):
         raise HTTPException(403, "local render worker enrollment is restricted to private coordinator networks")
-    if not x_internal_secret or not secrets.compare_digest(x_internal_secret, settings.admin_bootstrap_secret):
+    scheme, _, bootstrap_secret = str(authorization or "").partition(" ")
+    if (
+        scheme.lower() != "bearer"
+        or not bootstrap_secret
+        or not secrets.compare_digest(bootstrap_secret, settings.admin_bootstrap_secret)
+    ):
         raise HTTPException(401, "local render worker bootstrap secret is invalid")
     worker, credential = render_worker_service.enroll_local_worker(db, payload)
     return WorkerEnrollResponse(worker=WorkerRead.model_validate(worker), credential=credential)
