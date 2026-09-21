@@ -34,12 +34,34 @@ def upgrade() -> None:
     # add_column_if_missing below to upgrade installations where the table was
     # already created by auto_migrate.
     # The knowledge table predates Alembic. Revision 0006 is the first
-    # versioned migration that references it, so provide the minimal compatible
-    # parent table before creating the foreign key below. The runtime
-    # compatibility migration fills out the remaining RAG columns/indexes.
+    # versioned migration that references it, so create its historical base
+    # shape here as well. Existing deployments are validated by
+    # create_table_if_missing; fresh/offline upgrades get the full shape needed
+    # by the runtime compatibility indexes that run after Alembic reaches head.
     create_table_if_missing(
         "translation_knowledge_items",
         sa.Column("id", _uuid_type(), nullable=False),
+        sa.Column("item_type", sa.String(length=32), nullable=False, server_default="document"),
+        sa.Column("term", sa.Text(), nullable=False, server_default=""),
+        sa.Column("normalized_term", sa.Text(), nullable=False, server_default=""),
+        sa.Column("translation", sa.Text(), nullable=False, server_default=""),
+        sa.Column("target_lang", sa.String(length=16), nullable=False, server_default="zh"),
+        sa.Column("domain", sa.Text(), nullable=False, server_default=""),
+        sa.Column("aliases", sa.JSON().with_variant(JSONB(), "postgresql"), nullable=False, server_default=sa.text("'[]'")),
+        sa.Column("title", sa.Text(), nullable=False, server_default=""),
+        sa.Column("content", sa.Text(), nullable=False, server_default=""),
+        sa.Column("description", sa.Text(), nullable=False, server_default=""),
+        sa.Column("sources", sa.JSON().with_variant(JSONB(), "postgresql"), nullable=False, server_default=sa.text("'[]'")),
+        sa.Column("confidence", sa.Float(), nullable=False, server_default="0"),
+        sa.Column("status", sa.String(length=32), nullable=False, server_default="approved"),
+        sa.Column("created_by", sa.String(length=32), nullable=False, server_default="manual"),
+        sa.Column("usage_count", sa.Integer(), nullable=False, server_default="0"),
+        sa.Column("embedding", sa.Text(), nullable=True),
+        sa.Column("embedding_model", sa.Text(), nullable=False, server_default=""),
+        sa.Column("embedding_text_hash", sa.String(length=64), nullable=False, server_default=""),
+        sa.Column("last_verified_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()),
+        sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()),
         sa.PrimaryKeyConstraint("id"),
     )
 
