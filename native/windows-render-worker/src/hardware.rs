@@ -1,3 +1,4 @@
+use crate::logging::SharedLog;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -79,15 +80,15 @@ impl HardwareSnapshot {
     }
 }
 
-pub fn scan(ffmpeg: &Path) -> Result<HardwareSnapshot> {
+pub fn scan(ffmpeg: &Path, log: Option<&SharedLog>) -> Result<HardwareSnapshot> {
     let encoders = ffmpeg_list(ffmpeg, "-encoders").context("cannot query FFmpeg encoders")?;
     let filters = ffmpeg_list(ffmpeg, "-filters").unwrap_or_default();
     let encoder_set = encoders.iter().cloned().collect::<BTreeSet<_>>();
 
     let mut devices = Vec::new();
     if cfg!(target_os = "windows") {
-        devices.extend(scan_intel_qsv(ffmpeg, &encoder_set));
-        devices.extend(scan_nvidia(ffmpeg, &encoder_set));
+        devices.extend(scan_intel_qsv(ffmpeg, &encoder_set, log));
+        devices.extend(scan_nvidia(ffmpeg, &encoder_set, log));
     }
 
     let software = ["libx264", "libx265", "libsvtav1", "libaom-av1"]
@@ -123,11 +124,15 @@ pub fn scan(ffmpeg: &Path) -> Result<HardwareSnapshot> {
     })
 }
 
-fn scan_intel_qsv(ffmpeg: &Path, encoders: &BTreeSet<String>) -> Vec<Device> {
+fn scan_intel_qsv(
+    ffmpeg: &Path,
+    encoders: &BTreeSet<String>,
+    log: Option<&SharedLog>,
+) -> Vec<Device> {
     let candidates = ["h264_qsv", "hevc_qsv", "av1_qsv"]
         .into_iter()
         .filter(|encoder| encoders.contains(*encoder))
-        .filter(|encoder| probe_encoder(ffmpeg, encoder, "qsv", None))
+        .filter(|encoder| probe_encoder(ffmpeg, encoder, "qsv", None, log))
         .map(str::to_string)
         .collect::<Vec<_>>();
     if candidates.is_empty() {
@@ -144,7 +149,11 @@ fn scan_intel_qsv(ffmpeg: &Path, encoders: &BTreeSet<String>) -> Vec<Device> {
     }]
 }
 
-fn scan_nvidia(ffmpeg: &Path, encoders: &BTreeSet<String>) -> Vec<Device> {
+fn scan_nvidia(
+    ffmpeg: &Path,
+    encoders: &BTreeSet<String>,
+    log: Option<&SharedLog>,
+) -> Vec<Device> {
     let nvenc = ["h264_nvenc", "hevc_nvenc", "av1_nvenc"]
         .into_iter()
         .filter(|encoder| encoders.contains(*encoder))
@@ -179,7 +188,7 @@ fn scan_nvidia(ffmpeg: &Path, encoders: &BTreeSet<String>) -> Vec<Device> {
         let supported = nvenc
             .iter()
             .copied()
-            .filter(|encoder| probe_encoder(ffmpeg, encoder, "nvidia", Some(index)))
+            .filter(|encoder| probe_encoder(ffmpeg, encoder, "nvidia", Some(index), log))
             .map(str::to_string)
             .collect::<Vec<_>>();
         if supported.is_empty() {
@@ -201,7 +210,16 @@ fn scan_nvidia(ffmpeg: &Path, encoders: &BTreeSet<String>) -> Vec<Device> {
     devices
 }
 
-fn probe_encoder(ffmpeg: &Path, encoder: &str, backend: &str, index: Option<u32>) -> bool {
+fn probe_encoder(
+    ffmpeg: &Path,
+    encoder: &str,
+    backend: &str,
+    index: Option<u32>,
+    log: Option<&SharedLog>,
+) -> bool {
+    // AV1 QSV requires at least 128x96 on current Intel oneVPL hardware.
+    // Use a small but valid NV12 sample for every hardware probe so codec
+    // capability is not rejected just because the synthetic frame is invalid.
     let mut command = Command::new(ffmpeg);
     command.args([
         "-hide_banner",
@@ -210,25 +228,50 @@ fn probe_encoder(ffmpeg: &Path, encoder: &str, backend: &str, index: Option<u32>
         "-f",
         "lavfi",
         "-i",
-        "color=c=black:s=64x64:r=1",
+        "color=c=black:s=256x144:r=30",
+        "-vf",
+        "format=nv12",
         "-frames:v",
-        "1",
+        "4",
         "-c:v",
         encoder,
+        "-g",
+        "30",
     ]);
     if backend == "nvidia" {
         if let Some(index) = index {
             command.args(["-gpu", &index.to_string()]);
         }
     }
-    command
-        .args(["-f", "null", "-"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
+    command.args(["-f", "null", "-"]).stdin(Stdio::null());
+
+    match command.output() {
+        Ok(output) if output.status.success() => true,
+        Ok(output) => {
+            if let Some(log) = log {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let detail = stderr
+                    .lines()
+                    .filter(|line| !line.trim().is_empty())
+                    .last()
+                    .unwrap_or("FFmpeg returned no error detail");
+                log.warn(format!(
+                    "hardware encoder probe failed: backend={} encoder={} gpu={:?}: {}",
+                    backend, index, encoder, detail
+                ));
+            }
+            false
+        }
+        Err(error) => {
+            if let Some(log) = log {
+                log.warn(format!(
+                    "hardware encoder probe could not start: backend={} encoder={} gpu={:?}: {}",
+                    backend, index, encoder, error
+                ));
+            }
+            false
+        }
+    }
 }
 
 fn ffmpeg_list(ffmpeg: &Path, arg: &str) -> Result<Vec<String>> {

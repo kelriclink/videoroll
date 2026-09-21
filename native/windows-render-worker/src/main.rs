@@ -90,7 +90,7 @@ impl RenderWorkerApp {
         let ffmpeg = self.paths.ffmpeg();
         let log = self.log.clone();
         thread::spawn(move || {
-            let result = hardware::scan(&ffmpeg)
+            let result = hardware::scan(&ffmpeg, Some(&log))
                 .map(|snapshot| snapshot.devices)
                 .map_err(|error| format!("{error:#}"));
             if let Ok(ref devices) = result {

@@ -131,7 +131,7 @@ fn run_worker(
     }
 
     set_phase(&status, "scanning hardware");
-    let hardware = hardware::scan(&ffmpeg_path)?;
+    let hardware = hardware::scan(&ffmpeg_path, Some(&log))?;
     log_devices(&hardware, &log);
     if let Ok(mut state) = status.lock() {
         state.devices = hardware.devices.clone();
