@@ -2986,6 +2986,8 @@ def render_burn_in(
     video_codec: str = "av1",
     use_intel_gpu: bool = False,
     intel_gpu_render_device: str = "/dev/dri/renderD128",
+    use_nvidia_gpu: bool = False,
+    nvidia_gpu_index: int | None = None,
     preset: str | int | None = None,
     crf: int | None = None,
     log_path: Path | None = None,
@@ -3026,7 +3028,53 @@ def render_burn_in(
     extra_input_args: list[str] = []
     map_args: list[str] = []
 
-    if use_intel_gpu:
+    if use_intel_gpu and use_nvidia_gpu:
+        raise ValueError("render backend cannot use Intel and NVIDIA GPU at the same time")
+
+    if use_nvidia_gpu:
+        encoder = {
+            "h264": "h264_nvenc",
+            "avc": "h264_nvenc",
+            "hevc": "hevc_nvenc",
+            "h265": "hevc_nvenc",
+            "av1": "av1_nvenc",
+        }.get(codec)
+        if encoder is None:
+            raise ValueError("NVIDIA GPU burn-in currently supports only h264/hevc/av1")
+        if not _ffmpeg_supports_encoder(ffmpeg_path, encoder):
+            raise RuntimeError(f"Current ffmpeg build does not support {encoder}")
+        effective_cq = 24 if crf is None else max(0, min(51, int(crf)))
+        preset_s = str(preset or "").strip().lower()
+        nvenc_presets = {"p1", "p2", "p3", "p4", "p5", "p6", "p7"}
+        if preset_s in nvenc_presets:
+            effective_preset = preset_s
+        else:
+            # Keep historical software preset input wire-compatible while
+            # translating it to NVENC's speed/quality scale.
+            effective_preset = {
+                "ultrafast": "p1", "superfast": "p1", "veryfast": "p2",
+                "faster": "p2", "fast": "p3", "medium": "p4",
+                "slow": "p5", "slower": "p6", "veryslow": "p7", "placebo": "p7",
+            }.get(preset_s, "p4")
+        video_args = [
+            "-c:v", encoder,
+            "-preset", effective_preset,
+            "-rc", "vbr",
+            "-cq", str(effective_cq),
+            "-b:v", "0",
+        ]
+        if codec == "av1":
+            video_args.extend(["-multipass", "qres"])
+        if nvidia_gpu_index is not None:
+            video_args.extend(["-gpu", str(int(nvidia_gpu_index))])
+        filter_arg = ass_filter
+        note = (
+            f"NVIDIA render pipeline: encoder={encoder} gpu={nvidia_gpu_index if nvidia_gpu_index is not None else 'auto'} "
+            f"preset={effective_preset} cq={effective_cq}"
+        )
+        logger.info(note)
+        _append_processing_log_note(log_path, note)
+    elif use_intel_gpu:
         if codec not in {"h264", "avc", "av1"}:
             raise ValueError("Intel GPU burn-in currently supports only h264/av1")
         device = str(intel_gpu_render_device or "").strip() or "/dev/dri/renderD128"

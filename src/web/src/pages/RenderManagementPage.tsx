@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
-import { renderManagementApi, type CreatedEnrollment, type RenderConnection, type RenderEnrollment, type RenderExecution, type RenderWorker } from "../api/renderManagement";
+import { renderManagementApi, type CreatedEnrollment, type RenderConnection, type RenderDevice, type RenderEnrollment, type RenderExecution, type RenderWorker } from "../api/renderManagement";
 import { Button, DataTable, EmptyState, PageHeader, Section } from "../components/ui";
 
 const ACTIVE = new Set(["claimed", "running", "uploading"]);
@@ -116,10 +116,17 @@ export default function RenderManagementPage() {
         {workers.map((w) => {
           const gpu = (w.capabilities.gpu_model ?? w.capabilities.gpu ?? w.resources.gpu) as unknown;
           const fps = w.resources.fps ?? w.resources.render_fps;
+          const devices = (Array.isArray(w.resources.devices) ? w.resources.devices : Array.isArray(w.capabilities.devices) ? w.capabilities.devices : []) as RenderDevice[];
           return <div key={w.id} className="rounded-xl border border-slate-200 p-4 dark:border-slate-800">
             <div className="flex items-start justify-between gap-3"><div><div className="font-medium">{w.name}</div><div className="mt-1 text-xs text-slate-500">{w.platform}{w.architecture ? ` · ${w.architecture}` : ""} · {value(gpu)}</div></div>
               <span className={`rounded-full px-2 py-1 text-xs ${badge(w.stale ? "offline" : w.status)}`}>{w.stale ? "失联" : w.draining ? "Drain" : w.status}</span></div>
             <div className="mt-4 grid grid-cols-4 gap-3 text-xs"><div><div className="text-slate-500">运行中</div><div className="mt-1 font-medium">{w.active_jobs}</div></div><label><div className="text-slate-500">最大并发</div><input type="number" min={1} max={32} defaultValue={w.max_concurrency} disabled={busy === w.id} onBlur={(e) => { const n = Math.max(1, Math.min(32, Number(e.currentTarget.value) || 1)); if (n !== w.max_concurrency) void workerAction(w, { max_concurrency: n }); }} className="mt-1 w-16 rounded border border-slate-300 px-2 py-1 font-medium" /></label><div><div className="text-slate-500">速度</div><div className="mt-1 font-medium">{value(fps)} FPS</div></div><div><div className="text-slate-500">心跳</div><div className="mt-1 font-medium">{ago(w.last_seen_at)}</div></div></div>
+            {devices.length ? <div className="mt-4 space-y-2">
+              {devices.map((device) => <div key={device.id} className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 dark:border-slate-700 dark:bg-slate-900">
+                <div className="flex items-center justify-between gap-3"><div><div className="text-xs font-medium">{device.name}</div><div className="mt-0.5 font-mono text-[11px] text-slate-500">{device.id}{device.path ? ` · ${device.path}` : ""} · {device.backend}</div></div><span className={`rounded-full px-2 py-0.5 text-[11px] ${badge(device.status)}`}>{device.status}</span></div>
+                <div className="mt-2 grid grid-cols-3 gap-2 text-[11px]"><div><span className="text-slate-500">任务 </span>{device.active_jobs}/{device.max_concurrency}</div><div><span className="text-slate-500">空闲槽位 </span>{device.available_slots}</div><div className="truncate"><span className="text-slate-500">Execution </span>{device.execution_ids?.length ? device.execution_ids.map((id) => id.slice(0, 8)).join(", ") : "—"}</div></div>
+              </div>)}
+            </div> : null}
             <div className="mt-4 flex flex-wrap gap-2"><Button size="xs" disabled={busy === w.id} onClick={() => void workerAction(w, { draining: !w.draining })}>{w.draining ? "恢复接单" : "Drain"}</Button><Button size="xs" tone={w.enabled ? "danger" : "primary"} disabled={busy === w.id} onClick={() => void workerAction(w, { enabled: !w.enabled })}>{w.enabled ? "禁用" : "启用"}</Button><Button size="xs" tone="danger" disabled={busy === w.id || !w.credential_active} onClick={async () => { setBusy(w.id); try { await renderManagementApi.revokeWorkerCredential(w.id); await refresh(); } catch (e) { setError(e instanceof Error ? e.message : String(e)); } finally { setBusy(null); } }}>吊销凭据</Button></div>
           </div>;
         })}
@@ -131,7 +138,7 @@ export default function RenderManagementPage() {
       {executions.length === 0 ? <EmptyState>暂无远程渲染执行记录。</EmptyState> :
       <DataTable><thead><tr><th>状态</th><th>节点</th><th>进度</th><th>Attempt</th><th>Task</th><th>开始</th><th>操作</th></tr></thead><tbody>
         {executions.map((e) => <tr key={e.id} className="cursor-pointer" onClick={() => setSelected(e)}>
-          <td><span className={`rounded-full px-2 py-1 text-xs ${badge(e.state)}`}>{e.state}</span></td><td>{e.worker_name ?? e.worker_id.slice(0, 8)}</td><td>{e.progress}%</td><td>#{e.attempt}</td><td>{e.task_id ? <Link className="text-sky-700 hover:underline" to={`/tasks/${e.task_id}`} onClick={(x) => x.stopPropagation()}>{e.task_id.slice(0, 8)}</Link> : "—"}</td><td>{ago(e.started_at)}</td>
+          <td><span className={`rounded-full px-2 py-1 text-xs ${badge(e.state)}`}>{e.state}</span></td><td><div>{e.worker_name ?? e.worker_id.slice(0, 8)}</div>{typeof e.metrics.device_name === "string" ? <div className="mt-0.5 text-[11px] text-slate-500">{e.metrics.device_name}</div> : null}</td><td>{e.progress}%</td><td>#{e.attempt}</td><td>{e.task_id ? <Link className="text-sky-700 hover:underline" to={`/tasks/${e.task_id}`} onClick={(x) => x.stopPropagation()}>{e.task_id.slice(0, 8)}</Link> : "—"}</td><td>{ago(e.started_at)}</td>
           <td><div className="flex gap-1" onClick={(x) => x.stopPropagation()}>{ACTIVE.has(e.state) ? <Button size="xs" tone="danger" disabled={busy === e.id} onClick={() => void executionAction(e, "cancel")}>取消</Button> : null}<Button size="xs" disabled={busy === e.id || e.state === "succeeded"} onClick={() => void executionAction(e, "requeue")}>重排</Button></div></td>
         </tr>)}
       </tbody></DataTable>}

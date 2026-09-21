@@ -20,6 +20,9 @@ class WorkerRegisterRequest(BaseModel):
 class WorkerEnrollRequest(WorkerRegisterRequest):
     enrollment_token: str = Field(min_length=32, max_length=256)
 
+class LocalWorkerEnrollRequest(WorkerRegisterRequest):
+    pass
+
 class EnrollmentCreateRequest(BaseModel):
     label: str = Field(default="", max_length=128)
     ttl_minutes: int = Field(default=30, ge=5, le=1440)
@@ -86,6 +89,7 @@ class WorkerControlRequest(BaseModel):
 class ClaimRequest(BaseModel):
     available_slots: int = Field(default=1, ge=0, le=32)
     accepted_transfer_modes: list[Literal["http", "mapped"]] = Field(default_factory=lambda: ["http"])
+    available_encoders: list[str] = Field(default_factory=list, max_length=128)
 
 class ArtifactSpec(BaseModel):
     role: str
@@ -115,7 +119,16 @@ class ExecutionRead(BaseModel):
     render_spec: dict[str, Any]
     model_config = {"from_attributes": True}
 
-class ExecutionAdminRead(ExecutionRead):
+class ExecutionAdminRead(BaseModel):
+    id: uuid.UUID
+    render_job_id: uuid.UUID
+    worker_id: uuid.UUID
+    attempt: int
+    state: str
+    transfer_mode: str
+    progress: int
+    lease_until: datetime | None = None
+    render_spec: dict[str, Any]
     worker_name: str | None = None
     task_id: uuid.UUID | None = None
     job_status: str | None = None
@@ -125,6 +138,7 @@ class ExecutionAdminRead(ExecutionRead):
     heartbeat_at: datetime | None = None
     started_at: datetime
     finished_at: datetime | None = None
+    model_config = {"from_attributes": True}
 
 class ExecutionAdminActionRequest(BaseModel):
     reason: str = Field(default="canceled by coordinator", min_length=1, max_length=1024)

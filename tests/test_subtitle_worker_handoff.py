@@ -66,6 +66,7 @@ def test_render_handoff_commits_render_and_subtitle_completion_together() -> Non
     db = _DB(job=job)
     logs: list[str] = []
     queue_kicks: list[bool] = []
+    unlocked: list[uuid.UUID] = []
 
     result = complete_subtitle_handoff(
         db=db,  # type: ignore[arg-type]
@@ -76,7 +77,7 @@ def test_render_handoff_commits_render_and_subtitle_completion_together() -> Non
         soft_sub=False,
         render_payload={"input_key": "video.mp4", "srt_key": "subtitle.srt"},
         ensure_not_stopped=lambda: None,
-        unlock_task=lambda _task: (_ for _ in ()).throw(AssertionError("render handoff must keep task lock")),
+        unlock_task=lambda value: unlocked.append(value.id),
         kick_task_queue=lambda: queue_kicks.append(True),
         log=logs.append,
         upload_log=lambda: None,
@@ -93,6 +94,7 @@ def test_render_handoff_commits_render_and_subtitle_completion_together() -> Non
     assert db.commits == [(SubtitleJobStatus.succeeded, 1)]
     assert logs == ["render queued; waiting for task queue"]
     assert queue_kicks == [True]
+    assert unlocked == [task.id]
 
 
 def test_render_handoff_reuses_existing_queued_render() -> None:

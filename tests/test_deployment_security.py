@@ -224,7 +224,7 @@ def test_base_compose_does_not_require_an_intel_gpu() -> None:
 
 def test_intel_override_owns_all_gpu_device_mappings() -> None:
     services = _compose(ROOT / "docker-compose.intel.yml")["services"]
-    for name in ("ffplayout", "orchestrator", "subtitle-service", "subtitle-worker"):
+    for name in ("ffplayout", "orchestrator", "subtitle-service", "render-worker"):
         service = services[name]
         assert "/dev/dri:/dev/dri" in service.get("devices", [])
         assert service.get("group_add") == ["${INTEL_GPU_RENDER_GID:-992}"]

@@ -1,6 +1,12 @@
 import { fetchJson } from "../lib/http";
 import { orchestratorUrl } from "../lib/urls";
 
+export type RenderDevice = {
+  id: string; name: string; backend: string; path?: string; index?: number | null;
+  encoders?: string[]; max_concurrency: number; active_jobs: number; available_slots: number;
+  status: string; execution_ids?: string[];
+};
+
 export type RenderWorker = {
   id: string; worker_key: string; name: string; platform: string; architecture?: string | null;
   version: string; protocol_version: number; render_spec_versions: number[];
@@ -14,7 +20,7 @@ export type RenderEnrollment = { id: string; label: string; status: string; expi
 export type CreatedEnrollment = { id: string; token: string; server_url: string; expires_at: string };
 
 export type RenderExecution = {
-  id: string; render_job_id: string; worker_id: string; attempt: number; fence_token: string;
+  id: string; render_job_id: string; worker_id: string; attempt: number;
   state: string; transfer_mode: string; progress: number; lease_until?: string | null;
   render_spec: Record<string, unknown>; worker_name?: string | null; task_id?: string | null;
   job_status?: string | null; metrics: Record<string, unknown>; log_tail?: string | null;

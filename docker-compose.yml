@@ -287,6 +287,33 @@ services:
       retries: 10
     restart: unless-stopped
 
+  render-worker:
+    build: *subtitle-build
+    image: videoroll-subtitle:prod
+    <<: *application-security
+    command: ["python", "-m", "videoroll.apps.render_worker.runtime"]
+    environment:
+      RENDER_WORKER_SERVER_URL: ${RENDER_WORKER_SERVER_URL:-http://orchestrator:8000}
+      RENDER_WORKER_ENROLLMENT_TOKEN: ${RENDER_WORKER_ENROLLMENT_TOKEN:-}
+      RENDER_WORKER_CREDENTIAL: ${RENDER_WORKER_CREDENTIAL:-}
+      RENDER_WORKER_CREDENTIAL_FILE: /state/credential
+      INTERNAL_API_SECRET: ${INTERNAL_API_SECRET:-videoroll-development-internal-secret}
+      RENDER_WORKER_KEY: ${RENDER_WORKER_KEY:-local-render}
+      RENDER_WORKER_NAME: ${RENDER_WORKER_NAME:-本机渲染节点}
+      RENDER_WORKER_BACKEND: ${RENDER_WORKER_BACKEND:-auto}
+      RENDER_WORKER_GPU_DEVICE: ${RENDER_WORKER_GPU_DEVICE:-}
+      RENDER_WORKER_MAX_CONCURRENCY: ${RENDER_WORKER_MAX_CONCURRENCY:-1}
+      RENDER_WORKER_WORK_DIR: /work/render-worker
+      FFMPEG_PATH: ${FFMPEG_PATH:-ffmpeg}
+    volumes:
+      - render-worker-state:/state
+      - ${STORAGE_HOST_ROOT:-./data/storage}/render-worker-work:/work/render-worker
+    depends_on:
+      orchestrator:
+        condition: service_healthy
+    networks: [internal]
+    restart: unless-stopped
+
   subtitle-worker:
     build: *subtitle-build
     image: videoroll-subtitle:prod
@@ -504,6 +531,9 @@ services:
       timeout: 5s
       retries: 5
     restart: unless-stopped
+
+volumes:
+  render-worker-state:
 
 networks:
   internal:

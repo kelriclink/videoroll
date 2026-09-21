@@ -1,0 +1,1 @@
+"""Standalone VideoRoll render worker."""

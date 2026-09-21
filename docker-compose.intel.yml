@@ -18,10 +18,11 @@ services:
       - "${INTEL_GPU_RENDER_GID:-992}"
     environment:
       INTEL_GPU_RENDER_DEVICE: ${INTEL_GPU_RENDER_DEVICE:-/dev/dri/renderD128}
-  subtitle-worker:
+  render-worker:
     devices:
       - "/dev/dri:/dev/dri"
     group_add:
       - "${INTEL_GPU_RENDER_GID:-992}"
     environment:
-      INTEL_GPU_RENDER_DEVICE: ${INTEL_GPU_RENDER_DEVICE:-/dev/dri/renderD128}
+      RENDER_WORKER_BACKEND: auto
+      RENDER_WORKER_GPU_DEVICE: ""

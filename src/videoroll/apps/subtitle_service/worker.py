@@ -67,7 +67,6 @@ from videoroll.apps.subtitle_service.processing import (
     transcribe_openvino_whisper,
     write_json,
 )
-from videoroll.apps.subtitle_service.processing import _ffmpeg_supported_encoders, _ffmpeg_supported_filters
 from videoroll.apps.subtitle_service.asr_settings_store import get_asr_settings
 from videoroll.apps.subtitle_service.auto_profile_store import get_auto_profile
 from videoroll.apps.subtitle_service.bilibili_tags_store import get_task_bilibili_summary
@@ -114,7 +113,7 @@ from videoroll.apps.orchestrator_api.youtube_downloader import (
 )
 from videoroll.apps.subtitle_service.render_queue_store import TASK_QUEUE_SETTINGS_KEY, get_task_queue_settings
 from videoroll.apps.orchestrator_api.services import render_worker_service
-from videoroll.apps.orchestrator_api.render_worker_schemas import ExecutionFailRequest, ExecutionHeartbeatRequest
+from videoroll.apps.orchestrator_api.render_worker_schemas import ExecutionHeartbeatRequest
 from videoroll.apps.subtitle_service.queues import SUBTITLE_CONTROL_QUEUE, SUBTITLE_WORK_QUEUE
 from videoroll.apps.subtitle_service.worker_concurrency import (
     JobLeaseHeartbeat,
@@ -217,12 +216,6 @@ celery_app.conf.update(
     beat_schedule={
         "subtitle-service-task-queue-tick": {
             "task": "subtitle_service.task_queue_tick",
-            "schedule": _TASK_QUEUE_TICK_INTERVAL_SECONDS,
-            "args": (),
-            "options": {"queue": SUBTITLE_CONTROL_QUEUE},
-        },
-        "subtitle-service-render-coordinator-tick": {
-            "task": "subtitle_service.render_coordinator_tick",
             "schedule": _TASK_QUEUE_TICK_INTERVAL_SECONDS,
             "args": (),
             "options": {"queue": SUBTITLE_CONTROL_QUEUE},
@@ -2062,43 +2055,12 @@ def task_queue_tick() -> dict[str, Any]:
 
 @celery_app.task(name="subtitle_service.render_coordinator_tick")
 def render_coordinator_tick() -> dict[str, Any]:
-    """Sole local dispatcher for RenderJob; remote workers use the same claim path."""
-    _ensure_db()
-    db = _db()
-    store = FileStore(settings)
-    store.ensure_ready()
-    claimed: list[tuple[str, str, str]] = []
-    try:
-        supported_encoders = _ffmpeg_supported_encoders(settings.ffmpeg_path)
-        supported_filters = _ffmpeg_supported_filters(settings.ffmpeg_path)
-        worker = render_worker_service.ensure_local_worker(
-            db,
-            capabilities={
-                "gpu_model": "Local VAAPI",
-                "encoders": sorted(supported_encoders),
-                "filters": sorted(supported_filters),
-                "backend": "vaapi",
-            },
-            resources={"render_device": settings.intel_gpu_render_device},
-        )
-        if not worker.enabled or worker.draining:
-            return {"status": "paused", "claimed": "0"}
-        slots = max(0, int(worker.max_concurrency or 0) - int(worker.active_jobs or 0))
-        for _ in range(slots):
-            execution, _spec = render_worker_service.claim_job(db, store, worker.id, ["http"])
-            if execution is None:
-                break
-            claimed.append((str(execution.render_job_id), str(execution.id), str(execution.fence_token)))
-    finally:
-        db.close()
-    for render_job_id, execution_id, fence_token in claimed:
-        celery_app.send_task("subtitle_service.process_render_job", args=[render_job_id, execution_id, fence_token], queue=SUBTITLE_WORK_QUEUE)
-    return {"status": "ok", "claimed": str(len(claimed))}
+    """Compatibility no-op after local rendering moved to standalone workers."""
+    return {"status": "standalone-workers", "claimed": "0"}
 
 
 @celery_app.task(name="subtitle_service.render_queue_tick")
 def render_queue_tick() -> dict[str, Any]:
-    # Legacy entrypoint is retained, but it delegates to the render coordinator.
     return render_coordinator_tick()
 
 

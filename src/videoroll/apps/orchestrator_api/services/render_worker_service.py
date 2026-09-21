@@ -1,5 +1,6 @@
 from __future__ import annotations
 import hashlib
+import ipaddress
 import secrets
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -10,7 +11,14 @@ from sqlalchemy.orm import Session
 from videoroll.apps.outbox.service import create_outbox_event
 from videoroll.apps.orchestrator_api.render_worker_schemas import ArtifactSpec, RenderSpec
 from videoroll.apps.subtitle_service.auto_profile_store import get_auto_profile
-from videoroll.db.models import AppSetting, Asset, RenderExecution, RenderJob, RenderJobStatus, RenderWorker, RenderWorkerEnrollment, SubtitleJob, Task, TaskStatus
+from videoroll.apps.subtitle_service.processing import (
+    probe_video_resolution,
+    segments_from_json_data,
+    segments_to_ass,
+    srt_to_segments,
+)
+from videoroll.config import get_orchestrator_settings
+from videoroll.db.models import AppSetting, Asset, RenderExecution, RenderJob, RenderJobStatus, RenderWorker, RenderWorkerEnrollment, SubtitleJob, SubtitleJobStatus, Task, TaskStatus
 from videoroll.storage.filesystem import FileStore, StorageObjectNotFound
 from videoroll.utils.auto_youtube import parse_auto_youtube_created_by
 
@@ -88,6 +96,36 @@ def authenticate_worker(db: Session, credential: str) -> RenderWorker:
     if row is None or row.credential_revoked_at is not None or not row.enabled:
         raise HTTPException(401, "invalid render worker credential")
     return row
+
+def is_private_worker_bootstrap_address(value: str) -> bool:
+    try:
+        address = ipaddress.ip_address(str(value or "").strip())
+    except ValueError:
+        return False
+    return address.is_private or address.is_loopback
+
+
+def enroll_local_worker(db: Session, payload: Any) -> tuple[RenderWorker, str]:
+    now = utcnow()
+    worker = db.query(RenderWorker).filter(RenderWorker.worker_key == payload.worker_key).with_for_update().one_or_none()
+    existing_max_concurrency = int(worker.max_concurrency) if worker is not None else None
+    if worker is None:
+        worker = RenderWorker(worker_key=payload.worker_key, name=payload.name, platform=payload.platform)
+    for key in ("name","platform","architecture","version","protocol_version","render_spec_versions","capabilities","resources","labels","max_concurrency"):
+        setattr(worker, key, getattr(payload, key))
+    if existing_max_concurrency is not None:
+        worker.max_concurrency = existing_max_concurrency
+    credential = WORKER_CREDENTIAL_PREFIX + secrets.token_urlsafe(48)
+    worker.credential_hash = _secret_hash(credential)
+    worker.credential_issued_at = now
+    worker.credential_revoked_at = None
+    worker.status = "online"
+    worker.enabled = True
+    worker.last_seen_at = now
+    worker.labels = {**dict(worker.labels or {}), "local": True, "standalone": True}
+    db.add(worker); db.commit(); db.refresh(worker)
+    return worker, credential
+
 
 def revoke_worker_credential(db: Session, worker_id: uuid.UUID) -> RenderWorker:
     row = get_worker(db, worker_id, lock=True)
@@ -216,7 +254,7 @@ def execution_admin_payload(db: Session, execution: RenderExecution) -> dict[str
     job = db.get(RenderJob, execution.render_job_id)
     return {
         "id": execution.id, "render_job_id": execution.render_job_id, "worker_id": execution.worker_id,
-        "attempt": execution.attempt, "fence_token": execution.fence_token, "state": execution.state,
+        "attempt": execution.attempt, "state": execution.state,
         "transfer_mode": execution.transfer_mode, "progress": execution.progress,
         "lease_until": execution.lease_until, "render_spec": execution.render_spec,
         "worker_name": worker.name if worker else None, "task_id": job.task_id if job else None,
@@ -225,15 +263,21 @@ def execution_admin_payload(db: Session, execution: RenderExecution) -> dict[str
         "heartbeat_at": execution.heartbeat_at, "started_at": execution.started_at, "finished_at": execution.finished_at,
     }
 
-def _supports_job(worker: RenderWorker, job: RenderJob) -> bool:
+def _supports_job(worker: RenderWorker, job: RenderJob, available_encoders: set[str] | None = None) -> bool:
     if 1 not in (worker.render_spec_versions or []): return False
     caps = worker.capabilities or {}
-    encoders = {str(x).lower() for x in caps.get("encoders", []) if x}
+    encoders = (
+        {str(x).lower() for x in available_encoders if x}
+        if available_encoders is not None
+        else {str(x).lower() for x in caps.get("encoders", []) if x}
+    )
     req = job.request_json if isinstance(job.request_json, dict) else {}
     render = req.get("render") if isinstance(req.get("render"), dict) else {}
     codec = str(render.get("video_codec") or "av1").lower()
-    if not encoders:
+    if not encoders and available_encoders is None:
         return True  # compatibility for early workers; execution-side probe remains authoritative
+    if not encoders:
+        return False
     if codec == "av1":
         return bool(encoders & {"av1_nvenc","av1_vaapi","av1_qsv","libsvtav1","libaom-av1"})
     if codec in {"h264","avc"}:
@@ -280,9 +324,58 @@ def _build_spec(db: Session, store: FileStore, job: RenderJob, execution_id: uui
     for role, field in (("input","input_key"),("srt","srt_key"),("ass","ass_key")):
         key = str(req.get(field) or "").strip()
         if key: artifacts.append(_artifact(db, store, role, key, execution_id))
+
+    # A standalone worker must receive an executable render contract and must
+    # never query the coordinator database. Automatic renders historically
+    # generated ASS inside subtitle-worker at execution time; materialize the
+    # same ASS here and expose it as a normal execution-scoped artifact.
+    if automatic and burn_in and not str(req.get("ass_key") or "").strip():
+        input_key = str(req.get("input_key") or "").strip()
+        srt_key = str(req.get("srt_key") or "").strip()
+        if not input_key or not srt_key:
+            raise HTTPException(409, "automatic burn-in requires input and SRT artifacts")
+        runtime_segments = []
+        if job.subtitle_job_id:
+            subtitle_job = db.get(SubtitleJob, job.subtitle_job_id)
+            subtitle_request = subtitle_job.request_json if subtitle_job and isinstance(subtitle_job.request_json, dict) else {}
+            segment_key = str(dict(subtitle_request.get("artifacts") or {}).get("final_subtitle_segments_key") or "").strip()
+            if segment_key:
+                try:
+                    import json
+                    runtime_segments = segments_from_json_data(json.loads(store.path_for(segment_key).read_text(encoding="utf-8")))
+                except Exception:
+                    runtime_segments = []
+        if not runtime_segments:
+            runtime_segments = srt_to_segments(store.path_for(srt_key).read_text(encoding="utf-8"))
+        ffmpeg_path = get_orchestrator_settings().ffmpeg_path
+        play_res_x, play_res_y = probe_video_resolution(ffmpeg_path, store.path_for(input_key))
+        render_cfg = req.get("render") if isinstance(req.get("render"), dict) else {}
+        secondary_line_scale = 0.68 if any(segment.secondary_text for segment in runtime_segments) else None
+        ass_text = segments_to_ass(
+            runtime_segments,
+            style_name=str(render_cfg.get("ass_style") or "clean_white"),
+            play_res_x=play_res_x,
+            play_res_y=play_res_y,
+            secondary_line_scale=secondary_line_scale,
+            primary_font_scale_percent=int(render_cfg.get("primary_font_scale_percent") or 100),
+            secondary_font_scale_percent=int(render_cfg.get("secondary_font_scale_percent") or 100),
+        )
+        runtime_ass_key = f"render-input/{execution_id}/subtitle_runtime.ass"
+        runtime_ass_path = store.path_for(runtime_ass_key, require_exists=False)
+        runtime_ass_path.parent.mkdir(parents=True, exist_ok=True)
+        runtime_ass_path.write_text(ass_text, encoding="utf-8")
+        req["ass_key"] = runtime_ass_key
+        artifacts = [artifact for artifact in artifacts if artifact.role != "ass"]
+        artifacts.append(_artifact(db, store, "ass", runtime_ass_key, execution_id))
     return RenderSpec(schema_version=1, render_job_id=job.id, task_id=job.task_id, mode=mode, request=req, artifacts=artifacts)
 
-def claim_job(db: Session, store: FileStore, worker_id: uuid.UUID, accepted_transfer_modes: list[str]) -> tuple[RenderExecution | None, RenderSpec | None]:
+def claim_job(
+    db: Session,
+    store: FileStore,
+    worker_id: uuid.UUID,
+    accepted_transfer_modes: list[str],
+    available_encoders: list[str] | None = None,
+) -> tuple[RenderExecution | None, RenderSpec | None]:
     worker = get_worker(db, worker_id, lock=True)
     now = utcnow()
     if not worker.enabled or worker.draining or worker.status == "paused": return None, None
@@ -300,7 +393,8 @@ def claim_job(db: Session, store: FileStore, worker_id: uuid.UUID, accepted_tran
                 or_(Task.lock_until.is_(None), Task.lock_until <= now, Task.lock_owner.like(f"{REMOTE_LOCK_PREFIX}%")))
         .order_by(Task.priority.desc(), Task.queue_position.asc().nullslast(), RenderJob.created_at.asc())
         .with_for_update(skip_locked=True).limit(32).all())
-    job = next((candidate for candidate in jobs if _supports_job(worker, candidate)), None)
+    free_encoders = {str(x).lower() for x in available_encoders} if available_encoders is not None else None
+    job = next((candidate for candidate in jobs if _supports_job(worker, candidate, free_encoders)), None)
     if job is None: return None, None
     task = db.get(Task, job.task_id)
     attempt = int(db.query(func.max(RenderExecution.attempt)).filter(RenderExecution.render_job_id == job.id).scalar() or 0) + 1
@@ -396,6 +490,13 @@ def complete_execution(db: Session, execution_id: uuid.UUID, payload: Any) -> Re
         if asset is None or asset.task_id != job.task_id: raise HTTPException(400, "output asset does not belong to render task")
     now = utcnow(); execution.state = "succeeded"; execution.progress = 100; execution.output_json = payload.output; execution.finished_at = now
     job.status = RenderJobStatus.succeeded; job.progress = 100; job.finished_at = now; job.lease_owner = None; job.lease_until = None; job.heartbeat_at = now
+    if job.subtitle_job_id:
+        subtitle_job = db.get(SubtitleJob, job.subtitle_job_id)
+        if subtitle_job is not None:
+            subtitle_job.status = SubtitleJobStatus.succeeded
+            subtitle_job.progress = 100
+            subtitle_job.error_message = None
+            db.add(subtitle_job)
     task = db.get(Task, job.task_id)
     if task is not None:
         task.status = TaskStatus.rendered
@@ -424,7 +525,20 @@ def fail_execution(db: Session, execution_id: uuid.UUID, payload: Any) -> Render
         if payload.retryable: job.retry_count = int(job.retry_count or 0)+1; job.progress = 0; job.started_at = None
         else: job.finished_at = now
         task = db.get(Task, job.task_id)
-        if task is not None and task.lock_owner == f"{REMOTE_LOCK_PREFIX}{execution.id}": task.lock_owner = None; task.lock_until = None; db.add(task)
+        if task is not None:
+            if not payload.retryable and task.status != TaskStatus.published:
+                task.status = TaskStatus.failed
+                task.error_code = task.error_code or "RENDER_FAILED"
+                task.error_message = payload.error
+            if task.lock_owner == f"{REMOTE_LOCK_PREFIX}{execution.id}":
+                task.lock_owner = None; task.lock_until = None
+            db.add(task)
+        if not payload.retryable and job.subtitle_job_id:
+            subtitle_job = db.get(SubtitleJob, job.subtitle_job_id)
+            if subtitle_job is not None:
+                subtitle_job.status = SubtitleJobStatus.failed
+                subtitle_job.error_message = f"render failed: {payload.error}"
+                db.add(subtitle_job)
         db.add(job)
     worker = db.get(RenderWorker, execution.worker_id)
     if worker is not None: worker.active_jobs = max(0, int(worker.active_jobs or 0)-1); worker.status = "online"; db.add(worker)

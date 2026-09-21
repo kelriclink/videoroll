@@ -144,6 +144,34 @@ class SubtitleServiceSettings(CommonSettings):
     orchestrator_timeout_seconds: float = Field(1800.0, alias="ORCHESTRATOR_TIMEOUT_SECONDS")
 
 
+class RenderWorkerSettings(BaseSettings):
+    """Standalone render worker runtime configuration.
+
+    The worker intentionally has no DATABASE_URL or Redis dependency. It talks
+    to the coordinator only through the versioned Render Worker HTTP API.
+    """
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+
+    server_url: str = Field("http://orchestrator:8000", alias="RENDER_WORKER_SERVER_URL")
+    enrollment_token: str = Field("", alias="RENDER_WORKER_ENROLLMENT_TOKEN")
+    credential: str = Field("", alias="RENDER_WORKER_CREDENTIAL")
+    credential_file: str = Field("/state/credential", alias="RENDER_WORKER_CREDENTIAL_FILE")
+    internal_api_secret: str = Field(
+        "videoroll-development-internal-secret",
+        alias="INTERNAL_API_SECRET",
+    )
+    worker_key: str = Field("", alias="RENDER_WORKER_KEY")
+    name: str = Field("VideoRoll Render Worker", alias="RENDER_WORKER_NAME")
+    backend: str = Field("auto", alias="RENDER_WORKER_BACKEND")
+    gpu_device: str = Field("", alias="RENDER_WORKER_GPU_DEVICE")
+    max_concurrency: int = Field(1, ge=1, le=32, alias="RENDER_WORKER_MAX_CONCURRENCY")
+    poll_interval_seconds: float = Field(2.0, ge=0.25, le=60.0, alias="RENDER_WORKER_POLL_INTERVAL_SECONDS")
+    heartbeat_interval_seconds: float = Field(30.0, ge=5.0, le=60.0, alias="RENDER_WORKER_HEARTBEAT_INTERVAL_SECONDS")
+    request_timeout_seconds: float = Field(120.0, ge=5.0, le=3600.0, alias="RENDER_WORKER_REQUEST_TIMEOUT_SECONDS")
+    ffmpeg_path: str = Field("ffmpeg", alias="FFMPEG_PATH")
+    work_dir: str = Field("/work/render-worker", alias="RENDER_WORKER_WORK_DIR")
+
+
 class YouTubeIngestSettings(CommonSettings):
     user_agent: str = Field(DEFAULT_YOUTUBE_USER_AGENT, alias="YOUTUBE_USER_AGENT")
     youtube_proxy: str | None = Field(None, alias="YOUTUBE_PROXY")
@@ -179,6 +207,11 @@ def get_orchestrator_settings() -> OrchestratorSettings:
 @lru_cache
 def get_subtitle_settings() -> SubtitleServiceSettings:
     return SubtitleServiceSettings()
+
+
+@lru_cache
+def get_render_worker_settings() -> RenderWorkerSettings:
+    return RenderWorkerSettings()
 
 
 @lru_cache

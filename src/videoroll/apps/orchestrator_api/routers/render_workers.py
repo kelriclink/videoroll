@@ -1,6 +1,7 @@
 from __future__ import annotations
 import uuid
 from pathlib import Path
+import secrets
 from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.responses import Response, StreamingResponse
 from sqlalchemy.orm import Session
@@ -8,7 +9,7 @@ from videoroll.apps.orchestrator_api.dependencies import get_db, get_settings, g
 from videoroll.apps.orchestrator_api.render_worker_schemas import (
     ClaimRequest, ClaimResponse, ExecutionAdminActionRequest, ExecutionAdminRead, ExecutionCancelRead, ExecutionCompleteRequest, ExecutionFailRequest,
     ExecutionHeartbeatRequest, ExecutionLogRequest, ExecutionProgressRequest, ExecutionRead,
-    WorkerEnrollRequest, WorkerEnrollResponse, WorkerHeartbeatRequest, WorkerRead,
+    LocalWorkerEnrollRequest, WorkerEnrollRequest, WorkerEnrollResponse, WorkerHeartbeatRequest, WorkerRead,
 )
 from videoroll.apps.orchestrator_api.schemas import AssetRead
 from videoroll.apps.orchestrator_api.services import asset_service, render_worker_service
@@ -59,6 +60,23 @@ def enroll(payload: WorkerEnrollRequest, db: Session = Depends(get_db)) -> Worke
     worker, credential = render_worker_service.enroll_worker(db, payload)
     return WorkerEnrollResponse(worker=WorkerRead.model_validate(worker), credential=credential)
 
+@router.post("/local-enroll", response_model=WorkerEnrollResponse)
+def local_enroll(
+    payload: LocalWorkerEnrollRequest,
+    request: Request,
+    x_internal_secret: str = Header(default="", alias="X-Internal-Secret"),
+    db: Session = Depends(get_db),
+    settings: OrchestratorSettings = Depends(get_settings),
+) -> WorkerEnrollResponse:
+    # Bootstrap is restricted to the coordinator host/private Compose network.
+    # Remote machines must use a one-time enrollment token.
+    if request.client is None or not render_worker_service.is_private_worker_bootstrap_address(request.client.host):
+        raise HTTPException(403, "local render worker enrollment is restricted to private coordinator networks")
+    if not x_internal_secret or not secrets.compare_digest(x_internal_secret, settings.internal_api_secret):
+        raise HTTPException(401, "local render worker bootstrap secret is invalid")
+    worker, credential = render_worker_service.enroll_local_worker(db, payload)
+    return WorkerEnrollResponse(worker=WorkerRead.model_validate(worker), credential=credential)
+
 @router.post("/{worker_id}/heartbeat", response_model=WorkerRead)
 def heartbeat(worker_id: uuid.UUID, payload: WorkerHeartbeatRequest, db: Session = Depends(get_db), _worker: RenderWorker = Depends(require_assigned_worker)) -> RenderWorker:
     return render_worker_service.heartbeat_worker(db, worker_id, payload)
@@ -67,7 +85,10 @@ def heartbeat(worker_id: uuid.UUID, payload: WorkerHeartbeatRequest, db: Session
 def claim(worker_id: uuid.UUID, payload: ClaimRequest, db: Session = Depends(get_db), store: FileStore = Depends(get_store), _worker: RenderWorker = Depends(require_assigned_worker)) -> ClaimResponse:
     if payload.available_slots <= 0:
         return ClaimResponse()
-    execution, spec = render_worker_service.claim_job(db, store, worker_id, list(payload.accepted_transfer_modes))
+    execution, spec = render_worker_service.claim_job(
+        db, store, worker_id, list(payload.accepted_transfer_modes),
+        available_encoders=list(payload.available_encoders),
+    )
     return ClaimResponse(execution=execution, render_spec=spec)
 
 @router.post("/executions/{execution_id}/heartbeat", response_model=ExecutionRead)

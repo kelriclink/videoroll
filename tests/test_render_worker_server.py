@@ -135,6 +135,19 @@ def test_execution_admin_payload_exposes_scheduler_fields(db: Session) -> None:
     assert payload["worker_name"] == "Windows 4060"
     assert payload["task_id"] == job.task_id
     assert payload["job_status"] == "running"
+    assert "fence_token" not in payload
+
+
+def test_claim_respects_current_free_device_encoders(db: Session) -> None:
+    worker = make_worker(db)
+    av1_job = make_job(db, priority=10, codec="av1")
+    h264_job = make_job(db, priority=0, codec="h264")
+    execution, _ = render_worker_service.claim_job(
+        db, store(), worker.id, ["http"], available_encoders=["h264_nvenc"],
+    )
+    assert execution is not None
+    assert execution.render_job_id == h264_job.id
+    assert db.get(RenderJob, av1_job.id).status == RenderJobStatus.queued
 
 def test_worker_max_concurrency_is_enforced_by_coordinator(db: Session) -> None:
     worker = make_worker(db)
@@ -161,3 +174,26 @@ def test_local_worker_preserves_admin_concurrency_setting(db: Session) -> None:
     assert same.id == worker.id
     assert same.max_concurrency == 4
     assert same.labels.get("local") is True
+
+
+def test_local_worker_enrollment_preserves_existing_admin_concurrency(db: Session) -> None:
+    from videoroll.apps.orchestrator_api.render_worker_schemas import LocalWorkerEnrollRequest
+
+    existing = render_worker_service.ensure_local_worker(
+        db, capabilities={"encoders": ["av1_vaapi"]}, resources={}
+    )
+    existing.max_concurrency = 4
+    db.add(existing)
+    db.commit()
+    enrolled, _credential = render_worker_service.enroll_local_worker(
+        db,
+        LocalWorkerEnrollRequest(
+            worker_key="local-render",
+            name="本机渲染节点",
+            platform="linux",
+            capabilities={"encoders": ["av1_vaapi"]},
+            max_concurrency=1,
+        ),
+    )
+    assert enrolled.id == existing.id
+    assert enrolled.max_concurrency == 4

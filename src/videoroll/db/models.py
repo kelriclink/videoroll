@@ -97,9 +97,9 @@ class PublishBatch(Base):
     # Kept as strings instead of a database enum so a new deployment does not
     # need an enum migration before it can create the batch table.
     state: Mapped[str] = mapped_column(String(32), nullable=False, default="active")
-    expected_targets: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, nullable=False, default=list)
-    request_json: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
-    outcomes_json: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    expected_targets: Mapped[list[dict[str, Any]]] = mapped_column(JSON_PAYLOAD, nullable=False, default=list)
+    request_json: Mapped[dict[str, Any]] = mapped_column(JSON_PAYLOAD, nullable=False, default=dict)
+    outcomes_json: Mapped[dict[str, Any]] = mapped_column(JSON_PAYLOAD, nullable=False, default=dict)
 
     cleanup_enqueued_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     # Versioned so deployment can safely replay cleanup markers produced by the
@@ -260,7 +260,7 @@ class PublishJob(Base):
     account_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), ForeignKey("accounts.id", ondelete="SET NULL"), nullable=True)
     bili_account_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), ForeignKey("accounts.id", ondelete="SET NULL"), nullable=True)
 
-    meta_json: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    meta_json: Mapped[dict[str, Any]] = mapped_column(JSON_PAYLOAD, nullable=False, default=dict)
     cover_key: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
     state: Mapped[PublishState] = mapped_column(Enum(PublishState, name="publish_state"), nullable=False, default=PublishState.draft)
@@ -268,7 +268,7 @@ class PublishJob(Base):
     external_url: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     bvid: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
     aid: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
-    response_json: Mapped[Optional[dict[str, Any]]] = mapped_column(JSONB, nullable=True)
+    response_json: Mapped[Optional[dict[str, Any]]] = mapped_column(JSON_PAYLOAD, nullable=True)
 
     # These fields track only the Bilibili video transfer.  They deliberately
     # do not represent the overall publish lifecycle, which also includes
@@ -347,7 +347,7 @@ class RenderJob(Base):
     status: Mapped[RenderJobStatus] = mapped_column(Enum(RenderJobStatus, name="render_job_status"), nullable=False, default=RenderJobStatus.queued)
     progress: Mapped[int] = mapped_column(Integer, nullable=False, default=0)  # 0..100
     retry_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    request_json: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    request_json: Mapped[dict[str, Any]] = mapped_column(JSON_PAYLOAD, nullable=False, default=dict)
 
     error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     started_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -372,7 +372,7 @@ class RenderJob(Base):
 class RenderWorker(Base):
     __tablename__ = "render_workers"
 
-    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
     worker_key: Mapped[str] = mapped_column(String(128), nullable=False, unique=True)
     name: Mapped[str] = mapped_column(String(128), nullable=False)
     platform: Mapped[str] = mapped_column(String(32), nullable=False)
@@ -404,13 +404,13 @@ class RenderWorker(Base):
 class RenderWorkerEnrollment(Base):
     __tablename__ = "render_worker_enrollments"
 
-    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
     token_hash: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
     label: Mapped[str] = mapped_column(String(128), nullable=False, default="")
     status: Mapped[str] = mapped_column(String(24), nullable=False, default="active")
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     consumed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
-    worker_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), ForeignKey("render_workers.id", ondelete="SET NULL"), nullable=True)
+    worker_id: Mapped[Optional[uuid.UUID]] = mapped_column(Uuid(as_uuid=True), ForeignKey("render_workers.id", ondelete="SET NULL"), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
     __table_args__ = (Index("ix_render_worker_enrollments_status_expiry", "status", "expires_at"),)
@@ -419,9 +419,9 @@ class RenderWorkerEnrollment(Base):
 class RenderExecution(Base):
     __tablename__ = "render_executions"
 
-    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    render_job_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("render_jobs.id", ondelete="CASCADE"), nullable=False)
-    worker_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("render_workers.id", ondelete="CASCADE"), nullable=False)
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    render_job_id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), ForeignKey("render_jobs.id", ondelete="CASCADE"), nullable=False)
+    worker_id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), ForeignKey("render_workers.id", ondelete="CASCADE"), nullable=False)
     attempt: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     fence_token: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
     state: Mapped[str] = mapped_column(String(24), nullable=False, default="claimed")
@@ -456,7 +456,7 @@ class SubtitleJob(Base):
 
     status: Mapped[SubtitleJobStatus] = mapped_column(Enum(SubtitleJobStatus, name="subtitle_job_status"), nullable=False, default=SubtitleJobStatus.queued)
     progress: Mapped[int] = mapped_column(Integer, nullable=False, default=0)  # 0..100
-    request_json: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    request_json: Mapped[dict[str, Any]] = mapped_column(JSON_PAYLOAD, nullable=False, default=dict)
 
     error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     logs_key: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
@@ -518,7 +518,7 @@ class AppSetting(Base):
     __tablename__ = "app_settings"
 
     key: Mapped[str] = mapped_column(String(128), primary_key=True)
-    value_json: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    value_json: Mapped[dict[str, Any]] = mapped_column(JSON_PAYLOAD, nullable=False, default=dict)
     version: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default=text("1"))
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
 
