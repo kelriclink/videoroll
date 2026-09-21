@@ -205,7 +205,7 @@ fn run_worker(
 
         if !stopping && now >= next_claim {
             let (available_slots, available_encoders) =
-                available_capacity(&config, &hardware.devices, &active);
+                available_capacity(&hardware.devices);
             if available_slots > 0 {
                 let request = ClaimRequest {
                     available_slots,
@@ -326,32 +326,18 @@ fn send_worker_heartbeat(
 }
 
 fn available_capacity(
-    config: &AppConfig,
     devices: &[Device],
-    active: &Arc<Mutex<HashMap<Uuid, Device>>>,
 ) -> (usize, Vec<String>) {
-    let active_snapshot = active.lock().map(|items| items.clone()).unwrap_or_default();
-    let node_remaining = config
-        .max_concurrency
-        .clamp(1, 32)
-        .saturating_sub(active_snapshot.len());
-    let free_devices = devices
-        .iter()
-        .filter(|device| {
-            active_snapshot
-                .values()
-                .filter(|assigned| assigned.id == device.id)
-                .count()
-                < device.max_concurrency
-        })
-        .collect::<Vec<_>>();
-    let encoders = free_devices
+    let encoders = devices
         .iter()
         .flat_map(|device| device.encoders.iter().cloned())
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect::<Vec<_>>();
-    (node_remaining.min(free_devices.len()), encoders)
+    // Node-wide concurrency is enforced atomically by the coordinator.
+    // Multiple FFmpeg jobs may share one GPU; locally we only report whether
+    // at least one compatible render device exists.
+    (if devices.is_empty() { 0 } else { 1 }, encoders)
 }
 
 fn start_execution(
@@ -420,13 +406,6 @@ fn select_device(
     let mut candidates = devices
         .iter()
         .filter(|device| {
-            let used = active_snapshot
-                .values()
-                .filter(|assigned| assigned.id == device.id)
-                .count();
-            if used >= device.max_concurrency {
-                return false;
-            }
             if spec.mode == "burn_in" {
                 device.supports_codec(codec)
             } else {
@@ -436,16 +415,23 @@ fn select_device(
         .cloned()
         .collect::<Vec<_>>();
 
-    if spec.mode != "burn_in" {
-        candidates.sort_by_key(|device| device.backend != "software");
-    } else {
-        candidates.sort_by_key(|device| device.backend == "software");
-    }
+    candidates.sort_by_key(|device| {
+        let used = active_snapshot
+            .values()
+            .filter(|assigned| assigned.id == device.id)
+            .count();
+        let software_rank = if spec.mode == "burn_in" {
+            device.backend == "software"
+        } else {
+            device.backend != "software"
+        };
+        (software_rank, used, device.id.clone())
+    });
 
     candidates
         .into_iter()
         .next()
-        .context("no compatible free local render device")
+        .context("no compatible local render device")
 }
 
 fn run_execution(

@@ -54,14 +54,14 @@ export default function RenderManagementPage() {
     return stamp ? new Date(stamp).getTime() >= recentFailureCutoff : false;
   }).length;
   const schedulableWorkers = workers.filter((w) => w.enabled && !w.stale && !w.draining);
-  const capacity = schedulableWorkers.reduce((n, w) => n + (w.effective_capacity ?? w.max_concurrency), 0);
+  const capacity = schedulableWorkers.reduce((n, w) => n + w.max_concurrency, 0);
   const available = schedulableWorkers.reduce(
-    (n, w) => n + (w.available_slots ?? Math.max(0, (w.effective_capacity ?? w.max_concurrency) - w.active_jobs)),
+    (n, w) => n + (w.available_slots ?? Math.max(0, w.max_concurrency - w.active_jobs)),
     0,
   );
   const stats = useMemo(() => [
     ["在线节点", `${online} / ${workers.length}`], ["活动执行", String(active)],
-    ["GPU 槽位", `${available} / ${capacity}`], ["近 1h 异常", String(failed)],
+    ["可用并发", `${available} / ${capacity}`], ["近 1h 异常", String(failed)],
   ], [online, workers.length, active, available, capacity, failed]);
 
   async function workerAction(worker: RenderWorker, patch: { enabled?: boolean; draining?: boolean; max_concurrency?: number }) {
@@ -130,11 +130,11 @@ export default function RenderManagementPage() {
           return <div key={w.id} className="rounded-xl border border-slate-200 p-4 dark:border-slate-800">
             <div className="flex items-start justify-between gap-3"><div><div className="font-medium">{w.name}</div><div className="mt-1 text-xs text-slate-500">{w.platform}{w.architecture ? ` · ${w.architecture}` : ""} · {value(gpu)}</div></div>
               <span className={`rounded-full px-2 py-1 text-xs ${badge(w.stale ? "offline" : w.status)}`}>{w.stale ? "失联" : w.draining ? "Drain" : w.status}</span></div>
-            <div className="mt-4 grid grid-cols-5 gap-3 text-xs"><div><div className="text-slate-500">运行中</div><div className="mt-1 font-medium">{w.active_jobs}</div></div><label><div className="text-slate-500">管理上限</div><input type="number" min={1} max={32} defaultValue={w.max_concurrency} disabled={busy === w.id} onBlur={(e) => { const n = Math.max(1, Math.min(32, Number(e.currentTarget.value) || 1)); if (n !== w.max_concurrency) void workerAction(w, { max_concurrency: n }); }} className="mt-1 w-16 rounded border border-slate-300 px-2 py-1 font-medium" /></label><div><div className="text-slate-500">有效槽位</div><div className="mt-1 font-medium">{w.available_slots ?? 0} / {w.effective_capacity ?? w.max_concurrency}</div></div><div><div className="text-slate-500">速度</div><div className="mt-1 font-medium">{value(fps)} FPS</div></div><div><div className="text-slate-500">心跳</div><div className="mt-1 font-medium">{ago(w.last_seen_at)}</div></div></div>
+            <div className="mt-4 grid grid-cols-5 gap-3 text-xs"><div><div className="text-slate-500">运行中</div><div className="mt-1 font-medium">{w.active_jobs}</div></div><label><div className="text-slate-500">管理上限</div><input type="number" min={1} max={32} defaultValue={w.max_concurrency} disabled={busy === w.id} onBlur={(e) => { const n = Math.max(1, Math.min(32, Number(e.currentTarget.value) || 1)); if (n !== w.max_concurrency) void workerAction(w, { max_concurrency: n }); }} className="mt-1 w-16 rounded border border-slate-300 px-2 py-1 font-medium" /><div className="mt-1 text-[10px] text-slate-400">节点同时任务上限</div></label><div><div className="text-slate-500">可用并发</div><div className="mt-1 font-medium">{w.available_slots ?? Math.max(0, w.max_concurrency - w.active_jobs)} / {w.max_concurrency}</div></div><div><div className="text-slate-500">速度</div><div className="mt-1 font-medium">{value(fps)} FPS</div></div><div><div className="text-slate-500">心跳</div><div className="mt-1 font-medium">{ago(w.last_seen_at)}</div></div></div>
             {devices.length ? <div className="mt-4 space-y-2">
               {devices.map((device) => <div key={device.id} className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 dark:border-slate-700 dark:bg-slate-900">
                 <div className="flex items-center justify-between gap-3"><div><div className="text-xs font-medium">{device.name}</div><div className="mt-0.5 font-mono text-[11px] text-slate-500">{device.id}{device.path ? ` · ${device.path}` : ""} · {device.backend}</div></div><span className={`rounded-full px-2 py-0.5 text-[11px] ${badge(device.status)}`}>{device.status}</span></div>
-                <div className="mt-2 grid grid-cols-3 gap-2 text-[11px]"><div><span className="text-slate-500">任务 </span>{device.active_jobs}/{device.max_concurrency}</div><div><span className="text-slate-500">空闲槽位 </span>{device.available_slots}</div><div className="truncate"><span className="text-slate-500">Execution </span>{device.execution_ids?.length ? device.execution_ids.map((id) => id.slice(0, 8)).join(", ") : "—"}</div></div>
+                <div className="mt-2 grid grid-cols-2 gap-2 text-[11px]"><div><span className="text-slate-500">任务 </span>{device.active_jobs}</div><div className="truncate"><span className="text-slate-500">Execution </span>{device.execution_ids?.length ? device.execution_ids.map((id) => id.slice(0, 8)).join(", ") : "—"}</div></div>
               </div>)}
             </div> : null}
             <div className="mt-4 flex flex-wrap gap-2"><Button size="xs" disabled={busy === w.id} onClick={() => void workerAction(w, { draining: !w.draining })}>{w.draining ? "恢复接单" : "Drain"}</Button><Button size="xs" tone={w.enabled ? "danger" : "primary"} disabled={busy === w.id} onClick={() => void workerAction(w, { enabled: !w.enabled })}>{w.enabled ? "禁用" : "启用"}</Button><Button size="xs" tone="danger" disabled={busy === w.id || !w.credential_active} onClick={async () => { setBusy(w.id); try { await renderManagementApi.revokeWorkerCredential(w.id); await refresh(); } catch (e) { setError(e instanceof Error ? e.message : String(e)); } finally { setBusy(null); } }}>吊销凭据</Button></div>

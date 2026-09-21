@@ -77,7 +77,6 @@ class RenderDevice:
     path: str = ""
     index: int | None = None
     encoders: tuple[str, ...] = ()
-    max_concurrency: int = 1
 
     def payload(self, *, active_jobs: int = 0, execution_ids: list[str] | None = None) -> dict[str, Any]:
         return {
@@ -87,9 +86,7 @@ class RenderDevice:
             "path": self.path,
             "index": self.index,
             "encoders": list(self.encoders),
-            "max_concurrency": self.max_concurrency,
             "active_jobs": active_jobs,
-            "available_slots": max(0, self.max_concurrency - active_jobs),
             "status": "busy" if active_jobs else "idle",
             "execution_ids": execution_ids or [],
         }
@@ -135,7 +132,6 @@ def _hardware_encoder_available(
 def _windows_intel_devices(
     encoders: set[str],
     *,
-    device_capacity: int,
     ffmpeg_path: str,
 ) -> list[RenderDevice]:
     qsv_candidates = tuple(sorted(x for x in encoders if x.endswith("_qsv")))
@@ -173,23 +169,22 @@ def _windows_intel_devices(
             name=name,
             backend="qsv",
             encoders=qsv,
-            max_concurrency=device_capacity,
         )
     ]
 
 
-def _intel_devices(encoders: set[str], *, device_capacity: int, ffmpeg_path: str) -> list[RenderDevice]:
+def _intel_devices(encoders: set[str], *, ffmpeg_path: str) -> list[RenderDevice]:
     if os.name == "nt":
-        return _windows_intel_devices(encoders, device_capacity=device_capacity, ffmpeg_path=ffmpeg_path)
+        return _windows_intel_devices(encoders, ffmpeg_path=ffmpeg_path)
     paths = sorted(Path("/dev/dri").glob("renderD*")) if Path("/dev/dri").is_dir() else []
     vaapi = tuple(sorted(x for x in encoders if x.endswith("_vaapi")))
     return [
-        RenderDevice(id=f"vaapi:{path.name}", name=f"Intel/VAAPI {path.name}", backend="vaapi", path=str(path), encoders=vaapi, max_concurrency=device_capacity)
+        RenderDevice(id=f"vaapi:{path.name}", name=f"Intel/VAAPI {path.name}", backend="vaapi", path=str(path), encoders=vaapi)
         for path in paths
     ]
 
 
-def _nvidia_devices(encoders: set[str], *, device_capacity: int, ffmpeg_path: str) -> list[RenderDevice]:
+def _nvidia_devices(encoders: set[str], *, ffmpeg_path: str) -> list[RenderDevice]:
     nvenc = tuple(sorted(x for x in encoders if x.endswith("_nvenc")))
     if not nvenc:
         return []
@@ -225,7 +220,7 @@ def _nvidia_devices(encoders: set[str], *, device_capacity: int, ffmpeg_path: st
         )
         if not supported:
             continue
-        devices.append(RenderDevice(id=f"nvidia:{gpu_uuid}", name=parts[2], backend="nvidia", index=index, encoders=supported, max_concurrency=device_capacity))
+        devices.append(RenderDevice(id=f"nvidia:{gpu_uuid}", name=parts[2], backend="nvidia", index=index, encoders=supported))
     return devices
 
 
@@ -245,16 +240,13 @@ def probe_capabilities(settings: RenderWorkerSettings) -> tuple[dict[str, Any], 
             backend=backend,
             path=configured_device,
             encoders=tuple(sorted(x for x in encoders if x.endswith(f"_{backend}") or backend == "software")),
-            max_concurrency=settings.device_max_concurrency,
         ))
     else:
-        devices.extend(_intel_devices(encoders, device_capacity=settings.device_max_concurrency, ffmpeg_path=settings.ffmpeg_path))
-        devices.extend(_nvidia_devices(encoders, device_capacity=settings.device_max_concurrency, ffmpeg_path=settings.ffmpeg_path))
+        devices.extend(_intel_devices(encoders, ffmpeg_path=settings.ffmpeg_path))
+        devices.extend(_nvidia_devices(encoders, ffmpeg_path=settings.ffmpeg_path))
     if not devices:
         software = tuple(sorted(x for x in encoders if x in {"libx264", "libx265", "libsvtav1", "libaom-av1"}))
-        devices.append(RenderDevice(id="software:cpu", name=platform.processor() or "CPU", backend="software", encoders=software, max_concurrency=settings.device_max_concurrency))
-    detected_capacity = sum(device.max_concurrency for device in devices)
-    effective_capacity = detected_capacity
+        devices.append(RenderDevice(id="software:cpu", name=platform.processor() or "CPU", backend="software", encoders=software))
     union_encoders = sorted({encoder for device in devices for encoder in device.encoders})
     caps = {
         "backend": "multi" if len({device.backend for device in devices}) > 1 or len(devices) > 1 else devices[0].backend,
@@ -266,8 +258,7 @@ def probe_capabilities(settings: RenderWorkerSettings) -> tuple[dict[str, Any], 
     resources = {
         "hostname": socket.gethostname(),
         "cpu_count": os.cpu_count(),
-        "detected_capacity": detected_capacity,
-        "effective_capacity": effective_capacity,
+        "device_count": len(devices),
         "devices": [device.payload() for device in devices],
     }
     return caps, resources, devices
@@ -292,10 +283,10 @@ def select_device(devices: list[RenderDevice], active: dict[uuid.UUID, ActiveExe
         counts[item.device.id] = counts.get(item.device.id, 0) + 1
     candidates = [
         device for device in devices
-        if counts.get(device.id, 0) < device.max_concurrency and (not required or bool(required & set(device.encoders)))
+        if not required or bool(required & set(device.encoders))
     ]
     if not candidates:
-        raise RuntimeError("no local render device has a compatible free slot")
+        raise RuntimeError("no local render device supports the requested render")
     # Prefer hardware, then the least occupied device. Stable id breaks ties so
     # scheduling is deterministic and easy to diagnose.
     return min(candidates, key=lambda device: (device.backend == "software", counts.get(device.id, 0), device.id))
@@ -346,7 +337,10 @@ class RenderWorkerRuntime:
             "capabilities": self.capabilities,
             "resources": self.resources,
             "labels": {"standalone": True},
-            "max_concurrency": max(1, sum(device.max_concurrency for device in self.devices)),
+            # This is only the initial coordinator value for a newly enrolled
+            # worker. After enrollment, the coordinator-side admin setting is
+            # authoritative for total node concurrency.
+            "max_concurrency": self.settings.max_concurrency,
         }
         endpoint = "enroll" if token else "local-enroll"
         if token:
@@ -403,19 +397,11 @@ class RenderWorkerRuntime:
     def _claim(self) -> ClaimResponse:
         assert self.identity is not None
         with self._active_lock:
-            active = dict(self._active)
-            device_slots = sum(
-                max(0, device.max_concurrency - sum(1 for item in active.values() if item.device.id == device.id))
-                for device in self.devices
-            )
-            # Local admission follows discovered device slots. The coordinator's
-            # persisted worker.max_concurrency is the authoritative admin cap.
-            available = device_slots
-            free_devices = [
-                device for device in self.devices
-                if sum(1 for item in active.values() if item.device.id == device.id) < device.max_concurrency
-            ]
-            available_encoders = sorted({encoder for device in free_devices for encoder in device.encoders})
+            # The coordinator is the single source of truth for node-wide
+            # concurrency. A GPU can run multiple FFmpeg jobs; locally we only
+            # advertise whether another compatible job can be accepted.
+            available = 1 if self.devices else 0
+            available_encoders = sorted({encoder for device in self.devices for encoder in device.encoders})
         if available <= 0:
             return ClaimResponse()
         with httpx.Client(timeout=self.settings.request_timeout_seconds) as client:

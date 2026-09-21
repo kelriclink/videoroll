@@ -153,47 +153,42 @@ def test_windows_intel_device_reports_only_working_qsv_encoders(monkeypatch) -> 
     )
     devices = runtime._windows_intel_devices(
         {"h264_qsv", "hevc_qsv", "av1_qsv"},
-        device_capacity=2,
         ffmpeg_path="ffmpeg.exe",
     )
     assert len(devices) == 1
     assert devices[0].backend == "qsv"
     assert devices[0].encoders == ("h264_qsv", "hevc_qsv")
-    assert devices[0].max_concurrency == 2
 
 
-def test_probe_keeps_node_limit_separate_from_per_gpu_capacity(tmp_path: Path, monkeypatch) -> None:
+def test_probe_reports_devices_without_per_gpu_capacity(tmp_path: Path, monkeypatch) -> None:
     from videoroll.apps.render_worker import runtime
 
     monkeypatch.setattr(runtime, "_ffmpeg_supported_encoders", lambda _path: {"av1_nvenc"})
     monkeypatch.setattr(runtime, "_ffmpeg_supported_filters", lambda _path: set())
-    monkeypatch.setattr(runtime, "_intel_devices", lambda _encoders, device_capacity, ffmpeg_path: [])
+    monkeypatch.setattr(runtime, "_intel_devices", lambda _encoders, ffmpeg_path: [])
     monkeypatch.setattr(
         runtime, "_nvidia_devices",
-        lambda _encoders, device_capacity, ffmpeg_path: [
+        lambda _encoders, ffmpeg_path: [
             runtime.RenderDevice(
                 id="nvidia:0", name="GPU 0", backend="nvidia", index=0,
-                encoders=("av1_nvenc",), max_concurrency=device_capacity,
+                encoders=("av1_nvenc",),
             ),
             runtime.RenderDevice(
                 id="nvidia:1", name="GPU 1", backend="nvidia", index=1,
-                encoders=("av1_nvenc",), max_concurrency=device_capacity,
+                encoders=("av1_nvenc",),
             ),
         ],
     )
     _caps, resources, devices = runtime.probe_capabilities(
-        settings(
-            tmp_path,
-            RENDER_WORKER_MAX_CONCURRENCY=4,
-            RENDER_WORKER_DEVICE_MAX_CONCURRENCY=1,
-        )
+        settings(tmp_path, RENDER_WORKER_MAX_CONCURRENCY=4)
     )
-    assert [device.max_concurrency for device in devices] == [1, 1]
-    assert resources["detected_capacity"] == 2
-    assert resources["effective_capacity"] == 2
+    assert len(devices) == 2
+    assert resources["device_count"] == 2
+    assert all("max_concurrency" not in device.payload() for device in devices)
+    assert all("available_slots" not in device.payload() for device in devices)
 
 
-def test_claim_uses_device_slots_even_with_legacy_node_limit_one(tmp_path: Path, monkeypatch) -> None:
+def test_claim_stays_open_when_all_devices_already_have_jobs(tmp_path: Path, monkeypatch) -> None:
     from videoroll.apps.render_worker import runtime
 
     devices = [
@@ -235,11 +230,37 @@ def test_claim_uses_device_slots_even_with_legacy_node_limit_one(tmp_path: Path,
     monkeypatch.setattr(runtime.httpx, "Client", Client)
     worker = runtime.RenderWorkerRuntime(settings(tmp_path, RENDER_WORKER_MAX_CONCURRENCY=1))
     worker.identity = WorkerIdentity(uuid.uuid4(), "vrw_test")
+    worker._active = {
+        uuid.uuid4(): runtime.ActiveExecution(thread=threading.Thread(), device=devices[0]),
+        uuid.uuid4(): runtime.ActiveExecution(thread=threading.Thread(), device=devices[1]),
+    }
 
     claim = worker._claim()
 
     assert claim.execution is None
-    assert captured["available_slots"] == 2
+    assert captured["available_slots"] == 1
+    assert captured["available_encoders"] == ["av1_vaapi"]
+
+
+def test_select_device_balances_multiple_jobs_per_gpu() -> None:
+    from videoroll.apps.orchestrator_api.render_worker_schemas import RenderSpec
+    from videoroll.apps.render_worker.runtime import ActiveExecution, RenderDevice, select_device
+
+    gpu0 = RenderDevice(id="vaapi:renderD128", name="A380 #1", backend="vaapi", encoders=("av1_vaapi",))
+    gpu1 = RenderDevice(id="vaapi:renderD129", name="A380 #2", backend="vaapi", encoders=("av1_vaapi",))
+    spec = RenderSpec(
+        render_job_id=uuid.uuid4(),
+        task_id=uuid.uuid4(),
+        mode="burn_in",
+        request={"render": {"video_codec": "av1"}},
+    )
+    active = {
+        uuid.uuid4(): ActiveExecution(thread=threading.Thread(), device=gpu0),
+        uuid.uuid4(): ActiveExecution(thread=threading.Thread(), device=gpu0),
+        uuid.uuid4(): ActiveExecution(thread=threading.Thread(), device=gpu1),
+    }
+
+    assert select_device([gpu0, gpu1], active, spec).id == gpu1.id
 
 
 def test_cancellable_process_runner_terminates_child() -> None:

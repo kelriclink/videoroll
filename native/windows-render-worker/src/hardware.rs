@@ -12,7 +12,6 @@ pub struct Device {
     pub backend: String,
     pub index: Option<u32>,
     pub encoders: Vec<String>,
-    pub max_concurrency: usize,
 }
 
 impl Device {
@@ -24,9 +23,7 @@ impl Device {
             "path": "",
             "index": self.index,
             "encoders": self.encoders,
-            "max_concurrency": self.max_concurrency,
             "active_jobs": active_jobs,
-            "available_slots": self.max_concurrency.saturating_sub(active_jobs),
             "status": if active_jobs > 0 { "busy" } else { "idle" },
             "execution_ids": execution_ids,
         })
@@ -76,8 +73,7 @@ impl HardwareSnapshot {
         json!({
             "hostname": computer_name(),
             "cpu_count": std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1),
-            "detected_capacity": self.devices.iter().map(|d| d.max_concurrency).sum::<usize>(),
-            "effective_capacity": self.devices.iter().map(|d| d.max_concurrency).sum::<usize>(),
+            "device_count": self.devices.len(),
             "devices": device_payloads,
         })
     }
@@ -106,7 +102,6 @@ pub fn scan(ffmpeg: &Path) -> Result<HardwareSnapshot> {
             backend: "software".to_string(),
             index: None,
             encoders: software,
-            max_concurrency: 1,
         });
     }
 
@@ -146,7 +141,6 @@ fn scan_intel_qsv(ffmpeg: &Path, encoders: &BTreeSet<String>) -> Vec<Device> {
         backend: "qsv".to_string(),
         index: None,
         encoders: candidates,
-        max_concurrency: 1,
     }]
 }
 
@@ -202,7 +196,6 @@ fn scan_nvidia(ffmpeg: &Path, encoders: &BTreeSet<String>) -> Vec<Device> {
             backend: "nvidia".to_string(),
             index: Some(index),
             encoders: supported,
-            max_concurrency: 1,
         });
     }
     devices

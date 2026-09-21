@@ -80,6 +80,7 @@ class WorkerAdminRead(WorkerRead):
     stale: bool = False
     seconds_since_heartbeat: int = 0
     credential_active: bool = False
+    device_count: int = 0
     detected_capacity: int = 0
     effective_capacity: int = 0
     available_slots: int = 0

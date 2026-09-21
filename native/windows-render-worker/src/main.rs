@@ -232,8 +232,12 @@ impl eframe::App for RenderWorkerApp {
                     ui.text_edit_singleline(&mut self.config.node_name);
                     ui.end_row();
 
-                    ui.label("Max concurrency");
+                    ui.label("Initial node limit");
                     ui.add(egui::DragValue::new(&mut self.config.max_concurrency).range(1..=32));
+                    ui.end_row();
+
+                    ui.label("Runtime concurrency");
+                    ui.label("Managed by the VideoRoll server after pairing");
                     ui.end_row();
 
                     ui.label("Pairing");

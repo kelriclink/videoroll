@@ -130,21 +130,22 @@ def test_worker_heartbeat_does_not_reconcile_execution_lease(db: Session) -> Non
     assert execution.state in {"claimed", "running"}
 
 
-def test_worker_admin_capacity_uses_detected_device_slots(db: Session) -> None:
+def test_worker_admin_capacity_uses_node_management_limit(db: Session) -> None:
     worker = make_worker(db)
     worker.max_concurrency = 4
     worker.active_jobs = 1
     worker.resources = {
         "devices": [
-            {"max_concurrency": 1, "available_slots": 0},
-            {"max_concurrency": 1, "available_slots": 1},
+            {"id": "gpu0", "active_jobs": 1},
+            {"id": "gpu1", "active_jobs": 0},
         ]
     }
     db.add(worker); db.commit()
     payload = render_worker_service.worker_admin_payload(worker)
+    assert payload["device_count"] == 2
     assert payload["detected_capacity"] == 2
-    assert payload["effective_capacity"] == 2
-    assert payload["available_slots"] == 1
+    assert payload["effective_capacity"] == 4
+    assert payload["available_slots"] == 3
 
 
 def test_remote_reenrollment_preserves_admin_concurrency(db: Session) -> None:
@@ -160,7 +161,7 @@ def test_remote_reenrollment_preserves_admin_concurrency(db: Session) -> None:
             platform=existing.platform,
             architecture=existing.architecture,
             capabilities={"encoders": ["av1_nvenc"]},
-            resources={"detected_capacity": 2},
+            resources={"device_count": 2},
             max_concurrency=2,
             enrollment_token=token,
         ),
@@ -228,6 +229,26 @@ def test_worker_max_concurrency_is_enforced_by_coordinator(db: Session) -> None:
     second, spec = render_worker_service.claim_job(db, store(), worker.id, ["http"])
     assert second is None and spec is None
     assert db.get(RenderJob, second_job.id).status == RenderJobStatus.queued
+
+
+def test_worker_limit_four_allows_four_concurrent_claims(db: Session) -> None:
+    worker = make_worker(db)
+    worker.max_concurrency = 4
+    db.add(worker); db.commit()
+    jobs = [make_job(db, priority=10 - index) for index in range(5)]
+
+    claimed = [
+        render_worker_service.claim_job(db, store(), worker.id, ["http"])[0]
+        for _ in range(4)
+    ]
+    fifth, spec = render_worker_service.claim_job(db, store(), worker.id, ["http"])
+
+    assert all(execution is not None for execution in claimed)
+    assert {execution.render_job_id for execution in claimed if execution is not None} == {
+        job.id for job in jobs[:4]
+    }
+    assert fifth is None and spec is None
+    assert db.get(RenderJob, jobs[4].id).status == RenderJobStatus.queued
 
 
 def test_local_worker_preserves_admin_concurrency_setting(db: Session) -> None:

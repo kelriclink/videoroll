@@ -233,28 +233,19 @@ def worker_admin_payload(worker: RenderWorker) -> dict[str, Any]:
     age = max(0, int((utcnow() - seen).total_seconds()))
     resources = worker.resources or {}
     devices = resources.get("devices") if isinstance(resources.get("devices"), list) else []
-    detected_capacity = sum(
-        max(0, int(device.get("max_concurrency") or 0))
-        for device in devices
-        if isinstance(device, dict)
-    )
-    device_available_slots = sum(
-        max(0, int(device.get("available_slots") or 0))
-        for device in devices
-        if isinstance(device, dict)
-    )
-    effective_capacity = min(int(worker.max_concurrency or 0), detected_capacity) if detected_capacity else int(worker.max_concurrency or 0)
-    available_slots = min(
-        device_available_slots,
-        max(0, effective_capacity - int(worker.active_jobs or 0)),
-    ) if detected_capacity else max(0, effective_capacity - int(worker.active_jobs or 0))
+    device_count = len([device for device in devices if isinstance(device, dict)])
+    effective_capacity = int(worker.max_concurrency or 0)
+    available_slots = max(0, effective_capacity - int(worker.active_jobs or 0))
     return {
         "id": worker.id, "worker_key": worker.worker_key, "name": worker.name, "platform": worker.platform,
         "architecture": worker.architecture, "version": worker.version, "protocol_version": worker.protocol_version,
         "render_spec_versions": worker.render_spec_versions or [], "capabilities": worker.capabilities or {},
         "resources": worker.resources or {}, "labels": worker.labels or {}, "status": worker.status,
         "enabled": worker.enabled, "draining": worker.draining, "max_concurrency": worker.max_concurrency,
-        "active_jobs": worker.active_jobs, "detected_capacity": detected_capacity,
+        "active_jobs": worker.active_jobs, "device_count": device_count,
+        # Legacy field retained for API compatibility. It now represents the
+        # number of detected schedulable devices, not a hard concurrency cap.
+        "detected_capacity": device_count,
         "effective_capacity": effective_capacity, "available_slots": available_slots,
         "last_seen_at": worker.last_seen_at,
         "stale": age > WORKER_STALE_SECONDS, "seconds_since_heartbeat": age,
