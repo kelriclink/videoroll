@@ -22,7 +22,8 @@ from videoroll.db.models import AppSetting, Asset, RenderExecution, RenderJob, R
 from videoroll.storage.filesystem import FileStore, StorageObjectNotFound
 from videoroll.utils.auto_youtube import parse_auto_youtube_created_by
 
-LEASE_SECONDS = 90
+LEASE_SECONDS = 180
+WORKER_STALE_SECONDS = 180
 ACTIVE_EXECUTION_STATES = ("claimed", "running", "uploading")
 REMOTE_LOCK_PREFIX = "render-worker:"
 ENROLLMENT_PREFIX = "vre_"
@@ -77,10 +78,13 @@ def enroll_worker(db: Session, payload: Any) -> tuple[RenderWorker, str]:
     if enrollment is None or enrollment.status != "active" or (_utc(enrollment.expires_at) or now) <= now:
         raise HTTPException(401, "invalid or expired enrollment token")
     worker = db.query(RenderWorker).filter(RenderWorker.worker_key == payload.worker_key).with_for_update().one_or_none()
+    existing_max_concurrency = int(worker.max_concurrency) if worker is not None else None
     if worker is None:
         worker = RenderWorker(worker_key=payload.worker_key, name=payload.name, platform=payload.platform)
     for key in ("name","platform","architecture","version","protocol_version","render_spec_versions","capabilities","resources","labels","max_concurrency"):
         setattr(worker, key, getattr(payload, key))
+    if existing_max_concurrency is not None:
+        worker.max_concurrency = existing_max_concurrency
     credential = WORKER_CREDENTIAL_PREFIX + secrets.token_urlsafe(48)
     worker.credential_hash = _secret_hash(credential)
     worker.credential_issued_at = now
@@ -204,7 +208,6 @@ def reconcile_worker_executions(db: Session, worker_id: uuid.UUID) -> int:
 
 def heartbeat_worker(db: Session, worker_id: uuid.UUID, payload: Any) -> RenderWorker:
     row = get_worker(db, worker_id, lock=True)
-    reconcile_worker_executions(db, row.id)
     row.status = payload.status
     row.draining = payload.status == "draining" or row.draining
     row.resources = payload.resources
@@ -228,14 +231,33 @@ def list_workers(db: Session) -> list[RenderWorker]:
 def worker_admin_payload(worker: RenderWorker) -> dict[str, Any]:
     seen = _utc(worker.last_seen_at) or utcnow()
     age = max(0, int((utcnow() - seen).total_seconds()))
+    resources = worker.resources or {}
+    devices = resources.get("devices") if isinstance(resources.get("devices"), list) else []
+    detected_capacity = sum(
+        max(0, int(device.get("max_concurrency") or 0))
+        for device in devices
+        if isinstance(device, dict)
+    )
+    device_available_slots = sum(
+        max(0, int(device.get("available_slots") or 0))
+        for device in devices
+        if isinstance(device, dict)
+    )
+    effective_capacity = min(int(worker.max_concurrency or 0), detected_capacity) if detected_capacity else int(worker.max_concurrency or 0)
+    available_slots = min(
+        device_available_slots,
+        max(0, effective_capacity - int(worker.active_jobs or 0)),
+    ) if detected_capacity else max(0, effective_capacity - int(worker.active_jobs or 0))
     return {
         "id": worker.id, "worker_key": worker.worker_key, "name": worker.name, "platform": worker.platform,
         "architecture": worker.architecture, "version": worker.version, "protocol_version": worker.protocol_version,
         "render_spec_versions": worker.render_spec_versions or [], "capabilities": worker.capabilities or {},
         "resources": worker.resources or {}, "labels": worker.labels or {}, "status": worker.status,
         "enabled": worker.enabled, "draining": worker.draining, "max_concurrency": worker.max_concurrency,
-        "active_jobs": worker.active_jobs, "last_seen_at": worker.last_seen_at,
-        "stale": age > LEASE_SECONDS * 2, "seconds_since_heartbeat": age,
+        "active_jobs": worker.active_jobs, "detected_capacity": detected_capacity,
+        "effective_capacity": effective_capacity, "available_slots": available_slots,
+        "last_seen_at": worker.last_seen_at,
+        "stale": age > WORKER_STALE_SECONDS, "seconds_since_heartbeat": age,
         "credential_active": bool(worker.credential_hash and worker.credential_revoked_at is None),
     }
 
@@ -431,16 +453,27 @@ def heartbeat_execution(db: Session, execution_id: uuid.UUID, payload: Any) -> R
     now = utcnow()
     lease_until = _utc(execution.lease_until)
     if lease_until is not None and lease_until <= now: raise HTTPException(409, "render execution lease expired")
+    job = db.get(RenderJob, execution.render_job_id)
+    if job is None or job.lease_owner != f"{REMOTE_LOCK_PREFIX}{execution.id}": raise HTTPException(409, "render job ownership lost")
     execution.state = "running"; execution.heartbeat_at = now; execution.lease_until = now + timedelta(seconds=LEASE_SECONDS)
     execution.metrics = payload.metrics
     if payload.progress is not None: execution.progress = payload.progress
+    # Persist the execution lease first. Periodic heartbeats must not be held
+    # hostage by unrelated RenderJob/Task row locks or recovery bookkeeping.
+    db.add(execution); db.commit(); db.refresh(execution)
+    if payload.progress is None:
+        return execution
+
+    # Progress propagation is secondary to lease renewal. If this commit waits
+    # on a business row lock, the execution lease above is already durable.
     job = db.get(RenderJob, execution.render_job_id)
-    if job is None or job.lease_owner != f"{REMOTE_LOCK_PREFIX}{execution.id}": raise HTTPException(409, "render job ownership lost")
-    job.heartbeat_at = now; job.lease_until = execution.lease_until
-    if payload.progress is not None: job.progress = payload.progress
-    task = db.get(Task, job.task_id)
-    if task is not None and task.lock_owner == job.lease_owner: task.lock_until = execution.lease_until; db.add(task)
-    db.add_all([execution, job]); db.commit(); db.refresh(execution); return execution
+    if job is None or job.lease_owner != f"{REMOTE_LOCK_PREFIX}{execution.id}":
+        raise HTTPException(409, "render job ownership lost")
+    job.heartbeat_at = now
+    job.lease_until = execution.lease_until
+    job.progress = payload.progress
+    db.add(job); db.commit()
+    return execution
 
 def append_log(db: Session, execution_id: uuid.UUID, fence_token: str, text: str) -> RenderExecution:
     execution = get_execution(db, execution_id, lock=True); validate_fence(execution, fence_token)

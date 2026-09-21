@@ -47,12 +47,22 @@ export default function RenderManagementPage() {
 
   const online = workers.filter((w) => w.enabled && !w.stale).length;
   const active = executions.filter((e) => ACTIVE.has(e.state)).length;
-  const failed = executions.filter((e) => ["failed", "lost"].includes(e.state)).length;
-  const capacity = workers.filter((w) => w.enabled && !w.stale && !w.draining).reduce((n, w) => n + w.max_concurrency, 0);
+  const recentFailureCutoff = Date.now() - 60 * 60 * 1000;
+  const failed = executions.filter((e) => {
+    if (!["failed", "lost"].includes(e.state)) return false;
+    const stamp = e.finished_at ?? e.heartbeat_at ?? e.started_at;
+    return stamp ? new Date(stamp).getTime() >= recentFailureCutoff : false;
+  }).length;
+  const schedulableWorkers = workers.filter((w) => w.enabled && !w.stale && !w.draining);
+  const capacity = schedulableWorkers.reduce((n, w) => n + (w.effective_capacity ?? w.max_concurrency), 0);
+  const available = schedulableWorkers.reduce(
+    (n, w) => n + (w.available_slots ?? Math.max(0, (w.effective_capacity ?? w.max_concurrency) - w.active_jobs)),
+    0,
+  );
   const stats = useMemo(() => [
     ["在线节点", `${online} / ${workers.length}`], ["活动执行", String(active)],
-    ["可用并发", String(capacity)], ["异常执行", String(failed)],
-  ], [online, workers.length, active, capacity, failed]);
+    ["GPU 槽位", `${available} / ${capacity}`], ["近 1h 异常", String(failed)],
+  ], [online, workers.length, active, available, capacity, failed]);
 
   async function workerAction(worker: RenderWorker, patch: { enabled?: boolean; draining?: boolean; max_concurrency?: number }) {
     setBusy(worker.id);
@@ -120,7 +130,7 @@ export default function RenderManagementPage() {
           return <div key={w.id} className="rounded-xl border border-slate-200 p-4 dark:border-slate-800">
             <div className="flex items-start justify-between gap-3"><div><div className="font-medium">{w.name}</div><div className="mt-1 text-xs text-slate-500">{w.platform}{w.architecture ? ` · ${w.architecture}` : ""} · {value(gpu)}</div></div>
               <span className={`rounded-full px-2 py-1 text-xs ${badge(w.stale ? "offline" : w.status)}`}>{w.stale ? "失联" : w.draining ? "Drain" : w.status}</span></div>
-            <div className="mt-4 grid grid-cols-4 gap-3 text-xs"><div><div className="text-slate-500">运行中</div><div className="mt-1 font-medium">{w.active_jobs}</div></div><label><div className="text-slate-500">最大并发</div><input type="number" min={1} max={32} defaultValue={w.max_concurrency} disabled={busy === w.id} onBlur={(e) => { const n = Math.max(1, Math.min(32, Number(e.currentTarget.value) || 1)); if (n !== w.max_concurrency) void workerAction(w, { max_concurrency: n }); }} className="mt-1 w-16 rounded border border-slate-300 px-2 py-1 font-medium" /></label><div><div className="text-slate-500">速度</div><div className="mt-1 font-medium">{value(fps)} FPS</div></div><div><div className="text-slate-500">心跳</div><div className="mt-1 font-medium">{ago(w.last_seen_at)}</div></div></div>
+            <div className="mt-4 grid grid-cols-5 gap-3 text-xs"><div><div className="text-slate-500">运行中</div><div className="mt-1 font-medium">{w.active_jobs}</div></div><label><div className="text-slate-500">管理上限</div><input type="number" min={1} max={32} defaultValue={w.max_concurrency} disabled={busy === w.id} onBlur={(e) => { const n = Math.max(1, Math.min(32, Number(e.currentTarget.value) || 1)); if (n !== w.max_concurrency) void workerAction(w, { max_concurrency: n }); }} className="mt-1 w-16 rounded border border-slate-300 px-2 py-1 font-medium" /></label><div><div className="text-slate-500">有效槽位</div><div className="mt-1 font-medium">{w.available_slots ?? 0} / {w.effective_capacity ?? w.max_concurrency}</div></div><div><div className="text-slate-500">速度</div><div className="mt-1 font-medium">{value(fps)} FPS</div></div><div><div className="text-slate-500">心跳</div><div className="mt-1 font-medium">{ago(w.last_seen_at)}</div></div></div>
             {devices.length ? <div className="mt-4 space-y-2">
               {devices.map((device) => <div key={device.id} className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 dark:border-slate-700 dark:bg-slate-900">
                 <div className="flex items-center justify-between gap-3"><div><div className="text-xs font-medium">{device.name}</div><div className="mt-0.5 font-mono text-[11px] text-slate-500">{device.id}{device.path ? ` · ${device.path}` : ""} · {device.backend}</div></div><span className={`rounded-full px-2 py-0.5 text-[11px] ${badge(device.status)}`}>{device.status}</span></div>

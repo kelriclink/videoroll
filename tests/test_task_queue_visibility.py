@@ -13,8 +13,10 @@ from videoroll.apps.subtitle_service.worker import TASK_QUEUE_LOCK_OWNER
 from videoroll.db.base import Base
 from videoroll.db.models import (
     AppSetting,
+    RenderExecution,
     RenderJob,
     RenderJobStatus,
+    RenderWorker,
     SourceLicense,
     SourceType,
     SubtitleJob,
@@ -32,7 +34,14 @@ def _compile_jsonb_for_sqlite(_type: JSONB, _compiler: object, **_kwargs: object
 @pytest.fixture
 def db() -> Session:
     engine = create_engine("sqlite:///:memory:")
-    tables = [Task.__table__, AppSetting.__table__, SubtitleJob.__table__, RenderJob.__table__]
+    tables = [
+        Task.__table__,
+        AppSetting.__table__,
+        SubtitleJob.__table__,
+        RenderJob.__table__,
+        RenderWorker.__table__,
+        RenderExecution.__table__,
+    ]
     Base.metadata.create_all(engine, tables=tables)
     session = sessionmaker(bind=engine)()
     try:

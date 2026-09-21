@@ -12,6 +12,7 @@ export type RenderWorker = {
   version: string; protocol_version: number; render_spec_versions: number[];
   capabilities: Record<string, unknown>; resources: Record<string, unknown>; labels: Record<string, unknown>;
   status: string; enabled: boolean; draining: boolean; max_concurrency: number; active_jobs: number;
+  detected_capacity?: number; effective_capacity?: number; available_slots?: number;
   last_seen_at: string; stale: boolean; seconds_since_heartbeat: number; credential_active: boolean;
 };
 

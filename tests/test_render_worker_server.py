@@ -6,16 +6,16 @@ import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 from videoroll.apps.orchestrator_api.render_worker_schemas import (
-    ExecutionAdminActionRequest, ExecutionFailRequest, ExecutionHeartbeatRequest, WorkerRegisterRequest,
+    ExecutionAdminActionRequest, ExecutionFailRequest, ExecutionHeartbeatRequest, WorkerEnrollRequest, WorkerHeartbeatRequest, WorkerRegisterRequest,
 )
 from videoroll.apps.orchestrator_api.services import render_worker_service
 from videoroll.db.base import Base
-from videoroll.db.models import Asset, RenderExecution, RenderJob, RenderJobStatus, RenderWorker, SourceLicense, SourceType, Task, TaskStatus
+from videoroll.db.models import Asset, RenderExecution, RenderJob, RenderJobStatus, RenderWorker, RenderWorkerEnrollment, SourceLicense, SourceType, Task, TaskStatus
 
 @pytest.fixture
 def db() -> Session:
     engine = create_engine("sqlite:///:memory:")
-    Base.metadata.create_all(engine, tables=[Task.__table__, Asset.__table__, RenderJob.__table__, RenderWorker.__table__, RenderExecution.__table__])
+    Base.metadata.create_all(engine, tables=[Task.__table__, Asset.__table__, RenderJob.__table__, RenderWorker.__table__, RenderExecution.__table__, RenderWorkerEnrollment.__table__])
     session = sessionmaker(bind=engine)()
     try:
         yield session
@@ -69,6 +69,19 @@ def test_execution_heartbeat_renews_job_and_execution_lease(db: Session) -> None
     db.refresh(job)
     assert job.progress == 37 and job.lease_until == result.lease_until
 
+
+def test_execution_heartbeat_without_progress_renews_only_execution_lease(db: Session) -> None:
+    worker = make_worker(db); job = make_job(db)
+    execution, _ = render_worker_service.claim_job(db, store(), worker.id, ["http"])
+    assert execution is not None
+    original_job_lease = job.lease_until
+    result = render_worker_service.heartbeat_execution(db, execution.id, ExecutionHeartbeatRequest(
+        fence_token=execution.fence_token, progress=None, metrics={"device_id": "gpu0"},
+    ))
+    assert result.lease_until is not None
+    db.refresh(job)
+    assert job.lease_until == original_job_lease
+
 def test_stale_fence_token_cannot_mutate_execution(db: Session) -> None:
     worker = make_worker(db); make_job(db)
     execution, _ = render_worker_service.claim_job(db, store(), worker.id, ["http"])
@@ -100,6 +113,61 @@ def test_expired_execution_is_reconciled_and_releases_worker_capacity(db: Sessio
     assert render_worker_service.reconcile_worker_executions(db, worker.id) == 1
     db.commit(); db.refresh(execution)
     assert execution.state == "lost"
+
+
+def test_worker_heartbeat_does_not_reconcile_execution_lease(db: Session) -> None:
+    worker = make_worker(db); make_job(db)
+    execution, _ = render_worker_service.claim_job(db, store(), worker.id, ["http"])
+    assert execution is not None
+    execution.lease_until = datetime.now(timezone.utc) - timedelta(seconds=1)
+    db.add(execution); db.commit()
+    render_worker_service.heartbeat_worker(
+        db,
+        worker.id,
+        WorkerHeartbeatRequest(status="busy", resources={"devices": []}),
+    )
+    db.refresh(execution)
+    assert execution.state in {"claimed", "running"}
+
+
+def test_worker_admin_capacity_uses_detected_device_slots(db: Session) -> None:
+    worker = make_worker(db)
+    worker.max_concurrency = 4
+    worker.active_jobs = 1
+    worker.resources = {
+        "devices": [
+            {"max_concurrency": 1, "available_slots": 0},
+            {"max_concurrency": 1, "available_slots": 1},
+        ]
+    }
+    db.add(worker); db.commit()
+    payload = render_worker_service.worker_admin_payload(worker)
+    assert payload["detected_capacity"] == 2
+    assert payload["effective_capacity"] == 2
+    assert payload["available_slots"] == 1
+
+
+def test_remote_reenrollment_preserves_admin_concurrency(db: Session) -> None:
+    existing = make_worker(db)
+    existing.max_concurrency = 1
+    db.add(existing); db.commit()
+    _enrollment, token = render_worker_service.create_enrollment(db, label="re-pair", ttl_minutes=30)
+    enrolled, _credential = render_worker_service.enroll_worker(
+        db,
+        WorkerEnrollRequest(
+            worker_key=existing.worker_key,
+            name=existing.name,
+            platform=existing.platform,
+            architecture=existing.architecture,
+            capabilities={"encoders": ["av1_nvenc"]},
+            resources={"detected_capacity": 2},
+            max_concurrency=2,
+            enrollment_token=token,
+        ),
+    )
+    assert enrolled.id == existing.id
+    assert enrolled.max_concurrency == 1
+
 
 def test_admin_cancel_fences_running_execution(db: Session) -> None:
     worker = make_worker(db); job = make_job(db)

@@ -10,6 +10,7 @@ import logging
 import os
 import random
 import re
+import signal
 import shutil
 import subprocess
 import sys
@@ -224,62 +225,93 @@ def _run_logged(
     log_path: Path | None,
     live_upload_cb: Callable[[], None] | None = None,
     live_upload_interval_seconds: float = 3.0,
+    cancel_event: threading.Event | None = None,
 ) -> None:
-    if log_path is None:
+    if log_path is None and live_upload_cb is None and cancel_event is None:
         _run(cmd)
         return
 
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        f = log_path.open("ab")
-    except Exception:
-        # If logging can't even open the file, still run the command so the pipeline doesn't break.
-        _run(cmd)
-        return
-
-    with f:
+    file_context = nullcontext(None)
+    if log_path is not None:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
         try:
-            f.write(("\n$ " + " ".join(cmd) + "\n").encode("utf-8", errors="replace"))
-            f.flush()
+            file_context = log_path.open("ab")
         except Exception:
-            pass
+            # Logging is optional. Cancellation still needs a controllable child
+            # process, so do not fall back to blocking subprocess.run here.
+            file_context = nullcontext(None)
 
-        if live_upload_cb is None:
-            subprocess.run(cmd, check=True, stdout=f, stderr=f)
-            return
+    with file_context as f:
+        if f is not None:
+            try:
+                f.write(("\n$ " + " ".join(cmd) + "\n").encode("utf-8", errors="replace"))
+                f.flush()
+            except Exception:
+                pass
 
-        try:
-            proc = subprocess.Popen(cmd, stdout=f, stderr=f)
-        except Exception:
-            # If we can't start the process with live upload, fall back to the simple runner.
-            subprocess.run(cmd, check=True, stdout=f, stderr=f)
-            return
+        popen_kwargs: dict[str, Any] = {
+            "stdout": f if f is not None else None,
+            "stderr": f if f is not None else None,
+        }
+        if os.name == "nt":
+            popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        else:
+            popen_kwargs["start_new_session"] = True
 
+        proc = subprocess.Popen(cmd, **popen_kwargs)
         interval = float(live_upload_interval_seconds or 0)
         if interval <= 0:
             interval = 3.0
-        # Keep it responsive without busy-looping.
         tick_sleep = min(0.25, interval)
-
         next_upload_at = time.monotonic() + interval
+        cancelled = False
+
         while True:
             rc = proc.poll()
+            if rc is not None:
+                break
+
+            if cancel_event is not None and cancel_event.is_set():
+                cancelled = True
+                try:
+                    if os.name == "nt":
+                        proc.terminate()
+                    else:
+                        os.killpg(proc.pid, signal.SIGTERM)
+                    proc.wait(timeout=5)
+                except Exception:
+                    try:
+                        if os.name == "nt":
+                            proc.kill()
+                        else:
+                            os.killpg(proc.pid, signal.SIGKILL)
+                    except Exception:
+                        pass
+                rc = proc.poll()
+                if rc is None:
+                    try:
+                        rc = proc.wait(timeout=5)
+                    except Exception:
+                        rc = -1
+                break
+
             now = time.monotonic()
-            if now >= next_upload_at:
+            if live_upload_cb is not None and now >= next_upload_at:
                 try:
                     live_upload_cb()
                 except Exception:
                     pass
                 next_upload_at = now + interval
-            if rc is not None:
-                break
             time.sleep(tick_sleep)
 
-        try:
-            live_upload_cb()
-        except Exception:
-            pass
+        if live_upload_cb is not None:
+            try:
+                live_upload_cb()
+            except Exception:
+                pass
 
+        if cancelled:
+            raise RuntimeError("render process canceled")
         if rc != 0:
             raise subprocess.CalledProcessError(int(rc), cmd)
 
@@ -2994,6 +3026,7 @@ def render_burn_in(
     crf: int | None = None,
     log_path: Path | None = None,
     live_upload_cb: Callable[[], None] | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     codec = str(video_codec or "").strip().lower() or "av1"
@@ -3270,7 +3303,12 @@ def render_burn_in(
                 str(output_path),
             ]
             try:
-                _run_logged(overlay_cmd, log_path=log_path, live_upload_cb=live_upload_cb)
+                _run_logged(
+                    overlay_cmd,
+                    log_path=log_path,
+                    live_upload_cb=live_upload_cb,
+                    cancel_event=cancel_event,
+                )
             except (OSError, subprocess.CalledProcessError) as exc:
                 # Driver/format support varies across Intel generations. The fast
                 # overlay path is attempted for 8/10-bit and hardware/software
@@ -3296,7 +3334,12 @@ def render_burn_in(
                     "copy",
                     str(output_path),
                 ]
-                _run_logged(legacy_cmd, log_path=log_path, live_upload_cb=live_upload_cb)
+                _run_logged(
+                    legacy_cmd,
+                    log_path=log_path,
+                    live_upload_cb=live_upload_cb,
+                    cancel_event=cancel_event,
+                )
         else:
             cmd.extend(
                 [
@@ -3310,7 +3353,12 @@ def render_burn_in(
                     str(output_path),
                 ]
             )
-            _run_logged(cmd, log_path=log_path, live_upload_cb=live_upload_cb)
+            _run_logged(
+                cmd,
+                log_path=log_path,
+                live_upload_cb=live_upload_cb,
+                cancel_event=cancel_event,
+            )
     finally:
         if overlay_ass_path is not None:
             try:
@@ -3327,6 +3375,7 @@ def mux_soft_sub(
     *,
     log_path: Path | None = None,
     live_upload_cb: Callable[[], None] | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     cmd = [
@@ -3350,7 +3399,12 @@ def mux_soft_sub(
         "language=chi",
         str(output_path),
     ]
-    _run_logged(cmd, log_path=log_path, live_upload_cb=live_upload_cb)
+    _run_logged(
+        cmd,
+        log_path=log_path,
+        live_upload_cb=live_upload_cb,
+        cancel_event=cancel_event,
+    )
 
 
 def write_json(path: Path, data: Any) -> None:

@@ -10,7 +10,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Sequence
 
 from celery.app.control import flatten_reply
-from sqlalchemy import or_, update
+from sqlalchemy import exists, or_, update
 from sqlalchemy.orm import Session
 
 from videoroll.apps.subtitle_service.render_queue_store import get_task_queue_settings
@@ -18,6 +18,7 @@ from videoroll.apps.subtitle_service.queues import SUBTITLE_WORK_QUEUE
 from videoroll.db.models import (
     PublishJob,
     PublishState,
+    RenderExecution,
     RenderJob,
     RenderJobStatus,
     SubtitleJob,
@@ -33,6 +34,8 @@ _RUNTIME_CONTROL_TIMEOUT_SECONDS = 1.5
 _SUBTITLE_QUEUE_NAME = SUBTITLE_WORK_QUEUE
 _MIN_JOB_LEASE_SECONDS = 1
 _MAX_JOB_LEASE_SECONDS = 3600
+_RENDER_EXECUTION_REQUEUE_GRACE = timedelta(seconds=30)
+_ACTIVE_RENDER_EXECUTION_STATES = ("claimed", "running", "uploading")
 
 
 @dataclass(frozen=True)
@@ -207,6 +210,27 @@ def live_leased_task_ids(db: Session, now: datetime) -> set[uuid.UUID]:
             .all()
         )
     )
+    # Remote render workers renew RenderExecution first so their liveness does
+    # not depend on taking RenderJob/Task row locks. Keep those tasks reserved
+    # by the authoritative execution lease even when the mirrored job lease is
+    # older.
+    task_ids.update(
+        task_id
+        for task_id, in (
+            db.query(RenderJob.task_id)
+            .join(RenderExecution, RenderExecution.render_job_id == RenderJob.id)
+            .join(Task, Task.id == RenderJob.task_id)
+            .filter(
+                task_filter,
+                RenderJob.status == RenderJobStatus.running,
+                RenderExecution.state.in_(_ACTIVE_RENDER_EXECUTION_STATES),
+                RenderExecution.lease_until.is_not(None),
+                RenderExecution.lease_until > now,
+            )
+            .distinct()
+            .all()
+        )
+    )
     return task_ids
 
 
@@ -274,6 +298,15 @@ def recover_expired_leases(
 
     remaining -= subtitle_requeued
     if remaining:
+        execution_grace_cutoff = now - _RENDER_EXECUTION_REQUEUE_GRACE
+        live_or_recent_execution = exists().where(
+            RenderExecution.render_job_id == RenderJob.id,
+            RenderExecution.state.in_(_ACTIVE_RENDER_EXECUTION_STATES),
+            or_(
+                RenderExecution.lease_until.is_(None),
+                RenderExecution.lease_until > execution_grace_cutoff,
+            ),
+        )
         render_jobs = (
             db.query(RenderJob)
             .join(Task, Task.id == RenderJob.task_id)
@@ -282,6 +315,7 @@ def recover_expired_leases(
                 RenderJob.status == RenderJobStatus.running,
                 RenderJob.lease_until.is_not(None),
                 RenderJob.lease_until <= now,
+                ~live_or_recent_execution,
             )
             .order_by(RenderJob.lease_until.asc(), RenderJob.created_at.asc())
             .with_for_update(skip_locked=True)
@@ -289,6 +323,22 @@ def recover_expired_leases(
             .all()
         )
         for job in render_jobs:
+            expired_executions = (
+                db.query(RenderExecution)
+                .filter(
+                    RenderExecution.render_job_id == job.id,
+                    RenderExecution.state.in_(_ACTIVE_RENDER_EXECUTION_STATES),
+                    RenderExecution.lease_until.is_not(None),
+                    RenderExecution.lease_until <= execution_grace_cutoff,
+                )
+                .with_for_update(skip_locked=True)
+                .all()
+            )
+            for execution in expired_executions:
+                execution.state = "lost"
+                execution.finished_at = now
+                execution.error_message = execution.error_message or "render execution lease expired"
+                db.add(execution)
             job.status = RenderJobStatus.queued
             job.progress = 0
             job.retry_count = int(job.retry_count or 0) + 1

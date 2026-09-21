@@ -144,7 +144,9 @@ class WindowsRenderWorkerApp:
         self.server_url = tk.StringVar(value=str(saved.get("server_url") or ""))
         self.enrollment_token = tk.StringVar(value="")
         self.node_name = tk.StringVar(value=str(saved.get("node_name") or socket.gethostname()))
-        self.max_concurrency = tk.IntVar(value=int(saved.get("max_concurrency") or 1))
+        self.device_max_concurrency = tk.IntVar(
+            value=int(saved.get("device_max_concurrency") or saved.get("max_concurrency") or 1)
+        )
         self.status = tk.StringVar(value="已停止")
         self.ffmpeg_status = tk.StringVar(value=_bundled_ffmpeg())
 
@@ -191,11 +193,11 @@ class WindowsRenderWorkerApp:
         ttk.Label(form, text="节点名称").grid(row=2, column=0, sticky=tk.W, padx=(0, 8), pady=5)
         ttk.Entry(form, textvariable=self.node_name).grid(row=2, column=1, sticky=tk.EW, pady=5)
 
-        ttk.Label(form, text="最大并发").grid(row=3, column=0, sticky=tk.W, padx=(0, 8), pady=5)
-        ttk.Spinbox(form, from_=1, to=32, textvariable=self.max_concurrency, width=8).grid(
+        ttk.Label(form, text="单设备并发").grid(row=3, column=0, sticky=tk.W, padx=(0, 8), pady=5)
+        ttk.Spinbox(form, from_=1, to=8, textvariable=self.device_max_concurrency, width=8).grid(
             row=3, column=1, sticky=tk.W, pady=5
         )
-        ttk.Label(form, text="节点总并发上限；GPU 由节点内部自动分配").grid(
+        ttk.Label(form, text="每张 GPU 的本地槽位；节点总上限在服务器渲染节点页面管理").grid(
             row=3, column=2, sticky=tk.W, padx=(8, 0)
         )
 
@@ -243,7 +245,10 @@ class WindowsRenderWorkerApp:
             RENDER_WORKER_NAME=node_name,
             RENDER_WORKER_BACKEND="auto",
             RENDER_WORKER_GPU_DEVICE="",
-            RENDER_WORKER_MAX_CONCURRENCY=max(1, min(32, int(self.max_concurrency.get()))),
+            RENDER_WORKER_MAX_CONCURRENCY=32,
+            RENDER_WORKER_DEVICE_MAX_CONCURRENCY=max(
+                1, min(8, int(self.device_max_concurrency.get()))
+            ),
             RENDER_WORKER_WORK_DIR=str(_work_dir()),
             FFMPEG_PATH=ffmpeg_path,
         )
@@ -253,7 +258,9 @@ class WindowsRenderWorkerApp:
             {
                 "server_url": _normalize_server_url(self.server_url.get()),
                 "node_name": self.node_name.get().strip() or socket.gethostname(),
-                "max_concurrency": max(1, min(32, int(self.max_concurrency.get()))),
+                "device_max_concurrency": max(
+                    1, min(8, int(self.device_max_concurrency.get()))
+                ),
             }
         )
 

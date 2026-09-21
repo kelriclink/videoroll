@@ -80,6 +80,9 @@ class WorkerAdminRead(WorkerRead):
     stale: bool = False
     seconds_since_heartbeat: int = 0
     credential_active: bool = False
+    detected_capacity: int = 0
+    effective_capacity: int = 0
+    available_slots: int = 0
 
 class WorkerControlRequest(BaseModel):
     enabled: bool | None = None

@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import json
+import sys
+import threading
 import uuid
 from pathlib import Path
 from unittest.mock import Mock
+
+import pytest
 
 from videoroll.apps.render_worker.runtime import RenderWorkerRuntime, WorkerIdentity, _api_base, _worker_key
 from videoroll.config import RenderWorkerSettings
@@ -149,7 +153,7 @@ def test_windows_intel_device_reports_only_working_qsv_encoders(monkeypatch) -> 
     )
     devices = runtime._windows_intel_devices(
         {"h264_qsv", "hevc_qsv", "av1_qsv"},
-        max_concurrency=2,
+        device_capacity=2,
         ffmpeg_path="ffmpeg.exe",
     )
     assert len(devices) == 1
@@ -158,26 +162,94 @@ def test_windows_intel_device_reports_only_working_qsv_encoders(monkeypatch) -> 
     assert devices[0].max_concurrency == 2
 
 
-def test_probe_assigns_node_concurrency_to_each_gpu(tmp_path: Path, monkeypatch) -> None:
+def test_probe_keeps_node_limit_separate_from_per_gpu_capacity(tmp_path: Path, monkeypatch) -> None:
     from videoroll.apps.render_worker import runtime
 
     monkeypatch.setattr(runtime, "_ffmpeg_supported_encoders", lambda _path: {"av1_nvenc"})
     monkeypatch.setattr(runtime, "_ffmpeg_supported_filters", lambda _path: set())
-    monkeypatch.setattr(runtime, "_intel_devices", lambda _encoders, max_concurrency, ffmpeg_path: [])
+    monkeypatch.setattr(runtime, "_intel_devices", lambda _encoders, device_capacity, ffmpeg_path: [])
     monkeypatch.setattr(
         runtime, "_nvidia_devices",
-        lambda _encoders, max_concurrency, ffmpeg_path: [
+        lambda _encoders, device_capacity, ffmpeg_path: [
             runtime.RenderDevice(
                 id="nvidia:0", name="GPU 0", backend="nvidia", index=0,
-                encoders=("av1_nvenc",), max_concurrency=max_concurrency,
+                encoders=("av1_nvenc",), max_concurrency=device_capacity,
             ),
             runtime.RenderDevice(
                 id="nvidia:1", name="GPU 1", backend="nvidia", index=1,
-                encoders=("av1_nvenc",), max_concurrency=max_concurrency,
+                encoders=("av1_nvenc",), max_concurrency=device_capacity,
             ),
         ],
     )
-    _caps, _resources, devices = runtime.probe_capabilities(
-        settings(tmp_path, RENDER_WORKER_MAX_CONCURRENCY=4)
+    _caps, resources, devices = runtime.probe_capabilities(
+        settings(
+            tmp_path,
+            RENDER_WORKER_MAX_CONCURRENCY=4,
+            RENDER_WORKER_DEVICE_MAX_CONCURRENCY=1,
+        )
     )
-    assert [device.max_concurrency for device in devices] == [4, 4]
+    assert [device.max_concurrency for device in devices] == [1, 1]
+    assert resources["detected_capacity"] == 2
+    assert resources["effective_capacity"] == 2
+
+
+def test_claim_uses_device_slots_even_with_legacy_node_limit_one(tmp_path: Path, monkeypatch) -> None:
+    from videoroll.apps.render_worker import runtime
+
+    devices = [
+        runtime.RenderDevice(id="vaapi:0", name="GPU 0", backend="vaapi", encoders=("av1_vaapi",)),
+        runtime.RenderDevice(id="vaapi:1", name="GPU 1", backend="vaapi", encoders=("av1_vaapi",)),
+    ]
+    monkeypatch.setattr(
+        runtime,
+        "probe_capabilities",
+        lambda _settings: (
+            {"encoders": ["av1_vaapi"], "devices": [device.payload() for device in devices]},
+            {"devices": [device.payload() for device in devices]},
+            devices,
+        ),
+    )
+    captured: dict[str, object] = {}
+
+    class Response:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, object]:
+            return {}
+
+    class Client:
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args) -> None:
+            return None
+
+        def post(self, _url: str, *, headers: dict[str, str], json: dict[str, object]):
+            captured.update(json)
+            return Response()
+
+    monkeypatch.setattr(runtime.httpx, "Client", Client)
+    worker = runtime.RenderWorkerRuntime(settings(tmp_path, RENDER_WORKER_MAX_CONCURRENCY=1))
+    worker.identity = WorkerIdentity(uuid.uuid4(), "vrw_test")
+
+    claim = worker._claim()
+
+    assert claim.execution is None
+    assert captured["available_slots"] == 2
+
+
+def test_cancellable_process_runner_terminates_child() -> None:
+    from videoroll.apps.subtitle_service.processing import _run_logged
+
+    cancel = threading.Event()
+    cancel.set()
+    with pytest.raises(RuntimeError, match="canceled"):
+        _run_logged(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            log_path=None,
+            cancel_event=cancel,
+        )

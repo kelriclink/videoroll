@@ -17,8 +17,10 @@ from videoroll.apps.subtitle_service.worker_concurrency import (
 )
 from videoroll.db.base import Base
 from videoroll.db.models import (
+    RenderExecution,
     RenderJob,
     RenderJobStatus,
+    RenderWorker,
     PublishJob,
     SourceLicense,
     SourceType,
@@ -39,7 +41,14 @@ def db() -> Session:
     engine = create_engine("sqlite:///:memory:")
     Base.metadata.create_all(
         engine,
-        tables=[Task.__table__, SubtitleJob.__table__, RenderJob.__table__, PublishJob.__table__],
+        tables=[
+            Task.__table__,
+            SubtitleJob.__table__,
+            RenderJob.__table__,
+            RenderWorker.__table__,
+            RenderExecution.__table__,
+            PublishJob.__table__,
+        ],
     )
     session = sessionmaker(bind=engine)()
     try:
@@ -48,7 +57,14 @@ def db() -> Session:
         session.close()
         Base.metadata.drop_all(
             engine,
-            tables=[PublishJob.__table__, RenderJob.__table__, SubtitleJob.__table__, Task.__table__],
+            tables=[
+                PublishJob.__table__,
+                RenderExecution.__table__,
+                RenderWorker.__table__,
+                RenderJob.__table__,
+                SubtitleJob.__table__,
+                Task.__table__,
+            ],
         )
 
 
@@ -100,6 +116,68 @@ def test_expired_render_lease_is_requeued_with_resume(db: Session) -> None:
     assert job.lease_owner is None
     assert job.lease_until is None
     assert summary.render_requeued == 1
+
+
+def test_recent_execution_grace_prevents_immediate_render_requeue(db: Session) -> None:
+    now = _now()
+    task = _task(db)
+    worker = RenderWorker(worker_key="worker-a", name="Worker A", platform="linux")
+    job = RenderJob(
+        task_id=task.id,
+        status=RenderJobStatus.running,
+        lease_owner="render-worker:pending",
+        lease_until=now - timedelta(seconds=5),
+    )
+    db.add_all([worker, job]); db.flush()
+    execution = RenderExecution(
+        render_job_id=job.id,
+        worker_id=worker.id,
+        attempt=1,
+        fence_token="a" * 48,
+        state="running",
+        render_spec={},
+        capability_snapshot={},
+        lease_until=now - timedelta(seconds=5),
+        heartbeat_at=now - timedelta(seconds=10),
+    )
+    db.add(execution); db.flush()
+
+    summary = recover_expired_leases(db, now=now, limit=100)
+
+    assert summary.render_requeued == 0
+    assert job.status == RenderJobStatus.running
+    assert execution.state == "running"
+
+
+def test_stale_execution_is_fenced_before_render_requeue(db: Session) -> None:
+    now = _now()
+    task = _task(db)
+    worker = RenderWorker(worker_key="worker-a", name="Worker A", platform="linux")
+    job = RenderJob(
+        task_id=task.id,
+        status=RenderJobStatus.running,
+        lease_owner="render-worker:pending",
+        lease_until=now - timedelta(minutes=2),
+    )
+    db.add_all([worker, job]); db.flush()
+    execution = RenderExecution(
+        render_job_id=job.id,
+        worker_id=worker.id,
+        attempt=1,
+        fence_token="b" * 48,
+        state="running",
+        render_spec={},
+        capability_snapshot={},
+        lease_until=now - timedelta(minutes=2),
+        heartbeat_at=now - timedelta(minutes=2),
+    )
+    db.add(execution); db.flush()
+
+    summary = recover_expired_leases(db, now=now, limit=100)
+
+    assert summary.render_requeued == 1
+    assert job.status == RenderJobStatus.queued
+    assert execution.state == "lost"
 
 
 def test_recovery_reconciles_published_render_after_lease_expiry(db: Session) -> None:
@@ -160,6 +238,33 @@ def test_live_job_lease_reserves_task_until_recovery(db: Session) -> None:
     db.flush()
 
     assert live_leased_task_ids(db, _now()) == {live_task.id}
+
+
+def test_live_render_execution_reserves_task_when_job_lease_is_stale(db: Session) -> None:
+    now = _now()
+    task = _task(db)
+    worker = RenderWorker(worker_key="worker-live", name="Worker Live", platform="linux")
+    job = RenderJob(
+        task_id=task.id,
+        status=RenderJobStatus.running,
+        lease_owner="render-worker:live",
+        lease_until=now - timedelta(seconds=5),
+    )
+    db.add_all([worker, job]); db.flush()
+    execution = RenderExecution(
+        render_job_id=job.id,
+        worker_id=worker.id,
+        attempt=1,
+        fence_token="c" * 48,
+        state="running",
+        render_spec={},
+        capability_snapshot={},
+        lease_until=now + timedelta(minutes=2),
+        heartbeat_at=now,
+    )
+    db.add(execution); db.flush()
+
+    assert live_leased_task_ids(db, now) == {task.id}
 
 
 def test_running_job_without_a_lease_is_not_recovered(db: Session) -> None:

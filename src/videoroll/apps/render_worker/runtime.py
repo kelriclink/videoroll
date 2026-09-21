@@ -135,7 +135,7 @@ def _hardware_encoder_available(
 def _windows_intel_devices(
     encoders: set[str],
     *,
-    max_concurrency: int,
+    device_capacity: int,
     ffmpeg_path: str,
 ) -> list[RenderDevice]:
     qsv_candidates = tuple(sorted(x for x in encoders if x.endswith("_qsv")))
@@ -173,23 +173,23 @@ def _windows_intel_devices(
             name=name,
             backend="qsv",
             encoders=qsv,
-            max_concurrency=max_concurrency,
+            max_concurrency=device_capacity,
         )
     ]
 
 
-def _intel_devices(encoders: set[str], *, max_concurrency: int, ffmpeg_path: str) -> list[RenderDevice]:
+def _intel_devices(encoders: set[str], *, device_capacity: int, ffmpeg_path: str) -> list[RenderDevice]:
     if os.name == "nt":
-        return _windows_intel_devices(encoders, max_concurrency=max_concurrency, ffmpeg_path=ffmpeg_path)
+        return _windows_intel_devices(encoders, device_capacity=device_capacity, ffmpeg_path=ffmpeg_path)
     paths = sorted(Path("/dev/dri").glob("renderD*")) if Path("/dev/dri").is_dir() else []
     vaapi = tuple(sorted(x for x in encoders if x.endswith("_vaapi")))
     return [
-        RenderDevice(id=f"vaapi:{path.name}", name=f"Intel/VAAPI {path.name}", backend="vaapi", path=str(path), encoders=vaapi, max_concurrency=max_concurrency)
+        RenderDevice(id=f"vaapi:{path.name}", name=f"Intel/VAAPI {path.name}", backend="vaapi", path=str(path), encoders=vaapi, max_concurrency=device_capacity)
         for path in paths
     ]
 
 
-def _nvidia_devices(encoders: set[str], *, max_concurrency: int, ffmpeg_path: str) -> list[RenderDevice]:
+def _nvidia_devices(encoders: set[str], *, device_capacity: int, ffmpeg_path: str) -> list[RenderDevice]:
     nvenc = tuple(sorted(x for x in encoders if x.endswith("_nvenc")))
     if not nvenc:
         return []
@@ -225,7 +225,7 @@ def _nvidia_devices(encoders: set[str], *, max_concurrency: int, ffmpeg_path: st
         )
         if not supported:
             continue
-        devices.append(RenderDevice(id=f"nvidia:{gpu_uuid}", name=parts[2], backend="nvidia", index=index, encoders=supported, max_concurrency=max_concurrency))
+        devices.append(RenderDevice(id=f"nvidia:{gpu_uuid}", name=parts[2], backend="nvidia", index=index, encoders=supported, max_concurrency=device_capacity))
     return devices
 
 
@@ -245,14 +245,16 @@ def probe_capabilities(settings: RenderWorkerSettings) -> tuple[dict[str, Any], 
             backend=backend,
             path=configured_device,
             encoders=tuple(sorted(x for x in encoders if x.endswith(f"_{backend}") or backend == "software")),
-            max_concurrency=settings.max_concurrency,
+            max_concurrency=settings.device_max_concurrency,
         ))
     else:
-        devices.extend(_intel_devices(encoders, max_concurrency=settings.max_concurrency, ffmpeg_path=settings.ffmpeg_path))
-        devices.extend(_nvidia_devices(encoders, max_concurrency=settings.max_concurrency, ffmpeg_path=settings.ffmpeg_path))
+        devices.extend(_intel_devices(encoders, device_capacity=settings.device_max_concurrency, ffmpeg_path=settings.ffmpeg_path))
+        devices.extend(_nvidia_devices(encoders, device_capacity=settings.device_max_concurrency, ffmpeg_path=settings.ffmpeg_path))
     if not devices:
         software = tuple(sorted(x for x in encoders if x in {"libx264", "libx265", "libsvtav1", "libaom-av1"}))
-        devices.append(RenderDevice(id="software:cpu", name=platform.processor() or "CPU", backend="software", encoders=software, max_concurrency=settings.max_concurrency))
+        devices.append(RenderDevice(id="software:cpu", name=platform.processor() or "CPU", backend="software", encoders=software, max_concurrency=settings.device_max_concurrency))
+    detected_capacity = sum(device.max_concurrency for device in devices)
+    effective_capacity = detected_capacity
     union_encoders = sorted({encoder for device in devices for encoder in device.encoders})
     caps = {
         "backend": "multi" if len({device.backend for device in devices}) > 1 or len(devices) > 1 else devices[0].backend,
@@ -264,6 +266,8 @@ def probe_capabilities(settings: RenderWorkerSettings) -> tuple[dict[str, Any], 
     resources = {
         "hostname": socket.gethostname(),
         "cpu_count": os.cpu_count(),
+        "detected_capacity": detected_capacity,
+        "effective_capacity": effective_capacity,
         "devices": [device.payload() for device in devices],
     }
     return caps, resources, devices
@@ -342,7 +346,7 @@ class RenderWorkerRuntime:
             "capabilities": self.capabilities,
             "resources": self.resources,
             "labels": {"standalone": True},
-            "max_concurrency": self.settings.max_concurrency,
+            "max_concurrency": max(1, sum(device.max_concurrency for device in self.devices)),
         }
         endpoint = "enroll" if token else "local-enroll"
         if token:
@@ -400,12 +404,13 @@ class RenderWorkerRuntime:
         assert self.identity is not None
         with self._active_lock:
             active = dict(self._active)
-            node_slots = max(0, self.settings.max_concurrency - len(active))
             device_slots = sum(
                 max(0, device.max_concurrency - sum(1 for item in active.values() if item.device.id == device.id))
                 for device in self.devices
             )
-            available = min(node_slots, device_slots)
+            # Local admission follows discovered device slots. The coordinator's
+            # persisted worker.max_concurrency is the authoritative admin cap.
+            available = device_slots
             free_devices = [
                 device for device in self.devices
                 if sum(1 for item in active.values() if item.device.id == device.id) < device.max_concurrency
@@ -426,15 +431,40 @@ class RenderWorkerRuntime:
             response.raise_for_status()
             return ClaimResponse.model_validate(response.json())
 
-    def _execution_post(self, execution_id: uuid.UUID, suffix: str, body: dict[str, Any]) -> dict[str, Any]:
-        with httpx.Client(timeout=self.settings.request_timeout_seconds) as client:
+    def _execution_post(
+        self,
+        execution_id: uuid.UUID,
+        suffix: str,
+        body: dict[str, Any],
+        *,
+        timeout_seconds: float | None = None,
+    ) -> dict[str, Any]:
+        timeout = self.settings.request_timeout_seconds if timeout_seconds is None else timeout_seconds
+        with httpx.Client(timeout=timeout) as client:
             response = client.post(
                 f"{self.api_base}/executions/{execution_id}/{suffix}", headers=self._headers(), json=body
             )
             response.raise_for_status()
             return response.json()
 
-    def _download(self, execution_id: uuid.UUID, role: str, target: Path) -> None:
+    def _execution_cancel_state(self, execution_id: uuid.UUID, *, timeout_seconds: float) -> tuple[bool, str | None]:
+        with httpx.Client(timeout=timeout_seconds) as client:
+            response = client.get(
+                f"{self.api_base}/executions/{execution_id}/cancel",
+                headers=self._headers(),
+            )
+            response.raise_for_status()
+            payload = response.json()
+            return bool(payload.get("cancel_requested")), payload.get("reason")
+
+    def _download(
+        self,
+        execution_id: uuid.UUID,
+        role: str,
+        target: Path,
+        *,
+        cancel_event: threading.Event | None = None,
+    ) -> None:
         target.parent.mkdir(parents=True, exist_ok=True)
         with httpx.Client(timeout=None) as client:
             with client.stream(
@@ -443,6 +473,8 @@ class RenderWorkerRuntime:
                 response.raise_for_status()
                 with target.open("wb") as handle:
                     for chunk in response.iter_bytes(1024 * 1024):
+                        if cancel_event is not None and cancel_event.is_set():
+                            raise RuntimeError("render execution canceled during artifact download")
                         handle.write(chunk)
 
     def _upload_output(self, execution_id: uuid.UUID, fence: str, path: Path) -> uuid.UUID:
@@ -466,15 +498,78 @@ class RenderWorkerRuntime:
         root = Path(self.settings.work_dir) / str(execution_id)
         root.mkdir(parents=True, exist_ok=True)
         heartbeat_stop = threading.Event()
+        cancel_event = threading.Event()
+        cancel_reason: list[str] = []
 
         def heartbeat_loop() -> None:
-            while not heartbeat_stop.wait(30.0):
-                try:
-                    self._execution_post(
-                        execution_id, "heartbeat", {"fence_token": fence, "progress": None, "metrics": {"device_id": device.id, "device_name": device.name, "backend": device.backend}}
-                    )
-                except Exception:
-                    logger.exception("render execution heartbeat failed: %s", execution_id)
+            heartbeat_interval = max(5.0, min(float(self.settings.heartbeat_interval_seconds), 15.0))
+            request_timeout = max(2.0, min(float(self.settings.request_timeout_seconds), 10.0))
+            next_heartbeat = 0.0
+            next_cancel_poll = 0.0
+            heartbeat_failures = 0
+            while not heartbeat_stop.is_set() and not cancel_event.is_set():
+                now = time.monotonic()
+                if now >= next_heartbeat:
+                    try:
+                        self._execution_post(
+                            execution_id,
+                            "heartbeat",
+                            {
+                                "fence_token": fence,
+                                "progress": None,
+                                "metrics": {
+                                    "device_id": device.id,
+                                    "device_name": device.name,
+                                    "backend": device.backend,
+                                },
+                            },
+                            timeout_seconds=request_timeout,
+                        )
+                        heartbeat_failures = 0
+                    except httpx.HTTPStatusError as exc:
+                        heartbeat_failures += 1
+                        if exc.response.status_code in {409, 410}:
+                            cancel_reason.append(f"coordinator fenced execution ({exc.response.status_code})")
+                            cancel_event.set()
+                            break
+                        logger.warning(
+                            "render execution heartbeat rejected: execution=%s status=%s",
+                            execution_id,
+                            exc.response.status_code,
+                        )
+                    except Exception:
+                        heartbeat_failures += 1
+                        logger.exception("render execution heartbeat failed: %s", execution_id)
+                    if heartbeat_failures >= 3:
+                        cancel_reason.append("execution heartbeat unavailable")
+                        cancel_event.set()
+                        break
+                    next_heartbeat = now + heartbeat_interval
+
+                if now >= next_cancel_poll and not cancel_event.is_set():
+                    try:
+                        requested, reason = self._execution_cancel_state(
+                            execution_id,
+                            timeout_seconds=request_timeout,
+                        )
+                        if requested:
+                            cancel_reason.append(str(reason or "coordinator requested cancellation"))
+                            cancel_event.set()
+                            break
+                    except httpx.HTTPStatusError as exc:
+                        if exc.response.status_code in {409, 410}:
+                            cancel_reason.append(f"coordinator fenced execution ({exc.response.status_code})")
+                            cancel_event.set()
+                            break
+                        logger.warning(
+                            "render execution cancel poll rejected: execution=%s status=%s",
+                            execution_id,
+                            exc.response.status_code,
+                        )
+                    except Exception:
+                        logger.debug("render execution cancel poll failed: %s", execution_id, exc_info=True)
+                    next_cancel_poll = now + 5.0
+                heartbeat_stop.wait(0.5)
 
         hb = threading.Thread(target=heartbeat_loop, name=f"render-hb-{execution_id}", daemon=True)
         hb.start()
@@ -483,7 +578,7 @@ class RenderWorkerRuntime:
             for artifact in spec.artifacts:
                 suffix = Path(artifact.storage_key).suffix or ".bin"
                 target = root / f"{artifact.role}{suffix}"
-                self._download(execution_id, artifact.role, target)
+                self._download(execution_id, artifact.role, target, cancel_event=cancel_event)
                 if artifact.sha256 and sha256_file(target) != artifact.sha256:
                     raise RuntimeError(f"artifact checksum mismatch: {artifact.role}")
                 paths[artifact.role] = target
@@ -518,14 +613,23 @@ class RenderWorkerRuntime:
                     nvidia_gpu_index=device.index,
                     preset=render_cfg.get("video_preset"),
                     crf=render_cfg.get("video_crf"),
+                    cancel_event=cancel_event,
                 )
             elif spec.mode == "soft_sub":
                 output = root / "video_softsub.mkv"
-                mux_soft_sub(self.settings.ffmpeg_path, input_path, srt_path, output)
+                mux_soft_sub(
+                    self.settings.ffmpeg_path,
+                    input_path,
+                    srt_path,
+                    output,
+                    cancel_event=cancel_event,
+                )
             else:
                 self._execution_post(execution_id, "complete", {"fence_token": fence, "output": {}})
                 return
 
+            if cancel_event.is_set():
+                raise RuntimeError(cancel_reason[-1] if cancel_reason else "render execution canceled")
             self._execution_post(execution_id, "progress", {"fence_token": fence, "progress": 90, "metrics": {"device_id": device.id, "device_name": device.name, "backend": device.backend}})
             output_asset_id = self._upload_output(execution_id, fence, output)
             self._execution_post(
@@ -538,11 +642,21 @@ class RenderWorkerRuntime:
                 },
             )
         except Exception as exc:
-            logger.exception("render execution failed: %s", execution_id)
+            if cancel_event.is_set():
+                logger.warning(
+                    "render execution stopped: execution=%s reason=%s",
+                    execution_id,
+                    cancel_reason[-1] if cancel_reason else str(exc),
+                )
+            else:
+                logger.exception("render execution failed: %s", execution_id)
             try:
                 self._execution_post(
                     execution_id, "fail", {"fence_token": fence, "error": str(exc)[:8192], "retryable": True}
                 )
+            except httpx.HTTPStatusError as report_exc:
+                if report_exc.response.status_code not in {409, 410}:
+                    logger.exception("failed to report render execution failure: %s", execution_id)
             except Exception:
                 logger.exception("failed to report render execution failure: %s", execution_id)
         finally:
