@@ -194,9 +194,9 @@ impl RenderWorkerApp {
 }
 
 impl eframe::App for RenderWorkerApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.consume_scan();
-        ctx.request_repaint_after(Duration::from_millis(500));
+        ui.ctx().request_repaint_after(Duration::from_millis(500));
 
         let status = self.worker.as_ref().map(WorkerHandle::status);
         if let Some(state) = &status {
@@ -208,7 +208,6 @@ impl eframe::App for RenderWorkerApp {
             }
         }
 
-        egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("VideoRoll Native Render Worker");
             ui.label("Rust worker · self-contained install directory · Intel QSV / NVIDIA NVENC / CPU fallback");
             ui.add_space(8.0);
@@ -340,7 +339,6 @@ impl eframe::App for RenderWorkerApp {
                         ui.monospace(line);
                     }
                 });
-        });
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
