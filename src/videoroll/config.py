@@ -160,6 +160,10 @@ class RenderWorkerSettings(BaseSettings):
         "videoroll-development-internal-secret",
         alias="INTERNAL_API_SECRET",
     )
+    admin_bootstrap_secret: str = Field(
+        "videoroll-development-bootstrap-secret",
+        alias="ADMIN_BOOTSTRAP_SECRET",
+    )
     worker_key: str = Field("", alias="RENDER_WORKER_KEY")
     name: str = Field("VideoRoll Render Worker", alias="RENDER_WORKER_NAME")
     backend: str = Field("auto", alias="RENDER_WORKER_BACKEND")
