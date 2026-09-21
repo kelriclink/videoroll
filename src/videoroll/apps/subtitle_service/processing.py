@@ -177,6 +177,36 @@ def _ffmpeg_supports_encoder(ffmpeg_path: str, encoder: str) -> bool:
     return encoder in supported
 
 
+@lru_cache(maxsize=8)
+def _ffmpeg_supported_filters(ffmpeg_path: str) -> frozenset[str]:
+    try:
+        proc = subprocess.run(
+            [ffmpeg_path, "-hide_banner", "-filters"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except Exception:
+        return frozenset()
+
+    filters: set[str] = set()
+    for raw_line in proc.stdout.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("Filters:"):
+            continue
+        parts = line.split()
+        if len(parts) >= 2:
+            filters.add(parts[1].strip())
+    return frozenset(filters)
+
+
+def _ffmpeg_supports_filter(ffmpeg_path: str, filter_name: str) -> bool:
+    supported = _ffmpeg_supported_filters(ffmpeg_path)
+    if not supported:
+        return True
+    return filter_name in supported
+
+
 def _append_processing_log_note(log_path: Path | None, message: str) -> None:
     if log_path is None:
         return
@@ -2456,6 +2486,153 @@ def probe_video_resolution(ffmpeg_path: str, video_path: Path) -> tuple[int, int
     return 1920, 1080
 
 
+def probe_video_frame_rate(ffmpeg_path: str, video_path: Path) -> str:
+    """Return a validated ffmpeg frame-rate expression such as 60/1."""
+    ffmpeg_cmd = str(ffmpeg_path or "").strip() or "ffmpeg"
+    ffmpeg_bin = Path(ffmpeg_cmd)
+    ffprobe_name = "ffprobe" + ffmpeg_bin.suffix if ffmpeg_bin.suffix else "ffprobe"
+    candidates = dict.fromkeys((str(ffmpeg_bin.with_name(ffprobe_name)), shutil.which("ffprobe") or "ffprobe"))
+
+    for candidate in candidates:
+        if not candidate:
+            continue
+        try:
+            proc = subprocess.run(
+                [
+                    candidate,
+                    "-v",
+                    "error",
+                    "-select_streams",
+                    "v:0",
+                    "-show_entries",
+                    "stream=avg_frame_rate,r_frame_rate",
+                    "-of",
+                    "json",
+                    str(video_path),
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            data = json.loads(proc.stdout or "{}")
+            streams = data.get("streams")
+            if not isinstance(streams, list) or not streams:
+                continue
+            stream = streams[0] if isinstance(streams[0], dict) else {}
+            for key in ("avg_frame_rate", "r_frame_rate"):
+                value = str(stream.get(key) or "").strip()
+                match = re.fullmatch(r"(\d+)/(\d+)", value)
+                if not match:
+                    continue
+                numerator = int(match.group(1))
+                denominator = int(match.group(2))
+                if numerator > 0 and denominator > 0 and numerator / denominator <= 240:
+                    return f"{numerator}/{denominator}"
+        except Exception:
+            continue
+    return "30/1"
+
+
+def _prepare_ass_overlay_band(
+    ass_path: Path,
+    *,
+    video_width: int,
+    video_height: int,
+    output_dir: Path,
+) -> tuple[Path, int] | None:
+    """Create a bottom-aligned ASS script sized only for the subtitle band."""
+    try:
+        ass_text = ass_path.read_text(encoding="utf-8")
+    except Exception:
+        return None
+
+    # Keep the fast path conservative. Positioned/drawing ASS may intentionally
+    # place subtitles outside the bottom band and must use full-frame rendering.
+    if re.search(r"\\(?:pos|move|org|clip|iclip|an[1-9]|p[1-9])\b", ass_text, flags=re.IGNORECASE):
+        return None
+
+    play_res_x_match = re.search(r"(?im)^PlayResX:\s*(\d+)\s*$", ass_text)
+    play_res_y_match = re.search(r"(?im)^PlayResY:\s*(\d+)\s*$", ass_text)
+    if not play_res_x_match or not play_res_y_match:
+        return None
+    if int(play_res_x_match.group(1)) != int(video_width):
+        return None
+
+    styles: dict[str, tuple[float, float, int, int]] = {}
+    for raw_line in ass_text.splitlines():
+        if not raw_line.startswith("Style: "):
+            continue
+        fields = [field.strip() for field in raw_line[len("Style: ") :].split(",")]
+        if len(fields) < 23:
+            continue
+        try:
+            name = fields[0]
+            font_size = max(1.0, float(fields[2]))
+            outline = max(0.0, float(fields[16]))
+            alignment = int(fields[18])
+            margin_v = max(0, int(fields[21]))
+        except (TypeError, ValueError):
+            continue
+        if alignment not in {1, 2, 3}:
+            return None
+        styles[name] = (font_size, outline, alignment, margin_v)
+    if not styles:
+        return None
+
+    default_style = "Default" if "Default" in styles else next(iter(styles))
+    required_height = 0.0
+    for raw_line in ass_text.splitlines():
+        if not raw_line.startswith("Dialogue:"):
+            continue
+        fields = raw_line.split(",", 9)
+        if len(fields) < 10:
+            continue
+        event_style = fields[3].strip() or default_style
+        current_style = event_style if event_style in styles else default_style
+        line_height_sum = 0.0
+        margin_v = styles[current_style][3]
+        for logical_line in fields[9].split(r"\N"):
+            resets = re.findall(r"\{\\r([^}\\]+)\}", logical_line)
+            if resets:
+                requested_style = resets[-1].strip()
+                if requested_style in styles:
+                    current_style = requested_style
+            font_size, outline, _alignment, style_margin_v = styles[current_style]
+            margin_v = max(margin_v, style_margin_v)
+            line_height_sum += font_size * 1.22 + outline * 2.0
+        required_height = max(required_height, line_height_sum + margin_v + 32.0)
+
+    min_band = max(192, int(round(video_height * 0.24)))
+    band_height = max(min_band, int(required_height + 1))
+    band_height = min(int(video_height), band_height)
+    if band_height % 2:
+        band_height += 1
+    band_height = min(int(video_height), band_height)
+    if band_height >= int(video_height * 0.85):
+        return None
+
+    band_text = re.sub(
+        r"(?im)^PlayResY:\s*\d+\s*$",
+        f"PlayResY: {band_height}",
+        ass_text,
+        count=1,
+    )
+    output_dir.mkdir(parents=True, exist_ok=True)
+    handle = tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        prefix="subtitle_band_",
+        suffix=".ass",
+        dir=str(output_dir),
+        delete=False,
+    )
+    try:
+        handle.write(band_text)
+        return Path(handle.name), band_height
+    finally:
+        handle.close()
+
+
 def _pixel_format_bit_depth(pixel_format: str) -> int:
     value = str(pixel_format or "").strip().lower()
     if not value:
@@ -2844,6 +3021,11 @@ def render_burn_in(
         preset_n = max(0, min(13, preset_n))
         return 1 + round((preset_n * 7) / 13)
 
+    overlay_ass_path: Path | None = None
+    filter_complex: str | None = None
+    extra_input_args: list[str] = []
+    map_args: list[str] = []
+
     if use_intel_gpu:
         if codec not in {"h264", "avc", "av1"}:
             raise ValueError("Intel GPU burn-in currently supports only h264/av1")
@@ -2883,20 +3065,63 @@ def render_burn_in(
             log_path=log_path,
             live_upload_cb=live_upload_cb,
         )
+        decode_mode = "vaapi" if hardware_decode else "software-fallback"
         if hardware_decode:
             cmd.extend(_intel_vaapi_decode_args())
+
+        overlay_band: tuple[Path, int] | None = None
+        video_width = 0
+        video_height = 0
+        if (
+            hardware_decode
+            and target_bit_depth == 8
+            and _ffmpeg_supports_filter(ffmpeg_path, "overlay_vaapi")
+        ):
+            video_width, video_height = probe_video_resolution(ffmpeg_path, video_path)
+            overlay_band = _prepare_ass_overlay_band(
+                ass_path,
+                video_width=video_width,
+                video_height=video_height,
+                output_dir=output_path.parent,
+            )
+
+        if overlay_band is not None:
+            overlay_ass_path, band_height = overlay_band
+            frame_rate = probe_video_frame_rate(ffmpeg_path, video_path)
+            overlay_y = max(0, video_height - band_height)
+            overlay_ass_filter = f"ass={str(overlay_ass_path).replace(':', r'\:')}:alpha=1"
+            extra_input_args = [
+                "-f",
+                "lavfi",
+                "-i",
+                (
+                    f"color=c=black@0.0:s={video_width}x{band_height}:"
+                    f"r={frame_rate},format=yuva420p"
+                ),
+            ]
+            filter_complex = (
+                f"[0:v]scale_vaapi=format={vaapi_pixel_format}[main];"
+                f"[1:v]{overlay_ass_filter},format=bgra,hwupload[sub];"
+                f"[main][sub]overlay_vaapi=x=0:y={overlay_y}:shortest=1[out]"
+            )
+            map_args = ["-map", "[out]", "-map", "0:a?"]
+            filter_arg = ""
+            compose_mode = f"vaapi-overlay band={video_width}x{band_height}@y{overlay_y}"
+        elif hardware_decode:
             filter_arg = (
                 f"scale_vaapi=format={vaapi_pixel_format},"
                 f"hwdownload,format={software_pixel_format},"
                 f"{ass_filter},format={software_pixel_format},hwupload"
             )
-            decode_mode = "vaapi"
+            compose_mode = "legacy-full-frame"
         else:
             filter_arg = f"{ass_filter},format={software_pixel_format},hwupload"
-            decode_mode = "software-fallback"
+            compose_mode = "legacy-full-frame"
+
         bit_depth_note = (
-            f"Intel render pipeline: decode={decode_mode} source_bit_depth={source_bit_depth} "
-            f"output_bit_depth={target_bit_depth} software_format={software_pixel_format}"
+            f"Intel render pipeline: decode={decode_mode} compose={compose_mode} "
+            f"source_bit_depth={source_bit_depth} output_bit_depth={target_bit_depth} "
+            f"software_format={software_pixel_format}"
         )
         if codec in {"h264", "avc"} and source_bit_depth > 8:
             bit_depth_note += " (h264_vaapi output is limited to the 8-bit NV12 path)"
@@ -2934,19 +3159,42 @@ def render_burn_in(
         video_args = ["-c:v", "libsvtav1", "-preset", str(effective_preset_n), "-crf", str(effective_crf)]
         filter_arg = ass_filter
 
-    cmd.extend(
-        [
-            "-i",
-            str(video_path),
-            "-vf",
-            filter_arg,
-            *video_args,
-            "-c:a",
-            "copy",
-            str(output_path),
-        ]
-    )
-    _run_logged(cmd, log_path=log_path, live_upload_cb=live_upload_cb)
+    if filter_complex is not None:
+        cmd.extend(
+            [
+                "-i",
+                str(video_path),
+                *extra_input_args,
+                "-filter_complex",
+                filter_complex,
+                *map_args,
+                *video_args,
+                "-c:a",
+                "copy",
+                str(output_path),
+            ]
+        )
+    else:
+        cmd.extend(
+            [
+                "-i",
+                str(video_path),
+                "-vf",
+                filter_arg,
+                *video_args,
+                "-c:a",
+                "copy",
+                str(output_path),
+            ]
+        )
+    try:
+        _run_logged(cmd, log_path=log_path, live_upload_cb=live_upload_cb)
+    finally:
+        if overlay_ass_path is not None:
+            try:
+                overlay_ass_path.unlink(missing_ok=True)
+            except Exception:
+                pass
 
 
 def mux_soft_sub(
