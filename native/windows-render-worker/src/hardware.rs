@@ -257,7 +257,7 @@ fn probe_encoder(
                     .unwrap_or("FFmpeg returned no error detail");
                 log.warn(format!(
                     "hardware encoder probe failed: backend={} encoder={} gpu={:?}: {}",
-                    backend, index, encoder, detail
+                    backend, encoder, index, detail
                 ));
             }
             false
@@ -266,7 +266,7 @@ fn probe_encoder(
             if let Some(log) = log {
                 log.warn(format!(
                     "hardware encoder probe could not start: backend={} encoder={} gpu={:?}: {}",
-                    backend, index, encoder, error
+                    backend, encoder, index, error
                 ));
             }
             false
