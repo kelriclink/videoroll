@@ -9,6 +9,8 @@ pub struct AppConfig {
     pub server_url: String,
     #[serde(default = "default_node_name")]
     pub node_name: String,
+    #[serde(default = "default_worker_key")]
+    pub worker_key: String,
     #[serde(default = "default_concurrency")]
     pub max_concurrency: usize,
 }
@@ -18,6 +20,7 @@ impl Default for AppConfig {
         Self {
             server_url: String::new(),
             node_name: default_node_name(),
+            worker_key: default_worker_key(),
             max_concurrency: default_concurrency(),
         }
     }
@@ -97,4 +100,13 @@ fn default_node_name() -> String {
     std::env::var("COMPUTERNAME")
         .or_else(|_| std::env::var("HOSTNAME"))
         .unwrap_or_else(|_| "Windows Render Node".to_string())
+}
+
+fn default_worker_key() -> String {
+    let name = default_node_name()
+        .to_ascii_lowercase()
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' { ch } else { '-' })
+        .collect::<String>();
+    format!("windows-native-{}", name.trim_matches('-'))
 }

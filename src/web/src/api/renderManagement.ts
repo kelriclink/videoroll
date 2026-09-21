@@ -40,7 +40,7 @@ export const renderManagementApi = {
     fetchJson<RenderEnrollment>(orchestratorUrl(`/render-management/enrollments/${id}`), { method: "DELETE" }),
   workers: () => fetchJson<RenderWorker[]>(orchestratorUrl("/render-management/workers")),
   executions: (limit = 100) => fetchJson<RenderExecution[]>(orchestratorUrl(`/render-management/executions?limit=${limit}`)),
-  controlWorker: (id: string, payload: { enabled?: boolean; draining?: boolean; max_concurrency?: number }) =>
+  controlWorker: (id: string, payload: { enabled?: boolean; draining?: boolean; max_concurrency?: number; worker_key?: string }) =>
     fetchJson<RenderWorker>(orchestratorUrl(`/render-management/workers/${id}`), { method: "PATCH", ...json(payload) }),
   revokeWorkerCredential: (id: string) =>
     fetchJson<RenderWorker>(orchestratorUrl(`/render-management/workers/${id}/revoke-credential`), { method: "POST" }),

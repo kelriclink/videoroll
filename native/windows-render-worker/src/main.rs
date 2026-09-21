@@ -138,6 +138,11 @@ impl RenderWorkerApp {
             self.ui_message = "Server URL is required.".to_string();
             return;
         }
+        self.config.worker_key = self.config.worker_key.trim().to_string();
+        if self.config.worker_key.is_empty() {
+            self.ui_message = "Node key is required.".to_string();
+            return;
+        }
         if Credential::load(&self.paths).is_none() && self.enrollment_token.trim().is_empty() {
             self.ui_message =
                 "This PC is not paired. Paste a one-time vre_* enrollment token first.".to_string();
@@ -224,12 +229,23 @@ impl eframe::App for RenderWorkerApp {
                     ui.add(
                         egui::TextEdit::singleline(&mut self.enrollment_token)
                             .password(true)
-                            .hint_text("vre_* (first pairing only)"),
+                            .hint_text("vre_* (first pairing or recovery)"),
                     );
                     ui.end_row();
 
                     ui.label("Node name");
                     ui.text_edit_singleline(&mut self.config.node_name);
+                    ui.end_row();
+
+                    ui.label("Node key");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.config.worker_key)
+                            .hint_text("stable recovery identity"),
+                    );
+                    ui.end_row();
+
+                    ui.label("Recovery");
+                    ui.label("Keep this key. Paste a new vre_* token to re-pair after server-side deletion.");
                     ui.end_row();
 
                     ui.label("Initial node limit");
@@ -241,7 +257,7 @@ impl eframe::App for RenderWorkerApp {
                     ui.end_row();
 
                     ui.label("Pairing");
-                    ui.label(if self.paired() { "Paired" } else { "Not paired" });
+                    ui.label(if self.paired() { "Paired locally" } else { "Not paired" });
                     ui.end_row();
 
                     ui.label("Install directory");
@@ -251,10 +267,24 @@ impl eframe::App for RenderWorkerApp {
 
             ui.add_space(10.0);
             ui.horizontal(|ui| {
+                let running = status.as_ref().is_some_and(|state| state.running);
+                if ui
+                    .add_enabled(!running, egui::Button::new("Save settings"))
+                    .clicked()
+                {
+                    self.config.worker_key = self.config.worker_key.trim().to_string();
+                    self.ui_message = if self.config.worker_key.is_empty() {
+                        "Node key is required.".to_string()
+                    } else {
+                        match self.config.save(&self.paths) {
+                            Ok(()) => "Settings saved.".to_string(),
+                            Err(error) => format!("Cannot save configuration: {error:#}"),
+                        }
+                    };
+                }
                 if ui.button("Scan hardware").clicked() {
                     self.start_scan();
                 }
-                let running = status.as_ref().is_some_and(|state| state.running);
                 if ui
                     .add_enabled(!running, egui::Button::new("Start worker"))
                     .clicked()
@@ -268,7 +298,7 @@ impl eframe::App for RenderWorkerApp {
                     self.stop_worker();
                 }
                 if ui
-                    .add_enabled(!running, egui::Button::new("Reset pairing"))
+                    .add_enabled(!running, egui::Button::new("Forget local credential"))
                     .clicked()
                 {
                     self.reset_pairing();

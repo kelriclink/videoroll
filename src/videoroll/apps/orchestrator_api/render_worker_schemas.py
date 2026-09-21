@@ -89,6 +89,7 @@ class WorkerControlRequest(BaseModel):
     enabled: bool | None = None
     draining: bool | None = None
     max_concurrency: int | None = Field(default=None, ge=1, le=32)
+    worker_key: str | None = Field(default=None, min_length=1, max_length=128)
 
 class ClaimRequest(BaseModel):
     available_slots: int = Field(default=1, ge=0, le=32)

@@ -313,7 +313,8 @@ class RenderWorkerRuntime:
 
     def enroll(self) -> WorkerIdentity:
         credential = _load_credential(self.settings)
-        if credential:
+        token = self.settings.enrollment_token.strip()
+        if credential and not token:
             # The worker id is recovered by enrolling only when necessary. With
             # an existing credential, heartbeat lookup is not available by key,
             # so persist the id next to the credential as JSON.
@@ -325,7 +326,6 @@ class RenderWorkerRuntime:
             except Exception as exc:
                 raise RuntimeError("render worker credential must contain worker_id and credential; pair this worker again") from exc
 
-        token = self.settings.enrollment_token.strip()
         body = {
             "worker_key": _worker_key(self.settings),
             "name": self.settings.name,
@@ -360,7 +360,11 @@ class RenderWorkerRuntime:
                 )
             response.raise_for_status()
             enrolled = WorkerEnrollResponse.model_validate(response.json())
-        stored = json.dumps({"worker_id": str(enrolled.worker.id), "credential": enrolled.credential})
+        stored = json.dumps({
+            "worker_id": str(enrolled.worker.id),
+            "worker_key": enrolled.worker.worker_key,
+            "credential": enrolled.credential,
+        })
         _save_credential(self.settings, stored)
         self.identity = WorkerIdentity(enrolled.worker.id, enrolled.credential)
         logger.info("render worker enrolled: id=%s key=%s", enrolled.worker.id, enrolled.worker.worker_key)

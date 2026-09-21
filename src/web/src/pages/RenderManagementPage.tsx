@@ -64,7 +64,7 @@ export default function RenderManagementPage() {
     ["可用并发", `${available} / ${capacity}`], ["近 1h 异常", String(failed)],
   ], [online, workers.length, active, available, capacity, failed]);
 
-  async function workerAction(worker: RenderWorker, patch: { enabled?: boolean; draining?: boolean; max_concurrency?: number }) {
+  async function workerAction(worker: RenderWorker, patch: { enabled?: boolean; draining?: boolean; max_concurrency?: number; worker_key?: string }) {
     setBusy(worker.id);
     try { await renderManagementApi.controlWorker(worker.id, patch); await refresh(); }
     catch (e) { setError(e instanceof Error ? e.message : String(e)); } finally { setBusy(null); }
@@ -84,6 +84,19 @@ export default function RenderManagementPage() {
       setCreatedEnrollment(created); setEnrollmentLabel(""); await refresh();
     } catch (e) { setError(e instanceof Error ? e.message : String(e)); } finally { setBusy(null); }
   }
+  async function createRecoveryEnrollment(worker: RenderWorker) {
+    setBusy(`recover:${worker.id}`);
+    try {
+      const created = await renderManagementApi.createEnrollment({
+        label: `恢复 ${worker.name} · ${worker.worker_key}`,
+        ttl_minutes: 30,
+      });
+      setCreatedEnrollment(created);
+      setError(null);
+      await refresh();
+    } catch (e) { setError(e instanceof Error ? e.message : String(e)); }
+    finally { setBusy(null); }
+  }
   async function saveServerUrl() {
     setBusy("connection");
     try { const next = await renderManagementApi.updateConnection(serverUrl.trim()); setConnection(next); setServerUrl(next.server_url); }
@@ -96,8 +109,8 @@ export default function RenderManagementPage() {
     {error ? <div className="rounded-lg border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700">{error}</div> : null}
 
     <Section>
-      <div className="text-sm font-semibold">添加渲染节点</div>
-      <div className="mt-1 text-xs text-slate-500">在渲染机上填写服务器地址和一次性配对凭据。配对成功后渲染机会换取并仅在本机保存独立长期凭据。</div>
+      <div className="text-sm font-semibold">添加 / 恢复渲染节点</div>
+      <div className="mt-1 text-xs text-slate-500">在渲染机上填写服务器地址和一次性配对凭据。节点端会长期保存 Worker Key；服务端记录误删后，用原 Worker Key + 新的一次性凭据即可重新创建节点。</div>
       <div className="mt-4 grid gap-3 lg:grid-cols-[minmax(0,1fr)_auto]">
         <label><div className="mb-1 text-xs text-slate-500">服务器地址</div><input value={serverUrl} onChange={(e) => setServerUrl(e.target.value)} placeholder="https://video.example.com" className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm" /></label>
         <div className="flex items-end"><Button disabled={busy === "connection" || !serverUrl.trim()} onClick={() => void saveServerUrl()}>保存地址</Button></div>
@@ -131,13 +144,20 @@ export default function RenderManagementPage() {
             <div className="flex items-start justify-between gap-3"><div><div className="font-medium">{w.name}</div><div className="mt-1 text-xs text-slate-500">{w.platform}{w.architecture ? ` · ${w.architecture}` : ""} · {value(gpu)}</div></div>
               <span className={`rounded-full px-2 py-1 text-xs ${badge(w.stale ? "offline" : w.status)}`}>{w.stale ? "失联" : w.draining ? "Drain" : w.status}</span></div>
             <div className="mt-4 grid grid-cols-5 gap-3 text-xs"><div><div className="text-slate-500">运行中</div><div className="mt-1 font-medium">{w.active_jobs}</div></div><label><div className="text-slate-500">管理上限</div><input type="number" min={1} max={32} defaultValue={w.max_concurrency} disabled={busy === w.id} onBlur={(e) => { const n = Math.max(1, Math.min(32, Number(e.currentTarget.value) || 1)); if (n !== w.max_concurrency) void workerAction(w, { max_concurrency: n }); }} className="mt-1 w-16 rounded border border-slate-300 px-2 py-1 font-medium" /><div className="mt-1 text-[10px] text-slate-400">节点同时任务上限</div></label><div><div className="text-slate-500">可用并发</div><div className="mt-1 font-medium">{w.available_slots ?? Math.max(0, w.max_concurrency - w.active_jobs)} / {w.max_concurrency}</div></div><div><div className="text-slate-500">速度</div><div className="mt-1 font-medium">{value(fps)} FPS</div></div><div><div className="text-slate-500">心跳</div><div className="mt-1 font-medium">{ago(w.last_seen_at)}</div></div></div>
+            <div className="mt-4 rounded-lg border border-slate-200 bg-slate-50 p-3 dark:border-slate-700 dark:bg-slate-900">
+              <div className="flex flex-col gap-2 sm:flex-row sm:items-end">
+                <label className="min-w-0 flex-1"><div className="mb-1 text-xs text-slate-500">Worker Key（恢复身份）</div><input key={w.worker_key} defaultValue={w.worker_key} disabled={busy === w.id} onBlur={(e) => { const key = e.currentTarget.value.trim(); e.currentTarget.value = key; if (key && key !== w.worker_key) void workerAction(w, { worker_key: key }); }} className="w-full rounded border border-slate-300 bg-white px-2 py-1.5 font-mono text-xs dark:border-slate-700 dark:bg-slate-950" /></label>
+                <Button size="xs" disabled={busy === `recover:${w.id}`} onClick={() => void createRecoveryEnrollment(w)}>生成恢复凭据</Button>
+              </div>
+              <div className="mt-2 text-[11px] text-slate-500">修改后请让节点端使用相同 Worker Key。若服务端记录被误删，节点端保留此 Key，粘贴新的 vre_* 凭据重新配对即可恢复。</div>
+            </div>
             {devices.length ? <div className="mt-4 space-y-2">
               {devices.map((device) => <div key={device.id} className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 dark:border-slate-700 dark:bg-slate-900">
                 <div className="flex items-center justify-between gap-3"><div><div className="text-xs font-medium">{device.name}</div><div className="mt-0.5 font-mono text-[11px] text-slate-500">{device.id}{device.path ? ` · ${device.path}` : ""} · {device.backend}</div></div><span className={`rounded-full px-2 py-0.5 text-[11px] ${badge(device.status)}`}>{device.status}</span></div>
                 <div className="mt-2 grid grid-cols-2 gap-2 text-[11px]"><div><span className="text-slate-500">任务 </span>{device.active_jobs}</div><div className="truncate"><span className="text-slate-500">Execution </span>{device.execution_ids?.length ? device.execution_ids.map((id) => id.slice(0, 8)).join(", ") : "—"}</div></div>
               </div>)}
             </div> : null}
-            <div className="mt-4 flex flex-wrap gap-2"><Button size="xs" disabled={busy === w.id} onClick={() => void workerAction(w, { draining: !w.draining })}>{w.draining ? "恢复接单" : "Drain"}</Button><Button size="xs" tone={w.enabled ? "danger" : "primary"} disabled={busy === w.id} onClick={() => void workerAction(w, { enabled: !w.enabled })}>{w.enabled ? "禁用" : "启用"}</Button><Button size="xs" tone="danger" disabled={busy === w.id || !w.credential_active} onClick={async () => { setBusy(w.id); try { await renderManagementApi.revokeWorkerCredential(w.id); await refresh(); } catch (e) { setError(e instanceof Error ? e.message : String(e)); } finally { setBusy(null); } }}>吊销凭据</Button></div>
+            <div className="mt-4 flex flex-wrap gap-2"><Button size="xs" disabled={busy === w.id} onClick={() => void workerAction(w, { draining: !w.draining })}>{w.draining ? "恢复接单" : "Drain"}</Button><Button size="xs" tone={w.enabled ? "danger" : "primary"} disabled={busy === w.id} onClick={() => void workerAction(w, { enabled: !w.enabled })}>{w.enabled ? "禁用" : "启用"}</Button><Button size="xs" tone="danger" disabled={busy === w.id || !w.credential_active} onClick={async () => { setBusy(w.id); try { await renderManagementApi.revokeWorkerCredential(w.id); await refresh(); } catch (e) { setError(e instanceof Error ? e.message : String(e)); } finally { setBusy(null); } }}>吊销长期凭据</Button></div>
           </div>;
         })}
       </div>}

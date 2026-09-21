@@ -48,6 +48,83 @@ def test_existing_identity_is_loaded_without_database_or_redis(tmp_path: Path, m
     assert identity == WorkerIdentity(worker_id, "vrw_test")
 
 
+def test_enrollment_token_forces_repair_over_stale_local_credential(tmp_path: Path, monkeypatch) -> None:
+    old_worker_id = uuid.uuid4()
+    new_worker_id = uuid.uuid4()
+    credential_file = tmp_path / "credential.json"
+    credential_file.write_text(
+        json.dumps({"worker_id": str(old_worker_id), "credential": "vrw_stale"}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "videoroll.apps.render_worker.runtime.probe_capabilities",
+        lambda _cfg: ({"encoders": []}, {}, []),
+    )
+    captured: dict[str, object] = {}
+
+    class Response:
+        is_error = False
+        status_code = 200
+        text = ""
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, object]:
+            return {
+                "worker": {
+                    "id": str(new_worker_id),
+                    "worker_key": "a380-1",
+                    "name": "A380 #1",
+                    "platform": "linux",
+                    "architecture": "x86_64",
+                    "version": "test",
+                    "protocol_version": 1,
+                    "render_spec_versions": [1],
+                    "capabilities": {},
+                    "resources": {},
+                    "labels": {},
+                    "status": "online",
+                    "enabled": True,
+                    "draining": False,
+                    "max_concurrency": 1,
+                    "active_jobs": 0,
+                    "last_seen_at": "2026-09-21T13:00:00Z",
+                },
+                "credential": "vrw_recovered",
+            }
+
+    class Client:
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args) -> None:
+            return None
+
+        def post(self, url: str, *, json: dict[str, object], headers: dict[str, str]):
+            captured["url"] = url
+            captured["json"] = json
+            captured["headers"] = headers
+            return Response()
+
+    monkeypatch.setattr("videoroll.apps.render_worker.runtime.httpx.Client", Client)
+    runtime = RenderWorkerRuntime(
+        settings(tmp_path, RENDER_WORKER_ENROLLMENT_TOKEN="vre_recovery_token")
+    )
+    identity = runtime.enroll()
+
+    assert identity == WorkerIdentity(new_worker_id, "vrw_recovered")
+    assert str(captured["url"]).endswith("/enroll")
+    assert captured["json"]["worker_key"] == "a380-1"
+    stored = json.loads(credential_file.read_text(encoding="utf-8"))
+    assert stored["worker_id"] == str(new_worker_id)
+    assert stored["worker_key"] == "a380-1"
+    assert stored["credential"] == "vrw_recovered"
+
+
 def test_select_device_prefers_idle_compatible_gpu() -> None:
     from videoroll.apps.orchestrator_api.render_worker_schemas import RenderSpec
     from videoroll.apps.render_worker.runtime import ActiveExecution, RenderDevice, select_device

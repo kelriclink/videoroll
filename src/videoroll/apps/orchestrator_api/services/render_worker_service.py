@@ -222,6 +222,18 @@ def control_worker(db: Session, worker_id: uuid.UUID, payload: Any) -> RenderWor
     for key in ("enabled","draining","max_concurrency"):
         value = getattr(payload, key)
         if value is not None: setattr(row, key, value)
+    if getattr(payload, "worker_key", None) is not None:
+        worker_key = str(payload.worker_key).strip()
+        if not worker_key:
+            raise HTTPException(400, "render worker key must not be blank")
+        duplicate = (
+            db.query(RenderWorker)
+            .filter(RenderWorker.worker_key == worker_key, RenderWorker.id != row.id)
+            .one_or_none()
+        )
+        if duplicate is not None:
+            raise HTTPException(409, "render worker key is already in use")
+        row.worker_key = worker_key
     db.add(row); db.commit(); db.refresh(row)
     return row
 

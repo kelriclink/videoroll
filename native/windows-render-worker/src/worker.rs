@@ -144,15 +144,16 @@ fn run_worker(
     let api = ApiClient::new(api_base.clone())?;
 
     set_phase(&status, "pairing");
-    let credential = match Credential::load(&paths) {
-        Some(credential) => credential,
-        None => {
-            let token = enrollment_token.trim();
-            if token.is_empty() {
-                anyhow::bail!("this node is not paired; provide a one-time vre_* enrollment token");
-            }
-            enroll(&api, &config, &hardware, token, &paths, &log)?
-        }
+    let token = enrollment_token.trim();
+    let credential = if !token.is_empty() {
+        // An explicitly supplied one-time token always means "pair/recover
+        // now". This lets a node whose server-side record was deleted recover
+        // without requiring the operator to manually remove credential.json.
+        enroll(&api, &config, &hardware, token, &paths, &log)?
+    } else {
+        Credential::load(&paths).context(
+            "this node is not paired; provide a one-time vre_* enrollment token",
+        )?
     };
 
     log.info(format!(
@@ -262,10 +263,13 @@ fn enroll(
         .map(|device| device.payload(0, Vec::new()))
         .collect::<Vec<_>>();
     let request = EnrollRequest {
-        worker_key: format!(
-            "windows-native-{}",
-            hardware::computer_name().to_ascii_lowercase().replace(' ', "-")
-        ),
+        worker_key: {
+            let value = config.worker_key.trim();
+            if value.is_empty() {
+                anyhow::bail!("node key is empty");
+            }
+            value.to_string()
+        },
         name: config.node_name.clone(),
         platform: "windows".to_string(),
         architecture: Some(std::env::consts::ARCH.to_string()),

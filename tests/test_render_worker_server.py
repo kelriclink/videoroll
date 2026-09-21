@@ -6,7 +6,7 @@ import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 from videoroll.apps.orchestrator_api.render_worker_schemas import (
-    ExecutionAdminActionRequest, ExecutionFailRequest, ExecutionHeartbeatRequest, WorkerEnrollRequest, WorkerHeartbeatRequest, WorkerRegisterRequest,
+    ExecutionAdminActionRequest, ExecutionFailRequest, ExecutionHeartbeatRequest, WorkerControlRequest, WorkerEnrollRequest, WorkerHeartbeatRequest, WorkerRegisterRequest,
 )
 from videoroll.apps.orchestrator_api.services import render_worker_service
 from videoroll.db.base import Base
@@ -168,6 +168,56 @@ def test_remote_reenrollment_preserves_admin_concurrency(db: Session) -> None:
     )
     assert enrolled.id == existing.id
     assert enrolled.max_concurrency == 1
+
+
+def test_worker_key_can_be_changed_but_must_remain_unique(db: Session) -> None:
+    worker = make_worker(db)
+    updated = render_worker_service.control_worker(
+        db,
+        worker.id,
+        WorkerControlRequest(worker_key=" recovered-a380 "),
+    )
+    assert updated.worker_key == "recovered-a380"
+
+    other = render_worker_service.register_worker(db, WorkerRegisterRequest(
+        worker_key="other-node", name="Other", platform="linux", capabilities={},
+    ))
+    with pytest.raises(Exception) as exc:
+        render_worker_service.control_worker(
+            db,
+            other.id,
+            WorkerControlRequest(worker_key="recovered-a380"),
+        )
+    assert "already in use" in str(exc.value)
+
+
+def test_deleted_worker_can_be_recreated_with_same_worker_key(db: Session) -> None:
+    worker = make_worker(db)
+    original_id = worker.id
+    key = worker.worker_key
+    db.delete(worker)
+    db.commit()
+
+    _enrollment, token = render_worker_service.create_enrollment(
+        db, label="recover deleted node", ttl_minutes=30
+    )
+    recovered, credential = render_worker_service.enroll_worker(
+        db,
+        WorkerEnrollRequest(
+            worker_key=key,
+            name="Windows 4060 recovered",
+            platform="windows",
+            architecture="amd64",
+            capabilities={"encoders": ["av1_nvenc"]},
+            resources={"device_count": 1},
+            max_concurrency=2,
+            enrollment_token=token,
+        ),
+    )
+    assert recovered.id != original_id
+    assert recovered.worker_key == key
+    assert credential.startswith(render_worker_service.WORKER_CREDENTIAL_PREFIX)
+    assert render_worker_service.authenticate_worker(db, credential).id == recovered.id
 
 
 def test_admin_cancel_fences_running_execution(db: Session) -> None:
