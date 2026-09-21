@@ -1098,10 +1098,7 @@ def process_job(self: Any, job_id: str) -> dict[str, str]:
     log_key: str | None = None
     hb: _TaskQueueHeartbeat | None = None
     job_hb: JobLeaseHeartbeat | None = None
-    execution_hb: _RenderExecutionHeartbeat | None = None
     lease_owner: str | None = None
-    execution_uuid = uuid.UUID(execution_id) if execution_id else None
-    coordinator_owned = execution_uuid is not None and bool(fence_token)
     work_root: Path | None = None
     ai_usage_tokens: tuple[Any, Any] | None = None
     try:
@@ -1154,7 +1151,7 @@ def process_job(self: Any, job_id: str) -> dict[str, str]:
                 return {"status": "in_progress", "detail": "running job awaits lease recovery"}
             _kick_task_queue(countdown=_TASK_QUEUE_REQUEUE_COUNTDOWN_SECONDS)
             return {"status": "queued", "detail": "waiting for task queue"}
-        if not coordinator_owned and (task.lock_until is None or task.lock_until <= now):
+        if task.lock_until is None or task.lock_until <= now:
             task.lock_until = _task_queue_expires_at(now)
             db.add(task)
 
@@ -1781,27 +1778,17 @@ def process_job(self: Any, job_id: str) -> dict[str, str]:
                 task.error_message = str(e)
                 db.add(task)
         db.commit()
-        if coordinator_owned:
-            if execution_hb is not None:
-                execution_hb.stop()
-                execution_hb = None
-            try:
-                render_worker_service.settle_local_execution(db, execution_uuid, str(fence_token), succeeded=False, error=str(e))
-            except Exception:
-                logger.exception("failed to settle local render execution %s", execution_uuid)
         _safe_append_log_line(log_path, f"ERROR: {type(e).__name__}: {e}")
         _safe_append_log_block(log_path, traceback.format_exc())
         _safe_upload_log(store, log_path, log_key)
         _kick_task_queue()
         return {"status": "error", "detail": str(e)}
     finally:
-        if execution_hb is not None:
-            execution_hb.stop()
         if job_hb is not None:
             job_hb.stop()
         if hb is not None:
             hb.stop()
-        if lease_owner is not None and not coordinator_owned:
+        if lease_owner is not None:
             lease_db = _db()
             try:
                 release_job_lease(lease_db, jid, lease_owner)
@@ -2127,7 +2114,10 @@ def process_render_job(self: Any, render_job_id: str, execution_id: str | None =
     log_key: str | None = None
     hb: _TaskQueueHeartbeat | None = None
     job_hb: JobLeaseHeartbeat | None = None
+    execution_hb: _RenderExecutionHeartbeat | None = None
     lease_owner: str | None = None
+    execution_uuid = uuid.UUID(execution_id) if execution_id else None
+    coordinator_owned = execution_uuid is not None and bool(fence_token)
     work_root: Path | None = None
     try:
         rj = db.get(RenderJob, rid)
@@ -2166,7 +2156,7 @@ def process_render_job(self: Any, render_job_id: str, execution_id: str | None =
                 return {"status": "in_progress", "detail": "running render awaits lease recovery"}
             _kick_task_queue(countdown=_TASK_QUEUE_REQUEUE_COUNTDOWN_SECONDS)
             return {"status": "queued", "detail": "waiting for task queue"}
-        if task.lock_until is None or task.lock_until <= now:
+        if not coordinator_owned and (task.lock_until is None or task.lock_until <= now):
             task.lock_until = _task_queue_expires_at(now)
             db.add(task)
             db.commit()
@@ -2516,17 +2506,29 @@ def process_render_job(self: Any, render_job_id: str, execution_id: str | None =
                 sj.error_message = f"render failed: {e}"
                 db.add(sj)
         db.commit()
+        if coordinator_owned:
+            if execution_hb is not None:
+                execution_hb.stop()
+                execution_hb = None
+            try:
+                render_worker_service.settle_local_execution(
+                    db, execution_uuid, str(fence_token), succeeded=False, error=str(e)
+                )
+            except Exception:
+                logger.exception("failed to settle local render execution %s", execution_uuid)
         _safe_append_log_line(log_path, f"ERROR: {type(e).__name__}: {e}")
         _safe_append_log_block(log_path, traceback.format_exc())
         _safe_upload_log(store, log_path, log_key)
         _kick_task_queue()
         return {"status": "error", "detail": str(e)}
     finally:
+        if execution_hb is not None:
+            execution_hb.stop()
         if job_hb is not None:
             job_hb.stop()
         if hb is not None:
             hb.stop()
-        if lease_owner is not None:
+        if lease_owner is not None and not coordinator_owned:
             lease_db = _db()
             try:
                 release_job_lease(lease_db, rid, lease_owner)
