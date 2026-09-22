@@ -74,3 +74,38 @@ def test_auto_migrate_force_bypasses_process_cache(monkeypatch) -> None:
         ("auto_migrate_engine", "engine-for-postgresql+psycopg://user:pass@db/app"),
         ("auto_migrate_engine", "engine-for-postgresql+psycopg://user:pass@db/app"),
     ]
+
+def test_postgres_psycopg_connect_args_include_transaction_safety_timeouts() -> None:
+    args = session_module._engine_connect_args("postgresql+psycopg://user:pass@db/app")
+
+    assert args["prepare_threshold"] is None
+    options = str(args["options"])
+    assert "idle_in_transaction_session_timeout=60000" in options
+    assert "lock_timeout=10000" in options
+
+
+def test_autocommit_sessionmaker_uses_autocommit_engine(monkeypatch) -> None:
+    seen: dict[str, object] = {}
+
+    class FakeEngine:
+        def execution_options(self, **kwargs):
+            seen["execution_options"] = kwargs
+            return "autocommit-engine"
+
+    def fake_sessionmaker(**kwargs):
+        seen["sessionmaker"] = kwargs
+        return "factory"
+
+    monkeypatch.setattr(session_module, "get_engine", lambda _url: FakeEngine())
+    monkeypatch.setattr(session_module, "sessionmaker", fake_sessionmaker)
+
+    result = session_module.get_autocommit_sessionmaker("postgresql+psycopg://user:pass@db/app")
+
+    assert result == "factory"
+    assert seen["execution_options"] == {"isolation_level": "AUTOCOMMIT"}
+    assert seen["sessionmaker"] == {
+        "bind": "autocommit-engine",
+        "autocommit": False,
+        "autoflush": False,
+        "expire_on_commit": False,
+    }

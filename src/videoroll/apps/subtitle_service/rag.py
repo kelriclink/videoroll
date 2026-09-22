@@ -5588,7 +5588,7 @@ def _run_research_agents(
             try:
                 result = _run_research_agent(
                     db=db,
-                    session_factory=None,
+                    session_factory=session_factory,
                     item=item,
                     target_lang=target_lang,
                     rag_settings=rag_settings,

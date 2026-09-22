@@ -510,6 +510,63 @@ def test_run_research_agents_uses_session_factory_for_parallel_terms(monkeypatch
     assert {parent for _db, _term, parent in calls} == {"master-run"}
 
 
+
+def test_run_research_agents_uses_session_factory_for_single_term(monkeypatch) -> None:
+    from videoroll.apps.subtitle_service import rag as rag_module
+
+    events: list[object] = []
+
+    class _Session:
+        def close(self) -> None:
+            events.append("closed")
+
+    session = _Session()
+
+    def session_factory() -> _Session:
+        events.append("created")
+        return session
+
+    def fake_research(db, *, item, **_kwargs):
+        events.append(db)
+        return rag_module.AgentResearchResult(
+            term=item["term"],
+            normalized_term=normalize_term(item["term"]),
+        )
+
+    monkeypatch.setattr(rag_module, "_research_discovered_term", fake_research)
+    rag_cfg = rag_settings_from_translate_settings(
+        {
+            "rag_enabled": True,
+            "rag_agent_parallelism": 1,
+            "rag_agent_timeout_seconds": 30,
+        }
+    )
+    emb_cfg = embedding_settings_from_translate_settings(
+        {"rag_embedding_provider": "local", "rag_embedding_dimensions": 2}
+    )
+
+    results = _run_research_agents(
+        db=object(),  # type: ignore[arg-type]
+        session_factory=session_factory,  # type: ignore[arg-type]
+        items=[{"term": "AWP"}],
+        target_lang="zh",
+        rag_settings=rag_cfg,
+        embedding_settings=emb_cfg,
+        chat_config=OpenAIChatConfig(api_key="x", base_url="https://example.invalid/v1", model="demo"),
+        text_value="AWP",
+        llm_context="AWP",
+        previous_summary="",
+        existing_term_cards=[],
+        gate_duration_ms=1,
+        parent_agent_run_id="master-run",
+        task_id=None,
+        subtitle_job_id=None,
+    )
+
+    assert [item.term for item in results] == ["AWP"]
+    assert events == ["created", session, "closed"]
+
+
 def test_fallback_search_queries_include_definition_and_target_language() -> None:
     queries = _fallback_search_queries("Hopper Minecart", domain="Minecraft", target_lang="zh")
 

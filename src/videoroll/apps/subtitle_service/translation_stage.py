@@ -21,7 +21,7 @@ from videoroll.apps.subtitle_service.translation_memory import (
     remember_translation_pairs,
 )
 from videoroll.apps.subtitle_service.translation_trace import TranslationTraceRecorder
-from videoroll.db.session import get_sessionmaker
+from videoroll.db.session import get_autocommit_sessionmaker
 
 
 FreshTranslateSettings = Callable[[], dict[str, Any]]
@@ -288,30 +288,39 @@ def run_translation_stage(
                         pass
                     log(f"translate memory recall unavailable: {type(memory_error).__name__}: {memory_error}")
 
+                # Translation-memory reads above use the job session. End that
+                # transaction before any RAG agent performs web/LLM I/O so the
+                # job session cannot sit idle-in-transaction while waiting on
+                # the network.
+                try:
+                    db.commit()
+                except Exception:
+                    db.rollback()
+
                 payload: dict[str, Any] = {}
                 if current_rag_settings.enabled:
-                    ctx = build_rag_context(
-                        db,
-                        segments=batch_segments,
-                        target_lang=target_lang,
-                        rag_settings=current_rag_settings,
-                        embedding_settings=embedding_settings_from_translate_settings(current_settings),
-                        chat_config=openai_chat_config_from_settings(current_settings),
-                        previous_summary=summary,
-                        session_factory=lambda: get_sessionmaker(database_url)(),
-                        task_id=task_id,
-                        subtitle_job_id=subtitle_job_id,
-                        parent_agent_run_id=(
-                            str(batch_context.get("run_id") or "")
-                            if isinstance(batch_context, dict) and batch_context.get("run_id")
-                            else None
-                        ),
-                    )
-                    if ctx.hits:
-                        try:
-                            db.commit()
-                        except Exception:
-                            db.rollback()
+                    rag_session_factory = get_autocommit_sessionmaker(database_url)
+                    rag_db = rag_session_factory()
+                    try:
+                        ctx = build_rag_context(
+                            rag_db,
+                            segments=batch_segments,
+                            target_lang=target_lang,
+                            rag_settings=current_rag_settings,
+                            embedding_settings=embedding_settings_from_translate_settings(current_settings),
+                            chat_config=openai_chat_config_from_settings(current_settings),
+                            previous_summary=summary,
+                            session_factory=rag_session_factory,
+                            task_id=task_id,
+                            subtitle_job_id=subtitle_job_id,
+                            parent_agent_run_id=(
+                                str(batch_context.get("run_id") or "")
+                                if isinstance(batch_context, dict) and batch_context.get("run_id")
+                                else None
+                            ),
+                        )
+                    finally:
+                        rag_db.close()
                     if ctx.term_cards:
                         payload["term_cards"] = ctx.term_cards
                     if ctx.knowledge_cards:
