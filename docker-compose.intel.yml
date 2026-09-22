@@ -23,8 +23,6 @@ services:
       - "/dev/dri:/dev/dri"
     group_add:
       - "${INTEL_GPU_RENDER_GID:-992}"
-    environment:
-      CELERY_SUB_CONCURRENCY_CAP: ${CELERY_SUB_CONCURRENCY_CAP:-1}
   render-worker:
     devices:
       - "/dev/dri:/dev/dri"

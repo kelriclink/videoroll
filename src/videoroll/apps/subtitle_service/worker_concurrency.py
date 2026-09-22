@@ -545,19 +545,10 @@ def normalize_subtitle_worker_concurrency(value: Any, *, fallback: int = 1) -> i
     return n
 
 
-def subtitle_worker_concurrency_cap() -> int:
-    raw = str(os.getenv("CELERY_SUB_CONCURRENCY_CAP", "") or "").strip()
-    if not raw:
-        return _MAX_WORKER_CONCURRENCY
-    return normalize_subtitle_worker_concurrency(raw, fallback=_MAX_WORKER_CONCURRENCY)
-
-
 def subtitle_worker_concurrency_for_task_queue_settings(settings: dict[str, Any], *, fallback: int = 1) -> int:
     if not isinstance(settings, dict):
-        desired = normalize_subtitle_worker_concurrency(fallback, fallback=fallback)
-    else:
-        desired = normalize_subtitle_worker_concurrency(settings.get("max_concurrency"), fallback=fallback)
-    return min(desired, subtitle_worker_concurrency_cap())
+        return normalize_subtitle_worker_concurrency(fallback, fallback=fallback)
+    return normalize_subtitle_worker_concurrency(settings.get("max_concurrency"), fallback=fallback)
 
 
 def _as_dict(value: Any) -> dict[str, Any]:
@@ -660,13 +651,11 @@ def sync_subtitle_worker_concurrency(
     queue: str = _SUBTITLE_QUEUE_NAME,
     timeout: float = _RUNTIME_CONTROL_TIMEOUT_SECONDS,
 ) -> dict[str, Any]:
-    cap = subtitle_worker_concurrency_cap()
-    target = min(normalize_subtitle_worker_concurrency(target_concurrency), cap)
+    target = normalize_subtitle_worker_concurrency(target_concurrency)
     result: dict[str, Any] = {
         "ok": False,
         "queue": queue,
         "target_concurrency": target,
-        "concurrency_cap": cap,
         "detail": None,
         "workers": [],
     }

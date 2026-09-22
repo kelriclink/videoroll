@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import pytest
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -58,3 +59,96 @@ def test_cpu_threads_share_the_task_concurrency_budget(monkeypatch: pytest.Monke
     monkeypatch.setattr(worker, "process_cpu_count", lambda: 16)
 
     assert worker._asr_cpu_threads(object()) == expected
+
+
+def test_openvino_cpu_does_not_take_gpu_resource_lock(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(worker, "_db", lambda: (_ for _ in ()).throw(AssertionError("GPU lock DB should not be used")))
+
+    with worker._openvino_gpu_slot(device="CPU", log_path=None):
+        pass
+
+
+def test_openvino_gpu_resource_lock_waits_without_changing_worker_concurrency(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _ScalarResult:
+        def __init__(self, value: bool) -> None:
+            self.value = value
+
+        def scalar(self) -> bool:
+            return self.value
+
+    class _LockDb:
+        def __init__(self) -> None:
+            self.results = iter([False, True])
+            self.execute_calls = 0
+            self.rollbacks = 0
+            self.closed = False
+
+        def execute(self, _statement, _params):
+            self.execute_calls += 1
+            return _ScalarResult(next(self.results))
+
+        def rollback(self) -> None:
+            self.rollbacks += 1
+
+        def close(self) -> None:
+            self.closed = True
+
+    lock_db = _LockDb()
+    cancel_checks = 0
+
+    def cancel_check() -> None:
+        nonlocal cancel_checks
+        cancel_checks += 1
+
+    monkeypatch.setattr(worker, "_db", lambda: lock_db)
+    monkeypatch.setattr(worker.time, "sleep", lambda _seconds: None)
+    monkeypatch.setenv("OPENVINO_GPU_MAX_CONCURRENCY", "1")
+
+    with worker._openvino_gpu_slot(device="GPU", log_path=None, cancel_check=cancel_check):
+        assert lock_db.execute_calls == 2
+
+    assert cancel_checks >= 2
+    assert lock_db.rollbacks >= 2
+    assert lock_db.closed is True
+
+
+def test_run_asr_stage_gates_only_openvino_gpu(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    entered: list[str] = []
+
+    @contextlib.contextmanager
+    def fake_slot(*, device: str, log_path, cancel_check=None):
+        entered.append(device)
+        yield
+
+    monkeypatch.setattr(worker, "_openvino_gpu_slot", fake_slot)
+    monkeypatch.setattr(
+        worker,
+        "get_asr_settings",
+        lambda _db, _settings: {
+            "default_engine": "openvino",
+            "default_language": "auto",
+            "default_model": "/models/large-v3",
+            "openvino_device": "GPU",
+            "openvino_num_beams": 1,
+            "openvino_max_new_tokens": 32,
+            "openvino_vad_enabled": False,
+            "openvino_vad_threshold": 0.5,
+            "model_download_proxy": "",
+        },
+    )
+    monkeypatch.setattr(worker, "_resolve_openvino_model", lambda model, _root, proxy=None: model)
+    monkeypatch.setattr(worker, "transcribe_openvino_whisper", lambda *args, **kwargs: [])
+
+    result = worker._run_asr_stage(
+        db=object(),
+        audio_path=tmp_path / "audio.wav",
+        audio_key=None,
+        asr_cfg={"engine": "openvino"},
+        log_path=None,
+        groq_checkpoint_path=tmp_path / "groq.json",
+    )
+
+    assert result == []
+    assert entered == ["GPU"]

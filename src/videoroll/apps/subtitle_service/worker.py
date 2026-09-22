@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import contextlib
+import hashlib
 import json
 import logging
 import os
@@ -11,13 +13,13 @@ import traceback
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Iterator
 
 import httpx
 from celery import Celery
 from celery.exceptions import Retry
 from celery.signals import worker_init
-from sqlalchemy import or_
+from sqlalchemy import or_, text
 from sqlalchemy.orm import Session
 
 from videoroll.ai.service import AIService
@@ -405,6 +407,75 @@ def _asr_cpu_threads(db: Session) -> int:
     return min(requested, shared_budget) if requested > 0 else shared_budget
 
 
+def _openvino_uses_gpu(device: str) -> bool:
+    normalized = str(device or "").strip().upper()
+    return normalized == "AUTO" or normalized.startswith("GPU")
+
+
+def _openvino_gpu_lock_key(device: str, slot: int) -> int:
+    payload = f"videoroll:openvino-gpu:{str(device or 'GPU').strip().upper()}:{int(slot)}".encode("utf-8")
+    return int.from_bytes(hashlib.sha256(payload).digest()[:8], byteorder="big", signed=True)
+
+
+@contextlib.contextmanager
+def _openvino_gpu_slot(
+    *,
+    device: str,
+    log_path: Path | None,
+    cancel_check: Callable[[], None] | None = None,
+) -> Iterator[None]:
+    """Serialize OpenVINO GPU model use without reducing task-worker concurrency.
+
+    The task queue remains authoritative for Celery pool size. This gate only
+    limits the scarce OpenVINO GPU resource. PostgreSQL transaction-scoped
+    advisory locks coordinate prefork processes and multiple worker containers,
+    and release automatically if the owning process/connection dies.
+    """
+
+    if not _openvino_uses_gpu(device):
+        yield
+        return
+
+    max_slots = max(1, min(8, _positive_int_env("OPENVINO_GPU_MAX_CONCURRENCY", 1)))
+    lock_db = _db()
+    waiting_logged = False
+    try:
+        while True:
+            if cancel_check is not None:
+                cancel_check()
+            for slot in range(max_slots):
+                key = _openvino_gpu_lock_key(device, slot)
+                acquired = bool(
+                    lock_db.execute(
+                        text("SELECT pg_try_advisory_xact_lock(:key)"),
+                        {"key": key},
+                    ).scalar()
+                )
+                if acquired:
+                    note = f"asr: acquired OpenVINO GPU slot {slot + 1}/{max_slots} device={device}"
+                    _safe_append_log_line(log_path, note)
+                    try:
+                        yield
+                    finally:
+                        # Transaction-scoped advisory lock is released by rollback.
+                        lock_db.rollback()
+                    return
+
+            lock_db.rollback()
+            if not waiting_logged:
+                _safe_append_log_line(
+                    log_path,
+                    f"asr: waiting for OpenVINO GPU slot device={device} slots={max_slots}",
+                )
+                waiting_logged = True
+            time.sleep(0.25)
+    finally:
+        try:
+            lock_db.rollback()
+        finally:
+            lock_db.close()
+
+
 def _run_asr_stage(
     *,
     db: Session,
@@ -413,6 +484,7 @@ def _run_asr_stage(
     asr_cfg: dict[str, Any],
     log_path: Path | None,
     groq_checkpoint_path: Path,
+    cancel_check: Callable[[], None] | None = None,
 ) -> list[Segment]:
     """Resolve runtime ASR settings, execute one provider, and normalize its timeline."""
 
@@ -458,16 +530,21 @@ def _run_asr_stage(
             f"device={openvino_device} num_beams={openvino_num_beams} max_new_tokens={openvino_max_new_tokens} "
             f"vad_enabled={openvino_vad_enabled} vad_threshold={openvino_vad_threshold}",
         )
-        segments = transcribe_openvino_whisper(
-            audio_path,
-            model_name=model_name,
-            language=language,
+        with _openvino_gpu_slot(
             device=openvino_device,
-            num_beams=openvino_num_beams,
-            max_new_tokens=openvino_max_new_tokens,
-            vad_enabled=openvino_vad_enabled,
-            vad_threshold=openvino_vad_threshold,
-        )
+            log_path=log_path,
+            cancel_check=cancel_check,
+        ):
+            segments = transcribe_openvino_whisper(
+                audio_path,
+                model_name=model_name,
+                language=language,
+                device=openvino_device,
+                num_beams=openvino_num_beams,
+                max_new_tokens=openvino_max_new_tokens,
+                vad_enabled=openvino_vad_enabled,
+                vad_threshold=openvino_vad_threshold,
+            )
     elif engine == "external-whisper":
         external_base_url = str(asr_defaults.get("external_whisper_base_url") or "").strip()
         external_api_key = str(asr_defaults.get("external_whisper_api_key") or "").strip()
@@ -1586,6 +1663,7 @@ def process_job(self: Any, job_id: str) -> dict[str, str]:
                 asr_cfg=asr_cfg,
                 log_path=log_path,
                 groq_checkpoint_path=_groq_asr_checkpoint_path(),
+                cancel_check=lambda: _raise_if_task_stopped(db, task.id),
             )
             _store_source_segments(segments, source_label="asr done")
 
