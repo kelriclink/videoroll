@@ -94,6 +94,30 @@ class ProcessingRenderTests(unittest.TestCase):
             self.assertIsNone(plan)
             self.assertTrue(reason.startswith("high-churn:"), reason)
 
+    def test_event_cache_plan_is_bounded_by_video_duration(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "subtitle.ass"
+            source.write_text(
+                "[Events]\n"
+                "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
+                "Dialogue: 0,0:00:01.00,0:00:10.00,Default,,0,0,0,,Visible\n"
+                "Dialogue: 0,0:00:45.00,0:00:50.00,Default,,0,0,0,,Beyond clip\n",
+                encoding="utf-8",
+            )
+
+            plan, reason = _plan_ass_event_cache(
+                source,
+                "15/1",
+                duration_seconds=30.0,
+                min_output_frames=1,
+            )
+
+            self.assertEqual(reason, "eligible")
+            self.assertIsNotNone(plan)
+            assert plan is not None
+            self.assertEqual(plan.boundaries, (0.0, 1.0, 10.0))
+            self.assertEqual(plan.output_frame_count, 451)
+
     def test_event_cache_producer_reuses_latest_state_and_honors_stop(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -165,6 +189,7 @@ class ProcessingRenderTests(unittest.TestCase):
                     video_width=3840,
                     overlay_height=916,
                     overlay_frame_rate="15/1",
+                    duration_seconds=10.0,
                     output_dir=root,
                     log_path=None,
                     live_upload_cb=None,
@@ -398,7 +423,7 @@ class ProcessingRenderTests(unittest.TestCase):
         self.assertIn("pipe:0", cmd)
         graph = cmd[cmd.index("-filter_complex") + 1]
         self.assertNotIn("ass=", graph)
-        self.assertIn("shortest=0:repeatlast=1", graph)
+        self.assertIn("shortest=1:repeatlast=1", graph)
         self.assertIs(kwargs.get("stdin_producer"), sentinel_producer)
 
     def test_event_cache_overlay_failure_retries_live_vaapi_overlay(self) -> None:

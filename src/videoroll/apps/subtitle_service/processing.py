@@ -2653,6 +2653,54 @@ def probe_video_frame_rate(ffmpeg_path: str, video_path: Path) -> str:
     return "30/1"
 
 
+def probe_video_duration_seconds(ffmpeg_path: str, video_path: Path) -> float | None:
+    """Return container/video duration without decoding frames."""
+    ffmpeg_cmd = str(ffmpeg_path or "").strip() or "ffmpeg"
+    ffmpeg_bin = Path(ffmpeg_cmd)
+    ffprobe_name = "ffprobe" + ffmpeg_bin.suffix if ffmpeg_bin.suffix else "ffprobe"
+    candidates = dict.fromkeys((str(ffmpeg_bin.with_name(ffprobe_name)), shutil.which("ffprobe") or "ffprobe"))
+
+    for candidate in candidates:
+        if not candidate:
+            continue
+        try:
+            proc = subprocess.run(
+                [
+                    candidate,
+                    "-v",
+                    "error",
+                    "-select_streams",
+                    "v:0",
+                    "-show_entries",
+                    "stream=duration:format=duration",
+                    "-of",
+                    "json",
+                    str(video_path),
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            data = json.loads(proc.stdout or "{}")
+            values: list[Any] = []
+            streams = data.get("streams")
+            if isinstance(streams, list) and streams and isinstance(streams[0], dict):
+                values.append(streams[0].get("duration"))
+            container = data.get("format")
+            if isinstance(container, dict):
+                values.append(container.get("duration"))
+            for raw in values:
+                try:
+                    duration = float(raw)
+                except (TypeError, ValueError):
+                    continue
+                if math.isfinite(duration) and duration > 0:
+                    return duration
+        except Exception:
+            continue
+    return None
+
+
 def _prepare_ass_overlay_band(
     ass_path: Path,
     *,
@@ -2858,6 +2906,7 @@ def _plan_ass_event_cache(
     ass_path: Path,
     overlay_frame_rate: str,
     *,
+    duration_seconds: float | None = None,
     max_states: int = 4096,
     max_state_ratio: float = 0.20,
     min_output_frames: int = 90,
@@ -2866,6 +2915,13 @@ def _plan_ass_event_cache(
         return None, "complex-or-animated-ass"
 
     boundaries = _ass_event_boundaries(ass_path)
+    if duration_seconds is not None and duration_seconds > 0:
+        boundaries = tuple(
+            boundary for boundary in boundaries
+            if boundary <= duration_seconds + 1e-6
+        )
+        if not boundaries or boundaries[0] != 0.0:
+            boundaries = (0.0, *boundaries)
     if len(boundaries) < 2:
         return None, "insufficient-event-boundaries"
     if len(boundaries) > max_states:
@@ -2876,9 +2932,14 @@ def _plan_ass_event_cache(
         return None, "invalid-overlay-frame-rate"
 
     last_boundary = boundaries[-1]
-    if last_boundary <= 0:
+    timeline_end = (
+        float(duration_seconds)
+        if duration_seconds is not None and duration_seconds > 0
+        else last_boundary
+    )
+    if timeline_end <= 0:
         return None, "zero-duration-events"
-    output_frame_count = int(math.ceil(last_boundary * overlay_fps)) + 1
+    output_frame_count = int(math.ceil(timeline_end * overlay_fps)) + 1
     if output_frame_count < min_output_frames:
         return None, f"too-short:{output_frame_count}<{min_output_frames}"
 
@@ -2904,13 +2965,18 @@ def _prepare_ass_event_cache(
     video_width: int,
     overlay_height: int,
     overlay_frame_rate: str,
+    duration_seconds: float | None = None,
     output_dir: Path,
     log_path: Path | None,
     live_upload_cb: Callable[[], None] | None,
     cancel_event: threading.Event | None,
     max_cache_bytes: int = 256 * 1024 * 1024,
 ) -> tuple[AssEventCache | None, str]:
-    plan, reason = _plan_ass_event_cache(ass_path, overlay_frame_rate)
+    plan, reason = _plan_ass_event_cache(
+        ass_path,
+        overlay_frame_rate,
+        duration_seconds=duration_seconds,
+    )
     if plan is None:
         return None, reason
 
@@ -3598,6 +3664,7 @@ def render_burn_in(
                 compose_mode = f"vaapi-overlay-full {video_width}x{video_height}"
 
             frame_rate = probe_video_frame_rate(ffmpeg_path, video_path)
+            video_duration = probe_video_duration_seconds(ffmpeg_path, video_path)
             overlay_frame_rate = frame_rate
             static_overlay = overlay_band is not None and _ass_can_use_reduced_overlay_rate(ass_path)
             if static_overlay:
@@ -3633,6 +3700,7 @@ def render_burn_in(
                         video_width=video_width,
                         overlay_height=overlay_height,
                         overlay_frame_rate=overlay_frame_rate,
+                        duration_seconds=video_duration,
                         output_dir=output_path.parent,
                         log_path=log_path,
                         live_upload_cb=live_upload_cb,
@@ -3661,7 +3729,7 @@ def render_burn_in(
                         f"[0:v]{main_filter}[main];"
                         f"[1:v]format=bgra,hwupload[sub];"
                         f"[main][sub]overlay_vaapi=x=0:y={overlay_y}:"
-                        "shortest=0:repeatlast=1[out]"
+                        "shortest=1:repeatlast=1[out]"
                     )
                     compose_mode += (
                         f" event-cache states={len(event_cache.plan.boundaries)}"
