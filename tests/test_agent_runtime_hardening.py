@@ -695,8 +695,10 @@ def test_checkpoint_save_fence_rejects_stale_worker() -> None:
         def __init__(self) -> None:
             self.rolled_back = False
             self.committed = False
+            self.statement = ""
 
-        def execute(self, *_args, **_kwargs):
+        def execute(self, statement, *_args, **_kwargs):
+            self.statement = str(statement)
             return SimpleNamespace(rowcount=0)
 
         def rollback(self) -> None:
@@ -723,6 +725,7 @@ def test_checkpoint_save_fence_rejects_stale_worker() -> None:
 
     assert db.rolled_back
     assert not db.committed
+    assert "CAST(:expected_lease_owner AS varchar)" in db.statement
 
 
 def test_finish_fence_rejects_stale_worker(monkeypatch) -> None:
@@ -734,8 +737,10 @@ def test_finish_fence_rejects_stale_worker(monkeypatch) -> None:
         def __init__(self) -> None:
             self.rolled_back = False
             self.committed = False
+            self.statement = ""
 
-        def execute(self, *_args, **_kwargs):
+        def execute(self, statement, *_args, **_kwargs):
+            self.statement = str(statement)
             return SimpleNamespace(rowcount=0)
 
         def rollback(self) -> None:
@@ -762,6 +767,7 @@ def test_finish_fence_rejects_stale_worker(monkeypatch) -> None:
 
     assert db.rolled_back
     assert not db.committed
+    assert "CAST(:expected_lease_owner AS varchar)" in db.statement
 
 
 def test_finish_agent_run_uses_independent_postgres_trace_session(monkeypatch) -> None:

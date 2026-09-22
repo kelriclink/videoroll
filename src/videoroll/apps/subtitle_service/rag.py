@@ -1278,7 +1278,7 @@ def _save_agent_checkpoint(
                     lease_until = :lease_until,
                     updated_at = now()
                 WHERE id = CAST(:id AS uuid)
-                  AND (:expected_lease_owner IS NULL OR lease_owner = :expected_lease_owner)
+                  AND (CAST(:expected_lease_owner AS varchar) IS NULL OR lease_owner = CAST(:expected_lease_owner AS varchar))
                 """
             ),
             {
@@ -1991,7 +1991,7 @@ def _finish_agent_run(
                     lease_until = NULL,
                     updated_at = now()
                 WHERE id = CAST(:id AS uuid)
-                  AND (:expected_lease_owner IS NULL OR lease_owner = :expected_lease_owner)
+                  AND (CAST(:expected_lease_owner AS varchar) IS NULL OR lease_owner = CAST(:expected_lease_owner AS varchar))
                 """
             ),
             {
