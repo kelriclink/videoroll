@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import os
 import unittest
 from contextlib import redirect_stdout, redirect_stderr
 from unittest.mock import patch
@@ -14,6 +15,7 @@ from videoroll.apps.subtitle_service.worker_concurrency import (
     resolve_subtitle_worker_concurrency_with_retry,
     sync_subtitle_worker_concurrency,
     sync_subtitle_worker_concurrency_for_task_queue_settings,
+    subtitle_worker_concurrency_cap,
     subtitle_worker_concurrency_for_task_queue_settings,
 )
 from videoroll.apps.subtitle_service.queues import SUBTITLE_CONTROL_QUEUE
@@ -86,6 +88,25 @@ class WorkerConcurrencyTests(unittest.TestCase):
         self.assertEqual(subtitle_worker_concurrency_for_task_queue_settings({"max_concurrency": 2}), 2)
         self.assertEqual(subtitle_worker_concurrency_for_task_queue_settings({"max_concurrency": 7}), 7)
         self.assertEqual(subtitle_worker_concurrency_for_task_queue_settings({"max_concurrency": 0}), 1)
+
+    def test_worker_concurrency_cap_limits_settings_and_runtime_sync(self) -> None:
+        fake_celery = _FakeCeleryApp(
+            active_queues={"celery@subtitle": [{"name": "subtitle"}]},
+            stats={"celery@subtitle": {"pool": {"max-concurrency": 4}}},
+        )
+
+        with patch.dict(os.environ, {"CELERY_SUB_CONCURRENCY_CAP": "1"}, clear=False):
+            self.assertEqual(subtitle_worker_concurrency_cap(), 1)
+            self.assertEqual(subtitle_worker_concurrency_for_task_queue_settings({"max_concurrency": 7}), 1)
+            result = sync_subtitle_worker_concurrency(fake_celery, 7, timeout=2.0)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["target_concurrency"], 1)
+        self.assertEqual(result["concurrency_cap"], 1)
+        self.assertEqual(
+            fake_celery.control.shrink_calls,
+            [{"n": 3, "destination": ["celery@subtitle"], "reply": True, "timeout": 2.0}],
+        )
 
     def test_sync_grows_only_workers_consuming_subtitle_queue(self) -> None:
         fake_celery = _FakeCeleryApp(
