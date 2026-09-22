@@ -70,6 +70,20 @@ def test_execution_heartbeat_renews_job_and_execution_lease(db: Session) -> None
     assert job.progress == 37 and job.lease_until == result.lease_until
 
 
+def test_list_executions_can_filter_by_task(db: Session) -> None:
+    worker = make_worker(db)
+    first = make_job(db, priority=10)
+    second = make_job(db, priority=0)
+    first_execution, _ = render_worker_service.claim_job(db, store(), worker.id, ["http"])
+    second_execution, _ = render_worker_service.claim_job(db, store(), worker.id, ["http"])
+    assert first_execution is not None and second_execution is not None
+
+    rows = render_worker_service.list_executions(db, task_id=first.task_id)
+
+    assert [row.id for row in rows] == [first_execution.id]
+    assert second_execution.id not in {row.id for row in rows}
+
+
 def test_execution_heartbeat_without_progress_renews_only_execution_lease(db: Session) -> None:
     worker = make_worker(db); job = make_job(db)
     execution, _ = render_worker_service.claim_job(db, store(), worker.id, ["http"])

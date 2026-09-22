@@ -55,10 +55,22 @@ def revoke_worker(worker_id: uuid.UUID, db: Session = Depends(get_db)):
     return render_worker_service.worker_admin_payload(row)
 
 @router.get("/executions", response_model=list[ExecutionAdminRead])
-def executions(worker_id: uuid.UUID | None = None, state: str | None = None, limit: int = 100, db: Session = Depends(get_db)):
+def executions(
+    worker_id: uuid.UUID | None = None,
+    task_id: uuid.UUID | None = None,
+    state: str | None = None,
+    limit: int = 100,
+    db: Session = Depends(get_db),
+):
     return [
         render_worker_service.execution_admin_payload(db, row)
-        for row in render_worker_service.list_executions(db, worker_id=worker_id, state=state, limit=limit)
+        for row in render_worker_service.list_executions(
+            db,
+            worker_id=worker_id,
+            task_id=task_id,
+            state=state,
+            limit=limit,
+        )
     ]
 
 @router.get("/executions/{execution_id}", response_model=ExecutionAdminRead)

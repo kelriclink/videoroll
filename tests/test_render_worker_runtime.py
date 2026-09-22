@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sys
 import threading
+import time
 import uuid
 from pathlib import Path
 from unittest.mock import Mock
@@ -365,3 +366,35 @@ def test_process_runner_surfaces_stdin_producer_failure() -> None:
             log_path=None,
             stdin_producer=producer,
         )
+
+
+def test_process_runner_parses_ffmpeg_style_progress_pipe() -> None:
+    from videoroll.apps.subtitle_service.processing import _ffmpeg_progress_metrics, _run_logged
+
+    snapshots: list[dict[str, str]] = []
+    _run_logged(
+        [
+            sys.executable,
+            "-c",
+            (
+                "print('frame=120');"
+                "print('fps=60.0');"
+                "print('out_time_us=2000000');"
+                "print('speed=1.50x');"
+                "print('total_size=1234');"
+                "print('progress=continue')"
+            ),
+        ],
+        log_path=None,
+        progress_callback=snapshots.append,
+    )
+
+    assert len(snapshots) == 1
+    metrics = _ffmpeg_progress_metrics(snapshots[0], duration_seconds=10.0, started_at=time.monotonic() - 1.0)
+    assert metrics["frame"] == 120
+    assert metrics["fps"] == 60.0
+    assert metrics["speed"] == 1.5
+    assert metrics["out_time_seconds"] == 2.0
+    assert metrics["render_percent"] == 20.0
+    assert metrics["eta_seconds"] == pytest.approx(5.333, abs=0.001)
+    assert metrics["total_size"] == 1234

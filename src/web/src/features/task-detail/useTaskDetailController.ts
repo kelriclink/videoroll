@@ -6,12 +6,15 @@ import { useTaskLogs } from "./hooks/useTaskLogs";
 import { useTaskMedia } from "./hooks/useTaskMedia";
 import { useTaskPublish } from "./hooks/useTaskPublish";
 import { useTaskRealtime } from "./hooks/useTaskRealtime";
+import { useTaskRender } from "./hooks/useTaskRender";
 import { useTaskSubtitle } from "./hooks/useTaskSubtitle";
+import { formatRenderFps, formatRenderSpeed, getRenderTelemetry } from "../renderTelemetry";
 
 export function useTaskDetailController(taskId: string | undefined) {
   const [activeTab, setActiveTab] = useState<TaskDetailTab>("overview");
   const [busy, setBusy] = useState(false);
   const core = useTaskCore(taskId);
+  const render = useTaskRender(taskId);
   const logs = useTaskLogs({ taskId, assets: core.assets, activeTab });
   const controls = useTaskControls({
     taskId,
@@ -86,6 +89,8 @@ export function useTaskDetailController(taskId: string | undefined) {
     const failed = core.task.status === "FAILED";
     const hasSubtitle = media.subtitleAssets.length > 0 || ["SUBTITLE_READY", "RENDERED", "READY_FOR_REVIEW", "APPROVED", "PUBLISHING", "PUBLISHED"].includes(core.task.status);
     const hasFinalVideo = media.finalAssets.length > 0 || ["RENDERED", "READY_FOR_REVIEW", "APPROVED", "PUBLISHING", "PUBLISHED"].includes(core.task.status);
+    const activeRender = render.activeRenderExecutions[0] ?? null;
+    const activeTelemetry = activeRender ? getRenderTelemetry(activeRender) : null;
     const reviewDone = ["APPROVED", "PUBLISHING", "PUBLISHED"].includes(core.task.status);
     const published = core.task.status === "PUBLISHED";
     return [
@@ -102,8 +107,12 @@ export function useTaskDetailController(taskId: string | undefined) {
       },
       {
         label: "渲染",
-        detail: hasFinalVideo ? `${media.finalAssets.length || 1} 个最终视频` : hasSubtitle ? "等待压制最终视频" : "等待字幕阶段完成",
-        state: hasFinalVideo ? "done" : failed && hasSubtitle ? "failed" : hasSubtitle ? "active" : "pending",
+        detail: hasFinalVideo
+          ? `${media.finalAssets.length || 1} 个最终视频`
+          : activeTelemetry
+            ? `${activeTelemetry.overallProgress}% · ${formatRenderFps(activeTelemetry.fps)} · ${formatRenderSpeed(activeTelemetry.speed)}`
+            : hasSubtitle ? "等待压制最终视频" : "等待字幕阶段完成",
+        state: hasFinalVideo ? "done" : activeRender ? "active" : failed && hasSubtitle ? "failed" : hasSubtitle ? "active" : "pending",
       },
       {
         label: "审核",
@@ -123,6 +132,7 @@ export function useTaskDetailController(taskId: string | undefined) {
     media.subtitleAssets,
     publish.failedPublishJobs,
     publish.runningPublishJobs,
+    render.activeRenderExecutions,
     runningSubtitleJobs,
   ]);
 
@@ -241,6 +251,7 @@ export function useTaskDetailController(taskId: string | undefined) {
     ...publish,
     ...logs,
     ...controls,
+    ...render,
     failedSubtitleJobs,
     runningSubtitleJobs,
     workflowSteps,

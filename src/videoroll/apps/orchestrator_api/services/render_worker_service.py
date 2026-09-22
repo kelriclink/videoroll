@@ -265,11 +265,18 @@ def worker_admin_payload(worker: RenderWorker) -> dict[str, Any]:
     }
 
 def list_executions(
-    db: Session, *, worker_id: uuid.UUID | None = None, state: str | None = None, limit: int = 100
+    db: Session,
+    *,
+    worker_id: uuid.UUID | None = None,
+    task_id: uuid.UUID | None = None,
+    state: str | None = None,
+    limit: int = 100,
 ) -> list[RenderExecution]:
     q = db.query(RenderExecution)
     if worker_id is not None:
         q = q.filter(RenderExecution.worker_id == worker_id)
+    if task_id is not None:
+        q = q.join(RenderJob, RenderJob.id == RenderExecution.render_job_id).filter(RenderJob.task_id == task_id)
     if state:
         q = q.filter(RenderExecution.state == state)
     return q.order_by(RenderExecution.created_at.desc()).limit(max(1, min(limit, 500))).all()

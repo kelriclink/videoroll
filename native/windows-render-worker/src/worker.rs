@@ -18,7 +18,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
-const WORKER_VERSION: &str = "0.1.0";
+const WORKER_VERSION: &str = "0.1.1";
 
 #[derive(Debug, Clone)]
 pub struct JobTelemetry {
@@ -790,7 +790,7 @@ fn start_execution_heartbeat(
                 next_cancel = Instant::now() + Duration::from_secs(5);
             }
 
-            for _ in 0..20 {
+            for _ in 0..10 {
                 if stop.load(Ordering::Relaxed) || cancel.load(Ordering::Relaxed) {
                     return;
                 }
@@ -814,7 +814,10 @@ fn metrics(device: &Device, telemetry: &Arc<Mutex<JobTelemetry>>) -> Value {
         "speed": job.as_ref().map(|value| value.speed).unwrap_or(0.0),
         "render_percent": job.as_ref().map(|value| value.percent).unwrap_or(0.0),
         "out_time_seconds": job.as_ref().map(|value| value.out_time_seconds).unwrap_or(0.0),
+        "duration_seconds": job.as_ref().and_then(|value| value.duration_seconds),
         "elapsed_seconds": job.as_ref().map(|value| value.elapsed_seconds).unwrap_or(0.0),
+        "bitrate": job.as_ref().map(|value| value.bitrate.as_str()).unwrap_or(""),
+        "total_size": job.as_ref().map(|value| value.total_size).unwrap_or(0),
         "source_codec": job.as_ref().map(|value| value.source_codec.as_str()).unwrap_or(""),
         "source_width": job.as_ref().map(|value| value.source_width).unwrap_or(0),
         "source_height": job.as_ref().map(|value| value.source_height).unwrap_or(0),

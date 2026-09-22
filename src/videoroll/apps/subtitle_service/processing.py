@@ -238,6 +238,78 @@ def _append_processing_log_note(log_path: Path | None, message: str) -> None:
         pass
 
 
+def _parse_ffmpeg_clock(value: str | None) -> float:
+    raw = str(value or "").strip()
+    if not raw:
+        return 0.0
+    try:
+        hours_s, minutes_s, seconds_s = raw.split(":", 2)
+        return max(0.0, int(hours_s) * 3600.0 + int(minutes_s) * 60.0 + float(seconds_s))
+    except Exception:
+        return 0.0
+
+
+def _ffmpeg_progress_metrics(
+    snapshot: dict[str, str],
+    *,
+    duration_seconds: float | None,
+    started_at: float,
+) -> dict[str, Any]:
+    def _float(key: str, default: float = 0.0) -> float:
+        raw = str(snapshot.get(key) or "").strip().rstrip("x")
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            return default
+        return value if math.isfinite(value) else default
+
+    def _int(key: str, default: int = 0) -> int:
+        try:
+            return max(0, int(float(str(snapshot.get(key) or "").strip())))
+        except (TypeError, ValueError):
+            return default
+
+    out_time = 0.0
+    # Modern FFmpeg emits out_time_us. Some older builds expose out_time_ms
+    # with the same microsecond-scale value, so prefer the explicit *_us key.
+    if snapshot.get("out_time_us"):
+        out_time = max(0.0, _float("out_time_us") / 1_000_000.0)
+    elif snapshot.get("out_time_ms"):
+        out_time = max(0.0, _float("out_time_ms") / 1_000_000.0)
+    elif snapshot.get("out_time"):
+        out_time = _parse_ffmpeg_clock(snapshot.get("out_time"))
+
+    speed = max(0.0, _float("speed"))
+    elapsed = max(0.0, time.monotonic() - started_at)
+    duration = (
+        float(duration_seconds)
+        if duration_seconds is not None and math.isfinite(float(duration_seconds)) and float(duration_seconds) > 0
+        else None
+    )
+    render_percent = (
+        min(100.0, max(0.0, out_time / duration * 100.0))
+        if duration is not None
+        else 0.0
+    )
+    eta_seconds = (
+        max(0.0, (duration - out_time) / speed)
+        if duration is not None and speed > 0.001
+        else None
+    )
+    return {
+        "frame": _int("frame"),
+        "fps": round(max(0.0, _float("fps")), 3),
+        "speed": round(speed, 4),
+        "render_percent": round(render_percent, 3),
+        "out_time_seconds": round(out_time, 3),
+        "duration_seconds": round(duration, 3) if duration is not None else None,
+        "elapsed_seconds": round(elapsed, 3),
+        "eta_seconds": round(eta_seconds, 3) if eta_seconds is not None else None,
+        "bitrate": str(snapshot.get("bitrate") or ""),
+        "total_size": _int("total_size"),
+    }
+
+
 def _run_logged(
     cmd: list[str],
     *,
@@ -246,8 +318,15 @@ def _run_logged(
     live_upload_interval_seconds: float = 3.0,
     cancel_event: threading.Event | None = None,
     stdin_producer: Callable[[Any, threading.Event], None] | None = None,
+    progress_callback: Callable[[dict[str, str]], None] | None = None,
 ) -> None:
-    if log_path is None and live_upload_cb is None and cancel_event is None and stdin_producer is None:
+    if (
+        log_path is None
+        and live_upload_cb is None
+        and cancel_event is None
+        and stdin_producer is None
+        and progress_callback is None
+    ):
         _run(cmd)
         return
 
@@ -270,7 +349,7 @@ def _run_logged(
                 pass
 
         popen_kwargs: dict[str, Any] = {
-            "stdout": f if f is not None else None,
+            "stdout": subprocess.PIPE if progress_callback is not None else (f if f is not None else None),
             "stderr": f if f is not None else None,
         }
         if stdin_producer is not None:
@@ -284,6 +363,36 @@ def _run_logged(
         producer_stop = threading.Event()
         producer_errors: list[BaseException] = []
         producer_thread: threading.Thread | None = None
+        progress_thread: threading.Thread | None = None
+
+        if progress_callback is not None and proc.stdout is not None:
+            def _read_progress() -> None:
+                current: dict[str, str] = {}
+                try:
+                    for raw_line in iter(proc.stdout.readline, b""):
+                        line = raw_line.decode("utf-8", errors="replace").strip()
+                        if "=" not in line:
+                            continue
+                        key, value = line.split("=", 1)
+                        current[key.strip()] = value.strip()
+                        if key.strip() == "progress":
+                            try:
+                                progress_callback(dict(current))
+                            except Exception:
+                                # Telemetry must never make a render fail.
+                                pass
+                finally:
+                    try:
+                        proc.stdout.close()
+                    except Exception:
+                        pass
+
+            progress_thread = threading.Thread(
+                target=_read_progress,
+                name="videoroll-ffmpeg-progress",
+                daemon=True,
+            )
+            progress_thread.start()
 
         if stdin_producer is not None:
             def _produce_stdin() -> None:
@@ -386,6 +495,8 @@ def _run_logged(
                     rc = -1
         if producer_thread is not None:
             producer_thread.join(timeout=5)
+        if progress_thread is not None:
+            progress_thread.join(timeout=5)
 
         if live_upload_cb is not None:
             try:
@@ -3467,8 +3578,12 @@ def render_burn_in(
 ) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     codec = str(video_codec or "").strip().lower() or "av1"
+    source_duration_seconds = probe_video_duration_seconds(ffmpeg_path, video_path)
+    render_started_at = time.monotonic()
     ass_filter = f"ass={str(ass_path).replace(':', r'\:')}"
     cmd = [ffmpeg_path, "-y"]
+    encoder = ""
+    pipeline = ""
     intel_h264_preset_quality = {
         "placebo": 1,
         "veryslow": 1,
@@ -3503,6 +3618,37 @@ def render_burn_in(
     map_args: list[str] = []
     live_overlay_extra_input_args: list[str] = []
     live_overlay_filter_complex: str | None = None
+
+    def _on_ffmpeg_progress(snapshot: dict[str, str]) -> None:
+        if render_metrics is None:
+            return
+        render_metrics.update(
+            _ffmpeg_progress_metrics(
+                snapshot,
+                duration_seconds=source_duration_seconds,
+                started_at=render_started_at,
+            )
+        )
+        render_metrics["stage"] = "rendering"
+
+    def _with_ffmpeg_progress(command: list[str]) -> list[str]:
+        if render_metrics is None:
+            return command
+        return [command[0], "-progress", "pipe:1", "-nostats", *command[1:]]
+
+    def _run_render_command(
+        command: list[str],
+        *,
+        stdin_producer: Callable[[Any, threading.Event], None] | None = None,
+    ) -> None:
+        _run_logged(
+            _with_ffmpeg_progress(command),
+            log_path=log_path,
+            live_upload_cb=live_upload_cb,
+            cancel_event=cancel_event,
+            stdin_producer=stdin_producer,
+            progress_callback=_on_ffmpeg_progress if render_metrics is not None else None,
+        )
 
     if sum(bool(value) for value in (use_intel_gpu, use_intel_qsv, use_nvidia_gpu)) > 1:
         raise ValueError("render backend cannot use multiple hardware backends at the same time")
@@ -3544,6 +3690,7 @@ def render_burn_in(
         if nvidia_gpu_index is not None:
             video_args.extend(["-gpu", str(int(nvidia_gpu_index))])
         filter_arg = ass_filter
+        pipeline = "cpu-ass-nvenc"
         note = (
             f"NVIDIA render pipeline: encoder={encoder} gpu={nvidia_gpu_index if nvidia_gpu_index is not None else 'auto'} "
             f"preset={effective_preset} cq={effective_cq}"
@@ -3580,6 +3727,7 @@ def render_burn_in(
             "-global_quality", str(effective_quality),
         ]
         filter_arg = ass_filter
+        pipeline = "cpu-ass-qsv"
         note = (
             f"Intel QSV render pipeline: encoder={encoder} "
             f"device={intel_qsv_device_index if intel_qsv_device_index is not None else 'auto'} "
@@ -3599,6 +3747,7 @@ def render_burn_in(
                     "Current ffmpeg build does not support h264_vaapi; rebuild the image with VAAPI support or disable Intel GPU burn-in."
                 )
             effective_qp = 23 if crf is None else max(0, min(51, int(crf)))
+            encoder = "h264_vaapi"
             video_args = ["-c:v", "h264_vaapi", "-rc_mode", "CQP", "-qp", str(effective_qp)]
             quality = intel_h264_preset_quality.get(str(preset or "").strip().lower())
         else:
@@ -3607,6 +3756,7 @@ def render_burn_in(
                     "Current ffmpeg build does not support av1_vaapi; switch video_codec to h264 for Intel GPU burn-in, or disable Intel GPU and keep CPU AV1."
                 )
             effective_global_quality = 24 if crf is None else max(0, min(63, int(crf)))
+            encoder = "av1_vaapi"
             video_args = ["-c:v", "av1_vaapi", "-rc_mode", "CQP", "-global_quality", str(effective_global_quality)]
             quality = _intel_av1_quality(preset)
         if quality is not None:
@@ -3662,7 +3812,7 @@ def render_burn_in(
                 compose_mode = f"vaapi-overlay-full {video_width}x{video_height}"
 
             frame_rate = probe_video_frame_rate(ffmpeg_path, video_path)
-            video_duration = probe_video_duration_seconds(ffmpeg_path, video_path)
+            video_duration = source_duration_seconds
             overlay_frame_rate = frame_rate
             static_overlay = overlay_band is not None and _ass_can_use_reduced_overlay_rate(ass_path)
             if static_overlay:
@@ -3785,9 +3935,11 @@ def render_burn_in(
 
             map_args = ["-map", "[out]", "-map", "0:a?"]
             filter_arg = ""
+            pipeline = compose_mode
         else:
             filter_arg = legacy_filter_arg
             compose_mode = "legacy-full-frame"
+            pipeline = compose_mode
             if render_metrics is not None:
                 render_metrics["subtitle_overlay_mode"] = "legacy-full-frame"
 
@@ -3816,6 +3968,8 @@ def render_burn_in(
         }
         preset_s = str(preset or "").strip().lower()
         effective_preset = preset_s if preset_s in allowed_presets else "veryfast"
+        encoder = "libx264"
+        pipeline = "cpu-ass-libx264"
         video_args = ["-c:v", "libx264", "-preset", effective_preset, "-crf", str(effective_crf)]
         filter_arg = ass_filter
     else:
@@ -3829,8 +3983,22 @@ def render_burn_in(
         except Exception:
             preset_n = None
         effective_preset_n = 4 if preset_n is None else max(0, min(13, preset_n))
+        encoder = "libsvtav1"
+        pipeline = "cpu-ass-libsvtav1"
         video_args = ["-c:v", "libsvtav1", "-preset", str(effective_preset_n), "-crf", str(effective_crf)]
         filter_arg = ass_filter
+
+    if render_metrics is not None:
+        render_metrics.update(
+            {
+                "stage": "rendering",
+                "encoder": encoder,
+                "pipeline": pipeline,
+                "duration_seconds": round(source_duration_seconds, 3)
+                if source_duration_seconds is not None
+                else None,
+            }
+        )
 
     def _build_overlay_command(input_args: list[str], graph: str) -> list[str]:
         return [
@@ -3867,6 +4035,7 @@ def render_burn_in(
                 {
                     "subtitle_overlay_mode": "legacy-full-frame-fallback",
                     "subtitle_overlay_failure": type(reason).__name__,
+                    "pipeline": "legacy-full-frame-fallback",
                 }
             )
         _remove_partial_output()
@@ -3881,24 +4050,13 @@ def render_burn_in(
             "copy",
             str(output_path),
         ]
-        _run_logged(
-            legacy_cmd,
-            log_path=log_path,
-            live_upload_cb=live_upload_cb,
-            cancel_event=cancel_event,
-        )
+        _run_render_command(legacy_cmd)
 
     try:
         if filter_complex is not None:
             overlay_cmd = _build_overlay_command(extra_input_args, filter_complex)
             try:
-                _run_logged(
-                    overlay_cmd,
-                    log_path=log_path,
-                    live_upload_cb=live_upload_cb,
-                    cancel_event=cancel_event,
-                    stdin_producer=overlay_stdin_producer,
-                )
+                _run_render_command(overlay_cmd, stdin_producer=overlay_stdin_producer)
             except (OSError, subprocess.CalledProcessError, RuntimeError) as exc:
                 if cancel_event is not None and cancel_event.is_set():
                     raise
@@ -3914,6 +4072,7 @@ def render_burn_in(
                             {
                                 "subtitle_overlay_mode": "live-static-fallback",
                                 "subtitle_event_cache_failure": type(exc).__name__,
+                                "pipeline": "vaapi-live-static-fallback",
                             }
                         )
                     _remove_partial_output()
@@ -3922,12 +4081,7 @@ def render_burn_in(
                         live_overlay_filter_complex,
                     )
                     try:
-                        _run_logged(
-                            live_overlay_cmd,
-                            log_path=log_path,
-                            live_upload_cb=live_upload_cb,
-                            cancel_event=cancel_event,
-                        )
+                        _run_render_command(live_overlay_cmd)
                     except (OSError, subprocess.CalledProcessError, RuntimeError) as live_exc:
                         _run_legacy_fallback(live_exc)
                 else:
@@ -3945,12 +4099,7 @@ def render_burn_in(
                     str(output_path),
                 ]
             )
-            _run_logged(
-                cmd,
-                log_path=log_path,
-                live_upload_cb=live_upload_cb,
-                cancel_event=cancel_event,
-            )
+            _run_render_command(cmd)
     finally:
         if event_cache is not None:
             shutil.rmtree(event_cache.directory, ignore_errors=True)
@@ -3970,8 +4119,11 @@ def mux_soft_sub(
     log_path: Path | None = None,
     live_upload_cb: Callable[[], None] | None = None,
     cancel_event: threading.Event | None = None,
+    render_metrics: dict[str, Any] | None = None,
 ) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    duration_seconds = probe_video_duration_seconds(ffmpeg_path, video_path)
+    started_at = time.monotonic()
     cmd = [
         ffmpeg_path,
         "-y",
@@ -3993,11 +4145,35 @@ def mux_soft_sub(
         "language=chi",
         str(output_path),
     ]
+    if render_metrics is not None:
+        render_metrics.update(
+            {
+                "stage": "rendering",
+                "encoder": "copy",
+                "pipeline": "stream-copy-soft-sub",
+                "duration_seconds": round(duration_seconds, 3) if duration_seconds is not None else None,
+            }
+        )
+        cmd = [cmd[0], "-progress", "pipe:1", "-nostats", *cmd[1:]]
+
+    def _on_progress(snapshot: dict[str, str]) -> None:
+        if render_metrics is None:
+            return
+        render_metrics.update(
+            _ffmpeg_progress_metrics(
+                snapshot,
+                duration_seconds=duration_seconds,
+                started_at=started_at,
+            )
+        )
+        render_metrics["stage"] = "rendering"
+
     _run_logged(
         cmd,
         log_path=log_path,
         live_upload_cb=live_upload_cb,
         cancel_event=cancel_event,
+        progress_callback=_on_progress if render_metrics is not None else None,
     )
 
 

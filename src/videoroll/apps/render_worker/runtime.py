@@ -494,10 +494,29 @@ class RenderWorkerRuntime:
             "device_id": device.id,
             "device_name": device.name,
             "backend": device.backend,
+            "stage": "downloading",
         }
 
+        def current_execution_progress() -> int:
+            stage = str(execution_metrics.get("stage") or "").strip().lower()
+            if stage in {"claimed", "downloading"}:
+                return 10
+            if stage == "uploading":
+                return 90
+            if stage == "complete":
+                return 100
+            if stage == "rendering":
+                try:
+                    render_percent = float(execution_metrics.get("render_percent") or 0.0)
+                except (TypeError, ValueError):
+                    render_percent = 0.0
+                return int(round(20.0 + max(0.0, min(100.0, render_percent)) * 0.7))
+            return 5
+
         def heartbeat_loop() -> None:
-            heartbeat_interval = max(5.0, min(float(self.settings.heartbeat_interval_seconds), 15.0))
+            # Render telemetry is user-facing, so keep execution heartbeats
+            # reasonably fresh even when the node-level heartbeat is slower.
+            heartbeat_interval = 5.0
             request_timeout = max(2.0, min(float(self.settings.request_timeout_seconds), 10.0))
             next_heartbeat = 0.0
             next_cancel_poll = 0.0
@@ -511,7 +530,7 @@ class RenderWorkerRuntime:
                             "heartbeat",
                             {
                                 "fence_token": fence,
-                                "progress": None,
+                                "progress": current_execution_progress(),
                                 "metrics": dict(execution_metrics),
                             },
                             timeout_seconds=request_timeout,
@@ -586,6 +605,7 @@ class RenderWorkerRuntime:
             if spec.mode == "soft_sub" and srt_path is None:
                 raise RuntimeError("soft-sub render requires an SRT artifact")
 
+            execution_metrics["stage"] = "rendering"
             self._execution_post(
                 execution_id,
                 "progress",
@@ -619,6 +639,7 @@ class RenderWorkerRuntime:
                     srt_path,
                     output,
                     cancel_event=cancel_event,
+                    render_metrics=execution_metrics,
                 )
             else:
                 self._execution_post(execution_id, "complete", {"fence_token": fence, "output": {}})
@@ -626,6 +647,7 @@ class RenderWorkerRuntime:
 
             if cancel_event.is_set():
                 raise RuntimeError(cancel_reason[-1] if cancel_reason else "render execution canceled")
+            execution_metrics["stage"] = "uploading"
             self._execution_post(
                 execution_id,
                 "progress",

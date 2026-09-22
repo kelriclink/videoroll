@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { renderManagementApi, type CreatedEnrollment, type RenderConnection, type RenderDevice, type RenderEnrollment, type RenderExecution, type RenderWorker } from "../api/renderManagement";
 import { Button, DataTable, EmptyState, PageHeader, Section } from "../components/ui";
+import { formatRenderDuration, formatRenderFps, formatRenderSpeed, getRenderTelemetry, summarizeRenderExecutions } from "../features/renderTelemetry";
 
 const ACTIVE = new Set(["claimed", "running", "uploading"]);
 const value = (v: unknown) => typeof v === "number" || typeof v === "string" ? String(v) : "—";
@@ -41,7 +42,7 @@ export default function RenderManagementPage() {
 
   useEffect(() => {
     void refresh();
-    const timer = window.setInterval(() => void refresh(), 5000);
+    const timer = window.setInterval(() => void refresh(), 3000);
     return () => window.clearInterval(timer);
   }, [refresh]);
 
@@ -102,6 +103,7 @@ export default function RenderManagementPage() {
     try { const next = await renderManagementApi.updateConnection(serverUrl.trim()); setConnection(next); setServerUrl(next.server_url); }
     catch (e) { setError(e instanceof Error ? e.message : String(e)); } finally { setBusy(null); }
   }
+  const selectedTelemetry = selected ? getRenderTelemetry(selected) : null;
 
   return <div className="space-y-5">
     <PageHeader title="渲染管理" description="统一查看本机与远程渲染节点、执行状态和故障重排。任务优先级与拖拽顺序继续由处理队列管理。"
@@ -138,12 +140,31 @@ export default function RenderManagementPage() {
       <div className="grid gap-3 lg:grid-cols-2">
         {workers.map((w) => {
           const gpu = (w.capabilities.gpu_model ?? w.capabilities.gpu ?? w.resources.gpu) as unknown;
-          const fps = w.resources.fps ?? w.resources.render_fps;
+          const activeExecutions = executions.filter((execution) => execution.worker_id === w.id && ACTIVE.has(execution.state));
+          const throughput = summarizeRenderExecutions(activeExecutions);
           const devices = (Array.isArray(w.resources.devices) ? w.resources.devices : Array.isArray(w.capabilities.devices) ? w.capabilities.devices : []) as RenderDevice[];
           return <div key={w.id} className="rounded-xl border border-slate-200 p-4 dark:border-slate-800">
             <div className="flex items-start justify-between gap-3"><div><div className="font-medium">{w.name}</div><div className="mt-1 text-xs text-slate-500">{w.platform}{w.architecture ? ` · ${w.architecture}` : ""} · {value(gpu)}</div></div>
               <span className={`rounded-full px-2 py-1 text-xs ${badge(w.stale ? "offline" : w.status)}`}>{w.stale ? "失联" : w.draining ? "Drain" : w.status}</span></div>
-            <div className="mt-4 grid grid-cols-5 gap-3 text-xs"><div><div className="text-slate-500">运行中</div><div className="mt-1 font-medium">{w.active_jobs}</div></div><label><div className="text-slate-500">管理上限</div><input type="number" min={1} max={32} defaultValue={w.max_concurrency} disabled={busy === w.id} onBlur={(e) => { const n = Math.max(1, Math.min(32, Number(e.currentTarget.value) || 1)); if (n !== w.max_concurrency) void workerAction(w, { max_concurrency: n }); }} className="mt-1 w-16 rounded border border-slate-300 px-2 py-1 font-medium" /><div className="mt-1 text-[10px] text-slate-400">节点同时任务上限</div></label><div><div className="text-slate-500">可用并发</div><div className="mt-1 font-medium">{w.available_slots ?? Math.max(0, w.max_concurrency - w.active_jobs)} / {w.max_concurrency}</div></div><div><div className="text-slate-500">速度</div><div className="mt-1 font-medium">{value(fps)} FPS</div></div><div><div className="text-slate-500">心跳</div><div className="mt-1 font-medium">{ago(w.last_seen_at)}</div></div></div>
+            <div className="mt-4 grid grid-cols-3 gap-3 text-xs lg:grid-cols-6">
+              <div><div className="text-slate-500">运行中</div><div className="mt-1 font-medium">{w.active_jobs}</div></div>
+              <label><div className="text-slate-500">管理上限</div><input type="number" min={1} max={32} defaultValue={w.max_concurrency} disabled={busy === w.id} onBlur={(e) => { const n = Math.max(1, Math.min(32, Number(e.currentTarget.value) || 1)); if (n !== w.max_concurrency) void workerAction(w, { max_concurrency: n }); }} className="mt-1 w-16 rounded border border-slate-300 px-2 py-1 font-medium" /><div className="mt-1 text-[10px] text-slate-400">节点同时任务上限</div></label>
+              <div><div className="text-slate-500">可用并发</div><div className="mt-1 font-medium">{w.available_slots ?? Math.max(0, w.max_concurrency - w.active_jobs)} / {w.max_concurrency}</div></div>
+              <div><div className="text-slate-500">总 FPS</div><div className="mt-1 font-medium">{throughput.fps > 0 ? formatRenderFps(throughput.fps) : "—"}</div></div>
+              <div><div className="text-slate-500">总实时倍速</div><div className="mt-1 font-medium">{throughput.speed > 0 ? formatRenderSpeed(throughput.speed) : "—"}</div></div>
+              <div><div className="text-slate-500">心跳</div><div className="mt-1 font-medium">{ago(w.last_seen_at)}</div></div>
+            </div>
+            {activeExecutions.length ? <div className="mt-4 space-y-2">
+              <div className="text-xs font-medium text-slate-500">当前渲染</div>
+              {activeExecutions.map((execution) => {
+                const telemetry = getRenderTelemetry(execution);
+                return <div key={execution.id} className="rounded-lg border border-sky-200 bg-sky-50/60 p-3 dark:border-sky-900 dark:bg-sky-950/20">
+                  <div className="flex flex-wrap items-center justify-between gap-2 text-xs"><div className="flex items-center gap-2"><span className="font-medium">{execution.task_id ? <Link className="text-sky-700 hover:underline" to={`/tasks/${execution.task_id}`}>Task {execution.task_id.slice(0, 8)}</Link> : `Execution ${execution.id.slice(0, 8)}`}</span><span className="text-slate-500">{telemetry.stage}</span></div><div className="flex gap-3 font-mono"><span>{formatRenderFps(telemetry.fps)}</span><span>{formatRenderSpeed(telemetry.speed)}</span><span>ETA {formatRenderDuration(telemetry.etaSeconds)}</span></div></div>
+                  <div className="mt-2 h-2 overflow-hidden rounded-full bg-slate-200 dark:bg-slate-800"><div className="h-full rounded-full bg-sky-500 transition-all" style={{ width: `${telemetry.overallProgress}%` }} /></div>
+                  <div className="mt-1 flex flex-wrap justify-between gap-2 text-[11px] text-slate-500"><span>总进度 {telemetry.overallProgress}% · 渲染 {telemetry.renderPercent.toFixed(1)}%</span><span>{telemetry.encoder ?? "—"} · {telemetry.deviceName ?? w.name}</span></div>
+                </div>;
+              })}
+            </div> : null}
             <div className="mt-4 rounded-lg border border-slate-200 bg-slate-50 p-3 dark:border-slate-700 dark:bg-slate-900">
               <div className="flex flex-col gap-2 sm:flex-row sm:items-end">
                 <label className="min-w-0 flex-1"><div className="mb-1 text-xs text-slate-500">Worker Key（恢复身份）</div><input key={w.worker_key} defaultValue={w.worker_key} disabled={busy === w.id} onBlur={(e) => { const key = e.currentTarget.value.trim(); e.currentTarget.value = key; if (key && key !== w.worker_key) void workerAction(w, { worker_key: key }); }} className="w-full rounded border border-slate-300 bg-white px-2 py-1.5 font-mono text-xs dark:border-slate-700 dark:bg-slate-950" /></label>
@@ -166,17 +187,28 @@ export default function RenderManagementPage() {
     <Section>
       <div className="mb-4"><div className="text-sm font-semibold">执行记录</div><div className="mt-1 text-xs text-slate-500">每次 Worker 领取任务都会产生独立 Attempt；重新排队会生成新的 fence token。</div></div>
       {executions.length === 0 ? <EmptyState>暂无远程渲染执行记录。</EmptyState> :
-      <DataTable><thead><tr><th>状态</th><th>节点</th><th>进度</th><th>Attempt</th><th>Task</th><th>开始</th><th>操作</th></tr></thead><tbody>
-        {executions.map((e) => <tr key={e.id} className="cursor-pointer" onClick={() => setSelected(e)}>
-          <td><span className={`rounded-full px-2 py-1 text-xs ${badge(e.state)}`}>{e.state}</span></td><td><div>{e.worker_name ?? e.worker_id.slice(0, 8)}</div>{typeof e.metrics.device_name === "string" ? <div className="mt-0.5 text-[11px] text-slate-500">{e.metrics.device_name}</div> : null}</td><td>{e.progress}%</td><td>#{e.attempt}</td><td>{e.task_id ? <Link className="text-sky-700 hover:underline" to={`/tasks/${e.task_id}`} onClick={(x) => x.stopPropagation()}>{e.task_id.slice(0, 8)}</Link> : "—"}</td><td>{ago(e.started_at)}</td>
-          <td><div className="flex gap-1" onClick={(x) => x.stopPropagation()}>{ACTIVE.has(e.state) ? <Button size="xs" tone="danger" disabled={busy === e.id} onClick={() => void executionAction(e, "cancel")}>取消</Button> : null}<Button size="xs" disabled={busy === e.id || e.state === "succeeded"} onClick={() => void executionAction(e, "requeue")}>重排</Button></div></td>
-        </tr>)}
+      <DataTable><thead><tr><th>状态</th><th>节点</th><th>进度</th><th>FPS</th><th>倍速</th><th>ETA</th><th>编码</th><th>Task</th><th>开始</th><th>操作</th></tr></thead><tbody>
+        {executions.map((e) => {
+          const telemetry = getRenderTelemetry(e);
+          return <tr key={e.id} className="cursor-pointer" onClick={() => setSelected(e)}>
+            <td><span className={`rounded-full px-2 py-1 text-xs ${badge(e.state)}`}>{e.state}</span><div className="mt-1 text-[11px] text-slate-500">{telemetry.stage}</div></td>
+            <td><div>{e.worker_name ?? e.worker_id.slice(0, 8)}</div>{telemetry.deviceName ? <div className="mt-0.5 text-[11px] text-slate-500">{telemetry.deviceName}</div> : null}</td>
+            <td className="min-w-32"><div className="flex items-center justify-between gap-2 text-xs"><span>{telemetry.overallProgress}%</span><span className="text-slate-500">渲染 {telemetry.renderPercent.toFixed(1)}%</span></div><div className="mt-1 h-1.5 overflow-hidden rounded-full bg-slate-200 dark:bg-slate-800"><div className="h-full rounded-full bg-sky-500" style={{ width: `${telemetry.overallProgress}%` }} /></div></td>
+            <td className="font-mono text-xs">{formatRenderFps(telemetry.fps)}</td>
+            <td className="font-mono text-xs">{formatRenderSpeed(telemetry.speed)}</td>
+            <td className="font-mono text-xs">{formatRenderDuration(telemetry.etaSeconds)}</td>
+            <td><div className="text-xs">{telemetry.encoder ?? "—"}</div><div className="max-w-48 truncate text-[11px] text-slate-500">{telemetry.pipeline ?? ""}</div></td>
+            <td>{e.task_id ? <Link className="text-sky-700 hover:underline" to={`/tasks/${e.task_id}`} onClick={(x) => x.stopPropagation()}>{e.task_id.slice(0, 8)}</Link> : "—"}</td>
+            <td>{ago(e.started_at)}</td>
+            <td><div className="flex gap-1" onClick={(x) => x.stopPropagation()}>{ACTIVE.has(e.state) ? <Button size="xs" tone="danger" disabled={busy === e.id} onClick={() => void executionAction(e, "cancel")}>取消</Button> : null}<Button size="xs" disabled={busy === e.id || e.state === "succeeded"} onClick={() => void executionAction(e, "requeue")}>重排</Button></div></td>
+          </tr>;
+        })}
       </tbody></DataTable>}
     </Section>
 
     {selected ? <Section>
       <div className="flex items-start justify-between gap-3"><div><div className="text-sm font-semibold">执行详情 · Attempt #{selected.attempt}</div><div className="mt-1 font-mono text-xs text-slate-500">{selected.id}</div></div><Button size="xs" onClick={() => setSelected(null)}>关闭</Button></div>
-      <div className="mt-4 grid gap-3 text-sm sm:grid-cols-2 lg:grid-cols-4"><div><span className="text-slate-500">Worker：</span>{selected.worker_name ?? selected.worker_id}</div><div><span className="text-slate-500">状态：</span>{selected.state}</div><div><span className="text-slate-500">Job：</span>{selected.job_status ?? "—"}</div><div><span className="text-slate-500">Lease：</span>{ago(selected.lease_until)}</div></div>
+      <div className="mt-4 grid gap-3 text-sm sm:grid-cols-2 lg:grid-cols-4"><div><span className="text-slate-500">Worker：</span>{selected.worker_name ?? selected.worker_id}</div><div><span className="text-slate-500">状态：</span>{selected.state}</div><div><span className="text-slate-500">Job：</span>{selected.job_status ?? "—"}</div><div><span className="text-slate-500">Lease：</span>{ago(selected.lease_until)}</div>{selectedTelemetry ? <><div><span className="text-slate-500">FPS：</span>{formatRenderFps(selectedTelemetry.fps)}</div><div><span className="text-slate-500">实时倍速：</span>{formatRenderSpeed(selectedTelemetry.speed)}</div><div><span className="text-slate-500">渲染进度：</span>{selectedTelemetry.renderPercent.toFixed(1)}%</div><div><span className="text-slate-500">ETA：</span>{formatRenderDuration(selectedTelemetry.etaSeconds)}</div></> : null}</div>
       {selected.error_message ? <div className="mt-4 rounded-lg bg-rose-50 p-3 text-sm text-rose-700">{selected.error_message}</div> : null}
       <div className="mt-4 grid gap-4 lg:grid-cols-2"><div><div className="mb-2 text-xs font-medium text-slate-500">Metrics</div><pre className="max-h-52 overflow-auto rounded-lg bg-slate-950 p-3 text-xs text-slate-100">{JSON.stringify(selected.metrics, null, 2)}</pre></div><div><div className="mb-2 text-xs font-medium text-slate-500">日志尾部</div><pre className="max-h-52 overflow-auto whitespace-pre-wrap rounded-lg bg-slate-950 p-3 text-xs text-slate-100">{selected.log_tail || "暂无日志"}</pre></div></div>
     </Section> : null}
