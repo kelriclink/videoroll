@@ -13,6 +13,14 @@ export type ASRDefaults = {
   external_whisper_base_url: string;
   external_whisper_model: string;
   external_whisper_api_key_set: boolean;
+  external_whisper_batch_size: number;
+  external_whisper_vad_enabled: boolean;
+  external_whisper_vad_threshold: number;
+  external_whisper_min_silence_ms: number;
+  external_whisper_speech_pad_ms: number;
+  external_whisper_condition_on_previous_text: boolean;
+  external_whisper_max_segment_seconds: number;
+  external_whisper_max_segment_chars: number;
   groq_whisper_model: string;
   groq_whisper_api_key_set: boolean;
   cloudflare_workers_ai_account_id: string;
@@ -39,6 +47,14 @@ export type ASRFormState = {
   externalWhisperBaseUrl: string;
   externalWhisperModel: string;
   externalWhisperApiKey: string;
+  externalWhisperBatchSize: string;
+  externalWhisperVadEnabled: boolean;
+  externalWhisperVadThreshold: string;
+  externalWhisperMinSilenceMs: string;
+  externalWhisperSpeechPadMs: string;
+  externalWhisperConditionOnPreviousText: boolean;
+  externalWhisperMaxSegmentSeconds: string;
+  externalWhisperMaxSegmentChars: string;
   groqWhisperModel: string;
   groqWhisperApiKey: string;
   cloudflareAccountId: string;
@@ -65,6 +81,14 @@ export const initialASRForm: ASRFormState = {
   externalWhisperBaseUrl: "",
   externalWhisperModel: "whisper-1",
   externalWhisperApiKey: "",
+  externalWhisperBatchSize: "1",
+  externalWhisperVadEnabled: true,
+  externalWhisperVadThreshold: "0.5",
+  externalWhisperMinSilenceMs: "500",
+  externalWhisperSpeechPadMs: "180",
+  externalWhisperConditionOnPreviousText: false,
+  externalWhisperMaxSegmentSeconds: "6",
+  externalWhisperMaxSegmentChars: "80",
   groqWhisperModel: "whisper-large-v3-turbo",
   groqWhisperApiKey: "",
   cloudflareAccountId: "",
@@ -110,6 +134,38 @@ export function asrFormReducer(state: ASRFormState, action: ASRFormAction): ASRF
         : state.externalWhisperBaseUrl,
     externalWhisperModel:
       defaults.external_whisper_model?.trim() || state.externalWhisperModel,
+    externalWhisperBatchSize:
+      typeof defaults.external_whisper_batch_size === "number"
+        ? String(defaults.external_whisper_batch_size)
+        : state.externalWhisperBatchSize,
+    externalWhisperVadEnabled:
+      typeof defaults.external_whisper_vad_enabled === "boolean"
+        ? defaults.external_whisper_vad_enabled
+        : state.externalWhisperVadEnabled,
+    externalWhisperVadThreshold:
+      typeof defaults.external_whisper_vad_threshold === "number"
+        ? String(defaults.external_whisper_vad_threshold)
+        : state.externalWhisperVadThreshold,
+    externalWhisperMinSilenceMs:
+      typeof defaults.external_whisper_min_silence_ms === "number"
+        ? String(defaults.external_whisper_min_silence_ms)
+        : state.externalWhisperMinSilenceMs,
+    externalWhisperSpeechPadMs:
+      typeof defaults.external_whisper_speech_pad_ms === "number"
+        ? String(defaults.external_whisper_speech_pad_ms)
+        : state.externalWhisperSpeechPadMs,
+    externalWhisperConditionOnPreviousText:
+      typeof defaults.external_whisper_condition_on_previous_text === "boolean"
+        ? defaults.external_whisper_condition_on_previous_text
+        : state.externalWhisperConditionOnPreviousText,
+    externalWhisperMaxSegmentSeconds:
+      typeof defaults.external_whisper_max_segment_seconds === "number"
+        ? String(defaults.external_whisper_max_segment_seconds)
+        : state.externalWhisperMaxSegmentSeconds,
+    externalWhisperMaxSegmentChars:
+      typeof defaults.external_whisper_max_segment_chars === "number"
+        ? String(defaults.external_whisper_max_segment_chars)
+        : state.externalWhisperMaxSegmentChars,
     groqWhisperModel: defaults.groq_whisper_model?.trim() || state.groqWhisperModel,
     cloudflareAccountId:
       typeof defaults.cloudflare_workers_ai_account_id === "string"
@@ -149,6 +205,14 @@ export function useASRForm() {
     setExternalWhisperBaseUrl: setField("externalWhisperBaseUrl"),
     setExternalWhisperModel: setField("externalWhisperModel"),
     setExternalWhisperApiKey: setField("externalWhisperApiKey"),
+    setExternalWhisperBatchSize: setField("externalWhisperBatchSize"),
+    setExternalWhisperVadEnabled: setField("externalWhisperVadEnabled"),
+    setExternalWhisperVadThreshold: setField("externalWhisperVadThreshold"),
+    setExternalWhisperMinSilenceMs: setField("externalWhisperMinSilenceMs"),
+    setExternalWhisperSpeechPadMs: setField("externalWhisperSpeechPadMs"),
+    setExternalWhisperConditionOnPreviousText: setField("externalWhisperConditionOnPreviousText"),
+    setExternalWhisperMaxSegmentSeconds: setField("externalWhisperMaxSegmentSeconds"),
+    setExternalWhisperMaxSegmentChars: setField("externalWhisperMaxSegmentChars"),
     setGroqWhisperModel: setField("groqWhisperModel"),
     setGroqWhisperApiKey: setField("groqWhisperApiKey"),
     setCloudflareAccountId: setField("cloudflareAccountId"),

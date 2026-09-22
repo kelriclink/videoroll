@@ -98,6 +98,14 @@ class WhisperSettingsRead(BaseModel):
     external_whisper_base_url: str = ""
     external_whisper_model: str = ""
     external_whisper_api_key_set: bool = False
+    external_whisper_batch_size: int = 1
+    external_whisper_vad_enabled: bool = True
+    external_whisper_vad_threshold: float = 0.5
+    external_whisper_min_silence_ms: int = 500
+    external_whisper_speech_pad_ms: int = 180
+    external_whisper_condition_on_previous_text: bool = False
+    external_whisper_max_segment_seconds: float = 6.0
+    external_whisper_max_segment_chars: int = 80
     groq_whisper_model: str = "whisper-large-v3-turbo"
     groq_whisper_api_key_set: bool = False
     cloudflare_workers_ai_account_id: str = ""
@@ -132,6 +140,14 @@ class ASRDefaultsRead(BaseModel):
     external_whisper_base_url: str = ""
     external_whisper_model: str = "whisper-1"
     external_whisper_api_key_set: bool = False
+    external_whisper_batch_size: int = 1
+    external_whisper_vad_enabled: bool = True
+    external_whisper_vad_threshold: float = 0.5
+    external_whisper_min_silence_ms: int = 500
+    external_whisper_speech_pad_ms: int = 180
+    external_whisper_condition_on_previous_text: bool = False
+    external_whisper_max_segment_seconds: float = 6.0
+    external_whisper_max_segment_chars: int = 80
     groq_whisper_model: str = "whisper-large-v3-turbo"
     groq_whisper_api_key_set: bool = False
     cloudflare_workers_ai_account_id: str = ""
@@ -152,6 +168,14 @@ class ASRDefaultsUpdate(BaseModel):
     external_whisper_base_url: Optional[str] = Field(default=None, max_length=2048)
     external_whisper_model: Optional[str] = Field(default=None, max_length=256)
     external_whisper_api_key: Optional[str] = Field(default=None, max_length=4096)
+    external_whisper_batch_size: Optional[int] = Field(default=None, ge=1, le=32)
+    external_whisper_vad_enabled: Optional[bool] = None
+    external_whisper_vad_threshold: Optional[float] = Field(default=None, ge=0.1, le=0.95)
+    external_whisper_min_silence_ms: Optional[int] = Field(default=None, ge=50, le=5000)
+    external_whisper_speech_pad_ms: Optional[int] = Field(default=None, ge=0, le=2000)
+    external_whisper_condition_on_previous_text: Optional[bool] = None
+    external_whisper_max_segment_seconds: Optional[float] = Field(default=None, ge=1.0, le=30.0)
+    external_whisper_max_segment_chars: Optional[int] = Field(default=None, ge=10, le=500)
     groq_whisper_model: Optional[str] = Field(default=None, max_length=256)
     groq_whisper_api_key: Optional[str] = Field(default=None, max_length=4096)
     cloudflare_workers_ai_account_id: Optional[str] = Field(default=None, max_length=128)
@@ -163,6 +187,14 @@ class ExternalWhisperTestRequest(BaseModel):
     base_url: str = Field(min_length=1, max_length=2048)
     api_key: Optional[str] = Field(default=None, max_length=4096)
     model: str = Field(default="whisper-1", min_length=1, max_length=256)
+    batch_size: Optional[int] = Field(default=None, ge=1, le=32)
+    vad_enabled: Optional[bool] = None
+    vad_threshold: Optional[float] = Field(default=None, ge=0.1, le=0.95)
+    min_silence_ms: Optional[int] = Field(default=None, ge=50, le=5000)
+    speech_pad_ms: Optional[int] = Field(default=None, ge=0, le=2000)
+    condition_on_previous_text: Optional[bool] = None
+    max_segment_seconds: Optional[float] = Field(default=None, ge=1.0, le=30.0)
+    max_segment_chars: Optional[int] = Field(default=None, ge=10, le=500)
 
 
 class ExternalWhisperTestResponse(BaseModel):
@@ -170,6 +202,9 @@ class ExternalWhisperTestResponse(BaseModel):
     status_code: Optional[int] = None
     elapsed_ms: int = 0
     text: str = ""
+    segments: int = 0
+    longest_segment_seconds: float = 0.0
+    longest_segment_chars: int = 0
     error: Optional[str] = None
 
 

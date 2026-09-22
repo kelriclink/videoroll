@@ -559,6 +559,14 @@ def _run_asr_stage(
             api_key=external_api_key,
             model_name=external_model,
             language=language,
+            batch_size=int(asr_defaults.get("external_whisper_batch_size") or 1),
+            vad_filter=bool(asr_defaults.get("external_whisper_vad_enabled", True)),
+            vad_threshold=float(asr_defaults.get("external_whisper_vad_threshold") or 0.5),
+            min_silence_duration_ms=int(asr_defaults.get("external_whisper_min_silence_ms") or 500),
+            speech_pad_ms=int(asr_defaults.get("external_whisper_speech_pad_ms") or 180),
+            condition_on_previous_text=bool(asr_defaults.get("external_whisper_condition_on_previous_text", False)),
+            max_segment_seconds=float(asr_defaults.get("external_whisper_max_segment_seconds") or 6.0),
+            max_segment_chars=int(asr_defaults.get("external_whisper_max_segment_chars") or 80),
         )
     elif engine == "groq-whisper":
         groq_api_key = str(asr_defaults.get("groq_whisper_api_key") or "").strip()

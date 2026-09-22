@@ -52,6 +52,9 @@ _FW_VAD_SPEECH_PAD_MS = 180
 _FW_NO_SPEECH_THRESHOLD = 0.45
 _FW_LOG_PROB_THRESHOLD = -0.8
 _FW_COMPRESSION_RATIO_THRESHOLD = 2.2
+_EXTERNAL_WHISPER_DEFAULT_MAX_SEGMENT_SECONDS = 6.0
+_EXTERNAL_WHISPER_DEFAULT_MAX_SEGMENT_CHARS = 80
+_EXTERNAL_WHISPER_MIN_PUNCTUATION_SPLIT_SECONDS = 1.5
 _ASR_SILENCE_PEAK_THRESHOLD = 0.005
 _ASR_SILENCE_RMS_THRESHOLD = 0.0008
 _ASR_SILENCE_ACTIVE_THRESHOLD = 0.015
@@ -671,50 +674,176 @@ def transcribe_faster_whisper(
     return reconcile_overlapping_asr_segments(out)
 
 
-def transcribe_external_whisper(
-    audio_path: Path,
+def _external_word_segments(
+    item: dict[str, Any],
     *,
-    base_url: str,
-    api_key: str,
-    model_name: str,
-    language: str = "auto",
-    timeout_seconds: float = 180.0,
+    max_segment_seconds: float,
+    max_segment_chars: int,
 ) -> list[Segment]:
-    """Transcribe audio through an OpenAI-compatible online Whisper API."""
-    key = str(api_key or "").strip()
-    model = str(model_name or "").strip() or "whisper-1"
-    url = build_openai_audio_transcriptions_url(base_url)
-    data: dict[str, str] = {"model": model, "response_format": "verbose_json"}
-    lang = str(language or "").strip()
-    if lang and lang.lower() != "auto":
-        data["language"] = lang
-    timeout = max(1.0, min(600.0, float(timeout_seconds)))
-    headers: dict[str, str] = {}
-    if key:
-        headers["Authorization"] = f"Bearer {key}"
-    try:
-        with audio_path.open("rb") as audio_file:
-            response = httpx.post(
-                url,
-                headers=headers,
-                data=data,
-                files={"file": (audio_path.name, audio_file, "audio/wav")},
-                timeout=timeout,
-            )
-        response.raise_for_status()
-        payload = response.json()
-    except httpx.HTTPStatusError as exc:
-        detail = (exc.response.text or "").strip().replace("\n", " ")[:500]
-        raise RuntimeError(f"online Whisper API failed (status={exc.response.status_code}): {detail}") from exc
-    except httpx.HTTPError as exc:
-        raise RuntimeError(f"online Whisper API request failed: {exc}") from exc
-    except ValueError as exc:
-        raise RuntimeError("online Whisper API returned invalid JSON") from exc
+    raw_words = item.get("words")
+    if not isinstance(raw_words, list):
+        return []
 
-    if not isinstance(payload, dict):
-        raise RuntimeError("online Whisper API response must be an object")
+    words: list[tuple[float, float, str]] = []
+    for raw in raw_words:
+        if not isinstance(raw, dict):
+            continue
+        word = str(raw.get("word") or "")
+        if not word.strip():
+            continue
+        try:
+            start = max(0.0, float(raw.get("start")))
+            end = max(start, float(raw.get("end")))
+        except (TypeError, ValueError):
+            continue
+        if end <= start:
+            continue
+        words.append((start, end, word))
+    if not words:
+        return []
+
+    chunks: list[Segment] = []
+    current: list[tuple[float, float, str]] = []
+
+    def flush() -> None:
+        if not current:
+            return
+        text = _normalize_asr_text("".join(word for _, _, word in current))
+        if text:
+            chunks.append(Segment(start=current[0][0], end=current[-1][1], text=text))
+        current.clear()
+
+    for word in words:
+        if current:
+            candidate_text = _normalize_asr_text(
+                "".join(value for _, _, value in [*current, word])
+            )
+            candidate_duration = max(0.0, word[1] - current[0][0])
+            if candidate_duration > max_segment_seconds or len(candidate_text) > max_segment_chars:
+                flush()
+
+        current.append(word)
+        text = _normalize_asr_text("".join(value for _, _, value in current))
+        duration = max(0.0, current[-1][1] - current[0][0])
+        punctuated = bool(re.search(r"[.!?。！？；;：:]+[\"'”’）)\]]*$", text))
+        soft_boundary = punctuated and duration >= min(
+            max_segment_seconds,
+            _EXTERNAL_WHISPER_MIN_PUNCTUATION_SPLIT_SECONDS,
+        )
+        if soft_boundary:
+            flush()
+    flush()
+    return chunks
+
+
+def _external_text_segments(
+    text: str,
+    *,
+    start: float,
+    end: float,
+    max_segment_seconds: float,
+    max_segment_chars: int,
+) -> list[Segment]:
+    normalized = _normalize_asr_text(text)
+    if not normalized:
+        return []
+    duration = max(0.0, end - start)
+    if duration <= max_segment_seconds and len(normalized) <= max_segment_chars:
+        return [Segment(start=start, end=end, text=normalized)]
+
+    # Prefer sentence/phrase boundaries; fall back to whitespace and finally
+    # fixed character chunks for CJK/no-space transcripts.
+    units = [
+        part.strip()
+        for part in re.findall(r".+?(?:[。！？!?；;：:]+|(?<=[,.，、])\s+|$)", normalized)
+        if part.strip()
+    ]
+    if len(units) <= 1:
+        if " " in normalized:
+            tokens = normalized.split()
+            units = []
+            current = ""
+            for token in tokens:
+                candidate = f"{current} {token}".strip()
+                if current and len(candidate) > max_segment_chars:
+                    units.append(current)
+                    current = token
+                else:
+                    current = candidate
+            if current:
+                units.append(current)
+        else:
+            units = [
+                normalized[index : index + max_segment_chars]
+                for index in range(0, len(normalized), max_segment_chars)
+            ]
+
+    chunks: list[str] = []
+    current = ""
+    for unit in units:
+        candidate = f"{current} {unit}".strip() if current else unit
+        if current and len(candidate) > max_segment_chars:
+            chunks.append(current)
+            current = unit
+        else:
+            current = candidate
+    if current:
+        chunks.append(current)
+
+    required_by_time = max(1, int(math.ceil(duration / max_segment_seconds))) if duration > 0 else 1
+    while len(chunks) < required_by_time:
+        candidates = [
+            index
+            for index, value in enumerate(chunks)
+            if (" " in value and len(value.split()) > 1) or len(value) > 1
+        ]
+        if not candidates:
+            break
+        index = max(candidates, key=lambda i: len(chunks[i]))
+        value = chunks.pop(index)
+        if " " in value and len(value.split()) > 1:
+            parts = value.split()
+            pivot = max(1, len(parts) // 2)
+            split = (" ".join(parts[:pivot]), " ".join(parts[pivot:]))
+        else:
+            pivot = max(1, len(value) // 2)
+            split = (value[:pivot], value[pivot:])
+        parts = [part for part in split if part]
+        if len(parts) < 2:
+            chunks.insert(index, value)
+            break
+        chunks[index:index] = parts
+
+    if len(chunks) < required_by_time:
+        raise RuntimeError(
+            "online Whisper timestamps are too coarse to build subtitle-sized segments "
+            f"(duration={duration:.2f}s, text_chars={len(normalized)}); "
+            "enable segment/word timestamps on the ASR service"
+        )
+
+    cursor = start
+    out: list[Segment] = []
+    step = duration / len(chunks) if chunks and duration > 0 else 0.0
+    for index, chunk in enumerate(chunks):
+        chunk_end = end if index == len(chunks) - 1 else min(end, start + step * (index + 1))
+        chunk_end = max(cursor, chunk_end)
+        out.append(Segment(start=cursor, end=chunk_end, text=chunk))
+        cursor = chunk_end
+    return out
+
+
+def _normalize_external_whisper_payload(
+    payload: dict[str, Any],
+    *,
+    audio_duration: float,
+    max_segment_seconds: float,
+    max_segment_chars: int,
+) -> list[Segment]:
+    max_seconds = max(1.0, min(30.0, float(max_segment_seconds)))
+    max_chars = max(10, min(500, int(max_segment_chars)))
     segments_raw = payload.get("segments")
     out: list[Segment] = []
+
     if isinstance(segments_raw, list):
         for item in segments_raw:
             if not isinstance(item, dict):
@@ -727,17 +856,148 @@ def transcribe_external_whisper(
                 end = max(start, float(item.get("end") or start))
             except (TypeError, ValueError):
                 start, end = 0.0, 0.0
-            out.append(Segment(start=start, end=end, text=text))
+
+            if end - start <= max_seconds and len(text) <= max_chars:
+                out.append(Segment(start=start, end=end, text=text))
+                continue
+
+            word_segments = _external_word_segments(
+                item,
+                max_segment_seconds=max_seconds,
+                max_segment_chars=max_chars,
+            )
+            if word_segments:
+                out.extend(word_segments)
+            else:
+                logger.warning(
+                    "online Whisper returned an oversized segment without usable word timestamps: "
+                    "duration=%.2fs chars=%d; using proportional text split",
+                    end - start,
+                    len(text),
+                )
+                out.extend(
+                    _external_text_segments(
+                        text,
+                        start=start,
+                        end=end,
+                        max_segment_seconds=max_seconds,
+                        max_segment_chars=max_chars,
+                    )
+                )
     if out:
         return out
+
     text = _normalize_asr_text(str(payload.get("text") or ""))
     if not text:
         return []
+    if audio_duration > max_seconds:
+        logger.warning(
+            "online Whisper response has text but no segment/word timestamps for %.2fs of audio; "
+            "refusing to create a full-duration caption",
+            audio_duration,
+        )
+        raise RuntimeError(
+            "online Whisper returned text without segment/word timestamps; "
+            "subtitle timeline is unavailable. Enable verbose segment or word timestamps on the ASR service."
+        )
+    return [Segment(start=0.0, end=max(0.0, float(audio_duration)), text=text)]
+
+
+def transcribe_external_whisper(
+    audio_path: Path,
+    *,
+    base_url: str,
+    api_key: str,
+    model_name: str,
+    language: str = "auto",
+    timeout_seconds: float = 180.0,
+    batch_size: int = 1,
+    vad_filter: bool = True,
+    vad_threshold: float = 0.5,
+    min_silence_duration_ms: int = 500,
+    speech_pad_ms: int = 180,
+    condition_on_previous_text: bool = False,
+    max_segment_seconds: float = _EXTERNAL_WHISPER_DEFAULT_MAX_SEGMENT_SECONDS,
+    max_segment_chars: int = _EXTERNAL_WHISPER_DEFAULT_MAX_SEGMENT_CHARS,
+) -> list[Segment]:
+    """Transcribe through an OpenAI-compatible Whisper API and normalize subtitle granularity."""
+    key = str(api_key or "").strip()
+    model = str(model_name or "").strip() or "whisper-1"
+    url = build_openai_audio_transcriptions_url(base_url)
+    lang = str(language or "").strip()
+    minimal_data: dict[str, str] = {"model": model, "response_format": "verbose_json"}
+    if lang and lang.lower() != "auto":
+        minimal_data["language"] = lang
+
+    data = dict(minimal_data)
+    data.update(
+        {
+            "temperature": "0",
+            "beam_size": "5",
+            "batch_size": str(max(1, min(32, int(batch_size)))),
+            "word_timestamps": "true",
+            "vad_filter": "true" if vad_filter else "false",
+            "vad_threshold": str(max(0.1, min(0.95, float(vad_threshold)))),
+            "min_silence_duration_ms": str(max(50, min(5000, int(min_silence_duration_ms)))),
+            "speech_pad_ms": str(max(0, min(2000, int(speech_pad_ms)))),
+            "condition_on_previous_text": "true" if condition_on_previous_text else "false",
+            "no_speech_threshold": str(_FW_NO_SPEECH_THRESHOLD),
+            "log_prob_threshold": str(_FW_LOG_PROB_THRESHOLD),
+            "compression_ratio_threshold": str(_FW_COMPRESSION_RATIO_THRESHOLD),
+        }
+    )
+    timeout = max(1.0, min(600.0, float(timeout_seconds)))
+    headers: dict[str, str] = {}
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+
+    def post(form_data: dict[str, str]) -> httpx.Response:
+        with audio_path.open("rb") as audio_file:
+            return httpx.post(
+                url,
+                headers=headers,
+                data=form_data,
+                files={"file": (audio_path.name, audio_file, "audio/wav")},
+                timeout=timeout,
+            )
+
     try:
-        duration = _wav_duration_seconds(audio_path)
+        response = post(data)
+        try:
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            # Strict OpenAI-compatible providers may reject faster-whisper
+            # extension fields. Retry once with the portable minimal request.
+            if exc.response.status_code not in {400, 422}:
+                raise
+            logger.info(
+                "online Whisper rejected faster-whisper extension fields (status=%d); "
+                "retrying with portable OpenAI fields",
+                exc.response.status_code,
+            )
+            response = post(minimal_data)
+            response.raise_for_status()
+        payload = response.json()
+    except httpx.HTTPStatusError as exc:
+        detail = (exc.response.text or "").strip().replace("\n", " ")[:500]
+        raise RuntimeError(f"online Whisper API failed (status={exc.response.status_code}): {detail}") from exc
+    except httpx.HTTPError as exc:
+        raise RuntimeError(f"online Whisper API request failed: {exc}") from exc
+    except ValueError as exc:
+        raise RuntimeError("online Whisper API returned invalid JSON") from exc
+
+    if not isinstance(payload, dict):
+        raise RuntimeError("online Whisper API response must be an object")
+    try:
+        duration = float(payload.get("duration") or _wav_duration_seconds(audio_path))
     except Exception:
         duration = 0.0
-    return [Segment(start=0.0, end=max(0.0, float(duration)), text=text)]
+    return _normalize_external_whisper_payload(
+        payload,
+        audio_duration=duration,
+        max_segment_seconds=max_segment_seconds,
+        max_segment_chars=max_segment_chars,
+    )
 
 
 def _groq_chunk_windows(

@@ -27,6 +27,14 @@ type WhisperSettings = {
   external_whisper_base_url: string;
   external_whisper_model: string;
   external_whisper_api_key_set: boolean;
+  external_whisper_batch_size: number;
+  external_whisper_vad_enabled: boolean;
+  external_whisper_vad_threshold: number;
+  external_whisper_min_silence_ms: number;
+  external_whisper_speech_pad_ms: number;
+  external_whisper_condition_on_previous_text: boolean;
+  external_whisper_max_segment_seconds: number;
+  external_whisper_max_segment_chars: number;
   groq_whisper_model: string;
   groq_whisper_api_key_set: boolean;
   cloudflare_workers_ai_account_id: string;
@@ -39,6 +47,9 @@ type ExternalWhisperTestResponse = {
   status_code?: number | null;
   elapsed_ms: number;
   text: string;
+  segments: number;
+  longest_segment_seconds: number;
+  longest_segment_chars: number;
   error?: string | null;
 };
 
@@ -114,6 +125,14 @@ function asrDefaultsSnapshot(defaults: ASRDefaults): string {
     modelDownloadProxy: defaults.model_download_proxy || "",
     externalWhisperBaseUrl: defaults.external_whisper_base_url || "",
     externalWhisperModel: defaults.external_whisper_model || "whisper-1",
+    externalWhisperBatchSize: String(defaults.external_whisper_batch_size ?? 1),
+    externalWhisperVadEnabled: Boolean(defaults.external_whisper_vad_enabled),
+    externalWhisperVadThreshold: String(defaults.external_whisper_vad_threshold ?? 0.5),
+    externalWhisperMinSilenceMs: String(defaults.external_whisper_min_silence_ms ?? 500),
+    externalWhisperSpeechPadMs: String(defaults.external_whisper_speech_pad_ms ?? 180),
+    externalWhisperConditionOnPreviousText: Boolean(defaults.external_whisper_condition_on_previous_text),
+    externalWhisperMaxSegmentSeconds: String(defaults.external_whisper_max_segment_seconds ?? 6),
+    externalWhisperMaxSegmentChars: String(defaults.external_whisper_max_segment_chars ?? 80),
     groqWhisperModel: defaults.groq_whisper_model || "whisper-large-v3-turbo",
     cloudflareAccountId: defaults.cloudflare_workers_ai_account_id || "",
     cloudflareModel: defaults.cloudflare_workers_ai_model || "@cf/openai/whisper-large-v3-turbo",
@@ -142,6 +161,14 @@ export default function SettingsASRPage() {
     externalWhisperBaseUrl, setExternalWhisperBaseUrl,
     externalWhisperModel, setExternalWhisperModel,
     externalWhisperApiKey, setExternalWhisperApiKey,
+    externalWhisperBatchSize, setExternalWhisperBatchSize,
+    externalWhisperVadEnabled, setExternalWhisperVadEnabled,
+    externalWhisperVadThreshold, setExternalWhisperVadThreshold,
+    externalWhisperMinSilenceMs, setExternalWhisperMinSilenceMs,
+    externalWhisperSpeechPadMs, setExternalWhisperSpeechPadMs,
+    externalWhisperConditionOnPreviousText, setExternalWhisperConditionOnPreviousText,
+    externalWhisperMaxSegmentSeconds, setExternalWhisperMaxSegmentSeconds,
+    externalWhisperMaxSegmentChars, setExternalWhisperMaxSegmentChars,
     groqWhisperModel, setGroqWhisperModel,
     groqWhisperApiKey, setGroqWhisperApiKey,
     cloudflareAccountId, setCloudflareAccountId,
@@ -214,6 +241,14 @@ export default function SettingsASRPage() {
     modelDownloadProxy,
     externalWhisperBaseUrl,
     externalWhisperModel,
+    externalWhisperBatchSize,
+    externalWhisperVadEnabled,
+    externalWhisperVadThreshold,
+    externalWhisperMinSilenceMs,
+    externalWhisperSpeechPadMs,
+    externalWhisperConditionOnPreviousText,
+    externalWhisperMaxSegmentSeconds,
+    externalWhisperMaxSegmentChars,
     groqWhisperModel,
     cloudflareAccountId,
     cloudflareModel,
@@ -248,6 +283,12 @@ export default function SettingsASRPage() {
         0.95,
         Math.max(0.1, Number.isFinite(parsedOpenvinoVadThreshold) ? parsedOpenvinoVadThreshold : 0.5),
       );
+      const externalWhisperBatchSizeValue = Math.min(32, Math.max(1, Number.parseInt(externalWhisperBatchSize || "1", 10) || 1));
+      const externalWhisperVadThresholdValue = Math.min(0.95, Math.max(0.1, Number.parseFloat(externalWhisperVadThreshold || "0.5") || 0.5));
+      const externalWhisperMinSilenceMsValue = Math.min(5000, Math.max(50, Number.parseInt(externalWhisperMinSilenceMs || "500", 10) || 500));
+      const externalWhisperSpeechPadMsValue = Math.min(2000, Math.max(0, Number.parseInt(externalWhisperSpeechPadMs || "180", 10) || 0));
+      const externalWhisperMaxSegmentSecondsValue = Math.min(30, Math.max(1, Number.parseFloat(externalWhisperMaxSegmentSeconds || "6") || 6));
+      const externalWhisperMaxSegmentCharsValue = Math.min(500, Math.max(10, Number.parseInt(externalWhisperMaxSegmentChars || "80", 10) || 80));
       await fetchJson(`${ORCHESTRATOR_URL}/subtitle/asr/settings`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
@@ -263,6 +304,14 @@ export default function SettingsASRPage() {
           model_download_proxy: modelDownloadProxy,
           external_whisper_base_url: externalWhisperBaseUrl,
           external_whisper_model: externalWhisperModel,
+          external_whisper_batch_size: externalWhisperBatchSizeValue,
+          external_whisper_vad_enabled: externalWhisperVadEnabled,
+          external_whisper_vad_threshold: externalWhisperVadThresholdValue,
+          external_whisper_min_silence_ms: externalWhisperMinSilenceMsValue,
+          external_whisper_speech_pad_ms: externalWhisperSpeechPadMsValue,
+          external_whisper_condition_on_previous_text: externalWhisperConditionOnPreviousText,
+          external_whisper_max_segment_seconds: externalWhisperMaxSegmentSecondsValue,
+          external_whisper_max_segment_chars: externalWhisperMaxSegmentCharsValue,
           ...(externalWhisperApiKey.trim() ? { external_whisper_api_key: externalWhisperApiKey.trim() } : {}),
           groq_whisper_model: groqWhisperModel,
           ...(groqWhisperApiKey.trim() ? { groq_whisper_api_key: groqWhisperApiKey.trim() } : {}),
@@ -505,6 +554,42 @@ export default function SettingsASRPage() {
                   <input className="w-full rounded border px-3 py-2 text-sm" value={externalWhisperModel} onChange={(e) => setExternalWhisperModel(e.target.value)} placeholder="whisper-1" />
                   <div className="mt-1 text-xs text-slate-500">服务端固定模型时保持默认 `whisper-1` 即可；如果你的服务要求指定模型 ID，可在这里填写。</div>
                 </label>
+                <label className="block">
+                  <div className="mb-1 text-xs text-slate-600">推理 Batch Size</div>
+                  <input type="number" min={1} max={32} className="w-full rounded border px-3 py-2 text-sm" value={externalWhisperBatchSize} onChange={(e) => setExternalWhisperBatchSize(e.target.value)} />
+                  <div className="mt-1 text-xs text-slate-500">字幕优先建议 1。大于 1 会启用 batched pipeline，吞吐更高但上游 segment 往往更粗。</div>
+                </label>
+                <label className="block">
+                  <div className="mb-1 text-xs text-slate-600">字幕最大时长（秒）</div>
+                  <input type="number" min={1} max={30} step={0.5} className="w-full rounded border px-3 py-2 text-sm" value={externalWhisperMaxSegmentSeconds} onChange={(e) => setExternalWhisperMaxSegmentSeconds(e.target.value)} />
+                  <div className="mt-1 text-xs text-slate-500">优先利用 word timestamps 对超长 ASR segment 做二次切分。</div>
+                </label>
+                <label className="block">
+                  <div className="mb-1 text-xs text-slate-600">字幕最大字符数</div>
+                  <input type="number" min={10} max={500} className="w-full rounded border px-3 py-2 text-sm" value={externalWhisperMaxSegmentChars} onChange={(e) => setExternalWhisperMaxSegmentChars(e.target.value)} />
+                </label>
+                <label className="flex items-center gap-2 self-end rounded border border-slate-200 px-3 py-2">
+                  <input type="checkbox" checked={externalWhisperVadEnabled} onChange={(e) => setExternalWhisperVadEnabled(e.target.checked)} />
+                  <span className="text-sm text-slate-700">启用服务端 VAD</span>
+                </label>
+                <label className="block">
+                  <div className="mb-1 text-xs text-slate-600">VAD 阈值</div>
+                  <input type="number" min={0.1} max={0.95} step={0.05} className="w-full rounded border px-3 py-2 text-sm" value={externalWhisperVadThreshold} onChange={(e) => setExternalWhisperVadThreshold(e.target.value)} />
+                </label>
+                <label className="block">
+                  <div className="mb-1 text-xs text-slate-600">最短静音（ms）</div>
+                  <input type="number" min={50} max={5000} step={10} className="w-full rounded border px-3 py-2 text-sm" value={externalWhisperMinSilenceMs} onChange={(e) => setExternalWhisperMinSilenceMs(e.target.value)} />
+                  <div className="mt-1 text-xs text-slate-500">默认 500ms，与本地 faster-whisper 路径一致。</div>
+                </label>
+                <label className="block">
+                  <div className="mb-1 text-xs text-slate-600">Speech Pad（ms）</div>
+                  <input type="number" min={0} max={2000} step={10} className="w-full rounded border px-3 py-2 text-sm" value={externalWhisperSpeechPadMs} onChange={(e) => setExternalWhisperSpeechPadMs(e.target.value)} />
+                  <div className="mt-1 text-xs text-slate-500">默认 180ms，与本地 faster-whisper 路径一致。</div>
+                </label>
+                <label className="flex items-center gap-2 rounded border border-slate-200 px-3 py-2 lg:col-span-2">
+                  <input type="checkbox" checked={externalWhisperConditionOnPreviousText} onChange={(e) => setExternalWhisperConditionOnPreviousText(e.target.checked)} />
+                  <span className="text-sm text-slate-700">继承上一片段文本上下文（字幕任务默认关闭，减少静音/音乐处重复与幻觉）</span>
+                </label>
                 <div className="flex items-end">
                   <button
                     type="button"
@@ -518,11 +603,31 @@ export default function SettingsASRPage() {
                         const result = await fetchJson<ExternalWhisperTestResponse>(`${ORCHESTRATOR_URL}/subtitle/asr/external/test`, {
                           method: "POST",
                           headers: { "Content-Type": "application/json" },
-                          body: JSON.stringify({ base_url: externalWhisperBaseUrl, api_key: externalWhisperApiKey, model: externalWhisperModel }),
+                          body: JSON.stringify({
+                            base_url: externalWhisperBaseUrl,
+                            api_key: externalWhisperApiKey,
+                            model: externalWhisperModel,
+                            batch_size: Math.min(32, Math.max(1, Number.parseInt(externalWhisperBatchSize || "1", 10) || 1)),
+                            vad_enabled: externalWhisperVadEnabled,
+                            vad_threshold: Math.min(0.95, Math.max(0.1, Number.parseFloat(externalWhisperVadThreshold || "0.5") || 0.5)),
+                            min_silence_ms: Math.min(5000, Math.max(50, Number.parseInt(externalWhisperMinSilenceMs || "500", 10) || 500)),
+                            speech_pad_ms: Math.min(2000, Math.max(0, Number.parseInt(externalWhisperSpeechPadMs || "180", 10) || 0)),
+                            condition_on_previous_text: externalWhisperConditionOnPreviousText,
+                            max_segment_seconds: Math.min(30, Math.max(1, Number.parseFloat(externalWhisperMaxSegmentSeconds || "6") || 6)),
+                            max_segment_chars: Math.min(500, Math.max(10, Number.parseInt(externalWhisperMaxSegmentChars || "80", 10) || 80)),
+                          }),
                         });
                         setExternalWhisperTestResult(result);
                       } catch (e: unknown) {
-                        setExternalWhisperTestResult({ ok: false, elapsed_ms: 0, text: "", error: e instanceof Error ? e.message : String(e) });
+                        setExternalWhisperTestResult({
+                          ok: false,
+                          elapsed_ms: 0,
+                          text: "",
+                          segments: 0,
+                          longest_segment_seconds: 0,
+                          longest_segment_chars: 0,
+                          error: e instanceof Error ? e.message : String(e),
+                        });
                       } finally {
                         setExternalWhisperTestBusy(false);
                       }
@@ -535,6 +640,11 @@ export default function SettingsASRPage() {
               {externalWhisperTestResult ? (
                 <div className="mt-3 rounded-lg border border-slate-200 bg-slate-50 p-3 text-xs">
                   <div className={externalWhisperTestResult.ok ? "text-emerald-700" : "text-rose-700"}>{externalWhisperTestResult.ok ? "连接成功" : "测试失败"} · {externalWhisperTestResult.elapsed_ms}ms</div>
+                  {externalWhisperTestResult.ok ? (
+                    <div className="mt-1 text-slate-600">
+                      segments: {externalWhisperTestResult.segments} · 最长 {externalWhisperTestResult.longest_segment_seconds.toFixed(2)}s · 最长 {externalWhisperTestResult.longest_segment_chars} 字符
+                    </div>
+                  ) : null}
                   {externalWhisperTestResult.text ? <div className="mt-1 break-all text-slate-700">返回：{externalWhisperTestResult.text}</div> : null}
                   {externalWhisperTestResult.error ? <div className="mt-1 break-all text-rose-700">{externalWhisperTestResult.error}</div> : null}
                 </div>

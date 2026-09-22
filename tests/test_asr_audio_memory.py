@@ -357,9 +357,9 @@ def test_external_whisper_plain_text_duration_reads_only_the_wav_header(monkeypa
     response = SimpleNamespace(raise_for_status=lambda: None, json=lambda: {"text": "Spoken phrase"})
     monkeypatch.setattr(processing.httpx, "post", lambda *args, **kwargs: response)
 
-    segments = processing.transcribe_external_whisper(
-        path, base_url="https://api.example/v1", api_key="offline-test-key", model_name="test-whisper",
-    )
+    with pytest.raises(RuntimeError, match="without segment/word timestamps"):
+        processing.transcribe_external_whisper(
+            path, base_url="https://api.example/v1", api_key="offline-test-key", model_name="test-whisper",
+        )
 
-    assert segments == [processing.Segment(0.0, 10800.0, "Spoken phrase")]
     assert reads == []

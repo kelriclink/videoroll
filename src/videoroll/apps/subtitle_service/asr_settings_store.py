@@ -101,6 +101,24 @@ def get_asr_settings(db: Session, defaults: SubtitleServiceSettings) -> dict[str
         external_base_url = normalize_openai_base_url(external_base_url)[:_MAX_EXTERNAL_BASE_URL_LEN]
     external_model = str(external.get("model") or defaults.external_whisper_model or "whisper-1").strip()[:_MAX_EXTERNAL_MODEL_LEN]
     external_api_key = _decrypt_api_key(external.get("api_key_enc")) or str(defaults.external_whisper_api_key or "").strip()
+    external_batch_size = max(1, min(32, int(external.get("batch_size") or getattr(defaults, "external_whisper_batch_size", 1) or 1)))
+    stored_external_vad_enabled = external.get("vad_enabled")
+    external_vad_enabled = (
+        bool(stored_external_vad_enabled)
+        if isinstance(stored_external_vad_enabled, bool)
+        else bool(getattr(defaults, "external_whisper_vad_enabled", True))
+    )
+    external_vad_threshold = max(0.1, min(0.95, float(external.get("vad_threshold") or getattr(defaults, "external_whisper_vad_threshold", 0.5) or 0.5)))
+    external_min_silence_ms = max(50, min(5000, int(external.get("min_silence_ms") or getattr(defaults, "external_whisper_min_silence_ms", 500) or 500)))
+    external_speech_pad_ms = max(0, min(2000, int(external.get("speech_pad_ms") if external.get("speech_pad_ms") is not None else getattr(defaults, "external_whisper_speech_pad_ms", 180))))
+    stored_condition = external.get("condition_on_previous_text")
+    external_condition_on_previous_text = (
+        bool(stored_condition)
+        if isinstance(stored_condition, bool)
+        else bool(getattr(defaults, "external_whisper_condition_on_previous_text", False))
+    )
+    external_max_segment_seconds = max(1.0, min(30.0, float(external.get("max_segment_seconds") or getattr(defaults, "external_whisper_max_segment_seconds", 6.0) or 6.0)))
+    external_max_segment_chars = max(10, min(500, int(external.get("max_segment_chars") or getattr(defaults, "external_whisper_max_segment_chars", 80) or 80)))
 
     groq = _as_dict(stored.get("groq_whisper"))
     groq_model = str(
@@ -137,6 +155,14 @@ def get_asr_settings(db: Session, defaults: SubtitleServiceSettings) -> dict[str
         "external_whisper_model": external_model,
         "external_whisper_api_key": external_api_key,
         "external_whisper_api_key_set": bool(external_api_key),
+        "external_whisper_batch_size": external_batch_size,
+        "external_whisper_vad_enabled": external_vad_enabled,
+        "external_whisper_vad_threshold": external_vad_threshold,
+        "external_whisper_min_silence_ms": external_min_silence_ms,
+        "external_whisper_speech_pad_ms": external_speech_pad_ms,
+        "external_whisper_condition_on_previous_text": external_condition_on_previous_text,
+        "external_whisper_max_segment_seconds": external_max_segment_seconds,
+        "external_whisper_max_segment_chars": external_max_segment_chars,
         "groq_whisper_model": groq_model,
         "groq_whisper_api_key": groq_api_key,
         "groq_whisper_api_key_set": bool(groq_api_key),
@@ -241,6 +267,23 @@ def update_asr_settings(db: Session, defaults: SubtitleServiceSettings, update: 
             external["api_key_enc"] = encrypt_str(val)
         else:
             external.pop("api_key_enc", None)
+
+    if "external_whisper_batch_size" in update and update["external_whisper_batch_size"] is not None:
+        external["batch_size"] = max(1, min(32, int(update["external_whisper_batch_size"])))
+    if "external_whisper_vad_enabled" in update and update["external_whisper_vad_enabled"] is not None:
+        external["vad_enabled"] = bool(update["external_whisper_vad_enabled"])
+    if "external_whisper_vad_threshold" in update and update["external_whisper_vad_threshold"] is not None:
+        external["vad_threshold"] = max(0.1, min(0.95, float(update["external_whisper_vad_threshold"])))
+    if "external_whisper_min_silence_ms" in update and update["external_whisper_min_silence_ms"] is not None:
+        external["min_silence_ms"] = max(50, min(5000, int(update["external_whisper_min_silence_ms"])))
+    if "external_whisper_speech_pad_ms" in update and update["external_whisper_speech_pad_ms"] is not None:
+        external["speech_pad_ms"] = max(0, min(2000, int(update["external_whisper_speech_pad_ms"])))
+    if "external_whisper_condition_on_previous_text" in update and update["external_whisper_condition_on_previous_text"] is not None:
+        external["condition_on_previous_text"] = bool(update["external_whisper_condition_on_previous_text"])
+    if "external_whisper_max_segment_seconds" in update and update["external_whisper_max_segment_seconds"] is not None:
+        external["max_segment_seconds"] = max(1.0, min(30.0, float(update["external_whisper_max_segment_seconds"])))
+    if "external_whisper_max_segment_chars" in update and update["external_whisper_max_segment_chars"] is not None:
+        external["max_segment_chars"] = max(10, min(500, int(update["external_whisper_max_segment_chars"])))
 
     if "groq_whisper_model" in update and update["groq_whisper_model"] is not None:
         val = str(update["groq_whisper_model"] or "").strip()

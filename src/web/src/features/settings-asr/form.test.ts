@@ -15,6 +15,14 @@ const defaults: ASRDefaults = {
   external_whisper_base_url: "https://whisper.example/v1",
   external_whisper_model: "whisper-1",
   external_whisper_api_key_set: true,
+  external_whisper_batch_size: 1,
+  external_whisper_vad_enabled: true,
+  external_whisper_vad_threshold: 0.5,
+  external_whisper_min_silence_ms: 500,
+  external_whisper_speech_pad_ms: 180,
+  external_whisper_condition_on_previous_text: false,
+  external_whisper_max_segment_seconds: 6,
+  external_whisper_max_segment_chars: 80,
   groq_whisper_model: "whisper-large-v3-turbo",
   groq_whisper_api_key_set: true,
   cloudflare_workers_ai_account_id: "acct",
@@ -31,6 +39,10 @@ describe("ASR settings form", () => {
     expect(next.openvinoMaxNewTokens).toBe("512");
     expect(next.openvinoVadEnabled).toBe(false);
     expect(next.openvinoVadThreshold).toBe("0.42");
+    expect(next.externalWhisperBatchSize).toBe("1");
+    expect(next.externalWhisperVadEnabled).toBe(true);
+    expect(next.externalWhisperMaxSegmentSeconds).toBe("6");
+    expect(next.externalWhisperMaxSegmentChars).toBe("80");
     expect(next.cloudflareAccountId).toBe("acct");
   });
 

@@ -381,6 +381,14 @@ def get_subtitle_settings_view(settings: SubtitleServiceSettings = Depends(get_s
         external_whisper_base_url=str(settings.external_whisper_base_url or ""),
         external_whisper_model=str(settings.external_whisper_model or ""),
         external_whisper_api_key_set=bool(settings.external_whisper_api_key),
+        external_whisper_batch_size=int(settings.external_whisper_batch_size or 1),
+        external_whisper_vad_enabled=bool(settings.external_whisper_vad_enabled),
+        external_whisper_vad_threshold=float(settings.external_whisper_vad_threshold or 0.5),
+        external_whisper_min_silence_ms=int(settings.external_whisper_min_silence_ms or 500),
+        external_whisper_speech_pad_ms=int(settings.external_whisper_speech_pad_ms or 180),
+        external_whisper_condition_on_previous_text=bool(settings.external_whisper_condition_on_previous_text),
+        external_whisper_max_segment_seconds=float(settings.external_whisper_max_segment_seconds or 6.0),
+        external_whisper_max_segment_chars=int(settings.external_whisper_max_segment_chars or 80),
         groq_whisper_model=str(settings.groq_whisper_model or "whisper-large-v3-turbo"),
         groq_whisper_api_key_set=bool(settings.groq_whisper_api_key),
         cloudflare_workers_ai_account_id=str(settings.cloudflare_workers_ai_account_id or ""),
@@ -471,11 +479,34 @@ def test_external_whisper(
             api_key=api_key,
             model_name=payload.model,
             timeout_seconds=30.0,
+            batch_size=int(payload.batch_size or stored.get("external_whisper_batch_size") or 1),
+            vad_filter=(
+                bool(payload.vad_enabled)
+                if payload.vad_enabled is not None
+                else bool(stored.get("external_whisper_vad_enabled", True))
+            ),
+            vad_threshold=float(payload.vad_threshold or stored.get("external_whisper_vad_threshold") or 0.5),
+            min_silence_duration_ms=int(payload.min_silence_ms or stored.get("external_whisper_min_silence_ms") or 500),
+            speech_pad_ms=int(
+                payload.speech_pad_ms
+                if payload.speech_pad_ms is not None
+                else stored.get("external_whisper_speech_pad_ms") or 180
+            ),
+            condition_on_previous_text=(
+                bool(payload.condition_on_previous_text)
+                if payload.condition_on_previous_text is not None
+                else bool(stored.get("external_whisper_condition_on_previous_text", False))
+            ),
+            max_segment_seconds=float(payload.max_segment_seconds or stored.get("external_whisper_max_segment_seconds") or 6.0),
+            max_segment_chars=int(payload.max_segment_chars or stored.get("external_whisper_max_segment_chars") or 80),
         )
         return ExternalWhisperTestResponse(
             ok=True,
             elapsed_ms=int((time.perf_counter() - started) * 1000),
             text=" ".join(segment.text for segment in segments),
+            segments=len(segments),
+            longest_segment_seconds=max((segment.end - segment.start for segment in segments), default=0.0),
+            longest_segment_chars=max((len(segment.text) for segment in segments), default=0),
         )
     except Exception as exc:
         return ExternalWhisperTestResponse(
