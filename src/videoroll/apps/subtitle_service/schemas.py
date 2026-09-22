@@ -161,8 +161,8 @@ class ASRDefaultsUpdate(BaseModel):
 
 class ExternalWhisperTestRequest(BaseModel):
     base_url: str = Field(min_length=1, max_length=2048)
-    api_key: str = Field(min_length=1, max_length=4096)
-    model: str = Field(min_length=1, max_length=256)
+    api_key: Optional[str] = Field(default=None, max_length=4096)
+    model: str = Field(default="whisper-1", min_length=1, max_length=256)
 
 
 class ExternalWhisperTestResponse(BaseModel):

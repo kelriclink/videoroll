@@ -426,7 +426,7 @@ export default function SettingsASRPage() {
             <select className="w-full rounded border px-3 py-2 text-sm" value={defaultEngine} onChange={(e) => setDefaultEngine(e.target.value)}>
               <option value="faster-whisper">faster-whisper</option>
               <option value="openvino">openvino（方案2 / Intel Arc）</option>
-              <option value="external-whisper">external-whisper（外部 API）</option>
+              <option value="external-whisper">在线 Whisper（自建 faster-whisper / OpenAI 兼容）</option>
               <option value="groq-whisper">groq-whisper（GroqCloud，自动切片）</option>
               <option value="cloudflare-workers-ai">cloudflare-workers-ai（原生时间轴）</option>
               <option value="mock">mock</option>
@@ -478,26 +478,32 @@ export default function SettingsASRPage() {
               </div>
             ) : null}
             <div className="mt-2 text-xs text-slate-500">
-              `faster-whisper` 可用 size/repo id/本地路径；`openvino` 需要填写一个已导出的 OpenVINO Whisper 模型目录路径；外部 API 模式使用下方配置的模型。
+              `faster-whisper` 可用 size/repo id/本地路径；`openvino` 需要填写一个已导出的 OpenVINO Whisper 模型目录路径；在线 Whisper 使用下方配置的远程服务地址与模型名。
             </div>
           </label>
 
           {defaultEngine === "external-whisper" ? (
             <div className="rounded border border-amber-100 bg-amber-50/60 p-3 lg:col-span-2">
-              <div className="text-sm font-medium text-slate-800">外部 Whisper API（OpenAI 兼容接口）</div>
-              <div className="mt-1 text-xs text-slate-600">请求地址应为服务的 base URL，例如 `https://api.openai.com/v1`；后端会调用 `/audio/transcriptions`。</div>
+              <div className="text-sm font-medium text-slate-800">在线 Whisper（自建 faster-whisper / OpenAI 兼容）</div>
+              <div className="mt-1 text-xs text-slate-600">
+                填写 VideoRoll 生产机能够访问的 Whisper 服务地址。支持 `http://192.168.1.10:8000`、`http://192.168.1.10:8000/v1`，也可直接填写完整的 `/v1/audio/transcriptions` 地址。
+              </div>
               <div className="mt-3 grid gap-3 lg:grid-cols-2">
                 <label className="block lg:col-span-2">
-                  <div className="mb-1 text-xs text-slate-600">Base URL <span className="font-mono text-[10px] text-slate-400">external_whisper_base_url</span></div>
-                  <input className="w-full rounded border px-3 py-2 text-sm" value={externalWhisperBaseUrl} onChange={(e) => setExternalWhisperBaseUrl(e.target.value)} placeholder="https://api.openai.com/v1" />
+                  <div className="mb-1 text-xs text-slate-600">服务地址 <span className="font-mono text-[10px] text-slate-400">external_whisper_base_url</span></div>
+                  <input className="w-full rounded border px-3 py-2 text-sm" value={externalWhisperBaseUrl} onChange={(e) => setExternalWhisperBaseUrl(e.target.value)} placeholder="http://192.168.1.10:8000/v1" />
+                  <div className="mt-1 text-xs text-slate-500">
+                    请求由 subtitle-worker 发出；如果 faster-whisper 在另一台机器上，请填写生产机可达的 IP/域名，不要填写你浏览器电脑的 127.0.0.1。
+                  </div>
                 </label>
                 <label className="block lg:col-span-2">
-                  <div className="mb-1 text-xs text-slate-600">API Key（仅保存，不回显） <span className="font-mono text-[10px] text-slate-400">external_whisper_api_key</span></div>
-                  <input type="password" className="w-full rounded border px-3 py-2 text-sm" value={externalWhisperApiKey} onChange={(e) => setExternalWhisperApiKey(e.target.value)} placeholder={asrDefaults?.external_whisper_api_key_set ? "已设置（留空则不修改）" : "API key"} />
+                  <div className="mb-1 text-xs text-slate-600">API Key（可选，仅保存不回显） <span className="font-mono text-[10px] text-slate-400">external_whisper_api_key</span></div>
+                  <input type="password" className="w-full rounded border px-3 py-2 text-sm" value={externalWhisperApiKey} onChange={(e) => setExternalWhisperApiKey(e.target.value)} placeholder={asrDefaults?.external_whisper_api_key_set ? "已设置（留空则继续使用已保存 Key）" : "本地服务无需鉴权可留空"} />
                 </label>
                 <label className="block">
-                  <div className="mb-1 text-xs text-slate-600">模型 <span className="font-mono text-[10px] text-slate-400">external_whisper_model</span></div>
+                  <div className="mb-1 text-xs text-slate-600">模型名 <span className="font-mono text-[10px] text-slate-400">external_whisper_model</span></div>
                   <input className="w-full rounded border px-3 py-2 text-sm" value={externalWhisperModel} onChange={(e) => setExternalWhisperModel(e.target.value)} placeholder="whisper-1" />
+                  <div className="mt-1 text-xs text-slate-500">服务端固定模型时保持默认 `whisper-1` 即可；如果你的服务要求指定模型 ID，可在这里填写。</div>
                 </label>
                 <div className="flex items-end">
                   <button
@@ -522,7 +528,7 @@ export default function SettingsASRPage() {
                       }
                     }}
                   >
-                    {externalWhisperTestBusy ? "测试中…" : "测试外部 Whisper"}
+                    {externalWhisperTestBusy ? "测试中…" : "测试在线 Whisper"}
                   </button>
                 </div>
               </div>

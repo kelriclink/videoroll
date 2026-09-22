@@ -551,7 +551,7 @@ def _run_asr_stage(
         external_model = str(model_name or asr_defaults.get("external_whisper_model") or "").strip()
         _safe_append_log_line(
             log_path,
-            f"asr: engine=external-whisper model={external_model} base_url={external_base_url or '(empty)'} language={language}",
+            f"asr: engine=online-whisper model={external_model} base_url={external_base_url or '(empty)'} language={language}",
         )
         segments = transcribe_external_whisper(
             audio_path,

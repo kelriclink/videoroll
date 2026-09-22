@@ -6,6 +6,7 @@ import wave
 
 from videoroll.apps.subtitle_service import processing
 from videoroll.apps.subtitle_service.asr_settings_store import get_asr_settings
+from videoroll.apps.subtitle_service.schemas import ExternalWhisperTestRequest
 
 
 def _defaults() -> SimpleNamespace:
@@ -86,3 +87,53 @@ def test_external_whisper_falls_back_to_one_segment_for_plain_text_response(tmp_
         )
 
     assert segments == [processing.Segment(start=0.0, end=2.0, text="Hello")]
+
+
+def test_external_whisper_allows_local_service_without_api_key(tmp_path) -> None:
+    audio_path = tmp_path / "audio.wav"
+    audio_path.write_bytes(b"wav")
+    response = MagicMock()
+    response.json.return_value = {
+        "text": "Local faster whisper",
+        "segments": [{"start": 0.0, "end": 1.0, "text": "Local faster whisper"}],
+    }
+    response.raise_for_status.return_value = None
+
+    with patch("videoroll.apps.subtitle_service.processing.httpx.post", return_value=response) as post:
+        segments = processing.transcribe_external_whisper(
+            audio_path,
+            base_url="http://192.168.5.50:8000",
+            api_key="",
+            model_name="",
+        )
+
+    assert segments[0].text == "Local faster whisper"
+    assert post.call_args.kwargs["headers"] == {}
+    assert post.call_args.kwargs["data"]["model"] == "whisper-1"
+    assert post.call_args.args[0] == "http://192.168.5.50:8000/v1/audio/transcriptions"
+
+
+def test_external_whisper_accepts_full_transcriptions_endpoint(tmp_path) -> None:
+    audio_path = tmp_path / "audio.wav"
+    audio_path.write_bytes(b"wav")
+    response = MagicMock()
+    response.json.return_value = {"text": ""}
+    response.raise_for_status.return_value = None
+
+    endpoint = "http://whisper.internal:8000/v1/audio/transcriptions"
+    with patch("videoroll.apps.subtitle_service.processing.httpx.post", return_value=response) as post:
+        processing.transcribe_external_whisper(
+            audio_path,
+            base_url=endpoint,
+            api_key="",
+            model_name="whisper-1",
+        )
+
+    assert post.call_args.args[0] == endpoint
+
+
+def test_external_whisper_test_request_only_requires_service_address() -> None:
+    request = ExternalWhisperTestRequest(base_url="http://whisper.internal:8000")
+
+    assert request.api_key is None
+    assert request.model == "whisper-1"

@@ -569,20 +569,18 @@ def transcribe_external_whisper(
     language: str = "auto",
     timeout_seconds: float = 180.0,
 ) -> list[Segment]:
-    """Transcribe audio through an OpenAI-compatible Whisper API."""
+    """Transcribe audio through an OpenAI-compatible online Whisper API."""
     key = str(api_key or "").strip()
-    model = str(model_name or "").strip()
-    if not key:
-        raise RuntimeError("external Whisper API key is not set")
-    if not model:
-        raise RuntimeError("external Whisper model is not set")
+    model = str(model_name or "").strip() or "whisper-1"
     url = build_openai_audio_transcriptions_url(base_url)
     data: dict[str, str] = {"model": model, "response_format": "verbose_json"}
     lang = str(language or "").strip()
     if lang and lang.lower() != "auto":
         data["language"] = lang
     timeout = max(1.0, min(600.0, float(timeout_seconds)))
-    headers = {"Authorization": f"Bearer {key}"}
+    headers: dict[str, str] = {}
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
     try:
         with audio_path.open("rb") as audio_file:
             response = httpx.post(
@@ -596,14 +594,14 @@ def transcribe_external_whisper(
         payload = response.json()
     except httpx.HTTPStatusError as exc:
         detail = (exc.response.text or "").strip().replace("\n", " ")[:500]
-        raise RuntimeError(f"external Whisper API failed (status={exc.response.status_code}): {detail}") from exc
+        raise RuntimeError(f"online Whisper API failed (status={exc.response.status_code}): {detail}") from exc
     except httpx.HTTPError as exc:
-        raise RuntimeError(f"external Whisper API request failed: {exc}") from exc
+        raise RuntimeError(f"online Whisper API request failed: {exc}") from exc
     except ValueError as exc:
-        raise RuntimeError("external Whisper API returned invalid JSON") from exc
+        raise RuntimeError("online Whisper API returned invalid JSON") from exc
 
     if not isinstance(payload, dict):
-        raise RuntimeError("external Whisper API response must be an object")
+        raise RuntimeError("online Whisper API response must be an object")
     segments_raw = payload.get("segments")
     out: list[Segment] = []
     if isinstance(segments_raw, list):

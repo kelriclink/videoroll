@@ -244,7 +244,7 @@ export function TaskDetailSubtitle({ controller }: { controller: TaskDetailContr
                   <option value="mock">mock</option>
                   <option value="faster-whisper">faster-whisper</option>
                   <option value="openvino">openvino（方案2 / Intel Arc）</option>
-                  <option value="external-whisper">external-whisper（外部 API）</option>
+                  <option value="external-whisper">在线 Whisper（使用 ASR 设置中的服务地址）</option>
                   <option value="groq-whisper">groq-whisper（GroqCloud，自动切片）</option>
                   <option value="cloudflare-workers-ai">cloudflare-workers-ai（原生时间轴）</option>
                 </select>
@@ -277,7 +277,7 @@ export function TaskDetailSubtitle({ controller }: { controller: TaskDetailContr
                   ))}
                 </select>
                 <div className="mt-2 text-xs text-slate-500">
-                  提示：`faster-whisper` 和 `openvino` 可以传本地模型目录路径；Groq 使用 `whisper-large-v3(-turbo)`，Cloudflare 使用 `@cf/` 模型 ID。
+                  提示：`faster-whisper` 和 `openvino` 可以传本地模型目录路径；在线 Whisper 使用“ASR 设置”中保存的服务地址；Groq 使用 `whisper-large-v3(-turbo)`，Cloudflare 使用 `@cf/` 模型 ID。
                 </div>
               </label>
             </div>

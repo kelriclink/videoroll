@@ -449,8 +449,10 @@ def put_asr_settings_view(
 @app.post("/subtitle/asr/external/test", response_model=ExternalWhisperTestResponse)
 def test_external_whisper(
     payload: ExternalWhisperTestRequest,
+    settings: SubtitleServiceSettings = Depends(get_settings),
+    db: Session = Depends(get_db),
 ) -> ExternalWhisperTestResponse:
-    """Send a short generated WAV to an external Whisper API to verify settings."""
+    """Send a short generated WAV to an online/OpenAI-compatible Whisper API."""
     started = time.perf_counter()
     temp_path: Path | None = None
     try:
@@ -461,10 +463,12 @@ def test_external_whisper(
             wav_file.setsampwidth(2)
             wav_file.setframerate(16000)
             wav_file.writeframes(b"\x00\x00" * 16000)
+        stored = get_asr_settings(db, settings)
+        api_key = str(payload.api_key or "").strip() or str(stored.get("external_whisper_api_key") or "").strip()
         segments = transcribe_external_whisper(
             temp_path,
             base_url=payload.base_url,
-            api_key=payload.api_key,
+            api_key=api_key,
             model_name=payload.model,
             timeout_seconds=30.0,
         )
@@ -484,7 +488,7 @@ def test_external_whisper(
             try:
                 temp_path.unlink(missing_ok=True)
             except Exception:
-                logger.debug("failed to remove external Whisper test audio", exc_info=True)
+                logger.debug("failed to remove online Whisper test audio", exc_info=True)
 
 
 @app.post("/subtitle/asr/cloudflare/test", response_model=CloudflareWorkersAITestResponse)
