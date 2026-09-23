@@ -134,7 +134,7 @@ def test_application_network_is_internal_and_egress_is_role_scoped() -> None:
             assert set(compose["services"][name]["networks"]) == {"internal", "infrastructure-egress"}
         assert compose["services"]["render-worker"]["networks"] == ["internal"]
         assert "hatchet-postgres" not in compose["services"]
-        assert compose["services"]["hatchet-lite"]["networks"] == ["internal"]
+        assert set(compose["services"]["hatchet-lite"]["networks"]) == {"internal", "infrastructure-egress"}
         assert "host.docker.internal:host-gateway" in compose["services"]["hatchet-lite"].get("extra_hosts", [])
         assert compose["services"]["hatchet-lite"]["environment"]["DATABASE_URL"] == "${HATCHET_DATABASE_URL:?HATCHET_DATABASE_URL must be set}"
         assert compose["services"]["hatchet-lite"]["environment"]["LITE_FRONTEND_BASE_PATH"] == "/workflow-ui"
