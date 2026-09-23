@@ -156,7 +156,7 @@ def test_task_queue_reports_real_youtube_download_progress(
     assert item.progress == 55
 
 
-def test_task_queue_reports_pipeline_bootstrap_after_youtube_download(
+def test_task_queue_reports_workflow_after_youtube_download(
     monkeypatch: pytest.MonkeyPatch,
     operations_db: Session,
 ) -> None:
@@ -186,7 +186,7 @@ def test_task_queue_reports_pipeline_bootstrap_after_youtube_download(
     queue = _read_task_queue(operations_db, limit=20)
     item = next(row for row in queue.tasks if row.task_id == task.id)
 
-    assert item.stage == "subtitle_handoff"
+    assert item.stage == "workflow"
     assert item.progress == 100
 
 

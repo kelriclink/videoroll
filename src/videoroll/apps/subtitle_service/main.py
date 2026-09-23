@@ -2107,7 +2107,11 @@ def _auto_youtube_queue_progress(db: Session, task: Task) -> tuple[str, int, str
         progress = 0
     error = str(data.get("error") or "").strip() or None
     if status == "completed":
-        return "subtitle_handoff", 100, error
+        # Download completion only proves the source asset is ready. Hatchet may
+        # still be advancing the workflow (or a previous run may have failed),
+        # so do not fabricate a subtitle-handoff execution state before a real
+        # SubtitleJob exists.
+        return "workflow", 100, error
     return "youtube_download", progress, error
 
 

@@ -14,6 +14,10 @@ VIDEO_PIPELINE_NAME = "VideoPipelineV1"
 SUBTITLE_JOB_TASK_NAME = "SubtitleJobV1"
 RENDER_FINISHED_EVENT = "videoroll.render.finished"
 PUBLISH_FINISHED_EVENT = "videoroll.publish.finished"
+YOUTUBE_DOWNLOAD_REQUEST_TIMEOUT_SECONDS = 6 * 60 * 60
+YOUTUBE_DOWNLOAD_POLL_INTERVAL_SECONDS = 10
+YOUTUBE_DOWNLOAD_IDLE_GRACE_POLLS = 6
+YOUTUBE_DOWNLOAD_MAX_POLLS = 8 * 60 * 60 // YOUTUBE_DOWNLOAD_POLL_INTERVAL_SECONDS
 
 
 class AutoYouTubeWorkflowInput(BaseModel):
@@ -86,6 +90,135 @@ def _post_orchestrator(
         raise RuntimeError(f"orchestrator request failed: {type(exc).__name__}: {exc}") from exc
 
 
+def _non_retryable(message: str, *, cause: Exception | None = None) -> None:
+    try:
+        from hatchet_sdk import NonRetryableException
+    except ImportError:
+        NonRetryableException = RuntimeError  # type: ignore[misc,assignment]
+    if cause is None:
+        raise NonRetryableException(message)
+    raise NonRetryableException(message) from cause
+
+
+async def _get_youtube_download_progress(
+    settings: WorkflowRuntimeSettings,
+    task_id: str,
+) -> dict[str, Any]:
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(30.0, connect=10.0),
+            headers=_headers(settings),
+        ) as client:
+            response = await client.get(
+                f"{settings.orchestrator_url}/tasks/{task_id}/youtube_download_progress"
+            )
+            response.raise_for_status()
+            payload = response.json() if response.content else {}
+            return payload if isinstance(payload, dict) else {}
+    except httpx.HTTPStatusError as exc:
+        status = int(exc.response.status_code)
+        detail = (exc.response.text or "").strip()
+        if status in {400, 401, 403, 404}:
+            _non_retryable(
+                f"youtube download progress returned {status}: {detail[:1000]}",
+                cause=exc,
+            )
+        raise RuntimeError(
+            f"youtube download progress returned retryable {status}: {detail[:1000]}"
+        ) from exc
+    except httpx.HTTPError as exc:
+        raise RuntimeError(
+            f"youtube download progress request failed: {type(exc).__name__}: {exc}"
+        ) from exc
+
+
+async def _wait_for_youtube_download(
+    settings: WorkflowRuntimeSettings,
+    task_id: str,
+    ctx: Any,
+    *,
+    uncertain_start_error: Exception | None = None,
+) -> dict[str, Any]:
+    idle_polls = 0
+    transient_progress_errors = 0
+    for _ in range(YOUTUBE_DOWNLOAD_MAX_POLLS):
+        try:
+            progress = await _get_youtube_download_progress(settings, task_id)
+            transient_progress_errors = 0
+        except RuntimeError:
+            transient_progress_errors += 1
+            if transient_progress_errors >= YOUTUBE_DOWNLOAD_IDLE_GRACE_POLLS:
+                raise
+            await ctx.aio_sleep_for(timedelta(seconds=YOUTUBE_DOWNLOAD_POLL_INTERVAL_SECONDS))
+            continue
+
+        status = str(progress.get("status") or "").strip().lower()
+        active = bool(progress.get("active"))
+        if status == "completed":
+            return progress
+        if status == "failed":
+            detail = str(progress.get("error") or "").strip()
+            raise RuntimeError(detail or f"youtube download failed for task {task_id}")
+
+        if status in {"preparing", "downloading", "processing", "storing", "uploading"} or active:
+            idle_polls = 0
+        elif status in {"", "idle"}:
+            idle_polls += 1
+            if uncertain_start_error is not None and idle_polls >= YOUTUBE_DOWNLOAD_IDLE_GRACE_POLLS:
+                raise RuntimeError(
+                    f"youtube download did not start after orchestrator request failed: "
+                    f"{type(uncertain_start_error).__name__}: {uncertain_start_error}"
+                ) from uncertain_start_error
+
+        await ctx.aio_sleep_for(timedelta(seconds=YOUTUBE_DOWNLOAD_POLL_INTERVAL_SECONDS))
+
+    raise RuntimeError(f"youtube download did not finish within 8 hours for task {task_id}")
+
+
+async def _ensure_youtube_download(
+    settings: WorkflowRuntimeSettings,
+    task_id: str,
+    ctx: Any,
+) -> dict[str, Any]:
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(YOUTUBE_DOWNLOAD_REQUEST_TIMEOUT_SECONDS, connect=10.0),
+            headers=_headers(settings),
+        ) as client:
+            response = await client.post(
+                f"{settings.orchestrator_url}/tasks/{task_id}/actions/youtube_download"
+            )
+    except httpx.HTTPError as exc:
+        # A disconnected/expired HTTP request does not mean the synchronous
+        # orchestrator download stopped. Durable-poll the business progress so
+        # Hatchet does not start a duplicate download and burn retries on 409.
+        return await _wait_for_youtube_download(
+            settings,
+            task_id,
+            ctx,
+            uncertain_start_error=exc,
+        )
+
+    if response.is_success:
+        payload = response.json() if response.content else {}
+        return payload if isinstance(payload, dict) else {"result": payload}
+
+    detail = (response.text or "").strip()
+    status = int(response.status_code)
+    if status == 409 and any(
+        marker in detail.lower()
+        for marker in (
+            "already in progress",
+            "result is being recovered",
+            "recovery is already in progress",
+        )
+    ):
+        return await _wait_for_youtube_download(settings, task_id, ctx)
+    if status not in {429, 500, 502, 503, 504}:
+        _non_retryable(f"orchestrator returned {status}: {detail[:1000]}")
+    raise RuntimeError(f"orchestrator returned retryable {status}: {detail[:1000]}")
+
+
 def _desired_pool(pool: str) -> list[Any]:
     try:
         from hatchet_sdk import DesiredWorkerLabel
@@ -138,21 +271,17 @@ def register_video_pipeline(hatchet: Any, *, settings: WorkflowRuntimeSettings |
         input_validator=AutoYouTubeWorkflowInput,
     )
 
-    @workflow.task(
+    @workflow.durable_task(
         name="youtube-download",
         retries=2,
         backoff_factor=2.0,
         backoff_max_seconds=30,
         schedule_timeout=timedelta(minutes=10),
-        execution_timeout=timedelta(minutes=40),
+        execution_timeout=timedelta(hours=8),
         desired_worker_labels=_desired_pool("workflow-core"),
     )
-    def youtube_download(input: AutoYouTubeWorkflowInput, _ctx: Any) -> WorkflowStageOutput:
-        _post_orchestrator(
-            runtime,
-            f"/tasks/{input.task_id}/actions/youtube_download",
-            timeout_seconds=35 * 60,
-        )
+    async def youtube_download(input: AutoYouTubeWorkflowInput, ctx: Any) -> WorkflowStageOutput:
+        await _ensure_youtube_download(runtime, input.task_id, ctx)
         return WorkflowStageOutput(task_id=input.task_id, status="downloaded")
 
     @workflow.task(
