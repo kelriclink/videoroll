@@ -675,6 +675,58 @@ def list_task_publish_batches(task_id: uuid.UUID, limit: int, db: Session) -> li
     ]
 
 
+def auto_publish_task(
+    task_id: uuid.UUID,
+    settings: OrchestratorSettings,
+    db: Session,
+    store: FileStore,
+) -> dict[str, Any]:
+    """Evaluate the current automatic publish box and submit enabled targets.
+
+    This is the Hatchet workflow boundary after render completion. Configuration
+    is read at execution time rather than frozen into the original intake.
+    """
+    task = db.get(Task, task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="task not found")
+    profile = dict(get_auto_profile(db))
+    if not bool(profile.get("auto_publish")):
+        return {"status": "skipped", "detail": "automatic publishing is disabled"}
+    if not list(profile.get("auto_publish_platforms") or []):
+        return {"status": "skipped", "detail": "no automatic publish platforms are selected"}
+
+    final_asset = (
+        db.query(Asset)
+        .filter(Asset.task_id == task_id, Asset.kind == AssetKind.video_final)
+        .order_by(Asset.created_at.desc())
+        .first()
+    )
+    if final_asset is None:
+        return {"status": "error", "detail": "render completed without a final video asset"}
+
+    action = build_auto_publish_after_render(task, db=db, store=store)
+    publish_payload = dict(action.get("publish_payload") or {})
+    publish_payload["fresh_batch"] = True
+    if publish_payload.get("video_key") in {"", None}:
+        publish_payload["video_key"] = None
+    result_data = publish_all(
+        task_id,
+        PublishAllRequest.model_validate(publish_payload),
+        settings,
+        db,
+        store,
+    )
+    errors = result_data.get("errors", {}) if isinstance(result_data, dict) else {}
+    if not result_data.get("has_any_accepted", False) and errors:
+        detail = "; ".join(f"{platform}: {message}" for platform, message in errors.items())
+        return {"status": "error", "detail": f"all platforms failed: {detail}", "platforms": result_data}
+    return {
+        "status": "ok",
+        "platforms": result_data,
+        "publish_batch_id": str(result_data.get("batch_id") or "").strip() or None,
+    }
+
+
 def enqueue_publish_job(
     task_id: uuid.UUID,
     payload: PublishActionRequest,

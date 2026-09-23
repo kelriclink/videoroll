@@ -71,7 +71,7 @@ def test_resume_failed_recent_restarts_youtube_pipeline_when_no_subtitle_job(mon
     monkeypatch.setattr(
         youtube_service,
         "enqueue_auto_youtube_pipeline",
-        lambda task_id, auto_publish: f"pipeline:{task_id}:{auto_publish}",
+        lambda task_id, auto_publish, **_kwargs: f"pipeline:{task_id}:{auto_publish}",
     )
 
     resp = subtitle_service.resume_recent_failed_tasks(

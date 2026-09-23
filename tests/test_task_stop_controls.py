@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+import uuid
 
 import pytest
 from sqlalchemy import create_engine
@@ -11,6 +11,8 @@ from sqlalchemy.orm import Session, sessionmaker
 from videoroll.apps.orchestrator_api.services import task_service
 from videoroll.db.base import Base
 from videoroll.db.models import (
+    OutboxEvent,
+    PipelineRun,
     RenderJob,
     RenderJobStatus,
     SourceLicense,
@@ -30,13 +32,19 @@ def _compile_jsonb_for_sqlite(_type: JSONB, _compiler: object, **_kwargs: object
 @pytest.fixture
 def db() -> Session:
     engine = create_engine("sqlite:///:memory:")
-    Base.metadata.create_all(engine, tables=[Task.__table__, SubtitleJob.__table__, RenderJob.__table__])
+    Base.metadata.create_all(
+        engine,
+        tables=[Task.__table__, SubtitleJob.__table__, RenderJob.__table__, PipelineRun.__table__, OutboxEvent.__table__],
+    )
     session = sessionmaker(bind=engine)()
     try:
         yield session
     finally:
         session.close()
-        Base.metadata.drop_all(engine, tables=[RenderJob.__table__, SubtitleJob.__table__, Task.__table__])
+        Base.metadata.drop_all(
+            engine,
+            tables=[OutboxEvent.__table__, PipelineRun.__table__, RenderJob.__table__, SubtitleJob.__table__, Task.__table__],
+        )
 
 
 def _task(status: TaskStatus = TaskStatus.ingested) -> Task:
@@ -45,17 +53,29 @@ def _task(status: TaskStatus = TaskStatus.ingested) -> Task:
 
 def test_stop_and_resume_preserves_the_previous_task_stage(db: Session) -> None:
     task = _task(TaskStatus.translated)
-    task.lock_owner = "subtitle_service.task_queue"
-    task.lock_until = datetime.now(timezone.utc) + timedelta(minutes=5)
     db.add(task)
+    db.flush()
+    run = PipelineRun(
+        task_id=task.id,
+        engine="hatchet",
+        workflow_name="SubtitleJobV1",
+        external_run_id="hatchet-run-1",
+        state="submitted",
+        request_json={},
+    )
+    db.add(run)
     db.commit()
 
     stopped = task_service.stop_task(task.id, db=db)
 
     assert stopped.status == TaskStatus.canceled
     assert stopped.stopped_status == TaskStatus.translated
-    assert stopped.lock_owner is None
-    assert stopped.lock_until is None
+    db.refresh(run)
+    assert run.state == "cancel_requested"
+    event = db.query(OutboxEvent).filter(OutboxEvent.event_type == "workflow.cancel").one()
+    assert event.task_name == "subtitle_service.cancel_workflow_run"
+    assert event.args_json["queue"] == "subtitle-control"
+    assert event.args_json["args"] == [str(run.id), "hatchet-run-1"]
 
     resumed = task_service.resume_stopped_task(task.id, db=db)
 
@@ -69,8 +89,6 @@ def test_stop_all_skips_terminal_and_already_stopped_tasks(db: Session) -> None:
     failed = _task(TaskStatus.failed)
     already_stopped = _task(TaskStatus.canceled)
     already_stopped.stopped_status = TaskStatus.ingested
-    already_stopped.lock_owner = "subtitle_service.task_queue"
-    already_stopped.lock_until = datetime.now(timezone.utc) + timedelta(minutes=5)
     db.add_all([active, completed, failed, already_stopped])
     db.commit()
 
@@ -81,8 +99,6 @@ def test_stop_all_skips_terminal_and_already_stopped_tasks(db: Session) -> None:
     assert active.stopped_status == TaskStatus.downloaded
     assert completed.status == TaskStatus.published
     assert failed.status == TaskStatus.failed
-    assert already_stopped.lock_owner is None
-    assert already_stopped.lock_until is None
 
 
 def test_stop_all_includes_failed_tasks_with_live_jobs(db: Session) -> None:

@@ -184,6 +184,16 @@ def delete_social_publish_account(
     return publishing_service.delete_social_publish_account(account_id, settings)
 
 
+@router.post("/tasks/{task_id}/actions/auto_publish")
+def auto_publish_task(
+    task_id: uuid.UUID,
+    settings: OrchestratorSettings = Depends(get_settings),
+    db: Session = Depends(get_db),
+    store: FileStore = Depends(get_store),
+) -> dict[str, Any]:
+    return publishing_service.auto_publish_task(task_id, settings, db, store)
+
+
 @router.post("/tasks/{task_id}/actions/publish_all", response_model=PublishAllResultResponse)
 def publish_all_platforms(
     task_id: uuid.UUID,

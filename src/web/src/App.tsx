@@ -22,6 +22,7 @@ const SettingsPublishPage = lazy(() => import("./pages/SettingsPublishPage"));
 const SettingsAutoPage = lazy(() => import("./pages/SettingsAutoPage"));
 const SettingsReviewPage = lazy(() => import("./pages/SettingsReviewPage"));
 const PlayoutPage = lazy(() => import("./pages/PlayoutPage"));
+const WorkflowCenterPage = lazy(() => import("./pages/WorkflowCenterPage"));
 const RenderQueuePage = lazy(() => import("./pages/RenderQueuePage"));
 const RenderManagementPage = lazy(() => import("./pages/RenderManagementPage"));
 const KnowledgeBasePage = lazy(() => import("./pages/KnowledgeBasePage"));
@@ -103,6 +104,7 @@ function Navigation({ onNavigate }: { onNavigate?: () => void }) {
         <NavItem to="/tasks" label="任务" onNavigate={onNavigate} />
         <NavItem to="/videos" label="视频成品" onNavigate={onNavigate} />
         <NavItem to="/playout" label="播控中心" onNavigate={onNavigate} />
+        <NavItem to="/workflow" label="工作流中心" onNavigate={onNavigate} />
         <NavItem to="/queue/render" label="处理队列" onNavigate={onNavigate} />
         <NavItem to="/render" label="渲染管理" onNavigate={onNavigate} />
         <NavItem to="/knowledge" label="知识库" onNavigate={onNavigate} />
@@ -151,7 +153,7 @@ function NotFoundPage() {
 
 export default function App() {
   const location = useLocation();
-  const isPlayoutRoute = location.pathname === "/playout";
+  const isEmbeddedConsoleRoute = location.pathname === "/playout" || location.pathname === "/workflow";
   const orchestratorDisplay =
     ORCHESTRATOR_URL.startsWith("http://") || ORCHESTRATOR_URL.startsWith("https://")
       ? ORCHESTRATOR_URL
@@ -214,13 +216,13 @@ export default function App() {
       <div
         className={[
           "bg-slate-50 transition-colors dark:bg-slate-950",
-          isPlayoutRoute ? "flex h-screen flex-col overflow-hidden" : "min-h-screen",
+          isEmbeddedConsoleRoute ? "flex h-screen flex-col overflow-hidden" : "min-h-screen",
         ].join(" ")}
       >
         <header
           className={[
             "sticky top-0 z-30 border-b bg-white/95 backdrop-blur transition-colors dark:border-slate-800 dark:bg-slate-950/95",
-            isPlayoutRoute ? "flex-none" : "",
+            isEmbeddedConsoleRoute ? "flex-none" : "",
           ].join(" ")}
         >
           <div className="mx-auto flex max-w-[1440px] items-center justify-between px-4 py-3 lg:px-6">
@@ -305,13 +307,13 @@ export default function App() {
         <div
           className={[
             "mx-auto grid max-w-[1440px] grid-cols-1 gap-6 px-4 py-5 md:grid-cols-[220px_minmax(0,1fr)] lg:px-6",
-            isPlayoutRoute ? "min-h-0 w-full flex-1 overflow-hidden" : "",
+            isEmbeddedConsoleRoute ? "min-h-0 w-full flex-1 overflow-hidden" : "",
           ].join(" ")}
         >
           <aside
             className={[
               "hidden md:block",
-              isPlayoutRoute ? "min-h-0 overflow-y-auto" : "",
+              isEmbeddedConsoleRoute ? "min-h-0 overflow-y-auto" : "",
             ].join(" ")}
           >
             <div className="sticky top-[69px] max-h-[calc(100vh-89px)] overflow-y-auto pr-2">
@@ -326,7 +328,7 @@ export default function App() {
           <main
             className={[
               "min-w-0",
-              isPlayoutRoute ? "min-h-0 overflow-hidden" : "",
+              isEmbeddedConsoleRoute ? "min-h-0 overflow-hidden" : "",
             ].join(" ")}
           >
             <Suspense fallback={<PageLoading />}>
@@ -336,6 +338,7 @@ export default function App() {
                 <Route path="/videos" element={<VideosPage />} />
                 <Route path="/live" element={<Navigate to="/playout" replace />} />
                 <Route path="/playout" element={<PlayoutPage />} />
+                <Route path="/workflow" element={<WorkflowCenterPage />} />
                 <Route path="/tasks/new" element={<TaskNewPage />} />
                 <Route path="/tasks/:taskId" element={<TaskDetailPage />} />
                 <Route path="/youtube/sources" element={<YouTubeSourcesPage />} />

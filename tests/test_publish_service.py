@@ -10,6 +10,7 @@ from fastapi import HTTPException
 from videoroll.apps.orchestrator_api.schemas import PublishAllRequest
 from videoroll.apps.orchestrator_api.services.publishing_service import (
     _publish_review_blocks_publish,
+    auto_publish_task,
     build_auto_publish_after_render,
     publish_all,
     run_task_publish_review,
@@ -220,6 +221,94 @@ def test_publish_service_limits_targets_to_requested_enabled_platforms(mock_get_
     service = PublishService(MagicMock(), MagicMock(), MagicMock())
 
     assert service._get_enabled_platforms({"platforms": ["douyin"]}) == ["douyin"]
+
+
+def test_auto_publish_task_skips_when_current_profile_is_disabled() -> None:
+    task_id = uuid.uuid4()
+    task = MagicMock(id=task_id)
+    db = MagicMock()
+    db.get.return_value = task
+
+    with patch(
+        "videoroll.apps.orchestrator_api.services.publishing_service.get_auto_profile",
+        return_value={"auto_publish": False, "auto_publish_platforms": ["douyin"]},
+    ):
+        result = auto_publish_task(task_id, MagicMock(), db, MagicMock())
+
+    assert result == {"status": "skipped", "detail": "automatic publishing is disabled"}
+
+
+def test_auto_publish_task_submits_current_profile_after_render() -> None:
+    task_id = uuid.uuid4()
+    task = MagicMock(id=task_id)
+    final_asset = MagicMock(storage_key=f"final/{task_id}/video.mp4")
+    db = MagicMock()
+    db.get.return_value = task
+    db.query.return_value.filter.return_value.order_by.return_value.first.return_value = final_asset
+    publish_result = {
+        "has_any_accepted": True,
+        "batch_id": "batch-1",
+        "errors": {},
+        "results": {"douyin": {"status": "accepted"}},
+    }
+
+    with (
+        patch(
+            "videoroll.apps.orchestrator_api.services.publishing_service.get_auto_profile",
+            return_value={"auto_publish": True, "auto_publish_platforms": ["douyin"]},
+        ),
+        patch(
+            "videoroll.apps.orchestrator_api.services.publishing_service.build_auto_publish_after_render",
+            return_value={
+                "publish": True,
+                "publish_payload": {"platforms": ["douyin"], "video_key": None, "skip_review": True},
+            },
+        ) as build_action,
+        patch(
+            "videoroll.apps.orchestrator_api.services.publishing_service.publish_all",
+            return_value=publish_result,
+        ) as publish_all_call,
+    ):
+        result = auto_publish_task(task_id, MagicMock(), db, MagicMock())
+
+    assert result == {"status": "ok", "platforms": publish_result, "publish_batch_id": "batch-1"}
+    build_action.assert_called_once()
+    payload = publish_all_call.call_args.args[1]
+    assert payload.platforms == ["douyin"]
+    assert payload.video_key is None
+    assert payload.fresh_batch is True
+
+
+def test_auto_publish_task_reports_all_target_failures() -> None:
+    task_id = uuid.uuid4()
+    task = MagicMock(id=task_id)
+    db = MagicMock()
+    db.get.return_value = task
+    db.query.return_value.filter.return_value.order_by.return_value.first.return_value = MagicMock()
+    publish_result = {
+        "has_any_accepted": False,
+        "errors": {"douyin": "account expired"},
+        "results": {"douyin": {"status": "error"}},
+    }
+
+    with (
+        patch(
+            "videoroll.apps.orchestrator_api.services.publishing_service.get_auto_profile",
+            return_value={"auto_publish": True, "auto_publish_platforms": ["douyin"]},
+        ),
+        patch(
+            "videoroll.apps.orchestrator_api.services.publishing_service.build_auto_publish_after_render",
+            return_value={"publish": True, "publish_payload": {"platforms": ["douyin"], "video_key": None}},
+        ),
+        patch(
+            "videoroll.apps.orchestrator_api.services.publishing_service.publish_all",
+            return_value=publish_result,
+        ),
+    ):
+        result = auto_publish_task(task_id, MagicMock(), db, MagicMock())
+
+    assert result["status"] == "error"
+    assert "account expired" in result["detail"]
 
 
 def test_build_auto_publish_after_render_uses_profile_platforms() -> None:

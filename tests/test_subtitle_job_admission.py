@@ -79,10 +79,8 @@ def test_orchestrator_rejects_published_subtitle_actions_before_forwarding(db: S
 
 
 @pytest.mark.parametrize("status", [TaskStatus.published, TaskStatus.canceled])
-def test_internal_subtitle_api_does_not_create_jobs_for_terminal_tasks(db: Session, monkeypatch, status: TaskStatus) -> None:
+def test_internal_subtitle_api_does_not_create_jobs_for_terminal_tasks(db: Session, status: TaskStatus) -> None:
     task = _task(db, status)
-    dispatched: list[str] = []
-    monkeypatch.setattr(subtitle_api.celery_app, "send_task", lambda name, **kwargs: dispatched.append(name))
     request = SubtitleJobCreate(task_id=task.id, input={"key": f"raw/{task.id}/source.mp4"})
 
     with pytest.raises(HTTPException) as caught:
@@ -90,12 +88,10 @@ def test_internal_subtitle_api_does_not_create_jobs_for_terminal_tasks(db: Sessi
 
     assert caught.value.status_code == 409
     assert db.query(SubtitleJob).count() == 0
-    assert dispatched == []
 
 
-def test_internal_subtitle_api_accepts_an_unfinished_task(db: Session, monkeypatch) -> None:
+def test_internal_subtitle_api_accepts_an_unfinished_task(db: Session) -> None:
     task = _task(db, TaskStatus.downloaded)
-    monkeypatch.setattr(subtitle_api.celery_app, "send_task", lambda *args, **kwargs: None)
 
     response = subtitle_api.create_job(SubtitleJobCreate(task_id=task.id, input={"key": "raw/source.mp4"}), db)
 
@@ -104,12 +100,11 @@ def test_internal_subtitle_api_accepts_an_unfinished_task(db: Session, monkeypat
     assert job is not None and job.task_id == task.id
 
 
-def test_legacy_auto_job_infers_runtime_profile_but_explicit_manual_request_does_not(db: Session, monkeypatch) -> None:
+def test_automatic_job_infers_runtime_profile_but_explicit_manual_request_does_not(db: Session) -> None:
     task = _task(db, TaskStatus.downloaded)
     task.created_by = encode_auto_youtube_created_by("auto_youtube", auto_publish=None)
     db.add(task)
     db.commit()
-    monkeypatch.setattr(subtitle_api.celery_app, "send_task", lambda *args, **kwargs: None)
 
     legacy = subtitle_api.create_job(SubtitleJobCreate(task_id=task.id, input={"key": "raw/source.mp4"}), db)
     legacy_job = db.get(SubtitleJob, uuid.UUID(legacy["job_id"]))

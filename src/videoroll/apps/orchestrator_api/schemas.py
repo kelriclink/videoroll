@@ -143,6 +143,7 @@ class PublishAllRequest(BaseModel):
     platform_options: dict[str, dict[str, Any]] = Field(default_factory=dict)
     skip_review: bool = False
     force_retry: bool = False
+    fresh_batch: bool = False
 
 
 class PublishPlatformSettingsRead(BaseModel):
@@ -208,6 +209,13 @@ class TaskPublishReviewRead(BaseModel):
 class RemoteJobResponse(BaseModel):
     job_id: uuid.UUID
     status: str
+
+
+class AutoSubtitleHandoffResponse(BaseModel):
+    status: str
+    job_id: Optional[uuid.UUID] = None
+    job_kind: Optional[Literal["subtitle", "render"]] = None
+    detail: Optional[str] = None
 
 
 class TaskBulkControlResponse(BaseModel):

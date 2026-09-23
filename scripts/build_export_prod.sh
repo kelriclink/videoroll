@@ -12,6 +12,9 @@ fi
 ENV_FILE="${ENV_FILE:-fromprod/.env}"
 APP_IMAGE="${APP_IMAGE:-videoroll:prod}"
 SUBTITLE_IMAGE="${SUBTITLE_IMAGE:-videoroll-subtitle:prod}"
+WORKFLOW_IMAGE="${WORKFLOW_IMAGE:-videoroll-workflow:prod}"
+SUBTITLE_WORKFLOW_IMAGE="${SUBTITLE_WORKFLOW_IMAGE:-videoroll-subtitle-workflow:prod}"
+HATCHET_IMAGE="${HATCHET_IMAGE:-videoroll-hatchet:prod}"
 EGRESS_IMAGE="${EGRESS_IMAGE:-videoroll-egress:prod}"
 WEB_IMAGE="${WEB_IMAGE:-videoroll-web:prod}"
 SOCIAL_IMAGE="${SOCIAL_IMAGE:-videoroll-social-publisher:prod}"
@@ -63,6 +66,26 @@ docker_run build \
   -f Dockerfile \
   .
 
+echo "Building workflow image: $WORKFLOW_IMAGE"
+docker_run build \
+  -t "$WORKFLOW_IMAGE" \
+  --build-arg APP_UID="${APP_UID:-10001}" \
+  --build-arg APP_GID="${APP_GID:-10001}" \
+  -f docker/workflow.Dockerfile \
+  .
+
+echo "Building subtitle workflow image: $SUBTITLE_WORKFLOW_IMAGE"
+docker_run build \
+  -t "$SUBTITLE_WORKFLOW_IMAGE" \
+  --build-arg INSTALL_SUBTITLE="1" \
+  --build-arg INSTALL_ASR="${INSTALL_ASR:-1}" \
+  --build-arg INSTALL_HATCHET="1" \
+  --build-arg YTDLP_VERSION="${YTDLP_VERSION:-latest}" \
+  --build-arg APP_UID="${APP_UID:-10001}" \
+  --build-arg APP_GID="${APP_GID:-10001}" \
+  -f Dockerfile \
+  .
+
 echo "Building egress gateway image: $EGRESS_IMAGE"
 docker_run build \
   -t "$EGRESS_IMAGE" \
@@ -79,6 +102,7 @@ docker_run build \
   -t "$WEB_IMAGE" \
   --build-arg VITE_ORCHESTRATOR_URL="${VITE_ORCHESTRATOR_URL:-}" \
   --build-arg VITE_FFPLAYOUT_URL="${VITE_FFPLAYOUT_URL:-}" \
+  --build-arg VITE_HATCHET_DASHBOARD_URL="${VITE_HATCHET_DASHBOARD_URL:-}" \
   -f src/web/Dockerfile \
   src/web
 
@@ -98,7 +122,14 @@ docker_run build \
   -f services/ffplayout/Dockerfile.videoroll \
   services/ffplayout
 
-IMAGES=("$APP_IMAGE" "$SUBTITLE_IMAGE" "$EGRESS_IMAGE" "$WEB_IMAGE" "$SOCIAL_IMAGE" "$FFPLAYOUT_IMAGE")
+echo "Building Hatchet Lite image from vendored source: $HATCHET_IMAGE"
+docker_run build \
+  -t "$HATCHET_IMAGE" \
+  --build-arg VERSION="${HATCHET_VERSION:-v0.107.0}" \
+  -f services/hatchet/Dockerfile.videoroll \
+  services/hatchet
+
+IMAGES=("$APP_IMAGE" "$SUBTITLE_IMAGE" "$WORKFLOW_IMAGE" "$SUBTITLE_WORKFLOW_IMAGE" "$EGRESS_IMAGE" "$WEB_IMAGE" "$SOCIAL_IMAGE" "$FFPLAYOUT_IMAGE" "$HATCHET_IMAGE")
 if [[ "$INCLUDE_BASE_IMAGES" == "1" ]]; then
   echo "Pulling base service images"
   docker_run pull redis:7

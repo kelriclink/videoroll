@@ -24,15 +24,14 @@ from videoroll.ai.client import (
 from videoroll.apps.orchestrator_api.services import operations_service
 from videoroll.apps.subtitle_service import main as subtitle_main
 from videoroll.apps.subtitle_service.main import _parse_knowledge_import, _read_task_queue
-from videoroll.apps.subtitle_service import worker as subtitle_worker
 from videoroll.apps.subtitle_service.rag import RagSettings, rebuild_knowledge_embeddings
-from videoroll.apps.subtitle_service.schemas import TaskQueuePriorityUpdate, TaskQueueReorderRequest
 from videoroll.db.base import Base
 from videoroll.db.models import (
     AIUsageEvent,
     Account,
     AlertEvent,
     AppSetting,
+    OperationInbox,
     RenderExecution,
     RenderJob,
     RenderJobStatus,
@@ -44,6 +43,8 @@ from videoroll.db.models import (
     Task,
     TaskStatus,
 )
+
+from videoroll.utils.auto_youtube import encode_auto_youtube_created_by
 
 
 @compiles(JSONB, "sqlite")
@@ -65,6 +66,7 @@ def operations_db() -> Session:
     tables = [
         Task.__table__,
         AppSetting.__table__,
+        OperationInbox.__table__,
         Account.__table__,
         SubtitleJob.__table__,
         RenderJob.__table__,
@@ -83,27 +85,24 @@ def operations_db() -> Session:
         engine.dispose()
 
 
-def test_task_queue_orders_queued_tasks_by_priority_then_position(operations_db: Session) -> None:
+def test_task_queue_projects_hatchet_priority_without_legacy_position_ordering(operations_db: Session) -> None:
     low = Task(
         source_type=SourceType.local,
         source_license=SourceLicense.own,
         status=TaskStatus.downloaded,
         priority=0,
-        queue_position=1000,
     )
     high_late = Task(
         source_type=SourceType.local,
         source_license=SourceLicense.own,
         status=TaskStatus.downloaded,
         priority=50,
-        queue_position=2000,
     )
     high_first = Task(
         source_type=SourceType.local,
         source_license=SourceLicense.own,
         status=TaskStatus.downloaded,
         priority=50,
-        queue_position=1000,
     )
     operations_db.add_all([low, high_late, high_first])
     operations_db.flush()
@@ -114,58 +113,81 @@ def test_task_queue_orders_queued_tasks_by_priority_then_position(operations_db:
     queue = _read_task_queue(operations_db, limit=20)
     ids = [item.task_id for item in queue.tasks if item.state == "queued"]
 
-    assert ids == [high_first.id, high_late.id, low.id]
-    assert queue.tasks[0].priority == 50
-    assert queue.tasks[0].queue_position == 1000
+    # Hatchet priority is authoritative. Tasks in the same priority bucket
+    # intentionally have no user-controlled secondary queue position.
+    assert set(ids[:2]) == {high_late.id, high_first.id}
+    assert ids[2] == low.id
+    assert all(item.priority == 50 for item in queue.tasks[:2])
 
 
-def test_task_queue_tick_dispatches_highest_priority_across_job_stages(
+
+def test_task_queue_reports_real_youtube_download_progress(
     monkeypatch: pytest.MonkeyPatch,
     operations_db: Session,
 ) -> None:
-    low_render = Task(
-        source_type=SourceType.local,
+    task = Task(
+        source_type=SourceType.youtube,
+        source_url="https://www.youtube.com/watch?v=demo",
         source_license=SourceLicense.own,
-        status=TaskStatus.downloaded,
-        priority=-50,
-        queue_position=1000,
+        status=TaskStatus.ingested,
+        created_by=encode_auto_youtube_created_by("auto_youtube", auto_publish=None, run_id="queue-progress"),
     )
-    urgent_subtitle = Task(
-        source_type=SourceType.local,
-        source_license=SourceLicense.own,
-        status=TaskStatus.downloaded,
-        priority=100,
-        queue_position=2000,
-    )
-    operations_db.add_all([low_render, urgent_subtitle])
-    operations_db.flush()
-    render_job = RenderJob(task_id=low_render.id, status=RenderJobStatus.queued, request_json={})
-    subtitle_job = SubtitleJob(task_id=urgent_subtitle.id, status=SubtitleJobStatus.queued, request_json={})
-    operations_db.add_all([render_job, subtitle_job])
+    operations_db.add(task)
     operations_db.commit()
-    subtitle_job_id = str(subtitle_job.id)
 
-    sent: list[tuple[str, list[object]]] = []
-    monkeypatch.setattr(subtitle_worker, "_ensure_db", lambda: None)
-    monkeypatch.setattr(subtitle_worker, "_db", lambda: operations_db)
+    from videoroll.apps.orchestrator_api.services import youtube_service
+
     monkeypatch.setattr(
-        subtitle_worker,
-        "recover_expired_leases",
-        lambda *_args, **_kwargs: SimpleNamespace(subtitle_requeued=0, render_requeued=0),
-    )
-    monkeypatch.setattr(subtitle_worker, "live_leased_task_ids", lambda *_args, **_kwargs: set())
-    monkeypatch.setattr(subtitle_worker, "publish_queue_changed", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(
-        subtitle_worker.celery_app,
-        "send_task",
-        lambda name, args=None, **_kwargs: sent.append((str(name), list(args or []))),
+        youtube_service,
+        "get_download_progress",
+        lambda *_args, **_kwargs: {
+            "status": "downloading",
+            "active": True,
+            "progress": 55,
+            "error": None,
+        },
     )
 
-    result = subtitle_worker.task_queue_tick()
+    queue = _read_task_queue(operations_db, limit=20)
+    item = next(row for row in queue.tasks if row.task_id == task.id)
 
-    assert result["started_subtitle"] == "1"
-    assert result["started_render"] == "0"
-    assert sent == [("subtitle_service.process_job", [subtitle_job_id])]
+    assert item.state == "running"
+    assert item.stage == "youtube_download"
+    assert item.progress == 55
+
+
+def test_task_queue_reports_pipeline_bootstrap_after_youtube_download(
+    monkeypatch: pytest.MonkeyPatch,
+    operations_db: Session,
+) -> None:
+    task = Task(
+        source_type=SourceType.youtube,
+        source_url="https://www.youtube.com/watch?v=demo",
+        source_license=SourceLicense.own,
+        status=TaskStatus.downloaded,
+        created_by=encode_auto_youtube_created_by("auto_youtube", auto_publish=None, run_id="queue-complete"),
+    )
+    operations_db.add(task)
+    operations_db.commit()
+
+    from videoroll.apps.orchestrator_api.services import youtube_service
+
+    monkeypatch.setattr(
+        youtube_service,
+        "get_download_progress",
+        lambda *_args, **_kwargs: {
+            "status": "completed",
+            "active": False,
+            "progress": 100,
+            "error": None,
+        },
+    )
+
+    queue = _read_task_queue(operations_db, limit=20)
+    item = next(row for row in queue.tasks if row.task_id == task.id)
+
+    assert item.stage == "subtitle_handoff"
+    assert item.progress == 100
 
 
 def test_knowledge_bulk_parser_supports_csv_json_and_srt() -> None:
@@ -274,60 +296,6 @@ def test_embedding_rebuild_prioritizes_never_or_oldest_verified_items() -> None:
     assert "last_verified_at ASC" in db.sql
     assert "updated_at DESC" not in db.sql
     assert result["total"] == 0
-
-
-def test_priority_update_rolls_back_when_task_is_not_in_live_queue(operations_db: Session) -> None:
-    task = Task(
-        source_type=SourceType.local,
-        source_license=SourceLicense.own,
-        status=TaskStatus.downloaded,
-        priority=0,
-        queue_position=1000,
-    )
-    operations_db.add(task)
-    operations_db.commit()
-
-    with pytest.raises(HTTPException) as raised:
-        subtitle_main.patch_task_queue_priority(
-            task.id,
-            TaskQueuePriorityUpdate(priority=50),
-            db=operations_db,
-        )
-
-    assert raised.value.status_code == 409
-    operations_db.expire_all()
-    persisted = operations_db.get(Task, task.id)
-    assert persisted is not None
-    assert persisted.priority == 0
-    assert persisted.queue_position == 1000
-
-
-def test_reorder_rejects_partial_priority_bucket_without_mutating_positions(operations_db: Session) -> None:
-    tasks = [
-        Task(
-            source_type=SourceType.local,
-            source_license=SourceLicense.own,
-            status=TaskStatus.downloaded,
-            priority=50,
-            queue_position=index * 1000,
-        )
-        for index in range(1, 4)
-    ]
-    operations_db.add_all(tasks)
-    operations_db.flush()
-    for task in tasks:
-        operations_db.add(SubtitleJob(task_id=task.id, status=SubtitleJobStatus.queued, request_json={}))
-    operations_db.commit()
-
-    with pytest.raises(HTTPException) as raised:
-        subtitle_main.reorder_task_queue(
-            TaskQueueReorderRequest(task_ids=[tasks[0].id, tasks[2].id]),
-            db=operations_db,
-        )
-
-    assert raised.value.status_code == 409
-    operations_db.expire_all()
-    assert [operations_db.get(Task, task.id).queue_position for task in tasks] == [1000, 2000, 3000]
 
 
 def test_ai_usage_summary_and_pricing(operations_db: Session) -> None:

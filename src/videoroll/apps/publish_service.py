@@ -269,6 +269,7 @@ class PublishService:
         targets = self._build_enabled_targets(payload)
         if (
             current_batch
+            and not bool(payload.get("fresh_batch"))
             and current_batch.state in {
                 PublishBatchState.partial_failed.value,
                 PublishBatchState.failed.value,

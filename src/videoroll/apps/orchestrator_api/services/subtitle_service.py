@@ -14,6 +14,7 @@ from videoroll.apps.orchestrator_api.infrastructure.internal_http import (
     proxy_internal_service_request,
 )
 from videoroll.apps.orchestrator_api.schemas import (
+    AutoSubtitleHandoffResponse,
     RecentFailedResumeItem,
     RecentFailedResumeResponse,
     RemoteJobResponse,
@@ -35,7 +36,7 @@ from videoroll.db.models import (
     TaskStatus,
 )
 from videoroll.storage.filesystem import FileStore
-from videoroll.utils.auto_youtube import encode_auto_youtube_created_by
+from videoroll.utils.auto_youtube import encode_auto_youtube_created_by, parse_auto_youtube_created_by
 
 
 _BROWSER_PROXY_PATHS: dict[str, set[str]] = {
@@ -76,7 +77,6 @@ _BROWSER_PROXY_PATHS: dict[str, set[str]] = {
         "subtitle/asr/settings",
         "subtitle/auto/profile",
         "subtitle/translate/settings",
-        "subtitle/task_queue/settings",
     },
 }
 
@@ -134,6 +134,8 @@ def utcnow() -> datetime:
 def enqueue_subtitle_service_job_request(
     settings: OrchestratorSettings,
     request: dict[str, Any],
+    *,
+    launch_workflow: bool = True,
 ) -> RemoteJobResponse:
     try:
         with httpx.Client(timeout=30.0, headers=internal_http_headers(settings)) as client:
@@ -151,17 +153,39 @@ def enqueue_subtitle_service_job_request(
                 pass
             raise HTTPException(status_code=409, detail=detail) from exc
         raise HTTPException(status_code=502, detail=f"subtitle-service request failed: {exc}") from exc
-    return RemoteJobResponse(job_id=uuid.UUID(data["job_id"]), status=str(data.get("status", "queued")))
+    remote = RemoteJobResponse(job_id=uuid.UUID(data["job_id"]), status=str(data.get("status", "queued")))
+    if launch_workflow and remote.status == SubtitleJobStatus.queued.value:
+        from videoroll.workflows.launcher import PipelineLauncher
+
+        PipelineLauncher(settings).launch_subtitle_job(remote.job_id)
+    return remote
 
 
-def kick_task_queue(settings: OrchestratorSettings) -> bool:
-    """Ask the subtitle service to re-evaluate queued work without failing UI actions."""
-    try:
-        with httpx.Client(timeout=5.0, headers=internal_http_headers(settings)) as client:
-            client.post(f"{settings.subtitle_service_url}/subtitle/task_queue/tick").raise_for_status()
-        return True
-    except httpx.HTTPError:
-        return False
+def relaunch_queued_subtitle_job(
+    task_id: uuid.UUID,
+    *,
+    settings: OrchestratorSettings,
+    db: Session,
+) -> str | None:
+    """Restart a stopped manual SubtitleJob through Hatchet.
+
+    Automatic YouTube tasks are resumed by their parent VideoPipelineV1, which
+    reuses the queued SubtitleJob and owns its child execution.
+    """
+    task = db.get(Task, task_id)
+    if task is None or parse_auto_youtube_created_by(task.created_by) is not None:
+        return None
+    job = (
+        db.query(SubtitleJob)
+        .filter(SubtitleJob.task_id == task_id, SubtitleJob.status == SubtitleJobStatus.queued)
+        .order_by(SubtitleJob.created_at.desc())
+        .first()
+    )
+    if job is None:
+        return None
+    from videoroll.workflows.launcher import PipelineLauncher
+
+    return PipelineLauncher(settings).launch_subtitle_job(job.id).external_run_id
 
 
 def build_resume_subtitle_request(
@@ -276,7 +300,6 @@ def enqueue_subtitle_job(
         .first()
     )
     if in_flight:
-        kick_task_queue(settings)
         return RemoteJobResponse(job_id=in_flight.id, status=in_flight.status.value)
     raw_asset = (
         db.query(Asset)
@@ -304,6 +327,97 @@ def enqueue_subtitle_job(
             publish_payload_overrides=dict(payload.publish_payload or {}),
         )
     return enqueue_subtitle_service_job_request(settings, request)
+
+
+def enqueue_auto_subtitle_handoff(
+    task_id: uuid.UUID,
+    *,
+    settings: OrchestratorSettings,
+    db: Session,
+) -> AutoSubtitleHandoffResponse:
+    """Hand a downloaded automatic task to the existing subtitle execution path.
+
+    This is deliberately idempotent. Hatchet owns parent workflow retry/history
+    and execution; the subtitle service remains the owner of SubtitleJob creation.
+    """
+    task = db.get(Task, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="task not found")
+    if task.status == TaskStatus.canceled:
+        raise HTTPException(status_code=409, detail="task is stopped; resume it before continuing")
+    if task.status == TaskStatus.published:
+        return AutoSubtitleHandoffResponse(status="complete", detail="task is already published")
+
+    final_asset = (
+        db.query(Asset)
+        .filter(Asset.task_id == task_id, Asset.kind == AssetKind.video_final)
+        .order_by(Asset.created_at.desc())
+        .first()
+    )
+    if final_asset is not None:
+        return AutoSubtitleHandoffResponse(status="complete", detail="final video already exists")
+
+    subtitle_job = (
+        db.query(SubtitleJob)
+        .filter(
+            SubtitleJob.task_id == task_id,
+            SubtitleJob.status.in_([SubtitleJobStatus.queued, SubtitleJobStatus.running]),
+        )
+        .order_by(SubtitleJob.created_at.desc())
+        .first()
+    )
+    if subtitle_job is not None:
+        return AutoSubtitleHandoffResponse(
+            status=subtitle_job.status.value,
+            job_id=subtitle_job.id,
+            job_kind="subtitle",
+            detail="reused active subtitle job",
+        )
+
+    render_job = (
+        db.query(RenderJob)
+        .filter(
+            RenderJob.task_id == task_id,
+            RenderJob.status.in_([RenderJobStatus.queued, RenderJobStatus.running]),
+        )
+        .order_by(RenderJob.created_at.desc())
+        .first()
+    )
+    if render_job is not None:
+        return AutoSubtitleHandoffResponse(
+            status=render_job.status.value,
+            job_id=render_job.id,
+            job_kind="render",
+            detail="reused active render job",
+        )
+
+    raw_asset = (
+        db.query(Asset)
+        .filter(Asset.task_id == task_id, Asset.kind == AssetKind.video_raw)
+        .order_by(Asset.created_at.desc())
+        .first()
+    )
+    if raw_asset is None:
+        raise HTTPException(status_code=409, detail="youtube download has not produced a raw video asset yet")
+
+    request = {
+        "task_id": str(task_id),
+        "resume": task.status == TaskStatus.failed,
+        "runtime_profile": True,
+        "input": {"type": "storage", "key": raw_asset.storage_key},
+        "asr": {"engine": "auto", "language": "auto", "model": None},
+        "translate": {},
+        "output": {"formats": ["srt"], "render": {}},
+        "output_prefix": f"sub/{task_id}/",
+        "after_render": {"publish": True, "runtime_profile": True},
+    }
+    remote = enqueue_subtitle_service_job_request(settings, request, launch_workflow=False)
+    return AutoSubtitleHandoffResponse(
+        status=remote.status,
+        job_id=remote.job_id,
+        job_kind="subtitle",
+        detail="queued automatic subtitle job",
+    )
 
 
 def resume_subtitle_job(
@@ -415,6 +529,7 @@ def resume_recent_failed_tasks(
                 pipeline_job_id = youtube_service.enqueue_auto_youtube_pipeline(
                     task.id,
                     auto_publish=None,
+                    settings=settings,
                 )
                 resumed_count += 1
                 results.append(

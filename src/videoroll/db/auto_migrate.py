@@ -82,24 +82,6 @@ def _ensure_postgres_enum_values(engine: Bind) -> None:
                 conn.execute(text(f"ALTER TYPE {enum_name} ADD VALUE IF NOT EXISTS '{value}'"))
 
 
-def _ensure_tasks_lock_columns(engine: Bind) -> None:
-    insp = inspect(engine)
-    if "tasks" not in set(insp.get_table_names()):
-        return
-
-    cols = {c.get("name") for c in insp.get_columns("tasks")}
-    dialect = (engine.dialect.name or "").lower()
-
-    if "lock_owner" not in cols:
-        _add_column(engine, "tasks", "lock_owner", "VARCHAR(128)")
-        logger.warning("auto-migrated DB: added tasks.lock_owner")
-
-    if "lock_until" not in cols:
-        ts_type = "TIMESTAMPTZ" if dialect == "postgresql" else "TIMESTAMP"
-        _add_column(engine, "tasks", "lock_until", ts_type)
-        logger.warning("auto-migrated DB: added tasks.lock_until")
-
-
 def _ensure_tasks_stop_columns(engine: Bind) -> None:
     insp = inspect(engine)
     if "tasks" not in set(insp.get_table_names()):
@@ -257,8 +239,6 @@ def _ensure_scheduler_indexes(engine: Bind) -> None:
     insp = inspect(engine)
     tables = set(insp.get_table_names())
     with _transaction(engine) as conn:
-        if "tasks" in tables:
-            conn.execute(text("CREATE INDEX IF NOT EXISTS ix_tasks_lock_until ON tasks (lock_owner, lock_until)"))
         if "subtitle_jobs" in tables:
             conn.execute(
                 text("CREATE INDEX IF NOT EXISTS ix_subtitle_jobs_status_created_at ON subtitle_jobs (status, created_at)")
@@ -832,7 +812,6 @@ def apply_legacy_migrations(connection: Connection) -> None:
     """
     _ensure_app_settings_version_column(connection)
     _ensure_job_lease_columns(connection)
-    _ensure_tasks_lock_columns(connection)
     _ensure_tasks_stop_columns(connection)
     _ensure_tasks_publish_batch_columns(connection)
     _ensure_youtube_sources_columns(connection)

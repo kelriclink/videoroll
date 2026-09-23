@@ -2,6 +2,7 @@ FROM ubuntu:24.04
 
 ARG INSTALL_SUBTITLE=0
 ARG INSTALL_ASR=0
+ARG INSTALL_HATCHET=0
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONDONTWRITEBYTECODE=1
@@ -48,6 +49,13 @@ RUN INSTALL_SUBTITLE="$INSTALL_SUBTITLE" INSTALL_ASR="$INSTALL_ASR" python -c "i
        pip install --no-cache-dir --index-url "$TORCH_CPU_INDEX_URL" "torch==2.14.0"; \
      fi \
   && pip install --no-cache-dir -c requirements.lock -r /tmp/requirements.txt
+
+# Hatchet currently requires protobuf < 7. Keep that downgrade isolated to
+# dedicated Hatchet execution images so validated core images retain their lock.
+RUN if [ "$INSTALL_HATCHET" = "1" ]; then \
+      pip install --no-cache-dir "hatchet-sdk==1.40.3" "protobuf==6.33.6" \
+      && pip check; \
+    fi
 
 COPY src/videoroll ./src/videoroll
 COPY alembic.ini ./alembic.ini

@@ -179,6 +179,7 @@ services:
       YOUTUBE_INGEST_URL: http://youtube-ingest:8002
       BILIBILI_PUBLISHER_URL: http://bilibili-publisher:8003
       SOCIAL_PUBLISHER_URL: http://social-publisher-api:8010
+      WORKFLOW_SERVICE_URL: http://workflow-api:8030
       WORK_DIR: ${WORK_DIR:-/storage/work/videoroll}
       FFMPEG_PATH: ${FFMPEG_PATH:-ffmpeg}
       PLAYOUT_MEDIA_ROOT: ${PLAYOUT_MEDIA_ROOT:-/storage/playout-media}
@@ -204,6 +205,8 @@ services:
       bilibili-publisher:
         condition: service_healthy
       social-publisher-api:
+        condition: service_healthy
+      workflow-api:
         condition: service_healthy
     networks:
       internal:
@@ -287,6 +290,46 @@ services:
       retries: 10
     restart: unless-stopped
 
+  hatchet-lite:
+    build:
+      context: ./services/hatchet
+      dockerfile: Dockerfile.videoroll
+      args:
+        VERSION: ${HATCHET_VERSION:-v0.107.0}
+    image: videoroll-hatchet:prod
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      DATABASE_URL: ${HATCHET_DATABASE_URL:?HATCHET_DATABASE_URL must be set}
+      LITE_FRONTEND_BASE_PATH: /workflow-ui
+      SERVER_MSGQUEUE_KIND: postgres
+      SERVER_DEFAULT_ENGINE_VERSION: V1
+      SERVER_GRPC_BIND_ADDRESS: 0.0.0.0
+      SERVER_GRPC_BROADCAST_ADDRESS: hatchet-lite:7077
+      SERVER_INTERNAL_CLIENT_INTERNAL_GRPC_BROADCAST_ADDRESS: hatchet-lite:7077
+      SERVER_GRPC_PORT: "7077"
+      SERVER_GRPC_INSECURE: "true"
+      SERVER_URL: ${HATCHET_SERVER_URL:-http://localhost:3000}
+      SERVER_FRONTEND_URL: ${HATCHET_FRONTEND_URL:-http://localhost:3000/workflow-ui/}
+      SERVER_AUTH_COOKIE_DOMAIN: ${HATCHET_COOKIE_DOMAIN:-localhost}
+      SERVER_AUTH_COOKIE_INSECURE: ${HATCHET_COOKIE_INSECURE:-true}
+      SERVER_AUTH_SET_EMAIL_VERIFIED: "true"
+      SERVER_SECURITY_CHECK_ENABLED: "false"
+      SERVER_LOGGER_LEVEL: ${HATCHET_LOG_LEVEL:-warn}
+    volumes:
+      - hatchet-lite-config:/config
+    expose:
+      - "8888"
+      - "7077"
+    networks: [internal]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:8888/api/ready"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
+
   render-worker:
     build: *subtitle-build
     image: videoroll-subtitle:prod
@@ -316,32 +359,98 @@ services:
     networks: [internal]
     restart: unless-stopped
 
-  subtitle-worker:
-    build: *subtitle-build
-    image: videoroll-subtitle:prod
+  workflow-api:
+    build:
+      context: .
+      dockerfile: docker/workflow.Dockerfile
+      args:
+        APP_UID: ${APP_UID:-10001}
+        APP_GID: ${APP_GID:-10001}
+    image: videoroll-workflow:prod
     <<: *application-security
-    command: ["sh", "-ec", "worker_concurrency=$$(python -m videoroll.apps.subtitle_service.worker_concurrency); exec celery -A videoroll.apps.subtitle_service.worker:celery_app worker -Q subtitle -l INFO --concurrency \"$$worker_concurrency\""]
+    command: ["uvicorn", "videoroll.workflows.api:app", "--host", "0.0.0.0", "--port", "8030"]
+    environment:
+      HATCHET_CLIENT_TOKEN: ${HATCHET_CLIENT_TOKEN:-}
+      HATCHET_CLIENT_SERVER_URL: ${HATCHET_CLIENT_SERVER_URL:-http://hatchet-lite:8888}
+      HATCHET_CLIENT_HOST_PORT: ${HATCHET_CLIENT_HOST_PORT:-hatchet-lite:7077}
+      HATCHET_CLIENT_TLS_STRATEGY: ${HATCHET_CLIENT_TLS_STRATEGY:-none}
+      INTERNAL_API_SECRET: ${INTERNAL_API_SECRET:?INTERNAL_API_SECRET must be set}
+      DEVELOPMENT_MODE: ${DEVELOPMENT_MODE:-false}
+      ORCHESTRATOR_URL: http://orchestrator:8000
+    depends_on:
+      hatchet-lite:
+        condition: service_healthy
+    networks: [internal, infrastructure-egress]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8030/health', timeout=5)"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  workflow-worker:
+    build:
+      context: .
+      dockerfile: docker/workflow.Dockerfile
+      args:
+        APP_UID: ${APP_UID:-10001}
+        APP_GID: ${APP_GID:-10001}
+    image: videoroll-workflow:prod
+    <<: *application-security
+    command: ["python", "-m", "videoroll.workflows.worker"]
+    environment:
+      HATCHET_CLIENT_TOKEN: ${HATCHET_CLIENT_TOKEN:-}
+      HATCHET_CLIENT_SERVER_URL: ${HATCHET_CLIENT_SERVER_URL:-http://hatchet-lite:8888}
+      HATCHET_CLIENT_HOST_PORT: ${HATCHET_CLIENT_HOST_PORT:-hatchet-lite:7077}
+      HATCHET_CLIENT_TLS_STRATEGY: ${HATCHET_CLIENT_TLS_STRATEGY:-none}
+      HATCHET_WORKER_NAME: ${HATCHET_WORKER_NAME:-videoroll-workflow-core-01}
+      HATCHET_WORKER_SLOTS: ${HATCHET_WORKER_SLOTS:-4}
+      INTERNAL_API_SECRET: ${INTERNAL_API_SECRET:?INTERNAL_API_SECRET must be set}
+      DEVELOPMENT_MODE: ${DEVELOPMENT_MODE:-false}
+      ORCHESTRATOR_URL: http://orchestrator:8000
+    depends_on:
+      orchestrator:
+        condition: service_healthy
+      hatchet-lite:
+        condition: service_healthy
+    networks: [internal, infrastructure-egress]
+    restart: unless-stopped
+
+  subtitle-workflow-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        INSTALL_SUBTITLE: "1"
+        INSTALL_ASR: ${INSTALL_ASR:-1}
+        INSTALL_HATCHET: "1"
+        YTDLP_VERSION: ${YTDLP_VERSION:-latest}
+        APP_UID: ${APP_UID:-10001}
+        APP_GID: ${APP_GID:-10001}
+    image: videoroll-subtitle-workflow:prod
+    <<: *application-security
+    command: ["python", "-m", "videoroll.workflows.subtitle_worker"]
     environment:
       <<: *subtitle-environment
-      DEPLOYMENT_ROLE: subtitle-worker
-      CELERY_SUB_CONCURRENCY_FALLBACK: ${CELERY_SUB_CONCURRENCY_FALLBACK:-1}
-      CELERY_SUB_CONCURRENCY_DB_ATTEMPTS: ${CELERY_SUB_CONCURRENCY_DB_ATTEMPTS:-60}
-      CELERY_SUB_CONCURRENCY_DB_DELAY_SECONDS: ${CELERY_SUB_CONCURRENCY_DB_DELAY_SECONDS:-2}
+      DEPLOYMENT_ROLE: subtitle-workflow-worker
+      HATCHET_CLIENT_TOKEN: ${HATCHET_CLIENT_TOKEN:-}
+      HATCHET_CLIENT_SERVER_URL: ${HATCHET_CLIENT_SERVER_URL:-http://hatchet-lite:8888}
+      HATCHET_CLIENT_HOST_PORT: ${HATCHET_CLIENT_HOST_PORT:-hatchet-lite:7077}
+      HATCHET_CLIENT_TLS_STRATEGY: ${HATCHET_CLIENT_TLS_STRATEGY:-none}
+      HATCHET_SUBTITLE_WORKER_NAME: ${HATCHET_SUBTITLE_WORKER_NAME:-videoroll-subtitle-01}
+      HATCHET_SUBTITLE_WORKER_SLOTS: ${HATCHET_SUBTITLE_WORKER_SLOTS:-1}
     volumes:
       - ./data/models:/models
       - ./data/secrets:/secrets
       - ${STORAGE_HOST_ROOT:-./data/storage}:/storage
     depends_on:
-      redis:
+      orchestrator:
         condition: service_healthy
       egress-gateway:
         condition: service_healthy
-    networks: [internal, subtitle-egress]
-    healthcheck:
-      test: ["CMD-SHELL", "celery -A videoroll.apps.subtitle_service.worker:celery_app inspect ping --timeout=3 --destination=celery@$${HOSTNAME} | grep -q pong"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
+      hatchet-lite:
+        condition: service_healthy
+    networks: [internal, subtitle-egress, infrastructure-egress]
     restart: unless-stopped
 
   subtitle-control-worker:
@@ -513,6 +622,7 @@ services:
       args:
         VITE_ORCHESTRATOR_URL: ${VITE_ORCHESTRATOR_URL:-}
         VITE_FFPLAYOUT_URL: ${VITE_FFPLAYOUT_URL:-}
+        VITE_HATCHET_DASHBOARD_URL: ${VITE_HATCHET_DASHBOARD_URL:-}
     image: videoroll-web:prod
     environment:
       VIDEOROLL_PUBLIC_ORIGIN: ${VIDEOROLL_PUBLIC_ORIGIN:-http://localhost:3000}
@@ -536,6 +646,7 @@ services:
 
 volumes:
   render-worker-state:
+  hatchet-lite-config:
 
 networks:
   internal:

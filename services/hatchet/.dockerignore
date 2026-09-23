@@ -1,0 +1,27 @@
+.git
+.github
+.claude
+.cursor
+
+# Upstream material not used by the VideoRoll Hatchet Lite image.
+contributing
+examples
+sdks
+frontend/docs
+frontend/snippets
+frontend/vscode-extension
+
+# Local/editor/CI metadata.
+CHANGELOG.md
+SECURITY.md
+AI_POLICY.md
+Taskfile.yaml
+docker-compose*.yml
+nodemon*.json
+commitlint.config.js
+.pre-commit-config.yaml
+.gitguardian.yaml
+.golangci.yml
+.nvmrc
+.tool-versions
+.typos.toml

@@ -140,13 +140,22 @@ def test_late_non_current_batch_cannot_overwrite_task_publish_state() -> None:
     db.get.side_effect = lambda model, _id, **_kwargs: batch if model is PublishBatch else task
     db.query.return_value = query
 
-    reconciliation = reconcile_publish_batch(db, batch_id)
+    with patch("videoroll.apps.outbox.service.create_outbox_event") as create_event:
+        reconciliation = reconcile_publish_batch(db, batch_id)
 
     assert reconciliation.batch_state == PublishBatchState.succeeded
     assert reconciliation.cleanup_needed is False
     assert task.status == TaskStatus.publishing
     locked_models = [call.args[0] for call in db.get.call_args_list if call.kwargs.get("with_for_update")]
     assert locked_models == [Task, PublishBatch]
+    create_event.assert_called_once()
+    event_kwargs = create_event.call_args.kwargs
+    assert event_kwargs["event_type"] == "workflow.publish.finished"
+    assert event_kwargs["task_name"] == "subtitle_service.push_publish_workflow_event"
+    assert event_kwargs["args"] == {
+        "args": [str(batch_id), "succeeded", str(task_id)],
+        "queue": "subtitle-control",
+    }
 
 
 def test_batch_managed_task_skips_legacy_any_published_job_compensation() -> None:
@@ -164,11 +173,20 @@ def test_cleanup_broker_failure_keeps_durable_dispatch_intent() -> None:
     celery_app = MagicMock()
     celery_app.send_task.side_effect = RuntimeError("broker unavailable")
 
-    with patch("videoroll.apps.publish_lifecycle.mark_publish_batch_cleanup_enqueued") as mark:
-        assert enqueue_publish_batch_cleanup(db, celery_app, uuid.uuid4(), uuid.uuid4(), needed=True) is True
+    with (
+        patch("videoroll.apps.publish_lifecycle.mark_publish_batch_cleanup_enqueued") as mark,
+        patch("videoroll.apps.outbox.service.create_outbox_event", return_value=object()) as create_event,
+    ):
+        task_id = uuid.uuid4()
+        batch_id = uuid.uuid4()
+        assert enqueue_publish_batch_cleanup(db, celery_app, task_id, batch_id, needed=True) is True
 
     mark.assert_not_called()
     db.commit.assert_called_once()
+    assert create_event.call_args.kwargs["args"] == {
+        "args": [str(task_id), str(batch_id)],
+        "queue": "subtitle-control",
+    }
 
 
 def test_binding_unresolved_social_target_uses_current_batch_under_task_lock() -> None:

@@ -142,10 +142,6 @@ class Task(Base):
     # workflow stage it should return to when the user resumes it.
     stopped_status: Mapped[Optional[TaskStatus]] = mapped_column(Enum(TaskStatus, name="task_status"), nullable=True)
     priority: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    # Optional user-controlled ordering within the same priority bucket.
-    # NULL means "use the natural created_at order".
-    queue_position: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
-
     created_by: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
 
     error_code: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
@@ -157,9 +153,6 @@ class Task(Base):
     # platforms can run at the same time.
     active_publish_batch_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), nullable=True)
 
-    lock_owner: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
-    lock_until: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
-
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
 
@@ -167,12 +160,49 @@ class Task(Base):
     subtitles: Mapped[list["Subtitle"]] = relationship(back_populates="task", cascade="all, delete-orphan")
     publish_jobs: Mapped[list["PublishJob"]] = relationship(back_populates="task", cascade="all, delete-orphan")
     publish_batches: Mapped[list["PublishBatch"]] = relationship(back_populates="task", cascade="all, delete-orphan")
+    pipeline_runs: Mapped[list["PipelineRun"]] = relationship(back_populates="task", cascade="all, delete-orphan")
 
     __table_args__ = (
         Index("ix_tasks_status_created_at", "status", "created_at"),
-        Index("ix_tasks_queue_priority_position", "priority", "queue_position", "created_at"),
-        Index("ix_tasks_lock_until", "lock_owner", "lock_until"),
+        Index("ix_tasks_priority_created_at", "priority", "created_at"),
         Index("ix_tasks_active_publish_batch_id", "active_publish_batch_id"),
+    )
+
+
+class PipelineRun(Base):
+    """VideoRoll-to-execution-engine run mapping.
+
+    This table is deliberately not a scheduler: it contains no lease, heartbeat,
+    retry-owner, or worker-allocation fields. Runtime truth belongs to the
+    selected workflow engine; VideoRoll keeps only the business correlation and
+    audit history needed to correlate VideoRoll business tasks with Hatchet.
+    """
+
+    __tablename__ = "pipeline_runs"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    task_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("tasks.id", ondelete="CASCADE"), nullable=False
+    )
+    engine: Mapped[str] = mapped_column(String(16), nullable=False)
+    workflow_name: Mapped[str] = mapped_column(String(128), nullable=False)
+    external_run_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    state: Mapped[str] = mapped_column(String(32), nullable=False, default="submitting", server_default="submitting")
+    request_json: Mapped[dict[str, Any]] = mapped_column(JSON_PAYLOAD, nullable=False, default=dict)
+    error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    started_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+
+    task: Mapped["Task"] = relationship(back_populates="pipeline_runs")
+
+    __table_args__ = (
+        UniqueConstraint("engine", "external_run_id", name="uq_pipeline_runs_engine_external_run"),
+        Index("ix_pipeline_runs_task_created", "task_id", "created_at"),
+        Index("ix_pipeline_runs_state_created", "state", "created_at"),
     )
 
 

@@ -55,41 +55,19 @@ class _FakeYdl:
         }
 
 
-class _FakeAsyncResult:
-    def __init__(self, job_id: str) -> None:
-        self.id = job_id
-
-
-class _FakeCeleryApp:
-    def __init__(self) -> None:
-        self.calls: list[dict[str, object]] = []
-
-    def send_task(self, name: str, *, args: list[object], queue: str) -> _FakeAsyncResult:
-        self.calls.append({"name": name, "args": list(args), "queue": queue})
-        return _FakeAsyncResult("job-123")
-
-
 class YouTubeSourceServiceTests(TestCase):
-    def test_start_auto_pipeline_passes_auto_publish_override(self) -> None:
+    def test_start_auto_pipeline_uses_injected_workflow_starter(self) -> None:
         task_id = uuid4()
-        fake_celery = _FakeCeleryApp()
+        calls: list[object] = []
 
-        fake_worker = types.ModuleType("videoroll.apps.subtitle_service.worker")
-        fake_worker.celery_app = fake_celery
-        with patch.dict(sys.modules, {"videoroll.apps.subtitle_service.worker": fake_worker}):
-            job_id = _start_auto_pipeline(task_id, auto_publish=True)
+        def starter(value: object) -> str:
+            calls.append(value)
+            return "hatchet-run-123"
 
-        self.assertEqual(job_id, "job-123")
-        self.assertEqual(
-            fake_celery.calls,
-            [
-                {
-                    "name": "subtitle_service.auto_youtube_pipeline",
-                    "args": [str(task_id), {"auto_publish": True}],
-                    "queue": "subtitle",
-                }
-            ],
-        )
+        run_id = _start_auto_pipeline(task_id, starter=starter)
+
+        self.assertEqual(run_id, "hatchet-run-123")
+        self.assertEqual(calls, [task_id])
 
     def test_resolve_direct_channel_url(self) -> None:
         resolved = resolve_youtube_source_input(
@@ -258,14 +236,21 @@ class YouTubePlaylistScanTests(TestCase):
         self.db.commit()
         self.db.refresh(source)
 
+        run_ids = iter(["job-1", "job-2", "job-3", "job-4", "job-5"])
+        starter = lambda _task_id: next(run_ids)
         with (
             patch("videoroll.apps.youtube_ingest.source_service.fetch_youtube_feed", return_value=self._playlist_entries()) as fetch_feed,
             patch("videoroll.apps.youtube_ingest.source_service.get_youtube_settings", return_value={}),
-            patch("videoroll.apps.youtube_ingest.source_service._start_auto_pipeline", side_effect=["job-1", "job-2", "job-3", "job-4", "job-5"]),
         ):
-            first = scan_youtube_source_by_id(self.db, source.id, user_agent="UA/1.0", force=True)
-            second = scan_youtube_source_by_id(self.db, source.id, user_agent="UA/1.0", force=True)
-            third = scan_youtube_source_by_id(self.db, source.id, user_agent="UA/1.0", force=True)
+            first = scan_youtube_source_by_id(
+                self.db, source.id, user_agent="UA/1.0", force=True, pipeline_starter=starter
+            )
+            second = scan_youtube_source_by_id(
+                self.db, source.id, user_agent="UA/1.0", force=True, pipeline_starter=starter
+            )
+            third = scan_youtube_source_by_id(
+                self.db, source.id, user_agent="UA/1.0", force=True, pipeline_starter=starter
+            )
 
         self.assertIsNotNone(first)
         self.assertIsNotNone(second)

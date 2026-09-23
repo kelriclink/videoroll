@@ -37,6 +37,7 @@ class OrchestratorSettings(CommonSettings):
     youtube_ingest_url: str = Field("http://youtube-ingest:8002", alias="YOUTUBE_INGEST_URL")
     bilibili_publisher_url: str = Field("http://bilibili-publisher:8003", alias="BILIBILI_PUBLISHER_URL")
     social_publisher_url: str = Field("http://social-publisher-api:8010", alias="SOCIAL_PUBLISHER_URL")
+    workflow_service_url: str = Field("http://workflow-api:8030", alias="WORKFLOW_SERVICE_URL")
 
     # Shared runtime settings (used by orchestrator actions).
     work_dir: str = Field("/tmp/videoroll", alias="WORK_DIR")
@@ -185,6 +186,7 @@ class RenderWorkerSettings(BaseSettings):
 
 
 class YouTubeIngestSettings(CommonSettings):
+    orchestrator_url: str = Field("http://orchestrator:8000", alias="ORCHESTRATOR_URL")
     user_agent: str = Field(DEFAULT_YOUTUBE_USER_AGENT, alias="YOUTUBE_USER_AGENT")
     youtube_proxy: str | None = Field(None, alias="YOUTUBE_PROXY")
 

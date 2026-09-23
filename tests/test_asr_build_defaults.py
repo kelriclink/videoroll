@@ -35,7 +35,10 @@ def test_compose_splits_core_and_subtitle_builds() -> None:
         assert 'INSTALL_ASR: "0"' in compose
         assert "INSTALL_ASR: ${INSTALL_ASR:-1}" in compose
         assert "build: *subtitle-build" in _service_block(compose, "subtitle-service")
-        assert "build: *subtitle-build" in _service_block(compose, "subtitle-worker")
+        subtitle_workflow = _service_block(compose, "subtitle-workflow-worker")
+        assert 'INSTALL_SUBTITLE: "1"' in subtitle_workflow
+        assert 'INSTALL_HATCHET: "1"' in subtitle_workflow
+        assert "dockerfile: docker/workflow.Dockerfile" in _service_block(compose, "workflow-api")
         assert "build: *subtitle-build" in _service_block(compose, "subtitle-control-worker")
         assert "build: *core-build" in _service_block(compose, "orchestrator")
         assert "build: *core-build" in _service_block(compose, "youtube-ingest")

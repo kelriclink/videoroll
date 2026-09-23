@@ -15,6 +15,7 @@ from videoroll.config import OrchestratorSettings
 from videoroll.db.models import (
     AppSetting,
     Asset,
+    OperationInbox,
     PublishJob,
     PublishState,
     RenderJob,
@@ -187,8 +188,6 @@ def expire_stale_publishing_tasks(
         task.status = TaskStatus.failed
         task.error_code = PUBLISHING_TIMEOUT_ERROR_CODE
         task.error_message = f"publishing status exceeded {effective_timeout_hours} hours"
-        task.lock_owner = None
-        task.lock_until = None
         db.add(task)
         expired += 1
     db.commit()
@@ -392,8 +391,21 @@ def scan_workdir_state(settings: OrchestratorSettings, db: Session) -> Any:
     if youtube_task_ids:
         for row in db.query(Task).filter(Task.id.in_(youtube_task_ids)).all():
             known_task_ids.add(row.id)
-            if row.lock_owner and row.lock_until and row.lock_until > now:
-                active_task_ids.add(row.id)
+        download_key_to_task = {f"youtube-download:{task_id}": task_id for task_id in youtube_task_ids}
+        active_downloads = (
+            db.query(OperationInbox.operation_key)
+            .filter(
+                OperationInbox.operation_key.in_(download_key_to_task),
+                OperationInbox.status == "processing",
+                OperationInbox.lease_until.is_not(None),
+                OperationInbox.lease_until > now,
+            )
+            .all()
+        )
+        for operation_key, in active_downloads:
+            task_id = download_key_to_task.get(str(operation_key))
+            if task_id is not None:
+                active_task_ids.add(task_id)
         for task_id, in (
             db.query(SubtitleJob.task_id)
             .filter(

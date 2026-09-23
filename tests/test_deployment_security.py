@@ -17,10 +17,12 @@ def _compose(path: Path) -> dict:
     return value
 
 
-def test_production_compose_has_only_web_host_port() -> None:
+def test_production_compose_exposes_only_web_host_port() -> None:
     for path in COMPOSE_FILES:
         services = _compose(path)["services"]
         assert set(services["web"].get("ports", ()))
+        assert not services["hatchet-lite"].get("ports")
+        assert {"8888", "7077"}.issubset(set(services["hatchet-lite"].get("expose", ())))
         for name, service in services.items():
             if name != "web":
                 assert not service.get("ports"), f"{path.name}:{name} exposes a host port"
@@ -33,16 +35,32 @@ def test_process_roles_are_not_combined() -> None:
         "youtube-ingest": "videoroll.apps.youtube_ingest.main:app",
         "bilibili-publisher": "videoroll.apps.bilibili_publisher.main:app",
         "outbox-dispatcher": "outbox-dispatcher",
-        "subtitle-worker": "videoroll.apps.subtitle_service.worker:celery_app",
+        "workflow-api": "videoroll.workflows.api:app",
+        "workflow-worker": "videoroll.workflows.worker",
+        "subtitle-workflow-worker": "videoroll.workflows.subtitle_worker",
+        "render-worker": "videoroll.apps.render_worker.runtime",
         "subtitle-control-worker": "videoroll.apps.subtitle_service.worker:celery_app",
         "publish-worker": "videoroll.apps.bilibili_publisher.worker:celery_app",
         "egress-gateway": "videoroll.apps.egress_gateway.main:app",
     }
+    healthchecked = {
+        "orchestrator",
+        "subtitle-service",
+        "youtube-ingest",
+        "bilibili-publisher",
+        "outbox-dispatcher",
+        "workflow-api",
+        "subtitle-control-worker",
+        "publish-worker",
+        "egress-gateway",
+    }
     for path in COMPOSE_FILES:
         services = _compose(path)["services"]
+        assert "subtitle-worker" not in services
         for name, expected in required.items():
             command = " ".join(str(part) for part in services[name]["command"])
             assert expected in command
+        for name in healthchecked:
             assert services[name].get("healthcheck"), f"{path.name}:{name} lacks a health check"
 
 
@@ -52,7 +70,7 @@ def test_production_compose_uses_shared_filesystem_storage() -> None:
         assert "minio" not in compose["services"]
         internal_env = compose["x-internal-environment"]
         assert internal_env["STORAGE_ROOT"] == "${STORAGE_ROOT:-/storage/objects}"
-        for name in ("orchestrator", "subtitle-service", "subtitle-worker", "subtitle-control-worker", "publish-worker"):
+        for name in ("orchestrator", "subtitle-service", "subtitle-workflow-worker", "subtitle-control-worker", "publish-worker"):
             assert any("/storage" in str(item) for item in compose["services"][name].get("volumes", ()))
 
 
@@ -78,7 +96,10 @@ def test_application_roles_resolve_host_database_gateway() -> None:
         "subtitle-service",
         "youtube-ingest",
         "bilibili-publisher",
-        "subtitle-worker",
+        "workflow-api",
+        "workflow-worker",
+        "subtitle-workflow-worker",
+        "render-worker",
         "subtitle-control-worker",
         "outbox-dispatcher",
         "publish-worker",
@@ -102,8 +123,34 @@ def test_application_network_is_internal_and_egress_is_role_scoped() -> None:
         assert "web-ingress" in compose["networks"]
         assert set(compose["services"]["egress-gateway"]["networks"]) == {"internal", "egress"}
 
-        for name in ("subtitle-service", "subtitle-worker", "subtitle-control-worker"):
+        for name in ("subtitle-service", "subtitle-control-worker"):
             assert set(compose["services"][name]["networks"]) == {"internal", "subtitle-egress"}
+        assert set(compose["services"]["subtitle-workflow-worker"]["networks"]) == {
+            "internal",
+            "subtitle-egress",
+            "infrastructure-egress",
+        }
+        for name in ("workflow-api", "workflow-worker"):
+            assert set(compose["services"][name]["networks"]) == {"internal", "infrastructure-egress"}
+        assert compose["services"]["render-worker"]["networks"] == ["internal"]
+        assert "hatchet-postgres" not in compose["services"]
+        assert compose["services"]["hatchet-lite"]["networks"] == ["internal"]
+        assert "host.docker.internal:host-gateway" in compose["services"]["hatchet-lite"].get("extra_hosts", [])
+        assert compose["services"]["hatchet-lite"]["environment"]["DATABASE_URL"] == "${HATCHET_DATABASE_URL:?HATCHET_DATABASE_URL must be set}"
+        assert compose["services"]["hatchet-lite"]["environment"]["LITE_FRONTEND_BASE_PATH"] == "/workflow-ui"
+        assert compose["services"]["hatchet-lite"]["environment"]["SERVER_FRONTEND_URL"] == "${HATCHET_FRONTEND_URL:-http://localhost:3000/workflow-ui/}"
+        assert compose["services"]["hatchet-lite"]["build"] == {
+            "context": "./services/hatchet",
+            "dockerfile": "Dockerfile.videoroll",
+            "args": {"VERSION": "${HATCHET_VERSION:-v0.107.0}"},
+        }
+        assert compose["services"]["hatchet-lite"]["image"] == "videoroll-hatchet:prod"
+
+        for name in ("workflow-api", "workflow-worker", "subtitle-workflow-worker"):
+            environment = compose["services"][name]["environment"]
+            assert environment["HATCHET_CLIENT_SERVER_URL"] == "${HATCHET_CLIENT_SERVER_URL:-http://hatchet-lite:8888}"
+            assert environment["HATCHET_CLIENT_HOST_PORT"] == "${HATCHET_CLIENT_HOST_PORT:-hatchet-lite:7077}"
+            assert environment["HATCHET_CLIENT_TLS_STRATEGY"] == "${HATCHET_CLIENT_TLS_STRATEGY:-none}"
 
         for name in (
             "orchestrator",
@@ -137,20 +184,28 @@ def test_subtitle_control_tasks_have_a_dedicated_worker_and_single_scheduler() -
         assert services["outbox-dispatcher"]["command"] == ["outbox-dispatcher"]
 
 
-def test_offline_production_compose_keeps_the_control_worker() -> None:
+def test_offline_production_compose_keeps_hatchet_and_control_plane() -> None:
     services = _compose(ROOT / "fromprod" / "docker-compose.yml")["services"]
-    assert "subtitle-control-worker" in services
+    assert "subtitle-worker" not in services
+    assert "hatchet-postgres" not in services
+    for name in (
+        "hatchet-lite",
+        "workflow-api",
+        "workflow-worker",
+        "subtitle-workflow-worker",
+        "render-worker",
+        "subtitle-control-worker",
+    ):
+        assert name in services
     control_command = " ".join(str(part) for part in services["subtitle-control-worker"]["command"])
     assert "worker" in control_command
     assert "subtitle-control" in control_command
     assert "subtitle-control-worker" in services["outbox-dispatcher"].get("depends_on", {})
-    assert "subtitle-worker" not in services["outbox-dispatcher"].get("depends_on", {})
 
-    normal = _compose(ROOT / "docker-compose.yml")["services"]["subtitle-worker"]
-    offline = services["subtitle-worker"]
+    normal = _compose(ROOT / "docker-compose.yml")["services"]["subtitle-workflow-worker"]
+    offline = services["subtitle-workflow-worker"]
     assert offline["command"] == normal["command"]
-    for key in ("CELERY_SUB_CONCURRENCY_FALLBACK", "CELERY_SUB_CONCURRENCY_DB_ATTEMPTS", "CELERY_SUB_CONCURRENCY_DB_DELAY_SECONDS"):
-        assert offline["environment"][key] == normal["environment"][key]
+    assert offline["environment"]["HATCHET_SUBTITLE_WORKER_SLOTS"] == normal["environment"]["HATCHET_SUBTITLE_WORKER_SLOTS"]
 
 
 def test_offline_production_compose_keeps_runtime_tuning_environment() -> None:
@@ -200,23 +255,32 @@ def test_offline_bundle_includes_split_application_images() -> None:
     script = (ROOT / "scripts" / "build_export_prod.sh").read_text(encoding="utf-8")
 
     assert 'SUBTITLE_IMAGE="${SUBTITLE_IMAGE:-videoroll-subtitle:prod}"' in script
+    assert 'WORKFLOW_IMAGE="${WORKFLOW_IMAGE:-videoroll-workflow:prod}"' in script
+    assert 'SUBTITLE_WORKFLOW_IMAGE="${SUBTITLE_WORKFLOW_IMAGE:-videoroll-subtitle-workflow:prod}"' in script
+    assert 'HATCHET_IMAGE="${HATCHET_IMAGE:-videoroll-hatchet:prod}"' in script
     assert 'EGRESS_IMAGE="${EGRESS_IMAGE:-videoroll-egress:prod}"' in script
     assert '-t "$SUBTITLE_IMAGE"' in script
+    assert '-t "$WORKFLOW_IMAGE"' in script
+    assert '-t "$SUBTITLE_WORKFLOW_IMAGE"' in script
+    assert '--build-arg INSTALL_HATCHET="1"' in script
     assert '-t "$EGRESS_IMAGE"' in script
     assert 'FFPLAYOUT_IMAGE="${FFPLAYOUT_IMAGE:-videoroll-ffplayout:prod}"' in script
-    assert 'IMAGES=("$APP_IMAGE" "$SUBTITLE_IMAGE" "$EGRESS_IMAGE" "$WEB_IMAGE" "$SOCIAL_IMAGE" "$FFPLAYOUT_IMAGE")' in script
+    assert '-f services/hatchet/Dockerfile.videoroll' in script
+    assert 'services/hatchet' in script
+    assert '"$HATCHET_IMAGE"' in script
 
 
-def test_web_is_not_hard_blocked_on_ffplayout_health() -> None:
+def test_web_is_not_hard_blocked_on_optional_embedded_consoles() -> None:
     for path in COMPOSE_FILES:
         web = _compose(path)["services"]["web"]
         assert "ffplayout" not in web.get("depends_on", {})
+        assert "hatchet-lite" not in web.get("depends_on", {})
 
 
 def test_base_compose_does_not_require_an_intel_gpu() -> None:
     for path in (*COMPOSE_FILES, ROOT / "fromprod" / "docker-compose.yml"):
         services = _compose(path)["services"]
-        for name in ("ffplayout", "orchestrator", "subtitle-service", "subtitle-worker"):
+        for name in ("ffplayout", "orchestrator", "subtitle-service", "subtitle-workflow-worker", "render-worker"):
             service = services[name]
             assert not service.get("devices"), f"{path}:{name} unexpectedly requires /dev/dri"
             assert not service.get("group_add"), f"{path}:{name} unexpectedly requires an Intel render group"
@@ -242,6 +306,34 @@ def test_playout_proxy_uses_dynamic_docker_dns_and_frame_ancestors() -> None:
     assert "resolver 127.0.0.11" in nginx
     assert "proxy_pass $ffplayout_upstream;" in nginx
     assert "frame-ancestors 'self' http://$host:* https://$host:*" in nginx
+
+
+def test_hatchet_dashboard_uses_single_port_subpath_proxy() -> None:
+    nginx = (ROOT / "src" / "web" / "nginx.conf").read_text(encoding="utf-8")
+    urls = (ROOT / "src" / "web" / "src" / "lib" / "urls.ts").read_text(encoding="utf-8")
+
+    assert "set $hatchet_upstream http://hatchet-lite:8888;" in nginx
+    assert "location ^~ /workflow-ui/" in nginx
+    assert "location ^~ /api/v1/" in nginx
+    assert "location = /api/ready" in nginx
+    assert "location = /api/live" in nginx
+    assert "proxy_pass $hatchet_upstream$request_uri;" in nginx
+    assert "proxy_hide_header X-Frame-Options;" in nginx
+    assert 'return "/workflow-ui/";' in urls
+    assert 'url.port = "8888"' not in urls
+
+
+def test_vendored_hatchet_version_keeps_native_subpath_support() -> None:
+    vendor = (ROOT / "services" / "hatchet" / "VENDOR_VERSION").read_text(encoding="utf-8")
+    lite_main = (ROOT / "services" / "hatchet" / "cmd" / "hatchet-lite" / "main.go").read_text(encoding="utf-8")
+    vite = (ROOT / "services" / "hatchet" / "frontend" / "app" / "vite.config.ts").read_text(encoding="utf-8")
+    dockerfile = (ROOT / "services" / "hatchet" / "Dockerfile.videoroll").read_text(encoding="utf-8")
+
+    assert "tag=v0.107.0" in vendor
+    assert "commit=d6c9e6849526b0d8a51d97bf2f5b6dcfdfee0179" in vendor
+    assert 'os.Getenv("LITE_FRONTEND_BASE_PATH")' in lite_main
+    assert "{{ .BasePath }}" in vite
+    assert "LITE_FRONTEND_BASE_PATH=/workflow-ui" in dockerfile
 
 
 def test_web_proxy_preserves_outer_https_scheme_for_secure_cookies() -> None:

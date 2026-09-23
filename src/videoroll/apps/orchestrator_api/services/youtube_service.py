@@ -85,6 +85,7 @@ from videoroll.utils.auto_youtube import encode_auto_youtube_created_by
 from videoroll.utils.hashing import sha256_file
 from videoroll.utils.httpx_proxy import HTTPX_PROXY_KWARG_UNSUPPORTED, format_httpx_proxy_error
 from videoroll.utils.youtube_urls import canonicalize_youtube_url, is_youtube_url
+from videoroll.workflows.launcher import PipelineLauncher
 
 
 logger = logging.getLogger(__name__)
@@ -211,14 +212,17 @@ def ingest_youtube_source(*, url: str, license: SourceLicense, proof_url: str | 
     return task_id, bool(data.get("deduped")), str(data.get("source_id") or "") or None
 
 
-def enqueue_auto_youtube_pipeline(task_id: uuid.UUID, *, auto_publish: bool | None) -> str:
-    from videoroll.apps.subtitle_service.worker import celery_app
-
-    # auto_publish is retained in the public/internal call signature for
-    # compatibility, but automatic stages are runtime-configured boxes. Never
-    # freeze this intake value into the Celery message.
+def enqueue_auto_youtube_pipeline(
+    task_id: uuid.UUID,
+    *,
+    auto_publish: bool | None,
+    settings: OrchestratorSettings,
+) -> str:
+    # auto_publish remains runtime-configured. Never freeze an intake snapshot
+    # into the Hatchet workflow input.
     _ = auto_publish
-    return str(celery_app.send_task("subtitle_service.auto_youtube_pipeline", args=[str(task_id)], queue="subtitle").id)
+    result = PipelineLauncher(settings).launch_auto_youtube(task_id)
+    return result.external_run_id
 
 
 def start_auto_youtube_pipeline(*, url: str, license: SourceLicense, proof_url: str | None, auto_publish: bool | None, settings: OrchestratorSettings) -> AutoYouTubeResponse:
@@ -243,7 +247,7 @@ def start_auto_youtube_pipeline(*, url: str, license: SourceLicense, proof_url: 
     )
     return AutoYouTubeResponse(
         task_id=task_id,
-        pipeline_job_id=enqueue_auto_youtube_pipeline(task_id, auto_publish=None),
+        pipeline_job_id=enqueue_auto_youtube_pipeline(task_id, auto_publish=None, settings=settings),
         deduped=deduped,
         source_id=source_id,
     )
@@ -275,7 +279,7 @@ def start_existing_task(task_id: uuid.UUID, *, settings: OrchestratorSettings, d
     )
     return AutoYouTubeTaskStartResponse(
         task_id=task_id,
-        pipeline_job_id=enqueue_auto_youtube_pipeline(task_id, auto_publish=None),
+        pipeline_job_id=enqueue_auto_youtube_pipeline(task_id, auto_publish=None, settings=settings),
     )
 
 
@@ -945,7 +949,7 @@ def run_home_scan(settings: OrchestratorSettings, *, force: bool = False, raise_
                         run_id=uuid.uuid4().hex,
                     ),
                 )
-                created.append(task_id); jobs.append(enqueue_auto_youtube_pipeline(task_id, auto_publish=None))
+                created.append(task_id); jobs.append(enqueue_auto_youtube_pipeline(task_id, auto_publish=None, settings=settings))
             except Exception as exc:
                 failed += 1; errors.append(f"{item.video_id}: {type(exc).__name__}: {exc}")
         stats = feed.stats

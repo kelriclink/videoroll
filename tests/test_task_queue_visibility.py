@@ -9,7 +9,6 @@ from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.orm import Session, sessionmaker
 
 from videoroll.apps.subtitle_service.main import _read_task_queue
-from videoroll.apps.subtitle_service.worker import TASK_QUEUE_LOCK_OWNER
 from videoroll.db.base import Base
 from videoroll.db.models import (
     AppSetting,
@@ -55,12 +54,9 @@ def _task(status: TaskStatus) -> Task:
     return Task(source_type=SourceType.local, source_license=SourceLicense.own, status=status)
 
 
-def test_task_queue_does_not_show_stopped_tasks_or_count_their_locks(db: Session) -> None:
-    now = datetime.now(timezone.utc)
+def test_task_queue_does_not_show_stopped_tasks_or_count_their_jobs(db: Session) -> None:
     stopped_subtitle = _task(TaskStatus.canceled)
     stopped_subtitle.stopped_status = TaskStatus.downloaded
-    stopped_subtitle.lock_owner = TASK_QUEUE_LOCK_OWNER
-    stopped_subtitle.lock_until = now + timedelta(minutes=5)
     stopped_render = _task(TaskStatus.canceled)
     stopped_render.stopped_status = TaskStatus.subtitle_ready
     db.add_all([stopped_subtitle, stopped_render])
@@ -89,10 +85,7 @@ def test_task_queue_does_not_show_stopped_tasks_or_count_their_locks(db: Session
 
 
 def test_task_queue_does_not_show_published_tasks_or_count_their_jobs(db: Session) -> None:
-    now = datetime.now(timezone.utc)
     published = _task(TaskStatus.published)
-    published.lock_owner = TASK_QUEUE_LOCK_OWNER
-    published.lock_until = now + timedelta(minutes=5)
     db.add(published)
     db.flush()
     db.add(RenderJob(task_id=published.id, status=RenderJobStatus.queued, request_json={}))
@@ -105,7 +98,7 @@ def test_task_queue_does_not_show_published_tasks_or_count_their_jobs(db: Sessio
     assert queue.tasks == []
 
 
-def test_task_queue_shows_live_leased_job_as_running_after_task_lock_expires(db: Session) -> None:
+def test_task_queue_shows_live_leased_render_job_as_running(db: Session) -> None:
     now = datetime.now(timezone.utc)
     task = _task(TaskStatus.subtitle_ready)
     db.add(task)

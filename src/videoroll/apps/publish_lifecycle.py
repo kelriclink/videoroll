@@ -8,7 +8,7 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
-from videoroll.apps.subtitle_service.queues import SUBTITLE_CONTROL_QUEUE, SUBTITLE_WORK_QUEUE
+from videoroll.apps.subtitle_service.queues import SUBTITLE_CONTROL_QUEUE
 from videoroll.db.models import Platform, PublishBatch, PublishJob, PublishState, Task, TaskStatus
 
 
@@ -314,6 +314,23 @@ def _reconcile_locked_publish_batch(
     db.add(batch)
 
     # Flush this batch before resolving the task's current batch per target.
+    if evaluation.batch_state != PublishBatchState.active:
+        from videoroll.apps.outbox.service import create_outbox_event
+
+        create_outbox_event(
+            db,
+            event_type="workflow.publish.finished",
+            aggregate_type="publish_batch",
+            aggregate_id=batch.id,
+            task_name="subtitle_service.push_publish_workflow_event",
+            args={
+                "args": [str(batch.id), evaluation.batch_state.value, str(task.id)],
+                "queue": SUBTITLE_CONTROL_QUEUE,
+            },
+            operation_key=f"workflow-publish-finished:{batch.id}:{evaluation.batch_state.value}",
+        )
+
+    # Flush this batch before resolving the task's current batch per target.
     # The task may have several active channel batches at once.
     db.flush()
     current_batches = current_publish_batches_for_task(db, task.id)
@@ -346,7 +363,7 @@ def _reconcile_locked_publish_batch(
             aggregate_type="publish_batch",
             aggregate_id=batch.id,
             task_name="subtitle_service.cleanup_task",
-            args={"args": [str(task.id), str(batch.id)], "queue": "subtitle"},
+            args={"args": [str(task.id), str(batch.id)], "queue": SUBTITLE_CONTROL_QUEUE},
             operation_key=f"publish-cleanup:{batch.id}",
         )
 
@@ -475,7 +492,7 @@ def enqueue_publish_batch_cleanup(
         aggregate_type="publish_batch",
         aggregate_id=batch_id,
         task_name="subtitle_service.cleanup_task",
-        args={"args": [str(task_id), str(batch_id)], "queue": SUBTITLE_WORK_QUEUE},
+        args={"args": [str(task_id), str(batch_id)], "queue": SUBTITLE_CONTROL_QUEUE},
         operation_key=f"publish-cleanup:{batch_id}",
     )
     db.commit()

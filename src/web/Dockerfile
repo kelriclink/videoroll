@@ -11,6 +11,9 @@ ENV VITE_ORCHESTRATOR_URL=$VITE_ORCHESTRATOR_URL
 ARG VITE_FFPLAYOUT_URL
 ENV VITE_FFPLAYOUT_URL=$VITE_FFPLAYOUT_URL
 
+ARG VITE_HATCHET_DASHBOARD_URL
+ENV VITE_HATCHET_DASHBOARD_URL=$VITE_HATCHET_DASHBOARD_URL
+
 COPY package*.json ./
 RUN if [ -f package-lock.json ]; then npm ci --no-fund --no-audit; else npm install --no-fund --no-audit; fi
 

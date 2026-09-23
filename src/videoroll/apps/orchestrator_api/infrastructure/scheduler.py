@@ -201,6 +201,11 @@ class OrchestratorScheduler:
                     raise_if_locked=False,
                     lock_owner_prefix=f"scheduled_youtube_source_scan:{self._source_scan_worker_id}",
                     lock_ttl_seconds=self._source_scan_lock_ttl_seconds,
+                    pipeline_starter=lambda task_id: youtube_service.enqueue_auto_youtube_pipeline(
+                        task_id,
+                        auto_publish=None,
+                        settings=self.settings,
+                    ),
                 )
                 if result is not None:
                     started += 1

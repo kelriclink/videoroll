@@ -1,0 +1,76 @@
+# VideoRoll-local build of Hatchet Lite.
+# Upstream source is vendored at services/hatchet and pinned by VENDOR_VERSION.
+# This keeps Hatchet self-hosted and reproducible without pulling the prebuilt
+# ghcr.io/hatchet-dev/hatchet/hatchet-lite runtime image.
+
+FROM node:22-alpine AS openapi-build
+WORKDIR /openapi
+COPY api-contracts/openapi ./openapi
+COPY hack/oas/bundle-openapi.mjs ./bundle-openapi.mjs
+RUN echo '{ "type": "module", "dependencies": { "@redocly/openapi-core": "2.14.7", "yaml": "2.7.0" }, "overrides": { "@redocly/ajv": "8.18.1" } }' > package.json \
+    && npm install --no-audit --no-fund \
+    && node bundle-openapi.mjs \
+    && rm -f package.json package-lock.json bundle-openapi.mjs
+
+FROM golang:1.26-alpine AS go-build
+ARG VERSION=v0.107.0
+WORKDIR /hatchet
+ENV CGO_ENABLED=0
+RUN apk add --no-cache git protoc protobuf-dev
+RUN go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.28 \
+    && go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.2 \
+    && go install github.com/deepmap/oapi-codegen/v2/cmd/oapi-codegen@v2.0.0
+
+COPY go.mod go.sum ./
+RUN --mount=type=cache,target=/go/pkg/mod go mod download
+
+COPY api ./api
+COPY api-contracts ./api-contracts
+COPY internal ./internal
+COPY pkg ./pkg
+COPY hack ./hack
+COPY cmd ./cmd
+
+RUN go generate ./...
+RUN sh ./hack/proto/proto.sh
+COPY --from=openapi-build /openapi/bin/oas/openapi.yaml ./bin/oas/openapi.yaml
+RUN oapi-codegen -config ./api/v1/server/oas/gen/codegen.yaml ./bin/oas/openapi.yaml
+
+RUN mkdir -p /out
+RUN --mount=type=cache,target=/root/.cache/go-build \
+    --mount=type=cache,target=/go/pkg/mod \
+    go build -ldflags="-w -s -X 'main.Version=${VERSION}'" -o /out/hatchet-lite ./cmd/hatchet-lite \
+    && go build -ldflags="-w -s -X 'main.Version=${VERSION}'" -o /out/hatchet-admin ./cmd/hatchet-admin \
+    && go build -ldflags="-w -s -X 'main.Version=${VERSION}'" -o /out/hatchet-migrate ./cmd/hatchet-migrate
+
+FROM node:22-alpine AS frontend-build
+WORKDIR /app
+COPY frontend/app/package.json frontend/app/pnpm-lock.yaml ./
+RUN corepack pnpm@10.16.1 --version \
+    && corepack pnpm@10.16.1 install --frozen-lockfile \
+    && corepack pnpm@10.16.1 store prune
+COPY frontend/app ./
+RUN npm run build
+
+FROM alpine:3.21 AS runtime
+RUN apk add --no-cache bash openssl ca-certificates curl postgresql-client tzdata
+
+COPY --from=go-build /out/hatchet-lite /hatchet-lite
+COPY --from=go-build /out/hatchet-admin /hatchet-admin
+COPY --from=go-build /out/hatchet-migrate /hatchet-migrate
+COPY --from=frontend-build /app/dist /static-assets
+COPY hack/lite/start.sh /entrypoint.sh
+
+ENV LITE_STATIC_ASSET_DIR=/static-assets \
+    LITE_FRONTEND_BASE_PATH=/workflow-ui \
+    LITE_FRONTEND_PORT=8081 \
+    LITE_RUNTIME_PORT=8888
+
+RUN chmod +x /entrypoint.sh
+
+EXPOSE 8888 7077
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=10 \
+    CMD curl -fsS http://127.0.0.1:8888/api/ready >/dev/null || exit 1
+
+CMD ["/entrypoint.sh"]

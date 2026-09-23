@@ -5,7 +5,7 @@ import threading
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import yt_dlp
 from sqlalchemy import select
@@ -133,18 +133,16 @@ def _normalize_source_type(value: YouTubeSourceType | str | None) -> YouTubeSour
     return YouTubeSourceType(raw)
 
 
-def _start_auto_pipeline(task_id: uuid.UUID, *, auto_publish: bool | None = None) -> str:
-    from videoroll.apps.subtitle_service.worker import celery_app as subtitle_celery_app
-
-    task_args: list[Any] = [str(task_id)]
-    if auto_publish is not None:
-        task_args.append({"auto_publish": bool(auto_publish)})
-    res = subtitle_celery_app.send_task(
-        "subtitle_service.auto_youtube_pipeline",
-        args=task_args,
-        queue="subtitle",
-    )
-    return str(res.id)
+def _start_auto_pipeline(
+    task_id: uuid.UUID,
+    *,
+    starter: Callable[[uuid.UUID], str],
+) -> str:
+    """Start the parent workflow through an injected orchestration boundary."""
+    run_id = str(starter(task_id) or "").strip()
+    if not run_id:
+        raise RuntimeError("pipeline starter returned an empty workflow run id")
+    return run_id
 
 
 def _build_resolved_source(
@@ -551,6 +549,7 @@ def scan_youtube_source_by_id(
     raise_if_locked: bool = False,
     lock_owner_prefix: str = "youtube_source_scan",
     lock_ttl_seconds: int = DEFAULT_SOURCE_SCAN_LOCK_TTL_SECONDS,
+    pipeline_starter: Callable[[uuid.UUID], str] | None = None,
 ) -> YouTubeSourceScanResult | None:
     src = db.get(YouTubeSource, source_pk)
     if src is None:
@@ -582,9 +581,6 @@ def scan_youtube_source_by_id(
 
     limit = normalize_source_scan_limit(limit_override if limit_override is not None else getattr(locked, "scan_limit", None))
     auto_process = bool(getattr(locked, "auto_process", True)) if auto_process_override is None else bool(auto_process_override)
-    # Automatic source scans deliberately do not snapshot auto-publish.  The
-    # publish box reads the current setting only when that stage starts.
-    auto_publish: bool | None = None
     yt_cfg = get_youtube_settings(db, default_proxy=default_proxy)
     proxy = str(yt_cfg.get("proxy") or "").strip() or default_proxy or None
 
@@ -673,7 +669,9 @@ def scan_youtube_source_by_id(
             created.append(task.id)
             if auto_process:
                 try:
-                    started.append(_start_auto_pipeline(task.id, auto_publish=auto_publish))
+                    if pipeline_starter is None:
+                        raise RuntimeError("auto_process requires a pipeline_starter")
+                    started.append(_start_auto_pipeline(task.id, starter=pipeline_starter))
                 except Exception as e:
                     error_message = _trim_error_message(f"{entry.video_id}: start pipeline failed: {e}")
                     logger.exception("failed to start auto pipeline for youtube source task %s", task.id)

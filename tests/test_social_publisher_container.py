@@ -66,7 +66,7 @@ def test_nginx_authorizes_every_novnc_request_and_vnc_uses_a_tmpfs_password_file
 
     assert "location = /internal/desktop-auth" in nginx
     assert "internal;" in nginx
-    assert "proxy_pass http://app:8000/desktop/authorize;" in nginx
+    assert "proxy_pass http://videoroll_app_backend/desktop/authorize;" in nginx
     assert "proxy_set_header Cookie $http_cookie;" in nginx
     assert "proxy_set_header X-Desktop-Grant $desktop_grant;" in nginx
     assert "proxy_set_header X-Desktop-Resource $desktop_resource;" in nginx

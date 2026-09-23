@@ -106,7 +106,7 @@ def test_concurrent_initializers_do_not_share_alembic_global_context(monkeypatch
         try:
             migrate.upgrade_database(engine)
             with engine.connect() as connection:
-                assert connection.exec_driver_sql("SELECT version_num FROM alembic_version").scalar_one() == "0008_render_worker_credentials"
+                assert connection.exec_driver_sql("SELECT version_num FROM alembic_version").scalar_one() == "0010_remove_legacy_task_queue"
         finally:
             engine.dispose()
 

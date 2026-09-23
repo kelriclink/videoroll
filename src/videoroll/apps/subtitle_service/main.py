@@ -81,11 +81,8 @@ from videoroll.apps.subtitle_service.schemas import (
     EmbeddingTestResponse,
     EmbeddingRuntimeStatusRead,
     TaskQueueItemRead,
-    TaskQueuePriorityUpdate,
-    TaskQueueReorderRequest,
     TaskQueueRead,
     TaskQueueSettingsRead,
-    TaskQueueSettingsUpdate,
 )
 from videoroll.apps.subtitle_service.asr_settings_store import get_asr_settings, update_asr_settings
 from videoroll.apps.subtitle_service.auto_profile_store import get_auto_profile, update_auto_profile
@@ -94,7 +91,6 @@ from videoroll.apps.subtitle_service.model_downloads import (
     download_model_snapshot,
     normalize_model_download_engine,
 )
-from videoroll.apps.subtitle_service.render_queue_store import get_task_queue_settings, update_task_queue_settings
 from videoroll.apps.subtitle_service.embeddings import (
     assert_embedding_dimensions,
     delete_local_embedding_model,
@@ -128,12 +124,6 @@ from videoroll.apps.subtitle_service.dictionaries import (
     update_dictionary_source,
 )
 from videoroll.apps.subtitle_service.translate_settings_store import get_translate_settings, update_translate_settings
-from videoroll.apps.subtitle_service.worker_concurrency import (
-    live_leased_task_ids,
-    sync_subtitle_worker_concurrency_for_task_queue_settings,
-)
-from videoroll.apps.subtitle_service.queues import SUBTITLE_CONTROL_QUEUE
-from videoroll.apps.subtitle_service.worker import TASK_QUEUE_LOCK_OWNER, celery_app
 from videoroll.apps.subtitle_service.processing import (
     transcribe_cloudflare_workers_ai,
     transcribe_external_whisper,
@@ -2035,7 +2025,6 @@ def create_job(payload: SubtitleJobCreate, db: Session = Depends(get_db)) -> dic
     db.add(job)
     db.commit()
     db.refresh(job)
-    celery_app.send_task("subtitle_service.task_queue_tick", args=[], queue=SUBTITLE_CONTROL_QUEUE)
     return {"job_id": str(job.id), "status": job.status.value}
 
 
@@ -2086,509 +2075,164 @@ def _clamp_queue_limit(v: int) -> int:
     return v
 
 
-def _task_queue_order_columns() -> tuple[Any, ...]:
-    return (
-        Task.priority.desc(),
-        Task.queue_position.asc().nullslast(),
-        Task.created_at.asc(),
-    )
+def _subtitle_worker_slots() -> int:
+    try:
+        value = int(os.getenv("HATCHET_SUBTITLE_WORKER_SLOTS") or "1")
+    except (TypeError, ValueError):
+        value = 1
+    return max(1, min(256, value))
+
+
+def _auto_youtube_queue_progress(db: Session, task: Task) -> tuple[str, int, str | None] | None:
+    if task.source_type != SourceType.youtube or parse_auto_youtube_created_by(task.created_by) is None:
+        return None
+    try:
+        from videoroll.apps.orchestrator_api.services.youtube_service import get_download_progress
+
+        data = get_download_progress(
+            task.id,
+            db=db,
+            redis_url=str(get_subtitle_settings().redis_url or ""),
+        )
+    except Exception:
+        logger.exception("failed to read YouTube download progress for task %s", task.id)
+        return None
+
+    status = str(data.get("status") or "").strip().lower()
+    if not status or status == "idle":
+        return None
+    try:
+        progress = max(0, min(100, int(data.get("progress") or 0)))
+    except (TypeError, ValueError):
+        progress = 0
+    error = str(data.get("error") or "").strip() or None
+    if status == "completed":
+        return "subtitle_handoff", 100, error
+    return "youtube_download", progress, error
 
 
 def _read_task_queue(db: Session, *, limit: int) -> TaskQueueRead:
+    """Project the active execution queue from durable job state.
+
+    Hatchet owns scheduling. This projection only reads durable business job
+    state so the UI cannot report synthetic queue states from the removed
+    Celery scheduler.
+    """
     limit = _clamp_queue_limit(limit)
-    cfg = get_task_queue_settings(db)
-    now = datetime.now(tz=timezone.utc)
-
     live_task = Task.status.notin_([TaskStatus.canceled, TaskStatus.published])
-    locked_q = db.query(Task).filter(
-        live_task,
-        Task.lock_owner == TASK_QUEUE_LOCK_OWNER,
-        Task.lock_until.is_not(None),
-        Task.lock_until > now,
-    )
-    live_job_task_ids = live_leased_task_ids(db, now)
-    locked_task_ids = {task_id for task_id, in locked_q.with_entities(Task.id).all()}
-    running_count = len(locked_task_ids | live_job_task_ids)
-    locked = locked_q.order_by(Task.lock_until.asc()).limit(limit).all()
-    visible_task_ids = {task.id for task in locked}
-    if live_job_task_ids and len(locked) < limit:
-        missing_live_tasks = (
-            db.query(Task)
-            .filter(live_task, Task.id.in_(live_job_task_ids - visible_task_ids))
-            .order_by(Task.updated_at.asc(), Task.created_at.asc())
-            .limit(limit - len(locked))
-            .all()
-        )
-        locked.extend(missing_live_tasks)
-    locked_ids = [t.id for t in locked]
 
-    render_running_by_task: dict[uuid.UUID, RenderJob] = {}
-    subtitle_running_by_task: dict[uuid.UUID, SubtitleJob] = {}
-    render_queued_by_task: dict[uuid.UUID, RenderJob] = {}
-    subtitle_queued_by_task: dict[uuid.UUID, SubtitleJob] = {}
-
-    if locked_ids:
-        for rj in (
-            db.query(RenderJob)
-            .filter(RenderJob.task_id.in_(locked_ids), RenderJob.status == RenderJobStatus.running)
-            .order_by(RenderJob.started_at.desc().nullslast(), RenderJob.updated_at.desc(), RenderJob.created_at.desc())
-            .all()
-        ):
-            render_running_by_task.setdefault(rj.task_id, rj)
-        for sj in (
-            db.query(SubtitleJob)
-            .filter(SubtitleJob.task_id.in_(locked_ids), SubtitleJob.status == SubtitleJobStatus.running)
-            .order_by(SubtitleJob.updated_at.desc(), SubtitleJob.created_at.desc())
-            .all()
-        ):
-            subtitle_running_by_task.setdefault(sj.task_id, sj)
-        for rj in (
-            db.query(RenderJob)
-            .filter(RenderJob.task_id.in_(locked_ids), RenderJob.status == RenderJobStatus.queued)
-            .order_by(RenderJob.created_at.asc())
-            .all()
-        ):
-            render_queued_by_task.setdefault(rj.task_id, rj)
-        for sj in (
-            db.query(SubtitleJob)
-            .filter(SubtitleJob.task_id.in_(locked_ids), SubtitleJob.status == SubtitleJobStatus.queued)
-            .order_by(SubtitleJob.created_at.asc())
-            .all()
-        ):
-            subtitle_queued_by_task.setdefault(sj.task_id, sj)
-
-    running_items: list[TaskQueueItemRead] = []
-    for t in locked:
-        tid = t.id
-        r_run = render_running_by_task.get(tid)
-        s_run = subtitle_running_by_task.get(tid)
-        r_q = render_queued_by_task.get(tid)
-        s_q = subtitle_queued_by_task.get(tid)
-
-        if r_run:
-            running_items.append(
-                TaskQueueItemRead(
-                    task_id=tid,
-                    state="running",
-                    stage="render",
-                    render_job_id=r_run.id,
-                    subtitle_job_id=r_run.subtitle_job_id,
-                    progress=int(r_run.progress or 0),
-                    error_message=r_run.error_message,
-                    created_at=r_run.created_at,
-                    updated_at=r_run.updated_at,
-                )
-            )
-            continue
-        if s_run:
-            running_items.append(
-                TaskQueueItemRead(
-                    task_id=tid,
-                    state="running",
-                    stage="subtitle",
-                    subtitle_job_id=s_run.id,
-                    progress=int(s_run.progress or 0),
-                    error_message=s_run.error_message,
-                    created_at=s_run.created_at,
-                    updated_at=s_run.updated_at,
-                )
-            )
-            continue
-        if r_q:
-            running_items.append(
-                TaskQueueItemRead(
-                    task_id=tid,
-                    state="running",
-                    stage="waiting_render",
-                    render_job_id=r_q.id,
-                    subtitle_job_id=r_q.subtitle_job_id,
-                    progress=int(r_q.progress or 0),
-                    error_message=r_q.error_message,
-                    created_at=r_q.created_at,
-                    updated_at=r_q.updated_at,
-                )
-            )
-            continue
-        if s_q:
-            running_items.append(
-                TaskQueueItemRead(
-                    task_id=tid,
-                    state="running",
-                    stage="waiting_subtitle",
-                    subtitle_job_id=s_q.id,
-                    progress=int(s_q.progress or 0),
-                    error_message=s_q.error_message,
-                    created_at=s_q.created_at,
-                    updated_at=s_q.updated_at,
-                )
-            )
-            continue
-
-        running_items.append(
-            TaskQueueItemRead(
-                task_id=tid,
-                state="running",
-                stage="idle",
-                progress=0,
-                error_message=None,
-                created_at=t.created_at,
-                updated_at=t.updated_at,
-            )
-        )
-
-    # Stopped tasks retain their jobs for a later resume, but never belong in
-    # the live queue.  Keep this predicate explicit on every queue query so a
-    # stale queued/running job cannot make the dashboard show a stopped task.
-    unlocked = (
-        live_task
-        & (
-            (Task.lock_owner != TASK_QUEUE_LOCK_OWNER)
-            | (Task.lock_until.is_(None))
-            | (Task.lock_until <= now)
-        )
-    )
-    if live_job_task_ids:
-        unlocked = unlocked & Task.id.notin_(live_job_task_ids)
-    orphaned_render_by_task: dict[uuid.UUID, RenderJob] = {}
-    orphaned_subtitle_by_task: dict[uuid.UUID, SubtitleJob] = {}
-    for rj in (
-        db.query(RenderJob)
-        .join(Task, Task.id == RenderJob.task_id)
-        .filter(RenderJob.status == RenderJobStatus.running, unlocked)
-        .order_by(Task.priority.desc(), Task.queue_position.asc().nullslast(), RenderJob.updated_at.asc(), RenderJob.created_at.asc())
-        .limit(5000)
-        .all()
-    ):
-        orphaned_render_by_task.setdefault(rj.task_id, rj)
-    for sj in (
+    subtitle_by_task: dict[uuid.UUID, SubtitleJob] = {}
+    for job in (
         db.query(SubtitleJob)
         .join(Task, Task.id == SubtitleJob.task_id)
-        .filter(SubtitleJob.status == SubtitleJobStatus.running, unlocked)
-        .order_by(Task.priority.desc(), Task.queue_position.asc().nullslast(), SubtitleJob.updated_at.asc(), SubtitleJob.created_at.asc())
+        .filter(SubtitleJob.status.in_([SubtitleJobStatus.queued, SubtitleJobStatus.running]), live_task)
+        .order_by(SubtitleJob.updated_at.desc(), SubtitleJob.created_at.desc())
         .limit(5000)
         .all()
     ):
-        orphaned_subtitle_by_task.setdefault(sj.task_id, sj)
+        subtitle_by_task.setdefault(job.task_id, job)
 
-    # queued_count: distinct tasks with queued jobs, plus orphaned running jobs that lost their task lock.
-    queued_task_ids: set[uuid.UUID] = set(orphaned_render_by_task) | set(orphaned_subtitle_by_task)
-    for tid, in (
-        db.query(SubtitleJob.task_id)
-        .join(Task, Task.id == SubtitleJob.task_id)
-        .filter(SubtitleJob.status == SubtitleJobStatus.queued, unlocked)
-        .distinct()
-        .limit(5000)
-        .all()
-    ):
-        queued_task_ids.add(tid)
-    for tid, in (
-        db.query(RenderJob.task_id)
+    render_by_task: dict[uuid.UUID, RenderJob] = {}
+    for job in (
+        db.query(RenderJob)
         .join(Task, Task.id == RenderJob.task_id)
-        .filter(RenderJob.status == RenderJobStatus.queued, unlocked)
-        .distinct()
+        .filter(RenderJob.status.in_([RenderJobStatus.queued, RenderJobStatus.running]), live_task)
+        .order_by(RenderJob.updated_at.desc(), RenderJob.created_at.desc())
         .limit(5000)
         .all()
     ):
-        queued_task_ids.add(tid)
+        render_by_task.setdefault(job.task_id, job)
 
-    recoverable_pipeline_tasks: list[Task] = []
-    bootstrap_cutoff = now - timedelta(seconds=60)
-    for task in (
+    candidate_ids = set(subtitle_by_task) | set(render_by_task)
+    auto_tasks = (
         db.query(Task)
         .filter(
             Task.source_type == SourceType.youtube,
             Task.status.in_([TaskStatus.ingested, TaskStatus.downloaded]),
-            unlocked,
-            Task.updated_at.is_not(None),
-            Task.updated_at < bootstrap_cutoff,
+            live_task,
         )
-        .order_by(*_task_queue_order_columns())
+        .order_by(Task.priority.desc(), Task.created_at.asc())
         .limit(5000)
         .all()
-    ):
-        if parse_auto_youtube_created_by(task.created_by) is None:
-            continue
-        has_jobs = (
-            db.query(SubtitleJob).filter(SubtitleJob.task_id == task.id).count()
-            + db.query(RenderJob).filter(RenderJob.task_id == task.id).count()
-        )
-        if has_jobs:
-            continue
-        recoverable_pipeline_tasks.append(task)
-        queued_task_ids.add(task.id)
-
-    queued_count = len(queued_task_ids)
-
-    remaining = max(0, limit - len(running_items))
-    queued_items: list[TaskQueueItemRead] = []
-    seen: set[uuid.UUID] = set()
-
-    for rj in orphaned_render_by_task.values():
-        if rj.task_id in seen:
-            continue
-        seen.add(rj.task_id)
-        queued_items.append(
-            TaskQueueItemRead(
-                task_id=rj.task_id,
-                state="queued",
-                stage="recover_render",
-                render_job_id=rj.id,
-                subtitle_job_id=rj.subtitle_job_id,
-                progress=int(rj.progress or 0),
-                error_message=rj.error_message,
-                created_at=rj.created_at,
-                updated_at=rj.updated_at,
-            )
-        )
-        if len(queued_items) >= remaining:
-            break
-
-    if len(queued_items) < remaining:
-        for sj in orphaned_subtitle_by_task.values():
-            if sj.task_id in seen:
-                continue
-            seen.add(sj.task_id)
-            queued_items.append(
-                TaskQueueItemRead(
-                    task_id=sj.task_id,
-                    state="queued",
-                    stage="recover_subtitle",
-                    subtitle_job_id=sj.id,
-                    progress=int(sj.progress or 0),
-                    error_message=sj.error_message,
-                    created_at=sj.created_at,
-                    updated_at=sj.updated_at,
-                )
-            )
-            if len(queued_items) >= remaining:
-                break
-
-    fetch_n = min(5000, max(50, remaining * 20))
-    if len(queued_items) < remaining:
-        for task in recoverable_pipeline_tasks:
-            if task.id in seen:
-                continue
-            seen.add(task.id)
-            queued_items.append(
-                TaskQueueItemRead(
-                    task_id=task.id,
-                    state="queued",
-                    stage="recover_pipeline",
-                    progress=0,
-                    error_message=task.error_message,
-                    created_at=task.created_at,
-                    updated_at=task.updated_at,
-                )
-            )
-            if len(queued_items) >= remaining:
-                break
-
-    if len(queued_items) < remaining:
-        for sj in (
-            db.query(SubtitleJob)
-            .join(Task, Task.id == SubtitleJob.task_id)
-            .filter(SubtitleJob.status == SubtitleJobStatus.queued, unlocked)
-            .order_by(Task.priority.desc(), Task.queue_position.asc().nullslast(), SubtitleJob.created_at.asc())
-            .limit(fetch_n)
-            .all()
-        ):
-            if sj.task_id in seen:
-                continue
-            seen.add(sj.task_id)
-            queued_items.append(
-                TaskQueueItemRead(
-                    task_id=sj.task_id,
-                    state="queued",
-                    stage="subtitle",
-                    subtitle_job_id=sj.id,
-                    progress=int(sj.progress or 0),
-                    error_message=sj.error_message,
-                    created_at=sj.created_at,
-                    updated_at=sj.updated_at,
-                )
-            )
-            if len(queued_items) >= remaining:
-                break
-
-    if len(queued_items) < remaining:
-        for rj in (
-            db.query(RenderJob)
-            .join(Task, Task.id == RenderJob.task_id)
-            .filter(RenderJob.status == RenderJobStatus.queued, unlocked)
-            .order_by(Task.priority.desc(), Task.queue_position.asc().nullslast(), RenderJob.created_at.asc())
-            .limit(fetch_n)
-            .all()
-        ):
-            if rj.task_id in seen:
-                continue
-            seen.add(rj.task_id)
-            queued_items.append(
-                TaskQueueItemRead(
-                    task_id=rj.task_id,
-                    state="queued",
-                    stage="render",
-                    render_job_id=rj.id,
-                    subtitle_job_id=rj.subtitle_job_id,
-                    progress=int(rj.progress or 0),
-                    error_message=rj.error_message,
-                    created_at=rj.created_at,
-                    updated_at=rj.updated_at,
-                )
-            )
-            if len(queued_items) >= remaining:
-                break
-
-    all_items = [*running_items, *queued_items]
-    item_task_ids = {item.task_id for item in all_items}
-    task_meta = {
-        task.id: task
-        for task in db.query(Task).filter(Task.id.in_(item_task_ids)).all()
-    } if item_task_ids else {}
-    for item in all_items:
-        task = task_meta.get(item.task_id)
-        if task is not None:
-            item.priority = int(task.priority or 0)
-            item.queue_position = task.queue_position
-
-    queued_items.sort(
-        key=lambda item: (
-            -int(item.priority or 0),
-            item.queue_position is None,
-            int(item.queue_position or 0),
-            item.created_at,
-        )
     )
-    all_items = [*running_items, *queued_items]
+    for task in auto_tasks:
+        if parse_auto_youtube_created_by(task.created_by) is not None:
+            candidate_ids.add(task.id)
 
+    if not candidate_ids:
+        return TaskQueueRead(
+            settings=TaskQueueSettingsRead(scheduler="hatchet", subtitle_worker_slots=_subtitle_worker_slots()),
+            running_count=0,
+            queued_count=0,
+            tasks=[],
+        )
+
+    tasks = (
+        db.query(Task)
+        .filter(Task.id.in_(candidate_ids), live_task)
+        .order_by(Task.priority.desc(), Task.created_at.asc())
+        .limit(limit)
+        .all()
+    )
+
+    items: list[TaskQueueItemRead] = []
+    for task in tasks:
+        sj = subtitle_by_task.get(task.id)
+        rj = render_by_task.get(task.id)
+        state = "queued"
+        stage = "workflow"
+        progress = 0
+        error_message = task.error_message
+        created_at = task.created_at
+        updated_at = task.updated_at
+        subtitle_job_id = sj.id if sj is not None else None
+        render_job_id = rj.id if rj is not None else None
+
+        if rj is not None:
+            state = "running" if rj.status == RenderJobStatus.running else "queued"
+            stage = "render" if state == "running" else "waiting_render"
+            progress = int(rj.progress or 0)
+            error_message = rj.error_message
+            created_at = rj.created_at
+            updated_at = rj.updated_at
+            subtitle_job_id = rj.subtitle_job_id or subtitle_job_id
+        elif sj is not None:
+            state = "running" if sj.status == SubtitleJobStatus.running else "queued"
+            stage = "subtitle"
+            progress = int(sj.progress or 0)
+            error_message = sj.error_message
+            created_at = sj.created_at
+            updated_at = sj.updated_at
+        else:
+            youtube_progress = _auto_youtube_queue_progress(db, task)
+            if youtube_progress is not None:
+                stage, progress, error_message = youtube_progress
+                state = "running" if stage == "youtube_download" else "queued"
+
+        items.append(
+            TaskQueueItemRead(
+                task_id=task.id,
+                state=state,
+                stage=stage,
+                priority=int(task.priority or 0),
+                subtitle_job_id=subtitle_job_id,
+                render_job_id=render_job_id,
+                progress=progress,
+                error_message=error_message,
+                created_at=created_at,
+                updated_at=updated_at,
+            )
+        )
+
+    items.sort(key=lambda item: (0 if item.state == "running" else 1, -int(item.priority or 0), item.created_at))
     return TaskQueueRead(
-        settings=TaskQueueSettingsRead(**cfg),
-        running_count=running_count,
-        queued_count=int(queued_count),
-        tasks=all_items,
+        settings=TaskQueueSettingsRead(scheduler="hatchet", subtitle_worker_slots=_subtitle_worker_slots()),
+        running_count=sum(1 for item in items if item.state == "running"),
+        queued_count=sum(1 for item in items if item.state == "queued"),
+        tasks=items,
     )
 
 
 @app.get("/subtitle/task_queue", response_model=TaskQueueRead)
 def get_task_queue(limit: int = 200, db: Session = Depends(get_db)) -> TaskQueueRead:
     return _read_task_queue(db, limit=limit)
-
-
-@app.get("/subtitle/render_queue", response_model=TaskQueueRead)
-def get_render_queue_legacy(limit: int = 200, db: Session = Depends(get_db)) -> TaskQueueRead:
-    return _read_task_queue(db, limit=limit)
-
-
-@app.put("/subtitle/task_queue/settings", response_model=TaskQueueSettingsRead)
-def put_task_queue_settings_view(payload: TaskQueueSettingsUpdate, db: Session = Depends(get_db)) -> TaskQueueSettingsRead:
-    cfg = update_task_queue_settings(db, payload.model_dump(exclude_unset=True))
-    publish_queue_changed(get_subtitle_settings().redis_url)
-    runtime_sync = sync_subtitle_worker_concurrency_for_task_queue_settings(celery_app, cfg, queue="subtitle")
-    if not bool(runtime_sync.get("ok")):
-        logger.warning(
-            "subtitle worker concurrency runtime sync incomplete after task queue update: %s",
-            runtime_sync.get("detail"),
-        )
-    celery_app.send_task("subtitle_service.task_queue_tick", args=[], queue=SUBTITLE_CONTROL_QUEUE)
-    return TaskQueueSettingsRead(
-        **cfg,
-        runtime_worker_concurrency=runtime_sync.get("target_concurrency"),
-        runtime_sync_ok=bool(runtime_sync.get("ok")),
-        runtime_sync_detail=str(runtime_sync.get("detail") or "").strip() or None,
-        runtime_sync_workers=list(runtime_sync.get("workers") or []),
-    )
-
-
-@app.put("/subtitle/render_queue/settings", response_model=TaskQueueSettingsRead)
-def put_render_queue_settings_legacy(payload: TaskQueueSettingsUpdate, db: Session = Depends(get_db)) -> TaskQueueSettingsRead:
-    return put_task_queue_settings_view(payload, db=db)
-
-
-@app.put("/subtitle/task_queue/tasks/{task_id}", response_model=TaskQueueItemRead)
-def patch_task_queue_priority(
-    task_id: uuid.UUID,
-    payload: TaskQueuePriorityUpdate,
-    db: Session = Depends(get_db),
-) -> TaskQueueItemRead:
-    task = db.query(Task).filter(Task.id == task_id).with_for_update().one_or_none()
-    if task is None:
-        raise HTTPException(status_code=404, detail="task not found")
-    previous_priority = int(task.priority or 0)
-    task.priority = int(payload.priority)
-    if task.priority != previous_priority:
-        # queue_position is meaningful only inside one priority bucket.  Carrying
-        # it into another bucket can create duplicate positions and unstable
-        # ordering, so a priority change rejoins the tail of that bucket.
-        task.queue_position = None
-    db.add(task)
-    db.flush()
-    queue = _read_task_queue(db, limit=2000)
-    item = next((row for row in queue.tasks if row.task_id == task_id), None)
-    if item is None:
-        db.rollback()
-        raise HTTPException(status_code=409, detail="task is not currently queued or running")
-    db.commit()
-    publish_queue_changed(get_subtitle_settings().redis_url)
-    celery_app.send_task("subtitle_service.task_queue_tick", args=[], queue=SUBTITLE_CONTROL_QUEUE)
-    return item
-
-
-@app.post("/subtitle/task_queue/reorder", response_model=TaskQueueRead)
-def reorder_task_queue(payload: TaskQueueReorderRequest, db: Session = Depends(get_db)) -> TaskQueueRead:
-    ordered_ids = list(dict.fromkeys(payload.task_ids))
-    if len(ordered_ids) != len(payload.task_ids):
-        raise HTTPException(status_code=400, detail="task_ids contains duplicates")
-    tasks = db.query(Task).filter(Task.id.in_(ordered_ids)).with_for_update().all()
-    by_id = {task.id: task for task in tasks}
-    missing = [str(task_id) for task_id in ordered_ids if task_id not in by_id]
-    if missing:
-        raise HTTPException(status_code=404, detail=f"tasks not found: {', '.join(missing[:5])}")
-
-    priorities = {int(task.priority or 0) for task in tasks}
-    if len(priorities) != 1:
-        raise HTTPException(status_code=400, detail="reorder only supports tasks with the same priority")
-
-    visible_queue = _read_task_queue(db, limit=2000)
-    visible_queued = [item for item in visible_queue.tasks if item.state == "queued"]
-    if visible_queue.queued_count != len(visible_queued):
-        raise HTTPException(
-            status_code=409,
-            detail="queue is too large to reorder safely; narrow the queue before reordering",
-        )
-    queued_ids = {item.task_id for item in visible_queued}
-    not_queued = [str(task_id) for task_id in ordered_ids if task_id not in queued_ids]
-    if not_queued:
-        raise HTTPException(status_code=409, detail=f"tasks are not currently queued: {', '.join(not_queued[:5])}")
-
-    priority = next(iter(priorities))
-    bucket_ids = [item.task_id for item in visible_queued if int(item.priority or 0) == priority]
-    if len(bucket_ids) != len(ordered_ids) or set(bucket_ids) != set(ordered_ids):
-        raise HTTPException(
-            status_code=409,
-            detail="reorder must include every queued task in the selected priority bucket",
-        )
-
-    for index, task_id in enumerate(ordered_ids, start=1):
-        task = by_id[task_id]
-        task.queue_position = index * 1000
-        db.add(task)
-    db.flush()
-    result = _read_task_queue(db, limit=2000)
-    db.commit()
-    publish_queue_changed(get_subtitle_settings().redis_url)
-    celery_app.send_task("subtitle_service.task_queue_tick", args=[], queue=SUBTITLE_CONTROL_QUEUE)
-    return result
-
-
-@app.post("/subtitle/task_queue/tick")
-def post_task_queue_tick() -> dict[str, str]:
-    """
-    Best-effort scheduler kick.
-    Useful when a job is queued but no tick was delivered/consumed.
-    """
-    celery_app.send_task("subtitle_service.task_queue_tick", args=[], queue=SUBTITLE_CONTROL_QUEUE)
-    return {"status": "queued"}
-
-
-@app.post("/subtitle/render_queue/tick")
-def post_render_queue_tick_legacy() -> dict[str, str]:
-    return post_task_queue_tick()

@@ -1,0 +1,3 @@
+upstream=https://github.com/hatchet-dev/hatchet
+tag=v0.107.0
+commit=d6c9e6849526b0d8a51d97bf2f5b6dcfdfee0179

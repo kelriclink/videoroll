@@ -68,8 +68,6 @@ def clear_task_working_state(db: Session, task: Task) -> None:
     task.error_code = None
     task.error_message = None
     task.retry_count = 0
-    task.lock_owner = None
-    task.lock_until = None
 
 
 def reset_task_for_source_recovery(db: Session, task: Task) -> TaskStatus:

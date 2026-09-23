@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import uuid
+
 from datetime import timedelta
-from unittest.mock import MagicMock
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import pytest
 from sqlalchemy import create_engine
@@ -119,3 +122,193 @@ def test_dispatcher_sends_worker_args_and_outbox_event_id(db: Session) -> None:
         queue="publish",
     )
     assert db.get(OutboxEvent, event.id).status == "dispatched"
+
+
+def test_workflow_cancel_bridge_calls_hatchet_and_marks_pipeline_run(monkeypatch: pytest.MonkeyPatch) -> None:
+    from videoroll.apps.subtitle_service import worker
+    from videoroll.db.models import PipelineRun
+
+    pipeline_run_id = uuid.uuid4()
+    response = MagicMock()
+    response.raise_for_status.return_value = None
+    client = MagicMock()
+    client.__enter__.return_value = client
+    client.__exit__.return_value = None
+    client.post.return_value = response
+    finished: list[tuple[str, dict[str, object]]] = []
+    row = SimpleNamespace(state="cancel_requested", error_message="old", finished_at=None)
+    db = MagicMock()
+    db.get.return_value = row
+
+    monkeypatch.setattr(worker, "_ensure_db", lambda: None)
+    monkeypatch.setattr(worker, "_db", lambda: db)
+    monkeypatch.setattr(
+        worker,
+        "_claim_outbox_worker_operation",
+        lambda *_args, **_kwargs: (f"workflow-cancel:{pipeline_run_id}", "cancel-owner"),
+    )
+    monkeypatch.setattr(
+        worker,
+        "_finish_outbox_worker_operation",
+        lambda operation_key, result: finished.append((operation_key, dict(result))),
+    )
+    monkeypatch.setattr(
+        worker,
+        "_release_outbox_worker_operation",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("success must not release operation")),
+    )
+    monkeypatch.setattr(
+        worker,
+        "get_orchestrator_settings",
+        lambda: SimpleNamespace(workflow_service_url="http://workflow-api:8030"),
+    )
+    monkeypatch.setattr(worker, "service_token", lambda _settings: "internal-token")
+    monkeypatch.setattr(worker.httpx, "Client", lambda *args, **kwargs: client)
+
+    result = worker.cancel_workflow_run.run(
+        str(pipeline_run_id),
+        "hatchet-run-1",
+        "outbox-cancel-1",
+    )
+
+    client.post.assert_called_once_with("http://workflow-api:8030/runs/hatchet-run-1/cancel")
+    db.get.assert_called_once_with(PipelineRun, pipeline_run_id)
+    assert row.state == "canceled"
+    assert row.finished_at is not None
+    assert result == {
+        "status": "ok",
+        "pipeline_run_id": str(pipeline_run_id),
+        "external_run_id": "hatchet-run-1",
+    }
+    assert finished == [(f"workflow-cancel:{pipeline_run_id}", result)]
+
+
+def test_render_workflow_event_bridge_finishes_inbox_only_after_http_success(monkeypatch: pytest.MonkeyPatch) -> None:
+    from videoroll.apps.subtitle_service import worker
+
+    response = MagicMock()
+    response.raise_for_status.return_value = None
+    client = MagicMock()
+    client.__enter__.return_value = client
+    client.__exit__.return_value = None
+    client.post.return_value = response
+    finished: list[tuple[str, dict[str, object]]] = []
+
+    monkeypatch.setattr(worker, "_ensure_db", lambda: None)
+    monkeypatch.setattr(
+        worker,
+        "_claim_outbox_worker_operation",
+        lambda *_args, **_kwargs: ("workflow-render-finished:render-1:succeeded", "bridge-owner"),
+    )
+    monkeypatch.setattr(
+        worker,
+        "_finish_outbox_worker_operation",
+        lambda operation_key, result: finished.append((operation_key, dict(result))),
+    )
+    monkeypatch.setattr(
+        worker,
+        "_release_outbox_worker_operation",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("success must not release operation")),
+    )
+    monkeypatch.setattr(
+        worker,
+        "get_orchestrator_settings",
+        lambda: SimpleNamespace(workflow_service_url="http://workflow-api:8030"),
+    )
+    monkeypatch.setattr(worker, "service_token", lambda _settings: "internal-token")
+    monkeypatch.setattr(worker.httpx, "Client", lambda *args, **kwargs: client)
+
+    result = worker.push_render_workflow_event.run(
+        "render-1",
+        "succeeded",
+        "exec-1",
+        None,
+        "outbox-1",
+    )
+
+    client.post.assert_called_once_with(
+        "http://workflow-api:8030/events/render-finished",
+        json={
+            "render_job_id": "render-1",
+            "status": "succeeded",
+            "execution_id": "exec-1",
+            "error": None,
+        },
+    )
+    assert result["status"] == "ok"
+    assert finished == [
+        (
+            "workflow-render-finished:render-1:succeeded",
+            {
+                "status": "ok",
+                "render_status": "succeeded",
+                "render_job_id": "render-1",
+                "execution_id": "exec-1",
+                "error": None,
+            },
+        )
+    ]
+
+
+def test_publish_workflow_event_bridge_finishes_inbox_only_after_http_success(monkeypatch: pytest.MonkeyPatch) -> None:
+    from videoroll.apps.subtitle_service import worker
+
+    response = MagicMock()
+    response.raise_for_status.return_value = None
+    client = MagicMock()
+    client.__enter__.return_value = client
+    client.__exit__.return_value = None
+    client.post.return_value = response
+    finished: list[tuple[str, dict[str, object]]] = []
+
+    monkeypatch.setattr(worker, "_ensure_db", lambda: None)
+    monkeypatch.setattr(
+        worker,
+        "_claim_outbox_worker_operation",
+        lambda *_args, **_kwargs: ("workflow-publish-finished:batch-1:succeeded", "bridge-owner"),
+    )
+    monkeypatch.setattr(
+        worker,
+        "_finish_outbox_worker_operation",
+        lambda operation_key, result: finished.append((operation_key, dict(result))),
+    )
+    monkeypatch.setattr(
+        worker,
+        "_release_outbox_worker_operation",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("success must not release operation")),
+    )
+    monkeypatch.setattr(
+        worker,
+        "get_orchestrator_settings",
+        lambda: SimpleNamespace(workflow_service_url="http://workflow-api:8030"),
+    )
+    monkeypatch.setattr(worker, "service_token", lambda _settings: "internal-token")
+    monkeypatch.setattr(worker.httpx, "Client", lambda *args, **kwargs: client)
+
+    result = worker.push_publish_workflow_event.run(
+        "batch-1",
+        "succeeded",
+        "task-1",
+        "outbox-2",
+    )
+
+    client.post.assert_called_once_with(
+        "http://workflow-api:8030/events/publish-finished",
+        json={
+            "publish_batch_id": "batch-1",
+            "status": "succeeded",
+            "task_id": "task-1",
+        },
+    )
+    assert result == {
+        "status": "ok",
+        "publish_status": "succeeded",
+        "publish_batch_id": "batch-1",
+        "task_id": "task-1",
+    }
+    assert finished == [
+        (
+            "workflow-publish-finished:batch-1:succeeded",
+            result,
+        )
+    ]

@@ -6,13 +6,14 @@ import os
 import uuid
 from typing import Generator
 
+import httpx
 from fastapi import Body, Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from videoroll.config import YouTubeIngestSettings, get_youtube_ingest_settings
-from videoroll.apps.security.service_auth import install_internal_service_auth, service_token
+from videoroll.apps.security.service_auth import INTERNAL_TOKEN_HEADER, install_internal_service_auth, service_token
 from videoroll.db.migrate import initialize_database
 from videoroll.db.models import (
     IngestedVideo,
@@ -44,6 +45,25 @@ from videoroll.utils.youtube_urls import canonicalize_youtube_url, extract_youtu
 
 def get_settings() -> YouTubeIngestSettings:
     return get_youtube_ingest_settings()
+
+
+def _start_pipeline_via_orchestrator(settings: YouTubeIngestSettings, task_id: uuid.UUID) -> str:
+    token = service_token(settings)
+    headers = {INTERNAL_TOKEN_HEADER: token} if token else {}
+    with httpx.Client(timeout=20.0, headers=headers) as client:
+        response = client.post(
+            f"{settings.orchestrator_url.rstrip('/')}/tasks/{task_id}/actions/auto_youtube_start"
+        )
+        response.raise_for_status()
+        payload = response.json()
+    workflow_run_id = str(payload.get("pipeline_job_id") or "").strip()
+    if not workflow_run_id:
+        raise RuntimeError("orchestrator did not return pipeline_job_id")
+    return workflow_run_id
+
+
+def _pipeline_starter(settings: YouTubeIngestSettings):
+    return lambda task_id: _start_pipeline_via_orchestrator(settings, task_id)
 
 
 def get_db(settings: YouTubeIngestSettings = Depends(get_settings)) -> Generator[Session, None, None]:
@@ -199,6 +219,7 @@ def scan_source(
             force=True,
             raise_if_locked=True,
             lock_owner_prefix="manual_youtube_source_scan",
+            pipeline_starter=_pipeline_starter(settings),
         )
     except KeyError as e:
         raise HTTPException(status_code=404, detail=str(e)) from e
@@ -236,6 +257,7 @@ def scan_source_by_row_id(
             force=True,
             raise_if_locked=True,
             lock_owner_prefix="manual_youtube_source_scan",
+            pipeline_starter=_pipeline_starter(settings),
         )
     except KeyError as e:
         raise HTTPException(status_code=404, detail=str(e)) from e

@@ -717,23 +717,8 @@ class ModelDownloadProxyTestResponse(BaseModel):
 
 
 class TaskQueueSettingsRead(BaseModel):
-    max_concurrency: int = Field(1, description="0=暂停调度；>0 表示最多同时运行多少个任务（Task pipeline）")
-    runtime_worker_concurrency: Optional[int] = Field(default=None, description="运行中 subtitle worker 的目标并发；最小为 1")
-    runtime_sync_ok: Optional[bool] = None
-    runtime_sync_detail: Optional[str] = None
-    runtime_sync_workers: list[dict[str, Any]] = Field(default_factory=list)
-
-
-class TaskQueueSettingsUpdate(BaseModel):
-    max_concurrency: Optional[int] = Field(default=None, ge=0, le=32)
-
-
-class TaskQueuePriorityUpdate(BaseModel):
-    priority: int = Field(default=0, ge=-100, le=100)
-
-
-class TaskQueueReorderRequest(BaseModel):
-    task_ids: list[uuid.UUID] = Field(default_factory=list, min_length=1, max_length=2000)
+    scheduler: Literal["hatchet"] = "hatchet"
+    subtitle_worker_slots: int = Field(1, ge=1, le=256)
 
 
 class TaskQueueItemRead(BaseModel):
@@ -741,7 +726,6 @@ class TaskQueueItemRead(BaseModel):
     state: str
     stage: str
     priority: int = 0
-    queue_position: Optional[int] = None
     subtitle_job_id: Optional[uuid.UUID] = None
     render_job_id: Optional[uuid.UUID] = None
     progress: int = 0

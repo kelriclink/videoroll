@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 
 from videoroll.apps.orchestrator_api.dependencies import get_db, get_store, get_settings
 from videoroll.apps.orchestrator_api.schemas import (
+    AutoSubtitleHandoffResponse,
     ConvertedVideoItem,
     RecentFailedResumeResponse,
     RemoteJobResponse,
@@ -59,10 +60,19 @@ def get_task(
     return task_service.get_task(task_id, db=db, store=store)
 
 
-def _restart_resumed_auto_youtube_task(task: Task, *, db: Session) -> None:
+def _restart_resumed_auto_youtube_task(
+    task: Task,
+    *,
+    settings: OrchestratorSettings,
+    db: Session,
+) -> None:
     should_restart_auto_youtube, auto_publish = task_service.auto_youtube_restart_options(task, db=db)
     if should_restart_auto_youtube:
-        youtube_service.enqueue_auto_youtube_pipeline(task.id, auto_publish=auto_publish)
+        youtube_service.enqueue_auto_youtube_pipeline(
+            task.id,
+            auto_publish=auto_publish,
+            settings=settings,
+        )
 
 
 @router.post("/tasks/{task_id}/actions/stop", response_model=TaskRead)
@@ -73,7 +83,6 @@ def stop_task(
 ) -> Task:
     task = task_service.stop_task(task_id, db=db)
     publish_queue_changed(settings.redis_url, task_id=task.id)
-    subtitle_service.kick_task_queue(settings)
     return task
 
 
@@ -84,8 +93,8 @@ def resume_stopped_task(
     db: Session = Depends(get_db),
 ) -> Task:
     task = task_service.resume_stopped_task(task_id, db=db)
-    _restart_resumed_auto_youtube_task(task, db=db)
-    subtitle_service.kick_task_queue(settings)
+    _restart_resumed_auto_youtube_task(task, settings=settings, db=db)
+    subtitle_service.relaunch_queued_subtitle_job(task.id, settings=settings, db=db)
     return task
 
 
@@ -96,7 +105,6 @@ def stop_all_tasks(
 ) -> TaskBulkControlResponse:
     matched_count, changed_count = task_service.stop_all_tasks(db=db)
     publish_queue_changed(settings.redis_url)
-    subtitle_service.kick_task_queue(settings)
     return TaskBulkControlResponse(matched_count=matched_count, changed_count=changed_count)
 
 
@@ -107,8 +115,8 @@ def resume_all_stopped_tasks(
 ) -> TaskBulkControlResponse:
     matched_count, changed_count, tasks = task_service.resume_all_stopped_tasks(db=db)
     for task in tasks:
-        _restart_resumed_auto_youtube_task(task, db=db)
-    subtitle_service.kick_task_queue(settings)
+        _restart_resumed_auto_youtube_task(task, settings=settings, db=db)
+        subtitle_service.relaunch_queued_subtitle_job(task.id, settings=settings, db=db)
     return TaskBulkControlResponse(matched_count=matched_count, changed_count=changed_count)
 
 
@@ -119,6 +127,19 @@ def list_task_subtitle_jobs(
     db: Session = Depends(get_db),
 ) -> list[SubtitleJob]:
     return subtitle_service.list_task_subtitle_jobs(task_id, limit=limit, db=db)
+
+
+@router.post("/tasks/{task_id}/actions/auto_subtitle_handoff", response_model=AutoSubtitleHandoffResponse)
+def auto_subtitle_handoff(
+    task_id: uuid.UUID,
+    settings: OrchestratorSettings = Depends(get_settings),
+    db: Session = Depends(get_db),
+) -> AutoSubtitleHandoffResponse:
+    return subtitle_service.enqueue_auto_subtitle_handoff(
+        task_id,
+        settings=settings,
+        db=db,
+    )
 
 
 @router.post("/tasks/{task_id}/actions/subtitle", response_model=RemoteJobResponse)

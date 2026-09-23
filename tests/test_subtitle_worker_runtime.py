@@ -16,6 +16,15 @@ def test_worker_has_no_rss_memory_limit() -> None:
     assert worker.celery_app.conf.worker_max_tasks_per_child == 20
 
 
+def test_remaining_celery_worker_is_control_plane_only() -> None:
+    from videoroll.apps.subtitle_service.queues import SUBTITLE_CONTROL_QUEUE
+
+    assert worker.celery_app.conf.worker_prefetch_multiplier == 1
+    schedules = dict(worker.celery_app.conf.beat_schedule)
+    assert schedules
+    assert {item["options"]["queue"] for item in schedules.values()} == {SUBTITLE_CONTROL_QUEUE}
+
+
 def test_runtime_profile_marker_preserves_manual_override_on_automatic_task() -> None:
     task = SimpleNamespace(created_by=encode_auto_youtube_created_by("auto_youtube", auto_publish=None))
 
@@ -52,8 +61,8 @@ def test_active_pipeline_job_reuses_render_when_no_subtitle_is_active() -> None:
 
 
 @pytest.mark.parametrize("override,expected", [(0, 8), (20, 8), (2, 2)])
-def test_cpu_threads_share_the_task_concurrency_budget(monkeypatch: pytest.MonkeyPatch, override: int, expected: int) -> None:
-    monkeypatch.setattr(worker, "get_task_queue_settings", lambda _db: {"max_concurrency": 2})
+def test_cpu_threads_share_the_hatchet_subtitle_slot_budget(monkeypatch: pytest.MonkeyPatch, override: int, expected: int) -> None:
+    monkeypatch.setenv("HATCHET_SUBTITLE_WORKER_SLOTS", "2")
     monkeypatch.setattr(worker.settings, "whisper_cpu_threads", override)
     monkeypatch.setattr(worker.settings, "whisper_num_workers", 1)
     monkeypatch.setattr(worker, "process_cpu_count", lambda: 16)

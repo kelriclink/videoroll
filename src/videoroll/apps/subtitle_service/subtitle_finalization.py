@@ -35,7 +35,6 @@ UniqueStorageKey = Callable[[str, str, str], str]
 LogLine = Callable[[str], None]
 NoArgCallback = Callable[[], None]
 EnsureNotStopped = Callable[[], None]
-UnlockTask = Callable[[Task], None]
 
 
 @dataclass(slots=True)
@@ -308,8 +307,6 @@ def complete_subtitle_handoff(
     soft_sub: bool,
     render_payload: dict[str, Any],
     ensure_not_stopped: EnsureNotStopped,
-    unlock_task: UnlockTask,
-    kick_task_queue: NoArgCallback,
     log: LogLine,
     upload_log: NoArgCallback,
 ) -> dict[str, str]:
@@ -318,16 +315,13 @@ def complete_subtitle_handoff(
     if not automatic_runtime_profile and not burn_in and not soft_sub:
         job.status = SubtitleJobStatus.succeeded
         job.progress = 100
-        unlock_task(task)
-        db.add(task)
         db.add(job)
         db.commit()
         log("subtitle job done (no render configured)")
         upload_log()
-        kick_task_queue()
         return {"status": "ok"}
 
-    existing = (
+    render_job = (
         db.query(RenderJob)
         .filter(
             RenderJob.subtitle_job_id == job.id,
@@ -336,29 +330,23 @@ def complete_subtitle_handoff(
         .order_by(RenderJob.created_at.desc())
         .first()
     )
-    if not existing:
-        db.add(
-            RenderJob(
-                task_id=task.id,
-                subtitle_job_id=job.id,
-                status=RenderJobStatus.queued,
-                progress=0,
-                request_json=render_payload,
-            )
+    if render_job is None:
+        render_job = RenderJob(
+            id=uuid.uuid4(),
+            task_id=task.id,
+            subtitle_job_id=job.id,
+            status=RenderJobStatus.queued,
+            progress=0,
+            request_json=render_payload,
         )
+        db.add(render_job)
 
-    # Render creation and subtitle completion deliberately share one commit:
-    # the scheduler must never observe an incomplete handoff.
+    # Render creation and subtitle completion deliberately share one commit so
+    # the Render Coordinator never observes an incomplete handoff.
     job.status = SubtitleJobStatus.succeeded
     job.progress = 100
-    # Subtitle scheduling no longer owns the render stage. Release its task
-    # lock in the same transaction so the Render Coordinator can claim the
-    # freshly queued RenderJob immediately.
-    unlock_task(task)
-    db.add(task)
     db.add(job)
     db.commit()
-    log("render queued; waiting for task queue")
+    log("render queued; waiting for render worker")
     upload_log()
-    kick_task_queue()
-    return {"status": "ok", "detail": "render queued"}
+    return {"status": "ok", "detail": "render queued", "render_job_id": str(render_job.id)}

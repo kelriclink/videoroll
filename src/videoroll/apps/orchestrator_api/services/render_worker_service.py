@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 from videoroll.apps.outbox.service import create_outbox_event
 from videoroll.apps.orchestrator_api.render_worker_schemas import ArtifactSpec, RenderSpec
 from videoroll.apps.subtitle_service.auto_profile_store import get_auto_profile
+from videoroll.apps.subtitle_service.queues import SUBTITLE_CONTROL_QUEUE
 from videoroll.apps.subtitle_service.processing import (
     probe_video_resolution,
     segments_from_json_data,
@@ -421,14 +422,12 @@ def claim_job(
     jobs = (db.query(RenderJob).join(Task, Task.id == RenderJob.task_id)
         .filter(RenderJob.status == RenderJobStatus.queued,
                 or_(RenderJob.lease_until.is_(None), RenderJob.lease_until <= now),
-                Task.status.notin_([TaskStatus.canceled, TaskStatus.published]),
-                or_(Task.lock_until.is_(None), Task.lock_until <= now, Task.lock_owner.like(f"{REMOTE_LOCK_PREFIX}%")))
-        .order_by(Task.priority.desc(), Task.queue_position.asc().nullslast(), RenderJob.created_at.asc())
+                Task.status.notin_([TaskStatus.canceled, TaskStatus.published]))
+        .order_by(Task.priority.desc(), RenderJob.created_at.asc())
         .with_for_update(skip_locked=True).limit(32).all())
     free_encoders = {str(x).lower() for x in available_encoders} if available_encoders is not None else None
     job = next((candidate for candidate in jobs if _supports_job(worker, candidate, free_encoders)), None)
     if job is None: return None, None
-    task = db.get(Task, job.task_id)
     attempt = int(db.query(func.max(RenderExecution.attempt)).filter(RenderExecution.render_job_id == job.id).scalar() or 0) + 1
     execution = RenderExecution(render_job_id=job.id, worker_id=worker.id, attempt=attempt,
         fence_token=secrets.token_hex(24), state="claimed", transfer_mode="http",
@@ -439,8 +438,6 @@ def claim_job(
     owner = f"{REMOTE_LOCK_PREFIX}{execution.id}"
     job.status = RenderJobStatus.running; job.started_at = job.started_at or now; job.progress = max(int(job.progress or 0), 2)
     job.lease_owner = owner; job.lease_until = execution.lease_until; job.heartbeat_at = now
-    if task is not None:
-        task.lock_owner = owner; task.lock_until = execution.lease_until; db.add(task)
     worker.active_jobs = active + 1; worker.status = "busy"; worker.last_seen_at = now
     db.add_all([job, execution, worker]); db.commit(); db.refresh(execution)
     return execution, spec
@@ -506,9 +503,6 @@ def settle_local_execution(
     execution.error_message = error
     execution.finished_at = now
     job.lease_owner = None; job.lease_until = None; job.heartbeat_at = now
-    task = db.get(Task, job.task_id)
-    if task is not None and task.lock_owner == owner:
-        task.lock_owner = None; task.lock_until = None; db.add(task)
     worker = db.get(RenderWorker, execution.worker_id)
     if worker is not None:
         worker.active_jobs = max(0, int(worker.active_jobs or 0) - 1)
@@ -543,16 +537,29 @@ def complete_execution(db: Session, execution_id: uuid.UUID, payload: Any) -> Re
     task = db.get(Task, job.task_id)
     if task is not None:
         task.status = TaskStatus.rendered
-        if task.lock_owner == f"{REMOTE_LOCK_PREFIX}{execution.id}": task.lock_owner = None; task.lock_until = None
         db.add(task)
     req = job.request_json if isinstance(job.request_json, dict) else {}
     after_render = req.get("after_render") if isinstance(req, dict) else None
     automatic = bool(req.get("runtime_profile")) if "runtime_profile" in req else bool(
         task is not None and parse_auto_youtube_created_by(task.created_by) is not None
     )
-    if automatic or (isinstance(after_render, dict) and after_render.get("publish")):
+    create_outbox_event(
+        db,
+        event_type="workflow.render.finished",
+        aggregate_type="render_job",
+        aggregate_id=job.id,
+        task_name="subtitle_service.push_render_workflow_event",
+        args={
+            "args": [str(job.id), "succeeded", str(execution.id), None],
+            "queue": SUBTITLE_CONTROL_QUEUE,
+        },
+        operation_key=f"workflow-render-finished:{job.id}:succeeded",
+    )
+    # Automatic publishing is the next Hatchet stage after render-wait. Keep
+    # this outbox only for explicit manual after_render publishing.
+    if not automatic and isinstance(after_render, dict) and after_render.get("publish"):
         create_outbox_event(db, event_type="render.after_publish", aggregate_type="render_job", aggregate_id=job.id,
-            task_name="subtitle_service.after_render_publish", args={"args":[str(job.id)],"queue":"subtitle"},
+            task_name="subtitle_service.after_render_publish", args={"args":[str(job.id)],"queue":SUBTITLE_CONTROL_QUEUE},
             operation_key=f"after-render-publish:{job.id}")
     worker = db.get(RenderWorker, execution.worker_id)
     if worker is not None: worker.active_jobs = max(0, int(worker.active_jobs or 0)-1); worker.status = "online"; db.add(worker)
@@ -573,8 +580,6 @@ def fail_execution(db: Session, execution_id: uuid.UUID, payload: Any) -> Render
                 task.status = TaskStatus.failed
                 task.error_code = task.error_code or "RENDER_FAILED"
                 task.error_message = payload.error
-            if task.lock_owner == f"{REMOTE_LOCK_PREFIX}{execution.id}":
-                task.lock_owner = None; task.lock_until = None
             db.add(task)
         if not payload.retryable and job.subtitle_job_id:
             subtitle_job = db.get(SubtitleJob, job.subtitle_job_id)
@@ -582,6 +587,19 @@ def fail_execution(db: Session, execution_id: uuid.UUID, payload: Any) -> Render
                 subtitle_job.status = SubtitleJobStatus.failed
                 subtitle_job.error_message = f"render failed: {payload.error}"
                 db.add(subtitle_job)
+        if not payload.retryable:
+            create_outbox_event(
+                db,
+                event_type="workflow.render.finished",
+                aggregate_type="render_job",
+                aggregate_id=job.id,
+                task_name="subtitle_service.push_render_workflow_event",
+                args={
+                    "args": [str(job.id), "failed", str(execution.id), str(payload.error or "render failed")],
+                    "queue": SUBTITLE_CONTROL_QUEUE,
+                },
+                operation_key=f"workflow-render-finished:{job.id}:failed",
+            )
         db.add(job)
     worker = db.get(RenderWorker, execution.worker_id)
     if worker is not None: worker.active_jobs = max(0, int(worker.active_jobs or 0)-1); worker.status = "online"; db.add(worker)
@@ -612,9 +630,6 @@ def cancel_execution(db: Session, execution_id: uuid.UUID, reason: str) -> Rende
         job.error_message = reason
         job.finished_at = now
         job.lease_owner = None; job.lease_until = None; job.heartbeat_at = now
-        task = db.get(Task, job.task_id)
-        if task is not None and task.lock_owner == owner:
-            task.lock_owner = None; task.lock_until = None; db.add(task)
         db.add(job)
     worker = db.get(RenderWorker, execution.worker_id)
     if worker is not None:
@@ -641,9 +656,6 @@ def requeue_execution(db: Session, execution_id: uuid.UUID, reason: str) -> Rend
         job.lease_owner = None; job.lease_until = None; job.heartbeat_at = now
     else:
         raise HTTPException(409, "render job is owned by another execution")
-    task = db.get(Task, job.task_id)
-    if task is not None and task.lock_owner == owner:
-        task.lock_owner = None; task.lock_until = None; db.add(task)
     worker = db.get(RenderWorker, execution.worker_id)
     if worker is not None:
         worker.active_jobs = max(0, int(worker.active_jobs or 0) - 1)

@@ -10,12 +10,15 @@ from sqlalchemy.orm import Session
 
 from videoroll.apps.orchestrator_api.schemas import TaskCreate, TaskRead
 from videoroll.apps.orchestrator_api.services import asset_service, publishing_service
+from videoroll.apps.outbox.service import create_outbox_event
+from videoroll.apps.subtitle_service.queues import SUBTITLE_CONTROL_QUEUE
 from videoroll.apps.subtitle_service.task_title_store import get_task_display_title_with_storage
 from videoroll.db.models import (
     AppSetting,
     Asset,
     AssetKind,
     Platform,
+    PipelineRun,
     PublishJob,
     PublishState,
     RenderJob,
@@ -120,6 +123,43 @@ def create_task(payload: TaskCreate, *, db: Session) -> Task:
     return task
 
 
+def _enqueue_hatchet_run_cancellations(db: Session, task_ids: list[uuid.UUID]) -> int:
+    if not task_ids:
+        return 0
+    runs: list[PipelineRun] = []
+    for task_id in task_ids:
+        run = (
+            db.query(PipelineRun)
+            .filter(
+                PipelineRun.task_id == task_id,
+                PipelineRun.engine == "hatchet",
+                PipelineRun.external_run_id.is_not(None),
+                PipelineRun.state.notin_(["canceled", "cancel_requested", "launch_failed"]),
+            )
+            .order_by(PipelineRun.created_at.desc())
+            .with_for_update(skip_locked=True)
+            .first()
+        )
+        if run is not None:
+            runs.append(run)
+    for run in runs:
+        create_outbox_event(
+            db,
+            event_type="workflow.cancel",
+            aggregate_type="pipeline_run",
+            aggregate_id=run.id,
+            task_name="subtitle_service.cancel_workflow_run",
+            args={
+                "args": [str(run.id), str(run.external_run_id)],
+                "queue": SUBTITLE_CONTROL_QUEUE,
+            },
+            operation_key=f"workflow-cancel:{run.id}",
+        )
+        run.state = "cancel_requested"
+        db.add(run)
+    return len(runs)
+
+
 def stop_task(task_id: uuid.UUID, *, db: Session) -> Task:
     task = db.get(Task, task_id)
     if not task:
@@ -131,12 +171,8 @@ def stop_task(task_id: uuid.UUID, *, db: Session) -> Task:
 
     task.stopped_status = task.status
     task.status = TaskStatus.canceled
-    # A stopped task must release its task-level queue slot immediately.  The
-    # worker will safely return any in-flight job to queued at its next stop
-    # check, while the queue UI/scheduler no longer treats this task as active.
-    task.lock_owner = None
-    task.lock_until = None
     db.add(task)
+    _enqueue_hatchet_run_cancellations(db, [task.id])
     db.commit()
     db.refresh(task)
     return task
@@ -192,16 +228,9 @@ def stop_all_tasks(*, db: Session) -> tuple[int, int]:
     for task in tasks:
         task.stopped_status = task.status
         task.status = TaskStatus.canceled
-        task.lock_owner = None
-        task.lock_until = None
         db.add(task)
 
-    # Also repair stale queue locks on tasks that were already stopped by a
-    # previous request.  They are not counted as changed tasks, but must never
-    # reserve a concurrency slot.
-    db.query(Task).filter(Task.status == TaskStatus.canceled).update(
-        {"lock_owner": None, "lock_until": None}, synchronize_session=False
-    )
+    _enqueue_hatchet_run_cancellations(db, [task.id for task in tasks])
     db.commit()
     return len(tasks), len(tasks)
 
@@ -224,30 +253,17 @@ def resume_all_stopped_tasks(*, db: Session) -> tuple[int, int, list[Task]]:
 
 
 def auto_youtube_restart_options(task: Task, *, db: Session) -> tuple[bool, bool | None]:
-    """Return the auto-publish option when a fully stopped pipeline must restart.
+    """Return whether a stopped automatic YouTube task should get a fresh Hatchet run.
 
-    A pipeline that still owns a live task lock will observe the restored state
-    itself, so sending another Celery task would duplicate work.
+    The new run is intentionally allowed to reuse an existing SubtitleJob,
+    RenderJob, or final asset. Those business rows are the resume checkpoint;
+    no legacy task lock participates in workflow liveness anymore.
     """
-    if task.source_type.value != "youtube" or task.status not in {TaskStatus.ingested, TaskStatus.downloaded}:
+    del db
+    if task.source_type.value != "youtube" or task.status in {TaskStatus.published, TaskStatus.publishing, TaskStatus.canceled}:
         return False, None
     marker = parse_auto_youtube_created_by(task.created_by)
     if marker is None:
-        return False, None
-    now = datetime.now(timezone.utc)
-    if task.lock_owner and task.lock_until and task.lock_until > now:
-        return False, None
-    subtitle_active = (
-        db.query(SubtitleJob)
-        .filter(SubtitleJob.task_id == task.id, SubtitleJob.status.in_([SubtitleJobStatus.queued, SubtitleJobStatus.running]))
-        .count()
-    )
-    render_active = (
-        db.query(RenderJob)
-        .filter(RenderJob.task_id == task.id, RenderJob.status.in_([RenderJobStatus.queued, RenderJobStatus.running]))
-        .count()
-    )
-    if subtitle_active or render_active:
         return False, None
     return True, marker.get("auto_publish")
 

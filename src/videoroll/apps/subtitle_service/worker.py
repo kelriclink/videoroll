@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import httpx
 import json
 import logging
 import os
@@ -15,7 +16,6 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
-import httpx
 from celery import Celery
 from celery.exceptions import Retry
 from celery.signals import worker_init
@@ -27,9 +27,9 @@ from videoroll.ai.usage import reset_ai_usage_context, set_ai_usage_context
 from videoroll.config import get_orchestrator_settings, get_subtitle_settings
 from videoroll.db.migrate import initialize_database
 from videoroll.db.models import (
-    AppSetting,
     Asset,
     AssetKind,
+    PipelineRun,
     PublishBatch,
     PublishJob,
     PublishState,
@@ -48,7 +48,6 @@ from videoroll.storage.filesystem import FileStore
 from videoroll.apps.security.service_auth import INTERNAL_TOKEN_HEADER, service_token
 from videoroll.utils.auto_youtube import parse_auto_youtube_created_by
 from videoroll.utils.hashing import sha256_file
-from videoroll.utils.task_queue import available_task_queue_capacity, task_queue_slot_reserved_for
 from videoroll.apps.subtitle_service.processing import (
     Segment,
     convert_subtitle_to_srt,
@@ -71,7 +70,6 @@ from videoroll.apps.subtitle_service.processing import (
 )
 from videoroll.apps.subtitle_service.asr_settings_store import get_asr_settings
 from videoroll.apps.subtitle_service.auto_profile_store import get_auto_profile
-from videoroll.apps.subtitle_service.bilibili_tags_store import get_task_bilibili_summary
 from videoroll.apps.subtitle_service.model_downloads import (
     default_model_dir_name,
     download_model_snapshot,
@@ -92,12 +90,9 @@ from videoroll.apps.subtitle_service.subtitle_finalization import (
     persist_subtitle_outputs,
     store_ass_output,
 )
-from videoroll.apps.publish_meta_draft import apply_publish_source_overrides, default_publish_meta
 from videoroll.apps.outbox.dispatcher import dispatch_outbox_events
 from videoroll.apps.outbox.service import create_outbox_event
 from videoroll.apps.outbox.worker_inbox import (
-    OperationHeartbeat,
-    claim_operation,
     claim_outbox_operation,
     finish_operation,
     release_operation,
@@ -113,15 +108,10 @@ from videoroll.apps.orchestrator_api.youtube_downloader import (
     normalize_youtube_subtitle_mode,
     pick_preferred_youtube_subtitle,
 )
-from videoroll.apps.subtitle_service.render_queue_store import TASK_QUEUE_SETTINGS_KEY, get_task_queue_settings
-from videoroll.apps.orchestrator_api.services import render_worker_service
-from videoroll.apps.orchestrator_api.render_worker_schemas import ExecutionHeartbeatRequest
-from videoroll.apps.subtitle_service.queues import SUBTITLE_CONTROL_QUEUE, SUBTITLE_WORK_QUEUE
+from videoroll.apps.subtitle_service.queues import SUBTITLE_CONTROL_QUEUE
 from videoroll.apps.subtitle_service.worker_concurrency import (
     JobLeaseHeartbeat,
     acquire_job_lease,
-    live_leased_task_ids,
-    recover_expired_leases,
     release_job_lease,
 )
 from videoroll.apps.youtube_settings_store import (
@@ -216,12 +206,6 @@ celery_app.conf.update(
     # accumulate indefinitely across many completed tasks.
     worker_max_tasks_per_child=settings.celery_sub_max_tasks_per_child,
     beat_schedule={
-        "subtitle-service-task-queue-tick": {
-            "task": "subtitle_service.task_queue_tick",
-            "schedule": _TASK_QUEUE_TICK_INTERVAL_SECONDS,
-            "args": (),
-            "options": {"queue": SUBTITLE_CONTROL_QUEUE},
-        },
         "subtitle-service-publish-cleanup-retry": {
             "task": "subtitle_service.enqueue_pending_publish_batch_cleanups",
             "schedule": 60.0,
@@ -350,57 +334,12 @@ def _now() -> datetime:
     return datetime.now(tz=timezone.utc)
 
 
-# Task Queue (task-level concurrency)
-TASK_QUEUE_LOCK_OWNER = "subtitle_service.task_queue"
-_TASK_QUEUE_LOCK_TTL = timedelta(seconds=300)
-_TASK_QUEUE_HEARTBEAT_INTERVAL_SECONDS = 30.0
-_TASK_QUEUE_REQUEUE_COUNTDOWN_SECONDS = 10
-_JOB_LEASE_TTL_SECONDS = 900
-_JOB_DISPATCH_PROGRESS = 1
-_JOB_DISPATCH_RETRY_AFTER = timedelta(seconds=60)
-
-
-def _task_queue_expires_at(now: datetime) -> datetime:
-    return now + _TASK_QUEUE_LOCK_TTL
-
-
-def _task_queue_is_task_locked(task: Task, now: datetime) -> bool:
-    return bool(task.lock_owner == TASK_QUEUE_LOCK_OWNER and task.lock_until and task.lock_until > now)
-
-
-def _task_queue_unlock(task: Task) -> None:
-    task.lock_owner = None
-    task.lock_until = None
-
-
-def _kick_task_queue(*, countdown: int | None = None) -> None:
-    options: dict[str, Any] = {"queue": SUBTITLE_CONTROL_QUEUE}
-    if countdown is not None:
-        options["countdown"] = countdown
-    celery_app.send_task("subtitle_service.task_queue_tick", args=[], **options)
-
-
-def _queued_job_dispatch_due(job: SubtitleJob | RenderJob, now: datetime) -> bool:
-    if int(job.progress or 0) != _JOB_DISPATCH_PROGRESS:
-        return True
-    updated_at = job.updated_at
-    if updated_at is None:
-        return True
-    if updated_at.tzinfo is None:
-        updated_at = updated_at.replace(tzinfo=timezone.utc)
-    return updated_at <= now - _JOB_DISPATCH_RETRY_AFTER
-
-
-def _mark_queued_job_dispatched(job: SubtitleJob | RenderJob) -> None:
-    job.progress = _JOB_DISPATCH_PROGRESS
-    # A retry already has progress=1, so SQLAlchemy's onupdate would otherwise
-    # see no change and leave the previous dispatch timestamp in place.
-    job.updated_at = _now()
+_HATCHET_JOB_LEASE_TTL_SECONDS = 60
 
 
 def _asr_cpu_threads(db: Session) -> int:
-    configured = get_task_queue_settings(db)
-    concurrency = max(1, min(32, int(configured.get("max_concurrency", 1))))
+    del db
+    concurrency = max(1, min(32, _positive_int_env("HATCHET_SUBTITLE_WORKER_SLOTS", 1)))
     model_workers = max(1, int(settings.whisper_num_workers))
     shared_budget = max(1, (process_cpu_count() or 1) // (concurrency * model_workers))
     requested = int(settings.whisper_cpu_threads)
@@ -665,90 +604,8 @@ def _pause_subtitle_job_if_task_stopped(db: Session, job_id: uuid.UUID) -> bool:
         job.progress = 0
         job.error_message = _task_queue_join_message(job.error_message, "Task stopped by user; waiting for resume.")
         db.add(job)
-    if task.lock_owner == TASK_QUEUE_LOCK_OWNER:
-        _task_queue_unlock(task)
-        db.add(task)
     db.commit()
-    _kick_task_queue()
     return True
-
-
-def _pause_render_job_if_task_stopped(db: Session, job_id: uuid.UUID) -> bool:
-    job = db.get(RenderJob, job_id)
-    if not job:
-        return False
-    if not _task_is_stopped(db, job.task_id):
-        return False
-    task = db.get(Task, job.task_id)
-    if not task:
-        return False
-    db.refresh(task)
-    if job.status == RenderJobStatus.running:
-        job.status = RenderJobStatus.queued
-        job.progress = 0
-        job.started_at = None
-        job.error_message = _task_queue_join_message(job.error_message, "Task stopped by user; waiting for resume.")
-        db.add(job)
-    if task.lock_owner == TASK_QUEUE_LOCK_OWNER:
-        _task_queue_unlock(task)
-        db.add(task)
-    db.commit()
-    _kick_task_queue()
-    return True
-
-
-def _build_after_render_publish_action(
-    *,
-    task_id: uuid.UUID,
-    cover_key: str | None,
-    profile: dict[str, Any],
-    yt_title: str,
-    yt_desc: str,
-    webpage_url: str,
-    yt_uploader: str = "",
-    db: Session,
-    store: FileStore,
-) -> dict[str, Any] | None:
-    auto_publish_platforms = list(profile.get("auto_publish_platforms") or [])
-    if not profile.get("auto_publish") or not auto_publish_platforms:
-        return None
-
-    meta = default_publish_meta(db)
-    translate_settings = get_translate_settings(db, settings)
-    draft_profile = dict(profile)
-    if bool(profile.get("translate_enabled")) and bool(profile.get("publish_translate_title")):
-        # The final title is generated after subtitle translation, when the
-        # rolling summary is available. Keep this preliminary draft cheap and
-        # overwrite it before the render-triggered publish action runs.
-        draft_profile["publish_translate_title"] = False
-    meta = apply_publish_source_overrides(
-        meta,
-        source_title=yt_title,
-        source_description=yt_desc,
-        source_url=webpage_url,
-        source_uploader=yt_uploader,
-        profile=draft_profile,
-        translate_settings=translate_settings,
-        summary=get_task_bilibili_summary(db, str(task_id)),
-        ai_service=_ai_service(),
-    )
-
-    publish_meta_key = f"meta/{task_id}/publish_meta.json"
-    store.put_bytes(
-        json.dumps(meta, ensure_ascii=False, indent=2).encode("utf-8"),
-        publish_meta_key,
-        content_type="application/json",
-    )
-
-    publish_payload = {
-        "account_id": None,
-        "platforms": auto_publish_platforms,
-        "video_key": None,
-        "cover_key": cover_key,
-        "typeid_mode": profile.get("publish_typeid_mode") or "ai_summary",
-        "meta": None,
-    }
-    return {"publish": True, "publish_payload": publish_payload}
 
 
 def _task_queue_join_message(message: str | None, detail: str, *, limit: int = 2000) -> str:
@@ -763,161 +620,6 @@ def _task_queue_join_message(message: str | None, detail: str, *, limit: int = 2
     if len(out) > limit:
         out = out[: limit - 1] + "…"
     return out
-
-
-def _task_queue_lock_settings_row(db: Session) -> None:
-    """
-    Serialize queue ticks by locking the settings row.
-    This prevents overshooting max_concurrency when multiple ticks run concurrently.
-    """
-    row = db.get(AppSetting, TASK_QUEUE_SETTINGS_KEY)
-    if not row:
-        row = AppSetting(key=TASK_QUEUE_SETTINGS_KEY, value_json={})
-        db.add(row)
-        db.commit()
-    # Best-effort lock (ignored on dialects that don't support it).
-    db.query(AppSetting).filter(AppSetting.key == TASK_QUEUE_SETTINGS_KEY).with_for_update().first()
-
-
-def _task_has_queued_or_running_jobs(db: Session, task_id: uuid.UUID) -> bool:
-    subtitle_jobs = (
-        db.query(SubtitleJob)
-        .filter(SubtitleJob.task_id == task_id, SubtitleJob.status.in_([SubtitleJobStatus.queued, SubtitleJobStatus.running]))
-        .count()
-    )
-    if int(subtitle_jobs or 0) > 0:
-        return True
-    render_jobs = (
-        db.query(RenderJob)
-        .filter(RenderJob.task_id == task_id, RenderJob.status.in_([RenderJobStatus.queued, RenderJobStatus.running]))
-        .count()
-    )
-    return bool(int(render_jobs or 0) > 0)
-
-
-def _cancel_unclaimable_render_job(db: Session, job: RenderJob, task: Task, now: datetime) -> str | None:
-    """Cancel terminal-task renders and duplicate active renders before FFmpeg starts."""
-    if task.status == TaskStatus.published:
-        job.status = RenderJobStatus.canceled
-        job.progress = 0
-        job.finished_at = now
-        job.lease_owner = None
-        job.lease_until = None
-        job.heartbeat_at = now
-        job.error_message = _task_queue_join_message(
-            job.error_message,
-            "Task is already published; stale render job canceled.",
-        )
-        if task.lock_owner == TASK_QUEUE_LOCK_OWNER:
-            _task_queue_unlock(task)
-        db.add(job)
-        db.add(task)
-        return "task already published"
-
-    active_jobs = (
-        db.query(RenderJob)
-        .filter(
-            RenderJob.task_id == task.id,
-            RenderJob.status.in_([RenderJobStatus.queued, RenderJobStatus.running]),
-        )
-        .order_by(RenderJob.created_at.asc(), RenderJob.id.asc())
-        .all()
-    )
-    live_jobs = [
-        active
-        for active in active_jobs
-        if active.status == RenderJobStatus.running and active.lease_until is not None and active.lease_until > now
-    ]
-    canonical = live_jobs[0] if live_jobs else (active_jobs[0] if active_jobs else None)
-    if canonical is None or canonical.id == job.id:
-        return None
-
-    job.status = RenderJobStatus.canceled
-    job.progress = 0
-    job.finished_at = now
-    job.lease_owner = None
-    job.lease_until = None
-    job.heartbeat_at = now
-    job.error_message = _task_queue_join_message(
-        job.error_message,
-        f"Duplicate render job canceled; active render job is {canonical.id}.",
-    )
-    db.add(job)
-    return f"superseded by render job {canonical.id}"
-
-
-class _TaskQueueHeartbeat:
-    def __init__(self, task_id: uuid.UUID):
-        self._task_id = task_id
-        self._stop = threading.Event()
-        self._thr = threading.Thread(target=self._run, name=f"task-queue-hb-{task_id}", daemon=True)
-
-    def start(self) -> None:
-        self._thr.start()
-
-    def stop(self) -> None:
-        self._stop.set()
-        try:
-            self._thr.join(timeout=5.0)
-        except Exception:
-            pass
-
-    def _run(self) -> None:
-        while not self._stop.wait(_TASK_QUEUE_HEARTBEAT_INTERVAL_SECONDS):
-            db = _db()
-            try:
-                now = _now()
-                db.query(Task).filter(Task.id == self._task_id, Task.lock_owner == TASK_QUEUE_LOCK_OWNER).update(
-                    {"lock_until": _task_queue_expires_at(now)},
-                    synchronize_session=False,
-                )
-                db.commit()
-            except Exception:
-                try:
-                    db.rollback()
-                except Exception:
-                    pass
-            finally:
-                db.close()
-
-
-class _RenderExecutionHeartbeat:
-    def __init__(self, execution_id: uuid.UUID, fence_token: str):
-        self._execution_id = execution_id
-        self._fence_token = fence_token
-        self._stop = threading.Event()
-        self._thr = threading.Thread(target=self._run, name=f"render-exec-hb-{execution_id}", daemon=True)
-
-    def start(self) -> None:
-        self._thr.start()
-
-    def stop(self) -> None:
-        self._stop.set()
-        try:
-            self._thr.join(timeout=5.0)
-        except Exception:
-            pass
-
-    def _run(self) -> None:
-        while not self._stop.wait(30.0):
-            db = _db()
-            try:
-                execution = render_worker_service.get_execution(db, self._execution_id)
-                job = db.get(RenderJob, execution.render_job_id)
-                render_worker_service.heartbeat_execution(
-                    db, self._execution_id,
-                    ExecutionHeartbeatRequest(
-                        fence_token=self._fence_token,
-                        progress=int(job.progress or 0) if job is not None else None,
-                        metrics={},
-                    ),
-                )
-            except Exception:
-                try: db.rollback()
-                except Exception: pass
-                logger.exception("failed to heartbeat local render execution %s", self._execution_id)
-            finally:
-                db.close()
 
 
 def _append_log_line(log_path: Path, message: str) -> None:
@@ -1153,19 +855,30 @@ def _download_youtube_subtitle_segments(
 
 @worker_init.connect
 def _on_worker_init(**_kwargs: Any) -> None:
-    """Initialize runtime state and let the scheduler recover expired leases."""
-    # Validate production service identity during an actual worker start, not
-    # while this module is imported by offline tooling or tests.
+    """Initialize runtime state for the remaining Celery control worker."""
+    # Subtitle execution is owned by Hatchet. Celery remains temporarily for
+    # outbox/publish control tasks only.
     _orchestrator_internal_headers()
     try:
         _ensure_db()
-        _kick_task_queue()
     except Exception:
-        logger.exception("subtitle worker initialization failed")
+        logger.exception("subtitle control worker initialization failed")
 
 
-@celery_app.task(name="subtitle_service.process_job", bind=True, acks_late=True, reject_on_worker_lost=True)
-def process_job(self: Any, job_id: str) -> dict[str, str]:
+class SubtitleJobExecutionFailed(RuntimeError):
+    """Terminal subtitle execution failure surfaced to non-Celery executors."""
+
+
+class SubtitleJobLeaseBusy(RuntimeError):
+    """Retryable conflict while another executor still owns a subtitle job lease."""
+
+
+def run_subtitle_job(
+    job_id: str,
+    *,
+    retry_attempt: int = 0,
+    raise_on_error: bool = False,
+) -> dict[str, str]:
     _ensure_db()
     store = FileStore(settings)
     store.ensure_ready()
@@ -1174,7 +887,6 @@ def process_job(self: Any, job_id: str) -> dict[str, str]:
     db = _db()
     log_path: Path | None = None
     log_key: str | None = None
-    hb: _TaskQueueHeartbeat | None = None
     job_hb: JobLeaseHeartbeat | None = None
     lease_owner: str | None = None
     work_root: Path | None = None
@@ -1203,10 +915,7 @@ def process_job(self: Any, job_id: str) -> dict[str, str]:
                 job.error_message,
                 "Task is already published; stale subtitle job skipped.",
             )
-            if task.lock_owner == TASK_QUEUE_LOCK_OWNER:
-                _task_queue_unlock(task)
             db.add(job)
-            db.add(task)
             db.commit()
             return {"status": "skipped", "detail": "task already published"}
         if _pause_subtitle_job_if_task_stopped(db, jid):
@@ -1214,40 +923,40 @@ def process_job(self: Any, job_id: str) -> dict[str, str]:
 
         now = _now()
         if job.status == SubtitleJobStatus.running:
-            return {"status": "in_progress", "detail": "running job awaits completion or lease recovery"}
-        # Serialize worker claiming with dispatch so duplicate broker deliveries
-        # cannot start the same queued job twice.
-        _task_queue_lock_settings_row(db)
+            lease_until = job.lease_until
+            if lease_until is not None and lease_until.tzinfo is None:
+                lease_until = lease_until.replace(tzinfo=timezone.utc)
+            if lease_until is not None and lease_until > now:
+                raise SubtitleJobLeaseBusy(f"subtitle job {job.id} is still leased by {job.lease_owner or 'another worker'}")
+            request = dict(job.request_json) if isinstance(job.request_json, dict) else {}
+            request["resume"] = True
+            job.request_json = request
+            job.status = SubtitleJobStatus.queued
+            job.progress = 0
+            job.lease_owner = None
+            job.lease_until = None
+            job.heartbeat_at = now
+            db.add(job)
+            db.flush()
         db.refresh(job)
         db.refresh(task)
         if job.status != SubtitleJobStatus.queued:
             return {"status": "in_progress", "detail": "job was already claimed or completed"}
-        if task.lock_owner != TASK_QUEUE_LOCK_OWNER:
-            # Do not rewrite an existing running row here.  Only the lease
-            # recovery scheduler may decide that a worker is dead.
-            if job.status == SubtitleJobStatus.running:
-                return {"status": "in_progress", "detail": "running job awaits lease recovery"}
-            _kick_task_queue(countdown=_TASK_QUEUE_REQUEUE_COUNTDOWN_SECONDS)
-            return {"status": "queued", "detail": "waiting for task queue"}
-        if task.lock_until is None or task.lock_until <= now:
-            task.lock_until = _task_queue_expires_at(now)
-            db.add(task)
-
-        # progress=1 is set by the scheduler; bump to >=2 ASAP to mark as claimed by a worker.
+        # Hatchet owns scheduling; the database lease protects against duplicate
+        # delivery or overlapping retries of the same SubtitleJob.
         job.status = SubtitleJobStatus.running
         job.progress = max(int(job.progress or 0), 2)
         db.add(job)
         db.flush()
-        candidate_owner = f"subtitle_service.process_job:{os.getpid()}:{uuid.uuid4().hex[:12]}"
-        if not acquire_job_lease(db, job, candidate_owner, _JOB_LEASE_TTL_SECONDS):
+        lease_ttl_seconds = _HATCHET_JOB_LEASE_TTL_SECONDS
+        candidate_owner = f"hatchet.subtitle_job:{os.getpid()}:{uuid.uuid4().hex[:12]}"
+        if not acquire_job_lease(db, job, candidate_owner, lease_ttl_seconds):
             db.rollback()
-            return {"status": "in_progress", "detail": "job lease is held by another worker"}
+            raise SubtitleJobLeaseBusy(f"subtitle job {job.id} lease claim lost to another worker")
         db.commit()
         lease_owner = candidate_owner
 
-        hb = _TaskQueueHeartbeat(task.id)
-        hb.start()
-        job_hb = JobLeaseHeartbeat(lambda: _db(), job.id, lease_owner, _JOB_LEASE_TTL_SECONDS)
+        job_hb = JobLeaseHeartbeat(lambda: _db(), job.id, lease_owner, lease_ttl_seconds)
         job_hb.start()
 
         _raise_if_task_stopped(db, task.id)
@@ -1552,8 +1261,6 @@ def process_job(self: Any, job_id: str) -> dict[str, str]:
                 soft_sub=soft_sub,
                 render_payload=render_payload,
                 ensure_not_stopped=lambda: _raise_if_task_stopped(db, task.id),
-                unlock_task=_task_queue_unlock,
-                kick_task_queue=_kick_task_queue,
                 log=lambda message: _safe_append_log_line(log_path, message),
                 upload_log=lambda: _safe_upload_log(store, log_path, log_key),
             )
@@ -1706,7 +1413,7 @@ def process_job(self: Any, job_id: str) -> dict[str, str]:
                 translate_cfg=translate_cfg,
                 checkpoint=translation_checkpoint,
                 trace=translation_trace_recorder(db),
-                retry_attempt=int(getattr(self.request, "retries", 0) or 0),
+                retry_attempt=max(0, int(retry_attempt or 0)),
                 database_url=settings.database_url,
                 fresh_translate_settings=_fresh_translate_settings,
                 ai_service_factory=_ai_service,
@@ -1716,7 +1423,7 @@ def process_job(self: Any, job_id: str) -> dict[str, str]:
             req["resume"] = True
             _save_job_request()
             job.error_message = (
-                f"translate failed; celery retrying "
+                f"translate failed; retrying "
                 f"({retry.retry_no}/{retry.max_retries}): {retry.cause}"
             )
             db.add(job)
@@ -1727,11 +1434,7 @@ def process_job(self: Any, job_id: str) -> dict[str, str]:
                 f"{type(retry.cause).__name__}: {retry.cause}",
             )
             _safe_upload_log(store, log_path, log_key)
-            raise self.retry(
-                exc=retry.cause,
-                countdown=retry.countdown,
-                max_retries=retry.max_retries,
-            )
+            raise
 
         translate_enabled = translation_result.enabled
         provider = translation_result.provider
@@ -1826,15 +1529,15 @@ def process_job(self: Any, job_id: str) -> dict[str, str]:
             soft_sub=soft_sub,
             render_payload=render_payload,
             ensure_not_stopped=lambda: _raise_if_task_stopped(db, task.id),
-            unlock_task=_task_queue_unlock,
-            kick_task_queue=_kick_task_queue,
             log=lambda message: _safe_append_log_line(log_path, message),
             upload_log=lambda: _safe_upload_log(store, log_path, log_key),
         )
     except _TaskStopped:
         _pause_subtitle_job_if_task_stopped(db, jid)
         return {"status": "stopped", "detail": "task stopped by user"}
-    except Retry:
+    except SubtitleJobLeaseBusy:
+        raise
+    except TranslationRetryRequired:
         retry_job = db.get(SubtitleJob, jid)
         if retry_job and retry_job.status == SubtitleJobStatus.running:
             retry_job.status = SubtitleJobStatus.queued
@@ -1848,9 +1551,6 @@ def process_job(self: Any, job_id: str) -> dict[str, str]:
             job.error_message = str(e)
             db.add(job)
             task = db.get(Task, job.task_id)
-            if task and task.lock_owner == TASK_QUEUE_LOCK_OWNER:
-                _task_queue_unlock(task)
-                db.add(task)
             if task and not _task_is_stopped(db, task.id) and task.status != TaskStatus.published:
                 task.status = TaskStatus.failed
                 task.error_code = task.error_code or "SUBTITLE_FAILED"
@@ -1860,13 +1560,12 @@ def process_job(self: Any, job_id: str) -> dict[str, str]:
         _safe_append_log_line(log_path, f"ERROR: {type(e).__name__}: {e}")
         _safe_append_log_block(log_path, traceback.format_exc())
         _safe_upload_log(store, log_path, log_key)
-        _kick_task_queue()
+        if raise_on_error:
+            raise SubtitleJobExecutionFailed(str(e)) from e
         return {"status": "error", "detail": str(e)}
     finally:
         if job_hb is not None:
             job_hb.stop()
-        if hb is not None:
-            hb.stop()
         if lease_owner is not None:
             lease_db = _db()
             try:
@@ -1878,714 +1577,6 @@ def process_job(self: Any, job_id: str) -> dict[str, str]:
             finally:
                 lease_db.close()
         reset_ai_usage_context(ai_usage_tokens)
-        db.close()
-        _cleanup_local_work_root(work_root)
-
-
-@celery_app.task(name="subtitle_service.task_queue_tick")
-def task_queue_tick() -> dict[str, Any]:
-    """
-    Task-level scheduler.
-
-    max_concurrency now limits the number of *tasks* (pipelines) that can be in-flight.
-    A task occupies a slot from subtitle-job start until render finishes (or subtitle finishes
-    when no render is configured).
-    """
-    _ensure_db()
-    db = _db()
-    now = _now()
-
-    started_subtitle = 0
-    started_render = 0
-    recovered_subtitle = 0
-    recovered_render = 0
-    recovered_pipeline = 0
-    unlocked_expired = 0
-
-    to_start: list[tuple[str, str]] = []  # ("subtitle"|"render", job_id)
-    to_bootstrap: list[tuple[str, dict[str, Any] | None]] = []
-    try:
-        _task_queue_lock_settings_row(db)
-        cfg = get_task_queue_settings(db)
-        try:
-            max_conc = int(cfg.get("max_concurrency", 1))
-        except Exception:
-            max_conc = 1
-        if max_conc < 0:
-            max_conc = 0
-        recovery = recover_expired_leases(db, now=now, limit=100)
-        recovered_subtitle = recovery.subtitle_requeued
-        recovered_render = recovery.render_requeued
-        live_job_task_ids = live_leased_task_ids(db, now)
-        if max_conc == 0:
-            db.commit()
-            return {
-                "status": "paused",
-                "max_concurrency": str(max_conc),
-                "recovered_subtitle": str(recovered_subtitle),
-                "recovered_render": str(recovered_render),
-            }
-
-        # Clear expired locks to avoid permanent stalls after crashes.
-        try:
-            unlocked_expired = int(
-                db.query(Task)
-                .filter(Task.lock_owner == TASK_QUEUE_LOCK_OWNER, Task.lock_until.is_not(None), Task.lock_until <= now)
-                .update({"lock_owner": None, "lock_until": None}, synchronize_session=False)
-                or 0
-            )
-        except Exception:
-            unlocked_expired = 0
-
-        # A stop request clears the lock in the orchestrator, but this also
-        # repairs terminal-task locks left by an older deployment or tick.
-        try:
-            unlocked_expired += int(
-                db.query(Task)
-                .filter(
-                    Task.status.in_([TaskStatus.canceled, TaskStatus.published]),
-                    Task.lock_owner == TASK_QUEUE_LOCK_OWNER,
-                )
-                .update({"lock_owner": None, "lock_until": None}, synchronize_session=False)
-                or 0
-            )
-        except Exception:
-            pass
-
-        unlocked = or_(
-            Task.lock_owner != TASK_QUEUE_LOCK_OWNER,
-            Task.lock_until.is_(None),
-            Task.lock_until <= now,
-        )
-        schedulable_unlocked = unlocked
-        if live_job_task_ids:
-            schedulable_unlocked = unlocked & Task.id.notin_(live_job_task_ids)
-
-        locked_tasks = (
-            db.query(Task)
-            .filter(
-                Task.status.notin_([TaskStatus.canceled, TaskStatus.published]),
-                Task.lock_owner == TASK_QUEUE_LOCK_OWNER,
-                Task.lock_until.is_not(None),
-                Task.lock_until > now,
-            )
-            .order_by(Task.lock_until.asc())
-            .all()
-        )
-        dispatch_retry_cutoff = now - _JOB_DISPATCH_RETRY_AFTER
-
-        # Phase 1: advance locked tasks (start their next queued job if nothing is running).
-        for t in locked_tasks:
-            tid = t.id
-            has_running = (
-                db.query(SubtitleJob).filter(SubtitleJob.task_id == tid, SubtitleJob.status == SubtitleJobStatus.running).count()
-                + db.query(RenderJob).filter(RenderJob.task_id == tid, RenderJob.status == RenderJobStatus.running).count()
-            )
-            if has_running:
-                continue
-
-            sj = (
-                db.query(SubtitleJob)
-                .filter(SubtitleJob.task_id == tid, SubtitleJob.status == SubtitleJobStatus.queued)
-                .order_by(SubtitleJob.created_at.asc())
-                .with_for_update(skip_locked=True)
-                .first()
-            )
-            if sj and _queued_job_dispatch_due(sj, now):
-                _mark_queued_job_dispatched(sj)
-                db.add(sj)
-                to_start.append(("subtitle", str(sj.id)))
-                started_subtitle += 1
-
-        # Phase 2: choose the next *task* globally, then advance that task's
-        # next stage.  Priority therefore works across subtitle, render, and
-        # recoverable auto-YouTube pipelines instead of only within one job
-        # type.
-        running_tasks = len({task.id for task in locked_tasks} | live_job_task_ids)
-        capacity = available_task_queue_capacity(max_conc, running_tasks)
-        bootstrap_cutoff = now - timedelta(seconds=60)
-
-        render_due_exists = (
-            db.query(RenderJob.id)
-            .filter(
-                RenderJob.task_id == Task.id,
-                RenderJob.status == RenderJobStatus.queued,
-                or_(RenderJob.progress != _JOB_DISPATCH_PROGRESS, RenderJob.updated_at <= dispatch_retry_cutoff),
-            )
-            .exists()
-        )
-        subtitle_due_exists = (
-            db.query(SubtitleJob.id)
-            .filter(
-                SubtitleJob.task_id == Task.id,
-                SubtitleJob.status == SubtitleJobStatus.queued,
-                or_(SubtitleJob.progress != _JOB_DISPATCH_PROGRESS, SubtitleJob.updated_at <= dispatch_retry_cutoff),
-            )
-            .exists()
-        )
-        any_subtitle_job_exists = db.query(SubtitleJob.id).filter(SubtitleJob.task_id == Task.id).exists()
-        any_render_job_exists = db.query(RenderJob.id).filter(RenderJob.task_id == Task.id).exists()
-        auto_youtube_origin = or_(
-            Task.created_by == "auto_youtube",
-            Task.created_by.like("auto_youtube;%"),
-            Task.created_by == "youtube_home_scan",
-            Task.created_by.like("youtube_home_scan;%"),
-            Task.created_by == "youtube_task_restart",
-            Task.created_by.like("youtube_task_restart;%"),
-        )
-        recoverable_pipeline = (
-            (Task.source_type == SourceType.youtube)
-            & Task.status.in_([TaskStatus.ingested, TaskStatus.downloaded])
-            & Task.updated_at.is_not(None)
-            & (Task.updated_at < bootstrap_cutoff)
-            & auto_youtube_origin
-            & ~any_subtitle_job_exists
-            & ~any_render_job_exists
-        )
-
-        for _ in range(capacity):
-            if available_task_queue_capacity(max_conc, running_tasks) <= 0:
-                break
-            # Production sessions disable autoflush. Persist this tick's
-            # previous claims before selecting another unlocked candidate.
-            db.flush()
-            task = (
-                db.query(Task)
-                .filter(
-                    Task.status.notin_([TaskStatus.canceled, TaskStatus.published]),
-                    schedulable_unlocked,
-                    or_(subtitle_due_exists, recoverable_pipeline),
-                )
-                .order_by(Task.priority.desc(), Task.queue_position.asc().nullslast(), Task.created_at.asc())
-                .with_for_update(skip_locked=True)
-                .first()
-            )
-            if task is None:
-                break
-            if _task_queue_is_task_locked(task, now):
-                continue
-            if task.lock_until and task.lock_until > now and task.lock_owner and task.lock_owner != TASK_QUEUE_LOCK_OWNER:
-                continue
-
-            sj = (
-                db.query(SubtitleJob)
-                .filter(
-                    SubtitleJob.task_id == task.id,
-                    SubtitleJob.status == SubtitleJobStatus.queued,
-                    or_(SubtitleJob.progress != _JOB_DISPATCH_PROGRESS, SubtitleJob.updated_at <= dispatch_retry_cutoff),
-                )
-                .order_by(SubtitleJob.created_at.asc())
-                .with_for_update(skip_locked=True)
-                .first()
-            )
-
-            task.lock_owner = TASK_QUEUE_LOCK_OWNER
-            task.lock_until = _task_queue_expires_at(now)
-            db.add(task)
-
-            if sj is not None:
-                _mark_queued_job_dispatched(sj)
-                db.add(sj)
-                to_start.append(("subtitle", str(sj.id)))
-                started_subtitle += 1
-                running_tasks += 1
-                continue
-
-            meta = parse_auto_youtube_created_by(task.created_by)
-            if meta is None:
-                # Defensive: the SQL candidate predicate should make this
-                # impossible, but never reserve a slot for an invalid source.
-                _task_queue_unlock(task)
-                db.add(task)
-                continue
-            overrides: dict[str, Any] | None = None
-            if meta.get("auto_publish") is not None:
-                overrides = {"auto_publish": bool(meta["auto_publish"])}
-            to_bootstrap.append((str(task.id), overrides))
-            recovered_pipeline += 1
-            running_tasks += 1
-
-        db.commit()
-    except Exception:
-        try:
-            db.rollback()
-        except Exception:
-            pass
-        raise
-    finally:
-        db.close()
-
-    if unlocked_expired:
-        publish_queue_changed(settings.redis_url)
-
-    for kind, jid in to_start:
-        if kind == "subtitle":
-            celery_app.send_task("subtitle_service.process_job", args=[jid], queue="subtitle")
-    for task_id, overrides in to_bootstrap:
-        task_args: list[Any] = [task_id]
-        if isinstance(overrides, dict) and overrides:
-            task_args.append(dict(overrides))
-        celery_app.send_task("subtitle_service.auto_youtube_pipeline", args=task_args, queue="subtitle")
-
-    return {
-        "status": "ok",
-        "max_concurrency": str(max_conc),
-        "started_subtitle": str(started_subtitle),
-        "started_render": str(started_render),
-        "recovered_subtitle": str(recovered_subtitle),
-        "recovered_render": str(recovered_render),
-        "recovered_pipeline": str(recovered_pipeline),
-        "unlocked_expired": str(unlocked_expired),
-    }
-
-
-@celery_app.task(name="subtitle_service.render_coordinator_tick")
-def render_coordinator_tick() -> dict[str, Any]:
-    """Compatibility no-op after local rendering moved to standalone workers."""
-    return {"status": "standalone-workers", "claimed": "0"}
-
-
-@celery_app.task(name="subtitle_service.render_queue_tick")
-def render_queue_tick() -> dict[str, Any]:
-    return render_coordinator_tick()
-
-
-@celery_app.task(name="subtitle_service.process_render_job", bind=True, acks_late=True, reject_on_worker_lost=True)
-def process_render_job(self: Any, render_job_id: str, execution_id: str | None = None, fence_token: str | None = None) -> dict[str, Any]:
-    _ensure_db()
-    store = FileStore(settings)
-    store.ensure_ready()
-
-    rid = uuid.UUID(render_job_id)
-    db = _db()
-    log_path: Path | None = None
-    log_key: str | None = None
-    hb: _TaskQueueHeartbeat | None = None
-    job_hb: JobLeaseHeartbeat | None = None
-    execution_hb: _RenderExecutionHeartbeat | None = None
-    lease_owner: str | None = None
-    execution_uuid = uuid.UUID(execution_id) if execution_id else None
-    coordinator_owned = execution_uuid is not None and bool(fence_token)
-    work_root: Path | None = None
-    try:
-        rj = db.get(RenderJob, rid)
-        if not rj:
-            return {"status": "error", "detail": "render job not found"}
-        if not coordinator_owned:
-            # Old deployments may still have a queued Celery render message.
-            # Never let it bypass the Render Coordinator after the cutover.
-            return {"status": "skipped", "detail": "render job must be assigned by render coordinator"}
-
-        task = db.query(Task).filter(Task.id == rj.task_id).with_for_update().first()
-        if not task:
-            return {"status": "error", "detail": "task not found"}
-        db.refresh(rj)
-        if rj.status == RenderJobStatus.succeeded:
-            return {"status": "ok", "detail": "already succeeded"}
-        if rj.status == RenderJobStatus.canceled:
-            return {"status": "skipped", "detail": "canceled"}
-        if _pause_render_job_if_task_stopped(db, rid):
-            return {"status": "stopped", "detail": "task stopped by user"}
-
-        now = _now()
-        skip_detail = _cancel_unclaimable_render_job(db, rj, task, now)
-        if skip_detail:
-            db.commit()
-            return {"status": "skipped", "detail": skip_detail}
-        expected_owner = f"{render_worker_service.REMOTE_LOCK_PREFIX}{execution_uuid}" if coordinator_owned else None
-        if coordinator_owned and rj.lease_owner != expected_owner:
-            return {"status": "skipped", "detail": "render coordinator ownership lost"}
-        if not coordinator_owned and rj.status == RenderJobStatus.running and rj.lease_until is not None and rj.lease_until > now:
-            return {"status": "in_progress", "detail": "render job has a live worker lease"}
-        if not coordinator_owned and task.lock_owner != TASK_QUEUE_LOCK_OWNER:
-            # As with subtitle work, only expired leases may move a running
-            # render back to queued.
-            if rj.status == RenderJobStatus.running:
-                return {"status": "in_progress", "detail": "running render awaits lease recovery"}
-            _kick_task_queue(countdown=_TASK_QUEUE_REQUEUE_COUNTDOWN_SECONDS)
-            return {"status": "queued", "detail": "waiting for task queue"}
-        if not coordinator_owned and (task.lock_until is None or task.lock_until <= now):
-            task.lock_until = _task_queue_expires_at(now)
-            db.add(task)
-            db.commit()
-
-        # Best-effort: if called directly, atomically claim it before render work.
-        if not coordinator_owned and rj.status == RenderJobStatus.queued:
-            rj.status = RenderJobStatus.running
-            rj.started_at = _now()
-        if rj.status == RenderJobStatus.running and rj.started_at is None:
-            rj.started_at = _now()
-
-        if rj.status != RenderJobStatus.running:
-            return {"status": "skipped", "detail": f"unexpected status={rj.status.value}"}
-
-        # Mark as claimed by a worker ASAP so the scheduler can detect orphaned jobs.
-        rj.progress = max(int(rj.progress or 0), 2)
-        db.add(rj)
-        db.flush()
-        if coordinator_owned:
-            lease_owner = expected_owner
-            render_worker_service.heartbeat_execution(
-                db, execution_uuid,
-                ExecutionHeartbeatRequest(fence_token=str(fence_token), progress=max(int(rj.progress or 0), 2), metrics={}),
-            )
-        else:
-            candidate_owner = f"subtitle_service.process_render_job:{os.getpid()}:{uuid.uuid4().hex[:12]}"
-            if not acquire_job_lease(db, rj, candidate_owner, _JOB_LEASE_TTL_SECONDS):
-                db.rollback()
-                return {"status": "in_progress", "detail": "render job lease is held by another worker"}
-            db.commit()
-            lease_owner = candidate_owner
-
-        hb = _TaskQueueHeartbeat(task.id)
-        hb.start()
-        if not coordinator_owned:
-            job_hb = JobLeaseHeartbeat(lambda: _db(), rj.id, lease_owner, _JOB_LEASE_TTL_SECONDS)
-            job_hb.start()
-        else:
-            execution_hb = _RenderExecutionHeartbeat(execution_uuid, str(fence_token))
-            execution_hb.start()
-
-        _raise_if_task_stopped(db, task.id)
-
-        req = rj.request_json if isinstance(rj.request_json, dict) else {}
-        input_key = str(req.get("input_key") or "").strip()
-        srt_key = str(req.get("srt_key") or "").strip()
-        ass_key = str(req.get("ass_key") or "").strip() or None
-        automatic_render = _uses_runtime_auto_profile(task, req)
-        if automatic_render:
-            # Render is its own configurable box.  Old queued render rows may
-            # contain stale snapshots; ignore them for automatic tasks and read
-            # the current profile exactly when this worker claims the stage.
-            render_profile = dict(get_auto_profile(db))
-            burn_in = bool(render_profile.get("burn_in"))
-            soft_sub = bool(render_profile.get("soft_sub"))
-            render_cfg = {
-                "video_codec": render_profile.get("video_codec") or "av1",
-                "use_intel_gpu": bool(render_profile.get("use_intel_gpu")),
-                "video_preset": render_profile.get("video_preset"),
-                "video_crf": render_profile.get("video_crf"),
-                "ass_style": render_profile.get("ass_style") or "clean_white",
-                "primary_font_scale_percent": render_profile.get("primary_font_scale_percent") or 100,
-                "secondary_font_scale_percent": render_profile.get("secondary_font_scale_percent") or 100,
-            }
-        else:
-            burn_in = bool(req.get("burn_in"))
-            soft_sub = bool(req.get("soft_sub"))
-            render_cfg = req.get("render") if isinstance(req.get("render"), dict) else {}
-
-        video_codec = str(render_cfg.get("video_codec") or "av1").strip().lower() or "av1"
-        use_intel_gpu = bool(render_cfg.get("use_intel_gpu"))
-        video_preset = render_cfg.get("video_preset")
-        # Wire compatibility keeps the historical video_crf name; internally it
-        # is encoder quality (CRF for software encoders, QP/global_quality for QSV).
-        video_quality = render_cfg.get("video_crf")
-
-        if not input_key:
-            raise ValueError("render job missing input_key")
-        if not srt_key:
-            raise ValueError("render job missing srt_key")
-        if burn_in and not automatic_render and not ass_key:
-            raise ValueError("render job missing ass_key for burn_in")
-
-        work_root = Path(settings.work_dir) / "render" / str(rj.id)
-        work_root.mkdir(parents=True, exist_ok=True)
-        log_path = work_root / "job.log"
-        log_key = f"log/{task.id}/render_{rj.id}.log"
-        try:
-            _ensure_log_asset(db, task.id, log_key)
-            db.commit()
-        except Exception:
-            db.rollback()
-
-        _seed_log_from_store(store, log_key, log_path)
-        _safe_append_log_line(
-            log_path,
-            f"render job start: render_job_id={rj.id} task_id={task.id} burn_in={burn_in} soft_sub={soft_sub} codec={video_codec} intel_gpu={use_intel_gpu} preset={video_preset} quality={video_quality}",
-        )
-        _safe_upload_log(store, log_path, log_key)
-
-        last_live_upload_at = 0.0
-        last_live_upload_size = -1
-        last_db_heartbeat_at = 0.0
-
-        def _heartbeat_db(now: float) -> None:
-            nonlocal last_db_heartbeat_at
-            if now - last_db_heartbeat_at < 10.0:
-                return
-            try:
-                rj.updated_at = _now()
-                db.add(rj)
-                db.commit()
-                last_db_heartbeat_at = now
-            except Exception:
-                try:
-                    db.rollback()
-                except Exception:
-                    pass
-
-        def _live_upload_log() -> None:
-            nonlocal last_live_upload_at, last_live_upload_size
-            if log_path is None or not log_key:
-                return
-            try:
-                now = time.monotonic()
-                _heartbeat_db(now)
-                if now - last_live_upload_at < 2.0:
-                    return
-                size = log_path.stat().st_size if log_path.exists() else 0
-                if last_live_upload_size >= 0 and size - last_live_upload_size < 4096 and now - last_live_upload_at < 10.0:
-                    return
-                _safe_upload_log(store, log_path, log_key)
-                last_live_upload_at = now
-                last_live_upload_size = size
-            except Exception:
-                pass
-
-        video_path = store.path_for(input_key)
-        srt_path = store.path_for(srt_key)
-        ass_path = (
-            work_root / "subtitle_runtime.ass"
-            if automatic_render and burn_in
-            else (store.path_for(ass_key) if burn_in and ass_key else work_root / "subtitle_zh.ass")
-        )
-
-        _safe_append_log_line(log_path, f"storage input ready: input_key={input_key}")
-        _safe_upload_log(store, log_path, log_key)
-        rj.progress = max(int(rj.progress or 0), 5)
-        db.add(rj)
-        db.commit()
-        _safe_append_log_line(log_path, f"storage subtitle ready: srt_key={srt_key}")
-        _safe_upload_log(store, log_path, log_key)
-        if burn_in and ass_key:
-            _safe_append_log_line(log_path, f"storage ASS ready: ass_key={ass_key}")
-            _safe_upload_log(store, log_path, log_key)
-        _safe_append_log_line(log_path, "storage inputs ready")
-        _safe_upload_log(store, log_path, log_key)
-
-        subtitle_job: SubtitleJob | None = None
-        if rj.subtitle_job_id:
-            subtitle_job = db.get(SubtitleJob, rj.subtitle_job_id)
-            if subtitle_job:
-                subtitle_job.progress = max(int(subtitle_job.progress or 0), 81)
-                db.add(subtitle_job)
-
-        if automatic_render and burn_in:
-            runtime_segments: list[Segment] = []
-            if subtitle_job and isinstance(subtitle_job.request_json, dict):
-                artifacts = subtitle_job.request_json.get("artifacts")
-                if isinstance(artifacts, dict):
-                    segments_key = str(artifacts.get("final_subtitle_segments_key") or "").strip()
-                    if segments_key:
-                        try:
-                            segments_payload = json.loads(store.path_for(segments_key).read_text(encoding="utf-8"))
-                            runtime_segments = segments_from_json_data(segments_payload)
-                        except Exception:
-                            runtime_segments = []
-            if not runtime_segments:
-                runtime_segments = srt_to_segments(srt_path.read_text(encoding="utf-8"))
-            play_res_x, play_res_y = probe_video_resolution(settings.ffmpeg_path, video_path)
-            secondary_line_scale = 0.68 if any(seg.secondary_text for seg in runtime_segments) else None
-            ass_path.write_text(
-                segments_to_ass(
-                    runtime_segments,
-                    style_name=str(render_cfg.get("ass_style") or "clean_white"),
-                    play_res_x=play_res_x,
-                    play_res_y=play_res_y,
-                    secondary_line_scale=secondary_line_scale,
-                    primary_font_scale_percent=int(render_cfg.get("primary_font_scale_percent") or 100),
-                    secondary_font_scale_percent=int(render_cfg.get("secondary_font_scale_percent") or 100),
-                ),
-                encoding="utf-8",
-            )
-            _safe_append_log_line(log_path, "runtime ASS generated from current render box settings")
-
-        rj.progress = max(int(rj.progress or 0), 10)
-        db.add(rj)
-        db.commit()
-
-        if burn_in:
-            rj.progress = max(int(rj.progress or 0), 20)
-            if subtitle_job:
-                subtitle_job.progress = max(int(subtitle_job.progress or 0), 85)
-                db.add(subtitle_job)
-            db.add(rj)
-            db.commit()
-
-            out_video = work_root / "video_burnin.mp4"
-            _safe_append_log_line(log_path, "ffmpeg: burn-in subtitles")
-            render_burn_in(
-                settings.ffmpeg_path,
-                video_path,
-                ass_path,
-                out_video,
-                video_codec=video_codec,
-                use_intel_gpu=use_intel_gpu,
-                intel_gpu_render_device=settings.intel_gpu_render_device,
-                preset=video_preset,
-                crf=video_quality,
-                log_path=log_path,
-                live_upload_cb=_live_upload_log,
-            )
-            _safe_upload_log(store, log_path, log_key)
-            final_sha = sha256_file(out_video)
-            final_key = _unique_storage_key(
-                f"final/{task.id}/video_burnin",
-                final_sha,
-                ".mp4",
-            )
-            final_size = out_video.stat().st_size
-            store.promote_file(out_video, final_key)
-            db.add(
-                Asset(
-                    task_id=task.id,
-                    kind=AssetKind.video_final,
-                    storage_key=final_key,
-                    sha256=final_sha,
-                    size_bytes=final_size,
-                )
-            )
-
-        if soft_sub:
-            rj.progress = max(int(rj.progress or 0), 60)
-            if subtitle_job:
-                subtitle_job.progress = max(int(subtitle_job.progress or 0), 90)
-                db.add(subtitle_job)
-            db.add(rj)
-            db.commit()
-
-            out_video = work_root / "video_softsub.mkv"
-            _safe_append_log_line(log_path, "ffmpeg: mux soft subtitles")
-            mux_soft_sub(settings.ffmpeg_path, video_path, srt_path, out_video, log_path=log_path, live_upload_cb=_live_upload_log)
-            _safe_upload_log(store, log_path, log_key)
-            final_sha = sha256_file(out_video)
-            final_key = _unique_storage_key(
-                f"final/{task.id}/video_softsub",
-                final_sha,
-                ".mkv",
-            )
-            final_size = out_video.stat().st_size
-            store.promote_file(out_video, final_key)
-            db.add(
-                Asset(
-                    task_id=task.id,
-                    kind=AssetKind.video_final,
-                    storage_key=final_key,
-                    sha256=final_sha,
-                    size_bytes=final_size,
-                )
-            )
-
-        _raise_if_task_stopped(db, task.id)
-        if burn_in or soft_sub:
-            task.status = TaskStatus.rendered
-            db.add(task)
-
-        if subtitle_job:
-            subtitle_job.status = SubtitleJobStatus.succeeded
-            subtitle_job.progress = 100
-            subtitle_job.error_message = None
-            db.add(subtitle_job)
-
-        rj.status = RenderJobStatus.succeeded
-        rj.progress = 100
-        rj.finished_at = _now()
-        db.add(rj)
-        # The completed render and its auto-publish instruction are one
-        # transaction.  The dispatcher, rather than this worker, performs the
-        # broker delivery so a broker outage cannot lose auto publishing.
-        after_render = req.get("after_render") if isinstance(req, dict) else None
-        if automatic_render or (isinstance(after_render, dict) and after_render.get("publish")):
-            create_outbox_event(
-                db,
-                event_type="render.after_publish",
-                aggregate_type="render_job",
-                aggregate_id=rj.id,
-                task_name="subtitle_service.after_render_publish",
-                args={"args": [str(rj.id)], "queue": "subtitle"},
-                operation_key=f"after-render-publish:{rj.id}",
-            )
-        db.commit()
-        if coordinator_owned:
-            if execution_hb is not None:
-                execution_hb.stop()
-                execution_hb = None
-            render_worker_service.settle_local_execution(db, execution_uuid, str(fence_token), succeeded=True)
-        _safe_append_log_line(log_path, "render job done")
-        _safe_upload_log(store, log_path, log_key)
-
-        if task.lock_owner == TASK_QUEUE_LOCK_OWNER:
-            _task_queue_unlock(task)
-            db.add(task)
-            db.commit()
-
-        _kick_task_queue()
-        return {"status": "ok"}
-    except _TaskStopped:
-        _pause_render_job_if_task_stopped(db, rid)
-        return {"status": "stopped", "detail": "task stopped by user"}
-    except Retry:
-        retry_job = db.get(RenderJob, rid)
-        if retry_job and retry_job.status == RenderJobStatus.running:
-            retry_job.status = RenderJobStatus.queued
-            db.add(retry_job)
-            db.commit()
-        raise
-    except Exception as e:
-        rj = db.get(RenderJob, rid)
-        if rj:
-            rj.status = RenderJobStatus.failed
-            rj.error_message = str(e)
-            rj.finished_at = _now()
-            db.add(rj)
-            task = db.get(Task, rj.task_id)
-            if task:
-                if not _task_is_stopped(db, task.id) and task.status != TaskStatus.published:
-                    task.status = TaskStatus.failed
-                    task.error_code = task.error_code or "RENDER_FAILED"
-                    task.error_message = str(e)
-                if task.lock_owner == TASK_QUEUE_LOCK_OWNER:
-                    _task_queue_unlock(task)
-                db.add(task)
-        if rj and rj.subtitle_job_id:
-            sj = db.get(SubtitleJob, rj.subtitle_job_id)
-            if sj:
-                sj.status = SubtitleJobStatus.failed
-                sj.error_message = f"render failed: {e}"
-                db.add(sj)
-        db.commit()
-        if coordinator_owned:
-            if execution_hb is not None:
-                execution_hb.stop()
-                execution_hb = None
-            try:
-                render_worker_service.settle_local_execution(
-                    db, execution_uuid, str(fence_token), succeeded=False, error=str(e)
-                )
-            except Exception:
-                logger.exception("failed to settle local render execution %s", execution_uuid)
-        _safe_append_log_line(log_path, f"ERROR: {type(e).__name__}: {e}")
-        _safe_append_log_block(log_path, traceback.format_exc())
-        _safe_upload_log(store, log_path, log_key)
-        _kick_task_queue()
-        return {"status": "error", "detail": str(e)}
-    finally:
-        if execution_hb is not None:
-            execution_hb.stop()
-        if job_hb is not None:
-            job_hb.stop()
-        if hb is not None:
-            hb.stop()
-        if lease_owner is not None and not coordinator_owned:
-            lease_db = _db()
-            try:
-                release_job_lease(lease_db, rid, lease_owner)
-                lease_db.commit()
-            except Exception:
-                lease_db.rollback()
-                logger.exception("failed to release render job lease (job_id=%s)", rid)
-            finally:
-                lease_db.close()
         db.close()
         _cleanup_local_work_root(work_root)
 
@@ -2604,39 +1595,17 @@ def _after_render_publish_impl(render_job_id: str) -> dict[str, Any]:
             return {"status": "error", "detail": "task not found"}
         req = rj.request_json if isinstance(rj.request_json, dict) else {}
         after_render = req.get("after_render") if isinstance(req.get("after_render"), dict) else {}
-        automatic_publish = _uses_runtime_auto_profile(task, req, after_render)
+        if not after_render.get("publish"):
+            return {"status": "skipped"}
+        publish_payload = after_render.get("publish_payload") or after_render.get("payload") or {}
+        if not isinstance(publish_payload, dict):
+            return {"status": "error", "detail": "after_render.publish_payload must be an object"}
+        publish_payload = dict(publish_payload)
         store = FileStore(settings)
         store.ensure_ready()
 
         from videoroll.apps.orchestrator_api.schemas import PublishAllRequest
-        from videoroll.apps.orchestrator_api.services.publishing_service import (
-            build_auto_publish_after_render,
-            publish_all,
-        )
-
-        if automatic_publish:
-            publish_profile = dict(get_auto_profile(db))
-            if not bool(publish_profile.get("auto_publish")):
-                return {"status": "skipped", "detail": "automatic publishing is disabled in the current publish box"}
-            if not list(publish_profile.get("auto_publish_platforms") or []):
-                return {"status": "skipped", "detail": "no automatic publish platforms are selected"}
-            final_asset = (
-                db.query(Asset)
-                .filter(Asset.task_id == task.id, Asset.kind == AssetKind.video_final)
-                .order_by(Asset.created_at.desc())
-                .first()
-            )
-            if final_asset is None:
-                return {"status": "skipped", "detail": "current render box produced no final video"}
-            action = build_auto_publish_after_render(task, db=db, store=store)
-            publish_payload = dict(action.get("publish_payload") or {})
-        else:
-            if not after_render.get("publish"):
-                return {"status": "skipped"}
-            publish_payload = after_render.get("publish_payload") or after_render.get("payload") or {}
-            if not isinstance(publish_payload, dict):
-                return {"status": "error", "detail": "after_render.publish_payload must be an object"}
-            publish_payload = dict(publish_payload)
+        from videoroll.apps.orchestrator_api.services.publishing_service import publish_all
 
         # Let publish_all resolve the latest rendered asset unless a manual
         # request explicitly pinned one.
@@ -2714,6 +1683,178 @@ def _release_outbox_worker_operation(operation_key: str, owner: str, error: obje
         db.commit()
     finally:
         db.close()
+
+
+@celery_app.task(
+    name="subtitle_service.cancel_workflow_run",
+    bind=True,
+    max_retries=20,
+    acks_late=True,
+    reject_on_worker_lost=True,
+)
+def cancel_workflow_run(
+    self: Any,
+    pipeline_run_id: str,
+    external_run_id: str,
+    outbox_event_id: str | None = None,
+) -> dict[str, Any]:
+    """Durably cancel one Hatchet run after a VideoRoll task is stopped."""
+    _ensure_db()
+    operation = _claim_outbox_worker_operation(
+        outbox_event_id,
+        worker_name="subtitle_service.cancel_workflow_run",
+        lease_seconds=120,
+    )
+    if isinstance(operation, dict):
+        return operation
+    if operation is None:
+        raise ValueError("workflow cancellation must be delivered through the durable outbox")
+    operation_key, owner = operation
+    try:
+        orchestrator_settings = get_orchestrator_settings()
+        headers = {INTERNAL_TOKEN_HEADER: service_token(orchestrator_settings)}
+        with httpx.Client(timeout=15.0, headers=headers) as client:
+            response = client.post(
+                f"{orchestrator_settings.workflow_service_url.rstrip('/')}/runs/{external_run_id}/cancel"
+            )
+            response.raise_for_status()
+    except Exception as exc:
+        _release_outbox_worker_operation(operation_key, owner, exc)
+        raise self.retry(exc=exc, countdown=min(300, 2 ** min(int(self.request.retries or 0) + 1, 8)))
+
+    db = _db()
+    try:
+        try:
+            row = db.get(PipelineRun, uuid.UUID(str(pipeline_run_id)))
+        except (TypeError, ValueError):
+            row = None
+        if row is not None:
+            row.state = "canceled"
+            row.error_message = None
+            row.finished_at = _now()
+            db.add(row)
+            db.commit()
+    finally:
+        db.close()
+
+    result = {
+        "status": "ok",
+        "pipeline_run_id": str(pipeline_run_id),
+        "external_run_id": str(external_run_id),
+    }
+    _finish_outbox_worker_operation(operation_key, result)
+    return result
+
+
+@celery_app.task(
+    name="subtitle_service.push_render_workflow_event",
+    bind=True,
+    max_retries=20,
+    acks_late=True,
+    reject_on_worker_lost=True,
+)
+def push_render_workflow_event(
+    self: Any,
+    render_job_id: str,
+    status: str,
+    execution_id: str,
+    error: str | None = None,
+    outbox_event_id: str | None = None,
+) -> dict[str, Any]:
+    """Durably bridge a committed render terminal state into Hatchet."""
+    _ensure_db()
+    operation = _claim_outbox_worker_operation(
+        outbox_event_id,
+        worker_name="subtitle_service.push_render_workflow_event",
+        lease_seconds=120,
+    )
+    if isinstance(operation, dict):
+        return operation
+    if operation is None:
+        raise ValueError("render workflow events must be delivered through the durable outbox")
+    operation_key, owner = operation
+    payload = {
+        "render_job_id": str(render_job_id),
+        "status": str(status),
+        "execution_id": str(execution_id),
+        "error": str(error) if error else None,
+    }
+    try:
+        orchestrator_settings = get_orchestrator_settings()
+        headers = {INTERNAL_TOKEN_HEADER: service_token(orchestrator_settings)}
+        with httpx.Client(timeout=15.0, headers=headers) as client:
+            response = client.post(
+                f"{orchestrator_settings.workflow_service_url.rstrip('/')}/events/render-finished",
+                json=payload,
+            )
+            response.raise_for_status()
+    except Exception as exc:
+        _release_outbox_worker_operation(operation_key, owner, exc)
+        raise self.retry(exc=exc, countdown=min(300, 2 ** min(int(self.request.retries or 0) + 1, 8)))
+
+    result = {
+        "status": "ok",
+        "render_status": str(status),
+        "render_job_id": str(render_job_id),
+        "execution_id": str(execution_id),
+        "error": str(error) if error else None,
+    }
+    _finish_outbox_worker_operation(operation_key, result)
+    return result
+
+
+@celery_app.task(
+    name="subtitle_service.push_publish_workflow_event",
+    bind=True,
+    max_retries=20,
+    acks_late=True,
+    reject_on_worker_lost=True,
+)
+def push_publish_workflow_event(
+    self: Any,
+    publish_batch_id: str,
+    status: str,
+    task_id: str,
+    outbox_event_id: str | None = None,
+) -> dict[str, Any]:
+    """Durably bridge a committed publish-batch terminal state into Hatchet."""
+    _ensure_db()
+    operation = _claim_outbox_worker_operation(
+        outbox_event_id,
+        worker_name="subtitle_service.push_publish_workflow_event",
+        lease_seconds=120,
+    )
+    if isinstance(operation, dict):
+        return operation
+    if operation is None:
+        raise ValueError("publish workflow events must be delivered through the durable outbox")
+    operation_key, owner = operation
+    payload = {
+        "publish_batch_id": str(publish_batch_id),
+        "status": str(status),
+        "task_id": str(task_id),
+    }
+    try:
+        orchestrator_settings = get_orchestrator_settings()
+        headers = {INTERNAL_TOKEN_HEADER: service_token(orchestrator_settings)}
+        with httpx.Client(timeout=15.0, headers=headers) as client:
+            response = client.post(
+                f"{orchestrator_settings.workflow_service_url.rstrip('/')}/events/publish-finished",
+                json=payload,
+            )
+            response.raise_for_status()
+    except Exception as exc:
+        _release_outbox_worker_operation(operation_key, owner, exc)
+        raise self.retry(exc=exc, countdown=min(300, 2 ** min(int(self.request.retries or 0) + 1, 8)))
+
+    result = {
+        "status": "ok",
+        "publish_status": str(status),
+        "publish_batch_id": str(publish_batch_id),
+        "task_id": str(task_id),
+    }
+    _finish_outbox_worker_operation(operation_key, result)
+    return result
 
 
 @celery_app.task(name="subtitle_service.after_render_publish")
@@ -2981,442 +2122,4 @@ def recover_publish_dispatches() -> dict[str, int]:
         db.rollback()
         raise
     finally:
-        db.close()
-
-
-@celery_app.task(name="subtitle_service.auto_youtube_pipeline", bind=True, acks_late=True, reject_on_worker_lost=True)
-def auto_youtube_pipeline(self: Any, task_id: str, overrides: dict[str, Any] | None = None) -> dict[str, str]:
-    """
-    One-click pipeline:
-      - download YouTube video (+ metadata + cover)
-      - generate translated subtitles
-      - burn-in (and/or soft-sub) according to auto profile
-      - publish to bilibili (optional, according to auto profile)
-    """
-    _ensure_db()
-    store = FileStore(settings)
-    store.ensure_ready()
-
-    orch_base = str(settings.orchestrator_url or "").strip().rstrip("/") or "http://localhost:8000"
-
-    db = _db()
-    hb: _TaskQueueHeartbeat | None = None
-    pipeline_hb: OperationHeartbeat | None = None
-    pipeline_operation_key: str | None = None
-    pipeline_operation_owner: str | None = None
-    acquired_lock = False
-    ai_usage_tokens: tuple[Any, Any] | None = None
-    try:
-        tid = uuid.UUID(task_id)
-        pipeline_args: list[Any] = [str(tid)]
-        if isinstance(overrides, dict) and overrides:
-            pipeline_args.append(dict(overrides))
-        task = db.get(Task, tid)
-        if not task:
-            raise RuntimeError("task not found")
-        ai_usage_tokens = set_ai_usage_context(task_id=task.id, operation="auto_youtube")
-        if task.source_type.value != "youtube":
-            raise RuntimeError("task is not a youtube source")
-        _raise_if_task_stopped(db, task.id)
-
-        now = _now()
-        _task_queue_lock_settings_row(db)
-        cfg = get_task_queue_settings(db)
-        try:
-            max_conc = int(cfg.get("max_concurrency", 1))
-        except Exception:
-            max_conc = 1
-        if max_conc < 0:
-            max_conc = 0
-        if max_conc == 0:
-            celery_app.send_task(
-                "subtitle_service.auto_youtube_pipeline",
-                args=pipeline_args,
-                queue="subtitle",
-                countdown=_TASK_QUEUE_REQUEUE_COUNTDOWN_SECONDS,
-            )
-            return {"status": "queued", "task_id": str(tid), "detail": "task queue paused"}
-
-        locked_task_ids = [
-            row[0]
-            for row in (
-                db.query(Task.id)
-                .filter(Task.lock_owner == TASK_QUEUE_LOCK_OWNER, Task.lock_until.is_not(None), Task.lock_until > now)
-                .order_by(Task.lock_until.asc(), Task.created_at.asc())
-                .all()
-            )
-        ]
-        has_queue_jobs = _task_has_queued_or_running_jobs(db, tid)
-        if _task_queue_is_task_locked(task, now):
-            # Self-heal old over-bootstrapped locks: only the first N locked tasks keep their slot.
-            if (
-                task.status in [TaskStatus.ingested, TaskStatus.downloaded]
-                and not has_queue_jobs
-                and not task_queue_slot_reserved_for(task.id, locked_task_ids, max_conc)
-            ):
-                _task_queue_unlock(task)
-                db.add(task)
-                db.commit()
-                celery_app.send_task(
-                    "subtitle_service.auto_youtube_pipeline",
-                    args=pipeline_args,
-                    queue="subtitle",
-                    countdown=_TASK_QUEUE_REQUEUE_COUNTDOWN_SECONDS,
-                )
-                return {"status": "queued", "task_id": str(tid), "detail": "waiting for task queue"}
-        else:
-            # Claim a task slot before doing anything heavy (download/ASR/render).
-            if len(locked_task_ids) >= int(max_conc):
-                celery_app.send_task(
-                    "subtitle_service.auto_youtube_pipeline",
-                    args=pipeline_args,
-                    queue="subtitle",
-                    countdown=_TASK_QUEUE_REQUEUE_COUNTDOWN_SECONDS,
-                )
-                return {"status": "queued", "task_id": str(tid), "detail": "waiting for task queue"}
-
-            task.lock_owner = TASK_QUEUE_LOCK_OWNER
-            task.lock_until = _task_queue_expires_at(now)
-            db.add(task)
-            db.commit()
-            acquired_lock = True
-        if task.lock_until is None or task.lock_until <= now:
-            # Refresh a stale/expired lock to avoid accidental eviction mid-pipeline.
-            task.lock_until = _task_queue_expires_at(now)
-            db.add(task)
-
-        # Release the settings-row FOR UPDATE lock before YouTube download or
-        # any other slow network work. Tasks dispatched by task_queue_tick
-        # already own their task slot, so the branches above may otherwise
-        # leave this transaction open for the full download and block every
-        # later queue tick.
-        db.commit()
-
-        pipeline_meta = parse_auto_youtube_created_by(task.created_by) or {}
-        pipeline_run_id = str(pipeline_meta.get("run_id") or "legacy").strip() or "legacy"
-        pipeline_operation_key = f"auto-youtube-pipeline:{task.id}:{pipeline_run_id}"
-        pipeline_operation_owner = f"subtitle_service.auto_youtube_pipeline:{os.getpid()}:{uuid.uuid4().hex[:12]}"
-        claim = claim_operation(
-            db,
-            pipeline_operation_key,
-            pipeline_operation_owner,
-            3600,
-            request_json={"task_id": str(task.id), "run_id": pipeline_run_id},
-        )
-        db.commit()
-        if not claim.acquired:
-            if claim.result_json is not None:
-                return claim.result_json
-            return {"status": "in_progress", "task_id": str(tid), "detail": "automatic pipeline is already running"}
-
-        pipeline_hb = OperationHeartbeat(
-            lambda: _db(),
-            pipeline_operation_key,
-            pipeline_operation_owner,
-            3600,
-        )
-        pipeline_hb.start()
-
-        def _finish_pipeline(result: dict[str, Any]) -> dict[str, Any]:
-            finish_db = _db()
-            try:
-                finish_operation(finish_db, pipeline_operation_key, result)
-                finish_db.commit()
-            finally:
-                finish_db.close()
-            return result
-
-        def _release_pipeline(error: object) -> None:
-            release_db = _db()
-            try:
-                release_operation(release_db, pipeline_operation_key, pipeline_operation_owner, error)
-                release_db.commit()
-            finally:
-                release_db.close()
-
-        hb = _TaskQueueHeartbeat(task.id)
-        hb.start()
-
-        # Future boxes deliberately do not inherit this point-in-time profile.
-        # It is only a local snapshot for decisions made in this pipeline stage;
-        # ASR/translate/render/publish each reread the profile when they start.
-        profile = dict(get_auto_profile(db))
-
-        # Download YouTube video + cover + metadata (idempotent).
-        yt: dict[str, Any] = {}
-        yt_retries_done = int(getattr(self.request, "retries", 0) or 0)
-        yt_max_retries = 2
-
-        def _youtube_retry_countdown(retry_no: int) -> float:
-            return min(30.0, float(3 * (2**retry_no)))
-
-        while True:
-            try:
-                timeout_seconds = float(getattr(settings, "orchestrator_timeout_seconds", 1800.0) or 1800.0)
-                with httpx.Client(
-                    timeout=httpx.Timeout(timeout_seconds, connect=10.0),
-                    headers=_orchestrator_internal_headers(),
-                ) as client:
-                    resp = client.post(f"{orch_base}/tasks/{tid}/actions/youtube_download")
-                    resp.raise_for_status()
-                    yt = resp.json() if resp.content else {}
-                break
-            except httpx.HTTPStatusError as e:
-                status_code = int(getattr(e.response, "status_code", 0) or 0)
-                if status_code in {409, 429, 500, 502, 503, 504} and yt_retries_done < yt_max_retries:
-                    retry_no = yt_retries_done + 1
-                    try:
-                        task.retry_count = int(task.retry_count or 0) + 1
-                        msg = (e.response.text or "").strip()
-                        if len(msg) > 300:
-                            msg = msg[:299] + "..."
-                        task.error_message = f"youtube_download failed; celery retrying ({retry_no}/{yt_max_retries}): {status_code} {msg}".strip()
-                        db.add(task)
-                        db.commit()
-                    except Exception:
-                        db.rollback()
-                    raise self.retry(exc=e, countdown=_youtube_retry_countdown(retry_no), max_retries=yt_max_retries)
-                raise
-            except httpx.HTTPError as e:
-                if yt_retries_done < yt_max_retries:
-                    retry_no = yt_retries_done + 1
-                    try:
-                        task.retry_count = int(task.retry_count or 0) + 1
-                        task.error_message = f"youtube_download request failed; celery retrying ({retry_no}/{yt_max_retries}): {type(e).__name__}: {e}"
-                        db.add(task)
-                        db.commit()
-                    except Exception:
-                        db.rollback()
-                    raise self.retry(exc=e, countdown=_youtube_retry_countdown(retry_no), max_retries=yt_max_retries)
-                raise
-
-        if yt_retries_done:
-            try:
-                task.error_message = None
-                db.add(task)
-                db.commit()
-            except Exception:
-                db.rollback()
-
-        _raise_if_task_stopped(db, task.id)
-
-        yt_meta = yt.get("metadata") if isinstance(yt, dict) else {}
-        if not isinstance(yt_meta, dict):
-            yt_meta = {}
-        yt_title = str(yt_meta.get("title") or "").strip()
-        yt_desc = str(yt_meta.get("description") or "")
-        webpage_url = str(yt_meta.get("webpage_url") or task.source_url or "").strip()
-        yt_uploader = str(yt_meta.get("uploader") or yt_meta.get("channel") or yt_meta.get("uploader_id") or "").strip()
-
-        video_key = None
-        if isinstance(yt, dict):
-            va = yt.get("video_asset")
-            if isinstance(va, dict):
-                video_key = str(va.get("storage_key") or "").strip() or None
-        if not video_key:
-            latest_video = (
-                db.query(Asset)
-                .filter(Asset.task_id == tid, Asset.kind == AssetKind.video_raw)
-                .order_by(Asset.created_at.desc())
-                .first()
-            )
-            video_key = latest_video.storage_key if latest_video else None
-        if not video_key:
-            raise RuntimeError("no raw video asset found after youtube_download")
-
-        cover_key = None
-        if isinstance(yt, dict):
-            ca = yt.get("cover_asset")
-            if isinstance(ca, dict):
-                cover_key = str(ca.get("storage_key") or "").strip() or None
-        if not cover_key:
-            latest_cover = (
-                db.query(Asset)
-                .filter(Asset.task_id == tid, Asset.kind == AssetKind.cover_image)
-                .order_by(Asset.created_at.desc())
-                .first()
-            )
-            cover_key = latest_cover.storage_key if latest_cover else None
-
-        # Queue the next box without freezing ASR/translation/render settings.
-        # The worker identifies this as an automatic task from task.created_by
-        # and reads the then-current profile at each stage boundary.
-        final_asset = (
-            db.query(Asset)
-            .filter(Asset.task_id == tid, Asset.kind == AssetKind.video_final)
-            .order_by(Asset.created_at.desc())
-            .first()
-        )
-        if not final_asset:
-            req = {
-                "task_id": str(tid),
-                "resume": task.status == TaskStatus.failed,
-                "runtime_profile": True,
-                "input": {"type": "storage", "key": video_key},
-                "asr": {"engine": "auto", "language": "auto", "model": None},
-                "translate": {},
-                "output": {"formats": ["srt"], "render": {}},
-                "output_prefix": f"sub/{tid}/",
-                # Always evaluate the publish box after the render boundary.
-                # Its current config decides whether anything is actually submitted.
-                "after_render": {"publish": True, "runtime_profile": True},
-            }
-
-            active_job = _active_pipeline_job(db, tid)
-            if active_job is not None:
-                existing_kind, existing_job_id = active_job
-                _kick_task_queue()
-                return _finish_pipeline(
-                    {
-                        "status": "ok",
-                        "task_id": str(tid),
-                        "detail": f"reused active {existing_kind} job {existing_job_id}",
-                    }
-                )
-
-            job = SubtitleJob(task_id=tid, request_json=req, status=SubtitleJobStatus.queued, progress=0)
-            db.add(job)
-            db.commit()
-            db.refresh(job)
-
-            _kick_task_queue()
-            return _finish_pipeline({"status": "ok", "task_id": str(tid), "detail": f"queued subtitle job {job.id}"})
-
-        # A pre-existing final video can jump straight to the publish box. Read
-        # only the configuration that exists when it reaches this box; legacy
-        # task metadata/Celery overrides are historical snapshots, not controls.
-        profile = dict(get_auto_profile(db))
-        result_data: dict[str, Any] = {}
-        auto_publish_platforms = list(profile.get("auto_publish_platforms") or [])
-        if profile.get("auto_publish") and auto_publish_platforms:
-            task = db.get(Task, tid)
-            _raise_if_task_stopped(db, tid)
-            if not final_asset:
-                raise RuntimeError("no final video asset found; enable burn_in/soft_sub in auto profile")
-
-            meta = default_publish_meta(db)
-            translate_settings = get_translate_settings(db, settings)
-            meta = apply_publish_source_overrides(
-                meta,
-                source_title=yt_title,
-                source_description=yt_desc,
-                source_url=webpage_url,
-                source_uploader=yt_uploader,
-                profile=profile,
-                translate_settings=translate_settings,
-                summary=get_task_bilibili_summary(db, str(tid)),
-                ai_service=_ai_service(),
-            )
-
-            publish_meta_key = f"meta/{tid}/publish_meta.json"
-            store.put_bytes(
-                json.dumps(meta, ensure_ascii=False, indent=2).encode("utf-8"),
-                publish_meta_key,
-                content_type="application/json",
-            )
-
-            publish_payload = {
-                "account_id": None,
-                "platforms": auto_publish_platforms,
-                "video_key": final_asset.storage_key,
-                "cover_key": cover_key,
-                "typeid_mode": profile.get("publish_typeid_mode") or "ai_summary",
-                "meta": None,
-            }
-
-            from videoroll.apps.orchestrator_api.schemas import PublishAllRequest
-            from videoroll.apps.orchestrator_api.services.publishing_service import publish_all
-
-            result_data = publish_all(
-                tid,
-                PublishAllRequest.model_validate(publish_payload),
-                get_orchestrator_settings(),
-                db,
-                store,
-            )
-
-            # Log partial failures but don't fail the task if at least one platform succeeded.
-            errors = result_data.get("errors", {}) if isinstance(result_data, dict) else {}
-            if errors:
-                logger.warning("auto_youtube_pipeline partial failure for task %s: %s", tid, errors)
-            if not result_data.get("has_any_accepted", False) and errors:
-                error_details = "; ".join(f"{p}: {msg}" for p, msg in errors.items())
-                return _finish_pipeline({
-                    "status": "error",
-                    "task_id": str(tid),
-                    "detail": f"all platforms failed: {error_details}",
-                    "platforms": result_data,
-                })
-
-        return _finish_pipeline({"status": "ok", "task_id": str(tid), "platforms": result_data})
-    except _TaskStopped:
-        task = db.get(Task, uuid.UUID(task_id))
-        if task and task.lock_owner == TASK_QUEUE_LOCK_OWNER:
-            _task_queue_unlock(task)
-            db.add(task)
-            db.commit()
-        _kick_task_queue()
-        result = {"status": "stopped", "task_id": task_id, "detail": "task stopped by user"}
-        if pipeline_operation_key and pipeline_operation_owner:
-            return _finish_pipeline(result)
-        return result
-    except Retry as exc:
-        if pipeline_operation_key and pipeline_operation_owner:
-            _release_pipeline(exc)
-        raise
-    except Exception as e:
-        task = db.get(Task, uuid.UUID(task_id))
-        if task:
-            if _task_is_stopped(db, task.id):
-                _kick_task_queue()
-                result = {"status": "stopped", "task_id": str(task.id), "detail": "task stopped by user"}
-                if pipeline_operation_key and pipeline_operation_owner:
-                    return _finish_pipeline(result)
-                return result
-            if task.status == TaskStatus.ready_for_review and task.error_code == "AI_REVIEW_REJECTED":
-                _kick_task_queue()
-                result = {"status": "review_rejected", "task_id": str(task.id), "detail": task.error_message or str(e)}
-                if pipeline_operation_key and pipeline_operation_owner:
-                    return _finish_pipeline(result)
-                return result
-            task.status = TaskStatus.failed
-            task.error_message = str(e)
-            db.add(task)
-            db.commit()
-        if pipeline_operation_key and pipeline_operation_owner:
-            _release_pipeline(e)
-        _kick_task_queue()
-        raise
-    finally:
-        if pipeline_hb is not None:
-            pipeline_hb.stop()
-        if hb is not None:
-            hb.stop()
-        try:
-            if acquired_lock:
-                tid2 = uuid.UUID(task_id)
-                task2 = db.get(Task, tid2)
-                if task2 and task2.lock_owner == TASK_QUEUE_LOCK_OWNER:
-                    inflight = (
-                        db.query(SubtitleJob)
-                        .filter(
-                            SubtitleJob.task_id == tid2,
-                            SubtitleJob.status.in_([SubtitleJobStatus.queued, SubtitleJobStatus.running]),
-                        )
-                        .count()
-                        + db.query(RenderJob)
-                        .filter(RenderJob.task_id == tid2, RenderJob.status.in_([RenderJobStatus.queued, RenderJobStatus.running]))
-                        .count()
-                    )
-                    if not inflight:
-                        _task_queue_unlock(task2)
-                        db.add(task2)
-                        db.commit()
-                        _kick_task_queue()
-        except Exception:
-            try:
-                db.rollback()
-            except Exception:
-                pass
-        reset_ai_usage_context(ai_usage_tokens)
         db.close()

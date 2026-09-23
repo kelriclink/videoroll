@@ -6,16 +6,16 @@ import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 from videoroll.apps.orchestrator_api.render_worker_schemas import (
-    ExecutionAdminActionRequest, ExecutionFailRequest, ExecutionHeartbeatRequest, WorkerControlRequest, WorkerEnrollRequest, WorkerHeartbeatRequest, WorkerRegisterRequest,
+    ExecutionAdminActionRequest, ExecutionCompleteRequest, ExecutionFailRequest, ExecutionHeartbeatRequest, WorkerControlRequest, WorkerEnrollRequest, WorkerHeartbeatRequest, WorkerRegisterRequest,
 )
 from videoroll.apps.orchestrator_api.services import render_worker_service
 from videoroll.db.base import Base
-from videoroll.db.models import Asset, RenderExecution, RenderJob, RenderJobStatus, RenderWorker, RenderWorkerEnrollment, SourceLicense, SourceType, Task, TaskStatus
+from videoroll.db.models import AppSetting, Asset, AssetKind, OutboxEvent, RenderExecution, RenderJob, RenderJobStatus, RenderWorker, RenderWorkerEnrollment, SourceLicense, SourceType, Task, TaskStatus
 
 @pytest.fixture
 def db() -> Session:
     engine = create_engine("sqlite:///:memory:")
-    Base.metadata.create_all(engine, tables=[Task.__table__, Asset.__table__, RenderJob.__table__, RenderWorker.__table__, RenderExecution.__table__, RenderWorkerEnrollment.__table__])
+    Base.metadata.create_all(engine, tables=[Task.__table__, Asset.__table__, RenderJob.__table__, RenderWorker.__table__, RenderExecution.__table__, RenderWorkerEnrollment.__table__, OutboxEvent.__table__, AppSetting.__table__])
     session = sessionmaker(bind=engine)()
     try:
         yield session
@@ -117,6 +117,106 @@ def test_retryable_failure_requeues_existing_render_job(db: Session) -> None:
     assert job.status == RenderJobStatus.queued
     assert job.retry_count == 1
     assert job.lease_owner is None
+
+    assert db.query(OutboxEvent).filter(OutboxEvent.event_type == "workflow.render.finished").count() == 0
+
+
+def test_render_success_writes_durable_hatchet_event_outbox(db: Session) -> None:
+    worker = make_worker(db); job = make_job(db)
+    execution, _ = render_worker_service.claim_job(db, store(), worker.id, ["http"])
+    assert execution is not None
+    output = Asset(
+        task_id=job.task_id,
+        kind=AssetKind.video_final,
+        storage_key=f"final/{job.task_id}/video.mp4",
+    )
+    db.add(output); db.commit()
+
+    render_worker_service.complete_execution(
+        db,
+        execution.id,
+        ExecutionCompleteRequest(
+            fence_token=execution.fence_token,
+            output_asset_id=output.id,
+            output={"fps": 90.0},
+        ),
+    )
+
+    event = db.query(OutboxEvent).filter(OutboxEvent.event_type == "workflow.render.finished").one()
+    assert event.aggregate_id == str(job.id)
+    assert event.task_name == "subtitle_service.push_render_workflow_event"
+    assert event.args_json["queue"] == "subtitle-control"
+    assert event.args_json["args"][:3] == [str(job.id), "succeeded", str(execution.id)]
+
+
+def test_nonretryable_render_failure_writes_terminal_hatchet_event(db: Session) -> None:
+    worker = make_worker(db); job = make_job(db)
+    execution, _ = render_worker_service.claim_job(db, store(), worker.id, ["http"])
+    assert execution is not None
+
+    render_worker_service.fail_execution(
+        db,
+        execution.id,
+        ExecutionFailRequest(
+            fence_token=execution.fence_token,
+            error="encoder permanently failed",
+            retryable=False,
+        ),
+    )
+
+    event = db.query(OutboxEvent).filter(OutboxEvent.event_type == "workflow.render.finished").one()
+    assert event.args_json["queue"] == "subtitle-control"
+    assert event.args_json["args"] == [
+        str(job.id),
+        "failed",
+        str(execution.id),
+        "encoder permanently failed",
+    ]
+
+
+def test_automatic_render_does_not_create_legacy_publish_outbox(db: Session) -> None:
+    worker = make_worker(db); job = make_job(db)
+    execution, _ = render_worker_service.claim_job(db, store(), worker.id, ["http"])
+    assert execution is not None
+    # Completion reads the current runtime-profile flag. Set it after claim so
+    # this test stays focused on the terminal outbox route instead of ASS rebuild.
+    job.request_json = {**dict(job.request_json or {}), "runtime_profile": True}
+    db.add(job); db.commit()
+    output = Asset(task_id=job.task_id, kind=AssetKind.video_final, storage_key=f"final/{job.task_id}/video.mp4")
+    db.add(output); db.commit()
+
+    render_worker_service.complete_execution(
+        db,
+        execution.id,
+        ExecutionCompleteRequest(fence_token=execution.fence_token, output_asset_id=output.id),
+    )
+
+    assert db.query(OutboxEvent).filter(OutboxEvent.event_type == "render.after_publish").count() == 0
+    assert db.query(OutboxEvent).filter(OutboxEvent.event_type == "workflow.render.finished").count() == 1
+
+
+def test_manual_after_render_publish_outbox_uses_control_queue(db: Session) -> None:
+    worker = make_worker(db); job = make_job(db)
+    execution, _ = render_worker_service.claim_job(db, store(), worker.id, ["http"])
+    assert execution is not None
+    job.request_json = {
+        **dict(job.request_json or {}),
+        "runtime_profile": False,
+        "after_render": {"publish": True, "publish_payload": {"platforms": ["bilibili"]}},
+    }
+    db.add(job); db.commit()
+    output = Asset(task_id=job.task_id, kind=AssetKind.video_final, storage_key=f"final/{job.task_id}/video.mp4")
+    db.add(output); db.commit()
+
+    render_worker_service.complete_execution(
+        db,
+        execution.id,
+        ExecutionCompleteRequest(fence_token=execution.fence_token, output_asset_id=output.id),
+    )
+
+    publish_event = db.query(OutboxEvent).filter(OutboxEvent.event_type == "render.after_publish").one()
+    assert publish_event.task_name == "subtitle_service.after_render_publish"
+    assert publish_event.args_json["queue"] == "subtitle-control"
 
 def test_expired_execution_is_reconciled_and_releases_worker_capacity(db: Session) -> None:
     worker = make_worker(db); make_job(db)
