@@ -21,6 +21,8 @@ x-subtitle-build: &subtitle-build
 x-application-security: &application-security
   user: "${APP_UID:-10001}:${APP_GID:-10001}"
   init: true
+  dns:
+    - "1.1.1.1"
   extra_hosts:
     - "host.docker.internal:host-gateway"
   security_opt:
@@ -66,6 +68,7 @@ x-subtitle-environment: &subtitle-environment
   YOUTUBE_PROXY: ${YOUTUBE_PROXY:-}
   YOUTUBE_EXTRACTOR_ARGS_JSON: ${YOUTUBE_EXTRACTOR_ARGS_JSON:-}
   TASK_QUEUE_TICK_INTERVAL_SECONDS: ${TASK_QUEUE_TICK_INTERVAL_SECONDS:-10}
+  HATCHET_SUBTITLE_JOB_LEASE_TTL_SECONDS: ${HATCHET_SUBTITLE_JOB_LEASE_TTL_SECONDS:-300}
   HATCHET_SUBTITLE_WORKER_SLOTS: ${HATCHET_SUBTITLE_WORKER_SLOTS:-1}
   SUBTITLE_DICTIONARY_DATA_DIR: ${SUBTITLE_DICTIONARY_DATA_DIR:-/storage/state/dictionaries}
   INTEL_GPU_RENDER_DEVICE: ${INTEL_GPU_RENDER_DEVICE:-/dev/dri/renderD128}

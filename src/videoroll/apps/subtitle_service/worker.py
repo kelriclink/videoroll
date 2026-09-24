@@ -341,7 +341,16 @@ def _now() -> datetime:
     return datetime.now(tz=timezone.utc)
 
 
-_HATCHET_JOB_LEASE_TTL_SECONDS = 60
+def _subtitle_job_lease_ttl_seconds() -> int:
+    return max(
+        60,
+        min(
+            3600,
+            _positive_int_env("HATCHET_SUBTITLE_JOB_LEASE_TTL_SECONDS", 300),
+        ),
+    )
+
+
 
 
 def _asr_cpu_threads(db: Session) -> int:
@@ -970,7 +979,7 @@ def run_subtitle_job(
         job.progress = max(int(job.progress or 0), 2)
         db.add(job)
         db.flush()
-        lease_ttl_seconds = _HATCHET_JOB_LEASE_TTL_SECONDS
+        lease_ttl_seconds = _subtitle_job_lease_ttl_seconds()
         candidate_owner = f"hatchet.subtitle_job:{os.getpid()}:{uuid.uuid4().hex[:12]}"
         if not acquire_job_lease(db, job, candidate_owner, lease_ttl_seconds):
             db.rollback()

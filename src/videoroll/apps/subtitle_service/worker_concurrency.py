@@ -507,7 +507,7 @@ class JobLeaseHeartbeat:
             self._thread.join(timeout=2.0)
 
     def _run(self) -> None:
-        interval = max(1.0, self._ttl_seconds / 3)
+        interval = min(30.0, max(1.0, self._ttl_seconds / 3))
         while not self._stop.wait(interval):
             db = self._session_factory()
             try:
