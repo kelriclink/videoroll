@@ -11,7 +11,11 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.orm import Session
 
-from videoroll.apps.orchestrator_api.schemas import RemoteJobResponse, SubtitleActionRequest
+from videoroll.apps.orchestrator_api.schemas import (
+    RemoteJobResponse,
+    SubtitleActionRequest,
+    SubtitleRetranslateRequest,
+)
 from videoroll.apps.orchestrator_api.services import subtitle_service
 from videoroll.apps.subtitle_service import main as subtitle_api
 from videoroll.apps.subtitle_service.schemas import SubtitleJobCreate
@@ -125,6 +129,132 @@ def test_automatic_job_infers_runtime_profile_but_explicit_manual_request_does_n
     assert manual_job is not None
     assert manual_job.request_json["runtime_profile"] is False
     assert manual_job.request_json["asr"]["engine"] == "openvino"
+
+
+def test_selective_retranslation_reuses_aligned_snapshot_and_context(
+    db: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task = _task(db, TaskStatus.subtitle_ready)
+    previous_request = {
+        "task_id": str(task.id),
+        "resume": False,
+        "runtime_profile": False,
+        "input": {"type": "storage", "key": f"raw/{task.id}/source.mp4"},
+        "asr": {"engine": "faster-whisper", "language": "en", "model": None},
+        "translate": {
+            "enabled": True,
+            "provider": "openai",
+            "target_lang": "zh",
+            "style": "自然",
+            "bilingual": False,
+        },
+        "output": {"formats": ["srt", "ass"], "render": {"burn_in": False}},
+        "output_prefix": f"sub/{task.id}/",
+        "artifacts": {
+            "translated_segments_key": f"sub/{task.id}/translated.json",
+            "translation_context_key": f"sub/{task.id}/context.json",
+            "subtitle_quality_key": f"sub/{task.id}/quality.json",
+        },
+    }
+    previous = SubtitleJob(
+        task_id=task.id,
+        status=SubtitleJobStatus.succeeded,
+        request_json=previous_request,
+    )
+    db.add(previous)
+    db.commit()
+
+    forwarded: list[dict] = []
+
+    def forward(_settings, request):
+        forwarded.append(request)
+        return RemoteJobResponse(job_id=uuid.uuid4(), status="queued")
+
+    monkeypatch.setattr(subtitle_service, "enqueue_subtitle_service_job_request", forward)
+
+    result = subtitle_service.enqueue_selective_subtitle_retranslation(
+        task.id,
+        SubtitleRetranslateRequest(indices=[5, 2, 5, 0, -1]),
+        settings=_settings(),
+        db=db,
+    )
+
+    assert result.status == "queued"
+    assert len(forwarded) == 1
+    request = forwarded[0]
+    assert request["resume"] is True
+    assert request["asr"] == previous_request["asr"]
+    assert request["translate"] == previous_request["translate"]
+    assert request["output"] == previous_request["output"]
+    assert request["selective_retranslate"] == {
+        "indices": [2, 5],
+        "base_translated_segments_key": f"sub/{task.id}/translated.json",
+        "translation_context_key": f"sub/{task.id}/context.json",
+    }
+
+
+def test_selective_retranslation_requires_aligned_translation_snapshot(
+    db: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task = _task(db, TaskStatus.subtitle_ready)
+    db.add(
+        SubtitleJob(
+            task_id=task.id,
+            status=SubtitleJobStatus.succeeded,
+            request_json={
+                "task_id": str(task.id),
+                "input": {"type": "storage", "key": f"raw/{task.id}/source.mp4"},
+                "translate": {"enabled": True, "provider": "openai"},
+                "artifacts": {"translation_context_key": f"sub/{task.id}/context.json"},
+            },
+        )
+    )
+    db.commit()
+    forwarded: list[dict] = []
+    monkeypatch.setattr(
+        subtitle_service,
+        "enqueue_subtitle_service_job_request",
+        lambda _settings, request: forwarded.append(request),
+    )
+
+    with pytest.raises(HTTPException) as caught:
+        subtitle_service.enqueue_selective_subtitle_retranslation(
+            task.id,
+            SubtitleRetranslateRequest(indices=[1]),
+            settings=_settings(),
+            db=db,
+        )
+
+    assert caught.value.status_code == 409
+    assert "aligned translation snapshots" in str(caught.value.detail)
+    assert forwarded == []
+
+
+def test_selective_retranslation_rejects_published_task(
+    db: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task = _task(db, TaskStatus.published)
+    forwarded: list[dict] = []
+    monkeypatch.setattr(
+        subtitle_service,
+        "enqueue_subtitle_service_job_request",
+        lambda _settings, request: forwarded.append(request),
+    )
+
+    with pytest.raises(HTTPException) as caught:
+        subtitle_service.enqueue_selective_subtitle_retranslation(
+            task.id,
+            SubtitleRetranslateRequest(indices=[1]),
+            settings=_settings(),
+            db=db,
+        )
+
+    assert caught.value.status_code == 409
+    assert "published" in str(caught.value.detail)
+    assert forwarded == []
 
 
 def test_subtitle_relay_preserves_a_conflict_detected_by_the_internal_api() -> None:
