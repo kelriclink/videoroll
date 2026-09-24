@@ -55,6 +55,7 @@ from videoroll.apps.subtitle_service.processing import (
     mux_soft_sub,
     probe_video_resolution,
     reconcile_overlapping_asr_segments,
+    refine_asr_segment_timing,
     render_burn_in,
     srt_to_segments,
     segments_from_json_data,
@@ -78,11 +79,17 @@ from videoroll.apps.subtitle_service.model_downloads import (
 from videoroll.apps.subtitle_service.rag import translation_trace_recorder
 from videoroll.apps.subtitle_service.translate_settings_store import get_translate_settings
 from videoroll.apps.subtitle_service.translation_checkpoint import TranslationCheckpointStore
+from videoroll.apps.subtitle_service.translation_context import context_memory_is_empty
 from videoroll.apps.subtitle_service.translation_stage import (
     TranslationRetryRequired,
     run_translation_stage,
 )
 from videoroll.apps.subtitle_service.translation_postprocess import postprocess_translation
+from videoroll.apps.subtitle_service.subtitle_readability import (
+    derive_readability_profile,
+    optimize_subtitle_readability,
+)
+from videoroll.apps.subtitle_service.subtitle_quality import analyze_subtitle_quality
 from videoroll.apps.subtitle_service.subtitle_finalization import (
     build_render_job_payload,
     complete_subtitle_handoff,
@@ -501,11 +508,11 @@ def _run_asr_stage(
             batch_size=int(asr_defaults.get("external_whisper_batch_size") or 1),
             vad_filter=bool(asr_defaults.get("external_whisper_vad_enabled", True)),
             vad_threshold=float(asr_defaults.get("external_whisper_vad_threshold") or 0.5),
-            min_silence_duration_ms=int(asr_defaults.get("external_whisper_min_silence_ms") or 500),
-            speech_pad_ms=int(asr_defaults.get("external_whisper_speech_pad_ms") or 180),
-            condition_on_previous_text=bool(asr_defaults.get("external_whisper_condition_on_previous_text", False)),
-            max_segment_seconds=float(asr_defaults.get("external_whisper_max_segment_seconds") or 6.0),
-            max_segment_chars=int(asr_defaults.get("external_whisper_max_segment_chars") or 80),
+            min_silence_duration_ms=int(asr_defaults.get("external_whisper_min_silence_ms") or 2000),
+            speech_pad_ms=int(asr_defaults.get("external_whisper_speech_pad_ms") or 400),
+            condition_on_previous_text=bool(asr_defaults.get("external_whisper_condition_on_previous_text", True)),
+            max_segment_seconds=float(asr_defaults.get("external_whisper_max_segment_seconds") or 12.0),
+            max_segment_chars=int(asr_defaults.get("external_whisper_max_segment_chars") or 120),
         )
     elif engine == "groq-whisper":
         groq_api_key = str(asr_defaults.get("groq_whisper_api_key") or "").strip()
@@ -570,6 +577,21 @@ def _run_asr_stage(
             "asr timeline reconciled before translation: "
             f"overlaps={overlap_count} segments={len(raw_segments)}->{len(reconciled)}",
         )
+
+    if engine != "mock" and reconciled:
+        refined = refine_asr_segment_timing(audio_path, reconciled)
+        timing_changes = sum(
+            1
+            for before, after in zip(reconciled, refined)
+            if abs(float(before.start) - float(after.start)) > 0.01
+            or abs(float(before.end) - float(after.end)) > 0.01
+        )
+        if timing_changes:
+            _safe_append_log_line(
+                log_path,
+                f"asr timing refined before translation: changed={timing_changes}/{len(refined)}",
+            )
+        reconciled = refined
     return reconciled
 
 
@@ -973,7 +995,10 @@ def run_subtitle_job(
         audio_path = work_root / "audio.wav"
         segments_path = work_root / "segments.json"
         subtitle_segments_path = work_root / "subtitle_segments.json"
+        translated_segments_path = work_root / "translated_segments.json"
         translation_checkpoint_path = work_root / "translation_checkpoint.json"
+        translation_context_path = work_root / "translation_context.json"
+        subtitle_quality_path = work_root / "subtitle_quality.json"
         srt_path = work_root / "subtitle_zh.srt"
         ass_path = work_root / "subtitle_zh.ass"
 
@@ -983,6 +1008,17 @@ def run_subtitle_job(
         ass_key: str | None = None
 
         resume = bool(req.get("resume"))
+        selective_cfg = req.get("selective_retranslate") if isinstance(req.get("selective_retranslate"), dict) else {}
+        selective_indices = sorted(
+            {
+                int(index)
+                for index in (selective_cfg.get("indices") or [])
+                if str(index).strip().isdigit() and int(index) > 0
+            }
+        )
+        selective_mode = bool(selective_indices)
+        if selective_mode:
+            resume = True
         auto_task_meta = parse_auto_youtube_created_by(task.created_by)
         automatic_runtime_profile = _uses_runtime_auto_profile(task, req)
 
@@ -1179,7 +1215,7 @@ def run_subtitle_job(
             _clear_groq_asr_checkpoint()
 
         srt_asset = _download_latest_asset(AssetKind.subtitle_srt, srt_path) if resume else None
-        if resume and srt_asset:
+        if resume and srt_asset and not selective_mode:
             srt_key = srt_asset.storage_key
             translation_checkpoint.clear()
             _clear_groq_asr_checkpoint()
@@ -1403,6 +1439,38 @@ def run_subtitle_job(
         if skip_translation_for_target_subtitle:
             translate_cfg["enabled"] = False
 
+        selective_base_translations: list[Segment] | None = None
+        selective_context_memory: dict[str, object] | None = None
+        selective_summary = ""
+        if selective_mode:
+            base_key = str(selective_cfg.get("base_translated_segments_key") or "").strip()
+            if not base_key:
+                raise RuntimeError("selective retranslation requires base_translated_segments_key")
+            store.download_file(base_key, translated_segments_path)
+            selective_base_translations = _load_segments_json(translated_segments_path)
+            if not selective_base_translations or len(selective_base_translations) != len(segments):
+                raise RuntimeError(
+                    "selective retranslation base/source segment alignment mismatch; run a full translation first"
+                )
+            context_key = str(selective_cfg.get("translation_context_key") or "").strip()
+            if context_key:
+                try:
+                    context_payload = json.loads(store.path_for(context_key).read_text(encoding="utf-8"))
+                except Exception as context_error:
+                    raise RuntimeError(f"selective retranslation context load failed: {context_error}") from context_error
+                if isinstance(context_payload, dict):
+                    selective_summary = str(context_payload.get("summary") or "").strip()[:500]
+                    raw_memory = context_payload.get("memory")
+                    if isinstance(raw_memory, dict):
+                        selective_context_memory = dict(raw_memory)
+            translate_cfg["enabled"] = True
+            if str(translate_cfg.get("provider") or "openai").strip() != "openai":
+                translate_cfg["provider"] = "openai"
+            _safe_append_log_line(
+                log_path,
+                f"selective retranslation: indices={len(selective_indices)} base={base_key}",
+            )
+
         try:
             translation_result = run_translation_stage(
                 db=db,
@@ -1418,6 +1486,10 @@ def run_subtitle_job(
                 fresh_translate_settings=_fresh_translate_settings,
                 ai_service_factory=_ai_service,
                 log=lambda message: _safe_append_log_line(log_path, message),
+                selective_indices=selective_indices if selective_mode else None,
+                base_translations=selective_base_translations,
+                initial_context_memory_override=selective_context_memory,
+                initial_summary_override=selective_summary,
             )
         except TranslationRetryRequired as retry:
             req["resume"] = True
@@ -1442,6 +1514,7 @@ def run_subtitle_job(
         bilingual = translation_result.bilingual
         segments_out = translation_result.segments
         translation_summary = translation_result.summary
+        translation_context_memory = dict(translation_result.context_memory or {})
         if translate_enabled:
             style = translation_result.style
             ai_service = translation_result.ai_service
@@ -1468,6 +1541,43 @@ def run_subtitle_job(
                 bilingual=bilingual,
                 ai_service=ai_service,
                 log=lambda message: _safe_append_log_line(log_path, message),
+            )
+
+        translated_segments_for_quality = list(segments_out)
+        readability_profile = derive_readability_profile(
+            translated_segments_for_quality,
+            target_lang=target_lang,
+        )
+        readability = optimize_subtitle_readability(
+            segments_out,
+            bilingual=bool(bilingual and any(segment.secondary_text for segment in segments_out)),
+            max_line_units=float(readability_profile["max_line_units"]),
+            target_cps=float(readability_profile["target_cps"]),
+            min_display_seconds=float(readability_profile["min_display_seconds"]),
+            max_gap_extension_seconds=float(readability_profile["max_gap_extension_seconds"]),
+        )
+        segments_out = readability.segments
+        readability_stats = readability.stats
+        quality_report = analyze_subtitle_quality(
+            source_segments=segments,
+            translated_segments=translated_segments_for_quality,
+            final_segments=segments_out,
+            target_lang=target_lang,
+            context_memory=translation_context_memory,
+        )
+        if (
+            readability_stats.wrapped_segments
+            or readability_stats.split_segments
+            or readability_stats.extended_segments
+        ):
+            _safe_append_log_line(
+                log_path,
+                "subtitle readability optimized: "
+                f"segments={readability_stats.input_segments}->{readability_stats.output_segments} "
+                f"wrapped={readability_stats.wrapped_segments} "
+                f"split={readability_stats.split_segments} "
+                f"extended={readability_stats.extended_segments} "
+                f"max_cps={readability_stats.max_cps_before:.2f}->{readability_stats.max_cps_after:.2f}",
             )
 
         if automatic_runtime_profile:
@@ -1497,6 +1607,103 @@ def run_subtitle_job(
         )
         srt_key = outputs.srt_key
         ass_key = outputs.ass_key
+
+        if translate_enabled and translated_segments_for_quality:
+            try:
+                write_json(
+                    translated_segments_path,
+                    segments_to_json_data(translated_segments_for_quality),
+                )
+                translated_sha = sha256_file(translated_segments_path)
+                translated_segments_key = _unique_storage_key(
+                    f"sub/{task.id}/translated_segments",
+                    translated_sha,
+                    ".json",
+                )
+                store.upload_file(
+                    translated_segments_path,
+                    translated_segments_key,
+                    content_type="application/json",
+                )
+                artifacts = dict(req.get("artifacts") or {})
+                artifacts["translated_segments_key"] = translated_segments_key
+                req["artifacts"] = artifacts
+                _save_job_request()
+            except Exception as translated_error:
+                _safe_append_log_line(
+                    log_path,
+                    "translated segment persistence skipped: "
+                    f"{type(translated_error).__name__}: {translated_error}",
+                )
+
+        try:
+            write_json(subtitle_quality_path, quality_report)
+            quality_sha = sha256_file(subtitle_quality_path)
+            subtitle_quality_key = _unique_storage_key(
+                f"sub/{task.id}/subtitle_quality",
+                quality_sha,
+                ".json",
+            )
+            store.upload_file(
+                subtitle_quality_path,
+                subtitle_quality_key,
+                content_type="application/json",
+            )
+            artifacts = dict(req.get("artifacts") or {})
+            artifacts["subtitle_quality_key"] = subtitle_quality_key
+            req["artifacts"] = artifacts
+            _save_job_request()
+            _safe_append_log_line(
+                log_path,
+                "subtitle quality analyzed: "
+                f"score={quality_report.get('score')} "
+                f"issues={len(quality_report.get('issues') or [])}",
+            )
+        except Exception as quality_error:
+            _safe_append_log_line(
+                log_path,
+                "subtitle quality persistence skipped: "
+                f"{type(quality_error).__name__}: {quality_error}",
+            )
+
+        if translate_enabled and not context_memory_is_empty(translation_context_memory):
+            try:
+                write_json(
+                    translation_context_path,
+                    {
+                        "version": 1,
+                        "summary": translation_summary,
+                        "memory": translation_context_memory,
+                    },
+                )
+                context_sha = sha256_file(translation_context_path)
+                translation_context_key = _unique_storage_key(
+                    f"sub/{task.id}/translation_context",
+                    context_sha,
+                    ".json",
+                )
+                store.upload_file(
+                    translation_context_path,
+                    translation_context_key,
+                    content_type="application/json",
+                )
+                artifacts = dict(req.get("artifacts") or {})
+                artifacts["translation_context_key"] = translation_context_key
+                req["artifacts"] = artifacts
+                _save_job_request()
+                _safe_append_log_line(
+                    log_path,
+                    "translation context persisted: "
+                    f"characters={len(translation_context_memory.get('characters') or [])} "
+                    f"terms={len(translation_context_memory.get('terminology') or [])} "
+                    f"ambiguities={len(translation_context_memory.get('ambiguities') or [])}",
+                )
+            except Exception as context_error:
+                _safe_append_log_line(
+                    log_path,
+                    "translation context persistence skipped: "
+                    f"{type(context_error).__name__}: {context_error}",
+                )
 
         _raise_if_task_stopped(db, task.id)
         mark_subtitle_ready(

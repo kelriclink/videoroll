@@ -48,6 +48,20 @@ def _decrypt_api_key(value: Any) -> str:
         return ""
 
 
+def _is_legacy_external_profile(external: dict[str, Any]) -> bool:
+    if not external:
+        return False
+    try:
+        return (
+            int(external.get("min_silence_ms") or 500) == 500
+            and int(external.get("speech_pad_ms") if external.get("speech_pad_ms") is not None else 180) == 180
+            and external.get("condition_on_previous_text", False) is False
+            and float(external.get("max_segment_seconds") or 6.0) == 6.0
+            and int(external.get("max_segment_chars") or 80) == 80
+        )
+    except (TypeError, ValueError):
+        return False
+
 def get_asr_settings(db: Session, defaults: SubtitleServiceSettings) -> dict[str, Any]:
     row = db.get(AppSetting, ASR_SETTINGS_KEY)
     stored = dict(_as_dict(row.value_json)) if row else {}
@@ -96,6 +110,18 @@ def get_asr_settings(db: Session, defaults: SubtitleServiceSettings) -> dict[str
         proxy = proxy[:_MAX_PROXY_LEN]
 
     external = _as_dict(stored.get("external_whisper"))
+    # Upgrade the exact short-lived legacy defaults introduced with the first
+    # online-Whisper UI. This preserves genuinely customized profiles while
+    # preventing old persisted 500ms/6s defaults from defeating semantic regrouping.
+    if _is_legacy_external_profile(external):
+        external = {
+            **external,
+            "min_silence_ms": 2000,
+            "speech_pad_ms": 400,
+            "condition_on_previous_text": True,
+            "max_segment_seconds": 12.0,
+            "max_segment_chars": 120,
+        }
     external_base_url = str(external.get("base_url") or defaults.external_whisper_base_url or "").strip()
     if external_base_url:
         external_base_url = normalize_openai_base_url(external_base_url)[:_MAX_EXTERNAL_BASE_URL_LEN]
@@ -109,16 +135,16 @@ def get_asr_settings(db: Session, defaults: SubtitleServiceSettings) -> dict[str
         else bool(getattr(defaults, "external_whisper_vad_enabled", True))
     )
     external_vad_threshold = max(0.1, min(0.95, float(external.get("vad_threshold") or getattr(defaults, "external_whisper_vad_threshold", 0.5) or 0.5)))
-    external_min_silence_ms = max(50, min(5000, int(external.get("min_silence_ms") or getattr(defaults, "external_whisper_min_silence_ms", 500) or 500)))
-    external_speech_pad_ms = max(0, min(2000, int(external.get("speech_pad_ms") if external.get("speech_pad_ms") is not None else getattr(defaults, "external_whisper_speech_pad_ms", 180))))
+    external_min_silence_ms = max(50, min(5000, int(external.get("min_silence_ms") or getattr(defaults, "external_whisper_min_silence_ms", 2000) or 2000)))
+    external_speech_pad_ms = max(0, min(2000, int(external.get("speech_pad_ms") if external.get("speech_pad_ms") is not None else getattr(defaults, "external_whisper_speech_pad_ms", 400))))
     stored_condition = external.get("condition_on_previous_text")
     external_condition_on_previous_text = (
         bool(stored_condition)
         if isinstance(stored_condition, bool)
-        else bool(getattr(defaults, "external_whisper_condition_on_previous_text", False))
+        else bool(getattr(defaults, "external_whisper_condition_on_previous_text", True))
     )
-    external_max_segment_seconds = max(1.0, min(30.0, float(external.get("max_segment_seconds") or getattr(defaults, "external_whisper_max_segment_seconds", 6.0) or 6.0)))
-    external_max_segment_chars = max(10, min(500, int(external.get("max_segment_chars") or getattr(defaults, "external_whisper_max_segment_chars", 80) or 80)))
+    external_max_segment_seconds = max(1.0, min(30.0, float(external.get("max_segment_seconds") or getattr(defaults, "external_whisper_max_segment_seconds", 12.0) or 12.0)))
+    external_max_segment_chars = max(10, min(500, int(external.get("max_segment_chars") or getattr(defaults, "external_whisper_max_segment_chars", 120) or 120)))
 
     groq = _as_dict(stored.get("groq_whisper"))
     groq_model = str(

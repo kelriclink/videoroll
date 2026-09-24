@@ -128,11 +128,11 @@ function asrDefaultsSnapshot(defaults: ASRDefaults): string {
     externalWhisperBatchSize: String(defaults.external_whisper_batch_size ?? 1),
     externalWhisperVadEnabled: Boolean(defaults.external_whisper_vad_enabled),
     externalWhisperVadThreshold: String(defaults.external_whisper_vad_threshold ?? 0.5),
-    externalWhisperMinSilenceMs: String(defaults.external_whisper_min_silence_ms ?? 500),
-    externalWhisperSpeechPadMs: String(defaults.external_whisper_speech_pad_ms ?? 180),
-    externalWhisperConditionOnPreviousText: Boolean(defaults.external_whisper_condition_on_previous_text),
-    externalWhisperMaxSegmentSeconds: String(defaults.external_whisper_max_segment_seconds ?? 6),
-    externalWhisperMaxSegmentChars: String(defaults.external_whisper_max_segment_chars ?? 80),
+    externalWhisperMinSilenceMs: String(defaults.external_whisper_min_silence_ms ?? 2000),
+    externalWhisperSpeechPadMs: String(defaults.external_whisper_speech_pad_ms ?? 400),
+    externalWhisperConditionOnPreviousText: defaults.external_whisper_condition_on_previous_text ?? true,
+    externalWhisperMaxSegmentSeconds: String(defaults.external_whisper_max_segment_seconds ?? 12),
+    externalWhisperMaxSegmentChars: String(defaults.external_whisper_max_segment_chars ?? 120),
     groqWhisperModel: defaults.groq_whisper_model || "whisper-large-v3-turbo",
     cloudflareAccountId: defaults.cloudflare_workers_ai_account_id || "",
     cloudflareModel: defaults.cloudflare_workers_ai_model || "@cf/openai/whisper-large-v3-turbo",
@@ -560,12 +560,12 @@ export default function SettingsASRPage() {
                   <div className="mt-1 text-xs text-slate-500">字幕优先建议 1。大于 1 会启用 batched pipeline，吞吐更高但上游 segment 往往更粗。</div>
                 </label>
                 <label className="block">
-                  <div className="mb-1 text-xs text-slate-600">字幕最大时长（秒）</div>
+                  <div className="mb-1 text-xs text-slate-600">语义分段硬上限（秒）</div>
                   <input type="number" min={1} max={30} step={0.5} className="w-full rounded border px-3 py-2 text-sm" value={externalWhisperMaxSegmentSeconds} onChange={(e) => setExternalWhisperMaxSegmentSeconds(e.target.value)} />
-                  <div className="mt-1 text-xs text-slate-500">优先利用 word timestamps 对超长 ASR segment 做二次切分。</div>
+                  <div className="mt-1 text-xs text-slate-500">不是固定切片长度。系统优先按句末标点、语音停顿和弱标点找自然边界，仅在没有合适边界时用该值兜底。</div>
                 </label>
                 <label className="block">
-                  <div className="mb-1 text-xs text-slate-600">字幕最大字符数</div>
+                  <div className="mb-1 text-xs text-slate-600">语义分段硬上限（字符）</div>
                   <input type="number" min={10} max={500} className="w-full rounded border px-3 py-2 text-sm" value={externalWhisperMaxSegmentChars} onChange={(e) => setExternalWhisperMaxSegmentChars(e.target.value)} />
                 </label>
                 <label className="flex items-center gap-2 self-end rounded border border-slate-200 px-3 py-2">
@@ -579,16 +579,16 @@ export default function SettingsASRPage() {
                 <label className="block">
                   <div className="mb-1 text-xs text-slate-600">最短静音（ms）</div>
                   <input type="number" min={50} max={5000} step={10} className="w-full rounded border px-3 py-2 text-sm" value={externalWhisperMinSilenceMs} onChange={(e) => setExternalWhisperMinSilenceMs(e.target.value)} />
-                  <div className="mt-1 text-xs text-slate-500">默认 500ms，与本地 faster-whisper 路径一致。</div>
+                  <div className="mt-1 text-xs text-slate-500">默认 2000ms。VAD 只负责过滤真正的长静音；较短停顿会保留给字幕语义边界评分器使用。</div>
                 </label>
                 <label className="block">
                   <div className="mb-1 text-xs text-slate-600">Speech Pad（ms）</div>
                   <input type="number" min={0} max={2000} step={10} className="w-full rounded border px-3 py-2 text-sm" value={externalWhisperSpeechPadMs} onChange={(e) => setExternalWhisperSpeechPadMs(e.target.value)} />
-                  <div className="mt-1 text-xs text-slate-500">默认 180ms，与本地 faster-whisper 路径一致。</div>
+                  <div className="mt-1 text-xs text-slate-500">默认 400ms，与 faster-whisper 的保守 VAD 路径一致，降低句首句尾被裁掉的风险。</div>
                 </label>
                 <label className="flex items-center gap-2 rounded border border-slate-200 px-3 py-2 lg:col-span-2">
                   <input type="checkbox" checked={externalWhisperConditionOnPreviousText} onChange={(e) => setExternalWhisperConditionOnPreviousText(e.target.checked)} />
-                  <span className="text-sm text-slate-700">继承上一片段文本上下文（字幕任务默认关闭，减少静音/音乐处重复与幻觉）</span>
+                  <span className="text-sm text-slate-700">继承上一片段文本上下文（默认开启；连续语音更连贯，仍配合 no-speech / hallucination 过滤）</span>
                 </label>
                 <div className="flex items-end">
                   <button
@@ -610,11 +610,11 @@ export default function SettingsASRPage() {
                             batch_size: Math.min(32, Math.max(1, Number.parseInt(externalWhisperBatchSize || "1", 10) || 1)),
                             vad_enabled: externalWhisperVadEnabled,
                             vad_threshold: Math.min(0.95, Math.max(0.1, Number.parseFloat(externalWhisperVadThreshold || "0.5") || 0.5)),
-                            min_silence_ms: Math.min(5000, Math.max(50, Number.parseInt(externalWhisperMinSilenceMs || "500", 10) || 500)),
-                            speech_pad_ms: Math.min(2000, Math.max(0, Number.parseInt(externalWhisperSpeechPadMs || "180", 10) || 0)),
+                            min_silence_ms: Math.min(5000, Math.max(50, Number.parseInt(externalWhisperMinSilenceMs || "2000", 10) || 2000)),
+                            speech_pad_ms: Math.min(2000, Math.max(0, Number.parseInt(externalWhisperSpeechPadMs || "400", 10) || 400)),
                             condition_on_previous_text: externalWhisperConditionOnPreviousText,
-                            max_segment_seconds: Math.min(30, Math.max(1, Number.parseFloat(externalWhisperMaxSegmentSeconds || "6") || 6)),
-                            max_segment_chars: Math.min(500, Math.max(10, Number.parseInt(externalWhisperMaxSegmentChars || "80", 10) || 80)),
+                            max_segment_seconds: Math.min(30, Math.max(1, Number.parseFloat(externalWhisperMaxSegmentSeconds || "12") || 12)),
+                            max_segment_chars: Math.min(500, Math.max(10, Number.parseInt(externalWhisperMaxSegmentChars || "120", 10) || 120)),
                           }),
                         });
                         setExternalWhisperTestResult(result);

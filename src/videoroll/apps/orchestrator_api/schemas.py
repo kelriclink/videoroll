@@ -113,6 +113,10 @@ class SubtitleActionRequest(BaseModel):
     publish_payload: Optional[dict[str, Any]] = None
 
 
+class SubtitleRetranslateRequest(BaseModel):
+    indices: list[int] = Field(min_length=1, max_length=5000)
+
+
 class PublishActionRequest(BaseModel):
     platform: str = "bilibili"
     account_id: Optional[str] = None

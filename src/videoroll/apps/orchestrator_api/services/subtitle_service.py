@@ -19,6 +19,7 @@ from videoroll.apps.orchestrator_api.schemas import (
     RecentFailedResumeResponse,
     RemoteJobResponse,
     SubtitleActionRequest,
+    SubtitleRetranslateRequest,
 )
 from videoroll.apps.orchestrator_api.services import publishing_service, youtube_service
 from videoroll.apps.subtitle_service.auto_profile_store import get_auto_profile
@@ -91,6 +92,17 @@ def _is_browser_proxy_path_allowed(method: str, service_path: str) -> bool:
         except (TypeError, ValueError):
             return False
         return True
+    if service_path.startswith("subtitle/tasks/") and service_path.count("/") == 3:
+        parts = service_path.split("/")
+        try:
+            uuid.UUID(parts[2])
+        except (TypeError, ValueError):
+            return False
+        leaf = parts[3]
+        if normalized_method == "GET" and leaf in {"quality", "translation-context"}:
+            return True
+        if normalized_method == "PUT" and leaf == "translation-context":
+            return True
     if normalized_method in {"PUT", "DELETE"}:
         dynamic_path_depths = {
             "subtitle/models/": 2,
@@ -418,6 +430,69 @@ def enqueue_auto_subtitle_handoff(
         job_kind="subtitle",
         detail="queued automatic subtitle job",
     )
+
+
+def enqueue_selective_subtitle_retranslation(
+    task_id: uuid.UUID,
+    payload: SubtitleRetranslateRequest,
+    *,
+    settings: OrchestratorSettings,
+    db: Session,
+) -> RemoteJobResponse:
+    task = db.get(Task, task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="task not found")
+    if task.status == TaskStatus.canceled:
+        raise HTTPException(status_code=409, detail="task is stopped; resume it before retranslating")
+    if task.status == TaskStatus.published:
+        raise HTTPException(status_code=409, detail="task is already published; create a new task to retranslate subtitles")
+
+    in_flight = (
+        db.query(SubtitleJob)
+        .filter(
+            SubtitleJob.task_id == task_id,
+            SubtitleJob.status.in_([SubtitleJobStatus.queued, SubtitleJobStatus.running]),
+        )
+        .order_by(SubtitleJob.created_at.desc())
+        .first()
+    )
+    if in_flight is not None:
+        return RemoteJobResponse(job_id=in_flight.id, status=in_flight.status.value)
+
+    previous = (
+        db.query(SubtitleJob)
+        .filter(SubtitleJob.task_id == task_id)
+        .order_by(SubtitleJob.created_at.desc())
+        .first()
+    )
+    if previous is None or not isinstance(previous.request_json, dict):
+        raise HTTPException(status_code=409, detail="no completed subtitle job is available for selective retranslation")
+
+    request = dict(previous.request_json)
+    artifacts = dict(request.get("artifacts") or {})
+    base_key = str(artifacts.get("translated_segments_key") or "").strip()
+    context_key = str(artifacts.get("translation_context_key") or "").strip()
+    if not base_key:
+        raise HTTPException(
+            status_code=409,
+            detail="this subtitle result predates aligned translation snapshots; run one full translation first",
+        )
+
+    indices = sorted({int(index) for index in payload.indices if int(index) > 0})
+    if not indices:
+        raise HTTPException(status_code=400, detail="no valid subtitle indices supplied")
+
+    request["task_id"] = str(task_id)
+    request["resume"] = True
+    request["artifacts"] = artifacts
+    request["selective_retranslate"] = {
+        "indices": indices,
+        "base_translated_segments_key": base_key,
+        "translation_context_key": context_key,
+    }
+    if not isinstance(request.get("output_prefix"), str) or not str(request.get("output_prefix") or "").strip():
+        request["output_prefix"] = f"sub/{task_id}/"
+    return enqueue_subtitle_service_job_request(settings, request)
 
 
 def resume_subtitle_job(

@@ -42,6 +42,7 @@ def build_translation_plan(
     blocks: list[dict[str, Any]],
     glossary: Mapping[str, str] | None = None,
     rag_context: Mapping[str, Any] | None = None,
+    context_memory: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Turn research output into explicit translation-time constraints.
 
@@ -100,6 +101,34 @@ def build_translation_plan(
             target=str(target),
             mode="hard",
             origin="user_glossary",
+        )
+
+    memory = context_memory if isinstance(context_memory, Mapping) else {}
+    for raw_term in memory.get("terminology") or []:
+        if not isinstance(raw_term, Mapping):
+            continue
+        add_constraint(
+            source=str(raw_term.get("source") or ""),
+            target=str(raw_term.get("target") or ""),
+            mode="preferred",
+            meaning=str(raw_term.get("meaning") or ""),
+            origin="context_memory_term",
+        )
+
+    for raw_character in memory.get("characters") or []:
+        if not isinstance(raw_character, Mapping):
+            continue
+        target_name = str(raw_character.get("target_name") or "").strip()
+        if not target_name:
+            continue
+        aliases = raw_character.get("aliases") if isinstance(raw_character.get("aliases"), list) else ()
+        add_constraint(
+            source=str(raw_character.get("name") or ""),
+            target=target_name,
+            mode="preferred",
+            aliases=aliases,
+            meaning=str(raw_character.get("role") or raw_character.get("notes") or ""),
+            origin="context_memory_character",
         )
 
     context = rag_context if isinstance(rag_context, Mapping) else {}
@@ -253,6 +282,39 @@ def validate_translation_mapping(
                     "severity": "error",
                     "expected": missing_numbers[:12],
                     "message": "one or more source numbers are missing or changed",
+                }
+            )
+
+    ordered_ids = sorted(block_by_idx)
+    for left_idx, right_idx in zip(ordered_ids, ordered_ids[1:]):
+        if right_idx != left_idx + 1:
+            continue
+        left_source = _norm_text(block_by_idx[left_idx].get("text"))
+        right_source = _norm_text(block_by_idx[right_idx].get("text"))
+        left_target = _norm_text(translations.get(left_idx))
+        right_target = _norm_text(translations.get(right_idx))
+        if (
+            not left_source
+            or not right_source
+            or left_source == right_source
+            or len(left_source) < 3
+            or len(right_source) < 3
+            or not left_target
+            or left_target != right_target
+            or len(left_target) < 2
+        ):
+            continue
+        for idx, neighbor in ((left_idx, right_idx), (right_idx, left_idx)):
+            issues.append(
+                {
+                    "idx": idx,
+                    "type": "adjacent_duplicate_translation",
+                    "severity": "warning",
+                    "neighbor_idx": neighbor,
+                    "message": (
+                        "adjacent different source blocks received the same translation; "
+                        "possible line merge/copy, re-check both blocks independently"
+                    ),
                 }
             )
 

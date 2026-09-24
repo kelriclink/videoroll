@@ -54,6 +54,71 @@ export type SubtitleSubmitPayload = {
   bilingual: boolean;
 };
 
+export type TranslationContextCharacter = {
+  name: string;
+  target_name: string;
+  aliases?: string[];
+  role?: string;
+  notes?: string;
+};
+
+export type TranslationContextTerm = {
+  source: string;
+  target: string;
+  meaning?: string;
+};
+
+export type TranslationContextAmbiguity = {
+  term: string;
+  resolution: string;
+};
+
+export type TranslationContextMemory = {
+  version?: number;
+  topic: string;
+  style_notes: string;
+  characters: TranslationContextCharacter[];
+  terminology: TranslationContextTerm[];
+  ambiguities: TranslationContextAmbiguity[];
+  recent_scene?: { scene_id: number; summary: string };
+};
+
+export type TranslationContextResponse = {
+  available: boolean;
+  job_id: string;
+  key?: string;
+  summary: string;
+  memory: TranslationContextMemory;
+  changed_terms?: string[];
+  affected_indices: number[];
+};
+
+export type SubtitleQualityReport = {
+  version: number;
+  score: number;
+  segment_count: number;
+  source_segment_count: number;
+  translation_segment_count: number;
+  metrics: Record<string, number>;
+  adaptive_profile: {
+    readability: Record<string, number>;
+    scene: Record<string, number>;
+  };
+  context: {
+    characters: number;
+    terminology: number;
+    ambiguities: number;
+  };
+  issues: Array<Record<string, unknown>>;
+};
+
+export type SubtitleQualityResponse = {
+  available: boolean;
+  job_id: string;
+  key?: string;
+  report: SubtitleQualityReport | null;
+};
+
 export const subtitleApi = {
   models() {
     return fetchJson<Array<{ name: string; path: string }>>(orchestratorUrl("/subtitle/models"));
@@ -65,6 +130,33 @@ export const subtitleApi = {
 
   translationSettings() {
     return fetchJson<{ openai_api_key_set: boolean }>(orchestratorUrl("/subtitle/translate/settings"));
+  },
+
+  quality(taskId: string) {
+    return fetchJson<SubtitleQualityResponse>(orchestratorUrl(`/subtitle/tasks/${taskId}/quality`));
+  },
+
+  translationContext(taskId: string) {
+    return fetchJson<TranslationContextResponse>(orchestratorUrl(`/subtitle/tasks/${taskId}/translation-context`));
+  },
+
+  updateTranslationContext(
+    taskId: string,
+    payload: { summary: string; memory: TranslationContextMemory },
+  ) {
+    return fetchJson<TranslationContextResponse>(orchestratorUrl(`/subtitle/tasks/${taskId}/translation-context`), {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+  },
+
+  retranslate(taskId: string, indices: number[]) {
+    return fetchJson<SubtitleActionResponse>(orchestratorUrl(`/tasks/${taskId}/actions/subtitle_retranslate`), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ indices }),
+    });
   },
 
   submit(taskId: string, payload: SubtitleSubmitPayload) {

@@ -125,9 +125,14 @@ from videoroll.apps.subtitle_service.dictionaries import (
 )
 from videoroll.apps.subtitle_service.translate_settings_store import get_translate_settings, update_translate_settings
 from videoroll.apps.subtitle_service.processing import (
+    segments_from_json_data,
     transcribe_cloudflare_workers_ai,
     transcribe_external_whisper,
     transcribe_groq_whisper,
+)
+from videoroll.apps.subtitle_service.translation_context import (
+    context_memory_is_empty,
+    sanitize_translation_context_memory,
 )
 from videoroll.utils.auto_youtube import parse_auto_youtube_created_by
 from videoroll.utils.cpu import process_cpu_count
@@ -374,11 +379,11 @@ def get_subtitle_settings_view(settings: SubtitleServiceSettings = Depends(get_s
         external_whisper_batch_size=int(settings.external_whisper_batch_size or 1),
         external_whisper_vad_enabled=bool(settings.external_whisper_vad_enabled),
         external_whisper_vad_threshold=float(settings.external_whisper_vad_threshold or 0.5),
-        external_whisper_min_silence_ms=int(settings.external_whisper_min_silence_ms or 500),
-        external_whisper_speech_pad_ms=int(settings.external_whisper_speech_pad_ms or 180),
+        external_whisper_min_silence_ms=int(settings.external_whisper_min_silence_ms or 2000),
+        external_whisper_speech_pad_ms=int(settings.external_whisper_speech_pad_ms or 400),
         external_whisper_condition_on_previous_text=bool(settings.external_whisper_condition_on_previous_text),
-        external_whisper_max_segment_seconds=float(settings.external_whisper_max_segment_seconds or 6.0),
-        external_whisper_max_segment_chars=int(settings.external_whisper_max_segment_chars or 80),
+        external_whisper_max_segment_seconds=float(settings.external_whisper_max_segment_seconds or 12.0),
+        external_whisper_max_segment_chars=int(settings.external_whisper_max_segment_chars or 120),
         groq_whisper_model=str(settings.groq_whisper_model or "whisper-large-v3-turbo"),
         groq_whisper_api_key_set=bool(settings.groq_whisper_api_key),
         cloudflare_workers_ai_account_id=str(settings.cloudflare_workers_ai_account_id or ""),
@@ -476,19 +481,19 @@ def test_external_whisper(
                 else bool(stored.get("external_whisper_vad_enabled", True))
             ),
             vad_threshold=float(payload.vad_threshold or stored.get("external_whisper_vad_threshold") or 0.5),
-            min_silence_duration_ms=int(payload.min_silence_ms or stored.get("external_whisper_min_silence_ms") or 500),
+            min_silence_duration_ms=int(payload.min_silence_ms or stored.get("external_whisper_min_silence_ms") or 2000),
             speech_pad_ms=int(
                 payload.speech_pad_ms
                 if payload.speech_pad_ms is not None
-                else stored.get("external_whisper_speech_pad_ms") or 180
+                else stored.get("external_whisper_speech_pad_ms") or 400
             ),
             condition_on_previous_text=(
                 bool(payload.condition_on_previous_text)
                 if payload.condition_on_previous_text is not None
-                else bool(stored.get("external_whisper_condition_on_previous_text", False))
+                else bool(stored.get("external_whisper_condition_on_previous_text", True))
             ),
-            max_segment_seconds=float(payload.max_segment_seconds or stored.get("external_whisper_max_segment_seconds") or 6.0),
-            max_segment_chars=int(payload.max_segment_chars or stored.get("external_whisper_max_segment_chars") or 80),
+            max_segment_seconds=float(payload.max_segment_seconds or stored.get("external_whisper_max_segment_seconds") or 12.0),
+            max_segment_chars=int(payload.max_segment_chars or stored.get("external_whisper_max_segment_chars") or 120),
         )
         return ExternalWhisperTestResponse(
             ok=True,
@@ -1983,6 +1988,231 @@ def test_model_download_proxy(
             elapsed_ms=elapsed_ms,
             error=format_httpx_proxy_error(e, proxy=proxy),
         )
+
+
+def _latest_subtitle_job_for_task(db: Session, task_id: uuid.UUID) -> SubtitleJob:
+    if db.get(Task, task_id) is None:
+        raise HTTPException(status_code=404, detail="task not found")
+    job = (
+        db.query(SubtitleJob)
+        .filter(SubtitleJob.task_id == task_id)
+        .order_by(SubtitleJob.created_at.desc(), SubtitleJob.id.desc())
+        .first()
+    )
+    if job is None:
+        raise HTTPException(status_code=404, detail="subtitle job not found")
+    return job
+
+
+def _job_artifact_key(job: SubtitleJob, name: str) -> str:
+    request_json = job.request_json if isinstance(job.request_json, dict) else {}
+    artifacts = request_json.get("artifacts") if isinstance(request_json.get("artifacts"), dict) else {}
+    return str(artifacts.get(name) or "").strip()
+
+
+def _read_json_object(store: FileStore, key: str) -> Any:
+    if not key:
+        raise HTTPException(status_code=404, detail="artifact not available")
+    try:
+        return json.loads(store.path_for(key).read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="artifact not found") from exc
+    except (OSError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=500, detail=f"artifact read failed: {exc}") from exc
+
+
+def _context_term_map(memory: dict[str, object]) -> dict[str, tuple[str, ...]]:
+    out: dict[str, tuple[str, ...]] = {}
+    for raw in memory.get("characters") or []:
+        if not isinstance(raw, dict):
+            continue
+        name = str(raw.get("name") or "").strip()
+        if name:
+            out[f"character:{name.casefold()}"] = (
+                name,
+                str(raw.get("target_name") or "").strip(),
+                str(raw.get("role") or "").strip(),
+                str(raw.get("notes") or "").strip(),
+            )
+        for alias in raw.get("aliases") or []:
+            clean = str(alias or "").strip()
+            if clean:
+                out[f"character-alias:{clean.casefold()}"] = (
+                    clean,
+                    str(raw.get("target_name") or "").strip(),
+                )
+    for raw in memory.get("terminology") or []:
+        if not isinstance(raw, dict):
+            continue
+        source = str(raw.get("source") or "").strip()
+        if source:
+            out[f"term:{source.casefold()}"] = (
+                source,
+                str(raw.get("target") or "").strip(),
+                str(raw.get("meaning") or "").strip(),
+            )
+    for raw in memory.get("ambiguities") or []:
+        if not isinstance(raw, dict):
+            continue
+        term = str(raw.get("term") or "").strip()
+        if term:
+            out[f"ambiguity:{term.casefold()}"] = (
+                term,
+                str(raw.get("resolution") or "").strip(),
+            )
+    return out
+
+
+def _changed_context_source_terms(
+    previous: dict[str, object],
+    current: dict[str, object],
+) -> list[str]:
+    before = _context_term_map(previous)
+    after = _context_term_map(current)
+    changed: list[str] = []
+    for key in sorted(set(before) | set(after)):
+        if before.get(key) == after.get(key):
+            continue
+        record = after.get(key) or before.get(key)
+        if record and record[0] and record[0] not in changed:
+            changed.append(record[0])
+    return changed
+
+
+def _affected_source_indices(
+    db: Session,
+    store: FileStore,
+    task_id: uuid.UUID,
+    terms: list[str],
+) -> list[int]:
+    if not terms:
+        return []
+    asset = (
+        db.query(Asset)
+        .filter(Asset.task_id == task_id, Asset.kind == AssetKind.segments_json)
+        .order_by(Asset.created_at.desc(), Asset.id.desc())
+        .first()
+    )
+    if asset is None:
+        return []
+    try:
+        rows = segments_from_json_data(json.loads(store.path_for(asset.storage_key).read_text(encoding="utf-8")))
+    except Exception:
+        return []
+
+    def contains_term(text_value: str, term: str) -> bool:
+        folded = str(text_value or "").casefold()
+        needle = str(term or "").strip().casefold()
+        if not folded or not needle:
+            return False
+        if re.fullmatch(r"[a-z0-9][a-z0-9_.+\- ]*", needle):
+            return re.search(r"(?<![a-z0-9])" + re.escape(needle) + r"(?![a-z0-9])", folded) is not None
+        return needle in folded
+
+    affected: list[int] = []
+    for index, segment in enumerate(rows, start=1):
+        if any(contains_term(segment.text, term) for term in terms):
+            affected.append(index)
+    return affected
+
+
+@app.get("/subtitle/tasks/{task_id}/quality")
+def get_task_subtitle_quality(
+    task_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    settings: SubtitleServiceSettings = Depends(get_settings),
+) -> dict[str, Any]:
+    job = _latest_subtitle_job_for_task(db, task_id)
+    key = _job_artifact_key(job, "subtitle_quality_key")
+    if not key:
+        return {"available": False, "job_id": str(job.id), "report": None}
+    report = _read_json_object(FileStore(settings), key)
+    return {"available": True, "job_id": str(job.id), "key": key, "report": report}
+
+
+@app.get("/subtitle/tasks/{task_id}/translation-context")
+def get_task_translation_context(
+    task_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    settings: SubtitleServiceSettings = Depends(get_settings),
+) -> dict[str, Any]:
+    job = _latest_subtitle_job_for_task(db, task_id)
+    key = _job_artifact_key(job, "translation_context_key")
+    if not key:
+        return {
+            "available": False,
+            "job_id": str(job.id),
+            "summary": "",
+            "memory": sanitize_translation_context_memory({}),
+            "affected_indices": [],
+        }
+    payload = _read_json_object(FileStore(settings), key)
+    payload_dict = payload if isinstance(payload, dict) else {}
+    return {
+        "available": True,
+        "job_id": str(job.id),
+        "key": key,
+        "summary": str(payload_dict.get("summary") or "")[:500],
+        "memory": sanitize_translation_context_memory(payload_dict.get("memory")),
+        "affected_indices": [],
+    }
+
+
+@app.put("/subtitle/tasks/{task_id}/translation-context")
+def put_task_translation_context(
+    task_id: uuid.UUID,
+    payload: dict[str, Any],
+    db: Session = Depends(get_db),
+    settings: SubtitleServiceSettings = Depends(get_settings),
+) -> dict[str, Any]:
+    job = _latest_subtitle_job_for_task(db, task_id)
+    store = FileStore(settings)
+    old_key = _job_artifact_key(job, "translation_context_key")
+    previous_payload: dict[str, Any] = {}
+    if old_key:
+        try:
+            loaded = _read_json_object(store, old_key)
+            if isinstance(loaded, dict):
+                previous_payload = loaded
+        except HTTPException as exc:
+            if exc.status_code != 404:
+                raise
+
+    previous_memory = sanitize_translation_context_memory(previous_payload.get("memory"))
+    memory = sanitize_translation_context_memory(payload.get("memory"))
+    summary = str(payload.get("summary") or previous_payload.get("summary") or "").strip()[:500]
+    if context_memory_is_empty(memory):
+        raise HTTPException(status_code=400, detail="translation context memory cannot be empty")
+
+    changed_terms = _changed_context_source_terms(previous_memory, memory)
+    affected_indices = _affected_source_indices(db, store, task_id, changed_terms)
+    key = f"sub/{task_id}/translation_context/manual-{uuid.uuid4().hex}.json"
+    store.put_bytes(
+        json.dumps(
+            {"version": 1, "summary": summary, "memory": memory},
+            ensure_ascii=False,
+            indent=2,
+        ).encode("utf-8"),
+        key,
+        content_type="application/json",
+    )
+
+    request_json = dict(job.request_json or {})
+    artifacts = dict(request_json.get("artifacts") or {})
+    artifacts["translation_context_key"] = key
+    request_json["artifacts"] = artifacts
+    job.request_json = request_json
+    db.add(job)
+    db.commit()
+    return {
+        "available": True,
+        "job_id": str(job.id),
+        "key": key,
+        "summary": summary,
+        "memory": memory,
+        "changed_terms": changed_terms,
+        "affected_indices": affected_indices,
+    }
 
 
 @app.post("/subtitle/jobs")

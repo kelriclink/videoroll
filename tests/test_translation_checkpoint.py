@@ -49,6 +49,49 @@ def test_translation_checkpoint_round_trip(tmp_path: Path) -> None:
     assert summary == "summary"
 
 
+    checkpoint.save(
+        "sub/source.json",
+        translated,
+        summary="summary",
+        context_state={
+            "topic": "hardware",
+            "characters": [{"name": "Alice", "target_name": "爱丽丝"}],
+            "terminology": [{"source": "POST", "target": "开机自检"}],
+        },
+    )
+    resumed_with_context, summary_with_context, context = checkpoint.load_with_context(
+        source,
+        source_segments_key="sub/source.json",
+    )
+    assert resumed_with_context == translated
+    assert summary_with_context == "summary"
+    assert context["topic"] == "hardware"
+    assert context["characters"][0]["target_name"] == "爱丽丝"
+    assert context["terminology"][0]["target"] == "开机自检"
+
+
+def test_translation_checkpoint_load_with_context_accepts_legacy_payload(tmp_path: Path) -> None:
+    task_id = uuid.uuid4()
+    store = _Store(tmp_path / "objects")
+    checkpoint = TranslationCheckpointStore(
+        store=store,
+        task_id=task_id,
+        local_path=tmp_path / "checkpoint.json",
+    )
+    source = [Segment(start=0.0, end=1.0, text="hello")]
+    translated = [Segment(start=0.0, end=1.0, text="你好")]
+    checkpoint.save("sub/source.json", translated, summary="legacy")
+
+    resumed, summary, context = checkpoint.load_with_context(
+        source,
+        source_segments_key="sub/source.json",
+    )
+
+    assert resumed == translated
+    assert summary == "legacy"
+    assert context == {}
+
+
 def test_translation_checkpoint_rejects_other_source_or_timeline(tmp_path: Path) -> None:
     task_id = uuid.uuid4()
     checkpoint = TranslationCheckpointStore(

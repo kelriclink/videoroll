@@ -38,6 +38,7 @@ class TranslationStageResult:
     segments: list[Segment]
     summary: str = ""
     style: str = ""
+    context_memory: dict[str, object] | None = None
     ai_service: AIService | None = None
 
 
@@ -79,6 +80,10 @@ def run_translation_stage(
     database_url: str,
     fresh_translate_settings: FreshTranslateSettings,
     ai_service_factory: AIServiceFactory,
+    selective_indices: list[int] | None = None,
+    base_translations: list[Segment] | None = None,
+    initial_context_memory_override: dict[str, object] | None = None,
+    initial_summary_override: str = "",
     log: LogLine,
 ) -> TranslationStageResult:
     enabled = bool(translate_cfg.get("enabled"))
@@ -117,6 +122,8 @@ def run_translation_stage(
     failed_batches = 0
     completed_segments = 0
     thought_characters = 0
+    structured_context_memory: dict[str, object] = {}
+    selective_mode = bool(selective_indices and base_translations)
 
     def flush_batch_thinking(batch_context: Any, *, force: bool = False) -> None:
         if not isinstance(batch_context, dict):
@@ -220,10 +227,22 @@ def run_translation_stage(
             segments_out = segments
             translation_summary = ""
         elif provider == "openai":
-            resume_prefix, resume_summary = checkpoint.load(
-                segments,
-                source_segments_key=source_segments_key,
-            )
+            if selective_mode:
+                resume_prefix = []
+                resume_summary = str(initial_summary_override or "").strip()[:500]
+                resume_context_memory = dict(initial_context_memory_override or {})
+            elif hasattr(checkpoint, "load_with_context"):
+                resume_prefix, resume_summary, resume_context_memory = checkpoint.load_with_context(
+                    segments,
+                    source_segments_key=source_segments_key,
+                )
+            else:
+                resume_prefix, resume_summary = checkpoint.load(
+                    segments,
+                    source_segments_key=source_segments_key,
+                )
+                resume_context_memory = {}
+            structured_context_memory = dict(resume_context_memory)
             resumed_segments = len(resume_prefix)
             completed_segments = len(resume_prefix)
             if resume_prefix:
@@ -329,6 +348,10 @@ def run_translation_stage(
                     payload["translation_examples"] = translation_examples
                 return payload or None
 
+            def on_context_memory_update(memory: dict[str, object]) -> None:
+                nonlocal structured_context_memory
+                structured_context_memory = dict(memory)
+
             def on_batch_done(
                 batch_context: Any,
                 batch_segments: list[Segment],
@@ -336,12 +359,14 @@ def run_translation_stage(
                 completed_count: int,
             ) -> None:
                 nonlocal completed_segments, succeeded_batches
-                checkpoint_segments.extend(batch_segments)
-                checkpoint.save(
-                    source_segments_key,
-                    checkpoint_segments,
-                    summary=updated_summary,
-                )
+                if not selective_mode:
+                    checkpoint_segments.extend(batch_segments)
+                    checkpoint.save(
+                        source_segments_key,
+                        checkpoint_segments,
+                        summary=updated_summary,
+                        context_state=structured_context_memory,
+                    )
                 completed_segments = completed_count
                 succeeded_batches += 1
                 flush_batch_thinking(batch_context, force=True)
@@ -440,11 +465,15 @@ def run_translation_stage(
                 batch_size=batch_size,
                 enable_summary=enable_summary,
                 resume_from=resume_prefix,
+                base_translations=base_translations if selective_mode else None,
+                selected_indices=selective_indices if selective_mode else None,
                 initial_summary=resume_summary,
+                initial_context_memory=structured_context_memory,
                 ai_service=ai_service,
                 enable_thinking=thinking_enabled,
                 on_batch_start=on_batch_start,
                 rag_context_provider_with_context=rag_context_provider,
+                on_context_memory_update=on_context_memory_update,
                 on_batch_done_with_context=on_batch_done,
                 on_batch_error=on_batch_error,
                 on_thinking_delta_with_context=on_thinking if thinking_enabled else None,
@@ -473,6 +502,7 @@ def run_translation_stage(
             segments=segments_out,
             summary=translation_summary,
             style=style,
+            context_memory=structured_context_memory,
             ai_service=ai_service,
         )
     except Exception as error:

@@ -57,6 +57,42 @@ def test_translation_plan_distinguishes_hard_preferred_and_contextual() -> None:
     assert plan["translation_examples"][0]["applies_to_blocks"] == [2]
 
 
+def test_translation_plan_uses_structured_memory_for_term_and_character_consistency() -> None:
+    blocks = [
+        {"idx": 1, "text": "Alice says POST completed."},
+        {"idx": 2, "text": "Nothing relevant here."},
+    ]
+    plan = build_translation_plan(
+        blocks=blocks,
+        context_memory={
+            "characters": [
+                {
+                    "name": "Alice",
+                    "target_name": "爱丽丝",
+                    "aliases": ["Al"],
+                    "role": "engineer",
+                }
+            ],
+            "terminology": [
+                {
+                    "source": "POST",
+                    "target": "开机自检",
+                    "meaning": "power-on self-test",
+                }
+            ],
+        },
+    )
+
+    constraints = {
+        (item["source"], item["origin"]): item
+        for item in plan["constraints"]
+    }
+    assert constraints[("Alice", "context_memory_character")]["mode"] == "preferred"
+    assert constraints[("Alice", "context_memory_character")]["applies_to_blocks"] == [1]
+    assert constraints[("POST", "context_memory_term")]["mode"] == "preferred"
+    assert constraints[("POST", "context_memory_term")]["applies_to_blocks"] == [1]
+
+
 def test_translation_validator_flags_hard_term_and_changed_numbers() -> None:
     blocks = [{"idx": 1, "text": "POST reports 450W on H264."}]
     plan = build_translation_plan(
@@ -95,6 +131,129 @@ def test_preferred_term_is_repairable_but_not_blocking() -> None:
     )
     assert [issue["type"] for issue in issues] == ["preferred_term_missing"]
     assert blocking_translation_issues(issues) == []
+
+
+def test_translation_validator_flags_adjacent_duplicate_for_different_sources() -> None:
+    issues = validate_translation_mapping(
+        blocks=[
+            {"idx": 1, "text": "Open the configuration page."},
+            {"idx": 2, "text": "Restart the subtitle worker."},
+        ],
+        translations={
+            1: "打开配置页面。",
+            2: "打开配置页面。",
+        },
+        translation_plan={},
+    )
+
+    duplicates = [issue for issue in issues if issue["type"] == "adjacent_duplicate_translation"]
+    assert [issue["idx"] for issue in duplicates] == [1, 2]
+    assert blocking_translation_issues(duplicates) == []
+
+
+def test_translation_validator_allows_same_translation_for_same_source() -> None:
+    issues = validate_translation_mapping(
+        blocks=[
+            {"idx": 1, "text": "Yes."},
+            {"idx": 2, "text": "Yes."},
+        ],
+        translations={
+            1: "是的。",
+            2: "是的。",
+        },
+        translation_plan={},
+    )
+
+    assert not [issue for issue in issues if issue["type"] == "adjacent_duplicate_translation"]
+
+
+def test_translation_pipeline_repairs_missing_idx_without_retranslating_good_rows() -> None:
+    calls: list[tuple[str, object]] = []
+
+    class FakeAIService:
+        def translate_subtitle_batch(self, **kwargs: object) -> dict[str, object]:
+            calls.append(("translate", kwargs))
+            return {
+                "updated_summary": "network",
+                "translations": [
+                    {"idx": 1, "text": "第一行。"},
+                    {"idx": 3, "text": "第三行。"},
+                ],
+            }
+
+        def repair_subtitle_batch(self, **kwargs: object) -> dict[str, object]:
+            calls.append(("repair", kwargs))
+            assert kwargs["source_blocks"] == [{"idx": 2, "text": "Second line."}]
+            assert kwargs["draft_translations"] == []
+            issues = kwargs["issues"]
+            assert isinstance(issues, list)
+            assert issues[0]["type"] == "missing_translation"
+            return {"translations": [{"idx": 2, "text": "第二行。"}]}
+
+    translated, summary = translate_segments_openai_with_summary(
+        [
+            Segment(0.0, 1.0, "First line."),
+            Segment(1.0, 2.0, "Second line."),
+            Segment(2.0, 3.0, "Third line."),
+        ],
+        target_lang="zh",
+        style="自然",
+        batch_size=3,
+        ai_service=FakeAIService(),  # type: ignore[arg-type]
+    )
+
+    assert [segment.text for segment in translated] == ["第一行。", "第二行。", "第三行。"]
+    assert summary == "network"
+    assert [name for name, _payload in calls] == ["translate", "repair"]
+
+
+def test_translation_pipeline_repairs_adjacent_duplicate_blocks_only() -> None:
+    calls: list[tuple[str, object]] = []
+
+    class FakeAIService:
+        def translate_subtitle_batch(self, **kwargs: object) -> dict[str, object]:
+            calls.append(("translate", kwargs))
+            return {
+                "updated_summary": "ops",
+                "translations": [
+                    {"idx": 1, "text": "打开配置页面。"},
+                    {"idx": 2, "text": "打开配置页面。"},
+                    {"idx": 3, "text": "完成。"},
+                ],
+            }
+
+        def repair_subtitle_batch(self, **kwargs: object) -> dict[str, object]:
+            calls.append(("repair", kwargs))
+            assert kwargs["source_blocks"] == [
+                {"idx": 1, "text": "Open the configuration page."},
+                {"idx": 2, "text": "Restart the subtitle worker."},
+            ]
+            return {
+                "translations": [
+                    {"idx": 1, "text": "打开配置页面。"},
+                    {"idx": 2, "text": "重启字幕 Worker。"},
+                ]
+            }
+
+    translated, summary = translate_segments_openai_with_summary(
+        [
+            Segment(0.0, 1.0, "Open the configuration page."),
+            Segment(1.0, 2.0, "Restart the subtitle worker."),
+            Segment(2.0, 3.0, "Done."),
+        ],
+        target_lang="zh",
+        style="自然",
+        batch_size=3,
+        ai_service=FakeAIService(),  # type: ignore[arg-type]
+    )
+
+    assert [segment.text for segment in translated] == [
+        "打开配置页面。",
+        "重启字幕 Worker。",
+        "完成。",
+    ]
+    assert summary == "ops"
+    assert [name for name, _payload in calls] == ["translate", "repair"]
 
 
 def test_translation_pipeline_repairs_only_failed_block() -> None:

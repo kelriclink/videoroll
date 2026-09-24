@@ -271,15 +271,17 @@ def test_faster_whisper_long_wav_reuses_model_and_bounds_numpy_decode(monkeypatc
     ]
 
     def transcribe(audio, language=None, vad_filter=False, vad_parameters=None, condition_on_previous_text=True,
-                   no_speech_threshold=None, log_prob_threshold=None, compression_ratio_threshold=None):
+                   word_timestamps=False, no_speech_threshold=None, log_prob_threshold=None,
+                   compression_ratio_threshold=None, hallucination_silence_threshold=None):
         assert isinstance(audio, np.ndarray) and audio.dtype == np.float32
         assert audio.ndim == 1 and audio.flags.c_contiguous
         assert audio[0] == 2048 / 32768
         calls.append((len(audio), {
             "language": language, "vad_filter": vad_filter, "vad_parameters": vad_parameters,
-            "condition_on_previous_text": condition_on_previous_text,
+            "condition_on_previous_text": condition_on_previous_text, "word_timestamps": word_timestamps,
             "no_speech_threshold": no_speech_threshold, "log_prob_threshold": log_prob_threshold,
             "compression_ratio_threshold": compression_ratio_threshold,
+            "hallucination_silence_threshold": hallucination_silence_threshold,
         }))
         return iter(results[len(calls) - 1]), SimpleNamespace()
 
@@ -293,13 +295,46 @@ def test_faster_whisper_long_wav_reuses_model_and_bounds_numpy_decode(monkeypatc
     assert [count for count, _ in calls] == [32000, 32000, 19200]
     assert all(kwargs == {
         "language": "ja", "vad_filter": True,
-        "vad_parameters": {"min_silence_duration_ms": 500, "speech_pad_ms": 180},
-        "condition_on_previous_text": False, "no_speech_threshold": 0.45,
-        "log_prob_threshold": -0.8, "compression_ratio_threshold": 2.2,
+        "vad_parameters": {"min_silence_duration_ms": 2000, "speech_pad_ms": 400},
+        "condition_on_previous_text": True, "word_timestamps": True, "no_speech_threshold": 0.6,
+        "log_prob_threshold": -1.0, "compression_ratio_threshold": 2.4,
+        "hallucination_silence_threshold": 1.0,
     } for _, kwargs in calls)
     assert [(item.start, item.end) for item in segments] == pytest.approx([(0.0, 0.5), (1.2, 2.3), (2.6, 3.5), (3.7, 4.2)])
     assert [item.text for item in segments] == ["First phrase", "A shared boundary phrase", "Later speech", "Tail speech"]
     assert all(item.confidence == 0.9 for item in segments)
+
+
+def test_faster_whisper_regroups_words_across_model_segments(monkeypatch, tmp_path) -> None:
+    path = tmp_path / "semantic.wav"
+    _write_wav(path, seconds=4.0)
+    first = _chunk(0.0, 1.6, "This is only")
+    first.words = [
+        SimpleNamespace(start=0.0, end=0.4, word=" This", probability=0.95),
+        SimpleNamespace(start=0.4, end=0.8, word=" is", probability=0.95),
+        SimpleNamespace(start=0.8, end=1.2, word=" only", probability=0.95),
+    ]
+    second = _chunk(1.2, 3.0, "one complete sentence.")
+    second.words = [
+        SimpleNamespace(start=1.2, end=1.6, word=" one", probability=0.95),
+        SimpleNamespace(start=1.6, end=2.1, word=" complete", probability=0.95),
+        SimpleNamespace(start=2.1, end=3.0, word=" sentence.", probability=0.95),
+    ]
+    seen: dict[str, object] = {}
+
+    def transcribe(audio, word_timestamps=False, condition_on_previous_text=False):
+        assert audio == str(path)
+        seen["word_timestamps"] = word_timestamps
+        seen["condition_on_previous_text"] = condition_on_previous_text
+        return iter([first, second]), SimpleNamespace()
+
+    _fake_faster_whisper(monkeypatch, transcribe)
+    segments = processing.transcribe_faster_whisper(path, model_name="large-v3")
+
+    assert seen == {"word_timestamps": True, "condition_on_previous_text": True}
+    assert [(segment.start, segment.end, segment.text) for segment in segments] == [
+        (0.0, 3.0, "This is only one complete sentence.")
+    ]
 
 
 @pytest.mark.parametrize("seconds", [0.5, 2.0])

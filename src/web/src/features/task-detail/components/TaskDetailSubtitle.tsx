@@ -1,6 +1,7 @@
 import type { TaskDetailController } from "../useTaskDetailController";
 import { Link } from "react-router-dom";
 import { normalizeYouTubeSubtitleMode, clampText } from "../utils";
+import { SubtitleQualityContextPanel } from "./SubtitleQualityContextPanel";
 export function TaskDetailSubtitle({ controller }: { controller: TaskDetailController }) {
   const {
     task,
@@ -306,6 +307,8 @@ export function TaskDetailSubtitle({ controller }: { controller: TaskDetailContr
             <span className="text-sm text-slate-500">任务已发布；如需重新生成字幕，请创建新任务。</span>
           ) : null}
         </div>
+
+        <SubtitleQualityContextPanel controller={controller} />
 
         <div className="mt-4">
           <div className="text-xs font-semibold text-slate-700">Subtitle Jobs</div>

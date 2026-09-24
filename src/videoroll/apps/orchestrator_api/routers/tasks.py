@@ -14,6 +14,7 @@ from videoroll.apps.orchestrator_api.schemas import (
     RemoteJobResponse,
     SubtitleActionRequest,
     SubtitleJobSummary,
+    SubtitleRetranslateRequest,
     TaskCreate,
     TaskBulkControlResponse,
     TaskRead,
@@ -151,6 +152,21 @@ def enqueue_subtitle_job(
     store: FileStore = Depends(get_store),
 ) -> RemoteJobResponse:
     return subtitle_service.enqueue_subtitle_job(task_id, payload, settings=settings, db=db, store=store)
+
+
+@router.post("/tasks/{task_id}/actions/subtitle_retranslate", response_model=RemoteJobResponse)
+def retranslate_subtitle_indices(
+    task_id: uuid.UUID,
+    payload: SubtitleRetranslateRequest,
+    settings: OrchestratorSettings = Depends(get_settings),
+    db: Session = Depends(get_db),
+) -> RemoteJobResponse:
+    return subtitle_service.enqueue_selective_subtitle_retranslation(
+        task_id,
+        payload,
+        settings=settings,
+        db=db,
+    )
 
 
 @router.post("/tasks/{task_id}/actions/subtitle_resume", response_model=RemoteJobResponse)

@@ -11,6 +11,10 @@ from videoroll.apps.subtitle_service.processing import (
     segments_to_json_data,
     write_json,
 )
+from videoroll.apps.subtitle_service.translation_context import (
+    context_memory_is_empty,
+    sanitize_translation_context_memory,
+)
 
 
 class CheckpointObjectStore(Protocol):
@@ -57,24 +61,39 @@ class TranslationCheckpointStore:
         *,
         source_segments_key: str | None,
     ) -> tuple[list[Segment], str]:
+        translated_prefix, summary, _context_state = self.load_with_context(
+            source,
+            source_segments_key=source_segments_key,
+        )
+        return translated_prefix, summary
+
+    def load_with_context(
+        self,
+        source: list[Segment],
+        *,
+        source_segments_key: str | None,
+    ) -> tuple[list[Segment], str, dict[str, object]]:
         if not source or not source_segments_key:
-            return [], ""
+            return [], "", {}
         try:
             self._store.download_file(self._key, self._local_path)
             payload = json.loads(self._local_path.read_text(encoding="utf-8"))
         except Exception:
-            return [], ""
+            return [], "", {}
 
         if not isinstance(payload, dict):
-            return [], ""
+            return [], "", {}
         if str(payload.get("source_segments_key") or "").strip() != str(source_segments_key or "").strip():
-            return [], ""
+            return [], "", {}
 
         translated_prefix = segments_from_json_data(payload.get("translated_segments"))
         if not translated_prefix or not self._matches(source, translated_prefix):
-            return [], ""
+            return [], "", {}
         summary = str(payload.get("summary") or "").strip()[:500]
-        return translated_prefix, summary
+        context_state = sanitize_translation_context_memory(payload.get("context_state"))
+        if context_memory_is_empty(context_state):
+            context_state = {}
+        return translated_prefix, summary, context_state
 
     def save(
         self,
@@ -82,6 +101,7 @@ class TranslationCheckpointStore:
         translated_prefix: list[Segment],
         *,
         summary: str,
+        context_state: dict[str, object] | None = None,
     ) -> None:
         if not source_segments_key or not translated_prefix:
             return
@@ -90,6 +110,9 @@ class TranslationCheckpointStore:
             "summary": str(summary or "").strip()[:500],
             "translated_segments": segments_to_json_data(translated_prefix),
         }
+        clean_context = sanitize_translation_context_memory(context_state)
+        if not context_memory_is_empty(clean_context):
+            payload["context_state"] = clean_context
         try:
             write_json(self._local_path, payload)
             self._store.upload_file(self._local_path, self._key, content_type="application/json")

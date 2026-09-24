@@ -1,6 +1,11 @@
-import { useEffect, useState, type Dispatch, type SetStateAction } from "react";
+import { useCallback, useEffect, useMemo, useState, type Dispatch, type SetStateAction } from "react";
 import { useToast } from "../../../components/feedbackContext";
-import { subtitleApi } from "../../../api/subtitle";
+import {
+  subtitleApi,
+  type SubtitleQualityResponse,
+  type TranslationContextMemory,
+  type TranslationContextResponse,
+} from "../../../api/subtitle";
 import type { Asset, SubtitleJob, Task } from "../../../lib/types";
 import type { YouTubeSubtitleMode } from "../types";
 import { normalizeYouTubeSubtitleMode } from "../utils";
@@ -52,6 +57,9 @@ export function useTaskSubtitle({
   const [translateStyle, setTranslateStyle] = useState("口语自然");
   const [translateEnableSummary, setTranslateEnableSummary] = useState(true);
   const [openaiKeySet, setOpenaiKeySet] = useState<boolean | null>(null);
+  const [subtitleQuality, setSubtitleQuality] = useState<SubtitleQualityResponse | null>(null);
+  const [translationContext, setTranslationContext] = useState<TranslationContextResponse | null>(null);
+  const [subtitleReviewLoading, setSubtitleReviewLoading] = useState(false);
 
   useEffect(() => {
     void subtitleApi.models()
@@ -95,6 +103,77 @@ export function useTaskSubtitle({
       }
     })();
   }, [taskId, setPublishTypeidMode]);
+
+  const refreshSubtitleReview = useCallback(async () => {
+    if (!taskId) return;
+    setSubtitleReviewLoading(true);
+    try {
+      const [quality, context] = await Promise.all([
+        subtitleApi.quality(taskId).catch(() => null),
+        subtitleApi.translationContext(taskId).catch(() => null),
+      ]);
+      setSubtitleQuality(quality);
+      setTranslationContext(context);
+    } finally {
+      setSubtitleReviewLoading(false);
+    }
+  }, [taskId]);
+
+  const latestSubtitleReviewKey = useMemo(() => {
+    const latest = (subtitleJobs ?? [])[0];
+    if (!latest) return "";
+    return `${latest.id}:${latest.status}:${latest.updated_at}`;
+  }, [subtitleJobs]);
+
+  useEffect(() => {
+    if (!taskId || !latestSubtitleReviewKey) return;
+    const latestStatus = String((subtitleJobs ?? [])[0]?.status ?? "").toLowerCase();
+    if (!["completed", "succeeded", "done"].includes(latestStatus)) return;
+    void refreshSubtitleReview();
+  }, [taskId, latestSubtitleReviewKey, refreshSubtitleReview, subtitleJobs]);
+
+  async function saveTranslationContext(summary: string, memory: TranslationContextMemory) {
+    if (!taskId) return null;
+    setBusy(true);
+    setError(null);
+    try {
+      const result = await subtitleApi.updateTranslationContext(taskId, { summary, memory });
+      setTranslationContext(result);
+      toast({
+        kind: "success",
+        title: "翻译上下文已保存",
+        message: result.affected_indices.length
+          ? `检测到 ${result.affected_indices.length} 条字幕受影响`
+          : "没有检测到需要重翻的字幕",
+      });
+      return result;
+    } catch (error: unknown) {
+      setError(error instanceof Error ? error.message : String(error));
+      return null;
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function retranslateAffected(indices: number[]) {
+    if (!taskId || indices.length === 0) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const response = await subtitleApi.retranslate(taskId, indices);
+      await refresh({ silent: true });
+      toast({
+        kind: "success",
+        title: "已提交选择性重翻",
+        message: `${indices.length} 条字幕 · ${response.job_id}`,
+      });
+      return response;
+    } catch (error: unknown) {
+      setError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setBusy(false);
+    }
+  }
 
   async function submitSubtitleJob(opts: { resume: boolean }) {
     if (!taskId) return;
@@ -199,6 +278,12 @@ export function useTaskSubtitle({
     setTranslateEnableSummary,
     openaiKeySet,
     submitSubtitleJob,
+    subtitleQuality,
+    translationContext,
+    subtitleReviewLoading,
+    refreshSubtitleReview,
+    saveTranslationContext,
+    retranslateAffected,
     canResumeSubtitle,
   };
 }

@@ -43,18 +43,37 @@ from videoroll.apps.subtitle_service.translation_quality import (
     build_translation_plan,
     validate_translation_mapping,
 )
+from videoroll.apps.subtitle_service.translation_context import (
+    build_translation_context_state,
+    build_translation_scenes,
+    choose_translation_batch_end,
+    derive_translation_scene_profile,
+    ground_translation_context_update,
+    merge_translation_context_memory,
+    sanitize_translation_context_memory,
+)
 from videoroll.utils.openai_compat import build_openai_audio_transcriptions_url
 
 logger = logging.getLogger(__name__)
 
-_FW_VAD_MIN_SILENCE_MS = 500
-_FW_VAD_SPEECH_PAD_MS = 180
-_FW_NO_SPEECH_THRESHOLD = 0.45
-_FW_LOG_PROB_THRESHOLD = -0.8
-_FW_COMPRESSION_RATIO_THRESHOLD = 2.2
-_EXTERNAL_WHISPER_DEFAULT_MAX_SEGMENT_SECONDS = 6.0
-_EXTERNAL_WHISPER_DEFAULT_MAX_SEGMENT_CHARS = 80
-_EXTERNAL_WHISPER_MIN_PUNCTUATION_SPLIT_SECONDS = 1.5
+_FW_VAD_MIN_SILENCE_MS = 2000
+_FW_VAD_SPEECH_PAD_MS = 400
+_FW_NO_SPEECH_THRESHOLD = 0.6
+_FW_LOG_PROB_THRESHOLD = -1.0
+_FW_COMPRESSION_RATIO_THRESHOLD = 2.4
+_FW_HALLUCINATION_SILENCE_THRESHOLD = 1.0
+_EXTERNAL_WHISPER_DEFAULT_MAX_SEGMENT_SECONDS = 12.0
+_EXTERNAL_WHISPER_DEFAULT_MAX_SEGMENT_CHARS = 120
+_SEMANTIC_ASR_GAP_SECONDS = 0.7
+_SEMANTIC_ASR_SOFT_GAP_SECONDS = 0.45
+_SEMANTIC_ASR_SOFT_SECONDS = 8.0
+_SEMANTIC_ASR_TARGET_MIN_SECONDS = 1.5
+_SEMANTIC_ASR_TARGET_MAX_SECONDS = 7.0
+_SEMANTIC_ASR_MAX_WORDS = 24
+_SEMANTIC_ASR_MIN_SEGMENT_SECONDS = 0.8
+_SEMANTIC_ASR_TINY_SECONDS = 1.1
+_SEMANTIC_ASR_TINY_CHARS = 8
+_SEMANTIC_ASR_SOFT_CPS = 20.0
 _ASR_SILENCE_PEAK_THRESHOLD = 0.005
 _ASR_SILENCE_RMS_THRESHOLD = 0.0008
 _ASR_SILENCE_ACTIVE_THRESHOLD = 0.015
@@ -92,6 +111,14 @@ class Segment:
     text: str
     confidence: float | None = None
     secondary_text: str | None = None
+
+
+@dataclass(frozen=True)
+class _ASRWord:
+    start: float
+    end: float
+    text: str
+    probability: float | None = None
 
 
 @dataclass(frozen=True)
@@ -615,14 +642,19 @@ def transcribe_faster_whisper(
             "speech_pad_ms": _FW_VAD_SPEECH_PAD_MS,
         }
     if "condition_on_previous_text" in supported:
-        # Avoid propagating hallucinated context across silent / music-only spans.
-        transcribe_kwargs["condition_on_previous_text"] = False
+        # Continuous speech benefits from cross-window linguistic context. The
+        # VAD/no-speech/hallucination thresholds below still reset bad spans.
+        transcribe_kwargs["condition_on_previous_text"] = True
+    if "word_timestamps" in supported:
+        transcribe_kwargs["word_timestamps"] = True
     if "no_speech_threshold" in supported:
         transcribe_kwargs["no_speech_threshold"] = _FW_NO_SPEECH_THRESHOLD
     if "log_prob_threshold" in supported:
         transcribe_kwargs["log_prob_threshold"] = _FW_LOG_PROB_THRESHOLD
     if "compression_ratio_threshold" in supported:
         transcribe_kwargs["compression_ratio_threshold"] = _FW_COMPRESSION_RATIO_THRESHOLD
+    if "hallucination_silence_threshold" in supported:
+        transcribe_kwargs["hallucination_silence_threshold"] = _FW_HALLUCINATION_SILENCE_THRESHOLD
 
     def transcribe_window(audio: Any) -> list[Segment]:
         try:
@@ -635,6 +667,13 @@ def transcribe_faster_whisper(
                 return []
             raise
         kept = _filter_faster_whisper_segments(raw_segments)
+        words = _faster_whisper_words(raw_segments)
+        if words:
+            kept = _semantic_regroup_asr_words(
+                words,
+                max_segment_seconds=_EXTERNAL_WHISPER_DEFAULT_MAX_SEGMENT_SECONDS,
+                max_segment_chars=_EXTERNAL_WHISPER_DEFAULT_MAX_SEGMENT_CHARS,
+            )
         if raw_segments:
             logger.info("faster-whisper kept %d/%d segments for %s", len(kept), len(raw_segments), audio_path)
         return kept
@@ -674,66 +713,341 @@ def transcribe_faster_whisper(
     return reconcile_overlapping_asr_segments(out)
 
 
-def _external_word_segments(
-    item: dict[str, Any],
-    *,
-    max_segment_seconds: float,
-    max_segment_chars: int,
-) -> list[Segment]:
-    raw_words = item.get("words")
-    if not isinstance(raw_words, list):
-        return []
+def _word_probability(value: Any) -> float | None:
+    try:
+        if value is None:
+            return None
+        return max(0.0, min(1.0, float(value)))
+    except (TypeError, ValueError):
+        return None
 
-    words: list[tuple[float, float, str]] = []
-    for raw in raw_words:
-        if not isinstance(raw, dict):
-            continue
-        word = str(raw.get("word") or "")
-        if not word.strip():
-            continue
-        try:
-            start = max(0.0, float(raw.get("start")))
-            end = max(start, float(raw.get("end")))
-        except (TypeError, ValueError):
-            continue
-        if end <= start:
-            continue
-        words.append((start, end, word))
+
+def _join_asr_word_text(words: Sequence[_ASRWord]) -> str:
+    raw_parts = [word.text for word in words if str(word.text or "").strip()]
+    if not raw_parts:
+        return ""
+    raw = "".join(raw_parts)
+    normalized = _normalize_asr_text(raw)
+    # Whisper normally preserves leading spaces on Latin-script words. A few
+    # compatible servers do not, so repair only the unambiguous all-ASCII case
+    # while leaving CJK concatenation untouched.
+    if " " not in raw and len(raw_parts) > 1:
+        stripped = [part.strip() for part in raw_parts]
+        if all(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9'’._-]*[,.!?;:]*", part) for part in stripped):
+            normalized = re.sub(r"\s+([,.!?;:])", r"\1", " ".join(stripped))
+    return normalized
+
+
+def _asr_text_has_terminal_punctuation(text: str) -> bool:
+    return bool(re.search(r"[.!?。！？]+[\"'”’）)\]]*$", text))
+
+
+def _asr_text_has_weak_punctuation(text: str) -> bool:
+    return bool(re.search(r"[,，、;；:：]+[\"'”’）)\]]*$", text))
+
+
+def _segment_from_asr_words(words: Sequence[_ASRWord]) -> Segment | None:
     if not words:
+        return None
+    text = _join_asr_word_text(words)
+    if not text:
+        return None
+    probabilities = [word.probability for word in words if word.probability is not None]
+    confidence = round(sum(probabilities) / len(probabilities), 4) if probabilities else None
+    return Segment(
+        start=max(0.0, float(words[0].start)),
+        end=max(float(words[0].start), float(words[-1].end)),
+        text=text,
+        confidence=confidence,
+    )
+
+
+def _asr_reading_units(text: str) -> int:
+    """Approximate subtitle reading load without assuming a specific language."""
+    return len(re.sub(r"\s+", "", text))
+
+
+def _asr_boundary_score(
+    words: Sequence[_ASRWord],
+    index: int,
+    *,
+    penalize_single_tail: bool = True,
+) -> float:
+    """Score the boundary after words[index]; higher means more natural."""
+    if index < 0 or index >= len(words) - 1:
+        return float("-inf")
+    left = words[: index + 1]
+    right = words[index + 1 :]
+    left_text = _join_asr_word_text(left)
+    duration = max(0.0, float(left[-1].end) - float(left[0].start))
+    gap = max(0.0, float(right[0].start) - float(left[-1].end))
+
+    score = 0.0
+    if _asr_text_has_terminal_punctuation(left_text):
+        score += 100.0
+    elif _asr_text_has_weak_punctuation(left_text):
+        score += 34.0
+
+    if gap >= 1.2:
+        score += 90.0
+    elif gap >= _SEMANTIC_ASR_GAP_SECONDS:
+        score += 72.0
+    elif gap >= _SEMANTIC_ASR_SOFT_GAP_SECONDS:
+        score += 38.0
+
+    if _SEMANTIC_ASR_TARGET_MIN_SECONDS <= duration <= _SEMANTIC_ASR_TARGET_MAX_SECONDS:
+        score += 12.0
+    elif duration < _SEMANTIC_ASR_MIN_SEGMENT_SECONDS:
+        score -= 60.0
+
+    # Avoid producing tiny dangling tails when another candidate is available.
+    if penalize_single_tail and len(right) == 1:
+        score -= 18.0
+    return score
+
+
+def _best_asr_split_index(
+    words: Sequence[_ASRWord],
+    *,
+    minimum_score: float | None = None,
+    penalize_single_tail: bool = True,
+) -> int | None:
+    if len(words) < 3:
+        return None
+    candidates: list[tuple[float, int]] = []
+    for index in range(0, len(words) - 1):
+        left_duration = max(0.0, float(words[index].end) - float(words[0].start))
+        if left_duration < _SEMANTIC_ASR_MIN_SEGMENT_SECONDS and index + 1 < 3:
+            continue
+        score = _asr_boundary_score(words, index, penalize_single_tail=penalize_single_tail)
+        if minimum_score is None or score >= minimum_score:
+            candidates.append((score, index))
+    if not candidates:
+        return None
+    # Prefer the strongest linguistic/acoustic boundary; for ties, prefer the
+    # later boundary to keep captions reasonably full.
+    return max(candidates, key=lambda item: (item[0], item[1]))[1]
+
+
+def _can_merge_asr_word_chunks(
+    left: Sequence[_ASRWord],
+    right: Sequence[_ASRWord],
+    *,
+    hard_seconds: float,
+    max_chars: int,
+) -> bool:
+    if not left or not right:
+        return False
+    gap = max(0.0, float(right[0].start) - float(left[-1].end))
+    if gap >= _SEMANTIC_ASR_GAP_SECONDS:
+        return False
+    combined = [*left, *right]
+    text = _join_asr_word_text(combined)
+    duration = max(0.0, float(combined[-1].end) - float(combined[0].start))
+    return (
+        duration <= hard_seconds
+        and len(text) <= max_chars
+        and len(combined) <= _SEMANTIC_ASR_MAX_WORDS
+    )
+
+
+def _merge_tiny_asr_word_chunks(
+    chunks: Sequence[Sequence[_ASRWord]],
+    *,
+    hard_seconds: float,
+    max_chars: int,
+) -> list[list[_ASRWord]]:
+    merged = [list(chunk) for chunk in chunks if chunk]
+    index = 0
+    while index < len(merged):
+        chunk = merged[index]
+        text = _join_asr_word_text(chunk)
+        duration = max(0.0, float(chunk[-1].end) - float(chunk[0].start))
+        terminal = _asr_text_has_terminal_punctuation(text)
+        tiny = (
+            not terminal
+            and (
+                duration < _SEMANTIC_ASR_TINY_SECONDS
+                or _asr_reading_units(text) <= _SEMANTIC_ASR_TINY_CHARS
+                or len(chunk) <= 1
+            )
+        )
+        if not tiny:
+            index += 1
+            continue
+
+        # Prefer merging a connective/fragment into what follows. This fixes
+        # subtitles such as "so" / "therefore" / "所以" becoming standalone.
+        if index + 1 < len(merged) and _can_merge_asr_word_chunks(
+            chunk, merged[index + 1], hard_seconds=hard_seconds, max_chars=max_chars
+        ):
+            merged[index : index + 2] = [[*chunk, *merged[index + 1]]]
+            continue
+        if index > 0 and _can_merge_asr_word_chunks(
+            merged[index - 1], chunk, hard_seconds=hard_seconds, max_chars=max_chars
+        ):
+            merged[index - 1 : index + 1] = [[*merged[index - 1], *chunk]]
+            index = max(0, index - 1)
+            continue
+        index += 1
+    return merged
+
+
+def _semantic_regroup_asr_words(
+    words: Iterable[_ASRWord],
+    *,
+    max_segment_seconds: float = _EXTERNAL_WHISPER_DEFAULT_MAX_SEGMENT_SECONDS,
+    max_segment_chars: int = _EXTERNAL_WHISPER_DEFAULT_MAX_SEGMENT_CHARS,
+) -> list[Segment]:
+    """Build semantic subtitle clauses from one global word timeline."""
+    hard_seconds = max(4.0, min(30.0, float(max_segment_seconds)))
+    max_chars = max(24, min(500, int(max_segment_chars)))
+    soft_seconds = min(_SEMANTIC_ASR_SOFT_SECONDS, hard_seconds)
+    ordered = sorted(
+        (
+            word
+            for word in words
+            if str(word.text or "").strip() and float(word.end) > float(word.start)
+        ),
+        key=lambda word: (float(word.start), float(word.end)),
+    )
+    if not ordered:
         return []
 
-    chunks: list[Segment] = []
-    current: list[tuple[float, float, str]] = []
+    word_chunks: list[list[_ASRWord]] = []
+    current: list[_ASRWord] = []
 
-    def flush() -> None:
-        if not current:
-            return
-        text = _normalize_asr_text("".join(word for _, _, word in current))
-        if text:
-            chunks.append(Segment(start=current[0][0], end=current[-1][1], text=text))
-        current.clear()
+    def emit(values: Sequence[_ASRWord]) -> None:
+        if values:
+            word_chunks.append(list(values))
 
-    for word in words:
+    for word in ordered:
         if current:
-            candidate_text = _normalize_asr_text(
-                "".join(value for _, _, value in [*current, word])
-            )
-            candidate_duration = max(0.0, word[1] - current[0][0])
-            if candidate_duration > max_segment_seconds or len(candidate_text) > max_segment_chars:
-                flush()
+            gap = max(0.0, float(word.start) - float(current[-1].end))
+            current_duration = max(0.0, float(current[-1].end) - float(current[0].start))
+            if gap >= _SEMANTIC_ASR_GAP_SECONDS and (
+                current_duration >= _SEMANTIC_ASR_MIN_SEGMENT_SECONDS or len(current) >= 2
+            ):
+                emit(current)
+                current = []
 
         current.append(word)
-        text = _normalize_asr_text("".join(value for _, _, value in current))
-        duration = max(0.0, current[-1][1] - current[0][0])
-        punctuated = bool(re.search(r"[.!?。！？；;：:]+[\"'”’）)\]]*$", text))
-        soft_boundary = punctuated and duration >= min(
-            max_segment_seconds,
-            _EXTERNAL_WHISPER_MIN_PUNCTUATION_SPLIT_SECONDS,
+        text = _join_asr_word_text(current)
+        duration = max(0.0, float(current[-1].end) - float(current[0].start))
+        reading_units = _asr_reading_units(text)
+        cps = reading_units / max(duration, 0.25)
+
+        if _asr_text_has_terminal_punctuation(text) and (
+            duration >= _SEMANTIC_ASR_MIN_SEGMENT_SECONDS or len(current) >= 2
+        ):
+            emit(current)
+            current = []
+            continue
+
+        soft_pressure = (
+            duration >= soft_seconds
+            or len(current) >= 16
+            or len(text) >= int(max_chars * 0.75)
+            or (duration >= 3.0 and cps >= _SEMANTIC_ASR_SOFT_CPS)
         )
-        if soft_boundary:
-            flush()
-    flush()
-    return chunks
+        if soft_pressure and len(current) >= 3:
+            split_index = _best_asr_split_index(current, minimum_score=30.0)
+            if split_index is not None:
+                emit(current[: split_index + 1])
+                current = current[split_index + 1 :]
+                continue
+
+        exceeds_hard_limit = (
+            duration > hard_seconds
+            or len(text) > max_chars
+            or len(current) > _SEMANTIC_ASR_MAX_WORDS
+        )
+        if exceeds_hard_limit and len(current) > 1:
+            split_index = _best_asr_split_index(current, penalize_single_tail=False)
+            if split_index is None:
+                # Never split inside a word. Leave the newest word on the next
+                # caption so the emitted caption stays within the hard bound.
+                split_index = len(current) - 2
+            emit(current[: split_index + 1])
+            current = current[split_index + 1 :]
+
+    if current:
+        emit(current)
+
+    word_chunks = _merge_tiny_asr_word_chunks(
+        word_chunks,
+        hard_seconds=hard_seconds,
+        max_chars=max_chars,
+    )
+    out: list[Segment] = []
+    for chunk in word_chunks:
+        segment = _segment_from_asr_words(chunk)
+        if segment is not None:
+            out.append(segment)
+    return out
+
+
+def _faster_whisper_words(raw_segments: Sequence[Any]) -> list[_ASRWord]:
+    words: list[_ASRWord] = []
+    for raw_seg in raw_segments:
+        seg_text = _normalize_asr_text(getattr(raw_seg, "text", ""))
+        if not seg_text or _segment_is_probably_non_speech(raw_seg, seg_text):
+            continue
+        raw_words = getattr(raw_seg, "words", None)
+        if not raw_words:
+            continue
+        for raw_word in raw_words:
+            word_text = str(getattr(raw_word, "word", "") or "")
+            if not word_text.strip():
+                continue
+            try:
+                start = max(0.0, float(getattr(raw_word, "start")))
+                end = max(start, float(getattr(raw_word, "end")))
+            except (TypeError, ValueError):
+                continue
+            if end <= start:
+                continue
+            words.append(
+                _ASRWord(
+                    start=start,
+                    end=end,
+                    text=word_text,
+                    probability=_word_probability(getattr(raw_word, "probability", None)),
+                )
+            )
+    return words
+
+
+def _external_whisper_words(segments_raw: Sequence[Any]) -> list[_ASRWord]:
+    words: list[_ASRWord] = []
+    for item in segments_raw:
+        if not isinstance(item, dict):
+            continue
+        raw_words = item.get("words")
+        if not isinstance(raw_words, list):
+            continue
+        for raw in raw_words:
+            if not isinstance(raw, dict):
+                continue
+            word_text = str(raw.get("word") or "")
+            if not word_text.strip():
+                continue
+            try:
+                start = max(0.0, float(raw.get("start")))
+                end = max(start, float(raw.get("end")))
+            except (TypeError, ValueError):
+                continue
+            if end <= start:
+                continue
+            words.append(
+                _ASRWord(
+                    start=start,
+                    end=end,
+                    text=word_text,
+                    probability=_word_probability(raw.get("probability")),
+                )
+            )
+    return words
 
 
 def _external_text_segments(
@@ -748,14 +1062,17 @@ def _external_text_segments(
     if not normalized:
         return []
     duration = max(0.0, end - start)
-    if duration <= max_segment_seconds and len(normalized) <= max_segment_chars:
+    # Without word timestamps, preserving the provider's sentence is safer
+    # than inventing a time boundary. Only degrade to text-based splitting for
+    # truly oversized captions.
+    if duration <= max_segment_seconds * 2.0 and len(normalized) <= max_segment_chars * 2:
         return [Segment(start=start, end=end, text=normalized)]
 
-    # Prefer sentence/phrase boundaries; fall back to whitespace and finally
+    # Prefer sentence/phrase boundaries; fall back to whitespace and only then
     # fixed character chunks for CJK/no-space transcripts.
     units = [
         part.strip()
-        for part in re.findall(r".+?(?:[。！？!?；;：:]+|(?<=[,.，、])\s+|$)", normalized)
+        for part in re.findall(r".+?(?:[。！？!?]+|[；;：:]+|(?<=[,.，、])\s+|$)", normalized)
         if part.strip()
     ]
     if len(units) <= 1:
@@ -790,42 +1107,18 @@ def _external_text_segments(
     if current:
         chunks.append(current)
 
-    required_by_time = max(1, int(math.ceil(duration / max_segment_seconds))) if duration > 0 else 1
-    while len(chunks) < required_by_time:
-        candidates = [
-            index
-            for index, value in enumerate(chunks)
-            if (" " in value and len(value.split()) > 1) or len(value) > 1
-        ]
-        if not candidates:
-            break
-        index = max(candidates, key=lambda i: len(chunks[i]))
-        value = chunks.pop(index)
-        if " " in value and len(value.split()) > 1:
-            parts = value.split()
-            pivot = max(1, len(parts) // 2)
-            split = (" ".join(parts[:pivot]), " ".join(parts[pivot:]))
-        else:
-            pivot = max(1, len(value) // 2)
-            split = (value[:pivot], value[pivot:])
-        parts = [part for part in split if part]
-        if len(parts) < 2:
-            chunks.insert(index, value)
-            break
-        chunks[index:index] = parts
-
-    if len(chunks) < required_by_time:
-        raise RuntimeError(
-            "online Whisper timestamps are too coarse to build subtitle-sized segments "
-            f"(duration={duration:.2f}s, text_chars={len(normalized)}); "
-            "enable segment/word timestamps on the ASR service"
-        )
-
     cursor = start
     out: list[Segment] = []
-    step = duration / len(chunks) if chunks and duration > 0 else 0.0
+    weights = [max(1, len(chunk.replace(" ", ""))) for chunk in chunks]
+    total_weight = sum(weights)
+    consumed_weight = 0
     for index, chunk in enumerate(chunks):
-        chunk_end = end if index == len(chunks) - 1 else min(end, start + step * (index + 1))
+        consumed_weight += weights[index]
+        chunk_end = (
+            end
+            if index == len(chunks) - 1 or total_weight <= 0
+            else min(end, start + duration * (consumed_weight / total_weight))
+        )
         chunk_end = max(cursor, chunk_end)
         out.append(Segment(start=cursor, end=chunk_end, text=chunk))
         cursor = chunk_end
@@ -842,9 +1135,16 @@ def _normalize_external_whisper_payload(
     max_seconds = max(1.0, min(30.0, float(max_segment_seconds)))
     max_chars = max(10, min(500, int(max_segment_chars)))
     segments_raw = payload.get("segments")
-    out: list[Segment] = []
-
     if isinstance(segments_raw, list):
+        words = _external_whisper_words(segments_raw)
+        if words:
+            return _semantic_regroup_asr_words(
+                words,
+                max_segment_seconds=max_seconds,
+                max_segment_chars=max_chars,
+            )
+
+        out: list[Segment] = []
         for item in segments_raw:
             if not isinstance(item, dict):
                 continue
@@ -857,35 +1157,26 @@ def _normalize_external_whisper_payload(
             except (TypeError, ValueError):
                 start, end = 0.0, 0.0
 
-            if end - start <= max_seconds and len(text) <= max_chars:
+            if end - start <= max_seconds * 2.0 and len(text) <= max_chars * 2:
                 out.append(Segment(start=start, end=end, text=text))
                 continue
-
-            word_segments = _external_word_segments(
-                item,
-                max_segment_seconds=max_seconds,
-                max_segment_chars=max_chars,
+            logger.warning(
+                "online Whisper returned an oversized segment without usable word timestamps: "
+                "duration=%.2fs chars=%d; using degraded punctuation-aware text split",
+                end - start,
+                len(text),
             )
-            if word_segments:
-                out.extend(word_segments)
-            else:
-                logger.warning(
-                    "online Whisper returned an oversized segment without usable word timestamps: "
-                    "duration=%.2fs chars=%d; using proportional text split",
-                    end - start,
-                    len(text),
+            out.extend(
+                _external_text_segments(
+                    text,
+                    start=start,
+                    end=end,
+                    max_segment_seconds=max_seconds,
+                    max_segment_chars=max_chars,
                 )
-                out.extend(
-                    _external_text_segments(
-                        text,
-                        start=start,
-                        end=end,
-                        max_segment_seconds=max_seconds,
-                        max_segment_chars=max_chars,
-                    )
-                )
-    if out:
-        return out
+            )
+        if out:
+            return out
 
     text = _normalize_asr_text(str(payload.get("text") or ""))
     if not text:
@@ -914,9 +1205,9 @@ def transcribe_external_whisper(
     batch_size: int = 1,
     vad_filter: bool = True,
     vad_threshold: float = 0.5,
-    min_silence_duration_ms: int = 500,
-    speech_pad_ms: int = 180,
-    condition_on_previous_text: bool = False,
+    min_silence_duration_ms: int = 2000,
+    speech_pad_ms: int = 400,
+    condition_on_previous_text: bool = True,
     max_segment_seconds: float = _EXTERNAL_WHISPER_DEFAULT_MAX_SEGMENT_SECONDS,
     max_segment_chars: int = _EXTERNAL_WHISPER_DEFAULT_MAX_SEGMENT_CHARS,
 ) -> list[Segment]:
@@ -2080,6 +2371,10 @@ def _detect_silero_speech_spans(
     audio_data: Sequence[float],
     *,
     threshold: float = _OPENVINO_VAD_THRESHOLD,
+    min_speech_duration_ms: int = _OPENVINO_VAD_MIN_SPEECH_MS,
+    max_speech_duration_s: float = _OPENVINO_VAD_MAX_SPEECH_SECONDS,
+    min_silence_duration_ms: int = _OPENVINO_VAD_MIN_SILENCE_MS,
+    speech_pad_ms: int = _OPENVINO_VAD_SPEECH_PAD_MS,
 ) -> list[_OpenVinoSpeechSpan] | None:
     """Return Silero VAD speech spans, or None when VAD is unavailable.
 
@@ -2103,10 +2398,10 @@ def _detect_silero_speech_spans(
             samples,
             vad_options=VadOptions(
                 threshold=max(0.01, min(0.99, float(threshold))),
-                min_speech_duration_ms=_OPENVINO_VAD_MIN_SPEECH_MS,
-                max_speech_duration_s=_OPENVINO_VAD_MAX_SPEECH_SECONDS,
-                min_silence_duration_ms=_OPENVINO_VAD_MIN_SILENCE_MS,
-                speech_pad_ms=_OPENVINO_VAD_SPEECH_PAD_MS,
+                min_speech_duration_ms=max(1, int(min_speech_duration_ms)),
+                max_speech_duration_s=max(0.5, float(max_speech_duration_s)),
+                min_silence_duration_ms=max(1, int(min_silence_duration_ms)),
+                speech_pad_ms=max(0, int(speech_pad_ms)),
             ),
             sampling_rate=_ASR_SAMPLE_RATE,
         )
@@ -2128,6 +2423,142 @@ def _detect_silero_speech_spans(
         if end > start:
             spans.append(_OpenVinoSpeechSpan(start_sample=start, end_sample=end))
     return spans
+
+
+def refine_asr_segment_timing(
+    audio_path: Path,
+    segments: Iterable[Segment],
+    *,
+    threshold: float = 0.5,
+    margin_seconds: float = 0.35,
+    max_shift_seconds: float = 0.45,
+    minimum_duration: float = 0.12,
+) -> list[Segment]:
+    """Snap subtitle timing toward real speech while preserving semantic text.
+
+    The function reads only small windows around each caption. Silero VAD is
+    optional: unsupported/non-WAV sources simply keep the reconciled ASR timing.
+    """
+    source = reconcile_overlapping_asr_segments(segments, minimum_duration=minimum_duration)
+    if not source:
+        return []
+
+    margin = max(0.05, min(1.5, float(margin_seconds)))
+    max_shift = max(0.05, min(1.5, float(max_shift_seconds)))
+    min_duration = max(0.05, float(minimum_duration))
+    refined: list[Segment] = []
+
+    for segment in source:
+        window_start = max(0.0, float(segment.start) - margin)
+        window_end = max(window_start, float(segment.end) + margin)
+        try:
+            audio_data = _read_wav_window_as_float_mono_16k(
+                audio_path,
+                offset=window_start,
+                duration=window_end - window_start,
+            )
+        except Exception as exc:
+            logger.debug(
+                "ASR timing refiner skipped for %s (%s): %s",
+                audio_path,
+                type(exc).__name__,
+                exc,
+            )
+            return source
+
+        spans = _detect_silero_speech_spans(
+            audio_data,
+            threshold=threshold,
+            min_speech_duration_ms=120,
+            max_speech_duration_s=max(30.0, (window_end - window_start) + 1.0),
+            min_silence_duration_ms=160,
+            speech_pad_ms=80,
+        )
+        if spans is None:
+            return source
+        if not spans:
+            refined.append(segment)
+            continue
+
+        absolute_spans = [
+            (
+                window_start + span.start_sample / float(_ASR_SAMPLE_RATE),
+                window_start + span.end_sample / float(_ASR_SAMPLE_RATE),
+            )
+            for span in spans
+        ]
+        relevant = [
+            (start, end)
+            for start, end in absolute_spans
+            if end > float(segment.start) and start < float(segment.end)
+        ]
+        if not relevant:
+            refined.append(segment)
+            continue
+
+        speech_start = min(start for start, _ in relevant)
+        speech_end = max(end for _, end in relevant)
+        lower_start = max(0.0, float(segment.start) - max_shift)
+        upper_start = float(segment.start) + max_shift
+        lower_end = max(float(segment.start) + min_duration, float(segment.end) - max_shift)
+        upper_end = float(segment.end) + max_shift
+
+        new_start = min(upper_start, max(lower_start, speech_start))
+        new_end = min(upper_end, max(lower_end, speech_end))
+        if new_end - new_start < min_duration:
+            refined.append(segment)
+            continue
+        refined.append(
+            Segment(
+                start=new_start,
+                end=new_end,
+                text=segment.text,
+                confidence=segment.confidence,
+                secondary_text=segment.secondary_text,
+            )
+        )
+
+    # Refinement can expand two neighboring captions into each other. Resolve
+    # only the timing collision; never merge their semantic text at this stage.
+    out: list[Segment] = []
+    for index, segment in enumerate(refined):
+        if not out:
+            out.append(segment)
+            continue
+        previous = out[-1]
+        if segment.start >= previous.end:
+            out.append(segment)
+            continue
+
+        boundary = (float(previous.end) + float(segment.start)) / 2.0
+        min_boundary = float(previous.start) + min_duration
+        max_boundary = float(segment.end) - min_duration
+        if min_boundary <= max_boundary:
+            boundary = min(max_boundary, max(min_boundary, boundary))
+            out[-1] = Segment(
+                start=previous.start,
+                end=boundary,
+                text=previous.text,
+                confidence=previous.confidence,
+                secondary_text=previous.secondary_text,
+            )
+            out.append(
+                Segment(
+                    start=boundary,
+                    end=segment.end,
+                    text=segment.text,
+                    confidence=segment.confidence,
+                    secondary_text=segment.secondary_text,
+                )
+            )
+        else:
+            # The original reconciled timing is known-safe; use it for this
+            # pathological pair rather than collapsing either subtitle.
+            original_previous = source[index - 1]
+            original_current = source[index]
+            out[-1] = original_previous
+            out.append(original_current)
+    return out
 
 
 def _offset_openvino_chunks(chunks: Iterable[_OpenVinoChunk], *, offset_seconds: float) -> list[_OpenVinoChunk]:
@@ -2490,13 +2921,17 @@ def translate_segments_openai_with_summary(
     glossary: dict[str, str] | None = None,
     rag_context_provider: Callable[[list[Segment], int, str], dict[str, Any] | None] | None = None,
     resume_from: Iterable[Segment] | None = None,
+    base_translations: Iterable[Segment] | None = None,
+    selected_indices: Iterable[int] | None = None,
     initial_summary: str = "",
+    initial_context_memory: dict[str, object] | None = None,
     on_batch_done: Callable[[list[Segment], str, int], None] | None = None,
     ai_service: AIService | None = None,
     enable_thinking: bool = False,
     on_thinking_delta: Callable[[str, int, int], None] | None = None,
     on_batch_start: Callable[[list[Segment], int, str], Any] | None = None,
     rag_context_provider_with_context: Callable[[list[Segment], int, str, Any], dict[str, Any] | None] | None = None,
+    on_context_memory_update: Callable[[dict[str, object]], None] | None = None,
     on_batch_done_with_context: Callable[[Any, list[Segment], str, int], None] | None = None,
     on_batch_error: Callable[[Any, Exception], None] | None = None,
     on_thinking_delta_with_context: Callable[[str, int, int, Any], None] | None = None,
@@ -2509,6 +2944,16 @@ def translate_segments_openai_with_summary(
     resumed = list(resume_from or [])
     if len(resumed) > len(segs):
         raise ValueError("translation resume checkpoint is longer than the source segments")
+    base_rows = list(base_translations or [])
+    selected = sorted(
+        {
+            int(index)
+            for index in (selected_indices or [])
+            if 1 <= int(index) <= len(segs)
+        }
+    )
+    if selected and len(base_rows) != len(segs):
+        raise ValueError("selective translation requires a full base translation aligned to source segments")
     cfg: OpenAIChatConfig | None = None
     if ai_service is None:
         cfg = OpenAIChatConfig(
@@ -2522,6 +2967,14 @@ def translate_segments_openai_with_summary(
     tgt = (target_lang or "zh").strip() or "zh"
     tone = (style or "").strip() or "口语自然"
     batch_size = max(1, int(batch_size))
+    scene_profile = derive_translation_scene_profile(segs)
+    translation_scenes = build_translation_scenes(
+        segs,
+        soft_gap_seconds=float(scene_profile["soft_gap_seconds"]),
+        hard_gap_seconds=float(scene_profile["hard_gap_seconds"]),
+    )
+    context_memory = sanitize_translation_context_memory(initial_context_memory)
+
     def _client() -> httpx.Client:
         assert cfg is not None
         return create_openai_http_client(cfg.timeout_seconds)
@@ -2539,7 +2992,17 @@ def translate_segments_openai_with_summary(
         summary: str,
         batch_context: Any,
     ) -> tuple[list[Segment], str]:
+        nonlocal context_memory
         blocks = [{"idx": start_idx + i + 1, "text": s.text} for i, s in enumerate(batch)]
+        context_state = build_translation_context_state(
+            segs,
+            scenes=translation_scenes,
+            start_index=start_idx,
+            end_index=start_idx + len(batch),
+            running_summary=summary,
+            context_memory=context_memory,
+            scene_profile=scene_profile,
+        )
         rag_context: dict[str, Any] | None = None
         if rag_context_provider_with_context is not None:
             value = rag_context_provider_with_context(batch, start_idx, summary, batch_context)
@@ -2553,6 +3016,7 @@ def translate_segments_openai_with_summary(
             blocks=blocks,
             glossary=glossary,
             rag_context=rag_context,
+            context_memory=context_memory,
         )
         if not translation_plan.get("constraints") and not translation_plan.get("translation_examples"):
             translation_plan = {}
@@ -2580,6 +3044,7 @@ def translate_segments_openai_with_summary(
                 glossary=glossary,
                 rag_context=rag_context_for_prompt,
                 translation_plan=translation_plan or None,
+                context_state=context_state,
                 network_retries=3,
                 enable_thinking=enable_thinking,
                 on_thinking_delta=_thinking_callback
@@ -2598,6 +3063,7 @@ def translate_segments_openai_with_summary(
                 glossary=glossary,
                 rag_context=rag_context_for_prompt,
                 translation_plan=translation_plan or None,
+                context_state=context_state,
                 network_retries=3,
             )
             request_kwargs = {
@@ -2637,6 +3103,43 @@ def translate_segments_openai_with_summary(
 
         expected = [b["idx"] for b in blocks]
         missing = [i for i in expected if i not in mapping]
+        if missing and ai_service is not None:
+            missing_set = set(missing)
+            missing_blocks = [block for block in blocks if int(block["idx"]) in missing_set]
+            missing_issues = [
+                {
+                    "idx": missing_idx,
+                    "type": "missing_translation",
+                    "severity": "error",
+                    "message": "translation response omitted this required block",
+                }
+                for missing_idx in missing
+            ]
+            try:
+                missing_repair = ai_service.repair_subtitle_batch(
+                    source_blocks=missing_blocks,
+                    draft_translations=[],
+                    issues=missing_issues,
+                    target_lang=tgt,
+                    style=tone,
+                    translation_plan=translation_plan or None,
+                )
+            except Exception:
+                logger.warning("subtitle missing-index repair failed; falling back to batch shrink", exc_info=True)
+            else:
+                repair_rows = missing_repair.get("translations") if isinstance(missing_repair, dict) else None
+                if isinstance(repair_rows, list):
+                    for item in repair_rows:
+                        if not isinstance(item, dict) or "idx" not in item or "text" not in item:
+                            continue
+                        try:
+                            repair_idx = int(item["idx"])
+                        except (TypeError, ValueError):
+                            continue
+                        repaired_text = str(item["text"] or "").strip()
+                        if repair_idx in missing_set and repaired_text:
+                            mapping[repair_idx] = repaired_text
+                missing = [i for i in expected if i not in mapping]
         if missing:
             partial_prefix: list[Segment] = []
             for i, orig in enumerate(batch):
@@ -2745,6 +3248,45 @@ def translate_segments_openai_with_summary(
         if enable_summary and isinstance(data.get("updated_summary"), str):
             updated_summary = str(data.get("updated_summary")).strip()[:500]
 
+        scene_info = context_state.get("scene") if isinstance(context_state, dict) else None
+        scene_id: int | None = None
+        if isinstance(scene_info, dict):
+            try:
+                scene_id = int(scene_info.get("scene_id") or 0) or None
+            except (TypeError, ValueError):
+                scene_id = None
+
+        raw_context_update = data.get("context_update")
+        if isinstance(raw_context_update, dict):
+            grounded_context_update = ground_translation_context_update(
+                raw_context_update,
+                source_texts=[segment.text for segment in batch],
+            )
+            context_memory = merge_translation_context_memory(
+                context_memory,
+                grounded_context_update,
+                scene_id=scene_id,
+            )
+
+        hard_terms = [
+            {
+                "source": str(item.get("source") or ""),
+                "target": str(item.get("target") or ""),
+                "meaning": str(item.get("meaning") or ""),
+            }
+            for item in translation_plan.get("constraints") or []
+            if isinstance(item, dict) and str(item.get("mode") or "") == "hard"
+        ]
+        if hard_terms:
+            context_memory = merge_translation_context_memory(
+                context_memory,
+                {"terminology": hard_terms},
+                scene_id=scene_id,
+            )
+
+        if on_context_memory_update is not None:
+            on_context_memory_update(sanitize_translation_context_memory(context_memory))
+
         out_batch: list[Segment] = []
         for i, orig in enumerate(batch):
             idx = start_idx + i + 1
@@ -2758,6 +3300,64 @@ def translate_segments_openai_with_summary(
             )
         return out_batch, updated_summary
 
+    if selected:
+        summary = str(initial_summary or "").strip()[:500] if enable_summary else ""
+        out = list(base_rows)
+        cur_batch_size = batch_size
+        selected_zero = [index - 1 for index in selected]
+        runs: list[tuple[int, int]] = []
+        run_start = selected_zero[0]
+        run_end = run_start + 1
+        for position in selected_zero[1:]:
+            if position == run_end:
+                run_end += 1
+                continue
+            runs.append((run_start, run_end))
+            run_start = position
+            run_end = position + 1
+        runs.append((run_start, run_end))
+
+        client_context = _client() if ai_service is None else nullcontext(None)
+        with client_context as client:
+            for selected_start, selected_end in runs:
+                cursor = selected_start
+                while cursor < selected_end:
+                    natural_end = choose_translation_batch_end(
+                        segs,
+                        start_index=cursor,
+                        max_batch_size=min(cur_batch_size, selected_end - cursor),
+                        scenes=translation_scenes,
+                    )
+                    batch_end = min(selected_end, max(cursor + 1, natural_end))
+                    batch = segs[cursor:batch_end]
+                    batch_context = on_batch_start(batch, cursor, summary) if on_batch_start is not None else None
+                    try:
+                        translated, summary = _translate_batch(
+                            client,
+                            batch,
+                            start_idx=cursor,
+                            summary=summary,
+                            batch_context=batch_context,
+                        )
+                        out[cursor:batch_end] = translated
+                        completed_count = sum(1 for index in selected_zero if index < batch_end)
+                        if on_batch_done is not None:
+                            on_batch_done(translated, summary, completed_count)
+                        if on_batch_done_with_context is not None:
+                            on_batch_done_with_context(batch_context, translated, summary, completed_count)
+                        cursor = batch_end
+                    except (TranslationValidationError, httpx.TimeoutException, httpx.TransportError) as exc:
+                        if on_batch_error is not None:
+                            on_batch_error(batch_context, exc)
+                        if len(batch) <= 1:
+                            raise
+                        cur_batch_size = max(1, len(batch) // 2)
+                    except Exception as exc:
+                        if on_batch_error is not None:
+                            on_batch_error(batch_context, exc)
+                        raise
+        return out, summary
+
     summary = str(initial_summary or "").strip()[:500] if enable_summary else ""
     out: list[Segment] = list(resumed)
     cur_batch_size = batch_size
@@ -2765,8 +3365,14 @@ def translate_segments_openai_with_summary(
     client_context = _client() if ai_service is None else nullcontext(None)
     with client_context as client:
         while idx < len(segs):
-            size = min(cur_batch_size, len(segs) - idx)
-            batch = segs[idx : idx + size]
+            batch_end = choose_translation_batch_end(
+                segs,
+                start_index=idx,
+                max_batch_size=cur_batch_size,
+                scenes=translation_scenes,
+            )
+            size = max(1, batch_end - idx)
+            batch = segs[idx:batch_end]
             batch_context = on_batch_start(batch, idx, summary) if on_batch_start is not None else None
             try:
                 translated, summary = _translate_batch(

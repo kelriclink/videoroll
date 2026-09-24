@@ -61,6 +61,8 @@ class SubtitleJobCreate(BaseModel):
     asr: ASROptions = Field(default_factory=ASROptions)
     translate: TranslateOptions = Field(default_factory=TranslateOptions)
     output: OutputOptions = Field(default_factory=OutputOptions)
+    artifacts: Optional[dict[str, Any]] = None
+    selective_retranslate: Optional[dict[str, Any]] = None
     output_prefix: str = ""
     after_render: Optional[dict[str, Any]] = None
 
@@ -101,11 +103,11 @@ class WhisperSettingsRead(BaseModel):
     external_whisper_batch_size: int = 1
     external_whisper_vad_enabled: bool = True
     external_whisper_vad_threshold: float = 0.5
-    external_whisper_min_silence_ms: int = 500
-    external_whisper_speech_pad_ms: int = 180
-    external_whisper_condition_on_previous_text: bool = False
-    external_whisper_max_segment_seconds: float = 6.0
-    external_whisper_max_segment_chars: int = 80
+    external_whisper_min_silence_ms: int = 2000
+    external_whisper_speech_pad_ms: int = 400
+    external_whisper_condition_on_previous_text: bool = True
+    external_whisper_max_segment_seconds: float = 12.0
+    external_whisper_max_segment_chars: int = 120
     groq_whisper_model: str = "whisper-large-v3-turbo"
     groq_whisper_api_key_set: bool = False
     cloudflare_workers_ai_account_id: str = ""
@@ -143,11 +145,11 @@ class ASRDefaultsRead(BaseModel):
     external_whisper_batch_size: int = 1
     external_whisper_vad_enabled: bool = True
     external_whisper_vad_threshold: float = 0.5
-    external_whisper_min_silence_ms: int = 500
-    external_whisper_speech_pad_ms: int = 180
-    external_whisper_condition_on_previous_text: bool = False
-    external_whisper_max_segment_seconds: float = 6.0
-    external_whisper_max_segment_chars: int = 80
+    external_whisper_min_silence_ms: int = 2000
+    external_whisper_speech_pad_ms: int = 400
+    external_whisper_condition_on_previous_text: bool = True
+    external_whisper_max_segment_seconds: float = 12.0
+    external_whisper_max_segment_chars: int = 120
     groq_whisper_model: str = "whisper-large-v3-turbo"
     groq_whisper_api_key_set: bool = False
     cloudflare_workers_ai_account_id: str = ""

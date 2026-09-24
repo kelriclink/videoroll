@@ -127,6 +127,9 @@ async def test_subtitle_browser_proxy_uses_server_derived_service_token(monkeypa
     ("method", "service_path"),
     [
         ("GET", "subtitle/agents/runs/5d7db7cf-1a7d-4d77-9335-cf39bbbcb9a4"),
+        ("GET", "subtitle/tasks/5d7db7cf-1a7d-4d77-9335-cf39bbbcb9a4/quality"),
+        ("GET", "subtitle/tasks/5d7db7cf-1a7d-4d77-9335-cf39bbbcb9a4/translation-context"),
+        ("PUT", "subtitle/tasks/5d7db7cf-1a7d-4d77-9335-cf39bbbcb9a4/translation-context"),
         ("DELETE", "subtitle/models/model-name"),
         ("PUT", "subtitle/dictionaries/sources/source-id"),
         ("DELETE", "subtitle/dictionaries/entries/entry-id"),
@@ -139,6 +142,15 @@ def test_subtitle_proxy_allows_each_dynamic_browser_operation(method: str, servi
 
 def test_subtitle_proxy_rejects_invalid_agent_run_id() -> None:
     assert not subtitle_service._is_browser_proxy_path_allowed("GET", "subtitle/agents/runs/not-a-uuid")
+
+
+def test_subtitle_proxy_rejects_invalid_task_context_path() -> None:
+    assert not subtitle_service._is_browser_proxy_path_allowed(
+        "GET", "subtitle/tasks/not-a-uuid/quality"
+    )
+    assert not subtitle_service._is_browser_proxy_path_allowed(
+        "POST", "subtitle/tasks/5d7db7cf-1a7d-4d77-9335-cf39bbbcb9a4/translation-context"
+    )
 
 
 def test_subtitle_proxy_allows_groq_asr_test() -> None:
