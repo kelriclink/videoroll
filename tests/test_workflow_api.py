@@ -42,6 +42,46 @@ def _runtime() -> Any:
     )
 
 
+def test_recovery_idempotency_collision_returns_existing_hatchet_run(monkeypatch) -> None:
+    from hatchet_sdk import IdempotencyCollisionError
+
+    runtime = _runtime()
+    received = []
+
+    class CollisionTask:
+        async def aio_run(self, workflow_input, **kwargs):
+            received.append(workflow_input)
+            raise IdempotencyCollisionError("previous-hatchet-run")
+
+    monkeypatch.setattr(workflow_api, "_settings", lambda: runtime)
+    monkeypatch.setattr(workflow_api, "_subtitle_job_task", lambda: CollisionTask())
+    token = internal_service_token(runtime.internal_api_secret, development_mode=False)
+    response = TestClient(workflow_api.create_app()).post(
+        "/runs/subtitle-job",
+        json={"job_id": "job-1", "dispatch_key": "job-1:recover-123"},
+        headers={INTERNAL_TOKEN_HEADER: token},
+    )
+    assert response.status_code == 200
+    assert response.json() == {"workflow_run_id": "previous-hatchet-run"}
+    assert received[0].dispatch_key == "job-1:recover-123"
+
+
+def test_subtitle_workflow_registers_hatchet_idempotency() -> None:
+    from datetime import timedelta
+    from videoroll.workflows.video_pipeline import register_subtitle_job_task
+
+    captured = {}
+
+    class CapturingHatchet:
+        def task(self, **kwargs):
+            captured.update(kwargs)
+            return lambda function: function
+
+    register_subtitle_job_task(CapturingHatchet())
+    assert captured["idempotency"].key_expression == "input.dispatch_key"
+    assert captured["idempotency"].ttl == timedelta(days=7)
+
+
 def test_workflow_api_health_does_not_require_hatchet_credentials(monkeypatch) -> None:
     def fail_if_called() -> Any:
         raise AssertionError("Hatchet client must not be initialized by /health")

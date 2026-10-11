@@ -532,7 +532,7 @@ Web Settings 可以配置资源保留策略。
 0003_task_stop_controls
 0004_playout_asset_links
 0005_operations_center
-0006_agent_runtime
+0010_remove_legacy_task_queue
 ```
 
 Orchestrator 启动时升级 schema 到 head。

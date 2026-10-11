@@ -224,7 +224,7 @@ API / worker / scheduler 应部署**相同应用版本**，因为它们共享数
 错误部署示例：
 
 ```text
-database head = 0006_agent_runtime
+database head = 0010_remove_legacy_task_queue
 social image only knows migration 0005
 → startup migration cannot locate revision
 ```
@@ -233,13 +233,9 @@ social image only knows migration 0005
 
 ## 12. Secret
 
-必须保护：
+Social storage_state 从当前版本开始直接以数据库可恢复格式保存，不再依赖外部 `fernet.key`。
 
-```text
-data/secrets/fernet.key
-```
-
-替换或删除后，数据库中已有加密账号状态可能无法恢复。
+这使 PostgreSQL 成为可独立恢复的业务状态源，但也意味着数据库备份本身包含账号凭据。旧版本遗留的 Fernet 密文如果没有旧 key，则需要在 DB-only 恢复后重新登录对应账号。
 
 ## 13. 网络
 

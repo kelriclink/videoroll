@@ -16,7 +16,6 @@ dependencies = [
   "uvicorn[standard]==0.53.0",
   "pydantic==2.13.5",
   "pydantic-settings==2.15.0",
-  "cryptography==50.0.1",
   "sqlalchemy==2.0.54",
   "psycopg[binary]==3.3.5",
   "httpx[socks]==0.28.1",
@@ -43,6 +42,7 @@ dev = [
   "hatchling>=1.25.0",
   "pytest>=8,<9",
   "PyYAML>=6,<7",
+  "hatchet-sdk==1.40.3",
 ]
 
 [tool.hatch.build.targets.wheel]

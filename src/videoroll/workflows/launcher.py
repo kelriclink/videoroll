@@ -94,7 +94,7 @@ class PipelineLauncher:
         finally:
             db.close()
 
-    def launch_subtitle_job(self, job_id: uuid.UUID) -> PipelineLaunchResult:
+    def launch_subtitle_job(self, job_id: uuid.UUID, *, dispatch_key: str | None = None) -> PipelineLaunchResult:
         db = self.session_factory()
         run_id = uuid.uuid4()
         try:
@@ -105,13 +105,16 @@ class PipelineLauncher:
             if task is None:
                 raise ValueError(f"task not found for subtitle job: {job.task_id}")
             priority = int(task.priority or 0)
+            request = {"job_id": str(job_id), "priority": priority}
+            if dispatch_key:
+                request["dispatch_key"] = dispatch_key
             run = PipelineRun(
                 id=run_id,
                 task_id=job.task_id,
                 engine="hatchet",
                 workflow_name=SUBTITLE_JOB_WORKFLOW_NAME,
                 state="submitting",
-                request_json={"job_id": str(job_id), "priority": priority},
+                request_json=request,
             )
             db.add(run)
             db.commit()
@@ -119,7 +122,7 @@ class PipelineLauncher:
                 with httpx.Client(timeout=20.0, headers=internal_http_headers(self.settings)) as client:
                     response = client.post(
                         f"{self.settings.workflow_service_url.rstrip('/')}/runs/subtitle-job",
-                        json={"job_id": str(job_id), "priority": priority},
+                        json=request,
                     )
                     response.raise_for_status()
                     payload = response.json()

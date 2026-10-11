@@ -150,8 +150,10 @@ def test_run_asr_stage_gates_only_openvino_gpu(monkeypatch: pytest.MonkeyPatch, 
     monkeypatch.setattr(worker, "_resolve_openvino_model", lambda model, _root, proxy=None: model)
     monkeypatch.setattr(worker, "transcribe_openvino_whisper", lambda *args, **kwargs: [])
 
+    db = Mock()
+    db.new = db.dirty = db.deleted = ()
     result = worker._run_asr_stage(
-        db=object(),
+        db=db,
         audio_path=tmp_path / "audio.wav",
         audio_key=None,
         asr_cfg={"engine": "openvino"},

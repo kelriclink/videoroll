@@ -135,6 +135,35 @@ def test_pipeline_launcher_submits_subtitle_job(monkeypatch: pytest.MonkeyPatch)
     engine.dispose()
 
 
+def test_recovery_launcher_passes_stable_dispatch_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    from videoroll.workflows import launcher as launcher_module
+
+    engine, factory, task_id = _database()
+    with factory() as db:
+        job = SubtitleJob(
+            task_id=task_id, request_json={}, status=SubtitleJobStatus.queued,
+        )
+        db.add(job)
+        db.commit()
+        job_id = job.id
+
+    client = _Client()
+    monkeypatch.setattr(launcher_module.httpx, "Client", lambda *args, **kwargs: client)
+    launcher = PipelineLauncher(_settings(), session_factory=factory)
+    result = launcher.launch_subtitle_job(job_id, dispatch_key="recover-job-unique-key")
+    assert result.external_run_id == "hatchet-123"
+    assert client.posts == [
+        ("http://workflow-api:8030/runs/subtitle-job", {
+            "job_id": str(job_id),
+            "priority": 100,
+            "dispatch_key": "recover-job-unique-key",
+        })
+    ]
+    with factory() as db:
+        assert db.get(PipelineRun, result.pipeline_run_id).request_json["dispatch_key"] == "recover-job-unique-key"
+    engine.dispose()
+
+
 def test_pipeline_launcher_persists_workflow_service_failure(monkeypatch: pytest.MonkeyPatch) -> None:
     from videoroll.workflows import launcher as launcher_module
 

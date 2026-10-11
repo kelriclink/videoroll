@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import hmac
+import uuid
+
+from hatchet_sdk import IdempotencyCollisionError
 from functools import lru_cache
 from typing import Any, Literal
 
@@ -28,6 +31,7 @@ class AutoYouTubeLaunchRequest(BaseModel):
 class SubtitleJobLaunchRequest(BaseModel):
     job_id: str
     priority: int = 0
+    dispatch_key: str | None = None
 
 
 class WorkflowLaunchResponse(BaseModel):
@@ -112,13 +116,19 @@ def create_app() -> FastAPI:
 
     @app.post("/runs/subtitle-job", response_model=WorkflowLaunchResponse, dependencies=[Depends(_require_internal)])
     async def launch_subtitle_job(payload: SubtitleJobLaunchRequest) -> WorkflowLaunchResponse:
-        ref = await _subtitle_job_task().aio_run(
-            SubtitleJobWorkflowInput(job_id=payload.job_id),
-            wait_for_result=False,
-            additional_metadata={"videoroll_subtitle_job_id": payload.job_id},
-            priority=_hatchet_priority(payload.priority),
-        )
-        workflow_run_id = str(getattr(ref, "workflow_run_id", "") or "").strip()
+        # Initial submissions get a unique key. Recovery retries reuse their
+        # durable key so Hatchet does not start two runs after a lost response.
+        dispatch_key = payload.dispatch_key or f"{payload.job_id}:{uuid.uuid4().hex}"
+        try:
+            ref = await _subtitle_job_task().aio_run(
+                SubtitleJobWorkflowInput(job_id=payload.job_id, dispatch_key=dispatch_key),
+                wait_for_result=False,
+                additional_metadata={"videoroll_subtitle_job_id": payload.job_id},
+                priority=_hatchet_priority(payload.priority),
+            )
+            workflow_run_id = str(getattr(ref, "workflow_run_id", "") or "").strip()
+        except IdempotencyCollisionError as exc:
+            workflow_run_id = str(exc.existing_run_external_id or "").strip()
         if not workflow_run_id:
             raise HTTPException(status_code=502, detail="Hatchet did not return a workflow run id")
         return WorkflowLaunchResponse(workflow_run_id=workflow_run_id)

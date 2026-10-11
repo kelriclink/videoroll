@@ -137,6 +137,10 @@ def test_application_network_is_internal_and_egress_is_role_scoped() -> None:
         assert set(compose["services"]["hatchet-lite"]["networks"]) == {"internal", "infrastructure-egress"}
         assert "host.docker.internal:host-gateway" in compose["services"]["hatchet-lite"].get("extra_hosts", [])
         assert compose["services"]["hatchet-lite"]["environment"]["DATABASE_URL"] == "${HATCHET_DATABASE_URL:?HATCHET_DATABASE_URL must be set}"
+        assert compose["services"]["hatchet-lite"]["environment"]["ADMIN_EMAIL"] == "${HATCHET_ADMIN_EMAIL:-admin@videoroll.local}"
+        assert compose["services"]["hatchet-lite"]["environment"]["ADMIN_PASSWORD"] == "${HATCHET_ADMIN_PASSWORD:?HATCHET_ADMIN_PASSWORD must be set}"
+        assert compose["services"]["hatchet-lite"]["environment"]["DEFAULT_TENANT_NAME"] == "${HATCHET_TENANT_NAME:-VideoRoll}"
+        assert compose["services"]["hatchet-lite"]["environment"]["DEFAULT_TENANT_SLUG"] == "${HATCHET_TENANT_SLUG:-videoroll}"
         assert compose["services"]["hatchet-lite"]["environment"]["LITE_FRONTEND_BASE_PATH"] == "/workflow-ui"
         assert compose["services"]["hatchet-lite"]["environment"]["SERVER_FRONTEND_URL"] == "${HATCHET_FRONTEND_URL:-http://localhost:3000/workflow-ui/}"
         assert compose["services"]["hatchet-lite"]["build"] == {

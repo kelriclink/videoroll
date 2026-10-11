@@ -9,6 +9,7 @@ from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.orm import Session, sessionmaker
 
 from videoroll.apps.subtitle_service.worker_concurrency import (
+    RECOVERY_RELAUNCH_PENDING_KEY,
     acquire_job_lease,
     heartbeat_job_lease,
     live_leased_task_ids,
@@ -292,6 +293,7 @@ def test_stale_legacy_running_job_without_lease_is_requeued(db: Session) -> None
 
     assert job.status == SubtitleJobStatus.queued
     assert job.request_json.get("resume") is True
+    assert job.request_json.get(RECOVERY_RELAUNCH_PENDING_KEY) is True
     assert summary.subtitle_requeued == 1
     assert summary.legacy_subtitle_requeued == 1
 

@@ -2,3 +2,5 @@
 Dockerfile text eol=lf
 docker/* text eol=lf
 src/web/nginx.conf text eol=lf
+scripts/native/* text eol=lf
+deploy/systemd/* text eol=lf

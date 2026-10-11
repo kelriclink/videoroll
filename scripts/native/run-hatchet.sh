@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+HATCHET_HOME="${VIDEOROLL_HATCHET_HOME:-/opt/videoroll/current/data/hatchet}"
+CONFIG_DIR="$HATCHET_HOME/config"
+
+: "${HATCHET_DATABASE_URL:?HATCHET_DATABASE_URL must be set}"
+: "${HATCHET_ADMIN_PASSWORD:?HATCHET_ADMIN_PASSWORD must be set}"
+
+export DATABASE_URL="$HATCHET_DATABASE_URL"
+export ADMIN_EMAIL="${HATCHET_ADMIN_EMAIL:-admin@videoroll.local}"
+export ADMIN_PASSWORD="$HATCHET_ADMIN_PASSWORD"
+export ADMIN_NAME="${HATCHET_ADMIN_NAME:-VideoRoll Admin}"
+export DEFAULT_TENANT_NAME="${HATCHET_TENANT_NAME:-VideoRoll}"
+export DEFAULT_TENANT_SLUG="${HATCHET_TENANT_SLUG:-videoroll}"
+
+export LITE_STATIC_ASSET_DIR="${LITE_STATIC_ASSET_DIR:-/usr/share/videoroll/hatchet/static-assets}"
+export LITE_FRONTEND_BASE_PATH="${LITE_FRONTEND_BASE_PATH:-/workflow-ui}"
+export LITE_FRONTEND_PORT="${LITE_FRONTEND_PORT:-8081}"
+export LITE_RUNTIME_PORT="${LITE_RUNTIME_PORT:-8888}"
+
+export SERVER_MSGQUEUE_KIND=postgres
+export SERVER_DEFAULT_ENGINE_VERSION=V1
+export SERVER_GRPC_BIND_ADDRESS=127.0.0.1
+export SERVER_GRPC_BROADCAST_ADDRESS=127.0.0.1:7077
+export SERVER_INTERNAL_CLIENT_INTERNAL_GRPC_BROADCAST_ADDRESS=127.0.0.1:7077
+export SERVER_GRPC_PORT=7077
+export SERVER_GRPC_INSECURE=true
+export SERVER_URL="${HATCHET_SERVER_URL:-http://127.0.0.1:3001}"
+export SERVER_FRONTEND_URL="${HATCHET_FRONTEND_URL:-http://127.0.0.1:3001/workflow-ui/}"
+export SERVER_AUTH_COOKIE_DOMAIN="${HATCHET_COOKIE_DOMAIN:-localhost}"
+export SERVER_AUTH_COOKIE_INSECURE="${HATCHET_COOKIE_INSECURE:-true}"
+export SERVER_AUTH_SET_EMAIL_VERIFIED=true
+export SERVER_SECURITY_CHECK_ENABLED=false
+export SERVER_LOGGER_LEVEL="${HATCHET_LOG_LEVEL:-warn}"
+
+mkdir -p "$CONFIG_DIR"
+cd "$HATCHET_HOME"
+
+/usr/local/bin/hatchet-migrate
+/usr/local/bin/hatchet-admin quickstart --skip certs --generated-config-dir "$CONFIG_DIR" --overwrite=false
+exec /usr/local/bin/hatchet-lite --config "$CONFIG_DIR"

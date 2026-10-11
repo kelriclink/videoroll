@@ -5,19 +5,30 @@ import os
 import threading
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+
+from sqlalchemy import or_
 
 from videoroll.apps.orchestrator_api.services import asset_service, maintenance_service, operations_service, youtube_service
 from videoroll.apps.orchestrator_api.storage_retention_store import get_storage_retention_settings
-from videoroll.apps.subtitle_service.worker_concurrency import RecoverySummary, recover_expired_leases
+from videoroll.apps.subtitle_service.worker_concurrency import (
+    RECOVERY_RELAUNCH_PENDING_KEY,
+    RECOVERY_RELAUNCH_AT_KEY,
+    RECOVERY_CLAIM_ID_KEY,
+    RECOVERY_CLAIM_UNTIL_KEY,
+    RecoverySummary,
+    recover_expired_leases,
+)
 from videoroll.apps.youtube_ingest.source_service import (
     DEFAULT_SOURCE_SCAN_LOCK_TTL_SECONDS,
     get_due_youtube_source_ids,
     scan_youtube_source_by_id,
 )
 from videoroll.config import OrchestratorSettings
+from videoroll.db.models import PipelineRun, SubtitleJob, SubtitleJobStatus, Task, TaskStatus
 from videoroll.db.session import get_sessionmaker
 from videoroll.storage.filesystem import FileStore
+from videoroll.workflows.launcher import PipelineLauncher, SUBTITLE_JOB_WORKFLOW_NAME
 
 
 logger = logging.getLogger(__name__)
@@ -156,15 +167,159 @@ class OrchestratorScheduler:
         finally:
             db.close()
 
+    def _dispatch_recovered_subtitle_jobs_once(self, *, limit: int = 100) -> int:
+        """Atomically claim recoveries; keep network I/O outside DB transactions."""
+        session_local = get_sessionmaker(self.settings.database_url)
+        now = datetime.now(timezone.utc)
+        claim_id = uuid.uuid4().hex
+        claim_until = (now + timedelta(minutes=2)).isoformat()
+        db = session_local()
+        try:
+            jobs = (
+                db.query(SubtitleJob)
+                .join(Task, Task.id == SubtitleJob.task_id)
+                .filter(
+                    Task.status.notin_([TaskStatus.canceled, TaskStatus.published]),
+                    SubtitleJob.status == SubtitleJobStatus.queued,
+                    SubtitleJob.request_json[RECOVERY_RELAUNCH_PENDING_KEY].as_boolean().is_(True),
+                    or_(
+                        SubtitleJob.request_json[RECOVERY_CLAIM_UNTIL_KEY].as_string().is_(None),
+                        SubtitleJob.request_json[RECOVERY_CLAIM_UNTIL_KEY].as_string() <= now.isoformat(),
+                    ),
+                )
+                .order_by(SubtitleJob.updated_at.asc())
+                .with_for_update(skip_locked=True)
+                .limit(max(0, int(limit)))
+                .all()
+            )
+            claimed = []
+            for job in jobs:
+                request = dict(job.request_json)
+                recovered_at = request.get(RECOVERY_RELAUNCH_AT_KEY) or job.updated_at.isoformat()
+                request[RECOVERY_RELAUNCH_AT_KEY] = recovered_at
+                request[RECOVERY_CLAIM_ID_KEY] = claim_id
+                request[RECOVERY_CLAIM_UNTIL_KEY] = claim_until
+                job.request_json = request
+                db.add(job)
+                claimed.append((job.id, job.task_id, recovered_at))
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+
+        launched = 0
+        for job_id, task_id, recovered_at in claimed:
+            db = session_local()
+            try:
+                job = db.get(SubtitleJob, job_id)
+                request = dict(job.request_json) if job and isinstance(job.request_json, dict) else {}
+                if (
+                    job is None or job.status != SubtitleJobStatus.queued
+                    or request.get(RECOVERY_CLAIM_ID_KEY) != claim_id
+                ):
+                    continue
+
+                recovered_time = datetime.fromisoformat(recovered_at)
+                if recovered_time.tzinfo is None:
+                    recovered_time = recovered_time.replace(tzinfo=timezone.utc)
+                runs = (
+                    db.query(PipelineRun)
+                    .filter(
+                        PipelineRun.task_id == task_id,
+                        PipelineRun.engine == "hatchet",
+                        PipelineRun.workflow_name == SUBTITLE_JOB_WORKFLOW_NAME,
+                    )
+                    .order_by(PipelineRun.created_at.desc())
+                    .all()
+                )
+                matching = [
+                    run for run in runs
+                    if str((run.request_json or {}).get("job_id") or "") == str(job_id)
+                ]
+                recent = [
+                    run for run in matching
+                    if run.created_at is not None
+                    and run.created_at.replace(tzinfo=timezone.utc) >= recovered_time
+                ]
+                if any(run.state in {"submitted", "running"} for run in recent):
+                    # Confirmed Hatchet acceptance: crash-safe marker cleanup.
+                    for key in (
+                        RECOVERY_RELAUNCH_PENDING_KEY, RECOVERY_RELAUNCH_AT_KEY,
+                        RECOVERY_CLAIM_ID_KEY, RECOVERY_CLAIM_UNTIL_KEY,
+                    ):
+                        request.pop(key, None)
+                    job.request_json = request
+                    db.commit()
+                    continue
+                if any(
+                    run.state == "submitting"
+                    and run.created_at.replace(tzinfo=timezone.utc) >= now - timedelta(minutes=2)
+                    for run in recent
+                ):
+                    # "submitting" does not prove the external run exists.
+                    request.pop(RECOVERY_CLAIM_ID_KEY, None)
+                    request[RECOVERY_CLAIM_UNTIL_KEY] = claim_until
+                    job.request_json = request
+                    db.commit()
+                    continue
+                for run in matching:
+                    if run.state in {"submitting", "submitted", "running"}:
+                        run.state = "superseded"
+                        run.finished_at = now
+                        run.error_message = "Superseded after subtitle worker lease recovery."
+                        db.add(run)
+                db.commit()
+            except Exception:
+                db.rollback()
+                logger.exception("failed to prepare recovered subtitle dispatch (job_id=%s)", job_id)
+                continue
+            finally:
+                db.close()
+
+            try:
+                PipelineLauncher(self.settings).launch_subtitle_job(
+                    job_id, dispatch_key=f"{job_id}:{recovered_at}",
+                )
+            except Exception:
+                logger.exception("failed to relaunch recovered subtitle job (job_id=%s)", job_id)
+                # Keep the pending marker; retry only after the claim expires.
+                continue
+
+            clear_db = session_local()
+            try:
+                current = clear_db.get(SubtitleJob, job_id)
+                if current is not None and isinstance(current.request_json, dict):
+                    current_request = dict(current.request_json)
+                    if current_request.get(RECOVERY_CLAIM_ID_KEY) == claim_id:
+                        for key in (
+                            RECOVERY_RELAUNCH_PENDING_KEY, RECOVERY_RELAUNCH_AT_KEY,
+                            RECOVERY_CLAIM_ID_KEY, RECOVERY_CLAIM_UNTIL_KEY,
+                        ):
+                            current_request.pop(key, None)
+                        current.request_json = current_request
+                        clear_db.commit()
+                launched += 1
+            except Exception:
+                clear_db.rollback()
+                logger.exception("failed to clear recovered subtitle dispatch marker (job_id=%s)", job_id)
+            finally:
+                clear_db.close()
+
+        return launched
+
     def _worker_lease_recovery_loop(self) -> None:
         while not self._cleanup_stop.is_set():
             try:
                 result = self._recover_worker_leases_once()
-                if result.total_recovered:
+                relaunched = self._dispatch_recovered_subtitle_jobs_once()
+                if result.total_recovered or relaunched:
                     logger.warning(
-                        "recovered expired worker leases: subtitle=%s render=%s",
+                        "recovered expired worker leases: subtitle=%s render=%s relaunched=%s",
                         result.subtitle_requeued,
                         result.render_requeued,
+                        relaunched,
                     )
             except Exception:
                 logger.exception("worker lease recovery loop failed")

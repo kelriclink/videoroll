@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from datetime import timedelta
+
+from hatchet_sdk import TTLBasedIdempotencyConfig
 from typing import Any
 
 import httpx
@@ -26,6 +28,7 @@ class AutoYouTubeWorkflowInput(BaseModel):
 
 class SubtitleJobWorkflowInput(BaseModel):
     job_id: str
+    dispatch_key: str = ""
 
 
 class WorkflowStageOutput(BaseModel):
@@ -251,6 +254,9 @@ def register_subtitle_job_task(hatchet: Any) -> Any:
     @hatchet.task(
         name=SUBTITLE_JOB_TASK_NAME,
         input_validator=SubtitleJobWorkflowInput,
+        idempotency=TTLBasedIdempotencyConfig(
+            key_expression="input.dispatch_key", ttl=timedelta(days=7),
+        ),
         retries=5,
         backoff_factor=2.0,
         backoff_max_seconds=60,

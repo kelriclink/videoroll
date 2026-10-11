@@ -1,0 +1,79 @@
+x-social-common: &social-common
+  build:
+    context: ../..
+    dockerfile: docker/social-publisher.Dockerfile
+    args:
+      APP_UID: ${APP_UID:-10001}
+      APP_GID: ${APP_GID:-10001}
+  image: videoroll-social-publisher:prod
+  user: "${APP_UID:-10001}:${APP_GID:-10001}"
+  init: true
+  network_mode: host
+  env_file:
+    - ${VIDEOROLL_DOTENV:?VIDEOROLL_DOTENV must be set}
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+  environment: &social-environment
+    REDIS_URL: redis://127.0.0.1:6379/0
+    ORCHESTRATOR_URL: http://127.0.0.1:8000
+    STORAGE_ROOT: /storage/objects
+    SOCIAL_PUBLISH_WORK_DIR: /storage/work/social-publisher
+  volumes:
+    - ${VIDEOROLL_STORAGE_HOST_ROOT:-./data/storage}:/storage
+  restart: unless-stopped
+
+services:
+  social-publisher-api:
+    <<: *social-common
+    command: ["uvicorn", "videoroll.apps.social_publisher.main:app", "--host", "127.0.0.1", "--port", "8010"]
+    environment:
+      <<: *social-environment
+      DEPLOYMENT_ROLE: social-publisher-api
+      SOCIAL_VNC_WEBSOCKIFY_BIND: 127.0.0.1
+      SOCIAL_VNC_WEBSOCKIFY_PORT: "6080"
+      SOCIAL_VNC_RFB_PORT: "5900"
+      SOCIAL_VNC_BRIDGE_PORT: "5901"
+    tmpfs:
+      - /opt/social-auto-upload/cookies:mode=0700,uid=${APP_UID:-10001},gid=${APP_GID:-10001}
+      - /dev/shm:mode=1777
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8010/health', timeout=5)"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+
+  social-publisher-worker:
+    <<: *social-common
+    command: ["celery", "-A", "videoroll.apps.social_publisher.worker:celery_app", "worker", "-Q", "social_publish", "-l", "INFO", "--concurrency", "${SOCIAL_PUBLISH_CONCURRENCY:-1}"]
+    environment:
+      <<: *social-environment
+      DEPLOYMENT_ROLE: social-publisher-worker
+      SOCIAL_VNC_WEBSOCKIFY_BIND: 127.0.0.1
+      SOCIAL_VNC_WEBSOCKIFY_PORT: "6081"
+      SOCIAL_VNC_RFB_PORT: "5910"
+      SOCIAL_VNC_BRIDGE_PORT: "5911"
+    tmpfs:
+      - /opt/social-auto-upload/cookies:mode=0700,uid=${APP_UID:-10001},gid=${APP_GID:-10001}
+      - /dev/shm:mode=1777
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A videoroll.apps.social_publisher.worker:celery_app inspect ping --timeout=3 --destination=celery@$$HOSTNAME | grep -q pong"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  social-publisher-scheduler:
+    <<: *social-common
+    command: ["celery", "-A", "videoroll.apps.social_publisher.worker:celery_app", "beat", "-l", "INFO", "--schedule", "/tmp/social-celerybeat-schedule"]
+    environment:
+      <<: *social-environment
+      DEPLOYMENT_ROLE: social-publisher-scheduler
+      SOCIAL_VNC_DISABLED: "true"
+    healthcheck:
+      test: ["CMD-SHELL", "test -e /tmp/social-celerybeat-schedule"]
+      interval: 30s
+      timeout: 5s
+      retries: 5

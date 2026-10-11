@@ -1,0 +1,42 @@
+name: Native application release
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  bundle:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: src/web/package-lock.json
+      - name: Test native release transactions
+        run: |
+          python -m pip install 'pytest>=8,<9'
+          python -m pytest -q tests/test_native_releases.py
+      - name: Build frontend
+        working-directory: src/web
+        run: |
+          npm ci --no-fund --no-audit
+          npm run build
+      - name: Package application without runtime dependencies
+        run: >-
+          python scripts/native/releases.py
+          --output dist/videoroll-native-${{ github.sha }}.tar.gz
+          --web-dist src/web/dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: videoroll-native-${{ github.sha }}
+          path: |
+            dist/videoroll-native-*.tar.gz
+            dist/videoroll-native-*.tar.gz.sha256
+          if-no-files-found: error

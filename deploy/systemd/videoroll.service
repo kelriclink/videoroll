@@ -1,0 +1,37 @@
+[Unit]
+Description=VideoRoll (single native service supervisor)
+Documentation=file:/opt/videoroll/current/docs/NATIVE_DEPLOYMENT.md
+Wants=network-online.target
+After=network-online.target
+Conflicts=videoroll.target
+StartLimitIntervalSec=180
+StartLimitBurst=3
+
+[Service]
+Type=exec
+User=videoroll
+Group=videoroll
+WorkingDirectory=/opt/videoroll/current
+EnvironmentFile=/etc/videoroll/videoroll.env
+Environment=HOME=/opt/videoroll/current/data/home
+Environment=PYTHONPATH=/opt/videoroll/current/src:/opt/videoroll/current/social-auto-upload
+RuntimeDirectory=videoroll
+RuntimeDirectoryMode=0700
+ExecStartPre=/usr/bin/python3 /opt/videoroll/current/scripts/native/supervisor.py --check
+ExecStart=/usr/bin/python3 /opt/videoroll/current/scripts/native/supervisor.py
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=300
+TimeoutStopSec=45
+KillMode=control-group
+KillSignal=SIGTERM
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectHome=yes
+ReadWritePaths=/opt/videoroll/current/data
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

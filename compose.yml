@@ -195,7 +195,6 @@ services:
       YOUTUBE_EXTRACTOR_ARGS_JSON: ${YOUTUBE_EXTRACTOR_ARGS_JSON:-}
       STORAGE_CLEANUP_INTERVAL_SECONDS: ${STORAGE_CLEANUP_INTERVAL_SECONDS:-3600}
     volumes:
-      - ./data/secrets:/secrets
       - ${STORAGE_HOST_ROOT:-./data/storage}:/storage
     depends_on:
       redis:
@@ -233,7 +232,6 @@ services:
       DEPLOYMENT_ROLE: subtitle-api
     volumes:
       - ./data/models:/models
-      - ./data/secrets:/secrets
       - ${STORAGE_HOST_ROOT:-./data/storage}:/storage
     depends_on:
       redis:
@@ -281,7 +279,6 @@ services:
       DEPLOYMENT_ROLE: bilibili-publisher-api
       BILIBILI_PUBLISH_MODE: ${BILIBILI_PUBLISH_MODE:-web}
     volumes:
-      - ./data/secrets:/secrets
       - ${STORAGE_HOST_ROOT:-./data/storage}:/storage
     depends_on:
       redis:
@@ -305,6 +302,11 @@ services:
       - "host.docker.internal:host-gateway"
     environment:
       DATABASE_URL: ${HATCHET_DATABASE_URL:?HATCHET_DATABASE_URL must be set}
+      ADMIN_EMAIL: ${HATCHET_ADMIN_EMAIL:-admin@videoroll.local}
+      ADMIN_PASSWORD: ${HATCHET_ADMIN_PASSWORD:?HATCHET_ADMIN_PASSWORD must be set}
+      ADMIN_NAME: ${HATCHET_ADMIN_NAME:-VideoRoll Admin}
+      DEFAULT_TENANT_NAME: ${HATCHET_TENANT_NAME:-VideoRoll}
+      DEFAULT_TENANT_SLUG: ${HATCHET_TENANT_SLUG:-videoroll}
       LITE_FRONTEND_BASE_PATH: /workflow-ui
       SERVER_MSGQUEUE_KIND: postgres
       SERVER_DEFAULT_ENGINE_VERSION: V1
@@ -445,7 +447,6 @@ services:
       HATCHET_SUBTITLE_WORKER_SLOTS: ${HATCHET_SUBTITLE_WORKER_SLOTS:-1}
     volumes:
       - ./data/models:/models
-      - ./data/secrets:/secrets
       - ${STORAGE_HOST_ROOT:-./data/storage}:/storage
     depends_on:
       orchestrator:
@@ -466,7 +467,6 @@ services:
       <<: *subtitle-environment
       DEPLOYMENT_ROLE: subtitle-control-worker
     volumes:
-      - ./data/secrets:/secrets
       - ${STORAGE_HOST_ROOT:-./data/storage}:/storage
     depends_on:
       redis:
@@ -518,7 +518,6 @@ services:
       DEPLOYMENT_ROLE: publish-worker
       BILIBILI_PUBLISH_MODE: ${BILIBILI_PUBLISH_MODE:-web}
     volumes:
-      - ./data/secrets:/secrets
       - ${STORAGE_HOST_ROOT:-./data/storage}:/storage
     depends_on:
       redis:
@@ -545,7 +544,6 @@ services:
       <<: *social-publisher-environment
       DEPLOYMENT_ROLE: social-publisher-api
     volumes:
-      - ./data/secrets:/secrets
       - ${STORAGE_HOST_ROOT:-./data/storage}:/storage
     tmpfs:
       - /opt/social-auto-upload/cookies:mode=0700,uid=${APP_UID:-10001},gid=${APP_GID:-10001}
@@ -575,7 +573,6 @@ services:
       <<: *social-publisher-environment
       DEPLOYMENT_ROLE: social-publisher-worker
     volumes:
-      - ./data/secrets:/secrets
       - ${STORAGE_HOST_ROOT:-./data/storage}:/storage
     tmpfs:
       - /opt/social-auto-upload/cookies:mode=0700,uid=${APP_UID:-10001},gid=${APP_GID:-10001}
@@ -605,7 +602,6 @@ services:
       <<: *social-publisher-environment
       DEPLOYMENT_ROLE: social-publisher-scheduler
     volumes:
-      - ./data/secrets:/secrets
       - ${STORAGE_HOST_ROOT:-./data/storage}:/storage
     depends_on:
       redis:

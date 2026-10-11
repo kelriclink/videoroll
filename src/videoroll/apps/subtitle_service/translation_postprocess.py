@@ -147,6 +147,19 @@ def merge_bilingual_segments(
     ]
 
 
+class PendingDatabaseWritesError(RuntimeError):
+    """Caller must resolve writes before any slow external request."""
+
+
+def _end_transaction_before_external_io(db: Session) -> None:
+    """Close read transactions; never commit changes owned by the caller."""
+    if getattr(db, "new", ()) or getattr(db, "dirty", ()) or getattr(db, "deleted", ()):
+        raise PendingDatabaseWritesError("pending database writes before external I/O")
+    rollback = getattr(db, "rollback", None)
+    if callable(rollback):
+        rollback()
+
+
 def _rollback_best_effort(db: Session, *, operation: str, error: Exception, log: LogLine) -> None:
     try:
         db.rollback()
@@ -178,6 +191,10 @@ def postprocess_translation(
     # Best-effort title enrichment for UI/downloads.
     try:
         source_title = latest_youtube_title(db, store, task.id)
+        # The title model call may take longer than PostgreSQL's configured
+        # idle-in-transaction timeout. Persist pending task state and end the
+        # read transaction before waiting on the AI provider.
+        _end_transaction_before_external_io(db)
         if source_title:
             translated_title = source_title
             if provider == "openai" and not has_cjk(source_title):
@@ -197,6 +214,8 @@ def postprocess_translation(
                 source_title=source_title,
                 translated_title=translated_title,
             )
+    except PendingDatabaseWritesError:
+        raise
     except Exception as error:
         _rollback_best_effort(
             db,
@@ -208,6 +227,7 @@ def postprocess_translation(
     # Best-effort Bilibili tags.
     try:
         title_hint = latest_youtube_title(db, store, task.id)
+        _end_transaction_before_external_io(db)
         transcript_excerpt = segments_text_excerpt(translated_segments, max_chars=7000)
         tags: list[str] = []
         if provider == "openai":
@@ -235,6 +255,8 @@ def postprocess_translation(
                 title=title_hint,
                 summary=summary,
             )
+    except PendingDatabaseWritesError:
+        raise
     except Exception as error:
         _rollback_best_effort(
             db,
@@ -255,6 +277,8 @@ def postprocess_translation(
                 content_type="application/json",
             )
             log("publish meta refreshed after summary-aware title translation")
+    except PendingDatabaseWritesError:
+        raise
     except Exception as error:
         _rollback_best_effort(
             db,

@@ -254,7 +254,23 @@ ASR 设置页还会显示 OpenVINO 实际枚举到的设备，用于区分：
 容器真的能使用 GPU
 ```
 
-## 生产离线部署
+## 原生部署
+
+Linux 生产环境支持独立 systemd 服务，不需要 Docker 运行时。首次准备五个 Python 3.12 环境、浏览器和原生二进制，后续通过带校验清单的应用小包更新；模型、媒体和运行依赖不随包传输。
+
+```bash
+# 在构建机打包当前源码，可附带已构建的前端
+python3 scripts/native/releases.py --output dist/videoroll-native.tar.gz --web-dist src/web/dist
+
+# 在已安装原生环境的服务器上预览、应用和回滚
+sudo videorollctl update --bundle /path/to/videoroll-native.tar.gz
+sudo videorollctl update --bundle /path/to/videoroll-native.tar.gz --apply
+sudo videorollctl rollback --apply
+```
+
+首次安装、Compose 切换、数据库与依赖升级边界见 [原生部署指南](docs/NATIVE_DEPLOYMENT.md)。
+
+## Docker 生产离线部署
 
 构建完整离线镜像包：
 
@@ -285,7 +301,6 @@ docker load -i videoroll-prod-bundle-*.tar
 
 ```text
 data/
-├── secrets/
 ├── models/
 ├── redis/
 ├── storage/
@@ -297,14 +312,14 @@ data/
     └── public/
 ```
 
-PostgreSQL 是主要业务状态源。Redis 用于 Celery、实时事件和部分速率/并发辅助状态。
+PostgreSQL 是唯一必须备份的业务状态源。Redis 仅承担可重建队列/实时运行状态，本地媒体、模型缓存和 ffplayout 状态也可按需重建。
 
 不要提交：
 
 - `.env`；
 - API Key / Cookie / Remote API Token；
 - 数据库密码；
-- `data/secrets/fernet.key`；
+- 数据库导出的明文平台凭据或 Cookie；
 - 平台 storage_state；
 - 用户素材或生产日志。
 

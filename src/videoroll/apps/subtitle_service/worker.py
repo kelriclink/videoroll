@@ -118,6 +118,7 @@ from videoroll.apps.orchestrator_api.youtube_downloader import (
 from videoroll.apps.subtitle_service.queues import SUBTITLE_CONTROL_QUEUE
 from videoroll.apps.subtitle_service.worker_concurrency import (
     JobLeaseHeartbeat,
+    RECOVERY_RELAUNCH_PENDING_KEY,
     acquire_job_lease,
     release_job_lease,
 )
@@ -451,6 +452,12 @@ def _run_asr_stage(
     engine = asr_defaults["default_engine"] if requested_engine in {"", "auto"} else requested_engine
     language = asr_defaults["default_language"] if requested_language in {"", "auto"} else requested_language
     model_name = requested_model or asr_defaults["default_model"]
+    cpu_threads_cfg = _asr_cpu_threads(db) if engine == "faster-whisper" else None
+
+    # Provider execution can take minutes. End the read transaction opened by
+    # ASR settings lookups before any local model or network call so PostgreSQL's
+    # idle-in-transaction timeout cannot kill this Session underneath the job.
+    _end_read_transaction(db)
 
     if engine == "mock":
         _safe_append_log_line(log_path, "asr: engine=mock")
@@ -459,7 +466,6 @@ def _run_asr_stage(
         _safe_append_log_line(log_path, f"asr: engine=faster-whisper model={model_name} language={language}")
         proxy = str(asr_defaults.get("model_download_proxy") or "").strip() or None
         model_name = _resolve_faster_whisper_model(model_name, Path(settings.whisper_model_dir), proxy=proxy)
-        cpu_threads_cfg = _asr_cpu_threads(db)
         num_workers_cfg = max(1, int(getattr(settings, "whisper_num_workers", 1) or 1))
         segments = transcribe_faster_whisper(
             audio_path,
@@ -514,6 +520,9 @@ def _run_asr_stage(
             api_key=external_api_key,
             model_name=external_model,
             language=language,
+            timeout_seconds=600.0,
+            redis_url=settings.redis_url,
+            provider_max_concurrency=1,
             batch_size=int(asr_defaults.get("external_whisper_batch_size") or 1),
             vad_filter=bool(asr_defaults.get("external_whisper_vad_enabled", True)),
             vad_threshold=float(asr_defaults.get("external_whisper_vad_threshold") or 0.5),
@@ -608,6 +617,20 @@ class _TaskStopped(Exception):
     """Raised at a safe boundary when a user has stopped a task."""
 
 
+def _rollback_quietly(db: Session) -> None:
+    try:
+        db.rollback()
+    except Exception:
+        pass
+
+
+def _end_read_transaction(db: Session) -> None:
+    """Release a SELECT transaction without discarding uncommitted writes."""
+    if db.new or db.dirty or db.deleted:
+        raise RuntimeError("pending database writes before external I/O")
+    db.rollback()
+
+
 def _task_is_stopped(db: Session, task_id: uuid.UUID) -> bool:
     return db.query(Task.status).filter(Task.id == task_id).scalar() == TaskStatus.canceled
 
@@ -615,6 +638,15 @@ def _task_is_stopped(db: Session, task_id: uuid.UUID) -> bool:
 def _raise_if_task_stopped(db: Session, task_id: uuid.UUID) -> None:
     if _task_is_stopped(db, task_id):
         raise _TaskStopped("task stopped by user")
+
+
+def _raise_if_task_stopped_fresh(task_id: uuid.UUID) -> None:
+    check_db = _db()
+    try:
+        _raise_if_task_stopped(check_db, task_id)
+    finally:
+        _rollback_quietly(check_db)
+        check_db.close()
 
 
 def _pause_subtitle_job_if_task_stopped(db: Session, job_id: uuid.UUID) -> bool:
@@ -799,6 +831,9 @@ def _download_youtube_subtitle_segments(
         with tempfile.TemporaryDirectory(prefix="ytsub_", dir=str(work_root)) as tmp:
             tmp_dir = Path(tmp)
             yt_settings = _effective_subtitle_worker_youtube_settings(db, cookie_dir=tmp_dir)
+            # yt-dlp can block on network I/O for well over a minute. Do not
+            # keep the settings SELECT transaction open while it runs.
+            _end_read_transaction(db)
             started_at = time.monotonic()
             _safe_append_log_line(log_path, "youtube subtitles: fetching metadata via yt-dlp")
             _safe_upload_log(store, log_path, log_key)
@@ -975,6 +1010,9 @@ def run_subtitle_job(
             return {"status": "in_progress", "detail": "job was already claimed or completed"}
         # Hatchet owns scheduling; the database lease protects against duplicate
         # delivery or overlapping retries of the same SubtitleJob.
+        request = dict(job.request_json) if isinstance(job.request_json, dict) else {}
+        request.pop(RECOVERY_RELAUNCH_PENDING_KEY, None)
+        job.request_json = request
         job.status = SubtitleJobStatus.running
         job.progress = max(int(job.progress or 0), 2)
         db.add(job)
@@ -990,7 +1028,7 @@ def run_subtitle_job(
         job_hb = JobLeaseHeartbeat(lambda: _db(), job.id, lease_owner, lease_ttl_seconds)
         job_hb.start()
 
-        _raise_if_task_stopped(db, task.id)
+        _raise_if_task_stopped_fresh(task.id)
 
         req = dict(job.request_json) if isinstance(job.request_json, dict) else {}
         input_key = (req.get("input") or {}).get("key")
@@ -1379,6 +1417,7 @@ def run_subtitle_job(
             else:
                 _ensure_video()
                 _safe_append_log_line(log_path, "ffmpeg: extract audio")
+                _end_read_transaction(db)
                 extract_audio(settings.ffmpeg_path, video_path, audio_path, log_path=log_path)
                 _safe_upload_log(store, log_path, log_key)
                 audio_sha = sha256_file(audio_path)
@@ -1423,7 +1462,7 @@ def run_subtitle_job(
                 asr_cfg=asr_cfg,
                 log_path=log_path,
                 groq_checkpoint_path=_groq_asr_checkpoint_path(),
-                cancel_check=lambda: _raise_if_task_stopped(db, task.id),
+                cancel_check=lambda: _raise_if_task_stopped_fresh(task.id),
             )
             _store_source_segments(segments, source_label="asr done")
 
@@ -1481,6 +1520,7 @@ def run_subtitle_job(
             )
 
         try:
+            _end_read_transaction(db)
             translation_result = run_translation_stage(
                 db=db,
                 task_id=str(task.id),
@@ -1501,6 +1541,14 @@ def run_subtitle_job(
                 initial_summary_override=selective_summary,
             )
         except TranslationRetryRequired as retry:
+            if retry.retry_no >= retry.max_retries:
+                _safe_append_log_line(
+                    log_path,
+                    f"translate retries exhausted ({retry.retry_no}/{retry.max_retries}): "
+                    f"{type(retry.cause).__name__}: {retry.cause}",
+                )
+                _safe_upload_log(store, log_path, log_key)
+                raise retry.cause from retry
             req["resume"] = True
             _save_job_request()
             job.error_message = (
@@ -1535,6 +1583,7 @@ def run_subtitle_job(
             _raise_if_task_stopped(db, task.id)
             task.status = TaskStatus.translated
             db.add(task)
+            db.commit()
 
             segments_out = postprocess_translation(
                 db=db,
@@ -1749,30 +1798,55 @@ def run_subtitle_job(
             upload_log=lambda: _safe_upload_log(store, log_path, log_key),
         )
     except _TaskStopped:
-        _pause_subtitle_job_if_task_stopped(db, jid)
+        _rollback_quietly(db)
+        stop_db = _db()
+        try:
+            _pause_subtitle_job_if_task_stopped(stop_db, jid)
+        finally:
+            stop_db.close()
         return {"status": "stopped", "detail": "task stopped by user"}
     except SubtitleJobLeaseBusy:
         raise
     except TranslationRetryRequired:
-        retry_job = db.get(SubtitleJob, jid)
-        if retry_job and retry_job.status == SubtitleJobStatus.running:
-            retry_job.status = SubtitleJobStatus.queued
-            db.add(retry_job)
-            db.commit()
+        _rollback_quietly(db)
+        retry_db = _db()
+        try:
+            retry_job = retry_db.get(SubtitleJob, jid)
+            if retry_job and retry_job.status == SubtitleJobStatus.running:
+                retry_job.status = SubtitleJobStatus.queued
+                retry_db.add(retry_job)
+                retry_db.commit()
+        except Exception:
+            _rollback_quietly(retry_db)
+            raise
+        finally:
+            retry_db.close()
         raise
     except Exception as e:
-        job = db.get(SubtitleJob, uuid.UUID(job_id))
-        if job:
-            job.status = SubtitleJobStatus.failed
-            job.error_message = str(e)
-            db.add(job)
-            task = db.get(Task, job.task_id)
-            if task and not _task_is_stopped(db, task.id) and task.status != TaskStatus.published:
-                task.status = TaskStatus.failed
-                task.error_code = task.error_code or "SUBTITLE_FAILED"
-                task.error_message = str(e)
-                db.add(task)
-        db.commit()
+        _rollback_quietly(db)
+        failure_db = _db()
+        try:
+            failed_job = failure_db.get(SubtitleJob, jid)
+            if failed_job:
+                failed_job.status = SubtitleJobStatus.failed
+                failed_job.error_message = str(e)
+                failure_db.add(failed_job)
+                failed_task = failure_db.get(Task, failed_job.task_id)
+                if (
+                    failed_task
+                    and not _task_is_stopped(failure_db, failed_task.id)
+                    and failed_task.status != TaskStatus.published
+                ):
+                    failed_task.status = TaskStatus.failed
+                    failed_task.error_code = failed_task.error_code or "SUBTITLE_FAILED"
+                    failed_task.error_message = str(e)
+                    failure_db.add(failed_task)
+            failure_db.commit()
+        except Exception:
+            _rollback_quietly(failure_db)
+            logger.exception("failed to persist subtitle job failure (job_id=%s)", jid)
+        finally:
+            failure_db.close()
         _safe_append_log_line(log_path, f"ERROR: {type(e).__name__}: {e}")
         _safe_append_log_block(log_path, traceback.format_exc())
         _safe_upload_log(store, log_path, log_key)

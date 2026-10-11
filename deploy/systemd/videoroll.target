@@ -1,0 +1,26 @@
+[Unit]
+Description=VideoRoll native application stack
+Wants=videoroll-redis.service
+Wants=videoroll-hatchet.service
+Wants=videoroll-hatchet-token.service
+Wants=videoroll-social@api.service
+Wants=videoroll-social@worker.service
+Wants=videoroll-social@scheduler.service
+Wants=videoroll@egress-gateway.service
+Wants=videoroll@subtitle-service.service
+Wants=videoroll@youtube-ingest.service
+Wants=videoroll@bilibili-publisher.service
+Wants=videoroll@workflow-api.service
+Wants=videoroll@workflow-worker.service
+Wants=videoroll@subtitle-workflow-worker.service
+Wants=videoroll@subtitle-control-worker.service
+Wants=videoroll@publish-worker.service
+Wants=videoroll@outbox-dispatcher.service
+# Local renderer is opt-in: distributed Rust render nodes handle this role by default.
+# To enable fallback: systemctl enable videoroll@render-worker.service
+Wants=videoroll@orchestrator.service
+Wants=videoroll-web.service
+After=network-online.target
+
+[Install]
+WantedBy=multi-user.target

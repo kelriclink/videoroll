@@ -1,0 +1,28 @@
+[Unit]
+Description=VideoRoll native Web gateway
+After=network-online.target videoroll@orchestrator.service
+Wants=network-online.target
+PartOf=videoroll.target
+ConditionPathExists=/opt/videoroll/current/web/index.html
+
+[Service]
+Type=simple
+User=videoroll
+Group=videoroll
+ExecStartPre=/usr/sbin/nginx -t -c /etc/videoroll/nginx.conf
+ExecStart=/usr/sbin/nginx -c /etc/videoroll/nginx.conf -g "daemon off;"
+ExecReload=/usr/sbin/nginx -c /etc/videoroll/nginx.conf -s reload
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=30
+KillSignal=SIGQUIT
+UMask=0027
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectHome=yes
+ReadWritePaths=/opt/videoroll/current/data/nginx
+LimitNOFILE=65536
+
+[Install]
+WantedBy=videoroll.target

@@ -443,7 +443,7 @@ Orchestrator 启动时调用 `initialize_database()`，通过 Alembic upgrade �
 当前 migration head：
 
 ```text
-0006_agent_runtime
+0010_remove_legacy_task_queue
 ```
 
 生产发布仍建议在滚动切换前显式运行 migration，把 schema 变化和容器重建拆成两个可观测步骤。

@@ -14,6 +14,50 @@ from videoroll.apps.subtitle_service.translation_postprocess import (
 )
 
 
+def test_external_io_boundary_rejects_pending_database_writes() -> None:
+    class DirtySession:
+        new = ()
+        dirty = ("uncommitted task status",)
+        deleted = ()
+
+        def rollback(self):
+            raise AssertionError("must not discard uncommitted state")
+
+        def commit(self):
+            raise AssertionError("must not commit another function's state")
+
+    with pytest.raises(RuntimeError, match="pending database writes"):
+        translation_postprocess._end_transaction_before_external_io(DirtySession())
+
+
+def test_postprocess_does_not_swallow_uncommitted_writes(monkeypatch) -> None:
+    class DirtySession:
+        new = ()
+        dirty = ("uncommitted task update",)
+        deleted = ()
+
+        def rollback(self):
+            raise AssertionError("unexpected rollback")
+
+        def commit(self):
+            raise AssertionError("unexpected commit")
+
+    monkeypatch.setattr(
+        translation_postprocess, "latest_youtube_title",
+        lambda *_args: "test title",
+    )
+    segments = [Segment(start=0, end=1, text="hello")]
+    with pytest.raises(translation_postprocess.PendingDatabaseWritesError):
+        postprocess_translation(
+            db=DirtySession(), store=object(),
+            task=SimpleNamespace(id=uuid.uuid4()),
+            request_json={}, source_segments=segments,
+            translated_segments=segments, provider="mock",
+            target_lang="zh", style="normal", summary="",
+            bilingual=False, ai_service=object(), log=lambda _line: None,
+        )
+
+
 def test_merge_bilingual_segments_preserves_translated_timing_and_source_text() -> None:
     source = [
         Segment(start=0.0, end=1.0, text="hello"),
@@ -175,7 +219,8 @@ def test_title_metadata_failure_rolls_back_and_tag_update_continues(
     )
 
     assert result is translated
-    assert db.rollbacks == 1
+    # Two read-only transactions are closed before LLM calls, then failure rolls back.
+    assert db.rollbacks == 3
     assert tag_updates == [["tag1", "tag2", "tag3", "tag4", "tag5", "tag6"]]
     assert any("title metadata update skipped: RuntimeError: title commit failed" in line for line in logs)
 
@@ -243,7 +288,8 @@ def test_tag_failure_rolls_back_before_publish_meta_refresh(
     )
 
     assert result is translated
-    assert db.rollbacks == 1
+    # Two read-only transactions are closed before LLM calls, then failure rolls back.
+    assert db.rollbacks == 3
     assert writes == [f"meta/{task_id}/publish_meta.json"]
     assert any("bilibili tag update skipped: RuntimeError: tag commit failed" in line for line in logs)
     assert any("publish meta refreshed" in line for line in logs)

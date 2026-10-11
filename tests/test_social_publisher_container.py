@@ -52,12 +52,12 @@ def test_novnc_uses_root_absolute_websocket_paths() -> None:
     assert "path=/social-publish/websockify" in publish_helpers
 
 
-def test_bilibili_publishers_share_the_persistent_fernet_key() -> None:
+def test_publishers_do_not_require_a_filesystem_secret_volume() -> None:
     for relative_path in ("compose.yml", "docker-compose.yml"):
         compose = (ROOT / relative_path).read_text(encoding="utf-8")
         for service in ("bilibili-publisher", "publish-worker"):
             block = _compose_service_block(compose, service)
-            assert "./data/secrets:/secrets" in block
+            assert "./data/secrets:/secrets" not in block
 
 
 def test_nginx_authorizes_every_novnc_request_and_vnc_uses_a_tmpfs_password_file() -> None:

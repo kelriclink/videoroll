@@ -25,6 +25,10 @@ _MIN_JOB_LEASE_SECONDS = 1
 _MAX_JOB_LEASE_SECONDS = 3600
 _RENDER_EXECUTION_REQUEUE_GRACE = timedelta(seconds=30)
 _ACTIVE_RENDER_EXECUTION_STATES = ("claimed", "running", "uploading")
+RECOVERY_RELAUNCH_PENDING_KEY = "_hatchet_relaunch_pending"
+RECOVERY_RELAUNCH_AT_KEY = "_hatchet_relaunch_at"
+RECOVERY_CLAIM_ID_KEY = "_hatchet_relaunch_claim_id"
+RECOVERY_CLAIM_UNTIL_KEY = "_hatchet_relaunch_claim_until"
 
 
 @dataclass(frozen=True)
@@ -272,6 +276,8 @@ def recover_expired_leases(
     for job in subtitle_jobs:
         request = dict(job.request_json) if isinstance(job.request_json, dict) else {}
         request["resume"] = True
+        request[RECOVERY_RELAUNCH_PENDING_KEY] = True
+        request[RECOVERY_RELAUNCH_AT_KEY] = now.isoformat()
         job.request_json = request
         job.status = SubtitleJobStatus.queued
         job.progress = 0
@@ -364,6 +370,8 @@ def recover_expired_leases(
         for job in legacy_subtitles:
             request = dict(job.request_json) if isinstance(job.request_json, dict) else {}
             request["resume"] = True
+            request[RECOVERY_RELAUNCH_PENDING_KEY] = True
+            request[RECOVERY_RELAUNCH_AT_KEY] = now.isoformat()
             job.request_json = request
             job.status = SubtitleJobStatus.queued
             job.progress = 0

@@ -122,16 +122,12 @@ Realtime event 本身不提供额外授权能力。
 
 Social storage_state / Bilibili credential 等敏感信息：
 
-- 保存时加密；
-- Web 不回显明文；
-- social worker 仅在 tmpfs 临时解密；
-- worker 任务结束清理临时文件。
+- 按当前部署策略直接保存到 PostgreSQL，以支持仅凭数据库完成灾难恢复；
+- Web 仍不回显完整明文；
+- social worker 运行时临时文件仍放在 tmpfs；
+- worker 任务结束仍清理临时文件。
 
-必须保护：
-
-```text
-data/secrets/fernet.key
-```
+因此 PostgreSQL 备份本身包含敏感凭据，应按生产数据库权限控制和备份策略管理。
 
 ## 9. Security Audit
 

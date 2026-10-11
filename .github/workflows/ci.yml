@@ -116,6 +116,8 @@ jobs:
       INTERNAL_API_SECRET: ci-internal-secret-change-me
       ADMIN_BOOTSTRAP_SECRET: ci-bootstrap-secret-change-me
       DEVELOPMENT_MODE: "false"
+      HATCHET_DATABASE_URL: postgresql://hatchet:hatchet@postgres:5432/hatchet
+      HATCHET_ADMIN_PASSWORD: ci-hatchet-admin-password
 
     steps:
       - uses: actions/checkout@v4

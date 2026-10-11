@@ -1,0 +1,2 @@
+#!/bin/sh
+exec /opt/videoroll/venvs/core/bin/python /opt/videoroll/current/scripts/native/videorollctl.py "$@"

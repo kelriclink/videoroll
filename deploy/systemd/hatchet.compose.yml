@@ -1,0 +1,41 @@
+services:
+  hatchet-lite:
+    build:
+      context: ../../services/hatchet
+      dockerfile: Dockerfile.videoroll
+      args:
+        VERSION: ${HATCHET_VERSION:-v0.107.0}
+    image: videoroll-hatchet:prod
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      DATABASE_URL: ${HATCHET_DATABASE_URL:?HATCHET_DATABASE_URL must be set}
+      ADMIN_EMAIL: ${HATCHET_ADMIN_EMAIL:-admin@videoroll.local}
+      ADMIN_PASSWORD: ${HATCHET_ADMIN_PASSWORD:?HATCHET_ADMIN_PASSWORD must be set}
+      ADMIN_NAME: ${HATCHET_ADMIN_NAME:-VideoRoll Admin}
+      DEFAULT_TENANT_NAME: ${HATCHET_TENANT_NAME:-VideoRoll}
+      DEFAULT_TENANT_SLUG: ${HATCHET_TENANT_SLUG:-videoroll}
+      LITE_FRONTEND_BASE_PATH: /workflow-ui
+      SERVER_MSGQUEUE_KIND: postgres
+      SERVER_DEFAULT_ENGINE_VERSION: V1
+      SERVER_GRPC_BIND_ADDRESS: 0.0.0.0
+      SERVER_GRPC_BROADCAST_ADDRESS: 127.0.0.1:7077
+      SERVER_INTERNAL_CLIENT_INTERNAL_GRPC_BROADCAST_ADDRESS: 127.0.0.1:7077
+      SERVER_GRPC_PORT: "7077"
+      SERVER_GRPC_INSECURE: "true"
+      SERVER_URL: ${HATCHET_SERVER_URL:-http://127.0.0.1:3001}
+      SERVER_FRONTEND_URL: ${HATCHET_FRONTEND_URL:-http://127.0.0.1:3001/workflow-ui/}
+      SERVER_AUTH_COOKIE_DOMAIN: ${HATCHET_COOKIE_DOMAIN:-localhost}
+      SERVER_AUTH_COOKIE_INSECURE: ${HATCHET_COOKIE_INSECURE:-true}
+      SERVER_AUTH_SET_EMAIL_VERIFIED: "true"
+      SERVER_SECURITY_CHECK_ENABLED: "false"
+      SERVER_LOGGER_LEVEL: ${HATCHET_LOG_LEVEL:-warn}
+    ports:
+      - "127.0.0.1:8888:8888"
+      - "127.0.0.1:7077:7077"
+    volumes:
+      - hatchet-lite-config:/config
+    restart: unless-stopped
+
+volumes:
+  hatchet-lite-config:

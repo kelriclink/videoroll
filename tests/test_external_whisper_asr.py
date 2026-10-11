@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 import wave
 
+import httpx
 import pytest
 
 from videoroll.apps.subtitle_service import processing
@@ -137,6 +138,37 @@ def test_external_whisper_parses_verbose_segments(tmp_path) -> None:
     assert sent["min_silence_duration_ms"] == "2000"
     assert sent["speech_pad_ms"] == "400"
     assert post.call_args.args[0] == "https://api.example/v1/audio/transcriptions"
+    request_timeout = post.call_args.kwargs["timeout"]
+    assert request_timeout.read == 600.0
+    assert request_timeout.connect == 15.0
+
+
+def test_external_whisper_retries_transient_connect_error(tmp_path) -> None:
+    audio_path = tmp_path / "audio.wav"
+    audio_path.write_bytes(b"wav")
+    response = MagicMock()
+    response.json.return_value = {
+        "segments": [{"start": 0.0, "end": 1.0, "text": "Recovered"}],
+    }
+    response.raise_for_status.return_value = None
+
+    with (
+        patch(
+            "videoroll.apps.subtitle_service.processing.httpx.post",
+            side_effect=[httpx.ConnectError("temporary DNS failure"), response],
+        ) as post,
+        patch("videoroll.apps.subtitle_service.processing.time.sleep") as sleep,
+    ):
+        segments = processing.transcribe_external_whisper(
+            audio_path,
+            base_url="https://api.example/v1",
+            api_key="secret",
+            model_name="whisper-1",
+        )
+
+    assert [segment.text for segment in segments] == ["Recovered"]
+    assert post.call_count == 2
+    sleep.assert_called_once_with(0.5)
 
 
 def test_external_whisper_falls_back_to_one_segment_for_plain_text_response(tmp_path) -> None:

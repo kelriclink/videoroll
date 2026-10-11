@@ -229,7 +229,7 @@ migrations/versions/
 当前 head：
 
 ```text
-0006_agent_runtime
+0010_remove_legacy_task_queue
 ```
 
 运行：

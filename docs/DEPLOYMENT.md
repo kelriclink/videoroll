@@ -4,6 +4,8 @@
 
 本文覆盖 Docker Compose 开发环境、离线生产部署、数据库迁移、Intel GPU、上线验证和回滚。
 
+需要避免重复传输完整镜像时，使用 [原生 systemd 部署](NATIVE_DEPLOYMENT.md)。原生应用更新使用版本包，保留运行依赖和共享数据，并支持健康检查失败回退。本文的 Docker 操作不适用于原生应用日常更新。
+
 ## 1. 推荐部署模型
 
 ```text
@@ -95,7 +97,6 @@ STORAGE_ROOT=/storage/objects
 
 ```text
 data/
-├── secrets/
 ├── models/
 ├── redis/
 ├── storage/
@@ -113,22 +114,14 @@ data/
 sudo env ENV_FILE=.env ./scripts/prepare_prod_dirs.sh
 ```
 
-### 发布时不可覆盖的数据
+### 发布时真正需要保留的数据
 
-- `data/secrets`；
-- `data/models`；
-- `data/redis`；
-- `data/storage`；
-- `data/ffplayout`；
-- 外部 PostgreSQL 数据。
+当前原生部署把 PostgreSQL 视为唯一必须长期保留的业务状态源。
 
-尤其不要删除或替换：
-
-```text
-data/secrets/fernet.key
-```
-
-否则数据库中已加密的社交账号状态、Cookie 等可能无法解密。
+- 外部 PostgreSQL 数据必须备份。
+- Redis、模型缓存、媒体工作目录、ffplayout 本地数据库和浏览器运行状态都允许重建。
+- API Key、Cookie、social storage_state 从这一版开始直接以数据库可恢复格式保存，不再依赖 `fernet.key`。
+- 旧版本数据库中的 Fernet 密文在缺少旧 key 时无法恢复；DB-only 恢复会清掉这些旧凭据并要求重新录入。
 
 ## 6. 开发环境启动
 
@@ -271,7 +264,7 @@ docker load -i videoroll-prod-bundle-*.tar
 当前 migration head：
 
 ```text
-0006_agent_runtime
+0010_remove_legacy_task_queue
 ```
 
 推荐在切换业务容器前显式运行：
@@ -455,15 +448,16 @@ VideoRoll 的 `video_final` 由服务端 hardlink/copy 加入播控，不经过�
 
 ## 19. 备份
 
-至少备份：
+原生 / DB-only 部署下，唯一必须保留的业务状态是 PostgreSQL。
 
-1. PostgreSQL；
-2. `data/secrets`；
-3. `data/storage`；
-4. `data/ffplayout`；
-5. 生产 `.env`。
+建议备份优先级：
 
-`data/models` 可以重新下载时优先级可略低，但大模型的重新获取成本通常很高。
+1. PostgreSQL：必须；
+2. 生产 `.env`：方便恢复，但丢失后可重新生成内部 secret；
+3. `data/storage` / `data/ffplayout`：仅在希望保留本地媒体与播控状态时备份；
+4. `data/models`：可重新下载。
+
+从当前版本开始，平台 API Key、Cookie 和 social storage_state 直接保存到 PostgreSQL，因此数据库备份本身包含敏感凭据。
 
 ## 20. 回滚
 

@@ -1,0 +1,24 @@
+[Unit]
+Description=VideoRoll Redis
+After=network.target
+Before=videoroll.target
+PartOf=videoroll.target
+
+[Service]
+Type=simple
+User=videoroll
+Group=videoroll
+ExecStart=/usr/bin/redis-server /etc/videoroll/redis.conf
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=30
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectHome=yes
+ReadWritePaths=/opt/videoroll/current/data/redis-native
+LimitNOFILE=65536
+
+[Install]
+WantedBy=videoroll.target

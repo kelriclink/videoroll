@@ -1201,7 +1201,9 @@ def transcribe_external_whisper(
     api_key: str,
     model_name: str,
     language: str = "auto",
-    timeout_seconds: float = 180.0,
+    timeout_seconds: float = 600.0,
+    redis_url: str = "",
+    provider_max_concurrency: int = 1,
     batch_size: int = 1,
     vad_filter: bool = True,
     vad_threshold: float = 0.5,
@@ -1242,15 +1244,47 @@ def transcribe_external_whisper(
     if key:
         headers["Authorization"] = f"Bearer {key}"
 
+    provider_gate = ProviderRateGate(
+        redis_url,
+        "external-whisper",
+        max_concurrency=max(1, int(provider_max_concurrency or 1)),
+        slot_ttl_seconds=timeout + 120.0,
+    )
+
     def post(form_data: dict[str, str]) -> httpx.Response:
-        with audio_path.open("rb") as audio_file:
-            return httpx.post(
-                url,
-                headers=headers,
-                data=form_data,
-                files={"file": (audio_path.name, audio_file, "audio/wav")},
-                timeout=timeout,
-            )
+        # The self-hosted faster-whisper backend currently serializes GPU
+        # inference with a process-wide lock. Bound requests before HTTP so
+        # queued jobs do not burn their read timeout while waiting behind it.
+        with provider_gate.slot(wait_seconds=max(3600.0, timeout * 6.0)):
+            max_connect_attempts = 4
+            for attempt in range(1, max_connect_attempts + 1):
+                try:
+                    with audio_path.open("rb") as audio_file:
+                        return httpx.post(
+                            url,
+                            headers=headers,
+                            data=form_data,
+                            files={"file": (audio_path.name, audio_file, "audio/wav")},
+                            timeout=httpx.Timeout(
+                                timeout,
+                                connect=min(15.0, timeout),
+                                write=timeout,
+                                pool=min(15.0, timeout),
+                            ),
+                        )
+                except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+                    if attempt >= max_connect_attempts:
+                        raise
+                    delay = min(4.0, 0.5 * (2 ** (attempt - 1)))
+                    logger.warning(
+                        "online Whisper connect attempt %d/%d failed with %s; retrying in %.1fs",
+                        attempt,
+                        max_connect_attempts,
+                        exc,
+                        delay,
+                    )
+                    time.sleep(delay)
+        raise RuntimeError("online Whisper connection retry loop exited unexpectedly")
 
     try:
         response = post(data)
