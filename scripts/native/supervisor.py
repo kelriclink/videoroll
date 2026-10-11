@@ -22,10 +22,10 @@ from pathlib import Path
 
 SOURCE = Path("/opt/videoroll/current")
 LAUNCHERS = SOURCE / "scripts" / "native"
-DATA = SOURCE / "data"
+DATA = Path(os.environ.get("VIDEOROLL_DATA_ROOT", "/opt/videoroll/data"))
 HATCHET_CONFIG = DATA / "hatchet" / "config"
-REDIS_CONF = Path("/etc/videoroll/redis.conf")
-NGINX_CONF = Path("/etc/videoroll/nginx.conf")
+REDIS_CONF = Path("/opt/videoroll/config/redis.conf")
+NGINX_CONF = Path("/opt/videoroll/config/nginx.conf")
 HEALTH_TIMEOUT = 120
 RESTART_WINDOW = 60
 RESTART_LIMIT = 5
@@ -46,6 +46,7 @@ class Program:
 def programs(env: dict[str, str], *, runtime_dir: str) -> list[Program]:
     """Keep the launcher roles identical to the validated Compose roles."""
     service_env = {
+        "LD_LIBRARY_PATH": "/opt/videoroll/lib",
         "HOME": str(DATA / "home"),
         "PLAYWRIGHT_BROWSERS_PATH": str(DATA / "browsers"),
         "SAU_RUNTIME_DIR": "/opt/videoroll/current/social-auto-upload",
@@ -54,7 +55,7 @@ def programs(env: dict[str, str], *, runtime_dir: str) -> list[Program]:
         "PYTHONDONTWRITEBYTECODE": "1",
     }
     result = [
-        Program("redis", ("/usr/bin/redis-server", str(REDIS_CONF))),
+        Program("redis", ("/opt/videoroll/bin/redis-server", str(REDIS_CONF)), env={"LD_LIBRARY_PATH": "/opt/videoroll/lib"}),
         Program("hatchet", (str(LAUNCHERS / "run-hatchet.sh"),)),
     ]
     for name in (
@@ -77,13 +78,13 @@ def programs(env: dict[str, str], *, runtime_dir: str) -> list[Program]:
         )
     if (
         env.get("VIDEOROLL_SKIP_FFPLAYOUT", "").lower() not in ("1", "true", "yes")
-        and Path("/usr/local/bin/ffplayout").is_file()
+        and Path("/opt/videoroll/bin/ffplayout").is_file()
     ):
         result.append(
             Program(
                 "ffplayout",
                 (
-                    "/usr/local/bin/ffplayout", "--listen", "127.0.0.1:8787",
+                    "/opt/videoroll/bin/ffplayout", "--listen", "127.0.0.1:8787",
                     "--db", str(DATA / "ffplayout" / "db" / "ffplayout.db"),
                     "--log-to-console",
                 ),
@@ -91,7 +92,7 @@ def programs(env: dict[str, str], *, runtime_dir: str) -> list[Program]:
             )
         )
     result.append(
-        Program("web", ("/usr/sbin/nginx", "-c", str(NGINX_CONF), "-g", "daemon off;"))
+        Program("web", ("/opt/videoroll/bin/nginx", "-c", str(NGINX_CONF), "-g", "daemon off;"))
     )
     return result
 
@@ -118,7 +119,7 @@ def mint_hatchet_token(env: dict[str, str]) -> str:
     admin_env = {**env, "DATABASE_URL": env["HATCHET_DATABASE_URL"]}
     result = subprocess.run(
         (
-            "/usr/local/bin/hatchet-admin", "token", "create",
+            "/opt/videoroll/bin/hatchet-admin", "token", "create",
             "--config", str(HATCHET_CONFIG),
             "--name", "videoroll-native", "--expiresIn", "87600h",
         ),

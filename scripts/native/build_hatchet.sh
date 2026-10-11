@@ -73,14 +73,14 @@ if [[ -n "$OUTPUT_DIR" ]]; then
   exit 0
 fi
 
+install -d -m 0755 /opt/videoroll/share/hatchet /opt/videoroll/bin
 for binary in hatchet-lite hatchet-admin hatchet-migrate; do
-  install -m 0755 "$TMP/bin/$binary" "/usr/local/bin/$binary"
+  install -m 0755 "$TMP/bin/$binary" "/opt/videoroll/bin/$binary"
 done
-install -d -m 0755 /usr/share/videoroll/hatchet
 # Atomic directory replacement would be ideal; keep a versioned directory so
 # existing in-use assets aren't partially overwritten during a failed copy.
-ASSET_DIR="/usr/share/videoroll/hatchet/static-assets"
-STAGED="/usr/share/videoroll/hatchet/.static-assets-next"
+ASSET_DIR="/opt/videoroll/share/hatchet/static-assets"
+STAGED="/opt/videoroll/share/hatchet/.static-assets-next"
 rm -rf "$STAGED"
 mkdir -p "$STAGED"
 cp -a "$TMP/static-assets/." "$STAGED/"

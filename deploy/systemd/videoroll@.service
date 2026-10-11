@@ -9,10 +9,9 @@ PartOf=videoroll.target
 Type=simple
 User=videoroll
 Group=videoroll
-EnvironmentFile=/etc/videoroll/videoroll.env
+EnvironmentFile=/opt/videoroll/config/videoroll.env
 Environment=PYTHONPATH=/opt/videoroll/current/src:/opt/videoroll/current/social-auto-upload
-Environment=HOME=/opt/videoroll/current/data/home
-ExecStart=/usr/local/libexec/videoroll-run-role %i
+ExecStart=/opt/videoroll/libexec/videoroll-run-role %i
 Restart=on-failure
 RestartSec=3
 TimeoutStartSec=120
@@ -23,7 +22,6 @@ NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=full
 ProtectHome=yes
-ReadWritePaths=/opt/videoroll/current/data
 LimitNOFILE=65536
 
 [Install]

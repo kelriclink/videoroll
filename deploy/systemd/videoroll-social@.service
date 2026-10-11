@@ -10,15 +10,13 @@ ConditionPathExists=/opt/videoroll/venvs/social/bin/python
 Type=simple
 User=videoroll
 Group=videoroll
-EnvironmentFile=/etc/videoroll/videoroll.env
+EnvironmentFile=/opt/videoroll/config/videoroll.env
 Environment=PYTHONPATH=/opt/videoroll/current/src:/opt/videoroll/current/social-auto-upload
-Environment=PLAYWRIGHT_BROWSERS_PATH=/opt/videoroll/current/data/browsers
 Environment=SAU_RUNTIME_DIR=/opt/videoroll/current/social-auto-upload
 Environment=SAU_EXECUTABLE=/opt/videoroll/venvs/social/bin/sau
-Environment=HOME=/opt/videoroll/current/data/home
 RuntimeDirectory=videoroll-social-%i
 RuntimeDirectoryMode=0700
-ExecStart=/usr/local/libexec/videoroll-run-social-role %i
+ExecStart=/opt/videoroll/libexec/videoroll-run-social-role %i
 Restart=on-failure
 RestartSec=3
 TimeoutStartSec=180
@@ -30,7 +28,6 @@ NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=full
 ProtectHome=yes
-ReadWritePaths=/opt/videoroll/current/data
 LimitNOFILE=65536
 
 [Install]

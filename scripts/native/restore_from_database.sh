@@ -13,7 +13,7 @@ if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
 fi
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-NATIVE_ENV=/etc/videoroll/videoroll.env
+NATIVE_ENV=/opt/videoroll/config/videoroll.env
 
 stop_partial_restore() {
   status=$?
@@ -27,7 +27,7 @@ trap stop_partial_restore ERR
 if [[ ! -f "$NATIVE_ENV" ]]; then
   : "${DATABASE_URL:?DATABASE_URL is required when no native environment exists}"
   : "${HATCHET_DATABASE_URL:?HATCHET_DATABASE_URL must point to a new/rebuildable Hatchet database}"
-  install -d -m 0750 /etc/videoroll
+  install -d -m 0750 /opt/videoroll/config
   python3 "$ROOT_DIR/scripts/native/bootstrap_env.py" \
     --database-url "$DATABASE_URL" \
     --hatchet-database-url "$HATCHET_DATABASE_URL" \
@@ -39,7 +39,7 @@ bash "$ROOT_DIR/scripts/native/install.sh"
 
 echo "[2/7] Build/install native Web and Hatchet"
 bash "$ROOT_DIR/scripts/native/build_web.sh"
-if [[ ! -x /usr/local/bin/hatchet-lite || ! -x /usr/local/bin/hatchet-admin ]]; then
+if [[ ! -x /opt/videoroll/bin/hatchet-lite || ! -x /opt/videoroll/bin/hatchet-admin ]]; then
   bash "$ROOT_DIR/scripts/native/build_hatchet.sh"
 fi
 
@@ -60,7 +60,7 @@ echo "[4/7] Start native Redis/Hatchet and generate worker token"
 bash "$ROOT_DIR/scripts/native/start_native_infra.sh"
 
 echo "[5/7] Start all native VideoRoll systemd units"
-if [[ -x /usr/local/bin/ffplayout ]]; then
+if [[ -x /opt/videoroll/bin/ffplayout ]]; then
   systemctl start videoroll-ffplayout.service
 else
   echo "ffplayout not installed: playout UI will be unavailable until the binary is built." >&2
@@ -86,7 +86,7 @@ systemctl enable videoroll.target
 if systemctl is-active --quiet videoroll-ffplayout.service; then
   systemctl enable videoroll-ffplayout.service
 fi
-touch "$ROOT_DIR/data/db-only-restore-complete"
+touch "${VIDEOROLL_DATA_ROOT:-/opt/videoroll/data}/db-only-restore-complete"
 trap - ERR
 echo "Database-only native restore complete. No Docker runtime is required."
 echo "Old Fernet credentials, if present, require re-entry."

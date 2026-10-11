@@ -232,7 +232,8 @@ def deployment_lock(install_root: Path) -> Iterator[None]:
 
 
 def attach_shared_paths(old: Path, new: Path) -> None:
-    for name in ("data", "social-auto-upload"):
+    # Persistent media and credentials now live outside the Git checkout.
+    for name in ("social-auto-upload",):
         target = (old / name).resolve(strict=True)
         (new / name).symlink_to(target, target_is_directory=True)
     if not (new / "web").exists():

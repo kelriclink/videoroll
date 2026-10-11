@@ -235,3 +235,27 @@ sudo env VIDEOROLL_DATA_ROOT=/DATA/videoroll/data VIDEOROLL_NATIVE_ASR_RUNTIME=r
 ```
 
 原生 Redis 使用隔离目录 `data/redis-native`，不直接操作原 Docker Redis 的 AOF 文件；旧 AOF 原样保留。切换前需确认旧 Redis 中没有必须恢复的未完成任务。预构建 Hatchet 二进制、ffplayout 及完整数据恢复仍须独立验收。
+
+
+## 10. 项目内自带 Nginx/Redis 和集中配置（link）
+
+2026-10 的 link 原生方案取消了 `/etc/videoroll`、`/usr/local/bin/hatchet-*`、`/usr/local/libexec/videoroll-*` 等散落位置：配置与密钥存于 `/opt/videoroll/config/videoroll.env`（root:root, 0600），Nginx/Redis 文本配置在同目录且由安装器按 `VIDEOROLL_DATA_ROOT` 渲染；应用二进制在 `/opt/videoroll/bin`，脚本在 `/opt/videoroll/libexec`，Hatchet/Nginx 的静态资源与动态库分别在 `share/` 与 `lib/`。系统唯一必要注册文件为 `/etc/systemd/system/videoroll*.service` 和 `videoroll.target`。
+
+Nginx 和 Redis 是 Debian 13 包中的**原生二进制**，通过 `scripts/native/install_system_binaries.sh` 提取到项目目录，**不安装系统级 nginx/redis-server 服务**。为重复部署可在构建机提供已解压的 Debian 包目录 `VIDEOROLL_SYSTEM_BINARIES_ARTIFACT_DIR=/path/to/extracted`，其中包含 `usr/sbin/nginx`、`usr/bin/redis-server`、`usr/bin/redis-cli`、`etc/nginx/mime.types` 和 `usr/lib/*/liblzf.so.*`。不提供时安装脚本使用 `apt-get download` + `dpkg-deb -x`，无容器运行需求。仅适用与构建产物 ABI 兼容的目标 Debian/Ubuntu 系统，需要以 `ldd` 检验动态链接。
+
+link 应将旧 Docker `.env` 作为迁移输入，**不是**直接修改旧环境文件：
+
+```bash
+sudo env VIDEOROLL_SOURCE_ENV=/DATA/videoroll/.env \
+  VIDEOROLL_DATA_ROOT=/DATA/videoroll/data \
+  VIDEOROLL_NATIVE_ASR_RUNTIME=remote \
+  VIDEOROLL_SYSTEM_BINARIES_ARTIFACT_DIR=/DATA/videoroll/native-build-artifacts/system-services/extracted \
+  VIDEOROLL_WEB_DIST=/DATA/videoroll/native-build-artifacts/web \
+  HATCHET_ARTIFACT_DIR=/DATA/videoroll/native-build-artifacts/hatchet \
+  FFPLAYOUT_ARTIFACT_DIR=/DATA/videoroll/native-build-artifacts/ffplayout \
+  bash /opt/videoroll/src/scripts/native/install.sh
+```
+
+迁移后的 `VIDEOROLL_DATA_ROOT=/DATA/videoroll/data` 会供所有程序使用；`data/redis-native` 与旧 Docker AOF 隔离。`nginx.conf` 的 PID 和临时路径、Redis 的 dir 由同一值生成。源码目录 `src/data` 不再必须存在，也不需要成为旧数据的软链接。
+
+`/opt/videoroll/config/videoroll.env` 仍含数据库凭据，应限制为 root 读取；服务由 systemd 在降权前加载变量。不要把该文件上传到 GitHub。

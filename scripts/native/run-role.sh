@@ -68,7 +68,7 @@ case "$role" in
   outbox-dispatcher)
     export DEPLOYMENT_ROLE=outbox-dispatcher
     preflight "$CORE_VENV/bin/python" outbox-dispatcher
-    exec "$CORE_VENV/bin/celery" -A videoroll.apps.subtitle_service.worker:celery_app beat -l INFO --schedule /opt/videoroll/current/data/state/celerybeat-schedule
+    exec "$CORE_VENV/bin/celery" -A videoroll.apps.subtitle_service.worker:celery_app beat -l INFO --schedule "${VIDEOROLL_DATA_ROOT:-/opt/videoroll/data}/state/celerybeat-schedule"
     ;;
   render-worker)
     export DEPLOYMENT_ROLE=render-worker

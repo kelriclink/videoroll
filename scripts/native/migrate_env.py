@@ -73,6 +73,11 @@ def native_data_paths(project_root: Path) -> dict[str, str]:
     work = storage / "work" if use_legacy else data / "work"
     state = storage / "state" if use_legacy else data / "state"
     return {
+        "VIDEOROLL_DATA_ROOT": str(data),
+        "HOME": str(data / "home"),
+        "PLAYWRIGHT_BROWSERS_PATH": str(data / "browsers"),
+        "VIDEOROLL_HATCHET_HOME": str(data / "hatchet"),
+        "VIDEOROLL_HATCHET_CONFIG_DIR": str(data / "hatchet" / "config"),
         "STORAGE_ROOT": str(storage / "objects"),
         "TMPDIR": str(storage / ".partial"),
         "WORK_DIR": str(work / "videoroll"),
@@ -109,6 +114,9 @@ def build_native_environment(source: Path) -> dict[str, str]:
         "FFMPEG_PATH": "/usr/bin/ffmpeg",
     }
     values.update(overrides)
+    for key in ("DATABASE_URL", "HATCHET_DATABASE_URL"):
+        url = values.get(key, "")
+        values[key] = url.replace("@host.docker.internal:", "@127.0.0.1:")
     # Compose examples used localhost:3000 for Hatchet, which is not the native
     # gateway port. Convert only the known template defaults; do not overwrite
     # an explicitly configured public HTTPS origin or its cookie domain.
@@ -118,6 +126,9 @@ def build_native_environment(source: Path) -> dict[str, str]:
             values["HATCHET_FRONTEND_URL"] = "http://127.0.0.1:3001/workflow-ui/"
         if values.get("HATCHET_COOKIE_DOMAIN", "") == "localhost":
             values["HATCHET_COOKIE_DOMAIN"] = "127.0.0.1"
+    if values.get("HATCHET_SERVER_URL", "").startswith("https://"):
+        if values.get("HATCHET_COOKIE_INSECURE", "").lower() in {"true", "1", "yes"}:
+            values["HATCHET_COOKIE_INSECURE"] = "false"
     # An older file may omit Hatchet browser fields entirely. Provide a valid
     # loopback-only baseline and make operators configure a public origin for
     # non-local access rather than falling back to mismatched cookie defaults.
@@ -163,7 +174,7 @@ def write_native_environment(source: Path, output: Path, *, force: bool) -> None
 def main() -> int:
     parser = argparse.ArgumentParser(description="Convert the existing VideoRoll dotenv file for native/systemd runtime")
     parser.add_argument("--source", type=Path, default=Path(".env"))
-    parser.add_argument("--output", type=Path, default=Path("/etc/videoroll/videoroll.env"))
+    parser.add_argument("--output", type=Path, default=Path("/opt/videoroll/config/videoroll.env"))
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
 

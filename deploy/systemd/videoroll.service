@@ -12,8 +12,7 @@ Type=exec
 User=videoroll
 Group=videoroll
 WorkingDirectory=/opt/videoroll/current
-EnvironmentFile=/etc/videoroll/videoroll.env
-Environment=HOME=/opt/videoroll/current/data/home
+EnvironmentFile=/opt/videoroll/config/videoroll.env
 Environment=PYTHONPATH=/opt/videoroll/current/src:/opt/videoroll/current/social-auto-upload
 RuntimeDirectory=videoroll
 RuntimeDirectoryMode=0700
@@ -30,7 +29,6 @@ NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=full
 ProtectHome=yes
-ReadWritePaths=/opt/videoroll/current/data
 LimitNOFILE=65536
 
 [Install]

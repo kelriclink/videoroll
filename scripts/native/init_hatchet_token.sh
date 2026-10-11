@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR=/opt/videoroll/current
-ENV_FILE="${VIDEOROLL_NATIVE_ENV:-/etc/videoroll/videoroll.env}"
+ENV_FILE="${VIDEOROLL_NATIVE_ENV:-/opt/videoroll/config/videoroll.env}"
 
 if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
   echo "Hatchet token initialization requires root to update the protected environment file" >&2

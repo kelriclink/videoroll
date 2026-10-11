@@ -7,9 +7,9 @@ Wants=network-online.target
 Type=simple
 User=videoroll
 Group=videoroll
-EnvironmentFile=/etc/videoroll/videoroll.env
-WorkingDirectory=/opt/videoroll/current/data/ffplayout
-ExecStart=/usr/local/bin/ffplayout --listen 127.0.0.1:8787 --db /opt/videoroll/current/data/ffplayout/db/ffplayout.db --log-to-console
+EnvironmentFile=/opt/videoroll/config/videoroll.env
+WorkingDirectory=/opt/videoroll
+ExecStart=/opt/videoroll/libexec/videoroll-run-ffplayout
 Restart=on-failure
 RestartSec=3
 UMask=0027
@@ -17,7 +17,6 @@ NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=full
 ProtectHome=yes
-ReadWritePaths=/opt/videoroll/current/data
 LimitNOFILE=65536
 
 [Install]

@@ -11,7 +11,7 @@ if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
   exit 1
 fi
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-NATIVE_ENV=/etc/videoroll/videoroll.env
+NATIVE_ENV=/opt/videoroll/config/videoroll.env
 old_stopped=0
 
 rollback_on_error() {
@@ -31,14 +31,14 @@ test -s "$NATIVE_ENV" || {
   exit 1
 }
 echo "[1/7] Verify the separately installed runtime"
-if [[ ! -x /usr/local/bin/ffplayout && "${VIDEOROLL_SKIP_FFPLAYOUT:-0}" != "1" ]]; then
+if [[ ! -x /opt/videoroll/bin/ffplayout && "${VIDEOROLL_SKIP_FFPLAYOUT:-0}" != "1" ]]; then
   echo "Install native ffplayout first or set VIDEOROLL_SKIP_FFPLAYOUT=1" >&2
   exit 1
 fi
 
 echo "[2/7] Validate native configuration"
 systemctl daemon-reload
-nginx -t -c /etc/videoroll/nginx.conf
+nginx -t -c /opt/videoroll/config/nginx.conf
 for service in videoroll-redis videoroll-hatchet videoroll-social@api videoroll-social@worker; do
   systemctl cat "$service.service" >/dev/null
 done
@@ -66,7 +66,7 @@ echo "[5/7] Start native Redis/Hatchet and mint worker token"
 bash "$ROOT_DIR/scripts/native/start_native_infra.sh"
 
 echo "[6/7] Start all native services"
-if [[ -x /usr/local/bin/ffplayout && "${VIDEOROLL_SKIP_FFPLAYOUT:-0}" != "1" ]]; then
+if [[ -x /opt/videoroll/bin/ffplayout && "${VIDEOROLL_SKIP_FFPLAYOUT:-0}" != "1" ]]; then
   systemctl start videoroll-ffplayout.service
 fi
 systemctl start videoroll.target
@@ -88,6 +88,6 @@ systemctl enable videoroll.target
 if systemctl is-active --quiet videoroll-ffplayout.service; then
   systemctl enable videoroll-ffplayout.service
 fi
-touch "$ROOT_DIR/data/native-cutover-complete"
+touch "${VIDEOROLL_DATA_ROOT:-/opt/videoroll/data}/native-cutover-complete"
 trap - ERR
 echo "VideoRoll native cutover completed. No Docker containers required at runtime."

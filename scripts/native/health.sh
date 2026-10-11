@@ -65,10 +65,10 @@ fi
 # An explicit opt-out is supported for installations without the binary.
 if systemctl is-active --quiet videoroll.service; then
   ffplayout_skip="${VIDEOROLL_SKIP_FFPLAYOUT:-}"
-  if [[ -z "$ffplayout_skip" && -r /etc/videoroll/videoroll.env ]]; then
-    ffplayout_skip="$(sed -n 's/^VIDEOROLL_SKIP_FFPLAYOUT=//p' /etc/videoroll/videoroll.env | tail -n 1 | tr -d '\"')"
+  if [[ -z "$ffplayout_skip" && -r /opt/videoroll/config/videoroll.env ]]; then
+    ffplayout_skip="$(sed -n 's/^VIDEOROLL_SKIP_FFPLAYOUT=//p' /opt/videoroll/config/videoroll.env | tail -n 1 | tr -d '\"')"
   fi
-  if [[ "$ffplayout_skip" != "1" && "$ffplayout_skip" != "true" && -x /usr/local/bin/ffplayout ]]; then
+  if [[ "$ffplayout_skip" != "1" && "$ffplayout_skip" != "true" && -x /opt/videoroll/bin/ffplayout ]]; then
     check_http ffplayout http://127.0.0.1:8787/api/setup
   fi
 elif systemctl is-active --quiet videoroll-ffplayout.service; then

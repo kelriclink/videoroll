@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-ENV_FILE="${VIDEOROLL_DOTENV:-/etc/videoroll/videoroll.env}"
+ENV_FILE="${VIDEOROLL_DOTENV:-/opt/videoroll/config/videoroll.env}"
 if [[ ! -f "$ENV_FILE" && -f "$ROOT_DIR/.env" ]]; then
   ENV_FILE="$ROOT_DIR/.env"
 fi
@@ -13,7 +13,7 @@ if [[ ! -f "$ENV_FILE" ]]; then
 fi
 
 export VIDEOROLL_PROJECT_ROOT="$ROOT_DIR"
-export VIDEOROLL_STORAGE_HOST_ROOT="${VIDEOROLL_STORAGE_HOST_ROOT:-$ROOT_DIR/data/storage}"
+export VIDEOROLL_STORAGE_HOST_ROOT="${VIDEOROLL_STORAGE_HOST_ROOT:-${VIDEOROLL_DATA_ROOT:-/opt/videoroll/data}/storage}"
 export VIDEOROLL_DOTENV="$(realpath "$ENV_FILE")"
 
 redis=(docker compose -p videoroll-native-redis --project-directory "$ROOT_DIR" --env-file "$ENV_FILE" -f "$ROOT_DIR/deploy/systemd/redis.compose.yml")

@@ -9,12 +9,12 @@ export PYTHONUNBUFFERED=1
 export PYTHONDONTWRITEBYTECODE=1
 export REDIS_URL="${REDIS_URL:-redis://127.0.0.1:6379/0}"
 export ORCHESTRATOR_URL="${ORCHESTRATOR_URL:-http://127.0.0.1:8000}"
-export SOCIAL_PUBLISH_WORK_DIR="${SOCIAL_PUBLISH_WORK_DIR:-/opt/videoroll/current/data/work/social-publisher}"
+export SOCIAL_PUBLISH_WORK_DIR="${SOCIAL_PUBLISH_WORK_DIR:-${VIDEOROLL_DATA_ROOT:-/opt/videoroll/data}/work/social-publisher}"
 export SAU_RUNTIME_DIR="${SAU_RUNTIME_DIR:-/opt/videoroll/current/social-auto-upload}"
 export SAU_EXECUTABLE="${SAU_EXECUTABLE:-$VENV/bin/sau}"
 export SAU_COOKIES_DIR="$RUNTIME_DIR/cookies"
-export PLAYWRIGHT_BROWSERS_PATH="${PLAYWRIGHT_BROWSERS_PATH:-/opt/videoroll/current/data/browsers}"
-export HOME="${HOME:-/opt/videoroll/current/data/home}"
+export PLAYWRIGHT_BROWSERS_PATH="${PLAYWRIGHT_BROWSERS_PATH:-${VIDEOROLL_DATA_ROOT:-/opt/videoroll/data}/browsers}"
+export HOME="${HOME:-${VIDEOROLL_DATA_ROOT:-/opt/videoroll/data}/home}"
 
 mkdir -p "$SAU_COOKIES_DIR"
 chmod 700 "$RUNTIME_DIR" "$SAU_COOKIES_DIR"
@@ -79,7 +79,7 @@ case "$role" in
     ;;
   scheduler)
     export DEPLOYMENT_ROLE=social-publisher-scheduler
-    exec "$VENV/bin/celery" -A videoroll.apps.social_publisher.worker:celery_app       beat -l INFO --schedule /opt/videoroll/current/data/state/social-celerybeat-schedule
+    exec "$VENV/bin/celery" -A videoroll.apps.social_publisher.worker:celery_app       beat -l INFO --schedule "${VIDEOROLL_DATA_ROOT:-/opt/videoroll/data}/state/social-celerybeat-schedule"
     ;;
   *)
     echo "unknown social role: $role" >&2

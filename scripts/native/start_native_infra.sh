@@ -5,7 +5,7 @@ if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
   exit 1
 fi
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-ENV_FILE="${VIDEOROLL_NATIVE_ENV:-/etc/videoroll/videoroll.env}"
+ENV_FILE="${VIDEOROLL_NATIVE_ENV:-/opt/videoroll/config/videoroll.env}"
 test -s "$ENV_FILE"
 
 systemctl start videoroll-redis.service

@@ -58,8 +58,9 @@ if [[ -n "$OUTPUT_DIR" ]]; then
   echo "Native ffplayout artifacts exported to $OUTPUT_DIR"
   exit 0
 fi
-install -m 0755 "$ARTIFACT_DIR/bin/ffplayout" /usr/local/bin/ffplayout
-install -d -m 0755 /usr/share/ffplayout
-install -m 0644 "$ARTIFACT_DIR/assets/"{dummy.vtt,logo.png} /usr/share/ffplayout/
+install -d -m 0755 /opt/videoroll/bin
+install -m 0755 "$ARTIFACT_DIR/bin/ffplayout" /opt/videoroll/bin/ffplayout
+install -d -m 0755 /opt/videoroll/share/ffplayout
+install -m 0644 "$ARTIFACT_DIR/assets/"{dummy.vtt,logo.png} /opt/videoroll/share/ffplayout/
 
-echo "Installed /usr/local/bin/ffplayout"
+echo "Installed /opt/videoroll/bin/ffplayout"

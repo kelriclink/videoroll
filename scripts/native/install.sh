@@ -29,27 +29,17 @@ if [[ "$ASR_RUNTIME" != "local" && "$ASR_RUNTIME" != "remote" ]]; then
 fi
 # An existing production data tree can be reused without moving any media.
 # /opt/videoroll/current is only a stable symlink to this checkout.
-DATA_ROOT="${VIDEOROLL_DATA_ROOT:-$ROOT_DIR/data}"
+DATA_ROOT="${VIDEOROLL_DATA_ROOT:-/opt/videoroll/data}"
 if [[ "$DATA_ROOT" != /* || "$DATA_ROOT" == / ]]; then
   echo "VIDEOROLL_DATA_ROOT must be an absolute directory path other than /" >&2
   exit 1
 fi
-# Never replace an existing data directory or redirect it silently.
-if [[ "$DATA_ROOT" != "$ROOT_DIR/data" ]]; then
-  if [[ -e "$ROOT_DIR/data" || -L "$ROOT_DIR/data" ]]; then
-    if [[ ! -L "$ROOT_DIR/data" || "$(readlink -f "$ROOT_DIR/data")" != "$(realpath -m "$DATA_ROOT")" ]]; then
-      echo "Repository data path must be a symlink to $DATA_ROOT; refusing to overwrite" >&2
-      exit 1
-    fi
-  else
-    ln -s "$DATA_ROOT" "$ROOT_DIR/data"
-  fi
-fi
-ENV_DIR=/etc/videoroll
+# Do not link persistent data into the Git checkout. Use configured root.
+ENV_DIR=/opt/videoroll/config
 
 env_value() {
   local key="$1"
-  local file="$ROOT_DIR/.env"
+  local file="${VIDEOROLL_SOURCE_ENV:-$ROOT_DIR/.env}"
   [[ -f "$file" ]] || return 0
   local value
   value="$(sed -n "s/^${key}=//p" "$file" | tail -n 1 | tr -d '\r')"
@@ -87,7 +77,7 @@ fi
 
 apt-get update
 apt-get install -y --no-install-recommends \
-  python3 python3-venv python3-pip ffmpeg curl nginx redis-server \
+  python3 python3-venv python3-pip ffmpeg curl \
   xvfb fluxbox novnc websockify x11vnc xauth \
   fonts-noto-cjk ca-certificates pciutils ocl-icd-libopencl1
 
@@ -175,7 +165,7 @@ if ! runuser -u videoroll -- test -x "$DATA_ROOT" \
   exit 1
 fi
 
-install -d -m 0755 "$INSTALL_ROOT" "$VENV_ROOT"
+install -d -m 0755 "$INSTALL_ROOT" "$VENV_ROOT" "$INSTALL_ROOT/bin" "$INSTALL_ROOT/libexec" "$INSTALL_ROOT/share"
 # DrvFs/NTFS venvs exhibit extremely slow pip installs on WSL; fail early.
 if [[ -x /usr/bin/findmnt && "${VIDEOROLL_NATIVE_ALLOW_NONPOSIX_VENV:-0}" != "1" ]]; then
   venv_filesystem="$(findmnt -n -T "$VENV_ROOT" -o FSTYPE | head -n 1)"
@@ -191,8 +181,8 @@ if [[ -e "$INSTALL_ROOT/current" && ! -L "$INSTALL_ROOT/current" ]]; then
   exit 1
 fi
 ln -sfn "$ROOT_DIR" "$INSTALL_ROOT/current"
-if [[ ! -e "$ROOT_DIR/web" ]]; then
-  ln -s "$DATA_ROOT/web" "$ROOT_DIR/web"
+if [[ ! -e "$ROOT_DIR/web" && ! -L "$ROOT_DIR/web" ]]; then
+  ln -s "$INSTALL_ROOT/web" "$ROOT_DIR/web"
 fi
 
 # Service users need directory traversal for non-secret Redis/nginx config.
@@ -200,13 +190,21 @@ fi
 install -d -m 0711 "$ENV_DIR"
 chmod 0711 "$ENV_DIR"
 if [[ ! -f "$ENV_DIR/videoroll.env" ]]; then
-  if [[ -f "$ROOT_DIR/.env" ]]; then
+  if [[ -f "${VIDEOROLL_SOURCE_ENV:-$ROOT_DIR/.env}" ]]; then
     VIDEOROLL_DATA_ROOT="$DATA_ROOT" python3 "$ROOT_DIR/scripts/native/migrate_env.py" \
-      --source "$ROOT_DIR/.env" --output "$ENV_DIR/videoroll.env"
+      --source "${VIDEOROLL_SOURCE_ENV:-$ROOT_DIR/.env}" --output "$ENV_DIR/videoroll.env"
   else
-    install -m 0600 "$ROOT_DIR/deploy/systemd/videoroll.env.example" "$ENV_DIR/videoroll.env"
+    VIDEOROLL_DATA_ROOT="$DATA_ROOT" python3 "$ROOT_DIR/scripts/native/migrate_env.py" \
+      --source "$ROOT_DIR/deploy/systemd/videoroll.env.example" --output "$ENV_DIR/videoroll.env"
     echo "No .env found; created template $ENV_DIR/videoroll.env." >&2
   fi
+fi
+
+# Refuse a different persistent data root when config already exists.
+existing_root="$(sed -n 's/^VIDEOROLL_DATA_ROOT=//p' "$ENV_DIR/videoroll.env" | tail -n 1 | tr -d '"')"
+if [[ -n "$existing_root" && "$existing_root" != "$DATA_ROOT" ]]; then
+  echo "Configured data root differs from requested VIDEOROLL_DATA_ROOT" >&2
+  exit 1
 fi
 
 # Use the same Python ABI for all five environments, including Debian 13.
@@ -273,14 +271,16 @@ if [[ "${VIDEOROLL_SKIP_SOCIAL_BROWSER_INSTALL:-0}" != "1" ]]; then
   chown -R videoroll:videoroll "$DATA_ROOT/browsers"
 fi
 
-install -d -m 0755 /usr/local/libexec
+bash "$ROOT_DIR/scripts/native/install_system_binaries.sh"
+install -d -m 0755 "$INSTALL_ROOT/libexec"
 # A stable executable launcher also works with source archives lacking exec bits.
-rm -f /usr/local/bin/videorollctl
-install -m 0755 "$ROOT_DIR/scripts/native/videorollctl" /usr/local/bin/videorollctl
-install -m 0755 "$ROOT_DIR/scripts/native/run-role.sh" /usr/local/libexec/videoroll-run-role
-install -m 0755 "$ROOT_DIR/scripts/native/run-hatchet.sh" /usr/local/libexec/videoroll-run-hatchet
-install -m 0755 "$ROOT_DIR/scripts/native/init_hatchet_token.sh" /usr/local/libexec/videoroll-init-hatchet-token
-install -m 0755 "$ROOT_DIR/scripts/native/run-social-role.sh" /usr/local/libexec/videoroll-run-social-role
+rm -f /opt/videoroll/bin/videorollctl
+install -m 0755 "$ROOT_DIR/scripts/native/videorollctl" /opt/videoroll/bin/videorollctl
+install -m 0755 "$ROOT_DIR/scripts/native/run-role.sh" /opt/videoroll/libexec/videoroll-run-role
+install -m 0755 "$ROOT_DIR/scripts/native/run-hatchet.sh" /opt/videoroll/libexec/videoroll-run-hatchet
+install -m 0755 "$ROOT_DIR/scripts/native/init_hatchet_token.sh" /opt/videoroll/libexec/videoroll-init-hatchet-token
+install -m 0755 "$ROOT_DIR/scripts/native/run-social-role.sh" /opt/videoroll/libexec/videoroll-run-social-role
+install -m 0755 "$ROOT_DIR/scripts/native/run-ffplayout.sh" /opt/videoroll/libexec/videoroll-run-ffplayout
 install -m 0644 "$ROOT_DIR/deploy/systemd/videoroll@.service" /etc/systemd/system/videoroll@.service
 install -m 0644 "$ROOT_DIR/deploy/systemd/videoroll.target" /etc/systemd/system/videoroll.target
 install -m 0644 "$ROOT_DIR/deploy/systemd/videoroll-web.service" /etc/systemd/system/videoroll-web.service
@@ -289,8 +289,21 @@ install -m 0644 "$ROOT_DIR/deploy/systemd/videoroll-redis.service" /etc/systemd/
 install -m 0644 "$ROOT_DIR/deploy/systemd/videoroll-hatchet.service" /etc/systemd/system/videoroll-hatchet.service
 install -m 0644 "$ROOT_DIR/deploy/systemd/videoroll-hatchet-token.service" /etc/systemd/system/videoroll-hatchet-token.service
 install -m 0644 "$ROOT_DIR/deploy/systemd/videoroll-social@.service" /etc/systemd/system/videoroll-social@.service
-install -m 0644 "$ROOT_DIR/deploy/systemd/redis.conf" "$ENV_DIR/redis.conf"
-install -m 0644 "$ROOT_DIR/deploy/systemd/nginx-videoroll.conf" "$ENV_DIR/nginx.conf"
+# Nginx and Redis do not expand EnvironmentFile path variables.
+VIDEOROLL_DATA_ROOT="$DATA_ROOT" python3 - "$ROOT_DIR" "$ENV_DIR" <<'PYCONFIG'
+import os, pathlib, sys
+source, destination = map(pathlib.Path, sys.argv[1:3])
+for template, filename in (
+    ("deploy/systemd/redis.conf", "redis.conf"),
+    ("deploy/systemd/nginx-videoroll.conf", "nginx.conf"),
+):
+    content = (source / template).read_text()
+    if "@VIDEOROLL_DATA_ROOT@" not in content:
+        raise SystemExit("Missing data-root placeholder: " + template)
+    output = destination / filename
+    output.write_text(content.replace("@VIDEOROLL_DATA_ROOT@", os.environ["VIDEOROLL_DATA_ROOT"]))
+    output.chmod(0o644)
+PYCONFIG
 # This catches the real systemd Redis permission failure missed by mock tests.
 for config_file in redis.conf nginx.conf; do
   if ! runuser -u videoroll -- test -r "$ENV_DIR/$config_file"; then

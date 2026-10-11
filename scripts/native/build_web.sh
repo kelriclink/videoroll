@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 WEB_DIR="$ROOT_DIR/src/web"
-DEST="${VIDEOROLL_WEB_ROOT:-$ROOT_DIR/data/web}"
+DEST="${VIDEOROLL_WEB_ROOT:-/opt/videoroll/web}"
 ARTIFACT_DIR=""
 case "${1:-}" in
   --artifact-dir) ARTIFACT_DIR="${2:?artifact directory required}" ;;

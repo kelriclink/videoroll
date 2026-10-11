@@ -13,7 +13,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 NATIVE = ROOT / "scripts" / "native"
 INSTALL_ROOT = Path("/opt/videoroll")
-ENV_FILE = Path("/etc/videoroll/videoroll.env")
+ENV_FILE = Path("/opt/videoroll/config/videoroll.env")
 CORE_PYTHON = INSTALL_ROOT / "venvs" / "core" / "bin" / "python"
 UNIT_TARGET = "videoroll.target"
 LEGACY_UNIT = "videoroll.service"
@@ -86,13 +86,13 @@ def check_not_legacy() -> None:
 
 def filesystem_layout() -> dict[str, Path]:
     # This intentionally does not migrate any files.
-    old_data = ROOT / "data"
+    old_data = Path(os.environ.get("VIDEOROLL_DATA_ROOT", "/opt/videoroll/data"))
     return {
         "git_checkout": ROOT,
         "legacy_project": Path("/DATA/videoroll"),
         "app_entrypoint": INSTALL_ROOT / "current",
         "python_environments": INSTALL_ROOT / "venvs",
-        "runtime_state": ROOT / "data",
+        "runtime_state": Path(os.environ.get("VIDEOROLL_DATA_ROOT", "/opt/videoroll/data")),
         "project_data": old_data,
         "video_storage": old_data / "storage",
         "project_work": old_data / "work",
@@ -158,7 +158,7 @@ def check_configured_data_paths() -> None:
         if value.startswith(("/var/lib/videoroll/", "/var/lib/ffplayout/", "/storage/", "/work/")):
             raise RuntimeError(
                 f"{key} uses legacy location {value}. "
-                "Back up/migrate old state and update /etc/videoroll/videoroll.env "
+                "Back up/migrate old state and update /opt/videoroll/config/videoroll.env "
                 "before starting native services; existing data will not be moved automatically."
             )
 
@@ -171,19 +171,19 @@ def doctor(*, check_database: bool) -> None:
         ENV_FILE,
         Path("/etc/systemd/system/videoroll.target"),
         Path("/etc/systemd/system/videoroll-hatchet-token.service"),
-        Path("/etc/videoroll/redis.conf"),
-        Path("/usr/local/libexec/videoroll-init-hatchet-token"),
-        Path("/usr/local/bin/hatchet-lite"),
-        Path("/usr/local/bin/hatchet-admin"),
-        Path("/usr/local/bin/hatchet-migrate"),
-        Path("/usr/local/bin/ffplayout"),
+        Path("/opt/videoroll/config/redis.conf"),
+        Path("/opt/videoroll/libexec/videoroll-init-hatchet-token"),
+        Path("/opt/videoroll/bin/hatchet-lite"),
+        Path("/opt/videoroll/bin/hatchet-admin"),
+        Path("/opt/videoroll/bin/hatchet-migrate"),
+        Path("/opt/videoroll/bin/ffplayout"),
         INSTALL_ROOT / "current" / "web" / "index.html",
         CORE_PYTHON,
         *(INSTALL_ROOT / "venvs" / name / "bin/python" for name in
           ("subtitle", "workflow", "subtitle-workflow", "social")),
     ):
         print(f"{'OK' if path.exists() else 'MISSING':7} {path}")
-        if not path.exists() and path != Path("/usr/local/bin/ffplayout"):
+        if not path.exists() and path != Path("/opt/videoroll/bin/ffplayout"):
             missing.append(str(path))
     for executable in ("ffmpeg", "nginx", "redis-server", "redis-cli", "Xvfb", "x11vnc", "websockify", "fluxbox"):
         if shutil.which(executable) is None:
@@ -202,10 +202,10 @@ def start() -> None:
     require_root()
     check_not_legacy()
     if not ENV_FILE.exists():
-        raise RuntimeError("Configure /etc/videoroll/videoroll.env first")
+        raise RuntimeError("Configure /opt/videoroll/config/videoroll.env first")
     doctor(check_database=True)
     run("systemctl", "start", UNIT_TARGET)
-    if Path("/usr/local/bin/ffplayout").exists():
+    if Path("/opt/videoroll/bin/ffplayout").exists():
         run("systemctl", "start", "videoroll-ffplayout.service")
     from releases import wait_healthy
 
@@ -236,7 +236,7 @@ def enable() -> None:
     check_not_legacy()
     doctor(check_database=True)
     run("systemctl", "enable", UNIT_TARGET)
-    if Path("/usr/local/bin/ffplayout").exists():
+    if Path("/opt/videoroll/bin/ffplayout").exists():
         run("systemctl", "enable", "videoroll-ffplayout.service")
     print("VideoRoll will start at boot. Existing processes were not restarted.")
 

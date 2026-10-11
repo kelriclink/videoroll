@@ -65,7 +65,7 @@ def main() -> int:
         required=True,
         help="URL of an empty/rebuildable PostgreSQL database used only by Hatchet",
     )
-    parser.add_argument("--output", type=Path, default=Path("/etc/videoroll/videoroll.env"))
+    parser.add_argument("--output", type=Path, default=Path("/opt/videoroll/config/videoroll.env"))
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
 

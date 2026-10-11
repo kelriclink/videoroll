@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-HATCHET_HOME="${VIDEOROLL_HATCHET_HOME:-/opt/videoroll/current/data/hatchet}"
+HATCHET_HOME="${VIDEOROLL_HATCHET_HOME:-${VIDEOROLL_DATA_ROOT:-/opt/videoroll/data}/hatchet}"
 CONFIG_DIR="$HATCHET_HOME/config"
 
 : "${HATCHET_DATABASE_URL:?HATCHET_DATABASE_URL must be set}"
@@ -14,7 +14,7 @@ export ADMIN_NAME="${HATCHET_ADMIN_NAME:-VideoRoll Admin}"
 export DEFAULT_TENANT_NAME="${HATCHET_TENANT_NAME:-VideoRoll}"
 export DEFAULT_TENANT_SLUG="${HATCHET_TENANT_SLUG:-videoroll}"
 
-export LITE_STATIC_ASSET_DIR="${LITE_STATIC_ASSET_DIR:-/usr/share/videoroll/hatchet/static-assets}"
+export LITE_STATIC_ASSET_DIR="${LITE_STATIC_ASSET_DIR:-/opt/videoroll/share/hatchet/static-assets}"
 export LITE_FRONTEND_BASE_PATH="${LITE_FRONTEND_BASE_PATH:-/workflow-ui}"
 export LITE_FRONTEND_PORT="${LITE_FRONTEND_PORT:-8081}"
 export LITE_RUNTIME_PORT="${LITE_RUNTIME_PORT:-8888}"
@@ -37,6 +37,6 @@ export SERVER_LOGGER_LEVEL="${HATCHET_LOG_LEVEL:-warn}"
 mkdir -p "$CONFIG_DIR"
 cd "$HATCHET_HOME"
 
-/usr/local/bin/hatchet-migrate
-/usr/local/bin/hatchet-admin quickstart --skip certs --generated-config-dir "$CONFIG_DIR" --overwrite=false
-exec /usr/local/bin/hatchet-lite --config "$CONFIG_DIR"
+/opt/videoroll/bin/hatchet-migrate
+/opt/videoroll/bin/hatchet-admin quickstart --skip certs --generated-config-dir "$CONFIG_DIR" --overwrite=false
+exec /opt/videoroll/bin/hatchet-lite --config "$CONFIG_DIR"

@@ -19,6 +19,7 @@ def test_layout_is_read_only_and_distinguishes_two_work_folders(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
 ) -> None:
     monkeypatch.setattr(ctl, "ROOT", Path("/DATA/videoroll"))
+    monkeypatch.setenv("VIDEOROLL_DATA_ROOT", "/DATA/videoroll/data")
     ctl.print_layout()
     output = capsys.readouterr().out
     assert "/DATA/videoroll/data/work" in output
@@ -59,7 +60,7 @@ def test_project_data_env_is_accepted(
 
 def test_installer_does_not_reown_or_delete_existing_data_tree() -> None:
     installer = (ROOT / "scripts/native/install.sh").read_text(encoding="utf-8")
-    assert 'DATA_ROOT="${VIDEOROLL_DATA_ROOT:-$ROOT_DIR/data}"' in installer
+    assert 'DATA_ROOT="${VIDEOROLL_DATA_ROOT:-/opt/videoroll/data}"' in installer
     assert 'if [[ ! -d "$path" ]]; then' in installer
     assert 'install -d -o videoroll -g videoroll -m 0750 "$path"' in installer
     assert 'runuser -u videoroll -- test -w "$work_check"' in installer

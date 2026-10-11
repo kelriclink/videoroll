@@ -133,14 +133,14 @@ def test_deploy_and_rollback_preserve_media_and_freeze_old_checkout(deployment):
     previous = (ctl.INSTALL_ROOT / "previous").resolve()
     assert current.parent == previous.parent == ctl.INSTALL_ROOT / "releases"
     assert (current / "web/index.html").read_text() == "new frontend"
-    assert (current / "data").resolve() == old / "data"
+    assert not (current / "data").exists()  # Media tree is external; no symlink needed
     assert (current / "social-auto-upload").resolve() == old / "social-auto-upload"
     (old / "src/videoroll/__init__.py").write_text("# subsequent development")
     releases.rollback(ctl, apply=True)
     assert (ctl.INSTALL_ROOT / "current").resolve() == previous
     assert (previous / "src/videoroll/__init__.py").read_text() == "# initial\n"
     assert (previous / "web/index.html").read_text() == "old frontend"
-    assert (previous / "data/video.mp4").read_text() == "media must survive"
+    assert (old / "data/video.mp4").read_text() == "media must survive"
     for command in commands:
         assert "redis" not in " ".join(command)
         assert "migrate" not in " ".join(command)

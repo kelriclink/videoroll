@@ -4,15 +4,15 @@ After=network-online.target
 Wants=network-online.target
 Before=videoroll.target
 PartOf=videoroll.target
-ConditionPathExists=/usr/local/bin/hatchet-lite
-ConditionPathExists=/usr/share/videoroll/hatchet/static-assets/index.html
+ConditionPathExists=/opt/videoroll/bin/hatchet-lite
+ConditionPathExists=/opt/videoroll/share/hatchet/static-assets/index.html
 
 [Service]
 Type=simple
 User=videoroll
 Group=videoroll
-EnvironmentFile=/etc/videoroll/videoroll.env
-ExecStart=/usr/local/libexec/videoroll-run-hatchet
+EnvironmentFile=/opt/videoroll/config/videoroll.env
+ExecStart=/opt/videoroll/libexec/videoroll-run-hatchet
 Restart=on-failure
 RestartSec=3
 TimeoutStartSec=180
@@ -23,7 +23,6 @@ NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=full
 ProtectHome=yes
-ReadWritePaths=/opt/videoroll/current/data/hatchet
 LimitNOFILE=65536
 
 [Install]

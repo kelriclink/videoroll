@@ -8,10 +8,10 @@ if [[ "$scope" != "core" && "$scope" != "full" ]]; then
   exit 64
 fi
 if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
-  echo "run with sudo: root is needed only to read /etc/videoroll/videoroll.env" >&2
+  echo "run with sudo: root is needed only to read /opt/videoroll/config/videoroll.env" >&2
   exit 1
 fi
-env_file="${VIDEOROLL_NATIVE_ENV:-/etc/videoroll/videoroll.env}"
+env_file="${VIDEOROLL_NATIVE_ENV:-/opt/videoroll/config/videoroll.env}"
 python_bin="${VIDEOROLL_CORE_PYTHON:-/opt/videoroll/venvs/core/bin/python}"
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 base_url="${VIDEOROLL_SMOKE_BASE_URL:-http://127.0.0.1:3001}"
@@ -26,8 +26,8 @@ echo "[1] PostgreSQL connectivity (business + Hatchet DB)"
 
 echo "[2] Real service-user filesystem permissions"
 for config in redis.conf nginx.conf; do
-  runuser -u videoroll -- test -r "/etc/videoroll/$config" || {
-    echo "Cannot read /etc/videoroll/$config as videoroll" >&2
+  runuser -u videoroll -- test -r "/opt/videoroll/config/$config" || {
+    echo "Cannot read /opt/videoroll/config/$config as videoroll" >&2
     exit 1
   }
 done

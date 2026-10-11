@@ -19,6 +19,6 @@ if [[ "${VIDEOROLL_STOP_LEGACY_COMPANIONS:-0}" == "1" ]]; then
   bash "$ROOT_DIR/scripts/native/companions.sh" down || true
 fi
 "$ROOT_DIR/scripts/prod_compose.sh" up -d --no-build --remove-orphans
-rm -f "$ROOT_DIR/data/native-cutover-complete"
+rm -f "${VIDEOROLL_DATA_ROOT:-/opt/videoroll/data}/native-cutover-complete"
 
 echo "Compose stack restored. Database migrations are not automatically downgraded."

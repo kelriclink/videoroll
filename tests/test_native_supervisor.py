@@ -44,7 +44,7 @@ def test_ffplayout_requires_installed_binary(
     real_path = supervisor_module.Path
 
     def checked_path(path: str):
-        if path == "/usr/local/bin/ffplayout":
+        if path == "/opt/videoroll/bin/ffplayout":
             return real_path(sys.executable)
         return real_path(path)
 

@@ -158,7 +158,9 @@ def test_native_redis_is_private_and_rebuildable() -> None:
     unit = (ROOT / "deploy/systemd/videoroll-redis.service").read_text(encoding="utf-8")
     assert "bind 127.0.0.1" in config
     assert "appendonly yes" in config
-    assert "ReadWritePaths=/opt/videoroll/current/data/redis-native" in unit
+    assert "dir @VIDEOROLL_DATA_ROOT@/redis-native" in config
+    assert "ExecStart=/opt/videoroll/bin/redis-server" in unit
+    assert "LD_LIBRARY_PATH=/opt/videoroll/lib" in unit
 
 
 def test_native_hatchet_uses_generated_source_build() -> None:
