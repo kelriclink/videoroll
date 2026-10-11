@@ -37,7 +37,14 @@ done
 install -d -m 0755 "$ROOT/bin" "$ROOT/lib" "$ROOT/share/nginx"
 install -m 0755 "$nginx_bin" "$ROOT/bin/nginx"
 install -m 0755 "$redis_bin" "$ROOT/bin/redis-server"
-install -m 0755 "$redis_cli" "$ROOT/bin/redis-cli"
+install -m 0755 "$redis_cli" "$ROOT/bin/redis-cli-real"
+# CLI also links liblzf. Wrap it so operators need no global linker changes.
+cat > "$ROOT/bin/redis-cli" <<'SH'
+#!/usr/bin/env bash
+export LD_LIBRARY_PATH="/opt/videoroll/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+exec /opt/videoroll/bin/redis-cli-real "$@"
+SH
+chmod 0755 "$ROOT/bin/redis-cli"
 install -m 0644 "$mime" "$ROOT/share/nginx/mime.types"
 install -m 0644 "$lzf" "$ROOT/lib/liblzf.so.1.5"
 ln -sfn liblzf.so.1.5 "$ROOT/lib/liblzf.so.1"

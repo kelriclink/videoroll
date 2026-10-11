@@ -149,6 +149,8 @@ for data_dir in \
   "$DATA_ROOT/work" "$DATA_ROOT/work/videoroll" "$DATA_ROOT/work/render-worker" \
   "$DATA_ROOT/work/social-publisher" "$DATA_ROOT/nginx" \
   "$DATA_ROOT/nginx/client_temp" "$DATA_ROOT/nginx/proxy_temp" \
+  "$DATA_ROOT/nginx/fastcgi_temp" "$DATA_ROOT/nginx/uwsgi_temp" \
+  "$DATA_ROOT/nginx/scgi_temp" \
   "$DATA_ROOT/models" "$DATA_ROOT/models/whisper" "$DATA_ROOT/models/embeddings" \
   "$DATA_ROOT/dictionaries" "$DATA_ROOT/redis-native" "$DATA_ROOT/hatchet" \
   "$DATA_ROOT/browsers" "$DATA_ROOT/web" \

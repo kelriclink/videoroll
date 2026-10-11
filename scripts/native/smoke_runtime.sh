@@ -37,12 +37,12 @@ if runuser -u videoroll -- test -r "$env_file"; then
 fi
 
 echo "[3] Redis real write/read/delete with an expiring, random probe key"
-redis-cli -h 127.0.0.1 -p 6379 ping | grep -qx PONG
+/opt/videoroll/bin/redis-cli -h 127.0.0.1 -p 6379 ping | grep -qx PONG
 probe="videoroll:native-smoke:$("$python_bin" -c 'import secrets; print(secrets.token_hex(12))')"
-trap 'redis-cli -h 127.0.0.1 -p 6379 del "$probe" >/dev/null 2>&1 || true' EXIT
-redis-cli -h 127.0.0.1 -p 6379 set "$probe" native-smoke NX EX 30 | grep -qx OK
-redis-cli -h 127.0.0.1 -p 6379 get "$probe" | grep -qx native-smoke
-redis-cli -h 127.0.0.1 -p 6379 del "$probe" | grep -qx 1
+trap '/opt/videoroll/bin/redis-cli -h 127.0.0.1 -p 6379 del "$probe" >/dev/null 2>&1 || true' EXIT
+/opt/videoroll/bin/redis-cli -h 127.0.0.1 -p 6379 set "$probe" native-smoke NX EX 30 | grep -qx OK
+/opt/videoroll/bin/redis-cli -h 127.0.0.1 -p 6379 get "$probe" | grep -qx native-smoke
+/opt/videoroll/bin/redis-cli -h 127.0.0.1 -p 6379 del "$probe" | grep -qx 1
 trap - EXIT
 
 echo "[4] Nginx and Orchestrator actual HTTP response through the gateway"

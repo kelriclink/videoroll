@@ -157,6 +157,9 @@ def test_native_redis_is_private_and_rebuildable() -> None:
     config = (ROOT / "deploy/systemd/redis.conf").read_text(encoding="utf-8")
     unit = (ROOT / "deploy/systemd/videoroll-redis.service").read_text(encoding="utf-8")
     assert "bind 127.0.0.1" in config
+    native_web = (ROOT / "deploy/systemd/nginx-videoroll.conf").read_text(encoding="utf-8")
+    for temp_type in ("fastcgi", "uwsgi", "scgi"):
+        assert f"{temp_type}_temp_path @VIDEOROLL_DATA_ROOT@/nginx/{temp_type}_temp;" in native_web
     assert "appendonly yes" in config
     assert "dir @VIDEOROLL_DATA_ROOT@/redis-native" in config
     assert "ExecStart=/opt/videoroll/bin/redis-server" in unit
