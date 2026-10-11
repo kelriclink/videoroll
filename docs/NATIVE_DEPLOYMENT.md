@@ -259,3 +259,5 @@ sudo env VIDEOROLL_SOURCE_ENV=/DATA/videoroll/.env \
 迁移后的 `VIDEOROLL_DATA_ROOT=/DATA/videoroll/data` 会供所有程序使用；`data/redis-native` 与旧 Docker AOF 隔离。`nginx.conf` 的 PID 和临时路径、Redis 的 dir 由同一值生成。源码目录 `src/data` 不再必须存在，也不需要成为旧数据的软链接。
 
 `/opt/videoroll/config/videoroll.env` 仍含数据库凭据，应限制为 root 读取；服务由 systemd 在降权前加载变量。不要把该文件上传到 GitHub。
+
+首次采用远程 ASR / 远程渲染时不强制安装 `fonts-noto-cjk`（软件包约 57 MB）；需要本机字幕渲染时可设置 `VIDEOROLL_INSTALL_CJK_FONTS=1`，或单独安装所需字体。

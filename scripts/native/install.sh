@@ -76,10 +76,17 @@ if [[ ! -e /usr/sbin/policy-rc.d ]]; then
 fi
 
 apt-get update
-apt-get install -y --no-install-recommends \
-  python3 python3-venv python3-pip ffmpeg curl \
-  xvfb fluxbox novnc websockify x11vnc xauth \
-  fonts-noto-cjk ca-certificates pciutils ocl-icd-libopencl1
+# Large CJK fonts are only needed for server-local rendering; keep the remote
+# ASR + distributed-render control plane small on a fresh Debian machine.
+system_packages=(
+  python3 python3-venv python3-pip ffmpeg curl
+  xvfb fluxbox novnc websockify x11vnc xauth
+  ca-certificates pciutils ocl-icd-libopencl1
+)
+if [[ "${VIDEOROLL_INSTALL_CJK_FONTS:-0}" == "1" ]]; then
+  system_packages+=(fonts-noto-cjk)
+fi
+apt-get install -y --no-install-recommends "${system_packages[@]}"
 
 cleanup_policy
 policy_created=0
