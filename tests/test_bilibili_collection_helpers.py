@@ -147,3 +147,77 @@ def test_author_season_cover_uses_existing_bilibili_cover_without_channel_fetch(
     )
     assert result == cover
     assert metadata == {"source": "video_cover"}
+
+def test_create_season_omits_empty_optional_fields() -> None:
+    import httpx
+    from unittest.mock import MagicMock
+    from videoroll.apps.bilibili_publisher.bilibili_web_client import BilibiliWebClient
+    client = BilibiliWebClient.__new__(BilibiliWebClient)
+    client._bili = MagicMock()
+    client._bili.post.return_value = httpx.Response(
+        200, json={"code": 0, "message": "OK", "data": 9307439}
+    )
+    created = client.create_season(
+        title=" NASA Goddard ", cover="https://archive.biliimg.com/a.jpg",
+        csrf="dummy", desc="", season_price=0,
+    )
+    assert created == 9307439
+    assert client._bili.post.call_args.kwargs["data"] == {
+        "title": "NASA Goddard",
+        "cover": "https://archive.biliimg.com/a.jpg",
+        "csrf": "dummy",
+    }
+
+
+def test_create_season_keeps_explicit_nonempty_options() -> None:
+    import httpx
+    from unittest.mock import MagicMock
+    from videoroll.apps.bilibili_publisher.bilibili_web_client import BilibiliWebClient
+    client = BilibiliWebClient.__new__(BilibiliWebClient)
+    client._bili = MagicMock()
+    client._bili.post.return_value = httpx.Response(200, json={"code": 0, "data": 88})
+    client.create_season(
+        title="Example", cover="https://archive.biliimg.com/a.jpg",
+        csrf="dummy", desc=" Description ", season_price=7,
+    )
+    assert client._bili.post.call_args.kwargs["data"] == {
+        "title": "Example", "cover": "https://archive.biliimg.com/a.jpg",
+        "csrf": "dummy", "desc": "Description", "season_price": 7,
+    }
+
+
+def test_existing_season_direct_object_response_is_idempotent() -> None:
+    import uuid
+    from unittest.mock import MagicMock
+    from videoroll.apps.bilibili_publisher.worker import _attach_youtube_uploader_collection
+    client = MagicMock()
+    client.get_archive_season.return_value = {
+        "id": 9307439, "title": "NASA Goddard", "state": 0
+    }
+    result = _attach_youtube_uploader_collection(
+        client=client, info={"uploader": "NASA Goddard"},
+        task_id=uuid.uuid4(), meta=MagicMock(), uploaded_cid=42,
+        aid=117426268146290, csrf="dummy", cover_url="",
+    )
+    assert result["ok"] is True and result["already_assigned"] is True
+    assert result["season_id"] == 9307439
+    client.add_to_season.assert_not_called()
+    client.ensure_season.assert_not_called()
+
+
+def test_existing_different_direct_season_not_overwritten() -> None:
+    import uuid
+    from unittest.mock import MagicMock
+    from videoroll.apps.bilibili_publisher.worker import _attach_youtube_uploader_collection
+    client = MagicMock()
+    client.get_archive_season.return_value = {
+        "id": 99, "title": "Manually Picked Collection", "state": 0
+    }
+    result = _attach_youtube_uploader_collection(
+        client=client, info={"uploader": "NASA Goddard"},
+        task_id=uuid.uuid4(), meta=MagicMock(), uploaded_cid=42,
+        aid=117426268146290, csrf="dummy", cover_url="",
+    )
+    assert result["skipped"] is True
+    assert result["reason"] == "different_collection_already_assigned"
+    client.add_to_season.assert_not_called()

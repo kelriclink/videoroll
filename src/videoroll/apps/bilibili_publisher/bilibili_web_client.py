@@ -716,15 +716,18 @@ class BilibiliWebClient:
         _require(bool(title), "season title is empty")
         _require(bool(cover), "season cover is empty")
 
+        # Bilibili currently accepts the minimal documented form for new
+        # seasons. Sending empty optional fields can yield business code -400.
+        # Preserve explicitly supplied non-empty descriptions and nonzero price.
+        form: dict[str, str | int] = {"title": title, "cover": cover, "csrf": csrf}
+        if (description := str(desc or "").strip()):
+            form["desc"] = description
+        if int(season_price):
+            form["season_price"] = int(season_price)
+
         resp = self._bili.post(
             "https://member.bilibili.com/x2/creative/web/season/add",
-            data={
-                "title": title,
-                "desc": str(desc or "").strip(),
-                "cover": cover,
-                "season_price": int(season_price),
-                "csrf": csrf,
-            },
+            data=form,
         )
         data = _json(resp)
         _bili_code_ok(data)

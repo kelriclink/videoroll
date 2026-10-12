@@ -231,10 +231,11 @@ def _attach_youtube_uploader_collection(
         # original attempt succeeded but VideoRoll failed to record its result.
         assigned = client.get_archive_season(aid=aid)
         if assigned is not None:
-            # /season/aid wraps the season in data.season (not data.id).
-            # Do not silently claim that a manually assigned *different*
-            # collection is the YouTube author's intended collection.
-            assigned_season = _as_dict(assigned.get("season"))
+            # Actual /season/aid responses vary: data can be the season
+            # object itself or {"season": {...}}. Support both; otherwise
+            # retries can add the same archive twice.
+            # Do not override a different, manually assigned collection.
+            assigned_season = _as_dict(assigned.get("season")) or assigned
             if assigned_season.get("id"):
                 assigned_title = _normalize_collection_title(assigned_season.get("title"))
                 if assigned_title == title:
