@@ -49,3 +49,17 @@ def test_pick_thumbnail_url_prefers_largest_channel_banner() -> None:
         ]
     }
     assert pick_thumbnail_url(info) == "https://img.example/banner-large.jpg"
+
+def test_critical_publish_commit_precedes_optional_youtube_collection() -> None:
+    """Prevent an external collection lookup from delaying durable BVID storage."""
+    import inspect
+    from videoroll.apps.bilibili_publisher.worker import _process_job_impl
+
+    source = inspect.getsource(_process_job_impl)
+    assert "optional YouTube channel collection attempted after durable publication" in source
+    first_published = source.index("job.state = PublishState.published")
+    durable_commit = source.index("db.commit()", first_published)
+    assert source.index("db.rollback()", source.index('add_resp, meta, desc_retry =')) < first_published
+    collection_attempt = source.index("updated_collection = _attach_youtube_uploader_collection(")
+    assert first_published < durable_commit < collection_attempt
+    assert "noncritical post-publish collection failed; Bilibili publication remains committed" in source

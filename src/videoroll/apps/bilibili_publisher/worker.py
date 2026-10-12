@@ -877,27 +877,25 @@ def _process_job_impl(self, job_id: str) -> dict[str, Any]:
             except Exception:
                 aid_int = 0
             if task.source_type.value == "youtube":
-                if aid_int > 0:
-                    collection_result = _attach_youtube_uploader_collection(
-                        client=client,
-                        task=task,
-                        meta=meta,
-                        uploaded_cid=uploaded.cid,
-                        aid=aid_int,
-                        csrf=csrf,
-                        cover_url=cover_url,
-                        store=store,
-                        db=db,
-                    )
-                else:
-                    collection_result = {
-                        "ok": False,
-                        "skipped": True,
-                        "reason": "publish response missing aid; cannot attach collection",
-                    }
-                if collection_result and not bool(collection_result.get("ok")) and not bool(collection_result.get("skipped")):
-                    logger.warning("youtube uploader collection attach failed (task_id=%s): %s", task.id, collection_result)
+                # The optional channel-collection feature may invoke yt-dlp
+                # against an entire YouTube channel (>60s). Never defer
+                # writing the Bilibili aid/bvid while this network I/O runs:
+                # PostgreSQL idle transactions can expire and leave a video
+                # that was actually published recorded as "unknown".
+                collection_result = {
+                    "ok": False,
+                    "skipped": True,
+                    "reason": "optional YouTube channel collection attempted after durable publication",
+                }
 
+        # Bilibili may already have committed the archive. Reopen the DB
+        # transaction after all uploads/model calls before recording the BV ID:
+        # a connection left idle while external I/O ran may have been expired.
+        db.rollback()
+        job = db.get(PublishJob, job_uuid)
+        task = db.get(Task, job.task_id) if job is not None else None
+        if job is None or task is None:
+            raise RuntimeError("publish job or task disappeared after Bilibili accepted submission")
         data = _as_dict(add_resp.get("data"))
         aid = data.get("aid")
         bvid = data.get("bvid")
@@ -947,6 +945,42 @@ def _process_job_impl(self, job_id: str) -> dict[str, Any]:
             enqueue_publish_batch_cleanup(db, celery_app, task.id, job.batch_id, needed=cleanup_enqueued) if job.batch_id else None
         except Exception:
             logger.exception("failed to enqueue batch cleanup task (task_id=%s batch_id=%s)", task.id, job.batch_id)
+
+        # Bilibili already has the video and the durable job is PUBLISHED.
+        # Attempt nonessential collection sorting independently so a slow
+        # YouTube request or failed season API cannot negate publication.
+        if task.source_type.value == "youtube" and aid_int > 0:
+            try:
+                with _db() as collection_db:
+                    collection_task = collection_db.get(Task, task.id)
+                    if collection_task is None:
+                        raise RuntimeError("task missing during optional collection sync")
+                    with BilibiliWebClient(cookie) as collection_client:
+                        updated_collection = _attach_youtube_uploader_collection(
+                            client=collection_client,
+                            task=collection_task,
+                            meta=meta,
+                            uploaded_cid=uploaded.cid,
+                            aid=aid_int,
+                            csrf=csrf,
+                            cover_url=cover_url,
+                            store=store,
+                            db=collection_db,
+                        )
+                    # Long metadata fetches may have invalidated an open read
+                    # transaction; clear it without impacting published state.
+                    collection_db.rollback()
+                    durable_job = collection_db.get(PublishJob, job.id)
+                    if durable_job is not None and durable_job.state == PublishState.published:
+                        result = _as_dict(durable_job.response_json)
+                        result["collection"] = updated_collection
+                        durable_job.response_json = result
+                        collection_db.add(durable_job)
+                        collection_db.commit()
+                    if updated_collection and not updated_collection.get("ok") and not updated_collection.get("skipped"):
+                        logger.warning("post-publish collection failed (task_id=%s): %s", task.id, updated_collection)
+            except Exception:
+                logger.exception("noncritical post-publish collection failed; Bilibili publication remains committed")
         return {"status": "ok", "aid": aid_str or None, "bvid": bvid_str or None}
     except Retry:
         raise
