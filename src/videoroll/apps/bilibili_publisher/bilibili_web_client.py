@@ -636,6 +636,18 @@ class BilibiliWebClient:
                 return SeasonRef(season_id=season_id, section_id=section_id, title=title)
         return None
 
+    def get_archive_season(self, *, aid: int) -> dict[str, Any] | None:
+        """Read-only idempotency check: determine whether a video is in any collection."""
+        resp = self._bili.get(
+            "https://member.bilibili.com/x2/creative/web/season/aid",
+            params={"id": int(aid)},
+        )
+        result = _json(resp)
+        if result.get("code") == -404:
+            return None
+        _bili_code_ok(result)
+        return _as_dict(result.get("data")) or None
+
     def find_season_by_title(self, title: str, *, ps: int = 30) -> SeasonRef | None:
         expected = str(title or "").strip()
         _require(bool(expected), "season title is empty")

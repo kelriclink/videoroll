@@ -193,12 +193,11 @@ def _youtube_channel_url_from_info(info: dict[str, Any]) -> str:
 
 def _pick_youtube_collection_cover(
     *,
-    task: Task,
-    store: FileStore,
-    db: Session,
+    task_id: uuid.UUID,
+    info: dict[str, Any],
     fallback_cover_url: str,
 ) -> tuple[str, dict[str, Any]]:
-    info = _read_latest_youtube_info(task, db, store)
+    """Perform all remote channel-cover lookups without holding a DB session."""
     channel_url = _youtube_channel_url_from_info(info)
     if channel_url:
         try:
@@ -207,7 +206,7 @@ def _pick_youtube_collection_cover(
             if art_url:
                 return art_url, {"source": "youtube_channel", "channel_url": channel_url}
         except Exception as e:
-            logger.warning("failed to extract youtube channel art (task_id=%s url=%s): %s", task.id, channel_url, e)
+            logger.warning("failed to extract youtube channel art (task_id=%s): %s", task_id, e)
 
     fallback = str(fallback_cover_url or "").strip()
     if fallback:
@@ -218,86 +217,149 @@ def _pick_youtube_collection_cover(
 def _attach_youtube_uploader_collection(
     *,
     client: BilibiliWebClient,
-    task: Task,
+    info: dict[str, Any],
+    task_id: uuid.UUID,
     meta: BilibiliPublishMeta,
     uploaded_cid: int,
     aid: int,
     csrf: str,
     cover_url: str,
-    store: FileStore,
-    db: Session,
 ) -> dict[str, Any]:
-    info = _read_latest_youtube_info(task, db, store)
+    """Attach a video to its uploader season; no database transaction is held."""
     title = _youtube_collection_title_from_info(info)
     if not title:
         return {"ok": False, "skipped": True, "reason": "youtube uploader/channel not found"}
 
-    result: dict[str, Any] = {
-        "ok": False,
-        "title": title,
-        "created": False,
-    }
+    result: dict[str, Any] = {"ok": False, "title": title, "created": False}
     try:
+        # The creator API identifies an already assigned archive even if the
+        # original attempt succeeded but VideoRoll failed to record its result.
+        assigned = client.get_archive_season(aid=aid)
+        if assigned is not None:
+            # /season/aid wraps the season in data.season (not data.id).
+            # Do not silently claim that a manually assigned *different*
+            # collection is the YouTube author's intended collection.
+            assigned_season = _as_dict(assigned.get("season"))
+            if assigned_season.get("id"):
+                assigned_title = _normalize_collection_title(assigned_season.get("title"))
+                if assigned_title == title:
+                    return {
+                        **result, "ok": True, "already_assigned": True,
+                        "season_id": assigned_season.get("id"),
+                    }
+                return {
+                    **result, "skipped": True, "reason": "different_collection_already_assigned",
+                    "assigned_season_title": assigned_title,
+                    "season_id": assigned_season.get("id"),
+                }
         season = client.find_season_by_title(title)
         cover_debug: dict[str, Any] = {"source": "existing_season"} if season else {}
         if season is None:
             season_cover, cover_debug = _pick_youtube_collection_cover(
-                task=task,
-                store=store,
-                db=db,
-                fallback_cover_url=cover_url,
+                task_id=task_id, info=info, fallback_cover_url=cover_url,
             )
             if not season_cover:
                 video_info = client.get_video_info(aid=aid)
                 season_cover = video_info.cover
                 cover_debug = {"source": "published_video"}
             if not season_cover:
-                return {
-                    **result,
-                    "skipped": True,
-                    "reason": "collection cover is empty",
-                    "cover": cover_debug,
-                }
+                return {**result, "skipped": True, "reason": "collection cover is empty", "cover": cover_debug}
             season, created = client.ensure_season(title=title, cover=season_cover, csrf=csrf)
             result["created"] = bool(created)
 
-        episodes = [
-            {
-                "aid": int(aid),
-                "cid": int(uploaded_cid),
-                "title": meta.title,
-                "charging_pay": 0,
-            }
-        ]
+        episodes = [{
+            "aid": int(aid), "cid": int(uploaded_cid),
+            "title": meta.title, "charging_pay": 0,
+        }]
         try:
             client.add_to_season(section_id=season.section_id, episodes=episodes, csrf=csrf)
         except Exception:
             video_info = client.get_video_info(aid=aid)
             client.add_to_season(
                 section_id=season.section_id,
-                episodes=[
-                    {
-                        "aid": int(video_info.aid),
-                        "cid": int(video_info.cid),
-                        "title": video_info.title,
-                        "charging_pay": 0,
-                    }
-                ],
+                episodes=[{
+                    "aid": int(video_info.aid),
+                    "cid": int(video_info.cid),
+                    "title": video_info.title,
+                    "charging_pay": 0,
+                }],
                 csrf=csrf,
             )
-
-        return {
-            **result,
-            "ok": True,
-            "season_id": season.season_id,
-            "section_id": season.section_id,
-            "cover": cover_debug,
-        }
+        return {**result, "ok": True, "season_id": season.season_id,
+                "section_id": season.section_id, "cover": cover_debug}
     except Exception as e:
-        return {
-            **result,
-            "error": str(e),
-        }
+        return {**result, "error": str(e)[:400]}
+
+
+def _save_collection_result(job_id: uuid.UUID, collection: dict[str, Any]) -> None:
+    """Persist optional collection progress without changing published state."""
+    with _db() as db:
+        job = db.get(PublishJob, job_id, with_for_update=True)
+        if job is None or job.state != PublishState.published:
+            return
+        result = dict(_as_dict(job.response_json))
+        result["collection"] = collection
+        job.response_json = result
+        db.add(job)
+        db.commit()
+
+
+@celery_app.task(name="bilibili_publisher.sync_collection", bind=True, max_retries=96)
+def sync_collection(self, job_id: str) -> dict[str, Any]:
+    """Eventually attach an accepted YouTube video to its uploader collection.
+
+    External YouTube/Bilibili requests occur outside any database transaction.
+    Failures here never change the upload job's PUBLISHED state or resubmit it.
+    """
+    _ensure_db()
+    uid = uuid.UUID(job_id)
+    try:
+        with _db() as db:
+            job = db.get(PublishJob, uid)
+            if job is None or job.state != PublishState.published:
+                return {"status": "skipped", "reason": "publish job not successful"}
+            previous = _as_dict(_as_dict(job.response_json).get("collection"))
+            if previous.get("ok"):
+                return {"status": "already_synced", "collection": previous}
+            task = db.get(Task, job.task_id)
+            if task is None or task.source_type.value != "youtube":
+                return {"status": "skipped", "reason": "not a YouTube source"}
+            store = FileStore(settings)
+            info = _read_latest_youtube_info(task, db, store)
+            aid = int(job.aid or 0)
+            cover_url = str(_as_dict(job.response_json).get("cover_url") or "")
+            meta = BilibiliPublishMeta.model_validate(
+                _as_dict(_as_dict(job.meta_json).get("meta")) or _as_dict(job.meta_json)
+            )
+            cookie = str(get_bilibili_cookie_header(db) or "")
+            csrf = str(get_bilibili_csrf_token(db) or "")
+            task_id = task.id
+        # Session has closed before all remote HTTP / yt-dlp calls.
+        if aid <= 0 or not cookie or not csrf:
+            raise RuntimeError("missing published aid or Bilibili credentials")
+        with BilibiliWebClient(cookie) as client:
+            video = client.get_video_info(aid=aid)
+            collection = _attach_youtube_uploader_collection(
+                client=client, info=info, task_id=task_id, meta=meta,
+                uploaded_cid=video.cid, aid=aid, csrf=csrf, cover_url=cover_url,
+            )
+        if collection.get("ok") or collection.get("skipped"):
+            _save_collection_result(uid, collection)
+            return {"status": "ok" if collection.get("ok") else "skipped", "collection": collection}
+        reason = str(collection.get("error") or "collection attachment failed")
+    except Exception as exc:
+        reason = f"{type(exc).__name__}: {exc}"[:400]
+    attempts = int(getattr(self.request, "retries", 0))
+    if attempts >= self.max_retries:
+        _save_collection_result(uid, {"ok": False, "pending": False, "error": reason, "attempts": attempts + 1})
+        logger.error("post-publish collection permanently failed (job_id=%s): %s", uid, reason)
+        return {"status": "failed", "error": reason}
+    _save_collection_result(uid, {
+        "ok": False, "pending": True, "error": reason,
+        "attempts": attempts + 1, "retry_after_seconds": 3600,
+    })
+    logger.warning("post-publish collection pending, retry in 1 hour (job_id=%s): %s", uid, reason)
+    raise self.retry(countdown=3600)
 
 
 def _ensure_publish_result_asset(db: Session, task_id: uuid.UUID, key: str) -> None:
@@ -885,7 +947,8 @@ def _process_job_impl(self, job_id: str) -> dict[str, Any]:
                 collection_result = {
                     "ok": False,
                     "skipped": True,
-                    "reason": "optional YouTube channel collection attempted after durable publication",
+                    "reason": "queued for independent post-publish collection sync",
+                    "pending": True,
                 }
 
         # Bilibili may already have committed the archive. Reopen the DB
@@ -946,41 +1009,15 @@ def _process_job_impl(self, job_id: str) -> dict[str, Any]:
         except Exception:
             logger.exception("failed to enqueue batch cleanup task (task_id=%s batch_id=%s)", task.id, job.batch_id)
 
-        # Bilibili already has the video and the durable job is PUBLISHED.
-        # Attempt nonessential collection sorting independently so a slow
-        # YouTube request or failed season API cannot negate publication.
+        # Publication is already durably committed; collection creation and
+        # attachment must run independently. Platform readiness is checked
+        # by the delayed worker and retried if the archive or season is pending.
         if task.source_type.value == "youtube" and aid_int > 0:
             try:
-                with _db() as collection_db:
-                    collection_task = collection_db.get(Task, task.id)
-                    if collection_task is None:
-                        raise RuntimeError("task missing during optional collection sync")
-                    with BilibiliWebClient(cookie) as collection_client:
-                        updated_collection = _attach_youtube_uploader_collection(
-                            client=collection_client,
-                            task=collection_task,
-                            meta=meta,
-                            uploaded_cid=uploaded.cid,
-                            aid=aid_int,
-                            csrf=csrf,
-                            cover_url=cover_url,
-                            store=store,
-                            db=collection_db,
-                        )
-                    # Long metadata fetches may have invalidated an open read
-                    # transaction; clear it without impacting published state.
-                    collection_db.rollback()
-                    durable_job = collection_db.get(PublishJob, job.id)
-                    if durable_job is not None and durable_job.state == PublishState.published:
-                        result = _as_dict(durable_job.response_json)
-                        result["collection"] = updated_collection
-                        durable_job.response_json = result
-                        collection_db.add(durable_job)
-                        collection_db.commit()
-                    if updated_collection and not updated_collection.get("ok") and not updated_collection.get("skipped"):
-                        logger.warning("post-publish collection failed (task_id=%s): %s", task.id, updated_collection)
+                sync_collection.apply_async(args=[str(job_uuid)], queue="publish", countdown=300)
             except Exception:
-                logger.exception("noncritical post-publish collection failed; Bilibili publication remains committed")
+                logger.exception("failed to queue optional author collection sync for published job %s", job_uuid)
+                # Do not throw: Bilibili publication is already confirmed.
         return {"status": "ok", "aid": aid_str or None, "bvid": bvid_str or None}
     except Retry:
         raise
