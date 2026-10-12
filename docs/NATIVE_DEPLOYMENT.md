@@ -279,3 +279,8 @@ sudo systemctl start videoroll-ffplayout.service
 ```
 
 此操作仅将已知目录配置项中的 `/var/lib/ffplayout/` 前缀替换为 `/DATA/videoroll/data/ffplayout/`；不会修改频道 ID、播放列表内容、媒体、账号或令牌。可以重复执行，第二次变更数量应为零。
+
+
+### Node.js 离线前端发布产物
+
+如果运行服务器不具备 Node 22 或 npm 网络不可用，开发机可使用 `npm ci && npm run build` 生成可验证的 `dist/`，将静态资源归档为版本化 `.tar.gz` 发布包。当前发布包 `deploy/artifacts/videoroll-web-73296ca.tar.gz` 对应 Git 源码版本 `73296ca`。运行服务器先校验 SHA-256，再解压至临时目录并调用 `scripts/native/build_web.sh --artifact-dir` 原子切换 `/opt/videoroll/web` 链接，不停止后端服务。该产物不含环境变量、数据库、Cookie、登录凭据或媒体。后续应由 CI 自动附加发布产物而不是长期累积在 Git 仓库中。
