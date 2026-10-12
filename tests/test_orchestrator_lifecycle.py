@@ -17,6 +17,29 @@ class OrchestratorLifecycleTests(unittest.TestCase):
 
         self.assertTrue(callable(orchestrator_lifespan))
 
+    def test_cutover_pauses_background_scheduler(self) -> None:
+        import asyncio
+        from fastapi import FastAPI
+        from videoroll.apps.orchestrator_api.infrastructure import lifecycle
+
+        async def check() -> None:
+            app = FastAPI()
+            scheduler = Mock()
+            realtime = Mock()
+            realtime.start = unittest.mock.AsyncMock()
+            realtime.stop = unittest.mock.AsyncMock()
+            app.state.realtime_hub = realtime
+            with patch.object(lifecycle, "initialize_runtime", return_value=scheduler), patch.dict(
+                "os.environ", {"VIDEOROLL_PAUSE_BACKGROUND_JOBS": "1"}
+            ):
+                async with lifecycle.orchestrator_lifespan(app):
+                    scheduler.start.assert_not_called()
+                    realtime.start.assert_awaited_once()
+                scheduler.stop.assert_not_called()
+                realtime.stop.assert_awaited_once()
+
+        asyncio.run(check())
+
     def test_scheduler_stop_waits_for_threads_to_finish(self) -> None:
         from videoroll.apps.orchestrator_api.infrastructure.scheduler import OrchestratorScheduler
 

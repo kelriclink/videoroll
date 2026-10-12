@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -66,10 +67,17 @@ def initialize_runtime(app: FastAPI) -> OrchestratorScheduler:
 async def orchestrator_lifespan(app: FastAPI):
     scheduler = initialize_runtime(app)
     realtime_hub: RealtimeHub = app.state.realtime_hub
-    scheduler.start()
+    # Migration-safe mode: provide the API without starting background recovery,
+    # storage cleanup, source polling or automatic task state transitions.
+    pause_background = os.getenv("VIDEOROLL_PAUSE_BACKGROUND_JOBS", "").lower() in {
+        "1", "true", "yes", "on",
+    }
+    if not pause_background:
+        scheduler.start()
     await realtime_hub.start()
     try:
         yield
     finally:
         await realtime_hub.stop()
-        scheduler.stop()
+        if not pause_background:
+            scheduler.stop()
