@@ -9,6 +9,21 @@ if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
   exit 1
 fi
 test -r "$ENV_FILE"
+# During a Docker-to-native migration, the existing Hatchet tenant and signing
+# keysets are retained. Do not mint/rotate an already usable worker token.
+# This also keeps the token itself out of logs and systemd process arguments.
+if python3 - "$ENV_FILE" <<'PYCHECK'
+import pathlib,sys
+config=pathlib.Path(sys.argv[1]).read_text().splitlines()
+for line in config:
+    if line.startswith("HATCHET_CLIENT_TOKEN=") and len(line.split("=", 1)[1].strip().strip('"')) >= 30:
+        raise SystemExit(0)
+raise SystemExit(1)
+PYCHECK
+then
+  echo "Existing Hatchet worker token preserved."
+  exit 0
+fi
 for attempt in $(seq 1 60); do
   if curl -fsS --max-time 3 http://127.0.0.1:8888/api/ready >/dev/null 2>&1; then
     break
