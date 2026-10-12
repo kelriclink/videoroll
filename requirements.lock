@@ -108,3 +108,5 @@ wcwidth==0.8.3
 websockets==17.1
 yt-dlp-ejs==0.8.0
 yt-dlp==2026.8.19
+
+cryptography==46.0.3
