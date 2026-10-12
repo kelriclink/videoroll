@@ -195,3 +195,11 @@ def test_native_celery_worker_names_are_unique_across_queues() -> None:
     for name in ("subtitle-control@%h", "bilibili-publish@%h"):
         assert f'-n "{name}"' in core
     assert '-n "social-publish@%h"' in social
+
+
+def test_native_openvino_profile_pins_abi_compatible_runtime():
+    installer=(ROOT/"scripts/native/install.sh").read_text()
+    assert 'ASR_RUNTIME" == "openvino"' in installer
+    assert installer.count('"openvino==2026.4.0"')==2
+    assert installer.count('"openvino-genai==2026.4.0.0"')==2
+    assert installer.count('"openvino-tokenizers==2026.4.0.0"')==2

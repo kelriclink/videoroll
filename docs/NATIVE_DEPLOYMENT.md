@@ -284,3 +284,8 @@ sudo systemctl start videoroll-ffplayout.service
 ### Node.js 离线前端发布产物
 
 如果运行服务器不具备 Node 22 或 npm 网络不可用，开发机可使用 `npm ci && npm run build` 生成可验证的 `dist/`，将静态资源归档为版本化 `.tar.gz` 发布包。当前发布包 `deploy/artifacts/videoroll-web-73296ca.tar.gz` 对应 Git 源码版本 `73296ca`。运行服务器先校验 SHA-256，再解压至临时目录并调用 `scripts/native/build_web.sh --artifact-dir` 原子切换 `/opt/videoroll/web` 链接，不停止后端服务。该产物不含环境变量、数据库、Cookie、登录凭据或媒体。后续应由 CI 自动附加发布产物而不是长期累积在 Git 仓库中。
+
+
+### 原生 OpenVINO GPU ASR 配置
+
+对保留了 OpenVINO Whisper 模型、需要通过 Intel Arc A380 进行本地语音识别的 link，使用 VIDEOROLL_NATIVE_ASR_RUNTIME=openvino 安装字幕和字幕工作流环境。此模式仅安装基础程序及 OpenVINO GenAI 依赖，不强制安装额外的 Torch、Optimum Intel 或 Faster Whisper。为避免真实部署中遇到的 libopenvino.so.2640 缺失错误，固定 openvino==2026.4.0、openvino-tokenizers==2026.4.0.0 与 openvino-genai==2026.4.0.0，必须同时保持兼容版本。需在应用配置中将 subtitle.asr.default_model 设置为 /DATA/videoroll/data/models/whisper/whisper-large-v3-fp16-ov，并确保 videoroll 用户能够读取模型。该配置不会执行真实任务。模型 GPU 初始化、实际音频推理和每次新版本升级应另行验证。

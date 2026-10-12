@@ -23,8 +23,8 @@ test -f "$ROOT_DIR/social-auto-upload/sau_cli.py" || {
 VENV_ROOT="$INSTALL_ROOT/venvs"
 # Remote ASR does not require local torch/OpenVINO/faster-whisper runtimes.
 ASR_RUNTIME="${VIDEOROLL_NATIVE_ASR_RUNTIME:-local}"
-if [[ "$ASR_RUNTIME" != "local" && "$ASR_RUNTIME" != "remote" ]]; then
-  echo "VIDEOROLL_NATIVE_ASR_RUNTIME must be local or remote" >&2
+if [[ "$ASR_RUNTIME" != "local" && "$ASR_RUNTIME" != "remote" && "$ASR_RUNTIME" != "openvino" ]]; then
+  echo "VIDEOROLL_NATIVE_ASR_RUNTIME must be local, remote, or openvino" >&2
   exit 64
 fi
 # An existing production data tree can be reused without moving any media.
@@ -246,6 +246,11 @@ make_venv subtitle
 if [[ "$ASR_RUNTIME" == "local" ]]; then
   "$VENV_ROOT/subtitle/bin/pip" install --index-url "${TORCH_CPU_INDEX_URL:-https://download.pytorch.org/whl/cpu}" "torch==2.14.0"
   "$VENV_ROOT/subtitle/bin/pip" install -c "$ROOT_DIR/requirements.lock" "${ROOT_DIR}[subtitle,asr]"
+elif [[ "$ASR_RUNTIME" == "openvino" ]]; then
+  # OpenVINO GenAI and core must use matching SONAME (libopenvino.so.2640);
+  # allowing pip to select 2026.4.1 core breaks imports at runtime.
+  "$VENV_ROOT/subtitle/bin/pip" install -c "$ROOT_DIR/requirements.lock" "$ROOT_DIR"
+  "$VENV_ROOT/subtitle/bin/pip" install "openvino==2026.4.0" "openvino-tokenizers==2026.4.0.0" "openvino-genai==2026.4.0.0"
 else
   "$VENV_ROOT/subtitle/bin/pip" install -c "$ROOT_DIR/requirements.lock" "$ROOT_DIR"
 fi
@@ -258,6 +263,11 @@ make_venv subtitle-workflow
 if [[ "$ASR_RUNTIME" == "local" ]]; then
   "$VENV_ROOT/subtitle-workflow/bin/pip" install --index-url "${TORCH_CPU_INDEX_URL:-https://download.pytorch.org/whl/cpu}" "torch==2.14.0"
   "$VENV_ROOT/subtitle-workflow/bin/pip" install -c "$ROOT_DIR/requirements.lock" "${ROOT_DIR}[subtitle,asr]"
+elif [[ "$ASR_RUNTIME" == "openvino" ]]; then
+  # OpenVINO GenAI and core must use matching SONAME (libopenvino.so.2640);
+  # allowing pip to select 2026.4.1 core breaks imports at runtime.
+  "$VENV_ROOT/subtitle-workflow/bin/pip" install -c "$ROOT_DIR/requirements.lock" "$ROOT_DIR"
+  "$VENV_ROOT/subtitle-workflow/bin/pip" install "openvino==2026.4.0" "openvino-tokenizers==2026.4.0.0" "openvino-genai==2026.4.0.0"
 else
   "$VENV_ROOT/subtitle-workflow/bin/pip" install -c "$ROOT_DIR/requirements.lock" "$ROOT_DIR"
 fi
