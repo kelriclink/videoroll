@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-role="${1:?usage: videoroll-run-social-role {api|worker|scheduler}}"
+role="${1:?usage: videoroll-run-social-role api|worker|scheduler}"
 VENV="${VIDEOROLL_SOCIAL_VENV:-/opt/videoroll/venvs/social}"
 RUNTIME_DIR="${RUNTIME_DIRECTORY:-/run/videoroll-social-$role}"
 

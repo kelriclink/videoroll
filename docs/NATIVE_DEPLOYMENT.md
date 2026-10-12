@@ -261,3 +261,21 @@ sudo env VIDEOROLL_SOURCE_ENV=/DATA/videoroll/.env \
 `/opt/videoroll/config/videoroll.env` 仍含数据库凭据，应限制为 root 读取；服务由 systemd 在降权前加载变量。不要把该文件上传到 GitHub。
 
 首次采用远程 ASR / 远程渲染时不强制安装 `fonts-noto-cjk`（软件包约 57 MB）；需要本机字幕渲染时可设置 `VIDEOROLL_INSTALL_CJK_FONTS=1`，或单独安装所需字体。
+
+
+### 原有 ffplayout SQLite 路径迁移
+
+从 Docker 切换到原生时，ffplayout 的 SQLite `config_global`、`channels`、`config_recording` 会保存 `/var/lib/ffplayout/` 的绝对路径；即使二进制命令行中设置 `--db`，仍会尝试创建该旧路径并报 `Permission denied`。不要因此直接修改 `/var/lib/ffplayout` 目录权限或初始化新数据库。
+
+确认 ffplayout 已停止、旧 SQLite 已单独备份后执行：
+
+```bash
+sudo systemctl stop videoroll-ffplayout.service
+sudo python3 /opt/videoroll/src/scripts/native/migrate_ffplayout_paths.py \
+  --data-root /DATA/videoroll/data
+sudo python3 /opt/videoroll/src/scripts/native/migrate_ffplayout_paths.py \
+  --data-root /DATA/videoroll/data --execute
+sudo systemctl start videoroll-ffplayout.service
+```
+
+此操作仅将已知目录配置项中的 `/var/lib/ffplayout/` 前缀替换为 `/DATA/videoroll/data/ffplayout/`；不会修改频道 ID、播放列表内容、媒体、账号或令牌。可以重复执行，第二次变更数量应为零。
