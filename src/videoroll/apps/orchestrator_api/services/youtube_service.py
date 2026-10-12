@@ -53,6 +53,7 @@ from videoroll.apps.outbox.worker_inbox import (
     release_operation,
     reopen_completed_operation,
 )
+from videoroll.apps.youtube_meta_store import snapshot_downloaded_youtube_info
 from videoroll.apps.subtitle_service.auto_profile_store import get_auto_profile
 from videoroll.apps.youtube_settings_store import (
     finish_youtube_home_scan_lock,
@@ -711,6 +712,10 @@ def _download(
         if not key_was_referenced:
             uploaded_keys.append(key)
         meta_asset = Asset(task_id=task_id, kind=AssetKind.metadata_json, storage_key=key, sha256=digest, size_bytes=len(payload)); db.add(meta_asset)
+        # The publishing cleanup deletes raw metadata before the deferred
+        # author-collection task runs. Persist a compact durable snapshot in
+        # the same download transaction, without further network requests.
+        snapshot_downloaded_youtube_info(db, task_id, info, fallback_url=url)
         cover_asset = None
         try:
             cover_path = download_thumbnail_jpg(info, yt_settings, work_dir=temp_dir)

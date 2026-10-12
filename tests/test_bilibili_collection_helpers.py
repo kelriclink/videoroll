@@ -221,3 +221,38 @@ def test_existing_different_direct_season_not_overwritten() -> None:
     assert result["skipped"] is True
     assert result["reason"] == "different_collection_already_assigned"
     client.add_to_season.assert_not_called()
+
+
+def test_author_metadata_survives_post_publish_raw_asset_cleanup() -> None:
+    import uuid
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock, patch
+    from videoroll.apps.bilibili_publisher.worker import _read_latest_youtube_info
+
+    task = SimpleNamespace(id=uuid.uuid4(), source_type=SimpleNamespace(value="youtube"))
+    db = MagicMock()
+    db.query.return_value.filter.return_value.order_by.return_value.first.return_value = None
+    retained = SimpleNamespace(
+        uploader="Example Scientific Channel", title="The Universe",
+        webpage_url="https://www.youtube.com/watch?v=test",
+    )
+    with patch("videoroll.apps.bilibili_publisher.worker.get_task_youtube_meta", return_value=retained):
+        info = _read_latest_youtube_info(task, db, MagicMock())
+    assert info["uploader"] == "Example Scientific Channel"
+    assert info["webpage_url"].startswith("https://www.youtube.com/")
+
+
+def test_author_raw_youtube_info_preferred_over_durable_fallback() -> None:
+    import uuid
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock, patch
+    from videoroll.apps.bilibili_publisher.worker import _read_latest_youtube_info
+
+    task = SimpleNamespace(id=uuid.uuid4(), source_type=SimpleNamespace(value="youtube"))
+    db = MagicMock()
+    db.query.return_value.filter.return_value.order_by.return_value.first.return_value = SimpleNamespace(storage_key="metadata/key")
+    with patch("videoroll.apps.bilibili_publisher.worker._read_storage_json", return_value={"uploader": "Source Truth"}):
+        with patch("videoroll.apps.bilibili_publisher.worker.get_task_youtube_meta") as fallback:
+            info = _read_latest_youtube_info(task, db, MagicMock())
+    assert info["uploader"] == "Source Truth"
+    fallback.assert_not_called()

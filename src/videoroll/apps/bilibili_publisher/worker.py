@@ -43,6 +43,7 @@ from videoroll.db.session import get_sessionmaker
 from videoroll.storage.filesystem import FileStore
 from videoroll.apps.subtitle_service.bilibili_tags_store import get_task_bilibili_summary
 from videoroll.apps.subtitle_service.translate_settings_store import get_translate_settings
+from videoroll.apps.youtube_meta_store import get_task_youtube_meta
 
 
 settings = get_bilibili_publisher_settings()
@@ -155,12 +156,23 @@ def _read_latest_youtube_info(task: Task, db: Session, store: FileStore) -> dict
         .order_by(Asset.created_at.desc())
         .first()
     )
-    if not asset:
-        return {}
-    try:
-        return _read_storage_json(store, asset.storage_key)
-    except Exception:
-        return {}
+    if asset:
+        try:
+            raw_info = _read_storage_json(store, asset.storage_key)
+            if _youtube_collection_title_from_info(raw_info):
+                return raw_info
+        except Exception:
+            logger.debug("raw YouTube metadata is unavailable for task %s", task.id)
+    # Successful publication triggers storage cleanup before the delayed
+    # author-collection task. The compact SQL metadata is durable by design.
+    saved = get_task_youtube_meta(db, task.id)
+    if saved and saved.uploader:
+        return {
+            "uploader": saved.uploader,
+            "title": saved.title,
+            "webpage_url": saved.webpage_url,
+        }
+    return {}
 
 
 def _normalize_collection_title(value: Any, *, max_chars: int = 80) -> str:

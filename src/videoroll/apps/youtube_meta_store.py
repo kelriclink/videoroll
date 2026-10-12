@@ -47,3 +47,37 @@ def upsert_task_youtube_meta(
 def delete_task_youtube_meta(db: Session, task_id: uuid.UUID) -> int:
     return db.query(YouTubeVideoMeta).filter(YouTubeVideoMeta.task_id == task_id).delete(synchronize_session=False)
 
+
+
+def snapshot_downloaded_youtube_info(
+    db: Session,
+    task_id: uuid.UUID,
+    info: dict[str, object],
+    *,
+    fallback_url: str,
+) -> YouTubeVideoMeta | None:
+    """Save small source metadata before the published-task cleanup removes raw JSON.
+
+    Author-collection sync is intentionally asynchronous, so it must not depend
+    on the raw yt-dlp metadata asset surviving post-publish cleanup.
+    """
+    if not isinstance(info, dict) or not info:
+        return None
+    duration: int | None = None
+    try:
+        raw_duration = info.get("duration")
+        if raw_duration is not None:
+            duration = max(0, int(float(raw_duration)))
+    except (TypeError, ValueError, OverflowError):
+        pass
+    uploader = _as_str(info.get("uploader") or info.get("channel")) or None
+    return upsert_task_youtube_meta(
+        db, task_id,
+        source_id=_as_str(info.get("id")) or None,
+        title=_as_str(info.get("title")),
+        description=str(info.get("description") or ""),
+        webpage_url=_as_str(info.get("webpage_url")) or fallback_url,
+        uploader=uploader,
+        upload_date=_as_str(info.get("upload_date")) or None,
+        duration=duration,
+    )
