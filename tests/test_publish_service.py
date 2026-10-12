@@ -855,30 +855,3 @@ def test_http_status_error_detail_reports_validation_fields():
     detail = PublishService._http_status_error_detail(error)
 
     assert detail == "HTTP 422: video: Field required; meta: Field required"
-
-def test_auto_publishing_does_not_claim_third_party_nasa_source_as_original() -> None:
-    from types import SimpleNamespace
-    from videoroll.db.models import SourceLicense, SourceType
-    from videoroll.apps.orchestrator_api.services.publishing_service import prepare_publish_meta
-
-    source = "https://www.youtube.com/watch?v=Y4rrx4D7gcU"
-    task = SimpleNamespace(id=uuid.uuid4(), source_type=SourceType.youtube, source_license=SourceLicense.authorized, source_url=source)
-    draft = {"title": "NASA LIDAR 中文讲解", "desc": f"来自 NASA Goddard。\n{source}",
-             "tags": ["NASA", "雷达"], "typeid": 17, "copyright": 1, "source": ""}
-    with patch("videoroll.apps.orchestrator_api.services.publishing_service.get_task_bilibili_tags", return_value=[]):
-        result = prepare_publish_meta(task=task, payload_meta=draft, db=MagicMock(),store=MagicMock(),allow_auto_draft=False)
-    assert result["copyright"] == 2
-    assert result["source"] == source
-
-
-def test_publishing_can_retain_original_license_for_owned_source() -> None:
-    from types import SimpleNamespace
-    from videoroll.db.models import SourceLicense, SourceType
-    from videoroll.apps.orchestrator_api.services.publishing_service import prepare_publish_meta
-
-    task = SimpleNamespace(id=uuid.uuid4(), source_type=SourceType.youtube, source_license=SourceLicense.own,
-                           source_url="https://www.youtube.com/watch?v=own")
-    draft = {"title":"My Video","desc":"Original by me","tags":["video"],"typeid":17,"copyright":1,"source":""}
-    with patch("videoroll.apps.orchestrator_api.services.publishing_service.get_task_bilibili_tags", return_value=[]):
-        result=prepare_publish_meta(task=task,payload_meta=draft,db=MagicMock(),store=MagicMock(),allow_auto_draft=False)
-    assert result["copyright"]==1

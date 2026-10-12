@@ -45,7 +45,7 @@ from videoroll.apps.subtitle_service.bilibili_tags_store import get_task_bilibil
 from videoroll.apps.subtitle_service.translate_settings_store import get_translate_settings
 from videoroll.apps.youtube_meta_store import get_task_youtube_meta
 from videoroll.config import OrchestratorSettings, get_subtitle_settings
-from videoroll.db.models import Asset, AssetKind, PublishBatch, PublishJob, PublishState, SourceLicense, SourceType, Task, TaskStatus
+from videoroll.db.models import Asset, AssetKind, PublishBatch, PublishJob, PublishState, Task, TaskStatus
 from videoroll.storage.filesystem import FileStore
 
 
@@ -270,20 +270,7 @@ def prepare_publish_meta(
         copyright_value = int(meta.get("copyright") or 1)
     except Exception:
         copyright_value = 1
-
-    # The saved publishing template defaults to "original" (1). That is not
-    # evidence of ownership of a third-party source. Public-domain, CC and
-    # authorized external material is a repost on Bilibili, even if the
-    # translation and subtitles were newly produced by VideoRoll.
-    if (
-        task.source_type in {SourceType.youtube, SourceType.url}
-        and task.source_license != SourceLicense.own
-        and task.source_url
-    ):
-        copyright_value = 2
-        meta["copyright"] = 2
-        meta["source"] = task.source_url
-    elif copyright_value == 2 and not str(meta.get("source") or "").strip() and task.source_url:
+    if copyright_value == 2 and not str(meta.get("source") or "").strip() and task.source_url:
         meta["source"] = task.source_url
 
     merged_tags: list[str] = []
