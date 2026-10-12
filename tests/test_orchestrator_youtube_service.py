@@ -323,3 +323,29 @@ def test_fetch_meta_never_immediately_deletes_a_deterministic_key(tmp_path) -> N
         youtube_service.fetch_meta(task_id, settings=settings, db=db, store=store)  # type: ignore[arg-type]
 
     store.delete_object.assert_not_called()
+
+def test_youtube_download_releases_settings_transaction_before_network(tmp_path) -> None:
+    """Regression: do not hold 60-second PostgreSQL idle transaction during yt-dlp."""
+    from videoroll.db.models import SourceType, TaskStatus
+    task_id = uuid.uuid4()
+    task = SimpleNamespace(source_url="https://www.youtube.com/watch?v=HZMiJ_Q47qk",
+                           source_type=SourceType.youtube,status=TaskStatus.ingested)
+    timeline = []
+    db = Mock()
+    db.get.return_value = task
+    db.query.return_value.filter.return_value.order_by.return_value.first.return_value = None
+    db.commit.side_effect = lambda: timeline.append("commit")
+    reporter = Mock()
+    store = Mock()
+    settings = SimpleNamespace(work_dir=str(tmp_path))
+    def fail_before_file(*args, **kwargs):
+        timeline.append("download")
+        raise RuntimeError("upstream connection reset")
+    with patch.object(youtube_service, "effective_youtube_settings", return_value=object()), \
+         patch.object(youtube_service, "download_youtube_video", side_effect=fail_before_file), \
+         patch.object(youtube_service, "youtube_bot_check_hint", return_value=""), \
+         patch.object(youtube_service, "_store_failure_log"):
+        with pytest.raises(HTTPException, match="upstream connection reset"):
+            youtube_service._download(task_id, settings=settings, db=db, store=store, reporter=reporter)
+    assert timeline.index("commit") < timeline.index("download")
+    db.rollback.assert_called()

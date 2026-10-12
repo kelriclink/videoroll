@@ -657,6 +657,11 @@ def _download(
             yt_settings = effective_youtube_settings(settings, db, cookie_dir=temp_dir)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=f"invalid youtube cookies: {exc}") from exc
+        # Reading saved YouTube settings starts an ORM transaction. A slow
+        # yt-dlp request may take minutes, exceeding PostgreSQL's 60s
+        # idle_in_transaction_session_timeout. Close the read transaction
+        # before external I/O; progress checkpoints use their own commits.
+        db.commit()
         info: dict[str, Any] = {}; meta: Any = None
         if video_asset is None:
             try:
@@ -667,6 +672,9 @@ def _download(
                     progress_hook=reporter.hook,
                 )
             except Exception as exc:
+                # Avoid masking yt-dlp's original network error with a poisoned
+                # or server-expired transaction in bot-check/error persistence.
+                db.rollback()
                 hint = youtube_bot_check_hint(str(exc), yt_settings=yt_settings, db=db)
                 try:
                     _store_failure_log(db, store, task_id, url, exc, hint)
