@@ -549,7 +549,10 @@ def _request_openai_json_object_with_thinking_with_client(
             req["response_format"] = {"type": "json_object"}
             req["enable_thinking"] = True
 
-        for net_attempt in range(attempts_network):
+        # One additional attempt is reserved solely for a gateway that
+        # explicitly rejects the non-standard enable_thinking request field.
+        # Ordinary HTTP/network retries retain their original limit.
+        for net_attempt in range(attempts_network + (1 if "enable_thinking" in req else 0)):
             content_parts: list[str] = []
             attempt_started_at = time.perf_counter()
             stream_usage: dict[str, Any] | None = None
@@ -589,6 +592,19 @@ def _request_openai_json_object_with_thinking_with_client(
                             latency_ms=int((time.perf_counter() - attempt_started_at) * 1000),
                             error=error,
                         )
+                        if (
+                            status == 400
+                            and api_type == "openai"
+                            and "enable_thinking" in req
+                            and "enable_thinking" in raw_body.lower()
+                            and any(term in raw_body.lower() for term in ("unsupported", "unknown", "not permitted", "not allowed", "extra forbidden"))
+                        ):
+                            # Retry the same request with the standard OpenAI
+                            # streaming protocol. Gateways such as Qwen proxies
+                            # may handle reasoning internally but reject the
+                            # non-standard field. This fallback runs at most once.
+                            req.pop("enable_thinking", None)
+                            continue
                         if status in _RETRYABLE_STATUS_CODES and net_attempt < attempts_network - 1:
                             _sleep_before_retry(resp, net_attempt, cancel_check=cancel_check)
                             continue

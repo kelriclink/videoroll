@@ -284,3 +284,50 @@ def test_subtitle_batch_error_context_is_reported_before_timeout_halving() -> No
     assert starts == [{"start": 0, "size": 2}, {"start": 0, "size": 1}, {"start": 1, "size": 1}]
     assert errors == [({"start": 0, "size": 2}, "batch too large")]
     assert completed == [({"start": 0, "size": 1}, 1), ({"start": 1, "size": 1}, 2)]
+
+def test_thinking_fallback_when_gateway_rejects_enable_thinking() -> None:
+    requests: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body=json.loads(request.content)
+        requests.append(body)
+        if "enable_thinking" in body:
+            return httpx.Response(
+                400,
+                json={"error": {"message": "enable_thinking: property 'enable_thinking' is unsupported"}},
+            )
+        return httpx.Response(200, headers={"content-type": "text/event-stream"},
+                              content='data: {"choices":[{"delta":{"content":"{\\"translations\\": []}"}}]}\n\ndata: [DONE]\n')
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        result = request_openai_json_object_with_thinking(
+            config=OpenAIChatConfig(api_key="test", base_url="https://llm.example/v1", model="think-model"),
+            system_prompt="JSON only", user_prompt="translate",
+            format_retries=1, network_retries=1, client=client,
+        )
+    assert result == {"translations": []}
+    assert len(requests) == 2
+    assert requests[0]["enable_thinking"] is True
+    assert "enable_thinking" not in requests[1]
+    assert requests[1]["stream"] is True
+
+
+def test_thinking_does_not_fallback_for_unrelated_bad_request() -> None:
+    requests=[]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content))
+        return httpx.Response(400, json={"error": {"message": "invalid model name"}})
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        try:
+            request_openai_json_object_with_thinking(
+                config=OpenAIChatConfig(api_key="test", base_url="https://llm.example/v1", model="think-model"),
+                system_prompt="json only", user_prompt="test", client=client,
+                format_retries=1, network_retries=1,
+            )
+        except OpenAIRequestError as e:
+            assert e.status_code == 400
+        else:
+            raise AssertionError("Must reject unrelated gateway errors")
+    assert len(requests) == 1
