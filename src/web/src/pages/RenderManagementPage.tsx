@@ -70,6 +70,15 @@ export default function RenderManagementPage() {
     try { await renderManagementApi.controlWorker(worker.id, patch); await refresh(); }
     catch (e) { setError(e instanceof Error ? e.message : String(e)); } finally { setBusy(null); }
   }
+  async function deviceAction(worker: RenderWorker, device: RenderDevice, enabled: boolean) {
+    const key = `device:${worker.id}:${device.id}`;
+    setBusy(key);
+    try {
+      await renderManagementApi.controlDevice(worker.id, device.id, enabled);
+      await refresh();
+    } catch (e) { setError(e instanceof Error ? e.message : String(e)); }
+    finally { setBusy(null); }
+  }
   async function executionAction(execution: RenderExecution, action: "cancel" | "requeue") {
     setBusy(execution.id);
     try {
@@ -174,9 +183,10 @@ export default function RenderManagementPage() {
             </div>
             {devices.length ? <div className="mt-4 space-y-2">
               {devices.map((device) => <div key={device.id} className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 dark:border-slate-700 dark:bg-slate-900">
-                <div className="flex items-center justify-between gap-3"><div><div className="text-xs font-medium">{device.name}</div><div className="mt-0.5 font-mono text-[11px] text-slate-500">{device.id}{device.path ? ` · ${device.path}` : ""} · {device.backend}</div></div><span className={`rounded-full px-2 py-0.5 text-[11px] ${badge(device.status)}`}>{device.status}</span></div>
+                <div className="flex items-center justify-between gap-3"><div className="min-w-0"><div className="text-xs font-medium">{device.name}</div><div className="mt-0.5 break-all font-mono text-[11px] text-slate-500">{device.id}{device.path ? ` · ${device.path}` : ""} · {device.backend}</div></div><div className="flex shrink-0 items-center gap-2"><span className={`rounded-full px-2 py-0.5 text-[11px] ${badge(device.status)}`}>{device.enabled === false ? "已暂停" : device.status === "cooldown" ? "故障冷却" : device.status}</span><Button size="xs" disabled={busy !== null || w.stale || !w.credential_active} tone={device.enabled === false ? "primary" : "danger"} onClick={() => void deviceAction(w, device, device.enabled === false)}>{device.enabled === false ? "启用此显卡" : "暂停此显卡"}</Button></div></div>
                 <div className="mt-2 grid grid-cols-2 gap-2 text-[11px]"><div><span className="text-slate-500">任务 </span>{device.active_jobs}</div><div className="truncate"><span className="text-slate-500">Execution </span>{device.execution_ids?.length ? device.execution_ids.map((id) => id.slice(0, 8)).join(", ") : "—"}</div></div>
               </div>)}
+              <div className="text-[11px] text-slate-500">显卡开关仅控制新渲染任务的分配，不会中断当前执行；节点收到下一次心跳响应后生效。</div>
             </div> : null}
             <div className="mt-4 flex flex-wrap gap-2"><Button size="xs" disabled={busy === w.id} onClick={() => void workerAction(w, { draining: !w.draining })}>{w.draining ? "恢复接单" : "Drain"}</Button><Button size="xs" tone={w.enabled ? "danger" : "primary"} disabled={busy === w.id} onClick={() => void workerAction(w, { enabled: !w.enabled })}>{w.enabled ? "禁用" : "启用"}</Button><Button size="xs" tone="danger" disabled={busy === w.id || !w.credential_active} onClick={async () => { setBusy(w.id); try { await renderManagementApi.revokeWorkerCredential(w.id); await refresh(); } catch (e) { setError(e instanceof Error ? e.message : String(e)); } finally { setBusy(null); } }}>吊销长期凭据</Button></div>
           </div>;

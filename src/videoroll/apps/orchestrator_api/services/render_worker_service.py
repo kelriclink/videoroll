@@ -31,6 +31,8 @@ ENROLLMENT_PREFIX = "vre_"
 WORKER_CREDENTIAL_PREFIX = "vrw_"
 RENDER_CONNECTION_SETTINGS_KEY = "render_worker_connection"
 LOCAL_WORKER_KEY = "local-render"
+DISABLED_DEVICE_LABEL = "disabled_render_device_ids"
+MAX_RENDER_ATTEMPTS = 5
 
 def _secret_hash(value: str) -> str:
     return hashlib.sha256(str(value or "").encode("utf-8")).hexdigest()
@@ -83,7 +85,11 @@ def enroll_worker(db: Session, payload: Any) -> tuple[RenderWorker, str]:
     if worker is None:
         worker = RenderWorker(worker_key=payload.worker_key, name=payload.name, platform=payload.platform)
     for key in ("name","platform","architecture","version","protocol_version","render_spec_versions","capabilities","resources","labels","max_concurrency"):
-        setattr(worker, key, getattr(payload, key))
+        value = getattr(payload, key)
+        if key == "labels" and worker.id is not None:
+            previous_disabled = (worker.labels or {}).get(DISABLED_DEVICE_LABEL, [])
+            value = {**dict(value or {}), DISABLED_DEVICE_LABEL: list(previous_disabled)}
+        setattr(worker, key, value)
     if existing_max_concurrency is not None:
         worker.max_concurrency = existing_max_concurrency
     credential = WORKER_CREDENTIAL_PREFIX + secrets.token_urlsafe(48)
@@ -117,7 +123,11 @@ def enroll_local_worker(db: Session, payload: Any) -> tuple[RenderWorker, str]:
     if worker is None:
         worker = RenderWorker(worker_key=payload.worker_key, name=payload.name, platform=payload.platform)
     for key in ("name","platform","architecture","version","protocol_version","render_spec_versions","capabilities","resources","labels","max_concurrency"):
-        setattr(worker, key, getattr(payload, key))
+        value = getattr(payload, key)
+        if key == "labels" and worker.id is not None:
+            previous_disabled = (worker.labels or {}).get(DISABLED_DEVICE_LABEL, [])
+            value = {**dict(value or {}), DISABLED_DEVICE_LABEL: list(previous_disabled)}
+        setattr(worker, key, value)
     if existing_max_concurrency is not None:
         worker.max_concurrency = existing_max_concurrency
     credential = WORKER_CREDENTIAL_PREFIX + secrets.token_urlsafe(48)
@@ -238,22 +248,48 @@ def control_worker(db: Session, worker_id: uuid.UUID, payload: Any) -> RenderWor
     db.add(row); db.commit(); db.refresh(row)
     return row
 
+def control_worker_device(db: Session, worker_id: uuid.UUID, device_id: str, enabled: bool) -> RenderWorker:
+    """Persist scheduling preference in worker labels; worker observes it at heartbeat."""
+    row = get_worker(db, worker_id, lock=True)
+    advertised = (row.resources or {}).get("devices") or (row.capabilities or {}).get("devices") or []
+    known_ids = {str(device.get("id")) for device in advertised if isinstance(device, dict)}
+    if device_id not in known_ids:
+        raise HTTPException(404, "render device not found on worker")
+    labels = dict(row.labels or {})
+    disabled = set(labels.get(DISABLED_DEVICE_LABEL, []))
+    if enabled:
+        disabled.discard(device_id)
+    else:
+        disabled.add(device_id)
+    labels[DISABLED_DEVICE_LABEL] = sorted(disabled)
+    row.labels = labels
+    db.add(row); db.commit(); db.refresh(row)
+    return row
+
+
 def list_workers(db: Session) -> list[RenderWorker]:
     return db.query(RenderWorker).order_by(RenderWorker.last_seen_at.desc()).all()
 
 def worker_admin_payload(worker: RenderWorker) -> dict[str, Any]:
     seen = _utc(worker.last_seen_at) or utcnow()
     age = max(0, int((utcnow() - seen).total_seconds()))
-    resources = worker.resources or {}
+    resources = dict(worker.resources or {})
     devices = resources.get("devices") if isinstance(resources.get("devices"), list) else []
-    device_count = len([device for device in devices if isinstance(device, dict)])
+    disabled = set((worker.labels or {}).get(DISABLED_DEVICE_LABEL, []))
+    devices = [
+        {**device, "enabled": device.get("id") not in disabled,
+         "status": "disabled" if device.get("id") in disabled else device.get("status", "idle")}
+        for device in devices if isinstance(device, dict)
+    ]
+    resources["devices"] = devices
+    device_count = len(devices)
     effective_capacity = int(worker.max_concurrency or 0)
     available_slots = max(0, effective_capacity - int(worker.active_jobs or 0))
     return {
         "id": worker.id, "worker_key": worker.worker_key, "name": worker.name, "platform": worker.platform,
         "architecture": worker.architecture, "version": worker.version, "protocol_version": worker.protocol_version,
         "render_spec_versions": worker.render_spec_versions or [], "capabilities": worker.capabilities or {},
-        "resources": worker.resources or {}, "labels": worker.labels or {}, "status": worker.status,
+        "resources": resources, "labels": worker.labels or {}, "status": worker.status,
         "enabled": worker.enabled, "draining": worker.draining, "max_concurrency": worker.max_concurrency,
         "active_jobs": worker.active_jobs, "device_count": device_count,
         # Legacy field retained for API compatibility. It now represents the
@@ -503,6 +539,8 @@ def settle_local_execution(
     execution.error_message = error
     execution.finished_at = now
     job.lease_owner = None; job.lease_until = None; job.heartbeat_at = now
+    if succeeded:
+        job.error_message = None
     worker = db.get(RenderWorker, execution.worker_id)
     if worker is not None:
         worker.active_jobs = max(0, int(worker.active_jobs or 0) - 1)
@@ -526,7 +564,7 @@ def complete_execution(db: Session, execution_id: uuid.UUID, payload: Any) -> Re
         asset = db.get(Asset, payload.output_asset_id)
         if asset is None or asset.task_id != job.task_id: raise HTTPException(400, "output asset does not belong to render task")
     now = utcnow(); execution.state = "succeeded"; execution.progress = 100; execution.output_json = payload.output; execution.finished_at = now
-    job.status = RenderJobStatus.succeeded; job.progress = 100; job.finished_at = now; job.lease_owner = None; job.lease_until = None; job.heartbeat_at = now
+    job.status = RenderJobStatus.succeeded; job.progress = 100; job.finished_at = now; job.lease_owner = None; job.lease_until = None; job.heartbeat_at = now; job.error_message = None
     if job.subtitle_job_id:
         subtitle_job = db.get(SubtitleJob, job.subtitle_job_id)
         if subtitle_job is not None:
@@ -571,23 +609,24 @@ def fail_execution(db: Session, execution_id: uuid.UUID, payload: Any) -> Render
     execution.state = "failed"; execution.error_message = payload.error; execution.finished_at = now
     if job is not None and job.lease_owner == f"{REMOTE_LOCK_PREFIX}{execution.id}":
         job.lease_owner = None; job.lease_until = None; job.heartbeat_at = now; job.error_message = payload.error
-        job.status = RenderJobStatus.queued if payload.retryable else RenderJobStatus.failed
-        if payload.retryable: job.retry_count = int(job.retry_count or 0)+1; job.progress = 0; job.started_at = None
+        retryable = bool(payload.retryable and execution.attempt < MAX_RENDER_ATTEMPTS)
+        job.status = RenderJobStatus.queued if retryable else RenderJobStatus.failed
+        if retryable: job.retry_count = int(job.retry_count or 0)+1; job.progress = 0; job.started_at = None
         else: job.finished_at = now
         task = db.get(Task, job.task_id)
         if task is not None:
-            if not payload.retryable and task.status != TaskStatus.published:
+            if not retryable and task.status != TaskStatus.published:
                 task.status = TaskStatus.failed
                 task.error_code = task.error_code or "RENDER_FAILED"
                 task.error_message = payload.error
             db.add(task)
-        if not payload.retryable and job.subtitle_job_id:
+        if not retryable and job.subtitle_job_id:
             subtitle_job = db.get(SubtitleJob, job.subtitle_job_id)
             if subtitle_job is not None:
                 subtitle_job.status = SubtitleJobStatus.failed
                 subtitle_job.error_message = f"render failed: {payload.error}"
                 db.add(subtitle_job)
-        if not payload.retryable:
+        if not retryable:
             create_outbox_event(
                 db,
                 event_type="workflow.render.finished",

@@ -8,7 +8,7 @@ from videoroll.apps.orchestrator_api.dependencies import get_db
 from videoroll.apps.orchestrator_api.render_worker_schemas import (
     EnrollmentAdminRead, EnrollmentCreateRequest, EnrollmentCreateResponse,
     RenderConnectionUpdate,
-    ExecutionAdminActionRequest, ExecutionAdminRead, WorkerAdminRead, WorkerControlRequest,
+    ExecutionAdminActionRequest, ExecutionAdminRead, WorkerAdminRead, WorkerControlRequest, WorkerDeviceControlRequest,
 )
 from videoroll.apps.orchestrator_api.services import render_worker_service
 
@@ -47,6 +47,11 @@ def workers(db: Session = Depends(get_db)):
 @router.patch("/workers/{worker_id}", response_model=WorkerAdminRead)
 def control_worker(worker_id: uuid.UUID, payload: WorkerControlRequest, db: Session = Depends(get_db)):
     row = render_worker_service.control_worker(db, worker_id, payload)
+    return render_worker_service.worker_admin_payload(row)
+
+@router.patch("/workers/{worker_id}/devices/{device_id:path}", response_model=WorkerAdminRead)
+def control_device(worker_id: uuid.UUID, device_id: str, payload: WorkerDeviceControlRequest, db: Session = Depends(get_db)):
+    row = render_worker_service.control_worker_device(db, worker_id, device_id, payload.enabled)
     return render_worker_service.worker_admin_payload(row)
 
 @router.post("/workers/{worker_id}/revoke-credential", response_model=WorkerAdminRead)

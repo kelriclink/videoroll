@@ -91,6 +91,10 @@ class WorkerControlRequest(BaseModel):
     max_concurrency: int | None = Field(default=None, ge=1, le=32)
     worker_key: str | None = Field(default=None, min_length=1, max_length=128)
 
+class WorkerDeviceControlRequest(BaseModel):
+    enabled: bool
+
+
 class ClaimRequest(BaseModel):
     available_slots: int = Field(default=1, ge=0, le=32)
     accepted_transfer_modes: list[Literal["http", "mapped"]] = Field(default_factory=lambda: ["http"])

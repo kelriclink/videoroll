@@ -4,7 +4,7 @@ import { orchestratorUrl } from "../lib/urls";
 export type RenderDevice = {
   id: string; name: string; backend: string; path?: string; index?: number | null;
   encoders?: string[]; max_concurrency?: number; active_jobs: number; available_slots?: number;
-  status: string; execution_ids?: string[];
+  status: string; execution_ids?: string[]; enabled?: boolean;
 };
 
 export type RenderWorker = {
@@ -49,6 +49,8 @@ export const renderManagementApi = {
   },
   controlWorker: (id: string, payload: { enabled?: boolean; draining?: boolean; max_concurrency?: number; worker_key?: string }) =>
     fetchJson<RenderWorker>(orchestratorUrl(`/render-management/workers/${id}`), { method: "PATCH", ...json(payload) }),
+  controlDevice: (workerId: string, deviceId: string, enabled: boolean) =>
+    fetchJson<RenderWorker>(orchestratorUrl(`/render-management/workers/${workerId}/devices/${encodeURIComponent(deviceId)}`), { method: "PATCH", ...json({ enabled }) }),
   revokeWorkerCredential: (id: string) =>
     fetchJson<RenderWorker>(orchestratorUrl(`/render-management/workers/${id}/revoke-credential`), { method: "POST" }),
   cancelExecution: (id: string, reason = "管理员取消") =>

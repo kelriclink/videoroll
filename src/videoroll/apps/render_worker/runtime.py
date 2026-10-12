@@ -28,6 +28,9 @@ from videoroll.utils.hashing import sha256_file
 
 logger = logging.getLogger(__name__)
 WORKER_VERSION = "1"
+DEVICE_COOLDOWN_SECONDS = 120
+DEVICE_COOLDOWN_MAX_SECONDS = 900
+DISABLED_DEVICE_LABEL = "disabled_render_device_ids"
 
 
 @dataclass(frozen=True)
@@ -104,21 +107,27 @@ def _hardware_encoder_available(
     *,
     backend: str,
     index: int | None = None,
+    device_path: str | None = None,
 ) -> bool:
-    command = [
-        ffmpeg_path,
-        "-hide_banner",
-        "-loglevel",
-        "error",
+    command = [ffmpeg_path, "-hide_banner", "-loglevel", "error"]
+    if backend == "vaapi":
+        if not device_path:
+            return False
+        command.extend(["-init_hw_device", f"vaapi=va:{device_path}", "-filter_hw_device", "va"])
+    command.extend([
         "-f",
         "lavfi",
         "-i",
-        "color=c=black:s=64x64:r=1",
+        "color=c=black:s=128x128:r=1",
+    ])
+    if backend == "vaapi":
+        command.extend(["-vf", "format=nv12,hwupload"])
+    command.extend([
         "-frames:v",
         "1",
         "-c:v",
         encoder,
-    ]
+    ])
     if backend == "nvidia" and index is not None:
         command.extend(["-gpu", str(index)])
     command.extend(["-f", "null", "-"])
@@ -173,14 +182,41 @@ def _windows_intel_devices(
     ]
 
 
+def _drm_pci_identity(path: Path) -> tuple[int, int, str] | None:
+    """Resolve render-node PCI identity through sysfs, not its filename."""
+    pci = Path("/sys/class/drm") / path.name / "device"
+    try:
+        return (int((pci / "vendor").read_text().strip(), 16),
+                int((pci / "device").read_text().strip(), 16), pci.resolve(strict=True).name)
+    except (OSError, ValueError):
+        return None
+
+
+def _vaapi_device(path: Path, encoders: set[str], *, ffmpeg_path: str) -> RenderDevice | None:
+    pci = _drm_pci_identity(path)
+    # NVIDIA DRM render nodes exist, but they are not Intel/AMD VAAPI encoders.
+    if pci is None or pci[0] not in {0x8086, 0x1002}:
+        return None
+    supported = tuple(
+        encoder for encoder in sorted(encoders) if encoder.endswith("_vaapi")
+        and _hardware_encoder_available(ffmpeg_path, encoder, backend="vaapi", device_path=str(path))
+    )
+    if not supported:
+        return None
+    vendor = "Intel" if pci[0] == 0x8086 else "AMD"
+    return RenderDevice(
+        id=f"vaapi:{pci[2]}", name=f"{vendor} VAAPI {path.name} ({pci[0]:04x}:{pci[1]:04x})",
+        backend="vaapi", path=str(path), encoders=supported,
+    )
+
+
 def _intel_devices(encoders: set[str], *, ffmpeg_path: str) -> list[RenderDevice]:
     if os.name == "nt":
         return _windows_intel_devices(encoders, ffmpeg_path=ffmpeg_path)
     paths = sorted(Path("/dev/dri").glob("renderD*")) if Path("/dev/dri").is_dir() else []
-    vaapi = tuple(sorted(x for x in encoders if x.endswith("_vaapi")))
     return [
-        RenderDevice(id=f"vaapi:{path.name}", name=f"Intel/VAAPI {path.name}", backend="vaapi", path=str(path), encoders=vaapi)
-        for path in paths
+        device for path in paths
+        if (device := _vaapi_device(path, encoders, ffmpeg_path=ffmpeg_path)) is not None
     ]
 
 
@@ -234,13 +270,17 @@ def probe_capabilities(settings: RenderWorkerSettings) -> tuple[dict[str, Any], 
         if os.name != "nt" and not Path(configured_device).exists():
             raise FileNotFoundError(f"render GPU device not found: {configured_device}")
         backend = "vaapi" if configured_backend in {"", "auto", "intel", "vaapi"} else configured_backend
-        devices.append(RenderDevice(
-            id=f"{backend}:{Path(configured_device).name}",
-            name=configured_device,
-            backend=backend,
-            path=configured_device,
-            encoders=tuple(sorted(x for x in encoders if x.endswith(f"_{backend}") or backend == "software")),
-        ))
+        if backend == "vaapi":
+            device = _vaapi_device(Path(configured_device), encoders, ffmpeg_path=settings.ffmpeg_path)
+            if device is None:
+                raise ValueError(f"configured VAAPI device does not pass hardware encoding probe: {configured_device}")
+            devices.append(device)
+        else:
+            devices.append(RenderDevice(
+                id=f"{backend}:{Path(configured_device).name}",
+                name=configured_device, backend=backend, path=configured_device,
+                encoders=tuple(sorted(x for x in encoders if x.endswith(f"_{backend}") or backend == "software")),
+            ))
     else:
         devices.extend(_intel_devices(encoders, ffmpeg_path=settings.ffmpeg_path))
         devices.extend(_nvidia_devices(encoders, ffmpeg_path=settings.ffmpeg_path))
@@ -301,6 +341,48 @@ class RenderWorkerRuntime:
         self._stop = threading.Event()
         self._active: dict[uuid.UUID, ActiveExecution] = {}
         self._active_lock = threading.Lock()
+        self._disabled_device_ids: set[str] = set()
+        self._device_cooldowns: dict[str, float] = {}
+        self._device_failures: dict[str, int] = {}
+        self._failed_devices_by_job: dict[uuid.UUID, set[str]] = {}
+
+    def _eligible_devices(self) -> list[RenderDevice]:
+        now = time.monotonic()
+        return [device for device in self.devices if device.id not in self._disabled_device_ids
+                and self._device_cooldowns.get(device.id, 0) <= now]
+
+    def _select_device_for_job(self, spec: RenderSpec) -> RenderDevice:
+        eligible = self._eligible_devices()
+        excluded = self._failed_devices_by_job.get(spec.render_job_id, set())
+        cfg = spec.request.get("render") if isinstance(spec.request.get("render"), dict) else {}
+        required = _codec_encoder_names(str(cfg.get("video_codec") or "av1"))
+        alternatives = [
+            device for device in eligible
+            if device.id not in excluded and (not required or bool(required & set(device.encoders)))
+        ]
+        # Avoid the same failed GPU when a compatible alternative is present.
+        return select_device(alternatives or eligible, self._active, spec)
+
+    def _quarantine_device(self, device: RenderDevice) -> None:
+        failures = self._device_failures.get(device.id, 0) + 1
+        self._device_failures[device.id] = failures
+        delay = min(DEVICE_COOLDOWN_MAX_SECONDS, DEVICE_COOLDOWN_SECONDS * 2 ** min(failures - 1, 3))
+        self._device_cooldowns[device.id] = time.monotonic() + delay
+        logger.warning("quarantining render device %s for %ss after encoder probe failure", device.id, delay)
+
+    def _device_encoder_broken(self, device: RenderDevice, spec: RenderSpec) -> bool:
+        if device.backend not in {"vaapi", "nvidia", "qsv"}:
+            return False
+        cfg = spec.request.get("render") if isinstance(spec.request.get("render"), dict) else {}
+        required = _codec_encoder_names(str(cfg.get("video_codec") or "av1"))
+        encoder = next((name for name in device.encoders if name in required), None)
+        if encoder is None:
+            return True
+        return not _hardware_encoder_available(
+            self.settings.ffmpeg_path, encoder,
+            backend="nvidia" if device.backend == "nvidia" else device.backend,
+            index=device.index, device_path=device.path,
+        )
 
     def _headers(self) -> dict[str, str]:
         if self.identity is None:
@@ -378,10 +460,16 @@ class RenderWorkerRuntime:
         for execution_id, item in active.items():
             execution_ids_by_device.setdefault(item.device.id, []).append(str(execution_id))
         device_payloads = [
-            device.payload(
-                active_jobs=len(execution_ids_by_device.get(device.id, [])),
-                execution_ids=execution_ids_by_device.get(device.id, []),
-            )
+            {
+                **device.payload(
+                    active_jobs=len(execution_ids_by_device.get(device.id, [])),
+                    execution_ids=execution_ids_by_device.get(device.id, []),
+                ),
+                "enabled": device.id not in self._disabled_device_ids,
+                "status": ("disabled" if device.id in self._disabled_device_ids else
+                           "cooldown" if self._device_cooldowns.get(device.id, 0) > time.monotonic() else
+                           "busy" if execution_ids_by_device.get(device.id) else "idle"),
+            }
             for device in self.devices
         ]
         self.resources = {**self.resources, "devices": device_payloads}
@@ -397,6 +485,12 @@ class RenderWorkerRuntime:
                 f"{self.api_base}/{self.identity.id}/heartbeat", headers=self._headers(), json=body
             )
             response.raise_for_status()
+            worker = response.json()
+            labels = worker.get("labels", {}) if isinstance(worker, dict) else {}
+            disabled = labels.get(DISABLED_DEVICE_LABEL, []) if isinstance(labels, dict) else []
+            if isinstance(disabled, list):
+                with self._active_lock:
+                    self._disabled_device_ids = {str(item) for item in disabled if isinstance(item, str)}
 
     def _claim(self) -> ClaimResponse:
         assert self.identity is not None
@@ -404,8 +498,9 @@ class RenderWorkerRuntime:
             # The coordinator is the single source of truth for node-wide
             # concurrency. A GPU can run multiple FFmpeg jobs; locally we only
             # advertise whether another compatible job can be accepted.
-            available = 1 if self.devices else 0
-            available_encoders = sorted({encoder for device in self.devices for encoder in device.encoders})
+            eligible = self._eligible_devices()
+            available = 1 if eligible else 0
+            available_encoders = sorted({encoder for device in eligible for encoder in device.encoders})
         if available <= 0:
             return ClaimResponse()
         with httpx.Client(timeout=self.settings.request_timeout_seconds) as client:
@@ -663,6 +758,8 @@ class RenderWorkerRuntime:
                     "output": {"sha256": sha256_file(output), "size_bytes": output.stat().st_size},
                 },
             )
+            with self._active_lock:
+                self._failed_devices_by_job.pop(spec.render_job_id, None)
         except Exception as exc:
             if cancel_event.is_set():
                 logger.warning(
@@ -673,8 +770,18 @@ class RenderWorkerRuntime:
             else:
                 logger.exception("render execution failed: %s", execution_id)
             try:
+                if isinstance(exc, subprocess.CalledProcessError):
+                    with self._active_lock:
+                        if len(self._failed_devices_by_job) > 512:
+                            self._failed_devices_by_job.pop(next(iter(self._failed_devices_by_job)))
+                        self._failed_devices_by_job.setdefault(spec.render_job_id, set()).add(device.id)
+                    if self._device_encoder_broken(device, spec):
+                        with self._active_lock:
+                            self._quarantine_device(device)
+                # The coordinator imposes a global attempt limit on retryable errors.
+                retryable = not isinstance(exc, (ValueError, FileNotFoundError, NotImplementedError))
                 self._execution_post(
-                    execution_id, "fail", {"fence_token": fence, "error": str(exc)[:8192], "retryable": True}
+                    execution_id, "fail", {"fence_token": fence, "error": str(exc)[:8192], "retryable": retryable}
                 )
             except httpx.HTTPStatusError as report_exc:
                 if report_exc.response.status_code not in {409, 410}:
@@ -703,7 +810,7 @@ class RenderWorkerRuntime:
                 claim = self._claim()
                 if claim.execution is not None and claim.render_spec is not None:
                     with self._active_lock:
-                        device = select_device(self.devices, self._active, claim.render_spec)
+                        device = self._select_device_for_job(claim.render_spec)
                         thread = threading.Thread(
                             target=self._run_execution,
                             args=(claim, device),
