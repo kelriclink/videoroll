@@ -134,3 +134,16 @@ def test_no_existing_season_when_success_response_has_null_season() -> None:
     )
     assert result["ok"] is True
     client.add_to_season.assert_called_once()
+
+
+def test_author_season_cover_uses_existing_bilibili_cover_without_channel_fetch() -> None:
+    import uuid
+    from videoroll.apps.bilibili_publisher.worker import _pick_youtube_collection_cover
+    cover = "https://archive.biliimg.com/bfs/archive/cover.jpg"
+    result, metadata = _pick_youtube_collection_cover(
+        task_id=uuid.uuid4(),
+        info={"uploader": "Example Creator", "channel_url": "https://www.youtube.com/@example"},
+        fallback_cover_url=cover,
+    )
+    assert result == cover
+    assert metadata == {"source": "video_cover"}

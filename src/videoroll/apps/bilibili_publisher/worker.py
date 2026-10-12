@@ -24,7 +24,6 @@ from celery.exceptions import Retry
 
 from videoroll.apps.bilibili_publisher.bilibili_web_client import BilibiliDescTooLongError, BilibiliRateLimitError, BilibiliWebClient
 from videoroll.apps.bilibili_publisher.constants import BILIBILI_DESC_RETRY_MAX_CHARS
-from videoroll.apps.orchestrator_api.youtube_downloader import extract_youtube_channel_info, pick_thumbnail_url
 from videoroll.apps.bilibili_publisher.schemas import BilibiliPublishMeta
 from videoroll.apps.bilibili_publisher.storage_keys import unique_publish_result_key
 from videoroll.apps.bilibili_publisher.typeid_recommender import flatten_typelist
@@ -197,17 +196,13 @@ def _pick_youtube_collection_cover(
     info: dict[str, Any],
     fallback_cover_url: str,
 ) -> tuple[str, dict[str, Any]]:
-    """Perform all remote channel-cover lookups without holding a DB session."""
-    channel_url = _youtube_channel_url_from_info(info)
-    if channel_url:
-        try:
-            channel_info = extract_youtube_channel_info(channel_url, get_subtitle_settings())
-            art_url = str(pick_thumbnail_url(channel_info) or "").strip()
-            if art_url:
-                return art_url, {"source": "youtube_channel", "channel_url": channel_url}
-        except Exception as e:
-            logger.warning("failed to extract youtube channel art (task_id=%s): %s", task_id, e)
+    """Prefer the cover already uploaded to Bilibili.
 
+    Fetching an entire YouTube channel with yt-dlp solely for artwork can block
+    season creation for minutes and is not required by Bilibili's season API.
+    The source uploader identity is still derived from downloaded video
+    metadata. This removes slow external I/O from the collection critical path.
+    """
     fallback = str(fallback_cover_url or "").strip()
     if fallback:
         return fallback, {"source": "video_cover"}
