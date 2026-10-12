@@ -187,3 +187,11 @@ def test_in_place_recovery_can_preserve_file_metadata() -> None:
     recovery = (ROOT / "scripts/native/db_only_recovery.py").read_text(encoding="utf-8")
     assert "--preserve-files" in recovery
     assert "if preserve_files:" in recovery
+
+
+def test_native_celery_worker_names_are_unique_across_queues() -> None:
+    core=(ROOT/"scripts/native/run-role.sh").read_text()
+    social=(ROOT/"scripts/native/run-social-role.sh").read_text()
+    for name in ("subtitle-control@%h", "bilibili-publish@%h"):
+        assert f'-n "{name}"' in core
+    assert '-n "social-publish@%h"' in social

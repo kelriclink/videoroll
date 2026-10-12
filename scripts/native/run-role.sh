@@ -58,12 +58,12 @@ case "$role" in
   subtitle-control-worker)
     export DEPLOYMENT_ROLE=subtitle-control-worker
     preflight "$SUBTITLE_VENV/bin/python" subtitle-control-worker
-    exec "$SUBTITLE_VENV/bin/celery" -A videoroll.apps.subtitle_service.worker:celery_app worker -Q subtitle-control -l INFO --concurrency 1
+    exec "$SUBTITLE_VENV/bin/celery" -A videoroll.apps.subtitle_service.worker:celery_app worker -n "subtitle-control@%h" -Q subtitle-control -l INFO --concurrency 1
     ;;
   publish-worker)
     export DEPLOYMENT_ROLE=publish-worker
     preflight "$CORE_VENV/bin/python" publish-worker
-    exec "$CORE_VENV/bin/celery" -A videoroll.apps.bilibili_publisher.worker:celery_app worker -Q publish -l INFO --concurrency "${CELERY_PUB_CONCURRENCY:-1}"
+    exec "$CORE_VENV/bin/celery" -A videoroll.apps.bilibili_publisher.worker:celery_app worker -n "bilibili-publish@%h" -Q publish -l INFO --concurrency "${CELERY_PUB_CONCURRENCY:-1}"
     ;;
   outbox-dispatcher)
     export DEPLOYMENT_ROLE=outbox-dispatcher

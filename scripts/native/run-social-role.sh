@@ -75,7 +75,7 @@ case "$role" in
     export DEPLOYMENT_ROLE=social-publisher-worker
     "$VENV/bin/python" -m videoroll.deployment
     start_display_stack :100 5910 5911 6081
-    exec "$VENV/bin/celery" -A videoroll.apps.social_publisher.worker:celery_app       worker -Q social_publish -l INFO --concurrency "${SOCIAL_PUBLISH_CONCURRENCY:-1}"
+    exec "$VENV/bin/celery" -A videoroll.apps.social_publisher.worker:celery_app       worker -n "social-publish@%h" -Q social_publish -l INFO --concurrency "${SOCIAL_PUBLISH_CONCURRENCY:-1}"
     ;;
   scheduler)
     export DEPLOYMENT_ROLE=social-publisher-scheduler
