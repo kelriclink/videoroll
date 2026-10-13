@@ -68,6 +68,8 @@ class AssetKind(str, enum.Enum):
     subtitle_srt = "subtitle_srt"
     subtitle_ass = "subtitle_ass"
     video_final = "video_final"
+    dubbing_audio = "dubbing_audio"
+    video_dubbed = "video_dubbed"
     cover_image = "cover_image"
     log = "log"
     publish_result = "publish_result"
@@ -503,6 +505,32 @@ class SubtitleJob(Base):
         Index("ix_subtitle_jobs_status_created_at", "status", "created_at"),
         Index("ix_subtitle_jobs_status_lease_until", "status", "lease_until", "created_at"),
         Index("ix_subtitle_jobs_operation_key", "operation_key"),
+    )
+
+
+class DubbingJob(Base):
+    """Durable, independent TTS job; does not take over the subtitle lease."""
+    __tablename__ = "dubbing_jobs"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    task_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("tasks.id", ondelete="CASCADE"), nullable=False)
+    subtitle_job_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), ForeignKey("subtitle_jobs.id", ondelete="SET NULL"))
+    status: Mapped[str] = mapped_column(String(24), nullable=False, default="queued")
+    progress: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    request_json: Mapped[dict[str, Any]] = mapped_column(JSON_PAYLOAD, nullable=False, default=dict)
+    output_json: Mapped[dict[str, Any]] = mapped_column(JSON_PAYLOAD, nullable=False, default=dict)
+    error_message: Mapped[Optional[str]] = mapped_column(Text)
+    lease_owner: Mapped[Optional[str]] = mapped_column(String(128))
+    lease_until: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    heartbeat_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    operation_key: Mapped[Optional[str]] = mapped_column(String(255))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("task_id", "operation_key", name="uq_dubbing_jobs_task_operation"),
+        Index("ix_dubbing_jobs_status_lease", "status", "lease_until", "created_at"),
+        Index("ix_dubbing_jobs_task_created", "task_id", "created_at"),
     )
 
 

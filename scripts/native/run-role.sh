@@ -7,6 +7,7 @@ CORE_VENV="${VIDEOROLL_CORE_VENV:-/opt/videoroll/venvs/core}"
 SUBTITLE_VENV="${VIDEOROLL_SUBTITLE_VENV:-/opt/videoroll/venvs/subtitle}"
 WORKFLOW_VENV="${VIDEOROLL_WORKFLOW_VENV:-/opt/videoroll/venvs/workflow}"
 SUBTITLE_WORKFLOW_VENV="${VIDEOROLL_SUBTITLE_WORKFLOW_VENV:-/opt/videoroll/venvs/subtitle-workflow}"
+DUBBING_VENV="${VIDEOROLL_DUBBING_VENV:-/opt/videoroll/venvs/dubbing}"
 
 export PYTHONUNBUFFERED=1
 export PYTHONDONTWRITEBYTECODE=1
@@ -54,6 +55,11 @@ case "$role" in
     export DEPLOYMENT_ROLE=subtitle-workflow-worker
     preflight "$SUBTITLE_WORKFLOW_VENV/bin/python" subtitle-workflow-worker
     exec "$SUBTITLE_WORKFLOW_VENV/bin/python" -m videoroll.workflows.subtitle_worker
+    ;;
+  dubbing-workflow-worker)
+    export DEPLOYMENT_ROLE=dubbing-workflow-worker
+    preflight "$DUBBING_VENV/bin/python" dubbing-workflow-worker
+    exec "$DUBBING_VENV/bin/python" -m videoroll.workflows.dubbing_worker
     ;;
   subtitle-control-worker)
     export DEPLOYMENT_ROLE=subtitle-control-worker

@@ -12,6 +12,7 @@ from pydantic import BaseModel
 
 from videoroll.workflows.auth import INTERNAL_TOKEN_HEADER, internal_service_token
 from videoroll.workflows.client import create_hatchet_client
+from videoroll.workflows.dubbing_job import DubbingJobWorkflowInput, register_dubbing_job_task
 from videoroll.workflows.settings import WorkflowRuntimeSettings
 from videoroll.workflows.video_pipeline import (
     AutoYouTubeWorkflowInput,
@@ -29,6 +30,12 @@ class AutoYouTubeLaunchRequest(BaseModel):
 
 
 class SubtitleJobLaunchRequest(BaseModel):
+    job_id: str
+    priority: int = 0
+    dispatch_key: str | None = None
+
+
+class DubbingJobLaunchRequest(BaseModel):
     job_id: str
     priority: int = 0
     dispatch_key: str | None = None
@@ -69,6 +76,11 @@ def _video_pipeline() -> Any:
 @lru_cache(maxsize=1)
 def _subtitle_job_task() -> Any:
     return register_subtitle_job_task(_hatchet())
+
+
+@lru_cache(maxsize=1)
+def _dubbing_job_task() -> Any:
+    return register_dubbing_job_task(_hatchet())
 
 
 def _require_internal(x_videoroll_internal_token: str | None = Header(default=None, alias=INTERNAL_TOKEN_HEADER)) -> None:
@@ -131,6 +143,23 @@ def create_app() -> FastAPI:
             workflow_run_id = str(exc.existing_run_external_id or "").strip()
         if not workflow_run_id:
             raise HTTPException(status_code=502, detail="Hatchet did not return a workflow run id")
+        return WorkflowLaunchResponse(workflow_run_id=workflow_run_id)
+
+    @app.post("/runs/dubbing-job", response_model=WorkflowLaunchResponse, dependencies=[Depends(_require_internal)])
+    async def launch_dubbing_job(payload: DubbingJobLaunchRequest) -> WorkflowLaunchResponse:
+        dispatch_key = payload.dispatch_key or f"{payload.job_id}:{uuid.uuid4().hex}"
+        try:
+            ref = await _dubbing_job_task().aio_run(
+                DubbingJobWorkflowInput(job_id=payload.job_id, dispatch_key=dispatch_key),
+                wait_for_result=False,
+                additional_metadata={"videoroll_dubbing_job_id": payload.job_id},
+                priority=_hatchet_priority(payload.priority),
+            )
+            workflow_run_id = str(getattr(ref, "workflow_run_id", "") or "").strip()
+        except IdempotencyCollisionError as exc:
+            workflow_run_id = str(exc.existing_run_external_id or "").strip()
+        if not workflow_run_id:
+            raise HTTPException(status_code=502, detail="Hatchet did not return a dubbing workflow run id")
         return WorkflowLaunchResponse(workflow_run_id=workflow_run_id)
 
     @app.post("/runs/{run_id}/cancel", dependencies=[Depends(_require_internal)])

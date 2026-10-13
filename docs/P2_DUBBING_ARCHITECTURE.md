@@ -2,6 +2,61 @@
 
 状态：**开发中，独立分支 `feature/dubbing-multipart`**。本阶段禁止直接部署生产。
 
+## 第二批实现进展（开发分支，未部署）
+
+本次新增了以下可执行模块：
+
+- `migrations/versions/0011_dubbing_jobs.py` / `DubbingJob`：持久化任务、独立 lease、进度、失败与断点续跑。新增 `dubbing_audio` 和 `video_dubbed` 资产枚举；字幕渲染成品仍使用 `video_final`。
+- `apps/dubbing/qwen_tts.py`：延迟加载官方 `Qwen3TTSModel.generate_custom_voice`，支持 `0.6B/1.7B CustomVoice` 的中文固定音色。Tesla V100 使用 FP16 + SDPA，**尚未实机验证模型能否成功加载和语音质量**。
+- `apps/dubbing/pipeline.py`：消费最终中文 JSON，保留独立 `speech_text`；以文本、模型和音色哈希缓存单句语音，失败重启不强制全部重合成。
+- `apps/dubbing/audio.py`：逐段 PCM 重采样、调整语速、静音补齐，流式生成完整音轨，按原视频的时间轴封装，不将长音频全部读入内存。
+- `apps/dubbing/job.py`：状态更新/租约/续跑、音轨和 P2 的独立资产写入；模型推理前提交并关闭事务，减少 PostgreSQL idle-in-transaction 故障。
+- `workflows/dubbing_job.py`、`dubbing_worker.py`：专用 `dubbing` Hatchet Worker pool，保持模型与字幕、渲染节点隔离。运行前需要独立的 Python 虚拟环境。
+- Orchestrator 的 `POST /tasks/{task_id}/actions/dubbing` 和 `GET /tasks/{task_id}/dubbing_jobs`，可创建、查询配音任务；只有源翻译完成且 P1 视频资产存在才能创建任务。
+- Bilibili 投稿处理检查分 P 资产归属及成功的 P2 DubbingJob，防止提交了无效或其他任务的视频。
+- 发布清理进程保留中文音轨和 P2 视频，并在配音运行中暂停清理。
+
+### 手动接口示例
+
+在 Orchestrator 已认证 API 上提交任务（**前提：P1 已渲染并且有对应成功的 subtitle_job**）：
+
+```json
+{
+  "subtitle_job_id": "<成功的 SubtitleJob UUID>",
+  "subtitle_video_key": "<当前任务已保存的 P1 视频存储键>",
+  "operation_key": "p2:initial",
+  "voice": "Vivian",
+  "model_path": "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
+  "retain_original_audio": false
+}
+```
+
+GET 查询 `/tasks/{task_id}/dubbing_jobs`。配音成功后返回 `output.audio_key` 与 `output.video_key`，下载使用已有的 Task Asset API，而不是传生产机绝对路径。
+
+发布时经既有多平台发布接口向 Bilibili 传入两个分 P（先验证两个资产已生成）。当未显式传入 `video_parts` 时，不改变原单 P 流程。
+
+### Native Worker 运行前置
+
+新增角色 `videoroll@dubbing-workflow-worker.service` 对应脚本角色 `dubbing-workflow-worker`；为避免安装额外 GPU 依赖影响现有服务，**它不会被 videoroll.target 自动启用**。独立 Python 3.12 环境推荐置于 `/opt/videoroll/venvs/dubbing`，其中必须安装 VideoRoll 本体、Hatchet SDK、PyTorch、`qwen-tts`、`soundfile` 等；FFmpeg/ffprobe 需要能执行。模型需要由服务账户读取，工作盘和 `STORAGE_ROOT` 应可写。在 V100 上先测试单句生成/峰值显存，再开启任何后台 Worker。
+
+### 尚未完成（绝不可声称完整上线）
+
+1. **自动模式**：自动生成 DubbingJob、等待双产物全部完成、原有 after-render 发布改为单 BV 双分 P；当前仅提供显式任务入口。
+2. **前端**：自动设置页的中配开关、音色配置、任务详情试听/重新生成、双文件下载按钮。
+3. **真实 Qwen 推理**：尚未在目标 V100 完成模型安装、FP16/SDPA 兼容性或长视频速度验证。
+4. **人声分离**：基础混音只降低整条原音轨，不能只保留环境声；Demucs 尚未开发。
+5. **重放与恢复**：离线缓存/DB 幂等已经测试，Hatchet 中断/机器关机恢复以及真实 B 站分 P 投稿仍需端到端测试。
+6. **发布安全**：启用双分 P 前必须确保自动发布不会提前提交 P1；现阶段不要为生产任务自动开启中配。
+
+### 测试
+
+- SQLite DubbingJob 从创建、生成完整音轨/P2、写资产、二次调用不重新执行 TTS 的离线端到端测试。
+- FFmpeg 原视频和生成 P2 的视频编码、音频格式、总时长测试。
+- 配音时间槽、超时拒绝、音频拼接静音、哈希缓存测试。
+- Bilibili 两分 P 提交顺序、CID 不重复、单稿一次请求及既有投稿行为的回归测试。
+
+
+
 ## 目标与约束
 
 每个翻译任务只执行一次下载、ASR、术语检索和中文翻译，最终产出：

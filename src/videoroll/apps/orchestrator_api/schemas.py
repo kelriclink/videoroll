@@ -212,6 +212,18 @@ class TaskPublishReviewRead(BaseModel):
     checked_at: Optional[str] = None
 
 
+class DubbingActionRequest(BaseModel):
+    subtitle_job_id: uuid.UUID
+    subtitle_video_key: str = Field(min_length=1, max_length=2048)
+    operation_key: str = Field(default="p2:initial", min_length=1, max_length=255)
+    voice: Literal["Vivian", "Serena", "Uncle_Fu", "Dylan", "Eric"] = "Vivian"
+    model_path: Literal[
+        "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
+        "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
+    ] = "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"
+    retain_original_audio: bool = False
+
+
 class RemoteJobResponse(BaseModel):
     job_id: uuid.UUID
     status: str

@@ -9,12 +9,13 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from videoroll.apps.orchestrator_api.infrastructure.internal_http import internal_http_headers
 from videoroll.config import OrchestratorSettings
-from videoroll.db.models import PipelineRun, SubtitleJob, Task
+from videoroll.db.models import DubbingJob, PipelineRun, SubtitleJob, Task
 from videoroll.db.session import get_sessionmaker
 
 
 AUTO_YOUTUBE_WORKFLOW_NAME = "VideoPipelineV1"
 SUBTITLE_JOB_WORKFLOW_NAME = "SubtitleJobV1"
+DUBBING_JOB_WORKFLOW_NAME = "DubbingJobV1"
 
 
 @dataclass(frozen=True)
@@ -152,6 +153,56 @@ class PipelineLauncher:
                 workflow_name=SUBTITLE_JOB_WORKFLOW_NAME,
                 external_run_id=external_run_id,
             )
+        finally:
+            db.close()
+
+    def launch_dubbing_job(self, job_id: uuid.UUID, *, dispatch_key: str | None = None) -> PipelineLaunchResult:
+        db = self.session_factory()
+        run_id = uuid.uuid4()
+        try:
+            job = db.get(DubbingJob, job_id)
+            if job is None:
+                raise ValueError(f"dubbing job not found: {job_id}")
+            task = db.get(Task, job.task_id)
+            if task is None:
+                raise ValueError(f"task not found for dubbing job: {job.task_id}")
+            request = {
+                "job_id": str(job_id), "priority": int(task.priority or 0),
+                "dispatch_key": dispatch_key or f"{job_id}:{uuid.uuid4().hex}",
+            }
+            run = PipelineRun(
+                id=run_id, task_id=job.task_id, engine="hatchet",
+                workflow_name=DUBBING_JOB_WORKFLOW_NAME, state="submitting",
+                request_json=request,
+            )
+            db.add(run)
+            db.commit()
+            try:
+                with httpx.Client(timeout=20.0, headers=internal_http_headers(self.settings)) as client:
+                    response = client.post(
+                        f"{self.settings.workflow_service_url.rstrip('/')}/runs/dubbing-job",
+                        json=request,
+                    )
+                    response.raise_for_status()
+                    external_run_id = str(response.json().get("workflow_run_id") or "").strip()
+                if not external_run_id:
+                    raise RuntimeError("workflow service returned no dubbing run id")
+            except Exception as exc:
+                db.rollback()
+                failed = db.get(PipelineRun, run_id)
+                if failed is not None:
+                    failed.state = "launch_failed"
+                    failed.error_message = f"{type(exc).__name__}: {exc}"[:2000]
+                    failed.finished_at = datetime.now(timezone.utc)
+                    db.commit()
+                raise
+            persisted = db.get(PipelineRun, run_id)
+            if persisted is None:
+                raise RuntimeError("dubbing pipeline run vanished")
+            persisted.external_run_id = external_run_id
+            persisted.state = "submitted"
+            db.commit()
+            return PipelineLaunchResult(run_id, DUBBING_JOB_WORKFLOW_NAME, external_run_id)
         finally:
             db.close()
 
