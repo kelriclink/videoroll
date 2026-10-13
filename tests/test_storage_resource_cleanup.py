@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from videoroll.apps.orchestrator_api.services import maintenance_service
 from videoroll.db.base import Base
-from videoroll.db.models import AppSetting, Asset, AssetKind, PublishJob, PublishState, SourceLicense, SourceType, Subtitle, SubtitleFormat, Task, TaskStatus
+from videoroll.db.models import AppSetting, Asset, AssetKind, DubbingJob, PublishJob, PublishState, SourceLicense, SourceType, Subtitle, SubtitleFormat, SubtitleJob, Task, TaskStatus
 
 
 @compiles(JSONB, "sqlite")
@@ -71,7 +71,7 @@ def db() -> Session:
     engine = create_engine("sqlite:///:memory:")
     Base.metadata.create_all(
         engine,
-        tables=[AppSetting.__table__, Task.__table__, Asset.__table__, Subtitle.__table__, PublishJob.__table__],
+        tables=[AppSetting.__table__, Task.__table__, Asset.__table__, Subtitle.__table__, SubtitleJob.__table__, DubbingJob.__table__, PublishJob.__table__],
     )
     session = sessionmaker(bind=engine)()
     try:
@@ -80,7 +80,7 @@ def db() -> Session:
         session.close()
         Base.metadata.drop_all(
             engine,
-            tables=[PublishJob.__table__, Subtitle.__table__, Asset.__table__, Task.__table__, AppSetting.__table__],
+            tables=[DubbingJob.__table__, SubtitleJob.__table__, PublishJob.__table__, Subtitle.__table__, Asset.__table__, Task.__table__, AppSetting.__table__],
         )
 
 
@@ -199,6 +199,39 @@ def test_cleanup_terminal_resources_deletes_orphans_but_preserves_task_history_a
     assert paused_key not in fake_s3.deleted
     assert db.query(Task).count() == 3
     assert db.query(Asset).filter(Asset.task_id == paused.id).count() == 1
+
+
+def test_periodic_cleanup_defers_published_assets_while_dubbing_queued(db: Session) -> None:
+    now = datetime(2026, 7, 15, 12, tzinfo=timezone.utc)
+    published = _task(TaskStatus.published)
+    published.updated_at = now - timedelta(days=2)
+    db.add(published)
+    db.flush()
+    raw_key = f"raw/{published.id}/original.webm"
+    cached_tts = f"dub/{published.id}/tts/fragment.wav"
+    db.add(Asset(task_id=published.id, kind=AssetKind.video_raw, storage_key=raw_key))
+    job = DubbingJob(task_id=published.id, status="queued", request_json={}, output_json={})
+    db.add(job)
+    db.commit()
+
+    fake_s3 = _FakeS3({raw_key, cached_tts})
+    with patch.object(maintenance_service, "FileStore", return_value=fake_s3):
+        result = maintenance_service.cleanup_terminal_task_resources(
+            MagicMock(), db, published_older_than_days=1,
+            failed_older_than_hours=None, owner_prefix="test", now=now,
+        )
+    assert result is not None and result.matched_tasks == 0
+    assert raw_key in fake_s3.keys and cached_tts in fake_s3.keys
+
+    job.status = "succeeded"
+    db.commit()
+    with patch.object(maintenance_service, "FileStore", return_value=fake_s3):
+        result = maintenance_service.cleanup_terminal_task_resources(
+            MagicMock(), db, published_older_than_days=1,
+            failed_older_than_hours=None, owner_prefix="test", now=now,
+        )
+    assert result is not None and result.matched_tasks == 1
+    assert raw_key not in fake_s3.keys and cached_tts not in fake_s3.keys
 
 
 def test_scheduled_cleanup_waits_48_hours_after_failure_even_when_published_retention_is_disabled(db: Session) -> None:

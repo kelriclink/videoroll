@@ -57,17 +57,18 @@ export function TaskDetailDubbing({
   const [error, setError] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
 
-  const p1Assets = useMemo(
-    () => (assets ?? []).filter((item) => item.kind === "video_final"),
+  const sourceVideos = useMemo(
+    () => (assets ?? []).filter((item) => item.kind === "video_final" || item.kind === "video_raw")
+      .sort((a, b) => Number(b.kind === "video_final") - Number(a.kind === "video_final")),
     [assets],
   );
   const finishedSubtitles = useMemo(
     () => (subtitleJobs ?? []).filter((item) => item.status === "succeeded"),
     [subtitleJobs],
   );
-  const selectedP1 = p1Assets.some((item) => item.storage_key === videoKey)
+  const selectedVideo = sourceVideos.some((item) => item.storage_key === videoKey)
     ? videoKey
-    : p1Assets[0]?.storage_key ?? "";
+    : sourceVideos[0]?.storage_key ?? "";
   const selectedSubtitle = finishedSubtitles.some((item) => item.id === subtitleJobId)
     ? subtitleJobId
     : finishedSubtitles[0]?.id ?? "";
@@ -106,8 +107,8 @@ export function TaskDetailDubbing({
   }, [taskId]);
 
   const running = jobs.some((job) => RUNNING.has(job.status));
-  const canGenerate = Boolean(installedModels.includes(modelPath) && selectedP1 && selectedSubtitle && task?.status !== "CANCELED"
-    && task?.status !== "PUBLISHED" && !running && !submitting);
+  const canGenerate = Boolean(installedModels.includes(modelPath) && selectedVideo && selectedSubtitle && task?.status !== "CANCELED"
+    && !running && !submitting);
 
   async function submitJob(request: {
     subtitle_job_id: string;
@@ -157,8 +158,8 @@ export function TaskDetailDubbing({
     <section className="rounded border bg-white p-4" aria-label="中文配音">
       <div className="text-base font-semibold text-slate-900">中文配音 · 手动模式</div>
       <p className="mt-1 text-sm text-slate-600">
-        复用已经生成的中文翻译与 P1 中文字幕视频。配音结束后提供独立中文音轨和 P2 MP4；
-        此操作不会自动投稿，也不会修改 P1。
+        中文字幕任务完成后即可手动配音，无须等待 P1 渲染。可以选择原视频或已完成的 P1；
+        生成独立中文音轨和配音 MP4，后续渲染、分 P 和投稿由你自行操作，不会自动投稿。
       </p>
       <p className="mt-2 text-xs text-slate-600">模型未下载？<Link className="text-sky-700 underline" to="/settings/dubbing">前往中文配音模型管理</Link>，先下载并配置默认推理模型。</p>
       <div className="mt-4 grid gap-3 md:grid-cols-2">
@@ -173,13 +174,13 @@ export function TaskDetailDubbing({
           </select>
         </label>
         <label className="text-sm text-slate-700">
-          P1 中文字幕视频
-          <select className="mt-1 w-full rounded border p-2" value={selectedP1}
+          配音源视频（原视频 / P1）
+          <select className="mt-1 w-full rounded border p-2" value={selectedVideo}
             onChange={(e) => setVideoKey(e.target.value)} disabled={running || submitting}>
-            {p1Assets.length === 0 ? <option value="">等待 P1 渲染完成</option> : null}
-            {p1Assets.map((item) => (
+            {sourceVideos.length === 0 ? <option value="">尚未找到可用的原视频或 P1</option> : null}
+            {sourceVideos.map((item) => (
               <option value={item.storage_key} key={item.id}>
-                {item.storage_key.split("/").pop()}
+                {item.kind === "video_raw" ? "原视频" : "P1 中文字幕"} · {item.storage_key.split("/").pop()}
               </option>
             ))}
           </select>
@@ -209,7 +210,7 @@ export function TaskDetailDubbing({
           disabled={!canGenerate}
           onClick={() => void submitJob({
             subtitle_job_id: selectedSubtitle,
-            subtitle_video_key: selectedP1,
+            subtitle_video_key: selectedVideo,
             operation_key: `p2:manual:${Date.now()}`,
             voice, model_path: modelPath, retain_original_audio: mixOriginal,
           })}>
@@ -222,7 +223,7 @@ export function TaskDetailDubbing({
       </div>
       {!canGenerate && !running && !submitting ? (
         <p className="mt-2 text-xs text-amber-700">
-          必须先完成中文字幕任务和 P1 渲染；已发布或已停止的任务不能直接创建新配音。
+          需要已完成的中文字幕任务、仍保留的原视频或 P1，以及已下载的 TTS 模型；已取消的任务不可启动。
         </p>
       ) : null}
       {message ? <p className="mt-2 text-sm text-emerald-700">{message}</p> : null}

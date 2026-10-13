@@ -56,7 +56,7 @@ def create_dubbing_job(
     model_path: str = "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
     retain_original_audio: bool = False,
 ) -> DubbingJob:
-    """Record a request bound to existing P1 and subtitle artifacts."""
+    """Create a manual dubbing job from translated subtitles and raw or P1 video."""
     existing = db.query(DubbingJob).filter(
         DubbingJob.task_id == task_id, DubbingJob.operation_key == operation_key,
     ).first()
@@ -71,12 +71,12 @@ def create_dubbing_job(
     segments_key = str((subtitle_job.request_json or {}).get("artifacts", {}).get("final_subtitle_segments_key") or "").strip()
     if not segments_key or subtitle_job.status.value != "succeeded":
         raise ValueError("translated subtitles have not finished")
-    p1 = db.query(Asset).filter(
+    video_asset = db.query(Asset).filter(
         Asset.task_id == task_id, Asset.storage_key == subtitle_video_key,
-        Asset.kind == AssetKind.video_final,
+        Asset.kind.in_([AssetKind.video_raw, AssetKind.video_final]),
     ).first()
-    if p1 is None:
-        raise ValueError("P1 subtitle video asset not found")
+    if video_asset is None:
+        raise ValueError("source raw or P1 video asset not found")
     from videoroll.apps.dubbing.qwen_tts import CHINESE_SPEAKERS
     if voice not in CHINESE_SPEAKERS:
         raise ValueError(f"unsupported TTS voice: {voice}")
@@ -86,6 +86,7 @@ def create_dubbing_job(
         request_json={
             "source_segments_key": segments_key,
             "subtitle_video_key": subtitle_video_key,
+            "source_video_kind": video_asset.kind.value,
             "voice": voice, "model_path": model_path,
             "retain_original_audio": bool(retain_original_audio),
         },
@@ -234,7 +235,9 @@ def execute_dubbing_job(
             item.output_json = {
                 **dict(item.output_json or {}),
                 "audio_key": track_key, "video_key": video_output_key,
-                "subtitle_video_key": video_key, "duration": result.source_duration,
+                "source_video_key": video_key,
+                "subtitle_video_key": (video_key if request.get("source_video_kind", "video_final") == "video_final" else None),
+                "duration": result.source_duration,
                 "segments_total": result.segments_total,
             }
             item.progress = 100

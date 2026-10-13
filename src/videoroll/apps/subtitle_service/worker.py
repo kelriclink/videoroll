@@ -2271,6 +2271,14 @@ def _cleanup_task_impl(self: Any, task_id: str, batch_id: str | None = None) -> 
                 return {"status": "skipped", "detail": f"publish batch state is {batch.state}"}
             if task.status != TaskStatus.published:
                 return {"status": "skipped", "detail": f"task publish state is {task.status.value}"}
+            # Guard even legacy/early-dispatched Celery messages. The outbox
+            # normally schedules the cleanup for this deadline, but a broker
+            # message already delivered before an upgrade must not delete early.
+            from videoroll.apps.publish_lifecycle import current_publish_batches_for_task, publish_cleanup_due_at
+            current_batches = current_publish_batches_for_task(db, tid)
+            wait_seconds = (publish_cleanup_due_at(batch, current_batches) - datetime.now(timezone.utc)).total_seconds()
+            if wait_seconds > 0:
+                raise self.retry(countdown=max(1, int(wait_seconds) + 1))
         elif task.status != TaskStatus.published:
             return {"status": "skipped", "detail": f"task status is {task.status.value}"}
 
@@ -2302,7 +2310,7 @@ def _cleanup_task_impl(self: Any, task_id: str, batch_id: str | None = None) -> 
         )
         in_flight_dubbing = db.query(DubbingJob).filter(
             DubbingJob.task_id == tid,
-            DubbingJob.status.in_(["queued", "preparing", "synthesizing"]),
+            DubbingJob.status.in_(["queued", "preparing", "synthesizing", "aligning", "mixing"]),
         ).count()
         if in_flight_sub or in_flight_render or in_flight_dubbing:
             if batch_id:

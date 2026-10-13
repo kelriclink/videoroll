@@ -15,6 +15,7 @@ from videoroll.config import OrchestratorSettings
 from videoroll.db.models import (
     AppSetting,
     Asset,
+    DubbingJob,
     OperationInbox,
     PublishJob,
     PublishState,
@@ -36,7 +37,7 @@ STORAGE_RESOURCE_CLEANUP_LOCK_KEY = "orchestrator.storage_resource_cleanup"
 WORKDIR_RECENT_GRACE_SECONDS = int(os.getenv("WORKDIR_RECENT_GRACE_SECONDS", "900") or "900")
 WORKDIR_LOCK_TTL_SECONDS = int(os.getenv("WORKDIR_MAINTENANCE_LOCK_TTL_SECONDS", "900") or "900")
 STORAGE_RESOURCE_CLEANUP_LOCK_TTL_SECONDS = int(os.getenv("STORAGE_RESOURCE_CLEANUP_LOCK_TTL_SECONDS", "3600") or "3600")
-TASK_RESOURCE_PREFIXES = ("raw", "final", "sub", "work", "log", "meta")
+TASK_RESOURCE_PREFIXES = ("raw", "final", "sub", "work", "log", "meta", "dub")
 STORAGE_DELETE_BATCH_SIZE = 1000
 PUBLISHING_TIMEOUT_ERROR_CODE = "PUBLISHING_TIMEOUT"
 
@@ -298,6 +299,15 @@ def cleanup_terminal_task_resources(
             )
         )
         query = db.query(Task.id).filter(task_filter)
+        if not cleanup_all_terminal:
+            # A user may start manual TTS just before the 24h publication
+            # retention deadline. Do not delete raw/subtitle inputs while the
+            # corresponding durable dubbing job is still in flight.
+            active_dubbing = db.query(DubbingJob.id).filter(
+                DubbingJob.task_id == Task.id,
+                DubbingJob.status.in_(["queued", "preparing", "synthesizing", "aligning", "mixing"]),
+            ).exists()
+            query = query.filter(~active_dubbing)
         task_ids = {row[0] for row in query.all()}
         if not task_ids:
             return StorageResourceCleanupRead()

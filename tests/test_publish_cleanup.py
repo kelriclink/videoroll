@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import uuid
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -10,11 +11,33 @@ from videoroll.apps.subtitle_service.worker import cleanup_task
 from videoroll.db.models import PublishBatch, RenderJob, SubtitleJob, Task, TaskStatus
 
 
+def test_cleanup_cannot_delete_assets_within_first_24_hours() -> None:
+    task_id = uuid.uuid4()
+    batch_id = uuid.uuid4()
+    task = MagicMock(id=task_id, active_publish_batch_id=batch_id, status=TaskStatus.published)
+    batch = MagicMock(id=batch_id, task_id=task_id, state="succeeded",
+                      finished_at=datetime.now(timezone.utc) - timedelta(hours=2))
+    db = MagicMock()
+    db.get.side_effect = lambda model, _id, **_kwargs: task if model is Task else batch if model is PublishBatch else None
+    with (
+        patch("videoroll.apps.subtitle_service.worker._ensure_db"),
+        patch("videoroll.apps.subtitle_service.worker._db", return_value=db),
+        patch("videoroll.apps.subtitle_service.worker.FileStore") as store_cls,
+        patch.object(cleanup_task, "retry", side_effect=Retry()) as retry,
+    ):
+        store_cls.return_value.ensure_bucket.return_value = None
+        with pytest.raises(Retry):
+            cleanup_task.run(str(task_id), str(batch_id))
+    assert retry.call_args.kwargs["countdown"] > 21 * 3600
+    store_cls.return_value.delete_object.assert_not_called()
+
+
 def test_cleanup_retries_and_clears_marker_when_subtitle_work_is_in_flight() -> None:
     task_id = uuid.uuid4()
     batch_id = uuid.uuid4()
     task = MagicMock(id=task_id, active_publish_batch_id=batch_id, status=TaskStatus.published)
-    batch = MagicMock(id=batch_id, task_id=task_id, state="succeeded", cleanup_enqueued_at=MagicMock())
+    batch = MagicMock(id=batch_id, task_id=task_id, state="succeeded", cleanup_enqueued_at=MagicMock(),
+                      finished_at=datetime.now(timezone.utc) - timedelta(hours=25))
 
     publish_query = MagicMock()
     publish_query.filter.return_value.count.return_value = 0
@@ -22,10 +45,12 @@ def test_cleanup_retries_and_clears_marker_when_subtitle_work_is_in_flight() -> 
     subtitle_query.filter.return_value.count.return_value = 1
     render_query = MagicMock()
     render_query.filter.return_value.count.return_value = 0
+    dubbing_query = MagicMock()
+    dubbing_query.filter.return_value.count.return_value = 0
 
     db = MagicMock()
     db.get.side_effect = lambda model, _id, **_kwargs: task if model is Task else batch if model is PublishBatch else None
-    db.query.side_effect = [publish_query, subtitle_query, render_query]
+    db.query.side_effect = [publish_query, subtitle_query, render_query, dubbing_query]
 
     with (
         patch("videoroll.apps.subtitle_service.worker._ensure_db"),

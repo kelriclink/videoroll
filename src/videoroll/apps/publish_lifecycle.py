@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Any
 
@@ -10,6 +10,17 @@ from sqlalchemy.orm import Session
 
 from videoroll.apps.subtitle_service.queues import SUBTITLE_CONTROL_QUEUE
 from videoroll.db.models import Platform, PublishBatch, PublishJob, PublishState, Task, TaskStatus
+
+PUBLISH_CLEANUP_RETENTION = timedelta(hours=24)
+
+
+def publish_cleanup_due_at(batch: PublishBatch, current_batches: list[PublishBatch] | None = None) -> datetime:
+    """Wait 24h after the last completed target, not the first channel."""
+    finished_times = [row.finished_at for row in (current_batches or [batch]) if isinstance(row.finished_at, datetime)]
+    finished = max((value.replace(tzinfo=value.tzinfo or timezone.utc) for value in finished_times),
+                   default=datetime.now(timezone.utc))
+    return finished + PUBLISH_CLEANUP_RETENTION
+
 
 
 class PublishBatchState(str, Enum):
@@ -307,8 +318,9 @@ def _reconcile_locked_publish_batch(
     evaluation = evaluate_publish_batch(
         list(batch.expected_targets or []), latest_states, dict(batch.outcomes_json or {}),
     )
+    previous_state = batch.state
     batch.state = evaluation.batch_state.value
-    if evaluation.batch_state != PublishBatchState.active:
+    if evaluation.batch_state != PublishBatchState.active and (previous_state != batch.state or batch.finished_at is None):
         batch.finished_at = datetime.now(timezone.utc)
 
     db.add(batch)
@@ -365,6 +377,7 @@ def _reconcile_locked_publish_batch(
             task_name="subtitle_service.cleanup_task",
             args={"args": [str(task.id), str(batch.id)], "queue": SUBTITLE_CONTROL_QUEUE},
             operation_key=f"publish-cleanup:{batch.id}",
+            available_at=publish_cleanup_due_at(batch, current_batches),
         )
 
     return PublishBatchReconciliation(
@@ -486,6 +499,9 @@ def enqueue_publish_batch_cleanup(
         return False
     from videoroll.apps.outbox.service import create_outbox_event
 
+    batch = db.get(PublishBatch, batch_id)
+    if batch is None or batch.task_id != task_id or batch.state != PublishBatchState.succeeded.value:
+        return False
     event = create_outbox_event(
         db,
         event_type="publish.cleanup",
@@ -494,6 +510,7 @@ def enqueue_publish_batch_cleanup(
         task_name="subtitle_service.cleanup_task",
         args={"args": [str(task_id), str(batch_id)], "queue": SUBTITLE_CONTROL_QUEUE},
         operation_key=f"publish-cleanup:{batch_id}",
+        available_at=publish_cleanup_due_at(batch, current_publish_batches_for_task(db, task_id)),
     )
     db.commit()
     try:

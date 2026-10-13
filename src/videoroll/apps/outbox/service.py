@@ -40,6 +40,7 @@ def create_outbox_event(
     task_name: str,
     args: dict[str, Any],
     operation_key: str,
+    available_at: datetime | None = None,
 ) -> OutboxEvent:
     """Add one durable event to the caller's current domain transaction.
 
@@ -58,6 +59,14 @@ def create_outbox_event(
         .first()
     )
     if existing is not None:
+        # Allow a newly introduced hold to protect still-pending cleanup
+        # events without touching an already-dispatched broker operation.
+        if available_at is not None and existing.status in {"pending", "failed"}:
+            current = existing.available_at
+            if current is None or current.replace(tzinfo=current.tzinfo or timezone.utc) < available_at:
+                existing.available_at = available_at
+                db.add(existing)
+                db.flush()
         return existing
 
     now = utcnow()
@@ -69,7 +78,7 @@ def create_outbox_event(
         args_json=dict(args or {}),
         operation_key=key[:255],
         status="pending",
-        available_at=now,
+        available_at=available_at or now,
         attempt_count=0,
     )
     db.add(event)

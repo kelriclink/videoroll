@@ -64,6 +64,37 @@ def test_duplicate_operation_key_reuses_pending_outbox_event(db: Session) -> Non
     assert second is first
     assert db.query(OutboxEvent).count() == 1
 
+def test_scheduled_cleanup_stays_pending_until_24_hour_deadline(db: Session) -> None:
+    created = _pending_event(db, operation_key="publish-other")
+    finish = created.available_at
+    deadline = finish + timedelta(hours=24)
+    event = create_outbox_event(
+        db, event_type="publish.cleanup", aggregate_type="publish_batch",
+        aggregate_id="batch-1", task_name="subtitle_service.cleanup_task",
+        args={"args": ["task-1", "batch-1"], "queue": "subtitle-control"},
+        operation_key="publish-cleanup:batch-1", available_at=deadline,
+    )
+    db.flush()
+    due_early = claim_outbox_events(db, owner="first", limit=10, now=finish + timedelta(hours=23))
+    assert event not in due_early
+    assert event.status == "pending"
+    due_later = claim_outbox_events(db, owner="later", limit=10, now=deadline)
+    assert event in due_later
+
+
+def test_duplicate_pending_cleanup_can_push_its_deadline_forward(db: Session) -> None:
+    event = _pending_event(db, operation_key="publish-cleanup:same")
+    deadline = event.available_at + timedelta(hours=24)
+    same = create_outbox_event(
+        db, event_type="publish.cleanup", aggregate_type="publish_batch",
+        aggregate_id="same", task_name="subtitle_service.cleanup_task",
+        args={"args": ["task", "same"]},
+        operation_key="publish-cleanup:same", available_at=deadline,
+    )
+    assert same is event
+    assert event.available_at == deadline
+    assert db.query(OutboxEvent).count() == 1
+
 
 def test_expired_dispatch_lease_can_be_reclaimed(db: Session) -> None:
     event = _pending_event(db)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import uuid
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
 from videoroll.apps.publish_lifecycle import (
@@ -172,13 +173,15 @@ def test_cleanup_broker_failure_keeps_durable_dispatch_intent() -> None:
     db = MagicMock()
     celery_app = MagicMock()
     celery_app.send_task.side_effect = RuntimeError("broker unavailable")
+    finished = datetime(2026, 10, 14, 3, tzinfo=timezone.utc)
+    task_id = uuid.uuid4()
+    batch_id = uuid.uuid4()
+    db.get.return_value = MagicMock(task_id=task_id, state="succeeded", finished_at=finished)
 
     with (
         patch("videoroll.apps.publish_lifecycle.mark_publish_batch_cleanup_enqueued") as mark,
         patch("videoroll.apps.outbox.service.create_outbox_event", return_value=object()) as create_event,
     ):
-        task_id = uuid.uuid4()
-        batch_id = uuid.uuid4()
         assert enqueue_publish_batch_cleanup(db, celery_app, task_id, batch_id, needed=True) is True
 
     mark.assert_not_called()
@@ -187,6 +190,13 @@ def test_cleanup_broker_failure_keeps_durable_dispatch_intent() -> None:
         "args": [str(task_id), str(batch_id)],
         "queue": "subtitle-control",
     }
+    assert create_event.call_args.kwargs["available_at"] == finished + timedelta(hours=24)
+
+def test_publish_cleanup_waits_for_last_successful_channel() -> None:
+    from videoroll.apps.publish_lifecycle import publish_cleanup_due_at
+    first = MagicMock(finished_at=datetime(2026, 10, 13, 10, tzinfo=timezone.utc))
+    last = MagicMock(finished_at=datetime(2026, 10, 13, 13, tzinfo=timezone.utc))
+    assert publish_cleanup_due_at(first, [first, last]) == datetime(2026, 10, 14, 13, tzinfo=timezone.utc)
 
 
 def test_binding_unresolved_social_target_uses_current_batch_under_task_lock() -> None:
