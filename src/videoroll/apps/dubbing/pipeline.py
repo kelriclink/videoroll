@@ -8,10 +8,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import subprocess
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Protocol
+from typing import Any, Callable, Mapping, Protocol
 
 from videoroll.apps.dubbing.audio import assemble_track, wav_duration
 from videoroll.apps.dubbing.mux import build_dubbed_part_command
@@ -48,7 +50,9 @@ def probe_duration(path: Path, *, ffprobe: str = "ffprobe") -> float:
     return duration
 
 
-def spoken_segments_from_json(raw: Any, *, voice: str) -> list[SpokenSegment]:
+def spoken_segments_from_json(
+    raw: Any, *, voice: str, speech_overrides: Mapping[str, str] | None = None,
+) -> list[SpokenSegment]:
     if not isinstance(raw, list) or not raw:
         raise DubbingTimingError("translated segment JSON must be a nonempty list")
     output: list[SpokenSegment] = []
@@ -58,7 +62,8 @@ def spoken_segments_from_json(raw: Any, *, voice: str) -> list[SpokenSegment]:
         if not isinstance(item, dict):
             raise DubbingTimingError(f"segment {index}: invalid JSON")
         caption = str(item.get("text") or "").strip()
-        speech = str(item.get("speech_text") or caption).strip()
+        override = (speech_overrides or {}).get(str(index))
+        speech = str(override if override is not None else item.get("speech_text") or caption).strip()
         if not speech or not caption:
             raise DubbingTimingError(f"segment {index}: missing translated text")
         if len(speech) > 1000:
@@ -92,11 +97,14 @@ def generate_dubbed_media(
     retain_original_audio: bool = False,
     original_audio_present: bool = True,
     on_segment_done: Callable[[int, int, str, Path], None] | None = None,
+    speech_overrides: Mapping[str, str] | None = None,
+    on_stage: Callable[[str, int], None] | None = None,
 ) -> DubbingResult:
     """Synthesize/cache fragments, align them, mux P2; don't modify P1."""
     workspace.mkdir(parents=True, exist_ok=True)
     segments = spoken_segments_from_json(
-        json.loads(subtitle_json.read_text(encoding="utf-8")), voice=voice,
+        json.loads(subtitle_json.read_text(encoding="utf-8")),
+        voice=voice, speech_overrides=speech_overrides,
     )
     duration = probe_duration(subtitle_video, ffprobe=ffprobe)
     audio_files: dict[int, Path] = {}
@@ -107,7 +115,9 @@ def generate_dubbed_media(
         segment_file = workspace / "segments" / f"{key}.wav"
         if not segment_file.is_file() or segment_file.stat().st_size <= 44:
             segment_file.parent.mkdir(parents=True, exist_ok=True)
-            partial = segment_file.with_suffix(".pending.wav")
+            partial = segment_file.with_name(
+                f"{segment_file.stem}.{os.getpid()}.{uuid.uuid4().hex}.pending.wav"
+            )
             partial.unlink(missing_ok=True)
             try:
                 synthesizer.synthesize(item.speech_text, partial, voice=item.voice)
@@ -123,9 +133,13 @@ def generate_dubbed_media(
         if on_segment_done is not None:
             on_segment_done(n, len(segments), key, segment_file)
 
+    if on_stage is not None:
+        on_stage("aligning", 88)
     placements = plan_dubbing_timeline(
         segments, tts_durations, video_duration=duration,
     )
+    if on_stage is not None:
+        on_stage("mixing", 90)
     track = workspace / "chinese_audio.wav"
     assemble_track(placements, audio_files, track, video_duration=duration, ffmpeg_path=ffmpeg)
     p2 = workspace / "dubbed.mp4"

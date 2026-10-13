@@ -164,9 +164,12 @@ def list_task_dubbing_jobs(
         DubbingJob.task_id == task_id,
     ).order_by(DubbingJob.created_at.desc()).limit(50).all()
     return [
-        {"id": str(j.id), "task_id": str(j.task_id), "status": j.status,
-         "progress": j.progress, "error_message": j.error_message,
-         "output": j.output_json}
+        {"id": str(j.id), "task_id": str(j.task_id),
+         "subtitle_job_id": str(j.subtitle_job_id) if j.subtitle_job_id else None,
+         "status": j.status, "progress": j.progress,
+         "operation_key": j.operation_key, "request": j.request_json,
+         "error_message": j.error_message, "output": j.output_json,
+         "created_at": j.created_at.isoformat() if j.created_at else None}
         for j in jobs
     ]
 
@@ -199,6 +202,47 @@ def enqueue_dubbing_job(
                 status_code=502, detail=f"dubbing dispatch failed, persisted job={job.id}: {type(exc).__name__}",
             ) from exc
     return RemoteJobResponse(job_id=job.id, status=job.status)
+
+
+@router.post("/tasks/{task_id}/dubbing_jobs/{job_id}/retry", response_model=RemoteJobResponse)
+def retry_dubbing_job(
+    task_id: uuid.UUID,
+    job_id: uuid.UUID,
+    settings: OrchestratorSettings = Depends(get_settings),
+    db: Session = Depends(get_db),
+) -> RemoteJobResponse:
+    """Explicit operator recovery for failed or expired-lease dubbing runs."""
+    from videoroll.workflows.launcher import PipelineLauncher
+    from videoroll.apps.dubbing.job import lease_is_active
+
+    job = db.query(DubbingJob).filter(
+        DubbingJob.task_id == task_id, DubbingJob.id == job_id,
+    ).with_for_update().one_or_none()
+    if job is None:
+        raise HTTPException(404, "dubbing job not found")
+    task = db.get(Task, task_id)
+    if task is None or task.status == TaskStatus.canceled:
+        raise HTTPException(409, "task is stopped or missing")
+    if job.status in {"succeeded", "canceled"}:
+        raise HTTPException(409, "completed or canceled dubbing job cannot be retried")
+    if job.lease_owner and lease_is_active(job.lease_until):
+        raise HTTPException(409, "dubbing worker is still within its active lease")
+    if job.status not in {"queued", "failed", "preparing", "synthesizing", "aligning", "mixing"}:
+        raise HTTPException(409, f"dubbing job cannot be retried from {job.status}")
+    job.lease_owner = None
+    job.lease_until = None
+    job.status = "queued"
+    job.error_message = None
+    db.commit()
+    try:
+        PipelineLauncher(settings).launch_dubbing_job(
+            job.id, dispatch_key=f"{job.id}:manual-retry:{uuid.uuid4().hex}",
+        )
+    except Exception as exc:
+        raise HTTPException(
+            502, f"dubbing recovery dispatch failed; job still queued: {type(exc).__name__}",
+        ) from exc
+    return RemoteJobResponse(job_id=job.id, status="queued")
 
 
 @router.post("/tasks/{task_id}/actions/subtitle_retranslate", response_model=RemoteJobResponse)

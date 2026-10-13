@@ -1,5 +1,30 @@
 import type { PublishActionPayload } from "./types";
 
+export function buildBilibiliMultipartParts(
+  jobs: import("./types").DubbingJob[],
+  assets: import("./types").Asset[],
+  selectedP1Key = "",
+): Pick<PublishActionPayload, "video_key" | "video_parts"> {
+  const successful = jobs.find((job) => {
+    const p1 = job.output.subtitle_video_key;
+    const p2 = job.output.video_key;
+    return job.status === "succeeded" && Boolean(p1 && p2)
+      && (!selectedP1Key || p1 === selectedP1Key)
+      && assets.some((asset) => asset.kind === "video_final" && asset.storage_key === p1)
+      && assets.some((asset) => asset.kind === "video_dubbed" && asset.storage_key === p2);
+  });
+  if (!successful?.output.subtitle_video_key || !successful.output.video_key) {
+    throw new Error("找不到同一配音任务对应的 P1 和 P2 成品，请先完成中文配音并刷新资产");
+  }
+  return {
+    video_key: successful.output.subtitle_video_key,
+    video_parts: [
+      { video: { type: "storage", key: successful.output.subtitle_video_key }, title: "P1 中文字幕版" },
+      { video: { type: "storage", key: successful.output.video_key }, title: "P2 中文配音版" },
+    ],
+  };
+}
+
 export type SocialPlatform = "douyin" | "xiaohongshu" | "kuaishou";
 export type PublishPlatform = "bilibili" | SocialPlatform;
 export type PublishPlatformSettings = Record<PublishPlatform, boolean>;

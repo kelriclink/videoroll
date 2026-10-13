@@ -35,6 +35,16 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def lease_is_active(deadline: datetime | None) -> bool:
+    if deadline is None:
+        return False
+    if deadline.tzinfo is None:
+        # SQLite test/dev sessions return naive DateTime even for timezone=True.
+        # PostgreSQL uses aware timestamptz; keep UTC semantics consistent.
+        deadline = deadline.replace(tzinfo=timezone.utc)
+    return deadline > _utcnow()
+
+
 def create_dubbing_job(
     db: Session,
     *,
@@ -105,8 +115,7 @@ def execute_dubbing_job(
             raise ValueError("dubbing job not found")
         if job.status == "succeeded":
             return dict(job.output_json or {})
-        lease_until = job.lease_until
-        if job.lease_owner and lease_until and lease_until > _utcnow():
+        if job.lease_owner and lease_is_active(job.lease_until):
             raise DubbingLeaseBusy(f"dubbing job {job_id} is already running")
         if job.status == "canceled":
             raise ValueError("dubbing job canceled")
@@ -134,7 +143,8 @@ def execute_dubbing_job(
         model_path = str(request.get("model_path") or "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice")
         workspace.mkdir(parents=True, exist_ok=True)
         raw = json.loads(segments.read_text(encoding="utf-8"))
-        spoken = spoken_segments_from_json(raw, voice=voice)
+        speech_overrides = request.get("speech_overrides") or {}
+        spoken = spoken_segments_from_json(raw, voice=voice, speech_overrides=speech_overrides)
         cache_dir = workspace / "segments"
         cache_dir.mkdir(parents=True, exist_ok=True)
         # A resumed task can run on another machine, provided FileStore uses
@@ -159,6 +169,9 @@ def execute_dubbing_job(
                 item = progress_db.get(DubbingJob, job_id)
                 if item is None or item.lease_owner != owner:
                     raise DubbingLeaseBusy("dubbing job lease changed")
+                task_row = progress_db.get(Task, task_id)
+                if task_row is None or task_row.status == TaskStatus.canceled:
+                    raise RuntimeError("source task stopped during dubbing")
                 checkpoint_data = dict(item.output_json or {})
                 completed = dict(checkpoint_data.get("segments") or {})
                 completed[key] = uploaded_key
@@ -173,11 +186,30 @@ def execute_dubbing_job(
             finally:
                 progress_db.close()
 
+        def stage_update(status: str, progress: int) -> None:
+            stage_db = session_factory()
+            try:
+                item = stage_db.get(DubbingJob, job_id)
+                task_row = stage_db.get(Task, task_id)
+                if item is None or item.lease_owner != owner:
+                    raise DubbingLeaseBusy("dubbing job ownership lost")
+                if task_row is None or task_row.status == TaskStatus.canceled:
+                    raise RuntimeError("source task stopped during dubbing")
+                item.status = status
+                item.progress = max(item.progress, progress)
+                item.heartbeat_at = _utcnow()
+                item.lease_until = _utcnow() + timedelta(seconds=LEASE_SECONDS)
+                stage_db.commit()
+            finally:
+                stage_db.close()
+
         result = generate_dubbed_media(
             video, segments, workspace, factory,
             voice=voice, ffmpeg=ffmpeg, ffprobe=ffprobe,
             retain_original_audio=bool(request.get("retain_original_audio")),
             on_segment_done=checkpoint,
+            speech_overrides=speech_overrides,
+            on_stage=stage_update,
         )
         track_key = f"dub/{task_id}/audio/{sha256_file(result.audio_path)}.wav"
         video_output_key = f"render/{task_id}/dubbed-{sha256_file(result.video_path)}.mp4"
@@ -188,6 +220,9 @@ def execute_dubbing_job(
             item = final_db.query(DubbingJob).filter(DubbingJob.id == job_id).with_for_update().one()
             if item.lease_owner != owner:
                 raise DubbingLeaseBusy("dubbing job lease changed before finalization")
+            task_row = final_db.get(Task, task_id)
+            if task_row is None or task_row.status == TaskStatus.canceled:
+                raise RuntimeError("source task stopped before dubbing finalization")
             for kind, key, path in (
                 (AssetKind.dubbing_audio, track_key, result.audio_path),
                 (AssetKind.video_dubbed, video_output_key, result.video_path),

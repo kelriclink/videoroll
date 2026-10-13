@@ -27,6 +27,7 @@ export function useTaskDetailController(taskId: string | undefined) {
   const publish = useTaskPublish({
     taskId,
     task: core.task,
+    assets: core.assets,
     publishJobs: core.publishJobs,
     setPublishReview: core.setPublishReview,
     socialAccounts: core.socialAccounts,

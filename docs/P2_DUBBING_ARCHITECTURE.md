@@ -2,6 +2,28 @@
 
 状态：**开发中，独立分支 `feature/dubbing-multipart`**。本阶段禁止直接部署生产。
 
+## 第三批：手动模式操作界面及故障恢复
+
+在开发分支 `feature/dubbing-multipart` 新增：
+
+- **手动 UI**：任务详情 →「字幕 / 渲染」→「中文配音 · 手动模式」可选成功的 SubtitleJob、P1 `video_final`、CustomVoice 模型及中文音色，创建 DubbingJob。按 5 秒周期刷新状态，提供失败信息、WAV 音轨和 P2 MP4 下载。只有任务存在相应的成功字幕和 P1 资产才能开始配音。
+- **单句改写 / 试听**：`GET /tasks/{task_id}/dubbing_jobs/{job_id}/segments` 分页列出原字幕和口播文案；`PUT .../segments/{index}` 仅允许未运行的 queued/failed Job 改写 `speech_text`，不改原字幕；`GET .../segments/{index}/audio` 返回仅与当前模型、文本和音色匹配的缓存 WAV。前端支持改写和试听，然后断点重试。过长 TTS 仍不会自动 AI 缩写，但可人工局部缩写而不重跑整个翻译过程。
+- **显式恢复**：`POST /tasks/{task_id}/dubbing_jobs/{job_id}/retry` 只允许 failed / queued / 租约过期的中配 Job 重新调度；活跃租约、已成功/已取消作业均拒绝恢复。SQLite 的 naive DateTime 和 PostgreSQL 的 aware timestamp 均按 UTC 处理，避免时间戳类型冲突。
+- **进度 / 清理**：逐句 checkpoint、`aligning`、`mixing` 阶段实时登记；发现源 Task 已停止时拒绝继续提交音频和成品。临时 WAV 文件名唯一化，减少并行恢复时文件冲突。
+- **手动 B 站双分 P**：投稿页提供单独开关（默认关闭）。开启时前端使用同一成功 DubbingJob 的 `subtitle_video_key` 和 `video_key` 配置有序双分 P，Bilibili Publisher 还会独立校验 P1/P2 同任务资产和成功配音状态。未勾选保留旧单 P 行为。**真实 B 站投稿尚未验证，请勿直接对外发布测试稿。**
+
+### 部署前验收边界
+
+当前开发阶段的自动化测试只使用离线模拟 TTS 和 FFmpeg。首次生产试跑前必须：
+
+1. 在生产代码历史与开发分支对齐后再合并、部署；**生产机当前不是这一分支**。
+2. 用独立 `/opt/videoroll/venvs/dubbing` 安装 Torch CUDA + qwen-tts、soundfile、Hatchet 等依赖；下载 CustomVoice 模型；在 V100 上进行真实 FP16 + SDPA 单句 smoke test。
+3. 先让字幕任务和 P1 正常完成，再在管理页面手动运行中配，确认 1–3 分钟测试视频的声画同步及质量。检查异常超时句子是否能人工缩短并继续。
+4. 初次双分 P 投稿时使用无公开影响的测试稿，人工确认 BVID、两个 CID 顺序、标题、审核状态及新手动模式是否绕开已有定时自动投稿。
+5. 自动模式默认**不启用配音**，P1/P2 全自动就绪门禁及自动发布衔接仍在待开发阶段。
+
+
+
 ## 第二批实现进展（开发分支，未部署）
 
 本次新增了以下可执行模块：

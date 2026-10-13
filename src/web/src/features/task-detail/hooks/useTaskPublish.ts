@@ -2,8 +2,9 @@ import { useCallback, useEffect, useMemo, useRef, useState, type Dispatch, type 
 import { useConfirm, useToast } from "../../../components/feedbackContext";
 import { desktopApi } from "../../../api/desktop";
 import { publishApi } from "../../../api/publish";
-import type { PublishJob, Task } from "../../../lib/types";
-import { activeAccountsForPlatform, buildPublishActionPayload, type PublishPlatform, type PublishPlatformSettings, type SocialAccount } from "../../../lib/publish";
+import { tasksApi } from "../../../api/tasks";
+import type { Asset, PublishJob, Task } from "../../../lib/types";
+import { activeAccountsForPlatform, buildBilibiliMultipartParts, buildPublishActionPayload, type PublishPlatform, type PublishPlatformSettings, type SocialAccount } from "../../../lib/publish";
 import type {
   BiliTypeNode,
   BilibiliTypeRecommendResponse,
@@ -14,6 +15,7 @@ import { flattenBiliTypeOptions, scopedDesktopUrl } from "../utils";
 type UseTaskPublishArgs = {
   taskId: string | undefined;
   task: Task | null;
+  assets: Asset[] | null;
   publishJobs: PublishJob[] | null;
   setPublishReview: Dispatch<SetStateAction<PublishReview | null>>;
   socialAccounts: SocialAccount[];
@@ -26,6 +28,7 @@ type UseTaskPublishArgs = {
 export function useTaskPublish({
   taskId,
   task,
+  assets,
   publishJobs,
   setPublishReview,
   socialAccounts,
@@ -39,6 +42,7 @@ export function useTaskPublish({
   const [publishMetaText, setPublishMetaText] = useState("{}");
   const [publishPlatform, setPublishPlatform] = useState<PublishPlatform>("bilibili");
   const [publishVideoKey, setPublishVideoKey] = useState("");
+  const [publishTwoParts, setPublishTwoParts] = useState(false);
   const [publishCoverKey, setPublishCoverKey] = useState("");
   const [publishAccountId, setPublishAccountId] = useState("");
   const [publishSchedule, setPublishSchedule] = useState("");
@@ -77,6 +81,7 @@ export function useTaskPublish({
   useEffect(() => {
     if (!taskId) return;
     setPublishVideoKey("");
+    setPublishTwoParts(false);
     setPublishPlatform("bilibili");
     setPublishCoverKey("");
     setPublishAccountId("");
@@ -265,6 +270,14 @@ export function useTaskPublish({
         skipReview: Boolean(opts?.skipReview),
         forceRetry: Boolean(opts?.forceRetry),
       });
+      if (publishTwoParts) {
+        if (platform !== "bilibili") throw new Error("双分 P 仅适用于 B 站投稿");
+        const parts = buildBilibiliMultipartParts(
+          await tasksApi.dubbingJobs(taskId), assets ?? [], publishVideoKey,
+        );
+        payload.video_key = parts.video_key;
+        payload.video_parts = parts.video_parts;
+      }
       const response = await publishApi.submit(taskId, payload);
       await refresh();
       toast({ kind: "success", title: "投稿任务已提交", message: `platform=${response.platform ?? platform} state=${response.state}` });
@@ -331,6 +344,8 @@ export function useTaskPublish({
     setPublishPlatform,
     publishVideoKey,
     setPublishVideoKey,
+    publishTwoParts,
+    setPublishTwoParts,
     publishCoverKey,
     setPublishCoverKey,
     publishAccountId,
