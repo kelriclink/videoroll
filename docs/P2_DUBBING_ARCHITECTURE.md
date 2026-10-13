@@ -1,5 +1,20 @@
 # VideoRoll P2：中文配音及 B 站双分 P 设计与实施记录
 
+## 第四批：中文配音模型管理
+
+配置侧新增「设置 → 中文配音 / 模型」，提供以下功能：
+
+- 官方 CustomVoice 0.6B、1.7B 两个可选推理模型（服务端严格允许名单，不接受自定义下载 URL 或服务器文件路径）。
+- Hugging Face / ModelScope 下载源、模型状态、已下载字节数量、失败说明；单模型下载互斥，取消或进程异常后再次点击「继续下载」会复用已有权重文件。
+- Qwen3-TTS Tokenizer 作为共同依赖优先下载；模型成功下载和权重校验之后才标记安装完毕。
+- 模型、固定中文音色、设备 (cuda:0/cuda:1/cpu) 的默认推理选择持久化到数据盘；手动任务页读取所选模型并拒绝未安装模型。
+- 推理 Worker 只从受管的本地模型目录加载，不会在合成任务开始时从 Hugging Face 自动拉取权重。对应视频片段缓存仍使用模型的稳定仓库 ID 计算哈希。
+- API：`GET /settings/dubbing`、`PUT /settings/dubbing`、`POST /settings/dubbing/models/download`；管理员认证沿用 Orchestrator 的统一保护。
+- 下载 Python 应与推理、字幕 Python 环境隔离。示例环境变量为 `DUBBING_MODEL_ROOT=/opt/videoroll/data/models/tts` 和 `DUBBING_DOWNLOAD_PYTHON=/opt/videoroll/venvs/dubbing-download/bin/python`。在此 venv 内安装 `huggingface_hub` 与 `modelscope`。
+- **注意**：下载按钮只下载文件，并不安装 PyTorch/qwen-tts 或启用 TTS Worker；这些仍须单独配置与真实 V100 推理验收。
+
+
+
 状态：**开发中，独立分支 `feature/dubbing-multipart`**。本阶段禁止直接部署生产。
 
 ## 第三批：手动模式操作界面及故障恢复

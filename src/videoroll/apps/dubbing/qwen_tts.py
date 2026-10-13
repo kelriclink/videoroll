@@ -18,6 +18,7 @@ class QwenCustomVoice:
         *,
         device: str = "cuda:0",
         voice: str = "Vivian",
+        cache_identity: str | None = None,
     ):
         if voice not in CHINESE_SPEAKERS:
             raise ValueError(f"unsupported Chinese voice: {voice}")
@@ -25,7 +26,7 @@ class QwenCustomVoice:
         import torch
         from qwen_tts import Qwen3TTSModel
 
-        self.model_path = model_path
+        self.model_path = cache_identity or model_path
         self.voice = voice
         self.model = Qwen3TTSModel.from_pretrained(
             model_path,

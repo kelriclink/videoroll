@@ -20,6 +20,7 @@ const SettingsApiPage = lazy(() => import("./pages/SettingsApiPage"));
 const SettingsTranslatePage = lazy(() => import("./pages/SettingsTranslatePage"));
 const SettingsPublishPage = lazy(() => import("./pages/SettingsPublishPage"));
 const SettingsAutoPage = lazy(() => import("./pages/SettingsAutoPage"));
+const SettingsDubbingPage = lazy(() => import("./pages/SettingsDubbingPage"));
 const SettingsReviewPage = lazy(() => import("./pages/SettingsReviewPage"));
 const PlayoutPage = lazy(() => import("./pages/PlayoutPage"));
 const WorkflowCenterPage = lazy(() => import("./pages/WorkflowCenterPage"));
@@ -116,6 +117,7 @@ function Navigation({ onNavigate }: { onNavigate?: () => void }) {
       </NavGroup>
       <NavGroup title="配置" collapsible open={settingsOpen} onToggle={() => setSettingsOpen((value) => !value)}>
         <NavItem to="/settings/auto" label="自动模式" onNavigate={onNavigate} />
+        <NavItem to="/settings/dubbing" label="中文配音 / 模型" onNavigate={onNavigate} />
         <NavItem to="/settings/youtube" label="YouTube" onNavigate={onNavigate} />
         <NavItem to="/settings/publish" label="投稿设置" onNavigate={onNavigate} />
         <NavItem to="/settings/asr" label="ASR" onNavigate={onNavigate} />
@@ -350,6 +352,7 @@ export default function App() {
                 <Route path="/settings" element={<SettingsLayout />}>
                   <Route index element={<Navigate to="auto" replace />} />
                   <Route path="auto" element={<SettingsAutoPage />} />
+                  <Route path="dubbing" element={<SettingsDubbingPage />} />
                   <Route path="youtube" element={<SettingsYouTubePage />} />
                   <Route path="publish" element={<SettingsPublishPage />} />
                   <Route path="bilibili" element={<SettingsPublishPage />} />

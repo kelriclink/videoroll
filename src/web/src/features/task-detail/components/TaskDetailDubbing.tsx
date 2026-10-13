@@ -1,4 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { Link } from "react-router-dom";
+import { fetchJson } from "../../../lib/http";
+import { orchestratorUrl } from "../../../lib/urls";
 import { tasksApi } from "../../../api/tasks";
 import { TaskDubbingSegments } from "./TaskDubbingSegments";
 import type { Asset, DubbingJob, SubtitleJob, Task } from "../../../lib/types";
@@ -45,6 +48,7 @@ export function TaskDetailDubbing({
   const [jobs, setJobs] = useState<DubbingJob[]>([]);
   const [voice, setVoice] = useState("Vivian");
   const [modelPath, setModelPath] = useState<string>(MODELS[0].id);
+  const [installedModels, setInstalledModels] = useState<string[]>([]);
   const [mixOriginal, setMixOriginal] = useState(false);
   const [videoKey, setVideoKey] = useState("");
   const [subtitleJobId, setSubtitleJobId] = useState("");
@@ -85,8 +89,24 @@ export function TaskDetailDubbing({
     return () => window.clearInterval(interval);
   }, [reloadJobs]);
 
+  useEffect(() => {
+    let active = true;
+    void fetchJson<{
+      models: Array<{ model: string; installed: boolean }>;
+      selection: { model: string; voice: string };
+    }>(orchestratorUrl("/settings/dubbing"))
+      .then((state) => {
+        if (!active) return;
+        setInstalledModels(state.models.filter((entry) => entry.installed).map((entry) => entry.model));
+        setModelPath(state.selection.model);
+        setVoice(state.selection.voice);
+      })
+      .catch(() => { if (active) setInstalledModels([]); });
+    return () => { active = false; };
+  }, [taskId]);
+
   const running = jobs.some((job) => RUNNING.has(job.status));
-  const canGenerate = Boolean(selectedP1 && selectedSubtitle && task?.status !== "CANCELED"
+  const canGenerate = Boolean(installedModels.includes(modelPath) && selectedP1 && selectedSubtitle && task?.status !== "CANCELED"
     && task?.status !== "PUBLISHED" && !running && !submitting);
 
   async function submitJob(request: {
@@ -140,6 +160,7 @@ export function TaskDetailDubbing({
         复用已经生成的中文翻译与 P1 中文字幕视频。配音结束后提供独立中文音轨和 P2 MP4；
         此操作不会自动投稿，也不会修改 P1。
       </p>
+      <p className="mt-2 text-xs text-slate-600">模型未下载？<Link className="text-sky-700 underline" to="/settings/dubbing">前往中文配音模型管理</Link>，先下载并配置默认推理模型。</p>
       <div className="mt-4 grid gap-3 md:grid-cols-2">
         <label className="text-sm text-slate-700">
           中文字幕任务
@@ -174,7 +195,7 @@ export function TaskDetailDubbing({
           TTS 模型
           <select className="mt-1 w-full rounded border p-2" value={modelPath}
             onChange={(e) => setModelPath(e.target.value)} disabled={running || submitting}>
-            {MODELS.map((item) => <option value={item.id} key={item.id}>{item.label}</option>)}
+            {MODELS.map((item) => <option value={item.id} key={item.id} disabled={!installedModels.includes(item.id)}>{item.label}{installedModels.includes(item.id) ? "" : " · 未下载"}</option>)}
           </select>
         </label>
       </div>
