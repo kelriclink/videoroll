@@ -386,6 +386,7 @@ def publish(payload: PublishRequest, settings: BilibiliPublisherSettings = Depen
         meta_json={
             "meta": payload.meta.model_dump(),
             "video": payload.video.model_dump(),
+            "video_parts": [part.model_dump() for part in payload.video_parts],
             "account_id": payload.account_id,
             "platform": "bilibili",
             "typeid_mode": payload.typeid_mode,

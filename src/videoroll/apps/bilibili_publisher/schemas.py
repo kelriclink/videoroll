@@ -178,6 +178,11 @@ class InputRef(BaseModel):
     key: str
 
 
+class PublishPart(BaseModel):
+    video: InputRef
+    title: str = Field(min_length=1, max_length=80)
+
+
 class PublishRequest(BaseModel):
     task_id: uuid.UUID
     batch_id: Optional[uuid.UUID] = None
@@ -185,8 +190,22 @@ class PublishRequest(BaseModel):
     force_retry: bool = False
     typeid_mode: Literal["meta", "bilibili_predict", "ai_summary"] = "bilibili_predict"
     video: InputRef
+    # Optional atomic Bilibili two-part submission. First part must be the legacy video.
+    video_parts: list[PublishPart] = Field(default_factory=list, max_length=2)
     cover: Optional[InputRef] = None
     meta: BilibiliPublishMeta
+
+    @model_validator(mode="after")
+    def _validate_video_parts(self) -> "PublishRequest":
+        if self.video_parts:
+            if len(self.video_parts) != 2:
+                raise ValueError("video_parts must contain P1 and P2")
+            keys = [part.video.key.strip() for part in self.video_parts]
+            if not all(keys) or len(set(keys)) != len(keys):
+                raise ValueError("video_parts keys must be nonempty and distinct")
+            if keys[0] != self.video.key.strip():
+                raise ValueError("video_parts P1 must match video.key")
+        return self
 
 
 class BilibiliTypeNode(BaseModel):

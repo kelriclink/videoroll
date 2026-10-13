@@ -167,6 +167,8 @@ def build_publish_gateway_request(
         "meta": meta,
         "platform_options": platform_options,
     }
+    if platform == "bilibili" and _value(payload, "video_parts"):
+        request["video_parts"] = _value(payload, "video_parts")
     if platform != "bilibili":
         request["force_retry"] = bool(_value(payload, "force_retry", False))
     typeid_mode = str(platform_options.get("typeid_mode") or _value(payload, "typeid_mode") or "").strip()

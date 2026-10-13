@@ -125,6 +125,28 @@ def _extract_video_key(meta_json: dict[str, Any]) -> str:
     return ""
 
 
+def _video_parts_for_job(meta_json: dict[str, Any], video_key: str, default_title: str) -> list[tuple[str, str]]:
+    """Resolve ordered P1/P2 storage keys; never silently publish a partial archive."""
+    raw = meta_json.get("video_parts") or []
+    if not raw:
+        return [(video_key, default_title)]
+    if not isinstance(raw, list) or len(raw) != 2:
+        raise ValueError("Bilibili video_parts must contain exactly two parts")
+    out: list[tuple[str, str]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            raise ValueError("invalid Bilibili video part")
+        video = item.get("video")
+        key = str(video.get("key") or "").strip() if isinstance(video, dict) else ""
+        title = str(item.get("title") or "").strip()
+        if not key or not title or len(title) > 80:
+            raise ValueError("Bilibili video part key/title invalid")
+        out.append((key, title))
+    if out[0][0] != video_key or out[0][0] == out[1][0]:
+        raise ValueError("Bilibili P1 must match video.key and P2 must have a distinct key")
+    return out
+
+
 def _read_storage_json(store: FileStore, key: str) -> dict[str, Any]:
     obj = store.get_object(key)
     body = obj.get("Body")
@@ -692,9 +714,13 @@ def _add_archive_with_desc_retry(
     tid: int,
     uploaded: Any,
     cover_url: str,
+    uploaded_parts: list[tuple[Any, str]] | None = None,
 ) -> tuple[dict[str, Any], BilibiliPublishMeta, dict[str, Any] | None]:
+    kwargs = {"csrf": csrf, "tid": tid, "uploaded": uploaded, "cover_url": cover_url}
+    if uploaded_parts:
+        kwargs["uploaded_parts"] = uploaded_parts
     try:
-        return client.add_archive(meta, csrf=csrf, tid=tid, uploaded=uploaded, cover_url=cover_url), meta, None
+        return client.add_archive(meta, **kwargs), meta, None
     except BilibiliDescTooLongError as e:
         retry_meta = _publish_meta_with_retry_desc_limit(meta)
         retry_info = {
@@ -711,7 +737,7 @@ def _add_archive_with_desc_retry(
             retry_info["retry_units"],
             retry_info["retry_max_units"],
         )
-        return client.add_archive(retry_meta, csrf=csrf, tid=tid, uploaded=uploaded, cover_url=cover_url), retry_meta, retry_info
+        return client.add_archive(retry_meta, **kwargs), retry_meta, retry_info
 
 
 def _process_job_impl(self, job_id: str) -> dict[str, Any]:
@@ -796,7 +822,9 @@ def _process_job_impl(self, job_id: str) -> dict[str, Any]:
         # actually starts sending video bytes again.
         _set_bilibili_upload_progress(db, job, active=False, progress=0)
 
-        video_path = store.path_for(video_key)
+        video_part_refs = _video_parts_for_job(meta_json, video_key, meta.title)
+        video_part_paths = [(store.path_for(key), title) for key, title in video_part_refs]
+        video_path = video_part_paths[0][0]
 
         cover_url = ""
         cover_path: Path | None = None
@@ -830,7 +858,23 @@ def _process_job_impl(self, job_id: str) -> dict[str, Any]:
                 last_upload_progress = progress
                 _set_bilibili_upload_progress(db, job, active=True, progress=progress)
 
-            uploaded, upload_debug = client.upload_video_file(video_path, on_progress=persist_upload_progress)
+            total_part_bytes = sum(path.stat().st_size for path, _title in video_part_paths)
+            completed_bytes = 0
+            uploaded_parts: list[tuple[Any, str]] = []
+            uploaded_debugs: list[dict[str, Any]] = []
+            for part_path, part_title in video_part_paths:
+                offset = completed_bytes
+                part_upload, part_debug = client.upload_video_file(
+                    part_path,
+                    on_progress=lambda completed, _part_total, offset=offset: persist_upload_progress(
+                        offset + completed, total_part_bytes,
+                    ),
+                )
+                uploaded_parts.append((part_upload, part_title))
+                uploaded_debugs.append(part_debug)
+                completed_bytes += part_path.stat().st_size
+            uploaded = uploaded_parts[0][0]
+            upload_debug = uploaded_debugs[0]
             _set_bilibili_upload_progress(db, job, active=False, progress=100)
             predicted_tid: int | None = None
             tid_meta = int(meta.typeid)
@@ -940,6 +984,7 @@ def _process_job_impl(self, job_id: str) -> dict[str, Any]:
                 tid=tid,
                 uploaded=uploaded,
                 cover_url=cover_url,
+                uploaded_parts=uploaded_parts if len(uploaded_parts) > 1 else None,
             )
             add_data = _as_dict(add_resp.get("data"))
             try:
@@ -984,6 +1029,10 @@ def _process_job_impl(self, job_id: str) -> dict[str, Any]:
             "mode": "web",
             "cover_url": cover_url or None,
             "video": upload_debug,
+            "video_parts": [
+                {"storage_key": key, "title": title, "upload": debug}
+                for (key, title), debug in zip(video_part_refs, uploaded_debugs)
+            ],
             "throttle": {
                 "upload": upload_throttle,
                 "submit": submit_throttle,

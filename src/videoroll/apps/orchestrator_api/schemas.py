@@ -121,6 +121,7 @@ class PublishActionRequest(BaseModel):
     platform: str = "bilibili"
     account_id: Optional[str] = None
     video_key: Optional[str] = None
+    video_parts: Optional[list[dict[str, Any]]] = None
     cover_key: Optional[str] = None
     typeid_mode: Optional[str] = None
     meta: Optional[dict[str, Any]] = None
@@ -140,6 +141,7 @@ class PublishAllRequest(BaseModel):
     platforms: Optional[list[Literal["bilibili", "douyin", "xiaohongshu", "kuaishou"]]] = None
     account_ids: dict[str, str] = Field(default_factory=dict)
     video_key: Optional[str] = None
+    video_parts: Optional[list[dict[str, Any]]] = None
     cover_key: Optional[str] = None
     typeid_mode: Optional[str] = None
     meta: Optional[dict[str, Any]] = None

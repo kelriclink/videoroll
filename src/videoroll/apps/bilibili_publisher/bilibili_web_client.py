@@ -7,7 +7,7 @@ import mimetypes
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Sequence
 
 import httpx
 
@@ -779,6 +779,7 @@ class BilibiliWebClient:
         tid: int,
         uploaded: UploadedVideo,
         cover_url: str = "",
+        uploaded_parts: Sequence[tuple[UploadedVideo, str]] | None = None,
     ) -> dict[str, Any]:
         csrf = (csrf or "").strip()
         _require(bool(csrf), "csrf (bili_jct) is empty")
@@ -787,14 +788,15 @@ class BilibiliWebClient:
         _require(bool(tags), "meta.tags is required for bilibili publish")
         cover_url = str(cover_url or "").strip()
 
+        parts = list(uploaded_parts) if uploaded_parts is not None else [(uploaded, meta.title)]
+        _require(bool(parts), "at least one video part is required")
+        _require(all(part.cid > 0 for part, _title in parts), "video part cid is missing")
+        _require(all(bool(part.filename_no_suffix) for part, _title in parts), "video part filename is missing")
+        _require(len({part.cid for part, _title in parts}) == len(parts), "duplicate video part cid")
         body: dict[str, Any] = {
             "videos": [
-                {
-                    "filename": uploaded.filename_no_suffix,
-                    "title": meta.title,
-                    "desc": "",
-                    "cid": uploaded.cid,
-                }
+                {"filename": part.filename_no_suffix, "title": title.strip(), "desc": "", "cid": part.cid}
+                for part, title in parts
             ],
             # If cover is omitted, Bilibili will auto-pick one.
             "cover": cover_url or None,
