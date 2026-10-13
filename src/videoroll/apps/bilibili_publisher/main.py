@@ -278,6 +278,27 @@ def publish(payload: PublishRequest, settings: BilibiliPublisherSettings = Depen
     task = db.get(Task, payload.task_id, with_for_update=True)
     if not task:
         raise HTTPException(status_code=404, detail="task not found")
+    if payload.video_parts:
+        # Fail closed: a two-part submission cannot use a P2 belonging to
+        # another task or a stale artifact from a failed dubbing run.
+        expected = (AssetKind.video_final, AssetKind.video_dubbed)
+        for part, kind in zip(payload.video_parts, expected):
+            found = db.query(Asset).filter(
+                Asset.task_id == task.id,
+                Asset.storage_key == part.video.key,
+                Asset.kind == kind,
+            ).first()
+            if found is None:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Bilibili P1/P2 not ready or not owned by task: {part.title}",
+                )
+        from videoroll.db.models import DubbingJob
+        dubbed = db.query(DubbingJob).filter(
+            DubbingJob.task_id == task.id, DubbingJob.status == "succeeded",
+        ).order_by(DubbingJob.created_at.desc()).first()
+        if dubbed is None or dubbed.output_json.get("video_key") != payload.video_parts[1].video.key:
+            raise HTTPException(status_code=409, detail="P2 dubbing job is not succeeded")
     if payload.batch_id is not None:
         batch = db.get(PublishBatch, payload.batch_id)
         if not batch or batch.task_id != task.id:
@@ -386,6 +407,7 @@ def publish(payload: PublishRequest, settings: BilibiliPublisherSettings = Depen
         meta_json={
             "meta": payload.meta.model_dump(),
             "video": payload.video.model_dump(),
+            "video_parts": [part.model_dump() for part in payload.video_parts],
             "account_id": payload.account_id,
             "platform": "bilibili",
             "typeid_mode": payload.typeid_mode,

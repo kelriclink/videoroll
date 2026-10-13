@@ -29,6 +29,7 @@ from videoroll.db.migrate import initialize_database
 from videoroll.db.models import (
     Asset,
     AssetKind,
+    DubbingJob,
     PipelineRun,
     PublishBatch,
     PublishJob,
@@ -2244,7 +2245,8 @@ def _cleanup_task_impl(self: Any, task_id: str, batch_id: str | None = None) -> 
       - delete local WORK_DIR temp dirs for subtitle/render/youtube
       - delete non-final stored assets to prevent storage from growing forever
     Keeps:
-      - AssetKind.video_final
+      - AssetKind.video_final / video_dubbed
+      - AssetKind.dubbing_audio (downloadable Chinese track)
       - AssetKind.publish_result
     """
     _ensure_db()
@@ -2298,7 +2300,11 @@ def _cleanup_task_impl(self: Any, task_id: str, batch_id: str | None = None) -> 
             .filter(RenderJob.task_id == tid, RenderJob.status.in_([RenderJobStatus.queued, RenderJobStatus.running]))
             .count()
         )
-        if in_flight_sub or in_flight_render:
+        in_flight_dubbing = db.query(DubbingJob).filter(
+            DubbingJob.task_id == tid,
+            DubbingJob.status.in_(["queued", "preparing", "synthesizing"]),
+        ).count()
+        if in_flight_sub or in_flight_render or in_flight_dubbing:
             if batch_id:
                 batch.cleanup_enqueued_at = None
                 db.add(batch)
@@ -2307,9 +2313,10 @@ def _cleanup_task_impl(self: Any, task_id: str, batch_id: str | None = None) -> 
 
         subtitle_job_ids = [row[0] for row in db.query(SubtitleJob.id).filter(SubtitleJob.task_id == tid).all()]
         render_job_ids = [row[0] for row in db.query(RenderJob.id).filter(RenderJob.task_id == tid).all()]
+        dubbing_job_ids = [row[0] for row in db.query(DubbingJob.id).filter(DubbingJob.task_id == tid).all()]
 
         assets = db.query(Asset).filter(Asset.task_id == tid).all()
-        keep_kinds = {AssetKind.video_final, AssetKind.publish_result}
+        keep_kinds = {AssetKind.video_final, AssetKind.video_dubbed, AssetKind.dubbing_audio, AssetKind.publish_result}
         keep_keys = {a.storage_key for a in assets if a.kind in keep_kinds}
 
         if not any(a.kind == AssetKind.video_final for a in assets):
@@ -2360,6 +2367,14 @@ def _cleanup_task_impl(self: Any, task_id: str, batch_id: str | None = None) -> 
                 pass
         for rjid in render_job_ids:
             p = work_dir / "render" / str(rjid)
+            try:
+                if p.exists():
+                    removed_dirs += 1
+                shutil.rmtree(p, ignore_errors=True)
+            except Exception:
+                pass
+        for djid in dubbing_job_ids:
+            p = work_dir / "dubbing" / str(djid)
             try:
                 if p.exists():
                     removed_dirs += 1

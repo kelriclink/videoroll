@@ -59,6 +59,31 @@ export type SubtitleJob = {
   updated_at: string;
 };
 
+export type DubbingJob = {
+  id: string;
+  task_id: string;
+  subtitle_job_id: string | null;
+  status: "queued" | "preparing" | "synthesizing" | "aligning" | "mixing" | "succeeded" | "failed" | "canceled";
+  progress: number;
+  operation_key: string | null;
+  request: {
+    subtitle_video_key?: string;
+    voice?: string;
+    model_path?: string;
+    retain_original_audio?: boolean;
+  };
+  output: {
+    audio_key?: string;
+    video_key?: string;
+    subtitle_video_key?: string;
+    duration?: number;
+    segments_total?: number;
+    segments?: Record<string, string>;
+  };
+  error_message: string | null;
+  created_at: string;
+};
+
 export type PublishJob = {
   id: string;
   task_id: string;
@@ -106,6 +131,7 @@ export type PublishActionPayload = {
   platform: "bilibili" | "douyin" | "xiaohongshu" | "kuaishou";
   account_id: string | null;
   video_key: string | null;
+  video_parts?: Array<{ video: { type: "storage"; key: string }; title: string }>;
   cover_key: string | null;
   typeid_mode?: string;
   meta: Record<string, unknown>;

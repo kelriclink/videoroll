@@ -17,6 +17,8 @@ export function TaskDetailPublish({ controller }: { controller: TaskDetailContro
     setPublishPlatform,
     publishVideoKey,
     setPublishVideoKey,
+    publishTwoParts,
+    setPublishTwoParts,
     publishCoverKey,
     setPublishCoverKey,
     publishAccountId,
@@ -118,6 +120,19 @@ export function TaskDetailPublish({ controller }: { controller: TaskDetailContro
             </div>
           ) : null}
         </div>
+        {publishPlatform === "bilibili" ? (
+          <label className="mt-3 flex items-start gap-2 rounded border border-slate-200 p-3 text-sm">
+            <input type="checkbox" checked={publishTwoParts}
+              onChange={(e) => setPublishTwoParts(e.target.checked)} className="mt-0.5" />
+            <span>
+              <strong>投稿双分 P（P1 中文字幕 + P2 中文配音）</strong>
+              <span className="mt-1 block text-xs text-slate-500">
+                只使用同一个成功 DubbingJob 生成的两个成品；两份视频均就绪后才提交一次 B 站稿件。
+                未勾选时保持原有单视频投稿行为。
+              </span>
+            </span>
+          </label>
+        ) : null}
         <div className="mt-3 grid gap-3 md:grid-cols-2">
           <label className="block">
             <div className="mb-1 text-xs text-slate-600">投稿视频（video_key，可选）</div>

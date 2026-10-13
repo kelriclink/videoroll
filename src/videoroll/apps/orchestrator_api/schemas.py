@@ -121,6 +121,7 @@ class PublishActionRequest(BaseModel):
     platform: str = "bilibili"
     account_id: Optional[str] = None
     video_key: Optional[str] = None
+    video_parts: Optional[list[dict[str, Any]]] = None
     cover_key: Optional[str] = None
     typeid_mode: Optional[str] = None
     meta: Optional[dict[str, Any]] = None
@@ -140,6 +141,7 @@ class PublishAllRequest(BaseModel):
     platforms: Optional[list[Literal["bilibili", "douyin", "xiaohongshu", "kuaishou"]]] = None
     account_ids: dict[str, str] = Field(default_factory=dict)
     video_key: Optional[str] = None
+    video_parts: Optional[list[dict[str, Any]]] = None
     cover_key: Optional[str] = None
     typeid_mode: Optional[str] = None
     meta: Optional[dict[str, Any]] = None
@@ -208,6 +210,18 @@ class TaskPublishReviewRead(BaseModel):
     summary: Optional[str] = None
     subtitle_chars: int = 0
     checked_at: Optional[str] = None
+
+
+class DubbingActionRequest(BaseModel):
+    subtitle_job_id: uuid.UUID
+    subtitle_video_key: str = Field(min_length=1, max_length=2048)
+    operation_key: str = Field(default="p2:initial", min_length=1, max_length=255)
+    voice: Literal["Vivian", "Serena", "Uncle_Fu", "Dylan", "Eric"] = "Vivian"
+    model_path: Literal[
+        "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
+        "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
+    ] = "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"
+    retain_original_audio: bool = False
 
 
 class RemoteJobResponse(BaseModel):

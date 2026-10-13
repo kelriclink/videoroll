@@ -1,6 +1,6 @@
 import { fetchJson, fetchText } from "../lib/http";
 import { orchestratorUrl } from "../lib/urls";
-import type { Asset, PublishBatch, PublishJob, SubtitleJob, Task } from "../lib/types";
+import type { Asset, DubbingJob, PublishBatch, PublishJob, SubtitleJob, Task } from "../lib/types";
 import type { PublishReview } from "./publish";
 
 export type YouTubeMeta = {
@@ -65,6 +65,51 @@ export const tasksApi = {
 
   subtitleJobs(taskId: string) {
     return fetchJson<SubtitleJob[]>(orchestratorUrl(`/tasks/${taskId}/subtitle_jobs`));
+  },
+
+  dubbingJobs(taskId: string) {
+    return fetchJson<DubbingJob[]>(orchestratorUrl(`/tasks/${taskId}/dubbing_jobs`));
+  },
+
+  startDubbing(taskId: string, request: {
+    subtitle_job_id: string;
+    subtitle_video_key: string;
+    operation_key: string;
+    voice: string;
+    model_path: string;
+    retain_original_audio: boolean;
+  }) {
+    return fetchJson<{ job_id: string; status: string }>(
+      orchestratorUrl(`/tasks/${taskId}/actions/dubbing`),
+      { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(request) },
+    );
+  },
+
+  retryDubbing(taskId: string, jobId: string) {
+    return fetchJson<{ job_id: string; status: string }>(
+      orchestratorUrl(`/tasks/${taskId}/dubbing_jobs/${jobId}/retry`),
+      { method: "POST" },
+    );
+  },
+
+  dubbingSegments(taskId: string, jobId: string, offset = 0, limit = 30) {
+    return fetchJson<{ total: number; offset: number; items: Array<{
+      index: number; start: number; end: number;
+      subtitle_text: string; speech_text: string;
+      overridden: boolean; has_audio: boolean;
+    }> }>(orchestratorUrl(`/tasks/${taskId}/dubbing_jobs/${jobId}/segments?offset=${offset}&limit=${limit}`));
+  },
+
+  updateDubbingSpeech(taskId: string, jobId: string, index: number, speechText: string) {
+    return fetchJson<{ index: number; speech_text: string; status: string }>(
+      orchestratorUrl(`/tasks/${taskId}/dubbing_jobs/${jobId}/segments/${index}`),
+      { method: "PUT", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ speech_text: speechText }) },
+    );
+  },
+
+  dubbingPreviewUrl(taskId: string, jobId: string, index: number) {
+    return orchestratorUrl(`/tasks/${taskId}/dubbing_jobs/${jobId}/segments/${index}/audio`);
   },
 
   publishJobs(taskId: string) {
