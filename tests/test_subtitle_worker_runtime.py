@@ -77,7 +77,7 @@ def test_openvino_cpu_does_not_take_gpu_resource_lock(monkeypatch: pytest.Monkey
         pass
 
 
-def test_openvino_gpu_resource_lock_waits_without_changing_worker_concurrency(
+def test_openvino_gpu_resource_lock_waits_without_an_idle_transaction(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class _ScalarResult:
@@ -87,40 +87,102 @@ def test_openvino_gpu_resource_lock_waits_without_changing_worker_concurrency(
         def scalar(self) -> bool:
             return self.value
 
-    class _LockDb:
-        def __init__(self) -> None:
-            self.results = iter([False, True])
-            self.execute_calls = 0
-            self.rollbacks = 0
+    class _LockConn:
+        def __init__(self, engine) -> None:
+            self.engine = engine
             self.closed = False
+            self.invalidated = False
 
-        def execute(self, _statement, _params):
-            self.execute_calls += 1
-            return _ScalarResult(next(self.results))
+        def __enter__(self):
+            return self
 
-        def rollback(self) -> None:
-            self.rollbacks += 1
-
-        def close(self) -> None:
+        def __exit__(self, *_args):
             self.closed = True
 
-    lock_db = _LockDb()
+        def execute(self, statement, _params):
+            sql = str(statement)
+            self.engine.statements.append(sql)
+            if "pg_try_advisory_lock" in sql:
+                return _ScalarResult(next(self.engine.results))
+            if "pg_advisory_unlock" in sql:
+                return _ScalarResult(True)
+            raise AssertionError(sql)
+
+        def invalidate(self):
+            self.invalidated = True
+
+    class _LockEngine:
+        def __init__(self) -> None:
+            self.results = iter([False, True])
+            self.connections = []
+            self.statements = []
+
+        def execution_options(self, **kwargs):
+            assert kwargs == {"isolation_level": "AUTOCOMMIT"}
+            return self
+
+        def connect(self):
+            conn = _LockConn(self)
+            self.connections.append(conn)
+            return conn
+
+    engine = _LockEngine()
     cancel_checks = 0
 
     def cancel_check() -> None:
         nonlocal cancel_checks
         cancel_checks += 1
 
-    monkeypatch.setattr(worker, "_db", lambda: lock_db)
+    monkeypatch.setattr(worker, "get_engine", lambda _url: engine)
     monkeypatch.setattr(worker.time, "sleep", lambda _seconds: None)
     monkeypatch.setenv("OPENVINO_GPU_MAX_CONCURRENCY", "1")
 
     with worker._openvino_gpu_slot(device="GPU", log_path=None, cancel_check=cancel_check):
-        assert lock_db.execute_calls == 2
+        assert len(engine.connections) == 2
+        assert engine.connections[0].closed
+        assert not engine.connections[1].closed
 
     assert cancel_checks >= 2
-    assert lock_db.rollbacks >= 2
-    assert lock_db.closed is True
+    assert all(connection.closed for connection in engine.connections)
+    assert sum("pg_try_advisory_lock" in sql for sql in engine.statements) == 2
+    assert sum("pg_advisory_unlock" in sql for sql in engine.statements) == 1
+    assert all("xact" not in sql for sql in engine.statements)
+
+
+def test_openvino_gpu_resource_lock_unlocks_when_inference_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    from unittest.mock import MagicMock
+
+    conn = MagicMock()
+    conn.__enter__.return_value = conn
+    conn.execute.return_value.scalar.return_value = True
+    engine = MagicMock()
+    engine.execution_options.return_value.connect.return_value = conn
+    monkeypatch.setattr(worker, "get_engine", lambda _url: engine)
+    monkeypatch.setenv("OPENVINO_GPU_MAX_CONCURRENCY", "1")
+
+    with pytest.raises(RuntimeError, match="inference failed"):
+        with worker._openvino_gpu_slot(device="GPU", log_path=None):
+            raise RuntimeError("inference failed")
+
+    assert conn.execute.call_count == 2  # acquire then unlock, including error path
+    assert "pg_advisory_unlock" in str(conn.execute.call_args.args[0])
+    conn.invalidate.assert_not_called()
+
+
+def test_openvino_gpu_aliases_share_one_lock_key() -> None:
+    assert worker._openvino_gpu_lock_key("GPU", 0) == worker._openvino_gpu_lock_key("GPU.0", 0)
+    assert worker._openvino_gpu_lock_key("AUTO", 0) == worker._openvino_gpu_lock_key("GPU.0", 0)
+    assert worker._openvino_gpu_lock_key("GPU.1", 0) != worker._openvino_gpu_lock_key("GPU.0", 0)
+
+
+@pytest.mark.parametrize("error,transient", [
+    (RuntimeError("Infer Request is busy"), True),
+    (RuntimeError("terminating connection due to idle-in-transaction timeout"), True),
+    (ValueError("missing input.key"), False),
+    (RuntimeError("model does not support language"), False),
+])
+def test_only_known_temporary_subtitle_errors_are_retryable(error: Exception, transient: bool) -> None:
+    assert worker._is_transient_subtitle_error(error) is transient
 
 
 def test_run_asr_stage_gates_only_openvino_gpu(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:

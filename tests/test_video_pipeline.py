@@ -4,6 +4,7 @@ import asyncio
 from datetime import timedelta
 
 import httpx
+import pytest
 from typing import Any, Callable
 
 from videoroll.workflows.settings import WorkflowRuntimeSettings
@@ -80,6 +81,18 @@ class _FakeContext:
 
     async def aio_sleep_for(self, duration: timedelta) -> None:
         self.sleep_calls.append(duration)
+
+
+def test_subtitle_pipeline_preserves_transient_failures_for_hatchet_retries(monkeypatch) -> None:
+    from videoroll.apps.subtitle_service import worker
+    from videoroll.workflows import video_pipeline
+
+    def busy(*_args, **_kwargs):
+        raise worker.SubtitleJobTransientFailure("Infer Request is busy")
+
+    monkeypatch.setattr(worker, "run_subtitle_job", busy)
+    with pytest.raises(worker.SubtitleJobTransientFailure, match="Infer Request is busy"):
+        video_pipeline._run_subtitle_job("job-id", retry_attempt=0)
 
 
 def test_video_pipeline_orders_download_handoff_and_subtitle_process(monkeypatch) -> None:
