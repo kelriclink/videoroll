@@ -232,7 +232,11 @@ def _desired_pool(pool: str) -> list[Any]:
 
 def _run_subtitle_job(job_id: str, *, retry_attempt: int) -> dict[str, str]:
     from videoroll.apps.subtitle_service.translation_stage import TranslationRetryRequired
-    from videoroll.apps.subtitle_service.worker import SubtitleJobExecutionFailed, run_subtitle_job
+    from videoroll.apps.subtitle_service.worker import (
+        SubtitleJobExecutionFailed,
+        SubtitleJobTransientFailure,
+        run_subtitle_job,
+    )
 
     try:
         return run_subtitle_job(
@@ -240,7 +244,7 @@ def _run_subtitle_job(job_id: str, *, retry_attempt: int) -> dict[str, str]:
             retry_attempt=retry_attempt,
             raise_on_error=True,
         )
-    except TranslationRetryRequired:
+    except (TranslationRetryRequired, SubtitleJobTransientFailure):
         raise
     except SubtitleJobExecutionFailed as exc:
         try:

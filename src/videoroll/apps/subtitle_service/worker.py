@@ -42,7 +42,7 @@ from videoroll.db.models import (
     Task,
     TaskStatus,
 )
-from videoroll.db.session import get_sessionmaker
+from videoroll.db.session import get_engine, get_sessionmaker
 from videoroll.realtime import publish_log_updated, publish_queue_changed
 from videoroll.storage.filesystem import FileStore
 from videoroll.apps.security.service_auth import INTERNAL_TOKEN_HEADER, service_token
@@ -369,7 +369,12 @@ def _openvino_uses_gpu(device: str) -> bool:
 
 
 def _openvino_gpu_lock_key(device: str, slot: int) -> int:
-    payload = f"videoroll:openvino-gpu:{str(device or 'GPU').strip().upper()}:{int(slot)}".encode("utf-8")
+    normalized = str(device or "GPU").strip().upper()
+    # OpenVINO's GPU, GPU.0 and AUTO can all address the same first GPU.
+    # They must contend for the same inference slot.
+    if normalized in {"GPU", "GPU.0", "AUTO"}:
+        normalized = "GPU.0"
+    payload = f"videoroll:openvino-gpu:{normalized}:{int(slot)}".encode("utf-8")
     return int.from_bytes(hashlib.sha256(payload).digest()[:8], byteorder="big", signed=True)
 
 
@@ -380,12 +385,13 @@ def _openvino_gpu_slot(
     log_path: Path | None,
     cancel_check: Callable[[], None] | None = None,
 ) -> Iterator[None]:
-    """Serialize OpenVINO GPU model use without reducing task-worker concurrency.
+    """Limit OpenVINO GPU inference across threads and worker processes.
 
-    The task queue remains authoritative for Celery pool size. This gate only
-    limits the scarce OpenVINO GPU resource. PostgreSQL transaction-scoped
-    advisory locks coordinate prefork processes and multiple worker containers,
-    and release automatically if the owning process/connection dies.
+    A transaction-scoped advisory lock holds an idle PostgreSQL transaction
+    throughout multi-minute inference. PostgreSQL kills that transaction after
+    idle_in_transaction_session_timeout and silently frees the GPU slot.
+    Use a dedicated AUTOCOMMIT connection and a session-scoped lock instead.
+    A waiting worker returns its DB connection to the pool between attempts.
     """
 
     if not _openvino_uses_gpu(device):
@@ -393,43 +399,44 @@ def _openvino_gpu_slot(
         return
 
     max_slots = max(1, min(8, _positive_int_env("OPENVINO_GPU_MAX_CONCURRENCY", 1)))
-    lock_db = _db()
+    lock_engine = get_engine(settings.database_url).execution_options(isolation_level="AUTOCOMMIT")
     waiting_logged = False
-    try:
-        while True:
-            if cancel_check is not None:
-                cancel_check()
+    while True:
+        if cancel_check is not None:
+            cancel_check()
+        with lock_engine.connect() as lock_conn:
             for slot in range(max_slots):
                 key = _openvino_gpu_lock_key(device, slot)
                 acquired = bool(
-                    lock_db.execute(
-                        text("SELECT pg_try_advisory_xact_lock(:key)"),
-                        {"key": key},
-                    ).scalar()
+                    lock_conn.execute(text("SELECT pg_try_advisory_lock(:key)"), {"key": key}).scalar()
                 )
                 if acquired:
-                    note = f"asr: acquired OpenVINO GPU slot {slot + 1}/{max_slots} device={device}"
-                    _safe_append_log_line(log_path, note)
+                    _safe_append_log_line(
+                        log_path,
+                        f"asr: acquired OpenVINO GPU slot {slot + 1}/{max_slots} device={device}",
+                    )
                     try:
                         yield
                     finally:
-                        # Transaction-scoped advisory lock is released by rollback.
-                        lock_db.rollback()
+                        try:
+                            unlocked = lock_conn.execute(
+                                text("SELECT pg_advisory_unlock(:key)"), {"key": key}
+                            ).scalar()
+                            if not unlocked:
+                                raise RuntimeError("OpenVINO GPU advisory lock was lost")
+                        except Exception:
+                            # Never return an uncertain session lock to the pool.
+                            lock_conn.invalidate()
+                            raise
                     return
 
-            lock_db.rollback()
-            if not waiting_logged:
-                _safe_append_log_line(
-                    log_path,
-                    f"asr: waiting for OpenVINO GPU slot device={device} slots={max_slots}",
-                )
-                waiting_logged = True
-            time.sleep(0.25)
-    finally:
-        try:
-            lock_db.rollback()
-        finally:
-            lock_db.close()
+        if not waiting_logged:
+            _safe_append_log_line(
+                log_path,
+                f"asr: waiting for OpenVINO GPU slot device={device} slots={max_slots}",
+            )
+            waiting_logged = True
+        time.sleep(0.25)
 
 
 def _run_asr_stage(
@@ -935,8 +942,23 @@ class SubtitleJobExecutionFailed(RuntimeError):
     """Terminal subtitle execution failure surfaced to non-Celery executors."""
 
 
+class SubtitleJobTransientFailure(RuntimeError):
+    """Temporary infrastructure error that Hatchet should retry with backoff."""
+
+
 class SubtitleJobLeaseBusy(RuntimeError):
     """Retryable conflict while another executor still owns a subtitle job lease."""
+
+
+def _is_transient_subtitle_error(exc: Exception) -> bool:
+    """Limit retries to known temporary ASR/DB failures, not bad inputs."""
+    chain: BaseException | None = exc
+    while chain is not None:
+        message = str(chain).lower()
+        if "infer request is busy" in message or "idle-in-transaction timeout" in message:
+            return True
+        chain = chain.__cause__ or chain.__context__
+    return False
 
 
 def run_subtitle_job(
@@ -1462,7 +1484,10 @@ def run_subtitle_job(
                 asr_cfg=asr_cfg,
                 log_path=log_path,
                 groq_checkpoint_path=_groq_asr_checkpoint_path(),
-                cancel_check=lambda: _raise_if_task_stopped_fresh(task.id),
+                # Capture the UUID before _run_asr_stage rolls back the read
+                # transaction. Accessing an expired ORM task inside the GPU
+                # wait callback would open another idle transaction.
+                cancel_check=lambda task_id=task.id: _raise_if_task_stopped_fresh(task_id),
             )
             _store_source_segments(segments, source_label="asr done")
 
@@ -1824,24 +1849,35 @@ def run_subtitle_job(
         raise
     except Exception as e:
         _rollback_quietly(db)
+        transient_retry = raise_on_error and retry_attempt < 5 and _is_transient_subtitle_error(e)
+        retry_persisted = False
         failure_db = _db()
         try:
             failed_job = failure_db.get(SubtitleJob, jid)
             if failed_job:
-                failed_job.status = SubtitleJobStatus.failed
-                failed_job.error_message = str(e)
-                failure_db.add(failed_job)
-                failed_task = failure_db.get(Task, failed_job.task_id)
-                if (
-                    failed_task
-                    and not _task_is_stopped(failure_db, failed_task.id)
-                    and failed_task.status != TaskStatus.published
-                ):
-                    failed_task.status = TaskStatus.failed
-                    failed_task.error_code = failed_task.error_code or "SUBTITLE_FAILED"
-                    failed_task.error_message = str(e)
-                    failure_db.add(failed_task)
+                if transient_retry:
+                    request = dict(failed_job.request_json or {})
+                    request["resume"] = True
+                    failed_job.request_json = request
+                    failed_job.status = SubtitleJobStatus.queued
+                    failed_job.error_message = str(e)
+                    failure_db.add(failed_job)
+                else:
+                    failed_job.status = SubtitleJobStatus.failed
+                    failed_job.error_message = str(e)
+                    failure_db.add(failed_job)
+                    failed_task = failure_db.get(Task, failed_job.task_id)
+                    if (
+                        failed_task
+                        and not _task_is_stopped(failure_db, failed_task.id)
+                        and failed_task.status != TaskStatus.published
+                    ):
+                        failed_task.status = TaskStatus.failed
+                        failed_task.error_code = failed_task.error_code or "SUBTITLE_FAILED"
+                        failed_task.error_message = str(e)
+                        failure_db.add(failed_task)
             failure_db.commit()
+            retry_persisted = transient_retry and failed_job is not None
         except Exception:
             _rollback_quietly(failure_db)
             logger.exception("failed to persist subtitle job failure (job_id=%s)", jid)
@@ -1850,6 +1886,8 @@ def run_subtitle_job(
         _safe_append_log_line(log_path, f"ERROR: {type(e).__name__}: {e}")
         _safe_append_log_block(log_path, traceback.format_exc())
         _safe_upload_log(store, log_path, log_key)
+        if retry_persisted:
+            raise SubtitleJobTransientFailure(str(e)) from e
         if raise_on_error:
             raise SubtitleJobExecutionFailed(str(e)) from e
         return {"status": "error", "detail": str(e)}
