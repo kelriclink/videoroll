@@ -68,7 +68,7 @@ def create_dubbing_job(
     cosy_mode: str = "cross_lingual",
     cosy_speed: float = 1.0,
     debug_timing: bool = False,
-    auto_group_speech: bool = True,
+    auto_group_speech: bool = False,
 ) -> DubbingJob:
     """Create a manual dubbing job from translated subtitles and raw or P1 video."""
     existing = db.query(DubbingJob).filter(

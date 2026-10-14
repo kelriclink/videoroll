@@ -143,7 +143,6 @@ def generate_dubbed_media(
             "index": unit.part.index, "source_indices": list(unit.source_indices),
             "start": round(unit.part.start, 3), "end": round(unit.part.end, 3),
             "speech_text": unit.part.speech_text,
-            "duplicate_removed": unit.duplicate_removed,
         } for unit in units])
     # Early structural validation: reject invalid source timestamps before
     # spending hours on inference. Dummy durations test only intervals.

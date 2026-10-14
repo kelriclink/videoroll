@@ -19,7 +19,7 @@ def normalize_quality(*, instruct: str = "", temperature: float = 0.9,
                       cosy_speed: float = 1.0, cosy_mode: str = "cross_lingual",
                       profile_id: str = "", profile_sha256: str = "",
                       debug_timing: bool = False,
-                      auto_group_speech: bool = True) -> dict[str, Any]:
+                      auto_group_speech: bool = False) -> dict[str, Any]:
     if len(instruct) > 120 or any(ord(c) < 32 for c in instruct):
         raise ValueError("invalid TTS speaking instruction")
     if not (0.3 <= temperature <= 1.5 and 0.6 <= top_p <= 1.0):

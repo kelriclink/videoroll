@@ -15,7 +15,7 @@ def _p(i, start, end, text, voice='reference'):
     return SpokenSegment(i, start, end, text, text, voice)
 
 
-def test_real_s100_fragments_become_one_natural_utterance_without_repeat():
+def test_multi_subtitle_utterance_preserves_exact_repeated_content():
     original = [
         _p(1, .32, 5.84, 'S100 电脑超级酷，即使你不熟悉 S100 这个术语，'),
         _p(2, 5.84, 11.56, '你大概率在过去的某个时候，见过、\n遇到过，甚至用过 S100 电脑，'),
@@ -27,12 +27,39 @@ def test_real_s100_fragments_become_one_natural_utterance_without_repeat():
     assert len(groups)==2
     assert groups[0].source_indices==(1,2,3)
     assert groups[0].part.start==.32 and groups[0].part.end==12.56
-    assert groups[0].duplicate_removed
-    assert groups[0].part.speech_text.count('见过、') == 1
+    # Dubbing must never infer that the speaker's intentional repetition can
+    # be removed just because the adjacent subtitles share a long prefix.
+    assert groups[0].part.speech_text.count('见过、') == 2
     assert '一台 S100 电脑。' in groups[0].part.speech_text
     assert groups[1].source_indices==(4,5)
     assert original[1].speech_text.count('见过、')==1
     assert original[2].speech_text.startswith('见过、')  # Display subtitles unchanged.
+
+
+@pytest.mark.parametrize('a,b', [
+    ('我们必须认真讨论这个重要问题，', '必须认真讨论这个重要问题，因为后果严重。'),
+    ('第一次要确保所有设备完全断电，', '确保所有设备完全断电，再重新开启。'),
+    ('We need to verify the signal,', 'verify the signal, even if it looks fine.'),
+    ('这就是他的结论：', '这就是他的结论：还有一个例外。'),
+])
+def test_repeated_phrase_preserved_in_dubbing(a,b):
+    p=[_p(1,0,4,a),_p(2,4,8,b)]
+    units=build_speech_units(p,enabled=True)
+    assert len(units)==1
+    out=units[0].part.speech_text
+    # Normalize harmless whitespace/punctuation but never delete a real phrase.
+    from videoroll.apps.dubbing.speech_units import normalize_spoken_text
+    assert out==normalize_spoken_text(a)+normalize_spoken_text(b)
+    assert units[0].source_indices==(1,2)
+
+
+def test_disabled_by_default_and_explicit_opt_in():
+    from videoroll.apps.dubbing.quality import normalize_quality
+    from videoroll.apps.orchestrator_api.schemas import DubbingActionRequest
+    q=normalize_quality(model='Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice')
+    assert q['auto_group_speech'] is False
+    request=DubbingActionRequest(subtitle_job_id='d9317475-f1dd-472a-a44c-e19c777f6f4e',subtitle_video_key='raw/any.mp4')
+    assert request.auto_group_speech is False
 
 
 def test_keep_speaker_boundaries_and_long_silence():
@@ -129,3 +156,46 @@ def test_voice_preview_endpoint_and_script_editor_follow_group_cache(tmp_path):
         after=list_dubbing_segments(task_id,job_id,offset=0,limit=40,db=db,store=store)
         assert after['items'][0]['has_audio'] is False
         assert '应该把句子真正讲完' in after['items'][0]['generated_speech_text']
+
+
+@pytest.mark.parametrize('phrases', [
+    ('请确认各个设备正常供电，','先用万用表检查端子，再继续运行。'),
+    ('我们必须保证信号完整，','保证信号完整，别忽略电源干扰。'),
+    ('The voltage is five volts,','not fifteen, five volts.'),
+    ('今天的结论是，','如果温度不稳定，就必须停止。'),
+    ('如果它又出现故障，','那么请检查供电和接地。'),
+    ('0.125 英寸，','也就是大约三点一七五毫米。'),
+])
+def test_speech_group_never_discards_source_phrases(phrases):
+    a,b=phrases
+    units=build_speech_units([_p(1,0,2.5,a),_p(2,2.5,5,b)],enabled=True)
+    assert [u.source_indices for u in units]==[(1,2)]
+    text=units[0].part.speech_text
+    assert text.count(normalize_spoken_text(a))==1
+    assert text.count(normalize_spoken_text(b))==1
+
+
+def test_grouping_is_deterministic_with_generic_fragments():
+    import random
+    rng=random.Random(1429)
+    pieces=['重复强调必须保留，','这是一段完整的讲解，','应该先完成检查，',
+            '但是信号可能不稳定，','最后输出检测报告。','0.125 毫米的间隙，',
+            '还有另一个测试参数，','同一含义并不保证同一发音。']
+    for _ in range(100):
+        parts=[];cursor=0.0
+        for i in range(rng.randint(2,14)):
+            text=rng.choice(pieces)
+            duration=rng.uniform(.5,3.1)
+            next_end=cursor+duration
+            parts.append(_p(i+1,cursor,next_end,text))
+            cursor=next_end+rng.uniform(0,.6)
+        one=build_speech_units(parts,enabled=True)
+        two=build_speech_units(parts,enabled=True)
+        assert one==two
+        assert [ix for unit in one for ix in unit.source_indices]==[p.index for p in parts]
+        assert all(unit.part.start<unit.part.end for unit in one)
+        # A joined group must contain every original phrase, including repeats.
+        for unit in one:
+            originals=[parts[ix-1].speech_text for ix in unit.source_indices]
+            assert all(unit.part.speech_text.count(phrase)>=originals.count(phrase)
+                       for phrase in set(originals))

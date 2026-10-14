@@ -86,6 +86,7 @@ export function TaskDetailDubbing({
   const [loading, setLoading] = useState(true);
   const [submitting, setSubmitting] = useState(false);
   const [debugTiming, setDebugTiming] = useState(true);
+  const [autoGroupSpeech, setAutoGroupSpeech] = useState(false);
   const [forceRegenerate, setForceRegenerate] = useState(true);
   const restoredJob = useRef(false);
   const [error, setError] = useState<string | null>(null);
@@ -127,6 +128,7 @@ export function TaskDetailDubbing({
           setMixMode((q?.mix_mode as typeof mixMode) || "replace");
           setBatchSize((q?.batch_size as 1 | 2 | 4) || 1);
           setDebugTiming(q?.debug_timing ?? true);
+          setAutoGroupSpeech(q?.auto_group_speech ?? false);
         }
       }
       setError(null);
@@ -226,7 +228,8 @@ export function TaskDetailDubbing({
         cosy_mode: (q?.cosy_mode as "cross_lingual" | "zero_shot" | "instruct") ?? "cross_lingual",
         cosy_speed: q?.cosy_speed ?? 1, debug_timing: true, auto_group_speech: true,
       }, false);
-      setMessage("已启用自动合句与短字幕优化，原任务继续生成。");
+      setAutoGroupSpeech(true);
+      setMessage("已启用实验性短字幕合句，原任务继续生成；不会自动删除重复内容。");
       await reloadJobs();
     } catch (reason) {setError(String(reason));}
     finally {setSubmitting(false);}
@@ -446,6 +449,11 @@ export function TaskDetailDubbing({
       </div> : null}
       <details className="mt-3 rounded border border-slate-200 p-3">
         <summary className="cursor-pointer text-sm font-medium">高级参数 · 原声混音、批量与语气指令</summary>
+        <label className="mt-3 flex items-center gap-2 text-sm">
+          <input type="checkbox" checked={autoGroupSpeech}
+            onChange={(event) => setAutoGroupSpeech(event.target.checked)} disabled={trulyBusy || submitting}/>
+          实验性合并短字幕（保留原文，默认关闭）
+        </label>
       <div className="mt-3 grid gap-3 md:grid-cols-2">
         <label className="text-sm text-slate-700">原声音轨
           <select className="mt-1 block w-full rounded border p-2" value={mixMode}
@@ -503,7 +511,7 @@ export function TaskDetailDubbing({
               temperature, top_p: topP, batch_size: usingCosy ? 1 : batchSize, mix_mode: mixMode,
               reference_profile_id: usingCosy ? profileId : null,
               cosy_mode: cosyMode, cosy_speed: cosySpeed, debug_timing: debugTiming,
-              auto_group_speech: true,
+              auto_group_speech: autoGroupSpeech,
             })}>
             {submitting ? "正在提交…" : preview ? "生成一句试听" : "完整配音"}
           </button>
