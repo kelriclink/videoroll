@@ -198,3 +198,30 @@ GET 查询 `/tasks/{task_id}/dubbing_jobs`。配音成功后返回 `output.audio
 - 生产机源码曾报告提交 `92eb843`，开发分支基于另一台开发机 `c3f529e`，两台机器未完成同一 Git 历史确认；部署前必须对齐提交并检查最近字幕修复。
 - 当前 P2 仅是产品分 P 名称，源码中的 NVENC 编码器预设 `p2` 与该功能无关。
 - V100 显存已有其他模型占用，Qwen3-TTS 推理必须独立探测可用显存、计算精度和注意力实现，不可默认套用 BF16/FlashAttention-2。
+
+## 配音生产可靠性第二阶段（2026-10-14）
+
+### 上游参考
+
+- [pyVideoTrans 架构和复审流程](https://en.pyvideotrans.com/yuanli)：音频与字幕编辑、逐句重配、SpeedRate 配音/视频对齐。VideoRoll 保留源视频时长，**不会偷偷截断语音或随意减速视频**。
+- [pyVideoTrans 音画同步说明](https://doc.pyvideotrans.com/subtitle-sound-alignment)：语音加速、视频减速及二者协作模式。VideoRoll 对超时句子先停止在待修订状态，以避免 334 句全跑后统一失败。
+- [Qwen3-TTS 官方批量 CustomVoice 示例](https://github.com/QwenLM/Qwen3-TTS/blob/main/examples/test_model_12hz_custom_voice.py)：1.7B 的语气指令及多句批量文本支持，0.6B CustomVoice 不支持 instruct。
+
+### 主要更改
+
+- 新 DubbingJob 生命周期：queued → preparing → synthesizing → preview_ready (首句试听确认) → queued → synthesizing → aligning → mixing → succeeded；或 pause_requested → paused → retry；cancel_requested → canceled；超长语音 → needs_review → 改稿 → retry。
+- 暂停/取消为**协作式安全停止**：当前正在执行的单句或批次推理结束后检查控制信号；不会 SIGKILL GPU Worker 或把源 Task 标记 canceled。可恢复缓存，允许多次断点继续。用户不应将此误以为立即中止 GPU 内核。
+- 正式生成前必须先完成首句试听。试听只产生首句 WAV，不封装全视频；确认后复用缓存继续，避免单纯点击即生成数百句。
+- 每句 WAV 产生后即检查是否适合下一句字幕起点、0.5s 扩展及最大 1.25x 语速；不符合便进入 needs_review，并提供具体的句号、时长、槽位和所需倍速。
+- 配音页面提供“AI 精简口播建议”，按下后调用当前已配置的兼容 OpenAI 翻译接口生成**候选文案**。结果不改变中文字幕、不自动保存或自动开始合成，必须由用户确认并保存；语义准确性仍需人工检查。该功能依赖配置了可用 API Key 的翻译模型。未经设置时返回明确错误。
+- CustomVoice 开放 instruct（只针对 1.7B）、temperature、top_p 及可选 batch_size=1/2/4。V100 默认 1；批量模式需进一步基准测试及注意显存峰值。生成结果记录 batch 数、生成音频秒数及墙钟耗时。
+- 音频缓存 schema2 将模型标记版本、文本、语音角色、instruct、temperature、top_p 纳入哈希；旧任务继续使用原有 schema1，避免升级强制丢缓存。并发创建通过锁定同一 Task 行并二次去重，杜绝不同 operation_key 同时运行两个配音任务。
+- 模型安装但 Worker 关闭时，API 返回 503 并禁用页面首句试听；不能提交无人执行的队列。恢复时也检查 Worker 是否存在。
+- 源视频处理模式为 replace、original_low 和 background_only。最后一项由 Demucs htdemucs 分离「no_vocals」伴奏轨，再与中文配音混音；要求单独安装 Demucs 和模型，未安装时 UI 禁止选择并返回 503，不会用“降低原声”冒充人声分离。
+- 暂停、首句预览和待修订状态最多保护相关素材 7 天；运行中的状态持续保护。超过保留期限可能由存储保留/投稿清理流程清除素材；配音已完成及已取消的任务依既定保留策略处理。
+
+### 发布边界
+
+- 新状态使用现有的 DubbingJob.status 字符串字段、request_json 和 output_json，不引入数据库迁移。
+- 生产环境先只部署后端与前端，并**保持当前配音 Worker 禁用**，不会自动恢复之前被取消的 334 句任务。
+- 仍需要短片真实试听验证中文配音自然度、Demucs 分离音质，以及 batch_size 2/4 在 V100 上的实际性能；不应把这些尚未测试的能力标为已完成的音质性能验收。

@@ -305,7 +305,16 @@ def cleanup_terminal_task_resources(
             # corresponding durable dubbing job is still in flight.
             active_dubbing = db.query(DubbingJob.id).filter(
                 DubbingJob.task_id == Task.id,
-                DubbingJob.status.in_(["queued", "preparing", "synthesizing", "aligning", "mixing"]),
+                (
+                    DubbingJob.status.in_([
+                        "queued", "preparing", "synthesizing", "aligning", "mixing",
+                        "pause_requested", "cancel_requested",
+                    ])
+                    | (
+                        DubbingJob.status.in_(["paused", "preview_ready", "needs_review"])
+                        & (DubbingJob.updated_at >= now - timedelta(days=7))
+                    )
+                ),
             ).exists()
             query = query.filter(~active_dubbing)
         task_ids = {row[0] for row in query.all()}

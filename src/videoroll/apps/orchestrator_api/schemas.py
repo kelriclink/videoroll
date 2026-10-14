@@ -222,6 +222,12 @@ class DubbingActionRequest(BaseModel):
         "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
     ] = "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"
     retain_original_audio: bool = False
+    preview_only: bool = False
+    instruct: str = Field(default="", max_length=120)
+    temperature: float = Field(default=0.9, ge=0.3, le=1.5)
+    top_p: float = Field(default=0.9, ge=0.6, le=1)
+    batch_size: Literal[1, 2, 4] = 1
+    mix_mode: Literal["replace", "original_low", "background_only"] = "replace"
 
 
 class RemoteJobResponse(BaseModel):

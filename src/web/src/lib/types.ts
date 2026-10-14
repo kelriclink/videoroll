@@ -63,7 +63,7 @@ export type DubbingJob = {
   id: string;
   task_id: string;
   subtitle_job_id: string | null;
-  status: "queued" | "preparing" | "synthesizing" | "aligning" | "mixing" | "succeeded" | "failed" | "canceled";
+  status: "queued" | "preparing" | "synthesizing" | "aligning" | "mixing" | "succeeded" | "failed" | "canceled" | "pause_requested" | "cancel_requested" | "paused" | "preview_ready" | "needs_review";
   progress: number;
   operation_key: string | null;
   request: {
@@ -71,6 +71,8 @@ export type DubbingJob = {
     voice?: string;
     model_path?: string;
     retain_original_audio?: boolean;
+    preview_only?: boolean;
+    quality?: { instruct?: string; temperature?: number; top_p?: number; batch_size?: number; mix_mode?: string };
   };
   output: {
     audio_key?: string;
@@ -79,6 +81,8 @@ export type DubbingJob = {
     duration?: number;
     segments_total?: number;
     segments?: Record<string, string>;
+    timing_issue?: { segment_index: number; duration: number; slot: number; required_speed: number } | null;
+    performance?: { chunks: number; wall_seconds: number; audio_seconds: number; last_batch_size: number };
   };
   error_message: string | null;
   created_at: string;

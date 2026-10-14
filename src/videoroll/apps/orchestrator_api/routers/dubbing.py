@@ -4,6 +4,8 @@ from __future__ import annotations
 import json
 import uuid
 
+import httpx
+
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
@@ -59,6 +61,7 @@ def list_dubbing_segments(
     job = _owned_job(db, task_id, job_id)
     segments = _speech_segments(job, store)
     model = str(job.request_json.get("model_path") or "")
+    quality = (job.request_json.get("quality") or {}) if job.request_json.get("cache_schema") == 2 else None
     successful = dict((job.output_json or {}).get("segments") or {})
     overrides = job.request_json.get("speech_overrides") or {}
     return {
@@ -68,7 +71,7 @@ def list_dubbing_segments(
                 "index": item.index, "start": item.start, "end": item.end,
                 "subtitle_text": item.subtitle_text, "speech_text": item.speech_text,
                 "overridden": str(item.index) in overrides,
-                "has_audio": segment_cache_key(item, model) in successful,
+                "has_audio": segment_cache_key(item, model, quality=quality) in successful,
             }
             for item in segments[offset:offset + limit]
         ],
@@ -85,7 +88,7 @@ def edit_dubbing_segment(
     store: FileStore = Depends(get_store),
 ) -> dict:
     job = _owned_job(db, task_id, job_id, lock=True)
-    if job.status not in {"queued", "failed"} or job.lease_owner:
+    if job.status not in {"queued", "failed", "paused", "needs_review", "preview_ready"} or job.lease_owner:
         raise HTTPException(409, "only inactive queued/failed dubbing jobs can be edited")
     segments = _speech_segments(job, store)
     if index < 1 or index > len(segments):
@@ -100,11 +103,54 @@ def edit_dubbing_segment(
     job.request_json = request
     # The audio files remain cached under their content hashes, but progress
     # from the old spoken script must not be shown as the new script.
-    job.output_json = {}
-    job.progress = 0
+    # Keep successful cache references for other lines, but the edited line
+    # now has a new content-addressed key. A preview must be regenerated if
+    # its first line was edited.
+    job.output_json = {**dict(job.output_json or {}), "timing_issue": None}
+    if job.status in ("needs_review", "preview_ready"):
+        job.status = "paused"
     job.error_message = None
     db.commit()
     return {"index": index, "speech_text": script, "status": job.status}
+
+
+@router.post("/tasks/{task_id}/dubbing_jobs/{job_id}/segments/{index}/suggest")
+def suggest_dubbing_speech(
+    task_id: uuid.UUID,
+    job_id: uuid.UUID,
+    index: int,
+    db: Session = Depends(get_db),
+    store: FileStore = Depends(get_store),
+) -> dict:
+    """Generate an optional proposal only; no writes to the task or audio."""
+    from videoroll.apps.dubbing.rewrite import propose_concise_script
+    from videoroll.apps.subtitle_service.translate_settings_store import get_translate_settings
+    from videoroll.config import get_subtitle_settings
+
+    job = _owned_job(db, task_id, job_id)
+    if job.status not in {"queued", "failed", "paused", "needs_review", "preview_ready"} or job.lease_owner:
+        raise HTTPException(409, "pause the dubbing job before requesting a rewrite")
+    items = _speech_segments(job, store)
+    if not 1 <= index <= len(items):
+        raise HTTPException(404, "segment not found")
+    part = items[index - 1]
+    next_start = items[index].start if index < len(items) else part.end + 0.5
+    slot = max(0.1, min(part.end + 0.5, next_start - 0.08) - part.start)
+    settings = get_translate_settings(db, get_subtitle_settings())
+    # Do not keep a PostgreSQL transaction open across external inference.
+    db.rollback()
+    try:
+        candidate = propose_concise_script(
+            text=part.speech_text,
+            target_seconds=slot,
+            cfg=settings,
+        )
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except httpx.HTTPError as exc:
+        raise HTTPException(502, f"rewrite model request failed: {type(exc).__name__}") from exc
+    return {"index": index, "original": part.speech_text, "suggestion": candidate,
+            "requires_approval": True, "target_seconds": slot}
 
 
 @router.get("/tasks/{task_id}/dubbing_jobs/{job_id}/segments/{index}/audio")
@@ -120,7 +166,8 @@ def preview_dubbing_segment(
     if index < 1 or index > len(segments):
         raise HTTPException(404, "dubbing segment not found")
     model = str(job.request_json.get("model_path") or "")
-    key = segment_cache_key(segments[index - 1], model)
+    quality = (job.request_json.get("quality") or {}) if job.request_json.get("cache_schema") == 2 else None
+    key = segment_cache_key(segments[index - 1], model, quality=quality)
     saved = str((job.output_json or {}).get("segments", {}).get(key) or "")
     if not saved:
         # Previously generated clips remain independently cached. Only grant

@@ -25,11 +25,18 @@ def _run_dubbing_job(job_id: str) -> dict[str, str]:
     from videoroll.config import get_subtitle_settings
     from videoroll.db.migrate import initialize_database
     from videoroll.db.session import get_sessionmaker
+    from videoroll.db.models import DubbingJob
     from videoroll.storage.filesystem import FileStore
 
     settings = get_subtitle_settings()
     selected = selection()
     initialize_database(settings.database_url)
+    factory = get_sessionmaker(settings.database_url)
+    with factory() as db:
+        current = db.get(DubbingJob, uuid.UUID(job_id))
+        if current is None:
+            raise ValueError("dubbing job does not exist")
+        quality = dict((current.request_json or {}).get("quality") or {})
 
     def make_synthesizer(model: str, voice: str) -> QwenCustomVoice:
         if not installed(model):
@@ -37,6 +44,9 @@ def _run_dubbing_job(job_id: str) -> dict[str, str]:
         return QwenCustomVoice(
             model_path=str(folder(model)), cache_identity=model,
             device=selected["device"], voice=voice,
+            instruct=str(quality.get("instruct") or ""),
+            temperature=float(quality.get("temperature") or 0.9),
+            top_p=float(quality.get("top_p") or 0.9),
         )
     return execute_dubbing_job(
         uuid.UUID(job_id),
@@ -69,5 +79,6 @@ def register_dubbing_job_task(hatchet: Any) -> Any:
     )
     def dubbing_job(input: DubbingJobWorkflowInput, _ctx: Any) -> dict[str, str]:
         result = _run_dubbing_job(input.job_id)
-        return {"status": "succeeded", "video_key": str(result["video_key"])}
+        return {"status": str(result.get("status") or "succeeded"),
+                "video_key": str(result.get("video_key") or "")}
     return dubbing_job

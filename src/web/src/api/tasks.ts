@@ -78,10 +78,30 @@ export const tasksApi = {
     voice: string;
     model_path: string;
     retain_original_audio: boolean;
+    preview_only?: boolean;
+    instruct?: string;
+    temperature?: number;
+    top_p?: number;
+    batch_size?: 1 | 2 | 4;
+    mix_mode?: "replace" | "original_low" | "background_only";
   }) {
     return fetchJson<{ job_id: string; status: string }>(
       orchestratorUrl(`/tasks/${taskId}/actions/dubbing`),
       { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(request) },
+    );
+  },
+
+  controlDubbing(taskId: string, jobId: string, action: "pause" | "cancel") {
+    return fetchJson<{ job_id: string; status: string }>(
+      orchestratorUrl(`/tasks/${taskId}/dubbing_jobs/${jobId}/control?action=${action}`),
+      { method: "POST" },
+    );
+  },
+
+  confirmDubbing(taskId: string, jobId: string) {
+    return fetchJson<{ job_id: string; status: string }>(
+      orchestratorUrl(`/tasks/${taskId}/dubbing_jobs/${jobId}/confirm`),
+      { method: "POST" },
     );
   },
 
@@ -105,6 +125,13 @@ export const tasksApi = {
       orchestratorUrl(`/tasks/${taskId}/dubbing_jobs/${jobId}/segments/${index}`),
       { method: "PUT", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ speech_text: speechText }) },
+    );
+  },
+
+  suggestDubbingSpeech(taskId: string, jobId: string, index: number) {
+    return fetchJson<{ index: number; original: string; suggestion: string; requires_approval: boolean; target_seconds: number }>(
+      orchestratorUrl(`/tasks/${taskId}/dubbing_jobs/${jobId}/segments/${index}/suggest`),
+      { method: "POST" },
     );
   },
 

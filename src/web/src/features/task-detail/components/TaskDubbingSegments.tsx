@@ -25,8 +25,10 @@ export function TaskDubbingSegments({
   const [segments, setSegments] = useState<Segment[]>([]);
   const [edits, setEdits] = useState<Record<number, string>>({});
   const [savingIndex, setSavingIndex] = useState<number | null>(null);
+  const [suggestingIndex, setSuggestingIndex] = useState<number | null>(null);
+  const [suggested, setSuggested] = useState<Record<number, boolean>>({});
   const [error, setError] = useState<string | null>(null);
-  const editable = job.status === "failed" || job.status === "queued";
+  const editable = ["failed", "queued", "paused", "needs_review", "preview_ready"].includes(job.status);
 
   const fetchSegments = useCallback(async () => {
     try {
@@ -57,6 +59,20 @@ export function TaskDubbingSegments({
       setError(String(reason));
     } finally {
       setSavingIndex(null);
+    }
+  }
+
+  async function suggest(item: Segment) {
+    setSuggestingIndex(item.index);
+    setError(null);
+    try {
+      const candidate = await tasksApi.suggestDubbingSpeech(taskId, job.id, item.index);
+      setEdits((before) => ({ ...before, [item.index]: candidate.suggestion }));
+      setSuggested((before) => ({ ...before, [item.index]: true }));
+    } catch (reason) {
+      setError(String(reason));
+    } finally {
+      setSuggestingIndex(null);
     }
   }
 
@@ -91,6 +107,13 @@ export function TaskDubbingSegments({
                 ) : <span className="text-slate-500">尚未生成该句音频</span>}
                 {editable ? (
                   <button type="button" className="rounded border px-2 py-1"
+                    disabled={suggestingIndex !== null || savingIndex !== null}
+                    onClick={() => void suggest(item)}>
+                    {suggestingIndex === item.index ? "生成建议中…" : "AI 精简口播建议"}
+                  </button>
+                ) : null}
+                {editable ? (
+                  <button type="button" className="rounded border px-2 py-1"
                     disabled={savingIndex !== null || !edits[item.index]?.trim()
                       || edits[item.index]?.trim() === item.speech_text}
                     onClick={() => void saveSegment(item)}>
@@ -98,6 +121,9 @@ export function TaskDubbingSegments({
                   </button>
                 ) : null}
               </div>
+              {suggested[item.index] ? (
+                <p className="mt-1 text-amber-700">AI 建议仅供参考，可能丢失术语或改变含义。请核对后点击「保存口播修改」，不会自动覆盖原字幕。</p>
+              ) : null}
             </div>
           ))}
           {total > 30 ? (

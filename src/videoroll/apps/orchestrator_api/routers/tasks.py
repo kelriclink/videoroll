@@ -182,7 +182,17 @@ def enqueue_dubbing_job(
     db: Session = Depends(get_db),
 ) -> RemoteJobResponse:
     from videoroll.apps.dubbing.job import create_dubbing_job
+    from videoroll.apps.dubbing.model_management import installed
+    from videoroll.apps.dubbing.worker_status import worker_status
     from videoroll.workflows.launcher import PipelineLauncher
+    if not worker_status()["available"]:
+        raise HTTPException(503, "dubbing worker is not running; enable it before submitting")
+    if not installed(payload.model_path):
+        raise HTTPException(409, "Qwen3-TTS model is not installed")
+    if payload.mix_mode == "background_only":
+        from videoroll.apps.dubbing.separation import available
+        if not available():
+            raise HTTPException(503, "Demucs separation is not installed; use replace or original_low")
 
     try:
         job = create_dubbing_job(
@@ -191,6 +201,12 @@ def enqueue_dubbing_job(
             operation_key=payload.operation_key, voice=payload.voice,
             model_path=payload.model_path,
             retain_original_audio=payload.retain_original_audio,
+            preview_only=payload.preview_only,
+            instruct=payload.instruct,
+            temperature=payload.temperature,
+            top_p=payload.top_p,
+            batch_size=payload.batch_size,
+            mix_mode=payload.mix_mode,
         )
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -214,6 +230,7 @@ def retry_dubbing_job(
     """Explicit operator recovery for failed or expired-lease dubbing runs."""
     from videoroll.workflows.launcher import PipelineLauncher
     from videoroll.apps.dubbing.job import lease_is_active
+    from videoroll.apps.dubbing.worker_status import worker_status
 
     job = db.query(DubbingJob).filter(
         DubbingJob.task_id == task_id, DubbingJob.id == job_id,
@@ -227,8 +244,10 @@ def retry_dubbing_job(
         raise HTTPException(409, "completed or canceled dubbing job cannot be retried")
     if job.lease_owner and lease_is_active(job.lease_until):
         raise HTTPException(409, "dubbing worker is still within its active lease")
-    if job.status not in {"queued", "failed", "preparing", "synthesizing", "aligning", "mixing"}:
+    if job.status not in {"queued", "failed", "paused", "needs_review", "preparing", "synthesizing", "aligning", "mixing"}:
         raise HTTPException(409, f"dubbing job cannot be retried from {job.status}")
+    if not worker_status()["available"]:
+        raise HTTPException(503, "dubbing worker is not running")
     job.lease_owner = None
     job.lease_until = None
     job.status = "queued"
@@ -243,6 +262,57 @@ def retry_dubbing_job(
             502, f"dubbing recovery dispatch failed; job still queued: {type(exc).__name__}",
         ) from exc
     return RemoteJobResponse(job_id=job.id, status="queued")
+
+
+
+@router.post("/tasks/{task_id}/dubbing_jobs/{job_id}/confirm", response_model=RemoteJobResponse)
+def confirm_dubbing_preview(
+    task_id: uuid.UUID,
+    job_id: uuid.UUID,
+    settings: OrchestratorSettings = Depends(get_settings),
+    db: Session = Depends(get_db),
+) -> RemoteJobResponse:
+    from videoroll.workflows.launcher import PipelineLauncher
+    from videoroll.apps.dubbing.worker_status import worker_status
+    if not worker_status()["available"]:
+        raise HTTPException(503, "dubbing worker is not running")
+    job = db.query(DubbingJob).filter(
+        DubbingJob.task_id == task_id, DubbingJob.id == job_id,
+    ).with_for_update().one_or_none()
+    if job is None:
+        raise HTTPException(404, "dubbing job not found")
+    if job.status != "preview_ready":
+        raise HTTPException(409, "only a completed preview can be confirmed")
+    request = dict(job.request_json or {})
+    request["preview_only"] = False
+    job.request_json = request
+    job.status = "queued"
+    job.lease_owner = None
+    job.lease_until = None
+    db.commit()
+    PipelineLauncher(settings).launch_dubbing_job(
+        job.id, dispatch_key=f"{job.id}:preview-confirm:{uuid.uuid4().hex}",
+    )
+    return RemoteJobResponse(job_id=job.id, status="queued")
+
+
+@router.post("/tasks/{task_id}/dubbing_jobs/{job_id}/control")
+def control_dubbing_job(
+    task_id: uuid.UUID,
+    job_id: uuid.UUID,
+    action: str = Query(pattern="^(pause|cancel)$"),
+    db: Session = Depends(get_db),
+) -> dict[str, str]:
+    from videoroll.apps.dubbing.control import request_control
+    try:
+        job = request_control(db, task_id, job_id, action=action)
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return {"job_id": str(job.id), "status": job.status}
+
+
 
 
 @router.post("/tasks/{task_id}/actions/subtitle_retranslate", response_model=RemoteJobResponse)

@@ -16,6 +16,31 @@ class DubbingTimingError(ValueError):
     """A spoken segment cannot safely fit in the original video timeline."""
 
 
+class SpeechTooLong(DubbingTimingError):
+    def __init__(self, index: int, duration: float, slot: float, required_speed: float):
+        self.index, self.duration, self.slot = index, duration, slot
+        self.required_speed = required_speed
+        super().__init__(f"segment {index}: speech {duration:.3f}s exceeds slot {slot:.3f}s "
+                         f"(requires {required_speed:.2f}x; maximum 1.25x). "
+                         "Shorten this spoken script and regenerate this segment.")
+
+
+def check_segment_fit(segments: Sequence[SpokenSegment], index: int, duration: float,
+                      *, video_duration: float, max_extension: float = 0.5,
+                      min_gap: float = 0.08, max_speed: float = 1.25) -> float:
+    """Immediately validate each generated clip against the next speech start."""
+    part = segments[index]
+    next_start = segments[index + 1].start if index + 1 < len(segments) else video_duration + min_gap
+    deadline = min(part.end + max_extension, next_start - min_gap, video_duration)
+    slot = deadline - part.start
+    if slot <= 0:
+        raise DubbingTimingError(f"segment {part.index}: no audio slot available")
+    speed = max(1.0, duration / slot)
+    if speed > max_speed + 1e-8:
+        raise SpeechTooLong(part.index, duration, slot, speed)
+    return speed
+
+
 @dataclass(frozen=True, slots=True)
 class SpokenSegment:
     index: int

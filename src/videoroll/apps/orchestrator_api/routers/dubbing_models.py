@@ -7,6 +7,8 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from videoroll.apps.dubbing.model_management import choose, download, inventory
+from videoroll.apps.dubbing.worker_status import worker_status
+from videoroll.apps.dubbing.separation import available as demucs_available
 
 router = APIRouter()
 
@@ -24,7 +26,8 @@ class ModelDownload(BaseModel):
 
 @router.get("/settings/dubbing")
 def get_dubbing_config() -> dict:
-    return inventory()
+    return {**inventory(), "worker": worker_status(),
+            "separation": {"available": demucs_available(), "engine": "Demucs htdemucs"}}
 
 
 @router.put("/settings/dubbing")

@@ -42,7 +42,9 @@ class DummyLauncher:
 def test_failed_dubbing_job_can_relaunch_without_new_job_id():
     factory, task_id, job_id = _init()
     DummyLauncher.runs = []
-    with patch("videoroll.workflows.launcher.PipelineLauncher", DummyLauncher):
+    with patch("videoroll.workflows.launcher.PipelineLauncher", DummyLauncher), patch(
+        "videoroll.apps.dubbing.worker_status.worker_status", return_value={"available": True, "state": "active"}
+    ):
         with factory() as db:
             result = retry_dubbing_job(task_id, job_id, settings=SimpleNamespace(), db=db)
             assert result.status == "queued"
@@ -68,7 +70,9 @@ def test_live_lease_refuses_retry_but_expired_one_can_recover():
         job = db.get(DubbingJob, job_id)
         job.lease_until = datetime.now(timezone.utc) - timedelta(minutes=1)
         db.commit()
-    with patch("videoroll.workflows.launcher.PipelineLauncher", DummyLauncher):
+    with patch("videoroll.workflows.launcher.PipelineLauncher", DummyLauncher), patch(
+        "videoroll.apps.dubbing.worker_status.worker_status", return_value={"available": True, "state": "active"}
+    ):
         with factory() as db:
             result = retry_dubbing_job(task_id, job_id, settings=SimpleNamespace(), db=db)
             assert result.status == "queued"

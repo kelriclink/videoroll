@@ -20,6 +20,9 @@ from videoroll.apps.dubbing.pipeline import (
     SpeechSynthesizer, generate_dubbed_media, segment_cache_key, spoken_segments_from_json,
 )
 from videoroll.db.models import Asset, AssetKind, DubbingJob, SubtitleJob, Task, TaskStatus
+from videoroll.apps.dubbing.quality import ACTIVE, normalize_quality
+from videoroll.apps.dubbing.control import DubbingInterrupted, check_control
+from videoroll.apps.dubbing.timing import SpeechTooLong
 from videoroll.storage.filesystem import FileStore
 from videoroll.utils.hashing import sha256_file
 
@@ -55,6 +58,12 @@ def create_dubbing_job(
     voice: str = "Vivian",
     model_path: str = "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
     retain_original_audio: bool = False,
+    preview_only: bool = False,
+    instruct: str = "",
+    temperature: float = 0.9,
+    top_p: float = 0.9,
+    batch_size: int = 1,
+    mix_mode: str = "replace",
 ) -> DubbingJob:
     """Create a manual dubbing job from translated subtitles and raw or P1 video."""
     existing = db.query(DubbingJob).filter(
@@ -62,12 +71,36 @@ def create_dubbing_job(
     ).first()
     if existing is not None:
         return existing
-    task = db.get(Task, task_id)
+    # Serialize competing creates for a single source task even when callers
+    # supply distinct idempotency keys. PostgreSQL locks the parent Task row.
+    task = db.query(Task).filter(Task.id == task_id).with_for_update().one_or_none()
     subtitle_job = db.get(SubtitleJob, subtitle_job_id)
+    # Recheck idempotency after the parent row lock to serialize competing
+    # requests with the same operation key.
+    existing = db.query(DubbingJob).filter(
+        DubbingJob.task_id == task_id, DubbingJob.operation_key == operation_key,
+    ).first()
+    if existing is not None:
+        return existing
     if task is None or subtitle_job is None or subtitle_job.task_id != task_id:
         raise ValueError("task or source subtitle job not found")
     if task.status == TaskStatus.canceled:
         raise ValueError("canceled task cannot be dubbed")
+    competing = db.query(DubbingJob).filter(
+        DubbingJob.task_id == task_id, DubbingJob.status.in_(list(ACTIVE)),
+    ).first()
+    if competing is not None:
+        raise ValueError(f"another dubbing job is active: {competing.id}")
+    quality = normalize_quality(instruct=instruct, temperature=temperature,
+                                top_p=top_p, batch_size=batch_size,
+                                mix_mode=mix_mode, model=model_path)
+    # Cache separates different installed model revisions even if the user
+    # keeps the same user-facing model name.
+    import hashlib
+    from videoroll.apps.dubbing.model_management import folder
+    marker = folder(model_path) / ".videoroll-complete.json"
+    if marker.is_file():
+        quality["_model_revision"] = hashlib.sha256(marker.read_bytes()).hexdigest()[:16]
     segments_key = str((subtitle_job.request_json or {}).get("artifacts", {}).get("final_subtitle_segments_key") or "").strip()
     if not segments_key or subtitle_job.status.value != "succeeded":
         raise ValueError("translated subtitles have not finished")
@@ -89,6 +122,9 @@ def create_dubbing_job(
             "source_video_kind": video_asset.kind.value,
             "voice": voice, "model_path": model_path,
             "retain_original_audio": bool(retain_original_audio),
+            "preview_only": bool(preview_only),
+            "cache_schema": 2,
+            "quality": quality,
         },
         output_json={},
     )
@@ -118,8 +154,8 @@ def execute_dubbing_job(
             return dict(job.output_json or {})
         if job.lease_owner and lease_is_active(job.lease_until):
             raise DubbingLeaseBusy(f"dubbing job {job_id} is already running")
-        if job.status == "canceled":
-            raise ValueError("dubbing job canceled")
+        if job.status not in ("queued", "failed", "preparing", "synthesizing", "aligning", "mixing"):
+            raise ValueError(f"dubbing job not runnable from {job.status}")
         task = db.get(Task, job.task_id)
         if task is None or task.status == TaskStatus.canceled:
             raise ValueError("source task is missing or canceled")
@@ -141,6 +177,12 @@ def execute_dubbing_job(
         video = store.path_for(video_key)
         segments = store.path_for(segments_key)
         voice = str(request.get("voice") or "Vivian")
+        quality = dict(request.get("quality") or {})
+        cache_quality = quality if request.get("cache_schema") == 2 else None
+        def safe_point() -> None:
+            with session_factory() as control_db:
+                check_control(control_db, job_id, owner)
+        safe_point()
         model_path = str(request.get("model_path") or "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice")
         workspace.mkdir(parents=True, exist_ok=True)
         raw = json.loads(segments.read_text(encoding="utf-8"))
@@ -151,7 +193,7 @@ def execute_dubbing_job(
         # A resumed task can run on another machine, provided FileStore uses
         # the same shared filesystem. Repopulate cache from persisted assets.
         for part in spoken:
-            key = segment_cache_key(part, model_path)
+            key = segment_cache_key(part, model_path, quality=cache_quality)
             cached_key = f"dub/{task_id}/tts/{key}.wav"
             cached = store.path_for(cached_key, require_exists=False)
             local = cache_dir / f"{key}.wav"
@@ -169,7 +211,11 @@ def execute_dubbing_job(
             try:
                 item = progress_db.get(DubbingJob, job_id)
                 if item is None or item.lease_owner != owner:
-                    raise DubbingLeaseBusy("dubbing job lease changed")
+                    raise DubbingInterrupted("lease_lost")
+                if item.status == "pause_requested":
+                    raise DubbingInterrupted("paused")
+                if item.status == "cancel_requested":
+                    raise DubbingInterrupted("canceled")
                 task_row = progress_db.get(Task, task_id)
                 if task_row is None or task_row.status == TaskStatus.canceled:
                     raise RuntimeError("source task stopped during dubbing")
@@ -186,6 +232,18 @@ def execute_dubbing_job(
                 progress_db.commit()
             finally:
                 progress_db.close()
+        def performance_update(count: int, elapsed: float, audio_seconds: float) -> None:
+            with session_factory() as perf_db:
+                item = perf_db.get(DubbingJob, job_id)
+                if item is None or item.lease_owner != owner:
+                    raise DubbingInterrupted("lease_lost")
+                stats = dict((item.output_json or {}).get("performance") or {})
+                stats["chunks"] = int(stats.get("chunks") or 0) + 1
+                stats["wall_seconds"] = round(float(stats.get("wall_seconds") or 0) + elapsed, 3)
+                stats["audio_seconds"] = round(float(stats.get("audio_seconds") or 0) + audio_seconds, 3)
+                stats["last_batch_size"] = count
+                item.output_json = {**dict(item.output_json or {}), "performance": stats}
+                perf_db.commit()
 
         def stage_update(status: str, progress: int) -> None:
             stage_db = session_factory()
@@ -193,7 +251,9 @@ def execute_dubbing_job(
                 item = stage_db.get(DubbingJob, job_id)
                 task_row = stage_db.get(Task, task_id)
                 if item is None or item.lease_owner != owner:
-                    raise DubbingLeaseBusy("dubbing job ownership lost")
+                    raise DubbingInterrupted("lease_lost")
+                if item.status in ("pause_requested", "cancel_requested"):
+                    raise DubbingInterrupted("paused" if item.status == "pause_requested" else "canceled")
                 if task_row is None or task_row.status == TaskStatus.canceled:
                     raise RuntimeError("source task stopped during dubbing")
                 item.status = status
@@ -211,6 +271,13 @@ def execute_dubbing_job(
             on_segment_done=checkpoint,
             speech_overrides=speech_overrides,
             on_stage=stage_update,
+            on_check=safe_point,
+            quality=cache_quality,
+            batch_size=int(quality.get("batch_size") or 1),
+            on_performance=performance_update,
+            preview_only=bool(request.get("preview_only")),
+            mix_mode=str(quality.get("mix_mode") or (
+                "original_low" if request.get("retain_original_audio") else "replace")),
         )
         track_key = f"dub/{task_id}/audio/{sha256_file(result.audio_path)}.wav"
         video_output_key = f"render/{task_id}/dubbed-{sha256_file(result.video_path)}.mp4"
@@ -220,7 +287,9 @@ def execute_dubbing_job(
         try:
             item = final_db.query(DubbingJob).filter(DubbingJob.id == job_id).with_for_update().one()
             if item.lease_owner != owner:
-                raise DubbingLeaseBusy("dubbing job lease changed before finalization")
+                raise DubbingInterrupted("lease_lost")
+            if item.status in ("cancel_requested", "pause_requested"):
+                raise DubbingInterrupted("canceled" if item.status == "cancel_requested" else "paused")
             task_row = final_db.get(Task, task_id)
             if task_row is None or task_row.status == TaskStatus.canceled:
                 raise RuntimeError("source task stopped before dubbing finalization")
@@ -249,6 +318,24 @@ def execute_dubbing_job(
             return dict(item.output_json)
         finally:
             final_db.close()
+    except (DubbingInterrupted, SpeechTooLong) as error:
+        with session_factory() as state_db:
+            item = state_db.get(DubbingJob, job_id)
+            if item is not None and item.lease_owner == owner:
+                if isinstance(error, SpeechTooLong):
+                    item.status = "needs_review"
+                    item.error_message = str(error)[:2000]
+                    item.output_json = {**dict(item.output_json or {}), "timing_issue": {
+                        "segment_index": error.index, "duration": error.duration,
+                        "slot": error.slot, "required_speed": error.required_speed,
+                    }}
+                elif error.status != "lease_lost":
+                    item.status = error.status
+                    item.error_message = None
+                item.lease_owner = None
+                item.lease_until = None
+                state_db.commit()
+        return {"status": "needs_review" if isinstance(error, SpeechTooLong) else error.status}
     except Exception as error:
         error_db = session_factory()
         try:

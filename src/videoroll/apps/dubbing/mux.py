@@ -20,6 +20,7 @@ def build_dubbed_part_command(
     original_audio_present: bool,
     retain_original_audio: bool = False,
     original_volume: float = 0.10,
+    background_track: Path | None = None,
 ) -> list[str]:
     """Return a deterministic FFmpeg command for a separate dubbed P2 MP4.
 
@@ -33,10 +34,19 @@ def build_dubbed_part_command(
         raise ValueError("original_volume must be between 0 and 1")
     if retain_original_audio and not original_audio_present:
         raise ValueError("cannot mix absent original audio")
+    if background_track is not None and retain_original_audio:
+        raise ValueError("select either low original audio or separated background")
     if subtitle_video == output_video or chinese_audio == output_video:
         raise ValueError("output must be distinct from inputs")
     duration = f"{video_duration:.6f}"
-    if retain_original_audio:
+    if background_track is not None:
+        graph = (
+            "[2:a:0]volume=0.65[background];"
+            f"[1:a:0]apad=whole_dur={duration}[dub];"
+            "[background][dub]amix=inputs=2:duration=longest:normalize=0,"
+            "alimiter=limit=0.95[out]"
+        )
+    elif retain_original_audio:
         graph = (
             f"[0:a:0]volume={original_volume:.4f}[original];"
             f"[1:a:0]apad=whole_dur={duration}[dub];"
@@ -48,6 +58,7 @@ def build_dubbed_part_command(
     return [
         ffmpeg, "-y", "-hide_banner",
         "-i", str(subtitle_video), "-i", str(chinese_audio),
+        *([] if background_track is None else ["-i", str(background_track)]),
         "-filter_complex", graph,
         "-map", "0:v:0", "-map", "[out]", "-map", "0:s?",
         "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",

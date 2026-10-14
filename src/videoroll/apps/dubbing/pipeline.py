@@ -17,7 +17,9 @@ from typing import Any, Callable, Mapping, Protocol
 
 from videoroll.apps.dubbing.audio import assemble_track, wav_duration
 from videoroll.apps.dubbing.mux import build_dubbed_part_command
-from videoroll.apps.dubbing.timing import SpokenSegment, plan_dubbing_timeline, DubbingTimingError
+from videoroll.apps.dubbing.timing import (SpokenSegment, plan_dubbing_timeline,
+                                            check_segment_fit, DubbingTimingError)
+from videoroll.apps.dubbing.quality import audio_cache_key
 
 
 class SpeechSynthesizer(Protocol):
@@ -77,7 +79,11 @@ def spoken_segments_from_json(
     return output
 
 
-def segment_cache_key(segment: SpokenSegment, model_path: str) -> str:
+def segment_cache_key(segment: SpokenSegment, model_path: str,
+                      *, quality: dict[str, Any] | None = None) -> str:
+    if quality is not None:
+        return audio_cache_key(text=segment.speech_text, voice=segment.voice,
+                               model=model_path, quality=quality)
     source = json.dumps({
         "schema": 1, "text": segment.speech_text,
         "voice": segment.voice, "model": model_path, "language": "Chinese",
@@ -99,6 +105,12 @@ def generate_dubbed_media(
     on_segment_done: Callable[[int, int, str, Path], None] | None = None,
     speech_overrides: Mapping[str, str] | None = None,
     on_stage: Callable[[str, int], None] | None = None,
+    on_check: Callable[[], None] | None = None,
+    quality: dict[str, Any] | None = None,
+    batch_size: int = 1,
+    on_performance: Callable[[int, float, float], None] | None = None,
+    mix_mode: str = "replace",
+    preview_only: bool = False,
 ) -> DubbingResult:
     """Synthesize/cache fragments, align them, mux P2; don't modify P1."""
     workspace.mkdir(parents=True, exist_ok=True)
@@ -107,31 +119,86 @@ def generate_dubbed_media(
         voice=voice, speech_overrides=speech_overrides,
     )
     duration = probe_duration(subtitle_video, ffprobe=ffprobe)
+    # Early structural validation: reject invalid source timestamps before
+    # spending hours on inference. Dummy durations test only intervals.
+    plan_dubbing_timeline(
+        segments, {s.index: max(0.01, (s.end - s.start) * 0.5) for s in segments},
+        video_duration=duration,
+    )
+    if retain_original_audio or mix_mode in ("original_low", "background_only"):
+        audio_probe = subprocess.run(
+            [ffprobe, "-v", "error", "-select_streams", "a:0",
+             "-show_entries", "stream=index", "-of", "csv=p=0",
+             str(subtitle_video)],
+            capture_output=True, text=True, timeout=60, check=True,
+        )
+        original_audio_present = bool(audio_probe.stdout.strip())
+        if not original_audio_present:
+            raise DubbingTimingError("selected audio mix requires an original audio stream")
     audio_files: dict[int, Path] = {}
     tts_durations: dict[int, float] = {}
     keys: dict[str, str] = {}
-    for n, item in enumerate(segments, start=1):
-        key = segment_cache_key(item, synthesizer.model_path)
-        segment_file = workspace / "segments" / f"{key}.wav"
-        if not segment_file.is_file() or segment_file.stat().st_size <= 44:
-            segment_file.parent.mkdir(parents=True, exist_ok=True)
-            partial = segment_file.with_name(
-                f"{segment_file.stem}.{os.getpid()}.{uuid.uuid4().hex}.pending.wav"
+    import time
+    if batch_size not in (1, 2, 4):
+        raise ValueError("batch_size must be 1, 2 or 4")
+    if preview_only:
+        batch_size = 1
+    for start in range(0, len(segments), batch_size):
+        if on_check:
+            on_check()
+        group = segments[start:start + batch_size]
+        missing: list[tuple[SpokenSegment, Path]] = []
+        for item in group:
+            key = segment_cache_key(item, synthesizer.model_path, quality=quality)
+            file = workspace / "segments" / f"{key}.wav"
+            if not file.is_file() or file.stat().st_size <= 44:
+                missing.append((item, file))
+        began = time.perf_counter()
+        # Explicitly batch only completely missing groups. Mixed cached/new
+        # groups use the safe single-item route to preserve resumability.
+        if len(missing) > 1 and len(missing) == len(group) and hasattr(synthesizer, "synthesize_batch"):
+            for _item, file in missing:
+                file.parent.mkdir(parents=True, exist_ok=True)
+            getattr(synthesizer, "synthesize_batch")(
+                [item.speech_text for item, _ in missing],
+                [file for _, file in missing],
+                voices=[item.voice for item, _ in missing],
             )
-            partial.unlink(missing_ok=True)
-            try:
-                synthesizer.synthesize(item.speech_text, partial, voice=item.voice)
-                sample_duration = wav_duration(partial)
-                if sample_duration <= 0:
-                    raise DubbingTimingError(f"segment {item.index}: TTS returned silence")
-                partial.replace(segment_file)
-            finally:
-                partial.unlink(missing_ok=True)
-        audio_files[item.index] = segment_file
-        tts_durations[item.index] = wav_duration(segment_file)
-        keys[str(item.index)] = key
-        if on_segment_done is not None:
-            on_segment_done(n, len(segments), key, segment_file)
+        else:
+            for item, file in missing:
+                if on_check:
+                    on_check()
+                file.parent.mkdir(parents=True, exist_ok=True)
+                partial = file.with_name(f"{file.stem}.{os.getpid()}.{uuid.uuid4().hex}.pending.wav")
+                try:
+                    synthesizer.synthesize(item.speech_text, partial, voice=item.voice)
+                    if wav_duration(partial) <= 0:
+                        raise DubbingTimingError(f"segment {item.index}: TTS returned silence")
+                    partial.replace(file)
+                finally:
+                    partial.unlink(missing_ok=True)
+        elapsed = time.perf_counter() - began
+        audio_generated = 0.0
+        for n, item in enumerate(group, start=start + 1):
+            if on_check:
+                on_check()
+            key = segment_cache_key(item, synthesizer.model_path, quality=quality)
+            file = workspace / "segments" / f"{key}.wav"
+            length = wav_duration(file)
+            audio_files[item.index] = file
+            tts_durations[item.index] = length
+            keys[str(item.index)] = key
+            audio_generated += length
+            if on_segment_done is not None:
+                on_segment_done(n, len(segments), key, file)
+            # Persist the clip first, then flag a too-long line for review.
+            # Resuming after a rewrite can reuse all prior valid clips.
+            check_segment_fit(segments, n - 1, length, video_duration=duration)
+            if preview_only and n == 1:
+                from videoroll.apps.dubbing.control import DubbingInterrupted
+                raise DubbingInterrupted("preview_ready")
+        if on_performance is not None:
+            on_performance(len(group), elapsed, audio_generated)
 
     if on_stage is not None:
         on_stage("aligning", 88)
@@ -143,10 +210,21 @@ def generate_dubbed_media(
     track = workspace / "chinese_audio.wav"
     assemble_track(placements, audio_files, track, video_duration=duration, ffmpeg_path=ffmpeg)
     p2 = workspace / "dubbed.mp4"
+    stem = None
+    if mix_mode == "background_only":
+        from videoroll.apps.dubbing.separation import background_stem
+        if on_check:
+            on_check()
+        stem = background_stem(subtitle_video, workspace / "separation", ffmpeg=ffmpeg)
+        if on_check:
+            on_check()
+    elif mix_mode not in ("replace", "original_low"):
+        raise ValueError("invalid mix mode")
     command = build_dubbed_part_command(
         ffmpeg, subtitle_video, track, p2, video_duration=duration,
         original_audio_present=original_audio_present,
-        retain_original_audio=retain_original_audio,
+        retain_original_audio=(mix_mode == "original_low" or retain_original_audio),
+        background_track=stem,
     )
     subprocess.run(command, check=True, capture_output=True, timeout=max(120, int(duration * 4)))
     if not p2.is_file() or not p2.stat().st_size:

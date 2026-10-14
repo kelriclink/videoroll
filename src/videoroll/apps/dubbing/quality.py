@@ -1,0 +1,39 @@
+"""Bounded, versioned, deterministic manual dubbing settings.
+
+Never silently truncate translated speech to fit a timeline.
+"""
+from __future__ import annotations
+import hashlib
+import json
+from typing import Any
+
+ALLOWED_MODES = ("replace", "original_low", "background_only")
+MAX_BATCH = 4
+ACTIVE = frozenset(("queued", "preparing", "synthesizing", "aligning", "mixing",
+                    "pause_requested", "cancel_requested", "preview_ready", "needs_review", "paused"))
+RUNNING = frozenset(("preparing", "synthesizing", "aligning", "mixing"))
+
+def normalize_quality(*, instruct: str = "", temperature: float = 0.9,
+                      top_p: float = 0.9, batch_size: int = 1,
+                      mix_mode: str = "replace", model: str = "") -> dict[str, Any]:
+    if len(instruct) > 120 or any(ord(c) < 32 for c in instruct):
+        raise ValueError("invalid TTS speaking instruction")
+    if not (0.3 <= temperature <= 1.5 and 0.6 <= top_p <= 1.0):
+        raise ValueError("TTS sampling parameters are out of range")
+    if isinstance(batch_size, bool) or batch_size not in (1, 2, 4):
+        raise ValueError("batch size must be 1, 2 or 4")
+    if mix_mode not in ALLOWED_MODES:
+        raise ValueError("unsupported audio mix mode")
+    if instruct.strip() and "0.6B" in model:
+        raise ValueError("0.6B CustomVoice does not support speaking instructions")
+    return {"instruct": instruct.strip(), "temperature": float(temperature),
+            "top_p": float(top_p), "batch_size": int(batch_size), "mix_mode": mix_mode}
+
+
+def audio_cache_key(*, text: str, voice: str, model: str, quality: dict[str, Any],
+                    model_revision: str = "local-managed") -> str:
+    relevant = {key: quality.get(key) for key in ("instruct", "temperature", "top_p")}
+    payload = {"schema": 2, "text": text, "voice": voice,
+               "model": model, "model_revision": quality.get("_model_revision", model_revision), "language": "Chinese",
+               "generation": relevant}
+    return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode()).hexdigest()

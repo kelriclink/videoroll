@@ -2310,7 +2310,14 @@ def _cleanup_task_impl(self: Any, task_id: str, batch_id: str | None = None) -> 
         )
         in_flight_dubbing = db.query(DubbingJob).filter(
             DubbingJob.task_id == tid,
-            DubbingJob.status.in_(["queued", "preparing", "synthesizing", "aligning", "mixing"]),
+            (
+                DubbingJob.status.in_(["queued", "preparing", "synthesizing", "aligning",
+                                      "mixing", "pause_requested", "cancel_requested"])
+                | (
+                    DubbingJob.status.in_(["paused", "preview_ready", "needs_review"])
+                    & (DubbingJob.updated_at >= datetime.now(timezone.utc) - timedelta(days=7))
+                )
+            ),
         ).count()
         if in_flight_sub or in_flight_render or in_flight_dubbing:
             if batch_id:
