@@ -234,6 +234,7 @@ class DubbingActionRequest(BaseModel):
     cosy_speed: float = Field(default=1.0, ge=0.8, le=1.25)
     debug_timing: bool = False
     auto_group_speech: bool = False
+    auto_rewrite_speech: bool = False
 
 
 class RemoteJobResponse(BaseModel):

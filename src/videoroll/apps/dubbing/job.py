@@ -8,6 +8,7 @@ function using the dedicated Hatchet dubbing pool.
 from __future__ import annotations
 
 import json
+import logging
 import shutil
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -28,6 +29,7 @@ from videoroll.utils.hashing import sha256_file
 
 
 LEASE_SECONDS = 1800
+logger = logging.getLogger(__name__)
 
 
 class DubbingLeaseBusy(RuntimeError):
@@ -69,6 +71,7 @@ def create_dubbing_job(
     cosy_speed: float = 1.0,
     debug_timing: bool = False,
     auto_group_speech: bool = False,
+    auto_rewrite_speech: bool = False,
 ) -> DubbingJob:
     """Create a manual dubbing job from translated subtitles and raw or P1 video."""
     existing = db.query(DubbingJob).filter(
@@ -122,7 +125,8 @@ def create_dubbing_job(
                                 cosy_speed=cosy_speed, cosy_mode=cosy_mode,
                                 profile_id=profile_id, profile_sha256=profile_sha,
                                 debug_timing=debug_timing,
-                                auto_group_speech=auto_group_speech)
+                                auto_group_speech=auto_group_speech,
+                                auto_rewrite_speech=auto_rewrite_speech)
     # Cache separates different installed model revisions even if the user
     # keeps the same user-facing model name.
     import hashlib
@@ -219,11 +223,14 @@ def execute_dubbing_job(
         model_path = str(request.get("model_path") or "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice")
         workspace.mkdir(parents=True, exist_ok=True)
         raw = json.loads(segments.read_text(encoding="utf-8"))
-        speech_overrides = request.get("speech_overrides") or {}
+        speech_overrides = request.get('speech_overrides') or {}
+        auto_overrides = request.get('auto_speech_unit_overrides') or {}
         spoken = spoken_segments_from_json(raw, voice=voice, speech_overrides=speech_overrides)
-        from videoroll.apps.dubbing.speech_units import build_speech_units
-        cache_spoken = [u.part for u in build_speech_units(spoken,
-            enabled=bool(quality.get("auto_group_speech", False)))]
+        from videoroll.apps.dubbing.speech_units import (build_speech_units,
+            apply_speech_unit_overrides, speech_fingerprint)
+        base_units = build_speech_units(spoken,
+            enabled=bool(quality.get('auto_group_speech', False)))
+        cache_spoken = [u.part for u in apply_speech_unit_overrides(base_units, auto_overrides)]
         cache_dir = workspace / "segments"
         cache_dir.mkdir(parents=True, exist_ok=True)
         # A resumed task can run on another machine, provided FileStore uses
@@ -319,12 +326,64 @@ def execute_dubbing_job(
                 item.output_json={**dict(item.output_json or {}),"speech_units":groups}
                 status_db.commit()
 
+        def automatic_rewrite(unit, target_seconds: float, audio_seconds: float) -> str | None:
+            """Attempt one audited, guarded LLM rewrite without holding a DB transaction."""
+            if (str(unit.part.index) in auto_overrides or
+                    any(str(i) in speech_overrides for i in unit.source_indices)):
+                return None  # A prior automatic attempt or human edit wins.
+            safe_point()
+            from videoroll.apps.dubbing.rewrite import (propose_concise_script,
+                safe_automatic_rewrite)
+            from videoroll.apps.subtitle_service.translate_settings_store import get_translate_settings
+            from videoroll.config import get_subtitle_settings
+            try:
+                with session_factory() as settings_db:
+                    cfg = get_translate_settings(settings_db, get_subtitle_settings())
+                    settings_db.rollback()
+                candidate = propose_concise_script(
+                    text=unit.part.speech_text, target_seconds=target_seconds, cfg=cfg)
+            except (ValueError, RuntimeError, ImportError, OSError) as exc:
+                logger.warning('automatic spoken rewrite unavailable for unit %d: %s',
+                               unit.part.index, type(exc).__name__)
+                return None
+            except Exception as exc:
+                # Network/API failures must not turn a recoverable timing issue
+                # into a repeated worker crash. Control/lease errors still propagate.
+                if isinstance(exc, DubbingInterrupted):
+                    raise
+                logger.warning('automatic spoken rewrite failed for unit %d: %s',
+                               unit.part.index, type(exc).__name__)
+                return None
+            if not safe_automatic_rewrite(unit.part.speech_text, candidate):
+                return None
+            safe_point()
+            with session_factory() as rewrite_db:
+                item = rewrite_db.query(DubbingJob).filter(DubbingJob.id == job_id).with_for_update().one()
+                if item.lease_owner != owner:
+                    raise DubbingInterrupted('lease_lost')
+                saved_request = dict(item.request_json or {})
+                saved_overrides = dict(saved_request.get('auto_speech_unit_overrides') or {})
+                if str(unit.part.index) in saved_overrides:
+                    return None
+                saved_overrides[str(unit.part.index)] = {
+                    'fingerprint': speech_fingerprint(unit), 'speech_text': candidate,
+                    'original_text': unit.part.speech_text, 'source_indices': list(unit.source_indices),
+                    'target_seconds': round(target_seconds, 3),
+                    'original_audio_seconds': round(audio_seconds, 3),
+                }
+                saved_request['auto_speech_unit_overrides'] = saved_overrides
+                item.request_json = saved_request
+                rewrite_db.commit()
+            return candidate
+
         result = generate_dubbed_media(
             video, segments, workspace, factory,
             voice=voice, ffmpeg=ffmpeg, ffprobe=ffprobe,
             retain_original_audio=bool(request.get("retain_original_audio")),
             on_segment_done=checkpoint,
             speech_overrides=speech_overrides,
+            speech_unit_overrides=auto_overrides,
+            on_auto_rewrite=automatic_rewrite if quality.get('auto_rewrite_speech') else None,
             on_stage=stage_update,
             on_check=safe_point,
             quality=cache_quality,
@@ -358,8 +417,10 @@ def execute_dubbing_job(
                     final_db.add(Asset(task_id=task_id, kind=kind, storage_key=key,
                                        sha256=sha256_file(path), size_bytes=path.stat().st_size,
                                        duration_ms=round(result.source_duration * 1000)))
+            successful_output = dict(item.output_json or {})
+            successful_output.pop('timing_issue', None)
             item.output_json = {
-                **dict(item.output_json or {}),
+                **successful_output,
                 "audio_key": track_key, "video_key": video_output_key,
                 "source_video_key": video_key,
                 "subtitle_video_key": (video_key if request.get("source_video_kind", "video_final") == "video_final" else None),
@@ -367,6 +428,7 @@ def execute_dubbing_job(
                 "segments_total": result.segments_total,
             }
             item.progress = 100
+            item.error_message = None
             item.status = "succeeded"
             item.lease_owner = None
             item.lease_until = None

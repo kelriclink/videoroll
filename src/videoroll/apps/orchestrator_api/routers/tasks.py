@@ -216,6 +216,7 @@ def enqueue_dubbing_job(
             cosy_speed=payload.cosy_speed,
             debug_timing=payload.debug_timing,
             auto_group_speech=payload.auto_group_speech,
+            auto_rewrite_speech=payload.auto_rewrite_speech,
         )
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc

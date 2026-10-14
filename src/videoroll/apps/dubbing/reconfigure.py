@@ -58,7 +58,8 @@ def reconfigure_dubbing(db: Session, *, task_id: uuid.UUID, job_id: uuid.UUID,
         top_p=values['top_p'],batch_size=values['batch_size'],mix_mode=values['mix_mode'],
         model=model,cosy_speed=values['cosy_speed'],cosy_mode=values['cosy_mode'],
         profile_id=profile_id,profile_sha256=profile_sha,debug_timing=values['debug_timing'],
-        auto_group_speech=values.get('auto_group_speech',False))
+        auto_group_speech=values.get('auto_group_speech',False),
+        auto_rewrite_speech=values.get('auto_rewrite_speech',False))
     if values['mix_mode']=='background_only':
         from videoroll.apps.dubbing.separation import available
         if not available():raise ValueError('background separation is unavailable')

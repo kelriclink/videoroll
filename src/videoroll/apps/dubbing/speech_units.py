@@ -5,9 +5,10 @@ Never infer speakers from punctuation or silently rewrite arbitrary content.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+import hashlib
 import re
-from typing import Sequence
+from typing import Mapping, Sequence
 
 from videoroll.apps.dubbing.timing import SpokenSegment
 
@@ -16,6 +17,34 @@ from videoroll.apps.dubbing.timing import SpokenSegment
 class SpeechUnit:
     part: SpokenSegment
     source_indices: tuple[int, ...]
+
+
+def speech_fingerprint(unit: SpeechUnit) -> str:
+    """Bind an automatic proposal to an exact group and its source script."""
+    source = f"{','.join(map(str, unit.source_indices))}\0{unit.part.speech_text}"
+    return hashlib.sha256(source.encode('utf-8')).hexdigest()
+
+
+def apply_speech_unit_overrides(
+    units: Sequence[SpeechUnit], overrides: Mapping[str, object] | None,
+) -> list[SpeechUnit]:
+    """Apply only still-valid automatic spoken scripts, never modify display text.
+
+    A changed source subtitle, manual edit or regrouping invalidates the
+    fingerprint, so stale rewrites cannot leak into another speech unit.
+    """
+    result: list[SpeechUnit] = []
+    for unit in units:
+        entry = (overrides or {}).get(str(unit.part.index))
+        if not isinstance(entry, dict) or entry.get('fingerprint') != speech_fingerprint(unit):
+            result.append(unit)
+            continue
+        text = entry.get('speech_text')
+        if not isinstance(text, str) or not text.strip() or len(text) > 1000:
+            result.append(unit)
+            continue
+        result.append(SpeechUnit(replace(unit.part, speech_text=text.strip()), unit.source_indices))
+    return result
 
 
 def normalize_spoken_text(text: str) -> str:

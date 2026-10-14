@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from math import isfinite
+import re
 from typing import Mapping, Sequence
 
 
@@ -24,6 +25,26 @@ class SpeechTooLong(DubbingTimingError):
         super().__init__(f"segment {index}: speech {duration:.3f}s exceeds slot {slot:.3f}s "
                          f"(requires {required_speed:.2f}x; maximum {max_speed:.2f}x). "
                          "Shorten this spoken script and regenerate this segment.")
+
+
+def estimate_spoken_seconds(text: str) -> float:
+    """Rough preflight-only Mandarin duration estimate, NOT a timing decision.
+
+    Only measured WAV lengths determine acceptance. This advisory estimate
+    finds obvious short slots before paying for long-running TTS.
+    """
+    han = sum('\u3400' <= c <= '\u9fff' for c in text)
+    latin = len(re.findall(r'[A-Za-z0-9]+(?:[._-][A-Za-z0-9]+)*', text))
+    pauses = sum(c in '，。！？；：,.!?;:' for c in text)
+    return round(max(0.1, han / 4.5 + latin / 2.7 + pauses * 0.10), 3)
+
+
+def speech_slot_seconds(segments: Sequence[SpokenSegment], position: int, *,
+                        video_duration: float, max_extension: float = 0.5,
+                        min_gap: float = 0.08) -> float:
+    part = segments[position]
+    next_start = segments[position + 1].start if position + 1 < len(segments) else video_duration + min_gap
+    return max(0.0, min(part.end + max_extension, next_start - min_gap, video_duration) - part.start)
 
 
 def check_segment_fit(segments: Sequence[SpokenSegment], index: int, duration: float,
@@ -131,11 +152,17 @@ def plan_dubbing_timeline(
             raise DubbingTimingError(f"duplicate segment index {segment.index}")
         seen_indices.add(segment.index)
         if not all(isfinite(x) for x in (segment.start, segment.end)):
-            raise DubbingTimingError(f"segment {segment.index}: nonfinite timestamps")
+            raise DubbingTimingError(f"segment {segment.index}: nonfinite source timestamps")
         if segment.start < previous_end - 1e-8 or segment.start < 0:
             raise DubbingTimingError(f"segment {segment.index}: overlapping or unordered source")
         if segment.end <= segment.start or segment.end > video_duration + 1e-8:
-            raise DubbingTimingError(f"segment {segment.index}: invalid source interval")
+            reason = ('nonpositive interval' if segment.end <= segment.start
+                      else 'extends past media end')
+            raise DubbingTimingError(
+                f'segment {segment.index}: invalid source interval ({reason}; '
+                f'start={segment.start:.3f}s end={segment.end:.3f}s '
+                f'video={video_duration:.3f}s). Recheck ASR/subtitle boundaries'
+            )
         if not segment.speech_text.strip():
             raise DubbingTimingError(f"segment {segment.index}: empty spoken text")
         previous_end = segment.end

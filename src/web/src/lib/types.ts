@@ -74,7 +74,7 @@ export type DubbingJob = {
     preview_only?: boolean;
     quality?: { instruct?: string; temperature?: number; top_p?: number; batch_size?: number;
       mix_mode?: string; cosy_speed?: number; cosy_mode?: string; profile_id?: string;
-      debug_timing?: boolean; auto_group_speech?: boolean };
+      debug_timing?: boolean; auto_group_speech?: boolean; auto_rewrite_speech?: boolean };
   };
   output: {
     audio_key?: string;
@@ -83,6 +83,8 @@ export type DubbingJob = {
     duration?: number;
     segments_total?: number;
     segments?: Record<string, string>;
+    speech_units?: Array<{ index: number; source_indices: number[]; start: number; end: number;
+      speech_text: string; slot_seconds?: number; estimated_audio_seconds?: number; estimated_overlong?: boolean }>;
     timing_issue?: { segment_index: number; duration: number; slot: number; required_speed: number } | null;
     performance?: { chunks: number; wall_seconds: number; audio_seconds: number; last_batch_size: number };
   };

@@ -11,7 +11,7 @@ import json
 import os
 import subprocess
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol
 
@@ -19,9 +19,11 @@ from videoroll.apps.dubbing.audio import assemble_track, wav_duration
 from videoroll.apps.dubbing.mux import build_dubbed_part_command
 from videoroll.apps.dubbing.timing import (SpokenSegment, plan_dubbing_timeline,
                                             check_segment_fit, DubbingTimingError,
-                                            reconcile_final_subtitle_boundary)
+                                            reconcile_final_subtitle_boundary, SpeechTooLong,
+                                            estimate_spoken_seconds, speech_slot_seconds)
 from videoroll.apps.dubbing.quality import audio_cache_key
-from videoroll.apps.dubbing.speech_units import build_speech_units
+from videoroll.apps.dubbing.speech_units import (SpeechUnit, build_speech_units,
+    apply_speech_unit_overrides)
 
 
 class SpeechSynthesizer(Protocol):
@@ -113,6 +115,8 @@ def generate_dubbed_media(
     on_performance: Callable[[int, float, float], None] | None = None,
     on_timing_adjustment: Callable[[list[dict[str, float | int | str]]], None] | None = None,
     on_speech_units: Callable[[list[dict[str, Any]]], None] | None = None,
+    speech_unit_overrides: Mapping[str, object] | None = None,
+    on_auto_rewrite: Callable[[SpeechUnit, float, float], str | None] | None = None,
     mix_mode: str = "replace",
     preview_only: bool = False,
 ) -> DubbingResult:
@@ -135,15 +139,24 @@ def generate_dubbed_media(
         segments, {p.index: max(0.01, (p.end-p.start) * 0.5) for p in segments},
         video_duration=duration, max_speed=max_speed,
     )
-    units=build_speech_units(segments,
-        enabled=bool((quality or {}).get("auto_group_speech", False)))
-    segments=[unit.part for unit in units]
-    if on_speech_units is not None:
-        on_speech_units([{
-            "index": unit.part.index, "source_indices": list(unit.source_indices),
-            "start": round(unit.part.start, 3), "end": round(unit.part.end, 3),
-            "speech_text": unit.part.speech_text,
-        } for unit in units])
+    units = apply_speech_unit_overrides(build_speech_units(
+        segments, enabled=bool((quality or {}).get('auto_group_speech', False))),
+        speech_unit_overrides)
+    segments = [unit.part for unit in units]
+
+    def report_speech_units() -> None:
+        if on_speech_units is not None:
+            on_speech_units([{
+                'index': unit.part.index, 'source_indices': list(unit.source_indices),
+                'start': round(unit.part.start, 3), 'end': round(unit.part.end, 3),
+                'speech_text': unit.part.speech_text,
+                'slot_seconds': round(speech_slot_seconds(segments, i, video_duration=duration), 3),
+                'estimated_audio_seconds': estimate_spoken_seconds(unit.part.speech_text),
+                'estimated_overlong': (estimate_spoken_seconds(unit.part.speech_text) >
+                    speech_slot_seconds(segments, i, video_duration=duration) * max_speed),
+            } for i, unit in enumerate(units)])
+
+    report_speech_units()
     # Early structural validation: reject invalid source timestamps before
     # spending hours on inference. Dummy durations test only intervals.
     plan_dubbing_timeline(
@@ -202,7 +215,6 @@ def generate_dubbed_media(
                     partial.replace(file)
                 finally:
                     partial.unlink(missing_ok=True)
-        elapsed = time.perf_counter() - began
         audio_generated = 0.0
         for n, item in enumerate(group, start=start + 1):
             if on_check:
@@ -216,15 +228,52 @@ def generate_dubbed_media(
             audio_generated += length
             if on_segment_done is not None:
                 on_segment_done(n, len(segments), key, file)
-            # Persist the clip first, then flag a too-long line for review.
-            # Resuming after a rewrite can reuse all prior valid clips.
-            check_segment_fit(segments, n - 1, length, video_duration=duration,
-                              max_speed=max_speed)
+            # Persist the original clip for a playable review even if it is too long.
+            # Only explicitly opted-in jobs may automatically change speech_text.
+            try:
+                check_segment_fit(segments, n - 1, length, video_duration=duration,
+                                  max_speed=max_speed)
+            except SpeechTooLong as issue:
+                if (preview_only or on_auto_rewrite is None or
+                        not (quality or {}).get('auto_rewrite_speech')):
+                    raise
+                # The callback checks source/manual overrides and makes at most
+                # one persisted proposal per speech unit. Failure stays reviewable.
+                candidate = on_auto_rewrite(units[n - 1], issue.slot * max_speed * 0.88, length)
+                if not candidate or candidate == item.speech_text:
+                    raise
+                item = replace(item, speech_text=candidate)
+                segments[n - 1] = item
+                units[n - 1] = SpeechUnit(item, units[n - 1].source_indices)
+                report_speech_units()
+                key = segment_cache_key(item, synthesizer.model_path, quality=quality)
+                file = workspace / 'segments' / f'{key}.wav'
+                if not file.is_file() or file.stat().st_size <= 44:
+                    file.parent.mkdir(parents=True, exist_ok=True)
+                    partial = file.with_name(f'{file.stem}.{os.getpid()}.{uuid.uuid4().hex}.pending.wav')
+                    try:
+                        if on_check:
+                            on_check()
+                        synthesizer.synthesize(item.speech_text, partial, voice=item.voice)
+                        if wav_duration(partial) <= 0:
+                            raise DubbingTimingError(f'segment {item.index}: TTS returned silence')
+                        partial.replace(file)
+                    finally:
+                        partial.unlink(missing_ok=True)
+                length = wav_duration(file)
+                audio_generated += length
+                audio_files[item.index] = file
+                tts_durations[item.index] = length
+                keys[str(item.index)] = key
+                if on_segment_done is not None:
+                    on_segment_done(n, len(segments), key, file)
+                check_segment_fit(segments, n - 1, length, video_duration=duration,
+                                  max_speed=max_speed)
             if preview_only and n == 1:
                 from videoroll.apps.dubbing.control import DubbingInterrupted
                 raise DubbingInterrupted("preview_ready")
         if on_performance is not None:
-            on_performance(len(group), elapsed, audio_generated)
+            on_performance(len(group), time.perf_counter() - began, audio_generated)
 
     if on_stage is not None:
         on_stage("aligning", 88)

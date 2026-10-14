@@ -6,6 +6,32 @@ must review and explicitly save the suggestion before TTS is re-run.
 from __future__ import annotations
 
 import httpx
+import re
+
+
+def safe_automatic_rewrite(original: str, candidate: str) -> bool:
+    """Conservative lexical gate; not a claim of semantic equivalence.
+
+    Numbers, source-language technical identifiers and explicit negation must
+    survive an unattended shortening. Ambiguous cases still require review.
+    """
+    original, candidate = original.strip(), candidate.strip()
+    if not candidate or len(candidate) >= len(original) or len(candidate) > 1000:
+        return False
+    # Reject suspiciously aggressive deletion of a substantial script.
+    if len(original) >= 20 and len(candidate) < len(original) * 0.48:
+        return False
+    numeric = re.compile(r'(?<![A-Za-z0-9])\d+(?:[.,]\d+)*(?![A-Za-z0-9])')
+    if sorted(numeric.findall(original)) != sorted(numeric.findall(candidate)):
+        return False
+    technical = re.compile(r'[A-Za-z]+\d+[A-Za-z0-9]*|[A-Za-z]+(?:[-_.][A-Za-z0-9]+)*')
+    if sorted(x.lower() for x in technical.findall(original)) != sorted(x.lower() for x in technical.findall(candidate)):
+        return False
+    negations = ('不', '没', '无', '未', '非', '别', '禁止', '不能', '不是', '没有')
+    if any(term in original for term in negations) and not any(term in candidate for term in negations):
+        return False
+    return True
+
 
 from videoroll.utils.openai_compat import build_openai_chat_completions_url
 

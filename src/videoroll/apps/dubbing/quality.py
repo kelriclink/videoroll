@@ -19,7 +19,8 @@ def normalize_quality(*, instruct: str = "", temperature: float = 0.9,
                       cosy_speed: float = 1.0, cosy_mode: str = "cross_lingual",
                       profile_id: str = "", profile_sha256: str = "",
                       debug_timing: bool = False,
-                      auto_group_speech: bool = False) -> dict[str, Any]:
+                      auto_group_speech: bool = False,
+                      auto_rewrite_speech: bool = False) -> dict[str, Any]:
     if len(instruct) > 120 or any(ord(c) < 32 for c in instruct):
         raise ValueError("invalid TTS speaking instruction")
     if not (0.3 <= temperature <= 1.5 and 0.6 <= top_p <= 1.0):
@@ -39,9 +40,10 @@ def normalize_quality(*, instruct: str = "", temperature: float = 0.9,
             raise ValueError('CosyVoice3 currently supports sequential inference only')
         if not profile_id or not profile_sha256:
             raise ValueError('CosyVoice3 requires an authorized reference voice')
-    if not isinstance(debug_timing, bool) or not isinstance(auto_group_speech, bool):
+    if not all(isinstance(flag, bool) for flag in (debug_timing, auto_group_speech, auto_rewrite_speech)):
         raise ValueError("debug or natural speech settings must be boolean")
     return {"auto_group_speech": auto_group_speech,
+            "auto_rewrite_speech": auto_rewrite_speech,
             "debug_timing": debug_timing,
             "cosy_speed": float(cosy_speed), "cosy_mode": cosy_mode,
             "profile_id": profile_id, "profile_sha256": profile_sha256,

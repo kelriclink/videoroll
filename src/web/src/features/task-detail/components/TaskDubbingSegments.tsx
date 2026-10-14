@@ -9,6 +9,7 @@ type Segment = {
   subtitle_text: string;
   speech_text: string;
   overridden: boolean;
+  auto_rewritten?: boolean;
   has_audio: boolean;
   speech_unit_start?: number;
   speech_unit_indices?: number[];
@@ -100,6 +101,9 @@ export function TaskDubbingSegments({
               ) : null}
               {item.speech_unit_start && item.speech_unit_start !== item.index ? (
                 <p className="mt-1 text-sky-700">这条字幕已合并进第 {item.speech_unit_start} 条朗读单元；无需单独配音。</p>
+              ) : null}
+              {item.auto_rewritten && item.speech_unit_start === item.index ? (
+                <p className="mt-1 text-amber-800">已自动精简实际配音稿：{item.generated_speech_text}。请试听并核对原意；下面仍为原始口播稿，可手动修改覆盖。</p>
               ) : null}
               <textarea
                 aria-label={`第 ${item.index} 句口播文案`}

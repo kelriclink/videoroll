@@ -52,7 +52,7 @@ export type DubbingRequest = {
   preview_only?: boolean; instruct?: string; temperature?: number; top_p?: number;
   batch_size?: 1 | 2 | 4; mix_mode?: "replace" | "original_low" | "background_only";
   reference_profile_id?: string | null; cosy_mode?: "cross_lingual" | "zero_shot" | "instruct";
-  cosy_speed?: number; debug_timing?: boolean; auto_group_speech?: boolean;
+  cosy_speed?: number; debug_timing?: boolean; auto_group_speech?: boolean; auto_rewrite_speech?: boolean;
 };
 
 export const tasksApi = {

@@ -12,7 +12,8 @@ from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from videoroll.apps.dubbing.pipeline import segment_cache_key, spoken_segments_from_json
-from videoroll.apps.dubbing.speech_units import build_speech_units
+from videoroll.apps.dubbing.speech_units import (build_speech_units,
+    apply_speech_unit_overrides)
 from videoroll.apps.orchestrator_api.dependencies import get_db, get_store
 from videoroll.db.models import DubbingJob
 from videoroll.storage.filesystem import FileStore
@@ -64,7 +65,9 @@ def list_dubbing_segments(
     model = str(job.request_json.get("model_path") or "")
     quality = (job.request_json.get("quality") or {}) if job.request_json.get("cache_schema") == 2 else None
     successful = dict((job.output_json or {}).get("segments") or {})
-    units = build_speech_units(segments, enabled=bool((quality or {}).get("auto_group_speech", False)))
+    units = apply_speech_unit_overrides(build_speech_units(
+        segments, enabled=bool((quality or {}).get('auto_group_speech', False))),
+        job.request_json.get('auto_speech_unit_overrides'))
     membership = {index: (unit.part, unit.source_indices) for unit in units for index in unit.source_indices}
     overrides = job.request_json.get("speech_overrides") or {}
     return {
@@ -74,6 +77,9 @@ def list_dubbing_segments(
                 "index": item.index, "start": item.start, "end": item.end,
                 "subtitle_text": item.subtitle_text, "speech_text": item.speech_text,
                 "overridden": str(item.index) in overrides,
+                "auto_rewritten": (item.index == membership[item.index][0].index and
+                    str(item.index) in (job.request_json.get('auto_speech_unit_overrides') or {}) and
+                    membership[item.index][0].speech_text != item.speech_text),
                 "has_audio": (item.index == membership[item.index][0].index and
                               segment_cache_key(membership[item.index][0],model,quality=quality) in successful),
                 "speech_unit_start": membership[item.index][0].index,
@@ -106,7 +112,13 @@ def edit_dubbing_segment(
     request = dict(job.request_json)
     overrides = dict(request.get("speech_overrides") or {})
     overrides[str(index)] = script
-    request["speech_overrides"] = overrides
+    request['speech_overrides'] = overrides
+    # Manual edits supersede any automatic group rewrite containing this row.
+    auto = dict(request.get('auto_speech_unit_overrides') or {})
+    for leader, record in list(auto.items()):
+        if isinstance(record, dict) and index in record.get('source_indices', []):
+            del auto[leader]
+    request['auto_speech_unit_overrides'] = auto
     job.request_json = request
     # The audio files remain cached under their content hashes, but progress
     # from the old spoken script must not be shown as the new script.
@@ -174,7 +186,9 @@ def preview_dubbing_segment(
         raise HTTPException(404, "dubbing segment not found")
     model = str(job.request_json.get("model_path") or "")
     quality = (job.request_json.get("quality") or {}) if job.request_json.get("cache_schema") == 2 else None
-    units=build_speech_units(segments, enabled=bool((quality or {}).get("auto_group_speech", False)))
+    units = apply_speech_unit_overrides(build_speech_units(
+        segments, enabled=bool((quality or {}).get('auto_group_speech', False))),
+        job.request_json.get('auto_speech_unit_overrides'))
     leader=next((unit.part for unit in units if index in unit.source_indices),None)
     if leader is None:
         raise HTTPException(404,"speech unit not found")
