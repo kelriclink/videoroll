@@ -16,7 +16,7 @@ from videoroll.apps.dubbing.timing import SpokenSegment
 class SpeechUnit:
     part: SpokenSegment
     source_indices: tuple[int, ...]
-    duplicate_removed: bool = False
+    duplicate_removed: bool = False  # Legacy output field; never auto-delete spoken content.
 
 
 def normalize_spoken_text(text: str) -> str:
@@ -29,27 +29,19 @@ def normalize_spoken_text(text: str) -> str:
     return re.sub(r"[ \t]{2,}", " ", text)
 
 
-def _join(left: str, right: str) -> tuple[str, bool]:
-    """Eliminate clear *near-tail* restart repetitions, not arbitrary edits.
+def _join(left: str, right: str) -> str:
+    """Join subtitle fragments without deleting or paraphrasing user speech.
 
-    E.g. '见过、遇到过，甚至用过 S100电脑，' followed by
-    '见过、遇到过，甚至用过一台 S100电脑。': retain the more complete
-    follow-up clause. Require 10 exact chars and at most 16 trailing
-    chars to avoid deleting ordinary repetitions or unrelated ideas.
+    ASR/translations may repeat words intentionally. Deduplication requires
+    transcript evidence or explicit user edits, never a string-overlap rule.
     """
     a, b = normalize_spoken_text(left), normalize_spoken_text(right)
-    match_start = match_len = 0
-    for pos in range(max(0, len(a) - 90), len(a)):
-        size = 0
-        while pos + size < len(a) and size < len(b) and a[pos + size] == b[size]:
-            size += 1
-        if size >= 10 and size > match_len and len(a) - pos - size <= 16:
-            match_start, match_len = pos, size
-    if match_len:
-        return a[:match_start].rstrip() + b, True
-    if a.endswith(("，", ",", "、")):
-        return a + b, False
-    return a + (" " if a and b and a[-1].isascii() and b[0].isascii() else "") + b, False
+    if not a:
+        return b
+    if not b:
+        return a
+    separator = " " if a[-1].isascii() and (b[0].isascii() or b[0].isalpha()) else ""
+    return a + separator + b
 
 
 def build_speech_units(
@@ -73,7 +65,6 @@ def build_speech_units(
         text = normalize_spoken_text(first.speech_text)
         source = [first.index]
         end = first.end
-        had_duplicate = False
         j = i + 1
         while j < n:
             nxt = parts[j]
@@ -94,8 +85,7 @@ def build_speech_units(
                 break
             if not (short_next or unfinished or too_short):
                 break
-            text, removed = _join(text, nxt.speech_text)
-            had_duplicate = had_duplicate or removed
+            text = _join(text, nxt.speech_text)
             source.append(nxt.index)
             end = nxt.end
             j += 1
@@ -104,6 +94,6 @@ def build_speech_units(
             subtitle_text="\n".join(p.subtitle_text for p in parts[i:j]),
             speech_text=text, voice=first.voice,
         )
-        result.append(SpeechUnit(part, tuple(source), had_duplicate))
+        result.append(SpeechUnit(part, tuple(source)))
         i = j
     return result

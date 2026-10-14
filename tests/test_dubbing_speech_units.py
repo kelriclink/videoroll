@@ -15,7 +15,7 @@ def _p(i, start, end, text, voice='reference'):
     return SpokenSegment(i, start, end, text, text, voice)
 
 
-def test_real_s100_fragments_become_one_natural_utterance_without_repeat():
+def test_grouping_preserves_every_word_even_in_repeated_translation():
     original = [
         _p(1, .32, 5.84, 'S100 电脑超级酷，即使你不熟悉 S100 这个术语，'),
         _p(2, 5.84, 11.56, '你大概率在过去的某个时候，见过、\n遇到过，甚至用过 S100 电脑，'),
@@ -27,8 +27,8 @@ def test_real_s100_fragments_become_one_natural_utterance_without_repeat():
     assert len(groups)==2
     assert groups[0].source_indices==(1,2,3)
     assert groups[0].part.start==.32 and groups[0].part.end==12.56
-    assert groups[0].duplicate_removed
-    assert groups[0].part.speech_text.count('见过、') == 1
+    assert not groups[0].duplicate_removed
+    assert groups[0].part.speech_text.count('见过、') == 2
     assert '一台 S100 电脑。' in groups[0].part.speech_text
     assert groups[1].source_indices==(4,5)
     assert original[1].speech_text.count('见过、')==1
@@ -129,3 +129,29 @@ def test_voice_preview_endpoint_and_script_editor_follow_group_cache(tmp_path):
         after=list_dubbing_segments(task_id,job_id,offset=0,limit=40,db=db,store=store)
         assert after['items'][0]['has_audio'] is False
         assert '应该把句子真正讲完' in after['items'][0]['generated_speech_text']
+
+
+def test_repeated_or_corrected_speech_is_never_automatically_deleted():
+    # A real non-Chinese transcript repeated "I'm not crazy" on purpose.
+    # There is no trustworthy way to classify it as an ASR hallucination.
+    from videoroll.apps.dubbing.speech_units import _join
+    assert _join("I thought I was going crazy. I'm not crazy.",
+                 "I'm not crazy. It really happened.").count("I'm not crazy.") == 2
+    assert _join("我已经说过两次，我不知道，", "我不知道，这是我的回答。")        .count("我不知道") == 2
+
+
+def test_auto_group_is_off_by_default_and_opt_in_is_explicit():
+    from videoroll.apps.dubbing.quality import normalize_quality
+    normal = normalize_quality(model="Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice")
+    assert normal["auto_group_speech"] is False
+    enabled = normalize_quality(model="Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",auto_group_speech=True)
+    assert enabled["auto_group_speech"] is True
+    parts=[_p(1,0,1,"这是第一段，"),_p(2,1,2,"这是第二段。")]
+    assert len(build_speech_units(parts,enabled=normal["auto_group_speech"]))==2
+    assert len(build_speech_units(parts,enabled=enabled["auto_group_speech"]))==1
+
+
+def test_non_chinese_punctuation_keeps_sentence_boundary_spaces():
+    from videoroll.apps.dubbing.speech_units import _join
+    assert _join("There it goes.","I'm not crazy.") == "There it goes. I'm not crazy."
+    assert _join("First,","second.") == "First, second."

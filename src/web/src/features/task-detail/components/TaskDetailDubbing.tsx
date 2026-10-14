@@ -86,6 +86,7 @@ export function TaskDetailDubbing({
   const [loading, setLoading] = useState(true);
   const [submitting, setSubmitting] = useState(false);
   const [debugTiming, setDebugTiming] = useState(true);
+  const [autoGroupSpeech, setAutoGroupSpeech] = useState(false);
   const [forceRegenerate, setForceRegenerate] = useState(true);
   const restoredJob = useRef(false);
   const [error, setError] = useState<string | null>(null);
@@ -127,6 +128,7 @@ export function TaskDetailDubbing({
           setMixMode((q?.mix_mode as typeof mixMode) || "replace");
           setBatchSize((q?.batch_size as 1 | 2 | 4) || 1);
           setDebugTiming(q?.debug_timing ?? true);
+          setAutoGroupSpeech(q?.auto_group_speech ?? false);
         }
       }
       setError(null);
@@ -446,6 +448,10 @@ export function TaskDetailDubbing({
       </div> : null}
       <details className="mt-3 rounded border border-slate-200 p-3">
         <summary className="cursor-pointer text-sm font-medium">高级参数 · 原声混音、批量与语气指令</summary>
+        <label className="mt-3 flex items-center gap-2 text-sm text-slate-700">
+          <input type="checkbox" checked={autoGroupSpeech} onChange={(e) => setAutoGroupSpeech(e.target.checked)} disabled={trulyBusy || submitting}/>
+          实验性自动合句（默认关闭；不自动删词，可能改变配音时间槽）
+        </label>
       <div className="mt-3 grid gap-3 md:grid-cols-2">
         <label className="text-sm text-slate-700">原声音轨
           <select className="mt-1 block w-full rounded border p-2" value={mixMode}
@@ -503,7 +509,7 @@ export function TaskDetailDubbing({
               temperature, top_p: topP, batch_size: usingCosy ? 1 : batchSize, mix_mode: mixMode,
               reference_profile_id: usingCosy ? profileId : null,
               cosy_mode: cosyMode, cosy_speed: cosySpeed, debug_timing: debugTiming,
-              auto_group_speech: true,
+              auto_group_speech: autoGroupSpeech,
             })}>
             {submitting ? "正在提交…" : preview ? "生成一句试听" : "完整配音"}
           </button>
@@ -573,7 +579,7 @@ export function TaskDetailDubbing({
                   ) : null}
                   {job.status === "needs_review" && !submitting ? (
                     <button type="button" className="rounded border border-amber-400 px-2 py-1 text-xs text-amber-800"
-                      onClick={() => void autoRetryJob(job)}>智能合句重试</button>
+                      onClick={() => void autoRetryJob(job)}>尝试实验性合句</button>
                   ) : ["failed", "paused"].includes(job.status) && !submitting ? (
                     <button type="button" className="rounded border border-amber-400 px-2 py-1 text-xs text-amber-800"
                       onClick={() => void retryJob(job.id)}>{job.status === "paused" ? "恢复配音" : "断点重试"}</button>
