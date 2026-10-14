@@ -335,7 +335,7 @@ def _assert_complete_schema(engine: Engine) -> None:
     task_indexes = {index["name"] for index in inspector.get_indexes("tasks")}
     assert "ix_tasks_priority_created_at" in task_indexes
     with engine.connect() as connection:
-        assert connection.exec_driver_sql("SELECT version_num FROM alembic_version").scalar_one() == "0010_remove_legacy_task_queue"
+        assert connection.exec_driver_sql("SELECT version_num FROM alembic_version").scalar_one() == "0011_dubbing_jobs"
 
 
 def test_migration_initializes_empty_database_and_can_run_again(tmp_path: Path) -> None:

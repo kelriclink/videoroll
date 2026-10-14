@@ -9,6 +9,15 @@ from sqlalchemy.engine import Connection
 
 def _validate_columns(connection: Connection, table_name: str, columns: Sequence[sa.Column]) -> None:
     existing = {column["name"]: column for column in sa.inspect(connection).get_columns(table_name)}
+    # Legacy SQLite create_all used PostgreSQL UUID columns, which SQLite
+    # declares as UUID and reflects with NUMERIC affinity (not CHAR(32)).
+    # Accept that exact declared UUID spelling, never an arbitrary NUMERIC.
+    sqlite_declared = {}
+    if connection.dialect.name == "sqlite":
+        sqlite_declared = {
+            row["name"]: row["type"].upper()
+            for row in connection.exec_driver_sql(f"PRAGMA table_info(\"{table_name}\")").mappings()
+        }
     for column in columns:
         actual = existing.get(column.name)
         if actual is None:
@@ -17,7 +26,9 @@ def _validate_columns(connection: Connection, table_name: str, columns: Sequence
         actual_type = actual["type"]
         compatible = expected_type._type_affinity is actual_type._type_affinity
         if connection.dialect.name == "sqlite" and isinstance(expected_type, sa.Uuid):
-            compatible = isinstance(actual_type, sa.String) and actual_type.length in {32, 36}
+            compatible = (isinstance(actual_type, sa.String) and actual_type.length in {32, 36}) or (
+                sqlite_declared.get(column.name) == "UUID"
+            )
         if not compatible:
             raise RuntimeError(f"Incompatible existing schema: {table_name}.{column.name} has type {actual_type}")
         if isinstance(expected_type, sa.String) and not isinstance(column.type, sa.Enum) and expected_type.length:

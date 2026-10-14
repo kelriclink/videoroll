@@ -73,7 +73,7 @@ def test_native_nginx_has_no_docker_dns_upstreams() -> None:
     assert "http://127.0.0.1:6081" in nginx
     assert "root /opt/videoroll/current/web;" in nginx
 
-    assert "listen 127.0.0.1:3001;" in nginx
+    assert "listen 0.0.0.0:3001;" in nginx
 
 
 def test_native_redis_companion_uses_fresh_rebuildable_volume() -> None:
