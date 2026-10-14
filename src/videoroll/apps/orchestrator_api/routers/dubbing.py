@@ -65,6 +65,7 @@ def list_dubbing_segments(
     model = str(job.request_json.get("model_path") or "")
     quality = (job.request_json.get("quality") or {}) if job.request_json.get("cache_schema") == 2 else None
     successful = dict((job.output_json or {}).get("segments") or {})
+    prepared_segments = dict((job.output_json or {}).get("prepared_segments") or {})
     units = apply_speech_unit_overrides(build_speech_units(
         segments, enabled=bool((quality or {}).get('auto_group_speech', False))),
         job.request_json.get('auto_speech_unit_overrides'))
@@ -82,6 +83,9 @@ def list_dubbing_segments(
                     membership[item.index][0].speech_text != item.speech_text),
                 "has_audio": (item.index == membership[item.index][0].index and
                               segment_cache_key(membership[item.index][0],model,quality=quality) in successful),
+                "prepared_audio": (prepared_segments.get(segment_cache_key(
+                    membership[item.index][0], model, quality=quality))
+                    if item.index == membership[item.index][0].index else None),
                 "speech_unit_start": membership[item.index][0].index,
                 "speech_unit_indices": list(membership[item.index][1]),
                 "generated_speech_text": membership[item.index][0].speech_text if item.index == membership[item.index][0].index else None,
@@ -177,6 +181,7 @@ def preview_dubbing_segment(
     task_id: uuid.UUID,
     job_id: uuid.UUID,
     index: int,
+    original: bool = Query(default=False),
     db: Session = Depends(get_db),
     store: FileStore = Depends(get_store),
 ) -> FileResponse:
@@ -193,7 +198,11 @@ def preview_dubbing_segment(
     if leader is None:
         raise HTTPException(404,"speech unit not found")
     key = segment_cache_key(leader, model, quality=quality)
-    saved = str((job.output_json or {}).get("segments", {}).get(key) or "")
+    output = job.output_json or {}
+    saved = str(output.get("segments", {}).get(key) or "")
+    prepared = (output.get("prepared_segments") or {}).get(key) or {}
+    if saved and not original and prepared.get("storage_key"):
+        saved = str(prepared["storage_key"])
     if not saved:
         # Previously generated clips remain independently cached. Only grant
         # access if they match this job's current voice, model and spoken text.

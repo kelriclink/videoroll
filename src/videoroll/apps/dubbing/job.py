@@ -17,6 +17,7 @@ from typing import Any, Callable
 
 from sqlalchemy.orm import Session, sessionmaker
 
+from videoroll.apps.dubbing.pauses import prepared_name
 from videoroll.apps.dubbing.pipeline import (
     SpeechSynthesizer, generate_dubbed_media, segment_cache_key, spoken_segments_from_json,
 )
@@ -277,6 +278,29 @@ def execute_dubbing_job(
                 progress_db.commit()
             finally:
                 progress_db.close()
+        def prepared_checkpoint(key: str, wav: Path, report) -> None:
+            # A pause-condensed alternative never overwrites source TTS audio.
+            prepared_key = f'dub/{task_id}/tts/prepared/{prepared_name(key)}'
+            cached_path = store.path_for(prepared_key, require_exists=False)
+            if not cached_path.is_file():
+                store.upload_file(wav, prepared_key, content_type='audio/wav')
+            with session_factory() as prepared_db:
+                item = prepared_db.get(DubbingJob, job_id)
+                if item is None or item.lease_owner != owner:
+                    raise DubbingInterrupted('lease_lost')
+                data = dict(item.output_json or {})
+                prepared = dict(data.get('prepared_segments') or {})
+                prepared[key] = {
+                    'storage_key': prepared_key,
+                    'original_seconds': round(report.original_seconds, 3),
+                    'prepared_seconds': round(report.prepared_seconds, 3),
+                    'removed_seconds': round(report.removed_seconds, 3),
+                    'pauses_shortened': report.pauses_shortened,
+                }
+                data['prepared_segments'] = prepared
+                item.output_json = data
+                prepared_db.commit()
+
         def performance_update(count: int, elapsed: float, audio_seconds: float) -> None:
             with session_factory() as perf_db:
                 item = perf_db.get(DubbingJob, job_id)
@@ -383,6 +407,7 @@ def execute_dubbing_job(
             voice=voice, ffmpeg=ffmpeg, ffprobe=ffprobe,
             retain_original_audio=bool(request.get("retain_original_audio")),
             on_segment_done=checkpoint,
+            on_segment_prepared=prepared_checkpoint,
             speech_overrides=speech_overrides,
             speech_unit_overrides=auto_overrides,
             on_auto_rewrite=automatic_rewrite if quality.get('auto_rewrite_speech') else None,

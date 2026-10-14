@@ -91,6 +91,7 @@ def reconfigure_dubbing(db: Session, *, task_id: uuid.UUID, job_id: uuid.UUID,
         output.pop('segments',None)
         output.pop('performance',None)
         output.pop('speech_units',None)
+        output.pop('prepared_segments',None)
     job.output_json=output
     job.status='queued'
     job.progress=0

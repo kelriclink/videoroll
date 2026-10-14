@@ -11,6 +11,7 @@ type Segment = {
   overridden: boolean;
   auto_rewritten?: boolean;
   has_audio: boolean;
+  prepared_audio?: { storage_key: string; original_seconds: number; prepared_seconds: number; removed_seconds: number; pauses_shortened: number } | null;
   speech_unit_start?: number;
   speech_unit_indices?: number[];
   generated_speech_text?: string | null;
@@ -116,7 +117,22 @@ export function TaskDubbingSegments({
               />
               <div className="mt-2 flex flex-wrap items-center gap-2">
                 {item.has_audio ? (
-                  <audio controls preload="none" src={tasksApi.dubbingPreviewUrl(taskId, job.id, item.index)} />
+                  <div>
+                    {item.prepared_audio ? (
+                      <p className="mb-1 text-emerald-800">
+                        已清理 {item.prepared_audio.pauses_shortened} 处异常长停顿：
+                        {item.prepared_audio.original_seconds.toFixed(2)} 秒 → {item.prepared_audio.prepared_seconds.toFixed(2)} 秒
+                        （原始音频仍保留）
+                      </p>
+                    ) : null}
+                    <audio controls preload="none" src={tasksApi.dubbingPreviewUrl(taskId, job.id, item.index)} />
+                    {item.prepared_audio ? (
+                      <details className="mt-1">
+                        <summary className="cursor-pointer text-slate-600">对比原始 TTS 音频</summary>
+                        <audio controls preload="none" src={tasksApi.dubbingPreviewUrl(taskId, job.id, item.index, true)} />
+                      </details>
+                    ) : null}
+                  </div>
                 ) : item.speech_unit_start && item.speech_unit_start !== item.index ? (
                   <span className="text-slate-500">音频随第 {item.speech_unit_start} 条合并生成</span>
                 ) : <span className="text-slate-500">尚未生成该句音频</span>}

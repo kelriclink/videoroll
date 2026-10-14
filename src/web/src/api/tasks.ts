@@ -139,8 +139,8 @@ export const tasksApi = {
     );
   },
 
-  dubbingPreviewUrl(taskId: string, jobId: string, index: number) {
-    return orchestratorUrl(`/tasks/${taskId}/dubbing_jobs/${jobId}/segments/${index}/audio`);
+  dubbingPreviewUrl(taskId: string, jobId: string, index: number, original = false) {
+    return orchestratorUrl(`/tasks/${taskId}/dubbing_jobs/${jobId}/segments/${index}/audio${original ? '?original=true' : ''}`);
   },
 
   publishJobs(taskId: string) {

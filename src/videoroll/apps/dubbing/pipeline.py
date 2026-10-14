@@ -17,6 +17,7 @@ from typing import Any, Callable, Mapping, Protocol
 
 from videoroll.apps.dubbing.audio import assemble_track, wav_duration
 from videoroll.apps.dubbing.mux import build_dubbed_part_command
+from videoroll.apps.dubbing.pauses import PauseResult, prepare_long_pauses, prepared_name
 from videoroll.apps.dubbing.timing import (SpokenSegment, plan_dubbing_timeline,
                                             check_segment_fit, DubbingTimingError,
                                             reconcile_final_subtitle_boundary, SpeechTooLong,
@@ -107,6 +108,7 @@ def generate_dubbed_media(
     retain_original_audio: bool = False,
     original_audio_present: bool = True,
     on_segment_done: Callable[[int, int, str, Path], None] | None = None,
+    on_segment_prepared: Callable[[str, Path, PauseResult], None] | None = None,
     speech_overrides: Mapping[str, str] | None = None,
     on_stage: Callable[[str, int], None] | None = None,
     on_check: Callable[[], None] | None = None,
@@ -178,6 +180,19 @@ def generate_dubbed_media(
         original_audio_present = bool(audio_probe.stdout.strip())
         if not original_audio_present:
             raise DubbingTimingError("selected audio mix requires an original audio stream")
+    def effective_audio(raw_file: Path, key: str) -> tuple[Path, float]:
+        # Keep original TTS immutable. For CosyVoice3, pathological multi-
+        # second low-energy gaps are removed in a separately versioned WAV.
+        if not synthesizer.model_path.startswith('cosyvoice3:'):
+            return raw_file, wav_duration(raw_file)
+        prepared = prepare_long_pauses(
+            raw_file, workspace / 'segments' / 'prepared' / prepared_name(key),
+            ffmpeg=ffmpeg,
+        )
+        if prepared.pauses_shortened and on_segment_prepared is not None:
+            on_segment_prepared(key, prepared.path, prepared)
+        return prepared.path, prepared.prepared_seconds
+
     audio_files: dict[int, Path] = {}
     tts_durations: dict[int, float] = {}
     keys: dict[str, str] = {}
@@ -226,14 +241,16 @@ def generate_dubbed_media(
                 on_check()
             key = segment_cache_key(item, synthesizer.model_path, quality=quality)
             file = workspace / "segments" / f"{key}.wav"
-            length = wav_duration(file)
+            # Upload original first, then publish a separate derived WAV.
+            # This keeps the original available even when the fit check fails.
+            audio_generated += wav_duration(file)
+            if on_segment_done is not None:
+                on_segment_done(n, len(segments), key, file)
+            file, length = effective_audio(file, key)
             audio_files[item.index] = file
             tts_durations[item.index] = length
             keys[str(item.index)] = key
-            audio_generated += length
-            if on_segment_done is not None:
-                on_segment_done(n, len(segments), key, file)
-            # Persist the original clip for a playable review even if it is too long.
+            # Keep a prepared WAV for review without overwriting model output.
             # Only explicitly opted-in jobs may automatically change speech_text.
             try:
                 check_segment_fit(segments, n - 1, length, video_duration=duration,
@@ -265,13 +282,13 @@ def generate_dubbed_media(
                         partial.replace(file)
                     finally:
                         partial.unlink(missing_ok=True)
-                length = wav_duration(file)
-                audio_generated += length
+                audio_generated += wav_duration(file)
+                if on_segment_done is not None:
+                    on_segment_done(n, len(segments), key, file)
+                file, length = effective_audio(file, key)
                 audio_files[item.index] = file
                 tts_durations[item.index] = length
                 keys[str(item.index)] = key
-                if on_segment_done is not None:
-                    on_segment_done(n, len(segments), key, file)
                 check_segment_fit(segments, n - 1, length, video_duration=duration,
                                   max_speed=max_speed)
             if preview_only and n == 1:
