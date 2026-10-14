@@ -27,6 +27,25 @@ def test_native_target_contains_core_roles_but_not_social_publisher() -> None:
     assert "Wants=videoroll@render-worker.service" not in target
 
 
+def test_native_release_restarts_optional_dubbing_roles() -> None:
+    # Regression: previous deployment switched frontend/API but left the
+    # independently running dubbing Hatchet worker on old Python code.
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        'native_roles_for_test', ROOT / 'scripts/native/videorollctl.py')
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    worker = 'videoroll@dubbing-workflow-worker.service'
+    service = 'videoroll@dubbing-service.service'
+    assert worker in module.ROLE_UNITS
+    assert service in module.ROLE_UNITS
+    assert worker in module.WORKFLOW_UNITS
+    assert {worker, service}.issubset(set(module.changed_services(
+        ['src/videoroll/apps/dubbing/timing.py'])))
+    assert worker in module.changed_services(['src/videoroll/workflows/dubbing_job.py'])
+
+
 def test_native_http_services_bind_loopback_only() -> None:
     launcher = (ROOT / "scripts/native/run-role.sh").read_text(encoding="utf-8")
     assert "--host 0.0.0.0" not in launcher
