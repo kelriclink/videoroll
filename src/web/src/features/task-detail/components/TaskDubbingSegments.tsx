@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { tasksApi } from "../../../api/tasks";
+import { DubbingAudioPreview } from "./DubbingAudioPreview";
 import type { DubbingJob } from "../../../lib/types";
 
 type Segment = {
@@ -125,11 +126,11 @@ export function TaskDubbingSegments({
                         （原始音频仍保留）
                       </p>
                     ) : null}
-                    <audio controls preload="none" src={tasksApi.dubbingPreviewUrl(taskId, job.id, item.index)} />
+                    <DubbingAudioPreview src={tasksApi.dubbingPreviewUrl(taskId, job.id, item.index)} />
                     {item.prepared_audio ? (
                       <details className="mt-1">
                         <summary className="cursor-pointer text-slate-600">对比原始 TTS 音频</summary>
-                        <audio controls preload="none" src={tasksApi.dubbingPreviewUrl(taskId, job.id, item.index, true)} />
+                        <DubbingAudioPreview src={tasksApi.dubbingPreviewUrl(taskId, job.id, item.index, true)} />
                       </details>
                     ) : null}
                   </div>

@@ -18,6 +18,7 @@ def build_dubbed_part_command(
     *,
     video_duration: float,
     original_audio_present: bool,
+    source_video_duration: float | None = None,
     retain_original_audio: bool = False,
     original_volume: float = 0.10,
     background_track: Path | None = None,
@@ -39,6 +40,17 @@ def build_dubbed_part_command(
     if subtitle_video == output_video or chinese_audio == output_video:
         raise ValueError("output must be distinct from inputs")
     duration = f"{video_duration:.6f}"
+    if source_video_duration is not None and (
+        not isfinite(source_video_duration) or source_video_duration <= 0
+        or video_duration + 1e-8 < source_video_duration
+    ):
+        raise ValueError('invalid source video duration')
+    # YouDub alignment can legitimately extend the final audio past the
+    # source footage. Retain visual frames throughout the exported duration:
+    # tpad freezes the final frame, so Bilibili will not receive audio with
+    # no corresponding video track near the end.
+    extra = max(0.0, video_duration - (source_video_duration or video_duration))
+    video_tail = extra > 0.055
     if background_track is not None:
         graph = (
             "[2:a:0]volume=0.65[background];"
@@ -61,7 +73,11 @@ def build_dubbed_part_command(
         *([] if background_track is None else ["-i", str(background_track)]),
         "-filter_complex", graph,
         "-map", "0:v:0", "-map", "[out]", "-map", "0:s?",
-        "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+        *(['-vf', f'tpad=stop_mode=clone:stop_duration={extra + 0.05:.6f}']
+          if video_tail else []),
+        *(['-c:v', 'libx264', '-preset', 'fast', '-crf', '22',
+           '-pix_fmt', 'yuv420p'] if video_tail else ['-c:v', 'copy']),
+        "-c:a", "aac", "-b:a", "192k",
         "-c:s", "copy", "-metadata:s:a:0", "language=zho",
         "-metadata:s:a:0", "title=中文配音",
         "-t", duration, "-movflags", "+faststart", str(output_video),

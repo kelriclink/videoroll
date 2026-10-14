@@ -106,17 +106,16 @@ class RecordingTTS:
                         "-ar", "24000", "-ac", "1", str(output)], check=True)
 
 
-def test_overlong_first_clip_is_detected_before_generating_remaining_ones(tmp_path):
+def test_youdub_completes_all_clips_even_when_first_exceeds_original_slot(tmp_path):
     video, subtitles = _create_media(tmp_path)
     tts = RecordingTTS(4.0)
     persisted = []
-    with pytest.raises(SpeechTooLong) as exc:
-        generate_dubbed_media(video, subtitles, tmp_path / "work", tts,
-                             on_segment_done=lambda *args: persisted.append(args[0]))
-    assert exc.value.index == 1
-    assert persisted == [1]
-    assert tts.calls == 1
-    assert not (tmp_path / "work/dubbed.mp4").exists()
+    result = generate_dubbed_media(video, subtitles, tmp_path / "work", tts,
+                                   on_segment_done=lambda *args: persisted.append(args[0]))
+    assert persisted == [1, 2]
+    assert tts.calls == 2
+    assert result.video_path.is_file()
+    assert result.source_duration >= 5.0
 
 
 def test_first_sentence_preview_stops_early_and_can_reuse_cache(tmp_path):
@@ -350,7 +349,7 @@ def test_preview_passes_when_last_subtitle_extends_past_video_end(tmp_path):
     assert json.loads(subtitles.read_text(encoding='utf-8'))[-1]['end']==7.1
 
 
-def test_overlong_first_preview_keeps_audio_and_requires_edit_before_full_generation(tmp_path):
+def test_youdub_long_first_preview_keeps_audio_and_requires_no_edit(tmp_path):
     from videoroll.apps.dubbing.job import execute_dubbing_job
     factory, store, _, job_id = _prepare_job_media(tmp_path)
     # Valid TTS sound with a 5s duration cannot fit the first subtitle slot.
@@ -362,16 +361,14 @@ def test_overlong_first_preview_keeps_audio_and_requires_edit_before_full_genera
         row=db.get(DubbingJob,job_id)
         assert row.status=='preview_ready'
         assert row.request_json['preview_only'] is True
-        assert row.output_json['timing_issue']['segment_index']==1
-        assert row.output_json['timing_issue']['required_speed'] > 1.25
+        assert not row.output_json.get('timing_issue')
         assert len(row.output_json['segments'])==1
         wav=store.path_for(next(iter(row.output_json['segments'].values())))
         assert wav.is_file() and wav.stat().st_size>44
     assert tts.calls==1
 
 
-def test_preview_with_timing_issue_cannot_start_full_job_from_api(tmp_path):
-    from fastapi import HTTPException
+def test_youdub_preview_with_legacy_timing_issue_can_confirm(tmp_path):
     from videoroll.apps.orchestrator_api.routers.tasks import confirm_dubbing_preview
     from videoroll.db.models import DubbingJob
     factory, _, task_id, job_id = _prepare_job_media(tmp_path)
@@ -382,10 +379,13 @@ def test_preview_with_timing_issue_cannot_start_full_job_from_api(tmp_path):
                          'segments':{'sample':'stored.wav'}}
         db.commit()
     with patch('videoroll.apps.dubbing.worker_status.worker_status',return_value={'available':True}):
-        with factory() as db, pytest.raises(HTTPException) as caught:
-            confirm_dubbing_preview(task_id,job_id,settings=None,db=db)
-        assert caught.value.status_code == 409
+        with patch('videoroll.workflows.launcher.PipelineLauncher') as launcher:
+            with factory() as db:
+                reply = confirm_dubbing_preview(task_id,job_id,settings=None,db=db)
+                assert reply.status == 'queued'
+            launcher.return_value.launch_dubbing_job.assert_called_once()
     with factory() as db:
         job=db.get(DubbingJob,job_id)
-        assert job.status=='preview_ready'
-        assert job.request_json['preview_only'] is True
+        assert job.status=='queued'
+        assert job.request_json['preview_only'] is False
+        assert not job.output_json.get('timing_issue')

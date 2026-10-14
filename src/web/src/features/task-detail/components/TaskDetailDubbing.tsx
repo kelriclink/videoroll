@@ -85,7 +85,6 @@ export function TaskDetailDubbing({
   const [subtitleJobId, setSubtitleJobId] = useState("");
   const [loading, setLoading] = useState(true);
   const [submitting, setSubmitting] = useState(false);
-  const [maxAudioSpeed, setMaxAudioSpeed] = useState(2.0);
   const [autoGroupSpeech, setAutoGroupSpeech] = useState(false);
   const [forceRegenerate, setForceRegenerate] = useState(false);
   const restoredJob = useRef(false);
@@ -131,10 +130,6 @@ export function TaskDetailDubbing({
           setProfileId(q?.profile_id || "");
           setMixMode((q?.mix_mode as typeof mixMode) || "replace");
           setBatchSize((q?.batch_size as 1 | 2 | 4) || 1);
-          const existingLimit = q?.max_audio_speed ?? (q?.debug_timing ? 2.0 : 1.25);
-          const required = editable.output.timing_issue?.required_speed ?? 0;
-          setMaxAudioSpeed(required > existingLimit
-            ? (required <= 2.25 ? 2.25 : 2.5) : existingLimit);
           setAutoGroupSpeech(q?.auto_group_speech ?? false);
         }
       }
@@ -216,20 +211,15 @@ export function TaskDetailDubbing({
     && !trulyBusy && (!blockedByExisting || Boolean(editableJob)) && !submitting
     && (mixMode !== "background_only" || separationReady));
 
-  async function continueWithAudioSpeed(job: DubbingJob) {
+  async function continueWithYouDub(job: DubbingJob) {
     if (submitting) return;
-    const required = job.output.timing_issue?.required_speed ?? 0;
-    if (maxAudioSpeed + 0.000001 < required) {
-      setError(`当前片段至少需要 ${required.toFixed(2)}×，所选上限 ${maxAudioSpeed.toFixed(2)}× 不足。请提高加速上限或编辑该句口播。`);
-      return;
-    }
     setSubmitting(true);setError(null);setMessage(null);
     try {
       const q = job.request.quality;
       await tasksApi.rerunDubbing(taskId, job.id, {
         subtitle_job_id: job.subtitle_job_id ?? "",
         subtitle_video_key: job.request.subtitle_video_key ?? "",
-        operation_key: `p2:audio-tempo:${Date.now()}`,
+        operation_key: `p2:youdub-resume:${Date.now()}`,
         model_path: job.request.model_path ?? modelPath,
         voice: job.request.voice ?? voice,
         retain_original_audio: job.request.retain_original_audio ?? false,
@@ -240,10 +230,10 @@ export function TaskDetailDubbing({
         reference_profile_id: q?.profile_id ?? null,
         cosy_mode: (q?.cosy_mode as "cross_lingual" | "zero_shot" | "instruct") ?? "cross_lingual",
         cosy_speed: q?.cosy_speed ?? 1,
-        debug_timing: maxAudioSpeed > 1.25, max_audio_speed: maxAudioSpeed,
+        debug_timing: false,
         auto_group_speech: q?.auto_group_speech ?? false, auto_rewrite_speech: false,
       }, false);
-      setMessage(`已请求继续原任务：保留已生成语音，仅在合成阶段允许最高 ${maxAudioSpeed.toFixed(2)}× 音频变速，不进行智能合句重试或 AI 自动删改。`);
+      setMessage("已请求 YouDub 配音引擎继续：保留音频缓存，由 YouDub 全局/局部伸缩并顺延过长语音；不再限制在单句字幕窗口内。");
       await reloadJobs();
     } catch (reason) {setError(String(reason));}
     finally {setSubmitting(false);}
@@ -506,14 +496,7 @@ export function TaskDetailDubbing({
       </details>
       {!workerReady ? <p className="mt-2 text-sm text-amber-700">配音 Worker 未运行，已禁止创建无执行节点的任务。</p> : null}
       <div className="mt-3 flex flex-wrap items-center gap-3 text-sm">
-        <label className="flex items-center gap-2">
-          最大后期音频加速
-          <select className="rounded border p-1" value={maxAudioSpeed}
-            onChange={(event) => setMaxAudioSpeed(Number(event.target.value))} disabled={trulyBusy || submitting}>
-            {[1.25, 1.5, 1.75, 2, 2.25, 2.5].map((value) =>
-              <option key={value} value={value}>{value.toFixed(2)}×</option>)}
-          </select>
-        </label>
+        <p className="text-slate-600">配音对齐：YouDub 原生全局/局部伸缩与语音顺延。无需设置最大单句倍速。</p>
         <label className="flex items-center gap-2">
           <input type="checkbox" checked={forceRegenerate} onChange={(event) => setForceRegenerate(event.target.checked)} disabled={trulyBusy || submitting}/>
           强制重新生成语音（默认关闭；重试建议复用旧缓存）
@@ -533,7 +516,7 @@ export function TaskDetailDubbing({
               temperature, top_p: topP, batch_size: usingCosy ? 1 : batchSize, mix_mode: mixMode,
               reference_profile_id: usingCosy ? profileId : null,
               cosy_mode: cosyMode, cosy_speed: cosySpeed,
-              debug_timing: maxAudioSpeed > 1.25, max_audio_speed: maxAudioSpeed,
+              debug_timing: false,
               auto_group_speech: autoGroupSpeech, auto_rewrite_speech: false,
             })}>
             {submitting ? "正在提交…" : preview ? "生成一句试听" : "完整配音"}
@@ -574,12 +557,10 @@ export function TaskDetailDubbing({
                   已缓存 {Object.keys(job.output.segments ?? {}).length}/{job.output.segments_total ?? "?"} 段
                 </div>
                 {job.output.speech_units?.length ? <p className="mt-1 text-xs text-slate-500">
-                  配音规划 {job.output.speech_units.length} 单元 · 以实际生成的音频测量时长（估算并不能保证通过）
+                  配音规划 {job.output.speech_units.length} 单元 · YouDub 按实际音频全局对齐，单句超时不再中止
                 </p> : null}
                 {job.output.timing_issue ? <p className="mt-2 text-amber-700">
-                  第 {job.output.timing_issue.segment_index} 段口播太长。{job.status === "needs_review"
-                    ? `已保存音频。实测需要 ${job.output.timing_issue.required_speed.toFixed(2)}× 才能装入原时间窗；可提高后期音频变速并继续，或在下方编辑口播。`
-                    : "已保存试听音频；可以试听或重新生成。"}
+                  旧引擎第 {job.output.timing_issue.segment_index} 段时长限制导致暂停。可继续使用 YouDub 对齐并复用之前生成的音频。
                 </p> : null}
                 {job.output.performance ? <p className="mt-1 text-xs text-slate-500">已测推理 {job.output.performance.wall_seconds.toFixed(1)} 秒；生成音频 {job.output.performance.audio_seconds.toFixed(1)} 秒；最近批次 {job.output.performance.last_batch_size} 句</p> : null}
                 {job.error_message && !job.output.timing_issue ? <div className="mt-2 break-words text-xs text-rose-700">{job.error_message}</div> : null}
@@ -608,15 +589,14 @@ export function TaskDetailDubbing({
                   ) : null}
                   {job.status === "needs_review" && !submitting ? (
                     <button type="button" className="rounded border border-amber-400 px-2 py-1 text-xs text-amber-800 disabled:opacity-50"
-                      disabled={maxAudioSpeed + 0.000001 < (job.output.timing_issue?.required_speed ?? 0)}
-                      onClick={() => void continueWithAudioSpeed(job)}>继续配音（最高 {maxAudioSpeed.toFixed(2)}× 后期变速，复用缓存）</button>
+                      onClick={() => void continueWithYouDub(job)}>用 YouDub 引擎继续配音（复用缓存）</button>
                   ) : ["failed", "paused"].includes(job.status) && !submitting ? (
                     <button type="button" className="rounded border border-amber-400 px-2 py-1 text-xs text-amber-800"
                       onClick={() => void retryJob(job.id)}>{job.status === "paused" ? "恢复配音" : "断点重试"}</button>
                   ) : null}
                 </div>
                 {job.status === "needs_review" ? <p className="mt-2 text-xs text-amber-700">
-                  高倍率可能让说话急促。片段试听为原始生成 WAV；最终 MP4 在混音时变速，原视频长度不变。
+                  YouDub 按生成语音顺序对齐：单句超时不再中止任务。最终成片可能延长，需试听检查音画偏移。
                 </p> : null}
                 <TaskDubbingSegments taskId={taskId} job={job} reload={reloadJobs} />
               </div>

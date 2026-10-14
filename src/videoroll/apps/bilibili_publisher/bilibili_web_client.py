@@ -3,6 +3,8 @@ from __future__ import annotations
 import base64
 import hashlib
 import math
+import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import mimetypes
 import time
 from dataclasses import dataclass
@@ -439,40 +441,74 @@ class BilibiliWebClient:
         chunks = int(math.ceil(filesize / float(chunk_size)))
         parts: list[dict[str, Any]] = []
 
-        with video_path.open("rb") as f:
-            for chunk in range(chunks):
-                start = chunk * chunk_size
-                buf = f.read(chunk_size)
-                if not buf:
-                    break
-                end = start + len(buf)
-                resp = self._upos.put(
-                    url,
-                    params={
-                        "partNumber": str(chunk + 1),
-                        "uploadId": meta.upload_id,
-                        "chunk": str(chunk),
-                        "chunks": str(chunks),
-                        "size": str(len(buf)),
-                        "start": str(start),
-                        "end": str(end),
-                        "total": str(filesize),
-                    },
-                    headers={"X-Upos-Auth": pre.auth, "Content-Type": "application/octet-stream"},
-                    content=buf,
+        # Bilibili UPOS supports independent, out-of-order multipart PUTs.
+        # Cap concurrent requests to avoid proxy/rate-limit overload. The API
+        # only publishes the upload after ALL part numbers are acknowledged.
+        try:
+            worker_count = int(os.environ.get("BILIBILI_UPLOAD_WORKERS", "3"))
+        except (TypeError, ValueError):
+            worker_count = 3
+        worker_count = max(1, min(worker_count, 4, chunks))
+
+        def upload_part(chunk: int) -> tuple[dict[str, Any], int]:
+            start = chunk * chunk_size
+            with video_path.open("rb") as stream:
+                stream.seek(start)
+                buf = stream.read(chunk_size)
+            if not buf:
+                raise BilibiliWebError(f"missing upload chunk {chunk + 1}")
+            end = start + len(buf)
+            resp = self._upos.put(
+                url,
+                params={
+                    "partNumber": str(chunk + 1),
+                    "uploadId": meta.upload_id,
+                    "chunk": str(chunk),
+                    "chunks": str(chunks),
+                    "size": str(len(buf)),
+                    "start": str(start),
+                    "end": str(end),
+                    "total": str(filesize),
+                },
+                headers={"X-Upos-Auth": pre.auth, "Content-Type": "application/octet-stream"},
+                content=buf,
+            )
+            if resp.status_code != 200:
+                raise BilibiliWebError(
+                    f"chunk {chunk + 1} upload failed "
+                    f"(status={resp.status_code} body={resp.text[:200]})"
                 )
-                if resp.status_code != 200:
-                    raise BilibiliWebError(f"chunk upload failed (status={resp.status_code} body={resp.text[:200]})")
-                # Some servers respond with "MULTIPART_PUT_SUCCESS" plain text. Prefer ETag header if present;
-                # otherwise fall back to MD5 of the uploaded chunk (common ETag semantics).
-                etag = (resp.headers.get("ETag") or resp.headers.get("Etag") or resp.headers.get("etag") or "").strip()
-                if etag:
-                    etag = etag.strip('"')
-                else:
-                    etag = hashlib.md5(buf).hexdigest()  # noqa: S324
-                parts.append({"partNumber": chunk + 1, "eTag": etag or "etag"})
+            etag = (resp.headers.get("ETag") or resp.headers.get("Etag")
+                    or resp.headers.get("etag") or "").strip().strip('"')
+            if not etag:
+                etag = hashlib.md5(buf).hexdigest()  # noqa: S324
+            return {"partNumber": chunk + 1, "eTag": etag}, len(buf)
+
+        uploaded_bytes = 0
+        # Small videos retain the previous strictly sequential behavior.
+        if worker_count == 1 or chunks < 4:
+            for chunk in range(chunks):
+                part, size = upload_part(chunk)
+                parts.append(part)
+                uploaded_bytes += size
                 if on_progress is not None:
-                    on_progress(end, filesize)
+                    on_progress(uploaded_bytes, filesize)
+        else:
+            with ThreadPoolExecutor(max_workers=worker_count) as pool:
+                futures = [pool.submit(upload_part, chunk) for chunk in range(chunks)]
+                for future in as_completed(futures):
+                    part, size = future.result()
+                    parts.append(part)
+                    uploaded_bytes += size
+                    if on_progress is not None:
+                        on_progress(uploaded_bytes, filesize)
+            # Bilibili requires a complete ordered list for the final request,
+            # regardless of which parallel HTTP PUT finished first.
+            parts.sort(key=lambda part: int(part["partNumber"]))
+        if len(parts) != chunks or uploaded_bytes != filesize:
+            raise BilibiliWebError(
+                f"UPOS upload incomplete ({uploaded_bytes}/{filesize} bytes)"
+            )
 
         resp = self._upos.post(
             url,

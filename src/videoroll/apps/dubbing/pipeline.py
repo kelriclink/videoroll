@@ -12,16 +12,18 @@ import os
 import subprocess
 import uuid
 from dataclasses import dataclass, replace
+from math import isfinite
 from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol
 
-from videoroll.apps.dubbing.audio import assemble_track, wav_duration
+from videoroll.apps.dubbing.audio import wav_duration
 from videoroll.apps.dubbing.mux import build_dubbed_part_command
 from videoroll.apps.dubbing.pauses import PauseResult, prepare_long_pauses, prepared_name
-from videoroll.apps.dubbing.timing import (SpokenSegment, plan_dubbing_timeline,
-                                            check_segment_fit, DubbingTimingError,
-                                            reconcile_final_subtitle_boundary, SpeechTooLong,
-                                            estimate_spoken_seconds, speech_slot_seconds)
+from videoroll.apps.dubbing.youdub_adapter import align_youdub
+from videoroll.apps.dubbing.timing import (
+    SpokenSegment, DubbingTimingError, reconcile_final_subtitle_boundary,
+    estimate_spoken_seconds, speech_slot_seconds,
+)
 from videoroll.apps.dubbing.quality import audio_cache_key
 from videoroll.apps.dubbing.speech_units import (SpeechUnit, build_speech_units,
     apply_speech_unit_overrides)
@@ -140,12 +142,18 @@ def generate_dubbed_media(
     )
     if adjustments and on_timing_adjustment is not None:
         on_timing_adjustment(adjustments)
-    # Validate the original translated subtitle chronology before grouping:
-    # grouping must never conceal broken source timestamps.
-    plan_dubbing_timeline(
-        segments, {p.index: max(0.01, (p.end-p.start) * 0.5) for p in segments},
-        video_duration=duration, max_speed=max_speed,
-    )
+    # Validate chronology only. YouDub permits overlapping caption windows
+    # and schedules utterances in sequence after the preceding voice.
+    previous_start = -1.0
+    for part in segments:
+        if (not isfinite(part.start) or not isfinite(part.end)
+                or part.start < 0 or part.start + 1e-6 < previous_start
+                or part.end <= part.start or part.end > duration + 0.02):
+            raise DubbingTimingError(
+                f'segment {part.index}: invalid or unsorted source interval '
+                f'({part.start:.3f}..{part.end:.3f}, source {duration:.3f}s)'
+            )
+        previous_start = part.start
     units = apply_speech_unit_overrides(build_speech_units(
         segments, enabled=bool((quality or {}).get('auto_group_speech', False))),
         speech_unit_overrides)
@@ -164,12 +172,6 @@ def generate_dubbed_media(
             } for i, unit in enumerate(units)])
 
     report_speech_units()
-    # Early structural validation: reject invalid source timestamps before
-    # spending hours on inference. Dummy durations test only intervals.
-    plan_dubbing_timeline(
-        segments, {s.index: max(0.01, (s.end - s.start) * 0.5) for s in segments},
-        video_duration=duration, max_speed=max_speed,
-    )
     if retain_original_audio or mix_mode in ("original_low", "background_only"):
         audio_probe = subprocess.run(
             [ffprobe, "-v", "error", "-select_streams", "a:0",
@@ -250,47 +252,9 @@ def generate_dubbed_media(
             audio_files[item.index] = file
             tts_durations[item.index] = length
             keys[str(item.index)] = key
-            # Keep a prepared WAV for review without overwriting model output.
-            # Only explicitly opted-in jobs may automatically change speech_text.
-            try:
-                check_segment_fit(segments, n - 1, length, video_duration=duration,
-                                  max_speed=max_speed)
-            except SpeechTooLong as issue:
-                if (preview_only or on_auto_rewrite is None or
-                        not (quality or {}).get('auto_rewrite_speech')):
-                    raise
-                # The callback checks source/manual overrides and makes at most
-                # one persisted proposal per speech unit. Failure stays reviewable.
-                candidate = on_auto_rewrite(units[n - 1], issue.slot * max_speed * 0.88, length)
-                if not candidate or candidate == item.speech_text:
-                    raise
-                item = replace(item, speech_text=candidate)
-                segments[n - 1] = item
-                units[n - 1] = SpeechUnit(item, units[n - 1].source_indices)
-                report_speech_units()
-                key = segment_cache_key(item, synthesizer.model_path, quality=quality)
-                file = workspace / 'segments' / f'{key}.wav'
-                if not file.is_file() or file.stat().st_size <= 44:
-                    file.parent.mkdir(parents=True, exist_ok=True)
-                    partial = file.with_name(f'{file.stem}.{os.getpid()}.{uuid.uuid4().hex}.pending.wav')
-                    try:
-                        if on_check:
-                            on_check()
-                        synthesizer.synthesize(item.speech_text, partial, voice=item.voice)
-                        if wav_duration(partial) <= 0:
-                            raise DubbingTimingError(f'segment {item.index}: TTS returned silence')
-                        partial.replace(file)
-                    finally:
-                        partial.unlink(missing_ok=True)
-                audio_generated += wav_duration(file)
-                if on_segment_done is not None:
-                    on_segment_done(n, len(segments), key, file)
-                file, length = effective_audio(file, key)
-                audio_files[item.index] = file
-                tts_durations[item.index] = length
-                keys[str(item.index)] = key
-                check_segment_fit(segments, n - 1, length, video_duration=duration,
-                                  max_speed=max_speed)
+            # YouDub alignment is not restricted to this subtitle's original
+            # time slot. Complete TTS for every unit; the upstream global/local
+            # mixer schedules late clips after the preceding voice.
             if preview_only and n == 1:
                 from videoroll.apps.dubbing.control import DubbingInterrupted
                 raise DubbingInterrupted("preview_ready")
@@ -299,15 +263,15 @@ def generate_dubbed_media(
 
     if on_stage is not None:
         on_stage("aligning", 88)
-    placements = plan_dubbing_timeline(
-        segments, tts_durations, video_duration=duration,
-        max_speed=max_speed,
-    )
+    if on_check:
+        on_check()
+    # Use YouDub's original merge_tts_audio: global stretch, local stretch,
+    # gap padding, and time drift. No per-clip SpeechTooLong gate remains.
+    aligned = align_youdub(segments, audio_files, source_duration=duration,
+                           workspace=workspace)
     if on_stage is not None:
         on_stage("mixing", 90)
-    track = workspace / "chinese_audio.wav"
-    assemble_track(placements, audio_files, track, video_duration=duration,
-                   ffmpeg_path=ffmpeg, max_playback_speed=max_speed)
+    track = aligned.audio_path
     p2 = workspace / "dubbed.mp4"
     stem = None
     if mix_mode == "background_only":
@@ -320,7 +284,8 @@ def generate_dubbed_media(
     elif mix_mode not in ("replace", "original_low"):
         raise ValueError("invalid mix mode")
     command = build_dubbed_part_command(
-        ffmpeg, subtitle_video, track, p2, video_duration=duration,
+        ffmpeg, subtitle_video, track, p2, video_duration=aligned.final_duration,
+        source_video_duration=duration,
         original_audio_present=original_audio_present,
         retain_original_audio=(mix_mode == "original_low" or retain_original_audio),
         background_track=stem,
@@ -329,6 +294,8 @@ def generate_dubbed_media(
     if not p2.is_file() or not p2.stat().st_size:
         raise RuntimeError("P2 mux generated no video file")
     output_duration = probe_duration(p2, ffprobe=ffprobe)
-    if abs(output_duration - duration) > 0.10:
-        raise DubbingTimingError(f"P2 duration mismatch ({output_duration} vs {duration})")
-    return DubbingResult(track, p2, duration, len(segments), keys)
+    if abs(output_duration - aligned.final_duration) > 0.25:
+        raise DubbingTimingError(
+            f'YouDub P2 duration mismatch ({output_duration:.3f} vs '
+            f'{aligned.final_duration:.3f})')
+    return DubbingResult(track, p2, output_duration, len(segments), keys)

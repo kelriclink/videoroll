@@ -66,10 +66,11 @@ def test_auto_rewrite_once_then_restore_exact_speech_unit_cache(tmp_path):
         on_auto_rewrite=propose, on_speech_units=lambda items: events.append(items),
     )
     assert result.video_path.is_file()
-    assert [p[0] for p in proposals] == [1]
-    assert proposals[0][1] < 0.8
-    assert model.calls == ["我们也不是科学家，我懂。", "我懂，我们也不是专家。", "后面是下一句话。"]
-    assert events[-1][0]["speech_text"] == "我懂，我们也不是专家。"
+    # The legacy repair callback is deliberately never called by YouDub:
+    # audio is scheduled without silently editing the translated speech.
+    assert proposals == []
+    assert model.calls == ["我们也不是科学家，我懂。", "后面是下一句话。"]
+    assert events[-1][0]["speech_text"] == original[0]["text"]
     assert json.loads(source.read_text(encoding="utf-8")) == original
 
     second = generate_dubbed_media(
@@ -77,8 +78,8 @@ def test_auto_rewrite_once_then_restore_exact_speech_unit_cache(tmp_path):
         speech_unit_overrides=saved, on_auto_rewrite=propose,
     )
     assert second.completed_keys == result.completed_keys
-    assert len(model.calls) == 3
-    assert len(proposals) == 1
+    assert len(model.calls) == 2
+    assert proposals == []
 
 
 def test_auto_rewrite_disabled_and_preview_never_changes_speech(tmp_path):
@@ -87,13 +88,14 @@ def test_auto_rewrite_disabled_and_preview_never_changes_speech(tmp_path):
         {"start": 0.2, "end": 0.7, "text": "我们也不是科学家，我懂。"},
     ], ensure_ascii=False), encoding="utf-8")
     proposals = []
-    with pytest.raises(SpeechTooLong):
-        generate_dubbed_media(
-            video, source, tmp_path / "disabled", TimedSynth(),
-            quality={"auto_rewrite_speech": False},
-            on_auto_rewrite=lambda *args: proposals.append(args) or "我懂。",
-        )
-    with pytest.raises(SpeechTooLong):
+    result = generate_dubbed_media(
+        video, source, tmp_path / "disabled", TimedSynth(),
+        quality={"auto_rewrite_speech": False},
+        on_auto_rewrite=lambda *args: proposals.append(args) or "我懂。",
+    )
+    assert result.video_path.is_file()
+    from videoroll.apps.dubbing.control import DubbingInterrupted
+    with pytest.raises(DubbingInterrupted, match="preview_ready"):
         generate_dubbed_media(
             video, source, tmp_path / "preview", TimedSynth(),
             quality={"auto_rewrite_speech": True}, preview_only=True,
@@ -161,15 +163,13 @@ def test_job_persists_automatic_rewrite_and_editor_reports_real_audio(tmp_path, 
         synthesizer_factory=lambda _model, _voice: tts,
     )
     assert "audio_key" in result
-    assert len(tts.calls) == 3
+    assert len(tts.calls) == 2
     with factory() as db:
         job = db.get(DubbingJob, job_id)
         assert job.status == "succeeded"
-        saved = job.request_json["auto_speech_unit_overrides"]["1"]
-        assert saved["speech_text"] == "我懂，我们也非专家。"
-        assert saved["original_text"] == raw[0]["text"]
+        assert not job.request_json.get("auto_speech_unit_overrides")
         listing = list_dubbing_segments(task_id, job_id, offset=0, limit=40, db=db, store=store)
         assert listing["items"][0]["subtitle_text"] == raw[0]["text"]
-        assert listing["items"][0]["auto_rewritten"]
-        assert listing["items"][0]["generated_speech_text"] == saved["speech_text"]
+        assert not listing["items"][0]["auto_rewritten"]
+        assert listing["items"][0]["speech_text"] == raw[0]["text"]
         assert listing["items"][0]["has_audio"]
