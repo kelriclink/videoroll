@@ -331,3 +331,20 @@ def test_llm_rewrite_refuses_missing_configuration_or_unshortened_result(monkeyp
         rewrite.propose_concise_script(text="这是很长的中文口播稿", target_seconds=2.0,
                                        cfg={"openai_model": "local", "openai_api_key": "k",
                                             "openai_base_url": "https://translate.example/v1"})
+
+
+def test_preview_passes_when_last_subtitle_extends_past_video_end(tmp_path):
+    video, subtitles = _create_media(tmp_path)
+    source = json.loads(subtitles.read_text(encoding='utf-8'))
+    source[-1]['end'] = 7.1  # Deliberately beyond the local video duration.
+    subtitles.write_text(json.dumps(source,ensure_ascii=False),encoding='utf-8')
+    tts=RecordingTTS(0.3)
+    fixes=[]
+    with pytest.raises(DubbingInterrupted) as err:
+        generate_dubbed_media(video,subtitles,tmp_path/'work',tts,
+            preview_only=True,on_timing_adjustment=fixes.extend)
+    assert err.value.status=='preview_ready'
+    assert tts.calls==1
+    assert fixes and fixes[0]['segment_index']==len(source)
+    assert fixes[0]['original_end']==7.1
+    assert json.loads(subtitles.read_text(encoding='utf-8'))[-1]['end']==7.1

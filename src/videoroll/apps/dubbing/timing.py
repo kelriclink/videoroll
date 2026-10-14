@@ -7,7 +7,7 @@ never silently truncated, overlapped or allowed to lengthen the video.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from math import isfinite
 from typing import Mapping, Sequence
 
@@ -49,6 +49,37 @@ class SpokenSegment:
     subtitle_text: str
     speech_text: str
     voice: str
+
+
+def reconcile_final_subtitle_boundary(
+    segments: Sequence[SpokenSegment], *, video_duration: float,
+    max_tail_overhang: float = 30.0,
+) -> tuple[list[SpokenSegment], list[dict[str, float | int | str]]]:
+    """Clip a final ASR/translation end time that overshoots source media.
+
+    Only the last segment may be corrected automatically. Earlier malformed
+    timestamps, zero/negative intervals, entries fully outside the video and
+    implausibly large overruns still fail the strict timeline preflight.
+    Preserve original segment indices, texts and cache keys; don't modify SRT.
+    """
+    result = list(segments)
+    if not result or not isfinite(video_duration) or video_duration <= 0:
+        return result, []
+    last = result[-1]
+    overrun = last.end - video_duration
+    if overrun <= 1e-8:
+        return result, []
+    if (not isfinite(last.start) or not isfinite(last.end)
+        or last.start < 0 or last.start >= video_duration - 0.1
+        or last.end <= last.start or overrun > max_tail_overhang):
+        return result, []  # Retain the hard error with segment index.
+    result[-1] = replace(last, end=video_duration)
+    return result, [{
+        'segment_index': last.index, 'reason': 'final_subtitle_past_video_end',
+        'original_end': round(last.end, 3),
+        'corrected_end': round(video_duration, 3),
+        'overrun_seconds': round(overrun, 3),
+    }]
 
 
 @dataclass(frozen=True, slots=True)

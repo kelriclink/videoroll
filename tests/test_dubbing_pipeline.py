@@ -61,3 +61,20 @@ def test_spoken_script_does_not_override_subtitle_text():
     ], voice="Vivian")
     assert result[0].subtitle_text == "正式的技术字幕"
     assert result[0].speech_text == "口播更简洁"
+
+
+def test_pipeline_automatically_clips_last_overlong_subtitle_to_media_boundary(tmp_path):
+    p1, subtitles = _make_input(tmp_path)
+    original = json.loads(subtitles.read_text(encoding='utf-8'))
+    original[-1]['end'] = 4.2  # The source media is only 3 seconds long.
+    subtitles.write_text(json.dumps(original,ensure_ascii=False),encoding='utf-8')
+    notices=[]
+    model=FakeSynthesizer()
+    result=generate_dubbed_media(p1,subtitles,tmp_path/'work',model,
+                                  on_timing_adjustment=notices.extend)
+    assert result.segments_total==2
+    assert len(model.calls)==2
+    assert notices and notices[0]['segment_index']==2
+    assert notices[0]['original_end']==4.2
+    assert notices[0]['corrected_end']==pytest.approx(3.0,abs=0.07)
+    assert json.loads(subtitles.read_text(encoding='utf-8'))[-1]['end']==4.2

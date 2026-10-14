@@ -293,6 +293,17 @@ def execute_dubbing_job(
             finally:
                 stage_db.close()
 
+        def record_timing_adjustments(changes: list[dict]) -> None:
+            with session_factory() as audit_db:
+                item = audit_db.get(DubbingJob, job_id)
+                if item is None or item.lease_owner != owner:
+                    raise DubbingInterrupted("lease_lost")
+                item.output_json = {
+                    **dict(item.output_json or {}),
+                    "source_timing_adjustments": changes,
+                }
+                audit_db.commit()
+
         result = generate_dubbed_media(
             video, segments, workspace, factory,
             voice=voice, ffmpeg=ffmpeg, ffprobe=ffprobe,
@@ -304,6 +315,7 @@ def execute_dubbing_job(
             quality=cache_quality,
             batch_size=int(quality.get("batch_size") or 1),
             on_performance=performance_update,
+            on_timing_adjustment=record_timing_adjustments,
             preview_only=bool(request.get("preview_only")),
             mix_mode=str(quality.get("mix_mode") or (
                 "original_low" if request.get("retain_original_audio") else "replace")),

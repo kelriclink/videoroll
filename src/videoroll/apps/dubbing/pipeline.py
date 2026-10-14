@@ -18,7 +18,8 @@ from typing import Any, Callable, Mapping, Protocol
 from videoroll.apps.dubbing.audio import assemble_track, wav_duration
 from videoroll.apps.dubbing.mux import build_dubbed_part_command
 from videoroll.apps.dubbing.timing import (SpokenSegment, plan_dubbing_timeline,
-                                            check_segment_fit, DubbingTimingError)
+                                            check_segment_fit, DubbingTimingError,
+                                            reconcile_final_subtitle_boundary)
 from videoroll.apps.dubbing.quality import audio_cache_key
 
 
@@ -109,6 +110,7 @@ def generate_dubbed_media(
     quality: dict[str, Any] | None = None,
     batch_size: int = 1,
     on_performance: Callable[[int, float, float], None] | None = None,
+    on_timing_adjustment: Callable[[list[dict[str, float | int | str]]], None] | None = None,
     mix_mode: str = "replace",
     preview_only: bool = False,
 ) -> DubbingResult:
@@ -119,6 +121,11 @@ def generate_dubbed_media(
         voice=voice, speech_overrides=speech_overrides,
     )
     duration = probe_duration(subtitle_video, ffprobe=ffprobe)
+    segments, adjustments = reconcile_final_subtitle_boundary(
+        segments, video_duration=duration,
+    )
+    if adjustments and on_timing_adjustment is not None:
+        on_timing_adjustment(adjustments)
     # Early structural validation: reject invalid source timestamps before
     # spending hours on inference. Dummy durations test only intervals.
     plan_dubbing_timeline(
