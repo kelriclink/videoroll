@@ -215,6 +215,7 @@ def enqueue_dubbing_job(
             cosy_mode=payload.cosy_mode,
             cosy_speed=payload.cosy_speed,
             debug_timing=payload.debug_timing,
+            max_audio_speed=payload.max_audio_speed,
             auto_group_speech=payload.auto_group_speech,
             auto_rewrite_speech=payload.auto_rewrite_speech,
         )

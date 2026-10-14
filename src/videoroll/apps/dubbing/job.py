@@ -70,6 +70,7 @@ def create_dubbing_job(
     cosy_mode: str = "cross_lingual",
     cosy_speed: float = 1.0,
     debug_timing: bool = False,
+    max_audio_speed: float | None = None,
     auto_group_speech: bool = False,
     auto_rewrite_speech: bool = False,
 ) -> DubbingJob:
@@ -125,6 +126,7 @@ def create_dubbing_job(
                                 cosy_speed=cosy_speed, cosy_mode=cosy_mode,
                                 profile_id=profile_id, profile_sha256=profile_sha,
                                 debug_timing=debug_timing,
+                                max_audio_speed=max_audio_speed,
                                 auto_group_speech=auto_group_speech,
                                 auto_rewrite_speech=auto_rewrite_speech)
     # Cache separates different installed model revisions even if the user

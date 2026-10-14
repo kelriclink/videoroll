@@ -6,6 +6,7 @@ PCM to a WAV writer to avoid holding long videos in RAM.
 """
 from __future__ import annotations
 
+import math
 import subprocess
 import wave
 from pathlib import Path
@@ -37,7 +38,10 @@ def assemble_track(
     video_duration: float,
     ffmpeg_path: str = "ffmpeg",
     sample_rate: int = 24000,
+    max_playback_speed: float = 2.5,
 ) -> None:
+    if not math.isfinite(max_playback_speed) or not 1.0 <= max_playback_speed <= 2.5:
+        raise ValueError('invalid maximum audio tempo')
     if video_duration <= 0 or sample_rate not in (24000, 48000):
         raise ValueError("unsupported audio timeline")
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -57,27 +61,43 @@ def assemble_track(
                 raise DubbingTimingError(f"segment {placement.index}: overlaps existing audio")
             _write_silence(out, start - cursor)
             cursor = start
-            # Decode one clip to bounded-size raw audio on disk. atempo is
-            # controlled by the validated timing plan (1.0 .. 2.0).
+            # Decode one clip to bounded-size raw audio on disk. For rates
+            # above 2x, chain sub-2x FFmpeg atempo stages to avoid sample
+            # dropping in a single high-rate filter. The plan caps at 2.5x.
             raw_path = output.with_name(f"{output.stem}_{placement.index}.pcm.tmp")
             try:
-                command = [
-                    ffmpeg_path, "-hide_banner", "-loglevel", "error", "-y",
-                    "-i", str(path), "-vn",
-                    "-af", f"atempo={placement.playback_speed:.9f},aresample={sample_rate}",
-                    "-ac", "1", "-ar", str(sample_rate), "-f", "s16le",
-                    str(raw_path),
-                ]
-                subprocess.run(command, check=True, capture_output=True, timeout=600)
-                count = raw_path.stat().st_size // 2
-                if count == 0 or count > deadline - start + round(0.025 * sample_rate):
+                speed = placement.playback_speed
+                if not 1.0 <= speed <= max_playback_speed or not math.isfinite(speed):
+                    raise DubbingTimingError(f'segment {placement.index}: invalid playback speed')
+                available_frames = deadline - start
+                for _attempt in range(7):
+                    tempo = (f'atempo={math.sqrt(speed):.10f},atempo={math.sqrt(speed):.10f}'
+                             if speed > 2.0 else f'atempo={speed:.10f}')
+                    command = [
+                        ffmpeg_path, '-hide_banner', '-loglevel', 'error', '-y',
+                        '-i', str(path), '-vn',
+                        '-af', f'{tempo},aresample={sample_rate}',
+                        '-ac', '1', '-ar', str(sample_rate), '-f', 's16le',
+                        str(raw_path),
+                    ]
+                    subprocess.run(command, check=True, capture_output=True, timeout=600)
+                    count = raw_path.stat().st_size // 2
+                    if 0 < count <= available_frames:
+                        break
+                    # FFmpeg atempo frame granularity can vary non-monotonically
+                    # (observed on real CosyVoice3 WAVs). Re-measure the PCM and
+                    # retry conservatively within the user's speed ceiling.
+                    if count <= 0 or speed >= max_playback_speed - 1e-8:
+                        raise DubbingTimingError(
+                            f'segment {placement.index}: audio remains over the time slot '
+                            f'at max {max_playback_speed:.2f}x; edit spoken text'
+                        )
+                    speed = min(max_playback_speed,
+                                speed * max(1.025, count / max(1, available_frames) * 1.01))
+                else:
                     raise DubbingTimingError(
-                        f"segment {placement.index}: decoded audio exceeds slot; retry shorter speech"
+                        f'segment {placement.index}: repeated audio tempo adjustment did not fit'
                     )
-                if count > deadline - start:
-                    # FFmpeg resampler may add up to 25ms of padding. Don't
-                    # truncate speech content: fail and request regeneration.
-                    raise DubbingTimingError(f"segment {placement.index}: decoding overshot deadline")
                 with raw_path.open("rb") as src:
                     while chunk := src.read(128 * 1024):
                         out.writeframesraw(chunk)

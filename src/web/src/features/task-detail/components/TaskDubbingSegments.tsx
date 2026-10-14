@@ -89,7 +89,7 @@ export function TaskDubbingSegments({
       {open ? (
         <div className="mt-3 space-y-3">
           <p className="text-xs text-slate-500">
-            仅修改口播文案，原中文字幕不会变化。过长的语音请改写为简短表述后使用“断点重试”。
+            仅修改口播文案，原中文字幕不会变化。过长时可以先尝试后期音频变速；需要改稿时保存修改，再点击“继续配音”（会复用其他已缓存片段）。
           </p>
           {error ? <p className="text-xs text-rose-700">{error}</p> : null}
           {segments.map((item) => (

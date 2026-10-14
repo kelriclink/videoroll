@@ -127,7 +127,12 @@ def generate_dubbed_media(
         voice=voice, speech_overrides=speech_overrides,
     )
     duration = probe_duration(subtitle_video, ffprobe=ffprobe)
-    max_speed = 2.0 if (quality or {}).get("debug_timing") is True else 1.25
+    max_speed = (quality or {}).get('max_audio_speed')
+    if max_speed is None:
+        max_speed = 2.0 if (quality or {}).get('debug_timing') is True else 1.25
+    max_speed = float(max_speed)
+    if not 1.0 <= max_speed <= 2.5:
+        raise DubbingTimingError('invalid maximum post-TTS audio speed')
     segments, adjustments = reconcile_final_subtitle_boundary(
         segments, video_duration=duration,
     )
@@ -284,7 +289,8 @@ def generate_dubbed_media(
     if on_stage is not None:
         on_stage("mixing", 90)
     track = workspace / "chinese_audio.wav"
-    assemble_track(placements, audio_files, track, video_duration=duration, ffmpeg_path=ffmpeg)
+    assemble_track(placements, audio_files, track, video_duration=duration,
+                   ffmpeg_path=ffmpeg, max_playback_speed=max_speed)
     p2 = workspace / "dubbed.mp4"
     stem = None
     if mix_mode == "background_only":

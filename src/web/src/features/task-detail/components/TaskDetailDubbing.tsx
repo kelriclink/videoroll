@@ -85,10 +85,9 @@ export function TaskDetailDubbing({
   const [subtitleJobId, setSubtitleJobId] = useState("");
   const [loading, setLoading] = useState(true);
   const [submitting, setSubmitting] = useState(false);
-  const [debugTiming, setDebugTiming] = useState(true);
+  const [maxAudioSpeed, setMaxAudioSpeed] = useState(2.0);
   const [autoGroupSpeech, setAutoGroupSpeech] = useState(false);
-  const [autoRewriteSpeech, setAutoRewriteSpeech] = useState(false);
-  const [forceRegenerate, setForceRegenerate] = useState(true);
+  const [forceRegenerate, setForceRegenerate] = useState(false);
   const restoredJob = useRef(false);
   const [error, setError] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
@@ -132,9 +131,11 @@ export function TaskDetailDubbing({
           setProfileId(q?.profile_id || "");
           setMixMode((q?.mix_mode as typeof mixMode) || "replace");
           setBatchSize((q?.batch_size as 1 | 2 | 4) || 1);
-          setDebugTiming(q?.debug_timing ?? true);
+          const existingLimit = q?.max_audio_speed ?? (q?.debug_timing ? 2.0 : 1.25);
+          const required = editable.output.timing_issue?.required_speed ?? 0;
+          setMaxAudioSpeed(required > existingLimit
+            ? (required <= 2.25 ? 2.25 : 2.5) : existingLimit);
           setAutoGroupSpeech(q?.auto_group_speech ?? false);
-          setAutoRewriteSpeech(q?.auto_rewrite_speech ?? false);
         }
       }
       setError(null);
@@ -215,15 +216,20 @@ export function TaskDetailDubbing({
     && !trulyBusy && (!blockedByExisting || Boolean(editableJob)) && !submitting
     && (mixMode !== "background_only" || separationReady));
 
-  async function autoRetryJob(job: DubbingJob) {
+  async function continueWithAudioSpeed(job: DubbingJob) {
     if (submitting) return;
+    const required = job.output.timing_issue?.required_speed ?? 0;
+    if (maxAudioSpeed + 0.000001 < required) {
+      setError(`当前片段至少需要 ${required.toFixed(2)}×，所选上限 ${maxAudioSpeed.toFixed(2)}× 不足。请提高加速上限或编辑该句口播。`);
+      return;
+    }
     setSubmitting(true);setError(null);setMessage(null);
     try {
       const q = job.request.quality;
       await tasksApi.rerunDubbing(taskId, job.id, {
         subtitle_job_id: job.subtitle_job_id ?? "",
         subtitle_video_key: job.request.subtitle_video_key ?? "",
-        operation_key: `p2:auto-repair:${Date.now()}`,
+        operation_key: `p2:audio-tempo:${Date.now()}`,
         model_path: job.request.model_path ?? modelPath,
         voice: job.request.voice ?? voice,
         retain_original_audio: job.request.retain_original_audio ?? false,
@@ -233,12 +239,11 @@ export function TaskDetailDubbing({
         mix_mode: (q?.mix_mode as "replace" | "original_low" | "background_only") ?? "replace",
         reference_profile_id: q?.profile_id ?? null,
         cosy_mode: (q?.cosy_mode as "cross_lingual" | "zero_shot" | "instruct") ?? "cross_lingual",
-        cosy_speed: q?.cosy_speed ?? 1, debug_timing: true, auto_group_speech: true,
-        auto_rewrite_speech: true,
+        cosy_speed: q?.cosy_speed ?? 1,
+        debug_timing: maxAudioSpeed > 1.25, max_audio_speed: maxAudioSpeed,
+        auto_group_speech: q?.auto_group_speech ?? false, auto_rewrite_speech: false,
       }, false);
-      setAutoGroupSpeech(true);
-      setAutoRewriteSpeech(true);
-      setMessage("已开启智能合句和超时口播精简。原字幕不变；仅在安全校验通过时自动替换口播，无法压缩的片段仍需人工检查。");
+      setMessage(`已请求继续原任务：保留已生成语音，仅在合成阶段允许最高 ${maxAudioSpeed.toFixed(2)}× 音频变速，不进行智能合句重试或 AI 自动删改。`);
       await reloadJobs();
     } catch (reason) {setError(String(reason));}
     finally {setSubmitting(false);}
@@ -467,11 +472,6 @@ export function TaskDetailDubbing({
             onChange={(event) => setAutoGroupSpeech(event.target.checked)} disabled={trulyBusy || submitting}/>
           实验性合并短字幕（保留原文，默认关闭）
         </label>
-        <label className="mt-3 flex items-center gap-2 text-sm">
-          <input type="checkbox" checked={autoRewriteSpeech}
-            onChange={(event) => setAutoRewriteSpeech(event.target.checked)} disabled={trulyBusy || submitting}/>
-          实验性超时口播自动精简（依赖翻译模型；最多尝试一次，保留原字幕）
-        </label>
       <div className="mt-3 grid gap-3 md:grid-cols-2">
         <label className="text-sm text-slate-700">原声音轨
           <select className="mt-1 block w-full rounded border p-2" value={mixMode}
@@ -507,12 +507,16 @@ export function TaskDetailDubbing({
       {!workerReady ? <p className="mt-2 text-sm text-amber-700">配音 Worker 未运行，已禁止创建无执行节点的任务。</p> : null}
       <div className="mt-3 flex flex-wrap items-center gap-3 text-sm">
         <label className="flex items-center gap-2">
-          <input type="checkbox" checked={debugTiming} onChange={(event) => setDebugTiming(event.target.checked)} disabled={trulyBusy || submitting}/>
-          调试对齐（允许最高 2.0× 音频加速）
+          最大后期音频加速
+          <select className="rounded border p-1" value={maxAudioSpeed}
+            onChange={(event) => setMaxAudioSpeed(Number(event.target.value))} disabled={trulyBusy || submitting}>
+            {[1.25, 1.5, 1.75, 2, 2.25, 2.5].map((value) =>
+              <option key={value} value={value}>{value.toFixed(2)}×</option>)}
+          </select>
         </label>
         <label className="flex items-center gap-2">
           <input type="checkbox" checked={forceRegenerate} onChange={(event) => setForceRegenerate(event.target.checked)} disabled={trulyBusy || submitting}/>
-          强制重新生成语音（不复用旧缓存）
+          强制重新生成语音（默认关闭；重试建议复用旧缓存）
         </label>
       </div>
       <div className="mt-3 flex flex-wrap items-center gap-3">
@@ -528,9 +532,9 @@ export function TaskDetailDubbing({
               preview_only: preview, instruct: modelPath.includes("0.6B") ? "" : instruct,
               temperature, top_p: topP, batch_size: usingCosy ? 1 : batchSize, mix_mode: mixMode,
               reference_profile_id: usingCosy ? profileId : null,
-              cosy_mode: cosyMode, cosy_speed: cosySpeed, debug_timing: debugTiming,
-              auto_group_speech: autoGroupSpeech,
-              auto_rewrite_speech: autoRewriteSpeech,
+              cosy_mode: cosyMode, cosy_speed: cosySpeed,
+              debug_timing: maxAudioSpeed > 1.25, max_audio_speed: maxAudioSpeed,
+              auto_group_speech: autoGroupSpeech, auto_rewrite_speech: false,
             })}>
             {submitting ? "正在提交…" : preview ? "生成一句试听" : "完整配音"}
           </button>
@@ -570,11 +574,11 @@ export function TaskDetailDubbing({
                   已缓存 {Object.keys(job.output.segments ?? {}).length}/{job.output.segments_total ?? "?"} 段
                 </div>
                 {job.output.speech_units?.length ? <p className="mt-1 text-xs text-slate-500">
-                  配音规划 {job.output.speech_units.length} 单元 · 估算时长紧张 {job.output.speech_units.filter((unit) => unit.estimated_overlong).length} 单元（仅供预警，最终按实际音频判断）
+                  配音规划 {job.output.speech_units.length} 单元 · 以实际生成的音频测量时长（估算并不能保证通过）
                 </p> : null}
                 {job.output.timing_issue ? <p className="mt-2 text-amber-700">
                   第 {job.output.timing_issue.segment_index} 段口播太长。{job.status === "needs_review"
-                    ? "已保存生成进度。可点「智能合句重试」尝试短字幕合并和自动精简口播；无法安全精简时仍需人工修改。"
+                    ? `已保存音频。实测需要 ${job.output.timing_issue.required_speed.toFixed(2)}× 才能装入原时间窗；可提高后期音频变速并继续，或在下方编辑口播。`
                     : "已保存试听音频；可以试听或重新生成。"}
                 </p> : null}
                 {job.output.performance ? <p className="mt-1 text-xs text-slate-500">已测推理 {job.output.performance.wall_seconds.toFixed(1)} 秒；生成音频 {job.output.performance.audio_seconds.toFixed(1)} 秒；最近批次 {job.output.performance.last_batch_size} 句</p> : null}
@@ -603,13 +607,17 @@ export function TaskDetailDubbing({
                       onClick={() => void controlJob(job.id, "cancel")}>取消配音</button>
                   ) : null}
                   {job.status === "needs_review" && !submitting ? (
-                    <button type="button" className="rounded border border-amber-400 px-2 py-1 text-xs text-amber-800"
-                      onClick={() => void autoRetryJob(job)}>智能合句重试</button>
+                    <button type="button" className="rounded border border-amber-400 px-2 py-1 text-xs text-amber-800 disabled:opacity-50"
+                      disabled={maxAudioSpeed + 0.000001 < (job.output.timing_issue?.required_speed ?? 0)}
+                      onClick={() => void continueWithAudioSpeed(job)}>继续配音（最高 {maxAudioSpeed.toFixed(2)}× 后期变速，复用缓存）</button>
                   ) : ["failed", "paused"].includes(job.status) && !submitting ? (
                     <button type="button" className="rounded border border-amber-400 px-2 py-1 text-xs text-amber-800"
                       onClick={() => void retryJob(job.id)}>{job.status === "paused" ? "恢复配音" : "断点重试"}</button>
                   ) : null}
                 </div>
+                {job.status === "needs_review" ? <p className="mt-2 text-xs text-amber-700">
+                  高倍率可能让说话急促。片段试听为原始生成 WAV；最终 MP4 在混音时变速，原视频长度不变。
+                </p> : null}
                 <TaskDubbingSegments taskId={taskId} job={job} reload={reloadJobs} />
               </div>
             );

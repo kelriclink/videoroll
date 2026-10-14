@@ -136,8 +136,8 @@ def plan_dubbing_timeline(
     """
     if not isfinite(video_duration) or video_duration <= 0:
         raise DubbingTimingError("video duration must be positive and finite")
-    if not 1.0 <= max_speed <= 2.0:
-        raise DubbingTimingError("max_speed must be between 1.0 and 2.0")
+    if not isfinite(max_speed) or not 1.0 <= max_speed <= 2.5:
+        raise DubbingTimingError("max_speed must be between 1.0 and 2.5")
     if not isfinite(max_extension) or max_extension < 0:
         raise DubbingTimingError("max_extension must be nonnegative")
     if not isfinite(min_gap) or min_gap < 0:
@@ -185,14 +185,19 @@ def plan_dubbing_timeline(
                 f"slot {slot_duration:.3f}s at max_speed {max_speed:.2f}; "
                 "rewrite speech_text or regenerate audio"
             )
-        actual_duration = duration / necessary_speed
+        # Leave a tiny FFmpeg tempo-filter safety margin for very fast clips:
+        # atempo can differ by a few milliseconds from the ideal duration.
+        # The adjustment is bounded by the operator-selected maximum.
+        playback_speed = (min(max_speed, necessary_speed * 1.015)
+                          if necessary_speed > 2.0 else necessary_speed)
+        actual_duration = duration / playback_speed
         placements.append(
             AudioPlacement(
                 index=segment.index,
                 start=segment.start,
                 deadline=deadline,
                 source_duration=duration,
-                playback_speed=necessary_speed,
+                playback_speed=playback_speed,
                 actual_duration=actual_duration,
             )
         )
