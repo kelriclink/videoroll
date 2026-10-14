@@ -239,3 +239,15 @@ GET 查询 `/tasks/{task_id}/dubbing_jobs`。配音成功后返回 `output.audio
 - **质量校验**：子进程音频必须是 24kHz、有限数值、非静音、峰值合理的完整 WAV，音频输出采用临时文件后原子替换。系统不擅自切除超出字幕时间槽的台词，进入 `needs_review`，用户改稿后续跑。
 - **依赖**：官方锁定部分老版 `torch==2.3.1`、`transformers==4.51.3` 和 `openai-whisper==20231117`，新版 Torch 与旧版 Whisper 的 Triton 上限不兼容。应保持隔离，按现场 V100 验证。
 - **后续性能/音质验收**：分别执行 Base/RL 参考声音克隆、音频自然度/术语、首句试听与整段封装；对比 Qwen3-TTS 的 RTF、显存和失败率。不通过则继续保留现有 Qwen 默认引擎，绝不批量启动旧任务。
+
+## 统一配音服务（Qwen3-TTS + CosyVoice3）
+
+VideoRoll 对所有 TTS 模型仅部署**一套统一内网 API 服务** `videoroll@dubbing-service.service`，端口 `127.0.0.1:8040`（不得绑定公网），入口 `videoroll.apps.dubbing.serving:app`。它使用轻量的 Core Python 解释器，不直接导入任何 CUDA 模型。配音的 Hatchet 持久化任务由既有 `videoroll@dubbing-workflow-worker` 运行，但所有语音模型加载与 GPU 推理均统一经认证 HTTP 客户端 `RemoteSpeechSynthesizer` 调用本服务。**外部客户端仍只能访问带鉴权的 VideoRoll Orchestrator，不可以直接访问模型服务。**
+
+- 服务采用单一 V100 推理槽（`SpeechEnginePool` 互斥调度）。按需加载 Qwen3-TTS 0.6/1.7B 或 CosyVoice3 Base/RL，后续同配置任务持续复用 GPU 已加载模型；切换引擎前退出旧 CUDA 子进程释放显存。GPU 服务保持空闲时不预加载全部模型。
+- Qwen 使用隔离 `/opt/videoroll/venvs/dubbing/bin/python` 的 `qwen_bridge.py`；CosyVoice3 使用隔离 `/opt/videoroll/venvs/cosyvoice3/bin/python` 的 `cosyvoice3_bridge.py`。共享的内部协议为 NDJSON、WAV 文件和运行状态，不允许外部网页上传任意路径。
+- 推理接口 `POST /v1/synthesize` 支持 1–4 条 Qwen 语音或单句 CosyVoice3；内部凭证 `X-VideoRoll-Token` 取自仅 `videoroll` 服务账户可读的文件 `/opt/videoroll/config/dubbing-service.token`。`GET /health` 仅返回公开运行概况，`GET /v1/status` 返回已加载模型、是否繁忙、成功生成句数及故障次数。全局设置页面显示这些指标。
+- 配音任务需要**工作流 Worker + 推理服务两者均在线**才能提交；模型未安装、CosyVoice 依赖没装完时不得创建不可执行的任务。模型权重和现有任务缓存不随子进程切换而删除。
+- 请求 WAV 输出路径限制在 `/DATA/videoroll/data/storage/work` 内。参考声音 ID/哈希逐次核验，模型从服务器受控目录加载。协作式暂停/取消在当前句后检查状态，服务故障由 Hatchet 的持久化任务接管重试，不承诺立即终止正在执行的单句 GPU 内核。
+- 由 Root 执行 `scripts/native/provision-dubbing-token.sh` 生成持久凭证，然后使用 systemd `enable --now videoroll@dubbing-service.service`。在启动新的统一服务后重启 `videoroll@dubbing-workflow-worker.service` 使其改用 HTTP API；部署不得停掉当前渲染 Worker。
+- 当模型包安装或 CosyVoice3 V100 真实音质验收尚未完成时，推理服务可以先为 Qwen 提供生产能力；CosyVoice 选项展示但明确标记 `runtime_ready=false` 并禁止提交。

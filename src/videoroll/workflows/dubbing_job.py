@@ -20,8 +20,7 @@ class DubbingJobWorkflowInput(BaseModel):
 
 def _run_dubbing_job(job_id: str) -> dict[str, str]:
     from videoroll.apps.dubbing.job import execute_dubbing_job
-    from videoroll.apps.dubbing.qwen_tts import QwenCustomVoice
-    from videoroll.apps.dubbing.model_management import folder, installed, selection
+    from videoroll.apps.dubbing.service_client import RemoteSpeechSynthesizer
     from videoroll.config import get_subtitle_settings
     from videoroll.db.migrate import initialize_database
     from videoroll.db.session import get_sessionmaker
@@ -29,7 +28,6 @@ def _run_dubbing_job(job_id: str) -> dict[str, str]:
     from videoroll.storage.filesystem import FileStore
 
     settings = get_subtitle_settings()
-    selected = selection()
     initialize_database(settings.database_url)
     factory = get_sessionmaker(settings.database_url)
     with factory() as db:
@@ -38,46 +36,23 @@ def _run_dubbing_job(job_id: str) -> dict[str, str]:
             raise ValueError("dubbing job does not exist")
         quality = dict((current.request_json or {}).get("quality") or {})
 
-    from videoroll.apps.dubbing.model_management import COSY_MODELS
-    opened = []
-    def make_synthesizer(model: str, voice: str):
-        if not installed(model):
-            raise RuntimeError('Selected TTS model has not been downloaded')
-        if model in COSY_MODELS:
-            from videoroll.apps.dubbing.cosyvoice3_adapter import CosyVoice3Synthesizer
-            from videoroll.apps.dubbing.voice_profiles import resolve
-            profile_id = str(quality.get('profile_id') or '')
-            profile, reference = resolve(profile_id)
-            if profile.get('audio_sha256') != quality.get('profile_sha256'):
-                raise RuntimeError('reference audio was changed after job submission')
-            engine = CosyVoice3Synthesizer(
-                model_path=model, model_dir=folder(model), reference=reference,
-                prompt_text=str(profile.get('reference_text') or ''),
-                mode=str(quality.get('cosy_mode') or 'cross_lingual'),
-                instruct=str(quality.get('instruct') or ''),
-                speed=float(quality.get('cosy_speed', 1.0)), fp16=False,
-            )
-            opened.append(engine)
-            return engine
-        return QwenCustomVoice(
-            model_path=str(folder(model)), cache_identity=model,
-            device=selected["device"], voice=voice,
-            instruct=str(quality.get("instruct") or ""),
-            temperature=float(quality.get("temperature") or 0.9),
-            top_p=float(quality.get("top_p") or 0.9),
-        )
+    adapters: list[RemoteSpeechSynthesizer] = []
+    def make_synthesizer(model: str, voice: str) -> RemoteSpeechSynthesizer:
+        engine = RemoteSpeechSynthesizer(model_path=model, voice=voice, quality=quality)
+        adapters.append(engine)
+        return engine
     try:
         return execute_dubbing_job(
             uuid.UUID(job_id),
-            session_factory=get_sessionmaker(settings.database_url),
+            session_factory=factory,
             store=FileStore(settings),
             work_dir=Path(settings.work_dir),
             synthesizer_factory=make_synthesizer,
             ffmpeg=settings.ffmpeg_path,
         )
     finally:
-        for engine in opened:
-            engine.close()
+        for adapter in adapters:
+            adapter.close()
 
 
 def register_dubbing_job_task(hatchet: Any) -> Any:

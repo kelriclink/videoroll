@@ -56,6 +56,11 @@ case "$role" in
     preflight "$SUBTITLE_WORKFLOW_VENV/bin/python" subtitle-workflow-worker
     exec "$SUBTITLE_WORKFLOW_VENV/bin/python" -m videoroll.workflows.subtitle_worker
     ;;
+  dubbing-service)
+    # Shared API / GPU scheduler. Actual TTS GPU runtimes are isolated child
+    # processes; no heavy model or torch imports in this service itself.
+    exec "$CORE_VENV/bin/uvicorn" videoroll.apps.dubbing.serving:app --host 127.0.0.1 --port 8040 --workers 1
+    ;;
   dubbing-workflow-worker)
     export DEPLOYMENT_ROLE=dubbing-workflow-worker
     preflight "$DUBBING_VENV/bin/python" dubbing-workflow-worker

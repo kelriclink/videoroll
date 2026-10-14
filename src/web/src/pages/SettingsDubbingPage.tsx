@@ -22,6 +22,8 @@ export type DubbingInventory = {
   sources: string[];
   tokenizer_installed: boolean;
   voice_profiles?: Array<{ id: string; name: string; duration_seconds: number }>;
+  service?: { connected: boolean; loaded: boolean; busy: boolean; model: string | null;
+    sentences: number; failures: number; last_error?: string; gpu_slots: number };
   engines?: string[];
 };
 
@@ -116,6 +118,18 @@ export default function SettingsDubbingPage() {
         <p className="mt-1 text-sm text-slate-600">
           下载和管理 Qwen3-TTS 或 CosyVoice 3 Base/RL。CosyVoice 需先安装独立 Python 3.10 推理环境，并从视频提取授权参考声音。
         </p>
+      </div>
+      <div className="rounded border bg-white p-4">
+        <h2 className="font-semibold">统一配音服务 · VideoRoll Dubbing Service</h2>
+        <p className="mt-1 text-sm text-slate-600">
+          {inventory?.service?.connected ? "服务已连接 · Qwen3 / CosyVoice 共用一个 GPU 调度器" : "服务未连接 · 无法启动新的配音"}
+        </p>
+        {inventory?.service?.connected ? <div className="mt-2 grid gap-2 text-sm md:grid-cols-3">
+          <span>GPU 推理槽：{inventory.service.gpu_slots} · {inventory.service.busy ? "正在生成" : "空闲"}</span>
+          <span>已加载模型：{inventory.service.model ?? "暂无（按需加载）"}</span>
+          <span>已合成句段：{inventory.service.sentences} · 错误：{inventory.service.failures}</span>
+          {inventory.service.last_error ? <span className="text-amber-700 md:col-span-3">最近错误：{inventory.service.last_error}</span> : null}
+        </div> : null}
       </div>
       <div className="rounded border bg-white p-4">
         <h2 className="font-semibold">模型下载安装</h2>
