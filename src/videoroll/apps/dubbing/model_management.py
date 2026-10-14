@@ -1,4 +1,4 @@
-"""Allowlisted on-disk Qwen3-TTS model management."""
+"""Allowlisted on-disk Qwen3-TTS and CosyVoice3 Base/RL model management."""
 from __future__ import annotations
 import fcntl
 import json
@@ -8,7 +8,11 @@ import sys
 from contextlib import contextmanager
 from pathlib import Path
 
-MODELS = ("Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice", "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice")
+QWEN_MODELS = ("Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice", "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice")
+COSY_MODELS = ("cosyvoice3:base", "cosyvoice3:rl")
+COSY_REPO = "FunAudioLLM/Fun-CosyVoice3-0.5B-2512"
+COSY_FOLDER = "Fun-CosyVoice3-0.5B-2512"
+MODELS = QWEN_MODELS + COSY_MODELS
 TOKENIZER = "Qwen/Qwen3-TTS-Tokenizer-12Hz"
 VOICES = ("Vivian", "Serena", "Uncle_Fu", "Dylan", "Eric")
 DEVICES = ("cuda:0", "cuda:1", "cpu")
@@ -25,7 +29,7 @@ def root() -> Path:
 def folder(model: str, base: Path | None = None) -> Path:
     if model not in MODELS:
         raise ValueError("unsupported TTS model")
-    return (base or root()) / model.split("/")[-1]
+    return (base or root()) / (COSY_FOLDER if model in COSY_MODELS else model.split("/")[-1])
 
 
 def atomic_json(path: Path, obj: dict) -> None:
@@ -59,6 +63,13 @@ def lock(base: Path):
 
 def installed(model: str, base: Path | None = None) -> bool:
     d = folder(model, base)
+    if model in COSY_MODELS:
+        required = ("cosyvoice3.yaml", "flow.pt", "hift.pt", "campplus.onnx",
+                    "speech_tokenizer_v3.onnx", "CosyVoice-BlankEN/model.safetensors",
+                    "llm.rl.pt" if model.endswith(":rl") else "llm.pt")
+        return (d / ".videoroll-complete.json").is_file() and all(
+            (d / name).is_file() and (d / name).stat().st_size > 1024 for name in required
+        )
     tokenizer = (base or root()) / TOKENIZER.split("/")[-1]
     return ((tokenizer / ".videoroll-complete.json").is_file()
             and (d / ".videoroll-complete.json").is_file() and (d / "config.json").is_file()
@@ -69,15 +80,20 @@ def selection(base: Path | None = None) -> dict:
     value = read_json((base or root()) / "selected.json")
     return {
         "model": value.get("model") if value.get("model") in MODELS else MODELS[0],
-        "voice": value.get("voice") if value.get("voice") in VOICES else "Vivian",
+        "voice": ("reference" if value.get("model") in COSY_MODELS
+                  else (value.get("voice") if value.get("voice") in VOICES else "Vivian")),
         "device": value.get("device") if value.get("device") in DEVICES else "cuda:0",
     }
 
 
 def choose(model: str, voice: str, device: str, base: Path | None = None) -> dict:
     base = base or root()
-    if model not in MODELS or voice not in VOICES or device not in DEVICES:
-        raise ValueError("invalid model, speaker or device")
+    if model not in MODELS or device not in DEVICES:
+        raise ValueError("invalid model or device")
+    if (model in COSY_MODELS and voice != "reference") or (model in QWEN_MODELS and voice not in VOICES):
+        raise ValueError("invalid voice for the selected engine")
+    if model in COSY_MODELS and device != "cuda:0":
+        raise ValueError("CosyVoice3 V100 runtime currently supports cuda:0 only")
     if not installed(model, base):
         raise ValueError("download the model before choosing it")
     with lock(base):
@@ -116,7 +132,13 @@ def status(model: str, base: Path | None = None) -> dict:
                     size += x.stat().st_size
             except OSError:
                 pass
-    return {"model": model, "installed": done, "status": state, "bytes": size,
+    if model in COSY_MODELS:
+        from videoroll.apps.dubbing.cosyvoice3_adapter import runtime_ready
+        ready = runtime_ready()
+    else:
+        ready = True
+    return {"model": model, "installed": done, "runtime_ready": ready,
+            "status": state, "bytes": size,
             "message": str(data.get("message") or ""), "source": str(data.get("source") or "huggingface")}
 
 
@@ -124,7 +146,7 @@ def inventory(base: Path | None = None) -> dict:
     base = base or root()
     return {"models": [status(m, base) for m in MODELS], "selection": selection(base),
             "model_root": str(base), "voices": list(VOICES), "devices": list(DEVICES),
-            "sources": list(SOURCES),
+            "sources": list(SOURCES), "engines": ["qwen3", "cosyvoice3"],
             "tokenizer_installed": (base / TOKENIZER.split("/")[-1] / ".videoroll-complete.json").is_file()}
 
 

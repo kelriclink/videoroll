@@ -225,3 +225,17 @@ GET 查询 `/tasks/{task_id}/dubbing_jobs`。配音成功后返回 `output.audio
 - 新状态使用现有的 DubbingJob.status 字符串字段、request_json 和 output_json，不引入数据库迁移。
 - 生产环境先只部署后端与前端，并**保持当前配音 Worker 禁用**，不会自动恢复之前被取消的 334 句任务。
 - 仍需要短片真实试听验证中文配音自然度、Demucs 分离音质，以及 batch_size 2/4 在 V100 上的实际性能；不应把这些尚未测试的能力标为已完成的音质性能验收。
+
+## CosyVoice 3（实验性引擎，2026-10-14）
+
+本功能在独立分支验证，通过真实 V100 Base/RL 短句生成之后才能作为生产可选项发布。不能依据单元测试通过即承诺模型可用。
+
+- **模型 ID**：`cosyvoice3:base` / `cosyvoice3:rl`；二者映射到同一官方权重目录 `Fun-CosyVoice3-0.5B-2512`，其中 `llm.pt` 和 `llm.rl.pt` 并存。RL 通过私有只读链接视图替换被加载的 `llm.pt`，不移动或复制共享基础权重。
+- **官方源码**：`https://github.com/QwenAudio/CosyVoice`；固定外部部署目录 `/opt/videoroll/external/CosyVoice`；需要初始化 Matcha-TTS 子模块。
+- **运行时**：隔离 Python 3.10 虚拟环境 `/opt/videoroll/venvs/cosyvoice3`，不覆盖 Qwen 3.12 环境。模型仅由可信 Hatchet Worker 通过本机 stdin/stdout JSON 协议调用；不会向公网开放 CosyVoice 官方演示服务。
+- **参考声音**：从该任务已有原视频/P1 指定时间区间提取单声道 16kHz PCM WAV，支持 3–30s，生成音频哈希及关联任务的私人声音库；创建时必须明确确认授权。浏览器允许试听；正在运行/待审核任务引用的参考音频不能删除。上传前应审阅声音克隆授权与源视频内容。
+- **引擎能力**：`cross_lingual`（推荐英文声音说中文）、`zero_shot`（需要与参考声音相对应的转录文本）、`instruct`（需要指令）；非流式 `speed=0.8–1.25`，默认 1.0。优先 PyTorch FP32 和 `load_trt=False, load_vllm=False`。
+- **工作流**：复用现有字幕、首句试听、暂停/取消、续跑、语速校验、音频归一化和 MP4 混音逻辑。各片段缓存依据引擎、Base/RL、参考音频 sha256、语速、模式及文本构建独立键，避免误复用 Qwen 语音。官方 CosyVoice 3 不是已经完成多句并行推理的证明，现阶段固定 `batch_size=1`。
+- **质量校验**：子进程音频必须是 24kHz、有限数值、非静音、峰值合理的完整 WAV，音频输出采用临时文件后原子替换。系统不擅自切除超出字幕时间槽的台词，进入 `needs_review`，用户改稿后续跑。
+- **依赖**：官方锁定部分老版 `torch==2.3.1`、`transformers==4.51.3` 和 `openai-whisper==20231117`，新版 Torch 与旧版 Whisper 的 Triton 上限不兼容。应保持隔离，按现场 V100 验证。
+- **后续性能/音质验收**：分别执行 Base/RL 参考声音克隆、音频自然度/术语、首句试听与整段封装；对比 Qwen3-TTS 的 RTF、显存和失败率。不通过则继续保留现有 Qwen 默认引擎，绝不批量启动旧任务。

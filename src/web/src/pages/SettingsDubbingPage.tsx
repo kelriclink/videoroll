@@ -6,6 +6,7 @@ import { orchestratorUrl } from "../lib/urls";
 export type ModelState = {
   model: string;
   installed: boolean;
+  runtime_ready?: boolean;
   status: string;
   bytes: number;
   source: string;
@@ -20,6 +21,8 @@ export type DubbingInventory = {
   devices: string[];
   sources: string[];
   tokenizer_installed: boolean;
+  voice_profiles?: Array<{ id: string; name: string; duration_seconds: number }>;
+  engines?: string[];
 };
 
 const api = orchestratorUrl("/settings/dubbing");
@@ -111,7 +114,7 @@ export default function SettingsDubbingPage() {
       <div>
         <h1 className="text-xl font-semibold">中文配音 · 模型管理</h1>
         <p className="mt-1 text-sm text-slate-600">
-          下载官方 Qwen3-TTS 固定音色模型，选择默认推理模型、音色及设备。下载不会立即启动 GPU 推理。
+          下载和管理 Qwen3-TTS 或 CosyVoice 3 Base/RL。CosyVoice 需先安装独立 Python 3.10 推理环境，并从视频提取授权参考声音。
         </p>
       </div>
       <div className="rounded border bg-white p-4">
@@ -127,7 +130,7 @@ export default function SettingsDubbingPage() {
           <button type="button" onClick={() => void refresh()} className="rounded border px-3 py-2 text-sm">刷新状态</button>
         </div>
         <p className="mt-2 text-xs text-slate-500">
-          目录：{inventory?.model_root ?? "读取中…"}。首次下载会同时下载 Qwen3-TTS Tokenizer。
+          目录：{inventory?.model_root ?? "读取中…"}。Qwen 首次下载包含 Tokenizer；CosyVoice 3 的 Base/RL 共用一份官方模型目录。
           已完成的文件将在中断后复用。
         </p>
         <div className="mt-4 space-y-3">
@@ -137,13 +140,13 @@ export default function SettingsDubbingPage() {
               <div key={item.model} className="rounded border p-3">
                 <div className="flex flex-wrap items-center justify-between gap-2">
                   <div>
-                    <div className="font-medium">{item.model.includes("0.6B") ? "Qwen3-TTS CustomVoice 0.6B" : "Qwen3-TTS CustomVoice 1.7B"}</div>
+                    <div className="font-medium">{item.model === "cosyvoice3:base" ? "CosyVoice 3 0.5B · Base · 声音克隆" : item.model === "cosyvoice3:rl" ? "CosyVoice 3 0.5B · RL · 发音准确性优先" : item.model.includes("0.6B") ? "Qwen3-TTS CustomVoice 0.6B" : "Qwen3-TTS CustomVoice 1.7B"}</div>
                     <div className="text-xs text-slate-500">{item.model}</div>
                   </div>
                   <span className="text-sm">{labels[item.status] ?? item.status}</span>
                 </div>
                 <div className="mt-2 text-xs text-slate-600">
-                  已存储 {sizeLabel(item.bytes)} · {item.message || "尚无下载记录"}
+                  已存储 {sizeLabel(item.bytes)} · {item.message || "尚无下载记录"}{item.runtime_ready === false ? " · 推理环境尚未就绪" : ""}
                 </div>
                 <button type="button" disabled={item.installed || downloading || busy !== null}
                   onClick={() => void install(item.model)}
@@ -160,17 +163,21 @@ export default function SettingsDubbingPage() {
         <h2 className="font-semibold">默认推理配置</h2>
         <div className="mt-3 grid gap-3 md:grid-cols-3">
           <label className="text-sm">模型
-            <select className="mt-1 block w-full rounded border p-2" value={model} onChange={(e) => setModel(e.target.value)}>
+            <select className="mt-1 block w-full rounded border p-2" value={model} onChange={(e) => {
+              setModel(e.target.value);
+              setVoice(e.target.value.startsWith("cosyvoice3:") ? "reference" : "Vivian");
+              if (e.target.value.startsWith("cosyvoice3:")) setDevice("cuda:0");
+            }}>
               {(inventory?.models ?? []).map((item) => (
                 <option key={item.model} value={item.model}>
-                  {item.model.includes("0.6B") ? "0.6B" : "1.7B"} {item.installed ? "（已安装）" : "（未下载）"}
+                  {item.model === "cosyvoice3:base" ? "CosyVoice 3 Base" : item.model === "cosyvoice3:rl" ? "CosyVoice 3 RL" : item.model.includes("0.6B") ? "Qwen 0.6B" : "Qwen 1.7B"} {item.installed ? "（已安装）" : "（未下载）"}
                 </option>
               ))}
             </select>
           </label>
           <label className="text-sm">中文音色
             <select className="mt-1 block w-full rounded border p-2" value={voice} onChange={(e) => setVoice(e.target.value)}>
-              {(inventory?.voices ?? []).map((v) => <option key={v}>{v}</option>)}
+              {model.startsWith("cosyvoice3:") ? <option value="reference">从任务视频提取参考音色（在任务详情中选择）</option> : (inventory?.voices ?? []).map((v) => <option key={v}>{v}</option>)}
             </select>
           </label>
           <label className="text-sm">推理设备
@@ -180,11 +187,11 @@ export default function SettingsDubbingPage() {
           </label>
         </div>
         <p className="mt-2 text-xs text-slate-500">
-          V100 建议 FP16 + SDPA，从 0.6B 开始测试。选择 CUDA 设备前请确认实际编号。
-          保存设置不会安装 PyTorch、Qwen TTS 依赖，也不会自动开启 Worker。
+          Qwen V100 使用 FP16 + SDPA；CosyVoice 3 首次测试优先 PyTorch FP32，确认稳定后再测试 FP16。
+          保存配置不会安装推理依赖、下载参考声音或自动执行任何配音任务。
         </p>
         <div className="mt-3 flex items-center gap-3">
-          <button type="button" disabled={!selectedInstalled || busy !== null}
+          <button type="button" disabled={!selectedInstalled || busy !== null || (model.startsWith("cosyvoice3:") && !inventory?.models.find((v) => v.model === model)?.runtime_ready)}
             onClick={() => void save()}
             className="rounded bg-slate-900 px-4 py-2 text-sm text-white disabled:opacity-50">
             保存默认推理配置

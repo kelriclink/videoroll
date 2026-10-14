@@ -64,6 +64,9 @@ def create_dubbing_job(
     top_p: float = 0.9,
     batch_size: int = 1,
     mix_mode: str = "replace",
+    reference_profile_id: uuid.UUID | None = None,
+    cosy_mode: str = "cross_lingual",
+    cosy_speed: float = 1.0,
 ) -> DubbingJob:
     """Create a manual dubbing job from translated subtitles and raw or P1 video."""
     existing = db.query(DubbingJob).filter(
@@ -91,9 +94,29 @@ def create_dubbing_job(
     ).first()
     if competing is not None:
         raise ValueError(f"another dubbing job is active: {competing.id}")
+    from videoroll.apps.dubbing.model_management import COSY_MODELS, QWEN_MODELS
+    profile_id, profile_sha = '', ''
+    if model_path in COSY_MODELS:
+        from videoroll.apps.dubbing.voice_profiles import resolve
+        if voice != 'reference' or reference_profile_id is None:
+            raise ValueError('select an authorized reference voice for CosyVoice3')
+        profile, _ = resolve(str(reference_profile_id))
+        if cosy_mode == 'zero_shot' and not profile.get('reference_text'):
+            raise ValueError('zero-shot mode requires the reference transcript')
+        if cosy_mode == 'instruct' and not instruct.strip():
+            raise ValueError('instruct mode requires an instruction')
+        profile_id = str(reference_profile_id)
+        profile_sha = str(profile['audio_sha256'])
+    elif model_path in QWEN_MODELS:
+        if voice not in ('Vivian', 'Serena', 'Uncle_Fu', 'Dylan', 'Eric'):
+            raise ValueError('invalid Qwen3-TTS preset speaker')
+    else:
+        raise ValueError('unsupported TTS model')
     quality = normalize_quality(instruct=instruct, temperature=temperature,
                                 top_p=top_p, batch_size=batch_size,
-                                mix_mode=mix_mode, model=model_path)
+                                mix_mode=mix_mode, model=model_path,
+                                cosy_speed=cosy_speed, cosy_mode=cosy_mode,
+                                profile_id=profile_id, profile_sha256=profile_sha)
     # Cache separates different installed model revisions even if the user
     # keeps the same user-facing model name.
     import hashlib
@@ -123,6 +146,7 @@ def create_dubbing_job(
             "voice": voice, "model_path": model_path,
             "retain_original_audio": bool(retain_original_audio),
             "preview_only": bool(preview_only),
+            "reference_profile_id": profile_id or None,
             "cache_schema": 2,
             "quality": quality,
         },

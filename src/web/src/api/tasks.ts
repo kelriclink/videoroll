@@ -84,6 +84,9 @@ export const tasksApi = {
     top_p?: number;
     batch_size?: 1 | 2 | 4;
     mix_mode?: "replace" | "original_low" | "background_only";
+    reference_profile_id?: string | null;
+    cosy_mode?: "cross_lingual" | "zero_shot" | "instruct";
+    cosy_speed?: number;
   }) {
     return fetchJson<{ job_id: string; status: string }>(
       orchestratorUrl(`/tasks/${taskId}/actions/dubbing`),

@@ -182,13 +182,17 @@ def enqueue_dubbing_job(
     db: Session = Depends(get_db),
 ) -> RemoteJobResponse:
     from videoroll.apps.dubbing.job import create_dubbing_job
-    from videoroll.apps.dubbing.model_management import installed
+    from videoroll.apps.dubbing.model_management import installed, COSY_MODELS
     from videoroll.apps.dubbing.worker_status import worker_status
     from videoroll.workflows.launcher import PipelineLauncher
     if not worker_status()["available"]:
         raise HTTPException(503, "dubbing worker is not running; enable it before submitting")
     if not installed(payload.model_path):
-        raise HTTPException(409, "Qwen3-TTS model is not installed")
+        raise HTTPException(409, "Selected TTS model is not installed")
+    if payload.model_path in COSY_MODELS:
+        from videoroll.apps.dubbing.cosyvoice3_adapter import runtime_ready
+        if not runtime_ready():
+            raise HTTPException(503, "CosyVoice3 inference runtime is not installed")
     if payload.mix_mode == "background_only":
         from videoroll.apps.dubbing.separation import available
         if not available():
@@ -207,6 +211,9 @@ def enqueue_dubbing_job(
             top_p=payload.top_p,
             batch_size=payload.batch_size,
             mix_mode=payload.mix_mode,
+            reference_profile_id=payload.reference_profile_id,
+            cosy_mode=payload.cosy_mode,
+            cosy_speed=payload.cosy_speed,
         )
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc

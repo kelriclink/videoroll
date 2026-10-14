@@ -5,7 +5,8 @@ import argparse
 import os
 import time
 from pathlib import Path
-from videoroll.apps.dubbing.model_management import MODELS, SOURCES, TOKENIZER, atomic_json, state_file
+from videoroll.apps.dubbing.model_management import (MODELS, COSY_MODELS, COSY_REPO,
+    COSY_FOLDER, SOURCES, TOKENIZER, atomic_json, state_file)
 
 
 def snapshot(repo: str, destination: Path, source: str) -> None:
@@ -25,22 +26,34 @@ def perform(model: str, source: str, root: Path) -> None:
     state = state_file(model, root)
     pid = os.getpid()
     try:
-        for repo in (TOKENIZER, model):
+        for repo in ((COSY_REPO,) if model in COSY_MODELS else (TOKENIZER, model)):
             directory = root / repo.split("/")[-1]
             marker = directory / ".videoroll-complete.json"
-            valid = ((directory / "config.json").is_file()
-                     and any(x.is_file() and x.stat().st_size > 1024
-                             for x in directory.rglob("*.safetensors")))
+            if model in COSY_MODELS:
+                required = ("cosyvoice3.yaml", "llm.pt", "llm.rl.pt", "flow.pt", "hift.pt",
+                            "campplus.onnx", "speech_tokenizer_v3.onnx",
+                            "CosyVoice-BlankEN/model.safetensors")
+                valid = all((directory / f).is_file() and (directory / f).stat().st_size > 1024
+                            for f in required)
+            else:
+                valid = ((directory / "config.json").is_file()
+                         and any(x.is_file() and x.stat().st_size > 1024
+                                 for x in directory.rglob("*.safetensors")))
             if marker.is_file() and valid:
                 continue
             marker.unlink(missing_ok=True)
             atomic_json(state, {"pid": pid, "status": "downloading", "source": source,
                                 "message": f"Downloading {repo.split('/')[-1]}"})
             snapshot(repo, directory, source)
-            if not (directory / "config.json").is_file():
-                raise RuntimeError(f"{repo} download incomplete: no config.json")
-            if not any(x.is_file() and x.stat().st_size > 1024 for x in directory.rglob("*.safetensors")):
-                raise RuntimeError(f"{repo} download incomplete: no safetensors")
+            if model in COSY_MODELS:
+                if not all((directory / f).is_file() and (directory / f).stat().st_size > 1024
+                           for f in required):
+                    raise RuntimeError(f"{repo} download incomplete: CosyVoice3 components missing")
+            else:
+                if not (directory / "config.json").is_file():
+                    raise RuntimeError(f"{repo} download incomplete: no config.json")
+                if not any(x.is_file() and x.stat().st_size > 1024 for x in directory.rglob("*.safetensors")):
+                    raise RuntimeError(f"{repo} download incomplete: no safetensors")
             atomic_json(marker, {"repo": repo, "source": source, "completed_at": time.time()})
         atomic_json(state, {"pid": pid, "status": "installed", "source": source,
                             "message": "Model and tokenizer installed"})

@@ -38,9 +38,27 @@ def _run_dubbing_job(job_id: str) -> dict[str, str]:
             raise ValueError("dubbing job does not exist")
         quality = dict((current.request_json or {}).get("quality") or {})
 
-    def make_synthesizer(model: str, voice: str) -> QwenCustomVoice:
+    from videoroll.apps.dubbing.model_management import COSY_MODELS
+    opened = []
+    def make_synthesizer(model: str, voice: str):
         if not installed(model):
-            raise RuntimeError("Selected Qwen3-TTS model has not been downloaded")
+            raise RuntimeError('Selected TTS model has not been downloaded')
+        if model in COSY_MODELS:
+            from videoroll.apps.dubbing.cosyvoice3_adapter import CosyVoice3Synthesizer
+            from videoroll.apps.dubbing.voice_profiles import resolve
+            profile_id = str(quality.get('profile_id') or '')
+            profile, reference = resolve(profile_id)
+            if profile.get('audio_sha256') != quality.get('profile_sha256'):
+                raise RuntimeError('reference audio was changed after job submission')
+            engine = CosyVoice3Synthesizer(
+                model_path=model, model_dir=folder(model), reference=reference,
+                prompt_text=str(profile.get('reference_text') or ''),
+                mode=str(quality.get('cosy_mode') or 'cross_lingual'),
+                instruct=str(quality.get('instruct') or ''),
+                speed=float(quality.get('cosy_speed', 1.0)), fp16=False,
+            )
+            opened.append(engine)
+            return engine
         return QwenCustomVoice(
             model_path=str(folder(model)), cache_identity=model,
             device=selected["device"], voice=voice,
@@ -48,14 +66,18 @@ def _run_dubbing_job(job_id: str) -> dict[str, str]:
             temperature=float(quality.get("temperature") or 0.9),
             top_p=float(quality.get("top_p") or 0.9),
         )
-    return execute_dubbing_job(
-        uuid.UUID(job_id),
-        session_factory=get_sessionmaker(settings.database_url),
-        store=FileStore(settings),
-        work_dir=Path(settings.work_dir),
-        synthesizer_factory=make_synthesizer,
-        ffmpeg=settings.ffmpeg_path,
-    )
+    try:
+        return execute_dubbing_job(
+            uuid.UUID(job_id),
+            session_factory=get_sessionmaker(settings.database_url),
+            store=FileStore(settings),
+            work_dir=Path(settings.work_dir),
+            synthesizer_factory=make_synthesizer,
+            ffmpeg=settings.ffmpeg_path,
+        )
+    finally:
+        for engine in opened:
+            engine.close()
 
 
 def register_dubbing_job_task(hatchet: Any) -> Any:

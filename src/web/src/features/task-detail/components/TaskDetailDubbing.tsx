@@ -17,6 +17,8 @@ const VOICES = [
 const MODELS = [
   { id: "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice", label: "Qwen3-TTS 0.6B（推荐试用）" },
   { id: "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice", label: "Qwen3-TTS 1.7B（显存占用更高）" },
+  { id: "cosyvoice3:base", label: "CosyVoice 3 Base · 英文转中文声音克隆" },
+  { id: "cosyvoice3:rl", label: "CosyVoice 3 RL · 科技术语优先测试" },
 ] as const;
 
 const RUNNING = new Set(["queued", "preparing", "synthesizing", "aligning", "mixing", "pause_requested", "cancel_requested"]);
@@ -62,6 +64,16 @@ export function TaskDetailDubbing({
   const [temperature, setTemperature] = useState(0.9);
   const [topP, setTopP] = useState(0.9);
   const [batchSize, setBatchSize] = useState<1 | 2 | 4>(1);
+  const [voiceProfiles, setVoiceProfiles] = useState<Array<{ id: string; name: string; duration_seconds: number; reference_text: string }>>([]);
+  const [profileId, setProfileId] = useState("");
+  const [profileName, setProfileName] = useState("视频原作者");
+  const [referenceStart, setReferenceStart] = useState(0);
+  const [referenceDuration, setReferenceDuration] = useState(10);
+  const [referenceTranscript, setReferenceTranscript] = useState("");
+  const [referenceConsent, setReferenceConsent] = useState(false);
+  const [cosyMode, setCosyMode] = useState<"cross_lingual" | "zero_shot" | "instruct">("cross_lingual");
+  const [cosySpeed, setCosySpeed] = useState(1.0);
+  const usingCosy = modelPath.startsWith("cosyvoice3:");
   const [videoKey, setVideoKey] = useState("");
   const [subtitleJobId, setSubtitleJobId] = useState("");
   const [loading, setLoading] = useState(true);
@@ -105,14 +117,16 @@ export function TaskDetailDubbing({
   useEffect(() => {
     let active = true;
     void fetchJson<{
-      models: Array<{ model: string; installed: boolean }>;
+      models: Array<{ model: string; installed: boolean; runtime_ready?: boolean }> ;
+      voice_profiles?: Array<{ id: string; name: string; duration_seconds: number; reference_text: string }>;
       selection: { model: string; voice: string };
       worker: { available: boolean; state: string };
       separation: { available: boolean };
     }>(orchestratorUrl("/settings/dubbing"))
       .then((state) => {
         if (!active) return;
-        setInstalledModels(state.models.filter((entry) => entry.installed).map((entry) => entry.model));
+        setInstalledModels(state.models.filter((entry) => entry.installed && entry.runtime_ready !== false).map((entry) => entry.model));
+        setVoiceProfiles(state.voice_profiles ?? []);
         setModelPath(state.selection.model);
         setVoice(state.selection.voice);
         setWorkerReady(state.worker?.available ?? false);
@@ -125,6 +139,7 @@ export function TaskDetailDubbing({
   const running = jobs.some((job) => RUNNING.has(job.status));
   const blockedByExisting = jobs.some((job) => BLOCKING.has(job.status));
   const canGenerate = Boolean(workerReady && installedModels.includes(modelPath) && selectedVideo && selectedSubtitle && task?.status !== "CANCELED"
+    && (!usingCosy || (profileId !== "" && (cosyMode !== "zero_shot" || Boolean(voiceProfiles.find((x) => x.id === profileId)?.reference_text)) && (cosyMode !== "instruct" || Boolean(instruct.trim()))))
     && !blockedByExisting && !submitting && (mixMode !== "background_only" || separationReady));
 
   async function submitJob(request: {
@@ -140,6 +155,9 @@ export function TaskDetailDubbing({
     top_p: number;
     batch_size: 1 | 2 | 4;
     mix_mode: "replace" | "original_low" | "background_only";
+    reference_profile_id?: string | null;
+    cosy_mode?: "cross_lingual" | "zero_shot" | "instruct";
+    cosy_speed?: number;
   }) {
     if (submitting) return;
     setSubmitting(true);
@@ -201,6 +219,23 @@ export function TaskDetailDubbing({
     }
   }
 
+  async function createReference() {
+    if (!referenceConsent || !selectedVideo || submitting) return;
+    setSubmitting(true); setError(null);
+    try {
+      const profile = await fetchJson<{ id: string; name: string; duration_seconds: number; reference_text: string }>(
+        orchestratorUrl("/settings/dubbing/voices"), {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ task_id: taskId, asset_key: selectedVideo, name: profileName,
+            start_seconds: referenceStart, duration_seconds: referenceDuration,
+            reference_text: referenceTranscript, authorization_confirmed: true }),
+        });
+      setVoiceProfiles((items) => [...items, profile]);setProfileId(profile.id);
+      setMessage("参考音频已提取为 16 kHz WAV。请先试听确认声音清晰，再创建配音任务。");
+    } catch (reason) {setError(String(reason));}
+    finally {setSubmitting(false);}
+  }
+
   const audioAssets = (assets ?? []).filter((item) => item.kind === "dubbing_audio");
   const videoAssets = (assets ?? []).filter((item) => item.kind === "video_dubbed");
 
@@ -239,17 +274,51 @@ export function TaskDetailDubbing({
           中文音色
           <select className="mt-1 w-full rounded border p-2" value={voice}
             onChange={(e) => setVoice(e.target.value)} disabled={running || submitting}>
-            {VOICES.map((item) => <option value={item.id} key={item.id}>{item.label}</option>)}
+            {usingCosy ? <option value="reference">参考音频声音克隆</option> : VOICES.map((item) => <option value={item.id} key={item.id}>{item.label}</option>)}
           </select>
         </label>
         <label className="text-sm text-slate-700">
           TTS 模型
           <select className="mt-1 w-full rounded border p-2" value={modelPath}
-            onChange={(e) => setModelPath(e.target.value)} disabled={running || submitting}>
+            onChange={(e) => {setModelPath(e.target.value);if (e.target.value.startsWith("cosyvoice3:")) setBatchSize(1);}} disabled={running || submitting}>
             {MODELS.map((item) => <option value={item.id} key={item.id} disabled={!installedModels.includes(item.id)}>{item.label}{installedModels.includes(item.id) ? "" : " · 未下载"}</option>)}
           </select>
         </label>
       </div>
+      {usingCosy ? <div className="mt-3 rounded border border-sky-200 bg-sky-50 p-3 space-y-3 text-sm">
+        <div className="font-semibold">CosyVoice 3 · 原作者声音克隆（需要拥有授权）</div>
+        <div className="grid gap-3 md:grid-cols-2">
+          <label>保存的参考声音
+            <select className="mt-1 block w-full rounded border p-2" value={profileId} onChange={(e) => setProfileId(e.target.value)}>
+              <option value="">请选择已授权的声音</option>
+              {voiceProfiles.map((p) => <option key={p.id} value={p.id}>{p.name} · {p.duration_seconds.toFixed(1)} 秒</option>)}
+            </select>
+          </label>
+          <label>克隆方式
+            <select className="mt-1 block w-full rounded border p-2" value={cosyMode} onChange={(e) => setCosyMode(e.target.value as typeof cosyMode)}>
+              <option value="cross_lingual">跨语言 · 英语声音说中文（推荐）</option>
+              <option value="zero_shot">零样本 · 需要准确的参考转录文本</option>
+              <option value="instruct">指令控制 · 需要语气指令</option>
+            </select>
+          </label>
+          <label>语速（0.8–1.25，仅非流式）
+            <input type="number" className="mt-1 block w-full rounded border p-2" min={0.8} max={1.25} step={0.05} value={cosySpeed}
+              onChange={(e) => setCosySpeed(Number(e.target.value))}/>
+          </label>
+          {profileId ? <div className="flex items-end"><audio controls preload="none" src={orchestratorUrl(`/settings/dubbing/voices/${profileId}/audio`)} /></div> : null}
+        </div>
+        <details><summary className="cursor-pointer font-medium">从当前视频提取新的参考声音</summary>
+          <div className="mt-3 grid gap-2 md:grid-cols-2">
+            <label>声音名称<input className="mt-1 block w-full rounded border p-2" value={profileName} onChange={(e) => setProfileName(e.target.value)} /></label>
+            <label>开始秒数<input type="number" min={0} step={0.5} className="mt-1 block w-full rounded border p-2" value={referenceStart} onChange={(e) => setReferenceStart(Number(e.target.value))}/></label>
+            <label>参考秒数（3–30 秒）<input type="number" min={3} max={30} step={1} className="mt-1 block w-full rounded border p-2" value={referenceDuration} onChange={(e) => setReferenceDuration(Number(e.target.value))}/></label>
+            <label>原声对应转录文字（零样本必填）<input className="mt-1 block w-full rounded border p-2" value={referenceTranscript} onChange={(e) => setReferenceTranscript(e.target.value)} /></label>
+          </div>
+          <label className="mt-3 flex items-start gap-2"><input type="checkbox" checked={referenceConsent} onChange={(e) => setReferenceConsent(e.target.checked)}/>我已确认拥有克隆该声音的授权</label>
+          <button type="button" disabled={!referenceConsent || submitting || !selectedVideo} onClick={() => void createReference()}
+            className="mt-2 rounded bg-sky-800 px-3 py-2 text-white disabled:opacity-50">提取并保存参考音频</button>
+        </details>
+      </div> : null}
       <div className="mt-3 grid gap-3 md:grid-cols-2">
         <label className="text-sm text-slate-700">原声音轨
           <select className="mt-1 block w-full rounded border p-2" value={mixMode}
@@ -261,16 +330,16 @@ export function TaskDetailDubbing({
         </label>
         <label className="text-sm text-slate-700">每批生成句数（V100 建议 1）
           <select className="mt-1 block w-full rounded border p-2" value={batchSize}
-            onChange={(e) => setBatchSize(Number(e.target.value) as 1 | 2 | 4)} disabled={blockedByExisting || submitting}>
+            onChange={(e) => setBatchSize(Number(e.target.value) as 1 | 2 | 4)} disabled={blockedByExisting || submitting || usingCosy}>
             <option value={1}>1 · 单句稳妥</option><option value={2}>2 · 批量实验</option><option value={4}>4 · 批量实验</option>
           </select>
         </label>
-        <label className="text-sm text-slate-700">语气指令（仅 1.7B 支持）
+        <label className="text-sm text-slate-700">语气指令（Qwen 1.7B / CosyVoice 指令模式）
           <input className="mt-1 block w-full rounded border p-2" value={instruct} maxLength={120}
-            disabled={modelPath.includes("0.6B") || blockedByExisting || submitting}
+            disabled={modelPath.includes("0.6B") && !usingCosy || blockedByExisting || submitting}
             onChange={(e) => setInstruct(e.target.value)} placeholder="例如：自然清晰，语速稍快，像科普讲解" />
         </label>
-        <div className="grid grid-cols-2 gap-2">
+        {!usingCosy ? <div className="grid grid-cols-2 gap-2">
           <label className="text-sm text-slate-700">temperature
             <input type="number" min={0.3} max={1.5} step={0.1} className="mt-1 block w-full rounded border p-2"
               value={temperature} onChange={(e) => setTemperature(Number(e.target.value))} />
@@ -279,7 +348,7 @@ export function TaskDetailDubbing({
             <input type="number" min={0.6} max={1} step={0.05} className="mt-1 block w-full rounded border p-2"
               value={topP} onChange={(e) => setTopP(Number(e.target.value))} />
           </label>
-        </div>
+        </div> : null}
       </div>
       {!workerReady ? <p className="mt-2 text-sm text-amber-700">配音 Worker 未运行，已禁止创建无执行节点的任务。</p> : null}
       <div className="mt-3 flex flex-wrap items-center gap-3">
@@ -289,9 +358,11 @@ export function TaskDetailDubbing({
             subtitle_job_id: selectedSubtitle,
             subtitle_video_key: selectedVideo,
             operation_key: `p2:manual:${Date.now()}`,
-            voice, model_path: modelPath, retain_original_audio: mixMode === "original_low",
+            voice: usingCosy ? "reference" : voice, model_path: modelPath, retain_original_audio: mixMode === "original_low",
             preview_only: true, instruct: modelPath.includes("0.6B") ? "" : instruct,
-            temperature, top_p: topP, batch_size: batchSize, mix_mode: mixMode,
+            temperature, top_p: topP, batch_size: usingCosy ? 1 : batchSize, mix_mode: mixMode,
+            reference_profile_id: usingCosy ? profileId : null,
+            cosy_mode: cosyMode, cosy_speed: cosySpeed,
           })}>
           {submitting ? "正在提交…" : running ? "配音任务运行中" : "先生成首句试听"}
         </button>
