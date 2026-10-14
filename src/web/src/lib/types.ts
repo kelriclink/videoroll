@@ -72,7 +72,9 @@ export type DubbingJob = {
     model_path?: string;
     retain_original_audio?: boolean;
     preview_only?: boolean;
-    quality?: { instruct?: string; temperature?: number; top_p?: number; batch_size?: number; mix_mode?: string };
+    quality?: { instruct?: string; temperature?: number; top_p?: number; batch_size?: number;
+      mix_mode?: string; cosy_speed?: number; cosy_mode?: string; profile_id?: string;
+      debug_timing?: boolean };
   };
   output: {
     audio_key?: string;

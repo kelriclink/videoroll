@@ -46,6 +46,15 @@ export type PlayoutAssetLink = {
   updated_at: string;
 };
 
+export type DubbingRequest = {
+  subtitle_job_id: string; subtitle_video_key: string; operation_key: string;
+  voice: string; model_path: string; retain_original_audio: boolean;
+  preview_only?: boolean; instruct?: string; temperature?: number; top_p?: number;
+  batch_size?: 1 | 2 | 4; mix_mode?: "replace" | "original_low" | "background_only";
+  reference_profile_id?: string | null; cosy_mode?: "cross_lingual" | "zero_shot" | "instruct";
+  cosy_speed?: number; debug_timing?: boolean;
+};
+
 export const tasksApi = {
   get(taskId: string) {
     return fetchJson<Task>(orchestratorUrl(`/tasks/${taskId}`));
@@ -71,25 +80,17 @@ export const tasksApi = {
     return fetchJson<DubbingJob[]>(orchestratorUrl(`/tasks/${taskId}/dubbing_jobs`));
   },
 
-  startDubbing(taskId: string, request: {
-    subtitle_job_id: string;
-    subtitle_video_key: string;
-    operation_key: string;
-    voice: string;
-    model_path: string;
-    retain_original_audio: boolean;
-    preview_only?: boolean;
-    instruct?: string;
-    temperature?: number;
-    top_p?: number;
-    batch_size?: 1 | 2 | 4;
-    mix_mode?: "replace" | "original_low" | "background_only";
-    reference_profile_id?: string | null;
-    cosy_mode?: "cross_lingual" | "zero_shot" | "instruct";
-    cosy_speed?: number;
-  }) {
+  startDubbing(taskId: string, request: DubbingRequest) {
     return fetchJson<{ job_id: string; status: string }>(
       orchestratorUrl(`/tasks/${taskId}/actions/dubbing`),
+      { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(request) },
+    );
+  },
+
+  rerunDubbing(taskId: string, jobId: string,
+    request: DubbingRequest, forceRegenerate = false) {
+    return fetchJson<{ job_id: string; status: string }>(
+      orchestratorUrl(`/tasks/${taskId}/dubbing_jobs/${jobId}/rerun?regenerate=${forceRegenerate}`),
       { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(request) },
     );
   },

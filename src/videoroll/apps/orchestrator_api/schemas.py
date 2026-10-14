@@ -232,6 +232,7 @@ class DubbingActionRequest(BaseModel):
     reference_profile_id: uuid.UUID | None = None
     cosy_mode: Literal["cross_lingual", "zero_shot", "instruct"] = "cross_lingual"
     cosy_speed: float = Field(default=1.0, ge=0.8, le=1.25)
+    debug_timing: bool = False
 
 
 class RemoteJobResponse(BaseModel):

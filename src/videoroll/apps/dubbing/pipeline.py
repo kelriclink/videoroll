@@ -121,6 +121,7 @@ def generate_dubbed_media(
         voice=voice, speech_overrides=speech_overrides,
     )
     duration = probe_duration(subtitle_video, ffprobe=ffprobe)
+    max_speed = 2.0 if (quality or {}).get("debug_timing") is True else 1.25
     segments, adjustments = reconcile_final_subtitle_boundary(
         segments, video_duration=duration,
     )
@@ -130,7 +131,7 @@ def generate_dubbed_media(
     # spending hours on inference. Dummy durations test only intervals.
     plan_dubbing_timeline(
         segments, {s.index: max(0.01, (s.end - s.start) * 0.5) for s in segments},
-        video_duration=duration,
+        video_duration=duration, max_speed=max_speed,
     )
     if retain_original_audio or mix_mode in ("original_low", "background_only"):
         audio_probe = subprocess.run(
@@ -200,7 +201,8 @@ def generate_dubbed_media(
                 on_segment_done(n, len(segments), key, file)
             # Persist the clip first, then flag a too-long line for review.
             # Resuming after a rewrite can reuse all prior valid clips.
-            check_segment_fit(segments, n - 1, length, video_duration=duration)
+            check_segment_fit(segments, n - 1, length, video_duration=duration,
+                              max_speed=max_speed)
             if preview_only and n == 1:
                 from videoroll.apps.dubbing.control import DubbingInterrupted
                 raise DubbingInterrupted("preview_ready")
@@ -211,6 +213,7 @@ def generate_dubbed_media(
         on_stage("aligning", 88)
     placements = plan_dubbing_timeline(
         segments, tts_durations, video_duration=duration,
+        max_speed=max_speed,
     )
     if on_stage is not None:
         on_stage("mixing", 90)

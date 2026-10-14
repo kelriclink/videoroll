@@ -17,7 +17,8 @@ def normalize_quality(*, instruct: str = "", temperature: float = 0.9,
                       top_p: float = 0.9, batch_size: int = 1,
                       mix_mode: str = "replace", model: str = "",
                       cosy_speed: float = 1.0, cosy_mode: str = "cross_lingual",
-                      profile_id: str = "", profile_sha256: str = "") -> dict[str, Any]:
+                      profile_id: str = "", profile_sha256: str = "",
+                      debug_timing: bool = False) -> dict[str, Any]:
     if len(instruct) > 120 or any(ord(c) < 32 for c in instruct):
         raise ValueError("invalid TTS speaking instruction")
     if not (0.3 <= temperature <= 1.5 and 0.6 <= top_p <= 1.0):
@@ -37,7 +38,10 @@ def normalize_quality(*, instruct: str = "", temperature: float = 0.9,
             raise ValueError('CosyVoice3 currently supports sequential inference only')
         if not profile_id or not profile_sha256:
             raise ValueError('CosyVoice3 requires an authorized reference voice')
-    return {"cosy_speed": float(cosy_speed), "cosy_mode": cosy_mode,
+    if not isinstance(debug_timing, bool):
+        raise ValueError("debug timing flag must be boolean")
+    return {"debug_timing": debug_timing,
+            "cosy_speed": float(cosy_speed), "cosy_mode": cosy_mode,
             "profile_id": profile_id, "profile_sha256": profile_sha256,
             "instruct": instruct.strip(), "temperature": float(temperature),
             "top_p": float(top_p), "batch_size": int(batch_size), "mix_mode": mix_mode}
@@ -47,7 +51,7 @@ def audio_cache_key(*, text: str, voice: str, model: str, quality: dict[str, Any
                     model_revision: str = "local-managed") -> str:
     relevant = {key: quality.get(key) for key in (
         "instruct", "temperature", "top_p", "cosy_speed", "cosy_mode",
-        "profile_id", "profile_sha256") if key in quality}
+        "profile_id", "profile_sha256", "_sample_nonce") if key in quality}
     payload = {"schema": 2, "text": text, "voice": voice,
                "model": model, "model_revision": quality.get("_model_revision", model_revision), "language": "Chinese",
                "generation": relevant}

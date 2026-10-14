@@ -67,6 +67,7 @@ def create_dubbing_job(
     reference_profile_id: uuid.UUID | None = None,
     cosy_mode: str = "cross_lingual",
     cosy_speed: float = 1.0,
+    debug_timing: bool = False,
 ) -> DubbingJob:
     """Create a manual dubbing job from translated subtitles and raw or P1 video."""
     existing = db.query(DubbingJob).filter(
@@ -118,7 +119,8 @@ def create_dubbing_job(
                                 top_p=top_p, batch_size=batch_size,
                                 mix_mode=mix_mode, model=model_path,
                                 cosy_speed=cosy_speed, cosy_mode=cosy_mode,
-                                profile_id=profile_id, profile_sha256=profile_sha)
+                                profile_id=profile_id, profile_sha256=profile_sha,
+                                debug_timing=debug_timing)
     # Cache separates different installed model revisions even if the user
     # keeps the same user-facing model name.
     import hashlib

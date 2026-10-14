@@ -118,6 +118,7 @@ EXPECTED_ORCHESTRATOR_ROUTES: set[tuple[str, str]] = {
     ("POST", "/tasks/{task_id}/dubbing_jobs/{job_id}/retry"),
     ("POST", "/tasks/{task_id}/dubbing_jobs/{job_id}/control"),
     ("POST", "/tasks/{task_id}/dubbing_jobs/{job_id}/confirm"),
+    ("POST", "/tasks/{task_id}/dubbing_jobs/{job_id}/rerun"),
     ("POST", "/tasks/{task_id}/dubbing_jobs/{job_id}/segments/{index}/suggest"),
     ("POST", "/tasks/{task_id}/actions/publish"),
     ("POST", "/tasks/{task_id}/actions/publish_all"),

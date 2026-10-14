@@ -58,7 +58,7 @@ def assemble_track(
             _write_silence(out, start - cursor)
             cursor = start
             # Decode one clip to bounded-size raw audio on disk. atempo is
-            # controlled by the validated timing plan (1.0 .. 1.25).
+            # controlled by the validated timing plan (1.0 .. 2.0).
             raw_path = output.with_name(f"{output.stem}_{placement.index}.pcm.tmp")
             try:
                 command = [

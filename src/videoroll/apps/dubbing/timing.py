@@ -17,11 +17,12 @@ class DubbingTimingError(ValueError):
 
 
 class SpeechTooLong(DubbingTimingError):
-    def __init__(self, index: int, duration: float, slot: float, required_speed: float):
+    def __init__(self, index: int, duration: float, slot: float, required_speed: float,
+                 max_speed: float = 1.25):
         self.index, self.duration, self.slot = index, duration, slot
         self.required_speed = required_speed
         super().__init__(f"segment {index}: speech {duration:.3f}s exceeds slot {slot:.3f}s "
-                         f"(requires {required_speed:.2f}x; maximum 1.25x). "
+                         f"(requires {required_speed:.2f}x; maximum {max_speed:.2f}x). "
                          "Shorten this spoken script and regenerate this segment.")
 
 
@@ -37,7 +38,7 @@ def check_segment_fit(segments: Sequence[SpokenSegment], index: int, duration: f
         raise DubbingTimingError(f"segment {part.index}: no audio slot available")
     speed = max(1.0, duration / slot)
     if speed > max_speed + 1e-8:
-        raise SpeechTooLong(part.index, duration, slot, speed)
+        raise SpeechTooLong(part.index, duration, slot, speed, max_speed)
     return speed
 
 

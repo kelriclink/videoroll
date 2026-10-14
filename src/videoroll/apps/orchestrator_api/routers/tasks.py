@@ -214,6 +214,7 @@ def enqueue_dubbing_job(
             reference_profile_id=payload.reference_profile_id,
             cosy_mode=payload.cosy_mode,
             cosy_speed=payload.cosy_speed,
+            debug_timing=payload.debug_timing,
         )
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -270,6 +271,36 @@ def retry_dubbing_job(
         ) from exc
     return RemoteJobResponse(job_id=job.id, status="queued")
 
+
+
+@router.post("/tasks/{task_id}/dubbing_jobs/{job_id}/rerun", response_model=RemoteJobResponse)
+def rerun_dubbing_with_parameters(
+    task_id: uuid.UUID,
+    job_id: uuid.UUID,
+    payload: DubbingActionRequest,
+    regenerate: bool = Query(False),
+    settings: OrchestratorSettings = Depends(get_settings),
+    db: Session = Depends(get_db),
+) -> RemoteJobResponse:
+    """Regenerate a debug preview or start the full run without a new job ID."""
+    from videoroll.apps.dubbing.reconfigure import reconfigure_dubbing
+    from videoroll.apps.dubbing.worker_status import worker_status
+    from videoroll.workflows.launcher import PipelineLauncher
+    if not worker_status()['available']:
+        raise HTTPException(503,'dubbing worker or model service unavailable')
+    try:
+        job=reconfigure_dubbing(db,task_id=task_id,job_id=job_id,
+            values=payload.model_dump(),regenerate=regenerate)
+    except LookupError as exc:
+        raise HTTPException(404,str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(409,str(exc)) from exc
+    try:
+        PipelineLauncher(settings).launch_dubbing_job(
+            job.id,dispatch_key=f'{job.id}:debug-rerun:{uuid.uuid4().hex}')
+    except Exception as exc:
+        raise HTTPException(502,f'dubbing was queued but dispatch failed: {type(exc).__name__}') from exc
+    return RemoteJobResponse(job_id=job.id,status='queued')
 
 
 @router.post("/tasks/{task_id}/dubbing_jobs/{job_id}/confirm", response_model=RemoteJobResponse)

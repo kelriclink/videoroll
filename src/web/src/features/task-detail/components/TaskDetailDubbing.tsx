@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import { fetchJson } from "../../../lib/http";
 import { orchestratorUrl } from "../../../lib/urls";
@@ -85,6 +85,9 @@ export function TaskDetailDubbing({
   const [subtitleJobId, setSubtitleJobId] = useState("");
   const [loading, setLoading] = useState(true);
   const [submitting, setSubmitting] = useState(false);
+  const [debugTiming, setDebugTiming] = useState(true);
+  const [forceRegenerate, setForceRegenerate] = useState(true);
+  const restoredJob = useRef(false);
   const [error, setError] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
 
@@ -106,7 +109,26 @@ export function TaskDetailDubbing({
 
   const reloadJobs = useCallback(async () => {
     try {
-      setJobs(await tasksApi.dubbingJobs(taskId));
+      const found = await tasksApi.dubbingJobs(taskId);
+      setJobs(found);
+      if (!restoredJob.current) {
+        const editable = found.find((j) => ["preview_ready", "needs_review", "paused", "failed"].includes(j.status));
+        if (editable) {
+          restoredJob.current = true;
+          setModelPath(editable.request.model_path ?? MODELS[0].id);
+          setVoice(editable.request.voice ?? "Vivian");
+          setVideoKey(editable.request.subtitle_video_key ?? "");
+          setSubtitleJobId(editable.subtitle_job_id ?? "");
+          const q = editable.request.quality;
+          setInstruct(q?.instruct ?? "");setTemperature(q?.temperature ?? 0.9);
+          setTopP(q?.top_p ?? 0.9);setCosySpeed(q?.cosy_speed ?? 1.0);
+          setCosyMode((q?.cosy_mode as typeof cosyMode) || "cross_lingual");
+          setProfileId(q?.profile_id || "");
+          setMixMode((q?.mix_mode as typeof mixMode) || "replace");
+          setBatchSize((q?.batch_size as 1 | 2 | 4) || 1);
+          setDebugTiming(q?.debug_timing ?? true);
+        }
+      }
       setError(null);
     } catch (reason) {
       setError(String(reason));
@@ -137,8 +159,10 @@ export function TaskDetailDubbing({
         const currentTaskProfiles = (state.voice_profiles ?? []).filter((profile) => profile.task_id === taskId);
         setProfileId((current) => currentTaskProfiles.some((profile) => profile.id === current)
           ? current : currentTaskProfiles[currentTaskProfiles.length - 1]?.id ?? "");
-        setModelPath(state.selection.model);
-        setVoice(state.selection.voice);
+        if (!restoredJob.current) {
+          setModelPath(state.selection.model);
+          setVoice(state.selection.voice);
+        }
         setWorkerReady(state.worker?.available ?? false);
         setSeparationReady(state.separation?.available ?? false);
       })
@@ -173,34 +197,27 @@ export function TaskDetailDubbing({
 
   const running = jobs.some((job) => RUNNING.has(job.status));
   const blockedByExisting = jobs.some((job) => BLOCKING.has(job.status));
+  const editableJob = jobs.find((job) => ["preview_ready", "needs_review", "paused", "failed"].includes(job.status)
+    && job.subtitle_job_id === selectedSubtitle && job.request.subtitle_video_key === selectedVideo);
+  const trulyBusy = jobs.some((job) => RUNNING.has(job.status) ||
+    ["queued", "pause_requested", "cancel_requested"].includes(job.status));
   const canGenerate = Boolean(workerReady && installedModels.includes(modelPath) && selectedVideo && selectedSubtitle && task?.status !== "CANCELED"
     && (!usingCosy || (profileId !== "" && (cosyMode !== "zero_shot" || Boolean(voiceProfiles.find((x) => x.id === profileId)?.reference_text)) && (cosyMode !== "instruct" || Boolean(instruct.trim()))))
-    && !blockedByExisting && !submitting && (mixMode !== "background_only" || separationReady));
+    && !trulyBusy && (!blockedByExisting || Boolean(editableJob)) && !submitting
+    && (mixMode !== "background_only" || separationReady));
 
-  async function submitJob(request: {
-    subtitle_job_id: string;
-    subtitle_video_key: string;
-    operation_key: string;
-    voice: string;
-    model_path: string;
-    retain_original_audio: boolean;
-    preview_only: boolean;
-    instruct: string;
-    temperature: number;
-    top_p: number;
-    batch_size: 1 | 2 | 4;
-    mix_mode: "replace" | "original_low" | "background_only";
-    reference_profile_id?: string | null;
-    cosy_mode?: "cross_lingual" | "zero_shot" | "instruct";
-    cosy_speed?: number;
-  }) {
+  async function submitJob(request: import("../../../api/tasks").DubbingRequest) {
     if (submitting) return;
     setSubmitting(true);
     setError(null);
     setMessage(null);
     try {
-      const response = await tasksApi.startDubbing(taskId, request);
-      setMessage(`已提交首句试听任务：${response.job_id}。试听满意后，再点“确认正式生成”。`);
+      const matching = jobs.find((j) => ["preview_ready", "needs_review", "paused", "failed"].includes(j.status)
+        && j.subtitle_job_id === request.subtitle_job_id && j.request.subtitle_video_key === request.subtitle_video_key);
+      const response = matching
+        ? await tasksApi.rerunDubbing(taskId, matching.id, request, forceRegenerate)
+        : await tasksApi.startDubbing(taskId, request);
+      setMessage(`${request.preview_only ? "首句试听" : "完整配音"}任务已提交：${response.job_id}。${request.preview_only ? "可以反复调参试听。" : "正在生成整个视频。"}`);
       await reloadJobs();
       await refreshAssets();
     } catch (reason) {
@@ -245,7 +262,7 @@ export function TaskDetailDubbing({
     setSubmitting(true);
     try {
       await tasksApi.confirmDubbing(taskId, jobId);
-      setMessage("已确认首句试听，开始后续配音。");
+      setMessage("已按试听设置提交完整配音。");
       await reloadJobs();
     } catch (reason) {
       setError(String(reason));
@@ -360,8 +377,8 @@ export function TaskDetailDubbing({
           </label>
           {profileId ? <div className="flex items-end"><audio controls preload="none" src={orchestratorUrl(`/settings/dubbing/voices/${profileId}/audio`)} /></div> : null}
         </div>
-        <div className="rounded border border-sky-300 bg-white p-3 space-y-2">
-          <div className="font-medium">自动匹配原声（使用字幕识别结果，无需填写时间与原文）</div>
+        <details className="rounded border border-sky-300 bg-white p-3 space-y-2" open={!profileId}>
+          <summary className="cursor-pointer font-medium">{profileId ? "更换参考声音（可选）" : "自动提取参考声音"}</summary>
           {suggestionsLoading ? <p>正在从原语言识别片段中寻找合适的声音…</p> : null}
           {suggestionsError ? <p className="text-amber-700">自动选取不可用：{suggestionsError}。可展开下面的高级手动选项。</p> : null}
           {suggestedVoices.length > 0 ? <>
@@ -388,7 +405,7 @@ export function TaskDetailDubbing({
             </button>
             <p className="text-xs text-slate-600">根据原声识别时间轴自动挑选连续人声；不能保证完全无人声重叠或背景音乐，建议试听后确认。</p>
           </> : null}
-        </div>
+        </details>
         <details><summary className="cursor-pointer font-medium">高级：手动指定参考声音（自动选取失败时使用）</summary>
           <div className="mt-3 grid gap-2 md:grid-cols-2">
             <label>声音名称<input className="mt-1 block w-full rounded border p-2" value={profileName} onChange={(e) => setProfileName(e.target.value)} /></label>
@@ -401,10 +418,12 @@ export function TaskDetailDubbing({
             className="mt-2 rounded bg-sky-800 px-3 py-2 text-white disabled:opacity-50">提取并保存参考音频</button>
         </details>
       </div> : null}
+      <details className="mt-3 rounded border border-slate-200 p-3">
+        <summary className="cursor-pointer text-sm font-medium">高级参数 · 原声混音、批量与语气指令</summary>
       <div className="mt-3 grid gap-3 md:grid-cols-2">
         <label className="text-sm text-slate-700">原声音轨
           <select className="mt-1 block w-full rounded border p-2" value={mixMode}
-            onChange={(e) => setMixMode(e.target.value as typeof mixMode)} disabled={blockedByExisting || submitting}>
+            onChange={(e) => setMixMode(e.target.value as typeof mixMode)} disabled={trulyBusy || submitting}>
             <option value="replace">仅中文配音（替换原声）</option>
             <option value="original_low">低音量原声混音（包含外语人声）</option>
             <option value="background_only" disabled={!separationReady}>Demucs 分离背景音（{separationReady ? "可用" : "未安装"}）</option>
@@ -412,13 +431,13 @@ export function TaskDetailDubbing({
         </label>
         <label className="text-sm text-slate-700">每批生成句数（V100 建议 1）
           <select className="mt-1 block w-full rounded border p-2" value={batchSize}
-            onChange={(e) => setBatchSize(Number(e.target.value) as 1 | 2 | 4)} disabled={blockedByExisting || submitting || usingCosy}>
+            onChange={(e) => setBatchSize(Number(e.target.value) as 1 | 2 | 4)} disabled={trulyBusy || submitting || usingCosy}>
             <option value={1}>1 · 单句稳妥</option><option value={2}>2 · 批量实验</option><option value={4}>4 · 批量实验</option>
           </select>
         </label>
         <label className="text-sm text-slate-700">语气指令（Qwen 1.7B / CosyVoice 指令模式）
           <input className="mt-1 block w-full rounded border p-2" value={instruct} maxLength={120}
-            disabled={modelPath.includes("0.6B") && !usingCosy || blockedByExisting || submitting}
+            disabled={(modelPath.includes("0.6B") && !usingCosy) || trulyBusy || submitting}
             onChange={(e) => setInstruct(e.target.value)} placeholder="例如：自然清晰，语速稍快，像科普讲解" />
         </label>
         {!usingCosy ? <div className="grid grid-cols-2 gap-2">
@@ -432,28 +451,42 @@ export function TaskDetailDubbing({
           </label>
         </div> : null}
       </div>
+      </details>
       {!workerReady ? <p className="mt-2 text-sm text-amber-700">配音 Worker 未运行，已禁止创建无执行节点的任务。</p> : null}
+      <div className="mt-3 flex flex-wrap items-center gap-3 text-sm">
+        <label className="flex items-center gap-2">
+          <input type="checkbox" checked={debugTiming} onChange={(event) => setDebugTiming(event.target.checked)} disabled={trulyBusy || submitting}/>
+          调试对齐（允许最高 2.0× 音频加速）
+        </label>
+        <label className="flex items-center gap-2">
+          <input type="checkbox" checked={forceRegenerate} onChange={(event) => setForceRegenerate(event.target.checked)} disabled={trulyBusy || submitting}/>
+          强制重新生成语音（不复用旧缓存）
+        </label>
+      </div>
       <div className="mt-3 flex flex-wrap items-center gap-3">
-        <button type="button" className="rounded bg-slate-900 px-4 py-2 text-sm text-white disabled:opacity-50"
-          disabled={!canGenerate}
-          onClick={() => void submitJob({
-            subtitle_job_id: selectedSubtitle,
-            subtitle_video_key: selectedVideo,
-            operation_key: `p2:manual:${Date.now()}`,
-            voice: usingCosy ? "reference" : voice, model_path: modelPath, retain_original_audio: mixMode === "original_low",
-            preview_only: true, instruct: modelPath.includes("0.6B") ? "" : instruct,
-            temperature, top_p: topP, batch_size: usingCosy ? 1 : batchSize, mix_mode: mixMode,
-            reference_profile_id: usingCosy ? profileId : null,
-            cosy_mode: cosyMode, cosy_speed: cosySpeed,
-          })}>
-          {submitting ? "正在提交…" : running ? "配音任务运行中" : "先生成首句试听"}
-        </button>
+        {([false, true] as const).map((preview) => (
+          <button key={String(preview)} type="button" className={preview ? "rounded border border-sky-800 px-4 py-2 text-sm text-sky-900 disabled:opacity-50" : "rounded bg-slate-900 px-4 py-2 text-sm text-white disabled:opacity-50"}
+            disabled={!canGenerate}
+            onClick={() => void submitJob({
+              subtitle_job_id: selectedSubtitle,
+              subtitle_video_key: selectedVideo,
+              operation_key: `p2:debug:${Date.now()}:${preview ? "preview" : "full"}`,
+              voice: usingCosy ? "reference" : voice,
+              model_path: modelPath, retain_original_audio: mixMode === "original_low",
+              preview_only: preview, instruct: modelPath.includes("0.6B") ? "" : instruct,
+              temperature, top_p: topP, batch_size: usingCosy ? 1 : batchSize, mix_mode: mixMode,
+              reference_profile_id: usingCosy ? profileId : null,
+              cosy_mode: cosyMode, cosy_speed: cosySpeed, debug_timing: debugTiming,
+            })}>
+            {submitting ? "正在提交…" : preview ? "生成一句试听" : "完整配音"}
+          </button>
+        ))}
         <button type="button" className="rounded border px-3 py-2 text-sm"
           onClick={() => { void reloadJobs(); void refreshAssets(); }} disabled={submitting}>
           刷新配音进度
         </button>
       </div>
-      {!canGenerate && !blockedByExisting && !submitting ? (
+      {!canGenerate && !trulyBusy && !submitting ? (
         <p className="mt-2 text-xs text-amber-700">
           需要已完成的中文字幕任务、仍保留的原视频或 P1，以及已下载的 TTS 模型；已取消的任务不可启动。
         </p>
@@ -481,7 +514,7 @@ export function TaskDetailDubbing({
                   {job.progress}% · {job.request.voice ?? "Vivian"} ·
                   已缓存 {Object.keys(job.output.segments ?? {}).length}/{job.output.segments_total ?? "?"} 段
                 </div>
-                {job.output.timing_issue ? <p className="mt-2 text-amber-700">第 {job.output.timing_issue.segment_index} 句超时：需要 {job.output.timing_issue.required_speed.toFixed(2)}× 语速。{job.status === "preview_ready" ? "试听音频已生成，可在下方「试听 / 编辑口播片段」播放；请精简口播并重新试听，通过时间轴检查后再正式生成。" : "请编辑口播文案，再重试。"}</p> : null}
+                {job.output.timing_issue ? <p className="mt-2 text-amber-700">第 {job.output.timing_issue.segment_index} 句超时：需要 {job.output.timing_issue.required_speed.toFixed(2)}× 语速。{job.status === "preview_ready" ? "试听音频已生成；可直接播放。调试对齐开启后可用最高 2× 加速，也可修改参数并重新生成。" : "请编辑口播文案，再重试。"}</p> : null}
                 {job.output.performance ? <p className="mt-1 text-xs text-slate-500">已测推理 {job.output.performance.wall_seconds.toFixed(1)} 秒；生成音频 {job.output.performance.audio_seconds.toFixed(1)} 秒；最近批次 {job.output.performance.last_batch_size} 句</p> : null}
                 {job.error_message ? <div className="mt-2 break-words text-xs text-rose-700">{job.error_message}</div> : null}
                 <div className="mt-2 flex flex-wrap gap-2">
@@ -493,7 +526,7 @@ export function TaskDetailDubbing({
                   ) : null}
                   {job.status === "preview_ready" && !job.output.timing_issue && !submitting ? (
                     <button type="button" className="rounded bg-emerald-700 px-3 py-1 text-xs text-white"
-                      onClick={() => void confirmPreview(job.id)}>确认试听，正式生成剩余片段</button>
+                      onClick={() => void confirmPreview(job.id)}>沿用当前试听生成完整配音</button>
                   ) : null}
                   {RUNNING.has(job.status) && !["pause_requested", "cancel_requested"].includes(job.status) && !submitting ? (
                     <button type="button" className="rounded border px-2 py-1 text-xs"
