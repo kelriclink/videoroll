@@ -269,3 +269,12 @@ VideoRoll 对所有 TTS 模型仅部署**一套统一内网 API 服务** `videor
 - GPU Base WAV `cosyvoice3-v100-base-acceptance.wav`：24kHz、3.28s、非静音、无 NaN，RTF≈2.25；RL WAV `cosyvoice3-v100-rl-acceptance.wav`：24kHz、2.88s、非静音、无 NaN，RTF≈1.57。数值只代表短句与具体测试环境，不作为整体视频的性能承诺。
 - **统一服务端到端**：独立测试端口 `127.0.0.1:8041` 实测 Base/RL 均返回 HTTP 200，各生成合法 WAV，且 Base → RL 切换成功、零服务错误。验收用官方示例声音已删除，测试服务已停止，不影响生产端口 `8040`。V100 验收记录与 SHA256 位于 `/opt/videoroll/artifacts/cosyvoice3-v100-environment-acceptance.json`；只有实际测试后才写入 `/opt/videoroll/venvs/cosyvoice3/.v100-base-rl-validated`。
 - 初次 Qwen/CosyVoice 模型加载会额外花几十秒，之后同模型复用已加载 CUDA 子进程。要评估真正字幕配音吞吐仍需长句和语速测试。
+
+## 从已有 ASR 自动挑选声音参考片段（2026-10-14）
+
+- **无需填写参考起止时间或原文**：VideoRoll ASR 已将原语言、起止时间、可用置信度存于 `AssetKind.segments_json`。新的字幕任务在 ASR 完成时把 `source_segments_key` 绑定到 `SubtitleJob.request_json.artifacts`；历史任务仅存在唯一 ASR 资产时也能复用。如果有多个无法归属的版本则拒绝猜测。
+- API `GET /tasks/{task_id}/dubbing/voice_candidates?subtitle_job_id=<uuid>` 从**原文 ASR**而非中文译文排序选取最多三个约 3–16s 连续语句。优先 6–15s、有较高语音覆盖率、置信度高、停顿不超过 0.75s 且没有明显时间重叠的片段；如果 ASR 包含 speaker 标签则避免合并不同标签，但**没有进行说话人分离，因此不保证没有混入其他人声或背景音乐**。
+- 只选择匹配字幕任务的**原始视频 `video_raw`**，即使 P1 已完成也不用可能经过加字幕/混音的最终视频。`POST /tasks/{task_id}/dubbing/voice_profiles/auto` 带 `subtitle_job_id`、自动候选 index、`authorization_confirmed=true`，后端重新选取和验证归属，自动填入起点、时长和原文，用 FFmpeg 转出 16kHz 单声道 PCM，保存哈希和声音库引用。后台不自动启动 TTS、克隆或投稿。
+- **用户界面**：选择 CosyVoice 和已完成字幕后自动展示推荐候选及识别原文（只读）；用户仅需要确认声音使用权限，点击“自动提取推荐声音并保存”，试听提取结果，然后进入首句中文配音试听流程。可更换第 2/3 候选，不需修改时间或文本；不满足条件时保留折叠的高级手动入口。
+- **修复模型音色校验**：配音创建不再强制所有引擎使用 Qwen 的固定中文音色，CosyVoice 使用自身授权的 `reference` 音色并验证引用归属于当前任务。
+- 自动选片不是声纹匹配、音乐分离或多说话人聚类。内容多人的视频依然需要人工试听筛选；若想全自动多人分离，下一阶段需接入独立 VAD + diarization + 音乐/人声分离，而不能用 ASR 时间戳冒充声纹识别。

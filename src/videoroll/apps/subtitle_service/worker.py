@@ -1244,6 +1244,12 @@ def run_subtitle_job(
                 ".json",
             )
             store.upload_file(segments_path, segments_key, content_type="application/json")
+            # Pin original-language ASR to this subtitle job for TTS voice
+            # cloning; translated Chinese cues must never act as prompt text.
+            artifacts = dict(req.get("artifacts") or {})
+            artifacts["source_segments_key"] = segments_key
+            req["artifacts"] = artifacts
+            _save_job_request()
             db.add(
                 Asset(
                     task_id=task.id,
@@ -1372,10 +1378,34 @@ def run_subtitle_job(
             )
 
         segments: list[Segment] | None = None
-        segments_asset = _download_latest_asset(AssetKind.segments_json, segments_path) if resume else None
+        pinned_source = str((req.get("artifacts") or {}).get("source_segments_key") or "").strip()
+        segments_asset = None
+        if resume and pinned_source:
+            # Multiple ASR attempts may exist under one Task. Resume this
+            # particular subtitle job's original speech, not another job's
+            # most recent and potentially unrelated transcript.
+            pinned_asset = db.query(Asset).filter(
+                Asset.task_id == task.id, Asset.kind == AssetKind.segments_json,
+                Asset.storage_key == pinned_source,
+            ).one_or_none()
+            if pinned_asset is not None:
+                try:
+                    store.download_file(pinned_source, segments_path)
+                    if segments_path.is_file() and segments_path.stat().st_size > 0:
+                        segments_asset = pinned_asset
+                except (OSError, ValueError):
+                    pass
+        if resume and not pinned_source:
+            segments_asset = _download_latest_asset(AssetKind.segments_json, segments_path)
         if resume and segments_asset:
             segments_key = segments_asset.storage_key
             segments = _load_segments_json(segments_path)
+            if segments:
+                artifacts = dict(req.get("artifacts") or {})
+                artifacts["source_segments_key"] = segments_key
+                req["artifacts"] = artifacts
+                _save_job_request()
+                db.commit()
             if segments is not None:
                 _clear_groq_asr_checkpoint()
 

@@ -113,6 +113,8 @@ EXPECTED_ORCHESTRATOR_ROUTES: set[tuple[str, str]] = {
     ("POST", "/settings/dubbing/voices"),
     ("DELETE", "/settings/dubbing/voices/{profile_id}"),
     ("GET", "/settings/dubbing/voices/{profile_id}/audio"),
+    ("GET", "/tasks/{task_id}/dubbing/voice_candidates"),
+    ("POST", "/tasks/{task_id}/dubbing/voice_profiles/auto"),
     ("POST", "/tasks/{task_id}/dubbing_jobs/{job_id}/retry"),
     ("POST", "/tasks/{task_id}/dubbing_jobs/{job_id}/control"),
     ("POST", "/tasks/{task_id}/dubbing_jobs/{job_id}/confirm"),

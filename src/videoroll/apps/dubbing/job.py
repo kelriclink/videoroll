@@ -101,6 +101,8 @@ def create_dubbing_job(
         if voice != 'reference' or reference_profile_id is None:
             raise ValueError('select an authorized reference voice for CosyVoice3')
         profile, _ = resolve(str(reference_profile_id))
+        if str(profile.get('task_id') or '') != str(task_id):
+            raise ValueError('reference voice does not belong to this task')
         if cosy_mode == 'zero_shot' and not profile.get('reference_text'):
             raise ValueError('zero-shot mode requires the reference transcript')
         if cosy_mode == 'instruct' and not instruct.strip():
@@ -133,9 +135,12 @@ def create_dubbing_job(
     ).first()
     if video_asset is None:
         raise ValueError("source raw or P1 video asset not found")
-    from videoroll.apps.dubbing.qwen_tts import CHINESE_SPEAKERS
-    if voice not in CHINESE_SPEAKERS:
-        raise ValueError(f"unsupported TTS voice: {voice}")
+    # Preset Chinese voices are Qwen-only. CosyVoice3 uses its authorized
+    # reference voice and must not be rejected by the Qwen speaker catalog.
+    if model_path in QWEN_MODELS:
+        from videoroll.apps.dubbing.qwen_tts import CHINESE_SPEAKERS
+        if voice not in CHINESE_SPEAKERS:
+            raise ValueError(f"unsupported TTS voice: {voice}")
     job = DubbingJob(
         id=uuid.uuid4(), task_id=task_id, subtitle_job_id=subtitle_job_id,
         operation_key=operation_key, status="queued",
