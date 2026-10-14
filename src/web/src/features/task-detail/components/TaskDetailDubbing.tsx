@@ -111,9 +111,13 @@ export function TaskDetailDubbing({
   const reloadJobs = useCallback(async () => {
     try {
       const found = await tasksApi.dubbingJobs(taskId);
-      setJobs(found);
+      // Always prefer the newest attempt; never resurrect an older pending
+      // review form when a newer manual dubbing version exists.
+      const ordered = [...found].sort((a, b) => b.created_at.localeCompare(a.created_at));
+      setJobs(ordered);
       if (!restoredJob.current) {
-        const editable = found.find((j) => ["preview_ready", "needs_review", "paused", "failed"].includes(j.status));
+        const editable = ["preview_ready", "needs_review", "paused", "failed"].includes(ordered[0]?.status ?? "")
+          ? ordered[0] : undefined;
         if (editable) {
           restoredJob.current = true;
           setModelPath(editable.request.model_path ?? MODELS[0].id);
@@ -198,9 +202,10 @@ export function TaskDetailDubbing({
   }, [usingCosy, selectedSubtitle, taskId]);
 
   const running = jobs.some((job) => RUNNING.has(job.status));
-  const blockedByExisting = jobs.some((job) => BLOCKING.has(job.status));
-  const editableJob = jobs.find((job) => ["preview_ready", "needs_review", "paused", "failed"].includes(job.status)
-    && job.subtitle_job_id === selectedSubtitle && job.request.subtitle_video_key === selectedVideo);
+  const blockedByExisting = jobs.some((job) => BLOCKING.has(job.status) && job.id === jobs[0]?.id);
+  const editableJob = jobs[0] && ["preview_ready", "needs_review", "paused", "failed"].includes(jobs[0].status)
+    && jobs[0].subtitle_job_id === selectedSubtitle && jobs[0].request.subtitle_video_key === selectedVideo
+    ? jobs[0] : undefined;
   const trulyBusy = jobs.some((job) => RUNNING.has(job.status) ||
     ["queued", "pause_requested", "cancel_requested"].includes(job.status));
   const canGenerate = Boolean(workerReady && installedModels.includes(modelPath) && selectedVideo && selectedSubtitle && task?.status !== "CANCELED"
@@ -241,8 +246,12 @@ export function TaskDetailDubbing({
     setError(null);
     setMessage(null);
     try {
-      const matching = jobs.find((j) => ["preview_ready", "needs_review", "paused", "failed"].includes(j.status)
-        && j.subtitle_job_id === request.subtitle_job_id && j.request.subtitle_video_key === request.subtitle_video_key);
+      // A new manual version replaces the old editing context. A historical
+      // preview must not silently capture a request for the latest version.
+      const latest = jobs[0];
+      const matching = latest && ["preview_ready", "needs_review", "paused", "failed"].includes(latest.status)
+        && latest.subtitle_job_id === request.subtitle_job_id && latest.request.subtitle_video_key === request.subtitle_video_key
+        ? latest : undefined;
       const response = matching
         ? await tasksApi.rerunDubbing(taskId, matching.id, request, forceRegenerate)
         : await tasksApi.startDubbing(taskId, request);
@@ -340,7 +349,7 @@ export function TaskDetailDubbing({
 
   return (
     <section className="rounded border bg-white p-4" aria-label="中文配音">
-      <div className="text-base font-semibold text-slate-900">中文配音 · 手动模式</div>
+      <div className="text-base font-semibold text-slate-900">中文配音 · 统一手动工作台</div>
       <p className="mt-1 text-sm text-slate-600">
         中文字幕任务完成后即可手动配音，无须等待 P1 渲染。可以选择原视频或已完成的 P1；
         生成独立中文音轨和配音 MP4，后续渲染、分 P 和投稿由你自行操作，不会自动投稿。
@@ -529,7 +538,8 @@ export function TaskDetailDubbing({
       {message ? <p className="mt-2 text-sm text-emerald-700">{message}</p> : null}
       {error ? <p className="mt-2 break-words text-sm text-rose-700">{error}</p> : null}
       <div className="mt-5 border-t pt-3">
-        <div className="font-medium">配音任务记录</div>
+        <div className="font-medium">当前配音版本与历史记录</div>
+        <p className="mt-1 text-xs text-slate-500">默认操作最新版本；旧试听、取消与待审核记录仅作为历史保留，不会覆盖新配音。</p>
         {loading ? <p className="mt-2 text-sm text-slate-500">正在加载…</p> : null}
         {!loading && jobs.length === 0 ? <p className="mt-2 text-sm text-slate-500">暂无配音任务</p> : null}
         <div className="mt-2 space-y-3">
@@ -539,7 +549,7 @@ export function TaskDetailDubbing({
             return (
               <div key={job.id} className="rounded border border-slate-200 p-3 text-sm">
                 <div className="flex flex-wrap items-center justify-between gap-2">
-                  <span className="font-medium">{statusLabel[job.status] ?? job.status}</span>
+                  <span className="font-medium">{job.id === jobs[0]?.id ? "当前版本 · " : "历史版本 · "}{statusLabel[job.status] ?? job.status}</span>
                   <span className="font-mono text-xs text-slate-500">{job.id.slice(0, 12)}</span>
                 </div>
                 <div className="mt-2 h-2 rounded bg-slate-100">
