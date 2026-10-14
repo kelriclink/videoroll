@@ -106,3 +106,20 @@ def test_cosy_runtime_rejects_unverified_gpu_inference(tmp_path, monkeypatch):
     assert runtime_ready() is False
     (venv / '.v100-base-rl-validated').write_text('both variants tested')
     assert runtime_ready() is True
+
+
+def test_cosyvoice_cuda_libraries_are_isolated_to_runtime(monkeypatch,tmp_path):
+    from videoroll.apps.dubbing.cosyvoice3_adapter import cosine_runtime_environment
+    venv = tmp_path / 'cosy3'
+    for lib in ('cudnn','cublas','cuda_runtime'):
+        (venv / f'lib/python3.10/site-packages/nvidia/{lib}/lib').mkdir(parents=True)
+    py=venv/'bin/python'
+    py.parent.mkdir(parents=True)
+    py.write_text('stub')
+    monkeypatch.setenv('COSYVOICE3_PYTHON',str(py))
+    env=cosine_runtime_environment({'LD_LIBRARY_PATH':'/existing'})
+    paths=env['LD_LIBRARY_PATH'].split(':')
+    assert paths[-1]=='/existing'
+    assert str(venv/'lib/python3.10/site-packages/nvidia/cudnn/lib') in paths
+    assert str(venv/'lib/python3.10/site-packages/nvidia/cublas/lib') in paths
+    assert env['PYTHONPATH'].startswith('/opt/videoroll/external/CosyVoice')

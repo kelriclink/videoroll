@@ -256,3 +256,16 @@ VideoRoll 对所有 TTS 模型仅部署**一套统一内网 API 服务** `videor
 ### 上线开关（CosyVoice 3）
 
 `/opt/videoroll/venvs/cosyvoice3/.runtime-ready` 由依赖安装阶段生成，**仅表示依赖能够导入**，不得自动开放用户配音。只有在官方参考音频下，对 Base 和 RL **分别用 V100 FP32 生成有效 24kHz、非静音 WAV**，且校验音量、音频时长及无 NaN 后，管理员才能创建 `/opt/videoroll/venvs/cosyvoice3/.v100-base-rl-validated`，此时 `runtime_ready()` 才返回 True，前端才启用该模型。未经真实测试不得创建这个文件。
+
+### V100 环境验收完成（2026-10-14）
+
+- Python 3.10.22 venv：`/opt/videoroll/venvs/cosyvoice3`，PyTorch `2.3.1+cu121`，Torch 所用 cuDNN 8。
+- **ONNX Runtime 修复**：PyPI 镜像的 `onnxruntime-gpu==1.18.0` 默认为 CUDA 11 构建，直接加载时会报 `libcublasLt.so.11` 缺失。改从官方 Azure CUDA 12 源安装与 Torch 2.3.1 匹配的 `onnxruntime-gpu==1.18.0`：
+
+  `uv pip install --python /opt/videoroll/venvs/cosyvoice3/bin/python --index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/onnxruntime-cuda-12/pypi/simple/ --no-deps --reinstall-package onnxruntime-gpu onnxruntime-gpu==1.18.0`
+
+  不要向系统全局 CUDA 路径添加错误版本的 `.so` 软链接，也不要覆盖其他 TTS 虚拟环境。`cosine_runtime_environment()` 仅对 CosyVoice 私有子进程设置 CUDA 12/cuDNN 8 的 `LD_LIBRARY_PATH`；Qwen3-TTS 和其他 VideoRoll 服务的环境不变。
+- 实际 ONNX Tokenizer `speech_tokenizer_v3.onnx` 使用 `CUDAExecutionProvider` 成功创建会话；有非致命的图分配/Memcpy 提示，没有 `.so` 缺失或 CPU 全量回退。
+- GPU Base WAV `cosyvoice3-v100-base-acceptance.wav`：24kHz、3.28s、非静音、无 NaN，RTF≈2.25；RL WAV `cosyvoice3-v100-rl-acceptance.wav`：24kHz、2.88s、非静音、无 NaN，RTF≈1.57。数值只代表短句与具体测试环境，不作为整体视频的性能承诺。
+- **统一服务端到端**：独立测试端口 `127.0.0.1:8041` 实测 Base/RL 均返回 HTTP 200，各生成合法 WAV，且 Base → RL 切换成功、零服务错误。验收用官方示例声音已删除，测试服务已停止，不影响生产端口 `8040`。V100 验收记录与 SHA256 位于 `/opt/videoroll/artifacts/cosyvoice3-v100-environment-acceptance.json`；只有实际测试后才写入 `/opt/videoroll/venvs/cosyvoice3/.v100-base-rl-validated`。
+- 初次 Qwen/CosyVoice 模型加载会额外花几十秒，之后同模型复用已加载 CUDA 子进程。要评估真正字幕配音吞吐仍需长句和语速测试。

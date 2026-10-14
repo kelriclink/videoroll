@@ -15,7 +15,7 @@ import time
 from typing import Any
 
 from videoroll.apps.dubbing.model_management import COSY_MODELS, QWEN_MODELS, folder, installed
-from videoroll.apps.dubbing.cosyvoice3_adapter import runtime_python, source_repo, runtime_ready
+from videoroll.apps.dubbing.cosyvoice3_adapter import (runtime_python, runtime_ready, cosine_runtime_environment)
 from videoroll.apps.dubbing.voice_profiles import resolve
 
 
@@ -100,9 +100,7 @@ class SpeechEnginePool:
                     '--reference', str(reference), '--mode', str(quality.get('cosy_mode') or 'cross_lingual'),
                     '--prompt-text', str(profile.get('reference_text') or ''),
                     '--instruct', str(quality.get('instruct') or '')]
-            env = {**os.environ, 'PYTHONPATH':
-                   f'{source_repo()}:{source_repo()}/third_party/Matcha-TTS:{os.environ.get("PYTHONPATH", "")}',
-                   'HF_HOME': os.environ.get('HF_HOME', '/DATA/videoroll/data/.cache/huggingface')}
+            env = cosine_runtime_environment()
         else:raise ValueError('unknown TTS engine')
         # Switch engines only after the prior CUDA subprocess exits; GPU freed.
         self._stop()

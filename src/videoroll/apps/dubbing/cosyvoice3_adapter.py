@@ -19,6 +19,28 @@ def source_repo() -> Path:
     return Path(os.environ.get('COSYVOICE3_REPO', '/opt/videoroll/external/CosyVoice'))
 
 
+def cosine_runtime_environment(base_env: dict[str, str] | None = None) -> dict[str, str]:
+    """Provide CUDA 12/cuDNN 8 libraries to CosyVoice's private subprocess.
+
+    ORT 1.18.0's CUDA 12 build and PyTorch 2.3.1 require the virtualenv's
+    NVIDIA wheel libraries. Do not change global system/CUDA search paths.
+    """
+    env = dict(os.environ if base_env is None else base_env)
+    venv = runtime_python().parent.parent
+    nvidia = venv / 'lib/python3.10/site-packages/nvidia'
+    dirs = sorted(str(d) for d in nvidia.glob('*/lib') if d.is_dir())
+    prior = env.get('LD_LIBRARY_PATH', '')
+    if dirs:
+        env['LD_LIBRARY_PATH'] = os.pathsep.join(dirs + ([prior] if prior else []))
+    env['PYTHONPATH'] = os.pathsep.join([
+        str(source_repo()), str(source_repo() / 'third_party/Matcha-TTS'),
+        env.get('PYTHONPATH', ''),
+    ])
+    env.setdefault('HF_HOME', '/DATA/videoroll/data/.cache/huggingface')
+    env.setdefault('MPLCONFIGDIR', '/DATA/videoroll/data/.cache/matplotlib')
+    return env
+
+
 def runtime_ready() -> bool:
     # Package installation alone does not prove an SM7.0 V100 can generate
     # valid audio in BOTH Base and RL modes. Operators add this marker only
@@ -52,7 +74,7 @@ class CosyVoice3Synthesizer:
             '--model-root', str(model_dir), '--variant', model_path.split(':')[1],
             '--reference', str(reference), '--mode', mode, '--prompt-text', prompt_text,
             '--instruct', instruct, *(['--fp16'] if fp16 else []),
-        ], env={**os.environ, 'PYTHONPATH': f'{source_repo()}:{source_repo()}/third_party/Matcha-TTS:{os.environ.get("PYTHONPATH", "")}'},
+        ], env=cosine_runtime_environment(),
            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=None, bufsize=0)
         try:
             reply = self._read(startup_timeout)
