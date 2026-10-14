@@ -10,6 +10,9 @@ type Segment = {
   speech_text: string;
   overridden: boolean;
   has_audio: boolean;
+  speech_unit_start?: number;
+  speech_unit_indices?: number[];
+  generated_speech_text?: string | null;
 };
 
 export function TaskDubbingSegments({
@@ -92,6 +95,12 @@ export function TaskDubbingSegments({
             <div key={item.index} className="rounded bg-slate-50 p-3 text-xs">
               <div className="font-medium">第 {item.index} 句 · {item.start.toFixed(2)}–{item.end.toFixed(2)} 秒</div>
               <p className="mt-1 text-slate-600">字幕：{item.subtitle_text}</p>
+              {item.speech_unit_indices && item.speech_unit_indices.length > 1 && item.speech_unit_start === item.index ? (
+                <p className="mt-1 text-sky-700">已自动合并第 {item.speech_unit_indices[0]}–{item.speech_unit_indices[item.speech_unit_indices.length - 1]} 条字幕，实际朗读：{item.generated_speech_text}</p>
+              ) : null}
+              {item.speech_unit_start && item.speech_unit_start !== item.index ? (
+                <p className="mt-1 text-sky-700">这条字幕已合并进第 {item.speech_unit_start} 条朗读单元；无需单独配音。</p>
+              ) : null}
               <textarea
                 aria-label={`第 ${item.index} 句口播文案`}
                 className="mt-2 w-full rounded border bg-white p-2 text-sm"
@@ -104,6 +113,8 @@ export function TaskDubbingSegments({
               <div className="mt-2 flex flex-wrap items-center gap-2">
                 {item.has_audio ? (
                   <audio controls preload="none" src={tasksApi.dubbingPreviewUrl(taskId, job.id, item.index)} />
+                ) : item.speech_unit_start && item.speech_unit_start !== item.index ? (
+                  <span className="text-slate-500">音频随第 {item.speech_unit_start} 条合并生成</span>
                 ) : <span className="text-slate-500">尚未生成该句音频</span>}
                 {editable ? (
                   <button type="button" className="rounded border px-2 py-1"

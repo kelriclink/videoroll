@@ -37,7 +37,7 @@ const statusLabel: Record<string, string> = {
   pause_requested: "请求暂停，当前句生成结束后生效",
   cancel_requested: "请求取消，当前句生成结束后生效",
   preview_ready: "首句试听已生成，等待确认",
-  needs_review: "语音过长，等待修改口播稿",
+  needs_review: "需要重新对齐口播",
 };
 
 export function TaskDetailDubbing({
@@ -205,6 +205,32 @@ export function TaskDetailDubbing({
     && (!usingCosy || (profileId !== "" && (cosyMode !== "zero_shot" || Boolean(voiceProfiles.find((x) => x.id === profileId)?.reference_text)) && (cosyMode !== "instruct" || Boolean(instruct.trim()))))
     && !trulyBusy && (!blockedByExisting || Boolean(editableJob)) && !submitting
     && (mixMode !== "background_only" || separationReady));
+
+  async function autoRetryJob(job: DubbingJob) {
+    if (submitting) return;
+    setSubmitting(true);setError(null);setMessage(null);
+    try {
+      const q = job.request.quality;
+      await tasksApi.rerunDubbing(taskId, job.id, {
+        subtitle_job_id: job.subtitle_job_id ?? "",
+        subtitle_video_key: job.request.subtitle_video_key ?? "",
+        operation_key: `p2:auto-repair:${Date.now()}`,
+        model_path: job.request.model_path ?? modelPath,
+        voice: job.request.voice ?? voice,
+        retain_original_audio: job.request.retain_original_audio ?? false,
+        preview_only: job.request.preview_only ?? false,
+        instruct: q?.instruct ?? "", temperature: q?.temperature ?? 0.9,
+        top_p: q?.top_p ?? 0.9, batch_size: (q?.batch_size as 1 | 2 | 4) ?? 1,
+        mix_mode: (q?.mix_mode as "replace" | "original_low" | "background_only") ?? "replace",
+        reference_profile_id: q?.profile_id ?? null,
+        cosy_mode: (q?.cosy_mode as "cross_lingual" | "zero_shot" | "instruct") ?? "cross_lingual",
+        cosy_speed: q?.cosy_speed ?? 1, debug_timing: true, auto_group_speech: true,
+      }, false);
+      setMessage("已启用自动合句与短字幕优化，原任务继续生成。");
+      await reloadJobs();
+    } catch (reason) {setError(String(reason));}
+    finally {setSubmitting(false);}
+  }
 
   async function submitJob(request: import("../../../api/tasks").DubbingRequest) {
     if (submitting) return;
@@ -477,6 +503,7 @@ export function TaskDetailDubbing({
               temperature, top_p: topP, batch_size: usingCosy ? 1 : batchSize, mix_mode: mixMode,
               reference_profile_id: usingCosy ? profileId : null,
               cosy_mode: cosyMode, cosy_speed: cosySpeed, debug_timing: debugTiming,
+              auto_group_speech: true,
             })}>
             {submitting ? "正在提交…" : preview ? "生成一句试听" : "完整配音"}
           </button>
@@ -514,9 +541,17 @@ export function TaskDetailDubbing({
                   {job.progress}% · {job.request.voice ?? "Vivian"} ·
                   已缓存 {Object.keys(job.output.segments ?? {}).length}/{job.output.segments_total ?? "?"} 段
                 </div>
-                {job.output.timing_issue ? <p className="mt-2 text-amber-700">第 {job.output.timing_issue.segment_index} 句超时：需要 {job.output.timing_issue.required_speed.toFixed(2)}× 语速。{job.status === "preview_ready" ? "试听音频已生成；可直接播放。调试对齐开启后可用最高 2× 加速，也可修改参数并重新生成。" : "请编辑口播文案，再重试。"}</p> : null}
+                {job.output.timing_issue ? <p className="mt-2 text-amber-700">
+                  第 {job.output.timing_issue.segment_index} 段口播太长。{job.status === "needs_review"
+                    ? "已保存生成进度，点「智能合句重试」会自动合并过短字幕，无需逐句改稿。"
+                    : "已保存试听音频；可以试听或重新生成。"}
+                </p> : null}
                 {job.output.performance ? <p className="mt-1 text-xs text-slate-500">已测推理 {job.output.performance.wall_seconds.toFixed(1)} 秒；生成音频 {job.output.performance.audio_seconds.toFixed(1)} 秒；最近批次 {job.output.performance.last_batch_size} 句</p> : null}
-                {job.error_message ? <div className="mt-2 break-words text-xs text-rose-700">{job.error_message}</div> : null}
+                {job.error_message && !job.output.timing_issue ? <div className="mt-2 break-words text-xs text-rose-700">{job.error_message}</div> : null}
+                {job.error_message && job.output.timing_issue ? <details className="mt-2 text-xs text-slate-500">
+                  <summary className="cursor-pointer">技术错误详情</summary>
+                  <pre className="mt-1 whitespace-pre-wrap break-words">{job.error_message}</pre>
+                </details> : null}
                 <div className="mt-2 flex flex-wrap gap-2">
                   {audio ? <a className="rounded border px-2 py-1 text-xs" href={tasksApi.assetDownloadUrl(taskId, audio.id)}>下载中文音轨 WAV</a> : null}
                   {video ? <a className="rounded border px-2 py-1 text-xs" href={tasksApi.assetDownloadUrl(taskId, video.id)}>下载 P2 MP4</a> : null}
@@ -536,11 +571,12 @@ export function TaskDetailDubbing({
                     <button type="button" className="rounded border border-red-400 px-2 py-1 text-xs text-red-700"
                       onClick={() => void controlJob(job.id, "cancel")}>取消配音</button>
                   ) : null}
-                  {["failed", "paused", "needs_review"].includes(job.status) && !submitting ? (
+                  {job.status === "needs_review" && !submitting ? (
                     <button type="button" className="rounded border border-amber-400 px-2 py-1 text-xs text-amber-800"
-                      onClick={() => void retryJob(job.id)}>
-                      {job.status === "needs_review" ? "改写后继续生成" : job.status === "paused" ? "恢复配音" : "断点重试"}
-                    </button>
+                      onClick={() => void autoRetryJob(job)}>智能合句重试</button>
+                  ) : ["failed", "paused"].includes(job.status) && !submitting ? (
+                    <button type="button" className="rounded border border-amber-400 px-2 py-1 text-xs text-amber-800"
+                      onClick={() => void retryJob(job.id)}>{job.status === "paused" ? "恢复配音" : "断点重试"}</button>
                   ) : null}
                 </div>
                 <TaskDubbingSegments taskId={taskId} job={job} reload={reloadJobs} />

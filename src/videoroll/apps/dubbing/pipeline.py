@@ -21,6 +21,7 @@ from videoroll.apps.dubbing.timing import (SpokenSegment, plan_dubbing_timeline,
                                             check_segment_fit, DubbingTimingError,
                                             reconcile_final_subtitle_boundary)
 from videoroll.apps.dubbing.quality import audio_cache_key
+from videoroll.apps.dubbing.speech_units import build_speech_units
 
 
 class SpeechSynthesizer(Protocol):
@@ -111,6 +112,7 @@ def generate_dubbed_media(
     batch_size: int = 1,
     on_performance: Callable[[int, float, float], None] | None = None,
     on_timing_adjustment: Callable[[list[dict[str, float | int | str]]], None] | None = None,
+    on_speech_units: Callable[[list[dict[str, Any]]], None] | None = None,
     mix_mode: str = "replace",
     preview_only: bool = False,
 ) -> DubbingResult:
@@ -127,6 +129,22 @@ def generate_dubbed_media(
     )
     if adjustments and on_timing_adjustment is not None:
         on_timing_adjustment(adjustments)
+    # Validate the original translated subtitle chronology before grouping:
+    # grouping must never conceal broken source timestamps.
+    plan_dubbing_timeline(
+        segments, {p.index: max(0.01, (p.end-p.start) * 0.5) for p in segments},
+        video_duration=duration, max_speed=max_speed,
+    )
+    units=build_speech_units(segments,
+        enabled=bool((quality or {}).get("auto_group_speech", False)))
+    segments=[unit.part for unit in units]
+    if on_speech_units is not None:
+        on_speech_units([{
+            "index": unit.part.index, "source_indices": list(unit.source_indices),
+            "start": round(unit.part.start, 3), "end": round(unit.part.end, 3),
+            "speech_text": unit.part.speech_text,
+            "duplicate_removed": unit.duplicate_removed,
+        } for unit in units])
     # Early structural validation: reject invalid source timestamps before
     # spending hours on inference. Dummy durations test only intervals.
     plan_dubbing_timeline(

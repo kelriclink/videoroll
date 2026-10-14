@@ -68,6 +68,7 @@ def create_dubbing_job(
     cosy_mode: str = "cross_lingual",
     cosy_speed: float = 1.0,
     debug_timing: bool = False,
+    auto_group_speech: bool = True,
 ) -> DubbingJob:
     """Create a manual dubbing job from translated subtitles and raw or P1 video."""
     existing = db.query(DubbingJob).filter(
@@ -120,7 +121,8 @@ def create_dubbing_job(
                                 mix_mode=mix_mode, model=model_path,
                                 cosy_speed=cosy_speed, cosy_mode=cosy_mode,
                                 profile_id=profile_id, profile_sha256=profile_sha,
-                                debug_timing=debug_timing)
+                                debug_timing=debug_timing,
+                                auto_group_speech=auto_group_speech)
     # Cache separates different installed model revisions even if the user
     # keeps the same user-facing model name.
     import hashlib
@@ -219,11 +221,14 @@ def execute_dubbing_job(
         raw = json.loads(segments.read_text(encoding="utf-8"))
         speech_overrides = request.get("speech_overrides") or {}
         spoken = spoken_segments_from_json(raw, voice=voice, speech_overrides=speech_overrides)
+        from videoroll.apps.dubbing.speech_units import build_speech_units
+        cache_spoken = [u.part for u in build_speech_units(spoken,
+            enabled=bool(quality.get("auto_group_speech", False)))]
         cache_dir = workspace / "segments"
         cache_dir.mkdir(parents=True, exist_ok=True)
         # A resumed task can run on another machine, provided FileStore uses
         # the same shared filesystem. Repopulate cache from persisted assets.
-        for part in spoken:
+        for part in cache_spoken:
             key = segment_cache_key(part, model_path, quality=cache_quality)
             cached_key = f"dub/{task_id}/tts/{key}.wav"
             cached = store.path_for(cached_key, require_exists=False)
@@ -306,6 +311,14 @@ def execute_dubbing_job(
                 }
                 audit_db.commit()
 
+        def save_speech_units(groups: list[dict]) -> None:
+            with session_factory() as status_db:
+                item=status_db.get(DubbingJob,job_id)
+                if item is None or item.lease_owner != owner:
+                    raise DubbingInterrupted("lease_lost")
+                item.output_json={**dict(item.output_json or {}),"speech_units":groups}
+                status_db.commit()
+
         result = generate_dubbed_media(
             video, segments, workspace, factory,
             voice=voice, ffmpeg=ffmpeg, ffprobe=ffprobe,
@@ -318,6 +331,7 @@ def execute_dubbing_job(
             batch_size=int(quality.get("batch_size") or 1),
             on_performance=performance_update,
             on_timing_adjustment=record_timing_adjustments,
+            on_speech_units=save_speech_units,
             preview_only=bool(request.get("preview_only")),
             mix_mode=str(quality.get("mix_mode") or (
                 "original_low" if request.get("retain_original_audio") else "replace")),

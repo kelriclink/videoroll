@@ -12,6 +12,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from videoroll.apps.dubbing.pipeline import segment_cache_key, spoken_segments_from_json
+from videoroll.apps.dubbing.speech_units import build_speech_units
 from videoroll.apps.orchestrator_api.dependencies import get_db, get_store
 from videoroll.db.models import DubbingJob
 from videoroll.storage.filesystem import FileStore
@@ -63,6 +64,8 @@ def list_dubbing_segments(
     model = str(job.request_json.get("model_path") or "")
     quality = (job.request_json.get("quality") or {}) if job.request_json.get("cache_schema") == 2 else None
     successful = dict((job.output_json or {}).get("segments") or {})
+    units = build_speech_units(segments, enabled=bool((quality or {}).get("auto_group_speech", False)))
+    membership = {index: (unit.part, unit.source_indices) for unit in units for index in unit.source_indices}
     overrides = job.request_json.get("speech_overrides") or {}
     return {
         "total": len(segments), "offset": offset,
@@ -71,7 +74,11 @@ def list_dubbing_segments(
                 "index": item.index, "start": item.start, "end": item.end,
                 "subtitle_text": item.subtitle_text, "speech_text": item.speech_text,
                 "overridden": str(item.index) in overrides,
-                "has_audio": segment_cache_key(item, model, quality=quality) in successful,
+                "has_audio": (item.index == membership[item.index][0].index and
+                              segment_cache_key(membership[item.index][0],model,quality=quality) in successful),
+                "speech_unit_start": membership[item.index][0].index,
+                "speech_unit_indices": list(membership[item.index][1]),
+                "generated_speech_text": membership[item.index][0].speech_text if item.index == membership[item.index][0].index else None,
             }
             for item in segments[offset:offset + limit]
         ],
@@ -167,7 +174,11 @@ def preview_dubbing_segment(
         raise HTTPException(404, "dubbing segment not found")
     model = str(job.request_json.get("model_path") or "")
     quality = (job.request_json.get("quality") or {}) if job.request_json.get("cache_schema") == 2 else None
-    key = segment_cache_key(segments[index - 1], model, quality=quality)
+    units=build_speech_units(segments, enabled=bool((quality or {}).get("auto_group_speech", False)))
+    leader=next((unit.part for unit in units if index in unit.source_indices),None)
+    if leader is None:
+        raise HTTPException(404,"speech unit not found")
+    key = segment_cache_key(leader, model, quality=quality)
     saved = str((job.output_json or {}).get("segments", {}).get(key) or "")
     if not saved:
         # Previously generated clips remain independently cached. Only grant

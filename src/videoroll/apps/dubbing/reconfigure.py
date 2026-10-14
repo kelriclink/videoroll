@@ -57,7 +57,8 @@ def reconfigure_dubbing(db: Session, *, task_id: uuid.UUID, job_id: uuid.UUID,
     quality=normalize_quality(instruct=values['instruct'],temperature=values['temperature'],
         top_p=values['top_p'],batch_size=values['batch_size'],mix_mode=values['mix_mode'],
         model=model,cosy_speed=values['cosy_speed'],cosy_mode=values['cosy_mode'],
-        profile_id=profile_id,profile_sha256=profile_sha,debug_timing=values['debug_timing'])
+        profile_id=profile_id,profile_sha256=profile_sha,debug_timing=values['debug_timing'],
+        auto_group_speech=values.get('auto_group_speech',True))
     if values['mix_mode']=='background_only':
         from videoroll.apps.dubbing.separation import available
         if not available():raise ValueError('background separation is unavailable')
@@ -76,7 +77,7 @@ def reconfigure_dubbing(db: Session, *, task_id: uuid.UUID, job_id: uuid.UUID,
     reset_audio=(model!=old.get('model_path') or voice!=old.get('voice') or regenerate or
                  any(quality.get(k)!=old_quality.get(k) for k in (
                      'instruct','temperature','top_p','cosy_mode','cosy_speed',
-                     'profile_id','profile_sha256','_model_revision')))
+                     'profile_id','profile_sha256','_model_revision','auto_group_speech')))
     old.update({'model_path':model,'voice':voice,'reference_profile_id':profile_id or None,
                 'preview_only':bool(values['preview_only']),
                 'retain_original_audio':values['mix_mode']=='original_low',
