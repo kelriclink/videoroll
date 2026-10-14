@@ -20,9 +20,14 @@ def source_repo() -> Path:
 
 
 def runtime_ready() -> bool:
-    return runtime_python().is_file() and (runtime_python().parent.parent / '.runtime-ready').is_file() \
-        and (source_repo() / 'cosyvoice/cli/cosyvoice.py').is_file() \
-        and (source_repo() / 'third_party/Matcha-TTS').is_dir()
+    # Package installation alone does not prove an SM7.0 V100 can generate
+    # valid audio in BOTH Base and RL modes. Operators add this marker only
+    # after a real two-variant WAV smoke test (finite samples, non-silence).
+    return (runtime_python().is_file()
+            and (runtime_python().parent.parent / '.runtime-ready').is_file()
+            and (runtime_python().parent.parent / '.v100-base-rl-validated').is_file()
+            and (source_repo() / 'cosyvoice/cli/cosyvoice.py').is_file()
+            and (source_repo() / 'third_party/Matcha-TTS').is_dir())
 
 
 class CosyVoice3Synthesizer:

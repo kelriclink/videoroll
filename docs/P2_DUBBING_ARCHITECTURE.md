@@ -251,3 +251,8 @@ VideoRoll 对所有 TTS 模型仅部署**一套统一内网 API 服务** `videor
 - 请求 WAV 输出路径限制在 `/DATA/videoroll/data/storage/work` 内。参考声音 ID/哈希逐次核验，模型从服务器受控目录加载。协作式暂停/取消在当前句后检查状态，服务故障由 Hatchet 的持久化任务接管重试，不承诺立即终止正在执行的单句 GPU 内核。
 - 由 Root 执行 `scripts/native/provision-dubbing-token.sh` 生成持久凭证，然后使用 systemd `enable --now videoroll@dubbing-service.service`。在启动新的统一服务后重启 `videoroll@dubbing-workflow-worker.service` 使其改用 HTTP API；部署不得停掉当前渲染 Worker。
 - 当模型包安装或 CosyVoice3 V100 真实音质验收尚未完成时，推理服务可以先为 Qwen 提供生产能力；CosyVoice 选项展示但明确标记 `runtime_ready=false` 并禁止提交。
+
+
+### 上线开关（CosyVoice 3）
+
+`/opt/videoroll/venvs/cosyvoice3/.runtime-ready` 由依赖安装阶段生成，**仅表示依赖能够导入**，不得自动开放用户配音。只有在官方参考音频下，对 Base 和 RL **分别用 V100 FP32 生成有效 24kHz、非静音 WAV**，且校验音量、音频时长及无 NaN 后，管理员才能创建 `/opt/videoroll/venvs/cosyvoice3/.v100-base-rl-validated`，此时 `runtime_ready()` 才返回 True，前端才启用该模型。未经真实测试不得创建这个文件。

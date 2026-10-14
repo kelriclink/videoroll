@@ -88,3 +88,21 @@ def test_isolated_runtime_requirement_can_be_detected(tmp_path,monkeypatch):
     with pytest.raises(RuntimeError,match='not installed'):
         CosyVoice3Synthesizer(model_path='cosyvoice3:base',model_dir=tmp_path,
                               reference=tmp_path/'missing.wav')
+
+
+def test_cosy_runtime_rejects_unverified_gpu_inference(tmp_path, monkeypatch):
+    from videoroll.apps.dubbing.cosyvoice3_adapter import runtime_ready
+    venv = tmp_path / 'venv'
+    py = venv / 'bin/python'
+    py.parent.mkdir(parents=True)
+    py.write_text('fake executable')
+    (venv / '.runtime-ready').write_text('deps installed')
+    repo = tmp_path / 'src'
+    (repo / 'cosyvoice/cli').mkdir(parents=True)
+    (repo / 'cosyvoice/cli/cosyvoice.py').write_text('module')
+    (repo / 'third_party/Matcha-TTS').mkdir(parents=True)
+    monkeypatch.setenv('COSYVOICE3_PYTHON', str(py))
+    monkeypatch.setenv('COSYVOICE3_REPO', str(repo))
+    assert runtime_ready() is False
+    (venv / '.v100-base-rl-validated').write_text('both variants tested')
+    assert runtime_ready() is True
