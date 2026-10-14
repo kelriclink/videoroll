@@ -481,7 +481,7 @@ export function TaskDetailDubbing({
                   {job.progress}% · {job.request.voice ?? "Vivian"} ·
                   已缓存 {Object.keys(job.output.segments ?? {}).length}/{job.output.segments_total ?? "?"} 段
                 </div>
-                {job.output.timing_issue ? <p className="mt-2 text-amber-700">第 {job.output.timing_issue.segment_index} 句超时：需要 {job.output.timing_issue.required_speed.toFixed(2)}× 语速。请编辑口播文案，再重试。</p> : null}
+                {job.output.timing_issue ? <p className="mt-2 text-amber-700">第 {job.output.timing_issue.segment_index} 句超时：需要 {job.output.timing_issue.required_speed.toFixed(2)}× 语速。{job.status === "preview_ready" ? "试听音频已生成，可在下方「试听 / 编辑口播片段」播放；请精简口播并重新试听，通过时间轴检查后再正式生成。" : "请编辑口播文案，再重试。"}</p> : null}
                 {job.output.performance ? <p className="mt-1 text-xs text-slate-500">已测推理 {job.output.performance.wall_seconds.toFixed(1)} 秒；生成音频 {job.output.performance.audio_seconds.toFixed(1)} 秒；最近批次 {job.output.performance.last_batch_size} 句</p> : null}
                 {job.error_message ? <div className="mt-2 break-words text-xs text-rose-700">{job.error_message}</div> : null}
                 <div className="mt-2 flex flex-wrap gap-2">
@@ -491,7 +491,7 @@ export function TaskDetailDubbing({
                     <button type="button" className="rounded border px-2 py-1 text-xs"
                       onClick={() => void refreshAssets()}>刷新成品资产</button>
                   ) : null}
-                  {job.status === "preview_ready" && !submitting ? (
+                  {job.status === "preview_ready" && !job.output.timing_issue && !submitting ? (
                     <button type="button" className="rounded bg-emerald-700 px-3 py-1 text-xs text-white"
                       onClick={() => void confirmPreview(job.id)}>确认试听，正式生成剩余片段</button>
                   ) : null}

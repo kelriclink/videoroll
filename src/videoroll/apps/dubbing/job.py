@@ -360,11 +360,19 @@ def execute_dubbing_job(
         finally:
             final_db.close()
     except (DubbingInterrupted, SpeechTooLong) as error:
+        # Preview is a listening/voice-quality gate, not a final alignment
+        # acceptance test. A successfully cached first WAV must be playable
+        # even when it is too long for its target slot. Still flag the issue
+        # and prevent final generation until the user shortens that script.
+        result_status = error.status if isinstance(error, DubbingInterrupted) else "needs_review"
         with session_factory() as state_db:
             item = state_db.get(DubbingJob, job_id)
             if item is not None and item.lease_owner == owner:
                 if isinstance(error, SpeechTooLong):
-                    item.status = "needs_review"
+                    cached = dict((item.output_json or {}).get("segments") or {})
+                    if bool(request.get("preview_only")) and error.index == 1 and cached:
+                        result_status = "preview_ready"
+                    item.status = result_status
                     item.error_message = str(error)[:2000]
                     item.output_json = {**dict(item.output_json or {}), "timing_issue": {
                         "segment_index": error.index, "duration": error.duration,
@@ -376,7 +384,7 @@ def execute_dubbing_job(
                 item.lease_owner = None
                 item.lease_until = None
                 state_db.commit()
-        return {"status": "needs_review" if isinstance(error, SpeechTooLong) else error.status}
+        return {"status": result_status}
     except Exception as error:
         error_db = session_factory()
         try:

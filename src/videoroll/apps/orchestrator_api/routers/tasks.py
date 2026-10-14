@@ -290,6 +290,8 @@ def confirm_dubbing_preview(
         raise HTTPException(404, "dubbing job not found")
     if job.status != "preview_ready":
         raise HTTPException(409, "only a completed preview can be confirmed")
+    if (job.output_json or {}).get("timing_issue"):
+        raise HTTPException(409, "preview speech exceeds its video slot; shorten the spoken script and preview again")
     request = dict(job.request_json or {})
     request["preview_only"] = False
     job.request_json = request

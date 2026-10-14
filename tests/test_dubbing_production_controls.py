@@ -348,3 +348,44 @@ def test_preview_passes_when_last_subtitle_extends_past_video_end(tmp_path):
     assert fixes and fixes[0]['segment_index']==len(source)
     assert fixes[0]['original_end']==7.1
     assert json.loads(subtitles.read_text(encoding='utf-8'))[-1]['end']==7.1
+
+
+def test_overlong_first_preview_keeps_audio_and_requires_edit_before_full_generation(tmp_path):
+    from videoroll.apps.dubbing.job import execute_dubbing_job
+    factory, store, _, job_id = _prepare_job_media(tmp_path)
+    # Valid TTS sound with a 5s duration cannot fit the first subtitle slot.
+    tts = RecordingTTS(5.0)
+    outcome = execute_dubbing_job(job_id,session_factory=factory,store=store,
+        work_dir=tmp_path/'scratch',synthesizer_factory=lambda model,voice:tts)
+    assert outcome == {'status':'preview_ready'}
+    with factory() as db:
+        row=db.get(DubbingJob,job_id)
+        assert row.status=='preview_ready'
+        assert row.request_json['preview_only'] is True
+        assert row.output_json['timing_issue']['segment_index']==1
+        assert row.output_json['timing_issue']['required_speed'] > 1.25
+        assert len(row.output_json['segments'])==1
+        wav=store.path_for(next(iter(row.output_json['segments'].values())))
+        assert wav.is_file() and wav.stat().st_size>44
+    assert tts.calls==1
+
+
+def test_preview_with_timing_issue_cannot_start_full_job_from_api(tmp_path):
+    from fastapi import HTTPException
+    from videoroll.apps.orchestrator_api.routers.tasks import confirm_dubbing_preview
+    from videoroll.db.models import DubbingJob
+    factory, _, task_id, job_id = _prepare_job_media(tmp_path)
+    with factory() as db:
+        row=db.get(DubbingJob,job_id)
+        row.status='preview_ready'
+        row.output_json={'timing_issue':{'segment_index':1,'required_speed':1.41},
+                         'segments':{'sample':'stored.wav'}}
+        db.commit()
+    with patch('videoroll.apps.dubbing.worker_status.worker_status',return_value={'available':True}):
+        with factory() as db, pytest.raises(HTTPException) as caught:
+            confirm_dubbing_preview(task_id,job_id,settings=None,db=db)
+        assert caught.value.status_code == 409
+    with factory() as db:
+        job=db.get(DubbingJob,job_id)
+        assert job.status=='preview_ready'
+        assert job.request_json['preview_only'] is True
