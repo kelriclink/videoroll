@@ -3,6 +3,7 @@ import { Link } from "react-router-dom";
 import { fetchJson } from "../../../lib/http";
 import { orchestratorUrl } from "../../../lib/urls";
 import { tasksApi } from "../../../api/tasks";
+import { createYouDubOperationKey } from "../../../lib/dubbingOperationKey";
 import type { Asset, DubbingJob, SubtitleJob, Task } from "../../../lib/types";
 
 type NativeControl = {
@@ -83,7 +84,7 @@ export function TaskDetailDubbing({
       const job = await tasksApi.startDubbing(taskId, {
         subtitle_job_id: selectedSubtitle,
         subtitle_video_key: rawVideos[0].storage_key,
-        operation_key: `youdub-native:${crypto.randomUUID()}`,
+        operation_key: createYouDubOperationKey(),
         model_path: "youdub:voxcpm2",
         voice: "reference", retain_original_audio: false,
         preview_only: false,
