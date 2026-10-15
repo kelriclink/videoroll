@@ -717,7 +717,9 @@ def auto_publish_task(
     publish_payload = dict(action.get("publish_payload") or {})
     publish_payload["fresh_batch"] = True
     if dubbing_job_id is not None:
-        from videoroll.apps.bilibili_publisher.auto_dub_p2 import p2_title
+        from videoroll.apps.bilibili_publisher.auto_dub_p2 import (
+            dual_part_archive_title, p2_title,
+        )
         from videoroll.db.models import DubbingJob
 
         dubbed = db.get(DubbingJob, dubbing_job_id)
@@ -742,6 +744,16 @@ def auto_publish_task(
         main_title = str(as_dict(source_meta).get("title") or "").strip()
         if not main_title:
             raise HTTPException(409, detail="cannot determine P1 part title for dual-part publish")
+        # Update ONLY the Bilibili archive title. P1/P2 part titles retain
+        # their independent labels, and other platforms keep their own meta.
+        publish_payload["platform_meta"] = {
+            **dict(publish_payload.get("platform_meta") or {}),
+            "bilibili": {
+                **dict(as_dict(source_meta)),
+                "title": dual_part_archive_title(
+                    main_title, request.get("auto_p1_prefix", "【熟肉】")),
+            },
+        }
         publish_payload["video_key"] = final_asset.storage_key
         publish_payload["video_parts"] = [
             {"video": {"type": "storage", "key": final_asset.storage_key},

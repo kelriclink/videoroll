@@ -808,8 +808,8 @@ export default function SettingsAutoPage() {
                 disabled={!autoDubP2} maxLength={30} />
             </label>
             <p className="text-xs text-slate-600">
-              仅作用于自动模式的 B站投稿，默认关闭。P1 的标题、封面、简介和现有投稿流程不变；
-              先完成渲染和配音，再一次创建同一 BV 的 P1+P2；配音失败则暂停工作流、不提前投稿 P1。配音进度可在处理流程和投稿页查看。
+              仅作用于自动模式的 B站投稿，默认关闭。开启后稿件总标题使用【熟肉&中配】前缀；
+              P1/P2 分 P 标题保留各自的前缀，封面和简介不变。先完成渲染与配音，再一次投稿双分 P；配音失败则暂停，不提前投稿 P1。
             </p>
           </div>
           <div className="mt-2 text-xs text-slate-500">

@@ -55,12 +55,24 @@ def test_publishing_p1_p2_as_one_archive_submission() -> None:
     payload = send.call_args.args[1]
     assert response["publish_batch_id"] == "batch-one"
     assert payload.video_key == "render/p1.mp4"
+    assert payload.platform_meta["bilibili"]["title"] == "【熟肉&中配】火箭引擎原理"
+    assert payload.platform_meta["bilibili"]["desc"] == "原简介"
     assert len(payload.video_parts) == 2
     assert payload.video_parts[0]["title"] == "【熟肉】火箭引擎原理"
     assert payload.video_parts[0]["video"]["key"] == "render/p1.mp4"
     assert payload.video_parts[1]["title"] == "【中配】火箭引擎原理"
     assert payload.video_parts[1]["video"]["key"] == "dubbing/p2.mp4"
     assert payload.fresh_batch
+
+
+def test_combined_archive_prefix_is_idempotent_and_respects_title_limit() -> None:
+    from videoroll.apps.bilibili_publisher.auto_dub_p2 import dual_part_archive_title
+
+    assert dual_part_archive_title("【熟肉】火箭引擎", "【熟肉】") == "【熟肉&中配】火箭引擎"
+    assert dual_part_archive_title("【熟肉&中配】火箭引擎", "【熟肉】") == "【熟肉&中配】火箭引擎"
+    assert dual_part_archive_title("【其他前缀】火箭引擎", "【其他前缀】") == "【熟肉&中配】火箭引擎"
+    assert dual_part_archive_title("【熟肉】" + "火" * 100, "【熟肉】").startswith("【熟肉&中配】")
+    assert len(dual_part_archive_title("【熟肉】" + "火" * 100, "【熟肉】")) <= 80
 
 
 def test_publishing_refuses_to_send_any_part_before_dubbing_is_complete() -> None:

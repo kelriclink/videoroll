@@ -31,6 +31,26 @@ TASK_NAME = "bilibili_publisher.auto_dub_p2"
 STORAGE_KEY = "auto_dub_p2"
 
 
+def dual_part_archive_title(original: str, original_prefix: str) -> str:
+    """Combined title for the Bilibili *archive*, not P1/P2 part titles.
+
+    Only the auto dubbing branch calls this helper. Preserve the remaining
+    title, including its uploader suffix, and avoid repeated prefixes.
+    """
+    from videoroll.apps.publish_meta_rules import clamp_text
+
+    original = str(original or "").strip()
+    prefix = "【熟肉&中配】"
+    if original.startswith(prefix):
+        return clamp_text(original, 80)
+    old = str(original_prefix or "").strip()
+    if old and original.startswith(old):
+        original = original[len(old):].lstrip()
+    elif original.startswith("【熟肉】"):
+        original = original[len("【熟肉】"):].lstrip()
+    return clamp_text(prefix + original, 80)
+
+
 def p2_title(original: str, original_prefix: str, dubbed_prefix: str) -> str:
     """Replace only the auto-publish marker, leaving the rest of P1 title intact."""
     original = str(original or "").strip()
