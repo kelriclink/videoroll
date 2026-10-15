@@ -57,6 +57,8 @@ def test_settings_persist_and_validate_parallel_connections():
 
 
 def test_format_selector_only_chooses_aria_for_big_http_objects():
+    if not register_parallel_downloader():
+        pytest.skip("aria2c not installed on this test runner")
     settings = Settings()
     opts = yd.build_ydl_opts(settings, for_download=True)
     assert opts["videoroll_parallel_connections"] == 8
