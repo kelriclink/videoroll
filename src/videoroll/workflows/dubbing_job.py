@@ -20,39 +20,18 @@ class DubbingJobWorkflowInput(BaseModel):
 
 def _run_dubbing_job(job_id: str) -> dict[str, str]:
     from videoroll.apps.dubbing.job import execute_dubbing_job
-    from videoroll.apps.dubbing.service_client import RemoteSpeechSynthesizer
     from videoroll.config import get_subtitle_settings
     from videoroll.db.migrate import initialize_database
     from videoroll.db.session import get_sessionmaker
-    from videoroll.db.models import DubbingJob
     from videoroll.storage.filesystem import FileStore
 
     settings = get_subtitle_settings()
     initialize_database(settings.database_url)
     factory = get_sessionmaker(settings.database_url)
-    with factory() as db:
-        current = db.get(DubbingJob, uuid.UUID(job_id))
-        if current is None:
-            raise ValueError("dubbing job does not exist")
-        quality = dict((current.request_json or {}).get("quality") or {})
-
-    adapters: list[RemoteSpeechSynthesizer] = []
-    def make_synthesizer(model: str, voice: str) -> RemoteSpeechSynthesizer:
-        engine = RemoteSpeechSynthesizer(model_path=model, voice=voice, quality=quality)
-        adapters.append(engine)
-        return engine
-    try:
-        return execute_dubbing_job(
-            uuid.UUID(job_id),
-            session_factory=factory,
-            store=FileStore(settings),
-            work_dir=Path(settings.work_dir),
-            synthesizer_factory=make_synthesizer,
-            ffmpeg=settings.ffmpeg_path,
-        )
-    finally:
-        for adapter in adapters:
-            adapter.close()
+    return execute_dubbing_job(
+        uuid.UUID(job_id), session_factory=factory,
+        store=FileStore(settings), work_dir=Path(settings.work_dir),
+    )
 
 
 def register_dubbing_job_task(hatchet: Any) -> Any:

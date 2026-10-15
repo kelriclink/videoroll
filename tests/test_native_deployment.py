@@ -37,12 +37,11 @@ def test_native_release_restarts_optional_dubbing_roles() -> None:
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     worker = 'videoroll@dubbing-workflow-worker.service'
-    service = 'videoroll@dubbing-service.service'
     assert worker in module.ROLE_UNITS
-    assert service in module.ROLE_UNITS
+    assert 'videoroll@dubbing-service.service' not in module.ROLE_UNITS
     assert worker in module.WORKFLOW_UNITS
-    assert {worker, service}.issubset(set(module.changed_services(
-        ['src/videoroll/apps/dubbing/timing.py'])))
+    assert worker in module.changed_services(
+        ['src/videoroll/apps/dubbing/youdub_job.py'])
     assert worker in module.changed_services(['src/videoroll/workflows/dubbing_job.py'])
 
 

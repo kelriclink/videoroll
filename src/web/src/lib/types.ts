@@ -82,6 +82,7 @@ export type DubbingJob = {
     subtitle_video_key?: string;
     duration?: number;
     segments_total?: number;
+    youdub?: { task_id: string; stage: string; stages: Array<{ name: string; status: string; progress?: number }> };
     segments?: Record<string, string>;
     speech_units?: Array<{ index: number; source_indices: number[]; start: number; end: number;
       speech_text: string; slot_seconds?: number; estimated_audio_seconds?: number; estimated_overlong?: boolean }>;

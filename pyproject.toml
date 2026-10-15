@@ -30,15 +30,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Audio integration uses the upstream YouDub WebUI mixer verbatim. Keep its
-# import/runtime dependencies isolated in the dubbing worker environment.
-dubbing = [
-  "audiostretchy==1.3.5",
-  "pydub==0.25.1",
-  "librosa==0.11.0",
-  "soundfile==0.13.1",
-  "numpy>=2.4,<3",
-]
+# YouDub VoxCPM2 and Demucs run in their own isolated vendor runtime.
+# The VideoRoll Hatchet worker only requires the core orchestration packages.
+dubbing = []
 subtitle = [
   "huggingface-hub==1.21.0",
   "sentence-transformers==6.0.1",

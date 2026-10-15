@@ -4,7 +4,7 @@ import { TaskDetailMedia } from "./components/TaskDetailMedia";
 import { TaskDetailOverview } from "./components/TaskDetailOverview";
 import { TaskDetailPublish } from "./components/TaskDetailPublish";
 import { TaskDetailSubtitle } from "./components/TaskDetailSubtitle";
-import { TaskDetailDubbing } from "./components/TaskDetailDubbing";
+import { TaskDetailDubbing } from "./components/TaskDetailYouDub";
 import type { TaskDetailController } from "./useTaskDetailController";
 
 export function TaskDetailView({ controller }: { controller: TaskDetailController }) {

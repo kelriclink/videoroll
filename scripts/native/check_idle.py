@@ -12,7 +12,9 @@ CHECKS = {
     "render_executions": "state IN ('claimed', 'running')",
     "publish_jobs": "state::text = 'submitting' OR upload_active",
     "pipeline_runs": "state IN ('submitting', 'submitted', 'running')",
-    "outbox_events": "status IN ('pending', 'processing')",
+    # Future pending cleanup events are scheduled, not active work.
+    # Processing events and due pending events still block code switches.
+    "outbox_events": "status = 'processing' OR (status = 'pending' AND available_at <= now())",
     "operation_inbox": "status IN ('pending', 'running', 'processing')",
 }
 

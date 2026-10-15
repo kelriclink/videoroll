@@ -27,7 +27,6 @@ ROLE_UNITS = (
     "videoroll@workflow-worker.service",
     "videoroll@subtitle-workflow-worker.service",
     "videoroll@dubbing-workflow-worker.service",
-    "videoroll@dubbing-service.service",
     "videoroll@subtitle-control-worker.service",
     "videoroll@publish-worker.service",
     "videoroll@outbox-dispatcher.service",
@@ -307,8 +306,7 @@ def changed_services(paths: list[str]) -> tuple[str, ...]:
         elif path.startswith("src/videoroll/workflows/"):
             restarts.update(WORKFLOW_UNITS)
         elif path.startswith("src/videoroll/apps/dubbing/"):
-            restarts.update(("videoroll@dubbing-workflow-worker.service",
-                             "videoroll@dubbing-service.service"))
+            restarts.add("videoroll@dubbing-workflow-worker.service")
         elif path.startswith("src/videoroll/apps/orchestrator_api/"):
             restarts.add("videoroll@orchestrator.service")
         elif path.startswith("src/videoroll/apps/egress_gateway/"):

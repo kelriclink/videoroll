@@ -2,7 +2,7 @@
 from __future__ import annotations
 import uuid
 from sqlalchemy.orm import Session
-from videoroll.apps.dubbing.quality import RUNNING
+RUNNING = frozenset(('preparing', 'synthesizing', 'aligning', 'mixing'))
 from videoroll.db.models import DubbingJob
 
 class DubbingInterrupted(RuntimeError):

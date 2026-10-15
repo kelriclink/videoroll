@@ -1,1 +1,1 @@
-"""Timing and audio preparation primitives for optional Chinese dubbing."""
+"""Native YouDub VoxCPM2 lifecycle and task orchestration only."""

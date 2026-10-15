@@ -20,7 +20,7 @@ const SettingsApiPage = lazy(() => import("./pages/SettingsApiPage"));
 const SettingsTranslatePage = lazy(() => import("./pages/SettingsTranslatePage"));
 const SettingsPublishPage = lazy(() => import("./pages/SettingsPublishPage"));
 const SettingsAutoPage = lazy(() => import("./pages/SettingsAutoPage"));
-const SettingsDubbingPage = lazy(() => import("./pages/SettingsDubbingPage"));
+const SettingsDubbingPage = lazy(() => import("./pages/SettingsYouDubPage"));
 const SettingsReviewPage = lazy(() => import("./pages/SettingsReviewPage"));
 const PlayoutPage = lazy(() => import("./pages/PlayoutPage"));
 const WorkflowCenterPage = lazy(() => import("./pages/WorkflowCenterPage"));
