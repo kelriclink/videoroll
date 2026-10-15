@@ -289,6 +289,9 @@ def cleanup_terminal_task_resources(
     if not _try_acquire_resource_cleanup_lock(db, owner=owner, ttl_seconds=STORAGE_RESOURCE_CLEANUP_LOCK_TTL_SECONDS):
         return None
     try:
+        # Reuse one resolved timestamp for retention and dubbing-in-flight protection.
+        # When callers omit `now`, using None in a timedelta subtraction breaks cleanup.
+        now = now or utcnow()
         task_filter = (
             _all_terminal_task_filter()
             if cleanup_all_terminal

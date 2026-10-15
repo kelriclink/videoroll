@@ -154,6 +154,7 @@ def translate_subtitles_index(
     if len(out) > len(segments):
         raise ValueError("Index translation checkpoint longer than source")
     limit = max(4000, min(100000, int(settings.get("index_context_chars") or 48000)))
+    effective_context_limit = limit
     width = max(1, min(50, int(batch_size or 12)))
     source_lang = "视频原始语言"
     glossary = str(settings.get("index_glossary") or "").strip()[:4000]
@@ -161,31 +162,55 @@ def translate_subtitles_index(
     domain = str(settings.get("index_domain") or "视频字幕").strip()[:90]
 
     def translate_slice(first: int, last: int) -> list[Segment]:
-        context, is_complete = _bounded_context(segments, start=first, limit=limit)
+        nonlocal effective_context_limit
+        context, is_complete = _bounded_context(segments, start=first, limit=effective_context_limit)
         if report and not is_complete:
-            report(f"index context: transcript exceeds {limit} chars; using head/local/tail context for {first+1}-{last}")
+            report(
+                f"index context: full source exceeds effective {effective_context_limit} chars; "
+                f"using head/neighbor/tail context for {first + 1}-{last}"
+            )
         blocks = [{"idx": i+1, "text": segments[i].text} for i in range(first, last)]
         rules = [
-            f"请将以下{source_lang}{domain}翻译成{target_lang}，并严格遵守约束。",
-            "【硬性要求】仅翻译待翻译 blocks 的 text，保持 idx 与条数及顺序完全相同。",
-            "【硬性要求】只返回 JSON 对象 {\"translations\": [{\"idx\": 数字, \"text\": \"译文\"}]}，不得添加额外条目。",
-            "【硬性要求】严格保留技术符号、单位、专有名词、数字和代码；不允许凭参考材料增补原文不存在的内容。",
-            f"【软性要求】目标风格：{style}；在准确基础上尽量适合字幕阅读和自然中文口播。",
-            "【软性要求】下方完整视频原文只用于理解话题、前后文、代词和术语；绝对不能把参考文字当作待翻译字幕。",
+            f"请将{source_lang}的{domain}翻译成{target_lang}。",
+            "【硬性要求】仅翻译随后用户消息里的字幕 JSON 数组中的 text，逐条保留 idx 与顺序；不得漏条。",
+            '【硬性要求】只输出 JSON 对象 {"translations":[{"idx":数字,"text":"译文"}]}。不解释、不输出其它内容。',
+            "【硬性要求】保留技术单位、数字、代码和专有名词，不要编造原文没有的事实。",
+            f"【软性要求】翻译风格为{style}，保证自然准确并适合字幕。",
+            "【软性上下文】下方视频原文仅用于理解话题、指代、术语和后续情节。"
+            "它不是待翻译内容，也不是输出内容；禁止在字幕译文中加入背景原文的信息。",
         ]
         if glossary:
-            rules.append("【硬性要求】固定术语对照：" + glossary)
+            rules.append("【硬性要求】术语表：" + glossary)
         if extra:
             rules.append("【软性要求】" + extra)
-        req = "\n".join(rules) + "\n\n【整段视频原文（软性参考）】\n" + context
-        req += "\n\n【待翻译字幕块（只翻译这里）】\n" + json.dumps(blocks, ensure_ascii=False)
-        # One failed/malformed group is split rather than silently losing subtitle lines.
+        system_message = "\n".join(rules) + "\n\n【视频字幕上下文（仅参考）】\n" + context
+        user_message = (
+            f"【只翻译下面这 {last-first} 条字幕，必须返回相同数量的 idx】\n"
+            + json.dumps(blocks, ensure_ascii=False)
+        )
         try:
-            raw = _call([{"role": "user", "content": req}], settings, expect_json=True)
+            call_cfg = dict(settings)
+            # A long prompt with repeated retries can overload the free gateway.
+            # After the first oversized attempt, use a stable smaller local context.
+            if len(system_message) > 9000:
+                call_cfg["default_max_retries"] = 0
+            raw = _call([
+                {"role": "system", "content": system_message},
+                {"role": "user", "content": user_message},
+            ], call_cfg, expect_json=True)
             data = json.loads(raw)
+            if not isinstance(data, dict):
+                raise ValueError("expected JSON object")
             rows = data.get("translations")
             if not isinstance(rows, list):
-                raise ValueError("missing translations list")
+                # Index specializes in translation and sometimes emits one {"idx","text"}
+                # even when asked for a translations array.
+                if "idx" in data and "text" in data:
+                    rows = [data]
+                elif last-first == 1 and isinstance(data.get("translation"), str):
+                    rows = [{"idx": first + 1, "text": data["translation"]}]
+                else:
+                    raise ValueError("missing translations list")
             mapping: dict[int, str] = {}
             for row in rows:
                 if not isinstance(row, dict):
@@ -199,15 +224,46 @@ def translate_subtitles_index(
                     raise ValueError("duplicate idx")
                 if first < idx <= last and isinstance(text, str) and text.strip():
                     mapping[idx] = text.strip()
-            if set(mapping) != {i + 1 for i in range(first, last)}:
-                raise ValueError("translation index/line mismatch")
-            return [replace(segments[i], text=mapping[i+1], secondary_text=None) for i in range(first, last)]
+            expected = {i+1 for i in range(first, last)}
+            if not mapping:
+                raise ValueError("no valid translated subtitle indices")
+            if set(mapping) != expected:
+                if last-first == 1:
+                    raise ValueError("single line idx mismatch")
+                # Preserve every valid batch result and repair only missing lines,
+                # avoiding the previous recursive full-batch retranslations.
+                missing = expected - set(mapping)
+                if report:
+                    report(f"index translation: recovered {len(mapping)}/{len(expected)} lines; "
+                           f"retrying {len(missing)} missing lines")
+                if effective_context_limit > 6000:
+                    effective_context_limit = 6000
+                for idx in sorted(missing):
+                    correction = translate_slice(idx-1, idx)
+                    mapping[idx] = correction[0].text
+            return [replace(segments[i], text=mapping[i+1], secondary_text=None)
+                    for i in range(first, last)]
+        except (httpx.HTTPStatusError, httpx.TimeoutException, httpx.TransportError) as exc:
+            # Public gateway 504/timeout with long contexts: transparently lower
+            # the context budget instead of failing the user's whole video.
+            if effective_context_limit > 6000 and (
+                not isinstance(exc, httpx.HTTPStatusError)
+                or exc.response.status_code in {408, 413, 422, 429, 500, 502, 503, 504}
+            ):
+                effective_context_limit = 6000
+                if report:
+                    report(f"index translation: gateway rejected long context, retrying "
+                           f"{first+1}-{last} with shortened reference")
+                return translate_slice(first, last)
+            raise
         except (ValueError, json.JSONDecodeError) as exc:
-            if last - first <= 1:
+            if last-first <= 1:
                 raise RuntimeError(f"Index-Translate invalid translation at line {first+1}: {exc}") from exc
-            middle = (first + last) // 2
+            if effective_context_limit > 6000:
+                effective_context_limit = 6000
+            middle = (first+last)//2
             if report:
-                report(f"index translation: retrying malformed batch {first+1}-{last} as smaller groups")
+                report(f"index translation: malformed batch {first+1}-{last}; split and retry")
             return translate_slice(first, middle) + translate_slice(middle, last)
 
     if selective:

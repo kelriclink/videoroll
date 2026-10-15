@@ -23,12 +23,12 @@ def test_index_uses_full_video_context_but_only_translates_requested_blocks(monk
 
     def fake_call(messages, _settings, *, expect_json):
         assert expect_json
-        request = messages[0]["content"]
+        reference, request = messages[0]["content"], messages[1]["content"]
         calls.append(request)
-        assert all(f"[{i+1}] {item.text}" in request for i, item in enumerate(source))
-        assert "【软性要求】" in request and "【硬性要求】" in request
-        assert "PCB→印刷电路板" in request
-        items = json.loads(request.split("【待翻译字幕块（只翻译这里）】\n", 1)[1])
+        assert all(f"[{i+1}] {item.text}" in reference for i, item in enumerate(source))
+        assert "【软性要求】" in reference and "【硬性要求】" in reference
+        assert "PCB→印刷电路板" in reference
+        items = json.loads(request.split("\n", 1)[1])
         return json.dumps({"translations": [
             {"idx": row["idx"], "text": "中文-" + row["text"]} for row in items
         ]})
@@ -50,7 +50,7 @@ def test_bad_batch_splits_instead_of_silently_dropping_lines(monkeypatch, source
     observed = []
 
     def fake_call(messages, *_args, **kwargs):
-        rows = json.loads(messages[0]["content"].split("【待翻译字幕块（只翻译这里）】\n")[1])
+        rows = json.loads(messages[1]["content"].split("\n", 1)[1])
         observed.append(len(rows))
         if len(rows) > 1:
             return '{"translations": []}'
@@ -62,6 +62,22 @@ def test_bad_batch_splits_instead_of_silently_dropping_lines(monkeypatch, source
     )
     assert observed[0] == 3
     assert all(seg.text == "正确译文" for seg in got)
+
+
+def test_index_recovers_partial_rows_and_singleton_json(monkeypatch, source):
+    calls = []
+    def fake_call(messages, *_args, **_kwargs):
+        rows = json.loads(messages[1]["content"].split("\n", 1)[1])
+        calls.append([row["idx"] for row in rows])
+        if len(rows) > 1:
+            # The real public API can return a singleton instead of the requested array.
+            return json.dumps({"idx": rows[0]["idx"], "text": "译文" + str(rows[0]["idx"])})
+        return json.dumps({"idx": rows[0]["idx"], "text": "译文" + str(rows[0]["idx"])})
+    monkeypatch.setattr(index_translate, "_call", fake_call)
+    translated = index_translate.translate_subtitles_index(
+        source, target_lang="zh", style="口语自然", settings={}, batch_size=3)
+    assert [s.text for s in translated] == ["译文1","译文2","译文3"]
+    assert calls == [[1,2,3],[2],[3]]
 
 
 def test_index_rejects_nonmatching_single_line(monkeypatch, source):
@@ -83,7 +99,7 @@ def test_full_context_has_bounded_long_video_fallback(source):
 def test_selective_index_translates_only_selected_rows(monkeypatch, source):
     translated = [Segment(s.start, s.end, "已有译文") for s in source]
     def fake_call(messages, *_a, **_kw):
-        rows = json.loads(messages[0]["content"].split("【待翻译字幕块（只翻译这里）】\n")[1])
+        rows = json.loads(messages[1]["content"].split("\n", 1)[1])
         return json.dumps({"translations": [{"idx": rows[0]["idx"], "text": "修复译文"}]})
     monkeypatch.setattr(index_translate, "_call", fake_call)
     got = index_translate.translate_subtitles_index(
