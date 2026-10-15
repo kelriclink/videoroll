@@ -1062,14 +1062,8 @@ def _process_job_impl(self, job_id: str) -> dict[str, Any]:
         store.put_bytes(result_bytes, result_key, content_type="application/json")
         _ensure_publish_result_asset(db, task.id, result_key)
 
-        # P2 is optional. A SAVEPOINT isolates its scheduling errors from P1.
-        # On success the outbox intent commits in the same P1 transaction.
-        try:
-            with db.begin_nested():
-                from videoroll.apps.bilibili_publisher.auto_dub_p2 import schedule_after_p1
-                schedule_after_p1(db, job, task)
-        except Exception:
-            logger.exception("optional YouDub P2 could not be scheduled (job_id=%s)", job.id)
+        # P1/P2 are uploaded together in add_archive(videos=[P1, P2]).
+        # Never create a hidden post-publication P2 task on a successful P1.
         db.commit()
         try:
             enqueue_publish_batch_cleanup(db, celery_app, task.id, job.batch_id, needed=cleanup_enqueued) if job.batch_id else None

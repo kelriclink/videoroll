@@ -799,7 +799,7 @@ export default function SettingsAutoPage() {
           <div className="mt-4 rounded border border-sky-200 bg-sky-50 p-3 text-sm space-y-3">
             <label className="flex items-center gap-2">
               <input type="checkbox" checked={autoDubP2} onChange={(e) => setAutoDubP2(e.target.checked)} />
-              P1 投稿成功后，自动 YouDub 配音并追加 B站 P2
+              将 YouDub 配音加入自动处理流程，P1+P2 一次投稿到 B站
             </label>
             <label className="block">
               <span className="mb-1 block text-xs text-slate-600">配音 P2 标题前缀（仅改变 P2 分 P 标题）</span>
@@ -809,7 +809,7 @@ export default function SettingsAutoPage() {
             </label>
             <p className="text-xs text-slate-600">
               仅作用于自动模式的 B站投稿，默认关闭。P1 的标题、封面、简介和现有投稿流程不变；
-              生成失败时 P1 保持已发布，P2 失败单独记录，不会重复投稿 P1。
+              先完成渲染和配音，再一次创建同一 BV 的 P1+P2；配音失败则暂停工作流、不提前投稿 P1。配音进度可在处理流程和投稿页查看。
             </p>
           </div>
           <div className="mt-2 text-xs text-slate-500">

@@ -5,6 +5,7 @@ import { clampUploadProgress } from "../utils";
 export function TaskDetailPublish({ controller }: { controller: TaskDetailController }) {
   const {
     taskId,
+    dubbingJobs,
     publishJobs,
     publishBatches,
     setError,
@@ -68,6 +69,21 @@ export function TaskDetailPublish({ controller }: { controller: TaskDetailContro
         <div className="mt-2 text-xs text-slate-500">
           哔哩哔哩使用现有接口发布；抖音、小红书和快手由独立 SAU 无头浏览器服务发布。
         </div>
+        {(() => {
+          const job = dubbingJobs.find((item) => item.request.auto_p2_source === "video_pipeline");
+          if (!job) return null;
+          const done = job.status === "succeeded";
+          const failed = ["failed", "canceled", "paused"].includes(job.status);
+          const stage = job.output.youdub?.stage ?? "等待加载";
+          return <div className={`mt-3 rounded border p-3 text-sm ${failed ? "border-rose-200 bg-rose-50 text-rose-800" : "border-sky-200 bg-sky-50 text-sky-900"}`}>
+            <strong>{done ? "YouDub 配音完成，正在进入双分 P 投稿" : failed ? "自动 YouDub 配音未完成，尚未投稿" : "自动 YouDub 配音中 · 尚未提交 B站稿件"}</strong>
+            <div className="mt-1 text-xs">{job.progress}% · {stage} · 任务 {job.id.slice(0, 8)}</div>
+            {job.error_message ? <p className="mt-1 text-xs">{job.error_message}</p> : null}
+            <div className="mt-2 h-2 overflow-hidden rounded bg-sky-100">
+              <div className="h-full bg-sky-500" style={{ width: `${Math.min(100, Math.max(0, job.progress))}%` }}/>
+            </div>
+          </div>;
+        })()}
         {activeBilibiliUpload ? (
           <div className="mt-3 rounded border border-sky-200 bg-sky-50 p-3">
             <div className="flex items-center justify-between gap-3 text-sm text-sky-900">

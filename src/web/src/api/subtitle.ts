@@ -24,6 +24,8 @@ export type SubtitleAutoProfile = {
   translate_enable_summary: boolean;
   bilingual: boolean;
   auto_publish: boolean;
+  auto_dub_p2?: boolean;
+  auto_dub_p2_prefix?: string;
   publish_typeid_mode?: string | null;
   publish_title_prefix: string;
   publish_translate_title: boolean;

@@ -18,6 +18,7 @@ from videoroll.workflows.video_pipeline import (
     AutoYouTubeWorkflowInput,
     PUBLISH_FINISHED_EVENT,
     RENDER_FINISHED_EVENT,
+    DUBBING_FINISHED_EVENT,
     SubtitleJobWorkflowInput,
     register_subtitle_job_task,
     register_video_pipeline,
@@ -49,6 +50,12 @@ class RenderFinishedEventRequest(BaseModel):
     render_job_id: str
     status: Literal["succeeded", "failed"]
     execution_id: str | None = None
+    error: str | None = None
+
+
+class DubbingFinishedEventRequest(BaseModel):
+    dubbing_job_id: str
+    status: Literal["succeeded", "failed"]
     error: str | None = None
 
 
@@ -173,6 +180,15 @@ def create_app() -> FastAPI:
             RENDER_FINISHED_EVENT,
             payload.model_dump(),
             scope=payload.render_job_id,
+        )
+        return {"status": "accepted"}
+
+    @app.post("/events/dubbing-finished", dependencies=[Depends(_require_internal)])
+    async def push_dubbing_finished(payload: DubbingFinishedEventRequest) -> dict[str, str]:
+        await _hatchet().event.aio_push(
+            DUBBING_FINISHED_EVENT,
+            payload.model_dump(),
+            scope=payload.dubbing_job_id,
         )
         return {"status": "accepted"}
 

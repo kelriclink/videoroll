@@ -1,4 +1,7 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
+import { tasksApi } from "../../api/tasks";
+import { subtitleApi } from "../../api/subtitle";
+import type { DubbingJob } from "../../lib/types";
 import type { WorkflowStep, TaskDetailTab } from "./types";
 import { useTaskCore } from "./hooks/useTaskCore";
 import { useTaskControls } from "./hooks/useTaskControls";
@@ -13,6 +16,24 @@ import { formatRenderFps, formatRenderSpeed, getRenderTelemetry } from "../rende
 export function useTaskDetailController(taskId: string | undefined) {
   const [activeTab, setActiveTab] = useState<TaskDetailTab>("overview");
   const [busy, setBusy] = useState(false);
+  const [dubbingJobs, setDubbingJobs] = useState<DubbingJob[]>([]);
+  const [autoDubP2Enabled, setAutoDubP2Enabled] = useState(false);
+  useEffect(() => {
+    if (!taskId) return;
+    let active = true;
+    const refreshDubbing = async () => {
+      try {
+        const jobs = await tasksApi.dubbingJobs(taskId);
+        if (active) setDubbingJobs(jobs);
+      } catch { /* keep existing status while the server reconnects */ }
+    };
+    void refreshDubbing();
+    void subtitleApi.autoProfile().then((profile) => {
+      if (active) setAutoDubP2Enabled(Boolean(profile.auto_publish && profile.auto_dub_p2));
+    }).catch(() => {});
+    const interval = window.setInterval(() => void refreshDubbing(), 5000);
+    return () => { active = false; window.clearInterval(interval); };
+  }, [taskId]);
   const core = useTaskCore(taskId);
   const render = useTaskRender(taskId);
   const logs = useTaskLogs({ taskId, assets: core.assets, activeTab });
@@ -94,6 +115,11 @@ export function useTaskDetailController(taskId: string | undefined) {
     const activeTelemetry = activeRender ? getRenderTelemetry(activeRender) : null;
     const reviewDone = ["APPROVED", "PUBLISHING", "PUBLISHED"].includes(core.task.status);
     const published = core.task.status === "PUBLISHED";
+    const dubbingJob = dubbingJobs.find((job) => job.request.auto_p2_source === "video_pipeline");
+    const showAutoDub = Boolean(dubbingJob || (autoDubP2Enabled && core.task.created_by?.includes("auto_youtube")));
+    const dubDone = dubbingJob?.status === "succeeded";
+    const dubFailed = dubbingJob?.status === "failed" || dubbingJob?.status === "canceled" || dubbingJob?.status === "paused";
+    const dubActive = Boolean(dubbingJob && !dubDone && !dubFailed);
     return [
       { label: "入库", detail: core.task.created_at ? new Date(core.task.created_at).toLocaleString() : "任务已创建", state: "done" },
       {
@@ -115,6 +141,14 @@ export function useTaskDetailController(taskId: string | undefined) {
             : hasSubtitle ? "等待压制最终视频" : "等待字幕阶段完成",
         state: hasFinalVideo ? "done" : activeRender ? "active" : failed && hasSubtitle ? "failed" : hasSubtitle ? "active" : "pending",
       },
+      ...(showAutoDub ? [{
+        label: "中文配音",
+        detail: dubDone ? "YouDub 配音完成，P1/P2 已准备投稿"
+          : dubFailed ? `YouDub ${dubbingJob?.status}：${dubbingJob?.error_message ?? "需要处理后继续"}`
+          : dubActive ? `YouDub ${dubbingJob?.progress ?? 0}% · ${dubbingJob?.output.youdub?.stage ?? "准备中"}`
+          : hasFinalVideo ? "等待进入 YouDub 任务队列" : "等待字幕与渲染完成",
+        state: (dubDone ? "done" : dubFailed ? "failed" : dubActive ? "active" : "pending") as WorkflowStep["state"],
+      }] : []),
       {
         label: "审核",
         detail: reviewDone ? "已通过或进入投稿阶段" : hasFinalVideo ? "等待审核或确认投稿信息" : "等待最终视频",
@@ -128,6 +162,8 @@ export function useTaskDetailController(taskId: string | undefined) {
     ];
   }, [
     core.task,
+    dubbingJobs,
+    autoDubP2Enabled,
     media.finalAssets,
     media.rawAsset,
     media.subtitleAssets,
@@ -161,6 +197,29 @@ export function useTaskDetailController(taskId: string | undefined) {
         onPrimary: () => setActiveTab("media"),
         secondaryLabel: "投稿记录",
         onSecondary: () => setActiveTab("publish"),
+      };
+    }
+    const autoDub = dubbingJobs.find((job) => job.request.auto_p2_source === "video_pipeline");
+    if (autoDub && autoDub.status === "failed") {
+      return {
+        title: "YouDub 自动配音失败",
+        description: autoDub.error_message ?? "配音失败，主工作流没有进入 B站投稿阶段。",
+        primaryLabel: "查看配音详情",
+        primaryTone: "warning" as const,
+        onPrimary: () => setActiveTab("subtitle"),
+        secondaryLabel: "查看日志",
+        onSecondary: () => setActiveTab("logs"),
+      };
+    }
+    if (autoDub && ["queued", "preparing", "synthesizing", "aligning", "mixing"].includes(autoDub.status)) {
+      return {
+        title: `YouDub 配音中 · ${autoDub.progress}%`,
+        description: "正在自动生成 P2，完成后将 P1/P2 一次提交给 B站，当前还没有开始投稿。",
+        primaryLabel: "查看配音进度",
+        primaryTone: "primary" as const,
+        onPrimary: () => setActiveTab("subtitle"),
+        secondaryLabel: "刷新状态",
+        onSecondary: () => core.refresh({ silent: true }),
       };
     }
     if (runningSubtitleJobs > 0 || publish.runningPublishJobs > 0) {
@@ -255,6 +314,8 @@ export function useTaskDetailController(taskId: string | undefined) {
     ...render,
     failedSubtitleJobs,
     runningSubtitleJobs,
+    dubbingJobs,
+    autoDubP2Enabled,
     workflowSteps,
     nextAction,
   };

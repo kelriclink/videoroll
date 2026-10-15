@@ -57,6 +57,73 @@ def engine_control(payload: EngineControl, db: Session = Depends(get_db)) -> dic
         raise HTTPException(409, str(exc)) from exc
 
 
+@router.post("/tasks/{task_id}/actions/auto_dubbing")
+def auto_dubbing(
+    task_id: uuid.UUID,
+    settings: OrchestratorSettings = Depends(get_settings),
+    db: Session = Depends(get_db),
+) -> dict[str, str | None]:
+    """Visible VideoPipelineV1 stage: schedule YouDub BEFORE publication.
+
+    Its deterministic operation key and Hatchet dispatch key make retries
+    idempotent. No Bilibili mutation occurs in this stage.
+    """
+    from videoroll.apps.subtitle_service.auto_profile_store import get_auto_profile
+    from videoroll.db.models import SubtitleJob, SubtitleJobStatus, Asset, AssetKind
+    from videoroll.utils.auto_youtube import parse_auto_youtube_created_by
+
+    task = db.get(Task, task_id)
+    if task is None:
+        raise HTTPException(404, "source task not found")
+    profile = get_auto_profile(db)
+    if not (profile.get("auto_publish") and profile.get("auto_dub_p2")
+            and "bilibili" in (profile.get("auto_publish_platforms") or [])):
+        return {"status": "skipped", "detail": "automatic P2 is disabled",
+                "dubbing_job_id": None}
+    if parse_auto_youtube_created_by(task.created_by) is None:
+        raise HTTPException(409, "automatic P2 requires an automatic YouTube task")
+    subtitle = (db.query(SubtitleJob).filter(
+        SubtitleJob.task_id == task_id,
+        SubtitleJob.status == SubtitleJobStatus.succeeded,
+    ).order_by(SubtitleJob.created_at.desc()).first())
+    source = (db.query(Asset).filter(
+        Asset.task_id == task_id, Asset.kind == AssetKind.video_raw,
+    ).order_by(Asset.created_at.desc()).first())
+    if subtitle is None or source is None:
+        raise HTTPException(409, "automatic P2 needs Chinese subtitles and source video")
+    ensure_ready(db)
+    try:
+        job = create_dubbing_job(
+            db, task_id=task_id, subtitle_job_id=subtitle.id,
+            subtitle_video_key=source.storage_key,
+            operation_key=f"auto-p2:videopipeline:{task_id}",
+        )
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    request = dict(job.request_json or {})
+    if "auto_p2_prefix" not in request:
+        request["auto_p2_prefix"] = profile.get("auto_dub_p2_prefix") or "【中配】"
+        request["auto_p1_prefix"] = profile.get("publish_title_prefix") or "【熟肉】"
+        request["auto_p2_source"] = "video_pipeline"
+        job.request_json = request
+        db.commit()
+    if job.status == "succeeded":
+        return {"status": "succeeded", "detail": "existing YouDub result ready",
+                "dubbing_job_id": str(job.id)}
+    if job.status not in ("queued", "preparing", "synthesizing", "aligning", "mixing"):
+        raise HTTPException(409, f"YouDub job {job.id} ended as {job.status}; resolve before publishing")
+    if job.status == "queued":
+        try:
+            PipelineLauncher(settings).launch_dubbing_job(
+                job.id, dispatch_key=f"video-pipeline-auto-p2:{job.id}")
+        except Exception as exc:
+            raise HTTPException(
+                503, f"YouDub dispatch pending: {type(exc).__name__}: {exc}"
+            ) from exc
+    return {"status": "queued", "detail": "YouDub is scheduled in the main workflow",
+            "dubbing_job_id": str(job.id)}
+
+
 @router.get("/tasks/{task_id}/dubbing_jobs")
 def dubbing_history(task_id: uuid.UUID, db: Session = Depends(get_db)) -> list[dict]:
     jobs = db.query(DubbingJob).filter(DubbingJob.task_id == task_id).order_by(

@@ -15,6 +15,7 @@ from videoroll.workflows.settings import WorkflowRuntimeSettings
 VIDEO_PIPELINE_NAME = "VideoPipelineV1"
 SUBTITLE_JOB_TASK_NAME = "SubtitleJobV1"
 RENDER_FINISHED_EVENT = "videoroll.render.finished"
+DUBBING_FINISHED_EVENT = "videoroll.dubbing.finished"
 PUBLISH_FINISHED_EVENT = "videoroll.publish.finished"
 YOUTUBE_DOWNLOAD_REQUEST_TIMEOUT_SECONDS = 6 * 60 * 60
 YOUTUBE_DOWNLOAD_POLL_INTERVAL_SECONDS = 10
@@ -38,6 +39,7 @@ class WorkflowStageOutput(BaseModel):
     job_id: str | None = None
     job_kind: str | None = None
     render_job_id: str | None = None
+    dubbing_job_id: str | None = None
     publish_batch_id: str | None = None
 
 
@@ -45,6 +47,12 @@ class RenderFinishedEvent(BaseModel):
     render_job_id: str
     status: str
     execution_id: str | None = None
+    error: str | None = None
+
+
+class DubbingFinishedEvent(BaseModel):
+    dubbing_job_id: str
+    status: str
     error: str | None = None
 
 
@@ -408,8 +416,65 @@ def register_video_pipeline(hatchet: Any, *, settings: WorkflowRuntimeSettings |
         )
 
     @workflow.task(
-        name="publish",
+        name="dubbing-start",
         parents=[render_wait],
+        retries=3,
+        backoff_factor=2.0,
+        backoff_max_seconds=45,
+        schedule_timeout=timedelta(minutes=30),
+        execution_timeout=timedelta(minutes=5),
+        desired_worker_labels=_desired_pool("workflow-core"),
+    )
+    def dubbing_start(input: AutoYouTubeWorkflowInput, _ctx: Any) -> WorkflowStageOutput:
+        result = _post_orchestrator(
+            runtime,
+            f"/tasks/{input.task_id}/actions/auto_dubbing",
+            timeout_seconds=120,
+        )
+        return WorkflowStageOutput(
+            task_id=input.task_id,
+            status=str(result.get("status") or "queued"),
+            detail=str(result.get("detail") or ""),
+            dubbing_job_id=str(result.get("dubbing_job_id") or "").strip() or None,
+        )
+
+    @workflow.durable_task(
+        name="dubbing-wait",
+        parents=[dubbing_start],
+        schedule_timeout=timedelta(minutes=30),
+        execution_timeout=timedelta(hours=48),
+        desired_worker_labels=_desired_pool("workflow-core"),
+    )
+    async def dubbing_wait(input: AutoYouTubeWorkflowInput, ctx: Any) -> WorkflowStageOutput:
+        started = ctx.task_output(dubbing_start)
+        job_id = getattr(started, "dubbing_job_id", None)
+        stage_status = getattr(started, "status", None)
+        if isinstance(started, dict):
+            job_id = started.get("dubbing_job_id")
+            stage_status = started.get("status")
+        job_id = str(job_id or "").strip()
+        if not job_id:
+            return WorkflowStageOutput(task_id=input.task_id, status="skipped",
+                                       detail="automatic dubbing disabled")
+        if str(stage_status or "") == "succeeded":
+            return WorkflowStageOutput(task_id=input.task_id, status="dubbed", dubbing_job_id=job_id)
+        event = await ctx.aio_wait_for_event(
+            DUBBING_FINISHED_EVENT,
+            f"input.dubbing_job_id == '{job_id}'",
+            payload_validator=DubbingFinishedEvent,
+            scope=job_id,
+            lookback_window=timedelta(hours=48),
+            label=f"dubbing:{job_id}",
+        )
+        if event.status != "succeeded":
+            _non_retryable(event.error or f"YouDub task {job_id} ended as {event.status}")
+        return WorkflowStageOutput(task_id=input.task_id, status="dubbed",
+                                   detail="YouDub finished; P1/P2 ready",
+                                   dubbing_job_id=job_id)
+
+    @workflow.task(
+        name="publish",
+        parents=[dubbing_wait],
         retries=2,
         backoff_factor=2.0,
         backoff_max_seconds=60,
@@ -417,10 +482,17 @@ def register_video_pipeline(hatchet: Any, *, settings: WorkflowRuntimeSettings |
         execution_timeout=timedelta(hours=2),
         desired_worker_labels=_desired_pool("workflow-core"),
     )
-    def publish(input: AutoYouTubeWorkflowInput, _ctx: Any) -> WorkflowStageOutput:
+    def publish(input: AutoYouTubeWorkflowInput, ctx: Any) -> WorkflowStageOutput:
+        dubbed = ctx.task_output(dubbing_wait)
+        job_id = getattr(dubbed, "dubbing_job_id", None)
+        if isinstance(dubbed, dict):
+            job_id = dubbed.get("dubbing_job_id")
+        route = f"/tasks/{input.task_id}/actions/auto_publish"
+        if job_id:
+            route += f"?dubbing_job_id={job_id}"
         result = _post_orchestrator(
             runtime,
-            f"/tasks/{input.task_id}/actions/auto_publish",
+            route,
             timeout_seconds=90 * 60,
             retryable_statuses={429, 500, 502, 503, 504},
         )

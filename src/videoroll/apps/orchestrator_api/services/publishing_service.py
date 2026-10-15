@@ -687,6 +687,8 @@ def auto_publish_task(
     settings: OrchestratorSettings,
     db: Session,
     store: FileStore,
+    *,
+    dubbing_job_id: uuid.UUID | None = None,
 ) -> dict[str, Any]:
     """Evaluate the current automatic publish box and submit enabled targets.
 
@@ -714,6 +716,41 @@ def auto_publish_task(
     action = build_auto_publish_after_render(task, db=db, store=store)
     publish_payload = dict(action.get("publish_payload") or {})
     publish_payload["fresh_batch"] = True
+    if dubbing_job_id is not None:
+        from videoroll.apps.bilibili_publisher.auto_dub_p2 import p2_title
+        from videoroll.db.models import DubbingJob
+
+        dubbed = db.get(DubbingJob, dubbing_job_id)
+        if dubbed is None or dubbed.task_id != task_id:
+            raise HTTPException(409, detail="automatic P2 dubbing job does not belong to task")
+        request = dict(dubbed.request_json or {})
+        output = dict(dubbed.output_json or {})
+        if request.get("auto_p2_source") != "video_pipeline":
+            raise HTTPException(409, detail="unexpected dubbing job origin for P2")
+        if dubbed.status != "succeeded":
+            raise HTTPException(
+                409, detail=f"YouDub is {dubbed.status}: wait before publishing P1/P2")
+        dubbed_key = str(output.get("video_key") or "").strip()
+        dubbed_asset = db.query(Asset).filter(
+            Asset.task_id == task_id,
+            Asset.kind == AssetKind.video_dubbed,
+            Asset.storage_key == dubbed_key,
+        ).first()
+        if not dubbed_key or dubbed_asset is None:
+            raise HTTPException(409, detail="YouDub completed without registered P2 video")
+        source_meta = read_storage_json_object(store, publish_meta_storage_key(task_id))
+        main_title = str(as_dict(source_meta).get("title") or "").strip()
+        if not main_title:
+            raise HTTPException(409, detail="cannot determine P1 part title for dual-part publish")
+        publish_payload["video_key"] = final_asset.storage_key
+        publish_payload["video_parts"] = [
+            {"video": {"type": "storage", "key": final_asset.storage_key},
+             "title": main_title[:80]},
+            {"video": {"type": "storage", "key": dubbed_key},
+             "title": p2_title(
+                 main_title, request.get("auto_p1_prefix", "【熟肉】"),
+                 request.get("auto_p2_prefix", "【中配】"))},
+        ]
     if publish_payload.get("video_key") in {"", None}:
         publish_payload["video_key"] = None
     result_data = publish_all(

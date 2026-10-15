@@ -187,11 +187,13 @@ def delete_social_publish_account(
 @router.post("/tasks/{task_id}/actions/auto_publish")
 def auto_publish_task(
     task_id: uuid.UUID,
+    dubbing_job_id: uuid.UUID | None = Query(default=None),
     settings: OrchestratorSettings = Depends(get_settings),
     db: Session = Depends(get_db),
     store: FileStore = Depends(get_store),
 ) -> dict[str, Any]:
-    return publishing_service.auto_publish_task(task_id, settings, db, store)
+    return publishing_service.auto_publish_task(
+        task_id, settings, db, store, dubbing_job_id=dubbing_job_id)
 
 
 @router.post("/tasks/{task_id}/actions/publish_all", response_model=PublishAllResultResponse)

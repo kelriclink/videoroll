@@ -70,6 +70,7 @@ export type DubbingJob = {
     subtitle_video_key?: string;
     voice?: string;
     model_path?: string;
+    auto_p2_source?: string;
     retain_original_audio?: boolean;
     preview_only?: boolean;
     quality?: { instruct?: string; temperature?: number; top_p?: number; batch_size?: number;

@@ -12,6 +12,8 @@ from videoroll.workflows.video_pipeline import (
     AutoYouTubeWorkflowInput,
     PUBLISH_FINISHED_EVENT,
     RENDER_FINISHED_EVENT,
+    DUBBING_FINISHED_EVENT,
+    DubbingFinishedEvent,
     PublishFinishedEvent,
     RenderFinishedEvent,
     VIDEO_PIPELINE_NAME,
@@ -58,11 +60,13 @@ class _FakeContext:
         retry_count: int = 0,
         render_event: RenderFinishedEvent | None = None,
         publish_event: PublishFinishedEvent | None = None,
+        dubbing_event: DubbingFinishedEvent | None = None,
     ) -> None:
         self.parent_output = parent_output
         self.retry_count = retry_count
         self.render_event = render_event
         self.publish_event = publish_event
+        self.dubbing_event = dubbing_event
         self.wait_calls: list[tuple[str, str | None, dict[str, Any]]] = []
         self.sleep_calls: list[timedelta] = []
 
@@ -77,6 +81,9 @@ class _FakeContext:
         if key == PUBLISH_FINISHED_EVENT:
             assert self.publish_event is not None
             return self.publish_event
+        if key == DUBBING_FINISHED_EVENT:
+            assert self.dubbing_event is not None
+            return self.dubbing_event
         raise AssertionError(f"unexpected event key: {key}")
 
     async def aio_sleep_for(self, duration: timedelta) -> None:
@@ -111,7 +118,9 @@ def test_video_pipeline_orders_download_handoff_and_subtitle_process(monkeypatch
         calls.append((path, timeout_seconds))
         if path.endswith("/actions/auto_subtitle_handoff"):
             return {"status": "queued", "detail": "ok", "job_id": "job-1", "job_kind": "subtitle"}
-        if path.endswith("/actions/auto_publish"):
+        if path.endswith("/actions/auto_dubbing"):
+            return {"status": "queued", "dubbing_job_id": "dub-1", "detail": "YouDub started"}
+        if "/actions/auto_publish" in path:
             return {"status": "ok", "detail": "publish submitted", "publish_batch_id": "batch-1"}
         return {"status": "downloaded", "detail": "ok"}
 
@@ -149,7 +158,7 @@ def test_video_pipeline_orders_download_handoff_and_subtitle_process(monkeypatch
     assert workflow is hatchet.workflow_obj
     assert hatchet.workflow_name == VIDEO_PIPELINE_NAME
     assert hatchet.input_validator is AutoYouTubeWorkflowInput
-    assert set(workflow.tasks) == {"youtube-download", "subtitle-handoff", "subtitle-process", "render-wait", "publish", "publish-wait"}
+    assert set(workflow.tasks) == {"youtube-download", "subtitle-handoff", "subtitle-process", "render-wait", "dubbing-start", "dubbing-wait", "publish", "publish-wait"}
     assert workflow.options["youtube-download"]["retries"] == 2
     assert workflow.options["youtube-download"]["durable"] is True
     assert workflow.options["subtitle-handoff"]["retries"] == 3
@@ -158,7 +167,10 @@ def test_video_pipeline_orders_download_handoff_and_subtitle_process(monkeypatch
     assert workflow.options["subtitle-process"]["retries"] == 5
     assert workflow.options["render-wait"]["parents"] == [workflow.tasks["subtitle-process"]]
     assert workflow.options["render-wait"]["durable"] is True
-    assert workflow.options["publish"]["parents"] == [workflow.tasks["render-wait"]]
+    assert workflow.options["dubbing-start"]["parents"] == [workflow.tasks["render-wait"]]
+    assert workflow.options["dubbing-wait"]["parents"] == [workflow.tasks["dubbing-start"]]
+    assert workflow.options["dubbing-wait"]["durable"] is True
+    assert workflow.options["publish"]["parents"] == [workflow.tasks["dubbing-wait"]]
     assert workflow.options["publish-wait"]["parents"] == [workflow.tasks["publish"]]
     assert workflow.options["publish-wait"]["durable"] is True
 
@@ -175,7 +187,13 @@ def test_video_pipeline_orders_download_handoff_and_subtitle_process(monkeypatch
         ),
     )
     rendered = asyncio.run(workflow.tasks["render-wait"](payload, render_ctx))
-    published = workflow.tasks["publish"](payload, _FakeContext(rendered))
+    started = workflow.tasks["dubbing-start"](payload, _FakeContext(rendered))
+    dubbing_ctx = _FakeContext(
+        started,
+        dubbing_event=DubbingFinishedEvent(dubbing_job_id="dub-1", status="succeeded"),
+    )
+    dubbed = asyncio.run(workflow.tasks["dubbing-wait"](payload, dubbing_ctx))
+    published = workflow.tasks["publish"](payload, _FakeContext(dubbed))
     publish_ctx = _FakeContext(
         published,
         publish_event=PublishFinishedEvent(
@@ -194,6 +212,10 @@ def test_video_pipeline_orders_download_handoff_and_subtitle_process(monkeypatch
     assert subtitle.render_job_id == "render-1"
     assert rendered.status == "rendered"
     assert rendered.render_job_id == "render-1"
+    assert started.dubbing_job_id == "dub-1"
+    assert dubbed.status == "dubbed"
+    assert dubbing_ctx.wait_calls[0][0] == DUBBING_FINISHED_EVENT
+    assert dubbing_ctx.wait_calls[0][2]["scope"] == "dub-1"
     assert published.status == "ok"
     assert published.detail == "publish submitted"
     assert published.publish_batch_id == "batch-1"
@@ -209,7 +231,8 @@ def test_video_pipeline_orders_download_handoff_and_subtitle_process(monkeypatch
     assert download_calls == [payload.task_id]
     assert calls == [
         ("/tasks/00000000-0000-0000-0000-000000000001/actions/auto_subtitle_handoff", 240),
-        ("/tasks/00000000-0000-0000-0000-000000000001/actions/auto_publish", 90 * 60),
+        ("/tasks/00000000-0000-0000-0000-000000000001/actions/auto_dubbing", 120),
+        ("/tasks/00000000-0000-0000-0000-000000000001/actions/auto_publish?dubbing_job_id=dub-1", 90 * 60),
     ]
 
 
