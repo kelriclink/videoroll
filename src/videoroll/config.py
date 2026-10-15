@@ -50,6 +50,8 @@ class OrchestratorSettings(CommonSettings):
     youtube_proxy: str | None = Field(None, alias="YOUTUBE_PROXY")
     youtube_extractor_args_json: str | None = Field(None, alias="YOUTUBE_EXTRACTOR_ARGS_JSON")
     youtube_compatibility_mode_enabled: bool = False
+    youtube_parallel_download_enabled: bool = True
+    youtube_parallel_download_connections: int = Field(8, ge=1, le=16)
 
 
 class SubtitleServiceSettings(CommonSettings):

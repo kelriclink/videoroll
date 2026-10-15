@@ -42,6 +42,11 @@ export function TaskDetailMedia({ controller }: { controller: TaskDetailControll
               <span>{formatDownloadBytes(youtubeDownloadProgress.downloaded_bytes)}{youtubeDownloadProgress.total_bytes ? ` / ${formatDownloadBytes(youtubeDownloadProgress.total_bytes)}` : ""}</span>
               {youtubeDownloadProgress.speed_bytes_per_second ? <span>{formatDownloadBytes(youtubeDownloadProgress.speed_bytes_per_second)}/s</span> : null}
               {youtubeDownloadProgress.eta_seconds != null && youtubeDownloadProgress.active ? <span>剩余约 {youtubeDownloadProgress.eta_seconds}s</span> : null}
+              {youtubeDownloadProgress.download_backend === "aria2c" ? (
+                <span>aria2c · 配置 {youtubeDownloadProgress.configured_connections ?? 8} 连接
+                  {youtubeDownloadProgress.active_connections != null ? ` · 当前 ${youtubeDownloadProgress.active_connections} 连接` : ""}
+                </span>
+              ) : null}
               {youtubeDownloadProgress.filename ? <span className="max-w-full truncate">{youtubeDownloadProgress.filename}</span> : null}
             </div>
             {youtubeDownloadProgress.error ? <div className="mt-2 break-words text-xs text-rose-700">{youtubeDownloadProgress.error}</div> : null}

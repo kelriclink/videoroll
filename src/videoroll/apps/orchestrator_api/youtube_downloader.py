@@ -61,6 +61,8 @@ class YouTubeDownloaderSettings(Protocol):
     youtube_proxy: str | None
     youtube_extractor_args_json: str | None
     youtube_compatibility_mode_enabled: bool
+    youtube_parallel_download_enabled: bool
+    youtube_parallel_download_connections: int
     ffmpeg_path: str
 
 
@@ -274,6 +276,13 @@ def build_ydl_opts(
     if extractor_args:
         opts["extractor_args"] = extractor_args
 
+    if for_download and getattr(settings, "youtube_parallel_download_enabled", False):
+        from videoroll.apps.orchestrator_api.youtube_parallel_downloader import register_parallel_downloader
+        proxy = str(settings.youtube_proxy or "").strip().lower()
+        if not proxy.startswith(("socks5:", "socks4:")) and register_parallel_downloader():
+            opts["external_downloader"] = {"http": "videoroll-aria2c", "https": "videoroll-aria2c"}
+            opts["videoroll_parallel_connections"] = max(
+                1, min(16, int(getattr(settings, "youtube_parallel_download_connections", 8))))
     if outtmpl:
         opts["outtmpl"] = outtmpl
     if logger is not None:
@@ -703,6 +712,7 @@ def _download_once(
     diagnostics: list[str] | None = None,
     extractor_args_override: dict[str, Any] | None = None,
     progress_hook: Callable[[dict[str, Any]], None] | None = None,
+    parallel: bool | None = None,
 ) -> tuple[Path, dict[str, Any], YouTubeMeta]:
     work_dir.mkdir(parents=True, exist_ok=True)
     outtmpl = str(work_dir / "%(id)s.%(ext)s")
@@ -719,6 +729,9 @@ def _download_once(
         verbose=diagnostics is not None,
         extractor_args_override=extractor_args_override,
     )
+    if parallel is False:
+        options.pop("external_downloader", None)
+        options.pop("videoroll_parallel_connections", None)
     if progress_hook is not None:
         options["progress_hooks"] = [progress_hook]
     with yt_dlp.YoutubeDL(options) as ydl:
@@ -831,32 +844,40 @@ def download_youtube_video(
       - meta summary
     """
     diagnostics: list[str] = []
-    attempts: list[tuple[str, dict[str, Any] | None]] = [("default", None)]
+    attempts: list[tuple[str, dict[str, Any] | None, bool]] = []
+    enabled = bool(getattr(settings, "youtube_parallel_download_enabled", False))
+    if enabled and shutil.which("aria2c") and not str(settings.youtube_proxy or "").startswith(("socks5:", "socks4:")):
+        attempts.append(("aria2c-range", None, True))
+    attempts.append(("yt-dlp-native", None, False))
     if not _compatibility_mode_enabled(settings):
-        attempts.extend(_FORMAT_UNAVAILABLE_FALLBACKS)
+        attempts.extend(
+            (f"yt-dlp-native:{label}", override, False)
+            for label, override in _FORMAT_UNAVAILABLE_FALLBACKS
+        )
 
     last_error: Exception | None = None
-    for idx, (label, extractor_args_override) in enumerate(attempts, start=1):
-        if idx > 1:
-            _reset_work_dir_for_retry(work_dir)
-            diagnostics.append(f"---- videoroll retry #{idx}: {label} ----")
+    for idx, (label, extractor_args_override, parallel) in enumerate(attempts):
+        # Parallel partial files live in a separate directory and survive
+        # a failed request/retry. Never pass them to the native fallback,
+        # which must begin with its own empty files to prevent corruption.
+        chosen_dir = work_dir / ("parallel" if parallel else "native") if enabled else work_dir
+        if idx > 0 and not parallel:
+            _reset_work_dir_for_retry(chosen_dir)
+        diagnostics.append(f"---- videoroll downloader #{idx+1}: {label} ----")
         try:
             return _download_once(
-                url,
-                settings,
-                work_dir=work_dir,
-                diagnostics=diagnostics,
+                url, settings, work_dir=chosen_dir, diagnostics=diagnostics,
                 extractor_args_override=extractor_args_override,
                 progress_hook=progress_hook,
+                parallel=parallel,
             )
-        except DownloadError as e:
-            last_error = e
-        except Exception as e:
-            last_error = e
+        except Exception as exc:
+            last_error = exc
+            if parallel and progress_hook is not None:
+                progress_hook({"status": "retrying", "download_backend": "yt-dlp"})
 
-        if last_error is None:
-            break
-        if idx >= len(attempts) or not _looks_like_requested_format_unavailable(str(last_error)):
+        # Non-format native failures must not cycle through all player clients.
+        if not parallel and not _looks_like_requested_format_unavailable(str(last_error)):
             break
 
     if isinstance(last_error, DownloadError):

@@ -10,6 +10,8 @@ type YouTubeSettings = {
   cookies_set?: boolean;
   cookies_enabled?: boolean;
   compatibility_mode_enabled?: boolean;
+  parallel_download_enabled?: boolean;
+  parallel_download_connections?: number;
   cookies_updated_at?: string | null;
   cookies_count?: number;
   cookies_domains_count?: number;
@@ -81,6 +83,9 @@ export default function SettingsYouTubePage() {
   const [cookiesEnabled, setCookiesEnabled] = useState(false);
   const [compatibilityModeEnabled, setCompatibilityModeEnabled] = useState(false);
   const [compatibilityBusy, setCompatibilityBusy] = useState(false);
+  const [parallelEnabled, setParallelEnabled] = useState(true);
+  const [parallelConnections, setParallelConnections] = useState(8);
+  const [parallelBusy, setParallelBusy] = useState(false);
   const [testUrl, setTestUrl] = useState("https://www.youtube.com/robots.txt");
   const [testBusy, setTestBusy] = useState(false);
   const [testResult, setTestResult] = useState<YouTubeProxyTestResponse | null>(null);
@@ -102,6 +107,8 @@ export default function SettingsYouTubePage() {
         setProxy((s.proxy ?? "").toString());
         setCookiesEnabled(Boolean(s.cookies_enabled));
         setCompatibilityModeEnabled(Boolean(s.compatibility_mode_enabled));
+        setParallelEnabled(s.parallel_download_enabled ?? true);
+        setParallelConnections(s.parallel_download_connections ?? 8);
         setHomeScanEnabled(Boolean(s.home_scan_enabled));
         setHomeScanIntervalMinutes(Math.max(1, Number(s.home_scan_interval_minutes ?? 60) || 60));
         setHomeScanLimit(Math.max(1, Number(s.home_scan_limit ?? 10) || 10));
@@ -119,6 +126,10 @@ export default function SettingsYouTubePage() {
   }, []);
 
   const compatibilityDirty = Boolean(settings) && compatibilityModeEnabled !== Boolean(settings?.compatibility_mode_enabled);
+  const parallelDirty = Boolean(settings) && (
+    parallelEnabled !== (settings?.parallel_download_enabled ?? true) ||
+    parallelConnections !== (settings?.parallel_download_connections ?? 8)
+  );
   const homeScanDirty =
     Boolean(settings) &&
     (
@@ -131,7 +142,7 @@ export default function SettingsYouTubePage() {
   const proxyDirty = Boolean(settings) && proxy !== String(settings?.proxy ?? "");
   const cookiesToggleDirty = Boolean(settings) && cookiesEnabled !== Boolean(settings?.cookies_enabled);
   const cookiesContentDirty = Boolean(cookiesTxt.trim());
-  const isDirty = compatibilityDirty || homeScanDirty || proxyDirty || cookiesToggleDirty || cookiesContentDirty;
+  const isDirty = compatibilityDirty || parallelDirty || homeScanDirty || proxyDirty || cookiesToggleDirty || cookiesContentDirty;
   useUnsavedChangesGuard(isDirty, { message: "离开当前页面会丢失尚未保存的 YouTube 配置草稿。" });
 
   async function reloadFromServer() {
@@ -211,6 +222,54 @@ export default function SettingsYouTubePage() {
             </div>
           </div>
         )}
+      </div>
+
+      <div className="vr-section">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div className="text-sm font-semibold">YouTube 大文件多连接下载</div>
+          {parallelDirty ? <span className="rounded bg-amber-50 px-2 py-0.5 text-xs text-amber-700">未保存</span> : null}
+        </div>
+        <p className="mt-2 text-xs text-slate-600">
+          大于等于 128 MiB 的普通 HTTP/HTTPS 视频使用 aria2c Range 多连接下载。
+          直播、HLS/DASH 分片和小文件继续使用 yt-dlp。失败时回退原生 yt-dlp，
+          未完成的 aria2 分片会保留供后续续传。下载进度显示实时速度和剩余时间。
+        </p>
+        <label className="mt-3 flex items-center gap-2 text-sm">
+          <input type="checkbox" checked={parallelEnabled}
+            onChange={(e) => setParallelEnabled(e.target.checked)} />
+          启用多连接下载
+        </label>
+        <label className="mt-3 block text-sm">
+          <span className="mb-1 block text-xs text-slate-600">每个大文件的并发连接数（1–16）</span>
+          <input type="number" min={1} max={16} step={1}
+            value={parallelConnections}
+            disabled={!parallelEnabled}
+            onChange={(e) => setParallelConnections(Number(e.target.value))}
+            className="w-28 rounded border border-slate-300 px-3 py-2" />
+          <span className="ml-3 text-xs text-slate-500">推荐 8；过高并发可能遭 CDN 限流</span>
+        </label>
+        <div className="mt-3">
+          <Button tone="primary"
+            disabled={parallelBusy || !parallelDirty || !Number.isInteger(parallelConnections) || parallelConnections < 1 || parallelConnections > 16}
+            onClick={async () => {
+              setParallelBusy(true);
+              setError(null);
+              try {
+                await fetchJson(`${ORCHESTRATOR_URL}/settings/youtube`, {
+                  method: "PUT", headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({
+                    parallel_download_enabled: parallelEnabled,
+                    parallel_download_connections: parallelConnections,
+                  }),
+                });
+                await refresh(false);
+              } catch (e: unknown) {
+                setError(e instanceof Error ? e.message : String(e));
+              } finally {
+                setParallelBusy(false);
+              }
+            }}>保存下载并发设置</Button>
+        </div>
       </div>
 
       <div className="vr-section">

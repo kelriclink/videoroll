@@ -368,6 +368,8 @@ def get_youtube_settings(db: Session, *, default_proxy: Optional[str] = None) ->
         "cookies_set": bool(cookies_txt),
         "cookies_enabled": _cookies_enabled(stored, cookies_txt),
         "compatibility_mode_enabled": bool(stored.get("compatibility_mode_enabled")),
+        "parallel_download_enabled": bool(stored.get("parallel_download_enabled", True)),
+        "parallel_download_connections": max(1, min(16, _safe_int(stored.get("parallel_download_connections"), 8))),
         "cookies_updated_at": cookies_updated_at,
         "home_scan_enabled": bool(stored.get("home_scan_enabled")),
         "home_scan_interval_minutes": _normalize_home_scan_interval_minutes(stored.get("home_scan_interval_minutes")),
@@ -445,6 +447,15 @@ def update_youtube_settings(db: Session, update: dict[str, Any], *, default_prox
 
     if "compatibility_mode_enabled" in update and update["compatibility_mode_enabled"] is not None:
         stored["compatibility_mode_enabled"] = bool(update["compatibility_mode_enabled"])
+
+    if "parallel_download_enabled" in update and update["parallel_download_enabled"] is not None:
+        stored["parallel_download_enabled"] = bool(update["parallel_download_enabled"])
+
+    if "parallel_download_connections" in update and update["parallel_download_connections"] is not None:
+        count = int(update["parallel_download_connections"])
+        if not 1 <= count <= 16:
+            raise ValueError("parallel_download_connections must be between 1 and 16")
+        stored["parallel_download_connections"] = count
 
     if "home_scan_enabled" in update and update["home_scan_enabled"] is not None:
         stored["home_scan_enabled"] = bool(update["home_scan_enabled"])

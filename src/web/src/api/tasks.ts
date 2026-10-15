@@ -27,6 +27,9 @@ export type YouTubeDownloadProgress = {
   downloaded_bytes: number;
   total_bytes?: number | null;
   speed_bytes_per_second?: number | null;
+  download_backend?: string | null;
+  configured_connections?: number | null;
+  active_connections?: number | null;
   eta_seconds?: number | null;
   filename?: string | null;
   error?: string | null;

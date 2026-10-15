@@ -308,6 +308,8 @@ def effective_youtube_settings(settings: OrchestratorSettings, db: Session, *, c
             "youtube_proxy": proxy or None,
             "youtube_cookie_file": cookie_file,
             "youtube_compatibility_mode_enabled": bool(config.get("compatibility_mode_enabled")),
+            "youtube_parallel_download_enabled": bool(config.get("parallel_download_enabled", True)),
+            "youtube_parallel_download_connections": int(config.get("parallel_download_connections", 8)),
         }
     )
 
@@ -581,6 +583,16 @@ class _YouTubeDownloadProgressReporter:
 
     def hook(self, event: dict[str, Any]) -> None:
         status = str(event.get("status") or "").lower()
+        if status == "retrying":
+            self.completed_bytes.clear()
+            self.last_progress = 0
+            self.update(
+                "preparing", 0, download_backend="yt-dlp",
+                configured_connections=None, active_connections=None,
+                downloaded_bytes=0, total_bytes=None,
+                speed_bytes_per_second=None, eta_seconds=None, filename=None,
+            )
+            return
         if status not in {"downloading", "finished"}:
             return
         downloaded = self._number(event.get("downloaded_bytes")) or 0
@@ -609,6 +621,9 @@ class _YouTubeDownloadProgressReporter:
                 "speed_bytes_per_second": self._float(event.get("speed")),
                 "eta_seconds": self._number(event.get("eta")),
                 "filename": filename,
+                "download_backend": str(event.get("download_backend") or "yt-dlp"),
+                "configured_connections": event.get("configured_connections"),
+                "active_connections": event.get("connections"),
                 "error": None,
             },
             force=status == "finished",
@@ -666,10 +681,13 @@ def _download(
         info: dict[str, Any] = {}; meta: Any = None
         if video_asset is None:
             try:
+                # Keep aria2 .aria2 checkpoint files across request failures.
+                # Cookie files remain isolated in the short-lived temp dir.
+                download_cache = root / "media-download"
                 video_path, info, meta = download_youtube_video(
                     url,
                     yt_settings,
-                    work_dir=temp_dir,
+                    work_dir=download_cache,
                     progress_hook=reporter.hook,
                 )
             except Exception as exc:
@@ -747,6 +765,9 @@ def _download(
             db.rollback()
             _queue_uploaded_objects_for_cleanup(db, uploaded_keys)
             raise
+    if video_asset is not None:
+        # Cleanup only after media promotion + database transaction succeeded.
+        shutil.rmtree(root / "media-download", ignore_errors=True)
     reporter.update("completed", 100, speed_bytes_per_second=None, eta_seconds=0)
     return YouTubeDownloadActionResponse(metadata=youtube_meta_to_read(meta), metadata_asset=meta_asset, video_asset=video_asset, cover_asset=cover_asset)
 

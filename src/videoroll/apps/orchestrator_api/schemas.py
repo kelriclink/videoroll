@@ -466,6 +466,8 @@ class YouTubeSettingsRead(BaseModel):
     cookies_set: bool = False
     cookies_enabled: bool = False
     compatibility_mode_enabled: bool = False
+    parallel_download_enabled: bool = True
+    parallel_download_connections: int = 8
     cookies_updated_at: Optional[str] = None
     cookies_count: int = 0
     cookies_domains_count: int = 0
@@ -503,6 +505,8 @@ class YouTubeSettingsUpdate(BaseModel):
     cookies_txt: Optional[str] = None
     cookies_enabled: Optional[bool] = None
     compatibility_mode_enabled: Optional[bool] = None
+    parallel_download_enabled: Optional[bool] = None
+    parallel_download_connections: Optional[int] = Field(default=None, ge=1, le=16)
     home_scan_enabled: Optional[bool] = None
     home_scan_interval_minutes: Optional[int] = Field(default=None, ge=1, le=1440)
     home_scan_limit: Optional[int] = Field(default=None, ge=1, le=100)
