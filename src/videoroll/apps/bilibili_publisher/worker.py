@@ -44,6 +44,7 @@ from videoroll.storage.filesystem import FileStore
 from videoroll.apps.subtitle_service.bilibili_tags_store import get_task_bilibili_summary
 from videoroll.apps.subtitle_service.translate_settings_store import get_translate_settings
 from videoroll.apps.youtube_meta_store import get_task_youtube_meta
+from videoroll.apps.bilibili_publisher.auto_dub_p2 import register_auto_dub_p2_task
 
 
 settings = get_bilibili_publisher_settings()
@@ -61,6 +62,7 @@ celery_app.conf.update(
     timezone="UTC",
     enable_utc=True,
 )
+register_auto_dub_p2_task(celery_app)
 _JOB_LEASE_TTL_SECONDS = 1800
 
 
@@ -1060,6 +1062,14 @@ def _process_job_impl(self, job_id: str) -> dict[str, Any]:
         store.put_bytes(result_bytes, result_key, content_type="application/json")
         _ensure_publish_result_asset(db, task.id, result_key)
 
+        # P2 is optional. A SAVEPOINT isolates its scheduling errors from P1.
+        # On success the outbox intent commits in the same P1 transaction.
+        try:
+            with db.begin_nested():
+                from videoroll.apps.bilibili_publisher.auto_dub_p2 import schedule_after_p1
+                schedule_after_p1(db, job, task)
+        except Exception:
+            logger.exception("optional YouDub P2 could not be scheduled (job_id=%s)", job.id)
         db.commit()
         try:
             enqueue_publish_batch_cleanup(db, celery_app, task.id, job.batch_id, needed=cleanup_enqueued) if job.batch_id else None

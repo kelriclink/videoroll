@@ -113,6 +113,7 @@ export type PublishJob = {
   typeid_selected_by?: string | null;
   typeid_ai_ok?: boolean | null;
   typeid_ai_reason?: string | null;
+  auto_dub_p2?: { state?: string; title?: string; error?: string | null; dub_job_id?: string | null; cid?: number | null } | null;
   error_message?: string | null;
   created_at: string;
   updated_at: string;

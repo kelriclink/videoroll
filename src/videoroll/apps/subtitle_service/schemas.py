@@ -268,6 +268,8 @@ class SubtitleAutoProfileRead(BaseModel):
     auto_publish_platforms: list[Literal["bilibili", "douyin", "xiaohongshu", "kuaishou"]] = Field(default_factory=list)
     publish_typeid_mode: str = "ai_summary"
     publish_title_prefix: str = "【熟肉】"
+    auto_dub_p2: bool = False
+    auto_dub_p2_prefix: str = Field(default="【中配】", max_length=30)
     publish_translate_title: bool = True
     publish_use_youtube_cover: bool = True
     publish_enable_reprint: bool = True
@@ -302,6 +304,8 @@ class SubtitleAutoProfileUpdate(BaseModel):
     auto_publish_platforms: Optional[list[Literal["bilibili", "douyin", "xiaohongshu", "kuaishou"]]] = None
     publish_typeid_mode: Optional[str] = None
     publish_title_prefix: Optional[str] = None
+    auto_dub_p2: Optional[bool] = None
+    auto_dub_p2_prefix: Optional[str] = Field(default=None, max_length=30)
     publish_translate_title: Optional[bool] = None
     publish_use_youtube_cover: Optional[bool] = None
     publish_enable_reprint: Optional[bool] = None

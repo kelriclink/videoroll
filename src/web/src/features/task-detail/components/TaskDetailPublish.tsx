@@ -540,6 +540,13 @@ export function TaskDetailPublish({ controller }: { controller: TaskDetailContro
                       <td className="py-2 pr-3 font-mono text-xs">{j.account_id?.slice(0, 8) ?? "-"}</td>
                       <td className={`py-2 pr-3 ${j.state === "unknown" || j.state === "submitted" ? "text-amber-700" : ""}`}>
                         <div>{j.state}</div>
+                        {j.auto_dub_p2 ? (
+                          <div className={`mt-1 text-xs ${["failed", "unknown", "submitting", "uploading"].includes(j.auto_dub_p2.state ?? "") ? "text-amber-700" : "text-sky-800"}`}
+                            title={j.auto_dub_p2.error ?? undefined}>
+                            配音 P2：{({ queued: "排队中", dubbing: "YouDub 配音中", uploaded: "已上传，等待追加", uploading: "上传中", submitting: "正在追加/待确认", published: "已追加成功", failed: "失败（P1 保留）", unknown: "状态待人工确认" } as Record<string, string>)[j.auto_dub_p2.state ?? ""] ?? j.auto_dub_p2.state}
+                            {j.auto_dub_p2.error ? <div className="max-w-48 truncate text-rose-700">{j.auto_dub_p2.error}</div> : null}
+                          </div>
+                        ) : null}
                         {isActiveBilibiliUpload ? (
                           <div className="mt-1 min-w-32 text-xs text-sky-800">
                             <div className="flex items-center justify-between gap-2">

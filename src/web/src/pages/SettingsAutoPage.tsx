@@ -45,6 +45,8 @@ type AutoProfile = {
   auto_publish_platforms: PublishPlatform[];
   publish_typeid_mode: string;
   publish_title_prefix: string;
+  auto_dub_p2: boolean;
+  auto_dub_p2_prefix: string;
   publish_translate_title: boolean;
   publish_use_youtube_cover: boolean;
   publish_enable_reprint: boolean;
@@ -101,6 +103,8 @@ function autoProfileSnapshotFromServer(profile: AutoProfile, enabledPlatforms: P
     publishTypeidMode: (profile.publish_typeid_mode || "ai_summary").toLowerCase(),
     publishTranslateTitle: Boolean(profile.publish_translate_title),
     publishTitlePrefix: (profile.publish_title_prefix ?? "【熟肉】").trim() || "【熟肉】",
+    autoDubP2: Boolean(profile.auto_dub_p2),
+    autoDubP2Prefix: (profile.auto_dub_p2_prefix ?? "【中配】").trim() || "【中配】",
     publishUseYouTubeCover: Boolean(profile.publish_use_youtube_cover),
     publishEnableReprint: Boolean(profile.publish_enable_reprint),
   });
@@ -147,6 +151,8 @@ export default function SettingsAutoPage() {
   const [publishTypeidMode, setPublishTypeidMode] = useState("ai_summary");
   const [publishTranslateTitle, setPublishTranslateTitle] = useState(true);
   const [publishTitlePrefix, setPublishTitlePrefix] = useState("【熟肉】");
+  const [autoDubP2, setAutoDubP2] = useState(false);
+  const [autoDubP2Prefix, setAutoDubP2Prefix] = useState("【中配】");
   const [publishUseYouTubeCover, setPublishUseYouTubeCover] = useState(true);
   const [publishEnableReprint, setPublishEnableReprint] = useState(true);
 
@@ -198,6 +204,8 @@ export default function SettingsAutoPage() {
       setPublishTypeidMode((profile.publish_typeid_mode || "ai_summary").toLowerCase());
       setPublishTranslateTitle(Boolean(profile.publish_translate_title));
       setPublishTitlePrefix((profile.publish_title_prefix ?? "【熟肉】").trim() || "【熟肉】");
+      setAutoDubP2(Boolean(profile.auto_dub_p2));
+      setAutoDubP2Prefix((profile.auto_dub_p2_prefix ?? "【中配】").trim() || "【中配】");
       setPublishUseYouTubeCover(Boolean(profile.publish_use_youtube_cover));
       setPublishEnableReprint(Boolean(profile.publish_enable_reprint));
       savedSnapshotRef.current = autoProfileSnapshotFromServer(profile, enabledPlatformIds);
@@ -245,6 +253,8 @@ export default function SettingsAutoPage() {
     publishTypeidMode,
     publishTranslateTitle,
     publishTitlePrefix: publishTitlePrefix.trim() || "【熟肉】",
+    autoDubP2,
+    autoDubP2Prefix: autoDubP2Prefix.trim() || "【中配】",
     publishUseYouTubeCover,
     publishEnableReprint,
   });
@@ -310,6 +320,8 @@ export default function SettingsAutoPage() {
           auto_publish_platforms: availableAutoPublishPlatforms,
           publish_typeid_mode: publishTypeidMode,
           publish_title_prefix: publishTitlePrefix,
+          auto_dub_p2: autoDubP2,
+          auto_dub_p2_prefix: autoDubP2Prefix.trim() || "【中配】",
           publish_translate_title: publishTranslateTitle,
           publish_use_youtube_cover: publishUseYouTubeCover,
           publish_enable_reprint: publishEnableReprint,
@@ -356,6 +368,8 @@ export default function SettingsAutoPage() {
     setPublishTypeidMode("ai_summary");
     setPublishTranslateTitle(true);
     setPublishTitlePrefix("【熟肉】");
+    setAutoDubP2(false);
+    setAutoDubP2Prefix("【中配】");
     setPublishUseYouTubeCover(true);
     setPublishEnableReprint(true);
   }
@@ -781,6 +795,22 @@ export default function SettingsAutoPage() {
                 placeholder="【熟肉】"
               />
             </label>
+          </div>
+          <div className="mt-4 rounded border border-sky-200 bg-sky-50 p-3 text-sm space-y-3">
+            <label className="flex items-center gap-2">
+              <input type="checkbox" checked={autoDubP2} onChange={(e) => setAutoDubP2(e.target.checked)} />
+              P1 投稿成功后，自动 YouDub 配音并追加 B站 P2
+            </label>
+            <label className="block">
+              <span className="mb-1 block text-xs text-slate-600">配音 P2 标题前缀（仅改变 P2 分 P 标题）</span>
+              <input className="w-full rounded border px-3 py-2 text-sm" value={autoDubP2Prefix}
+                onChange={(e) => setAutoDubP2Prefix(e.target.value)} placeholder="【中配】"
+                disabled={!autoDubP2} maxLength={30} />
+            </label>
+            <p className="text-xs text-slate-600">
+              仅作用于自动模式的 B站投稿，默认关闭。P1 的标题、封面、简介和现有投稿流程不变；
+              生成失败时 P1 保持已发布，P2 失败单独记录，不会重复投稿 P1。
+            </p>
           </div>
           <div className="mt-2 text-xs text-slate-500">
             投稿 meta 的默认值（标题/简介/tags 等）请到 <Link className="underline" to="/settings/publish">投稿设置</Link> 配置；分区由上面的 “分区模式” 决定。

@@ -339,6 +339,7 @@ class PublishJobSummary(BaseModel):
     typeid_ai_ok: Optional[bool] = None
     typeid_ai_reason: Optional[str] = None
     error_message: Optional[str] = None
+    auto_dub_p2: Optional[dict[str, Any]] = None
     created_at: datetime
     updated_at: datetime
 

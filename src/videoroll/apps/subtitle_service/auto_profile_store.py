@@ -69,6 +69,8 @@ def _default_profile() -> dict[str, Any]:
         "auto_publish_platforms": [],
         "publish_typeid_mode": "ai_summary",
         "publish_title_prefix": "【熟肉】",
+        "auto_dub_p2": False,
+        "auto_dub_p2_prefix": "【中配】",
         "publish_translate_title": True,
         "publish_use_youtube_cover": True,
         # If false, publish as "自制" (copyright=1) while keeping the original link in description.
@@ -228,10 +230,24 @@ def get_auto_profile(db: Session) -> dict[str, Any]:
     merged["publish_title_prefix"] = str(merged.get("publish_title_prefix") or baseline["publish_title_prefix"]).strip() or baseline[
         "publish_title_prefix"
     ]
+    merged["auto_dub_p2"] = bool(merged.get("auto_dub_p2", False))
+    merged["auto_dub_p2_prefix"] = normalize_auto_dub_prefix(merged.get("auto_dub_p2_prefix"))
     merged["publish_translate_title"] = bool(merged.get("publish_translate_title"))
     merged["publish_use_youtube_cover"] = bool(merged.get("publish_use_youtube_cover"))
     merged["publish_enable_reprint"] = bool(merged.get("publish_enable_reprint"))
     return merged
+
+
+def normalize_auto_dub_prefix(value: Any) -> str:
+    # The bracketed token is a P2 part-title marker, not a video-wide prefix.
+    text = str(value or "").strip()
+    if not text:
+        return "【中配】"
+    if text.startswith("【") and text.endswith("】"):
+        text = text[1:-1].strip()
+    if not text or any(c in text for c in "【】\\/\r\n\x00") or len(text) > 20:
+        raise ValueError("P2 prefix must contain 1–20 characters without brackets or control characters")
+    return f"【{text}】"
 
 
 def update_auto_profile(db: Session, update: dict[str, Any]) -> dict[str, Any]:
@@ -252,6 +268,7 @@ def update_auto_profile(db: Session, update: dict[str, Any]) -> dict[str, Any]:
         "bilingual",
         "auto_publish",
         "publish_translate_title",
+        "auto_dub_p2",
         "publish_use_youtube_cover",
         "publish_enable_reprint",
     ]:
@@ -268,6 +285,7 @@ def update_auto_profile(db: Session, update: dict[str, Any]) -> dict[str, Any]:
         "target_lang",
         "translate_style",
         "publish_title_prefix",
+        "auto_dub_p2_prefix",
     ]:
         if k in update and update[k] is not None:
             stored[k] = update[k]
@@ -292,6 +310,11 @@ def update_auto_profile(db: Session, update: dict[str, Any]) -> dict[str, Any]:
         val = str(update["asr_model"]).strip()
         stored["asr_model"] = val or None
 
+    # Validate BEFORE committing; invalid UI input must not poison the
+    # persisted profile or break automatic P1 publishing.
+    stored['auto_dub_p2_prefix'] = normalize_auto_dub_prefix(
+        stored.get('auto_dub_p2_prefix', '【中配】')
+    )
     row.value_json = stored
     db.add(row)
     db.commit()

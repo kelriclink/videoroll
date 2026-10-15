@@ -807,6 +807,79 @@ class BilibiliWebClient:
         _bili_code_ok(data)
         return data
 
+    def get_owned_archive(self, *, aid: int) -> dict[str, Any]:
+        """Load owner-side editable metadata and ALL existing parts."""
+        _require(int(aid) > 0, 'aid must be positive')
+        resp = self._bili.get(
+            'https://member.bilibili.com/x/vupre/web/archive/view',
+            params={'aid': int(aid)},
+        )
+        data = _json(resp)
+        _bili_code_ok(data, status_code=resp.status_code)
+        value = _as_dict(data.get('data'))
+        archive = _as_dict(value.get('archive'))
+        videos = value.get('videos')
+        if not archive or not isinstance(videos, list) or not videos:
+            raise BilibiliWebError('owner archive view is incomplete; refusing metadata edit')
+        if int(archive.get('aid') or aid) != int(aid):
+            raise BilibiliWebError('owner archive aid mismatch')
+        for v in videos:
+            if not isinstance(v, dict) or int(v.get('cid') or 0) <= 0 or not str(v.get('filename') or '').strip():
+                raise BilibiliWebError('existing P1 part has no filename/cid; cannot edit safely')
+        return {'archive': archive, 'videos': videos}
+
+    def append_archive_part(
+        self, *, archive: dict[str, Any], aid: int,
+        uploaded: UploadedVideo, title: str, csrf: str,
+    ) -> dict[str, Any]:
+        """Append just one P2 while preserving P1 + all archive metadata."""
+        source = _as_dict(archive.get('archive'))
+        original_parts = archive.get('videos')
+        _require(isinstance(original_parts, list) and len(original_parts) == 1,
+                 'P2 addition requires exactly one existing P1')
+        _require(int(source.get('aid') or aid) == int(aid), 'archive aid mismatch')
+        _require(uploaded.cid > 0 and bool(uploaded.filename_no_suffix), 'P2 upload incomplete')
+        title = str(title or '').strip()
+        _require(bool(title) and len(title) <= 80, 'P2 title invalid')
+        # Editing APIs require the full original payload, NOT just a CID or
+        # the new part. Send a carefully selected set of owner-side fields.
+        keep = ('title', 'cover', 'cover43', 'copyright', 'source', 'tid',
+                'tag', 'desc', 'desc_v2', 'desc_format_id', 'dynamic',
+                'recreate', 'interactive', 'act_reserve_create', 'no_disturbance',
+                'no_reprint', 'subtitle', 'dolby', 'lossless_music',
+                'up_selection_reply', 'up_close_reply', 'up_close_danmu',
+                'web_os', 'is_only_self', 'topic_id', 'mission_id', 'is_360',
+                'neutral_mark', 'human_type2')
+        body = {key: source[key] for key in keep if key in source}
+        for required in ('title', 'copyright', 'tid', 'tag', 'desc'):
+            _require(required in body, f'owner archive missing required {required}')
+        _require(int(body['tid']) > 0, 'invalid owner archive tid')
+        existing = []
+        for part in original_parts:
+            existing.append({
+                'filename': str(part['filename']).strip(),
+                'title': str(part.get('title') or source['title']).strip(),
+                'desc': str(part.get('desc') or ''),
+                'cid': int(part['cid']),
+            })
+        _require(all(int(p['cid']) != uploaded.cid for p in existing), 'duplicate P2 CID')
+        body.update({
+            'aid': int(aid), 'csrf': str(csrf).strip(),
+            'videos': [*existing, {
+                'filename': uploaded.filename_no_suffix, 'cid': int(uploaded.cid),
+                'title': title, 'desc': '',
+            }],
+        })
+        _require(bool(body['csrf']), 'csrf missing')
+        response = self._bili.post(
+            'https://member.bilibili.com/x/vu/web/edit',
+            params={'csrf': body['csrf'], 't': int(time.time() * 1000)},
+            json=_drop_none(body),
+        )
+        data = _json(response)
+        _bili_code_ok(data, status_code=response.status_code, rate_limit_scope='submit')
+        return data
+
     def add_archive(
         self,
         meta: BilibiliPublishMeta,

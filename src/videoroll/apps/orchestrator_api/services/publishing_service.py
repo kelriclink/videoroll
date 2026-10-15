@@ -620,6 +620,11 @@ def list_task_publish_jobs(task_id: uuid.UUID, limit: int, db: Session) -> list[
                 "typeid_ai_ok": ai_ok,
                 "typeid_ai_reason": str(ai.get("reason") or "").strip() or None,
                 "error_message": publish_job_error_message(job),
+                "auto_dub_p2": (
+                    {k: as_dict(response.get("auto_dub_p2")).get(k)
+                     for k in ("state", "title", "error", "dub_job_id", "cid")}
+                    if isinstance(response.get("auto_dub_p2"), dict) else None
+                ),
                 "created_at": job.created_at,
                 "updated_at": job.updated_at,
             }
