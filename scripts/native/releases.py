@@ -21,6 +21,7 @@ from typing import Iterator
 FORMAT = 1
 MANIFEST = "native-release.json"
 SOURCE_DIRS = ("src/videoroll", "migrations", "scripts/native", "deploy/systemd")
+OPTIONAL_SOURCE_DIRS = ("vendor/youdub_webui",)
 SOURCE_FILES = (
     "pyproject.toml", "requirements.lock", "alembic.ini", "README.md",
     "docker/workflow-requirements.txt", "docker/social-publisher-requirements.txt",
@@ -47,7 +48,7 @@ def allowed_path(name: str) -> bool:
     if any(part in {"..", ".", "__pycache__", "node_modules", ".git"}
            or part.startswith(".env") for part in path.parts):
         return False
-    return name in SOURCE_FILES or any(name.startswith(d + "/") for d in (*SOURCE_DIRS, "web"))
+    return name in SOURCE_FILES or any(name.startswith(d + "/") for d in (*SOURCE_DIRS, *OPTIONAL_SOURCE_DIRS, "web"))
 
 
 def runtime_path(name: str) -> bool:
@@ -67,9 +68,13 @@ def source_files(root: Path) -> dict[str, Path]:
         if not path.is_file() or path.is_symlink():
             raise RuntimeError(f"Missing or linked release input: {name}")
         files[name] = path
-    for directory in SOURCE_DIRS:
-        if not (root / directory).is_dir() or (root / directory).is_symlink():
+    for directory in (*SOURCE_DIRS, *OPTIONAL_SOURCE_DIRS):
+        if not (root / directory).is_dir():
+            if directory in OPTIONAL_SOURCE_DIRS and not (root / directory).exists():
+                continue  # Support older minimal fixtures and non-YouDub releases.
             raise RuntimeError(f"Missing release source directory: {directory}")
+        if (root / directory).is_symlink():
+            raise RuntimeError(f"Linked release source directory: {directory}")
         for path in sorted((root / directory).rglob("*")):
             name = path.relative_to(root).as_posix()
             if not allowed_path(name) or path.suffix in {".pyc", ".pyo"}:

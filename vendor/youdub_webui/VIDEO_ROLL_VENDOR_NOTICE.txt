@@ -1,0 +1,8 @@
+UPSTREAM: https://github.com/liuzhao1225/YouDub-webui
+REVISION: 0f6c75935e7a208c4b8ea56140e31c5316953fec
+LICENSE: Apache-2.0, copied LICENSE alongside source
+SCOPE: complete upstream backend (including VoxCPM2, Demucs, speech stages, file handling, runner) and web source as inspected in commit above.
+STATUS: vendor files copied verbatim; VideoRoll integration resides outside this directory.
+# YouDub backend original source; separate runtime data
+
+Demucs git submodule revision: e976d93ecc3865e5757426930257e200846a520a (Facebook Research Demucs, original LICENSE copied).
