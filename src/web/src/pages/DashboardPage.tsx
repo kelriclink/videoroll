@@ -44,6 +44,12 @@ type ResourceSnapshot = {
   } | null;
 };
 
+type DubbingSummary = {
+  queued: number; running: number; failed: number;
+  recent: Array<{ id: string; task_id: string; status: string; progress: number;
+    stage?: string | null; error?: string | null; created_at?: string | null }>;
+};
+
 type AgentRun = {
   id: string;
   agent_type: string;
@@ -692,6 +698,7 @@ export default function DashboardPage() {
   const [resources, setResources] = useState<ResourceSnapshot | null>(null);
   const [resourcesError, setResourcesError] = useState<string | null>(null);
   const [agentRuns, setAgentRuns] = useState<AgentRun[] | null>(null);
+  const [dubbingSummary, setDubbingSummary] = useState<DubbingSummary | null>(null);
   const [agentRunsError, setAgentRunsError] = useState<string | null>(null);
   const [selectedAgentRootId, setSelectedAgentRootId] = useState<string | null>(null);
   const [selectedAgentNodeId, setSelectedAgentNodeId] = useState<string | null>(null);
@@ -709,6 +716,13 @@ export default function DashboardPage() {
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : String(e));
     }
+  }, []);
+
+  const loadDubbing = useCallback(async () => {
+    try {
+      setDubbingSummary(await fetchJson<DubbingSummary>(
+        `${ORCHESTRATOR_URL}/settings/dubbing/jobs/summary`));
+    } catch { /* retain last successful snapshot */ }
   }, []);
 
   const loadPublishingTasks = useCallback(async () => {
@@ -741,9 +755,10 @@ export default function DashboardPage() {
   useEffect(() => {
     void loadTasks();
     void loadPublishingTasks();
+    void loadDubbing();
     void loadResources();
     void loadAgentRuns();
-  }, [loadAgentRuns, loadPublishingTasks, loadResources, loadTasks]);
+  }, [loadAgentRuns, loadDubbing, loadPublishingTasks, loadResources, loadTasks]);
 
   useEffect(() => {
     // WebSocket is the fast path, but a missed/drop-overflowed event must not
@@ -794,6 +809,10 @@ export default function DashboardPage() {
     if (event.name === "system.resources.sample") {
       setResources(data as unknown as ResourceSnapshot);
       setResourcesError(null);
+      return;
+    }
+    if (event.name === "dubbing_job.updated" || event.name === "dubbing_job.deleted") {
+      void loadDubbing();
       return;
     }
     if (event.name === "task.updated") {
@@ -877,11 +896,12 @@ export default function DashboardPage() {
         scheduleSelectedAgentRefresh(id);
       }
     }
-  }, [scheduleAgentListRefresh, scheduleSelectedAgentRefresh, selectedAgentNodeId]);
+  }, [loadDubbing, scheduleAgentListRefresh, scheduleSelectedAgentRefresh, selectedAgentNodeId]);
 
   useRealtimeSubscription(["tasks", "publishing", "resources", "agents"], handleRealtimeEvent, () => {
     void loadTasks();
     void loadPublishingTasks();
+    void loadDubbing();
     void loadResources();
     void loadAgentRuns();
   });
@@ -1057,6 +1077,37 @@ export default function DashboardPage() {
             ) : null}
           </>
         ) : null}
+      </section>
+
+      <section className="vr-section" aria-label="YouDub 中文配音队列">
+        <div className="flex items-center justify-between gap-3">
+          <div>
+            <div className="text-sm font-semibold text-slate-950">YouDub · 中文配音</div>
+            <div className="mt-1 text-xs text-slate-500">批量配音队列，显示当前进度与最近失败原因。</div>
+          </div>
+          <Link to="/settings/dubbing" className="text-xs text-sky-700 hover:underline">引擎管理 →</Link>
+        </div>
+        <div className="mt-3 flex flex-wrap gap-3 text-sm text-slate-700">
+          <span>等待 {dubbingSummary?.queued ?? "-"}</span>
+          <span>运行 {dubbingSummary?.running ?? "-"}</span>
+          <span>最近失败 {dubbingSummary?.failed ?? "-"}</span>
+        </div>
+        <div className="mt-3 grid gap-2 lg:grid-cols-2">
+          {(dubbingSummary?.recent ?? []).slice(0, 8).map((job) => <Link
+            key={job.id} to={`/tasks/${job.task_id}`}
+            className="rounded border border-slate-200 p-3 hover:border-sky-300">
+            <div className="flex items-center justify-between gap-3 text-xs">
+              <span className="font-mono text-slate-600">{job.task_id.slice(0, 8)} · {job.stage ?? job.status}</span>
+              <span>{job.status} · {job.progress}%</span>
+            </div>
+            <div className="mt-2 h-1.5 overflow-hidden rounded bg-slate-100">
+              <div className="h-full bg-sky-600" style={{ width: `${Math.max(0, Math.min(100, job.progress))}%` }} />
+            </div>
+            {job.error && <div className="mt-2 truncate text-xs text-rose-700">{job.error}</div>}
+          </Link>)}
+          {dubbingSummary && dubbingSummary.recent.length === 0 &&
+            <div className="text-xs text-slate-500">暂无原生中配任务。</div>}
+        </div>
       </section>
 
       <div className="grid gap-4 lg:grid-cols-2">

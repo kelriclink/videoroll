@@ -11,6 +11,8 @@ import argparse
 import hashlib
 import json
 import os
+import socket
+import socketserver
 from pathlib import Path
 import shutil
 import sqlite3
@@ -171,16 +173,109 @@ def interrupt(task_id: str) -> dict:
     return status(task_id)
 
 
+RESIDENT_SOCKET = RUNTIME / "voxcpm-resident.sock"
+
+
+def resident_request(command: str, task_id: str | None = None, *, timeout: float = 3) -> dict:
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as channel:
+        channel.settimeout(timeout)
+        channel.connect(str(RESIDENT_SOCKET))
+        channel.sendall((json.dumps({"command": command, "task_id": task_id}) + "\n").encode())
+        if command == "run":
+            channel.settimeout(None)  # whole videos may take hours
+        body = bytearray()
+        while not body.endswith(b"\n"):
+            chunk = channel.recv(65536)
+            if not chunk:
+                raise RuntimeError("Resident VoxCPM2 process disconnected")
+            body.extend(chunk)
+            if len(body) > 1_000_000:
+                raise RuntimeError("Resident VoxCPM2 response exceeded limit")
+        result = json.loads(body.decode())
+        if not result.get("ok"):
+            raise RuntimeError(str(result.get("error") or "Resident inference failed"))
+        return result.get("result") or {}
+
+
+def serve_resident() -> None:
+    """Reuse upstream VoxCPM2 _MODEL across consecutive, serialized jobs.
+
+    A single-process Unix socket eliminates extra GPU copies. YouDub itself
+    remains untouched; opt out of its end-of-stage model eviction only inside
+    this dedicated residency process.
+    """
+    import gc
+    from backend.app.adapters import voxcpm
+    from backend.app import gpu_memory
+    import torch
+
+    config, database, pipeline = load_upstream()
+    # Preserve ONLY VoxCPM across tasks. Other YouDub models continue to
+    # honor upstream's normal stage cleanup to minimize GPU pressure.
+    original_stage_release = gpu_memory.release_stage_memory
+    def _release_nonresident_stage(stage: str):
+        if stage == "tts":
+            return None
+        return original_stage_release(stage)
+    gpu_memory.release_stage_memory = _release_nonresident_stage
+    def _release_nonresident_task():
+        return gpu_memory._release_memory(
+            "resident task finally", (("backend.app.adapters.whisper_asr", "Whisper"),),
+        )
+    gpu_memory.release_task_memory = _release_nonresident_task
+    voxcpm._load_model()  # real GPU residency; startup fails on OOM
+    if RESIDENT_SOCKET.exists():
+        try:
+            resident_request("ping", timeout=0.5)
+        except (OSError, RuntimeError, ValueError):
+            RESIDENT_SOCKET.unlink(missing_ok=True)
+        else:
+            raise RuntimeError("Resident VoxCPM2 already serving")
+
+    class Handler(socketserver.StreamRequestHandler):
+        def handle(self):
+            try:
+                message = json.loads(self.rfile.readline(8192))
+                action = message.get("command")
+                if action == "ping":
+                    result = {"gpu_loaded": voxcpm._MODEL is not None, "pid": os.getpid()}
+                elif action == "run":
+                    result = run(str(uuid.UUID(message["task_id"])))
+                    # Clear temporary Torch allocations but retain the model.
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                else:
+                    raise ValueError("unsupported resident action")
+                self.wfile.write((json.dumps({"ok": True, "result": result}) + "\n").encode())
+            except BaseException as exc:
+                self.wfile.write((json.dumps({"ok": False, "error": f"{type(exc).__name__}: {exc}"}) + "\n").encode())
+
+    class Server(socketserver.UnixStreamServer):
+        allow_reuse_address = False
+
+    try:
+        with Server(str(RESIDENT_SOCKET), Handler) as server:
+            os.chmod(RESIDENT_SOCKET, 0o600)
+            print(json.dumps({"status": "resident_ready", "pid": os.getpid()}), flush=True)
+            server.serve_forever(poll_interval=1)
+    finally:
+        RESIDENT_SOCKET.unlink(missing_ok=True)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     mode = parser.add_mutually_exclusive_group(required=True)
-    for value in ("prepare", "create", "run", "status", "resume", "interrupt"):
+    for value in ("prepare", "create", "run", "status", "resume", "interrupt", "serve"):
         mode.add_argument("--" + value, action="store_true")
     parser.add_argument("--video", type=Path)
     parser.add_argument("--srt", type=Path)
     parser.add_argument("--direction", default="en-zh")
     parser.add_argument("--task-id")
     a = parser.parse_args()
+    if a.serve:
+        load_upstream()  # configure module paths before importing VoxCPM
+        serve_resident()
+        return
     if a.prepare:
         result = prepare()
     elif a.create:
@@ -195,7 +290,10 @@ def main() -> None:
     elif a.interrupt:
         result = interrupt(a.task_id)
     else:
-        result = run(a.task_id)
+        if os.getenv("VIDEOROLL_YOUDUB_RESIDENT", "0") == "1":
+            result = resident_request("run", a.task_id, timeout=3)
+        else:
+            result = run(a.task_id)
     print(json.dumps(result, ensure_ascii=False, default=str), flush=True)
 
 

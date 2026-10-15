@@ -4,7 +4,8 @@ import { orchestratorUrl } from "../lib/urls";
 
 type NativeStatus = {
   engine: string; installed: boolean; enabled: boolean; accepting_jobs: boolean;
-  active_jobs: number; busy: boolean; mode: string; gpu_loaded: boolean | null; message: string;
+  active_jobs: number; busy: boolean; mode: string; resident: boolean;
+  gpu_loaded: boolean | null; message: string;
 };
 type Summary = { native: NativeStatus; worker: { state: string } };
 
@@ -41,6 +42,21 @@ export default function SettingsDubbingPage() {
     finally { setBusy(false); }
   }
 
+  async function switchResidency(resident: boolean) {
+    setBusy(true); setError(null); setMessage(null);
+    try {
+      await fetchJson(orchestratorUrl("/settings/dubbing/native"), {
+        method: "PUT", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ enabled: true, resident }),
+      });
+      setMessage(resident ?
+        "已请求驻留：正在独立进程预热 VoxCPM2；加载完成后显示显存已驻留。" :
+        "已关闭驻留，模型使用完后不保留在 GPU。 ");
+      await refresh();
+    } catch (reason) { setError(String(reason)); }
+    finally { setBusy(false); }
+  }
+
   const native = state?.native;
   return <section className="space-y-5">
     <div>
@@ -57,7 +73,7 @@ export default function SettingsDubbingPage() {
         <span>控制：{native?.enabled ? "已启用（按需加载）" : "已停用"}</span>
         <span>任务：{native?.active_jobs ?? 0} 项正在执行或排队</span>
         <span>Hatchet Worker：{state?.worker.state === "active" ? "运行中" : "未运行"}</span>
-        <span>显存：{native?.gpu_loaded === false ? "当前不驻留" : native?.busy ? "正在使用" : "未加载"}</span>
+        <span>显存：{native?.gpu_loaded === true ? "已驻留" : native?.resident ? "正在预热 / 执行中" : native?.busy ? "任务使用中" : "按需释放"}</span>
         <span>引擎：YouDub 原生独立环境</span>
       </div>
       <p className="text-xs text-slate-600">{native?.message ?? "正在检查引擎运行状态…"}</p>
@@ -71,9 +87,23 @@ export default function SettingsDubbingPage() {
         <button type="button" disabled={busy} onClick={() => void refresh()}
           className="rounded border px-4 py-2 text-sm">刷新</button>
       </div>
+      <div className="rounded border border-slate-200 p-3 space-y-2">
+        <div className="text-sm font-medium">VoxCPM2 显存驻留</div>
+        <label className="flex items-center gap-2 text-sm">
+          <input type="checkbox" checked={Boolean(native?.resident)}
+            disabled={busy || !native?.enabled || (native?.active_jobs ?? 0) > 0}
+            onChange={(e) => void switchResidency(e.target.checked)}/>
+          任务结束后继续保留模型在显存中（加速下一条配音）
+        </label>
+        <p className="text-xs text-slate-500">
+          默认关闭。开启后以独立进程真正驻留并跨任务复用 VoxCPM2；
+          为避免与 Qwen/其他推理冲突，需要至少约 12 GiB 可用显存，否则会拒绝开启。
+          有排队或运行任务时禁止切换；驻留进程异常退出后，新任务会尝试恢复。
+        </p>
+      </div>
       <p className="text-xs text-slate-500">
-        启用并不常驻显存；VideoRoll 只控制是否接收任务，YouDub 工作进程在任务运行时加载模型。
-        为保护正在执行的任务，存在排队或运行任务时不能停用。
+        配音服务“启用”与“显存驻留”独立控制。未开启驻留时任务结束释放 GPU；
+        为保护批量处理，排队或运行中不能切换驻留状态或停用引擎。
       </p>
       {error && <p role="alert" className="break-all text-sm text-red-700">{error}</p>}
       {message && <p className="text-sm text-emerald-700">{message}</p>}

@@ -37,11 +37,35 @@ def worker_state() -> dict[str, str | bool]:
 
 class EngineControl(BaseModel):
     enabled: bool
+    resident: bool | None = None
 
 
 @router.get("/settings/dubbing")
 def settings(db: Session = Depends(get_db)) -> dict:
     return {"native": youdub_control.status(db), "worker": worker_state()}
+
+
+@router.get("/settings/dubbing/jobs/summary")
+def recent_native_jobs(db: Session = Depends(get_db)) -> dict:
+    """Batch-aware status for the main workbench (no GPU/model imports)."""
+    native_model = DubbingJob.request_json["model_path"].as_string() == "youdub:voxcpm2"
+    rows = db.query(DubbingJob).filter(native_model).order_by(
+        DubbingJob.created_at.desc()).limit(40).all()
+    active = {"queued", "preparing", "synthesizing", "aligning", "mixing",
+              "pause_requested", "cancel_requested"}
+    all_active = db.query(DubbingJob).filter(native_model, DubbingJob.status.in_(active)).all()
+    return {
+        "queued": sum(j.status == "queued" for j in all_active),
+        "running": sum(j.status in active - {"queued"} for j in all_active),
+        "failed": sum(j.status == "failed" for j in rows),
+        "recent": [
+            {"id": str(j.id), "task_id": str(j.task_id), "status": j.status,
+             "progress": j.progress, "stage": (j.output_json or {}).get("youdub", {}).get("stage"),
+             "error": j.error_message,
+             "created_at": j.created_at.isoformat() if j.created_at else None}
+            for j in rows[:12]
+        ],
+    }
 
 
 @router.get("/settings/dubbing/native")
@@ -52,7 +76,7 @@ def engine_state(db: Session = Depends(get_db)) -> dict:
 @router.put("/settings/dubbing/native")
 def engine_control(payload: EngineControl, db: Session = Depends(get_db)) -> dict:
     try:
-        return youdub_control.configure(db, enabled=payload.enabled)
+        return youdub_control.configure(db, enabled=payload.enabled, resident=payload.resident)
     except (ValueError, RuntimeError) as exc:
         raise HTTPException(409, str(exc)) from exc
 

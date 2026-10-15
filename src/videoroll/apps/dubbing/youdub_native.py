@@ -5,6 +5,7 @@ All those stages execute inside upstream YouDub PipelineRunner subprocess.
 """
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import signal
@@ -12,6 +13,7 @@ import subprocess
 import time
 import uuid
 from dataclasses import dataclass
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Callable
 
@@ -129,7 +131,30 @@ def _stop_group(process: subprocess.Popen) -> None:
         process.wait(timeout=10)
 
 
-def run_native(
+@contextmanager
+def _exclusive_gpu_slot(progress: Callable[[dict], None], should_continue: Callable[[], None]):
+    """Host-level guard: even another Hatchet worker/process cannot run a
+    second Demucs/VoxCPM task on the same V100 simultaneously. The wait
+    heartbeats the DB lease and remains cancelable.
+    """
+    lock_path = runtime_dir() / ".videoroll-native-gpu.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+b") as handle:
+        while True:
+            should_continue()
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                progress({"current_stage": "waiting_gpu", "stages": [], "status": "queued"})
+                time.sleep(5)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+
+
+def _run_native_unlocked(
     *, job_id: uuid.UUID, video: Path, raw_subtitles: Path,
     workspace: Path,
     progress: Callable[[dict], None],
@@ -163,7 +188,14 @@ def run_native(
     elif state["status"] != "queued":
         raise RuntimeError(f"YouDub task cannot resume from {state['status']}")
     else:
+        from videoroll.apps.dubbing.youdub_control import (
+            is_resident, ensure_resident, stop_resident,
+        )
+        resident = is_resident()
+        if resident:
+            ensure_resident(progress=progress, should_continue=should_continue)
         env = os.environ.copy()
+        env["VIDEOROLL_YOUDUB_RESIDENT"] = "1" if resident else "0"
         env.setdefault(
             "VOXCPM_MODEL_DIR",
             str(runtime_dir() / "models/OpenBMB__VoxCPM2-modelscope"),
@@ -184,6 +216,11 @@ def run_native(
                     time.sleep(5)
             except BaseException:
                 _stop_group(proc)
+                # In resident mode the socket client is only a proxy; the
+                # actual YouDub PipelineRunner must be killed too or it keeps
+                # running after the VideoRoll task was paused/canceled.
+                if resident:
+                    stop_resident()
                 # Upstream only resumes jobs marked failed. Do not leave a
                 # killed native runner with its stage stuck in 'running'.
                 try:
@@ -207,3 +244,17 @@ def run_native(
     if not audio.is_file() or audio.stat().st_size < 1024:
         raise RuntimeError("YouDub mix asset is missing")
     return NativeResult(video=output, audio=audio, stages=tuple(state["stages"]))
+
+
+def run_native(
+    *, job_id: uuid.UUID, video: Path, raw_subtitles: Path,
+    workspace: Path,
+    progress: Callable[[dict], None],
+    should_continue: Callable[[], None],
+) -> NativeResult:
+    with _exclusive_gpu_slot(progress, should_continue):
+        return _run_native_unlocked(
+            job_id=job_id, video=video, raw_subtitles=raw_subtitles,
+            workspace=workspace, progress=progress,
+            should_continue=should_continue,
+        )

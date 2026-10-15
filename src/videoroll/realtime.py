@@ -260,7 +260,7 @@ def publish_agent_event(
 
 
 def _model_event_spec(obj: Any, *, deleted: bool = False) -> dict[str, Any] | None:
-    from videoroll.db.models import Account, Asset, PublishBatch, PublishJob, RenderJob, SubtitleJob, Task
+    from videoroll.db.models import Account, Asset, DubbingJob, PublishBatch, PublishJob, RenderJob, SubtitleJob, Task
 
     if isinstance(obj, Task):
         task_id = str(obj.id or "")
@@ -300,6 +300,20 @@ def _model_event_spec(obj: Any, *, deleted: bool = False) -> dict[str, Any] | No
                 "error_message": obj.error_message,
                 "created_at": obj.created_at,
                 "updated_at": obj.updated_at,
+            },
+        }
+    if isinstance(obj, DubbingJob):
+        task_id = str(obj.task_id or "")
+        return {
+            "topics": ["tasks", "queue", f"task:{task_id}"],
+            "name": "dubbing_job.deleted" if deleted else "dubbing_job.updated",
+            "entity_id": str(obj.id),
+            "data": {
+                "id": str(obj.id), "task_id": task_id,
+                "status": str(obj.status), "progress": int(obj.progress or 0),
+                "error_message": obj.error_message,
+                "stage": (obj.output_json or {}).get("youdub", {}).get("stage"),
+                "created_at": obj.created_at, "updated_at": obj.updated_at,
             },
         }
     if isinstance(obj, RenderJob):

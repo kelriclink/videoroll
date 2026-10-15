@@ -91,8 +91,8 @@ def register_dubbing_job_task(hatchet: Any) -> Any:
         retries=1,
         backoff_factor=2.0,
         backoff_max_seconds=60,
-        schedule_timeout=timedelta(minutes=30),
-        execution_timeout=timedelta(hours=24),
+        schedule_timeout=timedelta(days=7),
+        execution_timeout=timedelta(hours=36),
         desired_worker_labels=pool,
     )
     def dubbing_job(input: DubbingJobWorkflowInput, ctx: Any) -> dict[str, str]:

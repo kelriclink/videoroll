@@ -441,8 +441,8 @@ def register_video_pipeline(hatchet: Any, *, settings: WorkflowRuntimeSettings |
     @workflow.durable_task(
         name="dubbing-wait",
         parents=[dubbing_start],
-        schedule_timeout=timedelta(minutes=30),
-        execution_timeout=timedelta(hours=48),
+        schedule_timeout=timedelta(days=7),
+        execution_timeout=timedelta(days=7),
         desired_worker_labels=_desired_pool("workflow-core"),
     )
     async def dubbing_wait(input: AutoYouTubeWorkflowInput, ctx: Any) -> WorkflowStageOutput:
@@ -463,7 +463,7 @@ def register_video_pipeline(hatchet: Any, *, settings: WorkflowRuntimeSettings |
             f"input.dubbing_job_id == '{job_id}'",
             payload_validator=DubbingFinishedEvent,
             scope=job_id,
-            lookback_window=timedelta(hours=48),
+            lookback_window=timedelta(days=7),
             label=f"dubbing:{job_id}",
         )
         if event.status != "succeeded":

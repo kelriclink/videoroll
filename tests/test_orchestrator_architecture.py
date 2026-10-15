@@ -44,6 +44,7 @@ EXPECTED_ORCHESTRATOR_ROUTES: set[tuple[str, str]] = {
     ("GET", "/settings/api"),
     ("GET", "/settings/dubbing"),
     ("GET", "/settings/dubbing/native"),
+    ("GET", "/settings/dubbing/jobs/summary"),
     ("GET", "/settings/publish/platforms"),
     ("GET", "/settings/publish/social/accounts"),
     ("GET", "/settings/publish/social/login-sessions/{session_id}"),
