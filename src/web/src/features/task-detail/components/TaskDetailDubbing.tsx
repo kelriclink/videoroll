@@ -15,7 +15,8 @@ const VOICES = [
 ] as const;
 
 const MODELS = [
-  { id: "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice", label: "Qwen3-TTS 0.6B（推荐试用）" },
+  { id: "youdub:voxcpm2", label: "YouDub · VoxCPM2 原生全流程配音（推荐）" },
+  { id: "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice", label: "Qwen3-TTS 0.6B（旧版）" },
   { id: "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice", label: "Qwen3-TTS 1.7B（显存占用更高）" },
   { id: "cosyvoice3:base", label: "CosyVoice 3 Base · 英文转中文声音克隆" },
   { id: "cosyvoice3:rl", label: "CosyVoice 3 RL · 科技术语优先测试" },
@@ -59,6 +60,7 @@ export function TaskDetailDubbing({
   const [installedModels, setInstalledModels] = useState<string[]>([]);
   const [mixMode, setMixMode] = useState<"replace" | "original_low" | "background_only">("replace");
   const [workerReady, setWorkerReady] = useState(false);
+  const [nativeWorkerReady, setNativeWorkerReady] = useState(false);
   const [separationReady, setSeparationReady] = useState(false);
   const [instruct, setInstruct] = useState("");
   const [temperature, setTemperature] = useState(0.9);
@@ -81,6 +83,7 @@ export function TaskDetailDubbing({
   const [cosyMode, setCosyMode] = useState<"cross_lingual" | "zero_shot" | "instruct">("cross_lingual");
   const [cosySpeed, setCosySpeed] = useState(1.0);
   const usingCosy = modelPath.startsWith("cosyvoice3:");
+  const usingNative = modelPath === "youdub:voxcpm2";
   const [videoKey, setVideoKey] = useState("");
   const [subtitleJobId, setSubtitleJobId] = useState("");
   const [loading, setLoading] = useState(true);
@@ -100,9 +103,10 @@ export function TaskDetailDubbing({
     () => (subtitleJobs ?? []).filter((item) => item.status === "succeeded"),
     [subtitleJobs],
   );
-  const selectedVideo = sourceVideos.some((item) => item.storage_key === videoKey)
+  const eligibleVideos = usingNative ? sourceVideos.filter((item) => item.kind === "video_raw") : sourceVideos;
+  const selectedVideo = eligibleVideos.some((item) => item.storage_key === videoKey)
     ? videoKey
-    : sourceVideos[0]?.storage_key ?? "";
+    : eligibleVideos[0]?.storage_key ?? "";
   const selectedSubtitle = finishedSubtitles.some((item) => item.id === subtitleJobId)
     ? subtitleJobId
     : finishedSubtitles[0]?.id ?? "";
@@ -164,10 +168,11 @@ export function TaskDetailDubbing({
         setProfileId((current) => currentTaskProfiles.some((profile) => profile.id === current)
           ? current : currentTaskProfiles[currentTaskProfiles.length - 1]?.id ?? "");
         if (!restoredJob.current) {
-          setModelPath(state.selection.model);
-          setVoice(state.selection.voice);
+          setModelPath(state.models.some((m) => m.model === "youdub:voxcpm2" && m.installed && m.runtime_ready !== false) ? "youdub:voxcpm2" : state.selection.model);
+          setVoice(state.models.some((m) => m.model === "youdub:voxcpm2" && m.installed) ? "reference" : state.selection.voice);
         }
         setWorkerReady(state.worker?.available ?? false);
+        setNativeWorkerReady(state.worker?.state === "active");
         setSeparationReady(state.separation?.available ?? false);
       })
       .catch(() => { if (active) setInstalledModels([]); });
@@ -206,7 +211,7 @@ export function TaskDetailDubbing({
     ? jobs[0] : undefined;
   const trulyBusy = jobs.some((job) => RUNNING.has(job.status) ||
     ["queued", "pause_requested", "cancel_requested"].includes(job.status));
-  const canGenerate = Boolean(workerReady && installedModels.includes(modelPath) && selectedVideo && selectedSubtitle && task?.status !== "CANCELED"
+  const canGenerate = Boolean((usingNative ? nativeWorkerReady : workerReady) && installedModels.includes(modelPath) && selectedVideo && selectedSubtitle && task?.status !== "CANCELED"
     && (!usingCosy || (profileId !== "" && (cosyMode !== "zero_shot" || Boolean(voiceProfiles.find((x) => x.id === profileId)?.reference_text)) && (cosyMode !== "instruct" || Boolean(instruct.trim()))))
     && !trulyBusy && (!blockedByExisting || Boolean(editableJob)) && !submitting
     && (mixMode !== "background_only" || separationReady));
@@ -369,8 +374,8 @@ export function TaskDetailDubbing({
           配音源视频（原视频 / P1）
           <select className="mt-1 w-full rounded border p-2" value={selectedVideo}
             onChange={(e) => setVideoKey(e.target.value)} disabled={running || submitting}>
-            {sourceVideos.length === 0 ? <option value="">尚未找到可用的原视频或 P1</option> : null}
-            {sourceVideos.map((item) => (
+            {eligibleVideos.length === 0 ? <option value="">{usingNative ? "YouDub 必须使用原视频，不能使用已烧录字幕的 P1" : "尚未找到原视频或 P1"}</option> : null}
+            {eligibleVideos.map((item) => (
               <option value={item.storage_key} key={item.id}>
                 {item.kind === "video_raw" ? "原视频" : "P1 中文字幕"} · {item.storage_key.split("/").pop()}
               </option>
@@ -381,17 +386,21 @@ export function TaskDetailDubbing({
           中文音色
           <select className="mt-1 w-full rounded border p-2" value={voice}
             onChange={(e) => setVoice(e.target.value)} disabled={running || submitting}>
-            {usingCosy ? <option value="reference">参考音频声音克隆</option> : VOICES.map((item) => <option value={item.id} key={item.id}>{item.label}</option>)}
+            {usingCosy || usingNative ? <option value="reference">视频原声 · YouDub 自动提取参考音频</option> : VOICES.map((item) => <option value={item.id} key={item.id}>{item.label}</option>)}
           </select>
         </label>
         <label className="text-sm text-slate-700">
           TTS 模型
           <select className="mt-1 w-full rounded border p-2" value={modelPath}
-            onChange={(e) => {setModelPath(e.target.value);setVoice(e.target.value.startsWith("cosyvoice3:") ? "reference" : "Vivian");if (e.target.value.startsWith("cosyvoice3:")) setBatchSize(1);}} disabled={running || submitting}>
+            onChange={(e) => {setModelPath(e.target.value);setVoice(e.target.value.startsWith("cosyvoice3:") || e.target.value === "youdub:voxcpm2" ? "reference" : "Vivian");if (e.target.value.startsWith("cosyvoice3:") || e.target.value === "youdub:voxcpm2") setBatchSize(1);}} disabled={running || submitting}>
             {MODELS.map((item) => <option value={item.id} key={item.id} disabled={!installedModels.includes(item.id)}>{item.label}{installedModels.includes(item.id) ? "" : " · 未下载"}</option>)}
           </select>
         </label>
       </div>
+      {usingNative ? <div className="mt-3 rounded border border-sky-200 bg-sky-50 p-3 text-sm">
+        YouDub 原生引擎负责 Demucs、人声参考、VoxCPM2 语音克隆、时间轴对齐及 MP4 合成。
+        此模式只生成完整视频，不使用 VideoRoll 的旧逐句试听和加速逻辑。
+      </div> : null}
       {usingCosy ? <div className="mt-3 rounded border border-sky-200 bg-sky-50 p-3 space-y-3 text-sm">
         <div className="font-semibold">CosyVoice 3 · 原作者声音克隆（需要拥有授权）</div>
         <div className="grid gap-3 md:grid-cols-2">
@@ -455,7 +464,7 @@ export function TaskDetailDubbing({
             className="mt-2 rounded bg-sky-800 px-3 py-2 text-white disabled:opacity-50">提取并保存参考音频</button>
         </details>
       </div> : null}
-      <details className="mt-3 rounded border border-slate-200 p-3">
+      {!usingNative ? <details className="mt-3 rounded border border-slate-200 p-3">
         <summary className="cursor-pointer text-sm font-medium">高级参数 · 原声混音、批量与语气指令</summary>
         <label className="mt-3 flex items-center gap-2 text-sm">
           <input type="checkbox" checked={autoGroupSpeech}
@@ -493,33 +502,33 @@ export function TaskDetailDubbing({
           </label>
         </div> : null}
       </div>
-      </details>
-      {!workerReady ? <p className="mt-2 text-sm text-amber-700">配音 Worker 未运行，已禁止创建无执行节点的任务。</p> : null}
+      </details> : null}
+      {!(usingNative ? nativeWorkerReady : workerReady) ? <p className="mt-2 text-sm text-amber-700">配音 Worker 未运行，已禁止创建无执行节点的任务。</p> : null}
       <div className="mt-3 flex flex-wrap items-center gap-3 text-sm">
-        <p className="text-slate-600">配音对齐：YouDub 原生全局/局部伸缩与语音顺延。无需设置最大单句倍速。</p>
-        <label className="flex items-center gap-2">
+        <p className="text-slate-600">{usingNative ? "完整原生 YouDub：直接运行 VoxCPM2 / Demucs / 对齐 / 合成；禁用旧配音算法。" : "旧版 TTS + YouDub 对齐器（保留供历史兼容）。"}</p>
+        {!usingNative ? <label className="flex items-center gap-2">
           <input type="checkbox" checked={forceRegenerate} onChange={(event) => setForceRegenerate(event.target.checked)} disabled={trulyBusy || submitting}/>
           强制重新生成语音（默认关闭；重试建议复用旧缓存）
-        </label>
+        </label> : null}
       </div>
       <div className="mt-3 flex flex-wrap items-center gap-3">
-        {([false, true] as const).map((preview) => (
+        {(usingNative ? [false] as const : [false, true] as const).map((preview) => (
           <button key={String(preview)} type="button" className={preview ? "rounded border border-sky-800 px-4 py-2 text-sm text-sky-900 disabled:opacity-50" : "rounded bg-slate-900 px-4 py-2 text-sm text-white disabled:opacity-50"}
             disabled={!canGenerate}
             onClick={() => void submitJob({
               subtitle_job_id: selectedSubtitle,
               subtitle_video_key: selectedVideo,
               operation_key: `p2:debug:${Date.now()}:${preview ? "preview" : "full"}`,
-              voice: usingCosy ? "reference" : voice,
+              voice: usingCosy || usingNative ? "reference" : voice,
               model_path: modelPath, retain_original_audio: mixMode === "original_low",
               preview_only: preview, instruct: modelPath.includes("0.6B") ? "" : instruct,
-              temperature, top_p: topP, batch_size: usingCosy ? 1 : batchSize, mix_mode: mixMode,
+              temperature, top_p: topP, batch_size: usingCosy || usingNative ? 1 : batchSize, mix_mode: mixMode,
               reference_profile_id: usingCosy ? profileId : null,
               cosy_mode: cosyMode, cosy_speed: cosySpeed,
               debug_timing: false,
               auto_group_speech: autoGroupSpeech, auto_rewrite_speech: false,
             })}>
-            {submitting ? "正在提交…" : preview ? "生成一句试听" : "完整配音"}
+            {submitting ? "正在提交…" : preview ? "生成一句试听" : usingNative ? "使用原生 YouDub 完整配音" : "完整配音"}
           </button>
         ))}
         <button type="button" className="rounded border px-3 py-2 text-sm"

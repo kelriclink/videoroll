@@ -54,6 +54,7 @@ def _load_model():
         _MODEL = VoxCPM.from_pretrained(
             str(_model_path()),
             load_denoiser=os.getenv("VOXCPM_LOAD_DENOISER", "false").lower() == "true",
+            optimize=os.getenv("VOXCPM_OPTIMIZE", "false").lower() == "true",  # V100/torch.compile compatible
         )
     return _MODEL
 

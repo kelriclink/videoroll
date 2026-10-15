@@ -101,7 +101,7 @@ def create_dubbing_job(
     ).first()
     if competing is not None:
         raise ValueError(f"another dubbing job is active: {competing.id}")
-    from videoroll.apps.dubbing.model_management import COSY_MODELS, QWEN_MODELS
+    from videoroll.apps.dubbing.model_management import COSY_MODELS, QWEN_MODELS, NATIVE_MODELS
     profile_id, profile_sha = '', ''
     if model_path in COSY_MODELS:
         from videoroll.apps.dubbing.voice_profiles import resolve
@@ -116,6 +116,9 @@ def create_dubbing_job(
             raise ValueError('instruct mode requires an instruction')
         profile_id = str(reference_profile_id)
         profile_sha = str(profile['audio_sha256'])
+    elif model_path in NATIVE_MODELS:
+        if voice != 'reference' or preview_only:
+            raise ValueError('YouDub VoxCPM2 requires reference voice and complete pipeline')
     elif model_path in QWEN_MODELS:
         if voice not in ('Vivian', 'Serena', 'Uncle_Fu', 'Dylan', 'Eric'):
             raise ValueError('invalid Qwen3-TTS preset speaker')
@@ -146,6 +149,8 @@ def create_dubbing_job(
     ).first()
     if video_asset is None:
         raise ValueError("source raw or P1 video asset not found")
+    if model_path in NATIVE_MODELS and video_asset.kind != AssetKind.video_raw:
+        raise ValueError('Native YouDub must receive original video, not P1 with baked-in subtitles')
     # Preset Chinese voices are Qwen-only. CosyVoice3 uses its authorized
     # reference voice and must not be rejected by the Qwen speaker catalog.
     if model_path in QWEN_MODELS:
@@ -184,6 +189,12 @@ def execute_dubbing_job(
     ffmpeg: str = "ffmpeg",
     ffprobe: str = "ffprobe",
 ) -> dict[str, Any]:
+    with session_factory() as probe_db:
+        target = probe_db.get(DubbingJob, job_id)
+        if target is not None and (target.request_json or {}).get('model_path') == 'youdub:voxcpm2':
+            from videoroll.apps.dubbing.youdub_job import execute_native_job
+            return execute_native_job(job_id, session_factory=session_factory,
+                                      store=store, work_dir=work_dir)
     owner = f"dubbing:{uuid.uuid4().hex}"
     db = session_factory()
     try:

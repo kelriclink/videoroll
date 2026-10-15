@@ -221,6 +221,7 @@ class DubbingActionRequest(BaseModel):
         "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
         "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
         "cosyvoice3:base", "cosyvoice3:rl",
+        "youdub:voxcpm2",
     ] = "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"
     retain_original_audio: bool = False
     preview_only: bool = False

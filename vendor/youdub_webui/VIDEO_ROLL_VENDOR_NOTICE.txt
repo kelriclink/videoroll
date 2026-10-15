@@ -6,3 +6,5 @@ STATUS: vendor files copied verbatim; VideoRoll integration resides outside this
 # YouDub backend original source; separate runtime data
 
 Demucs git submodule revision: e976d93ecc3865e5757426930257e200846a520a (Facebook Research Demucs, original LICENSE copied).
+
+Local change: backend/app/adapters/voxcpm.py passes the officially supported optimize parameter (default false on V100; VOXCPM_OPTIMIZE=true to override), avoiding torch.compile/Einops incompatibility. Original generation algorithms unchanged.

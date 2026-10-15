@@ -182,10 +182,19 @@ def enqueue_dubbing_job(
     db: Session = Depends(get_db),
 ) -> RemoteJobResponse:
     from videoroll.apps.dubbing.job import create_dubbing_job
-    from videoroll.apps.dubbing.model_management import installed, COSY_MODELS
+    from videoroll.apps.dubbing.model_management import installed, COSY_MODELS, NATIVE_MODELS
     from videoroll.apps.dubbing.worker_status import worker_status
     from videoroll.workflows.launcher import PipelineLauncher
-    if not worker_status()["available"]:
+    worker = worker_status()
+    if payload.model_path in NATIVE_MODELS:
+        from videoroll.apps.dubbing.youdub_control import status as native_status
+        if not native_status(db)["accepting_jobs"]:
+            raise HTTPException(409, "YouDub is disabled or not ready; enable it in Dubbing settings")
+        if worker.get("state") != "active":
+            raise HTTPException(503, "Native YouDub worker is not running")
+        if payload.preview_only:
+            raise HTTPException(409, "Native YouDub produces complete media, not single-sentence previews")
+    elif not worker["available"]:
         raise HTTPException(503, "dubbing worker is not running; enable it before submitting")
     if not installed(payload.model_path):
         raise HTTPException(409, "Selected TTS model is not installed")
@@ -193,7 +202,7 @@ def enqueue_dubbing_job(
         from videoroll.apps.dubbing.cosyvoice3_adapter import runtime_ready
         if not runtime_ready():
             raise HTTPException(503, "CosyVoice3 inference runtime is not installed")
-    if payload.mix_mode == "background_only":
+    if payload.mix_mode == "background_only" and payload.model_path not in NATIVE_MODELS:
         from videoroll.apps.dubbing.separation import available
         if not available():
             raise HTTPException(503, "Demucs separation is not installed; use replace or original_low")

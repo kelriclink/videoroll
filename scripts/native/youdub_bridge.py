@@ -143,10 +143,38 @@ def run(task_id: str) -> dict:
     return result
 
 
+def resume(task_id: str) -> dict:
+    _, database, _ = load_upstream()
+    prior = status(task_id)
+    if prior['status'] != 'failed':
+        raise RuntimeError('Only failed YouDub tasks can resume')
+    # This is YouDub's own native stage-resume routine: completed stages and
+    # valid generated WAVs remain untouched.
+    database.reset_failed_for_resume(str(uuid.UUID(task_id)))
+    return status(task_id)
+
+
+def interrupt(task_id: str) -> dict:
+    _, database, _ = load_upstream()
+    prior = status(task_id)
+    if prior['status'] not in ('running', 'queued'):
+        raise RuntimeError('Only unfinished native jobs can be marked interrupted')
+    # Caller must terminate and wait for PipelineRunner process first; this
+    # only reconciles its native stage DB for upstream resume support.
+    task_id = str(uuid.UUID(task_id))
+    current = prior.get('current_stage')
+    if current:
+        database.update_stage(task_id, current, status='failed',
+                              error_message='Interrupted by VideoRoll controller')
+    database.update_task(task_id, status='failed',
+                         error_message='Interrupted by VideoRoll controller')
+    return status(task_id)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     mode = parser.add_mutually_exclusive_group(required=True)
-    for value in ("prepare", "create", "run", "status"):
+    for value in ("prepare", "create", "run", "status", "resume", "interrupt"):
         mode.add_argument("--" + value, action="store_true")
     parser.add_argument("--video", type=Path)
     parser.add_argument("--srt", type=Path)
@@ -162,6 +190,10 @@ def main() -> None:
                         direction=a.direction, task_id=a.task_id)
     elif a.status:
         result = status(a.task_id)
+    elif a.resume:
+        result = resume(a.task_id)
+    elif a.interrupt:
+        result = interrupt(a.task_id)
     else:
         result = run(a.task_id)
     print(json.dumps(result, ensure_ascii=False, default=str), flush=True)

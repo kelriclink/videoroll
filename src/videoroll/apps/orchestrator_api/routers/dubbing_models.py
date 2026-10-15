@@ -18,13 +18,14 @@ from pydantic import BaseModel
 from videoroll.apps.dubbing.model_management import choose, download, inventory
 from videoroll.apps.dubbing.worker_status import worker_status
 from videoroll.apps.dubbing.service_client import unified_service_status
+from videoroll.apps.dubbing import youdub_control
 from videoroll.apps.dubbing.separation import available as demucs_available
 
 router = APIRouter()
 
 
 class DubbingSelection(BaseModel):
-    model: Literal["Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice", "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice", "cosyvoice3:base", "cosyvoice3:rl"]
+    model: Literal["Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice", "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice", "cosyvoice3:base", "cosyvoice3:rl", "youdub:voxcpm2"]
     voice: Literal["Vivian", "Serena", "Uncle_Fu", "Dylan", "Eric", "reference"]
     device: Literal["cuda:0", "cuda:1", "cpu"]
 
@@ -35,8 +36,9 @@ class ModelDownload(BaseModel):
 
 
 @router.get("/settings/dubbing")
-def get_dubbing_config() -> dict:
+def get_dubbing_config(db: Session = Depends(get_db)) -> dict:
     return {**inventory(), "voice_profiles": list_profiles(), "worker": worker_status(),
+            "native": youdub_control.status(db),
             "service": unified_service_status(),
             "separation": {"available": demucs_available(), "engine": "Demucs htdemucs"}}
 
@@ -58,6 +60,24 @@ def download_dubbing_model(payload: ModelDownload) -> dict:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+class NativeEngineControl(BaseModel):
+    enabled: bool
+
+
+@router.get('/settings/dubbing/native')
+def get_native_engine_control(db: Session = Depends(get_db)) -> dict:
+    return youdub_control.status(db)
+
+
+@router.put('/settings/dubbing/native')
+def update_native_engine_control(payload: NativeEngineControl,
+                                 db: Session = Depends(get_db)) -> dict:
+    try:
+        return youdub_control.configure(db, enabled=payload.enabled)
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(409, str(exc)) from exc
 
 
 class VoiceReferenceFromVideo(BaseModel):

@@ -12,7 +12,8 @@ QWEN_MODELS = ("Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice", "Qwen/Qwen3-TTS-12Hz-1.7B
 COSY_MODELS = ("cosyvoice3:base", "cosyvoice3:rl")
 COSY_REPO = "FunAudioLLM/Fun-CosyVoice3-0.5B-2512"
 COSY_FOLDER = "Fun-CosyVoice3-0.5B-2512"
-MODELS = QWEN_MODELS + COSY_MODELS
+NATIVE_MODELS = ('youdub:voxcpm2',)
+MODELS = QWEN_MODELS + COSY_MODELS + NATIVE_MODELS
 TOKENIZER = "Qwen/Qwen3-TTS-Tokenizer-12Hz"
 VOICES = ("Vivian", "Serena", "Uncle_Fu", "Dylan", "Eric")
 DEVICES = ("cuda:0", "cuda:1", "cpu")
@@ -29,7 +30,10 @@ def root() -> Path:
 def folder(model: str, base: Path | None = None) -> Path:
     if model not in MODELS:
         raise ValueError("unsupported TTS model")
-    return (base or root()) / (COSY_FOLDER if model in COSY_MODELS else model.split("/")[-1])
+    if model in NATIVE_MODELS:
+        from videoroll.apps.dubbing.youdub_native import runtime_dir
+        return runtime_dir() / 'models' / 'OpenBMB__VoxCPM2-modelscope'
+    return (base or root()) / (COSY_FOLDER if model in COSY_MODELS else model.split('/')[-1])
 
 
 def atomic_json(path: Path, obj: dict) -> None:
@@ -62,6 +66,9 @@ def lock(base: Path):
 
 
 def installed(model: str, base: Path | None = None) -> bool:
+    if model in NATIVE_MODELS:
+        from videoroll.apps.dubbing.youdub_native import model_installed
+        return model_installed()
     d = folder(model, base)
     if model in COSY_MODELS:
         required = ("cosyvoice3.yaml", "flow.pt", "hift.pt", "campplus.onnx",
@@ -80,7 +87,7 @@ def selection(base: Path | None = None) -> dict:
     value = read_json((base or root()) / "selected.json")
     return {
         "model": value.get("model") if value.get("model") in MODELS else MODELS[0],
-        "voice": ("reference" if value.get("model") in COSY_MODELS
+        "voice": ("reference" if value.get("model") in COSY_MODELS + NATIVE_MODELS
                   else (value.get("voice") if value.get("voice") in VOICES else "Vivian")),
         "device": value.get("device") if value.get("device") in DEVICES else "cuda:0",
     }
@@ -90,7 +97,7 @@ def choose(model: str, voice: str, device: str, base: Path | None = None) -> dic
     base = base or root()
     if model not in MODELS or device not in DEVICES:
         raise ValueError("invalid model or device")
-    if (model in COSY_MODELS and voice != "reference") or (model in QWEN_MODELS and voice not in VOICES):
+    if (model in COSY_MODELS + NATIVE_MODELS and voice != "reference") or (model in QWEN_MODELS and voice not in VOICES):
         raise ValueError("invalid voice for the selected engine")
     if model in COSY_MODELS and device != "cuda:0":
         raise ValueError("CosyVoice3 V100 runtime currently supports cuda:0 only")
