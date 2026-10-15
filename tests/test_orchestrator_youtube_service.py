@@ -349,3 +349,91 @@ def test_youtube_download_releases_settings_transaction_before_network(tmp_path)
             youtube_service._download(task_id, settings=settings, db=db, store=store, reporter=reporter)
     assert timeline.index("commit") < timeline.index("download")
     db.rollback.assert_called()
+
+
+def test_successful_youtube_download_cleanup_removes_partial_files(tmp_path) -> None:
+    """A completed download should clean temporary aria2/yt-dlp files."""
+    root = tmp_path / "youtube" / "task-id"
+    media = root / "media-download" / "parallel"
+    media.mkdir(parents=True)
+    (media / "video.webm.part.aria2").write_text("resume", encoding="utf-8")
+    youtube_service._cleanup_completed_youtube_media(root)
+    assert not (root / "media-download").exists()
+
+
+def test_successful_youtube_download_cleanup_error_is_nonfatal(tmp_path, caplog) -> None:
+    """Post-commit workdir errors must not mark a saved video as failed."""
+    root = tmp_path / "youtube" / "task-id"
+    media = root / "media-download"
+    media.mkdir(parents=True)
+    with patch.object(youtube_service.shutil, "rmtree", side_effect=PermissionError("busy workdir")):
+        youtube_service._cleanup_completed_youtube_media(root, task_id=uuid.uuid4())
+    assert media.exists()
+    assert "temporary media cleanup failed" in caplog.text
+
+
+def test_existing_video_download_retry_succeeds_even_if_workdir_cleanup_fails(tmp_path) -> None:
+    """Regression for a real 3+ GB video saved before post-download NameError."""
+    from videoroll.db.models import Asset, AssetKind, SourceType, TaskStatus
+
+    task_id = uuid.uuid4()
+    source_url = "https://www.youtube.com/watch?v=63lqU99buno"
+    task = SimpleNamespace(
+        id=task_id, source_url=source_url,
+        source_type=SourceType.youtube, status=TaskStatus.downloaded,
+    )
+    video_key = f"raw/{task_id}/video_saved.webm"
+    video_asset = Asset(
+        id=uuid.uuid4(), task_id=task_id, kind=AssetKind.video_raw,
+        storage_key=video_key, sha256="0" * 64, size_bytes=3_300_000_000,
+        duration_ms=None, created_at=datetime.now(timezone.utc),
+    )
+    metadata_asset = Asset(
+        id=uuid.uuid4(), task_id=task_id, kind=AssetKind.metadata_json,
+        storage_key=f"raw/{task_id}/metadata.json", sha256="1" * 64,
+        size_bytes=100, duration_ms=None, created_at=datetime.now(timezone.utc),
+    )
+    info = {"title": "Existing YouTube download", "id": "63lqU99buno"}
+    db = Mock()
+    db.get.return_value = task
+    def apply_db_defaults(row):
+        if getattr(row, "id", None) is None:
+            row.id = uuid.uuid4()
+        if getattr(row, "created_at", None) is None:
+            row.created_at = datetime.now(timezone.utc)
+    db.refresh.side_effect = apply_db_defaults
+    query = Mock()
+    db.query.return_value = query
+    query.filter.return_value.order_by.return_value.first.side_effect = [
+        video_asset, metadata_asset,
+    ]
+    store = Mock()
+    store.get_object.return_value = {
+        "Body": SimpleNamespace(read=lambda: youtube_service.json.dumps(info).encode()),
+    }
+    settings = SimpleNamespace(work_dir=str(tmp_path))
+    meta = SimpleNamespace(title="Existing YouTube download", description="", webpage_url=source_url)
+    reporter = Mock()
+
+    real_rmtree = youtube_service.shutil.rmtree
+
+    def fail_just_media_cleanup(path, *args, **kwargs):
+        if str(path).endswith("media-download"):
+            raise PermissionError("busy workdir")
+        return real_rmtree(path, *args, **kwargs)
+
+    with (
+        patch.object(youtube_service, "effective_youtube_settings", return_value=object()),
+        patch.object(youtube_service, "summarize_info", return_value=meta),
+        patch.object(youtube_service, "download_thumbnail_jpg", return_value=None),
+        patch.object(youtube_service, "snapshot_downloaded_youtube_info"),
+        patch.object(youtube_service, "download_youtube_video") as download_again,
+        patch.object(youtube_service.shutil, "rmtree", side_effect=fail_just_media_cleanup),
+    ):
+        response = youtube_service._download(
+            task_id, settings=settings, db=db, store=store, reporter=reporter
+        )
+    assert response.video_asset.storage_key == video_key
+    download_again.assert_not_called()
+    store.head_object.assert_called_once_with(video_key)
+    reporter.update.assert_any_call("completed", 100, speed_bytes_per_second=None, eta_seconds=0)

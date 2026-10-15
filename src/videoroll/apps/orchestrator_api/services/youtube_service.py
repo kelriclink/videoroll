@@ -4,6 +4,7 @@ import hashlib
 import json
 import logging
 import os
+import shutil
 import tempfile
 import threading
 import time
@@ -634,6 +635,23 @@ class _YouTubeDownloadProgressReporter:
             self.update("failed", self.last_progress, error=str(exc)[:500])
 
 
+def _cleanup_completed_youtube_media(root: Path, *, task_id: uuid.UUID | None = None) -> None:
+    """Best-effort cleanup only after raw media and metadata have been committed.
+
+    A failed cleanup must not turn a successful download into a failed API
+    response. Failed downloads retain aria2 checkpoints for resume.
+    """
+    try:
+        shutil.rmtree(root / "media-download")
+    except FileNotFoundError:
+        pass
+    except Exception:
+        logger.exception(
+            "youtube download persisted successfully, but temporary media cleanup failed",
+            extra={"task_id": str(task_id) if task_id else None},
+        )
+
+
 def _download(
     task_id: uuid.UUID,
     *,
@@ -766,8 +784,7 @@ def _download(
             _queue_uploaded_objects_for_cleanup(db, uploaded_keys)
             raise
     if video_asset is not None:
-        # Cleanup only after media promotion + database transaction succeeded.
-        shutil.rmtree(root / "media-download", ignore_errors=True)
+        _cleanup_completed_youtube_media(root, task_id=task_id)
     reporter.update("completed", 100, speed_bytes_per_second=None, eta_seconds=0)
     return YouTubeDownloadActionResponse(metadata=youtube_meta_to_read(meta), metadata_asset=meta_asset, video_asset=video_asset, cover_asset=cover_asset)
 
