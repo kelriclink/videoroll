@@ -72,6 +72,7 @@ class TranslationCheckpointStore:
         source: list[Segment],
         *,
         source_segments_key: str | None,
+        provider: str = "openai",
     ) -> tuple[list[Segment], str, dict[str, object]]:
         if not source or not source_segments_key:
             return [], "", {}
@@ -84,6 +85,9 @@ class TranslationCheckpointStore:
         if not isinstance(payload, dict):
             return [], "", {}
         if str(payload.get("source_segments_key") or "").strip() != str(source_segments_key or "").strip():
+            return [], "", {}
+        # Historical checkpoints predate provider markers and belong to OpenAI.
+        if str(payload.get("provider") or "openai") != provider:
             return [], "", {}
 
         translated_prefix = segments_from_json_data(payload.get("translated_segments"))
@@ -102,11 +106,13 @@ class TranslationCheckpointStore:
         *,
         summary: str,
         context_state: dict[str, object] | None = None,
+        provider: str = "openai",
     ) -> None:
         if not source_segments_key or not translated_prefix:
             return
         payload = {
             "source_segments_key": str(source_segments_key).strip(),
+            "provider": provider,
             "summary": str(summary or "").strip()[:500],
             "translated_segments": segments_to_json_data(translated_prefix),
         }

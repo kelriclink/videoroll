@@ -220,7 +220,38 @@ def run_translation_stage(
         flush_batch_thinking(batch_context)
 
     try:
-        if provider == "mock":
+        if provider == "index_translate":
+            from videoroll.apps.subtitle_service.index_translate import translate_subtitles_index
+
+            # Keep this provider independent of the tool-capable RAG LLM.
+            # Existing source timestamps are preserved, and prefix checkpoints remain resumable.
+            prefix, _, _ = checkpoint.load_with_context(
+                segments, source_segments_key=source_segments_key, provider="index_translate"
+            )
+            if selective_mode:
+                prefix = []
+            resumed_segments = len(prefix)
+            completed_segments = len(prefix)
+            db.commit()  # Avoid idle-in-transaction while waiting for the public API.
+
+            def on_index_batch_done(completed: list[Segment]) -> None:
+                nonlocal completed_segments, succeeded_batches, batch_count
+                completed_segments = len(completed) if not selective_mode else len(selected_indices or [])
+                succeeded_batches += 1
+                batch_count += 1
+                if not selective_mode:
+                    checkpoint.save(source_segments_key, completed, summary="", provider="index_translate")
+            segments_out = translate_subtitles_index(
+                segments, target_lang=target_lang, style=style, settings=translate_settings,
+                batch_size=int(translate_cfg.get("batch_size") or translate_settings.get("index_batch_size") or 12),
+                resume_from=prefix,
+                selected_indices=selective_indices if selective_mode else None,
+                base_translations=base_translations if selective_mode else None,
+                on_batch_done=on_index_batch_done, report=log,
+            )
+            translation_summary = ""
+            checkpoint.clear()
+        elif provider == "mock":
             segments_out = translate_segments_mock(segments, target_lang=target_lang)
             translation_summary = ""
         elif provider in {"noop", "none"}:

@@ -93,6 +93,14 @@ def get_translate_settings(db: Session, defaults: SubtitleServiceSettings) -> di
         "default_enable_summary": bool(
             stored.get("default_enable_summary") if "default_enable_summary" in stored else defaults.translate_enable_summary
         ),
+        "index_temperature": float(stored.get("index_temperature") if stored.get("index_temperature") is not None else 0.0),
+        "index_timeout_seconds": float(stored.get("index_timeout_seconds") or 120.0),
+        "index_max_tokens": int(stored.get("index_max_tokens") or 4096),
+        "index_batch_size": int(stored.get("index_batch_size") or 12),
+        "index_context_chars": int(stored.get("index_context_chars") or 48000),
+        "index_domain": str(stored.get("index_domain") or "视频字幕"),
+        "index_glossary": str(stored.get("index_glossary") or ""),
+        "index_instruction": str(stored.get("index_instruction") or ""),
         "openai_api_key": api_key,
         "openai_api_key_set": bool(api_key),
         "openai_base_url": normalize_openai_base_url(str(openai.get("base_url") or defaults.openai_base_url)),
@@ -191,6 +199,14 @@ def update_translate_settings(db: Session, defaults: SubtitleServiceSettings, up
     stored = dict(_as_dict(row.value_json))
 
     for key in [
+        "index_temperature",
+        "index_timeout_seconds",
+        "index_max_tokens",
+        "index_batch_size",
+        "index_context_chars",
+        "index_domain",
+        "index_glossary",
+        "index_instruction",
         "default_provider",
         "default_target_lang",
         "default_style",
@@ -286,6 +302,23 @@ def update_translate_settings(db: Session, defaults: SubtitleServiceSettings, up
     if "rag_embedding_timeout_seconds" in update and update.get("rag_embedding_timeout_seconds") is not None:
         embedding_openai["timeout_seconds"] = update.get("rag_embedding_timeout_seconds")
     stored["rag_embedding_openai"] = embedding_openai
+
+    if "default_provider" in stored and stored["default_provider"] not in {"openai", "index_translate", "mock", "noop"}:
+        raise ValueError("unsupported translation provider")
+    for key, minimum, maximum in (
+        ("index_temperature", 0.0, 2.0),
+        ("index_timeout_seconds", 15.0, 300.0),
+        ("index_max_tokens", 128, 16384),
+        ("index_batch_size", 1, 30),
+        ("index_context_chars", 4000, 100000),
+    ):
+        if key in stored:
+            v = float(stored[key])
+            if not minimum <= v <= maximum:
+                raise ValueError(f"{key} outside supported range")
+    for key, limit in (("index_domain", 90), ("index_glossary", 4000), ("index_instruction", 2000)):
+        if key in stored:
+            stored[key] = str(stored[key])[:limit]
 
     # Normalize a few types.
     try:

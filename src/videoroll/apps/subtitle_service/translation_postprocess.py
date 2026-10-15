@@ -197,15 +197,23 @@ def postprocess_translation(
         _end_transaction_before_external_io(db)
         if source_title:
             translated_title = source_title
-            if provider == "openai" and not has_cjk(source_title):
+            if provider in {"openai", "index_translate"} and not has_cjk(source_title):
                 try:
-                    translated_title = ai_service.translate_title(
-                        source_title,
-                        target_lang=target_lang,
-                        style=style,
-                        summary=summary,
-                        retry_count=4,
-                    )
+                    if provider == "index_translate":
+                        from videoroll.apps.subtitle_service.index_translate import translate_title_index
+                        index_settings = dict(ai_service.current_settings())
+                        _end_transaction_before_external_io(db)
+                        translated_title = translate_title_index(
+                            source_title, target_lang=target_lang, style=style,
+                            settings=index_settings,
+                            context=segments_text_excerpt(translated_segments, max_chars=4000) or summary,
+                        )
+                    else:
+                        translated_title = ai_service.translate_title(
+                            source_title, target_lang=target_lang, style=style,
+                            summary=summary,
+                            retry_count=4,
+                        )
                 except Exception:
                     translated_title = source_title
             set_task_titles(

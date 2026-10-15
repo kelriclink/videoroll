@@ -24,6 +24,7 @@ function persistedFormSnapshot(form: typeof initialTranslateForm): string {
   return JSON.stringify({
     translation: form.translation,
     llm: form.llm,
+    index: form.index,
     rag: form.rag,
     embedding: form.embedding,
   });
@@ -329,6 +330,8 @@ export function useSettingsTranslateController() {
     defaultBatchSize: form.translation.batchSize,
     defaultMaxRetries: form.translation.maxRetries,
     defaultEnableSummary: form.translation.enableSummary,
+    indexSettings: form.index,
+    setIndexSettings: (patch: Partial<typeof form.index>) => update("patchIndex", patch),
     openaiBaseUrl: form.llm.baseUrl,
     openaiModel: form.llm.model,
     openaiTemperature: form.llm.temperature,

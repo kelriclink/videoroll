@@ -57,6 +57,18 @@ def translate_publish_title(
         return title_in
 
     provider = str(profile.get("translate_provider") or translate_settings.get("default_provider") or "").strip() or "openai"
+    if provider == "index_translate":
+        from videoroll.apps.subtitle_service.index_translate import translate_title_index
+        try:
+            return translate_title_index(
+                title_in,
+                target_lang=str(profile.get("target_lang") or translate_settings.get("default_target_lang") or "zh"),
+                style=str(profile.get("translate_style") or translate_settings.get("default_style") or "口语自然"),
+                settings=translate_settings,
+                context=summary,
+            )
+        except Exception:
+            return title_in
     if provider != "openai" or not translate_settings.get("openai_api_key"):
         return title_in
 

@@ -194,7 +194,8 @@ export function TaskDetailSubtitle({ controller }: { controller: TaskDetailContr
                 >
                   <option value="mock">mock</option>
                   <option value="noop">noop</option>
-                  <option value="openai">openai</option>
+                  <option value="openai">OpenAI</option>
+                  <option value="index_translate">Index-Translate 免费 API</option>
                 </select>
               </label>
 

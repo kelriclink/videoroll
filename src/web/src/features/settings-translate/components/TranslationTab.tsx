@@ -15,6 +15,8 @@ export function TranslationTab({ controller }: { controller: SettingsTranslateCo
     setDefaultMaxRetries,
     defaultEnableSummary,
     setDefaultEnableSummary,
+    indexSettings,
+    setIndexSettings,
     openaiBaseUrl,
     setOpenaiBaseUrl,
     openaiModel,
@@ -45,7 +47,8 @@ export function TranslationTab({ controller }: { controller: SettingsTranslateCo
           <label className="block">
             <div className="mb-1 text-xs text-slate-600">默认 Provider</div>
             <select className="w-full rounded border px-3 py-2 text-sm" value={defaultProvider} onChange={(e) => setDefaultProvider(e.target.value)}>
-              <option value="openai">openai</option>
+              <option value="openai">OpenAI / RAG</option>
+              <option value="index_translate">Index-Translate 官方免费 API</option>
               <option value="mock">mock</option>
               <option value="noop">noop</option>
             </select>
@@ -64,17 +67,59 @@ export function TranslationTab({ controller }: { controller: SettingsTranslateCo
           </label>
           <label className="block">
             <div className="mb-1 text-xs text-slate-600">Batch 大小</div>
-            <input type="number" min={1} className="w-full rounded border px-3 py-2 text-sm" value={defaultBatchSize} onChange={(e) => setDefaultBatchSize(parseInt(e.target.value || "1", 10))} />
+            <input type="number" min={1} disabled={defaultProvider === "index_translate"} className="w-full rounded border px-3 py-2 text-sm" value={defaultBatchSize} onChange={(e) => setDefaultBatchSize(parseInt(e.target.value || "1", 10))} />
           </label>
           <label className="block">
             <div className="mb-1 text-xs text-slate-600">翻译批次最大重试</div>
             <input type="number" min={0} max={10} className="w-full rounded border px-3 py-2 text-sm" value={defaultMaxRetries} onChange={(e) => setDefaultMaxRetries(parseInt(e.target.value || "0", 10))} />
           </label>
           <label className="flex items-center gap-2 text-sm">
-            <input type="checkbox" checked={defaultEnableSummary} onChange={(e) => setDefaultEnableSummary(e.target.checked)} />
+            <input type="checkbox" disabled={defaultProvider === "index_translate"} checked={defaultEnableSummary} onChange={(e) => setDefaultEnableSummary(e.target.checked)} />
             启用批次摘要上下文
           </label>
-          <div className="lg:col-span-2 mt-1 border-b border-slate-100 pb-2 text-xs font-semibold uppercase tracking-wide text-slate-400">模型接口</div>
+          {defaultProvider === "index_translate" ? (
+            <div className="lg:col-span-2 grid gap-3 rounded-lg border border-sky-200 bg-sky-50 p-4 lg:grid-cols-2">
+              <div className="lg:col-span-2 text-sm font-semibold text-sky-950">Index-Translate 翻译配置</div>
+              <div className="lg:col-span-2 text-xs text-sky-800">
+                官方免费服务 · Index-Translate-35B-A3B · https://index-translate.bilibili.com/v1
+                <div className="mt-1">无需密钥。启用后字幕、视频标题只调用此翻译服务；不调用 OpenAI/RAG Agent。完整原文在上下文预算内作为软性参考，超出预算时采用片头、局部与片尾上下文。</div>
+              </div>
+              <label className="block">
+                <div className="mb-1 text-xs">温度</div>
+                <input type="number" min={0} max={2} step={0.1} className="w-full rounded px-3 py-2 text-sm" value={indexSettings.temperature} onChange={e => setIndexSettings({temperature: Number(e.target.value)})} />
+              </label>
+              <label className="block">
+                <div className="mb-1 text-xs">最大输出 Token</div>
+                <input type="number" min={128} max={16384} className="w-full rounded px-3 py-2 text-sm" value={indexSettings.maxTokens} onChange={e => setIndexSettings({maxTokens: Number(e.target.value)})} />
+              </label>
+              <label className="block">
+                <div className="mb-1 text-xs">Index 每批字幕数</div>
+                <input type="number" min={1} max={30} className="w-full rounded px-3 py-2 text-sm" value={indexSettings.batchSize} onChange={e => setIndexSettings({batchSize: Number(e.target.value)})} />
+              </label>
+              <label className="block">
+                <div className="mb-1 text-xs">请求超时（秒）</div>
+                <input type="number" min={15} max={300} className="w-full rounded px-3 py-2 text-sm" value={indexSettings.timeoutSeconds} onChange={e => setIndexSettings({timeoutSeconds: Number(e.target.value)})} />
+              </label>
+              <label className="block">
+                <div className="mb-1 text-xs">完整字幕参考上限（字符）</div>
+                <input type="number" min={4000} max={100000} step={1000} className="w-full rounded px-3 py-2 text-sm" value={indexSettings.contextChars} onChange={e => setIndexSettings({contextChars: Number(e.target.value)})} />
+              </label>
+              <label className="block lg:col-span-2">
+                <div className="mb-1 text-xs">字幕领域</div>
+                <input className="w-full rounded px-3 py-2 text-sm" value={indexSettings.domain} onChange={e => setIndexSettings({domain: e.target.value})} placeholder="如 科技视频字幕" />
+              </label>
+              <label className="block lg:col-span-2">
+                <div className="mb-1 text-xs">固定术语（硬性要求）</div>
+                <textarea rows={2} className="w-full rounded px-3 py-2 text-sm" value={indexSettings.glossary} onChange={e => setIndexSettings({glossary: e.target.value})} placeholder="PCB:印刷电路板, I2C:I2C" />
+              </label>
+              <label className="block lg:col-span-2">
+                <div className="mb-1 text-xs">自定义翻译要求（软性要求）</div>
+                <textarea rows={3} className="w-full rounded px-3 py-2 text-sm" value={indexSettings.instruction} onChange={e => setIndexSettings({instruction: e.target.value})} placeholder="保持科技视频解说风格，尽量精简句子" />
+              </label>
+            </div>
+          ) : (
+          <>
+          <div className="lg:col-span-2 mt-1 border-b border-slate-100 pb-2 text-xs font-semibold uppercase tracking-wide text-slate-400">模型接口（OpenAI）</div>
           <label className="block lg:col-span-2">
             <div className="mb-1 text-xs text-slate-600">接口类型</div>
             <select
@@ -158,6 +203,8 @@ export function TranslationTab({ controller }: { controller: SettingsTranslateCo
               </span>
             </span>
           </label>
+          </>
+          )}
         </div>
       </Section>
   );

@@ -641,6 +641,14 @@ def get_translate_settings_view(
         default_batch_size=cfg["default_batch_size"],
         default_max_retries=cfg["default_max_retries"],
         default_enable_summary=cfg["default_enable_summary"],
+        index_temperature=cfg["index_temperature"],
+        index_timeout_seconds=cfg["index_timeout_seconds"],
+        index_max_tokens=cfg["index_max_tokens"],
+        index_batch_size=cfg["index_batch_size"],
+        index_context_chars=cfg["index_context_chars"],
+        index_domain=cfg["index_domain"],
+        index_glossary=cfg["index_glossary"],
+        index_instruction=cfg["index_instruction"],
         openai_api_key_set=cfg["openai_api_key_set"],
         openai_base_url=cfg["openai_base_url"],
         openai_model=cfg["openai_model"],
@@ -701,6 +709,14 @@ def put_translate_settings_view(
         default_batch_size=cfg["default_batch_size"],
         default_max_retries=cfg["default_max_retries"],
         default_enable_summary=cfg["default_enable_summary"],
+        index_temperature=cfg["index_temperature"],
+        index_timeout_seconds=cfg["index_timeout_seconds"],
+        index_max_tokens=cfg["index_max_tokens"],
+        index_batch_size=cfg["index_batch_size"],
+        index_context_chars=cfg["index_context_chars"],
+        index_domain=cfg["index_domain"],
+        index_glossary=cfg["index_glossary"],
+        index_instruction=cfg["index_instruction"],
         openai_api_key_set=cfg["openai_api_key_set"],
         openai_base_url=cfg["openai_base_url"],
         openai_model=cfg["openai_model"],
@@ -1783,12 +1799,18 @@ def translate_test(
 
     try:
         ai_service = AIService(lambda: get_translate_settings(db, settings))
-        translated = ai_service.translate_text(
-            text,
-            target_lang=payload.target_lang,
-            style=payload.style,
-            enable_thinking=bool(get_translate_settings(db, settings).get("openai_enable_thinking")),
-        )
+        cfg = get_translate_settings(db, settings)
+        if cfg.get("default_provider") == "index_translate":
+            from videoroll.apps.subtitle_service.index_translate import translate_text_index
+            db.commit()  # End the read transaction before an external request.
+            translated = translate_text_index(text, target_lang=payload.target_lang, style=payload.style, settings=cfg)
+        else:
+            translated = ai_service.translate_text(
+                text,
+                target_lang=payload.target_lang,
+                style=payload.style,
+                enable_thinking=bool(cfg.get("openai_enable_thinking")),
+            )
     except Exception as e:
         raise HTTPException(status_code=502, detail=str(e)) from e
 

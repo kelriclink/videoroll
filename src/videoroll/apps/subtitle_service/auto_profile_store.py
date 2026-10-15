@@ -11,7 +11,7 @@ AUTO_PROFILE_KEY = "subtitle.auto_profile"
 
 _ALLOWED_FORMATS = {"srt", "ass"}
 _ALLOWED_ASR_ENGINES = {"auto", "mock", "faster-whisper", "openvino", "external-whisper", "groq-whisper", "cloudflare-workers-ai"}
-_ALLOWED_TRANSLATE_PROVIDERS = {"mock", "noop", "openai"}
+_ALLOWED_TRANSLATE_PROVIDERS = {"mock", "noop", "openai", "index_translate"}
 _ALLOWED_YOUTUBE_SUBTITLE_MODES = {"off", "target", "auto_source"}
 _ALLOWED_ASS_STYLES = {"clean_white"}
 _ALLOWED_VIDEO_CODECS = {"av1", "h264"}

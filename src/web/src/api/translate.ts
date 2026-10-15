@@ -8,6 +8,14 @@ export type TranslateSettings = {
   default_batch_size: number;
   default_max_retries: number;
   default_enable_summary: boolean;
+  index_temperature: number;
+  index_timeout_seconds: number;
+  index_max_tokens: number;
+  index_batch_size: number;
+  index_context_chars: number;
+  index_domain: string;
+  index_glossary: string;
+  index_instruction: string;
   openai_api_key_set: boolean;
   openai_base_url: string;
   openai_model: string;

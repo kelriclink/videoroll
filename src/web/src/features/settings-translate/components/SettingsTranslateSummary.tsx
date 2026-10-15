@@ -27,14 +27,14 @@ export function SettingsTranslateSummary({ controller }: { controller: SettingsT
                   {settings.openai_api_key_set || settings.default_provider !== "openai" ? "Ready" : "Key missing"}
                 </span>
               </div>
-              <div className="mt-2 truncate text-sm font-medium text-slate-900" title={settings.openai_model}>{settings.openai_model}</div>
+              <div className="mt-2 truncate text-sm font-medium text-slate-900" title={settings.default_provider === "index_translate" ? "Index-Translate-35B-A3B" : settings.openai_model}>{settings.default_provider === "index_translate" ? "Index-Translate-35B-A3B" : settings.openai_model}</div>
               <div className="mt-1 text-xs text-slate-500">{settings.default_target_lang} · batch {settings.default_batch_size}</div>
             </div>
             <div className="rounded-lg border border-slate-200 p-3">
               <div className="flex items-center justify-between gap-2">
                 <div className="text-xs font-medium text-slate-500">RAG</div>
-                <span className={`rounded-full px-2 py-0.5 text-[11px] ${statusClass(settings.rag_enabled)}`}>
-                  {settings.rag_enabled ? "Enabled" : "Disabled"}
+                <span className={`rounded-full px-2 py-0.5 text-[11px] ${statusClass(settings.rag_enabled && settings.default_provider !== "index_translate")}`}>
+                  {settings.default_provider === "index_translate" ? "Bypassed" : settings.rag_enabled ? "Enabled" : "Disabled"}
                 </span>
               </div>
               <div className="mt-2 text-sm font-medium text-slate-900">Top {settings.rag_top_k} · score {settings.rag_min_score}</div>

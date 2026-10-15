@@ -3,6 +3,16 @@ import type { TranslateSettings, TranslateSettingsUpdate } from "../../api/trans
 export type TranslateSettingsTab = "translation" | "rag" | "embedding" | "test";
 
 export type TranslateFormState = {
+  index: {
+    temperature: number;
+    timeoutSeconds: number;
+    maxTokens: number;
+    batchSize: number;
+    contextChars: number;
+    domain: string;
+    glossary: string;
+    instruction: string;
+  };
   translation: {
     provider: string;
     targetLang: string;
@@ -86,6 +96,16 @@ export const initialTranslateForm: TranslateFormState = {
     maxRetries: 2,
     enableSummary: true,
   },
+  index: {
+    temperature: 0,
+    timeoutSeconds: 120,
+    maxTokens: 4096,
+    batchSize: 12,
+    contextChars: 48000,
+    domain: "视频字幕",
+    glossary: "",
+    instruction: "",
+  },
   llm: {
     baseUrl: "https://api.openai.com/v1",
     model: "gpt-4o-mini",
@@ -135,6 +155,7 @@ export const initialTranslateForm: TranslateFormState = {
 export type TranslateFormAction =
   | { type: "replace"; value: TranslateFormState }
   | { type: "patchTranslation"; patch: Partial<TranslateFormState["translation"]> }
+  | { type: "patchIndex"; patch: Partial<TranslateFormState["index"]> }
   | { type: "patchLlm"; patch: Partial<TranslateFormState["llm"]> }
   | { type: "patchEmbedding"; patch: Partial<TranslateFormState["embedding"]> }
   | { type: "patchRag"; patch: Partial<TranslateFormState["rag"]> }
@@ -150,6 +171,8 @@ export function translateFormReducer(state: TranslateFormState, action: Translat
       return action.value;
     case "patchTranslation":
       return { ...state, translation: { ...state.translation, ...action.patch } };
+    case "patchIndex":
+      return { ...state, index: { ...state.index, ...action.patch } };
     case "patchLlm":
       return { ...state, llm: { ...state.llm, ...action.patch } };
     case "patchEmbedding":
@@ -181,6 +204,16 @@ export function settingsToForm(
       batchSize: settings.default_batch_size,
       maxRetries: settings.default_max_retries ?? 0,
       enableSummary: settings.default_enable_summary,
+    },
+    index: {
+      temperature: settings.index_temperature ?? 0,
+      timeoutSeconds: settings.index_timeout_seconds ?? 120,
+      maxTokens: settings.index_max_tokens ?? 4096,
+      batchSize: settings.index_batch_size ?? 12,
+      contextChars: settings.index_context_chars ?? 48000,
+      domain: settings.index_domain ?? "视频字幕",
+      glossary: settings.index_glossary ?? "",
+      instruction: settings.index_instruction ?? "",
     },
     llm: {
       baseUrl: settings.openai_base_url,
@@ -252,6 +285,14 @@ export function formToUpdatePayload(form: TranslateFormState, secrets: SecretDra
     default_batch_size: form.translation.batchSize,
     default_max_retries: form.translation.maxRetries,
     default_enable_summary: form.translation.enableSummary,
+    index_temperature: form.index.temperature,
+    index_timeout_seconds: form.index.timeoutSeconds,
+    index_max_tokens: form.index.maxTokens,
+    index_batch_size: form.index.batchSize,
+    index_context_chars: form.index.contextChars,
+    index_domain: form.index.domain,
+    index_glossary: form.index.glossary,
+    index_instruction: form.index.instruction,
     openai_base_url: form.llm.baseUrl,
     openai_model: form.llm.model,
     openai_temperature: form.llm.temperature,

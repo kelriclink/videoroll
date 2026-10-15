@@ -1568,7 +1568,7 @@ def run_subtitle_job(
                     if isinstance(raw_memory, dict):
                         selective_context_memory = dict(raw_memory)
             translate_cfg["enabled"] = True
-            if str(translate_cfg.get("provider") or "openai").strip() != "openai":
+            if str(translate_cfg.get("provider") or "openai").strip() not in {"openai", "index_translate"}:
                 translate_cfg["provider"] = "openai"
             _safe_append_log_line(
                 log_path,

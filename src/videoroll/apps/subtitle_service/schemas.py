@@ -319,6 +319,14 @@ class TranslateSettingsRead(BaseModel):
     default_max_retries: int
     default_enable_summary: bool
 
+    index_temperature: float = 0.0
+    index_timeout_seconds: float = 120.0
+    index_max_tokens: int = 4096
+    index_batch_size: int = 12
+    index_context_chars: int = 48000
+    index_domain: str = "视频字幕"
+    index_glossary: str = ""
+    index_instruction: str = ""
     openai_api_key_set: bool
     openai_base_url: str
     openai_model: str
@@ -374,6 +382,14 @@ class TranslateSettingsUpdate(BaseModel):
     default_enable_summary: Optional[bool] = None
 
     # Secrets are never returned from the API. If set to "" it clears the stored key.
+    index_temperature: Optional[float] = Field(default=None, ge=0, le=2)
+    index_timeout_seconds: Optional[float] = Field(default=None, ge=15, le=300)
+    index_max_tokens: Optional[int] = Field(default=None, ge=128, le=16384)
+    index_batch_size: Optional[int] = Field(default=None, ge=1, le=30)
+    index_context_chars: Optional[int] = Field(default=None, ge=4000, le=100000)
+    index_domain: Optional[str] = Field(default=None, max_length=90)
+    index_glossary: Optional[str] = Field(default=None, max_length=4000)
+    index_instruction: Optional[str] = Field(default=None, max_length=2000)
     openai_api_key: Optional[str] = None
     openai_base_url: Optional[str] = None
     openai_model: Optional[str] = None
