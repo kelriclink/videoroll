@@ -149,6 +149,27 @@ def test_render_success_writes_durable_hatchet_event_outbox(db: Session) -> None
     assert event.args_json["args"][:3] == [str(job.id), "succeeded", str(execution.id)]
 
 
+def test_canceled_task_cannot_complete_remote_render(db: Session) -> None:
+    from fastapi import HTTPException
+
+    worker = make_worker(db)
+    job = make_job(db)
+    execution, _ = render_worker_service.claim_job(db, store(), worker.id, ["http"])
+    assert execution is not None
+    task = db.get(Task, job.task_id)
+    assert task is not None
+    task.status = TaskStatus.canceled
+    db.commit()
+
+    with pytest.raises(HTTPException) as exc:
+        render_worker_service.complete_execution(
+            db, execution.id, ExecutionCompleteRequest(fence_token=execution.fence_token),
+        )
+
+    assert exc.value.status_code == 409
+    assert not db.query(OutboxEvent).filter(OutboxEvent.event_type == "workflow.render.finished").count()
+
+
 def test_nonretryable_render_failure_writes_terminal_hatchet_event(db: Session) -> None:
     worker = make_worker(db); job = make_job(db)
     execution, _ = render_worker_service.claim_job(db, store(), worker.id, ["http"])

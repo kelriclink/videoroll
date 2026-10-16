@@ -86,7 +86,7 @@ def execute_native_job(
                      "aligning" if stage_name in ("merge_audio", "split_audio") else
                      "mixing" if stage_name == "merge_video" else "preparing")
             with session_factory() as db:
-                item = db.get(DubbingJob, job_id)
+                item = db.query(DubbingJob).filter(DubbingJob.id == job_id).with_for_update().one_or_none()
                 if item is None or item.lease_owner != owner:
                     raise DubbingInterrupted("lease_lost")
                 if item.status in ("pause_requested", "cancel_requested"):
@@ -121,8 +121,10 @@ def execute_native_job(
         control()
         with session_factory() as db:
             job = db.query(DubbingJob).filter(DubbingJob.id == job_id).with_for_update().one()
-            if job.lease_owner != owner or job.status in ("cancel_requested", "pause_requested"):
+            if job.lease_owner != owner:
                 raise DubbingInterrupted("lease_lost")
+            if job.status in ("pause_requested", "cancel_requested"):
+                raise DubbingInterrupted("paused" if job.status == "pause_requested" else "canceled")
             for kind, key, path in (
                 (AssetKind.dubbing_audio, track_key, result.audio),
                 (AssetKind.video_dubbed, video_key, result.video),

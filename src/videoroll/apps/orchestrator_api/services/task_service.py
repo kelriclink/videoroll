@@ -128,20 +128,19 @@ def _enqueue_hatchet_run_cancellations(db: Session, task_ids: list[uuid.UUID]) -
         return 0
     runs: list[PipelineRun] = []
     for task_id in task_ids:
-        run = (
+        task_runs = (
             db.query(PipelineRun)
             .filter(
                 PipelineRun.task_id == task_id,
                 PipelineRun.engine == "hatchet",
                 PipelineRun.external_run_id.is_not(None),
-                PipelineRun.state.notin_(["canceled", "cancel_requested", "launch_failed"]),
+                PipelineRun.state.in_(["queued", "submitting", "submitted", "running", "waiting"]),
             )
             .order_by(PipelineRun.created_at.desc())
-            .with_for_update(skip_locked=True)
-            .first()
+            .with_for_update()
+            .all()
         )
-        if run is not None:
-            runs.append(run)
+        runs.extend(task_runs)
     for run in runs:
         create_outbox_event(
             db,

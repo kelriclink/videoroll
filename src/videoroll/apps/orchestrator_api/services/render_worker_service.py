@@ -557,6 +557,9 @@ def complete_execution(db: Session, execution_id: uuid.UUID, payload: Any) -> Re
     execution = get_execution(db, execution_id, lock=True); validate_fence(execution, payload.fence_token)
     job = db.get(RenderJob, execution.render_job_id)
     if job is None or job.lease_owner != f"{REMOTE_LOCK_PREFIX}{execution.id}": raise HTTPException(409, "render job ownership lost")
+    canceled, reason = cancellation_state(db, execution_id)
+    if canceled:
+        raise HTTPException(409, reason or "render execution canceled before completion")
     mode = str((execution.render_spec or {}).get("mode") or "noop")
     if mode != "noop" and payload.output_asset_id is None:
         raise HTTPException(400, "render output asset is required")

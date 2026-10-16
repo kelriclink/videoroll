@@ -201,6 +201,29 @@ def test_cleanup_terminal_resources_deletes_orphans_but_preserves_task_history_a
     assert db.query(Asset).filter(Asset.task_id == paused.id).count() == 1
 
 
+def test_periodic_cleanup_default_now_does_not_crash_on_dubbing_guard(db: Session) -> None:
+    now = datetime(2026, 7, 15, 12, tzinfo=timezone.utc)
+    published = _task(TaskStatus.published)
+    published.updated_at = now - timedelta(days=2)
+    db.add(published)
+    db.flush()
+    video_key = f"raw/{published.id}/video.mp4"
+    db.add(Asset(task_id=published.id, kind=AssetKind.video_raw, storage_key=video_key))
+    db.commit()
+
+    fake_s3 = _FakeS3({video_key})
+    with (
+        patch.object(maintenance_service, "utcnow", return_value=now),
+        patch.object(maintenance_service, "FileStore", return_value=fake_s3),
+    ):
+        result = maintenance_service.cleanup_terminal_task_resources(
+            MagicMock(), db, published_older_than_days=1,
+            failed_older_than_hours=None, owner_prefix="test",
+        )
+    assert result is not None and result.matched_tasks == 1
+    assert video_key not in fake_s3.keys
+
+
 def test_periodic_cleanup_defers_published_assets_while_dubbing_queued(db: Session) -> None:
     now = datetime(2026, 7, 15, 12, tzinfo=timezone.utc)
     published = _task(TaskStatus.published)

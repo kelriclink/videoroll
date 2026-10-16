@@ -8,7 +8,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import quote
 
 from fastapi import HTTPException, UploadFile
@@ -439,6 +439,7 @@ async def store_uploaded_task_asset(
     asset_kind: AssetKind,
     update_task_status: TaskStatus | None = None,
     max_bytes: int | None = None,
+    before_commit: Callable[[Session], None] | None = None,
 ) -> Asset:
     suffix = Path(file.filename or "").suffix or default_suffix
     temp_path: Path | None = None
@@ -471,6 +472,10 @@ async def store_uploaded_task_asset(
             sha256=sha256,
             size_bytes=size_bytes,
         )
+        # Validate under DB row locks after the potentially long upload,
+        # in the same transaction that registers the final asset.
+        if before_commit is not None:
+            before_commit(db)
         db.add(asset)
         if update_task_status is not None:
             task.status = update_task_status
@@ -479,6 +484,13 @@ async def store_uploaded_task_asset(
         db.refresh(asset)
         return asset
     except HTTPException:
+        db.rollback()
+        if uploaded_key:
+            try:
+                queue_pending_storage_delete(db, uploaded_key, reason="rejected_asset_upload")
+            except Exception:
+                db.rollback()
+                logger.exception("failed to queue rejected upload cleanup", extra={"storage_key": uploaded_key})
         raise
     except UploadTooLargeError as exc:
         db.rollback()
