@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import uuid
 
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -18,8 +18,9 @@ from videoroll.apps.outbox.service import (
     create_outbox_event,
     mark_outbox_dispatch_failed,
     redeliver_dispatched_event,
+    recover_unacknowledged_workflow_events,
 )
-from videoroll.db.models import OutboxEvent
+from videoroll.db.models import OperationInbox, OutboxEvent
 
 
 @compiles(JSONB, "sqlite")
@@ -31,11 +32,13 @@ def _compile_jsonb_for_sqlite(_type: JSONB, _compiler: object, **_kwargs: object
 def db() -> Session:
     engine = create_engine("sqlite:///:memory:")
     OutboxEvent.__table__.create(engine)
+    OperationInbox.__table__.create(engine)
     session = sessionmaker(bind=engine)()
     try:
         yield session
     finally:
         session.close()
+        OperationInbox.__table__.drop(engine)
         OutboxEvent.__table__.drop(engine)
 
 
@@ -343,3 +346,40 @@ def test_publish_workflow_event_bridge_finishes_inbox_only_after_http_success(mo
             result,
         )
     ]
+
+
+def test_workflow_event_recovery_requires_missing_or_expired_inbox_ack(db: Session) -> None:
+    now = datetime(2026, 10, 16, 10, 0, tzinfo=timezone.utc)
+    def make(key: str, *, category: str = "workflow.render.finished") -> OutboxEvent:
+        e = create_outbox_event(
+            db, event_type=category, aggregate_type="render_job", aggregate_id=key,
+            task_name="subtitle_service.push_render_workflow_event",
+            args={"args": [key]}, operation_key=key,
+        )
+        e.status = "dispatched"
+        e.delivered_at = now - timedelta(minutes=10)
+        db.flush()
+        return e
+
+    missing = make("workflow:missing")
+    completed = make("workflow:completed")
+    active = make("workflow:active")
+    expired = make("workflow:expired")
+    unsafe = make("publisher:unsafe", category="publish.bilibili")
+    db.add_all([
+        OperationInbox(operation_key=completed.operation_key, status="completed"),
+        OperationInbox(operation_key=active.operation_key, status="processing",
+                       lease_until=now + timedelta(minutes=2)),
+        OperationInbox(operation_key=expired.operation_key, status="processing",
+                       lease_until=now - timedelta(minutes=2)),
+    ])
+    db.commit()
+
+    assert recover_unacknowledged_workflow_events(db, now=now) == 2
+    assert missing.status == "pending"
+    assert expired.status == "pending"
+    assert completed.status == "dispatched"
+    assert active.status == "dispatched"
+    assert unsafe.status == "dispatched"  # Do not replay external publication
+    db.commit()
+    assert recover_unacknowledged_workflow_events(db, now=now) == 0

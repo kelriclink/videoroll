@@ -179,6 +179,10 @@ def _run_native_unlocked(
             raise
         state = _cli("--create", "--task-id", str(job_id),
                      "--video", str(video), "--srt", str(srt))
+    if state["status"] == "running":
+        # Our DB lease is now owned by this worker; reconcile a native runner
+        # whose process exited before updating YouDub's own status.
+        state = _cli("--interrupt", "--task-id", str(job_id))
     if state["status"] == "failed":
         state = _cli("--resume", "--task-id", str(job_id))
     if state["status"] == "succeeded":

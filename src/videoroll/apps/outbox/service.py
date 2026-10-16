@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from sqlalchemy import and_, or_
+from videoroll.db.models import OperationInbox
 from sqlalchemy.orm import Session
 
 from videoroll.db.models import OutboxEvent
@@ -118,6 +119,57 @@ def redeliver_dispatched_event(db: Session, operation_key: str, *, now: datetime
     db.add(event)
     db.flush()
     return True
+
+
+def recover_unacknowledged_workflow_events(
+    db: Session, *, now: datetime | None = None, limit: int = 100,
+    grace_seconds: int = 300,
+) -> int:
+    """Redeliver safe workflow notifications after broker acceptance without an inbox ACK.
+
+    Only workflow.* events are eligible: external publishing side effects must
+    never be replayed merely because a broker ACK went missing.  A completed
+    inbox operation is authoritative; a live lease is not reclaimed.
+    """
+    now = now or utcnow()
+    cutoff = now - timedelta(seconds=max(60, int(grace_seconds)))
+    rows = (
+        db.query(OutboxEvent)
+        .filter(
+            OutboxEvent.status == "dispatched",
+            OutboxEvent.event_type.like("workflow.%"),
+            OutboxEvent.delivered_at <= cutoff,
+        )
+        .order_by(OutboxEvent.delivered_at.asc())
+        .with_for_update(skip_locked=True)
+        .limit(max(1, min(int(limit), 500)))
+        .all()
+    )
+    recovered = 0
+    for event in rows:
+        inbox = (
+            db.query(OperationInbox)
+            .filter(OperationInbox.operation_key == event.operation_key)
+            .with_for_update()
+            .one_or_none()
+        )
+        if inbox is not None and (
+            inbox.status == "completed"
+            or (inbox.status == "processing" and inbox.lease_until is not None
+                and (inbox.lease_until.replace(tzinfo=inbox.lease_until.tzinfo or timezone.utc) > now))
+        ):
+            continue
+        event.status = "pending"
+        event.available_at = now
+        event.delivered_at = None
+        event.lease_owner = None
+        event.lease_until = None
+        event.heartbeat_at = now
+        event.last_error = "workflow event broker ACK had no completed inbox; requeueing"
+        db.add(event)
+        recovered += 1
+    db.flush()
+    return recovered
 
 
 def claim_outbox_events(

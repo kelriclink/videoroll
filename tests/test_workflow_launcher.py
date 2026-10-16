@@ -11,7 +11,7 @@ from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.orm import Session, sessionmaker
 
 from videoroll.db.base import Base
-from videoroll.db.models import PipelineRun, SourceLicense, SourceType, SubtitleJob, SubtitleJobStatus, Task
+from videoroll.db.models import OutboxEvent, PipelineRun, SourceLicense, SourceType, SubtitleJob, SubtitleJobStatus, Task, TaskStatus
 from videoroll.workflows.launcher import PipelineLauncher
 from videoroll.workflows.settings import WorkflowRuntimeSettings
 
@@ -53,7 +53,7 @@ class _Client:
 
 def _database() -> tuple[object, sessionmaker[Session], uuid.UUID]:
     engine = create_engine("sqlite:///:memory:")
-    Base.metadata.create_all(engine, tables=[Task.__table__, SubtitleJob.__table__, PipelineRun.__table__])
+    Base.metadata.create_all(engine, tables=[Task.__table__, SubtitleJob.__table__, PipelineRun.__table__, OutboxEvent.__table__])
     factory = sessionmaker(bind=engine, autocommit=False, autoflush=False)
     with factory() as db:
         task = Task(source_type=SourceType.youtube, source_license=SourceLicense.own, priority=100)
@@ -85,7 +85,10 @@ def test_pipeline_launcher_records_hatchet_run_without_scheduler_fields(monkeypa
     assert result.workflow_name == "VideoPipelineV1"
     assert result.external_run_id == "hatchet-123"
     assert client.posts == [
-        ("http://workflow-api:8030/runs/auto-youtube", {"task_id": str(task_id), "priority": 100})
+        ("http://workflow-api:8030/runs/auto-youtube", {
+            "task_id": str(task_id), "priority": 100,
+            "dispatch_key": f"auto-youtube:{result.pipeline_run_id}",
+        })
     ]
     with factory() as db:
         row = db.get(PipelineRun, result.pipeline_run_id)
@@ -94,7 +97,8 @@ def test_pipeline_launcher_records_hatchet_run_without_scheduler_fields(monkeypa
         assert row.engine == "hatchet"
         assert row.state == "submitted"
         assert row.external_run_id == "hatchet-123"
-        assert row.request_json == {"task_id": str(task_id), "runtime_profile": True, "priority": 100}
+        assert row.request_json == {"task_id": str(task_id), "runtime_profile": True,
+                                    "priority": 100, "dispatch_key": f"auto-youtube:{result.pipeline_run_id}"}
     assert {column.name for column in PipelineRun.__table__.columns}.isdisjoint(
         {"lease_owner", "lease_until", "heartbeat_at", "worker_id"}
     )
@@ -124,14 +128,18 @@ def test_pipeline_launcher_submits_subtitle_job(monkeypatch: pytest.MonkeyPatch)
     assert result.workflow_name == "SubtitleJobV1"
     assert result.external_run_id == "subtitle-run-1"
     assert client.posts == [
-        ("http://workflow-api:8030/runs/subtitle-job", {"job_id": str(job_id), "priority": 100})
+        ("http://workflow-api:8030/runs/subtitle-job", {
+            "job_id": str(job_id), "priority": 100,
+            "dispatch_key": f"subtitle:{result.pipeline_run_id}",
+        })
     ]
     with factory() as db:
         row = db.get(PipelineRun, result.pipeline_run_id)
         assert row is not None
         assert row.task_id == task_id
         assert row.workflow_name == "SubtitleJobV1"
-        assert row.request_json == {"job_id": str(job_id), "priority": 100}
+        assert row.request_json == {"job_id": str(job_id), "priority": 100,
+                                    "dispatch_key": f"subtitle:{result.pipeline_run_id}"}
     engine.dispose()
 
 
@@ -195,3 +203,93 @@ def test_workflow_runtime_settings_has_no_execution_engine_switch(monkeypatch: p
     assert not hasattr(settings, "engine")
     assert settings.worker_slots == 4
     assert settings.orchestrator_url == "http://orchestrator:8000"
+
+
+def test_submit_then_stop_before_hatchet_response_enqueues_cancel(monkeypatch: pytest.MonkeyPatch) -> None:
+    from videoroll.workflows import launcher as launcher_module
+    from videoroll.apps.orchestrator_api.services import task_service
+
+    engine, factory, task_id = _database()
+    client = _Client()
+    original_post = client.post
+
+    def stop_during_post(url: str, *, json: dict[str, Any]):
+        with factory() as db:
+            task_service.stop_task(task_id, db=db)
+            rows = db.query(PipelineRun).all()
+            assert len(rows) == 1
+            assert rows[0].state == "cancel_requested"
+            assert rows[0].external_run_id is None
+            assert db.query(OutboxEvent).count() == 0
+        return original_post(url, json=json)
+
+    monkeypatch.setattr(client, "post", stop_during_post)
+    monkeypatch.setattr(launcher_module.httpx, "Client", lambda *args, **kwargs: client)
+    result = PipelineLauncher(_settings(), session_factory=factory).launch_auto_youtube(task_id)
+    with factory() as db:
+        row = db.get(PipelineRun, result.pipeline_run_id)
+        assert row.state == "cancel_requested"
+        event = db.query(OutboxEvent).one()
+        assert event.args_json["args"] == [str(row.id), "hatchet-123"]
+    engine.dispose()
+
+
+def test_lost_auto_youtube_response_reuses_same_dispatch_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    from videoroll.workflows import launcher as launcher_module
+
+    engine, factory, task_id = _database()
+    monkeypatch.setattr(launcher_module.httpx, "Client", lambda *args, **kwargs: _Client(error=TimeoutError("lost response")))
+    launcher = PipelineLauncher(_settings(), session_factory=factory)
+    with pytest.raises(TimeoutError):
+        launcher.launch_auto_youtube(task_id)
+    with factory() as db:
+        row = db.query(PipelineRun).one()
+        first_id, key = row.id, row.request_json["dispatch_key"]
+        assert row.state == "launch_failed"
+
+    client = _Client()
+    monkeypatch.setattr(launcher_module.httpx, "Client", lambda *args, **kwargs: client)
+    result = launcher.launch_auto_youtube(task_id)
+    assert result.pipeline_run_id == first_id
+    assert client.posts[0][1]["dispatch_key"] == key
+    with factory() as db:
+        assert db.query(PipelineRun).count() == 1
+        assert db.query(PipelineRun).one().state == "submitted"
+    engine.dispose()
+
+
+def test_canceled_lost_hatchet_response_is_reconciled_and_canceled(monkeypatch: pytest.MonkeyPatch) -> None:
+    from videoroll.workflows import launcher as launcher_module
+    from videoroll.apps.orchestrator_api.services import task_service
+
+    engine, factory, task_id = _database()
+    launcher = PipelineLauncher(_settings(), session_factory=factory)
+    failure = _Client(error=TimeoutError("response lost after acceptance"))
+    original_post = failure.post
+
+    def stop_then_timeout(url: str, *, json: dict[str, Any]):
+        with factory() as db:
+            task_service.stop_task(task_id, db=db)
+        return original_post(url, json=json)
+
+    monkeypatch.setattr(failure, "post", stop_then_timeout)
+    monkeypatch.setattr(launcher_module.httpx, "Client", lambda *args, **kwargs: failure)
+    with pytest.raises(TimeoutError):
+        launcher.launch_auto_youtube(task_id)
+    with factory() as db:
+        row = db.query(PipelineRun).one()
+        assert row.state == "cancel_requested"
+        assert row.external_run_id is None
+        key = row.request_json["dispatch_key"]
+
+    client = _Client()
+    monkeypatch.setattr(launcher_module.httpx, "Client", lambda *args, **kwargs: client)
+    assert launcher.reconcile_unresolved_cancellations() == 1
+    assert client.posts[0][1]["dispatch_key"] == key
+    with factory() as db:
+        row = db.query(PipelineRun).one()
+        assert row.state == "cancel_requested"
+        assert row.external_run_id == "hatchet-123"
+        assert db.query(OutboxEvent).one().args_json["args"] == [str(row.id), "hatchet-123"]
+    assert launcher.reconcile_unresolved_cancellations() == 0
+    engine.dispose()

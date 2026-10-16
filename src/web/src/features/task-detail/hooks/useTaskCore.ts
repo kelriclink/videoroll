@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { loadSlices } from "../../../lib/requestState";
 import { tasksApi } from "../../../api/tasks";
 import { publishApi } from "../../../api/publish";
@@ -7,6 +7,8 @@ import type { PublishPlatformSettings, SocialAccount } from "../../../lib/publis
 import type { PublishPlatformSettingsResponse, PublishReview } from "../types";
 
 export function useTaskCore(taskId: string | undefined) {
+  const activeTaskId = useRef(taskId);
+  const latestRequest = useRef(0);
   const [task, setTask] = useState<Task | null>(null);
   const [assets, setAssets] = useState<Asset[] | null>(null);
   const [subtitleJobs, setSubtitleJobs] = useState<SubtitleJob[] | null>(null);
@@ -22,6 +24,7 @@ export function useTaskCore(taskId: string | undefined) {
   const refresh = useCallback(
     async (opts?: { silent?: boolean }) => {
       if (!taskId) return;
+      const requestId = ++latestRequest.current;
       const result = await loadSlices<
         TaskCoreSnapshot,
         {
@@ -49,6 +52,7 @@ export function useTaskCore(taskId: string | undefined) {
         },
       );
 
+      if (activeTaskId.current !== taskId || latestRequest.current !== requestId) return;
       if (result.core.ok) {
         setTask(result.core.value.task);
         setAssets(result.core.value.assets);
@@ -72,6 +76,7 @@ export function useTaskCore(taskId: string | undefined) {
 
   const refreshRealtimeSnapshot = useCallback(async () => {
     if (!taskId) return;
+    const requestId = ++latestRequest.current;
     const result = await loadSlices<TaskCoreSnapshot, { publishJobs: PublishJob[]; publishBatches: PublishBatch[] }>(
       async () => {
         const [nextTask, nextAssets, nextSubtitleJobs] = await Promise.all([
@@ -86,6 +91,7 @@ export function useTaskCore(taskId: string | undefined) {
         publishBatches: () => tasksApi.publishBatches(taskId),
       },
     );
+    if (activeTaskId.current !== taskId || latestRequest.current !== requestId) return;
     if (result.core.ok) {
       setTask(result.core.value.task);
       setAssets(result.core.value.assets);
@@ -99,8 +105,21 @@ export function useTaskCore(taskId: string | undefined) {
   }, [taskId]);
 
   useEffect(() => {
+    activeTaskId.current = taskId;
+    ++latestRequest.current;
+    setTask(null);
+    setAssets(null);
+    setSubtitleJobs(null);
+    setPublishJobs(null);
+    setPublishBatches(null);
+    setPublishReview(null);
+    setCoreError(null);
+    setError(null);
+    setPublisherErrors({});
     void refresh();
-  }, [refresh]);
+    const requestCounter = latestRequest;
+    return () => { ++requestCounter.current; };
+  }, [taskId, refresh]);
 
   return {
     task,

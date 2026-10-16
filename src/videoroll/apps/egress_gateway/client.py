@@ -23,7 +23,9 @@ _MAX_TIMEOUT_SECONDS = 60.0
 _MAX_RESPONSE_BYTES = 2_000_000
 _MAX_REDIRECTS = 5
 _RESOLVER_SLOTS = BoundedSemaphore(16)
-_DEFAULT_GATEWAY_HOSTNAMES = frozenset({"egress-gateway"})
+# Native deployments bind the internal gateway on the loopback interface.
+# Keep this explicit allow-list narrow; never accept arbitrary private IPs.
+_DEFAULT_GATEWAY_HOSTNAMES = frozenset({"egress-gateway", "127.0.0.1", "::1"})
 _DEFAULT_HEADERS = {
     "accept": "application/json, text/html;q=0.9, text/plain;q=0.8, */*;q=0.1",
     "user-agent": "VideoRoll-Egress-Gateway/1.0",

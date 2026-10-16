@@ -202,6 +202,8 @@ def test_success_clears_previous_failure_without_losing_attempts(db: Session) ->
     output = Asset(task_id=job.task_id, kind=AssetKind.video_final, storage_key="final/video.mp4")
     db.add(output)
     db.commit()
+    new.output_json = {"uploaded_output_asset_id": str(output.id)}
+    db.add(new); db.commit()
     service.complete_execution(db, new.id, ExecutionCompleteRequest(
         fence_token=new.fence_token, output_asset_id=output.id,
     ))

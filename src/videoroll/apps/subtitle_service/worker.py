@@ -99,6 +99,7 @@ from videoroll.apps.subtitle_service.subtitle_finalization import (
     store_ass_output,
 )
 from videoroll.apps.outbox.dispatcher import dispatch_outbox_events
+from videoroll.apps.outbox.service import recover_unacknowledged_workflow_events
 from videoroll.apps.outbox.service import create_outbox_event
 from videoroll.apps.outbox.worker_inbox import (
     claim_outbox_operation,
@@ -2163,6 +2164,51 @@ def push_render_workflow_event(
 
 
 @celery_app.task(
+    name="subtitle_service.push_dubbing_workflow_event",
+    bind=True,
+    max_retries=100,
+    acks_late=True,
+    reject_on_worker_lost=True,
+)
+def push_dubbing_workflow_event(
+    self: Any,
+    dubbing_job_id: str,
+    status: str,
+    error: str | None = None,
+    outbox_event_id: str | None = None,
+) -> dict[str, Any]:
+    """Retry a durable dubbing completion notification until Hatchet accepts it."""
+    _ensure_db()
+    operation = _claim_outbox_worker_operation(
+        outbox_event_id,
+        worker_name="subtitle_service.push_dubbing_workflow_event",
+        lease_seconds=120,
+    )
+    if isinstance(operation, dict):
+        return operation
+    if operation is None:
+        raise ValueError("dubbing workflow events must be delivered through the durable outbox")
+    operation_key, owner = operation
+    payload = {"dubbing_job_id": dubbing_job_id, "status": status, "error": error}
+    try:
+        orchestrator_settings = get_orchestrator_settings()
+        headers = {INTERNAL_TOKEN_HEADER: service_token(orchestrator_settings)}
+        with httpx.Client(timeout=15.0, headers=headers) as client:
+            response = client.post(
+                f"{orchestrator_settings.workflow_service_url.rstrip('/')}/events/dubbing-finished",
+                json=payload,
+            )
+            response.raise_for_status()
+    except Exception as exc:
+        _release_outbox_worker_operation(operation_key, owner, exc)
+        raise self.retry(exc=exc, countdown=min(300, 2 ** min(int(self.request.retries or 0) + 1, 8)))
+
+    result = {"status": "ok", "dubbing_job_id": dubbing_job_id, "dubbing_status": status}
+    _finish_outbox_worker_operation(operation_key, result)
+    return result
+
+
+@celery_app.task(
     name="subtitle_service.push_publish_workflow_event",
     bind=True,
     max_retries=20,
@@ -2484,13 +2530,15 @@ def dispatch_outbox() -> dict[str, int]:
     _ensure_db()
     db = _db()
     try:
+        recovered = recover_unacknowledged_workflow_events(db, limit=100)
+        db.commit()
         result = dispatch_outbox_events(
             db,
             celery_app,
             owner=f"subtitle_service.dispatcher:{os.getpid()}:{uuid.uuid4().hex[:12]}",
             limit=50,
         )
-        return {"claimed": result.claimed, "dispatched": result.dispatched, "failed": result.failed}
+        return {"claimed": result.claimed, "dispatched": result.dispatched, "failed": result.failed, "recovered": recovered}
     finally:
         db.close()
 

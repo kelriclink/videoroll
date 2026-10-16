@@ -83,6 +83,29 @@ def test_stop_and_resume_preserves_the_previous_task_stage(db: Session) -> None:
     assert resumed.stopped_status is None
 
 
+def test_stop_cancels_every_active_hatchet_run_for_one_task(db: Session) -> None:
+    task = _task(TaskStatus.translated)
+    db.add(task)
+    db.flush()
+    runs = [
+        PipelineRun(
+            task_id=task.id, engine="hatchet", workflow_name=name,
+            external_run_id=f"hatchet-{index}", state="running", request_json={},
+        )
+        for index, name in enumerate(("VideoPipelineV1", "SubtitleJobV1"), 1)
+    ]
+    db.add_all(runs)
+    db.commit()
+
+    task_service.stop_task(task.id, db=db)
+
+    for run in runs:
+        db.refresh(run)
+        assert run.state == "cancel_requested"
+    events = db.query(OutboxEvent).filter(OutboxEvent.event_type == "workflow.cancel").all()
+    assert {event.aggregate_id for event in events} == {str(run.id) for run in runs}
+
+
 def test_stop_all_skips_terminal_and_already_stopped_tasks(db: Session) -> None:
     active = _task(TaskStatus.downloaded)
     completed = _task(TaskStatus.published)
