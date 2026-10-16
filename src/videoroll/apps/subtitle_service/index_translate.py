@@ -153,8 +153,14 @@ def translate_subtitles_index(
     out = list(base_translations or []) if selective else list(resume_from or [])
     if len(out) > len(segments):
         raise ValueError("Index translation checkpoint longer than source")
-    limit = max(4000, min(100000, int(settings.get("index_context_chars") or 48000)))
+    requested_context_limit = max(1000, int(settings.get("index_context_chars") or 6000))
+    # The public Index endpoint currently has a 16,384-token input limit.
+    # It is not safe to replay a 48,000-character transcript for each batch.
+    limit = min(6000, requested_context_limit)
     effective_context_limit = limit
+    if report and requested_context_limit > limit:
+        report(f"index translation: reference capped at {limit} characters "
+               f"(requested {requested_context_limit}) to respect public gateway limits")
     width = max(1, min(50, int(batch_size or 12)))
     source_lang = "视频原始语言"
     glossary = str(settings.get("index_glossary") or "").strip()[:4000]
@@ -244,17 +250,31 @@ def translate_subtitles_index(
             return [replace(segments[i], text=mapping[i+1], secondary_text=None)
                     for i in range(first, last)]
         except (httpx.HTTPStatusError, httpx.TimeoutException, httpx.TransportError) as exc:
-            # Public gateway 504/timeout with long contexts: transparently lower
-            # the context budget instead of failing the user's whole video.
-            if effective_context_limit > 6000 and (
-                not isinstance(exc, httpx.HTTPStatusError)
-                or exc.response.status_code in {408, 413, 422, 429, 500, 502, 503, 504}
-            ):
-                effective_context_limit = 6000
+            # HTTP 400 from this public gateway can mean that the prompt
+            # exceeded its 16,384-token limit. Check the *body*, never treat
+            # an unrelated bad request as a retriable context overflow.
+            text = exc.response.text.lower() if isinstance(exc, httpx.HTTPStatusError) else ""
+            oversized = isinstance(exc, httpx.HTTPStatusError) and (
+                exc.response.status_code in {413, 422}
+                or (exc.response.status_code == 400 and (
+                    "token" in text and any(word in text for word in
+                                            ("限制", "超过", "limit", "context", "maximum"))
+                ))
+            )
+            temporary = (not isinstance(exc, httpx.HTTPStatusError)
+                         or exc.response.status_code in {408, 429, 500, 502, 503, 504})
+            if (oversized or temporary) and effective_context_limit > 1500:
+                effective_context_limit = max(1500, effective_context_limit // 2)
                 if report:
-                    report(f"index translation: gateway rejected long context, retrying "
-                           f"{first+1}-{last} with shortened reference")
+                    report(f"index translation: gateway rejected context for {first+1}-{last}; "
+                           f"retrying with {effective_context_limit} characters")
                 return translate_slice(first, last)
+            if oversized and last - first > 1:
+                middle = (first + last) // 2
+                if report:
+                    report(f"index translation: batch exceeds gateway token limit; "
+                           f"splitting {first+1}-{last}")
+                return translate_slice(first, middle) + translate_slice(middle, last)
             raise
         except (ValueError, json.JSONDecodeError) as exc:
             if last-first <= 1:

@@ -23,7 +23,7 @@ index_temperature: 0
 index_batch_size: 12 source cues/request
 index_max_tokens: 4096 tokens/request
 index_timeout_seconds: 120
-index_context_chars: 48000
+index_context_chars: 6000 (public 16,384-token input limit; requests are capped at 6000 chars)
 index_domain: 视频字幕
 index_glossary: fixed terminology (hard constraint)
 index_instruction: freeform style/context notes (soft constraint)

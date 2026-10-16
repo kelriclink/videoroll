@@ -97,7 +97,7 @@ def get_translate_settings(db: Session, defaults: SubtitleServiceSettings) -> di
         "index_timeout_seconds": float(stored.get("index_timeout_seconds") or 120.0),
         "index_max_tokens": int(stored.get("index_max_tokens") or 4096),
         "index_batch_size": int(stored.get("index_batch_size") or 12),
-        "index_context_chars": int(stored.get("index_context_chars") or 48000),
+        "index_context_chars": int(stored.get("index_context_chars") or 6000),
         "index_domain": str(stored.get("index_domain") or "视频字幕"),
         "index_glossary": str(stored.get("index_glossary") or ""),
         "index_instruction": str(stored.get("index_instruction") or ""),
