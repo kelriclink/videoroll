@@ -2388,7 +2388,7 @@ def _cleanup_task_impl(self: Any, task_id: str, batch_id: str | None = None) -> 
             DubbingJob.task_id == tid,
             (
                 DubbingJob.status.in_(["queued", "preparing", "synthesizing", "aligning",
-                                      "mixing", "pause_requested", "cancel_requested"])
+                                      "mixing", "rendering", "pause_requested", "cancel_requested"])
                 | (
                     DubbingJob.status.in_(["paused", "preview_ready", "needs_review"])
                     & (DubbingJob.updated_at >= datetime.now(timezone.utc) - timedelta(days=7))

@@ -169,10 +169,13 @@ async def upload_output(
         current.output_json = {**dict(current.output_json or {}), "uploaded_output_asset_id": str(asset.id)}
         session.add(current)
 
+    is_dubbed = bool((job.request_json or {}).get("dubbing_job_id"))
     return await asset_service.store_uploaded_task_asset(
         task=task, file=file, store=store, db=db, temp_prefix="render_worker_",
-        default_suffix=".mp4", key_prefix="final", object_name_prefix="video_remote",
-        asset_kind=AssetKind.video_final, max_bytes=256 * 1024 * 1024 * 1024,
+        default_suffix=".mp4", key_prefix="dubbed" if is_dubbed else "final",
+        object_name_prefix="video_p2_remote" if is_dubbed else "video_remote",
+        asset_kind=AssetKind.video_dubbed if is_dubbed else AssetKind.video_final,
+        max_bytes=256 * 1024 * 1024 * 1024,
         before_commit=verify_upload_before_commit,
         after_register=register_execution_output,
     )

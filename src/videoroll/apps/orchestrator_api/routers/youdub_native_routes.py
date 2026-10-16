@@ -51,7 +51,7 @@ def recent_native_jobs(db: Session = Depends(get_db)) -> dict:
     native_model = DubbingJob.request_json["model_path"].as_string() == "youdub:voxcpm2"
     rows = db.query(DubbingJob).filter(native_model).order_by(
         DubbingJob.created_at.desc()).limit(40).all()
-    active = {"queued", "preparing", "synthesizing", "aligning", "mixing",
+    active = {"queued", "preparing", "synthesizing", "aligning", "mixing", "rendering",
               "pause_requested", "cancel_requested"}
     all_active = db.query(DubbingJob).filter(native_model, DubbingJob.status.in_(active)).all()
     return {
@@ -134,7 +134,7 @@ def auto_dubbing(
     if job.status == "succeeded":
         return {"status": "succeeded", "detail": "existing YouDub result ready",
                 "dubbing_job_id": str(job.id)}
-    if job.status not in ("queued", "preparing", "synthesizing", "aligning", "mixing"):
+    if job.status not in ("queued", "preparing", "synthesizing", "aligning", "mixing", "rendering"):
         raise HTTPException(409, f"YouDub job {job.id} ended as {job.status}; resolve before publishing")
     if job.status == "queued":
         try:

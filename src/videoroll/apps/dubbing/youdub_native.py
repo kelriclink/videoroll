@@ -28,6 +28,8 @@ class NativeResult:
     video: Path
     audio: Path
     stages: tuple[dict, ...]
+    mixed_audio: Path | None = None
+    aligned_srt: Path | None = None
 
 
 def bridge_path() -> Path:
@@ -179,6 +181,12 @@ def _run_native_unlocked(
             raise
         state = _cli("--create", "--task-id", str(job_id),
                      "--video", str(video), "--srt", str(srt))
+        # The bridge stays upstream-compatible; enable per-task audio-only
+        # processing with a marker only for newly created tasks. Older jobs
+        # never receive the flag, including after restart/resume.
+        if os.getenv("VIDEOROLL_YOUDUB_AUDIO_ONLY", "1").strip().lower() not in {"0", "false", "off", "no"}:
+            upload_root = Path(os.getenv("WORKFOLDER", str(runtime_dir() / "workfolder"))) / "_uploads" / str(job_id)
+            (upload_root / "audio_only.flag").write_text("1\n", encoding="ascii")
     if state["status"] == "running":
         # Our DB lease is now owned by this worker; reconcile a native runner
         # whose process exited before updating YouDub's own status.
@@ -242,11 +250,22 @@ def _run_native_unlocked(
     if state["status"] != "succeeded":
         raise RuntimeError(f"Native YouDub did not complete: {state}")
     output = Path(state["output_video"])
-    audio = output.parents[1] / "tmp" / "audio_dubbing.wav"
     if not output.is_file() or output.stat().st_size < 1024:
-        raise RuntimeError("YouDub final video asset is missing")
+        raise RuntimeError("YouDub output artifact is missing")
+    session = output.parents[1]
+    audio = session / "tmp" / "audio_dubbing.wav"
     if not audio.is_file() or audio.stat().st_size < 1024:
-        raise RuntimeError("YouDub mix asset is missing")
+        raise RuntimeError("YouDub generated speech track is missing")
+    info_path = session / "metadata" / "local_info.json"
+    is_audio_only = bool(json.loads(info_path.read_text(encoding="utf-8")).get("audio_only")) if info_path.is_file() else False
+    if is_audio_only:
+        mixed = session / "tmp" / "audio_mixed.m4a"
+        subtitles = next((path for path in sorted((session / "metadata").glob("subtitles.*.srt"))
+                          if path.is_file()), None)
+        if not mixed.is_file() or mixed.stat().st_size < 1024 or subtitles is None:
+            raise RuntimeError("YouDub audio-only handoff is missing mixed audio or aligned subtitles")
+        return NativeResult(video=output, audio=audio, stages=tuple(state["stages"]),
+                            mixed_audio=mixed, aligned_srt=subtitles)
     return NativeResult(video=output, audio=audio, stages=tuple(state["stages"]))
 
 

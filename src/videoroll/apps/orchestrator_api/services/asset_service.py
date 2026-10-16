@@ -50,6 +50,9 @@ _SAFE_CONTENT_TYPES_BY_KIND: dict[AssetKind, frozenset[str]] = {
     AssetKind.video_final: frozenset(
         {"video/mp4", "video/webm", "video/quicktime", "video/x-matroska"}
     ),
+    AssetKind.video_dubbed: frozenset(
+        {"video/mp4", "video/webm", "video/quicktime", "video/x-matroska"}
+    ),
     AssetKind.audio_wav: frozenset({"audio/wav", "audio/x-wav"}),
     AssetKind.cover_image: frozenset({"image/jpeg", "image/png", "image/webp"}),
     AssetKind.metadata_json: frozenset({"application/json"}),
@@ -60,7 +63,7 @@ _SAFE_CONTENT_TYPES_BY_KIND: dict[AssetKind, frozenset[str]] = {
     AssetKind.log: frozenset({"text/plain"}),
 }
 _INLINE_ASSET_KINDS = frozenset(
-    {AssetKind.video_raw, AssetKind.video_final, AssetKind.audio_wav}
+    {AssetKind.video_raw, AssetKind.video_final, AssetKind.video_dubbed, AssetKind.audio_wav}
 )
 
 

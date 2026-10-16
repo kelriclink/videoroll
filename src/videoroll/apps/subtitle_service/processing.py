@@ -4475,8 +4475,11 @@ def render_burn_in(
     live_upload_cb: Callable[[], None] | None = None,
     cancel_event: threading.Event | None = None,
     render_metrics: dict[str, Any] | None = None,
+    audio_path: Path | None = None,
 ) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    if audio_path is not None and not audio_path.is_file():
+        raise FileNotFoundError(f"P2 mixed audio missing: {audio_path}")
     codec = str(video_codec or "").strip().lower() or "av1"
     source_duration_seconds = probe_video_duration_seconds(ffmpeg_path, video_path)
     render_started_at = time.monotonic()
@@ -4901,14 +4904,19 @@ def render_burn_in(
         )
 
     def _build_overlay_command(input_args: list[str], graph: str) -> list[str]:
+        # Input 0 = source video, 1 = ASS overlay, 2 = optional mixed P2 audio.
+        audio_input = ["-i", str(audio_path)] if audio_path else []
+        audio_map = ["-map", "2:a:0"] if audio_path else []
+        selected_map = ["-map", "[out]", *audio_map] if audio_path else map_args
         return [
             *cmd,
             "-i",
             str(video_path),
             *input_args,
+            *audio_input,
             "-filter_complex",
             graph,
-            *map_args,
+            *selected_map,
             *video_args,
             "-c:a",
             "copy",
@@ -4943,8 +4951,10 @@ def render_burn_in(
             *cmd,
             "-i",
             str(video_path),
+            *(["-i", str(audio_path)] if audio_path else []),
             "-vf",
             legacy_filter_arg,
+            *(["-map", "0:v:0", "-map", "1:a:0"] if audio_path else []),
             *video_args,
             "-c:a",
             "copy",
@@ -4991,8 +5001,10 @@ def render_burn_in(
                 [
                     "-i",
                     str(video_path),
+                    *(["-i", str(audio_path)] if audio_path else []),
                     "-vf",
                     filter_arg,
+                    *(["-map", "0:v:0", "-map", "1:a:0"] if audio_path else []),
                     *video_args,
                     "-c:a",
                     "copy",

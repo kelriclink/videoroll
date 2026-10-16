@@ -262,7 +262,7 @@ def register_auto_dub_p2_task(app: Celery) -> Any:
             if dub is None:
                 raise RuntimeError("native P2 job record disappeared")
             if dub.status in ("queued", "preparing", "synthesizing", "aligning",
-                              "mixing", "pause_requested"):
+                              "mixing", "rendering", "pause_requested"):
                 db.commit()
                 raise self.retry(countdown=90)
             if dub.status != "succeeded":

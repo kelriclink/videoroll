@@ -10,12 +10,12 @@ from videoroll.apps.orchestrator_api.render_worker_schemas import (
 )
 from videoroll.apps.orchestrator_api.services import render_worker_service
 from videoroll.db.base import Base
-from videoroll.db.models import AppSetting, Asset, AssetKind, OutboxEvent, RenderExecution, RenderJob, RenderJobStatus, RenderWorker, RenderWorkerEnrollment, SourceLicense, SourceType, Task, TaskStatus
+from videoroll.db.models import AppSetting, Asset, AssetKind, DubbingJob, OutboxEvent, RenderExecution, RenderJob, RenderJobStatus, RenderWorker, RenderWorkerEnrollment, SourceLicense, SourceType, Task, TaskStatus
 
 @pytest.fixture
 def db() -> Session:
     engine = create_engine("sqlite:///:memory:")
-    Base.metadata.create_all(engine, tables=[Task.__table__, Asset.__table__, RenderJob.__table__, RenderWorker.__table__, RenderExecution.__table__, RenderWorkerEnrollment.__table__, OutboxEvent.__table__, AppSetting.__table__])
+    Base.metadata.create_all(engine, tables=[Task.__table__, Asset.__table__, RenderJob.__table__, DubbingJob.__table__, RenderWorker.__table__, RenderExecution.__table__, RenderWorkerEnrollment.__table__, OutboxEvent.__table__, AppSetting.__table__])
     session = sessionmaker(bind=engine)()
     try:
         yield session
@@ -529,3 +529,70 @@ def test_real_upload_route_registers_asset_for_exact_execution(db: Session) -> N
         ),
     )
     assert done.state == "succeeded"
+
+
+def _make_p2_job(db: Session):
+    from videoroll.db.models import DubbingJob
+    worker = make_worker(db)
+    task = Task(source_type=SourceType.local, source_license=SourceLicense.own,
+                status=TaskStatus.published)
+    db.add(task); db.flush()
+    dub = DubbingJob(task_id=task.id, status="rendering", request_json={"model_path": "youdub:voxcpm2"}, output_json={})
+    db.add(dub); db.flush()
+    job = RenderJob(task_id=task.id, status=RenderJobStatus.queued,
+                    operation_key=f"youdub:p2-render:{dub.id}",
+                    request_json={"dubbing_job_id":str(dub.id), "runtime_profile":False,
+                                  "input_key":"raw/source.webm", "srt_key":"sub/p2.srt",
+                                  "ass_key":"sub/p2.ass", "audio_key":"dub/mixed.m4a",
+                                  "burn_in":True, "render":{"video_codec":"h264"}})
+    db.add(job);db.flush()
+    dub.output_json={"render_job_id":str(job.id), "audio_key":"dub/mixed.m4a"}
+    db.commit()
+    return worker,task,dub,job
+
+
+def test_p2_render_consumes_mixed_audio_and_does_not_mutate_p1_task(db: Session) -> None:
+    from videoroll.db.models import DubbingJob
+    worker,task,dub,job = _make_p2_job(db)
+    execution,spec=render_worker_service.claim_job(db,store(),worker.id,["http"])
+    assert execution is not None and spec is not None
+    assert {a.role for a in spec.artifacts} == {"input", "srt", "ass", "audio"}
+    assert not render_worker_service.cancellation_state(db,execution.id)[0]
+    output=Asset(task_id=task.id,kind=AssetKind.video_dubbed,storage_key="dubbed/p2.mp4")
+    db.add(output);db.commit()
+    execution.output_json={"uploaded_output_asset_id":str(output.id)}
+    db.add(execution);db.commit()
+    render_worker_service.complete_execution(db,execution.id,ExecutionCompleteRequest(
+        fence_token=execution.fence_token,output_asset_id=output.id))
+    db.refresh(task);db.refresh(dub)
+    assert task.status==TaskStatus.published
+    assert dub.status=="succeeded" and dub.output_json["video_key"]=="dubbed/p2.mp4"
+    assert db.query(Asset).filter(Asset.kind==AssetKind.video_final).count()==0
+    events=db.query(OutboxEvent).all()
+    assert [event.event_type for event in events]==["workflow.dubbing.finished"]
+
+
+def test_p2_render_failure_fails_only_dubbing_not_p1(db: Session) -> None:
+    from videoroll.db.models import DubbingJob
+    worker,task,dub,job = _make_p2_job(db)
+    execution,spec=render_worker_service.claim_job(db,store(),worker.id,["http"])
+    assert execution is not None
+    render_worker_service.fail_execution(db,execution.id,ExecutionFailRequest(
+        fence_token=execution.fence_token,error="hardware failure",retryable=False))
+    db.refresh(task);db.refresh(dub);db.refresh(job)
+    assert task.status==TaskStatus.published
+    assert dub.status=="failed" and job.status==RenderJobStatus.failed
+    assert [e.event_type for e in db.query(OutboxEvent)]==["workflow.dubbing.finished"]
+
+
+def test_p2_render_rejects_p1_final_asset(db: Session) -> None:
+    from fastapi import HTTPException
+    worker,task,dub,job=_make_p2_job(db)
+    execution,_=render_worker_service.claim_job(db,store(),worker.id,["http"])
+    old=Asset(task_id=task.id,kind=AssetKind.video_final,storage_key="final/p1.mp4")
+    db.add(old);db.commit()
+    execution.output_json={"uploaded_output_asset_id":str(old.id)}
+    db.add(execution);db.commit()
+    with pytest.raises(HTTPException,match="dubbed video"):
+        render_worker_service.complete_execution(db,execution.id,ExecutionCompleteRequest(
+            fence_token=execution.fence_token,output_asset_id=old.id))

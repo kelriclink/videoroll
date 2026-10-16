@@ -63,3 +63,25 @@ def test_import_local_video_keeps_legacy_root_upload_compatibility(monkeypatch, 
 
     assert session == tmp_path / "local" / f"legacy__{task_id}"
     assert info["original_path"] == str(source_file)
+
+
+def test_audio_only_local_video_import_reuses_encoded_bytes_without_ffmpeg(monkeypatch, tmp_path):
+    task_id = "audio-only-task"
+    upload_root = local_video.upload_dir(tmp_path, task_id)
+    upload_dir = local_video.uploaded_video_dir(tmp_path, task_id)
+    upload_dir.mkdir(parents=True)
+    source_file = upload_dir / "source.mp4"
+    source_file.write_bytes(b"synthetic webm bytes; do not transcode")
+    (upload_root / "audio_only.flag").write_text("1\n", encoding="ascii")
+
+    def must_not_transcode(*_args, **_kwargs):
+        raise AssertionError("audio-only import must not call FFmpeg")
+    monkeypatch.setattr(local_video.subprocess, "run", must_not_transcode)
+    session, info = local_video.import_local_video(
+        f"local://upload/{task_id}?direction=en-zh&filename=test.webm",
+        tmp_path, detect_source(f"local://upload/{task_id}?direction=en-zh"),
+    )
+    assert info["audio_only"] is True
+    assert not (session / "media" / "video_source.mp4").exists()
+    assert Path(info["original_path"]) == source_file
+    assert json.loads((session / "metadata" / "local_info.json").read_text())["audio_only"]

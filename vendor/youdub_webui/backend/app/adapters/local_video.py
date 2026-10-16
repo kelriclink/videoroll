@@ -115,8 +115,14 @@ def import_local_video(url: str, workfolder: Path, source: SourceConfig) -> tupl
     if subtitle_file:
         info["subtitle_path"] = str(subtitle_file)
     metadata_file = metadata_dir / "local_info.json"
+    # Persist this per task, so legacy task resumes retain their old pipeline.
+    info["audio_only"] = bool(source_file.parent.parent.joinpath("audio_only.flag").is_file())
     metadata_file.write_text(json.dumps(info, ensure_ascii=False, indent=2), encoding="utf-8")
 
+    if info["audio_only"]:
+        # The already snapshotted source file in _uploads is enough for Demucs.
+        # Avoid even a duplicate video file, not just its previous transcoding.
+        return session, info
     if video_file.exists() and video_file.stat().st_size > 0:
         return session, info
 

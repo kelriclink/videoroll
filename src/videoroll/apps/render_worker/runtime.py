@@ -700,6 +700,9 @@ class RenderWorkerRuntime:
             input_path = paths.get("input")
             srt_path = paths.get("srt")
             ass_path = paths.get("ass")
+            audio_path = paths.get("audio")
+            if request.get("dubbing_job_id") and audio_path is None:
+                raise RuntimeError("P2 render requires its mixed audio artifact")
             if input_path is None:
                 raise RuntimeError("render input artifact is missing")
             if spec.mode == "burn_in" and ass_path is None:
@@ -732,6 +735,7 @@ class RenderWorkerRuntime:
                     crf=render_cfg.get("video_crf"),
                     cancel_event=cancel_event,
                     render_metrics=execution_metrics,
+                    audio_path=audio_path,
                 )
             elif spec.mode == "soft_sub":
                 output = root / "video_softsub.mkv"

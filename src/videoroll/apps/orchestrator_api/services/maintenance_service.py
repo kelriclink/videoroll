@@ -311,7 +311,7 @@ def cleanup_terminal_task_resources(
                 DubbingJob.task_id == Task.id,
                 (
                     DubbingJob.status.in_([
-                        "queued", "preparing", "synthesizing", "aligning", "mixing",
+                        "queued", "preparing", "synthesizing", "aligning", "mixing", "rendering",
                         "pause_requested", "cancel_requested",
                     ])
                     | (

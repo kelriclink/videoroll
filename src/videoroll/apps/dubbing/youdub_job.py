@@ -16,7 +16,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from videoroll.apps.dubbing.control import DubbingInterrupted, check_control
 from videoroll.apps.dubbing.youdub_native import run_native, STAGES, convert_subtitle_json
-from videoroll.db.models import Asset, AssetKind, DubbingJob, Task, TaskStatus
+from videoroll.db.models import Asset, AssetKind, DubbingJob, RenderJob, RenderJobStatus, Task, TaskStatus
 from videoroll.storage.filesystem import FileStore
 from videoroll.utils.hashing import sha256_file
 
@@ -46,6 +46,8 @@ def execute_native_job(
         job = db.query(DubbingJob).filter(DubbingJob.id == job_id).with_for_update().one()
         if job.status == "succeeded":
             return dict(job.output_json or {})
+        if job.status == "rendering":
+            return {"status": "rendering", **dict(job.output_json or {})}
         if job.lease_owner and lease_is_active(job.lease_until):
             raise DubbingLeaseBusy(f"Native YouDub job {job_id} already leased")
         if job.status not in ("queued", "failed", "preparing", "synthesizing", "aligning", "mixing"):
@@ -109,6 +111,86 @@ def execute_native_job(
             workspace=workspace, progress=update, should_continue=control,
         )
         control()
+        if result.mixed_audio is not None:
+            # Durable handoff: YouDub has finished *audio* only. The parent
+            # workflow must wait for Render Worker to create video_dubbed.
+            if result.aligned_srt is None:
+                raise RuntimeError("Audio-only YouDub did not provide aligned subtitles")
+            duration = _duration(result.mixed_audio)
+            voice_key = f"dub/{task_id}/audio/voice-{sha256_file(result.audio)}.wav"
+            mixed_key = f"dub/{task_id}/audio/mixed-{sha256_file(result.mixed_audio)}.m4a"
+            srt_key = f"sub/{task_id}/dubbed-{sha256_file(result.aligned_srt)}.srt"
+            store.upload_file(result.audio, voice_key, content_type="audio/wav")
+            store.upload_file(result.mixed_audio, mixed_key, content_type="audio/mp4")
+            store.upload_file(result.aligned_srt, srt_key, content_type="application/x-subrip")
+            control()
+            with session_factory() as db:
+                from videoroll.apps.subtitle_service.auto_profile_store import get_auto_profile
+                job = db.query(DubbingJob).filter(DubbingJob.id == job_id).with_for_update().one()
+                if job.lease_owner != owner or job.status in ("pause_requested", "cancel_requested"):
+                    raise DubbingInterrupted("lease_lost")
+                op_key = f"youdub:p2-render:{job_id}"
+                render = db.query(RenderJob).filter(RenderJob.operation_key == op_key).first()
+                if render is None:
+                    profile = dict(get_auto_profile(db))
+                    render = RenderJob(
+                        task_id=task_id,
+                        subtitle_job_id=None,
+                        status=RenderJobStatus.queued,
+                        operation_key=op_key,
+                        request_json={
+                            "input_key": request["subtitle_video_key"],
+                            "srt_key": srt_key,
+                            "audio_key": mixed_key,
+                            "burn_in": True,
+                            "runtime_profile": False,
+                            "dubbing_job_id": str(job_id),
+                            "render": {
+                                "video_codec": profile.get("video_codec") or "h264",
+                                "video_preset": profile.get("video_preset") or "fast",
+                                "video_crf": profile.get("video_crf"),
+                                "ass_style": profile.get("ass_style") or "clean_white",
+                                "primary_font_scale_percent": profile.get("primary_font_scale_percent") or 100,
+                                "secondary_font_scale_percent": profile.get("secondary_font_scale_percent") or 100,
+                            },
+                        },
+                    )
+                    db.add(render)
+                    db.flush()
+                elif render.status in {RenderJobStatus.failed, RenderJobStatus.canceled}:
+                    # Retry ONLY the video stage; upstream VoxCPM2 audio assets
+                    # are already complete and should not be synthesized again.
+                    render.status = RenderJobStatus.queued
+                    render.progress = 0
+                    render.retry_count = 0
+                    render.error_message = None
+                    render.started_at = render.finished_at = None
+                    render.lease_owner = render.lease_until = None
+                    db.add(render)
+                for key, path in ((mixed_key, result.mixed_audio), (voice_key, result.audio)):
+                    if db.query(Asset).filter(Asset.task_id == task_id,
+                            Asset.kind == AssetKind.dubbing_audio, Asset.storage_key == key).first() is None:
+                        db.add(Asset(task_id=task_id, kind=AssetKind.dubbing_audio,
+                                     storage_key=key, sha256=sha256_file(path),
+                                     size_bytes=path.stat().st_size, duration_ms=round(duration * 1000)))
+                output = dict(job.output_json or {})
+                output.update({
+                    "audio_key": mixed_key, "voice_key": voice_key,
+                    "aligned_srt_key": srt_key,
+                    "source_video_key": request["subtitle_video_key"],
+                    "render_job_id": str(render.id),
+                    "duration": duration,
+                    "youdub": {"task_id": str(job_id), "stage": "rendering_p2",
+                               "stages": list(result.stages)},
+                })
+                job.output_json = output
+                job.status = "rendering"
+                job.progress = max(job.progress, 96)
+                job.lease_owner = job.lease_until = None
+                job.error_message = None
+                job.heartbeat_at = _utcnow()
+                db.commit()
+                return {"status": "rendering", **output}
         duration = _duration(result.video)
         native_srt = workspace / "translated.srt"
         # Count actual translated cues, not the 9 YouDub stages.

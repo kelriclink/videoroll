@@ -136,6 +136,12 @@ def register_dubbing_job_task(hatchet: Any) -> Any:
                 close_dubbing_pipeline_audit(input.job_id, status="succeeded")
             except Exception:
                 pass  # Durable event intent was already committed.
+        elif result_status == "rendering":
+            # Audio-only YouDub has handed off P2 to Render Coordinator.
+            # Render completion (not this worker) delivers the parent event.
+            if not result.get("render_job_id"):
+                raise RuntimeError("YouDub audio-only handoff has no render job")
+            close_dubbing_pipeline_audit(input.job_id, status="succeeded")
         elif result_status in ("paused", "canceled"):
             # A pause/cancel must fail the parent wait promptly, not strand P1.
             enqueue_dubbing_finished(input.job_id, "failed", result_status)

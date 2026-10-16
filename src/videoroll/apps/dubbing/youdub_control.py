@@ -20,7 +20,7 @@ from videoroll.apps.dubbing.youdub_native import model_installed, runtime_dir
 from videoroll.db.models import DubbingJob
 
 BUSY_STATES = (
-    "queued", "preparing", "synthesizing", "aligning", "mixing",
+    "queued", "preparing", "synthesizing", "aligning", "mixing", "rendering",
     "pause_requested", "cancel_requested",
 )
 MODEL_ID = "youdub:voxcpm2"
