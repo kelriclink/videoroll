@@ -221,3 +221,18 @@ def test_index_public_gateway_token_overflow_retries_with_shorter_reference(monk
     assert len(translated) == len(source)
     assert attempted[1] < attempted[0]
     assert max(attempted) < 8000
+
+
+def test_index_accepts_numbered_json_object_without_extra_calls(monkeypatch, source):
+    calls = []
+
+    def fake_call(messages, *_args, **_kwargs):
+        rows = json.loads(messages[1]["content"].split("\n", 1)[1])
+        calls.append([row["idx"] for row in rows])
+        return json.dumps({str(row["idx"]): "译文" + str(row["idx"]) for row in rows})
+
+    monkeypatch.setattr(index_translate, "_call", fake_call)
+    output = index_translate.translate_subtitles_index(
+        source, target_lang="zh", style="自然", settings={}, batch_size=3)
+    assert calls == [[1, 2, 3]]
+    assert [row.text for row in output] == ["译文1", "译文2", "译文3"]

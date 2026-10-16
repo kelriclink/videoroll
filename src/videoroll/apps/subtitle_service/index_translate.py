@@ -208,15 +208,26 @@ def translate_subtitles_index(
             if not isinstance(data, dict):
                 raise ValueError("expected JSON object")
             rows = data.get("translations")
+            if isinstance(rows, dict):
+                # The public Index-Translate endpoint also returns indexed
+                # JSON objects: {"1":"译文", "2":"译文"} instead of row arrays.
+                rows = [{"idx": key, "text": value.get("text") if isinstance(value, dict) else value}
+                        for key, value in rows.items() if str(key).isdigit()]
             if not isinstance(rows, list):
+                numbered = [
+                    {"idx": key, "text": value.get("text") if isinstance(value, dict) else value}
+                    for key, value in data.items() if str(key).isdigit()
+                ]
+                if numbered:
+                    rows = numbered
                 # Index specializes in translation and sometimes emits one {"idx","text"}
                 # even when asked for a translations array.
-                if "idx" in data and "text" in data:
+                elif "idx" in data and "text" in data:
                     rows = [data]
                 elif last-first == 1 and isinstance(data.get("translation"), str):
                     rows = [{"idx": first + 1, "text": data["translation"]}]
                 else:
-                    raise ValueError("missing translations list")
+                    raise ValueError("missing translations list or indexed translations")
             mapping: dict[int, str] = {}
             for row in rows:
                 if not isinstance(row, dict):
