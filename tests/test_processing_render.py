@@ -28,7 +28,7 @@ from videoroll.apps.subtitle_service.processing import (
     Segment,
     _ass_can_use_reduced_overlay_rate,
     _ass_event_boundaries,
-    _make_ass_event_cache_producer,
+    _write_ass_event_timeline,
     _parse_ass_timestamp,
     _plan_ass_event_cache,
     _prepare_ass_overlay_band,
@@ -118,45 +118,21 @@ class ProcessingRenderTests(unittest.TestCase):
             self.assertEqual(plan.boundaries, (0.0, 1.0, 10.0))
             self.assertEqual(plan.output_frame_count, 451)
 
-    def test_event_cache_producer_reuses_latest_state_and_honors_stop(self) -> None:
+    def test_event_cache_omits_subtitle_state_at_exact_video_eof(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            frames = []
-            for index, blob in enumerate((b"A", b"B", b"C"), start=1):
-                path = root / f"state_{index:06d}.png"
-                path.write_bytes(blob)
-                frames.append(path)
-            cache = AssEventCache(
-                plan=AssEventCachePlan(
-                    boundaries=(0.0, 1.0, 2.0),
-                    overlay_fps=2.0,
-                    output_frame_count=5,
-                    savings_ratio=0.6,
-                ),
-                directory=root,
-                frame_paths=tuple(frames),
-                total_bytes=3,
-                build_seconds=0.01,
+            ass = Path(tmp) / "eof.ass"
+            ass.write_text(
+                "[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
+                "Dialogue: 0,0:00:00.37,0:00:02.00,Default,,0,0,0,,last line\n",
+                encoding="utf-8",
             )
-            producer = _make_ass_event_cache_producer(cache)
-            output = io.BytesIO()
-            producer(output, threading.Event())
-            self.assertEqual(output.getvalue(), b"AABBC")
-
-            stopped = threading.Event()
-            stopped.set()
-            output = io.BytesIO()
-            producer(output, stopped)
-            self.assertEqual(output.getvalue(), b"")
-
-            class BrokenPipe:
-                def write(self, _blob: bytes) -> None:
-                    raise BrokenPipeError()
-
-                def flush(self) -> None:
-                    raise AssertionError("flush should not be reached")
-
-            producer(BrokenPipe(), threading.Event())
+            plan, reason = _plan_ass_event_cache(
+                ass, "15/1", duration_seconds=2.0, min_output_frames=1,
+            )
+            self.assertEqual(reason, "eligible")
+            self.assertIsNotNone(plan)
+            assert plan is not None
+            self.assertEqual(plan.boundaries, (0.0, 0.37))
 
     def test_prepare_ass_event_cache_builds_one_png_per_state(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -178,8 +154,9 @@ class ProcessingRenderTests(unittest.TestCase):
                     return
                 output_pattern = str(cmd[-1])
                 cache_dir = Path(output_pattern).parent
-                boundaries = _ass_event_boundaries(source)
-                for index in range(1, len(boundaries) + 1):
+                plan, _ = _plan_ass_event_cache(source, "15/1", duration_seconds=10.0)
+                assert plan is not None
+                for index in range(1, len(plan.boundaries) + 1):
                     (cache_dir / f"state_{index:06d}.png").write_bytes(bytes([index]) * 5)
 
             with patch("videoroll.apps.subtitle_service.processing._run_logged", side_effect=fake_run):
@@ -199,8 +176,8 @@ class ProcessingRenderTests(unittest.TestCase):
             self.assertEqual(reason, "built")
             self.assertIsNotNone(cache)
             assert cache is not None
-            self.assertEqual(len(cache.frame_paths), 5)
-            self.assertEqual(cache.total_bytes, 25)
+            self.assertEqual(len(cache.frame_paths), 4)
+            self.assertEqual(cache.total_bytes, 20)
             self.assertEqual(len(seen), 2)
             self.assertIn("concat", seen[1])
             shutil_target = cache.directory
@@ -359,9 +336,8 @@ class ProcessingRenderTests(unittest.TestCase):
         self.assertIn("[out]", cmd)
         self.assertIn("0:a?", cmd)
 
-    def test_render_burn_in_static_ass_uses_event_cache_image_pipe(self) -> None:
+    def test_render_burn_in_static_ass_uses_event_timed_vfr_input(self) -> None:
         calls: list[tuple[list[str], dict[str, object]]] = []
-        sentinel_producer = object()
 
         def fake_run_logged(cmd: list[str], **kwargs: object) -> None:
             calls.append((cmd, kwargs))
@@ -402,10 +378,6 @@ class ProcessingRenderTests(unittest.TestCase):
                     "videoroll.apps.subtitle_service.processing._prepare_ass_event_cache",
                     return_value=(cache, "built"),
                 ),
-                patch(
-                    "videoroll.apps.subtitle_service.processing._make_ass_event_cache_producer",
-                    return_value=sentinel_producer,
-                ),
             ):
                 render_burn_in(
                     "ffmpeg",
@@ -419,12 +391,84 @@ class ProcessingRenderTests(unittest.TestCase):
 
         self.assertEqual(len(calls), 2)
         cmd, kwargs = calls[-1]
-        self.assertIn("image2pipe", cmd)
-        self.assertIn("pipe:0", cmd)
+        self.assertIn("concat", cmd)
+        self.assertNotIn("image2pipe", cmd)
+        self.assertNotIn("pipe:0", cmd)
         graph = cmd[cmd.index("-filter_complex") + 1]
         self.assertNotIn("ass=", graph)
-        self.assertIn("shortest=1:repeatlast=1", graph)
-        self.assertIs(kwargs.get("stdin_producer"), sentinel_producer)
+        self.assertIn("shortest=0:repeatlast=1:eof_action=repeat", graph)
+        self.assertIsNone(kwargs.get("stdin_producer"))
+
+    def test_event_timeline_uses_exact_boundaries_and_no_terminal_frame(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cache = AssEventCache(
+                plan=AssEventCachePlan((0.0, 0.37, 0.83, 1.73), 15.0, 31, 4 / 31),
+                directory=root,
+                frame_paths=tuple(root / f"state_{i:06d}.png" for i in range(4)),
+                total_bytes=12, build_seconds=0.01,
+            )
+            path = _write_ass_event_timeline(cache)
+            lines = path.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(lines[0], "ffconcat version 1.0")
+            self.assertEqual(lines.count("option framerate 1000"), 4)
+            self.assertEqual([line for line in lines if line.startswith("duration ")],
+                             ["duration 0.370000", "duration 0.460000", "duration 0.900000"])
+            self.assertEqual(lines[-2:], ["file state_000003.png", "option framerate 1000"])
+            self.assertEqual(len([line for line in lines if line.startswith("file ")]), 4)
+
+    def test_event_timeline_rejects_unsafe_or_nonmonotonic_entries(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for boundaries, frame_paths in (
+                ((0.0, 1.0), (root / "state_0.png", root / "../wrong.png")),
+                ((0.0, 1.0), (root / "state_0.png", root / "quote'bad.png")),
+                ((0.0, 0.0), (root / "state_0.png", root / "state_1.png")),
+            ):
+                cache = AssEventCache(
+                    plan=AssEventCachePlan(boundaries, 15.0, 31, 0.1),
+                    directory=root, frame_paths=frame_paths, total_bytes=0,
+                    build_seconds=0.0,
+                )
+                with self.assertRaises(ValueError):
+                    _write_ass_event_timeline(cache)
+
+    def test_event_timeline_error_uses_original_live_vaapi_fallback(self) -> None:
+        calls: list[list[str]] = []
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            band_ass = root / "band.ass"
+            band_ass.write_text("[Events]\n", encoding="utf-8")
+            cache_dir = root / "cache"
+            cache_dir.mkdir()
+            cache = AssEventCache(
+                plan=AssEventCachePlan((0.0, 1.0), 15.0, 91, 2 / 91),
+                directory=cache_dir,
+                frame_paths=(cache_dir / "state_000001.png", cache_dir / "state_000002.png"),
+                total_bytes=100, build_seconds=0.01,
+            )
+            metrics: dict[str, object] = {}
+            with (
+                patch("videoroll.apps.subtitle_service.processing._run_logged", side_effect=lambda cmd, **_: calls.append(cmd)),
+                patch("videoroll.apps.subtitle_service.processing.Path.exists", return_value=True),
+                patch("videoroll.apps.subtitle_service.processing._ffmpeg_supports_encoder", return_value=True),
+                patch("videoroll.apps.subtitle_service.processing._ffmpeg_supports_filter", return_value=True),
+                patch("videoroll.apps.subtitle_service.processing.probe_video_bit_depth", return_value=8),
+                patch("videoroll.apps.subtitle_service.processing.probe_video_resolution", return_value=(1280, 720)),
+                patch("videoroll.apps.subtitle_service.processing.probe_video_frame_rate", return_value="60/1"),
+                patch("videoroll.apps.subtitle_service.processing._prepare_ass_overlay_band", return_value=(band_ass, 200)),
+                patch("videoroll.apps.subtitle_service.processing._ass_can_use_reduced_overlay_rate", return_value=True),
+                patch("videoroll.apps.subtitle_service.processing._prepare_ass_event_cache", return_value=(cache, "built")),
+                patch("videoroll.apps.subtitle_service.processing._write_ass_event_timeline", side_effect=OSError("disk full")),
+            ):
+                render_burn_in("ffmpeg", root / "input.webm", root / "subtitle.ass",
+                               root / "out.mp4", video_codec="h264", use_intel_gpu=True,
+                               intel_gpu_render_device="/dev/dri/renderD128", render_metrics=metrics)
+            self.assertTrue(calls)
+            self.assertIn("lavfi", calls[-1])
+            self.assertEqual(metrics.get("subtitle_overlay_mode"), "live-static")
+            self.assertIsNone(metrics.get("subtitle_overlay_timing"))
+            self.assertFalse(cache_dir.exists())
 
     def test_event_cache_overlay_failure_retries_live_vaapi_overlay(self) -> None:
         calls: list[list[str]] = []
@@ -443,7 +487,7 @@ class ProcessingRenderTests(unittest.TestCase):
             cache = AssEventCache(
                 plan=AssEventCachePlan((0.0, 1.0, 4.0), 15.0, 61, 3 / 61),
                 directory=cache_dir,
-                frame_paths=(),
+                frame_paths=tuple(cache_dir / f"state_{i:06d}.png" for i in range(3)),
                 total_bytes=1,
                 build_seconds=0.01,
             )
@@ -464,10 +508,6 @@ class ProcessingRenderTests(unittest.TestCase):
                     "videoroll.apps.subtitle_service.processing._prepare_ass_event_cache",
                     return_value=(cache, "built"),
                 ),
-                patch(
-                    "videoroll.apps.subtitle_service.processing._make_ass_event_cache_producer",
-                    return_value=lambda _handle, _stop: None,
-                ),
             ):
                 render_burn_in(
                     "ffmpeg",
@@ -480,7 +520,7 @@ class ProcessingRenderTests(unittest.TestCase):
                 )
 
         self.assertEqual(len(calls), 3)
-        self.assertIn("image2pipe", calls[1])
+        self.assertIn("concat", calls[1])
         self.assertIn("lavfi", calls[2])
         graph = calls[2][calls[2].index("-filter_complex") + 1]
         self.assertIn("ass=", graph)
@@ -502,7 +542,7 @@ class ProcessingRenderTests(unittest.TestCase):
             cache = AssEventCache(
                 plan=AssEventCachePlan((0.0, 1.0, 4.0), 15.0, 61, 3 / 61),
                 directory=cache_dir,
-                frame_paths=(),
+                frame_paths=tuple(cache_dir / f"state_{i:06d}.png" for i in range(3)),
                 total_bytes=1,
                 build_seconds=0.01,
             )
@@ -523,10 +563,6 @@ class ProcessingRenderTests(unittest.TestCase):
                     "videoroll.apps.subtitle_service.processing._prepare_ass_event_cache",
                     return_value=(cache, "built"),
                 ),
-                patch(
-                    "videoroll.apps.subtitle_service.processing._make_ass_event_cache_producer",
-                    return_value=lambda _handle, _stop: None,
-                ),
             ):
                 render_burn_in(
                     "ffmpeg",
@@ -539,7 +575,7 @@ class ProcessingRenderTests(unittest.TestCase):
                 )
 
         self.assertEqual(len(calls), 4)
-        self.assertIn("image2pipe", calls[1])
+        self.assertIn("concat", calls[1])
         self.assertIn("lavfi", calls[2])
         self.assertIn("-vf", calls[3])
         self.assertTrue(any("ass=/tmp/subtitle.ass" in part for part in calls[3]))
