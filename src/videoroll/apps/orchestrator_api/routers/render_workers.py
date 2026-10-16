@@ -159,12 +159,22 @@ async def upload_output(
         canceled, reason = render_worker_service.cancellation_state(session, execution_id)
         if canceled:
             raise HTTPException(409, reason or "render execution canceled during upload")
+        if (current.output_json or {}).get("uploaded_output_asset_id"):
+            raise HTTPException(409, "this execution already registered an output")
+
+    def register_execution_output(session: Session, asset: Asset) -> None:
+        current = session.get(render_worker_service.RenderExecution, execution_id)
+        if current is None:
+            raise HTTPException(409, "render execution disappeared")
+        current.output_json = {**dict(current.output_json or {}), "uploaded_output_asset_id": str(asset.id)}
+        session.add(current)
 
     return await asset_service.store_uploaded_task_asset(
         task=task, file=file, store=store, db=db, temp_prefix="render_worker_",
         default_suffix=".mp4", key_prefix="final", object_name_prefix="video_remote",
         asset_kind=AssetKind.video_final, max_bytes=256 * 1024 * 1024 * 1024,
         before_commit=verify_upload_before_commit,
+        after_register=register_execution_output,
     )
 
 @router.post("/executions/{execution_id}/complete", response_model=ExecutionRead)

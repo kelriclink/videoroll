@@ -99,6 +99,7 @@ from videoroll.apps.subtitle_service.subtitle_finalization import (
     store_ass_output,
 )
 from videoroll.apps.outbox.dispatcher import dispatch_outbox_events
+from videoroll.apps.outbox.service import recover_unacknowledged_workflow_events
 from videoroll.apps.outbox.service import create_outbox_event
 from videoroll.apps.outbox.worker_inbox import (
     claim_outbox_operation,
@@ -2529,13 +2530,15 @@ def dispatch_outbox() -> dict[str, int]:
     _ensure_db()
     db = _db()
     try:
+        recovered = recover_unacknowledged_workflow_events(db, limit=100)
+        db.commit()
         result = dispatch_outbox_events(
             db,
             celery_app,
             owner=f"subtitle_service.dispatcher:{os.getpid()}:{uuid.uuid4().hex[:12]}",
             limit=50,
         )
-        return {"claimed": result.claimed, "dispatched": result.dispatched, "failed": result.failed}
+        return {"claimed": result.claimed, "dispatched": result.dispatched, "failed": result.failed, "recovered": recovered}
     finally:
         db.close()
 

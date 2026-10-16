@@ -19,7 +19,7 @@ from videoroll.apps.subtitle_service.processing import (
     srt_to_segments,
 )
 from videoroll.config import get_orchestrator_settings
-from videoroll.db.models import AppSetting, Asset, RenderExecution, RenderJob, RenderJobStatus, RenderWorker, RenderWorkerEnrollment, SubtitleJob, SubtitleJobStatus, Task, TaskStatus
+from videoroll.db.models import AppSetting, Asset, AssetKind, RenderExecution, RenderJob, RenderJobStatus, RenderWorker, RenderWorkerEnrollment, SubtitleJob, SubtitleJobStatus, Task, TaskStatus
 from videoroll.storage.filesystem import FileStore, StorageObjectNotFound
 from videoroll.utils.auto_youtube import parse_auto_youtube_created_by
 
@@ -565,8 +565,17 @@ def complete_execution(db: Session, execution_id: uuid.UUID, payload: Any) -> Re
         raise HTTPException(400, "render output asset is required")
     if payload.output_asset_id is not None:
         asset = db.get(Asset, payload.output_asset_id)
-        if asset is None or asset.task_id != job.task_id: raise HTTPException(400, "output asset does not belong to render task")
-    now = utcnow(); execution.state = "succeeded"; execution.progress = 100; execution.output_json = payload.output; execution.finished_at = now
+        if asset is None or asset.task_id != job.task_id or asset.kind != AssetKind.video_final:
+            raise HTTPException(400, "output asset must be a final video for this task")
+        uploaded_id = str((execution.output_json or {}).get("uploaded_output_asset_id") or "")
+        if uploaded_id != str(asset.id):
+            raise HTTPException(409, "output asset was not uploaded by this execution")
+    # Serialize completion and cancellation on the same task row. The task
+    # status must still be eligible after acquiring that lock.
+    task = db.query(Task).filter(Task.id == job.task_id).with_for_update().one_or_none()
+    if task is None or task.status in {TaskStatus.canceled, TaskStatus.published}:
+        raise HTTPException(409, "task stopped before render completion")
+    now = utcnow(); execution.state = "succeeded"; execution.progress = 100; execution.output_json = {**dict(payload.output or {}), "output_asset_id": str(payload.output_asset_id) if payload.output_asset_id else None}; execution.finished_at = now
     job.status = RenderJobStatus.succeeded; job.progress = 100; job.finished_at = now; job.lease_owner = None; job.lease_until = None; job.heartbeat_at = now; job.error_message = None
     if job.subtitle_job_id:
         subtitle_job = db.get(SubtitleJob, job.subtitle_job_id)
@@ -575,10 +584,8 @@ def complete_execution(db: Session, execution_id: uuid.UUID, payload: Any) -> Re
             subtitle_job.progress = 100
             subtitle_job.error_message = None
             db.add(subtitle_job)
-    task = db.get(Task, job.task_id)
-    if task is not None:
-        task.status = TaskStatus.rendered
-        db.add(task)
+    task.status = TaskStatus.rendered
+    db.add(task)
     req = job.request_json if isinstance(job.request_json, dict) else {}
     after_render = req.get("after_render") if isinstance(req, dict) else None
     automatic = bool(req.get("runtime_profile")) if "runtime_profile" in req else bool(

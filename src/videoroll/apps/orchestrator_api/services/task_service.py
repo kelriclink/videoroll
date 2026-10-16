@@ -133,8 +133,7 @@ def _enqueue_hatchet_run_cancellations(db: Session, task_ids: list[uuid.UUID]) -
             .filter(
                 PipelineRun.task_id == task_id,
                 PipelineRun.engine == "hatchet",
-                PipelineRun.external_run_id.is_not(None),
-                PipelineRun.state.in_(["queued", "submitting", "submitted", "running", "waiting"]),
+                PipelineRun.state.in_(["queued", "submitting", "submitted", "running", "waiting", "launch_failed"]),
             )
             .order_by(PipelineRun.created_at.desc())
             .with_for_update()
@@ -142,25 +141,24 @@ def _enqueue_hatchet_run_cancellations(db: Session, task_ids: list[uuid.UUID]) -
         )
         runs.extend(task_runs)
     for run in runs:
-        create_outbox_event(
-            db,
-            event_type="workflow.cancel",
-            aggregate_type="pipeline_run",
-            aggregate_id=run.id,
-            task_name="subtitle_service.cancel_workflow_run",
-            args={
-                "args": [str(run.id), str(run.external_run_id)],
-                "queue": SUBTITLE_CONTROL_QUEUE,
-            },
-            operation_key=f"workflow-cancel:{run.id}",
-        )
+        # The launcher may still be waiting for Hatchet to return its run ID.
+        # Persist the cancellation intent; the launcher enqueues delivery as
+        # soon as that ID becomes known, under the same task/run row locks.
+        if run.external_run_id:
+            create_outbox_event(
+                db, event_type="workflow.cancel", aggregate_type="pipeline_run",
+                aggregate_id=run.id, task_name="subtitle_service.cancel_workflow_run",
+                args={"args": [str(run.id), str(run.external_run_id)],
+                      "queue": SUBTITLE_CONTROL_QUEUE},
+                operation_key=f"workflow-cancel:{run.id}",
+            )
         run.state = "cancel_requested"
         db.add(run)
     return len(runs)
 
 
 def stop_task(task_id: uuid.UUID, *, db: Session) -> Task:
-    task = db.get(Task, task_id)
+    task = db.query(Task).filter(Task.id == task_id).with_for_update().one_or_none()
     if not task:
         raise HTTPException(status_code=404, detail="task not found")
     if task.status == TaskStatus.canceled and task.stopped_status is not None:
@@ -193,7 +191,7 @@ def resume_stopped_task(task_id: uuid.UUID, *, db: Session) -> Task:
 
 
 def stop_all_tasks(*, db: Session) -> tuple[int, int]:
-    tasks = db.query(Task).filter(Task.status.in_(STOPPABLE_TASK_STATUSES)).all()
+    tasks = db.query(Task).filter(Task.status.in_(STOPPABLE_TASK_STATUSES)).order_by(Task.id).with_for_update().all()
 
     # A failed worker can leave a recoverable job behind.  These tasks are
     # normally terminal and therefore are not in STOPPABLE_TASK_STATUSES, but

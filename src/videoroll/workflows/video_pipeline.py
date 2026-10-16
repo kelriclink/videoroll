@@ -25,6 +25,7 @@ YOUTUBE_DOWNLOAD_MAX_POLLS = 8 * 60 * 60 // YOUTUBE_DOWNLOAD_POLL_INTERVAL_SECON
 
 class AutoYouTubeWorkflowInput(BaseModel):
     task_id: str
+    dispatch_key: str = ""
 
 
 class SubtitleJobWorkflowInput(BaseModel):
@@ -287,6 +288,9 @@ def register_video_pipeline(hatchet: Any, *, settings: WorkflowRuntimeSettings |
     workflow = hatchet.workflow(
         name=VIDEO_PIPELINE_NAME,
         input_validator=AutoYouTubeWorkflowInput,
+        idempotency=TTLBasedIdempotencyConfig(
+            key_expression="input.dispatch_key", ttl=timedelta(days=7),
+        ),
     )
 
     @workflow.durable_task(

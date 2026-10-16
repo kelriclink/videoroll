@@ -440,6 +440,7 @@ async def store_uploaded_task_asset(
     update_task_status: TaskStatus | None = None,
     max_bytes: int | None = None,
     before_commit: Callable[[Session], None] | None = None,
+    after_register: Callable[[Session, Asset], None] | None = None,
 ) -> Asset:
     suffix = Path(file.filename or "").suffix or default_suffix
     temp_path: Path | None = None
@@ -477,6 +478,9 @@ async def store_uploaded_task_asset(
         if before_commit is not None:
             before_commit(db)
         db.add(asset)
+        if after_register is not None:
+            db.flush()
+            after_register(db, asset)
         if update_task_status is not None:
             task.status = update_task_status
             db.add(task)

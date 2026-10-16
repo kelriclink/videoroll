@@ -28,6 +28,7 @@ from videoroll.workflows.video_pipeline import (
 class AutoYouTubeLaunchRequest(BaseModel):
     task_id: str
     priority: int = 0
+    dispatch_key: str | None = None
 
 
 class SubtitleJobLaunchRequest(BaseModel):
@@ -122,13 +123,17 @@ def create_app() -> FastAPI:
 
     @app.post("/runs/auto-youtube", response_model=WorkflowLaunchResponse, dependencies=[Depends(_require_internal)])
     async def launch_auto_youtube(payload: AutoYouTubeLaunchRequest) -> WorkflowLaunchResponse:
-        ref = await _video_pipeline().aio_run(
-            AutoYouTubeWorkflowInput(task_id=payload.task_id),
-            wait_for_result=False,
-            additional_metadata={"videoroll_task_id": payload.task_id},
-            priority=_hatchet_priority(payload.priority),
-        )
-        workflow_run_id = str(getattr(ref, "workflow_run_id", "") or "").strip()
+        dispatch_key = payload.dispatch_key or f"{payload.task_id}:{uuid.uuid4().hex}"
+        try:
+            ref = await _video_pipeline().aio_run(
+                AutoYouTubeWorkflowInput(task_id=payload.task_id, dispatch_key=dispatch_key),
+                wait_for_result=False,
+                additional_metadata={"videoroll_task_id": payload.task_id},
+                priority=_hatchet_priority(payload.priority),
+            )
+            workflow_run_id = str(getattr(ref, "workflow_run_id", "") or "").strip()
+        except IdempotencyCollisionError as exc:
+            workflow_run_id = str(exc.existing_run_external_id or "").strip()
         if not workflow_run_id:
             raise HTTPException(status_code=502, detail="Hatchet did not return a workflow run id")
         return WorkflowLaunchResponse(workflow_run_id=workflow_run_id)

@@ -131,6 +131,8 @@ def test_render_success_writes_durable_hatchet_event_outbox(db: Session) -> None
         storage_key=f"final/{job.task_id}/video.mp4",
     )
     db.add(output); db.commit()
+    execution.output_json = {"uploaded_output_asset_id": str(output.id)}
+    db.add(execution); db.commit()
 
     render_worker_service.complete_execution(
         db,
@@ -205,6 +207,8 @@ def test_automatic_render_does_not_create_legacy_publish_outbox(db: Session) -> 
     db.add(job); db.commit()
     output = Asset(task_id=job.task_id, kind=AssetKind.video_final, storage_key=f"final/{job.task_id}/video.mp4")
     db.add(output); db.commit()
+    execution.output_json = {"uploaded_output_asset_id": str(output.id)}
+    db.add(execution); db.commit()
 
     render_worker_service.complete_execution(
         db,
@@ -228,6 +232,8 @@ def test_manual_after_render_publish_outbox_uses_control_queue(db: Session) -> N
     db.add(job); db.commit()
     output = Asset(task_id=job.task_id, kind=AssetKind.video_final, storage_key=f"final/{job.task_id}/video.mp4")
     db.add(output); db.commit()
+    execution.output_json = {"uploaded_output_asset_id": str(output.id)}
+    db.add(execution); db.commit()
 
     render_worker_service.complete_execution(
         db,
@@ -471,3 +477,55 @@ def test_local_worker_enrollment_preserves_existing_admin_concurrency(db: Sessio
     )
     assert enrolled.id == existing.id
     assert enrolled.max_concurrency == 4
+
+
+def test_completion_requires_asset_uploaded_by_current_execution(db: Session) -> None:
+    from fastapi import HTTPException
+    worker = make_worker(db)
+    job = make_job(db)
+    execution, _ = render_worker_service.claim_job(db, store(), worker.id, ["http"])
+    assert execution is not None
+    old_video = Asset(task_id=job.task_id, kind=AssetKind.video_final,
+                      storage_key=f"final/{job.task_id}/previous.mp4")
+    not_a_video = Asset(task_id=job.task_id, kind=AssetKind.metadata_json,
+                        storage_key=f"raw/{job.task_id}/metadata.json")
+    db.add_all([old_video, not_a_video]); db.commit()
+
+    with pytest.raises(HTTPException, match="not uploaded by this execution"):
+        render_worker_service.complete_execution(db, execution.id,
+            ExecutionCompleteRequest(fence_token=execution.fence_token,
+                                     output_asset_id=old_video.id))
+    execution.output_json = {"uploaded_output_asset_id": str(not_a_video.id)}
+    db.add(execution); db.commit()
+    with pytest.raises(HTTPException, match="must be a final video"):
+        render_worker_service.complete_execution(db, execution.id,
+            ExecutionCompleteRequest(fence_token=execution.fence_token,
+                                     output_asset_id=not_a_video.id))
+    assert db.get(RenderJob, job.id).status == RenderJobStatus.running
+
+
+def test_real_upload_route_registers_asset_for_exact_execution(db: Session) -> None:
+    import asyncio
+    import io
+    from fastapi import UploadFile
+    from videoroll.apps.orchestrator_api.routers.render_workers import upload_output
+
+    worker = make_worker(db)
+    job = make_job(db)
+    execution, _ = render_worker_service.claim_job(db, store(), worker.id, ["http"])
+    assert execution is not None
+    upload = UploadFile(file=io.BytesIO(b"video-content-from-this-execution"), filename="render.mp4")
+    asset = asyncio.run(upload_output(
+        execution_id=execution.id, file=upload, fence_token=execution.fence_token,
+        db=db, store=store(), _worker=worker,
+    ))
+    db.refresh(execution)
+    assert execution.output_json["uploaded_output_asset_id"] == str(asset.id)
+    assert asset.kind == AssetKind.video_final
+    assert asset.task_id == job.task_id
+    done = render_worker_service.complete_execution(
+        db, execution.id, ExecutionCompleteRequest(
+            fence_token=execution.fence_token, output_asset_id=asset.id,
+        ),
+    )
+    assert done.state == "succeeded"

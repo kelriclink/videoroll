@@ -314,12 +314,14 @@ class OrchestratorScheduler:
             try:
                 result = self._recover_worker_leases_once()
                 relaunched = self._dispatch_recovered_subtitle_jobs_once()
-                if result.total_recovered or relaunched:
+                canceled_launches = PipelineLauncher(self.settings).reconcile_unresolved_cancellations()
+                if result.total_recovered or relaunched or canceled_launches:
                     logger.warning(
-                        "recovered expired worker leases: subtitle=%s render=%s relaunched=%s",
+                        "recovered worker leases: subtitle=%s render=%s relaunched=%s canceled_launches=%s",
                         result.subtitle_requeued,
                         result.render_requeued,
                         relaunched,
+                        canceled_launches,
                     )
             except Exception:
                 logger.exception("worker lease recovery loop failed")
