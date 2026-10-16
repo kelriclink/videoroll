@@ -327,9 +327,16 @@ def select_device(devices: list[RenderDevice], active: dict[uuid.UUID, ActiveExe
     ]
     if not candidates:
         raise RuntimeError("no local render device supports the requested render")
-    # Prefer hardware, then the least occupied device. Stable id breaks ties so
-    # scheduling is deterministic and easy to diagnose.
-    return min(candidates, key=lambda device: (device.backend == "software", counts.get(device.id, 0), device.id))
+    # Prefer hardware, then the least occupied device. For burn-in subtitles,
+    # VAAPI offers a GPU overlay path; NVIDIA's current ASS path renders the
+    # entire 4K frame on the CPU before NVENC. Prefer VAAPI on an idle tie
+    # instead of accidentally preferring NVIDIA because "n" sorts before "v".
+    return min(candidates, key=lambda device: (
+        device.backend == "software",
+        counts.get(device.id, 0),
+        0 if spec.mode == "burn_in" and device.backend == "vaapi" else 1,
+        device.id,
+    ))
 
 
 class RenderWorkerRuntime:

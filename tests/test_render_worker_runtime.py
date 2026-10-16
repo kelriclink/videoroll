@@ -138,6 +138,21 @@ def test_select_device_prefers_idle_compatible_gpu() -> None:
     assert select_device([gpu0, gpu1], active, spec).id == gpu1.id
 
 
+def test_burn_in_prefers_idle_vaapi_overlay_over_cpu_ass_nvenc() -> None:
+    from videoroll.apps.orchestrator_api.render_worker_schemas import RenderSpec
+    from videoroll.apps.render_worker.runtime import ActiveExecution, RenderDevice, select_device
+    import threading
+
+    intel = RenderDevice(id="vaapi:0000:01:00.0", name="Intel A380", backend="vaapi", encoders=("h264_vaapi",))
+    nvidia = RenderDevice(id="nvidia:GPU-v100", name="NVIDIA V100", backend="nvidia", encoders=("h264_nvenc",))
+    spec = RenderSpec(render_job_id=uuid.uuid4(), task_id=uuid.uuid4(), mode="burn_in",
+                      request={"render": {"video_codec": "h264"}})
+    assert select_device([nvidia, intel], {}, spec).id == intel.id
+    # Keep both GPUs available: prefer the free NVIDIA encoder when Intel is busy.
+    active = {uuid.uuid4(): ActiveExecution(thread=threading.Thread(), device=intel)}
+    assert select_device([nvidia, intel], active, spec).id == nvidia.id
+
+
 def test_select_device_filters_by_codec_capability() -> None:
     from videoroll.apps.orchestrator_api.render_worker_schemas import RenderSpec
     from videoroll.apps.render_worker.runtime import RenderDevice, select_device
