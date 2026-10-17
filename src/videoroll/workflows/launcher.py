@@ -60,7 +60,8 @@ class PipelineLauncher:
                 args={"args": [str(run.id), external_run_id], "queue": SUBTITLE_CONTROL_QUEUE},
                 operation_key=f"workflow-cancel:{run.id}",
             )
-        else:
+        elif run.state not in {"succeeded", "failed", "canceled", "superseded"}:
+            # Callback can close a very fast run before launch response is saved.
             run.state = "submitted"
             run.error_message = None
         db.add(run)

@@ -174,6 +174,17 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=502, detail="Hatchet did not return a dubbing workflow run id")
         return WorkflowLaunchResponse(workflow_run_id=workflow_run_id)
 
+    @app.get("/runs/{run_id}/status", dependencies=[Depends(_require_internal)])
+    async def run_status(run_id: str) -> dict[str, str]:
+        # Read-only, authoritative Hatchet run state; never infer status from
+        # the independent VideoRoll publishing business record.
+        try:
+            status = await _hatchet().runs.aio_get_status(run_id)
+        except Exception as exc:
+            raise HTTPException(status_code=503, detail="Hatchet run status unavailable") from exc
+        return {"workflow_run_id": run_id,
+                "status": str(getattr(status, "value", status)).upper()}
+
     @app.post("/runs/{run_id}/cancel", dependencies=[Depends(_require_internal)])
     async def cancel_run(run_id: str) -> dict[str, str]:
         await _hatchet().runs.aio_cancel(run_id)

@@ -35,6 +35,12 @@ class _FakeWorkflow:
 
         return decorator
 
+    def on_success_task(self, **kwargs: Any) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+        return self.task(**kwargs)
+
+    def on_failure_task(self, **kwargs: Any) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+        return self.task(**kwargs)
+
     def durable_task(self, **kwargs: Any) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
         kwargs = {**kwargs, "durable": True}
         return self.task(**kwargs)
@@ -158,7 +164,7 @@ def test_video_pipeline_orders_download_handoff_and_subtitle_process(monkeypatch
     assert workflow is hatchet.workflow_obj
     assert hatchet.workflow_name == VIDEO_PIPELINE_NAME
     assert hatchet.input_validator is AutoYouTubeWorkflowInput
-    assert set(workflow.tasks) == {"youtube-download", "subtitle-handoff", "subtitle-process", "render-wait", "dubbing-start", "dubbing-wait", "publish", "publish-wait"}
+    assert set(workflow.tasks) == {"youtube-download", "subtitle-handoff", "subtitle-process", "render-wait", "dubbing-start", "dubbing-wait", "publish", "publish-wait", "pipeline-audit-success", "pipeline-audit-failure"}
     assert workflow.options["youtube-download"]["retries"] == 2
     assert workflow.options["youtube-download"]["durable"] is True
     assert workflow.options["subtitle-handoff"]["retries"] == 3

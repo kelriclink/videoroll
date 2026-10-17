@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+
 from datetime import timedelta
 
 from hatchet_sdk import TTLBasedIdempotencyConfig
@@ -11,6 +13,8 @@ from pydantic import BaseModel
 from videoroll.workflows.auth import INTERNAL_TOKEN_HEADER, internal_service_token
 from videoroll.workflows.settings import WorkflowRuntimeSettings
 
+
+logger = logging.getLogger(__name__)
 
 VIDEO_PIPELINE_NAME = "VideoPipelineV1"
 SUBTITLE_JOB_TASK_NAME = "SubtitleJobV1"
@@ -575,5 +579,25 @@ def register_video_pipeline(hatchet: Any, *, settings: WorkflowRuntimeSettings |
             detail="publish batch completed",
             publish_batch_id=publish_batch_id,
         )
+
+    @workflow.on_success_task(name="pipeline-audit-success")
+    def pipeline_audit_success(input: AutoYouTubeWorkflowInput, _ctx: Any) -> dict[str, str]:
+        from videoroll.workflows.pipeline_status_sync import finish_auto_pipeline_audit
+        try:
+            finish_auto_pipeline_audit(input.task_id, input.dispatch_key, succeeded=True)
+        except Exception:
+            logger.exception("VideoPipeline success audit callback failed; reconciler will recover")
+            return {"status": "audit_deferred"}
+        return {"status": "succeeded"}
+
+    @workflow.on_failure_task(name="pipeline-audit-failure")
+    def pipeline_audit_failure(input: AutoYouTubeWorkflowInput, _ctx: Any) -> dict[str, str]:
+        from videoroll.workflows.pipeline_status_sync import finish_auto_pipeline_audit
+        try:
+            finish_auto_pipeline_audit(input.task_id, input.dispatch_key, succeeded=False)
+        except Exception:
+            logger.exception("VideoPipeline failure audit callback failed; reconciler will recover")
+            return {"status": "audit_deferred"}
+        return {"status": "failed"}
 
     return workflow

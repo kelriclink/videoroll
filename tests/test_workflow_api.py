@@ -34,6 +34,10 @@ class _FakeRuns:
     async def aio_cancel(self, run_id: str) -> None:
         self.canceled.append(run_id)
 
+    async def aio_get_status(self, run_id: str) -> Any:
+        from hatchet_sdk.clients.rest.models.v1_task_status import V1TaskStatus
+        return V1TaskStatus.COMPLETED
+
 
 def _runtime() -> Any:
     return SimpleNamespace(
@@ -201,3 +205,16 @@ def test_auto_youtube_api_returns_existing_id_after_idempotency_collision(monkey
     )
     assert response.status_code == 200
     assert response.json() == {"workflow_run_id": "original-video-pipeline"}
+
+
+def test_workflow_status_endpoint_requires_token_and_reports_hatchet_not_business(monkeypatch) -> None:
+    runtime = _runtime()
+    fake = _FakeRuns()
+    monkeypatch.setattr(workflow_api, "_settings", lambda: runtime)
+    monkeypatch.setattr(workflow_api, "_hatchet", lambda: SimpleNamespace(runs=fake))
+    client = TestClient(workflow_api.create_app())
+    assert client.get("/runs/abc/status").status_code == 401
+    token = internal_service_token(runtime.internal_api_secret, development_mode=False)
+    response = client.get("/runs/abc/status", headers={INTERNAL_TOKEN_HEADER: token})
+    assert response.status_code == 200
+    assert response.json() == {"workflow_run_id": "abc", "status": "COMPLETED"}

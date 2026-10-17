@@ -293,3 +293,19 @@ def test_canceled_lost_hatchet_response_is_reconciled_and_canceled(monkeypatch: 
         assert db.query(OutboxEvent).one().args_json["args"] == [str(row.id), "hatchet-123"]
     assert launcher.reconcile_unresolved_cancellations() == 0
     engine.dispose()
+
+
+def test_launch_response_does_not_regress_a_completed_callback_to_submitted() -> None:
+    engine, factory, task_id = _database()
+    with factory() as db:
+        run = PipelineRun(task_id=task_id, engine='hatchet', workflow_name='VideoPipelineV1',
+                          state='succeeded', request_json={'dispatch_key': 'already-done'})
+        db.add(run)
+        db.commit()
+        run_id = run.id
+    with factory() as db:
+        PipelineLauncher._finish_external_launch(db, run_id, 'hatchet-fast-completed')
+    with factory() as db:
+        assert db.get(PipelineRun, run_id).state == 'succeeded'
+        assert db.get(PipelineRun, run_id).external_run_id == 'hatchet-fast-completed'
+    engine.dispose()
