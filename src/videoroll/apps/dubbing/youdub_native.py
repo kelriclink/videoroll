@@ -119,6 +119,22 @@ def _cli(*args: str) -> dict:
         raise RuntimeError("YouDub bridge returned invalid JSON") from exc
 
 
+def _poll_native_status(job_id: str, progress: Callable[[dict], None]) -> bool:
+    """Best-effort state sample; a busy SQLite reader must not stop TTS.
+
+    Only sqlite transient contention is soft. Any other status/bridge error
+    still propagates so the existing worker can enforce process cleanup.
+    """
+    try:
+        state = _cli("--status", "--task-id", str(job_id))
+    except RuntimeError as exc:
+        if "database is locked" not in str(exc).lower():
+            raise
+        return False
+    progress(state)
+    return True
+
+
 def _stop_group(process: subprocess.Popen) -> None:
     if process.poll() is not None:
         return
@@ -223,8 +239,9 @@ def _run_native_unlocked(
             try:
                 while proc.poll() is None:
                     should_continue()
-                    state = _cli("--status", "--task-id", str(job_id))
-                    progress(state)
+                    # A transient SQLite lock must never terminate an
+                    # otherwise healthy Demucs or VoxCPM2 subprocess.
+                    _poll_native_status(str(job_id), progress)
                     time.sleep(5)
             except BaseException:
                 _stop_group(proc)

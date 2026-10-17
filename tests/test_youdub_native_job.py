@@ -164,3 +164,26 @@ def test_native_failure_is_persisted_and_does_not_advertise_success(tmp_path, mo
         assert not j.lease_owner
         assert j.progress < 100
         assert db.query(Asset).filter(Asset.kind == AssetKind.video_dubbed).count() == 0
+
+
+def test_temporary_sqlite_lock_does_not_abort_native_progress_poll(monkeypatch):
+    import sqlite3
+    from videoroll.apps.dubbing import youdub_native as native
+    messages = []
+    monkeypatch.setattr(native, "_cli", lambda *args: (_ for _ in ()).throw(
+        RuntimeError("sqlite3.OperationalError: database is locked")))
+    assert native._poll_native_status("test-job", messages.append) is False
+    assert messages == []
+
+    def success(*args):
+        assert args == ("--status", "--task-id", "test-job")
+        return {"status": "running", "current_stage": "tts", "progress": 20}
+
+    monkeypatch.setattr(native, "_cli", success)
+    assert native._poll_native_status("test-job", messages.append) is True
+    assert messages == [{"status": "running", "current_stage": "tts", "progress": 20}]
+
+    monkeypatch.setattr(native, "_cli", lambda *args: (_ for _ in ()).throw(
+        RuntimeError("YouDub native bridge: missing video file")))
+    with pytest.raises(RuntimeError, match="missing video file"):
+        native._poll_native_status("test-job", messages.append)
