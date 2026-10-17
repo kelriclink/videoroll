@@ -4483,6 +4483,17 @@ def render_burn_in(
     codec = str(video_codec or "").strip().lower() or "av1"
     source_duration_seconds = probe_video_duration_seconds(ffmpeg_path, video_path)
     render_started_at = time.monotonic()
+
+    def _warn_compatibility(code: str, description: str, *, reason: str = "") -> None:
+        """Persistent, user-facing facts; Render Worker uploads them in metrics."""
+        if render_metrics is None:
+            return
+        warning = {"code": code, "message": description, "reason": str(reason)[:400]}
+        warnings = list(render_metrics.get("compatibility_warnings") or [])
+        if not any(item.get("code") == code for item in warnings if isinstance(item, dict)):
+            warnings.append(warning)
+            render_metrics["compatibility_warnings"] = warnings
+
     ass_filter = f"ass={str(ass_path).replace(':', r'\:')}"
     cmd = [ffmpeg_path, "-y"]
     encoder = ""
@@ -4593,6 +4604,7 @@ def render_burn_in(
             video_args.extend(["-gpu", str(int(nvidia_gpu_index))])
         filter_arg = ass_filter
         pipeline = "cpu-ass-nvenc"
+        _warn_compatibility("cpu-ass-nvenc", "NVIDIA 编码使用 CPU libass 字幕合成，未使用 GPU 字幕叠加", reason="NVENC 当前无原生 GPU ASS 合成路径")
         note = (
             f"NVIDIA render pipeline: encoder={encoder} gpu={nvidia_gpu_index if nvidia_gpu_index is not None else 'auto'} "
             f"preset={effective_preset} cq={effective_cq}"
@@ -4630,6 +4642,7 @@ def render_burn_in(
         ]
         filter_arg = ass_filter
         pipeline = "cpu-ass-qsv"
+        _warn_compatibility("cpu-ass-qsv", "QSV 编码使用 CPU 字幕合成兼容路径", reason="QSV 字幕合成仍依赖 CPU libass")
         note = (
             f"Intel QSV render pipeline: encoder={encoder} "
             f"device={intel_qsv_device_index if intel_qsv_device_index is not None else 'auto'} "
@@ -4679,6 +4692,8 @@ def render_burn_in(
             live_upload_cb=live_upload_cb,
         )
         decode_mode = "vaapi" if hardware_decode else "software-fallback"
+        if not hardware_decode:
+            _warn_compatibility("vaapi-software-decode", "Intel VAAPI 硬件解码不可用，已改用 CPU 解码、GPU 合成编码", reason=f"device={device}")
         if hardware_decode:
             cmd.extend(_intel_vaapi_decode_args())
 
@@ -4761,6 +4776,7 @@ def render_burn_in(
                         raise
                     event_cache = None
                     cache_reason = f"build-failed:{type(exc).__name__}"
+                    _warn_compatibility("ass-event-cache-failed", "字幕事件缓存构建失败，已改用实时 VAAPI 图层", reason=f"{type(exc).__name__}: {exc}")
                     logger.warning("ASS event cache build failed; using live overlay: %s", exc)
 
                 if event_cache is not None:
@@ -4768,6 +4784,7 @@ def render_burn_in(
                         timeline = _write_ass_event_timeline(event_cache)
                     except (OSError, ValueError) as exc:
                         cache_reason = f"timeline-failed:{type(exc).__name__}"
+                        _warn_compatibility("ass-event-timeline-failed", "字幕事件时间轴生成失败，已改用实时 VAAPI 图层", reason=f"{type(exc).__name__}: {exc}")
                         logger.warning("ASS event timeline unavailable; using live overlay: %s", exc)
                         shutil.rmtree(event_cache.directory, ignore_errors=True)
                         event_cache = None
@@ -4845,6 +4862,7 @@ def render_burn_in(
             filter_arg = ""
             pipeline = compose_mode
         else:
+            _warn_compatibility("vaapi-overlay-unavailable", "当前 FFmpeg 缺少 overlay_vaapi，已改用 CPU libass 逐帧合成后回传 GPU", reason="overlay_vaapi filter not available")
             filter_arg = legacy_filter_arg
             compose_mode = "legacy-full-frame"
             pipeline = compose_mode
@@ -4858,6 +4876,7 @@ def render_burn_in(
         )
         if codec in {"h264", "avc"} and source_bit_depth > 8:
             bit_depth_note += " (h264_vaapi output is limited to the 8-bit NV12 path)"
+            _warn_compatibility("vaapi-10bit-to-8bit", "H.264 VAAPI 不支持保留该视频的 10-bit 输出，已转为 8-bit NV12", reason=f"source_bit_depth={source_bit_depth}")
         logger.info(bit_depth_note)
         _append_processing_log_note(log_path, bit_depth_note)
     elif codec in {"h264", "avc"}:
@@ -4878,6 +4897,7 @@ def render_burn_in(
         effective_preset = preset_s if preset_s in allowed_presets else "veryfast"
         encoder = "libx264"
         pipeline = "cpu-ass-libx264"
+        _warn_compatibility("cpu-ass-libx264", "渲染任务使用 CPU 字幕合成和软件 H.264 编码", reason="当前选用 CPU 兼容渲染路径")
         video_args = ["-c:v", "libx264", "-preset", effective_preset, "-crf", str(effective_crf)]
         filter_arg = ass_filter
     else:
@@ -4893,6 +4913,7 @@ def render_burn_in(
         effective_preset_n = 4 if preset_n is None else max(0, min(13, preset_n))
         encoder = "libsvtav1"
         pipeline = "cpu-ass-libsvtav1"
+        _warn_compatibility("cpu-ass-libsvtav1", "渲染任务使用 CPU 字幕合成和软件 AV1 编码", reason="当前选用 CPU 兼容渲染路径")
         video_args = ["-c:v", "libsvtav1", "-preset", str(effective_preset_n), "-crf", str(effective_crf)]
         filter_arg = ass_filter
 
@@ -4937,6 +4958,7 @@ def render_burn_in(
     def _run_legacy_fallback(reason: BaseException) -> None:
         if cancel_event is not None and cancel_event.is_set():
             raise RuntimeError("render process canceled") from reason
+        _warn_compatibility("vaapi-legacy-ass-fallback", "VAAPI GPU 字幕叠加失败，已使用逐帧 CPU libass 兼容合成", reason=f"{type(reason).__name__}: {reason}")
         message = (
             "VAAPI subtitle overlay failed; retrying with legacy full-frame composition "
             f"({type(reason).__name__})"
@@ -4978,6 +5000,7 @@ def render_burn_in(
                 if cancel_event is not None and cancel_event.is_set():
                     raise
                 if event_cache is not None and live_overlay_filter_complex is not None:
+                    _warn_compatibility("ass-event-overlay-failed", "字幕事件 GPU 叠加失败，已回退实时 VAAPI 图层", reason=f"{type(exc).__name__}: {exc}")
                     message = (
                         "ASS event-cache overlay failed; retrying live VAAPI subtitle overlay "
                         f"({type(exc).__name__})"
