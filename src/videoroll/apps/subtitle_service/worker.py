@@ -1523,6 +1523,25 @@ def run_subtitle_job(
             )
             _store_source_segments(segments, source_label="asr done")
 
+        if not segments and automatic_runtime_profile:
+            # If recovery encounters an empty ASR artifact, the same safe
+            # terminal state applies: never translate, dub or auto-post.
+            message = "未检测到可信语音：已跳过自动字幕、中文配音和投稿，请人工检查视频音轨。"
+            if not segments_key:
+                _store_source_segments([], source_label="asr no speech detected")
+            job.status = SubtitleJobStatus.succeeded
+            job.progress = 100
+            job.error_message = None
+            task.status = TaskStatus.failed
+            task.error_code = "NO_SPEECH_DETECTED"
+            task.error_message = message
+            db.add(job)
+            db.add(task)
+            db.commit()
+            _safe_append_log_line(log_path, message)
+            _safe_upload_log(store, log_path, log_key)
+            return {"status": "no_speech", "detail": message}
+
         job.progress = 60
         db.add(job)
         db.commit()

@@ -108,9 +108,9 @@ def register_dubbing_job_task(hatchet: Any) -> Any:
         idempotency=TTLBasedIdempotencyConfig(
             key_expression="input.dispatch_key", ttl=timedelta(days=7),
         ),
-        retries=1,
+        retries=2,
         backoff_factor=2.0,
-        backoff_max_seconds=60,
+        backoff_max_seconds=120,
         schedule_timeout=timedelta(days=7),
         execution_timeout=timedelta(hours=36),
         desired_worker_labels=pool,
@@ -119,7 +119,7 @@ def register_dubbing_job_task(hatchet: Any) -> Any:
         try:
             result = _run_dubbing_job(input.job_id)
         except Exception as exc:
-            if int(getattr(ctx, "retry_count", 0) or 0) >= 1:
+            if int(getattr(ctx, "retry_count", 0) or 0) >= 2:
                 message = f"{type(exc).__name__}: {exc}"[:800]
                 enqueue_dubbing_finished(input.job_id, "failed", message)
                 try:

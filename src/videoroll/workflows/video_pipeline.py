@@ -391,6 +391,14 @@ def register_video_pipeline(hatchet: Any, *, settings: WorkflowRuntimeSettings |
             render_job_id = subtitle_result.get("render_job_id")
         render_job_id = str(render_job_id or "").strip()
         if not render_job_id:
+            subtitle_status = getattr(subtitle_result, "status", None)
+            if isinstance(subtitle_result, dict):
+                subtitle_status = subtitle_result.get("status")
+            if subtitle_status == "no_speech":
+                return WorkflowStageOutput(
+                    task_id=input.task_id, status="no_speech",
+                    detail="No credible speech; do not render, dub or publish",
+                )
             return WorkflowStageOutput(
                 task_id=input.task_id,
                 status="skipped",
@@ -430,6 +438,12 @@ def register_video_pipeline(hatchet: Any, *, settings: WorkflowRuntimeSettings |
         desired_worker_labels=_desired_pool("workflow-core"),
     )
     def dubbing_start(input: AutoYouTubeWorkflowInput, _ctx: Any) -> WorkflowStageOutput:
+        rendered = _ctx.task_output(render_wait)
+        if getattr(rendered, "status", None) == "no_speech" or (
+            isinstance(rendered, dict) and rendered.get("status") == "no_speech"
+        ):
+            return WorkflowStageOutput(task_id=input.task_id, status="no_speech",
+                                       detail="No credible speech; dubbing skipped")
         result = _post_orchestrator(
             runtime,
             f"/tasks/{input.task_id}/actions/auto_dubbing",
@@ -458,6 +472,9 @@ def register_video_pipeline(hatchet: Any, *, settings: WorkflowRuntimeSettings |
             stage_status = started.get("status")
         job_id = str(job_id or "").strip()
         if not job_id:
+            if str(stage_status or "") == "no_speech":
+                return WorkflowStageOutput(task_id=input.task_id, status="no_speech",
+                                           detail="No credible speech; publishing must be skipped")
             return WorkflowStageOutput(task_id=input.task_id, status="skipped",
                                        detail="automatic dubbing disabled")
         if str(stage_status or "") == "succeeded":
@@ -488,6 +505,12 @@ def register_video_pipeline(hatchet: Any, *, settings: WorkflowRuntimeSettings |
     )
     def publish(input: AutoYouTubeWorkflowInput, ctx: Any) -> WorkflowStageOutput:
         dubbed = ctx.task_output(dubbing_wait)
+        status = getattr(dubbed, "status", None)
+        if isinstance(dubbed, dict):
+            status = dubbed.get("status")
+        if status == "no_speech":
+            return WorkflowStageOutput(task_id=input.task_id, status="no_speech",
+                                       detail="Automatic publishing suppressed: no credible speech")
         job_id = getattr(dubbed, "dubbing_job_id", None)
         if isinstance(dubbed, dict):
             job_id = dubbed.get("dubbing_job_id")

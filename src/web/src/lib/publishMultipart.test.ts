@@ -3,12 +3,13 @@ import { buildBilibiliMultipartParts } from "./publish";
 import type { Asset, DubbingJob } from "./types";
 
 const assets = [
-  { id: "p1", kind: "video_final", storage_key: "task/p1.mp4" },
-  { id: "p2", kind: "video_dubbed", storage_key: "task/p2.mp4" },
+  { id: "p1", kind: "video_final", task_id: "task1", storage_key: "task/p1.mp4" },
+  { id: "p2", kind: "video_dubbed", task_id: "task1", storage_key: "task/p2.mp4" },
 ] as Asset[];
 
 const job = {
   id: "job1",
+  task_id: "task1",
   status: "succeeded",
   output: { subtitle_video_key: "task/p1.mp4", video_key: "task/p2.mp4" },
 } as DubbingJob;
@@ -18,6 +19,18 @@ describe("Bilibili multipart selection", () => {
     const result = buildBilibiliMultipartParts([job], assets);
     expect(result.video_key).toBe("task/p1.mp4");
     expect(result.video_parts?.map((part) => part.video.key)).toEqual(["task/p1.mp4", "task/p2.mp4"]);
+  });
+
+  it("supports current unified audio-only P2 without legacy subtitle_video_key", () => {
+    const currentJob = { ...job, output: { video_key: "task/p2.mp4", source_video_key: "task/raw.webm" } } as DubbingJob;
+    const result = buildBilibiliMultipartParts([currentJob], assets);
+    expect(result.video_key).toBe("task/p1.mp4");
+    expect(result.video_parts?.[1].video.key).toBe("task/p2.mp4");
+  });
+
+  it("refuses P2 from another task even when storage keys overlap", () => {
+    const wrong = { ...job, task_id: "other", output: { video_key: "task/p2.mp4" } } as DubbingJob;
+    expect(() => buildBilibiliMultipartParts([wrong], assets)).toThrow();
   });
 
   it("refuses P2 without matching P1", () => {

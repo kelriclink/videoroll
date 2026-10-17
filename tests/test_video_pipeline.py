@@ -310,3 +310,26 @@ def test_youtube_download_transport_timeout_checks_progress_before_retry(monkeyp
 
     assert result["status"] == "completed"
     assert seen_error == [httpx.ReadTimeout]
+
+
+def test_no_speech_auto_pipeline_does_not_dub_or_publish(monkeypatch) -> None:
+    hatchet = _FakeHatchet()
+    workflow = register_video_pipeline(hatchet, settings=WorkflowRuntimeSettings(
+        orchestrator_url="http://localhost:8000",
+        internal_api_secret="test",
+    ))
+    tasks = hatchet.workflow_obj.tasks
+    task_input = AutoYouTubeWorkflowInput(task_id="00000000-0000-0000-0000-000000000001")
+    from videoroll.workflows.video_pipeline import WorkflowStageOutput
+    subtitle = WorkflowStageOutput(task_id=task_input.task_id, status="no_speech", detail="no speech")
+    rendered = asyncio.run(tasks["render-wait"](task_input, _FakeContext(subtitle)))
+    assert rendered.status == "no_speech"
+    def unexpected_call(*_args, **_kwargs):
+        raise AssertionError("No model or publish API must be called for silent source")
+    monkeypatch.setattr("videoroll.workflows.video_pipeline._post_orchestrator", unexpected_call)
+    dubbing = tasks["dubbing-start"](task_input, _FakeContext(rendered))
+    assert dubbing.status == "no_speech"
+    waiting = asyncio.run(tasks["dubbing-wait"](task_input, _FakeContext(dubbing)))
+    assert waiting.status == "no_speech"
+    published = tasks["publish"](task_input, _FakeContext(waiting))
+    assert published.status == "no_speech"

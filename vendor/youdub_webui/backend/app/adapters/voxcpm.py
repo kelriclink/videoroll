@@ -166,6 +166,33 @@ def _write_original_target_audio(
         handle.flush()
 
 
+def _require_available_voxcpm_gpu_memory() -> None:
+    """Check *external* GPU pressure before model initialization.
+
+    Insufficient free VRAM is a resource scheduling failure, not a defective
+    TTS sample. The restartable pipeline retains all previously written WAVs.
+    """
+    import subprocess
+    minimum_mib = max(1024, int(os.getenv("VOXCPM_MIN_FREE_GPU_MIB", "9216")))
+    if shutil.which("nvidia-smi") is None:
+        return  # CPU-only/dev hosts still use native backend device errors.
+    try:
+        probe = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=8, check=True,
+        )
+        lines = [int(x.strip().split()[0]) for x in probe.stdout.splitlines() if x.strip()]
+        free_mib = lines[0] if lines else None
+    except (OSError, subprocess.SubprocessError, ValueError, IndexError):
+        free_mib = None
+    if free_mib is not None and free_mib < minimum_mib:
+        raise RuntimeError(
+            f"VOXCPM_GPU_MEMORY_BUSY: only {free_mib} MiB free on CUDA GPU 0; "
+            f"at least {minimum_mib} MiB required before TTS, "
+            "release competing model memory and resume the saved task"
+        )
+
+
 def generate_tts(
     translation_file: Path,
     vocals_dir: Path,
@@ -198,7 +225,14 @@ def generate_tts(
                 progress_callback(progress, f"Prepared {index}/{total} TTS clips")
         return output_dir
 
-    model = _load_model()
+    # Completed segment WAVs are durable; if the resumed job already has
+    # them, no GPU allocation or resource gate is necessary.
+    unfinished = [index for index, item in enumerate(items, 1)
+                  if not is_original_audio(item)
+                  and not (output_dir / f"{index:04d}.wav").is_file()]
+    if unfinished:
+        _require_available_voxcpm_gpu_memory()
+    model = _load_model() if unfinished else None
     min_reference_ms = int(os.getenv("VOXCPM_MIN_REFERENCE_MS", "1200"))
     fallback_references, global_fallback = _fallback_references(vocals_dir, items, min_reference_ms)
     cfg_value = float(os.getenv("VOXCPM_CFG_VALUE", "2.0"))

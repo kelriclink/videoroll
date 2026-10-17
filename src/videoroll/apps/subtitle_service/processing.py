@@ -2404,6 +2404,7 @@ def _groq_window_has_speech(
 def _detect_silero_speech_spans(
     audio_data: Sequence[float],
     *,
+    required: bool = False,
     threshold: float = _OPENVINO_VAD_THRESHOLD,
     min_speech_duration_ms: int = _OPENVINO_VAD_MIN_SPEECH_MS,
     max_speech_duration_s: float = _OPENVINO_VAD_MAX_SPEECH_SECONDS,
@@ -2420,10 +2421,12 @@ def _detect_silero_speech_spans(
         import numpy as np  # type: ignore
         from faster_whisper.vad import VadOptions, get_speech_timestamps  # type: ignore
     except Exception as e:  # pragma: no cover - depends on optional ASR packages
-        logger.warning(
-            "Silero VAD is unavailable (%s); falling back to window transcription",
-            type(e).__name__,
-        )
+        if required:
+            raise RuntimeError(
+                "Silero VAD is enabled but faster-whisper/onnxruntime is unavailable; "
+                "install the OpenVINO ASR VAD dependencies before transcribing"
+            ) from e
+        logger.warning("Silero VAD is unavailable (%s); falling back to window transcription", type(e).__name__)
         return None
 
     try:
@@ -2440,11 +2443,12 @@ def _detect_silero_speech_spans(
             sampling_rate=_ASR_SAMPLE_RATE,
         )
     except Exception as e:  # pragma: no cover - runtime/model dependent
-        logger.warning(
-            "Silero VAD failed for %d samples (%s); falling back to window transcription",
-            len(audio_data),
-            type(e).__name__,
-        )
+        if required:
+            raise RuntimeError(
+                f"Silero VAD execution failed for {len(audio_data)} audio samples; "
+                "refusing unfiltered OpenVINO transcription"
+            ) from e
+        logger.warning("Silero VAD failed for %d samples (%s); falling back to window transcription", len(audio_data), type(e).__name__)
         return None
 
     spans: list[_OpenVinoSpeechSpan] = []
@@ -2684,7 +2688,7 @@ def _iter_openvino_speech_windows(
 ) -> Iterator[tuple[array, float]]:
     for audio_data, window_offset in _iter_wav_windows_as_float_mono_16k(audio_path):
         if not _audio_is_effectively_silent(audio_data):
-            spans = _detect_silero_speech_spans(audio_data, threshold=vad_threshold) if vad_enabled else None
+            spans = _detect_silero_speech_spans(audio_data, threshold=vad_threshold, required=True) if vad_enabled else None
             if spans is None:
                 yield audio_data, window_offset
             else:
@@ -2787,18 +2791,55 @@ def transcribe_openvino_whisper(
         else:
             result = pipeline.generate(speech_audio, **generate_kwargs)
         local_duration = len(speech_audio) / float(_ASR_SAMPLE_RATE)
-        chunks.extend(
-            _offset_openvino_chunks(
-                _openvino_result_chunks(result, audio_duration=local_duration),
-                offset_seconds=offset_seconds,
-            )
-        )
+        # The OpenVINO GenAI timestamps can exceed a 30s source window.
+        # Never let such model-generated timestamps escape the actual audio.
+        local_chunks = _openvino_result_chunks(result, audio_duration=local_duration)
+        for chunk in local_chunks:
+            start = max(0.0, min(local_duration, float(chunk.start)))
+            end = max(start, min(local_duration, float(chunk.end)))
+            if end > start:
+                chunks.append(_OpenVinoChunk(
+                    start=offset_seconds + start, end=offset_seconds + end, text=chunk.text,
+                ))
         del result, speech_audio
 
     out = _dedupe_overlapping_asr_segments(_filter_faster_whisper_segments(chunks))
+    out = _filter_openvino_hallucinations(out, audio_duration=_wav_duration_seconds(audio_path))
     if chunks:
         logger.info("openvino-whisper kept %d/%d segments for %s", len(out), len(chunks), audio_path)
     return out
+
+
+def _wav_duration_seconds(audio_path: Path) -> float:
+    with wave.open(str(audio_path), "rb") as source:
+        return source.getnframes() / float(source.getframerate())
+
+
+def _filter_openvino_hallucinations(segments: list[Segment], *, audio_duration: float) -> list[Segment]:
+    """Conservative guard for low-information text filling long Whisper windows.
+
+    Real short speech often lasts 1-3 seconds, while OpenVINO's music
+    hallucination was 'Thank you.' repeated over consecutive 30s windows.
+    Never apply this duration heuristic to other ASR engines.
+    """
+    kept: list[Segment] = []
+    dropped = 0
+    for seg in segments:
+        start = max(0.0, float(seg.start))
+        end = min(max(0.0, audio_duration), float(seg.end))
+        text = str(seg.text or "").strip()
+        words = text.split()
+        # A single or two-word caption spanning most of a 30-second ASR
+        # chunk is practically always unsupported by the audio timeline.
+        if (end <= start or ((end - start) >= 8.0 and len(words) <= 3)
+                or ((end - start) >= 4.0 and len(words) <= 1)):
+            dropped += 1
+            continue
+        kept.append(Segment(start=start, end=end, text=text,
+                            confidence=seg.confidence, secondary_text=seg.secondary_text))
+    if dropped:
+        logger.warning("OpenVINO ASR discarded %d hallucinated/invalid-time captions", dropped)
+    return kept
 
 
 def _as_float(value: Any) -> float | None:

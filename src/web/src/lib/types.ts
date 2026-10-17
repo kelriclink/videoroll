@@ -40,6 +40,7 @@ export type Task = {
 };
 
 export type Asset = {
+  task_id?: string;
   id: string;
   kind: string;
   storage_key: string;
