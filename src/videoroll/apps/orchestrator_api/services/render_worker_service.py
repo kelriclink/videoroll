@@ -435,7 +435,13 @@ def _build_spec(db: Session, store: FileStore, job: RenderJob, execution_id: uui
         runtime_ass_path.write_text(ass_text, encoding="utf-8")
         req["ass_key"] = runtime_ass_key
         artifacts = [artifact for artifact in artifacts if artifact.role != "ass"]
-        artifacts.append(_artifact(db, store, "ass", runtime_ass_key, execution_id))
+        # Execution-scoped ASS paths change on every retry, but identical
+        # subtitle content MUST use the same render cache key. Expose its
+        # digest so standalone Render Workers can fingerprint by content.
+        generated_ass = _artifact(db, store, "ass", runtime_ass_key, execution_id)
+        artifacts.append(generated_ass.model_copy(update={
+            "sha256": hashlib.sha256(ass_text.encode("utf-8")).hexdigest(),
+        }))
     return RenderSpec(schema_version=1, render_job_id=job.id, task_id=job.task_id, mode=mode, request=req, artifacts=artifacts)
 
 def claim_job(

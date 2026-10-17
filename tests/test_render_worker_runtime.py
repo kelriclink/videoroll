@@ -529,3 +529,26 @@ def test_stale_cache_expiration_only_owns_render_cache(tmp_path: Path, monkeypat
     runtime = RenderWorkerRuntime(settings(tmp_path))
     assert not video.exists() and not manifest.exists()
     assert (legacy / "video_burnin.mp4").exists()
+
+
+def test_generated_ass_cache_is_stable_across_executions_only_when_same_bytes(tmp_path: Path, monkeypatch) -> None:
+    from videoroll.apps.orchestrator_api.render_worker_schemas import ArtifactSpec, RenderSpec
+    from videoroll.apps.render_worker import runtime as mod
+    monkeypatch.setattr(mod, "probe_capabilities", lambda *_: ({}, {}, []))
+    runner = RenderWorkerRuntime(settings(tmp_path))
+    uid_a, uid_b = uuid.uuid4(), uuid.uuid4()
+    job_id, task_id = uuid.uuid4(), uuid.uuid4()
+    digest = "a" * 64
+    def make_spec(eid, sha):
+        ass_key = f"render-input/{eid}/subtitle_runtime.ass"
+        return RenderSpec(task_id=task_id, render_job_id=job_id, mode="burn_in",
+                          request={"ass_key": ass_key, "render": {"video_codec": "av1"}},
+                          artifacts=[ArtifactSpec(role="ass", storage_key=ass_key,
+                                                  sha256=sha, size_bytes=92122,
+                                                  download_url=f"http://example.invalid/{eid}")])
+    old, new = make_spec(uid_a,digest),make_spec(uid_b,digest)
+    assert runner._render_cache_path(old) == runner._render_cache_path(new)
+    assert runner._render_cache_path(old) != runner._render_cache_path(make_spec(uid_b,"b"*64))
+    # Without a hash, reusing output across different execution-scoped paths
+    # is unsafe and must fail closed.
+    assert runner._render_cache_path(make_spec(uid_a,None)) != runner._render_cache_path(make_spec(uid_b,None))

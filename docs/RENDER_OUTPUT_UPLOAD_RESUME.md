@@ -21,3 +21,16 @@ Capture `is_dubbed` and `task_id` before committing the preflight and pass the c
 ## Verification
 
 Tests simulate idle transaction hazard during file storage, concurrent DB transaction boundaries, exact output reference fencing, corrupted cache, changed config and source SHA, cache survival across worker restarts, 500 retry and ambiguous 500-after-commit, and cache retention bounds. See `tests/test_render_worker_server.py` and `tests/test_render_worker_runtime.py`.
+
+### Follow-up: execution-specific ASS cache mismatch (2026-10-18)
+
+Production reattempts use `render-input/{execution_id}/subtitle_runtime.ass`.
+The ASS text and bytes were identical for consecutive attempts but the original
+cache fingerprint included this unique path in both `request.ass_key` and the
+artifact storage key, yielding a false cache miss and another source download.
+The coordinator now supplies the content SHA-256 of the generated ASS; the
+worker fingerprints such inputs as `generated-ass:sha256:<digest>` in both
+locations, retaining the exact hash and size. Other inputs/settings remain
+unchanged; a genuinely different ASS digest still invalidates the cache.
+The older preserved 4K files are migrated by hardlink/manifest to the stable
+cache key before they can be requeued. No incomplete MP4 is eligible.

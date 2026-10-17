@@ -598,12 +598,33 @@ class RenderWorkerRuntime:
         # Digest only semantic render inputs, not execution/fence/worker URLs.
         # A new attempt may reuse the output only for an identical render job
         # with identical source artifact IDs/checksums and rendering request.
-        artifact_inputs = [{
-            "role": x.role, "key": x.storage_key, "sha256": x.sha256,
-            "size_bytes": x.size_bytes,
-        } for x in spec.artifacts]
+        semantic_request = dict(spec.request)
+        artifact_inputs = []
+        for x in spec.artifacts:
+            key = x.storage_key
+            # A generated ASS asset has a unique execution path, even though
+            # the ASS bytes are identical between retries. Canonicalize ONLY
+            # if the coordinator supplies a verified content hash; otherwise
+            # keep the original path as part of the fingerprint (fail closed).
+            generated = (
+                x.role == "ass" and x.sha256 is not None
+                and key.startswith("render-input/")
+                and key.endswith("/subtitle_runtime.ass")
+            )
+            if generated:
+                middle = key[len("render-input/"):-len("/subtitle_runtime.ass")]
+                try:
+                    uuid.UUID(middle)
+                except ValueError:
+                    generated = False
+            if generated:
+                if semantic_request.get("ass_key") == key:
+                    semantic_request["ass_key"] = f"generated-ass:sha256:{x.sha256}"
+                key = f"generated-ass:sha256:{x.sha256}"
+            artifact_inputs.append({"role": x.role, "key": key,
+                                    "sha256": x.sha256, "size_bytes": x.size_bytes})
         payload = {"schema": spec.schema_version, "mode": spec.mode,
-                   "request": spec.request, "artifacts": artifact_inputs}
+                   "request": semantic_request, "artifacts": artifact_inputs}
         fingerprint = hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()
         suffix = ".mkv" if spec.mode == "soft_sub" else ".mp4"
         return Path(self.settings.work_dir) / "_render_output_cache" / str(spec.render_job_id) / f"{fingerprint}{suffix}"
