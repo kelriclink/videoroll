@@ -54,6 +54,7 @@ def test_archive_response_timeout_requires_manual_confirmation(tmp_path: Path) -
         patch.object(worker.BilibiliPublishMeta, "model_validate", return_value=SimpleNamespace(title="test", typeid=1)),
         patch.object(worker, "FileStore", return_value=store),
         patch.object(worker, "BilibiliWebClient", return_value=web_client),
+        patch.object(worker, "get_bilibili_publish_settings", return_value={"upload_workers": 4}),
         patch.object(worker, "_set_bilibili_upload_progress"),
         patch.object(worker, "_apply_publish_stage_throttle", return_value={}),
         patch.object(worker, "_add_archive_with_desc_retry", side_effect=httpx.ReadTimeout("archive response lost")),

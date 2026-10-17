@@ -94,3 +94,66 @@ def test_bilibili_upload_workers_one_preserves_serial_upload(tmp_path, monkeypat
     finally:
         client.close()
     assert order == [1, 2, 3, 4, 5]
+
+
+def test_bilibili_eight_parallel_puts_and_transient_chunk_retry(tmp_path, monkeypatch):
+    monkeypatch.setattr("videoroll.apps.bilibili_publisher.bilibili_web_client.time.sleep", lambda _: None)
+    path = tmp_path / "big.mp4"
+    path.write_bytes(bytes(range(16)))
+    client = _client(chunk_size=2)
+    barrier = threading.Barrier(8, timeout=3)
+    attempts = {}
+
+    def put(*args, params, content, **kwargs):
+        number = int(params["partNumber"])
+        attempts[number] = attempts.get(number, 0) + 1
+        if attempts[number] == 1:
+            barrier.wait()
+        if number == 4 and attempts[number] == 1:
+            return httpx.Response(503)
+        return httpx.Response(200, headers={"ETag": f"tag-{number}"})
+
+    client._upos.put.side_effect = put
+    try:
+        _, report = client.upload_video_file(path, upload_workers=8, chunk_retries=2)
+    finally:
+        client.close()
+    assert report["upload_workers"] == 8
+    assert report["chunk_retries"] == 1
+    assert attempts[4] == 2
+    assert len(attempts) == 8
+    submitted = client._upos.post.call_args.kwargs["json"]["parts"]
+    assert [x["partNumber"] for x in submitted] == list(range(1, 9))
+
+
+def test_bilibili_upload_rate_limit_is_not_retried(tmp_path):
+    path = tmp_path / "clip.mp4"
+    path.write_bytes(b"abcdef")
+    client = _client(chunk_size=2)
+    client._upos.put.return_value = httpx.Response(429)
+    try:
+        with pytest.raises(BilibiliWebError, match="status=429"):
+            client.upload_video_file(path, upload_workers=4, chunk_retries=3)
+        assert client._upos.put.call_count == 1
+        client._upos.post.assert_not_called()
+    finally:
+        client.close()
+
+
+def test_bilibili_upload_settings_are_persisted_and_bounded():
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import Session
+    from videoroll.db.models import AppSetting
+    from videoroll.apps.bilibili_publisher.publish_settings_store import (
+        get_bilibili_publish_settings, update_bilibili_publish_settings,
+    )
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    AppSetting.__table__.create(engine)
+    with Session(engine) as db:
+        assert get_bilibili_publish_settings(db)["upload_workers"] == 4
+        settings = update_bilibili_publish_settings(db, {"upload_workers": 6})
+        assert settings["upload_workers"] == 6
+        assert get_bilibili_publish_settings(db)["upload_workers"] == 6
+        with pytest.raises(ValueError, match="between 1 and 8"):
+            update_bilibili_publish_settings(db, {"upload_workers": 9})
+        assert get_bilibili_publish_settings(db)["upload_workers"] == 6

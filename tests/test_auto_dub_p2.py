@@ -108,7 +108,7 @@ class FakeClient:
         return {"archive": {"aid": aid, "title": "原视频", "copyright": 2,
                             "tid": 201, "tag": "科普", "desc": "原简介"}, "videos": parts}
 
-    def upload_video_file(self, path):
+    def upload_video_file(self, path, *, upload_workers=None):
         self.calls.append(("upload", str(path)))
         return UploadedVideo("p2", 202, "upload-id", "upos://p2"), {}
 

@@ -242,7 +242,14 @@ def build_ydl_opts(
         "noplaylist": True,
         "retries": 3,
         "fragment_retries": 3,
-        "concurrent_fragment_downloads": 4,
+        # Fragmented DASH/HLS streams do not use aria2c. Route them through
+        # yt-dlp's native concurrent fragment engine using the same user
+        # setting as direct HTTP Range transfers.
+        "concurrent_fragment_downloads": (
+            max(1, min(16, int(getattr(settings, "youtube_parallel_download_connections", 8))))
+            if for_download and bool(getattr(settings, "youtube_parallel_download_enabled", False))
+            else 1
+        ),
         "http_headers": {"User-Agent": settings.youtube_user_agent},
     }
     try:

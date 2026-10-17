@@ -190,7 +190,9 @@ def _upload_then_append(db: Session, publish_id: uuid.UUID, *, client: Any, stor
             from videoroll.apps.bilibili_publisher.bilibili_web_client import UploadedVideo
             uploaded = UploadedVideo(**previous)
         else:
-            uploaded, debug = client.upload_video_file(store.path_for(video_key))
+            from videoroll.apps.bilibili_publisher.publish_settings_store import get_bilibili_publish_settings
+            workers = get_bilibili_publish_settings(db)["upload_workers"]
+            uploaded, debug = client.upload_video_file(store.path_for(video_key), upload_workers=workers)
             state["upload"] = {
                 "filename_no_suffix": uploaded.filename_no_suffix,
                 "cid": uploaded.cid, "upload_id": uploaded.upload_id,

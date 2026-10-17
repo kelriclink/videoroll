@@ -153,6 +153,7 @@ export type PublishActionPayload = {
 
 export type VersionedPublishSettings = {
   default_meta: Record<string, unknown>;
+  upload_workers?: number;
   version?: string | number | null;
 };
 

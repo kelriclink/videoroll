@@ -428,6 +428,8 @@ class BilibiliWebClient:
         *,
         profile: str = "ugcupos/bup",
         on_progress: Callable[[int, int], None] | None = None,
+        upload_workers: int | None = None,
+        chunk_retries: int = 3,
     ) -> tuple[UploadedVideo, dict[str, Any]]:
         _require(video_path.exists(), f"video file not found: {video_path}")
         filesize = video_path.stat().st_size
@@ -444,11 +446,16 @@ class BilibiliWebClient:
         # Bilibili UPOS supports independent, out-of-order multipart PUTs.
         # Cap concurrent requests to avoid proxy/rate-limit overload. The API
         # only publishes the upload after ALL part numbers are acknowledged.
-        try:
-            worker_count = int(os.environ.get("BILIBILI_UPLOAD_WORKERS", "3"))
-        except (TypeError, ValueError):
-            worker_count = 3
-        worker_count = max(1, min(worker_count, 4, chunks))
+        if upload_workers is None:
+            try:
+                upload_workers = int(os.environ.get("BILIBILI_UPLOAD_WORKERS", "4"))
+            except (TypeError, ValueError):
+                upload_workers = 4
+        worker_count = max(1, min(int(upload_workers), 8, chunks))
+        retry_limit = max(0, min(int(chunk_retries), 5))
+        retried_chunks = 0
+        # One independent upload ID owns the file. Only UPOS part PUTs may
+        # run concurrently; the final archive publish remains exactly once.
 
         def upload_part(chunk: int) -> tuple[dict[str, Any], int]:
             start = chunk * chunk_size
@@ -458,26 +465,38 @@ class BilibiliWebClient:
             if not buf:
                 raise BilibiliWebError(f"missing upload chunk {chunk + 1}")
             end = start + len(buf)
-            resp = self._upos.put(
-                url,
-                params={
-                    "partNumber": str(chunk + 1),
-                    "uploadId": meta.upload_id,
-                    "chunk": str(chunk),
-                    "chunks": str(chunks),
-                    "size": str(len(buf)),
-                    "start": str(start),
-                    "end": str(end),
-                    "total": str(filesize),
-                },
-                headers={"X-Upos-Auth": pre.auth, "Content-Type": "application/octet-stream"},
-                content=buf,
-            )
-            if resp.status_code != 200:
-                raise BilibiliWebError(
-                    f"chunk {chunk + 1} upload failed "
-                    f"(status={resp.status_code} body={resp.text[:200]})"
-                )
+            nonlocal retried_chunks
+            for attempt in range(retry_limit + 1):
+                try:
+                    resp = self._upos.put(
+                        url,
+                        params={
+                            "partNumber": str(chunk + 1),
+                            "uploadId": meta.upload_id,
+                            "chunk": str(chunk),
+                            "chunks": str(chunks),
+                            "size": str(len(buf)),
+                            "start": str(start),
+                            "end": str(end),
+                            "total": str(filesize),
+                        },
+                        headers={"X-Upos-Auth": pre.auth, "Content-Type": "application/octet-stream"},
+                        content=buf,
+                    )
+                except (httpx.TimeoutException, httpx.NetworkError) as exc:
+                    if attempt >= retry_limit:
+                        raise BilibiliWebError(
+                            f"chunk {chunk + 1} upload failed after {attempt + 1} attempts ({type(exc).__name__})"
+                        ) from exc
+                else:
+                    if resp.status_code == 200:
+                        break
+                    if resp.status_code not in {408, 500, 502, 503, 504} or attempt >= retry_limit:
+                        raise BilibiliWebError(
+                            f"chunk {chunk + 1} upload failed (status={resp.status_code})"
+                        )
+                retried_chunks += 1  # diagnostics only; not used for progress
+                time.sleep(min(4.0, 0.25 * 2 ** attempt))
             etag = (resp.headers.get("ETag") or resp.headers.get("Etag")
                     or resp.headers.get("etag") or "").strip().strip('"')
             if not etag:
@@ -546,6 +565,8 @@ class BilibiliWebClient:
             "upload_id": meta.upload_id,
             "upload_url": url,
             "chunks": len(parts),
+            "upload_workers": worker_count,
+            "chunk_retries": retried_chunks,
         }
 
     def predict_type(self, *, csrf: str, filename: str, title: str = "", upload_id: str = "") -> Optional[int]:

@@ -73,6 +73,7 @@ const SOCIAL_PLATFORMS: Array<{ id: SocialPlatform; label: string }> = [
 export default function SettingsPublishPage() {
   const confirm = useConfirm();
   const [settings, setSettings] = useState<PublishSettings | null>(null);
+  const [uploadWorkers, setUploadWorkers] = useState(4);
   const [auth, setAuth] = useState<AuthSettings | null>(null);
   const [metaEditor, setMetaEditor] = useState(() => createDirtyFieldState("{}"));
   const [cookieText, setCookieText] = useState<string>("");
@@ -106,6 +107,7 @@ export default function SettingsPublishPage() {
         fetchJson<PublishPlatformSettingsResponse>(`${ORCHESTRATOR_URL}/settings/publish/platforms`),
       ]);
       setSettings(s);
+      setUploadWorkers(s.upload_workers ?? 4);
       setAuth(a);
       setMe(null);
       setSocialAccounts(accounts);
@@ -217,6 +219,23 @@ export default function SettingsPublishPage() {
       await refresh();
     } catch (e: unknown) {
       if (!recordPublishSettingsConflict(e)) throw e;
+    }
+  }
+
+  async function saveUploadWorkers() {
+    setBusy(true);
+    setError(null);
+    try {
+      await fetchJson(`${ORCHESTRATOR_URL}/bilibili/publish/settings`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ upload_workers: uploadWorkers }),
+      });
+      await refresh();
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
     }
   }
 
@@ -584,6 +603,19 @@ export default function SettingsPublishPage() {
             </div>
           </div>
         ) : null}
+      </div>
+
+      <div className="vr-section">
+        <div className="text-sm font-semibold">B站分片上传并发</div>
+        <div className="mt-1 text-sm text-slate-600">单个视频使用 UPOS 多线程上传（1–8 路）。默认 4 路；网络不稳定、被限流时建议降到 2–3 路。P1/P2 按顺序投稿，不会产生重复稿件。</div>
+        <div className="mt-3 flex flex-wrap items-center gap-3">
+          <label htmlFor="bili-upload-workers" className="text-sm text-slate-700">分片连接数</label>
+          <input id="bili-upload-workers" type="number" min={1} max={8} step={1}
+            className="w-24 rounded border px-2 py-1.5 text-sm" value={uploadWorkers}
+            onChange={(event) => setUploadWorkers(Math.max(1, Math.min(8, Number(event.target.value) || 1)))} />
+          <Button tone="primary" disabled={busy || !settings || uploadWorkers === (settings.upload_workers ?? 4)} onClick={() => void saveUploadWorkers()}>保存上传并发</Button>
+        </div>
+        <div className="mt-2 text-xs text-slate-500">仅针对 UPOS 分片 PUT；失败只重试受影响的分片，不会自动重复提交整份稿件。</div>
       </div>
 
       <div className="vr-section">

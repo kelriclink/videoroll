@@ -20,6 +20,7 @@ from sqlalchemy.orm import Session
 
 from videoroll.ai.service import AIService
 from videoroll.apps.bilibili_publisher.auth_settings_store import get_bilibili_cookie_header, get_bilibili_csrf_token
+from videoroll.apps.bilibili_publisher.publish_settings_store import get_bilibili_publish_settings
 from celery.exceptions import Retry
 
 from videoroll.apps.bilibili_publisher.bilibili_web_client import BilibiliDescTooLongError, BilibiliRateLimitError, BilibiliWebClient
@@ -867,6 +868,7 @@ def _process_job_impl(self, job_id: str) -> dict[str, Any]:
             completed_bytes = 0
             uploaded_parts: list[tuple[Any, str]] = []
             uploaded_debugs: list[dict[str, Any]] = []
+            upload_workers = get_bilibili_publish_settings(db)["upload_workers"]
             for part_path, part_title in video_part_paths:
                 offset = completed_bytes
                 part_upload, part_debug = client.upload_video_file(
@@ -874,6 +876,7 @@ def _process_job_impl(self, job_id: str) -> dict[str, Any]:
                     on_progress=lambda completed, _part_total, offset=offset: persist_upload_progress(
                         offset + completed, total_part_bytes,
                     ),
+                    upload_workers=upload_workers,
                 )
                 uploaded_parts.append((part_upload, part_title))
                 uploaded_debugs.append(part_debug)
