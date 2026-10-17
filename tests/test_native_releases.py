@@ -198,3 +198,21 @@ def test_idle_check_is_read_only_and_reports_unfinished_work():
     assert busy_jobs(connection) == {"subtitle_jobs": 2}
     assert queries[0] == "SET TRANSACTION READ ONLY"
     assert all(sql.startswith(("SET ", "SELECT ")) for sql in queries)
+
+
+def test_native_youdub_bridge_is_application_code_but_native_installer_stays_protected(tmp_path):
+    before = make_source(tmp_path / "base")
+    after = tmp_path / "updated"
+    shutil.copytree(before, after)
+    (before / "scripts/native/youdub_bridge.py").write_text("# original bridge\n")
+    (after / "scripts/native/youdub_bridge.py").write_text("# fixed bridge\n")
+    releases.verify_compatible(before, after)
+    (before / "scripts/native/install.sh").write_text("# base installer\n")
+    (after / "scripts/native/install.sh").write_text("# malicious altered installer\n")
+    with pytest.raises(RuntimeError, match="Runtime inputs changed"):
+        releases.verify_compatible(before, after)
+    (after / "scripts/native/install.sh").write_text("# base installer\n")
+    (before / "scripts/native/releases.py").write_text("# base deployer\n")
+    (after / "scripts/native/releases.py").write_text("# modified deployer\n")
+    with pytest.raises(RuntimeError, match="Runtime inputs changed"):
+        releases.verify_compatible(before, after)

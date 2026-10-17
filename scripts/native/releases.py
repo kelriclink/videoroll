@@ -52,6 +52,11 @@ def allowed_path(name: str) -> bool:
 
 
 def runtime_path(name: str) -> bool:
+    # The YouDub bridge is application code, not an installer, systemd unit,
+    # dependency lock or schema. Permit its verified, atomic release updates.
+    # Keep all other scripts/native files protected as runtime inputs.
+    if name == "scripts/native/youdub_bridge.py":
+        return False
     return name in {"pyproject.toml", "requirements.lock"} or name.startswith(
         ("docker/", "scripts/native/", "deploy/")
     )
