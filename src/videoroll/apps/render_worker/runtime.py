@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -352,6 +353,7 @@ class RenderWorkerRuntime:
         self._device_cooldowns: dict[str, float] = {}
         self._device_failures: dict[str, int] = {}
         self._failed_devices_by_job: dict[uuid.UUID, set[str]] = {}
+        self._prune_stale_render_cache()
 
     def _eligible_devices(self) -> list[RenderDevice]:
         now = time.monotonic()
@@ -569,16 +571,128 @@ class RenderWorkerRuntime:
                             raise RuntimeError("render execution canceled during artifact download")
                         handle.write(chunk)
 
-    def _upload_output(self, execution_id: uuid.UUID, fence: str, path: Path) -> uuid.UUID:
-        with path.open("rb") as handle, httpx.Client(timeout=None) as client:
-            response = client.post(
+    def _prune_stale_render_cache(self) -> None:
+        """Bound disk retention of our *own* verified, failed-upload outputs.
+
+        Never sweep pre-existing execution working directories or live renders.
+        Cached outputs younger than 72 hours survive worker restarts.
+        """
+        base = Path(self.settings.work_dir) / "_render_output_cache"
+        cutoff = time.time() - 72 * 3600
+        if not base.is_dir():
+            return
+        for metadata in base.glob("*/*.json"):
+            try:
+                if metadata.stat().st_mtime < cutoff:
+                    video = metadata.with_name(metadata.name[:-5])
+                    video.unlink(missing_ok=True)
+                    metadata.unlink(missing_ok=True)
+                    try:
+                        metadata.parent.rmdir()
+                    except OSError:
+                        pass
+            except OSError:
+                logger.warning("could not prune expired render cache manifest %s", metadata, exc_info=True)
+
+    def _render_cache_path(self, spec: RenderSpec) -> Path:
+        # Digest only semantic render inputs, not execution/fence/worker URLs.
+        # A new attempt may reuse the output only for an identical render job
+        # with identical source artifact IDs/checksums and rendering request.
+        artifact_inputs = [{
+            "role": x.role, "key": x.storage_key, "sha256": x.sha256,
+            "size_bytes": x.size_bytes,
+        } for x in spec.artifacts]
+        payload = {"schema": spec.schema_version, "mode": spec.mode,
+                   "request": spec.request, "artifacts": artifact_inputs}
+        fingerprint = hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()
+        suffix = ".mkv" if spec.mode == "soft_sub" else ".mp4"
+        return Path(self.settings.work_dir) / "_render_output_cache" / str(spec.render_job_id) / f"{fingerprint}{suffix}"
+
+    def _load_cached_output(self, spec: RenderSpec) -> Path | None:
+        video = self._render_cache_path(spec)
+        metadata = video.with_name(video.name + ".json")
+        if not video.is_file() or not metadata.is_file():
+            return None
+        try:
+            manifest = json.loads(metadata.read_text(encoding="utf-8"))
+            if (video.stat().st_size > 0 and video.stat().st_size == manifest["size_bytes"]
+                    and sha256_file(video) == manifest["sha256"]):
+                return video
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+        logger.warning("render cache validation failed; will render again: %s", video)
+        return None
+
+    def _persist_cached_output(self, spec: RenderSpec, output: Path) -> Path:
+        video = self._render_cache_path(spec)
+        video.parent.mkdir(parents=True, exist_ok=True)
+        # Cache is on the same work filesystem: atomic rename, not an extra
+        # 10-40 GB copy. Never mark partial/unfinished FFmpeg outputs reusable.
+        size = output.stat().st_size
+        if size <= 0:
+            raise RuntimeError("cannot cache empty render output")
+        digest = sha256_file(output)
+        os.replace(output, video)
+        meta = video.with_name(video.name + ".json")
+        tmp = meta.with_name(meta.name + f".{uuid.uuid4().hex}.partial")
+        try:
+            tmp.write_text(json.dumps({"sha256": digest, "size_bytes": size}), encoding="utf-8")
+            os.replace(tmp, meta)
+        finally:
+            tmp.unlink(missing_ok=True)
+        return video
+
+    def _clear_cached_output(self, spec: RenderSpec) -> None:
+        video = self._render_cache_path(spec)
+        video.unlink(missing_ok=True)
+        video.with_name(video.name + ".json").unlink(missing_ok=True)
+        try:
+            video.parent.rmdir()
+        except OSError:
+            pass
+
+    def _probe_registered_output(self, client: httpx.Client, execution_id: uuid.UUID, fence: str) -> uuid.UUID | None:
+        try:
+            response = client.get(
                 f"{self.api_base}/executions/{execution_id}/output",
-                headers=self._headers(),
-                data={"fence_token": fence},
-                files={"file": (path.name, handle, "application/octet-stream")},
+                headers=self._headers(), params={"fence_token": fence}, timeout=12,
             )
+            if response.status_code == 404:
+                return None
             response.raise_for_status()
             return uuid.UUID(response.json()["id"])
+        except (httpx.RequestError, httpx.HTTPStatusError, ValueError, KeyError):
+            return None
+
+    def _upload_output(self, execution_id: uuid.UUID, fence: str, path: Path) -> uuid.UUID:
+        with httpx.Client(timeout=None) as client:
+            previous = self._probe_registered_output(client, execution_id, fence)
+            if previous is not None:
+                return previous
+            for attempt in range(4):
+                try:
+                    with path.open("rb") as handle:
+                        response = client.post(
+                            f"{self.api_base}/executions/{execution_id}/output",
+                            headers=self._headers(),
+                            data={"fence_token": fence},
+                            files={"file": (path.name, handle, "application/octet-stream")},
+                        )
+                    response.raise_for_status()
+                    return uuid.UUID(response.json()["id"])
+                except (httpx.RequestError, httpx.HTTPStatusError) as exc:
+                    recovered = self._probe_registered_output(client, execution_id, fence)
+                    if recovered is not None:
+                        return recovered
+                    if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code not in {500, 502, 503, 504}:
+                        raise
+                    if attempt == 3:
+                        raise
+                    delay = min(12, 2 ** attempt * 2)
+                    logger.warning("render output transfer failed (%s); retrying saved file after %ss, attempt %d/4: %s",
+                                   type(exc).__name__, delay, attempt + 1, execution_id)
+                    time.sleep(delay)
+        raise AssertionError("render output upload did not return")
 
     def _run_execution(self, claim: ClaimResponse, device: RenderDevice) -> None:
         execution = claim.execution
@@ -686,71 +800,76 @@ class RenderWorkerRuntime:
         hb = threading.Thread(target=heartbeat_loop, name=f"render-hb-{execution_id}", daemon=True)
         hb.start()
         try:
-            paths: dict[str, Path] = {}
-            for artifact in spec.artifacts:
-                suffix = Path(artifact.storage_key).suffix or ".bin"
-                target = root / f"{artifact.role}{suffix}"
-                self._download(execution_id, artifact.role, target, cancel_event=cancel_event)
-                if artifact.sha256 and sha256_file(target) != artifact.sha256:
-                    raise RuntimeError(f"artifact checksum mismatch: {artifact.role}")
-                paths[artifact.role] = target
+            output = self._load_cached_output(spec)
+            if output is None:
+                paths: dict[str, Path] = {}
+                for artifact in spec.artifacts:
+                    suffix = Path(artifact.storage_key).suffix or ".bin"
+                    target = root / f"{artifact.role}{suffix}"
+                    self._download(execution_id, artifact.role, target, cancel_event=cancel_event)
+                    if artifact.sha256 and sha256_file(target) != artifact.sha256:
+                        raise RuntimeError(f"artifact checksum mismatch: {artifact.role}")
+                    paths[artifact.role] = target
 
-            request = dict(spec.request or {})
-            render_cfg = request.get("render") if isinstance(request.get("render"), dict) else {}
-            input_path = paths.get("input")
-            srt_path = paths.get("srt")
-            ass_path = paths.get("ass")
-            audio_path = paths.get("audio")
-            if request.get("dubbing_job_id") and audio_path is None:
-                raise RuntimeError("P2 render requires its mixed audio artifact")
-            if input_path is None:
-                raise RuntimeError("render input artifact is missing")
-            if spec.mode == "burn_in" and ass_path is None:
-                raise RuntimeError("burn-in render requires an ASS artifact")
-            if spec.mode == "soft_sub" and srt_path is None:
-                raise RuntimeError("soft-sub render requires an SRT artifact")
+                request = dict(spec.request or {})
+                render_cfg = request.get("render") if isinstance(request.get("render"), dict) else {}
+                input_path = paths.get("input")
+                srt_path = paths.get("srt")
+                ass_path = paths.get("ass")
+                audio_path = paths.get("audio")
+                if request.get("dubbing_job_id") and audio_path is None:
+                    raise RuntimeError("P2 render requires its mixed audio artifact")
+                if input_path is None:
+                    raise RuntimeError("render input artifact is missing")
+                if spec.mode == "burn_in" and ass_path is None:
+                    raise RuntimeError("burn-in render requires an ASS artifact")
+                if spec.mode == "soft_sub" and srt_path is None:
+                    raise RuntimeError("soft-sub render requires an SRT artifact")
 
-            execution_metrics["stage"] = "rendering"
-            self._execution_post(
-                execution_id,
-                "progress",
-                {"fence_token": fence, "progress": 20, "metrics": dict(execution_metrics)},
-            )
-            if spec.mode == "burn_in":
-                output = root / "video_burnin.mp4"
-                backend = device.backend
-                render_burn_in(
-                    self.settings.ffmpeg_path,
-                    input_path,
-                    ass_path,
-                    output,
-                    video_codec=str(render_cfg.get("video_codec") or "av1"),
-                    use_intel_gpu=backend in {"intel", "vaapi"},
-                    intel_gpu_render_device=device.path or "/dev/dri/renderD128",
-                    use_intel_qsv=backend == "qsv",
-                    intel_qsv_device_index=device.index,
-                    use_nvidia_gpu=backend == "nvidia",
-                    nvidia_gpu_index=device.index,
-                    preset=render_cfg.get("video_preset"),
-                    crf=render_cfg.get("video_crf"),
-                    cancel_event=cancel_event,
-                    render_metrics=execution_metrics,
-                    audio_path=audio_path,
+                execution_metrics["stage"] = "rendering"
+                self._execution_post(
+                    execution_id,
+                    "progress",
+                    {"fence_token": fence, "progress": 20, "metrics": dict(execution_metrics)},
                 )
-            elif spec.mode == "soft_sub":
-                output = root / "video_softsub.mkv"
-                mux_soft_sub(
-                    self.settings.ffmpeg_path,
-                    input_path,
-                    srt_path,
-                    output,
-                    cancel_event=cancel_event,
-                    render_metrics=execution_metrics,
-                )
+                if spec.mode == "burn_in":
+                    output = root / "video_burnin.mp4"
+                    backend = device.backend
+                    render_burn_in(
+                        self.settings.ffmpeg_path,
+                        input_path,
+                        ass_path,
+                        output,
+                        video_codec=str(render_cfg.get("video_codec") or "av1"),
+                        use_intel_gpu=backend in {"intel", "vaapi"},
+                        intel_gpu_render_device=device.path or "/dev/dri/renderD128",
+                        use_intel_qsv=backend == "qsv",
+                        intel_qsv_device_index=device.index,
+                        use_nvidia_gpu=backend == "nvidia",
+                        nvidia_gpu_index=device.index,
+                        preset=render_cfg.get("video_preset"),
+                        crf=render_cfg.get("video_crf"),
+                        cancel_event=cancel_event,
+                        render_metrics=execution_metrics,
+                        audio_path=audio_path,
+                    )
+                elif spec.mode == "soft_sub":
+                    output = root / "video_softsub.mkv"
+                    mux_soft_sub(
+                        self.settings.ffmpeg_path,
+                        input_path,
+                        srt_path,
+                        output,
+                        cancel_event=cancel_event,
+                        render_metrics=execution_metrics,
+                    )
+                else:
+                    self._execution_post(execution_id, "complete", {"fence_token": fence, "output": {}})
+                    return
+
+                output = self._persist_cached_output(spec, output)
             else:
-                self._execution_post(execution_id, "complete", {"fence_token": fence, "output": {}})
-                return
-
+                logger.info("resuming finished render without FFmpeg: job=%s cached=%s", spec.render_job_id, output)
             if cancel_event.is_set():
                 raise RuntimeError(cancel_reason[-1] if cancel_reason else "render execution canceled")
             execution_metrics["stage"] = "uploading"
@@ -769,6 +888,7 @@ class RenderWorkerRuntime:
                     "output": {"sha256": sha256_file(output), "size_bytes": output.stat().st_size},
                 },
             )
+            self._clear_cached_output(spec)
             with self._active_lock:
                 self._failed_devices_by_job.pop(spec.render_job_id, None)
         except Exception as exc:

@@ -444,7 +444,13 @@ async def store_uploaded_task_asset(
     max_bytes: int | None = None,
     before_commit: Callable[[Session], None] | None = None,
     after_register: Callable[[Session, Asset], None] | None = None,
+    task_id_override: uuid.UUID | None = None,
 ) -> Asset:
+    # Remote renders commit the preflight transaction before uploading. Never
+    # touch an expired SQLAlchemy Task after that commit: a primary-key lookup
+    # would silently start a new transaction that stays idle across hundreds
+    # of MB of multipart/disk I/O (PostgreSQL idle_in_transaction timeout).
+    task_id = task_id_override if task_id_override is not None else task.id
     suffix = Path(file.filename or "").suffix or default_suffix
     temp_path: Path | None = None
     uploaded_key: str | None = None
@@ -463,14 +469,14 @@ async def store_uploaded_task_asset(
             directory=store.partial_root if isinstance(store, FileStore) else None,
         )
         uploaded_key = (
-            f"{key_prefix}/{task.id}/{object_name_prefix}_{sha256[:16]}_{uuid.uuid4().hex[:12]}{suffix}"
+            f"{key_prefix}/{task_id}/{object_name_prefix}_{sha256[:16]}_{uuid.uuid4().hex[:12]}{suffix}"
         )
         if isinstance(store, FileStore):
             await run_in_threadpool(store.promote_file, temp_path, uploaded_key)
         else:
             await run_in_threadpool(store.upload_file, temp_path, uploaded_key, file.content_type or None)
         asset = Asset(
-            task_id=task.id,
+            task_id=task_id,
             kind=asset_kind,
             storage_key=uploaded_key,
             sha256=sha256,

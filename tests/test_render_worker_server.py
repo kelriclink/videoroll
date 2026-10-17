@@ -596,3 +596,30 @@ def test_p2_render_rejects_p1_final_asset(db: Session) -> None:
     with pytest.raises(HTTPException,match="dubbed video"):
         render_worker_service.complete_execution(db,execution.id,ExecutionCompleteRequest(
             fence_token=execution.fence_token,output_asset_id=old.id))
+
+
+def test_render_output_upload_never_keeps_db_transaction_open_while_storing(db: Session) -> None:
+    import io
+    import asyncio
+    from unittest.mock import MagicMock
+    from fastapi import UploadFile
+    from videoroll.apps.orchestrator_api.routers.render_workers import upload_output, registered_output
+    worker = make_worker(db)
+    job = make_job(db)
+    execution, _ = render_worker_service.claim_job(db, store(), worker.id, ["http"])
+    assert execution is not None
+    remote_store = MagicMock()
+    remote_store.upload_file.side_effect = lambda *args, **kwargs: (
+        None if not db.in_transaction() else (_ for _ in ()).throw(
+            AssertionError("DB transaction remained open during long remote output copy")
+        )
+    )
+    video = UploadFile(file=io.BytesIO(b"long remote output stream"), filename="video.mp4")
+    registered = asyncio.run(upload_output(
+        execution_id=execution.id, file=video, fence_token=execution.fence_token,
+        db=db, store=remote_store, _worker=worker,
+    ))
+    assert registered_output(execution.id, execution.fence_token, db=db, _worker=worker).id == registered.id
+    from fastapi import HTTPException
+    with pytest.raises(HTTPException):
+        registered_output(execution.id, "wrong-fence", db=db, _worker=worker)

@@ -144,6 +144,11 @@ async def upload_output(
     if task is None: raise HTTPException(404, "task not found")
     if render_worker_service.cancellation_state(db, execution_id)[0]:
         raise HTTPException(409, "render execution was canceled before upload")
+    # Freeze all ORM-backed values before commit: Session defaults to
+    # expire_on_commit, so reading `job.request_json` later would issue a SELECT
+    # and hold a transaction open through the large upload.
+    is_dubbed = bool((job.request_json or {}).get("dubbing_job_id"))
+    task_id = task.id
     execution.state = "uploading"; db.add(execution); db.commit()
 
     def verify_upload_before_commit(session: Session) -> None:
@@ -169,7 +174,6 @@ async def upload_output(
         current.output_json = {**dict(current.output_json or {}), "uploaded_output_asset_id": str(asset.id)}
         session.add(current)
 
-    is_dubbed = bool((job.request_json or {}).get("dubbing_job_id"))
     return await asset_service.store_uploaded_task_asset(
         task=task, file=file, store=store, db=db, temp_prefix="render_worker_",
         default_suffix=".mp4", key_prefix="dubbed" if is_dubbed else "final",
@@ -178,7 +182,27 @@ async def upload_output(
         max_bytes=256 * 1024 * 1024 * 1024,
         before_commit=verify_upload_before_commit,
         after_register=register_execution_output,
+        task_id_override=task_id,
     )
+
+@router.get("/executions/{execution_id}/output", response_model=AssetRead)
+def registered_output(
+    execution_id: uuid.UUID,
+    fence_token: str,
+    db: Session = Depends(get_db),
+    _worker: RenderWorker = Depends(require_execution_worker),
+) -> Asset:
+    """Idempotency probe after a network/500 error, without re-uploading GBs."""
+    execution = render_worker_service.get_execution(db, execution_id)
+    render_worker_service.validate_fence(execution, fence_token)
+    asset_id = (execution.output_json or {}).get("uploaded_output_asset_id")
+    if not asset_id:
+        raise HTTPException(404, "render output not registered")
+    asset = db.get(Asset, uuid.UUID(str(asset_id)))
+    if asset is None:
+        raise HTTPException(404, "render output asset missing")
+    return asset
+
 
 @router.post("/executions/{execution_id}/complete", response_model=ExecutionRead)
 def complete(execution_id: uuid.UUID, payload: ExecutionCompleteRequest, db: Session = Depends(get_db), _worker: RenderWorker = Depends(require_execution_worker)):
