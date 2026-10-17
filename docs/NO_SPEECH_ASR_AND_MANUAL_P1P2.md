@@ -45,13 +45,13 @@ No automatic resubmission of archived videos is attempted by this fix.
 
 ## VoxCPM2 scheduling
 
-Before loading the model for missing TTS clips, check NVIDIA free GPU memory.
-Default minimum is 9216 MiB (`VOXCPM_MIN_FREE_GPU_MIB` override). If the shared
-V100 has insufficient free VRAM, report `VOXCPM_GPU_MEMORY_BUSY` with the actual
-free and required memory. Hatchet makes at most two retries with backoff; then
-records an actionable error. Completed WAV clips survive requeue/resume and
-are not synthesized again. If all TTS WAVs already exist, avoid the GPU model
-load and preflight entirely.
+The proactive NVIDIA free-memory threshold is **disabled by default**.
+VoxCPM2 attempts generation normally even when other inference services use
+most of the V100. An actual CUDA OOM can still fail the attempt; Hatchet
+retains up to two retries with backoff, and completed WAV clips survive
+requeue/resume. Users may explicitly opt in to the old preflight by setting
+`VOXCPM_GPU_PREFLIGHT_ENABLED=1` (default minimum 9216 MiB, adjustable using
+`VOXCPM_MIN_FREE_GPU_MIB`). If all TTS WAVs exist, the model is not loaded.
 
 This is a headroom guard, not a reservation or absolute OOM guarantee. Qwen
 running in the same GPU can still change its allocation between checking and

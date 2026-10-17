@@ -167,11 +167,17 @@ def _write_original_target_audio(
 
 
 def _require_available_voxcpm_gpu_memory() -> None:
-    """Check *external* GPU pressure before model initialization.
+    """Optional GPU headroom gate, disabled unless explicitly opted into.
 
-    Insufficient free VRAM is a resource scheduling failure, not a defective
-    TTS sample. The restartable pipeline retains all previously written WAVs.
+    VideoRoll shares the V100 with resident inference models; free GPU memory
+    at a single instant is not a reliable predictor of VoxCPM2 allocation.
+    The default allows VoxCPM2 to try normal generation and retain native
+    CUDA OOM recovery if an allocation truly fails.
     """
+    if os.getenv("VOXCPM_GPU_PREFLIGHT_ENABLED", "0").strip().lower() not in {
+        "1", "true", "yes", "on",
+    }:
+        return
     import subprocess
     minimum_mib = max(1024, int(os.getenv("VOXCPM_MIN_FREE_GPU_MIB", "9216")))
     if shutil.which("nvidia-smi") is None:
