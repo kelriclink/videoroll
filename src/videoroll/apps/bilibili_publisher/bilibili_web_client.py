@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import math
+import logging
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import mimetypes
@@ -14,6 +15,8 @@ from typing import Any, Callable, Optional, Sequence
 import httpx
 
 from videoroll.apps.bilibili_publisher.schemas import BilibiliPublishMeta
+
+logger = logging.getLogger(__name__)
 
 
 class BilibiliWebError(RuntimeError):
@@ -288,6 +291,22 @@ class BilibiliWebClient:
     def __exit__(self, exc_type, exc, tb) -> None:
         self.close()
 
+    @staticmethod
+    def _safe_metadata_request(call: Callable[[], httpx.Response]) -> httpx.Response:
+        """Retry transient TLS/network failures only for safe metadata operations.
+
+        Archive creation/edit and UPOS completion must not be replayed on timeout.
+        """
+        for attempt in range(3):
+            try:
+                return call()
+            except (httpx.ConnectError, httpx.TimeoutException) as exc:
+                if attempt == 2:
+                    raise
+                logger.warning("Bilibili metadata network error: %s, retry %d/2", type(exc).__name__, attempt + 1)
+                time.sleep(0.5 * (2 ** attempt))
+        raise AssertionError("unreachable")
+
     def upload_cover(self, image_path: Path, *, csrf: str) -> str:
         csrf = (csrf or "").strip()
         _require(bool(csrf), "csrf (bili_jct) is empty")
@@ -350,7 +369,7 @@ class BilibiliWebClient:
         url = "https://member.bilibili.com/preupload"
         if probe_query:
             url = f"{url}?{probe_query}"
-        resp = self._bili.get(
+        resp = self._safe_metadata_request(lambda: self._bili.get(
             url,
             params={
                 "name": filename,
@@ -362,7 +381,7 @@ class BilibiliWebClient:
                 "build": 2140000,
                 "size": int(filesize),
             },
-        )
+        ))
         try:
             data = _json(resp)
         except BilibiliWebError:
@@ -577,11 +596,11 @@ class BilibiliWebClient:
             "title": (None, str(title or "")),
             "upload_id": (None, str(upload_id or "")),
         }
-        resp = self._bili.post(
+        resp = self._safe_metadata_request(lambda: self._bili.post(
             "https://member.bilibili.com/x/vupre/web/archive/types/predict",
             params={"csrf": csrf, "ts": int(time.time() * 1000)},
             files=files,
-        )
+        ))
         data = _json(resp)
         _bili_code_ok(data)
         arr = data.get("data")
@@ -831,10 +850,10 @@ class BilibiliWebClient:
     def get_owned_archive(self, *, aid: int) -> dict[str, Any]:
         """Load owner-side editable metadata and ALL existing parts."""
         _require(int(aid) > 0, 'aid must be positive')
-        resp = self._bili.get(
+        resp = self._safe_metadata_request(lambda: self._bili.get(
             'https://member.bilibili.com/x/vupre/web/archive/view',
             params={'aid': int(aid)},
-        )
+        ))
         data = _json(resp)
         _bili_code_ok(data, status_code=resp.status_code)
         value = _as_dict(data.get('data'))

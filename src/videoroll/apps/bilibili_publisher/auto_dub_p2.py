@@ -102,6 +102,71 @@ def schedule_after_p1(db: Session, job: PublishJob, task: Task) -> bool:
     return True
 
 
+def schedule_manual_p2(
+    db: Session, *, task_id: uuid.UUID, publish_job_id: uuid.UUID,
+    dubbing_job_id: uuid.UUID, title: str | None = None,
+) -> dict[str, Any]:
+    """Queue only a missing P2 on a *confirmed* existing Bilibili archive.
+
+    The record and outbox event are committed atomically. A failed pre-edit
+    upload can be retried, but an unknown edit must be reconciled manually.
+    No path here creates a new Bilibili archive or changes P1's publish state.
+    """
+    job = (db.query(PublishJob).filter(
+        PublishJob.id == publish_job_id, PublishJob.task_id == task_id,
+    ).with_for_update().one_or_none())
+    if job is None:
+        raise ValueError("publish job does not belong to this task")
+    if job.platform != Platform.bilibili or job.state != PublishState.published or not job.aid:
+        raise ValueError("append P2 requires a confirmed published Bilibili P1 with aid")
+    dub = db.get(DubbingJob, dubbing_job_id)
+    if dub is None or dub.task_id != task_id or dub.status != "succeeded":
+        raise ValueError("select a successful dubbing job from this video task")
+    video_key = str((dub.output_json or {}).get("video_key") or "")
+    if not video_key or not db.query(Asset).filter(
+        Asset.task_id == task_id, Asset.kind == AssetKind.video_dubbed,
+        Asset.storage_key == video_key,
+    ).first():
+        raise ValueError("selected dubbing job has no registered P2 video asset")
+    existing = dict((job.response_json or {}).get(STORAGE_KEY) or {})
+    current = str(existing.get("state") or "")
+    if current == "published":
+        raise ValueError("P2 already recorded as published; do not append again")
+    if current and current != "failed":
+        raise ValueError(f"P2 is {current}; verify the existing operation before retrying")
+    # A confirmed pre-edit failure may use a regenerated P2. Never reuse the
+    # previous upload's CID if the selected dubbing output changed.
+    if current == "failed" and existing.get("dub_job_id") not in (None, str(dubbing_job_id)):
+        existing.pop("upload", None)
+        existing.pop("upload_debug", None)
+    meta_json = job.meta_json if isinstance(job.meta_json, dict) else {}
+    inner_meta = meta_json.get("meta") if isinstance(meta_json.get("meta"), dict) else {}
+    raw_title = str(inner_meta.get("title") or meta_json.get("title") or "").strip()
+    part_title = str(title or "").strip() or existing.get("title") or p2_title(
+        raw_title, "【熟肉】", "【中配】",
+    )
+    if not isinstance(part_title, str) or not 1 <= len(part_title) <= 80:
+        raise ValueError("P2 title must contain 1–80 characters")
+    attempt = int(existing.get("manual_attempt") or 0) + 1
+    existing.update(
+        state="queued", title=part_title, dub_job_id=str(dubbing_job_id),
+        dispatched=True, error=None, manual_attempt=attempt,
+        manual_requested_at=datetime.now(timezone.utc).isoformat(),
+    )
+    job.response_json = {**dict(job.response_json or {}), STORAGE_KEY: existing}
+    db.add(job)
+    create_outbox_event(
+        db, event_type=EVENT_NAME, aggregate_type="publish_job", aggregate_id=job.id,
+        task_name=TASK_NAME, args={"args": [str(job.id)], "queue": "publish"},
+        operation_key=f"bilibili:manual-p2:{job.id}:{attempt}",
+    )
+    db.commit()
+    logger.info("manual Bilibili P2 queued: task=%s publish_job=%s dubbing_job=%s attempt=%d",
+                task_id, job.id, dubbing_job_id, attempt)
+    return {"publish_job_id": str(job.id), "aid": str(job.aid),
+            "dubbing_job_id": str(dubbing_job_id), "state": "queued", "attempt": attempt}
+
+
 def _load_locked(db: Session, job_id: uuid.UUID) -> tuple[PublishJob, dict[str, Any]]:
     job = db.query(PublishJob).filter(PublishJob.id == job_id).with_for_update().one()
     record = dict((job.response_json or {}).get(STORAGE_KEY) or {})
@@ -192,6 +257,7 @@ def _upload_then_append(db: Session, publish_id: uuid.UUID, *, client: Any, stor
         else:
             from videoroll.apps.bilibili_publisher.publish_settings_store import get_bilibili_publish_settings
             workers = get_bilibili_publish_settings(db)["upload_workers"]
+            db.commit()  # Do not hold an idle PostgreSQL transaction during upload.
             uploaded, debug = client.upload_video_file(store.path_for(video_key), upload_workers=workers)
             state["upload"] = {
                 "filename_no_suffix": uploaded.filename_no_suffix,

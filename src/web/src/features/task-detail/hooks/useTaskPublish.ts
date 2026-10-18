@@ -3,7 +3,7 @@ import { useConfirm, useToast } from "../../../components/feedbackContext";
 import { desktopApi } from "../../../api/desktop";
 import { publishApi } from "../../../api/publish";
 import { tasksApi } from "../../../api/tasks";
-import type { Asset, PublishJob, Task } from "../../../lib/types";
+import type { PublishJob, Task } from "../../../lib/types";
 import { activeAccountsForPlatform, buildBilibiliMultipartParts, buildPublishActionPayload, type PublishPlatform, type PublishPlatformSettings, type SocialAccount } from "../../../lib/publish";
 import type {
   BiliTypeNode,
@@ -15,7 +15,6 @@ import { flattenBiliTypeOptions, scopedDesktopUrl } from "../utils";
 type UseTaskPublishArgs = {
   taskId: string | undefined;
   task: Task | null;
-  assets: Asset[] | null;
   publishJobs: PublishJob[] | null;
   setPublishReview: Dispatch<SetStateAction<PublishReview | null>>;
   socialAccounts: SocialAccount[];
@@ -28,7 +27,6 @@ type UseTaskPublishArgs = {
 export function useTaskPublish({
   taskId,
   task,
-  assets,
   publishJobs,
   setPublishReview,
   socialAccounts,
@@ -272,9 +270,12 @@ export function useTaskPublish({
       });
       if (publishTwoParts) {
         if (platform !== "bilibili") throw new Error("双分 P 仅适用于 B 站投稿");
-        const parts = buildBilibiliMultipartParts(
-          await tasksApi.dubbingJobs(taskId), assets ?? [], publishVideoKey,
-        );
+        // P2 assets are registered asynchronously. Never pair a fresh dubbing
+        // job with a stale asset snapshot retained in the task-detail hook.
+        const [currentJobs, currentAssets] = await Promise.all([
+          tasksApi.dubbingJobs(taskId), tasksApi.assets(taskId),
+        ]);
+        const parts = buildBilibiliMultipartParts(currentJobs, currentAssets, publishVideoKey);
         payload.video_key = parts.video_key;
         payload.video_parts = parts.video_parts;
       }
@@ -323,6 +324,36 @@ export function useTaskPublish({
       setPublishMetaText(JSON.stringify(JSON.parse(publishMetaText), null, 2));
     } catch (error: unknown) {
       setError(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  async function appendPublishedP2(job: PublishJob, dubbingJobId: string) {
+    if (!taskId || job.task_id !== taskId || job.state !== "published" || !job.aid) {
+      setError("只能向当前任务已确认发布的 B 站 P1 稿件追加 P2");
+      return;
+    }
+    if (job.auto_dub_p2 && job.auto_dub_p2.state !== "failed") {
+      setError(`配音 P2 当前状态：${job.auto_dub_p2.state}，请先核实，不能重复追加`);
+      return;
+    }
+    const ok = await confirm({
+      title: "向现有 B 站稿件追加 P2",
+      message: `将使用已完成的 YouDub 成品，仅向稿件 ${job.bvid ?? job.aid} 追加 P2。不会重新投稿 P1；将先检查作者稿件分 P，若已存在 P2 则拒绝重复编辑。`,
+      confirmLabel: "确认追加 P2",
+      tone: "warning",
+    });
+    if (!ok) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const result = await publishApi.appendP2(taskId, job.id, dubbingJobId);
+      await refresh();
+      toast({ kind: "success", title: "P2 追加已排队", message: `稿件 ${result.aid}：已提交单独追加任务，P1 不会重投。` });
+    } catch (error: unknown) {
+      setError(error instanceof Error ? error.message : String(error));
+      try { await refresh({ silent: true }); } catch {}
+    } finally {
+      setBusy(false);
     }
   }
 
@@ -380,5 +411,6 @@ export function useTaskPublish({
     savePublishMetaFromText,
     formatPublishMeta,
     retryPublishJob,
+    appendPublishedP2,
   };
 }

@@ -5,18 +5,20 @@ export function buildBilibiliMultipartParts(
   assets: import("./types").Asset[],
   selectedP1Key = "",
 ): Pick<PublishActionPayload, "video_key" | "video_parts"> {
-  // New audio-only YouDub returns output.video_key for P2, but the
-  // subtitle_video_key request points to the RAW source (not the P1 encode).
-  // Find P1 by the task's video_final asset instead. Never combine assets
-  // across different task IDs, and honor an explicitly selected P1 key.
-  const taskId = jobs[0]?.task_id || assets.find((a) => a.kind === "video_final")?.task_id;
-  const owned = assets.filter((asset) => !taskId || asset.task_id === taskId);
-  const p1 = owned.find((asset) => asset.kind === "video_final"
+  // YouDub audio-only uses subtitle_video_key for its INPUT (often video_raw),
+  // not for the rendered P1. A succeeded dubbing job owns its registered P2;
+  // never infer P2 merely by finding the latest dubbed asset from another job.
+  const p1 = assets.find((asset) => asset.kind === "video_final"
     && (!selectedP1Key || asset.storage_key === selectedP1Key));
+  const taskId = p1?.task_id;
+  const owned = assets.filter((asset) => Boolean(taskId) && asset.task_id === taskId);
   const matched = jobs.find((job) => job.status === "succeeded"
-    && (!taskId || job.task_id === taskId)
-    && Boolean(job.output.video_key)
-    && (!job.output.subtitle_video_key || job.output.subtitle_video_key === p1?.storage_key)
+    && Boolean(taskId) && job.task_id === taskId
+    && Boolean(job.output?.video_key)
+    && job.output.video_key !== p1?.storage_key
+    && (!job.output.subtitle_video_key || owned.some((asset) =>
+      (asset.kind === "video_raw" || asset.kind === "video_final")
+      && asset.storage_key === job.output.subtitle_video_key))
     && owned.some((asset) => asset.kind === "video_dubbed"
       && asset.storage_key === job.output.video_key));
   if (!p1 || !matched?.output.video_key) {
