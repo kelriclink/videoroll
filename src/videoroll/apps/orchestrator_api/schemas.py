@@ -130,6 +130,11 @@ class PublishActionRequest(BaseModel):
     force_retry: bool = False
 
 
+class AppendBilibiliP2Request(BaseModel):
+    dubbing_job_id: uuid.UUID
+    title: Optional[str] = Field(default=None, max_length=80)
+
+
 class PublishAllRequest(BaseModel):
     """Validated multi-platform publish input.
 

@@ -4,6 +4,7 @@ import type { Asset, DubbingJob } from "./types";
 
 const assets = [
   { id: "p1", kind: "video_final", task_id: "task1", storage_key: "task/p1.mp4" },
+  { id: "raw", kind: "video_raw", task_id: "task1", storage_key: "task/raw.webm" },
   { id: "p2", kind: "video_dubbed", task_id: "task1", storage_key: "task/p2.mp4" },
 ] as Asset[];
 
@@ -19,6 +20,16 @@ describe("Bilibili multipart selection", () => {
     const result = buildBilibiliMultipartParts([job], assets);
     expect(result.video_key).toBe("task/p1.mp4");
     expect(result.video_parts?.map((part) => part.video.key)).toEqual(["task/p1.mp4", "task/p2.mp4"]);
+  });
+
+  it("accepts native YouDub whose subtitle_video_key is the RAW input rather than P1", () => {
+    const native = { ...job, output: { subtitle_video_key: "task/raw.webm", video_key: "task/p2.mp4" } } as DubbingJob;
+    expect(buildBilibiliMultipartParts([native], assets).video_parts?.[1].video.key).toBe("task/p2.mp4");
+  });
+
+  it("rejects an input key that is not registered to this task", () => {
+    const foreign = { ...job, output: { subtitle_video_key: "other/raw.webm", video_key: "task/p2.mp4" } } as DubbingJob;
+    expect(() => buildBilibiliMultipartParts([foreign], assets)).toThrow();
   });
 
   it("supports current unified audio-only P2 without legacy subtitle_video_key", () => {

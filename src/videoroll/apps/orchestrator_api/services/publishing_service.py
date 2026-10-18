@@ -783,6 +783,30 @@ def auto_publish_task(
     }
 
 
+def append_dubbing_p2(
+    task_id: uuid.UUID,
+    publish_job_id: uuid.UUID,
+    dubbing_job_id: uuid.UUID,
+    title: str | None,
+    db: Session,
+) -> dict[str, Any]:
+    """Validate and enqueue a manual P2 append on an already published archive."""
+    if db.get(Task, task_id) is None:
+        raise HTTPException(status_code=404, detail="task not found")
+    if not is_publish_platform_enabled(db, "bilibili"):
+        raise HTTPException(status_code=409, detail="Bilibili publishing is disabled")
+    from videoroll.apps.bilibili_publisher.auto_dub_p2 import schedule_manual_p2
+
+    try:
+        return schedule_manual_p2(
+            db, task_id=task_id, publish_job_id=publish_job_id,
+            dubbing_job_id=dubbing_job_id, title=title,
+        )
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
 def enqueue_publish_job(
     task_id: uuid.UUID,
     payload: PublishActionRequest,

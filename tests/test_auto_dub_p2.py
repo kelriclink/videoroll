@@ -198,3 +198,94 @@ def test_creator_edit_uses_original_metadata_and_p1():
             archive={"archive": original["archive"], "videos": original["videos"] * 2},
             aid=98765, uploaded=UploadedVideo("p2", 202, "id", "uri"),
             title="【中配】火箭引擎", csrf="fake")
+
+
+def test_manual_p2_queues_one_outbox_and_does_not_republish_p1():
+    from videoroll.apps.bilibili_publisher.auto_dub_p2 import schedule_manual_p2
+    from videoroll.db.models import OutboxEvent
+
+    factory, task_id, pub_id, sub_id, dub_id = _setup()
+    with factory() as db:
+        db.add(DubbingJob(
+            id=dub_id, task_id=task_id, subtitle_job_id=sub_id,
+            status="succeeded", output_json={"video_key": "final/p2.mp4"},
+        ))
+        db.add(Asset(task_id=task_id, kind=AssetKind.video_dubbed,
+                     storage_key="final/p2.mp4"))
+        db.commit()
+        result = schedule_manual_p2(db, task_id=task_id,
+            publish_job_id=pub_id, dubbing_job_id=dub_id)
+        assert result["state"] == "queued" and result["attempt"] == 1
+        saved = db.get(PublishJob, pub_id)
+        assert saved.state == PublishState.published and saved.bvid == "BV123"
+        assert saved.response_json["auto_dub_p2"]["title"] == "【中配】火箭引擎"
+        assert db.query(OutboxEvent).count() == 1
+        with pytest.raises(ValueError, match="queued"):
+            schedule_manual_p2(db, task_id=task_id, publish_job_id=pub_id, dubbing_job_id=dub_id)
+        assert db.query(OutboxEvent).count() == 1
+
+        # Failed before the archive edit: safe to enqueue another attempt.
+        saved.response_json = {**saved.response_json, "auto_dub_p2": {
+            **saved.response_json["auto_dub_p2"], "state": "failed", "error": "TLS timeout",
+        }}
+        db.commit()
+        retried = schedule_manual_p2(db, task_id=task_id,
+            publish_job_id=pub_id, dubbing_job_id=dub_id)
+        assert retried["attempt"] == 2
+        assert db.query(OutboxEvent).count() == 2
+
+        # Unknown outcome after an edit: never submit again blindly.
+        saved.response_json = {**saved.response_json, "auto_dub_p2": {
+            **saved.response_json["auto_dub_p2"], "state": "unknown",
+        }}
+        db.commit()
+        with pytest.raises(ValueError, match="unknown"):
+            schedule_manual_p2(db, task_id=task_id, publish_job_id=pub_id, dubbing_job_id=dub_id)
+
+
+def test_manual_p2_rejects_wrong_task_and_unpublished_parent():
+    from videoroll.apps.bilibili_publisher.auto_dub_p2 import schedule_manual_p2
+    factory, task_id, pub_id, sub_id, dub_id = _setup()
+    with factory() as db:
+        db.add(DubbingJob(
+            id=dub_id, task_id=task_id, subtitle_job_id=sub_id,
+            status="succeeded", output_json={"video_key": "final/p2.mp4"},
+        ))
+        db.add(Asset(task_id=task_id, kind=AssetKind.video_dubbed, storage_key="final/p2.mp4"))
+        db.commit()
+        with pytest.raises(ValueError, match="does not belong"):
+            schedule_manual_p2(db, task_id=uuid.uuid4(),
+                publish_job_id=pub_id, dubbing_job_id=dub_id)
+        db.get(PublishJob, pub_id).state = PublishState.failed
+        db.commit()
+        with pytest.raises(ValueError, match="confirmed published"):
+            schedule_manual_p2(db, task_id=task_id, publish_job_id=pub_id, dubbing_job_id=dub_id)
+
+
+def test_safe_metadata_retry_recovers_handshake_failure_without_reposting_archive(monkeypatch):
+    import httpx
+    client = BilibiliWebClient("SESSDATA=fake")
+    monkeypatch.setattr("videoroll.apps.bilibili_publisher.bilibili_web_client.time.sleep", lambda _: None)
+    successful = MagicMock()
+    successful.status_code = 200
+    successful.json.return_value = {"code": 0, "data": {
+        "archive": {"aid": 98765, "title": "existing"},
+        "videos": [{"filename": "p1", "title": "original", "cid": 101}],
+    }}
+    client._bili = MagicMock()
+    client._bili.get.side_effect = [httpx.ConnectTimeout("TLS handshake timed out"), successful]
+    try:
+        assert client.get_owned_archive(aid=98765)["videos"][0]["cid"] == 101
+        assert client._bili.get.call_count == 2
+        client._bili.post.side_effect = httpx.ConnectTimeout("uncertain edit outcome")
+        with pytest.raises(httpx.ConnectTimeout):
+            client.append_archive_part(
+                archive={"archive": {"aid": 98765, "title": "original", "copyright": 2,
+                                     "tid": 201, "tag": "科普", "desc": "desc"},
+                         "videos": [{"filename": "p1", "title": "original", "cid": 101}]},
+                aid=98765, uploaded=UploadedVideo("p2", 202, "upload", "upos://p2"),
+                title="P2", csrf="fake",
+            )
+        assert client._bili.post.call_count == 1  # never retry Bilibili edit
+    finally:
+        client.close()

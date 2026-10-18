@@ -1,8 +1,10 @@
+import { useState } from "react";
 import type { TaskDetailController } from "../useTaskDetailController";
 import { Link } from "react-router-dom";
 import { activeAccountsForPlatform, PublishPlatform, socialPublishBrowserUrl } from "../../../lib/publish";
 import { clampUploadProgress } from "../utils";
 export function TaskDetailPublish({ controller }: { controller: TaskDetailController }) {
+  const [appendDubbingJobId, setAppendDubbingJobId] = useState("");
   const {
     taskId,
     dubbingJobs,
@@ -61,7 +63,8 @@ export function TaskDetailPublish({ controller }: { controller: TaskDetailContro
     uploadCover,
     savePublishMetaFromText,
     formatPublishMeta,
-    retryPublishJob
+    retryPublishJob,
+    appendPublishedP2,
   } = controller;
   return (
 <div className="rounded border bg-white p-4">
@@ -143,7 +146,7 @@ export function TaskDetailPublish({ controller }: { controller: TaskDetailContro
             <span>
               <strong>投稿双分 P（P1 中文字幕 + P2 中文配音）</strong>
               <span className="mt-1 block text-xs text-slate-500">
-                只使用同一个成功 DubbingJob 生成的两个成品；两份视频均就绪后才提交一次 B 站稿件。
+                P1 使用任务已完成的字幕视频，P2 使用同任务一个成功 YouDub 作业的配音成品；两份视频均就绪后才提交一次 B 站稿件。
                 未勾选时保持原有单视频投稿行为。
               </span>
             </span>
@@ -525,6 +528,20 @@ export function TaskDetailPublish({ controller }: { controller: TaskDetailContro
           <div className="text-xs font-semibold text-slate-700">Publish Jobs</div>
           {!publishJobs ? <div className="mt-2 text-sm text-slate-500">加载中…</div> : null}
           {publishJobs && publishJobs.length === 0 ? <div className="mt-2 text-sm text-slate-500">暂无</div> : null}
+          {publishJobs?.some((j) => j.platform === "bilibili" && j.state === "published" && j.aid) ? (
+            <div className="mt-3 flex flex-wrap items-center gap-2 text-xs">
+              <label htmlFor="append-dub-job">单独追加 P2：选择已完成的中文配音</label>
+              <select id="append-dub-job" className="rounded border px-2 py-1"
+                value={appendDubbingJobId || dubbingJobs.find((d) => d.status === "succeeded" && Boolean(d.output.video_key))?.id || ""}
+                onChange={(event) => setAppendDubbingJobId(event.target.value)}>
+                <option value="" disabled>请选择已完成的配音成品</option>
+                {dubbingJobs.filter((d) => d.status === "succeeded" && Boolean(d.output.video_key)).map((d) => (
+                  <option key={d.id} value={d.id}>{d.id.slice(0, 8)} · {d.output.video_key || "无 P2 视频"}</option>
+                ))}
+              </select>
+              <span className="text-slate-500">仅追加到下方已有稿件，不会重新投稿 P1。</span>
+            </div>
+          ) : null}
           {publishJobs && publishJobs.length > 0 ? (
             <div className="mt-2 overflow-auto">
               <table className="min-w-full text-left text-sm">
@@ -621,6 +638,14 @@ export function TaskDetailPublish({ controller }: { controller: TaskDetailContro
                             onClick={() => retryPublishJob(j)}
                           >
                             确认后重试
+                          </button>
+                        ) : j.platform === "bilibili" && j.state === "published" && j.aid
+                            && (!j.auto_dub_p2 || j.auto_dub_p2.state === "failed") ? (
+                          <button className="rounded border border-sky-300 px-2 py-1 text-xs text-sky-800"
+                            disabled={busy || !dubbingJobs.some((d) => d.status === "succeeded" && Boolean(d.output.video_key))}
+                            title="在现有 B 站稿件后追加配音 P2；后台确认不存在已有 P2 才会修改"
+                            onClick={() => appendPublishedP2(j, appendDubbingJobId || dubbingJobs.find((d) => d.status === "succeeded" && Boolean(d.output.video_key))?.id || "")}>
+                            追加中配 P2
                           </button>
                         ) : "-"}
                       </td>

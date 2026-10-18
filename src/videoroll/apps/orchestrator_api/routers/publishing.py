@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 from videoroll.apps.orchestrator_api.dependencies import get_db, get_store, get_settings
 from videoroll.apps.orchestrator_api.schemas import (
     PublishActionRequest,
+    AppendBilibiliP2Request,
     PublishAllRequest,
     PublishAllResultResponse,
     PublishBatchSummary,
@@ -215,3 +216,16 @@ def enqueue_publish_job(
     store: FileStore = Depends(get_store),
 ) -> RemotePublishResponse:
     return publishing_service.enqueue_publish_job(task_id, payload, settings, db, store)
+
+
+@router.post("/tasks/{task_id}/publish_jobs/{publish_job_id}/append_p2")
+def append_bilibili_p2(
+    task_id: uuid.UUID,
+    publish_job_id: uuid.UUID,
+    payload: AppendBilibiliP2Request,
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """Queue an independent P2 edit; never create a second archive."""
+    return publishing_service.append_dubbing_p2(
+        task_id, publish_job_id, payload.dubbing_job_id, payload.title, db,
+    )

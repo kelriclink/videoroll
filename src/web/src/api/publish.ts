@@ -87,6 +87,16 @@ export const publishApi = {
     });
   },
 
+  appendP2(taskId: string, publishJobId: string, dubbingJobId: string) {
+    return fetchJson<{ publish_job_id: string; aid: string; state: string; attempt: number }>(
+      orchestratorUrl(`/tasks/${taskId}/publish_jobs/${publishJobId}/append_p2`), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ dubbing_job_id: dubbingJobId }),
+      },
+    );
+  },
+
   accounts() {
     return fetchJson<SocialAccount[]>(orchestratorUrl("/settings/publish/social/accounts"));
   },
