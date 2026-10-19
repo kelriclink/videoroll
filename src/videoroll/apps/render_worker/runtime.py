@@ -24,6 +24,9 @@ from videoroll.apps.subtitle_service.processing import (
     render_burn_in,
 )
 from videoroll.config import RenderWorkerSettings, get_render_worker_settings
+from videoroll.apps.render_worker.checkpoint import (
+    cache_path, load_completed_render, prune_completed_renders, save_completed_render,
+)
 from videoroll.utils.hashing import sha256_file
 
 logger = logging.getLogger(__name__)
@@ -679,6 +682,36 @@ class RenderWorkerRuntime:
         hb = threading.Thread(target=heartbeat_loop, name=f"render-hb-{execution_id}", daemon=True)
         hb.start()
         try:
+            # A previous attempt may have fully encoded the video but crashed
+            # while uploading or acknowledging it. Reuse only hash-verified,
+            # spec-bound completed output; never reuse a partial MP4.
+            checkpoint = None
+            if spec.mode in {"burn_in", "soft_sub"}:
+                suffix = ".mp4" if spec.mode == "burn_in" else ".mkv"
+                checkpoint = cache_path(Path(self.settings.work_dir), spec, device, suffix)
+                prune_completed_renders(Path(self.settings.work_dir))
+                cached = load_completed_render(checkpoint)
+                if cached is not None:
+                    # Keep a second hardlink inside this execution. Cache
+                    # pruning by another worker cannot unlink an active upload.
+                    active_cached = root / f"cached_render{suffix}"
+                    os.link(cached, active_cached)
+                    logger.info("reusing completed render checkpoint for job %s", spec.render_job_id)
+                    execution_metrics.update(stage="uploading", cache_hit=True)
+                    self._execution_post(
+                        execution_id, "progress",
+                        {"fence_token": fence, "progress": 90, "metrics": dict(execution_metrics)},
+                    )
+                    output_asset_id = self._upload_output(execution_id, fence, active_cached)
+                    self._execution_post(
+                        execution_id, "complete",
+                        {"fence_token": fence, "output_asset_id": str(output_asset_id),
+                         "output": {"sha256": sha256_file(active_cached), "size_bytes": active_cached.stat().st_size}},
+                    )
+                    with self._active_lock:
+                        self._failed_devices_by_job.pop(spec.render_job_id, None)
+                    return
+
             paths: dict[str, Path] = {}
             for artifact in spec.artifacts:
                 suffix = Path(artifact.storage_key).suffix or ".bin"
@@ -742,6 +775,9 @@ class RenderWorkerRuntime:
 
             if cancel_event.is_set():
                 raise RuntimeError(cancel_reason[-1] if cancel_reason else "render execution canceled")
+            if checkpoint is not None:
+                output = save_completed_render(checkpoint, output)
+                prune_completed_renders(Path(self.settings.work_dir))
             execution_metrics["stage"] = "uploading"
             self._execution_post(
                 execution_id,

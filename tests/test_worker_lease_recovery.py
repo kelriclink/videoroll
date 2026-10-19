@@ -14,6 +14,7 @@ from videoroll.apps.subtitle_service.worker_concurrency import (
     heartbeat_job_lease,
     live_leased_task_ids,
     recover_expired_leases,
+    update_subtitle_asr_progress,
     release_job_lease,
 )
 from videoroll.db.base import Base
@@ -78,6 +79,29 @@ def _task(db: Session) -> Task:
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def test_asr_progress_requires_live_owner_and_is_monotonic(db: Session) -> None:
+    now = _now()
+    job = SubtitleJob(
+        task_id=_task(db).id, status=SubtitleJobStatus.running, progress=25,
+        lease_owner="active-worker", lease_until=now + timedelta(minutes=5),
+    )
+    db.add(job)
+    db.commit()
+
+    assert update_subtitle_asr_progress(db, job.id, "active-worker", 43)
+    db.commit()
+    db.refresh(job)
+    assert job.progress == 43
+    assert update_subtitle_asr_progress(db, job.id, "active-worker", 30)
+    db.commit()
+    db.refresh(job)
+    assert job.progress == 43
+    assert not update_subtitle_asr_progress(db, job.id, "old-worker", 59)
+    job.lease_until = now - timedelta(seconds=1)
+    db.commit()
+    assert not update_subtitle_asr_progress(db, job.id, "active-worker", 59)
 
 
 def test_live_subtitle_lease_is_not_requeued_by_recovery(db: Session) -> None:

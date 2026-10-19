@@ -102,6 +102,7 @@ def test_groq_whisper_posts_verbose_json_and_preserves_segments(tmp_path) -> Non
 def test_groq_whisper_chunks_large_wav_and_offsets_results(tmp_path) -> None:
     audio_path = tmp_path / "long.wav"
     _wav(audio_path, seconds=100)
+    progress: list[tuple[float, float]] = []
     response = MagicMock()
     response.raise_for_status.return_value = None
     response.json.return_value = {
@@ -117,8 +118,10 @@ def test_groq_whisper_chunks_large_wav_and_offsets_results(tmp_path) -> None:
             api_key="gsk-test",
             model_name="whisper-large-v3",
             vad_enabled=False,
+            progress_callback=lambda done, total: progress.append((done, total)),
         )
 
+    assert progress == [(45.0, 100.0), (85.0, 100.0), (100.0, 100.0)]
     assert post.call_count == 3
     assert len(segments) == 3
     assert segments[0].start == 0.5

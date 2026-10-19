@@ -45,10 +45,14 @@ case "$role" in
     ;;
   workflow-api)
     export DEPLOYMENT_ROLE=workflow-api
+    preflight "$WORKFLOW_VENV/bin/python" workflow-api
+    "$WORKFLOW_VENV/bin/python" -c 'import sqlalchemy, psycopg'
     exec "$WORKFLOW_VENV/bin/uvicorn" videoroll.workflows.api:app --host 127.0.0.1 --port 8030
     ;;
   workflow-worker)
     export DEPLOYMENT_ROLE=workflow-worker
+    preflight "$WORKFLOW_VENV/bin/python" workflow-worker
+    "$WORKFLOW_VENV/bin/python" -c 'import sqlalchemy, psycopg'
     exec "$WORKFLOW_VENV/bin/python" -m videoroll.workflows.worker
     ;;
   subtitle-workflow-worker)

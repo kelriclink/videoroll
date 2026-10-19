@@ -63,6 +63,14 @@ def test_native_runtime_keeps_hatchet_dependency_isolation() -> None:
     assert '"hatchet-sdk==1.40.3"' in installer
 
 
+def test_slim_workflow_runtime_includes_pipeline_audit_database_dependencies() -> None:
+    requirements = (ROOT / "docker/workflow-requirements.txt").read_text(encoding="utf-8")
+    launcher = (ROOT / "scripts/native/run-role.sh").read_text(encoding="utf-8")
+    assert "sqlalchemy==2.0.54" in requirements
+    assert "psycopg[binary]==3.3.5" in requirements
+    assert launcher.count('"$WORKFLOW_VENV/bin/python" -c \'import sqlalchemy, psycopg\'') == 2
+
+
 def test_native_environment_uses_loopback_service_urls() -> None:
     env = (ROOT / "deploy/systemd/videoroll.env.example").read_text(encoding="utf-8")
     assert "REDIS_URL=redis://127.0.0.1:6379/0" in env

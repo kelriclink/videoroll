@@ -599,6 +599,56 @@ def transcribe_mock(_audio_path: Path) -> list[Segment]:
     ]
 
 
+class _LocalAsrWindowCheckpoint:
+    """Crash-safe, configuration-bound checkpoint for completed ASR windows.
+
+    The checkpoint lives in durable task storage, not the per-attempt work
+    directory that gets cleaned up after a failed worker invocation. Only
+    fully transcribed windows are committed, by atomic replacement.
+    """
+
+    def __init__(self, path: Path | None, identity: str) -> None:
+        self.path = path
+        self.identity = identity
+        self.windows: dict[str, list[dict[str, Any]]] = {}
+        if path is None:
+            return
+        try:
+            saved = json.loads(path.read_text(encoding="utf-8"))
+            if (saved.get("version") == 1 and saved.get("identity") == identity
+                    and isinstance(saved.get("windows"), dict)):
+                self.windows = saved["windows"]
+        except (OSError, ValueError, TypeError, AttributeError):
+            # A torn or obsolete checkpoint must never contaminate captions.
+            pass
+
+    @staticmethod
+    def _key(offset: float, duration: float) -> str:
+        return f"{offset:.4f}:{duration:.4f}"
+
+    def load(self, offset: float, duration: float) -> list[Segment] | None:
+        data = self.windows.get(self._key(offset, duration))
+        if not isinstance(data, list) or not all(isinstance(item, dict) for item in data):
+            return None
+        segments = segments_from_json_data(data)
+        return segments if len(segments) == len(data) else None
+
+    def save(self, offset: float, duration: float, segments: list[Segment]) -> None:
+        if self.path is None:
+            return
+        self.windows[self._key(offset, duration)] = segments_to_json_data(segments)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = self.path.with_name(f".{self.path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+        try:
+            with temp_path.open("w", encoding="utf-8") as stream:
+                json.dump({"version": 1, "identity": self.identity, "windows": self.windows}, stream, ensure_ascii=False)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temp_path, self.path)
+        finally:
+            temp_path.unlink(missing_ok=True)
+
+
 def transcribe_faster_whisper(
     audio_path: Path,
     model_name: str,
@@ -607,6 +657,9 @@ def transcribe_faster_whisper(
     compute_type: str = "int8",
     cpu_threads: int | None = None,
     num_workers: int | None = None,
+    checkpoint_path: Path | None = None,
+    audio_identity: str = "",
+    progress_callback: Callable[[float, float], None] | None = None,
 ) -> list[Segment]:
     if _audio_path_is_effectively_silent(audio_path):
         logger.info("skipping faster-whisper for effectively silent audio %s", audio_path)
@@ -690,26 +743,35 @@ def transcribe_faster_whisper(
 
     import numpy as np  # type: ignore
 
+    checkpoint = _LocalAsrWindowCheckpoint(
+        checkpoint_path,
+        json.dumps(["faster-whisper", audio_identity, model_name, language, device, compute_type,
+                    _LOCAL_ASR_WINDOW_SECONDS, _LOCAL_ASR_OVERLAP_SECONDS]),
+    )
+    total_duration = _wav_duration_seconds(audio_path)
     out: list[Segment] = []
     for audio_data, offset_seconds in _iter_wav_windows_as_float_mono_16k(audio_path):
-        # faster-whisper accepts ndarray inputs; a path makes it decode the
-        # entire file before its own internal 30-second decoding loop starts.
-        samples = np.frombuffer(audio_data, dtype=np.float32)
         local_duration = len(audio_data) / float(_ASR_SAMPLE_RATE)
-        for segment in transcribe_window(samples):
-            start = min(local_duration, max(0.0, float(segment.start)))
-            end = min(local_duration, max(start, float(segment.end)))
-            if end > start:
-                out.append(
-                    Segment(
-                        start=offset_seconds + start,
-                        end=offset_seconds + end,
-                        text=segment.text,
-                        confidence=segment.confidence,
+        window_segments = checkpoint.load(offset_seconds, local_duration)
+        if window_segments is None:
+            # Model output is durable only once this entire window completes.
+            samples = np.frombuffer(audio_data, dtype=np.float32)
+            window_segments = []
+            for segment in transcribe_window(samples):
+                start = min(local_duration, max(0.0, float(segment.start)))
+                end = min(local_duration, max(start, float(segment.end)))
+                if end > start:
+                    window_segments.append(Segment(
+                        start=offset_seconds + start, end=offset_seconds + end,
+                        text=segment.text, confidence=segment.confidence,
                         secondary_text=segment.secondary_text,
-                    )
-                )
-        del samples, audio_data
+                    ))
+            checkpoint.save(offset_seconds, local_duration, window_segments)
+            del samples
+        out.extend(window_segments)
+        del audio_data
+        if progress_callback is not None:
+            progress_callback(min(total_duration, offset_seconds + local_duration), total_duration)
     return reconcile_overlapping_asr_segments(out)
 
 
@@ -1818,6 +1880,7 @@ def transcribe_groq_whisper(
     vad_threshold: float = _OPENVINO_VAD_THRESHOLD,
     redis_url: str = "",
     provider_max_concurrency: int = 1,
+    progress_callback: Callable[[float, float], None] | None = None,
 ) -> list[Segment]:
     """Transcribe through Groq using resumable, VAD-gated FLAC chunks."""
     key = str(api_key or "").strip()
@@ -1859,12 +1922,19 @@ def transcribe_groq_whisper(
         slot_ttl_seconds=timeout + 60.0,
     )
     results: list[tuple[float, Iterable[Segment]]] = []
+    total_duration = max((offset + duration for offset, duration in windows), default=0.0)
+
+    def report_progress(offset: float, duration: float) -> None:
+        if progress_callback is not None:
+            progress_callback(offset + duration, total_duration)
+
     if completed:
         logger.info("Groq Whisper restored %d/%d chunks from checkpoint", len(completed), len(windows))
     for index, (offset, duration) in enumerate(windows, start=1):
         restored_segments = completed.get(index)
         if restored_segments is not None:
             results.append((offset, restored_segments))
+            report_progress(offset, duration)
             continue
         if vad_enabled:
             has_speech = _groq_window_has_speech(
@@ -1884,6 +1954,7 @@ def transcribe_groq_whisper(
                 completed[index] = []
                 _save_groq_checkpoint(checkpoint_path, identity=identity, windows=windows, completed=completed)
                 results.append((offset, []))
+                report_progress(offset, duration)
                 continue
         audio_bytes = _encode_groq_flac_chunk(
             audio_path,
@@ -1986,6 +2057,7 @@ def transcribe_groq_whisper(
         completed[index] = chunk_segments
         _save_groq_checkpoint(checkpoint_path, identity=identity, windows=windows, completed=completed)
         results.append((offset, chunk_segments))
+        report_progress(offset, duration)
     return _merge_groq_segments(results)
 
 
@@ -2086,6 +2158,7 @@ def transcribe_cloudflare_workers_ai(
     timeout_seconds: float = 180.0,
     redis_url: str = "",
     provider_max_concurrency: int = 2,
+    progress_callback: Callable[[float, float], None] | None = None,
 ) -> list[Segment]:
     """Transcribe audio through Cloudflare Workers AI's native /ai/run API."""
     account = str(account_id or "").strip()
@@ -2109,6 +2182,7 @@ def transcribe_cloudflare_workers_ai(
     url = f"https://api.cloudflare.com/client/v4/accounts/{account}/ai/run/{model}"
     out: list[Segment] = []
     chunks = _cloudflare_wav_chunks(audio_path)
+    total_duration = max((offset + duration for offset, duration, _ in chunks), default=0.0)
     provider_gate = ProviderRateGate(
         redis_url,
         "cloudflare-workers-ai",
@@ -2206,6 +2280,8 @@ def transcribe_cloudflare_workers_ai(
             )
             for segment in chunk_segments
         )
+        if progress_callback is not None:
+            progress_callback(offset + duration, total_duration)
     return out
 
 
@@ -2763,11 +2839,21 @@ def transcribe_openvino_whisper(
     max_new_tokens: int = 448,
     vad_enabled: bool = True,
     vad_threshold: float = _OPENVINO_VAD_THRESHOLD,
+    checkpoint_path: Path | None = None,
+    audio_identity: str = "",
+    progress_callback: Callable[[float, float], None] | None = None,
 ) -> list[Segment]:
     model_name = str(model_name or "").strip()
     if not model_name:
         raise RuntimeError("OpenVINO ASR requires a converted Whisper model path")
 
+    checkpoint = _LocalAsrWindowCheckpoint(
+        checkpoint_path,
+        json.dumps(["openvino", audio_identity, model_name, language, device, num_beams,
+                    max_new_tokens, vad_enabled, vad_threshold, _LOCAL_ASR_WINDOW_SECONDS,
+                    _LOCAL_ASR_OVERLAP_SECONDS]),
+    )
+    total_duration = _wav_duration_seconds(audio_path)
     pipeline = None
     generation_config = None
     generate_kwargs: dict[str, Any] = {}
@@ -2775,25 +2861,33 @@ def transcribe_openvino_whisper(
     for speech_audio, offset_seconds in _iter_openvino_speech_windows(
         audio_path, vad_enabled=vad_enabled, vad_threshold=vad_threshold,
     ):
-        if pipeline is None:
-            pipeline = _get_openvino_pipeline(model_name, str(device or "GPU").strip() or "GPU")
-            generation_config, generate_kwargs = _openvino_generation_options(
-                pipeline, language=language, num_beams=num_beams, max_new_tokens=max_new_tokens,
-            )
-        # OpenVINO GenAI's std::vector<float> binding accepts packed float
-        # sequences such as array('f'), without a Python float list conversion.
-        if generation_config is not None:
-            result = pipeline.generate(speech_audio, generation_config=generation_config, **generate_kwargs)
-        else:
-            result = pipeline.generate(speech_audio, **generate_kwargs)
         local_duration = len(speech_audio) / float(_ASR_SAMPLE_RATE)
-        chunks.extend(
-            _offset_openvino_chunks(
+        cached = checkpoint.load(offset_seconds, local_duration)
+        if cached is not None:
+            chunks.extend(_OpenVinoChunk(start=item.start, end=item.end, text=item.text) for item in cached)
+        else:
+            if pipeline is None:
+                pipeline = _get_openvino_pipeline(model_name, str(device or "GPU").strip() or "GPU")
+                generation_config, generate_kwargs = _openvino_generation_options(
+                    pipeline, language=language, num_beams=num_beams, max_new_tokens=max_new_tokens,
+                )
+            # OpenVINO GenAI accepts packed arrays without Python float lists.
+            if generation_config is not None:
+                result = pipeline.generate(speech_audio, generation_config=generation_config, **generate_kwargs)
+            else:
+                result = pipeline.generate(speech_audio, **generate_kwargs)
+            completed = _offset_openvino_chunks(
                 _openvino_result_chunks(result, audio_duration=local_duration),
                 offset_seconds=offset_seconds,
             )
-        )
-        del result, speech_audio
+            checkpoint.save(offset_seconds, local_duration, [
+                Segment(start=item.start, end=item.end, text=item.text) for item in completed
+            ])
+            chunks.extend(completed)
+            del result
+        del speech_audio
+        if progress_callback is not None:
+            progress_callback(min(total_duration, offset_seconds + local_duration), total_duration)
 
     out = _dedupe_overlapping_asr_segments(_filter_faster_whisper_segments(chunks))
     if chunks:

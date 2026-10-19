@@ -126,6 +126,7 @@ def test_cloudflare_transcription_uses_word_timestamps_when_segments_missing(tmp
 
 
 def test_cloudflare_transcription_chunks_wav_and_offsets_timestamps(tmp_path) -> None:
+    progress: list[tuple[float, float]] = []
     audio_path = tmp_path / "long.wav"
     with wave.open(str(audio_path), "wb") as wav_file:
         wav_file.setnchannels(1)
@@ -148,8 +149,10 @@ def test_cloudflare_transcription_chunks_wav_and_offsets_timestamps(tmp_path) ->
             audio_path,
             account_id="account-id",
             api_key="secret",
+            progress_callback=lambda done, total: progress.append((done, total)),
         )
 
+    assert progress == [(30.0, 31.0), (31.0, 31.0)]
     assert post.call_count == 2
     assert segments == [
         processing.Segment(start=1.0, end=2.0, text="first"),

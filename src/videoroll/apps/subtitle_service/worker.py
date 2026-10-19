@@ -19,7 +19,7 @@ from typing import Any, Callable, Iterator
 from celery import Celery
 from celery.exceptions import Retry
 from celery.signals import worker_init
-from sqlalchemy import or_, text
+from sqlalchemy import or_, text, update
 from sqlalchemy.orm import Session
 
 from videoroll.ai.service import AIService
@@ -119,6 +119,7 @@ from videoroll.apps.orchestrator_api.youtube_downloader import (
 from videoroll.apps.subtitle_service.queues import SUBTITLE_CONTROL_QUEUE
 from videoroll.apps.subtitle_service.worker_concurrency import (
     JobLeaseHeartbeat,
+    update_subtitle_asr_progress,
     RECOVERY_RELAUNCH_PENDING_KEY,
     acquire_job_lease,
     release_job_lease,
@@ -449,6 +450,8 @@ def _run_asr_stage(
     log_path: Path | None,
     groq_checkpoint_path: Path,
     cancel_check: Callable[[], None] | None = None,
+    local_checkpoint_path: Path | None = None,
+    asr_progress: Callable[[float, float], None] | None = None,
 ) -> list[Segment]:
     """Resolve runtime ASR settings, execute one provider, and normalize its timeline."""
 
@@ -483,6 +486,9 @@ def _run_asr_stage(
             compute_type=settings.whisper_compute_type,
             cpu_threads=cpu_threads_cfg,
             num_workers=num_workers_cfg,
+            checkpoint_path=local_checkpoint_path,
+            audio_identity=str(audio_key or audio_path),
+            progress_callback=asr_progress,
         )
     elif engine == "openvino":
         proxy = str(asr_defaults.get("model_download_proxy") or "").strip() or None
@@ -513,6 +519,9 @@ def _run_asr_stage(
                 max_new_tokens=openvino_max_new_tokens,
                 vad_enabled=openvino_vad_enabled,
                 vad_threshold=openvino_vad_threshold,
+                checkpoint_path=local_checkpoint_path,
+                audio_identity=str(audio_key or audio_path),
+                progress_callback=asr_progress,
             )
     elif engine == "external-whisper":
         external_base_url = str(asr_defaults.get("external_whisper_base_url") or "").strip()
@@ -568,6 +577,7 @@ def _run_asr_stage(
             vad_threshold=groq_vad_threshold,
             redis_url=str(settings.redis_url or ""),
             provider_max_concurrency=_positive_int_env("GROQ_ASR_MAX_CONCURRENCY", 1),
+            progress_callback=asr_progress,
         )
     elif engine == "cloudflare-workers-ai":
         cloudflare_account_id = str(asr_defaults.get("cloudflare_workers_ai_account_id") or "").strip()
@@ -586,6 +596,7 @@ def _run_asr_stage(
             language=language,
             redis_url=str(settings.redis_url or ""),
             provider_max_concurrency=_positive_int_env("CLOUDFLARE_ASR_MAX_CONCURRENCY", 2),
+            progress_callback=asr_progress,
         )
     else:
         raise ValueError(f"unsupported ASR engine: {engine}")
@@ -1019,13 +1030,24 @@ def run_subtitle_job(
                 raise SubtitleJobLeaseBusy(f"subtitle job {job.id} is still leased by {job.lease_owner or 'another worker'}")
             request = dict(job.request_json) if isinstance(job.request_json, dict) else {}
             request["resume"] = True
-            job.request_json = request
-            job.status = SubtitleJobStatus.queued
-            job.progress = 0
-            job.lease_owner = None
-            job.lease_until = None
-            job.heartbeat_at = now
-            db.add(job)
+            # A heartbeat may have renewed the lease after our initial read.
+            # CAS prevents an old Hatchet delivery from clearing a live owner.
+            reclaimed = db.execute(
+                update(SubtitleJob)
+                .where(
+                    SubtitleJob.id == jid,
+                    SubtitleJob.status == SubtitleJobStatus.running,
+                    or_(SubtitleJob.lease_until.is_(None), SubtitleJob.lease_until <= now),
+                )
+                .values(
+                    request_json=request, status=SubtitleJobStatus.queued,
+                    progress=0, lease_owner=None, lease_until=None, heartbeat_at=now,
+                )
+                .execution_options(synchronize_session=False)
+            )
+            if not reclaimed.rowcount:
+                db.rollback()
+                raise SubtitleJobLeaseBusy(f"subtitle job {jid} lease was renewed concurrently")
             db.flush()
         db.refresh(job)
         db.refresh(task)
@@ -1264,6 +1286,7 @@ def run_subtitle_job(
             db.add(task)
             db.commit()
             _clear_groq_asr_checkpoint()
+            _clear_local_asr_checkpoint()
             _safe_append_log_line(log_path, f"{source_label}: segments={len(segs)}")
             _safe_upload_log(store, log_path, log_key)
 
@@ -1279,6 +1302,15 @@ def run_subtitle_job(
             except Exception:
                 pass
 
+        def _local_asr_checkpoint_key() -> str:
+            return f"sub/{job.id}/local_asr_checkpoint.json"
+
+        def _clear_local_asr_checkpoint() -> None:
+            try:
+                store.delete_object(_local_asr_checkpoint_key())
+            except Exception:
+                pass
+
         translation_checkpoint = TranslationCheckpointStore(
             store=store,
             task_id=task.id,
@@ -1289,12 +1321,14 @@ def run_subtitle_job(
         if not resume:
             translation_checkpoint.clear()
             _clear_groq_asr_checkpoint()
+            _clear_local_asr_checkpoint()
 
         srt_asset = _download_latest_asset(AssetKind.subtitle_srt, srt_path) if resume else None
         if resume and srt_asset and not selective_mode:
             srt_key = srt_asset.storage_key
             translation_checkpoint.clear()
             _clear_groq_asr_checkpoint()
+            _clear_local_asr_checkpoint()
             _safe_append_log_line(log_path, f"resume: found existing subtitle_srt asset: {srt_key}")
             _safe_upload_log(store, log_path, log_key)
 
@@ -1408,6 +1442,7 @@ def run_subtitle_job(
                 db.commit()
             if segments is not None:
                 _clear_groq_asr_checkpoint()
+                _clear_local_asr_checkpoint()
 
         youtube_subtitle_info: dict[str, str] | None = None
         request_artifacts = req.get("artifacts") if isinstance(req.get("artifacts"), dict) else {}
@@ -1508,6 +1543,25 @@ def run_subtitle_job(
                 }
             else:
                 asr_cfg = dict(req.get("asr") or {})
+            # The ASR stage rolls back its read transaction before inference.
+            # Use the captured UUID rather than dereferencing an expired ORM
+            # Task in every window callback (idle-in-transaction regression).
+            asr_task_id = task.id
+
+            def _asr_progress(processed_seconds: float, total_seconds: float) -> None:
+                if job_hb is not None and job_hb.lost:
+                    raise SubtitleJobLeaseBusy(f"subtitle job {jid} lost its worker lease")
+                progress = 25 + int(34 * processed_seconds / max(1.0, total_seconds))
+                progress_db = _db()
+                try:
+                    if not update_subtitle_asr_progress(progress_db, jid, lease_owner, progress):
+                        progress_db.rollback()
+                        raise SubtitleJobLeaseBusy(f"subtitle job {jid} no longer owns its ASR lease")
+                    progress_db.commit()
+                finally:
+                    progress_db.close()
+                _raise_if_task_stopped_fresh(asr_task_id)
+
             segments = _run_asr_stage(
                 db=db,
                 audio_path=audio_path,
@@ -1515,10 +1569,14 @@ def run_subtitle_job(
                 asr_cfg=asr_cfg,
                 log_path=log_path,
                 groq_checkpoint_path=_groq_asr_checkpoint_path(),
+                local_checkpoint_path=store.path_for(
+                    _local_asr_checkpoint_key(), require_exists=False,
+                ),
+                asr_progress=_asr_progress,
                 # Capture the UUID before _run_asr_stage rolls back the read
                 # transaction. Accessing an expired ORM task inside the GPU
                 # wait callback would open another idle transaction.
-                cancel_check=lambda task_id=task.id: _raise_if_task_stopped_fresh(task_id),
+                cancel_check=lambda task_id=asr_task_id: _raise_if_task_stopped_fresh(task_id),
             )
             _store_source_segments(segments, source_label="asr done")
 

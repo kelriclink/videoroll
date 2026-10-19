@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Callable
 
-from sqlalchemy import exists, or_, update
+from sqlalchemy import case, exists, or_, update
 from sqlalchemy.orm import Session
 
 from videoroll.db.models import (
@@ -144,6 +144,29 @@ def heartbeat_job_lease(db: Session, job_id: uuid.UUID | str, owner: str, ttl_se
         return False
     db.flush()
     return True
+
+
+def update_subtitle_asr_progress(db: Session, job_id: uuid.UUID | str, owner: str, progress: int) -> bool:
+    """Advance ASR progress only while this worker still owns its live lease.
+
+    An old worker whose lease was recovered must not overwrite the new
+    attempt's progress or continue into the final caption handoff.
+    """
+    now = _utcnow()
+    bounded = max(25, min(59, int(progress)))
+    result = db.execute(
+        update(SubtitleJob)
+        .where(
+            SubtitleJob.id == job_id,
+            SubtitleJob.status == SubtitleJobStatus.running,
+            SubtitleJob.lease_owner == _lease_owner(owner),
+            SubtitleJob.lease_until > now,
+        )
+        .values(progress=case((SubtitleJob.progress < bounded, bounded), else_=SubtitleJob.progress))
+        .execution_options(synchronize_session=False)
+    )
+    db.flush()
+    return bool(result.rowcount)
 
 
 def release_job_lease(db: Session, job_id: uuid.UUID | str, owner: str) -> bool:
@@ -501,6 +524,7 @@ class JobLeaseHeartbeat:
         self._owner = _lease_owner(owner)
         self._ttl_seconds = _lease_seconds(ttl_seconds)
         self._stop = threading.Event()
+        self._lost = threading.Event()
         self._thread: threading.Thread | None = None
 
     def start(self) -> None:
@@ -514,17 +538,27 @@ class JobLeaseHeartbeat:
         if self._thread is not None:
             self._thread.join(timeout=2.0)
 
+    @property
+    def lost(self) -> bool:
+        return self._lost.is_set()
+
     def _run(self) -> None:
         interval = min(30.0, max(1.0, self._ttl_seconds / 3))
         while not self._stop.wait(interval):
-            db = self._session_factory()
+            db: Session | None = None
             try:
+                db = self._session_factory()
                 if heartbeat_job_lease(db, self._job_id, self._owner, self._ttl_seconds):
                     db.commit()
                 else:
                     db.rollback()
+                    self._lost.set()
                     return
             except Exception:
-                db.rollback()
+                # A transient connection/session-creation failure must not
+                # silently terminate the heartbeat thread forever.
+                if db is not None:
+                    db.rollback()
             finally:
-                db.close()
+                if db is not None:
+                    db.close()

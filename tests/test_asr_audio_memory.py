@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from array import array
 from pathlib import Path
+import json
 import struct
 import sys
 import tracemalloc
@@ -383,6 +384,85 @@ def test_faster_whisper_empty_vad_window_does_not_drop_following_speech(monkeypa
 
     assert calls == [32000, 32000, 19200]
     assert [segment.start for segment in segments] == [0.1, 3.1]
+
+
+def test_faster_whisper_recovers_completed_windows_without_retranscribing(monkeypatch, tmp_path) -> None:
+    pytest.importorskip("numpy")
+    _small_windows(monkeypatch)
+    path = tmp_path / "speech.wav"
+    _write_wav(path, seconds=4.2)
+    checkpoint = tmp_path / "durable" / "asr.json"
+    calls: list[int] = []
+    failing = True
+
+    def transcribe(audio):
+        calls.append(len(audio))
+        if failing and len(calls) == 2:
+            raise RuntimeError("interrupted worker")
+        return iter([_chunk(0.1, 0.5, "A clear phrase")]), SimpleNamespace()
+
+    _fake_faster_whisper(monkeypatch, transcribe)
+    with pytest.raises(RuntimeError, match="interrupted worker"):
+        processing.transcribe_faster_whisper(
+            path, model_name="large-v3", checkpoint_path=checkpoint, audio_identity="sha:audio1",
+        )
+    assert len(calls) == 2
+    assert len(json.loads(checkpoint.read_text())["windows"]) == 1
+
+    failing = False
+    calls.clear()
+    progress: list[tuple[float, float]] = []
+    resumed = processing.transcribe_faster_whisper(
+        path, model_name="large-v3", checkpoint_path=checkpoint, audio_identity="sha:audio1",
+        progress_callback=lambda current, total: progress.append((current, total)),
+    )
+    assert len(calls) == 2  # First window reused from durable checkpoint.
+    assert len(resumed) == 3
+    assert len(progress) == 3 and progress[-1] == (4.2, 4.2)
+
+    calls.clear()
+    processing.transcribe_faster_whisper(
+        path, model_name="different-model", checkpoint_path=checkpoint, audio_identity="sha:audio1",
+    )
+    assert len(calls) == 3  # Changed model must invalidate cached text.
+
+
+def test_openvino_checkpoint_recovers_speech_windows_after_restart(monkeypatch, tmp_path) -> None:
+    _small_windows(monkeypatch)
+    path = tmp_path / "openvino.wav"
+    _write_wav(path, seconds=4.0)
+    checkpoint = tmp_path / "durable_openvino.json"
+    calls: list[int] = []
+    failing = True
+
+    def generate(audio, **_kwargs):
+        calls.append(len(audio))
+        if failing and len(calls) == 2:
+            raise RuntimeError("model worker interrupted")
+        return object()
+
+    monkeypatch.setattr(processing, "_get_openvino_pipeline", lambda *_args: SimpleNamespace(generate=generate))
+    monkeypatch.setattr(processing, "_openvino_generation_options", lambda *_a, **_k: (None, {}))
+    monkeypatch.setattr(
+        processing, "_iter_openvino_speech_windows",
+        lambda *_a, **_k: iter([(array("f", [0.1]) * 32000, 0.0), (array("f", [0.1]) * 32000, 2.0)]),
+    )
+    monkeypatch.setattr(
+        processing, "_openvino_result_chunks",
+        lambda *_a, **_k: [processing._OpenVinoChunk(0.1, 0.4, "Clearly spoken words")],
+    )
+    with pytest.raises(RuntimeError, match="model worker interrupted"):
+        processing.transcribe_openvino_whisper(
+            path, model_name="/models/openvino", checkpoint_path=checkpoint, audio_identity="sha:audio2",
+        )
+    assert len(json.loads(checkpoint.read_text())["windows"]) == 1
+    failing = False
+    calls.clear()
+    resumed = processing.transcribe_openvino_whisper(
+        path, model_name="/models/openvino", checkpoint_path=checkpoint, audio_identity="sha:audio2",
+    )
+    assert len(calls) == 1
+    assert len(resumed) == 2
 
 
 def test_external_whisper_plain_text_duration_reads_only_the_wav_header(monkeypatch, tmp_path) -> None:
