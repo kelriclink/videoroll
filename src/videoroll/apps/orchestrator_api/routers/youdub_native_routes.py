@@ -17,7 +17,7 @@ from videoroll.apps.dubbing.control import request_control
 from videoroll.apps.orchestrator_api.dependencies import get_db, get_settings
 from videoroll.apps.orchestrator_api.schemas import DubbingActionRequest, RemoteJobResponse
 from videoroll.config import OrchestratorSettings
-from videoroll.db.models import DubbingJob, Task, TaskStatus
+from videoroll.db.models import DubbingJob, PipelineRun, Task, TaskStatus
 from videoroll.workflows.launcher import PipelineLauncher
 
 router = APIRouter()
@@ -137,13 +137,39 @@ def auto_dubbing(
     if job.status not in ("queued", "preparing", "synthesizing", "aligning", "mixing"):
         raise HTTPException(409, f"YouDub job {job.id} ended as {job.status}; resolve before publishing")
     if job.status == "queued":
-        try:
-            PipelineLauncher(settings).launch_dubbing_job(
-                job.id, dispatch_key=f"video-pipeline-auto-p2:{job.id}")
-        except Exception as exc:
-            raise HTTPException(
-                503, f"YouDub dispatch pending: {type(exc).__name__}: {exc}"
-            ) from exc
+        # Manual resume may already have dispatched this same durable DubbingJob.
+        # Do not insert a second PipelineRun for a Hatchet run whose older
+        # deterministic dispatch key still exists in the seven-day dedupe TTL.
+        active = (
+            db.query(PipelineRun)
+            .filter(
+                PipelineRun.task_id == task_id,
+                PipelineRun.workflow_name == "DubbingJobV1",
+                PipelineRun.state.in_(["submitted", "running"]),
+                PipelineRun.external_run_id.is_not(None),
+            )
+            .order_by(PipelineRun.created_at.desc()).limit(20).all()
+        )
+        if not any(str((run.request_json or {}).get("job_id") or "") == str(job.id) for run in active):
+            # Scope the idempotency key to the owning parent attempt so a
+            # canceled old Hatchet run cannot be mistaken for a new one.
+            parent = (
+                db.query(PipelineRun)
+                .filter(
+                    PipelineRun.task_id == task_id,
+                    PipelineRun.workflow_name == "VideoPipelineV1",
+                    PipelineRun.state.in_(["submitted", "running"]),
+                )
+                .order_by(PipelineRun.created_at.desc()).first()
+            )
+            attempt_key = str(parent.id) if parent is not None else str(job.id)
+            try:
+                PipelineLauncher(settings).launch_dubbing_job(
+                    job.id, dispatch_key=f"video-pipeline-auto-p2:{job.id}:{attempt_key}")
+            except Exception as exc:
+                raise HTTPException(
+                    503, f"YouDub dispatch pending: {type(exc).__name__}: {exc}"
+                ) from exc
     return {"status": "queued", "detail": "YouDub is scheduled in the main workflow",
             "dubbing_job_id": str(job.id)}
 

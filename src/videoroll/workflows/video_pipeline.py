@@ -467,7 +467,32 @@ def register_video_pipeline(hatchet: Any, *, settings: WorkflowRuntimeSettings |
             label=f"dubbing:{job_id}",
         )
         if event.status != "succeeded":
-            _non_retryable(event.error or f"YouDub task {job_id} ended as {event.status}")
+            # A resumed job can have a durable 'failed: paused' event left by
+            # the earlier canceled attempt. Ignore that event ONLY while the
+            # current persisted job is actively resuming; never mask a real
+            # failure whose job status is already terminal.
+            reason = str(event.error or "").lower()
+            if event.status == "failed" and "paused" in reason:
+                from uuid import UUID
+                from videoroll.config import get_orchestrator_settings
+                from videoroll.db.models import DubbingJob
+                from videoroll.db.session import get_sessionmaker
+                with get_sessionmaker(get_orchestrator_settings().database_url)() as lookup:
+                    current = lookup.get(DubbingJob, UUID(job_id))
+                    resumed = bool(current is not None and current.status in (
+                        "queued", "preparing", "synthesizing", "aligning", "mixing", "rendering",
+                    ))
+                if resumed:
+                    event = await ctx.aio_wait_for_event(
+                        DUBBING_FINISHED_EVENT,
+                        f"input.dubbing_job_id == '{job_id}' && input.status == 'succeeded'",
+                        payload_validator=DubbingFinishedEvent,
+                        scope=f"{job_id}:resumed",
+                        lookback_window=timedelta(days=7),
+                        label=f"dubbing-resumed:{job_id}",
+                    )
+            if event.status != "succeeded":
+                _non_retryable(event.error or f"YouDub task {job_id} ended as {event.status}")
         return WorkflowStageOutput(task_id=input.task_id, status="dubbed",
                                    detail="YouDub finished; P1/P2 ready",
                                    dubbing_job_id=job_id)
