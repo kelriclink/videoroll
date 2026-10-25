@@ -332,7 +332,8 @@ def register_video_pipeline(hatchet: Any, *, settings: WorkflowRuntimeSettings |
         retries=5,
         backoff_factor=2.0,
         backoff_max_seconds=60,
-        schedule_timeout=timedelta(minutes=30),
+        # Scheduling wait and execution lifetime are independent.
+        schedule_timeout=timedelta(hours=12),
         execution_timeout=timedelta(hours=12),
         desired_worker_labels=_desired_pool("subtitle"),
     )

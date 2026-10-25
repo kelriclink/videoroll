@@ -31,7 +31,7 @@ from videoroll.ai.service import AIService
 from videoroll.apps.security.service_auth import install_internal_service_auth, service_token
 from videoroll.config import SubtitleServiceSettings, get_subtitle_settings
 from videoroll.db.migrate import initialize_database
-from videoroll.db.models import Asset, AssetKind, RenderJob, RenderJobStatus, SourceType, SubtitleJob, SubtitleJobStatus, Task, TaskStatus
+from videoroll.db.models import Asset, AssetKind, PipelineRun, RenderJob, RenderJobStatus, SourceType, SubtitleJob, SubtitleJobStatus, Task, TaskStatus
 from videoroll.db.session import db_session
 from videoroll.storage.filesystem import FileStore
 from videoroll.apps.subtitle_service.schemas import (
@@ -2358,6 +2358,9 @@ def _auto_youtube_queue_progress(db: Session, task: Task) -> tuple[str, int, str
     except (TypeError, ValueError):
         progress = 0
     error = str(data.get("error") or "").strip() or None
+    if status == "failed":
+        # Failed downloads are not active; do not display stale progress as running.
+        return None
     if status == "completed":
         # Download completion only proves the source asset is ready. Hatchet may
         # still be advancing the workflow (or a previous run may have failed),
@@ -2412,8 +2415,21 @@ def _read_task_queue(db: Session, *, limit: int) -> TaskQueueRead:
         .all()
     )
     for task in auto_tasks:
-        if parse_auto_youtube_created_by(task.created_by) is not None:
-            candidate_ids.add(task.id)
+        if parse_auto_youtube_created_by(task.created_by) is None:
+            continue
+        latest_parent = (
+            db.query(PipelineRun)
+            .filter(PipelineRun.task_id == task.id, PipelineRun.workflow_name == "VideoPipelineV1")
+            .order_by(PipelineRun.created_at.desc())
+            .first()
+        )
+        # A finished/failed workflow does not belong to the live task queue.
+        # A new automatic retry creates a new active PipelineRun.
+        if latest_parent is not None and latest_parent.state in {
+            "failed", "canceled", "launch_failed", "superseded", "succeeded",
+        }:
+            continue
+        candidate_ids.add(task.id)
 
     if not candidate_ids:
         return TaskQueueRead(

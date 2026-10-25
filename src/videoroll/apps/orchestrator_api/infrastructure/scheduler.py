@@ -41,6 +41,7 @@ class OrchestratorScheduler:
         self._home_scan_stop = threading.Event()
         self._source_scan_stop = threading.Event()
         self._alert_scan_stop = threading.Event()
+        self._workflow_audit_stop = threading.Event()
         self._threads: list[threading.Thread] = []
         self._cleanup_interval_seconds = int(os.getenv("STORAGE_CLEANUP_INTERVAL_SECONDS", "3600") or "3600")
         self._publishing_timeout_hours = max(1, int(os.getenv("PUBLISHING_TASK_TIMEOUT_HOURS", "48") or "48"))
@@ -52,6 +53,7 @@ class OrchestratorScheduler:
         self._home_scan_tick_seconds = int(os.getenv("YOUTUBE_HOME_SCAN_TICK_SECONDS", "30") or "30")
         self._source_scan_tick_seconds = int(os.getenv("YOUTUBE_SOURCE_SCAN_TICK_SECONDS", "30") or "30")
         self._alert_scan_tick_seconds = int(os.getenv("OPERATIONS_ALERT_SCAN_SECONDS", "60") or "60")
+        self._workflow_audit_tick_seconds = max(10, int(os.getenv("WORKFLOW_AUDIT_RECONCILE_SECONDS", "30") or "30"))
         self._shutdown_timeout_seconds = max(
             1.0,
             float(os.getenv("ORCHESTRATOR_SHUTDOWN_TIMEOUT_SECONDS", "30") or "30"),
@@ -73,6 +75,7 @@ class OrchestratorScheduler:
         self._home_scan_stop.clear()
         self._source_scan_stop.clear()
         self._alert_scan_stop.clear()
+        self._workflow_audit_stop.clear()
         self._threads = [
             self._start_thread("videoroll-storage-cleanup", self._cleanup_loop),
             self._start_thread("videoroll-youtube-home-scan", self._home_scan_loop),
@@ -80,6 +83,7 @@ class OrchestratorScheduler:
             self._start_thread("videoroll-workdir-startup-cleanup", self._workdir_startup_cleanup),
             self._start_thread("videoroll-worker-lease-recovery", self._worker_lease_recovery_loop),
             self._start_thread("videoroll-operations-alert-scan", self._alert_scan_loop),
+            self._start_thread("videoroll-workflow-audit-sync", self._workflow_audit_loop),
         ]
 
     def stop(self) -> None:
@@ -87,6 +91,7 @@ class OrchestratorScheduler:
         self._home_scan_stop.set()
         self._source_scan_stop.set()
         self._alert_scan_stop.set()
+        self._workflow_audit_stop.set()
         deadline = time.monotonic() + self._shutdown_timeout_seconds
         remaining: list[threading.Thread] = []
         for thread in self._threads:
@@ -324,6 +329,20 @@ class OrchestratorScheduler:
             except Exception:
                 logger.exception("worker lease recovery loop failed")
             self._cleanup_stop.wait(timeout=max(5, self._lease_recovery_interval_seconds))
+
+    def _workflow_audit_loop(self) -> None:
+        from videoroll.workflows.pipeline_status_sync import reconcile_auto_pipeline_runs
+        while not self._workflow_audit_stop.is_set():
+            try:
+                result = reconcile_auto_pipeline_runs(self.settings)
+                if result["updated"] or result["stranded_jobs_failed"]:
+                    logger.info(
+                        "workflow audit reconciled runs=%d stranded_subtitle_jobs=%d",
+                        result["updated"], result["stranded_jobs_failed"],
+                    )
+            except Exception:
+                logger.exception("workflow audit reconciliation failed")
+            self._workflow_audit_stop.wait(timeout=self._workflow_audit_tick_seconds)
 
     def _home_scan_loop(self) -> None:
         while not self._home_scan_stop.is_set():
