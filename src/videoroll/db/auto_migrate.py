@@ -224,6 +224,12 @@ def _ensure_youtube_sources_columns(engine: Bind) -> None:
         "last_scan_started_pipeline_count": "INTEGER DEFAULT 0",
         "last_scan_skipped_duplicates": "INTEGER DEFAULT 0",
         "last_scan_error": "TEXT",
+        "last_nonempty_scan_finished_at": ts_type,
+        "last_nonempty_discovered_count": "INTEGER NOT NULL DEFAULT 0",
+        "total_scan_count": "INTEGER NOT NULL DEFAULT 0",
+        "total_failed_scan_count": "INTEGER NOT NULL DEFAULT 0",
+        "total_created_count": "INTEGER NOT NULL DEFAULT 0",
+        "total_started_pipeline_count": "INTEGER NOT NULL DEFAULT 0",
         "scan_lock_owner": "VARCHAR(128)",
         "scan_lock_until": ts_type,
     }

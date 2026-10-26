@@ -374,7 +374,41 @@ export default function TasksPage() {
             {filteredTasks.length === 0 ? (
               <EmptyState>没有匹配的任务</EmptyState>
             ) : (
-              <DataTable wrapClassName="mt-3">
+              <>
+                <div className="mt-3 grid gap-3 md:hidden">
+                  {pageItems.map((task) => {
+                    const isBusy = actionBusyId === task.id;
+                    const canRetryDownload = task.status === "FAILED" && task.source_type === "youtube" && Boolean(task.source_url?.trim());
+                    const canStartAuto = ["INGESTED", "DOWNLOADED"].includes(task.status) && task.source_type === "youtube" && Boolean(task.source_url?.trim());
+                    const canStop = stoppableStatuses.includes(task.status);
+                    return (
+                      <div key={task.id} className="min-w-0 space-y-2 rounded-lg border border-slate-200 p-3">
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <Link to={`/tasks/${task.id}`} className="font-mono text-sm underline">{task.id.slice(0, 8)}</Link>
+                          <StatusBadge status={task.status} />
+                        </div>
+                        <Link to={`/tasks/${task.id}`} className="block break-words text-sm font-semibold text-slate-900">
+                          {task.display_title?.trim() || "未命名视频"}
+                        </Link>
+                        <div className="text-xs text-slate-500">{task.source_type} · {new Date(task.created_at).toLocaleString()}</div>
+                        <div className="break-all text-xs text-slate-600">{task.source_url ?? "-"}</div>
+                        {task.error_message ? (
+                          <details className="text-xs text-rose-700"><summary>查看错误</summary><div className="mt-1 whitespace-pre-wrap break-words">{task.error_message}</div></details>
+                        ) : null}
+                        <div className="flex flex-wrap gap-2 pt-1">
+                          <Link className="rounded border px-3 py-2 text-xs" to={`/tasks/${task.id}`}>详情</Link>
+                          {task.status === "FAILED" ? <Button size="xs" disabled={isBusy} onClick={() => resumeSubtitle(task)}>继续字幕</Button> : null}
+                          {canRetryDownload ? <Button size="xs" disabled={isBusy} onClick={() => retryYouTubeDownload(task)}>重试下载</Button> : null}
+                          {canStartAuto ? <Button size="xs" disabled={isBusy} onClick={() => startAuto(task)}>启动自动</Button> : null}
+                          {task.status === "CANCELED" ? <Button size="xs" disabled={isBusy} onClick={() => resumeStoppedTask(task)}>恢复</Button> : null}
+                          {canStop ? <Button size="xs" tone="danger" disabled={isBusy} onClick={() => stopTask(task)}>停止</Button> : null}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+                <div className="hidden md:block">
+                  <DataTable wrapClassName="mt-3">
                 <thead>
                   <tr>
                     <th className="w-24">ID</th>
@@ -470,7 +504,9 @@ export default function TasksPage() {
                     );
                   })}
                 </tbody>
-              </DataTable>
+                  </DataTable>
+                </div>
+              </>
             )}
             <PaginationControls
               page={page}

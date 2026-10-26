@@ -366,22 +366,45 @@ def finish_youtube_source_scan_lock(
     skipped_duplicates: int = 0,
     error: str | None = None,
     finished_at: datetime | None = None,
+    feed_completed: bool = True,
 ) -> YouTubeSource | None:
     row = db.execute(select(YouTubeSource).where(YouTubeSource.id == source_pk).with_for_update()).scalar_one_or_none()
     if row is None:
         return None
     current_owner = str(row.scan_lock_owner or "").strip()
-    if current_owner and current_owner != str(owner or "").strip():
+    if current_owner != str(owner or "").strip():
+        # An expired owner must not overwrite the current scan's result or counters.
         return row
+
+    # When upgrading old source rows, preserve the pre-upgrade last good
+    # snapshot before any new scan can replace the old last_scan_* fields.
+    if row.last_nonempty_scan_finished_at is None and int(row.last_scan_discovered_count or 0) > 0:
+        row.last_nonempty_scan_finished_at = row.last_scan_finished_at
+        row.last_nonempty_discovered_count = int(row.last_scan_discovered_count or 0)
 
     row.scan_lock_owner = None
     row.scan_lock_until = None
     row.last_scan_finished_at = finished_at or _utcnow()
-    row.last_scan_discovered_count = max(0, int(discovered_count or 0))
-    row.last_scan_created_count = max(0, int(created_count or 0))
-    row.last_scan_started_pipeline_count = max(0, int(started_pipeline_count or 0))
-    row.last_scan_skipped_duplicates = max(0, int(skipped_duplicates or 0))
-    row.last_scan_error = _trim_error_message(error)
+    discovered = max(0, int(discovered_count or 0))
+    created = max(0, int(created_count or 0))
+    started = max(0, int(started_pipeline_count or 0))
+    error_message = _trim_error_message(error)
+    row.total_created_count = int(row.total_created_count or 0) + created
+    row.total_started_pipeline_count = int(row.total_started_pipeline_count or 0) + started
+    if error_message:
+        row.total_failed_scan_count = int(row.total_failed_scan_count or 0) + 1
+    if feed_completed:
+        # Even when one pipeline fails to start, enumeration succeeded and the
+        # discovered/created snapshot is still authoritative.
+        row.total_scan_count = int(row.total_scan_count or 0) + 1
+        row.last_scan_discovered_count = discovered
+        row.last_scan_created_count = created
+        row.last_scan_started_pipeline_count = started
+        row.last_scan_skipped_duplicates = max(0, int(skipped_duplicates or 0))
+        if discovered > 0:
+            row.last_nonempty_scan_finished_at = row.last_scan_finished_at
+            row.last_nonempty_discovered_count = discovered
+    row.last_scan_error = error_message
     db.add(row)
     db.commit()
     db.refresh(row)
@@ -411,6 +434,12 @@ def source_to_read_dict(src: YouTubeSource) -> dict[str, Any]:
         "last_scan_started_pipeline_count": max(0, int(getattr(src, "last_scan_started_pipeline_count", 0) or 0)),
         "last_scan_skipped_duplicates": max(0, int(getattr(src, "last_scan_skipped_duplicates", 0) or 0)),
         "last_scan_error": _trim_error_message(getattr(src, "last_scan_error", None)),
+        "last_nonempty_scan_finished_at": getattr(src, "last_nonempty_scan_finished_at", None),
+        "last_nonempty_discovered_count": int(getattr(src, "last_nonempty_discovered_count", 0) or 0),
+        "total_scan_count": int(getattr(src, "total_scan_count", 0) or 0),
+        "total_failed_scan_count": int(getattr(src, "total_failed_scan_count", 0) or 0),
+        "total_created_count": int(getattr(src, "total_created_count", 0) or 0),
+        "total_started_pipeline_count": int(getattr(src, "total_started_pipeline_count", 0) or 0),
         "created_at": src.created_at,
         "updated_at": src.updated_at,
     }
@@ -706,6 +735,7 @@ def scan_youtube_source_by_id(
             started_pipeline_count=len(started),
             skipped_duplicates=skipped,
             error=_trim_error_message(str(e)),
+            feed_completed=False,
         )
         raise
     finally:

@@ -315,9 +315,70 @@ export default function YouTubeSourcesPage() {
         <div className="text-sm font-semibold">已订阅 Sources</div>
         {!sources ? <div className="mt-2 text-sm text-slate-500">加载中...</div> : null}
         {sources && sources.length === 0 ? <div className="mt-2 text-sm text-slate-500">暂无订阅源。</div> : null}
+        {sources && sources.length > 0 ? (
+          <div className="mt-3 grid gap-3 md:hidden">
+            {sources.map((source) => {
+              const draft = drafts[source.id];
+              const displayName = currentValue<string | null>(source, draft, "display_name", source.display_name ?? "");
+              const rowLicense = currentValue<SourceLicense>(source, draft, "license", source.license);
+              const rowProofUrl = currentValue<string | null>(source, draft, "proof_url", source.proof_url ?? "");
+              const rowEnabled = currentValue<boolean>(source, draft, "enabled", source.enabled);
+              const rowInterval = currentValue<number>(source, draft, "scan_interval_minutes", source.scan_interval_minutes);
+              const rowLimit = currentValue<number>(source, draft, "scan_limit", source.scan_limit);
+              const rowAutoProcess = currentValue<boolean>(source, draft, "auto_process", source.auto_process);
+              return (
+                <div key={source.id} className="min-w-0 space-y-3 rounded-lg border border-slate-200 p-3">
+                  <div className="text-xs font-semibold text-slate-500">{source.source_type === "playlist" ? "播放列表" : "YouTube 频道"}</div>
+                  <input className="w-full min-w-0 rounded border px-2 py-2 text-sm" aria-label="显示名称"
+                    value={displayName ?? ""} placeholder="显示名称"
+                    onChange={(e) => updateDraft(source.id, { display_name: e.target.value })} />
+                  <a className="block break-all text-xs text-sky-700 underline" href={source.source_url} target="_blank" rel="noreferrer">{source.source_url}</a>
+                  <div className="break-all font-mono text-xs text-slate-500">{source.source_id}</div>
+                  <div className="grid grid-cols-2 gap-3">
+                    <label className="min-w-0 text-xs">来源授权
+                      <select className="mt-1 w-full min-w-0 rounded border px-2 py-2 text-sm" value={rowLicense}
+                        onChange={(e) => updateDraft(source.id, { license: e.target.value as SourceLicense })}>
+                        <option value="own">own</option><option value="authorized">authorized</option>
+                        <option value="cc">cc</option><option value="unknown">unknown</option>
+                      </select>
+                    </label>
+                    <label className="min-w-0 text-xs">扫描间隔（分钟）
+                      <input type="number" min={1} max={1440} className="mt-1 w-full min-w-0 rounded border px-2 py-2 text-sm"
+                        value={rowInterval} onChange={(e) => updateDraft(source.id, { scan_interval_minutes: Math.max(1, parseInt(e.target.value || "60", 10) || 60) })} />
+                    </label>
+                    <label className="min-w-0 text-xs">每次新建上限
+                      <input type="number" min={1} max={200} className="mt-1 w-full min-w-0 rounded border px-2 py-2 text-sm"
+                        value={rowLimit} onChange={(e) => updateDraft(source.id, { scan_limit: Math.max(1, parseInt(e.target.value || "20", 10) || 20) })} />
+                    </label>
+                    <div className="flex flex-col justify-center gap-2 text-sm">
+                      <label className="flex items-center gap-2"><input type="checkbox" checked={rowEnabled} onChange={(e) => updateDraft(source.id, { enabled: e.target.checked })} />启用</label>
+                      <label className="flex items-center gap-2"><input type="checkbox" checked={rowAutoProcess} onChange={(e) => updateDraft(source.id, { auto_process: e.target.checked })} />自动模式</label>
+                    </div>
+                  </div>
+                  <label className="block min-w-0 text-xs">授权证明链接
+                    <input className="mt-1 w-full min-w-0 rounded border px-2 py-2 text-sm" value={rowProofUrl ?? ""}
+                      placeholder="proof_url（可选）" onChange={(e) => updateDraft(source.id, { proof_url: e.target.value })} />
+                  </label>
+                  <div className="space-y-1 rounded-md bg-slate-50 p-3 text-xs text-slate-700">
+                    <div>最近扫描：{formatTime(source.last_scan_finished_at ?? source.last_scan_started_at)}</div>
+                    <div>本次发现 {source.last_scan_discovered_count} / 新建 {source.last_scan_created_count} / 启动 {source.last_scan_started_pipeline_count}</div>
+                    <div>最近非空扫描发现 {source.last_nonempty_discovered_count || source.last_scan_discovered_count}</div>
+                    <div>升级后累计：成功 {source.total_scan_count ?? 0} 次 / 新建 {source.total_created_count ?? 0} / 启动 {source.total_started_pipeline_count ?? 0} / 失败 {source.total_failed_scan_count ?? 0} 次</div>
+                    {source.last_scan_error ? <div className="break-words text-rose-700">最近扫描异常：{source.last_scan_error}</div> : null}
+                  </div>
+                  <div className="grid grid-cols-3 gap-2">
+                    <button className="rounded border px-2 py-2 text-sm disabled:opacity-50" disabled={Boolean(busyMap[`save:${source.id}`])} onClick={() => saveSource(source)}>保存</button>
+                    <button className="rounded border px-2 py-2 text-sm disabled:opacity-50" disabled={Boolean(busyMap[`scan:${source.id}`])} onClick={() => scanSource(source)}>立即扫描</button>
+                    <button className="rounded border border-rose-200 px-2 py-2 text-sm text-rose-700 disabled:opacity-50" disabled={Boolean(busyMap[`delete:${source.id}`])} onClick={() => deleteSource(source)}>删除</button>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        ) : null}
         {sources ? (
-          <div className="mt-3 overflow-auto rounded-md border border-slate-200">
-            <table className="min-w-full text-left text-sm">
+          <div className="mt-3 hidden overflow-x-auto rounded-md border border-slate-200 md:block">
+            <table className="min-w-[1080px] text-left text-sm">
               <thead className="text-xs text-slate-500">
                 <tr>
                   <th className="py-2 pr-3">Creator</th>
@@ -413,7 +474,11 @@ export default function YouTubeSourcesPage() {
                       <td className="py-3 pr-3">
                         <div className="text-xs text-slate-700">{source.last_scan_finished_at ? `完成：${formatTime(source.last_scan_finished_at)}` : source.last_scan_started_at ? `开始：${formatTime(source.last_scan_started_at)}` : "未扫描"}</div>
                         <div className="mt-1 text-xs text-slate-500">
-                          发现 {source.last_scan_discovered_count} / 新建 {source.last_scan_created_count} / 启动 {source.last_scan_started_pipeline_count} / 跳过 {source.last_scan_skipped_duplicates}
+                          本次发现 {source.last_scan_discovered_count} / 新建 {source.last_scan_created_count} / 启动 {source.last_scan_started_pipeline_count} / 跳过 {source.last_scan_skipped_duplicates}
+                        </div>
+                        <div className="mt-1 text-xs text-slate-500">最近非空扫描发现 {source.last_nonempty_discovered_count || source.last_scan_discovered_count}</div>
+                        <div className="mt-1 text-xs text-slate-500">
+                          升级后累计：成功 {source.total_scan_count ?? 0} 次 / 新建 {source.total_created_count ?? 0} / 启动 {source.total_started_pipeline_count ?? 0} / 失败 {source.total_failed_scan_count ?? 0} 次
                         </div>
                         {source.last_scan_error ? <div className="mt-1 max-w-xs break-all text-xs text-rose-700">{source.last_scan_error}</div> : null}
                       </td>

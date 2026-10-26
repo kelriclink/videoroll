@@ -561,6 +561,14 @@ class YouTubeSource(Base):
     last_scan_started_pipeline_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     last_scan_skipped_duplicates: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     last_scan_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # Snapshot from the last non-empty feed, independent of subsequent empty/error scans.
+    last_nonempty_scan_finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_nonempty_discovered_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # Durable counters starting with the schema upgrade; not reconstructed from old overwritten scans.
+    total_scan_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    total_failed_scan_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    total_created_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    total_started_pipeline_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     scan_lock_owner: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
     scan_lock_until: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 

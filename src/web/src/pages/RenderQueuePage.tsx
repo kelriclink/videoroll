@@ -152,8 +152,29 @@ export default function RenderQueuePage() {
         {!queue ? <div className="mt-2 text-sm text-slate-500">加载中…</div> : null}
         {queue && queue.tasks.length === 0 ? <div className="mt-2 text-sm text-slate-500">暂无</div> : null}
         {queue && queue.tasks.length > 0 ? (
-          <div className="mt-2 overflow-auto">
-            <table className="min-w-full text-left text-sm">
+          <>
+            <div className="mt-3 grid gap-3 md:hidden">
+              {queue.tasks.map((t) => (
+                <div key={t.task_id} className="min-w-0 space-y-2 rounded-lg border border-slate-200 p-3 text-sm">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <span className="text-xs font-medium">{priorityLabel(t.priority)}</span>
+                    <span className="font-mono text-xs">{t.state}</span>
+                  </div>
+                  <div className="flex items-center justify-between gap-2">
+                    <span>阶段：{t.stage}</span><span className="font-mono">{t.progress}%</span>
+                  </div>
+                  <div className="h-2 overflow-hidden rounded bg-slate-100">
+                    <div className="h-full rounded bg-sky-600" style={{ width: `${Math.max(0, Math.min(t.progress, 100))}%` }} />
+                  </div>
+                  <Link to={`/tasks/${t.task_id}`} className="inline-block break-all font-mono text-xs text-sky-700 underline">任务 {t.task_id.slice(0, 8)}</Link>
+                  <div className="break-words text-xs text-slate-500">字幕 {t.subtitle_job_id?.slice(0, 8) ?? "-"} · 渲染 {t.render_job_id?.slice(0, 8) ?? "-"}</div>
+                  <div className="text-xs text-slate-500">更新 {new Date(t.updated_at).toLocaleString()}</div>
+                  {t.error_message ? <div className="break-words text-xs text-rose-700">{t.error_message}</div> : null}
+                </div>
+              ))}
+            </div>
+            <div className="mt-2 hidden overflow-x-auto md:block">
+            <table className="min-w-[920px] text-left text-sm">
               <thead className="text-xs text-slate-500">
                 <tr>
                   <th className="py-2 pr-3">Priority</th>
@@ -191,7 +212,8 @@ export default function RenderQueuePage() {
                 ))}
               </tbody>
             </table>
-          </div>
+            </div>
+          </>
         ) : null}
       </div>
     </div>
