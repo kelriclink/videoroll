@@ -62,6 +62,8 @@ def test_recovered_completed_render_skips_download_and_encoder(tmp_path: Path) -
         _execution_cancel_state=lambda _eid, **_kw: (False, None),
         _upload_output=lambda _eid, _fence, path: (uploaded.append(path), uuid.uuid4())[1],
         _download=lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("no redownload")),
+        _load_cached_output=lambda _spec: None,
+        _clear_cached_output=lambda _spec: None,
     )
     claim = SimpleNamespace(
         execution=SimpleNamespace(id=uuid.uuid4(), fence_token="x" * 40),

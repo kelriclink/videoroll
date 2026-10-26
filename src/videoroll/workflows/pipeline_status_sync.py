@@ -138,7 +138,7 @@ def reconcile_stranded_auto_subtitle_jobs(settings, *, limit: int = 200) -> int:
     return changed
 
 def reconcile_auto_pipeline_runs(settings, *, limit: int = 25) -> dict[str, int]:
-    """Poll authoritative external run state; repair missed callbacks and stale rows.
+    """Poll authoritative Hatchet state for all workflow types, repairing stale rows.
 
     The database transaction is *not* held while calling Hatchet. Status writes
     verify the same external run ID again under a row lock. Network failures
@@ -149,7 +149,9 @@ def reconcile_auto_pipeline_runs(settings, *, limit: int = 25) -> dict[str, int]
     with factory() as db:
         candidates = db.query(PipelineRun.id, PipelineRun.external_run_id).filter(
             PipelineRun.engine == "hatchet",
-            PipelineRun.workflow_name == AUTO_WORKFLOW_NAME,
+            # SubtitleJobV1 and other Hatchet child workflows must also be
+            # reconciled: otherwise their submitted rows stay forever active
+            # after the authoritative Hatchet run reached a terminal state.
             PipelineRun.state.in_(tuple(_ACTIVE)),
             PipelineRun.external_run_id.isnot(None),
         ).order_by(PipelineRun.created_at.asc()).limit(max(1, min(limit, 100))).all()

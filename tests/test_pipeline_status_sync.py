@@ -11,7 +11,7 @@ from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.orm import sessionmaker
 
 from videoroll.db.base import Base
-from videoroll.db.models import PipelineRun, SourceLicense, SourceType, Task, TaskStatus
+from videoroll.db.models import PipelineRun, SourceLicense, SourceType, SubtitleJob, Task, TaskStatus
 from videoroll.workflows import pipeline_status_sync as sync
 
 
@@ -22,7 +22,7 @@ def _sqlite_jsonb(_type, _compiler, **kwargs):
 
 def _factory():
     engine = create_engine('sqlite:///:memory:')
-    Base.metadata.create_all(engine, tables=[Task.__table__, PipelineRun.__table__])
+    Base.metadata.create_all(engine, tables=[Task.__table__, PipelineRun.__table__, SubtitleJob.__table__])
     factory = sessionmaker(bind=engine, expire_on_commit=False)
     with factory() as db:
         task = Task(source_type=SourceType.youtube, source_license=SourceLicense.authorized,
@@ -88,7 +88,7 @@ def test_reconcile_authoritative_success_failure_cancel_and_running(monkeypatch)
     monkeypatch.setattr(sync.httpx, 'Client', lambda **kwargs: real_client(
         transport=httpx.MockTransport(handler), timeout=kwargs.get('timeout', 8)))
     result = sync.reconcile_auto_pipeline_runs(_settings())
-    assert result == {'checked': 4, 'updated': 4, 'errors': 0}
+    assert result == {'checked': 4, 'updated': 4, 'errors': 0, 'stranded_jobs_failed': 0}
     assert 'external-3' not in seen
     rows = _runs(factory)
     assert [rows[f'external-{i}'][0] for i in range(5)] == [
@@ -99,6 +99,26 @@ def test_reconcile_authoritative_success_failure_cancel_and_running(monkeypatch)
     assert result['updated'] == 0
     with factory() as db:
         assert db.get(Task, task_id).status == TaskStatus.published
+    engine.dispose()
+
+
+def test_reconcile_completed_subtitle_child_workflow(monkeypatch):
+    engine, factory, task_id = _factory()
+    with factory() as db:
+        db.add(PipelineRun(
+            task_id=task_id, engine="hatchet", workflow_name="SubtitleJobV1",
+            state="submitted", external_run_id="subtitle-external",
+            request_json={"dispatch_key": "subtitle-test"},
+        ))
+        db.commit()
+    monkeypatch.setattr(sync, 'get_sessionmaker', lambda url: factory)
+    real_client = httpx.Client
+    monkeypatch.setattr(sync.httpx, 'Client', lambda **kwargs: real_client(
+        transport=httpx.MockTransport(lambda req: httpx.Response(
+            200, json={'status': 'COMPLETED' if 'subtitle-external' in str(req.url) else 'RUNNING'})), timeout=8))
+    result = sync.reconcile_auto_pipeline_runs(_settings())
+    assert result['checked'] == 5 and result['updated'] >= 1
+    assert _runs(factory)['subtitle-external'][0] == 'succeeded'
     engine.dispose()
 
 
