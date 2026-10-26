@@ -270,6 +270,86 @@ class YouTubePlaylistScanTests(TestCase):
             self.assertEqual(call.args[:2], ("playlist", "PL1234567890ABCDE"))
             self.assertIsNone(call.kwargs["limit"])
 
+    def test_scan_statistics_survive_failed_and_empty_scans(self) -> None:
+        source = YouTubeSource(
+            source_type=YouTubeSourceType.playlist,
+            source_id="PLscanStats123456789",
+            license=SourceLicense.authorized,
+            enabled=True,
+            scan_limit=2,
+            auto_process=False,
+        )
+        self.db.add(source)
+        self.db.commit()
+        self.db.refresh(source)
+
+        with (
+            patch("videoroll.apps.youtube_ingest.source_service.fetch_youtube_feed", return_value=self._playlist_entries()),
+            patch("videoroll.apps.youtube_ingest.source_service.get_youtube_settings", return_value={}),
+        ):
+            scan_youtube_source_by_id(self.db, source.id, user_agent="UA/1.0", force=True)
+        self.db.expire_all()
+        refreshed = self.db.get(YouTubeSource, source.id)
+        assert refreshed is not None
+        self.assertEqual(refreshed.last_scan_discovered_count, 5)
+        self.assertEqual(refreshed.last_nonempty_discovered_count, 5)
+        self.assertEqual(refreshed.total_created_count, 2)
+
+        with (
+            patch("videoroll.apps.youtube_ingest.source_service.fetch_youtube_feed", side_effect=RuntimeError("temporary error")),
+            patch("videoroll.apps.youtube_ingest.source_service.get_youtube_settings", return_value={}),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "temporary error"):
+                scan_youtube_source_by_id(self.db, source.id, user_agent="UA/1.0", force=True)
+        self.db.expire_all()
+        refreshed = self.db.get(YouTubeSource, source.id)
+        assert refreshed is not None
+        self.assertEqual(refreshed.last_scan_discovered_count, 5)
+        self.assertEqual(refreshed.last_nonempty_discovered_count, 5)
+        self.assertEqual(refreshed.total_failed_scan_count, 1)
+        self.assertIn("temporary error", refreshed.last_scan_error or "")
+
+        with (
+            patch("videoroll.apps.youtube_ingest.source_service.fetch_youtube_feed", return_value=[]),
+            patch("videoroll.apps.youtube_ingest.source_service.get_youtube_settings", return_value={}),
+        ):
+            scan_youtube_source_by_id(self.db, source.id, user_agent="UA/1.0", force=True)
+        # Rehydrate as after a service restart: counters must not depend on memory.
+        self.db.expunge_all()
+        refreshed = self.db.get(YouTubeSource, source.id)
+        assert refreshed is not None
+        self.assertEqual(refreshed.last_scan_discovered_count, 0)
+        self.assertEqual(refreshed.last_nonempty_discovered_count, 5)
+        self.assertEqual(refreshed.total_created_count, 2)
+        self.assertEqual(refreshed.total_scan_count, 2)
+        self.assertEqual(refreshed.total_failed_scan_count, 1)
+        self.assertIsNone(refreshed.last_scan_error)
+
+    def test_upgrade_preserves_previous_snapshot_before_empty_scan(self) -> None:
+        old_time = datetime.now(timezone.utc) - timedelta(days=1)
+        source = YouTubeSource(
+            source_type=YouTubeSourceType.channel,
+            source_id="UClegacyStatsTest123",
+            license=SourceLicense.authorized,
+            enabled=True,
+            auto_process=False,
+            last_scan_finished_at=old_time,
+            last_scan_discovered_count=401,
+        )
+        self.db.add(source)
+        self.db.commit()
+        with (
+            patch("videoroll.apps.youtube_ingest.source_service.fetch_youtube_feed", return_value=[]),
+            patch("videoroll.apps.youtube_ingest.source_service.get_youtube_settings", return_value={}),
+        ):
+            scan_youtube_source_by_id(self.db, source.id, user_agent="UA/1.0", force=True)
+        self.db.expunge_all()
+        refreshed = self.db.get(YouTubeSource, source.id)
+        assert refreshed is not None
+        self.assertEqual(refreshed.last_scan_discovered_count, 0)
+        self.assertEqual(refreshed.last_nonempty_discovered_count, 401)
+        self.assertEqual(refreshed.total_scan_count, 1)
+
     def test_selected_source_type_must_match_resolved_url(self) -> None:
         with patch("videoroll.apps.youtube_ingest.source_service.get_youtube_settings", return_value={}):
             with self.assertRaisesRegex(ValueError, "resolved as playlist"):

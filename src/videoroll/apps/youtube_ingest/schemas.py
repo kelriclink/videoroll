@@ -40,6 +40,12 @@ class YouTubeSourceRead(BaseModel):
     last_scan_started_pipeline_count: int = 0
     last_scan_skipped_duplicates: int = 0
     last_scan_error: Optional[str] = None
+    last_nonempty_scan_finished_at: Optional[datetime] = None
+    last_nonempty_discovered_count: int = 0
+    total_scan_count: int = 0
+    total_failed_scan_count: int = 0
+    total_created_count: int = 0
+    total_started_pipeline_count: int = 0
     created_at: datetime
     updated_at: datetime
 

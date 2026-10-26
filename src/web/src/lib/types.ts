@@ -177,6 +177,12 @@ export type YouTubeSource = {
   last_scan_started_pipeline_count: number;
   last_scan_skipped_duplicates: number;
   last_scan_error?: string | null;
+  last_nonempty_scan_finished_at?: string | null;
+  last_nonempty_discovered_count?: number;
+  total_scan_count?: number;
+  total_failed_scan_count?: number;
+  total_created_count?: number;
+  total_started_pipeline_count?: number;
   created_at: string;
   updated_at: string;
 };
