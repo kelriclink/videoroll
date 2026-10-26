@@ -13,6 +13,33 @@ from backend.app import runtime_security
 from backend.app.adapters import voxcpm as voxcpm_mod
 
 
+ORIGINAL_GPU_PREFLIGHT = voxcpm_mod._require_available_voxcpm_gpu_memory
+
+
+@pytest.fixture(autouse=True)
+def isolate_tts_gpu_preflight(monkeypatch):
+    # Existing synthesis unit tests must not depend on production GPU load.
+    monkeypatch.setattr(voxcpm_mod, "_require_available_voxcpm_gpu_memory", lambda: None)
+
+
+def test_gpu_preflight_disabled_by_default_without_querying_nvidia_smi(monkeypatch):
+    monkeypatch.delenv("VOXCPM_GPU_PREFLIGHT_ENABLED", raising=False)
+    def _unexpected_query(_name):
+        raise AssertionError("nvidia-smi queried despite preflight being disabled")
+    monkeypatch.setattr(voxcpm_mod.shutil, "which", _unexpected_query)
+    ORIGINAL_GPU_PREFLIGHT()  # must be a no-op even under GPU memory pressure
+
+
+def test_gpu_capacity_guard_blocks_model_initialization(monkeypatch):
+    import subprocess
+    monkeypatch.setenv("VOXCPM_GPU_PREFLIGHT_ENABLED", "1")
+    monkeypatch.setattr(voxcpm_mod.shutil, "which", lambda _name: "/usr/bin/nvidia-smi")
+    monkeypatch.setattr(subprocess, "run", lambda *a, **kw: subprocess.CompletedProcess(a, 0, stdout="7100\n"))
+    monkeypatch.setenv("VOXCPM_MIN_FREE_GPU_MIB", "9216")
+    with pytest.raises(RuntimeError, match="VOXCPM_GPU_MEMORY_BUSY"):
+        ORIGINAL_GPU_PREFLIGHT()
+
+
 def test_release_model_clears_cached_model(monkeypatch):
     model = object()
     monkeypatch.setattr(voxcpm_mod, "_MODEL", model)

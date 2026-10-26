@@ -62,10 +62,12 @@ def test_format_selector_only_chooses_aria_for_big_http_objects():
     settings = Settings()
     opts = yd.build_ydl_opts(settings, for_download=True)
     assert opts["videoroll_parallel_connections"] == 8
+    assert opts["concurrent_fragment_downloads"] == 8
     assert opts["external_downloader"]["https"] == "videoroll-aria2c"
     for protocol, size, expected in (
         ("https", 350_000_000, VideoRollAria2cFD),
         ("https", 10_000_000, None),
+        ("https", 65_000_000, VideoRollAria2cFD),
         ("http_dash_segments", 350_000_000, None),
         ("m3u8_native", 350_000_000, None),
     ):
@@ -74,10 +76,24 @@ def test_format_selector_only_chooses_aria_for_big_http_objects():
         downloader = get_suitable_downloader(info, opts)
         assert (downloader is VideoRollAria2cFD) == (expected is not None)
     settings.youtube_parallel_download_enabled = False
-    assert "external_downloader" not in yd.build_ydl_opts(settings, for_download=True)
+    disabled = yd.build_ydl_opts(settings, for_download=True)
+    assert "external_downloader" not in disabled
+    assert disabled["concurrent_fragment_downloads"] == 1
     settings.youtube_parallel_download_enabled = True
     settings.youtube_proxy = "socks5://127.0.0.1:1080"
     assert "external_downloader" not in yd.build_ydl_opts(settings, for_download=True)
+
+
+def test_unknown_size_direct_http_uses_aria2_and_dash_obeys_config():
+    if not register_parallel_downloader():
+        pytest.skip("aria2c not installed")
+    settings = Settings(youtube_parallel_download_connections=16)
+    opts = yd.build_ydl_opts(settings, for_download=True)
+    assert opts["concurrent_fragment_downloads"] == 16
+    assert get_suitable_downloader({"url": "https://example.test/movie.webm",
+        "protocol": "https", "ext": "webm"}, opts) is VideoRollAria2cFD
+    assert get_suitable_downloader({"url": "https://example.test/seg.m4s",
+        "protocol": "http_dash_segments", "ext": "webm"}, opts) is not VideoRollAria2cFD
 
 
 def test_parse_aria_progress_with_eta():

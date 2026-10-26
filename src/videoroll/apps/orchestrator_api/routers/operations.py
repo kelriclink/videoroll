@@ -47,11 +47,12 @@ def put_ai_usage_pricing(payload: AIUsagePricingRead, db: Session = Depends(get_
 def get_alerts(
     status: str = Query(default="all"),
     limit: int = Query(default=200, ge=1, le=1000),
+    task_id: uuid.UUID | None = Query(default=None),
     db: Session = Depends(get_db),
 ) -> list[AlertRead]:
     if status not in {"all", "active", "open", "acknowledged", "resolved"}:
         raise HTTPException(status_code=400, detail="invalid alert status")
-    return [AlertRead(**row) for row in operations_service.list_alerts(db, status=status, limit=limit)]
+    return [AlertRead(**row) for row in operations_service.list_alerts(db, status=status, limit=limit, task_id=task_id)]
 
 
 @router.post("/alerts/scan", response_model=AlertScanResponse)

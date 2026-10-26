@@ -20,6 +20,7 @@ from sqlalchemy.orm import Session
 
 from videoroll.ai.service import AIService
 from videoroll.apps.bilibili_publisher.auth_settings_store import get_bilibili_cookie_header, get_bilibili_csrf_token
+from videoroll.apps.bilibili_publisher.publish_settings_store import get_bilibili_publish_settings
 from celery.exceptions import Retry
 
 from videoroll.apps.bilibili_publisher.bilibili_web_client import BilibiliDescTooLongError, BilibiliRateLimitError, BilibiliWebClient
@@ -753,13 +754,16 @@ def _process_job_impl(self, job_id: str) -> dict[str, Any]:
     submit_throttle: dict[str, Any] | None = None
     job_hb: JobLeaseHeartbeat | None = None
     lease_owner: str | None = None
+    # The archive POST has no idempotency key. Once attempted, an exception
+    # cannot prove that Bilibili rejected it (including a response timeout).
+    archive_submission_started = False
     try:
         job_uuid = uuid.UUID(job_id)
         job = db.get(PublishJob, job_uuid)
         if not job:
             return {"status": "not_found"}
 
-        if job.state in (PublishState.published, PublishState.failed):
+        if job.state in (PublishState.published, PublishState.failed, PublishState.unknown):
             return {"status": "skipped", "state": job.state.value}
 
         candidate_owner = f"bilibili_publisher.process_job:{os.getpid()}:{uuid.uuid4().hex[:12]}"
@@ -864,6 +868,7 @@ def _process_job_impl(self, job_id: str) -> dict[str, Any]:
             completed_bytes = 0
             uploaded_parts: list[tuple[Any, str]] = []
             uploaded_debugs: list[dict[str, Any]] = []
+            upload_workers = get_bilibili_publish_settings(db)["upload_workers"]
             for part_path, part_title in video_part_paths:
                 offset = completed_bytes
                 part_upload, part_debug = client.upload_video_file(
@@ -871,6 +876,7 @@ def _process_job_impl(self, job_id: str) -> dict[str, Any]:
                     on_progress=lambda completed, _part_total, offset=offset: persist_upload_progress(
                         offset + completed, total_part_bytes,
                     ),
+                    upload_workers=upload_workers,
                 )
                 uploaded_parts.append((part_upload, part_title))
                 uploaded_debugs.append(part_debug)
@@ -979,6 +985,7 @@ def _process_job_impl(self, job_id: str) -> dict[str, Any]:
             )
 
             submit_throttle = _apply_publish_stage_throttle(db, stage="submit", job_id=job_id)
+            archive_submission_started = True
             add_resp, meta, desc_retry = _add_archive_with_desc_retry(
                 client=client,
                 meta=meta,
@@ -1214,15 +1221,27 @@ def _process_job_impl(self, job_id: str) -> dict[str, Any]:
     except Exception as e:
         logger.exception("bilibili publish failed (job_id=%s)", job_id)
         tb = traceback.format_exc(limit=30)
+        # An archive response timeout, broken connection or even a DB failure
+        # after receiving an archive ID cannot safely be treated as a reject.
+        uncertain = archive_submission_started
         try:
+            db.rollback()
             if job_uuid is None:
                 job_uuid = uuid.UUID(job_id)
             if job is None:
                 job = db.get(PublishJob, job_uuid)
             if job:
-                job.state = PublishState.failed
+                # A successful archive may already have committed to this DB.
+                # Never downgrade the persisted published state on later errors.
+                if job.state == PublishState.published:
+                    return {"status": "ok", "aid": job.aid, "bvid": job.bvid}
+                job.state = PublishState.unknown if uncertain else PublishState.failed
                 job.upload_active = False
-                job.response_json = {"error": str(e), "exception_type": type(e).__name__, "traceback": tb}
+                job.response_json = {
+                    "error": str(e), "exception_type": type(e).__name__, "traceback": tb,
+                    **({"recovery": "unknown", "requires_manual_confirmation": True,
+                        "reason": "Bilibili archive submission outcome cannot be confirmed"} if uncertain else {}),
+                }
                 job.updated_at = _utcnow()
                 db.add(job)
             if task is None and job:
@@ -1232,8 +1251,11 @@ def _process_job_impl(self, job_id: str) -> dict[str, Any]:
                 cleanup_enqueued = _reconcile_batch_after_publish_job(db, job)
             elif task and _can_mark_task_publish_failed(db, task):
                 task.status = TaskStatus.failed
-                task.error_code = "PUBLISH_FAILED"
-                task.error_message = str(e)
+                task.error_code = "PUBLISH_OUTCOME_UNKNOWN" if uncertain else "PUBLISH_FAILED"
+                task.error_message = (
+                    "Bilibili may have accepted this submission. Verify the account's archives before retrying."
+                    if uncertain else str(e)
+                )
                 db.add(task)
             if store is None:
                 store = FileStore(settings)
@@ -1252,7 +1274,7 @@ def _process_job_impl(self, job_id: str) -> dict[str, Any]:
                 enqueue_publish_batch_cleanup(db, celery_app, task.id, job.batch_id, needed=cleanup_enqueued)
         except Exception:
             pass
-        return {"status": "error", "detail": str(e)}
+        return {"status": "unknown" if uncertain else "error", "detail": str(e)}
     finally:
         if job_hb is not None:
             job_hb.stop()

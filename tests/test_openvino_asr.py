@@ -204,9 +204,33 @@ class OpenVinoAsrTests(unittest.TestCase):
                 model_name="/models/whisper/whisper-large-v3-ov",
             )
 
-        self.assertEqual([(seg.start, seg.end) for seg in segments], [(1.25, 2.5), (3.25, 4.5)])
+        self.assertEqual([(seg.start, seg.end) for seg in segments], [(1.25, 2.0), (3.25, 4.0)])
         self.assertEqual([len(call["raw_speech_input"]) for call in fake_pipeline.calls], [16000, 16000])
 
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_openvino_hallucination_filter_rejects_nasa_music_asr():
+    cues = [
+        processing.Segment(start=0.0, end=5.0, text="The"),
+        processing.Segment(start=5.0, end=34.98, text="Thank you."),
+        processing.Segment(start=35.0, end=64.98, text="Thank you."),
+        processing.Segment(start=65.0, end=94.98, text="Thank you."),
+    ]
+    filtered = processing._filter_openvino_hallucinations(cues, audio_duration=83.3)
+    assert filtered == []  # also reject the five-second lone "The" hallucination
+
+
+def test_openvino_hallucination_filter_retains_real_short_speech():
+    cues = [processing.Segment(start=2.0, end=4.8, text="It is a NASA mission."),
+            processing.Segment(start=7.5, end=8.8, text="Thank you.")]
+    assert processing._filter_openvino_hallucinations(cues, audio_duration=9.0) == cues
+
+
+def test_openvino_enabled_vad_fails_closed_on_import_error():
+    from unittest.mock import patch
+    with patch.dict(sys.modules, {"faster_whisper": None}):
+        with unittest.TestCase().assertRaisesRegex(RuntimeError, "Silero VAD is enabled"):
+            processing._detect_silero_speech_spans([0.01] * 1600, required=True)

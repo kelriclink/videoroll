@@ -285,6 +285,7 @@ def cleanup_terminal_task_resources(
     removed database asset rows without reliably deleting their files; those
     orphaned raw/final files cannot be found by querying ``assets``.
     """
+    now = now or utcnow()
     owner = f"{owner_prefix}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
     if not _try_acquire_resource_cleanup_lock(db, owner=owner, ttl_seconds=STORAGE_RESOURCE_CLEANUP_LOCK_TTL_SECONDS):
         return None
@@ -296,7 +297,7 @@ def cleanup_terminal_task_resources(
             _all_terminal_task_filter()
             if cleanup_all_terminal
             else _scheduled_resource_cleanup_filter(
-                now=now or utcnow(),
+                now=now,
                 published_older_than_days=published_older_than_days,
                 failed_older_than_hours=failed_older_than_hours,
             )
@@ -310,7 +311,7 @@ def cleanup_terminal_task_resources(
                 DubbingJob.task_id == Task.id,
                 (
                     DubbingJob.status.in_([
-                        "queued", "preparing", "synthesizing", "aligning", "mixing",
+                        "queued", "preparing", "synthesizing", "aligning", "mixing", "rendering",
                         "pause_requested", "cancel_requested",
                     ])
                     | (

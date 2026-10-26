@@ -128,3 +128,17 @@ class ProcessingAsrSilenceTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_openvino_music_only_vad_empty_means_zero_cues_without_gpu():
+    with tempfile.TemporaryDirectory() as directory:
+        audio = Path(directory) / "music.wav"
+        with wave.open(str(audio), "wb") as target:
+            target.setnchannels(1); target.setsampwidth(2); target.setframerate(16000)
+            target.writeframes(b"\x00\x08" * 32000)
+        with (
+            patch.object(processing, "_detect_silero_speech_spans", return_value=[]),
+            patch.object(processing, "_get_openvino_pipeline", side_effect=AssertionError("No GPU ASR on music")),
+        ):
+            result = processing.transcribe_openvino_whisper(audio, model_name="/models/whisper")
+        assert result == []

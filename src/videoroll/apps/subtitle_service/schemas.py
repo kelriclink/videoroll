@@ -323,7 +323,7 @@ class TranslateSettingsRead(BaseModel):
     index_timeout_seconds: float = 120.0
     index_max_tokens: int = 4096
     index_batch_size: int = 12
-    index_context_chars: int = 48000
+    index_context_chars: int = 6000
     index_domain: str = "视频字幕"
     index_glossary: str = ""
     index_instruction: str = ""

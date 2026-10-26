@@ -246,6 +246,26 @@ def subtitle_filter(video_file: Path, subtitle_file: Path, session: Path) -> str
     return f"subtitles=filename='{sub_path}':force_style='{style}'"
 
 
+def mix_dubbing_audio(dubbing_file: Path, bgm_file: Path, session: Path) -> Path:
+    """Mix both audio stems without touching encoded video frames."""
+    tmp_dir = session / "tmp"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    output = (tmp_dir / "audio_mixed.m4a").resolve()
+    pending = (tmp_dir / "audio_mixed.pending.m4a").resolve()
+    try:
+        subprocess.run([
+            ffmpeg_binary(), "-y", "-i", str(dubbing_file.resolve()),
+            "-i", str(bgm_file.resolve()), "-filter_complex",
+            "[0:a]volume=1.0[a0];[1:a]volume=0.30[a1];"
+            "[a0][a1]amix=inputs=2:duration=longest:normalize=0[aout]",
+            "-map", "[aout]", "-c:a", "aac", str(pending),
+        ], check=True)
+        pending.replace(output)
+        return output
+    finally:
+        pending.unlink(missing_ok=True)
+
+
 def merge_video(
     video_file: Path,
     dubbing_file: Path | None,
@@ -276,27 +296,7 @@ def merge_video(
     if include_dubbing:
         assert dubbing_file is not None
         assert bgm_file is not None
-        dubbing_input = dubbing_file.resolve()
-        bgm_input = bgm_file.resolve()
-        mixed_audio_output = (tmp_dir / "audio_mixed.m4a").resolve()
-        subprocess.run(
-            [
-                ffmpeg_binary(),
-                "-y",
-                "-i",
-                str(dubbing_input),
-                "-i",
-                str(bgm_input),
-                "-filter_complex",
-                "[0:a]volume=1.0[a0];[1:a]volume=0.30[a1];[a0][a1]amix=inputs=2:duration=longest:normalize=0[aout]",
-                "-map",
-                "[aout]",
-                "-c:a",
-                "aac",
-                str(mixed_audio_output),
-            ],
-            check=True,
-        )
+        mixed_audio_output = mix_dubbing_audio(dubbing_file, bgm_file, session)
 
     temporary_video = media_dir / f".video_final.{uuid.uuid4().hex}.mp4"
     try:

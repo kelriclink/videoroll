@@ -408,7 +408,6 @@ def test_internal_gateway_client_rejects_unexpected_dotless_hostname() -> None:
     "gateway_url",
     [
         "http://10.0.0.8:8020",
-        "http://127.0.0.1:8020",
         "http://localhost:8020",
     ],
 )
@@ -417,6 +416,14 @@ def test_internal_gateway_client_rejects_hosts_outside_exact_allowlist(gateway_u
 
     with pytest.raises(EgressGatewayError, match="allowed hostname"):
         EgressGatewayClient(gateway_url, "service-token")
+
+
+@pytest.mark.parametrize("gateway_url", ["http://127.0.0.1:8020", "http://[::1]:8020"])
+def test_native_gateway_client_allows_explicit_loopback(gateway_url: str) -> None:
+    from videoroll.apps.egress_gateway.client import EgressGatewayClient
+
+    with EgressGatewayClient(gateway_url, "service-token") as client:
+        assert client.fetch_url.endswith(":8020/fetch")
 
 
 @pytest.fixture

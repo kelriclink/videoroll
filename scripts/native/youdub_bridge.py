@@ -17,6 +17,7 @@ from pathlib import Path
 import shutil
 import sqlite3
 import sys
+import time
 import uuid
 from urllib.parse import quote
 
@@ -70,7 +71,13 @@ def prepare() -> dict:
     return {"runtime": str(RUNTIME), "version": version, "changed": True}
 
 
-def load_upstream():
+def load_upstream(*, initialize_db: bool = False):
+    """Load the runtime without DDL for status and resume operations.
+
+    Schema initialization writes SQLite even when tables already exist. Doing
+    this on every 5s status poll contends with YouDub pipeline's real writes.
+    Only creating a new task may initialize the existing schema.
+    """
     if not (RUNTIME / "backend/app/pipeline.py").is_file():
         raise RuntimeError("Run --prepare first")
     sys.path.insert(0, str(RUNTIME))
@@ -78,7 +85,8 @@ def load_upstream():
     os.environ.setdefault("MODEL_CACHE_DIR", str(RUNTIME / "models"))
     from backend.app import config, database, pipeline
     config.ensure_runtime_dirs()
-    database.init_db()
+    if initialize_db:
+        database.init_db()
     return config, database, pipeline
 
 
@@ -88,7 +96,7 @@ def create(video: Path, srt: Path, *, direction: str = "en-zh",
         raise ValueError("Unsupported YouDub language direction")
     if not video.is_file() or video.stat().st_size < 1024 or not srt.is_file():
         raise ValueError("Missing or empty video/SRT")
-    config, database, _ = load_upstream()
+    config, database, _ = load_upstream(initialize_db=True)
     from backend.app.adapters.local_video import uploaded_video_dir
     from backend.app.adapters.local_subtitles import uploaded_subtitle_dir, parse_srt
     from backend.app.youtube import LOCAL_UPLOAD_DIRECTIONS
@@ -115,7 +123,16 @@ def create(video: Path, srt: Path, *, direction: str = "en-zh",
 def status(task_id: str) -> dict:
     _, database, _ = load_upstream()
     task_id = str(uuid.UUID(task_id))
-    task = database.get_task(task_id)
+    for attempt in range(4):
+        try:
+            task = database.get_task(task_id)
+            break
+        except sqlite3.OperationalError as exc:
+            if "locked" not in str(exc).lower() or attempt == 3:
+                raise
+            # This is an ordinary read; a concurrent SQLite writer may hold
+            # the database briefly while finishing a stage checkpoint.
+            time.sleep(0.25 * (attempt + 1))
     if not task:
         raise LookupError(f"Unknown YouDub task {task_id}")
     return {

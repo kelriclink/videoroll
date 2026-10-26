@@ -138,6 +138,21 @@ def test_select_device_prefers_idle_compatible_gpu() -> None:
     assert select_device([gpu0, gpu1], active, spec).id == gpu1.id
 
 
+def test_burn_in_prefers_idle_vaapi_overlay_over_cpu_ass_nvenc() -> None:
+    from videoroll.apps.orchestrator_api.render_worker_schemas import RenderSpec
+    from videoroll.apps.render_worker.runtime import ActiveExecution, RenderDevice, select_device
+    import threading
+
+    intel = RenderDevice(id="vaapi:0000:01:00.0", name="Intel A380", backend="vaapi", encoders=("h264_vaapi",))
+    nvidia = RenderDevice(id="nvidia:GPU-v100", name="NVIDIA V100", backend="nvidia", encoders=("h264_nvenc",))
+    spec = RenderSpec(render_job_id=uuid.uuid4(), task_id=uuid.uuid4(), mode="burn_in",
+                      request={"render": {"video_codec": "h264"}})
+    assert select_device([nvidia, intel], {}, spec).id == intel.id
+    # Keep both GPUs available: prefer the free NVIDIA encoder when Intel is busy.
+    active = {uuid.uuid4(): ActiveExecution(thread=threading.Thread(), device=intel)}
+    assert select_device([nvidia, intel], active, spec).id == nvidia.id
+
+
 def test_select_device_filters_by_codec_capability() -> None:
     from videoroll.apps.orchestrator_api.render_worker_schemas import RenderSpec
     from videoroll.apps.render_worker.runtime import RenderDevice, select_device
@@ -398,3 +413,142 @@ def test_process_runner_parses_ffmpeg_style_progress_pipe() -> None:
     assert metrics["render_percent"] == 20.0
     assert metrics["eta_seconds"] == pytest.approx(5.333, abs=0.001)
     assert metrics["total_size"] == 1234
+
+
+def test_durable_render_output_cache_reused_only_for_matching_spec(tmp_path: Path, monkeypatch) -> None:
+    from videoroll.apps.orchestrator_api.render_worker_schemas import ArtifactSpec, RenderSpec
+    from videoroll.apps.render_worker import runtime as mod
+    monkeypatch.setattr(mod, "probe_capabilities", lambda *_: ({}, {}, []))
+    runtime = RenderWorkerRuntime(settings(tmp_path))
+    task_id = uuid.uuid4()
+    render_job_id = uuid.uuid4()
+    artifact = ArtifactSpec(role="input", storage_key="raw/a.mp4", sha256="sha123", size_bytes=1234,
+                            download_url="http://example.invalid/input")
+    spec = RenderSpec(task_id=task_id, render_job_id=render_job_id, mode="burn_in",
+                      request={"render": {"video_codec": "av1"}}, artifacts=[artifact])
+    output = tmp_path / "completed.mp4"
+    output.write_bytes(b"complete render stream, ready to upload" * 25)
+    cached = runtime._persist_cached_output(spec, output)
+    assert cached.is_file() and not output.exists()
+    assert cached.is_relative_to(tmp_path / "work" / "_render_output_cache")
+    assert runtime._load_cached_output(spec) == cached
+    unrelated = spec.model_copy(update={"request": {"render": {"video_codec": "h264"}}})
+    assert runtime._load_cached_output(unrelated) is None
+    other_input = spec.model_copy(update={"artifacts": [artifact.model_copy(update={"sha256": "changed"})]})
+    assert runtime._load_cached_output(other_input) is None
+    # A partial/corrupt output must never be handed to downstream posting.
+    cached.write_bytes(b"truncated")
+    assert runtime._load_cached_output(spec) is None
+    runtime._clear_cached_output(spec)
+    assert not cached.exists()
+
+
+def test_upload_retries_same_completed_file_and_checks_if_server_already_accepted(tmp_path: Path, monkeypatch) -> None:
+    import httpx
+    from videoroll.apps.render_worker import runtime as mod
+    monkeypatch.setattr(mod, "probe_capabilities", lambda *_: ({}, {}, []))
+    monkeypatch.setattr(mod.time, "sleep", lambda _: None)
+    runtime = RenderWorkerRuntime(settings(tmp_path))
+    runtime.identity = WorkerIdentity(uuid.uuid4(), "fake-secret")
+    output = tmp_path / "complete.mp4"
+    output.write_bytes(b"valid-completed-output")
+    job_id = uuid.uuid4()
+    state = {"posts": 0, "gets": 0, "registered": False}
+
+    def respond(req):
+        if req.method == "GET":
+            state["gets"] += 1
+            return httpx.Response(200, json={"id": str(job_id)}) if state["registered"] else httpx.Response(404)
+        assert req.method == "POST"
+        assert b"valid-completed-output" in req.content
+        state["posts"] += 1
+        if state["posts"] == 1:
+            return httpx.Response(500, text="simulated HTTP 500")
+        state["registered"] = True
+        return httpx.Response(200, json={"id": str(job_id)})
+
+    original_client = httpx.Client
+    monkeypatch.setattr(mod.httpx, "Client", lambda **kwargs: original_client(
+        transport=httpx.MockTransport(respond), timeout=kwargs.get("timeout")))
+    assert runtime._upload_output(uuid.uuid4(), "test-fence", output) == job_id
+    assert state["posts"] == 2 and state["gets"] >= 2
+    assert output.read_bytes() == b"valid-completed-output"
+
+    # Ambiguous first-POST 500 with a committed DB response: GET confirms
+    # registration and avoids the second POST/duplicate asset.
+    state.update(posts=0, gets=0, registered=False)
+    def committed_but_500(req):
+        if req.method == "GET":
+            state["gets"] += 1
+            return httpx.Response(200, json={"id": str(job_id)}) if state["registered"] else httpx.Response(404)
+        state["posts"] += 1
+        state["registered"] = True
+        return httpx.Response(500, text="connection failed after DB commit")
+    monkeypatch.setattr(mod.httpx, "Client", lambda **kwargs: original_client(
+        transport=httpx.MockTransport(committed_but_500), timeout=kwargs.get("timeout")))
+    assert runtime._upload_output(uuid.uuid4(), "test-fence", output) == job_id
+    assert state["posts"] == 1 and state["gets"] == 2
+
+
+def test_failed_render_retry_keeps_only_validated_cached_output(tmp_path: Path, monkeypatch) -> None:
+    from videoroll.apps.orchestrator_api.render_worker_schemas import RenderSpec
+    from videoroll.apps.render_worker import runtime as mod
+    monkeypatch.setattr(mod, "probe_capabilities", lambda *_: ({}, {}, []))
+    runtime = RenderWorkerRuntime(settings(tmp_path))
+    spec = RenderSpec(task_id=uuid.uuid4(), render_job_id=uuid.uuid4(), mode="burn_in", request={})
+    raw = tmp_path / "finished.mp4"
+    raw.write_bytes(b"completed av1 video")
+    target = runtime._persist_cached_output(spec, raw)
+    assert target.exists()
+    # The original execution working directory may be removed by the worker;
+    # the durable per-job verified output survives attempts/restarts.
+    (tmp_path / "work" / "execution-1").mkdir()
+    (tmp_path / "work" / "execution-1" / "input.webm").write_bytes(b"discard")
+    import shutil
+    shutil.rmtree(tmp_path / "work" / "execution-1")
+    restarted = RenderWorkerRuntime(settings(tmp_path))
+    assert restarted._load_cached_output(spec) == target
+
+
+def test_stale_cache_expiration_only_owns_render_cache(tmp_path: Path, monkeypatch) -> None:
+    from videoroll.apps.render_worker import runtime as mod
+    monkeypatch.setattr(mod, "probe_capabilities", lambda *_: ({}, {}, []))
+    work = tmp_path / "work"
+    stale = work / "_render_output_cache" / "old-job"
+    stale.mkdir(parents=True)
+    video = stale / "fingerprint.mp4"
+    manifest = stale / "fingerprint.mp4.json"
+    video.write_bytes(b"completed but expired")
+    manifest.write_text('{}')
+    legacy = work / "active-execution"
+    legacy.mkdir()
+    (legacy / "video_burnin.mp4").write_bytes(b"in progress; must never prune")
+    import os
+    previous = time.time() - 73 * 3600
+    os.utime(manifest, (previous, previous))
+    runtime = RenderWorkerRuntime(settings(tmp_path))
+    assert not video.exists() and not manifest.exists()
+    assert (legacy / "video_burnin.mp4").exists()
+
+
+def test_generated_ass_cache_is_stable_across_executions_only_when_same_bytes(tmp_path: Path, monkeypatch) -> None:
+    from videoroll.apps.orchestrator_api.render_worker_schemas import ArtifactSpec, RenderSpec
+    from videoroll.apps.render_worker import runtime as mod
+    monkeypatch.setattr(mod, "probe_capabilities", lambda *_: ({}, {}, []))
+    runner = RenderWorkerRuntime(settings(tmp_path))
+    uid_a, uid_b = uuid.uuid4(), uuid.uuid4()
+    job_id, task_id = uuid.uuid4(), uuid.uuid4()
+    digest = "a" * 64
+    def make_spec(eid, sha):
+        ass_key = f"render-input/{eid}/subtitle_runtime.ass"
+        return RenderSpec(task_id=task_id, render_job_id=job_id, mode="burn_in",
+                          request={"ass_key": ass_key, "render": {"video_codec": "av1"}},
+                          artifacts=[ArtifactSpec(role="ass", storage_key=ass_key,
+                                                  sha256=sha, size_bytes=92122,
+                                                  download_url=f"http://example.invalid/{eid}")])
+    old, new = make_spec(uid_a,digest),make_spec(uid_b,digest)
+    assert runner._render_cache_path(old) == runner._render_cache_path(new)
+    assert runner._render_cache_path(old) != runner._render_cache_path(make_spec(uid_b,"b"*64))
+    # Without a hash, reusing output across different execution-scoped paths
+    # is unsafe and must fail closed.
+    assert runner._render_cache_path(make_spec(uid_a,None)) != runner._render_cache_path(make_spec(uid_b,None))

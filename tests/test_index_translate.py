@@ -195,3 +195,44 @@ def test_index_and_openai_checkpoints_are_isolated(tmp_path):
     checkpoint.save("source.json", translations, summary="old", provider="openai")
     assert checkpoint.load_with_context(
         source, source_segments_key="source.json", provider="index_translate")[0] == []
+
+
+def test_index_public_gateway_token_overflow_retries_with_shorter_reference(monkeypatch):
+    import httpx
+
+    source = [Segment(float(i), float(i + 1), f"unique segment {i} " + "hello " * 12) for i in range(100)]
+    attempted = []
+
+    def fake_call(messages, _cfg, *, expect_json):
+        prompt = messages[0]["content"]
+        attempted.append(len(prompt))
+        if len(prompt) > 3800:
+            request = httpx.Request("POST", index_translate.INDEX_API_BASE + "/chat/completions")
+            response = httpx.Response(400, request=request,
+                json={"detail": "输入 Token 数量超过限制 (当前约 36564 tokens, 上限 16384)"})
+            raise httpx.HTTPStatusError("token limit", request=request, response=response)
+        rows = json.loads(messages[1]["content"].split("\n", 1)[1])
+        return json.dumps({"translations": [{"idx": row["idx"], "text": "译文"} for row in rows]})
+
+    monkeypatch.setattr(index_translate, "_call", fake_call)
+    translated = index_translate.translate_subtitles_index(
+        source, target_lang="zh", style="口语自然",
+        settings={"index_context_chars": 48000}, batch_size=12)
+    assert len(translated) == len(source)
+    assert attempted[1] < attempted[0]
+    assert max(attempted) < 8000
+
+
+def test_index_accepts_numbered_json_object_without_extra_calls(monkeypatch, source):
+    calls = []
+
+    def fake_call(messages, *_args, **_kwargs):
+        rows = json.loads(messages[1]["content"].split("\n", 1)[1])
+        calls.append([row["idx"] for row in rows])
+        return json.dumps({str(row["idx"]): "译文" + str(row["idx"]) for row in rows})
+
+    monkeypatch.setattr(index_translate, "_call", fake_call)
+    output = index_translate.translate_subtitles_index(
+        source, target_lang="zh", style="自然", settings={}, batch_size=3)
+    assert calls == [[1, 2, 3]]
+    assert [row.text for row in output] == ["译文1", "译文2", "译文3"]

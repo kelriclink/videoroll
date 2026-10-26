@@ -54,6 +54,19 @@ def test_native_upstream_task_create_and_read(tmp_path, monkeypatch):
         "download", "separate", "asr",
     ]
     assert (bridge.RUNTIME / "data/youdub.sqlite").is_file()
+    # An active pipeline writer holding a RESERVED lock must not turn --status
+    # into a DDL/schema migration. Previous status() called init_db() and
+    # blocked for five seconds before failing with database is locked.
+    db_file = bridge.RUNTIME / "data/youdub.sqlite"
+    writer = sqlite3.connect(db_file, timeout=0.25)
+    try:
+        writer.execute("BEGIN IMMEDIATE")
+        writer.execute("UPDATE tasks SET title=title WHERE id=?", (report["id"],))
+        live_status = bridge.status(report["id"])
+        assert live_status["status"] == "queued"
+    finally:
+        writer.rollback()
+        writer.close()
     uploaded = bridge.RUNTIME / "workfolder/_uploads" / report["id"] / "video/source.mp4"
     assert uploaded.read_bytes() == source.read_bytes()
     assert uploaded.stat().st_nlink == 1

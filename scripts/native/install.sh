@@ -251,6 +251,9 @@ elif [[ "$ASR_RUNTIME" == "openvino" ]]; then
   # allowing pip to select 2026.4.1 core breaks imports at runtime.
   "$VENV_ROOT/subtitle/bin/pip" install -c "$ROOT_DIR/requirements.lock" "$ROOT_DIR"
   "$VENV_ROOT/subtitle/bin/pip" install "openvino==2026.4.0" "openvino-tokenizers==2026.4.0.0" "openvino-genai==2026.4.0.0"
+  # OpenVINO Whisper uses Silero VAD from faster-whisper even when it never
+  # uses CTranslate2 transcription. Without it VAD was silently bypassed.
+  "$VENV_ROOT/subtitle/bin/pip" install -c "$ROOT_DIR/requirements.lock" "faster-whisper==1.2.1"
 else
   "$VENV_ROOT/subtitle/bin/pip" install -c "$ROOT_DIR/requirements.lock" "$ROOT_DIR"
 fi
@@ -268,6 +271,7 @@ elif [[ "$ASR_RUNTIME" == "openvino" ]]; then
   # allowing pip to select 2026.4.1 core breaks imports at runtime.
   "$VENV_ROOT/subtitle-workflow/bin/pip" install -c "$ROOT_DIR/requirements.lock" "$ROOT_DIR"
   "$VENV_ROOT/subtitle-workflow/bin/pip" install "openvino==2026.4.0" "openvino-tokenizers==2026.4.0.0" "openvino-genai==2026.4.0.0"
+  "$VENV_ROOT/subtitle-workflow/bin/pip" install -c "$ROOT_DIR/requirements.lock" "faster-whisper==1.2.1"
 else
   "$VENV_ROOT/subtitle-workflow/bin/pip" install -c "$ROOT_DIR/requirements.lock" "$ROOT_DIR"
 fi

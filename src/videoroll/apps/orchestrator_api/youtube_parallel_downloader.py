@@ -1,7 +1,8 @@
 """Bounded aria2c Range downloader for large progressive HTTP YouTube assets.
 
 yt-dlp remains responsible for extraction, auth, muxing and format selection.
-Only direct HTTP(S) objects above 128 MiB are eligible. All output is parsed
+Direct HTTP(S) media uses aria2c when large enough or size is unknown.
+Fragmented DASH/HLS media uses yt-dlp native concurrent fragment downloads. All output is parsed
 locally; sanitized progress is sent to the existing yt-dlp progress hooks.
 """
 from __future__ import annotations
@@ -17,7 +18,7 @@ from typing import Any
 
 from yt_dlp.downloader import external
 
-MIN_PARALLEL_BYTES = 128 * 1024 * 1024
+MIN_PARALLEL_BYTES = 24 * 1024 * 1024
 _GIB_UNITS = {"B": 1, "KiB": 1024, "MiB": 1024**2, "GiB": 1024**3,
               "KB": 1000, "MB": 1000**2, "GB": 1000**3}
 _AMOUNT = re.compile(r"(?P<number>[0-9]+(?:\.[0-9]+)?)(?P<unit>GiB|MiB|KiB|GB|MB|KB|B)")
@@ -70,17 +71,17 @@ class VideoRollAria2cFD(external.Aria2cFD):
     @classmethod
     def can_download(cls, info_dict, path=None):
         protocol = str(info_dict.get("protocol") or "")
-        size = info_dict.get("filesize") or info_dict.get("filesize_approx") or 0
-        try:
-            size = int(size)
-        except (TypeError, ValueError):
+        if protocol not in ("http", "https") or info_dict.get("is_live"):
             return False
-        return (
-            protocol in ("http", "https")
-            and not info_dict.get("is_live")
-            and size >= MIN_PARALLEL_BYTES
-            and super().can_download(info_dict, "aria2c")
-        )
+        size = info_dict.get("filesize") or info_dict.get("filesize_approx")
+        try:
+            estimated_size = int(size) if size is not None else None
+        except (TypeError, ValueError):
+            estimated_size = None
+        # The extractor often knows a direct signed media URL but not its
+        # content length. aria2c resolves length and Range support itself;
+        # the independent native attempt handles unsupported servers.
+        return (estimated_size is None or estimated_size >= MIN_PARALLEL_BYTES) and super().can_download(info_dict, "aria2c")
 
     def _make_cmd(self, tmpfilename, info_dict):
         cmd = super()._make_cmd(tmpfilename, info_dict)
@@ -112,11 +113,12 @@ class VideoRollAria2cFD(external.Aria2cFD):
         last_bytes = 0
         last_time = time.monotonic()
         sent_at = 0.0
+        last_connections: int | None = None
         logs: list[str] = []
         fragments = bytearray()
 
         def report(values: dict[str, Any], *, force: bool = False):
-            nonlocal last_bytes, last_time, sent_at
+            nonlocal last_bytes, last_time, sent_at, last_connections
             now = time.monotonic()
             downloaded = max(0, int(values.get("downloaded_bytes") or 0))
             if not force and (downloaded <= last_bytes or now - sent_at < 0.5):
@@ -125,6 +127,8 @@ class VideoRollAria2cFD(external.Aria2cFD):
             if speed is None:
                 speed = max(0.0, (downloaded - last_bytes) / max(0.1, now - last_time))
             count = max(1, min(16, int(self.params.get("videoroll_parallel_connections") or 8)))
+            if values.get("connections") is not None:
+                last_connections = int(values["connections"])
             progress = {
                 "status": "downloading",
                 "downloaded_bytes": downloaded,
@@ -135,7 +139,7 @@ class VideoRollAria2cFD(external.Aria2cFD):
                 ),
                 "filename": filename, "download_backend": "aria2c",
                 "configured_connections": count,
-                "connections": values.get("connections"),
+                "connections": last_connections,
             }
             self._hook_progress(progress, info_dict)
             last_bytes = downloaded

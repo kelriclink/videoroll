@@ -50,6 +50,26 @@ def push_dubbing_finished(job_id: str, status: str, error: str | None = None) ->
         response.raise_for_status()
 
 
+def enqueue_dubbing_finished(job_id: str, status: str, error: str | None = None) -> None:
+    """Persist Hatchet notification intent so an API outage cannot strand the parent."""
+    from videoroll.apps.outbox.service import create_outbox_event
+    from videoroll.config import get_subtitle_settings
+    from videoroll.db.session import get_sessionmaker
+
+    factory = get_sessionmaker(get_subtitle_settings().database_url)
+    with factory() as db:
+        create_outbox_event(
+            db,
+            event_type="workflow.dubbing.finished",
+            aggregate_type="dubbing_job",
+            aggregate_id=job_id,
+            task_name="subtitle_service.push_dubbing_workflow_event",
+            args={"args": [job_id, status, error], "queue": "subtitle-control"},
+            operation_key=f"workflow-dubbing-finished:{job_id}:{status}",
+        )
+        db.commit()
+
+
 def close_dubbing_pipeline_audit(job_id: str, *, status: str, error: str | None = None) -> None:
     from datetime import datetime, timezone
     from videoroll.config import get_subtitle_settings
@@ -88,9 +108,9 @@ def register_dubbing_job_task(hatchet: Any) -> Any:
         idempotency=TTLBasedIdempotencyConfig(
             key_expression="input.dispatch_key", ttl=timedelta(days=7),
         ),
-        retries=1,
+        retries=2,
         backoff_factor=2.0,
-        backoff_max_seconds=60,
+        backoff_max_seconds=120,
         schedule_timeout=timedelta(days=7),
         execution_timeout=timedelta(hours=36),
         desired_worker_labels=pool,
@@ -99,26 +119,32 @@ def register_dubbing_job_task(hatchet: Any) -> Any:
         try:
             result = _run_dubbing_job(input.job_id)
         except Exception as exc:
-            if int(getattr(ctx, "retry_count", 0) or 0) >= 1:
+            if int(getattr(ctx, "retry_count", 0) or 0) >= 2:
                 message = f"{type(exc).__name__}: {exc}"[:800]
-                push_dubbing_finished(input.job_id, "failed", message)
+                enqueue_dubbing_finished(input.job_id, "failed", message)
                 try:
                     close_dubbing_pipeline_audit(input.job_id, status="failed", error=message)
                 except Exception:
-                    pass  # Parent Hatchet workflow still receives a failed event.
+                    pass  # Durable outbox will still deliver the parent failure event.
             raise
         result_status = str(result.get("status") or "succeeded")
         if result_status == "succeeded":
             if not result.get("video_key"):
                 raise RuntimeError("YouDub completed without a registered video asset")
-            push_dubbing_finished(input.job_id, "succeeded")
+            enqueue_dubbing_finished(input.job_id, "succeeded")
             try:
                 close_dubbing_pipeline_audit(input.job_id, status="succeeded")
             except Exception:
-                pass  # Event already released the parent workflow.
+                pass  # Durable event intent was already committed.
+        elif result_status == "rendering":
+            # Audio-only YouDub has handed off P2 to Render Coordinator.
+            # Render completion (not this worker) delivers the parent event.
+            if not result.get("render_job_id"):
+                raise RuntimeError("YouDub audio-only handoff has no render job")
+            close_dubbing_pipeline_audit(input.job_id, status="succeeded")
         elif result_status in ("paused", "canceled"):
             # A pause/cancel must fail the parent wait promptly, not strand P1.
-            push_dubbing_finished(input.job_id, "failed", result_status)
+            enqueue_dubbing_finished(input.job_id, "failed", result_status)
             try:
                 close_dubbing_pipeline_audit(input.job_id, status="failed", error=result_status)
             except Exception:

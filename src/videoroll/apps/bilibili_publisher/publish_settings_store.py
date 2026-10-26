@@ -60,7 +60,11 @@ def get_bilibili_publish_settings(db: Session) -> dict[str, Any]:
     except Exception:
         meta = BilibiliPublishMeta.model_validate(baseline)
 
-    return {"default_meta": meta}
+    try:
+        workers = max(1, min(8, int(stored.get("upload_workers", 4))))
+    except (TypeError, ValueError):
+        workers = 4
+    return {"default_meta": meta, "upload_workers": workers}
 
 
 def update_bilibili_publish_settings(db: Session, update: dict[str, Any]) -> dict[str, Any]:
@@ -76,6 +80,12 @@ def update_bilibili_publish_settings(db: Session, update: dict[str, Any]) -> dic
         merged = {**baseline, **meta_in}
         meta = BilibiliPublishMeta.model_validate(merged)
         stored["default_meta"] = meta.model_dump()
+
+    if "upload_workers" in update and update["upload_workers"] is not None:
+        count = int(update["upload_workers"])
+        if count < 1 or count > 8:
+            raise ValueError("upload_workers must be between 1 and 8")
+        stored["upload_workers"] = count
 
     row.value_json = stored
     db.add(row)

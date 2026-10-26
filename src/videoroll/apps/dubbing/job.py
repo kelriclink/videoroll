@@ -15,7 +15,7 @@ from videoroll.db.models import Asset, AssetKind, DubbingJob, SubtitleJob, Task,
 from videoroll.storage.filesystem import FileStore
 
 LEASE_SECONDS = 1800
-ACTIVE = frozenset(("queued", "preparing", "synthesizing", "aligning", "mixing",
+ACTIVE = frozenset(("queued", "preparing", "synthesizing", "aligning", "mixing", "rendering",
                     "pause_requested", "cancel_requested"))
 
 

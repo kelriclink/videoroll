@@ -2480,6 +2480,7 @@ def _groq_window_has_speech(
 def _detect_silero_speech_spans(
     audio_data: Sequence[float],
     *,
+    required: bool = False,
     threshold: float = _OPENVINO_VAD_THRESHOLD,
     min_speech_duration_ms: int = _OPENVINO_VAD_MIN_SPEECH_MS,
     max_speech_duration_s: float = _OPENVINO_VAD_MAX_SPEECH_SECONDS,
@@ -2496,10 +2497,12 @@ def _detect_silero_speech_spans(
         import numpy as np  # type: ignore
         from faster_whisper.vad import VadOptions, get_speech_timestamps  # type: ignore
     except Exception as e:  # pragma: no cover - depends on optional ASR packages
-        logger.warning(
-            "Silero VAD is unavailable (%s); falling back to window transcription",
-            type(e).__name__,
-        )
+        if required:
+            raise RuntimeError(
+                "Silero VAD is enabled but faster-whisper/onnxruntime is unavailable; "
+                "install the OpenVINO ASR VAD dependencies before transcribing"
+            ) from e
+        logger.warning("Silero VAD is unavailable (%s); falling back to window transcription", type(e).__name__)
         return None
 
     try:
@@ -2516,11 +2519,12 @@ def _detect_silero_speech_spans(
             sampling_rate=_ASR_SAMPLE_RATE,
         )
     except Exception as e:  # pragma: no cover - runtime/model dependent
-        logger.warning(
-            "Silero VAD failed for %d samples (%s); falling back to window transcription",
-            len(audio_data),
-            type(e).__name__,
-        )
+        if required:
+            raise RuntimeError(
+                f"Silero VAD execution failed for {len(audio_data)} audio samples; "
+                "refusing unfiltered OpenVINO transcription"
+            ) from e
+        logger.warning("Silero VAD failed for %d samples (%s); falling back to window transcription", len(audio_data), type(e).__name__)
         return None
 
     spans: list[_OpenVinoSpeechSpan] = []
@@ -2760,7 +2764,7 @@ def _iter_openvino_speech_windows(
 ) -> Iterator[tuple[array, float]]:
     for audio_data, window_offset in _iter_wav_windows_as_float_mono_16k(audio_path):
         if not _audio_is_effectively_silent(audio_data):
-            spans = _detect_silero_speech_spans(audio_data, threshold=vad_threshold) if vad_enabled else None
+            spans = _detect_silero_speech_spans(audio_data, threshold=vad_threshold, required=True) if vad_enabled else None
             if spans is None:
                 yield audio_data, window_offset
             else:
@@ -2876,10 +2880,16 @@ def transcribe_openvino_whisper(
                 result = pipeline.generate(speech_audio, generation_config=generation_config, **generate_kwargs)
             else:
                 result = pipeline.generate(speech_audio, **generate_kwargs)
-            completed = _offset_openvino_chunks(
-                _openvino_result_chunks(result, audio_duration=local_duration),
-                offset_seconds=offset_seconds,
-            )
+            # OpenVINO sometimes returns timestamps beyond its source window.
+            # Clamp before offset and before checkpointing, so resumed segments
+            # cannot leak outside the actual audio duration.
+            relative_chunks = []
+            for item in _openvino_result_chunks(result, audio_duration=local_duration):
+                start = max(0.0, min(local_duration, float(item.start)))
+                end = max(start, min(local_duration, float(item.end)))
+                if end > start:
+                    relative_chunks.append(_OpenVinoChunk(start=start, end=end, text=item.text))
+            completed = _offset_openvino_chunks(relative_chunks, offset_seconds=offset_seconds)
             checkpoint.save(offset_seconds, local_duration, [
                 Segment(start=item.start, end=item.end, text=item.text) for item in completed
             ])
@@ -2888,11 +2898,43 @@ def transcribe_openvino_whisper(
         del speech_audio
         if progress_callback is not None:
             progress_callback(min(total_duration, offset_seconds + local_duration), total_duration)
-
     out = _dedupe_overlapping_asr_segments(_filter_faster_whisper_segments(chunks))
+    out = _filter_openvino_hallucinations(out, audio_duration=_wav_duration_seconds(audio_path))
     if chunks:
         logger.info("openvino-whisper kept %d/%d segments for %s", len(out), len(chunks), audio_path)
     return out
+
+
+def _wav_duration_seconds(audio_path: Path) -> float:
+    with wave.open(str(audio_path), "rb") as source:
+        return source.getnframes() / float(source.getframerate())
+
+
+def _filter_openvino_hallucinations(segments: list[Segment], *, audio_duration: float) -> list[Segment]:
+    """Conservative guard for low-information text filling long Whisper windows.
+
+    Real short speech often lasts 1-3 seconds, while OpenVINO's music
+    hallucination was 'Thank you.' repeated over consecutive 30s windows.
+    Never apply this duration heuristic to other ASR engines.
+    """
+    kept: list[Segment] = []
+    dropped = 0
+    for seg in segments:
+        start = max(0.0, float(seg.start))
+        end = min(max(0.0, audio_duration), float(seg.end))
+        text = str(seg.text or "").strip()
+        words = text.split()
+        # A single or two-word caption spanning most of a 30-second ASR
+        # chunk is practically always unsupported by the audio timeline.
+        if (end <= start or ((end - start) >= 8.0 and len(words) <= 3)
+                or ((end - start) >= 4.0 and len(words) <= 1)):
+            dropped += 1
+            continue
+        kept.append(Segment(start=start, end=end, text=text,
+                            confidence=seg.confidence, secondary_text=seg.secondary_text))
+    if dropped:
+        logger.warning("OpenVINO ASR discarded %d hallucinated/invalid-time captions", dropped)
+    return kept
 
 
 def _as_float(value: Any) -> float | None:
@@ -4021,7 +4063,9 @@ def _plan_ass_event_cache(
     if duration_seconds is not None and duration_seconds > 0:
         boundaries = tuple(
             boundary for boundary in boundaries
-            if boundary <= duration_seconds + 1e-6
+            # A state starting exactly at EOF is never visible on a source
+            # frame and can generate an extra output frame in framesync.
+            if boundary < duration_seconds - 1e-6
         )
         if not boundaries or boundaries[0] != 0.0:
             boundaries = (0.0, *boundaries)
@@ -4175,35 +4219,33 @@ def _prepare_ass_event_cache(
         raise
 
 
-def _make_ass_event_cache_producer(
-    cache: AssEventCache,
-) -> Callable[[Any, threading.Event], None]:
+def _write_ass_event_timeline(cache: AssEventCache) -> Path:
+    """Feed each raster state once, at its exact ASS event PTS.
+
+    ffconcat's per-file `option framerate 1000` sets a millisecond time base
+    for the image demuxer. `duration` advances the next image's PTS; we do
+    NOT append a terminal duplicate, which otherwise creates an extra video
+    frame at EOF in overlay_vaapi. Framesync holds the last state until the
+    main video ends. This also eliminates 15 FPS repeated PNG transfers.
+    """
     boundaries = cache.plan.boundaries
-    frame_paths = cache.frame_paths
-    overlay_fps = cache.plan.overlay_fps
-    output_frame_count = cache.plan.output_frame_count
-
-    def _producer(handle: Any, stop_event: threading.Event) -> None:
-        active_index = -1
-        active_blob = b""
-        for frame_number in range(output_frame_count):
-            if stop_event.is_set():
-                return
-            timestamp = frame_number / overlay_fps
-            state_index = max(0, bisect_right(boundaries, timestamp + 1e-9) - 1)
-            if state_index != active_index:
-                active_blob = frame_paths[state_index].read_bytes()
-                active_index = state_index
-            try:
-                handle.write(active_blob)
-            except BrokenPipeError:
-                return
-        try:
-            handle.flush()
-        except BrokenPipeError:
-            return
-
-    return _producer
+    if len(boundaries) != len(cache.frame_paths) or not boundaries or boundaries[0] != 0.0:
+        raise ValueError("subtitle event cache has inconsistent timestamp boundaries")
+    lines = ["ffconcat version 1.0"]
+    for index, image in enumerate(cache.frame_paths):
+        # Paths are generated by this renderer; no user-provided ffconcat
+        # directives or absolute paths are accepted in the manifest.
+        if image.parent != cache.directory or not re.fullmatch(r"[A-Za-z0-9_-]+\.png", image.name):
+            raise ValueError("unsafe subtitle event image path")
+        lines.extend((f"file {image.name}", "option framerate 1000"))
+        if index + 1 < len(boundaries):
+            delta = boundaries[index + 1] - boundaries[index]
+            if delta <= 0:
+                raise ValueError("subtitle event times must increase")
+            lines.append(f"duration {delta:.6f}")
+    timeline = cache.directory / "overlay_events.ffconcat"
+    timeline.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return timeline
 
 
 def _pixel_format_bit_depth(pixel_format: str) -> int:
@@ -4569,11 +4611,25 @@ def render_burn_in(
     live_upload_cb: Callable[[], None] | None = None,
     cancel_event: threading.Event | None = None,
     render_metrics: dict[str, Any] | None = None,
+    audio_path: Path | None = None,
 ) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    if audio_path is not None and not audio_path.is_file():
+        raise FileNotFoundError(f"P2 mixed audio missing: {audio_path}")
     codec = str(video_codec or "").strip().lower() or "av1"
     source_duration_seconds = probe_video_duration_seconds(ffmpeg_path, video_path)
     render_started_at = time.monotonic()
+
+    def _warn_compatibility(code: str, description: str, *, reason: str = "") -> None:
+        """Persistent, user-facing facts; Render Worker uploads them in metrics."""
+        if render_metrics is None:
+            return
+        warning = {"code": code, "message": description, "reason": str(reason)[:400]}
+        warnings = list(render_metrics.get("compatibility_warnings") or [])
+        if not any(item.get("code") == code for item in warnings if isinstance(item, dict)):
+            warnings.append(warning)
+            render_metrics["compatibility_warnings"] = warnings
+
     ass_filter = f"ass={str(ass_path).replace(':', r'\:')}"
     cmd = [ffmpeg_path, "-y"]
     encoder = ""
@@ -4606,7 +4662,6 @@ def render_burn_in(
 
     overlay_ass_path: Path | None = None
     event_cache: AssEventCache | None = None
-    overlay_stdin_producer: Callable[[Any, threading.Event], None] | None = None
     filter_complex: str | None = None
     extra_input_args: list[str] = []
     map_args: list[str] = []
@@ -4685,6 +4740,7 @@ def render_burn_in(
             video_args.extend(["-gpu", str(int(nvidia_gpu_index))])
         filter_arg = ass_filter
         pipeline = "cpu-ass-nvenc"
+        _warn_compatibility("cpu-ass-nvenc", "NVIDIA 编码使用 CPU libass 字幕合成，未使用 GPU 字幕叠加", reason="NVENC 当前无原生 GPU ASS 合成路径")
         note = (
             f"NVIDIA render pipeline: encoder={encoder} gpu={nvidia_gpu_index if nvidia_gpu_index is not None else 'auto'} "
             f"preset={effective_preset} cq={effective_cq}"
@@ -4722,6 +4778,7 @@ def render_burn_in(
         ]
         filter_arg = ass_filter
         pipeline = "cpu-ass-qsv"
+        _warn_compatibility("cpu-ass-qsv", "QSV 编码使用 CPU 字幕合成兼容路径", reason="QSV 字幕合成仍依赖 CPU libass")
         note = (
             f"Intel QSV render pipeline: encoder={encoder} "
             f"device={intel_qsv_device_index if intel_qsv_device_index is not None else 'auto'} "
@@ -4771,6 +4828,8 @@ def render_burn_in(
             live_upload_cb=live_upload_cb,
         )
         decode_mode = "vaapi" if hardware_decode else "software-fallback"
+        if not hardware_decode:
+            _warn_compatibility("vaapi-software-decode", "Intel VAAPI 硬件解码不可用，已改用 CPU 解码、GPU 合成编码", reason=f"device={device}")
         if hardware_decode:
             cmd.extend(_intel_vaapi_decode_args())
 
@@ -4811,7 +4870,7 @@ def render_burn_in(
             static_overlay = overlay_band is not None and _ass_can_use_reduced_overlay_rate(ass_path)
             if static_overlay:
                 overlay_frame_rate = _reduced_overlay_frame_rate(frame_rate)
-                compose_mode += f" static-overlay-fps={overlay_frame_rate}"
+                compose_mode += " static-ass-event-cache"
             else:
                 compose_mode += f" overlay-fps={frame_rate}"
             overlay_ass_filter = f"ass={str(overlay_render_ass_path).replace(':', r'\:')}:alpha=1"
@@ -4853,37 +4912,44 @@ def render_burn_in(
                         raise
                     event_cache = None
                     cache_reason = f"build-failed:{type(exc).__name__}"
+                    _warn_compatibility("ass-event-cache-failed", "字幕事件缓存构建失败，已改用实时 VAAPI 图层", reason=f"{type(exc).__name__}: {exc}")
                     logger.warning("ASS event cache build failed; using live overlay: %s", exc)
 
                 if event_cache is not None:
-                    overlay_stdin_producer = _make_ass_event_cache_producer(event_cache)
-                    extra_input_args = [
-                        "-f",
-                        "image2pipe",
-                        "-framerate",
-                        overlay_frame_rate,
-                        "-vcodec",
-                        "png",
-                        "-i",
-                        "pipe:0",
-                    ]
+                    try:
+                        timeline = _write_ass_event_timeline(event_cache)
+                    except (OSError, ValueError) as exc:
+                        cache_reason = f"timeline-failed:{type(exc).__name__}"
+                        _warn_compatibility("ass-event-timeline-failed", "字幕事件时间轴生成失败，已改用实时 VAAPI 图层", reason=f"{type(exc).__name__}: {exc}")
+                        logger.warning("ASS event timeline unavailable; using live overlay: %s", exc)
+                        shutil.rmtree(event_cache.directory, ignore_errors=True)
+                        event_cache = None
+
+                if event_cache is not None:
+                    # Sparse VFR secondary input: each subtitle state is
+                    # decoded and uploaded once, FFmpeg framesync retains it
+                    # across all main-video frames until the next event PTS.
+                    # ffconcat's per-file `option framerate` requires safe=0;
+                    # its manifest and PNG basenames are strictly generated
+                    # and validated by _write_ass_event_timeline.
+                    extra_input_args = ["-f", "concat", "-safe", "0", "-i", str(timeline)]
                     filter_complex = (
                         f"[0:v]{main_filter}[main];"
                         f"[1:v]format=bgra,hwupload[sub];"
                         f"[main][sub]overlay_vaapi=x=0:y={overlay_y}:"
-                        "shortest=1:repeatlast=1[out]"
+                        "shortest=0:repeatlast=1:eof_action=repeat[out]"
                     )
                     compose_mode += (
-                        f" event-cache states={len(event_cache.plan.boundaries)}"
-                        f" frames={event_cache.plan.output_frame_count}"
+                        f" event-vfr states={len(event_cache.plan.boundaries)}"
+                        f" input-frames={len(event_cache.frame_paths)}"
                         f" bytes={event_cache.total_bytes}"
                         f" build={event_cache.build_seconds:.3f}s"
                     )
                     cache_note = (
                         "ASS event cache enabled: "
                         f"states={len(event_cache.plan.boundaries)} "
-                        f"output_frames={event_cache.plan.output_frame_count} "
-                        f"overlay_fps={event_cache.plan.overlay_fps:.3f} "
+                        f"input_frames={len(event_cache.frame_paths)} "
+                        "timeline=event-pts-ms "
                         f"savings_ratio={event_cache.plan.savings_ratio:.4f} "
                         f"cache_bytes={event_cache.total_bytes} "
                         f"build_seconds={event_cache.build_seconds:.3f}"
@@ -4893,8 +4959,9 @@ def render_burn_in(
                     if render_metrics is not None:
                         render_metrics.update(
                             {
-                                "subtitle_overlay_mode": "event-cache",
-                                "subtitle_overlay_fps": round(event_cache.plan.overlay_fps, 3),
+                                "subtitle_overlay_mode": "event-vfr",
+                                "subtitle_overlay_timing": "event-pts-ms",
+                                "subtitle_overlay_input_frames": len(event_cache.frame_paths),
                                 "subtitle_cache_states": len(event_cache.plan.boundaries),
                                 "subtitle_cache_frames": event_cache.plan.output_frame_count,
                                 "subtitle_cache_bytes": event_cache.total_bytes,
@@ -4931,6 +4998,7 @@ def render_burn_in(
             filter_arg = ""
             pipeline = compose_mode
         else:
+            _warn_compatibility("vaapi-overlay-unavailable", "当前 FFmpeg 缺少 overlay_vaapi，已改用 CPU libass 逐帧合成后回传 GPU", reason="overlay_vaapi filter not available")
             filter_arg = legacy_filter_arg
             compose_mode = "legacy-full-frame"
             pipeline = compose_mode
@@ -4944,6 +5012,7 @@ def render_burn_in(
         )
         if codec in {"h264", "avc"} and source_bit_depth > 8:
             bit_depth_note += " (h264_vaapi output is limited to the 8-bit NV12 path)"
+            _warn_compatibility("vaapi-10bit-to-8bit", "H.264 VAAPI 不支持保留该视频的 10-bit 输出，已转为 8-bit NV12", reason=f"source_bit_depth={source_bit_depth}")
         logger.info(bit_depth_note)
         _append_processing_log_note(log_path, bit_depth_note)
     elif codec in {"h264", "avc"}:
@@ -4964,6 +5033,7 @@ def render_burn_in(
         effective_preset = preset_s if preset_s in allowed_presets else "veryfast"
         encoder = "libx264"
         pipeline = "cpu-ass-libx264"
+        _warn_compatibility("cpu-ass-libx264", "渲染任务使用 CPU 字幕合成和软件 H.264 编码", reason="当前选用 CPU 兼容渲染路径")
         video_args = ["-c:v", "libx264", "-preset", effective_preset, "-crf", str(effective_crf)]
         filter_arg = ass_filter
     else:
@@ -4979,6 +5049,7 @@ def render_burn_in(
         effective_preset_n = 4 if preset_n is None else max(0, min(13, preset_n))
         encoder = "libsvtav1"
         pipeline = "cpu-ass-libsvtav1"
+        _warn_compatibility("cpu-ass-libsvtav1", "渲染任务使用 CPU 字幕合成和软件 AV1 编码", reason="当前选用 CPU 兼容渲染路径")
         video_args = ["-c:v", "libsvtav1", "-preset", str(effective_preset_n), "-crf", str(effective_crf)]
         filter_arg = ass_filter
 
@@ -4995,14 +5066,19 @@ def render_burn_in(
         )
 
     def _build_overlay_command(input_args: list[str], graph: str) -> list[str]:
+        # Input 0 = source video, 1 = ASS overlay, 2 = optional mixed P2 audio.
+        audio_input = ["-i", str(audio_path)] if audio_path else []
+        audio_map = ["-map", "2:a:0"] if audio_path else []
+        selected_map = ["-map", "[out]", *audio_map] if audio_path else map_args
         return [
             *cmd,
             "-i",
             str(video_path),
             *input_args,
+            *audio_input,
             "-filter_complex",
             graph,
-            *map_args,
+            *selected_map,
             *video_args,
             "-c:a",
             "copy",
@@ -5018,6 +5094,7 @@ def render_burn_in(
     def _run_legacy_fallback(reason: BaseException) -> None:
         if cancel_event is not None and cancel_event.is_set():
             raise RuntimeError("render process canceled") from reason
+        _warn_compatibility("vaapi-legacy-ass-fallback", "VAAPI GPU 字幕叠加失败，已使用逐帧 CPU libass 兼容合成", reason=f"{type(reason).__name__}: {reason}")
         message = (
             "VAAPI subtitle overlay failed; retrying with legacy full-frame composition "
             f"({type(reason).__name__})"
@@ -5025,6 +5102,8 @@ def render_burn_in(
         logger.warning("%s: %s", message, video_path)
         _append_processing_log_note(log_path, message)
         if render_metrics is not None:
+            render_metrics.pop("subtitle_overlay_timing", None)
+            render_metrics.pop("subtitle_overlay_input_frames", None)
             render_metrics.update(
                 {
                     "subtitle_overlay_mode": "legacy-full-frame-fallback",
@@ -5037,8 +5116,10 @@ def render_burn_in(
             *cmd,
             "-i",
             str(video_path),
+            *(["-i", str(audio_path)] if audio_path else []),
             "-vf",
             legacy_filter_arg,
+            *(["-map", "0:v:0", "-map", "1:a:0"] if audio_path else []),
             *video_args,
             "-c:a",
             "copy",
@@ -5050,11 +5131,12 @@ def render_burn_in(
         if filter_complex is not None:
             overlay_cmd = _build_overlay_command(extra_input_args, filter_complex)
             try:
-                _run_render_command(overlay_cmd, stdin_producer=overlay_stdin_producer)
+                _run_render_command(overlay_cmd)
             except (OSError, subprocess.CalledProcessError, RuntimeError) as exc:
                 if cancel_event is not None and cancel_event.is_set():
                     raise
                 if event_cache is not None and live_overlay_filter_complex is not None:
+                    _warn_compatibility("ass-event-overlay-failed", "字幕事件 GPU 叠加失败，已回退实时 VAAPI 图层", reason=f"{type(exc).__name__}: {exc}")
                     message = (
                         "ASS event-cache overlay failed; retrying live VAAPI subtitle overlay "
                         f"({type(exc).__name__})"
@@ -5062,6 +5144,8 @@ def render_burn_in(
                     logger.warning("%s: %s", message, video_path)
                     _append_processing_log_note(log_path, message)
                     if render_metrics is not None:
+                        render_metrics.pop("subtitle_overlay_timing", None)
+                        render_metrics.pop("subtitle_overlay_input_frames", None)
                         render_metrics.update(
                             {
                                 "subtitle_overlay_mode": "live-static-fallback",
@@ -5085,8 +5169,10 @@ def render_burn_in(
                 [
                     "-i",
                     str(video_path),
+                    *(["-i", str(audio_path)] if audio_path else []),
                     "-vf",
                     filter_arg,
+                    *(["-map", "0:v:0", "-map", "1:a:0"] if audio_path else []),
                     *video_args,
                     "-c:a",
                     "copy",

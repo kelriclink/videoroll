@@ -28,6 +28,8 @@ class NativeResult:
     video: Path
     audio: Path
     stages: tuple[dict, ...]
+    mixed_audio: Path | None = None
+    aligned_srt: Path | None = None
 
 
 def bridge_path() -> Path:
@@ -117,6 +119,22 @@ def _cli(*args: str) -> dict:
         raise RuntimeError("YouDub bridge returned invalid JSON") from exc
 
 
+def _poll_native_status(job_id: str, progress: Callable[[dict], None]) -> bool:
+    """Best-effort state sample; a busy SQLite reader must not stop TTS.
+
+    Only sqlite transient contention is soft. Any other status/bridge error
+    still propagates so the existing worker can enforce process cleanup.
+    """
+    try:
+        state = _cli("--status", "--task-id", str(job_id))
+    except RuntimeError as exc:
+        if "database is locked" not in str(exc).lower():
+            raise
+        return False
+    progress(state)
+    return True
+
+
 def _stop_group(process: subprocess.Popen) -> None:
     if process.poll() is not None:
         return
@@ -179,6 +197,16 @@ def _run_native_unlocked(
             raise
         state = _cli("--create", "--task-id", str(job_id),
                      "--video", str(video), "--srt", str(srt))
+        # The bridge stays upstream-compatible; enable per-task audio-only
+        # processing with a marker only for newly created tasks. Older jobs
+        # never receive the flag, including after restart/resume.
+        if os.getenv("VIDEOROLL_YOUDUB_AUDIO_ONLY", "1").strip().lower() not in {"0", "false", "off", "no"}:
+            upload_root = Path(os.getenv("WORKFOLDER", str(runtime_dir() / "workfolder"))) / "_uploads" / str(job_id)
+            (upload_root / "audio_only.flag").write_text("1\n", encoding="ascii")
+    if state["status"] == "running":
+        # Our DB lease is now owned by this worker; reconcile a native runner
+        # whose process exited before updating YouDub's own status.
+        state = _cli("--interrupt", "--task-id", str(job_id))
     if state["status"] == "failed":
         state = _cli("--resume", "--task-id", str(job_id))
     if state["status"] == "succeeded":
@@ -211,8 +239,9 @@ def _run_native_unlocked(
             try:
                 while proc.poll() is None:
                     should_continue()
-                    state = _cli("--status", "--task-id", str(job_id))
-                    progress(state)
+                    # A transient SQLite lock must never terminate an
+                    # otherwise healthy Demucs or VoxCPM2 subprocess.
+                    _poll_native_status(str(job_id), progress)
                     time.sleep(5)
             except BaseException:
                 _stop_group(proc)
@@ -238,11 +267,22 @@ def _run_native_unlocked(
     if state["status"] != "succeeded":
         raise RuntimeError(f"Native YouDub did not complete: {state}")
     output = Path(state["output_video"])
-    audio = output.parents[1] / "tmp" / "audio_dubbing.wav"
     if not output.is_file() or output.stat().st_size < 1024:
-        raise RuntimeError("YouDub final video asset is missing")
+        raise RuntimeError("YouDub output artifact is missing")
+    session = output.parents[1]
+    audio = session / "tmp" / "audio_dubbing.wav"
     if not audio.is_file() or audio.stat().st_size < 1024:
-        raise RuntimeError("YouDub mix asset is missing")
+        raise RuntimeError("YouDub generated speech track is missing")
+    info_path = session / "metadata" / "local_info.json"
+    is_audio_only = bool(json.loads(info_path.read_text(encoding="utf-8")).get("audio_only")) if info_path.is_file() else False
+    if is_audio_only:
+        mixed = session / "tmp" / "audio_mixed.m4a"
+        subtitles = next((path for path in sorted((session / "metadata").glob("subtitles.*.srt"))
+                          if path.is_file()), None)
+        if not mixed.is_file() or mixed.stat().st_size < 1024 or subtitles is None:
+            raise RuntimeError("YouDub audio-only handoff is missing mixed audio or aligned subtitles")
+        return NativeResult(video=output, audio=audio, stages=tuple(state["stages"]),
+                            mixed_audio=mixed, aligned_srt=subtitles)
     return NativeResult(video=output, audio=audio, stages=tuple(state["stages"]))
 
 

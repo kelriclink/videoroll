@@ -19,7 +19,7 @@ from videoroll.apps.subtitle_service.processing import (
     srt_to_segments,
 )
 from videoroll.config import get_orchestrator_settings
-from videoroll.db.models import AppSetting, Asset, RenderExecution, RenderJob, RenderJobStatus, RenderWorker, RenderWorkerEnrollment, SubtitleJob, SubtitleJobStatus, Task, TaskStatus
+from videoroll.db.models import AppSetting, Asset, AssetKind, RenderExecution, RenderJob, RenderJobStatus, DubbingJob, RenderWorker, RenderWorkerEnrollment, SubtitleJob, SubtitleJobStatus, Task, TaskStatus
 from videoroll.storage.filesystem import FileStore, StorageObjectNotFound
 from videoroll.utils.auto_youtube import parse_auto_youtube_created_by
 
@@ -390,7 +390,7 @@ def _build_spec(db: Session, store: FileStore, job: RenderJob, execution_id: uui
     burn_in, soft_sub = bool(req.get("burn_in")), bool(req.get("soft_sub"))
     mode = "burn_in" if burn_in else ("soft_sub" if soft_sub else "noop")
     artifacts: list[ArtifactSpec] = []
-    for role, field in (("input","input_key"),("srt","srt_key"),("ass","ass_key")):
+    for role, field in (("input","input_key"),("srt","srt_key"),("ass","ass_key"),("audio","audio_key")):
         key = str(req.get(field) or "").strip()
         if key: artifacts.append(_artifact(db, store, role, key, execution_id))
 
@@ -398,7 +398,7 @@ def _build_spec(db: Session, store: FileStore, job: RenderJob, execution_id: uui
     # never query the coordinator database. Automatic renders historically
     # generated ASS inside subtitle-worker at execution time; materialize the
     # same ASS here and expose it as a normal execution-scoped artifact.
-    if automatic and burn_in and not str(req.get("ass_key") or "").strip():
+    if (automatic or req.get("dubbing_job_id")) and burn_in and not str(req.get("ass_key") or "").strip():
         input_key = str(req.get("input_key") or "").strip()
         srt_key = str(req.get("srt_key") or "").strip()
         if not input_key or not srt_key:
@@ -435,7 +435,13 @@ def _build_spec(db: Session, store: FileStore, job: RenderJob, execution_id: uui
         runtime_ass_path.write_text(ass_text, encoding="utf-8")
         req["ass_key"] = runtime_ass_key
         artifacts = [artifact for artifact in artifacts if artifact.role != "ass"]
-        artifacts.append(_artifact(db, store, "ass", runtime_ass_key, execution_id))
+        # Execution-scoped ASS paths change on every retry, but identical
+        # subtitle content MUST use the same render cache key. Expose its
+        # digest so standalone Render Workers can fingerprint by content.
+        generated_ass = _artifact(db, store, "ass", runtime_ass_key, execution_id)
+        artifacts.append(generated_ass.model_copy(update={
+            "sha256": hashlib.sha256(ass_text.encode("utf-8")).hexdigest(),
+        }))
     return RenderSpec(schema_version=1, render_job_id=job.id, task_id=job.task_id, mode=mode, request=req, artifacts=artifacts)
 
 def claim_job(
@@ -458,7 +464,9 @@ def claim_job(
     jobs = (db.query(RenderJob).join(Task, Task.id == RenderJob.task_id)
         .filter(RenderJob.status == RenderJobStatus.queued,
                 or_(RenderJob.lease_until.is_(None), RenderJob.lease_until <= now),
-                Task.status.notin_([TaskStatus.canceled, TaskStatus.published]))
+                Task.status != TaskStatus.canceled,
+                or_(Task.status != TaskStatus.published,
+                    RenderJob.operation_key.like("youdub:p2-render:%")))
         .order_by(Task.priority.desc(), RenderJob.created_at.asc())
         .with_for_update(skip_locked=True).limit(32).all())
     free_encoders = {str(x).lower() for x in available_encoders} if available_encoders is not None else None
@@ -557,13 +565,28 @@ def complete_execution(db: Session, execution_id: uuid.UUID, payload: Any) -> Re
     execution = get_execution(db, execution_id, lock=True); validate_fence(execution, payload.fence_token)
     job = db.get(RenderJob, execution.render_job_id)
     if job is None or job.lease_owner != f"{REMOTE_LOCK_PREFIX}{execution.id}": raise HTTPException(409, "render job ownership lost")
+    canceled, reason = cancellation_state(db, execution_id)
+    if canceled:
+        raise HTTPException(409, reason or "render execution canceled before completion")
     mode = str((execution.render_spec or {}).get("mode") or "noop")
     if mode != "noop" and payload.output_asset_id is None:
         raise HTTPException(400, "render output asset is required")
     if payload.output_asset_id is not None:
         asset = db.get(Asset, payload.output_asset_id)
-        if asset is None or asset.task_id != job.task_id: raise HTTPException(400, "output asset does not belong to render task")
-    now = utcnow(); execution.state = "succeeded"; execution.progress = 100; execution.output_json = payload.output; execution.finished_at = now
+        expected_kind = (AssetKind.video_dubbed if (job.request_json or {}).get("dubbing_job_id")
+                         else AssetKind.video_final)
+        if asset is None or asset.task_id != job.task_id or asset.kind != expected_kind:
+            raise HTTPException(400, "output asset must be a final video for this task" if not (job.request_json or {}).get("dubbing_job_id") else "output asset must be a dubbed video for this task")
+        uploaded_id = str((execution.output_json or {}).get("uploaded_output_asset_id") or "")
+        if uploaded_id != str(asset.id):
+            raise HTTPException(409, "output asset was not uploaded by this execution")
+    # Serialize completion and cancellation on the same task row. The task
+    # status must still be eligible after acquiring that lock.
+    task = db.query(Task).filter(Task.id == job.task_id).with_for_update().one_or_none()
+    is_dubbed = bool((job.request_json or {}).get("dubbing_job_id"))
+    if task is None or task.status == TaskStatus.canceled or (task.status == TaskStatus.published and not is_dubbed):
+        raise HTTPException(409, "task stopped before render completion")
+    now = utcnow(); execution.state = "succeeded"; execution.progress = 100; execution.output_json = {**dict(payload.output or {}), "output_asset_id": str(payload.output_asset_id) if payload.output_asset_id else None}; execution.finished_at = now
     job.status = RenderJobStatus.succeeded; job.progress = 100; job.finished_at = now; job.lease_owner = None; job.lease_until = None; job.heartbeat_at = now; job.error_message = None
     if job.subtitle_job_id:
         subtitle_job = db.get(SubtitleJob, job.subtitle_job_id)
@@ -572,30 +595,40 @@ def complete_execution(db: Session, execution_id: uuid.UUID, payload: Any) -> Re
             subtitle_job.progress = 100
             subtitle_job.error_message = None
             db.add(subtitle_job)
-    task = db.get(Task, job.task_id)
-    if task is not None:
+    if not is_dubbed:
         task.status = TaskStatus.rendered
         db.add(task)
     req = job.request_json if isinstance(job.request_json, dict) else {}
+    if is_dubbed:
+        dub = db.query(DubbingJob).filter(
+            DubbingJob.id == uuid.UUID(str(req["dubbing_job_id"])),
+        ).with_for_update().one_or_none()
+        if dub is None or dub.task_id != job.task_id or dub.status != "rendering" or (dub.output_json or {}).get("render_job_id") != str(job.id):
+            raise HTTPException(409, "P2 dubbing job no longer owns this render")
+        dub.output_json = {**dict(dub.output_json or {}), "video_key": asset.storage_key,
+                           "youdub": {**dict((dub.output_json or {}).get("youdub") or {}), "stage": "done"}}
+        dub.status = "succeeded"; dub.progress = 100; dub.error_message = None
+        db.add(dub)
+        create_outbox_event(db, event_type="workflow.dubbing.finished",
+            aggregate_type="dubbing_job", aggregate_id=dub.id,
+            task_name="subtitle_service.push_dubbing_workflow_event",
+            args={"args": [str(dub.id), "succeeded", None], "queue": SUBTITLE_CONTROL_QUEUE},
+            operation_key=f"workflow-dubbing-finished:{dub.id}:succeeded")
     after_render = req.get("after_render") if isinstance(req, dict) else None
     automatic = bool(req.get("runtime_profile")) if "runtime_profile" in req else bool(
         task is not None and parse_auto_youtube_created_by(task.created_by) is not None
     )
-    create_outbox_event(
-        db,
-        event_type="workflow.render.finished",
-        aggregate_type="render_job",
-        aggregate_id=job.id,
-        task_name="subtitle_service.push_render_workflow_event",
-        args={
-            "args": [str(job.id), "succeeded", str(execution.id), None],
-            "queue": SUBTITLE_CONTROL_QUEUE,
-        },
-        operation_key=f"workflow-render-finished:{job.id}:succeeded",
-    )
+    if not is_dubbed:
+        create_outbox_event(
+            db, event_type="workflow.render.finished", aggregate_type="render_job",
+            aggregate_id=job.id, task_name="subtitle_service.push_render_workflow_event",
+            args={"args": [str(job.id), "succeeded", str(execution.id), None],
+                  "queue": SUBTITLE_CONTROL_QUEUE},
+            operation_key=f"workflow-render-finished:{job.id}:succeeded",
+        )
     # Automatic publishing is the next Hatchet stage after render-wait. Keep
     # this outbox only for explicit manual after_render publishing.
-    if not automatic and isinstance(after_render, dict) and after_render.get("publish"):
+    if not automatic and not is_dubbed and isinstance(after_render, dict) and after_render.get("publish"):
         create_outbox_event(db, event_type="render.after_publish", aggregate_type="render_job", aggregate_id=job.id,
             task_name="subtitle_service.after_render_publish", args={"args":[str(job.id)],"queue":SUBTITLE_CONTROL_QUEUE},
             operation_key=f"after-render-publish:{job.id}")
@@ -609,12 +642,15 @@ def fail_execution(db: Session, execution_id: uuid.UUID, payload: Any) -> Render
     execution.state = "failed"; execution.error_message = payload.error; execution.finished_at = now
     if job is not None and job.lease_owner == f"{REMOTE_LOCK_PREFIX}{execution.id}":
         job.lease_owner = None; job.lease_until = None; job.heartbeat_at = now; job.error_message = payload.error
-        retryable = bool(payload.retryable and execution.attempt < MAX_RENDER_ATTEMPTS)
-        job.status = RenderJobStatus.queued if retryable else RenderJobStatus.failed
+        was_canceled = job.status == RenderJobStatus.canceled
+        retryable = bool(not was_canceled and payload.retryable and execution.attempt < MAX_RENDER_ATTEMPTS)
+        job.status = (RenderJobStatus.canceled if was_canceled
+                      else RenderJobStatus.queued if retryable else RenderJobStatus.failed)
         if retryable: job.retry_count = int(job.retry_count or 0)+1; job.progress = 0; job.started_at = None
         else: job.finished_at = now
+        is_dubbed = bool((job.request_json or {}).get("dubbing_job_id"))
         task = db.get(Task, job.task_id)
-        if task is not None:
+        if task is not None and not is_dubbed:
             if not retryable and task.status != TaskStatus.published:
                 task.status = TaskStatus.failed
                 task.error_code = task.error_code or "RENDER_FAILED"
@@ -626,7 +662,20 @@ def fail_execution(db: Session, execution_id: uuid.UUID, payload: Any) -> Render
                 subtitle_job.status = SubtitleJobStatus.failed
                 subtitle_job.error_message = f"render failed: {payload.error}"
                 db.add(subtitle_job)
-        if not retryable:
+        if not retryable and not was_canceled and is_dubbed:
+            dub = db.query(DubbingJob).filter(
+                DubbingJob.id == uuid.UUID(str(job.request_json["dubbing_job_id"])),
+            ).with_for_update().one_or_none()
+            if dub is not None and dub.task_id == job.task_id and dub.status == "rendering":
+                dub.status = "failed"
+                dub.error_message = f"P2 render failed: {payload.error}"[:2000]
+                db.add(dub)
+                create_outbox_event(db, event_type="workflow.dubbing.finished",
+                    aggregate_type="dubbing_job", aggregate_id=dub.id,
+                    task_name="subtitle_service.push_dubbing_workflow_event",
+                    args={"args": [str(dub.id), "failed", dub.error_message], "queue": SUBTITLE_CONTROL_QUEUE},
+                    operation_key=f"workflow-dubbing-finished:{dub.id}:failed")
+        if not retryable and not was_canceled and not is_dubbed:
             create_outbox_event(
                 db,
                 event_type="workflow.render.finished",
@@ -651,7 +700,8 @@ def cancellation_state(db: Session, execution_id: uuid.UUID) -> tuple[bool, str 
     if lease_until is not None and lease_until <= utcnow(): return True, "render execution lease expired"
     if job is None or job.status == RenderJobStatus.canceled: return True, "render job canceled"
     task = db.get(Task, job.task_id)
-    if task is None or task.status in {TaskStatus.canceled, TaskStatus.published}: return True, "task stopped or terminal"
+    if task is None or task.status == TaskStatus.canceled or (task.status == TaskStatus.published and not (job.request_json or {}).get("dubbing_job_id")):
+        return True, "task stopped or terminal"
     return False, None
 
 def cancel_execution(db: Session, execution_id: uuid.UUID, reason: str) -> RenderExecution:
@@ -674,6 +724,16 @@ def cancel_execution(db: Session, execution_id: uuid.UUID, reason: str) -> Rende
     if worker is not None:
         worker.active_jobs = max(0, int(worker.active_jobs or 0) - 1)
         worker.status = "online"; db.add(worker)
+    if job is not None and (job.request_json or {}).get("dubbing_job_id"):
+        dub = db.query(DubbingJob).filter(DubbingJob.id == uuid.UUID(str(job.request_json["dubbing_job_id"]))).with_for_update().one_or_none()
+        if dub is not None and dub.status == "rendering":
+            dub.status = "failed"
+            dub.error_message = f"P2 render canceled: {reason}"[:2000]
+            db.add(dub)
+            create_outbox_event(db, event_type="workflow.dubbing.finished", aggregate_type="dubbing_job",
+                aggregate_id=dub.id, task_name="subtitle_service.push_dubbing_workflow_event",
+                args={"args": [str(dub.id), "failed", dub.error_message], "queue": SUBTITLE_CONTROL_QUEUE},
+                operation_key=f"workflow-dubbing-finished:{dub.id}:failed")
     db.add(execution); db.commit(); db.refresh(execution)
     return execution
 
@@ -682,6 +742,18 @@ def requeue_execution(db: Session, execution_id: uuid.UUID, reason: str) -> Rend
     job = db.get(RenderJob, execution.render_job_id)
     if job is None:
         raise HTTPException(404, "render job not found")
+    if (job.request_json or {}).get("dubbing_job_id"):
+        dub = db.query(DubbingJob).filter(
+            DubbingJob.id == uuid.UUID(str(job.request_json["dubbing_job_id"])),
+        ).with_for_update().one_or_none()
+        if dub is None or dub.task_id != job.task_id or dub.status in {"canceled", "succeeded"}:
+            raise HTTPException(409, "P2 dubbing state cannot be requeued")
+        if dub.status in {"paused", "failed"}:
+            dub.status = "rendering"
+            dub.error_message = None
+            dub.output_json = {**dict(dub.output_json or {}),
+                               "youdub": {**dict((dub.output_json or {}).get("youdub") or {}), "stage": "rendering_p2"}}
+            db.add(dub)
     now = utcnow()
     owner = f"{REMOTE_LOCK_PREFIX}{execution.id}"
     if execution.state in ACTIVE_EXECUTION_STATES:

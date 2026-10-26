@@ -8,7 +8,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import quote
 
 from fastapi import HTTPException, UploadFile
@@ -50,6 +50,9 @@ _SAFE_CONTENT_TYPES_BY_KIND: dict[AssetKind, frozenset[str]] = {
     AssetKind.video_final: frozenset(
         {"video/mp4", "video/webm", "video/quicktime", "video/x-matroska"}
     ),
+    AssetKind.video_dubbed: frozenset(
+        {"video/mp4", "video/webm", "video/quicktime", "video/x-matroska"}
+    ),
     AssetKind.audio_wav: frozenset({"audio/wav", "audio/x-wav"}),
     AssetKind.cover_image: frozenset({"image/jpeg", "image/png", "image/webp"}),
     AssetKind.metadata_json: frozenset({"application/json"}),
@@ -60,7 +63,7 @@ _SAFE_CONTENT_TYPES_BY_KIND: dict[AssetKind, frozenset[str]] = {
     AssetKind.log: frozenset({"text/plain"}),
 }
 _INLINE_ASSET_KINDS = frozenset(
-    {AssetKind.video_raw, AssetKind.video_final, AssetKind.audio_wav}
+    {AssetKind.video_raw, AssetKind.video_final, AssetKind.video_dubbed, AssetKind.audio_wav}
 )
 
 
@@ -439,7 +442,15 @@ async def store_uploaded_task_asset(
     asset_kind: AssetKind,
     update_task_status: TaskStatus | None = None,
     max_bytes: int | None = None,
+    before_commit: Callable[[Session], None] | None = None,
+    after_register: Callable[[Session, Asset], None] | None = None,
+    task_id_override: uuid.UUID | None = None,
 ) -> Asset:
+    # Remote renders commit the preflight transaction before uploading. Never
+    # touch an expired SQLAlchemy Task after that commit: a primary-key lookup
+    # would silently start a new transaction that stays idle across hundreds
+    # of MB of multipart/disk I/O (PostgreSQL idle_in_transaction timeout).
+    task_id = task_id_override if task_id_override is not None else task.id
     suffix = Path(file.filename or "").suffix or default_suffix
     temp_path: Path | None = None
     uploaded_key: str | None = None
@@ -458,20 +469,27 @@ async def store_uploaded_task_asset(
             directory=store.partial_root if isinstance(store, FileStore) else None,
         )
         uploaded_key = (
-            f"{key_prefix}/{task.id}/{object_name_prefix}_{sha256[:16]}_{uuid.uuid4().hex[:12]}{suffix}"
+            f"{key_prefix}/{task_id}/{object_name_prefix}_{sha256[:16]}_{uuid.uuid4().hex[:12]}{suffix}"
         )
         if isinstance(store, FileStore):
             await run_in_threadpool(store.promote_file, temp_path, uploaded_key)
         else:
             await run_in_threadpool(store.upload_file, temp_path, uploaded_key, file.content_type or None)
         asset = Asset(
-            task_id=task.id,
+            task_id=task_id,
             kind=asset_kind,
             storage_key=uploaded_key,
             sha256=sha256,
             size_bytes=size_bytes,
         )
+        # Validate under DB row locks after the potentially long upload,
+        # in the same transaction that registers the final asset.
+        if before_commit is not None:
+            before_commit(db)
         db.add(asset)
+        if after_register is not None:
+            db.flush()
+            after_register(db, asset)
         if update_task_status is not None:
             task.status = update_task_status
             db.add(task)
@@ -479,6 +497,13 @@ async def store_uploaded_task_asset(
         db.refresh(asset)
         return asset
     except HTTPException:
+        db.rollback()
+        if uploaded_key:
+            try:
+                queue_pending_storage_delete(db, uploaded_key, reason="rejected_asset_upload")
+            except Exception:
+                db.rollback()
+                logger.exception("failed to queue rejected upload cleanup", extra={"storage_key": uploaded_key})
         raise
     except UploadTooLargeError as exc:
         db.rollback()

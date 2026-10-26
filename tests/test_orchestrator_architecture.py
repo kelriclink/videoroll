@@ -40,6 +40,7 @@ EXPECTED_ORCHESTRATOR_ROUTES: set[tuple[str, str]] = {
     ("GET", "/render-management/workers"),
     ("GET", "/render-workers/v1/executions/{execution_id}/artifacts/{role}"),
     ("GET", "/render-workers/v1/executions/{execution_id}/cancel"),
+    ("GET", "/render-workers/v1/executions/{execution_id}/output"),
     ("GET", "/render-workers/v1/protocol"),
     ("GET", "/settings/api"),
     ("GET", "/settings/dubbing"),

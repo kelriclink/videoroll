@@ -141,11 +141,13 @@ class BilibiliPublishMeta(BaseModel):
 
 class BilibiliPublishSettingsRead(BaseModel):
     default_meta: BilibiliPublishMeta
+    upload_workers: int = Field(default=4, ge=1, le=8)
 
 
 class BilibiliPublishSettingsUpdate(BaseModel):
     # Replace the default meta template (stored in DB).
     default_meta: Optional[dict[str, Any]] = None
+    upload_workers: int | None = Field(default=None, ge=1, le=8)
 
 
 class BilibiliAuthSettingsRead(BaseModel):

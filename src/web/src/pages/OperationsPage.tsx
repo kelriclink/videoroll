@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { Link } from "react-router-dom";
 import { Button, DataTable, PageHeader, Section } from "../components/ui";
 import { fetchJson } from "../lib/http";
 import { ORCHESTRATOR_URL } from "../lib/urls";
@@ -183,7 +184,7 @@ export default function OperationsPage() {
         <div className="flex items-center justify-between gap-3">
           <div>
             <div className="text-sm font-semibold">当前告警</div>
-            <div className="mt-1 text-xs text-slate-500">自动信号：磁盘、AI 402/429/5xx、Worker heartbeat、账号检查；ffplayout 的 RTMP/RTMPS 输出失败由输出链路直接上报并在恢复后自动解决。</div>
+            <div className="mt-1 text-xs text-slate-500">自动信号：磁盘、AI、Worker、账号、字幕/配音/渲染失败、渲染兼容回退以及投稿不确定状态。每 60 秒扫描；任务详情同步提示。</div>
           </div>
           <div className="text-sm text-slate-500">{openAlerts.length} 条未解决</div>
         </div>
@@ -200,6 +201,15 @@ export default function OperationsPage() {
                     </div>
                     <div className="mt-2 font-medium text-slate-950">{alert.title}</div>
                     <div className="mt-1 text-sm text-slate-600">{alert.message || "-"}</div>
+                    {typeof alert.details?.reason === "string" && alert.details.reason ? (
+                      <div className="mt-1 break-words text-xs text-amber-800">回退原因：{alert.details.reason}</div>
+                    ) : null}
+                    {typeof alert.details?.pipeline === "string" && alert.details.pipeline ? (
+                      <div className="mt-1 break-words text-xs text-slate-500">实际路径：{alert.details.pipeline}</div>
+                    ) : null}
+                    {typeof alert.details?.task_id === "string" && alert.details.task_id ? (
+                      <Link className="mt-1 inline-block text-xs text-sky-700 underline" to={`/tasks/${alert.details.task_id}`}>查看关联任务</Link>
+                    ) : null}
                     <div className="mt-1 text-xs text-slate-400">最后出现：{new Date(alert.last_seen_at).toLocaleString()}</div>
                   </div>
                   <div className="flex shrink-0 gap-2">

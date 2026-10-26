@@ -34,6 +34,10 @@ class _FakeRuns:
     async def aio_cancel(self, run_id: str) -> None:
         self.canceled.append(run_id)
 
+    async def aio_get_status(self, run_id: str) -> Any:
+        from hatchet_sdk.clients.rest.models.v1_task_status import V1TaskStatus
+        return V1TaskStatus.COMPLETED
+
 
 def _runtime() -> Any:
     return SimpleNamespace(
@@ -119,6 +123,7 @@ def test_workflow_api_requires_internal_service_token(monkeypatch) -> None:
     assert len(fake_pipeline.calls) == 1
     payload, options = fake_pipeline.calls[0]
     assert payload.task_id == "task-1"
+    assert payload.dispatch_key.startswith("task-1:")
     assert options["wait_for_result"] is False
     assert options["additional_metadata"] == {"videoroll_task_id": "task-1"}
     assert int(options["priority"]) == 3
@@ -180,3 +185,36 @@ def test_workflow_api_requires_internal_service_token(monkeypatch) -> None:
         {"publish_batch_id": "batch-1", "status": "succeeded", "task_id": "task-1"},
         "batch-1",
     )
+
+
+def test_auto_youtube_api_returns_existing_id_after_idempotency_collision(monkeypatch) -> None:
+    from hatchet_sdk import IdempotencyCollisionError
+
+    class CollisionPipeline:
+        async def aio_run(self, _payload, **_kwargs):
+            raise IdempotencyCollisionError("original-video-pipeline")
+
+    runtime = _runtime()
+    monkeypatch.setattr(workflow_api, "_settings", lambda: runtime)
+    monkeypatch.setattr(workflow_api, "_video_pipeline", lambda: CollisionPipeline())
+    token = internal_service_token(runtime.internal_api_secret, development_mode=False)
+    response = TestClient(workflow_api.create_app()).post(
+        "/runs/auto-youtube",
+        json={"task_id": "task-1", "dispatch_key": "stable-run-1"},
+        headers={INTERNAL_TOKEN_HEADER: token},
+    )
+    assert response.status_code == 200
+    assert response.json() == {"workflow_run_id": "original-video-pipeline"}
+
+
+def test_workflow_status_endpoint_requires_token_and_reports_hatchet_not_business(monkeypatch) -> None:
+    runtime = _runtime()
+    fake = _FakeRuns()
+    monkeypatch.setattr(workflow_api, "_settings", lambda: runtime)
+    monkeypatch.setattr(workflow_api, "_hatchet", lambda: SimpleNamespace(runs=fake))
+    client = TestClient(workflow_api.create_app())
+    assert client.get("/runs/abc/status").status_code == 401
+    token = internal_service_token(runtime.internal_api_secret, development_mode=False)
+    response = client.get("/runs/abc/status", headers={INTERNAL_TOKEN_HEADER: token})
+    assert response.status_code == 200
+    assert response.json() == {"workflow_run_id": "abc", "status": "COMPLETED"}

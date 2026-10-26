@@ -970,3 +970,24 @@ def test_manual_subtitles_with_uploaded_srt_continues_to_final_merge(monkeypatch
         "succeeded",
         "succeeded",
     ]
+
+
+def test_audio_only_merge_video_mixes_audio_without_video_encode(monkeypatch, tmp_path):
+    from backend.app.adapters import ffmpeg as adapter
+    runner = PipelineRunner("audio-only-stage")
+    session = _cached_session(tmp_path)
+    mixed = session / "tmp" / "audio_mixed.m4a"
+    mixed.write_bytes(b"mixed audio")
+    runner.artifacts.session = session
+    runner.artifacts.video_file = session / "media" / "video_source.mp4"
+    runner.artifacts.dubbing_file = session / "tmp" / "audio_dubbing.wav"
+    runner.artifacts.bgm_file = session / "media" / "audio_bgm.wav"
+    runner.artifacts.timings_file = session / "metadata" / "timings.json"
+    monkeypatch.setattr(runner, "_local_info", lambda: {"audio_only": True})
+    monkeypatch.setattr(runner, "stage_message", lambda *_: None)
+    monkeypatch.setattr(adapter, "mix_dubbing_audio", lambda *_: mixed)
+    monkeypatch.setattr(adapter, "write_srt", lambda *_: session / "metadata" / "subtitles.zh.srt")
+    monkeypatch.setattr(adapter, "merge_video", lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        AssertionError("audio-only must not encode video")))
+    runner._merge_video({"output_mode": "both"})
+    assert runner.artifacts.final_video == mixed

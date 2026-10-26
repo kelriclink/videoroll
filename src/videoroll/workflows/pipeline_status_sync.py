@@ -137,7 +137,6 @@ def reconcile_stranded_auto_subtitle_jobs(settings, *, limit: int = 200) -> int:
             db.commit()
     return changed
 
-
 def reconcile_auto_pipeline_runs(settings, *, limit: int = 25) -> dict[str, int]:
     """Poll authoritative external run state; repair missed callbacks and stale rows.
 

@@ -1,4 +1,5 @@
 import { TaskDetailHeader } from "./components/TaskDetailHeader";
+import { TaskCompatibilityAlerts } from "./TaskCompatibilityAlerts";
 import { TaskDetailLogs } from "./components/TaskDetailLogs";
 import { TaskDetailMedia } from "./components/TaskDetailMedia";
 import { TaskDetailOverview } from "./components/TaskDetailOverview";
@@ -13,6 +14,7 @@ export function TaskDetailView({ controller }: { controller: TaskDetailControlle
   return (
     <div className="space-y-4">
       <TaskDetailHeader controller={controller} />
+      <TaskCompatibilityAlerts taskId={controller.taskId} />
       {controller.activeTab === "overview" ? <TaskDetailOverview controller={controller} /> : null}
       {controller.activeTab === "media" ? <TaskDetailMedia controller={controller} /> : null}
       {controller.activeTab === "subtitle" ? (

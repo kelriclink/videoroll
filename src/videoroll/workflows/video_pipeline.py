@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+
 from datetime import timedelta
 
 from hatchet_sdk import TTLBasedIdempotencyConfig
@@ -11,6 +13,8 @@ from pydantic import BaseModel
 from videoroll.workflows.auth import INTERNAL_TOKEN_HEADER, internal_service_token
 from videoroll.workflows.settings import WorkflowRuntimeSettings
 
+
+logger = logging.getLogger(__name__)
 
 VIDEO_PIPELINE_NAME = "VideoPipelineV1"
 SUBTITLE_JOB_TASK_NAME = "SubtitleJobV1"
@@ -25,6 +29,7 @@ YOUTUBE_DOWNLOAD_MAX_POLLS = 8 * 60 * 60 // YOUTUBE_DOWNLOAD_POLL_INTERVAL_SECON
 
 class AutoYouTubeWorkflowInput(BaseModel):
     task_id: str
+    dispatch_key: str = ""
 
 
 class SubtitleJobWorkflowInput(BaseModel):
@@ -287,6 +292,9 @@ def register_video_pipeline(hatchet: Any, *, settings: WorkflowRuntimeSettings |
     workflow = hatchet.workflow(
         name=VIDEO_PIPELINE_NAME,
         input_validator=AutoYouTubeWorkflowInput,
+        idempotency=TTLBasedIdempotencyConfig(
+            key_expression="input.dispatch_key", ttl=timedelta(days=7),
+        ),
     )
 
     @workflow.durable_task(
@@ -388,6 +396,14 @@ def register_video_pipeline(hatchet: Any, *, settings: WorkflowRuntimeSettings |
             render_job_id = subtitle_result.get("render_job_id")
         render_job_id = str(render_job_id or "").strip()
         if not render_job_id:
+            subtitle_status = getattr(subtitle_result, "status", None)
+            if isinstance(subtitle_result, dict):
+                subtitle_status = subtitle_result.get("status")
+            if subtitle_status == "no_speech":
+                return WorkflowStageOutput(
+                    task_id=input.task_id, status="no_speech",
+                    detail="No credible speech; do not render, dub or publish",
+                )
             return WorkflowStageOutput(
                 task_id=input.task_id,
                 status="skipped",
@@ -427,6 +443,12 @@ def register_video_pipeline(hatchet: Any, *, settings: WorkflowRuntimeSettings |
         desired_worker_labels=_desired_pool("workflow-core"),
     )
     def dubbing_start(input: AutoYouTubeWorkflowInput, _ctx: Any) -> WorkflowStageOutput:
+        rendered = _ctx.task_output(render_wait)
+        if getattr(rendered, "status", None) == "no_speech" or (
+            isinstance(rendered, dict) and rendered.get("status") == "no_speech"
+        ):
+            return WorkflowStageOutput(task_id=input.task_id, status="no_speech",
+                                       detail="No credible speech; dubbing skipped")
         result = _post_orchestrator(
             runtime,
             f"/tasks/{input.task_id}/actions/auto_dubbing",
@@ -455,6 +477,9 @@ def register_video_pipeline(hatchet: Any, *, settings: WorkflowRuntimeSettings |
             stage_status = started.get("status")
         job_id = str(job_id or "").strip()
         if not job_id:
+            if str(stage_status or "") == "no_speech":
+                return WorkflowStageOutput(task_id=input.task_id, status="no_speech",
+                                           detail="No credible speech; publishing must be skipped")
             return WorkflowStageOutput(task_id=input.task_id, status="skipped",
                                        detail="automatic dubbing disabled")
         if str(stage_status or "") == "succeeded":
@@ -510,6 +535,12 @@ def register_video_pipeline(hatchet: Any, *, settings: WorkflowRuntimeSettings |
     )
     def publish(input: AutoYouTubeWorkflowInput, ctx: Any) -> WorkflowStageOutput:
         dubbed = ctx.task_output(dubbing_wait)
+        status = getattr(dubbed, "status", None)
+        if isinstance(dubbed, dict):
+            status = dubbed.get("status")
+        if status == "no_speech":
+            return WorkflowStageOutput(task_id=input.task_id, status="no_speech",
+                                       detail="Automatic publishing suppressed: no credible speech")
         job_id = getattr(dubbed, "dubbing_job_id", None)
         if isinstance(dubbed, dict):
             job_id = dubbed.get("dubbing_job_id")
@@ -574,5 +605,25 @@ def register_video_pipeline(hatchet: Any, *, settings: WorkflowRuntimeSettings |
             detail="publish batch completed",
             publish_batch_id=publish_batch_id,
         )
+
+    @workflow.on_success_task(name="pipeline-audit-success")
+    def pipeline_audit_success(input: AutoYouTubeWorkflowInput, _ctx: Any) -> dict[str, str]:
+        from videoroll.workflows.pipeline_status_sync import finish_auto_pipeline_audit
+        try:
+            finish_auto_pipeline_audit(input.task_id, input.dispatch_key, succeeded=True)
+        except Exception:
+            logger.exception("VideoPipeline success audit callback failed; reconciler will recover")
+            return {"status": "audit_deferred"}
+        return {"status": "succeeded"}
+
+    @workflow.on_failure_task(name="pipeline-audit-failure")
+    def pipeline_audit_failure(input: AutoYouTubeWorkflowInput, _ctx: Any) -> dict[str, str]:
+        from videoroll.workflows.pipeline_status_sync import finish_auto_pipeline_audit
+        try:
+            finish_auto_pipeline_audit(input.task_id, input.dispatch_key, succeeded=False)
+        except Exception:
+            logger.exception("VideoPipeline failure audit callback failed; reconciler will recover")
+            return {"status": "audit_deferred"}
+        return {"status": "failed"}
 
     return workflow

@@ -350,7 +350,9 @@ class PipelineRunner:
         self.artifacts.session = session
 
         if stage == "download":
-            self.artifacts.video_file = _require_existing(session / "media" / "video_source.mp4", "video_file")
+            info = self._local_info() or {}
+            video = Path(info["original_path"]) if info.get("audio_only") else session / "media" / "video_source.mp4"
+            self.artifacts.video_file = _require_existing(video, "video_file")
             return
         if stage == "separate":
             self.artifacts.vocals_file = _require_existing(session / "media" / "audio_vocals.wav", "vocals_file")
@@ -380,7 +382,9 @@ class PipelineRunner:
             self.artifacts.timings_file = _require_existing(session / "metadata" / "timings.json", "timings_file")
             return
         if stage == "merge_video":
-            self.artifacts.final_video = _require_existing(session / "media" / "video_final.mp4", "final_video")
+            audio_only = bool((self._local_info() or {}).get("audio_only"))
+            path = session / "tmp" / "audio_mixed.m4a" if audio_only else session / "media" / "video_final.mp4"
+            self.artifacts.final_video = _require_existing(path, "final_output")
             return
         raise RuntimeError(f"Unknown pipeline stage: {stage}")
 
@@ -402,7 +406,8 @@ class PipelineRunner:
                 task_id=self.task_id,
             )
         self.artifacts.session = session
-        self.artifacts.video_file = session / "media" / "video_source.mp4"
+        self.artifacts.video_file = (Path(info["original_path"]) if info.get("audio_only")
+                                     else session / "media" / "video_source.mp4")
         title = (info.get("title") or "").strip() or None
         database.update_task(self.task_id, session_path=str(session), title=title)
         self.stage_message("download", f"[{source.name}] {title or 'Downloaded'} -> {session}")
@@ -577,6 +582,14 @@ class PipelineRunner:
             dubbing_file = _require(self.artifacts.dubbing_file, "dubbing_file")
             bgm_file = _require(self.artifacts.bgm_file, "bgm_file")
             subtitle_source = _require(self.artifacts.timings_file, "timings_file")
+        if bool((self._local_info() or {}).get("audio_only")):
+            from .adapters.ffmpeg import mix_dubbing_audio, write_srt
+            self.artifacts.final_video = mix_dubbing_audio(
+                _require(dubbing_file, "dubbing_file"), _require(bgm_file, "bgm_file"), session,
+            )
+            write_srt(subtitle_source, session)
+            self.stage_message("merge_video", "Audio-only handoff: mixed soundtrack and aligned SRT ready; video untouched")
+            return
         self.artifacts.final_video = merge_video(
             video_file,
             dubbing_file,

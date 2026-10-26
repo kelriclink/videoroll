@@ -33,6 +33,9 @@ from videoroll.db.models import (
     AppSetting,
     OperationInbox,
     RenderExecution,
+    DubbingJob,
+    PublishJob,
+    PublishState,
     RenderJob,
     RenderJobStatus,
     RenderWorker,
@@ -72,6 +75,8 @@ def operations_db() -> Session:
         RenderJob.__table__,
         RenderWorker.__table__,
         RenderExecution.__table__,
+        DubbingJob.__table__,
+        PublishJob.__table__,
         AIUsageEvent.__table__,
         AlertEvent.__table__,
     ]
@@ -711,3 +716,53 @@ def test_thinking_retries_record_failed_attempt_before_success(monkeypatch: pyte
     assert result == {"ok": True}
     assert [event["status_code"] for event in events] == [500, 200]
     assert [event["success"] for event in events] == [False, True]
+
+
+def test_render_fallback_alert_is_task_linked_and_not_counted_on_rescan(
+    operations_db: Session, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _mock_healthy_disk(monkeypatch)
+    task = Task(source_type=SourceType.local, source_license=SourceLicense.own, status=TaskStatus.rendered)
+    worker = RenderWorker(worker_key="warn-worker", name="Warning Worker", platform="linux", status="online")
+    operations_db.add_all([task, worker]); operations_db.flush()
+    job = RenderJob(task_id=task.id, status=RenderJobStatus.succeeded, request_json={})
+    operations_db.add(job); operations_db.flush()
+    execution = RenderExecution(
+        render_job_id=job.id, worker_id=worker.id, attempt=1,
+        fence_token="warning-fence", state="succeeded",
+        metrics={"pipeline": "vaapi-live-static-fallback", "compatibility_warnings": [
+            {"code": "ass-event-overlay-failed", "message": "GPU 图层失败后切换实时图层", "reason": "driver failure"},
+        ]},
+    )
+    operations_db.add(execution); operations_db.commit()
+
+    settings = SimpleNamespace(storage_root="/tmp")
+    operations_service.scan_alerts(settings, operations_db)
+    rows = operations_service.list_alerts(operations_db, status="active", task_id=task.id)
+    assert len(rows) == 1
+    assert rows[0]["source"] == "render"
+    assert rows[0]["details"]["code"] == "ass-event-overlay-failed"
+    assert rows[0]["details"]["reason"] == "driver failure"
+    assert rows[0]["occurrence_count"] == 1
+    operations_service.scan_alerts(settings, operations_db)
+    assert operations_service.list_alerts(operations_db, task_id=task.id)[0]["occurrence_count"] == 1
+
+    operations_service.set_alert_status(operations_db, rows[0]["id"], status="resolved")
+    operations_service.scan_alerts(settings, operations_db)
+    assert operations_service.list_alerts(operations_db, status="active", task_id=task.id) == []
+
+
+def test_job_failure_and_uncertain_publish_are_actionable_without_retry(
+    operations_db: Session, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _mock_healthy_disk(monkeypatch)
+    task = Task(source_type=SourceType.local, source_license=SourceLicense.own, status=TaskStatus.rendered)
+    operations_db.add(task); operations_db.flush()
+    operations_db.add(DubbingJob(task_id=task.id, status="failed", error_message="CUDA out of memory"))
+    operations_db.add(PublishJob(task_id=task.id, state=PublishState.unknown, upload_active=False))
+    operations_db.commit()
+    operations_service.scan_alerts(SimpleNamespace(storage_root="/tmp"), operations_db)
+    rows = operations_service.list_alerts(operations_db, task_id=task.id)
+    assert {r["source"] for r in rows} == {"dubbing", "publishing"}
+    assert any("请勿盲目重投" in r["title"] for r in rows)
+    assert any("CUDA out of memory" in r["message"] for r in rows)

@@ -40,6 +40,7 @@ export type Task = {
 };
 
 export type Asset = {
+  task_id?: string;
   id: string;
   kind: string;
   storage_key: string;
@@ -153,6 +154,7 @@ export type PublishActionPayload = {
 
 export type VersionedPublishSettings = {
   default_meta: Record<string, unknown>;
+  upload_workers?: number;
   version?: string | number | null;
 };
 

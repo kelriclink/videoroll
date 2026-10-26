@@ -21,6 +21,12 @@ from videoroll.db.models import (
     AppSetting,
     RenderJob,
     RenderJobStatus,
+    RenderExecution,
+    DubbingJob,
+    PublishJob,
+    PublishState,
+    Task,
+    TaskStatus,
     SubtitleJob,
     SubtitleJobStatus,
 )
@@ -31,6 +37,10 @@ _MANAGED_ALERT_PREFIXES = (
     "ai:http:",
     "account:",
     "queue:stale:",
+    "render:compat:",
+    "render:failure:",
+    "job:failure:",
+    "publish:uncertain:",
 )
 
 
@@ -306,8 +316,13 @@ def _alert_dict(row: AlertEvent) -> dict[str, Any]:
     }
 
 
-def list_alerts(db: Session, *, status: str | None = None, limit: int = 200) -> list[dict[str, Any]]:
+def list_alerts(
+    db: Session, *, status: str | None = None, limit: int = 200,
+    task_id: uuid.UUID | None = None,
+) -> list[dict[str, Any]]:
     query = db.query(AlertEvent)
+    if task_id is not None:
+        query = query.filter(AlertEvent.details_json["task_id"].as_string() == str(task_id))
     if status == "active":
         query = query.filter(AlertEvent.status.in_(["open", "acknowledged"]))
     elif status and status != "all":
@@ -325,6 +340,7 @@ def upsert_alert(
     title: str,
     message: str = "",
     details: dict[str, Any] | None = None,
+    increment_occurrence: bool = True,
 ) -> AlertEvent:
     now = _utcnow()
     fingerprint = str(fingerprint or "").strip()[:255]
@@ -370,8 +386,9 @@ def upsert_alert(
     row.message = str(message or "")
     row.details_json = dict(details or {})
     row.last_seen_at = now
-    row.occurrence_count = int(row.occurrence_count or 0) + 1
-    if row.status == "resolved":
+    if increment_occurrence:
+        row.occurrence_count = int(row.occurrence_count or 0) + 1
+    if row.status == "resolved" and increment_occurrence:
         row.status = "open"
         row.resolved_at = None
         row.acknowledged_at = None
@@ -585,6 +602,75 @@ def _collect_scan_conditions(settings: OrchestratorSettings, db: Session) -> dic
                 details={"status_code": status, "count": count, "window_minutes": 15},
             )
 
+    # Business-task failures and compatibility switches: discover persisted
+    # outcomes, not transient log lines. Deduplicate each execution/job by ID.
+    # A 48-hour review window retains resolved incidents in the alert history.
+    since = now - timedelta(hours=48)
+    executions = (
+        db.query(RenderExecution, RenderJob.task_id)
+        .join(RenderJob, RenderExecution.render_job_id == RenderJob.id)
+        .filter(RenderExecution.updated_at >= since)
+        .order_by(RenderExecution.updated_at.desc()).limit(400).all()
+    )
+    for execution, task_id in executions:
+        details = {"task_id": str(task_id), "render_job_id": str(execution.render_job_id),
+                   "execution_id": str(execution.id), "attempt": int(execution.attempt)}
+        metrics = execution.metrics if isinstance(execution.metrics, dict) else {}
+        for warning in (metrics.get("compatibility_warnings") or [])[:20]:
+            if not isinstance(warning, dict):
+                continue
+            code = str(warning.get("code") or "").strip()[:64]
+            if not code:
+                continue
+            _condition(
+                active, fingerprint=f"render:compat:{execution.id}:{code}",
+                source="render", severity="warning",
+                title="渲染已采用兼容/回退路径",
+                message=str(warning.get("message") or code)[:600],
+                details={**details, "code": code, "reason": str(warning.get("reason") or "")[:400],
+                         "pipeline": str(metrics.get("pipeline") or "")[:350]},
+            )
+        if execution.state == "failed":
+            _condition(
+                active, fingerprint=f"render:failure:{execution.id}",
+                source="render", severity="warning", title="渲染执行失败或已安排重试",
+                message=str(execution.error_message or "渲染 Worker 返回失败")[:600],
+                details=details,
+            )
+
+    # Subtitle/TTS/overall task failures are equally visible even if no GPU
+    # render was attempted; publishing unknown is NOT treated as safe to retry.
+    for model, statuses, source, title in (
+        (SubtitleJob, [SubtitleJobStatus.failed], "subtitle", "字幕任务失败"),
+        (DubbingJob, ["failed"], "dubbing", "配音任务失败"),
+        (Task, [TaskStatus.failed], "task", "视频任务失败"),
+    ):
+        jobs = (db.query(model)
+                .filter(model.status.in_(statuses), model.updated_at >= since)
+                .order_by(model.updated_at.desc()).limit(200).all())
+        for job in jobs:
+            # An explicit user cancellation is not a service failure.
+            if str(job.error_message or "").lower().startswith("canceled by user"):
+                continue
+            task_id = job.task_id if hasattr(job, "task_id") else job.id
+            _condition(
+                active, fingerprint=f"job:failure:{source}:{job.id}",
+                source=source, severity="critical" if source == "dubbing" else "warning",
+                title=title, message=str(job.error_message or "任务失败，请检查日志")[:600],
+                details={"task_id": str(task_id), "job_id": str(job.id)},
+            )
+
+    uncertain = (db.query(PublishJob)
+                 .filter(PublishJob.state == PublishState.unknown, PublishJob.updated_at >= since)
+                 .order_by(PublishJob.updated_at.desc()).limit(100).all())
+    for job in uncertain:
+        _condition(
+            active, fingerprint=f"publish:uncertain:{job.id}",
+            source="publishing", severity="critical", title="投稿结果不确定，请勿盲目重投",
+            message="上传或提交结果未知，请先在 B站核实是否已经发布，避免重复投稿。",
+            details={"task_id": str(job.task_id), "publish_job_id": str(job.id)},
+        )
+
     return active
 
 
@@ -593,7 +679,16 @@ def scan_alerts(settings: OrchestratorSettings, db: Session) -> dict[str, Any]:
     active = _collect_scan_conditions(settings, db)
     updated = 0
     for condition in active.values():
-        upsert_alert(db, **condition)
+        fingerprint = condition["fingerprint"]
+        is_incident = fingerprint.startswith(("render:compat:", "render:failure:",
+                                              "job:failure:", "publish:uncertain:"))
+        if is_incident:
+            existing = db.query(AlertEvent).filter(AlertEvent.fingerprint == fingerprint).one_or_none()
+            # Manually resolved incidents are immutable once the user resolves
+            # them, even if the failure remains in the historical 48h window.
+            if existing is not None and existing.status == "resolved":
+                continue
+        upsert_alert(db, **condition, increment_occurrence=not is_incident)
         updated += 1
 
     managed_open = (
