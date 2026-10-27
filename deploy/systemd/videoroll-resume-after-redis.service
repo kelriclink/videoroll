@@ -1,0 +1,13 @@
+[Unit]
+Description=Resume VideoRoll required services when Redis starts
+Requires=videoroll-redis.service
+After=videoroll-redis.service videoroll-hatchet-token.service
+ConditionPathExists=/opt/videoroll/current
+
+[Service]
+Type=oneshot
+ExecStart=/opt/videoroll/libexec/videoroll-resume-after-redis
+TimeoutStartSec=30
+
+[Install]
+WantedBy=videoroll-redis.service

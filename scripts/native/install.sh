@@ -304,11 +304,27 @@ install -m 0755 "$ROOT_DIR/scripts/native/run-hatchet.sh" /opt/videoroll/libexec
 install -m 0755 "$ROOT_DIR/scripts/native/init_hatchet_token.sh" /opt/videoroll/libexec/videoroll-init-hatchet-token
 install -m 0755 "$ROOT_DIR/scripts/native/run-social-role.sh" /opt/videoroll/libexec/videoroll-run-social-role
 install -m 0755 "$ROOT_DIR/scripts/native/run-ffplayout.sh" /opt/videoroll/libexec/videoroll-run-ffplayout
+install -m 0755 "$ROOT_DIR/scripts/native/redis-aof-preflight.sh" /opt/videoroll/libexec/videoroll-redis-aof-preflight
+install -m 0755 "$ROOT_DIR/scripts/native/redis-wait-ready.sh" /opt/videoroll/libexec/videoroll-redis-wait-ready
+install -m 0755 "$ROOT_DIR/scripts/native/resume-after-redis.sh" /opt/videoroll/libexec/videoroll-resume-after-redis
 install -m 0644 "$ROOT_DIR/deploy/systemd/videoroll@.service" /etc/systemd/system/videoroll@.service
 install -m 0644 "$ROOT_DIR/deploy/systemd/videoroll.target" /etc/systemd/system/videoroll.target
 install -m 0644 "$ROOT_DIR/deploy/systemd/videoroll-web.service" /etc/systemd/system/videoroll-web.service
 install -m 0644 "$ROOT_DIR/deploy/systemd/videoroll-ffplayout.service" /etc/systemd/system/videoroll-ffplayout.service
 install -m 0644 "$ROOT_DIR/deploy/systemd/videoroll-redis.service" /etc/systemd/system/videoroll-redis.service
+install -m 0644 "$ROOT_DIR/deploy/systemd/videoroll-resume-after-redis.service" /etc/systemd/system/videoroll-resume-after-redis.service
+install -d -m 0755 /etc/systemd/system/videoroll-redis.service.d
+cat > /etc/systemd/system/videoroll-redis.service.d/20-aof-preflight.conf <<EOF
+[Unit]
+RequiresMountsFor=$DATA_ROOT/redis-native
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+ExecStartPre=+/opt/videoroll/libexec/videoroll-redis-aof-preflight
+ExecStartPost=+/opt/videoroll/libexec/videoroll-redis-wait-ready
+TimeoutStartSec=90
+EOF
 install -m 0644 "$ROOT_DIR/deploy/systemd/videoroll-hatchet.service" /etc/systemd/system/videoroll-hatchet.service
 install -m 0644 "$ROOT_DIR/deploy/systemd/videoroll-hatchet-token.service" /etc/systemd/system/videoroll-hatchet-token.service
 install -m 0644 "$ROOT_DIR/deploy/systemd/videoroll-social@.service" /etc/systemd/system/videoroll-social@.service
@@ -350,6 +366,7 @@ if [[ -n "${FFPLAYOUT_ARTIFACT_DIR:-}" ]]; then
 fi
 
 systemctl daemon-reload
+systemctl enable videoroll-resume-after-redis.service
 
 echo
 echo "Native runtime installed but not enabled or started."

@@ -29,15 +29,17 @@ fi
 nginx_bin="$tree/usr/sbin/nginx"
 redis_bin="$tree/usr/bin/redis-server"
 redis_cli="$tree/usr/bin/redis-cli"
+redis_check_aof="$tree/usr/bin/redis-check-aof"
 mime="$tree/etc/nginx/mime.types"
 lzf="$(find "$tree" -type f -name 'liblzf.so.1.*' -print -quit)"
-for file in "$nginx_bin" "$redis_bin" "$redis_cli" "$mime" "$lzf"; do
+for file in "$nginx_bin" "$redis_bin" "$redis_cli" "$redis_check_aof" "$mime" "$lzf"; do
   test -s "$file" || { echo "Missing bundled binary/resource $file" >&2; exit 1; }
 done
 install -d -m 0755 "$ROOT/bin" "$ROOT/lib" "$ROOT/share/nginx"
 install -m 0755 "$nginx_bin" "$ROOT/bin/nginx"
 install -m 0755 "$redis_bin" "$ROOT/bin/redis-server"
 install -m 0755 "$redis_cli" "$ROOT/bin/redis-cli-real"
+install -m 0755 "$redis_check_aof" "$ROOT/bin/redis-check-aof"
 # CLI also links liblzf. Wrap it so operators need no global linker changes.
 cat > "$ROOT/bin/redis-cli" <<'SH'
 #!/usr/bin/env bash
