@@ -8,13 +8,13 @@ from __future__ import annotations
 
 import logging
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import httpx
 from sqlalchemy.orm import Session
 
 from videoroll.apps.orchestrator_api.infrastructure.internal_http import internal_http_headers
-from videoroll.db.models import PipelineRun, SubtitleJob, SubtitleJobStatus, SourceType, Task
+from videoroll.db.models import PipelineRun, SubtitleJob, SubtitleJobStatus, SourceType, Task, TaskStatus
 from videoroll.db.session import get_sessionmaker
 
 logger = logging.getLogger(__name__)
@@ -137,6 +137,116 @@ def reconcile_stranded_auto_subtitle_jobs(settings, *, limit: int = 200) -> int:
             db.commit()
     return changed
 
+def recover_failed_auto_launches(settings, *, limit: int = 3) -> dict[str, int]:
+    """Retry recent automatic launch failures using their original Hatchet dispatch key.
+
+    An unavailable workflow-api must not indefinitely strand ingested scanner
+    tasks. The retry is throttled, checked against current business state and
+    bounded by Hatchet's seven-day idempotency TTL.
+    """
+    from videoroll.workflows.launcher import PipelineLauncher
+
+    now = datetime.now(timezone.utc)
+    factory = get_sessionmaker(settings.database_url)
+    with factory() as db:
+        rows = (
+            db.query(PipelineRun)
+            .join(Task, Task.id == PipelineRun.task_id)
+            .filter(
+                PipelineRun.engine == "hatchet",
+                PipelineRun.workflow_name == AUTO_WORKFLOW_NAME,
+                PipelineRun.state == "launch_failed",
+                PipelineRun.external_run_id.is_(None),
+                PipelineRun.created_at >= now - timedelta(days=6),
+                PipelineRun.updated_at <= now - timedelta(seconds=90),
+                Task.status == TaskStatus.ingested,
+                Task.created_by.like("auto_youtube;%"),
+            )
+            .order_by(PipelineRun.updated_at.asc())
+            .limit(max(1, min(int(limit), 10)))
+            .all()
+        )
+        candidates = [(row.task_id, row.id, (row.request_json or {}).get("dispatch_key")) for row in rows]
+
+    stats = {"checked": 0, "launched": 0, "errors": 0}
+    launcher = PipelineLauncher(settings)
+    for task_id, run_id, key in candidates:
+        if not isinstance(key, str) or not key.startswith("auto-youtube:"):
+            continue
+        # A concurrent manual restart may already have launched this task.
+        with factory() as db:
+            active = db.query(PipelineRun.id).filter(
+                PipelineRun.task_id == task_id,
+                PipelineRun.id != run_id,
+                PipelineRun.workflow_name == AUTO_WORKFLOW_NAME,
+                PipelineRun.state.in_(("submitting", "submitted", "running")),
+            ).first()
+            task = db.get(Task, task_id)
+            if active is not None or task is None or task.status != TaskStatus.ingested:
+                continue
+        stats["checked"] += 1
+        try:
+            launcher.launch_auto_youtube(task_id)
+            stats["launched"] += 1
+        except Exception as exc:
+            stats["errors"] += 1
+            logger.warning("failed to recover automatic Hatchet launch task=%s: %s", task_id, exc)
+            if isinstance(exc, httpx.TransportError):
+                break  # Don't flood an unavailable workflow API.
+    return stats
+
+
+def reconcile_failed_child_subtitle_jobs(settings, *, limit: int = 200) -> int:
+    """Clear phantom queued jobs whose own Hatchet child run failed.
+
+    Parent reconciliation deliberately excludes jobs created after parent
+    failure. These later independent retries need separate synchronization.
+    """
+    factory = get_sessionmaker(settings.database_url)
+    changed = 0
+    with factory() as db:
+        jobs = (
+            db.query(SubtitleJob)
+            .join(Task, Task.id == SubtitleJob.task_id)
+            .filter(
+                Task.status == TaskStatus.failed,
+                SubtitleJob.status == SubtitleJobStatus.queued,
+                SubtitleJob.progress == 0,
+                SubtitleJob.lease_owner.is_(None),
+                SubtitleJob.heartbeat_at.is_(None),
+            )
+            .order_by(SubtitleJob.created_at.asc())
+            .limit(max(1, min(int(limit), 500)))
+            .with_for_update(of=SubtitleJob, skip_locked=True)
+            .all()
+        )
+        for job in jobs:
+            runs = db.query(PipelineRun).filter(
+                PipelineRun.task_id == job.task_id,
+                PipelineRun.workflow_name == "SubtitleJobV1",
+            ).order_by(PipelineRun.created_at.desc()).all()
+            latest = next((r for r in runs if str((r.request_json or {}).get("job_id")) == str(job.id)), None)
+            if latest is None or latest.state not in {"failed", "canceled"}:
+                continue
+            active = db.query(PipelineRun.id).filter(
+                PipelineRun.task_id == job.task_id,
+                PipelineRun.state.in_(tuple(_ACTIVE)),
+            ).first()
+            if active is not None:
+                continue
+            job.status = SubtitleJobStatus.failed
+            job.error_message = (
+                "Hatchet SubtitleJobV1 failed before this queued job started; "
+                "retry from the task after resolving the original failure."
+            )
+            job.updated_at = datetime.now(timezone.utc)
+            db.add(job)
+            changed += 1
+        if changed:
+            db.commit()
+    return changed
+
+
 def reconcile_auto_pipeline_runs(settings, *, limit: int = 25) -> dict[str, int]:
     """Poll authoritative Hatchet state for all workflow types, repairing stale rows.
 
@@ -180,5 +290,6 @@ def reconcile_auto_pipeline_runs(settings, *, limit: int = 25) -> dict[str, int]
             except (httpx.HTTPError, ValueError, KeyError, TypeError) as exc:
                 counts["errors"] += 1
                 logger.warning("Hatchet workflow status reconciliation failed for %s: %s", run_id, exc)
-    counts["stranded_jobs_failed"] = reconcile_stranded_auto_subtitle_jobs(settings)
+    counts["stranded_jobs_failed"] = (reconcile_stranded_auto_subtitle_jobs(settings)
+                                      + reconcile_failed_child_subtitle_jobs(settings))
     return counts

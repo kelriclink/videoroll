@@ -132,3 +132,67 @@ def test_reconcile_failed_http_never_marks_a_completed_business_task(monkeypatch
     assert result['errors'] == 4 and result['updated'] == 0
     assert _runs(factory)['external-0'][0] == 'submitted'
     engine.dispose()
+
+def test_failed_auto_launch_recovery_reuses_durable_attempt(monkeypatch):
+    from datetime import datetime, timedelta, timezone
+    from videoroll.workflows import launcher as launch_module
+
+    engine, factory, _ = _factory()
+    old = datetime.now(timezone.utc) - timedelta(minutes=10)
+    with factory() as db:
+        auto = Task(source_type=SourceType.youtube, source_license=SourceLicense.authorized,
+                    status=TaskStatus.ingested,
+                    created_by="auto_youtube;auto_publish=;run_id=test")
+        manual = Task(source_type=SourceType.youtube, source_license=SourceLicense.authorized,
+                      status=TaskStatus.ingested, created_by="manual")
+        db.add_all([auto, manual])
+        db.flush()
+        for task in (auto, manual):
+            db.add(PipelineRun(task_id=task.id, engine="hatchet",
+                               workflow_name="VideoPipelineV1", state="launch_failed",
+                               created_at=old, updated_at=old,
+                               request_json={"dispatch_key": f"auto-youtube:{task.id}"}))
+        db.commit()
+        auto_id, manual_id = auto.id, manual.id
+
+    seen = []
+    monkeypatch.setattr(sync, "get_sessionmaker", lambda url: factory)
+    monkeypatch.setattr(launch_module, "PipelineLauncher",
+                        lambda settings: SimpleNamespace(launch_auto_youtube=lambda task_id: seen.append(task_id)))
+    result = sync.recover_failed_auto_launches(_settings())
+    assert result == {"checked": 1, "launched": 1, "errors": 0}
+    assert seen == [auto_id]
+    assert manual_id not in seen
+    with factory() as db:
+        original = db.query(PipelineRun).filter(PipelineRun.task_id == auto_id).one()
+        assert original.request_json["dispatch_key"] == f"auto-youtube:{auto_id}"
+        assert db.query(Task).filter(Task.id == auto_id).count() == 1
+    engine.dispose()
+
+
+def test_failed_hatchet_child_reconciles_its_orphaned_queued_job(monkeypatch):
+    from videoroll.db.models import SubtitleJobStatus
+
+    engine, factory, _ = _factory()
+    with factory() as db:
+        task = Task(source_type=SourceType.youtube, source_license=SourceLicense.authorized,
+                    status=TaskStatus.failed)
+        db.add(task)
+        db.flush()
+        failed_job = SubtitleJob(task_id=task.id, status=SubtitleJobStatus.queued,
+                                 request_json={"runtime_profile": True}, progress=0)
+        db.add(failed_job)
+        db.flush()
+        job_id = failed_job.id
+        db.add(PipelineRun(task_id=task.id, engine="hatchet", workflow_name="SubtitleJobV1",
+                           state="failed", request_json={"job_id": str(job_id)}))
+        db.commit()
+
+    monkeypatch.setattr(sync, "get_sessionmaker", lambda url: factory)
+    assert sync.reconcile_failed_child_subtitle_jobs(_settings()) == 1
+    with factory() as db:
+        job = db.get(SubtitleJob, job_id)
+        assert job.status == SubtitleJobStatus.failed
+        assert "Hatchet SubtitleJobV1 failed" in job.error_message
+    assert sync.reconcile_failed_child_subtitle_jobs(_settings()) == 0
+    engine.dispose()

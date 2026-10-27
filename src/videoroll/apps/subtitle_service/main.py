@@ -2403,6 +2403,7 @@ def _read_task_queue(db: Session, *, limit: int) -> TaskQueueRead:
         render_by_task.setdefault(job.task_id, job)
 
     candidate_ids = set(subtitle_by_task) | set(render_by_task)
+    failed_launch_by_task: dict[uuid.UUID, PipelineRun] = {}
     auto_tasks = (
         db.query(Task)
         .filter(
@@ -2426,9 +2427,11 @@ def _read_task_queue(db: Session, *, limit: int) -> TaskQueueRead:
         # A finished/failed workflow does not belong to the live task queue.
         # A new automatic retry creates a new active PipelineRun.
         if latest_parent is not None and latest_parent.state in {
-            "failed", "canceled", "launch_failed", "superseded", "succeeded",
+            "failed", "canceled", "superseded", "succeeded",
         }:
             continue
+        if latest_parent is not None and latest_parent.state == "launch_failed":
+            failed_launch_by_task[task.id] = latest_parent
         candidate_ids.add(task.id)
 
     if not candidate_ids:
@@ -2476,10 +2479,16 @@ def _read_task_queue(db: Session, *, limit: int) -> TaskQueueRead:
             created_at = sj.created_at
             updated_at = sj.updated_at
         else:
-            youtube_progress = _auto_youtube_queue_progress(db, task)
-            if youtube_progress is not None:
-                stage, progress, error_message = youtube_progress
-                state = "running" if stage == "youtube_download" else "queued"
+            failed_launch = failed_launch_by_task.get(task.id)
+            if failed_launch is not None:
+                stage = "workflow_retry"
+                error_message = ("Waiting to retry Hatchet launch: " +
+                                 str(failed_launch.error_message or "workflow service unavailable"))
+            else:
+                youtube_progress = _auto_youtube_queue_progress(db, task)
+                if youtube_progress is not None:
+                    stage, progress, error_message = youtube_progress
+                    state = "running" if stage == "youtube_download" else "queued"
 
         items.append(
             TaskQueueItemRead(
