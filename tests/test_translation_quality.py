@@ -413,3 +413,46 @@ def test_translation_memory_write_uses_one_upsert_per_pair() -> None:
     assert len(db.executions) == 2
     assert db.executions[0][1]["source_norm"] == "one"
     assert db.executions[1][1]["target_text"] == "二"
+
+
+
+def test_scp_identifier_hyphen_and_leading_zero_not_negative() -> None:
+    from videoroll.apps.subtitle_service.translation_quality import _numbers
+
+    assert _numbers("056 arrives in a small American town.") == _numbers(
+        "SCP-056 到达了一座美国小镇。"
+    )
+    assert _numbers("SCP-145 is contained.") == _numbers("SCP-145 已被收容。")
+    assert _numbers("D-9229 and D-9230") == _numbers("D-9229 和 D-9230")
+
+
+def test_asr_repeated_numbers_not_blocking_when_translated_once() -> None:
+    original = (
+        "For all intents and purposes, SCP-145 appears to be a standard, 2002 model cordless "
+        "For sense and purposes, SCP-145 appears to be a standard 2002 model cordless telephone handset."
+    )
+    translated = "SCP-145 看起来是一台普通的 2002 年款无线电话。"
+    assert validate_translation_mapping(
+        blocks=[{"idx": 3044, "text": original}],
+        translations={3044: translated},
+    ) == []
+
+
+def test_genuinely_altered_numeric_value_still_blocked() -> None:
+    issues = validate_translation_mapping(
+        blocks=[{"idx": 1, "text": "SCP-145 is a 2002 telephone, at -5 degrees."}],
+        translations={1: "SCP-145 是 2003 年款电话，温度为 5 度。"},
+    )
+    assert {item["type"] for item in blocking_translation_issues(issues)} == {"number_mismatch"}
+
+
+def test_nonrecoverable_singleton_validation_is_not_retried_as_network_error() -> None:
+    from videoroll.apps.subtitle_service.processing import (
+        TranslationPromptTooLongError, TranslationValidationError,
+    )
+    from videoroll.apps.subtitle_service.translation_stage import is_retryable_translation_error
+
+    assert not is_retryable_translation_error(
+        TranslationValidationError([{"idx": 2627, "type": "number_mismatch", "severity": "error"}])
+    )
+    assert not is_retryable_translation_error(TranslationPromptTooLongError("input budget exceeded"))

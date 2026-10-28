@@ -260,7 +260,14 @@ function translationSessionStats(run: AgentRun, childrenByParent: Map<string, Ag
   const total = numberValue(run.result?.total_segments)
     ?? numberValue(recordValue(run.steps[0]?.input).segment_count)
     ?? 0;
-  const completed = numberValue(run.result?.completed_segments) ?? completedFromBatches;
+  // A resumed translation starts a new Agent Session but keeps the existing
+  // object-store checkpoint. Show that persisted prefix immediately instead
+  // of incorrectly displaying 0% until its first new batch finishes.
+  const sessionStart = run.steps.find((step) => step.action === "translation_session.started");
+  const resumed = numberValue(recordValue(sessionStart?.input).resumed_segments) ?? 0;
+  const completed = Math.min(total, Math.max(
+    resumed, completedFromBatches, numberValue(run.result?.completed_segments) ?? 0,
+  ));
   const failed = batches.filter((batch) => agentTreeDisplayStatus(batch, childrenByParent).tone === "failed").length;
   const running = batches.filter((batch) => agentTreeDisplayStatus(batch, childrenByParent).tone === "running").length;
   const succeeded = batches.filter((batch) => agentTreeDisplayStatus(batch, childrenByParent).tone === "success").length;

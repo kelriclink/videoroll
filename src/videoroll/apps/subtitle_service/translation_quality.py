@@ -237,11 +237,25 @@ def _canonical_number(value: str) -> str:
 
 
 def _numbers(value: str) -> Counter[str]:
-    return Counter(
-        canonical
-        for match in _NUMBER_RE.findall(str(value or ""))
-        if (canonical := _canonical_number(match))
-    )
+    """Recognize distinct numeric *values*, not ASR repetition counts.
+
+    The minus in identifier labels such as SCP-145 or D-9229 is a separator,
+    not a mathematical negative sign. Duplicate ASR fragments may legitimately
+    be collapsed by a translation: a number mentioned twice is not two facts.
+    Actual negative values (e.g. -5 °C) still keep their sign.
+    """
+    text = unicodedata.normalize("NFKC", str(value or ""))
+    found: set[str] = set()
+    for match in _NUMBER_RE.finditer(text):
+        token = match.group()
+        if token.startswith("-") and match.start() and (
+            text[match.start() - 1].isascii() and text[match.start() - 1].isalpha()
+        ):
+            token = token[1:]
+        canonical = _canonical_number(token)
+        if canonical:
+            found.add(canonical)
+    return Counter({number: 1 for number in found})
 
 
 def validate_translation_mapping(

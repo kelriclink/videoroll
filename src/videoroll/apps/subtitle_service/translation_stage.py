@@ -12,6 +12,8 @@ from videoroll.apps.subtitle_service.model_provider_store import resolve_provide
 from videoroll.apps.subtitle_service.embeddings import embedding_settings_from_translate_settings
 from videoroll.apps.subtitle_service.processing import (
     Segment,
+    TranslationPromptTooLongError,
+    TranslationValidationError,
     translate_segments_mock,
     translate_segments_openai_with_summary,
 )
@@ -60,6 +62,11 @@ class TranslationRetryRequired(RuntimeError):
 
 
 def is_retryable_translation_error(error: Exception) -> bool:
+    # A single subtitle still failing semantic validation cannot be solved by
+    # restarting the entire Session. Preserve its completed prefix and expose
+    # the blocked index for manual correction instead of retry storms.
+    if isinstance(error, (TranslationValidationError, TranslationPromptTooLongError)):
+        return False
     return is_retryable_openai_error(error)
 
 
