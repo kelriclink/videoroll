@@ -55,7 +55,8 @@ def enqueue_download(db: Session, task_id: uuid.UUID) -> str:
     task = db.get(Task, task_id)
     if task is None or task.source_type != SourceType.youtube:
         raise ValueError("YouTube task not found")
-    if task.status in {TaskStatus.published, TaskStatus.publishing, TaskStatus.canceled, TaskStatus.failed}:
+    explicit_restart = str(task.created_by or "").startswith("youtube_task_restart;")
+    if task.status in {TaskStatus.published, TaskStatus.publishing, TaskStatus.canceled} or (task.status == TaskStatus.failed and not explicit_restart):
         raise ValueError("task is terminal and cannot enqueue an automatic download")
     key = f"{OPERATION_PREFIX}{task_id}"
     operation = db.query(OperationInbox).filter(OperationInbox.operation_key == key).with_for_update().one_or_none()
@@ -70,8 +71,16 @@ def enqueue_download(db: Session, task_id: uuid.UUID) -> str:
     if operation is not None and operation.status == "completed":
         return "completed"
     if operation is not None and operation.status == "failed":
-        # A failed attempt is explicit. Do not silently retry forever.
-        return "failed"
+        # Explicit UI restart supplies a new durable run marker and may reopen
+        # the same task; an automatic retry cannot erase a terminal failure.
+        if not explicit_restart or (operation.request_json or {}).get("explicit_restart_id") == task.created_by:
+            return "failed"
+        operation.status = "pending"
+        operation.lease_owner = None
+        operation.lease_until = None
+        operation.last_error = None
+        operation.request_json = {"task_id": str(task_id), "explicit_restart_id": task.created_by}
+
     db.commit()
     return "queued"
 
@@ -124,7 +133,7 @@ class DownloadSupervisor:
                 key = f"{OPERATION_PREFIX}{task_id}"
                 with self.sessions() as record:
                     op = record.query(OperationInbox).filter(OperationInbox.operation_key == key).with_for_update().one_or_none()
-                    if op is None:
+                    if op is None or op.status == "completed":
                         return
                     request = dict(op.request_json or {})
                     attempts = int(request.get("worker_failures", 0)) + 1
@@ -136,6 +145,12 @@ class DownloadSupervisor:
                         op.status = "failed"
                         op.lease_owner = None
                         op.lease_until = None
+                        task = record.get(Task, task_id)
+                        if task is not None and task.status == TaskStatus.ingested:
+                            task.status = TaskStatus.failed
+                            task.error_code = "YOUTUBE_DOWNLOAD_FAILED"
+                            task.error_message = op.last_error
+                            record.add(task)
                     record.commit()
 
     def _candidates(self, db: Session, *, limit: int) -> list[uuid.UUID]:
@@ -152,9 +167,10 @@ class DownloadSupervisor:
             except (ValueError, AttributeError):
                 continue
         tasks = db.query(Task).filter(Task.id.in_([task_id for task_id, _ in keys]),
-                                      Task.status == TaskStatus.ingested,
+                                      Task.status.in_((TaskStatus.ingested, TaskStatus.failed)),
                                       Task.source_type == SourceType.youtube).all() if keys else []
-        available = {task.id: task for task in tasks}
+        available = {task.id: task for task in tasks if task.status == TaskStatus.ingested or
+                     str(task.created_by or "").startswith("youtube_task_restart;")}
         ordered = sorted(((task_id, op) for task_id, op in keys if task_id in available),
                          key=lambda pair: (-int(available[pair[0]].priority or 0), pair[1].created_at))
         found = []

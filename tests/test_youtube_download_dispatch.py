@@ -139,3 +139,37 @@ def test_queued_download_progress_contract_accepts_recovery_states():
     task_id=uuid.uuid4()
     assert YouTubeDownloadProgressRead(task_id=task_id,status='queued').status=='queued'
     assert YouTubeDownloadProgressRead(task_id=task_id,status='storing').status=='storing'
+
+
+def test_explicit_manual_retry_reopens_failed_download_without_recreating_task(factory):
+    with factory() as db:
+        task = make_task(db, status=TaskStatus.failed)
+        task.created_by = 'youtube_task_restart;auto_publish=;run_id=retry-new'
+        db.flush()
+        key = 'youtube-download:' + str(task.id)
+        db.add(OperationInbox(operation_key=key, status='failed',
+                              request_json={'task_id': str(task.id), 'worker_failures': 4,
+                                            'explicit_restart_id': 'youtube_task_restart;auto_publish=;run_id=old'},
+                              last_error='previous download exhausted retries'))
+        db.commit()
+        assert enqueue_download(db, task.id) == 'queued'
+        current = db.query(OperationInbox).filter_by(operation_key=key).one()
+        assert current.status == 'pending'
+        assert current.last_error is None
+        assert current.request_json['explicit_restart_id'] == task.created_by
+        assert 'worker_failures' not in current.request_json
+        assert enqueue_download(db, task.id) == 'queued'
+        assert db.query(OperationInbox).filter_by(operation_key=key).count() == 1
+        assert db.query(Task).filter_by(id=task.id).count() == 1
+
+
+def test_automatic_enqueue_never_reopens_terminal_failed_download(factory):
+    with factory() as db:
+        task = make_task(db)
+        db.add(OperationInbox(operation_key='youtube-download:' + str(task.id),
+                              status='failed', request_json={'worker_failures': 4},
+                              last_error='network exhausted'))
+        db.commit()
+        assert enqueue_download(db, task.id) == 'failed'
+        op = db.query(OperationInbox).one()
+        assert op.status == 'failed'
