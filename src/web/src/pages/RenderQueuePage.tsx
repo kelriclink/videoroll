@@ -50,6 +50,7 @@ export default function RenderQueuePage() {
   const [saving, setSaving] = useState(false);
   const [saveMessage, setSaveMessage] = useState<string | null>(null);
   const queueRef = useRef<TaskQueue | null>(null);
+  const downloadInputDirtyRef = useRef(false);
   const refreshTimerRef = useRef<number | undefined>();
 
   const refresh = useCallback(async () => {
@@ -58,7 +59,8 @@ export default function RenderQueuePage() {
       const q = await fetchJson<TaskQueue>(`${ORCHESTRATOR_URL}/subtitle/task_queue?limit=2000`);
       queueRef.current = q;
       setQueue(q);
-      setDownloadConcurrency(q.settings.download_concurrency);
+      // Realtime queue updates must not overwrite a value while it is edited.
+      if (!downloadInputDirtyRef.current) setDownloadConcurrency(q.settings.download_concurrency);
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : String(e));
     }
@@ -78,6 +80,7 @@ export default function RenderQueuePage() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ max_concurrent: value }),
       });
+      downloadInputDirtyRef.current = false;
       setSaveMessage("设置已保存，新下载任务自动按此并发数调度");
       await refresh();
     } catch (e: unknown) {
@@ -182,7 +185,10 @@ export default function RenderQueuePage() {
           <label className="flex flex-col gap-1">
             <span className="text-xs text-slate-500">同时下载任务数（持久化）</span>
             <input className="w-24 rounded border px-2 py-2 font-mono" type="number" min={1} max={16} step={1}
-              value={downloadConcurrency} onChange={(event) => setDownloadConcurrency(Number(event.target.value))} />
+              value={downloadConcurrency} onChange={(event) => {
+                downloadInputDirtyRef.current = true;
+                setDownloadConcurrency(Number(event.target.value));
+              }} />
           </label>
           <button className="rounded border bg-slate-900 px-3 py-2 text-white disabled:opacity-50"
             disabled={saving || !queue || downloadConcurrency === queue.settings.download_concurrency}
