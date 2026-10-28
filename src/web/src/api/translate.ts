@@ -153,7 +153,10 @@ export const translateApi = {
   },
 
   remoteProviderModels(providerId: string) {
-    return fetchJson<{ models: string[] }>(
+    return fetchJson<{
+      models: string[];
+      details?: Record<string, { context_window: number | null; max_output_tokens: number | null }>;
+    }>(
       orchestratorUrl("/subtitle/translate/model-providers/" + encodeURIComponent(providerId) + "/remote-models"),
     );
   },

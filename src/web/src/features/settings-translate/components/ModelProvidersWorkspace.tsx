@@ -26,6 +26,9 @@ export function ModelProvidersWorkspace() {
   const [selectedModel, setSelectedModel] = useState("");
   const [newModel, setNewModel] = useState("");
   const [remoteModels, setRemoteModels] = useState<string[]>([]);
+  const [remoteDetails, setRemoteDetails] = useState<
+    Record<string, { context_window: number | null; max_output_tokens: number | null }>
+  >({});
   const [remoteSelected, setRemoteSelected] = useState("");
   const [error, setError] = useState("");
   const [message, setMessage] = useState("");
@@ -56,6 +59,7 @@ export function ModelProvidersWorkspace() {
     setDraft(next);
     setSelectedModel(next.models[0]?.id ?? "");
     setRemoteModels([]);
+    setRemoteDetails({});
     setRemoteSelected("");
     setNewModel("");
     setMessage("");
@@ -69,12 +73,18 @@ export function ModelProvidersWorkspace() {
     }));
   }
 
-  function addModel(value: string) {
+  function addModel(value: string, reported?: { context_window: number | null; max_output_tokens: number | null }) {
     const id = value.trim();
     if (!id || id.length > 256) return;
+    // Published metadata is imported only for a *new* model. Existing manual
+    // overrides are never replaced when the remote catalog is refreshed.
     setDraft((previous) => previous.models.some((item) => item.id === id) ? previous : ({
       ...previous,
-      models: [...previous.models, { id, context_window: null, max_output_tokens: null, temperature: 0.2, enable_thinking: false, reasoning_effort: "medium" }],
+      models: [...previous.models, {
+        id, context_window: reported?.context_window ?? null,
+        max_output_tokens: reported?.max_output_tokens ?? null,
+        temperature: 0.2, enable_thinking: false, reasoning_effort: "medium",
+      }],
     }));
     setSelectedModel(id);
     setNewModel("");
@@ -86,6 +96,17 @@ export function ModelProvidersWorkspace() {
     setMessage("");
     try {
       if (!draft.models.length) throw new Error("至少需要添加一个模型，才可以保存提供方");
+      for (const item of draft.models) {
+        for (const value of [item.context_window, item.max_output_tokens]) {
+          if (value !== null && value !== undefined && (!Number.isSafeInteger(value) || value <= 0)) {
+            throw new Error(item.id + "：Token 数必须是正整数且能被精确保存");
+          }
+        }
+        if (item.context_window != null && item.max_output_tokens != null
+            && item.max_output_tokens >= item.context_window) {
+          throw new Error(item.id + "：最大输出 Token 必须小于上下文窗口");
+        }
+      }
       const saved = await translateApi.saveModelProvider(selectedId === "_new" ? null : selectedId, draft);
       const rows = await refresh();
       choose(saved.id, rows);
@@ -115,8 +136,10 @@ export function ModelProvidersWorkspace() {
     try {
       const result = await translateApi.remoteProviderModels(selectedId);
       setRemoteModels(result.models);
+      setRemoteDetails(result.details ?? {});
       setRemoteSelected(result.models[0] ?? "");
-      setMessage("接口返回 " + result.models.length + " 个模型，可按需添加到当前提供方");
+      const limits = Object.keys(result.details ?? {}).length;
+      setMessage("接口返回 " + result.models.length + " 个模型；其中 " + limits + " 个带有可读取的容量元数据");
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : String(e));
     } finally { setLoading(false); }
@@ -175,7 +198,17 @@ export function ModelProvidersWorkspace() {
                 <select aria-label="远程模型" className="w-full rounded bg-slate-800 px-2 py-2 text-xs" value={remoteSelected} onChange={(e) => setRemoteSelected(e.target.value)}>
                   {remoteModels.map((item) => <option key={item} value={item}>{item}</option>)}
                 </select>
-                <button type="button" className="w-full rounded bg-blue-700 px-2 py-2 text-xs" onClick={() => addModel(remoteSelected)}>加入模型列表</button>
+                {remoteSelected && <p className="text-xs text-slate-400">
+                  {remoteDetails[remoteSelected]?.context_window
+                    ? "接口声明上下文：" + remoteDetails[remoteSelected].context_window?.toLocaleString() + " Token"
+                    : "接口未提供上下文容量"}
+                  {" · "}
+                  {remoteDetails[remoteSelected]?.max_output_tokens
+                    ? "接口声明最大输出：" + remoteDetails[remoteSelected].max_output_tokens?.toLocaleString()
+                    : "输出容量未知"}
+                </p>}
+                <button type="button" className="w-full rounded bg-blue-700 px-2 py-2 text-xs"
+                  onClick={() => addModel(remoteSelected, remoteDetails[remoteSelected])}>加入模型列表</button>
               </div>}
             </div>
           )}
@@ -209,8 +242,8 @@ export function ModelProvidersWorkspace() {
               <div className="flex items-center justify-between gap-2"><div className="font-semibold">模型：{model.id}</div>
                 <button type="button" className="text-xs text-rose-300" onClick={() => { setDraft({ ...draft, models: draft.models.filter((item) => item.id !== model.id) }); setSelectedModel(draft.models.find((item) => item.id !== model.id)?.id ?? ""); }}>移除模型</button></div>
               <div className="grid gap-3 sm:grid-cols-3">
-                <label className={fieldLabelClass}>上下文窗口 Token<input className={modelInputClass} type="number" min={1024} placeholder="未知（手动填写）" value={model.context_window ?? ""} onChange={(e) => updateModel("context_window", e.target.value ? Number(e.target.value) : null)} /></label>
-                <label className={fieldLabelClass}>最大输出 Token<input className={modelInputClass} type="number" min={1} placeholder="上游默认" value={model.max_output_tokens ?? ""} onChange={(e) => updateModel("max_output_tokens", e.target.value ? Number(e.target.value) : null)} /></label>
+                <label className={fieldLabelClass}>上下文窗口 Token<input className={modelInputClass} type="number" min={1} step={1} placeholder="未知（不限制本地预算）" value={model.context_window ?? ""} onChange={(e) => updateModel("context_window", e.target.value ? Number(e.target.value) : null)} /></label>
+                <label className={fieldLabelClass}>单次最大输出 Token<input className={modelInputClass} type="number" min={1} step={1} placeholder="留空使用上游默认" value={model.max_output_tokens ?? ""} onChange={(e) => updateModel("max_output_tokens", e.target.value ? Number(e.target.value) : null)} /></label>
                 <label className={fieldLabelClass}>温度<input className={modelInputClass} type="number" min={0} max={2} step={0.1} value={model.temperature ?? ""} onChange={(e) => updateModel("temperature", e.target.value ? Number(e.target.value) : null)} /></label>
               </div>
               <div className="grid gap-3 sm:grid-cols-2">
@@ -225,7 +258,11 @@ export function ModelProvidersWorkspace() {
                   </select>
                 </label>}
               </div>
-              <p className="text-xs text-slate-400">上下文窗口不会根据模型名称猜测；请填写实际上游支持的值。最大输出用于每次生成请求，而不是模型总上下文。</p>
+              {model.context_window != null && model.max_output_tokens != null
+                && model.max_output_tokens >= model.context_window && (
+                  <p role="alert" className="text-xs text-rose-300">最大输出 Token 必须小于上下文窗口，避免无法为输入提示词留出空间。</p>
+                )}
+              <p className="text-xs text-slate-400">不使用全局模型容量上限：优先读取接口提供的元数据，无法获取时可手动填写；留空表示未知／上游默认。该设置不会改变模型服务器实际的上下文容量，最终由上游校验。</p>
             </div>}
           </>}
           {error && <div role="alert" className="rounded bg-rose-950/50 p-3 text-sm text-rose-200">{error}</div>}

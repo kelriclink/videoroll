@@ -21,7 +21,7 @@ from typing import Any, Generator
 from urllib.parse import urlsplit
 
 import httpx
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StrictInt, model_validator
 from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
@@ -30,7 +30,8 @@ from sqlalchemy.exc import ProgrammingError
 
 from videoroll.ai.service import AIService
 from videoroll.apps.subtitle_service.model_provider_store import (
-    delete_provider, fetch_remote_models, list_providers, save_provider,
+    MAX_SAFE_JSON_INTEGER, delete_provider, fetch_remote_model_catalog, list_providers,
+    save_provider, validate_token_limits,
 )
 from videoroll.apps.security.service_auth import install_internal_service_auth, service_token
 from videoroll.config import SubtitleServiceSettings, get_subtitle_settings
@@ -634,11 +635,16 @@ def put_subtitle_auto_profile(payload: SubtitleAutoProfileUpdate, db: Session = 
 
 class ModelEntryPayload(BaseModel):
     id: str = Field(min_length=1, max_length=256)
-    context_window: int | None = Field(default=None, ge=1024, le=4_000_000)
-    max_output_tokens: int | None = Field(default=None, ge=1, le=250_000)
+    context_window: StrictInt | None = Field(default=None, gt=0, le=MAX_SAFE_JSON_INTEGER)
+    max_output_tokens: StrictInt | None = Field(default=None, gt=0, le=MAX_SAFE_JSON_INTEGER)
     temperature: float | None = Field(default=0.2, ge=0, le=2)
     enable_thinking: bool = False
     reasoning_effort: str = "medium"
+
+    @model_validator(mode="after")
+    def validate_context_budget(self) -> "ModelEntryPayload":
+        validate_token_limits(self.context_window, self.max_output_tokens)
+        return self
 
 
 class ModelProviderPayload(BaseModel):
@@ -687,9 +693,9 @@ def remove_model_provider(provider_id: str, db: Session = Depends(get_db)) -> di
 
 
 @app.get("/subtitle/translate/model-providers/{provider_id}/remote-models")
-def remote_model_provider_models(provider_id: str, db: Session = Depends(get_db)) -> dict[str, list[str]]:
+def remote_model_provider_models(provider_id: str, db: Session = Depends(get_db)) -> dict[str, Any]:
     try:
-        return {"models": fetch_remote_models(db, provider_id)}
+        return fetch_remote_model_catalog(db, provider_id)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except (httpx.HTTPError, json.JSONDecodeError) as exc:

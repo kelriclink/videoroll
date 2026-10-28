@@ -20,6 +20,23 @@ KEY = "subtitle.model_providers"
 LEGACY_ID = "legacy"
 INDEX_ID = "index_translate"
 
+# JavaScript Number cannot round-trip larger integers through JSON exactly.
+# This is a wire-format precision boundary, not a model-specific token cap.
+MAX_SAFE_JSON_INTEGER = (1 << 53) - 1
+
+
+def validate_token_limits(context: int | None, output: int | None) -> None:
+    """Validate exact, positive token counts without a model-specific ceiling."""
+    for label, value in (("上下文窗口", context), ("最大输出 Token", output)):
+        if value is None:
+            continue
+        if type(value) is not int or not 1 <= value <= MAX_SAFE_JSON_INTEGER:
+            raise ValueError(f"{label}必须是正整数且不超过 JSON 安全整数范围")
+    if context is not None and output is not None and output >= context:
+        raise ValueError("最大输出 Token 必须小于上下文窗口")
+
+
+
 
 def _rows(db: Session) -> list[dict[str, Any]]:
     row = db.get(AppSetting, KEY)
@@ -79,12 +96,7 @@ def _model(item: dict[str, Any]) -> dict[str, Any]:
     context = item.get("context_window")
     output = item.get("max_output_tokens")
     temperature = item.get("temperature", 0.2)
-    if context is not None and (not isinstance(context, int) or not 1024 <= context <= 4_000_000):
-        raise ValueError("上下文长度必须在 1024 至 4000000 Token 之间")
-    if output is not None and (not isinstance(output, int) or not 1 <= output <= 250000):
-        raise ValueError("最大输出长度必须在 1 至 250000 Token 之间")
-    if context and output and output >= context:
-        raise ValueError("最大输出 Token 必须小于上下文窗口")
+    validate_token_limits(context, output)
     if temperature is not None and (not isinstance(temperature, (int, float)) or not 0 <= temperature <= 2):
         raise ValueError("温度必须在 0 到 2 之间")
     if not isinstance(item.get("enable_thinking", False), bool):
@@ -183,8 +195,49 @@ def resolve_provider_settings(
     return result
 
 
-def fetch_remote_models(db: Session, provider_id: str) -> list[str]:
-    """Discover remote model IDs only, never execute model-provided instructions."""
+def _remote_token_limit(value: object) -> int | None:
+    # Only trust server-reported positive integer metadata, never model names.
+    if type(value) is int and 1 <= value <= MAX_SAFE_JSON_INTEGER:
+        return value
+    if isinstance(value, str) and value.isascii() and value.isdecimal() and len(value) <= 16:
+        number = int(value)
+        if 1 <= number <= MAX_SAFE_JSON_INTEGER:
+            return number
+    return None
+
+
+def _remote_model_details(item: dict[str, Any]) -> dict[str, int | None]:
+    """Read documented extension fields from /models when a gateway supplies them.
+
+    Standard OpenAI /v1/models does not promise context/output metadata.
+    OpenRouter exposes it in top_provider; other gateways may expose root keys.
+    Never fill unknown fields from a model name, heuristic, or a global default.
+    """
+    top = item.get("top_provider")
+    provider_metadata = top if isinstance(top, dict) else {}
+    context = next((
+        limit for limit in (
+            _remote_token_limit(provider_metadata.get("context_length")),
+            _remote_token_limit(item.get("context_length")),
+            _remote_token_limit(item.get("context_window")),
+            _remote_token_limit(item.get("max_model_len")),
+        ) if limit is not None
+    ), None)
+    output = next((
+        limit for limit in (
+            _remote_token_limit(provider_metadata.get("max_completion_tokens")),
+            _remote_token_limit(item.get("max_completion_tokens")),
+            _remote_token_limit(item.get("max_output_tokens")),
+        ) if limit is not None
+    ), None)
+    # Invalid or contradictory third-party metadata must not be imported.
+    if context is not None and output is not None and output >= context:
+        output = None
+    return {"context_window": context, "max_output_tokens": output}
+
+
+def fetch_remote_model_catalog(db: Session, provider_id: str) -> dict[str, Any]:
+    """Discover model IDs and optional published limits without saving overrides."""
     provider = next((row for row in _rows(db) if row["id"] == provider_id), None)
     if provider is None:
         raise ValueError("请先保存新提供方再获取模型")
@@ -199,5 +252,24 @@ def fetch_remote_models(db: Session, provider_id: str) -> list[str]:
         data = response.json()
     if not isinstance(data, dict) or not isinstance(data.get("data"), list):
         raise ValueError("接口未返回 OpenAI /models 格式")
-    names = [item.get("id") for item in data["data"][:500] if isinstance(item, dict)]
-    return sorted({name for name in names if isinstance(name, str) and 0 < len(name) <= 256})[:200]
+
+    discovered: dict[str, dict[str, int | None]] = {}
+    for item in data["data"][:500]:
+        if not isinstance(item, dict):
+            continue
+        model_id = item.get("id")
+        if not isinstance(model_id, str) or not 0 < len(model_id) <= 256:
+            continue
+        if model_id not in discovered:
+            discovered[model_id] = _remote_model_details(item)
+    names = sorted(discovered)[:200]
+    return {"models": names, "details": {
+        name: discovered[name] for name in names
+        if discovered[name]["context_window"] is not None
+        or discovered[name]["max_output_tokens"] is not None
+    }}
+
+
+def fetch_remote_models(db: Session, provider_id: str) -> list[str]:
+    """Legacy helper for callers only interested in model IDs."""
+    return fetch_remote_model_catalog(db, provider_id)["models"]
