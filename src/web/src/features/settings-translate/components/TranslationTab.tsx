@@ -41,7 +41,7 @@ export function TranslationTab({ controller }: { controller: SettingsTranslateCo
   return (
 <Section>
         <div className="text-sm font-semibold text-slate-900">翻译与模型</div>
-        <div className="mt-1 text-xs text-slate-500">默认翻译行为与 LLM 接口集中在这里；RAG 和 Embedding 使用各自独立页面。</div>
+        <div className="mt-1 text-xs text-slate-500">Index-Translate 与 OpenAI 接口设置独立保存；切换默认 Provider 不会清空另一方配置。</div>
         <div className="mt-3 grid gap-3 lg:grid-cols-2">
           <div className="lg:col-span-2 border-b border-slate-100 pb-2 text-xs font-semibold uppercase tracking-wide text-slate-400">默认翻译</div>
           <label className="block">
@@ -77,8 +77,7 @@ export function TranslationTab({ controller }: { controller: SettingsTranslateCo
             <input type="checkbox" disabled={defaultProvider === "index_translate"} checked={defaultEnableSummary} onChange={(e) => setDefaultEnableSummary(e.target.checked)} />
             启用批次摘要上下文
           </label>
-          {defaultProvider === "index_translate" ? (
-            <div className="lg:col-span-2 grid gap-3 rounded-lg border border-sky-200 bg-sky-50 p-4 lg:grid-cols-2">
+          <div id="index-translate-config" className="lg:col-span-2 grid gap-3 rounded-lg border border-sky-200 bg-sky-50 p-4 lg:grid-cols-2">
               <div className="lg:col-span-2 text-sm font-semibold text-sky-950">Index-Translate 翻译配置</div>
               <div className="lg:col-span-2 text-xs text-sky-800">
                 官方免费服务 · Index-Translate-35B-A3B · https://index-translate.bilibili.com/v1
@@ -117,8 +116,6 @@ export function TranslationTab({ controller }: { controller: SettingsTranslateCo
                 <textarea rows={3} className="w-full rounded px-3 py-2 text-sm" value={indexSettings.instruction} onChange={e => setIndexSettings({instruction: e.target.value})} placeholder="保持科技视频解说风格，尽量精简句子" />
               </label>
             </div>
-          ) : (
-          <>
           <details className="lg:col-span-2 rounded-lg border border-slate-200 bg-slate-50 p-3">
             <summary className="cursor-pointer text-sm font-semibold text-slate-700">旧版接口高级设置（现有 OpenAI 配置）</summary>
             <div className="mt-3 grid gap-3 lg:grid-cols-2">
@@ -208,8 +205,6 @@ export function TranslationTab({ controller }: { controller: SettingsTranslateCo
           </label>
           </div>
           </details>
-          </>
-          )}
         </div>
       </Section>
   );

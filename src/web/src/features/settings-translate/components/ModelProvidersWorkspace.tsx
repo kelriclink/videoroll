@@ -123,6 +123,8 @@ export function ModelProvidersWorkspace() {
   }
 
   const legacy = selectedId === "legacy";
+  const indexProvider = selectedId === "index_translate";
+  const builtIn = legacy || indexProvider;
   const model = draft.models.find((item) => item.id === selectedModel);
 
   return (
@@ -160,8 +162,8 @@ export function ModelProvidersWorkspace() {
               {item.context_window ? <span className="block text-xs text-slate-400">{item.context_window.toLocaleString()} Token</span> : null}
             </button>
           ))}
-          {legacy && <p className="mt-3 text-xs text-slate-400">现有配置由下方旧版高级设置管理。</p>}
-          {!legacy && (
+          {builtIn && <p className="mt-3 text-xs text-slate-400">{indexProvider ? "Index 参数在下方专用区域管理。" : "现有配置由下方旧版高级设置管理。"}</p>}
+          {!builtIn && (
             <div className="mt-3 space-y-2 border-t border-slate-700 pt-3">
               <label className="block text-xs text-slate-400">手动添加模型 ID</label>
               <div className="flex gap-1">
@@ -180,8 +182,8 @@ export function ModelProvidersWorkspace() {
         </div>
         <div className="space-y-4 p-5">
           <div className="flex flex-wrap items-center justify-between gap-2">
-            <div className="text-base font-semibold">{legacy ? "现有 OpenAI 接口" : selectedId === "_new" ? "新建提供方" : "编辑提供方"}</div>
-            {!legacy && <div className="flex gap-2">
+            <div className="text-base font-semibold">{legacy ? "现有 OpenAI 接口" : indexProvider ? "Index-Translate 官方接口" : selectedId === "_new" ? "新建提供方" : "编辑提供方"}</div>
+            {!builtIn && <div className="flex gap-2">
               {selectedId !== "_new" && <button type="button" onClick={() => void removeProvider()} className="rounded border border-rose-400/60 px-3 py-2 text-xs text-rose-300">删除提供方</button>}
               <button type="button" disabled={loading} onClick={() => void save()} className="rounded bg-blue-600 px-4 py-2 text-sm text-white disabled:opacity-50">保存提供方</button>
             </div>}
@@ -190,6 +192,10 @@ export function ModelProvidersWorkspace() {
             该项直接读取现有 OpenAI 配置，兼容历史任务。若要修改原有接口，请展开本页下方的“旧版接口高级设置”；
             也可以点击「添加提供方」新建多个独立接口。
             <div className="mt-3"><Link className="text-blue-300 underline" to="/settings/auto">在自动模式页面选择默认模型</Link></div>
+          </div> : indexProvider ? <div className="rounded-lg border border-slate-700 bg-slate-900 p-4 text-sm text-slate-300">
+            <p>Index-Translate-35B-A3B 通过独立的官方免费接口调用，不依赖 OpenAI API Key，也不应通过 OpenAI 的 /models 接口获取。</p>
+            <p className="mt-2">旧参数（每批字幕数、最大输出 Token、温度、上下文参考字符数、术语和超时）均保留。可在本页下方单独编辑，不需要切换全局默认 Provider。</p>
+            <a className="mt-3 inline-block text-blue-300 underline" href="#index-translate-config">查看和修改 Index-Translate 参数</a>
           </div> : <>
             <div className="grid gap-3 sm:grid-cols-2">
               <label className={fieldLabelClass}>提供方名称<input className={modelInputClass} value={draft.name} onChange={(e) => setDraft({ ...draft, name: e.target.value })} placeholder="例如 Ollama / SiliconFlow / New API" /></label>

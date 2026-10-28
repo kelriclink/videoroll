@@ -18,6 +18,7 @@ from videoroll.utils.openai_compat import normalize_openai_base_url
 
 KEY = "subtitle.model_providers"
 LEGACY_ID = "legacy"
+INDEX_ID = "index_translate"
 
 
 def _rows(db: Session) -> list[dict[str, Any]]:
@@ -51,7 +52,24 @@ def list_providers(db: Session, legacy: dict[str, Any]) -> list[dict[str, Any]]:
         "timeout_seconds": legacy.get("openai_timeout_seconds", 180),
         "max_retries": legacy.get("openai_max_retries", 3),
     }
-    return [virtual] + [_safe(row) for row in _rows(db)]
+    index_provider = {
+        "id": INDEX_ID,
+        "name": "Index-Translate（官方免费）",
+        "base_url": "https://index-translate.bilibili.com/v1",
+        "api_type": "index_translate",
+        "api_key_set": False,
+        "models": [{
+            "id": "Index-Translate-35B-A3B",
+            "context_window": None,
+            "max_output_tokens": int(legacy.get("index_max_tokens") or 4096),
+            "temperature": float(legacy.get("index_temperature") if legacy.get("index_temperature") is not None else 0),
+            "enable_thinking": False,
+            "reasoning_effort": "medium",
+        }],
+        "timeout_seconds": legacy.get("index_timeout_seconds", 120),
+        "max_retries": legacy.get("default_max_retries", 2),
+    }
+    return [virtual, index_provider] + [_safe(row) for row in _rows(db)]
 
 
 def _model(item: dict[str, Any]) -> dict[str, Any]:
@@ -82,8 +100,8 @@ def _model(item: dict[str, Any]) -> dict[str, Any]:
 
 def save_provider(db: Session, provider_id: str | None, values: dict[str, Any]) -> dict[str, Any]:
     provider_id = provider_id or str(uuid.uuid4())
-    if provider_id == LEGACY_ID:
-        raise ValueError("现有 OpenAI 配置请在旧版高级设置中修改")
+    if provider_id in {LEGACY_ID, INDEX_ID}:
+        raise ValueError("内置提供方应使用翻译高级设置修改")
     original = _rows(db)
     previous = next((item for item in original if item["id"] == provider_id), {})
     name = str(values.get("name") or "").strip()[:80]
@@ -118,7 +136,7 @@ def save_provider(db: Session, provider_id: str | None, values: dict[str, Any]) 
 
 
 def delete_provider(db: Session, provider_id: str) -> None:
-    if provider_id == LEGACY_ID:
+    if provider_id in {LEGACY_ID, INDEX_ID}:
         raise ValueError("内置提供方不能删除")
     rows = _rows(db)
     if not any(item["id"] == provider_id for item in rows):

@@ -53,6 +53,9 @@ def test_legacy_virtual_provider_and_catalog_do_not_expose_key(legacy: dict[str,
     assert rows[0]["id"] == "legacy"
     assert rows[0]["models"][0]["id"] == "old-model"
     assert "api_key" not in rows[0]
+    assert rows[1]["id"] == "index_translate"
+    assert rows[1]["models"][0]["id"] == "Index-Translate-35B-A3B"
+    assert "api_key" not in rows[1]
     assert db.commits == 0
 
 
@@ -77,10 +80,10 @@ def test_create_select_update_and_delete_provider(monkeypatch: pytest.MonkeyPatc
     store.save_provider(db, saved["id"], changed)  # type: ignore[arg-type]
     resolved = store.resolve_provider_settings(db, legacy, saved["id"], "qwen:test")  # type: ignore[arg-type]
     assert resolved["openai_api_key"] == "test-secret"
-    assert len(store.list_providers(db, legacy)) == 2  # type: ignore[arg-type]
+    assert len(store.list_providers(db, legacy)) == 3  # type: ignore[arg-type]
 
     store.delete_provider(db, saved["id"])  # type: ignore[arg-type]
-    assert len(store.list_providers(db, legacy)) == 1  # type: ignore[arg-type]
+    assert len(store.list_providers(db, legacy)) == 2  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="已删除"):
         store.resolve_provider_settings(db, legacy, saved["id"], "qwen:test")  # type: ignore[arg-type]
 
@@ -134,3 +137,13 @@ def test_fetch_remote_ids_only(monkeypatch: pytest.MonkeyPatch) -> None:
     assert captured["url"] == "http://localhost:11434/v1/models"
     assert captured["headers"]["Authorization"] == "Bearer test-secret"
     assert captured["options"]["follow_redirects"] is False
+
+
+
+def test_index_builtin_cannot_be_deleted_or_overwritten() -> None:
+    db = FakeDB()
+    with pytest.raises(ValueError, match="内置提供方"):
+        store.delete_provider(db, "index_translate")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="内置提供方"):
+        store.save_provider(db, "index_translate", payload())  # type: ignore[arg-type]
+    assert db.commits == 0

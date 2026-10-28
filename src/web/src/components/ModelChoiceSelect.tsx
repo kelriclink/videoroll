@@ -9,21 +9,24 @@ type Props = {
 };
 
 export function ModelChoiceSelect({ providers, providerId, modelId, onChange, disabled }: Props) {
-  const active = providers.find((item) => item.id === providerId);
+  // Index-Translate is selected through the translation-engine selector, not
+  // as an OpenAI-compatible provider: it uses a distinct transport.
+  const compatibleProviders = providers.filter((item) => item.api_type !== "index_translate");
+  const active = compatibleProviders.find((item) => item.id === providerId);
   const models = active?.models ?? [];
   const modelExists = models.some((model) => model.id === modelId);
   return (
     <div className="grid gap-2 sm:grid-cols-2">
       <label className="block text-xs text-slate-600">
         模型提供方
-        <select aria-label="模型提供方" disabled={disabled || !providers.length}
+        <select aria-label="模型提供方" disabled={disabled || !compatibleProviders.length}
           className="mt-1 w-full rounded border px-3 py-2 text-sm text-slate-900"
           value={providerId} onChange={(event) => {
             const id = event.target.value;
-            const next = providers.find((item) => item.id === id);
+            const next = compatibleProviders.find((item) => item.id === id);
             onChange(id, id === "legacy" ? "" : (next?.models[0]?.id ?? ""));
           }}>
-          {providers.map((provider) => <option key={provider.id} value={provider.id}>{provider.name}</option>)}
+          {compatibleProviders.map((provider) => <option key={provider.id} value={provider.id}>{provider.name}</option>)}
         </select>
       </label>
       <label className="block text-xs text-slate-600">

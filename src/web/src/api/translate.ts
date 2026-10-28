@@ -13,7 +13,7 @@ export type ModelProvider = {
   id: string;
   name: string;
   base_url: string;
-  api_type: "openai" | "cerebras";
+  api_type: "openai" | "cerebras" | "index_translate";
   api_key_set: boolean;
   models: ProviderModel[];
   timeout_seconds: number;
