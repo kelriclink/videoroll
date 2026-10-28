@@ -104,6 +104,8 @@ class SubtitleActionRequest(BaseModel):
     youtube_subtitle_mode: Literal["off", "target", "auto_source"] = "target"
     translate_enabled: bool = False
     translate_provider: str = "mock"
+    translate_model_provider_id: str = "legacy"
+    translate_model_id: str = ""
     target_lang: str = "zh"
     translate_style: str = "口语自然"
     translate_batch_size: Optional[int] = None

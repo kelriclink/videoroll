@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 
 from videoroll.ai.client import is_retryable_openai_error, openai_chat_config_from_settings
 from videoroll.ai.service import AIService
+from videoroll.apps.subtitle_service.model_provider_store import resolve_provider_settings
 from videoroll.apps.subtitle_service.embeddings import embedding_settings_from_translate_settings
 from videoroll.apps.subtitle_service.processing import (
     Segment,
@@ -100,8 +101,20 @@ def run_translation_stage(
         )
 
     log(f"translate: provider={provider} target_lang={target_lang} bilingual={bilingual}")
-    ai_service = ai_service_factory()
     translate_settings = fresh_translate_settings()
+    model_provider_id = str(translate_cfg.get("model_provider_id") or "legacy")
+    model_id = str(translate_cfg.get("model_id") or "")
+    if provider == "openai" and (model_provider_id != "legacy" or model_id):
+        translate_settings = resolve_provider_settings(
+            db, translate_settings, model_provider_id, model_id,
+        )
+        # Pin the selected model for all translation/RAG calls in this job.
+        selected_settings = dict(translate_settings)
+        fresh_translate_settings = lambda: dict(selected_settings)
+        ai_service = AIService(fresh_translate_settings)
+        log(f"translate model: provider={model_provider_id} model={translate_settings['openai_model']}")
+    else:
+        ai_service = ai_service_factory()
     default_style = str(translate_settings["default_style"])
     style = str(translate_cfg.get("style") or default_style).strip() or default_style
     batch_size = int(translate_cfg.get("batch_size") or translate_settings["default_batch_size"])
@@ -494,6 +507,8 @@ def run_translation_stage(
                 temperature=translate_settings["openai_temperature"],
                 timeout_seconds=translate_settings["openai_timeout_seconds"],
                 batch_size=batch_size,
+                model_context_window=translate_settings.get("model_context_window"),
+                model_max_output_tokens=translate_settings.get("max_output_tokens"),
                 enable_summary=enable_summary,
                 resume_from=resume_prefix,
                 base_translations=base_translations if selective_mode else None,

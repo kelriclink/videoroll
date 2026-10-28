@@ -241,6 +241,8 @@ def build_subtitle_job_request(
         "enabled": payload.translate_enabled,
         "target_lang": payload.target_lang,
         "provider": payload.translate_provider,
+        "model_provider_id": payload.translate_model_provider_id,
+        "model_id": payload.translate_model_id,
         "style": payload.translate_style,
         "glossary_id": None,
         "bilingual": payload.bilingual,

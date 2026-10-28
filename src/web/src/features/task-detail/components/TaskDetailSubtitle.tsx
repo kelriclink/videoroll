@@ -1,5 +1,6 @@
 import type { TaskDetailController } from "../useTaskDetailController";
 import { Link } from "react-router-dom";
+import { ModelChoiceSelect } from "../../../components/ModelChoiceSelect";
 import { normalizeYouTubeSubtitleMode, clampText } from "../utils";
 import { SubtitleQualityContextPanel } from "./SubtitleQualityContextPanel";
 export function TaskDetailSubtitle({ controller }: { controller: TaskDetailController }) {
@@ -38,6 +39,11 @@ export function TaskDetailSubtitle({ controller }: { controller: TaskDetailContr
     setTargetLang,
     translateProvider,
     setTranslateProvider,
+    translateModelProviderId,
+    setTranslateModelProviderId,
+    translateModelId,
+    setTranslateModelId,
+    modelProviders,
     translateStyle,
     setTranslateStyle,
     translateEnableSummary,
@@ -199,6 +205,12 @@ export function TaskDetailSubtitle({ controller }: { controller: TaskDetailContr
                 </select>
               </label>
 
+              {translateProvider === "openai" && (
+                <div className="rounded-lg border border-blue-100 bg-blue-50 p-3 md:col-span-2">
+                  <ModelChoiceSelect providers={modelProviders} providerId={translateModelProviderId} modelId={translateModelId}
+                    onChange={(providerId, modelId) => { setTranslateModelProviderId(providerId); setTranslateModelId(modelId); }} />
+                </div>
+              )}
               <label className="block md:col-span-2">
                 <div className="mb-1 text-xs text-slate-600">style</div>
                 <select className="w-full rounded border px-3 py-2 text-sm" value={translateStyle} onChange={(e) => setTranslateStyle(e.target.value)}>

@@ -259,6 +259,8 @@ class SubtitleAutoProfileRead(BaseModel):
     youtube_subtitle_mode: Literal["off", "target", "auto_source"] = "target"
     translate_enabled: bool = True
     translate_provider: str = "openai"
+    translate_model_provider_id: str = "legacy"
+    translate_model_id: str = ""
     target_lang: str = "zh"
     translate_style: str = "口语自然"
     translate_enable_summary: bool = True
@@ -295,6 +297,8 @@ class SubtitleAutoProfileUpdate(BaseModel):
     youtube_subtitle_mode: Optional[Literal["off", "target", "auto_source"]] = None
     translate_enabled: Optional[bool] = None
     translate_provider: Optional[str] = None
+    translate_model_provider_id: Optional[str] = Field(default=None, max_length=100)
+    translate_model_id: Optional[str] = Field(default=None, max_length=256)
     target_lang: Optional[str] = None
     translate_style: Optional[str] = None
     translate_enable_summary: Optional[bool] = None

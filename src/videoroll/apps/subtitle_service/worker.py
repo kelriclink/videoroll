@@ -1612,6 +1612,8 @@ def run_subtitle_job(
                 "enabled": bool(translate_profile.get("translate_enabled")),
                 "target_lang": translate_profile.get("target_lang") or "zh",
                 "provider": translate_profile.get("translate_provider") or "openai",
+                "model_provider_id": translate_profile.get("translate_model_provider_id") or "legacy",
+                "model_id": translate_profile.get("translate_model_id") or "",
                 "style": translate_profile.get("translate_style") or "口语自然",
                 "enable_summary": bool(translate_profile.get("translate_enable_summary")),
                 "bilingual": bool(translate_profile.get("bilingual")),

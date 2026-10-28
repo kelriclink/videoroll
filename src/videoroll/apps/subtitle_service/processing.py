@@ -3077,6 +3077,10 @@ def translate_segments_mock(segments: Iterable[Segment], target_lang: str) -> li
     return out
 
 
+class TranslationPromptTooLongError(RuntimeError):
+    """The configured model cannot fit a translation batch; caller may halve it."""
+
+
 def translate_segments_openai_with_summary(
     segments: Iterable[Segment],
     target_lang: str,
@@ -3104,6 +3108,8 @@ def translate_segments_openai_with_summary(
     on_context_memory_update: Callable[[dict[str, object]], None] | None = None,
     on_batch_done_with_context: Callable[[Any, list[Segment], str, int], None] | None = None,
     on_batch_error: Callable[[Any, Exception], None] | None = None,
+    model_context_window: int | None = None,
+    model_max_output_tokens: int | None = None,
     on_thinking_delta_with_context: Callable[[str, int, int, Any], None] | None = None,
 ) -> tuple[list[Segment], str]:
     segs = list(segments)
@@ -3204,6 +3210,28 @@ def translate_segments_openai_with_summary(
             elif on_thinking_delta is not None:
                 on_thinking_delta(delta, start_idx + 1, len(batch))
 
+        # Enforce a conservative upper bound only when the user configured a
+        # real model context window. Unknown context must never be guessed.
+        prompt = build_subtitle_translation_prompt(
+            blocks=blocks, target_lang=tgt, style=tone, summary=summary,
+            enable_summary=enable_summary, glossary=glossary,
+            rag_context=rag_context_for_prompt,
+            translation_plan=translation_plan or None, context_state=context_state,
+            network_retries=3,
+        )
+        if model_context_window:
+            output_reserve = model_max_output_tokens or min(4096, max(512, model_context_window // 4))
+            input_budget = max(0, model_context_window - output_reserve - 512)
+            # Deliberately overestimate multilingual tokenization; this is not
+            # an authoritative tokenizer. Upstream remains the final authority.
+            prompt_chars = prompt.system_prompt + prompt.user_prompt
+            estimate = max(len(prompt_chars), len(prompt_chars.encode("utf-8")) // 2)
+            if estimate > input_budget:
+                raise TranslationPromptTooLongError(
+                    f"翻译请求估算 {estimate} Token，超过配置的输入预算 {input_budget}；"
+                    f"模型上下文窗口={model_context_window}，请减小批次或提高窗口配置"
+                )
+
         if ai_service is not None:
             data = ai_service.translate_subtitle_batch(
                 blocks=blocks,
@@ -3224,18 +3252,6 @@ def translate_segments_openai_with_summary(
         else:
             assert cfg is not None
             assert client is not None
-            prompt = build_subtitle_translation_prompt(
-                blocks=blocks,
-                target_lang=tgt,
-                style=tone,
-                summary=summary,
-                enable_summary=enable_summary,
-                glossary=glossary,
-                rag_context=rag_context_for_prompt,
-                translation_plan=translation_plan or None,
-                context_state=context_state,
-                network_retries=3,
-            )
             request_kwargs = {
                 "config": cfg,
                 "system_prompt": prompt.system_prompt,
@@ -3516,7 +3532,7 @@ def translate_segments_openai_with_summary(
                         if on_batch_done_with_context is not None:
                             on_batch_done_with_context(batch_context, translated, summary, completed_count)
                         cursor = batch_end
-                    except (TranslationValidationError, httpx.TimeoutException, httpx.TransportError) as exc:
+                    except (TranslationValidationError, TranslationPromptTooLongError, httpx.TimeoutException, httpx.TransportError) as exc:
                         if on_batch_error is not None:
                             on_batch_error(batch_context, exc)
                         if len(batch) <= 1:
@@ -3575,7 +3591,7 @@ def translate_segments_openai_with_summary(
                 if on_batch_error is not None:
                     on_batch_error(batch_context, e)
                 raise RuntimeError(str(e)) from e
-            except TranslationValidationError as e:
+            except (TranslationValidationError, TranslationPromptTooLongError) as e:
                 if on_batch_error is not None:
                     on_batch_error(batch_context, e)
                 if cur_batch_size <= 1:

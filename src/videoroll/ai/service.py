@@ -93,6 +93,7 @@ class AIService:
                 network_retries=prompt.network_retries,
                 client=client,
                 on_thinking_delta=on_thinking_delta,
+                max_completion_tokens=runtime.settings.get("max_output_tokens"),
             )
         provider = self._providers.get(runtime.provider)
         return provider.request_json(runtime, prompt, client=client)

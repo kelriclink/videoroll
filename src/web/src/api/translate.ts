@@ -1,6 +1,26 @@
 import { fetchJson } from "../lib/http";
 import { orchestratorUrl } from "../lib/urls";
 
+export type ProviderModel = {
+  id: string;
+  context_window: number | null;
+  max_output_tokens: number | null;
+  temperature: number | null;
+  enable_thinking: boolean;
+  reasoning_effort: "low" | "medium" | "high";
+};
+export type ModelProvider = {
+  id: string;
+  name: string;
+  base_url: string;
+  api_type: "openai" | "cerebras";
+  api_key_set: boolean;
+  models: ProviderModel[];
+  timeout_seconds: number;
+  max_retries: number;
+};
+export type ModelProviderDraft = Omit<ModelProvider, "id" | "api_key_set"> & { api_key?: string | null };
+
 export type TranslateSettings = {
   default_provider: string;
   default_target_lang: string;
@@ -117,6 +137,27 @@ export type EmbeddingRuntimeStatus = {
 };
 
 export const translateApi = {
+  modelProviders() {
+    return fetchJson<ModelProvider[]>(orchestratorUrl("/subtitle/translate/model-providers"));
+  },
+
+  saveModelProvider(providerId: string | null, payload: ModelProviderDraft) {
+    return fetchJson<ModelProvider>(
+      orchestratorUrl("/subtitle/translate/model-providers" + (providerId ? "/" + encodeURIComponent(providerId) : "")),
+      { method: providerId ? "PUT" : "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) },
+    );
+  },
+
+  removeModelProvider(providerId: string) {
+    return fetchJson(orchestratorUrl("/subtitle/translate/model-providers/" + encodeURIComponent(providerId)), { method: "DELETE" });
+  },
+
+  remoteProviderModels(providerId: string) {
+    return fetchJson<{ models: string[] }>(
+      orchestratorUrl("/subtitle/translate/model-providers/" + encodeURIComponent(providerId) + "/remote-models"),
+    );
+  },
+
   settings() {
     return fetchJson<TranslateSettings>(orchestratorUrl("/subtitle/translate/settings"));
   },

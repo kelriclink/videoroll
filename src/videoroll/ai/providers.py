@@ -26,6 +26,7 @@ class OpenAICompatibleProvider:
             format_retries=prompt.format_retries,
             network_retries=prompt.network_retries,
             client=client,
+            max_completion_tokens=runtime.settings.get("max_output_tokens"),
         )
 
 

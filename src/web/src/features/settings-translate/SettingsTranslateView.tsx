@@ -6,6 +6,7 @@ import { EmbeddingTab } from "./components/EmbeddingTab";
 import { RagTab } from "./components/RagTab";
 import { TranslationTestTab } from "./components/TranslationTestTab";
 import { TranslationTab } from "./components/TranslationTab";
+import { ModelProvidersWorkspace } from "./components/ModelProvidersWorkspace";
 import type { SettingsTranslateController } from "./useSettingsTranslateController";
 
 export function SettingsTranslateView({ controller }: { controller: SettingsTranslateController }) {
@@ -14,7 +15,7 @@ export function SettingsTranslateView({ controller }: { controller: SettingsTran
       <SettingsTranslateHeader controller={controller} />
       <SettingsTranslateSummary controller={controller} />
       <SettingsTranslateTabs controller={controller} />
-      {controller.activeTab === "translation" ? <TranslationTab controller={controller} /> : null}
+      {controller.activeTab === "translation" ? <><ModelProvidersWorkspace /><TranslationTab controller={controller} /></> : null}
       {controller.activeTab === "rag" ? <RagTab controller={controller} /> : null}
       {controller.activeTab === "embedding" ? <EmbeddingTab controller={controller} /> : null}
       {controller.activeTab === "test" ? <TranslationTestTab controller={controller} /> : null}

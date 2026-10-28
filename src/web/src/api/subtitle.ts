@@ -19,6 +19,8 @@ export type SubtitleAutoProfile = {
   youtube_subtitle_mode?: YouTubeSubtitleMode | null;
   translate_enabled: boolean;
   translate_provider: string;
+  translate_model_provider_id: string;
+  translate_model_id: string;
   target_lang: string;
   translate_style: string;
   translate_enable_summary: boolean;
@@ -50,6 +52,8 @@ export type SubtitleSubmitPayload = {
   youtube_subtitle_mode: "off" | "target" | "auto_source";
   translate_enabled: boolean;
   translate_provider: string;
+  translate_model_provider_id: string;
+  translate_model_id: string;
   target_lang: string;
   translate_style: string;
   translate_enable_summary: boolean | null;

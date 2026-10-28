@@ -119,7 +119,10 @@ export function TranslationTab({ controller }: { controller: SettingsTranslateCo
             </div>
           ) : (
           <>
-          <div className="lg:col-span-2 mt-1 border-b border-slate-100 pb-2 text-xs font-semibold uppercase tracking-wide text-slate-400">模型接口（OpenAI）</div>
+          <details className="lg:col-span-2 rounded-lg border border-slate-200 bg-slate-50 p-3">
+            <summary className="cursor-pointer text-sm font-semibold text-slate-700">旧版接口高级设置（现有 OpenAI 配置）</summary>
+            <div className="mt-3 grid gap-3 lg:grid-cols-2">
+            <div className="lg:col-span-2 border-b border-slate-200 pb-2 text-xs text-slate-500">修改此处只影响「现有 OpenAI 配置」，不会覆盖新增的模型提供方</div>
           <label className="block lg:col-span-2">
             <div className="mb-1 text-xs text-slate-600">接口类型</div>
             <select
@@ -203,6 +206,8 @@ export function TranslationTab({ controller }: { controller: SettingsTranslateCo
               </span>
             </span>
           </label>
+          </div>
+          </details>
           </>
           )}
         </div>

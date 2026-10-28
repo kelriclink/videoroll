@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useState, type Dispatch, type SetStateAction } from "react";
 import { useToast } from "../../../components/feedbackContext";
+import { translateApi, type ModelProvider } from "../../../api/translate";
 import {
   subtitleApi,
   type SubtitleQualityResponse,
@@ -54,6 +55,9 @@ export function useTaskSubtitle({
   const [bilingual, setBilingual] = useState(false);
   const [targetLang, setTargetLang] = useState("zh");
   const [translateProvider, setTranslateProvider] = useState("mock");
+  const [translateModelProviderId, setTranslateModelProviderId] = useState("legacy");
+  const [translateModelId, setTranslateModelId] = useState("");
+  const [modelProviders, setModelProviders] = useState<ModelProvider[]>([]);
   const [translateStyle, setTranslateStyle] = useState("口语自然");
   const [translateEnableSummary, setTranslateEnableSummary] = useState(true);
   const [openaiKeySet, setOpenaiKeySet] = useState<boolean | null>(null);
@@ -91,6 +95,9 @@ export function useTaskSubtitle({
         setBilingual(Boolean(profile.bilingual));
         setTargetLang(profile.target_lang || "zh");
         setTranslateProvider(profile.translate_provider || "openai");
+        setTranslateModelProviderId(profile.translate_model_provider_id || "legacy");
+        setTranslateModelId(profile.translate_model_id || "");
+        void translateApi.modelProviders().then(setModelProviders).catch(() => {});
         setTranslateStyle(profile.translate_style || "口语自然");
         setTranslateEnableSummary(Boolean(profile.translate_enable_summary));
         setPublishTypeidMode((profile.publish_typeid_mode || "ai_summary").toLowerCase());
@@ -218,6 +225,8 @@ export function useTaskSubtitle({
             youtube_subtitle_mode: youtubeSubtitleMode,
             translate_enabled: translateEnabled,
             translate_provider: translateProvider,
+            translate_model_provider_id: translateModelProviderId,
+            translate_model_id: translateModelProviderId === "legacy" ? "" : translateModelId,
             target_lang: targetLang,
             translate_style: translateStyle,
             translate_enable_summary: translateProvider === "openai" ? translateEnableSummary : null,
@@ -272,6 +281,11 @@ export function useTaskSubtitle({
     setTargetLang,
     translateProvider,
     setTranslateProvider,
+    translateModelProviderId,
+    setTranslateModelProviderId,
+    translateModelId,
+    setTranslateModelId,
+    modelProviders,
     translateStyle,
     setTranslateStyle,
     translateEnableSummary,

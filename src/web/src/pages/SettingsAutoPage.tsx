@@ -1,6 +1,8 @@
 import { Link } from "react-router-dom";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useConfirm } from "../components/feedbackContext";
+import { ModelChoiceSelect } from "../components/ModelChoiceSelect";
+import { translateApi, type ModelProvider } from "../api/translate";
 import { Button, SettingsSaveBar } from "../components/ui";
 import { useUnsavedChangesGuard } from "../hooks/useUnsavedChangesGuard";
 import { fetchJson } from "../lib/http";
@@ -36,6 +38,8 @@ type AutoProfile = {
   youtube_subtitle_mode?: YouTubeSubtitleMode | null;
   translate_enabled: boolean;
   translate_provider: string;
+  translate_model_provider_id: string;
+  translate_model_id: string;
   target_lang: string;
   translate_style: string;
   translate_enable_summary: boolean;
@@ -94,6 +98,8 @@ function autoProfileSnapshotFromServer(profile: AutoProfile, enabledPlatforms: P
     bilingual: Boolean(profile.bilingual),
     targetLang: profile.target_lang || "zh",
     translateProvider: profile.translate_provider || "openai",
+    translateModelProviderId: profile.translate_model_provider_id || "legacy",
+    translateModelId: profile.translate_model_id || "",
     translateStyle: profile.translate_style || "口语自然",
     translateEnableSummary: Boolean(profile.translate_enable_summary),
     autoPublish: Boolean(profile.auto_publish),
@@ -141,6 +147,9 @@ export default function SettingsAutoPage() {
   const [bilingual, setBilingual] = useState(false);
   const [targetLang, setTargetLang] = useState("zh");
   const [translateProvider, setTranslateProvider] = useState("openai");
+  const [translateModelProviderId, setTranslateModelProviderId] = useState("legacy");
+  const [translateModelId, setTranslateModelId] = useState("");
+  const [modelProviders, setModelProviders] = useState<ModelProvider[]>([]);
   const [translateStyle, setTranslateStyle] = useState("口语自然");
   const [translateEnableSummary, setTranslateEnableSummary] = useState(true);
 
@@ -159,14 +168,16 @@ export default function SettingsAutoPage() {
   async function refresh() {
     setError(null);
     try {
-      const [profile, models, translateSettings, platformSettingsResp] = await Promise.all([
+      const [profile, models, translateSettings, platformSettingsResp, providerRows] = await Promise.all([
         fetchJson<AutoProfile>(`${ORCHESTRATOR_URL}/subtitle/auto/profile`),
         fetchJson<Array<{ name: string; path: string }>>(`${ORCHESTRATOR_URL}/subtitle/models`).catch(() => null),
         fetchJson<{ openai_api_key_set: boolean }>(`${ORCHESTRATOR_URL}/subtitle/translate/settings`).catch(() => null),
         fetchJson<{ platforms: Record<string, boolean> }>(`${ORCHESTRATOR_URL}/settings/publish/platforms`).catch(() => null),
+        translateApi.modelProviders().catch(() => []),
       ]);
 
       if (models) setWhisperModels(models);
+      setModelProviders(providerRows);
       if (translateSettings) setOpenaiKeySet(Boolean(translateSettings.openai_api_key_set));
       let enabledPlatformIds: PublishPlatform[] | null = null;
       if (platformSettingsResp?.platforms) {
@@ -196,6 +207,8 @@ export default function SettingsAutoPage() {
       setBilingual(Boolean(profile.bilingual));
       setTargetLang(profile.target_lang || "zh");
       setTranslateProvider(profile.translate_provider || "openai");
+      setTranslateModelProviderId(profile.translate_model_provider_id || "legacy");
+      setTranslateModelId(profile.translate_model_id || "");
       setTranslateStyle(profile.translate_style || "口语自然");
       setTranslateEnableSummary(Boolean(profile.translate_enable_summary));
 
@@ -246,6 +259,8 @@ export default function SettingsAutoPage() {
     bilingual,
     targetLang,
     translateProvider,
+    translateModelProviderId,
+    translateModelId,
     translateStyle,
     translateEnableSummary,
     autoPublish,
@@ -312,6 +327,8 @@ export default function SettingsAutoPage() {
           youtube_subtitle_mode: youtubeSubtitleMode,
           translate_enabled: translateEnabled,
           translate_provider: translateProvider,
+          translate_model_provider_id: translateModelProviderId,
+          translate_model_id: translateModelProviderId === "legacy" ? "" : translateModelId,
           target_lang: targetLang,
           translate_style: translateStyle,
           translate_enable_summary: translateEnableSummary,
@@ -361,6 +378,8 @@ export default function SettingsAutoPage() {
     setBilingual(false);
     setTargetLang("zh");
     setTranslateProvider("openai");
+    setTranslateModelProviderId("legacy");
+    setTranslateModelId("");
     setTranslateStyle("口语自然");
     setTranslateEnableSummary(true);
     setAutoPublish(true);
@@ -622,6 +641,12 @@ export default function SettingsAutoPage() {
                 </select>
               </label>
 
+              {translateProvider === "openai" && (
+                <div className="lg:col-span-2 rounded-lg border border-blue-100 bg-blue-50 p-3">
+                  <ModelChoiceSelect providers={modelProviders} providerId={translateModelProviderId} modelId={translateModelId}
+                    onChange={(providerId, modelId) => { setTranslateModelProviderId(providerId); setTranslateModelId(modelId); }} />
+                </div>
+              )}
               <label className="block lg:col-span-2">
                 <div className="mb-1 text-xs text-slate-600">翻译风格</div>
                 <select className="w-full rounded border px-3 py-2 text-sm" value={translateStyle} onChange={(e) => setTranslateStyle(e.target.value)}>

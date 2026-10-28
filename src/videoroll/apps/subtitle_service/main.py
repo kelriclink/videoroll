@@ -29,6 +29,9 @@ from sqlalchemy.orm import Session
 from sqlalchemy.exc import ProgrammingError
 
 from videoroll.ai.service import AIService
+from videoroll.apps.subtitle_service.model_provider_store import (
+    delete_provider, fetch_remote_models, list_providers, save_provider,
+)
 from videoroll.apps.security.service_auth import install_internal_service_auth, service_token
 from videoroll.config import SubtitleServiceSettings, get_subtitle_settings
 from videoroll.db.migrate import initialize_database
@@ -627,6 +630,70 @@ def put_subtitle_auto_profile(payload: SubtitleAutoProfileUpdate, db: Session = 
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     return SubtitleAutoProfileRead(**cfg)
+
+
+class ModelEntryPayload(BaseModel):
+    id: str = Field(min_length=1, max_length=256)
+    context_window: int | None = Field(default=None, ge=1024, le=4_000_000)
+    max_output_tokens: int | None = Field(default=None, ge=1, le=250_000)
+    temperature: float | None = Field(default=0.2, ge=0, le=2)
+    enable_thinking: bool = False
+    reasoning_effort: str = "medium"
+
+
+class ModelProviderPayload(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+    base_url: str = Field(min_length=1, max_length=2048)
+    api_key: str | None = Field(default=None, max_length=8192)
+    api_type: str = "openai"
+    timeout_seconds: int = Field(default=180, ge=5, le=1200)
+    max_retries: int = Field(default=3, ge=1, le=10)
+    models: list[ModelEntryPayload] = Field(default_factory=list, max_length=200)
+
+
+@app.get("/subtitle/translate/model-providers")
+def get_model_providers(
+    settings: SubtitleServiceSettings = Depends(get_settings),
+    db: Session = Depends(get_db),
+) -> list[dict[str, Any]]:
+    return list_providers(db, get_translate_settings(db, settings))
+
+
+@app.post("/subtitle/translate/model-providers")
+def create_model_provider(payload: ModelProviderPayload, db: Session = Depends(get_db)) -> dict[str, Any]:
+    try:
+        return save_provider(db, None, payload.model_dump())
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.put("/subtitle/translate/model-providers/{provider_id}")
+def update_model_provider(
+    provider_id: str, payload: ModelProviderPayload, db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    try:
+        return save_provider(db, provider_id, payload.model_dump())
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.delete("/subtitle/translate/model-providers/{provider_id}")
+def remove_model_provider(provider_id: str, db: Session = Depends(get_db)) -> dict[str, str]:
+    try:
+        delete_provider(db, provider_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {"status": "deleted"}
+
+
+@app.get("/subtitle/translate/model-providers/{provider_id}/remote-models")
+def remote_model_provider_models(provider_id: str, db: Session = Depends(get_db)) -> dict[str, list[str]]:
+    try:
+        return {"models": fetch_remote_models(db, provider_id)}
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except (httpx.HTTPError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=502, detail=f"模型列表获取失败：{type(exc).__name__}") from exc
 
 
 @app.get("/subtitle/translate/settings", response_model=TranslateSettingsRead)
