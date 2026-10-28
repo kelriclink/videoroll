@@ -153,6 +153,19 @@ def download_youtube(task_id: uuid.UUID, settings: OrchestratorSettings = Depend
     return youtube_service.download(task_id, settings=settings, db=db, store=store)
 
 
+@router.post("/tasks/{task_id}/actions/youtube_download_enqueue")
+def enqueue_youtube_download(task_id: uuid.UUID, db: Session = Depends(get_db)) -> dict[str, str]:
+    from videoroll.apps.youtube_ingest.download_dispatch import enqueue_download
+
+    try:
+        state = enqueue_download(db, task_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if state == "failed":
+        raise HTTPException(status_code=409, detail="download failed after bounded retries; inspect task error")
+    return {"status": state, "task_id": str(task_id)}
+
+
 @router.get("/tasks/{task_id}/youtube_download_progress", response_model=YouTubeDownloadProgressRead)
 def get_youtube_download_progress(
     task_id: uuid.UUID,

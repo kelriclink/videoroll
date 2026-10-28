@@ -12,6 +12,7 @@ type TaskQueueItem = {
   subtitle_job_id?: string | null;
   render_job_id?: string | null;
   progress: number;
+  stage_elapsed_seconds: number;
   error_message?: string | null;
   created_at: string;
   updated_at: string;
@@ -21,11 +22,20 @@ type TaskQueue = {
   settings: {
     scheduler: "hatchet";
     subtitle_worker_slots: number;
+    download_concurrency: number;
+    active_downloads: number;
+    pending_downloads: number;
   };
   running_count: number;
   queued_count: number;
   tasks: TaskQueueItem[];
 };
+
+function elapsedLabel(seconds: number): string {
+  const minutes = Math.floor(Math.max(0, seconds) / 60);
+  if (minutes < 60) return `${minutes} 分钟`;
+  return `${Math.floor(minutes / 60)} 小时 ${minutes % 60} 分`;
+}
 
 function priorityLabel(priority: number): string {
   if (priority >= 50) return priority >= 100 ? "P0 紧急 · HIGH" : "P1 高 · HIGH";
@@ -36,6 +46,9 @@ function priorityLabel(priority: number): string {
 export default function RenderQueuePage() {
   const [queue, setQueue] = useState<TaskQueue | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [downloadConcurrency, setDownloadConcurrency] = useState<number>(2);
+  const [saving, setSaving] = useState(false);
+  const [saveMessage, setSaveMessage] = useState<string | null>(null);
   const queueRef = useRef<TaskQueue | null>(null);
   const refreshTimerRef = useRef<number | undefined>();
 
@@ -45,10 +58,34 @@ export default function RenderQueuePage() {
       const q = await fetchJson<TaskQueue>(`${ORCHESTRATOR_URL}/subtitle/task_queue?limit=2000`);
       queueRef.current = q;
       setQueue(q);
+      setDownloadConcurrency(q.settings.download_concurrency);
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : String(e));
     }
   }, []);
+
+  const saveDownloadConcurrency = useCallback(async () => {
+    const value = Math.trunc(downloadConcurrency);
+    if (!Number.isFinite(value) || value < 1 || value > 16) {
+      setSaveMessage("同时下载数应为 1～16");
+      return;
+    }
+    setSaving(true);
+    setSaveMessage(null);
+    try {
+      await fetchJson(`${ORCHESTRATOR_URL}/subtitle/task_queue/settings`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ max_concurrent: value }),
+      });
+      setSaveMessage("设置已保存，新下载任务自动按此并发数调度");
+      await refresh();
+    } catch (e: unknown) {
+      setSaveMessage(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSaving(false);
+    }
+  }, [downloadConcurrency, refresh]);
 
   useEffect(() => {
     void refresh();
@@ -141,6 +178,18 @@ export default function RenderQueuePage() {
           <div><div className="text-xs text-slate-500">Running</div><div className="mt-1 font-mono">{queue?.running_count ?? 0}</div></div>
           <div><div className="text-xs text-slate-500">Queued</div><div className="mt-1 font-mono">{queue?.queued_count ?? 0}</div></div>
         </div>
+        <div className="mt-4 flex flex-wrap items-end gap-3 border-t pt-4 text-sm">
+          <label className="flex flex-col gap-1">
+            <span className="text-xs text-slate-500">同时下载任务数（持久化）</span>
+            <input className="w-24 rounded border px-2 py-2 font-mono" type="number" min={1} max={16} step={1}
+              value={downloadConcurrency} onChange={(event) => setDownloadConcurrency(Number(event.target.value))} />
+          </label>
+          <button className="rounded border bg-slate-900 px-3 py-2 text-white disabled:opacity-50"
+            disabled={saving || !queue || downloadConcurrency === queue.settings.download_concurrency}
+            onClick={() => void saveDownloadConcurrency()}>{saving ? "保存中…" : "保存并发"}</button>
+          <div className="text-xs text-slate-600">正在下载：{queue?.settings.active_downloads ?? 0} / {queue?.settings.download_concurrency ?? 2} · 等待下载：{queue?.settings.pending_downloads ?? 0}</div>
+          {saveMessage ? <div role="status" className="text-xs text-slate-600">{saveMessage}</div> : null}
+        </div>
         <div className="mt-3 text-xs text-slate-500">
           Subtitle slots 来自 HATCHET_SUBTITLE_WORKER_SLOTS。Task priority 会在创建或恢复 Hatchet run 时映射为 HIGH / MEDIUM / LOW；已提交 run 不做伪实时重排。
         </div>
@@ -167,6 +216,7 @@ export default function RenderQueuePage() {
                     <div className="h-full rounded bg-sky-600" style={{ width: `${Math.max(0, Math.min(t.progress, 100))}%` }} />
                   </div>
                   <Link to={`/tasks/${t.task_id}`} className="inline-block break-all font-mono text-xs text-sky-700 underline">任务 {t.task_id.slice(0, 8)}</Link>
+                  <div className="text-xs text-slate-500">本阶段累计（含排队）：{elapsedLabel(t.stage_elapsed_seconds)}</div>
                   <div className="break-words text-xs text-slate-500">字幕 {t.subtitle_job_id?.slice(0, 8) ?? "-"} · 渲染 {t.render_job_id?.slice(0, 8) ?? "-"}</div>
                   <div className="text-xs text-slate-500">更新 {new Date(t.updated_at).toLocaleString()}</div>
                   {t.error_message ? <div className="break-words text-xs text-rose-700">{t.error_message}</div> : null}
@@ -181,6 +231,7 @@ export default function RenderQueuePage() {
                   <th className="py-2 pr-3">State</th>
                   <th className="py-2 pr-3">Stage</th>
                   <th className="py-2 pr-3">Progress</th>
+                  <th className="py-2 pr-3">阶段耗时（含等待）</th>
                   <th className="py-2 pr-3">Task</th>
                   <th className="py-2 pr-3">Subtitle Job</th>
                   <th className="py-2 pr-3">Render Job</th>
@@ -195,6 +246,7 @@ export default function RenderQueuePage() {
                     <td className="py-2 pr-3 font-mono text-xs">{t.state}</td>
                     <td className="py-2 pr-3 font-mono text-xs">{t.stage}</td>
                     <td className="py-2 pr-3 font-mono text-xs">{t.progress}%</td>
+                    <td className="py-2 pr-3 text-xs whitespace-nowrap">{elapsedLabel(t.stage_elapsed_seconds)}</td>
                     <td className="py-2 pr-3">
                       <Link className="font-mono text-xs text-slate-900 hover:underline" to={`/tasks/${t.task_id}`}>
                         {t.task_id.slice(0, 8)}

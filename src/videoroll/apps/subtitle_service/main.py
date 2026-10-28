@@ -21,6 +21,7 @@ from typing import Any, Generator
 from urllib.parse import urlsplit
 
 import httpx
+from pydantic import BaseModel, Field
 from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
@@ -2361,6 +2362,8 @@ def _auto_youtube_queue_progress(db: Session, task: Task) -> tuple[str, int, str
     if status == "failed":
         # Failed downloads are not active; do not display stale progress as running.
         return None
+    if status in {"queued", "pending"}:
+        return "waiting_download", progress, error
     if status == "completed":
         # Download completion only proves the source asset is ready. Hatchet may
         # still be advancing the workflow (or a previous run may have failed),
@@ -2368,6 +2371,25 @@ def _auto_youtube_queue_progress(db: Session, task: Task) -> tuple[str, int, str
         # SubtitleJob exists.
         return "workflow", 100, error
     return "youtube_download", progress, error
+
+
+def _download_queue_settings(db: Session) -> TaskQueueSettingsRead:
+    from videoroll.apps.youtube_ingest.download_dispatch import (read_download_concurrency, OPERATION_PREFIX)
+    from videoroll.db.models import OperationInbox
+
+    current = datetime.now(timezone.utc)
+    active = db.query(OperationInbox).filter(
+        OperationInbox.operation_key.like(f"{OPERATION_PREFIX}%"),
+        OperationInbox.status == "processing", OperationInbox.lease_until > current,
+    ).count()
+    pending = db.query(OperationInbox).filter(
+        OperationInbox.operation_key.like(f"{OPERATION_PREFIX}%"),
+        (OperationInbox.status == "pending") |
+        ((OperationInbox.status == "processing") & (OperationInbox.lease_until <= current)),
+    ).count()
+    return TaskQueueSettingsRead(scheduler="hatchet", subtitle_worker_slots=_subtitle_worker_slots(),
+                                 download_concurrency=read_download_concurrency(db),
+                                 active_downloads=active, pending_downloads=pending)
 
 
 def _read_task_queue(db: Session, *, limit: int) -> TaskQueueRead:
@@ -2404,6 +2426,7 @@ def _read_task_queue(db: Session, *, limit: int) -> TaskQueueRead:
 
     candidate_ids = set(subtitle_by_task) | set(render_by_task)
     failed_launch_by_task: dict[uuid.UUID, PipelineRun] = {}
+    pipeline_by_task: dict[uuid.UUID, PipelineRun] = {}
     auto_tasks = (
         db.query(Task)
         .filter(
@@ -2430,13 +2453,15 @@ def _read_task_queue(db: Session, *, limit: int) -> TaskQueueRead:
             "failed", "canceled", "superseded", "succeeded",
         }:
             continue
+        if latest_parent is not None:
+            pipeline_by_task[task.id] = latest_parent
         if latest_parent is not None and latest_parent.state == "launch_failed":
             failed_launch_by_task[task.id] = latest_parent
         candidate_ids.add(task.id)
 
     if not candidate_ids:
         return TaskQueueRead(
-            settings=TaskQueueSettingsRead(scheduler="hatchet", subtitle_worker_slots=_subtitle_worker_slots()),
+            settings=_download_queue_settings(db),
             running_count=0,
             queued_count=0,
             tasks=[],
@@ -2459,6 +2484,7 @@ def _read_task_queue(db: Session, *, limit: int) -> TaskQueueRead:
         progress = 0
         error_message = task.error_message
         created_at = task.created_at
+        stage_since = task.created_at
         updated_at = task.updated_at
         subtitle_job_id = sj.id if sj is not None else None
         render_job_id = rj.id if rj is not None else None
@@ -2469,6 +2495,7 @@ def _read_task_queue(db: Session, *, limit: int) -> TaskQueueRead:
             progress = int(rj.progress or 0)
             error_message = rj.error_message
             created_at = rj.created_at
+            stage_since = rj.created_at
             updated_at = rj.updated_at
             subtitle_job_id = rj.subtitle_job_id or subtitle_job_id
         elif sj is not None:
@@ -2477,8 +2504,12 @@ def _read_task_queue(db: Session, *, limit: int) -> TaskQueueRead:
             progress = int(sj.progress or 0)
             error_message = sj.error_message
             created_at = sj.created_at
+            stage_since = sj.created_at
             updated_at = sj.updated_at
         else:
+            parent = pipeline_by_task.get(task.id)
+            if parent is not None and parent.created_at is not None:
+                stage_since = parent.created_at
             failed_launch = failed_launch_by_task.get(task.id)
             if failed_launch is not None:
                 stage = "workflow_retry"
@@ -2499,6 +2530,8 @@ def _read_task_queue(db: Session, *, limit: int) -> TaskQueueRead:
                 subtitle_job_id=subtitle_job_id,
                 render_job_id=render_job_id,
                 progress=progress,
+                stage_elapsed_seconds=max(0, int((datetime.now(timezone.utc) -
+                    stage_since.replace(tzinfo=stage_since.tzinfo or timezone.utc)).total_seconds())),
                 error_message=error_message,
                 created_at=created_at,
                 updated_at=updated_at,
@@ -2507,11 +2540,23 @@ def _read_task_queue(db: Session, *, limit: int) -> TaskQueueRead:
 
     items.sort(key=lambda item: (0 if item.state == "running" else 1, -int(item.priority or 0), item.created_at))
     return TaskQueueRead(
-        settings=TaskQueueSettingsRead(scheduler="hatchet", subtitle_worker_slots=_subtitle_worker_slots()),
+        settings=_download_queue_settings(db),
         running_count=sum(1 for item in items if item.state == "running"),
         queued_count=sum(1 for item in items if item.state == "queued"),
         tasks=items,
     )
+
+
+class DownloadConcurrencyUpdate(BaseModel):
+    max_concurrent: int = Field(ge=1, le=16)
+
+
+@app.put("/subtitle/task_queue/settings", response_model=TaskQueueSettingsRead)
+def update_task_queue_settings(payload: DownloadConcurrencyUpdate, db: Session = Depends(get_db)) -> TaskQueueSettingsRead:
+    from videoroll.apps.youtube_ingest.download_dispatch import set_download_concurrency
+
+    set_download_concurrency(db, payload.max_concurrent)
+    return _download_queue_settings(db)
 
 
 @app.get("/subtitle/task_queue", response_model=TaskQueueRead)

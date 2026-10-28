@@ -741,6 +741,9 @@ class ModelDownloadProxyTestResponse(BaseModel):
 class TaskQueueSettingsRead(BaseModel):
     scheduler: Literal["hatchet"] = "hatchet"
     subtitle_worker_slots: int = Field(1, ge=1, le=256)
+    download_concurrency: int = Field(2, ge=1, le=16)
+    active_downloads: int = 0
+    pending_downloads: int = 0
 
 
 class TaskQueueItemRead(BaseModel):
@@ -751,6 +754,7 @@ class TaskQueueItemRead(BaseModel):
     subtitle_job_id: Optional[uuid.UUID] = None
     render_job_id: Optional[uuid.UUID] = None
     progress: int = 0
+    stage_elapsed_seconds: int = Field(0, ge=0)
     error_message: Optional[str] = None
     created_at: datetime
     updated_at: datetime

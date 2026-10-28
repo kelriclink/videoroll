@@ -11,6 +11,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 
 import httpx
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from videoroll.apps.orchestrator_api.infrastructure.internal_http import internal_http_headers
@@ -136,6 +137,74 @@ def reconcile_stranded_auto_subtitle_jobs(settings, *, limit: int = 200) -> int:
         if changed:
             db.commit()
     return changed
+
+def recover_orphaned_youtube_download_pipelines(settings, *, limit: int = 3) -> dict[str, int]:
+    """Recreate at most one failed parent for an unowned, interrupted download.
+
+    The operation inbox marker is the durable once-only recovery claim. Existing
+    Task IDs and download checkpoints are reused; published/cancelled/manual
+    tasks and historical terminal download errors are never revived.
+    """
+    from videoroll.db.models import OperationInbox
+    from videoroll.workflows.launcher import PipelineLauncher
+
+    factory = get_sessionmaker(settings.database_url)
+    recovered = 0
+    errors = 0
+    for _ in range(max(0, min(int(limit), 10))):
+        with factory() as db:
+            now = datetime.now(timezone.utc)
+            candidates = (db.query(OperationInbox)
+                .filter(OperationInbox.operation_key.like("youtube-download:%"),
+                        OperationInbox.status == "processing",
+                        OperationInbox.lease_until < now,
+                        or_(OperationInbox.request_json["auto_workflow_recoveries"].as_integer().is_(None),
+                            OperationInbox.request_json["auto_workflow_recoveries"].as_integer() < 1))
+                .order_by(OperationInbox.created_at.asc())
+                .limit(200).all())
+            chosen = None
+            for operation in candidates:
+                info = operation.request_json if isinstance(operation.request_json, dict) else {}
+                if int(info.get("auto_workflow_recoveries", 0)) >= 1:
+                    continue
+                try:
+                    task_id = uuid.UUID(operation.operation_key.removeprefix("youtube-download:"))
+                except ValueError:
+                    continue
+                task = db.get(Task, task_id)
+                if task is None or task.status != TaskStatus.ingested or not str(task.created_by or "").startswith("auto_youtube;"):
+                    continue
+                parent = (db.query(PipelineRun).filter(
+                    PipelineRun.task_id == task_id,
+                    PipelineRun.workflow_name == AUTO_WORKFLOW_NAME)
+                    .order_by(PipelineRun.created_at.desc()).first())
+                if parent is None or parent.state != "failed":
+                    continue
+                row = (db.query(OperationInbox).filter(OperationInbox.id == operation.id)
+                       .with_for_update(skip_locked=True).one_or_none())
+                if row is None or row.status != "processing" or row.lease_until is None:
+                    continue
+                deadline = row.lease_until.replace(tzinfo=row.lease_until.tzinfo or timezone.utc)
+                if deadline >= now:
+                    continue
+                claim = dict(row.request_json or {})
+                if int(claim.get("auto_workflow_recoveries", 0)) >= 1:
+                    continue
+                claim["auto_workflow_recoveries"] = 1
+                row.request_json = claim
+                db.commit()
+                chosen = task_id
+                break
+        if chosen is None:
+            break
+        try:
+            PipelineLauncher(settings).launch_auto_youtube(chosen)
+            recovered += 1
+        except Exception:
+            errors += 1
+            logger.exception("failed to restart orphaned YouTube pipeline task=%s", chosen)
+    return {"recovered": recovered, "errors": errors}
+
 
 def recover_failed_auto_launches(settings, *, limit: int = 3) -> dict[str, int]:
     """Retry recent automatic launch failures using their original Hatchet dispatch key.

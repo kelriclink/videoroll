@@ -41,6 +41,7 @@ from videoroll.apps.youtube_ingest.source_service import (
     upsert_youtube_source,
 )
 from videoroll.utils.youtube_urls import canonicalize_youtube_url, extract_youtube_video_id
+from videoroll.apps.youtube_ingest.download_dispatch import DownloadSupervisor
 
 
 def get_settings() -> YouTubeIngestSettings:
@@ -73,7 +74,12 @@ def get_db(settings: YouTubeIngestSettings = Depends(get_settings)) -> Generator
 @asynccontextmanager
 async def _lifespan(_app: FastAPI):
     _startup()
-    yield
+    supervisor = DownloadSupervisor()
+    supervisor.start()
+    try:
+        yield
+    finally:
+        supervisor.stop()
 
 
 app = FastAPI(title="videoroll-youtube-ingest", version="0.1.0", lifespan=_lifespan)

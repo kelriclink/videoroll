@@ -12,6 +12,7 @@ from videoroll.apps.subtitle_service.main import _read_task_queue
 from videoroll.db.base import Base
 from videoroll.db.models import (
     AppSetting,
+    OperationInbox,
     RenderExecution,
     RenderJob,
     RenderJobStatus,
@@ -36,6 +37,7 @@ def db() -> Session:
     tables = [
         Task.__table__,
         AppSetting.__table__,
+        OperationInbox.__table__,
         SubtitleJob.__table__,
         RenderJob.__table__,
         RenderWorker.__table__,

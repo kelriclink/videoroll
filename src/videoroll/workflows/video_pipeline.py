@@ -21,10 +21,10 @@ SUBTITLE_JOB_TASK_NAME = "SubtitleJobV1"
 RENDER_FINISHED_EVENT = "videoroll.render.finished"
 DUBBING_FINISHED_EVENT = "videoroll.dubbing.finished"
 PUBLISH_FINISHED_EVENT = "videoroll.publish.finished"
-YOUTUBE_DOWNLOAD_REQUEST_TIMEOUT_SECONDS = 6 * 60 * 60
-YOUTUBE_DOWNLOAD_POLL_INTERVAL_SECONDS = 10
+YOUTUBE_DOWNLOAD_REQUEST_TIMEOUT_SECONDS = 15
+YOUTUBE_DOWNLOAD_POLL_INTERVAL_SECONDS = 60
 YOUTUBE_DOWNLOAD_IDLE_GRACE_POLLS = 6
-YOUTUBE_DOWNLOAD_MAX_POLLS = 8 * 60 * 60 // YOUTUBE_DOWNLOAD_POLL_INTERVAL_SECONDS
+YOUTUBE_DOWNLOAD_MAX_POLLS = 48 * 60 * 60 // YOUTUBE_DOWNLOAD_POLL_INTERVAL_SECONDS
 
 
 class AutoYouTubeWorkflowInput(BaseModel):
@@ -188,7 +188,7 @@ async def _wait_for_youtube_download(
 
         await ctx.aio_sleep_for(timedelta(seconds=YOUTUBE_DOWNLOAD_POLL_INTERVAL_SECONDS))
 
-    raise RuntimeError(f"youtube download did not finish within 8 hours for task {task_id}")
+    raise RuntimeError(f"youtube download did not finish within 48 hours for task {task_id}")
 
 
 async def _ensure_youtube_download(
@@ -202,7 +202,7 @@ async def _ensure_youtube_download(
             headers=_headers(settings),
         ) as client:
             response = await client.post(
-                f"{settings.orchestrator_url}/tasks/{task_id}/actions/youtube_download"
+                f"{settings.orchestrator_url}/tasks/{task_id}/actions/youtube_download_enqueue"
             )
     except httpx.HTTPError as exc:
         # A disconnected/expired HTTP request does not mean the synchronous
@@ -216,8 +216,8 @@ async def _ensure_youtube_download(
         )
 
     if response.is_success:
-        payload = response.json() if response.content else {}
-        return payload if isinstance(payload, dict) else {"result": payload}
+        # An acknowledged durable enqueue is not a completed video download.
+        return await _wait_for_youtube_download(settings, task_id, ctx)
 
     detail = (response.text or "").strip()
     status = int(response.status_code)
@@ -303,7 +303,7 @@ def register_video_pipeline(hatchet: Any, *, settings: WorkflowRuntimeSettings |
         backoff_factor=2.0,
         backoff_max_seconds=30,
         schedule_timeout=timedelta(minutes=10),
-        execution_timeout=timedelta(hours=8),
+        execution_timeout=timedelta(hours=48),
         desired_worker_labels=_desired_pool("workflow-core"),
     )
     async def youtube_download(input: AutoYouTubeWorkflowInput, ctx: Any) -> WorkflowStageOutput:

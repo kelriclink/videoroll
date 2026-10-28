@@ -333,10 +333,16 @@ class OrchestratorScheduler:
             self._cleanup_stop.wait(timeout=max(5, self._lease_recovery_interval_seconds))
 
     def _workflow_audit_loop(self) -> None:
-        from videoroll.workflows.pipeline_status_sync import reconcile_auto_pipeline_runs, recover_failed_auto_launches
+        from videoroll.workflows.pipeline_status_sync import reconcile_auto_pipeline_runs, recover_failed_auto_launches, recover_orphaned_youtube_download_pipelines
         while not self._workflow_audit_stop.is_set():
             try:
                 result = reconcile_auto_pipeline_runs(self.settings)
+                # Orchestrator crash can leave a failed Hatchet parent and an
+                # expired download operation. Resume once, not indefinitely.
+                orphaned = recover_orphaned_youtube_download_pipelines(self.settings)
+                if orphaned["recovered"] or orphaned["errors"]:
+                    logger.warning("orphaned YouTube pipelines recovered=%d errors=%d",
+                                   orphaned["recovered"], orphaned["errors"])
                 launches = recover_failed_auto_launches(self.settings)
                 if launches["checked"]:
                     logger.warning("automatic Hatchet launch recovery: checked=%d launched=%d errors=%d",

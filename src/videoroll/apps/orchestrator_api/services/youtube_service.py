@@ -455,6 +455,21 @@ def get_download_progress(task_id: uuid.UUID, *, db: Session, redis_url: str = "
     if not data:
         row = db.get(AppSetting, f"{YOUTUBE_DOWNLOAD_PROGRESS_PREFIX}{task_id}")
         data = dict(row.value_json or {}) if row else {}
+    from videoroll.apps.youtube_ingest.download_dispatch import download_operation_status
+
+    operation = download_operation_status(db, task_id)
+    if operation is not None:
+        state, op_updated, op_error = operation
+        if state in {"queued", "pending"}:
+            # Discard stale Redis active=true after a process dies or its lease expires.
+            data.update(status="queued", active=False, error=op_error,
+                        updated_at=op_updated.isoformat() if op_updated else data.get("updated_at"))
+        elif state == "failed":
+            data.update(status="failed", active=False, error=op_error)
+        elif state == "completed":
+            data.update(status="completed", active=False, progress=100, error=None)
+        elif state == "processing":
+            data["active"] = True
     return {**_download_progress_defaults(task_id), **data, "task_id": str(task_id)}
 
 
@@ -792,7 +807,7 @@ def _download(
 def download(task_id: uuid.UUID, *, settings: OrchestratorSettings, db: Session, store: FileStore) -> YouTubeDownloadActionResponse:
     reporter = _YouTubeDownloadProgressReporter(task_id, db=db, redis_url=str(getattr(settings, "redis_url", "") or ""))
     operation_key = f"youtube-download:{task_id}"
-    owner = f"orchestrator.youtube_download:{os.getpid()}:{uuid.uuid4().hex[:12]}"
+    owner = f"{os.getenv('DEPLOYMENT_ROLE', 'orchestrator')}.youtube_download:{os.getpid()}:{uuid.uuid4().hex[:12]}"
     heartbeat: OperationHeartbeat | None = None
     operation_acquired = False
     try:
@@ -800,7 +815,7 @@ def download(task_id: uuid.UUID, *, settings: OrchestratorSettings, db: Session,
             db,
             operation_key,
             owner,
-            3600,
+            180,
             request_json={"task_id": str(task_id)},
         )
         db.commit()
@@ -823,7 +838,7 @@ def download(task_id: uuid.UUID, *, settings: OrchestratorSettings, db: Session,
                     db,
                     operation_key,
                     owner,
-                    3600,
+                    180,
                     request_json={"task_id": str(task_id), "recovery": True},
                 )
                 db.commit()
@@ -835,7 +850,7 @@ def download(task_id: uuid.UUID, *, settings: OrchestratorSettings, db: Session,
             get_sessionmaker(settings.database_url),
             operation_key,
             owner,
-            3600,
+            180,
         )
         heartbeat.start()
         result = _download(task_id, settings=settings, db=db, store=store, reporter=reporter)

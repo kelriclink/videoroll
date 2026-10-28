@@ -388,7 +388,7 @@ class YouTubeDownloadActionResponse(BaseModel):
 
 class YouTubeDownloadProgressRead(BaseModel):
     task_id: uuid.UUID
-    status: Literal["idle", "preparing", "downloading", "processing", "uploading", "completed", "failed"] = "idle"
+    status: Literal["idle", "queued", "preparing", "downloading", "processing", "storing", "uploading", "completed", "failed"] = "idle"
     active: bool = False
     progress: int = Field(default=0, ge=0, le=100)
     downloaded_bytes: int = 0
