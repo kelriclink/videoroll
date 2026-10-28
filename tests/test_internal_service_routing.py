@@ -155,3 +155,31 @@ def test_subtitle_proxy_rejects_invalid_task_context_path() -> None:
 
 def test_subtitle_proxy_allows_groq_asr_test() -> None:
     assert subtitle_service._is_browser_proxy_path_allowed("POST", "subtitle/asr/groq/test")
+
+
+@pytest.mark.parametrize(
+    ("method", "path"),
+    [
+        ("GET", "subtitle/translate/model-providers"),
+        ("POST", "subtitle/translate/model-providers"),
+        ("PUT", "subtitle/translate/model-providers/migrated-openai-20261028"),
+        ("DELETE", "subtitle/translate/model-providers/a8b1e21f-1642-4256-9ad1-84bc4afe19e9"),
+        ("GET", "subtitle/translate/model-providers/migrated-openai-20261028/remote-models"),
+    ],
+)
+def test_model_provider_browser_routes_are_allowed(method: str, path: str) -> None:
+    assert subtitle_service._is_browser_proxy_path_allowed(method, path)
+
+
+@pytest.mark.parametrize(
+    ("method", "path"),
+    [
+        ("POST", "subtitle/translate/model-providers/foo/remote-models"),
+        ("GET", "subtitle/translate/model-providers/foo/delete"),
+        ("DELETE", "subtitle/translate/model-providers/foo/remote-models"),
+        ("PUT", "subtitle/translate/model-providers/foo/bar"),
+        ("GET", "subtitle/translate/model-providers/foo/bar/remote-models"),
+    ],
+)
+def test_model_provider_browser_routes_cannot_open_arbitrary_paths(method: str, path: str) -> None:
+    assert not subtitle_service._is_browser_proxy_path_allowed(method, path)

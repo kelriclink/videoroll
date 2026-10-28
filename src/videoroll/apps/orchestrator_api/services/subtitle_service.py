@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -47,6 +48,7 @@ _BROWSER_PROXY_PATHS: dict[str, set[str]] = {
         "subtitle/asr/settings",
         "subtitle/auto/profile",
         "subtitle/translate/settings",
+        "subtitle/translate/model-providers",
         "subtitle/hardware/intel",
         "subtitle/embedding/runtime",
         "subtitle/agents/runs",
@@ -59,6 +61,7 @@ _BROWSER_PROXY_PATHS: dict[str, set[str]] = {
         "subtitle/task_queue/settings",
     },
     "POST": {
+        "subtitle/translate/model-providers",
         "subtitle/models/proxy/test",
         "subtitle/asr/external/test",
         "subtitle/asr/groq/test",
@@ -88,6 +91,19 @@ def _is_browser_proxy_path_allowed(method: str, service_path: str) -> bool:
     normalized_method = method.upper()
     if service_path in _BROWSER_PROXY_PATHS.get(normalized_method, set()):
         return True
+    # New model-provider catalog is served by the subtitle service but must
+    # pass through the explicit browser allowlist. Provider IDs are a single
+    # safe path segment (UUID or migration slug); no unrestricted proxying.
+    prefix = "subtitle/translate/model-providers/"
+    if service_path.startswith(prefix):
+        suffix = service_path[len(prefix):]
+        remote_suffix = "/remote-models"
+        if normalized_method == "GET" and suffix.endswith(remote_suffix):
+            provider_id = suffix[:-len(remote_suffix)]
+            return re.fullmatch(r"[a-zA-Z0-9_-]{1,128}", provider_id) is not None
+        if normalized_method in {"PUT", "DELETE"}:
+            return re.fullmatch(r"[a-zA-Z0-9_-]{1,128}", suffix) is not None
+        return False
     if normalized_method == "GET" and service_path.startswith("subtitle/agents/runs/") and service_path.count("/") == 3:
         try:
             uuid.UUID(service_path.rsplit("/", 1)[1])
