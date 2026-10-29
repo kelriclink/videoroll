@@ -367,15 +367,16 @@ def reconcile_failed_child_subtitle_jobs(settings, *, limit: int = 200) -> int:
 
     Parent reconciliation deliberately excludes jobs created after parent
     failure. These later independent retries need separate synchronization.
+    A child run's terminal state is execution truth regardless of the Task's
+    current business stage, so an asr_done/downloaded Task cannot keep a phantom
+    queued SubtitleJob alive after its own child PipelineRun failed or canceled.
     """
     factory = get_sessionmaker(settings.database_url)
     changed = 0
     with factory() as db:
         jobs = (
             db.query(SubtitleJob)
-            .join(Task, Task.id == SubtitleJob.task_id)
             .filter(
-                Task.status == TaskStatus.failed,
                 SubtitleJob.status == SubtitleJobStatus.queued,
                 SubtitleJob.progress == 0,
                 SubtitleJob.lease_owner.is_(None),

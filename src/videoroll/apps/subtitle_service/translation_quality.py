@@ -3,10 +3,28 @@ from __future__ import annotations
 import re
 import unicodedata
 from collections import Counter
+from decimal import Decimal, InvalidOperation
 from typing import Any, Iterable, Mapping
 
 
 _NUMBER_RE = re.compile(r"(?<!\d)[-+]?\d+(?:[.,]\d+)*(?!\d)")
+_ENGLISH_SCALE_RE = re.compile(
+    r"(?<!\w)([-+]?\d+(?:[.,]\d+)*)\s*(thousand|million|billion|trillion)\b",
+    re.IGNORECASE,
+)
+_CJK_SCALE_RE = re.compile(r"(?<!\d)([-+]?\d+(?:\.\d+)?)\s*([万億亿兆])")
+_ENGLISH_SCALES = {
+    "thousand": Decimal("1000"),
+    "million": Decimal("1000000"),
+    "billion": Decimal("1000000000"),
+    "trillion": Decimal("1000000000000"),
+}
+_CJK_SCALES = {
+    "万": Decimal("10000"),
+    "亿": Decimal("100000000"),
+    "億": Decimal("100000000"),
+    "兆": Decimal("1000000000000"),
+}
 
 
 def _norm_text(value: Any) -> str:
@@ -236,17 +254,79 @@ def _canonical_number(value: str) -> str:
     return f"{sign}{raw}"
 
 
-def _numbers(value: str) -> Counter[str]:
-    """Recognize distinct numeric *values*, not ASR repetition counts.
+def _decimal_number(value: str) -> Decimal | None:
+    canonical = _canonical_number(value)
+    if not canonical:
+        return None
+    try:
+        return Decimal(canonical)
+    except InvalidOperation:
+        return None
 
-    The minus in identifier labels such as SCP-145 or D-9229 is a separator,
-    not a mathematical negative sign. Duplicate ASR fragments may legitimately
-    be collapsed by a translation: a number mentioned twice is not two facts.
-    Actual negative values (e.g. -5 °C) still keep their sign.
+
+def _canonical_decimal(value: Decimal) -> str:
+    normalized = value.normalize()
+    if normalized == normalized.to_integral():
+        return str(normalized.quantize(Decimal("1")))
+    return format(normalized, "f").rstrip("0").rstrip(".")
+
+
+def _scaled_numbers(text: str) -> tuple[set[str], set[tuple[int, int]]]:
+    """Return semantic values for common scale expressions and their digit spans.
+
+    This lets `200 million` and `2亿` compare as the same value without weakening
+    ordinary numeric fidelity checks such as `450W` versus `4500W`.
+    """
+    values: set[str] = set()
+    scaled_digit_spans: set[tuple[int, int]] = set()
+    for match in _ENGLISH_SCALE_RE.finditer(text):
+        number = _decimal_number(match.group(1))
+        scale = _ENGLISH_SCALES.get(match.group(2).casefold())
+        if number is None or scale is None:
+            continue
+        values.add(_canonical_decimal(number * scale))
+        scaled_digit_spans.add(match.span(1))
+    for match in _CJK_SCALE_RE.finditer(text):
+        number = _decimal_number(match.group(1))
+        scale = _CJK_SCALES.get(match.group(2))
+        if number is None or scale is None:
+            continue
+        values.add(_canonical_decimal(number * scale))
+        scaled_digit_spans.add(match.span(1))
+    return values, scaled_digit_spans
+
+
+def _source_identifier_numbers(text: str) -> set[str]:
+    """Return numbers whose leading hyphen is part of an ASCII identifier label."""
+    identifiers: set[str] = set()
+    for match in _NUMBER_RE.finditer(text):
+        token = match.group()
+        if not token.startswith("-") or not match.start():
+            continue
+        previous = text[match.start() - 1]
+        if not (previous.isascii() and previous.isalpha()):
+            continue
+        canonical = _canonical_number(token[1:])
+        if canonical:
+            identifiers.add(canonical)
+    return identifiers
+
+
+def _numbers(value: str, *, source: bool = False) -> Counter[str]:
+    """Recognize distinct numeric values, including common translated scales.
+
+    Duplicate ASR fragments may legitimately be collapsed by a translation, so
+    values are distinct rather than occurrence-counted. English identifier labels
+    such as SCP-145 keep `145` as their semantic number. Source-side scaled phrases
+    such as `200 million` are compared by their full numeric value instead of the
+    raw coefficient, allowing equivalent translations such as `2亿`.
     """
     text = unicodedata.normalize("NFKC", str(value or ""))
-    found: set[str] = set()
+    scaled_values, scaled_digit_spans = _scaled_numbers(text)
+    found: set[str] = set(scaled_values)
     for match in _NUMBER_RE.finditer(text):
+        if source and match.span() in scaled_digit_spans:
+            continue
         token = match.group()
         if token.startswith("-") and match.start() and (
             text[match.start() - 1].isascii() and text[match.start() - 1].isalpha()
@@ -285,8 +365,15 @@ def validate_translation_mapping(
                 }
             )
             continue
-        source_numbers = _numbers(source_text)
+        source_numbers = _numbers(source_text, source=True)
         target_numbers = _numbers(target_text)
+        # A translated identifier may use a non-ASCII name before the hyphen
+        # (`Plutonium-239` -> `钚-239`). In that context the target tokenizer
+        # cannot distinguish the separator from a unary minus by characters
+        # alone, so accept the signed spelling only for source-proven identifiers.
+        for identifier_number in _source_identifier_numbers(source_text):
+            if not identifier_number.startswith("-") and f"-{identifier_number}" in target_numbers:
+                target_numbers[identifier_number] = 1
         missing_numbers = list((source_numbers - target_numbers).elements())
         if missing_numbers:
             issues.append(

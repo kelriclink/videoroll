@@ -118,6 +118,33 @@ def test_translation_validator_accepts_decimal_separator_change() -> None:
     assert issues == []
 
 
+def test_translation_validator_accepts_hyphenated_identifier_after_translation() -> None:
+    issues = validate_translation_mapping(
+        blocks=[{"idx": 1, "text": "One 6.2 kilogram sphere of Plutonium-239."}],
+        translations={1: "一颗重 6.2 千克的钚-239。"},
+        translation_plan={},
+    )
+    assert issues == []
+
+
+def test_translation_validator_accepts_equivalent_scaled_number_translation() -> None:
+    issues = validate_translation_mapping(
+        blocks=[{"idx": 1, "text": "It happened 200 million years ago."}],
+        translations={1: "这发生在2亿年前。"},
+        translation_plan={},
+    )
+    assert issues == []
+
+
+def test_translation_validator_still_rejects_changed_negative_value() -> None:
+    issues = validate_translation_mapping(
+        blocks=[{"idx": 1, "text": "The temperature is -5 °C."}],
+        translations={1: "温度是 5 °C。"},
+        translation_plan={},
+    )
+    assert [issue["type"] for issue in issues] == ["number_mismatch"]
+
+
 def test_preferred_term_is_repairable_but_not_blocking() -> None:
     blocks = [{"idx": 1, "text": "Use the AWP here."}]
     plan = build_translation_plan(

@@ -255,3 +255,45 @@ def test_failed_hatchet_child_reconciles_its_orphaned_queued_job(monkeypatch):
         assert "Hatchet SubtitleJobV1 failed" in job.error_message
     assert sync.reconcile_failed_child_subtitle_jobs(_settings()) == 0
     engine.dispose()
+
+
+def test_failed_hatchet_child_reconciles_queued_job_even_when_task_is_not_failed(monkeypatch):
+    from videoroll.db.models import SubtitleJobStatus
+
+    engine, factory, _ = _factory()
+    with factory() as db:
+        task = Task(
+            source_type=SourceType.youtube,
+            source_license=SourceLicense.authorized,
+            status=TaskStatus.asr_done,
+        )
+        db.add(task)
+        db.flush()
+        failed_job = SubtitleJob(
+            task_id=task.id,
+            status=SubtitleJobStatus.queued,
+            request_json={"runtime_profile": True},
+            progress=0,
+        )
+        db.add(failed_job)
+        db.flush()
+        job_id = failed_job.id
+        db.add(
+            PipelineRun(
+                task_id=task.id,
+                engine="hatchet",
+                workflow_name="SubtitleJobV1",
+                state="failed",
+                request_json={"job_id": str(job_id)},
+            )
+        )
+        db.commit()
+
+    monkeypatch.setattr(sync, "get_sessionmaker", lambda _url: factory)
+    assert sync.reconcile_failed_child_subtitle_jobs(_settings()) == 1
+    with factory() as db:
+        job = db.get(SubtitleJob, job_id)
+        task = db.get(Task, job.task_id)
+        assert job.status == SubtitleJobStatus.failed
+        assert task.status == TaskStatus.asr_done
+    engine.dispose()
