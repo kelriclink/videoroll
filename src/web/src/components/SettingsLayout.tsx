@@ -1,14 +1,15 @@
 import { NavLink, Outlet } from "react-router-dom";
 
 const settingsItems = [
-  ["/settings/auto", "自动模式"],
+  ["/settings/auto", "自动处理"],
   ["/settings/youtube", "YouTube"],
-  ["/settings/publish", "投稿"],
-  ["/settings/asr", "ASR"],
-  ["/settings/translate", "翻译 / RAG"],
+  ["/settings/asr", "语音识别"],
+  ["/settings/translate", "翻译与 AI"],
+  ["/settings/dubbing", "中文配音"],
+  ["/settings/publish", "发布"],
   ["/settings/review", "审核"],
   ["/settings/storage", "存储"],
-  ["/settings/api", "API"],
+  ["/settings/api", "接口"],
 ] as const;
 
 export default function SettingsLayout() {
@@ -20,9 +21,9 @@ export default function SettingsLayout() {
             <div className="text-xs font-medium text-slate-400">系统</div>
             <h1 className="mt-1 text-xl font-semibold tracking-tight text-slate-950 dark:text-white">设置</h1>
           </div>
-          <div className="hidden text-xs text-slate-500 sm:block">修改后仅影响后续任务，除非页面另有说明</div>
+          <div className="hidden text-xs text-slate-500 sm:block">配置只影响后续任务；正在运行的任务保持原执行快照</div>
         </div>
-        <nav className="-mb-3 flex gap-1 overflow-x-auto pb-px md:hidden" aria-label="设置导航">
+        <nav className="-mb-3 flex gap-1 overflow-x-auto pb-px" aria-label="设置导航">
           {settingsItems.map(([to, label]) => (
             <NavLink
               key={to}

@@ -3,6 +3,9 @@ import type { TaskDetailController } from "../useTaskDetailController";
 import { Link } from "react-router-dom";
 import { activeAccountsForPlatform, PublishPlatform, socialPublishBrowserUrl } from "../../../lib/publish";
 import { clampUploadProgress } from "../utils";
+import { InlineNotice, TechnicalDetails } from "../../../components/ui";
+import { jobStatusLabel, publishPlatformLabel } from "../../../lib/executionPresentation";
+import { presentTaskError } from "../../../lib/taskPresentation";
 export function TaskDetailPublish({ controller }: { controller: TaskDetailController }) {
   const [appendDubbingJobId, setAppendDubbingJobId] = useState("");
   const {
@@ -81,7 +84,11 @@ export function TaskDetailPublish({ controller }: { controller: TaskDetailContro
           return <div className={`mt-3 rounded border p-3 text-sm ${failed ? "border-rose-200 bg-rose-50 text-rose-800" : "border-sky-200 bg-sky-50 text-sky-900"}`}>
             <strong>{done ? "YouDub 配音完成，正在进入双分 P 投稿" : failed ? "自动 YouDub 配音未完成，尚未投稿" : "自动 YouDub 配音中 · 尚未提交 B站稿件"}</strong>
             <div className="mt-1 text-xs">{job.progress}% · {stage} · 任务 {job.id.slice(0, 8)}</div>
-            {job.error_message ? <p className="mt-1 text-xs">{job.error_message}</p> : null}
+            {job.error_message ? (
+              <TechnicalDetails className="mt-2" summary={presentTaskError(job.error_message)?.title ?? "配音异常"}>
+                <div className="whitespace-pre-wrap break-words font-mono">{job.error_message}</div>
+              </TechnicalDetails>
+            ) : null}
             <div className="mt-2 h-2 overflow-hidden rounded bg-sky-100">
               <div className="h-full bg-sky-500" style={{ width: `${Math.min(100, Math.max(0, job.progress))}%` }}/>
             </div>
@@ -495,7 +502,7 @@ export function TaskDetailPublish({ controller }: { controller: TaskDetailContro
         </div>
 
         <div className="mt-4">
-          <div className="text-xs font-semibold text-slate-700">Publish Batches</div>
+          <div className="text-xs font-semibold text-slate-700 dark:text-slate-300">发布批次</div>
           {!publishBatches ? <div className="mt-2 text-sm text-slate-500">加载中…</div> : null}
           {publishBatches && publishBatches.length === 0 ? <div className="mt-2 text-sm text-slate-500">暂无</div> : null}
           {publishBatches && publishBatches.length > 0 ? (
@@ -511,21 +518,30 @@ export function TaskDetailPublish({ controller }: { controller: TaskDetailContro
                 return (
                   <div key={batch.id} className="rounded border border-slate-200 bg-slate-50 p-2 text-xs">
                     <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
-                      <span className="font-mono">{batch.id}</span>
-                      <span className="font-semibold">{batch.state}</span>
-                      <span className="text-slate-600">目标：{targets || "-"}</span>
+                      <span className="font-semibold">{jobStatusLabel(batch.state)}</span>
+                      <span className="text-slate-600">目标 {batch.expected_targets.length} 个</span>
                       <span className="text-slate-600">
                         清理：{batch.cleanup_enqueued_at ? "已投递" : batch.state === "succeeded" ? "待补偿投递" : "未满足条件"}
                       </span>
                     </div>
-                    {failures ? <div className="mt-1 text-rose-700">失败：{failures}</div> : null}
+                    {failures ? (
+                      <TechnicalDetails className="mt-2" summary="批次异常详情">
+                        <div className="whitespace-pre-wrap break-words font-mono">{failures}</div>
+                        <div className="mt-2 text-slate-500">批次 ID：{batch.id} · 目标：{targets || "—"}</div>
+                      </TechnicalDetails>
+                    ) : (
+                      <TechnicalDetails className="mt-2" summary="批次技术信息">
+                        <div>批次 ID：<span className="font-mono">{batch.id}</span></div>
+                        <div className="mt-1">目标：{targets || "—"}</div>
+                      </TechnicalDetails>
+                    )}
                   </div>
                 );
               })}
             </div>
           ) : null}
 
-          <div className="text-xs font-semibold text-slate-700">Publish Jobs</div>
+          <div className="text-xs font-semibold text-slate-700 dark:text-slate-300">发布记录</div>
           {!publishJobs ? <div className="mt-2 text-sm text-slate-500">加载中…</div> : null}
           {publishJobs && publishJobs.length === 0 ? <div className="mt-2 text-sm text-slate-500">暂无</div> : null}
           {publishJobs?.some((j) => j.platform === "bilibili" && j.state === "published" && j.aid) ? (
@@ -543,118 +559,122 @@ export function TaskDetailPublish({ controller }: { controller: TaskDetailContro
             </div>
           ) : null}
           {publishJobs && publishJobs.length > 0 ? (
-            <div className="mt-2 overflow-auto">
-              <table className="min-w-full text-left text-sm">
-                <thead className="text-xs text-slate-500">
-                  <tr>
-                    <th className="py-2 pr-3">ID</th>
-                    <th className="py-2 pr-3">Batch</th>
-                    <th className="py-2 pr-3">Platform</th>
-                    <th className="py-2 pr-3">Account</th>
-                    <th className="py-2 pr-3">State</th>
-                    <th className="py-2 pr-3">External</th>
-                    <th className="py-2 pr-3">tid</th>
-                    <th className="py-2 pr-3">typeid</th>
-                    <th className="py-2 pr-3">Error</th>
-                    <th className="py-2 pr-3">Started</th>
-                    <th className="py-2 pr-3">Finished</th>
-                    <th className="py-2 pr-3">Action</th>
-                    <th className="py-2 pr-3">Updated</th>
-                  </tr>
-                </thead>
-                  <tbody>
-                  {publishJobs.map((j) => {
-                    const isActiveBilibiliUpload = (j.platform ?? "bilibili") === "bilibili" && Boolean(j.upload_active);
-                    return (
-                    <tr key={j.id} className="border-t">
-                      <td className="py-2 pr-3 font-mono text-xs">{j.id.slice(0, 8)}</td>
-                      <td className="py-2 pr-3 font-mono text-xs">{j.batch_id?.slice(0, 8) ?? "-"}</td>
-                      <td className="py-2 pr-3">{j.platform ?? "bilibili"}</td>
-                      <td className="py-2 pr-3 font-mono text-xs">{j.account_id?.slice(0, 8) ?? "-"}</td>
-                      <td className={`py-2 pr-3 ${j.state === "unknown" || j.state === "submitted" ? "text-amber-700" : ""}`}>
-                        <div>{j.state}</div>
-                        {j.auto_dub_p2 ? (
-                          <div className={`mt-1 text-xs ${["failed", "unknown", "submitting", "uploading"].includes(j.auto_dub_p2.state ?? "") ? "text-amber-700" : "text-sky-800"}`}
-                            title={j.auto_dub_p2.error ?? undefined}>
-                            配音 P2：{({ queued: "排队中", dubbing: "YouDub 配音中", uploaded: "已上传，等待追加", uploading: "上传中", submitting: "正在追加/待确认", published: "已追加成功", failed: "失败（P1 保留）", unknown: "状态待人工确认" } as Record<string, string>)[j.auto_dub_p2.state ?? ""] ?? j.auto_dub_p2.state}
-                            {j.auto_dub_p2.error ? <div className="max-w-48 truncate text-rose-700">{j.auto_dub_p2.error}</div> : null}
-                          </div>
+            <div className="mt-3 space-y-3">
+              {publishJobs.map((job) => {
+                const isActiveBilibiliUpload =
+                  (job.platform ?? "bilibili") === "bilibili" && Boolean(job.upload_active);
+                const failure = presentTaskError(job.error_message);
+                const canAppendP2 =
+                  job.platform === "bilibili"
+                  && job.state === "published"
+                  && Boolean(job.aid)
+                  && (!job.auto_dub_p2 || job.auto_dub_p2.state === "failed");
+                const completedDub = dubbingJobs.find(
+                  (item) => item.status === "succeeded" && Boolean(item.output.video_key)
+                );
+                return (
+                  <div key={job.id} className="rounded-xl border border-slate-200 p-4 dark:border-slate-800">
+                    <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                      <div>
+                        <div className="font-medium text-slate-950 dark:text-white">
+                          {publishPlatformLabel(job.platform)}
+                        </div>
+                        <div className="mt-1 text-sm text-slate-600 dark:text-slate-300">
+                          {jobStatusLabel(job.state)}
+                        </div>
+                      </div>
+                      <div className="text-xs text-slate-500">
+                        更新于 {new Date(job.updated_at).toLocaleString()}
+                      </div>
+                    </div>
+
+                    {isActiveBilibiliUpload ? (
+                      <div className="mt-3">
+                        <div className="flex items-center justify-between gap-2 text-xs text-sky-800 dark:text-sky-300">
+                          <span>正在上传视频</span>
+                          <span>{clampUploadProgress(job.upload_progress)}%</span>
+                        </div>
+                        <div className="mt-1 h-1.5 overflow-hidden rounded-full bg-sky-100 dark:bg-sky-950">
+                          <div
+                            className="h-full rounded-full bg-sky-500"
+                            style={{ width: String(clampUploadProgress(job.upload_progress)) + "%" }}
+                          />
+                        </div>
+                      </div>
+                    ) : null}
+
+                    {job.auto_dub_p2 ? (
+                      <div className="mt-3 text-sm">
+                        <span className="text-slate-500">中文配音 P2：</span>
+                        <span>{jobStatusLabel(job.auto_dub_p2.state ?? "")}</span>
+                        {job.auto_dub_p2.error ? (
+                          <TechnicalDetails className="mt-2" summary="P2 异常详情">
+                            <div className="whitespace-pre-wrap break-words font-mono">{job.auto_dub_p2.error}</div>
+                          </TechnicalDetails>
                         ) : null}
-                        {isActiveBilibiliUpload ? (
-                          <div className="mt-1 min-w-32 text-xs text-sky-800">
-                            <div className="flex items-center justify-between gap-2">
-                              <span>上传中</span>
-                              <span className="font-mono">{clampUploadProgress(j.upload_progress)}%</span>
-                            </div>
-                            <div className="mt-1 h-1.5 overflow-hidden rounded bg-sky-100">
-                              <div
-                                className="h-full bg-sky-500 transition-[width] duration-300"
-                                style={{ width: `${clampUploadProgress(j.upload_progress)}%` }}
-                              />
-                            </div>
-                          </div>
-                        ) : null}
-                      </td>
-                      <td className="py-2 pr-3 font-mono text-xs">
-                        {j.external_url ? (
-                          <a className="underline" href={j.external_url} target="_blank" rel="noreferrer">
-                            {j.external_id ?? j.bvid ?? j.external_url}
-                          </a>
-                        ) : (
-                          j.external_id ?? j.bvid ?? "-"
-                        )}
-                      </td>
-                      <td className="py-2 pr-3 font-mono text-xs">{j.tid ?? "-"}</td>
-                      <td
-                        className="py-2 pr-3 text-xs text-slate-600"
-                        title={
-                          j.typeid_mode === "ai_summary" && j.typeid_selected_by !== "ai_summary" && j.typeid_ai_reason
-                            ? `AI 分区失败：${j.typeid_ai_reason}`
-                            : ""
-                        }
-                      >
-                        {(() => {
-                          const mode = j.typeid_mode ?? "-";
-                          const by = j.typeid_selected_by ?? "-";
-                          if (mode !== "-" && by !== "-" && mode !== by) return `${mode}→${by}`;
-                          return by !== "-" ? by : mode;
-                        })()}
-                      </td>
-                      <td className="py-2 pr-3">
-                        {j.error_message ? (
-                          <div className="max-w-[36rem] truncate text-xs text-rose-700" title={j.error_message}>
-                            {j.error_message}
-                          </div>
-                        ) : (
-                          <span className="text-xs text-slate-400">-</span>
-                        )}
-                      </td>
-                      <td className="py-2 pr-3 text-xs text-slate-600">{j.started_at ? new Date(j.started_at).toLocaleString() : "-"}</td>
-                      <td className="py-2 pr-3 text-xs text-slate-600">{j.finished_at ? new Date(j.finished_at).toLocaleString() : "-"}</td>
-                      <td className="py-2 pr-3">
-                        {["failed", "unknown"].includes(j.state) ? (
-                          <button
-                            className="rounded border border-amber-300 px-2 py-1 text-xs text-amber-800"
-                            onClick={() => retryPublishJob(j)}
-                          >
-                            确认后重试
-                          </button>
-                        ) : j.platform === "bilibili" && j.state === "published" && j.aid
-                            && (!j.auto_dub_p2 || j.auto_dub_p2.state === "failed") ? (
-                          <button className="rounded border border-sky-300 px-2 py-1 text-xs text-sky-800"
-                            disabled={busy || !dubbingJobs.some((d) => d.status === "succeeded" && Boolean(d.output.video_key))}
-                            title="在现有 B 站稿件后追加配音 P2；后台确认不存在已有 P2 才会修改"
-                            onClick={() => appendPublishedP2(j, appendDubbingJobId || dubbingJobs.find((d) => d.status === "succeeded" && Boolean(d.output.video_key))?.id || "")}>
-                            追加中配 P2
-                          </button>
-                        ) : "-"}
-                      </td>
-                      <td className="py-2 pr-3 text-xs text-slate-600">{new Date(j.updated_at).toLocaleString()}</td>
-                    </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
+                      </div>
+                    ) : null}
+
+                    {job.error_message ? (
+                      <InlineNotice className="mt-3" title={failure?.title ?? "发布失败"} tone="danger">
+                        {failure?.detail ?? "平台发布没有完成。"}
+                        <TechnicalDetails className="mt-2">
+                          <div className="whitespace-pre-wrap break-words font-mono">{job.error_message}</div>
+                        </TechnicalDetails>
+                      </InlineNotice>
+                    ) : null}
+
+                    <div className="mt-3 flex flex-wrap items-center gap-2">
+                      {job.external_url ? (
+                        <a
+                          className="rounded border border-slate-300 px-2.5 py-1.5 text-xs hover:bg-slate-50 dark:border-slate-700 dark:hover:bg-slate-900"
+                          href={job.external_url}
+                          target="_blank"
+                          rel="noreferrer"
+                        >
+                          打开平台稿件
+                        </a>
+                      ) : null}
+                      {["failed", "unknown"].includes(job.state) ? (
+                        <button
+                          className="rounded border border-amber-300 px-2.5 py-1.5 text-xs text-amber-800 dark:text-amber-300"
+                          onClick={() => retryPublishJob(job)}
+                        >
+                          确认后重试
+                        </button>
+                      ) : null}
+                      {canAppendP2 ? (
+                        <button
+                          className="rounded border border-sky-300 px-2.5 py-1.5 text-xs text-sky-800 dark:text-sky-300"
+                          disabled={busy || !completedDub}
+                          onClick={() => appendPublishedP2(
+                            job,
+                            appendDubbingJobId || completedDub?.id || ""
+                          )}
+                        >
+                          追加中配 P2
+                        </button>
+                      ) : null}
+                    </div>
+
+                    <TechnicalDetails className="mt-3" summary="发布技术信息">
+                      <div className="grid gap-2 sm:grid-cols-2">
+                        <div><span className="text-slate-500">发布作业：</span><span className="font-mono">{job.id}</span></div>
+                        <div><span className="text-slate-500">批次：</span><span className="font-mono">{job.batch_id ?? "—"}</span></div>
+                        <div><span className="text-slate-500">账号：</span><span className="font-mono">{job.account_id ?? "—"}</span></div>
+                        <div><span className="text-slate-500">平台稿件 ID：</span>{job.external_id ?? job.bvid ?? "—"}</div>
+                        <div><span className="text-slate-500">分区 ID：</span>{job.tid ?? "—"}</div>
+                        <div><span className="text-slate-500">分区策略：</span>{job.typeid_mode ?? "—"} → {job.typeid_selected_by ?? "—"}</div>
+                        <div><span className="text-slate-500">开始：</span>{job.started_at ? new Date(job.started_at).toLocaleString() : "—"}</div>
+                        <div><span className="text-slate-500">完成：</span>{job.finished_at ? new Date(job.finished_at).toLocaleString() : "—"}</div>
+                      </div>
+                      {job.typeid_ai_reason ? (
+                        <div className="mt-2"><span className="text-slate-500">AI 分区诊断：</span>{job.typeid_ai_reason}</div>
+                      ) : null}
+                    </TechnicalDetails>
+                  </div>
+                );
+              })}
             </div>
           ) : null}
         </div>

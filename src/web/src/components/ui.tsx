@@ -61,6 +61,70 @@ export function Section({ children, className = "" }: PropsWithChildren<{ classN
   return <div className={`vr-section ${className}`}>{children}</div>;
 }
 
+export function InlineNotice({
+  title,
+  children,
+  tone = "info",
+  className = "",
+}: PropsWithChildren<{ title?: ReactNode; tone?: "info" | "warning" | "danger" | "success"; className?: string }>) {
+  const tones = {
+    info: "border-sky-200 bg-sky-50 text-sky-900 dark:border-sky-900 dark:bg-sky-950/30 dark:text-sky-200",
+    warning: "border-amber-200 bg-amber-50 text-amber-950 dark:border-amber-900 dark:bg-amber-950/30 dark:text-amber-200",
+    danger: "border-rose-200 bg-rose-50 text-rose-950 dark:border-rose-900 dark:bg-rose-950/30 dark:text-rose-200",
+    success: "border-emerald-200 bg-emerald-50 text-emerald-950 dark:border-emerald-900 dark:bg-emerald-950/30 dark:text-emerald-200",
+  };
+  return (
+    <div className={[`rounded-lg border px-4 py-3 text-sm ${tones[tone]}`, className].join(" ")}>
+      {title ? <div className="font-medium">{title}</div> : null}
+      <div className={title ? "mt-1 text-sm opacity-90" : ""}>{children}</div>
+    </div>
+  );
+}
+
+export function TechnicalDetails({
+  children,
+  summary = "技术详情",
+  className = "",
+}: PropsWithChildren<{ summary?: ReactNode; className?: string }>) {
+  return (
+    <details className={`rounded-lg border border-slate-200 bg-slate-50/70 dark:border-slate-800 dark:bg-slate-950/40 ${className}`}>
+      <summary className="cursor-pointer select-none px-3 py-2 text-xs font-medium text-slate-600 hover:text-slate-950 dark:text-slate-400 dark:hover:text-white">
+        {summary}
+      </summary>
+      <div className="border-t border-slate-200 px-3 py-3 text-xs text-slate-600 dark:border-slate-800 dark:text-slate-300">
+        {children}
+      </div>
+    </details>
+  );
+}
+
+export function Metric({
+  label,
+  value,
+  detail,
+  tone = "neutral",
+}: {
+  label: ReactNode;
+  value: ReactNode;
+  detail?: ReactNode;
+  tone?: "neutral" | "info" | "warning" | "danger" | "success";
+}) {
+  const toneClass = {
+    neutral: "text-slate-950 dark:text-white",
+    info: "text-sky-800 dark:text-sky-300",
+    warning: "text-amber-800 dark:text-amber-300",
+    danger: "text-rose-800 dark:text-rose-300",
+    success: "text-emerald-800 dark:text-emerald-300",
+  }[tone];
+  return (
+    <div className="min-w-0">
+      <div className="text-xs font-medium text-slate-500 dark:text-slate-400">{label}</div>
+      <div className={`mt-1 text-2xl font-semibold tracking-tight ${toneClass}`}>{value}</div>
+      {detail ? <div className="mt-1 text-xs text-slate-500 dark:text-slate-400">{detail}</div> : null}
+    </div>
+  );
+}
+
 export function SettingsSaveBar({
   dirty,
   busy,
@@ -81,7 +145,7 @@ export function SettingsSaveBar({
   extraActions?: ReactNode;
 }) {
   return (
-    <div className="sticky bottom-3 z-20 rounded-xl border border-slate-200 bg-white/95 p-3 shadow-lg backdrop-blur">
+    <div className="sticky bottom-3 z-20 rounded-xl border border-slate-200 bg-white/95 p-3 shadow-lg backdrop-blur dark:border-slate-800 dark:bg-slate-950/95">
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div className="flex items-center gap-2 text-sm">
           <span className={["h-2 w-2 rounded-full", dirty ? "bg-amber-500" : "bg-emerald-500"].join(" ")} />
@@ -113,12 +177,12 @@ export function TableToolbar({
   meta?: ReactNode;
 }) {
   return (
-    <div className="flex flex-col gap-3 border-b border-slate-200 pb-4">
+    <div className="flex flex-col gap-3 border-b border-slate-200 pb-4 dark:border-slate-800">
       {(title || description || actions || meta) ? (
         <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
           {(title || description || meta) ? (
             <div className="min-w-0">
-              {title ? <div className="text-sm font-semibold text-slate-950">{title}</div> : null}
+              {title ? <div className="text-sm font-semibold text-slate-950 dark:text-white">{title}</div> : null}
               {description ? <div className="mt-1 text-xs text-slate-500">{description}</div> : null}
               {meta ? <div className="mt-1 text-xs text-slate-500">{meta}</div> : null}
             </div>
@@ -212,7 +276,7 @@ export function MoreMenu({ children, label = "更多操作" }: PropsWithChildren
     <div ref={ref} className="relative inline-flex">
       <button
         type="button"
-        className="inline-flex h-8 w-8 items-center justify-center rounded-lg border border-slate-200 bg-white text-lg leading-none text-slate-600 hover:bg-slate-50 hover:text-slate-950"
+        className="inline-flex h-8 w-8 items-center justify-center rounded-lg border border-slate-200 bg-white text-lg leading-none text-slate-600 hover:bg-slate-50 hover:text-slate-950 dark:border-slate-800 dark:bg-slate-950 dark:text-slate-400 dark:hover:bg-slate-900 dark:hover:text-white"
         aria-label={label}
         aria-expanded={open}
         title={label}
@@ -221,7 +285,7 @@ export function MoreMenu({ children, label = "更多操作" }: PropsWithChildren
         ...
       </button>
       {open ? (
-        <div className="absolute right-0 top-full z-30 mt-1 min-w-44 overflow-hidden rounded-lg border border-slate-200 bg-white py-1 shadow-lg">
+        <div className="absolute right-0 top-full z-30 mt-1 min-w-44 overflow-hidden rounded-lg border border-slate-200 bg-white py-1 shadow-lg dark:border-slate-800 dark:bg-slate-950">
           {children}
         </div>
       ) : null}
@@ -230,4 +294,4 @@ export function MoreMenu({ children, label = "更多操作" }: PropsWithChildren
 }
 
 export const menuItemClass =
-  "block w-full px-3 py-2 text-left text-sm text-slate-700 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50";
+  "block w-full px-3 py-2 text-left text-sm text-slate-700 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50 dark:text-slate-300 dark:hover:bg-slate-900";

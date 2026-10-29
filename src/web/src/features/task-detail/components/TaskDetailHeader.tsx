@@ -1,7 +1,8 @@
 import type { TaskDetailController } from "../useTaskDetailController";
 import StatusBadge from "../../../components/StatusBadge";
-import { Button } from "../../../components/ui";
+import { Button, InlineNotice, TechnicalDetails } from "../../../components/ui";
 import type { TaskDetailTab } from "../types";
+import { presentTaskError } from "../../../lib/taskPresentation";
 
 export function TaskDetailHeader({ controller }: { controller: TaskDetailController }) {
   const {
@@ -35,7 +36,7 @@ export function TaskDetailHeader({ controller }: { controller: TaskDetailControl
       <div className="vr-section">
         <div className="flex items-start justify-between gap-3">
           <div>
-            <div className="text-lg font-semibold">任务详情</div>
+            <div className="text-lg font-semibold text-slate-950 dark:text-white">任务详情</div>
             <div className="mt-1 font-mono text-xs text-slate-600">{taskId}</div>
           </div>
           <div className="flex flex-wrap items-center gap-2">
@@ -54,8 +55,16 @@ export function TaskDetailHeader({ controller }: { controller: TaskDetailControl
           </div>
         </div>
 
-        {error ? <div className="mt-3 whitespace-pre-wrap break-words text-sm text-rose-700">{error}</div> : null}
-        {coreError ? <div className="mt-3 whitespace-pre-wrap break-words text-sm text-rose-700">任务核心数据加载失败：{coreError}</div> : null}
+        {error ? (
+          <InlineNotice className="mt-3" title="任务详情部分操作失败" tone="danger">
+            <TechnicalDetails className="mt-2"><pre className="whitespace-pre-wrap break-words font-mono">{error}</pre></TechnicalDetails>
+          </InlineNotice>
+        ) : null}
+        {coreError ? (
+          <InlineNotice className="mt-3" title="任务核心数据加载失败" tone="danger">
+            <TechnicalDetails className="mt-2"><pre className="whitespace-pre-wrap break-words font-mono">{coreError}</pre></TechnicalDetails>
+          </InlineNotice>
+        ) : null}
         {!task ? <div className="mt-3 text-sm text-slate-500">加载中…</div> : null}
         {task ? (
           <div className="mt-3 grid gap-3 md:grid-cols-2">
@@ -67,19 +76,25 @@ export function TaskDetailHeader({ controller }: { controller: TaskDetailControl
             </div>
             <div className="rounded border p-3">
               <div className="text-xs text-slate-500">来源</div>
-              <div className="mt-1 text-sm text-slate-800">
+              <div className="mt-1 text-sm text-slate-800 dark:text-slate-200">
                 {task.source_type} · {task.source_license}
               </div>
               <div className="mt-1 break-all text-xs text-slate-600">{task.source_url ?? "-"}</div>
             </div>
           </div>
         ) : null}
-        {task?.error_message ? (
-          <div className="mt-3 rounded border border-amber-200 bg-amber-50 p-3 text-sm text-amber-900">
-            <div className="text-xs text-amber-700">Task Message</div>
-            <div className="mt-1 whitespace-pre-wrap break-words">{task.error_message}</div>
-          </div>
-        ) : null}
+        {task?.error_message ? (() => {
+          const failure = presentTaskError(task.error_message, task.error_code);
+          return (
+            <InlineNotice className="mt-3" title={failure?.title ?? "任务需要处理"} tone="warning">
+              {failure?.detail ?? "任务报告了异常。"}
+              {failure?.actionHint ? <div className="mt-1 text-xs">{failure.actionHint}</div> : null}
+              <TechnicalDetails className="mt-2">
+                <pre className="whitespace-pre-wrap break-words font-mono">{task.error_message}</pre>
+              </TechnicalDetails>
+            </InlineNotice>
+          );
+        })() : null}
 
         <div className="mt-4 flex gap-1 overflow-x-auto border-b border-slate-200">
           {tabs.map((tab) => {

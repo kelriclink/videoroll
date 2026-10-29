@@ -43,6 +43,7 @@ from videoroll.apps.publish_review_store import (
 from videoroll.apps.subtitle_service.auto_profile_store import get_auto_profile
 from videoroll.apps.subtitle_service.bilibili_tags_store import get_task_bilibili_summary, get_task_bilibili_tags
 from videoroll.apps.subtitle_service.translate_settings_store import get_translate_settings
+from videoroll.apps.subtitle_service.translation_runtime import resolve_profile_translation_runtime
 from videoroll.apps.youtube_meta_store import get_task_youtube_meta
 from videoroll.config import OrchestratorSettings, get_subtitle_settings
 from videoroll.db.models import Asset, AssetKind, PublishBatch, PublishJob, PublishState, Task, TaskStatus
@@ -306,8 +307,8 @@ def run_task_publish_review(task: Task, *, meta: dict[str, Any], db: Session, st
         return {"enabled": False, **current}
 
     translate_settings = get_translate_settings(db, get_subtitle_settings())
-    api_key = str(translate_settings.get("openai_api_key") or "").strip()
-    ai_service = AIService(lambda: get_translate_settings(db, get_subtitle_settings())) if api_key else None
+    runtime = resolve_profile_translation_runtime(db, translate_settings, get_auto_profile(db))
+    ai_service = AIService(lambda: dict(runtime.settings)) if runtime.provider == "openai" else None
     result = review_publish_materials(
         title=str(meta.get("title") or "").strip(),
         summary=get_task_bilibili_summary(db, str(task.id)),

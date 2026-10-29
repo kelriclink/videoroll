@@ -52,3 +52,25 @@ def resolve_translation_runtime(
         model_id=selected_model,
         settings=settings,
     )
+
+
+def resolve_profile_translation_runtime(
+    db: Session,
+    legacy_settings: dict[str, Any],
+    profile: dict[str, Any],
+) -> TranslationRuntime:
+    """Resolve the model selected by the automatic processing profile.
+
+    Publishing, review and subtitle-derived AI work must use the same selection
+    semantics as the subtitle pipeline instead of silently falling back to the
+    historical OpenAI settings.
+    """
+    return resolve_translation_runtime(
+        db,
+        legacy_settings,
+        provider=profile.get("translate_provider")
+        or legacy_settings.get("default_provider")
+        or "openai",
+        model_provider_id=profile.get("translate_model_provider_id"),
+        model_id=profile.get("translate_model_id"),
+    )

@@ -278,3 +278,253 @@ def test_translation_runtime_resolves_the_same_custom_provider_for_derived_calls
     assert runtime.settings["openai_base_url"] == "http://localhost:11434/v1"
     assert runtime.settings["openai_model"] == "qwen:test"
     assert runtime.settings["openai_api_key"] == "test-secret"
+
+
+def test_provider_catalog_exposes_ui_capabilities_and_index_options(legacy: dict[str, Any]) -> None:
+    legacy = {
+        **legacy,
+        "index_temperature": 0.1,
+        "index_timeout_seconds": 90,
+        "index_max_tokens": 8192,
+        "index_batch_size": 8,
+        "index_context_chars": 12000,
+        "index_domain": "科技",
+        "index_glossary": "PCB:印刷电路板",
+        "index_instruction": "简洁",
+    }
+    rows = store.list_providers(FakeDB(), legacy)  # type: ignore[arg-type]
+
+    compatibility = rows[0]
+    assert compatibility["kind"] == "compatibility"
+    assert compatibility["editable"] is True
+    assert compatibility["deletable"] is False
+    assert compatibility["supports_remote_catalog"] is False
+
+    index = rows[1]
+    assert index["kind"] == "builtin"
+    assert index["editable"] is True
+    assert index["deletable"] is False
+    assert index["models"][0]["max_output_tokens"] == 8192
+    assert index["options"] == {
+        "batch_size": 8,
+        "context_chars": 12000,
+        "domain": "科技",
+        "glossary": "PCB:印刷电路板",
+        "instruction": "简洁",
+    }
+
+
+def test_custom_provider_preserves_reasoning_format(
+    monkeypatch: pytest.MonkeyPatch,
+    legacy: dict[str, Any],
+) -> None:
+    monkeypatch.setattr(store, "encrypt_str", lambda value: "sealed:" + value)
+    monkeypatch.setattr(store, "decrypt_str", lambda value: value.removeprefix("sealed:"))
+    db = FakeDB()
+    provider = store.save_provider(
+        db,
+        None,
+        payload(
+            api_type="cerebras",
+            models=[{
+                "id": "reasoner",
+                "context_window": 32768,
+                "max_output_tokens": 4096,
+                "temperature": 0.2,
+                "enable_thinking": True,
+                "reasoning_effort": "high",
+                "reasoning_format": "hidden",
+            }],
+        ),
+    )  # type: ignore[arg-type]
+
+    assert provider["kind"] == "custom"
+    assert provider["models"][0]["reasoning_format"] == "hidden"
+    resolved = store.resolve_provider_settings(db, legacy, provider["id"], "reasoner")  # type: ignore[arg-type]
+    assert resolved["cerebras_reasoning_effort"] == "high"
+    assert resolved["cerebras_reasoning_format"] == "hidden"
+
+
+def test_builtin_provider_updates_are_routed_through_translate_settings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from videoroll.apps.subtitle_service import main as subtitle_main
+
+    current = {
+        "openai_temperature": 0.2,
+        "index_temperature": 0.0,
+        "index_max_tokens": 4096,
+        "index_batch_size": 12,
+        "index_context_chars": 6000,
+        "index_domain": "视频字幕",
+        "index_glossary": "",
+        "index_instruction": "",
+    }
+    writes: list[dict[str, Any]] = []
+
+    monkeypatch.setattr(subtitle_main, "get_translate_settings", lambda *_args: dict(current))
+
+    def fake_update(_db, _settings, update):
+        writes.append(dict(update))
+        return {**current, **update}
+
+    monkeypatch.setattr(subtitle_main, "update_translate_settings", fake_update)
+    monkeypatch.setattr(
+        subtitle_main,
+        "list_providers",
+        lambda _db, _settings: [
+            {"id": "legacy", "saved": dict(writes[-1])},
+            {"id": "index_translate", "saved": dict(writes[-1])},
+        ],
+    )
+
+    legacy_payload = subtitle_main.ModelProviderPayload(
+        name="OpenAI 兼容（内建）",
+        base_url="https://new.example/v1",
+        api_key="new-secret",
+        api_type="cerebras",
+        timeout_seconds=210,
+        max_retries=4,
+        models=[subtitle_main.ModelEntryPayload(
+            id="reasoner",
+            temperature=0.7,
+            enable_thinking=True,
+            reasoning_effort="high",
+            reasoning_format="hidden",
+        )],
+    )
+    result = subtitle_main._updated_builtin_model_provider(
+        store.LEGACY_ID,
+        legacy_payload,
+        settings=object(),  # type: ignore[arg-type]
+        db=object(),  # type: ignore[arg-type]
+    )
+    assert result["id"] == "legacy"
+    assert writes[-1] == {
+        "openai_base_url": "https://new.example/v1",
+        "openai_model": "reasoner",
+        "openai_temperature": 0.7,
+        "openai_timeout_seconds": 210,
+        "openai_max_retries": 4,
+        "openai_api_type": "cerebras",
+        "openai_enable_thinking": True,
+        "cerebras_reasoning_effort": "high",
+        "cerebras_reasoning_format": "hidden",
+        "openai_api_key": "new-secret",
+    }
+
+    index_payload = subtitle_main.ModelProviderPayload(
+        name="Index-Translate（官方免费）",
+        base_url="https://index-translate.bilibili.com/v1",
+        api_type="index_translate",
+        timeout_seconds=100,
+        models=[subtitle_main.ModelEntryPayload(
+            id="Index-Translate-35B-A3B",
+            max_output_tokens=8192,
+            temperature=0.1,
+            reasoning_format="hidden",
+        )],
+        options={
+            "batch_size": 8,
+            "context_chars": 12000,
+            "domain": "科技",
+            "glossary": "PCB:印刷电路板",
+            "instruction": "简洁",
+        },
+    )
+    result = subtitle_main._updated_builtin_model_provider(
+        store.INDEX_ID,
+        index_payload,
+        settings=object(),  # type: ignore[arg-type]
+        db=object(),  # type: ignore[arg-type]
+    )
+    assert result["id"] == "index_translate"
+    assert writes[-1] == {
+        "index_temperature": 0.1,
+        "index_timeout_seconds": 100,
+        "index_max_tokens": 8192,
+        "index_batch_size": 8,
+        "index_context_chars": 12000,
+        "index_domain": "科技",
+        "index_glossary": "PCB:印刷电路板",
+        "index_instruction": "简洁",
+    }
+
+
+def test_safe_catalog_normalizes_older_custom_model_records() -> None:
+    older = {
+        "id": "provider-old",
+        "name": "旧服务",
+        "base_url": "https://old.example/v1",
+        "api_type": "cerebras",
+        "models": [{
+            "id": "old-model",
+            "context_window": 32768,
+            "max_output_tokens": 4096,
+            "temperature": 0.3,
+        }],
+    }
+    safe = store._safe(older)
+    model = safe["models"][0]
+    assert model["enable_thinking"] is False
+    assert model["reasoning_effort"] == "medium"
+    assert model["reasoning_format"] == "parsed"
+
+
+def test_translate_test_uses_auto_profile_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from types import SimpleNamespace
+    from videoroll.apps.subtitle_service import main as subtitle_main
+
+    captured: dict[str, Any] = {}
+    profile = {
+        "translate_provider": "openai",
+        "translate_model_provider_id": "provider-x",
+        "translate_model_id": "model-x",
+    }
+    runtime_settings = {
+        "openai_base_url": "https://custom.example/v1",
+        "openai_api_key": "local-model",
+        "openai_model": "model-x",
+        "openai_enable_thinking": True,
+    }
+
+    monkeypatch.setattr(subtitle_main, "get_translate_settings", lambda *_args: {"default_provider": "openai"})
+    monkeypatch.setattr(subtitle_main, "get_auto_profile", lambda *_args: profile)
+
+    def resolve(_db, _legacy, selected_profile):
+        captured["profile"] = dict(selected_profile)
+        return SimpleNamespace(provider="openai", settings=runtime_settings)
+
+    monkeypatch.setattr(subtitle_main, "resolve_profile_translation_runtime", resolve)
+
+    class FakeAIService:
+        def __init__(self, loader):
+            captured["settings"] = loader()
+
+        def translate_text(self, text, **kwargs):
+            captured["text"] = text
+            captured["kwargs"] = kwargs
+            return "你好"
+
+    monkeypatch.setattr(subtitle_main, "AIService", FakeAIService)
+
+    class FakeSession:
+        committed = False
+
+        def commit(self):
+            self.committed = True
+
+    db = FakeSession()
+    response = subtitle_main.translate_test(
+        subtitle_main.TranslateTestRequest(text="Hello", target_lang="zh", style="口语自然"),
+        settings=object(),  # type: ignore[arg-type]
+        db=db,  # type: ignore[arg-type]
+    )
+
+    assert response.translated_text == "你好"
+    assert db.committed is True
+    assert captured["profile"] == profile
+    assert captured["settings"]["openai_model"] == "model-x"
+    assert captured["kwargs"]["enable_thinking"] is True

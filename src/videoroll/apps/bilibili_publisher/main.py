@@ -43,6 +43,8 @@ from videoroll.apps.bilibili_publisher.storage_keys import unique_publish_result
 from videoroll.apps.publish_lifecycle import enqueue_publish_job_dispatch, publish_batch_has_target
 from videoroll.apps.subtitle_service.bilibili_tags_store import get_task_bilibili_summary
 from videoroll.apps.subtitle_service.translate_settings_store import get_translate_settings
+from videoroll.apps.subtitle_service.auto_profile_store import get_auto_profile
+from videoroll.apps.subtitle_service.translation_runtime import resolve_profile_translation_runtime
 
 
 def _as_dict(v: object) -> dict:
@@ -119,8 +121,9 @@ def recommend_archive_type(
     if not cookie:
         raise HTTPException(status_code=400, detail="bilibili cookie is not set")
     translate_settings = get_translate_settings(db, get_subtitle_settings())
-    if not translate_settings.get("openai_api_key"):
-        raise HTTPException(status_code=400, detail="OpenAI API key is not set (save it in Settings · Translate)")
+    runtime = resolve_profile_translation_runtime(db, translate_settings, get_auto_profile(db))
+    if runtime.provider != "openai":
+        raise HTTPException(status_code=400, detail="当前自动处理翻译方式不支持 AI 分区推荐")
 
     text = get_task_bilibili_summary(db, str(payload.task_id)) if payload.task_id else ""
     if not text:
@@ -147,7 +150,7 @@ def recommend_archive_type(
     by_id = {k: v for k, v in by_id.items() if k > 0 and v}
 
     try:
-        ai_service = AIService(lambda: get_translate_settings(db, get_subtitle_settings()))
+        ai_service = AIService(lambda: dict(runtime.settings))
         obj = ai_service.recommend_typeid(
             text,
             options=options,

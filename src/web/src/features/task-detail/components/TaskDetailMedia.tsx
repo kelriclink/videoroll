@@ -1,6 +1,8 @@
 import type { TaskDetailController } from "../useTaskDetailController";
 import { clampUploadProgress, formatDownloadBytes, youtubeDownloadStatusLabel } from "../utils";
 import { Link } from "react-router-dom";
+import { InlineNotice, TechnicalDetails } from "../../../components/ui";
+import { presentTaskError } from "../../../lib/taskPresentation";
 export function TaskDetailMedia({ controller }: { controller: TaskDetailController }) {
   const {
     assets,
@@ -23,7 +25,7 @@ export function TaskDetailMedia({ controller }: { controller: TaskDetailControll
   return (
 <>
       <div className="rounded border bg-white p-4">
-        <div className="text-sm font-semibold">Upload / Raw Video</div>
+        <div className="text-sm font-semibold">源视频</div>
         <div className="mt-2 text-xs text-slate-500">已上传：{rawAsset ? rawAsset.storage_key : "无"}</div>
         <div className="mt-1 text-xs text-slate-500">metadata：{metadataAsset ? metadataAsset.storage_key : "无"}</div>
         {isYouTubeTask && youtubeDownloadProgress && youtubeDownloadProgress.status !== "idle" ? (
@@ -49,7 +51,14 @@ export function TaskDetailMedia({ controller }: { controller: TaskDetailControll
               ) : null}
               {youtubeDownloadProgress.filename ? <span className="max-w-full truncate">{youtubeDownloadProgress.filename}</span> : null}
             </div>
-            {youtubeDownloadProgress.error ? <div className="mt-2 break-words text-xs text-rose-700">{youtubeDownloadProgress.error}</div> : null}
+            {youtubeDownloadProgress.error ? (
+              <InlineNotice className="mt-2" title={presentTaskError(youtubeDownloadProgress.error)?.title ?? "下载失败"} tone="danger">
+                {presentTaskError(youtubeDownloadProgress.error)?.detail ?? "视频下载没有完成。"}
+                <TechnicalDetails className="mt-2">
+                  <div className="whitespace-pre-wrap break-words font-mono">{youtubeDownloadProgress.error}</div>
+                </TechnicalDetails>
+              </InlineNotice>
+            ) : null}
           </div>
         ) : null}
         <div className="mt-3 flex flex-wrap items-center gap-2">
@@ -74,7 +83,7 @@ export function TaskDetailMedia({ controller }: { controller: TaskDetailControll
       </div>
 
       <div className="rounded border bg-white p-4">
-        <div className="text-sm font-semibold">Assets</div>
+        <div className="text-sm font-semibold">任务文件</div>
         {!assets ? <div className="mt-2 text-sm text-slate-500">加载中…</div> : null}
         {assets ? (
           <div className="mt-2 overflow-auto">

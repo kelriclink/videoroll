@@ -1,43 +1,66 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { Link } from "react-router-dom";
-import { renderManagementApi, type CreatedEnrollment, type RenderConnection, type RenderDevice, type RenderEnrollment, type RenderExecution, type RenderWorker } from "../api/renderManagement";
-import { Button, DataTable, EmptyState, PageHeader, Section } from "../components/ui";
-import { formatRenderDuration, formatRenderFps, formatRenderSpeed, getRenderTelemetry, summarizeRenderExecutions } from "../features/renderTelemetry";
-
-const ACTIVE = new Set(["claimed", "running", "uploading"]);
-const value = (v: unknown) => typeof v === "number" || typeof v === "string" ? String(v) : "—";
-const ago = (iso?: string | null) => {
-  if (!iso) return "—";
-  const seconds = Math.max(0, Math.floor((Date.now() - new Date(iso).getTime()) / 1000));
-  if (seconds < 60) return `${seconds}s 前`;
-  if (seconds < 3600) return `${Math.floor(seconds / 60)}m 前`;
-  return `${Math.floor(seconds / 3600)}h 前`;
-};
-const badge = (state: string) => {
-  if (["online", "running", "busy", "succeeded"].includes(state)) return "bg-emerald-50 text-emerald-700";
-  if (["failed", "lost", "canceled", "offline"].includes(state)) return "bg-rose-50 text-rose-700";
-  if (["draining", "paused", "uploading"].includes(state)) return "bg-amber-50 text-amber-700";
-  return "bg-slate-100 text-slate-600";
-};
+import {
+  renderManagementApi,
+  type CreatedEnrollment,
+  type RenderConnection,
+  type RenderDevice,
+  type RenderExecution,
+  type RenderWorker,
+} from "../api/renderManagement";
+import { useConfirm } from "../components/feedbackContext";
+import { Button, EmptyState, InlineNotice, Metric, PageHeader, Section, TechnicalDetails } from "../components/ui";
+import { RenderEnrollmentPanel } from "../features/render-management/RenderEnrollmentPanel";
+import { RenderExecutions } from "../features/render-management/RenderExecutions";
+import { RenderWorkerCard } from "../features/render-management/RenderWorkerCard";
+import { ACTIVE_RENDER_STATES, type WorkerDraft } from "../features/render-management/presentation";
 
 export default function RenderManagementPage() {
+  const confirm = useConfirm();
   const [workers, setWorkers] = useState<RenderWorker[]>([]);
   const [executions, setExecutions] = useState<RenderExecution[]>([]);
   const [connection, setConnection] = useState<RenderConnection | null>(null);
-  const [enrollments, setEnrollments] = useState<RenderEnrollment[]>([]);
   const [createdEnrollment, setCreatedEnrollment] = useState<CreatedEnrollment | null>(null);
   const [enrollmentLabel, setEnrollmentLabel] = useState("");
   const [serverUrl, setServerUrl] = useState("");
   const [selected, setSelected] = useState<RenderExecution | null>(null);
+  const [drafts, setDrafts] = useState<Record<string, WorkerDraft>>({});
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
     try {
-      const [nextWorkers, nextExecutions, nextConnection, nextEnrollments] = await Promise.all([renderManagementApi.workers(), renderManagementApi.executions(), renderManagementApi.connection(), renderManagementApi.enrollments()]);
-      setWorkers(nextWorkers); setExecutions(nextExecutions); setConnection(nextConnection); setEnrollments(nextEnrollments); setServerUrl((current) => current || nextConnection.server_url); setError(null);
-      setSelected((current) => current ? nextExecutions.find((x) => x.id === current.id) ?? current : null);
-    } catch (e) { setError(e instanceof Error ? e.message : String(e)); }
+      const [nextWorkers, nextExecutions, nextConnection] = await Promise.all([
+        renderManagementApi.workers(),
+        renderManagementApi.executions(),
+        renderManagementApi.connection(),
+      ]);
+      setWorkers(nextWorkers);
+      setExecutions(nextExecutions);
+      setConnection(nextConnection);
+      setServerUrl((current) => current || nextConnection.server_url);
+      setDrafts((current) => {
+        const next = { ...current };
+        for (const worker of nextWorkers) {
+          const existing = next[worker.id];
+          const unchanged = !existing
+            || (existing.maxConcurrency === worker.max_concurrency && existing.workerKey === worker.worker_key);
+          if (unchanged) {
+            next[worker.id] = {
+              maxConcurrency: worker.max_concurrency,
+              workerKey: worker.worker_key,
+            };
+          }
+        }
+        return next;
+      });
+      setSelected((current) =>
+        current ? nextExecutions.find((item) => item.id === current.id) ?? current : null
+      );
+      setError(null);
+    } catch (reason: unknown) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    }
   }, []);
 
   useEffect(() => {
@@ -46,182 +69,254 @@ export default function RenderManagementPage() {
     return () => window.clearInterval(timer);
   }, [refresh]);
 
-  const online = workers.filter((w) => w.enabled && !w.stale).length;
-  const active = executions.filter((e) => ACTIVE.has(e.state)).length;
-  const recentFailureCutoff = Date.now() - 60 * 60 * 1000;
-  const failed = executions.filter((e) => {
-    if (!["failed", "lost"].includes(e.state)) return false;
-    const stamp = e.finished_at ?? e.heartbeat_at ?? e.started_at;
-    return stamp ? new Date(stamp).getTime() >= recentFailureCutoff : false;
+  const online = workers.filter((worker) => worker.enabled && !worker.stale).length;
+  const activeCount = executions.filter((execution) => ACTIVE_RENDER_STATES.has(execution.state)).length;
+  const failureCutoff = Date.now() - 60 * 60 * 1000;
+  const recentFailures = executions.filter((execution) => {
+    if (!["failed", "lost"].includes(execution.state)) return false;
+    const stamp = execution.finished_at ?? execution.heartbeat_at ?? execution.started_at;
+    return stamp ? new Date(stamp).getTime() >= failureCutoff : false;
   }).length;
-  const schedulableWorkers = workers.filter((w) => w.enabled && !w.stale && !w.draining);
-  const capacity = schedulableWorkers.reduce((n, w) => n + w.max_concurrency, 0);
-  const available = schedulableWorkers.reduce(
-    (n, w) => n + (w.available_slots ?? Math.max(0, w.max_concurrency - w.active_jobs)),
+  const schedulable = workers.filter((worker) => worker.enabled && !worker.stale && !worker.draining);
+  const capacity = schedulable.reduce((sum, worker) => sum + worker.max_concurrency, 0);
+  const available = schedulable.reduce(
+    (sum, worker) => sum + (worker.available_slots ?? Math.max(0, worker.max_concurrency - worker.active_jobs)),
     0,
   );
-  const stats = useMemo(() => [
-    ["在线节点", `${online} / ${workers.length}`], ["活动执行", String(active)],
-    ["可用并发", `${available} / ${capacity}`], ["近 1h 异常", String(failed)],
-  ], [online, workers.length, active, available, capacity, failed]);
 
-  async function workerAction(worker: RenderWorker, patch: { enabled?: boolean; draining?: boolean; max_concurrency?: number; worker_key?: string }) {
+  async function workerAction(
+    worker: RenderWorker,
+    patch: { enabled?: boolean; draining?: boolean; max_concurrency?: number; worker_key?: string },
+  ) {
     setBusy(worker.id);
-    try { await renderManagementApi.controlWorker(worker.id, patch); await refresh(); }
-    catch (e) { setError(e instanceof Error ? e.message : String(e)); } finally { setBusy(null); }
+    try {
+      await renderManagementApi.controlWorker(worker.id, patch);
+      await refresh();
+    } catch (reason: unknown) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setBusy(null);
+    }
   }
+
+  function updateDraft(worker: RenderWorker, patch: Partial<WorkerDraft>) {
+    setDrafts((current) => ({
+      ...current,
+      [worker.id]: {
+        maxConcurrency: current[worker.id]?.maxConcurrency ?? worker.max_concurrency,
+        workerKey: current[worker.id]?.workerKey ?? worker.worker_key,
+        ...patch,
+      },
+    }));
+  }
+
+  function resetDraft(worker: RenderWorker) {
+    setDrafts((current) => ({
+      ...current,
+      [worker.id]: {
+        maxConcurrency: worker.max_concurrency,
+        workerKey: worker.worker_key,
+      },
+    }));
+  }
+
+  async function saveWorkerSettings(worker: RenderWorker) {
+    const draft = drafts[worker.id];
+    if (!draft) return;
+    const maxConcurrency = Math.max(1, Math.min(32, Number(draft.maxConcurrency) || 1));
+    const workerKey = draft.workerKey.trim();
+    if (!workerKey) {
+      setError("节点身份 ID 不能为空。");
+      return;
+    }
+
+    const patch: { max_concurrency?: number; worker_key?: string } = {};
+    if (maxConcurrency !== worker.max_concurrency) patch.max_concurrency = maxConcurrency;
+    if (workerKey !== worker.worker_key) patch.worker_key = workerKey;
+    if (!Object.keys(patch).length) return;
+    await workerAction(worker, patch);
+  }
+
   async function deviceAction(worker: RenderWorker, device: RenderDevice, enabled: boolean) {
     const key = `device:${worker.id}:${device.id}`;
     setBusy(key);
     try {
       await renderManagementApi.controlDevice(worker.id, device.id, enabled);
       await refresh();
-    } catch (e) { setError(e instanceof Error ? e.message : String(e)); }
-    finally { setBusy(null); }
+    } catch (reason: unknown) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setBusy(null);
+    }
   }
+
   async function executionAction(execution: RenderExecution, action: "cancel" | "requeue") {
+    const ok = await confirm({
+      title: action === "cancel" ? "取消本次渲染执行" : "重新执行渲染",
+      message: action === "cancel"
+        ? "当前执行会被取消；任务本身仍保留，可以之后重新执行。"
+        : "会把该渲染任务重新加入队列，并创建一次新的执行记录。",
+      confirmLabel: action === "cancel" ? "取消执行" : "重新执行",
+      tone: action === "cancel" ? "danger" : "warning",
+    });
+    if (!ok) return;
+
     setBusy(execution.id);
     try {
       if (action === "cancel") await renderManagementApi.cancelExecution(execution.id);
       else await renderManagementApi.requeueExecution(execution.id);
       await refresh();
-    } catch (e) { setError(e instanceof Error ? e.message : String(e)); } finally { setBusy(null); }
+    } catch (reason: unknown) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setBusy(null);
+    }
   }
-  async function createEnrollment() {
-    setBusy("enrollment");
+
+  async function createEnrollment(worker?: RenderWorker) {
+    setBusy(worker ? `recover:${worker.id}` : "enrollment");
     try {
-      const created = await renderManagementApi.createEnrollment({ label: enrollmentLabel.trim(), ttl_minutes: 30 });
-      setCreatedEnrollment(created); setEnrollmentLabel(""); await refresh();
-    } catch (e) { setError(e instanceof Error ? e.message : String(e)); } finally { setBusy(null); }
-  }
-  async function createRecoveryEnrollment(worker: RenderWorker) {
-    setBusy(`recover:${worker.id}`);
-    try {
-      const created = await renderManagementApi.createEnrollment({
-        label: `恢复 ${worker.name} · ${worker.worker_key}`,
-        ttl_minutes: 30,
-      });
+      const label = worker
+        ? `恢复 ${worker.name} · ${worker.worker_key}`
+        : enrollmentLabel.trim();
+      const created = await renderManagementApi.createEnrollment({ label, ttl_minutes: 30 });
       setCreatedEnrollment(created);
+      if (!worker) setEnrollmentLabel("");
       setError(null);
-      await refresh();
-    } catch (e) { setError(e instanceof Error ? e.message : String(e)); }
-    finally { setBusy(null); }
+    } catch (reason: unknown) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setBusy(null);
+    }
   }
+
+  async function revokeCredential(worker: RenderWorker) {
+    const ok = await confirm({
+      title: "吊销节点凭据",
+      message: "该节点现有长期凭据会立即失效。之后需要新的配对凭据才能重新接入。",
+      confirmLabel: "吊销凭据",
+      tone: "danger",
+    });
+    if (!ok) return;
+
+    setBusy(worker.id);
+    try {
+      await renderManagementApi.revokeWorkerCredential(worker.id);
+      await refresh();
+    } catch (reason: unknown) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setBusy(null);
+    }
+  }
+
   async function saveServerUrl() {
     setBusy("connection");
-    try { const next = await renderManagementApi.updateConnection(serverUrl.trim()); setConnection(next); setServerUrl(next.server_url); }
-    catch (e) { setError(e instanceof Error ? e.message : String(e)); } finally { setBusy(null); }
+    try {
+      const next = await renderManagementApi.updateConnection(serverUrl.trim());
+      setConnection(next);
+      setServerUrl(next.server_url);
+      setError(null);
+    } catch (reason: unknown) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setBusy(null);
+    }
   }
-  const selectedTelemetry = selected ? getRenderTelemetry(selected) : null;
 
-  return <div className="space-y-5">
-    <PageHeader title="渲染管理" description="统一查看本机与远程渲染节点、执行状态和故障重排。任务优先级与拖拽顺序继续由处理队列管理。"
-      actions={<><Link to="/queue/render" className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm hover:bg-slate-50">处理队列</Link><Button onClick={() => void refresh()}>刷新</Button></>} />
-    {error ? <div className="rounded-lg border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700">{error}</div> : null}
+  return (
+    <div className="space-y-5">
+      <PageHeader
+        title="渲染节点"
+        description="管理渲染容量、当前任务和 GPU 分配。任务顺序与优先级仍在处理队列中管理。"
+        actions={
+          <>
+            <Link
+              to="/queue/render"
+              className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm hover:bg-slate-50 dark:border-slate-700 dark:bg-slate-950 dark:hover:bg-slate-900"
+            >
+              处理队列
+            </Link>
+            <Button onClick={() => void refresh()}>刷新</Button>
+          </>
+        }
+      />
 
-    <Section>
-      <div className="text-sm font-semibold">添加 / 恢复渲染节点</div>
-      <div className="mt-1 text-xs text-slate-500">在渲染机上填写服务器地址和一次性配对凭据。节点端会长期保存 Worker Key；服务端记录误删后，用原 Worker Key + 新的一次性凭据即可重新创建节点。</div>
-      <div className="mt-4 grid gap-3 lg:grid-cols-[minmax(0,1fr)_auto]">
-        <label><div className="mb-1 text-xs text-slate-500">服务器地址</div><input value={serverUrl} onChange={(e) => setServerUrl(e.target.value)} placeholder="https://video.example.com" className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm" /></label>
-        <div className="flex items-end"><Button disabled={busy === "connection" || !serverUrl.trim()} onClick={() => void saveServerUrl()}>保存地址</Button></div>
-      </div>
-      <div className="mt-3 grid gap-3 lg:grid-cols-[minmax(0,1fr)_220px_auto]">
-        <div className="self-end pb-2 text-xs text-slate-500">Worker API：{connection ? `${connection.server_url}${connection.worker_api_path}` : "—"}</div>
-        <label><div className="mb-1 text-xs text-slate-500">节点备注</div><input value={enrollmentLabel} onChange={(e) => setEnrollmentLabel(e.target.value)} placeholder="例如：4060 笔记本" className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm" /></label>
-        <div className="flex items-end"><Button tone="primary" disabled={busy === "enrollment"} onClick={() => void createEnrollment()}>生成配对凭据</Button></div>
-      </div>
-      {createdEnrollment ? <div className="mt-4 rounded-xl border border-amber-200 bg-amber-50 p-4">
-        <div className="text-sm font-medium text-amber-900">一次性配对凭据（仅显示本次生成结果）</div>
-        <div className="mt-2 break-all rounded bg-white px-3 py-2 font-mono text-xs text-slate-900">{createdEnrollment.token}</div>
-        <div className="mt-2 text-xs text-amber-800">有效期 30 分钟，成功配对后立即失效。不要把它作为长期 Worker Token 保存。</div>
-      </div> : null}
-      {enrollments.length ? <div className="mt-4 text-xs text-slate-500">最近配对凭据：{enrollments.slice(0, 5).map((x) => `${x.label || x.id.slice(0, 8)} · ${x.status}`).join("　")}</div> : null}
-    </Section>
+      {error ? (
+        <InlineNotice title="渲染管理操作未完成" tone="danger">
+          页面保留了最后一次成功读取的状态。
+          <TechnicalDetails className="mt-2">
+            <pre className="whitespace-pre-wrap break-words font-mono">{error}</pre>
+          </TechnicalDetails>
+        </InlineNotice>
+      ) : null}
 
-    <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
-      {stats.map(([label, n]) => <Section key={label}><div className="text-xs text-slate-500">{label}</div><div className="mt-2 text-2xl font-semibold">{n}</div></Section>)}
+      <Section>
+        <div className="grid grid-cols-2 gap-5 lg:grid-cols-4">
+          <Metric label="在线节点" value={`${online} / ${workers.length}`} tone={online ? "success" : "warning"} />
+          <Metric label="正在执行" value={activeCount} tone={activeCount ? "info" : "neutral"} />
+          <Metric label="可用并发" value={`${available} / ${capacity}`} detail="仅统计可接收新任务的节点" />
+          <Metric label="近 1 小时异常" value={recentFailures} tone={recentFailures ? "danger" : "success"} />
+        </div>
+      </Section>
+
+      <Section>
+        <div className="mb-4">
+          <div className="text-sm font-semibold text-slate-950 dark:text-white">节点</div>
+          <div className="mt-1 text-xs text-slate-500 dark:text-slate-400">
+            “停止接收新任务”不会中断当前渲染；关闭节点会阻止它领取后续任务。
+          </div>
+        </div>
+
+        {workers.length === 0 ? <EmptyState>还没有可用的渲染节点。</EmptyState> : (
+          <div className="grid gap-4 xl:grid-cols-2">
+            {workers.map((worker) => (
+              <RenderWorkerCard
+                key={worker.id}
+                worker={worker}
+                executions={executions.filter(
+                  (execution) =>
+                    execution.worker_id === worker.id
+                    && ACTIVE_RENDER_STATES.has(execution.state)
+                )}
+                draft={drafts[worker.id] ?? {
+                  maxConcurrency: worker.max_concurrency,
+                  workerKey: worker.worker_key,
+                }}
+                busy={busy}
+                onWorkerAction={(item, patch) => void workerAction(item, patch)}
+                onDraftChange={updateDraft}
+                onSaveSettings={(item) => void saveWorkerSettings(item)}
+                onResetDraft={resetDraft}
+                onDeviceAction={(item, device, enabled) => void deviceAction(item, device, enabled)}
+                onCreateEnrollment={(item) => void createEnrollment(item)}
+                onRevokeCredential={(item) => void revokeCredential(item)}
+              />
+            ))}
+          </div>
+        )}
+      </Section>
+
+      <RenderExecutions
+        executions={executions}
+        selected={selected}
+        busy={busy}
+        onSelect={setSelected}
+        onClose={() => setSelected(null)}
+        onAction={(execution, action) => void executionAction(execution, action)}
+      />
+
+      <RenderEnrollmentPanel
+        connection={connection}
+        createdEnrollment={createdEnrollment}
+        enrollmentLabel={enrollmentLabel}
+        serverUrl={serverUrl}
+        busy={busy}
+        onEnrollmentLabelChange={setEnrollmentLabel}
+        onServerUrlChange={setServerUrl}
+        onSaveServerUrl={() => void saveServerUrl()}
+        onCreateEnrollment={() => void createEnrollment()}
+      />
     </div>
-
-    <Section>
-      <div className="mb-4"><div className="text-sm font-semibold">渲染节点</div><div className="mt-1 text-xs text-slate-500">节点超过 180 秒无心跳标记为失联；Drain 只阻止领取新任务。</div></div>
-      {workers.length === 0 ? <EmptyState>还没有可用的渲染节点。</EmptyState> :
-      <div className="grid gap-3 lg:grid-cols-2">
-        {workers.map((w) => {
-          const gpu = (w.capabilities.gpu_model ?? w.capabilities.gpu ?? w.resources.gpu) as unknown;
-          const activeExecutions = executions.filter((execution) => execution.worker_id === w.id && ACTIVE.has(execution.state));
-          const throughput = summarizeRenderExecutions(activeExecutions);
-          const devices = (Array.isArray(w.resources.devices) ? w.resources.devices : Array.isArray(w.capabilities.devices) ? w.capabilities.devices : []) as RenderDevice[];
-          return <div key={w.id} className="rounded-xl border border-slate-200 p-4 dark:border-slate-800">
-            <div className="flex items-start justify-between gap-3"><div><div className="font-medium">{w.name}</div><div className="mt-1 text-xs text-slate-500">{w.platform}{w.architecture ? ` · ${w.architecture}` : ""} · {value(gpu)}</div></div>
-              <span className={`rounded-full px-2 py-1 text-xs ${badge(w.stale ? "offline" : w.status)}`}>{w.stale ? "失联" : w.draining ? "Drain" : w.status}</span></div>
-            <div className="mt-4 grid grid-cols-3 gap-3 text-xs lg:grid-cols-6">
-              <div><div className="text-slate-500">运行中</div><div className="mt-1 font-medium">{w.active_jobs}</div></div>
-              <label><div className="text-slate-500">管理上限</div><input type="number" min={1} max={32} defaultValue={w.max_concurrency} disabled={busy === w.id} onBlur={(e) => { const n = Math.max(1, Math.min(32, Number(e.currentTarget.value) || 1)); if (n !== w.max_concurrency) void workerAction(w, { max_concurrency: n }); }} className="mt-1 w-16 rounded border border-slate-300 px-2 py-1 font-medium" /><div className="mt-1 text-[10px] text-slate-400">节点同时任务上限</div></label>
-              <div><div className="text-slate-500">可用并发</div><div className="mt-1 font-medium">{w.available_slots ?? Math.max(0, w.max_concurrency - w.active_jobs)} / {w.max_concurrency}</div></div>
-              <div><div className="text-slate-500">总 FPS</div><div className="mt-1 font-medium">{throughput.fps > 0 ? formatRenderFps(throughput.fps) : "—"}</div></div>
-              <div><div className="text-slate-500">总实时倍速</div><div className="mt-1 font-medium">{throughput.speed > 0 ? formatRenderSpeed(throughput.speed) : "—"}</div></div>
-              <div><div className="text-slate-500">心跳</div><div className="mt-1 font-medium">{ago(w.last_seen_at)}</div></div>
-            </div>
-            {activeExecutions.length ? <div className="mt-4 space-y-2">
-              <div className="text-xs font-medium text-slate-500">当前渲染</div>
-              {activeExecutions.map((execution) => {
-                const telemetry = getRenderTelemetry(execution);
-                return <div key={execution.id} className="rounded-lg border border-sky-200 bg-sky-50/60 p-3 dark:border-sky-900 dark:bg-sky-950/20">
-                  <div className="flex flex-wrap items-center justify-between gap-2 text-xs"><div className="flex items-center gap-2"><span className="font-medium">{execution.task_id ? <Link className="text-sky-700 hover:underline" to={`/tasks/${execution.task_id}`}>Task {execution.task_id.slice(0, 8)}</Link> : `Execution ${execution.id.slice(0, 8)}`}</span><span className="text-slate-500">{telemetry.stage}</span></div><div className="flex gap-3 font-mono"><span>{formatRenderFps(telemetry.fps)}</span><span>{formatRenderSpeed(telemetry.speed)}</span><span>ETA {formatRenderDuration(telemetry.etaSeconds)}</span></div></div>
-                  <div className="mt-2 h-2 overflow-hidden rounded-full bg-slate-200 dark:bg-slate-800"><div className="h-full rounded-full bg-sky-500 transition-all" style={{ width: `${telemetry.overallProgress}%` }} /></div>
-                  <div className="mt-1 flex flex-wrap justify-between gap-2 text-[11px] text-slate-500"><span>总进度 {telemetry.overallProgress}% · 渲染 {telemetry.renderPercent.toFixed(1)}%</span><span>{telemetry.encoder ?? "—"} · {telemetry.deviceName ?? w.name}</span></div>
-                </div>;
-              })}
-            </div> : null}
-            <div className="mt-4 rounded-lg border border-slate-200 bg-slate-50 p-3 dark:border-slate-700 dark:bg-slate-900">
-              <div className="flex flex-col gap-2 sm:flex-row sm:items-end">
-                <label className="min-w-0 flex-1"><div className="mb-1 text-xs text-slate-500">Worker Key（恢复身份）</div><input key={w.worker_key} defaultValue={w.worker_key} disabled={busy === w.id} onBlur={(e) => { const key = e.currentTarget.value.trim(); e.currentTarget.value = key; if (key && key !== w.worker_key) void workerAction(w, { worker_key: key }); }} className="w-full rounded border border-slate-300 bg-white px-2 py-1.5 font-mono text-xs dark:border-slate-700 dark:bg-slate-950" /></label>
-                <Button size="xs" disabled={busy === `recover:${w.id}`} onClick={() => void createRecoveryEnrollment(w)}>生成恢复凭据</Button>
-              </div>
-              <div className="mt-2 text-[11px] text-slate-500">修改后请让节点端使用相同 Worker Key。若服务端记录被误删，节点端保留此 Key，粘贴新的 vre_* 凭据重新配对即可恢复。</div>
-            </div>
-            {devices.length ? <div className="mt-4 space-y-2">
-              {devices.map((device) => <div key={device.id} className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 dark:border-slate-700 dark:bg-slate-900">
-                <div className="flex items-center justify-between gap-3"><div className="min-w-0"><div className="text-xs font-medium">{device.name}</div><div className="mt-0.5 break-all font-mono text-[11px] text-slate-500">{device.id}{device.path ? ` · ${device.path}` : ""} · {device.backend}</div></div><div className="flex shrink-0 items-center gap-2"><span className={`rounded-full px-2 py-0.5 text-[11px] ${badge(device.status)}`}>{device.enabled === false ? "已暂停" : device.status === "cooldown" ? "故障冷却" : device.status}</span><Button size="xs" disabled={busy !== null || w.stale || !w.credential_active} tone={device.enabled === false ? "primary" : "danger"} onClick={() => void deviceAction(w, device, device.enabled === false)}>{device.enabled === false ? "启用此显卡" : "暂停此显卡"}</Button></div></div>
-                <div className="mt-2 grid grid-cols-2 gap-2 text-[11px]"><div><span className="text-slate-500">任务 </span>{device.active_jobs}</div><div className="truncate"><span className="text-slate-500">Execution </span>{device.execution_ids?.length ? device.execution_ids.map((id) => id.slice(0, 8)).join(", ") : "—"}</div></div>
-              </div>)}
-              <div className="text-[11px] text-slate-500">显卡开关仅控制新渲染任务的分配，不会中断当前执行；节点收到下一次心跳响应后生效。</div>
-            </div> : null}
-            <div className="mt-4 flex flex-wrap gap-2"><Button size="xs" disabled={busy === w.id} onClick={() => void workerAction(w, { draining: !w.draining })}>{w.draining ? "恢复接单" : "Drain"}</Button><Button size="xs" tone={w.enabled ? "danger" : "primary"} disabled={busy === w.id} onClick={() => void workerAction(w, { enabled: !w.enabled })}>{w.enabled ? "禁用" : "启用"}</Button><Button size="xs" tone="danger" disabled={busy === w.id || !w.credential_active} onClick={async () => { setBusy(w.id); try { await renderManagementApi.revokeWorkerCredential(w.id); await refresh(); } catch (e) { setError(e instanceof Error ? e.message : String(e)); } finally { setBusy(null); } }}>吊销长期凭据</Button></div>
-          </div>;
-        })}
-      </div>}
-    </Section>
-
-    <Section>
-      <div className="mb-4"><div className="text-sm font-semibold">执行记录</div><div className="mt-1 text-xs text-slate-500">每次 Worker 领取任务都会产生独立 Attempt；重新排队会生成新的 fence token。</div></div>
-      {executions.length === 0 ? <EmptyState>暂无远程渲染执行记录。</EmptyState> :
-      <DataTable><thead><tr><th>状态</th><th>节点</th><th>进度</th><th>FPS</th><th>倍速</th><th>ETA</th><th>编码</th><th>Task</th><th>开始</th><th>操作</th></tr></thead><tbody>
-        {executions.map((e) => {
-          const telemetry = getRenderTelemetry(e);
-          return <tr key={e.id} className="cursor-pointer" onClick={() => setSelected(e)}>
-            <td><span className={`rounded-full px-2 py-1 text-xs ${badge(e.state)}`}>{e.state}</span><div className="mt-1 text-[11px] text-slate-500">{telemetry.stage}</div></td>
-            <td><div>{e.worker_name ?? e.worker_id.slice(0, 8)}</div>{telemetry.deviceName ? <div className="mt-0.5 text-[11px] text-slate-500">{telemetry.deviceName}</div> : null}</td>
-            <td className="min-w-32"><div className="flex items-center justify-between gap-2 text-xs"><span>{telemetry.overallProgress}%</span><span className="text-slate-500">渲染 {telemetry.renderPercent.toFixed(1)}%</span></div><div className="mt-1 h-1.5 overflow-hidden rounded-full bg-slate-200 dark:bg-slate-800"><div className="h-full rounded-full bg-sky-500" style={{ width: `${telemetry.overallProgress}%` }} /></div></td>
-            <td className="font-mono text-xs">{formatRenderFps(telemetry.fps)}</td>
-            <td className="font-mono text-xs">{formatRenderSpeed(telemetry.speed)}</td>
-            <td className="font-mono text-xs">{formatRenderDuration(telemetry.etaSeconds)}</td>
-            <td><div className="text-xs">{telemetry.encoder ?? "—"}</div><div className="max-w-48 truncate text-[11px] text-slate-500">{telemetry.pipeline ?? ""}</div></td>
-            <td>{e.task_id ? <Link className="text-sky-700 hover:underline" to={`/tasks/${e.task_id}`} onClick={(x) => x.stopPropagation()}>{e.task_id.slice(0, 8)}</Link> : "—"}</td>
-            <td>{ago(e.started_at)}</td>
-            <td><div className="flex gap-1" onClick={(x) => x.stopPropagation()}>{ACTIVE.has(e.state) ? <Button size="xs" tone="danger" disabled={busy === e.id} onClick={() => void executionAction(e, "cancel")}>取消</Button> : null}<Button size="xs" disabled={busy === e.id || e.state === "succeeded"} onClick={() => void executionAction(e, "requeue")}>重排</Button></div></td>
-          </tr>;
-        })}
-      </tbody></DataTable>}
-    </Section>
-
-    {selected ? <Section>
-      <div className="flex items-start justify-between gap-3"><div><div className="text-sm font-semibold">执行详情 · Attempt #{selected.attempt}</div><div className="mt-1 font-mono text-xs text-slate-500">{selected.id}</div></div><Button size="xs" onClick={() => setSelected(null)}>关闭</Button></div>
-      <div className="mt-4 grid gap-3 text-sm sm:grid-cols-2 lg:grid-cols-4"><div><span className="text-slate-500">Worker：</span>{selected.worker_name ?? selected.worker_id}</div><div><span className="text-slate-500">状态：</span>{selected.state}</div><div><span className="text-slate-500">Job：</span>{selected.job_status ?? "—"}</div><div><span className="text-slate-500">Lease：</span>{ago(selected.lease_until)}</div>{selectedTelemetry ? <><div><span className="text-slate-500">FPS：</span>{formatRenderFps(selectedTelemetry.fps)}</div><div><span className="text-slate-500">实时倍速：</span>{formatRenderSpeed(selectedTelemetry.speed)}</div><div><span className="text-slate-500">渲染进度：</span>{selectedTelemetry.renderPercent.toFixed(1)}%</div><div><span className="text-slate-500">ETA：</span>{formatRenderDuration(selectedTelemetry.etaSeconds)}</div></> : null}</div>
-      {selected.error_message ? <div className="mt-4 rounded-lg bg-rose-50 p-3 text-sm text-rose-700">{selected.error_message}</div> : null}
-      <div className="mt-4 grid gap-4 lg:grid-cols-2"><div><div className="mb-2 text-xs font-medium text-slate-500">Metrics</div><pre className="max-h-52 overflow-auto rounded-lg bg-slate-950 p-3 text-xs text-slate-100">{JSON.stringify(selected.metrics, null, 2)}</pre></div><div><div className="mb-2 text-xs font-medium text-slate-500">日志尾部</div><pre className="max-h-52 overflow-auto whitespace-pre-wrap rounded-lg bg-slate-950 p-3 text-xs text-slate-100">{selected.log_tail || "暂无日志"}</pre></div></div>
-    </Section> : null}
-  </div>;
+  );
 }
-

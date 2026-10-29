@@ -30,8 +30,14 @@ from sqlalchemy.exc import ProgrammingError
 
 from videoroll.ai.service import AIService
 from videoroll.apps.subtitle_service.model_provider_store import (
-    MAX_SAFE_JSON_INTEGER, delete_provider, fetch_remote_model_catalog, list_providers,
-    save_provider, validate_token_limits,
+    INDEX_ID,
+    LEGACY_ID,
+    MAX_SAFE_JSON_INTEGER,
+    delete_provider,
+    fetch_remote_model_catalog,
+    list_providers,
+    save_provider,
+    validate_token_limits,
 )
 from videoroll.apps.security.service_auth import install_internal_service_auth, service_token
 from videoroll.config import SubtitleServiceSettings, get_subtitle_settings
@@ -130,6 +136,7 @@ from videoroll.apps.subtitle_service.dictionaries import (
     update_dictionary_source,
 )
 from videoroll.apps.subtitle_service.translate_settings_store import get_translate_settings, update_translate_settings
+from videoroll.apps.subtitle_service.translation_runtime import resolve_profile_translation_runtime
 from videoroll.apps.subtitle_service.processing import (
     segments_from_json_data,
     transcribe_cloudflare_workers_ai,
@@ -625,10 +632,47 @@ def get_subtitle_auto_profile(db: Session = Depends(get_db)) -> SubtitleAutoProf
     return SubtitleAutoProfileRead(**cfg)
 
 
+_AUTO_PROFILE_TRANSLATION_SELECTION_FIELDS = {
+    "translate_enabled",
+    "translate_provider",
+    "translate_model_provider_id",
+    "translate_model_id",
+}
+
+
+def _validate_auto_profile_translation_selection(
+    db: Session,
+    settings: SubtitleServiceSettings,
+    current: dict[str, Any],
+    update: dict[str, Any],
+) -> None:
+    if not _AUTO_PROFILE_TRANSLATION_SELECTION_FIELDS.intersection(update):
+        return
+
+    candidate = {**current, **{key: value for key, value in update.items() if value is not None}}
+    if not bool(candidate.get("translate_enabled", True)):
+        return
+    if str(candidate.get("translate_provider") or "openai").strip() != "openai":
+        return
+
+    resolve_profile_translation_runtime(
+        db,
+        get_translate_settings(db, settings),
+        candidate,
+    )
+
+
 @app.put("/subtitle/auto/profile", response_model=SubtitleAutoProfileRead)
-def put_subtitle_auto_profile(payload: SubtitleAutoProfileUpdate, db: Session = Depends(get_db)) -> SubtitleAutoProfileRead:
+def put_subtitle_auto_profile(
+    payload: SubtitleAutoProfileUpdate,
+    settings: SubtitleServiceSettings = Depends(get_settings),
+    db: Session = Depends(get_db),
+) -> SubtitleAutoProfileRead:
+    update = payload.model_dump(exclude_unset=True)
     try:
-        cfg = update_auto_profile(db, payload.model_dump(exclude_unset=True))
+        current = get_auto_profile(db)
+        _validate_auto_profile_translation_selection(db, settings, current, update)
+        cfg = update_auto_profile(db, update)
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     return SubtitleAutoProfileRead(**cfg)
@@ -641,6 +685,7 @@ class ModelEntryPayload(BaseModel):
     temperature: float | None = Field(default=0.2, ge=0, le=2)
     enable_thinking: bool = False
     reasoning_effort: str = "medium"
+    reasoning_format: str = "parsed"
 
     @model_validator(mode="after")
     def validate_context_budget(self) -> "ModelEntryPayload":
@@ -656,6 +701,72 @@ class ModelProviderPayload(BaseModel):
     timeout_seconds: int = Field(default=180, ge=5, le=1200)
     max_retries: int = Field(default=3, ge=1, le=10)
     models: list[ModelEntryPayload] = Field(default_factory=list, max_length=200)
+    options: dict[str, Any] = Field(default_factory=dict)
+
+
+def _updated_builtin_model_provider(
+    provider_id: str,
+    payload: ModelProviderPayload,
+    *,
+    settings: SubtitleServiceSettings,
+    db: Session,
+) -> dict[str, Any]:
+    if len(payload.models) != 1:
+        raise ValueError("内建翻译服务必须且只能配置一个模型")
+    model = payload.models[0]
+    current = get_translate_settings(db, settings)
+
+    if provider_id == LEGACY_ID:
+        if payload.api_type not in {"openai", "cerebras"}:
+            raise ValueError("OpenAI 兼容服务只支持 openai 或 cerebras 接口类型")
+        if model.context_window is not None or model.max_output_tokens is not None:
+            raise ValueError("兼容内建服务不保存模型容量；请新建独立模型服务以配置上下文和输出上限")
+        update: dict[str, Any] = {
+            "openai_base_url": payload.base_url,
+            "openai_model": model.id,
+            "openai_temperature": (
+                model.temperature
+                if model.temperature is not None
+                else current["openai_temperature"]
+            ),
+            "openai_timeout_seconds": payload.timeout_seconds,
+            "openai_max_retries": payload.max_retries,
+            "openai_api_type": payload.api_type,
+            "openai_enable_thinking": model.enable_thinking,
+            "cerebras_reasoning_effort": model.reasoning_effort,
+            "cerebras_reasoning_format": model.reasoning_format,
+        }
+        if payload.api_key is not None:
+            update["openai_api_key"] = payload.api_key
+        updated = update_translate_settings(db, settings, update)
+    elif provider_id == INDEX_ID:
+        options = payload.options or {}
+        updated = update_translate_settings(
+            db,
+            settings,
+            {
+                "index_temperature": (
+                    model.temperature
+                    if model.temperature is not None
+                    else current["index_temperature"]
+                ),
+                "index_timeout_seconds": payload.timeout_seconds,
+                "index_max_tokens": (
+                    model.max_output_tokens
+                    if model.max_output_tokens is not None
+                    else current["index_max_tokens"]
+                ),
+                "index_batch_size": options.get("batch_size", current["index_batch_size"]),
+                "index_context_chars": options.get("context_chars", current["index_context_chars"]),
+                "index_domain": options.get("domain", current["index_domain"]),
+                "index_glossary": options.get("glossary", current["index_glossary"]),
+                "index_instruction": options.get("instruction", current["index_instruction"]),
+            },
+        )
+    else:
+        raise ValueError("不是内建翻译服务")
+
+    return next(item for item in list_providers(db, updated) if item["id"] == provider_id)
 
 
 @app.get("/subtitle/translate/model-providers")
@@ -676,9 +787,19 @@ def create_model_provider(payload: ModelProviderPayload, db: Session = Depends(g
 
 @app.put("/subtitle/translate/model-providers/{provider_id}")
 def update_model_provider(
-    provider_id: str, payload: ModelProviderPayload, db: Session = Depends(get_db),
+    provider_id: str,
+    payload: ModelProviderPayload,
+    settings: SubtitleServiceSettings = Depends(get_settings),
+    db: Session = Depends(get_db),
 ) -> dict[str, Any]:
     try:
+        if provider_id in {LEGACY_ID, INDEX_ID}:
+            return _updated_builtin_model_provider(
+                provider_id,
+                payload,
+                settings=settings,
+                db=db,
+            )
         return save_provider(db, provider_id, payload.model_dump())
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -1873,19 +1994,32 @@ def translate_test(
         raise HTTPException(status_code=400, detail="text too long (max 2000 chars)")
 
     try:
-        ai_service = AIService(lambda: get_translate_settings(db, settings))
-        cfg = get_translate_settings(db, settings)
-        if cfg.get("default_provider") == "index_translate":
+        legacy_settings = get_translate_settings(db, settings)
+        runtime = resolve_profile_translation_runtime(
+            db,
+            legacy_settings,
+            get_auto_profile(db),
+        )
+        db.commit()  # End the read transaction before an external request.
+        if runtime.provider == "index_translate":
             from videoroll.apps.subtitle_service.index_translate import translate_text_index
-            db.commit()  # End the read transaction before an external request.
-            translated = translate_text_index(text, target_lang=payload.target_lang, style=payload.style, settings=cfg)
-        else:
+
+            translated = translate_text_index(
+                text,
+                target_lang=payload.target_lang,
+                style=payload.style,
+                settings=runtime.settings,
+            )
+        elif runtime.provider == "openai":
+            ai_service = AIService(lambda: dict(runtime.settings))
             translated = ai_service.translate_text(
                 text,
                 target_lang=payload.target_lang,
                 style=payload.style,
-                enable_thinking=bool(cfg.get("openai_enable_thinking")),
+                enable_thinking=bool(runtime.settings.get("openai_enable_thinking")),
             )
+        else:
+            raise ValueError(f"当前自动处理翻译方式不支持连接测试: {runtime.provider}")
     except Exception as e:
         raise HTTPException(status_code=502, detail=str(e)) from e
 

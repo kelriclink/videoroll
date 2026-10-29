@@ -51,3 +51,70 @@ class AutoProfileStoreTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_auto_profile_translation_selection_validation_only_runs_for_selection_changes(
+    monkeypatch,
+) -> None:
+    from videoroll.apps.subtitle_service import main as subtitle_main
+
+    calls: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        subtitle_main,
+        "get_translate_settings",
+        lambda *_args: {"default_provider": "openai"},
+    )
+    monkeypatch.setattr(
+        subtitle_main,
+        "resolve_profile_translation_runtime",
+        lambda _db, _legacy, profile: calls.append(dict(profile)),
+    )
+    current = {
+        "translate_enabled": True,
+        "translate_provider": "openai",
+        "translate_model_provider_id": "legacy",
+        "translate_model_id": "",
+    }
+
+    subtitle_main._validate_auto_profile_translation_selection(
+        object(), object(), current, {"video_codec": "h264"}
+    )
+    assert calls == []
+
+    subtitle_main._validate_auto_profile_translation_selection(
+        object(),
+        object(),
+        current,
+        {"translate_model_provider_id": "provider-x", "translate_model_id": "model-x"},
+    )
+    assert calls[-1]["translate_model_provider_id"] == "provider-x"
+    assert calls[-1]["translate_model_id"] == "model-x"
+
+
+def test_auto_profile_translation_selection_validation_skips_disabled_or_index(
+    monkeypatch,
+) -> None:
+    from videoroll.apps.subtitle_service import main as subtitle_main
+
+    called = False
+
+    def fail_if_called(*_args, **_kwargs):
+        nonlocal called
+        called = True
+        raise AssertionError("resolver should not run")
+
+    monkeypatch.setattr(subtitle_main, "resolve_profile_translation_runtime", fail_if_called)
+    current = {
+        "translate_enabled": True,
+        "translate_provider": "openai",
+        "translate_model_provider_id": "legacy",
+        "translate_model_id": "",
+    }
+
+    subtitle_main._validate_auto_profile_translation_selection(
+        object(), object(), current, {"translate_enabled": False}
+    )
+    subtitle_main._validate_auto_profile_translation_selection(
+        object(), object(), current, {"translate_provider": "index_translate"}
+    )
+    assert called is False

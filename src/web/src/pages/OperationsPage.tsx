@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
-import { Button, DataTable, PageHeader, Section } from "../components/ui";
+import { Button, DataTable, InlineNotice, PageHeader, Section, TechnicalDetails } from "../components/ui";
 import { fetchJson } from "../lib/http";
 import { ORCHESTRATOR_URL } from "../lib/urls";
 
@@ -147,10 +147,16 @@ export default function OperationsPage() {
   return (
     <div className="space-y-4">
       <PageHeader
-        title="运维中心"
-        description="统一查看 AI 用量与错误、直播/队列/存储/账号告警，并维护按模型 Token 价格。后台每 60 秒自动扫描一次告警。"
+        title="运维"
+        description="处理系统告警并查看 AI 用量。工作流、HTTP 状态和原始运行数据集中在高级诊断中。"
         actions={
           <>
+            <Link
+              to="/workflow"
+              className="rounded-lg border border-slate-300 px-3 py-2 text-sm text-slate-700 hover:bg-white dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-900"
+            >
+              工作流诊断
+            </Link>
             <select className="vr-input" value={hours} onChange={(e) => setHours(Number(e.target.value))}>
               <option value={1}>最近 1 小时</option>
               <option value={24}>最近 24 小时</option>
@@ -163,7 +169,13 @@ export default function OperationsPage() {
         }
       />
 
-      {error ? <div className="rounded-md border border-rose-200 bg-rose-50 p-3 text-sm text-rose-700">{error}</div> : null}
+      {error ? (
+        <InlineNotice title="运维数据未能完整刷新" tone="danger">
+          <TechnicalDetails className="mt-2">
+            <pre className="whitespace-pre-wrap break-words font-mono">{error}</pre>
+          </TechnicalDetails>
+        </InlineNotice>
+      ) : null}
 
       <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-5">
         {[
@@ -173,9 +185,9 @@ export default function OperationsPage() {
           ["输出 Token", formatTokens(usage?.output_tokens ?? 0)],
           ["估算成本", usage?.estimated_cost_usd == null ? "未配置价格" : `$${usage.estimated_cost_usd.toFixed(4)}`],
         ].map(([label, value]) => (
-          <div key={String(label)} className="rounded-xl border border-slate-200 bg-white p-4">
+          <div key={String(label)} className="rounded-xl border border-slate-200 bg-white p-4 dark:border-slate-800 dark:bg-slate-950">
             <div className="text-xs text-slate-500">{label}</div>
-            <div className="mt-1 text-xl font-semibold text-slate-950">{value}</div>
+            <div className="mt-1 text-xl font-semibold text-slate-950 dark:text-white">{value}</div>
           </div>
         ))}
       </div>
@@ -183,15 +195,15 @@ export default function OperationsPage() {
       <Section>
         <div className="flex items-center justify-between gap-3">
           <div>
-            <div className="text-sm font-semibold">当前告警</div>
-            <div className="mt-1 text-xs text-slate-500">自动信号：磁盘、AI、Worker、账号、字幕/配音/渲染失败、渲染兼容回退以及投稿不确定状态。每 60 秒扫描；任务详情同步提示。</div>
+            <div className="text-sm font-semibold text-slate-950 dark:text-white">当前告警</div>
+            <div className="mt-1 text-xs text-slate-500">磁盘、AI、渲染节点、账号和生产流程异常会汇总到这里；后台每 60 秒自动扫描。</div>
           </div>
           <div className="text-sm text-slate-500">{openAlerts.length} 条未解决</div>
         </div>
         {openAlerts.length === 0 ? <div className="mt-4 text-sm text-emerald-700">当前没有未解决告警。</div> : (
           <div className="mt-4 space-y-2">
             {openAlerts.map((alert) => (
-              <div key={alert.id} className="rounded-lg border border-slate-200 p-3">
+              <div key={alert.id} className="rounded-lg border border-slate-200 p-3 dark:border-slate-800">
                 <div className="flex flex-col gap-2 lg:flex-row lg:items-start lg:justify-between">
                   <div className="min-w-0">
                     <div className="flex flex-wrap items-center gap-2">
@@ -199,13 +211,18 @@ export default function OperationsPage() {
                       <span className="text-xs text-slate-500">{alert.source}</span>
                       <span className="text-xs text-slate-400">×{alert.occurrence_count}</span>
                     </div>
-                    <div className="mt-2 font-medium text-slate-950">{alert.title}</div>
-                    <div className="mt-1 text-sm text-slate-600">{alert.message || "-"}</div>
-                    {typeof alert.details?.reason === "string" && alert.details.reason ? (
-                      <div className="mt-1 break-words text-xs text-amber-800">回退原因：{alert.details.reason}</div>
-                    ) : null}
-                    {typeof alert.details?.pipeline === "string" && alert.details.pipeline ? (
-                      <div className="mt-1 break-words text-xs text-slate-500">实际路径：{alert.details.pipeline}</div>
+                    <div className="mt-2 font-medium text-slate-950 dark:text-white">{alert.title}</div>
+                    <div className="mt-1 text-sm text-slate-600 dark:text-slate-300">{alert.message || "-"}</div>
+                    {(typeof alert.details?.reason === "string" && alert.details.reason)
+                      || (typeof alert.details?.pipeline === "string" && alert.details.pipeline) ? (
+                      <TechnicalDetails className="mt-2" summary="诊断详情">
+                        {typeof alert.details?.reason === "string" && alert.details.reason ? (
+                          <div className="break-words"><span className="text-slate-500">原因：</span>{alert.details.reason}</div>
+                        ) : null}
+                        {typeof alert.details?.pipeline === "string" && alert.details.pipeline ? (
+                          <div className="mt-1 break-words"><span className="text-slate-500">执行路径：</span>{alert.details.pipeline}</div>
+                        ) : null}
+                      </TechnicalDetails>
                     ) : null}
                     {typeof alert.details?.task_id === "string" && alert.details.task_id ? (
                       <Link className="mt-1 inline-block text-xs text-sky-700 underline" to={`/tasks/${alert.details.task_id}`}>查看关联任务</Link>
@@ -230,11 +247,11 @@ export default function OperationsPage() {
         <DataTable wrapClassName="mt-3">
           <thead>
             <tr>
-              <th>Provider / Model</th>
+              <th>模型服务 / 模型</th>
               <th>请求</th>
               <th>失败</th>
-              <th>Input</th>
-              <th>Output</th>
+              <th>输入 Token</th>
+              <th>输出 Token</th>
               <th>成本</th>
             </tr>
           </thead>
@@ -253,25 +270,26 @@ export default function OperationsPage() {
           </tbody>
         </DataTable>
         {(usage?.by_status ?? []).length > 0 ? (
-          <div className="mt-3 flex flex-wrap gap-2 text-xs text-slate-600">
-            {(usage?.by_status ?? []).map((item) => (
-              <span key={String(item.status_code)} className="rounded border border-slate-200 px-2 py-1">
-                HTTP {item.status_code ?? "transport"}: {item.count}
-              </span>
-            ))}
-          </div>
+          <TechnicalDetails className="mt-3" summary="HTTP / 传输状态">
+            <div className="flex flex-wrap gap-2">
+              {(usage?.by_status ?? []).map((item) => (
+                <span key={String(item.status_code)} className="rounded border border-slate-200 px-2 py-1 dark:border-slate-700">
+                  {item.status_code ?? "传输失败"}：{item.count}
+                </span>
+              ))}
+            </div>
+          </TechnicalDetails>
         ) : null}
       </Section>
 
-      <Section>
+      <TechnicalDetails summary="高级：模型价格配置">
         <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
-          <div>
-            <div className="text-sm font-semibold">Token 价格表</div>
-            <div className="mt-1 text-xs text-slate-500">
-              单位为 USD / 1M tokens。Key 可写 model 或 provider:model；未配置价格的请求仍统计 Token，但成本显示为空。
-            </div>
+          <div className="text-xs text-slate-500">
+            单位为 USD / 1M tokens。键可以写 model 或 provider:model；只影响成本估算，不影响模型调用。
           </div>
-          <Button tone="primary" disabled={busy === "pricing"} onClick={savePricing}>{busy === "pricing" ? "保存中..." : "保存价格"}</Button>
+          <Button tone="primary" size="xs" disabled={busy === "pricing" || !pricingDirty} onClick={savePricing}>
+            {busy === "pricing" ? "保存中..." : "保存价格"}
+          </Button>
         </div>
         <textarea
           className="vr-input mt-3 min-h-44 w-full font-mono text-xs"
@@ -282,7 +300,7 @@ export default function OperationsPage() {
           }}
           placeholder={'{"gpt-4o-mini":{"input_per_million_usd":0.15,"output_per_million_usd":0.60}}'}
         />
-      </Section>
+      </TechnicalDetails>
 
       {resolvedAlerts.length > 0 ? (
         <Section>

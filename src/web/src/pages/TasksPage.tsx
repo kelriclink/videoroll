@@ -2,10 +2,11 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import StatusBadge from "../components/StatusBadge";
 import { useConfirm, useToast } from "../components/feedbackContext";
-import { Button, DataTable, EmptyState, MoreMenu, PageHeader, PaginationControls, Section, TableToolbar, menuItemClass } from "../components/ui";
+import { Button, DataTable, EmptyState, MoreMenu, PageHeader, PaginationControls, Section, TableToolbar, TechnicalDetails, menuItemClass } from "../components/ui";
 import { fetchJson } from "../lib/http";
 import { ORCHESTRATOR_URL } from "../lib/urls";
 import { Task, TaskStatus } from "../lib/types";
+import { presentTaskError } from "../lib/taskPresentation";
 
 type SubtitleActionResponse = { job_id: string; status: string };
 type AutoYouTubeStartResponse = { task_id: string; pipeline_job_id: string };
@@ -24,15 +25,15 @@ const PAGE_SIZE = 25;
 
 const statusOptions: Array<{ value: TaskStatus | null; label: string }> = [
   { value: null, label: "全部" },
-  { value: "INGESTED", label: "待处理" },
-  { value: "DOWNLOADED", label: "已下载" },
-  { value: "ASR_DONE", label: "ASR 完成" },
-  { value: "SUBTITLE_READY", label: "字幕完成" },
-  { value: "RENDERED", label: "已渲染" },
-  { value: "READY_FOR_REVIEW", label: "待审核" },
-  { value: "APPROVED", label: "已批准" },
+  { value: "INGESTED", label: "等待处理" },
+  { value: "DOWNLOADED", label: "视频已下载" },
+  { value: "ASR_DONE", label: "制作字幕" },
+  { value: "SUBTITLE_READY", label: "字幕已完成" },
+  { value: "RENDERED", label: "视频已生成" },
+  { value: "READY_FOR_REVIEW", label: "等待审核" },
+  { value: "APPROVED", label: "等待发布" },
   { value: "PUBLISHED", label: "已发布" },
-  { value: "FAILED", label: "失败" },
+  { value: "FAILED", label: "需要处理" },
   { value: "CANCELED", label: "已停止" },
 ];
 
@@ -205,8 +206,8 @@ export default function TasksPage() {
 
   async function resumeRecentFailed() {
     const ok = await confirm({
-      title: "继续最近失败任务",
-      message: "一键继续最近 24 小时内失败任务？会批量恢复字幕任务，并在渲染后自动投稿。",
+      title: "恢复最近失败任务",
+      message: "恢复最近 24 小时内可以安全继续的失败任务。系统会跳过缺少源文件或不适合自动恢复的任务。",
       confirmLabel: "继续",
       tone: "warning",
     });
@@ -303,16 +304,30 @@ export default function TasksPage() {
         description="查看处理状态，停止或恢复单个任务，也可批量停止与恢复。"
         actions={
           <>
-            <Button disabled={bulkControlBusy !== null} tone="danger" onClick={() => controlAllTasks("stop")}>
-              {bulkControlBusy === "stop" ? "停止中..." : "停止全部"}
-            </Button>
-            <Button disabled={bulkControlBusy !== null} onClick={() => controlAllTasks("resume")}>
-              {bulkControlBusy === "resume" ? "恢复中..." : "恢复全部已停止"}
-            </Button>
-            <Button disabled={bulkResumeBusy} tone="warning" onClick={resumeRecentFailed}>
-              {bulkResumeBusy ? "处理中..." : "继续 24h 失败任务"}
-            </Button>
-            <Link to="/tasks/new" className="rounded-md bg-slate-900 px-3 py-2 text-sm text-white hover:bg-slate-800">
+            <MoreMenu label="批量操作">
+              <button
+                className={menuItemClass}
+                disabled={bulkResumeBusy}
+                onClick={() => void resumeRecentFailed()}
+              >
+                {bulkResumeBusy ? "恢复处理中..." : "恢复最近失败任务"}
+              </button>
+              <button
+                className={menuItemClass}
+                disabled={bulkControlBusy !== null}
+                onClick={() => void controlAllTasks("resume")}
+              >
+                {bulkControlBusy === "resume" ? "恢复中..." : "恢复全部已停止任务"}
+              </button>
+              <button
+                className={menuItemClass + " text-rose-700 dark:text-rose-300"}
+                disabled={bulkControlBusy !== null}
+                onClick={() => void controlAllTasks("stop")}
+              >
+                {bulkControlBusy === "stop" ? "停止中..." : "停止全部可停止任务"}
+              </button>
+            </MoreMenu>
+            <Link to="/tasks/new" className="rounded-md bg-slate-900 px-3 py-2 text-sm text-white hover:bg-slate-800 dark:bg-slate-100 dark:text-slate-950">
               新建任务
             </Link>
           </>
@@ -392,9 +407,20 @@ export default function TasksPage() {
                         </Link>
                         <div className="text-xs text-slate-500">{task.source_type} · {new Date(task.created_at).toLocaleString()}</div>
                         <div className="break-all text-xs text-slate-600">{task.source_url ?? "-"}</div>
-                        {task.error_message ? (
-                          <details className="text-xs text-rose-700"><summary>查看错误</summary><div className="mt-1 whitespace-pre-wrap break-words">{task.error_message}</div></details>
-                        ) : null}
+                        {task.error_message ? (() => {
+                          const presentation = presentTaskError(task.error_message, task.error_code);
+                          return (
+                            <div className="space-y-2">
+                              <div className="text-xs text-rose-700 dark:text-rose-300">
+                                <span className="font-medium">{presentation?.title ?? "任务执行失败"}</span>
+                                {presentation?.detail ? <span className="ml-1 text-slate-500 dark:text-slate-400">{presentation.detail}</span> : null}
+                              </div>
+                              <TechnicalDetails>
+                                <div className="whitespace-pre-wrap break-words font-mono">{task.error_message}</div>
+                              </TechnicalDetails>
+                            </div>
+                          );
+                        })() : null}
                         <div className="flex flex-wrap gap-2 pt-1">
                           <Link className="rounded border px-3 py-2 text-xs" to={`/tasks/${task.id}`}>详情</Link>
                           {task.status === "FAILED" ? <Button size="xs" disabled={isBusy} onClick={() => resumeSubtitle(task)}>继续字幕</Button> : null}
@@ -448,14 +474,19 @@ export default function TasksPage() {
                           ) : null}
                           <div className="text-xs text-slate-500">{task.source_type}</div>
                           <div className="max-w-[34rem] truncate text-xs text-slate-700">{task.source_url ?? "-"}</div>
-                          {task.error_message ? (
-                            <details className="mt-1 max-w-[34rem] text-xs text-rose-700">
-                              <summary className="cursor-pointer truncate" title={task.error_message}>
-                                {task.error_message}
-                              </summary>
-                              <div className="mt-1 whitespace-pre-wrap break-words rounded-md bg-rose-50 p-2">{task.error_message}</div>
-                            </details>
-                          ) : null}
+                          {task.error_message ? (() => {
+                            const presentation = presentTaskError(task.error_message, task.error_code);
+                            return (
+                              <div className="mt-1 max-w-[34rem]">
+                                <div className="truncate text-xs text-rose-700 dark:text-rose-300" title={presentation?.detail}>
+                                  {presentation?.title ?? "任务执行失败"}
+                                </div>
+                                <TechnicalDetails className="mt-1">
+                                  <div className="whitespace-pre-wrap break-words font-mono">{task.error_message}</div>
+                                </TechnicalDetails>
+                              </div>
+                            );
+                          })() : null}
                         </td>
                         <td>
                           <div className="text-xs text-slate-700">{new Date(task.created_at).toLocaleString()}</div>

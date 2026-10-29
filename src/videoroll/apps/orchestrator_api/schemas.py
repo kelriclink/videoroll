@@ -103,7 +103,7 @@ class SubtitleActionRequest(BaseModel):
     prefer_youtube_subtitles: bool = True
     youtube_subtitle_mode: Literal["off", "target", "auto_source"] = "target"
     translate_enabled: bool = False
-    translate_provider: str = "mock"
+    translate_provider: str = "openai"
     translate_model_provider_id: str = "legacy"
     translate_model_id: str = ""
     target_lang: str = "zh"

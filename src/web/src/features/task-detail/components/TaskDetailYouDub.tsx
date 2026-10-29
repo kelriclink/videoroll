@@ -5,6 +5,8 @@ import { orchestratorUrl } from "../../../lib/urls";
 import { tasksApi } from "../../../api/tasks";
 import { createYouDubOperationKey } from "../../../lib/dubbingOperationKey";
 import type { Asset, DubbingJob, SubtitleJob, Task } from "../../../lib/types";
+import { InlineNotice, TechnicalDetails } from "../../../components/ui";
+import { presentTaskError } from "../../../lib/taskPresentation";
 
 type NativeControl = {
   installed: boolean; enabled: boolean; accepting_jobs: boolean;
@@ -136,7 +138,12 @@ export function TaskDetailDubbing({
           {stage.status === "running" && typeof stage.progress === "number" ? ` ${stage.progress}%` : ""}
         </span>)}
       </div> : null}
-      {job.error_message ? <p className="break-all text-xs text-rose-700">{job.error_message}</p> : null}
+      {job.error_message ? (
+        <InlineNotice title={presentTaskError(job.error_message)?.title ?? "配音执行失败"} tone="danger">
+          {presentTaskError(job.error_message)?.detail ?? "配音任务没有完成。"}
+          <TechnicalDetails className="mt-2"><div className="break-all font-mono">{job.error_message}</div></TechnicalDetails>
+        </InlineNotice>
+      ) : null}
       <div className="flex flex-wrap gap-2">
         {video ? <a className="rounded border px-3 py-2 text-sm" href={tasksApi.assetDownloadUrl(taskId, video.id)}>下载配音 MP4</a> : null}
         {audio ? <a className="rounded border px-3 py-2 text-sm" href={tasksApi.assetDownloadUrl(taskId, audio.id)}>下载中文 WAV</a> : null}
@@ -150,7 +157,7 @@ export function TaskDetailDubbing({
     </div>;
   };
 
-  return <section className="space-y-4 rounded border bg-white p-4 text-slate-900">
+  return <section className="space-y-4 rounded border border-slate-200 bg-white p-4 text-slate-900 dark:border-slate-800 dark:bg-slate-950 dark:text-slate-100">
     <div className="flex items-center justify-between gap-3">
       <div>
         <h3 className="font-semibold text-lg">YouDub · 原生中文配音</h3>
@@ -182,7 +189,11 @@ export function TaskDetailDubbing({
     <button type="button" onClick={() => { void refresh(); void refreshAssets(); }}
       disabled={busy} className="ml-2 rounded border px-4 py-2 text-sm">刷新状态</button>
     {!ready && <p className="text-sm text-amber-700">先在「引擎管理」中启用 YouDub，并确保配音任务 Worker 正常运行。</p>}
-    {error && <p role="alert" className="text-sm text-rose-700 break-all">{error}</p>}
+    {error ? (
+      <InlineNotice title="配音操作失败" tone="danger">
+        <TechnicalDetails className="mt-2"><div className="break-all font-mono">{error}</div></TechnicalDetails>
+      </InlineNotice>
+    ) : null}
     {notice && <p className="text-sm text-emerald-700">{notice}</p>}
     {latest && <div className="space-y-2">
       <h4 className="font-semibold">当前配音任务</h4>

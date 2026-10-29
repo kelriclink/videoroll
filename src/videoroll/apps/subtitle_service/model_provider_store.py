@@ -51,23 +51,40 @@ def _safe(item: dict[str, Any]) -> dict[str, Any]:
         "base_url": item["base_url"],
         "api_type": item.get("api_type", "openai"),
         "api_key_set": bool(item.get("api_key_enc")),
-        "models": list(item.get("models", [])),
+        "models": [_model(model) for model in item.get("models", [])],
         "timeout_seconds": item.get("timeout_seconds", 180),
         "max_retries": item.get("max_retries", 3),
+        "kind": "custom",
+        "editable": True,
+        "deletable": True,
+        "supports_remote_catalog": True,
+        "options": {},
     }
 
 
 def list_providers(db: Session, legacy: dict[str, Any]) -> list[dict[str, Any]]:
-    virtual = {
+    compatibility_provider = {
         "id": LEGACY_ID,
-        "name": "现有 OpenAI 配置",
+        "name": "OpenAI 兼容（内建）",
         "base_url": legacy["openai_base_url"],
         "api_type": legacy.get("openai_api_type", "openai"),
         "api_key_set": bool(legacy.get("openai_api_key_set")),
-        "models": [{"id": legacy["openai_model"], "context_window": None,
-                    "max_output_tokens": None, "temperature": legacy.get("openai_temperature", 0.2)}],
+        "models": [{
+            "id": legacy["openai_model"],
+            "context_window": None,
+            "max_output_tokens": None,
+            "temperature": legacy.get("openai_temperature", 0.2),
+            "enable_thinking": bool(legacy.get("openai_enable_thinking", False)),
+            "reasoning_effort": legacy.get("cerebras_reasoning_effort", "medium"),
+            "reasoning_format": legacy.get("cerebras_reasoning_format", "parsed"),
+        }],
         "timeout_seconds": legacy.get("openai_timeout_seconds", 180),
         "max_retries": legacy.get("openai_max_retries", 3),
+        "kind": "compatibility",
+        "editable": True,
+        "deletable": False,
+        "supports_remote_catalog": False,
+        "options": {},
     }
     index_provider = {
         "id": INDEX_ID,
@@ -82,11 +99,23 @@ def list_providers(db: Session, legacy: dict[str, Any]) -> list[dict[str, Any]]:
             "temperature": float(legacy.get("index_temperature") if legacy.get("index_temperature") is not None else 0),
             "enable_thinking": False,
             "reasoning_effort": "medium",
+            "reasoning_format": "hidden",
         }],
         "timeout_seconds": legacy.get("index_timeout_seconds", 120),
         "max_retries": legacy.get("default_max_retries", 2),
+        "kind": "builtin",
+        "editable": True,
+        "deletable": False,
+        "supports_remote_catalog": False,
+        "options": {
+            "batch_size": int(legacy.get("index_batch_size") or 12),
+            "context_chars": int(legacy.get("index_context_chars") or 6000),
+            "domain": str(legacy.get("index_domain") or "视频字幕"),
+            "glossary": str(legacy.get("index_glossary") or ""),
+            "instruction": str(legacy.get("index_instruction") or ""),
+        },
     }
-    return [virtual, index_provider] + [_safe(row) for row in _rows(db)]
+    return [compatibility_provider, index_provider] + [_safe(row) for row in _rows(db)]
 
 
 def _model(item: dict[str, Any]) -> dict[str, Any]:
@@ -104,10 +133,13 @@ def _model(item: dict[str, Any]) -> dict[str, Any]:
     effort = str(item.get("reasoning_effort") or "medium")
     if effort not in {"low", "medium", "high"}:
         raise ValueError("推理强度只能是 low、medium 或 high")
+    reasoning_format = str(item.get("reasoning_format") or "parsed")
+    if reasoning_format not in {"parsed", "raw", "hidden"}:
+        raise ValueError("推理输出格式只能是 parsed、raw 或 hidden")
     return {"id": model_id, "context_window": context,
             "max_output_tokens": output, "temperature": temperature,
             "enable_thinking": bool(item.get("enable_thinking", False)),
-            "reasoning_effort": effort}
+            "reasoning_effort": effort, "reasoning_format": reasoning_format}
 
 
 def save_provider(db: Session, provider_id: str | None, values: dict[str, Any]) -> dict[str, Any]:
@@ -189,6 +221,7 @@ def resolve_provider_settings(
         "openai_max_retries": provider.get("max_retries", 3),
         "openai_enable_thinking": bool(model.get("enable_thinking", False)),
         "cerebras_reasoning_effort": model.get("reasoning_effort", "medium"),
+        "cerebras_reasoning_format": model.get("reasoning_format", "parsed"),
         "model_context_window": model.get("context_window"),
         "max_output_tokens": model.get("max_output_tokens"),
     })

@@ -401,11 +401,11 @@ export default function SettingsASRPage() {
               <div className="mt-1 font-mono text-[11px] text-slate-400">SUBTITLE_ASR_ENGINE</div>
             </div>
             <div className="rounded border p-3">
-              <div className="text-xs text-slate-500">faster-whisper Runtime</div>
+              <div className="text-xs text-slate-500">faster-whisper 运行时</div>
               <div className={["mt-1 text-sm font-medium", settings.faster_whisper_installed ? "text-emerald-700" : "text-rose-700"].join(" ")}>{settings.faster_whisper_installed ? "已安装" : "未安装"}</div>
             </div>
             <div className="rounded border p-3">
-              <div className="text-xs text-slate-500">OpenVINO GenAI Runtime</div>
+              <div className="text-xs text-slate-500">OpenVINO GenAI 运行时</div>
               <div className={["mt-1 text-sm font-medium", settings.openvino_installed ? "text-emerald-700" : "text-rose-700"].join(" ")}>{settings.openvino_installed ? "已安装" : "未安装"}</div>
             </div>
             <div className="rounded border p-3">

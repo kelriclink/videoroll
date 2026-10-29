@@ -1,8 +1,11 @@
 import type { TaskDetailController } from "../useTaskDetailController";
 import { Link } from "react-router-dom";
 import { ModelChoiceSelect } from "../../../components/ModelChoiceSelect";
-import { normalizeYouTubeSubtitleMode, clampText } from "../utils";
+import { normalizeYouTubeSubtitleMode } from "../utils";
 import { SubtitleQualityContextPanel } from "./SubtitleQualityContextPanel";
+import { TechnicalDetails } from "../../../components/ui";
+import { jobStatusLabel } from "../../../lib/executionPresentation";
+import { presentTaskError } from "../../../lib/taskPresentation";
 export function TaskDetailSubtitle({ controller }: { controller: TaskDetailController }) {
   const {
     task,
@@ -333,23 +336,24 @@ export function TaskDetailSubtitle({ controller }: { controller: TaskDetailContr
                 <thead className="text-xs text-slate-500">
                   <tr>
                     <th className="py-2 pr-3">ID</th>
-                    <th className="py-2 pr-3">Status</th>
-                    <th className="py-2 pr-3">Progress</th>
-                    <th className="py-2 pr-3">Error</th>
-                    <th className="py-2 pr-3">Updated</th>
+                    <th className="py-2 pr-3">状态</th>
+                    <th className="py-2 pr-3">进度</th>
+                    <th className="py-2 pr-3">异常</th>
+                    <th className="py-2 pr-3">更新时间</th>
                   </tr>
                 </thead>
                 <tbody>
                   {subtitleJobs.map((j) => (
                     <tr key={j.id} className="border-t">
                       <td className="py-2 pr-3 font-mono text-xs">{j.id.slice(0, 8)}</td>
-                      <td className="py-2 pr-3">{j.status}</td>
+                      <td className="py-2 pr-3">{jobStatusLabel(j.status)}</td>
                       <td className="py-2 pr-3">{j.progress}%</td>
-                      <td
-                        className={`py-2 pr-3 text-xs ${j.error_message ? "max-w-[360px] truncate text-rose-700" : "text-slate-400"}`}
-                        title={j.error_message ?? ""}
-                      >
-                        {j.error_message ? clampText(j.error_message, 160) : "—"}
+                      <td className="py-2 pr-3 text-xs">
+                        {j.error_message ? (
+                          <TechnicalDetails summary={presentTaskError(j.error_message)?.title ?? "执行异常"}>
+                            <div className="max-w-[360px] whitespace-pre-wrap break-words font-mono">{j.error_message}</div>
+                          </TechnicalDetails>
+                        ) : <span className="text-slate-400">—</span>}
                       </td>
                       <td className="py-2 pr-3 text-xs text-slate-600">{new Date(j.updated_at).toLocaleString()}</td>
                     </tr>

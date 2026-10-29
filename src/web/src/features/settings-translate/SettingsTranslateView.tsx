@@ -1,6 +1,5 @@
 import { SettingsTranslateActions } from "./components/SettingsTranslateActions";
 import { SettingsTranslateHeader } from "./components/SettingsTranslateHeader";
-import { SettingsTranslateSummary } from "./components/SettingsTranslateSummary";
 import { SettingsTranslateTabs } from "./components/SettingsTranslateTabs";
 import { EmbeddingTab } from "./components/EmbeddingTab";
 import { RagTab } from "./components/RagTab";
@@ -13,9 +12,13 @@ export function SettingsTranslateView({ controller }: { controller: SettingsTran
   return (
     <div className="space-y-4">
       <SettingsTranslateHeader controller={controller} />
-      <SettingsTranslateSummary controller={controller} />
       <SettingsTranslateTabs controller={controller} />
-      {controller.activeTab === "translation" ? <><ModelProvidersWorkspace /><TranslationTab controller={controller} /></> : null}
+      {controller.activeTab === "translation" ? (
+        <>
+          <ModelProvidersWorkspace />
+          <TranslationTab controller={controller} />
+        </>
+      ) : null}
       {controller.activeTab === "rag" ? <RagTab controller={controller} /> : null}
       {controller.activeTab === "embedding" ? <EmbeddingTab controller={controller} /> : null}
       {controller.activeTab === "test" ? <TranslationTestTab controller={controller} /> : null}

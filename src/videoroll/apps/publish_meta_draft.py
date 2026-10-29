@@ -20,7 +20,7 @@ from videoroll.apps.subtitle_service.auto_profile_store import get_auto_profile
 from videoroll.apps.subtitle_service.bilibili_tags_store import get_task_bilibili_summary
 from videoroll.apps.subtitle_service.task_title_store import get_task_titles
 from videoroll.apps.subtitle_service.translate_settings_store import get_translate_settings
-from videoroll.apps.subtitle_service.translation_runtime import resolve_translation_runtime
+from videoroll.apps.subtitle_service.translation_runtime import resolve_profile_translation_runtime
 from videoroll.config import get_subtitle_settings
 from videoroll.db.models import Asset, AssetKind, Task
 from videoroll.storage.filesystem import FileStore, StorageObjectNotFound
@@ -217,14 +217,10 @@ def build_task_publish_meta_draft(
 
     profile = get_auto_profile(db)
     legacy_translate_settings = get_translate_settings(db, get_subtitle_settings())
-    runtime = resolve_translation_runtime(
+    runtime = resolve_profile_translation_runtime(
         db,
         legacy_translate_settings,
-        provider=profile.get("translate_provider")
-        or legacy_translate_settings.get("default_provider")
-        or "openai",
-        model_provider_id=profile.get("translate_model_provider_id"),
-        model_id=profile.get("translate_model_id"),
+        profile,
     )
     translate_settings = runtime.settings
     ai_service = AIService(lambda: dict(runtime.settings))

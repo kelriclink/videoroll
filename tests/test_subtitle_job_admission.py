@@ -328,3 +328,10 @@ def test_subtitle_relay_preserves_a_conflict_detected_by_the_internal_api() -> N
 
     assert caught.value.status_code == 409
     assert caught.value.detail == "task is already published"
+
+
+
+def test_subtitle_action_request_defaults_to_real_translation_provider() -> None:
+    request = SubtitleActionRequest()
+    assert request.translate_provider == "openai"
+    assert request.translate_enabled is False

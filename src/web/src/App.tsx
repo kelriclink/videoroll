@@ -83,16 +83,8 @@ function NavGroup({
 }
 
 function Navigation({ onNavigate }: { onNavigate?: () => void }) {
-  const location = useLocation();
-  const settingsActive = location.pathname.startsWith("/settings/");
-  const [settingsOpen, setSettingsOpen] = useState(settingsActive);
-
-  useEffect(() => {
-    if (settingsActive) setSettingsOpen(true);
-  }, [settingsActive]);
-
   return (
-    <nav className="space-y-3" aria-label="主导航">
+    <nav className="space-y-4" aria-label="主导航">
       <Link
         to="/tasks/new"
         onClick={onNavigate}
@@ -100,31 +92,28 @@ function Navigation({ onNavigate }: { onNavigate?: () => void }) {
       >
         ＋ 新建任务
       </Link>
-      <NavGroup title="工作台">
+
+      <NavGroup title="生产">
         <NavItem to="/" label="工作台" onNavigate={onNavigate} />
         <NavItem to="/tasks" label="任务" onNavigate={onNavigate} />
         <NavItem to="/videos" label="视频成品" onNavigate={onNavigate} />
-        <NavItem to="/playout" label="播控中心" onNavigate={onNavigate} />
-        <NavItem to="/workflow" label="工作流中心" onNavigate={onNavigate} />
-        <NavItem to="/queue/render" label="处理队列" onNavigate={onNavigate} />
-        <NavItem to="/render" label="渲染管理" onNavigate={onNavigate} />
-        <NavItem to="/knowledge" label="知识库" onNavigate={onNavigate} />
-        <NavItem to="/dictionaries" label="词典" onNavigate={onNavigate} />
-        <NavItem to="/operations" label="运维中心" onNavigate={onNavigate} />
-      </NavGroup>
-      <NavGroup title="来源">
         <NavItem to="/youtube/sources" label="YouTube 来源" onNavigate={onNavigate} />
       </NavGroup>
-      <NavGroup title="配置" collapsible open={settingsOpen} onToggle={() => setSettingsOpen((value) => !value)}>
-        <NavItem to="/settings/auto" label="自动模式" onNavigate={onNavigate} />
-        <NavItem to="/settings/dubbing" label="中文配音 / 模型" onNavigate={onNavigate} />
-        <NavItem to="/settings/youtube" label="YouTube" onNavigate={onNavigate} />
-        <NavItem to="/settings/publish" label="投稿设置" onNavigate={onNavigate} />
-        <NavItem to="/settings/asr" label="ASR" onNavigate={onNavigate} />
-        <NavItem to="/settings/translate" label="翻译 / RAG" onNavigate={onNavigate} />
-        <NavItem to="/settings/review" label="审核" onNavigate={onNavigate} />
-        <NavItem to="/settings/storage" label="存储" onNavigate={onNavigate} />
-        <NavItem to="/settings/api" label="API" onNavigate={onNavigate} />
+
+      <NavGroup title="制作">
+        <NavItem to="/queue/render" label="处理队列" onNavigate={onNavigate} />
+        <NavItem to="/render" label="渲染节点" onNavigate={onNavigate} />
+        <NavItem to="/playout" label="播控" onNavigate={onNavigate} />
+      </NavGroup>
+
+      <NavGroup title="内容">
+        <NavItem to="/knowledge" label="知识库" onNavigate={onNavigate} />
+        <NavItem to="/dictionaries" label="词典" onNavigate={onNavigate} />
+      </NavGroup>
+
+      <NavGroup title="系统">
+        <NavItem to="/operations" label="运维" onNavigate={onNavigate} />
+        <NavItem to="/settings" label="设置" onNavigate={onNavigate} />
       </NavGroup>
     </nav>
   );

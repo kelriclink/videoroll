@@ -119,7 +119,6 @@ export default function SettingsAutoPage() {
   const [busy, setBusy] = useState(false);
 
   const [whisperModels, setWhisperModels] = useState<Array<{ name: string; path: string }> | null>(null);
-  const [openaiKeySet, setOpenaiKeySet] = useState<boolean | null>(null);
 
   const [formats, setFormats] = useState<{ srt: boolean; ass: boolean }>({ srt: true, ass: true });
   const [burnIn, setBurnIn] = useState(true);
@@ -164,17 +163,15 @@ export default function SettingsAutoPage() {
   async function refresh() {
     setError(null);
     try {
-      const [profile, models, translateSettings, platformSettingsResp, providerRows] = await Promise.all([
+      const [profile, models, platformSettingsResp, providerRows] = await Promise.all([
         fetchJson<AutoProfile>(`${ORCHESTRATOR_URL}/subtitle/auto/profile`),
         fetchJson<Array<{ name: string; path: string }>>(`${ORCHESTRATOR_URL}/subtitle/models`).catch(() => null),
-        fetchJson<{ openai_api_key_set: boolean }>(`${ORCHESTRATOR_URL}/subtitle/translate/settings`).catch(() => null),
         fetchJson<{ platforms: Record<string, boolean> }>(`${ORCHESTRATOR_URL}/settings/publish/platforms`).catch(() => null),
         translateApi.modelProviders().catch(() => []),
       ]);
 
       if (models) setWhisperModels(models);
       setModelProviders(providerRows);
-      if (translateSettings) setOpenaiKeySet(Boolean(translateSettings.openai_api_key_set));
       let enabledPlatformIds: PublishPlatform[] | null = null;
       if (platformSettingsResp?.platforms) {
         enabledPlatformIds = PUBLISH_PLATFORMS.filter(({ id }) => platformSettingsResp.platforms[id] === true).map(({ id }) => id);
@@ -409,14 +406,14 @@ export default function SettingsAutoPage() {
   return (
     <div className="space-y-4">
       <div className="px-1">
-        <h2 className="text-xl font-semibold tracking-tight text-slate-950">自动模式</h2>
-        <div className="mt-1 text-sm text-slate-600">用于 “YouTube 自动模式” 的默认参数（下载→字幕/翻译→烧录→投稿）。</div>
+        <h2 className="text-xl font-semibold tracking-tight text-slate-950 dark:text-white">自动处理</h2>
+        <div className="mt-1 text-sm text-slate-600">定义新建自动任务的处理策略：获取素材 → 字幕与翻译 → 视频生成 → 发布。</div>
         {error ? <div className="mt-3 text-sm text-rose-700">{error}</div> : null}
       </div>
 
       <div className="vr-section">
         <div className="flex items-center justify-between gap-2">
-          <div className="text-sm font-semibold">Subtitle</div>
+          <div className="text-sm font-semibold">字幕与视频</div>
           <button onClick={() => refresh()} className="rounded border px-3 py-2 text-sm hover:bg-slate-50">
             刷新
           </button>
@@ -599,7 +596,7 @@ export default function SettingsAutoPage() {
           </div>
 
           <div className="rounded border p-3">
-            <div className="text-xs text-slate-500">翻译（可选：mock/noop/openai）</div>
+            <div className="text-xs text-slate-500">翻译</div>
             <div className="mt-2 flex items-center gap-3 text-sm">
               <label className="block min-w-64">
                 <div className="mb-1 text-xs text-slate-600">YouTube 字幕复用</div>
@@ -628,12 +625,13 @@ export default function SettingsAutoPage() {
                 <input className="w-full rounded border px-3 py-2 text-sm" value={targetLang} onChange={(e) => setTargetLang(e.target.value)} />
               </label>
               <label className="block">
-                <div className="mb-1 text-xs text-slate-600">翻译 Provider</div>
+                <div className="mb-1 text-xs text-slate-600">翻译方式</div>
                 <select className="w-full rounded border px-3 py-2 text-sm" value={translateProvider} onChange={(e) => setTranslateProvider(e.target.value)}>
-                  <option value="mock">mock</option>
-                  <option value="noop">noop</option>
-                  <option value="openai">OpenAI</option>
-                  <option value="index_translate">Index-Translate 免费 API</option>
+                  {!["openai", "index_translate"].includes(translateProvider) ? (
+                    <option value={translateProvider}>开发兼容配置：{translateProvider}</option>
+                  ) : null}
+                  <option value="openai">模型服务</option>
+                  <option value="index_translate">Index-Translate 官方免费服务</option>
                 </select>
               </label>
 
@@ -659,7 +657,7 @@ export default function SettingsAutoPage() {
                   onChange={(e) => setTranslateEnableSummary(e.target.checked)}
                   disabled={translateProvider !== "openai"}
                 />
-                启用动态摘要上下文（仅 OpenAI）
+                在长视频批次之间保留摘要上下文
               </label>
 
               <div className="lg:col-span-2 text-xs text-slate-500">
@@ -670,11 +668,7 @@ export default function SettingsAutoPage() {
                     : "逻辑：优先找 `target_lang` 对应的 YouTube 字幕；命中后直接复用并跳过翻译；如果没有可用目标字幕，再回退到 ASR。"}
               </div>
 
-              {translateEnabled && translateProvider === "openai" && openaiKeySet === false ? (
-                <div className="lg:col-span-2 text-xs text-rose-700">
-                  OpenAI API Key 未设置，请先到 <Link className="underline" to="/settings/translate">翻译 / RAG 设置</Link> 保存配置。
-                </div>
-              ) : null}
+
             </div>
           </div>
 
@@ -684,13 +678,13 @@ export default function SettingsAutoPage() {
               <label className="block">
                 <div className="mb-1 text-xs text-slate-600">ASR 引擎</div>
                 <select className="w-full rounded border px-3 py-2 text-sm" value={asrEngine} onChange={(e) => setAsrEngine(e.target.value)}>
-                  <option value="auto">auto（使用后端默认）</option>
-                  <option value="mock">mock</option>
+                  <option value="auto">使用系统默认</option>
+                  {asrEngine === "mock" ? <option value="mock">开发兼容配置：mock</option> : null}
                   <option value="faster-whisper">faster-whisper</option>
-                  <option value="openvino">openvino（方案2 / Intel Arc）</option>
-                  <option value="external-whisper">在线 Whisper（自建 faster-whisper）</option>
-                  <option value="groq-whisper">groq-whisper（GroqCloud，自动切片）</option>
-                  <option value="cloudflare-workers-ai">cloudflare-workers-ai（原生时间轴）</option>
+                  <option value="openvino">OpenVINO（Intel）</option>
+                  <option value="external-whisper">OpenAI 兼容 Whisper 服务</option>
+                  <option value="groq-whisper">GroqCloud Whisper</option>
+                  <option value="cloudflare-workers-ai">Cloudflare Workers AI</option>
                 </select>
               </label>
               <label className="block">
@@ -700,7 +694,7 @@ export default function SettingsAutoPage() {
               <label className="block lg:col-span-2">
                 <div className="mb-1 text-xs text-slate-600">ASR 模型（可选）</div>
                 <select className="w-full rounded border px-3 py-2 text-sm" value={asrModel} onChange={(e) => setAsrModel(e.target.value)}>
-                  <option value="">(use default)</option>
+                  <option value="">使用引擎默认模型</option>
                   {asrEngine === "cloudflare-workers-ai" ? (
                     <option value="@cf/openai/whisper-large-v3-turbo">@cf/openai/whisper-large-v3-turbo</option>
                   ) : null}
@@ -792,12 +786,12 @@ export default function SettingsAutoPage() {
                 <option value="bilibili_predict">B站预测（标题/文件）</option>
                 <option value="meta">手动（使用投稿设置里的 meta.typeid）</option>
               </select>
-              {publishTypeidMode === "ai_summary" && (!translateEnableSummary || translateProvider !== "openai" || openaiKeySet === false) ? (
-                <div className="mt-2 text-xs text-rose-700">
-                  提示：AI 分区需要启用 OpenAI summary，并在 翻译 / RAG 设置 保存 OpenAI API Key；否则会回退到 B 站预测/手动分区。
+              {publishTypeidMode === "ai_summary" && (!translateEnableSummary || translateProvider !== "openai") ? (
+                <div className="mt-2 text-xs text-amber-700 dark:text-amber-300">
+                  AI 分区需要启用摘要上下文，并使用“模型服务”翻译方式；否则投稿时会安全回退到平台预测或手动分区。
                 </div>
               ) : (
-                <div className="mt-2 text-xs text-slate-500">AI 分区会在投稿时自动拉取可用分区列表，让 AI 从候选中选择一个 typeid。</div>
+                <div className="mt-2 text-xs text-slate-500">AI 分区会使用自动处理当前选中的模型服务，从平台候选分区中选择一个结果。</div>
               )}
             </label>
             <label className="flex items-center gap-2 text-sm">

@@ -164,8 +164,8 @@ def test_publish_meta_draft_resolves_selected_model_provider(monkeypatch: pytest
     monkeypatch.setattr(module, "get_translate_settings", lambda *_args: legacy)
     monkeypatch.setattr(module, "get_subtitle_settings", lambda: SimpleNamespace())
 
-    def resolve_runtime(_db, _legacy, **selection):
-        captured["selection"] = selection
+    def resolve_runtime(_db, _legacy, selected_profile):
+        captured["profile"] = dict(selected_profile)
         return SimpleNamespace(settings=runtime_settings)
 
     class FakeAIService:
@@ -177,7 +177,7 @@ def test_publish_meta_draft_resolves_selected_model_provider(monkeypatch: pytest
         captured["ai_service"] = kwargs["ai_service"]
         return meta
 
-    monkeypatch.setattr(module, "resolve_translation_runtime", resolve_runtime)
+    monkeypatch.setattr(module, "resolve_profile_translation_runtime", resolve_runtime)
     monkeypatch.setattr(module, "AIService", FakeAIService)
     monkeypatch.setattr(module, "apply_publish_source_overrides", apply_overrides)
 
@@ -188,11 +188,7 @@ def test_publish_meta_draft_resolves_selected_model_provider(monkeypatch: pytest
     )
 
     assert result == {"title": ""}
-    assert captured["selection"] == {
-        "provider": "openai",
-        "model_provider_id": "provider-x",
-        "model_id": "model-x",
-    }
+    assert captured["profile"] == profile
     assert captured["translate_settings"] is runtime_settings
     assert captured["service_settings"] == runtime_settings
 

@@ -8,6 +8,7 @@ export type ProviderModel = {
   temperature: number | null;
   enable_thinking: boolean;
   reasoning_effort: "low" | "medium" | "high";
+  reasoning_format: "parsed" | "raw" | "hidden";
 };
 export type ModelProvider = {
   id: string;
@@ -18,8 +19,16 @@ export type ModelProvider = {
   models: ProviderModel[];
   timeout_seconds: number;
   max_retries: number;
+  kind: "builtin" | "compatibility" | "custom";
+  editable: boolean;
+  deletable: boolean;
+  supports_remote_catalog: boolean;
+  options: Record<string, unknown>;
 };
-export type ModelProviderDraft = Omit<ModelProvider, "id" | "api_key_set"> & { api_key?: string | null };
+export type ModelProviderDraft = Pick<
+  ModelProvider,
+  "name" | "base_url" | "api_type" | "models" | "timeout_seconds" | "max_retries" | "options"
+> & { api_key?: string | null };
 
 export type TranslateSettings = {
   default_provider: string;

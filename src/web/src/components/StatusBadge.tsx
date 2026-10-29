@@ -1,27 +1,22 @@
-import { TaskStatus } from "../lib/types";
+import { taskPresentation, type TaskTone } from "../lib/taskPresentation";
+import type { TaskStatus } from "../lib/types";
 
-const colors: Record<string, string> = {
-  CREATED: "bg-slate-100 text-slate-700",
-  INGESTED: "bg-sky-100 text-sky-800",
-  DOWNLOADED: "bg-sky-100 text-sky-800",
-  AUDIO_EXTRACTED: "bg-sky-100 text-sky-800",
-  ASR_DONE: "bg-indigo-100 text-indigo-800",
-  TRANSLATED: "bg-indigo-100 text-indigo-800",
-  SUBTITLE_READY: "bg-indigo-100 text-indigo-800",
-  RENDERED: "bg-emerald-100 text-emerald-800",
-  READY_FOR_REVIEW: "bg-amber-100 text-amber-900",
-  APPROVED: "bg-amber-100 text-amber-900",
-  PUBLISHING: "bg-fuchsia-100 text-fuchsia-800",
-  PUBLISHED: "bg-emerald-100 text-emerald-800",
-  FAILED: "bg-rose-100 text-rose-800",
-  CANCELED: "bg-slate-100 text-slate-700",
+const colors: Record<TaskTone, string> = {
+  neutral: "bg-slate-100 text-slate-700 dark:bg-slate-800 dark:text-slate-300",
+  info: "bg-sky-100 text-sky-800 dark:bg-sky-950/50 dark:text-sky-300",
+  warning: "bg-amber-100 text-amber-900 dark:bg-amber-950/50 dark:text-amber-300",
+  danger: "bg-rose-100 text-rose-800 dark:bg-rose-950/50 dark:text-rose-300",
+  success: "bg-emerald-100 text-emerald-800 dark:bg-emerald-950/50 dark:text-emerald-300",
 };
 
-const labels: Record<string, string> = {
-  CANCELED: "已停止",
-};
-
-export default function StatusBadge({ status }: { status: TaskStatus | string }) {
-  const cls = colors[status] ?? "bg-slate-100 text-slate-700";
-  return <span className={`inline-flex rounded px-2 py-0.5 text-xs font-medium ${cls}`}>{labels[status] ?? status}</span>;
+export default function StatusBadge({ status, compact = false }: { status: TaskStatus | string; compact?: boolean }) {
+  const presentation = taskPresentation(status);
+  return (
+    <span
+      title={presentation.label}
+      className={`inline-flex rounded px-2 py-0.5 text-xs font-medium ${colors[presentation.tone]}`}
+    >
+      {compact ? presentation.shortLabel : presentation.label}
+    </span>
+  );
 }

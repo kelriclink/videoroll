@@ -44,6 +44,8 @@ from videoroll.db.session import get_sessionmaker
 from videoroll.storage.filesystem import FileStore
 from videoroll.apps.subtitle_service.bilibili_tags_store import get_task_bilibili_summary
 from videoroll.apps.subtitle_service.translate_settings_store import get_translate_settings
+from videoroll.apps.subtitle_service.auto_profile_store import get_auto_profile
+from videoroll.apps.subtitle_service.translation_runtime import resolve_profile_translation_runtime
 from videoroll.apps.youtube_meta_store import get_task_youtube_meta
 from videoroll.apps.bilibili_publisher.auto_dub_p2 import register_auto_dub_p2_task
 
@@ -70,19 +72,6 @@ _JOB_LEASE_TTL_SECONDS = 1800
 def _db() -> Session:
     SessionLocal = get_sessionmaker(settings.database_url)
     return SessionLocal()
-
-
-def _fresh_translate_settings() -> dict[str, Any]:
-    SessionLocal = get_sessionmaker(settings.database_url)
-    db = SessionLocal()
-    try:
-        return get_translate_settings(db, get_subtitle_settings())
-    finally:
-        db.close()
-
-
-def _ai_service() -> AIService:
-    return AIService(_fresh_translate_settings)
 
 
 def _ensure_db() -> None:
@@ -910,15 +899,20 @@ def _process_job_impl(self, job_id: str) -> dict[str, Any]:
                     text_for_ai = f"{meta.title}\n{meta.desc}".strip()
                     text_source = "meta"
 
-                translate_settings = get_translate_settings(db, get_subtitle_settings())
-                api_key = str(translate_settings.get("openai_api_key") or "").strip()
+                legacy_translate_settings = get_translate_settings(db, get_subtitle_settings())
+                profile = get_auto_profile(db)
+                runtime = resolve_profile_translation_runtime(
+                    db,
+                    legacy_translate_settings,
+                    profile,
+                )
                 ai_info["text_source"] = text_source
                 ai_info["text_chars"] = len(text_for_ai)
 
-                if not api_key:
-                    ai_info["reason"] = "openai api key not set"
-                elif not text_for_ai:
+                if not text_for_ai:
                     ai_info["reason"] = "text is empty"
+                elif runtime.provider != "openai":
+                    ai_info["reason"] = "selected translation provider does not support AI type recommendation"
                 else:
                     try:
                         pre = client.archive_pre()
@@ -930,7 +924,8 @@ def _process_job_impl(self, job_id: str) -> dict[str, Any]:
                             ai_info["reason"] = "bilibili typelist is empty"
                         else:
                             id_to_path = {int(o.get("id") or 0): str(o.get("path") or "").strip() for o in options}
-                            obj = _ai_service().recommend_typeid(
+                            ai_service = AIService(lambda: dict(runtime.settings))
+                            obj = ai_service.recommend_typeid(
                                 text_for_ai,
                                 options=options,
                             )

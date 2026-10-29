@@ -1,5 +1,6 @@
 import { useState } from "react";
-import { Button, PageHeader } from "../components/ui";
+import { Link } from "react-router-dom";
+import { Button, InlineNotice, PageHeader, TechnicalDetails } from "../components/ui";
 import { HATCHET_DASHBOARD_URL } from "../lib/urls";
 
 export default function WorkflowCenterPage() {
@@ -14,19 +15,30 @@ export default function WorkflowCenterPage() {
   return (
     <div className="flex h-full min-h-0 flex-col gap-4 overflow-hidden">
       <PageHeader
-        title="工作流中心"
-        description="Hatchet 原生工作流控制台：查看 Runs、Workers、Events、重试、日志与执行历史。"
+        title="工作流诊断（高级）"
+        description="用于排查执行器、工作流事件和底层重试。日常任务操作请使用“任务”和“处理队列”页面。"
         actions={
-          <Button disabled={!HATCHET_DASHBOARD_URL} onClick={openInNewWindow}>
-            新窗口打开
-          </Button>
+          <>
+            <Link
+              to="/operations"
+              className="rounded-lg border border-slate-300 px-3 py-2 text-sm text-slate-700 hover:bg-white dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-900"
+            >
+              返回运维
+            </Link>
+            <Button disabled={!HATCHET_DASHBOARD_URL} onClick={openInNewWindow}>
+              新窗口打开
+            </Button>
+          </>
         }
       />
 
       {!HATCHET_DASHBOARD_URL ? (
-        <div className="rounded-md border border-amber-200 bg-amber-50 p-4 text-sm text-amber-900">
-          尚未配置 Hatchet Dashboard 地址。构建 Web 时设置 <code>VITE_HATCHET_DASHBOARD_URL</code> 即可嵌入原生控制台。
-        </div>
+        <InlineNotice title="工作流诊断控制台未配置" tone="warning">
+          生产任务不受影响。需要底层执行诊断时，再配置 Hatchet Dashboard 地址。
+          <TechnicalDetails className="mt-2">
+            构建 Web 时设置 <code>VITE_HATCHET_DASHBOARD_URL</code>。
+          </TechnicalDetails>
+        </InlineNotice>
       ) : null}
 
       {error ? (

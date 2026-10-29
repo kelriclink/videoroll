@@ -517,7 +517,7 @@ export default function YouTubeSourcesPage() {
       </div>
 
       <div className="rounded border bg-white p-4 text-xs text-slate-600">
-        <div>提示：后台会按每个订阅源自己的扫描间隔自动拉取新视频；新任务仍可在 Tasks 里用 status=INGESTED 查看。</div>
+        <div>后台会按每个订阅源自己的扫描间隔自动拉取新视频；新发现的视频会出现在“任务”页面的等待处理列表中。</div>
       </div>
     </div>
   );
