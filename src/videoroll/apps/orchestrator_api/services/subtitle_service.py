@@ -37,9 +37,10 @@ from videoroll.db.models import (
     Task,
     TaskStatus,
 )
-from videoroll.storage.filesystem import FileStore
+from videoroll.storage.filesystem import FileStore, StorageObjectNotFound
 from videoroll.utils.auto_youtube import encode_auto_youtube_created_by
 from videoroll.utils.task_origin import is_auto_youtube_task
+from videoroll.workflows.execution_truth import active_subtitle_job_ids, render_job_is_live, subtitle_job_is_live
 
 
 _BROWSER_PROXY_PATHS: dict[str, set[str]] = {
@@ -162,6 +163,53 @@ def utcnow() -> datetime:
     return datetime.now(tz=timezone.utc)
 
 
+class ResumeRequestError(RuntimeError):
+    """Structured refusal to replay a historical subtitle request."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+def _resume_error_http(error: ResumeRequestError) -> HTTPException:
+    return HTTPException(
+        status_code=400,
+        detail={"code": error.code, "message": error.message},
+    )
+
+
+def _live_subtitle_job(db: Session, task_id: uuid.UUID) -> SubtitleJob | None:
+    jobs = (
+        db.query(SubtitleJob)
+        .filter(
+            SubtitleJob.task_id == task_id,
+            SubtitleJob.status.in_([SubtitleJobStatus.queued, SubtitleJobStatus.running]),
+        )
+        .order_by(SubtitleJob.created_at.desc())
+        .all()
+    )
+    if not jobs:
+        return None
+    active_ids = active_subtitle_job_ids(db, task_ids=[task_id])
+    now = utcnow()
+    return next((job for job in jobs if subtitle_job_is_live(job, active_ids, now=now)), None)
+
+
+def _live_render_job(db: Session, task_id: uuid.UUID) -> RenderJob | None:
+    jobs = (
+        db.query(RenderJob)
+        .filter(
+            RenderJob.task_id == task_id,
+            RenderJob.status.in_([RenderJobStatus.queued, RenderJobStatus.running]),
+        )
+        .order_by(RenderJob.created_at.desc())
+        .all()
+    )
+    now = utcnow()
+    return next((job for job in jobs if render_job_is_live(job, now=now)), None)
+
+
 def enqueue_subtitle_service_job_request(
     settings: OrchestratorSettings,
     request: dict[str, Any],
@@ -223,6 +271,7 @@ def build_resume_subtitle_request(
     task_id: uuid.UUID,
     db: Session,
     *,
+    store: FileStore | None = None,
     after_render: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     previous = (
@@ -232,13 +281,47 @@ def build_resume_subtitle_request(
         .first()
     )
     if not previous:
-        raise HTTPException(status_code=400, detail="no subtitle job found to resume")
+        raise ResumeRequestError("NO_SUBTITLE_JOB", "no subtitle job found to resume")
     request_in = previous.request_json if isinstance(previous.request_json, dict) else {}
     if not request_in:
-        raise HTTPException(status_code=400, detail="subtitle job request is empty")
+        raise ResumeRequestError("EMPTY_SUBTITLE_REQUEST", "subtitle job request is empty")
     request_out = dict(request_in)
     request_out["task_id"] = str(task_id)
     request_out["resume"] = True
+
+    if store is not None:
+        request_input = request_out.get("input") if isinstance(request_out.get("input"), dict) else {}
+        saved_key = str(request_input.get("key") or "").strip()
+        saved_input_exists = False
+        if saved_key:
+            try:
+                store.path_for(saved_key)
+                saved_input_exists = True
+            except (StorageObjectNotFound, ValueError):
+                saved_input_exists = False
+
+        if not saved_input_exists:
+            latest_raw = (
+                db.query(Asset)
+                .filter(Asset.task_id == task_id, Asset.kind == AssetKind.video_raw)
+                .order_by(Asset.created_at.desc())
+                .first()
+            )
+            replacement_key = str(latest_raw.storage_key or "").strip() if latest_raw is not None else ""
+            replacement_exists = False
+            if replacement_key:
+                try:
+                    store.path_for(replacement_key)
+                    replacement_exists = True
+                except (StorageObjectNotFound, ValueError):
+                    replacement_exists = False
+            if not replacement_exists:
+                raise ResumeRequestError(
+                    "SUBTITLE_INPUT_MISSING",
+                    "saved subtitle input is no longer available; restore or redownload the source media before retrying",
+                )
+            request_out["input"] = {"type": "storage", "key": replacement_key}
+
     if not isinstance(request_out.get("output_prefix"), str) or not str(request_out.get("output_prefix") or "").strip():
         request_out["output_prefix"] = f"sub/{task_id}/"
     if after_render is not None:
@@ -323,15 +406,7 @@ def enqueue_subtitle_job(
         raise HTTPException(status_code=409, detail="task is stopped; resume it before submitting subtitle work")
     if task.status == TaskStatus.published:
         raise HTTPException(status_code=409, detail="task is already published; create a new task to generate subtitles")
-    in_flight = (
-        db.query(SubtitleJob)
-        .filter(
-            SubtitleJob.task_id == task_id,
-            SubtitleJob.status.in_([SubtitleJobStatus.queued, SubtitleJobStatus.running]),
-        )
-        .order_by(SubtitleJob.created_at.desc())
-        .first()
-    )
+    in_flight = _live_subtitle_job(db, task_id)
     if in_flight:
         return RemoteJobResponse(job_id=in_flight.id, status=in_flight.status.value)
     raw_asset = (
@@ -529,17 +604,14 @@ def resume_subtitle_job(
         raise HTTPException(status_code=409, detail="task is stopped; resume it before continuing subtitle work")
     if task.status == TaskStatus.published:
         raise HTTPException(status_code=409, detail="task is already published; create a new task to generate subtitles")
-    in_flight = (
-        db.query(SubtitleJob)
-        .filter(
-            SubtitleJob.task_id == task_id,
-            SubtitleJob.status.in_([SubtitleJobStatus.queued, SubtitleJobStatus.running]),
-        )
-        .count()
-    )
-    if in_flight:
+    in_flight = _live_subtitle_job(db, task_id)
+    if in_flight is not None:
         raise HTTPException(status_code=409, detail="subtitle job already in progress")
-    return enqueue_subtitle_service_job_request(settings, build_resume_subtitle_request(task_id, db))
+    try:
+        request = build_resume_subtitle_request(task_id, db, store=FileStore(settings))
+    except ResumeRequestError as exc:
+        raise _resume_error_http(exc) from exc
+    return enqueue_subtitle_service_job_request(settings, request)
 
 
 def resume_recent_failed_tasks(
@@ -563,23 +635,9 @@ def resume_recent_failed_tasks(
     failed_count = 0
     results: list[RecentFailedResumeItem] = []
     for task in tasks:
-        subtitle_inflight = (
-            db.query(SubtitleJob)
-            .filter(
-                SubtitleJob.task_id == task.id,
-                SubtitleJob.status.in_([SubtitleJobStatus.queued, SubtitleJobStatus.running]),
-            )
-            .count()
-        )
-        render_inflight = (
-            db.query(RenderJob)
-            .filter(
-                RenderJob.task_id == task.id,
-                RenderJob.status.in_([RenderJobStatus.queued, RenderJobStatus.running]),
-            )
-            .count()
-        )
-        if subtitle_inflight or render_inflight:
+        subtitle_inflight = _live_subtitle_job(db, task.id)
+        render_inflight = _live_render_job(db, task.id)
+        if subtitle_inflight is not None or render_inflight is not None:
             skipped_count += 1
             results.append(
                 RecentFailedResumeItem(
@@ -601,15 +659,14 @@ def resume_recent_failed_tasks(
             continue
         try:
             after_render = publishing_service.build_auto_publish_after_render(task, db=db, store=store)
-            request = build_resume_subtitle_request(task.id, db, after_render=after_render)
+            request = build_resume_subtitle_request(task.id, db, store=store, after_render=after_render)
             remote = enqueue_subtitle_service_job_request(settings, request)
             resumed_count += 1
             results.append(RecentFailedResumeItem(task_id=task.id, job_id=remote.job_id, status=remote.status))
-        except HTTPException as exc:
-            detail = str(exc.detail) if exc.detail is not None else str(exc)
+        except ResumeRequestError as exc:
+            detail = exc.message
             if (
-                exc.status_code == 400
-                and detail == "no subtitle job found to resume"
+                exc.code == "NO_SUBTITLE_JOB"
                 and task.source_type == SourceType.youtube
                 and str(task.source_url or "").strip()
             ):
@@ -636,6 +693,11 @@ def resume_recent_failed_tasks(
                     )
                 )
                 continue
+            skipped_count += 1
+            results.append(RecentFailedResumeItem(task_id=task.id, status="skipped", detail=detail))
+            continue
+        except HTTPException as exc:
+            detail = str(exc.detail) if exc.detail is not None else str(exc)
             if exc.status_code in {400, 404, 409}:
                 skipped_count += 1
                 results.append(RecentFailedResumeItem(task_id=task.id, status="skipped", detail=detail))

@@ -102,6 +102,44 @@ def test_task_queue_does_not_show_published_tasks_or_count_their_jobs(db: Sessio
     assert queue.tasks == []
 
 
+def test_task_queue_does_not_show_orphan_subtitle_status_rows(db: Session) -> None:
+    task = _task(TaskStatus.downloaded)
+    db.add(task)
+    db.flush()
+    db.add(SubtitleJob(task_id=task.id, status=SubtitleJobStatus.queued, request_json={}))
+    db.commit()
+
+    queue = _read_task_queue(db, limit=200)
+
+    assert queue.running_count == 0
+    assert queue.queued_count == 0
+    assert queue.tasks == []
+
+
+def test_task_queue_does_not_show_expired_running_render_job(db: Session) -> None:
+    now = datetime.now(timezone.utc)
+    task = _task(TaskStatus.subtitle_ready)
+    db.add(task)
+    db.flush()
+    db.add(
+        RenderJob(
+            task_id=task.id,
+            status=RenderJobStatus.running,
+            progress=42,
+            request_json={},
+            lease_owner="dead-worker",
+            lease_until=now - timedelta(minutes=1),
+        )
+    )
+    db.commit()
+
+    queue = _read_task_queue(db, limit=200)
+
+    assert queue.running_count == 0
+    assert queue.queued_count == 0
+    assert queue.tasks == []
+
+
 def test_task_queue_shows_live_leased_render_job_as_running(db: Session) -> None:
     now = datetime.now(timezone.utc)
     task = _task(TaskStatus.subtitle_ready)

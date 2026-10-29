@@ -43,9 +43,25 @@ def test_hatchet_queue_projection_uses_durable_job_state(monkeypatch: pytest.Mon
         )
         db.add_all([queued_task, running_task])
         db.flush()
+        queued_job = SubtitleJob(task_id=queued_task.id, status=SubtitleJobStatus.queued, request_json={}, progress=0)
+        running_job = SubtitleJob(task_id=running_task.id, status=SubtitleJobStatus.running, request_json={}, progress=55)
+        db.add_all([queued_job, running_job])
+        db.flush()
         db.add_all([
-            SubtitleJob(task_id=queued_task.id, status=SubtitleJobStatus.queued, request_json={}, progress=0),
-            SubtitleJob(task_id=running_task.id, status=SubtitleJobStatus.running, request_json={}, progress=55),
+            PipelineRun(
+                task_id=queued_task.id,
+                engine="hatchet",
+                workflow_name="SubtitleJobV1",
+                state="submitted",
+                request_json={"job_id": str(queued_job.id)},
+            ),
+            PipelineRun(
+                task_id=running_task.id,
+                engine="hatchet",
+                workflow_name="SubtitleJobV1",
+                state="running",
+                request_json={"job_id": str(running_job.id)},
+            ),
         ])
         db.commit()
         queued_task_id = queued_task.id

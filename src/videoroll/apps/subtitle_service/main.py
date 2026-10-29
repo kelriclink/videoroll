@@ -39,6 +39,7 @@ from videoroll.db.migrate import initialize_database
 from videoroll.db.models import Asset, AssetKind, PipelineRun, RenderJob, RenderJobStatus, SourceType, SubtitleJob, SubtitleJobStatus, Task, TaskStatus
 from videoroll.db.session import db_session
 from videoroll.storage.filesystem import FileStore
+from videoroll.workflows.execution_truth import active_subtitle_job_ids, render_job_is_live, subtitle_job_is_live
 from videoroll.apps.subtitle_service.schemas import (
     ASRDefaultsRead,
     ASRDefaultsUpdate,
@@ -2516,6 +2517,8 @@ def _read_task_queue(db: Session, *, limit: int) -> TaskQueueRead:
     limit = _clamp_queue_limit(limit)
     live_task = Task.status.notin_([TaskStatus.canceled, TaskStatus.published])
 
+    now = datetime.now(timezone.utc)
+    active_subtitle_ids = active_subtitle_job_ids(db)
     subtitle_by_task: dict[uuid.UUID, SubtitleJob] = {}
     for job in (
         db.query(SubtitleJob)
@@ -2525,6 +2528,8 @@ def _read_task_queue(db: Session, *, limit: int) -> TaskQueueRead:
         .limit(5000)
         .all()
     ):
+        if not subtitle_job_is_live(job, active_subtitle_ids, now=now):
+            continue
         subtitle_by_task.setdefault(job.task_id, job)
 
     render_by_task: dict[uuid.UUID, RenderJob] = {}
@@ -2536,6 +2541,8 @@ def _read_task_queue(db: Session, *, limit: int) -> TaskQueueRead:
         .limit(5000)
         .all()
     ):
+        if not render_job_is_live(job, now=now):
+            continue
         render_by_task.setdefault(job.task_id, job)
 
     pipeline_by_task = _latest_video_pipeline_runs(db)
@@ -2564,7 +2571,6 @@ def _read_task_queue(db: Session, *, limit: int) -> TaskQueueRead:
     )
 
     items: list[TaskQueueItemRead] = []
-    now = datetime.now(timezone.utc)
     for task in tasks:
         sj = subtitle_by_task.get(task.id)
         rj = render_by_task.get(task.id)

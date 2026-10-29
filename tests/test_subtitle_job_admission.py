@@ -21,7 +21,7 @@ from videoroll.apps.subtitle_service import main as subtitle_api
 from videoroll.apps.subtitle_service.schemas import SubtitleJobCreate
 from videoroll.config import OrchestratorSettings
 from videoroll.db.base import Base
-from videoroll.db.models import Asset, AssetKind, SourceLicense, SourceType, SubtitleJob, SubtitleJobStatus, Task, TaskStatus
+from videoroll.db.models import Asset, AssetKind, PipelineRun, SourceLicense, SourceType, SubtitleJob, SubtitleJobStatus, Task, TaskStatus
 from videoroll.utils.auto_youtube import encode_auto_youtube_created_by
 
 
@@ -33,7 +33,7 @@ def _compile_jsonb_for_sqlite(_type: JSONB, _compiler: object, **_kwargs: object
 @pytest.fixture
 def db(monkeypatch: pytest.MonkeyPatch) -> Session:
     engine = create_engine("sqlite:///:memory:")
-    Base.metadata.create_all(engine, tables=[Task.__table__, Asset.__table__, SubtitleJob.__table__])
+    Base.metadata.create_all(engine, tables=[Task.__table__, Asset.__table__, PipelineRun.__table__, SubtitleJob.__table__])
     monkeypatch.setattr("videoroll.realtime.publish_ui_event", lambda *args, **kwargs: True)
     with Session(engine) as session:
         yield session
@@ -57,6 +57,16 @@ def _task(db: Session, status: TaskStatus) -> Task:
     db.add(Asset(task_id=task.id, kind=AssetKind.video_raw, storage_key=f"raw/{task.id}/source.mp4"))
     db.commit()
     return task
+
+
+class _FakeStore:
+    def __init__(self, existing_keys: set[str]) -> None:
+        self.existing_keys = set(existing_keys)
+
+    def path_for(self, key: str):
+        if key not in self.existing_keys:
+            raise subtitle_service.StorageObjectNotFound(key)
+        return object()
 
 
 @pytest.mark.parametrize("resume", [False, True])
@@ -102,6 +112,58 @@ def test_internal_subtitle_api_accepts_an_unfinished_task(db: Session) -> None:
     job = db.get(SubtitleJob, uuid.UUID(response["job_id"]))
     assert response["status"] == "queued"
     assert job is not None and job.task_id == task.id
+
+
+def test_resume_request_replaces_missing_saved_input_with_latest_valid_raw_asset(db: Session) -> None:
+    task = _task(db, TaskStatus.failed)
+    latest_key = f"raw/{task.id}/source.mp4"
+    db.add(
+        SubtitleJob(
+            task_id=task.id,
+            status=SubtitleJobStatus.failed,
+            request_json={"input": {"type": "storage", "key": f"raw/{task.id}/deleted.mp4"}},
+        )
+    )
+    db.commit()
+
+    request = subtitle_service.build_resume_subtitle_request(
+        task.id,
+        db,
+        store=_FakeStore({latest_key}),
+    )
+
+    assert request["resume"] is True
+    assert request["input"] == {"type": "storage", "key": latest_key}
+
+
+def test_resume_request_rejects_missing_saved_and_latest_raw_inputs(db: Session) -> None:
+    task = _task(db, TaskStatus.failed)
+    db.add(
+        SubtitleJob(
+            task_id=task.id,
+            status=SubtitleJobStatus.failed,
+            request_json={"input": {"type": "storage", "key": f"raw/{task.id}/deleted.mp4"}},
+        )
+    )
+    db.commit()
+
+    with pytest.raises(subtitle_service.ResumeRequestError) as caught:
+        subtitle_service.build_resume_subtitle_request(task.id, db, store=_FakeStore(set()))
+
+    assert caught.value.code == "SUBTITLE_INPUT_MISSING"
+
+
+def test_resume_subtitle_job_exposes_structured_missing_history_error(db: Session) -> None:
+    task = _task(db, TaskStatus.downloaded)
+
+    with pytest.raises(HTTPException) as caught:
+        subtitle_service.resume_subtitle_job(task.id, settings=_settings(), db=db)
+
+    assert caught.value.status_code == 400
+    assert caught.value.detail == {
+        "code": "NO_SUBTITLE_JOB",
+        "message": "no subtitle job found to resume",
+    }
 
 
 def test_automatic_job_infers_runtime_profile_but_explicit_manual_request_does_not(db: Session) -> None:

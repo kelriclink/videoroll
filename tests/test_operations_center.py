@@ -114,7 +114,18 @@ def test_task_queue_projects_hatchet_priority_without_legacy_position_ordering(o
     operations_db.add_all([low, high_late, high_first])
     operations_db.flush()
     for task in (low, high_late, high_first):
-        operations_db.add(SubtitleJob(task_id=task.id, status=SubtitleJobStatus.queued, request_json={}))
+        job = SubtitleJob(task_id=task.id, status=SubtitleJobStatus.queued, request_json={})
+        operations_db.add(job)
+        operations_db.flush()
+        operations_db.add(
+            PipelineRun(
+                task_id=task.id,
+                engine="hatchet",
+                workflow_name="SubtitleJobV1",
+                state="submitted",
+                request_json={"job_id": str(job.id)},
+            )
+        )
     operations_db.commit()
 
     queue = _read_task_queue(operations_db, limit=20)

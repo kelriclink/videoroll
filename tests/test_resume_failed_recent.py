@@ -48,8 +48,8 @@ def test_resume_failed_recent_restarts_youtube_pipeline_when_no_subtitle_job(mon
     db = MagicMock()
     db.query.side_effect = [
         _FakeQuery(all_result=[task]),
-        _FakeQuery(count_result=0),
-        _FakeQuery(count_result=0),
+        _FakeQuery(all_result=[]),
+        _FakeQuery(all_result=[]),
     ]
 
     set_created_by_calls: list[tuple[uuid.UUID, str]] = []
@@ -59,7 +59,7 @@ def test_resume_failed_recent_restarts_youtube_pipeline_when_no_subtitle_job(mon
         subtitle_service,
         "build_resume_subtitle_request",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            HTTPException(status_code=400, detail="no subtitle job found to resume")
+            subtitle_service.ResumeRequestError("NO_SUBTITLE_JOB", "no subtitle job found to resume")
         ),
     )
     monkeypatch.setattr(subtitle_service, "get_auto_profile", lambda _db: {"auto_publish": True})
@@ -96,8 +96,8 @@ def test_resume_failed_recent_skips_non_youtube_task_without_subtitle_job(monkey
     db = MagicMock()
     db.query.side_effect = [
         _FakeQuery(all_result=[task]),
-        _FakeQuery(count_result=0),
-        _FakeQuery(count_result=0),
+        _FakeQuery(all_result=[]),
+        _FakeQuery(all_result=[]),
     ]
 
     monkeypatch.setattr(publishing_service, "build_auto_publish_after_render", lambda *args, **kwargs: {"publish": True})
@@ -105,7 +105,7 @@ def test_resume_failed_recent_skips_non_youtube_task_without_subtitle_job(monkey
         subtitle_service,
         "build_resume_subtitle_request",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            HTTPException(status_code=400, detail="no subtitle job found to resume")
+            subtitle_service.ResumeRequestError("NO_SUBTITLE_JOB", "no subtitle job found to resume")
         ),
     )
 
