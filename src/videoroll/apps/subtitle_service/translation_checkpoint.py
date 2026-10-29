@@ -79,7 +79,12 @@ class TranslationCheckpointStore:
         try:
             self._store.download_file(self._key, self._local_path)
             payload = json.loads(self._local_path.read_text(encoding="utf-8"))
-        except Exception:
+        except Exception as exc:
+            if self._log is not None:
+                self._log(
+                    "translation checkpoint load failed; restarting translation: "
+                    f"{type(exc).__name__}: {exc}"
+                )
             return [], "", {}
 
         if not isinstance(payload, dict):

@@ -258,7 +258,12 @@ def test_youtube_download_409_waits_for_existing_operation(monkeypatch) -> None:
             return httpx.Response(
                 409,
                 request=request,
-                json={"detail": "youtube download is already in progress"},
+                json={
+                    "detail": {
+                        "code": "YOUTUBE_DOWNLOAD_IN_PROGRESS",
+                        "message": "wording may change without changing workflow semantics",
+                    }
+                },
             )
 
     monkeypatch.setattr(module.httpx, "AsyncClient", lambda **_kwargs: FakeClient())

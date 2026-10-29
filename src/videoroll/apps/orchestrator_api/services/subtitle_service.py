@@ -38,7 +38,8 @@ from videoroll.db.models import (
     TaskStatus,
 )
 from videoroll.storage.filesystem import FileStore
-from videoroll.utils.auto_youtube import encode_auto_youtube_created_by, parse_auto_youtube_created_by
+from videoroll.utils.auto_youtube import encode_auto_youtube_created_by
+from videoroll.utils.task_origin import is_auto_youtube_task
 
 
 _BROWSER_PROXY_PATHS: dict[str, set[str]] = {
@@ -203,7 +204,7 @@ def relaunch_queued_subtitle_job(
     reuses the queued SubtitleJob and owns its child execution.
     """
     task = db.get(Task, task_id)
-    if task is None or parse_auto_youtube_created_by(task.created_by) is not None:
+    if task is None or is_auto_youtube_task(task):
         return None
     job = (
         db.query(SubtitleJob)

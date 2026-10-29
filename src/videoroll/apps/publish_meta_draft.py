@@ -20,12 +20,17 @@ from videoroll.apps.subtitle_service.auto_profile_store import get_auto_profile
 from videoroll.apps.subtitle_service.bilibili_tags_store import get_task_bilibili_summary
 from videoroll.apps.subtitle_service.task_title_store import get_task_titles
 from videoroll.apps.subtitle_service.translate_settings_store import get_translate_settings
+from videoroll.apps.subtitle_service.translation_runtime import resolve_translation_runtime
 from videoroll.config import get_subtitle_settings
 from videoroll.db.models import Asset, AssetKind, Task
 from videoroll.storage.filesystem import FileStore, StorageObjectNotFound
 
 
 PublishMetaDraftMode = Literal["auto", "default", "source"]
+
+
+class PublishTitleTranslationError(RuntimeError):
+    pass
 
 
 def _as_dict(v: Any) -> dict[str, Any]:
@@ -67,8 +72,10 @@ def translate_publish_title(
                 settings=translate_settings,
                 context=summary,
             )
-        except Exception:
-            return title_in
+        except Exception as exc:
+            raise PublishTitleTranslationError(
+                f"Index title translation failed: {type(exc).__name__}: {exc}"
+            ) from exc
     if provider != "openai" or not translate_settings.get("openai_api_key"):
         return title_in
 
@@ -89,8 +96,10 @@ def translate_publish_title(
             config=openai_chat_config_from_settings(translate_settings),
             retry_count=4,
         )
-    except Exception:
-        return title_in
+    except Exception as exc:
+        raise PublishTitleTranslationError(
+            f"title translation failed: {type(exc).__name__}: {exc}"
+        ) from exc
 
 
 def apply_publish_source_overrides(
@@ -207,8 +216,18 @@ def build_task_publish_meta_draft(
     summary = get_task_bilibili_summary(db, str(task.id))
 
     profile = get_auto_profile(db)
-    translate_settings = get_translate_settings(db, get_subtitle_settings())
-    ai_service = AIService(lambda: get_translate_settings(db, get_subtitle_settings()))
+    legacy_translate_settings = get_translate_settings(db, get_subtitle_settings())
+    runtime = resolve_translation_runtime(
+        db,
+        legacy_translate_settings,
+        provider=profile.get("translate_provider")
+        or legacy_translate_settings.get("default_provider")
+        or "openai",
+        model_provider_id=profile.get("translate_model_provider_id"),
+        model_id=profile.get("translate_model_id"),
+    )
+    translate_settings = runtime.settings
+    ai_service = AIService(lambda: dict(runtime.settings))
     return apply_publish_source_overrides(
         meta_out,
         source_title=source_title,

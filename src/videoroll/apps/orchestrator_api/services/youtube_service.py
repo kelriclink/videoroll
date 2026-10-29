@@ -83,7 +83,8 @@ from videoroll.db.session import get_sessionmaker
 from videoroll.storage.filesystem import FileStore, StorageObjectNotFound
 from videoroll.storage.recovery import reset_task_for_source_recovery
 from videoroll.realtime import publish_ui_event
-from videoroll.utils.auto_youtube import encode_auto_youtube_created_by
+from videoroll.utils.auto_youtube import encode_auto_youtube_created_by, parse_auto_youtube_created_by
+from videoroll.utils.task_origin import apply_task_origin
 from videoroll.utils.hashing import sha256_file
 from videoroll.utils.httpx_proxy import HTTPX_PROXY_KWARG_UNSUPPORTED, format_httpx_proxy_error
 from videoroll.utils.youtube_urls import canonicalize_youtube_url, is_youtube_url
@@ -95,6 +96,18 @@ YOUTUBE_DOWNLOAD_PROGRESS_PREFIX = "youtube.download_progress."
 YOUTUBE_DOWNLOAD_PROGRESS_REDIS_PREFIX = "videoroll:youtube-download-progress:"
 YOUTUBE_DOWNLOAD_PROGRESS_DB_CHECKPOINT_SECONDS = 10.0
 YOUTUBE_DOWNLOAD_PROGRESS_REDIS_TTL_SECONDS = 86400
+
+
+class YouTubeConflict(RuntimeError):
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+class YouTubeHomeScanAlreadyRunning(YouTubeConflict):
+    def __init__(self) -> None:
+        super().__init__("YOUTUBE_HOME_SCAN_ALREADY_RUNNING", "youtube home scan is already running")
 
 
 _BROWSER_PROXY_PATHS: dict[str, set[str]] = {
@@ -176,6 +189,13 @@ def set_task_created_by(settings: OrchestratorSettings, *, task_id: uuid.UUID, c
         task = db.get(Task, task_id)
         if not task:
             return
+        parsed = parse_auto_youtube_created_by(marker)
+        if parsed is not None:
+            apply_task_origin(
+                task,
+                origin=str(parsed["origin"]),
+                run_id=str(parsed.get("run_id") or "").strip() or None,
+            )
         task.created_by = marker
         db.add(task)
         db.commit()
@@ -822,7 +842,10 @@ def download(task_id: uuid.UUID, *, settings: OrchestratorSettings, db: Session,
         operation_acquired = bool(claim.acquired)
         if not claim.acquired:
             if claim.result_json is None:
-                raise HTTPException(status_code=409, detail="youtube download is already in progress")
+                raise YouTubeConflict(
+                    "YOUTUBE_DOWNLOAD_IN_PROGRESS",
+                    "youtube download is already in progress",
+                )
             try:
                 replay = YouTubeDownloadActionResponse.model_validate(claim.result_json)
                 store.head_object(replay.video_asset.storage_key)
@@ -832,7 +855,10 @@ def download(task_id: uuid.UUID, *, settings: OrchestratorSettings, db: Session,
                 # only after proving the cached artifact is unusable.
                 if not reopen_completed_operation(db, operation_key):
                     db.rollback()
-                    raise HTTPException(status_code=409, detail="youtube download result is being recovered")
+                    raise YouTubeConflict(
+                        "YOUTUBE_DOWNLOAD_RESULT_RECOVERING",
+                        "youtube download result is being recovered",
+                    )
                 db.commit()
                 claim = claim_operation(
                     db,
@@ -843,7 +869,10 @@ def download(task_id: uuid.UUID, *, settings: OrchestratorSettings, db: Session,
                 )
                 db.commit()
                 if not claim.acquired:
-                    raise HTTPException(status_code=409, detail="youtube download recovery is already in progress")
+                    raise YouTubeConflict(
+                        "YOUTUBE_DOWNLOAD_RECOVERY_IN_PROGRESS",
+                        "youtube download recovery is already in progress",
+                    )
                 operation_acquired = True
 
         heartbeat = OperationHeartbeat(
@@ -983,7 +1012,7 @@ def run_home_scan(settings: OrchestratorSettings, *, force: bool = False, raise_
         home_scan_lock_ttl = int(os.getenv("YOUTUBE_HOME_SCAN_LOCK_TTL_SECONDS", "900"))
         if not try_acquire_youtube_home_scan_lock(db, owner=owner, ttl_seconds=home_scan_lock_ttl):
             if raise_if_locked:
-                raise RuntimeError("youtube home scan is already running")
+                raise YouTubeHomeScanAlreadyRunning()
             return None
         acquired = True
         heartbeat = _YouTubeHomeScanHeartbeat(settings.database_url, owner, home_scan_lock_ttl)

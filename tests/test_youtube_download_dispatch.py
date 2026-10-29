@@ -131,7 +131,8 @@ def test_orphaned_auto_pipeline_retries_once_and_never_repeats(factory, monkeypa
     assert calls==[task_id]
     with factory() as db:
         row=db.query(OperationInbox).one()
-        assert row.request_json['auto_workflow_recoveries']==1
+        assert row.recovery_count == 1
+        assert row.request_json == {"task_id": str(task_id)}
 
 
 def test_queued_download_progress_contract_accepts_recovery_states():
@@ -144,20 +145,28 @@ def test_queued_download_progress_contract_accepts_recovery_states():
 def test_explicit_manual_retry_reopens_failed_download_without_recreating_task(factory):
     with factory() as db:
         task = make_task(db, status=TaskStatus.failed)
-        task.created_by = 'youtube_task_restart;auto_publish=;run_id=retry-new'
+        task.origin_kind = "youtube_task_restart"
+        task.origin_run_id = "retry-new"
+        task.restart_generation = 2
         db.flush()
         key = 'youtube-download:' + str(task.id)
-        db.add(OperationInbox(operation_key=key, status='failed',
-                              request_json={'task_id': str(task.id), 'worker_failures': 4,
-                                            'explicit_restart_id': 'youtube_task_restart;auto_publish=;run_id=old'},
-                              last_error='previous download exhausted retries'))
+        db.add(OperationInbox(
+            operation_key=key,
+            status='failed',
+            request_json={'task_id': str(task.id)},
+            attempt_count=4,
+            restart_token='retry-old',
+            last_error='previous download exhausted retries',
+        ))
         db.commit()
         assert enqueue_download(db, task.id) == 'queued'
         current = db.query(OperationInbox).filter_by(operation_key=key).one()
         assert current.status == 'pending'
         assert current.last_error is None
-        assert current.request_json['explicit_restart_id'] == task.created_by
-        assert 'worker_failures' not in current.request_json
+        assert current.restart_token == "retry-new"
+        assert current.attempt_count == 0
+        assert current.retry_after is None
+        assert current.request_json == {"task_id": str(task.id)}
         assert enqueue_download(db, task.id) == 'queued'
         assert db.query(OperationInbox).filter_by(operation_key=key).count() == 1
         assert db.query(Task).filter_by(id=task.id).count() == 1
@@ -166,9 +175,13 @@ def test_explicit_manual_retry_reopens_failed_download_without_recreating_task(f
 def test_automatic_enqueue_never_reopens_terminal_failed_download(factory):
     with factory() as db:
         task = make_task(db)
-        db.add(OperationInbox(operation_key='youtube-download:' + str(task.id),
-                              status='failed', request_json={'worker_failures': 4},
-                              last_error='network exhausted'))
+        db.add(OperationInbox(
+            operation_key='youtube-download:' + str(task.id),
+            status='failed',
+            request_json={'task_id': str(task.id)},
+            attempt_count=4,
+            last_error='network exhausted',
+        ))
         db.commit()
         assert enqueue_download(db, task.id) == 'failed'
         op = db.query(OperationInbox).one()

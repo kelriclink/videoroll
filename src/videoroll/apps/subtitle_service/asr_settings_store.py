@@ -11,6 +11,7 @@ from videoroll.utils.openai_compat import normalize_openai_base_url
 
 
 ASR_SETTINGS_KEY = "subtitle.asr"
+ASR_SETTINGS_VERSION = 2
 
 _ALLOWED_ENGINES = {"mock", "faster-whisper", "openvino", "external-whisper", "groq-whisper", "cloudflare-workers-ai"}
 _MAX_PROXY_LEN = 2048
@@ -62,9 +63,39 @@ def _is_legacy_external_profile(external: dict[str, Any]) -> bool:
     except (TypeError, ValueError):
         return False
 
+def _upgrade_stored_settings(
+    db: Session,
+    row: AppSetting | None,
+    stored: dict[str, Any],
+) -> dict[str, Any]:
+    """Run versioned migrations once; never infer migrations on current settings."""
+    if row is None or int(getattr(row, "version", 1) or 1) >= ASR_SETTINGS_VERSION:
+        return stored
+
+    external = dict(_as_dict(stored.get("external_whisper")))
+    if _is_legacy_external_profile(external):
+        external.update(
+            {
+                "min_silence_ms": 2000,
+                "speech_pad_ms": 400,
+                "condition_on_previous_text": True,
+                "max_segment_seconds": 12.0,
+                "max_segment_chars": 120,
+            }
+        )
+        stored["external_whisper"] = external
+
+    row.value_json = stored
+    row.version = ASR_SETTINGS_VERSION
+    db.add(row)
+    db.commit()
+    return stored
+
+
 def get_asr_settings(db: Session, defaults: SubtitleServiceSettings) -> dict[str, Any]:
     row = db.get(AppSetting, ASR_SETTINGS_KEY)
     stored = dict(_as_dict(row.value_json)) if row else {}
+    stored = _upgrade_stored_settings(db, row, stored)
 
     engine = str(stored.get("default_engine") or defaults.asr_engine).strip() or defaults.asr_engine
     if engine not in _ALLOWED_ENGINES:
@@ -110,18 +141,6 @@ def get_asr_settings(db: Session, defaults: SubtitleServiceSettings) -> dict[str
         proxy = proxy[:_MAX_PROXY_LEN]
 
     external = _as_dict(stored.get("external_whisper"))
-    # Upgrade the exact short-lived legacy defaults introduced with the first
-    # online-Whisper UI. This preserves genuinely customized profiles while
-    # preventing old persisted 500ms/6s defaults from defeating semantic regrouping.
-    if _is_legacy_external_profile(external):
-        external = {
-            **external,
-            "min_silence_ms": 2000,
-            "speech_pad_ms": 400,
-            "condition_on_previous_text": True,
-            "max_segment_seconds": 12.0,
-            "max_segment_chars": 120,
-        }
     external_base_url = str(external.get("base_url") or defaults.external_whisper_base_url or "").strip()
     if external_base_url:
         external_base_url = normalize_openai_base_url(external_base_url)[:_MAX_EXTERNAL_BASE_URL_LEN]
@@ -370,6 +389,7 @@ def update_asr_settings(db: Session, defaults: SubtitleServiceSettings, update: 
         stored.pop("cloudflare_workers_ai", None)
 
     row.value_json = stored
+    row.version = ASR_SETTINGS_VERSION
     db.add(row)
     db.commit()
 

@@ -21,6 +21,7 @@ from videoroll.config import get_orchestrator_settings
 from videoroll.db.models import AppSetting, OperationInbox, PipelineRun, Task, TaskStatus, SourceType
 from videoroll.db.session import get_sessionmaker
 from videoroll.storage.filesystem import FileStore
+from videoroll.utils.task_origin import task_origin_context
 
 logger = logging.getLogger(__name__)
 SETTING_KEY = "workflow.youtube_download_concurrency"
@@ -55,7 +56,9 @@ def enqueue_download(db: Session, task_id: uuid.UUID) -> str:
     task = db.get(Task, task_id)
     if task is None or task.source_type != SourceType.youtube:
         raise ValueError("YouTube task not found")
-    explicit_restart = str(task.created_by or "").startswith("youtube_task_restart;")
+    origin = task_origin_context(task)
+    explicit_restart = bool(origin and origin.is_restart)
+    restart_token = origin.run_id if explicit_restart and origin else None
     if task.status in {TaskStatus.published, TaskStatus.publishing, TaskStatus.canceled} or (task.status == TaskStatus.failed and not explicit_restart):
         raise ValueError("task is terminal and cannot enqueue an automatic download")
     key = f"{OPERATION_PREFIX}{task_id}"
@@ -63,7 +66,13 @@ def enqueue_download(db: Session, task_id: uuid.UUID) -> str:
     if operation is None:
         try:
             with db.begin_nested():
-                db.add(OperationInbox(operation_key=key, status="pending", request_json={"task_id": str(task_id)}))
+                operation = OperationInbox(
+                    operation_key=key,
+                    status="pending",
+                    request_json={"task_id": str(task_id)},
+                    restart_token=restart_token,
+                )
+                db.add(operation)
                 db.flush()
         except IntegrityError:
             # Concurrent idempotent enqueues use the winner's durable record.
@@ -71,15 +80,21 @@ def enqueue_download(db: Session, task_id: uuid.UUID) -> str:
     if operation is not None and operation.status == "completed":
         return "completed"
     if operation is not None and operation.status == "failed":
-        # Explicit UI restart supplies a new durable run marker and may reopen
-        # the same task; an automatic retry cannot erase a terminal failure.
-        if not explicit_restart or (operation.request_json or {}).get("explicit_restart_id") == task.created_by:
+        # A new structured restart token may reopen the same durable operation.
+        # Re-submitting the same restart generation remains idempotent.
+        legacy_restart = str((operation.request_json or {}).get("explicit_restart_id") or "")
+        legacy_context = legacy_restart.rsplit("run_id=", 1)[-1] if "run_id=" in legacy_restart else None
+        previous_restart = operation.restart_token or legacy_context
+        if not explicit_restart or previous_restart == restart_token:
             return "failed"
         operation.status = "pending"
         operation.lease_owner = None
         operation.lease_until = None
         operation.last_error = None
-        operation.request_json = {"task_id": str(task_id), "explicit_restart_id": task.created_by}
+        operation.attempt_count = 0
+        operation.retry_after = None
+        operation.restart_token = restart_token
+        operation.request_json = {"task_id": str(task_id)}
 
     db.commit()
     return "queued"
@@ -135,11 +150,16 @@ class DownloadSupervisor:
                     op = record.query(OperationInbox).filter(OperationInbox.operation_key == key).with_for_update().one_or_none()
                     if op is None or op.status == "completed":
                         return
-                    request = dict(op.request_json or {})
-                    attempts = int(request.get("worker_failures", 0)) + 1
-                    request["worker_failures"] = attempts
-                    request["retry_after"] = (datetime.now(timezone.utc) + timedelta(seconds=min(900, 30 * (2 ** min(attempts, 5))))).isoformat()
-                    op.request_json = request
+                    legacy = dict(op.request_json or {})
+                    attempts = max(
+                        int(op.attempt_count or 0),
+                        int(legacy.get("worker_failures", 0) or 0),
+                    ) + 1
+                    op.attempt_count = attempts
+                    op.retry_after = datetime.now(timezone.utc) + timedelta(
+                        seconds=min(900, 30 * (2 ** min(attempts, 5)))
+                    )
+                    op.request_json = {"task_id": str(task_id)}
                     op.last_error = f"{type(exc).__name__}: {exc}"[:900]
                     if attempts >= 4:
                         op.status = "failed"
@@ -169,8 +189,12 @@ class DownloadSupervisor:
         tasks = db.query(Task).filter(Task.id.in_([task_id for task_id, _ in keys]),
                                       Task.status.in_((TaskStatus.ingested, TaskStatus.failed)),
                                       Task.source_type == SourceType.youtube).all() if keys else []
-        available = {task.id: task for task in tasks if task.status == TaskStatus.ingested or
-                     str(task.created_by or "").startswith("youtube_task_restart;")}
+        available = {
+            task.id: task
+            for task in tasks
+            if task.status == TaskStatus.ingested
+            or bool((origin := task_origin_context(task)) and origin.is_restart)
+        }
         ordered = sorted(((task_id, op) for task_id, op in keys if task_id in available),
                          key=lambda pair: (-int(available[pair[0]].priority or 0), pair[1].created_at))
         found = []
@@ -185,14 +209,18 @@ class DownloadSupervisor:
             ).order_by(PipelineRun.created_at.desc()).first())
             if parent is None or parent.state not in {"submitted", "running"}:
                 continue
-            req = op.request_json if isinstance(op.request_json, dict) else {}
-            after = req.get("retry_after")
-            if after:
-                try:
-                    if datetime.fromisoformat(after) > now:
-                        continue
-                except (TypeError, ValueError):
-                    pass
+            after = op.retry_after
+            if after is None:
+                legacy_after = (op.request_json or {}).get("retry_after") if isinstance(op.request_json, dict) else None
+                if legacy_after:
+                    try:
+                        after = datetime.fromisoformat(str(legacy_after))
+                    except (TypeError, ValueError):
+                        after = None
+            if after is not None:
+                comparable = after.replace(tzinfo=after.tzinfo or timezone.utc)
+                if comparable > now:
+                    continue
             found.append(task_id)
             if len(found) >= limit:
                 break

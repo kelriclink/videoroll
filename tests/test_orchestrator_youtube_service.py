@@ -88,7 +88,14 @@ def test_proxy_test_rejects_non_youtube_target_before_network() -> None:
 
 def test_download_progress_returns_idle_for_task_without_saved_progress() -> None:
     task_id = uuid.uuid4()
-    progress = youtube_service.get_download_progress(task_id, db=_ProgressDb(task_id))  # type: ignore[arg-type]
+    with patch(
+        "videoroll.apps.youtube_ingest.download_dispatch.download_operation_status",
+        return_value=None,
+    ):
+        progress = youtube_service.get_download_progress(
+            task_id,
+            db=_ProgressDb(task_id),  # type: ignore[arg-type]
+        )
 
     assert progress == {
         "task_id": str(task_id),
@@ -116,11 +123,11 @@ def test_duplicate_download_caller_does_not_mark_shared_progress_failed() -> Non
         patch.object(youtube_service, "_YouTubeDownloadProgressReporter", return_value=reporter),
         patch.object(youtube_service, "claim_operation", return_value=claim),
         patch.object(youtube_service, "release_operation") as release_operation,
-        pytest.raises(HTTPException) as caught,
+        pytest.raises(youtube_service.YouTubeConflict) as caught,
     ):
         youtube_service.download(task_id, settings=settings, db=db, store=Mock())  # type: ignore[arg-type]
 
-    assert caught.value.status_code == 409
+    assert caught.value.code == "YOUTUBE_DOWNLOAD_IN_PROGRESS"
     reporter.fail.assert_not_called()
     release_operation.assert_not_called()
 

@@ -140,6 +140,16 @@ def test_task_queue_reports_real_youtube_download_progress(
         created_by=encode_auto_youtube_created_by("auto_youtube", auto_publish=None, run_id="queue-progress"),
     )
     operations_db.add(task)
+    operations_db.flush()
+    operations_db.add(
+        OperationInbox(
+            operation_key=f"youtube-download:{task.id}",
+            status="processing",
+            request_json={"task_id": str(task.id)},
+            lease_owner="worker-a",
+            lease_until=datetime.now(timezone.utc) + timedelta(minutes=5),
+        )
+    )
     operations_db.commit()
 
     from videoroll.apps.orchestrator_api.services import youtube_service
@@ -175,6 +185,16 @@ def test_task_queue_reports_workflow_after_youtube_download(
         created_by=encode_auto_youtube_created_by("auto_youtube", auto_publish=None, run_id="queue-complete"),
     )
     operations_db.add(task)
+    operations_db.flush()
+    operations_db.add(
+        PipelineRun(
+            task_id=task.id,
+            engine="hatchet",
+            workflow_name="VideoPipelineV1",
+            state="running",
+            request_json={"dispatch_key": f"auto-youtube:{task.id}"},
+        )
+    )
     operations_db.commit()
 
     from videoroll.apps.orchestrator_api.services import youtube_service
@@ -195,6 +215,51 @@ def test_task_queue_reports_workflow_after_youtube_download(
 
     assert item.stage == "workflow"
     assert item.progress == 100
+
+
+def test_task_queue_keeps_active_pipeline_visible_between_child_jobs(
+    monkeypatch: pytest.MonkeyPatch,
+    operations_db: Session,
+) -> None:
+    task = Task(
+        source_type=SourceType.youtube,
+        source_url="https://www.youtube.com/watch?v=between-stages",
+        source_license=SourceLicense.own,
+        status=TaskStatus.asr_done,
+        origin_kind="auto_youtube",
+        origin_run_id="between-stages",
+    )
+    operations_db.add(task)
+    operations_db.flush()
+    run = PipelineRun(
+        task_id=task.id,
+        engine="hatchet",
+        workflow_name="VideoPipelineV1",
+        state="running",
+        request_json={"dispatch_key": f"auto-youtube:{task.id}"},
+    )
+    operations_db.add(run)
+    operations_db.commit()
+
+    from videoroll.apps.orchestrator_api.services import youtube_service
+
+    monkeypatch.setattr(
+        youtube_service,
+        "get_download_progress",
+        lambda *_args, **_kwargs: {
+            "status": "idle",
+            "active": False,
+            "progress": 0,
+            "error": None,
+        },
+    )
+
+    queue = _read_task_queue(operations_db, limit=20)
+    item = next(row for row in queue.tasks if row.task_id == task.id)
+
+    assert item.state == "running"
+    assert item.stage == "workflow"
+    assert item.progress == 0
 
 
 def test_knowledge_bulk_parser_supports_csv_json_and_srt() -> None:

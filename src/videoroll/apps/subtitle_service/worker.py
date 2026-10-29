@@ -47,7 +47,7 @@ from videoroll.db.session import get_engine, get_sessionmaker
 from videoroll.realtime import publish_log_updated, publish_queue_changed
 from videoroll.storage.filesystem import FileStore
 from videoroll.apps.security.service_auth import INTERNAL_TOKEN_HEADER, service_token
-from videoroll.utils.auto_youtube import parse_auto_youtube_created_by
+from videoroll.utils.task_origin import is_auto_youtube_task
 from videoroll.utils.hashing import sha256_file
 from videoroll.apps.subtitle_service.processing import (
     Segment,
@@ -156,7 +156,7 @@ def _uses_runtime_auto_profile(task: Task, request_json: dict[str, Any], *nested
     for item in nested:
         if "runtime_profile" in item and item.get("runtime_profile") is not None:
             return bool(item.get("runtime_profile"))
-    return parse_auto_youtube_created_by(task.created_by) is not None
+    return is_auto_youtube_task(task)
 
 
 def _active_pipeline_job(db: Session, task_id: uuid.UUID) -> tuple[str, uuid.UUID] | None:
@@ -1112,7 +1112,6 @@ def run_subtitle_job(
         selective_mode = bool(selective_indices)
         if selective_mode:
             resume = True
-        auto_task_meta = parse_auto_youtube_created_by(task.created_by)
         automatic_runtime_profile = _uses_runtime_auto_profile(task, req)
 
         def _current_auto_profile() -> dict[str, Any]:

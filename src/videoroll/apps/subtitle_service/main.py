@@ -139,7 +139,7 @@ from videoroll.apps.subtitle_service.translation_context import (
     context_memory_is_empty,
     sanitize_translation_context_memory,
 )
-from videoroll.utils.auto_youtube import parse_auto_youtube_created_by
+from videoroll.utils.task_origin import is_auto_youtube_task
 from videoroll.utils.cpu import process_cpu_count
 from videoroll.utils.httpx_proxy import HTTPX_PROXY_KWARG_UNSUPPORTED, format_httpx_proxy_error
 from videoroll.utils.intel_gpu import detect_intel_hardware
@@ -2342,7 +2342,7 @@ def create_job(payload: SubtitleJobCreate, db: Session = Depends(get_db)) -> dic
     if "runtime_profile" not in payload.model_fields_set or payload.runtime_profile is None:
         # Legacy automatic jobs have no explicit marker. Infer True only for
         # those tasks; new manual orchestrator requests send False explicitly.
-        request_json["runtime_profile"] = parse_auto_youtube_created_by(task.created_by) is not None
+        request_json["runtime_profile"] = is_auto_youtube_task(task)
     if "youtube_subtitle_mode" not in payload.model_fields_set:
         request_json["youtube_subtitle_mode"] = "target" if payload.prefer_youtube_subtitles else "off"
     request_json["prefer_youtube_subtitles"] = request_json.get("youtube_subtitle_mode") != "off"
@@ -2410,7 +2410,7 @@ def _subtitle_worker_slots() -> int:
 
 
 def _auto_youtube_queue_progress(db: Session, task: Task) -> tuple[str, int, str | None] | None:
-    if task.source_type != SourceType.youtube or parse_auto_youtube_created_by(task.created_by) is None:
+    if task.source_type != SourceType.youtube or not is_auto_youtube_task(task):
         return None
     try:
         from videoroll.apps.orchestrator_api.services.youtube_service import get_download_progress
@@ -2418,7 +2418,7 @@ def _auto_youtube_queue_progress(db: Session, task: Task) -> tuple[str, int, str
         data = get_download_progress(
             task.id,
             db=db,
-            redis_url=str(get_subtitle_settings().redis_url or ""),
+            redis_url=str(os.getenv("REDIS_URL") or ""),
         )
     except Exception:
         logger.exception("failed to read YouTube download progress for task %s", task.id)
@@ -2433,45 +2433,86 @@ def _auto_youtube_queue_progress(db: Session, task: Task) -> tuple[str, int, str
         progress = 0
     error = str(data.get("error") or "").strip() or None
     if status == "failed":
-        # Failed downloads are not active; do not display stale progress as running.
         return None
     if status in {"queued", "pending"}:
         return "waiting_download", progress, error
     if status == "completed":
-        # Download completion only proves the source asset is ready. Hatchet may
-        # still be advancing the workflow (or a previous run may have failed),
-        # so do not fabricate a subtitle-handoff execution state before a real
-        # SubtitleJob exists.
         return "workflow", 100, error
     return "youtube_download", progress, error
 
 
 def _download_queue_settings(db: Session) -> TaskQueueSettingsRead:
-    from videoroll.apps.youtube_ingest.download_dispatch import (read_download_concurrency, OPERATION_PREFIX)
+    from videoroll.apps.youtube_ingest.download_dispatch import read_download_concurrency, OPERATION_PREFIX
     from videoroll.db.models import OperationInbox
 
     current = datetime.now(timezone.utc)
     active = db.query(OperationInbox).filter(
         OperationInbox.operation_key.like(f"{OPERATION_PREFIX}%"),
-        OperationInbox.status == "processing", OperationInbox.lease_until > current,
+        OperationInbox.status == "processing",
+        OperationInbox.lease_until > current,
     ).count()
     pending = db.query(OperationInbox).filter(
         OperationInbox.operation_key.like(f"{OPERATION_PREFIX}%"),
-        (OperationInbox.status == "pending") |
-        ((OperationInbox.status == "processing") & (OperationInbox.lease_until <= current)),
+        (OperationInbox.status == "pending")
+        | ((OperationInbox.status == "processing") & (OperationInbox.lease_until <= current)),
     ).count()
-    return TaskQueueSettingsRead(scheduler="hatchet", subtitle_worker_slots=_subtitle_worker_slots(),
-                                 download_concurrency=read_download_concurrency(db),
-                                 active_downloads=active, pending_downloads=pending)
+    return TaskQueueSettingsRead(
+        scheduler="hatchet",
+        subtitle_worker_slots=_subtitle_worker_slots(),
+        download_concurrency=read_download_concurrency(db),
+        active_downloads=active,
+        pending_downloads=pending,
+    )
+
+
+def _latest_video_pipeline_runs(db: Session) -> dict[uuid.UUID, PipelineRun]:
+    """Return the latest nonterminal top-level workflow attempt per live task."""
+    active_states = ("submitting", "submitted", "running", "cancel_requested", "launch_failed")
+    rows = (
+        db.query(PipelineRun)
+        .join(Task, Task.id == PipelineRun.task_id)
+        .filter(
+            PipelineRun.workflow_name == "VideoPipelineV1",
+            PipelineRun.state.in_(active_states),
+            Task.status.notin_([TaskStatus.canceled, TaskStatus.published]),
+        )
+        .order_by(PipelineRun.created_at.desc())
+        .limit(5000)
+        .all()
+    )
+    by_task: dict[uuid.UUID, PipelineRun] = {}
+    for run in rows:
+        by_task.setdefault(run.task_id, run)
+    return by_task
+
+
+def _active_download_operations(db: Session) -> dict[uuid.UUID, Any]:
+    """Project durable download operations independently of Task.status."""
+    from videoroll.apps.youtube_ingest.download_dispatch import OPERATION_PREFIX
+    from videoroll.db.models import OperationInbox
+
+    rows = (
+        db.query(OperationInbox)
+        .filter(
+            OperationInbox.operation_key.like(f"{OPERATION_PREFIX}%"),
+            OperationInbox.status.in_(("pending", "processing")),
+        )
+        .order_by(OperationInbox.created_at.asc())
+        .limit(5000)
+        .all()
+    )
+    by_task: dict[uuid.UUID, Any] = {}
+    for operation in rows:
+        try:
+            task_id = uuid.UUID(operation.operation_key.removeprefix(OPERATION_PREFIX))
+        except (AttributeError, ValueError):
+            continue
+        by_task.setdefault(task_id, operation)
+    return by_task
 
 
 def _read_task_queue(db: Session, *, limit: int) -> TaskQueueRead:
-    """Project the active execution queue from durable job state.
-
-    Hatchet owns scheduling. This projection only reads durable business job
-    state so the UI cannot report synthetic queue states from the removed
-    Celery scheduler.
-    """
+    """Project queue UI from durable execution truth, never from stage guesses."""
     limit = _clamp_queue_limit(limit)
     live_task = Task.status.notin_([TaskStatus.canceled, TaskStatus.published])
 
@@ -2497,40 +2538,14 @@ def _read_task_queue(db: Session, *, limit: int) -> TaskQueueRead:
     ):
         render_by_task.setdefault(job.task_id, job)
 
-    candidate_ids = set(subtitle_by_task) | set(render_by_task)
-    failed_launch_by_task: dict[uuid.UUID, PipelineRun] = {}
-    pipeline_by_task: dict[uuid.UUID, PipelineRun] = {}
-    auto_tasks = (
-        db.query(Task)
-        .filter(
-            Task.source_type == SourceType.youtube,
-            Task.status.in_([TaskStatus.ingested, TaskStatus.downloaded]),
-            live_task,
-        )
-        .order_by(Task.priority.desc(), Task.created_at.asc())
-        .limit(5000)
-        .all()
+    pipeline_by_task = _latest_video_pipeline_runs(db)
+    download_by_task = _active_download_operations(db)
+    candidate_ids = (
+        set(subtitle_by_task)
+        | set(render_by_task)
+        | set(pipeline_by_task)
+        | set(download_by_task)
     )
-    for task in auto_tasks:
-        if parse_auto_youtube_created_by(task.created_by) is None:
-            continue
-        latest_parent = (
-            db.query(PipelineRun)
-            .filter(PipelineRun.task_id == task.id, PipelineRun.workflow_name == "VideoPipelineV1")
-            .order_by(PipelineRun.created_at.desc())
-            .first()
-        )
-        # A finished/failed workflow does not belong to the live task queue.
-        # A new automatic retry creates a new active PipelineRun.
-        if latest_parent is not None and latest_parent.state in {
-            "failed", "canceled", "superseded", "succeeded",
-        }:
-            continue
-        if latest_parent is not None:
-            pipeline_by_task[task.id] = latest_parent
-        if latest_parent is not None and latest_parent.state == "launch_failed":
-            failed_launch_by_task[task.id] = latest_parent
-        candidate_ids.add(task.id)
 
     if not candidate_ids:
         return TaskQueueRead(
@@ -2549,9 +2564,13 @@ def _read_task_queue(db: Session, *, limit: int) -> TaskQueueRead:
     )
 
     items: list[TaskQueueItemRead] = []
+    now = datetime.now(timezone.utc)
     for task in tasks:
         sj = subtitle_by_task.get(task.id)
         rj = render_by_task.get(task.id)
+        parent = pipeline_by_task.get(task.id)
+        download_operation = download_by_task.get(task.id)
+
         state = "queued"
         stage = "workflow"
         progress = 0
@@ -2580,19 +2599,41 @@ def _read_task_queue(db: Session, *, limit: int) -> TaskQueueRead:
             stage_since = sj.created_at
             updated_at = sj.updated_at
         else:
-            parent = pipeline_by_task.get(task.id)
             if parent is not None and parent.created_at is not None:
+                created_at = parent.created_at
                 stage_since = parent.created_at
-            failed_launch = failed_launch_by_task.get(task.id)
-            if failed_launch is not None:
+                updated_at = parent.updated_at
+                state = "running" if parent.state == "running" else "queued"
+            if parent is not None and parent.state == "launch_failed":
                 stage = "workflow_retry"
-                error_message = ("Waiting to retry Hatchet launch: " +
-                                 str(failed_launch.error_message or "workflow service unavailable"))
+                state = "queued"
+                error_message = (
+                    "Waiting to retry Hatchet launch: "
+                    + str(parent.error_message or "workflow service unavailable")
+                )
             else:
                 youtube_progress = _auto_youtube_queue_progress(db, task)
                 if youtube_progress is not None:
                     stage, progress, error_message = youtube_progress
-                    state = "running" if stage == "youtube_download" else "queued"
+                    if stage == "youtube_download":
+                        state = "running"
+                    elif stage == "workflow" and parent is not None and parent.state == "running":
+                        state = "running"
+                elif download_operation is not None:
+                    stage = "waiting_download"
+                    lease_until = download_operation.lease_until
+                    if lease_until is not None:
+                        lease_until = lease_until.replace(
+                            tzinfo=lease_until.tzinfo or timezone.utc
+                        )
+                    state = (
+                        "running"
+                        if download_operation.status == "processing"
+                        and lease_until is not None
+                        and lease_until > now
+                        else "queued"
+                    )
+                    error_message = download_operation.last_error
 
         items.append(
             TaskQueueItemRead(
@@ -2603,15 +2644,30 @@ def _read_task_queue(db: Session, *, limit: int) -> TaskQueueRead:
                 subtitle_job_id=subtitle_job_id,
                 render_job_id=render_job_id,
                 progress=progress,
-                stage_elapsed_seconds=max(0, int((datetime.now(timezone.utc) -
-                    stage_since.replace(tzinfo=stage_since.tzinfo or timezone.utc)).total_seconds())),
+                stage_elapsed_seconds=max(
+                    0,
+                    int(
+                        (
+                            now
+                            - stage_since.replace(
+                                tzinfo=stage_since.tzinfo or timezone.utc
+                            )
+                        ).total_seconds()
+                    ),
+                ),
                 error_message=error_message,
                 created_at=created_at,
                 updated_at=updated_at,
             )
         )
 
-    items.sort(key=lambda item: (0 if item.state == "running" else 1, -int(item.priority or 0), item.created_at))
+    items.sort(
+        key=lambda item: (
+            0 if item.state == "running" else 1,
+            -int(item.priority or 0),
+            item.created_at,
+        )
+    )
     return TaskQueueRead(
         settings=_download_queue_settings(db),
         running_count=sum(1 for item in items if item.state == "running"),

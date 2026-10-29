@@ -23,7 +23,7 @@ from videoroll.db.models import (
     Asset, AssetKind, DubbingJob, Platform, PublishJob, PublishState,
     SubtitleJob, SubtitleJobStatus, Task,
 )
-from videoroll.utils.auto_youtube import parse_auto_youtube_created_by
+from videoroll.utils.task_origin import is_auto_youtube_task
 
 logger = logging.getLogger(__name__)
 EVENT_NAME = "bilibili.auto_dub_p2"
@@ -71,7 +71,7 @@ def schedule_after_p1(db: Session, job: PublishJob, task: Task) -> bool:
     """Run inside the *same transaction* recording successful P1 publication."""
     if job.platform != Platform.bilibili or job.state != PublishState.published or not job.aid:
         return False
-    if job.batch_id is None or parse_auto_youtube_created_by(task.created_by) is None:
+    if job.batch_id is None or not is_auto_youtube_task(task):
         return False
     profile = get_auto_profile(db)
     if not (

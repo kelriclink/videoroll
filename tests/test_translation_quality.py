@@ -446,13 +446,13 @@ def test_genuinely_altered_numeric_value_still_blocked() -> None:
     assert {item["type"] for item in blocking_translation_issues(issues)} == {"number_mismatch"}
 
 
-def test_nonrecoverable_singleton_validation_is_not_retried_as_network_error() -> None:
+def test_validation_failure_retries_from_checkpoint_but_prompt_overflow_does_not() -> None:
     from videoroll.apps.subtitle_service.processing import (
         TranslationPromptTooLongError, TranslationValidationError,
     )
     from videoroll.apps.subtitle_service.translation_stage import is_retryable_translation_error
 
-    assert not is_retryable_translation_error(
+    assert is_retryable_translation_error(
         TranslationValidationError([{"idx": 2627, "type": "number_mismatch", "severity": "error"}])
     )
     assert not is_retryable_translation_error(TranslationPromptTooLongError("input budget exceeded"))

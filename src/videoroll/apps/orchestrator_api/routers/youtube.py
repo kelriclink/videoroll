@@ -118,8 +118,13 @@ def start_auto_youtube_for_existing_task(task_id: uuid.UUID, settings: Orchestra
 def run_youtube_home_scan_now(settings: OrchestratorSettings = Depends(get_settings)) -> YouTubeHomeScanRunResponse:
     try:
         result = youtube_service.run_home_scan(settings, force=True, raise_if_locked=True)
+    except youtube_service.YouTubeHomeScanAlreadyRunning as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": exc.code, "message": exc.message},
+        ) from exc
     except RuntimeError as exc:
-        raise HTTPException(status_code=409 if "already running" in str(exc).lower() else 400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except httpx.HTTPError as exc:
         raise HTTPException(status_code=502, detail=f"youtube home scan request failed: {exc}") from exc
     except HTTPException:
@@ -150,7 +155,13 @@ def fetch_youtube_meta(task_id: uuid.UUID, settings: OrchestratorSettings = Depe
 
 @router.post("/tasks/{task_id}/actions/youtube_download", response_model=YouTubeDownloadActionResponse)
 def download_youtube(task_id: uuid.UUID, settings: OrchestratorSettings = Depends(get_settings), db: Session = Depends(get_db), store: FileStore = Depends(get_store)) -> YouTubeDownloadActionResponse:
-    return youtube_service.download(task_id, settings=settings, db=db, store=store)
+    try:
+        return youtube_service.download(task_id, settings=settings, db=db, store=store)
+    except youtube_service.YouTubeConflict as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": exc.code, "message": exc.message},
+        ) from exc
 
 
 @router.post("/tasks/{task_id}/actions/youtube_download_enqueue")
@@ -160,9 +171,18 @@ def enqueue_youtube_download(task_id: uuid.UUID, db: Session = Depends(get_db)) 
     try:
         state = enqueue_download(db, task_id)
     except ValueError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "YOUTUBE_DOWNLOAD_ENQUEUE_REJECTED", "message": str(exc)},
+        ) from exc
     if state == "failed":
-        raise HTTPException(status_code=409, detail="download failed after bounded retries; inspect task error")
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "YOUTUBE_DOWNLOAD_RETRIES_EXHAUSTED",
+                "message": "download failed after bounded retries; inspect task error",
+            },
+        )
     return {"status": state, "task_id": str(task_id)}
 
 

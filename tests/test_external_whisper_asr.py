@@ -60,6 +60,7 @@ def test_asr_settings_exposes_external_whisper_defaults() -> None:
 def test_asr_settings_upgrades_exact_legacy_external_profile() -> None:
     db = MagicMock()
     db.get.return_value = SimpleNamespace(
+        version=1,
         value_json={
             "external_whisper": {
                 "base_url": "http://whisper.internal:8000/v1",
@@ -82,9 +83,35 @@ def test_asr_settings_upgrades_exact_legacy_external_profile() -> None:
     assert settings["external_whisper_max_segment_chars"] == 120
 
 
+def test_asr_current_schema_never_rewrites_values_that_resemble_legacy_defaults() -> None:
+    db = MagicMock()
+    db.get.return_value = SimpleNamespace(
+        version=2,
+        value_json={
+            "external_whisper": {
+                "min_silence_ms": 500,
+                "speech_pad_ms": 180,
+                "condition_on_previous_text": False,
+                "max_segment_seconds": 6.0,
+                "max_segment_chars": 80,
+            }
+        },
+    )
+
+    settings = get_asr_settings(db, _defaults())
+
+    assert settings["external_whisper_min_silence_ms"] == 500
+    assert settings["external_whisper_speech_pad_ms"] == 180
+    assert settings["external_whisper_condition_on_previous_text"] is False
+    assert settings["external_whisper_max_segment_seconds"] == 6.0
+    assert settings["external_whisper_max_segment_chars"] == 80
+    db.commit.assert_not_called()
+
+
 def test_asr_settings_keeps_custom_external_profile() -> None:
     db = MagicMock()
     db.get.return_value = SimpleNamespace(
+        version=2,
         value_json={
             "external_whisper": {
                 "min_silence_ms": 650,

@@ -172,6 +172,52 @@ def test_recovery_launcher_passes_stable_dispatch_key(monkeypatch: pytest.Monkey
     engine.dispose()
 
 
+def test_subtitle_recovery_reuses_launch_failed_attempt(monkeypatch: pytest.MonkeyPatch) -> None:
+    from videoroll.workflows import launcher as launcher_module
+
+    engine, factory, task_id = _database()
+    with factory() as db:
+        job = SubtitleJob(
+            task_id=task_id,
+            request_json={},
+            status=SubtitleJobStatus.queued,
+        )
+        db.add(job)
+        db.flush()
+        job_id = job.id
+        run = PipelineRun(
+            task_id=task_id,
+            engine="hatchet",
+            workflow_name="SubtitleJobV1",
+            state="launch_failed",
+            request_json={
+                "job_id": str(job_id),
+                "priority": 100,
+                "dispatch_key": "stable-recovery-key",
+            },
+            error_message="ConnectError: connection refused",
+        )
+        db.add(run)
+        db.commit()
+        run_id = run.id
+
+    client = _Client(payload={"workflow_run_id": "subtitle-recovered"})
+    monkeypatch.setattr(launcher_module.httpx, "Client", lambda *args, **kwargs: client)
+
+    result = PipelineLauncher(_settings(), session_factory=factory).launch_subtitle_job(
+        job_id,
+        dispatch_key="stable-recovery-key",
+    )
+
+    assert result.pipeline_run_id == run_id
+    assert result.external_run_id == "subtitle-recovered"
+    with factory() as db:
+        rows = db.query(PipelineRun).filter(PipelineRun.task_id == task_id).all()
+        assert len(rows) == 1
+        assert rows[0].state == "submitted"
+        assert rows[0].error_message is None
+
+
 def test_pipeline_launcher_persists_workflow_service_failure(monkeypatch: pytest.MonkeyPatch) -> None:
     from videoroll.workflows import launcher as launcher_module
 

@@ -13,6 +13,7 @@ from videoroll.db.base import Base
 from videoroll.db.models import (
     AppSetting,
     OperationInbox,
+    PipelineRun,
     RenderExecution,
     RenderJob,
     RenderJobStatus,
@@ -38,6 +39,7 @@ def db() -> Session:
         Task.__table__,
         AppSetting.__table__,
         OperationInbox.__table__,
+        PipelineRun.__table__,
         SubtitleJob.__table__,
         RenderJob.__table__,
         RenderWorker.__table__,

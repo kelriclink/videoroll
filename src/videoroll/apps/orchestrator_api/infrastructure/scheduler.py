@@ -333,7 +333,12 @@ class OrchestratorScheduler:
             self._cleanup_stop.wait(timeout=max(5, self._lease_recovery_interval_seconds))
 
     def _workflow_audit_loop(self) -> None:
-        from videoroll.workflows.pipeline_status_sync import reconcile_auto_pipeline_runs, recover_failed_auto_launches, recover_orphaned_youtube_download_pipelines
+        from videoroll.workflows.pipeline_status_sync import (
+            reconcile_auto_pipeline_runs,
+            recover_failed_auto_launches,
+            recover_failed_child_launches,
+            recover_orphaned_youtube_download_pipelines,
+        )
         while not self._workflow_audit_stop.is_set():
             try:
                 result = reconcile_auto_pipeline_runs(self.settings)
@@ -347,6 +352,14 @@ class OrchestratorScheduler:
                 if launches["checked"]:
                     logger.warning("automatic Hatchet launch recovery: checked=%d launched=%d errors=%d",
                                    launches["checked"], launches["launched"], launches["errors"])
+                child_launches = recover_failed_child_launches(self.settings)
+                if child_launches["checked"]:
+                    logger.warning(
+                        "child Hatchet launch recovery: checked=%d launched=%d errors=%d",
+                        child_launches["checked"],
+                        child_launches["launched"],
+                        child_launches["errors"],
+                    )
                 if result["updated"] or result["stranded_jobs_failed"]:
                     logger.info(
                         "workflow audit reconciled runs=%d stranded_subtitle_jobs=%d",

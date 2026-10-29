@@ -29,7 +29,7 @@ from videoroll.db.models import (
     TaskStatus,
 )
 from videoroll.storage.filesystem import FileStore
-from videoroll.utils.auto_youtube import parse_auto_youtube_created_by
+from videoroll.utils.task_origin import is_auto_youtube_task
 
 
 STOPPABLE_TASK_STATUSES = (
@@ -259,10 +259,10 @@ def auto_youtube_restart_options(task: Task, *, db: Session) -> tuple[bool, bool
     del db
     if task.source_type.value != "youtube" or task.status in {TaskStatus.published, TaskStatus.publishing, TaskStatus.canceled}:
         return False, None
-    marker = parse_auto_youtube_created_by(task.created_by)
-    if marker is None:
+    if not is_auto_youtube_task(task):
         return False, None
-    return True, marker.get("auto_publish")
+    # Automatic publish policy is runtime-configured, never frozen in task origin.
+    return True, None
 
 
 def active_bilibili_uploads(db: Session, task_ids: list[uuid.UUID]) -> dict[uuid.UUID, dict[str, Any]]:

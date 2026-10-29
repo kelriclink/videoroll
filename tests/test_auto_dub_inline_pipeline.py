@@ -125,15 +125,15 @@ def test_auto_dubbing_stage_is_idempotent_and_uses_original_video() -> None:
     db = MagicMock()
     db.get.return_value = task
     db.query.return_value.filter.return_value.order_by.return_value.first.side_effect = [
-        subtitle, source,
+        subtitle,
+        source,
+        None,
     ]
     with (
         patch("videoroll.apps.subtitle_service.auto_profile_store.get_auto_profile",
               return_value={"auto_publish": True, "auto_dub_p2": True,
                             "auto_publish_platforms": ["bilibili"],
                             "auto_dub_p2_prefix": "【配音】", "publish_title_prefix": "【熟肉】"}),
-        patch("videoroll.utils.auto_youtube.parse_auto_youtube_created_by",
-              return_value={"run_id": "test"}),
         patch("videoroll.apps.orchestrator_api.routers.youdub_native_routes.ensure_ready"),
         patch("videoroll.apps.orchestrator_api.routers.youdub_native_routes.create_dubbing_job",
               return_value=native_job) as create,
@@ -148,5 +148,6 @@ def test_auto_dubbing_stage_is_idempotent_and_uses_original_video() -> None:
     assert native_job.request_json["auto_p2_prefix"] == "【配音】"
     assert native_job.request_json["auto_p2_source"] == "video_pipeline"
     launcher.return_value.launch_dubbing_job.assert_called_once_with(
-        dub_id, dispatch_key=f"video-pipeline-auto-p2:{dub_id}"
+        dub_id,
+        dispatch_key=f"video-pipeline-auto-p2:{dub_id}:{dub_id}",
     )

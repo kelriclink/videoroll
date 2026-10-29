@@ -94,7 +94,7 @@ def auto_dubbing(
     """
     from videoroll.apps.subtitle_service.auto_profile_store import get_auto_profile
     from videoroll.db.models import SubtitleJob, SubtitleJobStatus, Asset, AssetKind
-    from videoroll.utils.auto_youtube import parse_auto_youtube_created_by
+    from videoroll.utils.task_origin import is_auto_youtube_task
 
     task = db.get(Task, task_id)
     if task is None:
@@ -104,7 +104,7 @@ def auto_dubbing(
             and "bilibili" in (profile.get("auto_publish_platforms") or [])):
         return {"status": "skipped", "detail": "automatic P2 is disabled",
                 "dubbing_job_id": None}
-    if parse_auto_youtube_created_by(task.created_by) is None:
+    if not is_auto_youtube_task(task):
         raise HTTPException(409, "automatic P2 requires an automatic YouTube task")
     subtitle = (db.query(SubtitleJob).filter(
         SubtitleJob.task_id == task_id,

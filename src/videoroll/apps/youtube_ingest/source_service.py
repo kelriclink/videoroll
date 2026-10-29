@@ -654,6 +654,7 @@ def scan_youtube_source_by_id(
         )
 
         for entry in selected_entries:
+            run_id = uuid.uuid4().hex if auto_process else None
             task = Task(
                 source_type=SourceType.youtube,
                 source_url=f"https://www.youtube.com/watch?v={entry.video_id}",
@@ -664,11 +665,13 @@ def scan_youtube_source_by_id(
                     encode_auto_youtube_created_by(
                         "auto_youtube",
                         auto_publish=None,
-                        run_id=uuid.uuid4().hex,
+                        run_id=run_id,
                     )
                     if auto_process
                     else None
                 ),
+                origin_kind="auto_youtube" if auto_process else None,
+                origin_run_id=run_id,
             )
             db.add(task)
             db.flush()

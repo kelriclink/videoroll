@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 
 from videoroll.ai.client import is_retryable_openai_error, openai_chat_config_from_settings
 from videoroll.ai.service import AIService
-from videoroll.apps.subtitle_service.model_provider_store import resolve_provider_settings
+from videoroll.apps.subtitle_service.translation_runtime import resolve_translation_runtime
 from videoroll.apps.subtitle_service.embeddings import embedding_settings_from_translate_settings
 from videoroll.apps.subtitle_service.processing import (
     Segment,
@@ -62,10 +62,12 @@ class TranslationRetryRequired(RuntimeError):
 
 
 def is_retryable_translation_error(error: Exception) -> bool:
-    # A single subtitle still failing semantic validation cannot be solved by
-    # restarting the entire Session. Preserve its completed prefix and expose
-    # the blocked index for manual correction instead of retry storms.
-    if isinstance(error, (TranslationValidationError, TranslationPromptTooLongError)):
+    # Validation failures are retryable because completed batches are checkpointed:
+    # a Hatchet retry resumes at the current batch instead of retranslating the
+    # whole subtitle. Prompt-size failures remain deterministic and must fail fast.
+    if isinstance(error, TranslationValidationError):
+        return True
+    if isinstance(error, TranslationPromptTooLongError):
         return False
     return is_retryable_openai_error(error)
 
@@ -108,18 +110,24 @@ def run_translation_stage(
         )
 
     log(f"translate: provider={provider} target_lang={target_lang} bilingual={bilingual}")
-    translate_settings = fresh_translate_settings()
-    model_provider_id = str(translate_cfg.get("model_provider_id") or "legacy")
-    model_id = str(translate_cfg.get("model_id") or "")
-    if provider == "openai" and (model_provider_id != "legacy" or model_id):
-        translate_settings = resolve_provider_settings(
-            db, translate_settings, model_provider_id, model_id,
-        )
-        # Pin the selected model for all translation/RAG calls in this job.
+    runtime = resolve_translation_runtime(
+        db,
+        fresh_translate_settings(),
+        provider=provider,
+        model_provider_id=translate_cfg.get("model_provider_id"),
+        model_id=translate_cfg.get("model_id"),
+    )
+    translate_settings = runtime.settings
+    if runtime.uses_custom_model:
+        # Pin one resolved runtime for translation, RAG and derived AI work.
         selected_settings = dict(translate_settings)
         fresh_translate_settings = lambda: dict(selected_settings)
         ai_service = AIService(fresh_translate_settings)
-        log(f"translate model: provider={model_provider_id} model={translate_settings['openai_model']}")
+        log(
+            "translate model: "
+            f"provider={runtime.model_provider_id} "
+            f"model={translate_settings['openai_model']}"
+        )
     else:
         ai_service = ai_service_factory()
     default_style = str(translate_settings["default_style"])

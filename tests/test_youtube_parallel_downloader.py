@@ -57,8 +57,11 @@ def test_settings_persist_and_validate_parallel_connections():
 
 
 def test_format_selector_only_chooses_aria_for_big_http_objects():
-    if not register_parallel_downloader():
-        pytest.skip("aria2c not installed on this test runner")
+    with patch(
+        "videoroll.apps.orchestrator_api.youtube_parallel_downloader.shutil.which",
+        return_value="/usr/bin/aria2c",
+    ):
+        assert register_parallel_downloader()
     settings = Settings()
     opts = yd.build_ydl_opts(settings, for_download=True)
     assert opts["videoroll_parallel_connections"] == 8
@@ -85,8 +88,11 @@ def test_format_selector_only_chooses_aria_for_big_http_objects():
 
 
 def test_unknown_size_direct_http_uses_aria2_and_dash_obeys_config():
-    if not register_parallel_downloader():
-        pytest.skip("aria2c not installed")
+    with patch(
+        "videoroll.apps.orchestrator_api.youtube_parallel_downloader.shutil.which",
+        return_value="/usr/bin/aria2c",
+    ):
+        assert register_parallel_downloader()
     settings = Settings(youtube_parallel_download_connections=16)
     opts = yd.build_ydl_opts(settings, for_download=True)
     assert opts["concurrent_fragment_downloads"] == 16

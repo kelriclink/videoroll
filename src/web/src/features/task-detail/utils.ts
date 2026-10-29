@@ -1,4 +1,5 @@
-import type { BiliTypeNode, DesktopGrant, YouTubeDownloadProgress, YouTubeSubtitleMode } from "./types";
+import type { BiliTypeNode, DesktopGrant, YouTubeDownloadProgress } from "./types";
+export { normalizeYouTubeSubtitleMode } from "../../lib/youtubeSubtitles";
 
 export function clampUploadProgress(value: number | null | undefined): number {
   const progress = Number(value);
@@ -29,13 +30,6 @@ export function youtubeDownloadStatusLabel(status: YouTubeDownloadProgress["stat
     completed: "下载完成",
     failed: "下载失败",
   }[status];
-}
-
-export function normalizeYouTubeSubtitleMode(value: unknown, legacyPrefer?: boolean | null): YouTubeSubtitleMode {
-  const mode = String(value ?? "").trim().toLowerCase();
-  if (mode === "off" || mode === "target" || mode === "auto_source") return mode;
-  if (legacyPrefer === false) return "off";
-  return "target";
 }
 
 export function clampText(text: string, maxLen: number): string {

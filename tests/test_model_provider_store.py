@@ -252,3 +252,29 @@ def test_remote_catalog_can_import_capacity_without_touching_user_model(
         "large": {"context_window": 10_000_000, "max_output_tokens": 1_000_000},
     }}
     assert db.get(store.AppSetting, store.KEY).value_json["providers"][0]["models"] == original
+
+
+def test_translation_runtime_resolves_the_same_custom_provider_for_derived_calls(
+    monkeypatch: pytest.MonkeyPatch,
+    legacy: dict[str, Any],
+) -> None:
+    from videoroll.apps.subtitle_service.translation_runtime import resolve_translation_runtime
+
+    monkeypatch.setattr(store, "encrypt_str", lambda value: "sealed:" + value)
+    monkeypatch.setattr(store, "decrypt_str", lambda value: value.removeprefix("sealed:"))
+    db = FakeDB()
+    provider = store.save_provider(db, None, payload())  # type: ignore[arg-type]
+
+    runtime = resolve_translation_runtime(
+        db,  # type: ignore[arg-type]
+        legacy,
+        provider="openai",
+        model_provider_id=provider["id"],
+        model_id="qwen:test",
+    )
+
+    assert runtime.uses_custom_model is True
+    assert runtime.model_provider_id == provider["id"]
+    assert runtime.settings["openai_base_url"] == "http://localhost:11434/v1"
+    assert runtime.settings["openai_model"] == "qwen:test"
+    assert runtime.settings["openai_api_key"] == "test-secret"

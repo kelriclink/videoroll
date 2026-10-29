@@ -21,7 +21,7 @@ from videoroll.apps.subtitle_service.processing import (
 from videoroll.config import get_orchestrator_settings
 from videoroll.db.models import AppSetting, Asset, AssetKind, RenderExecution, RenderJob, RenderJobStatus, DubbingJob, RenderWorker, RenderWorkerEnrollment, SubtitleJob, SubtitleJobStatus, Task, TaskStatus
 from videoroll.storage.filesystem import FileStore, StorageObjectNotFound
-from videoroll.utils.auto_youtube import parse_auto_youtube_created_by
+from videoroll.utils.task_origin import is_auto_youtube_task
 
 LEASE_SECONDS = 180
 WORKER_STALE_SECONDS = 180
@@ -369,7 +369,7 @@ def _build_spec(db: Session, store: FileStore, job: RenderJob, execution_id: uui
     req = dict(job.request_json or {})
     task = db.get(Task, job.task_id)
     automatic = bool(req.get("runtime_profile")) if "runtime_profile" in req else bool(
-        task is not None and parse_auto_youtube_created_by(task.created_by) is not None
+        task is not None and is_auto_youtube_task(task)
     )
     if automatic:
         profile = dict(get_auto_profile(db))
@@ -616,7 +616,7 @@ def complete_execution(db: Session, execution_id: uuid.UUID, payload: Any) -> Re
             operation_key=f"workflow-dubbing-finished:{dub.id}:succeeded")
     after_render = req.get("after_render") if isinstance(req, dict) else None
     automatic = bool(req.get("runtime_profile")) if "runtime_profile" in req else bool(
-        task is not None and parse_auto_youtube_created_by(task.created_by) is not None
+        task is not None and is_auto_youtube_task(task)
     )
     if not is_dubbed:
         create_outbox_event(

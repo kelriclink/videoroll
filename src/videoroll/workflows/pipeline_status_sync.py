@@ -15,8 +15,9 @@ from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from videoroll.apps.orchestrator_api.infrastructure.internal_http import internal_http_headers
-from videoroll.db.models import PipelineRun, SubtitleJob, SubtitleJobStatus, SourceType, Task, TaskStatus
+from videoroll.db.models import DubbingJob, PipelineRun, SubtitleJob, SubtitleJobStatus, SourceType, Task, TaskStatus
 from videoroll.db.session import get_sessionmaker
+from videoroll.utils.task_origin import task_origin_context
 
 logger = logging.getLogger(__name__)
 AUTO_WORKFLOW_NAME = "VideoPipelineV1"
@@ -154,25 +155,38 @@ def recover_orphaned_youtube_download_pipelines(settings, *, limit: int = 3) -> 
     for _ in range(max(0, min(int(limit), 10))):
         with factory() as db:
             now = datetime.now(timezone.utc)
-            candidates = (db.query(OperationInbox)
-                .filter(OperationInbox.operation_key.like("youtube-download:%"),
-                        OperationInbox.status == "processing",
-                        OperationInbox.lease_until < now,
-                        or_(OperationInbox.request_json["auto_workflow_recoveries"].as_integer().is_(None),
-                            OperationInbox.request_json["auto_workflow_recoveries"].as_integer() < 1))
+            candidates = (
+                db.query(OperationInbox)
+                .filter(
+                    OperationInbox.operation_key.like("youtube-download:%"),
+                    OperationInbox.status == "processing",
+                    OperationInbox.lease_until < now,
+                    OperationInbox.recovery_count < 1,
+                )
                 .order_by(OperationInbox.created_at.asc())
-                .limit(200).all())
+                .limit(200)
+                .all()
+            )
             chosen = None
             for operation in candidates:
-                info = operation.request_json if isinstance(operation.request_json, dict) else {}
-                if int(info.get("auto_workflow_recoveries", 0)) >= 1:
+                legacy = operation.request_json if isinstance(operation.request_json, dict) else {}
+                if max(
+                    int(operation.recovery_count or 0),
+                    int(legacy.get("auto_workflow_recoveries", 0) or 0),
+                ) >= 1:
                     continue
                 try:
                     task_id = uuid.UUID(operation.operation_key.removeprefix("youtube-download:"))
                 except ValueError:
                     continue
                 task = db.get(Task, task_id)
-                if task is None or task.status != TaskStatus.ingested or not str(task.created_by or "").startswith("auto_youtube;"):
+                origin = task_origin_context(task) if task is not None else None
+                if (
+                    task is None
+                    or task.status != TaskStatus.ingested
+                    or origin is None
+                    or origin.origin not in {"auto_youtube", "youtube_home_scan"}
+                ):
                     continue
                 parent = (db.query(PipelineRun).filter(
                     PipelineRun.task_id == task_id,
@@ -187,11 +201,14 @@ def recover_orphaned_youtube_download_pipelines(settings, *, limit: int = 3) -> 
                 deadline = row.lease_until.replace(tzinfo=row.lease_until.tzinfo or timezone.utc)
                 if deadline >= now:
                     continue
-                claim = dict(row.request_json or {})
-                if int(claim.get("auto_workflow_recoveries", 0)) >= 1:
+                legacy_claim = dict(row.request_json or {})
+                if max(
+                    int(row.recovery_count or 0),
+                    int(legacy_claim.get("auto_workflow_recoveries", 0) or 0),
+                ) >= 1:
                     continue
-                claim["auto_workflow_recoveries"] = 1
-                row.request_json = claim
+                row.recovery_count = 1
+                row.request_json = {"task_id": str(task_id)}
                 db.commit()
                 chosen = task_id
                 break
@@ -229,7 +246,11 @@ def recover_failed_auto_launches(settings, *, limit: int = 3) -> dict[str, int]:
                 PipelineRun.created_at >= now - timedelta(days=6),
                 PipelineRun.updated_at <= now - timedelta(seconds=90),
                 Task.status == TaskStatus.ingested,
-                Task.created_by.like("auto_youtube;%"),
+                or_(
+                    Task.origin_kind.in_(("auto_youtube", "youtube_home_scan")),
+                    Task.created_by.like("auto_youtube;%"),
+                    Task.created_by.like("youtube_home_scan;%"),
+                ),
             )
             .order_by(PipelineRun.updated_at.asc())
             .limit(max(1, min(int(limit), 10)))
@@ -262,6 +283,82 @@ def recover_failed_auto_launches(settings, *, limit: int = 3) -> dict[str, int]:
             logger.warning("failed to recover automatic Hatchet launch task=%s: %s", task_id, exc)
             if isinstance(exc, httpx.TransportError):
                 break  # Don't flood an unavailable workflow API.
+    return stats
+
+
+def recover_failed_child_launches(settings, *, limit: int = 10) -> dict[str, int]:
+    """Retry child workflow submissions without creating another audit attempt."""
+    from videoroll.workflows.launcher import (
+        DUBBING_JOB_WORKFLOW_NAME,
+        SUBTITLE_JOB_WORKFLOW_NAME,
+        PipelineLauncher,
+    )
+
+    now = datetime.now(timezone.utc)
+    factory = get_sessionmaker(settings.database_url)
+    with factory() as db:
+        rows = (
+            db.query(PipelineRun)
+            .filter(
+                PipelineRun.engine == "hatchet",
+                PipelineRun.workflow_name.in_(
+                    (SUBTITLE_JOB_WORKFLOW_NAME, DUBBING_JOB_WORKFLOW_NAME)
+                ),
+                PipelineRun.state == "launch_failed",
+                PipelineRun.external_run_id.is_(None),
+                PipelineRun.created_at >= now - timedelta(days=6),
+                PipelineRun.updated_at <= now - timedelta(seconds=90),
+            )
+            .order_by(PipelineRun.updated_at.asc())
+            .limit(max(1, min(int(limit), 50)))
+            .all()
+        )
+        candidates = [
+            (
+                row.workflow_name,
+                str((row.request_json or {}).get("job_id") or ""),
+                str((row.request_json or {}).get("dispatch_key") or ""),
+            )
+            for row in rows
+        ]
+
+    stats = {"checked": 0, "launched": 0, "errors": 0}
+    launcher = PipelineLauncher(settings)
+    for workflow_name, raw_job_id, dispatch_key in candidates:
+        try:
+            job_id = uuid.UUID(raw_job_id)
+        except ValueError:
+            continue
+        if not dispatch_key:
+            continue
+
+        with factory() as db:
+            if workflow_name == SUBTITLE_JOB_WORKFLOW_NAME:
+                job = db.get(SubtitleJob, job_id)
+                eligible = job is not None and job.status == SubtitleJobStatus.queued
+            else:
+                job = db.get(DubbingJob, job_id)
+                eligible = job is not None and str(job.status or "") == "queued"
+            if not eligible:
+                continue
+
+        stats["checked"] += 1
+        try:
+            if workflow_name == SUBTITLE_JOB_WORKFLOW_NAME:
+                launcher.launch_subtitle_job(job_id, dispatch_key=dispatch_key)
+            else:
+                launcher.launch_dubbing_job(job_id, dispatch_key=dispatch_key)
+            stats["launched"] += 1
+        except Exception as exc:
+            stats["errors"] += 1
+            logger.warning(
+                "failed to recover child Hatchet launch workflow=%s job=%s: %s",
+                workflow_name,
+                job_id,
+                exc,
+            )
+            if isinstance(exc, httpx.TransportError):
+                break
     return stats
 
 

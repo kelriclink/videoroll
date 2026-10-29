@@ -1,7 +1,8 @@
 import { fetchJson } from "../lib/http";
 import { orchestratorUrl } from "../lib/urls";
+import type { YouTubeSubtitleMode } from "../lib/youtubeSubtitles";
 
-export type YouTubeSubtitleMode = "off" | "target" | "auto_source";
+export type { YouTubeSubtitleMode } from "../lib/youtubeSubtitles";
 export type SubtitleActionResponse = { job_id: string; status: string };
 export type SubtitleAutoProfile = {
   formats: string[];

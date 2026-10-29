@@ -73,8 +73,8 @@ def test_reserve_publish_stage_slot_uses_queue_depth_to_push_later_calls() -> No
         patch.object(worker, "_count_pending_publish_jobs", return_value=3),
         patch.object(worker.time, "time", return_value=1000.0),
     ):
-        first = worker._reserve_publish_stage_slot(None, stage="upload", job_id="job-1")  # type: ignore[arg-type]
-        second = worker._reserve_publish_stage_slot(None, stage="upload", job_id="job-2")  # type: ignore[arg-type]
+        first = worker._reserve_publish_stage_slot(stage="upload", job_id="job-1")
+        second = worker._reserve_publish_stage_slot(stage="upload", job_id="job-2")
 
     assert first["wait_seconds"] == 0.0
     assert first["interval_seconds"] == 75.0

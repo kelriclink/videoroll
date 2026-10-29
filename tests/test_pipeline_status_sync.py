@@ -11,7 +11,7 @@ from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.orm import sessionmaker
 
 from videoroll.db.base import Base
-from videoroll.db.models import PipelineRun, SourceLicense, SourceType, SubtitleJob, Task, TaskStatus
+from videoroll.db.models import PipelineRun, SourceLicense, SourceType, SubtitleJob, SubtitleJobStatus, Task, TaskStatus
 from videoroll.workflows import pipeline_status_sync as sync
 
 
@@ -167,6 +167,65 @@ def test_failed_auto_launch_recovery_reuses_durable_attempt(monkeypatch):
         original = db.query(PipelineRun).filter(PipelineRun.task_id == auto_id).one()
         assert original.request_json["dispatch_key"] == f"auto-youtube:{auto_id}"
         assert db.query(Task).filter(Task.id == auto_id).count() == 1
+    engine.dispose()
+
+
+def test_failed_child_launch_recovery_reuses_original_dispatch_key(monkeypatch):
+    from datetime import datetime, timedelta, timezone
+    from videoroll.workflows import launcher as launch_module
+
+    engine, factory, _ = _factory()
+    old = datetime.now(timezone.utc) - timedelta(minutes=10)
+    with factory() as db:
+        task = Task(
+            source_type=SourceType.youtube,
+            source_license=SourceLicense.authorized,
+            status=TaskStatus.ingested,
+        )
+        db.add(task)
+        db.flush()
+        job = SubtitleJob(
+            task_id=task.id,
+            status=SubtitleJobStatus.queued,
+            request_json={},
+            progress=0,
+        )
+        db.add(job)
+        db.flush()
+        db.add(
+            PipelineRun(
+                task_id=task.id,
+                engine="hatchet",
+                workflow_name="SubtitleJobV1",
+                state="launch_failed",
+                created_at=old,
+                updated_at=old,
+                request_json={
+                    "job_id": str(job.id),
+                    "dispatch_key": "subtitle-stable-key",
+                },
+            )
+        )
+        db.commit()
+        job_id = job.id
+
+    seen = []
+    monkeypatch.setattr(sync, "get_sessionmaker", lambda _url: factory)
+    monkeypatch.setattr(
+        launch_module,
+        "PipelineLauncher",
+        lambda _settings: SimpleNamespace(
+            launch_subtitle_job=lambda current, dispatch_key=None: seen.append(
+                (current, dispatch_key)
+            ),
+            launch_dubbing_job=lambda *_args, **_kwargs: None,
+        ),
+    )
+
+    result = sync.recover_failed_child_launches(_settings())
+
+    assert result == {"checked": 1, "launched": 1, "errors": 0}
+    assert seen == [(job_id, "subtitle-stable-key")]
     engine.dispose()
 
 

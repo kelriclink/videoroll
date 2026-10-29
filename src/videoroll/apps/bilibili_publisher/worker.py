@@ -428,12 +428,16 @@ def _redis_client() -> Redis | None:
         return _REDIS_CLIENT
 
 
-def _count_pending_publish_jobs(db: Session) -> int:
-    return int(
-        db.query(Task)
-        .filter(Task.status == TaskStatus.publishing)
-        .count()
-    )
+def _count_pending_publish_jobs() -> int:
+    # Never borrow the long-lived publisher Session for a throttle read. The
+    # caller may sleep for minutes after this count, which would otherwise keep
+    # a PostgreSQL transaction idle across network I/O.
+    with _db() as db:
+        return int(
+            db.query(Task)
+            .filter(Task.status == TaskStatus.publishing)
+            .count()
+        )
 
 
 def _publish_throttle_config(stage: str) -> tuple[float, float, float]:
@@ -495,8 +499,8 @@ def _parse_float(raw: Any) -> float | None:
         return None
 
 
-def _reserve_publish_stage_slot(db: Session, *, stage: str, job_id: str) -> dict[str, Any]:
-    pending_jobs = _count_pending_publish_jobs(db)
+def _reserve_publish_stage_slot(*, stage: str, job_id: str) -> dict[str, Any]:
+    pending_jobs = _count_pending_publish_jobs()
     interval_seconds = _compute_publish_throttle_interval(stage, pending_jobs=pending_jobs)
     out = {
         "stage": stage,
@@ -549,8 +553,8 @@ def _reserve_publish_stage_slot(db: Session, *, stage: str, job_id: str) -> dict
                 pass
 
 
-def _apply_publish_stage_throttle(db: Session, *, stage: str, job_id: str) -> dict[str, Any]:
-    info = _reserve_publish_stage_slot(db, stage=stage, job_id=job_id)
+def _apply_publish_stage_throttle(*, stage: str, job_id: str) -> dict[str, Any]:
+    info = _reserve_publish_stage_slot(stage=stage, job_id=job_id)
     wait_seconds = float(info.get("wait_seconds") or 0.0)
     if wait_seconds > 0.25:
         logger.info(
@@ -850,7 +854,7 @@ def _process_job_impl(self, job_id: str) -> dict[str, Any]:
             if cover_path:
                 cover_url = client.upload_cover(cover_path, csrf=csrf)
 
-            upload_throttle = _apply_publish_stage_throttle(db, stage="upload", job_id=job_id)
+            upload_throttle = _apply_publish_stage_throttle(stage="upload", job_id=job_id)
             _set_bilibili_upload_progress(db, job, active=True, progress=0)
             last_upload_progress = -1
 
@@ -984,7 +988,7 @@ def _process_job_impl(self, job_id: str) -> dict[str, Any]:
                 ai_info.get("typeid"),
             )
 
-            submit_throttle = _apply_publish_stage_throttle(db, stage="submit", job_id=job_id)
+            submit_throttle = _apply_publish_stage_throttle(stage="submit", job_id=job_id)
             archive_submission_started = True
             add_resp, meta, desc_retry = _add_archive_with_desc_retry(
                 client=client,

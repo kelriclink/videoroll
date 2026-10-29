@@ -116,6 +116,24 @@ def _non_retryable(message: str, *, cause: Exception | None = None) -> None:
     raise NonRetryableException(message) from cause
 
 
+def _orchestrator_error(response: httpx.Response) -> tuple[str | None, str]:
+    """Read machine-readable service errors without coupling control flow to prose."""
+    message = (response.text or "").strip()
+    code: str | None = None
+    try:
+        payload = response.json()
+    except (ValueError, TypeError):
+        payload = None
+    if isinstance(payload, dict):
+        detail = payload.get("detail")
+        if isinstance(detail, dict):
+            code = str(detail.get("code") or "").strip() or None
+            message = str(detail.get("message") or message).strip()
+        elif isinstance(detail, str):
+            message = detail.strip()
+    return code, message
+
+
 async def _get_youtube_download_progress(
     settings: WorkflowRuntimeSettings,
     task_id: str,
@@ -219,19 +237,17 @@ async def _ensure_youtube_download(
         # An acknowledged durable enqueue is not a completed video download.
         return await _wait_for_youtube_download(settings, task_id, ctx)
 
-    detail = (response.text or "").strip()
+    code, detail = _orchestrator_error(response)
     status = int(response.status_code)
-    if status == 409 and any(
-        marker in detail.lower()
-        for marker in (
-            "already in progress",
-            "result is being recovered",
-            "recovery is already in progress",
-        )
-    ):
+    if status == 409 and code in {
+        "YOUTUBE_DOWNLOAD_IN_PROGRESS",
+        "YOUTUBE_DOWNLOAD_RESULT_RECOVERING",
+        "YOUTUBE_DOWNLOAD_RECOVERY_IN_PROGRESS",
+    }:
         return await _wait_for_youtube_download(settings, task_id, ctx)
     if status not in {429, 500, 502, 503, 504}:
-        _non_retryable(f"orchestrator returned {status}: {detail[:1000]}")
+        suffix = f" [{code}]" if code else ""
+        _non_retryable(f"orchestrator returned {status}{suffix}: {detail[:1000]}")
     raise RuntimeError(f"orchestrator returned retryable {status}: {detail[:1000]}")
 
 

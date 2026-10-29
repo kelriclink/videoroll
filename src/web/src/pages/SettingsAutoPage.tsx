@@ -7,8 +7,11 @@ import { Button, SettingsSaveBar } from "../components/ui";
 import { useUnsavedChangesGuard } from "../hooks/useUnsavedChangesGuard";
 import { fetchJson } from "../lib/http";
 import { ORCHESTRATOR_URL } from "../lib/urls";
+import {
+  normalizeYouTubeSubtitleMode,
+  type YouTubeSubtitleMode,
+} from "../lib/youtubeSubtitles";
 
-type YouTubeSubtitleMode = "off" | "target" | "auto_source";
 type PublishPlatform = "bilibili" | "douyin" | "xiaohongshu" | "kuaishou";
 
 const PUBLISH_PLATFORMS: Array<{ id: PublishPlatform; label: string }> = [
@@ -66,13 +69,6 @@ type IntelHardwareProbe = {
   pci_id?: string | null;
   detail: string;
 };
-
-function normalizeYouTubeSubtitleMode(value: unknown, legacyPrefer?: boolean | null): YouTubeSubtitleMode {
-  const mode = String(value ?? "").trim().toLowerCase();
-  if (mode === "off" || mode === "target" || mode === "auto_source") return mode;
-  if (legacyPrefer === false) return "off";
-  return "target";
-}
 
 function autoProfileSnapshotFromServer(profile: AutoProfile, enabledPlatforms: PublishPlatform[] | null): string {
   const formats = Array.isArray(profile.formats) ? profile.formats : [];

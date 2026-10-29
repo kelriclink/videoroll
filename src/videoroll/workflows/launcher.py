@@ -211,7 +211,6 @@ class PipelineLauncher:
 
     def launch_subtitle_job(self, job_id: uuid.UUID, *, dispatch_key: str | None = None) -> PipelineLaunchResult:
         db = self.session_factory()
-        run_id = uuid.uuid4()
         try:
             job = db.get(SubtitleJob, job_id)
             if job is None:
@@ -220,16 +219,54 @@ class PipelineLauncher:
             if task is None:
                 raise ValueError(f"task not found for subtitle job: {job.task_id}")
             priority = int(task.priority or 0)
-            request = {"job_id": str(job_id), "priority": priority,
-                       "dispatch_key": dispatch_key or f"subtitle:{run_id}"}
-            run = PipelineRun(
-                id=run_id,
-                task_id=job.task_id,
-                engine="hatchet",
-                workflow_name=SUBTITLE_JOB_WORKFLOW_NAME,
-                state="submitting",
-                request_json=request,
-            )
+
+            reusable: PipelineRun | None = None
+            if dispatch_key:
+                rows = (
+                    db.query(PipelineRun)
+                    .filter(
+                        PipelineRun.task_id == job.task_id,
+                        PipelineRun.engine == "hatchet",
+                        PipelineRun.workflow_name == SUBTITLE_JOB_WORKFLOW_NAME,
+                        PipelineRun.state.in_(("submitting", "launch_failed")),
+                        PipelineRun.external_run_id.is_(None),
+                    )
+                    .order_by(PipelineRun.created_at.desc())
+                    .with_for_update()
+                    .all()
+                )
+                reusable = next(
+                    (
+                        row
+                        for row in rows
+                        if str((row.request_json or {}).get("job_id") or "") == str(job_id)
+                        and str((row.request_json or {}).get("dispatch_key") or "") == dispatch_key
+                    ),
+                    None,
+                )
+
+            if reusable is not None:
+                run = reusable
+                run_id = run.id
+                request = dict(run.request_json or {})
+                run.state = "submitting"
+                run.finished_at = None
+                run.error_message = None
+            else:
+                run_id = uuid.uuid4()
+                request = {
+                    "job_id": str(job_id),
+                    "priority": priority,
+                    "dispatch_key": dispatch_key or f"subtitle:{run_id}",
+                }
+                run = PipelineRun(
+                    id=run_id,
+                    task_id=job.task_id,
+                    engine="hatchet",
+                    workflow_name=SUBTITLE_JOB_WORKFLOW_NAME,
+                    state="submitting",
+                    request_json=request,
+                )
             db.add(run)
             db.commit()
             try:
@@ -257,7 +294,6 @@ class PipelineLauncher:
 
     def launch_dubbing_job(self, job_id: uuid.UUID, *, dispatch_key: str | None = None) -> PipelineLaunchResult:
         db = self.session_factory()
-        run_id = uuid.uuid4()
         try:
             job = db.get(DubbingJob, job_id)
             if job is None:
@@ -265,15 +301,55 @@ class PipelineLauncher:
             task = db.get(Task, job.task_id)
             if task is None:
                 raise ValueError(f"task not found for dubbing job: {job.task_id}")
-            request = {
-                "job_id": str(job_id), "priority": int(task.priority or 0),
-                "dispatch_key": dispatch_key or f"{job_id}:{uuid.uuid4().hex}",
-            }
-            run = PipelineRun(
-                id=run_id, task_id=job.task_id, engine="hatchet",
-                workflow_name=DUBBING_JOB_WORKFLOW_NAME, state="submitting",
-                request_json=request,
-            )
+            priority = int(task.priority or 0)
+
+            reusable: PipelineRun | None = None
+            if dispatch_key:
+                rows = (
+                    db.query(PipelineRun)
+                    .filter(
+                        PipelineRun.task_id == job.task_id,
+                        PipelineRun.engine == "hatchet",
+                        PipelineRun.workflow_name == DUBBING_JOB_WORKFLOW_NAME,
+                        PipelineRun.state.in_(("submitting", "launch_failed")),
+                        PipelineRun.external_run_id.is_(None),
+                    )
+                    .order_by(PipelineRun.created_at.desc())
+                    .with_for_update()
+                    .all()
+                )
+                reusable = next(
+                    (
+                        row
+                        for row in rows
+                        if str((row.request_json or {}).get("job_id") or "") == str(job_id)
+                        and str((row.request_json or {}).get("dispatch_key") or "") == dispatch_key
+                    ),
+                    None,
+                )
+
+            if reusable is not None:
+                run = reusable
+                run_id = run.id
+                request = dict(run.request_json or {})
+                run.state = "submitting"
+                run.finished_at = None
+                run.error_message = None
+            else:
+                run_id = uuid.uuid4()
+                request = {
+                    "job_id": str(job_id),
+                    "priority": priority,
+                    "dispatch_key": dispatch_key or f"{job_id}:{run_id}",
+                }
+                run = PipelineRun(
+                    id=run_id,
+                    task_id=job.task_id,
+                    engine="hatchet",
+                    workflow_name=DUBBING_JOB_WORKFLOW_NAME,
+                    state="submitting",
+                    request_json=request,
+                )
             db.add(run)
             db.commit()
             try:

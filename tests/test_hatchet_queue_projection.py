@@ -8,7 +8,7 @@ from sqlalchemy.orm import sessionmaker
 
 from videoroll.apps.subtitle_service import main as subtitle_main
 from videoroll.db.base import Base
-from videoroll.db.models import AppSetting, OperationInbox, RenderJob, SourceLicense, SourceType, SubtitleJob, SubtitleJobStatus, Task, TaskStatus
+from videoroll.db.models import AppSetting, OperationInbox, PipelineRun, RenderJob, SourceLicense, SourceType, SubtitleJob, SubtitleJobStatus, Task, TaskStatus
 
 
 @compiles(JSONB, "sqlite")
@@ -18,7 +18,13 @@ def _compile_jsonb_for_sqlite(_type: JSONB, _compiler: object, **_kwargs: object
 
 def test_hatchet_queue_projection_uses_durable_job_state(monkeypatch: pytest.MonkeyPatch) -> None:
     engine = create_engine("sqlite:///:memory:")
-    Base.metadata.create_all(engine, tables=[Task.__table__, AppSetting.__table__, OperationInbox.__table__, SubtitleJob.__table__, RenderJob.__table__])
+    Base.metadata.create_all(
+        engine,
+        tables=[
+            Task.__table__, AppSetting.__table__, OperationInbox.__table__, PipelineRun.__table__,
+            SubtitleJob.__table__, RenderJob.__table__,
+        ],
+    )
     factory = sessionmaker(bind=engine, autocommit=False, autoflush=False)
     monkeypatch.setenv("HATCHET_SUBTITLE_WORKER_SLOTS", "3")
 

@@ -145,6 +145,10 @@ class Task(Base):
     stopped_status: Mapped[Optional[TaskStatus]] = mapped_column(Enum(TaskStatus, name="task_status"), nullable=True)
     priority: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     created_by: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    # Runtime origin is structured. created_by remains audit/display metadata only.
+    origin_kind: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    origin_run_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    restart_generation: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
 
     error_code: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
@@ -168,6 +172,7 @@ class Task(Base):
         Index("ix_tasks_status_created_at", "status", "created_at"),
         Index("ix_tasks_priority_created_at", "priority", "created_at"),
         Index("ix_tasks_active_publish_batch_id", "active_publish_batch_id"),
+        Index("ix_tasks_origin_kind_status", "origin_kind", "status"),
     )
 
 
@@ -627,6 +632,11 @@ class OperationInbox(Base):
     lease_owner: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
     lease_until: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     heartbeat_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Retry/recovery state is explicit instead of being smuggled through request_json.
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    retry_after: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    recovery_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    restart_token: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
     last_error: Mapped[Optional[str]] = mapped_column(String(1024), nullable=True)
     completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
@@ -635,6 +645,7 @@ class OperationInbox(Base):
     __table_args__ = (
         UniqueConstraint("operation_key", name="uq_operation_inbox_operation_key"),
         Index("ix_operation_inbox_pending_lease", "status", "lease_until", "created_at"),
+        Index("ix_operation_inbox_retry", "status", "retry_after", "lease_until", "created_at"),
     )
 
 
