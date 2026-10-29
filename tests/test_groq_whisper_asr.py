@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import wave
 import json
 from types import SimpleNamespace
@@ -470,3 +471,47 @@ def test_groq_whisper_restores_vad_skipped_chunk_without_rechecking(tmp_path) ->
         )
 
     assert segments == []
+
+
+
+def test_groq_whisper_provider_gate_uses_long_cancellable_queue_wait(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    audio_path = tmp_path / "audio.wav"
+    _wav(audio_path)
+    captured: dict[str, object] = {}
+    cancel_check = MagicMock()
+
+    class FakeGate:
+        def __init__(self, _redis_url, _provider, *, max_concurrency, slot_ttl_seconds):
+            captured["max_concurrency"] = max_concurrency
+            captured["slot_ttl_seconds"] = slot_ttl_seconds
+
+        @contextlib.contextmanager
+        def slot(self, *, wait_seconds, cancel_check=None):
+            captured["wait_seconds"] = wait_seconds
+            captured["cancel_check"] = cancel_check
+            yield
+
+    response = MagicMock()
+    response.raise_for_status.return_value = None
+    response.json.return_value = {
+        "segments": [{"start": 0.0, "end": 1.0, "text": "ok"}],
+    }
+
+    monkeypatch.setattr(processing, "ProviderRateGate", FakeGate)
+    monkeypatch.setattr(processing, "_encode_groq_flac_chunk", lambda *_args, **_kwargs: b"flac")
+    monkeypatch.setattr(processing.httpx, "post", lambda *_args, **_kwargs: response)
+
+    segments = processing.transcribe_groq_whisper(
+        audio_path,
+        api_key="gsk-test",
+        vad_enabled=False,
+        timeout_seconds=180,
+        provider_max_concurrency=1,
+        provider_wait_seconds=3600,
+        cancel_check=cancel_check,
+    )
+
+    assert [segment.text for segment in segments] == ["ok"]
+    assert captured["max_concurrency"] == 1
+    assert captured["wait_seconds"] == 3600
+    assert captured["cancel_check"] is cancel_check

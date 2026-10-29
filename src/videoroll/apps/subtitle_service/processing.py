@@ -1880,6 +1880,8 @@ def transcribe_groq_whisper(
     vad_threshold: float = _OPENVINO_VAD_THRESHOLD,
     redis_url: str = "",
     provider_max_concurrency: int = 1,
+    provider_wait_seconds: float = 3600.0,
+    cancel_check: Callable[[], None] | None = None,
     progress_callback: Callable[[float, float], None] | None = None,
 ) -> list[Segment]:
     """Transcribe through Groq using resumable, VAD-gated FLAC chunks."""
@@ -1891,6 +1893,14 @@ def transcribe_groq_whisper(
         raise RuntimeError("Groq Whisper model must be whisper-large-v3 or whisper-large-v3-turbo")
     url = build_openai_audio_transcriptions_url(base_url or _GROQ_DEFAULT_BASE_URL)
     timeout = max(1.0, min(600.0, float(timeout_seconds)))
+    # A provider concurrency slot is queue admission, not a request timeout.
+    # Keep it comfortably above one in-flight request and allow long subtitle
+    # batches to wait rather than turning normal backpressure into a hard job
+    # failure. The worker may override this with GROQ_ASR_GATE_WAIT_SECONDS.
+    provider_wait = max(
+        timeout + 30.0,
+        min(43_200.0, float(provider_wait_seconds or 0.0)),
+    )
     lang = str(language or "").strip()
     normalized_lang = "" if lang.lower() == "auto" else lang
     normalized_chunk_seconds = max(1.0, float(chunk_seconds))
@@ -1975,7 +1985,10 @@ def transcribe_groq_whisper(
         payload: Any = None
         for attempt in range(1, _GROQ_MAX_REQUEST_ATTEMPTS + 1):
             try:
-                with provider_gate.slot(wait_seconds=min(120.0, timeout)):
+                with provider_gate.slot(
+                    wait_seconds=provider_wait,
+                    cancel_check=cancel_check,
+                ):
                     response = httpx.post(
                         url,
                         headers={"Authorization": f"Bearer {key}"},

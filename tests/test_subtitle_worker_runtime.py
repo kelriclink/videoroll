@@ -9,6 +9,7 @@ import uuid
 from videoroll.utils.auto_youtube import encode_auto_youtube_created_by
 
 from videoroll.apps.subtitle_service import worker
+from videoroll.apps.subtitle_service.provider_rate_limit import ProviderGateTimeout
 
 
 def test_worker_has_no_rss_memory_limit() -> None:
@@ -178,6 +179,7 @@ def test_openvino_gpu_aliases_share_one_lock_key() -> None:
 @pytest.mark.parametrize("error,transient", [
     (RuntimeError("Infer Request is busy"), True),
     (RuntimeError("terminating connection due to idle-in-transaction timeout"), True),
+    (ProviderGateTimeout("groq-whisper local concurrency wait budget exceeded"), True),
     (ValueError("missing input.key"), False),
     (RuntimeError("model does not support language"), False),
 ])

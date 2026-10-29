@@ -77,6 +77,7 @@ from videoroll.apps.subtitle_service.model_downloads import (
     download_model_snapshot,
     resolve_model_repo_id,
 )
+from videoroll.apps.subtitle_service.provider_rate_limit import ProviderGateTimeout
 from videoroll.apps.subtitle_service.rag import translation_trace_recorder
 from videoroll.apps.subtitle_service.translate_settings_store import get_translate_settings
 from videoroll.apps.subtitle_service.translation_checkpoint import TranslationCheckpointStore
@@ -560,11 +561,14 @@ def _run_asr_stage(
         groq_vad_threshold = float(
             asr_defaults.get("openvino_vad_threshold") or settings.openvino_vad_threshold or 0.5
         )
+        groq_max_concurrency = _positive_int_env("GROQ_ASR_MAX_CONCURRENCY", 1)
+        groq_gate_wait_seconds = _positive_int_env("GROQ_ASR_GATE_WAIT_SECONDS", 3600)
         _safe_append_log_line(
             log_path,
             f"asr: engine=groq-whisper model={groq_model} language={language} "
             "format=flac chunk=45s overlap=5s retries=5 checkpoint=enabled "
-            f"vad_enabled={groq_vad_enabled} vad_threshold={groq_vad_threshold}",
+            f"vad_enabled={groq_vad_enabled} vad_threshold={groq_vad_threshold} "
+            f"provider_concurrency={groq_max_concurrency} gate_wait={groq_gate_wait_seconds}s",
         )
         segments = transcribe_groq_whisper(
             audio_path,
@@ -577,7 +581,9 @@ def _run_asr_stage(
             vad_enabled=groq_vad_enabled,
             vad_threshold=groq_vad_threshold,
             redis_url=str(settings.redis_url or ""),
-            provider_max_concurrency=_positive_int_env("GROQ_ASR_MAX_CONCURRENCY", 1),
+            provider_max_concurrency=groq_max_concurrency,
+            provider_wait_seconds=groq_gate_wait_seconds,
+            cancel_check=cancel_check,
             progress_callback=asr_progress,
         )
     elif engine == "cloudflare-workers-ai":
@@ -967,6 +973,8 @@ def _is_transient_subtitle_error(exc: Exception) -> bool:
     """Limit retries to known temporary ASR/DB failures, not bad inputs."""
     chain: BaseException | None = exc
     while chain is not None:
+        if isinstance(chain, ProviderGateTimeout):
+            return True
         message = str(chain).lower()
         if "infer request is busy" in message or "idle-in-transaction timeout" in message:
             return True
