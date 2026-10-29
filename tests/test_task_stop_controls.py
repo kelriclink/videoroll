@@ -8,8 +8,10 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.orm import Session, sessionmaker
 
+from videoroll.apps.orchestrator_api.routers import tasks as task_routes
 from videoroll.apps.orchestrator_api.services import task_service
 from videoroll.db.base import Base
+from videoroll.utils.auto_youtube import parse_auto_youtube_created_by
 from videoroll.db.models import (
     OutboxEvent,
     PipelineRun,
@@ -171,3 +173,66 @@ def test_resume_all_only_resumes_tasks_stopped_by_task_controls(db: Session) -> 
     assert resumable.status == TaskStatus.subtitle_ready
     assert resumable.stopped_status is None
     assert legacy_canceled.status == TaskStatus.canceled
+
+
+
+def test_failed_auto_youtube_resume_refreshes_restart_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    task = Task(
+        id=uuid.uuid4(),
+        source_type=SourceType.youtube,
+        source_license=SourceLicense.own,
+        source_url="https://www.youtube.com/watch?v=resume",
+        status=TaskStatus.failed,
+        created_by="auto_youtube;auto_publish=;run_id=old-run",
+    )
+    markers: list[str] = []
+    launches: list[tuple[uuid.UUID, object]] = []
+
+    monkeypatch.setattr(task_service, "auto_youtube_restart_options", lambda *_args, **_kwargs: (True, None))
+    monkeypatch.setattr(
+        task_routes.youtube_service,
+        "set_task_created_by",
+        lambda _settings, *, task_id, created_by: markers.append(created_by),
+    )
+    monkeypatch.setattr(
+        task_routes.youtube_service,
+        "enqueue_auto_youtube_pipeline",
+        lambda task_id, *, auto_publish, settings: launches.append((task_id, auto_publish)) or "run",
+    )
+
+    task_routes._restart_resumed_auto_youtube_task(task, settings=object(), db=object())  # type: ignore[arg-type]
+
+    assert len(markers) == 1
+    parsed = parse_auto_youtube_created_by(markers[0])
+    assert parsed is not None
+    assert parsed["origin"] == "youtube_task_restart"
+    assert parsed["run_id"] != "old-run"
+    assert launches == [(task.id, None)]
+
+
+def test_non_failed_auto_youtube_resume_keeps_existing_origin(monkeypatch: pytest.MonkeyPatch) -> None:
+    task = Task(
+        id=uuid.uuid4(),
+        source_type=SourceType.youtube,
+        source_license=SourceLicense.own,
+        source_url="https://www.youtube.com/watch?v=resume",
+        status=TaskStatus.downloaded,
+        created_by="auto_youtube;auto_publish=;run_id=existing-run",
+    )
+    launches: list[uuid.UUID] = []
+
+    monkeypatch.setattr(task_service, "auto_youtube_restart_options", lambda *_args, **_kwargs: (True, None))
+    monkeypatch.setattr(
+        task_routes.youtube_service,
+        "set_task_created_by",
+        lambda *_args, **_kwargs: pytest.fail("non-failed resume must not rewrite the origin"),
+    )
+    monkeypatch.setattr(
+        task_routes.youtube_service,
+        "enqueue_auto_youtube_pipeline",
+        lambda task_id, **_kwargs: launches.append(task_id) or "run",
+    )
+
+    task_routes._restart_resumed_auto_youtube_task(task, settings=object(), db=object())  # type: ignore[arg-type]
+
+    assert launches == [task.id]

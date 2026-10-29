@@ -24,6 +24,7 @@ from videoroll.config import OrchestratorSettings
 from videoroll.db.models import SubtitleJob, Task, TaskStatus
 from videoroll.realtime import publish_queue_changed
 from videoroll.storage.filesystem import FileStore
+from videoroll.utils.auto_youtube import encode_auto_youtube_created_by
 
 
 router = APIRouter()
@@ -69,6 +70,22 @@ def _restart_resumed_auto_youtube_task(
 ) -> None:
     should_restart_auto_youtube, auto_publish = task_service.auto_youtube_restart_options(task, db=db)
     if should_restart_auto_youtube:
+        # A stopped task can legitimately restore to FAILED when it was paused
+        # while a resumable YouTube/subtitle execution was still alive. The
+        # download admission path only permits a terminal task when the origin
+        # carries a fresh explicit-restart token. Reuse the same restart
+        # contract as "resume recent failed" instead of launching a doomed
+        # parent workflow with the historical run_id.
+        if task.status == TaskStatus.failed:
+            youtube_service.set_task_created_by(
+                settings,
+                task_id=task.id,
+                created_by=encode_auto_youtube_created_by(
+                    "youtube_task_restart",
+                    auto_publish=auto_publish,
+                    run_id=uuid.uuid4().hex,
+                ),
+            )
         youtube_service.enqueue_auto_youtube_pipeline(
             task.id,
             auto_publish=auto_publish,
