@@ -1,6 +1,7 @@
 import { Suspense, lazy, type ReactNode, useEffect, useState } from "react";
 import { Link, NavLink, Navigate, Route, Routes, useLocation } from "react-router-dom";
 import AuthGate from "./components/AuthGate";
+import AgentMonitorPanel from "./components/AgentMonitorPanel";
 import { FeedbackProvider } from "./components/Feedback";
 import SettingsLayout from "./components/SettingsLayout";
 import { fetchJson } from "./lib/http";
@@ -154,6 +155,8 @@ export default function App() {
 
   const [loggingOut, setLoggingOut] = useState(false);
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
+  const [agentDrawerOpen, setAgentDrawerOpen] = useState(false);
+  const [runningAgentCount, setRunningAgentCount] = useState(0);
   const [darkMode, setDarkMode] = useState(() => {
     if (typeof window === "undefined") return false;
     const stored = window.localStorage.getItem("videoroll-theme");
@@ -170,21 +173,25 @@ export default function App() {
 
   useEffect(() => {
     setMobileNavOpen(false);
+    setAgentDrawerOpen(false);
   }, [location.pathname]);
 
   useEffect(() => {
-    if (!mobileNavOpen) return undefined;
+    if (!mobileNavOpen && !agentDrawerOpen) return undefined;
     const previousOverflow = document.body.style.overflow;
     document.body.style.overflow = "hidden";
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") setMobileNavOpen(false);
+      if (event.key === "Escape") {
+        setMobileNavOpen(false);
+        setAgentDrawerOpen(false);
+      }
     };
     window.addEventListener("keydown", onKeyDown);
     return () => {
       window.removeEventListener("keydown", onKeyDown);
       document.body.style.overflow = previousOverflow;
     };
-  }, [mobileNavOpen]);
+  }, [agentDrawerOpen, mobileNavOpen]);
 
   async function logout() {
     if (loggingOut) return;
@@ -216,14 +223,14 @@ export default function App() {
             isEmbeddedConsoleRoute ? "flex-none" : "",
           ].join(" ")}
         >
-          <div className="mx-auto flex max-w-[1440px] items-center justify-between px-4 py-3 lg:px-6">
+          <div className="mx-auto flex max-w-[1760px] items-center justify-between px-4 py-3 lg:px-6">
             <div className="flex items-center gap-2">
               <button
                 type="button"
-                className="inline-flex h-8 w-8 items-center justify-center rounded-md border border-slate-300 text-sm text-slate-700 hover:bg-slate-50 md:hidden"
+                className="inline-flex h-8 w-8 items-center justify-center rounded-md border border-slate-300 text-sm text-slate-700 hover:bg-slate-50 md:hidden dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-900"
                 aria-label="打开导航"
                 title="打开导航"
-                onClick={() => setMobileNavOpen(true)}
+                onClick={() => { setAgentDrawerOpen(false); setMobileNavOpen(true); }}
               >
                 ☰
               </button>
@@ -244,6 +251,17 @@ export default function App() {
               >
                 {darkMode ? "☀" : "☾"}
               </button>
+              {!isEmbeddedConsoleRoute ? (
+                <button
+                  type="button"
+                  onClick={() => { setMobileNavOpen(false); setAgentDrawerOpen(true); }}
+                  className="inline-flex h-8 items-center gap-1.5 rounded-lg border border-slate-200 px-2.5 text-xs text-slate-600 hover:bg-slate-50 hover:text-slate-950 dark:border-slate-800 dark:text-slate-300 dark:hover:bg-slate-900 xl:hidden"
+                  title="打开 Agent 监控"
+                >
+                  <span className={["h-2 w-2 rounded-full", runningAgentCount ? "animate-pulse bg-sky-500" : "bg-slate-400"].join(" ")} />
+                  <span>Agent {runningAgentCount}</span>
+                </button>
+              ) : null}
               <button
                 type="button"
                 onClick={logout}
@@ -295,9 +313,44 @@ export default function App() {
           </div>
         ) : null}
 
+        {agentDrawerOpen && !isEmbeddedConsoleRoute ? (
+          <div className="fixed inset-0 z-40 xl:hidden">
+            <button
+              type="button"
+              className="absolute inset-0 bg-slate-950/40"
+              aria-label="关闭 Agent 监控"
+              onClick={() => setAgentDrawerOpen(false)}
+            />
+            <aside
+              className="absolute bottom-0 right-0 top-0 w-[min(22rem,calc(100vw-2rem))] overflow-y-auto border-l border-slate-200 bg-slate-50 p-4 shadow-2xl dark:border-slate-800 dark:bg-slate-950"
+              role="dialog"
+              aria-modal="true"
+              aria-label="Agent 实时运行监控"
+            >
+              <div className="mb-4 flex items-center justify-between gap-3 border-b border-slate-200 pb-3 dark:border-slate-800">
+                <div>
+                  <div className="font-semibold text-slate-950 dark:text-white">Agent 监控</div>
+                  <div className="mt-0.5 text-xs text-slate-500">正在运行和最近完成的 Agent</div>
+                </div>
+                <button
+                  type="button"
+                  className="rounded-md border border-slate-300 px-2 py-1 text-sm text-slate-700 hover:bg-slate-100 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-900"
+                  onClick={() => setAgentDrawerOpen(false)}
+                >
+                  关闭
+                </button>
+              </div>
+              <AgentMonitorPanel compact onRunningCountChange={setRunningAgentCount} />
+            </aside>
+          </div>
+        ) : null}
+
         <div
           className={[
-            "mx-auto grid max-w-[1440px] grid-cols-1 gap-6 px-4 py-5 md:grid-cols-[220px_minmax(0,1fr)] lg:px-6",
+            "mx-auto grid max-w-[1760px] grid-cols-1 gap-6 px-4 py-5 lg:px-6",
+            isEmbeddedConsoleRoute
+              ? "md:grid-cols-[220px_minmax(0,1fr)]"
+              : "md:grid-cols-[220px_minmax(0,1fr)] xl:grid-cols-[220px_280px_minmax(0,1fr)]",
             isEmbeddedConsoleRoute ? "min-h-0 w-full flex-1 overflow-hidden" : "",
           ].join(" ")}
         >
@@ -315,6 +368,14 @@ export default function App() {
               </div>
             </div>
           </aside>
+
+          {!isEmbeddedConsoleRoute ? (
+            <aside className="hidden min-w-0 xl:block">
+              <div className="sticky top-[69px] max-h-[calc(100vh-89px)] overflow-y-auto pr-1">
+                <AgentMonitorPanel onRunningCountChange={setRunningAgentCount} />
+              </div>
+            </aside>
+          ) : null}
 
           <main
             className={[

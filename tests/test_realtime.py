@@ -226,13 +226,13 @@ def test_realtime_pages_have_no_periodic_api_polling() -> None:
         assert "setTimeout(load" not in source
 
     # Agent status has a bounded reconciliation poll in addition to WebSocket
-    # events so a dropped/overflowed terminal event cannot leave the dashboard
-    # permanently showing a stale running state.
-    dashboard = Path("src/web/src/pages/DashboardPage.tsx").read_text(encoding="utf-8")
-    assert dashboard.count("setInterval") == 1
-    assert "void loadAgentRuns();" in dashboard
-    assert "15_000" in dashboard
-    assert "setTimeout(load" not in dashboard
+    # events so a dropped/overflowed terminal event cannot leave the global
+    # Agent monitor permanently showing a stale running state.
+    agent_monitor = Path("src/web/src/components/AgentMonitorPanel.tsx").read_text(encoding="utf-8")
+    assert agent_monitor.count("setInterval") == 1
+    assert "void load();" in agent_monitor
+    assert "15_000" in agent_monitor
+    assert "setTimeout(load" not in agent_monitor
 
 
 def test_render_queue_uses_realtime_updates_without_resource_polling() -> None:
