@@ -66,6 +66,8 @@ celery_app.conf.update(
     enable_utc=True,
 )
 register_auto_dub_p2_task(celery_app)
+from videoroll.apps.bilibili_publisher.subtitle_sync import register_subtitle_sync_task
+register_subtitle_sync_task(celery_app)
 _JOB_LEASE_TTL_SECONDS = 1800
 
 
@@ -1071,6 +1073,10 @@ def _process_job_impl(self, job_id: str) -> dict[str, Any]:
         # P1/P2 are uploaded together in add_archive(videos=[P1, P2]).
         # Never create a hidden post-publication P2 task on a successful P1.
         db.commit()
+        try:
+            celery_app.send_task("bilibili_publisher.sync_subtitles", args=[str(job_uuid)], queue="publish", countdown=300)
+        except Exception:
+            logger.exception("failed to enqueue optional Bilibili subtitles for %s", job_uuid)
         try:
             enqueue_publish_batch_cleanup(db, celery_app, task.id, job.batch_id, needed=cleanup_enqueued) if job.batch_id else None
         except Exception:
