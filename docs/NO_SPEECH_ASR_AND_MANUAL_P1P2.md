@@ -15,12 +15,13 @@ on instrumentals and music.
 - Reject OpenVINO hallucinations where one-to-three words occupy eight or more
   seconds of an ASR chunk; clip timestamp boundaries to actual audio duration.
   The conservative heuristic applies only to OpenVINO, not other engines.
-- In automatic mode, zero credible ASR segments means `NO_SPEECH_DETECTED`
-  with the message `未检测到可信语音`. The task is stopped for manual review; the
-  parent workflow explicitly skips render, dub and publication. Ordinary
-  subtitle jobs may still be run manually with alternative settings.
-- Resume preserves this no-speech result; it cannot reuse an empty segments
-  artifact and proceed to LLM translation or YouDub by mistake.
+- In automatic mode, zero credible ASR segments is a successful **no-speech**
+  branch. Keep the original source video as a no-caption final media reference;
+  skip translation, subtitle generation, and YouDub while allowing configured
+  single-part automatic publication.
+- Resume preserves this outcome using the explicit job artifact flag, or the
+  pinned empty-segments artifact for legacy jobs. It does not repeat ASR or
+  send fabricated cues to translation or YouDub.
 
 ### Real media validation on link (2026-10-17)
 

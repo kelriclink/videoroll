@@ -106,6 +106,12 @@ def auto_dubbing(
                 "dubbing_job_id": None}
     if not is_auto_youtube_task(task):
         raise HTTPException(409, "automatic P2 requires an automatic YouTube task")
+    from videoroll.apps.subtitle_service.no_speech import latest_no_speech_job
+    from videoroll.storage.filesystem import FileStore
+
+    if latest_no_speech_job(db, task_id, store=FileStore(settings)) is not None:
+        return {"status": "skipped", "detail": "no speech: no P2 voiceover needed",
+                "dubbing_job_id": None}
     subtitle = (db.query(SubtitleJob).filter(
         SubtitleJob.task_id == task_id,
         SubtitleJob.status == SubtitleJobStatus.succeeded,

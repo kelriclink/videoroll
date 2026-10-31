@@ -154,3 +154,46 @@ def test_auto_subtitle_handoff_requires_downloaded_asset() -> None:
     assert exc_info.value.status_code == 409
     assert "raw video asset" in str(exc_info.value.detail)
     engine.dispose()
+
+
+def test_auto_subtitle_handoff_recovers_successful_no_speech_without_asr(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine, factory, task_id = _database()
+    with factory() as db:
+        task = db.get(Task, task_id)
+        assert task is not None
+        task.status = TaskStatus.failed
+        task.error_code = "NO_SPEECH_DETECTED"
+        task.error_message = "old guard"
+        raw_key = f"raw/{task_id}/source.webm"
+        db.add(Asset(task_id=task_id, kind=AssetKind.video_raw,
+                     storage_key=raw_key, size_bytes=8192))
+        db.add(SubtitleJob(
+            task_id=task_id,
+            request_json={"artifacts": {"no_speech_detected": True}},
+            status=SubtitleJobStatus.succeeded, progress=100,
+        ))
+        db.commit()
+        monkeypatch.setattr(
+            subtitle_service, "enqueue_subtitle_service_job_request",
+            lambda *_a, **_kw: (_ for _ in ()).throw(AssertionError("ASR must not restart")),
+        )
+
+        first = subtitle_service.enqueue_auto_subtitle_handoff(
+            task_id, settings=object(), db=db,  # type: ignore[arg-type]
+        )
+        second = subtitle_service.enqueue_auto_subtitle_handoff(
+            task_id, settings=object(), db=db,  # type: ignore[arg-type]
+        )
+        finals = db.query(Asset).filter(
+            Asset.task_id == task_id, Asset.kind == AssetKind.video_final,
+        ).all()
+        db.refresh(task)
+
+        assert first.status == second.status == "no_speech"
+        assert len(finals) == 1
+        assert finals[0].storage_key == raw_key
+        assert task.status == TaskStatus.rendered
+        assert task.error_code is None
+    engine.dispose()

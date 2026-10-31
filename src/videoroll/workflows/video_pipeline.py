@@ -418,7 +418,7 @@ def register_video_pipeline(hatchet: Any, *, settings: WorkflowRuntimeSettings |
             if subtitle_status == "no_speech":
                 return WorkflowStageOutput(
                     task_id=input.task_id, status="no_speech",
-                    detail="No credible speech; do not render, dub or publish",
+                    detail="No credible speech; source media will be published without captions",
                 )
             return WorkflowStageOutput(
                 task_id=input.task_id,
@@ -495,7 +495,7 @@ def register_video_pipeline(hatchet: Any, *, settings: WorkflowRuntimeSettings |
         if not job_id:
             if str(stage_status or "") == "no_speech":
                 return WorkflowStageOutput(task_id=input.task_id, status="no_speech",
-                                           detail="No credible speech; publishing must be skipped")
+                                           detail="No credible speech; skip voiceover, continue to publishing")
             return WorkflowStageOutput(task_id=input.task_id, status="skipped",
                                        detail="automatic dubbing disabled")
         if str(stage_status or "") == "succeeded":
@@ -554,9 +554,8 @@ def register_video_pipeline(hatchet: Any, *, settings: WorkflowRuntimeSettings |
         status = getattr(dubbed, "status", None)
         if isinstance(dubbed, dict):
             status = dubbed.get("status")
-        if status == "no_speech":
-            return WorkflowStageOutput(task_id=input.task_id, status="no_speech",
-                                       detail="Automatic publishing suppressed: no credible speech")
+        # No-speech videos still publish as single-part source media. The
+        # subtitle worker registers a no-caption final asset; P2 is skipped.
         job_id = getattr(dubbed, "dubbing_job_id", None)
         if isinstance(dubbed, dict):
             job_id = dubbed.get("dubbing_job_id")

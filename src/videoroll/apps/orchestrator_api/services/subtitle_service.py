@@ -456,6 +456,18 @@ def enqueue_auto_subtitle_handoff(
     if task.status == TaskStatus.published:
         return AutoSubtitleHandoffResponse(status="complete", detail="task is already published")
 
+    # Resumed no-speech tasks must not run ASR again. Recover legacy successful
+    # empty-segment jobs from their pinned artifact instead of their error text.
+    from videoroll.apps.subtitle_service.no_speech import (
+        ensure_no_speech_final_asset, latest_no_speech_job,
+    )
+    if latest_no_speech_job(db, task_id, store_factory=lambda: FileStore(settings)) is not None:
+        ensure_no_speech_final_asset(db, task)
+        db.commit()
+        return AutoSubtitleHandoffResponse(
+            status="no_speech", detail="source video ready without captions",
+        )
+
     final_asset = (
         db.query(Asset)
         .filter(Asset.task_id == task_id, Asset.kind == AssetKind.video_final)

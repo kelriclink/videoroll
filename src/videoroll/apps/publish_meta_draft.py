@@ -189,6 +189,7 @@ def build_task_publish_meta_draft(
     store: FileStore,
     mode: PublishMetaDraftMode = "auto",
     base_meta: dict[str, Any] | None = None,
+    title_prefix_override: str | None = None,
 ) -> dict[str, Any]:
     meta_out = {**default_publish_meta(db), **_as_dict(base_meta)}
     if mode == "default":
@@ -216,6 +217,8 @@ def build_task_publish_meta_draft(
     summary = get_task_bilibili_summary(db, str(task.id))
 
     profile = get_auto_profile(db)
+    if title_prefix_override is not None:
+        profile = {**profile, "publish_title_prefix": title_prefix_override}
     legacy_translate_settings = get_translate_settings(db, get_subtitle_settings())
     runtime = resolve_profile_translation_runtime(
         db,

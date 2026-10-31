@@ -1589,19 +1589,23 @@ def run_subtitle_job(
             _store_source_segments(segments, source_label="asr done")
 
         if not segments and automatic_runtime_profile:
-            # If recovery encounters an empty ASR artifact, the same safe
-            # terminal state applies: never translate, dub or auto-post.
-            message = "未检测到可信语音：已跳过自动字幕、中文配音和投稿，请人工检查视频音轨。"
+            # An empty ASR is a legitimate source-video outcome. Keep the
+            # evidence, but do not feed empty text into translation or YouDub.
+            # No-caption media is still eligible for single-part publishing.
+            from videoroll.apps.subtitle_service.no_speech import ensure_no_speech_final_asset
+
+            message = "未检测到可信语音：跳过字幕和配音，继续使用原视频投稿。"
             if not segments_key:
                 _store_source_segments([], source_label="asr no speech detected")
+            artifacts = dict(req.get("artifacts") or {})
+            artifacts["no_speech_detected"] = True
+            req["artifacts"] = artifacts
+            _save_job_request()
+            ensure_no_speech_final_asset(db, task)
             job.status = SubtitleJobStatus.succeeded
             job.progress = 100
             job.error_message = None
-            task.status = TaskStatus.failed
-            task.error_code = "NO_SPEECH_DETECTED"
-            task.error_message = message
             db.add(job)
-            db.add(task)
             db.commit()
             _safe_append_log_line(log_path, message)
             _safe_upload_log(store, log_path, log_key)

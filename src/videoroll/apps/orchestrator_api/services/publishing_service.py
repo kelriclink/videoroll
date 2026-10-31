@@ -201,7 +201,14 @@ def build_auto_publish_after_render(
     if not auto_publish_platforms:
         raise HTTPException(status_code=409, detail="no automatic publish platforms are selected")
     stored_meta = read_storage_json_object(store, publish_meta_storage_key(task.id))
-    meta = build_task_publish_meta_draft(task, db=db, store=store, mode="source", base_meta=stored_meta)
+    # No-speech uploads are source media, never pretend to be Chinese-subtitled
+    # or dubbed by applying the normal "熟肉/中配" title prefix.
+    from videoroll.apps.subtitle_service.no_speech import latest_no_speech_job
+    no_speech = latest_no_speech_job(db, task.id, store=store) is not None
+    meta = build_task_publish_meta_draft(
+        task, db=db, store=store, mode="source", base_meta=stored_meta,
+        title_prefix_override="" if no_speech else None,
+    )
     write_storage_json(store, publish_meta_storage_key(task.id), meta)
     cover_key = latest_task_cover_key(task.id, db) if bool(auto_profile.get("publish_use_youtube_cover")) else None
     publish_payload: dict[str, Any] = {
