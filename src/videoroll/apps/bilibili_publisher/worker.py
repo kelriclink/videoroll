@@ -623,9 +623,17 @@ def _set_bilibili_upload_progress(
     active: bool,
     progress: int,
 ) -> None:
-    """Persist the actual video-transfer state for realtime browser updates."""
+    """Persist video-transfer state without holding a transaction across network I/O.
+
+    Every caller commits the publish state before invoking this progress
+    helper. A prior settings/ORM read may still have opened a transaction;
+    expire it first so a long multipart upload cannot outlive the DB idle
+    timeout. Even unchanged progress must leave the session idle and clean.
+    """
+    db.rollback()
     next_progress = max(0, min(100, int(progress)))
     if bool(job.upload_active) == bool(active) and int(job.upload_progress or 0) == next_progress:
+        db.rollback()
         return
     job.upload_active = bool(active)
     job.upload_progress = next_progress

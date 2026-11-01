@@ -41,3 +41,40 @@ def test_upload_video_file_reports_completed_bytes_after_each_uploaded_chunk(tmp
 
     assert updates == [(2, 5), (4, 5), (5, 5)]
     assert debug["chunks"] == 3
+
+
+def test_upload_progress_does_not_leave_long_lived_database_transaction() -> None:
+    from sqlalchemy import create_engine, select
+    from sqlalchemy.orm import Session
+
+    from videoroll.apps.bilibili_publisher.worker import _set_bilibili_upload_progress
+    from videoroll.db.base import Base
+    from videoroll.db.models import PublishJob, PublishState, SourceLicense, SourceType, Task
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine, tables=[Task.__table__, PublishJob.__table__])
+    try:
+        with Session(engine) as db:
+            task = Task(source_type=SourceType.youtube, source_license=SourceLicense.authorized)
+            db.add(task)
+            db.flush()
+            job = PublishJob(task_id=task.id, state=PublishState.submitting, upload_active=True, upload_progress=0)
+            db.add(job)
+            db.commit()
+
+            # This ORM SELECT starts a transaction. A multipart upload may run
+            # for several minutes without a percentage change, so a no-op
+            # progress update must still release that transaction.
+            db.scalars(select(PublishJob)).one()
+            assert db.in_transaction()
+            _set_bilibili_upload_progress(db, job, active=True, progress=0)
+            assert not db.in_transaction()
+
+            # Persist a real update while making sure the next network wait
+            # starts without an open transaction too.
+            _set_bilibili_upload_progress(db, job, active=True, progress=17)
+            assert not db.in_transaction()
+            db.expire_all()
+            assert db.get(PublishJob, job.id).upload_progress == 17
+    finally:
+        engine.dispose()
