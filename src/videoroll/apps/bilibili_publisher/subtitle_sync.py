@@ -13,7 +13,9 @@ from videoroll.db.session import get_sessionmaker
 from videoroll.storage.filesystem import FileStore
 
 logger = logging.getLogger(__name__)
-LANGUAGE = "zh-Hans"
+# The generated SRT remains Simplified Chinese (zh-Hans). Bilibili's
+# subtitle-draft API expects its own language identifier, "zh", not BCP-47.
+LANGUAGE = "zh"
 
 def _cids(data: dict) -> list[int]:
     pages = data.get("pages")

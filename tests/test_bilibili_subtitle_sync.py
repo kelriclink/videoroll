@@ -1,4 +1,5 @@
 from pathlib import Path
+import json
 from unittest.mock import Mock
 import pytest
 from videoroll.apps.bilibili_publisher.subtitle_sync import _cids, _upload
@@ -27,7 +28,11 @@ def test_upload_srt_and_presave_uses_cid(tmp_path: Path):
     assert second.args[0].endswith("/x/v2/dm/subtitle/draft/preSave")
     assert second.kwargs["data"]["aid"] == "100"
     assert second.kwargs["data"]["oid"] == "200"
-    assert '"zh-Hans"' in second.kwargs["data"]["files"]
+    # Bilibili draft API rejects zh-Hans with error 79011; its zh language
+    # code is distinct from the zh-Hans source subtitle's BCP-47 tag.
+    assert json.loads(second.kwargs["data"]["files"]) == [
+        {"url": "bfs://subtitle/test", "lan": "zh", "subtitle_id": 0},
+    ]
 
 def test_presave_failure_is_not_success(tmp_path):
     path = tmp_path / "zh.srt"
