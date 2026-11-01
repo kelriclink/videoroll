@@ -44,6 +44,7 @@ MAX_SOURCE_SCAN_LIMIT = 200
 
 DEFAULT_SOURCE_SCAN_LOCK_TTL_SECONDS = 900
 MAX_SOURCE_SCAN_ERROR_LEN = 1000
+INGESTED_VIDEO_LOOKUP_BATCH_SIZE = 500
 MAX_SOURCE_DISPLAY_NAME_LEN = 255
 
 
@@ -393,10 +394,10 @@ def finish_youtube_source_scan_lock(
     row.total_started_pipeline_count = int(row.total_started_pipeline_count or 0) + started
     if error_message:
         row.total_failed_scan_count = int(row.total_failed_scan_count or 0) + 1
-    if feed_completed:
-        # Even when one pipeline fails to start, enumeration succeeded and the
-        # discovered/created snapshot is still authoritative.
+    if feed_completed and not error_message:
         row.total_scan_count = int(row.total_scan_count or 0) + 1
+    if feed_completed:
+        # Preserve the fetched count when a later DB or workflow step fails.
         row.last_scan_discovered_count = discovered
         row.last_scan_created_count = created
         row.last_scan_started_pipeline_count = started
@@ -608,17 +609,27 @@ def scan_youtube_source_by_id(
     )
     heartbeat.start()
 
-    limit = normalize_source_scan_limit(limit_override if limit_override is not None else getattr(locked, "scan_limit", None))
-    auto_process = bool(getattr(locked, "auto_process", True)) if auto_process_override is None else bool(auto_process_override)
-    yt_cfg = get_youtube_settings(db, default_proxy=default_proxy)
-    proxy = str(yt_cfg.get("proxy") or "").strip() or default_proxy or None
-
     created: list[uuid.UUID] = []
     started: list[str] = []
+    entries: list[Any] = []
+    feed_completed = False
     skipped = 0
     error_message: str | None = None
 
     try:
+        limit = normalize_source_scan_limit(limit_override if limit_override is not None else locked.scan_limit)
+        auto_process = bool(locked.auto_process) if auto_process_override is None else bool(auto_process_override)
+        source_type = locked.source_type.value
+        source_id = locked.source_id
+        source_license = locked.license
+        source_proof_url = locked.proof_url
+        yt_cfg = get_youtube_settings(db, default_proxy=default_proxy)
+        proxy = str(yt_cfg.get("proxy") or "").strip() or default_proxy or None
+
+        # ORM reads (including the scan-lock refresh) start a read transaction.
+        # Freeze all needed source fields, then close that transaction before I/O.
+        db.commit()
+
         try:
             # Enumerate the complete source before applying scan_limit. This is
             # especially important for playlists: if the newest/list-leading
@@ -626,8 +637,8 @@ def scan_youtube_source_by_id(
             # be discovered and backfilled over subsequent scans.
             entries = list(
                 fetch_youtube_feed(
-                    locked.source_type.value,
-                    locked.source_id,
+                    source_type,
+                    source_id,
                     user_agent=user_agent,
                     proxy=proxy,
                     limit=None,
@@ -636,15 +647,21 @@ def scan_youtube_source_by_id(
         except Exception as e:
             raise RuntimeError(f"fetch youtube feed failed: {e}") from e
 
+        feed_completed = True
         existing_video_ids: set[str] = set()
-        entry_video_ids = [entry.video_id for entry in entries if str(getattr(entry, "video_id", "") or "").strip()]
-        if entry_video_ids:
+        entry_video_ids = list(dict.fromkeys(
+            str(entry.video_id).strip()
+            for entry in entries
+            if str(getattr(entry, "video_id", "") or "").strip()
+        ))
+        for offset in range(0, len(entry_video_ids), INGESTED_VIDEO_LOOKUP_BATCH_SIZE):
+            batch = entry_video_ids[offset:offset + INGESTED_VIDEO_LOOKUP_BATCH_SIZE]
             existing_rows = (
                 db.query(IngestedVideo.source_id)
-                .filter(IngestedVideo.platform == "youtube", IngestedVideo.source_id.in_(entry_video_ids))
+                .filter(IngestedVideo.platform == "youtube", IngestedVideo.source_id.in_(batch))
                 .all()
             )
-            existing_video_ids = {str(row[0]).strip() for row in existing_rows if row and row[0]}
+            existing_video_ids.update(str(row[0]).strip() for row in existing_rows if row and row[0])
 
         entries, selected_entries, skipped = _prepare_scan_entries(
             entries,
@@ -658,8 +675,8 @@ def scan_youtube_source_by_id(
             task = Task(
                 source_type=SourceType.youtube,
                 source_url=f"https://www.youtube.com/watch?v={entry.video_id}",
-                source_license=locked.license,
-                source_proof_url=locked.proof_url,
+                source_license=source_license,
+                source_proof_url=source_proof_url,
                 status=TaskStatus.ingested,
                 created_by=(
                     encode_auto_youtube_created_by(
@@ -683,6 +700,7 @@ def scan_youtube_source_by_id(
                     published_at=entry.published_at,
                 )
             )
+            task_id = task.id
             try:
                 db.commit()
             except IntegrityError:
@@ -697,16 +715,17 @@ def scan_youtube_source_by_id(
                     continue
                 raise
 
-            db.refresh(task)
-            created.append(task.id)
+            # Commit ends the task transaction; refreshing would reopen it
+            # while the external workflow starter waits on another service.
+            created.append(task_id)
             if auto_process:
                 try:
                     if pipeline_starter is None:
                         raise RuntimeError("auto_process requires a pipeline_starter")
-                    started.append(_start_auto_pipeline(task.id, starter=pipeline_starter))
+                    started.append(_start_auto_pipeline(task_id, starter=pipeline_starter))
                 except Exception as e:
                     error_message = _trim_error_message(f"{entry.video_id}: start pipeline failed: {e}")
-                    logger.exception("failed to start auto pipeline for youtube source task %s", task.id)
+                    logger.exception("failed to start auto pipeline for youtube source task %s", task_id)
 
         finish_youtube_source_scan_lock(
             db,
@@ -733,12 +752,12 @@ def scan_youtube_source_by_id(
             db,
             source_pk,
             owner=owner,
-            discovered_count=0,
+            discovered_count=len(entries) if feed_completed else 0,
             created_count=len(created),
             started_pipeline_count=len(started),
             skipped_duplicates=skipped,
-            error=_trim_error_message(str(e)),
-            feed_completed=False,
+            error=_trim_error_message(str(e).split("\n[SQL:", 1)[0]),
+            feed_completed=feed_completed,
         )
         raise
     finally:

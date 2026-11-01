@@ -33,7 +33,7 @@ from videoroll.apps.youtube_ingest.source_service import (
 )
 from videoroll.apps.youtube_ingest.youtube_feed import FeedEntry
 from videoroll.db.base import Base
-from videoroll.db.models import IngestedVideo, SourceLicense, Task, YouTubeSource, YouTubeSourceType
+from videoroll.db.models import IngestedVideo, SourceLicense, SourceType, Task, YouTubeSource, YouTubeSourceType
 
 
 class _FakeYdl:
@@ -453,3 +453,171 @@ class YouTubePlaylistScanTests(TestCase):
         self.db.refresh(source)
         self.assertIsNone(source.last_scan_error)
         self.assertIsNone(source.scan_lock_until)
+
+
+    def test_feed_and_workflow_start_run_without_open_database_transaction(self) -> None:
+        source = YouTubeSource(
+            source_type=YouTubeSourceType.channel,
+            source_id="UCtransaction123456",
+            license=SourceLicense.authorized,
+            proof_url="https://example.com/permission",
+            enabled=True,
+            scan_limit=1,
+            auto_process=True,
+        )
+        self.db.add(source)
+        self.db.commit()
+        source_id = source.id
+        observed: list[str] = []
+
+        def fetch(_kind: str, _source_id: str, **_kwargs: object) -> list[FeedEntry]:
+            self.assertFalse(self.db.in_transaction(), "network I/O must not hold a database transaction")
+            observed.append("feed")
+            return [FeedEntry(video_id="new-video-id", title="New", published_at=None)]
+
+        def start(_task_id: object) -> str:
+            self.assertFalse(self.db.in_transaction(), "workflow I/O must not hold a database transaction")
+            observed.append("workflow")
+            return "workflow-id"
+
+        with (
+            patch("videoroll.apps.youtube_ingest.source_service.fetch_youtube_feed", side_effect=fetch),
+            patch("videoroll.apps.youtube_ingest.source_service.get_youtube_settings", return_value={}),
+        ):
+            result = scan_youtube_source_by_id(
+                self.db, source_id, user_agent="UA/1.0", force=True, pipeline_starter=start
+            )
+
+        assert result is not None
+        self.assertEqual(observed, ["feed", "workflow"])
+        self.assertEqual(result.started_pipeline_job_ids, ["workflow-id"])
+        task = self.db.query(Task).one()
+        self.assertEqual(task.source_license, SourceLicense.authorized)
+        self.assertEqual(task.source_proof_url, "https://example.com/permission")
+
+    def test_settings_failure_is_recorded_and_scan_lock_is_released(self) -> None:
+        source = YouTubeSource(
+            source_type=YouTubeSourceType.channel,
+            source_id="UCsettingsfailure123",
+            license=SourceLicense.authorized,
+            enabled=True,
+            auto_process=False,
+        )
+        self.db.add(source)
+        self.db.commit()
+        source_id = source.id
+
+        with (
+            patch("videoroll.apps.youtube_ingest.source_service.get_youtube_settings", side_effect=RuntimeError("settings read failed")),
+            patch("videoroll.apps.youtube_ingest.source_service.fetch_youtube_feed") as fetch,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "settings read failed"):
+                scan_youtube_source_by_id(self.db, source_id, user_agent="UA/1.0", force=True)
+            fetch.assert_not_called()
+
+        self.db.expire_all()
+        refreshed = self.db.get(YouTubeSource, source_id)
+        assert refreshed is not None
+        self.assertIsNone(refreshed.scan_lock_owner)
+        self.assertIsNone(refreshed.scan_lock_until)
+        self.assertEqual(refreshed.total_failed_scan_count, 1)
+        self.assertEqual(refreshed.total_scan_count, 0)
+        self.assertIn("settings read failed", refreshed.last_scan_error or "")
+
+    def test_large_feed_uses_bounded_lookup_queries_and_preserves_backfill(self) -> None:
+        from sqlalchemy import event
+
+        source = YouTubeSource(
+            source_type=YouTubeSourceType.playlist,
+            source_id="PLlarge1234567890",
+            license=SourceLicense.authorized,
+            enabled=True,
+            scan_limit=2,
+            auto_process=False,
+        )
+        self.db.add(source)
+        self.db.commit()
+        source_id = source.id
+
+        # Two existing entries at the top; duplicates in the feed must not
+        # inflate the discovered count or prevent later unseen entries.
+        for i in range(2):
+            task = Task(source_type=SourceType.youtube, source_url=f"https://www.youtube.com/watch?v=video-{i}", source_license=SourceLicense.authorized)
+            self.db.add(task)
+            self.db.flush()
+            self.db.add(IngestedVideo(platform="youtube", source_id=f"video-{i}", task_id=task.id))
+        self.db.commit()
+
+        entries = [FeedEntry(video_id=f"video-{i}", title="", published_at=None) for i in range(1602)]
+        entries.append(entries[0])
+        lookup_sizes: list[int] = []
+
+        def inspect_query(_conn: object, _cursor: object, statement: str, parameters: object, _context: object, _executemany: bool) -> None:
+            if "SELECT" in statement and "ingested_videos" in statement and " IN " in statement:
+                lookup_sizes.append(len(parameters))
+
+        event.listen(self.engine, "before_cursor_execute", inspect_query)
+        try:
+            with (
+                patch("videoroll.apps.youtube_ingest.source_service.fetch_youtube_feed", return_value=entries),
+                patch("videoroll.apps.youtube_ingest.source_service.get_youtube_settings", return_value={}),
+            ):
+                result = scan_youtube_source_by_id(self.db, source_id, user_agent="UA/1.0", force=True)
+        finally:
+            event.remove(self.engine, "before_cursor_execute", inspect_query)
+
+        assert result is not None
+        self.assertEqual(result.discovered_count, 1602)
+        self.assertEqual(result.skipped_duplicates, 2)
+        self.assertEqual(len(result.created_task_ids), 2)
+        self.assertEqual(lookup_sizes, [501, 501, 501, 103])
+        self.assertEqual(
+            {row.source_id for row in self.db.query(IngestedVideo).all()},
+            {"video-0", "video-1", "video-2", "video-3"},
+        )
+
+    def test_database_failure_after_fetch_keeps_observed_count_and_marks_scan_failed(self) -> None:
+        from sqlalchemy import event
+
+        source = YouTubeSource(
+            source_type=YouTubeSourceType.playlist,
+            source_id="PLdbfailure123456",
+            license=SourceLicense.authorized,
+            enabled=True,
+            auto_process=False,
+        )
+        self.db.add(source)
+        self.db.commit()
+        source_id = source.id
+        injected = False
+
+        def fail_first_lookup(_conn: object, _cursor: object, statement: str, _parameters: object, _context: object, _executemany: bool) -> None:
+            nonlocal injected
+            if not injected and "SELECT" in statement and "ingested_videos" in statement:
+                injected = True
+                raise RuntimeError("database lookup unavailable")
+
+        event.listen(self.engine, "before_cursor_execute", fail_first_lookup)
+        try:
+            with (
+                patch(
+                    "videoroll.apps.youtube_ingest.source_service.fetch_youtube_feed",
+                    return_value=[FeedEntry(video_id=f"new-{i}", title="", published_at=None) for i in range(3)],
+                ),
+                patch("videoroll.apps.youtube_ingest.source_service.get_youtube_settings", return_value={}),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "database lookup unavailable"):
+                    scan_youtube_source_by_id(self.db, source_id, user_agent="UA/1.0", force=True)
+        finally:
+            event.remove(self.engine, "before_cursor_execute", fail_first_lookup)
+
+        self.db.expire_all()
+        refreshed = self.db.get(YouTubeSource, source_id)
+        assert refreshed is not None
+        self.assertTrue(injected)
+        self.assertEqual(refreshed.last_scan_discovered_count, 3)
+        self.assertEqual(refreshed.last_nonempty_discovered_count, 3)
+        self.assertEqual(refreshed.total_failed_scan_count, 1)
+        self.assertEqual(refreshed.total_scan_count, 0)
+        self.assertIsNone(refreshed.scan_lock_owner)
+        self.assertIsNone(refreshed.scan_lock_until)
