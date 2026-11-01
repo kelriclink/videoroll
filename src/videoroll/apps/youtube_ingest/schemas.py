@@ -33,6 +33,7 @@ class YouTubeSourceRead(BaseModel):
     scan_interval_minutes: int = 60
     scan_limit: int = 20
     auto_process: bool = True
+    scan_running: bool = False
     last_scan_started_at: Optional[datetime] = None
     last_scan_finished_at: Optional[datetime] = None
     last_scan_discovered_count: int = 0
@@ -87,6 +88,11 @@ class YouTubeScanResponse(BaseModel):
     created_task_ids: list[uuid.UUID]
     skipped_duplicates: int
     started_pipeline_job_ids: list[str] = Field(default_factory=list)
+
+
+class YouTubeSourceScanAccepted(BaseModel):
+    accepted: bool = True
+    scan_started_at: datetime
 
 
 class YouTubeSourceScanRequest(BaseModel):

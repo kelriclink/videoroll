@@ -183,3 +183,32 @@ def test_model_provider_browser_routes_are_allowed(method: str, path: str) -> No
 )
 def test_model_provider_browser_routes_cannot_open_arbitrary_paths(method: str, path: str) -> None:
     assert not subtitle_service._is_browser_proxy_path_allowed(method, path)
+
+@pytest.mark.anyio
+async def test_youtube_manual_scan_async_route_is_proxied_and_unrelated_paths_are_denied(monkeypatch) -> None:
+    from fastapi import HTTPException
+    from videoroll.apps.orchestrator_api.services import youtube_service
+
+    calls: list[str] = []
+
+    async def fake_proxy(_settings, **kwargs):
+        calls.append(kwargs["service_path"])
+        return internal_http.InternalServiceResponse(
+            status_code=202, content=b'{"accepted":true}', headers={"content-type": "application/json"},
+        )
+
+    monkeypatch.setattr(youtube_service, "proxy_internal_service_request", fake_proxy)
+    settings = SimpleNamespace(youtube_ingest_url="http://127.0.0.1:8002")
+
+    res = await youtube_service.proxy_browser_request(
+        settings, service_path="youtube/sources/1234/scan/start",
+        method="POST", query_string="", body=b"{}", content_type="application/json",
+    )
+    assert res.status_code == 202
+    assert calls == ["youtube/sources/1234/scan/start"]
+    with pytest.raises(HTTPException) as exc:
+        await youtube_service.proxy_browser_request(
+            settings, service_path="youtube/sources/1234/scan/delete",
+            method="POST", query_string="", body=b"", content_type="application/json",
+        )
+    assert exc.value.status_code == 404

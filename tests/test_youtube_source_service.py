@@ -427,6 +427,62 @@ class YouTubePlaylistScanTests(TestCase):
                 self.assertEqual(source.last_scan_created_count, 0)
                 self.assertEqual(self.db.query(Task).count(), 0)
 
+    def test_manual_scan_http_accepts_once_and_completes_after_response(self) -> None:
+        from types import SimpleNamespace
+
+        from fastapi import BackgroundTasks, HTTPException
+
+        from videoroll.apps.youtube_ingest.main import start_source_scan
+        from videoroll.apps.youtube_ingest.schemas import YouTubeSourceScanRequest
+
+        source = YouTubeSource(
+            source_type=YouTubeSourceType.channel,
+            source_id="UCmanual-async-1234",
+            license=SourceLicense.authorized,
+            enabled=True,
+            scan_limit=1,
+            auto_process=False,
+        )
+        self.db.add(source)
+        self.db.commit()
+        source_id = source.id
+
+        background = BackgroundTasks()
+        settings = SimpleNamespace(database_url="sqlite:///:memory:", user_agent="UA/1.0", youtube_proxy=None)
+        result = start_source_scan(
+            source_id, background, YouTubeSourceScanRequest(), settings, self.db,
+        )
+        self.assertTrue(result.accepted)
+        self.assertEqual(len(background.tasks), 1)
+        self.db.expire_all()
+        self.assertTrue(source_to_read_dict(self.db.get(YouTubeSource, source_id))["scan_running"])
+
+        with self.assertRaises(HTTPException) as duplicate:
+            start_source_scan(
+                source_id, BackgroundTasks(), YouTubeSourceScanRequest(), settings, self.db,
+            )
+        self.assertEqual(duplicate.exception.status_code, 409)
+
+        # Execute exactly the task accepted by the HTTP route. It must work
+        # with its own fresh DB session and preserve the existing scan lifecycle.
+        self.db.rollback()
+        job = background.tasks[0]
+        with (
+            patch("videoroll.apps.youtube_ingest.main.get_sessionmaker", return_value=lambda: Session(self.engine)),
+            patch("videoroll.apps.youtube_ingest.source_service.fetch_youtube_feed",
+                  return_value=[FeedEntry(video_id="manual-video", title="Manual", published_at=None)]),
+            patch("videoroll.apps.youtube_ingest.source_service.get_youtube_settings", return_value={}),
+        ):
+            job.func(*job.args, **job.kwargs)
+
+        self.db.expire_all()
+        finished = self.db.get(YouTubeSource, source_id)
+        self.assertFalse(source_to_read_dict(finished)["scan_running"])
+        self.assertEqual(finished.total_scan_count, 1)
+        self.assertEqual(finished.last_scan_discovered_count, 1)
+        self.assertEqual(finished.last_scan_created_count, 1)
+        self.assertEqual(self.db.query(IngestedVideo).filter_by(source_id="manual-video").count(), 1)
+
     def test_successful_empty_scan_clears_a_previous_error(self) -> None:
         source = YouTubeSource(
             source_type=YouTubeSourceType.playlist,

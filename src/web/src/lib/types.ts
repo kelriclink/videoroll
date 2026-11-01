@@ -170,6 +170,7 @@ export type YouTubeSource = {
   scan_interval_minutes: number;
   scan_limit: number;
   auto_process: boolean;
+  scan_running?: boolean;
   last_scan_started_at?: string | null;
   last_scan_finished_at?: string | null;
   last_scan_discovered_count: number;

@@ -244,6 +244,10 @@ def youtube_source_scan_is_locked(src: YouTubeSource, *, now: datetime | None = 
     lock_until = getattr(src, "scan_lock_until", None)
     if lock_until is None:
         return False
+    # PostgreSQL returns aware timestamptz values; SQLite may drop the UTC
+    # timezone when storing the same field. Compare UTC instants consistently.
+    if lock_until.tzinfo is None:
+        lock_until = lock_until.replace(tzinfo=timezone.utc)
     return lock_until > (now or _utcnow())
 
 
@@ -270,7 +274,7 @@ def try_acquire_youtube_source_scan_lock(
         return None
 
     now_dt = _utcnow()
-    if row.scan_lock_until is not None and row.scan_lock_until > now_dt:
+    if youtube_source_scan_is_locked(row, now=now_dt):
         return None
 
     row.scan_lock_owner = str(owner or "").strip() or None
@@ -428,6 +432,7 @@ def source_to_read_dict(src: YouTubeSource) -> dict[str, Any]:
         "scan_interval_minutes": normalize_source_scan_interval_minutes(getattr(src, "scan_interval_minutes", None)),
         "scan_limit": normalize_source_scan_limit(getattr(src, "scan_limit", None)),
         "auto_process": True if auto_process is None else bool(auto_process),
+        "scan_running": bool(src.scan_lock_owner) and youtube_source_scan_is_locked(src),
         "last_scan_started_at": getattr(src, "last_scan_started_at", None),
         "last_scan_finished_at": getattr(src, "last_scan_finished_at", None),
         "last_scan_discovered_count": max(0, int(getattr(src, "last_scan_discovered_count", 0) or 0)),
@@ -580,6 +585,7 @@ def scan_youtube_source_by_id(
     lock_owner_prefix: str = "youtube_source_scan",
     lock_ttl_seconds: int = DEFAULT_SOURCE_SCAN_LOCK_TTL_SECONDS,
     pipeline_starter: Callable[[uuid.UUID], str] | None = None,
+    claimed_owner: str | None = None,
 ) -> YouTubeSourceScanResult | None:
     src = db.get(YouTubeSource, source_pk)
     if src is None:
@@ -589,13 +595,15 @@ def scan_youtube_source_by_id(
     if not force and not youtube_source_is_due(src):
         return None
 
-    owner = f"{str(lock_owner_prefix or 'youtube_source_scan').strip()}:{uuid.uuid4().hex[:8]}"
-    locked = try_acquire_youtube_source_scan_lock(
-        db,
-        source_pk,
-        owner=owner,
-        ttl_seconds=lock_ttl_seconds,
-    )
+    owner = claimed_owner or f"{str(lock_owner_prefix or 'youtube_source_scan').strip()}:{uuid.uuid4().hex[:8]}"
+    if claimed_owner is not None:
+        locked = db.get(YouTubeSource, source_pk)
+        if locked is None or locked.scan_lock_owner != owner or not youtube_source_scan_is_locked(locked):
+            raise RuntimeError("youtube source scan claim is no longer owned by this worker")
+    else:
+        locked = try_acquire_youtube_source_scan_lock(
+            db, source_pk, owner=owner, ttl_seconds=lock_ttl_seconds,
+        )
     if locked is None:
         if raise_if_locked:
             raise RuntimeError("youtube source scan is already running")

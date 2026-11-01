@@ -132,8 +132,10 @@ async def proxy_browser_request(
     if normalized_method == "POST":
         allowed = allowed or (
             service_path.startswith("youtube/sources/")
-            and service_path.endswith("/scan")
-            and service_path.count("/") == 3
+            and (
+                (service_path.endswith("/scan") and service_path.count("/") == 3)
+                or (service_path.endswith("/scan/start") and service_path.count("/") == 4)
+            )
         )
     if not allowed:
         raise HTTPException(status_code=404, detail="youtube browser operation not found")

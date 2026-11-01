@@ -7,7 +7,7 @@ import uuid
 from typing import Generator
 
 import httpx
-from fastapi import Body, Depends, FastAPI, HTTPException
+from fastapi import BackgroundTasks, Body, Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -22,7 +22,7 @@ from videoroll.db.models import (
     TaskStatus,
     YouTubeSource,
 )
-from videoroll.db.session import db_session
+from videoroll.db.session import db_session, get_sessionmaker
 from videoroll.storage.filesystem import FileStore
 from videoroll.apps.youtube_ingest.schemas import (
     YouTubeIngestRequest,
@@ -32,10 +32,13 @@ from videoroll.apps.youtube_ingest.schemas import (
     YouTubeSourceCreate,
     YouTubeSourceRead,
     YouTubeSourceScanRequest,
+    YouTubeSourceScanAccepted,
     YouTubeSourceUpdate,
 )
 from videoroll.apps.youtube_ingest.source_service import (
     scan_youtube_source_by_id,
+    try_acquire_youtube_source_scan_lock,
+    DEFAULT_SOURCE_SCAN_LOCK_TTL_SECONDS,
     source_to_read_dict,
     update_youtube_source,
     upsert_youtube_source,
@@ -243,6 +246,55 @@ def scan_source(
         skipped_duplicates=res.skipped_duplicates,
         started_pipeline_job_ids=res.started_pipeline_job_ids,
     )
+
+
+def _run_claimed_manual_scan(
+    source_pk: uuid.UUID,
+    owner: str,
+    payload: YouTubeSourceScanRequest,
+    settings: YouTubeIngestSettings,
+) -> None:
+    # The HTTP response has already been sent. Own a fresh DB session and
+    # leave the failure/result lifecycle to the existing durable scan ledger.
+    with get_sessionmaker(settings.database_url)() as worker_db:
+        scan_youtube_source_by_id(
+            worker_db,
+            source_pk,
+            user_agent=settings.user_agent,
+            default_proxy=settings.youtube_proxy,
+            limit_override=payload.limit,
+            auto_process_override=payload.auto_process,
+            force=True,
+            claimed_owner=owner,
+            pipeline_starter=_pipeline_starter(settings),
+        )
+
+
+@app.post("/youtube/sources/{source_pk}/scan/start", response_model=YouTubeSourceScanAccepted, status_code=202)
+def start_source_scan(
+    source_pk: uuid.UUID,
+    background_tasks: BackgroundTasks,
+    payload: YouTubeSourceScanRequest = Body(default=YouTubeSourceScanRequest()),
+    settings: YouTubeIngestSettings = Depends(get_settings),
+    db: Session = Depends(get_db),
+) -> YouTubeSourceScanAccepted:
+    row = db.get(YouTubeSource, source_pk)
+    if row is None:
+        raise HTTPException(status_code=404, detail="source not found")
+    if not row.enabled:
+        raise HTTPException(status_code=400, detail="source disabled")
+    owner = f"manual_youtube_source_scan:{uuid.uuid4().hex[:8]}"
+    claimed = try_acquire_youtube_source_scan_lock(
+        db, source_pk, owner=owner, ttl_seconds=DEFAULT_SOURCE_SCAN_LOCK_TTL_SECONDS,
+    )
+    if claimed is None:
+        raise HTTPException(status_code=409, detail="youtube source scan is already running")
+    started_at = claimed.last_scan_started_at
+    # Acquiring the lock is committed before returning 202. The worker
+    # continues after the client disconnects; reconnecting clients can poll
+    # /youtube/sources, including scan_running and the persisted scan stats.
+    background_tasks.add_task(_run_claimed_manual_scan, source_pk, owner, payload, settings)
+    return YouTubeSourceScanAccepted(scan_started_at=started_at)
 
 
 @app.post("/youtube/sources/{source_pk}/scan", response_model=YouTubeScanResponse)

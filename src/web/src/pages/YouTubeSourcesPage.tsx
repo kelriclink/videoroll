@@ -9,11 +9,9 @@ type SourceDraft = Partial<
   Pick<YouTubeSource, "display_name" | "license" | "proof_url" | "enabled" | "scan_interval_minutes" | "scan_limit" | "auto_process">
 >;
 
-type ScanResponse = {
-  discovered_count: number;
-  created_task_ids: string[];
-  skipped_duplicates: number;
-  started_pipeline_job_ids?: string[];
+type ScanAcceptedResponse = {
+  accepted: boolean;
+  scan_started_at: string;
 };
 
 type SourceInputType = "auto" | YouTubeSource["source_type"];
@@ -61,6 +59,19 @@ export default function YouTubeSourcesPage() {
   useEffect(() => {
     refresh();
   }, []);
+
+  // Persisted database scan locks, not a pending HTTP request, are the
+  // authoritative signal. Poll only while scans are actually running.
+  const hasActiveScans = sources?.some((source) => source.scan_running) ?? false;
+  useEffect(() => {
+    if (!hasActiveScans) return;
+    const poll = window.setInterval(() => {
+      void fetchJson<YouTubeSource[]>(`${ORCHESTRATOR_URL}/youtube/sources`)
+        .then(setSources)
+        .catch(() => { /* leave the last known state visible; next poll can recover */ });
+    }, 4000);
+    return () => window.clearInterval(poll);
+  }, [hasActiveScans]);
 
   function setBusy(key: string, value: boolean) {
     setBusyMap((prev) => ({ ...prev, [key]: value }));
@@ -156,7 +167,7 @@ export default function YouTubeSourcesPage() {
     setBusy(`scan:${source.id}`, true);
     setError(null);
     try {
-      const res = await fetchJson<ScanResponse>(`${ORCHESTRATOR_URL}/youtube/sources/${source.id}/scan`, {
+      await fetchJson<ScanAcceptedResponse>(`${ORCHESTRATOR_URL}/youtube/sources/${source.id}/scan/start`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -167,8 +178,8 @@ export default function YouTubeSourcesPage() {
       await refresh();
       toast({
         kind: "info",
-        title: "扫描完成",
-        message: `discovered=${res.discovered_count} created=${res.created_task_ids.length} skipped=${res.skipped_duplicates} started_pipeline=${(res.started_pipeline_job_ids ?? []).length}`,
+        title: "扫描已启动",
+        message: "扫描在后台执行，完成后会自动更新结果；无需重复点击。",
       });
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : String(e));
@@ -360,7 +371,7 @@ export default function YouTubeSourcesPage() {
                       placeholder="proof_url（可选）" onChange={(e) => updateDraft(source.id, { proof_url: e.target.value })} />
                   </label>
                   <div className="space-y-1 rounded-md bg-slate-50 p-3 text-xs text-slate-700">
-                    <div>最近扫描：{formatTime(source.last_scan_finished_at ?? source.last_scan_started_at)}</div>
+                    <div>{source.scan_running ? "正在扫描，结果完成后自动更新" : "最近扫描：" + formatTime(source.last_scan_finished_at ?? source.last_scan_started_at)}</div>
                     <div>本次发现 {source.last_scan_discovered_count} / 新建 {source.last_scan_created_count} / 启动 {source.last_scan_started_pipeline_count}</div>
                     <div>最近非空扫描发现 {source.last_nonempty_discovered_count || source.last_scan_discovered_count}</div>
                     <div>升级后累计：成功 {source.total_scan_count ?? 0} 次 / 新建 {source.total_created_count ?? 0} / 启动 {source.total_started_pipeline_count ?? 0} / 失败 {source.total_failed_scan_count ?? 0} 次</div>
@@ -368,7 +379,7 @@ export default function YouTubeSourcesPage() {
                   </div>
                   <div className="grid grid-cols-3 gap-2">
                     <button className="rounded border px-2 py-2 text-sm disabled:opacity-50" disabled={Boolean(busyMap[`save:${source.id}`])} onClick={() => saveSource(source)}>保存</button>
-                    <button className="rounded border px-2 py-2 text-sm disabled:opacity-50" disabled={Boolean(busyMap[`scan:${source.id}`])} onClick={() => scanSource(source)}>立即扫描</button>
+                    <button className="rounded border px-2 py-2 text-sm disabled:opacity-50" disabled={Boolean(busyMap[`scan:${source.id}`]) || Boolean(source.scan_running)} onClick={() => scanSource(source)}>{source.scan_running ? "扫描中..." : "立即扫描"}</button>
                     <button className="rounded border border-rose-200 px-2 py-2 text-sm text-rose-700 disabled:opacity-50" disabled={Boolean(busyMap[`delete:${source.id}`])} onClick={() => deleteSource(source)}>删除</button>
                   </div>
                 </div>
@@ -472,7 +483,7 @@ export default function YouTubeSourcesPage() {
                         </label>
                       </td>
                       <td className="py-3 pr-3">
-                        <div className="text-xs text-slate-700">{source.last_scan_finished_at ? `完成：${formatTime(source.last_scan_finished_at)}` : source.last_scan_started_at ? `开始：${formatTime(source.last_scan_started_at)}` : "未扫描"}</div>
+                        <div className="text-xs text-slate-700">{source.scan_running ? `扫描中：${formatTime(source.last_scan_started_at)}` : source.last_scan_finished_at ? `完成：${formatTime(source.last_scan_finished_at)}` : source.last_scan_started_at ? `开始：${formatTime(source.last_scan_started_at)}` : "未扫描"}</div>
                         <div className="mt-1 text-xs text-slate-500">
                           本次发现 {source.last_scan_discovered_count} / 新建 {source.last_scan_created_count} / 启动 {source.last_scan_started_pipeline_count} / 跳过 {source.last_scan_skipped_duplicates}
                         </div>
@@ -493,10 +504,10 @@ export default function YouTubeSourcesPage() {
                           </button>
                           <button
                             className="rounded border px-2 py-1 text-xs hover:bg-slate-50 disabled:opacity-50"
-                            disabled={isScanning}
+                            disabled={isScanning || Boolean(source.scan_running)}
                             onClick={() => scanSource(source)}
                           >
-                            {isScanning ? "扫描中..." : "立即扫描"}
+                            {isScanning || source.scan_running ? "扫描中..." : "立即扫描"}
                           </button>
                           <button
                             className="rounded border border-rose-200 px-2 py-1 text-xs text-rose-700 hover:bg-rose-50 disabled:opacity-50"
