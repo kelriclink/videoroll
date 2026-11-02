@@ -1,0 +1,548 @@
+use std::time::{Duration, Instant};
+
+use log::warn;
+
+/// Large discontinuities are repaired only when delivery timing does not
+/// support a real gap. Smaller gaps and timestamp quantization remain intact.
+const DISCONTINUITY: Duration = Duration::from_millis(500);
+const DELIVERY_TOLERANCE: Duration = Duration::from_millis(500);
+// Missing video GOPs can span seconds while audio continues on the same clock.
+// Retain bounded forward gaps when the counterpart has advanced into the hole
+// and a second frame confirms the new source position.
+const MAX_COUNTERPART_SUPPORTED_GAP: Duration = Duration::from_secs(5);
+const AUDIO_RECOVERY_GRACE: Duration = Duration::from_millis(2500);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TimestampCorrection {
+    Outlier,
+    ClockReset,
+    ReferenceRecovery,
+}
+
+pub(crate) struct TimestampUpdate {
+    pub(crate) pts: i64,
+    pub(crate) correction: Option<TimestampCorrection>,
+    expected_pts: Option<i64>,
+    reference_pts: Option<i64>,
+    offset: i64,
+}
+
+impl TimestampUpdate {
+    pub(crate) fn log_correction(
+        &self,
+        stage: &str,
+        track: &str,
+        source_pts: i64,
+        rate: i64,
+        channel_id: i32,
+    ) {
+        if let Some(correction) = self.correction {
+            let seconds = |pts: Option<i64>| {
+                pts.map_or_else(
+                    || "unavailable".into(),
+                    |pts| format!("{:.3}", pts as f64 / rate as f64),
+                )
+            };
+            if correction == TimestampCorrection::ReferenceRecovery {
+                warn!(channel = channel_id;
+                    "live {track} timestamp mapping recovered from counterpart at {:.3} s (stage={stage}, expected_s={}, reference_s={}, offset_s={:.3})",
+                    self.pts as f64 / rate as f64, seconds(self.expected_pts), seconds(self.reference_pts), self.offset as f64 / rate as f64
+                );
+            } else {
+                warn!(channel = channel_id;
+                    "live {track} timestamp discontinuity ({correction:?}): {:.3} s corrected to {:.3} s (stage={stage}, expected_s={}, reference_s={}, offset_s={:.3})",
+                    source_pts as f64 / rate as f64, self.pts as f64 / rate as f64, seconds(self.expected_pts), seconds(self.reference_pts), self.offset as f64 / rate as f64
+                );
+            }
+        }
+    }
+}
+
+/// Each track retains its original position on the shared source timeline.
+/// One outlier cannot change the other track's mapping. A consistent new clock
+/// is confirmed by the next frame; an isolated outlier leaves no lasting offset.
+#[derive(Default)]
+pub(crate) struct LiveTimestampTracker {
+    next_pts: Option<i64>,
+    offset: i64,
+    pending_offset: Option<i64>,
+    pending_gap: bool,
+    reference_pts: Option<i64>,
+    received_at: Option<Instant>,
+    duration_pts: i64,
+}
+
+impl LiveTimestampTracker {
+    pub(crate) fn seed(&mut self, pts: i64) {
+        *self = Self {
+            next_pts: Some(pts),
+            ..Self::default()
+        };
+    }
+
+    #[cfg(test)]
+    pub(crate) fn normalize(
+        &mut self,
+        source_pts: i64,
+        duration_pts: i64,
+        ticks_per_second: i64,
+        now: Instant,
+    ) -> TimestampUpdate {
+        self.normalize_with_reference(source_pts, duration_pts, ticks_per_second, None, now)
+    }
+
+    pub(crate) fn next_pts(&self) -> Option<i64> {
+        self.next_pts
+    }
+
+    pub(crate) fn has_received_frame(&self) -> bool {
+        self.received_at.is_some()
+    }
+
+    pub(crate) fn normalize_with_reference(
+        &mut self,
+        source_pts: i64,
+        duration_pts: i64,
+        ticks_per_second: i64,
+        reference_pts: Option<i64>,
+        now: Instant,
+    ) -> TimestampUpdate {
+        let mut pts = source_pts.saturating_add(self.offset);
+        let mut correction = None;
+        let expected_pts = self.next_pts;
+        let reference_advance = reference_pts
+            .zip(self.reference_pts)
+            .map_or(0, |(current, previous)| current.saturating_sub(previous));
+        self.reference_pts = reference_pts;
+
+        if let Some(expected) = self.next_pts {
+            let threshold = (DISCONTINUITY.as_secs_f64() * ticks_per_second as f64) as i64;
+            let tolerance = (DELIVERY_TOLERANCE.as_secs_f64() * ticks_per_second as f64) as i64;
+            // A burst can present video after packet loss before the matching
+            // buffered audio. Two video frames then falsely confirm a reset.
+            // Once the other track confirms the original clock, release that
+            // stale offset rather than keeping the tracks permanently apart.
+            // Only advance: already emitted timestamps cannot be taken back.
+            if self.offset < 0
+                && source_pts >= expected
+                && reference_pts.is_some_and(|reference| {
+                    source_pts.abs_diff(reference) <= tolerance as u64
+                        && pts.abs_diff(reference) > tolerance as u64
+                })
+            {
+                self.offset = 0;
+                self.pending_offset = None;
+                self.pending_gap = false;
+                pts = source_pts;
+                correction = Some(TimestampCorrection::ReferenceRecovery);
+            }
+
+            let difference = pts.saturating_sub(expected);
+            let elapsed = self
+                .received_at
+                .map(|previous| now.saturating_duration_since(previous))
+                .unwrap_or_default();
+            let delivery_gap =
+                (elapsed.as_secs_f64() * ticks_per_second as f64) as i64 - self.duration_pts;
+            let counterpart_supports_gap =
+                reference_pts.is_some_and(|reference| pts <= reference.saturating_add(tolerance));
+            let candidate_offset = expected.saturating_sub(source_pts);
+            let confirmation_tolerance = duration_pts.max(ticks_per_second / 200).max(1);
+            let confirmed_jump = self.pending_offset.is_some_and(|pending| {
+                candidate_offset.abs_diff(pending) <= confirmation_tolerance as u64
+            });
+            // A small audio lead or its normal per-frame progress cannot
+            // validate an arbitrary forward video PTS. Require evidence that
+            // the counterpart advanced while frames of this track were missing,
+            // followed by a second frame confirming the new source position.
+            let bounded_gap = difference > 0
+                && difference
+                    <= (MAX_COUNTERPART_SUPPORTED_GAP.as_secs_f64() * ticks_per_second as f64)
+                        as i64
+                && reference_pts.is_some_and(|reference| reference > expected && reference < pts);
+            let counterpart_advanced_into_gap = bounded_gap
+                && reference_advance > self.duration_pts.max(duration_pts).saturating_mul(2);
+            let confirmed_gap = bounded_gap
+                && confirmed_jump
+                && (self.pending_gap || counterpart_advanced_into_gap);
+            let genuine_gap = difference > 0
+                && (difference <= delivery_gap.saturating_add(tolerance)
+                    || counterpart_supports_gap
+                    || confirmed_gap);
+
+            if difference.unsigned_abs() > threshold as u64 && !genuine_gap {
+                if confirmed_jump {
+                    self.offset = candidate_offset;
+                    self.pending_offset = None;
+                    self.pending_gap = false;
+                    correction = Some(TimestampCorrection::ClockReset);
+                } else {
+                    self.pending_offset = Some(candidate_offset);
+                    self.pending_gap = counterpart_advanced_into_gap;
+                    correction = Some(TimestampCorrection::Outlier);
+                }
+
+                pts = expected;
+            } else {
+                self.pending_offset = None;
+                self.pending_gap = false;
+            }
+        }
+
+        self.next_pts = Some(pts.saturating_add(duration_pts));
+        self.duration_pts = duration_pts;
+        self.received_at = Some(now);
+
+        TimestampUpdate {
+            pts,
+            correction,
+            expected_pts,
+            reference_pts,
+            offset: self.offset,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AudioRecoveryAction {
+    Wait,
+    Report,
+    Rebase,
+}
+
+#[derive(Default)]
+pub(crate) struct LateAudioRecovery {
+    first_pts: Option<i64>,
+    first_gap: i64,
+    last_pts: Option<i64>,
+    reported: bool,
+    pub(crate) discarded_frames: u64,
+}
+
+impl LateAudioRecovery {
+    pub(crate) fn observe(
+        &mut self,
+        source_pts: i64,
+        gap: i64,
+        sample_rate: u32,
+        last_output_at: Option<Instant>,
+        now: Instant,
+    ) -> AudioRecoveryAction {
+        let tolerance = i64::from(sample_rate) / 200;
+        let catching_up = gap.saturating_add(tolerance) < self.first_gap;
+        let went_backwards = self.last_pts.is_some_and(|previous| source_pts < previous);
+
+        if self.first_pts.is_none() || catching_up || went_backwards {
+            self.first_pts = Some(source_pts);
+            self.first_gap = gap;
+        }
+
+        self.last_pts = Some(source_pts);
+        self.discarded_frames = self.discarded_frames.saturating_add(1);
+        let overdue = last_output_at.is_some_and(|previous| {
+            now.saturating_duration_since(previous) >= AUDIO_RECOVERY_GRACE
+        });
+        let advancing = source_pts.saturating_sub(self.first_pts.unwrap_or(source_pts))
+            >= i64::from(sample_rate);
+
+        if overdue && !self.reported {
+            self.reported = true;
+
+            return AudioRecoveryAction::Report;
+        }
+
+        if overdue && advancing && !catching_up {
+            return AudioRecoveryAction::Rebase;
+        }
+
+        AudioRecoveryAction::Wait
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const RATE: i64 = 48_000;
+    const SAMPLES: i64 = 1920;
+
+    #[test]
+    fn isolated_forward_and_backward_outliers_do_not_change_the_clock() {
+        for jump in [258_096, -258_096] {
+            let now = Instant::now();
+            let mut clock = LiveTimestampTracker::default();
+            let start = RATE * 10;
+            assert_eq!(clock.normalize(start, SAMPLES, RATE, now).pts, start);
+            let outlier = clock.normalize(
+                start + SAMPLES + jump,
+                SAMPLES,
+                RATE,
+                now + Duration::from_millis(40),
+            );
+            assert_eq!(outlier.pts, start + SAMPLES);
+            assert_eq!(outlier.correction, Some(TimestampCorrection::Outlier));
+
+            for index in 2..100 {
+                let expected = start + index * SAMPLES;
+                let normal = clock.normalize(
+                    expected,
+                    SAMPLES,
+                    RATE,
+                    now + Duration::from_millis(index as u64 * 40),
+                );
+                assert_eq!(normal.pts, expected);
+                assert_eq!(normal.correction, None);
+            }
+        }
+    }
+
+    #[test]
+    fn persistent_clock_resets_and_return_to_original_clock_remain_continuous() {
+        for jump in [RATE * 30, -RATE * 30] {
+            let now = Instant::now();
+            let mut clock = LiveTimestampTracker::default();
+            clock.normalize(RATE * 10, SAMPLES, RATE, now);
+
+            for index in 1..10 {
+                let expected = RATE * 10 + index * SAMPLES;
+                let shifted = clock.normalize(
+                    expected + jump,
+                    SAMPLES,
+                    RATE,
+                    now + Duration::from_millis(index as u64 * 40),
+                );
+                assert_eq!(shifted.pts, expected);
+                assert_eq!(
+                    shifted.correction,
+                    match index {
+                        1 => Some(TimestampCorrection::Outlier),
+                        2 => Some(TimestampCorrection::ClockReset),
+                        _ => None,
+                    }
+                );
+            }
+
+            for index in 10..20 {
+                let expected = RATE * 10 + index * SAMPLES;
+                assert_eq!(
+                    clock
+                        .normalize(
+                            expected,
+                            SAMPLES,
+                            RATE,
+                            now + Duration::from_millis(index as u64 * 40)
+                        )
+                        .pts,
+                    expected
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn real_delivery_pause_retains_its_timestamp_gap() {
+        let now = Instant::now();
+        let mut clock = LiveTimestampTracker::default();
+        clock.normalize(0, 1024, RATE, now);
+        let resumed = clock.normalize(RATE * 7, 1024, RATE, now + Duration::from_secs(7));
+        assert_eq!(resumed.pts, RATE * 7);
+        assert_eq!(resumed.correction, None);
+        assert_eq!(
+            clock
+                .normalize(
+                    RATE * 7 + 1024,
+                    1024,
+                    RATE,
+                    now + Duration::from_secs(7) + Duration::from_millis(21)
+                )
+                .pts,
+            RATE * 7 + 1024
+        );
+    }
+
+    #[test]
+    fn smaller_gaps_and_millisecond_jitter_are_preserved() {
+        let now = Instant::now();
+        let mut clock = LiveTimestampTracker::default();
+
+        for pts in [0, 1008, 2064, RATE / 5, RATE / 5 + 1024] {
+            let update = clock.normalize(pts, 1024, RATE, now);
+            assert_eq!(update.pts, pts);
+            assert_eq!(update.correction, None);
+        }
+    }
+
+    #[test]
+    fn counterpart_timestamps_preserve_real_gaps_when_delivery_is_bursty() {
+        let now = Instant::now();
+        let mut clock = LiveTimestampTracker::default();
+        clock.normalize(0, 1024, RATE, now);
+        let after_packet_loss =
+            clock.normalize_with_reference(RATE * 2, 1024, RATE, Some(RATE * 2), now);
+        assert_eq!(after_packet_loss.pts, RATE * 2);
+        assert_eq!(after_packet_loss.correction, None);
+    }
+
+    #[test]
+    fn advancing_audio_preserves_a_missing_video_gop_before_audio_catches_up() {
+        let now = Instant::now();
+        let mut video = LiveTimestampTracker::default();
+        video.normalize_with_reference(1_201_581_000, 40_000, 1_000_000, Some(1_201_600_000), now);
+        // Server trace: two seconds of video are missing, but audio has
+        // advanced into that interval. Arrival timing alone resembles a reset.
+        for (source, reference, expected, correction) in [
+            (
+                1_203_581_000,
+                1_201_962_000,
+                1_201_621_000,
+                Some(TimestampCorrection::Outlier),
+            ),
+            (1_203_621_000, 1_202_004_000, 1_203_621_000, None),
+            (1_203_661_000, 1_202_046_000, 1_203_661_000, None),
+        ] {
+            let update =
+                video.normalize_with_reference(source, 40_000, 1_000_000, Some(reference), now);
+            assert_eq!(update.pts, expected);
+            assert_eq!(update.correction, correction);
+        }
+        assert_eq!(video.offset, 0);
+    }
+
+    #[test]
+    fn audio_lead_does_not_validate_an_isolated_video_outlier() {
+        let now = Instant::now();
+        for lead in [20_000, 360_000] {
+            let mut video = LiveTimestampTracker::default();
+            for index in 0..100 {
+                let expected = index * 40_000;
+                let outlier = index % 25 == 1;
+                let source = expected + if outlier { 1_960_000 } else { 0 };
+                let update = video.normalize_with_reference(
+                    source,
+                    40_000,
+                    1_000_000,
+                    Some(expected + if index == 0 { 20_000 } else { lead }),
+                    now + Duration::from_millis(index as u64 * 40),
+                );
+                assert_eq!(update.pts, expected);
+                assert_eq!(
+                    update.correction,
+                    outlier.then_some(TimestampCorrection::Outlier)
+                );
+                assert_eq!(video.offset, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn normal_audio_progress_does_not_turn_a_small_clock_reset_into_a_gap() {
+        let now = Instant::now();
+        let mut video = LiveTimestampTracker::default();
+        for index in 0..100 {
+            let expected = index * 40_000;
+            let source = expected + if index > 0 { 1_960_000 } else { 0 };
+            let update = video.normalize_with_reference(
+                source,
+                40_000,
+                1_000_000,
+                Some(expected + 20_000),
+                now + Duration::from_millis(index as u64 * 40),
+            );
+            assert_eq!(update.pts, expected);
+            assert_eq!(
+                update.correction,
+                match index {
+                    1 => Some(TimestampCorrection::Outlier),
+                    2 => Some(TimestampCorrection::ClockReset),
+                    _ => None,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn delayed_counterpart_recovers_a_gap_mistaken_for_a_clock_reset() {
+        let now = Instant::now();
+        let mut video = LiveTimestampTracker::default();
+        video.normalize_with_reference(0, 40_000, 1_000_000, Some(0), now);
+        // Video after a gap reaches the coordinator before buffered audio.
+        // With only the stale audio reference, the two frames look like a reset.
+        video.normalize_with_reference(1_840_000, 40_000, 1_000_000, Some(0), now);
+        video.normalize_with_reference(1_880_000, 40_000, 1_000_000, Some(0), now);
+        // Continuous audio subsequently catches up on its original clock.
+        for index in 0..20 {
+            let source = 1_920_000 + index * 40_000;
+            let update =
+                video.normalize_with_reference(source, 40_000, 1_000_000, Some(source), now);
+            assert_eq!(
+                update.pts, source,
+                "a confirmed common source clock must remove the stale per-track offset"
+            );
+            assert_eq!(
+                update.correction,
+                (index == 0).then_some(TimestampCorrection::ReferenceRecovery)
+            );
+        }
+    }
+
+    #[test]
+    fn joint_clock_reset_preserves_the_initial_audio_video_offset() {
+        let now = Instant::now();
+        let mut video = LiveTimestampTracker::default();
+        let mut audio = LiveTimestampTracker::default();
+        video.normalize(0, SAMPLES, RATE, now);
+        audio.normalize(480, SAMPLES, RATE, now);
+
+        for index in 1..10 {
+            let time = now + Duration::from_millis(index as u64 * 40);
+            let video_pts = video
+                .normalize(index * SAMPLES + RATE * 30, SAMPLES, RATE, time)
+                .pts;
+            let audio_pts = audio
+                .normalize(index * SAMPLES + RATE * 30 + 480, SAMPLES, RATE, time)
+                .pts;
+            assert_eq!(video_pts, index * SAMPLES);
+            assert_eq!(audio_pts - video_pts, 480);
+        }
+    }
+
+    #[test]
+    fn genuinely_late_audio_that_is_catching_up_is_not_rebased() {
+        let now = Instant::now();
+        let mut recovery = LateAudioRecovery::default();
+
+        for index in 0..100 {
+            let action = recovery.observe(
+                index * 1024,
+                RATE * 4 - index * 1024,
+                RATE as u32,
+                Some(now - Duration::from_secs(4)),
+                now,
+            );
+            assert_ne!(action, AudioRecoveryAction::Rebase);
+        }
+    }
+
+    #[test]
+    fn persistent_lag_is_reported_and_recovered_but_repeated_frames_only_report_once() {
+        let now = Instant::now();
+        let last_output = Some(now - Duration::from_secs(4));
+        let mut recovery = LateAudioRecovery::default();
+        assert!(
+            recovery.observe(0, RATE * 4, RATE as u32, last_output, now)
+                == AudioRecoveryAction::Report
+        );
+
+        for _ in 0..100 {
+            assert!(
+                recovery.observe(0, RATE * 4, RATE as u32, last_output, now)
+                    == AudioRecoveryAction::Wait
+            );
+        }
+
+        assert!(
+            recovery.observe(RATE, RATE * 4, RATE as u32, last_output, now)
+                == AudioRecoveryAction::Rebase
+        );
+    }
+}

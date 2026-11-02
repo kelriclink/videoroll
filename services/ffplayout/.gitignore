@@ -13,6 +13,7 @@
 # exlcude logging
 *.log
 /logs/
+/heap-profiles/
 
 *.exe
 *.zip
@@ -53,10 +54,3 @@ Videos/
 *.tar*
 home
 home/
-live
-live/
-live1
-live1/
-Musik
-Musik/
-test.vue

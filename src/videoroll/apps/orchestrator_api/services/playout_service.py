@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import errno
 import logging
 import os
 import shutil
@@ -15,6 +16,7 @@ from sqlalchemy.orm import Session
 
 from videoroll.db.models import Asset, AssetKind, PlayoutAssetLink, Task
 from videoroll.storage.filesystem import FileStore, StorageObjectNotFound
+from videoroll.apps.subtitle_service.task_title_store import get_task_display_title_with_storage
 
 
 logger = logging.getLogger(__name__)
@@ -38,23 +40,41 @@ def _final_asset_or_404(db: Session, task_id: uuid.UUID, asset_id: uuid.UUID) ->
     return asset
 
 
-def _safe_filename(storage_key: str, asset_id: uuid.UUID) -> str:
-    name = PurePosixPath(str(storage_key)).name
-    cleaned = "".join(
-        "_" if char in {"/", "\\"} or ord(char) < 32 else char
-        for char in name.replace("\x00", "")
-    ).strip()
-    if not cleaned or cleaned in {".", ".."}:
-        cleaned = f"video-{asset_id}.mp4"
-    return cleaned[:180]
+def _safe_media_filename(title: str, storage_key: str, asset_id: uuid.UUID) -> str:
+    """A readable single-level name; no directories or platform-specific control chars."""
+    extension = PurePosixPath(storage_key).suffix.lower()
+    if extension not in {".mp4", ".mkv", ".webm", ".mov", ".m4v"}:
+        extension = ".mp4"
+    value = str(title or "").strip() or PurePosixPath(storage_key).stem
+    name = "".join("_" if c in set("/\\:*?\"<>|") or ord(c) < 32 else c for c in value)
+    name = " ".join(name.split()).strip(" .")
+    if not name or name.upper() in {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}:
+        name = f"视频-{asset_id.hex[:8]}"
+    # Preserve UTF-8 boundaries; keep under typical filename length limits.
+    while len((name + extension).encode("utf-8")) > 180:
+        name = name[:-1].rstrip(" .")
+    return name + extension
 
 
-def _relative_media_path(task_id: uuid.UUID, storage_key: str, asset_id: uuid.UUID) -> str:
-    return (
-        PurePosixPath(PLAYOUT_MEDIA_DIRECTORY)
-        / str(task_id)
-        / _safe_filename(storage_key, asset_id)
-    ).as_posix()
+def _relative_media_path(filename: str) -> str:
+    return (PurePosixPath(PLAYOUT_MEDIA_DIRECTORY) / filename).as_posix()
+
+
+def _choose_media_path(db: Session, root: Path, filename: str, asset_id: uuid.UUID, checksum: str, source: Path) -> str:
+    """Keep the Chinese title when free; deterministically suffix collisions."""
+    stem, extension = Path(filename).stem, Path(filename).suffix
+    candidates = (filename, f"{stem[:110]}-{asset_id.hex[:8]}{extension}", f"{asset_id}{extension}")
+    for candidate in candidates:
+        relative = _relative_media_path(candidate)
+        owned = db.query(PlayoutAssetLink.id).filter(PlayoutAssetLink.relative_media_path == relative).first()
+        if owned:
+            continue
+        target = _resolve_media_path(root, relative)
+        if not target.exists():
+            return relative
+        if target.is_file() and (_same_file(source, target) or _sha256_file(target) == checksum):
+            return relative
+    raise HTTPException(status_code=409, detail="cannot allocate a unique playout filename")
 
 
 def _resolve_media_path(root: Path, relative_path: str) -> Path:
@@ -140,7 +160,27 @@ def _transfer(source: Path, destination: Path, checksum: str) -> str:
         except OSError:
             shutil.copy2(source, temporary_path)
             transfer_mode = "copy"
-        os.replace(temporary_path, destination)
+        # Publish without overwriting a conflicting file inserted concurrently.
+        try:
+            os.link(temporary_path, destination)
+        except OSError as exc:
+            if exc.errno == errno.EEXIST or destination.exists():
+                raise HTTPException(status_code=409, detail="playout destination already exists") from exc
+            # Filesystems without hardlinks: reserve the destination exclusively.
+            # The source is a completed temporary copy in the same directory.
+            created = False
+            try:
+                # Do not unlink an existing file if another importer wins the
+                # exclusive-create race before we open the destination.
+                with destination.open("xb") as writable:
+                    created = True
+                    with temporary_path.open("rb") as readable:
+                        shutil.copyfileobj(readable, writable, 8 * 1024 * 1024)
+            except Exception:
+                if created:
+                    destination.unlink(missing_ok=True)
+                raise
+        temporary_path.unlink()
         temporary_path = None
         return transfer_mode
     finally:
@@ -211,9 +251,6 @@ def import_asset_to_playout(
         raise HTTPException(status_code=409, detail="asset storage key is invalid") from exc
 
     checksum = _source_checksum(asset, source)
-    relative_path = _relative_media_path(task.id, asset.storage_key, asset.id)
-    destination = _resolve_media_path(Path(media_root), relative_path)
-
     existing = (
         db.query(PlayoutAssetLink)
         .filter(PlayoutAssetLink.asset_id == asset.id)
@@ -222,10 +259,17 @@ def import_asset_to_playout(
     if existing is not None:
         if existing.source_checksum != checksum:
             raise HTTPException(status_code=409, detail="source asset checksum changed")
-        if existing.relative_media_path != relative_path or existing.ffplayout_channel_id != channel_id:
-            raise HTTPException(status_code=409, detail="asset is already linked to another playout destination")
+        if existing.ffplayout_channel_id != channel_id:
+            raise HTTPException(status_code=409, detail="asset is already linked to another playout channel")
+        # Preserve previously imported paths: playlists may refer to them.
+        destination = _resolve_media_path(Path(media_root), existing.relative_media_path)
         _transfer(source, destination, checksum)
         return _link_response(existing)
+
+    title = get_task_display_title_with_storage(db, str(task.id), store=storage)
+    filename = _safe_media_filename(title, asset.storage_key, asset.id)
+    relative_path = _choose_media_path(db, Path(media_root), filename, asset.id, checksum, source)
+    destination = _resolve_media_path(Path(media_root), relative_path)
 
     transfer_mode = _transfer(source, destination, checksum)
     link = PlayoutAssetLink(

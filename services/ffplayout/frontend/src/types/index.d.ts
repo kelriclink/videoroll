@@ -21,6 +21,11 @@ declare global {
     }
 
     interface PlayoutOutput {
+        public_moq: boolean
+        runtime_status?: string | null
+        runtime_error?: string | null
+        runtime_retryable?: boolean
+        active?: boolean
         id: number
         name: string
         hls_variants: string
@@ -38,6 +43,7 @@ declare global {
         video_options: string
         protocol_options: string
         muxer_options: string
+        metadata_options: string
         audio_codec: string | null
         audio_options: string
         audio_bitrate: number | null
@@ -80,6 +86,8 @@ declare global {
     }
 
     interface PlayoutCodecOptions {
+        desktop_available: boolean
+        moq: OutputCodecOptions
         hls: OutputCodecOptions
         rtmp: OutputCodecOptions
         srt: OutputCodecOptions
@@ -251,6 +259,9 @@ declare global {
         audio?: AudioLevel
         loudness?: LiveLoudnessMetrics
         ingest: boolean
+        ingest_listener_id?: number | null
+        ingest_listener_name?: string | null
+        ingest_listener_backend?: string | null
         mode: string
         elapsed: number
         shift: number

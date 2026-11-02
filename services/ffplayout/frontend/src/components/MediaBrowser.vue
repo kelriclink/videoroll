@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import VirtualList from 'vue-virtual-sortable'
 
-import { ref, onMounted, watch } from 'vue'
+import { computed, ref, onMounted, watch } from 'vue'
 import { useWindowSize } from '@vueuse/core'
 import { storeToRefs } from 'pinia'
 
@@ -17,6 +17,18 @@ const mediaStore = useMedia()
 const { i } = storeToRefs(useConfig())
 
 const dragGroup = ref({ name: 'dragGroup', pull: 'clone', put: false })
+
+// The older VideoRoll importer placed each file under a task UUID folder.
+// Preserve those paths for existing playlists, but hide the redundant folders
+// after flattening the imported Chinese-titled files at VideoRoll's root.
+const visibleFolders = computed(() => {
+    const pathParts = (mediaStore.folderTree.source || '').split('/').filter(Boolean)
+    const inVideoRoll = pathParts.length === 1 && pathParts[0] === 'VideoRoll'
+    if (!inVideoRoll) return mediaStore.folderTree.folders
+    return mediaStore.folderTree.folders.filter(
+        (folder) => !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(folder.name),
+    )
+})
 
 defineProps({
     preview: {
@@ -69,7 +81,7 @@ watch([i], () => {
 
         <div class="w-full h-[calc(100%-40px)]">
             <VirtualList
-                v-if="mediaStore.folderTree.files.length > 0 || mediaStore.folderTree.folders.length > 0"
+                v-if="mediaStore.folderTree.files.length > 0 || visibleFolders.length > 0"
                 id="mediaList"
                 v-model="mediaStore.folderTree.files"
                 class="w-full h-full"
@@ -87,7 +99,7 @@ watch([i], () => {
                 <template #header>
                     <ul class="border-b border-base-content/20 list-none text-sm">
                         <li
-                            v-for="folder in mediaStore.folderTree.folders"
+                            v-for="folder in visibleFolders"
                             :key="folder.uid"
                             class="grid grid-cols-[30px_auto] even:bg-base-200 py-1.5 items-center cursor-pointer"
                             @click="mediaStore.getTree(`/${mediaStore.folderTree.source}/${folder.name}`)"
@@ -106,7 +118,7 @@ watch([i], () => {
                         :id="`file-${index}`"
                         :key="item.name"
                         class="grid grid-cols-[30px_auto_32px_62px] border-b border-base-content/20 py-1.5 items-center"
-                        :class="mediaStore.folderTree.folders.length % 2 === 0 ? 'even:bg-base-200' : 'odd:bg-base-200'"
+                        :class="visibleFolders.length % 2 === 0 ? 'even:bg-base-200' : 'odd:bg-base-200'"
                     >
                         <div class="px-2" :class="{ timeHidden: configStore.playout.playlist.infinit }">
                             <i v-if="mediaType(item.name) === 'audio'" class="bi-music-note-beamed" />

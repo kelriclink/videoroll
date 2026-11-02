@@ -6,8 +6,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 NGINX_CONF = ROOT / "src" / "web" / "nginx.conf"
-FFPLAYOUT_PATHS = ROOT / "services" / "ffplayout" / "backend" / "app" / "src" / "api" / "path.rs"
-FFPLAYOUT_SSE_PATHS = ROOT / "services" / "ffplayout" / "backend" / "app" / "src" / "sse" / "routes.rs"
+FFPLAYOUT_PATHS = ROOT / "services" / "ffplayout" / "crates" / "app" / "src" / "api" / "path.rs"
+FFPLAYOUT_SSE_PATHS = ROOT / "services" / "ffplayout" / "crates" / "app" / "src" / "sse" / "routes.rs"
 
 
 def _ffplayout_api_paths() -> list[str]:

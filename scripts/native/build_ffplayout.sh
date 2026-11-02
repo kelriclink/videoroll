@@ -32,8 +32,9 @@ if [[ -z "$ARTIFACT_DIR" ]]; then
 command -v cargo >/dev/null || { echo "cargo is required" >&2; exit 1; }
 command -v npm >/dev/null || { echo "npm is required" >&2; exit 1; }
 node_major="$(node -p 'process.versions.node.split(".")[0]')"
-if [[ "$node_major" != "24" ]]; then
-  echo "ffplayout build requires Node.js 24; found Node.js $node_major" >&2
+node_minor="$(node -p 'process.versions.node.split(".")[1]')"
+if (( node_major < 20 || (node_major == 20 && node_minor < 19) || node_major == 21 || (node_major == 22 && node_minor < 12) )); then
+  echo "ffplayout frontend build requires Node.js 20.19+, 22.12+ or later LTS; found $(node -v)" >&2
   exit 1
 fi
 

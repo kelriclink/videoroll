@@ -14,7 +14,7 @@ from videoroll.apps.orchestrator_api.services import playout_service
 from videoroll.apps.orchestrator_api.dependencies import get_db, get_store, get_settings
 from videoroll.apps.orchestrator_api.routers.assets import router as assets_router
 from videoroll.db.base import Base
-from videoroll.db.models import Asset, AssetKind, PlayoutAssetLink, SourceLicense, SourceType, Task, TaskStatus
+from videoroll.db.models import AppSetting, Asset, AssetKind, PlayoutAssetLink, SourceLicense, SourceType, Task, TaskStatus
 from videoroll.storage.filesystem import FileStore
 
 
@@ -50,7 +50,7 @@ def _task_and_asset(db: Session, root: Path, *, kind: AssetKind = AssetKind.vide
 @pytest.fixture
 def db(tmp_path: Path):
     engine = create_engine(f"sqlite:///{tmp_path / 'db.sqlite3'}")
-    Base.metadata.create_all(engine, tables=[Task.__table__, Asset.__table__, PlayoutAssetLink.__table__])
+    Base.metadata.create_all(engine, tables=[Task.__table__, Asset.__table__, PlayoutAssetLink.__table__, AppSetting.__table__])
     with Session(engine) as session:
         yield session
     engine.dispose()
@@ -66,6 +66,7 @@ def test_import_uses_hardlink_and_is_idempotent(db: Session, tmp_path: Path) -> 
     destination = _playout_root(tmp_path) / first["playout_path"]
     assert first["status"] == "ready"
     assert first["transfer_mode"] == "hardlink"
+    assert first["playout_path"] == "VideoRoll/video.mp4"
     assert first["task_id"] == task.id
     assert first["asset_id"] == asset.id
     assert destination.is_file()
@@ -189,6 +190,104 @@ def test_playout_import_route_returns_the_id_only_contract(db: Session, tmp_path
     assert payload["status"] == "ready"
     assert payload["task_id"] == str(task.id)
     assert payload["asset_id"] == str(asset.id)
-    assert payload["playout_path"].startswith(f"VideoRoll/{task.id}/")
+    assert payload["playout_path"] == "VideoRoll/video.mp4"
     assert listing.status_code == 200
     assert len(listing.json()) == 1
+
+
+def test_import_uses_translated_chinese_title_at_video_roll_root(db: Session, tmp_path: Path) -> None:
+    storage, root = _storage(tmp_path)
+    task, asset, _ = _task_and_asset(db, root)
+    db.add(AppSetting(key=f"task.title.{task.id}", value_json={
+        "source_title": "Original title", "translated_title": "为什么电路板上的走线粗细不同？"
+    }))
+    db.commit()
+    first = playout_service.import_asset_to_playout(task.id, asset.id, db=db, storage=storage, media_root=_playout_root(tmp_path))
+    second = playout_service.import_asset_to_playout(task.id, asset.id, db=db, storage=storage, media_root=_playout_root(tmp_path))
+    assert first["playout_path"] == "VideoRoll/为什么电路板上的走线粗细不同？.mp4"
+    assert second["playout_path"] == first["playout_path"]
+    assert (_playout_root(tmp_path) / first["playout_path"]).is_file()
+
+
+def test_title_filename_sanitized_no_subfolders(db: Session, tmp_path: Path) -> None:
+    storage, root = _storage(tmp_path)
+    task, asset, _ = _task_and_asset(db, root)
+    db.add(AppSetting(key=f"task.title.{task.id}", value_json={"translated_title": "  中文/标题\n:第一期?*  "}))
+    db.commit()
+    result = playout_service.import_asset_to_playout(task.id, asset.id, db=db, storage=storage, media_root=_playout_root(tmp_path))
+    assert result["playout_path"].startswith("VideoRoll/中文_标题")
+    assert len(Path(result["playout_path"]).parts) == 2
+    assert Path(result["playout_path"]).suffix == ".mp4"
+
+
+def test_two_assets_with_same_title_get_distinct_flat_names(db: Session, tmp_path: Path) -> None:
+    storage, root = _storage(tmp_path)
+    t1, a1, _ = _task_and_asset(db, root, key="final/first.mp4")
+    t2, a2, _ = _task_and_asset(db, root, key="final/second.mp4")
+    db.add_all([
+        AppSetting(key=f"task.title.{t1.id}", value_json={"translated_title": "同名测试"}),
+        AppSetting(key=f"task.title.{t2.id}", value_json={"translated_title": "同名测试"}),
+    ])
+    db.commit()
+    p1 = playout_service.import_asset_to_playout(t1.id, a1.id, db=db, storage=storage, media_root=_playout_root(tmp_path))
+    p2 = playout_service.import_asset_to_playout(t2.id, a2.id, db=db, storage=storage, media_root=_playout_root(tmp_path))
+    assert p1["playout_path"] == "VideoRoll/同名测试.mp4"
+    assert p2["playout_path"].startswith("VideoRoll/同名测试-")
+    assert p1["playout_path"] != p2["playout_path"]
+    assert (_playout_root(tmp_path) / p1["playout_path"]).is_file()
+    assert (_playout_root(tmp_path) / p2["playout_path"]).is_file()
+
+
+def test_existing_nested_playout_link_kept_for_playlists(db: Session, tmp_path: Path) -> None:
+    storage, root = _storage(tmp_path)
+    task, asset, source = _task_and_asset(db, root)
+    old_path = f"VideoRoll/{task.id}/video.mp4"
+    dest = _playout_root(tmp_path) / old_path
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.hardlink_to(source)
+    db.add(PlayoutAssetLink(task_id=task.id, asset_id=asset.id, ffplayout_channel_id=1,
+                             relative_media_path=old_path, transfer_mode="hardlink", source_checksum=asset.sha256))
+    db.commit()
+    result = playout_service.import_asset_to_playout(task.id, asset.id, db=db, storage=storage, media_root=_playout_root(tmp_path))
+    assert result["playout_path"] == old_path
+    assert dest.samefile(source)
+
+
+def test_chinese_filename_is_byte_bounded_and_sanitizes_windows_separators() -> None:
+    title = "测试" * 120 + '/\\:*?"<>|'
+    name = playout_service._safe_media_filename(title, "video/final.mp4", uuid.uuid4())
+    assert name.endswith(".mp4")
+    assert len(name.encode("utf-8")) <= 180
+    assert not any(c in name for c in '/\\:*?"<>|')
+    assert name.startswith("测试测试")
+
+
+def test_exclusive_copy_race_preserves_another_importer_destination(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from unittest.mock import patch
+    import errno
+
+    source = tmp_path / "source.mp4"
+    source.write_bytes(b"this video is the source")
+    destination = tmp_path / "other-video.mp4"
+    checksum = hashlib.sha256(source.read_bytes()).hexdigest()
+    original_open = Path.open
+
+    def inject_race(path: Path, mode: str = "r", *args: object, **kwargs: object):
+        if path == destination and mode == "xb":
+            # A concurrent writer created a different video immediately before
+            # the exclusive fallback destination was opened.
+            destination.write_bytes(b"different concurrent video")
+            raise FileExistsError(errno.EEXIST, "already exists", str(destination))
+        return original_open(path, mode, *args, **kwargs)
+
+    original_link = playout_service.os.link
+
+    def no_links(*args: object, **kwargs: object) -> None:
+        raise OSError(errno.EPERM, "hard links unsupported")
+
+    monkeypatch.setattr(playout_service.os, "link", no_links)
+    with patch.object(Path, "open", inject_race):
+        with pytest.raises(FileExistsError):
+            playout_service._transfer(source, destination, checksum)
+    assert destination.read_bytes() == b"different concurrent video"
+    monkeypatch.setattr(playout_service.os, "link", original_link)
