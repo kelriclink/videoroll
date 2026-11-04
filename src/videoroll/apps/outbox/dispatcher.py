@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy.orm import Session
@@ -54,7 +55,13 @@ def dispatch_outbox_events(
         try:
             args, kwargs, queue = _message_parts(event)
             args.append(str(event.id))
-            result = celery_app.send_task(event.task_name, args=args, kwargs=kwargs, queue=queue)
+            result = celery_app.send_task(
+                event.task_name,
+                args=args,
+                kwargs=kwargs,
+                queue=queue,
+                headers={"videoroll_enqueued_at": datetime.now(timezone.utc).isoformat()},
+            )
             mark_outbox_dispatched(db, event.id, str(getattr(result, "id", "") or ""))
             db.commit()
             dispatched += 1

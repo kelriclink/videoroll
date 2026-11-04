@@ -41,12 +41,10 @@ settings = get_social_publisher_settings()
 logger = logging.getLogger(__name__)
 _JOB_LEASE_TTL_SECONDS = 1800
 celery_app = Celery("social_publisher", broker=settings.redis_url, backend=settings.redis_url)
-celery_app.conf.beat_schedule = {
-    "social-publisher-mark-stale": {
-        "task": "social_publisher.mark_stale_jobs_unknown",
-        "schedule": 60.0,
-    }
-}
+# Publish-dispatch recovery is centralized in subtitle_service's outbox beat.
+# Scheduling the compatibility task here duplicated every recovery sweep and
+# sent it to Celery's default queue, which the social worker does not consume.
+celery_app.conf.beat_schedule = {}
 
 
 def _db() -> Session:

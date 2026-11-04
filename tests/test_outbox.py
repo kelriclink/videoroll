@@ -149,12 +149,14 @@ def test_dispatcher_sends_worker_args_and_outbox_event_id(db: Session) -> None:
     result = dispatch_outbox_events(db, celery_app, owner="dispatcher", limit=10)
 
     assert result.dispatched == 1
-    celery_app.send_task.assert_called_once_with(
-        "bilibili_publisher.process_job",
-        args=["job-1", str(event.id)],
-        kwargs={},
-        queue="publish",
-    )
+    celery_app.send_task.assert_called_once()
+    task_name = celery_app.send_task.call_args.args[0]
+    opts = celery_app.send_task.call_args.kwargs
+    assert task_name == "bilibili_publisher.process_job"
+    assert opts["args"] == ["job-1", str(event.id)]
+    assert opts["kwargs"] == {}
+    assert opts["queue"] == "publish"
+    assert datetime.fromisoformat(opts["headers"]["videoroll_enqueued_at"]).tzinfo is not None
     assert db.get(OutboxEvent, event.id).status == "dispatched"
 
 

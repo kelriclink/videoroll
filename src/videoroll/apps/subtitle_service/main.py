@@ -95,6 +95,7 @@ from videoroll.apps.subtitle_service.schemas import (
     TaskQueueItemRead,
     TaskQueueRead,
     TaskQueueSettingsRead,
+    BrokerQueueSnapshotRead,
 )
 from videoroll.apps.subtitle_service.asr_settings_store import get_asr_settings, update_asr_settings
 from videoroll.apps.subtitle_service.auto_profile_store import get_auto_profile, update_auto_profile
@@ -2826,6 +2827,17 @@ def update_task_queue_settings(payload: DownloadConcurrencyUpdate, db: Session =
 
     set_download_concurrency(db, payload.max_concurrent)
     return _download_queue_settings(db)
+
+
+@app.get("/subtitle/task_queue/broker", response_model=BrokerQueueSnapshotRead)
+def get_task_queue_broker(settings: SubtitleServiceSettings = Depends(get_settings)) -> BrokerQueueSnapshotRead:
+    from videoroll.apps.subtitle_service.queue_telemetry import read_broker_snapshot
+
+    try:
+        return BrokerQueueSnapshotRead.model_validate(read_broker_snapshot(settings.redis_url))
+    except Exception as exc:
+        logger.warning("broker telemetry unavailable: %s", type(exc).__name__)
+        raise HTTPException(status_code=503, detail="broker telemetry unavailable") from exc
 
 
 @app.get("/subtitle/task_queue", response_model=TaskQueueRead)

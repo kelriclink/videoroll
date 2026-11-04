@@ -34,6 +34,38 @@ type TaskQueue = {
   tasks: TaskQueueItem[];
 };
 
+type BrokerQueueMetrics = {
+  name: string;
+  ready: number;
+  reserved: number | null;
+  active: number | null;
+  unacked: number;
+  oldest_wait_seconds: number | null;
+  ready_retry_attempts: number;
+  sampled_ready: number;
+  scan_truncated: boolean;
+};
+
+type BrokerQueueSnapshot = {
+  observed_at: string;
+  worker_observed: boolean;
+  queues: BrokerQueueMetrics[];
+  warnings: string[];
+};
+
+const BROKER_QUEUE_LABELS: Record<string, string> = {
+  "subtitle-control": "字幕控制 / Outbox",
+  publish: "B 站投稿",
+  social_publish: "社交平台投稿",
+  celery: "默认队列（应保持为空）",
+};
+
+function brokerAgeLabel(seconds: number | null): string {
+  if (seconds === null) return "未知";
+  if (seconds < 60) return `${seconds} 秒`;
+  return elapsedLabel(seconds);
+}
+
 function elapsedLabel(seconds: number): string {
   const minutes = Math.floor(Math.max(0, seconds) / 60);
   if (minutes < 60) return `${minutes} 分钟`;
@@ -53,6 +85,8 @@ function queueErrorTitle(error?: string | null): string {
 
 export default function RenderQueuePage() {
   const [queue, setQueue] = useState<TaskQueue | null>(null);
+  const [broker, setBroker] = useState<BrokerQueueSnapshot | null>(null);
+  const [brokerError, setBrokerError] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [downloadConcurrency, setDownloadConcurrency] = useState<number>(2);
   const [saving, setSaving] = useState(false);
@@ -60,6 +94,16 @@ export default function RenderQueuePage() {
   const queueRef = useRef<TaskQueue | null>(null);
   const downloadInputDirtyRef = useRef(false);
   const refreshTimerRef = useRef<number | undefined>();
+
+  const refreshBroker = useCallback(async () => {
+    try {
+      const snapshot = await fetchJson<BrokerQueueSnapshot>(`${ORCHESTRATOR_URL}/subtitle/task_queue/broker`);
+      setBroker(snapshot);
+      setBrokerError(null);
+    } catch (cause: unknown) {
+      setBrokerError(cause instanceof Error ? cause.message : String(cause));
+    }
+  }, []);
 
   const refresh = useCallback(async () => {
     setError(null);
@@ -100,7 +144,10 @@ export default function RenderQueuePage() {
 
   useEffect(() => {
     void refresh();
-  }, [refresh]);
+    void refreshBroker();
+    const timer = window.setInterval(() => void refreshBroker(), 20_000);
+    return () => window.clearInterval(timer);
+  }, [refresh, refreshBroker]);
 
   const scheduleRefresh = useCallback(() => {
     if (refreshTimerRef.current) return;
@@ -171,7 +218,7 @@ export default function RenderQueuePage() {
       <PageHeader
         title="处理队列"
         description="查看正在执行和等待处理的业务阶段。底层调度器、作业 ID 与原始错误放在技术详情中。"
-        actions={<Button onClick={() => void refresh()}>刷新</Button>}
+        actions={<Button onClick={() => { void refresh(); void refreshBroker(); }}>刷新</Button>}
       />
 
       {error ? (
@@ -209,6 +256,40 @@ export default function RenderQueuePage() {
           <div className="mt-1">字幕 Worker 槽位：{queue?.settings.subtitle_worker_slots ?? "—"}</div>
           <div className="mt-2 text-slate-500">任务优先级只在创建或恢复工作流时映射到调度器；已提交执行不会伪装成可实时重排。</div>
         </TechnicalDetails>
+      </div>
+
+      <div className="vr-section space-y-3">
+        <div className="flex flex-wrap items-baseline justify-between gap-2">
+          <div className="font-semibold">Celery / Redis 队列健康</div>
+          <div className="text-xs text-slate-500">快照时间：{broker ? new Date(broker.observed_at).toLocaleString() : "尚未采集"}</div>
+        </div>
+        <div className="overflow-x-auto">
+          <table className="min-w-[760px] w-full text-left text-sm">
+            <thead className="text-xs text-slate-500"><tr>
+              <th className="py-2 pr-3">队列</th><th className="py-2 pr-3">Ready</th>
+              <th className="py-2 pr-3">Reserved</th><th className="py-2 pr-3">Active</th>
+              <th className="py-2 pr-3">Unacked</th><th className="py-2 pr-3">最老等待</th>
+              <th className="py-2 pr-3">排队重试次数</th>
+            </tr></thead>
+            <tbody>{broker?.queues.map((item) => (
+              <tr key={item.name} className="border-t border-slate-200 dark:border-slate-800">
+                <td className="py-2 pr-3">{BROKER_QUEUE_LABELS[item.name] ?? item.name}</td>
+                <td className="py-2 pr-3 font-mono">{item.ready}</td>
+                <td className="py-2 pr-3 font-mono">{item.reserved ?? "—"}</td>
+                <td className="py-2 pr-3 font-mono">{item.active ?? "—"}</td>
+                <td className="py-2 pr-3 font-mono">{item.unacked}</td>
+                <td className="py-2 pr-3">{brokerAgeLabel(item.oldest_wait_seconds)}</td>
+                <td className="py-2 pr-3 font-mono" title={item.scan_truncated ? `已扫描 ${item.sampled_ready} 条；统计不完整` : "当前 Ready 消息头中的 Celery 重试次数之和"}>
+                  {item.ready_retry_attempts}{item.scan_truncated ? "+" : ""}
+                </td>
+              </tr>
+            ))}</tbody>
+          </table>
+          {!broker ? <p className="mt-2 text-sm text-slate-500">等待 Broker 快照…</p> : null}
+        </div>
+        {brokerError ? <InlineNotice tone="warning" title="队列快照暂不可用">{brokerError}</InlineNotice> : null}
+        {broker?.warnings.map((warning) => <p key={warning} className="text-xs text-amber-700 dark:text-amber-300">{warning}</p>)}
+        <p className="text-xs text-slate-500">Ready 是 Broker 中尚未领取的消息；Reserved 和 Active 来自 Worker 实时检查；Unacked 可能与后两者重叠。最老等待仅在消息具有可信入队时间戳时计算；未知不会显示为零。重试次数仅统计 Ready 消息。</p>
       </div>
 
       <div className="rounded border bg-white p-4">

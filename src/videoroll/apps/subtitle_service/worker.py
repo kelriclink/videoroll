@@ -2582,17 +2582,17 @@ def _cleanup_task_impl(self: Any, task_id: str, batch_id: str | None = None) -> 
 
 @celery_app.task(name="subtitle_service.enqueue_pending_publish_batch_cleanups")
 def enqueue_pending_publish_batch_cleanups() -> dict[str, int]:
-    """Repair legacy cleanup rows by inserting their idempotent outbox event."""
+    """Repair only due, missing legacy cleanup events (bounded batch)."""
     _ensure_db()
     db = _db()
     enqueued = 0
     failed = 0
     try:
-        batches = (
-            db.query(PublishBatch)
-            .filter(PublishBatch.state == "succeeded", PublishBatch.cleanup_enqueued_at.is_(None))
-            .all()
-        )
+        from videoroll.apps.publish_lifecycle import due_missing_publish_cleanup_batches
+
+        # This is a legacy repair sweep. Normal cleanup events already live in
+        # the outbox; scanning every succeeded batch each minute is unnecessary.
+        batches = due_missing_publish_cleanup_batches(db, limit=100)
         for batch in batches:
             task = db.get(Task, batch.task_id)
             if not task or task.status != TaskStatus.published:
@@ -2600,7 +2600,9 @@ def enqueue_pending_publish_batch_cleanups() -> dict[str, int]:
             if not any(current.id == batch.id for current in current_publish_batches_for_task(db, task.id)):
                 continue
             try:
-                if enqueue_publish_batch_cleanup(db, celery_app, task.id, batch.id, needed=True):
+                if enqueue_publish_batch_cleanup(
+                    db, celery_app, task.id, batch.id, needed=True, wake_dispatch=False
+                ):
                     enqueued += 1
             except Exception:
                 failed += 1

@@ -180,7 +180,10 @@ def test_cleanup_broker_failure_keeps_durable_dispatch_intent() -> None:
 
     with (
         patch("videoroll.apps.publish_lifecycle.mark_publish_batch_cleanup_enqueued") as mark,
-        patch("videoroll.apps.outbox.service.create_outbox_event", return_value=object()) as create_event,
+        patch(
+            "videoroll.apps.outbox.service.create_outbox_event",
+            return_value=MagicMock(status="pending", available_at=finished + timedelta(hours=24)),
+        ) as create_event,
     ):
         assert enqueue_publish_batch_cleanup(db, celery_app, task_id, batch_id, needed=True) is True
 
@@ -191,6 +194,46 @@ def test_cleanup_broker_failure_keeps_durable_dispatch_intent() -> None:
         "queue": "subtitle-control",
     }
     assert create_event.call_args.kwargs["available_at"] == finished + timedelta(hours=24)
+
+
+def test_future_dated_publish_cleanup_does_not_wake_dispatcher() -> None:
+    db = MagicMock()
+    celery_app = MagicMock()
+    task_id = uuid.uuid4()
+    batch_id = uuid.uuid4()
+    finished = datetime.now(timezone.utc) - timedelta(hours=1)
+    due_at = finished + timedelta(hours=24)
+    db.get.return_value = MagicMock(task_id=task_id, state="succeeded", finished_at=finished)
+
+    with patch(
+        "videoroll.apps.outbox.service.create_outbox_event",
+        return_value=MagicMock(status="pending", available_at=due_at),
+    ):
+        assert enqueue_publish_batch_cleanup(db, celery_app, task_id, batch_id, needed=True) is True
+
+    db.commit.assert_called_once()
+    celery_app.send_task.assert_not_called()
+
+
+def test_bulk_publish_cleanup_can_defer_wakeups_to_periodic_dispatcher() -> None:
+    db = MagicMock()
+    celery_app = MagicMock()
+    task_id = uuid.uuid4()
+    batch_id = uuid.uuid4()
+    finished = datetime(2026, 10, 14, 3, tzinfo=timezone.utc)
+    db.get.return_value = MagicMock(task_id=task_id, state="succeeded", finished_at=finished)
+
+    with patch(
+        "videoroll.apps.outbox.service.create_outbox_event",
+        return_value=MagicMock(status="pending", available_at=finished + timedelta(hours=24)),
+    ):
+        assert enqueue_publish_batch_cleanup(
+            db, celery_app, task_id, batch_id, needed=True, wake_dispatch=False
+        ) is True
+
+    db.commit.assert_called_once()
+    celery_app.send_task.assert_not_called()
+
 
 def test_publish_cleanup_waits_for_last_successful_channel() -> None:
     from videoroll.apps.publish_lifecycle import publish_cleanup_due_at

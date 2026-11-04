@@ -742,6 +742,25 @@ class ModelDownloadProxyTestResponse(BaseModel):
     error: Optional[str] = None
 
 
+class BrokerQueueMetricsRead(BaseModel):
+    name: str
+    ready: int = Field(ge=0)
+    reserved: int | None = Field(default=None, ge=0)
+    active: int | None = Field(default=None, ge=0)
+    unacked: int = Field(ge=0)
+    oldest_wait_seconds: int | None = Field(default=None, ge=0)
+    ready_retry_attempts: int = Field(ge=0)
+    sampled_ready: int = Field(ge=0)
+    scan_truncated: bool = False
+
+
+class BrokerQueueSnapshotRead(BaseModel):
+    observed_at: datetime
+    worker_observed: bool
+    queues: list[BrokerQueueMetricsRead] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+
+
 class TaskQueueSettingsRead(BaseModel):
     scheduler: Literal["hatchet"] = "hatchet"
     subtitle_worker_slots: int = Field(1, ge=1, le=256)

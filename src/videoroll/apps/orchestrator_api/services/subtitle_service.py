@@ -60,6 +60,7 @@ _BROWSER_PROXY_PATHS: dict[str, set[str]] = {
         "subtitle/dictionaries/import-presets",
         "subtitle/knowledge/items",
         "subtitle/task_queue",
+        "subtitle/task_queue/broker",
         "subtitle/task_queue/settings",
     },
     "POST": {

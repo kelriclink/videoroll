@@ -6,12 +6,24 @@ from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Any
 
+from sqlalchemy import String, cast, exists
 from sqlalchemy.orm import Session
 
 from videoroll.apps.subtitle_service.queues import SUBTITLE_CONTROL_QUEUE
-from videoroll.db.models import Platform, PublishBatch, PublishJob, PublishState, Task, TaskStatus
+from videoroll.db.models import (
+    OperationInbox,
+    OutboxEvent,
+    Platform,
+    PublishBatch,
+    PublishJob,
+    PublishState,
+    Task,
+    TaskStatus,
+)
 
 PUBLISH_CLEANUP_RETENTION = timedelta(hours=24)
+# Broker acceptance is durable. A queued job must not be re-enqueued every
+# recovery tick merely because a single-concurrency publisher has not reached it.
 
 
 def publish_cleanup_due_at(batch: PublishBatch, current_batches: list[PublishBatch] | None = None) -> datetime:
@@ -117,14 +129,11 @@ def recover_stale_publish_dispatches(
     now: datetime | None = None,
     limit: int = 100,
 ) -> PublishDispatchRecovery:
-    """Repair only publisher work whose next action is unambiguous.
+    """Recover lost publisher deliveries without flooding a backed-up queue.
 
-    A new HTTP request leaves a ``submitting`` row with no worker heartbeat;
-    it has made no external call and can be redelivered safely.  In contrast,
-    an external start marker or an expired database lease means a worker may
-    have crossed the platform side-effect boundary.  Those rows become
-    ``unknown`` and require an explicit force retry after an operator checks
-    the target platform.
+    An unleased job may still have a Redis message or an in-flight delivery.
+    Only jobs missing a durable outbox operation are automatically repaired.
+    External-start markers or expired leases are classified as unknown.
     """
     now = now or datetime.now(timezone.utc)
     rows = (
@@ -138,8 +147,8 @@ def recover_stale_publish_dispatches(
     requeued = 0
     unknown = 0
     for job in rows:
-        # A healthy worker's owner lease remains authoritative.  Redis locks
-        # are intentionally absent from this decision.
+        # A healthy worker's owner lease remains authoritative. Redis locks are
+        # intentionally absent from this decision.
         if job.lease_until is not None and job.lease_until > now:
             continue
         if job.started_at is not None or job.lease_until is not None:
@@ -159,12 +168,62 @@ def recover_stale_publish_dispatches(
             unknown += 1
             continue
 
-        # A row with no live owner lease and no external-start marker has no
-        # active worker at the platform side-effect boundary.  This includes
-        # both a never-consumed broker message and a lost Celery retry.
-        if job.lease_until is None:
-            enqueue_publish_job_dispatch(db, job, redeliver=True)
-            requeued += 1
+        operation_key = str(job.operation_key or publish_operation_key(job.id))
+        inbox = (
+            db.query(OperationInbox)
+            .filter(OperationInbox.operation_key == operation_key)
+            .with_for_update(skip_locked=True)
+            .one_or_none()
+        )
+        if inbox is not None:
+            if inbox.status == "completed":
+                continue
+            inbox_lease_until = inbox.lease_until
+            if inbox_lease_until is not None:
+                inbox_lease_until = inbox_lease_until.replace(
+                    tzinfo=inbox_lease_until.tzinfo or timezone.utc
+                )
+            if inbox.status == "processing":
+                if inbox_lease_until is None or inbox_lease_until <= now:
+                    job.state = PublishState.unknown
+                    job.finished_at = now
+                    job.response_json = {
+                        **dict(job.response_json or {}),
+                        "error": "expired publish operation lease; verify the platform before retry",
+                        "recovery": "unknown",
+                    }
+                    job.lease_owner = None
+                    job.lease_until = None
+                    job.heartbeat_at = now
+                    if job.batch_id is not None:
+                        reconcile_publish_batch(db, job.batch_id)
+                    db.add(job)
+                    unknown += 1
+                continue
+            if inbox.status == "failed":
+                continue
+            retry_after = inbox.retry_after
+            if retry_after is not None:
+                retry_after = retry_after.replace(tzinfo=retry_after.tzinfo or timezone.utc)
+            if inbox.status == "pending" and retry_after is not None and retry_after > now:
+                continue
+
+        event = (
+            db.query(OutboxEvent)
+            .filter(OutboxEvent.operation_key == operation_key)
+            .order_by(OutboxEvent.created_at.desc())
+            .with_for_update(skip_locked=True)
+            .first()
+        )
+        if event is not None:
+            # A broker-accepted operation is not provably missing merely because
+            # no worker has claimed it. The persistent dispatcher handles
+            # pending or failed rows; accepted rows require verification.
+            continue
+
+        # Recover only legacy jobs missing their durable dispatch intent.
+        enqueue_publish_job_dispatch(db, job, redeliver=False)
+        requeued += 1
 
     db.flush()
     return PublishDispatchRecovery(requeued=requeued, unknown=unknown)
@@ -481,6 +540,41 @@ def mark_publish_batch_cleanup_enqueued(db: Session, batch_id: uuid.UUID) -> boo
     return True
 
 
+def due_missing_publish_cleanup_batches(
+    db: Session,
+    *,
+    now: datetime | None = None,
+    limit: int = 100,
+) -> list[PublishBatch]:
+    """Find only matured legacy cleanups without an outbox intent.
+
+    Normal cleanup is already persisted during batch reconciliation. Never
+    re-scan all future-dated events, and never fabricate a second cleanup
+    event for a batch whose intent exists but has not reached its due time.
+    """
+    now = now or datetime.now(timezone.utc)
+    event_exists = exists().where(
+        OutboxEvent.event_type == "publish.cleanup",
+        OutboxEvent.aggregate_type == "publish_batch",
+        OutboxEvent.aggregate_id == cast(PublishBatch.id, String),
+    )
+    return (
+        db.query(PublishBatch)
+        .join(Task, Task.id == PublishBatch.task_id)
+        .filter(
+            PublishBatch.state == PublishBatchState.succeeded.value,
+            PublishBatch.cleanup_enqueued_at.is_(None),
+            PublishBatch.finished_at.isnot(None),
+            PublishBatch.finished_at <= now - PUBLISH_CLEANUP_RETENTION,
+            Task.status == TaskStatus.published,
+            ~event_exists,
+        )
+        .order_by(PublishBatch.finished_at.asc())
+        .limit(max(1, min(int(limit), 500)))
+        .all()
+    )
+
+
 def enqueue_publish_batch_cleanup(
     db: Session,
     celery_app: Any,
@@ -488,12 +582,14 @@ def enqueue_publish_batch_cleanup(
     batch_id: uuid.UUID,
     *,
     needed: bool,
+    wake_dispatch: bool = True,
 ) -> bool:
-    """Persist cleanup dispatch and optionally wake the shared dispatcher.
+    """Persist cleanup dispatch and wake the shared dispatcher only when due.
 
-    ``celery_app`` remains in the public signature for legacy callers.  It is
+    ``celery_app`` remains in the public signature for legacy callers. It is
     only used for a best-effort wake-up; the outbox row is the authoritative
-    record and survives a broker outage.
+    record and survives a broker outage. Future-dated cleanup events are left
+    for the periodic dispatcher instead of creating useless broker messages.
     """
     if not needed:
         return False
@@ -502,6 +598,7 @@ def enqueue_publish_batch_cleanup(
     batch = db.get(PublishBatch, batch_id)
     if batch is None or batch.task_id != task_id or batch.state != PublishBatchState.succeeded.value:
         return False
+    available_at = publish_cleanup_due_at(batch, current_publish_batches_for_task(db, task_id))
     event = create_outbox_event(
         db,
         event_type="publish.cleanup",
@@ -510,14 +607,24 @@ def enqueue_publish_batch_cleanup(
         task_name="subtitle_service.cleanup_task",
         args={"args": [str(task_id), str(batch_id)], "queue": SUBTITLE_CONTROL_QUEUE},
         operation_key=f"publish-cleanup:{batch_id}",
-        available_at=publish_cleanup_due_at(batch, current_publish_batches_for_task(db, task_id)),
+        available_at=available_at,
     )
     db.commit()
-    try:
-        celery_app.send_task("subtitle_service.dispatch_outbox", args=[], queue=SUBTITLE_CONTROL_QUEUE)
-    except Exception:
-        # The event is already committed and will be picked up by the periodic
-        # dispatcher.  Do not turn a durable pending event into a failed
-        # domain transition merely because the best-effort wake-up is down.
-        pass
+    event_available_at = event.available_at
+    if event_available_at is not None:
+        event_available_at = event_available_at.replace(
+            tzinfo=event_available_at.tzinfo or timezone.utc
+        )
+    if (
+        wake_dispatch
+        and event.status == "pending"
+        and (event_available_at is None or event_available_at <= datetime.now(timezone.utc))
+    ):
+        try:
+            celery_app.send_task("subtitle_service.dispatch_outbox", args=[], queue=SUBTITLE_CONTROL_QUEUE)
+        except Exception:
+            # The event is already committed and will be picked up by the periodic
+            # dispatcher. Do not turn a durable pending event into a failed
+            # domain transition merely because a broker wake-up is down.
+            pass
     return event is not None

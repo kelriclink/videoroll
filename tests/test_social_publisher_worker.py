@@ -33,6 +33,10 @@ def test_account_check_message_marks_timeout() -> None:
     assert worker.account_check_message(result) == "SAU check timed out (exit=-15)"
 
 
+def test_social_scheduler_does_not_duplicate_central_publish_recovery() -> None:
+    assert not worker.celery_app.conf.beat_schedule
+
+
 def test_cleanup_delivery_failure_is_isolated_from_publish_result() -> None:
     assert hasattr(worker, "_enqueue_batch_cleanup_best_effort")
     with patch(
