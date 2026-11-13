@@ -1015,6 +1015,7 @@ def _process_job_impl(self, job_id: str) -> dict[str, Any]:
                         meta, activity_audit = select_publish_activity(
                             client, ai_service, meta, tid=tid,
                             summary=get_task_bilibili_summary(db, str(task.id)) or "",
+                            source_is_external=(task.source_type.value == "youtube"),
                         )
                 except Exception as e:
                     # Activity enhancement is optional: never turn a successful

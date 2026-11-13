@@ -15,7 +15,7 @@ def _default_meta() -> dict[str, Any]:
     return {
         "title": "示例标题",
         "desc": "示例简介（请包含来源/授权说明）",
-        "tags": ["videoroll"],
+        "tags": ["视频分享"],
         "typeid": 17,
         "copyright": 1,
         "source": "",
@@ -54,6 +54,11 @@ def get_bilibili_publish_settings(db: Session) -> dict[str, Any]:
     baseline = _default_meta()
     meta_update = _as_dict(stored.get("default_meta"))
     merged = {**baseline, **meta_update}
+    # Historical default template seeded the VideoRoll brand as a required
+    # tag. Treat that single legacy default as a template artifact, not a
+    # user-imposed requirement; explicit additional tags remain unchanged.
+    if merged.get("tags") == ["videoroll"]:
+        merged["tags"] = baseline["tags"]
 
     try:
         meta = BilibiliPublishMeta.model_validate(merged)

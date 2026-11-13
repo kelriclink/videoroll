@@ -78,6 +78,29 @@ def test_web_submit_uses_one_archive_with_two_ordered_videos() -> None:
         client.close()
 
 
+def test_web_submit_regular_topic_without_mission_id() -> None:
+    client = BilibiliWebClient("SESSDATA=fake")
+    client._bili = Mock()
+    client._bili.post.return_value = Mock(status_code=200)
+    client._bili.post.return_value.json.return_value = {
+        "code": 0, "data": {"aid": 1, "bvid": "BVtest"}
+    }
+    meta = BilibiliPublishMeta(
+        title="USB-C线材区别", typeid=171, tags=["USB-C"], topic_id=60739
+    )
+    part = UploadedVideo("uploaded_p1", 1001, "u1", "upos1")
+    try:
+        client.add_archive(meta, csrf="test", tid=171, uploaded=part)
+        submitted = client._bili.post.call_args.kwargs["json"]
+        assert submitted["topic_id"] == 60739
+        assert "mission_id" not in submitted
+        assert submitted["tag"] == "USB-C"
+        assert "videoroll" not in submitted["tag"].casefold()
+        client._bili.post.assert_called_once()
+    finally:
+        client.close()
+
+
 def test_web_submit_rejects_duplicate_video_cid_before_http() -> None:
     client = BilibiliWebClient("SESSDATA=fake")
     client._bili = Mock()

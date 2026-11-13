@@ -255,6 +255,21 @@ def read_latest_task_subtitle_text(task_id: uuid.UUID, db: Session, store: FileS
         return ""
 
 
+def merge_bilibili_tags(suggested: list[str], explicit: list[str]) -> list[str]:
+    """No injected platform-brand tag; user-supplied tags are respected."""
+    tags: list[str] = []
+    seen: set[str] = set()
+    for tag in [*suggested, *explicit]:
+        value = str(tag or "").strip()
+        if not value or value.casefold() in seen:
+            continue
+        tags.append(value)
+        seen.add(value.casefold())
+        if len(tags) == 10:
+            break
+    return tags
+
+
 def prepare_publish_meta(
     *,
     task: Task,
@@ -281,16 +296,13 @@ def prepare_publish_meta(
     if copyright_value == 2 and not str(meta.get("source") or "").strip() and task.source_url:
         meta["source"] = task.source_url
 
-    merged_tags: list[str] = []
-    seen: set[str] = set()
-    for tag in ["videoroll", *get_task_bilibili_tags(db, str(task.id)), *normalize_tags(meta.get("tags"))]:
-        text = str(tag or "").strip()
-        if not text or text.lower() in seen:
-            continue
-        seen.add(text.lower())
-        merged_tags.append(text)
-        if len(merged_tags) >= 10:
-            break
+    # Only remove the old generated VideoRoll brand tag. Explicit tags,
+    # including one manually named "videoroll", are never removed.
+    suggested_tags = [
+        tag for tag in get_task_bilibili_tags(db, str(task.id))
+        if str(tag or "").strip().casefold() != "videoroll"
+    ]
+    merged_tags = merge_bilibili_tags(suggested_tags, normalize_tags(meta.get("tags")))
     if merged_tags:
         meta["tags"] = merged_tags
 

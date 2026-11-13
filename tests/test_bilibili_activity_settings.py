@@ -44,3 +44,36 @@ def test_activity_toggle_rejects_non_boolean():
         assert "boolean" in str(error)
     else:
         raise AssertionError("non-boolean toggle value was accepted")
+
+
+def test_default_tag_is_no_longer_videoroll():
+    db = _Session()
+    assert "videoroll" not in get_bilibili_publish_settings(db)["default_meta"].tags
+
+
+def test_single_historical_videoroll_default_is_replaced_in_memory():
+    from types import SimpleNamespace
+    db = _Session()
+    db.row = SimpleNamespace(value_json={"default_meta": {
+        "title": "旧模板", "typeid": 17, "tags": ["videoroll"]
+    }})
+    settings = get_bilibili_publish_settings(db)
+    assert settings["default_meta"].tags == ["视频分享"]
+    assert db.row.value_json["default_meta"]["tags"] == ["videoroll"]
+
+
+def test_user_configured_additional_tags_are_preserved():
+    from types import SimpleNamespace
+    db = _Session()
+    db.row = SimpleNamespace(value_json={"default_meta": {
+        "title": "自定义", "typeid": 17, "tags": ["videoroll", "硬件"]
+    }})
+    assert get_bilibili_publish_settings(db)["default_meta"].tags == ["videoroll", "硬件"]
+
+
+def test_no_forced_videoroll_in_publishing_tag_merge():
+    from videoroll.apps.orchestrator_api.services.publishing_service import merge_bilibili_tags
+    assert merge_bilibili_tags(["USB-C", "科技"], ["USB-C", "快充"]) == ["USB-C", "科技", "快充"]
+    assert merge_bilibili_tags([], ["videoroll"]) == ["videoroll"]
+    assert merge_bilibili_tags(["USB-C"], []) == ["USB-C"]
+    assert merge_bilibili_tags(["tag"] * 20, ["title"]) == ["tag", "title"]
