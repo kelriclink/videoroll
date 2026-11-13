@@ -299,11 +299,12 @@ Plan 还可以携带：
 当前至少检查：
 
 - empty output；
-- number mismatch；
+- number mismatch（仅提示，不阻断任务、不触发修复或重试）；
 - hard term missing；
 - preferred term not used。
 
-阻断错误触发 targeted repair；不需要重新生成整个 batch。
+漏译、硬术语缺失等阻断错误仍触发 targeted repair；数字不一致不再导致翻译任务失败。
+历史失败的任务不会自动重投，需按原有继续/重试操作恢复。
 
 ## 16. Dictionary
 

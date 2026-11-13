@@ -380,7 +380,8 @@ def validate_translation_mapping(
                 {
                     "idx": idx,
                     "type": "number_mismatch",
-                    "severity": "error",
+                    # Numeric matching is heuristic and nonblocking.
+                    "severity": "warning",
                     "expected": missing_numbers[:12],
                     "message": "one or more source numbers are missing or changed",
                 }
@@ -458,4 +459,10 @@ def validate_translation_mapping(
 
 
 def blocking_translation_issues(issues: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
-    return [dict(issue) for issue in issues if str(issue.get("severity") or "") == "error"]
+    # Treat legacy number_mismatch errors as informational, including resumed jobs.
+    return [
+        dict(issue)
+        for issue in issues
+        if str(issue.get("severity") or "") == "error"
+        and str(issue.get("type") or "") != "number_mismatch"
+    ]

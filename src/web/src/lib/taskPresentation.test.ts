@@ -33,8 +33,10 @@ describe("presentTaskError", () => {
   });
 
   it("summarizes numeric validation failures", () => {
-    expect(presentTaskError("translation validation failed: idx=42:number_mismatch")?.title)
-      .toBe("翻译数字校验未通过");
+    const result = presentTaskError("translation validation failed: idx=42:number_mismatch");
+    expect(result?.title).toBe("翻译数字校验未通过");
+    expect(result?.detail).toContain("旧版本");
+    expect(result?.actionHint).toContain("从断点继续");
   });
 
   it("summarizes timeouts", () => {

@@ -78,8 +78,8 @@ export function presentTaskError(error?: string | null, code?: string | null): E
   if (normalized.includes("number_mismatch")) {
     return {
       title: "翻译数字校验未通过",
-      detail: "系统检测到原文与译文中的数字表达可能不一致，任务已停止以避免错误字幕继续流转。",
-      actionHint: "可重新执行；若仍失败，再查看技术详情中的字幕位置。",
+      detail: "这是旧版本数字校验造成的历史失败记录；新版仅提示数字差异，不再因此中断翻译。",
+      actionHint: "可从断点继续运行；历史失败任务不会自动恢复。",
     };
   }
   if (includesAny(normalized, ["timeout", "timed out", "read operation timed out", "deadline exceeded"])) {

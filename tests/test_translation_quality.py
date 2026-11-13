@@ -106,7 +106,8 @@ def test_translation_validator_flags_hard_term_and_changed_numbers() -> None:
     )
 
     assert {issue["type"] for issue in issues} == {"hard_term_missing", "number_mismatch"}
-    assert len(blocking_translation_issues(issues)) == 2
+    assert [issue["type"] for issue in blocking_translation_issues(issues)] == ["hard_term_missing"]
+    assert next(issue for issue in issues if issue["type"] == "number_mismatch")["severity"] == "warning"
 
 
 def test_translation_validator_accepts_decimal_separator_change() -> None:
@@ -136,13 +137,14 @@ def test_translation_validator_accepts_equivalent_scaled_number_translation() ->
     assert issues == []
 
 
-def test_translation_validator_still_rejects_changed_negative_value() -> None:
+def test_translation_validator_warns_on_changed_negative_value() -> None:
     issues = validate_translation_mapping(
         blocks=[{"idx": 1, "text": "The temperature is -5 °C."}],
         translations={1: "温度是 5 °C。"},
         translation_plan={},
     )
     assert [issue["type"] for issue in issues] == ["number_mismatch"]
+    assert blocking_translation_issues(issues) == []
 
 
 def test_preferred_term_is_repairable_but_not_blocking() -> None:
@@ -465,12 +467,65 @@ def test_asr_repeated_numbers_not_blocking_when_translated_once() -> None:
     ) == []
 
 
-def test_genuinely_altered_numeric_value_still_blocked() -> None:
+def test_genuinely_altered_numeric_value_is_warning_only() -> None:
     issues = validate_translation_mapping(
         blocks=[{"idx": 1, "text": "SCP-145 is a 2002 telephone, at -5 degrees."}],
         translations={1: "SCP-145 是 2003 年款电话，温度为 5 度。"},
     )
-    assert {item["type"] for item in blocking_translation_issues(issues)} == {"number_mismatch"}
+    assert {item["type"] for item in issues} == {"number_mismatch"}
+    assert blocking_translation_issues(issues) == []
+    # Legacy records marked error cannot revive the old failure gate.
+    assert blocking_translation_issues([
+        {"idx": 1, "type": "number_mismatch", "severity": "error"},
+    ]) == []
+
+
+def test_number_mismatch_does_not_call_repair_or_fail_pipeline() -> None:
+    class FakeAIService:
+        def translate_subtitle_batch(self, **_kwargs):
+            return {
+                "translations": [
+                    {"idx": 1, "text": "这台电脑功率为 4500W。"},
+                    {"idx": 2, "text": "第二行正常。"},
+                ]
+            }
+
+        def repair_subtitle_batch(self, **_kwargs):
+            raise AssertionError("numeric warnings must not trigger repair")
+
+    translated, _summary = translate_segments_openai_with_summary(
+        [
+            Segment(0.0, 1.0, "The computer draws 450W."),
+            Segment(1.0, 2.0, "Second line."),
+        ],
+        target_lang="zh",
+        style="自然",
+        batch_size=2,
+        ai_service=FakeAIService(),  # type: ignore[arg-type]
+    )
+    assert [line.text for line in translated] == ["这台电脑功率为 4500W。", "第二行正常。"]
+
+
+def test_numeric_warning_does_not_hide_hard_term_failure() -> None:
+    class FakeAIService:
+        def translate_subtitle_batch(self, **_kwargs):
+            return {"translations": [{"idx": 1, "text": "邮件显示 4500W。"}]}
+
+        def repair_subtitle_batch(self, **kwargs):
+            assert {item["type"] for item in kwargs["issues"]} == {"hard_term_missing"}
+            raise RuntimeError("hard term repair failed")
+
+    import pytest
+
+    with pytest.raises(RuntimeError, match="hard term repair failed"):
+        translate_segments_openai_with_summary(
+            [Segment(0.0, 1.0, "POST reports 450W.")],
+            target_lang="zh",
+            style="自然",
+            batch_size=1,
+            glossary={"POST": "开机自检"},
+            ai_service=FakeAIService(),  # type: ignore[arg-type]
+        )
 
 
 def test_validation_failure_retries_from_checkpoint_but_prompt_overflow_does_not() -> None:
@@ -480,6 +535,6 @@ def test_validation_failure_retries_from_checkpoint_but_prompt_overflow_does_not
     from videoroll.apps.subtitle_service.translation_stage import is_retryable_translation_error
 
     assert is_retryable_translation_error(
-        TranslationValidationError([{"idx": 2627, "type": "number_mismatch", "severity": "error"}])
+        TranslationValidationError([{"idx": 2627, "type": "hard_term_missing", "severity": "error"}])
     )
     assert not is_retryable_translation_error(TranslationPromptTooLongError("input budget exceeded"))

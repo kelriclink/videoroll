@@ -3366,13 +3366,26 @@ def translate_segments_openai_with_summary(
             translations=mapping,
             translation_plan=translation_plan,
         )
-        validation_issues_before = list(validation_issues)
-        repaired = False
-        if validation_issues:
+        numeric_warning_count = sum(
+            issue.get("type") == "number_mismatch" for issue in validation_issues
+        )
+        if numeric_warning_count:
+            logger.info(
+                "subtitle numeric differences ignored for translation gating "
+                "(batch_start=%s, count=%s)",
+                start_idx, numeric_warning_count,
+            )
+        # Numeric differences are informational only. Do not spend an AI
+        # repair request or trigger retries solely because of these warnings.
+        repair_issues = [
+            issue for issue in validation_issues
+            if issue.get("type") != "number_mismatch"
+        ]
+        if repair_issues:
             affected = sorted(
                 {
                     int(issue["idx"])
-                    for issue in validation_issues
+                    for issue in repair_issues
                     if isinstance(issue, dict)
                     and issue.get("idx") is not None
                     and int(issue["idx"]) in expected
@@ -3380,14 +3393,14 @@ def translate_segments_openai_with_summary(
             )
             source_blocks = [block for block in blocks if int(block["idx"]) in affected]
             draft_translations = [{"idx": idx, "text": mapping[idx]} for idx in affected]
-            blocking_before = blocking_translation_issues(validation_issues)
+            blocking_before = blocking_translation_issues(repair_issues)
             repair_data: dict[str, Any] | None = None
             try:
                 if ai_service is not None:
                     repair_data = ai_service.repair_subtitle_batch(
                         source_blocks=source_blocks,
                         draft_translations=draft_translations,
-                        issues=validation_issues,
+                        issues=repair_issues,
                         target_lang=tgt,
                         style=tone,
                         translation_plan=translation_plan or None,
@@ -3398,7 +3411,7 @@ def translate_segments_openai_with_summary(
                     repair_prompt = build_subtitle_repair_prompt(
                         source_blocks=source_blocks,
                         draft_translations=draft_translations,
-                        issues=validation_issues,
+                        issues=repair_issues,
                         target_lang=tgt,
                         style=tone,
                         translation_plan=translation_plan or None,
@@ -3415,7 +3428,7 @@ def translate_segments_openai_with_summary(
             except Exception:
                 if blocking_before:
                     raise
-                logger.warning("subtitle preferred-term repair failed", exc_info=True)
+                logger.warning("subtitle nonblocking translation repair failed", exc_info=True)
 
             repair_rows = repair_data.get("translations") if isinstance(repair_data, dict) else None
             if isinstance(repair_rows, list):
@@ -3432,7 +3445,6 @@ def translate_segments_openai_with_summary(
                     repaired_text = str(item["text"] or "").strip()
                     if repaired_text:
                         mapping[repair_idx] = repaired_text
-                        repaired = True
             validation_issues = validate_translation_mapping(
                 blocks=blocks,
                 translations=mapping,
