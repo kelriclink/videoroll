@@ -24,6 +24,7 @@ from videoroll.apps.bilibili_publisher.publish_settings_store import get_bilibil
 from celery.exceptions import Retry
 
 from videoroll.apps.bilibili_publisher.bilibili_web_client import BilibiliDescTooLongError, BilibiliRateLimitError, BilibiliWebClient
+from videoroll.apps.bilibili_publisher.activity_selector import select_publish_activity
 from videoroll.apps.bilibili_publisher.constants import BILIBILI_DESC_RETRY_MAX_CHARS
 from videoroll.apps.bilibili_publisher.schemas import BilibiliPublishMeta
 from videoroll.apps.bilibili_publisher.storage_keys import unique_publish_result_key
@@ -871,7 +872,8 @@ def _process_job_impl(self, job_id: str) -> dict[str, Any]:
             completed_bytes = 0
             uploaded_parts: list[tuple[Any, str]] = []
             uploaded_debugs: list[dict[str, Any]] = []
-            upload_workers = get_bilibili_publish_settings(db)["upload_workers"]
+            publish_settings = get_bilibili_publish_settings(db)
+            upload_workers = publish_settings["upload_workers"]
             for part_path, part_title in video_part_paths:
                 offset = completed_bytes
                 part_upload, part_debug = client.upload_video_file(
@@ -993,6 +995,34 @@ def _process_job_impl(self, job_id: str) -> dict[str, Any]:
                 ai_info.get("typeid"),
             )
 
+            activity_audit: dict[str, Any] = {
+                "enabled": bool(publish_settings["ai_activity_enabled"]),
+                "selected": False,
+                "reason": "disabled",
+            }
+            if publish_settings["ai_activity_enabled"]:
+                try:
+                    translation_cfg = get_translate_settings(db, get_subtitle_settings())
+                    selected_runtime = resolve_profile_translation_runtime(
+                        db, translation_cfg, get_auto_profile(db),
+                    )
+                    if selected_runtime.provider != "openai":
+                        activity_audit["reason"] = (
+                            "current AI provider is not OpenAI-compatible; activity skipped"
+                        )
+                    else:
+                        ai_service = AIService(lambda: dict(selected_runtime.settings))
+                        meta, activity_audit = select_publish_activity(
+                            client, ai_service, meta, tid=tid,
+                            summary=get_task_bilibili_summary(db, str(task.id)) or "",
+                        )
+                except Exception as e:
+                    # Activity enhancement is optional: never turn a successful
+                    # upload into a repeated/failed submission because AI is down.
+                    activity_audit["reason"] = f"activity discovery failed: {type(e).__name__}"
+                    logger.warning("activity match skipped (job_id=%s error=%s)",
+                                   job_id, type(e).__name__)
+
             submit_throttle = _apply_publish_stage_throttle(stage="submit", job_id=job_id)
             archive_submission_started = True
             add_resp, meta, desc_retry = _add_archive_with_desc_retry(
@@ -1057,6 +1087,7 @@ def _process_job_impl(self, job_id: str) -> dict[str, Any]:
             },
             "tid": tid,
             "typeid": typeid_debug,
+            "activity": activity_audit,
             "desc_retry": desc_retry,
             "result": {"aid": aid_str or None, "bvid": bvid_str or None},
             "collection": collection_result,

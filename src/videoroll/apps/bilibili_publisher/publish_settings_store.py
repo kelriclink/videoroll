@@ -64,7 +64,8 @@ def get_bilibili_publish_settings(db: Session) -> dict[str, Any]:
         workers = max(1, min(8, int(stored.get("upload_workers", 4))))
     except (TypeError, ValueError):
         workers = 4
-    return {"default_meta": meta, "upload_workers": workers}
+    return {"default_meta": meta, "upload_workers": workers,
+            "ai_activity_enabled": stored.get("ai_activity_enabled") is True}
 
 
 def update_bilibili_publish_settings(db: Session, update: dict[str, Any]) -> dict[str, Any]:
@@ -86,6 +87,11 @@ def update_bilibili_publish_settings(db: Session, update: dict[str, Any]) -> dic
         if count < 1 or count > 8:
             raise ValueError("upload_workers must be between 1 and 8")
         stored["upload_workers"] = count
+
+    if "ai_activity_enabled" in update and update["ai_activity_enabled"] is not None:
+        if type(update["ai_activity_enabled"]) is not bool:
+            raise ValueError("ai_activity_enabled must be a boolean")
+        stored["ai_activity_enabled"] = update["ai_activity_enabled"]
 
     row.value_json = stored
     db.add(row)

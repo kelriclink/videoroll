@@ -622,6 +622,53 @@ class BilibiliWebClient:
         _bili_code_ok(data)
         return data
 
+    def recommended_topics(self, *, type_id: int, title: str, page_size: int = 30) -> list[dict[str, Any]]:
+        """Creative-center suggestions for a category and title (Cookie-authenticated)."""
+        response = self._safe_metadata_request(lambda: self._bili.get(
+            "https://member.bilibili.com/x/vupre/web/topic/type",
+            params={"type_id": int(type_id), "title": str(title)[:80],
+                    "pn": 0, "ps": min(max(int(page_size), 1), 50)},
+        ))
+        payload = _json(response)
+        _bili_code_ok(payload)
+        topics = _as_dict(payload.get("data")).get("topics")
+        return [item for item in topics if isinstance(item, dict)] if isinstance(topics, list) else []
+
+    def search_topics(self, keyword: str, *, page_size: int = 20) -> list[dict[str, Any]]:
+        """Search creator-center topics to resolve an activity's actual mission_id."""
+        response = self._safe_metadata_request(lambda: self._bili.get(
+            "https://member.bilibili.com/x/vupre/web/topic/search",
+            params={"keywords": str(keyword)[:80], "page_size": min(max(int(page_size), 1), 30),
+                    "offset": 0},
+        ))
+        payload = _json(response)
+        _bili_code_ok(payload)
+        topics = _as_dict(_as_dict(payload.get("data")).get("result")).get("topics")
+        return [item for item in topics if isinstance(item, dict)] if isinstance(topics, list) else []
+
+    def public_activities(self, *, page: int = 1, page_size: int = 30) -> list[dict[str, Any]]:
+        """Public activity directory; its ID is NOT a mission_id."""
+        response = self._safe_metadata_request(lambda: self._bili.get(
+            "https://api.bilibili.com/x/activity/page/list",
+            params={"plat": "1,3", "pn": max(1, int(page)),
+                    "ps": min(max(int(page_size), 1), 30)},
+        ))
+        payload = _json(response)
+        _bili_code_ok(payload)
+        records = _as_dict(payload.get("data")).get("list")
+        return [item for item in records if isinstance(item, dict)] if isinstance(records, list) else []
+
+    def public_activity_detail(self, activity_id: int) -> dict[str, Any]:
+        """Fetch detail using a public-directory ID, never a mission/topic ID."""
+        _require(int(activity_id) > 0, "invalid public activity id")
+        response = self._safe_metadata_request(lambda: self._bili.get(
+            "https://api.bilibili.com/x/activity/subject/info",
+            params={"sid": int(activity_id)},
+        ))
+        payload = _json(response)
+        _bili_code_ok(payload)
+        return _as_dict(payload.get("data"))
+
     def get_video_info(
         self,
         *,
