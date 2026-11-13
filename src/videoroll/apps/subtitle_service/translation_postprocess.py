@@ -248,21 +248,17 @@ def postprocess_translation(
                 )
             except Exception:
                 tags = []
-        if len(tags) < 6:
-            tags = fallback_bilibili_tags(
-                title=title_hint,
-                summary=summary,
-                transcript=transcript_excerpt,
-                n=6,
-            )
-        if tags:
-            set_task_bilibili_tags(
-                db,
-                str(task.id),
-                tags=tags[:6],
-                title=title_hint,
-                summary=summary,
-            )
+        # Do NOT replace a short/empty AI result with local heuristic tags.
+        # Publish-time priority is: AI-generated tags -> authenticated Bilibili
+        # tag suggestions -> "视频分享" only if both sources are unavailable.
+        # Persist [] as well so retries cannot reuse stale generated tags.
+        set_task_bilibili_tags(
+            db,
+            str(task.id),
+            tags=tags[:6],
+            title=title_hint,
+            summary=summary,
+        )
     except PendingDatabaseWritesError:
         raise
     except Exception as error:

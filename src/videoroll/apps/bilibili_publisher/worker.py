@@ -650,6 +650,22 @@ def _rate_limit_retry_countdown(*, stage: str, retries_done: int) -> float:
     return min(90.0, max(20.0, exp))
 
 
+def _submitted_meta_snapshot(
+    original: dict[str, Any], submitted: BilibiliPublishMeta,
+) -> dict[str, Any]:
+    """Persist the archive meta actually used in a successful Bilibili POST.
+
+    The initial queued meta is a pre-AI snapshot. Preserve request settings
+    and part references, but use final topic/mission/tags for published jobs.
+    """
+    snapshot = dict(original)
+    if isinstance(snapshot.get("meta"), dict):
+        snapshot["meta"] = submitted.model_dump()
+    else:
+        snapshot.update(submitted.model_dump())
+    return snapshot
+
+
 def _publish_meta_with_retry_desc_limit(meta: BilibiliPublishMeta) -> BilibiliPublishMeta:
     payload = meta.model_dump()
     payload["desc"] = clamp_bilibili_text(meta.desc, BILIBILI_DESC_RETRY_MAX_CHARS)
@@ -996,11 +1012,11 @@ def _process_job_impl(self, job_id: str) -> dict[str, Any]:
             )
 
             activity_audit: dict[str, Any] = {
-                "enabled": bool(publish_settings["ai_activity_enabled"]),
+                "enabled": bool(publish_settings.get("ai_activity_enabled", False)),
                 "selected": False,
                 "reason": "disabled",
             }
-            if publish_settings["ai_activity_enabled"]:
+            if publish_settings.get("ai_activity_enabled", False):
                 try:
                     translation_cfg = get_translate_settings(db, get_subtitle_settings())
                     selected_runtime = resolve_profile_translation_runtime(
@@ -1023,6 +1039,21 @@ def _process_job_impl(self, job_id: str) -> dict[str, Any]:
                     activity_audit["reason"] = f"activity discovery failed: {type(e).__name__}"
                     logger.warning("activity match skipped (job_id=%s error=%s)",
                                    job_id, type(e).__name__)
+
+            logger.info(
+                "Bilibili topic/activity decision job_id=%s selected=%s kind=%s "
+                "topic_id=%s mission_id=%s topic_candidates=%s activity_candidates=%s "
+                "verified_topics=%s verified_activities=%s",
+                job_id,
+                bool(activity_audit.get("selected")),
+                activity_audit.get("kind"),
+                getattr(meta, "topic_id", None),
+                getattr(meta, "mission_id", None),
+                activity_audit.get("candidate_topic_count", 0),
+                activity_audit.get("candidate_activity_count", 0),
+                activity_audit.get("topic_verified_count", 0),
+                activity_audit.get("activity_verified_count", 0),
+            )
 
             submit_throttle = _apply_publish_stage_throttle(stage="submit", job_id=job_id)
             archive_submission_started = True
@@ -1074,6 +1105,13 @@ def _process_job_impl(self, job_id: str) -> dict[str, Any]:
         job.bvid = bvid_str or None
         job.external_id = bvid_str or aid_str or None
         job.external_url = f"https://www.bilibili.com/video/{bvid_str}" if bvid_str else None
+        # AI activity matching occurs after media upload. Previously the DB
+        # kept the unmodified queued request, hiding confirmed topic_id and
+        # mission_id from the UI even after successful Bilibili submission.
+        job.meta_json = _submitted_meta_snapshot(meta_json, meta)
+        activity_audit["submitted_topic_id"] = meta.topic_id
+        activity_audit["submitted_mission_id"] = meta.mission_id
+        activity_audit["submitted_tags"] = list(meta.tags)
         job.response_json = {
             "mode": "web",
             "cover_url": cover_url or None,

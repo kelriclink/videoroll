@@ -137,15 +137,51 @@ def test_public_activity_needs_verified_real_mission_and_full_time_window():
     assert audit["activity_verified_count"] == 1
 
 
-def test_public_list_id_cannot_be_guessed_as_subject_sid():
+def test_public_list_id_is_never_used_as_subject_sid():
     client = _Client()
     _public(client)
+    client.public[0].pop("sid")
+    # Public directory verifies time/state, and authenticated creator center
+    # independently provides the real topic and mission identifiers/rules.
+    ai = _AI({"refs": ["public:456"]}, {"ref": "public:456", "reason": "匹配"})
+    updated, audit = select_publish_activity(client, ai, _meta(), tid=17, now=100)
+    assert (updated.topic_id, updated.mission_id) == (12, 34)
+    assert audit["activity_verified_count"] == 1
+    assert not any(method == "detail" for method, _ in client.calls)
+
+
+def test_public_activities_are_not_truncated_by_full_topic_results():
+    client = _Client()
+    _public(client)
+    client.search["机械键盘测试"] = [
+        {"topic_id": i + 1000, "topic_name": f"话题{i}"}
+        for i in range(100)
+    ]
+    ai = _AI({"refs": ["public:456"]}, {"ref": "public:456", "reason": "匹配"})
+    updated, audit = select_publish_activity(client, ai, _meta(), tid=17, now=100)
+    assert updated.mission_id == 34
+    assert audit["candidate_topic_count"] <= 65
+    assert audit["candidate_activity_count"] == 1
+
+
+def test_public_activity_only_marketing_tagline_is_not_enough_for_eligibility():
+    client = _Client()
+    _public(client, rules="机械键盘大赛")
     client.public[0].pop("sid")
     ai = _AI({"refs": ["public:456"]})
     updated, audit = select_publish_activity(client, ai, _meta(), tid=17, now=100)
     assert updated.mission_id is None
     assert audit["activity_verified_count"] == 0
-    assert not any(method == "detail" for method, _ in client.calls)
+
+
+def test_public_activity_extra_submission_requirements_reject_auto_participation():
+    client = _Client()
+    _public(client, rules="标题带后缀【活动挑战】并在简介@活动官方")
+    client.public[0].pop("sid")
+    ai = _AI({"refs": ["public:456"]})
+    updated, audit = select_publish_activity(client, ai, _meta(), tid=17, now=100)
+    assert updated.mission_id is None
+    assert audit["rejected_refs"]["public:456"]
 
 
 def test_activity_missing_real_mission_is_rejected():
@@ -252,6 +288,43 @@ def test_no_ai_choice_keeps_original_meta():
     assert not audit["selected"]
 
 
+def test_plain_topic_is_kept_if_ai_only_declines_due_to_not_being_an_activity():
+    client = _Client()
+    client.recommended = [{
+        "topic_id": 1096346, "topic_name": "德克萨斯and拉普兰德 双狼组",
+    }]
+    client.search["德克萨斯and拉普兰德 双狼组"] = [{
+        "id": 1096346, "name": "德克萨斯and拉普兰德 双狼组",
+        "mission_id": 0,
+    }]
+    meta = _meta(
+        title="【熟肉】拉普兰德动画 #明日方舟 #德克萨斯",
+        tags=["明日方舟", "拉普兰德"],
+    )
+    ai = _AI(
+        {"refs": ["topic:1096346"]},
+        {"ref": "none", "reason": "只有普通话题，不属于参与活动"},
+    )
+    updated, audit = select_publish_activity(client, ai, meta, tid=17, now=100)
+    assert updated.topic_id == 1096346
+    assert updated.mission_id is None
+    assert audit["decision_fallback"] == "topic_not_activity"
+    assert audit["selected"] is True
+
+
+def test_unrelated_topic_cannot_use_nonactivity_fallback():
+    client = _Client()
+    client.recommended = [{"topic_id": 150, "topic_name": "高铁发展史"}]
+    client.search["高铁发展史"] = [{"id": 150, "name": "高铁发展史"}]
+    ai = _AI(
+        {"refs": ["topic:150"]},
+        {"ref": "none", "reason": "只有普通话题，不属于参与活动"},
+    )
+    updated, audit = select_publish_activity(client, ai, _meta(), tid=17, now=100)
+    assert updated.topic_id is None
+    assert not audit["selected"]
+
+
 def test_manual_topic_is_preserved_without_any_api_calls():
     client = _Client()
     ai = _AI()
@@ -270,6 +343,17 @@ def test_manual_activity_is_preserved_without_any_api_calls():
     assert changed is original
     assert "manual" in audit["reason"]
     assert not client.calls
+
+
+def test_generic_english_and_year_do_not_count_as_subject_evidence():
+    from videoroll.apps.bilibili_publisher.activity_selector import _has_subject_overlap
+
+    assert not _has_subject_overlap(
+        "德克萨斯and拉普兰德双狼组2026", "The and Game 2026"
+    )
+    assert _has_subject_overlap(
+        "明日方舟双狼Bonly同人会", "拉普兰德动画 #明日方舟"
+    )
 
 
 def test_old_videoroll_tag_is_not_used_to_search_topics():

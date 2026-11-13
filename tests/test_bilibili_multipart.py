@@ -57,6 +57,39 @@ def test_worker_extracts_video_parts_in_order() -> None:
         )
 
 
+def test_published_job_uses_actual_submitted_topic_and_tags_not_queued_snapshot() -> None:
+    request = {
+        "meta": {"title": "原稿", "tags": ["视频分享"], "typeid": 171},
+        "video": {"type": "storage", "key": "final.mp4"},
+        "typeid_mode": "ai_summary",
+    }
+    selected = BilibiliPublishMeta(
+        title="原稿", tags=["机械键盘", "科技"], typeid=171,
+        topic_id=1194769, mission_id=None,
+    )
+    snapshot = worker._submitted_meta_snapshot(request, selected)
+    assert snapshot["meta"]["topic_id"] == 1194769
+    assert snapshot["meta"]["mission_id"] is None
+    assert snapshot["meta"]["tags"] == ["机械键盘", "科技"]
+    assert snapshot["video"] == request["video"]
+    assert snapshot["typeid_mode"] == "ai_summary"
+    assert request["meta"]["tags"] == ["视频分享"]
+    assert "topic_id" not in request["meta"]
+
+
+def test_flat_legacy_published_job_meta_snapshot_is_updated_without_losing_video() -> None:
+    request = {"title": "原稿", "tags": ["视频分享"], "typeid": 171, "video": {"key": "x.mp4"}}
+    selected = BilibiliPublishMeta(
+        title="原稿", tags=["机械键盘"], typeid=171,
+        topic_id=12, mission_id=34,
+    )
+    snapshot = worker._submitted_meta_snapshot(request, selected)
+    assert snapshot["topic_id"] == 12
+    assert snapshot["mission_id"] == 34
+    assert snapshot["video"] == {"key": "x.mp4"}
+    assert request["tags"] == ["视频分享"]
+
+
 def test_web_submit_uses_one_archive_with_two_ordered_videos() -> None:
     client = BilibiliWebClient("SESSDATA=fake")
     client._bili = Mock()

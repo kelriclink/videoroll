@@ -622,6 +622,32 @@ class BilibiliWebClient:
         _bili_code_ok(data)
         return data
 
+    def recommended_tags(self, *, type_id: int, title: str, description: str = "") -> list[str]:
+        """Creator-center content tags (NOT topics or activity mission IDs).
+
+        Authenticated GET request; expected data shape: [{tag: "..."}].
+        """
+        response = self._safe_metadata_request(lambda: self._bili.get(
+            "https://member.bilibili.com/x/vupre/web/tag/recommend",
+            params={
+                "subtype_id": max(0, int(type_id)),
+                "title": str(title or "")[:80],
+                "description": str(description or "")[:500],
+            },
+            timeout=8.0,
+        ))
+        payload = _json(response)
+        _bili_code_ok(payload)
+        records = payload.get("data")
+        if not isinstance(records, list):
+            return []
+        return [
+            str(item.get("tag") or "").strip()
+            for item in records[:10]
+            if isinstance(item, dict) and isinstance(item.get("tag"), str)
+            and str(item.get("tag")).strip()
+        ]
+
     def recommended_topics(self, *, type_id: int, title: str, page_size: int = 30) -> list[dict[str, Any]]:
         """Creative-center suggestions for a category and title (Cookie-authenticated)."""
         response = self._safe_metadata_request(lambda: self._bili.get(

@@ -113,7 +113,7 @@ def test_custom_default_tags_remain_supported():
 
 
 def test_no_forced_videoroll_in_publishing_tag_merge():
-    from videoroll.apps.orchestrator_api.services.publishing_service import merge_bilibili_tags
+    from videoroll.apps.publish_gateway import merge_bilibili_tags
     assert merge_bilibili_tags(["USB-C", "科技"], ["USB-C", "快充"]) == ["USB-C", "科技", "快充"]
     assert merge_bilibili_tags([], ["videoroll"]) == ["videoroll"]
     assert merge_bilibili_tags(["USB-C"], []) == ["USB-C"]

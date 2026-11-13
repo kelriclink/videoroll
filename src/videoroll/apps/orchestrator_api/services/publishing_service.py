@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 
 from videoroll.ai.service import AIService
 from videoroll.apps.bilibili_publisher.schemas import BilibiliPublishMeta
+from videoroll.apps.bilibili_publisher.tag_recommendation import resolve_bilibili_publish_tags
 from videoroll.apps.orchestrator_api.infrastructure.internal_http import (
     InternalServiceResponse,
     internal_http_headers,
@@ -22,7 +23,6 @@ from videoroll.apps.orchestrator_api.services.asset_service import (
     write_storage_json,
 )
 from videoroll.apps.publish_gateway import (
-    merge_bilibili_tags,
     normalize_publish_platform,
     normalize_social_publish_meta,
     publish_backend_url,
@@ -282,15 +282,16 @@ def prepare_publish_meta(
     if copyright_value == 2 and not str(meta.get("source") or "").strip() and task.source_url:
         meta["source"] = task.source_url
 
-    # Only remove the old generated VideoRoll brand tag. Explicit tags,
-    # including one manually named "videoroll", are never removed.
-    suggested_tags = [
-        tag for tag in get_task_bilibili_tags(db, str(task.id))
-        if str(tag or "").strip().casefold() != "videoroll"
-    ]
-    merged_tags = merge_bilibili_tags(suggested_tags, normalize_tags(meta.get("tags")))
-    if merged_tags:
-        meta["tags"] = merged_tags
+    # Keep direct and queued publishing on the same tag priority policy.
+    meta["tags"] = resolve_bilibili_publish_tags(
+        db,
+        generated=get_task_bilibili_tags(db, str(task.id)),
+        explicit=normalize_tags(meta.get("tags")),
+        title=str(meta.get("title") or ""),
+        description=str(meta.get("desc") or ""),
+        typeid=int(meta.get("typeid") or meta.get("tid") or 0),
+        external_source=task.source_type.value == "youtube",
+    )
 
     try:
         return BilibiliPublishMeta.model_validate(meta).model_dump()

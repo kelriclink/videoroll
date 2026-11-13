@@ -159,6 +159,72 @@ def test_postprocess_translation_updates_metadata_and_returns_bilingual_segments
     assert "publish meta refreshed" in logs[0]
 
 
+@pytest.mark.parametrize(
+    ("provider", "ai_tags", "expected"),
+    [
+        ("openai", ["数据线", "USB-C"], ["数据线", "USB-C"]),
+        ("openai", [], []),
+        ("mock", [], []),
+    ],
+)
+def test_postprocess_preserves_ai_tag_priority_and_does_not_generate_local_tags(
+    monkeypatch: pytest.MonkeyPatch,
+    provider: str,
+    ai_tags: list[str],
+    expected: list[str],
+) -> None:
+    class Session:
+        new = ()
+        dirty = ()
+        deleted = ()
+
+        def rollback(self) -> None:
+            pass
+
+    class AI:
+        def translate_title(self, title: str, **_kwargs: object) -> str:
+            return title
+
+        def generate_bilibili_tags(self, **_kwargs: object) -> list[str]:
+            if provider != "openai":
+                raise AssertionError("other providers must not generate tags here")
+            return ai_tags
+
+    stored: list[list[str]] = []
+    monkeypatch.setattr(
+        translation_postprocess,
+        "latest_youtube_title", lambda *_args: "USB-C 科普",
+    )
+    monkeypatch.setattr(translation_postprocess, "set_task_titles", lambda *_args, **_kw: None)
+    monkeypatch.setattr(
+        translation_postprocess, "fallback_bilibili_tags",
+        lambda **_kw: (_ for _ in ()).throw(
+            AssertionError("heuristic fallback must not preempt Bilibili recommendations")
+        ),
+    )
+    monkeypatch.setattr(
+        translation_postprocess, "set_task_bilibili_tags",
+        lambda _db, _task_id, **kwargs: stored.append(kwargs["tags"]),
+    )
+    segments = [Segment(0.0, 1.0, "这里讲解 USB-C 数据线")]
+    postprocess_translation(
+        db=Session(),  # type: ignore[arg-type]
+        store=object(),  # type: ignore[arg-type]
+        task=SimpleNamespace(id=uuid.uuid4()),  # type: ignore[arg-type]
+        request_json={},
+        source_segments=segments,
+        translated_segments=segments,
+        provider=provider,
+        target_lang="zh",
+        style="natural",
+        summary="讲解数据线",
+        bilingual=False,
+        ai_service=AI(),  # type: ignore[arg-type]
+        log=lambda _line: None,
+    )
+    assert stored == [expected]
+
+
 def test_title_metadata_failure_rolls_back_and_tag_update_continues(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
