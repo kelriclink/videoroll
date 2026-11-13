@@ -7,6 +7,8 @@ import {
 } from "../../../api/translate";
 import { useConfirm } from "../../../components/feedbackContext";
 import { Button, InlineNotice, Section } from "../../../components/ui";
+import { fetchJson } from "../../../lib/http";
+import { orchestratorUrl } from "../../../lib/urls";
 import { IndexTranslateOptions } from "../model-providers/IndexTranslateOptions";
 import { ModelProviderConnectionForm } from "../model-providers/ModelProviderConnectionForm";
 import { ModelProviderModelsEditor } from "../model-providers/ModelProviderModelsEditor";
@@ -33,6 +35,10 @@ export function ModelProvidersWorkspace() {
   const [error, setError] = useState("");
   const [message, setMessage] = useState("");
   const [loading, setLoading] = useState(false);
+  const [activityEnabled, setActivityEnabled] = useState(false);
+  const [activityReady, setActivityReady] = useState(false);
+  const [activitySaving, setActivitySaving] = useState(false);
+  const [activityError, setActivityError] = useState("");
 
   const refresh = useCallback(async () => {
     const rows = await translateApi.modelProviders();
@@ -68,6 +74,37 @@ export function ModelProvidersWorkspace() {
       })
       .catch((reason: unknown) => setError(reason instanceof Error ? reason.message : String(reason)));
   }, [refresh]);
+
+  useEffect(() => {
+    let active = true;
+    void fetchJson<{ ai_activity_enabled: boolean }>(
+      orchestratorUrl("/bilibili/publish/settings"),
+    ).then((settings) => {
+      if (!active) return;
+      setActivityEnabled(settings.ai_activity_enabled === true);
+      setActivityReady(true);
+    }).catch((reason: unknown) => {
+      if (active) setActivityError(reason instanceof Error ? reason.message : String(reason));
+    });
+    return () => { active = false; };
+  }, []);
+
+  async function saveActivityEnabled(enabled: boolean) {
+    setActivitySaving(true);
+    setActivityError("");
+    try {
+      const response = await fetchJson<{ ai_activity_enabled: boolean }>(
+        orchestratorUrl("/bilibili/publish/settings"),
+        { method: "PUT", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ ai_activity_enabled: enabled }) },
+      );
+      setActivityEnabled(response.ai_activity_enabled === true);
+    } catch (reason: unknown) {
+      setActivityError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setActivitySaving(false);
+    }
+  }
 
   const selectedProvider = providers.find((item) => item.id === selectedId) ?? null;
   const isNew = selectedId === "_new";
@@ -185,6 +222,27 @@ export function ModelProvidersWorkspace() {
           </div>
         </div>
         <Button size="xs" onClick={() => selectProvider("_new")}>添加模型服务</Button>
+      </div>
+
+      <div className="mt-4 rounded-xl border border-slate-200 p-4 dark:border-slate-800">
+        <label className="flex items-start gap-3 text-sm">
+          <input
+            type="checkbox"
+            className="mt-1"
+            checked={activityEnabled}
+            disabled={!activityReady || activitySaving}
+            onChange={(event) => void saveActivityEnabled(event.target.checked)}
+          />
+          <span>
+            <span className="font-semibold">AI 智能参与 B站投稿活动</span>
+            <span className="mt-1 block text-xs text-slate-500">
+              默认关闭。投稿前查询创作中心推荐话题与公开活动，使用“自动处理”当前选择的 OpenAI 兼容模型筛选，
+              再核查活动详情。符合条件才填写活动 ID；失败或不适用时按原设置投稿，不覆盖手动选择。
+              活动奖励或账号资格不能由 AI 保证，转载稿件需要明确允许转载的活动规则。
+            </span>
+          </span>
+        </label>
+        {activityError ? <InlineNotice tone="danger">{activityError}</InlineNotice> : null}
       </div>
 
       <div className="mt-4 grid gap-5 lg:grid-cols-[220px_minmax(0,1fr)]">

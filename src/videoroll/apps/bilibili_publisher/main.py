@@ -172,7 +172,7 @@ def recommend_archive_type(
 @app.get("/bilibili/publish/settings", response_model=BilibiliPublishSettingsRead)
 def get_publish_settings(db: Session = Depends(get_db)) -> BilibiliPublishSettingsRead:
     cfg = get_bilibili_publish_settings(db)
-    return BilibiliPublishSettingsRead(default_meta=cfg["default_meta"], upload_workers=cfg["upload_workers"])
+    return BilibiliPublishSettingsRead(**cfg)
 
 
 @app.put("/bilibili/publish/settings", response_model=BilibiliPublishSettingsRead)
@@ -181,7 +181,7 @@ def put_publish_settings(payload: BilibiliPublishSettingsUpdate, db: Session = D
         cfg = update_bilibili_publish_settings(db, payload.model_dump(exclude_unset=True))
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
-    return BilibiliPublishSettingsRead(default_meta=cfg["default_meta"], upload_workers=cfg["upload_workers"])
+    return BilibiliPublishSettingsRead(**cfg)
 
 
 @app.get("/bilibili/auth/settings", response_model=BilibiliAuthSettingsRead)
