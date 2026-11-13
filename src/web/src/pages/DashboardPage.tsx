@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import StatusBadge from "../components/StatusBadge";
+import BilibiliDiscoveryView from "../features/bilibili-discovery/BilibiliDiscoveryView";
 import { InlineNotice, Metric, PageHeader, Section, TechnicalDetails } from "../components/ui";
 import { fetchJson } from "../lib/http";
 import { RealtimeEvent, useRealtimeSubscription } from "../lib/realtime";
@@ -259,6 +260,8 @@ export default function DashboardPage() {
           <Metric label="已发布" value={publishedCount} detail="最近加载的 200 条任务" tone="success" />
         </div>
       </Section>
+
+      <BilibiliDiscoveryView compact />
 
       {failedTasks.length > 0 ? (
         <Section>

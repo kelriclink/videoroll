@@ -9,6 +9,7 @@ import { ORCHESTRATOR_URL } from "./lib/urls";
 import { RealtimeProvider } from "./lib/RealtimeProvider";
 
 const DashboardPage = lazy(() => import("./pages/DashboardPage"));
+const BilibiliDiscoveryPage = lazy(() => import("./pages/BilibiliDiscoveryPage"));
 const TaskDetailPage = lazy(() => import("./pages/TaskDetailPage"));
 const TaskNewPage = lazy(() => import("./pages/TaskNewPage"));
 const TasksPage = lazy(() => import("./pages/TasksPage"));
@@ -99,6 +100,7 @@ function Navigation({ onNavigate }: { onNavigate?: () => void }) {
         <NavItem to="/tasks" label="任务" onNavigate={onNavigate} />
         <NavItem to="/videos" label="视频成品" onNavigate={onNavigate} />
         <NavItem to="/youtube/sources" label="YouTube 来源" onNavigate={onNavigate} />
+        <NavItem to="/bilibili/discovery" label="B站热点与活动" onNavigate={onNavigate} />
       </NavGroup>
 
       <NavGroup title="制作">
@@ -386,6 +388,7 @@ export default function App() {
             <Suspense fallback={<PageLoading />}>
               <Routes>
                 <Route path="/" element={<DashboardPage />} />
+                <Route path="/bilibili/discovery" element={<BilibiliDiscoveryPage />} />
                 <Route path="/tasks" element={<TasksPage />} />
                 <Route path="/videos" element={<VideosPage />} />
                 <Route path="/live" element={<Navigate to="/playout" replace />} />
