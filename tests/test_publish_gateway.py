@@ -8,6 +8,7 @@ import pytest
 from videoroll.apps.orchestrator_api.services.publishing_service import build_publish_gateway_request
 from videoroll.apps.publish_gateway import normalize_social_publish_meta, publish_backend_url, publish_meta_key
 from videoroll.apps.publish_request_builder import build_publish_gateway_request as build_queued_publish_gateway_request
+from videoroll.apps.publish_request_builder import prepare_bilibili_publish_meta
 from videoroll.db.models import SourceLicense, SourceType, Task
 
 
@@ -133,6 +134,58 @@ def test_queued_douyin_publish_uses_stored_youtube_uploader() -> None:
     )
 
     assert request["meta"]["desc"] == "原作者：Original Creator"
+
+
+@pytest.mark.parametrize(
+    ("suggested", "explicit", "expected"),
+    [
+        ([], ["视频分享"], ["视频分享"]),
+        (["videoroll", "科技", "科技"], ["视频分享"], ["科技", "视频分享"]),
+        (["VideoRoll", "科技"], ["videoroll", "视频分享"], ["科技", "videoroll", "视频分享"]),
+    ],
+)
+def test_queued_bilibili_publish_never_injects_brand_tag(
+    suggested: list[str], explicit: list[str], expected: list[str],
+) -> None:
+    task = Task(
+        id=uuid.uuid4(), source_type=SourceType.youtube,
+        source_license=SourceLicense.own,
+    )
+    meta = {"title": "实测投稿", "desc": "描述", "tags": explicit, "typeid": 17}
+    db = Mock()
+
+    with patch("videoroll.apps.publish_request_builder.get_task_bilibili_tags", return_value=suggested):
+        direct = prepare_bilibili_publish_meta(
+            task=task, payload_meta=meta, db=db, store=object(),  # type: ignore[arg-type]
+        )
+        queued = build_queued_publish_gateway_request(
+            task=task, task_id=task.id,
+            payload={"platform": "bilibili", "account_id": "acct", "meta": meta},
+            video_key="final/video.mp4",
+            db=db, store=object(),  # type: ignore[arg-type]
+        )
+
+    assert direct["tags"] == expected
+    assert queued["meta"]["tags"] == expected
+    # Builders must not mutate metadata already prepared for other targets.
+    assert meta["tags"] == explicit
+
+
+def test_queued_bilibili_publish_limits_tags_without_preemptive_brand() -> None:
+    task = Task(
+        id=uuid.uuid4(), source_type=SourceType.youtube,
+        source_license=SourceLicense.own,
+    )
+    with patch("videoroll.apps.publish_request_builder.get_task_bilibili_tags", return_value=[
+        "videoroll", *(f"标签{i}" for i in range(12)),
+    ]):
+        meta = prepare_bilibili_publish_meta(
+            task=task,
+            payload_meta={"title": "实测投稿", "tags": ["视频分享"], "typeid": 17},
+            db=Mock(), store=object(),  # type: ignore[arg-type]
+        )
+    assert meta["tags"] == [f"标签{i}" for i in range(10)]
+    assert "videoroll" not in [tag.casefold() for tag in meta["tags"]]
 
 
 def test_xiaohongshu_publish_meta_rejects_more_than_ten_tags() -> None:

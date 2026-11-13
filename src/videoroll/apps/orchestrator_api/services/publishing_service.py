@@ -22,6 +22,7 @@ from videoroll.apps.orchestrator_api.services.asset_service import (
     write_storage_json,
 )
 from videoroll.apps.publish_gateway import (
+    merge_bilibili_tags,
     normalize_publish_platform,
     normalize_social_publish_meta,
     publish_backend_url,
@@ -253,21 +254,6 @@ def read_latest_task_subtitle_text(task_id: uuid.UUID, db: Session, store: FileS
         return read_storage_bytes(store, asset.storage_key).decode("utf-8", errors="ignore")
     except Exception:
         return ""
-
-
-def merge_bilibili_tags(suggested: list[str], explicit: list[str]) -> list[str]:
-    """No injected platform-brand tag; user-supplied tags are respected."""
-    tags: list[str] = []
-    seen: set[str] = set()
-    for tag in [*suggested, *explicit]:
-        value = str(tag or "").strip()
-        if not value or value.casefold() in seen:
-            continue
-        tags.append(value)
-        seen.add(value.casefold())
-        if len(tags) == 10:
-            break
-    return tags
 
 
 def prepare_publish_meta(

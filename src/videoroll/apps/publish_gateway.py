@@ -9,6 +9,25 @@ SUPPORTED_SOCIAL_PLATFORMS = frozenset({"douyin", "xiaohongshu", "kuaishou"})
 SUPPORTED_PUBLISH_PLATFORMS = frozenset({"bilibili", *SUPPORTED_SOCIAL_PLATFORMS})
 
 
+def merge_bilibili_tags(suggested: list[str], explicit: list[str]) -> list[str]:
+    """Merge automatic and explicit tags without injecting a brand tag.
+
+    Explicit user tags (including 'videoroll') are preserved. The caller
+    filters obsolete brand tags from automatically generated suggestions.
+    """
+    tags: list[str] = []
+    seen: set[str] = set()
+    for tag in [*suggested, *explicit]:
+        value = str(tag or "").strip()
+        if not value or value.casefold() in seen:
+            continue
+        tags.append(value)
+        seen.add(value.casefold())
+        if len(tags) == 10:
+            break
+    return tags
+
+
 def normalize_publish_platform(platform: object) -> str:
     value = str(platform or "bilibili").strip().lower() or "bilibili"
     if value not in SUPPORTED_PUBLISH_PLATFORMS:

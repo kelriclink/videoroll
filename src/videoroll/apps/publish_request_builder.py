@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 
 from videoroll.apps.bilibili_publisher.schemas import BilibiliPublishMeta
 from videoroll.apps.publish_gateway import (
+    merge_bilibili_tags,
     normalize_publish_platform,
     normalize_social_publish_meta,
     publish_meta_key,
@@ -92,16 +93,13 @@ def prepare_bilibili_publish_meta(
     if copyright_value == 2 and not str(meta.get("source") or "").strip() and task.source_url:
         meta["source"] = task.source_url
 
-    merged_tags: list[str] = []
-    seen: set[str] = set()
-    for tag in ["videoroll", *get_task_bilibili_tags(db, str(task.id)), *_normalize_tags(meta.get("tags"))]:
-        text = str(tag or "").strip()
-        if not text or text.lower() in seen:
-            continue
-        seen.add(text.lower())
-        merged_tags.append(text)
-        if len(merged_tags) >= 10:
-            break
+    # Queue and direct publishing share the same tag rule. The old queue
+    # path unconditionally injected "videoroll", even with new defaults.
+    suggested_tags = [
+        tag for tag in get_task_bilibili_tags(db, str(task.id))
+        if str(tag or "").strip().casefold() != "videoroll"
+    ]
+    merged_tags = merge_bilibili_tags(suggested_tags, _normalize_tags(meta.get("tags")))
     if merged_tags:
         meta["tags"] = merged_tags
 
