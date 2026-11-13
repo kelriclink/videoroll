@@ -46,9 +46,9 @@ def test_activity_toggle_rejects_non_boolean():
         raise AssertionError("non-boolean toggle value was accepted")
 
 
-def test_default_tag_is_no_longer_videoroll():
+def test_default_tag_template_is_empty():
     db = _Session()
-    assert "videoroll" not in get_bilibili_publish_settings(db)["default_meta"].tags
+    assert get_bilibili_publish_settings(db)["default_meta"].tags == []
 
 
 def test_single_historical_videoroll_default_is_replaced_in_memory():
@@ -58,8 +58,41 @@ def test_single_historical_videoroll_default_is_replaced_in_memory():
         "title": "旧模板", "typeid": 17, "tags": ["videoroll"]
     }})
     settings = get_bilibili_publish_settings(db)
-    assert settings["default_meta"].tags == ["视频分享"]
+    assert settings["default_meta"].tags == []
     assert db.row.value_json["default_meta"]["tags"] == ["videoroll"]
+
+
+def test_historical_video_share_default_is_empty_without_database_mutation():
+    from types import SimpleNamespace
+
+    db = _Session()
+    db.row = SimpleNamespace(value_json={"default_meta": {
+        "title": "旧模板", "typeid": 17, "tags": ["视频分享"]
+    }})
+    settings = get_bilibili_publish_settings(db)
+    assert settings["default_meta"].tags == []
+    assert db.row.value_json["default_meta"]["tags"] == ["视频分享"]
+
+
+def test_user_can_save_empty_default_meta_but_publish_requires_tags():
+    import pytest
+
+    from videoroll.apps.bilibili_publisher.schemas import (
+        BilibiliPublishMeta, BilibiliPublishSettingsRead,
+    )
+    from pydantic import ValidationError
+
+    db = _Session()
+    settings = update_bilibili_publish_settings(db, {
+        "default_meta": {"title": "模板", "typeid": 17, "tags": []}
+    })
+    assert settings["default_meta"].tags == []
+    assert db.row.value_json["default_meta"]["tags"] == []
+    assert BilibiliPublishSettingsRead(**settings).default_meta["tags"] == []
+    with pytest.raises(ValidationError, match="meta.tags is required"):
+        BilibiliPublishMeta.model_validate({
+            "title": "即将投稿", "typeid": 17, "tags": []
+        })
 
 
 def test_user_configured_additional_tags_are_preserved():
@@ -69,6 +102,14 @@ def test_user_configured_additional_tags_are_preserved():
         "title": "自定义", "typeid": 17, "tags": ["videoroll", "硬件"]
     }})
     assert get_bilibili_publish_settings(db)["default_meta"].tags == ["videoroll", "硬件"]
+
+
+def test_custom_default_tags_remain_supported():
+    db = _Session()
+    settings = update_bilibili_publish_settings(db, {
+        "default_meta": {"title": "自定义", "typeid": 17, "tags": ["科技"]}
+    })
+    assert settings["default_meta"].tags == ["科技"]
 
 
 def test_no_forced_videoroll_in_publishing_tag_merge():

@@ -4,7 +4,7 @@ import uuid
 from datetime import datetime
 from typing import Any, Literal, Optional
 
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, ValidationInfo, field_validator, model_validator
 
 from videoroll.apps.bilibili_publisher.constants import BILIBILI_DESC_MAX_CHARS
 from videoroll.apps.publish_meta_rules import bilibili_text_units, clamp_bilibili_text
@@ -102,7 +102,7 @@ class BilibiliPublishMeta(BaseModel):
         return [str(v).strip()] if str(v).strip() else []
 
     @model_validator(mode="after")
-    def _validate_meta(self) -> "BilibiliPublishMeta":
+    def _validate_meta(self, info: ValidationInfo) -> "BilibiliPublishMeta":
         if not self.title:
             raise ValueError("meta.title is required")
         if len(self.title) > 80:
@@ -114,7 +114,10 @@ class BilibiliPublishMeta(BaseModel):
 
         # B 站限制：最多 10 个标签。这里做强校验，避免后续真实投稿失败。
         tags = [t for t in self.tags if t]
-        if len(tags) == 0:
+        # A saved default template may intentionally have no tags. A real
+        # publishing request must still provide at least one Bilibili tag.
+        allow_empty_template = isinstance(info.context, dict) and info.context.get("allow_empty_tags") is True
+        if len(tags) == 0 and not allow_empty_template:
             raise ValueError("meta.tags is required (at least 1)")
         if len(tags) > 10:
             raise ValueError("meta.tags too long (max 10)")
@@ -140,9 +143,21 @@ class BilibiliPublishMeta(BaseModel):
 
 
 class BilibiliPublishSettingsRead(BaseModel):
-    default_meta: BilibiliPublishMeta
+    # Default metadata is a template, not a ready-to-submit archive. Expose
+    # it as validated JSON so Pydantic cannot revalidate nested BilibiliPublishMeta
+    # without the template context and incorrectly reject empty tags.
+    default_meta: dict[str, Any]
     upload_workers: int = Field(default=4, ge=1, le=8)
     ai_activity_enabled: bool = False
+
+    @field_validator("default_meta", mode="before")
+    @classmethod
+    def _template_to_json(cls, value: Any) -> dict[str, Any]:
+        if isinstance(value, BilibiliPublishMeta):
+            return value.model_dump()
+        return BilibiliPublishMeta.model_validate(
+            value, context={"allow_empty_tags": True},
+        ).model_dump()
 
 
 class BilibiliPublishSettingsUpdate(BaseModel):
