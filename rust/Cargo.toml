@@ -17,13 +17,14 @@ anyhow = "1"
 base64 = "0.22"
 hmac = "0.12"
 pbkdf2 = "0.12"
-axum = { version = "0.8", features = ["macros", "json"] }
+axum = { version = "0.8", features = ["macros", "json", "multipart"] }
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive", "env"] }
 hex = "0.4"
+md5 = "0.7"
 futures-util = "0.3"
 http = "1"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream", "multipart"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
@@ -35,7 +36,7 @@ tokio-util = { version = "0.7", features = ["io"] }
 tower-http = { version = "0.6", features = ["trace", "cors", "limit"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-uuid = { version = "1", features = ["serde", "v4"] }
+uuid = { version = "1", features = ["serde", "v4", "v5"] }
 
 [dev-dependencies]
 tempfile = "3"

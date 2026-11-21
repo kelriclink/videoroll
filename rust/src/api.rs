@@ -330,6 +330,10 @@ async fn storage_stats(State(state): State<AppState>) -> AppResult<Json<Value>> 
 pub fn router(state: AppState) -> Router {
     let protected = Router::new()
         .merge(crate::assets::router())
+        .merge(crate::sources::router())
+        .merge(crate::telemetry::router())
+        .merge(crate::settings::router())
+        .merge(crate::remote_render::admin_router())
         .route("/tasks", get(list_tasks))
         .route("/tasks/{id}", get(get_task))
         .route("/tasks/{id}/workflows", get(workflows_for_task))
@@ -347,6 +351,7 @@ pub fn router(state: AppState) -> Router {
         .route("/storage/hold", post(asset_hold))
         .route_layer(middleware::from_fn_with_state(state.clone(), authorize));
     Router::new()
+        .merge(crate::remote_render::worker_router())
         .route("/api/auth/status", get(admin_status))
         .route("/api/auth/login", post(admin_login))
         .route("/api/auth/logout", post(admin_logout))

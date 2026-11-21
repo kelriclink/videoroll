@@ -31,6 +31,8 @@ const RenderManagementPage = lazy(() => import("./pages/RenderManagementPage"));
 const KnowledgeBasePage = lazy(() => import("./pages/KnowledgeBasePage"));
 const DictionaryPage = lazy(() => import("./pages/DictionaryPage"));
 const OperationsPage = lazy(() => import("./pages/OperationsPage"));
+const RustV2Page = lazy(() => import("./pages/RustV2Page"));
+const RUST_V2_ENABLED = import.meta.env.VITE_RUST_V2_UI === "true";
 
 function NavItem({ to, label, onNavigate }: { to: string; label: string; onNavigate?: () => void }) {
   return (
@@ -116,6 +118,7 @@ function Navigation({ onNavigate }: { onNavigate?: () => void }) {
 
       <NavGroup title="系统">
         <NavItem to="/operations" label="运维" onNavigate={onNavigate} />
+        {RUST_V2_ENABLED && <NavItem to="/rust-v2" label="Rust V2 测试控制台" onNavigate={onNavigate} />}
         <NavItem to="/settings" label="设置" onNavigate={onNavigate} />
       </NavGroup>
     </nav>
@@ -402,6 +405,7 @@ export default function App() {
                 <Route path="/knowledge" element={<KnowledgeBasePage />} />
                 <Route path="/dictionaries" element={<DictionaryPage />} />
                 <Route path="/operations" element={<OperationsPage />} />
+                {RUST_V2_ENABLED && <Route path="/rust-v2" element={<RustV2Page />} />}
                 <Route path="/settings" element={<SettingsLayout />}>
                   <Route index element={<Navigate to="auto" replace />} />
                   <Route path="auto" element={<SettingsAutoPage />} />

@@ -28,6 +28,17 @@ impl Scheduler {
         priority: i32,
         configuration: Value,
     ) -> AppResult<(TaskInfo, Option<WorkflowInfo>, bool)> {
+        self.create_youtube_source_task(source_url, source_license, priority, configuration, true)
+            .await
+    }
+    pub async fn create_youtube_source_task(
+        &self,
+        source_url: &str,
+        source_license: &str,
+        priority: i32,
+        configuration: Value,
+        auto_process: bool,
+    ) -> AppResult<(TaskInfo, Option<WorkflowInfo>, bool)> {
         let video_id = crate::ingest::youtube_video_id(source_url)?;
         let license = match source_license {
             "own" | "authorized" | "cc" | "unknown" => source_license,
@@ -55,9 +66,10 @@ impl Scheduler {
         let run_id = Uuid::new_v4().to_string();
         let canonical_url = format!("https://www.youtube.com/watch?v={video_id}");
         sqlx::query(
-            "INSERT INTO tasks(id,source_type,source_url,source_license,status,priority,origin_kind,origin_run_id,restart_generation,created_by) VALUES($1,'youtube'::source_type,$2,$3::source_license,'CREATED'::task_status,$4,'auto_youtube',$5,0,'auto_youtube')"
+            "INSERT INTO tasks(id,source_type,source_url,source_license,status,priority,origin_kind,origin_run_id,restart_generation,created_by) VALUES($1,'youtube'::source_type,$2,$3::source_license,'CREATED'::task_status,$4,$6,$5,0,$6)"
         ).bind(task_id).bind(canonical_url).bind(license).bind(priority.clamp(-100,100))
-            .bind(run_id).execute(&mut *tx).await?;
+            .bind(run_id).bind(if auto_process {"auto_youtube"} else {"source_scan"})
+            .execute(&mut *tx).await?;
         let inserted=sqlx::query(
             "INSERT INTO ingested_videos(id,platform,source_id,task_id) VALUES($1,'youtube',$2,$3) ON CONFLICT(platform,source_id) DO NOTHING"
         ).bind(Uuid::new_v4()).bind(&video_id).bind(task_id).execute(&mut *tx).await?;
@@ -72,22 +84,28 @@ impl Scheduler {
             .await?;
             return Ok((self.db.task(winner).await?, None, true));
         }
-        sqlx::query(
+        if auto_process {
+            sqlx::query(
             "INSERT INTO vr2_workflows(id,task_id,generation,state,current_stage,configuration) VALUES($1,$2,1,'running','download',$3)"
         ).bind(workflow_id).bind(task_id).bind(configuration).execute(&mut *tx).await?;
-        Self::insert_job(&mut tx, workflow_id, task_id, 1, Stage::Download).await?;
-        Self::event(
-            &mut tx,
-            workflow_id,
-            None,
-            "workflow.started",
-            json!({"generation":1,"video_id":video_id}),
-        )
-        .await?;
+            Self::insert_job(&mut tx, workflow_id, task_id, 1, Stage::Download).await?;
+            Self::event(
+                &mut tx,
+                workflow_id,
+                None,
+                "workflow.started",
+                json!({"generation":1,"video_id":video_id}),
+            )
+            .await?;
+        }
         tx.commit().await?;
         Ok((
             self.db.task(task_id).await?,
-            Some(self.workflow(workflow_id).await?),
+            if auto_process {
+                Some(self.workflow(workflow_id).await?)
+            } else {
+                None
+            },
             false,
         ))
     }
@@ -473,8 +491,79 @@ impl Scheduler {
         tx.commit().await?;
         Ok(())
     }
+    /// External rendering failures preserve the original durable operation ID
+    /// and are idempotently resolved only while the exact ticket is awaiting.
+    pub async fn fail_external(&self, job_id: Uuid, ticket: &str, error: &str) -> AppResult<()> {
+        if ticket.is_empty() || ticket.len() > 1024 {
+            return Err(AppError::Invalid("external render ticket missing".into()));
+        }
+        let mut tx = self.db.pool.begin().await?;
+        let peek = sqlx::query("SELECT task_id,workflow_id,stage FROM vr2_jobs WHERE id=$1")
+            .bind(job_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| AppError::NotFound("external stage job missing".into()))?;
+        let task_id: Uuid = peek.try_get("task_id")?;
+        let workflow_id: Uuid = peek.try_get("workflow_id")?;
+        if peek.try_get::<String, _>("stage")? != "render" {
+            return Err(AppError::Invalid(
+                "only external renderer failure accepted".into(),
+            ));
+        }
+        sqlx::query("SELECT id FROM tasks WHERE id=$1 FOR UPDATE")
+            .bind(task_id)
+            .fetch_one(&mut *tx)
+            .await?;
+        let flow: String =
+            sqlx::query_scalar("SELECT state FROM vr2_workflows WHERE id=$1 FOR UPDATE")
+                .bind(workflow_id)
+                .fetch_one(&mut *tx)
+                .await?;
+        let row = sqlx::query("SELECT state,external_ticket FROM vr2_jobs WHERE id=$1 FOR UPDATE")
+            .bind(job_id)
+            .fetch_one(&mut *tx)
+            .await?;
+        let state: String = row.try_get("state")?;
+        let old_ticket: Option<String> = row.try_get("external_ticket")?;
+        if old_ticket.as_deref() != Some(ticket) || state != "awaiting" || flow != "running" {
+            return Err(AppError::Conflict(
+                "external render no longer awaiting this ticket".into(),
+            ));
+        }
+        let message = error.chars().take(1000).collect::<String>();
+        sqlx::query("UPDATE vr2_jobs SET state='failed',last_error=$1,finished_at=now(),updated_at=now() WHERE id=$2")
+            .bind(&message).bind(job_id).execute(&mut *tx).await?;
+        sqlx::query(
+            "UPDATE vr2_workflows SET state='failed',last_error=$1,updated_at=now() WHERE id=$2",
+        )
+        .bind(&message)
+        .bind(workflow_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("UPDATE tasks SET status='FAILED'::task_status,error_code='V2_REMOTE_RENDER_FAILED',error_message=$1,updated_at=now() WHERE id=$2 AND status<>'CANCELED'::task_status")
+            .bind(&message).bind(task_id).execute(&mut *tx).await?;
+        Self::event(
+            &mut tx,
+            workflow_id,
+            Some(job_id),
+            "render.remote_failed",
+            json!({"error":message}),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
     pub async fn fail(&self, item: &WorkItem, error: &str) -> AppResult<()> {
         let mut tx = self.db.pool.begin().await?;
+        // Maintain the global transaction lock order: Task -> Workflow -> Job.
+        sqlx::query("SELECT id FROM tasks WHERE id=$1 FOR UPDATE")
+            .bind(item.task_id)
+            .fetch_one(&mut *tx)
+            .await?;
+        sqlx::query("SELECT id FROM vr2_workflows WHERE id=$1 FOR UPDATE")
+            .bind(item.workflow_id)
+            .fetch_one(&mut *tx)
+            .await?;
         let row = sqlx::query(
             "SELECT state,lease_token,attempts,max_attempts FROM vr2_jobs WHERE id=$1 FOR UPDATE",
         )
@@ -506,6 +595,11 @@ impl Scheduler {
             sqlx::query("UPDATE vr2_workflows SET state=$1,last_error=$2,updated_at=now() WHERE id=$3 AND state='running'")
                 .bind(target).bind(error.chars().take(2000).collect::<String>())
                 .bind(item.workflow_id).execute(&mut *tx).await?;
+            if !unknown {
+                sqlx::query("UPDATE tasks SET status='FAILED'::task_status,error_code='V2_WORKFLOW_FAILED',error_message=$1,updated_at=now() WHERE id=$2 AND status NOT IN ('PUBLISHED'::task_status,'CANCELED'::task_status)")
+                    .bind(error.chars().take(1000).collect::<String>())
+                    .bind(item.task_id).execute(&mut *tx).await?;
+            }
         }
         Self::event(&mut tx,item.workflow_id,Some(item.id), if unknown {"job.unknown"} else {"job.failed_attempt"},
             json!({"stage":item.stage,"attempts":attempts,"state":target,"error":error.chars().take(800).collect::<String>()})).await?;
@@ -584,6 +678,8 @@ impl Scheduler {
         } else {
             sqlx::query("UPDATE vr2_jobs SET state='canceled',lease_token=NULL,lease_until=NULL,updated_at=now() WHERE workflow_id=$1 AND state IN ('pending','running','awaiting')")
                 .bind(workflow_id).execute(&mut *tx).await?;
+            sqlx::query("UPDATE tasks SET status='CANCELED'::task_status,updated_at=now() WHERE id=$1 AND status<>'PUBLISHED'::task_status")
+                .bind(task_id).execute(&mut *tx).await?;
             sqlx::query("UPDATE vr2_workflows SET state='canceled',updated_at=now() WHERE id=$1")
                 .bind(workflow_id)
                 .execute(&mut *tx)

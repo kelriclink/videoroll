@@ -117,6 +117,15 @@ pub async fn download_youtube(
         let key:String=row.try_get("storage_key")?;
         if let Ok(path)=registry.resolve_existing(&key).await
             && fs::metadata(path).await.map(|m|m.len()>0).unwrap_or(false) {
+            // A previous worker may have committed its legacy Asset but crashed
+            // before registering the v2 ownership link. Reconcile it on reuse.
+            // Legacy paths stay outside v2 GC jurisdiction.
+            if key.starts_with("v2/") {
+                registry.register(
+                    &key,"workflow",job.workflow_id,"video_raw",
+                    chrono::Utc::now()+chrono::Duration::days(2)
+                ).await?;
+            }
             return Ok(serde_json::json!({"source":"existing_asset","storage_key":key}));
         }
     }

@@ -1,102 +1,52 @@
-# VideoRoll 2.0 (Rust) — 独立重写分支
+# VideoRoll 2.0 Rust 重写项目
 
-> **状态：可编译的基础架构，不是已经具备原版完整功能的生产替代品。**
->
-> 此目录只在 `rewrite/rust-v2` 开发。不得直接替换 `/opt/videoroll/current`，不得让新旧 Worker 同时消费同一批可投稿任务。
+当前状态：独立实验分支 rewrite/rust-v2。不能直接替换生产版。
+原版主分支和部署不变，旧 PostgreSQL 表只用于兼容读取、明确的任务与资产同步；新工作流表以 vr2_ 为前缀。
 
-## 整体迁移原则
+## 功能范围
 
-- **原版 PostgreSQL 业务契约保持兼容**：`tasks`、`assets`、`subtitles`、`ingested_videos` 和 `app_settings` 作为过渡读取/登记表。新的工作流、任务、租约、事件、资产登记与垃圾回收只写入 `vr2_*` 表。
-- **后端控制层 Rust**：Axum API、SQLx、Tokio Worker、持久任务、身份认证、文件流、投稿一致性保护。
-- **耗时媒体执行用隔离 Worker**：FFmpeg、yt-dlp、aria2c、Whisper、VoxCPM2、Demucs 和后续模型服务不应运行于 API 的 Tokio 线程中。
-- **Bilibili 等平台不可通过请求超时推断发布失败**：必须先核实外部稿件，恢复路径保留 `unknown` 状态。
-- **不继承垃圾文件扫描即删除的管理方式**：所有 V2 资产必须登记、持引用/保留期限并在可删除时经过数据库 fence。v1 资源不可由 v2 GC 删除。
+| 子系统 | 目前代码支持 | 尚缺生产等价/真实验证 |
+|---|---|---|
+| 核心 | Rust Axum、Tokio、SQLx、Postgres 原子任务创建、去重、租约与 fence | 全部老 API、历史 Hatchet 任务迁移 |
+| 认证 | V1 兼容管理员 Cookie、密码、V2 token、限速 | 全部原版会话/审计和代理场景 |
+| YouTube | yt-dlp 调度、频道/列表 CRUD、来源去重及定时扫描 | aria2 高并发续传、复杂代理与真实来源重试 |
+| 字幕 | Whisper 兼容音频请求、分窗识别、指纹检查点、SRT/ASS、按编号翻译 | 所有原版 ASR、Index-Translate 和 RAG Agent 完整实现 |
+| 视频 | 真正 FFmpeg H264/HEVC/AV1、VAAPI 回退、ASS 烧录 | 复杂原版 RenderSpec、长视频、多 GPU 性能 |
+| 远程渲染 | V1 Windows Worker 协议，单次注册、独立凭证、领取、心跳、日志、Range、fenced 上传与完成 | 真实 Windows/Linux GPU 节点压测和断电恢复 |
+| 配音 | YouDub 独立推理进程桥接，稳定任务 ID 和 V2 P2 归属约束 | 真正 VoxCPM2/Demucs 对齐和音质/时长验收 |
+| 投稿 | Rust B 站 UPOS 分块上传、单次稿件创建、双 P 校验；可选原版投稿兼容层 | 真实账户测试、原生字幕/合集/话题/多平台对齐 |
+| 资源 | 引用登记、延迟清理、故障/取消回收、播控保护、回收锁 | 海量并发、异常重启和 V1 历史目录清理 |
+| 配置与 UI | 版本化设置、队列遥测、V2 独立 React 开发控制台 | 全部原版页面和 API 完全迁移 |
 
-## 模块状态
+## 开发环境与安全
 
-| 范围 | 实际完成状态 |
-|---|---|
-| Rust 项目及工具链 | 完成，Cargo 构建、格式化与基础测试 |
-| 任务数据库与提交 | 已实现独立 Schema、原子接入、来源去重、租约/幂等键、暂停/恢复/取消 |
-| 任务恢复 | 已实现过期租约回收与投稿未知状态封锁；尚缺真实生产故障注入和 Hatchet 数据迁移 |
-| API | 实现 v2 工作流与资产 API，以及 v1 管理员登录 Cookie 的兼容路径；原 v1 页面所需所有路由尚未覆盖 |
-| YouTube 下载 | 已实现 yt-dlp 子进程和已有成品检查；未完成全部 v1 代理/aria2/进度细节 |
-| 资源系统 | 已实现流式上传、单范围下载、SHA256、显式对象引用、fenced GC；尚需真实多 Worker 压力测试 |
-| SRT、ASS | 解析与基础生成；缺原版可读性与 GPU 字幕叠加全部算法等价性 |
-| ASR | 尚未迁移；计划使用独立 AI 推理 Worker |
-| 翻译、RAG Agent、Embedding | 尚未迁移；原版上下文记忆、工具策略、知识库待做契约测试 |
-| GPU 渲染 | 仅建立 Worker Gateway 与交付状态契约；Windows Rust Renderer / ffplayout 尚未与 v2 集成 |
-| YouDub 配音、双 P | 尚未迁移；不能视为端到端可用 |
-| Bilibili/其他平台投稿 | 状态模型与回执校验已实现，真实提交协议尚未迁移，禁止用旧生产账户试运行 |
-| 前端 | 复用原版 React 代码，尚未完成 v2 API 全面适配和 UI 验收 |
+在 rust 目录运行 cargo fmt --check、cargo check --all-targets --locked、cargo test --all --locked、cargo clippy --all-targets --locked -- -D warnings。
+在项目根目录运行 bash rust/scripts/smoke-isolated.sh，测试会创建一次性的回环 PostgreSQL Docker 容器，模拟 ASR 和投稿后端，通过 FFmpeg 真正编码合成视频，并联调完整 Remote Worker HTTP 协议。测试不会执行真正平台投稿。
+V2 API 只监听指定回环端口，必须指定独立 DATABASE_URL、VIDEOROLL_V2_STORAGE_ROOT 和强内部 Token。不会在 API 启动时自动迁移或启动 Worker。
+YouDub 模型必须使用独立 V2 运行目录，不能和原版共享。原生 B 站投稿和旧版投稿兼容适配器都需要专门的显式配置才会启用。
+V2 React 页面只有在 VITE_RUST_V2_UI=true 时出现，生产界面默认没有变化。
+原版 Windows Render Worker 通过单次使用的注册码加入，凭证与执行 token 都只属于 V2，不能访问其他作业的数据。
 
-## 模块目录
+## 关键模块
 
-- `src/domain.rs`：阶段、工作流、资产与状态类型
-- `src/database.rs`：原版业务表兼容与 SQLx
-- `src/scheduler.rs`：持久工作流、CAS/租约、防重、对账、恢复
-- `src/api.rs` / `src/auth.rs`：Axum API 与管理员认证
-- `src/ingest.rs`：YouTube 单视频 URL 与 yt-dlp
-- `src/executor.rs`：阶段执行器和 Gateway 调度
-- `src/assets.rs` / `src/storage.rs`：视频流、对象引用、GC
-- `src/subtitles.rs`：字幕格式
-- `src/publish.rs`：投稿回执与批次状态规则
+- rust/src/api.rs：业务 API
+- rust/src/scheduler.rs：工作流、租约、恢复、UNKNOWN 人工对账
+- rust/src/storage.rs / assets.rs：对象、HTTP 流、延期回收
+- rust/src/media：字幕识别、FFmpeg、本地与外部推理
+- rust/src/remote_render：现有 Windows Render Worker v1 协议
+- rust/src/bilibili.rs / publish.rs / publish_legacy.rs：平台投稿
+- rust/src/sources.rs：频道/列表扫描
+- rust/src/settings.rs / telemetry.rs：动态配置和队列统计
+- rust/migrations：V2 表与权限约束
+- rust/scripts/smoke-isolated.sh：隔离集成验收
 
-## 开发/验收
+## 完整替代前必须通过
 
-使用隔离 Postgres 数据库；示例命令仅在**显式配置的开发数据库**下执行：
+1. 原版业务 API、设置、217 个路由和全部 React 页面及历史任务双向契约。
+2. 所有 ASR Provider、Index-Translate 专用接口、RAG Agent/Embedding/知识库、YouDub 和字幕详细样式。
+3. Windows Render Worker 实体 GPU、ffplayout 播控导入、长视频和中断恢复。
+4. B 站多账号双 P、话题活动、合集、原生字幕、其他 SAU 投稿平台真实验收。
+5. 多 Worker 并发、重启断点、无丢任务、无重复投稿、终态资产可靠回收。
+6. 和旧版只读影子流量比对及完整回滚预案，合格后才能考虑切换。
 
-```bash
-cd rust
-cargo fmt --check
-cargo check --all-targets
-cargo test --all
-```
-
-在 link 上可运行 `bash rust/scripts/smoke-isolated.sh`，脚本使用一次性的本地 Docker PostgreSQL 容器和回环地址，测试结束自动回收，绝不使用 v1 正式数据库。
-
-启动命令支持 `migrate` / `api` / `worker` / `gc`，不会在 API 启动时自动执行迁移，也不会默认启动 Worker。
-
-关键环境变量：
-
-| 环境变量 | 用途 |
-|---|---|
-| `DATABASE_URL` | V2 专用测试数据库；禁止直接接入正式实例 |
-| `VIDEOROLL_V2_BIND` | 回环监听地址；默认 `127.0.0.1:18080` |
-| `VIDEOROLL_V2_STORAGE_ROOT` | V2 隔离文件根目录 |
-| `VIDEOROLL_V2_INTERNAL_TOKEN` | 长度至少 32 的 v2 内部 API Token |
-| `INTERNAL_API_SECRET` | 可选，兼容原版受信任管理员 Cookie |
-| `ADMIN_BOOTSTRAP_SECRET` | 可选，首次创建管理员密码时使用 |
-| `VIDEOROLL_V2_WORKER_GATEWAY` | 独立 Worker Gateway 地址，未设置时字幕、配音、投稿阶段明确失败 |
-| `VIDEOROLL_V2_YT_DLP` | yt-dlp 可执行文件路径 |
-| `VIDEOROLL_V2_WORKERS` | 后台 Worker 数量 |
-
-## 外部 Worker 最小协议
-
-V2 对非下载阶段向 `POST {GATEWAY}/v2/stages/{stage}` 发送：
-
-```json
-{
-  "job_id": "UUID",
-  "workflow_id": "UUID",
-  "task_id": "UUID",
-  "operation_key": "vr2:...",
-  "payload": {}
-}
-```
-
-Gateway 必须鉴权 `x-videoroll-v2-internal-token`，并返回其自己的持久化任务凭据。同步完成可返回 `{"status":"completed","result":{...}}`；异步接受返回 HTTP 202 和 `{"status":"accepted","ticket":"..."}`。异步处理完成后带相同 Ticket 回调 `/api/v2/jobs/{id}/complete`。**收到 202 只代表接受请求，不能当成处理完成**。投稿结果还必须有明确回执 `{"confirmed":true,"external_id":"..."}`。
-
-当前尚不存在上线可用的 Gateway 实现，也没有真实投稿协议，因此不得启动生产 Worker。
-
-## 待完成的生产门槛
-
-1. 完成全部 217 个原 API 路由语义对比与前端兼容测试。
-2. 完成 YouTube 代理与 aria2 的真实下载恢复测试，时间戳、日志与进度保持一致。
-3. 将原版 Python ASR/LLM/YouDub 等实现封装成稳定的媒体 Worker 接口，再逐步替换 Rust 可实现部分。
-4. 衔接原版 Windows Rust Render Worker、ffplayout 与新资产协议。
-5. 完成 Bilibili 原生双 P、字幕上传、分区、话题活动验证、未知投稿人工核实；完成社交平台 SAU。
-6. 使用真实但隔离的媒体测试资源做完整下载→字幕→翻译→渲染→配音→投稿→清理，检查重新启动/中断/重试/资源残留。
-7. 核实长期任务租约、资源竞争和多进程部署负载，再经过只读影子运行后才考虑切换。
-
-**本次没有进行生产迁移或部署，也没有声称完成原版全部功能。**
+本分支仍不满足全部生产等价条件。没有假称完成所有业务，也没有切换生产。

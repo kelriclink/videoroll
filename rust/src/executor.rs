@@ -133,26 +133,92 @@ impl Executor {
                 .await?;
                 Ok(StageOutcome::Completed { result })
             }
+            Stage::Subtitle if self.config.asr_endpoint.is_some() => {
+                let result =
+                    crate::media::asr::process(&self.config, &self.db, &self.registry, item)
+                        .await?;
+                Ok(StageOutcome::Completed { result })
+            }
+            Stage::Render if self.config.remote_renderer_enabled => {
+                let id = crate::remote_render::enqueue(&self.db, &self.registry, item).await?;
+                Ok(StageOutcome::Awaiting {
+                    ticket: id.to_string(),
+                })
+            }
+            Stage::Render => {
+                let result =
+                    crate::media::ffmpeg::render(&self.config, &self.db, &self.registry, item)
+                        .await?;
+                Ok(StageOutcome::Completed { result })
+            }
+            Stage::Dubbing
+                if self.config.youdub_bridge.is_some() && self.config.youdub_python.is_some() =>
+            {
+                let result =
+                    crate::media::dubbing::process(&self.config, &self.db, &self.registry, item)
+                        .await?;
+                if let Some(reason) = result.get("skipped").and_then(serde_json::Value::as_str) {
+                    Ok(StageOutcome::Skipped {
+                        reason: reason.to_string(),
+                    })
+                } else {
+                    Ok(StageOutcome::Completed { result })
+                }
+            }
+            Stage::Publish => {
+                let choice = crate::publish_legacy::read_selection(&self.db, item).await?;
+                if !choice.enabled || choice.platforms.is_empty() {
+                    return Ok(StageOutcome::Skipped {
+                        reason: "automatic publishing has no enabled platform targets".into(),
+                    });
+                }
+                if self.config.native_bilibili_allowed {
+                    let result =
+                        crate::bilibili::publish(&self.config, &self.db, &self.registry, item)
+                            .await?;
+                    Ok(StageOutcome::Completed { result })
+                } else if self.config.legacy_publish_allowed {
+                    let result =
+                        crate::publish_legacy::publish(&self.config, &self.db, item).await?;
+                    if let Some(reason) = result.get("skipped").and_then(serde_json::Value::as_str)
+                    {
+                        Ok(StageOutcome::Skipped {
+                            reason: reason.to_string(),
+                        })
+                    } else {
+                        Ok(StageOutcome::Completed { result })
+                    }
+                } else {
+                    self.remote(item).await
+                }
+            }
             Stage::Cleanup => {
-                // Cleanup is a separate delayed retention workflow: never erase
-                // raw assets on 'accepted' or uncertain platform submissions.
-                let published:Option<Value>=sqlx::query_scalar(
+                let published: Option<Value> = sqlx::query_scalar(
                     "SELECT result FROM vr2_jobs WHERE workflow_id=$1 AND stage='publish' AND state='succeeded' LIMIT 1"
                 ).bind(item.workflow_id).fetch_optional(&self.db.pool).await?.flatten();
-                let confirmed = published.as_ref().is_some_and(|value| {
-                    value.get("confirmed") == Some(&Value::Bool(true))
-                        || value
-                            .get("bvid")
-                            .and_then(Value::as_str)
-                            .is_some_and(|s| !s.is_empty())
-                });
-                if confirmed {
+                if published
+                    .as_ref()
+                    .is_some_and(crate::publish::has_confirmed_result)
+                {
+                    let count = self
+                        .registry
+                        .schedule_terminal_release(
+                            item.task_id,
+                            item.workflow_id,
+                            self.config.cleanup_grace,
+                        )
+                        .await?;
                     Ok(StageOutcome::Completed {
-                        result: json!({"retention":"deferred","reason":"assets remain referenced until explicit retention release"}),
+                        result: json!({
+                            "retention":"scheduled","released_references":count,
+                            "grace_seconds":self.config.cleanup_grace.as_secs()
+                        }),
                     })
                 } else {
                     Ok(StageOutcome::Skipped {
-                        reason: "no confirmed published archive; artifacts are retained".into(),
+                        reason:
+                            "no verified completed publishing batch; retain the video for review"
+                                .into(),
                     })
                 }
             }

@@ -12,6 +12,25 @@ pub struct Config {
     pub secure_cookies: bool,
     pub worker_gateway: Option<String>,
     pub download_binary: PathBuf,
+    pub ffmpeg_binary: PathBuf,
+    pub ffprobe_binary: PathBuf,
+    pub asr_endpoint: Option<String>,
+    pub asr_api_key: Option<String>,
+    pub asr_model: String,
+    pub translate_endpoint: Option<String>,
+    pub translate_api_key: Option<String>,
+    pub translate_model: Option<String>,
+    pub youdub_python: Option<PathBuf>,
+    pub youdub_bridge: Option<PathBuf>,
+    pub youdub_runtime: Option<PathBuf>,
+    pub legacy_orchestrator_url: Option<String>,
+    pub legacy_internal_token: Option<String>,
+    pub legacy_publish_allowed: bool,
+    pub native_bilibili_allowed: bool,
+    pub native_bilibili_cookie: Option<String>,
+    pub native_bilibili_csrf: Option<String>,
+    pub source_scanner_enabled: bool,
+    pub remote_renderer_enabled: bool,
     pub worker_count: usize,
     pub worker_poll: Duration,
     pub job_lease: Duration,
@@ -59,6 +78,56 @@ impl Config {
             download_binary: std::env::var_os("VIDEOROLL_V2_YT_DLP")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("yt-dlp")),
+            ffmpeg_binary: std::env::var_os("VIDEOROLL_V2_FFMPEG")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("ffmpeg")),
+            ffprobe_binary: std::env::var_os("VIDEOROLL_V2_FFPROBE")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("ffprobe")),
+            asr_endpoint: std::env::var("VIDEOROLL_V2_ASR_ENDPOINT")
+                .ok()
+                .filter(|s| !s.is_empty()),
+            asr_api_key: std::env::var("VIDEOROLL_V2_ASR_API_KEY")
+                .ok()
+                .filter(|s| !s.is_empty()),
+            asr_model: std::env::var("VIDEOROLL_V2_ASR_MODEL")
+                .unwrap_or_else(|_| "whisper-large-v3-turbo".into()),
+            translate_endpoint: std::env::var("VIDEOROLL_V2_TRANSLATE_ENDPOINT")
+                .ok()
+                .filter(|s| !s.is_empty()),
+            translate_api_key: std::env::var("VIDEOROLL_V2_TRANSLATE_API_KEY")
+                .ok()
+                .filter(|s| !s.is_empty()),
+            translate_model: std::env::var("VIDEOROLL_V2_TRANSLATE_MODEL")
+                .ok()
+                .filter(|s| !s.is_empty()),
+            youdub_python: std::env::var_os("VIDEOROLL_V2_YOUDUB_PYTHON").map(PathBuf::from),
+            youdub_bridge: std::env::var_os("VIDEOROLL_V2_YOUDUB_BRIDGE").map(PathBuf::from),
+            youdub_runtime: std::env::var_os("VIDEOROLL_V2_YOUDUB_RUNTIME").map(PathBuf::from),
+            legacy_orchestrator_url: std::env::var("VIDEOROLL_V2_LEGACY_ORCHESTRATOR_URL")
+                .ok()
+                .filter(|s| !s.is_empty()),
+            legacy_internal_token: std::env::var("VIDEOROLL_V2_LEGACY_INTERNAL_TOKEN")
+                .ok()
+                .filter(|s| !s.is_empty()),
+            legacy_publish_allowed: std::env::var("VIDEOROLL_V2_ENABLE_LEGACY_PUBLISH")
+                .ok()
+                .as_deref()
+                == Some("true"),
+            native_bilibili_allowed: std::env::var("VIDEOROLL_V2_ENABLE_NATIVE_BILIBILI")
+                .ok()
+                .as_deref()
+                == Some("true"),
+            native_bilibili_cookie: std::env::var("VIDEOROLL_V2_BILIBILI_COOKIE")
+                .ok()
+                .filter(|s| !s.is_empty()),
+            native_bilibili_csrf: std::env::var("VIDEOROLL_V2_BILIBILI_CSRF")
+                .ok()
+                .filter(|s| !s.is_empty()),
+            source_scanner_enabled: std::env::var("VIDEOROLL_V2_SOURCE_SCANNER").ok().as_deref()
+                == Some("true"),
+            remote_renderer_enabled: std::env::var("VIDEOROLL_V2_REMOTE_RENDER").ok().as_deref()
+                == Some("true"),
             worker_count,
             worker_poll: Duration::from_secs(3),
             job_lease: Duration::from_secs(180),
