@@ -33,3 +33,7 @@ videoroll-prod-bundle-*.tar.sha256
 videoroll-deploy-*/
 videoroll-prod-deploy-*/
 docker_exports/
+
+# Rust v2 local toolchain and compilation output
+.toolchains/
+rust/target/
