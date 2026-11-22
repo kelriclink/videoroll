@@ -217,6 +217,147 @@ function JobTimeline({ workflowId, onChanged }: { workflowId: string; onChanged:
   );
 }
 
+type NativeSubtitleState = "pending" | "running" | "submitting" | "retry" | "unknown" | "submitted" | "failed";
+type NativeSubtitleRecord = {
+  publish_job_id: string;
+  task_id: string;
+  aid: number;
+  bvid: string;
+  state: NativeSubtitleState;
+  expected_parts: number;
+  submitted: Record<string, { cid: number; lan: string; location?: string; reconciled?: boolean }>;
+  attempts: number;
+  next_attempt_at: string;
+  inflight_cid: number | null;
+  last_error: string | null;
+};
+const NATIVE_SUBTITLE_STATUS: Record<NativeSubtitleState, string> = {
+  pending: "待同步",
+  running: "正在准备",
+  submitting: "正在提交",
+  retry: "稍后重试",
+  unknown: "提交结果待核实",
+  submitted: "已提交字幕草稿",
+  failed: "同步失败",
+};
+
+function NativeSubtitlePanel({ connected }: { connected: boolean }) {
+  const [rows, setRows] = useState<NativeSubtitleRecord[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [issue, setIssue] = useState<string | null>(null);
+  const [checking, setChecking] = useState<string | null>(null);
+  const [submitted, setSubmitted] = useState(false);
+  const [evidence, setEvidence] = useState("");
+  const [saving, setSaving] = useState(false);
+  const refresh = useCallback(async () => {
+    if (!connected) return;
+    try {
+      const result = await api<NativeSubtitleRecord[]>("/bilibili/subtitles?limit=60");
+      setRows(result);
+      setIssue(null);
+    } catch (error) {
+      setIssue(error instanceof Error ? error.message : String(error));
+    }
+  }, [connected]);
+  useEffect(() => {
+    void refresh();
+    if (!connected) return;
+    const timer = window.setInterval(() => { void refresh(); }, 15_000);
+    return () => window.clearInterval(timer);
+  }, [connected, refresh]);
+  const review = async (row: NativeSubtitleRecord) => {
+    if (row.inflight_cid == null || evidence.trim().length < 12) {
+      setIssue("必须填写至少 12 字符的核实证据，并确认视频分 P 的 CID。");
+      return;
+    }
+    const description = submitted ? "B站后台确实存在该字幕草稿" : "B站后台确认该字幕草稿不存在";
+    if (!window.confirm("已经人工核实：" + description + "？系统将据此继续执行，请勿猜测。")) return;
+    setSaving(true);
+    try {
+      await api("/bilibili/subtitles/" + row.publish_job_id + "/resolve", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          cid: row.inflight_cid,
+          submitted,
+          evidence: evidence.trim(),
+        }),
+      });
+      setChecking(null);
+      setSubmitted(false);
+      setEvidence("");
+      await refresh();
+    } catch (error) {
+      setIssue(error instanceof Error ? error.message : String(error));
+    } finally {
+      setSaving(false);
+    }
+  };
+  return (
+    <section className="rounded-xl border border-slate-200 p-4 dark:border-slate-800">
+      <div className="mb-3 flex items-center justify-between gap-2">
+        <h2 className="font-semibold">B站原生字幕同步（独立于投稿）</h2>
+        <Button onClick={() => { setLoading(true); void refresh().finally(() => setLoading(false)); }} disabled={!connected || loading}>
+          {loading ? "刷新中" : "刷新"}
+        </Button>
+      </div>
+      <p className="mb-3 text-xs text-slate-500">
+        已发布稿件不会因字幕同步失败而被撤销。遇到结果不明的草稿时，系统不会自动重复投稿字幕。
+        核实的是字幕草稿，不是视频稿件是否发布。
+      </p>
+      {issue && <InlineNotice tone="danger">{issue}</InlineNotice>}
+      {!rows.length && <p className="text-sm text-slate-500">没有待同步或历史字幕任务。</p>}
+      <div className="space-y-2">
+        {rows.map((row) => (
+          <div key={row.publish_job_id} className="rounded-lg border border-slate-200 p-3 text-xs dark:border-slate-700">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <a href={"https://www.bilibili.com/video/" + encodeURIComponent(row.bvid)} target="_blank" rel="noreferrer"
+                className="font-medium text-sky-700 hover:underline dark:text-sky-300">{row.bvid}</a>
+              <span className={row.state === "unknown" ? "font-semibold text-orange-700" :
+                row.state === "failed" ? "font-semibold text-red-600" : "text-slate-600 dark:text-slate-300"}>
+                {NATIVE_SUBTITLE_STATUS[row.state] || row.state}
+              </span>
+            </div>
+            <div className="mt-2 flex flex-wrap gap-x-5 gap-y-1 text-slate-500">
+              <span>稿件 aid：{row.aid}</span>
+              <span>应有分 P：{row.expected_parts}</span>
+              <span>已提交分 P：{Object.keys(row.submitted || {}).length}</span>
+              <span>执行次数：{row.attempts}</span>
+              {row.state === "retry" && <span>下次重试：{formatTime(row.next_attempt_at)}</span>}
+            </div>
+            {row.last_error && <p className="mt-2 break-words text-red-600">{row.last_error}</p>}
+            {row.state === "unknown" && row.inflight_cid != null && (
+              <button type="button" className="mt-2 rounded border border-orange-300 px-2 py-1 text-orange-800"
+                onClick={() => { setChecking(row.publish_job_id); setEvidence(""); setSubmitted(false); }}>
+                人工核实 CID {row.inflight_cid} 字幕草稿
+              </button>
+            )}
+            {checking === row.publish_job_id && (
+              <div className="mt-3 space-y-2 rounded border border-orange-200 p-3 dark:border-orange-900">
+                <p>请先登录 B站创作中心，检查 aid {row.aid} / cid {row.inflight_cid} 的中文字幕草稿。</p>
+                <label className="flex items-center gap-2">
+                  <input type="checkbox" checked={submitted} onChange={(e) => setSubmitted(e.target.checked)} />
+                  已确认草稿存在（不勾选代表确认草稿不存在）
+                </label>
+                <textarea value={evidence} onChange={(e) => setEvidence(e.target.value)}
+                  placeholder="请输入核对时间、位置及证据；不少于 12 字符" rows={2}
+                  className="w-full rounded border px-3 py-2 dark:bg-slate-900" />
+                <div className="flex gap-2">
+                  <button type="button" disabled={saving || evidence.trim().length < 12}
+                    onClick={() => void review(row)} className="rounded bg-slate-900 px-3 py-2 text-white disabled:opacity-50">
+                    保存核实结论
+                  </button>
+                  <button type="button" onClick={() => setChecking(null)} className="rounded border px-3 py-2">取消</button>
+                </div>
+              </div>
+            )}
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+
 export default function RustV2Page() {
   const [snapshot, setSnapshot] = useState<QueueSnapshot | null>(null);
   const [tasks, setTasks] = useState<Task[]>([]);
@@ -367,6 +508,7 @@ export default function RustV2Page() {
           </div>
         )}
       </section>
+      <NativeSubtitlePanel connected={connected} />
       <section className="rounded-xl border border-slate-200 p-4 dark:border-slate-800">
         <h2 className="mb-3 font-semibold">YouTube 来源扫描</h2>
         {sources.length===0 ? <p className="text-sm text-slate-500">还没有录入频道或播放列表</p> : sources.map((source) => (

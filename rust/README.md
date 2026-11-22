@@ -51,6 +51,14 @@ V2 React 页面只有在 VITE_RUST_V2_UI=true 时出现，生产界面默认没�
 
 本分支仍不满足全部生产等价条件。没有假称完成所有业务，也没有切换生产。
 
+## Rust 原生 B 站字幕同步
+
+- Rust Native Subtitles 使用持久化任务同步已成功投稿的 Simplified Chinese SRT（B 站 language=zh）。
+- 每个 cid 保存独立完成记录；如果 preSave 请求结果未知，则必须人工核实，不能重复提交。
+- 不影响已成功投稿的稿件。上限 8 次准备阶段重试，最多七天的字幕源文件引用。
+- 开启原生投稿必须显式设置 VIDEOROLL_V2_ENABLE_NATIVE_BILIBILI=true；原生字幕默认开启，可由 VIDEOROLL_V2_BILIBILI_SUBTITLES=false 关闭。
+- 仅本机隔离测试允许配置 VIDEOROLL_V2_BILIBILI_API_BASE=http://127.0.0.1:18084，真实账号需独立验收。
+
 ## 新增的 RAG / Index / 播控与迁移桥
 
 - rust/src/media/index_translate.rs：独立官方 Index-Translate 请求与字幕 idx 缺行修复，无需泛 OpenAI 路由伪装。

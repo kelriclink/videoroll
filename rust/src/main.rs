@@ -26,6 +26,9 @@ enum Command {
     Api,
     /// Start durable workflow workers. Requires a separate testing database.
     Worker,
+    /// Process at most one native Bilibili subtitle draft (outbox remains
+    /// independent of the irreversible archive submission).
+    SubtitlesTick,
     /// Process expired, unreferenced v2 artifacts. Never touches v1-only assets.
     Gc {
         #[arg(long, default_value_t = 50)]
@@ -83,6 +86,29 @@ async fn main() -> anyhow::Result<()> {
                     }
                 });
             }
+            if config.native_bilibili_allowed && config.native_bilibili_subtitles {
+                let subtitles_config = config.clone();
+                let subtitles_db = db.clone();
+                let subtitles_storage = storage.clone();
+                tokio::spawn(async move {
+                    let mut tick = tokio::time::interval(std::time::Duration::from_secs(45));
+                    loop {
+                        tick.tick().await;
+                        match videoroll_v2::bili_subtitles::tick(
+                            &subtitles_config,
+                            &subtitles_db,
+                            &subtitles_storage,
+                        )
+                        .await
+                        {
+                            Ok(true) => tracing::debug!("native Bilibili subtitle task processed"),
+                            Ok(false) => {}
+                            Err(error) => tracing::warn!(error=%error,
+                                "native Bilibili subtitle sync unavailable (publish unaffected)"),
+                        }
+                    }
+                });
+            }
             let executor = Executor::new(config.clone(), db.clone(), scheduler, storage);
             let mut workers = tokio::task::JoinSet::new();
             workers.spawn(async move {
@@ -111,6 +137,11 @@ async fn main() -> anyhow::Result<()> {
             while let Some(result) = workers.join_next().await {
                 result?;
             }
+        }
+        Command::SubtitlesTick => {
+            let storage = AssetRegistry::new(db.clone(), config.storage_root.clone());
+            let processed = videoroll_v2::bili_subtitles::tick(&config, &db, &storage).await?;
+            tracing::info!(processed, "native subtitle sync tick finished");
         }
         Command::Gc { limit } => {
             let registry = AssetRegistry::new(db, config.storage_root.clone());

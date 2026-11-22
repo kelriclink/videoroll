@@ -42,6 +42,8 @@ async fn async_job_futures_fit_default_tokio_worker_stack() {
         native_bilibili_allowed: false,
         native_bilibili_cookie: None,
         native_bilibili_csrf: None,
+        native_bilibili_api_base: None,
+        native_bilibili_subtitles: true,
         source_scanner_enabled: false,
         remote_renderer_enabled: false,
         compat_orchestrator_url: None,

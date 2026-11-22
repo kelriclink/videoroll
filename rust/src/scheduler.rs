@@ -378,6 +378,10 @@ impl Scheduler {
                     "publish completion requires a verified receipt".into(),
                 ));
             }
+            // Subtitle drafts are reconciled from confirmed publish receipts by
+            // the independent outbox worker. NEVER execute subtitle SQL inside
+            // the publication settlement transaction: a failed PostgreSQL
+            // statement would poison it and obscure a successful upload.
             sqlx::query("UPDATE tasks SET status='PUBLISHED'::task_status,error_code=NULL,error_message=NULL,updated_at=now() WHERE id=$1 AND status <> 'CANCELED'::task_status")
                 .bind(item.task_id).execute(&mut **tx).await?;
         }

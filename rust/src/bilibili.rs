@@ -531,7 +531,8 @@ impl BilibiliClient {
                 )
             })?;
         Ok(json!({
-            "confirmed":true,"external_id":bvid,"bvid":bvid,
+            "confirmed":true,"native_bilibili":true,
+            "external_id":bvid,"bvid":bvid,
             "aid":value.pointer("/data/aid"),"parts":parts.len(),
         }))
     }

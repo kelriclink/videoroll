@@ -14,10 +14,12 @@ worker_pid=""
 legacy_pid=""
 gateway_pid=""
 ai_pid=""
+bili_pid=""
 cleanup() {
   if [[ -n "$worker_pid" ]]; then kill "$worker_pid" 2>/dev/null || true; wait "$worker_pid" 2>/dev/null || true; fi
   if [[ -n "$legacy_pid" ]]; then kill "$legacy_pid" 2>/dev/null || true; wait "$legacy_pid" 2>/dev/null || true; fi
   if [[ -n "$ai_pid" ]]; then kill "$ai_pid" 2>/dev/null || true; wait "$ai_pid" 2>/dev/null || true; fi
+  if [[ -n "$bili_pid" ]]; then kill "$bili_pid" 2>/dev/null || true; wait "$bili_pid" 2>/dev/null || true; fi
   if [[ -n "$gateway_pid" ]]; then kill "$gateway_pid" 2>/dev/null || true; wait "$gateway_pid" 2>/dev/null || true; fi
   if [[ -n "$api_pid" ]]; then kill "$api_pid" 2>/dev/null || true; wait "$api_pid" 2>/dev/null || true; fi
   docker rm -f "$container_name" >/dev/null 2>&1 || true
@@ -48,6 +50,8 @@ mkdir -p "$VIDEOROLL_V2_PLAYOUT_ROOT"
 python3 "$repo_root/rust/tests/mock_legacy_api.py" > "$repo_root/rust/target/v2-mock-legacy.log" 2>&1 &
 legacy_pid=$!
 mkdir -p "$VIDEOROLL_V2_STORAGE_ROOT"
+python3 "$repo_root/rust/tests/mock_bilibili_subtitles.py" > "$repo_root/rust/target/v2-bili-subs-mock.log" 2>&1 &
+bili_pid=$!
 cd rust
 "$CARGO_HOME/bin/cargo" build --quiet
 ./target/debug/videoroll-v2 migrate
@@ -347,6 +351,69 @@ assert fields[3].startswith("v2/sub/"),fields
 assert fields[4]==os.environ["DUB_VIDEO"],fields
 PYDUB
 echo 'PASS: YouDub isolated adapter, deterministic model job, verified P2 video association'
+
+# Post-publication native subtitle outbox (test-only confirmed receipts).
+docker exec "$container_name" psql -v ON_ERROR_STOP=1 -U postgres -d videoroll_test -c   "UPDATE vr2_jobs SET result=COALESCE(result,'{}'::jsonb)||jsonb_build_object('native_bilibili',true,'aid',101,'bvid','BV1mockNativeTest','parts',1) WHERE task_id='$asr_task_id' AND stage='publish' AND state='succeeded'; UPDATE vr2_jobs SET result=COALESCE(result,'{}'::jsonb)||jsonb_build_object('native_bilibili',true,'aid',102,'bvid','BV1mockNativeTest','parts',1) WHERE task_id='$index_task_id' AND stage='publish' AND state='succeeded'; UPDATE vr2_jobs SET result=COALESCE(result,'{}'::jsonb)||jsonb_build_object('native_bilibili',true,'aid',103,'bvid','BV1mockNativeTest','parts',2) WHERE task_id='$dubbing_task_id' AND stage='publish' AND state='succeeded'" >/dev/null
+bili_sync_env=(
+  "VIDEOROLL_V2_ENABLE_NATIVE_BILIBILI=true"
+  "VIDEOROLL_V2_BILIBILI_SUBTITLES=true"
+  "VIDEOROLL_V2_BILIBILI_COOKIE=SESSDATA=video-roll-test; bili_jct=1234567890123456"
+  "VIDEOROLL_V2_BILIBILI_CSRF=1234567890123456"
+  "VIDEOROLL_V2_BILIBILI_API_BASE=http://127.0.0.1:18084"
+)
+env "${bili_sync_env[@]}" ./target/debug/videoroll-v2 subtitles-tick >/dev/null
+env "${bili_sync_env[@]}" ./target/debug/videoroll-v2 subtitles-tick >/dev/null
+env "${bili_sync_env[@]}" ./target/debug/videoroll-v2 subtitles-tick >/dev/null
+asr_publish_id="$(docker exec "$container_name" psql -At -U postgres -d videoroll_test -c   "SELECT id FROM vr2_jobs WHERE task_id='$asr_task_id' AND stage='publish'")"
+index_publish_id="$(docker exec "$container_name" psql -At -U postgres -d videoroll_test -c   "SELECT id FROM vr2_jobs WHERE task_id='$index_task_id' AND stage='publish'")"
+double_publish_id="$(docker exec "$container_name" psql -At -U postgres -d videoroll_test -c   "SELECT id FROM vr2_jobs WHERE task_id='$dubbing_task_id' AND stage='publish'")"
+bili_double="$(curl --silent --fail-with-body "${hdr[@]}" "http://127.0.0.1:18080/api/v2/bilibili/subtitles/$double_publish_id")"
+bili_ok="$(curl --silent --fail-with-body "${hdr[@]}" "http://127.0.0.1:18080/api/v2/bilibili/subtitles/$asr_publish_id")"
+bili_unknown="$(curl --silent --fail-with-body "${hdr[@]}" "http://127.0.0.1:18080/api/v2/bilibili/subtitles/$index_publish_id")"
+BILI_OK="$bili_ok" BILI_UNKNOWN="$bili_unknown" BILI_DOUBLE="$bili_double" python3 - <<'PYBILI'
+import json,os
+ok=json.loads(os.environ["BILI_OK"])
+unknown=json.loads(os.environ["BILI_UNKNOWN"])
+double=json.loads(os.environ["BILI_DOUBLE"])
+assert double["state"]=="submitted" and len(double["submitted"])==2,double
+assert ok["state"]=="submitted" and len(ok["submitted"])==1,ok
+assert ok["source_checksum"] and len(ok["source_checksum"])==64,ok
+assert unknown["state"]=="unknown" and unknown["inflight_cid"]==202,unknown
+PYBILI
+# A tick must not create another native draft while the status is uncertain.
+env "${bili_sync_env[@]}" ./target/debug/videoroll-v2 subtitles-tick >/dev/null
+count="$(curl --silent --fail-with-body http://127.0.0.1:18084/__test_state)"
+COUNT="$count" python3 - <<'PYCOUNT'
+import json,os
+counts=json.loads(os.environ["COUNT"])
+assert counts["presave_101"]==1 and counts["presave_102"]==1,counts
+assert counts["presave_103_203"]==1 and counts["presave_103_204"]==1,counts
+PYCOUNT
+# Even an expired SRT must survive GC while its uncertain subtitle submission
+# holds an independent reference, regardless of the video's published state.
+docker exec "$container_name" psql -v ON_ERROR_STOP=1 -U postgres -d videoroll_test -c   "UPDATE vr2_objects SET retain_until=now()-interval '1 minute' WHERE storage_key='$index_srt'" >/dev/null
+./target/debug/videoroll-v2 gc --limit 100 >/dev/null
+test -s "$VIDEOROLL_V2_STORAGE_ROOT/$index_srt"
+curl --silent --fail-with-body "${hdr[@]}"   -d '{"cid":202,"submitted":true,"evidence":"Mock creator studio confirms the draft was accepted"}'   "http://127.0.0.1:18080/api/v2/bilibili/subtitles/$index_publish_id/resolve"   | grep -q '"reconciled":true'
+env "${bili_sync_env[@]}" ./target/debug/videoroll-v2 subtitles-tick >/dev/null
+resolved="$(curl --silent --fail-with-body "${hdr[@]}" "http://127.0.0.1:18080/api/v2/bilibili/subtitles/$index_publish_id")"
+RESOLVED="$resolved" python3 - <<'PYRESOLVE'
+import json,os
+row=json.loads(os.environ["RESOLVED"])
+assert row["state"]=="submitted",row
+assert list(row["submitted"].values())[0]["reconciled"],row
+PYRESOLVE
+count="$(curl --silent --fail-with-body http://127.0.0.1:18084/__test_state)"
+COUNT="$count" python3 - <<'PYCOUNT'
+import json,os
+counts=json.loads(os.environ["COUNT"])
+assert counts["presave_101"]==1 and counts["presave_102"]==1,counts
+assert counts["presave_103_203"]==1 and counts["presave_103_204"]==1,counts
+PYCOUNT
+held="$(docker exec "$container_name" psql -At -U postgres -d videoroll_test -c   "SELECT count(*) FROM vr2_object_refs WHERE owner_type='bilibili_subtitle' AND owner_id IN ('$asr_publish_id','$index_publish_id','$double_publish_id')")"
+test "$held" = 0
+echo 'PASS: Bilibili native subtitles, per-CID retry fencing, unknown reconciliation and SRT resource release'
+
 
 
 

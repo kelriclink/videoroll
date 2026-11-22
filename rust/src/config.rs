@@ -29,6 +29,8 @@ pub struct Config {
     pub native_bilibili_allowed: bool,
     pub native_bilibili_cookie: Option<String>,
     pub native_bilibili_csrf: Option<String>,
+    pub native_bilibili_api_base: Option<String>,
+    pub native_bilibili_subtitles: bool,
     pub source_scanner_enabled: bool,
     pub remote_renderer_enabled: bool,
     pub embedding_endpoint: Option<String>,
@@ -131,6 +133,15 @@ impl Config {
             native_bilibili_csrf: std::env::var("VIDEOROLL_V2_BILIBILI_CSRF")
                 .ok()
                 .filter(|s| !s.is_empty()),
+            native_bilibili_api_base: std::env::var("VIDEOROLL_V2_BILIBILI_API_BASE")
+                .ok()
+                .filter(|s| !s.is_empty()),
+            native_bilibili_subtitles: !matches!(
+                std::env::var("VIDEOROLL_V2_BILIBILI_SUBTITLES")
+                    .ok()
+                    .as_deref(),
+                Some("false" | "0")
+            ),
             source_scanner_enabled: std::env::var("VIDEOROLL_V2_SOURCE_SCANNER").ok().as_deref()
                 == Some("true"),
             remote_renderer_enabled: std::env::var("VIDEOROLL_V2_REMOTE_RENDER").ok().as_deref()

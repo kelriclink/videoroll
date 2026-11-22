@@ -4,6 +4,7 @@ pub mod agent;
 pub mod api;
 pub mod assets;
 pub mod auth;
+pub mod bili_subtitles;
 pub mod bilibili;
 pub mod compat;
 pub mod config;

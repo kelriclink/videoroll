@@ -334,6 +334,7 @@ pub fn router(state: AppState) -> Router {
         .merge(crate::telemetry::router())
         .merge(crate::rag::router())
         .merge(crate::playout::router())
+        .merge(crate::bili_subtitles::router())
         .merge(crate::settings::router())
         .merge(crate::remote_render::admin_router())
         .route("/tasks", get(list_tasks))
