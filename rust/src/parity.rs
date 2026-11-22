@@ -37,6 +37,13 @@ const V1_ADAPTERS: &[(&str, &str)] = &[
     ("POST", "/tasks/{task_id}/actions/resume"),
     ("POST", "/tasks/actions/stop_all"),
     ("POST", "/tasks/actions/resume_stopped"),
+    ("GET", "/tasks/{task_id}/publish_meta"),
+    ("PUT", "/tasks/{task_id}/publish_meta"),
+    ("GET", "/tasks/{task_id}/publish_meta/draft"),
+    ("POST", "/tasks/{task_id}/publish_meta/draft"),
+    ("GET", "/tasks/{task_id}/youtube_meta"),
+    ("POST", "/tasks/{task_id}/actions/youtube_meta"),
+    ("GET", "/tasks/{task_id}/youtube_download_progress"),
 ];
 
 fn from_sources() -> AppResult<(Value, Value)> {
@@ -119,7 +126,7 @@ mod tests {
         let value = report().unwrap();
         assert_eq!(value["all_features_migrated"], false);
         assert!(value["legacy_route_declarations"].as_u64().unwrap() >= 217);
-        assert_eq!(value["native_v1_adapters"], 24);
+        assert_eq!(value["native_v1_adapters"], 31);
         assert_eq!(value["fully_verified_legacy_routes"], 0);
         assert!(value["frontend_url_references"].as_u64().unwrap() >= 190);
         assert!(is_adapter("GET", "/tasks/{task_id}"));

@@ -42,12 +42,15 @@ SELECT t.id,t.source_type::text AS source_type,t.source_url,
   t.priority,t.created_by,
   COALESCE(
     NULLIF(trim(title.value_json->>'translated_title'),''),
-    NULLIF(trim(title.value_json->>'source_title'),'')
+    NULLIF(trim(title.value_json->>'source_title'),''),
+    NULLIF(trim(vtitle.translated_title),''),
+    NULLIF(trim(vtitle.source_title),'')
   ) AS display_title,
   t.error_code,t.error_message,t.retry_count,NULL::jsonb AS bilibili_upload,
   t.created_at,t.updated_at
 FROM tasks t
 LEFT JOIN app_settings title ON title.key=('task.title.'||t.id::text)
+LEFT JOIN vr2_task_titles vtitle ON vtitle.task_id=t.id
 WHERE (EXISTS(SELECT 1 FROM vr2_workflows v WHERE v.task_id=t.id)
     OR EXISTS(SELECT 1 FROM vr2_managed_tasks m WHERE m.task_id=t.id))
 "#;
@@ -617,6 +620,8 @@ async fn health() -> Json<Value> {
 
 pub fn router() -> Router<AppState> {
     Router::new()
+        .merge(crate::publish_meta::router())
+        .merge(crate::youtube_meta::router())
         .merge(crate::system_resources::router())
         .route("/health", get(health))
         .route("/tasks", get(list_tasks).post(create_task))

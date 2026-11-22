@@ -78,3 +78,9 @@ V2 React 页面只有在 VITE_RUST_V2_UI=true 时出现，生产界面默认没�
 - 本地任务由 POST /api/v1/tasks 和 POST /api/v1/tasks/{id}/upload/video 创建并流式传输；YouTube 手动与自动入口分别为 /api/v1/youtube/ingest 和 /api/v1/auto/youtube。
 - POST /api/v1/tasks/{id}/actions/stop 与 /resume 使用 Postgres 状态事务保留原任务状态，外部结果不确定的投稿不能自动重发。
 - 还有大量原版 API 和对应页面操作未迁移，**完整转 Rust 仍未完成**。生产原版必须保留。
+
+### 原版投稿草稿及 YouTube 元数据（隔离版）
+
+- 原版投稿页 GET/POST /api/v1/tasks/{id}/publish_meta/draft 与 GET/PUT /api/v1/tasks/{id}/publish_meta 会将编辑内容持久化到独立 vr2_publish_meta，实际原生投稿优先读取此处。
+- 原版任务页 GET /api/v1/tasks/{id}/youtube_meta 与 POST /api/v1/tasks/{id}/actions/youtube_meta 使用外部 yt-dlp 提取；需在运行环境提供该程序。原生 GET .../youtube_download_progress 提供可信作业状态，但未提供下载期间的细粒度带宽信息。
+- 这些入口不代表全部原版 API、AI 审核、活动核验及前端完整功能已完成；生产 Rust 替换仍不允许。

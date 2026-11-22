@@ -44,3 +44,14 @@
 - 未实现的功能返回明确 404/错误，不会偷偷转发给旧 Python 写入 API。
 - 隔离 Postgres+FFmpeg 验收包括任务建立、multipart 流式上传、源类型/资产归属、重试恢复、Range 读取及 YouTube 入库。
 - **生产门槛未达到：真实多平台投稿、原版高级工作流和大量独立服务 API、完整前端交互仍未通过契约验收。**
+
+## 2026-11-22：投稿元数据与 YouTube 元数据原生迁移（第二批）
+
+- 原版 React 投稿编辑器的 GET/PUT /api/v1/tasks/{task_id}/publish_meta、GET/POST .../publish_meta/draft 已改由 Rust 原生实现，没有 Python 兼容代理。
+- Postgres vr2_publish_meta 保存投稿信息、SHA-256 与修订版本；仅 V2 所有任务可编辑，投稿作业产生后及结果未知时禁止改稿。
+- 原生 B 站提交读取已保存的标题、分区、标签、转载来源、话题、活动及支持的高级 Web 字段。额外字段白名单以外明确拒绝，不允许悄悄忽略。
+- topic_id、mission_id 只做正整数结构校验，尚未接入 B 站活动报名资格核实，不能认定为已认证活动。
+- 草稿模式 default/source/auto 已接入。源元数据来自真实 yt-dlp 元数据缓存。不自动杜撰分区，也不假装完成 AI 标题翻译或 AI 分类。
+- 原生 GET /api/v1/tasks/{task_id}/youtube_meta、POST .../actions/youtube_meta 使用维护中的 yt-dlp 单视频 JSON 提取能力（独立进程、输出上限、ID 校验及超时）。原始 JSON、校验和及任务标题记录进入 V2 独立资产存储。
+- GET .../youtube_download_progress 读取真实 V2 下载作业状态和已登记文件大小。正在下载阶段尚未提供细粒度字节数、速度和 ETA；不能把这种兼容接口等同于实时下载进度已全面迁移。
+- 原版 YouTube proxy、cookies、aria2c 并发配置和实时进度、完整 AI 审稿、其他高级页面功能仍未迁移。审计新增 7 个原生兼容入口（总计 31），不代表 31 个完整功能均达到等价。

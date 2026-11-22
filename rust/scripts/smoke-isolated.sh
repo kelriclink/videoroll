@@ -124,6 +124,70 @@ PYV1TASK
 legacy_unknown="$(curl --silent -o /dev/null -w '%{http_code}' "${hdr[@]}" http://127.0.0.1:18080/api/v1/some-not-migrated-route)"
 test "$legacy_unknown" = 404
 echo 'PASS: native V1 TaskRead/list, auth boundaries and no silent fallback to Python'
+
+# Extract and cache genuine yt-dlp-compatible metadata for an owned task.
+missing_meta="$(curl --silent -o /dev/null -w '%{http_code}' "${hdr[@]}"  "http://127.0.0.1:18080/api/v1/tasks/$v1_id/youtube_meta")"
+test "$missing_meta" = 404
+initial_progress="$(curl --silent --fail-with-body "${hdr[@]}"  "http://127.0.0.1:18080/api/v1/tasks/$v1_id/youtube_download_progress")"
+YT_PROGRESS="$initial_progress" python3 - <<'PYTPROGRESS'
+import json,os
+v=json.loads(os.environ["YT_PROGRESS"])
+assert v["status"]=="queued" and not v["active"] and v["progress"]==0,v
+PYTPROGRESS
+fetched_yt="$(curl --silent --fail-with-body "${hdr[@]}" -X POST  "http://127.0.0.1:18080/api/v1/tasks/$v1_id/actions/youtube_meta")"
+FETCHED_YT="$fetched_yt" python3 - <<'PYFETCHEDYT'
+import json,os
+v=json.loads(os.environ["FETCHED_YT"])
+assert v["metadata"]["title"]=="English title of test",v
+assert v["metadata"]["duration"]==23,v
+asset=v["metadata_asset"]
+assert asset["kind"]=="metadata_json" and asset["storage_key"].startswith("v2/"),v
+assert len(asset["sha256"])==64,v
+PYFETCHEDYT
+cached_yt="$(curl --silent --fail-with-body "${hdr[@]}"  "http://127.0.0.1:18080/api/v1/tasks/$v1_id/youtube_meta")"
+CACHED_YT="$cached_yt" python3 - <<'PYCACHEDYT'
+import json,os
+v=json.loads(os.environ["CACHED_YT"])
+assert v["uploader"]=="Test Channel" and v["description"]=="A synthetic tech explainer",v
+PYCACHEDYT
+echo 'PASS: original YouTube metadata read/fetch contract and V2 durable asset'
+
+display_task="$(curl --silent --fail-with-body "${hdr[@]}" "http://127.0.0.1:18080/api/v1/tasks/$v1_id")"
+DISPLAY_TASK="$display_task" python3 - <<'PYDISPLAYTASK'
+import json,os
+v=json.loads(os.environ["DISPLAY_TASK"])
+assert v["display_title"]=="English title of test",v
+PYDISPLAYTASK
+
+
+draft="$(curl --silent --fail-with-body "${hdr[@]}"  -d '{"mode":"source","meta":{"typeid":21}}'  "http://127.0.0.1:18080/api/v1/tasks/$v1_id/publish_meta/draft")"
+DRAFT="$draft" python3 - <<'PYDRAFT'
+import os,json
+m=json.loads(os.environ["DRAFT"])["meta"]
+assert m["typeid"]==21 and m["title"]=="English title of test",m
+assert m["source"]=="https://www.youtube.com/watch?v=0123456789A",m
+assert m["copyright"]==2 and m["tags"]==["视频分享"],m
+PYDRAFT
+save_payload="$(DRAFT="$draft" python3 -c 'import os,json;print(json.dumps(json.loads(os.environ["DRAFT"])["meta"],ensure_ascii=False))')"
+save_receipt="$(curl --silent --fail-with-body "${hdr[@]}" -X PUT -d "$save_payload"  "http://127.0.0.1:18080/api/v1/tasks/$v1_id/publish_meta")"
+SAVE_RECEIPT="$save_receipt" python3 - <<'PYSAVE'
+import os,json
+r=json.loads(os.environ["SAVE_RECEIPT"])
+assert r["stored"] and r["key"].startswith("db:vr2_publish_meta:"),r
+assert r["meta"]["tags"]==["视频分享"],r
+PYSAVE
+saved_meta="$(curl --silent --fail-with-body "${hdr[@]}"  "http://127.0.0.1:18080/api/v1/tasks/$v1_id/publish_meta")"
+SAVED_META="$saved_meta" SAVE_RECEIPT="$save_receipt" python3 - <<'PYREADMETA'
+import os,json
+assert json.loads(os.environ["SAVED_META"])==json.loads(os.environ["SAVE_RECEIPT"])["meta"]
+PYREADMETA
+invalid_meta="$(curl --silent -o /dev/null -w '%{http_code}' "${hdr[@]}" -X PUT  -d '{"title":"invalid","typeid":21,"tags":["tag"],"copyright":2,"topic_id":0}'  "http://127.0.0.1:18080/api/v1/tasks/$v1_id/publish_meta")"
+test "$invalid_meta" = 400
+revision="$(docker exec "$container_name" psql -At -U postgres -d videoroll_test -c  "SELECT revision FROM vr2_publish_meta WHERE task_id='$v1_id'")"
+test "$revision" = 1
+echo 'PASS: original publish meta draft, validated transactional save and DB readback'
+
+
 system_json="$(curl --silent --fail-with-body "${hdr[@]}" http://127.0.0.1:18080/api/v1/system/resources)"
 SYSTEM_JSON="$system_json" python3 - <<'PYSYSTEM'
 import json,os,datetime
@@ -362,6 +426,18 @@ range_headers="$(curl --silent --show-error --fail-with-body -D - -o /dev/null "
   "http://127.0.0.1:18080/api/v1/tasks/$asr_task_id/assets/$asr_final_id/stream")"
 echo "$range_headers" | grep -qi '^content-type: video/mp4'
 echo 'PASS: native V1 converted videos, asset isolation and range streaming'
+
+completed_progress="$(curl --silent --fail-with-body "${hdr[@]}"  "http://127.0.0.1:18080/api/v1/tasks/$asr_task_id/youtube_download_progress")"
+COMPLETE_YT="$completed_progress" python3 - <<'PYCOMPLETEYT'
+import json,os
+v=json.loads(os.environ["COMPLETE_YT"])
+assert v["status"]=="completed" and v["progress"]==100 and not v["active"],v
+assert v["downloaded_bytes"]>0 and v["total_bytes"]==v["downloaded_bytes"],v
+PYCOMPLETEYT
+frozen_code="$(curl --silent -o /dev/null -w '%{http_code}' "${hdr[@]}" -X PUT  -d '{"title":"不允许修改已投稿的稿件","typeid":21,"tags":["视频分享"]}'  "http://127.0.0.1:18080/api/v1/tasks/$asr_task_id/publish_meta")"
+test "$frozen_code" = 409
+echo 'PASS: legacy YouTube progress persisted from workflow and published metadata locked'
+
 
 
 # ffplayout importer uses a flat translated filename and protects media.
@@ -791,7 +867,7 @@ PARITY="$parity" python3 - <<'PYPARITY'
 import json,os
 d=json.loads(os.environ["PARITY"])
 assert d["legacy_route_declarations"]==217,d
-assert d["native_v1_adapters"]>=24,d
+assert d["native_v1_adapters"]>=31,d
 assert d["fully_verified_legacy_routes"]==0 and d["all_features_migrated"] is False,d
 assert d["frontend_url_references"]>=190,d
 PYPARITY

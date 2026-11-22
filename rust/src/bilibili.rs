@@ -39,12 +39,16 @@ pub struct ArchiveMeta {
     pub topic_id: Option<i64>,
     #[serde(default)]
     pub mission_id: Option<i64>,
+    // V1's additional Web publishing fields are validated explicitly.
+    // Unrecognized keys must never be silently dropped during an actual post.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, Value>,
 }
 fn default_copyright() -> u8 {
     2
 }
 impl ArchiveMeta {
-    fn validate(&self) -> AppResult<()> {
+    pub(crate) fn validate(&self) -> AppResult<()> {
         if self.title.trim().is_empty() || self.title.chars().count() > 80 {
             return Err(AppError::Invalid(
                 "Bilibili title must contain 1-80 characters".into(),
@@ -78,8 +82,46 @@ impl ArchiveMeta {
         }
         if self.topic_id.is_some_and(|id| id <= 0) || self.mission_id.is_some_and(|id| id <= 0) {
             return Err(AppError::Invalid(
-                "Bilibili topic/mission IDs must be verified positive IDs".into(),
+                "Bilibili topic/mission IDs must be positive (platform eligibility must be checked separately)".into(),
             ));
+        }
+        for (key, value) in &self.extra {
+            let valid = match key.as_str() {
+                "dynamic" | "neutral_mark" => {
+                    value.as_str().is_some_and(|v| v.chars().count() <= 2_000)
+                }
+                "dtime" => value.is_null() || value.as_i64().is_some_and(|v| v > 0),
+                "desc_v2" => value.is_null() || value.is_array() || value.is_object(),
+                "subtitle" => {
+                    value
+                        .get("open")
+                        .and_then(Value::as_i64)
+                        .is_some_and(|v| v == 0 || v == 1)
+                        && value
+                            .get("lan")
+                            .and_then(Value::as_str)
+                            .is_some_and(|v| v.len() <= 32)
+                        && value.as_object().is_some_and(|v| v.len() == 2)
+                }
+                "up_selection_reply" | "up_close_reply" | "up_close_danmu" | "up_close_danmaku" => {
+                    value.is_boolean()
+                }
+                "desc_format_id" => value.as_i64() == Some(9999),
+                "recreate" => value.as_i64().is_some_and(|v| v == -1 || v == 1),
+                "interactive" | "act_reserve_create" | "no_disturbance" | "no_reprint"
+                | "dolby" | "lossless_music" | "is_only_self" => {
+                    value.is_null() || value.as_i64().is_some_and(|v| v == 0 || v == 1)
+                }
+                "web_os" => value.as_i64().is_some_and(|v| (1..=3).contains(&v)),
+                "is_360" => value.is_null() || value.as_i64().is_some_and(|v| v == -1 || v == 1),
+                "human_type2" => value.is_null() || value.as_i64().is_some_and(|v| v >= 0),
+                _ => false,
+            };
+            if !valid {
+                return Err(AppError::Invalid(format!(
+                    "Bilibili metadata field {key:?} is unsupported or invalid in native publisher"
+                )));
+            }
         }
         Ok(())
     }
@@ -224,9 +266,11 @@ pub async fn archive_spec(
         .or_else(|| auto.as_ref().and_then(|v| v.get("auto_publish_platforms")));
     expected_platforms(&json!({"auto_publish_platforms":source_platforms}))?;
 
+    let saved = crate::publish_meta::saved(db, job.task_id).await?;
     let meta:ArchiveMeta=serde_json::from_value(
-        profile.pointer("/publish/bilibili").cloned().ok_or_else(||AppError::Unavailable(
-            "native Bilibili requires an explicit and reviewed publish.bilibili metadata block".into()
+        saved.or_else(||profile.pointer("/publish/bilibili").cloned())
+            .ok_or_else(||AppError::Unavailable(
+            "native Bilibili requires saved metadata or explicit publish.bilibili configuration".into()
         ))?
     ).map_err(|_|AppError::Invalid("Bilibili metadata schema invalid".into()))?;
     meta.validate()?;
@@ -259,6 +303,40 @@ struct BilibiliClient {
     member: Client,
     upos: Client,
 }
+// Pure, testable Bilibili Web POST mapping. Only validated fields are copied.
+fn archive_payload(csrf: &str, meta: &ArchiveMeta, parts: &[(UploadedVideo, String)]) -> Value {
+    let mut payload = json!({
+        "videos":parts.iter().map(|(part,title)|json!({
+            "filename":part.filename,"title":title,"desc":"","cid":part.cid
+        })).collect::<Vec<_>>(),
+        "cover":if meta.cover.is_empty(){Value::Null}else{json!(meta.cover)},
+        "cover43":"","title":meta.title,"copyright":meta.copyright,
+        "source":if meta.copyright==2{json!(meta.source)}else{Value::Null},
+        "tid":meta.typeid,"tag":meta.tags.join(","),"desc":meta.desc,
+        "desc_format_id":9999,"recreate":-1,"dynamic":"",
+        "interactive":0,"act_reserve_create":0,"no_disturbance":0,"no_reprint":1,
+        "subtitle":{"open":0,"lan":""},
+        "dolby":0,"lossless_music":0,"web_os":3,
+        "topic_id":meta.topic_id,"mission_id":meta.mission_id,
+        "csrf":csrf,
+    });
+    if let Some(obj) = payload.as_object_mut() {
+        for (field, value) in &meta.extra {
+            // V1 used both spellings; do not let aliases diverge.
+            let name = if field == "up_close_danmaku" {
+                "up_close_danmu"
+            } else {
+                field.as_str()
+            };
+            if !value.is_null() {
+                obj.insert(name.to_owned(), value.clone());
+            }
+        }
+        obj.retain(|_, v| !v.is_null());
+    }
+    payload
+}
+
 impl BilibiliClient {
     fn new(cookie: &str) -> AppResult<Self> {
         if cookie.trim().is_empty() || cookie.contains('\r') || cookie.contains('\n') {
@@ -491,24 +569,7 @@ impl BilibiliClient {
         meta: &ArchiveMeta,
         parts: &[(UploadedVideo, String)],
     ) -> AppResult<Value> {
-        let mut payload = json!({
-            "videos":parts.iter().map(|(part,title)|json!({
-                "filename":part.filename,"title":title,"desc":"","cid":part.cid
-            })).collect::<Vec<_>>(),
-            "cover":if meta.cover.is_empty(){Value::Null}else{json!(meta.cover)},
-            "cover43":"","title":meta.title,"copyright":meta.copyright,
-            "source":if meta.copyright==2{json!(meta.source)}else{Value::Null},
-            "tid":meta.typeid,"tag":meta.tags.join(","),"desc":meta.desc,
-            "desc_format_id":9999,"recreate":-1,"dynamic":"",
-            "interactive":0,"act_reserve_create":0,"no_disturbance":0,"no_reprint":1,
-            "subtitle":{"open":0,"lan":""},
-            "dolby":0,"lossless_music":0,"web_os":3,
-            "topic_id":meta.topic_id,"mission_id":meta.mission_id,
-            "csrf":csrf,
-        });
-        if let Some(obj) = payload.as_object_mut() {
-            obj.retain(|_, v| !v.is_null());
-        }
+        let payload = archive_payload(csrf, meta, parts);
         let response = self
             .member
             .post("https://member.bilibili.com/x/vu/web/add/v3")
@@ -604,6 +665,42 @@ mod tests {
         assert!(upos_target(&evil).is_err());
     }
     #[test]
+    fn saved_extended_metadata_is_transmitted_not_silently_ignored() {
+        let meta: ArchiveMeta = serde_json::from_value(json!({
+            "title":"稿件","typeid":21,"tags":["视频分享"],"copyright":2,
+            "source":"https://youtu.be/0123456789A","dynamic":"动态文案",
+            "no_disturbance":1,"up_close_reply":true,"up_close_danmaku":true,
+            "mission_id":12345,"topic_id":98765,"subtitle":{"open":0,"lan":"zh-CN"}
+        }))
+        .unwrap();
+        meta.validate().unwrap();
+        let payload = archive_payload(
+            "csrf-test",
+            &meta,
+            &[(
+                UploadedVideo {
+                    filename: "sample.mp4".into(),
+                    cid: 998,
+                },
+                "P1".into(),
+            )],
+        );
+        assert_eq!(payload["dynamic"], "动态文案");
+        assert_eq!(payload["no_disturbance"], 1);
+        assert_eq!(payload["up_close_reply"], true);
+        assert_eq!(payload["up_close_danmu"], true);
+        assert_eq!(payload["mission_id"], 12345);
+        assert_eq!(payload["topic_id"], 98765);
+        assert_eq!(payload["csrf"], "csrf-test");
+        assert_eq!(payload["videos"][0]["cid"], 998);
+        let rejected: ArchiveMeta = serde_json::from_value(json!({
+            "title":"稿件","typeid":21,"tags":["视频分享"],
+            "csrf":"user-controlled","videos":[]
+        }))
+        .unwrap();
+        assert!(rejected.validate().is_err());
+    }
+    #[test]
     fn native_bili_requires_valid_metadata_and_p1_p2() {
         let mut meta = ArchiveMeta {
             title: "测试标题".into(),
@@ -615,6 +712,7 @@ mod tests {
             cover: String::new(),
             topic_id: None,
             mission_id: None,
+            extra: serde_json::Map::new(),
         };
         assert!(meta.validate().is_ok());
         meta.source = String::new();
