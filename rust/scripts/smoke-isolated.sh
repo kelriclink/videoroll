@@ -11,10 +11,12 @@ fi
 container_name="vr2-smoke-$$"
 api_pid=""
 worker_pid=""
+legacy_pid=""
 gateway_pid=""
 ai_pid=""
 cleanup() {
   if [[ -n "$worker_pid" ]]; then kill "$worker_pid" 2>/dev/null || true; wait "$worker_pid" 2>/dev/null || true; fi
+  if [[ -n "$legacy_pid" ]]; then kill "$legacy_pid" 2>/dev/null || true; wait "$legacy_pid" 2>/dev/null || true; fi
   if [[ -n "$ai_pid" ]]; then kill "$ai_pid" 2>/dev/null || true; wait "$ai_pid" 2>/dev/null || true; fi
   if [[ -n "$gateway_pid" ]]; then kill "$gateway_pid" 2>/dev/null || true; wait "$gateway_pid" 2>/dev/null || true; fi
   if [[ -n "$api_pid" ]]; then kill "$api_pid" 2>/dev/null || true; wait "$api_pid" 2>/dev/null || true; fi
@@ -36,6 +38,15 @@ export INTERNAL_API_SECRET="rust-local-test-internal-secret"
 export ADMIN_BOOTSTRAP_SECRET="rust-local-test-bootstrap"
 export VIDEOROLL_V2_SECURE_COOKIES="false"
 export VIDEOROLL_V2_YT_DLP="$repo_root/rust/tests/mock_source_feed.sh"
+export VIDEOROLL_V2_INDEX_ENDPOINT="http://127.0.0.1:18082/v1/chat/completions"
+export VIDEOROLL_V2_COMPAT_URL="http://127.0.0.1:18083"
+export VIDEOROLL_V2_PLAYOUT_ROOT="$repo_root/rust/target/playout-sandbox"
+export VIDEOROLL_V2_YOUDUB_PYTHON="$(command -v python3)"
+export VIDEOROLL_V2_YOUDUB_BRIDGE="$repo_root/rust/tests/mock_youdub_bridge.py"
+export VIDEOROLL_V2_YOUDUB_RUNTIME="$repo_root/rust/target/mock-youdub-v2"
+mkdir -p "$VIDEOROLL_V2_PLAYOUT_ROOT"
+python3 "$repo_root/rust/tests/mock_legacy_api.py" > "$repo_root/rust/target/v2-mock-legacy.log" 2>&1 &
+legacy_pid=$!
 mkdir -p "$VIDEOROLL_V2_STORAGE_ROOT"
 cd rust
 "$CARGO_HOME/bin/cargo" build --quiet
@@ -79,6 +90,17 @@ curl --silent --fail-with-body -c "$jar" -H 'content-type: application/json' \
 curl --silent --fail-with-body -b "$jar" \
   http://127.0.0.1:18080/api/v2/tasks | grep -q '0123456789A'
 echo 'PASS: native admin setup/login and browser cookie compatibility'
+
+# The original API compatibility surface is explicitly read-only and cannot
+# forward V2 credentials, unauthenticated calls or unknown non-API routes.
+legacy_read="$(curl --silent --fail-with-body "${hdr[@]}"   http://127.0.0.1:18080/api/compat/read)"
+echo "$legacy_read" | grep -q '"read_only": true'
+legacy_post_status="$(curl --silent -o /dev/null -w '%{http_code}'   -X POST "${hdr[@]}"   http://127.0.0.1:18080/api/compat/write)"
+test "$legacy_post_status" = 409
+legacy_anonymous="$(curl --silent -o /dev/null -w '%{http_code}'   http://127.0.0.1:18080/api/compat/read)"
+test "$legacy_anonymous" = 401
+echo 'PASS: isolated legacy API bridge allows authenticated reads only'
+
 
 
 
@@ -215,6 +237,120 @@ grep -q 'Hello from a Rust integration test' "$VIDEOROLL_V2_STORAGE_ROOT/$srt_ke
 ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of default=noprint_wrappers=1 "$VIDEOROLL_V2_STORAGE_ROOT/$video_key" | grep -q '^codec_name=h264'
 echo 'PASS: native OpenAI-compatible ASR, SRT/ASS, and real FFmpeg subtitle burn-in'
 
+# ffplayout importer uses a flat translated filename and protects media.
+playout_payload="$(printf '{"task_id":"%s","channel_id":1,"part":1,"title":"中文 测试 视频"}' "$asr_task_id")"
+playout_result="$(curl --silent --fail-with-body "${hdr[@]}" -d "$playout_payload" http://127.0.0.1:18080/api/v2/playout/import)"
+playout_id="$(PLAYOUT="$playout_result" python3 -c 'import os,json;print(json.loads(os.environ["PLAYOUT"])["id"])')"
+playout_path="$(PLAYOUT="$playout_result" python3 -c 'import os,json;print(json.loads(os.environ["PLAYOUT"])["playout_path"])')"
+PLAYOUT="$playout_result" python3 - <<'PYPLAY'
+import os,json
+row=json.loads(os.environ["PLAYOUT"])
+assert row["status"]=="ready",row
+assert row["relative_media_path"].startswith("VideoRoll/"),row
+assert row["transfer_mode"] in ("hardlink","copy"),row
+PYPLAY
+test -s "$playout_path"
+playout_again="$(curl --silent --fail-with-body "${hdr[@]}" -d "$playout_payload" http://127.0.0.1:18080/api/v2/playout/import)"
+echo "$playout_again" | grep -q "$playout_id"
+curl --silent --fail-with-body "${hdr[@]}" -X DELETE   "http://127.0.0.1:18080/api/v2/playout/links/$playout_id" | grep -q '"status":"detached"'
+test -s "$playout_path"
+echo 'PASS: ffplayout translated filename, verified media and safe detach'
+
+# V2 lexical knowledge is always task-scoped or explicitly global.
+knowledge="$(curl --silent --fail-with-body "${hdr[@]}" -d   '{"collection":"translation","scope":"global","kind":"term","title":"Rust ASR glossary","content":"Hello from a Rust integration test. The phrase Rust integration test remains consistent.","keywords":["Rust","integration","subtitle"],"language":"en","confidence":1.0}'   http://127.0.0.1:18080/api/v2/rag/knowledge)"
+knowledge_id="$(KNOWLEDGE="$knowledge" python3 -c 'import json,os;print(json.loads(os.environ["KNOWLEDGE"])["id"])')"
+hits="$(curl --silent --fail-with-body "${hdr[@]}"   -d '{"collection":"translation","query":"Hello from a Rust integration test","limit":8}'   http://127.0.0.1:18080/api/v2/rag/search)"
+HITS="$hits" KNOWLEDGE_ID="$knowledge_id" python3 - <<'PYRAG'
+import json,os
+rows=json.loads(os.environ["HITS"])
+assert any(v["id"]==os.environ["KNOWLEDGE_ID"] for v in rows),rows
+assert rows[0]["score"]>0.1,rows
+PYRAG
+# Explicit local test-only model provider exercises the research Agent.
+docker exec -i "$container_name" psql -v ON_ERROR_STOP=1 -U postgres -d videoroll_test >/dev/null <<'PSQL'
+INSERT INTO app_settings(key,value_json) VALUES(
+  'subtitle.model_providers',
+  '{"providers":[{"id":"rag-test-provider","name":"RAG test",
+    "api_type":"openai","base_url":"http://127.0.0.1:18082/v1",
+    "models":[{"id":"rag-test-model","temperature":0.2}]}]}'
+);
+PSQL
+rag_settings="$(curl --silent --fail-with-body "${hdr[@]}"   -X PUT -d '{"expected_version":0,"value":{"enabled":true,"collection":"translation","max_items":8,"max_context_chars":2000,"use_embedding":false,"research_enabled":true,"research_blocking":true,"research_provider_id":"rag-test-provider","research_model_id":"rag-test-model","max_research_steps":4}}'   http://127.0.0.1:18080/api/v2/settings/rag)"
+echo "$rag_settings" | grep -q '"version":1'
+echo 'PASS: scoped RAG knowledge storage, native lexical ranking and explicit research settings'
+
+# Native official Index-Translate-compatible JSON numbering and missing-line repair.
+index_task="$(curl --silent --fail-with-body "${hdr[@]}" -d   '{"url":"https://youtu.be/0123456789I","source_license":"authorized","configuration":{"auto_publish":true,"auto_publish_platforms":["bilibili"],"subtitle":{"translate_enabled":true,"translate_provider":"index_translate","translate_model_provider_id":"index_translate","translate_model_id":"Index-Translate-35B-A3B"}}}'   http://127.0.0.1:18080/api/v2/auto/youtube)"
+index_task_id="$(INDEX_TASK="$index_task" python3 -c 'import json,os;print(json.loads(os.environ["INDEX_TASK"])["task"]["id"])')"
+mkdir -p "$VIDEOROLL_V2_STORAGE_ROOT/v2/raw/$index_task_id"
+ffmpeg -hide_banner -nostdin -loglevel error   -f lavfi -i 'color=c=black:s=320x180:r=25'   -f lavfi -i 'sine=frequency=550:sample_rate=44100'   -t 2 -c:v libx264 -pix_fmt yuv420p -c:a aac -shortest -y   "$VIDEOROLL_V2_STORAGE_ROOT/v2/raw/$index_task_id/source.mp4"
+index_raw_asset="$(python3 -c 'import uuid;print(uuid.uuid4())')"
+docker exec "$container_name" psql -v ON_ERROR_STOP=1 -U postgres -d videoroll_test -c   "INSERT INTO assets(id,task_id,kind,storage_key) VALUES('$index_raw_asset','$index_task_id','video_raw','v2/raw/$index_task_id/source.mp4')" >/dev/null
+index_state=""
+for i in $(seq 1 90); do
+  index_state="$(curl --silent --fail-with-body "${hdr[@]}"     "http://127.0.0.1:18080/api/v2/tasks/$index_task_id")"
+  if [[ "$index_state" == *'"status":"PUBLISHED"'* || "$index_state" == *'"status":"FAILED"'* ]];then break;fi
+  sleep 1
+done
+if [[ "$index_state" != *'"status":"PUBLISHED"'* ]];then
+  tail -120 "$repo_root/rust/target/v2-mock-worker.log" >&2
+  echo 'FAIL: native Index model translation pipeline did not finish' >&2; exit 1
+fi
+index_srt="$(docker exec "$container_name" psql -At -U postgres -d videoroll_test -c   "SELECT storage_key FROM assets WHERE task_id='$index_task_id' AND kind='subtitle_srt' ORDER BY created_at DESC LIMIT 1")"
+test -n "$index_srt"
+test "$(grep -c '译文：' "$VIDEOROLL_V2_STORAGE_ROOT/$index_srt")" = 3
+echo 'PASS: native Index-Translate API payload, numbered 3-cue mapping, missing-line repair'
+index_workflow_id="$(INDEX_TASK="$index_task" python3 -c 'import json,os;print(json.loads(os.environ["INDEX_TASK"])["workflow"]["id"])')"
+agent_runs="$(curl --silent --fail-with-body "${hdr[@]}"   "http://127.0.0.1:18080/api/v2/rag/agents/$index_workflow_id")"
+AGENT_RUNS="$agent_runs" KNOWLEDGE_ID="$knowledge_id" python3 - <<'PYAGENT'
+import json,os
+rows=json.loads(os.environ["AGENT_RUNS"])
+assert len(rows)==1,rows
+assert rows[0]["state"]=="succeeded",rows
+assert os.environ["KNOWLEDGE_ID"] in rows[0]["result"]["context"]["evidence_ids"],rows
+PYAGENT
+echo 'PASS: RAG evidence attached to translated workflow and persisted as auditable research'
+
+# Deterministic YouDub mock: the real V2 adapter must create exactly one
+# third-party task, import a valid P2, and bind the video to that task.
+dubbing_task="$(curl --silent --fail-with-body "${hdr[@]}" -d  '{"url":"https://youtu.be/0123456789J","source_license":"authorized","configuration":{"auto_publish":true,"auto_publish_platforms":["bilibili"],"subtitle":{"translate_enabled":false},"dubbing":{"enabled":true}}}'  http://127.0.0.1:18080/api/v2/auto/youtube)"
+dubbing_task_id="$(DUB_TASK="$dubbing_task" python3 -c 'import os,json;print(json.loads(os.environ["DUB_TASK"])["task"]["id"])')"
+dubbing_workflow_id="$(DUB_TASK="$dubbing_task" python3 -c 'import os,json;print(json.loads(os.environ["DUB_TASK"])["workflow"]["id"])')"
+mkdir -p "$VIDEOROLL_V2_STORAGE_ROOT/v2/raw/$dubbing_task_id"
+ffmpeg -hide_banner -nostdin -loglevel error   -f lavfi -i 'color=c=black:s=320x180:r=25'   -f lavfi -i 'sine=frequency=440:sample_rate=44100'   -t 2 -c:v libx264 -pix_fmt yuv420p -c:a aac -shortest -y   "$VIDEOROLL_V2_STORAGE_ROOT/v2/raw/$dubbing_task_id/source.mp4"
+dub_source_id="$(python3 -c 'import uuid;print(uuid.uuid4())')"
+docker exec "$container_name" psql -v ON_ERROR_STOP=1 -U postgres -d videoroll_test -c   "INSERT INTO assets(id,task_id,kind,storage_key) VALUES('$dub_source_id','$dubbing_task_id','video_raw','v2/raw/$dubbing_task_id/source.mp4')" >/dev/null
+dub_final=""
+for i in $(seq 1 70); do
+  dub_final="$(curl --silent --fail-with-body "${hdr[@]}"     "http://127.0.0.1:18080/api/v2/tasks/$dubbing_task_id")"
+  if [[ "$dub_final" == *'"status":"PUBLISHED"'* || "$dub_final" == *'"status":"FAILED"'* ]];then break;fi
+  sleep 1
+done
+if [[ "$dub_final" != *'"status":"PUBLISHED"'* ]];then
+  tail -65 "$repo_root/rust/target/v2-mock-worker.log" >&2
+  echo 'FAIL: V2 YouDub adapter did not complete P2 path' >&2
+  exit 1
+fi
+dub_video="$(docker exec "$container_name" psql -At -U postgres -d videoroll_test -c   "SELECT storage_key FROM assets WHERE task_id='$dubbing_task_id' AND kind='video_dubbed' LIMIT 1")"
+test -n "$dub_video"
+test -s "$VIDEOROLL_V2_STORAGE_ROOT/$dub_video"
+ffprobe -v error -show_entries format=duration -of csv=p=0   "$VIDEOROLL_V2_STORAGE_ROOT/$dub_video" >/dev/null
+dub_record="$(docker exec "$container_name" psql -At -U postgres -d videoroll_test -c   "SELECT model_job_id::text || '|' || model_status || '|' || source_video_key || '|' || source_srt_key || '|' || output_video_key FROM vr2_dubbing_runs WHERE task_id='$dubbing_task_id' AND workflow_id='$dubbing_workflow_id'")"
+DUB_RECORD="$dub_record" DUB_VIDEO="$dub_video" python3 - <<'PYDUB'
+import os,uuid
+fields=os.environ["DUB_RECORD"].split("|")
+assert len(fields)==5,fields
+uuid.UUID(fields[0])
+assert fields[1]=="succeeded",fields
+assert fields[2].startswith("v2/raw/"),fields
+assert fields[3].startswith("v2/sub/"),fields
+assert fields[4]==os.environ["DUB_VIDEO"],fields
+PYDUB
+echo 'PASS: YouDub isolated adapter, deterministic model job, verified P2 video association'
+
+
+
+
 # Retention / playout safety: force an expired retention period in the disposable
 # database. The final asset is protected while a playout link still exists.
 scheduled="$(docker exec "$container_name" psql -At -U postgres -d videoroll_test -c \
@@ -238,6 +374,17 @@ docker exec "$container_name" psql -v ON_ERROR_STOP=1 -U postgres -d videoroll_t
 test "$(docker exec "$container_name" psql -At -U postgres -d videoroll_test -c \
   "SELECT state FROM vr2_objects WHERE storage_key='$video_key'")" = "deleted"
 test ! -f "$VIDEOROLL_V2_STORAGE_ROOT/$video_key"
+# The detached audit row survives; its foreign key is safely null,
+# and the ffplayout media file is never deleted by ordinary source GC.
+historical="$(curl --silent --fail-with-body "${hdr[@]}"   "http://127.0.0.1:18080/api/v2/playout/links/$playout_id")"
+HISTORICAL="$historical" python3 - <<'PYGC'
+import json,os
+row=json.loads(os.environ["HISTORICAL"])
+assert row["status"]=="detached",row
+assert row["asset_id"] is None,row
+assert row["source_asset_id"] is not None,row
+PYGC
+test -s "$playout_path"
 echo 'PASS: verified terminal asset is reclaimed only after its last playout reference disappears'
 
 

@@ -50,3 +50,13 @@ V2 React 页面只有在 VITE_RUST_V2_UI=true 时出现，生产界面默认没�
 6. 和旧版只读影子流量比对及完整回滚预案，合格后才能考虑切换。
 
 本分支仍不满足全部生产等价条件。没有假称完成所有业务，也没有切换生产。
+
+## 新增的 RAG / Index / 播控与迁移桥
+
+- rust/src/media/index_translate.rs：独立官方 Index-Translate 请求与字幕 idx 缺行修复，无需泛 OpenAI 路由伪装。
+- rust/src/providers.rs：按原版模型 Provider/模型选择配置解析，不存在的选择明确报错，不含密钥的公共 Provider DTO。
+- rust/src/rag.rs：global/task 范围的知识库、中文/英文词汇检索、Embedding 余弦混合排序、受限上下文和持久 Agent 研究记录。
+- rust/src/playout.rs：独立媒体链接表、校验后的中文平铺视频名、硬链接/复制与保守撤销，不承诺已经插入播控节目单。
+- rust/src/compat.rs：默认关闭、显式只读的旧版 API 代理，用于旧页面迁移期间做功能对照，不代表代理接口已经 Rust 原生重写。
+
+以上模块仍需和生产版 RAG、ffplayout API、模型配置进行完整语义对照。参见 docs/INDEX_RAG_PARITY.md、docs/FEATURE_PARITY.md 和 docs/PLAYOUT_MIGRATION.md。

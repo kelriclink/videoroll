@@ -19,6 +19,7 @@ const PUBLIC_SECTIONS: &[(&str, &str)] = &[
     ("review", "review.settings"),
     ("storage", "storage.settings"),
     ("agent", "translate.agent"),
+    ("rag", "subtitle.rag"),
 ];
 pub fn resolve_key(section: &str) -> AppResult<&'static str> {
     PUBLIC_SECTIONS

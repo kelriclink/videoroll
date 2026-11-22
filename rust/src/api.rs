@@ -332,6 +332,8 @@ pub fn router(state: AppState) -> Router {
         .merge(crate::assets::router())
         .merge(crate::sources::router())
         .merge(crate::telemetry::router())
+        .merge(crate::rag::router())
+        .merge(crate::playout::router())
         .merge(crate::settings::router())
         .merge(crate::remote_render::admin_router())
         .route("/tasks", get(list_tasks))
@@ -359,5 +361,6 @@ pub fn router(state: AppState) -> Router {
         .route("/health", get(health))
         .route("/ready", get(readiness))
         .nest("/api/v2", protected)
+        .fallback(crate::compat::fallback)
         .with_state(state)
 }

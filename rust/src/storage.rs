@@ -274,6 +274,14 @@ impl AssetRegistry {
             if playout.0 {
                 return Ok(false);
             }
+            // A staging or ready ffplayout import still holds media even if
+            // an object reference has not been committed yet.
+            let active_v2_playout:(bool,)=sqlx::query_as(
+                "SELECT EXISTS(SELECT 1 FROM vr2_playout_links p JOIN assets a ON a.id=p.asset_id WHERE a.storage_key=$1 AND p.status IN ('staging','ready'))"
+            ).bind(key).fetch_one(&mut *tx).await?;
+            if active_v2_playout.0 {
+                return Ok(false);
+            }
             let refs: (bool,) =
                 sqlx::query_as("SELECT EXISTS(SELECT 1 FROM vr2_object_refs WHERE storage_key=$1)")
                     .bind(key)

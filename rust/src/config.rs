@@ -31,6 +31,13 @@ pub struct Config {
     pub native_bilibili_csrf: Option<String>,
     pub source_scanner_enabled: bool,
     pub remote_renderer_enabled: bool,
+    pub embedding_endpoint: Option<String>,
+    pub embedding_model: Option<String>,
+    pub embedding_api_key: Option<String>,
+    pub compat_orchestrator_url: Option<String>,
+    pub compat_internal_token: Option<String>,
+    pub compat_writes_allowed: bool,
+    pub playout_root: Option<std::path::PathBuf>,
     pub worker_count: usize,
     pub worker_poll: Duration,
     pub job_lease: Duration,
@@ -128,6 +135,25 @@ impl Config {
                 == Some("true"),
             remote_renderer_enabled: std::env::var("VIDEOROLL_V2_REMOTE_RENDER").ok().as_deref()
                 == Some("true"),
+            embedding_endpoint: std::env::var("VIDEOROLL_V2_EMBEDDING_ENDPOINT")
+                .ok()
+                .filter(|v| !v.is_empty()),
+            embedding_model: std::env::var("VIDEOROLL_V2_EMBEDDING_MODEL")
+                .ok()
+                .filter(|v| !v.is_empty()),
+            embedding_api_key: std::env::var("VIDEOROLL_V2_EMBEDDING_KEY")
+                .ok()
+                .filter(|v| !v.is_empty()),
+            compat_orchestrator_url: std::env::var("VIDEOROLL_V2_COMPAT_URL")
+                .ok()
+                .filter(|v| !v.is_empty()),
+            compat_internal_token: std::env::var("VIDEOROLL_V2_COMPAT_INTERNAL_TOKEN")
+                .ok()
+                .filter(|v| !v.is_empty()),
+            compat_writes_allowed: std::env::var("VIDEOROLL_V2_COMPAT_WRITE").ok().as_deref()
+                == Some("true"),
+            playout_root: std::env::var_os("VIDEOROLL_V2_PLAYOUT_ROOT")
+                .map(std::path::PathBuf::from),
             worker_count,
             worker_poll: Duration::from_secs(3),
             job_lease: Duration::from_secs(180),
