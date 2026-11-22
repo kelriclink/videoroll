@@ -68,15 +68,18 @@ struct StartedResponse {
 }
 
 #[derive(Debug, Deserialize)]
-struct PasswordRequest {
+pub(crate) struct PasswordRequest {
     password: String,
 }
-async fn admin_status(State(state): State<AppState>, headers: HeaderMap) -> AppResult<Json<Value>> {
+pub(crate) async fn admin_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> AppResult<Json<Value>> {
     Ok(Json(
         auth::auth_status(&headers, &state.db, &state.config).await?,
     ))
 }
-async fn admin_login(
+pub(crate) async fn admin_login(
     State(state): State<AppState>,
     headers: HeaderMap,
     ConnectInfo(address): ConnectInfo<SocketAddr>,
@@ -103,7 +106,7 @@ async fn admin_login(
     );
     Ok((headers, Json(json!({"password_set":true,"trusted":true}))))
 }
-async fn admin_logout(State(state): State<AppState>) -> (HeaderMap, Json<Value>) {
+pub(crate) async fn admin_logout(State(state): State<AppState>) -> (HeaderMap, Json<Value>) {
     let mut headers = HeaderMap::new();
     headers.insert(
         header::SET_COOKIE,
@@ -111,7 +114,7 @@ async fn admin_logout(State(state): State<AppState>) -> (HeaderMap, Json<Value>)
     );
     (headers, Json(json!({"trusted":false})))
 }
-async fn admin_setup(
+pub(crate) async fn admin_setup(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(body): Json<PasswordRequest>,
@@ -332,6 +335,7 @@ pub fn router(state: AppState) -> Router {
         .merge(crate::assets::router())
         .merge(crate::sources::router())
         .merge(crate::telemetry::router())
+        .merge(crate::parity::router())
         .merge(crate::rag::router())
         .merge(crate::playout::router())
         .merge(crate::bili_subtitles::router())
@@ -353,6 +357,16 @@ pub fn router(state: AppState) -> Router {
         .route("/storage/stats", get(storage_stats))
         .route("/storage/hold", post(asset_hold))
         .route_layer(middleware::from_fn_with_state(state.clone(), authorize));
+    let legacy_protected = crate::legacy_contracts::router()
+        .route_layer(middleware::from_fn_with_state(state.clone(), authorize));
+    // Login endpoints must remain public so the original React AuthGate can
+    // establish a V2 session before entering the native V1-contract surface.
+    let legacy = Router::new()
+        .route("/auth/status", get(admin_status))
+        .route("/auth/login", post(admin_login))
+        .route("/auth/logout", post(admin_logout))
+        .route("/auth/setup", post(admin_setup))
+        .merge(legacy_protected);
     Router::new()
         .merge(crate::remote_render::worker_router())
         .route("/api/auth/status", get(admin_status))
@@ -361,6 +375,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/auth/setup", post(admin_setup))
         .route("/health", get(health))
         .route("/ready", get(readiness))
+        .nest("/api/v1", legacy)
         .nest("/api/v2", protected)
         .fallback(crate::compat::fallback)
         .with_state(state)

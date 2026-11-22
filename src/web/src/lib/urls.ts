@@ -11,7 +11,14 @@ function defaultOrchestratorUrl(): string {
   return "http://localhost:8000";
 }
 
-export const ORCHESTRATOR_URL = env("VITE_ORCHESTRATOR_URL") ?? defaultOrchestratorUrl();
+// Explicit experimental switch: retains the complete original React UI but
+// targets the independent Rust V1-contract router. Keep OFF until every
+// frontend operation has native parity and contract tests. No silent fallback
+// to the production Python backend for unsupported writes.
+export const RUST_V2_FULL_UI_PREVIEW = env("VITE_RUST_V2_FULL_UI") === "true";
+export const ORCHESTRATOR_URL = RUST_V2_FULL_UI_PREVIEW
+  ? (env("VITE_RUST_V2_LEGACY_API_URL") ?? "/rust-v2/api/v1")
+  : (env("VITE_ORCHESTRATOR_URL") ?? defaultOrchestratorUrl());
 
 function defaultFfplayoutUrl(): string {
   // ffplayout is reverse-proxied by the Web nginx on the same browser origin.

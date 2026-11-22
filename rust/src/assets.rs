@@ -11,6 +11,7 @@ use axum::{
 use futures_util::StreamExt;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use sqlx::Row;
 use tokio::{
     fs,
     io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
@@ -66,6 +67,7 @@ async fn upload(
     AssetRegistry::checked_key(&key)?;
     let completed = state.storage.resolve_existing(&key).await?;
     let temporary = dir.join(format!("{file_id}.incomplete"));
+    let mut committed = false;
     let result=async {
         let mut file=fs::OpenOptions::new().write(true).create_new(true).open(&temporary).await?;
         let mut sha=Sha256::new();
@@ -104,18 +106,180 @@ async fn upload(
         ).bind(file_id).bind(task_id).bind(&p.kind).bind(&key).bind(&digest).bind(bytes as i64)
             .execute(&mut *tx).await?;
         tx.commit().await?;
+        committed=true;
         state.db.asset(file_id).await
     }.await;
     match result {
         Ok(asset) => Ok((StatusCode::CREATED, Json(asset))),
         Err(error) => {
             let _ = fs::remove_file(&temporary).await;
-            let _ = fs::remove_file(&completed).await;
+            if !committed {
+                let _ = fs::remove_file(&completed).await;
+            }
             Err(error)
         }
     }
 }
 /// Parse one HTTP range, including suffix ranges; multi-range requests are rejected.
+/// Original React local file-upload contract, handled by Rust directly.
+/// Strictly V2-owned tasks; streaming multipart never buffers the whole video.
+pub(crate) async fn upload_video_form(
+    State(state): State<AppState>,
+    Path(task_id): Path<Uuid>,
+    mut multipart: axum::extract::Multipart,
+) -> AppResult<(StatusCode, Json<AssetInfo>)> {
+    let ownership: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM vr2_managed_tasks WHERE task_id=$1)")
+            .bind(task_id)
+            .fetch_one(&state.db.pool)
+            .await?;
+    if !ownership {
+        return Err(AppError::NotFound("V2 manual-upload task not found".into()));
+    }
+    let source: Option<String> =
+        sqlx::query_scalar("SELECT source_type::text FROM tasks WHERE id=$1")
+            .bind(task_id)
+            .fetch_optional(&state.db.pool)
+            .await?;
+    if source.as_deref() != Some("local") {
+        return Err(AppError::Invalid(
+            "manual video upload requires a local V2 task".into(),
+        ));
+    }
+    let mut field = multipart
+        .next_field()
+        .await
+        .map_err(|_| AppError::Invalid("malformed multipart video upload".into()))?
+        .ok_or_else(|| AppError::Invalid("upload requires a file field".into()))?;
+    if field.name() != Some("file") {
+        return Err(AppError::Invalid(
+            "expected multipart field named file".into(),
+        ));
+    }
+    let filename = field.file_name().unwrap_or_default();
+    let ext = filename
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or_default()
+        .rsplit('.')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if !matches!(ext.as_str(), "mp4" | "webm" | "mkv" | "mov") {
+        return Err(AppError::Invalid(
+            "unsupported local video extension".into(),
+        ));
+    }
+    let directory = format!("v2/artifacts/{task_id}");
+    let dir = state.storage.resolve_existing(&directory).await?;
+    fs::create_dir_all(&dir).await?;
+    let file_id = Uuid::new_v4();
+    let key = format!("{directory}/{file_id}.{ext}");
+    let dest = state.storage.resolve_existing(&key).await?;
+    let temporary = dir.join(format!("{file_id}.uploading"));
+    let mut committed = false;
+    let result = async {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .await?;
+        let mut sha = Sha256::new();
+        let mut bytes = 0u64;
+        while let Some(chunk) = field
+            .chunk()
+            .await
+            .map_err(|_| AppError::Invalid("malformed multipart video chunk".into()))?
+        {
+            bytes = bytes
+                .checked_add(chunk.len() as u64)
+                .ok_or_else(|| AppError::Invalid("video byte count overflow".into()))?;
+            if bytes > VIDEO_MAX {
+                return Err(AppError::Invalid(
+                    "local video exceeds maximum supported size".into(),
+                ));
+            }
+            sha.update(&chunk);
+            file.write_all(&chunk).await?;
+        }
+        if bytes == 0 {
+            return Err(AppError::Invalid("empty local video".into()));
+        }
+        file.flush().await?;
+        file.sync_all().await?;
+        drop(file);
+        // Verify a valid video exists before committing any asset record.
+        crate::media::ffmpeg::probe_video(&state.config.ffprobe_binary, &temporary).await?;
+        fs::rename(&temporary, &dest).await?;
+        let sha = hex::encode(sha.finalize());
+        let mut tx = state.db.pool.begin().await?;
+        let task = sqlx::query(
+            "SELECT source_type::text AS source_type,status::text AS status
+             FROM tasks WHERE id=$1 FOR UPDATE",
+        )
+        .bind(task_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        let task_status: String = task.try_get("status")?;
+        if task.try_get::<String, _>("source_type")? != "local"
+            || !matches!(task_status.as_str(), "CREATED" | "INGESTED")
+        {
+            return Err(AppError::Conflict(
+                "task is no longer accepting a local source".into(),
+            ));
+        }
+        sqlx::query(
+            "INSERT INTO vr2_objects(storage_key,checksum_sha256,size_bytes,state,retain_until)
+             VALUES($1,$2,$3,'live',now()+interval '2 days')",
+        )
+        .bind(&key)
+        .bind(&sha)
+        .bind(bytes as i64)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO vr2_object_refs(storage_key,owner_type,owner_id,role)
+             VALUES($1,'task',$2,'video_raw')",
+        )
+        .bind(&key)
+        .bind(task_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO assets(id,task_id,kind,storage_key,sha256,size_bytes)
+             VALUES($1,$2,'video_raw'::asset_kind,$3,$4,$5)",
+        )
+        .bind(file_id)
+        .bind(task_id)
+        .bind(&key)
+        .bind(&sha)
+        .bind(bytes as i64)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE tasks SET status='INGESTED'::task_status,updated_at=now()
+             WHERE id=$1 AND status='CREATED'::task_status",
+        )
+        .bind(task_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        committed = true;
+        state.db.asset(file_id).await
+    }
+    .await;
+    match result {
+        Ok(asset) => Ok((StatusCode::CREATED, Json(asset))),
+        Err(error) => {
+            let _ = fs::remove_file(temporary).await;
+            if !committed {
+                let _ = fs::remove_file(dest).await;
+            }
+            Err(error)
+        }
+    }
+}
+
 pub fn parse_range(value: &str, size: u64) -> Option<(u64, u64)> {
     if size == 0 {
         return None;
@@ -147,7 +311,7 @@ pub fn parse_range(value: &str, size: u64) -> Option<(u64, u64)> {
     }
     Some((start, end))
 }
-async fn download(
+pub(crate) async fn download(
     State(state): State<AppState>,
     Path(asset_id): Path<Uuid>,
     request: Request,
@@ -177,10 +341,30 @@ async fn download(
     let mut response = Response::new(Body::from_stream(stream));
     *response.status_mut() = code;
     let headers = response.headers_mut();
-    headers.insert(
-        header::CONTENT_TYPE,
-        "application/octet-stream".parse().unwrap(),
-    );
+    // Browser <video> playback requires the correct MIME type with nosniff.
+    let ext = asset
+        .storage_key
+        .rsplit('.')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let mime = match ext.as_str() {
+        "mp4" | "m4v" => "video/mp4",
+        "webm" => "video/webm",
+        "mkv" => "video/x-matroska",
+        "mov" => "video/quicktime",
+        "mp3" => "audio/mpeg",
+        "wav" => "audio/wav",
+        "m4a" => "audio/mp4",
+        "flac" => "audio/flac",
+        "srt" => "application/x-subrip",
+        "ass" => "text/plain; charset=utf-8",
+        "json" => "application/json",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        _ => "application/octet-stream",
+    };
+    headers.insert(header::CONTENT_TYPE, mime.parse().unwrap());
     headers.insert(header::ACCEPT_RANGES, "bytes".parse().unwrap());
     headers.insert(header::CONTENT_LENGTH, length.to_string().parse().unwrap());
     headers.insert(header::CACHE_CONTROL, "private, no-store".parse().unwrap());

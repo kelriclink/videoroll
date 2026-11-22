@@ -9,7 +9,9 @@ CREATE TABLE tasks (
   source_type source_type NOT NULL,
   source_url TEXT,
   source_license source_license NOT NULL,
+  source_proof_url TEXT,
   status task_status NOT NULL,
+  stopped_status task_status,
   priority INTEGER NOT NULL DEFAULT 0,
   origin_kind VARCHAR(32),
   origin_run_id VARCHAR(64),
@@ -17,6 +19,7 @@ CREATE TABLE tasks (
   created_by VARCHAR(128),
   error_code VARCHAR(64),
   error_message TEXT,
+  retry_count INTEGER NOT NULL DEFAULT 0,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );

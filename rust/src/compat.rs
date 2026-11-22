@@ -56,7 +56,11 @@ pub async fn fallback(
     let url = trusted_url(&state.config)?
         .ok_or_else(|| AppError::NotFound("legacy API compatibility is disabled".into()))?;
     let path = request.uri().path();
-    if !path.starts_with("/api/") || path.starts_with("/api/v2/") {
+    if !path.starts_with("/api/")
+        || path.starts_with("/api/v2/")
+        || path.starts_with("/api/v1/")
+        || path == "/api/v1"
+    {
         return Err(AppError::NotFound("unsupported route".into()));
     }
     let method = request.method().clone();

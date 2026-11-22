@@ -63,6 +63,18 @@ type Source = {
   last_scan_error: string | null;
 };
 type SourceScan = { discovered: number; created: number; duplicated: number; pipelines_started: number };
+type ParitySummary = {
+  legacy_route_declarations: number;
+  frontend_url_references: number;
+  native_v1_adapters: number;
+  fully_verified_legacy_routes: number;
+  all_features_migrated: boolean;
+  services: Array<{
+    service: string; declared_routes: number; native_adapters: number;
+    requires_contract_verification: number;
+  }>;
+  warnings: string[];
+};
 
 const STAGES: Record<Stage, string> = {
   download: "下载",
@@ -359,6 +371,7 @@ function NativeSubtitlePanel({ connected }: { connected: boolean }) {
 }
 
 export default function RustV2Page() {
+  const [parity, setParity] = useState<ParitySummary | null>(null);
   const [snapshot, setSnapshot] = useState<QueueSnapshot | null>(null);
   const [tasks, setTasks] = useState<Task[]>([]);
   const [sources, setSources] = useState<Source[]>([]);
@@ -396,6 +409,13 @@ export default function RustV2Page() {
     const timer = window.setInterval(() => { void refresh(); }, 6_000);
     return () => window.clearInterval(timer);
   }, [refresh]);
+  useEffect(() => {
+    if (!connected) return;
+    void api<ParitySummary>("/parity")
+      .then(setParity)
+      .catch(() => setParity(null));
+  }, [connected]);
+
 
   const importTask = async () => {
     if (!sourceUrl.trim()) return;
@@ -462,6 +482,36 @@ export default function RustV2Page() {
         <span className="ml-2 text-xs">连接状态：{connected ? "已连接" : "未连接"}</span>
       </div>
       {error && <InlineNotice tone="danger">Rust API 不可用：{error}。检查测试环境的 V2 反向代理和管理员会话。</InlineNotice>}
+      <section className="rounded-xl border border-slate-200 p-4 dark:border-slate-800">
+        <h2 className="mb-2 font-semibold">原版 API / 前端迁移核查</h2>
+        <p className="text-xs text-slate-500">
+          此处使用源码审计清单，Rust 原生适配不代表全部行为已经通过原版契约验收。
+          原版前端可在隔离构建中选择 V2 API，但未完成的功能不允许伪造成功或自动转发到旧 Python 服务。
+        </p>
+        {parity ? (
+          <>
+            <div className="mt-3 grid gap-3 sm:grid-cols-4">
+              <Metric label="原版路由声明" value={parity.legacy_route_declarations} />
+              <Metric label="原版前端 API 引用" value={parity.frontend_url_references} />
+              <Metric label="Rust 原生适配入口" value={parity.native_v1_adapters} />
+              <Metric label="已完成全面契约验收" value={parity.fully_verified_legacy_routes} />
+            </div>
+            <div className="mt-3 grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
+              {parity.services.map((service) => (
+                <div key={service.service} className="rounded-lg border border-slate-200 p-2 text-xs dark:border-slate-800">
+                  <strong className="break-all">{service.service}</strong>
+                  <div className="mt-1 text-slate-500">
+                    原版 {service.declared_routes} · Rust 适配 {service.native_adapters}
+                    · 待核查 {service.requires_contract_verification}
+                  </div>
+                </div>
+              ))}
+            </div>
+          </>
+        ) : (
+          <p className="mt-2 text-xs text-slate-500">未能读取 Rust 原生迁移审计接口。</p>
+        )}
+      </section>
       <div className="grid gap-3 sm:grid-cols-3 lg:grid-cols-6">
         <Metric label="待处理" value={snapshot?.pending ?? "—"} />
         <Metric label="就绪" value={snapshot?.runnable ?? "—"} />

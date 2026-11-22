@@ -5,7 +5,7 @@ import AgentMonitorPanel from "./components/AgentMonitorPanel";
 import { FeedbackProvider } from "./components/Feedback";
 import SettingsLayout from "./components/SettingsLayout";
 import { fetchJson } from "./lib/http";
-import { ORCHESTRATOR_URL } from "./lib/urls";
+import { ORCHESTRATOR_URL, RUST_V2_FULL_UI_PREVIEW } from "./lib/urls";
 import { RealtimeProvider } from "./lib/RealtimeProvider";
 
 const DashboardPage = lazy(() => import("./pages/DashboardPage"));
@@ -281,6 +281,11 @@ export default function App() {
             </div>
           </div>
         </header>
+        {RUST_V2_FULL_UI_PREVIEW && (
+          <div role="alert" className="border-b border-amber-300 bg-amber-50 px-4 py-2 text-center text-xs text-amber-900 dark:border-amber-900 dark:bg-amber-950 dark:text-amber-100">
+            Rust 2.0 全页面隔离预览：当前 API 尚未完整迁移。此模式不可用于实际投稿，缺失功能应明确报错。
+          </div>
+        )}
 
         {mobileNavOpen ? (
           <div className="fixed inset-0 z-40 md:hidden">

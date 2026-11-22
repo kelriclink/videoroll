@@ -95,6 +95,99 @@ curl --silent --fail-with-body -b "$jar" \
   http://127.0.0.1:18080/api/v2/tasks | grep -q '0123456789A'
 echo 'PASS: native admin setup/login and browser cookie compatibility'
 
+# Original React TaskRead schema, isolated native V1 Rust routes.
+v1_status="$(curl --silent --fail-with-body http://127.0.0.1:18080/api/v1/auth/status)"
+V1_STATUS="$v1_status" python3 - <<'PYV1AUTH'
+import json,os
+status=json.loads(os.environ["V1_STATUS"])
+assert status=={"password_set":True,"trusted":False},status
+PYV1AUTH
+v1_anonymous="$(curl --silent -o /dev/null -w '%{http_code}' http://127.0.0.1:18080/api/v1/tasks)"
+test "$v1_anonymous" = 401
+v1_list="$(curl --silent --fail-with-body "${hdr[@]}" http://127.0.0.1:18080/api/v1/tasks?limit=2)"
+v1_id="$(FIRST="$first" python3 -c 'import os,json;print(json.loads(os.environ["FIRST"])["task"]["id"])')"
+v1_detail="$(curl --silent --fail-with-body "${hdr[@]}" "http://127.0.0.1:18080/api/v1/tasks/$v1_id")"
+V1_LIST="$v1_list" V1_DETAIL="$v1_detail" python3 - <<'PYV1TASK'
+import json,os
+rows=json.loads(os.environ["V1_LIST"])
+detail=json.loads(os.environ["V1_DETAIL"])
+required={"id","source_type","source_url","source_license","source_proof_url","status",
+          "stopped_status","priority","created_by","display_title","error_code",
+          "error_message","retry_count","bilibili_upload","created_at","updated_at"}
+assert len(rows)==1,rows
+assert required <= set(rows[0]),rows
+assert rows[0]==detail,rows
+assert detail["source_type"]=="youtube",detail
+assert detail["source_license"]=="authorized",detail
+assert detail["status"]=="CREATED",detail
+PYV1TASK
+legacy_unknown="$(curl --silent -o /dev/null -w '%{http_code}' "${hdr[@]}" http://127.0.0.1:18080/api/v1/some-not-migrated-route)"
+test "$legacy_unknown" = 404
+echo 'PASS: native V1 TaskRead/list, auth boundaries and no silent fallback to Python'
+system_json="$(curl --silent --fail-with-body "${hdr[@]}" http://127.0.0.1:18080/api/v1/system/resources)"
+SYSTEM_JSON="$system_json" python3 - <<'PYSYSTEM'
+import json,os,datetime
+v=json.loads(os.environ["SYSTEM_JSON"])
+assert v["cpu"]["cores"]>=1 and v["cpu"]["percent"] is None,v
+assert v["memory"]["total_bytes"]>0,v
+assert v["memory"]["used_bytes"]>=0,v
+assert v["memory"]["available_bytes"]>=0,v
+assert v["intel_gpu"] is None,v
+datetime.datetime.fromisoformat(v["sampled_at"])
+PYSYSTEM
+echo 'PASS: source-backed Linux system metrics without fabricated CPU/GPU utilization'
+
+
+# Contract: original TaskNewPage can submit its local upload directly
+# to native Rust without sending a video to the old Python backend.
+local_task="$(curl --silent --fail-with-body "${hdr[@]}"   -d '{"source_type":"local","source_url":null,"source_license":"own","created_by":"web","priority":0}'   http://127.0.0.1:18080/api/v1/tasks)"
+local_task_id="$(LOCAL_TASK="$local_task" python3 -c 'import os,json;print(json.loads(os.environ["LOCAL_TASK"])["id"])')"
+LOCAL_TASK="$local_task" python3 - <<'PYLOCAL'
+import json,os
+task=json.loads(os.environ["LOCAL_TASK"])
+assert task["source_type"]=="local" and task["status"]=="CREATED",task
+assert task["source_license"]=="own" and task["created_by"]=="web",task
+PYLOCAL
+local_video="$repo_root/rust/target/v2-v1-local-upload.mp4"
+ffmpeg -hide_banner -nostdin -loglevel error   -f lavfi -i 'color=c=black:s=160x90:r=25'   -f lavfi -i 'sine=frequency=470:sample_rate=44100'   -t 1.5 -c:v libx264 -pix_fmt yuv420p -c:a aac -shortest -y "$local_video"
+local_asset="$(curl --silent --fail-with-body   -H "x-videoroll-v2-internal-token: $VIDEOROLL_V2_INTERNAL_TOKEN"   -F "file=@$local_video;filename=local-upload.mp4;type=video/mp4"   "http://127.0.0.1:18080/api/v1/tasks/$local_task_id/upload/video")"
+LOCAL_ASSET="$local_asset" LOCAL_ID="$local_task_id" python3 - <<'PYLOCALASSET'
+import json,os
+asset=json.loads(os.environ["LOCAL_ASSET"])
+assert asset["task_id"]==os.environ["LOCAL_ID"],asset
+assert asset["kind"]=="video_raw" and asset["storage_key"].startswith("v2/"),asset
+assert len(asset["sha256"])==64 and asset["size_bytes"]>1000,asset
+PYLOCALASSET
+local_status="$(curl --silent --fail-with-body "${hdr[@]}" "http://127.0.0.1:18080/api/v1/tasks/$local_task_id")"
+LOCAL_STATUS="$local_status" python3 - <<'PYLOCALSTATUS'
+import json,os
+task=json.loads(os.environ["LOCAL_STATUS"])
+assert task["status"]=="INGESTED",task
+PYLOCALSTATUS
+local_stored="$(docker exec "$container_name" psql -At -U postgres -d videoroll_test -c   "SELECT count(*) FROM vr2_managed_tasks WHERE task_id='$local_task_id' AND origin='local_upload'")"
+test "$local_stored" = 1
+echo 'PASS: native V1 local TaskNewPage creation, verified streaming multipart, metadata and V2 ownership'
+stop_local="$(curl --silent --fail-with-body "${hdr[@]}" -X POST   "http://127.0.0.1:18080/api/v1/tasks/$local_task_id/actions/stop")"
+STOP_LOCAL="$stop_local" python3 - <<'PYSTOP'
+import os,json
+row=json.loads(os.environ["STOP_LOCAL"])
+assert row["status"]=="CANCELED" and row["stopped_status"]=="INGESTED",row
+PYSTOP
+curl --silent --fail-with-body "${hdr[@]}" -X POST   "http://127.0.0.1:18080/api/v1/tasks/$local_task_id/actions/resume"   | grep -q '"status":"INGESTED"'
+stop_first="$(curl --silent --fail-with-body "${hdr[@]}" -X POST   "http://127.0.0.1:18080/api/v1/tasks/$v1_id/actions/stop")"
+STOP_FIRST="$stop_first" python3 - <<'PYSTOPFLOW'
+import os,json
+row=json.loads(os.environ["STOP_FIRST"])
+assert row["status"]=="CANCELED" and row["stopped_status"]=="CREATED",row
+PYSTOPFLOW
+curl --silent --fail-with-body "${hdr[@]}"   "http://127.0.0.1:18080/api/v2/workflows/$workflow" | grep -q '"state":"paused"'
+curl --silent --fail-with-body "${hdr[@]}" -X POST   "http://127.0.0.1:18080/api/v1/tasks/$v1_id/actions/resume" | grep -q '"status":"CREATED"'
+curl --silent --fail-with-body "${hdr[@]}"   "http://127.0.0.1:18080/api/v2/workflows/$workflow" | grep -q '"state":"running"'
+echo 'PASS: native V1 individual stop/resume maintains original TaskStatus and durable workflow generation'
+
+
+
+
 # The original API compatibility surface is explicitly read-only and cannot
 # forward V2 credentials, unauthenticated calls or unknown non-API routes.
 legacy_read="$(curl --silent --fail-with-body "${hdr[@]}"   http://127.0.0.1:18080/api/compat/read)"
@@ -241,6 +334,36 @@ grep -q 'Hello from a Rust integration test' "$VIDEOROLL_V2_STORAGE_ROOT/$srt_ke
 ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of default=noprint_wrappers=1 "$VIDEOROLL_V2_STORAGE_ROOT/$video_key" | grep -q '^codec_name=h264'
 echo 'PASS: native OpenAI-compatible ASR, SRT/ASS, and real FFmpeg subtitle burn-in'
 
+# Converted videos, assets and range streaming use original frontend
+# response envelope but never serve non-V2 assets.
+v1_videos="$(curl --silent --fail-with-body "${hdr[@]}" http://127.0.0.1:18080/api/v1/videos/converted?limit=10)"
+v1_assets="$(curl --silent --fail-with-body "${hdr[@]}" "http://127.0.0.1:18080/api/v1/tasks/$asr_task_id/assets")"
+v1_subtitles="$(curl --silent --fail-with-body "${hdr[@]}" "http://127.0.0.1:18080/api/v1/tasks/$asr_task_id/subtitle_jobs")"
+V1_VIDEOS="$v1_videos" V1_ASSETS="$v1_assets" V1_SUBS="$v1_subtitles" ASR_TASK_ID="$asr_task_id" python3 - <<'PYV1VIDEO'
+import json,os
+task_id=os.environ["ASR_TASK_ID"]
+items=json.loads(os.environ["V1_VIDEOS"])
+video=next(x for x in items if x["task"]["id"]==task_id)
+assert video["task"]["status"]=="PUBLISHED",video
+assert video["final_asset"]["kind"]=="video_final",video
+assert video["final_asset"]["storage_key"].startswith("v2/"),video
+assets=json.loads(os.environ["V1_ASSETS"])
+assert {a["kind"] for a in assets}>={"subtitle_srt","video_final"},assets
+subs=json.loads(os.environ["V1_SUBS"])
+assert len(subs)==1 and subs[0]["status"]=="succeeded" and subs[0]["progress"]==100,subs
+PYV1VIDEO
+asr_final_id="$(docker exec "$container_name" psql -At -U postgres -d videoroll_test -c   "SELECT id FROM assets WHERE task_id='$asr_task_id' AND kind='video_final' LIMIT 1")"
+status="$(curl --silent -o /dev/null -w '%{http_code}' "${hdr[@]}"   "http://127.0.0.1:18080/api/v1/tasks/$v1_id/assets/$asr_final_id/stream")"
+test "$status" = 404
+curl --silent --fail-with-body "${hdr[@]}" -H 'range: bytes=0-511'   "http://127.0.0.1:18080/api/v1/tasks/$asr_task_id/assets/$asr_final_id/stream"   | head -c 512 > "$repo_root/rust/target/v2-v1-stream-prefix.bin"
+test "$(stat -c %s "$repo_root/rust/target/v2-v1-stream-prefix.bin")" = 512
+range_headers="$(curl --silent --show-error --fail-with-body -D - -o /dev/null "${hdr[@]}" \
+  -H 'range: bytes=0-1' \
+  "http://127.0.0.1:18080/api/v1/tasks/$asr_task_id/assets/$asr_final_id/stream")"
+echo "$range_headers" | grep -qi '^content-type: video/mp4'
+echo 'PASS: native V1 converted videos, asset isolation and range streaming'
+
+
 # ffplayout importer uses a flat translated filename and protects media.
 playout_payload="$(printf '{"task_id":"%s","channel_id":1,"part":1,"title":"中文 测试 视频"}' "$asr_task_id")"
 playout_result="$(curl --silent --fail-with-body "${hdr[@]}" -d "$playout_payload" http://127.0.0.1:18080/api/v2/playout/import)"
@@ -317,7 +440,7 @@ echo 'PASS: RAG evidence attached to translated workflow and persisted as audita
 
 # Deterministic YouDub mock: the real V2 adapter must create exactly one
 # third-party task, import a valid P2, and bind the video to that task.
-dubbing_task="$(curl --silent --fail-with-body "${hdr[@]}" -d  '{"url":"https://youtu.be/0123456789J","source_license":"authorized","configuration":{"auto_publish":true,"auto_publish_platforms":["bilibili"],"subtitle":{"translate_enabled":false},"dubbing":{"enabled":true}}}'  http://127.0.0.1:18080/api/v2/auto/youtube)"
+dubbing_task="$(curl --silent --fail-with-body "${hdr[@]}" -d  '{"url":"https://youtu.be/0123456789X","source_license":"authorized","configuration":{"auto_publish":true,"auto_publish_platforms":["bilibili"],"subtitle":{"translate_enabled":false},"dubbing":{"enabled":true}}}'  http://127.0.0.1:18080/api/v2/auto/youtube)"
 dubbing_task_id="$(DUB_TASK="$dubbing_task" python3 -c 'import os,json;print(json.loads(os.environ["DUB_TASK"])["task"]["id"])')"
 dubbing_workflow_id="$(DUB_TASK="$dubbing_task" python3 -c 'import os,json;print(json.loads(os.environ["DUB_TASK"])["workflow"]["id"])')"
 mkdir -p "$VIDEOROLL_V2_STORAGE_ROOT/v2/raw/$dubbing_task_id"
@@ -351,6 +474,20 @@ assert fields[3].startswith("v2/sub/"),fields
 assert fields[4]==os.environ["DUB_VIDEO"],fields
 PYDUB
 echo 'PASS: YouDub isolated adapter, deterministic model job, verified P2 video association'
+
+v1_dub_jobs="$(curl --silent --fail-with-body "${hdr[@]}" "http://127.0.0.1:18080/api/v1/tasks/$dubbing_task_id/dubbing_jobs")"
+v1_publish_jobs="$(curl --silent --fail-with-body "${hdr[@]}" "http://127.0.0.1:18080/api/v1/tasks/$dubbing_task_id/publish_jobs")"
+V1_DUB_JOBS="$v1_dub_jobs" V1_PUBLISH_JOBS="$v1_publish_jobs" DUB_VIDEO="$dub_video" python3 - <<'PYV1HISTORY'
+import json,os
+dub=json.loads(os.environ["V1_DUB_JOBS"])
+assert len(dub)==1 and dub[0]["status"]=="succeeded",dub
+assert dub[0]["output"]["video_key"]==os.environ["DUB_VIDEO"],dub
+pub=json.loads(os.environ["V1_PUBLISH_JOBS"])
+assert len(pub)==1 and pub[0]["state"]=="published",pub
+assert pub[0]["upload_progress"]==100,pub
+PYV1HISTORY
+echo 'PASS: native V1 dubbing and publish stage history adapters'
+
 
 # Post-publication native subtitle outbox (test-only confirmed receipts).
 docker exec "$container_name" psql -v ON_ERROR_STOP=1 -U postgres -d videoroll_test -c   "UPDATE vr2_jobs SET result=COALESCE(result,'{}'::jsonb)||jsonb_build_object('native_bilibili',true,'aid',101,'bvid','BV1mockNativeTest','parts',1) WHERE task_id='$asr_task_id' AND stage='publish' AND state='succeeded'; UPDATE vr2_jobs SET result=COALESCE(result,'{}'::jsonb)||jsonb_build_object('native_bilibili',true,'aid',102,'bvid','BV1mockNativeTest','parts',1) WHERE task_id='$index_task_id' AND stage='publish' AND state='succeeded'; UPDATE vr2_jobs SET result=COALESCE(result,'{}'::jsonb)||jsonb_build_object('native_bilibili',true,'aid',103,'bvid','BV1mockNativeTest','parts',2) WHERE task_id='$dubbing_task_id' AND stage='publish' AND state='succeeded'" >/dev/null
@@ -622,3 +759,40 @@ if [[ "$remote_final" != *'"status":"PUBLISHED"'* ]];then
   exit 1
 fi
 echo 'PASS: isolated Windows RenderWorker v1-compatible enrollment, claim, artifact, fence, upload, complete'
+
+# A manually created YouTube task has no runnable worker until explicitly
+# asked to start. A V1 page auto-create returns the exact legacy envelope.
+manual_src="$(curl --silent --fail-with-body "${hdr[@]}"   -d '{"url":"https://www.youtube.com/watch?v=0123456789Q","license":"authorized","proof_url":"https://example.org/license"}'   "http://127.0.0.1:18080/api/v1/youtube/ingest")"
+MANUAL_SRC="$manual_src" python3 - <<'PYMANUAL'
+import json,os
+data=json.loads(os.environ["MANUAL_SRC"])
+assert data["task_id"] and data["source_id"]=="0123456789Q",data
+assert data["deduped"]==False,data
+PYMANUAL
+manual_id="$(MANUAL_SRC="$manual_src" python3 -c 'import json,os;print(json.loads(os.environ["MANUAL_SRC"])["task_id"])')"
+manual_job_count="$(docker exec "$container_name" psql -At -U postgres -d videoroll_test -c   "SELECT count(*) FROM vr2_jobs WHERE task_id='$manual_id'")"
+test "$manual_job_count" = 0
+manual_task="$(curl --silent --fail-with-body "${hdr[@]}" "http://127.0.0.1:18080/api/v1/tasks/$manual_id")"
+MANUAL_TASK="$manual_task" python3 - <<'PYMANUALTASK'
+import json,os
+data=json.loads(os.environ["MANUAL_TASK"])
+assert data["source_type"]=="youtube" and data["status"]=="CREATED",data
+assert data["source_proof_url"]=="https://example.org/license",data
+PYMANUALTASK
+auto_src="$(curl --silent --fail-with-body "${hdr[@]}"   -d '{"url":"https://youtu.be/0123456789Y","license":"authorized","auto_publish":false}'   "http://127.0.0.1:18080/api/v1/auto/youtube")"
+AUTO_SRC="$auto_src" python3 - <<'PYAUTO'
+import json,os
+data=json.loads(os.environ["AUTO_SRC"])
+assert data["task_id"] and data["pipeline_job_id"] and not data["deduped"],data
+assert data["source_id"]=="0123456789Y",data
+PYAUTO
+parity="$(curl --silent --fail-with-body "${hdr[@]}" "http://127.0.0.1:18080/api/v2/parity")"
+PARITY="$parity" python3 - <<'PYPARITY'
+import json,os
+d=json.loads(os.environ["PARITY"])
+assert d["legacy_route_declarations"]==217,d
+assert d["native_v1_adapters"]>=24,d
+assert d["fully_verified_legacy_routes"]==0 and d["all_features_migrated"] is False,d
+assert d["frontend_url_references"]>=190,d
+PYPARITY
+echo 'PASS: original TaskNewPage YouTube manual/auto intake, conservative autopublish and API parity inventory'

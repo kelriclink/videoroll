@@ -102,10 +102,18 @@ pub async fn download_youtube(
     binary: &Path,
 ) -> AppResult<serde_json::Value> {
     let task = db.task(job.task_id).await?;
-    let source = task
-        .source_url
-        .ok_or_else(|| AppError::Invalid("missing YouTube source".into()))?;
-    youtube_video_id(&source)?;
+    let source = if task.source_type == "youtube" {
+        let url = task
+            .source_url
+            .as_deref()
+            .ok_or_else(|| AppError::Invalid("missing YouTube source".into()))?;
+        youtube_video_id(url)?;
+        Some(url.to_owned())
+    } else if task.source_type == "local" {
+        None
+    } else {
+        return Err(AppError::Invalid("unsupported V2 download source".into()));
+    };
     let rel_dir = format!("v2/raw/{}", job.task_id);
     let output_dir = registry.resolve_existing(&rel_dir).await?;
     fs::create_dir_all(&output_dir).await?;
@@ -129,6 +137,13 @@ pub async fn download_youtube(
             return Ok(serde_json::json!({"source":"existing_asset","storage_key":key}));
         }
     }
+    // Local uploads have no remote URL. They MUST reuse a registered
+    // task-owned video_raw asset and are never sent through yt-dlp.
+    let source = source.ok_or_else(|| {
+        AppError::Conflict(
+            "local task has no registered video_raw; upload it before starting".into(),
+        )
+    })?;
     // A run can have produced a full media file, then crash before DB commit.
     let video = match find_finished_video(&output_dir).await? {
         Some(existing) => existing,

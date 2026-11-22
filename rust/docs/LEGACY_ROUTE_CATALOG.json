@@ -1,0 +1,2176 @@
+{
+  "source": "src/videoroll/apps/**/*.py",
+  "note": "Declared routes, not verified parity",
+  "routes": [
+    {
+      "service": "bilibili_publisher",
+      "file": "src/videoroll/apps/bilibili_publisher/main.py",
+      "line": 114,
+      "method": "POST",
+      "path": "/bilibili/archive/type/recommend",
+      "handler": "recommend_archive_type",
+      "operation_id": null,
+      "response_model": "BilibiliTypeRecommendResponse"
+    },
+    {
+      "service": "bilibili_publisher",
+      "file": "src/videoroll/apps/bilibili_publisher/main.py",
+      "line": 96,
+      "method": "GET",
+      "path": "/bilibili/archive/types",
+      "handler": "get_archive_types",
+      "operation_id": null,
+      "response_model": "BilibiliArchiveTypesRead"
+    },
+    {
+      "service": "bilibili_publisher",
+      "file": "src/videoroll/apps/bilibili_publisher/main.py",
+      "line": 202,
+      "method": "GET",
+      "path": "/bilibili/auth/me",
+      "handler": "get_auth_me",
+      "operation_id": null,
+      "response_model": "BilibiliMeRead"
+    },
+    {
+      "service": "bilibili_publisher",
+      "file": "src/videoroll/apps/bilibili_publisher/main.py",
+      "line": 187,
+      "method": "GET",
+      "path": "/bilibili/auth/settings",
+      "handler": "get_auth_settings",
+      "operation_id": null,
+      "response_model": "BilibiliAuthSettingsRead"
+    },
+    {
+      "service": "bilibili_publisher",
+      "file": "src/videoroll/apps/bilibili_publisher/main.py",
+      "line": 193,
+      "method": "PUT",
+      "path": "/bilibili/auth/settings",
+      "handler": "put_auth_settings",
+      "operation_id": null,
+      "response_model": "BilibiliAuthSettingsRead"
+    },
+    {
+      "service": "bilibili_publisher",
+      "file": "src/videoroll/apps/bilibili_publisher/main.py",
+      "line": 279,
+      "method": "POST",
+      "path": "/bilibili/publish",
+      "handler": "publish",
+      "operation_id": null,
+      "response_model": "PublishResponse"
+    },
+    {
+      "service": "bilibili_publisher",
+      "file": "src/videoroll/apps/bilibili_publisher/main.py",
+      "line": 462,
+      "method": "GET",
+      "path": "/bilibili/publish/jobs/{job_id}",
+      "handler": "get_job",
+      "operation_id": null,
+      "response_model": "PublishJobRead"
+    },
+    {
+      "service": "bilibili_publisher",
+      "file": "src/videoroll/apps/bilibili_publisher/main.py",
+      "line": 172,
+      "method": "GET",
+      "path": "/bilibili/publish/settings",
+      "handler": "get_publish_settings",
+      "operation_id": null,
+      "response_model": "BilibiliPublishSettingsRead"
+    },
+    {
+      "service": "bilibili_publisher",
+      "file": "src/videoroll/apps/bilibili_publisher/main.py",
+      "line": 178,
+      "method": "PUT",
+      "path": "/bilibili/publish/settings",
+      "handler": "put_publish_settings",
+      "operation_id": null,
+      "response_model": "BilibiliPublishSettingsRead"
+    },
+    {
+      "service": "bilibili_publisher",
+      "file": "src/videoroll/apps/bilibili_publisher/main.py",
+      "line": 91,
+      "method": "GET",
+      "path": "/health",
+      "handler": "health",
+      "operation_id": null,
+      "response_model": null
+    },
+    {
+      "service": "egress_gateway",
+      "file": "src/videoroll/apps/egress_gateway/main.py",
+      "line": 83,
+      "method": "POST",
+      "path": "/fetch",
+      "handler": "fetch",
+      "operation_id": null,
+      "response_model": "FetchResponse"
+    },
+    {
+      "service": "egress_gateway",
+      "file": "src/videoroll/apps/egress_gateway/main.py",
+      "line": 61,
+      "method": "GET",
+      "path": "/health",
+      "handler": "health",
+      "operation_id": null,
+      "response_model": null
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/auth.py",
+      "line": 33,
+      "method": "POST",
+      "path": "/auth/login",
+      "handler": "auth_login",
+      "operation_id": null,
+      "response_model": "AdminAuthStatusRead"
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/auth.py",
+      "line": 42,
+      "method": "POST",
+      "path": "/auth/logout",
+      "handler": "auth_logout",
+      "operation_id": null,
+      "response_model": "AdminAuthStatusRead"
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/auth.py",
+      "line": 24,
+      "method": "POST",
+      "path": "/auth/setup",
+      "handler": "auth_setup",
+      "operation_id": null,
+      "response_model": "AdminAuthStatusRead"
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/auth.py",
+      "line": 19,
+      "method": "GET",
+      "path": "/auth/status",
+      "handler": "auth_status",
+      "operation_id": null,
+      "response_model": "AdminAuthStatusRead"
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/youtube.py",
+      "line": 65,
+      "method": "POST",
+      "path": "/auto/youtube",
+      "handler": "auto_youtube",
+      "operation_id": null,
+      "response_model": "AutoYouTubeResponse"
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/bilibili_discovery.py",
+      "line": 12,
+      "method": "GET",
+      "path": "/bilibili/discovery",
+      "handler": "bilibili_discovery",
+      "operation_id": null,
+      "response_model": null
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/publishing.py",
+      "line": 35,
+      "method": "GET",
+      "path": "/bilibili/{service_path:path}",
+      "handler": "proxy_bilibili_browser_operation",
+      "operation_id": "proxy_bilibili_browser_get",
+      "response_model": null
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/publishing.py",
+      "line": 36,
+      "method": "POST",
+      "path": "/bilibili/{service_path:path}",
+      "handler": "proxy_bilibili_browser_operation",
+      "operation_id": "proxy_bilibili_browser_post",
+      "response_model": null
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/publishing.py",
+      "line": 37,
+      "method": "PUT",
+      "path": "/bilibili/{service_path:path}",
+      "handler": "proxy_bilibili_browser_operation",
+      "operation_id": "proxy_bilibili_browser_put",
+      "response_model": null
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/desktop.py",
+      "line": 42,
+      "method": "GET",
+      "path": "/desktop/authorize",
+      "handler": "authorize_grant",
+      "operation_id": null,
+      "response_model": null
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/desktop.py",
+      "line": 25,
+      "method": "POST",
+      "path": "/desktop/grants",
+      "handler": "create_grant",
+      "operation_id": null,
+      "response_model": "DesktopGrantRead"
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/system.py",
+      "line": 14,
+      "method": "GET",
+      "path": "/health",
+      "handler": "health",
+      "operation_id": null,
+      "response_model": null
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/maintenance.py",
+      "line": 34,
+      "method": "POST",
+      "path": "/maintenance/storage/cleanup-terminal",
+      "handler": "cleanup_terminal_storage_resources",
+      "operation_id": null,
+      "response_model": "StorageResourceCleanupRead"
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/maintenance.py",
+      "line": 15,
+      "method": "GET",
+      "path": "/maintenance/workdir",
+      "handler": "get_workdir_maintenance",
+      "operation_id": null,
+      "response_model": "WorkdirMaintenanceRead"
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/maintenance.py",
+      "line": 23,
+      "method": "POST",
+      "path": "/maintenance/workdir/cleanup",
+      "handler": "cleanup_workdir_maintenance",
+      "operation_id": null,
+      "response_model": "WorkdirMaintenanceRead"
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/operations.py",
+      "line": 23,
+      "method": "GET",
+      "path": "/operations/ai-usage",
+      "handler": "get_ai_usage",
+      "operation_id": null,
+      "response_model": "AIUsageSummaryRead"
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/operations.py",
+      "line": 32,
+      "method": "GET",
+      "path": "/operations/ai-usage/pricing",
+      "handler": "get_ai_usage_pricing",
+      "operation_id": null,
+      "response_model": "AIUsagePricingRead"
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/operations.py",
+      "line": 37,
+      "method": "PUT",
+      "path": "/operations/ai-usage/pricing",
+      "handler": "put_ai_usage_pricing",
+      "operation_id": null,
+      "response_model": "AIUsagePricingRead"
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/operations.py",
+      "line": 46,
+      "method": "GET",
+      "path": "/operations/alerts",
+      "handler": "get_alerts",
+      "operation_id": null,
+      "response_model": "list[AlertRead]"
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/operations.py",
+      "line": 63,
+      "method": "POST",
+      "path": "/operations/alerts/report",
+      "handler": "post_alert_report",
+      "operation_id": null,
+      "response_model": "AlertRead | None"
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/operations.py",
+      "line": 58,
+      "method": "POST",
+      "path": "/operations/alerts/scan",
+      "handler": "post_alert_scan",
+      "operation_id": null,
+      "response_model": "AlertScanResponse"
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/operations.py",
+      "line": 71,
+      "method": "POST",
+      "path": "/operations/alerts/{alert_id}/ack",
+      "handler": "acknowledge_alert",
+      "operation_id": null,
+      "response_model": "AlertRead"
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/operations.py",
+      "line": 79,
+      "method": "POST",
+      "path": "/operations/alerts/{alert_id}/resolve",
+      "handler": "resolve_alert",
+      "operation_id": null,
+      "response_model": "AlertRead"
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/render_management.py",
+      "line": 22,
+      "method": "GET",
+      "path": "/render-management/connection",
+      "handler": "connection",
+      "operation_id": null,
+      "response_model": null
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/render_management.py",
+      "line": 26,
+      "method": "PUT",
+      "path": "/render-management/connection",
+      "handler": "update_connection",
+      "operation_id": null,
+      "response_model": null
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/render_management.py",
+      "line": 30,
+      "method": "GET",
+      "path": "/render-management/enrollments",
+      "handler": "enrollments",
+      "operation_id": null,
+      "response_model": "list[EnrollmentAdminRead]"
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/render_management.py",
+      "line": 34,
+      "method": "POST",
+      "path": "/render-management/enrollments",
+      "handler": "create_enrollment",
+      "operation_id": null,
+      "response_model": "EnrollmentCreateResponse"
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/render_management.py",
+      "line": 39,
+      "method": "DELETE",
+      "path": "/render-management/enrollments/{enrollment_id}",
+      "handler": "revoke_enrollment",
+      "operation_id": null,
+      "response_model": "EnrollmentAdminRead"
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/render_management.py",
+      "line": 62,
+      "method": "GET",
+      "path": "/render-management/executions",
+      "handler": "executions",
+      "operation_id": null,
+      "response_model": "list[ExecutionAdminRead]"
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/render_management.py",
+      "line": 81,
+      "method": "GET",
+      "path": "/render-management/executions/{execution_id}",
+      "handler": "execution",
+      "operation_id": null,
+      "response_model": "ExecutionAdminRead"
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/render_management.py",
+      "line": 85,
+      "method": "POST",
+      "path": "/render-management/executions/{execution_id}/cancel",
+      "handler": "cancel",
+      "operation_id": null,
+      "response_model": "ExecutionAdminRead"
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/render_management.py",
+      "line": 90,
+      "method": "POST",
+      "path": "/render-management/executions/{execution_id}/requeue",
+      "handler": "requeue",
+      "operation_id": null,
+      "response_model": "ExecutionAdminRead"
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/render_management.py",
+      "line": 43,
+      "method": "GET",
+      "path": "/render-management/workers",
+      "handler": "workers",
+      "operation_id": null,
+      "response_model": "list[WorkerAdminRead]"
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/render_management.py",
+      "line": 47,
+      "method": "PATCH",
+      "path": "/render-management/workers/{worker_id}",
+      "handler": "control_worker",
+      "operation_id": null,
+      "response_model": "WorkerAdminRead"
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/render_management.py",
+      "line": 52,
+      "method": "PATCH",
+      "path": "/render-management/workers/{worker_id}/devices/{device_id:path}",
+      "handler": "control_device",
+      "operation_id": null,
+      "response_model": "WorkerAdminRead"
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/render_management.py",
+      "line": 57,
+      "method": "POST",
+      "path": "/render-management/workers/{worker_id}/revoke-credential",
+      "handler": "revoke_worker",
+      "operation_id": null,
+      "response_model": "WorkerAdminRead"
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/render_workers.py",
+      "line": 58,
+      "method": "POST",
+      "path": "/render-workers/v1/enroll",
+      "handler": "enroll",
+      "operation_id": null,
+      "response_model": "WorkerEnrollResponse"
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/render_workers.py",
+      "line": 116,
+      "method": "GET",
+      "path": "/render-workers/v1/executions/{execution_id}/artifacts/{role}",
+      "handler": "download_artifact",
+      "operation_id": null,
+      "response_model": null
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/render_workers.py",
+      "line": 111,
+      "method": "GET",
+      "path": "/render-workers/v1/executions/{execution_id}/cancel",
+      "handler": "execution_cancel",
+      "operation_id": null,
+      "response_model": "ExecutionCancelRead"
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/render_workers.py",
+      "line": 207,
+      "method": "POST",
+      "path": "/render-workers/v1/executions/{execution_id}/complete",
+      "handler": "complete",
+      "operation_id": null,
+      "response_model": "ExecutionRead"
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/render_workers.py",
+      "line": 211,
+      "method": "POST",
+      "path": "/render-workers/v1/executions/{execution_id}/fail",
+      "handler": "fail",
+      "operation_id": null,
+      "response_model": "ExecutionRead"
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/render_workers.py",
+      "line": 99,
+      "method": "POST",
+      "path": "/render-workers/v1/executions/{execution_id}/heartbeat",
+      "handler": "execution_heartbeat",
+      "operation_id": null,
+      "response_model": "ExecutionRead"
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/render_workers.py",
+      "line": 107,
+      "method": "POST",
+      "path": "/render-workers/v1/executions/{execution_id}/logs",
+      "handler": "execution_logs",
+      "operation_id": null,
+      "response_model": "ExecutionRead"
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/render_workers.py",
+      "line": 188,
+      "method": "GET",
+      "path": "/render-workers/v1/executions/{execution_id}/output",
+      "handler": "registered_output",
+      "operation_id": null,
+      "response_model": "AssetRead"
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/render_workers.py",
+      "line": 130,
+      "method": "POST",
+      "path": "/render-workers/v1/executions/{execution_id}/output",
+      "handler": "upload_output",
+      "operation_id": null,
+      "response_model": "AssetRead"
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/render_workers.py",
+      "line": 103,
+      "method": "POST",
+      "path": "/render-workers/v1/executions/{execution_id}/progress",
+      "handler": "execution_progress",
+      "operation_id": null,
+      "response_model": "ExecutionRead"
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/render_workers.py",
+      "line": 63,
+      "method": "POST",
+      "path": "/render-workers/v1/local-enroll",
+      "handler": "local_enroll",
+      "operation_id": null,
+      "response_model": "WorkerEnrollResponse"
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/render_workers.py",
+      "line": 44,
+      "method": "GET",
+      "path": "/render-workers/v1/protocol",
+      "handler": "protocol",
+      "operation_id": null,
+      "response_model": null
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/render_workers.py",
+      "line": 89,
+      "method": "POST",
+      "path": "/render-workers/v1/{worker_id}/claim",
+      "handler": "claim",
+      "operation_id": null,
+      "response_model": "ClaimResponse"
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/render_workers.py",
+      "line": 85,
+      "method": "POST",
+      "path": "/render-workers/v1/{worker_id}/heartbeat",
+      "handler": "heartbeat",
+      "operation_id": null,
+      "response_model": "WorkerRead"
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/settings.py",
+      "line": 88,
+      "method": "GET",
+      "path": "/settings/api",
+      "handler": "get_remote_api_settings_view",
+      "operation_id": null,
+      "response_model": "RemoteAPISettingsRead"
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/settings.py",
+      "line": 93,
+      "method": "PUT",
+      "path": "/settings/api",
+      "handler": "put_remote_api_settings_view",
+      "operation_id": null,
+      "response_model": "RemoteAPISettingsRead"
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/youdub_native_routes.py",
+      "line": 43,
+      "method": "GET",
+      "path": "/settings/dubbing",
+      "handler": "settings",
+      "operation_id": null,
+      "response_model": null
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/youdub_native_routes.py",
+      "line": 48,
+      "method": "GET",
+      "path": "/settings/dubbing/jobs/summary",
+      "handler": "recent_native_jobs",
+      "operation_id": null,
+      "response_model": null
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/youdub_native_routes.py",
+      "line": 71,
+      "method": "GET",
+      "path": "/settings/dubbing/native",
+      "handler": "engine_state",
+      "operation_id": null,
+      "response_model": null
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/youdub_native_routes.py",
+      "line": 76,
+      "method": "PUT",
+      "path": "/settings/dubbing/native",
+      "handler": "engine_control",
+      "operation_id": null,
+      "response_model": null
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/publishing.py",
+      "line": 122,
+      "method": "GET",
+      "path": "/settings/publish/platforms",
+      "handler": "read_publish_platform_settings",
+      "operation_id": null,
+      "response_model": "PublishPlatformSettingsRead"
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/publishing.py",
+      "line": 127,
+      "method": "PUT",
+      "path": "/settings/publish/platforms/{platform}",
+      "handler": "put_publish_platform_setting",
+      "operation_id": null,
+      "response_model": "PublishPlatformSettingsRead"
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/publishing.py",
+      "line": 136,
+      "method": "GET",
+      "path": "/settings/publish/social/accounts",
+      "handler": "list_social_publish_accounts",
+      "operation_id": null,
+      "response_model": null
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/publishing.py",
+      "line": 181,
+      "method": "DELETE",
+      "path": "/settings/publish/social/accounts/{account_id}",
+      "handler": "delete_social_publish_account",
+      "operation_id": null,
+      "response_model": null
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/publishing.py",
+      "line": 174,
+      "method": "POST",
+      "path": "/settings/publish/social/accounts/{account_id}/check",
+      "handler": "check_social_publish_account",
+      "operation_id": null,
+      "response_model": null
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/publishing.py",
+      "line": 164,
+      "method": "POST",
+      "path": "/settings/publish/social/accounts/{platform}",
+      "handler": "import_social_publish_account",
+      "operation_id": null,
+      "response_model": null
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/publishing.py",
+      "line": 143,
+      "method": "POST",
+      "path": "/settings/publish/social/login-sessions/{platform}",
+      "handler": "start_social_login_session",
+      "operation_id": null,
+      "response_model": null
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/publishing.py",
+      "line": 157,
+      "method": "DELETE",
+      "path": "/settings/publish/social/login-sessions/{session_id}",
+      "handler": "cancel_social_login_session",
+      "operation_id": null,
+      "response_model": null
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/publishing.py",
+      "line": 150,
+      "method": "GET",
+      "path": "/settings/publish/social/login-sessions/{session_id}",
+      "handler": "get_social_login_session",
+      "operation_id": null,
+      "response_model": null
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/settings.py",
+      "line": 101,
+      "method": "GET",
+      "path": "/settings/review",
+      "handler": "get_publish_review_settings_view",
+      "operation_id": null,
+      "response_model": "PublishReviewSettingsRead"
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/settings.py",
+      "line": 106,
+      "method": "PUT",
+      "path": "/settings/review",
+      "handler": "put_publish_review_settings_view",
+      "operation_id": null,
+      "response_model": "PublishReviewSettingsRead"
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/settings.py",
+      "line": 71,
+      "method": "GET",
+      "path": "/settings/storage",
+      "handler": "get_storage_settings",
+      "operation_id": null,
+      "response_model": "StorageRetentionSettingsRead"
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/settings.py",
+      "line": 76,
+      "method": "PUT",
+      "path": "/settings/storage",
+      "handler": "put_storage_settings",
+      "operation_id": null,
+      "response_model": "StorageRetentionSettingsRead"
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/settings.py",
+      "line": 118,
+      "method": "GET",
+      "path": "/settings/youtube",
+      "handler": "get_youtube_settings_view",
+      "operation_id": null,
+      "response_model": "YouTubeSettingsRead"
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/settings.py",
+      "line": 128,
+      "method": "PUT",
+      "path": "/settings/youtube",
+      "handler": "put_youtube_settings_view",
+      "operation_id": null,
+      "response_model": "YouTubeSettingsRead"
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/youtube.py",
+      "line": 117,
+      "method": "POST",
+      "path": "/settings/youtube/home_scan/run",
+      "handler": "run_youtube_home_scan_now",
+      "operation_id": null,
+      "response_model": "YouTubeHomeScanRunResponse"
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/youtube.py",
+      "line": 139,
+      "method": "POST",
+      "path": "/settings/youtube/test",
+      "handler": "test_youtube_proxy",
+      "operation_id": null,
+      "response_model": "YouTubeProxyTestResponse"
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/settings.py",
+      "line": 41,
+      "method": "DELETE",
+      "path": "/subtitle/{service_path:path}",
+      "handler": "proxy_subtitle_browser_operation",
+      "operation_id": "proxy_subtitle_browser_delete",
+      "response_model": null
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/settings.py",
+      "line": 38,
+      "method": "GET",
+      "path": "/subtitle/{service_path:path}",
+      "handler": "proxy_subtitle_browser_operation",
+      "operation_id": "proxy_subtitle_browser_get",
+      "response_model": null
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/settings.py",
+      "line": 39,
+      "method": "POST",
+      "path": "/subtitle/{service_path:path}",
+      "handler": "proxy_subtitle_browser_operation",
+      "operation_id": "proxy_subtitle_browser_post",
+      "response_model": null
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/settings.py",
+      "line": 40,
+      "method": "PUT",
+      "path": "/subtitle/{service_path:path}",
+      "handler": "proxy_subtitle_browser_operation",
+      "operation_id": "proxy_subtitle_browser_put",
+      "response_model": null
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/system.py",
+      "line": 19,
+      "method": "GET",
+      "path": "/system/resources",
+      "handler": "system_resources",
+      "operation_id": null,
+      "response_model": "SystemResourcesRead"
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/tasks.py",
+      "line": 46,
+      "method": "GET",
+      "path": "/tasks",
+      "handler": "list_tasks",
+      "operation_id": null,
+      "response_model": "list[TaskRead]"
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/tasks.py",
+      "line": 33,
+      "method": "POST",
+      "path": "/tasks",
+      "handler": "create_task",
+      "operation_id": null,
+      "response_model": "TaskRead"
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/tasks.py",
+      "line": 198,
+      "method": "POST",
+      "path": "/tasks/actions/resume_failed_recent",
+      "handler": "resume_recent_failed_tasks",
+      "operation_id": null,
+      "response_model": "RecentFailedResumeResponse"
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/tasks.py",
+      "line": 129,
+      "method": "POST",
+      "path": "/tasks/actions/resume_stopped",
+      "handler": "resume_all_stopped_tasks",
+      "operation_id": null,
+      "response_model": "TaskBulkControlResponse"
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/tasks.py",
+      "line": 119,
+      "method": "POST",
+      "path": "/tasks/actions/stop_all",
+      "handler": "stop_all_tasks",
+      "operation_id": null,
+      "response_model": "TaskBulkControlResponse"
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/tasks.py",
+      "line": 56,
+      "method": "GET",
+      "path": "/tasks/{task_id}",
+      "handler": "get_task",
+      "operation_id": null,
+      "response_model": "TaskRead"
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/youdub_native_routes.py",
+      "line": 84,
+      "method": "POST",
+      "path": "/tasks/{task_id}/actions/auto_dubbing",
+      "handler": "auto_dubbing",
+      "operation_id": null,
+      "response_model": null
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/publishing.py",
+      "line": 188,
+      "method": "POST",
+      "path": "/tasks/{task_id}/actions/auto_publish",
+      "handler": "auto_publish_task",
+      "operation_id": null,
+      "response_model": null
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/tasks.py",
+      "line": 150,
+      "method": "POST",
+      "path": "/tasks/{task_id}/actions/auto_subtitle_handoff",
+      "handler": "auto_subtitle_handoff",
+      "operation_id": null,
+      "response_model": "AutoSubtitleHandoffResponse"
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/youtube.py",
+      "line": 112,
+      "method": "POST",
+      "path": "/tasks/{task_id}/actions/auto_youtube_start",
+      "handler": "start_auto_youtube_for_existing_task",
+      "operation_id": null,
+      "response_model": "AutoYouTubeTaskStartResponse"
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/youdub_native_routes.py",
+      "line": 206,
+      "method": "POST",
+      "path": "/tasks/{task_id}/actions/dubbing",
+      "handler": "create",
+      "operation_id": null,
+      "response_model": "RemoteJobResponse"
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/publishing.py",
+      "line": 210,
+      "method": "POST",
+      "path": "/tasks/{task_id}/actions/publish",
+      "handler": "enqueue_publish_job",
+      "operation_id": null,
+      "response_model": "RemotePublishResponse"
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/publishing.py",
+      "line": 200,
+      "method": "POST",
+      "path": "/tasks/{task_id}/actions/publish_all",
+      "handler": "publish_all_platforms",
+      "operation_id": null,
+      "response_model": "PublishAllResultResponse"
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/publishing.py",
+      "line": 94,
+      "method": "POST",
+      "path": "/tasks/{task_id}/actions/publish_review",
+      "handler": "run_task_publish_review",
+      "operation_id": null,
+      "response_model": "TaskPublishReviewRead"
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/tasks.py",
+      "line": 107,
+      "method": "POST",
+      "path": "/tasks/{task_id}/actions/resume",
+      "handler": "resume_stopped_task",
+      "operation_id": null,
+      "response_model": "TaskRead"
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/tasks.py",
+      "line": 96,
+      "method": "POST",
+      "path": "/tasks/{task_id}/actions/stop",
+      "handler": "stop_task",
+      "operation_id": null,
+      "response_model": "TaskRead"
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/tasks.py",
+      "line": 163,
+      "method": "POST",
+      "path": "/tasks/{task_id}/actions/subtitle",
+      "handler": "enqueue_subtitle_job",
+      "operation_id": null,
+      "response_model": "RemoteJobResponse"
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/tasks.py",
+      "line": 189,
+      "method": "POST",
+      "path": "/tasks/{task_id}/actions/subtitle_resume",
+      "handler": "resume_subtitle_job",
+      "operation_id": null,
+      "response_model": "RemoteJobResponse"
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/tasks.py",
+      "line": 174,
+      "method": "POST",
+      "path": "/tasks/{task_id}/actions/subtitle_retranslate",
+      "handler": "retranslate_subtitle_indices",
+      "operation_id": null,
+      "response_model": "RemoteJobResponse"
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/youtube.py",
+      "line": 156,
+      "method": "POST",
+      "path": "/tasks/{task_id}/actions/youtube_download",
+      "handler": "download_youtube",
+      "operation_id": null,
+      "response_model": "YouTubeDownloadActionResponse"
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/youtube.py",
+      "line": 167,
+      "method": "POST",
+      "path": "/tasks/{task_id}/actions/youtube_download_enqueue",
+      "handler": "enqueue_youtube_download",
+      "operation_id": null,
+      "response_model": null
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/youtube.py",
+      "line": 151,
+      "method": "POST",
+      "path": "/tasks/{task_id}/actions/youtube_meta",
+      "handler": "fetch_youtube_meta",
+      "operation_id": null,
+      "response_model": "YouTubeMetaActionResponse"
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/assets.py",
+      "line": 52,
+      "method": "GET",
+      "path": "/tasks/{task_id}/assets",
+      "handler": "list_task_assets",
+      "operation_id": null,
+      "response_model": "list[AssetRead]"
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/assets.py",
+      "line": 110,
+      "method": "DELETE",
+      "path": "/tasks/{task_id}/assets/{asset_id}",
+      "handler": "delete_task_asset",
+      "operation_id": null,
+      "response_model": null
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/assets.py",
+      "line": 79,
+      "method": "GET",
+      "path": "/tasks/{task_id}/assets/{asset_id}/download",
+      "handler": "download_task_asset",
+      "operation_id": null,
+      "response_model": null
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/assets.py",
+      "line": 62,
+      "method": "POST",
+      "path": "/tasks/{task_id}/assets/{asset_id}/playout",
+      "handler": "add_task_asset_to_playout",
+      "operation_id": null,
+      "response_model": "PlayoutAssetLinkRead"
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/assets.py",
+      "line": 91,
+      "method": "GET",
+      "path": "/tasks/{task_id}/assets/{asset_id}/stream",
+      "handler": "stream_task_asset",
+      "operation_id": null,
+      "response_model": null
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/youdub_native_routes.py",
+      "line": 183,
+      "method": "GET",
+      "path": "/tasks/{task_id}/dubbing_jobs",
+      "handler": "dubbing_history",
+      "operation_id": null,
+      "response_model": null
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/youdub_native_routes.py",
+      "line": 289,
+      "method": "POST",
+      "path": "/tasks/{task_id}/dubbing_jobs/{job_id}/confirm",
+      "handler": "retired_legacy_workflow",
+      "operation_id": null,
+      "response_model": null
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/youdub_native_routes.py",
+      "line": 268,
+      "method": "POST",
+      "path": "/tasks/{task_id}/dubbing_jobs/{job_id}/control",
+      "handler": "control",
+      "operation_id": null,
+      "response_model": null
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/youdub_native_routes.py",
+      "line": 288,
+      "method": "POST",
+      "path": "/tasks/{task_id}/dubbing_jobs/{job_id}/rerun",
+      "handler": "retired_legacy_workflow",
+      "operation_id": null,
+      "response_model": null
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/youdub_native_routes.py",
+      "line": 233,
+      "method": "POST",
+      "path": "/tasks/{task_id}/dubbing_jobs/{job_id}/retry",
+      "handler": "retry",
+      "operation_id": null,
+      "response_model": "RemoteJobResponse"
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/assets.py",
+      "line": 57,
+      "method": "GET",
+      "path": "/tasks/{task_id}/playout-assets",
+      "handler": "list_task_playout_assets",
+      "operation_id": null,
+      "response_model": "list[PlayoutAssetLinkRead]"
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/publishing.py",
+      "line": 113,
+      "method": "GET",
+      "path": "/tasks/{task_id}/publish_batches",
+      "handler": "list_task_publish_batches",
+      "operation_id": null,
+      "response_model": "list[PublishBatchSummary]"
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/publishing.py",
+      "line": 104,
+      "method": "GET",
+      "path": "/tasks/{task_id}/publish_jobs",
+      "handler": "list_task_publish_jobs",
+      "operation_id": null,
+      "response_model": "list[PublishJobSummary]"
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/publishing.py",
+      "line": 221,
+      "method": "POST",
+      "path": "/tasks/{task_id}/publish_jobs/{publish_job_id}/append_p2",
+      "handler": "append_bilibili_p2",
+      "operation_id": null,
+      "response_model": null
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/publishing.py",
+      "line": 57,
+      "method": "GET",
+      "path": "/tasks/{task_id}/publish_meta",
+      "handler": "get_task_publish_meta",
+      "operation_id": null,
+      "response_model": null
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/publishing.py",
+      "line": 82,
+      "method": "PUT",
+      "path": "/tasks/{task_id}/publish_meta",
+      "handler": "put_task_publish_meta",
+      "operation_id": null,
+      "response_model": null
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/publishing.py",
+      "line": 62,
+      "method": "GET",
+      "path": "/tasks/{task_id}/publish_meta/draft",
+      "handler": "get_task_publish_meta_draft",
+      "operation_id": null,
+      "response_model": "PublishMetaDraftResponse"
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/publishing.py",
+      "line": 69,
+      "method": "POST",
+      "path": "/tasks/{task_id}/publish_meta/draft",
+      "handler": "generate_task_publish_meta_draft",
+      "operation_id": null,
+      "response_model": "PublishMetaDraftResponse"
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/publishing.py",
+      "line": 89,
+      "method": "GET",
+      "path": "/tasks/{task_id}/publish_review",
+      "handler": "get_task_publish_review",
+      "operation_id": null,
+      "response_model": "TaskPublishReviewRead"
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/tasks.py",
+      "line": 141,
+      "method": "GET",
+      "path": "/tasks/{task_id}/subtitle_jobs",
+      "handler": "list_task_subtitle_jobs",
+      "operation_id": null,
+      "response_model": "list[SubtitleJobSummary]"
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/assets.py",
+      "line": 42,
+      "method": "POST",
+      "path": "/tasks/{task_id}/upload/cover",
+      "handler": "upload_task_cover",
+      "operation_id": null,
+      "response_model": "AssetRead"
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/assets.py",
+      "line": 32,
+      "method": "POST",
+      "path": "/tasks/{task_id}/upload/video",
+      "handler": "upload_task_video",
+      "operation_id": null,
+      "response_model": "AssetRead"
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/youtube.py",
+      "line": 189,
+      "method": "GET",
+      "path": "/tasks/{task_id}/youtube_download_progress",
+      "handler": "get_youtube_download_progress",
+      "operation_id": null,
+      "response_model": "YouTubeDownloadProgressRead"
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/youtube.py",
+      "line": 146,
+      "method": "GET",
+      "path": "/tasks/{task_id}/youtube_meta",
+      "handler": "get_cached_youtube_meta",
+      "operation_id": null,
+      "response_model": "YouTubeMetaRead"
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/tasks.py",
+      "line": 38,
+      "method": "GET",
+      "path": "/videos/converted",
+      "handler": "list_converted_videos",
+      "operation_id": null,
+      "response_model": "list[ConvertedVideoItem]"
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/realtime.py",
+      "line": 236,
+      "method": "WEBSOCKET",
+      "path": "/ws/events",
+      "handler": "realtime_events",
+      "operation_id": null,
+      "response_model": null
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/youtube.py",
+      "line": 45,
+      "method": "DELETE",
+      "path": "/youtube/{service_path:path}",
+      "handler": "proxy_youtube_browser_operation",
+      "operation_id": "proxy_youtube_browser_delete",
+      "response_model": null
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/youtube.py",
+      "line": 42,
+      "method": "GET",
+      "path": "/youtube/{service_path:path}",
+      "handler": "proxy_youtube_browser_operation",
+      "operation_id": "proxy_youtube_browser_get",
+      "response_model": null
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/youtube.py",
+      "line": 44,
+      "method": "PATCH",
+      "path": "/youtube/{service_path:path}",
+      "handler": "proxy_youtube_browser_operation",
+      "operation_id": "proxy_youtube_browser_patch",
+      "response_model": null
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/youtube.py",
+      "line": 43,
+      "method": "POST",
+      "path": "/youtube/{service_path:path}",
+      "handler": "proxy_youtube_browser_operation",
+      "operation_id": "proxy_youtube_browser_post",
+      "response_model": null
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/youtube.py",
+      "line": 103,
+      "method": "GET",
+      "path": null,
+      "handler": "remote_auto_youtube_legacy",
+      "operation_id": null,
+      "response_model": null
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/youtube.py",
+      "line": 70,
+      "method": "POST",
+      "path": null,
+      "handler": "remote_auto_youtube",
+      "operation_id": null,
+      "response_model": "AutoYouTubeResponse"
+    },
+    {
+      "service": "social_publisher",
+      "file": "src/videoroll/apps/social_publisher/main.py",
+      "line": 119,
+      "method": "GET",
+      "path": "/accounts",
+      "handler": "list_accounts",
+      "operation_id": null,
+      "response_model": "list[SocialAccountRead]"
+    },
+    {
+      "service": "social_publisher",
+      "file": "src/videoroll/apps/social_publisher/main.py",
+      "line": 183,
+      "method": "DELETE",
+      "path": "/accounts/{account_id}",
+      "handler": "delete_account",
+      "operation_id": null,
+      "response_model": null
+    },
+    {
+      "service": "social_publisher",
+      "file": "src/videoroll/apps/social_publisher/main.py",
+      "line": 163,
+      "method": "POST",
+      "path": "/accounts/{account_id}/check",
+      "handler": "recheck_account",
+      "operation_id": null,
+      "response_model": "SocialAccountImportResponse"
+    },
+    {
+      "service": "social_publisher",
+      "file": "src/videoroll/apps/social_publisher/main.py",
+      "line": 130,
+      "method": "POST",
+      "path": "/accounts/{platform}",
+      "handler": "import_account",
+      "operation_id": null,
+      "response_model": "SocialAccountImportResponse"
+    },
+    {
+      "service": "social_publisher",
+      "file": "src/videoroll/apps/social_publisher/main.py",
+      "line": 75,
+      "method": "GET",
+      "path": "/health",
+      "handler": "health",
+      "operation_id": null,
+      "response_model": null
+    },
+    {
+      "service": "social_publisher",
+      "file": "src/videoroll/apps/social_publisher/main.py",
+      "line": 93,
+      "method": "POST",
+      "path": "/login-sessions/{platform}",
+      "handler": "start_login_session",
+      "operation_id": null,
+      "response_model": "SocialLoginSessionRead"
+    },
+    {
+      "service": "social_publisher",
+      "file": "src/videoroll/apps/social_publisher/main.py",
+      "line": 111,
+      "method": "DELETE",
+      "path": "/login-sessions/{session_id}",
+      "handler": "cancel_login_session",
+      "operation_id": null,
+      "response_model": "SocialLoginSessionRead"
+    },
+    {
+      "service": "social_publisher",
+      "file": "src/videoroll/apps/social_publisher/main.py",
+      "line": 103,
+      "method": "GET",
+      "path": "/login-sessions/{session_id}",
+      "handler": "get_login_session",
+      "operation_id": null,
+      "response_model": "SocialLoginSessionRead"
+    },
+    {
+      "service": "social_publisher",
+      "file": "src/videoroll/apps/social_publisher/main.py",
+      "line": 208,
+      "method": "POST",
+      "path": "/sau/{platform}/publish",
+      "handler": "publish",
+      "operation_id": null,
+      "response_model": "SocialPublishResponse"
+    },
+    {
+      "service": "subtitle_service",
+      "file": "src/videoroll/apps/subtitle_service/main.py",
+      "line": 353,
+      "method": "GET",
+      "path": "/health",
+      "handler": "health",
+      "operation_id": null,
+      "response_model": null
+    },
+    {
+      "service": "subtitle_service",
+      "file": "src/videoroll/apps/subtitle_service/main.py",
+      "line": 1750,
+      "method": "GET",
+      "path": "/subtitle/agent/skills",
+      "handler": "list_agent_skills_view",
+      "operation_id": null,
+      "response_model": "list[AgentSkillRead]"
+    },
+    {
+      "service": "subtitle_service",
+      "file": "src/videoroll/apps/subtitle_service/main.py",
+      "line": 1704,
+      "method": "GET",
+      "path": "/subtitle/agents/runs",
+      "handler": "list_agent_runs_view",
+      "operation_id": null,
+      "response_model": "list[AgentRunRead]"
+    },
+    {
+      "service": "subtitle_service",
+      "file": "src/videoroll/apps/subtitle_service/main.py",
+      "line": 1727,
+      "method": "GET",
+      "path": "/subtitle/agents/runs/{run_id}",
+      "handler": "get_agent_run_view",
+      "operation_id": null,
+      "response_model": "AgentRunRead"
+    },
+    {
+      "service": "subtitle_service",
+      "file": "src/videoroll/apps/subtitle_service/main.py",
+      "line": 534,
+      "method": "POST",
+      "path": "/subtitle/asr/cloudflare/test",
+      "handler": "test_cloudflare_workers_ai",
+      "operation_id": null,
+      "response_model": "CloudflareWorkersAITestResponse"
+    },
+    {
+      "service": "subtitle_service",
+      "file": "src/videoroll/apps/subtitle_service/main.py",
+      "line": 466,
+      "method": "POST",
+      "path": "/subtitle/asr/external/test",
+      "handler": "test_external_whisper",
+      "operation_id": null,
+      "response_model": "ExternalWhisperTestResponse"
+    },
+    {
+      "service": "subtitle_service",
+      "file": "src/videoroll/apps/subtitle_service/main.py",
+      "line": 582,
+      "method": "POST",
+      "path": "/subtitle/asr/groq/test",
+      "handler": "test_groq_whisper",
+      "operation_id": null,
+      "response_model": "GroqWhisperTestResponse"
+    },
+    {
+      "service": "subtitle_service",
+      "file": "src/videoroll/apps/subtitle_service/main.py",
+      "line": 444,
+      "method": "GET",
+      "path": "/subtitle/asr/settings",
+      "handler": "get_asr_settings_view",
+      "operation_id": null,
+      "response_model": "ASRDefaultsRead"
+    },
+    {
+      "service": "subtitle_service",
+      "file": "src/videoroll/apps/subtitle_service/main.py",
+      "line": 453,
+      "method": "PUT",
+      "path": "/subtitle/asr/settings",
+      "handler": "put_asr_settings_view",
+      "operation_id": null,
+      "response_model": "ASRDefaultsRead"
+    },
+    {
+      "service": "subtitle_service",
+      "file": "src/videoroll/apps/subtitle_service/main.py",
+      "line": 630,
+      "method": "GET",
+      "path": "/subtitle/auto/profile",
+      "handler": "get_subtitle_auto_profile",
+      "operation_id": null,
+      "response_model": "SubtitleAutoProfileRead"
+    },
+    {
+      "service": "subtitle_service",
+      "file": "src/videoroll/apps/subtitle_service/main.py",
+      "line": 666,
+      "method": "PUT",
+      "path": "/subtitle/auto/profile",
+      "handler": "put_subtitle_auto_profile",
+      "operation_id": null,
+      "response_model": "SubtitleAutoProfileRead"
+    },
+    {
+      "service": "subtitle_service",
+      "file": "src/videoroll/apps/subtitle_service/main.py",
+      "line": 1489,
+      "method": "GET",
+      "path": "/subtitle/dictionaries/entries",
+      "handler": "list_dictionary_entries_view",
+      "operation_id": null,
+      "response_model": "list[DictionaryEntryRead]"
+    },
+    {
+      "service": "subtitle_service",
+      "file": "src/videoroll/apps/subtitle_service/main.py",
+      "line": 1555,
+      "method": "DELETE",
+      "path": "/subtitle/dictionaries/entries/{entry_id}",
+      "handler": "delete_dictionary_entry_view",
+      "operation_id": null,
+      "response_model": null
+    },
+    {
+      "service": "subtitle_service",
+      "file": "src/videoroll/apps/subtitle_service/main.py",
+      "line": 1533,
+      "method": "PUT",
+      "path": "/subtitle/dictionaries/entries/{entry_id}",
+      "handler": "update_dictionary_entry_view",
+      "operation_id": null,
+      "response_model": "DictionaryEntryRead"
+    },
+    {
+      "service": "subtitle_service",
+      "file": "src/videoroll/apps/subtitle_service/main.py",
+      "line": 1396,
+      "method": "POST",
+      "path": "/subtitle/dictionaries/import",
+      "handler": "import_dictionary_view",
+      "operation_id": null,
+      "response_model": "DictionaryImportResponse"
+    },
+    {
+      "service": "subtitle_service",
+      "file": "src/videoroll/apps/subtitle_service/main.py",
+      "line": 1391,
+      "method": "GET",
+      "path": "/subtitle/dictionaries/import-presets",
+      "handler": "list_dictionary_import_presets_view",
+      "operation_id": null,
+      "response_model": null
+    },
+    {
+      "service": "subtitle_service",
+      "file": "src/videoroll/apps/subtitle_service/main.py",
+      "line": 1576,
+      "method": "POST",
+      "path": "/subtitle/dictionaries/lookup",
+      "handler": "lookup_dictionary_view",
+      "operation_id": null,
+      "response_model": "DictionaryLookupResponse"
+    },
+    {
+      "service": "subtitle_service",
+      "file": "src/videoroll/apps/subtitle_service/main.py",
+      "line": 1613,
+      "method": "POST",
+      "path": "/subtitle/dictionaries/promote",
+      "handler": "promote_dictionary_entry_view",
+      "operation_id": null,
+      "response_model": "DictionaryPromoteResponse"
+    },
+    {
+      "service": "subtitle_service",
+      "file": "src/videoroll/apps/subtitle_service/main.py",
+      "line": 1329,
+      "method": "GET",
+      "path": "/subtitle/dictionaries/sources",
+      "handler": "list_dictionary_sources_view",
+      "operation_id": null,
+      "response_model": "list[DictionarySourceRead]"
+    },
+    {
+      "service": "subtitle_service",
+      "file": "src/videoroll/apps/subtitle_service/main.py",
+      "line": 1370,
+      "method": "DELETE",
+      "path": "/subtitle/dictionaries/sources/{source_id}",
+      "handler": "delete_dictionary_source_view",
+      "operation_id": null,
+      "response_model": null
+    },
+    {
+      "service": "subtitle_service",
+      "file": "src/videoroll/apps/subtitle_service/main.py",
+      "line": 1348,
+      "method": "PUT",
+      "path": "/subtitle/dictionaries/sources/{source_id}",
+      "handler": "update_dictionary_source_view",
+      "operation_id": null,
+      "response_model": "DictionarySourceRead"
+    },
+    {
+      "service": "subtitle_service",
+      "file": "src/videoroll/apps/subtitle_service/main.py",
+      "line": 1760,
+      "method": "GET",
+      "path": "/subtitle/embedding/models",
+      "handler": "list_embedding_models",
+      "operation_id": null,
+      "response_model": "list[EmbeddingModelInfo]"
+    },
+    {
+      "service": "subtitle_service",
+      "file": "src/videoroll/apps/subtitle_service/main.py",
+      "line": 1781,
+      "method": "POST",
+      "path": "/subtitle/embedding/models/download",
+      "handler": "download_embedding_model",
+      "operation_id": null,
+      "response_model": "EmbeddingModelInfo"
+    },
+    {
+      "service": "subtitle_service",
+      "file": "src/videoroll/apps/subtitle_service/main.py",
+      "line": 1769,
+      "method": "POST",
+      "path": "/subtitle/embedding/models/list",
+      "handler": "list_embedding_models_for_dir",
+      "operation_id": null,
+      "response_model": "list[EmbeddingModelInfo]"
+    },
+    {
+      "service": "subtitle_service",
+      "file": "src/videoroll/apps/subtitle_service/main.py",
+      "line": 1807,
+      "method": "DELETE",
+      "path": "/subtitle/embedding/models/{name}",
+      "handler": "delete_embedding_model",
+      "operation_id": null,
+      "response_model": null
+    },
+    {
+      "service": "subtitle_service",
+      "file": "src/videoroll/apps/subtitle_service/main.py",
+      "line": 1864,
+      "method": "GET",
+      "path": "/subtitle/embedding/runtime",
+      "handler": "get_embedding_runtime_status",
+      "operation_id": null,
+      "response_model": "EmbeddingRuntimeStatusRead"
+    },
+    {
+      "service": "subtitle_service",
+      "file": "src/videoroll/apps/subtitle_service/main.py",
+      "line": 1819,
+      "method": "POST",
+      "path": "/subtitle/embedding/test",
+      "handler": "test_embedding",
+      "operation_id": null,
+      "response_model": "EmbeddingTestResponse"
+    },
+    {
+      "service": "subtitle_service",
+      "file": "src/videoroll/apps/subtitle_service/main.py",
+      "line": 415,
+      "method": "GET",
+      "path": "/subtitle/hardware/intel",
+      "handler": "get_intel_hardware_view",
+      "operation_id": null,
+      "response_model": "IntelHardwareProbeRead"
+    },
+    {
+      "service": "subtitle_service",
+      "file": "src/videoroll/apps/subtitle_service/main.py",
+      "line": 2450,
+      "method": "POST",
+      "path": "/subtitle/jobs",
+      "handler": "create_job",
+      "operation_id": null,
+      "response_model": null
+    },
+    {
+      "service": "subtitle_service",
+      "file": "src/videoroll/apps/subtitle_service/main.py",
+      "line": 2493,
+      "method": "GET",
+      "path": "/subtitle/jobs/{job_id}",
+      "handler": "get_job",
+      "operation_id": null,
+      "response_model": "SubtitleJobRead"
+    },
+    {
+      "service": "subtitle_service",
+      "file": "src/videoroll/apps/subtitle_service/main.py",
+      "line": 1218,
+      "method": "POST",
+      "path": "/subtitle/knowledge/import",
+      "handler": "import_knowledge_items_view",
+      "operation_id": null,
+      "response_model": "KnowledgeBulkImportResponse"
+    },
+    {
+      "service": "subtitle_service",
+      "file": "src/videoroll/apps/subtitle_service/main.py",
+      "line": 963,
+      "method": "GET",
+      "path": "/subtitle/knowledge/items",
+      "handler": "list_knowledge_items_view",
+      "operation_id": null,
+      "response_model": "list[KnowledgeItemRead]"
+    },
+    {
+      "service": "subtitle_service",
+      "file": "src/videoroll/apps/subtitle_service/main.py",
+      "line": 989,
+      "method": "POST",
+      "path": "/subtitle/knowledge/items",
+      "handler": "upsert_knowledge_item_view",
+      "operation_id": null,
+      "response_model": "KnowledgeItemUpsertResponse"
+    },
+    {
+      "service": "subtitle_service",
+      "file": "src/videoroll/apps/subtitle_service/main.py",
+      "line": 1064,
+      "method": "DELETE",
+      "path": "/subtitle/knowledge/items/{item_id}",
+      "handler": "delete_knowledge_item_view",
+      "operation_id": null,
+      "response_model": null
+    },
+    {
+      "service": "subtitle_service",
+      "file": "src/videoroll/apps/subtitle_service/main.py",
+      "line": 1089,
+      "method": "POST",
+      "path": "/subtitle/knowledge/rebuild-embeddings",
+      "handler": "rebuild_knowledge_embeddings_view",
+      "operation_id": null,
+      "response_model": "KnowledgeEmbeddingRebuildResponse"
+    },
+    {
+      "service": "subtitle_service",
+      "file": "src/videoroll/apps/subtitle_service/main.py",
+      "line": 2030,
+      "method": "GET",
+      "path": "/subtitle/models",
+      "handler": "list_whisper_models",
+      "operation_id": null,
+      "response_model": "list[WhisperModelInfo]"
+    },
+    {
+      "service": "subtitle_service",
+      "file": "src/videoroll/apps/subtitle_service/main.py",
+      "line": 2045,
+      "method": "POST",
+      "path": "/subtitle/models/download",
+      "handler": "download_whisper_model",
+      "operation_id": null,
+      "response_model": "WhisperModelInfo"
+    },
+    {
+      "service": "subtitle_service",
+      "file": "src/videoroll/apps/subtitle_service/main.py",
+      "line": 2145,
+      "method": "POST",
+      "path": "/subtitle/models/proxy/test",
+      "handler": "test_model_download_proxy",
+      "operation_id": null,
+      "response_model": "ModelDownloadProxyTestResponse"
+    },
+    {
+      "service": "subtitle_service",
+      "file": "src/videoroll/apps/subtitle_service/main.py",
+      "line": 2086,
+      "method": "POST",
+      "path": "/subtitle/models/upload",
+      "handler": "upload_whisper_model",
+      "operation_id": null,
+      "response_model": "WhisperModelInfo"
+    },
+    {
+      "service": "subtitle_service",
+      "file": "src/videoroll/apps/subtitle_service/main.py",
+      "line": 2135,
+      "method": "DELETE",
+      "path": "/subtitle/models/{name}",
+      "handler": "delete_whisper_model",
+      "operation_id": null,
+      "response_model": null
+    },
+    {
+      "service": "subtitle_service",
+      "file": "src/videoroll/apps/subtitle_service/main.py",
+      "line": 358,
+      "method": "GET",
+      "path": "/subtitle/settings",
+      "handler": "get_subtitle_settings_view",
+      "operation_id": null,
+      "response_model": "WhisperSettingsRead"
+    },
+    {
+      "service": "subtitle_service",
+      "file": "src/videoroll/apps/subtitle_service/main.py",
+      "line": 2843,
+      "method": "GET",
+      "path": "/subtitle/task_queue",
+      "handler": "get_task_queue",
+      "operation_id": null,
+      "response_model": "TaskQueueRead"
+    },
+    {
+      "service": "subtitle_service",
+      "file": "src/videoroll/apps/subtitle_service/main.py",
+      "line": 2832,
+      "method": "GET",
+      "path": "/subtitle/task_queue/broker",
+      "handler": "get_task_queue_broker",
+      "operation_id": null,
+      "response_model": "BrokerQueueSnapshotRead"
+    },
+    {
+      "service": "subtitle_service",
+      "file": "src/videoroll/apps/subtitle_service/main.py",
+      "line": 2824,
+      "method": "PUT",
+      "path": "/subtitle/task_queue/settings",
+      "handler": "update_task_queue_settings",
+      "operation_id": null,
+      "response_model": "TaskQueueSettingsRead"
+    },
+    {
+      "service": "subtitle_service",
+      "file": "src/videoroll/apps/subtitle_service/main.py",
+      "line": 2351,
+      "method": "GET",
+      "path": "/subtitle/tasks/{task_id}/quality",
+      "handler": "get_task_subtitle_quality",
+      "operation_id": null,
+      "response_model": null
+    },
+    {
+      "service": "subtitle_service",
+      "file": "src/videoroll/apps/subtitle_service/main.py",
+      "line": 2365,
+      "method": "GET",
+      "path": "/subtitle/tasks/{task_id}/translation-context",
+      "handler": "get_task_translation_context",
+      "operation_id": null,
+      "response_model": null
+    },
+    {
+      "service": "subtitle_service",
+      "file": "src/videoroll/apps/subtitle_service/main.py",
+      "line": 2393,
+      "method": "PUT",
+      "path": "/subtitle/tasks/{task_id}/translation-context",
+      "handler": "put_task_translation_context",
+      "operation_id": null,
+      "response_model": null
+    },
+    {
+      "service": "subtitle_service",
+      "file": "src/videoroll/apps/subtitle_service/main.py",
+      "line": 773,
+      "method": "GET",
+      "path": "/subtitle/translate/model-providers",
+      "handler": "get_model_providers",
+      "operation_id": null,
+      "response_model": null
+    },
+    {
+      "service": "subtitle_service",
+      "file": "src/videoroll/apps/subtitle_service/main.py",
+      "line": 781,
+      "method": "POST",
+      "path": "/subtitle/translate/model-providers",
+      "handler": "create_model_provider",
+      "operation_id": null,
+      "response_model": null
+    },
+    {
+      "service": "subtitle_service",
+      "file": "src/videoroll/apps/subtitle_service/main.py",
+      "line": 809,
+      "method": "DELETE",
+      "path": "/subtitle/translate/model-providers/{provider_id}",
+      "handler": "remove_model_provider",
+      "operation_id": null,
+      "response_model": null
+    },
+    {
+      "service": "subtitle_service",
+      "file": "src/videoroll/apps/subtitle_service/main.py",
+      "line": 789,
+      "method": "PUT",
+      "path": "/subtitle/translate/model-providers/{provider_id}",
+      "handler": "update_model_provider",
+      "operation_id": null,
+      "response_model": null
+    },
+    {
+      "service": "subtitle_service",
+      "file": "src/videoroll/apps/subtitle_service/main.py",
+      "line": 818,
+      "method": "GET",
+      "path": "/subtitle/translate/model-providers/{provider_id}/remote-models",
+      "handler": "remote_model_provider_models",
+      "operation_id": null,
+      "response_model": null
+    },
+    {
+      "service": "subtitle_service",
+      "file": "src/videoroll/apps/subtitle_service/main.py",
+      "line": 828,
+      "method": "GET",
+      "path": "/subtitle/translate/settings",
+      "handler": "get_translate_settings_view",
+      "operation_id": null,
+      "response_model": "TranslateSettingsRead"
+    },
+    {
+      "service": "subtitle_service",
+      "file": "src/videoroll/apps/subtitle_service/main.py",
+      "line": 895,
+      "method": "PUT",
+      "path": "/subtitle/translate/settings",
+      "handler": "put_translate_settings_view",
+      "operation_id": null,
+      "response_model": "TranslateSettingsRead"
+    },
+    {
+      "service": "subtitle_service",
+      "file": "src/videoroll/apps/subtitle_service/main.py",
+      "line": 1985,
+      "method": "POST",
+      "path": "/subtitle/translate/test",
+      "handler": "translate_test",
+      "operation_id": null,
+      "response_model": "TranslateTestResponse"
+    },
+    {
+      "service": "youtube_ingest",
+      "file": "src/videoroll/apps/youtube_ingest/main.py",
+      "line": 111,
+      "method": "GET",
+      "path": "/health",
+      "handler": "health",
+      "operation_id": null,
+      "response_model": null
+    },
+    {
+      "service": "youtube_ingest",
+      "file": "src/videoroll/apps/youtube_ingest/main.py",
+      "line": 171,
+      "method": "POST",
+      "path": "/youtube/ingest",
+      "handler": "ingest_single",
+      "operation_id": null,
+      "response_model": "YouTubeIngestResponse"
+    },
+    {
+      "service": "youtube_ingest",
+      "file": "src/videoroll/apps/youtube_ingest/main.py",
+      "line": 210,
+      "method": "POST",
+      "path": "/youtube/scan",
+      "handler": "scan_source",
+      "operation_id": null,
+      "response_model": "YouTubeScanResponse"
+    },
+    {
+      "service": "youtube_ingest",
+      "file": "src/videoroll/apps/youtube_ingest/main.py",
+      "line": 142,
+      "method": "GET",
+      "path": "/youtube/sources",
+      "handler": "list_sources",
+      "operation_id": null,
+      "response_model": "list[YouTubeSourceRead]"
+    },
+    {
+      "service": "youtube_ingest",
+      "file": "src/videoroll/apps/youtube_ingest/main.py",
+      "line": 116,
+      "method": "POST",
+      "path": "/youtube/sources",
+      "handler": "create_source",
+      "operation_id": null,
+      "response_model": "YouTubeSourceRead"
+    },
+    {
+      "service": "youtube_ingest",
+      "file": "src/videoroll/apps/youtube_ingest/main.py",
+      "line": 161,
+      "method": "DELETE",
+      "path": "/youtube/sources/{source_pk}",
+      "handler": "delete_source",
+      "operation_id": null,
+      "response_model": null
+    },
+    {
+      "service": "youtube_ingest",
+      "file": "src/videoroll/apps/youtube_ingest/main.py",
+      "line": 148,
+      "method": "PATCH",
+      "path": "/youtube/sources/{source_pk}",
+      "handler": "patch_source",
+      "operation_id": null,
+      "response_model": "YouTubeSourceRead"
+    },
+    {
+      "service": "youtube_ingest",
+      "file": "src/videoroll/apps/youtube_ingest/main.py",
+      "line": 300,
+      "method": "POST",
+      "path": "/youtube/sources/{source_pk}/scan",
+      "handler": "scan_source_by_row_id",
+      "operation_id": null,
+      "response_model": "YouTubeScanResponse"
+    },
+    {
+      "service": "youtube_ingest",
+      "file": "src/videoroll/apps/youtube_ingest/main.py",
+      "line": 273,
+      "method": "POST",
+      "path": "/youtube/sources/{source_pk}/scan/start",
+      "handler": "start_source_scan",
+      "operation_id": null,
+      "response_model": "YouTubeSourceScanAccepted"
+    }
+  ]
+}

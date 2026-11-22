@@ -68,3 +68,13 @@ V2 React 页面只有在 VITE_RUST_V2_UI=true 时出现，生产界面默认没�
 - rust/src/compat.rs：默认关闭、显式只读的旧版 API 代理，用于旧页面迁移期间做功能对照，不代表代理接口已经 Rust 原生重写。
 
 以上模块仍需和生产版 RAG、ffplayout API、模型配置进行完整语义对照。参见 docs/INDEX_RAG_PARITY.md、docs/FEATURE_PARITY.md 和 docs/PLAYOUT_MIGRATION.md。
+
+
+## 旧版 API 与全页面 Rust 试验迁移
+
+- python3 rust/scripts/audit_legacy_routes.py 生成旧版路由与前端 API 调用审计；--check 检查与源码是否同步。明细保存在 rust/docs/PARITY_AUDIT.md 与 JSON 文件。
+- Rust /api/v1 为局部原生契约兼容层，限制 V2 任务所有权；/api/v2/parity 显示真正差异，不将同名路由当作完全兼容。
+- 可选试验构建 VITE_RUST_V2_FULL_UI=true；ORCHESTRATOR_URL 切换为 VITE_RUST_V2_LEGACY_API_URL（默认 /rust-v2/api/v1），默认生产未启用。
+- 本地任务由 POST /api/v1/tasks 和 POST /api/v1/tasks/{id}/upload/video 创建并流式传输；YouTube 手动与自动入口分别为 /api/v1/youtube/ingest 和 /api/v1/auto/youtube。
+- POST /api/v1/tasks/{id}/actions/stop 与 /resume 使用 Postgres 状态事务保留原任务状态，外部结果不确定的投稿不能自动重发。
+- 还有大量原版 API 和对应页面操作未迁移，**完整转 Rust 仍未完成**。生产原版必须保留。

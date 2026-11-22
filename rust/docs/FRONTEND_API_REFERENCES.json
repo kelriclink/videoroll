@@ -1,0 +1,971 @@
+{
+  "source": "src/web/src/**/*.ts*",
+  "note": "Textual candidate extraction; not complete TypeScript AST",
+  "references": [
+    {
+      "file": "src/web/src/App.tsx",
+      "line": 205,
+      "path_pattern": "/auth/logout`, { method: \"POST\" });"
+    },
+    {
+      "file": "src/web/src/api/desktop.ts",
+      "line": 19,
+      "path_pattern": "/desktop/grants"
+    },
+    {
+      "file": "src/web/src/api/publish.ts",
+      "line": 43,
+      "path_pattern": "/tasks/{}/publish_meta/draft"
+    },
+    {
+      "file": "src/web/src/api/publish.ts",
+      "line": 47,
+      "path_pattern": "/tasks/{}/publish_meta/draft"
+    },
+    {
+      "file": "src/web/src/api/publish.ts",
+      "line": 55,
+      "path_pattern": "/tasks/{}/publish_meta"
+    },
+    {
+      "file": "src/web/src/api/publish.ts",
+      "line": 63,
+      "path_pattern": "/bilibili/archive/types"
+    },
+    {
+      "file": "src/web/src/api/publish.ts",
+      "line": 67,
+      "path_pattern": "/bilibili/archive/type/recommend"
+    },
+    {
+      "file": "src/web/src/api/publish.ts",
+      "line": 75,
+      "path_pattern": "/tasks/{}/actions/publish_review"
+    },
+    {
+      "file": "src/web/src/api/publish.ts",
+      "line": 83,
+      "path_pattern": "/tasks/{}/actions/publish"
+    },
+    {
+      "file": "src/web/src/api/publish.ts",
+      "line": 92,
+      "path_pattern": "/tasks/{}/publish_jobs/{}/append_p2"
+    },
+    {
+      "file": "src/web/src/api/publish.ts",
+      "line": 101,
+      "path_pattern": "/settings/publish/social/accounts"
+    },
+    {
+      "file": "src/web/src/api/publish.ts",
+      "line": 105,
+      "path_pattern": "/settings/publish/platforms"
+    },
+    {
+      "file": "src/web/src/api/renderManagement.ts",
+      "line": 34,
+      "path_pattern": "/render-management/connection"
+    },
+    {
+      "file": "src/web/src/api/renderManagement.ts",
+      "line": 35,
+      "path_pattern": "/render-management/connection"
+    },
+    {
+      "file": "src/web/src/api/renderManagement.ts",
+      "line": 36,
+      "path_pattern": "/render-management/enrollments"
+    },
+    {
+      "file": "src/web/src/api/renderManagement.ts",
+      "line": 38,
+      "path_pattern": "/render-management/enrollments"
+    },
+    {
+      "file": "src/web/src/api/renderManagement.ts",
+      "line": 40,
+      "path_pattern": "/render-management/enrollments/{}"
+    },
+    {
+      "file": "src/web/src/api/renderManagement.ts",
+      "line": 41,
+      "path_pattern": "/render-management/workers"
+    },
+    {
+      "file": "src/web/src/api/renderManagement.ts",
+      "line": 48,
+      "path_pattern": "/render-management/executions"
+    },
+    {
+      "file": "src/web/src/api/renderManagement.ts",
+      "line": 51,
+      "path_pattern": "/render-management/workers/{}"
+    },
+    {
+      "file": "src/web/src/api/renderManagement.ts",
+      "line": 53,
+      "path_pattern": "/render-management/workers/{}/devices/{}"
+    },
+    {
+      "file": "src/web/src/api/renderManagement.ts",
+      "line": 55,
+      "path_pattern": "/render-management/workers/{}/revoke-credential"
+    },
+    {
+      "file": "src/web/src/api/renderManagement.ts",
+      "line": 57,
+      "path_pattern": "/render-management/executions/{}/cancel"
+    },
+    {
+      "file": "src/web/src/api/renderManagement.ts",
+      "line": 59,
+      "path_pattern": "/render-management/executions/{}/requeue"
+    },
+    {
+      "file": "src/web/src/api/subtitle.ts",
+      "line": 131,
+      "path_pattern": "/subtitle/models"
+    },
+    {
+      "file": "src/web/src/api/subtitle.ts",
+      "line": 135,
+      "path_pattern": "/subtitle/auto/profile"
+    },
+    {
+      "file": "src/web/src/api/subtitle.ts",
+      "line": 139,
+      "path_pattern": "/subtitle/translate/settings"
+    },
+    {
+      "file": "src/web/src/api/subtitle.ts",
+      "line": 143,
+      "path_pattern": "/subtitle/tasks/{}/quality"
+    },
+    {
+      "file": "src/web/src/api/subtitle.ts",
+      "line": 147,
+      "path_pattern": "/subtitle/tasks/{}/translation-context"
+    },
+    {
+      "file": "src/web/src/api/subtitle.ts",
+      "line": 154,
+      "path_pattern": "/subtitle/tasks/{}/translation-context"
+    },
+    {
+      "file": "src/web/src/api/subtitle.ts",
+      "line": 162,
+      "path_pattern": "/tasks/{}/actions/subtitle_retranslate"
+    },
+    {
+      "file": "src/web/src/api/subtitle.ts",
+      "line": 170,
+      "path_pattern": "/tasks/{}/actions/subtitle"
+    },
+    {
+      "file": "src/web/src/api/subtitle.ts",
+      "line": 178,
+      "path_pattern": "/tasks/{}/actions/subtitle_resume"
+    },
+    {
+      "file": "src/web/src/api/tasks.ts",
+      "line": 63,
+      "path_pattern": "/tasks/{}"
+    },
+    {
+      "file": "src/web/src/api/tasks.ts",
+      "line": 67,
+      "path_pattern": "/tasks/{}/assets"
+    },
+    {
+      "file": "src/web/src/api/tasks.ts",
+      "line": 71,
+      "path_pattern": "/tasks/{}/playout-assets"
+    },
+    {
+      "file": "src/web/src/api/tasks.ts",
+      "line": 75,
+      "path_pattern": "/tasks/{}/assets/{}/playout"
+    },
+    {
+      "file": "src/web/src/api/tasks.ts",
+      "line": 79,
+      "path_pattern": "/tasks/{}/subtitle_jobs"
+    },
+    {
+      "file": "src/web/src/api/tasks.ts",
+      "line": 83,
+      "path_pattern": "/tasks/{}/dubbing_jobs"
+    },
+    {
+      "file": "src/web/src/api/tasks.ts",
+      "line": 88,
+      "path_pattern": "/tasks/{}/actions/dubbing"
+    },
+    {
+      "file": "src/web/src/api/tasks.ts",
+      "line": 96,
+      "path_pattern": "/tasks/{}/dubbing_jobs/{}/rerun"
+    },
+    {
+      "file": "src/web/src/api/tasks.ts",
+      "line": 103,
+      "path_pattern": "/tasks/{}/dubbing_jobs/{}/control"
+    },
+    {
+      "file": "src/web/src/api/tasks.ts",
+      "line": 110,
+      "path_pattern": "/tasks/{}/dubbing_jobs/{}/confirm"
+    },
+    {
+      "file": "src/web/src/api/tasks.ts",
+      "line": 117,
+      "path_pattern": "/tasks/{}/dubbing_jobs/{}/retry"
+    },
+    {
+      "file": "src/web/src/api/tasks.ts",
+      "line": 127,
+      "path_pattern": "/tasks/{}/dubbing_jobs/{}/segments"
+    },
+    {
+      "file": "src/web/src/api/tasks.ts",
+      "line": 132,
+      "path_pattern": "/tasks/{}/dubbing_jobs/{}/segments/{}"
+    },
+    {
+      "file": "src/web/src/api/tasks.ts",
+      "line": 140,
+      "path_pattern": "/tasks/{}/dubbing_jobs/{}/segments/{}/suggest"
+    },
+    {
+      "file": "src/web/src/api/tasks.ts",
+      "line": 146,
+      "path_pattern": "/tasks/{}/dubbing_jobs/{}/segments/{}/audio{}"
+    },
+    {
+      "file": "src/web/src/api/tasks.ts",
+      "line": 150,
+      "path_pattern": "/tasks/{}/publish_jobs"
+    },
+    {
+      "file": "src/web/src/api/tasks.ts",
+      "line": 154,
+      "path_pattern": "/tasks/{}/publish_batches"
+    },
+    {
+      "file": "src/web/src/api/tasks.ts",
+      "line": 158,
+      "path_pattern": "/tasks/{}/publish_review"
+    },
+    {
+      "file": "src/web/src/api/tasks.ts",
+      "line": 162,
+      "path_pattern": "/tasks/{}/actions/stop"
+    },
+    {
+      "file": "src/web/src/api/tasks.ts",
+      "line": 166,
+      "path_pattern": "/tasks/{}/actions/resume"
+    },
+    {
+      "file": "src/web/src/api/tasks.ts",
+      "line": 170,
+      "path_pattern": "/tasks/{}/actions/youtube_download"
+    },
+    {
+      "file": "src/web/src/api/tasks.ts",
+      "line": 174,
+      "path_pattern": "/tasks/{}/actions/youtube_meta"
+    },
+    {
+      "file": "src/web/src/api/tasks.ts",
+      "line": 180,
+      "path_pattern": "/tasks/{}/upload/video"
+    },
+    {
+      "file": "src/web/src/api/tasks.ts",
+      "line": 186,
+      "path_pattern": "/tasks/{}/upload/cover"
+    },
+    {
+      "file": "src/web/src/api/tasks.ts",
+      "line": 190,
+      "path_pattern": "/tasks/{}/assets/{}"
+    },
+    {
+      "file": "src/web/src/api/tasks.ts",
+      "line": 194,
+      "path_pattern": "/tasks/{}/youtube_download_progress"
+    },
+    {
+      "file": "src/web/src/api/tasks.ts",
+      "line": 198,
+      "path_pattern": "/tasks/{}/assets/{}/download"
+    },
+    {
+      "file": "src/web/src/api/tasks.ts",
+      "line": 202,
+      "path_pattern": "/tasks/{}/assets/{}/stream"
+    },
+    {
+      "file": "src/web/src/api/translate.ts",
+      "line": 150,
+      "path_pattern": "/subtitle/translate/model-providers"
+    },
+    {
+      "file": "src/web/src/api/translate.ts",
+      "line": 155,
+      "path_pattern": "/subtitle/translate/model-providers"
+    },
+    {
+      "file": "src/web/src/api/translate.ts",
+      "line": 161,
+      "path_pattern": "/subtitle/translate/model-providers/"
+    },
+    {
+      "file": "src/web/src/api/translate.ts",
+      "line": 169,
+      "path_pattern": "/subtitle/translate/model-providers/"
+    },
+    {
+      "file": "src/web/src/api/translate.ts",
+      "line": 174,
+      "path_pattern": "/subtitle/translate/settings"
+    },
+    {
+      "file": "src/web/src/api/translate.ts",
+      "line": 178,
+      "path_pattern": "/subtitle/translate/settings"
+    },
+    {
+      "file": "src/web/src/api/translate.ts",
+      "line": 186,
+      "path_pattern": "/subtitle/embedding/models/list"
+    },
+    {
+      "file": "src/web/src/api/translate.ts",
+      "line": 194,
+      "path_pattern": "/subtitle/agent/skills"
+    },
+    {
+      "file": "src/web/src/api/translate.ts",
+      "line": 198,
+      "path_pattern": "/subtitle/embedding/runtime"
+    },
+    {
+      "file": "src/web/src/api/translate.ts",
+      "line": 202,
+      "path_pattern": "/subtitle/knowledge/rebuild-embeddings"
+    },
+    {
+      "file": "src/web/src/api/translate.ts",
+      "line": 210,
+      "path_pattern": "/subtitle/embedding/models/download"
+    },
+    {
+      "file": "src/web/src/api/translate.ts",
+      "line": 228,
+      "path_pattern": "/subtitle/embedding/test"
+    },
+    {
+      "file": "src/web/src/api/translate.ts",
+      "line": 236,
+      "path_pattern": "/subtitle/translate/test"
+    },
+    {
+      "file": "src/web/src/components/AuthGate.tsx",
+      "line": 20,
+      "path_pattern": "/auth/status`);"
+    },
+    {
+      "file": "src/web/src/components/AuthGate.tsx",
+      "line": 25,
+      "path_pattern": "/auth/setup`,"
+    },
+    {
+      "file": "src/web/src/components/AuthGate.tsx",
+      "line": 31,
+      "path_pattern": "/auth/login`, {"
+    },
+    {
+      "file": "src/web/src/features/bilibili-discovery/BilibiliDiscoveryView.tsx",
+      "line": 131,
+      "path_pattern": "/bilibili/discovery{}`);"
+    },
+    {
+      "file": "src/web/src/features/settings-translate/components/ModelProvidersWorkspace.tsx",
+      "line": 81,
+      "path_pattern": "/bilibili/publish/settings"
+    },
+    {
+      "file": "src/web/src/features/settings-translate/components/ModelProvidersWorkspace.tsx",
+      "line": 97,
+      "path_pattern": "/bilibili/publish/settings"
+    },
+    {
+      "file": "src/web/src/features/task-detail/TaskCompatibilityAlerts.tsx",
+      "line": 20,
+      "path_pattern": "/operations/alerts"
+    },
+    {
+      "file": "src/web/src/features/task-detail/components/TaskDetailYouDub.tsx",
+      "line": 67,
+      "path_pattern": "/settings/dubbing"
+    },
+    {
+      "file": "src/web/src/pages/DashboardPage.tsx",
+      "line": 163,
+      "path_pattern": "/tasks"
+    },
+    {
+      "file": "src/web/src/pages/DashboardPage.tsx",
+      "line": 164,
+      "path_pattern": "/videos/converted"
+    },
+    {
+      "file": "src/web/src/pages/DashboardPage.tsx",
+      "line": 165,
+      "path_pattern": "/operations/alerts"
+    },
+    {
+      "file": "src/web/src/pages/DashboardPage.tsx",
+      "line": 166,
+      "path_pattern": "/system/resources`),"
+    },
+    {
+      "file": "src/web/src/pages/DashboardPage.tsx",
+      "line": 318,
+      "path_pattern": "/tasks/{}/assets/{}/download`}"
+    },
+    {
+      "file": "src/web/src/pages/DictionaryPage.tsx",
+      "line": 131,
+      "path_pattern": "/subtitle/dictionaries/sources`);"
+    },
+    {
+      "file": "src/web/src/pages/DictionaryPage.tsx",
+      "line": 136,
+      "path_pattern": "/subtitle/dictionaries/entries"
+    },
+    {
+      "file": "src/web/src/pages/DictionaryPage.tsx",
+      "line": 154,
+      "path_pattern": "/subtitle/dictionaries/import-presets`)"
+    },
+    {
+      "file": "src/web/src/pages/DictionaryPage.tsx",
+      "line": 204,
+      "path_pattern": "/subtitle/dictionaries/import`, {"
+    },
+    {
+      "file": "src/web/src/pages/DictionaryPage.tsx",
+      "line": 222,
+      "path_pattern": "/subtitle/dictionaries/sources/{}`, {"
+    },
+    {
+      "file": "src/web/src/pages/DictionaryPage.tsx",
+      "line": 246,
+      "path_pattern": "/subtitle/dictionaries/sources/{}`, { method: \"DELETE\" });"
+    },
+    {
+      "file": "src/web/src/pages/DictionaryPage.tsx",
+      "line": 260,
+      "path_pattern": "/subtitle/dictionaries/entries/{}`, {"
+    },
+    {
+      "file": "src/web/src/pages/DictionaryPage.tsx",
+      "line": 284,
+      "path_pattern": "/subtitle/dictionaries/entries/{}`, { method: \"DELETE\" });"
+    },
+    {
+      "file": "src/web/src/pages/DictionaryPage.tsx",
+      "line": 298,
+      "path_pattern": "/subtitle/dictionaries/promote`, {"
+    },
+    {
+      "file": "src/web/src/pages/DictionaryPage.tsx",
+      "line": 316,
+      "path_pattern": "/subtitle/dictionaries/lookup`, {"
+    },
+    {
+      "file": "src/web/src/pages/KnowledgeBasePage.tsx",
+      "line": 97,
+      "path_pattern": "/subtitle/knowledge/items"
+    },
+    {
+      "file": "src/web/src/pages/KnowledgeBasePage.tsx",
+      "line": 142,
+      "path_pattern": "/subtitle/knowledge/items`, {"
+    },
+    {
+      "file": "src/web/src/pages/KnowledgeBasePage.tsx",
+      "line": 183,
+      "path_pattern": "/subtitle/knowledge/import`,"
+    },
+    {
+      "file": "src/web/src/pages/KnowledgeBasePage.tsx",
+      "line": 212,
+      "path_pattern": "/subtitle/knowledge/rebuild-embeddings`,"
+    },
+    {
+      "file": "src/web/src/pages/KnowledgeBasePage.tsx",
+      "line": 243,
+      "path_pattern": "/subtitle/knowledge/items/{}`, { method: \"DELETE\" });"
+    },
+    {
+      "file": "src/web/src/pages/OperationsPage.tsx",
+      "line": 77,
+      "path_pattern": "/operations/ai-usage"
+    },
+    {
+      "file": "src/web/src/pages/OperationsPage.tsx",
+      "line": 78,
+      "path_pattern": "/operations/alerts"
+    },
+    {
+      "file": "src/web/src/pages/OperationsPage.tsx",
+      "line": 79,
+      "path_pattern": "/operations/alerts"
+    },
+    {
+      "file": "src/web/src/pages/OperationsPage.tsx",
+      "line": 80,
+      "path_pattern": "/operations/ai-usage/pricing`),"
+    },
+    {
+      "file": "src/web/src/pages/OperationsPage.tsx",
+      "line": 103,
+      "path_pattern": "/operations/alerts/scan`, { method: \"POST\" });"
+    },
+    {
+      "file": "src/web/src/pages/OperationsPage.tsx",
+      "line": 116,
+      "path_pattern": "/operations/alerts/{}/{}`, { method: \"POST\" });"
+    },
+    {
+      "file": "src/web/src/pages/OperationsPage.tsx",
+      "line": 130,
+      "path_pattern": "/operations/ai-usage/pricing`, {"
+    },
+    {
+      "file": "src/web/src/pages/RenderQueuePage.tsx",
+      "line": 100,
+      "path_pattern": "/subtitle/task_queue/broker`);"
+    },
+    {
+      "file": "src/web/src/pages/RenderQueuePage.tsx",
+      "line": 111,
+      "path_pattern": "/subtitle/task_queue"
+    },
+    {
+      "file": "src/web/src/pages/RenderQueuePage.tsx",
+      "line": 130,
+      "path_pattern": "/subtitle/task_queue/settings`, {"
+    },
+    {
+      "file": "src/web/src/pages/SettingsASRPage.tsx",
+      "line": 200,
+      "path_pattern": "/subtitle/settings`),"
+    },
+    {
+      "file": "src/web/src/pages/SettingsASRPage.tsx",
+      "line": 201,
+      "path_pattern": "/subtitle/models`),"
+    },
+    {
+      "file": "src/web/src/pages/SettingsASRPage.tsx",
+      "line": 202,
+      "path_pattern": "/subtitle/asr/settings`),"
+    },
+    {
+      "file": "src/web/src/pages/SettingsASRPage.tsx",
+      "line": 203,
+      "path_pattern": "/subtitle/hardware/intel`).catch(() => null),"
+    },
+    {
+      "file": "src/web/src/pages/SettingsASRPage.tsx",
+      "line": 292,
+      "path_pattern": "/subtitle/asr/settings`, {"
+    },
+    {
+      "file": "src/web/src/pages/SettingsASRPage.tsx",
+      "line": 603,
+      "path_pattern": "/subtitle/asr/e"
+    },
+    {
+      "file": "src/web/src/pages/SettingsASRPage.tsx",
+      "line": 684,
+      "path_pattern": "/subtitle/asr/cloudflare/test`, {"
+    },
+    {
+      "file": "src/web/src/pages/SettingsASRPage.tsx",
+      "line": 739,
+      "path_pattern": "/subtitle/asr/groq/test`, {"
+    },
+    {
+      "file": "src/web/src/pages/SettingsASRPage.tsx",
+      "line": 849,
+      "path_pattern": "/subtitle/models/pro"
+    },
+    {
+      "file": "src/web/src/pages/SettingsASRPage.tsx",
+      "line": 924,
+      "path_pattern": "/subtitle/models/{}`, { method: \"DELETE\" });"
+    },
+    {
+      "file": "src/web/src/pages/SettingsASRPage.tsx",
+      "line": 999,
+      "path_pattern": "/subtitle/models/download`, {"
+    },
+    {
+      "file": "src/web/src/pages/SettingsASRPage.tsx",
+      "line": 1051,
+      "path_pattern": "/subtitle/models/upload"
+    },
+    {
+      "file": "src/web/src/pages/SettingsApiPage.tsx",
+      "line": 37,
+      "path_pattern": "/settings/api"
+    },
+    {
+      "file": "src/web/src/pages/SettingsApiPage.tsx",
+      "line": 56,
+      "path_pattern": "/settings/api"
+    },
+    {
+      "file": "src/web/src/pages/SettingsApiPage.tsx",
+      "line": 81,
+      "path_pattern": "/settings/api"
+    },
+    {
+      "file": "src/web/src/pages/SettingsAutoPage.tsx",
+      "line": 167,
+      "path_pattern": "/subtitle/auto/profile`),"
+    },
+    {
+      "file": "src/web/src/pages/SettingsAutoPage.tsx",
+      "line": 168,
+      "path_pattern": "/subtitle/models`).catch(() => null),"
+    },
+    {
+      "file": "src/web/src/pages/SettingsAutoPage.tsx",
+      "line": 169,
+      "path_pattern": "/settings/publish/platforms`).catch(() => null),"
+    },
+    {
+      "file": "src/web/src/pages/SettingsAutoPage.tsx",
+      "line": 302,
+      "path_pattern": "/subtitle/auto/profile`, {"
+    },
+    {
+      "file": "src/web/src/pages/SettingsAutoPage.tsx",
+      "line": 392,
+      "path_pattern": "/subtitle/hardware/intel`);"
+    },
+    {
+      "file": "src/web/src/pages/SettingsPublishPage.tsx",
+      "line": 104,
+      "path_pattern": "/bilibili/publish/settings`),"
+    },
+    {
+      "file": "src/web/src/pages/SettingsPublishPage.tsx",
+      "line": 105,
+      "path_pattern": "/bilibili/auth/settings`),"
+    },
+    {
+      "file": "src/web/src/pages/SettingsPublishPage.tsx",
+      "line": 106,
+      "path_pattern": "/settings/publish/social/accounts`),"
+    },
+    {
+      "file": "src/web/src/pages/SettingsPublishPage.tsx",
+      "line": 107,
+      "path_pattern": "/settings/publish/platforms`),"
+    },
+    {
+      "file": "src/web/src/pages/SettingsPublishPage.tsx",
+      "line": 165,
+      "path_pattern": "/settings/publish/social/accounts/{}`, { method: \"POST\", body: form });"
+    },
+    {
+      "file": "src/web/src/pages/SettingsPublishPage.tsx",
+      "line": 175,
+      "path_pattern": "/settings/publish/platforms/{}`,"
+    },
+    {
+      "file": "src/web/src/pages/SettingsPublishPage.tsx",
+      "line": 212,
+      "path_pattern": "/bilibili/publish/settings`, {"
+    },
+    {
+      "file": "src/web/src/pages/SettingsPublishPage.tsx",
+      "line": 229,
+      "path_pattern": "/bilibili/publish/settings`, {"
+    },
+    {
+      "file": "src/web/src/pages/SettingsPublishPage.tsx",
+      "line": 246,
+      "path_pattern": "/desktop/grants`, {"
+    },
+    {
+      "file": "src/web/src/pages/SettingsPublishPage.tsx",
+      "line": 325,
+      "path_pattern": "/settings/publish/social/login-sessions/{}`,"
+    },
+    {
+      "file": "src/web/src/pages/SettingsPublishPage.tsx",
+      "line": 398,
+      "path_pattern": "/settings/publish/social/login-sessions/{}`,"
+    },
+    {
+      "file": "src/web/src/pages/SettingsPublishPage.tsx",
+      "line": 431,
+      "path_pattern": "/settings/publish/social/accounts/{}/check`, { method: \"POST\" });"
+    },
+    {
+      "file": "src/web/src/pages/SettingsPublishPage.tsx",
+      "line": 456,
+      "path_pattern": "/settings/publish/social/accounts/{}`, { method: \"DELETE\" });"
+    },
+    {
+      "file": "src/web/src/pages/SettingsPublishPage.tsx",
+      "line": 530,
+      "path_pattern": "/bilibili/auth/settings`, {"
+    },
+    {
+      "file": "src/web/src/pages/SettingsPublishPage.tsx",
+      "line": 561,
+      "path_pattern": "/bilibili/auth/settings`, {"
+    },
+    {
+      "file": "src/web/src/pages/SettingsPublishPage.tsx",
+      "line": 584,
+      "path_pattern": "/bilibili/auth/me`);"
+    },
+    {
+      "file": "src/web/src/pages/SettingsReviewPage.tsx",
+      "line": 29,
+      "path_pattern": "/settings/review`),"
+    },
+    {
+      "file": "src/web/src/pages/SettingsReviewPage.tsx",
+      "line": 30,
+      "path_pattern": "/subtitle/translate/settings`).catch(() => null),"
+    },
+    {
+      "file": "src/web/src/pages/SettingsReviewPage.tsx",
+      "line": 77,
+      "path_pattern": "/settings/review`, {"
+    },
+    {
+      "file": "src/web/src/pages/SettingsStoragePage.tsx",
+      "line": 35,
+      "path_pattern": "/settings/storage`);"
+    },
+    {
+      "file": "src/web/src/pages/SettingsStoragePage.tsx",
+      "line": 54,
+      "path_pattern": "/settings/storage`, {"
+    },
+    {
+      "file": "src/web/src/pages/SettingsStoragePage.tsx",
+      "line": 139,
+      "path_pattern": "/maintenance/storage/cleanup-terminal`, {"
+    },
+    {
+      "file": "src/web/src/pages/SettingsYouDubPage.tsx",
+      "line": 20,
+      "path_pattern": "/settings/dubbing"
+    },
+    {
+      "file": "src/web/src/pages/SettingsYouDubPage.tsx",
+      "line": 33,
+      "path_pattern": "/settings/dubbing/native"
+    },
+    {
+      "file": "src/web/src/pages/SettingsYouDubPage.tsx",
+      "line": 48,
+      "path_pattern": "/settings/dubbing/native"
+    },
+    {
+      "file": "src/web/src/pages/SettingsYouTubePage.tsx",
+      "line": 104,
+      "path_pattern": "/settings/youtube`);"
+    },
+    {
+      "file": "src/web/src/pages/SettingsYouTubePage.tsx",
+      "line": 258,
+      "path_pattern": "/settings/youtube`, {"
+    },
+    {
+      "file": "src/web/src/pages/SettingsYouTubePage.tsx",
+      "line": 308,
+      "path_pattern": "/settings/youtube`, {"
+    },
+    {
+      "file": "src/web/src/pages/SettingsYouTubePage.tsx",
+      "line": 426,
+      "path_pattern": "/settings/youtube`, {"
+    },
+    {
+      "file": "src/web/src/pages/SettingsYouTubePage.tsx",
+      "line": 454,
+      "path_pattern": "/settings/youtube/home_scan/run`, {"
+    },
+    {
+      "file": "src/web/src/pages/SettingsYouTubePage.tsx",
+      "line": 543,
+      "path_pattern": "/settings/youtube`, {"
+    },
+    {
+      "file": "src/web/src/pages/SettingsYouTubePage.tsx",
+      "line": 566,
+      "path_pattern": "/settings/youtube/test`, {"
+    },
+    {
+      "file": "src/web/src/pages/SettingsYouTubePage.tsx",
+      "line": 634,
+      "path_pattern": "/settings/youtube`, {"
+    },
+    {
+      "file": "src/web/src/pages/SettingsYouTubePage.tsx",
+      "line": 656,
+      "path_pattern": "/settings/youtube`, {"
+    },
+    {
+      "file": "src/web/src/pages/SettingsYouTubePage.tsx",
+      "line": 685,
+      "path_pattern": "/settings/youtube`, {"
+    },
+    {
+      "file": "src/web/src/pages/TaskNewPage.tsx",
+      "line": 27,
+      "path_pattern": "/tasks"
+    },
+    {
+      "file": "src/web/src/pages/TaskNewPage.tsx",
+      "line": 44,
+      "path_pattern": "/tasks/{}/upload/video"
+    },
+    {
+      "file": "src/web/src/pages/TaskNewPage.tsx",
+      "line": 53,
+      "path_pattern": "/youtube/ingest"
+    },
+    {
+      "file": "src/web/src/pages/TaskNewPage.tsx",
+      "line": 66,
+      "path_pattern": "/auto/youtube"
+    },
+    {
+      "file": "src/web/src/pages/TasksPage.tsx",
+      "line": 108,
+      "path_pattern": "/tasks"
+    },
+    {
+      "file": "src/web/src/pages/TasksPage.tsx",
+      "line": 153,
+      "path_pattern": "/tasks/{}/actions/subtitle_resume`, {"
+    },
+    {
+      "file": "src/web/src/pages/TasksPage.tsx",
+      "line": 175,
+      "path_pattern": "/tasks/{}/actions/youtube_download`, { method: \"POST\" });"
+    },
+    {
+      "file": "src/web/src/pages/TasksPage.tsx",
+      "line": 195,
+      "path_pattern": "/tasks/{}/actions/auto_youtube_start`, {"
+    },
+    {
+      "file": "src/web/src/pages/TasksPage.tsx",
+      "line": 218,
+      "path_pattern": "/tasks/actions/resume_failed_recent`, {"
+    },
+    {
+      "file": "src/web/src/pages/TasksPage.tsx",
+      "line": 241,
+      "path_pattern": "/tasks/{}/actions/stop`, { method: \"POST\" });"
+    },
+    {
+      "file": "src/web/src/pages/TasksPage.tsx",
+      "line": 261,
+      "path_pattern": "/tasks/{}/actions/resume`, { method: \"POST\" });"
+    },
+    {
+      "file": "src/web/src/pages/TasksPage.tsx",
+      "line": 286,
+      "path_pattern": "/tasks/actions/{}`, { method: \"POST\" });"
+    },
+    {
+      "file": "src/web/src/pages/VideosPage.tsx",
+      "line": 109,
+      "path_pattern": "/videos/converted"
+    },
+    {
+      "file": "src/web/src/pages/VideosPage.tsx",
+      "line": 209,
+      "path_pattern": "/maintenance/workdir`);"
+    },
+    {
+      "file": "src/web/src/pages/VideosPage.tsx",
+      "line": 230,
+      "path_pattern": "/maintenance/workdir/cleanup`, {"
+    },
+    {
+      "file": "src/web/src/pages/VideosPage.tsx",
+      "line": 281,
+      "path_pattern": "/tasks/{}/assets/{}`, {"
+    },
+    {
+      "file": "src/web/src/pages/VideosPage.tsx",
+      "line": 315,
+      "path_pattern": "/tasks/{}/assets/{}`, {"
+    },
+    {
+      "file": "src/web/src/pages/VideosPage.tsx",
+      "line": 501,
+      "path_pattern": "/tasks/{}/assets/{}/stream`}"
+    },
+    {
+      "file": "src/web/src/pages/VideosPage.tsx",
+      "line": 528,
+      "path_pattern": "/tasks/{}/assets/{}/download`}"
+    },
+    {
+      "file": "src/web/src/pages/VideosPage.tsx",
+      "line": 535,
+      "path_pattern": "/tasks/{}/assets/{}/download`}"
+    },
+    {
+      "file": "src/web/src/pages/YouTubeSourcesPage.tsx",
+      "line": 52,
+      "path_pattern": "/youtube/sources`);"
+    },
+    {
+      "file": "src/web/src/pages/YouTubeSourcesPage.tsx",
+      "line": 69,
+      "path_pattern": "/youtube/sources`)"
+    },
+    {
+      "file": "src/web/src/pages/YouTubeSourcesPage.tsx",
+      "line": 105,
+      "path_pattern": "/youtube/sources`, {"
+    },
+    {
+      "file": "src/web/src/pages/YouTubeSourcesPage.tsx",
+      "line": 147,
+      "path_pattern": "/youtube/sources/{}`, {"
+    },
+    {
+      "file": "src/web/src/pages/YouTubeSourcesPage.tsx",
+      "line": 170,
+      "path_pattern": "/youtube/sources/{}/scan/start`, {"
+    },
+    {
+      "file": "src/web/src/pages/YouTubeSourcesPage.tsx",
+      "line": 202,
+      "path_pattern": "/youtube/sources/{}`, {"
+    }
+  ]
+}
