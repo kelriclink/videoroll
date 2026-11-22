@@ -56,10 +56,33 @@ const V1_ADAPTERS: &[(&str, &str)] = &[
     ("POST", "/tasks/{task_id}/dubbing_jobs/{job_id}/retry"),
     ("POST", "/tasks/{task_id}/dubbing_jobs/{job_id}/control"),
     ("POST", "/tasks/{task_id}/actions/subtitle_resume"),
+    ("POST", "/tasks/{task_id}/actions/auto_subtitle_handoff"),
+    ("POST", "/tasks/{task_id}/actions/auto_publish"),
     ("POST", "/tasks/{task_id}/actions/publish"),
     ("POST", "/tasks/actions/resume_failed_recent"),
     ("GET", "/settings/publish/platforms"),
     ("PUT", "/settings/publish/platforms/{platform}"),
+    ("GET", "/settings/publish/social/accounts"),
+    ("POST", "/settings/publish/social/accounts/{platform}"),
+    (
+        "POST",
+        "/settings/publish/social/accounts/{account_id}/check",
+    ),
+    ("DELETE", "/settings/publish/social/accounts/{account_id}"),
+    ("POST", "/settings/publish/social/login-sessions/{platform}"),
+    (
+        "GET",
+        "/settings/publish/social/login-sessions/{session_id}",
+    ),
+    (
+        "DELETE",
+        "/settings/publish/social/login-sessions/{session_id}",
+    ),
+    ("GET", "/operations/alerts"),
+    ("POST", "/operations/alerts/report"),
+    ("POST", "/operations/alerts/scan"),
+    ("POST", "/operations/alerts/{alert_id}/ack"),
+    ("POST", "/operations/alerts/{alert_id}/resolve"),
 ];
 
 fn from_sources() -> AppResult<(Value, Value)> {
@@ -147,7 +170,7 @@ mod tests {
         let value = report().unwrap();
         assert_eq!(value["all_features_migrated"], false);
         assert!(value["legacy_route_declarations"].as_u64().unwrap() >= 217);
-        assert_eq!(value["native_v1_adapters"], 48);
+        assert_eq!(value["native_v1_adapters"], 62);
         assert_eq!(value["fully_verified_legacy_routes"], 0);
         assert!(value["frontend_url_references"].as_u64().unwrap() >= 190);
         assert!(is_adapter("GET", "/tasks/{task_id}"));

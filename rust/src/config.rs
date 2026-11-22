@@ -27,6 +27,7 @@ pub struct Config {
     pub legacy_internal_token: Option<String>,
     pub legacy_publish_allowed: bool,
     pub native_bilibili_allowed: bool,
+    pub social_publisher_url: Option<String>,
     pub native_bilibili_cookie: Option<String>,
     pub native_bilibili_csrf: Option<String>,
     pub native_bilibili_api_base: Option<String>,
@@ -123,6 +124,9 @@ impl Config {
                 .ok()
                 .as_deref()
                 == Some("true"),
+            social_publisher_url: std::env::var("VIDEOROLL_V2_SOCIAL_PUBLISHER_URL")
+                .ok()
+                .filter(|v| !v.trim().is_empty()),
             native_bilibili_allowed: std::env::var("VIDEOROLL_V2_ENABLE_NATIVE_BILIBILI")
                 .ok()
                 .as_deref()

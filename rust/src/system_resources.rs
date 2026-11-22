@@ -40,7 +40,7 @@ async fn cgroup_memory() -> Option<Value> {
     }
     Some(mem_view(total, used, total - used))
 }
-async fn system_resources() -> AppResult<Json<Value>> {
+pub async fn sample() -> AppResult<Value> {
     let stats = fs::read_to_string("/proc/meminfo")
         .await
         .ok()
@@ -67,14 +67,18 @@ async fn system_resources() -> AppResult<Json<Value>> {
     let cores = std::thread::available_parallelism()
         .map(|v| v.get())
         .unwrap_or(0);
-    Ok(Json(json!({
+    Ok(json!({
         "sampled_at":chrono::Utc::now().to_rfc3339(),
         "cpu":{"percent":null,"cores":cores,"load_average":load},
         "memory":mem,
         "cgroup_memory":cgroup_memory().await,
         "intel_gpu":null,
-    })))
+    }))
 }
+async fn system_resources() -> AppResult<Json<Value>> {
+    Ok(Json(sample().await?))
+}
+
 pub fn router() -> Router<AppState> {
     Router::new().route("/system/resources", get(system_resources))
 }

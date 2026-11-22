@@ -5,8 +5,8 @@
 全部完成状态只允许结合 API 契约、权限、并发、重启、外部副作用与设备测试证据填写。
 
 - 原版声明：217
-- 原生 V1 部分适配：48
-- 无原生 V1 入口：169
+- 原生 V1 部分适配：62
+- 无原生 V1 入口：155
 - 已完成全面验收：0
 - 前端引用文本：193
 
@@ -14,7 +14,7 @@
 |---|---:|---:|---:|
 | bilibili_publisher | 10 | 0 | 10 |
 | egress_gateway | 2 | 0 | 2 |
-| orchestrator_api | 132 | 47 | 85 |
+| orchestrator_api | 132 | 61 | 71 |
 | social_publisher | 9 | 0 | 9 |
 | subtitle_service | 55 | 0 | 55 |
 | youtube_ingest | 9 | 1 | 8 |
@@ -53,11 +53,11 @@
 | orchestrator_api | GET | /operations/ai-usage | not_native_v1 | get_ai_usage |
 | orchestrator_api | GET | /operations/ai-usage/pricing | not_native_v1 | get_ai_usage_pricing |
 | orchestrator_api | PUT | /operations/ai-usage/pricing | not_native_v1 | put_ai_usage_pricing |
-| orchestrator_api | GET | /operations/alerts | not_native_v1 | get_alerts |
-| orchestrator_api | POST | /operations/alerts/report | not_native_v1 | post_alert_report |
-| orchestrator_api | POST | /operations/alerts/scan | not_native_v1 | post_alert_scan |
-| orchestrator_api | POST | /operations/alerts/{alert_id}/ack | not_native_v1 | acknowledge_alert |
-| orchestrator_api | POST | /operations/alerts/{alert_id}/resolve | not_native_v1 | resolve_alert |
+| orchestrator_api | GET | /operations/alerts | native_adapter_partial | get_alerts |
+| orchestrator_api | POST | /operations/alerts/report | native_adapter_partial | post_alert_report |
+| orchestrator_api | POST | /operations/alerts/scan | native_adapter_partial | post_alert_scan |
+| orchestrator_api | POST | /operations/alerts/{alert_id}/ack | native_adapter_partial | acknowledge_alert |
+| orchestrator_api | POST | /operations/alerts/{alert_id}/resolve | native_adapter_partial | resolve_alert |
 | orchestrator_api | GET | /render-management/connection | not_native_v1 | connection |
 | orchestrator_api | PUT | /render-management/connection | not_native_v1 | update_connection |
 | orchestrator_api | GET | /render-management/enrollments | not_native_v1 | enrollments |
@@ -93,13 +93,13 @@
 | orchestrator_api | PUT | /settings/dubbing/native | not_native_v1 | engine_control |
 | orchestrator_api | GET | /settings/publish/platforms | native_adapter_partial | read_publish_platform_settings |
 | orchestrator_api | PUT | /settings/publish/platforms/{platform} | native_adapter_partial | put_publish_platform_setting |
-| orchestrator_api | GET | /settings/publish/social/accounts | not_native_v1 | list_social_publish_accounts |
-| orchestrator_api | DELETE | /settings/publish/social/accounts/{account_id} | not_native_v1 | delete_social_publish_account |
-| orchestrator_api | POST | /settings/publish/social/accounts/{account_id}/check | not_native_v1 | check_social_publish_account |
-| orchestrator_api | POST | /settings/publish/social/accounts/{platform} | not_native_v1 | import_social_publish_account |
-| orchestrator_api | POST | /settings/publish/social/login-sessions/{platform} | not_native_v1 | start_social_login_session |
-| orchestrator_api | DELETE | /settings/publish/social/login-sessions/{session_id} | not_native_v1 | cancel_social_login_session |
-| orchestrator_api | GET | /settings/publish/social/login-sessions/{session_id} | not_native_v1 | get_social_login_session |
+| orchestrator_api | GET | /settings/publish/social/accounts | native_adapter_partial | list_social_publish_accounts |
+| orchestrator_api | DELETE | /settings/publish/social/accounts/{account_id} | native_adapter_partial | delete_social_publish_account |
+| orchestrator_api | POST | /settings/publish/social/accounts/{account_id}/check | native_adapter_partial | check_social_publish_account |
+| orchestrator_api | POST | /settings/publish/social/accounts/{platform} | native_adapter_partial | import_social_publish_account |
+| orchestrator_api | POST | /settings/publish/social/login-sessions/{platform} | native_adapter_partial | start_social_login_session |
+| orchestrator_api | DELETE | /settings/publish/social/login-sessions/{session_id} | native_adapter_partial | cancel_social_login_session |
+| orchestrator_api | GET | /settings/publish/social/login-sessions/{session_id} | native_adapter_partial | get_social_login_session |
 | orchestrator_api | GET | /settings/review | native_adapter_partial | get_publish_review_settings_view |
 | orchestrator_api | PUT | /settings/review | native_adapter_partial | put_publish_review_settings_view |
 | orchestrator_api | GET | /settings/storage | not_native_v1 | get_storage_settings |
@@ -120,8 +120,8 @@
 | orchestrator_api | POST | /tasks/actions/stop_all | native_adapter_partial | stop_all_tasks |
 | orchestrator_api | GET | /tasks/{task_id} | native_adapter_partial | get_task |
 | orchestrator_api | POST | /tasks/{task_id}/actions/auto_dubbing | not_native_v1 | auto_dubbing |
-| orchestrator_api | POST | /tasks/{task_id}/actions/auto_publish | not_native_v1 | auto_publish_task |
-| orchestrator_api | POST | /tasks/{task_id}/actions/auto_subtitle_handoff | not_native_v1 | auto_subtitle_handoff |
+| orchestrator_api | POST | /tasks/{task_id}/actions/auto_publish | native_adapter_partial | auto_publish_task |
+| orchestrator_api | POST | /tasks/{task_id}/actions/auto_subtitle_handoff | native_adapter_partial | auto_subtitle_handoff |
 | orchestrator_api | POST | /tasks/{task_id}/actions/auto_youtube_start | native_adapter_partial | start_auto_youtube_for_existing_task |
 | orchestrator_api | POST | /tasks/{task_id}/actions/dubbing | native_adapter_partial | create |
 | orchestrator_api | POST | /tasks/{task_id}/actions/publish | native_adapter_partial | enqueue_publish_job |

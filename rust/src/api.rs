@@ -333,6 +333,7 @@ async fn storage_stats(State(state): State<AppState>) -> AppResult<Json<Value>> 
 pub fn router(state: AppState) -> Router {
     let protected = Router::new()
         .merge(crate::assets::router())
+        .merge(crate::realtime::router())
         .merge(crate::sources::router())
         .merge(crate::telemetry::router())
         .merge(crate::parity::router())
@@ -362,6 +363,7 @@ pub fn router(state: AppState) -> Router {
     // Login endpoints must remain public so the original React AuthGate can
     // establish a V2 session before entering the native V1-contract surface.
     let legacy = Router::new()
+        .merge(crate::realtime::router())
         .route("/auth/status", get(admin_status))
         .route("/auth/login", post(admin_login))
         .route("/auth/logout", post(admin_logout))

@@ -13,7 +13,7 @@ PARITY = ROOT / "rust/src/parity.rs"
 OUTPUT = ROOT / "rust/docs/CONTRACT_MATRIX.json"
 REPORT = ROOT / "rust/docs/CONTRACT_MATRIX.md"
 ADAPTER_RE = re.compile(
-    r'\("(?P<method>GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)",\s*"(?P<path>/[^"]+)"\)'
+    r'\(\s*"(?P<method>GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)"\s*,\s*"(?P<path>/[^"]+)"\s*,?\s*\)'
 )
 
 def collect():

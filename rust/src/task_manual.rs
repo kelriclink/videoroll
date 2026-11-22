@@ -288,6 +288,207 @@ async fn manual_publish(
         "bvid":null,"aid":null,"response":null
     })))
 }
+/// Resume the V2-owned auto pipeline at the earliest remaining reversible
+/// stage. Reuse active stage jobs; never queue a second download or rerun an
+/// archive that might already have been submitted.
+async fn auto_subtitle_handoff(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> AppResult<Json<Value>> {
+    let task = read_task(&state.db, id).await?;
+    if task.status == "PUBLISHED" {
+        return Ok(Json(
+            json!({"status":"complete","job_id":null,"job_kind":null,
+            "detail":"task already published"}),
+        ));
+    }
+    if task.status == "CANCELED" {
+        return Err(AppError::Conflict(
+            "task is stopped; resume it before continuing".into(),
+        ));
+    }
+    let has_final: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM assets
+         WHERE task_id=$1 AND kind='video_final'::asset_kind AND storage_key LIKE 'v2/%')",
+    )
+    .bind(id)
+    .fetch_one(&state.db.pool)
+    .await?;
+    if has_final {
+        return Ok(Json(
+            json!({"status":"complete","job_id":null,"job_kind":null,
+            "detail":"final video already exists"}),
+        ));
+    }
+    let active = sqlx::query(
+        "SELECT j.id,j.stage,j.state FROM vr2_jobs j
+         JOIN vr2_workflows w ON w.id=j.workflow_id
+         WHERE j.task_id=$1 AND j.stage IN ('subtitle','render')
+           AND j.state IN ('pending','running','awaiting')
+           AND w.state='running'
+         ORDER BY w.generation DESC,j.created_at DESC LIMIT 1",
+    )
+    .bind(id)
+    .fetch_optional(&state.db.pool)
+    .await?;
+    if let Some(row) = active {
+        let stage: String = row.try_get("stage")?;
+        let job_state: String = row.try_get("state")?;
+        return Ok(Json(json!({
+            "status":if job_state=="pending"{"queued"}else{"running"},
+            "job_id":row.try_get::<Uuid,_>("id")?,
+            "job_kind":stage,"detail":"reused active V2 stage job"
+        })));
+    }
+    let has_srt: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM assets
+         WHERE task_id=$1 AND kind='subtitle_srt'::asset_kind AND storage_key LIKE 'v2/%')",
+    )
+    .bind(id)
+    .fetch_one(&state.db.pool)
+    .await?;
+    let stage = if has_srt {
+        Stage::Render
+    } else {
+        Stage::Subtitle
+    };
+    let flow = state.scheduler.restart_at(id, stage, json!({})).await?;
+    let result = response(&state, flow, stage).await?.0;
+    Ok(Json(json!({
+        "status":if result.status=="pending"{"queued"}else{result.status.as_str()},
+        "job_id":result.job_id,"job_kind":stage.as_str(),
+        "detail":"native V2 stage handoff scheduled"
+    })))
+}
+
+fn auto_platform_selection(profile: &Value, overrides: &Value) -> AppResult<(bool, Vec<String>)> {
+    let enabled = overrides
+        .get("auto_publish")
+        .and_then(Value::as_bool)
+        .or_else(|| profile.get("auto_publish").and_then(Value::as_bool))
+        .unwrap_or(true);
+    let raw = overrides
+        .get("auto_publish_platforms")
+        .or_else(|| profile.get("auto_publish_platforms"))
+        .cloned()
+        .unwrap_or_else(|| json!([]));
+    let items = raw
+        .as_array()
+        .ok_or_else(|| AppError::Invalid("auto_publish_platforms must be an array".into()))?;
+    if items.len() > 4 {
+        return Err(AppError::Invalid(
+            "too many auto publish platform targets".into(),
+        ));
+    }
+    let mut names = Vec::new();
+    for item in items {
+        let name = item
+            .as_str()
+            .ok_or_else(|| AppError::Invalid("invalid auto publish platform".into()))?;
+        if !matches!(name, "bilibili" | "douyin" | "xiaohongshu" | "kuaishou") {
+            return Err(AppError::Invalid("unknown auto publish platform".into()));
+        }
+        if !names.iter().any(|existing| existing == name) {
+            names.push(name.to_owned());
+        }
+    }
+    Ok((enabled, names))
+}
+
+/// The original automatic publisher can target four external platforms; V2
+/// only permits the genuine Bilibili single-archive workflow today. Keeping
+/// social selections as an explicit error prevents silently skipping targets.
+async fn auto_publish(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Query(query): Query<AutoPublishQuery>,
+) -> AppResult<Json<Value>> {
+    let task = read_task(&state.db, id).await?;
+    if task.status == "PUBLISHED" {
+        return Ok(Json(
+            json!({"status":"complete","detail":"task already published"}),
+        ));
+    }
+    if matches!(task.status.as_str(), "CANCELED" | "PUBLISHING") {
+        return Err(AppError::Conflict(
+            "task already stopped or publishing; no automatic replay".into(),
+        ));
+    }
+    let profile = crate::settings::effective(&state.db, "subtitle.auto_profile").await?;
+    let latest_configuration: Option<Value> = sqlx::query_scalar(
+        "SELECT configuration FROM vr2_workflows WHERE task_id=$1 ORDER BY generation DESC LIMIT 1",
+    )
+    .bind(id)
+    .fetch_optional(&state.db.pool)
+    .await?;
+    let (enabled, platforms) =
+        auto_platform_selection(&profile, &latest_configuration.unwrap_or_else(|| json!({})))?;
+    if !enabled {
+        return Ok(Json(
+            json!({"status":"skipped","detail":"automatic publishing disabled"}),
+        ));
+    }
+    if platforms.is_empty() {
+        return Ok(Json(
+            json!({"status":"skipped","detail":"no automatic publishing platforms selected"}),
+        ));
+    }
+    if platforms.len() != 1 || platforms[0] != "bilibili" {
+        return Err(AppError::Conflict(
+            "automatic publish cannot silently drop unfinished Douyin/Xiaohongshu/Kuaishou targets"
+                .into(),
+        ));
+    }
+    if !state.config.native_bilibili_allowed
+        || !crate::publish_platforms::enabled(&state.db, "bilibili").await?
+    {
+        return Err(AppError::Conflict(
+            "native Bilibili publishing disabled".into(),
+        ));
+    }
+    if let Some(dubbing_job_id) = query.dubbing_job_id {
+        let matching: bool = sqlx::query_scalar(
+            "SELECT EXISTS(
+                SELECT 1 FROM vr2_dubbing_runs r
+                JOIN vr2_jobs j ON j.id=r.job_id
+                JOIN assets a ON a.task_id=r.task_id
+                    AND a.storage_key=r.output_video_key
+                    AND a.kind='video_dubbed'::asset_kind
+                WHERE r.job_id=$1 AND r.task_id=$2
+                  AND r.model_status='succeeded'
+                  AND j.state='succeeded'
+                  AND r.output_video_key=(
+                    SELECT a2.storage_key FROM assets a2 WHERE a2.task_id=$2
+                    AND a2.kind='video_dubbed'::asset_kind
+                    ORDER BY a2.created_at DESC LIMIT 1)
+            )",
+        )
+        .bind(dubbing_job_id)
+        .bind(id)
+        .fetch_one(&state.db.pool)
+        .await?;
+        if !matching {
+            return Err(AppError::Conflict(
+                "automatic P2 requires the selected successful V2 YouDub job and latest dubbed video".into(),
+            ));
+        }
+    }
+    let flow = state
+        .scheduler
+        .restart_at(
+            id,
+            Stage::Publish,
+            json!({"auto_publish":true,"auto_publish_platforms":["bilibili"]}),
+        )
+        .await?;
+    let job = response(&state, flow, Stage::Publish).await?.0;
+    Ok(Json(json!({"status":job.status,"job_id":job.job_id,
+        "detail":"automatic native Bilibili stage scheduled"})))
+}
+#[derive(Debug, Deserialize)]
+struct AutoPublishQuery {
+    dubbing_job_id: Option<Uuid>,
+}
 #[derive(Debug, Deserialize)]
 struct BulkQuery {
     window_hours: Option<i64>,
@@ -571,12 +772,40 @@ pub fn router() -> Router<AppState> {
             post(control_dubbing),
         )
         .route("/tasks/{id}/actions/subtitle_resume", post(resume_subtitle))
+        .route(
+            "/tasks/{id}/actions/auto_subtitle_handoff",
+            post(auto_subtitle_handoff),
+        )
+        .route("/tasks/{id}/actions/auto_publish", post(auto_publish))
         .route("/tasks/{id}/actions/publish", post(manual_publish))
         .route("/tasks/actions/resume_failed_recent", post(resume_recent))
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn auto_publish_selection_requires_known_targets_and_respects_overrides() {
+        let (enabled, platforms) = auto_platform_selection(
+            &json!({"auto_publish":true,"auto_publish_platforms":["bilibili"]}),
+            &json!({"auto_publish":false,"auto_publish_platforms":[]}),
+        )
+        .unwrap();
+        assert!(!enabled && platforms.is_empty());
+        assert!(
+            auto_platform_selection(&json!({"auto_publish_platforms":["TikTok"]}), &json!({}))
+                .is_err()
+        );
+        assert!(
+            auto_platform_selection(&json!({"auto_publish_platforms":"bilibili"}), &json!({}))
+                .is_err()
+        );
+        let (_, platforms) = auto_platform_selection(
+            &json!({"auto_publish_platforms":["bilibili","bilibili"]}),
+            &json!({}),
+        )
+        .unwrap();
+        assert_eq!(platforms, ["bilibili"]);
+    }
     #[test]
     fn unsupported_subtitle_options_never_get_silently_ignored() {
         assert!(

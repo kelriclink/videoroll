@@ -17,7 +17,7 @@ anyhow = "1"
 base64 = "0.22"
 hmac = "0.12"
 pbkdf2 = "0.12"
-axum = { version = "0.8", features = ["macros", "json", "multipart"] }
+axum = { version = "0.8", features = ["macros", "json", "multipart", "ws"] }
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive", "env"] }
 hex = "0.4"

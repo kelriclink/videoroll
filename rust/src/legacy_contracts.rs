@@ -626,6 +626,8 @@ pub fn router() -> Router<AppState> {
         .merge(crate::publish_review::router())
         .merge(crate::task_manual::router())
         .merge(crate::publish_platforms::router())
+        .merge(crate::social_accounts::router())
+        .merge(crate::alerts::router())
         .merge(crate::system_resources::router())
         .route("/health", get(health))
         .route("/tasks", get(list_tasks).post(create_task))

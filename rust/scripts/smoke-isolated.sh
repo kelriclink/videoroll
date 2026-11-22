@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+export CARGO_INCREMENTAL=0
 cd "$(dirname "$0")/../.."
 repo_root="$PWD"
 python3 "$repo_root/rust/scripts/audit_contract_matrix.py" --check
@@ -16,7 +17,9 @@ legacy_pid=""
 gateway_pid=""
 ai_pid=""
 bili_pid=""
+sau_pid=""
 cleanup() {
+  if [[ -n "$sau_pid" ]]; then kill "$sau_pid" 2>/dev/null || true; wait "$sau_pid" 2>/dev/null || true; fi
   if [[ -n "$worker_pid" ]]; then kill "$worker_pid" 2>/dev/null || true; wait "$worker_pid" 2>/dev/null || true; fi
   if [[ -n "$legacy_pid" ]]; then kill "$legacy_pid" 2>/dev/null || true; wait "$legacy_pid" 2>/dev/null || true; fi
   if [[ -n "$ai_pid" ]]; then kill "$ai_pid" 2>/dev/null || true; wait "$ai_pid" 2>/dev/null || true; fi
@@ -45,6 +48,7 @@ export VIDEOROLL_V2_MOCK_YT_LOG="$repo_root/rust/target/v2-mock-ytdlp-args.log"
 : > "$VIDEOROLL_V2_MOCK_YT_LOG"
 export VIDEOROLL_V2_INDEX_ENDPOINT="http://127.0.0.1:18082/v1/chat/completions"
 export VIDEOROLL_V2_COMPAT_URL="http://127.0.0.1:18083"
+export VIDEOROLL_V2_SOCIAL_PUBLISHER_URL="http://127.0.0.1:18085"
 export VIDEOROLL_V2_PLAYOUT_ROOT="$repo_root/rust/target/playout-sandbox"
 export VIDEOROLL_V2_YOUDUB_PYTHON="$(command -v python3)"
 export VIDEOROLL_V2_YOUDUB_BRIDGE="$repo_root/rust/tests/mock_youdub_bridge.py"
@@ -55,6 +59,8 @@ legacy_pid=$!
 mkdir -p "$VIDEOROLL_V2_STORAGE_ROOT"
 python3 "$repo_root/rust/tests/mock_bilibili_subtitles.py" > "$repo_root/rust/target/v2-bili-subs-mock.log" 2>&1 &
 bili_pid=$!
+python3 "$repo_root/rust/tests/mock_social_sau.py" > "$repo_root/rust/target/v2-mock-sau.log" 2>&1 &
+sau_pid=$!
 cd rust
 "$CARGO_HOME/bin/cargo" build --quiet
 ./target/debug/videoroll-v2 migrate
@@ -98,6 +104,50 @@ curl --silent --fail-with-body -b "$jar" \
   http://127.0.0.1:18080/api/v2/tasks | grep -q '0123456789A'
 echo 'PASS: native admin setup/login and browser cookie compatibility'
 
+# SAFETY: all endpoints below target a disposable SAU mock on 127.0.0.1:18085.
+sau_account="$(curl --silent --fail-with-body "${hdr[@]}"   'http://127.0.0.1:18080/api/v1/settings/publish/social/accounts?platform=douyin')"
+SAU_ACCOUNT="$sau_account" python3 - <<'PYSAULIST'
+import json,os
+a=json.loads(os.environ["SAU_ACCOUNT"])
+assert len(a)==1 and a[0]["check_state"]=="valid",a
+PYSAULIST
+sau_session="$(curl --silent --fail-with-body "${hdr[@]}"    -d '{"account_name":"Test"}'    http://127.0.0.1:18080/api/v1/settings/publish/social/login-sessions/douyin)"
+sau_session_id="$(SAU_SESSION="$sau_session" python3 -c 'import os,json;print(json.loads(os.environ["SAU_SESSION"])["id"])')"
+curl --silent --fail-with-body "${hdr[@]}"     http://127.0.0.1:18080/api/v1/settings/publish/social/login-sessions/"$sau_session_id" | grep -q '"state":'
+curl --silent --fail-with-body "${hdr[@]}" -X DELETE     http://127.0.0.1:18080/api/v1/settings/publish/social/login-sessions/"$sau_session_id" | grep -q '"canceled"'
+curl --silent --fail-with-body "${hdr[@]}" -X POST     http://127.0.0.1:18080/api/v1/settings/publish/social/accounts/1e2baeba-d95b-44dd-bf7b-aedb0ce5cd7a/check | grep -q '"check_job_id":"mock"'
+sau_state="$repo_root/rust/target/v2-test-storage-state.json"
+printf '%s' '{"cookies":[],"origins":[]}' > "$sau_state"
+curl --silent --fail-with-body -H "x-videoroll-v2-internal-token: $VIDEOROLL_V2_INTERNAL_TOKEN"      -F 'account_name=Test' -F "file=@$sau_state;type=application/json"      http://127.0.0.1:18080/api/v1/settings/publish/social/accounts/douyin | grep -q '"check_job_id":"mock"'
+bad_sau="$(curl --silent -o /dev/null -w '%{http_code}'     http://127.0.0.1:18080/api/v1/settings/publish/social/accounts)"
+test "$bad_sau" = 401
+echo 'PASS: SAU account list, login-session lifecycle, secure storage-state import and authorization via local sidecar'
+
+# A live websocket session uses the browser-admin cookie, not a public token.
+VR2_COOKIE_JAR="$jar" VR2_SMOKE_CONTAINER="$container_name" VR2_TEST_TASK="$(FIRST="$first" python3 -c 'import json,os;print(json.loads(os.environ["FIRST"])["task"]["id"])')" VR2_TEST_WORKFLOW="$(FIRST="$first" python3 -c 'import json,os;print(json.loads(os.environ["FIRST"])["workflow"]["id"])')" node "$repo_root/rust/tests/ws_smoke.js"
+
+# Durable V2 alerts: open -> acknowledged -> resolved -> reopened; filtered
+# listing, scan, dedupe, and no writes into V1 alert_events.
+smoke_alert="$(curl --silent --fail-with-body "${hdr[@]}" -d   '{"fingerprint":"vr2.smoke.alert","source":"isolated","severity":"warning","title":"Simulated alert","message":"mock only","details":{}}'   http://127.0.0.1:18080/api/v1/operations/alerts/report)"
+alert_id="$(ALERT="$smoke_alert" python3 -c 'import json,os;a=json.loads(os.environ["ALERT"]);assert a["status"]=="open" and a["occurrence_count"]==1;print(a["id"])')"
+second_alert="$(curl --silent --fail-with-body "${hdr[@]}" -d   '{"fingerprint":"vr2.smoke.alert","source":"isolated","severity":"warning","title":"Simulated alert","message":"mock twice","details":{}}'   http://127.0.0.1:18080/api/v1/operations/alerts/report)"
+SECOND_ALERT="$second_alert" python3 - <<'PYALERT'
+import os,json
+a=json.loads(os.environ["SECOND_ALERT"])
+assert a["occurrence_count"]==2 and a["message"]=="mock twice",a
+PYALERT
+curl --silent --fail-with-body "${hdr[@]}" -X POST  http://127.0.0.1:18080/api/v1/operations/alerts/"$alert_id"/ack | grep -q '"status":"acknowledged"'
+curl --silent --fail-with-body "${hdr[@]}" -X POST  http://127.0.0.1:18080/api/v1/operations/alerts/"$alert_id"/resolve | grep -q '"status":"resolved"'
+curl --silent --fail-with-body "${hdr[@]}" -d   '{"fingerprint":"vr2.smoke.alert","source":"isolated","severity":"info","title":"Alert reopened","details":{}}'   http://127.0.0.1:18080/api/v1/operations/alerts/report | grep -q '"status":"open"'
+alert_list="$(curl --silent --fail-with-body "${hdr[@]}"   'http://127.0.0.1:18080/api/v1/operations/alerts?status=active&limit=20')"
+ALERT_LIST="$alert_list" python3 - <<'PYALERTLIST'
+import os,json
+rows=json.loads(os.environ["ALERT_LIST"])
+assert any(r["fingerprint"]=="vr2.smoke.alert" and r["occurrence_count"]==3 for r in rows),rows
+PYALERTLIST
+curl --silent --fail-with-body "${hdr[@]}" -X POST   http://127.0.0.1:18080/api/v1/operations/alerts/scan | grep -q '"scanned_at"'
+echo 'PASS: native durable V2 alerts, dedupe, status transitions, filtered views, scan'
+
 # Original React TaskRead schema, isolated native V1 Rust routes.
 v1_status="$(curl --silent --fail-with-body http://127.0.0.1:18080/api/v1/auth/status)"
 V1_STATUS="$v1_status" python3 - <<'PYV1AUTH'
@@ -127,6 +177,18 @@ PYV1TASK
 legacy_unknown="$(curl --silent -o /dev/null -w '%{http_code}' "${hdr[@]}" http://127.0.0.1:18080/api/v1/some-not-migrated-route)"
 test "$legacy_unknown" = 404
 echo 'PASS: native V1 TaskRead/list, auth boundaries and no silent fallback to Python'
+
+auto_skip="$(curl --silent --fail-with-body "${hdr[@]}" -X POST \
+  "http://127.0.0.1:18080/api/v1/tasks/$v1_id/actions/auto_publish")"
+AUTO_SKIP="$auto_skip" python3 - <<'PYAUTOSKIP'
+import json,os
+data=json.loads(os.environ["AUTO_SKIP"])
+assert data["status"]=="skipped" and ("disabled" in data["detail"] or "no automatic" in data["detail"]),data
+PYAUTOSKIP
+auto_handoff_missing="$(curl --silent -o /dev/null -w '%{http_code}' "${hdr[@]}" -X POST \
+  "http://127.0.0.1:18080/api/v1/tasks/$v1_id/actions/auto_subtitle_handoff")"
+test "$auto_handoff_missing" = 409
+echo 'PASS: auto-publish disabled is a real skip, auto-subtitle handoff cannot claim absent raw media'
 
 settings_default="$(curl --silent --fail-with-body "${hdr[@]}"  "http://127.0.0.1:18080/api/v1/settings/youtube")"
 SETTINGS_DEFAULT="$settings_default" python3 - <<'PYYTDEFAULT'

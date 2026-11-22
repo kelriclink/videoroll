@@ -40,6 +40,7 @@ async fn async_job_futures_fit_default_tokio_worker_stack() {
         legacy_internal_token: None,
         legacy_publish_allowed: false,
         native_bilibili_allowed: false,
+        social_publisher_url: None,
         native_bilibili_cookie: None,
         native_bilibili_csrf: None,
         native_bilibili_api_base: None,

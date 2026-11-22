@@ -1,6 +1,7 @@
 //! VideoRoll v2 Rust control plane. Existing media/AI libraries remain isolated workers.
 //! This crate intentionally does not modify a running v1 deployment.
 pub mod agent;
+pub mod alerts;
 pub mod api;
 pub mod assets;
 pub mod auth;
@@ -26,9 +27,11 @@ pub mod publish_meta;
 pub mod publish_platforms;
 pub mod publish_review;
 pub mod rag;
+pub mod realtime;
 pub mod remote_render;
 pub mod scheduler;
 pub mod settings;
+pub mod social_accounts;
 pub mod sources;
 pub mod storage;
 pub mod subtitles;
