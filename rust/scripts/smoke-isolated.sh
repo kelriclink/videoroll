@@ -2,6 +2,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 repo_root="$PWD"
+python3 "$repo_root/rust/scripts/audit_contract_matrix.py" --check
 if [[ -x "$repo_root/.toolchains/cargo/bin/cargo" ]]; then
   export RUSTUP_HOME="$repo_root/.toolchains/rustup"
   export CARGO_HOME="$repo_root/.toolchains/cargo"
@@ -323,6 +324,73 @@ curl --silent --fail-with-body "${hdr[@]}" -X POST   "http://127.0.0.1:18080/api
 curl --silent --fail-with-body "${hdr[@]}"   "http://127.0.0.1:18080/api/v2/workflows/$workflow" | grep -q '"state":"running"'
 echo 'PASS: native V1 individual stop/resume maintains original TaskStatus and durable workflow generation'
 
+# Native stage actions, real DB guarantees, no running mock worker yet.
+bad_engine="$(curl --silent -o /dev/null -w '%{http_code}' "${hdr[@]}" -d '{"asr_engine":"groq-whisper"}' \
+  "http://127.0.0.1:18080/api/v1/tasks/$local_task_id/actions/subtitle")"
+test "$bad_engine" = 400
+manual_sub="$(curl --silent --fail-with-body "${hdr[@]}" -d '{"prefer_youtube_subtitles":false,"youtube_subtitle_mode":"off","burn_in":true}' \
+  "http://127.0.0.1:18080/api/v1/tasks/$local_task_id/actions/subtitle")"
+manual_job="$(MANUAL="$manual_sub" python3 -c 'import json,os;d=json.loads(os.environ["MANUAL"]);assert d["status"]=="pending";print(d["job_id"])')"
+manual_repeat="$(curl --silent --fail-with-body "${hdr[@]}" -d '{"prefer_youtube_subtitles":false,"youtube_subtitle_mode":"off","burn_in":true}' \
+  "http://127.0.0.1:18080/api/v1/tasks/$local_task_id/actions/subtitle")"
+MANUAL_REPEAT="$manual_repeat" MANUAL_JOB="$manual_job" python3 -c \
+ 'import json,os;assert json.loads(os.environ["MANUAL_REPEAT"])["job_id"]==os.environ["MANUAL_JOB"]'
+test "$(docker exec "$container_name" psql -At -U postgres -d videoroll_test -c \
+ "SELECT count(*) FROM vr2_jobs WHERE task_id='$local_task_id' AND stage='download'")" = 0
+docker exec "$container_name" psql -v ON_ERROR_STOP=1 -U postgres -d videoroll_test -c \
+ "UPDATE vr2_jobs SET state='failed' WHERE id='$manual_job';
+  UPDATE vr2_workflows SET state='failed' WHERE task_id='$local_task_id';
+  UPDATE tasks SET status='FAILED'::task_status,updated_at=now() WHERE id='$local_task_id'" >/dev/null
+resumed_bulk="$(curl --silent --fail-with-body "${hdr[@]}" -X POST \
+  "http://127.0.0.1:18080/api/v1/tasks/actions/resume_failed_recent?window_hours=24&limit=20")"
+RESUMED_BULK="$resumed_bulk" LOCAL_ID="$local_task_id" python3 - <<'PYRESUMEBULK'
+import os,json
+v=json.loads(os.environ["RESUMED_BULK"])
+assert v["resumed_count"]>=1,v
+assert any(x["task_id"]==os.environ["LOCAL_ID"] and x["status"]=="resumed" for x in v["results"]),v
+PYRESUMEBULK
+test "$(docker exec "$container_name" psql -At -U postgres -d videoroll_test -c \
+ "SELECT max(generation) FROM vr2_workflows WHERE task_id='$local_task_id'")" = 2
+test "$(docker exec "$container_name" psql -At -U postgres -d videoroll_test -c \
+ "SELECT count(*) FROM vr2_jobs WHERE task_id='$local_task_id' AND stage='publish'")" = 0
+bad_publish="$(curl --silent -o /dev/null -w '%{http_code}' "${hdr[@]}" -d '{"skip_review":true}' \
+ "http://127.0.0.1:18080/api/v1/tasks/$local_task_id/actions/publish")"
+test "$bad_publish" = 400
+legacy_only="$(python3 -c 'import uuid;print(uuid.uuid4())')"
+docker exec "$container_name" psql -v ON_ERROR_STOP=1 -U postgres -d videoroll_test -c \
+ "INSERT INTO tasks(id,source_type,source_license,status)
+  VALUES('$legacy_only','local'::source_type,'own'::source_license,'CREATED'::task_status)" >/dev/null
+legacy_reject="$(curl --silent -o /dev/null -w '%{http_code}' "${hdr[@]}" -d "{\"task_id\":\"$legacy_only\",\"configuration\":{}}" \
+ http://127.0.0.1:18080/api/v2/workflows/start)"
+test "$legacy_reject" = 404
+echo 'PASS: native subtitle retry idempotency, durable generation, no download replay, V1 ownership gate'
+
+# Original publish platform switches: Bilibili toggle is durable, SAU
+# enablement refuses to report success before account/session parity.
+platforms="$(curl --silent --fail-with-body "${hdr[@]}" \
+ "http://127.0.0.1:18080/api/v1/settings/publish/platforms")"
+PLATFORMS="$platforms" python3 - <<'PYPLATFORMS'
+import json,os
+d=json.loads(os.environ["PLATFORMS"])["platforms"]
+assert d=={"bilibili":True,"douyin":False,"xiaohongshu":False,"kuaishou":False},d
+PYPLATFORMS
+disabled_bili="$(curl --silent --fail-with-body "${hdr[@]}" -X PUT \
+ -d '{"enabled":false}' \
+ "http://127.0.0.1:18080/api/v1/settings/publish/platforms/bilibili")"
+DISABLED_BILI="$disabled_bili" python3 -c \
+ 'import json,os;assert not json.loads(os.environ["DISABLED_BILI"])["platforms"]["bilibili"]'
+invalid_social="$(curl --silent -o /dev/null -w '%{http_code}' "${hdr[@]}" -X PUT \
+ -d '{"enabled":true}' \
+ "http://127.0.0.1:18080/api/v1/settings/publish/platforms/douyin")"
+test "$invalid_social" = 409
+curl --silent --fail-with-body "${hdr[@]}" -X PUT -d '{"enabled":true}' \
+ "http://127.0.0.1:18080/api/v1/settings/publish/platforms/bilibili" >/dev/null
+test "$(docker exec "$container_name" psql -At -U postgres -d videoroll_test -c \
+ "SELECT count(*) FROM app_settings WHERE key='publish.platforms'")" = 0
+echo 'PASS: Bilibili platform switch is native, isolated and durable; unsupported SAU toggles cannot silently succeed'
+
+
+
 
 
 
@@ -379,6 +447,12 @@ echo "$reconciled" | grep -q '"current_stage":"cleanup"'
 curl --silent --fail-with-body "${hdr[@]}" \
   "http://127.0.0.1:18080/api/v2/tasks/$task_id" | grep -q '"status":"PUBLISHED"'
 echo 'PASS: unknown publish blocks retries until manual verification'
+
+unknown_resume="$(curl --silent -o /dev/null -w '%{http_code}' "${hdr[@]}" -X POST \
+  "http://127.0.0.1:18080/api/v1/tasks/$v1_id/actions/subtitle_resume")"
+test "$unknown_resume" = 409
+echo 'PASS: uncertain Bilibili publication blocks even unrelated stage restarts'
+
 
 second_task="$(curl --silent --fail-with-body "${hdr[@]}" \
   -d '{"url":"https://youtu.be/0123456789B"}' http://127.0.0.1:18080/api/v2/auto/youtube)"
@@ -471,6 +545,76 @@ video_key="$(docker exec "$container_name" psql -At -U postgres -d videoroll_tes
 grep -q 'Hello from a Rust integration test' "$VIDEOROLL_V2_STORAGE_ROOT/$srt_key"
 ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of default=noprint_wrappers=1 "$VIDEOROLL_V2_STORAGE_ROOT/$video_key" | grep -q '^codec_name=h264'
 echo 'PASS: native OpenAI-compatible ASR, SRT/ASS, and real FFmpeg subtitle burn-in'
+
+# Original YouDub native-only task action: a real completed V2 SubtitleJob
+# is the prerequisite; repeated operation_key must not allocate another run.
+manual_dub_task="$(curl --silent --show-error --fail-with-body "${hdr[@]}" -d \
+  '{"source_type":"local","source_license":"own"}' \
+  "http://127.0.0.1:18080/api/v1/tasks")"
+manual_dub_id="$(MANUAL_DUB_TASK="$manual_dub_task" python3 -c \
+ 'import os,json;print(json.loads(os.environ["MANUAL_DUB_TASK"])["id"])')"
+curl --silent --show-error --fail-with-body -H "x-videoroll-v2-internal-token: $VIDEOROLL_V2_INTERNAL_TOKEN" \
+ -F "file=@$local_video;type=video/mp4" \
+ "http://127.0.0.1:18080/api/v1/tasks/$manual_dub_id/upload/video" >/dev/null
+manual_dub_source="$(docker exec "$container_name" psql -At -U postgres -d videoroll_test -c \
+ "SELECT storage_key FROM assets WHERE task_id='$manual_dub_id' AND kind='video_raw' LIMIT 1")"
+manual_dub_subtitle="$(curl --silent --show-error --fail-with-body "${hdr[@]}" \
+  -d '{"prefer_youtube_subtitles":false,"youtube_subtitle_mode":"off","translate_enabled":false,"burn_in":true}' \
+  "http://127.0.0.1:18080/api/v1/tasks/$manual_dub_id/actions/subtitle")"
+manual_dub_sub_id="$(MANUAL_DUB_SUBTITLE="$manual_dub_subtitle" python3 -c \
+ 'import json,os;print(json.loads(os.environ["MANUAL_DUB_SUBTITLE"])["job_id"])')"
+for i in $(seq 1 75);do
+  manual_finished="$(docker exec "$container_name" psql -At -U postgres -d videoroll_test -c \
+   "SELECT w.state FROM vr2_workflows w JOIN vr2_jobs j ON j.workflow_id=w.id
+    WHERE j.id='$manual_dub_sub_id'")"
+  if [[ "$manual_finished" == "succeeded" ]];then break;fi
+  sleep 1
+done
+test "$manual_finished" = succeeded
+manual_dubbing_body="$(MANUAL_DUB_ID="$manual_dub_id" MANUAL_DUB_SUB_ID="$manual_dub_sub_id" \
+ MANUAL_DUB_SOURCE="$manual_dub_source" python3 - <<'PYDUBBODY'
+import json,os
+print(json.dumps({"subtitle_job_id":os.environ["MANUAL_DUB_SUB_ID"],
+  "subtitle_video_key":os.environ["MANUAL_DUB_SOURCE"],
+  "operation_key":"test-native-dubbing-"+os.environ["MANUAL_DUB_ID"],
+  "model_path":"youdub:voxcpm2","voice":"reference","preview_only":False}))
+PYDUBBODY
+)"
+manual_dubbing="$(curl --silent --show-error --fail-with-body "${hdr[@]}" -d "$manual_dubbing_body" \
+ "http://127.0.0.1:18080/api/v1/tasks/$manual_dub_id/actions/dubbing")"
+manual_dub_job="$(MANUAL_DUBBING="$manual_dubbing" python3 -c \
+ 'import json,os;print(json.loads(os.environ["MANUAL_DUBBING"])["job_id"])')"
+manual_dubbing_repeat="$(curl --silent --show-error --fail-with-body "${hdr[@]}" -d "$manual_dubbing_body" \
+ "http://127.0.0.1:18080/api/v1/tasks/$manual_dub_id/actions/dubbing")"
+MANUAL_DUBBING_REPEAT="$manual_dubbing_repeat" MANUAL_DUB_JOB="$manual_dub_job" python3 -c \
+ 'import json,os;assert json.loads(os.environ["MANUAL_DUBBING_REPEAT"])["job_id"]==os.environ["MANUAL_DUB_JOB"]'
+for i in $(seq 1 70);do
+ manual_dub_finished="$(docker exec "$container_name" psql -At -U postgres -d videoroll_test -c \
+  "SELECT state FROM vr2_jobs WHERE id='$manual_dub_job'")"
+ if [[ "$manual_dub_finished" == "succeeded" ]];then break;fi
+ sleep 1
+done
+test "$manual_dub_finished" = succeeded
+
+# Manual and automatic P2 must reference an immutable successful dubbing run,
+# whose original raw-video key and SRT key match the current P1 inputs.
+manual_srt_key="$(docker exec "$container_name" psql -At -U postgres -d videoroll_test -c  "SELECT storage_key FROM assets WHERE task_id='$manual_dub_id' AND kind='subtitle_srt'
+  ORDER BY created_at DESC,id DESC LIMIT 1")"
+verified_p2="$(docker exec "$container_name" psql -At -U postgres -d videoroll_test -c  "SELECT EXISTS(SELECT 1 FROM vr2_dubbing_runs r JOIN vr2_jobs j ON j.id=r.job_id
+  WHERE r.task_id='$manual_dub_id'
+    AND r.source_video_key='$manual_dub_source'
+    AND r.source_srt_key='$manual_srt_key'
+    AND r.model_status='succeeded' AND j.state='succeeded' AND j.stage='dubbing')")"
+test "$verified_p2" = t
+echo 'PASS: cross-generation manual P2 retains raw video and SRT proof'
+
+test "$(docker exec "$container_name" psql -At -U postgres -d videoroll_test -c \
+ "SELECT count(*) FROM vr2_dubbing_runs WHERE task_id='$manual_dub_id' AND model_status='succeeded'")" = 1
+not_retryable="$(curl --silent -o /dev/null -w '%{http_code}' "${hdr[@]}" -X POST \
+ "http://127.0.0.1:18080/api/v1/tasks/$manual_dub_id/dubbing_jobs/$manual_dub_job/retry")"
+test "$not_retryable" = 409
+echo 'PASS: real native YouDub manual stage, strict subtitle ownership and deduplicated operation key'
+
 
 # Converted videos, assets and range streaming use original frontend
 # response envelope but never serve non-V2 assets.

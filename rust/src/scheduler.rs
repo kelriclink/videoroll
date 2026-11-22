@@ -7,6 +7,22 @@ use sqlx::{Postgres, Row, Transaction};
 use std::time::Duration;
 use uuid::Uuid;
 
+// Duplicate operator clicks are idempotent ONLY when their actual effective
+// settings match. A second click with different options must not claim that
+// the original already-queued work adopted the new settings.
+fn requested_settings_match(saved: &Value, changes: &serde_json::Map<String, Value>) -> bool {
+    changes.iter().all(|(key, requested)| {
+        if (key == "subtitle" || key == "render")
+            && let Some(fields) = requested.as_object()
+        {
+            return fields.iter().all(|(name, value)| {
+                saved.get(key).and_then(|parent| parent.get(name)) == Some(value)
+            });
+        }
+        saved.get(key) == Some(requested)
+    })
+}
+
 #[derive(Clone)]
 pub struct Scheduler {
     db: Database,
@@ -120,11 +136,15 @@ impl Scheduler {
     }
     pub async fn start(&self, task_id: Uuid, configuration: Value) -> AppResult<WorkflowInfo> {
         let mut tx = self.db.pool.begin().await?;
-        let task = sqlx::query("SELECT status::text AS status FROM tasks WHERE id=$1 FOR UPDATE")
-            .bind(task_id)
-            .fetch_optional(&mut *tx)
-            .await?
-            .ok_or_else(|| AppError::NotFound(format!("task {task_id}")))?;
+        let task = sqlx::query(
+            "SELECT t.status::text AS status FROM tasks t
+             JOIN vr2_managed_tasks m ON m.task_id=t.id
+             WHERE t.id=$1 FOR UPDATE OF t",
+        )
+        .bind(task_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| AppError::NotFound("V2-managed task not found".into()))?;
         let status: String = task.try_get("status")?;
         if status == "CANCELED" || status == "PUBLISHED" || status == "PUBLISHING" {
             return Err(AppError::Conflict(format!(
@@ -165,6 +185,255 @@ impl Scheduler {
         tx.commit().await?;
         self.workflow(workflow_id).await
     }
+    /// Restart a V2-owned task at an exact stage without reissuing earlier work.
+    ///
+    /// Every restart creates a new workflow generation and independent operation
+    /// keys, except while an identical stage is already running. A pending,
+    /// uncertain, or successful external publication is NEVER automatically
+    /// repeated, including after a process or machine restart.
+    pub async fn restart_at(
+        &self,
+        task_id: Uuid,
+        stage: Stage,
+        overrides: Value,
+    ) -> AppResult<WorkflowInfo> {
+        if stage == Stage::Cleanup {
+            return Err(AppError::Invalid(
+                "cleanup is not a restartable user stage".into(),
+            ));
+        }
+        let changes = overrides
+            .as_object()
+            .ok_or_else(|| AppError::Invalid("workflow overrides must be a JSON object".into()))?;
+        if serde_json::to_vec(&overrides)
+            .map_err(|_| AppError::Invalid("invalid overrides".into()))?
+            .len()
+            > 64 * 1024
+        {
+            return Err(AppError::Invalid("workflow overrides exceed 64KB".into()));
+        }
+        let mut tx = self.db.pool.begin().await?;
+        let status: Option<String> = sqlx::query_scalar(
+            "SELECT t.status::text FROM tasks t
+             JOIN vr2_managed_tasks m ON m.task_id=t.id
+             WHERE t.id=$1 FOR UPDATE OF t",
+        )
+        .bind(task_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let status = status.ok_or_else(|| AppError::NotFound("V2-owned task not found".into()))?;
+        if stage == Stage::Dubbing
+            && let Some(key) = changes
+                .get("manual_dub_operation_key")
+                .and_then(Value::as_str)
+        {
+            // The parent task row lock serializes concurrent operator calls.
+            // Repeating an operation key returns the original receipt even if
+            // that workflow has since failed; retry requires a new generation.
+            if let Some(existing) = sqlx::query(
+                "SELECT id,configuration->'manual_dub_request' AS request
+                 FROM vr2_workflows WHERE task_id=$1
+                 AND configuration->>'manual_dub_operation_key'=$2
+                 ORDER BY generation ASC LIMIT 1",
+            )
+            .bind(task_id)
+            .bind(key)
+            .fetch_optional(&mut *tx)
+            .await?
+            {
+                let originally: Option<Value> = existing.try_get("request")?;
+                if originally.as_ref() != changes.get("manual_dub_request") {
+                    return Err(AppError::Conflict(
+                        "YouDub operation key has been used for a different subtitle or raw video"
+                            .into(),
+                    ));
+                }
+                let flow_id: Uuid = existing.try_get("id")?;
+                tx.commit().await?;
+                return self.workflow(flow_id).await;
+            }
+        }
+        if matches!(status.as_str(), "CANCELED" | "PUBLISHED" | "PUBLISHING") {
+            return Err(AppError::Conflict(format!(
+                "task status {status} forbids stage restart"
+            )));
+        }
+        let unsafe_publish: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM vr2_jobs
+             WHERE task_id=$1 AND stage='publish'
+               AND (
+                 state IN ('pending','running','awaiting','unknown')
+                 OR (state='succeeded' AND COALESCE(result->>'skipped','')='')
+               ))",
+        )
+        .bind(task_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if unsafe_publish {
+            return Err(AppError::Conflict(
+                "a queued, successful or uncertain publication blocks restart; verify external outcome first".into()
+            ));
+        }
+        let latest = sqlx::query(
+            "SELECT id,state,current_stage,configuration
+             FROM vr2_workflows WHERE task_id=$1
+             ORDER BY generation DESC LIMIT 1 FOR UPDATE",
+        )
+        .bind(task_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let mut configuration = json!({});
+        if let Some(ref previous) = latest {
+            let prev_state: String = previous.try_get("state")?;
+            let prev_stage: String = previous.try_get("current_stage")?;
+            let prev_id: Uuid = previous.try_get("id")?;
+            if prev_state == "unknown" {
+                return Err(AppError::Conflict(
+                    "uncertain external workflow must be reconciled first".into(),
+                ));
+            }
+            if prev_state == "running" && prev_stage == stage.as_str() {
+                let current: Value = previous.try_get("configuration")?;
+                if !requested_settings_match(&current, changes) {
+                    return Err(AppError::Conflict(
+                        "same stage already running with different settings; cannot mutate an active generation".into()
+                    ));
+                }
+                tx.commit().await?;
+                return self.workflow(prev_id).await;
+            }
+            if matches!(prev_state.as_str(), "running" | "paused") {
+                return Err(AppError::Conflict(
+                    "another workflow is active or paused; stop or resume it before restarting"
+                        .into(),
+                ));
+            }
+            configuration = previous.try_get("configuration")?;
+        }
+        if let (Some(base), Some(overrides)) = (configuration.as_object_mut(), Some(changes)) {
+            for (key, value) in overrides {
+                if (key == "subtitle" || key == "render")
+                    && let (Some(src), Some(dst)) = (
+                        value.as_object(),
+                        base.get_mut(key).and_then(Value::as_object_mut),
+                    )
+                {
+                    for (field, content) in src {
+                        dst.insert(field.clone(), content.clone());
+                    }
+                    continue;
+                }
+                base.insert(key.clone(), value.clone());
+            }
+        }
+        // Preconditions are checked in the same transaction as workflow creation.
+        // Source files are separately validated by the stage worker before use.
+        let asset_needed = match stage {
+            Stage::Download => None,
+            Stage::Subtitle | Stage::Render | Stage::Dubbing => Some("video_raw"),
+            Stage::Publish => Some("video_final"),
+            Stage::Cleanup => unreachable!(),
+        };
+        if let Some(kind) = asset_needed {
+            let has_asset: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM assets WHERE task_id=$1
+                  AND kind::text=$2 AND storage_key LIKE 'v2/%')",
+            )
+            .bind(task_id)
+            .bind(kind)
+            .fetch_one(&mut *tx)
+            .await?;
+            if !has_asset
+                && !(stage == Stage::Publish
+                    && sqlx::query_scalar::<_, bool>(
+                        "SELECT EXISTS(SELECT 1 FROM assets WHERE task_id=$1
+                 AND kind='video_raw'::asset_kind AND storage_key LIKE 'v2/%')",
+                    )
+                    .bind(task_id)
+                    .fetch_one(&mut *tx)
+                    .await?)
+            {
+                return Err(AppError::Conflict(format!(
+                    "stage {} requires an existing V2 {kind} asset",
+                    stage.as_str()
+                )));
+            }
+        }
+        if matches!(stage, Stage::Render | Stage::Dubbing) {
+            let has_subtitle: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM assets WHERE task_id=$1
+                 AND kind='subtitle_srt'::asset_kind AND storage_key LIKE 'v2/%')",
+            )
+            .bind(task_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            if !has_subtitle {
+                return Err(AppError::Conflict(
+                    "requested stage needs a translated SRT".into(),
+                ));
+            }
+        }
+        if stage == Stage::Publish {
+            let has_meta: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM vr2_publish_meta WHERE task_id=$1)",
+            )
+            .bind(task_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            let inline = configuration.pointer("/publish/bilibili").is_some();
+            if !has_meta && !inline {
+                return Err(AppError::Conflict(
+                    "manual publication requires validated Bilibili metadata".into(),
+                ));
+            }
+        }
+        let generation: i32 = sqlx::query_scalar(
+            "SELECT COALESCE(MAX(generation),0)+1 FROM vr2_workflows WHERE task_id=$1",
+        )
+        .bind(task_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        let workflow_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO vr2_workflows(id,task_id,generation,state,current_stage,configuration)
+             VALUES($1,$2,$3,'running',$4,$5)",
+        )
+        .bind(workflow_id)
+        .bind(task_id)
+        .bind(generation)
+        .bind(stage.as_str())
+        .bind(&configuration)
+        .execute(&mut *tx)
+        .await?;
+        Self::insert_job(&mut tx, workflow_id, task_id, generation, stage).await?;
+        // Clear only internal error status, never platform history or artifacts.
+        let task_status = match stage {
+            Stage::Download => "CREATED",
+            Stage::Subtitle => "DOWNLOADED",
+            Stage::Render => "SUBTITLE_READY",
+            Stage::Dubbing | Stage::Publish => "RENDERED",
+            Stage::Cleanup => unreachable!(),
+        };
+        sqlx::query(
+            "UPDATE tasks SET status=$1::task_status,error_code=NULL,error_message=NULL,
+             updated_at=now() WHERE id=$2",
+        )
+        .bind(task_status)
+        .bind(task_id)
+        .execute(&mut *tx)
+        .await?;
+        Self::event(
+            &mut tx,
+            workflow_id,
+            None,
+            "workflow.restarted_from_stage",
+            json!({"generation":generation,"stage":stage.as_str()}),
+        )
+        .await?;
+        tx.commit().await?;
+        self.workflow(workflow_id).await
+    }
+
     async fn insert_job(
         tx: &mut Transaction<'_, Postgres>,
         workflow_id: Uuid,
@@ -964,5 +1233,28 @@ mod tests {
     fn publish_stages_have_no_automatic_retry() {
         assert!(Stage::Publish.has_irreversible_external_effect());
         assert!(!Stage::Subtitle.has_irreversible_external_effect());
+    }
+}
+
+#[cfg(test)]
+mod stage_restart_tests {
+    use super::*;
+    #[test]
+    fn reusing_a_stage_does_not_silently_change_settings() {
+        let saved = json!({"subtitle":{"translate_enabled":false,"asr_language":"en"},
+            "render":{"burn_in":true},"auto_publish":false});
+        let exact = json!({"subtitle":{"translate_enabled":false},"render":{"burn_in":true},
+            "auto_publish":false});
+        assert!(requested_settings_match(&saved, exact.as_object().unwrap()));
+        let changed = json!({"subtitle":{"translate_enabled":true}});
+        assert!(!requested_settings_match(
+            &saved,
+            changed.as_object().unwrap()
+        ));
+        let newkey = json!({"subtitle":{"model_id":"missing"}});
+        assert!(!requested_settings_match(
+            &saved,
+            newkey.as_object().unwrap()
+        ));
     }
 }

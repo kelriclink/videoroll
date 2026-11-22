@@ -65,3 +65,18 @@
 - B 站原生上传在存在 topic_id / mission_id 时，从已登录创作中心固定 HTTPS 只读查询精确核对话题/投稿任务 ID。公开活动列表 ID 不会被当作真正的 mission_id；活动规则要求有实质内容。转载视频只有规则明确允许转载且没有报名、白名单、原创等未证实限制时才通过；查询失败、不唯一或不匹配时阻断上传。可选 metadata.activity_name 作为检索关键字，此本地辅助字段不会转发给 B 站投稿接口。该检查不能证明账号奖励或报名资格，不能说成已完成活动资格认证。
 - React Rust 全页面预览下 YouTube 页面隐藏尚未迁移的「首页推荐定时扫描」，并明确说明 HTTP(S) aria2c 安全限制和未迁移的大文件下载阈值，而不是展示可点但无效的设置。
 - 未覆盖部分：YouTube 首页推荐扫描、Cookies 加密迁移、下载限速/128 MiB 阈值、B 站活动账号级报名状态、AI 自动活动筛选、多平台 SAU 投稿、手动字幕与 YouDub 全量控制、其余旧版 API 和页面。老生产服务继续运行，新 Rust 只隔离验证。API 候选迁移计数约 38/217，且每个入口的业务等价还需逐项测试。
+
+## 2026-11-22：Python 对照迁移第四批：任务详情页手动工作流及审计矩阵
+
+此批为部分兼容，不是 217 个 Python API 的完整迁移。单个 V1 原生入口仅在功能、状态与安全约束等价时才能标为完成。
+
+- rust/src/scheduler.rs 修正 V2 workflow start 的任务所有权：必须关联 vr2_managed_tasks。独立工作流分代可从 download/subtitle/render/dubbing/publish 精确阶段启动，沿用之前设置的浅层结构及字幕、渲染配置内层合并，不会为了重做字幕重新下载原片。
+- 重启存在强制外部副作用栅栏：此前 pending/running/awaiting/unknown 或曾真实成功的 publish 阻止重启；明确标记 skipped 且没有外部副作用的 publish 不被误当作真实成功。活动中同阶段的重复操作只有设置一致才复用原作业；变更设置返回冲突。
+- 新增旧任务详情页 V1 原生 POST actions/subtitle、actions/subtitle_resume、actions/publish 和 tasks/actions/resume_failed_recent。仅支持 Rust 已实现的 ASR/翻译和 FFmpeg 字段；无法原生执行的来源选择、引擎、特定字幕、自动发布策略和发布附加选项明确报错，绝不接受后偷偷忽略。手动投稿只支持保存过审核元数据、启用 native Bilibili 的安全部分；禁止强制重试和跳过 AI 审核。
+- 新增当前 Python YouDub VoxCPM2 路由 actions/dubbing、dubbing_jobs/{job_id}/retry、dubbing_jobs/{job_id}/control。只接受成功的同任务最新字幕作业与最新原片；operation_key 不可复用在不同请求数据，原始已完成请求可幂等取回。重新尝试只能创建新的持久代际。请注意，此控制目前仅管理 Rust workflow 状态与租约，不保证正在 GPU 上执行的第三方推理进程立即停止；原版已退役的逐段改写、预览和确认不予伪装复活。
+- 原生 V1 GET /settings/publish/platforms、PUT /settings/publish/platforms/{platform} 已基于单独 V2 overlay 提供 B 站开关。由于抖音、小红书、快手 SAU 账号和投稿尚未完成，主动启用它们会返回 409；管理页不能误显示可用。这不算 SAU 功能迁移完成。
+- 修复跨代际 P2 关联逻辑：手动字幕、手动 YouDub、手动 B 站投稿可以分别属于不同工作流。只能在成功的 vr2_dubbing_runs 证明原视频、SRT 与 P2 输出都匹配、同任务归属并且 YouDub 作业成功时使用，不能因为 workflow_id 不同而误拒绝，也不能拿旧配音视频冒充当前配音。
+- 增加 rust/scripts/audit_contract_matrix.py 与 rust/docs/CONTRACT_MATRIX.json、CONTRACT_MATRIX.md：对 217 个原始 Python 路由逐项记录来源方法、V1 原生映射与全面验收状态。目前所有路由的 fully_verified 均为 false。审计统计仅表示候选入口数量，而非实现率。
+- 隔离验收新增真实 PostgreSQL 阶段代际与任务归属、同阶段重入、失败批量恢复、未知稿件阻断、平台开关 V2 隔离、真实执行的模拟 YouDub 手动创建及成功资产关联。原生 YouDub 与最终 B 站 P2 仍需真实设备和平台验收。
+
+目前仍未完成：SAU 多平台账号及登录/投稿、B 站原版全部设置与追加 P2、ASR 引擎全覆盖、字幕高级控制、完整 YouDub 控制到第三方 GPU 运行时、渲染管理页面、告警与实时 WebSocket、旧版全部前端操作，以及故障注入、实际 YouTube/真实 B 站生产级验收。生产 main 与 VideoRoll 服务不变。

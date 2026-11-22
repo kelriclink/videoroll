@@ -91,3 +91,12 @@ V2 React 页面只有在 VITE_RUST_V2_UI=true 时出现，生产界面默认没�
 - Rust /api/v1/settings/review 与 /api/v1/tasks/{id}/publish_review 及 POST /actions/publish_review 支持规则审核、实际 OpenAI 兼容模型审核、内容指纹与变更失效，拒绝或无法核实时阻止原生 B 站 UPOS 上传。
 - 存在 B 站话题/任务 ID 时，原生发布在上传前用登录的创作中心只读接口核验一一对应、基础规则及转载限制；不能证明账户已经报名或具备活动奖励资格。
 - 仅 rewrite/rust-v2 开发分支可开启旧 UI 的 VITE_RUST_V2_FULL_UI=true 预览；尚未完成自动扫描、多平台 SAU、全部字幕配音管理 API，不能直接切到生产。
+
+### Python-to-Rust 第四批：旧任务详情页手动操作（隔离开发）
+
+- 新增按 V2 所有权与 SQL 事务约束的 restart_at(stage)；重复字幕点击不重下视频，成功或不确定的外部投稿不会自动重投。
+- Rust /api/v1 已接入手动字幕、字幕继续、B 站手动投稿、可逆阶段失败批量恢复、YouDub 原生手动作业与受限重试/控制。只接受现在真正实现的旧字段；超出范围时显式冲突/错误。
+- Bilibili 多 P 校验允许不同 V2 工作流代际中的相同原片/SRT 成对成功 YouDub；旧稿件和未成功配音不得复用。
+- 原生投稿平台开关已迁移 Bilibili 偏好；SAU 社交平台保持禁用直到完成真正平台账号会话、回执和幂等投稿。
+- 逐 Python 端点矩阵位于 rust/docs/CONTRACT_MATRIX.md 和 .json，校验命令为 python3 rust/scripts/audit_contract_matrix.py --check。该矩阵刻意将所有完全等价验收设为 false。
+- 禁止将这些局部兼容功能误称为完全迁移，也禁止将实验性 React 全页面预览与模拟服务结果用于宣布生产可切换。

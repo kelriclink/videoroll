@@ -16,7 +16,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{collections::HashSet, path::Path, time::Duration};
 use tokio::{fs, io::AsyncReadExt, time::sleep};
-use uuid::Uuid;
 
 const UPLOAD_MAX_CHUNK: usize = 64 * 1024 * 1024;
 const MAX_METADATA_BYTES: usize = 2 * 1024 * 1024;
@@ -282,12 +281,34 @@ pub async fn archive_spec(
     let p2 = latest_asset_key(db, job.task_id, "video_dubbed").await?;
     let mut parts = vec![(p1, meta.title.clone())];
     if let Some(p2) = p2 {
-        let bound:Option<Uuid>=sqlx::query_scalar(
-            "SELECT job_id FROM vr2_dubbing_runs WHERE task_id=$1 AND workflow_id=$2 AND output_video_key=$3 AND model_status='succeeded'"
-        ).bind(job.task_id).bind(job.workflow_id).bind(&p2).fetch_optional(&db.pool).await?;
-        if bound.is_none() {
+        // Manual YouDub and manual publishing are intentionally different V2
+        // workflow generations. Proof of same P1/P2 source is the immutable
+        // succeeded DubbingRun's original source+SRT keys, not a shared
+        // workflow ID (which would break valid manual P2 submissions).
+        let original = latest_asset_key(db, job.task_id, "video_raw")
+            .await?
+            .ok_or_else(|| AppError::NotFound("P2 original source video missing".into()))?;
+        let srt = latest_asset_key(db, job.task_id, "subtitle_srt")
+            .await?
+            .ok_or_else(|| AppError::NotFound("P2 associated subtitle missing".into()))?;
+        let matched: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM vr2_dubbing_runs r
+             JOIN vr2_jobs j ON j.id=r.job_id
+             WHERE r.task_id=$1 AND r.output_video_key=$2 AND
+               r.source_video_key=$3 AND r.source_srt_key=$4
+               AND r.model_status='succeeded' AND j.state='succeeded'
+               AND j.stage='dubbing' AND j.task_id=$1)",
+        )
+        .bind(job.task_id)
+        .bind(&p2)
+        .bind(&original)
+        .bind(&srt)
+        .fetch_one(&db.pool)
+        .await?;
+        if !matched {
             return Err(AppError::Conflict(
-                "P2 cannot be submitted without matching completed YouDub run".into(),
+                "P2 does not match the current original video and SRT from a completed YouDub run"
+                    .into(),
             ));
         }
         let p2_title = profile
@@ -623,6 +644,11 @@ pub async fn publish(
         .ok_or_else(|| AppError::Unavailable("Bilibili CSRF token not configured".into()))?;
     if csrf.len() < 12 || csrf.len() > 80 || !csrf.chars().all(|c| c.is_ascii_alphanumeric()) {
         return Err(AppError::Invalid("Bilibili CSRF token invalid".into()));
+    }
+    if !crate::publish_platforms::enabled(db, "bilibili").await? {
+        return Err(AppError::Conflict(
+            "Bilibili publishing is disabled in V2 platform settings".into(),
+        ));
     }
     let (meta, parts) = archive_spec(db, job).await?;
     let reviewed_meta = crate::publish_meta::saved(db, job.task_id)

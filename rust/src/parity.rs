@@ -51,6 +51,15 @@ const V1_ADAPTERS: &[(&str, &str)] = &[
     ("PUT", "/settings/review"),
     ("GET", "/tasks/{task_id}/publish_review"),
     ("POST", "/tasks/{task_id}/actions/publish_review"),
+    ("POST", "/tasks/{task_id}/actions/subtitle"),
+    ("POST", "/tasks/{task_id}/actions/dubbing"),
+    ("POST", "/tasks/{task_id}/dubbing_jobs/{job_id}/retry"),
+    ("POST", "/tasks/{task_id}/dubbing_jobs/{job_id}/control"),
+    ("POST", "/tasks/{task_id}/actions/subtitle_resume"),
+    ("POST", "/tasks/{task_id}/actions/publish"),
+    ("POST", "/tasks/actions/resume_failed_recent"),
+    ("GET", "/settings/publish/platforms"),
+    ("PUT", "/settings/publish/platforms/{platform}"),
 ];
 
 fn from_sources() -> AppResult<(Value, Value)> {
@@ -86,7 +95,12 @@ pub fn report() -> AppResult<Value> {
             .unwrap_or("unknown");
         let path = row.get("path").and_then(Value::as_str).unwrap_or("");
         let method = row.get("method").and_then(Value::as_str).unwrap_or("");
-        let adapter = service == "orchestrator_api" && is_adapter(method, path);
+        // The v1 frontend exposes /youtube/ingest directly; its Python
+        // declaration lives in the separate youtube_ingest service rather
+        // than the orchestrator's dynamic proxy route.
+        let adapter = (service == "orchestrator_api"
+            || (service == "youtube_ingest" && method == "POST" && path == "/youtube/ingest"))
+            && is_adapter(method, path);
         let entry = services.entry(service.into()).or_default();
         entry.0 += 1;
         if adapter {
@@ -133,10 +147,10 @@ mod tests {
         let value = report().unwrap();
         assert_eq!(value["all_features_migrated"], false);
         assert!(value["legacy_route_declarations"].as_u64().unwrap() >= 217);
-        assert_eq!(value["native_v1_adapters"], 38);
+        assert_eq!(value["native_v1_adapters"], 48);
         assert_eq!(value["fully_verified_legacy_routes"], 0);
         assert!(value["frontend_url_references"].as_u64().unwrap() >= 190);
         assert!(is_adapter("GET", "/tasks/{task_id}"));
-        assert!(!is_adapter("POST", "/tasks/{task_id}/actions/publish"));
+        assert!(is_adapter("POST", "/tasks/{task_id}/actions/publish"));
     }
 }

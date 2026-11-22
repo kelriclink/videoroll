@@ -1,0 +1,609 @@
+//! Stage-specific V1 TaskDetail actions implemented on durable V2 workflows.
+//! No V1 Python forwarding, detached task, or "accepted" response without a
+//! real queued vr2_job. Unsupported legacy options fail explicitly.
+use crate::{
+    AppError, AppResult,
+    api::AppState,
+    domain::{Stage, WorkflowInfo},
+    legacy_contracts::read_task,
+};
+use axum::{
+    Json, Router,
+    extract::{Path, Query, State},
+    routing::post,
+};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use sqlx::Row;
+use uuid::Uuid;
+
+#[derive(Debug, Deserialize)]
+struct SubtitleAction {
+    #[serde(default)]
+    resume: bool,
+    #[serde(default)]
+    burn_in: Option<bool>,
+    #[serde(default)]
+    soft_sub: Option<bool>,
+    #[serde(default)]
+    ass_style: Option<String>,
+    #[serde(default)]
+    video_codec: Option<String>,
+    #[serde(default)]
+    use_intel_gpu: Option<bool>,
+    #[serde(default)]
+    video_crf: Option<u8>,
+    #[serde(default)]
+    video_preset: Option<String>,
+    #[serde(default)]
+    asr_engine: Option<String>,
+    #[serde(default)]
+    asr_language: Option<String>,
+    #[serde(default)]
+    asr_model: Option<String>,
+    #[serde(default)]
+    translate_enabled: Option<bool>,
+    #[serde(default)]
+    translate_provider: Option<String>,
+    #[serde(default)]
+    translate_model_provider_id: Option<String>,
+    #[serde(default)]
+    translate_model_id: Option<String>,
+    #[serde(default)]
+    target_lang: Option<String>,
+    #[serde(default)]
+    translate_style: Option<String>,
+    #[serde(default)]
+    bilingual: Option<bool>,
+    #[serde(default)]
+    formats: Option<Vec<String>>,
+    #[serde(default)]
+    prefer_youtube_subtitles: Option<bool>,
+    #[serde(default)]
+    youtube_subtitle_mode: Option<String>,
+    #[serde(default)]
+    translate_batch_size: Option<i32>,
+    #[serde(default)]
+    translate_enable_summary: Option<bool>,
+    #[serde(default)]
+    auto_publish: Option<bool>,
+    #[serde(default)]
+    publish_payload: Option<Value>,
+}
+fn subtitle_config(request: SubtitleAction) -> AppResult<Value> {
+    // The native Rust ASR processes SRT/ASS using a single engine and the
+    // configured OpenAI-compatible endpoint. Legacy engine selectors and
+    // YouTube subtitle-source selection require separate implementations.
+    if request.asr_engine.as_deref().is_some_and(|s| s != "auto")
+        || request.asr_model.is_some()
+        || request.prefer_youtube_subtitles == Some(true)
+        || request
+            .youtube_subtitle_mode
+            .as_deref()
+            .is_some_and(|s| s != "off")
+        || request.translate_batch_size.is_some()
+        || request.translate_enable_summary.is_some()
+        || request.auto_publish == Some(true)
+        || request.publish_payload.is_some()
+    {
+        return Err(AppError::Invalid(
+            "selected legacy subtitle source, engine, summary or automatic publish option has no native V2 equivalent".into()
+        ));
+    }
+    if request
+        .formats
+        .as_ref()
+        .is_some_and(|f| f.iter().any(|v| !matches!(v.as_str(), "srt" | "ass")))
+    {
+        return Err(AppError::Invalid(
+            "only srt and ass subtitle formats supported by V2".into(),
+        ));
+    }
+    let mut subtitle = json!({});
+    let mut render = json!({});
+    macro_rules! put {
+        ($target:ident,$name:literal,$val:expr) => {
+            if let Some(v) = $val {
+                $target[$name] = json!(v);
+            }
+        };
+    }
+    put!(subtitle, "asr_language", request.asr_language);
+    put!(subtitle, "translate_enabled", request.translate_enabled);
+    put!(subtitle, "translate_provider", request.translate_provider);
+    put!(
+        subtitle,
+        "translate_model_provider_id",
+        request.translate_model_provider_id
+    );
+    put!(subtitle, "translate_model_id", request.translate_model_id);
+    put!(subtitle, "target_lang", request.target_lang);
+    put!(subtitle, "translate_style", request.translate_style);
+    put!(subtitle, "bilingual", request.bilingual);
+    put!(render, "burn_in", request.burn_in);
+    put!(render, "soft_sub", request.soft_sub);
+    put!(render, "ass_style", request.ass_style);
+    put!(render, "video_codec", request.video_codec);
+    put!(render, "use_intel_gpu", request.use_intel_gpu);
+    put!(render, "video_crf", request.video_crf);
+    put!(render, "video_preset", request.video_preset);
+    if let Some(codec) = render["video_codec"].as_str()
+        && !matches!(codec, "h264" | "av1")
+    {
+        return Err(AppError::Invalid(
+            "V2 supports only h264 or av1 render codec".into(),
+        ));
+    }
+    // A native subtitle retry uses the persisted ASR checkpoint. The resumed
+    // generation is independent of the prior lease and never replays publish.
+    let mut result = json!({"subtitle":subtitle,"render":render,"auto_publish":false,
+        "auto_publish_platforms":[]});
+    if request.resume {
+        result["subtitle"]["resume"] = json!(true);
+    }
+    Ok(result)
+}
+#[derive(Debug, Serialize)]
+struct ManualJobResponse {
+    job_id: Uuid,
+    status: String,
+}
+async fn response(
+    state: &AppState,
+    flow: WorkflowInfo,
+    stage: Stage,
+) -> AppResult<Json<ManualJobResponse>> {
+    let job = sqlx::query(
+        "SELECT id,state FROM vr2_jobs WHERE workflow_id=$1 AND stage=$2
+         ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(flow.id)
+    .bind(stage.as_str())
+    .fetch_optional(&state.db.pool)
+    .await?
+    .ok_or_else(|| AppError::Unavailable("new V2 workflow has no stage job".into()))?;
+    Ok(Json(ManualJobResponse {
+        job_id: job.try_get("id")?,
+        status: job.try_get("state")?,
+    }))
+}
+async fn manual_subtitle(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(req): Json<SubtitleAction>,
+) -> AppResult<Json<ManualJobResponse>> {
+    read_task(&state.db, id).await?;
+    let overrides = subtitle_config(req)?;
+    let flow = state
+        .scheduler
+        .restart_at(id, Stage::Subtitle, overrides)
+        .await?;
+    response(&state, flow, Stage::Subtitle).await
+}
+async fn resume_subtitle(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> AppResult<Json<ManualJobResponse>> {
+    read_task(&state.db, id).await?;
+    let flow = state
+        .scheduler
+        .restart_at(
+            id,
+            Stage::Subtitle,
+            json!({
+                "auto_publish":false,"auto_publish_platforms":[]
+            }),
+        )
+        .await?;
+    response(&state, flow, Stage::Subtitle).await
+}
+#[derive(Debug, Deserialize)]
+struct PublishPayload {
+    #[serde(default = "default_platform")]
+    platform: String,
+    #[serde(default)]
+    meta: Option<Value>,
+    account_id: Option<String>,
+    video_key: Option<String>,
+    video_parts: Option<Vec<Value>>,
+    cover_key: Option<String>,
+    typeid_mode: Option<String>,
+    #[serde(default)]
+    platform_options: Value,
+    #[serde(default)]
+    skip_review: bool,
+    #[serde(default)]
+    force_retry: bool,
+}
+fn default_platform() -> String {
+    "bilibili".into()
+}
+async fn manual_publish(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(payload): Json<PublishPayload>,
+) -> AppResult<Json<Value>> {
+    read_task(&state.db, id).await?;
+    if payload.platform != "bilibili"
+        || payload.account_id.is_some()
+        || payload.video_key.is_some()
+        || payload.video_parts.is_some()
+        || payload.cover_key.is_some()
+        || payload.typeid_mode.is_some()
+        || payload
+            .platform_options
+            .as_object()
+            .is_some_and(|v| !v.is_empty())
+        || payload.skip_review
+        || payload.force_retry
+    {
+        return Err(AppError::Invalid(
+            "only Bilibili's saved-metadata single-upload workflow is supported; explicit account, P2, cover, review bypass and forced retry are not migrated".into()
+        ));
+    }
+    if !crate::publish_platforms::enabled(&state.db, "bilibili").await? {
+        return Err(AppError::Conflict("Bilibili platform is disabled".into()));
+    }
+    if !state.config.native_bilibili_allowed {
+        return Err(AppError::Unavailable(
+            "manual native Bilibili publishing is not enabled on this isolated V2 host".into(),
+        ));
+    }
+    let saved = crate::publish_meta::saved(&state.db, id).await?;
+    let meta = if let Some(provided) = payload.meta {
+        let provided = crate::publish_meta::normalized(provided)?;
+        if let Some(ref existing) = saved
+            && existing != &provided
+        {
+            return Err(AppError::Conflict(
+                "metadata differs from the saved revision; save the draft first".into(),
+            ));
+        }
+        Some(provided)
+    } else {
+        None
+    };
+    let resolved = saved
+        .or(meta)
+        .ok_or_else(|| AppError::Invalid("save Bilibili metadata before publishing".into()))?;
+    let parsed: crate::bilibili::ArchiveMeta = serde_json::from_value(resolved.clone())
+        .map_err(|_| AppError::Invalid("invalid Bilibili metadata".into()))?;
+    parsed.validate()?;
+    // An activity mission must be revalidated at actual publish time.
+    // AI review is invoked by the Bilibili executor before any UPOS upload.
+    let flow = state
+        .scheduler
+        .restart_at(
+            id,
+            Stage::Publish,
+            json!({
+                "auto_publish":true,"auto_publish_platforms":["bilibili"],
+                "publish":{"bilibili":resolved}
+            }),
+        )
+        .await?;
+    let job = response(&state, flow, Stage::Publish).await?;
+    Ok(Json(json!({
+        "state":job.0.status,"platform":"bilibili","job_id":job.0.job_id,
+        "bvid":null,"aid":null,"response":null
+    })))
+}
+#[derive(Debug, Deserialize)]
+struct BulkQuery {
+    window_hours: Option<i64>,
+    limit: Option<i64>,
+}
+async fn resume_recent(
+    State(state): State<AppState>,
+    Query(query): Query<BulkQuery>,
+) -> AppResult<Json<Value>> {
+    let hours = query.window_hours.unwrap_or(24);
+    let limit = query.limit.unwrap_or(200);
+    if !(1..=168).contains(&hours) || !(1..=500).contains(&limit) {
+        return Err(AppError::Invalid(
+            "window_hours must be 1..168 and limit 1..500".into(),
+        ));
+    }
+    let rows = sqlx::query(
+        "SELECT t.id,j.stage,j.state FROM tasks t
+         JOIN vr2_managed_tasks m ON m.task_id=t.id
+         JOIN LATERAL (
+           SELECT stage,state FROM vr2_jobs
+           WHERE task_id=t.id
+           ORDER BY created_at DESC,id DESC LIMIT 1
+         ) j ON true
+         WHERE t.status='FAILED'::task_status
+           AND t.updated_at>=now()-($1 * interval '1 hour')
+         ORDER BY t.updated_at DESC LIMIT $2",
+    )
+    .bind(hours)
+    .bind(limit)
+    .fetch_all(&state.db.pool)
+    .await?;
+    let mut results = Vec::new();
+    let mut resumed = 0;
+    let mut skipped = 0;
+    let mut failed = 0;
+    for row in &rows {
+        let id: Uuid = row.try_get("id")?;
+        let stage_name: String = row.try_get("stage")?;
+        let state_name: String = row.try_get("state")?;
+        let stage = Stage::from_name(&stage_name);
+        let answer = if state_name != "failed"
+            || stage.is_none_or(|s| s == Stage::Publish || s == Stage::Cleanup)
+        {
+            skipped += 1;
+            json!({"task_id":id,"job_id":null,"status":"skipped",
+                "detail":"only failed, reversible V2 stages can be resumed"})
+        } else {
+            let stage = stage.expect("verified above");
+            match state.scheduler.restart_at(id, stage, json!({})).await {
+                Ok(flow) => {
+                    resumed += 1;
+                    let job: Option<Uuid> = sqlx::query_scalar(
+                        "SELECT id FROM vr2_jobs WHERE workflow_id=$1 AND stage=$2",
+                    )
+                    .bind(flow.id)
+                    .bind(stage.as_str())
+                    .fetch_optional(&state.db.pool)
+                    .await?;
+                    json!({"task_id":id,"job_id":job,"status":"resumed","detail":stage.as_str()})
+                }
+                Err(err) => {
+                    failed += 1;
+                    tracing::warn!(task_id=%id,error=%err,"V2 bulk resume refused");
+                    json!({"task_id":id,"job_id":null,"status":"failed",
+                        "detail":"safety or asset precondition rejected restart"})
+                }
+            }
+        };
+        results.push(answer);
+    }
+    Ok(Json(
+        json!({"window_hours":hours,"matched_count":rows.len(),
+        "resumed_count":resumed,"skipped_count":skipped,
+        "failed_count":failed,"results":results}),
+    ))
+}
+// The current Python service has already retired sentence rewriting, preview
+// and the old CosyVoice paths. Only native YouDub VoxCPM2 is supported here.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DubbingPayload {
+    subtitle_job_id: Uuid,
+    subtitle_video_key: String,
+    operation_key: String,
+    #[serde(default = "default_youdub")]
+    model_path: String,
+    #[serde(default = "default_voice")]
+    voice: String,
+    #[serde(default)]
+    preview_only: bool,
+}
+fn default_youdub() -> String {
+    "youdub:voxcpm2".into()
+}
+fn default_voice() -> String {
+    "reference".into()
+}
+async fn manual_dubbing(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(request): Json<DubbingPayload>,
+) -> AppResult<Json<ManualJobResponse>> {
+    read_task(&state.db, id).await?;
+    if request.model_path != "youdub:voxcpm2"
+        || request.voice != "reference"
+        || request.preview_only
+    {
+        return Err(AppError::Invalid(
+            "only native YouDub VoxCPM2 reference voice without legacy previews is supported"
+                .into(),
+        ));
+    }
+    if request.operation_key.trim().is_empty() || request.operation_key.len() > 255 {
+        return Err(AppError::Invalid(
+            "operation_key must be 1..255 bytes".into(),
+        ));
+    }
+    if state.config.youdub_bridge.is_none() || state.config.youdub_python.is_none() {
+        return Err(AppError::Unavailable(
+            "V2 isolated YouDub bridge is not configured".into(),
+        ));
+    }
+    let subtitle_belongs: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM vr2_jobs j JOIN vr2_workflows w ON w.id=j.workflow_id
+         WHERE j.id=$1 AND j.task_id=$2 AND j.stage='subtitle'
+           AND j.state='succeeded' AND w.task_id=$2)",
+    )
+    .bind(request.subtitle_job_id)
+    .bind(id)
+    .fetch_one(&state.db.pool)
+    .await?;
+    if !subtitle_belongs {
+        return Err(AppError::Conflict(
+            "completed V2 subtitle job does not belong to this task".into(),
+        ));
+    }
+    let video_owned: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM assets WHERE task_id=$1
+          AND kind='video_raw'::asset_kind AND storage_key=$2 AND storage_key LIKE 'v2/%')",
+    )
+    .bind(id)
+    .bind(&request.subtitle_video_key)
+    .fetch_one(&state.db.pool)
+    .await?;
+    if !video_owned {
+        return Err(AppError::Conflict(
+            "YouDub source key must reference the task's V2 raw video".into(),
+        ));
+    }
+    let latest_raw = crate::media::ffmpeg::latest_asset_key(&state.db, id, "video_raw").await?;
+    if latest_raw.as_deref() != Some(request.subtitle_video_key.as_str()) {
+        return Err(AppError::Conflict(
+            "native YouDub requires the latest original video; source changed".into(),
+        ));
+    }
+    let latest_subtitle: Option<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM vr2_jobs WHERE task_id=$1 AND stage='subtitle'
+           AND state='succeeded' ORDER BY generation DESC,created_at DESC LIMIT 1",
+    )
+    .bind(id)
+    .fetch_optional(&state.db.pool)
+    .await?;
+    if latest_subtitle != Some(request.subtitle_job_id) {
+        return Err(AppError::Conflict(
+            "native YouDub requires the latest completed subtitle job".into(),
+        ));
+    }
+    // The V2 YouDub bridge currently supports one deterministic completed
+    // native model run, not legacy preview/speech editing controls.
+    let flow = state
+        .scheduler
+        .restart_at(
+            id,
+            Stage::Dubbing,
+            json!({
+                "manual_dub_operation_key":request.operation_key,
+                "manual_dub_request":{
+                    "subtitle_job_id":request.subtitle_job_id,
+                    "source_video_key":request.subtitle_video_key
+                },
+                "auto_dub_p2":true,
+                "dubbing":{"enabled":true},
+                "auto_publish":false,"auto_publish_platforms":[]
+            }),
+        )
+        .await?;
+    response(&state, flow, Stage::Dubbing).await
+}
+async fn retry_dubbing(
+    State(state): State<AppState>,
+    Path((id, job_id)): Path<(Uuid, Uuid)>,
+) -> AppResult<Json<ManualJobResponse>> {
+    read_task(&state.db, id).await?;
+    let prior = sqlx::query(
+        "SELECT j.state,w.id AS workflow_id FROM vr2_jobs j
+         JOIN vr2_workflows w ON w.id=j.workflow_id
+         WHERE j.id=$1 AND j.task_id=$2 AND j.stage='dubbing'",
+    )
+    .bind(job_id)
+    .bind(id)
+    .fetch_optional(&state.db.pool)
+    .await?
+    .ok_or_else(|| AppError::NotFound("V2 YouDub stage job not found".into()))?;
+    let state_name: String = prior.try_get("state")?;
+    if state_name != "failed" {
+        return Err(AppError::Conflict(
+            "only a failed native YouDub stage is retryable".into(),
+        ));
+    }
+    let flow = state
+        .scheduler
+        .restart_at(
+            id,
+            Stage::Dubbing,
+            json!({
+                "manual_dub_operation_key":null,
+                "auto_dub_p2":true,"dubbing":{"enabled":true},
+                "auto_publish":false,"auto_publish_platforms":[]
+            }),
+        )
+        .await?;
+    response(&state, flow, Stage::Dubbing).await
+}
+#[derive(Debug, Deserialize)]
+struct ControlQuery {
+    action: String,
+}
+async fn control_dubbing(
+    State(state): State<AppState>,
+    Path((id, job_id)): Path<(Uuid, Uuid)>,
+    Query(query): Query<ControlQuery>,
+) -> AppResult<Json<Value>> {
+    read_task(&state.db, id).await?;
+    if !matches!(query.action.as_str(), "pause" | "cancel") {
+        return Err(AppError::Invalid(
+            "YouDub control action must be pause or cancel".into(),
+        ));
+    }
+    let row = sqlx::query(
+        "SELECT j.state,w.id AS workflow_id,w.current_stage,w.state AS workflow_state
+         FROM vr2_jobs j JOIN vr2_workflows w ON j.workflow_id=w.id
+         WHERE j.id=$1 AND j.task_id=$2 AND j.stage='dubbing'",
+    )
+    .bind(job_id)
+    .bind(id)
+    .fetch_optional(&state.db.pool)
+    .await?
+    .ok_or_else(|| AppError::NotFound("V2 dubbing job missing".into()))?;
+    let state_name: String = row.try_get("state")?;
+    let stage: String = row.try_get("current_stage")?;
+    let state_flow: String = row.try_get("workflow_state")?;
+    if stage != "dubbing"
+        || state_flow != "running"
+        || !matches!(state_name.as_str(), "pending" | "running" | "awaiting")
+    {
+        return Err(AppError::Conflict(
+            "YouDub stage is not currently controllable".into(),
+        ));
+    }
+    let workflow_id: Uuid = row.try_get("workflow_id")?;
+    if query.action == "pause" {
+        state.scheduler.pause(workflow_id).await?;
+    } else {
+        state.scheduler.cancel(workflow_id).await?;
+    }
+    Ok(Json(json!({"job_id":job_id,
+        "status":if query.action=="pause"{"paused"}else{"canceled"}})))
+}
+
+pub fn router() -> Router<AppState> {
+    Router::new()
+        .route("/tasks/{id}/actions/subtitle", post(manual_subtitle))
+        .route("/tasks/{id}/actions/dubbing", post(manual_dubbing))
+        .route(
+            "/tasks/{id}/dubbing_jobs/{job_id}/retry",
+            post(retry_dubbing),
+        )
+        .route(
+            "/tasks/{id}/dubbing_jobs/{job_id}/control",
+            post(control_dubbing),
+        )
+        .route("/tasks/{id}/actions/subtitle_resume", post(resume_subtitle))
+        .route("/tasks/{id}/actions/publish", post(manual_publish))
+        .route("/tasks/actions/resume_failed_recent", post(resume_recent))
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn unsupported_subtitle_options_never_get_silently_ignored() {
+        assert!(
+            subtitle_config(
+                serde_json::from_value(json!({
+            "asr_engine":"groq-whisper","burn_in":true}))
+                .unwrap()
+            )
+            .is_err()
+        );
+        assert!(
+            subtitle_config(
+                serde_json::from_value(json!({
+            "prefer_youtube_subtitles":true}))
+                .unwrap()
+            )
+            .is_err()
+        );
+        assert!(
+            subtitle_config(
+                serde_json::from_value(json!({
+                    "translate_enabled":true,"burn_in":true,"video_codec":"h264",
+                    "prefer_youtube_subtitles":false,"youtube_subtitle_mode":"off"
+                }))
+                .unwrap()
+            )
+            .is_ok()
+        );
+    }
+}
