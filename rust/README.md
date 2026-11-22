@@ -84,3 +84,10 @@ V2 React 页面只有在 VITE_RUST_V2_UI=true 时出现，生产界面默认没�
 - 原版投稿页 GET/POST /api/v1/tasks/{id}/publish_meta/draft 与 GET/PUT /api/v1/tasks/{id}/publish_meta 会将编辑内容持久化到独立 vr2_publish_meta，实际原生投稿优先读取此处。
 - 原版任务页 GET /api/v1/tasks/{id}/youtube_meta 与 POST /api/v1/tasks/{id}/actions/youtube_meta 使用外部 yt-dlp 提取；需在运行环境提供该程序。原生 GET .../youtube_download_progress 提供可信作业状态，但未提供下载期间的细粒度带宽信息。
 - 这些入口不代表全部原版 API、AI 审核、活动核验及前端完整功能已完成；生产 Rust 替换仍不允许。
+
+### 第三批旧版前端 API 迁移（隔离）
+
+- Rust /api/v1/settings/youtube 现有代理、Cookies（受限私有文件）、并发、兼容模式设置及代理连通性测试。下载 worker 直接读取这些设置，利用 yt-dlp 与（经版本校验的）aria2c；任务详情可读取带租约 fencing 的实时下载状态。
+- Rust /api/v1/settings/review 与 /api/v1/tasks/{id}/publish_review 及 POST /actions/publish_review 支持规则审核、实际 OpenAI 兼容模型审核、内容指纹与变更失效，拒绝或无法核实时阻止原生 B 站 UPOS 上传。
+- 存在 B 站话题/任务 ID 时，原生发布在上传前用登录的创作中心只读接口核验一一对应、基础规则及转载限制；不能证明账户已经报名或具备活动奖励资格。
+- 仅 rewrite/rust-v2 开发分支可开启旧 UI 的 VITE_RUST_V2_FULL_UI=true 预览；尚未完成自动扫描、多平台 SAU、全部字幕配音管理 API，不能直接切到生产。

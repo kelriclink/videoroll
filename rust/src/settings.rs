@@ -16,7 +16,7 @@ const PUBLIC_SECTIONS: &[(&str, &str)] = &[
     ("render", "subtitle.render"),
     ("publish", "publish.settings"),
     ("dubbing", "dubbing.settings"),
-    ("review", "review.settings"),
+    ("review", "publish.review.settings"),
     ("storage", "storage.settings"),
     ("agent", "translate.agent"),
     ("rag", "subtitle.rag"),

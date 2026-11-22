@@ -1,18 +1,12 @@
 //! Ingestion runs yt-dlp as a child, not inside the API or a held SQL transaction.
 use crate::{
-    AppError, AppResult, Database, domain::WorkItem, scheduler::Scheduler, storage::AssetRegistry,
+    AppError, AppResult, Config, Database, domain::WorkItem, scheduler::Scheduler,
+    storage::AssetRegistry,
 };
 use reqwest::Url;
 use sqlx::Row;
-use std::{
-    path::{Path, PathBuf},
-    process::Stdio,
-};
-use tokio::{
-    fs,
-    process::Command,
-    time::{Duration, interval},
-};
+use std::path::{Path, PathBuf};
+use tokio::fs;
 use uuid::Uuid;
 
 pub fn validate_youtube_url(value: &str) -> AppResult<Url> {
@@ -99,7 +93,7 @@ pub async fn download_youtube(
     registry: &AssetRegistry,
     scheduler: &Scheduler,
     job: &WorkItem,
-    binary: &Path,
+    config: &Config,
 ) -> AppResult<serde_json::Value> {
     let task = db.task(job.task_id).await?;
     let source = if task.source_type == "youtube" {
@@ -119,21 +113,45 @@ pub async fn download_youtube(
     fs::create_dir_all(&output_dir).await?;
 
     // Resume from an already registered source when it exists and passed integrity.
-    if let Some(row)=sqlx::query(
-        "SELECT storage_key FROM assets WHERE task_id=$1 AND kind='video_raw'::asset_kind ORDER BY created_at DESC LIMIT 1"
-    ).bind(job.task_id).fetch_optional(&db.pool).await? {
-        let key:String=row.try_get("storage_key")?;
-        if let Ok(path)=registry.resolve_existing(&key).await
-            && fs::metadata(path).await.map(|m|m.len()>0).unwrap_or(false) {
+    if let Some(row) = sqlx::query(
+        "SELECT storage_key FROM assets WHERE task_id=$1 AND kind='video_raw'::asset_kind
+         AND storage_key LIKE 'v2/%' ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(job.task_id)
+    .fetch_optional(&db.pool)
+    .await?
+    {
+        let key: String = row.try_get("storage_key")?;
+        if let Ok(path) = registry.resolve_existing(&key).await
+            && fs::metadata(path)
+                .await
+                .map(|m| m.len() > 0)
+                .unwrap_or(false)
+        {
             // A previous worker may have committed its legacy Asset but crashed
             // before registering the v2 ownership link. Reconcile it on reuse.
             // Legacy paths stay outside v2 GC jurisdiction.
             if key.starts_with("v2/") {
-                registry.register(
-                    &key,"workflow",job.workflow_id,"video_raw",
-                    chrono::Utc::now()+chrono::Duration::days(2)
-                ).await?;
+                registry
+                    .register(
+                        &key,
+                        "workflow",
+                        job.workflow_id,
+                        "video_raw",
+                        chrono::Utc::now() + chrono::Duration::days(2),
+                    )
+                    .await?;
             }
+            // A local file upload is already a successful download-stage
+            // receipt. Without this transition the UI can show 'CREATED'
+            // while later subtitle/render stages run.
+            sqlx::query(
+                "UPDATE tasks SET status='DOWNLOADED'::task_status,updated_at=now()
+                 WHERE id=$1 AND status IN ('CREATED'::task_status,'INGESTED'::task_status)",
+            )
+            .bind(job.task_id)
+            .execute(&db.pool)
+            .await?;
             return Ok(serde_json::json!({"source":"existing_asset","storage_key":key}));
         }
     }
@@ -149,40 +167,7 @@ pub async fn download_youtube(
         Some(existing) => existing,
         None => {
             let template = output_dir.join("source.%(ext)s");
-            let mut command = Command::new(binary);
-            command
-                .arg("--no-playlist")
-                .arg("--continue")
-                .arg("--no-overwrites")
-                .arg("--newline")
-                .arg("--merge-output-format")
-                .arg("mp4")
-                .arg("-o")
-                .arg(&template)
-                .arg("--")
-                .arg(&source)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .kill_on_drop(true);
-            let mut child = command.spawn().map_err(AppError::Io)?;
-            let mut tick = interval(Duration::from_secs(30));
-            loop {
-                tokio::select! {
-                    result=child.wait()=>{
-                        let status=result?;
-                        if !status.success(){
-                            return Err(AppError::Unavailable(format!("yt-dlp exited with {status}; inspect the task's worker logs")));
-                        }
-                        break;
-                    },
-                    _=tick.tick()=>{
-                        if !scheduler.heartbeat(job).await? {
-                            return Err(AppError::Conflict("download execution lease lost".into()));
-                        }
-                    }
-                }
-            }
+            crate::download_runtime::run(config, db, scheduler, job, &template, &source).await?;
             find_finished_video(&output_dir).await?.ok_or_else(|| {
                 AppError::Unavailable("yt-dlp returned success without a completed video".into())
             })?

@@ -40,6 +40,8 @@ export INTERNAL_API_SECRET="rust-local-test-internal-secret"
 export ADMIN_BOOTSTRAP_SECRET="rust-local-test-bootstrap"
 export VIDEOROLL_V2_SECURE_COOKIES="false"
 export VIDEOROLL_V2_YT_DLP="$repo_root/rust/tests/mock_source_feed.sh"
+export VIDEOROLL_V2_MOCK_YT_LOG="$repo_root/rust/target/v2-mock-ytdlp-args.log"
+: > "$VIDEOROLL_V2_MOCK_YT_LOG"
 export VIDEOROLL_V2_INDEX_ENDPOINT="http://127.0.0.1:18082/v1/chat/completions"
 export VIDEOROLL_V2_COMPAT_URL="http://127.0.0.1:18083"
 export VIDEOROLL_V2_PLAYOUT_ROOT="$repo_root/rust/target/playout-sandbox"
@@ -125,6 +127,35 @@ legacy_unknown="$(curl --silent -o /dev/null -w '%{http_code}' "${hdr[@]}" http:
 test "$legacy_unknown" = 404
 echo 'PASS: native V1 TaskRead/list, auth boundaries and no silent fallback to Python'
 
+settings_default="$(curl --silent --fail-with-body "${hdr[@]}"  "http://127.0.0.1:18080/api/v1/settings/youtube")"
+SETTINGS_DEFAULT="$settings_default" python3 - <<'PYYTDEFAULT'
+import json,os
+v=json.loads(os.environ["SETTINGS_DEFAULT"])
+assert not v["cookies_set"] and not v["cookies_enabled"],v
+assert v["parallel_download_connections"]==8 and v["parallel_download_enabled"],v
+PYYTDEFAULT
+test "$(curl --silent -o /dev/null -w '%{http_code}'  "http://127.0.0.1:18080/api/v1/settings/youtube")" = 401
+youtube_settings="$(curl --silent --fail-with-body "${hdr[@]}" -X PUT  -d '{"proxy":"http://127.0.0.1:18083","parallel_download_enabled":true,"parallel_download_connections":8,"compatibility_mode_enabled":true}'  "http://127.0.0.1:18080/api/v1/settings/youtube")"
+YT_SETTINGS="$youtube_settings" python3 - <<'PYYTSETTINGS'
+import json,os
+v=json.loads(os.environ["YT_SETTINGS"])
+assert v["proxy"]=="http://127.0.0.1:18083",v
+assert v["parallel_download_connections"]==8 and v["compatibility_mode_enabled"],v
+PYYTSETTINGS
+cookie_upload="$(curl --silent --fail-with-body "${hdr[@]}" -X PUT  -d '{"cookies_txt":"# Netscape HTTP Cookie File\n.youtube.com\tTRUE\t/\tTRUE\t1790000000\tSID\ttest-cookie-secret","cookies_enabled":true}'  "http://127.0.0.1:18080/api/v1/settings/youtube")"
+COOKIE_UPLOADED="$cookie_upload" python3 - <<'PYCOOKIESETTINGS'
+import json,os
+v=json.loads(os.environ["COOKIE_UPLOADED"])
+assert v["cookies_enabled"] and v["cookies_set"] and v["cookies_count"]==1,v
+assert v["cookies_has_auth"] and "test-cookie-secret" not in str(v),v
+PYCOOKIESETTINGS
+test "$(stat -c '%a' "$VIDEOROLL_V2_STORAGE_ROOT/.videoroll-private")" = 700
+test "$(stat -c '%a' "$VIDEOROLL_V2_STORAGE_ROOT/.videoroll-private/youtube-cookies.txt")" = 600
+! docker exec "$container_name" psql -At -U postgres -d videoroll_test -c  "SELECT value_json::text FROM vr2_settings WHERE key='youtube.settings'" | grep -q 'test-cookie-secret'
+test "$(curl --silent -o /dev/null -w '%{http_code}' "${hdr[@]}" -X POST  -d '{"url":"http://127.0.0.1/admin"}'  "http://127.0.0.1:18080/api/v1/settings/youtube/test")" = 400
+echo 'PASS: original YouTube settings native proxy/concurrency/compatibility and private Netscape cookies'
+
+
 # Extract and cache genuine yt-dlp-compatible metadata for an owned task.
 missing_meta="$(curl --silent -o /dev/null -w '%{http_code}' "${hdr[@]}"  "http://127.0.0.1:18080/api/v1/tasks/$v1_id/youtube_meta")"
 test "$missing_meta" = 404
@@ -151,6 +182,17 @@ v=json.loads(os.environ["CACHED_YT"])
 assert v["uploader"]=="Test Channel" and v["description"]=="A synthetic tech explainer",v
 PYCACHEDYT
 echo 'PASS: original YouTube metadata read/fetch contract and V2 durable asset'
+
+# Verify metadata extraction actually received settings from the control plane.
+grep -q -- '--proxy' "$VIDEOROLL_V2_MOCK_YT_LOG"
+grep -q -- 'http://127.0.0.1:18083' "$VIDEOROLL_V2_MOCK_YT_LOG"
+grep -q -- '--cookies' "$VIDEOROLL_V2_MOCK_YT_LOG"
+grep -q -- '--extractor-args' "$VIDEOROLL_V2_MOCK_YT_LOG"
+grep -q -- 'youtube:player_client=default,web_embedded' "$VIDEOROLL_V2_MOCK_YT_LOG"
+curl --silent --fail-with-body "${hdr[@]}" -X PUT  -d '{"cookies_txt":"","proxy":"","compatibility_mode_enabled":false}'  "http://127.0.0.1:18080/api/v1/settings/youtube" >/dev/null
+test ! -e "$VIDEOROLL_V2_STORAGE_ROOT/.videoroll-private/youtube-cookies.txt"
+echo 'PASS: metadata extractor uses configured proxy/cookie/compatibility and credentials are removed'
+
 
 display_task="$(curl --silent --fail-with-body "${hdr[@]}" "http://127.0.0.1:18080/api/v1/tasks/$v1_id")"
 DISPLAY_TASK="$display_task" python3 - <<'PYDISPLAYTASK'
@@ -187,6 +229,37 @@ revision="$(docker exec "$container_name" psql -At -U postgres -d videoroll_test
 test "$revision" = 1
 echo 'PASS: original publish meta draft, validated transactional save and DB readback'
 
+# Original review page and task detail editor: rejects before any model call.
+review_settings="$(curl --silent --fail-with-body "${hdr[@]}" -X PUT  -d '{"enabled":true,"blocked_words":["English"],"ai_rules":"Reject unsafe materials."}'  "http://127.0.0.1:18080/api/v1/settings/review")"
+REVIEW_SETTINGS="$review_settings" python3 - <<'PYREVIEWSET'
+import json,os
+r=json.loads(os.environ["REVIEW_SETTINGS"])
+assert r["enabled"] and r["blocked_words"]==["English"],r
+PYREVIEWSET
+review_payload="$(SAVE_PAYLOAD="$save_payload" python3 -c 'import json,os;print(json.dumps({"meta":json.loads(os.environ["SAVE_PAYLOAD"])},ensure_ascii=False))')"
+blocked_review="$(curl --silent --fail-with-body "${hdr[@]}" -d "$review_payload"  "http://127.0.0.1:18080/api/v1/tasks/$v1_id/actions/publish_review")"
+BLOCKED_REVIEW="$blocked_review" python3 - <<'PYBLOCKEDREVIEW'
+import json,os
+r=json.loads(os.environ["BLOCKED_REVIEW"])
+assert r["checked"] and not r["ok"] and r["review_mode"]=="blocked_words",r
+assert r["matched_blocked_words"]==["English"],r
+PYBLOCKEDREVIEW
+stored_review="$(curl --silent --fail-with-body "${hdr[@]}"  "http://127.0.0.1:18080/api/v1/tasks/$v1_id/publish_review")"
+STORED_REVIEW="$stored_review" python3 - <<'PYSTOREDREVIEW'
+import json,os
+r=json.loads(os.environ["STORED_REVIEW"])
+assert r["checked"] and not r["ok"],r
+PYSTOREDREVIEW
+curl --silent --fail-with-body "${hdr[@]}" -X PUT  -d '{"blocked_words":[]}'  "http://127.0.0.1:18080/api/v1/settings/review" >/dev/null
+cleared_review="$(curl --silent --fail-with-body "${hdr[@]}"  "http://127.0.0.1:18080/api/v1/tasks/$v1_id/publish_review")"
+CLEARED_REVIEW="$cleared_review" python3 - <<'PYCLEAREDREVIEW'
+import json,os
+r=json.loads(os.environ["CLEARED_REVIEW"])
+assert not r["checked"] and r["ok"] is None,r
+PYCLEAREDREVIEW
+echo 'PASS: original review settings/task review, deterministic prohibited words, and rule invalidation'
+
+
 
 system_json="$(curl --silent --fail-with-body "${hdr[@]}" http://127.0.0.1:18080/api/v1/system/resources)"
 SYSTEM_JSON="$system_json" python3 - <<'PYSYSTEM'
@@ -213,6 +286,7 @@ assert task["source_type"]=="local" and task["status"]=="CREATED",task
 assert task["source_license"]=="own" and task["created_by"]=="web",task
 PYLOCAL
 local_video="$repo_root/rust/target/v2-v1-local-upload.mp4"
+export VIDEOROLL_V2_MOCK_YT_VIDEO="$local_video"
 ffmpeg -hide_banner -nostdin -loglevel error   -f lavfi -i 'color=c=black:s=160x90:r=25'   -f lavfi -i 'sine=frequency=470:sample_rate=44100'   -t 1.5 -c:v libx264 -pix_fmt yuv420p -c:a aac -shortest -y "$local_video"
 local_asset="$(curl --silent --fail-with-body   -H "x-videoroll-v2-internal-token: $VIDEOROLL_V2_INTERNAL_TOKEN"   -F "file=@$local_video;filename=local-upload.mp4;type=video/mp4"   "http://127.0.0.1:18080/api/v1/tasks/$local_task_id/upload/video")"
 LOCAL_ASSET="$local_asset" LOCAL_ID="$local_task_id" python3 - <<'PYLOCALASSET'
@@ -867,8 +941,86 @@ PARITY="$parity" python3 - <<'PYPARITY'
 import json,os
 d=json.loads(os.environ["PARITY"])
 assert d["legacy_route_declarations"]==217,d
-assert d["native_v1_adapters"]>=31,d
+assert d["native_v1_adapters"]>=38,d
 assert d["fully_verified_legacy_routes"]==0 and d["all_features_migrated"] is False,d
 assert d["frontend_url_references"]>=190,d
 PYPARITY
 echo 'PASS: original TaskNewPage YouTube manual/auto intake, conservative autopublish and API parity inventory'
+
+# Test the *actual AI review request*, not a mocked stored approval. This
+# happens after all other running flows so the model switch cannot affect ASR.
+new_auto_profile="$(curl --silent --fail-with-body "${hdr[@]}" -X PUT  -d '{"expected_version":1,"value":{"translate_model_provider_id":"rag-test-provider","translate_model_id":"rag-test-model","auto_publish":false}}'  "http://127.0.0.1:18080/api/v2/settings/auto")"
+NEW_AUTO_PROFILE="$new_auto_profile" python3 - <<'PYAUTOREVIEW'
+import json,os
+assert json.loads(os.environ["NEW_AUTO_PROFILE"])["version"]==2
+PYAUTOREVIEW
+ai_approved="$(curl --silent --fail-with-body "${hdr[@]}" -d "$review_payload"  "http://127.0.0.1:18080/api/v1/tasks/$v1_id/actions/publish_review")"
+AI_APPROVED="$ai_approved" python3 - <<'PYAIAPPROVED'
+import json,os
+r=json.loads(os.environ["AI_APPROVED"])
+assert r["checked"] and r["ok"] is True and r["review_mode"]=="ai",r
+assert r["reason"]=="mock-approved",r
+PYAIAPPROVED
+saved_review="$(curl --silent --fail-with-body "${hdr[@]}"  "http://127.0.0.1:18080/api/v1/tasks/$v1_id/publish_review")"
+SAVED_REVIEW="$saved_review" python3 - <<'PYREADAI'
+import json,os
+r=json.loads(os.environ["SAVED_REVIEW"])
+assert r["checked"] and r["ok"] is True,r
+PYREADAI
+rejected_payload="$(SAVE_PAYLOAD="$save_payload" python3 -c 'import json,os;m=json.loads(os.environ["SAVE_PAYLOAD"]);m["title"]="REJECT unsafe claim";print(json.dumps({"meta":m}))')"
+ai_rejected="$(curl --silent --fail-with-body "${hdr[@]}" -d "$rejected_payload"  "http://127.0.0.1:18080/api/v1/tasks/$v1_id/actions/publish_review")"
+AI_REJECTED="$ai_rejected" python3 - <<'PYAIREJECTED'
+import json,os
+r=json.loads(os.environ["AI_REJECTED"])
+assert r["checked"] and r["ok"] is False and r["review_mode"]=="ai",r
+assert r["reason"]=="mock-rejected",r
+PYAIREJECTED
+stale_review="$(curl --silent --fail-with-body "${hdr[@]}"  "http://127.0.0.1:18080/api/v1/tasks/$v1_id/publish_review")"
+STALE_REVIEW="$stale_review" python3 - <<'PYSTALEREVIEW'
+import json,os
+r=json.loads(os.environ["STALE_REVIEW"])
+assert not r["checked"] and r["ok"] is None,r
+PYSTALEREVIEW
+echo 'PASS: actual OpenAI-compatible AI review request, approval, rejection, fingerprints and stale-result fencing'
+
+# Drive the actual Download stage through a slow synthetic yt-dlp child.
+# Its numeric progress must reach the original frontend API while still
+# running, and the database must never store raw/cookie payload strings.
+live_download="$(curl --silent --fail-with-body "${hdr[@]}"  -d '{"url":"https://youtu.be/0123456789Z","source_license":"authorized","configuration":{"auto_publish":false}}'  "http://127.0.0.1:18080/api/v2/auto/youtube")"
+live_task_id="$(LIVE_DL="$live_download" python3 -c 'import json,os;print(json.loads(os.environ["LIVE_DL"])["task"]["id"])')"
+live_workflow_id="$(LIVE_DL="$live_download" python3 -c 'import json,os;print(json.loads(os.environ["LIVE_DL"])["workflow"]["id"])')"
+docker exec "$container_name" psql -v ON_ERROR_STOP=1 -U postgres -d videoroll_test  -c "UPDATE tasks SET priority=100 WHERE id='$live_task_id'" >/dev/null
+live_state=""
+for i in $(seq 1 90); do
+  live_state="$(curl --silent --fail-with-body "${hdr[@]}"     "http://127.0.0.1:18080/api/v1/tasks/$live_task_id/youtube_download_progress")"
+  if LIVE_STATE="$live_state" python3 -c 'import json,os,sys;x=json.loads(os.environ["LIVE_STATE"]);sys.exit(0 if x["active"] and x["progress"]==20 and x["downloaded_bytes"]==2000 and x["speed_bytes_per_second"]==2000.0 else 1)';then
+    break
+  fi
+  sleep 1
+done
+LIVE_STATE="$live_state" python3 - <<'PYLIVEDL'
+import json,os
+d=json.loads(os.environ["LIVE_STATE"])
+assert d["active"] and d["status"]=="downloading" and d["progress"]==20,d
+assert d["downloaded_bytes"]==2000 and d["total_bytes"]==10000,d
+assert d["eta_seconds"]==3 and d["speed_bytes_per_second"]==2000.,d
+PYLIVEDL
+done_progress=""
+for i in $(seq 1 35); do
+  done_progress="$(curl --silent --fail-with-body "${hdr[@]}"    "http://127.0.0.1:18080/api/v1/tasks/$live_task_id/youtube_download_progress")"
+  if DONE_PROGRESS="$done_progress" python3 -c 'import json,os,sys;x=json.loads(os.environ["DONE_PROGRESS"]);sys.exit(0 if x["status"]=="completed" and x["progress"]==100 else 1)'; then break;fi
+  sleep 1
+done
+DONE_PROGRESS="$done_progress" python3 - <<'PYDONEPROGRESS'
+import json,os
+d=json.loads(os.environ["DONE_PROGRESS"])
+assert d["status"]=="completed" and d["progress"]==100,d
+assert not d["active"] and d["total_bytes"]==d["downloaded_bytes"] and d["total_bytes"]>1000,d
+assert d["speed_bytes_per_second"] is None and d["eta_seconds"] is None,d
+PYDONEPROGRESS
+grep -q -- '--concurrent-fragments' "$VIDEOROLL_V2_MOCK_YT_LOG"
+grep -q -- 'http,https:aria2c' "$VIDEOROLL_V2_MOCK_YT_LOG"
+lease_progress="$(docker exec "$container_name" psql -At -U postgres -d videoroll_test  -c "SELECT downloaded_bytes::text||'|'||percent::text FROM vr2_download_progress WHERE task_id='$live_task_id'")"
+test -n "$lease_progress"
+curl --silent --fail-with-body "${hdr[@]}" -X POST  "http://127.0.0.1:18080/api/v2/workflows/$live_workflow_id/cancel" >/dev/null
+echo 'PASS: isolated yt-dlp child updates fenced real-time progress, aria2c HTTP-only flags, and completed media receipt'

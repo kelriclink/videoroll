@@ -22,7 +22,7 @@ const UPLOAD_MAX_CHUNK: usize = 64 * 1024 * 1024;
 const MAX_METADATA_BYTES: usize = 2 * 1024 * 1024;
 const MAX_PARTS: u64 = 25_000;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ArchiveMeta {
     pub title: String,
     #[serde(default)]
@@ -87,6 +87,7 @@ impl ArchiveMeta {
         }
         for (key, value) in &self.extra {
             let valid = match key.as_str() {
+                "activity_name" => value.as_str().is_some_and(|v| v.chars().count() <= 120),
                 "dynamic" | "neutral_mark" => {
                     value.as_str().is_some_and(|v| v.chars().count() <= 2_000)
                 }
@@ -322,6 +323,9 @@ fn archive_payload(csrf: &str, meta: &ArchiveMeta, parts: &[(UploadedVideo, Stri
     });
     if let Some(obj) = payload.as_object_mut() {
         for (field, value) in &meta.extra {
+            if field == "activity_name" {
+                continue;
+            }
             // V1 used both spellings; do not let aliases diverge.
             let name = if field == "up_close_danmaku" {
                 "up_close_danmu"
@@ -621,7 +625,17 @@ pub async fn publish(
         return Err(AppError::Invalid("Bilibili CSRF token invalid".into()));
     }
     let (meta, parts) = archive_spec(db, job).await?;
+    let reviewed_meta = crate::publish_meta::saved(db, job.task_id)
+        .await?
+        .unwrap_or(
+            serde_json::to_value(&meta)
+                .map_err(|_| AppError::Invalid("Bilibili metadata serialization failed".into()))?,
+        );
+    crate::publish_review::ensure_approved(db, registry, config, job.task_id, &reviewed_meta)
+        .await?;
     let client = BilibiliClient::new(cookie)?;
+    // Validate creator-center ID pairing and rules before any UPOS upload.
+    crate::bili_activity::verify_remote(&client.member, &meta).await?;
     let mut uploaded = Vec::new();
     for (key, title) in parts {
         let path = registry.resolve_existing(&key).await?;

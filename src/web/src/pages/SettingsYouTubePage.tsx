@@ -3,7 +3,7 @@ import { useConfirm } from "../components/feedbackContext";
 import { Button } from "../components/ui";
 import { useUnsavedChangesGuard } from "../hooks/useUnsavedChangesGuard";
 import { fetchJson } from "../lib/http";
-import { ORCHESTRATOR_URL } from "../lib/urls";
+import { ORCHESTRATOR_URL, RUST_V2_FULL_UI_PREVIEW } from "../lib/urls";
 
 type YouTubeSettings = {
   proxy: string;
@@ -163,7 +163,12 @@ export default function SettingsYouTubePage() {
     <div className="space-y-4">
       <div className="px-1">
         <h2 className="text-xl font-semibold tracking-tight text-slate-950">YouTube</h2>
-        <div className="mt-1 text-sm text-slate-600">影响 YouTube 的下载、元信息、封面，以及首页推荐定时扫描请求。</div>
+        <div className="mt-1 text-sm text-slate-600">影响 YouTube 的下载和元信息提取。</div>
+        {RUST_V2_FULL_UI_PREVIEW && (
+          <div role="status" className="mt-2 text-sm text-amber-800">
+            Rust 2.0 预览：代理、Cookies、下载并发和兼容模式已接入；首页推荐扫描、封面下载及部分历史参数尚未迁移，本页暂不提供相应操作。
+          </div>
+        )}
         {error ? <div className="mt-3 text-sm text-rose-700">{error}</div> : null}
       </div>
 
@@ -229,11 +234,15 @@ export default function SettingsYouTubePage() {
           <div className="text-sm font-semibold">YouTube 大文件多连接下载</div>
           {parallelDirty ? <span className="rounded bg-amber-50 px-2 py-0.5 text-xs text-amber-700">未保存</span> : null}
         </div>
-        <p className="mt-2 text-xs text-slate-600">
+        {RUST_V2_FULL_UI_PREVIEW ? (
+          <p className="mt-2 text-xs text-slate-600">
+            Rust 使用 yt-dlp 进行 HLS/DASH 分片下载；只有已验证为修复版本的 yt-dlp 才会将普通 HTTP/HTTPS 资源交给 aria2c 多连接处理。实际连接数为 1–16，当前尚未迁移大文件阈值策略。
+          </p>
+        ) : <p className="mt-2 text-xs text-slate-600">
           大于等于 128 MiB 的普通 HTTP/HTTPS 视频使用 aria2c Range 多连接下载。
           直播、HLS/DASH 分片和小文件继续使用 yt-dlp。失败时回退原生 yt-dlp，
           未完成的 aria2 分片会保留供后续续传。下载进度显示实时速度和剩余时间。
-        </p>
+        </p>}
         <label className="mt-3 flex items-center gap-2 text-sm">
           <input type="checkbox" checked={parallelEnabled}
             onChange={(e) => setParallelEnabled(e.target.checked)} />
@@ -323,6 +332,7 @@ export default function SettingsYouTubePage() {
         </div>
       </div>
 
+      {!RUST_V2_FULL_UI_PREVIEW && (
       <div className="vr-section">
         <div className="flex flex-wrap items-center justify-between gap-2">
           <div className="text-sm font-semibold">首页推荐定时扫描</div>
@@ -502,7 +512,7 @@ export default function SettingsYouTubePage() {
           </div>
         ) : null}
       </div>
-
+      )}
       <div className="vr-section">
         <div className="flex flex-wrap items-center justify-between gap-2">
           <div className="text-sm font-semibold">代理设置</div>

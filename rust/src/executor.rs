@@ -128,7 +128,7 @@ impl Executor {
                     &self.registry,
                     &self.scheduler,
                     item,
-                    &self.config.download_binary,
+                    &self.config,
                 )
                 .await?;
                 Ok(StageOutcome::Completed { result })

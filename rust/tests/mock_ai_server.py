@@ -31,12 +31,18 @@ class Handler(BaseHTTPRequestHandler):
             model=body.get("model")
             if model=="rag-test-model":
                 messages=body["messages"]
-                result=(
+                if any("投稿合规审核员" in str(message.get("content","")) for message in messages):
+                    sample=json.loads(messages[-1]["content"])
+                    approved="REJECT" not in sample.get("title","")
+                    result={"approved":approved,"reason":"mock-approved" if approved else "mock-rejected",
+                            "risk_tags":[] if approved else ["test_rejection"]}
+                else:
+                    result=(
                     {"action":"finish","summary":"An electronics video.",
                      "terms":[{"source":"Rust","target":"Rust","note":"proper noun"}]}
                     if len(messages)>=4 else
                     {"action":"search_knowledge","query":"Rust integration"}
-                )
+                    )
             elif model=="Index-Translate-35B-A3B":
                 user=body["messages"][-1]["content"]
                 lines=json.loads(user.split("\n")[-1])

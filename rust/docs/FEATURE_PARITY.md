@@ -55,3 +55,13 @@
 - 原生 GET /api/v1/tasks/{task_id}/youtube_meta、POST .../actions/youtube_meta 使用维护中的 yt-dlp 单视频 JSON 提取能力（独立进程、输出上限、ID 校验及超时）。原始 JSON、校验和及任务标题记录进入 V2 独立资产存储。
 - GET .../youtube_download_progress 读取真实 V2 下载作业状态和已登记文件大小。正在下载阶段尚未提供细粒度字节数、速度和 ETA；不能把这种兼容接口等同于实时下载进度已全面迁移。
 - 原版 YouTube proxy、cookies、aria2c 并发配置和实时进度、完整 AI 审稿、其他高级页面功能仍未迁移。审计新增 7 个原生兼容入口（总计 31），不代表 31 个完整功能均达到等价。
+
+## 2026-11-22：YouTube 原生下载控制 / AI 审核 / 活动 ID 防误报（第三批）
+
+- 原版 React YouTube 页面可直接访问 Rust 原生的 GET/PUT /api/v1/settings/youtube 及 POST /api/v1/settings/youtube/test。支持 HTTP(S)/SOCKS5 代理（不接受嵌入账号密码）、Cookies.txt Netscape 导入、1–16 连接并发和兼容客户端 player_client。V2 Settings 独立 overlay 不改旧版生产配置；不自动解密原版 Fernet Cookies。Cookies 在私有目录以 0600 权限保存，提取器持有独立临时副本。
+- 下载阶段真正读取上述配置，使用 yt-dlp 子进程续传；内置原生 HLS/DASH 并发。只有确认 yt-dlp 至少为 2026.06.09 且 aria2c 可用时才启用 aria2c 的普通 HTTP(S) 下载器；SOCKS5 代理下不会强行启用 aria2c。没有安全版本校验则退回 yt-dlp 原生分片路径。HTTP 与 HLS/DASH 不得混用下载器。
+- 通过 stdout 受限前缀和长度解析实时已下载字节数、估计大小、速度、ETA、百分比。vr2_download_progress 只存数字和作业 ID，并用当前任务租约、有效期和 workflow state 限定写入，阻止旧执行覆盖新任务的进度。原版 GET /api/v1/tasks/{id}/youtube_download_progress 会丢弃已失效执行的速度/ETA，不再虚报。
+- 原生 GET/PUT /api/v1/settings/review 和 GET/POST /api/v1/tasks/{id}/publish_review /actions/publish_review 提供基于真实 V2 SRT 文本的违禁词/AI 审核。AI 模型使用现有翻译模型 Provider/ID 与 OpenAI 兼容 JSON 接口；无模型、模型报错、模型未返回明确布尔结论都会判定为不通过，绝不猜测为通过。审核指纹绑定当前稿件、审核规则和 SRT，发生变化后旧结论失效。真正 UPOS 投稿前调用审核门槛；禁用审核仅限显式设置。
+- B 站原生上传在存在 topic_id / mission_id 时，从已登录创作中心固定 HTTPS 只读查询精确核对话题/投稿任务 ID。公开活动列表 ID 不会被当作真正的 mission_id；活动规则要求有实质内容。转载视频只有规则明确允许转载且没有报名、白名单、原创等未证实限制时才通过；查询失败、不唯一或不匹配时阻断上传。可选 metadata.activity_name 作为检索关键字，此本地辅助字段不会转发给 B 站投稿接口。该检查不能证明账号奖励或报名资格，不能说成已完成活动资格认证。
+- React Rust 全页面预览下 YouTube 页面隐藏尚未迁移的「首页推荐定时扫描」，并明确说明 HTTP(S) aria2c 安全限制和未迁移的大文件下载阈值，而不是展示可点但无效的设置。
+- 未覆盖部分：YouTube 首页推荐扫描、Cookies 加密迁移、下载限速/128 MiB 阈值、B 站活动账号级报名状态、AI 自动活动筛选、多平台 SAU 投稿、手动字幕与 YouDub 全量控制、其余旧版 API 和页面。老生产服务继续运行，新 Rust 只隔离验证。API 候选迁移计数约 38/217，且每个入口的业务等价还需逐项测试。

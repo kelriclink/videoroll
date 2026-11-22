@@ -77,7 +77,7 @@ fn tags_from_input(value: &Value) -> AppResult<Vec<String>> {
     }
     Ok(result)
 }
-fn normalized(mut meta: Value) -> AppResult<Value> {
+pub(crate) fn normalized(mut meta: Value) -> AppResult<Value> {
     let source = meta
         .as_object_mut()
         .ok_or_else(|| AppError::Invalid("publish_meta must be a JSON object".into()))?;
@@ -399,6 +399,10 @@ async fn save_meta(
             "publish job already queued, submitted or unresolved; metadata frozen".into(),
         ));
     }
+    sqlx::query("DELETE FROM vr2_publish_reviews WHERE task_id=$1")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
     sqlx::query(
         "INSERT INTO vr2_publish_meta(task_id,value_json,sha256) VALUES($1,$2,$3)
          ON CONFLICT(task_id) DO UPDATE SET value_json=EXCLUDED.value_json,

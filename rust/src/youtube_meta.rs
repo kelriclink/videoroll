@@ -93,14 +93,34 @@ async fn read_metadata(
         task.source_url.as_deref().unwrap_or(""),
     )?))
 }
-async fn extract_info(binary: &std::path::Path, url: &str, expected_id: &str) -> AppResult<Value> {
-    let mut process = Command::new(binary);
+async fn extract_info(
+    config: &crate::Config,
+    settings: &crate::youtube_settings_v1::YoutubeRuntime,
+    url: &str,
+    expected_id: &str,
+) -> AppResult<Value> {
+    let cookies = crate::youtube_settings_v1::prepare_cookie_copy(config, settings).await?;
+    let mut process = Command::new(&config.download_binary);
     process
         .arg("--ignore-config")
         .arg("--no-playlist")
         .arg("--skip-download")
         .arg("--dump-single-json")
-        .arg("--no-warnings")
+        .arg("--no-warnings");
+    if settings.compatibility {
+        process
+            .arg("--extractor-args")
+            .arg("youtube:player_client=default,web_embedded");
+    }
+    if let Some(proxy) = settings.proxy.as_deref() {
+        process.arg("--proxy").arg(proxy);
+    }
+    if let Some(secret) = cookies.as_ref() {
+        process
+            .arg("--cookies")
+            .arg(secret.path().join("cookies.txt"));
+    }
+    process
         .arg("--")
         .arg(url)
         .stdin(Stdio::null())
@@ -155,7 +175,8 @@ async fn fetch_metadata(
             json!({"metadata":meta_view(&value,url)?,"metadata_asset":asset}),
         ));
     }
-    let value = extract_info(&state.config.download_binary, url, &video_id).await?;
+    let settings = crate::youtube_settings_v1::runtime(&state.db, &state.config).await?;
+    let value = extract_info(&state.config, &settings, url, &video_id).await?;
     let bytes = serde_json::to_vec(&value)
         .map_err(|_| AppError::Invalid("cannot serialize metadata".into()))?;
     if bytes.len() > MAX_INFO {
@@ -255,18 +276,24 @@ async fn progress(State(state): State<AppState>, Path(id): Path<Uuid>) -> AppRes
         return Err(AppError::Invalid("not a YouTube task".into()));
     }
     let row = sqlx::query(
-        "SELECT state,attempts,last_error,updated_at FROM vr2_jobs
+        "SELECT id,state,attempts,last_error,updated_at,lease_until FROM vr2_jobs
          WHERE task_id=$1 AND stage='download'
          ORDER BY generation DESC,created_at DESC LIMIT 1",
     )
     .bind(id)
     .fetch_optional(&state.db.pool)
     .await?;
-    let (status, active, percentage, error, updated) = if let Some(row) = row {
+    let stored_progress = crate::download_runtime::active_progress(&state.db, id).await?;
+    let (status, active, percentage, error, updated, live_metrics) = if let Some(row) = row {
         let state: String = row.try_get("state")?;
+        let job_id: Uuid = row.try_get("id")?;
+        let lease_until: Option<chrono::DateTime<chrono::Utc>> = row.try_get("lease_until")?;
+        let active = state == "running" && lease_until.is_some_and(|l| l > chrono::Utc::now());
+        let live_metrics = stored_progress.as_ref().filter(|(id, _, _)| *id == job_id);
         let status = match state.as_str() {
             "pending" => "queued",
-            "running" => "downloading",
+            "running" if active => "downloading",
+            "running" => "queued",
             "awaiting" => "processing",
             "succeeded" => "completed",
             "failed" | "canceled" | "unknown" => "failed",
@@ -274,14 +301,25 @@ async fn progress(State(state): State<AppState>, Path(id): Path<Uuid>) -> AppRes
         };
         (
             status,
-            state == "running",
-            if state == "succeeded" { 100 } else { 0 },
+            active,
+            if state == "succeeded" {
+                100
+            } else if active {
+                live_metrics.map(|(_, p, _)| p.percent).unwrap_or(0)
+            } else {
+                0
+            },
             row.try_get::<Option<String>, _>("last_error")?,
             row.try_get::<chrono::DateTime<chrono::Utc>, _>("updated_at")?
                 .to_rfc3339(),
+            if active {
+                live_metrics.map(|(_, p, _)| p.clone())
+            } else {
+                None
+            },
         )
     } else {
-        ("idle", false, 0, None, String::new())
+        ("idle", false, 0, None, String::new(), None)
     };
     let asset: Option<(String, Option<i64>)> = sqlx::query_as(
         "SELECT storage_key,size_bytes FROM assets
@@ -301,9 +339,11 @@ async fn progress(State(state): State<AppState>, Path(id): Path<Uuid>) -> AppRes
     }
     Ok(Json(json!({
         "task_id":id,"status":status,"active":active,"progress":percentage,
-        "downloaded_bytes":if status=="completed"{bytes.unwrap_or(0)}else{0},
-        "total_bytes":if status=="completed"{bytes}else{None},
-        "speed_bytes_per_second":null,"eta_seconds":null,"filename":null,
+        "downloaded_bytes":if status=="completed"{bytes.unwrap_or(0)}else{live_metrics.as_ref().map(|p|p.downloaded_bytes).unwrap_or(0)},
+        "total_bytes":if status=="completed"{bytes}else{live_metrics.as_ref().and_then(|p|p.total_bytes)},
+        "speed_bytes_per_second":live_metrics.as_ref().and_then(|p|p.speed_bytes_per_second),
+        "eta_seconds":live_metrics.as_ref().and_then(|p|p.eta_seconds),
+        "filename":if status=="completed"{asset.as_ref().and_then(|(key,_)|key.rsplit('/').next())}else{None},
         "error":error,"updated_at":if updated.is_empty(){None}else{Some(updated)},
     })))
 }
