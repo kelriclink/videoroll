@@ -38,21 +38,18 @@ pub struct V1Task {
 const TASK_VIEW: &str = r#"
 SELECT t.id,t.source_type::text AS source_type,t.source_url,
   t.source_license::text AS source_license,t.source_proof_url,
-  t.status::text AS status,t.stopped_status::text AS stopped_status,
+  upper(t.status::text) AS status,upper(t.stopped_status::text) AS stopped_status,
   t.priority,t.created_by,
   COALESCE(
     NULLIF(trim(title.value_json->>'translated_title'),''),
-    NULLIF(trim(title.value_json->>'source_title'),''),
-    NULLIF(trim(vtitle.translated_title),''),
-    NULLIF(trim(vtitle.source_title),'')
+    NULLIF(trim(title.value_json->>'source_title'),'')
   ) AS display_title,
   t.error_code,t.error_message,t.retry_count,NULL::jsonb AS bilibili_upload,
   t.created_at,t.updated_at
 FROM tasks t
 LEFT JOIN app_settings title ON title.key=('task.title.'||t.id::text)
-LEFT JOIN vr2_task_titles vtitle ON vtitle.task_id=t.id
 WHERE (EXISTS(SELECT 1 FROM vr2_workflows v WHERE v.task_id=t.id)
-    OR EXISTS(SELECT 1 FROM vr2_managed_tasks m WHERE m.task_id=t.id))
+    OR t.runtime_owner='rust')
 "#;
 
 #[derive(Debug, Deserialize)]
@@ -137,7 +134,7 @@ async fn create_task(
                 .await?;
             if deduped {
                 let owned: bool = sqlx::query_scalar(
-                    "SELECT EXISTS(SELECT 1 FROM vr2_managed_tasks WHERE task_id=$1)",
+                    "SELECT EXISTS(SELECT 1 FROM tasks WHERE id=$1 AND runtime_owner='rust')",
                 )
                 .bind(task.id)
                 .fetch_one(&state.db.pool)
@@ -177,14 +174,16 @@ async fn create_task(
             let mut tx = state.db.pool.begin().await?;
             sqlx::query(
                 "INSERT INTO tasks(id,source_type,source_url,source_license,source_proof_url,status,priority,created_by,origin_kind)
-                 VALUES($1,'local'::source_type,NULL,$2::source_license,$3,'CREATED'::task_status,$4,$5,'v2_local_upload')"
+                 VALUES($1,'local'::source_type,NULL,$2::source_license,$3,'created'::task_status,$4,$5,'v2_local_upload')"
             ).bind(id).bind(&payload.source_license).bind(proof).bind(priority)
                 .bind(payload.created_by.as_deref().unwrap_or("web"))
                 .execute(&mut *tx).await?;
-            sqlx::query("INSERT INTO vr2_managed_tasks(task_id,origin) VALUES($1,'local_upload')")
-                .bind(id)
-                .execute(&mut *tx)
-                .await?;
+            sqlx::query(
+                "UPDATE tasks SET runtime_owner='rust',runtime_origin='local_upload' WHERE id=$1",
+            )
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
             tx.commit().await?;
             Ok((StatusCode::CREATED, Json(read_task(&state.db, id).await?)))
         }
@@ -338,13 +337,13 @@ async fn resume_task(
 }
 async fn bulk_change(state: AppState, stop: bool) -> AppResult<Json<Value>> {
     let where_expr = if stop {
-        "t.status::text IN ('CREATED','INGESTED','DOWNLOADED','AUDIO_EXTRACTED',
+        "upper(t.status::text) IN ('CREATED','INGESTED','DOWNLOADED','AUDIO_EXTRACTED',
         'ASR_DONE','TRANSLATED','SUBTITLE_READY','RENDERED','READY_FOR_REVIEW','APPROVED')"
     } else {
-        "t.status::text='CANCELED' AND t.stopped_status IS NOT NULL"
+        "upper(t.status::text)='CANCELED' AND t.stopped_status IS NOT NULL"
     };
     let sql = format!(
-        "SELECT t.id FROM tasks t JOIN vr2_managed_tasks v ON v.task_id=t.id
+        "SELECT t.id FROM tasks t JOIN tasks v ON v.id=t.id AND v.runtime_owner='rust'
          WHERE {where_expr} ORDER BY t.id LIMIT 1001"
     );
     let ids = sqlx::query_scalar::<_, Uuid>(&sql)
@@ -382,7 +381,7 @@ async fn list_tasks(
         return Err(AppError::Invalid("invalid TaskStatus filter".into()));
     }
     let sql = format!(
-        "{TASK_VIEW} AND ($1::text IS NULL OR t.status::text=$1) ORDER BY t.created_at DESC LIMIT $2"
+        "{TASK_VIEW} AND ($1::text IS NULL OR upper(t.status::text)=$1) ORDER BY t.created_at DESC LIMIT $2"
     );
     let rows = sqlx::query_as::<_, V1Task>(&sql)
         .bind(q.status)
@@ -578,6 +577,39 @@ async fn publish_jobs(
             "updated_at":row.try_get::<DateTime<Utc>,_>("updated_at")?,
         }));
     }
+    // SAU sidecar posts are independent durable V2 intents, not fake
+    // vr2_jobs stages. Display them in the original task-history table.
+    let social = sqlx::query(
+        "SELECT id,platform,state,account_id,external_id,external_url,last_error,
+         dispatched_at,finished_at,created_at,updated_at
+         FROM vr2_social_publish_intents WHERE task_id=$1
+         ORDER BY created_at DESC LIMIT $2",
+    )
+    .bind(id)
+    .bind(q.limit.unwrap_or(50).clamp(1, 500))
+    .fetch_all(&state.db.pool)
+    .await?;
+    for row in social {
+        let status: String = row.try_get("state")?;
+        let succeeded = matches!(status.as_str(), "submitted" | "published");
+        let active = matches!(status.as_str(), "queued" | "dispatching" | "accepted");
+        output.push(json!({
+            "id":row.try_get::<Uuid,_>("id")?,"task_id":id,"batch_id":null,
+            "platform":row.try_get::<String,_>("platform")?,
+            "state":if active{"submitting"}else{status.as_str()},
+            "aid":null,"bvid":null,
+            "external_id":row.try_get::<Option<String>,_>("external_id")?,
+            "external_url":row.try_get::<Option<String>,_>("external_url")?,
+            "account_id":row.try_get::<Uuid,_>("account_id")?,
+            "upload_progress":if succeeded{100}else{0},
+            "upload_active":active,
+            "started_at":row.try_get::<Option<DateTime<Utc>>,_>("dispatched_at")?,
+            "finished_at":row.try_get::<Option<DateTime<Utc>>,_>("finished_at")?,
+            "error_message":row.try_get::<Option<String>,_>("last_error")?,
+            "created_at":row.try_get::<DateTime<Utc>,_>("created_at")?,
+            "updated_at":row.try_get::<DateTime<Utc>,_>("updated_at")?
+        }));
+    }
     Ok(Json(output))
 }
 async fn playout_assets(
@@ -614,22 +646,51 @@ async fn asset_for_task(
     }
     crate::assets::download(State(state), Path(asset_id), request).await
 }
-async fn health() -> Json<Value> {
+pub(crate) async fn health() -> Json<Value> {
     Json(json!({"status":"ok"}))
 }
 
 pub fn router() -> Router<AppState> {
     Router::new()
         .merge(crate::publish_meta::router())
+        .merge(crate::legacy_reliability_v1::router())
         .merge(crate::youtube_meta::router())
+        .merge(crate::youtube_sources_v1::router())
         .merge(crate::youtube_settings_v1::router())
         .merge(crate::publish_review::router())
         .merge(crate::task_manual::router())
         .merge(crate::publish_platforms::router())
         .merge(crate::social_accounts::router())
         .merge(crate::alerts::router())
+        .merge(crate::bili_p2::router())
+        .merge(crate::social_publish::router())
         .merge(crate::system_resources::router())
-        .route("/health", get(health))
+        .merge(crate::operations_v1::router())
+        .merge(crate::management_v1::router())
+        .merge(crate::remote_api_settings_v1::router())
+        .merge(crate::bilibili_settings_v1::router())
+        .merge(crate::bilibili_account_v1::router())
+        .merge(crate::legacy_missing_actions_v1::router())
+        .merge(crate::youdub_control_v1::router())
+        .merge(crate::agent_skills_v1::router())
+        .merge(crate::legacy_asset_delete_v1::router())
+        .merge(crate::render_management_read_v1::router())
+        .merge(crate::render_management_control_v1::router())
+        .merge(crate::subtitle_management_v1::router())
+        .merge(crate::subtitle_models_v1::router())
+        .merge(crate::subtitle_model_download_v1::router())
+        .merge(crate::subtitle_model_upload_v1::router())
+        .merge(crate::subtitle_model_proxy_v1::router())
+        .merge(crate::subtitle_asr_settings_v1::router())
+        .merge(crate::subtitle_asr_test_v1::router())
+        .merge(crate::subtitle_dictionary_v1::router())
+        .merge(crate::subtitle_dictionary_import_v1::router())
+        .merge(crate::subtitle_knowledge_read_v1::router())
+        .merge(crate::subtitle_embedding_v1::router())
+        .merge(crate::subtitle_translate_settings_v1::router())
+        .merge(crate::subtitle_queue_v1::router())
+        .merge(crate::subtitle_providers_v1::router())
+        .merge(crate::subtitle_remaining_v1::router())
         .route("/tasks", get(list_tasks).post(create_task))
         .route("/youtube/ingest", post(youtube_ingest))
         .route("/auto/youtube", post(auto_youtube))
@@ -640,6 +701,10 @@ pub fn router() -> Router<AppState> {
         .route(
             "/tasks/{task_id}/upload/video",
             post(crate::assets::upload_video_form).layer(DefaultBodyLimit::disable()),
+        )
+        .route(
+            "/tasks/{task_id}/upload/cover",
+            post(crate::legacy_cover_v1::upload).layer(DefaultBodyLimit::disable()),
         )
         .route("/tasks/{id}", get(get_task))
         .route("/tasks/{id}/actions/stop", post(stop_task))

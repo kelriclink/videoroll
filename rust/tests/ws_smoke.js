@@ -58,14 +58,14 @@ async function run() {
     assert.match((await error).detail,/invalid/);
     const resources=await message(ws,(m)=>m.name==="system.resources.sample");
     assert.ok(resources.data.memory.total_bytes>0);
-    const titleSql = "INSERT INTO vr2_task_titles(task_id,source_title) VALUES('"+process.env.VR2_TEST_TASK+"','WS Title Fixture') ON CONFLICT(task_id) DO UPDATE SET source_title='WS Title Fixture'";
+    const titleSql = "INSERT INTO app_settings(key,value_json,version) VALUES('task.title."+process.env.VR2_TEST_TASK+"', '{\"source_title\":\"WS Title Fixture\"}'::jsonb,1) ON CONFLICT(key) DO UPDATE SET value_json=EXCLUDED.value_json,version=app_settings.version+1";
     cp.execFileSync("docker",["exec",process.env.VR2_SMOKE_CONTAINER,"psql","-v","ON_ERROR_STOP=1","-U","postgres","-d","videoroll_test","-c",titleSql],{stdio:"ignore"});
     const update=message(ws,(m)=>m.name==="task.updated");
     cp.execFileSync("docker",["exec",process.env.VR2_SMOKE_CONTAINER,"psql","-v","ON_ERROR_STOP=1","-U","postgres","-d","videoroll_test",
         "-c",`INSERT INTO vr2_events(id,workflow_id,kind,details) VALUES(gen_random_uuid(),'${process.env.VR2_TEST_WORKFLOW}','smoke.live', '{}'::jsonb)`],{stdio:"ignore"});
     const msg=await update;
     assert.equal(msg.data.display_title,"WS Title Fixture");
-    const restoreTitleSql = "DELETE FROM vr2_task_titles WHERE task_id='"+process.env.VR2_TEST_TASK+"'";
+    const restoreTitleSql = "DELETE FROM app_settings WHERE key='task.title."+process.env.VR2_TEST_TASK+"'";
     cp.execFileSync("docker",["exec",process.env.VR2_SMOKE_CONTAINER,"psql","-v","ON_ERROR_STOP=1","-U","postgres","-d","videoroll_test","-c",restoreTitleSql],{stdio:"ignore"});
     assert.equal(msg.data.id,process.env.VR2_TEST_TASK);
     assert.equal(msg.entity_id,process.env.VR2_TEST_TASK);

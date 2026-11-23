@@ -32,6 +32,16 @@ for arg in "$@"; do
     exit 0
   fi
 done
+# Regression fixture: the first two entries have already been ingested,
+# while a third later playlist entry is new. A limit=1 scan must reach it.
+case "$*" in
+  *UC99999999999999999999*)
+    printf '%s\n' '{"id":"0123456789E","title":"already ingested A"}' \
+      '{"id":"0123456789F","title":"already ingested B"}' \
+      '{"id":"V2DEEP00001","title":"late new entry","upload_date":"20261122"}'
+    exit 0
+    ;;
+esac
 printf '%s\n' '{"id":"0123456789E","title":"one"}' \
  '{"id":"0123456789F","title":"two"}' \
  '{"id":"0123456789E","title":"duplicate"}'

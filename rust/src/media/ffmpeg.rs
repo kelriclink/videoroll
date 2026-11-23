@@ -282,7 +282,7 @@ pub(crate) async fn ensure_task_asset(
     let (sha, size) = registry.sha256(key).await?;
     let mut tx = db.pool.begin().await?;
     let status: Option<String> =
-        sqlx::query_scalar("SELECT status::text FROM tasks WHERE id=$1 FOR UPDATE")
+        sqlx::query_scalar("SELECT upper(status::text) FROM tasks WHERE id=$1 FOR UPDATE")
             .bind(task_id)
             .fetch_optional(&mut *tx)
             .await?;
@@ -292,10 +292,10 @@ pub(crate) async fn ensure_task_asset(
         ));
     }
     sqlx::query(
-        "INSERT INTO vr2_objects(storage_key,checksum_sha256,size_bytes,state,retain_until) VALUES($1,$2,$3,'live',now()+interval '2 days') ON CONFLICT(storage_key) DO UPDATE SET retain_until=GREATEST(vr2_objects.retain_until,now()+interval '2 days') WHERE vr2_objects.state='live'"
+        "INSERT INTO storage_objects(storage_key,checksum_sha256,size_bytes,state,retain_until) VALUES($1,$2,$3,'live',now()+interval '2 days') ON CONFLICT(storage_key) DO UPDATE SET retain_until=GREATEST(storage_objects.retain_until,now()+interval '2 days') WHERE storage_objects.state='live'"
     ).bind(key).bind(&sha).bind(size).execute(&mut *tx).await?;
     sqlx::query(
-        "INSERT INTO vr2_object_refs(storage_key,owner_type,owner_id,role) VALUES($1,'workflow',$2,$3) ON CONFLICT DO NOTHING"
+        "INSERT INTO storage_object_refs(storage_key,owner_type,owner_id,role) VALUES($1,'workflow',$2,$3) ON CONFLICT DO NOTHING"
     ).bind(key).bind(job.workflow_id).bind(kind).execute(&mut *tx).await?;
     let existing:Option<Uuid>=sqlx::query_scalar(
         "SELECT id FROM assets WHERE task_id=$1 AND storage_key=$2 AND kind::text=$3 ORDER BY created_at DESC LIMIT 1"
@@ -312,12 +312,12 @@ pub(crate) async fn ensure_task_asset(
             "INSERT INTO subtitles(id,task_id,version,format,language,storage_key) SELECT $1,$2,$3,$4::subtitle_format,'zh',$5 WHERE NOT EXISTS(SELECT 1 FROM subtitles WHERE task_id=$2 AND version=$3 AND format::text=$4 AND storage_key=$5)"
         ).bind(Uuid::new_v4()).bind(task_id).bind(job.generation).bind(format).bind(key)
             .execute(&mut *tx).await?;
-        sqlx::query("UPDATE tasks SET status='SUBTITLE_READY'::task_status,updated_at=now() WHERE id=$1 AND status IN ('CREATED'::task_status,'INGESTED'::task_status,'DOWNLOADED'::task_status,'AUDIO_EXTRACTED'::task_status,'ASR_DONE'::task_status,'TRANSLATED'::task_status)")
+        sqlx::query("UPDATE tasks SET status='subtitle_ready'::task_status,updated_at=now() WHERE id=$1 AND status IN ('created'::task_status,'ingested'::task_status,'downloaded'::task_status,'audio_extracted'::task_status,'asr_done'::task_status,'translated'::task_status)")
             .bind(task_id).execute(&mut *tx).await?;
     }
     if kind == "video_final" {
         sqlx::query(
-            "UPDATE tasks SET status='RENDERED'::task_status,updated_at=now() WHERE id=$1 AND status IN ('CREATED'::task_status,'INGESTED'::task_status,'DOWNLOADED'::task_status,'AUDIO_EXTRACTED'::task_status,'ASR_DONE'::task_status,'TRANSLATED'::task_status,'SUBTITLE_READY'::task_status)"
+            "UPDATE tasks SET status='rendered'::task_status,updated_at=now() WHERE id=$1 AND status IN ('created'::task_status,'ingested'::task_status,'downloaded'::task_status,'audio_extracted'::task_status,'asr_done'::task_status,'translated'::task_status,'subtitle_ready'::task_status)"
         ).bind(task_id).execute(&mut *tx).await?;
     }
     tx.commit().await?;

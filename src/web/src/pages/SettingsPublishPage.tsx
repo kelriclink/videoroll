@@ -79,6 +79,7 @@ export default function SettingsPublishPage() {
   const [cookieText, setCookieText] = useState<string>("");
   const [me, setMe] = useState<BilibiliMe | null>(null);
   const [socialAccounts, setSocialAccounts] = useState<SocialAccount[]>([]);
+  const [socialAccountsError, setSocialAccountsError] = useState<string | null>(null);
   const [platformSettings, setPlatformSettings] = useState<PublishPlatformSettings | null>(null);
   const [savingPlatform, setSavingPlatform] = useState<PublishPlatform | null>(null);
   const [socialNames, setSocialNames] = useState<Record<SocialPlatform, string>>({
@@ -100,17 +101,26 @@ export default function SettingsPublishPage() {
   const refresh = useCallback(async () => {
     setError(null);
     try {
+      // A SAU outage must not prevent editing the independent Bilibili settings.
+      const accountRequest = fetchJson<SocialAccount[]>(`${ORCHESTRATOR_URL}/settings/publish/social/accounts`).then(
+        (value) => ({ value, error: null as string | null }),
+        (reason: unknown) => ({
+          value: [] as SocialAccount[],
+          error: reason instanceof Error ? reason.message : String(reason),
+        }),
+      );
       const [s, a, accounts, platforms] = await Promise.all([
         fetchJson<PublishSettings>(`${ORCHESTRATOR_URL}/bilibili/publish/settings`),
         fetchJson<AuthSettings>(`${ORCHESTRATOR_URL}/bilibili/auth/settings`),
-        fetchJson<SocialAccount[]>(`${ORCHESTRATOR_URL}/settings/publish/social/accounts`),
+        accountRequest,
         fetchJson<PublishPlatformSettingsResponse>(`${ORCHESTRATOR_URL}/settings/publish/platforms`),
       ]);
       setSettings(s);
       setUploadWorkers(s.upload_workers ?? 4);
       setAuth(a);
       setMe(null);
-      setSocialAccounts(accounts);
+      setSocialAccounts(accounts.value);
+      setSocialAccountsError(accounts.error);
       setPlatformSettings(platforms.platforms);
       setMetaEditor((current) => applyServerValue(current, JSON.stringify(s.default_meta ?? {}, null, 2), s.version ?? null));
     } catch (e: unknown) {
@@ -257,6 +267,11 @@ export default function SettingsPublishPage() {
         <h2 className="text-xl font-semibold tracking-tight text-slate-950">投稿与发布</h2>
         <div className="mt-1 text-sm text-slate-600">按平台配置投稿启用状态、登录凭据和默认投稿策略。</div>
         {error ? <div className="mt-3 text-sm text-rose-700">{error}</div> : null}
+        {socialAccountsError ? (
+          <div role="alert" className="mt-3 text-sm text-amber-700">
+            SAU 账号服务暂不可用：{socialAccountsError}。哔哩哔哩发布设置仍可独立使用。
+          </div>
+        ) : null}
       </div>
 
       {SOCIAL_PLATFORMS.map(({ id, label }) => {
@@ -409,7 +424,11 @@ export default function SettingsPublishPage() {
             ) : null}
 
             <div className="mt-3 space-y-2">
-              {accounts.length === 0 ? <div className="text-sm text-slate-500">尚未导入账号。</div> : null}
+              {accounts.length === 0 ? (
+                <div className="text-sm text-slate-500">
+                  {socialAccountsError ? "账号列表暂无法读取，请恢复 SAU 服务后刷新。" : "尚未导入账号。"}
+                </div>
+              ) : null}
               {accounts.map((account) => (
                 <div key={account.id} className="flex flex-wrap items-center justify-between gap-2 rounded border p-3 text-sm">
                   <div>

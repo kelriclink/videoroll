@@ -255,11 +255,28 @@ pub async fn import(state: &AppState, body: ImportRequest) -> AppResult<PlayoutL
     let dest = playout_path(state, filename).await?;
     let actual_path = dest.to_string_lossy().to_string();
     let mut tx = state.db.pool.begin().await?;
-    let row=sqlx::query(
-        "INSERT INTO vr2_playout_links(id,task_id,asset_id,source_asset_id,channel_id,relative_media_path,playout_path,source_checksum) VALUES($1,$2,$3,$3,$4,$5,$6,$7) ON CONFLICT(source_asset_id,channel_id) DO UPDATE SET asset_id=EXCLUDED.asset_id,status='staging',updated_at=now() RETURNING id,status,source_checksum,playout_path"
-    ).bind(Uuid::new_v4()).bind(body.task_id).bind(asset_id).bind(body.channel_id)
-        .bind(&relative).bind(&actual_path).bind(&sha)
-        .fetch_one(&mut *tx).await?;
+    let row = sqlx::query(
+        "INSERT INTO playout_asset_links(
+          id,task_id,asset_id,source_asset_id,ffplayout_channel_id,
+          relative_media_path,playout_path,source_checksum,runtime_engine,status)
+          VALUES($1,$2,$3,$3,$4,$5,$6,$7,'rust-v2','staging')
+          ON CONFLICT(asset_id,ffplayout_channel_id)
+          DO UPDATE SET asset_id=EXCLUDED.asset_id,status='staging',updated_at=now()
+          WHERE playout_asset_links.runtime_engine='rust-v2'
+          RETURNING id,status,source_checksum,playout_path",
+    )
+    .bind(Uuid::new_v4())
+    .bind(body.task_id)
+    .bind(asset_id)
+    .bind(body.channel_id)
+    .bind(&relative)
+    .bind(&actual_path)
+    .bind(&sha)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| {
+        AppError::Conflict("asset already linked by an original VideoRoll channel".into())
+    })?;
     let id: Uuid = row.try_get("id")?;
     let previous: String = row.try_get("source_checksum")?;
     let path: String = row.try_get("playout_path")?;
@@ -353,14 +370,16 @@ async fn detach(
         .asset_id
         .ok_or_else(|| AppError::Conflict("playout link is missing a live source asset".into()))?;
     let asset = state.db.asset(live_asset).await?;
-    sqlx::query("UPDATE vr2_playout_links SET status='detached',updated_at=now() WHERE id=$1")
-        .bind(id)
-        .execute(&mut *tx)
-        .await?;
+    sqlx::query(
+        "UPDATE vr2_playout_links SET status='detached',asset_id=NULL,updated_at=now() WHERE id=$1",
+    )
+    .bind(id)
+    .execute(&mut *tx)
+    .await?;
     // Do NOT physically delete the destination: it may currently be playing.
     // The external playlist must separately acknowledge removal first.
     sqlx::query(
-        "DELETE FROM vr2_object_refs WHERE storage_key=$1 AND owner_type='playout' AND owner_id=$2",
+        "DELETE FROM storage_object_refs WHERE storage_key=$1 AND owner_type='playout' AND owner_id=$2",
     )
     .bind(asset.storage_key)
     .bind(id)

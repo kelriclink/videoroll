@@ -95,7 +95,7 @@ async fn update_settings(
         .execute(&mut *tx)
         .await?;
     let current: Option<Value> =
-        sqlx::query_scalar("SELECT value_json FROM vr2_settings WHERE key=$1")
+        sqlx::query_scalar("SELECT value_json FROM app_settings WHERE key=$1")
             .bind(KEY)
             .fetch_optional(&mut *tx)
             .await?;
@@ -114,11 +114,11 @@ async fn update_settings(
     }
     let result = normalize_settings(Value::Object(merged))?;
     sqlx::query(
-        "INSERT INTO vr2_settings(key,value_json,version) VALUES($1,$2,1)
-         ON CONFLICT(key) DO UPDATE SET value_json=$2,version=vr2_settings.version+1,updated_at=now()"
+        "INSERT INTO app_settings(key,value_json,version) VALUES($1,$2,1)
+         ON CONFLICT(key) DO UPDATE SET value_json=$2,version=app_settings.version+1,updated_at=now()"
     ).bind(KEY).bind(&result).execute(&mut *tx).await?;
     // Old review decisions cannot be reused after rule edits.
-    sqlx::query("DELETE FROM vr2_publish_reviews")
+    sqlx::query("UPDATE tasks SET publish_review_fingerprint=NULL,publish_review_approved=NULL,publish_review_result=NULL,publish_review_checked_at=NULL WHERE publish_review_fingerprint IS NOT NULL")
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;
@@ -168,6 +168,7 @@ fn fingerprint(meta: &Value, settings: &Value, subtitle: &str) -> AppResult<Stri
 }
 async fn from_model(
     db: &Database,
+    task_id: Uuid,
     config: &Config,
     title: &str,
     summary: &str,
@@ -199,28 +200,21 @@ async fn from_model(
                  "subtitle_excerpt":limited(subtitle,12000)}).to_string()}
         ]
     });
-    let mut request = client.post(provider.endpoint).json(&payload);
+    let mut request = client.post(provider.endpoint.clone()).json(&payload);
     if let Some(token) = provider.api_key.as_ref() {
         request = request.bearer_auth(token);
     }
-    let response = request.send().await?;
-    if !response.status().is_success() {
-        return Err(AppError::Unavailable(format!(
-            "AI review HTTP {}",
-            response.status()
-        )));
-    }
-    if response.content_length().is_some_and(|len| len > 65_536) {
-        return Err(AppError::Unavailable("AI review response oversized".into()));
-    }
-    let body = response.bytes().await?;
-    if body.len() > 65_536 {
-        return Err(AppError::Unavailable(
-            "AI review response exceeds budget".into(),
-        ));
-    }
-    let root: Value = serde_json::from_slice(&body)
-        .map_err(|_| AppError::Unavailable("AI review response is not JSON".into()))?;
+    let root = crate::ai_usage::chat_json(
+        db,
+        request,
+        &provider.endpoint,
+        &provider.model,
+        "publish_review",
+        Some(task_id),
+        65_536,
+        "AI review",
+    )
+    .await?;
     let content = root
         .pointer("/choices/0/message/content")
         .and_then(Value::as_str)
@@ -359,6 +353,7 @@ async fn review(
     } else {
         match from_model(
             db,
+            id,
             config,
             &clean_title,
             &clean_summary,
@@ -404,9 +399,9 @@ async fn review(
     };
     // Content fingerprints must never be reused after metadata changes.
     sqlx::query(
-        "INSERT INTO vr2_publish_reviews(task_id,fingerprint,approved,result)
-         VALUES($1,$2,$3,$4)
-         ON CONFLICT(task_id) DO UPDATE SET fingerprint=$2,approved=$3,result=$4,checked_at=now()",
+        "UPDATE tasks SET publish_review_fingerprint=$2,publish_review_approved=$3,
+          publish_review_result=$4,publish_review_checked_at=now()
+          WHERE id=$1 AND runtime_owner='rust'",
     )
     .bind(id)
     .bind(&fp)

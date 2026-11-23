@@ -1,7 +1,7 @@
 //! Native official Index-Translate adapter: bounded source context, exact
 //! numbered output, missing-line repair, and finite split/retry budgets.
 use crate::{AppError, AppResult, Database, subtitles::SubtitleCue};
-use reqwest::{Client, StatusCode, Url};
+use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
@@ -9,6 +9,7 @@ use std::{
     time::Duration,
 };
 use tokio::time::sleep;
+use uuid::Uuid;
 
 pub const MODEL: &str = "Index-Translate-35B-A3B";
 pub const ENDPOINT: &str = "https://index-translate.bilibili.com/v1/chat/completions";
@@ -237,52 +238,45 @@ fn decode_envelope(value: Value, start: usize, end: usize) -> AppResult<BTreeMap
         .map_err(|_| AppError::Unavailable("Index response mapping not valid JSON".into()))?;
     mapping(&decoded, start, end)
 }
-async fn call(client: &Client, url: &Url, opts: &Options, messages: Value) -> AppResult<Value> {
+async fn call(
+    db: &Database,
+    task_id: Uuid,
+    client: &Client,
+    url: &Url,
+    opts: &Options,
+    messages: Value,
+) -> AppResult<Value> {
     let body = json!({"model":MODEL,"messages":messages,"temperature":opts.temperature,
         "max_tokens":opts.max_tokens,"stream":false,
         "chat_template_kwargs":{"enable_thinking":false},
         "response_format":{"type":"json_object"}});
     for attempt in 0..3 {
-        let result = client
+        let request = client
             .post(url.clone())
             .header("User-Agent", "Index-Translate-Client/1.0")
-            .json(&body)
-            .send()
-            .await;
-        match result {
-            Ok(response) if response.status().is_success() => {
-                if response
-                    .content_length()
-                    .is_some_and(|n| n > 8 * 1024 * 1024)
-                {
-                    return Err(AppError::Unavailable("Index reply too large".into()));
-                }
-                let raw = response.bytes().await?;
-                if raw.len() > 8 * 1024 * 1024 {
-                    return Err(AppError::Unavailable("Index reply too large".into()));
-                }
-                return serde_json::from_slice(&raw)
-                    .map_err(|_| AppError::Unavailable("Index envelope JSON invalid".into()));
-            }
-            Ok(response)
-                if matches!(
-                    response.status(),
-                    StatusCode::TOO_MANY_REQUESTS
-                        | StatusCode::BAD_GATEWAY
-                        | StatusCode::SERVICE_UNAVAILABLE
-                        | StatusCode::INTERNAL_SERVER_ERROR
-                        | StatusCode::GATEWAY_TIMEOUT
-                ) && attempt < 2 => {}
-            Ok(response) => {
-                return Err(AppError::Unavailable(format!(
-                    "Index gateway HTTP {}",
-                    response.status()
-                )));
-            }
-            Err(err) if attempt < 2 => {
+            .json(&body);
+        match crate::ai_usage::chat_json(
+            db,
+            request,
+            url,
+            MODEL,
+            "index_translate",
+            Some(task_id),
+            8 * 1024 * 1024,
+            "Index gateway",
+        )
+        .await
+        {
+            Ok(value) => return Ok(value),
+            Err(AppError::Unavailable(message))
+                if attempt < 2
+                    && [" 429", " 500", " 502", " 503", " 504"]
+                        .iter()
+                        .any(|code| message.contains(code)) => {}
+            Err(AppError::Upstream(err)) if attempt < 2 => {
                 tracing::warn!(error=%err.without_url(),attempt,"Index request retry");
             }
-            Err(err) => return Err(AppError::Upstream(err)),
+            Err(err) => return Err(err),
         }
         sleep(Duration::from_secs(1 << attempt)).await;
     }
@@ -298,6 +292,8 @@ struct Window {
     tries: usize,
 }
 pub async fn translate(
+    db: &Database,
+    task_id: Uuid,
     client: &Client,
     source: &[SubtitleCue],
     start: usize,
@@ -338,7 +334,7 @@ pub async fn translate(
             &opts,
             window.context_chars,
         );
-        let result = call(client, &url, &opts, msgs)
+        let result = call(db, task_id, client, &url, &opts, msgs)
             .await
             .and_then(|v| decode_envelope(v, window.start, window.end));
         match result {

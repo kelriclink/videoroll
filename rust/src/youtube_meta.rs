@@ -202,16 +202,17 @@ async fn fetch_metadata(
         drop(output);
         let mut tx = state.db.pool.begin().await?;
         // No unauthorized import into a task from the V1 production workload.
-        let owned: bool =
-            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM vr2_managed_tasks WHERE task_id=$1)")
-                .bind(id)
-                .fetch_one(&mut *tx)
-                .await?;
+        let owned: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM tasks WHERE id=$1 AND runtime_owner='rust')",
+        )
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await?;
         if !owned {
             return Err(AppError::NotFound("V2 task ownership lost".into()));
         }
         sqlx::query(
-            "INSERT INTO vr2_objects(storage_key,checksum_sha256,size_bytes,state,retain_until)
+            "INSERT INTO storage_objects(storage_key,checksum_sha256,size_bytes,state,retain_until)
              VALUES($1,$2,$3,'live',now()+interval '2 days')",
         )
         .bind(&key)
@@ -220,7 +221,7 @@ async fn fetch_metadata(
         .execute(&mut *tx)
         .await?;
         sqlx::query(
-            "INSERT INTO vr2_object_refs(storage_key,owner_type,owner_id,role)
+            "INSERT INTO storage_object_refs(storage_key,owner_type,owner_id,role)
              VALUES($1,'task',$2,'metadata_json')",
         )
         .bind(&key)
@@ -233,10 +234,16 @@ async fn fetch_metadata(
             .unwrap_or("")
             .trim();
         sqlx::query(
-            "INSERT INTO vr2_task_titles(task_id,source_title) VALUES($1,$2)
-             ON CONFLICT(task_id) DO UPDATE
-             SET source_title=CASE WHEN vr2_task_titles.source_title='' THEN $2
-               ELSE vr2_task_titles.source_title END,updated_at=now()",
+            "INSERT INTO app_settings(key,value_json,version)
+             VALUES('task.title.'||$1::text,jsonb_build_object('source_title',$2::text),1)
+             ON CONFLICT(key) DO UPDATE SET
+               value_json=CASE
+                  WHEN NULLIF(trim(app_settings.value_json->>'source_title'),'') IS NULL
+                  THEN jsonb_set(app_settings.value_json,'{source_title}',to_jsonb($2::text),true)
+                  ELSE app_settings.value_json END,
+               version=CASE WHEN NULLIF(trim(app_settings.value_json->>'source_title'),'') IS NULL
+                    THEN app_settings.version+1 ELSE app_settings.version END,
+               updated_at=now()",
         )
         .bind(id)
         .bind(title)

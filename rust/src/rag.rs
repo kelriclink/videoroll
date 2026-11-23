@@ -235,13 +235,28 @@ pub async fn insert(db: &Database, item: NewKnowledge) -> AppResult<KnowledgeIte
     let id = Uuid::new_v4();
     let embeddings = item.embedding.map(|v| json!(v));
     sqlx::query(
-        "INSERT INTO vr2_knowledge_items(id,collection,scope,task_id,kind,source_ref,title,content,language,keywords,embedding,embedding_model,confidence) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)"
-    ).bind(id).bind(item.collection).bind(item.scope).bind(item.task_id)
-        .bind(item.kind).bind(item.source_ref).bind(item.title)
-        .bind(item.content).bind(item.language).bind(json!(item.keywords))
-        .bind(embeddings).bind(item.embedding_model)
-        .bind(item.confidence.unwrap_or(1.0))
-        .execute(&db.pool).await?;
+        "INSERT INTO translation_knowledge_items(
+          id,created_by,item_type,native_collection,native_scope,native_task_id,
+          native_kind,native_source_ref,title,content,native_language,
+          native_keywords,native_embedding_json,embedding_model,confidence)
+          VALUES($1,'rust-v2','document',$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,
+          COALESCE($12,''),$13)",
+    )
+    .bind(id)
+    .bind(item.collection)
+    .bind(item.scope)
+    .bind(item.task_id)
+    .bind(item.kind)
+    .bind(item.source_ref)
+    .bind(item.title)
+    .bind(item.content)
+    .bind(item.language)
+    .bind(json!(item.keywords))
+    .bind(embeddings)
+    .bind(item.embedding_model)
+    .bind(item.confidence.unwrap_or(1.0))
+    .execute(&db.pool)
+    .await?;
     find(db, id).await
 }
 async fn find(db: &Database, id: Uuid) -> AppResult<KnowledgeItem> {

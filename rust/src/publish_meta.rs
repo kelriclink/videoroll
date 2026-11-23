@@ -232,14 +232,7 @@ async fn title_for(db: &Database, id: Uuid) -> AppResult<Option<String>> {
     if v1.is_some() {
         return Ok(v1);
     }
-    let v2: Option<String> = sqlx::query_scalar(
-        "SELECT COALESCE(NULLIF(trim(translated_title),''),NULLIF(trim(source_title),''))
-         FROM vr2_task_titles WHERE task_id=$1",
-    )
-    .bind(id)
-    .fetch_optional(&db.pool)
-    .await?;
-    Ok(v2)
+    Ok(None)
 }
 async fn source_metadata(state: &AppState, id: Uuid) -> AppResult<Option<Value>> {
     let key: Option<String> = sqlx::query_scalar(
@@ -374,8 +367,8 @@ async fn save_meta(
     let mut tx = state.db.pool.begin().await?;
     // Task-first lock order matches the scheduler and publish lifecycle.
     let state_row = sqlx::query(
-        "SELECT status::text AS status FROM tasks t WHERE t.id=$1
-         AND EXISTS(SELECT 1 FROM vr2_managed_tasks WHERE task_id=$1) FOR UPDATE",
+        "SELECT upper(status::text) AS status FROM tasks t WHERE t.id=$1
+         AND EXISTS(SELECT 1 FROM tasks WHERE id=$1 AND runtime_owner='rust') FOR UPDATE",
     )
     .bind(id)
     .fetch_optional(&mut *tx)
@@ -399,14 +392,14 @@ async fn save_meta(
             "publish job already queued, submitted or unresolved; metadata frozen".into(),
         ));
     }
-    sqlx::query("DELETE FROM vr2_publish_reviews WHERE task_id=$1")
+    sqlx::query("UPDATE tasks SET publish_review_fingerprint=NULL,publish_review_approved=NULL,publish_review_result=NULL,publish_review_checked_at=NULL WHERE id=$1 AND runtime_owner='rust'")
         .bind(id)
         .execute(&mut *tx)
         .await?;
     sqlx::query(
-        "INSERT INTO vr2_publish_meta(task_id,value_json,sha256) VALUES($1,$2,$3)
-         ON CONFLICT(task_id) DO UPDATE SET value_json=EXCLUDED.value_json,
-         sha256=EXCLUDED.sha256,revision=vr2_publish_meta.revision+1,updated_at=now()",
+        "UPDATE tasks SET publish_meta_json=$2,publish_meta_sha256=$3,
+         publish_meta_revision=publish_meta_revision+1,publish_meta_updated_at=now()
+         WHERE id=$1 AND runtime_owner='rust'",
     )
     .bind(id)
     .bind(&normalized)

@@ -17,9 +17,9 @@ use crate::{
 use axum::{
     Json, Router,
     body::Body,
-    extract::{DefaultBodyLimit, Multipart, Path, Query, Request, State},
+    extract::{DefaultBodyLimit, Multipart, OriginalUri, Path, Query, Request, State},
     http::{HeaderMap, StatusCode, header},
-    response::Response,
+    response::{IntoResponse, Response},
     routing::{get, post},
 };
 use chrono::{DateTime, Utc};
@@ -159,20 +159,30 @@ async fn admin_workers(State(s): State<AppState>) -> AppResult<Json<Vec<WorkerIn
     }
     Ok(Json(out))
 }
-async fn protocol() -> Json<Value> {
+async fn protocol(OriginalUri(uri): OriginalUri) -> Json<Value> {
+    // The original Windows worker advertises 180s leases. V2 uses 240s;
+    // serve each wire contract according to its established API root.
+    let lease = if uri.path().starts_with("/api/render-workers/v1/") {
+        180
+    } else {
+        LEASE_SECONDS
+    };
     Json(json!({
         "protocol_version":1,"render_spec_versions":[1],"transfer_modes":["http"],
         "features":[
             "worker_registration","capability_report","pull_claim","lease_heartbeat",
             "progress","log_tail","range_download","output_upload","fencing",
             "retryable_failure","cancel_poll"
-        ],"lease_seconds":LEASE_SECONDS
+        ],"lease_seconds":lease
     }))
 }
 async fn enroll(
     State(s): State<AppState>,
     Json(payload): Json<EnrollRequest>,
-) -> AppResult<Json<WorkerResponse>> {
+) -> AppResult<Response> {
+    if payload.enrollment_token.starts_with("vre_") {
+        return Ok(Json(crate::render_worker_wire_v1::enroll(&s, &payload).await?).into_response());
+    }
     if payload.enrollment_token.len() != 64
         || !payload.render_spec_versions.contains(&1)
         || payload.protocol_version != 1
@@ -194,16 +204,17 @@ async fn enroll(
     let id = Uuid::new_v4();
     let credential = strong_token();
     let updated=sqlx::query(
-        "INSERT INTO vr2_render_workers(id,worker_key,name,platform,architecture,version,protocol_version,render_spec_versions,capabilities,resources,labels,credential_hash,max_concurrency,status) VALUES($1,$2,$3,$4,$5,$6,1,$7,$8,$9,$10,$11,$12,'online') ON CONFLICT(worker_key) DO UPDATE SET name=$3,platform=$4,architecture=$5,version=$6,render_spec_versions=$7,capabilities=$8,resources=$9,labels=$10,credential_hash=$11,max_concurrency=$12,enabled=true,draining=false,status='online',last_seen_at=now(),updated_at=now() RETURNING id"
+        "INSERT INTO render_workers(id,worker_key,name,platform,architecture,version,protocol_version,render_spec_versions,capabilities,resources,labels,credential_hash,credential_issued_at,max_concurrency,status,runtime_engine) VALUES($1,$2,$3,$4,$5,$6,1,$7,$8,$9,$10,$11,now(),$12,'online','rust-v2') ON CONFLICT(worker_key) DO UPDATE SET name=$3,platform=$4,architecture=$5,version=$6,render_spec_versions=$7,capabilities=$8,resources=$9,labels=$10,credential_hash=$11,credential_issued_at=now(),credential_revoked_at=NULL,max_concurrency=$12,enabled=true,draining=false,status='online',last_seen_at=now(),updated_at=now() WHERE render_workers.runtime_engine='rust-v2' RETURNING id"
     ).bind(id).bind(&payload.worker_key).bind(&payload.name)
         .bind(&payload.platform).bind(&payload.architecture).bind(&payload.version)
         .bind(serde_json::to_value(&payload.render_spec_versions)
             .map_err(|_|AppError::Invalid("invalid render spec versions".into()))?)
         .bind(&payload.capabilities).bind(&payload.resources).bind(&payload.labels)
         .bind(token_hash(&credential)).bind(payload.max_concurrency)
-        .fetch_one(&mut *tx).await?;
+        .fetch_optional(&mut *tx).await?
+        .ok_or_else(||AppError::Conflict("worker_key belongs to an original Python Worker; cannot replace its credential".into()))?;
     let assigned_id: Uuid = updated.try_get("id")?;
-    sqlx::query("UPDATE vr2_render_enrollments SET consumed_at=now(),worker_id=$1 WHERE id=$2")
+    sqlx::query("UPDATE vr2_render_enrollments SET consumed_at=now(),status='consumed',worker_id=$1 WHERE id=$2")
         .bind(assigned_id)
         .bind(enrollment_id)
         .execute(&mut *tx)
@@ -212,14 +223,28 @@ async fn enroll(
     Ok(Json(WorkerResponse {
         worker: read_worker(&s, assigned_id).await?,
         credential,
-    }))
+    })
+    .into_response())
 }
 async fn heartbeat(
     State(s): State<AppState>,
     Path(id): Path<Uuid>,
     headers: HeaderMap,
     Json(payload): Json<WorkerHeartbeat>,
-) -> AppResult<Json<WorkerInfo>> {
+) -> AppResult<Response> {
+    if crate::render_worker_wire_v1::is_legacy(&headers) {
+        let value = crate::render_worker_wire_v1::worker_heartbeat(
+            &s,
+            &headers,
+            id,
+            &payload.status,
+            &payload.resources,
+            payload.capabilities.as_ref(),
+            payload.active_execution_ids.len(),
+        )
+        .await?;
+        return Ok(Json(value).into_response());
+    }
     enrolled_worker(&s, &headers, id).await?;
     if !matches!(
         payload.status.as_str(),
@@ -232,7 +257,7 @@ async fn heartbeat(
         "UPDATE vr2_render_workers SET status=$1,resources=$2,capabilities=COALESCE($3,capabilities),last_seen_at=now(),updated_at=now() WHERE id=$4"
     ).bind(payload.status).bind(payload.resources).bind(payload.capabilities).bind(id)
         .execute(&s.db.pool).await?;
-    Ok(Json(read_worker(&s, id).await?))
+    Ok(Json(read_worker(&s, id).await?).into_response())
 }
 async fn build_spec(s: &AppState, exec: &ExecutionInfo) -> AppResult<RenderSpec> {
     let row =
@@ -372,7 +397,7 @@ async fn claim(
           JOIN tasks t ON t.id=r.task_id
           WHERE w.state='running' AND j.state='awaiting'
             AND j.external_ticket=r.id::text
-            AND t.status::text NOT IN ('CANCELED','FAILED')
+            AND upper(t.status::text) NOT IN ('CANCELED','FAILED')
             AND (
               r.state='queued'
               OR (r.state IN ('running','uploading') AND r.lease_until<now())
@@ -427,7 +452,20 @@ async fn execution_heartbeat(
     Path(id): Path<Uuid>,
     headers: HeaderMap,
     Json(payload): Json<ExecutionHeartbeat>,
-) -> AppResult<Json<ExecutionInfo>> {
+) -> AppResult<Response> {
+    if crate::render_worker_wire_v1::is_legacy(&headers) {
+        let value = crate::render_worker_wire_v1::heartbeat_execution(
+            &s,
+            &headers,
+            id,
+            &payload.fence_token,
+            payload.progress,
+            &payload.metrics,
+            payload.stage.as_deref(),
+        )
+        .await?;
+        return Ok(Json(value).into_response());
+    }
     let worker_id = authenticate(&s, &headers).await?;
     if payload.progress.is_some_and(|n| !(0..=100).contains(&n)) {
         return Err(AppError::Invalid("invalid progress percentage".into()));
@@ -456,14 +494,25 @@ async fn execution_heartbeat(
         .fetch_one(&mut *tx)
         .await?;
     tx.commit().await?;
-    Ok(Json(execution_info(&row)?))
+    Ok(Json(execution_info(&row)?).into_response())
 }
 async fn execution_log(
     State(s): State<AppState>,
     Path(id): Path<Uuid>,
     headers: HeaderMap,
     Json(payload): Json<ExecutionLog>,
-) -> AppResult<Json<ExecutionInfo>> {
+) -> AppResult<Response> {
+    if crate::render_worker_wire_v1::is_legacy(&headers) {
+        let value = crate::render_worker_wire_v1::log_execution(
+            &s,
+            &headers,
+            id,
+            &payload.fence_token,
+            &payload.text,
+        )
+        .await?;
+        return Ok(Json(value).into_response());
+    }
     let worker_id = authenticate(&s, &headers).await?;
     if payload.text.len() > 65536 {
         return Err(AppError::Invalid("render worker log too long".into()));
@@ -489,18 +538,22 @@ async fn execution_log(
         .fetch_one(&mut *tx)
         .await?;
     tx.commit().await?;
-    Ok(Json(execution_info(&row)?))
+    Ok(Json(execution_info(&row)?).into_response())
 }
 async fn execution_cancel(
     State(s): State<AppState>,
     Path(id): Path<Uuid>,
     headers: HeaderMap,
-) -> AppResult<Json<CancelState>> {
+) -> AppResult<Response> {
+    if crate::render_worker_wire_v1::is_legacy(&headers) {
+        let value = crate::render_worker_wire_v1::cancellation(&s, &headers, id).await?;
+        return Ok(Json(value).into_response());
+    }
     let row = enrolled_execution(&s, &headers, id).await?;
     let task_id: Uuid = row.try_get("task_id")?;
     let workflow_id: Uuid = row.try_get("workflow_id")?;
     let current:Option<(String,String)>=sqlx::query_as(
-        "SELECT t.status::text,w.state FROM vr2_workflows w JOIN tasks t ON t.id=w.task_id WHERE w.id=$1 AND t.id=$2"
+        "SELECT upper(t.status::text),w.state FROM vr2_workflows w JOIN tasks t ON t.id=w.task_id WHERE w.id=$1 AND t.id=$2"
     ).bind(workflow_id).bind(task_id).fetch_optional(&s.db.pool).await?;
     let state = match current {
         Some((status, flow)) if status == "CANCELED" || flow != "running" => {
@@ -512,7 +565,8 @@ async fn execution_cancel(
     Ok(Json(CancelState {
         cancel_requested: state.is_some(),
         reason: state,
-    }))
+    })
+    .into_response())
 }
 fn parse_range(requested: Option<&str>, size: u64) -> AppResult<(u64, u64, StatusCode)> {
     if size == 0 {
@@ -585,7 +639,12 @@ async fn execution_output_probe(
     Path(id): Path<Uuid>,
     headers: HeaderMap,
     Query(q): Query<OutputProbe>,
-) -> AppResult<Json<Value>> {
+) -> AppResult<Response> {
+    if crate::render_worker_wire_v1::is_legacy(&headers) {
+        let value =
+            crate::render_worker_wire_v1::probe_output(&s, &headers, id, &q.fence_token).await?;
+        return Ok(Json(value).into_response());
+    }
     let row = enrolled_execution(&s, &headers, id).await?;
     let fence: String = row
         .try_get::<Option<String>, _>("fence_token")?
@@ -600,9 +659,11 @@ async fn execution_output_probe(
         ));
     };
     let item = s.db.asset(asset).await?;
-    Ok(Json(serde_json::to_value(item).map_err(|_| {
-        AppError::Invalid("render asset serialization failed".into())
-    })?))
+    Ok(Json(
+        serde_json::to_value(item)
+            .map_err(|_| AppError::Invalid("render asset serialization failed".into()))?,
+    )
+    .into_response())
 }
 async fn execution_output_upload(
     State(s): State<AppState>,
@@ -676,7 +737,7 @@ async fn execution_output_upload(
         let _=probe_video(&s.config.ffprobe_binary,&temp).await?;
         let mut tx=s.db.pool.begin().await?;
         // Acquire locks in the same order as the Scheduler: Task -> Workflow -> Job -> Execution.
-        let status:String=sqlx::query_scalar("SELECT status::text FROM tasks WHERE id=$1 FOR UPDATE")
+        let status:String=sqlx::query_scalar("SELECT upper(status::text) FROM tasks WHERE id=$1 FOR UPDATE")
             .bind(task_id).fetch_one(&mut *tx).await?;
         let flow:String=sqlx::query_scalar("SELECT state FROM vr2_workflows WHERE id=$1 FOR UPDATE")
             .bind(workflow_id).fetch_one(&mut *tx).await?;
@@ -697,11 +758,11 @@ async fn execution_output_upload(
         fs::rename(&temp,&dest).await?;
         let asset_id=Uuid::new_v4();
         sqlx::query(
-            "INSERT INTO vr2_objects(storage_key,checksum_sha256,size_bytes,state,retain_until) VALUES($1,$2,$3,'live',now()+interval '2 days') ON CONFLICT(storage_key) DO UPDATE SET checksum_sha256=$2,size_bytes=$3,retain_until=GREATEST(vr2_objects.retain_until,now()+interval '2 days') WHERE vr2_objects.state='live'"
+            "INSERT INTO storage_objects(storage_key,checksum_sha256,size_bytes,state,retain_until) VALUES($1,$2,$3,'live',now()+interval '2 days') ON CONFLICT(storage_key) DO UPDATE SET checksum_sha256=$2,size_bytes=$3,retain_until=GREATEST(storage_objects.retain_until,now()+interval '2 days') WHERE storage_objects.state='live'"
         ).bind(&file_key).bind(&bytes_digest).bind(size as i64)
             .execute(&mut *tx).await?;
         sqlx::query(
-            "INSERT INTO vr2_object_refs(storage_key,owner_type,owner_id,role) VALUES($1,'workflow',$2,'video_final') ON CONFLICT DO NOTHING"
+            "INSERT INTO storage_object_refs(storage_key,owner_type,owner_id,role) VALUES($1,'workflow',$2,'video_final') ON CONFLICT DO NOTHING"
         ).bind(&file_key).bind(workflow_id).execute(&mut *tx).await?;
         sqlx::query(
             "INSERT INTO assets(id,task_id,kind,storage_key,sha256,size_bytes) VALUES($1,$2,'video_final'::asset_kind,$3,$4,$5)"
@@ -854,6 +915,7 @@ pub fn worker_router() -> Router<AppState> {
         Router::new()
             .route("/protocol", get(protocol))
             .route("/enroll", post(enroll))
+            .route("/local-enroll", post(crate::local_worker_enroll_v1::enroll))
             .route("/{worker_id}/heartbeat", post(heartbeat))
             .route("/{worker_id}/claim", post(claim))
             .route("/executions/{id}/heartbeat", post(execution_heartbeat))

@@ -29,6 +29,10 @@ enum Command {
     /// Process at most one native Bilibili subtitle draft (outbox remains
     /// independent of the irreversible archive submission).
     SubtitlesTick,
+    /// Process at most one independently scheduled published-P1/P2 append.
+    P2Tick,
+    /// Process one durable SAU social publication intent and reconcile receipts.
+    SocialTick,
     /// Process expired, unreferenced v2 artifacts. Never touches v1-only assets.
     Gc {
         #[arg(long, default_value_t = 50)]
@@ -109,6 +113,50 @@ async fn main() -> anyhow::Result<()> {
                     }
                 });
             }
+            if config.native_bilibili_allowed {
+                let p2_config = config.clone();
+                let p2_db = db.clone();
+                let p2_registry = storage.clone();
+                tokio::spawn(async move {
+                    let mut tick = tokio::time::interval(std::time::Duration::from_secs(15));
+                    loop {
+                        tick.tick().await;
+                        if let Err(error) = videoroll_v2::bili_p2::reconcile_stale(&p2_db).await {
+                            tracing::warn!(error=%error,"native Bilibili P2 stale intent reconciliation failed");
+                        }
+                        if let Err(error) =
+                            videoroll_v2::bili_p2::tick(&p2_config, &p2_db, &p2_registry).await
+                        {
+                            tracing::warn!(error=%error,"native Bilibili P2 processing failed");
+                        }
+                    }
+                });
+            }
+            if config.social_publish_allowed {
+                let social_config = config.clone();
+                let social_db = db.clone();
+                tokio::spawn(async move {
+                    let mut tick = tokio::time::interval(std::time::Duration::from_secs(15));
+                    loop {
+                        tick.tick().await;
+                        if let Err(error) =
+                            videoroll_v2::social_publish::reconcile_stale(&social_db).await
+                        {
+                            tracing::warn!(error=%error,"SAU social dispatch recovery failed");
+                        }
+                        if let Err(error) =
+                            videoroll_v2::social_publish::reconcile_receipts(&social_db).await
+                        {
+                            tracing::warn!(error=%error,"SAU publish receipt reconciliation failed");
+                        }
+                        if let Err(error) =
+                            videoroll_v2::social_publish::tick(&social_config, &social_db).await
+                        {
+                            tracing::warn!(error=%error,"SAU social publish handoff failed");
+                        }
+                    }
+                });
+            }
             let executor = Executor::new(config.clone(), db.clone(), scheduler, storage);
             let mut workers = tokio::task::JoinSet::new();
             workers.spawn(async move {
@@ -121,6 +169,18 @@ async fn main() -> anyhow::Result<()> {
                         .await
                     {
                         tracing::warn!(error=%e,"terminal resource release reconciliation failed");
+                    }
+                    let retention=videoroll_v2::operations_v1::published_retention(
+                        &maintenance_store.db
+                    ).await;
+                    match retention {
+                        Ok(ttl)=>{
+                            if let Err(error)=maintenance_store
+                                .reconcile_published_resources(50,ttl).await{
+                                tracing::warn!(%error,"published resource retention backfill failed");
+                            }
+                        },
+                        Err(error)=>tracing::warn!(%error,"published retention settings unavailable"),
                     }
                     if let Err(e) = maintenance_store.collect(100).await {
                         tracing::warn!(error=%e,"v2 object garbage collection failed");
@@ -143,16 +203,36 @@ async fn main() -> anyhow::Result<()> {
             let processed = videoroll_v2::bili_subtitles::tick(&config, &db, &storage).await?;
             tracing::info!(processed, "native subtitle sync tick finished");
         }
+        Command::P2Tick => {
+            let store = AssetRegistry::new(db.clone(), config.storage_root.clone());
+            let stale = videoroll_v2::bili_p2::reconcile_stale(&db).await?;
+            let processed = videoroll_v2::bili_p2::tick(&config, &db, &store).await?;
+            tracing::info!(stale, processed, "native post-P1 P2 append tick finished");
+        }
+        Command::SocialTick => {
+            let stale = videoroll_v2::social_publish::reconcile_stale(&db).await?;
+            let receipts = videoroll_v2::social_publish::reconcile_receipts(&db).await?;
+            let dispatched = videoroll_v2::social_publish::tick(&config, &db).await?;
+            tracing::info!(
+                stale,
+                receipts,
+                dispatched,
+                "SAU social publish tick finished"
+            );
+        }
         Command::Gc { limit } => {
             let registry = AssetRegistry::new(db, config.storage_root.clone());
             let released = registry
                 .reconcile_terminal_resources(limit, config.cleanup_grace)
                 .await?;
+            let ttl = videoroll_v2::operations_v1::published_retention(&registry.db).await?;
+            let published = registry.reconcile_published_resources(limit, ttl).await?;
             let deleted = registry.collect(limit).await?;
             let directories = registry.collect_workdirs(limit).await?;
             tracing::info!(
                 released,
                 deleted,
+                published,
                 directories,
                 "expired assets and workdirs deleted"
             );

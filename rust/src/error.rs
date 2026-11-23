@@ -18,10 +18,14 @@ pub enum AppError {
     Upstream(#[from] reqwest::Error),
     #[error("invalid input: {0}")]
     Invalid(String),
+    #[error("payload too large: {0}")]
+    TooLarge(String),
     #[error("resource not found: {0}")]
     NotFound(String),
     #[error("conflict: {0}")]
     Conflict(String),
+    #[error("forbidden: {0}")]
+    Forbidden(String),
     #[error("not authorized")]
     Unauthorized,
     #[error("too many login attempts")]
@@ -38,8 +42,10 @@ impl IntoResponse for AppError {
             }
             Self::Upstream(_) | Self::Unavailable(_) => StatusCode::BAD_GATEWAY,
             Self::Invalid(_) => StatusCode::BAD_REQUEST,
+            Self::TooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
             Self::NotFound(_) => StatusCode::NOT_FOUND,
             Self::Conflict(_) => StatusCode::CONFLICT,
+            Self::Forbidden(_) => StatusCode::FORBIDDEN,
             Self::Unauthorized => StatusCode::UNAUTHORIZED,
             Self::RateLimited => StatusCode::TOO_MANY_REQUESTS,
         };

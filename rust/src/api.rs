@@ -321,7 +321,7 @@ async fn asset_hold(
 async fn storage_stats(State(state): State<AppState>) -> AppResult<Json<Value>> {
     use sqlx::Row;
     let row=sqlx::query(
-        "SELECT count(*) AS objects, COALESCE(sum(size_bytes),0)::bigint AS total_bytes, count(*) FILTER(WHERE state='live') AS live, count(*) FILTER(WHERE state='deleted') AS deleted FROM vr2_objects"
+        "SELECT count(*) AS objects, COALESCE(sum(size_bytes),0)::bigint AS total_bytes, count(*) FILTER(WHERE state='live') AS live, count(*) FILTER(WHERE state='deleted') AS deleted FROM storage_objects"
     ).fetch_one(&state.db.pool).await?;
     Ok(Json(json!({
         "objects":row.get::<i64,_>("objects"),
@@ -368,6 +368,7 @@ pub fn router(state: AppState) -> Router {
         .route("/auth/login", post(admin_login))
         .route("/auth/logout", post(admin_logout))
         .route("/auth/setup", post(admin_setup))
+        .route("/health", get(crate::legacy_contracts::health))
         .merge(legacy_protected);
     Router::new()
         .merge(crate::remote_render::worker_router())

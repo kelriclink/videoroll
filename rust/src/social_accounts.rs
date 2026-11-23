@@ -2,7 +2,7 @@
 //! Rust orchestrator against the separately deployed SAU browser sidecar.
 //! SAU continues owning encrypted storage_state, browser logins, and account
 //! validation; never copy credentials into the control-plane database.
-use crate::{AppError, AppResult, api::AppState};
+use crate::{AppError, AppResult, Config, api::AppState};
 use axum::{
     Json, Router,
     extract::{Multipart, Path, Query, State},
@@ -54,22 +54,20 @@ fn service_token(secret: &str) -> AppResult<String> {
     Ok(format!("v1.{}", hex::encode(hmac.finalize().into_bytes())))
 }
 
-async fn call(
-    state: &AppState,
+pub(crate) async fn call(
+    config: &Config,
     method: Method,
     path: &str,
     query: Option<&[(&str, &str)]>,
     body: Option<Value>,
     multipart: Option<reqwest::multipart::Form>,
 ) -> AppResult<Value> {
-    let base = state
-        .config
+    let base = config
         .social_publisher_url
         .as_deref()
         .ok_or_else(|| AppError::Unavailable("SAU sidecar not configured in V2".into()))?;
     let base = trusted_sidecar(base)?;
-    let secret = state
-        .config
+    let secret = config
         .legacy_internal_secret
         .as_deref()
         .ok_or_else(|| AppError::Unavailable("SAU service secret unavailable".into()))?;
@@ -121,6 +119,13 @@ async fn call(
     Ok(parsed)
 }
 
+/// Check the original SAU sidecar rather than the Rust API readiness.
+async fn health(State(state): State<AppState>) -> AppResult<Json<Value>> {
+    Ok(Json(
+        call(&state.config, Method::GET, "health", None, None, None).await?,
+    ))
+}
+
 #[derive(Debug, Deserialize)]
 struct PlatformFilter {
     platform: Option<String>,
@@ -135,7 +140,7 @@ async fn accounts(
     };
     Ok(Json(
         call(
-            &state,
+            &state.config,
             Method::GET,
             "accounts",
             query.as_deref(),
@@ -167,7 +172,7 @@ async fn login(
     let name = account_name(&body.account_name)?;
     Ok(Json(
         call(
-            &state,
+            &state.config,
             Method::POST,
             &format!("login-sessions/{platform}"),
             None,
@@ -180,7 +185,7 @@ async fn login(
 async fn session(State(state): State<AppState>, Path(id): Path<Uuid>) -> AppResult<Json<Value>> {
     Ok(Json(
         call(
-            &state,
+            &state.config,
             Method::GET,
             &format!("login-sessions/{id}"),
             None,
@@ -196,7 +201,7 @@ async fn cancel_session(
 ) -> AppResult<Json<Value>> {
     Ok(Json(
         call(
-            &state,
+            &state.config,
             Method::DELETE,
             &format!("login-sessions/{id}"),
             None,
@@ -259,7 +264,7 @@ async fn import_account(
         .part("file", part);
     Ok(Json(
         call(
-            &state,
+            &state.config,
             Method::POST,
             &format!("accounts/{platform}"),
             None,
@@ -275,7 +280,7 @@ async fn check_account(
 ) -> AppResult<Json<Value>> {
     Ok(Json(
         call(
-            &state,
+            &state.config,
             Method::POST,
             &format!("accounts/{id}/check"),
             None,
@@ -291,7 +296,7 @@ async fn delete_account(
 ) -> AppResult<Json<Value>> {
     Ok(Json(
         call(
-            &state,
+            &state.config,
             Method::DELETE,
             &format!("accounts/{id}"),
             None,
@@ -304,6 +309,7 @@ async fn delete_account(
 
 pub fn router() -> Router<AppState> {
     Router::new()
+        .route("/settings/publish/social/health", get(health))
         .route("/settings/publish/social/accounts", get(accounts))
         .route(
             "/settings/publish/social/accounts/{handle}",

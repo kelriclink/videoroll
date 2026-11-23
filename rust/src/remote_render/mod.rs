@@ -4,6 +4,7 @@
 mod protocol;
 mod routes;
 mod service;
+pub(crate) use protocol::EnrollRequest;
 
 pub use routes::{admin_router, worker_router};
 pub use service::enqueue;

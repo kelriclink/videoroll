@@ -159,7 +159,7 @@ pub async fn auth_status(headers: &HeaderMap, db: &Database, config: &Config) ->
 pub async fn ensure_login_allowed(db: &Database, source: &str) -> AppResult<()> {
     let key = hex::encode(Sha256::digest(source.as_bytes()));
     let row = sqlx::query(
-        "SELECT failures,blocked_until,window_started FROM vr2_login_limits WHERE source_key=$1",
+        "SELECT failures,blocked_until,window_started FROM auth_login_limits WHERE source_key=$1",
     )
     .bind(&key)
     .fetch_optional(&db.pool)
@@ -175,23 +175,23 @@ pub async fn ensure_login_allowed(db: &Database, source: &str) -> AppResult<()> 
 pub async fn record_login_result(db: &Database, source: &str, success: bool) -> AppResult<()> {
     let key = hex::encode(Sha256::digest(source.as_bytes()));
     if success {
-        sqlx::query("DELETE FROM vr2_login_limits WHERE source_key=$1")
+        sqlx::query("DELETE FROM auth_login_limits WHERE source_key=$1")
             .bind(key)
             .execute(&db.pool)
             .await?;
         return Ok(());
     }
     sqlx::query(
-        r#"INSERT INTO vr2_login_limits(source_key,failures,window_started,blocked_until)
+        r#"INSERT INTO auth_login_limits(source_key,failures,window_started,blocked_until)
            VALUES($1,1,now(),NULL) ON CONFLICT(source_key)
            DO UPDATE SET
-              failures=CASE WHEN vr2_login_limits.window_started<now()-interval '15 minutes'
-                    THEN 1 ELSE vr2_login_limits.failures+1 END,
-              window_started=CASE WHEN vr2_login_limits.window_started<now()-interval '15 minutes'
-                    THEN now() ELSE vr2_login_limits.window_started END,
-              blocked_until=CASE WHEN vr2_login_limits.window_started>=now()-interval '15 minutes'
-                AND vr2_login_limits.failures+1>=$2 THEN now()+interval '10 minutes'
-                ELSE vr2_login_limits.blocked_until END"#,
+              failures=CASE WHEN auth_login_limits.window_started<now()-interval '15 minutes'
+                    THEN 1 ELSE auth_login_limits.failures+1 END,
+              window_started=CASE WHEN auth_login_limits.window_started<now()-interval '15 minutes'
+                    THEN now() ELSE auth_login_limits.window_started END,
+              blocked_until=CASE WHEN auth_login_limits.window_started>=now()-interval '15 minutes'
+                AND auth_login_limits.failures+1>=$2 THEN now()+interval '10 minutes'
+                ELSE auth_login_limits.blocked_until END"#,
     )
     .bind(key)
     .bind(MAX_FAILED_ATTEMPTS)

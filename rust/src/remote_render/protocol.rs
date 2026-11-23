@@ -3,18 +3,35 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
+fn default_one() -> i32 {
+    1
+}
+fn default_spec() -> Vec<i32> {
+    vec![1]
+}
+fn default_object() -> Value {
+    serde_json::json!({})
+}
 #[derive(Debug, Clone, Deserialize)]
 pub struct EnrollRequest {
     pub worker_key: String,
     pub name: String,
     pub platform: String,
+    #[serde(default)]
     pub architecture: Option<String>,
+    #[serde(default)]
     pub version: String,
+    #[serde(default = "default_one")]
     pub protocol_version: i32,
+    #[serde(default = "default_spec")]
     pub render_spec_versions: Vec<i32>,
+    #[serde(default = "default_object")]
     pub capabilities: Value,
+    #[serde(default = "default_object")]
     pub resources: Value,
+    #[serde(default = "default_object")]
     pub labels: Value,
+    #[serde(default = "default_one")]
     pub max_concurrency: i32,
     pub enrollment_token: String,
 }

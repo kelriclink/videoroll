@@ -110,21 +110,36 @@ pub async fn enqueue_locked(
         .filter(|v| (1..=2).contains(v))
         .ok_or_else(|| AppError::Invalid("invalid Bilibili archive parts".into()))?;
     let source:Option<String>=sqlx::query_scalar(
-        "SELECT a.storage_key FROM assets a JOIN vr2_objects o ON o.storage_key=a.storage_key AND o.state='live' WHERE a.task_id=$1 AND a.kind::text='subtitle_srt' AND a.storage_key LIKE 'v2/%' ORDER BY a.created_at DESC,a.id DESC LIMIT 1"
+        "SELECT a.storage_key FROM assets a JOIN storage_objects o ON o.storage_key=a.storage_key AND o.state='live' WHERE a.task_id=$1 AND a.kind::text='subtitle_srt' AND a.storage_key LIKE 'v2/%' ORDER BY a.created_at DESC,a.id DESC LIMIT 1"
     ).bind(item.task_id).fetch_optional(&mut **tx).await?;
     let Some(source) = source else {
         // The source had no credible speech, or no verified SRT was generated.
         return Ok(false);
     };
-    let inserted=sqlx::query(
-        "INSERT INTO vr2_bilibili_subtitle_syncs(publish_job_id,task_id,workflow_id,source_key,aid,bvid,expected_parts) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(publish_job_id) DO NOTHING"
-    ).bind(item.id).bind(item.task_id).bind(item.workflow_id).bind(&source)
-        .bind(aid).bind(bvid).bind(expected_parts as i16)
-        .execute(&mut **tx).await?.rows_affected() == 1;
+    let inserted = sqlx::query(
+        "UPDATE operation_inbox SET
+           bili_sync_source_key=$4,bili_sync_aid=$5,bili_sync_bvid=$6,
+           bili_sync_parts=$7,bili_sync_state='pending',bili_sync_created_at=now(),
+           bili_sync_next_attempt_at=now(),bili_sync_reference_deadline=now()+interval '7 days',
+           updated_at=now()
+           WHERE id=$1 AND task_id=$2 AND workflow_id=$3
+            AND stage='publish' AND runtime_engine='rust-v2' AND bili_sync_state IS NULL",
+    )
+    .bind(item.id)
+    .bind(item.task_id)
+    .bind(item.workflow_id)
+    .bind(&source)
+    .bind(aid)
+    .bind(bvid)
+    .bind(expected_parts as i16)
+    .execute(&mut **tx)
+    .await?
+    .rows_affected()
+        == 1;
     if inserted {
         // Retain only the SRT; regular workflow resource release is unaffected.
         sqlx::query(
-            "INSERT INTO vr2_object_refs(storage_key,owner_type,owner_id,role) VALUES($1,$2,$3,'native_srt') ON CONFLICT DO NOTHING"
+            "INSERT INTO storage_object_refs(storage_key,owner_type,owner_id,role) VALUES($1,$2,$3,'native_srt') ON CONFLICT DO NOTHING"
         ).bind(&source).bind(OWNER).bind(item.id).execute(&mut **tx).await?;
     }
     Ok(inserted)
@@ -134,7 +149,7 @@ pub async fn enqueue_locked(
 /// discovery. It reads only confirmed Rust-native receipts, never v1 jobs.
 pub async fn recover_confirmed(db: &Database, limit: i64) -> AppResult<u64> {
     let rows=sqlx::query(
-        "SELECT j.id,j.workflow_id,j.task_id,j.generation,j.operation_key,j.result FROM vr2_jobs j WHERE j.stage='publish' AND j.state='succeeded' AND j.result->>'native_bilibili'='true' AND NOT EXISTS (SELECT 1 FROM vr2_bilibili_subtitle_syncs s WHERE s.publish_job_id=j.id) AND EXISTS (SELECT 1 FROM assets a JOIN vr2_objects o ON o.storage_key=a.storage_key AND o.state='live' WHERE a.task_id=j.task_id AND a.kind::text='subtitle_srt' AND a.storage_key LIKE 'v2/%') ORDER BY j.finished_at DESC LIMIT $1"
+        "SELECT j.id,j.workflow_id,j.task_id,j.generation,j.operation_key,j.result FROM vr2_jobs j WHERE j.stage='publish' AND j.state='succeeded' AND j.result->>'native_bilibili'='true' AND NOT EXISTS (SELECT 1 FROM vr2_bilibili_subtitle_syncs s WHERE s.publish_job_id=j.id) AND EXISTS (SELECT 1 FROM assets a JOIN storage_objects o ON o.storage_key=a.storage_key AND o.state='live' WHERE a.task_id=j.task_id AND a.kind::text='subtitle_srt' AND a.storage_key LIKE 'v2/%') ORDER BY j.finished_at DESC LIMIT $1"
     ).bind(limit.clamp(1,40)).fetch_all(&db.pool).await?;
     let mut n = 0;
     for row in rows {
@@ -200,10 +215,7 @@ fn endpoint(base: &Url, path: &str) -> AppResult<Url> {
     base.join(path)
         .map_err(|_| AppError::Invalid("invalid Bilibili endpoint".into()))
 }
-fn cookie_client(config: &Config) -> AppResult<Client> {
-    let cookie = config.native_bilibili_cookie.as_deref().ok_or_else(|| {
-        AppError::Unavailable("native Bilibili subtitle sync requires Cookie".into())
-    })?;
+fn cookie_client(cookie: &str) -> AppResult<Client> {
     if cookie.trim().is_empty() || cookie.contains('\n') || cookie.contains('\r') {
         return Err(AppError::Invalid("Bilibili cookie invalid".into()));
     }
@@ -351,7 +363,7 @@ async fn mark_retry(db: &Database, record: &SyncRecord, token: Uuid, error: &str
 }
 async fn release_ref(tx: &mut Transaction<'_, Postgres>, record: &SyncRecord) -> AppResult<()> {
     sqlx::query(
-        "DELETE FROM vr2_object_refs WHERE owner_type=$1 AND owner_id=$2 AND role='native_srt'",
+        "DELETE FROM storage_object_refs WHERE owner_type=$1 AND owner_id=$2 AND role='native_srt'",
     )
     .bind(OWNER)
     .bind(record.publish_job_id)
@@ -382,7 +394,7 @@ pub async fn reconcile_expired(db: &Database) -> AppResult<()> {
     // Prevent permanent multi-GB retention in indefinitely unreviewed states.
     // The database audit row remains intact.
     sqlx::query(
-        "DELETE FROM vr2_object_refs WHERE owner_type=$1 AND role='native_srt' AND owner_id IN (SELECT publish_job_id FROM vr2_bilibili_subtitle_syncs WHERE reference_deadline<now())"
+        "DELETE FROM storage_object_refs WHERE owner_type=$1 AND role='native_srt' AND owner_id IN (SELECT publish_job_id FROM vr2_bilibili_subtitle_syncs WHERE reference_deadline<now())"
     ).bind(OWNER).execute(&db.pool).await?;
     Ok(())
 }
@@ -402,13 +414,7 @@ async fn run_claimed(
     token: Uuid,
 ) -> AppResult<()> {
     let base = api_base(config)?;
-    let csrf = config
-        .native_bilibili_csrf
-        .as_deref()
-        .ok_or_else(|| AppError::Unavailable("Bilibili CSRF is missing".into()))?;
-    if !(12..=80).contains(&csrf.len()) || !csrf.chars().all(|c| c.is_ascii_alphanumeric()) {
-        return Err(AppError::Invalid("Bilibili CSRF invalid".into()));
-    }
+    let (cookie, csrf) = crate::bilibili_account_v1::publication_credentials(db, config).await?;
     let (sha, size) = store.sha256(&record.source_key).await?;
     if size <= 0 || size as u64 > MAX_SUBTITLE_SIZE {
         return Err(AppError::Invalid("SRT source is empty or oversized".into()));
@@ -430,7 +436,7 @@ async fn run_claimed(
     sqlx::query(
         "UPDATE vr2_bilibili_subtitle_syncs SET source_checksum=$1 WHERE publish_job_id=$2 AND lease_token=$3 AND state='running'"
     ).bind(&sha).bind(record.publish_job_id).bind(token).execute(&db.pool).await?;
-    let client = cookie_client(config)?;
+    let client = cookie_client(&cookie)?;
     let page_data = bili_json(
         client
             .get(endpoint(&base, "x/web-interface/view")?)
@@ -445,7 +451,7 @@ async fn run_claimed(
         if record.submitted.get(&token_key).is_some() {
             continue;
         }
-        let location = upload_srt(&client, &base, csrf, raw.clone()).await?;
+        let location = upload_srt(&client, &base, &csrf, raw.clone()).await?;
         // Durable irreversible boundary. Crash/timeout from here is UNKNOWN;
         // the worker must not create a second draft automatically.
         let updated=sqlx::query(
@@ -457,7 +463,7 @@ async fn run_claimed(
                 "subtitle draft lease lost before submission".into(),
             ));
         }
-        if let Err(error) = pre_save(&client, &base, csrf, record.aid, cid, &location).await {
+        if let Err(error) = pre_save(&client, &base, &csrf, record.aid, cid, &location).await {
             mark_unknown(db, record, token, &error.to_string()).await?;
             return Ok(());
         }
@@ -531,7 +537,7 @@ async fn resolve(
         ).bind(id).execute(&mut *tx).await?;
     }
     sqlx::query(
-        "INSERT INTO vr2_events(id,workflow_id,kind,details) SELECT $1,workflow_id,'bilibili.subtitle_reconciled',$2 FROM vr2_bilibili_subtitle_syncs WHERE publish_job_id=$3"
+        "INSERT INTO workflow_events(id,workflow_id,kind,details) SELECT $1,workflow_id,'bilibili.subtitle_reconciled',$2 FROM vr2_bilibili_subtitle_syncs WHERE publish_job_id=$3"
     ).bind(Uuid::new_v4()).bind(json!({"cid":body.cid,
         "submitted":body.submitted,"evidence":evidence})).bind(id)
         .execute(&mut *tx).await?;

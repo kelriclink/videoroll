@@ -2,7 +2,7 @@
 //! Do not claim SAU support just because a toggle can be saved: until the
 //! complete account/session/publish adapter is migrated, social enablement
 //! is rejected explicitly rather than silently selecting a dead backend.
-use crate::{AppError, AppResult, Database, api::AppState};
+use crate::{AppError, AppResult, Config, Database, api::AppState};
 use axum::{
     Json, Router,
     extract::{Path, State},
@@ -29,6 +29,31 @@ fn normalized(raw: &Value) -> Value {
     }
     out
 }
+fn sau_configured(config: &Config) -> bool {
+    config.social_publish_allowed
+        && config.social_publisher_url.is_some()
+        && config
+            .legacy_internal_secret
+            .as_deref()
+            .is_some_and(|v| v.len() >= 16)
+        && config.social_storage_root.is_some()
+}
+pub async fn social_enabled(config: &Config, db: &Database, platform: &str) -> AppResult<bool> {
+    safe_platform(platform)?;
+    if platform == "bilibili" || !sau_configured(config) {
+        return Ok(false);
+    }
+    let value: Option<Value> =
+        sqlx::query_scalar("SELECT value_json FROM app_settings WHERE key=$1")
+            .bind(KEY)
+            .fetch_optional(&db.pool)
+            .await?;
+    Ok(value
+        .as_ref()
+        .and_then(|v| v.get(platform))
+        .and_then(Value::as_bool)
+        == Some(true))
+}
 pub async fn enabled(db: &Database, platform: &str) -> AppResult<bool> {
     safe_platform(platform)?;
     let raw = crate::settings::effective(db, KEY).await?;
@@ -36,6 +61,21 @@ pub async fn enabled(db: &Database, platform: &str) -> AppResult<bool> {
 }
 async fn read(State(state): State<AppState>) -> AppResult<Json<Value>> {
     let v = normalized(&crate::settings::effective(&state.db, KEY).await?);
+    let mut v = v;
+    if sau_configured(&state.config) {
+        let override_setting: Option<Value> =
+            sqlx::query_scalar("SELECT value_json FROM app_settings WHERE key=$1")
+                .bind(KEY)
+                .fetch_optional(&state.db.pool)
+                .await?;
+        if let Some(o) = override_setting {
+            for p in ["douyin", "xiaohongshu", "kuaishou"] {
+                if o[p] == true {
+                    v[p] = json!(true);
+                }
+            }
+        }
+    }
     Ok(Json(json!({"platforms":v})))
 }
 #[derive(Debug, Deserialize)]
@@ -48,19 +88,20 @@ async fn update(
     Json(payload): Json<Update>,
 ) -> AppResult<Json<Value>> {
     let platform = safe_platform(&platform)?;
-    if platform != "bilibili" && payload.enabled {
+    if platform != "bilibili" && payload.enabled && !sau_configured(&state.config) {
         return Err(AppError::Conflict(
-            "social SAU account sessions and actual publication are not native in V2 yet".into(),
+            "SAU publishing requires explicit opt-in, a sidecar, internal secret and shared media root".into(),
         ));
     }
     let mut tx = state.db.pool.begin().await?;
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('vr2.publish.platforms',0))")
         .execute(&mut *tx)
         .await?;
-    let raw: Option<Value> = sqlx::query_scalar("SELECT value_json FROM vr2_settings WHERE key=$1")
+    let raw: Option<Value> = sqlx::query_scalar("SELECT value_json FROM app_settings WHERE key=$1")
         .bind(KEY)
         .fetch_optional(&mut *tx)
         .await?;
+    let from_original = raw.is_some();
     let source = if let Some(v) = raw {
         v
     } else {
@@ -76,10 +117,22 @@ async fn update(
             next[key] = json!(false);
         }
     }
+    // Existing social choices may be persisted only when all SAU
+    // safety preconditions have been configured on this deployment.
+    if from_original
+        && sau_configured(&state.config)
+        && let Some(existing) = source.as_object()
+    {
+        for p in ["douyin", "xiaohongshu", "kuaishou"] {
+            if existing.get(p).and_then(Value::as_bool) == Some(true) {
+                next[p] = json!(true);
+            }
+        }
+    }
     next[platform] = json!(payload.enabled);
     sqlx::query(
-        "INSERT INTO vr2_settings(key,value_json,version) VALUES($1,$2,1)
-         ON CONFLICT(key) DO UPDATE SET value_json=$2,version=vr2_settings.version+1,updated_at=now()"
+        "INSERT INTO app_settings(key,value_json,version) VALUES($1,$2,1)
+         ON CONFLICT(key) DO UPDATE SET value_json=$2,version=app_settings.version+1,updated_at=now()"
     ).bind(KEY).bind(&next).execute(&mut *tx).await?;
     tx.commit().await?;
     Ok(Json(json!({"platforms":next})))

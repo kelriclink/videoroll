@@ -89,17 +89,17 @@ async fn upload(
         let digest=hex::encode(sha.finalize());
         let mut tx=state.db.pool.begin().await?;
         let status:Option<String>=sqlx::query_scalar(
-            "SELECT status::text FROM tasks WHERE id=$1 FOR UPDATE"
+            "SELECT upper(status::text) FROM tasks WHERE id=$1 FOR UPDATE"
         ).bind(task_id).fetch_optional(&mut *tx).await?;
         if status.as_deref()==Some("CANCELED") {
             return Err(AppError::Conflict("task was canceled while uploading an artifact".into()));
         }
         if status.is_none(){return Err(AppError::NotFound("task not found".into()));}
         sqlx::query(
-            "INSERT INTO vr2_objects(storage_key,checksum_sha256,size_bytes,state,retain_until) VALUES($1,$2,$3,'live',now()+interval '2 days')"
+            "INSERT INTO storage_objects(storage_key,checksum_sha256,size_bytes,state,retain_until) VALUES($1,$2,$3,'live',now()+interval '2 days')"
         ).bind(&key).bind(&digest).bind(bytes as i64).execute(&mut *tx).await?;
         sqlx::query(
-            "INSERT INTO vr2_object_refs(storage_key,owner_type,owner_id,role) VALUES($1,'task',$2,$3)"
+            "INSERT INTO storage_object_refs(storage_key,owner_type,owner_id,role) VALUES($1,'task',$2,$3)"
         ).bind(&key).bind(task_id).bind(&p.kind).execute(&mut *tx).await?;
         sqlx::query(
             "INSERT INTO assets(id,task_id,kind,storage_key,sha256,size_bytes) VALUES($1,$2,$3::asset_kind,$4,$5,$6)"
@@ -128,11 +128,12 @@ pub(crate) async fn upload_video_form(
     Path(task_id): Path<Uuid>,
     mut multipart: axum::extract::Multipart,
 ) -> AppResult<(StatusCode, Json<AssetInfo>)> {
-    let ownership: bool =
-        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM vr2_managed_tasks WHERE task_id=$1)")
-            .bind(task_id)
-            .fetch_one(&state.db.pool)
-            .await?;
+    let ownership: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM tasks WHERE id=$1 AND runtime_owner='rust')",
+    )
+    .bind(task_id)
+    .fetch_one(&state.db.pool)
+    .await?;
     if !ownership {
         return Err(AppError::NotFound("V2 manual-upload task not found".into()));
     }
@@ -214,7 +215,7 @@ pub(crate) async fn upload_video_form(
         let sha = hex::encode(sha.finalize());
         let mut tx = state.db.pool.begin().await?;
         let task = sqlx::query(
-            "SELECT source_type::text AS source_type,status::text AS status
+            "SELECT source_type::text AS source_type,upper(status::text) AS status
              FROM tasks WHERE id=$1 FOR UPDATE",
         )
         .bind(task_id)
@@ -229,7 +230,7 @@ pub(crate) async fn upload_video_form(
             ));
         }
         sqlx::query(
-            "INSERT INTO vr2_objects(storage_key,checksum_sha256,size_bytes,state,retain_until)
+            "INSERT INTO storage_objects(storage_key,checksum_sha256,size_bytes,state,retain_until)
              VALUES($1,$2,$3,'live',now()+interval '2 days')",
         )
         .bind(&key)
@@ -238,7 +239,7 @@ pub(crate) async fn upload_video_form(
         .execute(&mut *tx)
         .await?;
         sqlx::query(
-            "INSERT INTO vr2_object_refs(storage_key,owner_type,owner_id,role)
+            "INSERT INTO storage_object_refs(storage_key,owner_type,owner_id,role)
              VALUES($1,'task',$2,'video_raw')",
         )
         .bind(&key)
@@ -257,8 +258,8 @@ pub(crate) async fn upload_video_form(
         .execute(&mut *tx)
         .await?;
         sqlx::query(
-            "UPDATE tasks SET status='INGESTED'::task_status,updated_at=now()
-             WHERE id=$1 AND status='CREATED'::task_status",
+            "UPDATE tasks SET status='ingested'::task_status,updated_at=now()
+             WHERE id=$1 AND status='created'::task_status",
         )
         .bind(task_id)
         .execute(&mut *tx)
@@ -361,6 +362,7 @@ pub(crate) async fn download(
         "ass" => "text/plain; charset=utf-8",
         "json" => "application/json",
         "png" => "image/png",
+        "webp" => "image/webp",
         "jpg" | "jpeg" => "image/jpeg",
         _ => "application/octet-stream",
     };

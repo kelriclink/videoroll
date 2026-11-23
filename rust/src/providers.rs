@@ -52,7 +52,7 @@ fn endpoint(value: &str) -> AppResult<Url> {
     }
     Ok(parsed)
 }
-fn decode_secret(encoded: &str) -> AppResult<Option<String>> {
+pub(crate) fn decode_secret(encoded: &str) -> AppResult<Option<String>> {
     if encoded.trim().is_empty() {
         return Ok(None);
     }
@@ -143,33 +143,74 @@ pub async fn resolve(
 ) -> AppResult<TranslationProvider> {
     let provider = provider_id.trim();
     if provider == "legacy" {
-        let base = config.translate_endpoint.as_deref().ok_or_else(|| {
-            AppError::Unavailable(
-                "legacy translation endpoint missing; configure V2_TRANSLATE_ENDPOINT".into(),
-            )
-        })?;
-        let model = config.translate_model.as_deref().ok_or_else(|| {
-            AppError::Unavailable(
-                "legacy translation model missing; configure V2_TRANSLATE_MODEL".into(),
-            )
-        })?;
+        // The native control page writes original subtitle.translate.openai.
+        // Resolve it at job execution time, otherwise a successful settings
+        // update would leave V2 translating with stale startup env values.
+        let saved = crate::settings::effective(db, "subtitle.translate").await?;
+        let open = saved
+            .get("openai")
+            .filter(|v| v.is_object())
+            .unwrap_or(&Value::Null);
+        let stored_base = open
+            .get("base_url")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty());
+        let stored_model = open
+            .get("model")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty());
+        let base = stored_base.or(config.translate_endpoint.as_deref())
+            .ok_or_else(|| AppError::Unavailable(
+                "legacy translation endpoint missing; configure subtitle.translate or V2_TRANSLATE_ENDPOINT".into()
+            ))?;
+        let model = stored_model.or(config.translate_model.as_deref())
+            .ok_or_else(|| AppError::Unavailable(
+                "legacy translation model missing; configure subtitle.translate or V2_TRANSLATE_MODEL".into()
+            ))?;
         if !model_id.is_empty() && model_id != model {
             return Err(AppError::Conflict(
                 "legacy translation model differs from selected model".into(),
             ));
         }
+        let api_type = open
+            .get("api_type")
+            .and_then(Value::as_str)
+            .unwrap_or("openai");
+        if !matches!(api_type, "openai" | "cerebras") {
+            return Err(AppError::Invalid(
+                "unsupported saved translation API type".into(),
+            ));
+        }
+        let key = match open.get("api_key_enc").and_then(Value::as_str) {
+            Some(encoded) if !encoded.is_empty() => decode_secret(encoded)?,
+            _ => config.translate_api_key.clone(),
+        };
         return Ok(TranslationProvider {
             id: "legacy".into(),
             endpoint: endpoint(base)?,
             model: model.into(),
-            api_type: "openai".into(),
-            api_key: config.translate_api_key.clone(),
-            temperature: 0.2,
+            api_type: api_type.into(),
+            api_key: key,
+            temperature: open
+                .get("temperature")
+                .and_then(Value::as_f64)
+                .unwrap_or(0.2),
             max_output_tokens: None,
             context_window: None,
-            enable_thinking: false,
-            timeout_seconds: 180,
-            max_retries: 3,
+            enable_thinking: open
+                .get("enable_thinking")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            timeout_seconds: open
+                .get("timeout_seconds")
+                .and_then(Value::as_u64)
+                .unwrap_or(180)
+                .clamp(5, 1200),
+            max_retries: open
+                .get("max_retries")
+                .and_then(Value::as_u64)
+                .unwrap_or(3)
+                .clamp(1, 10) as u32,
         });
     }
     if provider == "index_translate" {

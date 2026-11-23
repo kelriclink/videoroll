@@ -119,25 +119,22 @@ async fn event_batch(state: &AppState, cursor: Cursor) -> AppResult<Vec<sqlx::po
     // committed at the same time. New sessions start with a short look-back.
     let rows = sqlx::query(
         "SELECT e.id AS event_id,e.job_id,e.kind,e.details,e.created_at,e.workflow_id,w.task_id,
-                jsonb_build_object('id',t.id,'status',t.status::text,'source_type',t.source_type::text,
+                jsonb_build_object('id',t.id,'status',upper(t.status::text),'source_type',t.source_type::text,
                 'source_url',t.source_url,'source_license',t.source_license::text,
-                'source_proof_url',t.source_proof_url,'stopped_status',t.stopped_status::text,
+                'source_proof_url',t.source_proof_url,'stopped_status',upper(t.stopped_status::text),
                 'created_by',t.created_by,'retry_count',t.retry_count,'bilibili_upload',NULL,
                 'priority',t.priority,
                 'display_title',COALESCE(
                   NULLIF(trim(title.value_json->>'translated_title'),''),
-                  NULLIF(trim(title.value_json->>'source_title'),''),
-                  NULLIF(trim(vtitle.translated_title),''),
-                  NULLIF(trim(vtitle.source_title),'')
+                  NULLIF(trim(title.value_json->>'source_title'),'')
                 ),
                 'error_code',t.error_code,'error_message',t.error_message,
                 'created_at',t.created_at,'updated_at',t.updated_at) AS task_data
-         FROM vr2_events e
+         FROM workflow_events e
          JOIN vr2_workflows w ON w.id=e.workflow_id
-         JOIN vr2_managed_tasks m ON m.task_id=w.task_id
+         JOIN tasks m ON m.id=w.task_id AND m.runtime_owner='rust'
          JOIN tasks t ON t.id=w.task_id
          LEFT JOIN app_settings title ON title.key=('task.title.'||t.id::text)
-         LEFT JOIN vr2_task_titles vtitle ON vtitle.task_id=t.id
          WHERE (e.created_at,e.id)>($1,$2)
          ORDER BY e.created_at,e.id LIMIT $3",
     )

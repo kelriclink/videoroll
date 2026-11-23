@@ -133,11 +133,17 @@ impl Executor {
                 .await?;
                 Ok(StageOutcome::Completed { result })
             }
-            Stage::Subtitle if self.config.asr_endpoint.is_some() => {
-                let result =
-                    crate::media::asr::process(&self.config, &self.db, &self.registry, item)
-                        .await?;
-                Ok(StageOutcome::Completed { result })
+            Stage::Subtitle => {
+                if let Some(runtime) =
+                    crate::media::asr::runtime_asr_config(&self.config, &self.db).await?
+                {
+                    let result =
+                        crate::media::asr::process(&runtime, &self.db, &self.registry, item)
+                            .await?;
+                    Ok(StageOutcome::Completed { result })
+                } else {
+                    self.remote(item).await
+                }
             }
             Stage::Render if self.config.remote_renderer_enabled => {
                 let id = crate::remote_render::enqueue(&self.db, &self.registry, item).await?;
@@ -200,20 +206,27 @@ impl Executor {
                     .as_ref()
                     .is_some_and(crate::publish::has_confirmed_result)
                 {
-                    let count = self
-                        .registry
-                        .schedule_terminal_release(
-                            item.task_id,
-                            item.workflow_id,
-                            self.config.cleanup_grace,
-                        )
-                        .await?;
-                    Ok(StageOutcome::Completed {
-                        result: json!({
-                            "retention":"scheduled","released_references":count,
-                            "grace_seconds":self.config.cleanup_grace.as_secs()
-                        }),
-                    })
+                    // Python's published asset TTL defaults to 0 (disabled).
+                    // The V2 task must NOT auto-delete a successfully posted
+                    // video when the owner has not opted into retention.
+                    if let Some(retention) =
+                        crate::operations_v1::published_retention(&self.db).await?
+                    {
+                        let count = self
+                            .registry
+                            .schedule_terminal_release(item.task_id, item.workflow_id, retention)
+                            .await?;
+                        Ok(StageOutcome::Completed {
+                            result: json!({
+                                "retention":"scheduled","released_references":count,
+                                "grace_seconds":retention.as_secs()
+                            }),
+                        })
+                    } else {
+                        Ok(StageOutcome::Skipped {
+                            reason: "published asset retention disabled (asset_ttl_days=0)".into(),
+                        })
+                    }
                 } else {
                     Ok(StageOutcome::Skipped {
                         reason:

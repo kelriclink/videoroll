@@ -4,7 +4,9 @@ export CARGO_INCREMENTAL=0
 cd "$(dirname "$0")/../.."
 repo_root="$PWD"
 python3 "$repo_root/rust/scripts/audit_contract_matrix.py" --check
-if [[ -x "$repo_root/.toolchains/cargo/bin/cargo" ]]; then
+if [[ -n "${CARGO_HOME:-}" && -x "$CARGO_HOME/bin/cargo" ]]; then
+  : # Honor an explicitly supplied isolated Rust toolchain.
+elif [[ -x "$repo_root/.toolchains/cargo/bin/cargo" ]]; then
   export RUSTUP_HOME="$repo_root/.toolchains/rustup"
   export CARGO_HOME="$repo_root/.toolchains/cargo"
 else
@@ -18,7 +20,15 @@ gateway_pid=""
 ai_pid=""
 bili_pid=""
 sau_pid=""
+model_catalog_pid=""
+model_proxy_pid=""
+hf_hub_pid=""
+asr_provider_pid=""
 cleanup() {
+  if [[ -n "$model_catalog_pid" ]]; then kill "$model_catalog_pid" 2>/dev/null || true; wait "$model_catalog_pid" 2>/dev/null || true; fi
+  if [[ -n "$model_proxy_pid" ]]; then kill "$model_proxy_pid" 2>/dev/null || true; wait "$model_proxy_pid" 2>/dev/null || true; fi
+  if [[ -n "$hf_hub_pid" ]]; then kill "$hf_hub_pid" 2>/dev/null || true; wait "$hf_hub_pid" 2>/dev/null || true; fi
+  if [[ -n "$asr_provider_pid" ]]; then kill "$asr_provider_pid" 2>/dev/null || true; wait "$asr_provider_pid" 2>/dev/null || true; fi
   if [[ -n "$sau_pid" ]]; then kill "$sau_pid" 2>/dev/null || true; wait "$sau_pid" 2>/dev/null || true; fi
   if [[ -n "$worker_pid" ]]; then kill "$worker_pid" 2>/dev/null || true; wait "$worker_pid" 2>/dev/null || true; fi
   if [[ -n "$legacy_pid" ]]; then kill "$legacy_pid" 2>/dev/null || true; wait "$legacy_pid" 2>/dev/null || true; fi
@@ -27,22 +37,96 @@ cleanup() {
   if [[ -n "$gateway_pid" ]]; then kill "$gateway_pid" 2>/dev/null || true; wait "$gateway_pid" 2>/dev/null || true; fi
   if [[ -n "$api_pid" ]]; then kill "$api_pid" 2>/dev/null || true; wait "$api_pid" 2>/dev/null || true; fi
   docker rm -f "$container_name" >/dev/null 2>&1 || true
+  if [[ -n "${SUBTITLE_WHISPER_MODEL_DIR:-}" && "$SUBTITLE_WHISPER_MODEL_DIR" == "$repo_root/rust/target/v2-smoke-whisper-models" ]]; then
+    rm -rf -- "$SUBTITLE_WHISPER_MODEL_DIR"
+  fi
+  rm -rf -- "$repo_root/rust/target/v2-smoke-embedding-models" "$repo_root/rust/target/embedding-symlink-target"
+  rm -rf -- "$repo_root/rust/target/v2-smoke-dictionaries"
+  rm -rf -- "$repo_root/rust/target/v2-smoke-dictionary-fixtures"
 }
 trap cleanup EXIT
-if ss -lnt '( sport = :35432 )' | grep -q ':35432'; then echo 'test port 35432 occupied' >&2;exit 1;fi
-docker run -d --rm --name "$container_name" --memory=512m   --publish 127.0.0.1:35432:5432   --env POSTGRES_PASSWORD=videoroll-test-20261121   --env POSTGRES_DB=videoroll_test pgvector/pgvector:pg18 >/dev/null
-for i in $(seq 1 45); do
-  if docker exec "$container_name" pg_isready -U postgres -d videoroll_test >/dev/null 2>&1; then break; fi
+smoke_db_port="${VIDEOROLL_V2_TEST_DB_PORT:-35432}"
+if ! [[ "$smoke_db_port" =~ ^[0-9]{4,5}$ ]] || (( smoke_db_port < 1024 || smoke_db_port > 65535 )); then echo 'invalid test DB port' >&2; exit 1; fi
+if ss -lnt "( sport = :$smoke_db_port )" | grep -q ":$smoke_db_port"; then echo "test port $smoke_db_port occupied" >&2;exit 1;fi
+docker run -d --rm --name "$container_name" --memory=512m   --publish "127.0.0.1:${smoke_db_port}:5432"   --env POSTGRES_PASSWORD=videoroll-test-20261121   --env POSTGRES_DB=videoroll_test pgvector/pgvector:pg18 >/dev/null
+for i in $(seq 1 60); do
+  # The pg18 entrypoint starts, then stops, a transient initdb server.
+  # Waiting only on pg_isready races against that intentional shutdown.
+  if docker logs "$container_name" 2>&1 | grep -q 'PostgreSQL init process complete; ready for start up' &&
+     docker exec "$container_name" pg_isready -U postgres -d videoroll_test >/dev/null 2>&1; then break; fi
   sleep 1
 done
+if ! docker exec "$container_name" psql -At -U postgres -d videoroll_test -c 'SELECT 1' 2>/dev/null | grep -qx 1; then
+  docker logs "$container_name" 2>&1 | tail -35 >&2
+  echo 'ephemeral PostgreSQL did not reach steady-state readiness' >&2
+  exit 1
+fi
 docker exec -i "$container_name" psql -v ON_ERROR_STOP=1 -U postgres -d videoroll_test   < rust/tests/bootstrap_legacy_for_integration.sql >/dev/null
-export DATABASE_URL="postgresql://postgres:videoroll-test-20261121@127.0.0.1:35432/videoroll_test"
+export DATABASE_URL="postgresql://postgres:videoroll-test-20261121@127.0.0.1:${smoke_db_port}/videoroll_test"
+if [[ "${VIDEOROLL_V2_TEST_SCHEMA_EMPTY_ONLY:-false}" == "true" ]]; then
+  /opt/videoroll/venvs/core/bin/python "$repo_root/rust/tests/schema_unify_empty_v2.py"
+  echo 'PASS: empty Rust V2 schema fully unified into original business tables'
+  exit 0
+fi
+
+# Backfill the distinct coordinator SAU dispatch intent into the original
+# operation inbox without duplicating the external receipt publish_jobs row.
+if [[ "${VIDEOROLL_V2_TEST_SAU_BACKFILL_ONLY:-false}" == "true" ]]; then
+  PYTHONPATH="$repo_root/src" /opt/videoroll/venvs/core/bin/python \
+    "$repo_root/rust/tests/schema_backfill_sau_intents.py"
+  echo 'PASS: original publish_jobs unchanged and SAU dispatch intents stored in operation_inbox'
+  exit 0
+fi
+
+# Durable preexisting native YouDub/P2 side effects, with unknown receipts,
+# migrated into original Stage operation records without touching P1.
+if [[ "${VIDEOROLL_V2_TEST_DUBBING_P2_BACKFILL_ONLY:-false}" == "true" ]]; then
+  PYTHONPATH="$repo_root/src" /opt/videoroll/venvs/core/bin/python \
+    "$repo_root/rust/tests/schema_backfill_dubbing_p2.py"
+  echo 'PASS: original dubbing and Bilibili P1 preserved, native P2 evidence backfilled'
+  exit 0
+fi
+
+# Test migration of already-enrolled Python and Rust remote workers, queued
+# and running executions, leases and foreign keys on this disposable DB.
+if [[ "${VIDEOROLL_V2_TEST_RENDER_BACKFILL_ONLY:-false}" == "true" ]]; then
+  PYTHONPATH="$repo_root/src" /opt/videoroll/venvs/core/bin/python \
+    "$repo_root/rust/tests/schema_backfill_render_workers.py"
+  echo 'PASS: old original/native worker and execution records migrate without loss'
+  exit 0
+fi
+
+# Directly test migration of preexisting durable Rust workflow/job rows, not
+# only new empty databases. All migrations are applied to this throwaway DB.
+if [[ "${VIDEOROLL_V2_TEST_BACKFILL_ONLY:-false}" == "true" ]]; then
+  PYTHONPATH="$repo_root/src" /opt/videoroll/venvs/core/bin/python \
+    "$repo_root/rust/tests/schema_backfill_preexisting_v2.py"
+  echo 'PASS: old Rust durable workflow/job rows backfilled without changing Python histories'
+  exit 0
+fi
+
 export VIDEOROLL_V2_BIND="127.0.0.1:18080"
 export VIDEOROLL_V2_STORAGE_ROOT="$repo_root/rust/target/v2-smoke-objects"
 export VIDEOROLL_V2_INTERNAL_TOKEN="v2-local-test-only-0123456789abcdef"
 export INTERNAL_API_SECRET="rust-local-test-internal-secret"
 export ADMIN_BOOTSTRAP_SECRET="rust-local-test-bootstrap"
 export VIDEOROLL_V2_SECURE_COOKIES="false"
+export VIDEOROLL_V2_ALLOW_V1_RENDER_CONTROL="true"
+export VIDEOROLL_V2_ALLOW_V1_PROVIDER_WRITES="true"
+export VIDEOROLL_V2_ALLOW_V1_SUBTITLE_SETTINGS_WRITES="true"
+export SUBTITLE_WHISPER_MODEL_DIR="$repo_root/rust/target/v2-smoke-whisper-models"
+export SUBTITLE_DICTIONARY_DATA_DIR="$repo_root/rust/target/v2-smoke-dictionaries"
+export VIDEOROLL_V2_TEST_HF_BASE="http://127.0.0.1:18090"
+export VIDEOROLL_V2_ALLOW_TEST_HF_LOOPBACK="true"
+export VIDEOROLL_V2_ALLOW_TEST_ASR_LOOPBACK="true"
+export VIDEOROLL_V2_TEST_GROQ_BASE="http://127.0.0.1:18091/groq/v1"
+export VIDEOROLL_V2_TEST_CLOUDFLARE_BASE="http://127.0.0.1:18091"
+# Never consume a production embedding key during isolated promotion.
+export SUBTITLE_RAG_EMBEDDING_API_KEY=""
+mkdir -p "$SUBTITLE_WHISPER_MODEL_DIR"
+export VIDEOROLL_V2_ALLOW_TEST_MODEL_CATALOG_LOOPBACK="true"
+export VIDEOROLL_V2_ALLOW_TEST_BILIBILI_LOOPBACK="true"
+export VIDEOROLL_V2_TEST_BILIBILI_BASE="http://127.0.0.1:18096/"
 export VIDEOROLL_V2_YT_DLP="$repo_root/rust/tests/mock_source_feed.sh"
 export VIDEOROLL_V2_MOCK_YT_LOG="$repo_root/rust/target/v2-mock-ytdlp-args.log"
 : > "$VIDEOROLL_V2_MOCK_YT_LOG"
@@ -61,6 +145,18 @@ python3 "$repo_root/rust/tests/mock_bilibili_subtitles.py" > "$repo_root/rust/ta
 bili_pid=$!
 python3 "$repo_root/rust/tests/mock_social_sau.py" > "$repo_root/rust/target/v2-mock-sau.log" 2>&1 &
 sau_pid=$!
+python3 "$repo_root/rust/tests/mock_model_catalog.py" > "$repo_root/rust/target/v2-mock-model-catalog.log" 2>&1 &
+model_catalog_pid=$!
+python3 "$repo_root/rust/tests/mock_model_proxy.py" > "$repo_root/rust/target/v2-mock-model-proxy.log" 2>&1 &
+model_proxy_pid=$!
+python3 "$repo_root/rust/tests/mock_hf_hub.py" > "$repo_root/rust/target/v2-mock-hf-hub.log" 2>&1 &
+hf_hub_pid=$!
+python3 "$repo_root/rust/tests/mock_asr_provider.py" > "$repo_root/rust/target/v2-mock-asr-provider.log" 2>&1 &
+asr_provider_pid=$!
+for i in $(seq 1 25); do
+  if curl -fsS -x http://127.0.0.1:18089 http://huggingface.co/robots.txt >/dev/null 2>&1; then break; fi
+  sleep 0.2
+done
 cd rust
 "$CARGO_HOME/bin/cargo" build --quiet
 ./target/debug/videoroll-v2 migrate
@@ -74,6 +170,117 @@ curl --silent --fail http://127.0.0.1:18080/ready >/dev/null
 status="$(curl --silent -o /dev/null -w '%{http_code}' http://127.0.0.1:18080/api/v2/tasks)"
 test "$status" = 401
 hdr=(-H "x-videoroll-v2-internal-token: $VIDEOROLL_V2_INTERNAL_TOKEN" -H 'content-type: application/json')
+# Native old-UI endpoints: YouDub live status, configured Skill registry,
+# and strictly local legacy RenderWorker bootstrap (disposable DB only).
+if [[ "${VIDEOROLL_V2_TEST_LEGACY_GAPS_ONLY:-false}" == "true" ]]; then
+  PYTHONPATH="$repo_root/src" /opt/videoroll/venvs/core/bin/python \
+    "$repo_root/rust/tests/legacy_gap_youdub_skills_local_enroll.py"
+  PYTHONPATH="$repo_root/src" /opt/videoroll/venvs/core/bin/python \
+    "$repo_root/rust/tests/legacy_gap_delete_final_asset.py"
+  echo 'PASS: original YouDub, Skills, private worker bootstrap and deferred original final-asset deletion'
+  exit 0
+fi
+
+if [[ "${VIDEOROLL_V2_TEST_MISSING_ACTIONS_ONLY:-false}" == "true" ]]; then
+  PYTHONPATH="$repo_root/src" /opt/videoroll/venvs/core/bin/python \
+    "$repo_root/rust/tests/legacy_missing_actions_v1_isolated.py"
+  exit 0
+fi
+if [[ "${VIDEOROLL_V2_TEST_PLAYOUT_ACTION_ONLY:-false}" == "true" ]]; then
+  PYTHONPATH="$repo_root/src" /opt/videoroll/venvs/core/bin/python \
+    "$repo_root/rust/tests/legacy_playout_action_v1_isolated.py"
+  exit 0
+fi
+if [[ "${VIDEOROLL_V2_TEST_BILIBILI_ACCOUNT_ONLY:-false}" == "true" ]]; then
+  PYTHONPATH="$repo_root/src" /opt/videoroll/venvs/core/bin/python \
+    "$repo_root/rust/tests/bilibili_account_v1_isolated.py"
+  exit 0
+fi
+if [[ "${VIDEOROLL_V2_TEST_BILIBILI_SETTINGS_ONLY:-false}" == "true" ]]; then
+  PYTHONPATH="$repo_root/src" /opt/videoroll/venvs/core/bin/python \
+    "$repo_root/rust/tests/bilibili_settings_v1_isolated.py"
+  exit 0
+fi
+if [[ "${VIDEOROLL_V2_TEST_REMOTE_SETTINGS_ONLY:-false}" == "true" ]]; then
+  PYTHONPATH="$repo_root/src" /opt/videoroll/venvs/core/bin/python \
+    "$repo_root/rust/tests/remote_api_settings_v1_isolated.py"
+  exit 0
+fi
+if [[ "${VIDEOROLL_V2_TEST_SUBTITLE_REMAINING_ONLY:-false}" == "true" ]]; then
+  /opt/videoroll/venvs/core/bin/python "$repo_root/rust/tests/subtitle_remaining_v1_focused.py"
+  echo 'PASS: remaining native subtitle-service V1 read/diagnostic adapters'
+  exit 0
+fi
+
+# Focused exact native RAG payload to expose HTTP/DB errors during schema unification.
+if [[ "${VIDEOROLL_V2_TEST_NATIVE_RAG_ONLY:-false}" == "true" ]]; then
+  curl -sS -i "${hdr[@]}" -d '{"collection":"translation","scope":"global","kind":"term","title":"Rust ASR glossary","content":"Hello from a Rust integration test. The phrase Rust integration test remains consistent.","keywords":["Rust","integration","subtitle"],"language":"en","confidence":1.0}' http://127.0.0.1:18080/api/v2/rag/knowledge
+  echo
+  docker exec "$container_name" psql -At -U postgres -d videoroll_test -c "SELECT created_by,id,confidence,native_scope,native_collection FROM translation_knowledge_items LIMIT 5"
+  echo 'RAG SEARCH HTTP:'
+  curl -sS -i "${hdr[@]}" -d '{"collection":"translation","query":"Hello from a Rust integration test","limit":8}' http://127.0.0.1:18080/api/v2/rag/search
+  echo
+  echo 'RAG SETTINGS HTTP:'
+  curl -sS -i "${hdr[@]}" -X PUT -d '{"expected_version":0,"value":{"enabled":true,"collection":"translation","max_items":8,"max_context_chars":2000,"use_embedding":false,"research_enabled":true,"research_blocking":true,"research_provider_id":"rag-test-provider","research_model_id":"rag-test-model","max_research_steps":4}}' http://127.0.0.1:18080/api/v2/settings/rag
+  echo
+  exit 0
+fi
+
+if [[ "${VIDEOROLL_V2_TEST_DIFF_ONLY:-false}" == "true" ]]; then
+  PYTHONPATH="$repo_root/src" /opt/videoroll/venvs/core/bin/python \
+     "$repo_root/rust/tests/python_rust_subtitle_render_diff.py"
+  echo 'PASS: focused original Python/Rust differential'
+  exit 0
+fi
+
+# Fast isolated Knowledge API differential: no expensive video/worker suite.
+# Useful for local repair iterations without stressing production memory.
+if [[ "${VIDEOROLL_V2_TEST_KNOWLEDGE_ONLY:-false}" == "true" ]]; then
+  PYTHONPATH="$repo_root/src" /opt/videoroll/venvs/core/bin/python \
+     "$repo_root/rust/tests/dictionary_promote_v1_focused_diff.py"
+  PYTHONPATH="$repo_root/src" /opt/videoroll/venvs/core/bin/python \
+     "$repo_root/rust/tests/knowledge_write_v1_focused_diff.py"
+  echo 'PASS: isolated native knowledge write/rebuild differential'
+  exit 0
+fi
+
+# Focused reliability differential: genuine PNG/JPEG/WebP uploads, durable
+# original publish batch receipts, and removed YouDub operations.
+if [[ "${VIDEOROLL_V2_TEST_RELIABILITY_ONLY:-false}" == "true" ]]; then
+  PYTHONPATH="$repo_root/src" /opt/videoroll/venvs/core/bin/python \
+    "$repo_root/rust/tests/task_reliability_v1_focused_diff.py"
+  echo 'PASS: isolated publish batch and cover differential'
+  exit 0
+fi
+
+# Unified RenderWorker registry: both original vrw_/vre_ credentials and native
+# 64-hex wire requests authenticate and persist in original Python tables.
+if [[ "${VIDEOROLL_V2_TEST_WORKER_AUTH_ONLY:-false}" == "true" ]]; then
+  PYTHONPATH="$repo_root/src" /opt/videoroll/venvs/core/bin/python \
+    "$repo_root/rust/tests/unified_worker_auth_isolated.py"
+  echo 'PASS: original/native worker HTTP identity and single-use enrollment'
+  exit 0
+fi
+
+# Canonical Python original tables (no vr2_settings/vr2_alerts).
+if [[ "${VIDEOROLL_V2_TEST_CANONICAL_ONLY:-false}" == "true" ]]; then
+  PYTHONPATH="$repo_root/src" /opt/videoroll/venvs/core/bin/python \
+    "$repo_root/rust/tests/canonical_tables_v1_focused.py"
+  echo 'PASS: original Python settings/alert tables are the single source of truth'
+  exit 0
+fi
+
+# Verify real concurrent Rust worker claims against the same downloaded
+# concurrency setting used by Python. The test owns no live production data.
+VIDEOROLL_V2_TEST_QUEUE_CLAIM=1 CARGO_BUILD_JOBS=1   nice -n 10 ionice -c3 "$CARGO_HOME/bin/cargo" test --locked -j1   --test queue_claim_limits -- --nocapture
+echo 'PASS: Rust worker claim cap is enforced by PostgreSQL lease admission'
+
+# Price the mock OpenAI-compatible RAG/review requests before their execution.
+# This is the disposable DB only and never touches production model secrets.
+curl --silent --fail-with-body "${hdr[@]}" -X PUT \
+  -d '{"models":{"127.0.0.1:rag-test-model":{"input_per_million_usd":1,"output_per_million_usd":2}}}' \
+  http://127.0.0.1:18080/api/v1/operations/ai-usage/pricing >/dev/null
+
 first="$(curl --silent --fail-with-body "${hdr[@]}" -d '{"url":"https://youtu.be/0123456789A","source_license":"authorized"}' http://127.0.0.1:18080/api/v2/auto/youtube)"
 second="$(curl --silent --fail-with-body "${hdr[@]}" -d '{"url":"https://www.youtube.com/watch?v=0123456789A","source_license":"authorized"}' http://127.0.0.1:18080/api/v2/auto/youtube)"
 FIRST="$first" SECOND="$second" python3 - <<'PY'
@@ -103,8 +310,26 @@ curl --silent --fail-with-body -c "$jar" -H 'content-type: application/json' \
 curl --silent --fail-with-body -b "$jar" \
   http://127.0.0.1:18080/api/v2/tasks | grep -q '0123456789A'
 echo 'PASS: native admin setup/login and browser cookie compatibility'
+if [[ "${VIDEOROLL_V2_TEST_WS_PROBE_ONLY:-false}" == "true" ]]; then
+  PYTHONPATH="$repo_root/src" python3 "$repo_root/rust/tests/contract_parity_64.py" \
+    --ws-only --task-id '00000000-0000-0000-0000-000000000011' \
+    --alert-id '00000000-0000-0000-0000-000000000011' \
+    --out "$repo_root/rust/target/v2-test-ws-contract.json"
+  exit 0
+fi
+
 
 # SAFETY: all endpoints below target a disposable SAU mock on 127.0.0.1:18085.
+sau_upstream_health="$(curl --silent --fail-with-body "${hdr[@]}" \
+ 'http://127.0.0.1:18080/api/v1/settings/publish/social/health')"
+SAU_UPSTREAM_HEALTH="$sau_upstream_health" python3 - <<'PYSAUHEALTH'
+import json, os
+assert json.loads(os.environ['SAU_UPSTREAM_HEALTH']) == {'status':'ok','driver':'sau'}
+PYSAUHEALTH
+sau_unauth_health="$(curl --silent -o /dev/null -w '%{http_code}' \
+ 'http://127.0.0.1:18080/api/v1/settings/publish/social/health')"
+test "$sau_unauth_health" = 401
+echo 'PASS: SAU health proxy validates actual browser sidecar and requires V1 authentication'
 sau_account="$(curl --silent --fail-with-body "${hdr[@]}"   'http://127.0.0.1:18080/api/v1/settings/publish/social/accounts?platform=douyin')"
 SAU_ACCOUNT="$sau_account" python3 - <<'PYSAULIST'
 import json,os
@@ -214,7 +439,7 @@ assert v["cookies_has_auth"] and "test-cookie-secret" not in str(v),v
 PYCOOKIESETTINGS
 test "$(stat -c '%a' "$VIDEOROLL_V2_STORAGE_ROOT/.videoroll-private")" = 700
 test "$(stat -c '%a' "$VIDEOROLL_V2_STORAGE_ROOT/.videoroll-private/youtube-cookies.txt")" = 600
-! docker exec "$container_name" psql -At -U postgres -d videoroll_test -c  "SELECT value_json::text FROM vr2_settings WHERE key='youtube.settings'" | grep -q 'test-cookie-secret'
+! docker exec "$container_name" psql -At -U postgres -d videoroll_test -c  "SELECT value_json::text FROM app_settings WHERE key='youtube.settings'" | grep -q 'test-cookie-secret'
 test "$(curl --silent -o /dev/null -w '%{http_code}' "${hdr[@]}" -X POST  -d '{"url":"http://127.0.0.1/admin"}'  "http://127.0.0.1:18080/api/v1/settings/youtube/test")" = 400
 echo 'PASS: original YouTube settings native proxy/concurrency/compatibility and private Netscape cookies'
 
@@ -365,7 +590,7 @@ import json,os
 task=json.loads(os.environ["LOCAL_STATUS"])
 assert task["status"]=="INGESTED",task
 PYLOCALSTATUS
-local_stored="$(docker exec "$container_name" psql -At -U postgres -d videoroll_test -c   "SELECT count(*) FROM vr2_managed_tasks WHERE task_id='$local_task_id' AND origin='local_upload'")"
+local_stored="$(docker exec "$container_name" psql -At -U postgres -d videoroll_test -c   "SELECT count(*) FROM tasks WHERE id='$local_task_id' AND runtime_owner='rust' AND runtime_origin='local_upload'")"
 test "$local_stored" = 1
 echo 'PASS: native V1 local TaskNewPage creation, verified streaming multipart, metadata and V2 ownership'
 stop_local="$(curl --silent --fail-with-body "${hdr[@]}" -X POST   "http://127.0.0.1:18080/api/v1/tasks/$local_task_id/actions/stop")"
@@ -402,7 +627,7 @@ test "$(docker exec "$container_name" psql -At -U postgres -d videoroll_test -c 
 docker exec "$container_name" psql -v ON_ERROR_STOP=1 -U postgres -d videoroll_test -c \
  "UPDATE vr2_jobs SET state='failed' WHERE id='$manual_job';
   UPDATE vr2_workflows SET state='failed' WHERE task_id='$local_task_id';
-  UPDATE tasks SET status='FAILED'::task_status,updated_at=now() WHERE id='$local_task_id'" >/dev/null
+  UPDATE tasks SET status='failed'::task_status,updated_at=now() WHERE id='$local_task_id'" >/dev/null
 resumed_bulk="$(curl --silent --fail-with-body "${hdr[@]}" -X POST \
   "http://127.0.0.1:18080/api/v1/tasks/actions/resume_failed_recent?window_hours=24&limit=20")"
 RESUMED_BULK="$resumed_bulk" LOCAL_ID="$local_task_id" python3 - <<'PYRESUMEBULK'
@@ -421,7 +646,7 @@ test "$bad_publish" = 400
 legacy_only="$(python3 -c 'import uuid;print(uuid.uuid4())')"
 docker exec "$container_name" psql -v ON_ERROR_STOP=1 -U postgres -d videoroll_test -c \
  "INSERT INTO tasks(id,source_type,source_license,status)
-  VALUES('$legacy_only','local'::source_type,'own'::source_license,'CREATED'::task_status)" >/dev/null
+  VALUES('$legacy_only','local'::source_type,'own'::source_license,'created'::task_status)" >/dev/null
 legacy_reject="$(curl --silent -o /dev/null -w '%{http_code}' "${hdr[@]}" -d "{\"task_id\":\"$legacy_only\",\"configuration\":{}}" \
  http://127.0.0.1:18080/api/v2/workflows/start)"
 test "$legacy_reject" = 404
@@ -448,7 +673,7 @@ test "$invalid_social" = 409
 curl --silent --fail-with-body "${hdr[@]}" -X PUT -d '{"enabled":true}' \
  "http://127.0.0.1:18080/api/v1/settings/publish/platforms/bilibili" >/dev/null
 test "$(docker exec "$container_name" psql -At -U postgres -d videoroll_test -c \
- "SELECT count(*) FROM app_settings WHERE key='publish.platforms'")" = 0
+ "SELECT count(*) FROM app_settings WHERE key='publish.platforms'")" = 1
 echo 'PASS: Bilibili platform switch is native, isolated and durable; unsupported SAU toggles cannot silently succeed'
 
 
@@ -483,13 +708,13 @@ test "$range" = 0123
 echo 'PASS: streaming artifact upload, register, and HTTP range download'
 # The GC's deleting state is an acquisition fence, not merely a UI label.
 docker exec "$container_name" psql -v ON_ERROR_STOP=1 -U postgres -d videoroll_test -c \
-  "UPDATE vr2_objects SET state='deleting' WHERE storage_key=(SELECT storage_key FROM assets WHERE id='$asset_id')" >/dev/null
+  "UPDATE storage_objects SET state='deleting' WHERE storage_key=(SELECT storage_key FROM assets WHERE id='$asset_id')" >/dev/null
 if docker exec "$container_name" psql -v ON_ERROR_STOP=1 -U postgres -d videoroll_test -c \
-  "INSERT INTO vr2_object_refs(storage_key,owner_type,owner_id,role) SELECT storage_key,'test','$task_id','race' FROM assets WHERE id='$asset_id'" >/dev/null 2>&1; then
+  "INSERT INTO storage_object_refs(storage_key,owner_type,owner_id,role) SELECT storage_key,'test','$task_id','race' FROM assets WHERE id='$asset_id'" >/dev/null 2>&1; then
   echo 'FAIL: allowed reference acquisition during garbage collection' >&2; exit 1
 fi
 docker exec "$container_name" psql -v ON_ERROR_STOP=1 -U postgres -d videoroll_test -c \
-  "UPDATE vr2_objects SET state='live' WHERE storage_key=(SELECT storage_key FROM assets WHERE id='$asset_id')" >/dev/null
+  "UPDATE storage_objects SET state='live' WHERE storage_key=(SELECT storage_key FROM assets WHERE id='$asset_id')" >/dev/null
 echo 'PASS: garbage collector reference fence prevents the delete/register race'
 
 
@@ -538,7 +763,7 @@ python3 "$repo_root/rust/tests/mock_gateway.py" > "$repo_root/rust/target/v2-moc
 gateway_pid=$!
 python3 "$repo_root/rust/tests/mock_ai_server.py" > "$repo_root/rust/target/v2-mock-ai.log" 2>&1 &
 ai_pid=$!
-RUST_LOG=info VIDEOROLL_V2_ASR_ENDPOINT=http://127.0.0.1:18082/v1/audio/transcriptions VIDEOROLL_V2_ASR_MODEL=whisper-mock VIDEOROLL_V2_WORKER_GATEWAY=http://127.0.0.1:18081 VIDEOROLL_V2_WORKERS=1 \
+RUST_LOG=info VIDEOROLL_V2_ASR_ENDPOINT=http://127.0.0.1:18082/v1/audio/transcriptions VIDEOROLL_V2_ASR_MODEL=stale-startup-model VIDEOROLL_V2_WORKER_GATEWAY=http://127.0.0.1:18081 VIDEOROLL_V2_WORKERS=1 \
   ./target/debug/videoroll-v2 worker > "$repo_root/rust/target/v2-mock-worker.log" 2>&1 &
 worker_pid=$!
 done_task=""
@@ -570,9 +795,46 @@ assert all(row['state']=='succeeded' for row in rows),rows
 print('PASS: six-stage Rust workflow completes with mock external workers')
 PY2
 
+# Original Python retention contract: 0 days keeps successfully published
+# media. Verify this before opt-in. The previous smoke incorrectly assumed
+# every successful publish scheduled automatic deletion.
+defaults="$(curl --silent --fail-with-body "${hdr[@]}" http://127.0.0.1:18080/api/v1/settings/storage)"
+test "$defaults" = '{"asset_ttl_days":0}'
+kept="$(docker exec "$container_name" psql -At -U postgres -d videoroll_test -c   "SELECT count(*) FROM storage_workdirs WHERE task_id='$fake_task_id'")"
+test "$kept" = 0
+echo 'PASS: default published media retention is disabled and keeps all task references'
+# Explicitly opt in to 1-day cleanup for the native ASR and downstream
+# playout/GC safety tests. The fixture may expire objects only after that.
+enabled_retention="$(curl --silent --fail-with-body "${hdr[@]}" -X PUT     -d '{"asset_ttl_days":1}' http://127.0.0.1:18080/api/v1/settings/storage)"
+test "$enabled_retention" = '{"asset_ttl_days":1}'
+echo 'PASS: opted-in published retention policy is persisted for new workflows'
+
+# The running worker has intentionally wrong startup ASR model.
+# Native stage must resolve the newer stored Python ASR provider at runtime.
+asr_runtime_settings="$(curl --silent --fail-with-body "${hdr[@]}" -X PUT   -d '{"default_engine":"external-whisper","default_model":"whisper-mock","external_whisper_base_url":"http://127.0.0.1:18082/v1","external_whisper_model":"whisper-mock"}'   http://127.0.0.1:18080/api/v1/subtitle/asr/settings)"
+ASR_RUNTIME_SETTINGS="$asr_runtime_settings" python3 - <<'PYASRSET'
+import os,json
+v=json.loads(os.environ["ASR_RUNTIME_SETTINGS"])
+assert v["default_engine"]=="external-whisper",v
+assert v["default_model"]=="whisper-mock",v
+assert v["external_whisper_base_url"]=="http://127.0.0.1:18082/v1",v
+PYASRSET
+echo 'PASS: V1 ASR settings saved while Rust worker uses stale startup model'
+
+# Verify that the OpenAI-compatible provider consumes saved V1 config at
+# runtime rather than an unset V2_TRANSLATE_ENDPOINT environment variable.
+translation_runtime_settings="$(curl --silent --fail-with-body "${hdr[@]}" -X PUT   -d '{"openai_base_url":"http://127.0.0.1:18082/v1","openai_model":"legacy-mock-translator","openai_api_type":"openai","openai_temperature":0.6}'   http://127.0.0.1:18080/api/v1/subtitle/translate/settings)"
+TRANSLATION_RUNTIME_SETTINGS="$translation_runtime_settings" python3 - <<'PYTRANSLATESET'
+import os,json
+v=json.loads(os.environ["TRANSLATION_RUNTIME_SETTINGS"])
+assert v["openai_base_url"]=="http://127.0.0.1:18082/v1",v
+assert v["openai_model"]=="legacy-mock-translator",v
+PYTRANSLATESET
+echo 'PASS: V1 translation settings stored independently of worker startup'
+
 # End-to-end native Whisper-compatible ASR + actual subtitle burn-in via FFmpeg.
 asr_task="$(curl --silent --fail-with-body "${hdr[@]}" -d \
-  '{"url":"https://youtu.be/0123456789D","source_license":"authorized","configuration":{"auto_publish":true,"auto_publish_platforms":["bilibili"],"subtitle":{"translate_enabled":false},"render":{"burn_in":true,"video_codec":"h264"}}}' \
+  '{"url":"https://youtu.be/0123456789D","source_license":"authorized","configuration":{"auto_publish":true,"auto_publish_platforms":["bilibili"],"subtitle":{"translate_enabled":true,"translate_provider":"openai","translate_model_provider_id":"legacy"},"render":{"burn_in":true,"video_codec":"h264"}}}' \
   http://127.0.0.1:18080/api/v2/auto/youtube)"
 asr_task_id="$(ASR_TASK="$asr_task" python3 -c 'import json,os;print(json.loads(os.environ["ASR_TASK"])["task"]["id"])')"
 asr_workflow="$(ASR_TASK="$asr_task" python3 -c 'import json,os;print(json.loads(os.environ["ASR_TASK"])["workflow"]["id"])')"
@@ -605,6 +867,8 @@ srt_key="$(docker exec "$container_name" psql -At -U postgres -d videoroll_test 
 video_key="$(docker exec "$container_name" psql -At -U postgres -d videoroll_test -c \
   "SELECT storage_key FROM assets WHERE task_id='$asr_task_id' AND kind='video_final' LIMIT 1")"
 grep -q 'Hello from a Rust integration test' "$VIDEOROLL_V2_STORAGE_ROOT/$srt_key"
+grep -q '译文：Hello from a Rust integration test' "$VIDEOROLL_V2_STORAGE_ROOT/$srt_key"
+echo 'PASS: native subtitle translation consumes saved V1 OpenAI model instead of startup env'
 ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of default=noprint_wrappers=1 "$VIDEOROLL_V2_STORAGE_ROOT/$video_key" | grep -q '^codec_name=h264'
 echo 'PASS: native OpenAI-compatible ASR, SRT/ASS, and real FFmpeg subtitle burn-in'
 
@@ -739,6 +1003,7 @@ curl --silent --fail-with-body "${hdr[@]}" -X DELETE   "http://127.0.0.1:18080/a
 test -s "$playout_path"
 echo 'PASS: ffplayout translated filename, verified media and safe detach'
 
+echo 'CHECKPOINT: beginning native RAG knowledge and settings validation'
 # V2 lexical knowledge is always task-scoped or explicitly global.
 knowledge="$(curl --silent --fail-with-body "${hdr[@]}" -d   '{"collection":"translation","scope":"global","kind":"term","title":"Rust ASR glossary","content":"Hello from a Rust integration test. The phrase Rust integration test remains consistent.","keywords":["Rust","integration","subtitle"],"language":"en","confidence":1.0}'   http://127.0.0.1:18080/api/v2/rag/knowledge)"
 knowledge_id="$(KNOWLEDGE="$knowledge" python3 -c 'import json,os;print(json.loads(os.environ["KNOWLEDGE"])["id"])')"
@@ -884,7 +1149,7 @@ assert counts["presave_103_203"]==1 and counts["presave_103_204"]==1,counts
 PYCOUNT
 # Even an expired SRT must survive GC while its uncertain subtitle submission
 # holds an independent reference, regardless of the video's published state.
-docker exec "$container_name" psql -v ON_ERROR_STOP=1 -U postgres -d videoroll_test -c   "UPDATE vr2_objects SET retain_until=now()-interval '1 minute' WHERE storage_key='$index_srt'" >/dev/null
+docker exec "$container_name" psql -v ON_ERROR_STOP=1 -U postgres -d videoroll_test -c   "UPDATE storage_objects SET retain_until=now()-interval '1 minute' WHERE storage_key='$index_srt'" >/dev/null
 ./target/debug/videoroll-v2 gc --limit 100 >/dev/null
 test -s "$VIDEOROLL_V2_STORAGE_ROOT/$index_srt"
 curl --silent --fail-with-body "${hdr[@]}"   -d '{"cid":202,"submitted":true,"evidence":"Mock creator studio confirms the draft was accepted"}'   "http://127.0.0.1:18080/api/v2/bilibili/subtitles/$index_publish_id/resolve"   | grep -q '"reconciled":true'
@@ -903,7 +1168,7 @@ counts=json.loads(os.environ["COUNT"])
 assert counts["presave_101"]==1 and counts["presave_102"]==1,counts
 assert counts["presave_103_203"]==1 and counts["presave_103_204"]==1,counts
 PYCOUNT
-held="$(docker exec "$container_name" psql -At -U postgres -d videoroll_test -c   "SELECT count(*) FROM vr2_object_refs WHERE owner_type='bilibili_subtitle' AND owner_id IN ('$asr_publish_id','$index_publish_id','$double_publish_id')")"
+held="$(docker exec "$container_name" psql -At -U postgres -d videoroll_test -c   "SELECT count(*) FROM storage_object_refs WHERE owner_type='bilibili_subtitle' AND owner_id IN ('$asr_publish_id','$index_publish_id','$double_publish_id')")"
 test "$held" = 0
 echo 'PASS: Bilibili native subtitles, per-CID retry fencing, unknown reconciliation and SRT resource release'
 
@@ -914,25 +1179,25 @@ echo 'PASS: Bilibili native subtitles, per-CID retry fencing, unknown reconcilia
 # Retention / playout safety: force an expired retention period in the disposable
 # database. The final asset is protected while a playout link still exists.
 scheduled="$(docker exec "$container_name" psql -At -U postgres -d videoroll_test -c \
-  "SELECT count(*) FROM vr2_workdirs WHERE task_id='$asr_task_id' AND state='retained'")"
+  "SELECT count(*) FROM storage_workdirs WHERE task_id='$asr_task_id' AND state='retained'")"
 test "$scheduled" = 4
 final_id="$(docker exec "$container_name" psql -At -U postgres -d videoroll_test -c \
   "SELECT id FROM assets WHERE task_id='$asr_task_id' AND kind='video_final' LIMIT 1")"
 link_id="$(python3 -c 'import uuid; print(uuid.uuid4())')"
 docker exec "$container_name" psql -v ON_ERROR_STOP=1 -U postgres -d videoroll_test -c \
-  "INSERT INTO playout_asset_links(id,task_id,asset_id) VALUES('$link_id','$asr_task_id','$final_id')" >/dev/null
+  "INSERT INTO playout_asset_links(id,task_id,asset_id,ffplayout_channel_id) VALUES('$link_id','$asr_task_id','$final_id',2)" >/dev/null
 docker exec "$container_name" psql -v ON_ERROR_STOP=1 -U postgres -d videoroll_test -c \
-  "UPDATE vr2_objects SET retain_until=now()-interval '1 minute' WHERE storage_key LIKE 'v2/%' AND storage_key LIKE '%$asr_task_id%'; UPDATE vr2_workdirs SET due_at=now()-interval '1 minute' WHERE task_id='$asr_task_id';" >/dev/null
+  "UPDATE storage_objects SET retain_until=now()-interval '1 minute' WHERE storage_key LIKE 'v2/%' AND storage_key LIKE '%$asr_task_id%'; UPDATE storage_workdirs SET due_at=now()-interval '1 minute' WHERE task_id='$asr_task_id';" >/dev/null
 ./target/debug/videoroll-v2 gc --limit 100 >/dev/null
 test -f "$VIDEOROLL_V2_STORAGE_ROOT/$video_key"
 test "$(docker exec "$container_name" psql -At -U postgres -d videoroll_test -c \
-  "SELECT state FROM vr2_objects WHERE storage_key='$video_key'")" = "live"
+  "SELECT state FROM storage_objects WHERE storage_key='$video_key'")" = "live"
 echo 'PASS: playout-linked finished asset is protected from deferred GC'
 docker exec "$container_name" psql -v ON_ERROR_STOP=1 -U postgres -d videoroll_test -c \
-  "DELETE FROM playout_asset_links WHERE id='$link_id'; UPDATE vr2_objects SET retain_until=now()-interval '1 minute' WHERE storage_key='$video_key';" >/dev/null
+  "DELETE FROM playout_asset_links WHERE id='$link_id'; UPDATE storage_objects SET retain_until=now()-interval '1 minute' WHERE storage_key='$video_key';" >/dev/null
 ./target/debug/videoroll-v2 gc --limit 100 >/dev/null
 test "$(docker exec "$container_name" psql -At -U postgres -d videoroll_test -c \
-  "SELECT state FROM vr2_objects WHERE storage_key='$video_key'")" = "deleted"
+  "SELECT state FROM storage_objects WHERE storage_key='$video_key'")" = "deleted"
 test ! -f "$VIDEOROLL_V2_STORAGE_ROOT/$video_key"
 # The detached audit row survives; its foreign key is safely null,
 # and the ffplayout media file is never deleted by ordinary source GC.
@@ -973,31 +1238,30 @@ assert value["duplicated"]==2,value
 PYSRC
 echo 'PASS: YouTube channel source CRUD, non-autostart scan and durable video dedup'
 
-# Versioned V2 overlay settings must never overwrite original v1 app_settings.
+# Rust and Python share the same original app_settings key; partial edits
+# preserve unknown original fields and stale versions reject.
 initial="$(curl --silent --fail-with-body "${hdr[@]}" \
   http://127.0.0.1:18080/api/v2/settings/auto)"
-INITIAL="$initial" python3 - <<'PYSET'
-import os,json
-row=json.loads(os.environ["INITIAL"])
-assert row["source"]=="v1_readonly",row
-assert row["version"]==0,row
-PYSET
+initial_version="$(INITIAL="$initial" python3 -c 'import os,json;print(json.loads(os.environ["INITIAL"])["version"])')"
 new_settings="$(curl --silent --fail-with-body "${hdr[@]}" \
-  -X PUT -d '{"expected_version":0,"value":{"translate_enabled":true,"auto_publish":false,"auto_publish_platforms":[],"asr_language":"en"}}' \
+  -X PUT -d "{\"expected_version\":$initial_version,\"value\":{\"translate_enabled\":true,\"auto_publish\":false,\"auto_publish_platforms\":[],\"asr_language\":\"en\"}}" \
   http://127.0.0.1:18080/api/v2/settings/auto)"
-NEW_SETTINGS="$new_settings" python3 - <<'PYSET'
+NEW_SETTINGS="$new_settings" OLD_VERSION="$initial_version" python3 - <<'PYSET'
 import os,json
 row=json.loads(os.environ["NEW_SETTINGS"])
-assert row["source"]=="v2" and row["version"]==1,row
+assert row["source"]=="app_settings",row
+assert row["version"]==int(os.environ["OLD_VERSION"])+1,row
 assert row["value"]["auto_publish"] is False,row
 PYSET
 conflict="$(curl --silent -o /dev/null -w '%{http_code}' "${hdr[@]}" \
-  -X PUT -d '{"expected_version":0,"value":{"auto_publish":true}}' \
+  -X PUT -d "{\"expected_version\":$initial_version,\"value\":{\"auto_publish\":true}}" \
   http://127.0.0.1:18080/api/v2/settings/auto)"
 test "$conflict" = 409
 test "$(docker exec "$container_name" psql -At -U postgres -d videoroll_test -c \
-  "SELECT count(*) FROM app_settings WHERE key='subtitle.auto_profile'")" = 0
-echo 'PASS: V2 settings overlays are versioned and never overwrite v1 originals'
+  "SELECT count(*) FROM app_settings WHERE key='subtitle.auto_profile'")" = 1
+test "$(docker exec "$container_name" psql -At -U postgres -d videoroll_test -c \
+  "SELECT to_regclass('public.vr2_settings') IS NULL")" = t
+echo 'PASS: Rust settings patch canonical original app_settings with versioned concurrency'
 
 # Windows/Linux RenderWorker v1 wire protocol against the V2 coordinator.
 # Only loopback, synthetic media and a dedicated ephemeral database are used.
@@ -1036,7 +1300,7 @@ curl --silent --fail-with-body "${credential_header[@]}" \
   -d '{"status":"online","resources":{},"capabilities":{},"active_execution_ids":[]}' \
   "http://127.0.0.1:18080/render-workers/v1/$worker_id/heartbeat" >/dev/null
 remote_task="$(curl --silent --fail-with-body "${hdr[@]}" -d \
-  '{"url":"https://youtu.be/0123456789G","source_license":"authorized","configuration":{"auto_publish":true,"auto_publish_platforms":["bilibili"],"subtitle":{"translate_enabled":false},"render":{"burn_in":true,"video_codec":"h264"}}}' \
+  '{"url":"https://youtu.be/0123456789G","priority":100,"source_license":"authorized","configuration":{"auto_publish":true,"auto_publish_platforms":["bilibili"],"subtitle":{"translate_enabled":false},"render":{"burn_in":true,"video_codec":"h264"}}}' \
   http://127.0.0.1:18080/api/v2/auto/youtube)"
 remote_task_id="$(TASK="$remote_task" python3 -c 'import json,os;print(json.loads(os.environ["TASK"])["task"]["id"])')"
 remote_workflow_id="$(TASK="$remote_task" python3 -c 'import json,os;print(json.loads(os.environ["TASK"])["workflow"]["id"])')"
@@ -1064,10 +1328,14 @@ fi
 claim="$(curl --silent --fail-with-body "${credential_header[@]}" \
   -d '{"available_slots":1,"accepted_transfer_modes":["http"],"available_encoders":["h264"]}' \
   "http://127.0.0.1:18080/render-workers/v1/$worker_id/claim")"
-CLAIM="$claim" python3 - <<'PYCLAIM'
+CLAIM="$claim" REMOTE_TASK_ID="$remote_task_id" python3 - <<'PYCLAIM'
 import os,json
 body=json.loads(os.environ["CLAIM"])
 assert body["execution"] and body["render_spec"],body
+# The RenderWorker claims the highest-priority globally ready execution,
+# not necessarily the task just created by this test. The test must prove
+# it received the task under examination before checking its final state.
+assert body["render_spec"]["task_id"]==os.environ["REMOTE_TASK_ID"],body
 assert body["render_spec"]["schema_version"]==1,body
 assert body["render_spec"]["mode"]=="burn_in",body
 assert {x["role"] for x in body["render_spec"]["artifacts"]}=={"input","ass"},body
@@ -1110,6 +1378,10 @@ for i in $(seq 1 70); do
   sleep 1
 done
 if [[ "$remote_final" != *'"status":"PUBLISHED"'* ]];then
+  echo "REMOTE_FINAL=$remote_final" >&2
+  docker exec "$container_name" psql -x -U postgres -d videoroll_test -c     "SELECT id,status,error_code,error_message,created_by FROM tasks WHERE id='$remote_task_id'" >&2 || true
+  docker exec "$container_name" psql -x -U postgres -d videoroll_test -c     "SELECT id,state,current_stage,last_error,configuration FROM vr2_workflows WHERE id='$remote_workflow_id'" >&2 || true
+  docker exec "$container_name" psql -x -U postgres -d videoroll_test -c     "SELECT stage,state,last_error,result FROM vr2_jobs WHERE workflow_id='$remote_workflow_id' ORDER BY created_at ASC" >&2 || true
   tail -80 "$repo_root/rust/target/v2-remote-worker.log" >&2
   echo 'FAIL: authenticated remote RenderWorker did not complete six-stage workflow' >&2
   exit 1
@@ -1230,3 +1502,68 @@ lease_progress="$(docker exec "$container_name" psql -At -U postgres -d videorol
 test -n "$lease_progress"
 curl --silent --fail-with-body "${hdr[@]}" -X POST  "http://127.0.0.1:18080/api/v2/workflows/$live_workflow_id/cancel" >/dev/null
 echo 'PASS: isolated yt-dlp child updates fenced real-time progress, aria2c HTTP-only flags, and completed media receipt'
+
+# Real creator-center edit protocol against disposable local fixture. No live
+# Bilibili UPOS / API requests or production DB rows are touched.
+container_name="$container_name" manual_dub_id="$manual_dub_id" \
+ manual_dub_job="$manual_dub_job" repo_root="$repo_root" \
+ bash "$repo_root/rust/tests/p2_isolated.sh"
+
+# Independent three-platform SAU posting: local browser-worker simulator only.
+container_name="$container_name" manual_dub_id="$manual_dub_id" repo_root="$repo_root" \
+ bash "$repo_root/rust/tests/sau_publish_isolated.sh"
+
+# Python YouTube source page: native V1 CRUD and durable scan, with yt-dlp mock.
+container_name="$container_name" python3 "$repo_root/rust/tests/youtube_sources_v1_isolated.py"
+
+# Python operations usage/pricing and storage retention parity on disposable Postgres.
+container_name="$container_name" python3 "$repo_root/rust/tests/operations_v1_isolated.py"
+
+# Python YouDub job summary + render worker connection management.
+container_name="$container_name" python3 "$repo_root/rust/tests/management_v1_isolated.py"
+
+# RenderWorker admin read-model parity from source-compatible V1 SQL fixtures.
+container_name="$container_name" python3 "$repo_root/rust/tests/render_management_read_v1_isolated.py"
+
+# The original-Python differential creates *synthetic* pending native jobs
+# to verify queue projections. Stop the actual Rust worker first, otherwise
+# it may legitimately claim those rows between two HTTP snapshots and make
+# deterministic contract assertions fail. All true worker-stage tests above
+# have completed before this point.
+if [[ -n "$worker_pid" ]]; then
+  kill "$worker_pid" 2>/dev/null || true
+  wait "$worker_pid" 2>/dev/null || true
+  worker_pid=""
+fi
+echo 'PASS: isolated worker stopped before fixed-fixture Python/Rust differential'
+
+# Actual original Python service functions and Rust HTTP on the same temporary DB.
+PYTHONPATH="$repo_root/src" /opt/videoroll/venvs/core/bin/python \
+  "$repo_root/rust/tests/python_rust_subtitle_render_diff.py"
+
+# Python original and Rust API must agree on embedding models and vector runtime.
+PYTHONPATH="$repo_root/src" /opt/videoroll/venvs/core/bin/python \
+  "$repo_root/rust/tests/embedding_v1_focused_diff.py"
+
+# Promote glossary terms into original RAG knowledge via transactional SQL.
+PYTHONPATH="$repo_root/src" /opt/videoroll/venvs/core/bin/python \
+  "$repo_root/rust/tests/dictionary_promote_v1_focused_diff.py"
+
+# Import real glossary files via multipart and compare the source Python DB rows.
+PYTHONPATH="$repo_root/src" /opt/videoroll/venvs/core/bin/python \
+  "$repo_root/rust/tests/dictionary_import_v1_focused_diff.py"
+
+# Real Python and Rust RAG item writes / vector rebuild through localhost
+# OpenAI-compatible Embedding API. All rows and credentials are disposable.
+PYTHONPATH="$repo_root/src" /opt/videoroll/venvs/core/bin/python \
+  "$repo_root/rust/tests/knowledge_write_v1_focused_diff.py"
+
+# Test original Python vs Rust publish batches and cover upload on disposable DB.
+PYTHONPATH="$repo_root/src" /opt/videoroll/venvs/core/bin/python \
+  "$repo_root/rust/tests/task_reliability_v1_focused_diff.py"
+
+# Probe every mapped native /api/v1 route independently.
+# Only local disposable fixtures are used; this is not Python-side parity signoff.
+python3 "$repo_root/rust/tests/contract_parity_64.py" \
+  --task-id "$manual_dub_id" --alert-id "$alert_id" \
+  --out "$repo_root/rust/target/contract-parity-64.json"

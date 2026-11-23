@@ -146,8 +146,8 @@ pub async fn download_youtube(
             // receipt. Without this transition the UI can show 'CREATED'
             // while later subtitle/render stages run.
             sqlx::query(
-                "UPDATE tasks SET status='DOWNLOADED'::task_status,updated_at=now()
-                 WHERE id=$1 AND status IN ('CREATED'::task_status,'INGESTED'::task_status)",
+                "UPDATE tasks SET status='downloaded'::task_status,updated_at=now()
+                 WHERE id=$1 AND status IN ('created'::task_status,'ingested'::task_status)",
             )
             .bind(job.task_id)
             .execute(&db.pool)
@@ -196,7 +196,7 @@ pub async fn download_youtube(
     ).bind(Uuid::new_v4()).bind(job.task_id).bind(&key).bind(&digest).bind(size)
         .execute(&mut *tx).await?;
     sqlx::query(
-        "UPDATE tasks SET status='DOWNLOADED'::task_status,updated_at=now() WHERE id=$1 AND status IN ('CREATED'::task_status,'INGESTED'::task_status)"
+        "UPDATE tasks SET status='downloaded'::task_status,updated_at=now() WHERE id=$1 AND status IN ('created'::task_status,'ingested'::task_status)"
     ).bind(job.task_id).execute(&mut *tx).await?;
     tx.commit().await?;
     Ok(serde_json::json!({"storage_key":key,"sha256":digest,"size_bytes":size}))

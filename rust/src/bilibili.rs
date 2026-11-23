@@ -623,6 +623,229 @@ impl BilibiliClient {
         }))
     }
 }
+
+/// Build an owner-preserving, single-P2 edit payload. Never reconstruct an
+/// existing archive from our (possibly outdated) original submission draft.
+fn append_p2_payload(
+    owner: &Value,
+    aid: i64,
+    filename: &str,
+    cid: i64,
+    title: &str,
+    csrf: &str,
+) -> AppResult<Value> {
+    let archive = owner
+        .get("archive")
+        .and_then(Value::as_object)
+        .ok_or_else(|| AppError::Conflict("Bilibili owner archive is missing".into()))?;
+    let parts = owner
+        .get("videos")
+        .and_then(Value::as_array)
+        .filter(|v| v.len() == 1)
+        .ok_or_else(|| AppError::Conflict("P2 append requires exactly one P1 part".into()))?;
+    if aid <= 0 || archive.get("aid").and_then(Value::as_i64) != Some(aid) {
+        return Err(AppError::Conflict("owner archive aid mismatch".into()));
+    }
+    let part = parts[0]
+        .as_object()
+        .ok_or_else(|| AppError::Conflict("malformed original P1 part".into()))?;
+    let p1_cid = part.get("cid").and_then(Value::as_i64).unwrap_or(0);
+    let p1_filename = part.get("filename").and_then(Value::as_str).unwrap_or("");
+    if p1_cid <= 0 || p1_cid == cid || p1_filename.is_empty() {
+        return Err(AppError::Conflict(
+            "P1 cid/filename missing or duplicate".into(),
+        ));
+    }
+    if cid <= 0
+        || filename.trim().is_empty()
+        || filename.len() > 256
+        || title.trim().is_empty()
+        || title.chars().count() > 80
+        || csrf.trim().len() < 12
+        || csrf.chars().any(char::is_control)
+    {
+        return Err(AppError::Invalid("invalid native P2 edit input".into()));
+    }
+    let keep: &[&str] = &[
+        "title",
+        "cover",
+        "cover43",
+        "copyright",
+        "source",
+        "tid",
+        "tag",
+        "desc",
+        "desc_v2",
+        "desc_format_id",
+        "dynamic",
+        "recreate",
+        "interactive",
+        "act_reserve_create",
+        "no_disturbance",
+        "no_reprint",
+        "subtitle",
+        "dolby",
+        "lossless_music",
+        "up_selection_reply",
+        "up_close_reply",
+        "up_close_danmu",
+        "web_os",
+        "is_only_self",
+        "topic_id",
+        "mission_id",
+        "is_360",
+        "neutral_mark",
+        "human_type2",
+    ];
+    let mut body = serde_json::Map::new();
+    for key in keep {
+        if let Some(value) = archive.get(*key) {
+            body.insert((*key).to_owned(), value.clone());
+        }
+    }
+    for key in ["title", "copyright", "tid", "tag", "desc"] {
+        if !body.contains_key(key) {
+            return Err(AppError::Conflict(format!("owner archive missing {key}")));
+        }
+    }
+    if body.get("tid").and_then(Value::as_i64).unwrap_or(0) <= 0 {
+        return Err(AppError::Conflict("owner archive has invalid tid".into()));
+    }
+    let p1_title = part
+        .get("title")
+        .and_then(Value::as_str)
+        .filter(|v| !v.is_empty())
+        .or_else(|| archive.get("title").and_then(Value::as_str))
+        .unwrap_or("");
+    if p1_title.is_empty() {
+        return Err(AppError::Conflict("owner P1 title missing".into()));
+    }
+    body.insert("aid".into(), json!(aid));
+    body.insert("csrf".into(), json!(csrf));
+    body.insert(
+        "videos".into(),
+        json!([
+            {"filename":p1_filename,"title":p1_title,"desc":part.get("desc").and_then(Value::as_str).unwrap_or(""),"cid":p1_cid},
+            {"filename":filename,"title":title,"desc":"","cid":cid}
+        ]),
+    );
+    Ok(Value::Object(body))
+}
+
+fn member_origin(config: &Config) -> AppResult<Url> {
+    let raw = config
+        .native_bilibili_api_base
+        .as_deref()
+        .unwrap_or("https://member.bilibili.com");
+    let url =
+        Url::parse(raw).map_err(|_| AppError::Invalid("invalid creator-center URL".into()))?;
+    let official = url.scheme() == "https"
+        && url.host_str() == Some("member.bilibili.com")
+        && url.port().is_none();
+    let testing = url.scheme() == "http"
+        && matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "::1"))
+        && url.port().is_some();
+    if !(official || testing)
+        || url.username() != ""
+        || url.password().is_some()
+        || url.path() != "/"
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(AppError::Invalid(
+            "P2 creator-center endpoint must be member.bilibili.com HTTPS or isolated loopback"
+                .into(),
+        ));
+    }
+    Ok(url)
+}
+
+pub(crate) struct NativeP2Client {
+    inner: BilibiliClient,
+    origin: Url,
+    csrf: String,
+}
+impl NativeP2Client {
+    pub(crate) async fn new(config: &Config, db: &Database) -> AppResult<Self> {
+        if !config.native_bilibili_allowed {
+            return Err(AppError::Unavailable(
+                "native Bilibili publisher disabled".into(),
+            ));
+        }
+        let (cookie, csrf) =
+            crate::bilibili_account_v1::publication_credentials(db, config).await?;
+        Ok(Self {
+            inner: BilibiliClient::new(&cookie)?,
+            origin: member_origin(config)?,
+            csrf,
+        })
+    }
+    fn url(&self, path: &str) -> AppResult<Url> {
+        self.origin
+            .join(path)
+            .map_err(|_| AppError::Invalid("invalid creator-center path".into()))
+    }
+    pub(crate) async fn owner(&self, aid: i64) -> AppResult<Value> {
+        if aid <= 0 {
+            return Err(AppError::Invalid("invalid Bilibili aid".into()));
+        }
+        let response = self
+            .inner
+            .member
+            .get(self.url("x/vupre/web/archive/view")?)
+            .query(&[("aid", aid)])
+            .send()
+            .await?;
+        let value = BilibiliClient::read_json(response).await?;
+        BilibiliClient::ensure_ok(&value, false)?;
+        let archive = value
+            .pointer("/data/archive")
+            .ok_or_else(|| AppError::Unavailable("creator-center archive missing".into()))?;
+        let videos = value
+            .pointer("/data/videos")
+            .ok_or_else(|| AppError::Unavailable("creator-center videos missing".into()))?;
+        if archive.get("aid").and_then(Value::as_i64) != Some(aid) || !videos.is_array() {
+            return Err(AppError::Conflict("owner archive identity mismatch".into()));
+        }
+        Ok(json!({"archive":archive,"videos":videos}))
+    }
+    pub(crate) async fn upload(&self, path: &Path) -> AppResult<(String, i64)> {
+        // A local mock creator center must never accidentally upload via
+        // the real hardcoded UPOS hosts. Integration tests inject a durable
+        // pre-uploaded receipt when exercising the irreversible edit.
+        if self.origin.scheme() == "http" {
+            return Err(AppError::Unavailable(
+                "UPOS upload disabled in loopback test mode".into(),
+            ));
+        }
+        let uploaded = self.inner.upload(path).await?;
+        Ok((uploaded.filename, uploaded.cid))
+    }
+    pub(crate) async fn edit(
+        &self,
+        owner: &Value,
+        aid: i64,
+        filename: &str,
+        cid: i64,
+        title: &str,
+    ) -> AppResult<()> {
+        let payload = append_p2_payload(owner, aid, filename, cid, title, &self.csrf)?;
+        let response = self
+            .inner
+            .member
+            .post(self.url("x/vu/web/edit")?)
+            .query(&[
+                ("csrf", self.csrf.as_str()),
+                ("t", &chrono::Utc::now().timestamp_millis().to_string()),
+            ])
+            .json(&payload)
+            .send()
+            .await?;
+        let value = BilibiliClient::read_json(response).await?;
+        BilibiliClient::ensure_ok(&value, false)?;
+        Ok(())
+    }
+}
 pub async fn publish(
     config: &Config,
     db: &Database,
@@ -634,17 +857,7 @@ pub async fn publish(
             "native Bilibili publisher is not enabled".into(),
         ));
     }
-    let cookie = config
-        .native_bilibili_cookie
-        .as_deref()
-        .ok_or_else(|| AppError::Unavailable("Bilibili cookie not configured".into()))?;
-    let csrf = config
-        .native_bilibili_csrf
-        .as_deref()
-        .ok_or_else(|| AppError::Unavailable("Bilibili CSRF token not configured".into()))?;
-    if csrf.len() < 12 || csrf.len() > 80 || !csrf.chars().all(|c| c.is_ascii_alphanumeric()) {
-        return Err(AppError::Invalid("Bilibili CSRF token invalid".into()));
-    }
+    let (cookie, csrf) = crate::bilibili_account_v1::publication_credentials(db, config).await?;
     if !crate::publish_platforms::enabled(db, "bilibili").await? {
         return Err(AppError::Conflict(
             "Bilibili publishing is disabled in V2 platform settings".into(),
@@ -659,7 +872,7 @@ pub async fn publish(
         );
     crate::publish_review::ensure_approved(db, registry, config, job.task_id, &reviewed_meta)
         .await?;
-    let client = BilibiliClient::new(cookie)?;
+    let client = BilibiliClient::new(&cookie)?;
     // Validate creator-center ID pairing and rules before any UPOS upload.
     crate::bili_activity::verify_remote(&client.member, &meta).await?;
     let mut uploaded = Vec::new();
@@ -671,13 +884,36 @@ pub async fn publish(
     }
     // Single archive creation: UPOS uploads are preparatory side-effects;
     // archive POST is the irreversible boundary and is NEVER retried.
-    let receipt = client.submit_once(csrf, &meta, &uploaded).await?;
+    let receipt = client.submit_once(&csrf, &meta, &uploaded).await?;
     tracing::info!(job_id=%job.id,parts=uploaded.len(),"Bilibili native archive confirmed");
     Ok(receipt)
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn p2_owner_edit_preserves_archive_and_never_overwrites_existing_p2() {
+        let input = json!({"archive":{"aid":10,"title":"Original","copyright":2,
+          "tid":171,"tag":"test","desc":"source","topic_id":2323,"mission_id":45},
+          "videos":[{"cid":11,"filename":"original_video","title":"P1","desc":"first"}]});
+        let payload =
+            append_p2_payload(&input, 10, "dubbed_video", 20, "P2", "123456789012").unwrap();
+        assert_eq!(payload["videos"].as_array().unwrap().len(), 2);
+        assert_eq!(payload["videos"][0]["cid"], 11);
+        assert_eq!(payload["videos"][1]["cid"], 20);
+        assert_eq!(payload["topic_id"], 2323);
+        assert_eq!(payload["mission_id"], 45);
+        assert_eq!(payload["desc"], "source");
+        assert!(append_p2_payload(&input, 11, "other", 20, "P2", "123456789012").is_err());
+        assert!(append_p2_payload(&input, 10, "other", 11, "P2", "123456789012").is_err());
+        let mut already = input.clone();
+        already["videos"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"cid":40,"filename":"other"}));
+        assert!(append_p2_payload(&already, 10, "other", 50, "P2", "123456789012").is_err());
+    }
     #[test]
     fn upos_hostname_and_path_are_strict() {
         let pre = Preupload {

@@ -28,6 +28,8 @@ pub struct Config {
     pub legacy_publish_allowed: bool,
     pub native_bilibili_allowed: bool,
     pub social_publisher_url: Option<String>,
+    pub social_publish_allowed: bool,
+    pub social_storage_root: Option<PathBuf>,
     pub native_bilibili_cookie: Option<String>,
     pub native_bilibili_csrf: Option<String>,
     pub native_bilibili_api_base: Option<String>,
@@ -127,6 +129,12 @@ impl Config {
             social_publisher_url: std::env::var("VIDEOROLL_V2_SOCIAL_PUBLISHER_URL")
                 .ok()
                 .filter(|v| !v.trim().is_empty()),
+            social_publish_allowed: std::env::var("VIDEOROLL_V2_ENABLE_SAU_PUBLISH")
+                .ok()
+                .as_deref()
+                == Some("true"),
+            social_storage_root: std::env::var_os("VIDEOROLL_V2_SAU_STORAGE_ROOT")
+                .map(PathBuf::from),
             native_bilibili_allowed: std::env::var("VIDEOROLL_V2_ENABLE_NATIVE_BILIBILI")
                 .ok()
                 .as_deref()

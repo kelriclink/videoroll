@@ -231,9 +231,45 @@ pub async fn process(
     let outcome =
         ensure_task_asset(db, registry, job.task_id, job, "video_dubbed", &dest_key).await?;
     sqlx::query(
-        "INSERT INTO vr2_dubbing_runs(job_id,workflow_id,task_id,source_video_key,source_srt_key,output_video_key,model_job_id,model_status) VALUES($1,$2,$3,$4,$5,$6,$7,'succeeded') ON CONFLICT(job_id) DO NOTHING"
-    ).bind(job.id).bind(job.workflow_id).bind(job.task_id).bind(video_key).bind(srt_key)
-        .bind(&dest_key).bind(native_id).execute(&db.pool).await?;
+        "UPDATE operation_inbox SET
+            dubbing_source_video_key=$4,dubbing_source_srt_key=$5,
+            dubbing_output_video_key=$6,dubbing_model_job_id=$7,
+            dubbing_model_status='succeeded',dubbing_run_created_at=now(),updated_at=now()
+          WHERE id=$1 AND workflow_id=$2 AND task_id=$3
+            AND runtime_engine='rust-v2' AND stage='dubbing'
+            AND dubbing_model_status IS NULL",
+    )
+    .bind(job.id)
+    .bind(job.workflow_id)
+    .bind(job.task_id)
+    .bind(&video_key)
+    .bind(&srt_key)
+    .bind(&dest_key)
+    .bind(native_id)
+    .execute(&db.pool)
+    .await?;
+    // Completed dubbing is an immutable proof for the selected subtitle and
+    // source media. Never silently replace it when a replay differs.
+    let proof = sqlx::query(
+        "SELECT source_video_key,source_srt_key,output_video_key,model_job_id
+         FROM vr2_dubbing_runs WHERE job_id=$1",
+    )
+    .bind(job.id)
+    .fetch_optional(&db.pool)
+    .await?
+    .ok_or_else(|| {
+        AppError::Conflict("native YouDub operation no longer owns dubbing evidence".into())
+    })?;
+    use sqlx::Row;
+    if proof.try_get::<String, _>("source_video_key")? != video_key
+        || proof.try_get::<String, _>("source_srt_key")? != srt_key
+        || proof.try_get::<String, _>("output_video_key")? != dest_key
+        || proof.try_get::<Uuid, _>("model_job_id")? != native_id
+    {
+        return Err(AppError::Conflict(
+            "native YouDub output differs from already persisted proof".into(),
+        ));
+    }
     Ok(json!({"native_id":native_id,"video_key":dest_key,"result":outcome}))
 }
 #[cfg(test)]

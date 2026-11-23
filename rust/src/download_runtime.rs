@@ -162,18 +162,14 @@ pub async fn prepare_args(binary: &Path, settings: &YoutubeRuntime, opts: bool) 
 }
 pub async fn record(db: &Database, job: &WorkItem, p: &Progress) -> AppResult<()> {
     sqlx::query(
-        r#"INSERT INTO vr2_download_progress(task_id,job_id,downloaded_bytes,total_bytes,
-            speed_bytes_per_second,eta_seconds,percent)
-          SELECT j.task_id,j.id,$3,$4,$5,$6,$7 FROM vr2_jobs j
-          JOIN vr2_workflows w ON w.id=j.workflow_id
-          WHERE j.id=$1 AND j.lease_token=$2 AND j.lease_until>now()
-            AND j.state='running' AND w.state='running'
-          ON CONFLICT(task_id) DO UPDATE SET
-            job_id=EXCLUDED.job_id,downloaded_bytes=EXCLUDED.downloaded_bytes,
-            total_bytes=EXCLUDED.total_bytes,
-            speed_bytes_per_second=EXCLUDED.speed_bytes_per_second,
-            eta_seconds=EXCLUDED.eta_seconds,percent=EXCLUDED.percent,
-            updated_at=now()"#,
+        r#"UPDATE tasks t SET download_stage_job_id=j.id,
+             download_stage_bytes=$3,download_stage_total_bytes=$4,
+             download_stage_speed=$5,download_stage_eta_seconds=$6,
+             download_stage_percent=$7,download_stage_updated_at=now()
+          FROM vr2_jobs j JOIN vr2_workflows w ON w.id=j.workflow_id
+          WHERE t.id=j.task_id AND t.runtime_owner='rust'
+            AND j.id=$1 AND j.lease_token=$2 AND j.lease_until>now()
+            AND j.stage='download' AND j.state='running' AND w.state='running'"#,
     )
     .bind(job.id)
     .bind(job.lease_token)

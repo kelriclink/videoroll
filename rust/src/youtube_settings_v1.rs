@@ -289,9 +289,9 @@ async fn save_cookie(_config: &Config, _value: Option<&str>) -> AppResult<()> {
     ))
 }
 async fn read_settings(db: &Database) -> AppResult<Value> {
-    // Only the V2 overlay is trusted as mutable configuration. Legacy
-    // cookies_txt_enc cannot be decrypted safely without its own key.
-    let own: Option<Value> = sqlx::query_scalar("SELECT value_json FROM vr2_settings WHERE key=$1")
+    // Use original settings including proxy and concurrency. Existing
+    // cookies_txt_enc is retained, but not misused as a plaintext cookie.
+    let own: Option<Value> = sqlx::query_scalar("SELECT value_json FROM app_settings WHERE key=$1")
         .bind(SETTING_KEY)
         .fetch_optional(&db.pool)
         .await?;
@@ -361,6 +361,68 @@ fn summary(value: &str) -> Value {
         "cookies_has_auth":auth,"cookies_has_visitor_info":visitor,
         "cookies_has_bot_check_bypass":captcha})
 }
+/// Historical Python home-scan telemetry comes from the legacy settings row.
+/// V2 has no independent home-recommendation scanner yet. This routine exposes
+/// persisted *past* counters, never claims a scan is active or enabled in V2.
+async fn legacy_home_scan_history(db: &Database) -> AppResult<serde_json::Map<String, Value>> {
+    let legacy: Option<Value> =
+        sqlx::query_scalar("SELECT value_json FROM app_settings WHERE key=$1")
+            .bind(SETTING_KEY)
+            .fetch_optional(&db.pool)
+            .await?;
+    let legacy = legacy.unwrap_or_else(|| json!({}));
+    let mut values = serde_json::Map::new();
+    for key in [
+        "home_scan_last_started_at",
+        "home_scan_last_finished_at",
+        "home_scan_last_error",
+    ] {
+        let value = legacy
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        values.insert(key.into(), value.map(|s| json!(s)).unwrap_or(Value::Null));
+    }
+    for key in [
+        "home_scan_last_discovered_count",
+        "home_scan_last_started_count",
+        "home_scan_last_skipped_duplicates",
+        "home_scan_last_failed_count",
+        "home_scan_last_candidate_count",
+        "home_scan_last_explicit_shorts_count",
+        "home_scan_last_known_duration_count",
+        "home_scan_last_unknown_duration_count",
+        "home_scan_last_below_min_duration_count",
+        "home_scan_last_kept_unknown_duration_count",
+        "home_scan_last_eligible_count",
+    ] {
+        let count = legacy.get(key).and_then(Value::as_i64).unwrap_or(0).max(0);
+        values.insert(key.into(), json!(count));
+    }
+    for (key, max_items, max_chars) in [
+        ("home_scan_last_log_lines", 40, 240),
+        ("home_scan_last_sample_urls", 10, 2048),
+    ] {
+        let lines = legacy
+            .get(key)
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::trim)
+                    .filter(|v| !v.is_empty())
+                    .take(max_items)
+                    .map(|v| v.chars().take(max_chars).collect::<String>())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        values.insert(key.into(), json!(lines));
+    }
+    Ok(values)
+}
+
 async fn snapshot(state: &AppState) -> AppResult<Value> {
     let stored = read_settings(&state.db).await?;
     let cookies = read_cookie(&state.config).await?;
@@ -384,6 +446,10 @@ async fn snapshot(state: &AppState) -> AppResult<Value> {
         "home_scan_min_duration_seconds":180,"home_scan_running":false,
         "home_scan_last_log_lines":[],"home_scan_last_sample_urls":[]
     });
+    result
+        .as_object_mut()
+        .unwrap()
+        .extend(legacy_home_scan_history(&state.db).await?);
     if let Some(raw) = cookies {
         if let (Some(to), Some(from)) = (result.as_object_mut(), summary(&raw).as_object()) {
             for (key, value) in from {
@@ -498,8 +564,8 @@ async fn update(State(state): State<AppState>, Json(patch): Json<Value>) -> AppR
         save_cookie(&state.config, change.as_deref()).await?;
     }
     sqlx::query(
-        "INSERT INTO vr2_settings(key,value_json,version) VALUES($1,$2,1)
-         ON CONFLICT(key) DO UPDATE SET value_json=$2,version=vr2_settings.version+1,updated_at=now()"
+        "INSERT INTO app_settings(key,value_json,version) VALUES($1,$2,1)
+         ON CONFLICT(key) DO UPDATE SET value_json=$2,version=app_settings.version+1,updated_at=now()"
     ).bind(SETTING_KEY).bind(Value::Object(merged)).execute(&mut *tx).await?;
     tx.commit().await?;
     Ok(Json(snapshot(&state).await?))

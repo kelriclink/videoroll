@@ -11,7 +11,7 @@ pub async fn enqueue(db: &Database, _registry: &AssetRegistry, job: &WorkItem) -
         format!("VideoRoll-v2-remote-render:{}", job.id).as_bytes(),
     );
     let row=sqlx::query(
-        "INSERT INTO vr2_render_executions(id,job_id,task_id,workflow_id,state) VALUES($1,$2,$3,$4,'queued') ON CONFLICT(job_id) DO UPDATE SET updated_at=now() WHERE vr2_render_executions.state IN ('queued','running','uploading') RETURNING id"
+        "INSERT INTO render_executions(id,job_id,task_id,workflow_id,state,attempt,runtime_engine) VALUES($1,$2,$3,$4,'queued',0,'rust-v2') ON CONFLICT(job_id) WHERE runtime_engine='rust-v2' DO UPDATE SET updated_at=now() WHERE render_executions.state IN ('queued','running','uploading') RETURNING id"
     ).bind(id).bind(job.id).bind(job.task_id).bind(job.workflow_id)
         .fetch_optional(&db.pool).await?;
     if let Some(row) = row {

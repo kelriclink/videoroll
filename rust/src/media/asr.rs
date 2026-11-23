@@ -13,6 +13,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{path::Path, process::Stdio, time::Duration};
 use tokio::{fs, process::Command, time::sleep};
+use uuid::Uuid;
 
 const WINDOW: f64 = 45.0;
 const OVERLAP: f64 = 4.0;
@@ -181,6 +182,8 @@ fn normalize_asr(
     Ok(items)
 }
 async fn run_asr(
+    db: &Database,
+    task_id: Uuid,
     client: &Client,
     config: &Config,
     path: &Path,
@@ -190,7 +193,7 @@ async fn run_asr(
         .asr_endpoint
         .as_deref()
         .ok_or_else(|| AppError::Unavailable("no native ASR endpoint configured".into()))?;
-    endpoint(target)?;
+    let parsed_endpoint = endpoint(target)?;
     if fs::metadata(path).await?.len() > 24 * 1024 * 1024 {
         return Err(AppError::Invalid("ASR audio chunk exceeds 24 MiB".into()));
     }
@@ -212,24 +215,18 @@ async fn run_asr(
     if let Some(key) = config.asr_api_key.as_ref() {
         req = req.bearer_auth(key);
     }
-    let response = req.send().await?;
-    if !response.status().is_success() {
-        return Err(AppError::Unavailable(format!(
-            "ASR HTTP {}",
-            response.status()
-        )));
-    }
-    if response
-        .content_length()
-        .is_some_and(|n| n > MAX_BYTES as u64)
-    {
-        return Err(AppError::Unavailable("ASR response too large".into()));
-    }
-    let raw = response.bytes().await?;
-    if raw.len() > MAX_BYTES {
-        return Err(AppError::Unavailable("ASR response too large".into()));
-    }
-    serde_json::from_slice(&raw)
+    let body = crate::ai_usage::chat_json(
+        db,
+        req,
+        &parsed_endpoint,
+        &config.asr_model,
+        "asr_whisper",
+        Some(task_id),
+        MAX_BYTES,
+        "ASR",
+    )
+    .await?;
+    serde_json::from_value(body)
         .map_err(|_| AppError::Unavailable("ASR response schema invalid".into()))
 }
 async fn convert_audio(
@@ -318,6 +315,8 @@ fn parse_translation(content: &str, count: usize) -> AppResult<Vec<String>> {
         .collect()
 }
 async fn translate_batch(
+    db: &Database,
+    task_id: Uuid,
     client: &Client,
     provider: &crate::providers::TranslationProvider,
     profile: &SubtitleProfile,
@@ -362,47 +361,35 @@ async fn translate_batch(
         if let Some(key) = provider.api_key.as_ref() {
             request = request.bearer_auth(key);
         }
-        match request.send().await {
-            Ok(resp) if resp.status().is_success() => {
-                if resp.content_length().is_some_and(|v| v > MAX_BYTES as u64) {
-                    return Err(AppError::Unavailable(
-                        "translation response too large".into(),
-                    ));
-                }
-                let raw = resp.bytes().await?;
-                if raw.len() > MAX_BYTES {
-                    return Err(AppError::Unavailable(
-                        "translation response too large".into(),
-                    ));
-                }
-                let value: Value = serde_json::from_slice(&raw)
-                    .map_err(|_| AppError::Unavailable("translation response invalid".into()))?;
+        match crate::ai_usage::chat_json(
+            db,
+            request,
+            &provider.endpoint,
+            &provider.model,
+            "subtitle_translate",
+            Some(task_id),
+            MAX_BYTES,
+            "translation provider",
+        )
+        .await
+        {
+            Ok(value) => {
                 let content = value
                     .pointer("/choices/0/message/content")
                     .and_then(Value::as_str)
                     .ok_or_else(|| AppError::Unavailable("translation content missing".into()))?;
                 return parse_translation(content, batch.len());
             }
-            Ok(resp)
-                if resp.status().is_server_error()
-                    || resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS =>
-            {
-                if attempt + 1 == attempts {
-                    return Err(AppError::Unavailable(format!(
-                        "translation provider HTTP {}",
-                        resp.status()
-                    )));
-                }
+            Err(AppError::Unavailable(message))
+                if attempt + 1 < attempts
+                    && [" 429", " 500", " 502", " 503", " 504"]
+                        .iter()
+                        .any(|code| message.contains(code)) => {}
+            Err(AppError::Upstream(error)) if attempt + 1 < attempts => {
+                tracing::warn!(error=%error.without_url(),attempt,
+                    "retry translation after transient network failure");
             }
-            Ok(resp) => {
-                return Err(AppError::Unavailable(format!(
-                    "translation provider HTTP {}",
-                    resp.status()
-                )));
-            }
-            Err(err) if attempt + 1 == attempts => return Err(AppError::Upstream(err)),
-            Err(err) => tracing::warn!(error=%err.without_url(),attempt,
-                "retry translation after transient network failure"),
+            Err(error) => return Err(error),
         }
         sleep(Duration::from_secs((1_u64 << attempt.min(4)).min(16))).await;
     }
@@ -410,6 +397,88 @@ async fn translate_batch(
         "translation attempt budget exhausted".into(),
     ))
 }
+
+/// Resolve the currently saved Python subtitle.asr configuration when
+/// executing a new subtitle stage, instead of reusing startup-only options.
+/// Non-HTTP engines continue through the external worker path.
+pub async fn runtime_asr_config(config: &Config, db: &Database) -> AppResult<Option<Config>> {
+    let stored: Option<Value> =
+        sqlx::query_scalar("SELECT value_json FROM app_settings WHERE key='subtitle.asr'")
+            .fetch_optional(&db.pool)
+            .await?;
+    let Some(stored) = stored else {
+        return Ok(config.asr_endpoint.as_ref().map(|_| config.clone()));
+    };
+    let Some(engine) = stored
+        .get("default_engine")
+        .and_then(Value::as_str)
+        .filter(|v| !v.trim().is_empty())
+    else {
+        return Ok(config.asr_endpoint.as_ref().map(|_| config.clone()));
+    };
+    let read = crate::subtitle_asr_settings_v1::view(&stored);
+    let mut out = config.clone();
+    let model = read
+        .get("default_model")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("whisper-large-v3-turbo");
+    match engine {
+        "external-whisper" => {
+            let base = read
+                .get("external_whisper_base_url")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    AppError::Unavailable(
+                        "external Whisper requires a configured OpenAI-compatible URL".into(),
+                    )
+                })?;
+            let parsed = Url::parse(base)
+                .map_err(|_| AppError::Invalid("external Whisper endpoint URL invalid".into()))?;
+            let path = parsed.path().trim_end_matches('/');
+            let target = if path.ends_with("/audio/transcriptions") {
+                base.to_owned()
+            } else {
+                format!("{base}/audio/transcriptions")
+            };
+            endpoint(&target)?;
+            let ext = stored.get("external_whisper").unwrap_or(&Value::Null);
+            let secret = ext
+                .get("api_key_enc")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty());
+            out.asr_api_key = match secret {
+                Some(s) => crate::providers::decode_secret(s)?,
+                None => std::env::var("SUBTITLE_EXTERNAL_WHISPER_API_KEY")
+                    .ok()
+                    .filter(|s| !s.is_empty()),
+            };
+            out.asr_endpoint = Some(target);
+            out.asr_model = model.into();
+            Ok(Some(out))
+        }
+        "groq-whisper" => {
+            let groq = stored.get("groq_whisper").unwrap_or(&Value::Null);
+            let secret = groq
+                .get("api_key_enc")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty());
+            out.asr_api_key = match secret {
+                Some(s) => crate::providers::decode_secret(s)?,
+                None => std::env::var("SUBTITLE_GROQ_WHISPER_API_KEY")
+                    .ok()
+                    .filter(|s| !s.is_empty()),
+            };
+            out.asr_endpoint = Some("https://api.groq.com/openai/v1/audio/transcriptions".into());
+            out.asr_model = model.into();
+            Ok(Some(out))
+        }
+        "mock" | "openvino" | "faster-whisper" | "cloudflare-workers-ai" => Ok(None), // These require a different worker/API, not Whisper HTTP.
+        _ => Err(AppError::Invalid("ASR engine not supported".into())),
+    }
+}
+
 pub async fn process(
     config: &Config,
     db: &Database,
@@ -494,7 +563,16 @@ pub async fn process(
             convert_audio(config, &video, &flac, start, seconds).await?;
             let mut result = None;
             for attempt in 0..3 {
-                match run_asr(&client, config, &flac, &profile.asr_language).await {
+                match run_asr(
+                    db,
+                    job.task_id,
+                    &client,
+                    config,
+                    &flac,
+                    &profile.asr_language,
+                )
+                .await
+                {
                     Ok(resp) => {
                         result = Some(resp);
                         break;
@@ -646,6 +724,8 @@ pub async fn process(
                 None => {
                     let translated = if let Some(opts) = index_opts.as_ref() {
                         crate::media::index_translate::translate(
+                            db,
+                            job.task_id,
                             &client,
                             &original,
                             start,
@@ -656,7 +736,16 @@ pub async fn process(
                         )
                         .await?
                     } else if let Some(model) = model.as_ref() {
-                        translate_batch(&client, model, &profile, batch, &research.prompt).await?
+                        translate_batch(
+                            db,
+                            job.task_id,
+                            &client,
+                            model,
+                            &profile,
+                            batch,
+                            &research.prompt,
+                        )
+                        .await?
                     } else if profile.translate_provider == "noop" {
                         batch.iter().map(|v| v.text.clone()).collect()
                     } else if profile.translate_provider == "mock" {

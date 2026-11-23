@@ -291,6 +291,8 @@ async fn persist_step(
     Ok(())
 }
 async fn call_model(
+    db: &Database,
+    task_id: Uuid,
     client: &Client,
     provider: &crate::providers::TranslationProvider,
     history: &[Value],
@@ -310,29 +312,17 @@ async fn call_model(
     if let Some(secret) = provider.api_key.as_ref() {
         request = request.bearer_auth(secret);
     }
-    let response = request.send().await?;
-    if !response.status().is_success() {
-        return Err(AppError::Unavailable(format!(
-            "RAG Agent provider HTTP {}",
-            response.status()
-        )));
-    }
-    if response
-        .content_length()
-        .is_some_and(|v| v > 4 * 1024 * 1024)
-    {
-        return Err(AppError::Unavailable(
-            "RAG Agent model response too large".into(),
-        ));
-    }
-    let bytes = response.bytes().await?;
-    if bytes.len() > 4 * 1024 * 1024 {
-        return Err(AppError::Unavailable(
-            "RAG Agent model response too large".into(),
-        ));
-    }
-    let value: Value = serde_json::from_slice(&bytes)
-        .map_err(|_| AppError::Unavailable("RAG Agent response JSON invalid".into()))?;
+    let value = crate::ai_usage::chat_json(
+        db,
+        request,
+        &provider.endpoint,
+        &provider.model,
+        "rag_agent",
+        Some(task_id),
+        4 * 1024 * 1024,
+        "RAG Agent",
+    )
+    .await?;
     response_json(&value)
 }
 pub struct ResearchTask<'a> {
@@ -389,7 +379,7 @@ async fn run_steps(
     let mut documents = known.to_vec();
     let mut web_calls = 0usize;
     for step in 0..settings.max_research_steps {
-        let action = call_model(&client, &provider, &history).await?;
+        let action = call_model(db, job.task_id, &client, &provider, &history).await?;
         let kind = action.get("action").and_then(Value::as_str).unwrap_or("");
         let query = action
             .get("query")
@@ -533,23 +523,41 @@ pub async fn run(
         return serde_json::from_value(cached.clone())
             .map_err(|_| AppError::Unavailable("RAG saved result corrupted".into()));
     }
-    sqlx::query(
-        "INSERT INTO vr2_rag_agent_runs(id,workflow_id,task_id,stage,state,plan,evidence,result,attempts,started_at) VALUES($1,$2,$3,'research','running',$4,$5,'{}'::jsonb,1,now()) ON CONFLICT(workflow_id,stage) DO UPDATE SET state='running',plan=$4,evidence=$5,result='{}'::jsonb,error=NULL,attempts=vr2_rag_agent_runs.attempts+1,started_at=now(),updated_at=now()"
-    ).bind(id).bind(job.workflow_id).bind(job.task_id)
-        .bind(json!({"fingerprint":fingerprint,"step_limit":settings.max_research_steps,
+    let effective_id: Uuid = sqlx::query_scalar(
+        "UPDATE pipeline_runs SET research_run_id=COALESCE(research_run_id,$1),
+            research_stage='research',research_state='running',research_plan=$4,
+            research_evidence=$5,research_result='{}'::jsonb,
+            research_error=NULL,research_attempts=research_attempts+1,
+            research_started_at=now(),research_finished_at=NULL,updated_at=now()
+         WHERE id=$2 AND task_id=$3 AND engine='rust-v2'
+         RETURNING research_run_id",
+    )
+    .bind(id)
+    .bind(job.workflow_id)
+    .bind(job.task_id)
+    .bind(
+        json!({"fingerprint":fingerprint,"step_limit":settings.max_research_steps,
             "provider_id":settings.research_provider_id,
-            "requested_model_id":settings.research_model_id}))
-        .bind(json!(evidence.iter().map(|hit|json!({
-            "id":hit.id,"score":hit.score,
-            "source":hit.source_ref
-        })).collect::<Vec<_>>()))
-        .execute(&db.pool).await?;
-    let result = run_steps(config, db, task, &source, initial, id).await;
+            "requested_model_id":settings.research_model_id}),
+    )
+    .bind(json!(
+        evidence
+            .iter()
+            .map(|hit| json!({
+                "id":hit.id,"score":hit.score,
+                "source":hit.source_ref
+            }))
+            .collect::<Vec<_>>()
+    ))
+    .fetch_optional(&db.pool)
+    .await?
+    .ok_or_else(|| AppError::Conflict("research workflow is not a native Rust run".into()))?;
+    let result = run_steps(config, db, task, &source, initial, effective_id).await;
     if let Err(error) = &result {
         sqlx::query(
             "UPDATE vr2_rag_agent_runs SET state='failed',error=$1,finished_at=now(),updated_at=now() WHERE id=$2"
         ).bind(error.to_string().chars().take(1500).collect::<String>())
-            .bind(id).execute(&db.pool).await?;
+            .bind(effective_id).execute(&db.pool).await?;
     }
     result
 }

@@ -9,7 +9,7 @@ import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-COUNTS = {"view": 0, "upload": 0, "presave_101": 0, "presave_102": 0, "presave_103_203": 0, "presave_103_204": 0}
+COUNTS = {"view": 0, "upload": 0, "presave_101": 0, "presave_102": 0, "presave_103_203": 0, "presave_103_204": 0, "p2_owner_view": 0, "p2_edit": 0, "p2_edit_ambiguous": 0}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -31,6 +31,18 @@ class Handler(BaseHTTPRequestHandler):
             return self.reply(200,COUNTS)
         if not self.authorized():
             return self.reply(403,{"code":-101,"message":"missing test cookie"})
+        if u.path=="/x/vupre/web/archive/view":
+            aid=parse_qs(u.query).get("aid",[""])[0]
+            if aid in ("34001","34002"):
+                COUNTS["p2_owner_view"]+=1
+                return self.reply(200,{"code":0,"data":{
+                    "archive":{"aid":int(aid),"title":"Original translated title",
+                       "copyright":2,"tid":171,"tag":"electronics","desc":"Original source",
+                       "topic_id":121,"mission_id":987},
+                    "videos":[{"cid":41001,"filename":"p1_video","title":"P1 original","desc":"P1"}]
+                }})
+        if u.path=="/preupload":
+            return self.reply(400,{"OK":0,"message":"No real UPOS in mock"})
         if u.path=="/x/web-interface/view":
             COUNTS["view"]+=1
             aid=parse_qs(u.query).get("aid",[""])[0]
@@ -49,6 +61,24 @@ class Handler(BaseHTTPRequestHandler):
         if length<2 or length>16*1024*1024:
             return self.reply(400,{"code":-403})
         raw=self.rfile.read(length)
+        if u.path=="/x/vu/web/edit":
+            try:
+                fields=json.loads(raw)
+                assert fields["aid"] in (34001,34002)
+                assert fields["csrf"]=="1234567890123456"
+                assert fields["tid"]==171
+                assert fields["tag"]=="electronics"
+                assert fields["topic_id"]==121 and fields["mission_id"]==987
+                assert fields["videos"]==[
+                    {"cid":41001,"filename":"p1_video","title":"P1 original","desc":"P1"},
+                    {"cid":41002,"filename":"mock_p2_file","title":"【中配】Mock P2","desc":""}]
+            except (AssertionError,ValueError,KeyError):
+                return self.reply(400,{"code":-403,"message":"incorrect original P1 preservation"})
+            if fields["aid"]==34002:
+                COUNTS["p2_edit_ambiguous"]+=1
+                return self.reply(503,{"code":-503,"message":"simulated edit timeout"})
+            COUNTS["p2_edit"]+=1
+            return self.reply(200,{"code":0,"data":{"accepted":True}})
         if u.path=="/x/upload/web/image":
             if (b"bucket" not in raw or b"subtitle" not in raw
                     or b"application/x-subrip" not in raw

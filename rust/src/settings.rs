@@ -1,4 +1,4 @@
-//! Explicit, versioned settings overlay. Never mutate V1 config rows.
+//! Canonical, versioned settings in original Python app_settings; no shadow overlay.
 use crate::{AppError, AppResult, Database, api::AppState};
 use axum::{
     Json, Router,
@@ -97,21 +97,14 @@ fn validate_keys(value: &Value) -> AppResult<()> {
 }
 async fn current(db: &Database, section: &str) -> AppResult<SettingsView> {
     let key = resolve_key(section)?;
-    let overlay: Option<(Value, i32)> =
-        sqlx::query_as("SELECT value_json,version FROM vr2_settings WHERE key=$1")
+    let original: Option<(Value, i32)> =
+        sqlx::query_as("SELECT value_json,version FROM app_settings WHERE key=$1")
             .bind(key)
             .fetch_optional(&db.pool)
             .await?;
-    let (value, version, source) = if let Some((value, version)) = overlay {
-        (value, version, "v2")
-    } else {
-        let fallback: Option<(Value, i32)> =
-            sqlx::query_as("SELECT value_json,version FROM app_settings WHERE key=$1")
-                .bind(key)
-                .fetch_optional(&db.pool)
-                .await?;
-        let (value, version) = fallback.unwrap_or((json!({}), 0));
-        (value, version, "v1_readonly")
+    let (value, version, source) = match original {
+        Some((value, version)) => (value, version, "app_settings"),
+        None => (json!({}), 0, "default"),
     };
     Ok(SettingsView {
         section: section.into(),
@@ -122,19 +115,12 @@ async fn current(db: &Database, section: &str) -> AppResult<SettingsView> {
     })
 }
 pub async fn effective(db: &Database, key: &str) -> AppResult<Value> {
-    let v: Option<(Value,)> = sqlx::query_as("SELECT value_json FROM vr2_settings WHERE key=$1")
-        .bind(key)
-        .fetch_optional(&db.pool)
-        .await?;
-    if let Some((v,)) = v {
-        return Ok(v);
-    }
-    let (v,): (Option<Value>,) =
-        sqlx::query_as("SELECT (SELECT value_json FROM app_settings WHERE key=$1)")
+    let value: Option<Value> =
+        sqlx::query_scalar("SELECT value_json FROM app_settings WHERE key=$1")
             .bind(key)
-            .fetch_one(&db.pool)
+            .fetch_optional(&db.pool)
             .await?;
-    Ok(v.unwrap_or(json!({})))
+    Ok(value.unwrap_or(json!({})))
 }
 async fn read(
     State(state): State<AppState>,
@@ -158,35 +144,61 @@ async fn patch(
     let value = payload.value;
     validate_keys(&value)?;
     let mut tx = state.db.pool.begin().await?;
-    // Serialize first-touch writes even without an existing V2 row.
+    // Original Python writes and Rust writes share the same row. For a
+    // missing key, the INSERT is conflict-checked rather than blindly
+    // replacing a concurrent Python insert.
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))")
-        .bind(format!("vr2.settings:{key}"))
+        .bind(format!("app.settings:{key}"))
         .execute(&mut *tx)
         .await?;
-    let active: Option<i32> =
-        sqlx::query_scalar("SELECT version FROM vr2_settings WHERE key=$1 FOR UPDATE")
+    let old: Option<(Value, i32)> =
+        sqlx::query_as("SELECT value_json,version FROM app_settings WHERE key=$1 FOR UPDATE")
             .bind(key)
             .fetch_optional(&mut *tx)
             .await?;
-    let version = if let Some(v) = active {
-        v
-    } else {
-        sqlx::query_scalar::<_, i32>(
-            "SELECT COALESCE((SELECT version FROM app_settings WHERE key=$1),0)",
-        )
-        .bind(key)
-        .fetch_one(&mut *tx)
-        .await?
-    };
+    let version = old.as_ref().map(|v| v.1).unwrap_or(0);
     if version != payload.expected_version {
         return Err(AppError::Conflict(format!(
             "settings version changed from {} to {}; reload before saving",
             payload.expected_version, version
         )));
     }
-    sqlx::query(
-        "INSERT INTO vr2_settings(key,value_json,version) VALUES($1,$2,$3) ON CONFLICT(key) DO UPDATE SET value_json=$2,version=$3,updated_at=now()"
-    ).bind(key).bind(value).bind(version+1).execute(&mut *tx).await?;
+    // Merge partial edits so fields/cookies stored by the Python original
+    // are preserved even if the V2 UI edits only a small subset.
+    let mut merged = old
+        .as_ref()
+        .and_then(|v| v.0.as_object().cloned())
+        .unwrap_or_default();
+    for (k, v) in value.as_object().expect("validated JSON object") {
+        merged.insert(k.clone(), v.clone());
+    }
+    let changed = if old.is_some() {
+        sqlx::query(
+            "UPDATE app_settings SET value_json=$2,version=version+1,updated_at=now()
+             WHERE key=$1 AND version=$3",
+        )
+        .bind(key)
+        .bind(Value::Object(merged))
+        .bind(version)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected()
+    } else {
+        sqlx::query(
+            "INSERT INTO app_settings(key,value_json,version)
+             VALUES($1,$2,1) ON CONFLICT(key) DO NOTHING",
+        )
+        .bind(key)
+        .bind(Value::Object(merged))
+        .execute(&mut *tx)
+        .await?
+        .rows_affected()
+    };
+    if changed != 1 {
+        return Err(AppError::Conflict(
+            "settings changed concurrently; reload before saving".into(),
+        ));
+    }
     tx.commit().await?;
     Ok(Json(current(&state.db, &section).await?))
 }

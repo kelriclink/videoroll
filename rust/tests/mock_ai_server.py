@@ -43,6 +43,17 @@ class Handler(BaseHTTPRequestHandler):
                     if len(messages)>=4 else
                     {"action":"search_knowledge","query":"Rust integration"}
                     )
+            elif model=="legacy-mock-translator":
+                rows=json.loads(body["messages"][-1]["content"])
+                if not isinstance(rows,list) or not rows or any(
+                    not isinstance(row,dict) or "i" not in row or "source" not in row
+                    for row in rows
+                ):
+                    return self.reply(400,{"error":"invalid translation input"})
+                result={"items":[
+                    {"i":row["i"],"text":"译文："+row["source"]}
+                    for row in rows
+                ]}
             elif model=="Index-Translate-35B-A3B":
                 user=body["messages"][-1]["content"]
                 lines=json.loads(user.split("\n")[-1])
@@ -57,7 +68,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self.reply(400,{"error":"unknown test model"})
             return self.reply(200,{"choices":[{"message":{
                 "content":json.dumps(result,ensure_ascii=False)
-            }}]})
+            }}],"usage":{"prompt_tokens":120,"completion_tokens":45,"total_tokens":165}})
         except (KeyError,ValueError,TypeError,IndexError) as error:
             return self.reply(400,{"error":str(error)})
     def reply(self,status,payload):

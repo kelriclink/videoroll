@@ -197,7 +197,7 @@ async fn resume_subtitle(
         .await?;
     response(&state, flow, Stage::Subtitle).await
 }
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct PublishPayload {
     #[serde(default = "default_platform")]
     platform: String,
@@ -224,6 +224,16 @@ async fn manual_publish(
     Json(payload): Json<PublishPayload>,
 ) -> AppResult<Json<Value>> {
     read_task(&state.db, id).await?;
+    if payload.platform != "bilibili" {
+        return crate::social_publish::manual(
+            &state,
+            id,
+            serde_json::to_value(payload)
+                .map_err(|_| AppError::Invalid("invalid social publish request".into()))?,
+        )
+        .await
+        .map(Json);
+    }
     if payload.platform != "bilibili"
         || payload.account_id.is_some()
         || payload.video_key.is_some()
@@ -507,13 +517,13 @@ async fn resume_recent(
     }
     let rows = sqlx::query(
         "SELECT t.id,j.stage,j.state FROM tasks t
-         JOIN vr2_managed_tasks m ON m.task_id=t.id
+         JOIN tasks m ON m.id=t.id AND m.runtime_owner='rust'
          JOIN LATERAL (
            SELECT stage,state FROM vr2_jobs
            WHERE task_id=t.id
            ORDER BY created_at DESC,id DESC LIMIT 1
          ) j ON true
-         WHERE t.status='FAILED'::task_status
+         WHERE t.status='failed'::task_status
            AND t.updated_at>=now()-($1 * interval '1 hour')
          ORDER BY t.updated_at DESC LIMIT $2",
     )

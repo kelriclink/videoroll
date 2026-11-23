@@ -82,7 +82,7 @@ impl Scheduler {
         let run_id = Uuid::new_v4().to_string();
         let canonical_url = format!("https://www.youtube.com/watch?v={video_id}");
         sqlx::query(
-            "INSERT INTO tasks(id,source_type,source_url,source_license,status,priority,origin_kind,origin_run_id,restart_generation,created_by) VALUES($1,'youtube'::source_type,$2,$3::source_license,'CREATED'::task_status,$4,$6,$5,0,$6)"
+            "INSERT INTO tasks(id,source_type,source_url,source_license,status,priority,origin_kind,origin_run_id,restart_generation,created_by) VALUES($1,'youtube'::source_type,$2,$3::source_license,'created'::task_status,$4,$6,$5,0,$6)"
         ).bind(task_id).bind(canonical_url).bind(license).bind(priority.clamp(-100,100))
             .bind(run_id).bind(if auto_process {"auto_youtube"} else {"source_scan"})
             .execute(&mut *tx).await?;
@@ -100,7 +100,7 @@ impl Scheduler {
             .await?;
             return Ok((self.db.task(winner).await?, None, true));
         }
-        sqlx::query("INSERT INTO vr2_managed_tasks(task_id,origin) VALUES($1,$2)")
+        sqlx::query("UPDATE tasks SET runtime_owner='rust',runtime_origin=$2 WHERE id=$1")
             .bind(task_id)
             .bind(if auto_process {
                 "youtube_auto"
@@ -137,8 +137,8 @@ impl Scheduler {
     pub async fn start(&self, task_id: Uuid, configuration: Value) -> AppResult<WorkflowInfo> {
         let mut tx = self.db.pool.begin().await?;
         let task = sqlx::query(
-            "SELECT t.status::text AS status FROM tasks t
-             JOIN vr2_managed_tasks m ON m.task_id=t.id
+            "SELECT upper(t.status::text) AS status FROM tasks t
+             JOIN tasks m ON m.id=t.id AND m.runtime_owner='rust'
              WHERE t.id=$1 FOR UPDATE OF t",
         )
         .bind(task_id)
@@ -214,8 +214,8 @@ impl Scheduler {
         }
         let mut tx = self.db.pool.begin().await?;
         let status: Option<String> = sqlx::query_scalar(
-            "SELECT t.status::text FROM tasks t
-             JOIN vr2_managed_tasks m ON m.task_id=t.id
+            "SELECT upper(t.status::text) FROM tasks t
+             JOIN tasks m ON m.id=t.id AND m.runtime_owner='rust'
              WHERE t.id=$1 FOR UPDATE OF t",
         )
         .bind(task_id)
@@ -260,11 +260,14 @@ impl Scheduler {
         }
         let unsafe_publish: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM vr2_jobs
-             WHERE task_id=$1 AND stage='publish'
-               AND (
-                 state IN ('pending','running','awaiting','unknown')
-                 OR (state='succeeded' AND COALESCE(result->>'skipped','')='')
-               ))",
+             WHERE task_id=$1 AND (
+               (stage='publish' AND (
+                  state IN ('pending','running','awaiting','unknown')
+                  OR (state='succeeded' AND COALESCE(result->>'skipped','')='')
+               ))
+               OR (stage='sau_publish' AND state IN
+                 ('queued','dispatching','accepted','submitted','published','unknown'))
+             ))",
         )
         .bind(task_id)
         .fetch_one(&mut *tx)
@@ -415,7 +418,7 @@ impl Scheduler {
             Stage::Cleanup => unreachable!(),
         };
         sqlx::query(
-            "UPDATE tasks SET status=$1::task_status,error_code=NULL,error_message=NULL,
+            "UPDATE tasks SET status=lower($1)::task_status,error_code=NULL,error_message=NULL,
              updated_at=now() WHERE id=$2",
         )
         .bind(task_status)
@@ -444,7 +447,7 @@ impl Scheduler {
         let operation_key = format!("vr2:{workflow_id}:{}:{generation}", stage.as_str());
         // The operation key, not the broker task ID, identifies a business side effect.
         sqlx::query(
-            "INSERT INTO vr2_jobs(id,workflow_id,task_id,stage,generation,operation_key,payload,max_attempts) VALUES($1,$2,$3,$4,$5,$6,'{}'::jsonb,$7) ON CONFLICT(operation_key) DO NOTHING"
+            "INSERT INTO operation_inbox(id,workflow_id,task_id,stage,generation,operation_key,request_json,max_attempts,runtime_engine) VALUES($1,$2,$3,$4,$5,$6,'{}'::jsonb,$7,'rust-v2') ON CONFLICT(operation_key) DO NOTHING"
         ).bind(Uuid::new_v4()).bind(workflow_id).bind(task_id)
             .bind(stage.as_str()).bind(generation).bind(operation_key)
             .bind(if stage == Stage::Publish {1i32} else {5i32})
@@ -459,7 +462,7 @@ impl Scheduler {
         details: Value,
     ) -> AppResult<()> {
         sqlx::query(
-            "INSERT INTO vr2_events(id,workflow_id,job_id,kind,details) VALUES($1,$2,$3,$4,$5)",
+            "INSERT INTO workflow_events(id,workflow_id,job_id,kind,details) VALUES($1,$2,$3,$4,$5)",
         )
         .bind(Uuid::new_v4())
         .bind(workflow_id)
@@ -527,15 +530,39 @@ impl Scheduler {
     /// The claim query can be safely used by multiple processes.
     pub async fn claim(&self) -> AppResult<Option<WorkItem>> {
         let mut tx = self.db.pool.begin().await?;
+        // Serialise admission across V2 workers: the queue settings must
+        // actually govern downloads rather than only change a UI number.
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtext('videoroll:v2:job-claim'))")
+            .execute(&mut *tx)
+            .await?;
+        let raw_limit: Option<Value> = sqlx::query_scalar(
+            "SELECT value_json FROM app_settings WHERE key='workflow.youtube_download_concurrency'",
+        )
+        .fetch_optional(&mut *tx)
+        .await?;
+        let max_downloads =
+            crate::subtitle_queue_v1::read_concurrency(&raw_limit.unwrap_or(Value::Null));
         let row = sqlx::query(
             r#"WITH next AS (
                 SELECT j.id FROM vr2_jobs j
                 JOIN vr2_workflows w ON w.id=j.workflow_id
                 JOIN tasks t ON t.id=j.task_id
-                WHERE w.state='running' AND t.status <> 'CANCELED'::task_status
+                WHERE w.state='running' AND t.status <> 'canceled'::task_status
                   AND (
                      (j.state='pending' AND j.available_at<=now())
                      OR (j.state='running' AND j.lease_until<now() AND j.stage <> 'publish')
+                  )
+                  AND (
+                    j.stage <> 'download' OR (
+                      (SELECT count(*) FROM vr2_jobs dj
+                        JOIN vr2_workflows dw ON dw.id=dj.workflow_id
+                        WHERE dj.stage='download' AND dj.state='running'
+                          AND dj.lease_until>now() AND dw.state='running')
+                      +
+                      (SELECT count(*) FROM operation_inbox op
+                        WHERE op.operation_key LIKE 'youtube-download:%'
+                          AND op.status='processing' AND op.lease_until>now())
+                    ) < $3
                   )
                 ORDER BY t.priority DESC, j.available_at, j.created_at
                 FOR UPDATE OF j SKIP LOCKED LIMIT 1
@@ -548,6 +575,7 @@ impl Scheduler {
         )
         .bind(Uuid::new_v4())
         .bind(self.lease_seconds())
+        .bind(max_downloads)
         .fetch_optional(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -584,7 +612,7 @@ impl Scheduler {
         // Strict lock order: parent task -> workflow -> child job.
         let mut tx = self.db.pool.begin().await?;
         let task_state: Option<String> =
-            sqlx::query_scalar("SELECT status::text FROM tasks WHERE id=$1 FOR UPDATE")
+            sqlx::query_scalar("SELECT upper(status::text) FROM tasks WHERE id=$1 FOR UPDATE")
                 .bind(item.task_id)
                 .fetch_optional(&mut *tx)
                 .await?;
@@ -660,7 +688,7 @@ impl Scheduler {
             // the independent outbox worker. NEVER execute subtitle SQL inside
             // the publication settlement transaction: a failed PostgreSQL
             // statement would poison it and obscure a successful upload.
-            sqlx::query("UPDATE tasks SET status='PUBLISHED'::task_status,error_code=NULL,error_message=NULL,updated_at=now() WHERE id=$1 AND status <> 'CANCELED'::task_status")
+            sqlx::query("UPDATE tasks SET status='published'::task_status,error_code=NULL,error_message=NULL,updated_at=now() WHERE id=$1 AND status <> 'canceled'::task_status")
                 .bind(item.task_id).execute(&mut **tx).await?;
         }
         sqlx::query("UPDATE vr2_jobs SET state='succeeded',result=$1,lease_token=NULL,lease_until=NULL,finished_at=now(),updated_at=now() WHERE id=$2")
@@ -723,7 +751,7 @@ impl Scheduler {
         let stage = Stage::from_name(peek.try_get::<String, _>("stage")?.as_str())
             .ok_or_else(|| AppError::Invalid("bad stage".into()))?;
         let task_state: String =
-            sqlx::query_scalar("SELECT status::text FROM tasks WHERE id=$1 FOR UPDATE")
+            sqlx::query_scalar("SELECT upper(status::text) FROM tasks WHERE id=$1 FOR UPDATE")
                 .bind(task_id)
                 .fetch_one(&mut *tx)
                 .await?;
@@ -822,7 +850,7 @@ impl Scheduler {
         .bind(workflow_id)
         .execute(&mut *tx)
         .await?;
-        sqlx::query("UPDATE tasks SET status='FAILED'::task_status,error_code='V2_REMOTE_RENDER_FAILED',error_message=$1,updated_at=now() WHERE id=$2 AND status<>'CANCELED'::task_status")
+        sqlx::query("UPDATE tasks SET status='failed'::task_status,error_code='V2_REMOTE_RENDER_FAILED',error_message=$1,updated_at=now() WHERE id=$2 AND status<>'canceled'::task_status")
             .bind(&message).bind(task_id).execute(&mut *tx).await?;
         Self::event(
             &mut tx,
@@ -878,7 +906,7 @@ impl Scheduler {
                 .bind(target).bind(error.chars().take(2000).collect::<String>())
                 .bind(item.workflow_id).execute(&mut *tx).await?;
             if !unknown {
-                sqlx::query("UPDATE tasks SET status='FAILED'::task_status,error_code='V2_WORKFLOW_FAILED',error_message=$1,updated_at=now() WHERE id=$2 AND status NOT IN ('PUBLISHED'::task_status,'CANCELED'::task_status)")
+                sqlx::query("UPDATE tasks SET status='failed'::task_status,error_code='V2_WORKFLOW_FAILED',error_message=$1,updated_at=now() WHERE id=$2 AND status NOT IN ('published'::task_status,'canceled'::task_status)")
                     .bind(error.chars().take(1000).collect::<String>())
                     .bind(item.task_id).execute(&mut *tx).await?;
             }
@@ -925,9 +953,9 @@ impl Scheduler {
     pub async fn stop_task_compat(&self, task_id: Uuid) -> AppResult<()> {
         let mut tx = self.db.pool.begin().await?;
         let row = sqlx::query(
-            "SELECT status::text AS status,stopped_status::text AS stopped
+            "SELECT upper(status::text) AS status,upper(stopped_status::text) AS stopped
              FROM tasks WHERE id=$1
-             AND EXISTS(SELECT 1 FROM vr2_managed_tasks WHERE task_id=$1)
+             AND EXISTS(SELECT 1 FROM tasks WHERE id=$1 AND runtime_owner='rust')
              FOR UPDATE",
         )
         .bind(task_id)
@@ -995,7 +1023,7 @@ impl Scheduler {
             .await?;
         }
         sqlx::query(
-            "UPDATE tasks SET stopped_status=$1::task_status,status='CANCELED'::task_status,updated_at=now() WHERE id=$2"
+            "UPDATE tasks SET stopped_status=lower($1)::task_status,status='canceled'::task_status,updated_at=now() WHERE id=$2"
         ).bind(status).bind(task_id).execute(&mut *tx).await?;
         tx.commit().await?;
         Ok(())
@@ -1005,8 +1033,8 @@ impl Scheduler {
     pub async fn resume_task_compat(&self, task_id: Uuid) -> AppResult<()> {
         let mut tx = self.db.pool.begin().await?;
         let row = sqlx::query(
-            "SELECT status::text AS status,stopped_status::text AS stopped FROM tasks
-             WHERE id=$1 AND EXISTS(SELECT 1 FROM vr2_managed_tasks WHERE task_id=$1)
+            "SELECT upper(status::text) AS status,upper(stopped_status::text) AS stopped FROM tasks
+             WHERE id=$1 AND EXISTS(SELECT 1 FROM tasks WHERE id=$1 AND runtime_owner='rust')
              FOR UPDATE",
         )
         .bind(task_id)
@@ -1042,7 +1070,7 @@ impl Scheduler {
             Self::event(&mut tx, id, None, "workflow.legacy_task_resumed", json!({})).await?;
         }
         sqlx::query(
-            "UPDATE tasks SET status=$1::task_status,stopped_status=NULL,updated_at=now() WHERE id=$2"
+            "UPDATE tasks SET status=lower($1)::task_status,stopped_status=NULL,updated_at=now() WHERE id=$2"
         ).bind(stopped).bind(task_id).execute(&mut *tx).await?;
         tx.commit().await?;
         Ok(())
@@ -1089,7 +1117,7 @@ impl Scheduler {
         } else {
             sqlx::query("UPDATE vr2_jobs SET state='canceled',lease_token=NULL,lease_until=NULL,updated_at=now() WHERE workflow_id=$1 AND state IN ('pending','running','awaiting')")
                 .bind(workflow_id).execute(&mut *tx).await?;
-            sqlx::query("UPDATE tasks SET status='CANCELED'::task_status,updated_at=now() WHERE id=$1 AND status<>'PUBLISHED'::task_status")
+            sqlx::query("UPDATE tasks SET status='canceled'::task_status,updated_at=now() WHERE id=$1 AND status<>'published'::task_status")
                 .bind(task_id).execute(&mut *tx).await?;
             sqlx::query("UPDATE vr2_workflows SET state='canceled',updated_at=now() WHERE id=$1")
                 .bind(workflow_id)
@@ -1208,7 +1236,7 @@ impl Scheduler {
             .ok_or_else(|| AppError::NotFound("workflow not found".into()))?;
         let task_id: Uuid = peek.try_get("task_id")?;
         let task_status: String =
-            sqlx::query_scalar("SELECT status::text FROM tasks WHERE id=$1 FOR UPDATE")
+            sqlx::query_scalar("SELECT upper(status::text) FROM tasks WHERE id=$1 FOR UPDATE")
                 .bind(task_id)
                 .fetch_one(&mut *tx)
                 .await?;

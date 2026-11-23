@@ -1,5 +1,5 @@
-//! Durable V2 operational alerts with the V1 management-page contract.
-//! Scan only V2-owned jobs; keep legacy alert_events strictly untouched.
+//! Shared operational alert feed using the original Python alert_events table.
+//! The scanner creates alerts only for Rust-owned stage failures.
 use crate::{AppError, AppResult, api::AppState};
 use axum::{
     Json, Router,
@@ -33,7 +33,7 @@ fn safe_limit(value: i64) -> AppResult<i64> {
     Ok(value)
 }
 const PROJECTION: &str =
-    "id, fingerprint, source, severity, status, title, message, details, occurrence_count,
+    "id, fingerprint, source, severity, status, title, message, details_json AS details, occurrence_count,
            first_seen_at, last_seen_at, acknowledged_at, resolved_at";
 
 fn row_json(row: &sqlx::postgres::PgRow) -> AppResult<Value> {
@@ -61,9 +61,9 @@ async fn list(
     check_status(status)?;
     let limit = safe_limit(query.limit.unwrap_or(200))?;
     let statement = format!(
-        "SELECT {PROJECTION} FROM vr2_alerts
+        "SELECT {PROJECTION} FROM alert_events
          WHERE ($1='all' OR ($1='active' AND status IN ('open','acknowledged')) OR status=$1)
-         AND ($2::uuid IS NULL OR details->>'task_id'=$2::text)
+         AND ($2::uuid IS NULL OR details_json->>'task_id'=$2::text)
          ORDER BY last_seen_at DESC,id LIMIT $3"
     );
     let rows = sqlx::query(&statement)
@@ -118,21 +118,21 @@ async fn report(
     validate(&payload)?;
     let statement = if payload.resolved {
         format!(
-            "UPDATE vr2_alerts SET status='resolved',resolved_at=now(),last_seen_at=now(),
-              details=$2,updated_at=now() WHERE fingerprint=$1
+            "UPDATE alert_events SET status='resolved',resolved_at=now(),last_seen_at=now(),
+              details_json=$2,updated_at=now() WHERE fingerprint=$1
              RETURNING {PROJECTION}"
         )
     } else {
         format!(
-            "INSERT INTO vr2_alerts(id,fingerprint,source,severity,title,message,details)
+            "INSERT INTO alert_events(id,fingerprint,source,severity,title,message,details_json)
              VALUES($7,$1,$2,$3,$4,$5,$6)
              ON CONFLICT(fingerprint) DO UPDATE SET
                source=EXCLUDED.source,severity=EXCLUDED.severity,title=EXCLUDED.title,
-               message=EXCLUDED.message,details=EXCLUDED.details,
-               occurrence_count=vr2_alerts.occurrence_count+1,last_seen_at=now(),
-               status=CASE WHEN vr2_alerts.status='resolved' THEN 'open' ELSE vr2_alerts.status END,
-               resolved_at=CASE WHEN vr2_alerts.status='resolved' THEN NULL ELSE vr2_alerts.resolved_at END,
-               acknowledged_at=CASE WHEN vr2_alerts.status='resolved' THEN NULL ELSE vr2_alerts.acknowledged_at END,
+               message=EXCLUDED.message,details_json=EXCLUDED.details_json,
+               occurrence_count=alert_events.occurrence_count+1,last_seen_at=now(),
+               status=CASE WHEN alert_events.status='resolved' THEN 'open' ELSE alert_events.status END,
+               resolved_at=CASE WHEN alert_events.status='resolved' THEN NULL ELSE alert_events.resolved_at END,
+               acknowledged_at=CASE WHEN alert_events.status='resolved' THEN NULL ELSE alert_events.acknowledged_at END,
                updated_at=now()
              RETURNING {PROJECTION}"
         )
@@ -162,7 +162,7 @@ async fn report(
 }
 async fn transition(state: &AppState, id: Uuid, status: &'static str) -> AppResult<Json<Value>> {
     let statement = format!(
-        "UPDATE vr2_alerts SET status=$2,
+        "UPDATE alert_events SET status=$2,
            acknowledged_at=CASE WHEN $2='acknowledged' THEN now() ELSE acknowledged_at END,
            resolved_at=CASE WHEN $2='resolved' THEN now() ELSE resolved_at END,
            updated_at=now()
@@ -204,7 +204,7 @@ async fn scan(State(state): State<AppState>) -> AppResult<Json<ScanResponse>> {
         "SELECT j.id,j.task_id,j.stage,j.state,j.last_error
          FROM vr2_jobs j
          JOIN vr2_workflows w ON w.id=j.workflow_id
-         JOIN vr2_managed_tasks m ON m.task_id=j.task_id
+         JOIN tasks m ON m.id=j.task_id AND m.runtime_owner='rust'
          WHERE j.state IN ('failed','unknown')
            AND w.generation=(SELECT MAX(x.generation) FROM vr2_workflows x WHERE x.task_id=j.task_id)
          ORDER BY j.updated_at DESC LIMIT 1000",
@@ -226,11 +226,11 @@ async fn scan(State(state): State<AppState>) -> AppResult<Json<ScanResponse>> {
         };
         let title = format!("V2 {} job {}", stage, status);
         let row = sqlx::query(&format!(
-            "INSERT INTO vr2_alerts(id,fingerprint,source,severity,title,message,details)
+            "INSERT INTO alert_events(id,fingerprint,source,severity,title,message,details_json)
              VALUES($1,$2,'v2_job',$3,$4,$5,$6)
              ON CONFLICT(fingerprint) DO UPDATE SET
              severity=EXCLUDED.severity,title=EXCLUDED.title,message=EXCLUDED.message,
-             details=EXCLUDED.details,last_seen_at=now(),updated_at=now()
+             details_json=EXCLUDED.details_json,last_seen_at=now(),updated_at=now()
              RETURNING {PROJECTION}"
         ))
         .bind(Uuid::new_v4())
@@ -245,12 +245,12 @@ async fn scan(State(state): State<AppState>) -> AppResult<Json<ScanResponse>> {
     }
     // Resolve ONLY alerts generated by this V2 scanner and no longer active.
     let resolved = sqlx::query(
-        "UPDATE vr2_alerts a SET status='resolved',resolved_at=now(),updated_at=now()
+        "UPDATE alert_events a SET status='resolved',resolved_at=now(),updated_at=now()
          WHERE a.source='v2_job' AND a.status!='resolved'
            AND NOT EXISTS(
              SELECT 1 FROM vr2_jobs j
              JOIN vr2_workflows w ON w.id=j.workflow_id
-             JOIN vr2_managed_tasks m ON m.task_id=j.task_id
+             JOIN tasks m ON m.id=j.task_id AND m.runtime_owner='rust'
              WHERE a.fingerprint=('vr2.job:'||j.id::text)
                AND j.state IN ('failed','unknown')
                AND w.generation=(SELECT MAX(x.generation) FROM vr2_workflows x WHERE x.task_id=j.task_id)

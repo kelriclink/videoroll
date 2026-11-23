@@ -35,13 +35,13 @@ impl Database {
     }
     pub async fn task(&self, id: Uuid) -> AppResult<TaskInfo> {
         sqlx::query_as::<_, TaskInfo>(
-            "SELECT id, source_type::text, source_url, status::text, error_code, error_message, priority, created_at, updated_at FROM tasks WHERE id=$1"
+            "SELECT id, source_type::text, source_url, upper(status::text) AS status, error_code, error_message, priority, created_at, updated_at FROM tasks WHERE id=$1"
         ).bind(id).fetch_optional(&self.pool).await?
             .ok_or_else(|| AppError::NotFound(format!("task {id}")))
     }
     pub async fn list_tasks(&self, limit: i64) -> AppResult<Vec<TaskInfo>> {
         Ok(sqlx::query_as::<_, TaskInfo>(
-            "SELECT id, source_type::text, source_url, status::text, error_code, error_message, priority, created_at, updated_at FROM tasks ORDER BY created_at DESC LIMIT $1"
+            "SELECT id, source_type::text, source_url, upper(status::text) AS status, error_code, error_message, priority, created_at, updated_at FROM tasks ORDER BY created_at DESC LIMIT $1"
         ).bind(limit.clamp(1, 200)).fetch_all(&self.pool).await?)
     }
     pub async fn list_assets(&self, task_id: Uuid) -> AppResult<Vec<AssetInfo>> {
@@ -62,7 +62,7 @@ impl Database {
     }
     pub async fn job_events(&self, workflow_id: Uuid) -> AppResult<Vec<Value>> {
         let rows: Vec<EventRow> = sqlx::query_as(
-            "SELECT id, job_id, kind, details, created_at FROM vr2_events WHERE workflow_id=$1 ORDER BY created_at ASC LIMIT 500"
+            "SELECT id, job_id, kind, details, created_at FROM workflow_events WHERE workflow_id=$1 ORDER BY created_at ASC LIMIT 500"
         ).bind(workflow_id).fetch_all(&self.pool).await?;
         Ok(rows
             .into_iter()

@@ -13,7 +13,7 @@ PARITY = ROOT / "rust/src/parity.rs"
 OUTPUT = ROOT / "rust/docs/CONTRACT_MATRIX.json"
 REPORT = ROOT / "rust/docs/CONTRACT_MATRIX.md"
 ADAPTER_RE = re.compile(
-    r'\(\s*"(?P<method>GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)"\s*,\s*"(?P<path>/[^"]+)"\s*,?\s*\)'
+    r'\(\s*"(?P<method>GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS|WEBSOCKET)"\s*,\s*"(?P<path>/[^"]+)"\s*,?\s*\)'
 )
 
 def collect():
@@ -21,17 +21,29 @@ def collect():
     refs = json.loads(FRONT.read_text())["references"]
     body = PARITY.read_text().split("const V1_ADAPTERS:", 1)[1].split("];", 1)[0]
     adapters = {(m.group("method"), m.group("path")) for m in ADAPTER_RE.finditer(body)}
+    # These two Bilibili publisher routes are no longer hosted in the old
+    # dedicated Python service; the Rust gateway exposes identical original
+    # paths under /api/v1 and verifies their full Python DTO with fixtures.
+    migrated_bili = {("GET","/bilibili/publish/settings"),
+                     ("PUT","/bilibili/publish/settings"),
+                     ("GET","/bilibili/auth/settings"),
+                     ("PUT","/bilibili/auth/settings"),
+                     ("GET","/bilibili/auth/me"),
+                     ("GET","/bilibili/archive/types"),
+                     ("GET","/bilibili/publish/jobs/{job_id}")}
+    def is_native_scope(r):
+        return (r["service"] == "orchestrator_api"
+                or (r["service"] == "youtube_ingest" and r["path"].startswith("/youtube/"))
+                or (r["service"] == "subtitle_service" and r["path"].startswith("/subtitle/"))
+                or (r["service"] == "bilibili_publisher" and
+                    (r["method"],r["path"]) in migrated_bili))
     original = {(r["method"], r["path"]) for r in routes
-                if r["service"] == "orchestrator_api"
-                or (r["service"]=="youtube_ingest" and r["path"]=="/youtube/ingest")}
+                if is_native_scope(r)}
     if adapters - original:
         raise ValueError("V1 adapter not in original routes: " + repr(sorted(adapters - original)))
     rows = []
     for source in routes:
-        adapted = ((source["service"] == "orchestrator_api"
-                    or (source["service"]=="youtube_ingest" and
-                        source["path"]=="/youtube/ingest")) and
-                   (source["method"], source["path"]) in adapters)
+        adapted = is_native_scope(source) and (source["method"], source["path"]) in adapters
         rows.append({
             "service":source["service"],"method":source["method"],"path":source["path"],
             "python_source":source["file"]+":"+str(source["line"]),
