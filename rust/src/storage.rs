@@ -482,6 +482,11 @@ impl AssetRegistry {
             let unfinished:(bool,)=sqlx::query_as(
                 "SELECT EXISTS(SELECT 1 FROM storage_objects WHERE storage_key LIKE ($1 || '/%') AND state<>'deleted')"
             ).bind(&key).fetch_one(&self.db.pool).await?;
+            // The legacy inbox is the durable source of active pipeline operations.
+            // A terminal task row alone does not prove its worker has released files.
+            let active_operation: (bool,) = sqlx::query_as(
+                "SELECT EXISTS(SELECT 1 FROM operation_inbox WHERE task_id=$1 AND status IN ('pending','awaiting','running','processing'))"
+            ).bind(task_id).fetch_one(&self.db.pool).await?;
             let legacy_ref:(bool,)=sqlx::query_as(
                 "SELECT EXISTS(SELECT 1 FROM assets WHERE storage_key LIKE ($1 || '/%') UNION ALL SELECT 1 FROM subtitles WHERE storage_key LIKE ($1 || '/%'))"
             ).bind(&key).fetch_one(&self.db.pool).await?;
@@ -493,6 +498,7 @@ impl AssetRegistry {
             if !expected
                 || parents.0
                 || unfinished.0
+                || active_operation.0
                 || legacy_ref.0
                 || !matches!(task_state.as_str(), "PUBLISHED" | "FAILED" | "CANCELED")
             {
