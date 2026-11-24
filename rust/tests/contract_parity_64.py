@@ -57,6 +57,17 @@ mapped = [r for r in matrix["routes"] if r["v1_status"]!="not_native_v1"
 assert len(mapped)+len(standalone)+len(social)+len(service_health) == matrix["native_v1_partial"], "Route count and parity matrix disagree"
 if args.all_services:
     assert not args.ws_only
+    # Guard before ANY request or fixture mutation.
+    from urllib.parse import urlsplit
+    db_url = urlsplit(os.environ["DATABASE_URL"])
+    assert db_url.hostname == "127.0.0.1" and db_url.path == "/videoroll_test"
+    assert token == "v2-local-test-only-0123456789abcdef"
+    assert os.environ["INTERNAL_API_SECRET"] == "rust-local-test-internal-secret"
+    import psycopg
+    embedding_root = root / "target/v2-smoke-embedding-models"
+    embedding_root.mkdir(parents=True, exist_ok=True)
+    with psycopg.connect(os.environ["DATABASE_URL"]) as db:
+        db.execute("""INSERT INTO app_settings(key,value_json) VALUES ('subtitle.translate',jsonb_build_object('rag_embedding_model_dir',%s::text)) ON CONFLICT(key) DO UPDATE SET value_json=COALESCE(app_settings.value_json,'{}'::jsonb)||EXCLUDED.value_json""", (str(embedding_root),))
     # Preserve orchestrator coverage separately from the original standalone
     # services. A proxy success cannot stand in for a standalone response.
     mapped=[r for r in matrix["routes"] if r["v1_status"]!="not_native_v1" and r["service"]=="orchestrator_api"]
@@ -514,12 +525,86 @@ if args.all_services:
                 except (OSError,urllib.error.URLError):pass
                 time.sleep(.15)
             else:raise RuntimeError(f"{service} health timeout")
-            for row in (r for r in service_rows if r["service"]==service):
+            # Use real IDs returned by create routes, and run deletion last.
+            provider_base="/subtitle/translate/model-providers"
+            source_base="/youtube/sources"
+            knowledge_base="/subtitle/knowledge/items"
+            service_context={**context,"platform":"douyin","account_id":fake,"session_id":fake}
+            # Each original service gets its own persisted, disposable fixtures.
+            with psycopg.connect(os.environ["DATABASE_URL"]) as db:
+                if service=="subtitle_service":
+                    task_id,job_id,run_id,source_id,entry_id=[str(uuid.uuid4()) for _ in range(5)]
+                    db.execute("INSERT INTO tasks(id,source_type,source_license,status) VALUES (%s,'local','own','subtitle_ready')",(task_id,))
+                    db.execute("INSERT INTO subtitle_jobs(id,task_id,status,progress) VALUES (%s,%s,'completed',100)",(job_id,task_id))
+                    db.execute("INSERT INTO translation_agent_runs(id,task_id,subtitle_job_id,status,term) VALUES (%s,%s,%s,'completed','contract term')",(run_id,task_id,job_id))
+                    db.execute("INSERT INTO translation_dictionary_sources(id,name,slug,source_lang,target_lang,entry_count) VALUES (%s,'Contract dictionary',%s,'en','zh',1)",(source_id,'contract-'+source_id))
+                    db.execute("INSERT INTO translation_dictionary_entries(id,source_id,source_lang,target_lang,term,normalized_term,translations,translation_text) VALUES (%s,%s,'en','zh','contract term','contract term','[\"测试术语\"]'::jsonb,'测试术语')",(entry_id,source_id))
+                    service_context.update(task_id=task_id,job_id=job_id,run_id=run_id,source_id=source_id,entry_id=entry_id)
+                elif service=="bilibili_publisher":
+                    task_id,job_id=[str(uuid.uuid4()) for _ in range(2)]
+                    db.execute("INSERT INTO tasks(id,source_type,source_license,status) VALUES (%s,'local','own','ready_for_review')",(task_id,))
+                    db.execute("INSERT INTO publish_jobs(id,task_id,platform,state) VALUES (%s,%s,'bilibili','draft')",(job_id,task_id))
+                    service_context.update(task_id=task_id,job_id=job_id)
+                elif service=="social_publisher":
+                    account_id=str(uuid.uuid4())
+                    db.execute("INSERT INTO accounts(id,platform,name,check_state) VALUES (%s,'douyin',%s,'unchecked')",(account_id,'contract-'+account_id))
+                    service_context.update(account_id=account_id)
+            if service=="subtitle_service":
+                # A named disposable model for each delete endpoint, never the deployed model directory.
+                model_name="contract-model-"+uuid.uuid4().hex[:12]
+                whisper_root=Path(os.environ["SUBTITLE_WHISPER_MODEL_DIR"])
+                assert whisper_root == root / "target/v2-smoke-whisper-models"
+                for directory in (whisper_root,embedding_root):
+                    (directory/model_name).mkdir(parents=True,exist_ok=False)
+                    (directory/model_name/"config.json").write_text("{}")
+                service_context["name"]=model_name
+            lifecycle_order={
+                ("POST",provider_base):0,
+                ("GET",provider_base+"/{provider_id}/remote-models"):1,
+                ("PUT",provider_base+"/{provider_id}"):2,
+                ("DELETE",provider_base+"/{provider_id}"):3,
+                ("POST",source_base):0,
+                ("PATCH",source_base+"/{source_pk}"):1,
+                ("POST",source_base+"/{source_pk}/scan"):2,
+                ("POST",source_base+"/{source_pk}/scan/start"):3,
+                ("DELETE",source_base+"/{source_pk}"):4,
+                ("POST",knowledge_base):0,
+                ("DELETE",knowledge_base+"/{item_id}"):4,
+                ("POST","/subtitle/dictionaries/promote"):1,
+                ("PUT","/subtitle/dictionaries/entries/{entry_id}"):2,
+                ("PUT","/subtitle/dictionaries/sources/{source_id}"):2,
+                ("DELETE","/subtitle/dictionaries/entries/{entry_id}"):3,
+                ("DELETE","/subtitle/dictionaries/sources/{source_id}"):4,
+                ("DELETE","/accounts/{account_id}"):4,
+            }
+            service_order=sorted((r for r in service_rows if r["service"]==service),
+                key=lambda r:lifecycle_order.get((r["method"],r["path"]),1))
+            for row in service_order:
                 template=row["path"];method=row["method"];path=template
-                ctx={**context,"platform":"douyin","account_id":fake,"session_id":fake}
+                ctx=service_context
                 for field in re.findall(r"\{([^{}]+)\}",path):
                     path=path.replace("{"+field+"}",ctx.get(field,fake))
                 body=None if method in ("GET","DELETE") else bodies.get(template,{})
+                if template==provider_base and method=="POST":
+                    body={"name":"Contract catalog fixture","base_url":"http://127.0.0.1:18088/v1","api_key":"model-test-key","models":[{"id":"model-z"}]}
+                elif template==provider_base+"/{provider_id}" and method=="PUT":
+                    body={"name":"Contract catalog updated","base_url":"http://127.0.0.1:18088/v1","models":[{"id":"model-b"}]}
+                elif template==source_base and method=="POST":
+                    body={"source_type":"channel","source_id":"UC12345678901234567890","license":"authorized","auto_process":False}
+                elif template==source_base+"/{source_pk}" and method=="PATCH":
+                    body={"display_name":"Contract source","scan_limit":2,"auto_process":False}
+                elif template in (source_base+"/{source_pk}/scan",source_base+"/{source_pk}/scan/start"):
+                    body={"limit":2,"auto_process":False}
+                if template=="/subtitle/dictionaries/promote":
+                    body={"entry_id":ctx["entry_id"]}
+                elif template=="/subtitle/dictionaries/entries/{entry_id}" and method=="PUT":
+                    body={"enabled":True}
+                elif template=="/subtitle/dictionaries/sources/{source_id}" and method=="PUT":
+                    body={"description":"updated contract fixture"}
+                elif template=="/subtitle/embedding/models/download":
+                    body={"model":"BAAI/bge-small-zh-v1.5","name":"contract-download-"+uuid.uuid4().hex[:12],"model_dir":str(embedding_root)}
+                elif template=="/subtitle/embedding/models/list":
+                    body={"model_dir":str(embedding_root)}
                 if service=="egress_gateway" and template=="/fetch":
                     # A private target must be rejected by the SSRF guard;
                     # never access a real outside resource in a broad probe.
@@ -534,6 +619,29 @@ if args.all_services:
                         probe="positive" if 200<=code<300 else "rejection" if 400<=code<500 else "failed",issue=None)
                     if code==404:
                         record["issue"]="standalone_route_or_fixture_not_found"
+                    elif code>=500:
+                        record["issue"]="standalone_server_error"
+                        if isinstance(obj,dict):record["error_detail"]=str(obj.get("detail",""))[:300]
+                    if 200<=code<300 and method=="POST" and isinstance(obj,dict):
+                        if template==provider_base:
+                            ctx["provider_id"]=obj["id"]
+                        elif template==source_base:
+                            ctx["source_pk"]=obj["id"]
+                        elif template==knowledge_base:
+                            ctx["item_id"]=obj["id"]
+                    if template==provider_base+"/{provider_id}/remote-models":
+                        if code!=200 or not isinstance(obj,dict) or obj.get("details",{}).get("model-z")!={"context_window":131072,"max_output_tokens":8192}:
+                            record["probe"]="failed"
+                            record["issue"]="catalog_fixture_assertion_failed"
+                    if template==source_base+"/{source_pk}/scan/start" and code==202:
+                        for _ in range(80):
+                            sc,_,listing=service_call(port,"GET",source_base)
+                            item=next((v for v in listing if v["id"]==ctx["source_pk"]),None) if sc==200 and isinstance(listing,list) else None
+                            if item and not item["scan_running"] and item["last_scan_finished_at"]:
+                                break
+                            time.sleep(.1)
+                        else:
+                            record["probe"]="failed";record["issue"]="source_scan_timeout"
                     if template!="/health":
                         unauth,_,_=service_call(port,method,path,auth=False)
                         record["unauthorized_status"]=unauth
@@ -557,7 +665,7 @@ summary={"standalone_egress_routes":len(standalone),
          "rejection_only":sum(r["probe"]=="rejection" for r in results),
          "failed":sum(bool(r["probe"]=="failed" or r.get("issue") in ("server_failure_or_unexpected_auth", "public_health_or_auth_status_incompatible", "unauthenticated_request_not_rejected", "standalone_auth_or_method_rejected")) for r in results),
          "blocked":sum(r["probe"]=="blocked" for r in results),
-         "limited":sum(bool(r.get("issue") in ("existing_fixture_read_returned_404","native_bilibili_disabled_in_isolated_test")) for r in results),
+         "limited":sum(bool(r.get("issue") in ("existing_fixture_read_returned_404","standalone_route_or_fixture_not_found","native_bilibili_disabled_in_isolated_test")) for r in results),
          "full_python_parity_verified":0,
          "cookie_login_status":cookie_status,
          "environment":"disposable Postgres, mocked platform services; no production writes"}
@@ -597,7 +705,7 @@ report_path.write_text("\n".join(lines)+"\n"+appendix)
 print("contract_probe_summary="+json.dumps(summary,ensure_ascii=False))
 for r in results:
     if r.get("issue"):
-        print("ISSUE",r["method"],r["path"],r["http_status"],r["issue"])
+        print("ISSUE",r["service"],r["method"],r["path"],r["http_status"],r["issue"])
 # Fail the test process on actual server/auth failures, not expected business rejections.
 if summary["failed"]:
     raise SystemExit(2)

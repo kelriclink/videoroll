@@ -223,32 +223,52 @@ for worker,task,dub,job,exe in (
     execute("""UPDATE render_jobs
                SET request_json=jsonb_build_object('dubbing_job_id',CAST(:dub AS text))
                WHERE id=:id""",{"dub":str(dub),"id":job})
+    execute("UPDATE dubbing_jobs SET output_json=output_json||jsonb_build_object('render_job_id',CAST(:job AS text)) WHERE id=:dub",
+            {"job":str(job),"dub":dub})
 with Session(engine) as s:
     p=py.cancel_execution(s,P2_PY_EX,"operator canceled P2")
     py_cancel=py.execution_admin_payload(s,p)
-code,ru_cancel=request("POST",f"/render-management/executions/{P2_RU_EX}/cancel",
-                      {"reason":"operator canceled P2"})
+# A Python-owned task cannot be canceled by the Rust P2 path. The
+# complete transaction must roll back, including lease and worker slot.
+def p2_snapshot(dub,job,exe):
+    return (dict(read("SELECT status,error_message,output_json FROM dubbing_jobs WHERE id=:id",{"id":dub})),
+            job_state(job),dict(read("SELECT state,error_message FROM render_executions WHERE id=:id",{"id":exe})),
+            read("SELECT active_jobs FROM render_workers WHERE id=:id",{"id":RU_ID})["active_jobs"])
+before=p2_snapshot(P2_RU_DUB,P2_RU_JOB,P2_RU_EX)
+path=f"/render-management/executions/{P2_RU_EX}/cancel"
+assert request("POST",path,{"reason":"operator canceled P2"})[0]==409
+assert p2_snapshot(P2_RU_DUB,P2_RU_JOB,P2_RU_EX)==before
+# Model an already audited owner cutover using only the disposable fixture.
+execute("UPDATE tasks SET runtime_owner='rust' WHERE id=:id",{"id":TASK_RU})
+execute("UPDATE dubbing_jobs SET output_json=output_json||jsonb_build_object('render_job_id','wrong') WHERE id=:id",{"id":P2_RU_DUB})
+wrong=p2_snapshot(P2_RU_DUB,P2_RU_JOB,P2_RU_EX)
+assert request("POST",path,{"reason":"operator canceled P2"})[0]==409
+assert p2_snapshot(P2_RU_DUB,P2_RU_JOB,P2_RU_EX)==wrong
+execute("UPDATE dubbing_jobs SET output_json=output_json||jsonb_build_object('render_job_id',CAST(:job AS text)) WHERE id=:id",{"job":str(P2_RU_JOB),"id":P2_RU_DUB})
+code,ru_cancel=request("POST",path,{"reason":"operator canceled P2"})
 assert code==200,(code,ru_cancel)
 for field in ("state","error_message","job_status"):
     assert py_cancel[field]==ru_cancel[field],(field,py_cancel,ru_cancel)
 py_dub=read("SELECT status,error_message,output_json FROM dubbing_jobs WHERE id=:id",{"id":P2_PY_DUB})
 ru_dub=read("SELECT status,error_message,output_json FROM dubbing_jobs WHERE id=:id",{"id":P2_RU_DUB})
-for field in ("status","error_message","output_json"):
+for field in ("status","error_message"):
     assert py_dub[field]==ru_dub[field],(field,py_dub,ru_dub)
+assert ru_dub["output_json"]=={**py_dub["output_json"],"render_job_id":str(P2_RU_JOB)}
 assert ru_dub["status"]=="failed" and ru_dub["error_message"]=="P2 render canceled: operator canceled P2"
 py_evt=read("SELECT * FROM outbox_events WHERE aggregate_id=:id",{"id":str(P2_PY_DUB)})
-ru_evt=read("SELECT * FROM outbox_events WHERE aggregate_id=:id",{"id":str(P2_RU_DUB)})
-assert py_evt and ru_evt
-for field in ("event_type","aggregate_type","task_name","status"):
-    assert py_evt[field]==ru_evt[field],(field,py_evt,ru_evt)
-assert ru_evt["args_json"]=={"args":[str(P2_RU_DUB),"failed",
-    "P2 render canceled: operator canceled P2"],"queue":"subtitle-control"}
-assert ru_evt["operation_key"]==f"workflow-dubbing-finished:{P2_RU_DUB}:failed"
-code,_=request("POST",f"/render-management/executions/{P2_RU_EX}/cancel",
-              {"reason":"duplicate cancel P2"})
-assert code==200
-assert read("SELECT count(*) AS n FROM outbox_events WHERE aggregate_id=:id",{"id":str(P2_RU_DUB)})["n"]==1
-print("PASS DIFF: P2 cancel updates DubbingJob and inserts exactly one durable Python workflow.dubbing.finished outbox in same transaction")
+assert py_evt and py_evt["task_name"]=="subtitle_service.push_dubbing_workflow_event"
+key=f"workflow-dubbing-finished:{P2_RU_DUB}:failed"
+def receipt():
+    return read("SELECT runtime_engine,status,task_id,request_json,result_json FROM operation_inbox WHERE operation_key=:key",{"key":key})
+row=receipt()
+assert row and row["runtime_engine"]=="rust-render-events" and row["status"]=="completed"
+assert row["task_id"]==TASK_RU
+assert row["request_json"]=={"dubbing_job_id":str(P2_RU_DUB),"render_job_id":str(P2_RU_JOB),"execution_id":str(P2_RU_EX)}
+assert row["result_json"]=={"status":"failed","error":ru_dub["error_message"]}
+assert request("POST",path,{"reason":"duplicate cancel P2"})[0]==200
+assert receipt()==row
+assert read("SELECT count(*) AS n FROM outbox_events WHERE aggregate_id=:id",{"id":str(P2_RU_DUB)})["n"]==0
+print("PASS DIFF: P2 cancellation business outcome matches Python; native receipt replaces old broker event; wrong binding and Python owner roll back")
 
 P2_PY_DUB2=uuid.UUID("00000000-0000-0000-0000-000000010207")
 P2_RU_DUB2=uuid.UUID("00000000-0000-0000-0000-000000010208")
@@ -268,26 +288,22 @@ for worker,task,dub,job,exe in (
     execute("""UPDATE render_jobs
                SET request_json=jsonb_build_object('dubbing_job_id',CAST(:dub AS text))
                WHERE id=:id""",{"dub":str(dub),"id":job})
+    execute("UPDATE dubbing_jobs SET output_json=output_json||jsonb_build_object('render_job_id',CAST(:job AS text)) WHERE id=:dub",
+            {"job":str(job),"dub":dub})
 with Session(engine) as s:
     p=py.requeue_execution(s,P2_PY_EX2,"operator resume P2")
     py_result=py.execution_admin_payload(s,p)
+# Python can requeue a historical job into its broker; Rust-owned legacy
+# rows intentionally cannot be requeued into a retired consumer.
+before=p2_snapshot(P2_RU_DUB2,P2_RU_JOB2,P2_RU_EX2)
 code,ru_result=request("POST",f"/render-management/executions/{P2_RU_EX2}/requeue",
                        {"reason":"operator resume P2"})
-assert code==200,(code,ru_result)
-for field in ("state","error_message","job_status"):
-    assert py_result[field]==ru_result[field],(field,py_result,ru_result)
+assert code==409,(code,ru_result)
+assert p2_snapshot(P2_RU_DUB2,P2_RU_JOB2,P2_RU_EX2)==before
 py_dub=read("SELECT status,error_message,output_json FROM dubbing_jobs WHERE id=:id",{"id":P2_PY_DUB2})
-ru_dub=read("SELECT status,error_message,output_json FROM dubbing_jobs WHERE id=:id",{"id":P2_RU_DUB2})
-for field in ("status","error_message","output_json"):
-    assert py_dub[field]==ru_dub[field],(field,py_dub,ru_dub)
-assert ru_dub["status"]=="rendering" and ru_dub["output_json"]["youdub"]["stage"]=="rendering_p2"
-same(job_state(P2_PY_JOB2),job_state(P2_RU_JOB2),["status","retry_count","lease_owner"])
-assert request("POST",f"/render-management/executions/{P2_RU_EX2}/requeue",
-               {"reason":"repeat P2"})[0]==200
-assert job_state(P2_RU_JOB2)["retry_count"]==1
-assert read("SELECT count(*) AS n FROM outbox_events WHERE aggregate_id=:id",
-            {"id":str(P2_RU_DUB2)})["n"]==0
-print("PASS DIFF: P2 requeue resumes paused dubbing and clears old lease without spurious finish notification")
+assert py_dub["status"]=="rendering" and job_state(P2_PY_JOB2)["retry_count"]==1
+assert read("SELECT count(*) AS n FROM outbox_events WHERE aggregate_id=:id",{"id":str(P2_RU_DUB2)})["n"]==0
+print("PASS intentional difference: Python legacy P2 requeue works; Rust-owned legacy P2 requeue returns 409 without mutation")
 
 # Subtitle profile: compare same default Python normalized dictionary and Rust GET.
 execute("DELETE FROM app_settings WHERE key='subtitle.auto_profile'")
