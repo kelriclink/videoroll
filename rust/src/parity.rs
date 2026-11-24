@@ -53,6 +53,7 @@ const V1_ADAPTERS: &[(&str, &str)] = &[
     ("GET", "/settings/dubbing/jobs/summary"),
     ("GET", "/settings/dubbing"),
     ("GET", "/settings/dubbing/native"),
+    ("PUT", "/settings/dubbing/native"),
     ("GET", "/render-management/connection"),
     ("PUT", "/render-management/connection"),
     ("GET", "/render-management/enrollments"),

@@ -157,6 +157,19 @@ if [[ "${VIDEOROLL_V2_TEST_TERMINAL_ONLY:-false}" == "true" ]]; then
 fi
 export VIDEOROLL_V2_YOUDUB_BRIDGE="$repo_root/rust/tests/mock_youdub_bridge.py"
 export VIDEOROLL_V2_YOUDUB_RUNTIME="$repo_root/rust/target/mock-youdub-v2"
+if [[ "${VIDEOROLL_V2_TEST_YOUDUB_CONTROL_ONLY:-false}" == "true" ]]; then
+  # Only in the disposable YouDub-control test: never query/load the real GPU.
+  gpu_tools="$repo_root/rust/target/mock-youdub-control-tools"
+  mkdir -p "$gpu_tools"
+  printf '16000\n' >"$gpu_tools/free-mb.txt"
+  cat >"$gpu_tools/nvidia-smi" <<'MOCK_GPU'
+#!/bin/sh
+cat "$(dirname "$0")/free-mb.txt"
+MOCK_GPU
+  chmod 700 "$gpu_tools/nvidia-smi"
+  export PATH="$gpu_tools:$PATH"
+fi
+
 mkdir -p "$VIDEOROLL_V2_PLAYOUT_ROOT"
 python3 "$repo_root/rust/tests/mock_legacy_api.py" > "$repo_root/rust/target/v2-mock-legacy.log" 2>&1 &
 legacy_pid=$!
@@ -196,6 +209,12 @@ if [[ "${VIDEOROLL_V2_TEST_TERMINAL_ONLY:-false}" == "true" ]]; then
   container_name="$container_name" PYTHONPATH="$repo_root/src" /opt/videoroll/venvs/core/bin/python \
     "$repo_root/rust/tests/maintenance_terminal_storage_v1_isolated.py"
   echo 'PASS: original terminal storage cleanup matches safe V1 behavior'
+  exit 0
+fi
+if [[ "${VIDEOROLL_V2_TEST_YOUDUB_CONTROL_ONLY:-false}" == "true" ]]; then
+  PYTHONPATH="$repo_root/src" /opt/videoroll/venvs/core/bin/python \
+    "$repo_root/rust/tests/youdub_control_v1_isolated.py"
+  echo 'PASS: YouDub original native configure and resident process management'
   exit 0
 fi
 if [[ "${VIDEOROLL_V2_TEST_WORKDIR_ONLY:-false}" == "true" ]]; then
