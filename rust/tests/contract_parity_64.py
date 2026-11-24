@@ -42,9 +42,11 @@ matrix = json.loads((root/"docs/CONTRACT_MATRIX.json").read_text())
 # for evidence about the dedicated Egress Gateway.
 standalone = [r for r in matrix["routes"] if r["service"]=="egress_gateway"
               and r["v1_status"]!="not_native_v1"]
+social = [r for r in matrix["routes"] if r["service"]=="social_publisher"
+          and r["v1_status"]!="not_native_v1"]
 mapped = [r for r in matrix["routes"] if r["v1_status"]!="not_native_v1"
-          and r["service"]!="egress_gateway"]
-assert len(mapped)+len(standalone) == matrix["native_v1_partial"], "Route count and parity matrix disagree"
+          and r["service"] not in ("egress_gateway","social_publisher")]
+assert len(mapped)+len(standalone)+len(social) == matrix["native_v1_partial"], "Route count and parity matrix disagree"
 jar = http.cookiejar.CookieJar()
 opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
 anonymous = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
@@ -439,6 +441,7 @@ for row in ordered:
 
 assert {(r["method"],r["path"]) for r in results} == {(r["method"],r["path"]) for r in mapped}
 summary={"standalone_egress_routes":len(standalone),
+         "standalone_sau_routes":len(social),
          "probed":len(results),
          "positive":sum(r["probe"]=="positive" for r in results),
          "rejection_only":sum(r["probe"]=="rejection" for r in results),

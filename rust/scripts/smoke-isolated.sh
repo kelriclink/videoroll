@@ -246,6 +246,12 @@ if [[ "${VIDEOROLL_V2_TEST_DESKTOP_ONLY:-false}" == "true" ]]; then
   echo 'PASS: original Python/Rust desktop grant cookie and reconnect fence'
   exit 0
 fi
+if [[ "${VIDEOROLL_V2_TEST_SAU_ACCOUNTS_ONLY:-false}" == "true" ]]; then
+  "$CARGO_HOME/bin/cargo" build --manifest-path "$repo_root/rust/Cargo.toml"     --bin videoroll-sau --locked --offline --quiet
+  PYTHONPATH="$repo_root/src" /opt/videoroll/venvs/core/bin/python     "$repo_root/rust/tests/sau_account_native_v1_isolated.py"
+  echo "PASS: standalone SAU health, original account listing and safe revocation"
+  exit 0
+fi
 if [[ "${VIDEOROLL_V2_TEST_REMOTE_AUTO_ONLY:-false}" == "true" ]]; then
   PYTHONPATH="$repo_root/src" /opt/videoroll/venvs/core/bin/python \
     "$repo_root/rust/tests/remote_auto_youtube_v1_isolated.py"
@@ -440,6 +446,9 @@ curl --silent --fail-with-body -c "$jar" -H 'content-type: application/json' \
 curl --silent --fail-with-body -b "$jar" \
   http://127.0.0.1:18080/api/v2/tasks | grep -q '0123456789A'
 echo 'PASS: native admin setup/login and browser cookie compatibility'
+"$CARGO_HOME/bin/cargo" build --manifest-path "$repo_root/rust/Cargo.toml"   --bin videoroll-sau --locked --offline --quiet
+PYTHONPATH="$repo_root/src" /opt/videoroll/venvs/core/bin/python   "$repo_root/rust/tests/sau_account_native_v1_isolated.py"
+
 # Test the Nginx desktop auth_request boundary only after native admin auth
 # is established; use disposable Python V1 cookie and original grant schema.
 PYTHONPATH="$repo_root/src" /opt/videoroll/venvs/core/bin/python \

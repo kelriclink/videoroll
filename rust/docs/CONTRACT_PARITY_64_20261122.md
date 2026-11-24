@@ -1,6 +1,6 @@
 # VideoRoll Rust V1 部分适配 API：192 条逐接口探测
 
-测试日期：2026-11-24T08:06:03.793771+00:00。
+测试日期：2026-11-24T08:26:00.038893+00:00。
 环境：隔离 PostgreSQL + 本地模拟平台，不使用生产账号、生产数据库或真实投稿。
 独立 Egress Gateway 另有 2 条接口，需运行专项 HTTP/SSRF 套件；不计入本 API 探测。
 注意：HTTP 请求得到响应不代表与 Python 完全等价；仅拒绝路径不代表正向业务通过。
@@ -251,3 +251,14 @@
   SELECT FOR UPDATE 原子行锁，与 Python V1 跨进程交叉验证，
   参见 DESKTOP_GRANTS_NATIVE_V1.md。
 - 不依赖管理员 API Token；生产 Nginx / SAU 真实 noVNC 尚未签收。
+
+## 2026-11-24：独立 Rust SAU 原生账号服务
+
+- 原 social_publisher GET /health、GET /accounts、
+  DELETE /accounts/{account_id} 由独立 Rust binary 实现。
+- 复用 original accounts/publish_jobs，Python HMAC 认证、
+  ORM SocialAccountRead 字段和 busy 提交行锁交叉验收。
+- 保留 unknown 投稿收据、重启时仍能读取撤销状态，不允许通用
+  管理 API Token 读取/撤销社交账号。详见 SAU_ACCOUNTS_NATIVE_V1.md。
+- Cookie 导入、真实账号校验、浏览器登录与 SAU 投稿仍未映射；
+  在这些业务迁移完成之前不得将原 SAU 全部切换至此二进制。

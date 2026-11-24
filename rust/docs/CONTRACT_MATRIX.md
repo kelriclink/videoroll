@@ -5,8 +5,8 @@
 全部完成状态只允许结合 API 契约、权限、并发、重启、外部副作用与设备测试证据填写。
 
 - 原版声明：217
-- 原生 V1 部分适配：194
-- 无原生 V1 入口：23
+- 原生 V1 部分适配：197
+- 无原生 V1 入口：20
 - 已完成全面验收：0
 - 前端引用文本：193
 
@@ -15,7 +15,7 @@
 | bilibili_publisher | 10 | 9 | 1 |
 | egress_gateway | 2 | 2 | 0 |
 | orchestrator_api | 132 | 121 | 11 |
-| social_publisher | 9 | 0 | 9 |
+| social_publisher | 9 | 3 | 6 |
 | subtitle_service | 55 | 54 | 1 |
 | youtube_ingest | 9 | 8 | 1 |
 
@@ -167,11 +167,11 @@
 | orchestrator_api | GET | /youtube/{service_path:path} | not_native_v1 | proxy_youtube_browser_operation |
 | orchestrator_api | PATCH | /youtube/{service_path:path} | not_native_v1 | proxy_youtube_browser_operation |
 | orchestrator_api | POST | /youtube/{service_path:path} | not_native_v1 | proxy_youtube_browser_operation |
-| social_publisher | GET | /accounts | not_native_v1 | list_accounts |
-| social_publisher | DELETE | /accounts/{account_id} | not_native_v1 | delete_account |
+| social_publisher | GET | /accounts | native_adapter_partial | list_accounts |
+| social_publisher | DELETE | /accounts/{account_id} | native_adapter_partial | delete_account |
 | social_publisher | POST | /accounts/{account_id}/check | not_native_v1 | recheck_account |
 | social_publisher | POST | /accounts/{platform} | not_native_v1 | import_account |
-| social_publisher | GET | /health | not_native_v1 | health |
+| social_publisher | GET | /health | native_adapter_partial | health |
 | social_publisher | POST | /login-sessions/{platform} | not_native_v1 | start_login_session |
 | social_publisher | DELETE | /login-sessions/{session_id} | not_native_v1 | cancel_login_session |
 | social_publisher | GET | /login-sessions/{session_id} | not_native_v1 | get_login_session |
