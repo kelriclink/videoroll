@@ -1,6 +1,6 @@
 //! Standalone Rust-compatible subset of the original Python social_publisher.
-//! Only account listing, safe account revocation and health are native here.
-//! Browser login, account checking and external publication remain unmapped.
+//! Native account listing, safe revocation, health and durable publish intake.
+//! Browser execution remains a dedicated SAU worker.
 use crate::{AppError, AppResult};
 use axum::{
     Json, Router,
@@ -26,6 +26,7 @@ const HEADER: &str = "x-videoroll-internal-token";
 #[derive(Clone)]
 pub struct SauState {
     pub pool: PgPool,
+    pub(crate) publish_outbox_enabled: bool,
     token: String,
 }
 impl SauState {
@@ -49,6 +50,10 @@ impl SauState {
         mac.update(SERVICE_CONTEXT);
         Ok(Self {
             pool,
+            publish_outbox_enabled: std::env::var("VIDEOROLL_V2_SAU_ENABLE_BROWSER_OUTBOX")
+                .ok()
+                .as_deref()
+                == Some("true"),
             token: format!("v1.{}", hex::encode(mac.finalize().into_bytes())),
         })
     }
@@ -182,6 +187,10 @@ pub fn router(state: Arc<SauState>) -> Router {
     let protected = Router::new()
         .route("/accounts", get(list_accounts))
         .route("/accounts/{account_id}", delete(disable_account))
+        .route(
+            "/sau/{platform}/publish",
+            axum::routing::post(crate::sau_publish_native_v1::publish),
+        )
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             authentication,

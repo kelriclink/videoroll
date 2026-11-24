@@ -1,5 +1,5 @@
-//! Rust SAU original-service account API subset. Not a replacement for the
-//! browser login/publish worker until the remaining endpoints are verified.
+//! Native SAU account and submission intake API. The dedicated browser
+//! worker and its original outbox dispatcher remain separate components.
 use std::{net::SocketAddr, sync::Arc};
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -22,7 +22,7 @@ async fn main() -> anyhow::Result<()> {
         anyhow::bail!("SAU must bind loopback unless container binding explicitly enabled")
     }
     let listener = tokio::net::TcpListener::bind(bind).await?;
-    tracing::info!(address=%bind,"native Rust SAU account subsystem ready");
+    tracing::info!(address=%bind,"native Rust SAU intake subsystem ready");
     axum::serve(listener, videoroll_v2::sau_account_native_v1::router(state)).await?;
     Ok(())
 }
