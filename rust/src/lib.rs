@@ -88,6 +88,8 @@ pub mod system_resources;
 pub mod task_manual;
 pub mod telemetry;
 pub mod youdub_control_v1;
+pub mod youtube_home_feed_v1;
+pub mod youtube_home_run_v1;
 pub mod youtube_meta;
 pub mod youtube_settings_v1;
 pub mod youtube_sources_v1;

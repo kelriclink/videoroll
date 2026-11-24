@@ -79,13 +79,33 @@ impl Scheduler {
         }
         let task_id = Uuid::new_v4();
         let workflow_id = Uuid::new_v4();
-        let run_id = Uuid::new_v4().to_string();
+        let run_id = Uuid::new_v4().simple().to_string();
+        let home_scan = auto_process
+            && configuration.get("origin").and_then(Value::as_str) == Some("youtube_home_scan");
+        let origin = if home_scan {
+            "youtube_home_scan"
+        } else if auto_process {
+            "auto_youtube"
+        } else {
+            "source_scan"
+        };
+        let created_by = if home_scan {
+            format!("youtube_home_scan;auto_publish=;run_id={run_id}")
+        } else {
+            origin.to_string()
+        };
         let canonical_url = format!("https://www.youtube.com/watch?v={video_id}");
         sqlx::query(
             "INSERT INTO tasks(id,source_type,source_url,source_license,status,priority,origin_kind,origin_run_id,restart_generation,created_by) VALUES($1,'youtube'::source_type,$2,$3::source_license,'created'::task_status,$4,$6,$5,0,$6)"
         ).bind(task_id).bind(canonical_url).bind(license).bind(priority.clamp(-100,100))
-            .bind(run_id).bind(if auto_process {"auto_youtube"} else {"source_scan"})
+            .bind(run_id).bind(created_by)
             .execute(&mut *tx).await?;
+        if home_scan {
+            sqlx::query("UPDATE tasks SET origin_kind='youtube_home_scan' WHERE id=$1")
+                .bind(task_id)
+                .execute(&mut *tx)
+                .await?;
+        }
         let inserted=sqlx::query(
             "INSERT INTO ingested_videos(id,platform,source_id,task_id) VALUES($1,'youtube',$2,$3) ON CONFLICT(platform,source_id) DO NOTHING"
         ).bind(Uuid::new_v4()).bind(&video_id).bind(task_id).execute(&mut *tx).await?;
