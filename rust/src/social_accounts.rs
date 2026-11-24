@@ -42,6 +42,31 @@ fn trusted_sidecar(raw: &str) -> AppResult<Url> {
     Ok(url)
 }
 
+/// Resolve an allowlisted, relative SAU resource. Reject URL authority
+/// changes and percent-encoded traversal before reqwest can normalize them.
+fn sidecar_resource(base: &Url, path: &str) -> AppResult<Url> {
+    if path.is_empty()
+        || path.len() > 256
+        || path.split('/').any(|segment| {
+            segment.is_empty()
+                || !segment
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        })
+    {
+        return Err(AppError::Invalid("invalid SAU resource path".into()));
+    }
+    let url = base
+        .join(path)
+        .map_err(|_| AppError::Invalid("invalid SAU resource path".into()))?;
+    if url.origin() != base.origin() || url.path() != format!("/{path}") {
+        return Err(AppError::Invalid(
+            "SAU resource path changed origin or path".into(),
+        ));
+    }
+    Ok(url)
+}
+
 fn service_token(secret: &str) -> AppResult<String> {
     if secret.len() < 16 {
         return Err(AppError::Unavailable(
@@ -71,9 +96,7 @@ pub(crate) async fn call(
         .legacy_internal_secret
         .as_deref()
         .ok_or_else(|| AppError::Unavailable("SAU service secret unavailable".into()))?;
-    let url = base
-        .join(path.trim_start_matches('/'))
-        .map_err(|_| AppError::Invalid("invalid SAU resource path".into()))?;
+    let url = sidecar_resource(&base, path)?;
     let client = Client::builder()
         .timeout(Duration::from_secs(30))
         .redirect(reqwest::redirect::Policy::none())
@@ -339,6 +362,43 @@ mod tests {
         assert!(social_platform("douyin").is_ok());
         assert!(social_platform("kuaishou").is_ok());
         assert!(social_platform("bilibilievil").is_err());
+    }
+    #[test]
+    fn proxy_resource_rejects_url_substitution_and_encoded_traversal() {
+        let origin = trusted_sidecar("http://127.0.0.1:8010").unwrap();
+        for allowed in [
+            "health",
+            "accounts",
+            "accounts/douyin",
+            "accounts/404ed79b-7078-4a38-b046-2bb31664ab03/check",
+            "login-sessions/xiaohongshu",
+        ] {
+            let url = sidecar_resource(&origin, allowed).unwrap();
+            assert_eq!(url.path(), format!("/{allowed}"));
+            assert_eq!(url.host_str(), Some("127.0.0.1"));
+        }
+        for blocked in [
+            "",
+            "/accounts",
+            "//evil.example/accounts",
+            "http://evil.example/",
+            "accounts/../health",
+            "accounts/%2e%2e/health",
+            "accounts//check",
+            "accounts?next=http://evil.example",
+            "accounts#fragment",
+            "accounts\\x",
+            "accounts/%252e%252e",
+            "accounts/./x",
+            "accounts/a:b",
+            "accounts/ä",
+        ] {
+            assert!(
+                sidecar_resource(&origin, blocked).is_err(),
+                "path {blocked:?} must be rejected"
+            );
+        }
+        assert!(sidecar_resource(&origin, &"a".repeat(257)).is_err());
     }
     #[test]
     fn native_service_auth_matches_original_service_token() {
