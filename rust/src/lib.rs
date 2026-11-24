@@ -31,6 +31,7 @@ pub mod legacy_contracts;
 pub mod legacy_cover_v1;
 pub mod legacy_missing_actions_v1;
 pub mod legacy_reliability_v1;
+pub mod legacy_service_v1;
 pub mod local_worker_enroll_v1;
 pub mod maintenance_terminal_storage_v1;
 pub mod maintenance_workdir_v1;

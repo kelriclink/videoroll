@@ -24,6 +24,10 @@ enum Command {
     Migrate,
     /// Bind an independent API, without starting any media/publishing jobs.
     Api,
+    /// Run an original internal service with native routes and HMAC authentication.
+    Service {
+        service: videoroll_v2::legacy_service_v1::LegacyService,
+    },
     /// Start durable workflow workers. Requires a separate testing database.
     Worker,
     /// Process at most one native Bilibili subtitle draft (outbox remains
@@ -63,6 +67,33 @@ async fn main() -> anyhow::Result<()> {
             });
             let listener = tokio::net::TcpListener::bind(config.bind).await?;
             tracing::info!(address=%config.bind,"v2 API listening (worker side effects disabled)");
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await?;
+        }
+        Command::Service { service } => {
+            if std::env::var_os("VIDEOROLL_V2_BIND").is_none() {
+                anyhow::bail!("standalone service requires explicit VIDEOROLL_V2_BIND");
+            }
+            if !config.bind.ip().is_loopback()
+                && std::env::var("VIDEOROLL_V2_SERVICE_ALLOW_CONTAINER_BIND")
+                    .ok()
+                    .as_deref()
+                    != Some("true")
+            {
+                anyhow::bail!("standalone service requires loopback or explicit container bind");
+            }
+            let state = AppState {
+                config: config.clone(),
+                scheduler: Scheduler::new(db.clone(), config.job_lease),
+                storage: AssetRegistry::new(db.clone(), config.storage_root.clone()),
+                db,
+            };
+            let app = videoroll_v2::legacy_service_v1::router(service, state)?;
+            let listener = tokio::net::TcpListener::bind(config.bind).await?;
+            tracing::info!(address=%config.bind, ?service, "original internal service listening");
             axum::serve(
                 listener,
                 app.into_make_service_with_connect_info::<std::net::SocketAddr>(),

@@ -43,6 +43,12 @@ def collect():
     if social_adapters - allowed_sau:
         raise ValueError("Standalone SAU adapter not in original routes")
 
+    health_body = PARITY.read_text().split(
+        "const STANDALONE_HEALTH_SERVICES:", 1
+    )[1].split("];", 1)[0]
+    health_services = set(re.findall(r'"([a-z_]+)"', health_body))
+    assert health_services == {"bilibili_publisher", "subtitle_service", "youtube_ingest"}
+
     # These two Bilibili publisher routes are no longer hosted in the old
     # dedicated Python service; the Rust gateway exposes identical original
     # paths under /api/v1 and verifies their full Python DTO with fixtures.
@@ -72,7 +78,9 @@ def collect():
                    or (source["service"]=="egress_gateway" and
                        (source["method"], source["path"]) in standalone)
                    or (source["service"]=="social_publisher" and
-                       (source["method"], source["path"]) in social_adapters))
+                       (source["method"], source["path"]) in social_adapters)
+                   or (source["service"] in health_services and
+                       (source["method"], source["path"]) == ("GET", "/health")))
         rows.append({
             "service":source["service"],"method":source["method"],"path":source["path"],
             "python_source":source["file"]+":"+str(source["line"]),
@@ -85,12 +93,12 @@ def collect():
             "frontend_verified":False,
             "real_platform_verified":False,
         })
-    assert sum(r["v1_status"]=="native_adapter_partial" for r in rows) == len(adapters)+len(standalone)+len(social_adapters)
+    assert sum(r["v1_status"]=="native_adapter_partial" for r in rows) == len(adapters)+len(standalone)+len(social_adapters)+len(health_services)
     return {
         "status":"INCOMPLETE",
         "notice":"Route registration is not contract parity; V2-only routes are counted separately.",
         "legacy_declarations":len(routes),
-        "native_v1_partial":len(adapters)+len(standalone)+len(social_adapters),
+        "native_v1_partial":len(adapters)+len(standalone)+len(social_adapters)+len(health_services),
         "fully_verified":0,
         "frontend_reference_text_occurrences":len(refs),
         "checks_needed":[

@@ -23,6 +23,8 @@ const STANDALONE_SAU_ADAPTERS: &[(&str, &str)] = &[
     ("GET", "/accounts"),
     ("DELETE", "/accounts/{account_id}"),
 ];
+const STANDALONE_HEALTH_SERVICES: &[&str] =
+    &["bilibili_publisher", "subtitle_service", "youtube_ingest"];
 const V1_ADAPTERS: &[(&str, &str)] = &[
     ("GET", "/health"),
     // Original Bilibili standalone settings now served natively at the
@@ -275,7 +277,7 @@ fn from_sources() -> AppResult<(Value, Value)> {
     Ok((routes, frontend))
 }
 
-fn is_adapter(method: &str, path: &str) -> bool {
+pub(crate) fn is_adapter(method: &str, path: &str) -> bool {
     V1_ADAPTERS
         .iter()
         .any(|&(verb, url)| verb == method && url == path)
@@ -318,11 +320,18 @@ pub fn report() -> AppResult<Value> {
                         | ("POST", "/bilibili/publish")
                 )))
             && is_adapter(method, path);
+        let adapter = adapter
+            || (service == "egress_gateway"
+                && STANDALONE_EGRESS_ADAPTERS.contains(&(method, path)))
+            || (service == "social_publisher" && STANDALONE_SAU_ADAPTERS.contains(&(method, path)))
+            || (STANDALONE_HEALTH_SERVICES.contains(&service)
+                && method == "GET"
+                && path == "/health");
         let entry = services.entry(service.into()).or_default();
         entry.0 += 1;
         if adapter {
             entry.1 += 1;
-            mapped.push(json!({"method":method,"path":path,"state":"native_adapter_partial"}));
+            mapped.push(json!({"service":service,"method":method,"path":path,"state":"native_adapter_partial"}));
         }
     }
     let breakdown = services
@@ -364,7 +373,16 @@ mod tests {
         let value = report().unwrap();
         assert_eq!(value["all_features_migrated"], false);
         assert!(value["legacy_route_declarations"].as_u64().unwrap() >= 217);
-        assert_eq!(value["native_v1_adapters"], V1_ADAPTERS.len());
+        assert_eq!(
+            value["native_v1_adapters"],
+            V1_ADAPTERS.len()
+                + STANDALONE_EGRESS_ADAPTERS.len()
+                + STANDALONE_SAU_ADAPTERS.len()
+                + STANDALONE_HEALTH_SERVICES.len()
+        );
+        let matrix: Value =
+            serde_json::from_str(include_str!("../docs/CONTRACT_MATRIX.json")).unwrap();
+        assert_eq!(value["native_v1_adapters"], matrix["native_v1_partial"]);
         assert!(V1_ADAPTERS.len() >= 147);
         assert_eq!(value["fully_verified_legacy_routes"], 0);
         assert!(value["frontend_url_references"].as_u64().unwrap() >= 190);
