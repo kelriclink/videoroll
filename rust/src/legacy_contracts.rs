@@ -669,6 +669,7 @@ pub fn router() -> Router<AppState> {
         .merge(crate::management_v1::router())
         .merge(crate::remote_api_settings_v1::router())
         .merge(crate::bilibili_settings_v1::router())
+        .merge(crate::bilibili_discovery_v1::router())
         .merge(crate::bilibili_account_v1::router())
         .merge(crate::bilibili_publish_v1::router())
         .merge(crate::legacy_missing_actions_v1::router())

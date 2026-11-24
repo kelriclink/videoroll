@@ -5,8 +5,8 @@
 全部完成状态只允许结合 API 契约、权限、并发、重启、外部副作用与设备测试证据填写。
 
 - 原版声明：217
-- 原生 V1 部分适配：191
-- 无原生 V1 入口：26
+- 原生 V1 部分适配：192
+- 无原生 V1 入口：25
 - 已完成全面验收：0
 - 前端引用文本：193
 
@@ -14,7 +14,7 @@
 |---|---:|---:|---:|
 | bilibili_publisher | 10 | 9 | 1 |
 | egress_gateway | 2 | 2 | 0 |
-| orchestrator_api | 132 | 118 | 14 |
+| orchestrator_api | 132 | 119 | 13 |
 | social_publisher | 9 | 0 | 9 |
 | subtitle_service | 55 | 54 | 1 |
 | youtube_ingest | 9 | 8 | 1 |
@@ -40,7 +40,7 @@
 | orchestrator_api | POST | /auth/setup | native_adapter_partial | auth_setup |
 | orchestrator_api | GET | /auth/status | native_adapter_partial | auth_status |
 | orchestrator_api | POST | /auto/youtube | native_adapter_partial | auto_youtube |
-| orchestrator_api | GET | /bilibili/discovery | not_native_v1 | bilibili_discovery |
+| orchestrator_api | GET | /bilibili/discovery | native_adapter_partial | bilibili_discovery |
 | orchestrator_api | GET | /bilibili/{service_path:path} | not_native_v1 | proxy_bilibili_browser_operation |
 | orchestrator_api | POST | /bilibili/{service_path:path} | not_native_v1 | proxy_bilibili_browser_operation |
 | orchestrator_api | PUT | /bilibili/{service_path:path} | not_native_v1 | proxy_bilibili_browser_operation |
