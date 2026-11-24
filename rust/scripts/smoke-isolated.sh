@@ -105,6 +105,11 @@ if [[ "${VIDEOROLL_V2_TEST_BACKFILL_ONLY:-false}" == "true" ]]; then
   exit 0
 fi
 
+if [[ "${VIDEOROLL_V2_TEST_BILI_DIRECT_ONLY:-false}" == "true" ]]; then
+  export VIDEOROLL_V2_ENABLE_NATIVE_BILIBILI=true
+  export VIDEOROLL_V2_BILIBILI_API_BASE="http://127.0.0.1:18199"
+  export VIDEOROLL_V2_ALLOW_TEST_BILIBILI_LOOPBACK=true
+fi
 export VIDEOROLL_V2_BIND="127.0.0.1:18080"
 export VIDEOROLL_V2_STORAGE_ROOT="$repo_root/rust/target/v2-smoke-objects"
 export VIDEOROLL_V2_INTERNAL_TOKEN="v2-local-test-only-0123456789abcdef"
@@ -181,6 +186,16 @@ if [[ "${VIDEOROLL_V2_TEST_LEGACY_GAPS_ONLY:-false}" == "true" ]]; then
   exit 0
 fi
 
+if [[ "${VIDEOROLL_V2_TEST_BILI_DIRECT_ONLY:-false}" == "true" ]]; then
+  export VIDEOROLL_V2_ENABLE_NATIVE_BILIBILI=true
+  export VIDEOROLL_V2_BILIBILI_API_BASE="http://127.0.0.1:18199"
+  export VIDEOROLL_V2_ALLOW_TEST_BILIBILI_LOOPBACK=true
+  python3 "$repo_root/rust/tests/mock_bilibili_publish_direct.py" > "$repo_root/rust/target/v2-bili-direct-mock.log" 2>&1 &
+  ai_pid=$!
+  PYTHONPATH="$repo_root/src" /opt/videoroll/venvs/core/bin/python \
+    "$repo_root/rust/tests/bilibili_publish_direct_v1_isolated.py"
+  exit 0
+fi
 if [[ "${VIDEOROLL_V2_TEST_SELECTIVE_ONLY:-false}" == "true" ]]; then
   python3 "$repo_root/rust/tests/mock_ai_server.py" > "$repo_root/rust/target/v2-selective-mock-ai.log" 2>&1 &
   ai_pid=$!

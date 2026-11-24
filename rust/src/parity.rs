@@ -23,6 +23,7 @@ const V1_ADAPTERS: &[(&str, &str)] = &[
     ("GET", "/bilibili/archive/types"),
     ("POST", "/bilibili/archive/type/recommend"),
     ("GET", "/bilibili/publish/jobs/{job_id}"),
+    ("POST", "/bilibili/publish"),
     ("GET", "/settings/api"),
     ("PUT", "/settings/api"),
     ("POST", "/tasks/{task_id}/actions/youtube_download_enqueue"),
@@ -292,6 +293,7 @@ pub fn report() -> AppResult<Value> {
                         | ("GET", "/bilibili/archive/types")
                         | ("POST", "/bilibili/archive/type/recommend")
                         | ("GET", "/bilibili/publish/jobs/{job_id}")
+                        | ("POST", "/bilibili/publish")
                 )))
             && is_adapter(method, path);
         let entry = services.entry(service.into()).or_default();

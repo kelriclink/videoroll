@@ -5,14 +5,14 @@
 全部完成状态只允许结合 API 契约、权限、并发、重启、外部副作用与设备测试证据填写。
 
 - 原版声明：217
-- 原生 V1 部分适配：181
-- 无原生 V1 入口：36
+- 原生 V1 部分适配：182
+- 无原生 V1 入口：35
 - 已完成全面验收：0
 - 前端引用文本：193
 
 | Python 子系统 | 原始声明 | Rust V1 部分适配 | 未映射 V1 |
 |---|---:|---:|---:|
-| bilibili_publisher | 10 | 8 | 2 |
+| bilibili_publisher | 10 | 9 | 1 |
 | egress_gateway | 2 | 0 | 2 |
 | orchestrator_api | 132 | 111 | 21 |
 | social_publisher | 9 | 0 | 9 |
@@ -28,7 +28,7 @@
 | bilibili_publisher | GET | /bilibili/auth/me | native_adapter_partial | get_auth_me |
 | bilibili_publisher | GET | /bilibili/auth/settings | native_adapter_partial | get_auth_settings |
 | bilibili_publisher | PUT | /bilibili/auth/settings | native_adapter_partial | put_auth_settings |
-| bilibili_publisher | POST | /bilibili/publish | not_native_v1 | publish |
+| bilibili_publisher | POST | /bilibili/publish | native_adapter_partial | publish |
 | bilibili_publisher | GET | /bilibili/publish/jobs/{job_id} | native_adapter_partial | get_job |
 | bilibili_publisher | GET | /bilibili/publish/settings | native_adapter_partial | get_publish_settings |
 | bilibili_publisher | PUT | /bilibili/publish/settings | native_adapter_partial | put_publish_settings |

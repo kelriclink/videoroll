@@ -138,6 +138,7 @@ struct Preupload {
 struct UploadedVideo {
     filename: String,
     cid: i64,
+    upload_id: String,
 }
 #[derive(Debug, Serialize)]
 struct PutPart {
@@ -177,17 +178,40 @@ fn upos_target(pre: &Preupload) -> AppResult<UploadTarget> {
             "Bilibili UPOS returned malformed upload metadata".into(),
         ));
     }
+    // Never trust the preupload response to redirect storage bytes to a
+    // caller-controlled host. HTTP loopback is allowed *only* for the isolated
+    // creator-center fixture and must match that fixture's exact authority.
+    let origin = std::env::var("VIDEOROLL_V2_BILIBILI_API_BASE")
+        .ok()
+        .and_then(|v| Url::parse(&v).ok());
+    let test_allowed = std::env::var("VIDEOROLL_V2_ALLOW_TEST_BILIBILI_LOOPBACK")
+        .ok()
+        .as_deref()
+        == Some("true")
+        && origin.as_ref().is_some_and(|v| {
+            v.scheme() == "http"
+                && matches!(v.host_str(), Some("localhost" | "127.0.0.1" | "::1"))
+                && v.port().is_some()
+        });
     let full = format!(
-        "https:{}{}",
+        "{}:{}{}",
+        if test_allowed { "http" } else { "https" },
         pre.endpoint,
         pre.upos_uri.replacen("upos:/", "", 1)
     );
     let url =
         Url::parse(&full).map_err(|_| AppError::Unavailable("invalid Bilibili CDN URL".into()))?;
     let host = url.host_str().unwrap_or("");
-    if url.scheme() != "https"
-        || !valid_upos_host(host)
-        || url.port_or_known_default() != Some(443)
+    let loopback = test_allowed
+        && origin
+            .as_ref()
+            .is_some_and(|v| v.host_str() == url.host_str() && v.port() == url.port());
+    let official = url.scheme() == "https"
+        && valid_upos_host(host)
+        && url.port_or_known_default() == Some(443);
+    if !(official || loopback)
+        || url.query().is_some()
+        || url.fragment().is_some()
         || url.username() != ""
         || url.password().is_some()
         || url.path().contains("..")
@@ -265,6 +289,80 @@ pub async fn archive_spec(
         .get("auto_publish_platforms")
         .or_else(|| auto.as_ref().and_then(|v| v.get("auto_publish_platforms")));
     expected_platforms(&json!({"auto_publish_platforms":source_platforms}))?;
+    if let Some(direct) = profile.get("bilibili_direct_v1") {
+        let meta: ArchiveMeta =
+            serde_json::from_value(direct.get("meta").cloned().unwrap_or(Value::Null))
+                .map_err(|_| AppError::Invalid("Bilibili direct metadata invalid".into()))?;
+        meta.validate()?;
+        let items = direct
+            .get("parts")
+            .and_then(Value::as_array)
+            .ok_or_else(|| AppError::Invalid("Bilibili direct part list missing".into()))?;
+        if !(1..=2).contains(&items.len()) {
+            return Err(AppError::Invalid(
+                "Bilibili direct archive requires one or two parts".into(),
+            ));
+        }
+        let mut parts = Vec::new();
+        for (index, item) in items.iter().enumerate() {
+            let key = item
+                .get("key")
+                .and_then(Value::as_str)
+                .ok_or_else(|| AppError::Invalid("Bilibili part key missing".into()))?;
+            let kind = if index == 0 {
+                "video_final"
+            } else {
+                "video_dubbed"
+            };
+            if item.get("kind").and_then(Value::as_str) != Some(kind) {
+                return Err(AppError::Conflict(
+                    "Bilibili part kind no longer matches request".into(),
+                ));
+            }
+            let actual:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM assets WHERE task_id=$1 AND kind::text=$2 AND storage_key=$3)")
+                .bind(job.task_id).bind(kind).bind(key).fetch_one(&db.pool).await?;
+            if !actual {
+                return Err(AppError::Conflict(
+                    "Bilibili requested media is no longer task-owned".into(),
+                ));
+            }
+            let title = item
+                .get("title")
+                .and_then(Value::as_str)
+                .filter(|v| !v.trim().is_empty())
+                .unwrap_or(&meta.title);
+            parts.push((key.to_owned(), title.to_owned()));
+        }
+        validate_assets(&parts)?;
+        if parts.len() == 2 {
+            let original = latest_asset_key(db, job.task_id, "video_raw")
+                .await?
+                .ok_or_else(|| {
+                    AppError::Conflict("original video missing for Bilibili P2".into())
+                })?;
+            let srt = latest_asset_key(db, job.task_id, "subtitle_srt")
+                .await?
+                .ok_or_else(|| AppError::Conflict("subtitle missing for Bilibili P2".into()))?;
+            let valid: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM vr2_dubbing_runs r JOIN vr2_jobs j ON j.id=r.job_id
+                WHERE r.task_id=$1 AND r.output_video_key=$2 AND r.source_video_key=$3
+                 AND r.source_srt_key=$4 AND r.model_status='succeeded' AND j.state='succeeded')",
+            )
+            .bind(job.task_id)
+            .bind(&parts[1].0)
+            .bind(original)
+            .bind(srt)
+            .fetch_one(&db.pool)
+            .await?;
+            if !valid {
+                return Err(AppError::Conflict(
+                    "Bilibili direct P2 no longer matches completed YouDub source and subtitles"
+                        .into(),
+                ));
+            }
+        }
+        return Ok((meta, parts));
+    }
 
     let saved = crate::publish_meta::saved(db, job.task_id).await?;
     let meta:ArchiveMeta=serde_json::from_value(
@@ -324,6 +422,7 @@ pub async fn archive_spec(
 struct BilibiliClient {
     member: Client,
     upos: Client,
+    origin: Url,
 }
 // Pure, testable Bilibili Web POST mapping. Only validated fields are copied.
 fn archive_payload(csrf: &str, meta: &ArchiveMeta, parts: &[(UploadedVideo, String)]) -> Value {
@@ -363,7 +462,7 @@ fn archive_payload(csrf: &str, meta: &ArchiveMeta, parts: &[(UploadedVideo, Stri
 }
 
 impl BilibiliClient {
-    fn new(cookie: &str) -> AppResult<Self> {
+    fn new(cookie: &str, origin: Url) -> AppResult<Self> {
         if cookie.trim().is_empty() || cookie.contains('\r') || cookie.contains('\n') {
             return Err(AppError::Invalid(
                 "Bilibili Cookie is missing or invalid".into(),
@@ -395,7 +494,94 @@ impl BilibiliClient {
             .timeout(Duration::from_secs(180))
             .redirect(reqwest::redirect::Policy::none())
             .build()?;
-        Ok(Self { member, upos })
+        Ok(Self {
+            member,
+            upos,
+            origin,
+        })
+    }
+    fn url(&self, path: &str) -> AppResult<Url> {
+        self.origin
+            .join(path)
+            .map_err(|_| AppError::Invalid("invalid Bilibili creator-center path".into()))
+    }
+    async fn predict_type(
+        &self,
+        csrf: &str,
+        video: &UploadedVideo,
+        title: &str,
+    ) -> AppResult<Option<u32>> {
+        let body = reqwest::multipart::Form::new()
+            .text("filename", video.filename.clone())
+            .text("title", title.to_owned())
+            .text("upload_id", video.upload_id.clone());
+        let response = self
+            .member
+            .post(self.url("x/vupre/web/archive/types/predict")?)
+            .query(&[
+                ("csrf", csrf),
+                ("ts", &chrono::Utc::now().timestamp_millis().to_string()),
+            ])
+            .multipart(body)
+            .send()
+            .await?;
+        let data = Self::read_json(response).await?;
+        Self::ensure_ok(&data, false)?;
+        Ok(data
+            .pointer("/data/0/id")
+            .and_then(Value::as_u64)
+            .and_then(|n| u32::try_from(n).ok())
+            .filter(|n| *n > 0))
+    }
+    async fn upload_cover(&self, csrf: &str, path: &Path) -> AppResult<String> {
+        use base64::Engine as _;
+        let image = fs::read(path).await?;
+        if image.is_empty() || image.len() > 8 * 1024 * 1024 {
+            return Err(AppError::Invalid(
+                "Bilibili cover must be 1 byte to 8 MiB".into(),
+            ));
+        }
+        let mime = match image.as_slice() {
+            [0xff, 0xd8, 0xff, ..] => "image/jpeg",
+            [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, ..] => "image/png",
+            [
+                b'R',
+                b'I',
+                b'F',
+                b'F',
+                _,
+                _,
+                _,
+                _,
+                b'W',
+                b'E',
+                b'B',
+                b'P',
+                ..,
+            ] => "image/webp",
+            _ => return Err(AppError::Invalid("unsupported Bilibili cover type".into())),
+        };
+        let cover = format!(
+            "data:{mime};base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(&image)
+        );
+        let response = self
+            .member
+            .post(self.url("x/vu/web/cover/up")?)
+            .query(&[("ts", chrono::Utc::now().timestamp_millis().to_string())])
+            .form(&[("csrf", csrf), ("cover", &cover)])
+            .send()
+            .await?;
+        let data = Self::read_json(response).await?;
+        Self::ensure_ok(&data, false)?;
+        let url = data
+            .pointer("/data/url")
+            .and_then(Value::as_str)
+            .filter(|s| s.starts_with("https://") && s.len() < 2048)
+            .ok_or_else(|| {
+                AppError::Unavailable("Bilibili cover URL missing or insecure".into())
+            })?;
+        Ok(url.to_owned())
     }
     async fn read_json(response: reqwest::Response) -> AppResult<Value> {
         if !response.status().is_success() {
@@ -439,7 +625,7 @@ impl BilibiliClient {
             .ok_or_else(|| AppError::Invalid("video filename not Unicode".into()))?;
         let response = self
             .member
-            .get("https://member.bilibili.com/preupload")
+            .get(self.url("preupload")?)
             .query(&[
                 ("name", name.to_string()),
                 ("r", "upos".into()),
@@ -586,6 +772,7 @@ impl BilibiliClient {
         Ok(UploadedVideo {
             filename: target.filename,
             cid: target.cid,
+            upload_id,
         })
     }
     async fn submit_once(
@@ -597,7 +784,7 @@ impl BilibiliClient {
         let payload = archive_payload(csrf, meta, parts);
         let response = self
             .member
-            .post("https://member.bilibili.com/x/vu/web/add/v3")
+            .post(self.url("x/vu/web/add/v3")?)
             .query(&[
                 ("csrf", csrf),
                 ("ts", &chrono::Utc::now().timestamp_millis().to_string()),
@@ -775,7 +962,7 @@ impl NativeP2Client {
         let (cookie, csrf) =
             crate::bilibili_account_v1::publication_credentials(db, config).await?;
         Ok(Self {
-            inner: BilibiliClient::new(&cookie)?,
+            inner: BilibiliClient::new(&cookie, member_origin(config)?)?,
             origin: member_origin(config)?,
             csrf,
         })
@@ -863,24 +1050,62 @@ pub async fn publish(
             "Bilibili publishing is disabled in V2 platform settings".into(),
         ));
     }
-    let (meta, parts) = archive_spec(db, job).await?;
-    let reviewed_meta = crate::publish_meta::saved(db, job.task_id)
-        .await?
-        .unwrap_or(
+    let (mut meta, parts) = archive_spec(db, job).await?;
+    let direct: Option<Value> = sqlx::query_scalar(
+        "SELECT configuration->'bilibili_direct_v1' FROM vr2_workflows WHERE id=$1",
+    )
+    .bind(job.workflow_id)
+    .fetch_optional(&db.pool)
+    .await?
+    .flatten();
+    let reviewed_meta = if direct.is_some() {
+        Some(
             serde_json::to_value(&meta)
-                .map_err(|_| AppError::Invalid("Bilibili metadata serialization failed".into()))?,
-        );
+                .map_err(|_| AppError::Invalid("metadata encoding failed".into()))?,
+        )
+    } else {
+        crate::publish_meta::saved(db, job.task_id).await?
+    };
+    let reviewed_meta = reviewed_meta.unwrap_or(
+        serde_json::to_value(&meta)
+            .map_err(|_| AppError::Invalid("Bilibili metadata serialization failed".into()))?,
+    );
     crate::publish_review::ensure_approved(db, registry, config, job.task_id, &reviewed_meta)
         .await?;
-    let client = BilibiliClient::new(&cookie)?;
+    let client = BilibiliClient::new(&cookie, member_origin(config)?)?;
     // Validate creator-center ID pairing and rules before any UPOS upload.
     crate::bili_activity::verify_remote(&client.member, &meta).await?;
+    if direct.is_some() {
+        crate::bilibili_publish_v1::mark_started(db, job).await?;
+        if let Some(cover) = direct
+            .as_ref()
+            .and_then(|d| d.get("cover_key"))
+            .and_then(Value::as_str)
+        {
+            let path = registry.resolve_existing(cover).await?;
+            meta.cover = client.upload_cover(&csrf, &path).await?;
+        }
+    }
     let mut uploaded = Vec::new();
     for (key, title) in parts {
         let path = registry.resolve_existing(&key).await?;
         probe_video(&config.ffprobe_binary, &path).await?;
         let upload = client.upload(&path).await?;
         uploaded.push((upload, title));
+    }
+    // Python V1 predicts only when requested; a missing prediction preserves
+    // the explicitly supplied metadata typeid rather than inventing one.
+    if direct
+        .as_ref()
+        .and_then(|v| v.get("typeid_mode"))
+        .and_then(Value::as_str)
+        == Some("bilibili_predict")
+    {
+        if let Some((p1, _)) = uploaded.first() {
+            if let Ok(Some(predicted)) = client.predict_type(&csrf, p1, &meta.title).await {
+                meta.typeid = predicted;
+            }
+        }
     }
     // Single archive creation: UPOS uploads are preparatory side-effects;
     // archive POST is the irreversible boundary and is NEVER retried.
@@ -957,6 +1182,7 @@ mod tests {
                 UploadedVideo {
                     filename: "sample.mp4".into(),
                     cid: 998,
+                    upload_id: String::new(),
                 },
                 "P1".into(),
             )],

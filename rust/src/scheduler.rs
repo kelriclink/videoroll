@@ -512,6 +512,12 @@ impl Scheduler {
         for row in &rows {
             let workflow_id: Uuid = row.try_get("workflow_id")?;
             let job_id: Uuid = row.try_get("id")?;
+            crate::bilibili_publish_v1::mark_uncertain(
+                &mut tx,
+                workflow_id,
+                "native publish lease expired; confirm external Bilibili archive manually",
+            )
+            .await?;
             sqlx::query("UPDATE vr2_workflows SET state='unknown',last_error='publish outcome unconfirmed',updated_at=now() WHERE id=$1 AND state='running'")
                 .bind(workflow_id).execute(&mut *tx).await?;
             Self::event(
@@ -684,6 +690,7 @@ impl Scheduler {
                     "publish completion requires a verified receipt".into(),
                 ));
             }
+            crate::bilibili_publish_v1::mark_confirmed(tx, item, &result).await?;
             // Subtitle drafts are reconciled from confirmed publish receipts by
             // the independent outbox worker. NEVER execute subtitle SQL inside
             // the publication settlement transaction: a failed PostgreSQL
@@ -902,6 +909,14 @@ impl Scheduler {
             .bind(target).bind(error.chars().take(2000).collect::<String>())
             .bind(retry_seconds).bind(failed).bind(item.id).execute(&mut *tx).await?;
         if failed {
+            if item.stage == Stage::Publish {
+                crate::bilibili_publish_v1::mark_uncertain(
+                    &mut tx,
+                    item.workflow_id,
+                    "native publisher outcome unknown; verify Bilibili before retry",
+                )
+                .await?;
+            }
             sqlx::query("UPDATE vr2_workflows SET state=$1,last_error=$2,updated_at=now() WHERE id=$3 AND state='running'")
                 .bind(target).bind(error.chars().take(2000).collect::<String>())
                 .bind(item.workflow_id).execute(&mut *tx).await?;

@@ -31,7 +31,8 @@ def collect():
                      ("GET","/bilibili/auth/me"),
                      ("GET","/bilibili/archive/types"),
                      ("POST","/bilibili/archive/type/recommend"),
-                     ("GET","/bilibili/publish/jobs/{job_id}")}
+                     ("GET","/bilibili/publish/jobs/{job_id}"),
+                     ("POST","/bilibili/publish")}
     def is_native_scope(r):
         return (r["service"] == "orchestrator_api"
                 or (r["service"] == "youtube_ingest" and r["path"].startswith("/youtube/"))

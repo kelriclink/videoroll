@@ -12,6 +12,7 @@ pub mod bili_p2;
 pub mod bili_subtitles;
 pub mod bilibili;
 pub mod bilibili_account_v1;
+pub mod bilibili_publish_v1;
 pub mod bilibili_settings_v1;
 pub mod compat;
 pub mod config;

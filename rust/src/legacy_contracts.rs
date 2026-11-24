@@ -670,6 +670,7 @@ pub fn router() -> Router<AppState> {
         .merge(crate::remote_api_settings_v1::router())
         .merge(crate::bilibili_settings_v1::router())
         .merge(crate::bilibili_account_v1::router())
+        .merge(crate::bilibili_publish_v1::router())
         .merge(crate::legacy_missing_actions_v1::router())
         .merge(crate::youdub_control_v1::router())
         .merge(crate::agent_skills_v1::router())
