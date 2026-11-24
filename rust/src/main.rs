@@ -39,6 +39,8 @@ enum Command {
     SocialTick,
     /// Settle due native publish batch events, without running any external publisher.
     PublishBatchTick,
+    /// Reconcile committed remote-render receipts without contacting a worker.
+    RenderTick,
     /// Run one due-check for the original YouTube Home recommendation scanner.
     /// Exits without side effects unless home_scan_enabled is true and due.
     HomeTick,
@@ -216,6 +218,20 @@ async fn main() -> anyhow::Result<()> {
                     }
                 });
             }
+            let render_db = db.clone();
+            let render_config = config.clone();
+            tokio::spawn(async move {
+                let mut timer = tokio::time::interval(std::time::Duration::from_secs(5));
+                timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    timer.tick().await;
+                    if let Err(error) =
+                        videoroll_v2::render_events::tick(&render_db, &render_config, 100).await
+                    {
+                        tracing::warn!(%error,"render receipt recovery unavailable");
+                    }
+                }
+            });
             let batch_db = db.clone();
             tokio::spawn(async move {
                 let mut timer = tokio::time::interval(std::time::Duration::from_secs(5));
@@ -301,6 +317,10 @@ async fn main() -> anyhow::Result<()> {
                 dispatched,
                 "SAU social publish tick finished"
             );
+        }
+        Command::RenderTick => {
+            let processed = videoroll_v2::render_events::tick(&db, &config, 100).await?;
+            tracing::info!(processed, "native render receipt tick finished");
         }
         Command::PublishBatchTick => {
             let processed = videoroll_v2::publish_batch_events::tick(&db, 100).await?;

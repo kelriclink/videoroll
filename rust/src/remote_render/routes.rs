@@ -819,10 +819,36 @@ async fn execution_completed(
             "uploaded render asset does not match completion".into(),
         ));
     }
+    // A replay must not re-register a noop asset or mutate a terminal task.
+    // Use the immutable receipt even when a newer source was imported.
+    if state == "completed" {
+        let stored =
+            sqlx::query("SELECT * FROM render_executions WHERE id=$1 AND runtime_engine='rust-v2'")
+                .bind(id)
+                .fetch_one(&s.db.pool)
+                .await?;
+        let result = crate::render_events::completed_receipt(&s.db, &s.storage, &stored).await?;
+        let scheduler = crate::scheduler::Scheduler::new(s.db.clone(), s.config.job_lease);
+        scheduler
+            .complete_external(job_id, &id.to_string(), result)
+            .await?;
+        return Ok(Json(execution_info(&row)?));
+    }
     let (asset_id, key) = if mode == "noop" {
-        let key = latest_asset_key(&s.db, task_id, "video_raw")
-            .await?
-            .ok_or_else(|| AppError::NotFound("noop render has no source video".into()))?;
+        let spec: Value = row.try_get("render_spec")?;
+        let key = spec["request"]["input_key"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| AppError::Conflict("noop render has no pinned source".into()))?
+            .to_owned();
+        let owned:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM assets WHERE task_id=$1 AND storage_key=$2 AND kind::text='video_raw')")
+            .bind(task_id).bind(&key).fetch_one(&s.db.pool).await?;
+        if !owned {
+            return Err(AppError::Conflict(
+                "noop source no longer belongs to task".into(),
+            ));
+        }
+
         let job = crate::domain::WorkItem {
             id: job_id,
             workflow_id: flow_id,
@@ -850,15 +876,30 @@ async fn execution_completed(
             AppError::Conflict("render output must be uploaded before completion".into())
         })?;
         let record = s.db.asset(asset).await?;
+        if record.task_id != task_id
+            || record.kind != "video_final"
+            || record.storage_key != output_key(task_id, id)
+        {
+            return Err(AppError::Conflict(
+                "render asset does not belong to execution".into(),
+            ));
+        }
         (Some(asset), Some(record.storage_key))
     };
     let result = receipt(id, asset_id, key.as_deref(), &mode);
+    if let Some(key) = key.as_deref() {
+        let path = s.storage.resolve_existing(key).await?;
+        let info = fs::metadata(path).await?;
+        if !info.is_file() || info.len() == 0 {
+            return Err(AppError::Conflict("render output missing or empty".into()));
+        }
+    }
     // A state update can commit even if the subsequent stage completion call
     // loses network; repeated calls are idempotent via the exact ticket+result.
     if state != "completed" {
         let row=sqlx::query(
-            "UPDATE vr2_render_executions SET state='completed',progress=100,finished_at=now(),updated_at=now() WHERE id=$1 AND worker_id=$2 AND fence_token=$3 AND state IN ('running','uploading') AND lease_until>now() RETURNING *"
-        ).bind(id).bind(worker_id).bind(&payload.fence_token)
+            "UPDATE render_executions SET state='completed',progress=100,output_json=$4,finished_at=now(),updated_at=now() WHERE id=$1 AND worker_id=$2 AND fence_token=$3 AND runtime_engine='rust-v2' AND state IN ('running','uploading') AND lease_until>now() RETURNING *"
+        ).bind(id).bind(worker_id).bind(&payload.fence_token).bind(&result)
             .fetch_optional(&s.db.pool).await?
             .ok_or_else(||AppError::Conflict("render fence expired before completion".into()))?;
         let _ = row;

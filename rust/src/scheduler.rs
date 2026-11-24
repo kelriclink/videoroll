@@ -929,18 +929,28 @@ impl Scheduler {
                 .bind(workflow_id)
                 .fetch_one(&mut *tx)
                 .await?;
-        let row = sqlx::query("SELECT state,external_ticket FROM vr2_jobs WHERE id=$1 FOR UPDATE")
-            .bind(job_id)
-            .fetch_one(&mut *tx)
-            .await?;
+        let row = sqlx::query(
+            "SELECT state,external_ticket,last_error FROM vr2_jobs WHERE id=$1 FOR UPDATE",
+        )
+        .bind(job_id)
+        .fetch_one(&mut *tx)
+        .await?;
         let state: String = row.try_get("state")?;
         let old_ticket: Option<String> = row.try_get("external_ticket")?;
+        let message = error.chars().take(1000).collect::<String>();
+        if old_ticket.as_deref() == Some(ticket)
+            && state == "failed"
+            && flow == "failed"
+            && row.try_get::<Option<String>, _>("last_error")?.as_deref() == Some(message.as_str())
+        {
+            tx.commit().await?;
+            return Ok(());
+        }
         if old_ticket.as_deref() != Some(ticket) || state != "awaiting" || flow != "running" {
             return Err(AppError::Conflict(
                 "external render no longer awaiting this ticket".into(),
             ));
         }
-        let message = error.chars().take(1000).collect::<String>();
         sqlx::query("UPDATE vr2_jobs SET state='failed',last_error=$1,finished_at=now(),updated_at=now() WHERE id=$2")
             .bind(&message).bind(job_id).execute(&mut *tx).await?;
         sqlx::query(
