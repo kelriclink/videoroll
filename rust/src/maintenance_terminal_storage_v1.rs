@@ -141,7 +141,11 @@ async fn unsafe_to_delete(tx: &mut Transaction<'_, Postgres>, task: Uuid) -> App
                      'pause_requested','cancel_requested','paused','preview_ready','needs_review')))
        OR EXISTS(SELECT 1 FROM pipeline_runs WHERE task_id=$1 AND state IN ('submitted','submitting','running','cancel_requested'))
        OR EXISTS(SELECT 1 FROM operation_inbox WHERE task_id=$1 AND status IN ('pending','awaiting','running','processing','unknown'))
-       OR EXISTS(SELECT 1 FROM publish_jobs WHERE task_id=$1 AND state::text IN ('draft','submitting','unknown'))
+       OR EXISTS(SELECT 1 FROM publish_jobs WHERE task_id=$1 AND
+          (state::text IN ('draft','submitting','unknown') OR
+           (state::text='submitted' AND response_json->>'runtime'='rust'
+            AND response_json->>'receipt_verified'='false'
+            AND NULLIF(external_id,'') IS NULL AND NULLIF(external_url,'') IS NULL)))
        OR EXISTS(SELECT 1 FROM vr2_workflows WHERE task_id=$1 AND state IN ('running','paused','unknown'))
        OR EXISTS(SELECT 1 FROM vr2_jobs WHERE task_id=$1 AND state IN ('pending','running','awaiting','unknown'))
        OR EXISTS(SELECT 1 FROM storage_object_refs WHERE owner_type='task' AND owner_id=$1)

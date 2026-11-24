@@ -370,24 +370,29 @@ async fn recover(state: &SauState) -> AppResult<()> {
     }
     Ok(())
 }
-struct CookieFile(PathBuf);
+pub(crate) struct CookieFile(pub(crate) PathBuf);
 impl Drop for CookieFile {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);
     }
 }
 fn materialize(runtime: &Runtime, work: &Work) -> AppResult<CookieFile> {
+    materialize_account_state(runtime, &work.platform, &work.name, &work.secret)
+}
+pub(crate) fn materialize_account_state(
+    runtime: &Runtime,
+    platform: &str,
+    account_name: &str,
+    secret: &str,
+) -> AppResult<CookieFile> {
     use std::{io::Write, os::unix::fs::OpenOptionsExt};
-    let raw = work
-        .secret
-        .strip_prefix("dbplain:v1:")
-        .unwrap_or(&work.secret);
+    let raw = secret.strip_prefix("dbplain:v1:").unwrap_or(secret);
     // Pre-DB-only Fernet credentials are not interpreted as JSON or copied.
     let canonical = canonical(raw.as_bytes())?;
     let file = runtime.cookies.join(format!(
         "{}_{}.json",
-        social_platform(&work.platform)?,
-        name(&work.name)?
+        social_platform(platform)?,
+        name(account_name)?
     ));
     let mut f = std::fs::OpenOptions::new()
         .write(true)
@@ -528,7 +533,7 @@ pub async fn run(state: Arc<SauState>, runtime: Runtime) {
                 finish(&state, &work, outcome).await?;
                 Ok(true)
             } else {
-                Ok(false)
+                crate::sau_worker_native_v1::tick(&state, &runtime).await
             }
         }
         .await;

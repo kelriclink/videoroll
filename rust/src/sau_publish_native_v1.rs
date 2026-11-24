@@ -172,12 +172,15 @@ async fn read_receipt(tx: &mut Transaction<'_, Postgres>, id: Uuid) -> AppResult
         .bind(id).fetch_one(&mut **tx).await?;
     receipt(&row)
 }
-async fn enqueue(tx: &mut Transaction<'_, Postgres>, job: Uuid) -> AppResult<()> {
+async fn enqueue(tx: &mut Transaction<'_, Postgres>, job: Uuid, native: bool) -> AppResult<()> {
     let key = format!("publish-job:{job}");
     // Same task/account row locks as original Python, so replay creates no
     // duplicate outbox event. Never reset an existing delivered event.
     let actual: String=sqlx::query_scalar("UPDATE publish_jobs SET operation_key=COALESCE(NULLIF(operation_key,''),$2) WHERE id=$1 RETURNING operation_key")
         .bind(job).bind(&key).fetch_one(&mut **tx).await?;
+    if native {
+        return crate::sau_worker_native_v1::enqueue(tx, job, &actual).await;
+    }
     sqlx::query("INSERT INTO outbox_events(id,event_type,aggregate_type,aggregate_id,task_name,args_json,operation_key)
         SELECT $1,'publish.dispatch','publish_job',$2,'social_publisher.process_job',$3,$4
         WHERE NOT EXISTS(SELECT 1 FROM outbox_events WHERE operation_key=$4)")
@@ -200,7 +203,7 @@ pub(crate) async fn publish(
             "unknown receipt requires independent reconciliation; force retry disabled".into(),
         ));
     }
-    if !state.publish_outbox_enabled {
+    if !state.publish_outbox_enabled && state.native_publish.is_none() {
         return Err(AppError::Conflict(
             "SAU browser worker/outbox dispatch not explicitly enabled".into(),
         ));
@@ -224,6 +227,15 @@ pub(crate) async fn publish(
             .fetch_optional(&mut *tx)
             .await?
             .ok_or_else(|| AppError::NotFound("task not found".into()))?;
+    if state.native_publish.is_some() {
+        let eligible:bool=sqlx::query_scalar("SELECT runtime_owner='rust' AND source_license::text<>'unknown' FROM tasks WHERE id=$1")
+            .bind(body.task_id).fetch_one(&mut *tx).await?;
+        if !eligible {
+            return Err(AppError::Conflict(
+                "native SAU publication requires a Rust-owned licensed task".into(),
+            ));
+        }
+    }
     if let Some(batch) = body.batch_id {
         let expected: Option<Value> = sqlx::query_scalar(
             "SELECT expected_targets FROM publish_batches WHERE id=$1 AND task_id=$2 FOR UPDATE",
@@ -309,7 +321,7 @@ pub(crate) async fn publish(
                 .try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("lease_until")?
                 .is_none()
         {
-            enqueue(&mut tx, id).await?;
+            enqueue(&mut tx, id, state.native_publish.is_some()).await?;
         }
         let response = read_receipt(&mut tx, result_id).await?;
         tx.commit().await?;
@@ -345,7 +357,7 @@ pub(crate) async fn publish(
       SELECT $1,$2,$3,platform,id,$4,$5,'submitting' FROM accounts WHERE id=$6")
         .bind(id).bind(body.task_id).bind(body.batch_id).bind(body.cover.as_ref().map(|v| &v.key))
         .bind(saved).bind(body.account_id).execute(&mut *tx).await?;
-    enqueue(&mut tx, id).await?;
+    enqueue(&mut tx, id, state.native_publish.is_some()).await?;
     if body.batch_id.is_none() && task_status != "published" {
         sqlx::query("UPDATE tasks SET status='publishing',error_code=NULL,error_message=NULL,updated_at=now() WHERE id=$1")
             .bind(body.task_id).execute(&mut *tx).await?;

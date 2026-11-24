@@ -2,7 +2,7 @@
 
 新增 POST /sau/{platform}/publish，沿用 Python 服务的 HMAC 认证、请求与响应字段，以及原 accounts、tasks、assets、publish_batches、publish_jobs、outbox_events。
 
-该入口负责 Rust 原生投稿接收、参数检查与事务性持久化，不运行浏览器，也不转发至 Python HTTP 投稿接口。执行仍依赖独立 SAU 浏览器 Worker 和原 Outbox Dispatcher；在 Rust 独立执行器替换前，必须保留并配置该执行链。仅显式设置 VIDEOROLL_V2_SAU_ENABLE_BROWSER_OUTBOX=true 后才允许创建投稿任务，默认拒绝。
+该入口负责 Rust 原生投稿接收、参数检查与事务性持久化，不转发至 Python HTTP 投稿接口。旧兼容模式仍使用原 Outbox Dispatcher；新的原生执行模式直接由 Rust 消费，详见 SAU_WORKER_NATIVE_V1.md。两种执行模式必须互斥，默认拒绝投稿。
 
 - 校验平台、账号 active/valid 状态、批次目标、任务媒体归属和存储路径；严格要求视频及可选封面登记为该任务的原 assets。旧版未登记封面需要补登记，不静默访问其他任务文件。
 - 按 Python 原版常见元数据输入规范处理抖音作者、熟肉前缀、标签和小红书数量限制。尚未逐项验收 Python 任意类型字符串转换及全部 Unicode casefold 边界。

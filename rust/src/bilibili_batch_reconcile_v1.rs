@@ -163,6 +163,21 @@ pub(crate) async fn reconcile(
     task: Uuid,
     batch: Uuid,
 ) -> AppResult<()> {
+    reconcile_impl(tx, task, batch, true).await
+}
+pub(crate) async fn reconcile_native_sau(
+    tx: &mut Transaction<'_, Postgres>,
+    task: Uuid,
+    batch: Uuid,
+) -> AppResult<()> {
+    reconcile_impl(tx, task, batch, false).await
+}
+async fn reconcile_impl(
+    tx: &mut Transaction<'_, Postgres>,
+    task: Uuid,
+    batch: Uuid,
+    legacy_events: bool,
+) -> AppResult<()> {
     let row = sqlx::query(
         "SELECT state,expected_targets,outcomes_json,finished_at,cleanup_enqueued_at
         FROM publish_batches WHERE id=$1 AND task_id=$2 FOR UPDATE",
@@ -178,7 +193,11 @@ pub(crate) async fn reconcile(
     let targets = keys(&expected)?;
     let outcomes: Value = row.try_get("outcomes_json")?;
     let rows = sqlx::query(
-        "SELECT platform::text AS platform,account_id,state::text AS state
+        "SELECT platform::text AS platform,account_id,
+        CASE WHEN state::text='submitted' AND response_json->>'runtime'='rust'
+              AND response_json->>'receipt_verified'='false'
+              AND NULLIF(external_id,'') IS NULL AND NULLIF(external_url,'') IS NULL
+             THEN 'unknown' ELSE state::text END AS state
         FROM publish_jobs WHERE batch_id=$1 ORDER BY updated_at DESC,created_at DESC,id DESC",
     )
     .bind(batch)
@@ -207,7 +226,8 @@ pub(crate) async fn reconcile(
     .bind(target != State::Active)
     .execute(&mut **tx)
     .await?;
-    if target != State::Active
+    if legacy_events
+        && target != State::Active
         && (prior != target.name()
             || row
                 .try_get::<Option<DateTime<Utc>>, _>("finished_at")?
@@ -277,7 +297,8 @@ pub(crate) async fn reconcile(
     .bind(message)
     .execute(&mut **tx)
     .await?;
-    if aggregate.iter().all(|s| *s == State::Succeeded)
+    if legacy_events
+        && aggregate.iter().all(|s| *s == State::Succeeded)
         && currents
             .iter()
             .any(|(id, _, _, enqueued)| *id == batch && !enqueued)
