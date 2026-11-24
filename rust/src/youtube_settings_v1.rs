@@ -171,7 +171,7 @@ fn cookie_path(config: &Config) -> PathBuf {
         .join(".videoroll-private")
         .join("youtube-cookies.txt")
 }
-async fn read_cookie(config: &Config) -> AppResult<Option<String>> {
+pub(crate) async fn read_cookie(config: &Config) -> AppResult<Option<String>> {
     let file = cookie_path(config);
     let dir = config.storage_root.join(".videoroll-private");
     match fs::symlink_metadata(&dir).await {
@@ -288,7 +288,7 @@ async fn save_cookie(_config: &Config, _value: Option<&str>) -> AppResult<()> {
         "secure cookie storage requires Unix file permissions".into(),
     ))
 }
-async fn read_settings(db: &Database) -> AppResult<Value> {
+pub(crate) async fn read_settings(db: &Database) -> AppResult<Value> {
     // Use original settings including proxy and concurrency. Existing
     // cookies_txt_enc is retained, but not misused as a plaintext cookie.
     let own: Option<Value> = sqlx::query_scalar("SELECT value_json FROM app_settings WHERE key=$1")
@@ -441,9 +441,14 @@ async fn snapshot(state: &AppState) -> AppResult<Value> {
         // This is a private V2-managed file, NOT the legacy YOUTUBE_COOKIE_FILE env option.
         "cookie_file_configured":false,
         "cookie_file_exists":false,
-        "home_scan_enabled":false,"home_scan_interval_minutes":60,
-        "home_scan_limit":10,"home_scan_long_videos_only":false,
-        "home_scan_min_duration_seconds":180,"home_scan_running":false,
+        "home_scan_enabled":stored.get("home_scan_enabled").and_then(Value::as_bool).unwrap_or(false),
+        "home_scan_interval_minutes":stored.get("home_scan_interval_minutes").and_then(Value::as_i64).unwrap_or(60).clamp(1,1440),
+        "home_scan_limit":stored.get("home_scan_limit").and_then(Value::as_i64).unwrap_or(10).clamp(1,100),
+        "home_scan_long_videos_only":stored.get("home_scan_long_videos_only").and_then(Value::as_bool).unwrap_or(false),
+        "home_scan_min_duration_seconds":stored.get("home_scan_min_duration_seconds").and_then(Value::as_i64).unwrap_or(180).clamp(0,86400),
+        "home_scan_running":stored.get("home_scan_lock_until").and_then(Value::as_str)
+            .and_then(|v|chrono::DateTime::parse_from_rfc3339(v).ok())
+            .is_some_and(|dt|dt>Utc::now()),
         "home_scan_last_log_lines":[],"home_scan_last_sample_urls":[]
     });
     result
@@ -471,7 +476,7 @@ async fn update(State(state): State<AppState>, Json(patch): Json<Value>) -> AppR
     let updates = patch
         .as_object()
         .ok_or_else(|| AppError::Invalid("YouTube settings must be a JSON object".into()))?;
-    if updates.len() > 10 {
+    if updates.len() > 12 {
         return Err(AppError::Invalid("too many YouTube setting fields".into()));
     }
     for key in updates.keys() {
@@ -483,6 +488,11 @@ async fn update(State(state): State<AppState>, Json(patch): Json<Value>) -> AppR
                 | "parallel_download_enabled"
                 | "parallel_download_connections"
                 | "compatibility_mode_enabled"
+                | "home_scan_enabled"
+                | "home_scan_interval_minutes"
+                | "home_scan_limit"
+                | "home_scan_long_videos_only"
+                | "home_scan_min_duration_seconds"
         ) {
             return Err(AppError::Invalid(format!(
                 "YouTube setting {key} is not migrated yet"
@@ -493,7 +503,15 @@ async fn update(State(state): State<AppState>, Json(patch): Json<Value>) -> AppR
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('vr2.youtube.settings',0))")
         .execute(&mut *tx)
         .await?;
-    let old = read_settings(&state.db).await?;
+    // Read under the same transaction that acquired the settings lock.
+    // Otherwise a concurrently starting Home scan can lose its lock owner
+    // when this update overwrites stale JSON from a separate pool connection.
+    let old: Option<Value> =
+        sqlx::query_scalar("SELECT value_json FROM app_settings WHERE key=$1 FOR UPDATE")
+            .bind(SETTING_KEY)
+            .fetch_optional(&mut *tx)
+            .await?;
+    let old = old.unwrap_or_else(|| json!({}));
     let mut merged = old.as_object().cloned().unwrap_or_default();
     let old_cookie = read_cookie(&state.config).await?;
     let mut next_cookie = None;
@@ -525,7 +543,11 @@ async fn update(State(state): State<AppState>, Json(patch): Json<Value>) -> AppR
                     next_cookie = Some(Some(verified));
                 }
             }
-            "cookies_enabled" | "parallel_download_enabled" | "compatibility_mode_enabled" => {
+            "cookies_enabled"
+            | "parallel_download_enabled"
+            | "compatibility_mode_enabled"
+            | "home_scan_enabled"
+            | "home_scan_long_videos_only" => {
                 let value = value
                     .as_bool()
                     .ok_or_else(|| AppError::Invalid(format!("{key} must be boolean")))?;
@@ -541,6 +563,18 @@ async fn update(State(state): State<AppState>, Json(patch): Json<Value>) -> AppR
                     ));
                 }
                 merged.insert(key.clone(), json!(n));
+            }
+            "home_scan_interval_minutes" | "home_scan_limit" | "home_scan_min_duration_seconds" => {
+                let n = value
+                    .as_i64()
+                    .ok_or_else(|| AppError::Invalid(format!("{key} must be integer")))?;
+                let (minimum, maximum) = match key.as_str() {
+                    "home_scan_interval_minutes" => (1, 1440),
+                    "home_scan_limit" => (1, 100),
+                    "home_scan_min_duration_seconds" => (0, 86400),
+                    _ => unreachable!(),
+                };
+                merged.insert(key.clone(), json!(n.clamp(minimum, maximum)));
             }
             _ => unreachable!(),
         }
@@ -627,6 +661,10 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/settings/youtube", get(read).put(update))
         .route("/settings/youtube/test", axum::routing::post(test_proxy))
+        .route(
+            "/settings/youtube/home_scan/run",
+            axum::routing::post(crate::youtube_home_run_v1::run),
+        )
 }
 #[cfg(test)]
 mod tests {

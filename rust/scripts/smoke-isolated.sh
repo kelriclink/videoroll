@@ -24,7 +24,9 @@ model_catalog_pid=""
 model_proxy_pid=""
 hf_hub_pid=""
 asr_provider_pid=""
+youtube_home_pid=""
 cleanup() {
+  if [[ -n "$youtube_home_pid" ]]; then kill "$youtube_home_pid" 2>/dev/null || true; wait "$youtube_home_pid" 2>/dev/null || true; fi
   if [[ -n "$model_catalog_pid" ]]; then kill "$model_catalog_pid" 2>/dev/null || true; wait "$model_catalog_pid" 2>/dev/null || true; fi
   if [[ -n "$model_proxy_pid" ]]; then kill "$model_proxy_pid" 2>/dev/null || true; wait "$model_proxy_pid" 2>/dev/null || true; fi
   if [[ -n "$hf_hub_pid" ]]; then kill "$hf_hub_pid" 2>/dev/null || true; wait "$hf_hub_pid" 2>/dev/null || true; fi
@@ -44,6 +46,10 @@ cleanup() {
   rm -rf -- "$repo_root/rust/target/v2-smoke-dictionaries"
   rm -rf -- "$repo_root/rust/target/v2-smoke-dictionary-fixtures"
   rm -rf -- "$repo_root/rust/target/v2-smoke-workdir"
+  # Never let test login cookies survive in the shared build target.
+  if [[ "${VIDEOROLL_V2_STORAGE_ROOT:-}" == "$repo_root/rust/target/v2-smoke-objects" ]]; then
+    rm -f -- "$VIDEOROLL_V2_STORAGE_ROOT/.videoroll-private/youtube-cookies.txt"
+  fi
 }
 trap cleanup EXIT
 smoke_db_port="${VIDEOROLL_V2_TEST_DB_PORT:-35432}"
@@ -114,6 +120,13 @@ if [[ "${VIDEOROLL_V2_TEST_BILI_DIRECT_ONLY:-false}" == "true" ]]; then
 fi
 export VIDEOROLL_V2_BIND="127.0.0.1:18080"
 export VIDEOROLL_V2_STORAGE_ROOT="$repo_root/rust/target/v2-smoke-objects"
+# Exact disposable sandbox only: reused Rust build target may retain a
+# cookies.txt from a previous aborted isolated test. Do not inherit it.
+case "$VIDEOROLL_V2_STORAGE_ROOT" in
+  "$repo_root/rust/target/v2-smoke-objects") ;;
+  *) echo 'refusing unsafe isolated private cookie cleanup' >&2; exit 1;;
+esac
+rm -f -- "$VIDEOROLL_V2_STORAGE_ROOT/.videoroll-private/youtube-cookies.txt"
 export VIDEOROLL_V2_INTERNAL_TOKEN="v2-local-test-only-0123456789abcdef"
 export INTERNAL_API_SECRET="rust-local-test-internal-secret"
 export ADMIN_BOOTSTRAP_SECRET="rust-local-test-bootstrap"
@@ -126,6 +139,12 @@ export SUBTITLE_DICTIONARY_DATA_DIR="$repo_root/rust/target/v2-smoke-dictionarie
 export VIDEOROLL_V2_TEST_HF_BASE="http://127.0.0.1:18090"
 export VIDEOROLL_V2_ALLOW_TEST_HF_LOOPBACK="true"
 export VIDEOROLL_V2_ALLOW_TEST_ASR_LOOPBACK="true"
+if [[ "${VIDEOROLL_V2_TEST_HOME_ONLY:-false}" == "true" ]]; then
+  export VIDEOROLL_V2_TEST_YOUTUBE_HOME_BASE="http://127.0.0.1:18195"
+  export VIDEOROLL_V2_ALLOW_TEST_YOUTUBE_HOME_LOOPBACK="true"
+  python3 "$repo_root/rust/tests/mock_youtube_home_feed_v1.py" > "$repo_root/rust/target/v2-mock-youtube-home.log" 2>&1 &
+  youtube_home_pid=$!
+fi
 export VIDEOROLL_V2_TEST_GROQ_BASE="http://127.0.0.1:18091/groq/v1"
 export VIDEOROLL_V2_TEST_CLOUDFLARE_BASE="http://127.0.0.1:18091"
 # Never consume a production embedding key during isolated promotion.
@@ -209,6 +228,12 @@ if [[ "${VIDEOROLL_V2_TEST_TERMINAL_ONLY:-false}" == "true" ]]; then
   container_name="$container_name" PYTHONPATH="$repo_root/src" /opt/videoroll/venvs/core/bin/python \
     "$repo_root/rust/tests/maintenance_terminal_storage_v1_isolated.py"
   echo 'PASS: original terminal storage cleanup matches safe V1 behavior'
+  exit 0
+fi
+if [[ "${VIDEOROLL_V2_TEST_HOME_ONLY:-false}" == "true" ]]; then
+  container_name="$container_name" PYTHONPATH="$repo_root/src" /opt/videoroll/venvs/core/bin/python \
+    "$repo_root/rust/tests/youtube_home_run_v1_isolated.py"
+  echo 'PASS: original YouTube home scan lock, native Browse, duplicate workflow fencing and legacy telemetry'
   exit 0
 fi
 if [[ "${VIDEOROLL_V2_TEST_YOUDUB_CONTROL_ONLY:-false}" == "true" ]]; then

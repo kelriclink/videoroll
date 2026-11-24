@@ -45,6 +45,7 @@ const V1_ADAPTERS: &[(&str, &str)] = &[
     ("GET", "/maintenance/workdir"),
     ("POST", "/maintenance/workdir/cleanup"),
     ("POST", "/maintenance/storage/cleanup-terminal"),
+    ("POST", "/settings/youtube/home_scan/run"),
     ("GET", "/settings/storage"),
     ("PUT", "/settings/storage"),
     ("GET", "/operations/ai-usage"),
