@@ -22,8 +22,8 @@ def post(path,payload=None):
 
 task=uuid4()
 with engine.begin() as db:
-    db.execute(text("""INSERT INTO tasks(id,source_type,source_license,status,runtime_owner,runtime_origin)
-       VALUES(CAST(:id AS uuid),'youtube','authorized','created','rust','youtube_manual')"""),{'id':str(task)})
+    db.execute(text("""INSERT INTO tasks(id,source_type,source_url,source_license,status,runtime_owner,runtime_origin)
+       VALUES(CAST(:id AS uuid),'youtube','https://www.youtube.com/watch?v=0123456789A','authorized','created','rust','youtube_manual')"""),{'id':str(task)})
 status,body=post(f'/tasks/{task}/actions/youtube_download_enqueue')
 assert status==200 and body=={'status':'queued','task_id':str(task)},(status,body)
 with engine.connect() as db:
@@ -119,3 +119,66 @@ with engine.connect() as db:
 print('PASS: V1 /subtitle/jobs schedules real native subtitle operation, preserves original active jobs, idempotency, stage GET and fails closed for unsupported inputs')
 
 print('PASS: original V1 youtube enqueue is durable and idempotent; automatic P2 rejects manual tasks, skips disabled/no-speech without creating jobs')
+
+# The old synchronous download action returns complete assets ONLY when they
+# exist on disk, and it never pretends a queued Rust stage is a finished file.
+from pathlib import Path
+for _ in range(2):
+    status,manual=post(f'/tasks/{task}/actions/youtube_download')
+    assert status==409 and manual['detail']['code']=='YOUTUBE_DOWNLOAD_IN_PROGRESS',(status,manual)
+with engine.connect() as db:
+    assert db.execute(text("SELECT count(*) FROM operation_inbox WHERE task_id=CAST(:id AS uuid) AND stage='download'"),{'id':str(task)}).scalar()==1
+# Simulate a finished Rust worker receipt using only disposable test files.
+root=Path(os.environ['VIDEOROLL_V2_STORAGE_ROOT'])
+raw_key=f'v2/raw/{task}/source.mp4'
+meta_key=f'v2/youtube-meta/{task}/metadata.json'
+raw_file=root/raw_key
+meta_file=root/meta_key
+raw_file.parent.mkdir(parents=True,exist_ok=True)
+meta_file.parent.mkdir(parents=True,exist_ok=True)
+raw_file.write_bytes(b'isolated-test-video-file-not-a-real-download')
+meta={'id':'0123456789A','title':'VideoRoll mock video','description':'Isolated fixture',
+      'webpage_url':'https://www.youtube.com/watch?v=0123456789A','duration':42,'uploader':'fixture channel'}
+meta_file.write_text(json.dumps(meta))
+raw_id=uuid4()
+meta_id=uuid4()
+with engine.begin() as db:
+    db.execute(text("INSERT INTO assets(id,task_id,kind,storage_key,size_bytes) VALUES(CAST(:asset AS uuid),CAST(:id AS uuid),'video_raw',:key,44)"),
+        {'asset':str(raw_id),'id':str(task),'key':raw_key})
+    db.execute(text("INSERT INTO assets(id,task_id,kind,storage_key,size_bytes) VALUES(CAST(:asset AS uuid),CAST(:id AS uuid),'metadata_json',:key,210)"),
+        {'asset':str(meta_id),'id':str(task),'key':meta_key})
+status,complete=post(f'/tasks/{task}/actions/youtube_download')
+assert status==200 and complete['metadata']['title']=='VideoRoll mock video',(status,complete)
+assert complete['video_asset']['id']==str(raw_id) and complete['metadata_asset']['id']==str(meta_id),complete
+assert complete['cover_asset'] is None and complete['video_asset']['storage_key']==raw_key,complete
+from videoroll.apps.orchestrator_api.schemas import YouTubeDownloadActionResponse
+YouTubeDownloadActionResponse.model_validate(complete)
+meta_file.write_text('broken JSON')
+status,corrupt=post(f'/tasks/{task}/actions/youtube_download')
+assert status==400,(status,corrupt)
+meta_file.write_text(json.dumps(meta))
+# Original Python in-flight operation must block a second Rust dispatch.
+python_task=uuid4()
+with engine.begin() as db:
+    db.execute(text("INSERT INTO tasks(id,source_type,source_url,source_license,status,runtime_owner) VALUES(CAST(:id AS uuid),'youtube','https://youtu.be/0123456789B','authorized','created','rust')"),{'id':str(python_task)})
+    db.execute(text("INSERT INTO operation_inbox(id,operation_key,status) VALUES(CAST(:op AS uuid),:key,'processing')"),
+        {'op':str(uuid4()),'key':'youtube-download:'+str(python_task)})
+status,conflict=post(f'/tasks/{python_task}/actions/youtube_download')
+assert status==409 and conflict['detail']['code']=='YOUTUBE_DOWNLOAD_IN_PROGRESS',(status,conflict)
+with engine.connect() as db:
+    assert db.execute(text("SELECT count(*) FROM vr2_jobs WHERE task_id=CAST(:id AS uuid) AND stage='download'"),{'id':str(python_task)}).scalar()==0
+print('PASS: V1 synchronous YouTube download returns validated original DTO when ready, queues without false success and protects Python lease and corrupt metadata')
+# A stage whose receipt was persisted but whose media object is missing must
+# never be marked completed or replayed automatically: reconcile the storage.
+lost_task=uuid4()
+with engine.begin() as db:
+    db.execute(text("INSERT INTO tasks(id,source_type,source_url,source_license,status,runtime_owner) VALUES(CAST(:id AS uuid),'youtube','https://youtu.be/0123456789C','authorized','created','rust')"),{'id':str(lost_task)})
+status,queued=post(f'/tasks/{lost_task}/actions/youtube_download')
+assert status==409 and queued['detail']['code']=='YOUTUBE_DOWNLOAD_IN_PROGRESS',(status,queued)
+with engine.begin() as db:
+    db.execute(text("UPDATE operation_inbox SET status='succeeded' WHERE task_id=CAST(:id AS uuid) AND stage='download'"),{'id':str(lost_task)})
+status,recovery=post(f'/tasks/{lost_task}/actions/youtube_download')
+assert status==409 and recovery['detail']['code']=='YOUTUBE_DOWNLOAD_RESULT_RECOVERING',(status,recovery)
+with engine.connect() as db:
+    assert db.execute(text("SELECT count(*) FROM operation_inbox WHERE task_id=CAST(:id AS uuid) AND stage='download'"),{'id':str(lost_task)}).scalar()==1
+print('PASS: lost successful download cannot claim completion or dispatch an unsafe retry')

@@ -20,7 +20,7 @@ use tokio::{
 use uuid::Uuid;
 
 const MAX_INFO: usize = 2_000_000;
-fn meta_view(value: &Value, fallback: &str) -> AppResult<Value> {
+pub(crate) fn meta_view(value: &Value, fallback: &str) -> AppResult<Value> {
     let source = value
         .as_object()
         .ok_or_else(|| AppError::Invalid("YouTube metadata is not an object".into()))?;
@@ -54,7 +54,10 @@ fn meta_view(value: &Value, fallback: &str) -> AppResult<Value> {
           .filter(|d| d.is_finite() && *d>=0.0).map(|d|d as u64)
     }))
 }
-async fn latest_info(state: &AppState, id: Uuid) -> AppResult<Option<(Value, AssetInfo)>> {
+pub(crate) async fn latest_info(
+    state: &AppState,
+    id: Uuid,
+) -> AppResult<Option<(Value, AssetInfo)>> {
     let asset = sqlx::query_as::<_, AssetInfo>(
         "SELECT id,task_id,kind::text,storage_key,sha256,size_bytes,duration_ms,created_at
          FROM assets WHERE task_id=$1 AND kind='metadata_json'::asset_kind
@@ -157,7 +160,7 @@ async fn extract_info(
     meta_view(&value, url)?;
     Ok(value)
 }
-async fn fetch_metadata(
+pub(crate) async fn fetch_metadata(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<Value>> {

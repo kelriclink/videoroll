@@ -4,6 +4,8 @@ use crate::{AppError, AppResult, api::AppState, domain::Stage, legacy_contracts:
 use axum::{
     Json, Router,
     extract::{Path, State},
+    http::StatusCode,
+    response::{IntoResponse, Response},
     routing::post,
 };
 use serde_json::{Value, json};
@@ -75,6 +77,140 @@ async fn enqueue_youtube_download(
         ));
     }
     Ok(Json(json!({"task_id":task_id,"status":"queued"})))
+}
+
+/// Original Python download action returned its complete media/metadata DTO.
+/// The Rust worker is durable and async: the legacy action returns that DTO
+/// only for verified existing assets, otherwise queues the real download and
+/// uses the original structured 409 in-progress error (never a fake success).
+fn legacy_asset(asset: &crate::domain::AssetInfo) -> Value {
+    json!({"id":asset.id,"kind":asset.kind,"storage_key":asset.storage_key,
+        "sha256":asset.sha256,"size_bytes":asset.size_bytes,
+        "duration_ms":asset.duration_ms,"created_at":asset.created_at})
+}
+fn download_conflict(code: &str, message: &str) -> Response {
+    (
+        StatusCode::CONFLICT,
+        Json(json!({"detail":{"code":code,"message":message}})),
+    )
+        .into_response()
+}
+async fn valid_media(state: &AppState, asset: &crate::domain::AssetInfo) -> AppResult<bool> {
+    if !asset.storage_key.starts_with("v2/") {
+        return Ok(false);
+    }
+    let path = state.storage.resolve_existing(&asset.storage_key).await?;
+    match tokio::fs::metadata(&path).await {
+        Ok(meta) => Ok(meta.is_file() && meta.len() > 0),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+async fn latest_asset(
+    state: &AppState,
+    task_id: Uuid,
+    kind: &str,
+) -> AppResult<Option<crate::domain::AssetInfo>> {
+    sqlx::query_as::<_, crate::domain::AssetInfo>(
+        "SELECT id,task_id,kind::text AS kind,storage_key,sha256,size_bytes,duration_ms,created_at
+         FROM assets WHERE task_id=$1 AND kind::text=$2 AND storage_key LIKE 'v2/%'
+         ORDER BY created_at DESC,id DESC LIMIT 1",
+    )
+    .bind(task_id)
+    .bind(kind)
+    .fetch_optional(&state.db.pool)
+    .await
+    .map_err(Into::into)
+}
+async fn native_youtube_download(
+    State(state): State<AppState>,
+    Path(task_id): Path<Uuid>,
+) -> AppResult<Response> {
+    let task = read_task(&state.db, task_id).await?;
+    if task.source_type != "youtube" {
+        return Err(AppError::NotFound("YouTube task not found".into()));
+    }
+    let url = task
+        .source_url
+        .as_deref()
+        .ok_or_else(|| AppError::Invalid("missing YouTube source URL".into()))?;
+    crate::ingest::youtube_video_id(url)?;
+    // The original V1 operation key is also a cross-generation ownership
+    // fence; never launch Rust while Python/Hatchet may still own the lease.
+    let legacy = sqlx::query(
+        "SELECT status,lease_until FROM operation_inbox
+        WHERE operation_key=$1 LIMIT 1",
+    )
+    .bind(format!("youtube-download:{task_id}"))
+    .fetch_optional(&state.db.pool)
+    .await?;
+    if let Some(row) = legacy {
+        let status: String = row.try_get("status")?;
+        if status == "unknown" || status == "pending" || status == "processing" {
+            return Ok(download_conflict(
+                "YOUTUBE_DOWNLOAD_IN_PROGRESS",
+                "legacy Python YouTube download still owns or may own this operation; reconcile it before Rust execution",
+            ));
+        }
+    }
+    if let Some(raw) = latest_asset(&state, task_id, "video_raw").await?
+        && valid_media(&state, &raw).await?
+    {
+        // Metadata extraction is real and can fail: do not invent DTO fields.
+        let Json(fetched) =
+            crate::youtube_meta::fetch_metadata(State(state.clone()), Path(task_id)).await?;
+        let meta_asset: crate::domain::AssetInfo =
+            serde_json::from_value(fetched["metadata_asset"].clone()).map_err(|_| {
+                AppError::Unavailable("metadata asset missing from source-backed response".into())
+            })?;
+        let cover = latest_asset(&state, task_id, "cover_image").await?;
+        let cover = match cover {
+            Some(item) if valid_media(&state, &item).await? => Some(legacy_asset(&item)),
+            _ => None,
+        };
+        return Ok(Json(
+            json!({"metadata":fetched["metadata"],"metadata_asset":legacy_asset(&meta_asset),
+            "video_asset":legacy_asset(&raw),"cover_asset":cover}),
+        )
+        .into_response());
+    }
+    if matches!(
+        task.status.as_str(),
+        "PUBLISHED" | "PUBLISHING" | "CANCELED"
+    ) {
+        return Err(AppError::Conflict(
+            "terminal task cannot download media".into(),
+        ));
+    }
+    // An existing successful receipt without a valid artifact cannot be
+    // treated as an available video or silently replayed after a crash.
+    let latest: Option<String> = sqlx::query_scalar(
+        "SELECT state FROM vr2_jobs
+        WHERE task_id=$1 AND stage='download' ORDER BY generation DESC,created_at DESC LIMIT 1",
+    )
+    .bind(task_id)
+    .fetch_optional(&state.db.pool)
+    .await?;
+    if latest.as_deref() == Some("succeeded") {
+        return Ok(download_conflict(
+            "YOUTUBE_DOWNLOAD_RESULT_RECOVERING",
+            "download succeeded but media object is unavailable; reconcile storage before retry",
+        ));
+    }
+    if latest.as_deref() == Some("unknown") {
+        return Ok(download_conflict(
+            "YOUTUBE_DOWNLOAD_RESULT_RECOVERING",
+            "download result uncertain; reconcile before retry",
+        ));
+    }
+    let Json(state_info) = enqueue_youtube_download(State(state.clone()), Path(task_id)).await?;
+    let state_label = state_info["status"].as_str().unwrap_or("queued");
+    Ok(download_conflict(
+        "YOUTUBE_DOWNLOAD_IN_PROGRESS",
+        &format!(
+            "download {state_label} in durable Rust worker; poll /tasks/{task_id}/youtube_download_progress and retry for the complete legacy asset response"
+        ),
+    ))
 }
 
 async fn auto_dubbing(
@@ -235,6 +371,10 @@ pub fn router() -> Router<AppState> {
         .route(
             "/tasks/{task_id}/actions/youtube_download_enqueue",
             post(enqueue_youtube_download),
+        )
+        .route(
+            "/tasks/{task_id}/actions/youtube_download",
+            post(native_youtube_download),
         )
         .route("/tasks/{task_id}/actions/auto_dubbing", post(auto_dubbing))
         .route(

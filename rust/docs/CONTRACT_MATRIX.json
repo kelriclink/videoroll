@@ -2,7 +2,7 @@
   "status": "INCOMPLETE",
   "notice": "Route registration is not contract parity; V2-only routes are counted separately.",
   "legacy_declarations": 217,
-  "native_v1_partial": 179,
+  "native_v1_partial": 180,
   "fully_verified": 0,
   "frontend_reference_text_occurrences": 193,
   "checks_needed": [
@@ -1575,7 +1575,7 @@
       "path": "/tasks/{task_id}/actions/youtube_download",
       "python_source": "src/videoroll/apps/orchestrator_api/routers/youtube.py:156",
       "python_handler": "download_youtube",
-      "v1_status": "not_native_v1",
+      "v1_status": "native_adapter_partial",
       "full_contract_verified": false,
       "auth_verified": false,
       "side_effects_verified": false,
