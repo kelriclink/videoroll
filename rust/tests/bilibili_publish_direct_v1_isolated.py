@@ -47,7 +47,7 @@ def check(task,status):
     end=time.monotonic()+75
     while time.monotonic()<end:
         with engine.connect() as db:
-            value=db.execute(text('SELECT state::text FROM publish_jobs WHERE task_id=CAST(:id AS uuid)'),{'id':str(task)}).scalar_one()
+            value=db.execute(text("SELECT state::text FROM publish_jobs WHERE task_id=CAST(:id AS uuid) AND platform='bilibili'"),{'id':str(task)}).scalar_one()
         if value==status:return
         if value not in ('submitting',):raise AssertionError((value,status))
         time.sleep(.6)
@@ -189,9 +189,9 @@ counts=counters()
 assert counts['ai']==2 and counts['ai_invalid']==1 and counts['type_catalog']==2 and counts['predict']==2 and counts['submit']==5,counts
 print('PASS: invalid AI partition ID is rejected and original Python fallback predicts a valid Bilibili type')
 
-# Original Python publish_batches can be used directly for a single Bilibili
-# target. Multi-platform batches remain fail-closed until their reconciliation
-# is native, and a batch cannot claim an asset or target of another task.
+# Original Python publish_batches are the only source of truth. Neither a
+# missing peer platform job nor a failed peer target can become "published"
+# solely because Bilibili returned a confirmed archive.
 def make_batch(task,targets):
     identity=uuid4()
     with engine.begin() as db:
@@ -212,11 +212,19 @@ code,wrong_target=api('/bilibili/publish',dict(invalid_target,batch_id=str(wrong
 assert code==400,(code,wrong_target)
 multi_task,multi_payload=fixture('batch-only')
 multi_batch=make_batch(multi_task,single+[{'key':'douyin:default','platform':'douyin'}])
-code,multi_result=api('/bilibili/publish',dict(multi_payload,batch_id=str(multi_batch)))
-assert code==409,(code,multi_result)
+multi_payload['batch_id']=str(multi_batch)
+code,multi_queued=api('/bilibili/publish',multi_payload)
+assert code==200 and multi_queued['state']=='submitting',(code,multi_queued)
 with engine.connect() as db:
-    for check_task in [unrelated_task,invalid_target_task,multi_task]:
+    for check_task in [unrelated_task,invalid_target_task]:
         assert db.execute(text('SELECT count(*) FROM publish_jobs WHERE task_id=CAST(:task AS uuid)'),{'task':str(check_task)}).scalar_one()==0
+process(multi_task,'published')
+with engine.connect() as db:
+    assert db.execute(text('SELECT state FROM publish_batches WHERE id=CAST(:batch AS uuid)'),{'batch':str(multi_batch)}).scalar_one()=='active'
+    assert db.execute(text('SELECT status::text FROM tasks WHERE id=CAST(:task AS uuid)'),{'task':str(multi_task)}).scalar_one()=='publishing'
+    assert db.execute(text("SELECT count(*) FROM outbox_events WHERE aggregate_id=:id AND event_type='publish.cleanup'"),{'id':str(multi_batch)}).scalar_one()==0
+assert api('/bilibili/publish',multi_payload)[1]['job_id']==multi_queued['job_id']
+print('PASS: Bilibili success in original multi-platform batch cannot publish unfinished Douyin target or schedule premature cleanup')
 
 batch_task,batch_payload=fixture('batch-only')
 batch_id=make_batch(batch_task,single)
@@ -234,7 +242,7 @@ with engine.connect() as db:
     assert batch_row.state=='succeeded' and batch_row.finished_at is not None,batch_row
     assert db.execute(text('SELECT status::text FROM tasks WHERE id=CAST(:task AS uuid)'),{'task':str(batch_task)}).scalar_one()=='published'
 counts=counters()
-assert counts['submit']==6,counts
+assert counts['submit']==7,counts
 print('PASS: original single-target Bilibili publish batch is task- and target-scoped and settled atomically with Python publish_jobs')
 # A later batch does not rewrite the previous confirmed job or invalidate an
 # idempotent replay under the original batch ID.
@@ -256,10 +264,117 @@ assert code==200 and bad_final['state']=='unknown' and bad_final['job_id']==bad_
 with engine.connect() as db:
     assert db.execute(text('SELECT state FROM publish_batches WHERE id=CAST(:batch AS uuid)'),{'batch':str(unknown_batch)}).scalar_one()=='failed'
     status=db.execute(text('SELECT status::text,error_code FROM tasks WHERE id=CAST(:task AS uuid)'),{'task':str(bad_batch_task)}).one()
-    assert status.status=='failed' and status.error_code=='PUBLISH_OUTCOME_UNKNOWN',status
+    assert status.status=='failed' and status.error_code=='PUBLISH_FAILED',status
 counts=counters()
-assert counts['submit']==7 and counts['ambiguous_submit']==2,counts
+assert counts['submit']==8 and counts['ambiguous_submit']==2,counts
 print('PASS: unknown Bilibili single-target batch quarantines original batch state, original job and task without resubmission')
+# Fully confirmed / partially failed peer platforms are read from the original
+# PublishJob table, never inferred from Bilibili's own archive result.
+def other_platform(task,batch,state):
+    with engine.begin() as db:
+        db.execute(text("""INSERT INTO publish_jobs(id,task_id,batch_id,platform,state,meta_json)
+          VALUES(CAST(:id AS uuid),CAST(:task AS uuid),CAST(:batch AS uuid),'douyin',:status,'{}'::jsonb)"""),
+          {'id':str(uuid4()),'task':str(task),'batch':str(batch),'status':state})
+
+finished_task,finished_payload=fixture('batch-only')
+finished_batch=make_batch(finished_task,single+[{'platform':'douyin'}])
+other_platform(finished_task,finished_batch,'published')
+finished_payload['batch_id']=str(finished_batch)
+code,receipt=api('/bilibili/publish',finished_payload)
+assert code==200,(code,receipt)
+process(finished_task,'published')
+with engine.connect() as db:
+    assert db.execute(text('SELECT state FROM publish_batches WHERE id=CAST(:id AS uuid)'),{'id':str(finished_batch)}).scalar_one()=='succeeded'
+    assert db.execute(text('SELECT status::text FROM tasks WHERE id=CAST(:id AS uuid)'),{'id':str(finished_task)}).scalar_one()=='published'
+    events=db.execute(text("SELECT event_type,available_at FROM outbox_events WHERE aggregate_id=:id ORDER BY event_type"),{'id':str(finished_batch)}).all()
+    assert [e.event_type for e in events]==['publish.cleanup','workflow.publish.finished'],events
+    from datetime import datetime,timezone,timedelta
+    assert timedelta(hours=23)<events[0].available_at-datetime.now(timezone.utc)<timedelta(hours=25),events
+print('PASS: all original platform receipts reconcile a multi-target batch atomically and schedule Python-compatible 24-hour cleanup')
+
+partial_task,partial_payload=fixture('batch-only')
+partial_batch=make_batch(partial_task,single+[{'platform':'douyin'}])
+other_platform(partial_task,partial_batch,'failed')
+partial_payload['batch_id']=str(partial_batch)
+code,_=api('/bilibili/publish',partial_payload)
+assert code==200,code
+process(partial_task,'published')
+with engine.connect() as db:
+    assert db.execute(text('SELECT state FROM publish_batches WHERE id=CAST(:id AS uuid)'),{'id':str(partial_batch)}).scalar_one()=='partial_failed'
+    task_state=db.execute(text('SELECT status::text,error_code FROM tasks WHERE id=CAST(:id AS uuid)'),{'id':str(partial_task)}).one()
+    assert task_state.status=='publishing' and task_state.error_code=='PUBLISH_PARTIAL_FAILURE',task_state
+    assert db.execute(text("SELECT count(*) FROM outbox_events WHERE aggregate_id=:id AND event_type='publish.cleanup'"),{'id':str(partial_batch)}).scalar_one()==0
+print('PASS: one confirmed Bilibili target plus a failed Douyin target stays partial_failed without cleanup')
+
+mixed_task,mixed_payload=fixture('batch-unknown')
+mixed_batch=make_batch(mixed_task,single+[{'platform':'douyin'}])
+other_platform(mixed_task,mixed_batch,'published')
+mixed_payload['batch_id']=str(mixed_batch)
+code,_=api('/bilibili/publish',mixed_payload)
+assert code==200,code
+process(mixed_task,'unknown')
+with engine.connect() as db:
+    assert db.execute(text('SELECT state FROM publish_batches WHERE id=CAST(:id AS uuid)'),{'id':str(mixed_batch)}).scalar_one()=='partial_failed'
+    task_state=db.execute(text('SELECT status::text,error_code FROM tasks WHERE id=CAST(:id AS uuid)'),{'id':str(mixed_task)}).one()
+    assert task_state.status=='publishing' and task_state.error_code=='PUBLISH_PARTIAL_FAILURE',task_state
+print('PASS: ambiguous Bilibili result plus another platform success becomes partial_failed without hiding unknown receipt')
+
+counts=counters()
+assert counts['submit']==11 and counts['ambiguous_submit']==3,counts
+
+
+# Simulate a genuine crashed Rust Worker holding an expired publish lease.
+# Quarantine must check the old PostgreSQL job and batch *before* claims,
+# without ever generating another external Bilibili upload or archive request.
+lease_task,lease_payload=fixture('batch-only')
+lease_batch=make_batch(lease_task,single+[{'platform':'douyin'}])
+other_platform(lease_task,lease_batch,'published')
+lease_payload['batch_id']=str(lease_batch)
+code,lease_response=api('/bilibili/publish',lease_payload)
+assert code==200 and lease_response['state']=='submitting',(code,lease_response)
+with engine.begin() as db:
+    lease_uuid=uuid4()
+    affected=db.execute(text("""UPDATE operation_inbox
+       SET status='running',lease_token=CAST(:lease AS uuid),
+           lease_until=now()-interval '1 minute'
+       WHERE task_id=CAST(:task AS uuid) AND stage='publish' AND runtime_engine='rust-v2'
+       RETURNING id"""),{'lease':str(lease_uuid),'task':str(lease_task)}).all()
+    assert len(affected)==1,affected
+before_lease=counters()
+process(lease_task,'unknown')
+with engine.connect() as db:
+    assert db.execute(text('SELECT state FROM publish_batches WHERE id=CAST(:id AS uuid)'),{'id':str(lease_batch)}).scalar_one()=='partial_failed'
+    assert db.execute(text("SELECT status FROM operation_inbox WHERE task_id=CAST(:id AS uuid) AND stage='publish' AND runtime_engine='rust-v2'"),{'id':str(lease_task)}).scalar_one()=='unknown'
+    check_state=db.execute(text('SELECT status::text,error_code FROM tasks WHERE id=CAST(:id AS uuid)'),{'id':str(lease_task)}).one()
+    assert check_state.status=='publishing' and check_state.error_code=='PUBLISH_PARTIAL_FAILURE',check_state
+assert counters()['submit']==before_lease['submit'],(before_lease,counters())
+print('PASS: expired Rust publishing lease is quarantined under Task->Workflow->Job->Batch lock order, without any UPOS/upload replay')
+
+# Parallel independent Python V1 channel batches are not the same as a
+# multi-target batch. The default Bilibili batch may finish, but the task must
+# remain publishing until the separately active Douyin batch is complete.
+parallel_task,parallel_payload=fixture('batch-only')
+other_batch=make_batch(parallel_task,[{'platform':'douyin'}])
+with engine.begin() as db:
+    db.execute(text("UPDATE tasks SET status='publishing'::task_status WHERE id=CAST(:id AS uuid)"),{'id':str(parallel_task)})
+other_platform(parallel_task,other_batch,'submitting')
+# Historical markers with empty target lists are accepted by Python's current
+# batch aggregation and must be ignored by the Rust read path.
+marker=make_batch(parallel_task,[])
+with engine.begin() as db:
+    db.execute(text("UPDATE publish_batches SET state='finished' WHERE id=CAST(:id AS uuid)"),{'id':str(marker)})
+separate_bili_batch=make_batch(parallel_task,single)
+parallel_payload['batch_id']=str(separate_bili_batch)
+code,parallel_queued=api('/bilibili/publish',parallel_payload)
+assert code==200 and parallel_queued['state']=='submitting',(code,parallel_queued)
+process(parallel_task,'published')
+with engine.connect() as db:
+    assert db.execute(text('SELECT state FROM publish_batches WHERE id=CAST(:id AS uuid)'),{'id':str(separate_bili_batch)}).scalar_one()=='succeeded'
+    assert db.execute(text('SELECT state FROM publish_batches WHERE id=CAST(:id AS uuid)'),{'id':str(other_batch)}).scalar_one()=='active'
+    assert db.execute(text('SELECT status::text FROM tasks WHERE id=CAST(:id AS uuid)'),{'id':str(parallel_task)}).scalar_one()=='publishing'
+    assert db.execute(text("SELECT count(*) FROM outbox_events WHERE aggregate_id=:id AND event_type='publish.cleanup'"),{'id':str(separate_bili_batch)}).scalar_one()==0
+print('PASS: independent Bilibili and Douyin batches coexist; legacy empty marker ignored; active Douyin target prevents premature task published and cleanup')
+counts=counters()
 
 # Restarting a disconnected Rust process must not replay a Bilibili archive
 # whose external side effect could already have succeeded.

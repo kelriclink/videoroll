@@ -502,24 +502,59 @@ impl Scheduler {
             })
             .collect())
     }
-    /// Mark expired publishing requests as unknown; NEVER replay an external submission
-    /// based only on a missing worker heartbeat.
+    /// Quarantine a bounded set of expired irreversible publishes. Acquire
+    /// locks in the same order as normal transitions and Python's original
+    /// publisher reconciliation: Task -> Workflow -> Job -> PublishBatch.
+    /// The earlier bulk UPDATE locked Jobs before Tasks, which could deadlock
+    /// concurrent Python Task -> Batch settlement during a rolling migration.
     pub async fn quarantine_expired_publish(&self) -> AppResult<u64> {
-        let mut tx = self.db.pool.begin().await?;
-        let rows = sqlx::query(
-            "UPDATE vr2_jobs SET state='unknown',lease_token=NULL,lease_until=NULL,last_error='publish ownership expired; external outcome must be verified',updated_at=now() WHERE stage='publish' AND ((state='running' AND lease_until < now()) OR (state='awaiting' AND updated_at < now()-interval '48 hours')) RETURNING workflow_id,id"
-        ).fetch_all(&mut *tx).await?;
-        for row in &rows {
-            let workflow_id: Uuid = row.try_get("workflow_id")?;
-            let job_id: Uuid = row.try_get("id")?;
+        let candidates = sqlx::query(
+            "SELECT id,task_id,workflow_id FROM vr2_jobs
+            WHERE stage='publish' AND ((state='running' AND lease_until<now())
+                OR (state='awaiting' AND updated_at<now()-interval '48 hours'))
+            ORDER BY updated_at,id LIMIT 100",
+        )
+        .fetch_all(&self.db.pool)
+        .await?;
+        let mut count = 0;
+        for candidate in candidates {
+            let task_id: Uuid = candidate.try_get("task_id")?;
+            let workflow_id: Uuid = candidate.try_get("workflow_id")?;
+            let job_id: Uuid = candidate.try_get("id")?;
+            let mut tx = self.db.pool.begin().await?;
+            sqlx::query("SELECT id FROM tasks WHERE id=$1 FOR UPDATE")
+                .bind(task_id)
+                .fetch_one(&mut *tx)
+                .await?;
+            sqlx::query("SELECT id FROM vr2_workflows WHERE id=$1 FOR UPDATE")
+                .bind(workflow_id)
+                .fetch_one(&mut *tx)
+                .await?;
+            let fenced=sqlx::query("UPDATE vr2_jobs SET state='unknown',lease_token=NULL,
+                lease_until=NULL,last_error='publish ownership expired; external outcome must be verified',
+                updated_at=now() WHERE id=$1 AND stage='publish'
+                AND ((state='running' AND lease_until<now())
+                    OR (state='awaiting' AND updated_at<now()-interval '48 hours'))
+                RETURNING id")
+                .bind(job_id).fetch_optional(&mut *tx).await?;
+            if fenced.is_none() {
+                tx.commit().await?;
+                continue;
+            }
             crate::bilibili_publish_v1::mark_uncertain(
                 &mut tx,
                 workflow_id,
                 "native publish lease expired; confirm external Bilibili archive manually",
             )
             .await?;
-            sqlx::query("UPDATE vr2_workflows SET state='unknown',last_error='publish outcome unconfirmed',updated_at=now() WHERE id=$1 AND state='running'")
-                .bind(workflow_id).execute(&mut *tx).await?;
+            sqlx::query(
+                "UPDATE vr2_workflows SET state='unknown',
+                last_error='publish outcome unconfirmed',updated_at=now()
+                WHERE id=$1 AND state='running'",
+            )
+            .bind(workflow_id)
+            .execute(&mut *tx)
+            .await?;
             Self::event(
                 &mut tx,
                 workflow_id,
@@ -528,9 +563,10 @@ impl Scheduler {
                 json!({"reason":"lease_expired"}),
             )
             .await?;
+            tx.commit().await?;
+            count += 1;
         }
-        tx.commit().await?;
-        Ok(rows.len() as u64)
+        Ok(count)
     }
     /// Claims are atomically fenced by a new UUID and a renewed PostgreSQL lease.
     /// The claim query can be safely used by multiple processes.
@@ -690,13 +726,15 @@ impl Scheduler {
                     "publish completion requires a verified receipt".into(),
                 ));
             }
-            crate::bilibili_publish_v1::mark_confirmed(tx, item, &result).await?;
+            let standalone = crate::bilibili_publish_v1::mark_confirmed(tx, item, &result).await?;
             // Subtitle drafts are reconciled from confirmed publish receipts by
             // the independent outbox worker. NEVER execute subtitle SQL inside
             // the publication settlement transaction: a failed PostgreSQL
             // statement would poison it and obscure a successful upload.
-            sqlx::query("UPDATE tasks SET status='published'::task_status,error_code=NULL,error_message=NULL,updated_at=now() WHERE id=$1 AND status <> 'canceled'::task_status")
-                .bind(item.task_id).execute(&mut **tx).await?;
+            if standalone {
+                sqlx::query("UPDATE tasks SET status='published'::task_status,error_code=NULL,error_message=NULL,updated_at=now() WHERE id=$1 AND status <> 'canceled'::task_status")
+                    .bind(item.task_id).execute(&mut **tx).await?;
+            }
         }
         sqlx::query("UPDATE vr2_jobs SET state='succeeded',result=$1,lease_token=NULL,lease_until=NULL,finished_at=now(),updated_at=now() WHERE id=$2")
             .bind(&result).bind(item.id).execute(&mut **tx).await?;
@@ -1119,6 +1157,12 @@ impl Scheduler {
         if let Some(job_id) = risky {
             sqlx::query("UPDATE vr2_jobs SET state='unknown',lease_token=NULL,lease_until=NULL,last_error='canceled during external publish: verify platform result',updated_at=now() WHERE id=$1")
                 .bind(job_id).execute(&mut *tx).await?;
+            crate::bilibili_publish_v1::mark_uncertain(
+                &mut tx,
+                workflow_id,
+                "native publisher canceled while external result uncertain",
+            )
+            .await?;
             sqlx::query("UPDATE vr2_workflows SET state='unknown',last_error='external publish outcome uncertain',updated_at=now() WHERE id=$1")
                 .bind(workflow_id).execute(&mut *tx).await?;
             Self::event(

@@ -19,14 +19,20 @@
 
 ## 暂不支持的旧合约
 
-- `account_id` 对应的多账号凭据选择尚未移植，不能将任务偷发到默认账号。含 `account_id` 的请求返回明确冲突。
-- 已支持原 `publish_batches` 中**恰好一个 B 站默认账号目标**的 `batch_id`；任务行加锁后校验批次任务 ID、`expected_targets` 和其他已存在的关联批次。原 `publish_jobs.batch_id` 与 Rust Publish Stage 同事务持久化；成功时原 `publish_batches.state=succeeded`，未知结果时 `state=failed`，均与原作业状态一起提交。同一批次终态的重复请求复用原回执。**多目标或跨账号批次**需要综合所有渠道作业状态、跨平台回执和 Python 原 `outbox_events` 回调/清理处理，目前继续拒绝，不能将单个 B 站成功错误地升级为整批成功。
+- `account_id` 对应的 B 站多账号 Cookie **原 Python 实现也有实际缺陷**：`main.py` 会把 account_id 写入原 `publish_jobs`，但 `worker.py` 实际调用的是全局 `get_bilibili_cookie_header/get_bilibili_csrf_token`，没有读取对应的账号 Cookie。因此 Rust 不得仅为了让接口返回 200 而将稿件发给错误账号；非空 `account_id` 仍显式拒绝，需先完成账号专属凭据与真实发布身份绑定的跨语言设计和隔离验证。对于 `expected_targets` 中其他渠道账号 ID，当前只读原有投稿凭据与回执，不擅自向这些平台发帖。
+- `batch_id` 已支持原 `publish_batches.expected_targets` 中包含 `bilibili:default` 的多目标批次，也支持 B 站和其他平台各自拥有独立活动批次。全部复用原表 `publish_batches`、`publish_jobs`、`outbox_events` 与原字段。锁定 Task→Workflow→Job→Batch；Rust 的单次 B 站回执和批次状态在同一个事务中结算。按 Python `publish_lifecycle.py` 对每个 `(platform,account_id)` 选取最新作业，缺少作业时回退原 `outcomes_json`：全部成功才标 `succeeded`，还有未完成目标则维持 `active`，部分失败为 `partial_failed`，全部失败为 `failed`。任务状态按照各渠道的**最新批次**综合计算，防止 B 站成功提前覆盖仍在运行的抖音等目标。
+- 批次终态生成与原 Python 相同 operation_key 的 `workflow.publish.finished` Outbox；所有当前渠道均成功时生成延迟 24 小时的 `publish.cleanup` Outbox（只入队不伪称实际执行）。原 `PublishResponse`、原作业租约与未知回执的防重原则不变；历史空 `expected_targets=[]` 的遗留 marker 不参与当前批次统计。已有批次终态的重复请求复用其原回执，不会重新发布或把 B 站成功回执误转移给新批次。
 - `force_retry=true` 会覆盖未知平台回执，Rust 直接拒绝，必须人工检查 B 站真实稿件后再设计有审核的恢复流程。
 - `ai_summary` 已接通独立 Rust 分区推荐器的同源代码路径，但仍缺 Python 原版更丰富的审计记录、分区结果解释、动态活动与合集后处理的全量差分；不能据此认为整条直投链路已完成生产验收。
+- 当前仅在 B 站直投的原生 Rust 结算点执行聚合；外部渠道**之后**单独完成时，应由该渠道的原 Python `reconcile_publish_batch` 或后续 Rust 社交平台结算器更新。原 Outbox 消费者、真实多平台同步和可靠执行 24 小时清理仍需集成验收。
 - 原 Python 完整上传速度、动态活动匹配、视频合集归档、投稿后所有审计和错误映射、复杂上传恢复并未完成逐条对照。直接单 P 投稿也仅接受经验证、实际归属 `video_final` 的 Rust 资产。
 
 ## 隔离验证
 
-`rust/tests/bilibili_publish_direct_v1_isolated.py` 与 `rust/tests/mock_bilibili_publish_direct.py` 使用临时 PostgreSQL + 本地模拟 B 站 + 本地 OpenAI 兼容接口 + 真实 Rust HTTP/Worker。已验证：拒绝不安全的 Python 旧请求选项；对同一任务的多次 HTTP 请求只创建一个原作业/一个 Rust Publish 阶段；UPOS 分片上传；B 站真实格式分区预测；封面上传；单 P 投稿只发送一次 Archive POST；已投出稿件的原表回执及 GET 读取；模拟不可确定的 HTTP 503 时原作业和 Rust 任务进入 `unknown`、绝不重复投稿；双 P 前必须有任务同源、当前 SRT 对应的成功 YouDub 记录，且双 P 以两个有序 CID 一次提交；AI 分类器使用任务历史摘要和原 Provider 配置，返回 B 站确实存在的叶子分区或回退到分区预测；仅含 B 站默认账号的原批次成功、未知结果和重复请求均更新或复用原 `publish_batches`，且跨任务、错误目标及多目标批次被拒绝。
+`rust/tests/bilibili_publish_direct_v1_isolated.py` 与 `rust/tests/mock_bilibili_publish_direct.py` 使用临时 PostgreSQL + 本地模拟 B 站 + 本地 OpenAI 兼容接口 + 真实 Rust HTTP/Worker。已验证：拒绝不安全的 Python 旧请求选项；对同一任务的多次 HTTP 请求只创建一个原作业/一个 Rust Publish 阶段；UPOS 分片上传；B 站真实格式分区预测；封面上传；单 P 投稿只发送一次 Archive POST；已投出稿件的原表回执及 GET 读取；模拟不可确定的 HTTP 503 时原作业和 Rust 任务进入 `unknown`、绝不重复投稿；双 P 前必须有任务同源、当前 SRT 对应的成功 YouDub 记录，且双 P 以两个有序 CID 一次提交；AI 分类器使用任务历史摘要和原 Provider 配置，返回 B 站确实存在的叶子分区或回退到分区预测；仅含 B 站默认账号的原批次成功、未知结果和重复请求均更新或复用原 `publish_batches`。已覆盖多目标下 B 站先完成而抖音仍等待、其他平台已成功/失败、单独渠道批次并行、旧空批次标记、24 小时 Outbox 清理排期、跨批次幂等、防止误标任务成功；还模拟 Rust Worker 租约过期和重启，保证不会重复 Archive 提交。
 
 测试使用一次性 Cookie、隔离数据库及本地 FFmpeg 视频，不触碰生产账号、生产 Python/Hatchet 或实际 B 站；仍需真实平台与长时间断点故障注入的生产等价验收。
+
+## 2026-11-24 多目标批次、旧表和 Worker 恢复增量
+
+新增 `rust/src/bilibili_batch_reconcile_v1.rs`，只使用原 `publish_batches` / `publish_jobs` / `outbox_events`，不创建新业务表。临时数据库 + 本地 B 站模拟 + 真实 Rust Worker 验证 `active/succeeded/partial_failed/failed`、跨平台独立批次、历史空目标列表、Outbox 延迟清理以及 B 站 HTTP 503 `unknown`。租约过期扫描从一次性先锁所有作业改为限量 100 条、逐项 Task→Workflow→Job→Batch 顺序锁定；取消已经开始的投稿也同步隔离原 `publish_jobs`，不依赖假设外部平台回绝。端到端验证只覆盖模拟环境，尚未声称真实 B 站和所有社交平台的生产等价。
