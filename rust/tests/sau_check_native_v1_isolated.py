@@ -93,6 +93,7 @@ cookie.write_text(json.dumps(state))
     mock.chmod(0o700)
     def spawn(enable=True,port=18189,wait=True):
         env=os.environ.copy()
+        env["VIDEOROLL_V2_SAU_ENABLE_NATIVE_LOGIN"]="false"
         env.update(VIDEOROLL_V2_SAU_BIND=f"127.0.0.1:{port}",
                    VIDEOROLL_V2_SAU_ENABLE_NATIVE_CHECK=str(enable).lower(),
                    VIDEOROLL_V2_SAU_ENABLE_BROWSER_OUTBOX="false",

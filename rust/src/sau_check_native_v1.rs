@@ -21,7 +21,7 @@ use uuid::Uuid;
 const ENGINE: &str = "rust-sau-check";
 const MAX_STATE: usize = 1024 * 1024;
 
-fn name(raw: &str) -> AppResult<String> {
+pub(crate) fn name(raw: &str) -> AppResult<String> {
     let n = raw.trim();
     if n.is_empty()
         || n.len() > 64
@@ -140,6 +140,8 @@ pub(crate) async fn import_account(
         file.ok_or_else(|| AppError::Invalid("file is required".into()))?
     );
     let mut tx = state.pool.begin().await?;
+    crate::sau_login_native_v1::lock_name(&mut tx, platform, &name).await?;
+    crate::sau_login_native_v1::ensure_not_logging_in(&mut tx, platform, &name).await?;
     // Same unique constraint as Python; serialize simultaneous new imports
     // before examining the existing account (including a disabled account).
     sqlx::query(
@@ -207,9 +209,9 @@ pub(crate) async fn recheck(
 // One native checker process per SAU cookie directory. Acquire an advisory
 // file lock at startup; no credentials are put into operation payloads.
 pub(crate) struct Runtime {
-    executable: PathBuf,
-    cwd: PathBuf,
-    cookies: PathBuf,
+    pub(crate) executable: PathBuf,
+    pub(crate) cwd: PathBuf,
+    pub(crate) cookies: PathBuf,
     timeout: Duration,
     _lock: std::fs::File,
 }
@@ -401,11 +403,11 @@ fn materialize(runtime: &Runtime, work: &Work) -> AppResult<CookieFile> {
     f.sync_all()?;
     Ok(guard)
 }
-fn refreshed(path: &FsPath) -> AppResult<String> {
+pub(crate) fn refreshed(path: &FsPath) -> AppResult<String> {
     use std::{io::Read, os::unix::fs::OpenOptionsExt};
     let f = std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)?;
     if !f.metadata()?.is_file() {
         return Err(AppError::Invalid("invalid SAU state file".into()));
@@ -518,6 +520,9 @@ pub async fn run(state: Arc<SauState>, runtime: Runtime) {
     loop {
         let result: AppResult<bool> = async {
             recover(&state).await?;
+            if crate::sau_login_native_v1::tick(&state, &runtime).await? {
+                return Ok(true);
+            }
             if let Some(work) = claim(&state, &runtime).await? {
                 let outcome = execute(&runtime, &work).await;
                 finish(&state, &work, outcome).await?;

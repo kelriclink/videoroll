@@ -28,6 +28,7 @@ pub struct SauState {
     pub pool: PgPool,
     pub(crate) publish_outbox_enabled: bool,
     pub(crate) check_enabled: bool,
+    pub(crate) login_config: Option<Arc<crate::sau_login_native_v1::LoginConfig>>,
     token: String,
 }
 impl SauState {
@@ -49,16 +50,34 @@ impl SauState {
         let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes())
             .map_err(|_| AppError::Unavailable("SAU HMAC unavailable".into()))?;
         mac.update(SERVICE_CONTEXT);
+        let check_enabled = std::env::var("VIDEOROLL_V2_SAU_ENABLE_NATIVE_CHECK")
+            .ok()
+            .as_deref()
+            == Some("true");
+        let login_config = if std::env::var("VIDEOROLL_V2_SAU_ENABLE_NATIVE_LOGIN")
+            .ok()
+            .as_deref()
+            == Some("true")
+        {
+            if !check_enabled {
+                return Err(AppError::Invalid(
+                    "native login requires native check runtime".into(),
+                ));
+            }
+            Some(Arc::new(
+                crate::sau_login_native_v1::LoginConfig::from_env()?
+            ))
+        } else {
+            None
+        };
         Ok(Self {
             pool,
             publish_outbox_enabled: std::env::var("VIDEOROLL_V2_SAU_ENABLE_BROWSER_OUTBOX")
                 .ok()
                 .as_deref()
                 == Some("true"),
-            check_enabled: std::env::var("VIDEOROLL_V2_SAU_ENABLE_NATIVE_CHECK")
-                .ok()
-                .as_deref()
-                == Some("true"),
+            check_enabled,
+            login_config,
             token: format!("v1.{}", hex::encode(mac.finalize().into_bytes())),
         })
     }
@@ -185,6 +204,16 @@ pub(crate) async fn account_busy(
     account_id: Uuid,
     check_state: &str,
 ) -> AppResult<()> {
+    let account = sqlx::query("SELECT platform::text AS platform,name FROM accounts WHERE id=$1")
+        .bind(account_id)
+        .fetch_one(&mut **tx)
+        .await?;
+    crate::sau_login_native_v1::ensure_not_logging_in(
+        tx,
+        &account.try_get::<String, _>("platform")?,
+        &account.try_get::<String, _>("name")?,
+    )
+    .await?;
     let publishing: bool = sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM publish_jobs
            WHERE account_id=$1 AND state::text='submitting')",
@@ -220,6 +249,12 @@ pub fn router(state: Arc<SauState>) -> Router {
         .route(
             "/sau/{platform}/publish",
             axum::routing::post(crate::sau_publish_native_v1::publish),
+        )
+        .route(
+            "/login-sessions/{session_id}",
+            get(crate::sau_login_native_v1::get)
+                .post(crate::sau_login_native_v1::start)
+                .delete(crate::sau_login_native_v1::cancel),
         )
         .route_layer(middleware::from_fn_with_state(
             state.clone(),

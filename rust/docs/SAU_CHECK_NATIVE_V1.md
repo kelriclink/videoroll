@@ -14,7 +14,7 @@
 - SAU_EXECUTABLE（默认 sau）、SAU_RUNTIME_DIR、SAU_COOKIES_DIR 与原 CLI 配置一致，cookies 必须为 runtime 目录下的 cookies；已有目录要求严格。SAU_ACCOUNT_CHECK_TIMEOUT_SECONDS 默认 120，允许 1..600 秒。
 - 原生 Worker 直接启动第三方 SAU CLI check，使用 0600 临时 cookie 文件、独占目录锁、无 shell 参数拼接。输出不回传 CLI 原始日志，成功时校验更新后的 storage_state 后保存；失败保留原凭据，正常结束删除临时文件。
 - 过期 processing 记录标记 error，禁止自动重复执行中断的浏览器进程。强制终止后可能遗留 Cookie 文件；拒绝覆盖该文件，需人工核实进程已退出并安全清理后重试。Linux 父进程死亡信号只能直接约束 CLI 主进程，仍需独立验证真实 Playwright 子进程生命周期。
-- 同一账号不能同时由旧 Python 导入/登录/检测 Worker 与新 Rust 账号检查 Worker 管理。上线前停掉旧检查入队并排空旧检查任务；原 SAU 投稿 Worker/Outbox Dispatcher 当前仍是投稿执行链，需继续迁移或保留。真实登录会话三条 API 仍待迁移。
+- 同一账号不能同时由旧 Python 导入/登录/检测 Worker 与新 Rust 账号检查 Worker 管理。上线前停掉旧检查入队并排空旧检查任务；原 SAU 投稿 Worker/Outbox Dispatcher 当前仍是投稿执行链，需继续迁移或保留。原生登录会话 API 已接入，详见 SAU_LOGIN_NATIVE_V1.md；真实浏览器仍待验收。
 
 隔离测试：
 VIDEOROLL_V2_TEST_SAU_NATIVE_CHECK_ONLY=true bash rust/scripts/smoke-isolated.sh

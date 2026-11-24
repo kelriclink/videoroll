@@ -16,7 +16,7 @@ use chrono::{DateTime, Utc};
 use futures_util::StreamExt;
 use serde_json::{Value, json};
 use sqlx::Row;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use tokio::time::{Duration, interval};
 use uuid::Uuid;
 
@@ -152,6 +152,15 @@ fn event_topics(task: Uuid, kind: &str) -> Vec<String> {
     }
     topics
 }
+async fn login_snapshots(state: &AppState) -> AppResult<Vec<Value>> {
+    let rows=sqlx::query("SELECT session.* FROM (VALUES ('douyin'),('xiaohongshu'),('kuaishou')) AS platforms(platform)
+      CROSS JOIN LATERAL (
+       SELECT id,status,request_json,result_json,created_at,completed_at FROM operation_inbox
+       WHERE runtime_engine='rust-sau-login' AND request_json->>'platform'=platforms.platform
+       ORDER BY created_at DESC,id DESC LIMIT 1
+      ) session").fetch_all(&state.db.pool).await?;
+    rows.iter().map(crate::sau_login_native_v1::dto).collect()
+}
 async fn serve(socket: &mut WebSocket, state: AppState) {
     let connection_id = Uuid::new_v4();
     if !send(
@@ -173,6 +182,10 @@ async fn serve(socket: &mut WebSocket, state: AppState) {
     heartbeat.tick().await;
     resource_poll.tick().await;
     let mut failure_notified = false;
+    let mut login_poll = interval(Duration::from_secs(2));
+    // At most three platform snapshots per authenticated connection.
+    let mut last_login = HashMap::<String, Value>::new();
+
     loop {
         tokio::select! {
             incoming = socket.next() => {
@@ -194,6 +207,8 @@ async fn serve(socket: &mut WebSocket, state: AppState) {
                             Some("set_subscriptions")=>{
                                 match parse_topics(&value["topics"]) {
                                     Ok(updated)=>{
+                                        if !updated.contains("publishing") || !topics.contains("publishing"){last_login.clear();}
+
                                         let mut sorted=updated.iter().cloned().collect::<Vec<_>>();
                                         sorted.sort();
                                         topics=updated;
@@ -220,6 +235,22 @@ async fn serve(socket: &mut WebSocket, state: AppState) {
                         "v":1,"type":"event","event_id":Uuid::new_v4(),
                         "topics":["resources"],"name":"system.resources.sample","data":data,
                     })).await {break;}
+            }
+            _=login_poll.tick(), if topics.contains("publishing")=>{
+                if let Ok(rows)=login_snapshots(&state).await {
+                    let mut connected=true;
+                    for data in rows{
+                        let platform=data["platform"].as_str().unwrap_or("").to_owned();
+                        if last_login.get(&platform)==Some(&data){continue;}
+                        if !send(socket,json!({"v":1,"type":"event","event_id":Uuid::new_v4(),
+                            "entity_id":data["id"],"occurred_at":Utc::now(),"topics":["publishing"],
+                            "name":"login_session.updated","data":data})).await {
+                            connected=false;break;
+                        }
+                        last_login.insert(platform,data);
+                    }
+                    if !connected{break;}
+                }
             }
             _=event_poll.tick(), if !topics.is_empty()=>{
                 match event_batch(&state,cursor).await{

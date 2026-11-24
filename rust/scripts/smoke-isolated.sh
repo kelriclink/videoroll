@@ -80,10 +80,35 @@ if ! docker exec "$container_name" psql -At -U postgres -d videoroll_test -c 'SE
 fi
 docker exec -i "$container_name" psql -v ON_ERROR_STOP=1 -U postgres -d videoroll_test   < rust/tests/bootstrap_legacy_for_integration.sql >/dev/null
 export DATABASE_URL="postgresql://postgres:videoroll-test-20261121@127.0.0.1:${smoke_db_port}/videoroll_test"
+if [[ "${VIDEOROLL_V2_TEST_SAU_NATIVE_LOGIN_ONLY:-false}" == "true" ]]; then
+  export INTERNAL_API_SECRET="isolated-sau-native-login-test-secret"
+  export ADMIN_BOOTSTRAP_SECRET="isolated-sau-ws-bootstrap-secret"
+  export VIDEOROLL_V2_INTERNAL_TOKEN="isolated-sau-ws-internal-token-0123456789"
+  export VIDEOROLL_V2_SECURE_COOKIES="false"
+  export VIDEOROLL_V2_BIND="127.0.0.1:18081"
+  export VIDEOROLL_V2_STORAGE_ROOT="$repo_root/rust/target/v2-sau-login-isolated-objects"
+  if ss -lntH "( sport = :18081 or sport = :18191 )" | grep -q .; then
+    echo "isolated SAU test port occupied" >&2;exit 1
+  fi
+  "$CARGO_HOME/bin/cargo" build --manifest-path "$repo_root/rust/Cargo.toml" --bin videoroll-sau --bin videoroll-v2 --locked --offline --quiet
+  "$repo_root/rust/target/debug/videoroll-v2" migrate
+  PYTHONPATH="$repo_root/src" /opt/videoroll/venvs/core/bin/python "$repo_root/rust/tests/sau_login_native_v1_isolated.py"
+  "$repo_root/rust/target/debug/videoroll-v2" api >"$repo_root/rust/target/sau-login-ws-api.log" 2>&1 &
+  api_pid=$!
+  for i in $(seq 1 40); do
+    if curl --silent --fail http://127.0.0.1:18081/ready >/dev/null;then break;fi
+    sleep 1
+  done
+  curl --silent --fail http://127.0.0.1:18081/ready >/dev/null
+  PYTHONPATH="$repo_root/src" /opt/videoroll/venvs/core/bin/python "$repo_root/rust/tests/sau_login_realtime_isolated.py"
+  echo 'PASS: native SAU login sessions, full DB migrations and authenticated original realtime events'
+  exit 0
+fi
 if [[ "${VIDEOROLL_V2_TEST_SAU_NATIVE_CHECK_ONLY:-false}" == "true" ]]; then
   export INTERNAL_API_SECRET="isolated-sau-native-check-test-secret"
   docker exec "$container_name" psql -v ON_ERROR_STOP=1 -U postgres -d videoroll_test -c "ALTER TABLE operation_inbox ADD COLUMN runtime_engine TEXT NOT NULL DEFAULT 'python'" >/dev/null
   docker exec -i "$container_name" psql -v ON_ERROR_STOP=1 -U postgres -d videoroll_test < rust/migrations/20261124000035_sau_check_queue_indexes.sql >/dev/null
+  docker exec -i "$container_name" psql -v ON_ERROR_STOP=1 -U postgres -d videoroll_test < rust/migrations/20261124000036_sau_login_session_indexes.sql >/dev/null
   "$CARGO_HOME/bin/cargo" build --manifest-path "$repo_root/rust/Cargo.toml" --bin videoroll-sau --locked --offline --quiet
   PYTHONPATH="$repo_root/src" /opt/videoroll/venvs/core/bin/python "$repo_root/rust/tests/sau_check_native_v1_isolated.py"
   echo 'PASS: native SAU account import/check and durable queue with fake browser CLI'
@@ -91,6 +116,8 @@ if [[ "${VIDEOROLL_V2_TEST_SAU_NATIVE_CHECK_ONLY:-false}" == "true" ]]; then
 fi
 if [[ "${VIDEOROLL_V2_TEST_SAU_NATIVE_PUBLISH_ONLY:-false}" == "true" ]]; then
   export INTERNAL_API_SECRET="isolated-sau-native-publish-test-secret"
+  docker exec "$container_name" psql -v ON_ERROR_STOP=1 -U postgres -d videoroll_test -c "ALTER TABLE operation_inbox ADD COLUMN runtime_engine TEXT NOT NULL DEFAULT 'python'" >/dev/null
+  docker exec -i "$container_name" psql -v ON_ERROR_STOP=1 -U postgres -d videoroll_test < rust/migrations/20261124000036_sau_login_session_indexes.sql >/dev/null
   # Test the production enum types rather than only the older TEXT fixtures.
   docker exec -i "$container_name" psql -v ON_ERROR_STOP=1 -U postgres -d videoroll_test <<'SQL'
 CREATE TYPE publish_state AS ENUM ('draft','submitting','submitted','published','unknown','failed');
