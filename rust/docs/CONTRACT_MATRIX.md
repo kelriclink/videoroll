@@ -5,8 +5,8 @@
 全部完成状态只允许结合 API 契约、权限、并发、重启、外部副作用与设备测试证据填写。
 
 - 原版声明：217
-- 原生 V1 部分适配：178
-- 无原生 V1 入口：39
+- 原生 V1 部分适配：179
+- 无原生 V1 入口：38
 - 已完成全面验收：0
 - 前端引用文本：193
 
@@ -16,7 +16,7 @@
 | egress_gateway | 2 | 0 | 2 |
 | orchestrator_api | 132 | 109 | 23 |
 | social_publisher | 9 | 0 | 9 |
-| subtitle_service | 55 | 53 | 2 |
+| subtitle_service | 55 | 54 | 1 |
 | youtube_ingest | 9 | 8 | 1 |
 
 ## 完整逐项清单
@@ -204,7 +204,7 @@
 | subtitle_service | GET | /subtitle/embedding/runtime | native_adapter_partial | get_embedding_runtime_status |
 | subtitle_service | POST | /subtitle/embedding/test | native_adapter_partial | test_embedding |
 | subtitle_service | GET | /subtitle/hardware/intel | native_adapter_partial | get_intel_hardware_view |
-| subtitle_service | POST | /subtitle/jobs | not_native_v1 | create_job |
+| subtitle_service | POST | /subtitle/jobs | native_adapter_partial | create_job |
 | subtitle_service | GET | /subtitle/jobs/{job_id} | native_adapter_partial | get_job |
 | subtitle_service | POST | /subtitle/knowledge/import | native_adapter_partial | import_knowledge_items_view |
 | subtitle_service | GET | /subtitle/knowledge/items | native_adapter_partial | list_knowledge_items_view |

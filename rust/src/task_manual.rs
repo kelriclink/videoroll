@@ -18,7 +18,7 @@ use sqlx::Row;
 use uuid::Uuid;
 
 #[derive(Debug, Deserialize)]
-struct SubtitleAction {
+pub(crate) struct SubtitleAction {
     #[serde(default)]
     resume: bool,
     #[serde(default)]
@@ -70,7 +70,7 @@ struct SubtitleAction {
     #[serde(default)]
     publish_payload: Option<Value>,
 }
-fn subtitle_config(request: SubtitleAction) -> AppResult<Value> {
+pub(crate) fn subtitle_config(request: SubtitleAction) -> AppResult<Value> {
     // The native Rust ASR processes SRT/ASS using a single engine and the
     // configured OpenAI-compatible endpoint. Legacy engine selectors and
     // YouTube subtitle-source selection require separate implementations.

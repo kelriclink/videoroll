@@ -140,6 +140,7 @@ const V1_ADAPTERS: &[(&str, &str)] = &[
     ("GET", "/subtitle/auto/profile"),
     ("PUT", "/subtitle/auto/profile"),
     ("GET", "/subtitle/jobs/{job_id}"),
+    ("POST", "/subtitle/jobs"),
     ("GET", "/subtitle/tasks/{task_id}/quality"),
     ("GET", "/subtitle/tasks/{task_id}/translation-context"),
     ("PUT", "/subtitle/tasks/{task_id}/translation-context"),

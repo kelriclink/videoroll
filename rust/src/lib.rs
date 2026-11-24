@@ -60,6 +60,7 @@ pub mod subtitle_dictionary_parse_v1;
 pub mod subtitle_dictionary_v1;
 pub mod subtitle_embedding_infer_v1;
 pub mod subtitle_embedding_v1;
+pub mod subtitle_jobs_create_v1;
 pub mod subtitle_knowledge_import_v1;
 pub mod subtitle_knowledge_read_v1;
 pub mod subtitle_knowledge_rebuild_v1;

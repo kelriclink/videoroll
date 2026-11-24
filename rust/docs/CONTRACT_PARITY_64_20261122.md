@@ -1,11 +1,11 @@
-# VideoRoll Rust V1 部分适配 API：178 条逐接口探测
+# VideoRoll Rust V1 部分适配 API：179 条逐接口探测
 
-测试日期：2026-11-24T01:13:30.137589+00:00。
+测试日期：2026-11-24T01:29:37.447298+00:00。
 环境：隔离 PostgreSQL + 本地模拟平台，不使用生产账号、生产数据库或真实投稿。
 注意：HTTP 请求得到响应不代表与 Python 完全等价；仅拒绝路径不代表正向业务通过。
 隔离探测不能替代 Python/Rust 双端业务差分验收。
 
-逐项执行：178；2xx 正向：97；4xx 拒绝路径：80；异常/需要复核：0；完整业务等价验收：0。
+逐项执行：179；2xx 正向：97；4xx 拒绝路径：81；异常/需要复核：0；完整业务等价验收：0。
 
 | HTTP 方法 | 原 Python 路径 | Rust 返回 | 测试类型 | 鉴权检查 | 问题 |
 |---|---|---:|---|---:|---|
@@ -106,6 +106,7 @@
 | GET | `/subtitle/embedding/runtime` | 200 | positive | 401 | - |
 | POST | `/subtitle/embedding/test` | 200 | positive | 401 | - |
 | GET | `/subtitle/hardware/intel` | 200 | positive | 401 | - |
+| POST | `/subtitle/jobs` | 400 | rejection | 401 | - |
 | GET | `/subtitle/jobs/{job_id}` | 404 | rejection | 401 | existing_fixture_read_returned_404 |
 | POST | `/subtitle/knowledge/import` | 400 | rejection | 401 | - |
 | GET | `/subtitle/knowledge/items` | 200 | positive | 401 | - |
