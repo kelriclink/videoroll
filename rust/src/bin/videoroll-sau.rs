@@ -22,6 +22,7 @@ async fn main() -> anyhow::Result<()> {
         anyhow::bail!("SAU must bind loopback unless container binding explicitly enabled")
     }
     let listener = tokio::net::TcpListener::bind(bind).await?;
+    videoroll_v2::sau_account_native_v1::start_native_checker(state.clone())?;
     tracing::info!(address=%bind,"native Rust SAU intake subsystem ready");
     axum::serve(listener, videoroll_v2::sau_account_native_v1::router(state)).await?;
     Ok(())

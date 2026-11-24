@@ -5,8 +5,8 @@
 全部完成状态只允许结合 API 契约、权限、并发、重启、外部副作用与设备测试证据填写。
 
 - 原版声明：217
-- 原生 V1 部分适配：212
-- 无原生 V1 入口：5
+- 原生 V1 部分适配：214
+- 无原生 V1 入口：3
 - 已完成全面验收：0
 - 前端引用文本：193
 
@@ -15,7 +15,7 @@
 | bilibili_publisher | 10 | 10 | 0 |
 | egress_gateway | 2 | 2 | 0 |
 | orchestrator_api | 132 | 132 | 0 |
-| social_publisher | 9 | 4 | 5 |
+| social_publisher | 9 | 6 | 3 |
 | subtitle_service | 55 | 55 | 0 |
 | youtube_ingest | 9 | 9 | 0 |
 
@@ -169,8 +169,8 @@
 | orchestrator_api | POST | /youtube/{service_path:path} | native_adapter_partial | proxy_youtube_browser_operation |
 | social_publisher | GET | /accounts | native_adapter_partial | list_accounts |
 | social_publisher | DELETE | /accounts/{account_id} | native_adapter_partial | delete_account |
-| social_publisher | POST | /accounts/{account_id}/check | not_native_v1 | recheck_account |
-| social_publisher | POST | /accounts/{platform} | not_native_v1 | import_account |
+| social_publisher | POST | /accounts/{account_id}/check | native_adapter_partial | recheck_account |
+| social_publisher | POST | /accounts/{platform} | native_adapter_partial | import_account |
 | social_publisher | GET | /health | native_adapter_partial | health |
 | social_publisher | POST | /login-sessions/{platform} | not_native_v1 | start_login_session |
 | social_publisher | DELETE | /login-sessions/{session_id} | not_native_v1 | cancel_login_session |
