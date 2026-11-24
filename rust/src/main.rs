@@ -41,6 +41,26 @@ enum Command {
     PublishBatchTick,
     /// Unified broker-free control-plane dispatch.
     OutboxTick,
+    /// Read-only paginated historical task ownership inventory.
+    TaskOwnershipAudit {
+        #[arg(long)]
+        after: Option<uuid::Uuid>,
+        #[arg(long, default_value_t = 100)]
+        limit: i64,
+    },
+    /// Adopt one original task; optionally recover from verified media.
+    TaskOwnershipAdopt {
+        #[arg(long)]
+        task: uuid::Uuid,
+        #[arg(long)]
+        quiesced: bool,
+        #[arg(long)]
+        resume: bool,
+        /// Exact IDs of externally verified stopped Hatchet runs.
+        #[arg(long)]
+        stopped_run: Vec<uuid::Uuid>,
+    },
+
     /// Read-only delivery ledger and cutover blocker inventory.
     OutboxAudit {
         /// Exit nonzero if any unresolved delivery rows remain.
@@ -321,6 +341,35 @@ async fn main() -> anyhow::Result<()> {
                 receipts,
                 dispatched,
                 "SAU social publish tick finished"
+            );
+        }
+        Command::TaskOwnershipAudit { after, limit } => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(
+                    &videoroll_v2::task_ownership::audit(&db, after, limit).await?
+                )?
+            );
+        }
+        Command::TaskOwnershipAdopt {
+            task,
+            quiesced,
+            resume,
+            stopped_run,
+        } => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(
+                    &videoroll_v2::task_ownership::adopt(
+                        &db,
+                        &config,
+                        task,
+                        quiesced,
+                        resume,
+                        stopped_run
+                    )
+                    .await?
+                )?
             );
         }
         Command::OutboxTick => {
