@@ -5,25 +5,25 @@
 全部完成状态只允许结合 API 契约、权限、并发、重启、外部副作用与设备测试证据填写。
 
 - 原版声明：217
-- 原生 V1 部分适配：176
-- 无原生 V1 入口：41
+- 原生 V1 部分适配：178
+- 无原生 V1 入口：39
 - 已完成全面验收：0
 - 前端引用文本：193
 
 | Python 子系统 | 原始声明 | Rust V1 部分适配 | 未映射 V1 |
 |---|---:|---:|---:|
-| bilibili_publisher | 10 | 7 | 3 |
+| bilibili_publisher | 10 | 8 | 2 |
 | egress_gateway | 2 | 0 | 2 |
 | orchestrator_api | 132 | 109 | 23 |
 | social_publisher | 9 | 0 | 9 |
-| subtitle_service | 55 | 52 | 3 |
+| subtitle_service | 55 | 53 | 2 |
 | youtube_ingest | 9 | 8 | 1 |
 
 ## 完整逐项清单
 
 | 子系统 | 方法 | 路径 | 原生 V1 状态 | Python 原方法 |
 |---|---|---|---|---|
-| bilibili_publisher | POST | /bilibili/archive/type/recommend | not_native_v1 | recommend_archive_type |
+| bilibili_publisher | POST | /bilibili/archive/type/recommend | native_adapter_partial | recommend_archive_type |
 | bilibili_publisher | GET | /bilibili/archive/types | native_adapter_partial | get_archive_types |
 | bilibili_publisher | GET | /bilibili/auth/me | native_adapter_partial | get_auth_me |
 | bilibili_publisher | GET | /bilibili/auth/settings | native_adapter_partial | get_auth_settings |
@@ -230,7 +230,7 @@
 | subtitle_service | GET | /subtitle/translate/model-providers/{provider_id}/remote-models | native_adapter_partial | remote_model_provider_models |
 | subtitle_service | GET | /subtitle/translate/settings | native_adapter_partial | get_translate_settings_view |
 | subtitle_service | PUT | /subtitle/translate/settings | native_adapter_partial | put_translate_settings_view |
-| subtitle_service | POST | /subtitle/translate/test | not_native_v1 | translate_test |
+| subtitle_service | POST | /subtitle/translate/test | native_adapter_partial | translate_test |
 | youtube_ingest | GET | /health | not_native_v1 | health |
 | youtube_ingest | POST | /youtube/ingest | native_adapter_partial | ingest_single |
 | youtube_ingest | POST | /youtube/scan | native_adapter_partial | scan_source |

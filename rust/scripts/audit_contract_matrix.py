@@ -30,6 +30,7 @@ def collect():
                      ("PUT","/bilibili/auth/settings"),
                      ("GET","/bilibili/auth/me"),
                      ("GET","/bilibili/archive/types"),
+                     ("POST","/bilibili/archive/type/recommend"),
                      ("GET","/bilibili/publish/jobs/{job_id}")}
     def is_native_scope(r):
         return (r["service"] == "orchestrator_api"

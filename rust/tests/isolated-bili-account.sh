@@ -5,7 +5,8 @@ cd "$root"
 port="${VIDEOROLL_BILI_TEST_PG_PORT:-35442}"
 api_port="${VIDEOROLL_BILI_TEST_API_PORT:-18180}"
 bili_port="${VIDEOROLL_BILI_TEST_UPSTREAM_PORT:-18196}"
-for p in "$port" "$api_port" "$bili_port"; do
+translate_port="${VIDEOROLL_BILI_TEST_TRANSLATE_PORT:-18198}"
+for p in "$port" "$api_port" "$bili_port" "$translate_port"; do
   if ss -lnt "( sport = :$p )" | grep -q ":$p"; then echo "test port $p is occupied" >&2; exit 1;fi
 done
 container="vr2-bili-auth-$$"
@@ -32,6 +33,8 @@ export DATABASE_URL="postgresql://postgres:videoroll-test-20261121@127.0.0.1:${p
 export VIDEOROLL_V2_BIND="127.0.0.1:${api_port}"
 export VIDEOROLL_V2_TEST_HTTP_BASE="http://127.0.0.1:${api_port}"
 export VIDEOROLL_V2_TEST_BILIBILI_PORT="$bili_port"
+export VIDEOROLL_V2_TEST_TRANSLATE_PORT="$translate_port"
+export VIDEOROLL_V2_INDEX_ENDPOINT="http://127.0.0.1:${translate_port}/v1/chat/completions"
 export VIDEOROLL_V2_ALLOW_TEST_BILIBILI_LOOPBACK=true
 export VIDEOROLL_V2_TEST_BILIBILI_BASE="http://127.0.0.1:${bili_port}/"
 export VIDEOROLL_V2_STORAGE_ROOT="$scratch"

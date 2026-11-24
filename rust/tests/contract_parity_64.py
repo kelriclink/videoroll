@@ -288,6 +288,10 @@ bodies = {
  "/subtitle/auto/profile":{},
  "/subtitle/asr/settings":{"default_language":"zh","default_engine":"faster-whisper"},
  "/subtitle/translate/settings":{"default_target_lang":"zh","index_max_tokens":4096},
+ # Generic contract scan validates input rejection without relying on a model
+ # whose settings may change throughout this fixture. Positive OpenAI and Index
+ # HTTP calls are covered by isolated-bili-account.sh with a loopback mock.
+ "/subtitle/translate/test":{"text":""},
  "/subtitle/embedding/models/list":{},
  "/subtitle/embedding/models/download":{"model":"BAAI/bge-small-zh-v1.5","name":"mock-embedding-test"},
  "/subtitle/dictionaries/promote":{"entry_id":"00000000-0000-0000-0000-000000010382"},

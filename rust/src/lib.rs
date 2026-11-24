@@ -76,6 +76,7 @@ pub mod subtitle_queue_v1;
 pub mod subtitle_remaining_v1;
 pub mod subtitle_remote_models_v1;
 pub mod subtitle_translate_settings_v1;
+pub mod subtitle_translate_test_v1;
 pub mod subtitles;
 pub mod system_resources;
 pub mod task_manual;

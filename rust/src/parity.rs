@@ -21,6 +21,7 @@ const V1_ADAPTERS: &[(&str, &str)] = &[
     ("PUT", "/bilibili/auth/settings"),
     ("GET", "/bilibili/auth/me"),
     ("GET", "/bilibili/archive/types"),
+    ("POST", "/bilibili/archive/type/recommend"),
     ("GET", "/bilibili/publish/jobs/{job_id}"),
     ("GET", "/settings/api"),
     ("PUT", "/settings/api"),
@@ -147,6 +148,7 @@ const V1_ADAPTERS: &[(&str, &str)] = &[
     ("PUT", "/subtitle/task_queue/settings"),
     ("GET", "/subtitle/translate/settings"),
     ("PUT", "/subtitle/translate/settings"),
+    ("POST", "/subtitle/translate/test"),
     ("GET", "/subtitle/translate/model-providers"),
     ("POST", "/subtitle/translate/model-providers"),
     ("PUT", "/subtitle/translate/model-providers/{provider_id}"),
@@ -285,6 +287,7 @@ pub fn report() -> AppResult<Value> {
                         | ("GET" | "PUT", "/bilibili/auth/settings")
                         | ("GET", "/bilibili/auth/me")
                         | ("GET", "/bilibili/archive/types")
+                        | ("POST", "/bilibili/archive/type/recommend")
                         | ("GET", "/bilibili/publish/jobs/{job_id}")
                 )))
             && is_adapter(method, path);

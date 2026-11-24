@@ -81,7 +81,7 @@ pub async fn options(db: &Database) -> AppResult<Options> {
     }
     Ok(opts.bounded())
 }
-fn url() -> AppResult<Url> {
+pub(crate) fn url() -> AppResult<Url> {
     let chosen = std::env::var("VIDEOROLL_V2_INDEX_ENDPOINT").unwrap_or_else(|_| ENDPOINT.into());
     let parsed = Url::parse(&chosen).map_err(|_| AppError::Invalid("Index URL invalid".into()))?;
     let official =

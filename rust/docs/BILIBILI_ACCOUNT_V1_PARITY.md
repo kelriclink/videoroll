@@ -13,4 +13,6 @@
 
 验收证据：`rust/tests/bilibili_account_v1_isolated.py` 和 `rust/tests/isolated-bili-account.sh` 使用原版 Python `get_bilibili_auth_settings` 及 `PublishJobRead` 做同表差分；有本地 Mock 的 Cookie、GET 账户、GET 分区、缺失 Cookie 和失效投稿作业边界。完整 `smoke-isolated.sh` 可通过 `VIDEOROLL_V2_TEST_BILIBILI_ACCOUNT_ONLY=true` 复用此测试。
 
-未完成：`POST /bilibili/archive/type/recommend` AI 分区推荐、`POST /bilibili/publish` 完整旧业务契约、真实 B 站账号/代理/网络异常、平台回执与重启故障注入验收。五条路由只是部分原生适配，不是生产级全签收。
+2026-11-24 新增 `POST /bilibili/archive/type/recommend`：读取原 `bilibili.tags.{task_id}` 摘要（优先于请求文本）、原 `subtitle.auto_profile` 选择的模型、原 `subtitle.translate`/Provider 配置，并获取投稿 API 的真实多级分区叶节点。通过原 OpenAI 兼容接口执行 JSON 分类，只有候选列表中存在的 typeid 才能返回 `ok=true`；不存在的分区会得到 `ok=false`，不会伪造分区。单次请求有模型超时、响应大小限制，记录 AI 使用量，不回传 Cookie/API Key。采用临时 PostgreSQL、模拟 B 站分区 API 和模拟 OpenAI 接口验证分区候选、任务摘要、模型配置及未知 ID 拒绝。
+
+未完成：`POST /bilibili/publish` 完整旧业务契约、真实 B 站账号/代理/网络异常、平台回执与重启故障注入验收。现有路由只是部分原生适配，不是生产级全签收。

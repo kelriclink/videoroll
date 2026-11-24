@@ -5,7 +5,7 @@ use crate::{AppError, AppResult, Config, Database, api::AppState, providers::dec
 use axum::{
     Json, Router,
     extract::{Path, State},
-    routing::get,
+    routing::{get, post},
 };
 use chrono::{DateTime, Utc};
 use reqwest::{Client, Url, header};
@@ -375,6 +375,212 @@ async fn archive_types(State(state): State<AppState>) -> AppResult<Json<Value>> 
         .collect::<AppResult<Vec<_>>>()?;
     Ok(Json(json!({"typelist":items})))
 }
+/// Original Bilibili `/archive/type/recommend`: bounded, read-only AI choice
+/// over live official partition IDs. The selected ID is NEVER trusted unless
+/// it exists in the same fetched partition snapshot.
+#[derive(Debug, Deserialize)]
+struct TypeRecommendRequest {
+    task_id: Option<Uuid>,
+    text: Option<String>,
+}
+
+fn type_options(nodes: &[Value]) -> Vec<(i64, String)> {
+    fn walk(node: &Value, parents: &[String], output: &mut Vec<(i64, String)>, depth: usize) {
+        if depth > 12 || output.len() >= 1000 {
+            return;
+        }
+        let Some(map) = node.as_object() else {
+            return;
+        };
+        let name = map.get("name").and_then(Value::as_str).unwrap_or("").trim();
+        let mut path = parents.to_vec();
+        if !name.is_empty() {
+            path.push(name.chars().take(100).collect());
+        }
+        if let Some(children) = map.get("children").and_then(Value::as_array)
+            && !children.is_empty()
+        {
+            for child in children {
+                walk(child, &path, output, depth + 1);
+            }
+            return;
+        }
+        let id = map
+            .get("id")
+            .and_then(Value::as_i64)
+            .or_else(|| {
+                map.get("id")
+                    .and_then(Value::as_str)
+                    .and_then(|v| v.parse::<i64>().ok())
+            })
+            .unwrap_or(0);
+        if id > 0 && !name.is_empty() && !output.iter().any(|(seen, _)| *seen == id) {
+            output.push((id, path.join("/")));
+        }
+    }
+    let mut output = Vec::new();
+    for node in nodes {
+        walk(node, &[], &mut output, 0);
+    }
+    output
+}
+
+fn type_choice(model: &Value, options: &[(i64, String)], text: &str) -> Value {
+    let id = model
+        .get("typeid")
+        .and_then(Value::as_i64)
+        .or_else(|| {
+            model
+                .get("typeid")
+                .and_then(Value::as_str)
+                .and_then(|v| v.parse().ok())
+        })
+        .unwrap_or(0);
+    let reason = model
+        .get("reason")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    match options.iter().find(|(available, _)| *available == id) {
+        Some((_, path)) if id > 0 => json!({
+            "ok":true,"typeid":id,"path":path,"reason":reason,"used_text":text
+        }),
+        _ => json!({"ok":false,"typeid":null,"path":null,
+            "reason":"typeid not in candidate list","used_text":text}),
+    }
+}
+
+async fn recommend_archive_type(
+    State(state): State<AppState>,
+    Json(payload): Json<TypeRecommendRequest>,
+) -> AppResult<Json<Value>> {
+    // The old service requires a stored Cookie, even though the metadata API
+    // might return some information publicly. `bili_get` owns this check.
+    if cookie_header(&stored(&state.db).await?)?.is_empty() {
+        return Err(AppError::Invalid("bilibili cookie is not set".into()));
+    }
+    let profile = crate::settings::effective(&state.db, "subtitle.auto_profile").await?;
+    let translation = crate::settings::effective(&state.db, "subtitle.translate").await?;
+    let provider_name = profile
+        .get("translate_provider")
+        .and_then(Value::as_str)
+        .filter(|v| !v.is_empty())
+        .or_else(|| translation.get("default_provider").and_then(Value::as_str))
+        .unwrap_or("openai");
+    if provider_name != "openai" {
+        return Err(AppError::Invalid(
+            "当前自动处理翻译方式不支持 AI 分区推荐".into(),
+        ));
+    }
+    let provider_id = profile
+        .get("translate_model_provider_id")
+        .and_then(Value::as_str)
+        .filter(|v| !v.is_empty())
+        .unwrap_or("legacy");
+    let model_id = profile
+        .get("translate_model_id")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let model = crate::providers::resolve(&state.db, &state.config, provider_id, model_id).await?;
+    let from_task: Option<String> = match payload.task_id {
+        Some(task) => sqlx::query_scalar(
+            "SELECT NULLIF(btrim(value_json->>'summary'),'') FROM app_settings WHERE key=$1",
+        )
+        .bind(format!("bilibili.tags.{task}"))
+        .fetch_optional(&state.db.pool)
+        .await?
+        .flatten(),
+        None => None,
+    };
+    let text = from_task
+        .as_deref()
+        .filter(|v| !v.is_empty())
+        .or(payload.text.as_deref())
+        .unwrap_or("")
+        .trim();
+    if text.is_empty() {
+        return Err(AppError::Invalid(
+            "missing text (and no task summary found)".into(),
+        ));
+    }
+    let text = if text.chars().count() > 2000 {
+        format!("{}…", text.chars().take(1999).collect::<String>())
+    } else {
+        text.to_owned()
+    };
+    let ts = Utc::now().timestamp_millis();
+    let bili_payload = bili_get(
+        &state,
+        "member.bilibili.com",
+        &format!("/x/vupre/web/archive/pre?ts={ts}"),
+    )
+    .await?;
+    if bili_payload.get("code").and_then(Value::as_i64) != Some(0) {
+        return Err(AppError::Unavailable(
+            "Bilibili partition service returned an error".into(),
+        ));
+    }
+    let source = bili_payload
+        .pointer("/data/typelist")
+        .and_then(Value::as_array)
+        .ok_or_else(|| AppError::Unavailable("bilibili typelist is empty".into()))?;
+    let options = type_options(source);
+    if options.is_empty() {
+        return Err(AppError::Unavailable("bilibili typelist is empty".into()));
+    }
+    let choices = options
+        .iter()
+        .map(|(id, path)| format!("{id}\t{path}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let prompt = format!(
+        "你是 B 站投稿分区（tid/typeid）助手。请根据输入文本，选择最合适的一个分区。\n要求：\n- 必须从提供的候选列表中选择，输出的 typeid 必须在候选列表里；\n- 只输出 JSON 对象，字段为：typeid（数字）与 reason（字符串，<=80字）。\n\n输入文本：\n{text}\n\n候选分区（每行：typeid<TAB>path）：\n{choices}\n\n输出 JSON：\n{{ \"typeid\": 0, \"reason\": \"\" }}"
+    );
+    let mut body = json!({
+        "model":model.model,"temperature":0.0,"response_format":{"type":"json_object"},
+        "messages":[{"role":"system","content":"Return ONLY valid JSON (no markdown, no extra text)."},
+            {"role":"user","content":prompt}]
+    });
+    if let Some(cap) = model.max_output_tokens {
+        body["max_tokens"] = json!(cap.min(1024));
+    }
+    let client = Client::builder()
+        .timeout(Duration::from_secs(model.timeout_seconds.min(120)))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?;
+    let mut request = client.post(model.endpoint.clone()).json(&body);
+    if let Some(key) = model.api_key.as_deref() {
+        request = request.bearer_auth(key);
+    }
+    let result = crate::ai_usage::chat_json(
+        &state.db,
+        request,
+        &model.endpoint,
+        &model.model,
+        "bilibili_type_recommend",
+        payload.task_id,
+        128 * 1024,
+        "Bilibili type AI",
+    )
+    .await;
+    let content = match result {
+        Ok(value) => value
+            .pointer("/choices/0/message/content")
+            .and_then(Value::as_str)
+            .and_then(|text| serde_json::from_str::<Value>(text).ok()),
+        Err(error) => {
+            tracing::warn!(error=%error, "Bilibili type classification unavailable");
+            return Ok(Json(json!({"ok":false,"typeid":null,"path":null,
+                "reason":"AI type recommendation unavailable","used_text":text})));
+        }
+    };
+    let Some(object) = content else {
+        return Ok(Json(json!({"ok":false,"typeid":null,"path":null,
+            "reason":"AI type recommendation invalid JSON","used_text":text})));
+    };
+    Ok(Json(type_choice(&object, &options, &text)))
+}
+
 async fn publish_job(
     State(state): State<AppState>,
     Path(job): Path<Uuid>,
@@ -396,11 +602,40 @@ pub fn router() -> Router<AppState> {
         .route("/bilibili/auth/settings", get(get_auth).put(put_auth))
         .route("/bilibili/auth/me", get(auth_me))
         .route("/bilibili/archive/types", get(archive_types))
+        .route(
+            "/bilibili/archive/type/recommend",
+            post(recommend_archive_type),
+        )
         .route("/bilibili/publish/jobs/{job_id}", get(publish_job))
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn typeid_candidates_are_leaf_only_and_model_choice_is_fenced() {
+        let rows = vec![json!({"id":17,"name":"科技","children":[
+            {"id":"180","name":"知识"},{"id":181,"name":"数码"}]})];
+        let choices = type_options(&rows);
+        assert_eq!(
+            choices,
+            vec![(180, "科技/知识".into()), (181, "科技/数码".into())]
+        );
+        assert_eq!(
+            type_choice(
+                &json!({"typeid":"181","reason":"电子相关"}),
+                &choices,
+                "PCB"
+            )["path"],
+            "科技/数码"
+        );
+        let forged = type_choice(
+            &json!({"typeid":999999,"reason":"model picked nonexisting category"}),
+            &choices,
+            "PCB",
+        );
+        assert_eq!(forged["ok"], false);
+        assert_eq!(forged["typeid"], Value::Null);
+    }
     #[test]
     fn previous_auth_field_semantics_and_cookie_normalization() {
         let row = update_record(
