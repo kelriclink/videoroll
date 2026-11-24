@@ -19,6 +19,8 @@ const V1_ADAPTERS: &[(&str, &str)] = &[
     ("GET", "/health"),
     // Original Bilibili standalone settings now served natively at the
     // orchestrator's /api/v1 boundary, after DB/Pydantic differential tests.
+    ("GET", "/desktop/authorize"),
+    ("POST", "/desktop/grants"),
     ("GET", "/bilibili/discovery"),
     ("GET", "/bilibili/publish/settings"),
     ("PUT", "/bilibili/publish/settings"),

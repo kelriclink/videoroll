@@ -372,7 +372,8 @@ pub fn router(state: AppState) -> Router {
         .merge(legacy_protected)
         // Public Remote API owns its separate Bearer token and durable
         // Idempotency-Key, not the administrator/internal authorization layer.
-        .merge(crate::remote_auto_youtube_v1::router());
+        .merge(crate::remote_auto_youtube_v1::router())
+        .merge(crate::desktop_grants_v1::router());
     Router::new()
         .merge(crate::remote_render::worker_router())
         .route("/api/auth/status", get(admin_status))
@@ -381,6 +382,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/auth/setup", post(admin_setup))
         .route("/health", get(health))
         .route("/ready", get(readiness))
+        .route(
+            "/desktop/authorize",
+            get(crate::desktop_grants_v1::authorize),
+        )
         .nest("/api/v1", legacy)
         .nest("/api/v2", protected)
         .fallback(crate::compat::fallback)

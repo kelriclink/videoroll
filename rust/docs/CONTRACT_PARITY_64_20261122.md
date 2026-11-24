@@ -1,12 +1,12 @@
-# VideoRoll Rust V1 部分适配 API：190 条逐接口探测
+# VideoRoll Rust V1 部分适配 API：192 条逐接口探测
 
-测试日期：2026-11-24T07:46:46.389713+00:00。
+测试日期：2026-11-24T08:06:03.793771+00:00。
 环境：隔离 PostgreSQL + 本地模拟平台，不使用生产账号、生产数据库或真实投稿。
 独立 Egress Gateway 另有 2 条接口，需运行专项 HTTP/SSRF 套件；不计入本 API 探测。
 注意：HTTP 请求得到响应不代表与 Python 完全等价；仅拒绝路径不代表正向业务通过。
 隔离探测不能替代 Python/Rust 双端业务差分验收。
 
-逐项执行：190；2xx 正向：99；4xx 拒绝路径：90；异常/需要复核：0；完整业务等价验收：0。
+逐项执行：192；2xx 正向：99；4xx 拒绝路径：92；异常/需要复核：0；完整业务等价验收：0。
 
 | HTTP 方法 | 原 Python 路径 | Rust 返回 | 测试类型 | 鉴权检查 | 问题 |
 |---|---|---:|---|---:|---|
@@ -25,6 +25,8 @@
 | GET | `/bilibili/publish/jobs/{job_id}` | 404 | rejection | 401 | - |
 | GET | `/bilibili/publish/settings` | 200 | positive | 401 | - |
 | PUT | `/bilibili/publish/settings` | 200 | positive | 401 | - |
+| GET | `/desktop/authorize` | 401 | rejection | 401 | - |
+| POST | `/desktop/grants` | 401 | rejection | 401 | - |
 | GET | `/health` | 200 | positive | - | - |
 | POST | `/maintenance/storage/cleanup-terminal` | 409 | rejection | 401 | - |
 | GET | `/maintenance/workdir` | 200 | positive | 401 | - |
@@ -239,3 +241,13 @@
   真实平台未验收，详情见 BILIBILI_DISCOVERY_NATIVE_V1.md。
 - 公开目录 ID 不会被当作投稿所需的 topic_id/mission_id，
   也不推断账号已报名。
+
+## 2026-11-24：Nginx noVNC 桌面访问授权
+
+- 原 POST /desktop/grants 和 GET /desktop/authorize 使用 Rust
+  trusted-device Cookie 验证，保留原 desktop_access_grants 数据字段，
+  Nginx 内部 GET /desktop/authorize 直接返回 204。
+- 原 Token SHA256 存储、同设备指纹、五分钟 TTL、八次重连以及
+  SELECT FOR UPDATE 原子行锁，与 Python V1 跨进程交叉验证，
+  参见 DESKTOP_GRANTS_NATIVE_V1.md。
+- 不依赖管理员 API Token；生产 Nginx / SAU 真实 noVNC 尚未签收。

@@ -101,6 +101,23 @@ CREATE TABLE app_settings (
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- Original V1 desktop_access_grants layout, only in disposable test schema.
+CREATE TABLE desktop_access_grants (
+  id UUID PRIMARY KEY,
+  token_hash VARCHAR(64) NOT NULL UNIQUE,
+  subject VARCHAR(128) NOT NULL,
+  scope_json JSONB NOT NULL,
+  status VARCHAR(32) NOT NULL DEFAULT 'active',
+  last_error VARCHAR(512),
+  expires_at TIMESTAMPTZ NOT NULL,
+  consumed_at TIMESTAMPTZ,
+  revoked_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX ix_desktop_access_grants_active_expiry
+  ON desktop_access_grants(status,expires_at);
+
 -- The original Python remote_api_requests ledger (security architecture
 -- migration 0001); no V2 shadow table or new business schema.
 CREATE TABLE remote_api_requests (
