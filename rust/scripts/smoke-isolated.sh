@@ -80,6 +80,15 @@ if ! docker exec "$container_name" psql -At -U postgres -d videoroll_test -c 'SE
 fi
 docker exec -i "$container_name" psql -v ON_ERROR_STOP=1 -U postgres -d videoroll_test   < rust/tests/bootstrap_legacy_for_integration.sql >/dev/null
 export DATABASE_URL="postgresql://postgres:videoroll-test-20261121@127.0.0.1:${smoke_db_port}/videoroll_test"
+if [[ "${VIDEOROLL_V2_TEST_NATIVE_DEPLOYMENT_ONLY:-false}" == "true" ]]; then
+  export VIDEOROLL_V2_INTERNAL_TOKEN="isolated-native-deploy-token-0123456789"
+  export VIDEOROLL_V2_STORAGE_ROOT="$(mktemp -d "$repo_root/rust/target/v2-native-deploy.XXXXXX")"
+  "$CARGO_HOME/bin/cargo" build --manifest-path "$repo_root/rust/Cargo.toml" --bins --locked --offline --quiet
+  "$repo_root/rust/target/debug/videoroll-v2" migrate
+  PYTHONPATH="$repo_root/src" /opt/videoroll/venvs/core/bin/python "$repo_root/rust/tests/native_deployment_isolated.py"
+  echo 'PASS: broker-free Rust native deployment'
+  exit 0
+fi
 if [[ "${VIDEOROLL_V2_TEST_TASK_OWNERSHIP_ONLY:-false}" == "true" ]]; then
   export VIDEOROLL_V2_INTERNAL_TOKEN="isolated-task-ownership-token-0123456789"
   export VIDEOROLL_V2_STORAGE_ROOT="$(mktemp -d "$repo_root/rust/target/v2-task-ownership-objects.XXXXXX")"

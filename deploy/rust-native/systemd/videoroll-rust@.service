@@ -1,0 +1,24 @@
+[Unit]
+Description=VideoRoll Rust role (%i)
+Requires=videoroll-rust-preflight.service
+After=network-online.target videoroll-rust-preflight.service
+PartOf=videoroll-rust.target
+
+[Service]
+Type=simple
+User=videoroll
+Group=videoroll
+EnvironmentFile=/opt/videoroll-rust/config/videoroll.env
+WorkingDirectory=/opt/videoroll-rust/current
+ExecStart=/opt/videoroll-rust/current/deploy/rust-native/run-role.sh %i
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=90
+KillMode=control-group
+UMask=0027
+NoNewPrivileges=yes
+ProtectSystem=full
+ProtectHome=yes
+LimitNOFILE=65536
+# Browser execution may need the host X11 socket; no private /tmp namespace.
+PrivateTmp=no

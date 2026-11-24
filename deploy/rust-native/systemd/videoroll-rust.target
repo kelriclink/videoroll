@@ -1,0 +1,11 @@
+[Unit]
+Description=VideoRoll Rust standalone stack (no legacy broker)
+Requires=videoroll-rust-preflight.service
+Requires=videoroll-rust@api.service videoroll-rust@worker.service
+Requires=videoroll-rust@bilibili-publisher.service videoroll-rust@subtitle-service.service videoroll-rust@youtube-ingest.service
+Requires=videoroll-rust@egress.service videoroll-rust@sau.service
+Requires=videoroll-rust-web.service
+After=network-online.target videoroll-rust-preflight.service
+
+[Install]
+WantedBy=multi-user.target

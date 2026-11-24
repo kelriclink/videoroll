@@ -41,6 +41,14 @@ enum Command {
     PublishBatchTick,
     /// Unified broker-free control-plane dispatch.
     OutboxTick,
+    /// Read-only standalone schema, ownership and outbox admission check.
+    StandalonePreflight {
+        /// Steady-state boot: native unknown outcomes remain quarantined,
+        /// not a reason to take the entire control plane offline.
+        #[arg(long)]
+        startup: bool,
+    },
+
     /// Read-only paginated historical task ownership inventory.
     TaskOwnershipAudit {
         #[arg(long)]
@@ -95,6 +103,7 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let config = Arc::new(Config::from_env()?);
     videoroll_v2::outbox_dispatcher::validate_config(&config)?;
+    videoroll_v2::native_deployment::validate(&config)?;
     let db = Database::connect(&config.database_url).await?;
     match cli.command {
         Command::Migrate => db.migrate().await?,
@@ -371,6 +380,13 @@ async fn main() -> anyhow::Result<()> {
                     .await?
                 )?
             );
+        }
+        Command::StandalonePreflight { startup } => {
+            let report = videoroll_v2::native_deployment::preflight(&db, &config, startup).await?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+            if report["ready"] != true {
+                anyhow::bail!("standalone deployment preflight failed");
+            }
         }
         Command::OutboxTick => {
             let result = videoroll_v2::outbox_dispatcher::tick(&db, &config, 100).await?;

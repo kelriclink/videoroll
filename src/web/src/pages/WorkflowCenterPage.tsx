@@ -7,6 +7,21 @@ export default function WorkflowCenterPage() {
   const [loading, setLoading] = useState(Boolean(HATCHET_DASHBOARD_URL));
   const [error, setError] = useState<string | null>(null);
 
+  if (import.meta.env.VITE_RUST_NATIVE_DEPLOYMENT === "true") {
+    return (
+      <div className="flex flex-col gap-4">
+        <PageHeader title="工作流诊断（Rust）" description="原生 PostgreSQL 工作流、租约与事件诊断，不依赖旧调度平台。" />
+        <InlineNotice title="Rust 原生调度" tone="info">
+          通过原生控制台查看工作流、等待阶段、执行结果及未知回执。
+        </InlineNotice>
+        <div className="flex gap-3">
+          <Link to="/rust-v2" className="rounded-lg border px-3 py-2 text-sm">原生工作流控制台</Link>
+          <Link to="/operations" className="rounded-lg border px-3 py-2 text-sm">返回运维</Link>
+        </div>
+      </div>
+    );
+  }
+
   function openInNewWindow() {
     if (!HATCHET_DASHBOARD_URL) return;
     window.open(HATCHET_DASHBOARD_URL, "hatchet-dashboard", "noopener,noreferrer");
