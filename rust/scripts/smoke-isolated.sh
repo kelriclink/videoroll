@@ -80,6 +80,19 @@ if ! docker exec "$container_name" psql -At -U postgres -d videoroll_test -c 'SE
 fi
 docker exec -i "$container_name" psql -v ON_ERROR_STOP=1 -U postgres -d videoroll_test   < rust/tests/bootstrap_legacy_for_integration.sql >/dev/null
 export DATABASE_URL="postgresql://postgres:videoroll-test-20261121@127.0.0.1:${smoke_db_port}/videoroll_test"
+if [[ "${VIDEOROLL_V2_TEST_SAU_NATIVE_PUBLISH_ONLY:-false}" == "true" ]]; then
+  export INTERNAL_API_SECRET="isolated-sau-native-publish-test-secret"
+  # Test the production enum types rather than only the older TEXT fixtures.
+  docker exec -i "$container_name" psql -v ON_ERROR_STOP=1 -U postgres -d videoroll_test <<'SQL'
+CREATE TYPE publish_state AS ENUM ('draft','submitting','submitted','published','unknown','failed');
+ALTER TABLE publish_jobs ALTER COLUMN platform TYPE platform USING platform::platform;
+ALTER TABLE publish_jobs ALTER COLUMN state TYPE publish_state USING state::publish_state;
+SQL
+  "$CARGO_HOME/bin/cargo" build --manifest-path "$repo_root/rust/Cargo.toml" --bin videoroll-sau --locked --offline --quiet
+  PYTHONPATH="$repo_root/src" /opt/videoroll/venvs/core/bin/python "$repo_root/rust/tests/sau_publish_native_v1_isolated.py"
+  echo 'PASS: native SAU publication intake and durable original outbox; browser worker not started'
+  exit 0
+fi
 if [[ "${VIDEOROLL_V2_TEST_SCHEMA_EMPTY_ONLY:-false}" == "true" ]]; then
   /opt/videoroll/venvs/core/bin/python "$repo_root/rust/tests/schema_unify_empty_v2.py"
   echo 'PASS: empty Rust V2 schema fully unified into original business tables'

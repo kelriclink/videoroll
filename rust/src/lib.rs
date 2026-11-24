@@ -56,6 +56,7 @@ pub mod render_management_control_v1;
 pub mod render_management_read_v1;
 pub mod render_worker_wire_v1;
 pub mod sau_account_native_v1;
+mod sau_publish_native_v1;
 pub mod scheduler;
 pub mod settings;
 pub mod social_accounts;
