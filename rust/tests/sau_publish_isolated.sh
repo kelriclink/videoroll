@@ -22,6 +22,24 @@ done
 curl -fsS http://127.0.0.1:18087/ready >/dev/null
 sau_hdr=(-H "x-videoroll-v2-internal-token: $VIDEOROLL_V2_INTERNAL_TOKEN" -H 'content-type: application/json')
 base="http://127.0.0.1:18087/api/v1"
+# Exercise the real Rust proxy against an HMAC-authenticated mock SAU:
+# allow normal resource paths after rejecting authority/traversal substitution.
+health="$(curl -fsS "${sau_hdr[@]}" "$base/settings/publish/social/health")"
+HEALTH="$health" python3 - <<'PYSAUHEALTH'
+import os,json
+assert json.loads(os.environ["HEALTH"])=={"status":"ok","driver":"sau"}
+PYSAUHEALTH
+accounts="$(curl -fsS "${sau_hdr[@]}" "$base/settings/publish/social/accounts?platform=douyin")"
+ACCOUNTS="$accounts" python3 - <<'PYSAUACCOUNTS'
+import os,json
+rows=json.loads(os.environ["ACCOUNTS"])
+assert len(rows)==1 and rows[0]["platform"]=="douyin" and rows[0]["check_state"]=="valid",rows
+PYSAUACCOUNTS
+session="$(curl -fsS "${sau_hdr[@]}" -d '{"account_name":"Test"}' "$base/settings/publish/social/login-sessions/douyin")"
+login_id="$(SESSION="$session" python3 -c 'import os,json;data=json.loads(os.environ["SESSION"]);assert data["state"]=="pending";print(data["id"])')"
+curl -fsS "${sau_hdr[@]}" "$base/settings/publish/social/login-sessions/$login_id" | python3 -c 'import json,sys;assert json.load(sys.stdin)["state"]=="pending"'
+curl -fsS "${sau_hdr[@]}" -X DELETE "$base/settings/publish/social/login-sessions/$login_id" | python3 -c 'import json,sys;assert json.load(sys.stdin)["state"]=="canceled"'
+echo 'PASS: Rust SAU proxy health, filtered accounts, login session lifecycle and HMAC sidecar transport'
 # Review controls are modified in the disposable DB only; the test checks
 # that a skip_review request is NEVER accepted even when review is disabled.
 curl -fsS "${sau_hdr[@]}" -X PUT -d '{"enabled":false,"blocked_words":[],"ai_rules":""}' \
