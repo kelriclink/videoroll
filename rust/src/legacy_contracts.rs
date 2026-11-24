@@ -691,6 +691,7 @@ pub fn router() -> Router<AppState> {
         .merge(crate::subtitle_embedding_v1::router())
         .merge(crate::subtitle_translate_settings_v1::router())
         .merge(crate::subtitle_translate_test_v1::router())
+        .merge(crate::subtitle_retranslate_v1::router())
         .merge(crate::subtitle_queue_v1::router())
         .merge(crate::subtitle_providers_v1::router())
         .merge(crate::subtitle_remaining_v1::router())

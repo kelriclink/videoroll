@@ -1,11 +1,11 @@
-# VideoRoll Rust V1 部分适配 API：180 条逐接口探测
+# VideoRoll Rust V1 部分适配 API：181 条逐接口探测
 
-测试日期：2026-11-24T01:39:32.882980+00:00。
+测试日期：2026-11-24T01:57:31.920928+00:00。
 环境：隔离 PostgreSQL + 本地模拟平台，不使用生产账号、生产数据库或真实投稿。
 注意：HTTP 请求得到响应不代表与 Python 完全等价；仅拒绝路径不代表正向业务通过。
 隔离探测不能替代 Python/Rust 双端业务差分验收。
 
-逐项执行：180；2xx 正向：97；4xx 拒绝路径：82；异常/需要复核：0；完整业务等价验收：0。
+逐项执行：181；2xx 正向：97；4xx 拒绝路径：83；异常/需要复核：0；完整业务等价验收：0。
 
 | HTTP 方法 | 原 Python 路径 | Rust 返回 | 测试类型 | 鉴权检查 | 问题 |
 |---|---|---:|---|---:|---|
@@ -152,6 +152,7 @@
 | POST | `/tasks/{task_id}/actions/stop` | 409 | rejection | 401 | - |
 | POST | `/tasks/{task_id}/actions/subtitle` | 409 | rejection | 401 | - |
 | POST | `/tasks/{task_id}/actions/subtitle_resume` | 409 | rejection | 401 | - |
+| POST | `/tasks/{task_id}/actions/subtitle_retranslate` | 422 | rejection | 401 | - |
 | POST | `/tasks/{task_id}/actions/youtube_download` | 404 | rejection | 401 | - |
 | POST | `/tasks/{task_id}/actions/youtube_download_enqueue` | 404 | rejection | 401 | - |
 | POST | `/tasks/{task_id}/actions/youtube_meta` | 400 | rejection | 401 | - |

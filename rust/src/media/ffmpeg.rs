@@ -330,7 +330,20 @@ pub async fn render(
     registry: &AssetRegistry,
     job: &WorkItem,
 ) -> AppResult<Value> {
-    let existing = latest_asset_key(db, job.task_id, "video_final").await?;
+    // A new selective subtitle version invalidates the previously burned-in
+    // video; never reuse a video_final from an earlier subtitle generation.
+    let selective: bool = sqlx::query_scalar(
+        "SELECT configuration ? 'selective_retranslate'
+        FROM vr2_workflows WHERE id=$1",
+    )
+    .bind(job.workflow_id)
+    .fetch_one(&db.pool)
+    .await?;
+    let existing = if selective {
+        None
+    } else {
+        latest_asset_key(db, job.task_id, "video_final").await?
+    };
     if let Some(key) = existing
         && let Ok(path) = registry.resolve_existing(&key).await
         && probe_video(&config.ffprobe_binary, &path).await.is_ok()

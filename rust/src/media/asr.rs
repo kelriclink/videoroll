@@ -479,12 +479,280 @@ pub async fn runtime_asr_config(config: &Config, db: &Database) -> AppResult<Opt
     }
 }
 
+/// Fence every external model batch and each output registration against
+/// the durable PostgreSQL worker lease. A prior timed-out worker cannot keep
+/// making new provider calls after another generation has taken ownership.
+async fn selective_lease(db: &Database, job: &WorkItem) -> AppResult<()> {
+    let held: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM vr2_jobs j
+       JOIN vr2_workflows w ON w.id=j.workflow_id
+       WHERE j.id=$1 AND j.lease_token=$2 AND j.state='running' AND j.lease_until>now()
+        AND w.state='running')",
+    )
+    .bind(job.id)
+    .bind(job.lease_token)
+    .fetch_one(&db.pool)
+    .await?;
+    if !held {
+        return Err(AppError::Conflict(
+            "stale selective translation worker lease".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// A durable selective retranslation reuses the pinned source/translated
+/// snapshot; it must NOT return the existing SRT early or invoke ASR again.
+async fn process_selective(
+    config: &Config,
+    db: &Database,
+    registry: &AssetRegistry,
+    job: &WorkItem,
+    value: Value,
+) -> AppResult<Value> {
+    use crate::subtitle_retranslate_v1::{Plan, load_snapshot, merge};
+    let plan: Plan = serde_json::from_value(value).map_err(|_| {
+        AppError::Invalid("selective retranslation job has invalid persisted plan".into())
+    })?;
+    if plan.indices.is_empty()
+        || plan.indices.len() > 500
+        || plan.indices.windows(2).any(|pair| pair[0] >= pair[1])
+    {
+        return Err(AppError::Invalid(
+            "selective retranslation plan must have sorted, distinct indices".into(),
+        ));
+    }
+    if crate::subtitle_retranslate_v1::source_job(job.task_id, &plan.base_segments_key)?
+        != plan.source_job_id
+    {
+        return Err(AppError::Conflict(
+            "pinned subtitle source job identity mismatch".into(),
+        ));
+    }
+    let (snapshot, digest) = load_snapshot(registry, job.task_id, &plan.base_segments_key).await?;
+    if digest != plan.base_sha256 {
+        return Err(AppError::Conflict(
+            "pinned translation snapshot has changed; no overwrite".into(),
+        ));
+    }
+    if plan
+        .indices
+        .last()
+        .is_some_and(|i| *i > snapshot.source.len())
+    {
+        return Err(AppError::Invalid(
+            "selected subtitle indices exceed pinned snapshot".into(),
+        ));
+    }
+    let profile = settings(db, job).await?;
+    if !profile.translate_enabled
+        || !matches!(
+            profile.translate_provider.as_str(),
+            "openai" | "index_translate"
+        )
+    {
+        return Err(AppError::Conflict(
+            "selective retranslation requires a real enabled translation provider".into(),
+        ));
+    }
+    let prefix = format!("v2/sub/{}/{}", job.task_id, job.id);
+    let segments_key = format!("{prefix}/segments.json");
+    let srt_key = format!("{prefix}/subtitle.srt");
+    let ass_key = format!("{prefix}/subtitle.ass");
+    let checkpoint = registry.resolve_existing(&segments_key).await?;
+    // On retry after an ambiguous DB commit, reuse the SAME completed output
+    // only when its plan and source snapshot identity match byte-for-byte.
+    let completed = match fs::metadata(&checkpoint).await {
+        Ok(meta) if meta.len() > 0 && meta.len() <= 8 * 1024 * 1024 => {
+            let existing = fs::read(&checkpoint).await?;
+            let value: Value = serde_json::from_slice(&existing)
+                .map_err(|_| AppError::Conflict("existing selective output is corrupted".into()))?;
+            if value.get("selective_retranslate") != Some(&json!(plan)) {
+                return Err(AppError::Conflict(
+                    "existing selective output has a different plan".into(),
+                ));
+            }
+            let changed: Vec<SubtitleCue> =
+                serde_json::from_value(value.get("translated").cloned().unwrap_or(Value::Null))
+                    .map_err(|_| {
+                        AppError::Conflict("existing selective output is not aligned".into())
+                    })?;
+            if changed.len() != snapshot.source.len()
+                || changed
+                    .iter()
+                    .zip(&snapshot.source)
+                    .any(|(t, s)| t.start_ms != s.start_ms || t.end_ms != s.end_ms)
+            {
+                return Err(AppError::Conflict(
+                    "existing selective output altered cue positions".into(),
+                ));
+            }
+            // Unselected cues must also be identical to the pinned translations.
+            let chosen = plan
+                .indices
+                .iter()
+                .copied()
+                .collect::<std::collections::HashSet<_>>();
+            if changed
+                .iter()
+                .zip(&snapshot.translated)
+                .enumerate()
+                .any(|(i, (t, old))| !chosen.contains(&(i + 1)) && t != old)
+            {
+                return Err(AppError::Conflict(
+                    "existing selective output changed unselected subtitles".into(),
+                ));
+            }
+            Some(changed)
+        }
+        Ok(meta) if meta.len() == 0 => {
+            return Err(AppError::Conflict(
+                "existing selective output is empty".into(),
+            ));
+        }
+        Ok(_) => {
+            return Err(AppError::Invalid(
+                "existing selective output too large".into(),
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    let edited = if let Some(existing) = completed {
+        existing
+    } else {
+        selective_lease(db, job).await?;
+        let client = Client::builder()
+            .timeout(Duration::from_secs(300))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()?;
+        let mut replacements = Vec::with_capacity(plan.indices.len());
+        if profile.translate_provider == "index_translate" {
+            let opts = crate::media::index_translate::options(db).await?;
+            for &index in &plan.indices {
+                selective_lease(db, job).await?;
+                let translated = crate::media::index_translate::translate(
+                    db,
+                    job.task_id,
+                    &client,
+                    &snapshot.source,
+                    index - 1,
+                    index,
+                    &opts,
+                    &profile.target_lang,
+                    &profile.translate_style,
+                )
+                .await?;
+                if translated.len() != 1 {
+                    return Err(AppError::Unavailable(
+                        "Index selective retranslation did not return one cue".into(),
+                    ));
+                }
+                replacements.extend(translated);
+            }
+        } else {
+            let provider = crate::providers::resolve(
+                db,
+                config,
+                &profile.translate_model_provider_id,
+                &profile.translate_model_id,
+            )
+            .await?;
+            // Preserve nearby terminology as untrusted context, never as instructions.
+            let context = snapshot
+                .translated
+                .iter()
+                .zip(&snapshot.source)
+                .take(80)
+                .map(|(translated, original)| format!("{} => {}", original.text, translated.text))
+                .collect::<Vec<_>>()
+                .join("\n");
+            for indices in plan.indices.chunks(16) {
+                selective_lease(db, job).await?;
+                let batch = indices
+                    .iter()
+                    .map(|&i| snapshot.source[i - 1].clone())
+                    .collect::<Vec<_>>();
+                let translated = translate_batch(
+                    db,
+                    job.task_id,
+                    &client,
+                    &provider,
+                    &profile,
+                    &batch,
+                    &context.chars().take(8000).collect::<String>(),
+                )
+                .await?;
+                if translated.len() != batch.len() {
+                    return Err(AppError::Unavailable(
+                        "selective batch count mismatch".into(),
+                    ));
+                }
+                replacements.extend(translated);
+            }
+        }
+        let edited = merge(&snapshot, &plan.indices, &replacements)?;
+        let mut metadata = snapshot.metadata.clone();
+        metadata["translated"] = json!(edited);
+        metadata["translation"] = json!(true);
+        metadata["selective_retranslate"] = json!(plan);
+        metadata["selective_translation_profile"] = json!({
+            "provider":profile.translate_provider,
+            "model_provider_id":profile.translate_model_provider_id,
+            "model_id":profile.translate_model_id,
+            "target_lang":profile.target_lang,
+            "style":profile.translate_style,
+        });
+        let content = serde_json::to_vec(&metadata)
+            .map_err(|_| AppError::Invalid("cannot encode selective subtitle snapshot".into()))?;
+        if content.len() > 8 * 1024 * 1024 {
+            return Err(AppError::Invalid(
+                "selected subtitles exceed snapshot limit".into(),
+            ));
+        }
+        // Persist checkpoint only if this stage still holds the lease.
+        // A stale worker must not overwrite the replacement snapshot.
+        selective_lease(db, job).await?;
+        atomic_write(&checkpoint, &content).await?;
+        edited
+    };
+    let srt = to_srt(&edited)?;
+    let ass = to_ass(&edited, 1920, 1080, "Arial", 48, profile.bilingual)?;
+    for (key, body, kind) in [
+        (&segments_key, None::<&[u8]>, "segments_json"),
+        (&srt_key, Some(srt.as_bytes()), "subtitle_srt"),
+        (&ass_key, Some(ass.as_bytes()), "subtitle_ass"),
+    ] {
+        selective_lease(db, job).await?;
+        let path = registry.resolve_existing(key).await?;
+        if let Some(body) = body {
+            atomic_write(&path, body).await?;
+        }
+        selective_lease(db, job).await?;
+        ensure_task_asset(db, registry, job.task_id, job, kind, key).await?;
+    }
+    Ok(
+        json!({"no_speech":false,"selective_retranslate":plan.indices,
+        "cues":edited.len(),"srt_key":srt_key,"ass_key":ass_key,"segments_key":segments_key}),
+    )
+}
+
 pub async fn process(
     config: &Config,
     db: &Database,
     registry: &AssetRegistry,
     job: &WorkItem,
 ) -> AppResult<Value> {
+    let selective: Option<Value> = sqlx::query_scalar(
+        "SELECT configuration->'selective_retranslate' FROM vr2_workflows WHERE id=$1",
+    )
+    .bind(job.workflow_id)
+    .fetch_optional(&db.pool)
+    .await?
+    .flatten();
+    if let Some(plan) = selective {
+        return process_selective(config, db, registry, job, plan).await;
+    }
     if let Some(srt) = latest_asset_key(db, job.task_id, "subtitle_srt").await?
         && let Ok(path) = registry.resolve_existing(&srt).await
         && fs::metadata(path).await.is_ok()

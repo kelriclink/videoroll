@@ -27,6 +27,7 @@ const V1_ADAPTERS: &[(&str, &str)] = &[
     ("PUT", "/settings/api"),
     ("POST", "/tasks/{task_id}/actions/youtube_download_enqueue"),
     ("POST", "/tasks/{task_id}/actions/youtube_download"),
+    ("POST", "/tasks/{task_id}/actions/subtitle_retranslate"),
     ("POST", "/tasks/{task_id}/actions/auto_dubbing"),
     ("POST", "/tasks/{task_id}/assets/{asset_id}/playout"),
     ("DELETE", "/tasks/{task_id}/assets/{asset_id}"),

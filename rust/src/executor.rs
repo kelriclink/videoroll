@@ -134,7 +134,21 @@ impl Executor {
                 Ok(StageOutcome::Completed { result })
             }
             Stage::Subtitle => {
-                if let Some(runtime) =
+                // Selective retranslation uses preserved aligned source cues
+                // and must execute natively even when the configured ASR
+                // engine itself is delegated to an external worker.
+                let selective: bool = sqlx::query_scalar(
+                    "SELECT configuration ? 'selective_retranslate' FROM vr2_workflows WHERE id=$1",
+                )
+                .bind(item.workflow_id)
+                .fetch_one(&self.db.pool)
+                .await?;
+                if selective {
+                    let result =
+                        crate::media::asr::process(&self.config, &self.db, &self.registry, item)
+                            .await?;
+                    Ok(StageOutcome::Completed { result })
+                } else if let Some(runtime) =
                     crate::media::asr::runtime_asr_config(&self.config, &self.db).await?
                 {
                     let result =

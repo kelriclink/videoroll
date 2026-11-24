@@ -5,8 +5,8 @@
 全部完成状态只允许结合 API 契约、权限、并发、重启、外部副作用与设备测试证据填写。
 
 - 原版声明：217
-- 原生 V1 部分适配：180
-- 无原生 V1 入口：37
+- 原生 V1 部分适配：181
+- 无原生 V1 入口：36
 - 已完成全面验收：0
 - 前端引用文本：193
 
@@ -14,7 +14,7 @@
 |---|---:|---:|---:|
 | bilibili_publisher | 10 | 8 | 2 |
 | egress_gateway | 2 | 0 | 2 |
-| orchestrator_api | 132 | 110 | 22 |
+| orchestrator_api | 132 | 111 | 21 |
 | social_publisher | 9 | 0 | 9 |
 | subtitle_service | 55 | 54 | 1 |
 | youtube_ingest | 9 | 8 | 1 |
@@ -133,7 +133,7 @@
 | orchestrator_api | POST | /tasks/{task_id}/actions/stop | native_adapter_partial | stop_task |
 | orchestrator_api | POST | /tasks/{task_id}/actions/subtitle | native_adapter_partial | enqueue_subtitle_job |
 | orchestrator_api | POST | /tasks/{task_id}/actions/subtitle_resume | native_adapter_partial | resume_subtitle_job |
-| orchestrator_api | POST | /tasks/{task_id}/actions/subtitle_retranslate | not_native_v1 | retranslate_subtitle_indices |
+| orchestrator_api | POST | /tasks/{task_id}/actions/subtitle_retranslate | native_adapter_partial | retranslate_subtitle_indices |
 | orchestrator_api | POST | /tasks/{task_id}/actions/youtube_download | native_adapter_partial | download_youtube |
 | orchestrator_api | POST | /tasks/{task_id}/actions/youtube_download_enqueue | native_adapter_partial | enqueue_youtube_download |
 | orchestrator_api | POST | /tasks/{task_id}/actions/youtube_meta | native_adapter_partial | fetch_youtube_meta |

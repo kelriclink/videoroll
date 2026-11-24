@@ -181,6 +181,13 @@ if [[ "${VIDEOROLL_V2_TEST_LEGACY_GAPS_ONLY:-false}" == "true" ]]; then
   exit 0
 fi
 
+if [[ "${VIDEOROLL_V2_TEST_SELECTIVE_ONLY:-false}" == "true" ]]; then
+  python3 "$repo_root/rust/tests/mock_ai_server.py" > "$repo_root/rust/target/v2-selective-mock-ai.log" 2>&1 &
+  ai_pid=$!
+  PYTHONPATH="$repo_root/src" /opt/videoroll/venvs/core/bin/python \
+    "$repo_root/rust/tests/selective_retranslate_v1_isolated.py"
+  exit 0
+fi
 if [[ "${VIDEOROLL_V2_TEST_MISSING_ACTIONS_ONLY:-false}" == "true" ]]; then
   PYTHONPATH="$repo_root/src" /opt/videoroll/venvs/core/bin/python \
     "$repo_root/rust/tests/legacy_missing_actions_v1_isolated.py"
