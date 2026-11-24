@@ -206,6 +206,14 @@ impl Scheduler {
                 "task status {status} forbids a new workflow"
             )));
         }
+        let historical_publish:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM operation_inbox i WHERE i.task_id=$1 AND i.runtime_engine='rust-task-cutover' AND i.status='completed') AND EXISTS(SELECT 1 FROM publish_jobs j WHERE j.task_id=$1)")
+            .bind(task_id).fetch_one(&mut *tx).await?;
+        if historical_publish {
+            return Err(AppError::Conflict(
+                "historical publication exists; use explicit reconciled publication controls"
+                    .into(),
+            ));
+        }
         if let Some(row) = sqlx::query(
             "SELECT id, state FROM vr2_workflows WHERE task_id=$1 AND state IN ('running','paused','unknown') ORDER BY generation DESC LIMIT 1 FOR UPDATE"
         ).bind(task_id).fetch_optional(&mut *tx).await? {
@@ -327,7 +335,9 @@ impl Scheduler {
         .bind(task_id)
         .fetch_one(&mut *tx)
         .await?;
-        if unsafe_publish {
+        let historical_publish:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM operation_inbox i WHERE i.task_id=$1 AND i.runtime_engine='rust-task-cutover' AND i.status='completed') AND EXISTS(SELECT 1 FROM publish_jobs j WHERE j.task_id=$1)")
+            .bind(task_id).fetch_one(&mut *tx).await?;
+        if unsafe_publish || historical_publish {
             return Err(AppError::Conflict(
                 "a queued, successful or uncertain publication blocks restart; verify external outcome first".into()
             ));
@@ -395,7 +405,7 @@ impl Scheduler {
         if let Some(kind) = asset_needed {
             let has_asset: bool = sqlx::query_scalar(
                 "SELECT EXISTS(SELECT 1 FROM assets WHERE task_id=$1
-                  AND kind::text=$2 AND storage_key LIKE 'v2/%')",
+                  AND kind::text=$2 AND (storage_key LIKE 'v2/%' OR EXISTS(SELECT 1 FROM operation_inbox i WHERE i.task_id=$1 AND i.runtime_engine='rust-task-cutover' AND i.status='completed')))",
             )
             .bind(task_id)
             .bind(kind)
@@ -420,7 +430,7 @@ impl Scheduler {
         if matches!(stage, Stage::Render | Stage::Dubbing) {
             let has_subtitle: bool = sqlx::query_scalar(
                 "SELECT EXISTS(SELECT 1 FROM assets WHERE task_id=$1
-                 AND kind='subtitle_srt'::asset_kind AND storage_key LIKE 'v2/%')",
+                 AND kind='subtitle_srt'::asset_kind AND (storage_key LIKE 'v2/%' OR EXISTS(SELECT 1 FROM operation_inbox i WHERE i.task_id=$1 AND i.runtime_engine='rust-task-cutover' AND i.status='completed')))",
             )
             .bind(task_id)
             .fetch_one(&mut *tx)
@@ -492,6 +502,43 @@ impl Scheduler {
         self.workflow(workflow_id).await
     }
 
+    /// Called only under the ownership-cutover transaction, after validating
+    /// all historical side effects and media. Never creates a publish job.
+    pub(crate) async fn adopt_resume(
+        tx: &mut Transaction<'_, Postgres>,
+        task: Uuid,
+        stage: Stage,
+    ) -> AppResult<Uuid> {
+        let status = match stage {
+            Stage::Download => "created",
+            Stage::Subtitle => "downloaded",
+            Stage::Render => "subtitle_ready",
+            _ => return Err(AppError::Invalid("unsafe adoption resume stage".into())),
+        };
+        let generation: i32 = sqlx::query_scalar(
+            "SELECT COALESCE(MAX(generation),0)+1 FROM vr2_workflows WHERE task_id=$1",
+        )
+        .bind(task)
+        .fetch_one(&mut **tx)
+        .await?;
+        let id = Uuid::new_v4();
+        sqlx::query("INSERT INTO vr2_workflows(id,task_id,generation,state,current_stage,configuration) VALUES($1,$2,$3,'running',$4,$5)")
+            .bind(id).bind(task).bind(generation).bind(stage.as_str())
+            .bind(json!({"auto_publish":false,"auto_publish_platforms":[],"auto_dub_p2":false,"historical_adoption":true}))
+            .execute(&mut **tx).await?;
+        Self::insert_job(tx, id, task, generation, stage).await?;
+        sqlx::query("UPDATE tasks SET status=$2::task_status,error_code=NULL,error_message=NULL,updated_at=now() WHERE id=$1")
+            .bind(task).bind(status).execute(&mut **tx).await?;
+        Self::event(
+            tx,
+            id,
+            None,
+            "workflow.historical_adopted",
+            json!({"stage":stage.as_str(),"generation":generation,"automatic_publish":false}),
+        )
+        .await?;
+        Ok(id)
+    }
     async fn insert_job(
         tx: &mut Transaction<'_, Postgres>,
         workflow_id: Uuid,
@@ -644,7 +691,7 @@ impl Scheduler {
                 SELECT j.id FROM vr2_jobs j
                 JOIN vr2_workflows w ON w.id=j.workflow_id
                 JOIN tasks t ON t.id=j.task_id
-                WHERE w.state='running' AND t.status <> 'canceled'::task_status
+                WHERE w.state='running' AND t.runtime_owner='rust' AND t.status <> 'canceled'::task_status
                   AND (
                      (j.state='pending' AND j.available_at<=now())
                      OR (j.state='running' AND j.lease_until<now() AND j.stage <> 'publish')

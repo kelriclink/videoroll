@@ -100,6 +100,7 @@ pub mod subtitle_translate_test_v1;
 pub mod subtitles;
 pub mod system_resources;
 pub mod task_manual;
+pub mod task_ownership;
 pub mod telemetry;
 pub mod youdub_control_v1;
 pub mod youtube_home_feed_v1;
