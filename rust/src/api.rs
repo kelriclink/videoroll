@@ -369,7 +369,10 @@ pub fn router(state: AppState) -> Router {
         .route("/auth/logout", post(admin_logout))
         .route("/auth/setup", post(admin_setup))
         .route("/health", get(crate::legacy_contracts::health))
-        .merge(legacy_protected);
+        .merge(legacy_protected)
+        // Public Remote API owns its separate Bearer token and durable
+        // Idempotency-Key, not the administrator/internal authorization layer.
+        .merge(crate::remote_auto_youtube_v1::router());
     Router::new()
         .merge(crate::remote_render::worker_router())
         .route("/api/auth/status", get(admin_status))

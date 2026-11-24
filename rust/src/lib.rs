@@ -45,6 +45,7 @@ pub mod publish_review;
 pub mod rag;
 pub mod realtime;
 pub mod remote_api_settings_v1;
+pub mod remote_auto_youtube_v1;
 pub mod remote_render;
 pub mod render_management_control_v1;
 pub mod render_management_read_v1;

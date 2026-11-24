@@ -101,6 +101,28 @@ CREATE TABLE app_settings (
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- The original Python remote_api_requests ledger (security architecture
+-- migration 0001); no V2 shadow table or new business schema.
+CREATE TABLE remote_api_requests (
+  id UUID PRIMARY KEY,
+  token_hash VARCHAR(64) NOT NULL,
+  idempotency_key VARCHAR(255) NOT NULL,
+  request_hash VARCHAR(64) NOT NULL,
+  request_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+  response_json JSONB,
+  status VARCHAR(32) NOT NULL DEFAULT 'pending',
+  lease_owner VARCHAR(128),
+  lease_until TIMESTAMPTZ,
+  heartbeat_at TIMESTAMPTZ,
+  last_error VARCHAR(1024),
+  completed_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  CONSTRAINT uq_remote_api_requests_token_idempotency UNIQUE(token_hash,idempotency_key)
+);
+CREATE INDEX ix_remote_api_requests_pending_lease
+  ON remote_api_requests(status,lease_until,created_at);
+
 -- Exact original Python AlertEvent layout, shared by both implementations.
 CREATE TABLE alert_events (
     id UUID PRIMARY KEY,

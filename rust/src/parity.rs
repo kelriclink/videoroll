@@ -187,6 +187,8 @@ const V1_ADAPTERS: &[(&str, &str)] = &[
     ("POST", "/tasks"),
     ("POST", "/youtube/ingest"),
     ("POST", "/auto/youtube"),
+    ("GET", "/remote/auto/youtube"),
+    ("POST", "/remote/auto/youtube"),
     ("POST", "/tasks/{task_id}/actions/auto_youtube_start"),
     ("POST", "/tasks/{task_id}/upload/video"),
     ("POST", "/tasks/{task_id}/upload/cover"),
