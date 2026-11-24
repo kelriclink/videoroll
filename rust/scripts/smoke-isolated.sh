@@ -20,7 +20,12 @@ if [[ "${VIDEOROLL_V2_TEST_EGRESS_ONLY:-false}" == "true" ]]; then
   echo "PASS: standalone Egress Gateway dedicated HMAC service and SSRF defense"
   exit 0
 fi
-container_name="vr2-smoke-$$"
+# Every invocation owns an identifiable PostgreSQL volume. PG18 declares a
+# VOLUME at /var/lib/postgresql; implicit anonymous volumes can survive
+# forced container removal and accumulate on the system disk.
+container_name="vr2-smoke-$(python3 -c 'import uuid; print(uuid.uuid4().hex)')"
+db_volume="${container_name}-db"
+db_volume_created=false
 api_pid=""
 worker_pid=""
 legacy_pid=""
@@ -48,7 +53,15 @@ cleanup() {
   if [[ -n "$bili_pid" ]]; then kill "$bili_pid" 2>/dev/null || true; wait "$bili_pid" 2>/dev/null || true; fi
   if [[ -n "$gateway_pid" ]]; then kill "$gateway_pid" 2>/dev/null || true; wait "$gateway_pid" 2>/dev/null || true; fi
   if [[ -n "$api_pid" ]]; then kill "$api_pid" 2>/dev/null || true; wait "$api_pid" 2>/dev/null || true; fi
-  docker rm -f "$container_name" >/dev/null 2>&1 || true
+  local volume_cleanup_failed=0
+  if [[ "$db_volume_created" == "true" ]]; then
+    docker rm -fv "$container_name" >/dev/null 2>&1 || true
+    # Named volumes are not removed by docker rm -v/--rm.
+    if ! docker volume rm "$db_volume" >/dev/null; then
+      echo "ERROR: isolated database volume remains: $db_volume" >&2
+      volume_cleanup_failed=1
+    fi
+  fi
   if [[ -n "${SUBTITLE_WHISPER_MODEL_DIR:-}" && "$SUBTITLE_WHISPER_MODEL_DIR" == "$repo_root/rust/target/v2-smoke-whisper-models" ]]; then
     rm -rf -- "$SUBTITLE_WHISPER_MODEL_DIR"
   fi
@@ -60,12 +73,21 @@ cleanup() {
   if [[ "${VIDEOROLL_V2_STORAGE_ROOT:-}" == "$repo_root/rust/target/v2-smoke-objects" ]]; then
     rm -f -- "$VIDEOROLL_V2_STORAGE_ROOT/.videoroll-private/youtube-cookies.txt"
   fi
+  if (( volume_cleanup_failed != 0 )); then exit 1; fi
 }
 trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 smoke_db_port="${VIDEOROLL_V2_TEST_DB_PORT:-35432}"
 if ! [[ "$smoke_db_port" =~ ^[0-9]{4,5}$ ]] || (( smoke_db_port < 1024 || smoke_db_port > 65535 )); then echo 'invalid test DB port' >&2; exit 1; fi
 if ss -lnt "( sport = :$smoke_db_port )" | grep -q ":$smoke_db_port"; then echo "test port $smoke_db_port occupied" >&2;exit 1;fi
-docker run -d --rm --name "$container_name" --memory=512m   --publish "127.0.0.1:${smoke_db_port}:5432"   --env POSTGRES_PASSWORD=videoroll-test-20261121   --env POSTGRES_DB=videoroll_test pgvector/pgvector:pg18 >/dev/null
+docker volume create --label io.videoroll.purpose=isolated-smoke --label "io.videoroll.run=$container_name" "$db_volume" >/dev/null
+db_volume_created=true
+docker run -d --rm --name "$container_name" --memory=512m \
+  --mount "type=volume,source=$db_volume,target=/var/lib/postgresql" \
+  --publish "127.0.0.1:${smoke_db_port}:5432" \
+  --env POSTGRES_PASSWORD=videoroll-test-20261121 --env POSTGRES_DB=videoroll_test \
+  pgvector/pgvector:pg18 >/dev/null
 for i in $(seq 1 60); do
   # The pg18 entrypoint starts, then stops, a transient initdb server.
   # Waiting only on pg_isready races against that intentional shutdown.
@@ -80,6 +102,10 @@ if ! docker exec "$container_name" psql -At -U postgres -d videoroll_test -c 'SE
 fi
 docker exec -i "$container_name" psql -v ON_ERROR_STOP=1 -U postgres -d videoroll_test   < rust/tests/bootstrap_legacy_for_integration.sql >/dev/null
 export DATABASE_URL="postgresql://postgres:videoroll-test-20261121@127.0.0.1:${smoke_db_port}/videoroll_test"
+if [[ "${VIDEOROLL_V2_TEST_DB_CLEANUP_ONLY:-false}" == "true" ]]; then
+  echo "PASS: isolated PostgreSQL bootstrap; EXIT trap will remove its dedicated volume"
+  exit 0
+fi
 if [[ "${VIDEOROLL_V2_TEST_NATIVE_DEPLOYMENT_ONLY:-false}" == "true" ]]; then
   export VIDEOROLL_V2_INTERNAL_TOKEN="isolated-native-deploy-token-0123456789"
   export VIDEOROLL_V2_STORAGE_ROOT="$(mktemp -d "$repo_root/rust/target/v2-native-deploy.XXXXXX")"
