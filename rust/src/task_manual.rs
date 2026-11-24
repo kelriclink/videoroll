@@ -71,11 +71,17 @@ pub(crate) struct SubtitleAction {
     publish_payload: Option<Value>,
 }
 pub(crate) fn subtitle_config(request: SubtitleAction) -> AppResult<Value> {
-    // The native Rust ASR processes SRT/ASS using a single engine and the
-    // configured OpenAI-compatible endpoint. Legacy engine selectors and
-    // YouTube subtitle-source selection require separate implementations.
-    if request.asr_engine.as_deref().is_some_and(|s| s != "auto")
-        || request.asr_model.is_some()
+    // Local inference may be explicitly selected. Other engine-specific
+    // selectors stay rejected until their request semantics are migrated.
+    if request
+        .asr_engine
+        .as_deref()
+        .is_some_and(|s| !matches!(s, "auto" | "openvino" | "faster-whisper"))
+        || (request.asr_model.is_some()
+            && !matches!(
+                request.asr_engine.as_deref(),
+                Some("openvino" | "faster-whisper")
+            ))
         || request.prefer_youtube_subtitles == Some(true)
         || request
             .youtube_subtitle_mode
@@ -108,6 +114,8 @@ pub(crate) fn subtitle_config(request: SubtitleAction) -> AppResult<Value> {
             }
         };
     }
+    put!(subtitle, "asr_engine", request.asr_engine);
+    put!(subtitle, "asr_model", request.asr_model);
     put!(subtitle, "asr_language", request.asr_language);
     put!(subtitle, "translate_enabled", request.translate_enabled);
     put!(subtitle, "translate_provider", request.translate_provider);

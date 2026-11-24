@@ -41,6 +41,7 @@ pub mod maintenance_terminal_storage_v1;
 pub mod maintenance_workdir_v1;
 pub mod management_v1;
 pub mod media;
+pub mod local_inference;
 pub mod operations_v1;
 pub mod parity;
 pub mod playout;

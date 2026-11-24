@@ -28,6 +28,7 @@ async fn async_job_futures_fit_default_tokio_worker_stack() {
         ffmpeg_binary: "ffmpeg".into(),
         ffprobe_binary: "ffprobe".into(),
         asr_endpoint: None,
+        local_asr: None,
         asr_api_key: None,
         asr_model: "test".into(),
         translate_endpoint: None,

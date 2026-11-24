@@ -189,6 +189,13 @@ async fn run_asr(
     path: &Path,
     lang: &str,
 ) -> AppResult<AsrResponse> {
+    if let Some(mut request) = config.local_asr.clone() {
+        request["audio"] = json!(path);
+        request["language"] = json!(lang);
+        let response = crate::local_inference::invoke(&request, Duration::from_secs(600)).await?;
+        return serde_json::from_value(response)
+            .map_err(|_| AppError::Unavailable("local ASR response schema invalid".into()));
+    }
     let target = config
         .asr_endpoint
         .as_deref()
@@ -401,22 +408,51 @@ async fn translate_batch(
 /// Resolve the currently saved Python subtitle.asr configuration when
 /// executing a new subtitle stage, instead of reusing startup-only options.
 /// Non-HTTP engines continue through the external worker path.
-pub async fn runtime_asr_config(config: &Config, db: &Database) -> AppResult<Option<Config>> {
+pub async fn runtime_asr_config(
+    config: &Config,
+    db: &Database,
+    job: &WorkItem,
+) -> AppResult<Option<Config>> {
     let stored: Option<Value> =
         sqlx::query_scalar("SELECT value_json FROM app_settings WHERE key='subtitle.asr'")
             .fetch_optional(&db.pool)
             .await?;
-    let Some(stored) = stored else {
-        return Ok(config.asr_endpoint.as_ref().map(|_| config.clone()));
-    };
-    let Some(engine) = stored
-        .get("default_engine")
-        .and_then(Value::as_str)
-        .filter(|v| !v.trim().is_empty())
-    else {
-        return Ok(config.asr_endpoint.as_ref().map(|_| config.clone()));
-    };
+    let overrides: Option<Value> =
+        sqlx::query_scalar("SELECT configuration->'subtitle' FROM vr2_workflows WHERE id=$1")
+            .bind(job.workflow_id)
+            .fetch_optional(&db.pool)
+            .await?
+            .flatten();
+    let explicit = overrides
+        .as_ref()
+        .and_then(|v| v["asr_engine"].as_str())
+        .filter(|s| *s != "auto");
+    let mut stored = stored.unwrap_or_else(|| json!({}));
+    if let Some(engine) = explicit {
+        let previous = stored["default_engine"].as_str().map(str::to_owned);
+        if previous.as_deref() != Some(engine) {
+            stored["default_model"] = Value::Null;
+        }
+        stored["default_engine"] = json!(engine);
+    }
+    if let Some(model) = overrides
+        .as_ref()
+        .and_then(|v| v["asr_model"].as_str())
+        .filter(|v| !v.is_empty())
+    {
+        stored["default_model"] = json!(model);
+    }
+    if stored["default_engine"].as_str().is_none()
+        && explicit.is_none()
+        && config.asr_endpoint.is_some()
+    {
+        return Ok(Some(config.clone()));
+    }
+    if stored["default_engine"].as_str().is_none() && !crate::local_inference::configured() {
+        return Ok(None);
+    }
     let read = crate::subtitle_asr_settings_v1::view(&stored);
+    let engine = read["default_engine"].as_str().unwrap_or("faster-whisper");
     let mut out = config.clone();
     let model = read
         .get("default_model")
@@ -474,7 +510,16 @@ pub async fn runtime_asr_config(config: &Config, db: &Database) -> AppResult<Opt
             out.asr_model = model.into();
             Ok(Some(out))
         }
-        "mock" | "openvino" | "faster-whisper" | "cloudflare-workers-ai" => Ok(None), // These require a different worker/API, not Whisper HTTP.
+        "openvino" | "faster-whisper" => {
+            let mut local = crate::local_inference::asr_settings(engine, model, &read).await?;
+            local["default_language"] = read["default_language"].clone();
+            out.local_asr = Some(local);
+            out.asr_endpoint = None;
+            out.asr_api_key = None;
+            out.asr_model = model.into();
+            Ok(Some(out))
+        }
+        "mock" | "cloudflare-workers-ai" => Ok(None), // These require a different worker/API, not Whisper HTTP.
         _ => Err(AppError::Invalid("ASR engine not supported".into())),
     }
 }
@@ -785,7 +830,15 @@ pub async fn process(
             "ASR duration is invalid or exceeds 48 hours".into(),
         ));
     }
-    let profile = settings(db, job).await?;
+    let mut profile = settings(db, job).await?;
+    if let Some(local) = config.local_asr.as_ref() {
+        // The job/profile keeps precedence; saved ASR default is used for auto.
+        if profile.asr_language == "auto" {
+            if let Some(lang) = local["default_language"].as_str() {
+                profile.asr_language = lang.into();
+            }
+        }
+    }
     let original_hash:Option<String>=sqlx::query_scalar(
         "SELECT sha256 FROM assets WHERE task_id=$1 AND storage_key=$2 AND kind='video_raw'::asset_kind ORDER BY created_at DESC LIMIT 1"
     ).bind(job.task_id).bind(&video_key).fetch_optional(&db.pool).await?.flatten();
@@ -796,7 +849,7 @@ pub async fn process(
     };
     let asr_identity = fingerprint(&json!({
         "checkpoint_version":2,"video_sha256":source_digest,
-        "model":config.asr_model,"asr_endpoint":config.asr_endpoint,
+        "model":config.asr_model,"asr_endpoint":config.asr_endpoint,"local_asr":config.local_asr,
         "language":profile.asr_language,"duration_ms":(duration*1000.0).round() as u64,
         "window_seconds":WINDOW,"overlap_seconds":OVERLAP
     }))?;

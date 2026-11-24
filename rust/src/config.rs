@@ -17,6 +17,7 @@ pub struct Config {
     pub asr_endpoint: Option<String>,
     pub asr_api_key: Option<String>,
     pub asr_model: String,
+    pub local_asr: Option<serde_json::Value>,
     pub translate_endpoint: Option<String>,
     pub translate_api_key: Option<String>,
     pub translate_model: Option<String>,
@@ -102,6 +103,7 @@ impl Config {
             asr_api_key: std::env::var("VIDEOROLL_V2_ASR_API_KEY")
                 .ok()
                 .filter(|s| !s.is_empty()),
+            local_asr: None,
             asr_model: std::env::var("VIDEOROLL_V2_ASR_MODEL")
                 .unwrap_or_else(|_| "whisper-large-v3-turbo".into()),
             translate_endpoint: std::env::var("VIDEOROLL_V2_TRANSLATE_ENDPOINT")

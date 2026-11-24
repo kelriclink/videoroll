@@ -9,6 +9,9 @@ import argparse
 import atexit
 import base64
 import hashlib
+import hmac
+import subprocess
+import time
 import socket
 import struct
 import threading
@@ -28,6 +31,7 @@ p.add_argument("--base", default="http://127.0.0.1:18080")
 p.add_argument("--task-id", required=True)
 p.add_argument("--alert-id", required=True)
 p.add_argument("--out", required=True)
+p.add_argument("--all-services", action="store_true", help="probe the exact original service boundaries, including HMAC")
 p.add_argument("--ws-only", action="store_true", help="isolated WebSocket handshake diagnostic only")
 args = p.parse_args()
 if args.base not in ("http://127.0.0.1:18080", "http://127.0.0.1:18180") or (
@@ -51,6 +55,15 @@ mapped = [r for r in matrix["routes"] if r["v1_status"]!="not_native_v1"
           and r["service"] not in ("egress_gateway","social_publisher")
           and r not in service_health]
 assert len(mapped)+len(standalone)+len(social)+len(service_health) == matrix["native_v1_partial"], "Route count and parity matrix disagree"
+if args.all_services:
+    assert not args.ws_only
+    # Preserve orchestrator coverage separately from the original standalone
+    # services. A proxy success cannot stand in for a standalone response.
+    mapped=[r for r in matrix["routes"] if r["v1_status"]!="not_native_v1" and r["service"]=="orchestrator_api"]
+    service_rows=[r for r in matrix["routes"] if r["v1_status"]!="not_native_v1" and r["service"]!="orchestrator_api"]
+else:
+    service_rows=[]
+
 jar = http.cookiejar.CookieJar()
 opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
 anonymous = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
@@ -445,13 +458,104 @@ for row in ordered:
     results.append(record)
 
 assert {(r["method"],r["path"]) for r in results} == {(r["method"],r["path"]) for r in mapped}
+# Label each record by original source service (old probe mode may include
+# non-orchestrator routes on its compatibility gateway).
+service_map={(r["method"],r["path"]):r["service"] for r in mapped}
+for record in results:record["service"]=service_map[(record["method"],record["path"])]
+if args.all_services:
+    assert os.environ["DATABASE_URL"].endswith("/videoroll_test") and "127.0.0.1:" in os.environ["DATABASE_URL"]
+    assert token=="v2-local-test-only-0123456789abcdef"
+    secret=os.environ["INTERNAL_API_SECRET"]
+    assert secret=="rust-local-test-internal-secret"
+    service_token="v1."+hmac.new(secret.encode(),b"videoroll-internal-service:v1",hashlib.sha256).hexdigest()
+    binaries=root/"target/debug"
+    specifications={
+       "bilibili_publisher":("videoroll-v2",["service","bilibili-publisher"],"VIDEOROLL_V2_BIND"),
+       "subtitle_service":("videoroll-v2",["service","subtitle-service"],"VIDEOROLL_V2_BIND"),
+       "youtube_ingest":("videoroll-v2",["service","youtube-ingest"],"VIDEOROLL_V2_BIND"),
+       "social_publisher":("videoroll-sau",[],"VIDEOROLL_V2_SAU_BIND"),
+       "egress_gateway":("videoroll-egress",[],"VIDEOROLL_V2_EGRESS_BIND"),
+    }
+    def service_call(port,method,path,payload=None,auth=True,form=False):
+        headers={}
+        if auth:headers["X-Videoroll-Internal-Token"]=service_token
+        if form:
+            headers["content-type"]="multipart/form-data; boundary=vr2contract"
+            data=payload
+        elif payload is None:data=None
+        else:
+            headers["content-type"]="application/json"
+            data=json.dumps(payload).encode()
+        req=urllib.request.Request(f"http://127.0.0.1:{port}"+path,data=data,method=method,headers=headers)
+        try:res=urllib.request.urlopen(req,timeout=12)
+        except urllib.error.HTTPError as e:res=e
+        with res:
+            raw=res.read(1024*1024)
+            try:obj=json.loads(raw)
+            except ValueError:obj=None
+            return res.status,res.headers.get("Content-Type","").split(";")[0],obj
+    for service,(binary,cmd,bindvar) in specifications.items():
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1",0))
+            port=sock.getsockname()[1]
+        # No real platform jobs or side effects. SAU mutating browser routes
+        # deliberately remain disabled in this broad request-level probe.
+        env={**os.environ,bindvar:f"127.0.0.1:{port}",
+             "VIDEOROLL_V2_SAU_ENABLE_NATIVE_CHECK":"false",
+             "VIDEOROLL_V2_SAU_ENABLE_NATIVE_LOGIN":"false",
+             "VIDEOROLL_V2_SAU_ENABLE_NATIVE_PUBLISH":"false",
+             "VIDEOROLL_V2_SAU_ENABLE_BROWSER_OUTBOX":"false"}
+        proc=subprocess.Popen([str(binaries/binary),*cmd],env=env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+        try:
+            for _ in range(80):
+                assert proc.poll() is None,(service,"service exited")
+                try:
+                    if service_call(port,"GET","/health",auth=False)[0]==200:break
+                except (OSError,urllib.error.URLError):pass
+                time.sleep(.15)
+            else:raise RuntimeError(f"{service} health timeout")
+            for row in (r for r in service_rows if r["service"]==service):
+                template=row["path"];method=row["method"];path=template
+                ctx={**context,"platform":"douyin","account_id":fake,"session_id":fake}
+                for field in re.findall(r"\{([^{}]+)\}",path):
+                    path=path.replace("{"+field+"}",ctx.get(field,fake))
+                body=None if method in ("GET","DELETE") else bodies.get(template,{})
+                if service=="egress_gateway" and template=="/fetch":
+                    # A private target must be rejected by the SSRF guard;
+                    # never access a real outside resource in a broad probe.
+                    body={"url":"http://127.0.0.1:1/"}
+                if template=="/accounts":path+="?platform=douyin"
+                form=template in ("/accounts/{platform}","/subtitle/models/upload")
+                if form:body=b"--vr2contract\r\nContent-Disposition: form-data; name=\"account_name\"\r\n\r\nTest\r\n--vr2contract--\r\n"
+                record={"service":service,"method":method,"path":template}
+                try:
+                    code,mime,obj=service_call(port,method,path,body,auth=template!="/health",form=form)
+                    record.update(http_status=code,response_kind=mime,json_fields=sorted(obj) if isinstance(obj,dict) else [],
+                        probe="positive" if 200<=code<300 else "rejection" if 400<=code<500 else "failed",issue=None)
+                    if code==404:
+                        record["issue"]="standalone_route_or_fixture_not_found"
+                    if template!="/health":
+                        unauth,_,_=service_call(port,method,path,auth=False)
+                        record["unauthorized_status"]=unauth
+                        if unauth not in (401,403):record["issue"]="unauthenticated_request_not_rejected"
+                    if code in (401,403,405) and template!="/fetch":
+                        record["issue"]="standalone_auth_or_method_rejected"
+                except Exception as exc:
+                    record.update(http_status=None,probe="failed",issue=type(exc).__name__)
+                results.append(record)
+        finally:
+            proc.terminate()
+            try:proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:proc.kill();proc.wait(timeout=5)
+    assert len(results)==len(matrix["routes"])
+    assert {(r["service"],r["method"],r["path"]) for r in results}=={(r["service"],r["method"],r["path"]) for r in matrix["routes"]}
 summary={"standalone_egress_routes":len(standalone),
          "standalone_sau_routes":len(social),
          "standalone_service_health_routes":len(service_health),
          "probed":len(results),
          "positive":sum(r["probe"]=="positive" for r in results),
          "rejection_only":sum(r["probe"]=="rejection" for r in results),
-         "failed":sum(bool(r["probe"]=="failed" or r.get("issue") in ("server_failure_or_unexpected_auth", "public_health_or_auth_status_incompatible", "unauthenticated_request_not_rejected")) for r in results),
+         "failed":sum(bool(r["probe"]=="failed" or r.get("issue") in ("server_failure_or_unexpected_auth", "public_health_or_auth_status_incompatible", "unauthenticated_request_not_rejected", "standalone_auth_or_method_rejected")) for r in results),
          "blocked":sum(r["probe"]=="blocked" for r in results),
          "limited":sum(bool(r.get("issue") in ("existing_fixture_read_returned_404","native_bilibili_disabled_in_isolated_test")) for r in results),
          "full_python_parity_verified":0,
@@ -461,22 +565,22 @@ report={"timestamp_utc":datetime.now(timezone.utc).isoformat(),
         "source_branch":"rewrite/rust-v2","summary":summary,"routes":results}
 target=Path(args.out);target.parent.mkdir(parents=True,exist_ok=True)
 target.write_text(json.dumps(report,ensure_ascii=False,indent=2)+"\n")
-lines=[f"# VideoRoll Rust V1 部分适配 API：{len(mapped)} 条逐接口探测",
+lines=[f"# VideoRoll Rust V1 部分适配 API：{len(results)} 条逐接口探测",
        "",
        f"测试日期：{report['timestamp_utc']}。",
        "环境：隔离 PostgreSQL + 本地模拟平台，不使用生产账号、生产数据库或真实投稿。",
-       f"独立 Egress Gateway 另有 {len(standalone)} 条接口，需运行专项 HTTP/SSRF 套件；不计入本 API 探测。",
-       f"独立业务服务健康检查另有 {len(service_health)} 条，由独立 Router 测试覆盖；不重复计算主 API 健康检查。",
+       "已分别执行独立服务与主 API 的请求探测。" if args.all_services else f"独立 Egress Gateway 另有 {len(standalone)} 条接口，需运行专项 HTTP/SSRF 套件；不计入本 API 探测。",
+       "独立服务健康检查独立计数，未将主 API 结果替代独立服务。" if args.all_services else f"独立业务服务健康检查另有 {len(service_health)} 条，由独立 Router 测试覆盖；不重复计算主 API 健康检查。",
        "通配代理的探测使用非白名单路径检查拒绝；正向参数转发由专项 Router 测试覆盖。",
        "注意：HTTP 请求得到响应不代表与 Python 完全等价；仅拒绝路径不代表正向业务通过。",
        "隔离探测不能替代 Python/Rust 双端业务差分验收。",
        "",
        f"逐项执行：{summary['probed']}；2xx 正向：{summary['positive']}；4xx 拒绝路径：{summary['rejection_only']}；异常/需要复核：{summary['failed']}；完整业务等价验收：0。",
        "",
-       "| HTTP 方法 | 原 Python 路径 | Rust 返回 | 测试类型 | 鉴权检查 | 问题 |",
-       "|---|---|---:|---|---:|---|"]
+       "| 服务 | HTTP 方法 | 原 Python 路径 | Rust 返回 | 测试类型 | 鉴权检查 | 问题 |",
+       "|---|---|---|---:|---|---:|---|"]
 for r in sorted(results,key=lambda x:(x["path"],x["method"])):
-    lines.append(f"| {r['method']} | `{r['path']}` | {r['http_status'] or '-'} | {r['probe']} | {r.get('unauthorized_status','-')} | {r.get('issue') or '-'} |")
+    lines.append(f"| {r['service']} | {r['method']} | `{r['path']}` | {r['http_status'] or '-'} | {r['probe']} | {r.get('unauthorized_status','-')} | {r.get('issue') or '-'} |")
 lines += ["","## 验收边界",
           "- 本测试只能判断每个已映射入口在隔离 Rust 进程中的请求行为和未登录拒绝行为。",
           "- 正向请求仅验证返回状态/基础 JSON 结构；未完成 Python 生产响应字段、错误码、状态迁移的逐项差分。",
@@ -485,7 +589,7 @@ lines += ["","## 验收边界",
 # Preserve independently reviewed compatibility notes appended after the
 # generated probe results; an isolated smoke test must not silently erase
 # an earlier migration's documented limitations.
-report_path=root/"docs/CONTRACT_PARITY_64_20261122.md"
+report_path=(target.with_suffix(".md") if args.all_services else root/"docs/CONTRACT_PARITY_64_20261122.md")
 historical="\n## 2026-11-24：Remote YouTube 公网 Bearer 接口\n"
 existing=report_path.read_text() if report_path.exists() else ""
 appendix=existing[existing.index(historical):] if historical in existing else ""

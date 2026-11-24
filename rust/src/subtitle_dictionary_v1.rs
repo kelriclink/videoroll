@@ -471,13 +471,6 @@ async fn promote(
             .await?;
     let cfg = crate::subtitle_translate_settings_v1::view(&raw.unwrap_or(Value::Null));
     let embedding_cfg = crate::subtitle_embedding_infer_v1::load(&state).await?;
-    // Local SentenceTransformers/OpenVINO is not migrated. Never claim to
-    // have persisted an indexed vector in that configured mode.
-    if embedding_cfg.provider != "openai" {
-        return Err(AppError::Unavailable(
-            "local Embedding inference for dictionary promotion is not migrated yet".into(),
-        ));
-    }
     let term = item["term"].as_str().unwrap_or("").trim().to_owned();
     let normalized = knowledge_normalize_term(&term);
     let target_lang = item["target_lang"]
@@ -525,12 +518,13 @@ async fn promote(
     let embedding_vec =
         match crate::subtitle_embedding_infer_v1::embed(&embedding_cfg, &embedding_text).await {
             Ok(vector) => Some(vector),
-            Err(err) => {
+            Err(err) if embedding_cfg.provider == "openai" => {
                 // Python's original promote endpoint accepts a glossary term
                 // when the online Embedding service is temporarily unavailable.
                 tracing::warn!("dictionary promotion Embedding unavailable: {err}");
                 None
             }
+            Err(err) => return Err(err),
         };
     let vector = embedding_vec
         .as_ref()
