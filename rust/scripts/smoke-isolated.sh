@@ -599,7 +599,7 @@ if [[ "${VIDEOROLL_V2_TEST_CONTRACT_217_ONLY:-false}" == "true" ]]; then
   probe_task_id="$(FIRST="$first" python3 -c 'import json,os;print(json.loads(os.environ["FIRST"])["task"]["id"])')"
   probe_alert="$(curl --silent --fail-with-body "${hdr[@]}" -d '{"fingerprint":"vr2.contract.alert","source":"isolated","severity":"warning","title":"Contract fixture","message":"mock only","details":{}}' http://127.0.0.1:18080/api/v1/operations/alerts/report)"
   probe_alert_id="$(ALERT="$probe_alert" python3 -c 'import json,os;print(json.loads(os.environ["ALERT"])["id"])')"
-  python3 "$repo_root/rust/tests/contract_parity_64.py" --all-services \
+  /opt/videoroll/venvs/core/bin/python "$repo_root/rust/tests/contract_parity_64.py" --all-services \
     --task-id "$probe_task_id" --alert-id "$probe_alert_id" \
     --out "$repo_root/rust/target/contract-parity-217.json"
   exit 0
@@ -1865,6 +1865,6 @@ PYTHONPATH="$repo_root/src" /opt/videoroll/venvs/core/bin/python \
 
 # Probe every mapped native /api/v1 route independently.
 # Only local disposable fixtures are used; this is not Python-side parity signoff.
-python3 "$repo_root/rust/tests/contract_parity_64.py" --all-services \
+/opt/videoroll/venvs/core/bin/python "$repo_root/rust/tests/contract_parity_64.py" --all-services \
   --task-id "$manual_dub_id" --alert-id "$alert_id" \
   --out "$repo_root/rust/target/contract-parity-217.json"
