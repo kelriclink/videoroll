@@ -20,6 +20,7 @@ pub mod config;
 pub mod database;
 pub mod domain;
 pub mod download_runtime;
+pub mod egress_gateway_v1;
 pub mod error;
 pub mod executor;
 pub mod ingest;

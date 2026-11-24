@@ -21,6 +21,18 @@ def collect():
     refs = json.loads(FRONT.read_text())["references"]
     body = PARITY.read_text().split("const V1_ADAPTERS:", 1)[1].split("];", 1)[0]
     adapters = {(m.group("method"), m.group("path")) for m in ADAPTER_RE.finditer(body)}
+    # Separate original standalone Egress Gateway has its own binary, bind and
+    # HMAC service token. Never mistake /api/v1 orchestrator's health endpoint
+    # for the Egress Gateway's public health endpoint.
+    standalone_body = PARITY.read_text().split(
+        "const STANDALONE_EGRESS_ADAPTERS:", 1
+    )[1].split("];", 1)[0]
+    standalone = {(m.group("method"), m.group("path"))
+                  for m in ADAPTER_RE.finditer(standalone_body)}
+    allowed_egress={(r["method"],r["path"]) for r in routes
+                    if r["service"]=="egress_gateway"}
+    if standalone - allowed_egress:
+        raise ValueError("Standalone Egress adapter not in original routes")
     # These two Bilibili publisher routes are no longer hosted in the old
     # dedicated Python service; the Rust gateway exposes identical original
     # paths under /api/v1 and verifies their full Python DTO with fixtures.
@@ -45,7 +57,10 @@ def collect():
         raise ValueError("V1 adapter not in original routes: " + repr(sorted(adapters - original)))
     rows = []
     for source in routes:
-        adapted = is_native_scope(source) and (source["method"], source["path"]) in adapters
+        adapted = ((is_native_scope(source) and
+                    (source["method"], source["path"]) in adapters)
+                   or (source["service"]=="egress_gateway" and
+                       (source["method"], source["path"]) in standalone))
         rows.append({
             "service":source["service"],"method":source["method"],"path":source["path"],
             "python_source":source["file"]+":"+str(source["line"]),
@@ -58,12 +73,12 @@ def collect():
             "frontend_verified":False,
             "real_platform_verified":False,
         })
-    assert sum(r["v1_status"]=="native_adapter_partial" for r in rows) == len(adapters)
+    assert sum(r["v1_status"]=="native_adapter_partial" for r in rows) == len(adapters)+len(standalone)
     return {
         "status":"INCOMPLETE",
         "notice":"Route registration is not contract parity; V2-only routes are counted separately.",
         "legacy_declarations":len(routes),
-        "native_v1_partial":len(adapters),
+        "native_v1_partial":len(adapters)+len(standalone),
         "fully_verified":0,
         "frontend_reference_text_occurrences":len(refs),
         "checks_needed":[
