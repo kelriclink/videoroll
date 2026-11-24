@@ -15,6 +15,14 @@ const FRONTEND_JSON: &str = include_str!("../docs/FRONTEND_API_REFERENCES.json")
 // router. Its own binary exposes these exact original endpoints.
 #[allow(dead_code)]
 const STANDALONE_EGRESS_ADAPTERS: &[(&str, &str)] = &[("GET", "/health"), ("POST", "/fetch")];
+// Separate standalone Rust SAU service: only routes implemented without
+// the Python browser manager or Celery are counted as partially mapped.
+#[allow(dead_code)]
+const STANDALONE_SAU_ADAPTERS: &[(&str, &str)] = &[
+    ("GET", "/health"),
+    ("GET", "/accounts"),
+    ("DELETE", "/accounts/{account_id}"),
+];
 const V1_ADAPTERS: &[(&str, &str)] = &[
     ("GET", "/health"),
     // Original Bilibili standalone settings now served natively at the
