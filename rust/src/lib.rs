@@ -14,6 +14,7 @@ pub mod bilibili;
 pub mod bilibili_account_v1;
 mod bilibili_batch_reconcile_v1;
 pub mod publish_batch_events;
+pub mod outbox_dispatcher;
 pub mod bilibili_discovery_v1;
 pub mod bilibili_publish_v1;
 pub mod bilibili_settings_v1;

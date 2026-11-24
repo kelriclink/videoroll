@@ -92,6 +92,47 @@ async fn consume(db: &Database, id: Uuid, batch: Uuid, task: Uuid) -> AppResult<
     let handler: String = event.try_get("task_name")?;
     let key: String = event.try_get("operation_key")?;
     let status: String = row.try_get("state")?;
+    let old_flow:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pipeline_runs WHERE task_id=$1 AND engine<>'rust-v2' AND state NOT IN ('succeeded','failed','canceled','completed','superseded'))")
+        .bind(task).fetch_one(&mut *tx).await?;
+    if old_flow {
+        defer(
+            &mut tx,
+            id,
+            Utc::now() + Duration::minutes(30),
+            "historical workflow still active",
+        )
+        .await?;
+        tx.commit().await?;
+        return Ok(false);
+    }
+    let args: Value = event.try_get("args_json")?;
+    let expected = if handler == CLEANUP {
+        key == format!("publish-cleanup:{batch}") && args["args"] == json!([task, batch])
+    } else if handler == FINISHED {
+        args["args"].as_array().is_some_and(|a| {
+            a.len() == 3
+                && a[0] == json!(batch)
+                && a[2] == json!(task)
+                && a[1].as_str().is_some_and(|s| {
+                    matches!(s, "succeeded" | "failed" | "partial_failed")
+                        && key == format!("workflow-publish-finished:{batch}:{s}")
+                })
+        })
+    } else {
+        false
+    };
+    if !expected || args.get("kwargs").is_some_and(|v| v != &json!({})) {
+        defer(
+            &mut tx,
+            id,
+            Utc::now() + Duration::minutes(30),
+            "batch event envelope does not match original record",
+        )
+        .await?;
+        tx.commit().await?;
+        return Ok(false);
+    }
+
     // Historical outbox keys were not unique. A duplicate native delivery
     // must acknowledge the existing receipt without repeating effects.
     let prior = sqlx::query(
