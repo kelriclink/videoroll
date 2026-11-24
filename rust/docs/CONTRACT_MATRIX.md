@@ -5,8 +5,8 @@
 全部完成状态只允许结合 API 契约、权限、并发、重启、外部副作用与设备测试证据填写。
 
 - 原版声明：217
-- 原生 V1 部分适配：192
-- 无原生 V1 入口：25
+- 原生 V1 部分适配：194
+- 无原生 V1 入口：23
 - 已完成全面验收：0
 - 前端引用文本：193
 
@@ -14,7 +14,7 @@
 |---|---:|---:|---:|
 | bilibili_publisher | 10 | 9 | 1 |
 | egress_gateway | 2 | 2 | 0 |
-| orchestrator_api | 132 | 119 | 13 |
+| orchestrator_api | 132 | 121 | 11 |
 | social_publisher | 9 | 0 | 9 |
 | subtitle_service | 55 | 54 | 1 |
 | youtube_ingest | 9 | 8 | 1 |
@@ -44,8 +44,8 @@
 | orchestrator_api | GET | /bilibili/{service_path:path} | not_native_v1 | proxy_bilibili_browser_operation |
 | orchestrator_api | POST | /bilibili/{service_path:path} | not_native_v1 | proxy_bilibili_browser_operation |
 | orchestrator_api | PUT | /bilibili/{service_path:path} | not_native_v1 | proxy_bilibili_browser_operation |
-| orchestrator_api | GET | /desktop/authorize | not_native_v1 | authorize_grant |
-| orchestrator_api | POST | /desktop/grants | not_native_v1 | create_grant |
+| orchestrator_api | GET | /desktop/authorize | native_adapter_partial | authorize_grant |
+| orchestrator_api | POST | /desktop/grants | native_adapter_partial | create_grant |
 | orchestrator_api | GET | /health | native_adapter_partial | health |
 | orchestrator_api | POST | /maintenance/storage/cleanup-terminal | native_adapter_partial | cleanup_terminal_storage_resources |
 | orchestrator_api | GET | /maintenance/workdir | native_adapter_partial | get_workdir_maintenance |

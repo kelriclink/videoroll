@@ -240,6 +240,12 @@ test "$status" = 401
 hdr=(-H "x-videoroll-v2-internal-token: $VIDEOROLL_V2_INTERNAL_TOKEN" -H 'content-type: application/json')
 # Native old-UI endpoints: YouDub live status, configured Skill registry,
 # and strictly local legacy RenderWorker bootstrap (disposable DB only).
+if [[ "${VIDEOROLL_V2_TEST_DESKTOP_ONLY:-false}" == "true" ]]; then
+  PYTHONPATH="$repo_root/src" /opt/videoroll/venvs/core/bin/python \
+    "$repo_root/rust/tests/desktop_grants_v1_isolated.py"
+  echo 'PASS: original Python/Rust desktop grant cookie and reconnect fence'
+  exit 0
+fi
 if [[ "${VIDEOROLL_V2_TEST_REMOTE_AUTO_ONLY:-false}" == "true" ]]; then
   PYTHONPATH="$repo_root/src" /opt/videoroll/venvs/core/bin/python \
     "$repo_root/rust/tests/remote_auto_youtube_v1_isolated.py"
@@ -434,6 +440,10 @@ curl --silent --fail-with-body -c "$jar" -H 'content-type: application/json' \
 curl --silent --fail-with-body -b "$jar" \
   http://127.0.0.1:18080/api/v2/tasks | grep -q '0123456789A'
 echo 'PASS: native admin setup/login and browser cookie compatibility'
+# Test the Nginx desktop auth_request boundary only after native admin auth
+# is established; use disposable Python V1 cookie and original grant schema.
+PYTHONPATH="$repo_root/src" /opt/videoroll/venvs/core/bin/python \
+  "$repo_root/rust/tests/desktop_grants_v1_isolated.py"
 if [[ "${VIDEOROLL_V2_TEST_WS_PROBE_ONLY:-false}" == "true" ]]; then
   PYTHONPATH="$repo_root/src" python3 "$repo_root/rust/tests/contract_parity_64.py" \
     --ws-only --task-id '00000000-0000-0000-0000-000000000011' \

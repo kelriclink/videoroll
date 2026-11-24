@@ -406,7 +406,8 @@ for row in ordered:
                               form=form,use_cookie=with_cookie,
                               headers={"Range":"bytes=0-15"} if template.endswith("/stream") else None)
         issue=None
-        if status>=500 or status in (301,302,303,307,308,405) or (status==401 and template not in public and not worker_wire):
+        if status>=500 or status in (301,302,303,307,308,405) or (status==401 and template not in public and not worker_wire
+            and template not in ("/desktop/grants","/desktop/authorize")):
             issue="server_failure_or_unexpected_auth"
         if status==404 and template in read_only:
             issue="existing_fixture_read_returned_404"

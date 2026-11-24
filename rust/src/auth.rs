@@ -115,7 +115,7 @@ pub fn encode_password(password: &str) -> AppResult<String> {
         d = '$'
     ))
 }
-fn cookie_from_headers(headers: &HeaderMap) -> Option<String> {
+pub(crate) fn cookie_from_headers(headers: &HeaderMap) -> Option<String> {
     let values = headers.get_all(header::COOKIE);
     for v in values.iter() {
         if let Ok(raw) = v.to_str() {

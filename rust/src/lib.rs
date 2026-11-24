@@ -19,6 +19,7 @@ pub mod bilibili_settings_v1;
 pub mod compat;
 pub mod config;
 pub mod database;
+pub mod desktop_grants_v1;
 pub mod domain;
 pub mod download_runtime;
 pub mod egress_gateway_v1;
