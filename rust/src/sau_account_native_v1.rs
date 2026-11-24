@@ -27,6 +27,7 @@ const HEADER: &str = "x-videoroll-internal-token";
 pub struct SauState {
     pub pool: PgPool,
     pub(crate) publish_outbox_enabled: bool,
+    pub(crate) check_enabled: bool,
     token: String,
 }
 impl SauState {
@@ -51,6 +52,10 @@ impl SauState {
         Ok(Self {
             pool,
             publish_outbox_enabled: std::env::var("VIDEOROLL_V2_SAU_ENABLE_BROWSER_OUTBOX")
+                .ok()
+                .as_deref()
+                == Some("true"),
+            check_enabled: std::env::var("VIDEOROLL_V2_SAU_ENABLE_NATIVE_CHECK")
                 .ok()
                 .as_deref()
                 == Some("true"),
@@ -91,8 +96,8 @@ async fn authentication(
 async fn health() -> Json<Value> {
     Json(json!({"status":"ok","driver":"sau"}))
 }
-fn social_platform(raw: &str) -> AppResult<&'static str> {
-    match raw {
+pub(crate) fn social_platform(raw: &str) -> AppResult<&'static str> {
+    match raw.trim().to_ascii_lowercase().as_str() {
         "douyin" => Ok("douyin"),
         "xiaohongshu" => Ok("xiaohongshu"),
         "kuaishou" => Ok("kuaishou"),
@@ -126,18 +131,21 @@ async fn list_accounts(
     .await?;
     let mut output = Vec::with_capacity(rows.len());
     for row in rows {
-        output.push(json!({
-            "id":row.try_get::<Uuid,_>("id")?,
-            "platform":row.try_get::<String,_>("platform")?,
-            "name":row.try_get::<String,_>("name")?,
-            "is_active":row.try_get::<bool,_>("is_active")?,
-            "check_state":row.try_get::<String,_>("check_state")?,
-            "last_checked_at":row.try_get::<Option<chrono::DateTime<chrono::Utc>>,_>("last_checked_at")?,
-            "last_check_message":row.try_get::<Option<String>,_>("last_check_message")?,
-            "rotated_at":row.try_get::<Option<chrono::DateTime<chrono::Utc>>,_>("rotated_at")?,
-        }));
+        output.push(account_json(&row)?);
     }
     Ok(Json(output))
+}
+pub(crate) fn account_json(row: &sqlx::postgres::PgRow) -> AppResult<Value> {
+    Ok(json!({
+        "id":row.try_get::<Uuid,_>("id")?,
+        "platform":row.try_get::<String,_>("platform")?,
+        "name":row.try_get::<String,_>("name")?,
+        "is_active":row.try_get::<bool,_>("is_active")?,
+        "check_state":row.try_get::<String,_>("check_state")?,
+        "last_checked_at":row.try_get::<Option<chrono::DateTime<chrono::Utc>>,_>("last_checked_at")?,
+        "last_check_message":row.try_get::<Option<String>,_>("last_check_message")?,
+        "rotated_at":row.try_get::<Option<chrono::DateTime<chrono::Utc>>,_>("rotated_at")?,
+    }))
 }
 async fn disable_account(
     State(state): State<Arc<SauState>>,
@@ -159,18 +167,7 @@ async fn disable_account(
         return Err(AppError::NotFound("social account not found".into()));
     }
     let check_state: String = row.try_get("check_state")?;
-    let publishing: bool = sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM publish_jobs
-           WHERE account_id=$1 AND state::text='submitting')",
-    )
-    .bind(account_id)
-    .fetch_one(&mut *tx)
-    .await?;
-    if check_state == "checking" || publishing {
-        return Err(AppError::Conflict(
-            "account is busy; wait for the current check or publish job".into(),
-        ));
-    }
+    account_busy(&mut tx, account_id, &check_state).await?;
     sqlx::query(
         "UPDATE accounts
             SET is_active=false,secrets_encrypted='',check_state='unchecked',
@@ -183,10 +180,43 @@ async fn disable_account(
     tx.commit().await?;
     Ok(Json(json!({"ok":true})))
 }
+pub(crate) async fn account_busy(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    account_id: Uuid,
+    check_state: &str,
+) -> AppResult<()> {
+    let publishing: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM publish_jobs
+           WHERE account_id=$1 AND state::text='submitting')",
+    )
+    .bind(account_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    if check_state == "checking" || publishing {
+        return Err(AppError::Conflict(
+            "account is busy; wait for the current check or publish job".into(),
+        ));
+    }
+    Ok(())
+}
+pub fn start_native_checker(state: Arc<SauState>) -> AppResult<()> {
+    if state.check_enabled {
+        let runtime = crate::sau_check_native_v1::Runtime::from_env()?;
+        tokio::spawn(crate::sau_check_native_v1::run(state, runtime));
+    }
+    Ok(())
+}
 pub fn router(state: Arc<SauState>) -> Router {
     let protected = Router::new()
         .route("/accounts", get(list_accounts))
-        .route("/accounts/{account_id}", delete(disable_account))
+        .route(
+            "/accounts/{account_id}",
+            delete(disable_account).post(crate::sau_check_native_v1::import_account),
+        )
+        .route(
+            "/accounts/{account_id}/check",
+            axum::routing::post(crate::sau_check_native_v1::recheck),
+        )
         .route(
             "/sau/{platform}/publish",
             axum::routing::post(crate::sau_publish_native_v1::publish),

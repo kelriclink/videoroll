@@ -23,6 +23,8 @@ const STANDALONE_SAU_ADAPTERS: &[(&str, &str)] = &[
     ("GET", "/accounts"),
     ("DELETE", "/accounts/{account_id}"),
     ("POST", "/sau/{platform}/publish"),
+    ("POST", "/accounts/{platform}"),
+    ("POST", "/accounts/{account_id}/check"),
 ];
 const STANDALONE_HEALTH_SERVICES: &[&str] =
     &["bilibili_publisher", "subtitle_service", "youtube_ingest"];
