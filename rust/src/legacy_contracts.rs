@@ -674,6 +674,7 @@ pub fn router() -> Router<AppState> {
         .merge(crate::legacy_missing_actions_v1::router())
         .merge(crate::youdub_control_v1::router())
         .merge(crate::maintenance_workdir_v1::router())
+        .merge(crate::maintenance_terminal_storage_v1::router())
         .merge(crate::agent_skills_v1::router())
         .merge(crate::legacy_asset_delete_v1::router())
         .merge(crate::render_management_read_v1::router())
