@@ -190,10 +190,8 @@ struct EmbeddingTest {
     api_key: Option<String>,
     base_url: Option<String>,
     timeout_seconds: Option<f64>,
-    #[allow(dead_code)]
     model_dir: Option<String>,
     dimensions: Option<usize>,
-    #[allow(dead_code)]
     device: Option<String>,
 }
 fn embedding_default_text() -> String {
@@ -240,6 +238,12 @@ async fn embedding_test(
             ));
         }
         settings.dimensions = dimensions;
+    }
+    if let Some(dir) = body.model_dir {
+        settings.model_dir = dir;
+    }
+    if let Some(device) = body.device {
+        settings.device = device;
     }
     let expected = settings.dimensions;
     let provider = settings.provider.clone();
@@ -348,12 +352,30 @@ async fn intel_hardware() -> AppResult<Json<Value>> {
         .ok()
         .and_then(|v| v.file_name().map(|x| x.to_string_lossy().to_string()));
     let intel = vendor.trim().eq_ignore_ascii_case("0x8086");
+    let (devices, error) = if crate::local_inference::configured() {
+        match crate::local_inference::invoke(
+            &json!({"kind":"devices"}),
+            std::time::Duration::from_secs(10),
+        )
+        .await
+        {
+            Ok(v) => (v["devices"].clone(), Value::Null),
+            Err(_) => (json!([]), json!("OpenVINO runtime device query failed")),
+        }
+    } else {
+        (json!([]), json!("local inference runtime not configured"))
+    };
+    let has_gpu = devices.as_array().is_some_and(|v| {
+        v.iter()
+            .any(|x| x.as_str().is_some_and(|s| s.starts_with("GPU")))
+    });
+
     Ok(Json(json!({
         "checked":true,"available":intel,"render_device":render_device,
         "model_name":null,"driver":driver,"pci_slot":pci_slot,"pci_id":pci_id,
         "detail":if intel{"检测到 Intel DRM 渲染设备"}else{"渲染设备不是 Intel PCI 设备"},
-        "openvino_devices":[],"openvino_gpu_available":false,
-        "openvino_error":"native Rust does not load the Python OpenVINO runtime"
+         "openvino_devices":devices,"openvino_gpu_available":has_gpu,
+        "openvino_error":error
     })))
 }
 

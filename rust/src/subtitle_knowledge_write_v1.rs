@@ -103,14 +103,6 @@ pub async fn create(
     }
     validate(&body)?;
     let config = embedding::load(&state).await?;
-    // Document rows without vectors are invalid in Python. Local model
-    // execution is not native yet: reject the configured backend explicitly,
-    // instead of permanently persisting a row with missing vectors.
-    if config.provider != "openai" {
-        return Err(AppError::Unavailable(
-            "local Embedding model inference is not migrated yet; knowledge write rejected".into(),
-        ));
-    }
     let kind = body.item_type.as_str();
     let alias_list: Vec<String> = body
         .aliases
@@ -134,7 +126,7 @@ pub async fn create(
     } else {
         match embedding::embed(&config, &text).await {
             Ok(v) => Some(v),
-            Err(err) if kind == "term" => {
+            Err(err) if kind == "term" && config.provider == "openai" => {
                 // Python term writes are allowed to survive transient
                 // Embedding failures. There is no false embedding_model/hash.
                 tracing::warn!("term knowledge Embedding unavailable: {err}");

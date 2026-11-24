@@ -106,6 +106,18 @@ if [[ "${VIDEOROLL_V2_TEST_DB_CLEANUP_ONLY:-false}" == "true" ]]; then
   echo "PASS: isolated PostgreSQL bootstrap; EXIT trap will remove its dedicated volume"
   exit 0
 fi
+if [[ "${VIDEOROLL_V2_TEST_LOCAL_INFERENCE_ONLY:-false}" == "true" ]]; then
+  export VIDEOROLL_V2_INTERNAL_TOKEN="isolated-local-inference-token-0123456789"
+  export INTERNAL_API_SECRET="isolated-local-inference-service-secret"
+  export VIDEOROLL_V2_STORAGE_ROOT="$(mktemp -d "$repo_root/rust/target/v2-local-inference.XXXXXX")"
+  : "${VIDEOROLL_TEST_INFERENCE_CONFIG:?nonsecret configuration snapshot required}"
+  : "${VIDEOROLL_V2_LOCAL_INFERENCE_PYTHON:?explicit model runtime required}"
+  export VIDEOROLL_V2_LOCAL_INFERENCE_BRIDGE="$repo_root/scripts/native/local_inference.py"
+  "$CARGO_HOME/bin/cargo" build --manifest-path "$repo_root/rust/Cargo.toml" --bin videoroll-v2 --locked --offline --quiet
+  "$repo_root/rust/target/debug/videoroll-v2" migrate
+  PYTHONPATH="$repo_root/src" /opt/videoroll/venvs/core/bin/python "$repo_root/rust/tests/local_inference_isolated.py"
+  exit 0
+fi
 if [[ "${VIDEOROLL_V2_TEST_NATIVE_DEPLOYMENT_ONLY:-false}" == "true" ]]; then
   export VIDEOROLL_V2_INTERNAL_TOKEN="isolated-native-deploy-token-0123456789"
   export VIDEOROLL_V2_STORAGE_ROOT="$(mktemp -d "$repo_root/rust/target/v2-native-deploy.XXXXXX")"
@@ -583,6 +595,15 @@ curl --silent --fail-with-body -c "$jar" -H 'content-type: application/json' \
 curl --silent --fail-with-body -b "$jar" \
   http://127.0.0.1:18080/api/v2/tasks | grep -q '0123456789A'
 echo 'PASS: native admin setup/login and browser cookie compatibility'
+if [[ "${VIDEOROLL_V2_TEST_CONTRACT_217_ONLY:-false}" == "true" ]]; then
+  probe_task_id="$(FIRST="$first" python3 -c 'import json,os;print(json.loads(os.environ["FIRST"])["task"]["id"])')"
+  probe_alert="$(curl --silent --fail-with-body "${hdr[@]}" -d '{"fingerprint":"vr2.contract.alert","source":"isolated","severity":"warning","title":"Contract fixture","message":"mock only","details":{}}' http://127.0.0.1:18080/api/v1/operations/alerts/report)"
+  probe_alert_id="$(ALERT="$probe_alert" python3 -c 'import json,os;print(json.loads(os.environ["ALERT"])["id"])')"
+  python3 "$repo_root/rust/tests/contract_parity_64.py" --all-services \
+    --task-id "$probe_task_id" --alert-id "$probe_alert_id" \
+    --out "$repo_root/rust/target/contract-parity-217.json"
+  exit 0
+fi
 "$CARGO_HOME/bin/cargo" build --manifest-path "$repo_root/rust/Cargo.toml"   --bin videoroll-sau --locked --offline --quiet
 PYTHONPATH="$repo_root/src" /opt/videoroll/venvs/core/bin/python   "$repo_root/rust/tests/sau_account_native_v1_isolated.py"
 
@@ -1844,6 +1865,6 @@ PYTHONPATH="$repo_root/src" /opt/videoroll/venvs/core/bin/python \
 
 # Probe every mapped native /api/v1 route independently.
 # Only local disposable fixtures are used; this is not Python-side parity signoff.
-python3 "$repo_root/rust/tests/contract_parity_64.py" \
+python3 "$repo_root/rust/tests/contract_parity_64.py" --all-services \
   --task-id "$manual_dub_id" --alert-id "$alert_id" \
-  --out "$repo_root/rust/target/contract-parity-64.json"
+  --out "$repo_root/rust/target/contract-parity-217.json"

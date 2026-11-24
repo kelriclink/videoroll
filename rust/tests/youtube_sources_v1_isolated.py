@@ -87,8 +87,11 @@ status,accepted=req("POST",f"/youtube/sources/{uid}/scan/start",
 assert status==202 and accepted["accepted"] is True and accepted["scan_started_at"],(status,accepted)
 done=False
 for _ in range(70):
-    status,row=req("GET",f"/youtube/sources/{uid}")
-    assert status==200
+    # The original Python contract only exposes list, patch and delete,
+    # not GET /youtube/sources/{id}. Poll the actual frontend list contract.
+    status,listing=req("GET","/youtube/sources")
+    assert status==200,(status,listing)
+    row=next(item for item in listing if item["id"]==uid)
     if row["last_scan_finished_at"] and not row["scan_running"]:
         done=True
         break
@@ -136,7 +139,8 @@ status,deleted=req("DELETE",f"/youtube/sources/{pl['id']}")
 assert status==200 and deleted=={"ok":True},(status,deleted)
 status,deleted=req("DELETE",f"/youtube/sources/{uid}")
 assert status==200 and deleted=={"ok":True},(status,deleted)
-assert req("GET",f"/youtube/sources/{uid}")[0]==404
+status,listing=req("GET","/youtube/sources")
+assert status==200 and all(item["id"]!=uid for item in listing)
 assert req("DELETE",f"/youtube/sources/{uid}")[0]==404
 # Historical Python home-scan counters are read-only. The V2 scanner is NOT
 # activated by stale legacy config; V2 must not forge an active scan.

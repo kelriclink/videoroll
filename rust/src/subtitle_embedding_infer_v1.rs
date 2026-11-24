@@ -1,6 +1,6 @@
 //! Python-compatible knowledge Embedding text, credentials and OpenAI-compatible
 //! HTTP request. Uses subtitle.translate original settings and pgvector, not
-//! the V2 RAG shadow table. Local sentence-transformers is not yet migrated.
+//! the V2 RAG shadow table. Local inference uses the isolated model adapter.
 use crate::{AppError, AppResult, api::AppState};
 use reqwest::{Client, Url, redirect::Policy};
 use serde_json::{Value, json};
@@ -10,6 +10,8 @@ use std::{net::IpAddr, time::Duration};
 #[derive(Clone)]
 pub struct Settings {
     pub provider: String,
+    pub model_dir: String,
+    pub device: String,
     pub model: String,
     pub dimensions: usize,
     pub api_key: Option<String>,
@@ -17,9 +19,12 @@ pub struct Settings {
     pub timeout_seconds: f64,
 }
 pub async fn load(state: &AppState) -> AppResult<Settings> {
+    load_db(&state.db).await
+}
+pub async fn load_db(db: &crate::Database) -> AppResult<Settings> {
     let raw: Option<Value> =
         sqlx::query_scalar("SELECT value_json FROM app_settings WHERE key='subtitle.translate'")
-            .fetch_optional(&state.db.pool)
+            .fetch_optional(&db.pool)
             .await?;
     let raw = raw.unwrap_or(Value::Null);
     let cfg = crate::subtitle_translate_settings_v1::view(&raw);
@@ -42,17 +47,25 @@ pub async fn load(state: &AppState) -> AppResult<Settings> {
         .get("api_key_enc")
         .and_then(Value::as_str)
         .unwrap_or("");
-    let key = crate::providers::decode_secret(cipher)?.or_else(|| {
-        std::env::var("SUBTITLE_RAG_EMBEDDING_API_KEY")
-            .ok()
-            .filter(|s| !s.trim().is_empty())
-    });
+    let key = if provider == "local" {
+        None
+    } else {
+        crate::providers::decode_secret(cipher)?.or_else(|| {
+            std::env::var("SUBTITLE_RAG_EMBEDDING_API_KEY")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+        })
+    };
     let raw_base = openai
         .get("base_url")
         .and_then(Value::as_str)
         .filter(|s| !s.trim().is_empty())
         .unwrap_or("https://api.openai.com/v1");
-    let endpoint = endpoint(raw_base)?;
+    let endpoint = endpoint(if provider == "local" {
+        "https://api.openai.com/v1"
+    } else {
+        raw_base
+    })?;
     let timeout = openai
         .get("timeout_seconds")
         .and_then(Value::as_f64)
@@ -61,6 +74,12 @@ pub async fn load(state: &AppState) -> AppResult<Settings> {
         .clamp(5., 600.);
     Ok(Settings {
         provider,
+        model_dir: cfg["rag_embedding_model_dir"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .unwrap_or("/models/embeddings")
+            .into(),
+        device: cfg["rag_embedding_device"].as_str().unwrap_or("cpu").into(),
         model,
         dimensions,
         api_key: key,
@@ -152,10 +171,56 @@ pub fn model_key(settings: &Settings) -> String {
     format!("{}:{}", settings.provider, settings.model)
 }
 pub async fn embed(settings: &Settings, text: &str) -> AppResult<Vec<f32>> {
+    if settings.provider == "local" {
+        if text.trim().is_empty() || text.len() > 128 * 1024 {
+            return Err(AppError::Invalid(
+                "local embedding text size invalid".into(),
+            ));
+        }
+        // The admin-selected directory must remain inside the deployment's
+        // explicitly trusted model root (no arbitrary model code/path loading).
+        let root = std::env::var("SUBTITLE_RAG_EMBEDDING_MODEL_DIR")
+            .unwrap_or_else(|_| "/models/embeddings".into());
+        let root = tokio::fs::canonicalize(root)
+            .await
+            .map_err(|_| AppError::Unavailable("embedding model root missing".into()))?;
+        let requested_dir = if settings.model_dir == "/models/embeddings" {
+            root.clone()
+        } else {
+            std::path::PathBuf::from(&settings.model_dir)
+        };
+        let requested = tokio::fs::canonicalize(&requested_dir)
+            .await
+            .map_err(|_| AppError::Unavailable("embedding model directory missing".into()))?;
+        if !requested.starts_with(&root) {
+            return Err(AppError::Invalid(
+                "embedding directory outside trusted root".into(),
+            ));
+        }
+        let path = crate::local_inference::model_path(&requested, &settings.model, true).await?;
+        let value = crate::local_inference::invoke(
+            &json!({"kind":"embedding","model_path":path,"device":settings.device,"text":text}),
+            Duration::from_secs_f64(settings.timeout_seconds),
+        )
+        .await?;
+        let vector = value["embedding"]
+            .as_array()
+            .ok_or_else(|| AppError::Unavailable("local embedding response missing vector".into()))?
+            .iter()
+            .map(|v| v.as_f64().map(|v| v as f32).filter(|v| v.is_finite()))
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| AppError::Unavailable("invalid embedding values".into()))?;
+        if vector.len() != settings.dimensions || vector.iter().all(|v| *v == 0.) {
+            return Err(AppError::Unavailable(format!(
+                "local embedding dimension mismatch/empty vector: expected {}, got {}",
+                settings.dimensions,
+                vector.len()
+            )));
+        }
+        return Ok(vector);
+    }
     if settings.provider != "openai" {
-        return Err(AppError::Unavailable(
-            "local sentence-transformers/OpenVINO Embedding inference is not migrated yet".into(),
-        ));
+        return Err(AppError::Invalid("unknown embedding provider".into()));
     }
     let key = settings
         .api_key

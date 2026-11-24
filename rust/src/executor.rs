@@ -149,7 +149,7 @@ impl Executor {
                             .await?;
                     Ok(StageOutcome::Completed { result })
                 } else if let Some(runtime) =
-                    crate::media::asr::runtime_asr_config(&self.config, &self.db).await?
+                    crate::media::asr::runtime_asr_config(&self.config, &self.db,item).await?
                 {
                     let result =
                         crate::media::asr::process(&runtime, &self.db, &self.registry, item)
