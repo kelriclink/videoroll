@@ -233,6 +233,8 @@ fi
 if [[ "${VIDEOROLL_V2_TEST_HOME_ONLY:-false}" == "true" ]]; then
   container_name="$container_name" PYTHONPATH="$repo_root/src" /opt/videoroll/venvs/core/bin/python \
     "$repo_root/rust/tests/youtube_home_run_v1_isolated.py"
+  PYTHONPATH="$repo_root/src" /opt/videoroll/venvs/core/bin/python \
+    "$repo_root/rust/tests/youtube_home_automatic_v1_isolated.py"
   echo 'PASS: original YouTube home scan lock, native Browse, duplicate workflow fencing and legacy telemetry'
   exit 0
 fi

@@ -33,6 +33,9 @@ enum Command {
     P2Tick,
     /// Process one durable SAU social publication intent and reconcile receipts.
     SocialTick,
+    /// Run one due-check for the original YouTube Home recommendation scanner.
+    /// Exits without side effects unless home_scan_enabled is true and due.
+    HomeTick,
     /// Process expired, unreferenced v2 artifacts. Never touches v1-only assets.
     Gc {
         #[arg(long, default_value_t = 50)]
@@ -70,6 +73,29 @@ async fn main() -> anyhow::Result<()> {
             let scheduler = Scheduler::new(db.clone(), config.job_lease);
             let storage = AssetRegistry::new(db.clone(), config.storage_root.clone());
             let maintenance_store = storage.clone();
+            // The original youtube.settings.home_scan_enabled flag is the
+            // owner of this schedule. Worker startup checks due immediately;
+            // API-only instances never start a scanner.
+            let home_state = AppState {
+                config: config.clone(),
+                db: db.clone(),
+                scheduler: scheduler.clone(),
+                storage: storage.clone(),
+            };
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    tick.tick().await;
+                    match videoroll_v2::youtube_home_run_v1::run_due(&home_state).await {
+                        Ok(true) => tracing::info!("scheduled YouTube Home scan completed"),
+                        Ok(false) => {}
+                        Err(error) => {
+                            tracing::warn!(error=%error,"scheduled YouTube Home scan failed")
+                        }
+                    }
+                }
+            });
             if config.source_scanner_enabled {
                 let scanner_config = config.clone();
                 let scanner_db = db.clone();
@@ -208,6 +234,16 @@ async fn main() -> anyhow::Result<()> {
             let stale = videoroll_v2::bili_p2::reconcile_stale(&db).await?;
             let processed = videoroll_v2::bili_p2::tick(&config, &db, &store).await?;
             tracing::info!(stale, processed, "native post-P1 P2 append tick finished");
+        }
+        Command::HomeTick => {
+            let state = AppState {
+                config: config.clone(),
+                db: db.clone(),
+                scheduler: Scheduler::new(db.clone(), config.job_lease),
+                storage: AssetRegistry::new(db.clone(), config.storage_root.clone()),
+            };
+            let did_run = videoroll_v2::youtube_home_run_v1::run_due(&state).await?;
+            println!("home_scan_run={did_run}");
         }
         Command::SocialTick => {
             let stale = videoroll_v2::social_publish::reconcile_stale(&db).await?;

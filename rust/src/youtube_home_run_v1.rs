@@ -32,30 +32,59 @@ fn parse_until(value: &Value) -> Option<DateTime<Utc>> {
         .and_then(|v| DateTime::parse_from_rfc3339(v).ok())
         .map(|v| v.with_timezone(&Utc))
 }
-fn modified_value(row: &Value) -> Map<String, Value> {
-    row.as_object().cloned().unwrap_or_default()
+// Match Python V1: last_finished has precedence over last_started. A new
+// worker process will retry a crashed scan after the old lease expires.
+pub(crate) fn home_scan_is_due(settings: &Value, now: DateTime<Utc>) -> bool {
+    if settings.get("home_scan_enabled").and_then(Value::as_bool) != Some(true) {
+        return false;
+    }
+    let interval = settings
+        .get("home_scan_interval_minutes")
+        .and_then(Value::as_i64)
+        .unwrap_or(60)
+        .clamp(1, 1440);
+    let baseline = settings
+        .get("home_scan_last_finished_at")
+        .and_then(parse_until)
+        .or_else(|| {
+            settings
+                .get("home_scan_last_started_at")
+                .and_then(parse_until)
+        });
+    baseline.is_none_or(|previous| now >= previous + ChronoDuration::minutes(interval))
 }
-async fn acquire(state: &AppState, owner: &str) -> AppResult<Value> {
+async fn acquire(state: &AppState, owner: &str, force: bool) -> AppResult<Option<Value>> {
     let mut tx = state.db.pool.begin().await?;
-    sqlx::query("INSERT INTO app_settings(key,value_json,version) VALUES($1,'{}'::jsonb,1) ON CONFLICT(key) DO NOTHING")
-        .bind(SETTINGS).execute(&mut *tx).await?;
-    let old: Value =
+    if force {
+        sqlx::query("INSERT INTO app_settings(key,value_json,version) VALUES($1,'{}'::jsonb,1) ON CONFLICT(key) DO NOTHING")
+            .bind(SETTINGS).execute(&mut *tx).await?;
+    }
+    let old: Option<Value> =
         sqlx::query_scalar("SELECT value_json FROM app_settings WHERE key=$1 FOR UPDATE")
             .bind(SETTINGS)
-            .fetch_one(&mut *tx)
+            .fetch_optional(&mut *tx)
             .await?;
+    let Some(old) = old else { return Ok(None) };
     let other = old
         .get("home_scan_lock_owner")
         .and_then(Value::as_str)
         .unwrap_or("");
     let current = old.get("home_scan_lock_until").and_then(parse_until);
-    if !other.is_empty() && current.is_some_and(|until| until > Utc::now()) {
+    let now = Utc::now();
+    if !other.is_empty() && current.is_some_and(|until| until > now) {
+        if !force {
+            return Ok(None);
+        }
         return Err(AppError::Conflict(
             "YOUTUBE_HOME_SCAN_ALREADY_RUNNING: another home scan is active".into(),
         ));
     }
-    let mut config = modified_value(&old);
-    let now = Utc::now();
+    // Re-evaluate due INSIDE the same row lock shared by Python and the manual
+    // endpoint. Two independent worker processes cannot both enqueue a scan.
+    if !force && !home_scan_is_due(&old, now) {
+        return Ok(None);
+    }
+    let mut config = object(old.clone());
     config.insert("home_scan_lock_owner".into(), json!(owner));
     config.insert(
         "home_scan_lock_until".into(),
@@ -70,7 +99,7 @@ async fn acquire(state: &AppState, owner: &str) -> AppResult<Value> {
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
-    Ok(old)
+    Ok(Some(old))
 }
 async fn heartbeat(state: &AppState, owner: &str) -> AppResult<bool> {
     let mut tx = state.db.pool.begin().await?;
@@ -276,7 +305,13 @@ async fn execute(state: &AppState, owner: &str, settings: &Value) -> AppResult<V
         let url = item.url();
         let candidate = state
             .scheduler
-            .create_youtube_source_task(&url, "authorized", 0, json!({}), true)
+            .create_youtube_source_task(
+                &url,
+                "authorized",
+                0,
+                json!({"origin":"youtube_home_scan"}),
+                true,
+            )
             .await;
         match candidate {
             Ok((task, flow, true)) => {
@@ -285,20 +320,6 @@ async fn execute(state: &AppState, owner: &str, settings: &Value) -> AppResult<V
                 skipped += 1;
             }
             Ok((task, flow, false)) => {
-                // Use the original created_by syntax as well as V2's structured
-                // origin fields; old front-end and billing reports read both.
-                let run = Uuid::new_v4().simple().to_string();
-                let metadata = format!("youtube_home_scan;auto_publish=;run_id={run}");
-                let updated=sqlx::query(
-                    "UPDATE tasks SET created_by=$2,origin_kind='youtube_home_scan',origin_run_id=$3
-                     WHERE id=$1 AND runtime_owner='rust'")
-                    .bind(task.id).bind(metadata).bind(run).execute(&state.db.pool).await?;
-                if updated.rows_affected() != 1 {
-                    // We cannot erase an already admitted durable workflow.
-                    // Count and report failure without pretending no side effect.
-                    failed += 1;
-                    errors.push("task origin metadata not saved".into());
-                }
                 ids.push(task.id);
                 if let Some(flow) = flow {
                     started.push(flow.id.to_string());
@@ -347,13 +368,15 @@ async fn execute(state: &AppState, owner: &str, settings: &Value) -> AppResult<V
     }
     Ok(response)
 }
-pub(crate) async fn run(State(state): State<AppState>) -> AppResult<Json<Value>> {
+async fn run_inner(state: &AppState, force: bool) -> AppResult<Option<Value>> {
     let owner = format!(
         "youtube-router:rust:{}:{}",
         std::process::id(),
         Uuid::new_v4().simple()
     );
-    let old = acquire(&state, &owner).await?;
+    let Some(old) = acquire(state, &owner, force).await? else {
+        return Ok(None);
+    };
     let period = Duration::from_secs((ttl() / 3).clamp(5, 60) as u64);
     let heartbeat_state = state.clone();
     let heartbeat_owner = owner.clone();
@@ -369,10 +392,10 @@ pub(crate) async fn run(State(state): State<AppState>) -> AppResult<Json<Value>>
         }
     });
     let _heartbeat_guard = AbortOnDrop(heartbeat.abort_handle());
-    let result = execute(&state, &owner, &old).await;
+    let result = execute(state, &owner, &old).await;
     heartbeat.abort();
     let release = finish(
-        &state,
+        state,
         &owner,
         result.as_ref().ok(),
         result.as_ref().err().map(|err| match err {
@@ -383,7 +406,20 @@ pub(crate) async fn run(State(state): State<AppState>) -> AppResult<Json<Value>>
     )
     .await;
     release?;
-    result.map(Json)
+    result.map(Some)
+}
+pub(crate) async fn run(State(state): State<AppState>) -> AppResult<Json<Value>> {
+    run_inner(&state, true)
+        .await?
+        .map(Json)
+        .ok_or_else(|| AppError::Conflict("YouTube home scan did not run".into()))
+}
+/// One scheduled tick, also callable from a fresh process after an unexpected
+/// restart. No side effects when disabled, not yet due, or another runtime owns
+/// the original Python lease.
+pub async fn run_due(state: &AppState) -> AppResult<bool> {
+    let executed = run_inner(state, false).await?.is_some();
+    Ok(executed)
 }
 #[cfg(test)]
 mod tests {
@@ -393,5 +429,21 @@ mod tests {
         let v = json!("2026-11-24T12:30:00+08:00");
         assert_eq!(parse_until(&v).unwrap().timestamp(), 1795494600);
         assert!(parse_until(&json!("invalid")).is_none());
+    }
+    #[test]
+    fn due_uses_python_finished_precedence_and_disabled_gate() {
+        let now = DateTime::parse_from_rfc3339("2026-11-24T14:00:00+08:00")
+            .unwrap()
+            .with_timezone(&Utc);
+        let enabled = json!({"home_scan_enabled":true,"home_scan_interval_minutes":60,
+            "home_scan_last_finished_at":"2026-11-24T12:00:00+08:00",
+            "home_scan_last_started_at":"2026-11-24T13:55:00+08:00"});
+        assert!(home_scan_is_due(&enabled, now));
+        let disabled = json!({"home_scan_enabled":false});
+        assert!(!home_scan_is_due(&disabled, now));
+        let just_finished = json!({"home_scan_enabled":true,
+           "home_scan_last_finished_at":"2026-11-24T13:30:00+08:00"});
+        assert!(!home_scan_is_due(&just_finished, now));
+        assert!(home_scan_is_due(&json!({"home_scan_enabled":true}), now));
     }
 }
