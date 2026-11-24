@@ -37,6 +37,8 @@ enum Command {
     P2Tick,
     /// Process one durable SAU social publication intent and reconcile receipts.
     SocialTick,
+    /// Settle due native publish batch events, without running any external publisher.
+    PublishBatchTick,
     /// Run one due-check for the original YouTube Home recommendation scanner.
     /// Exits without side effects unless home_scan_enabled is true and due.
     HomeTick,
@@ -214,6 +216,19 @@ async fn main() -> anyhow::Result<()> {
                     }
                 });
             }
+            let batch_db = db.clone();
+            tokio::spawn(async move {
+                let mut timer = tokio::time::interval(std::time::Duration::from_secs(5));
+                timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    timer.tick().await;
+                    if let Err(error) =
+                        videoroll_v2::publish_batch_events::tick(&batch_db, 100).await
+                    {
+                        tracing::warn!(%error,"native publish batch events unavailable");
+                    }
+                }
+            });
             let executor = Executor::new(config.clone(), db.clone(), scheduler, storage);
             let mut workers = tokio::task::JoinSet::new();
             workers.spawn(async move {
@@ -287,8 +302,14 @@ async fn main() -> anyhow::Result<()> {
                 "SAU social publish tick finished"
             );
         }
+        Command::PublishBatchTick => {
+            let processed = videoroll_v2::publish_batch_events::tick(&db, 100).await?;
+            tracing::info!(processed, "native publish batch event tick finished");
+        }
         Command::Gc { limit } => {
             let registry = AssetRegistry::new(db, config.storage_root.clone());
+            let batch_events =
+                videoroll_v2::publish_batch_events::tick(&registry.db, limit).await?;
             let released = registry
                 .reconcile_terminal_resources(limit, config.cleanup_grace)
                 .await?;
@@ -297,6 +318,7 @@ async fn main() -> anyhow::Result<()> {
             let deleted = registry.collect(limit).await?;
             let directories = registry.collect_workdirs(limit).await?;
             tracing::info!(
+                batch_events,
                 released,
                 deleted,
                 published,

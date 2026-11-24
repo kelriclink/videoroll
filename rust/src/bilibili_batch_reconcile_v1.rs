@@ -3,7 +3,9 @@
 //! make an unfinished Douyin/Kuaishou/Xiaohongshu target look published.
 use crate::{AppError, AppResult};
 use chrono::{DateTime, Duration, Utc};
-use serde_json::{Value, json};
+use serde_json::Value;
+#[cfg(test)]
+use serde_json::json;
 use sqlx::{Postgres, Row, Transaction};
 use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
@@ -58,7 +60,7 @@ pub(crate) fn keys(value: &Value) -> AppResult<Vec<String>> {
     Ok(output)
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum State {
+pub(crate) enum State {
     Active,
     Succeeded,
     PartialFailed,
@@ -129,32 +131,6 @@ fn task_state(states: &[State]) -> (String, Option<&'static str>, Option<&'stati
         Some("all publish targets failed"),
     )
 }
-async fn event(
-    tx: &mut Transaction<'_, Postgres>,
-    batch: Uuid,
-    kind: &str,
-    task: &str,
-    key: &str,
-    args: Value,
-    available: Option<DateTime<Utc>>,
-) -> AppResult<()> {
-    sqlx::query(
-        "INSERT INTO outbox_events(id,event_type,aggregate_type,aggregate_id,task_name,
-        args_json,operation_key,available_at,status)
-        SELECT $1,$2,'publish_batch',$3,$4,$5,$6,COALESCE($7,now()),'pending'
-        WHERE NOT EXISTS(SELECT 1 FROM outbox_events WHERE operation_key=$6)",
-    )
-    .bind(Uuid::new_v4())
-    .bind(kind)
-    .bind(batch.to_string())
-    .bind(task)
-    .bind(args)
-    .bind(key)
-    .bind(available)
-    .execute(&mut **tx)
-    .await?;
-    Ok(())
-}
 /// Only call after the original `publish_jobs` row has been updated within the
 /// same transaction and the parent Task row is already locked. Serializes
 /// with Python Task -> Batch reconciliation without a second business table.
@@ -176,7 +152,7 @@ async fn reconcile_impl(
     tx: &mut Transaction<'_, Postgres>,
     task: Uuid,
     batch: Uuid,
-    legacy_events: bool,
+    native_events: bool,
 ) -> AppResult<()> {
     let row = sqlx::query(
         "SELECT state,expected_targets,outcomes_json,finished_at,cleanup_enqueued_at
@@ -226,19 +202,57 @@ async fn reconcile_impl(
     .bind(target != State::Active)
     .execute(&mut **tx)
     .await?;
-    if legacy_events
+    if native_events
         && target != State::Active
         && (prior != target.name()
             || row
                 .try_get::<Option<DateTime<Utc>>, _>("finished_at")?
                 .is_none())
     {
-        event(tx,batch,"workflow.publish.finished","subtitle_service.push_publish_workflow_event",
-            &format!("workflow-publish-finished:{batch}:{}",target.name()),
-            json!({"args":[batch.to_string(),target.name(),task.to_string()],"queue":"subtitle-control"}),None).await?;
+        crate::publish_batch_events::enqueue(tx, task, batch, target.name(), None).await?;
     }
     // Python's currentness is per `(platform, account_id)`; do not let an
     // older completed batch override newer attempts on another channel.
+    let currents = current_batches(tx, task).await?;
+    if !currents.iter().any(|(id, _, _, _)| *id == batch) {
+        return Ok(());
+    }
+    let aggregate = currents
+        .iter()
+        .map(|(_, state, _, _)| *state)
+        .collect::<Vec<_>>();
+    let (task_status, code, message) = task_state(&aggregate);
+    sqlx::query(
+        "UPDATE tasks SET status=$2::task_status,error_code=$3,error_message=$4,
+        updated_at=now() WHERE id=$1 AND status <> 'canceled'::task_status",
+    )
+    .bind(task)
+    .bind(task_status)
+    .bind(code)
+    .bind(message)
+    .execute(&mut **tx)
+    .await?;
+    if native_events
+        && aggregate.iter().all(|s| *s == State::Succeeded)
+        && currents
+            .iter()
+            .any(|(id, _, _, enqueued)| *id == batch && !enqueued)
+    {
+        let retention = currents
+            .iter()
+            .filter_map(|(_, _, finished, _)| *finished)
+            .max()
+            .unwrap_or_else(Utc::now)
+            + Duration::hours(24);
+        crate::publish_batch_events::enqueue(tx, task, batch, target.name(), Some(retention))
+            .await?;
+    }
+    Ok(())
+}
+pub(crate) async fn current_batches(
+    tx: &mut Transaction<'_, Postgres>,
+    task: Uuid,
+) -> AppResult<Vec<(Uuid, State, Option<DateTime<Utc>>, bool)>> {
     let batches = sqlx::query(
         "SELECT id,state,expected_targets,finished_at,cleanup_enqueued_at
         FROM publish_batches WHERE task_id=$1 ORDER BY created_at DESC,id DESC",
@@ -279,48 +293,7 @@ async fn reconcile_impl(
             ));
         }
     }
-    if !currents.iter().any(|(id, _, _, _)| *id == batch) {
-        return Ok(());
-    }
-    let aggregate = currents
-        .iter()
-        .map(|(_, state, _, _)| *state)
-        .collect::<Vec<_>>();
-    let (task_status, code, message) = task_state(&aggregate);
-    sqlx::query(
-        "UPDATE tasks SET status=$2::task_status,error_code=$3,error_message=$4,
-        updated_at=now() WHERE id=$1 AND status <> 'canceled'::task_status",
-    )
-    .bind(task)
-    .bind(task_status)
-    .bind(code)
-    .bind(message)
-    .execute(&mut **tx)
-    .await?;
-    if legacy_events
-        && aggregate.iter().all(|s| *s == State::Succeeded)
-        && currents
-            .iter()
-            .any(|(id, _, _, enqueued)| *id == batch && !enqueued)
-    {
-        let retention = currents
-            .iter()
-            .filter_map(|(_, _, finished, _)| *finished)
-            .max()
-            .unwrap_or_else(Utc::now)
-            + Duration::hours(24);
-        event(
-            tx,
-            batch,
-            "publish.cleanup",
-            "subtitle_service.cleanup_task",
-            &format!("publish-cleanup:{batch}"),
-            json!({"args":[task.to_string(),batch.to_string()],"queue":"subtitle-control"}),
-            Some(retention),
-        )
-        .await?;
-    }
-    Ok(())
+    Ok(currents)
 }
 #[cfg(test)]
 mod tests {

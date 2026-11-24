@@ -213,6 +213,22 @@ impl Executor {
                 }
             }
             Stage::Cleanup => {
+                // Batch cleanup is independently due after ALL current targets
+                // settle. This stage must not fail an already confirmed Bilibili
+                // publication merely because another target is still running.
+                let batched: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM vr2_workflows w JOIN publish_jobs j
+                    ON j.id::text=w.configuration->'bilibili_direct_v1'->>'publish_job_id'
+                    WHERE w.id=$1 AND j.task_id=$2 AND j.batch_id IS NOT NULL)",
+                )
+                .bind(item.workflow_id)
+                .bind(item.task_id)
+                .fetch_one(&self.db.pool)
+                .await?;
+                if batched {
+                    return Ok(StageOutcome::Skipped{reason:"batch cleanup handled by durable publication events and retention policy".into()});
+                }
+
                 let published: Option<Value> = sqlx::query_scalar(
                     "SELECT result FROM vr2_jobs WHERE workflow_id=$1 AND stage='publish' AND state='succeeded' LIMIT 1"
                 ).bind(item.workflow_id).fetch_optional(&self.db.pool).await?.flatten();
