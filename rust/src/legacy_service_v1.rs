@@ -135,75 +135,82 @@ pub fn router(service: LegacyService, state: AppState) -> AppResult<Router> {
         .with_state(state))
 }
 #[cfg(test)]
+pub(crate) fn test_state() -> (tempfile::TempDir, AppState) {
+    use crate::{Config, Database, scheduler::Scheduler, storage::AssetRegistry};
+    use std::{sync::Arc, time::Duration};
+    let temp = tempfile::tempdir().unwrap();
+    let secret = "isolated-internal-service-secret";
+    let database_url = "postgresql://test:test@127.0.0.1:1/unused".to_owned();
+    let db = Database {
+        pool: sqlx::PgPool::connect_lazy(&database_url).unwrap(),
+    };
+    let duration = Duration::from_secs(60);
+    let config = Arc::new(Config {
+        bind: "127.0.0.1:0".parse().unwrap(),
+        database_url,
+        storage_root: temp.path().into(),
+        internal_token: "unused-isolated-v2-internal-token".into(),
+        legacy_internal_secret: Some(secret.into()),
+        bootstrap_secret: None,
+        secure_cookies: true,
+        worker_gateway: None,
+        download_binary: "yt-dlp".into(),
+        ffmpeg_binary: "ffmpeg".into(),
+        ffprobe_binary: "ffprobe".into(),
+        asr_endpoint: None,
+        asr_api_key: None,
+        asr_model: "".into(),
+        translate_endpoint: None,
+        translate_api_key: None,
+        translate_model: None,
+        youdub_python: None,
+        youdub_bridge: None,
+        youdub_runtime: None,
+        legacy_orchestrator_url: None,
+        legacy_internal_token: None,
+        legacy_publish_allowed: false,
+        native_bilibili_allowed: false,
+        social_publisher_url: None,
+        social_publish_allowed: false,
+        social_storage_root: None,
+        native_bilibili_cookie: None,
+        native_bilibili_csrf: None,
+        native_bilibili_api_base: None,
+        native_bilibili_subtitles: false,
+        source_scanner_enabled: false,
+        remote_renderer_enabled: false,
+        embedding_endpoint: None,
+        embedding_model: None,
+        embedding_api_key: None,
+        compat_orchestrator_url: None,
+        compat_internal_token: None,
+        compat_writes_allowed: false,
+        playout_root: None,
+        worker_count: 1,
+        worker_poll: duration,
+        job_lease: duration,
+        cleanup_grace: duration,
+    });
+    let state = AppState {
+        config,
+        db: db.clone(),
+        scheduler: Scheduler::new(db.clone(), duration),
+        storage: AssetRegistry::new(db, temp.path().into()),
+    };
+    (temp, state)
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     // Construct the actual standalone router using an unconnected pool.
     // These requests must never touch the database, external platform or disk.
     #[tokio::test]
     async fn actual_service_routers_health_and_isolation() {
-        use crate::{Config, Database, scheduler::Scheduler, storage::AssetRegistry};
         use axum::body::{Body, to_bytes};
-        use std::{sync::Arc, time::Duration};
         use tower::ServiceExt;
-        let temp = tempfile::tempdir().unwrap();
+        let (_temp, state) = test_state();
         let secret = "isolated-internal-service-secret";
-        let database_url = "postgresql://test:test@127.0.0.1:1/unused".to_owned();
-        let db = Database {
-            pool: sqlx::PgPool::connect_lazy(&database_url).unwrap(),
-        };
-        let duration = Duration::from_secs(60);
-        let config = Arc::new(Config {
-            bind: "127.0.0.1:0".parse().unwrap(),
-            database_url,
-            storage_root: temp.path().into(),
-            internal_token: "unused-isolated-v2-internal-token".into(),
-            legacy_internal_secret: Some(secret.into()),
-            bootstrap_secret: None,
-            secure_cookies: true,
-            worker_gateway: None,
-            download_binary: "yt-dlp".into(),
-            ffmpeg_binary: "ffmpeg".into(),
-            ffprobe_binary: "ffprobe".into(),
-            asr_endpoint: None,
-            asr_api_key: None,
-            asr_model: "".into(),
-            translate_endpoint: None,
-            translate_api_key: None,
-            translate_model: None,
-            youdub_python: None,
-            youdub_bridge: None,
-            youdub_runtime: None,
-            legacy_orchestrator_url: None,
-            legacy_internal_token: None,
-            legacy_publish_allowed: false,
-            native_bilibili_allowed: false,
-            social_publisher_url: None,
-            social_publish_allowed: false,
-            social_storage_root: None,
-            native_bilibili_cookie: None,
-            native_bilibili_csrf: None,
-            native_bilibili_api_base: None,
-            native_bilibili_subtitles: false,
-            source_scanner_enabled: false,
-            remote_renderer_enabled: false,
-            embedding_endpoint: None,
-            embedding_model: None,
-            embedding_api_key: None,
-            compat_orchestrator_url: None,
-            compat_internal_token: None,
-            compat_writes_allowed: false,
-            playout_root: None,
-            worker_count: 1,
-            worker_poll: duration,
-            job_lease: duration,
-            cleanup_grace: duration,
-        });
-        let state = AppState {
-            config,
-            db: db.clone(),
-            scheduler: Scheduler::new(db.clone(), duration),
-            storage: AssetRegistry::new(db, temp.path().into()),
-        };
         for (service, own, other) in [
             (
                 LegacyService::BilibiliPublisher,

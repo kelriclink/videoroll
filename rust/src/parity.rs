@@ -26,6 +26,17 @@ const STANDALONE_SAU_ADAPTERS: &[(&str, &str)] = &[
 const STANDALONE_HEALTH_SERVICES: &[&str] =
     &["bilibili_publisher", "subtitle_service", "youtube_ingest"];
 const V1_ADAPTERS: &[(&str, &str)] = &[
+    ("GET", "/bilibili/{service_path:path}"),
+    ("POST", "/bilibili/{service_path:path}"),
+    ("PUT", "/bilibili/{service_path:path}"),
+    ("GET", "/subtitle/{service_path:path}"),
+    ("POST", "/subtitle/{service_path:path}"),
+    ("PUT", "/subtitle/{service_path:path}"),
+    ("DELETE", "/subtitle/{service_path:path}"),
+    ("GET", "/youtube/{service_path:path}"),
+    ("POST", "/youtube/{service_path:path}"),
+    ("PATCH", "/youtube/{service_path:path}"),
+    ("DELETE", "/youtube/{service_path:path}"),
     ("GET", "/health"),
     // Original Bilibili standalone settings now served natively at the
     // orchestrator's /api/v1 boundary, after DB/Pydantic differential tests.
