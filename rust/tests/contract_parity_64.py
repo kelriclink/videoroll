@@ -44,9 +44,13 @@ standalone = [r for r in matrix["routes"] if r["service"]=="egress_gateway"
               and r["v1_status"]!="not_native_v1"]
 social = [r for r in matrix["routes"] if r["service"]=="social_publisher"
           and r["v1_status"]!="not_native_v1"]
+service_health = [r for r in matrix["routes"] if r["v1_status"]!="not_native_v1"
+                  and r["service"] in ("bilibili_publisher","subtitle_service","youtube_ingest")
+                  and r["path"]=="/health" and r["method"]=="GET"]
 mapped = [r for r in matrix["routes"] if r["v1_status"]!="not_native_v1"
-          and r["service"] not in ("egress_gateway","social_publisher")]
-assert len(mapped)+len(standalone)+len(social) == matrix["native_v1_partial"], "Route count and parity matrix disagree"
+          and r["service"] not in ("egress_gateway","social_publisher")
+          and r not in service_health]
+assert len(mapped)+len(standalone)+len(social)+len(service_health) == matrix["native_v1_partial"], "Route count and parity matrix disagree"
 jar = http.cookiejar.CookieJar()
 opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
 anonymous = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
@@ -56,6 +60,7 @@ context = {"task_id": args.task_id,"id":args.task_id,"alert_id":args.alert_id,
            "asset_id": fake,"job_id":fake,"publish_job_id":fake,
            "account_id":fake,"session_id":fake,"platform":"bilibili"}
 context["provider_id"]="isolated-provider-diff-probe"
+context["service_path:path"]="not-an-allowed-operation"
 def send(method, path, payload=None, authenticated=True, form=False, headers=None, use_cookie=False):
     if not path.startswith("/api/") or not args.base.startswith("http://127.0.0.1:"):
         raise RuntimeError("unsafe request destination")
@@ -442,6 +447,7 @@ for row in ordered:
 assert {(r["method"],r["path"]) for r in results} == {(r["method"],r["path"]) for r in mapped}
 summary={"standalone_egress_routes":len(standalone),
          "standalone_sau_routes":len(social),
+         "standalone_service_health_routes":len(service_health),
          "probed":len(results),
          "positive":sum(r["probe"]=="positive" for r in results),
          "rejection_only":sum(r["probe"]=="rejection" for r in results),
@@ -460,6 +466,8 @@ lines=[f"# VideoRoll Rust V1 部分适配 API：{len(mapped)} 条逐接口探测
        f"测试日期：{report['timestamp_utc']}。",
        "环境：隔离 PostgreSQL + 本地模拟平台，不使用生产账号、生产数据库或真实投稿。",
        f"独立 Egress Gateway 另有 {len(standalone)} 条接口，需运行专项 HTTP/SSRF 套件；不计入本 API 探测。",
+       f"独立业务服务健康检查另有 {len(service_health)} 条，由独立 Router 测试覆盖；不重复计算主 API 健康检查。",
+       "通配代理的探测使用非白名单路径检查拒绝；正向参数转发由专项 Router 测试覆盖。",
        "注意：HTTP 请求得到响应不代表与 Python 完全等价；仅拒绝路径不代表正向业务通过。",
        "隔离探测不能替代 Python/Rust 双端业务差分验收。",
        "",

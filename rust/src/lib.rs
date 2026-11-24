@@ -16,6 +16,7 @@ mod bilibili_batch_reconcile_v1;
 pub mod bilibili_discovery_v1;
 pub mod bilibili_publish_v1;
 pub mod bilibili_settings_v1;
+pub mod browser_gateway_v1;
 pub mod compat;
 pub mod config;
 pub mod database;

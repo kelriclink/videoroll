@@ -358,7 +358,8 @@ pub fn router(state: AppState) -> Router {
         .route("/storage/stats", get(storage_stats))
         .route("/storage/hold", post(asset_hold))
         .route_layer(middleware::from_fn_with_state(state.clone(), authorize));
-    let legacy_protected = crate::legacy_contracts::router()
+    let legacy_protected = crate::legacy_contracts::core_router()
+        .merge(crate::browser_gateway_v1::router(state.clone()))
         .route_layer(middleware::from_fn_with_state(state.clone(), authorize));
     // Login endpoints must remain public so the original React AuthGate can
     // establish a V2 session before entering the native V1-contract surface.
