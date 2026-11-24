@@ -1,0 +1,17 @@
+[Unit]
+Description=VideoRoll Rust read-only deployment admission
+Wants=network-online.target
+After=network-online.target
+PartOf=videoroll-rust.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User=videoroll
+Group=videoroll
+EnvironmentFile=/opt/videoroll-rust/config/videoroll.env
+ExecStart=/opt/videoroll-rust/current/deploy/rust-native/preflight.sh
+UMask=0027
+NoNewPrivileges=yes
+ProtectSystem=full
+ProtectHome=yes

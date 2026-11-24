@@ -1,0 +1,25 @@
+[Unit]
+Description=VideoRoll Rust Web gateway
+Requires=videoroll-rust@api.service videoroll-rust-preflight.service
+After=videoroll-rust@api.service videoroll-rust-preflight.service
+PartOf=videoroll-rust.target
+
+[Service]
+Type=simple
+User=videoroll
+Group=videoroll
+RuntimeDirectory=videoroll-rust-nginx
+RuntimeDirectoryMode=0750
+ExecStartPre=/opt/videoroll-rust/current/deploy/rust-native/wait-ready.sh http://127.0.0.1:18080/ready
+ExecStartPre=/opt/videoroll-rust/current/bin/nginx -t -c /opt/videoroll-rust/config/nginx.conf
+ExecStart=/opt/videoroll-rust/current/bin/nginx -c /opt/videoroll-rust/config/nginx.conf -g "daemon off;"
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+KillSignal=SIGQUIT
+UMask=0027
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectHome=yes
+LimitNOFILE=65536
