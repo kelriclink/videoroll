@@ -5,8 +5,8 @@
 全部完成状态只允许结合 API 契约、权限、并发、重启、外部副作用与设备测试证据填写。
 
 - 原版声明：217
-- 原生 V1 部分适配：185
-- 无原生 V1 入口：32
+- 原生 V1 部分适配：186
+- 无原生 V1 入口：31
 - 已完成全面验收：0
 - 前端引用文本：193
 
@@ -14,7 +14,7 @@
 |---|---:|---:|---:|
 | bilibili_publisher | 10 | 9 | 1 |
 | egress_gateway | 2 | 0 | 2 |
-| orchestrator_api | 132 | 114 | 18 |
+| orchestrator_api | 132 | 115 | 17 |
 | social_publisher | 9 | 0 | 9 |
 | subtitle_service | 55 | 54 | 1 |
 | youtube_ingest | 9 | 8 | 1 |
@@ -92,7 +92,7 @@
 | orchestrator_api | GET | /settings/dubbing | native_adapter_partial | settings |
 | orchestrator_api | GET | /settings/dubbing/jobs/summary | native_adapter_partial | recent_native_jobs |
 | orchestrator_api | GET | /settings/dubbing/native | native_adapter_partial | engine_state |
-| orchestrator_api | PUT | /settings/dubbing/native | not_native_v1 | engine_control |
+| orchestrator_api | PUT | /settings/dubbing/native | native_adapter_partial | engine_control |
 | orchestrator_api | GET | /settings/publish/platforms | native_adapter_partial | read_publish_platform_settings |
 | orchestrator_api | PUT | /settings/publish/platforms/{platform} | native_adapter_partial | put_publish_platform_setting |
 | orchestrator_api | GET | /settings/publish/social/accounts | native_adapter_partial | list_social_publish_accounts |

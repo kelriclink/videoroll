@@ -16,6 +16,22 @@ def main(argv: list[str]) -> int:
     if not str(runtime).endswith("mock-youdub-v2"):
         raise ValueError("test bridge cannot use a production runtime")
     mode = argv[0] if argv else ""
+    if mode == "--serve":
+        import socketserver
+        sock = runtime / "voxcpm-resident.sock"
+        sock.unlink(missing_ok=True)
+        class Handler(socketserver.StreamRequestHandler):
+            def handle(self):
+                request=json.loads(self.rfile.readline())
+                if request.get("command") == "ping":
+                    self.wfile.write(b'{"result":{"gpu_loaded":true}}\n')
+                else:
+                    self.wfile.write(b'{"error":"unsupported command"}\n')
+        class Server(socketserver.UnixStreamServer):
+            allow_reuse_address=True
+        with Server(str(sock), Handler) as server:
+            server.serve_forever(poll_interval=0.1)
+        return 0
     if mode == "--prepare":
         print(json.dumps({"status": "ready"}))
         return 0
