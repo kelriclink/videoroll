@@ -77,7 +77,7 @@ fn default_authorized() -> String {
     "authorized".into()
 }
 
-fn valid_license(value: &str) -> bool {
+pub(crate) fn valid_license(value: &str) -> bool {
     matches!(value, "own" | "authorized" | "cc" | "unknown")
 }
 fn verify_proof(value: Option<&str>) -> AppResult<Option<String>> {

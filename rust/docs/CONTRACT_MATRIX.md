@@ -5,8 +5,8 @@
 全部完成状态只允许结合 API 契约、权限、并发、重启、外部副作用与设备测试证据填写。
 
 - 原版声明：217
-- 原生 V1 部分适配：187
-- 无原生 V1 入口：30
+- 原生 V1 部分适配：189
+- 无原生 V1 入口：28
 - 已完成全面验收：0
 - 前端引用文本：193
 
@@ -14,7 +14,7 @@
 |---|---:|---:|---:|
 | bilibili_publisher | 10 | 9 | 1 |
 | egress_gateway | 2 | 0 | 2 |
-| orchestrator_api | 132 | 116 | 16 |
+| orchestrator_api | 132 | 118 | 14 |
 | social_publisher | 9 | 0 | 9 |
 | subtitle_service | 55 | 54 | 1 |
 | youtube_ingest | 9 | 8 | 1 |
@@ -58,8 +58,8 @@
 | orchestrator_api | POST | /operations/alerts/scan | native_adapter_partial | post_alert_scan |
 | orchestrator_api | POST | /operations/alerts/{alert_id}/ack | native_adapter_partial | acknowledge_alert |
 | orchestrator_api | POST | /operations/alerts/{alert_id}/resolve | native_adapter_partial | resolve_alert |
-| orchestrator_api | GET | /remote/auto/youtube | not_native_v1 | remote_auto_youtube_legacy |
-| orchestrator_api | POST | /remote/auto/youtube | not_native_v1 | remote_auto_youtube |
+| orchestrator_api | GET | /remote/auto/youtube | native_adapter_partial | remote_auto_youtube_legacy |
+| orchestrator_api | POST | /remote/auto/youtube | native_adapter_partial | remote_auto_youtube |
 | orchestrator_api | GET | /render-management/connection | native_adapter_partial | connection |
 | orchestrator_api | PUT | /render-management/connection | native_adapter_partial | update_connection |
 | orchestrator_api | GET | /render-management/enrollments | native_adapter_partial | enrollments |

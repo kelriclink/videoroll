@@ -47,6 +47,25 @@ impl Scheduler {
         self.create_youtube_source_task(source_url, source_license, priority, configuration, true)
             .await
     }
+    /// Persist optional source proof together with original Task and workflow.
+    pub async fn create_auto_youtube_with_proof(
+        &self,
+        source_url: &str,
+        source_license: &str,
+        priority: i32,
+        configuration: Value,
+        source_proof_url: Option<&str>,
+    ) -> AppResult<(TaskInfo, Option<WorkflowInfo>, bool)> {
+        self.create_youtube_source_task_inner(
+            source_url,
+            source_license,
+            priority,
+            configuration,
+            true,
+            source_proof_url,
+        )
+        .await
+    }
     pub async fn create_youtube_source_task(
         &self,
         source_url: &str,
@@ -54,6 +73,25 @@ impl Scheduler {
         priority: i32,
         configuration: Value,
         auto_process: bool,
+    ) -> AppResult<(TaskInfo, Option<WorkflowInfo>, bool)> {
+        self.create_youtube_source_task_inner(
+            source_url,
+            source_license,
+            priority,
+            configuration,
+            auto_process,
+            None,
+        )
+        .await
+    }
+    async fn create_youtube_source_task_inner(
+        &self,
+        source_url: &str,
+        source_license: &str,
+        priority: i32,
+        configuration: Value,
+        auto_process: bool,
+        source_proof_url: Option<&str>,
     ) -> AppResult<(TaskInfo, Option<WorkflowInfo>, bool)> {
         let video_id = crate::ingest::youtube_video_id(source_url)?;
         let license = match source_license {
@@ -99,9 +137,9 @@ impl Scheduler {
         // enum-like value; created_by can contain the original metadata.
         // Both must be committed atomically with the durable workflow.
         sqlx::query(
-            "INSERT INTO tasks(id,source_type,source_url,source_license,status,priority,origin_kind,origin_run_id,restart_generation,created_by) VALUES($1,'youtube'::source_type,$2,$3::source_license,'created'::task_status,$4,$6,$5,0,$7)"
+            "INSERT INTO tasks(id,source_type,source_url,source_license,status,priority,origin_kind,origin_run_id,restart_generation,created_by,source_proof_url) VALUES($1,'youtube'::source_type,$2,$3::source_license,'created'::task_status,$4,$6,$5,0,$7,$8)"
         ).bind(task_id).bind(canonical_url).bind(license).bind(priority.clamp(-100,100))
-            .bind(run_id).bind(origin).bind(created_by)
+            .bind(run_id).bind(origin).bind(created_by).bind(source_proof_url)
             .execute(&mut *tx).await?;
         let inserted=sqlx::query(
             "INSERT INTO ingested_videos(id,platform,source_id,task_id) VALUES($1,'youtube',$2,$3) ON CONFLICT(platform,source_id) DO NOTHING"

@@ -1,11 +1,11 @@
-# VideoRoll Rust V1 部分适配 API：187 条逐接口探测
+# VideoRoll Rust V1 部分适配 API：189 条逐接口探测
 
-测试日期：2026-11-24T06:44:26.824583+00:00。
+测试日期：2026-11-24T07:14:56.552127+00:00。
 环境：隔离 PostgreSQL + 本地模拟平台，不使用生产账号、生产数据库或真实投稿。
 注意：HTTP 请求得到响应不代表与 Python 完全等价；仅拒绝路径不代表正向业务通过。
 隔离探测不能替代 Python/Rust 双端业务差分验收。
 
-逐项执行：187；2xx 正向：98；4xx 拒绝路径：88；异常/需要复核：0；完整业务等价验收：0。
+逐项执行：189；2xx 正向：98；4xx 拒绝路径：90；异常/需要复核：0；完整业务等价验收：0。
 
 | HTTP 方法 | 原 Python 路径 | Rust 返回 | 测试类型 | 鉴权检查 | 问题 |
 |---|---|---:|---|---:|---|
@@ -35,6 +35,8 @@
 | POST | `/operations/alerts/scan` | 200 | positive | 401 | - |
 | POST | `/operations/alerts/{alert_id}/ack` | 200 | positive | 401 | - |
 | POST | `/operations/alerts/{alert_id}/resolve` | 200 | positive | 401 | - |
+| GET | `/remote/auto/youtube` | 410 | rejection | - | - |
+| POST | `/remote/auto/youtube` | 403 | rejection | 403 | - |
 | GET | `/render-management/connection` | 200 | positive | 401 | - |
 | PUT | `/render-management/connection` | 200 | positive | 401 | - |
 | GET | `/render-management/enrollments` | 200 | positive | 401 | - |
@@ -202,3 +204,15 @@
 - 正向请求仅验证返回状态/基础 JSON 结构；未完成 Python 生产响应字段、错误码、状态迁移的逐项差分。
 - 字幕、配音、B 站双 P、SAU 和真实 GPU 的生产级外部副作用仍需专门的受控验收。
 - 不对生产账号执行真实投稿、删改或会话操作。
+
+## 2026-11-24：Remote YouTube 公网 Bearer 接口
+
+- GET /remote/auto/youtube 公开返回 Python 原 410；POST 必须独立的
+  PBKDF2 Bearer Token 和 Idempotency-Key，不接受普通管理 Token。
+- 读取原 remote.api 配置、原 remote_api_requests 幂等账本，跨 Python/Rust
+  复用相同 SHA256 请求摘要。Task、来源证明、工作流事务原子创建。
+- 旧 pending/failed 禁止重试派发，历史 completed 按原响应回放；不同幂等键
+  用原 ingested_videos 唯一约束防重复视频。
+- 隔离测试涵盖原 PBKDF2、Python 同表已完成结果、并发抢占、重放、Token
+  轮换、限流和无权用户无 JSON 时先拒绝，详见 REMOTE_AUTO_YOUTUBE_V1.md。
+- 不具备独立 IP 维度 Redis 限流和实际平台生产等价；接口仅算部分适配。

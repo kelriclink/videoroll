@@ -388,12 +388,15 @@ for row in ordered:
     # Windows Worker V1 is mounted at /api/render-workers/v1, not /api/v1/...
     # Its protected calls require a vrw_ Bearer, not the admin session token.
     worker_wire=template.startswith("/render-workers/v1/")
+    # Python's retired GET query-token endpoint is intentionally public 410.
+    # Its POST replacement is NOT public: use the independent Bearer secret.
+    public_wire=template in public or (template=="/remote/auto/youtube" and row["method"]=="GET")
     actual_path=("/api" if worker_wire else "/api/v1")+path
     if template=="/render-workers/v1/executions/{execution_id}/output":
         actual_path += "?fence_token=invalid-probe"
     try:
         status,mime,obj=send(row["method"],actual_path,payload,
-                              authenticated=template not in public,
+                              authenticated=not public_wire,
                               form=form,use_cookie=with_cookie,
                               headers={"Range":"bytes=0-15"} if template.endswith("/stream") else None)
         issue=None
@@ -417,7 +420,7 @@ for row in ordered:
         record={"method":row["method"],"path":template,"http_status":None,
                 "probe":"failed","issue":type(exc).__name__}
     # Check unauthorized request for each protected endpoint without mutating.
-    if template not in public and not worker_wire:
+    if not public_wire and not worker_wire:
         try:
             unauth,_,_=send(row["method"],actual_path,None,authenticated=False)
             record["unauthorized_status"]=unauth
