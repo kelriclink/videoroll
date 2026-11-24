@@ -14,3 +14,10 @@
 - Rust scheduler 仍引用 `vr2_workflows`/`vr2_jobs`，须先统一持久化语义再做调度和恢复验收。
 - 当前开发机 `cargo fmt` 缺组件，离线 `cargo check` 缺 `anyhow` 索引；不能声明编译通过。
 - 本次没有运行临时 PostgreSQL 或生产测试，未启动任何清理动作。
+
+## 本轮新增：知识库批量导入
+
+- 新增原生 `POST /subtitle/knowledge/import`，支持 multipart JSON、CSV、SRT，以及 5 MiB 文件、2000 条记录上限。
+- SRT 以最多 50 条字幕/4000 字符分块写入原 `translation_knowledge_items`；term 去重与 document Embedding 均复用现有 Rust 原生 upsert。
+- 单条失败按原版契约计数、保留前 50 条错误，不伪造未写入的记录；需要显式打开 `VIDEOROLL_V2_ALLOW_V1_SUBTITLE_SETTINGS_WRITES`。
+- `cargo check --locked --offline`、141 项 Rust 全量测试、176/217 契约矩阵静态检查均通过。临时 PostgreSQL + Mock Embedding 隔离差分通过（JSON/CSV/SRT 导入、术语去重、跳过无效项及真实原业务表向量持久化）；生产配置及真实模型仍未验证，不能视为全面等价。
