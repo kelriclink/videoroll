@@ -5,19 +5,19 @@
 全部完成状态只允许结合 API 契约、权限、并发、重启、外部副作用与设备测试证据填写。
 
 - 原版声明：217
-- 原生 V1 部分适配：197
-- 无原生 V1 入口：20
+- 原生 V1 部分适配：200
+- 无原生 V1 入口：17
 - 已完成全面验收：0
 - 前端引用文本：193
 
 | Python 子系统 | 原始声明 | Rust V1 部分适配 | 未映射 V1 |
 |---|---:|---:|---:|
-| bilibili_publisher | 10 | 9 | 1 |
+| bilibili_publisher | 10 | 10 | 0 |
 | egress_gateway | 2 | 2 | 0 |
 | orchestrator_api | 132 | 121 | 11 |
 | social_publisher | 9 | 3 | 6 |
-| subtitle_service | 55 | 54 | 1 |
-| youtube_ingest | 9 | 8 | 1 |
+| subtitle_service | 55 | 55 | 0 |
+| youtube_ingest | 9 | 9 | 0 |
 
 ## 完整逐项清单
 
@@ -32,7 +32,7 @@
 | bilibili_publisher | GET | /bilibili/publish/jobs/{job_id} | native_adapter_partial | get_job |
 | bilibili_publisher | GET | /bilibili/publish/settings | native_adapter_partial | get_publish_settings |
 | bilibili_publisher | PUT | /bilibili/publish/settings | native_adapter_partial | put_publish_settings |
-| bilibili_publisher | GET | /health | not_native_v1 | health |
+| bilibili_publisher | GET | /health | native_adapter_partial | health |
 | egress_gateway | POST | /fetch | native_adapter_partial | fetch |
 | egress_gateway | GET | /health | native_adapter_partial | health |
 | orchestrator_api | POST | /auth/login | native_adapter_partial | auth_login |
@@ -176,7 +176,7 @@
 | social_publisher | DELETE | /login-sessions/{session_id} | not_native_v1 | cancel_login_session |
 | social_publisher | GET | /login-sessions/{session_id} | not_native_v1 | get_login_session |
 | social_publisher | POST | /sau/{platform}/publish | not_native_v1 | publish |
-| subtitle_service | GET | /health | not_native_v1 | health |
+| subtitle_service | GET | /health | native_adapter_partial | health |
 | subtitle_service | GET | /subtitle/agent/skills | native_adapter_partial | list_agent_skills_view |
 | subtitle_service | GET | /subtitle/agents/runs | native_adapter_partial | list_agent_runs_view |
 | subtitle_service | GET | /subtitle/agents/runs/{run_id} | native_adapter_partial | get_agent_run_view |
@@ -231,7 +231,7 @@
 | subtitle_service | GET | /subtitle/translate/settings | native_adapter_partial | get_translate_settings_view |
 | subtitle_service | PUT | /subtitle/translate/settings | native_adapter_partial | put_translate_settings_view |
 | subtitle_service | POST | /subtitle/translate/test | native_adapter_partial | translate_test |
-| youtube_ingest | GET | /health | not_native_v1 | health |
+| youtube_ingest | GET | /health | native_adapter_partial | health |
 | youtube_ingest | POST | /youtube/ingest | native_adapter_partial | ingest_single |
 | youtube_ingest | POST | /youtube/scan | native_adapter_partial | scan_source |
 | youtube_ingest | GET | /youtube/sources | native_adapter_partial | list_sources |
