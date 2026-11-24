@@ -43,6 +43,7 @@ cleanup() {
   rm -rf -- "$repo_root/rust/target/v2-smoke-embedding-models" "$repo_root/rust/target/embedding-symlink-target"
   rm -rf -- "$repo_root/rust/target/v2-smoke-dictionaries"
   rm -rf -- "$repo_root/rust/target/v2-smoke-dictionary-fixtures"
+  rm -rf -- "$repo_root/rust/target/v2-smoke-workdir"
 }
 trap cleanup EXIT
 smoke_db_port="${VIDEOROLL_V2_TEST_DB_PORT:-35432}"
@@ -145,6 +146,12 @@ export VIDEOROLL_V2_COMPAT_URL="http://127.0.0.1:18083"
 export VIDEOROLL_V2_SOCIAL_PUBLISHER_URL="http://127.0.0.1:18085"
 export VIDEOROLL_V2_PLAYOUT_ROOT="$repo_root/rust/target/playout-sandbox"
 export VIDEOROLL_V2_YOUDUB_PYTHON="$(command -v python3)"
+# Never inspect or clean the host production WORK_DIR during isolated tests.
+export VIDEOROLL_V2_WORK_DIR="$repo_root/rust/target/v2-smoke-workdir"
+mkdir -p "$VIDEOROLL_V2_WORK_DIR"
+if [[ "${VIDEOROLL_V2_TEST_WORKDIR_ONLY:-false}" == "true" ]]; then
+  export VIDEOROLL_V2_ALLOW_V1_WORKDIR_CLEANUP=true
+fi
 export VIDEOROLL_V2_YOUDUB_BRIDGE="$repo_root/rust/tests/mock_youdub_bridge.py"
 export VIDEOROLL_V2_YOUDUB_RUNTIME="$repo_root/rust/target/mock-youdub-v2"
 mkdir -p "$VIDEOROLL_V2_PLAYOUT_ROOT"
@@ -182,6 +189,12 @@ test "$status" = 401
 hdr=(-H "x-videoroll-v2-internal-token: $VIDEOROLL_V2_INTERNAL_TOKEN" -H 'content-type: application/json')
 # Native old-UI endpoints: YouDub live status, configured Skill registry,
 # and strictly local legacy RenderWorker bootstrap (disposable DB only).
+if [[ "${VIDEOROLL_V2_TEST_WORKDIR_ONLY:-false}" == "true" ]]; then
+  container_name="$container_name" PYTHONPATH="$repo_root/src" /opt/videoroll/venvs/core/bin/python \
+    "$repo_root/rust/tests/maintenance_workdir_v1_isolated.py"
+  echo 'PASS: isolated original workdir read/cleanup contract'
+  exit 0
+fi
 if [[ "${VIDEOROLL_V2_TEST_LEGACY_GAPS_ONLY:-false}" == "true" ]]; then
   PYTHONPATH="$repo_root/src" /opt/videoroll/venvs/core/bin/python \
     "$repo_root/rust/tests/legacy_gap_youdub_skills_local_enroll.py"

@@ -37,3 +37,4 @@ docker_exports/
 # Rust v2 local toolchain and compilation output
 .toolchains/
 rust/target/
+rust/target
