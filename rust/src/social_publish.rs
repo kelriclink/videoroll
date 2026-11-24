@@ -526,6 +526,14 @@ pub async fn reconcile_receipts(db: &Database) -> AppResult<u64> {
     let records = sqlx::query_as::<_, SocialIntent>(&format!(
         "SELECT {PROJECTION} FROM vr2_social_publish_intents
          WHERE state IN ('accepted','unknown') AND sau_job_id IS NOT NULL
+         AND EXISTS (SELECT 1 FROM publish_jobs j WHERE j.id=vr2_social_publish_intents.sau_job_id
+           AND j.task_id=vr2_social_publish_intents.task_id AND j.platform::text=vr2_social_publish_intents.platform
+           AND j.account_id=vr2_social_publish_intents.account_id
+           AND ((j.state::text IN ('submitted','published') AND (NULLIF(j.external_id,'') IS NOT NULL OR NULLIF(j.external_url,'') IS NOT NULL))
+                OR (j.state::text='failed')
+                OR (vr2_social_publish_intents.state='accepted' AND
+                    (j.state::text='unknown' OR (j.state::text='submitted' AND j.response_json->>'runtime'='rust'
+                                                 AND j.response_json->>'receipt_verified'='false')))))
          ORDER BY updated_at LIMIT 100"
     ))
     .fetch_all(&db.pool)
@@ -533,7 +541,7 @@ pub async fn reconcile_receipts(db: &Database) -> AppResult<u64> {
     let mut updated = 0;
     for record in records {
         let job = sqlx::query(
-            "SELECT state::text AS state,external_id,external_url
+            "SELECT state::text AS state,external_id,external_url,response_json
              FROM publish_jobs WHERE id=$1 AND task_id=$2 AND platform::text=$3
                AND account_id=$4",
         )
@@ -545,20 +553,30 @@ pub async fn reconcile_receipts(db: &Database) -> AppResult<u64> {
         .await?;
         let Some(job) = job else { continue };
         let external_state: String = job.get("state");
-        let external_id: Option<String> = job.get("external_id");
-        let external_url: Option<String> = job.get("external_url");
+        let external_id: Option<String> = job
+            .try_get::<Option<String>, _>("external_id")?
+            .filter(|s| !s.trim().is_empty());
+        let external_url: Option<String> = job
+            .try_get::<Option<String>, _>("external_url")?
+            .filter(|s| !s.trim().is_empty());
+        let response: Option<Value> = job.try_get("response_json")?;
+        let unverified_native_submission = response
+            .as_ref()
+            .is_some_and(|r| r["runtime"] == "rust" && r["receipt_verified"] == false);
         let state = match external_state.as_str() {
             "submitted" | "published" if external_id.is_some() || external_url.is_some() => {
                 external_state.as_str()
             }
+            "submitted" if unverified_native_submission => "unknown",
             "failed" => "failed",
             "unknown" => "unknown",
             _ => continue,
         };
         let changed = sqlx::query(
             "UPDATE vr2_social_publish_intents SET state=$2,external_id=$3,
-             external_url=$4,finished_at=now(),updated_at=now()
-             WHERE id=$1 AND state IN ('accepted','unknown')",
+             external_url=$4,finished_at=now(),updated_at=now(),
+             last_error=CASE WHEN $2='unknown' THEN COALESCE(last_error,'SAU platform receipt not independently verified; check platform before retry') ELSE NULL END
+             WHERE id=$1 AND state IN ('accepted','unknown') AND state IS DISTINCT FROM $2",
         )
         .bind(record.id)
         .bind(state)

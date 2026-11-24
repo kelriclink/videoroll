@@ -28,6 +28,7 @@ pub struct SauState {
     pub pool: PgPool,
     pub(crate) publish_outbox_enabled: bool,
     pub(crate) check_enabled: bool,
+    pub(crate) native_publish: Option<Arc<crate::sau_worker_native_v1::PublishConfig>>,
     pub(crate) login_config: Option<Arc<crate::sau_login_native_v1::LoginConfig>>,
     token: String,
 }
@@ -70,12 +71,31 @@ impl SauState {
         } else {
             None
         };
+        let publish_outbox_enabled = std::env::var("VIDEOROLL_V2_SAU_ENABLE_BROWSER_OUTBOX")
+            .ok()
+            .as_deref()
+            == Some("true");
+        let native_publish = if std::env::var("VIDEOROLL_V2_SAU_ENABLE_NATIVE_PUBLISH")
+            .ok()
+            .as_deref()
+            == Some("true")
+        {
+            if !check_enabled || publish_outbox_enabled {
+                return Err(AppError::Invalid(
+                    "native publication requires native runtime and excludes legacy outbox mode"
+                        .into(),
+                ));
+            }
+            Some(Arc::new(
+                crate::sau_worker_native_v1::PublishConfig::from_env()?,
+            ))
+        } else {
+            None
+        };
         Ok(Self {
             pool,
-            publish_outbox_enabled: std::env::var("VIDEOROLL_V2_SAU_ENABLE_BROWSER_OUTBOX")
-                .ok()
-                .as_deref()
-                == Some("true"),
+            publish_outbox_enabled,
+            native_publish,
             check_enabled,
             login_config,
             token: format!("v1.{}", hex::encode(mac.finalize().into_bytes())),

@@ -299,6 +299,11 @@ impl AssetRegistry {
                      WHERE p.task_id=$1 AND p.state<>'published')
               OR EXISTS(SELECT 1 FROM vr2_social_publish_intents s
                         WHERE s.task_id=$1 AND s.state<>'published')
+              OR EXISTS(SELECT 1 FROM publish_jobs j WHERE j.task_id=$1 AND
+                        (j.state::text IN ('submitting','unknown') OR
+                        (j.state::text='submitted' AND j.response_json->>'runtime'='rust'
+                          AND j.response_json->>'receipt_verified'='false'
+                          AND NULLIF(j.external_id,'') IS NULL AND NULLIF(j.external_url,'') IS NULL)))
               OR EXISTS(SELECT 1 FROM dubbing_jobs d WHERE d.task_id=$1 AND
                         (d.status IN ('queued','preparing','synthesizing','aligning',
                                       'mixing','rendering','pause_requested','cancel_requested')

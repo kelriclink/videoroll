@@ -80,6 +80,22 @@ if ! docker exec "$container_name" psql -At -U postgres -d videoroll_test -c 'SE
 fi
 docker exec -i "$container_name" psql -v ON_ERROR_STOP=1 -U postgres -d videoroll_test   < rust/tests/bootstrap_legacy_for_integration.sql >/dev/null
 export DATABASE_URL="postgresql://postgres:videoroll-test-20261121@127.0.0.1:${smoke_db_port}/videoroll_test"
+if [[ "${VIDEOROLL_V2_TEST_SAU_NATIVE_WORKER_ONLY:-false}" == "true" ]]; then
+  export INTERNAL_API_SECRET="isolated-sau-native-worker-secret"
+  export VIDEOROLL_V2_INTERNAL_TOKEN="isolated-sau-worker-internal-token-0123456789"
+  export VIDEOROLL_V2_STORAGE_ROOT="$repo_root/rust/target/v2-sau-worker-isolated-objects"
+  if ss -lntH "( sport = :18192 )" | grep -q .; then echo 'isolated port occupied' >&2;exit 1;fi
+  docker exec -i "$container_name" psql -v ON_ERROR_STOP=1 -U postgres -d videoroll_test <<'SQL'
+CREATE TYPE publish_state AS ENUM ('draft','submitting','submitted','published','unknown','failed');
+ALTER TABLE publish_jobs ALTER COLUMN platform TYPE platform USING platform::platform;
+ALTER TABLE publish_jobs ALTER COLUMN state TYPE publish_state USING state::publish_state;
+SQL
+  "$CARGO_HOME/bin/cargo" build --manifest-path "$repo_root/rust/Cargo.toml" --bin videoroll-sau --bin videoroll-v2 --locked --offline --quiet
+  "$repo_root/rust/target/debug/videoroll-v2" migrate
+  PYTHONPATH="$repo_root/src" /opt/videoroll/venvs/core/bin/python "$repo_root/rust/tests/sau_worker_native_v1_isolated.py"
+  echo 'PASS: native SAU publication worker without Celery or Redis'
+  exit 0
+fi
 if [[ "${VIDEOROLL_V2_TEST_SAU_NATIVE_LOGIN_ONLY:-false}" == "true" ]]; then
   export INTERNAL_API_SECRET="isolated-sau-native-login-test-secret"
   export ADMIN_BOOTSTRAP_SECRET="isolated-sau-ws-bootstrap-secret"
