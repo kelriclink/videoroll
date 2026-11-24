@@ -36,6 +36,31 @@ def prefix_for(node):
     return ""
 
 
+def imported_string_constants(project, module):
+    """Resolve literal string constants from local videoroll imports only."""
+    constants = {}
+    for statement in module.body:
+        if not isinstance(statement, ast.ImportFrom) or not statement.module or not statement.module.startswith("videoroll."):
+            continue
+        imported = project / "src" / (statement.module.replace(".", "/") + ".py")
+        if not imported.is_file():
+            continue
+        try:
+            imported_module = ast.parse(imported.read_text(encoding="utf-8"))
+        except (SyntaxError, UnicodeError):
+            continue
+        assignments = {}
+        for assignment in imported_module.body:
+            if isinstance(assignment, ast.Assign) and isinstance(assignment.value, ast.Constant) and isinstance(assignment.value.value, str):
+                for target in assignment.targets:
+                    if isinstance(target, ast.Name):
+                        assignments[target.id] = assignment.value.value
+        for alias in statement.names:
+            if alias.name in assignments:
+                constants[alias.asname or alias.name] = assignments[alias.name]
+    return constants
+
+
 def route_catalog(project):
     base = project / "src/videoroll/apps"
     routes = []
@@ -47,6 +72,7 @@ def route_catalog(project):
         except (SyntaxError, UnicodeError):
             continue
         prefix = prefix_for(module)
+        constants = imported_string_constants(project, module)
         for node in ast.walk(module):
             if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
@@ -56,6 +82,8 @@ def route_catalog(project):
                 if dec.func.attr not in METHODS:
                     continue
                 path_node = literal(dec.args[0]) if dec.args else None
+                if path_node is None and dec.args and isinstance(dec.args[0], ast.Name):
+                    path_node = constants.get(dec.args[0].id)
                 path = prefix + path_node if isinstance(path_node, str) else None
                 kw = {v.arg: literal(v.value) for v in dec.keywords}
                 response = next((v.value for v in dec.keywords if v.arg == "response_model"), None)

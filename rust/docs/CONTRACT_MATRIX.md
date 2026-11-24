@@ -5,8 +5,8 @@
 全部完成状态只允许结合 API 契约、权限、并发、重启、外部副作用与设备测试证据填写。
 
 - 原版声明：217
-- 原生 V1 部分适配：175
-- 无原生 V1 入口：42
+- 原生 V1 部分适配：176
+- 无原生 V1 入口：41
 - 已完成全面验收：0
 - 前端引用文本：193
 
@@ -16,7 +16,7 @@
 | egress_gateway | 2 | 0 | 2 |
 | orchestrator_api | 132 | 109 | 23 |
 | social_publisher | 9 | 0 | 9 |
-| subtitle_service | 55 | 51 | 4 |
+| subtitle_service | 55 | 52 | 3 |
 | youtube_ingest | 9 | 8 | 1 |
 
 ## 完整逐项清单
@@ -58,6 +58,8 @@
 | orchestrator_api | POST | /operations/alerts/scan | native_adapter_partial | post_alert_scan |
 | orchestrator_api | POST | /operations/alerts/{alert_id}/ack | native_adapter_partial | acknowledge_alert |
 | orchestrator_api | POST | /operations/alerts/{alert_id}/resolve | native_adapter_partial | resolve_alert |
+| orchestrator_api | GET | /remote/auto/youtube | not_native_v1 | remote_auto_youtube_legacy |
+| orchestrator_api | POST | /remote/auto/youtube | not_native_v1 | remote_auto_youtube |
 | orchestrator_api | GET | /render-management/connection | native_adapter_partial | connection |
 | orchestrator_api | PUT | /render-management/connection | native_adapter_partial | update_connection |
 | orchestrator_api | GET | /render-management/enrollments | native_adapter_partial | enrollments |
@@ -165,8 +167,6 @@
 | orchestrator_api | GET | /youtube/{service_path:path} | not_native_v1 | proxy_youtube_browser_operation |
 | orchestrator_api | PATCH | /youtube/{service_path:path} | not_native_v1 | proxy_youtube_browser_operation |
 | orchestrator_api | POST | /youtube/{service_path:path} | not_native_v1 | proxy_youtube_browser_operation |
-| orchestrator_api | GET | None | not_native_v1 | remote_auto_youtube_legacy |
-| orchestrator_api | POST | None | not_native_v1 | remote_auto_youtube |
 | social_publisher | GET | /accounts | not_native_v1 | list_accounts |
 | social_publisher | DELETE | /accounts/{account_id} | not_native_v1 | delete_account |
 | social_publisher | POST | /accounts/{account_id}/check | not_native_v1 | recheck_account |
@@ -206,7 +206,7 @@
 | subtitle_service | GET | /subtitle/hardware/intel | native_adapter_partial | get_intel_hardware_view |
 | subtitle_service | POST | /subtitle/jobs | not_native_v1 | create_job |
 | subtitle_service | GET | /subtitle/jobs/{job_id} | native_adapter_partial | get_job |
-| subtitle_service | POST | /subtitle/knowledge/import | not_native_v1 | import_knowledge_items_view |
+| subtitle_service | POST | /subtitle/knowledge/import | native_adapter_partial | import_knowledge_items_view |
 | subtitle_service | GET | /subtitle/knowledge/items | native_adapter_partial | list_knowledge_items_view |
 | subtitle_service | POST | /subtitle/knowledge/items | native_adapter_partial | upsert_knowledge_item_view |
 | subtitle_service | DELETE | /subtitle/knowledge/items/{item_id} | native_adapter_partial | delete_knowledge_item_view |

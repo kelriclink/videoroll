@@ -120,6 +120,7 @@ const V1_ADAPTERS: &[(&str, &str)] = &[
     ("POST", "/subtitle/dictionaries/promote"),
     ("GET", "/subtitle/knowledge/items"),
     ("POST", "/subtitle/knowledge/items"),
+    ("POST", "/subtitle/knowledge/import"),
     ("POST", "/subtitle/knowledge/rebuild-embeddings"),
     ("DELETE", "/subtitle/knowledge/items/{item_id}"),
     ("GET", "/subtitle/embedding/models"),

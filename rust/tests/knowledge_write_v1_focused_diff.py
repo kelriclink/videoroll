@@ -210,6 +210,55 @@ try:
     native_promoted=rows("V1 Vector-Promotion","embedding-comparison")
     assert comparable(native_promoted)==comparable(original_promoted),(
         original_promoted,native_promoted)
+    # Real multipart upload through the Rust API, with the same live mocked
+    # Embedding transport and original PostgreSQL business table as Python.
+    def import_multipart(filename, content, import_format="auto"):
+        boundary="----videoroll-bulk-knowledge-isolated"
+        data=bytearray()
+        for name,value,part_filename in (
+            ("import_format",import_format,None),
+            ("target_lang","zh",None),
+            ("domain","bulk-fixture",None),
+            ("file",content,filename),
+        ):
+            data.extend(f"--{boundary}\r\n".encode())
+            header=f'Content-Disposition: form-data; name="{name}"'
+            if part_filename is not None:header+=f'; filename="{part_filename}"'
+            data.extend((header+"\r\n\r\n").encode())
+            data.extend(value if isinstance(value,bytes) else value.encode())
+            data.extend(b"\r\n")
+        data.extend(f"--{boundary}--\r\n".encode())
+        req=Request(root+"/subtitle/knowledge/import",method="POST",data=bytes(data),
+            headers={"x-videoroll-v2-internal-token":token,
+                     "Content-Type":f"multipart/form-data; boundary={boundary}"})
+        try:response=urlopen(req,timeout=40)
+        except HTTPError as exc:response=exc
+        with response:return response.status,json.loads(response.read())
+    import_json=json.dumps({"items":[
+        {"term":"RUST_IMPORT_JSON","translation":"知识导入"},
+        {"term":"RUST_IMPORT_SKIPPED","translation":""}
+    ]},ensure_ascii=False).encode()
+    status,imported=import_multipart("knowledge.json",import_json)
+    assert status==200 and imported["format"]=="json" and imported["parsed"]==2,(status,imported)
+    assert (imported["imported"],imported["skipped"],imported["failed"])==(1,1,0),imported
+    original_id=imported["ids"][0]
+    status,again=import_multipart("knowledge.json",import_json)
+    assert status==200 and again["ids"]==[original_id],(status,again)
+    saved=rows("RUST_IMPORT_JSON","bulk-fixture")
+    assert saved and saved["embedding"] and saved["id"]==UUID(original_id),saved
+    status,csv_out=import_multipart("knowledge.csv",b"term,translation,aliases\nRUST_IMPORT_CSV,CSV translation,alias1|alias2\n")
+    assert status==200 and csv_out["format"]=="csv" and csv_out["imported"]==1,(status,csv_out)
+    assert rows("RUST_IMPORT_CSV","bulk-fixture")["aliases"]==["alias1","alias2"]
+    srt=b"1\n00:00:01,000 --> 00:00:02,000\nHello\n\n2\n00:00:02,000 --> 00:00:03,000\nworld\n"
+    status,srt_out=import_multipart("lesson.srt",srt)
+    assert status==200 and srt_out["format"]=="srt" and srt_out["imported"]==1,(status,srt_out)
+    with engine.connect() as db:
+        doc=db.execute(text("""SELECT content,embedding::text,created_by FROM translation_knowledge_items
+           WHERE id=CAST(:id AS uuid)"""),{"id":srt_out["ids"][0]}).one()
+    assert doc[0]=="Hello\nworld" and doc[1] and doc[2]=="bulk:srt",doc
+    status,bad_format=import_multipart("invalid.xml",b"<xml />")
+    assert status==400,(status,bad_format)
+    print("PASS DIFF: native multipart JSON/CSV/SRT import, dedupe, skip and live Embedding persisted in original table")
     print("PASS DIFF: original dictionary promotion now stores the same online Embedding vector, hash and metadata")
     print(f"PASS DIFF: Rust V1 knowledge create/dedupe/doc vector and rebuilding with real loopback OpenAI-compatible embedding ({len(calls)} network requests)")
 finally:

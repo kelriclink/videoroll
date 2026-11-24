@@ -354,6 +354,26 @@
     },
     {
       "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/youtube.py",
+      "line": 103,
+      "method": "GET",
+      "path": "/remote/auto/youtube",
+      "handler": "remote_auto_youtube_legacy",
+      "operation_id": null,
+      "response_model": null
+    },
+    {
+      "service": "orchestrator_api",
+      "file": "src/videoroll/apps/orchestrator_api/routers/youtube.py",
+      "line": 70,
+      "method": "POST",
+      "path": "/remote/auto/youtube",
+      "handler": "remote_auto_youtube",
+      "operation_id": null,
+      "response_model": "AutoYouTubeResponse"
+    },
+    {
+      "service": "orchestrator_api",
       "file": "src/videoroll/apps/orchestrator_api/routers/render_management.py",
       "line": 22,
       "method": "GET",
@@ -1421,26 +1441,6 @@
       "handler": "proxy_youtube_browser_operation",
       "operation_id": "proxy_youtube_browser_post",
       "response_model": null
-    },
-    {
-      "service": "orchestrator_api",
-      "file": "src/videoroll/apps/orchestrator_api/routers/youtube.py",
-      "line": 103,
-      "method": "GET",
-      "path": null,
-      "handler": "remote_auto_youtube_legacy",
-      "operation_id": null,
-      "response_model": null
-    },
-    {
-      "service": "orchestrator_api",
-      "file": "src/videoroll/apps/orchestrator_api/routers/youtube.py",
-      "line": 70,
-      "method": "POST",
-      "path": null,
-      "handler": "remote_auto_youtube",
-      "operation_id": null,
-      "response_model": "AutoYouTubeResponse"
     },
     {
       "service": "social_publisher",
