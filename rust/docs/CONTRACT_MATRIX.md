@@ -5,15 +5,15 @@
 全部完成状态只允许结合 API 契约、权限、并发、重启、外部副作用与设备测试证据填写。
 
 - 原版声明：217
-- 原生 V1 部分适配：189
-- 无原生 V1 入口：28
+- 原生 V1 部分适配：191
+- 无原生 V1 入口：26
 - 已完成全面验收：0
 - 前端引用文本：193
 
 | Python 子系统 | 原始声明 | Rust V1 部分适配 | 未映射 V1 |
 |---|---:|---:|---:|
 | bilibili_publisher | 10 | 9 | 1 |
-| egress_gateway | 2 | 0 | 2 |
+| egress_gateway | 2 | 2 | 0 |
 | orchestrator_api | 132 | 118 | 14 |
 | social_publisher | 9 | 0 | 9 |
 | subtitle_service | 55 | 54 | 1 |
@@ -33,8 +33,8 @@
 | bilibili_publisher | GET | /bilibili/publish/settings | native_adapter_partial | get_publish_settings |
 | bilibili_publisher | PUT | /bilibili/publish/settings | native_adapter_partial | put_publish_settings |
 | bilibili_publisher | GET | /health | not_native_v1 | health |
-| egress_gateway | POST | /fetch | not_native_v1 | fetch |
-| egress_gateway | GET | /health | not_native_v1 | health |
+| egress_gateway | POST | /fetch | native_adapter_partial | fetch |
+| egress_gateway | GET | /health | native_adapter_partial | health |
 | orchestrator_api | POST | /auth/login | native_adapter_partial | auth_login |
 | orchestrator_api | POST | /auth/logout | native_adapter_partial | auth_logout |
 | orchestrator_api | POST | /auth/setup | native_adapter_partial | auth_setup |

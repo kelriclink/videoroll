@@ -12,10 +12,14 @@ path = "src/lib.rs"
 name = "videoroll-v2"
 path = "src/main.rs"
 
+[features]
+egress-test-loopback = []
+
 [dependencies]
 anyhow = "1"
 base64 = "0.22"
 hmac = "0.12"
+ipnet = "2"
 pbkdf2 = "0.12"
 axum = { version = "0.8", features = ["macros", "json", "multipart", "ws"] }
 chrono = { version = "0.4", features = ["serde"] }

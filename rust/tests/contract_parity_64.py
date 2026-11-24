@@ -37,8 +37,14 @@ if args.base not in ("http://127.0.0.1:18080", "http://127.0.0.1:18180") or (
 token = os.environ["VIDEOROLL_V2_INTERNAL_TOKEN"]
 root = Path(__file__).resolve().parents[1]
 matrix = json.loads((root/"docs/CONTRACT_MATRIX.json").read_text())
-mapped = [r for r in matrix["routes"] if r["v1_status"]!="not_native_v1"]
-assert len(mapped) == matrix["native_v1_partial"], "Route count and parity matrix disagree"
+# A standalone gateway has a different port, service HMAC and security boundary.
+# Never probe /api/v1/{path} and mistake its unrelated 404 or health response
+# for evidence about the dedicated Egress Gateway.
+standalone = [r for r in matrix["routes"] if r["service"]=="egress_gateway"
+              and r["v1_status"]!="not_native_v1"]
+mapped = [r for r in matrix["routes"] if r["v1_status"]!="not_native_v1"
+          and r["service"]!="egress_gateway"]
+assert len(mapped)+len(standalone) == matrix["native_v1_partial"], "Route count and parity matrix disagree"
 jar = http.cookiejar.CookieJar()
 opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
 anonymous = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
@@ -431,7 +437,8 @@ for row in ordered:
     results.append(record)
 
 assert {(r["method"],r["path"]) for r in results} == {(r["method"],r["path"]) for r in mapped}
-summary={"probed":len(results),
+summary={"standalone_egress_routes":len(standalone),
+         "probed":len(results),
          "positive":sum(r["probe"]=="positive" for r in results),
          "rejection_only":sum(r["probe"]=="rejection" for r in results),
          "failed":sum(bool(r["probe"]=="failed" or r.get("issue") in ("server_failure_or_unexpected_auth", "public_health_or_auth_status_incompatible", "unauthenticated_request_not_rejected")) for r in results),
@@ -448,6 +455,7 @@ lines=[f"# VideoRoll Rust V1 部分适配 API：{len(mapped)} 条逐接口探测
        "",
        f"测试日期：{report['timestamp_utc']}。",
        "环境：隔离 PostgreSQL + 本地模拟平台，不使用生产账号、生产数据库或真实投稿。",
+       f"独立 Egress Gateway 另有 {len(standalone)} 条接口，需运行专项 HTTP/SSRF 套件；不计入本 API 探测。",
        "注意：HTTP 请求得到响应不代表与 Python 完全等价；仅拒绝路径不代表正向业务通过。",
        "隔离探测不能替代 Python/Rust 双端业务差分验收。",
        "",
@@ -462,7 +470,14 @@ lines += ["","## 验收边界",
           "- 正向请求仅验证返回状态/基础 JSON 结构；未完成 Python 生产响应字段、错误码、状态迁移的逐项差分。",
           "- 字幕、配音、B 站双 P、SAU 和真实 GPU 的生产级外部副作用仍需专门的受控验收。",
           "- 不对生产账号执行真实投稿、删改或会话操作。"]
-(root/"docs/CONTRACT_PARITY_64_20261122.md").write_text("\n".join(lines)+"\n")
+# Preserve independently reviewed compatibility notes appended after the
+# generated probe results; an isolated smoke test must not silently erase
+# an earlier migration's documented limitations.
+report_path=root/"docs/CONTRACT_PARITY_64_20261122.md"
+historical="\n## 2026-11-24：Remote YouTube 公网 Bearer 接口\n"
+existing=report_path.read_text() if report_path.exists() else ""
+appendix=existing[existing.index(historical):] if historical in existing else ""
+report_path.write_text("\n".join(lines)+"\n"+appendix)
 print("contract_probe_summary="+json.dumps(summary,ensure_ascii=False))
 for r in results:
     if r.get("issue"):

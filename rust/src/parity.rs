@@ -11,6 +11,10 @@ const FRONTEND_JSON: &str = include_str!("../docs/FRONTEND_API_REFERENCES.json")
 
 /// Verified native handler exists, but full original business equivalence
 /// remains pending (title fallback, historical assets, manual triggers, etc).
+// Dedicated legacy service, NOT mounted under the administrative /api/v1
+// router. Its own binary exposes these exact original endpoints.
+#[allow(dead_code)]
+const STANDALONE_EGRESS_ADAPTERS: &[(&str, &str)] = &[("GET", "/health"), ("POST", "/fetch")];
 const V1_ADAPTERS: &[(&str, &str)] = &[
     ("GET", "/health"),
     // Original Bilibili standalone settings now served natively at the

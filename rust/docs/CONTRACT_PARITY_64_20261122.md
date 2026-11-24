@@ -1,7 +1,8 @@
 # VideoRoll Rust V1 部分适配 API：189 条逐接口探测
 
-测试日期：2026-11-24T07:14:56.552127+00:00。
+测试日期：2026-11-24T07:28:18.090530+00:00。
 环境：隔离 PostgreSQL + 本地模拟平台，不使用生产账号、生产数据库或真实投稿。
+独立 Egress Gateway 另有 2 条接口，需运行专项 HTTP/SSRF 套件；不计入本 API 探测。
 注意：HTTP 请求得到响应不代表与 Python 完全等价；仅拒绝路径不代表正向业务通过。
 隔离探测不能替代 Python/Rust 双端业务差分验收。
 
@@ -216,3 +217,15 @@
 - 隔离测试涵盖原 PBKDF2、Python 同表已完成结果、并发抢占、重放、Token
   轮换、限流和无权用户无 JSON 时先拒绝，详见 REMOTE_AUTO_YOUTUBE_V1.md。
 - 不具备独立 IP 维度 Redis 限流和实际平台生产等价；接口仅算部分适配。
+
+
+## 2026-11-24：独立 Egress Gateway
+
+- Rust standalone videoroll-egress 暴露原 GET /health、POST /fetch；
+  原内部 HMAC 服务令牌和主要 JSON 请求/响应结构兼容。
+- DNS 全部地址公网检验、连接 IP 固定与证书/SNI、每个 30x 重定向
+  重新检查、拒绝私网/IMDS/二进制响应及请求头敏感字段。
+- 非默认 Cargo 测试模式模拟 127.0.0.1:18098；正式普通构建即便
+  设置相同环境变量仍拒绝私网/本机 URL。
+- Gateway 两条接口作为独立服务登记，不进入主 API 的 189 条隔离探测。
+  具体测试与未验收边界见 EGRESS_GATEWAY_NATIVE_V1.md。

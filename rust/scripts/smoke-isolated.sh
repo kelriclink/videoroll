@@ -12,6 +12,14 @@ elif [[ -x "$repo_root/.toolchains/cargo/bin/cargo" ]]; then
 else
   export CARGO_HOME="$HOME/.cargo"
 fi
+if [[ "${VIDEOROLL_V2_TEST_EGRESS_ONLY:-false}" == "true" ]]; then
+  export VIDEOROLL_V2_TEST_EGRESS_LOOPBACK="true"
+  export VIDEOROLL_V2_TEST_EGRESS_DB="disposable"
+  "$CARGO_HOME/bin/cargo" build --manifest-path "$repo_root/rust/Cargo.toml" --bin videoroll-egress --features egress-test-loopback --locked --offline --quiet
+  PYTHONPATH="$repo_root/src" python3 "$repo_root/rust/tests/egress_gateway_v1_isolated.py"
+  echo "PASS: standalone Egress Gateway dedicated HMAC service and SSRF defense"
+  exit 0
+fi
 container_name="vr2-smoke-$$"
 api_pid=""
 worker_pid=""
