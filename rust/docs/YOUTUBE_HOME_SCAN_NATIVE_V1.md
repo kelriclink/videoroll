@@ -15,3 +15,9 @@
 验证：隔离 PostgreSQL、真正 Rust HTTP API 与本地 Innertube 模拟服务，覆盖动态 sw.js_data API key/clientVersion、Cookie 配置、原 Python 锁冲突、两页推荐、长视频/Shorts/未知时长、历史 ingested_videos 去重、重复执行、原任务来源归属和上游 503 后释放租约及统计错误。
 
 未验证或未实现：自动周期调度 home_scan_enabled、真实登录 YouTube 的推荐流版本差异、IP/代理封锁与生产级整条媒体处理链。由于 UI/平台版本不断变化，接口仅计入部分映射，不能计为完整 Python 业务等价。未进行真实网页抓取和生产排队。
+
+### 2026-11-24 周期调度追加
+
+videoroll-v2 worker 现已实现原 home_scan_enabled 周期触发，详见
+YOUTUBE_HOME_PERIODIC_V1.md。该文档前述的“尚未实现自动周期调度”
+已由本轮补齐，真实平台和生产全流程验收仍然未完成。

@@ -95,17 +95,14 @@ impl Scheduler {
             origin.to_string()
         };
         let canonical_url = format!("https://www.youtube.com/watch?v={video_id}");
+        // Original Task columns are distinct: origin_kind has a 32-char
+        // enum-like value; created_by can contain the original metadata.
+        // Both must be committed atomically with the durable workflow.
         sqlx::query(
-            "INSERT INTO tasks(id,source_type,source_url,source_license,status,priority,origin_kind,origin_run_id,restart_generation,created_by) VALUES($1,'youtube'::source_type,$2,$3::source_license,'created'::task_status,$4,$6,$5,0,$6)"
+            "INSERT INTO tasks(id,source_type,source_url,source_license,status,priority,origin_kind,origin_run_id,restart_generation,created_by) VALUES($1,'youtube'::source_type,$2,$3::source_license,'created'::task_status,$4,$6,$5,0,$7)"
         ).bind(task_id).bind(canonical_url).bind(license).bind(priority.clamp(-100,100))
-            .bind(run_id).bind(created_by)
+            .bind(run_id).bind(origin).bind(created_by)
             .execute(&mut *tx).await?;
-        if home_scan {
-            sqlx::query("UPDATE tasks SET origin_kind='youtube_home_scan' WHERE id=$1")
-                .bind(task_id)
-                .execute(&mut *tx)
-                .await?;
-        }
         let inserted=sqlx::query(
             "INSERT INTO ingested_videos(id,platform,source_id,task_id) VALUES($1,'youtube',$2,$3) ON CONFLICT(platform,source_id) DO NOTHING"
         ).bind(Uuid::new_v4()).bind(&video_id).bind(task_id).execute(&mut *tx).await?;
