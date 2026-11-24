@@ -271,6 +271,13 @@ async fn execution_change(
 ) -> AppResult<Json<Value>> {
     can_write()?;
     let mut tx = state.db.pool.begin().await?;
+    let task_id:Uuid=sqlx::query_scalar("SELECT j.task_id FROM render_executions e JOIN render_jobs j ON j.id=e.render_job_id WHERE e.id=$1 AND e.runtime_engine='python'")
+        .bind(id).fetch_optional(&mut *tx).await?.ok_or_else(||AppError::NotFound("render execution not found".into()))?;
+    let task_owner: String =
+        sqlx::query_scalar("SELECT runtime_owner FROM tasks WHERE id=$1 FOR UPDATE")
+            .bind(task_id)
+            .fetch_one(&mut *tx)
+            .await?;
     let execution = sqlx::query(
         "SELECT * FROM render_executions WHERE id=$1 AND runtime_engine='python' FOR UPDATE",
     )
@@ -337,6 +344,12 @@ async fn execution_change(
     };
 
     if requeue {
+        // A Rust-owned historical render has no native execution lease.
+        // Requeueing this legacy row would require the retired Python
+        // consumer. Use a new native workflow generation instead.
+        if task_owner == "rust" {
+            return Err(AppError::Conflict("historical render cannot be requeued by Rust; restart the native render or dubbing stage".into()));
+        }
         let status: String = job.try_get("status")?;
         if state_before == "canceled" && status == "queued" {
             tx.commit().await?;
@@ -409,7 +422,7 @@ async fn execution_change(
         // Cancellation must publish a durable failure notification for an
         // in-flight P2 dubbing job. Locking the DubbingJob above prevents another
         // cancel/callback from creating an inconsistent second outcome.
-        if !requeue && active(&state_before) {
+        if !requeue && active(&state_before) && lease_owner.as_deref() == Some(owner.as_str()) {
             if let Some(row) = &dubbing {
                 let status: String = row.try_get("status")?;
                 if status == "rendering" {
@@ -424,29 +437,28 @@ async fn execution_change(
                     .bind(dub_id)
                     .execute(&mut *tx)
                     .await?;
-                    let key = format!("workflow-dubbing-finished:{dub_id}:failed");
-                    let old: Option<Uuid> = sqlx::query_scalar(
-                        "SELECT id FROM outbox_events WHERE operation_key=$1
-                     ORDER BY created_at DESC LIMIT 1 FOR UPDATE",
-                    )
-                    .bind(&key)
-                    .fetch_optional(&mut *tx)
-                    .await?;
-                    if old.is_none() {
-                        sqlx::query(
-                            "INSERT INTO outbox_events(id,event_type,aggregate_type,
-                        aggregate_id,task_name,args_json,operation_key,status)
-                        VALUES($1,'workflow.dubbing.finished','dubbing_job',$2,
-                        'subtitle_service.push_dubbing_workflow_event',$3,$4,'pending')",
-                        )
-                        .bind(Uuid::new_v4())
-                        .bind(dub_id.to_string())
-                        .bind(json!({"args":[dub_id.to_string(),"failed",message],
-                          "queue":"subtitle-control"}))
-                        .bind(key)
-                        .execute(&mut *tx)
-                        .await?;
+                    if row.try_get::<Uuid, _>("task_id")? != task_id
+                        || row
+                            .try_get::<Value, _>("output_json")?
+                            .get("render_job_id")
+                            .and_then(Value::as_str)
+                            != Some(job_id.to_string().as_str())
+                    {
+                        return Err(AppError::Conflict(
+                            "P2 render does not own dubbing job".into(),
+                        ));
                     }
+                    // Legacy Hatchet runs cannot be completed by a fabricated
+                    // native notification. Require an audited ownership cutover.
+                    let old_flow:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pipeline_runs WHERE task_id=$1 AND engine<>'rust-v2' AND state NOT IN ('succeeded','failed','canceled','completed'))")
+                        .bind(task_id).fetch_one(&mut *tx).await?;
+                    if task_owner != "rust" || old_flow {
+                        return Err(AppError::Conflict("P2 render belongs to historical Python workflow; drain or migrate ownership before Rust cancellation".into()));
+                    }
+                    crate::render_events::record_p2_failure(
+                        &mut tx, task_id, dub_id, job_id, id, &message,
+                    )
+                    .await?;
                 }
             }
         }

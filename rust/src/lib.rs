@@ -54,6 +54,7 @@ pub mod remote_api_settings_v1;
 pub mod remote_auto_youtube_v1;
 pub mod remote_render;
 pub mod render_management_control_v1;
+pub mod render_events;
 pub mod render_management_read_v1;
 pub mod render_worker_wire_v1;
 pub mod sau_account_native_v1;

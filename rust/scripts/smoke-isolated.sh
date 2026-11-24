@@ -80,6 +80,16 @@ if ! docker exec "$container_name" psql -At -U postgres -d videoroll_test -c 'SE
 fi
 docker exec -i "$container_name" psql -v ON_ERROR_STOP=1 -U postgres -d videoroll_test   < rust/tests/bootstrap_legacy_for_integration.sql >/dev/null
 export DATABASE_URL="postgresql://postgres:videoroll-test-20261121@127.0.0.1:${smoke_db_port}/videoroll_test"
+if [[ "${VIDEOROLL_V2_TEST_RENDER_EVENTS_ONLY:-false}" == "true" ]]; then
+  export VIDEOROLL_V2_INTERNAL_TOKEN="isolated-native-render-events-token-0123456789"
+  export VIDEOROLL_V2_STORAGE_ROOT="$(mktemp -d "$repo_root/rust/target/v2-render-events-objects.XXXXXX")"
+  if ss -lntH "( sport = :18194 )" | grep -q .; then echo 'isolated port occupied' >&2;exit 1;fi
+  "$CARGO_HOME/bin/cargo" build --manifest-path "$repo_root/rust/Cargo.toml" --bin videoroll-v2 --locked --offline --quiet
+  "$repo_root/rust/target/debug/videoroll-v2" migrate
+  PYTHONPATH="$repo_root/src" /opt/videoroll/venvs/core/bin/python "$repo_root/rust/tests/render_events_isolated.py"
+  echo 'PASS: native render control events and committed receipt recovery'
+  exit 0
+fi
 if [[ "${VIDEOROLL_V2_TEST_PUBLISH_BATCH_EVENTS_ONLY:-false}" == "true" ]]; then
   export VIDEOROLL_V2_INTERNAL_TOKEN="isolated-native-batch-internal-token-0123456789"
   export VIDEOROLL_V2_STORAGE_ROOT="$(mktemp -d "$repo_root/rust/target/v2-publish-batch-objects.XXXXXX")"
