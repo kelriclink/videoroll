@@ -152,6 +152,9 @@ mkdir -p "$VIDEOROLL_V2_WORK_DIR"
 if [[ "${VIDEOROLL_V2_TEST_WORKDIR_ONLY:-false}" == "true" ]]; then
   export VIDEOROLL_V2_ALLOW_V1_WORKDIR_CLEANUP=true
 fi
+if [[ "${VIDEOROLL_V2_TEST_TERMINAL_ONLY:-false}" == "true" ]]; then
+  export VIDEOROLL_V2_ALLOW_V1_TERMINAL_CLEANUP=true
+fi
 export VIDEOROLL_V2_YOUDUB_BRIDGE="$repo_root/rust/tests/mock_youdub_bridge.py"
 export VIDEOROLL_V2_YOUDUB_RUNTIME="$repo_root/rust/target/mock-youdub-v2"
 mkdir -p "$VIDEOROLL_V2_PLAYOUT_ROOT"
@@ -189,6 +192,12 @@ test "$status" = 401
 hdr=(-H "x-videoroll-v2-internal-token: $VIDEOROLL_V2_INTERNAL_TOKEN" -H 'content-type: application/json')
 # Native old-UI endpoints: YouDub live status, configured Skill registry,
 # and strictly local legacy RenderWorker bootstrap (disposable DB only).
+if [[ "${VIDEOROLL_V2_TEST_TERMINAL_ONLY:-false}" == "true" ]]; then
+  container_name="$container_name" PYTHONPATH="$repo_root/src" /opt/videoroll/venvs/core/bin/python \
+    "$repo_root/rust/tests/maintenance_terminal_storage_v1_isolated.py"
+  echo 'PASS: original terminal storage cleanup matches safe V1 behavior'
+  exit 0
+fi
 if [[ "${VIDEOROLL_V2_TEST_WORKDIR_ONLY:-false}" == "true" ]]; then
   container_name="$container_name" PYTHONPATH="$repo_root/src" /opt/videoroll/venvs/core/bin/python \
     "$repo_root/rust/tests/maintenance_workdir_v1_isolated.py"

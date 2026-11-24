@@ -44,6 +44,7 @@ const V1_ADAPTERS: &[(&str, &str)] = &[
     ("GET", "/system/resources"),
     ("GET", "/maintenance/workdir"),
     ("POST", "/maintenance/workdir/cleanup"),
+    ("POST", "/maintenance/storage/cleanup-terminal"),
     ("GET", "/settings/storage"),
     ("PUT", "/settings/storage"),
     ("GET", "/operations/ai-usage"),
