@@ -40,6 +40,8 @@ def call(path, body=None, auth=token):
         return response.status, content
 def spawn(enable):
     env=os.environ.copy()
+    env["VIDEOROLL_V2_SAU_ENABLE_NATIVE_LOGIN"]="false"
+    env["VIDEOROLL_V2_SAU_ENABLE_NATIVE_CHECK"]="false"
     env.update(VIDEOROLL_V2_SAU_BIND="127.0.0.1:18188",VIDEOROLL_V2_SAU_ENABLE_BROWSER_OUTBOX=str(enable).lower())
     proc=subprocess.Popen([str(exe)],env=env)
     for _ in range(80):

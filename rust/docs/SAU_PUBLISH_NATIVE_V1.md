@@ -9,7 +9,7 @@
 - 使用任务、账号行锁与原 operation_key，投稿记录、待投递事件及非批次任务状态同一事务提交。既有 Outbox 事件不重置或重复创建。
 - 保留既有 submitting/unknown/submitted/published 回执；成功回执可以复制给新批次而不再发布。未知回执禁止 force_retry；其他批次已有未决回执时拒绝新投稿。
 - 仅当既有 submitting 记录无开始时间、无租约时才补齐缺失的投递记录；独立 Worker 的实际外部执行及调度恢复仍需生产级测试。
-- 原版 API 适配矩阵 212/217；此为部分适配，仍有五条独立 SAU 账号及登录会话接口未迁移。
+- 本模块最初完成时矩阵为 212/217；当前独立 SAU 账号与登录 API 已补齐，仍为部分适配，真实执行链需独立验收。
 
 隔离验收命令（临时 DB、无真实投稿）：
 VIDEOROLL_V2_TEST_SAU_NATIVE_PUBLISH_ONLY=true bash rust/scripts/smoke-isolated.sh

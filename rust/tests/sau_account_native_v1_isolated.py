@@ -51,6 +51,8 @@ def call(path="/accounts",method="GET",authorization=token):
 
 def spawn(overrides=None):
     env=os.environ.copy()
+    env["VIDEOROLL_V2_SAU_ENABLE_NATIVE_LOGIN"]="false"
+    env["VIDEOROLL_V2_SAU_ENABLE_NATIVE_CHECK"]="false"
     env["VIDEOROLL_V2_SAU_BIND"]="127.0.0.1:18187"
     env.update(overrides or {})
     return subprocess.Popen([str(exe)],env=env,stdout=subprocess.DEVNULL,

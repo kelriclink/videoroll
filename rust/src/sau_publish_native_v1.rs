@@ -256,6 +256,7 @@ pub(crate) async fn publish(
         ));
     }
     let name: String = account.try_get("name")?;
+    crate::sau_login_native_v1::ensure_not_logging_in(&mut tx, p, &name).await?;
     // First find an exact batch receipt (or latest active receipt for the
     // original non-batch request), then examine all other batches for safety.
     let prior = sqlx::query(
