@@ -22,7 +22,11 @@ with engine.begin() as db:
     config={'cookie_enc':'dbplain:v1:SESSDATA=video-roll-test; bili_jct=1234567890123456'}
     for key,body in [('bilibili.auth',config),
                      ('publish.review.settings',{'enabled':False,'blocked_words':[],'ai_rules':''}),
-                     ('publish.platforms',{'bilibili':True})]:
+                     ('publish.platforms',{'bilibili':True}),
+                     ('subtitle.auto_profile',{'translate_provider':'openai'}),
+                     ('subtitle.translate',{'default_provider':'openai','openai':{
+                         'model':'mock-bilibili-ai-summary','base_url':'http://127.0.0.1:18199/v1',
+                         'timeout_seconds':15}})]:
         db.execute(text('INSERT INTO app_settings(key,value_json,version) VALUES(:key,CAST(:value AS jsonb),1) ON CONFLICT(key) DO UPDATE SET value_json=EXCLUDED.value_json'),
             {'key':key,'value':json.dumps(body)})
 def fixture(title):
@@ -61,9 +65,9 @@ with engine.begin() as db:
         {'asset':str(uuid4()),'task':str(task),'key':cover_key})
 payload['cover']={'type':'storage','key':cover_key}
 for alt in [dict(payload,force_retry=True),dict(payload,account_id=str(uuid4())),
-            dict(payload,batch_id=str(uuid4())),dict(payload,typeid_mode='ai_summary')]:
+            dict(payload,batch_id=str(uuid4())),dict(payload,typeid_mode='invalid_mode')]:
     code,_=api('/bilibili/publish',alt)
-    assert code==409,code
+    assert code in (400,409),code
 code,receipt=api('/bilibili/publish',payload)
 assert code==200 and receipt['state']=='submitting',(code,receipt)
 job=receipt['job_id']
@@ -158,6 +162,104 @@ assert code==200 and two_result['state']=='published' and two_result['job_id']==
 counts=counters()
 assert counts['submit']==3 and counts['complete']==4 and counts['predict']==1,counts
 print('PASS: atomic P1/P2 original request requires matching succeeded YouDub receipt, verifies original asset ownership, and submits exactly two ordered Bilibili parts once')
+
+# Use the independently implemented original Python `/archive/type/recommend`
+# logic from inside the direct Rust Publisher. The task summary must beat
+# caller title/description; a hallucinated type ID must never reach archive.
+ai_task,ai_payload=fixture('ai-summary')
+ai_payload['typeid_mode']='ai_summary'
+with engine.begin() as db:
+    db.execute(text("INSERT INTO app_settings(key,value_json,version) VALUES(:key,CAST(:value AS jsonb),1)"),
+        {'key':'bilibili.tags.'+str(ai_task),'value':json.dumps({'summary':'unique-summarized-ai-source'})})
+code,ai_job=api('/bilibili/publish',ai_payload)
+assert code==200 and ai_job['state']=='submitting',(code,ai_job)
+process(ai_task,'published')
+code,ai_result=api('/bilibili/publish',ai_payload)
+assert code==200 and ai_result['state']=='published',(code,ai_result)
+counts=counters()
+assert counts['ai']==1 and counts['type_catalog']==1 and counts['submit']==4 and counts['predict']==1,counts
+print('PASS: direct ai_summary reuses saved task summary, native translation model and official partition leaf whitelist')
+
+bad_task,bad_payload=fixture('ai-invalid')
+bad_payload['typeid_mode']='ai_summary'
+code,bad_job=api('/bilibili/publish',bad_payload)
+assert code==200 and bad_job['state']=='submitting',(code,bad_job)
+process(bad_task,'published')
+counts=counters()
+assert counts['ai']==2 and counts['ai_invalid']==1 and counts['type_catalog']==2 and counts['predict']==2 and counts['submit']==5,counts
+print('PASS: invalid AI partition ID is rejected and original Python fallback predicts a valid Bilibili type')
+
+# Original Python publish_batches can be used directly for a single Bilibili
+# target. Multi-platform batches remain fail-closed until their reconciliation
+# is native, and a batch cannot claim an asset or target of another task.
+def make_batch(task,targets):
+    identity=uuid4()
+    with engine.begin() as db:
+        db.execute(text("""INSERT INTO publish_batches(id,task_id,state,expected_targets)
+            VALUES(CAST(:batch AS uuid),CAST(:task AS uuid),'active',CAST(:expected AS jsonb))"""),
+            {'batch':str(identity),'task':str(task),'expected':json.dumps(targets)})
+    return identity
+
+single=[{'key':'bilibili:default','platform':'bilibili','account_id':None}]
+foreign_task,foreign_payload=fixture('batch-only')
+foreign_batch=make_batch(foreign_task,single)
+unrelated_task,unrelated_payload=fixture('batch-only')
+code,not_own=api('/bilibili/publish',dict(unrelated_payload,batch_id=str(foreign_batch)))
+assert code==400,(code,not_own)
+invalid_target_task,invalid_target=fixture('batch-only')
+wrong_batch=make_batch(invalid_target_task,[{'key':'douyin:default','platform':'douyin'}])
+code,wrong_target=api('/bilibili/publish',dict(invalid_target,batch_id=str(wrong_batch)))
+assert code==400,(code,wrong_target)
+multi_task,multi_payload=fixture('batch-only')
+multi_batch=make_batch(multi_task,single+[{'key':'douyin:default','platform':'douyin'}])
+code,multi_result=api('/bilibili/publish',dict(multi_payload,batch_id=str(multi_batch)))
+assert code==409,(code,multi_result)
+with engine.connect() as db:
+    for check_task in [unrelated_task,invalid_target_task,multi_task]:
+        assert db.execute(text('SELECT count(*) FROM publish_jobs WHERE task_id=CAST(:task AS uuid)'),{'task':str(check_task)}).scalar_one()==0
+
+batch_task,batch_payload=fixture('batch-only')
+batch_id=make_batch(batch_task,single)
+batch_payload['batch_id']=str(batch_id)
+code,batch_receipt=api('/bilibili/publish',batch_payload)
+assert code==200 and batch_receipt['state']=='submitting',(code,batch_receipt)
+with engine.connect() as db:
+    owned=db.execute(text('SELECT batch_id FROM publish_jobs WHERE id=CAST(:id AS uuid)'),{'id':batch_receipt['job_id']}).scalar_one()
+    assert str(owned)==str(batch_id),owned
+process(batch_task,'published')
+code,batch_result=api('/bilibili/publish',batch_payload)
+assert code==200 and batch_result['job_id']==batch_receipt['job_id'] and batch_result['state']=='published',(code,batch_result)
+with engine.connect() as db:
+    batch_row=db.execute(text('SELECT state,finished_at FROM publish_batches WHERE id=CAST(:batch AS uuid)'),{'batch':str(batch_id)}).one()
+    assert batch_row.state=='succeeded' and batch_row.finished_at is not None,batch_row
+    assert db.execute(text('SELECT status::text FROM tasks WHERE id=CAST(:task AS uuid)'),{'task':str(batch_task)}).scalar_one()=='published'
+counts=counters()
+assert counts['submit']==6,counts
+print('PASS: original single-target Bilibili publish batch is task- and target-scoped and settled atomically with Python publish_jobs')
+# A later batch does not rewrite the previous confirmed job or invalidate an
+# idempotent replay under the original batch ID.
+new_batch_id=make_batch(batch_task,single)
+code,original_again=api('/bilibili/publish',batch_payload)
+assert code==200 and original_again==batch_result,(code,original_again)
+code,conflicting_reuse=api('/bilibili/publish',dict(batch_payload,batch_id=str(new_batch_id)))
+assert code==409,(code,conflicting_reuse)
+print('PASS: an old confirmed Bilibili batch stays idempotent even when a new batch is registered; cross-batch receipt reassignment is denied')
+
+bad_batch_task,bad_batch_payload=fixture('batch-unknown')
+unknown_batch=make_batch(bad_batch_task,single)
+bad_batch_payload['batch_id']=str(unknown_batch)
+code,bad_receipt=api('/bilibili/publish',bad_batch_payload)
+assert code==200 and bad_receipt['state']=='submitting',(code,bad_receipt)
+process(bad_batch_task,'unknown')
+code,bad_final=api('/bilibili/publish',bad_batch_payload)
+assert code==200 and bad_final['state']=='unknown' and bad_final['job_id']==bad_receipt['job_id'],(code,bad_final)
+with engine.connect() as db:
+    assert db.execute(text('SELECT state FROM publish_batches WHERE id=CAST(:batch AS uuid)'),{'batch':str(unknown_batch)}).scalar_one()=='failed'
+    status=db.execute(text('SELECT status::text,error_code FROM tasks WHERE id=CAST(:task AS uuid)'),{'task':str(bad_batch_task)}).one()
+    assert status.status=='failed' and status.error_code=='PUBLISH_OUTCOME_UNKNOWN',status
+counts=counters()
+assert counts['submit']==7 and counts['ambiguous_submit']==2,counts
+print('PASS: unknown Bilibili single-target batch quarantines original batch state, original job and task without resubmission')
 
 # Restarting a disconnected Rust process must not replay a Bilibili archive
 # whose external side effect could already have succeeded.

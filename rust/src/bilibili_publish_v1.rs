@@ -193,18 +193,18 @@ async fn create(
     if body.account_id.is_some() {
         return Err(AppError::Conflict("account_id requires a matching account-specific Bilibili Cookie; not implemented in Rust yet".into()));
     }
-    if body.batch_id.is_some() {
-        return Err(AppError::Conflict(
-            "multi-target Bilibili batch reconciliation is not yet available in native Rust".into(),
-        ));
-    }
     if body.force_retry {
         return Err(AppError::Conflict(
             "force_retry risks duplicate external archives; reconcile before retry".into(),
         ));
     }
-    if !matches!(body.typeid_mode.as_str(), "meta" | "bilibili_predict") {
-        return Err(AppError::Conflict("AI summary classification for direct publication is not yet available; specify meta or bilibili_predict".into()));
+    if !matches!(
+        body.typeid_mode.as_str(),
+        "meta" | "bilibili_predict" | "ai_summary"
+    ) {
+        return Err(AppError::Conflict(
+            "unsupported Bilibili typeid_mode".into(),
+        ));
     }
     let meta = normalize_meta(&body.meta)?;
     let parts = check_parts(&body)?;
@@ -247,11 +247,49 @@ async fn create(
             "Bilibili publication requires a licensed source".into(),
         ));
     }
+    // Start with the original Batch entity, under the parent Task row lock.
+    // A single Bilibili target can be settled atomically with the original
+    // publish_jobs receipt. Multiple targets need independent platform
+    // correlation and task-level aggregation; fail closed until that exists.
+    let mut batch_is_active = true;
+    if let Some(batch_id) = body.batch_id {
+        let batch = sqlx::query(
+            "SELECT task_id,state,expected_targets FROM publish_batches
+             WHERE id=$1 FOR UPDATE",
+        )
+        .bind(batch_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| AppError::Invalid("publish batch does not exist".into()))?;
+        if batch.try_get::<Uuid, _>("task_id")? != body.task_id {
+            return Err(AppError::Invalid(
+                "publish batch does not belong to this task".into(),
+            ));
+        }
+        batch_is_active = batch.try_get::<String, _>("state")? == "active";
+        let targets: Value = batch.try_get("expected_targets")?;
+        let expected = targets
+            .as_array()
+            .ok_or_else(|| AppError::Invalid("invalid publish batch target list".into()))?;
+        if expected.len() != 1 {
+            return Err(AppError::Conflict("Rust direct Bilibili publishing currently requires an isolated single-target batch".into()));
+        }
+        let target = &expected[0];
+        let key = target.get("key").and_then(Value::as_str).unwrap_or("");
+        if target.get("platform").and_then(Value::as_str) != Some("bilibili")
+            || target.get("account_id").is_some_and(|v| !v.is_null())
+            || (!key.is_empty() && key != "bilibili:default")
+        {
+            return Err(AppError::Invalid(
+                "Bilibili default account is not an expected batch target".into(),
+            ));
+        }
+    }
     // Published/active/unknown rows always take precedence over a new action,
     // even when a different HTTP caller generated them (Python or Rust).
     let existing = sqlx::query(
-        "SELECT id,state::text AS state,aid,bvid,response_json
-       FROM publish_jobs WHERE task_id=$1 AND platform='bilibili'
+        "SELECT id,state::text AS state,aid,bvid,response_json,batch_id
+       FROM publish_jobs WHERE task_id=$1 AND platform='bilibili' AND account_id IS NULL
          AND state::text IN ('published','submitting','submitted','unknown')
          ORDER BY updated_at DESC,created_at DESC,id DESC LIMIT 1",
     )
@@ -259,7 +297,29 @@ async fn create(
     .fetch_optional(&mut *tx)
     .await?;
     if let Some(row) = existing {
+        let previous: Option<Uuid> = row.try_get("batch_id")?;
+        if previous != body.batch_id {
+            return Err(AppError::Conflict("previous Bilibili publish belongs to a different batch; reconcile before reusing it".into()));
+        }
         return Ok(Json(view(&row)?));
+    }
+    if !batch_is_active {
+        return Err(AppError::Conflict(
+            "publish batch is no longer active".into(),
+        ));
+    }
+    if let Some(batch_id) = body.batch_id {
+        let other_batches: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM publish_batches
+             WHERE task_id=$1 AND id<>$2 AND state IN ('active','succeeded','partial_failed'))",
+        )
+        .bind(body.task_id)
+        .bind(batch_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if other_batches {
+            return Err(AppError::Conflict("Bilibili direct batch has other current or completed targets; use batch orchestrator".into()));
+        }
     }
     if matches!(status.as_str(), "CANCELED" | "PUBLISHED" | "PUBLISHING") {
         return Err(AppError::Conflict(
@@ -371,11 +431,11 @@ async fn create(
     .bind(format!("vr2:{workflow_id}:publish:{generation}"))
     .execute(&mut *tx)
     .await?;
-    sqlx::query("INSERT INTO publish_jobs(id,task_id,platform,account_id,bili_account_id,meta_json,cover_key,
+    sqlx::query("INSERT INTO publish_jobs(id,task_id,batch_id,platform,account_id,bili_account_id,meta_json,cover_key,
        state,operation_key,lease_owner,lease_until)
-       VALUES($1,$2,'bilibili',NULL,NULL,$3,$4,'submitting',$5,
+       VALUES($1,$2,$3,'bilibili',NULL,NULL,$4,$5,'submitting',$6,
           'rust-v2',now()+interval '48 hours')")
-        .bind(job_id).bind(body.task_id).bind(&original_meta).bind(&cover)
+        .bind(job_id).bind(body.task_id).bind(body.batch_id).bind(&original_meta).bind(&cover)
         .bind(&original_operation).execute(&mut *tx).await?;
     sqlx::query(
         "INSERT INTO operation_inbox(id,operation_key,status,request_json,lease_owner,
@@ -537,6 +597,27 @@ pub(crate) async fn mark_confirmed(
             "original Bilibili receipt ownership lost".into(),
         ));
     }
+    let batch_id: Option<Uuid> =
+        sqlx::query_scalar("SELECT batch_id FROM publish_jobs WHERE id=$1")
+            .bind(id)
+            .fetch_one(&mut **tx)
+            .await?;
+    if let Some(batch_id) = batch_id {
+        let result = sqlx::query(
+            "UPDATE publish_batches SET state='succeeded',
+            finished_at=COALESCE(finished_at,now()),updated_at=now()
+            WHERE id=$1 AND task_id=$2 AND state='active'",
+        )
+        .bind(batch_id)
+        .bind(job.task_id)
+        .execute(&mut **tx)
+        .await?;
+        if result.rows_affected() != 1 {
+            return Err(AppError::Conflict(
+                "original single-target Bilibili batch is not active".into(),
+            ));
+        }
+    }
     sqlx::query(
         "UPDATE operation_inbox SET status='completed',result_json=$2,
         completed_at=now(),lease_owner=NULL,lease_until=NULL,updated_at=now()
@@ -581,6 +662,21 @@ pub(crate) async fn mark_uncertain(
     .bind(&details)
     .execute(&mut **tx)
     .await?;
+    let batch_id: Option<Uuid> =
+        sqlx::query_scalar("SELECT batch_id FROM publish_jobs WHERE id=$1")
+            .bind(id)
+            .fetch_one(&mut **tx)
+            .await?;
+    if let Some(batch_id) = batch_id {
+        sqlx::query(
+            "UPDATE publish_batches SET state='failed',
+           finished_at=COALESCE(finished_at,now()),updated_at=now()
+           WHERE id=$1 AND state='active'",
+        )
+        .bind(batch_id)
+        .execute(&mut **tx)
+        .await?;
+    }
     // Exact original Python failure semantics: do not leave task UI stuck at
     // PUBLISHING while the externally irreversible receipt is UNKNOWN.
     sqlx::query(

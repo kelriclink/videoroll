@@ -1093,14 +1093,45 @@ pub async fn publish(
         let upload = client.upload(&path).await?;
         uploaded.push((upload, title));
     }
-    // Python V1 predicts only when requested; a missing prediction preserves
-    // the explicitly supplied metadata typeid rather than inventing one.
-    if direct
+    // The original Python Worker computes AI summary classification after the
+    // preparatory UPOS upload, then falls back to Bilibili prediction and
+    // finally to the supplied metadata tid. Reuse the *same* Rust classifier
+    // as the independent /bilibili/archive/type/recommend endpoint.
+    let mode = direct
         .as_ref()
         .and_then(|v| v.get("typeid_mode"))
-        .and_then(Value::as_str)
-        == Some("bilibili_predict")
-    {
+        .and_then(Value::as_str);
+    let mut selected_by_ai = false;
+    if mode == Some("ai_summary") {
+        let fallback = format!("{}\n{}", meta.title, meta.desc);
+        match crate::bilibili_account_v1::recommend_for_publish(db, config, job.task_id, &fallback)
+            .await
+        {
+            Ok(choice) if choice.get("ok").and_then(Value::as_bool) == Some(true) => {
+                if let Some(id) = choice
+                    .get("typeid")
+                    .and_then(Value::as_u64)
+                    .and_then(|id| u32::try_from(id).ok())
+                    .filter(|id| *id > 0)
+                {
+                    meta.typeid = id;
+                    selected_by_ai = true;
+                }
+            }
+            Ok(choice) => {
+                let reason = choice
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                tracing::warn!(job_id=%job.id,reason=%reason,
+                    "Bilibili AI summary classifier returned no eligible type; trying platform prediction");
+            }
+
+            Err(error) => tracing::warn!(job_id=%job.id,error=%error,
+                "Bilibili AI summary unavailable; trying platform prediction"),
+        }
+    }
+    if (mode == Some("ai_summary") && !selected_by_ai) || mode == Some("bilibili_predict") {
         if let Some((p1, _)) = uploaded.first() {
             if let Ok(Some(predicted)) = client.predict_type(&csrf, p1, &meta.title).await {
                 meta.typeid = predicted;

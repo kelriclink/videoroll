@@ -108,6 +108,7 @@ fi
 if [[ "${VIDEOROLL_V2_TEST_BILI_DIRECT_ONLY:-false}" == "true" ]]; then
   export VIDEOROLL_V2_ENABLE_NATIVE_BILIBILI=true
   export VIDEOROLL_V2_BILIBILI_API_BASE="http://127.0.0.1:18199"
+  export VIDEOROLL_V2_TEST_BILIBILI_BASE="http://127.0.0.1:18199"
   export VIDEOROLL_V2_ALLOW_TEST_BILIBILI_LOOPBACK=true
 fi
 export VIDEOROLL_V2_BIND="127.0.0.1:18080"
@@ -189,6 +190,7 @@ fi
 if [[ "${VIDEOROLL_V2_TEST_BILI_DIRECT_ONLY:-false}" == "true" ]]; then
   export VIDEOROLL_V2_ENABLE_NATIVE_BILIBILI=true
   export VIDEOROLL_V2_BILIBILI_API_BASE="http://127.0.0.1:18199"
+  export VIDEOROLL_V2_TEST_BILIBILI_BASE="http://127.0.0.1:18199"
   export VIDEOROLL_V2_ALLOW_TEST_BILIBILI_LOOPBACK=true
   python3 "$repo_root/rust/tests/mock_bilibili_publish_direct.py" > "$repo_root/rust/target/v2-bili-direct-mock.log" 2>&1 &
   ai_pid=$!

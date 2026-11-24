@@ -3,7 +3,7 @@ from http.server import BaseHTTPRequestHandler,ThreadingHTTPServer
 from urllib.parse import parse_qs,urlparse
 import json
 
-STATE={'preupload':0,'uploads':0,'chunks':0,'complete':0,'predict':0,'submit':0,'ambiguous_submit':0,'cover':0}
+STATE={'preupload':0,'uploads':0,'chunks':0,'complete':0,'predict':0,'submit':0,'ambiguous_submit':0,'cover':0,'ai':0,'ai_invalid':0,'type_catalog':0}
 class Handler(BaseHTTPRequestHandler):
  def send(self,code,body,etag=None):
   value=json.dumps(body).encode()
@@ -17,6 +17,11 @@ class Handler(BaseHTTPRequestHandler):
   url=urlparse(self.path)
   if url.path=='/__state':return self.send(200,STATE)
   if not self.auth():return self.send(403,{'code':-101})
+  if url.path=='/x/vupre/web/archive/pre':
+   STATE['type_catalog']+=1
+   return self.send(200,{'code':0,'data':{'typelist':[
+     {'id':17,'name':'科技','children':[{'id':172,'name':'知识'},{'id':180,'name':'科学科普'}]},
+     {'id':129,'name':'其他'}]}})
   if url.path=='/preupload':
    STATE['preupload']+=1
    name=parse_qs(url.query).get('name',[''])[0]
@@ -36,6 +41,22 @@ class Handler(BaseHTTPRequestHandler):
     return self.send(200,{'OK':1,'upload_id':'isolated-upload-v1'})
    STATE['complete']+=1
    return self.send(200,{'OK':1})
+  if url.path=='/v1/chat/completions':
+   size=int(self.headers.get('Content-Length','0'))
+   if size<1 or size>256000:return self.send(413,{'error':'payload too large'})
+   body=json.loads(self.rfile.read(size))
+   assert body['model']=='mock-bilibili-ai-summary',body.get('model')
+   assert body['response_format']=={'type':'json_object'},body
+   text=body['messages'][-1]['content']
+   assert '候选分区' in text and '172' in text and '180' in text,text
+   STATE['ai']+=1
+   invalid='ai-invalid' in text
+   if invalid:STATE['ai_invalid']+=1
+   else:assert 'unique-summarized-ai-source' in text and 'ai-summary' not in text,text
+   content=json.dumps({'typeid':999999 if invalid else 172,'reason':'isolated mock choice'},ensure_ascii=False)
+   return self.send(200,{'id':'chatcmpl-fixture','object':'chat.completion','choices':[
+    {'index':0,'message':{'role':'assistant','content':content},'finish_reason':'stop'}],
+    'usage':{'prompt_tokens':16,'completion_tokens':10,'total_tokens':26}})
   if not self.auth():return self.send(403,{'code':-101})
   size=int(self.headers.get('Content-Length','0'))
   if size<1 or size>10*1024*1024:return self.send(413,{'code':-413})
@@ -51,7 +72,7 @@ class Handler(BaseHTTPRequestHandler):
   if url.path=='/x/vu/web/add/v3':
    data=json.loads(body)
    assert data['csrf']=='1234567890123456',data
-   assert data['title'] in ['isolated Rust P1','ambiguous-publish','two-part'],data
+   assert data['title'] in ['isolated Rust P1','ambiguous-publish','two-part','ai-summary','ai-invalid','batch-only','batch-unknown'],data
    assert data['copyright']==2 and data['source'].startswith('https://youtu.be/'),data
    assert data['videos'][0]['filename']=='rust-test' and data['videos'][0]['cid']==421,data
    if data['title']=='isolated Rust P1':assert data['cover']=='https://i0.hdslb.com/mock_cover.jpg',data
@@ -61,9 +82,10 @@ class Handler(BaseHTTPRequestHandler):
       {'filename':'rust-dub','title':'P2中文配音版','desc':'','cid':422}],data
    else:
     assert len(data['videos'])==1,data
-   assert data['tid']==(180 if data['title']=='isolated Rust P1' else 171),data
+   expected_tid={'isolated Rust P1':180,'ai-summary':172,'ai-invalid':180}.get(data['title'],171)
+   assert data['tid']==expected_tid,data
    STATE['submit']+=1
-   if data['title']=='ambiguous-publish':
+   if data['title'] in ('ambiguous-publish','batch-unknown'):
     STATE['ambiguous_submit']+=1
     return self.send(503,{'code':-500,'message':'archive may have been accepted'})
    return self.send(200,{'code':0,'data':{'aid':56321,'bvid':'BV1RUSTMOCK1'}})

@@ -242,7 +242,10 @@ fn api_url(_config: &Config, host: &str, path: &str) -> AppResult<Url> {
         .map_err(|_| AppError::Invalid("invalid Bilibili official endpoint".into()))
 }
 async fn bili_get(state: &AppState, host: &str, path: &str) -> AppResult<Value> {
-    let cookie = cookie_header(&stored(&state.db).await?)?;
+    bili_get_from(&state.db, &state.config, host, path).await
+}
+async fn bili_get_from(db: &Database, config: &Config, host: &str, path: &str) -> AppResult<Value> {
+    let cookie = cookie_header(&stored(db).await?)?;
     if cookie.is_empty() {
         return Err(AppError::Invalid("bilibili cookie is not set".into()));
     }
@@ -251,7 +254,7 @@ async fn bili_get(state: &AppState, host: &str, path: &str) -> AppResult<Value> 
         .redirect(reqwest::redirect::Policy::none())
         .no_proxy()
         .build()?;
-    let url = api_url(&state.config, host, path)?;
+    let url = api_url(config, host, path)?;
     let response = client
         .get(url)
         .header(header::USER_AGENT, "videoroll/0.1")
@@ -454,13 +457,41 @@ async fn recommend_archive_type(
     State(state): State<AppState>,
     Json(payload): Json<TypeRecommendRequest>,
 ) -> AppResult<Json<Value>> {
+    recommend_type_impl(&state.db, &state.config, payload).await
+}
+
+// Direct publisher reuses exactly the same source priority, provider selection,
+// official partition leaf whitelist, LLM prompt and usage ledger as the V1 API.
+pub(crate) async fn recommend_for_publish(
+    db: &Database,
+    config: &Config,
+    task_id: Uuid,
+    fallback_text: &str,
+) -> AppResult<Value> {
+    Ok(recommend_type_impl(
+        db,
+        config,
+        TypeRecommendRequest {
+            task_id: Some(task_id),
+            text: Some(fallback_text.to_owned()),
+        },
+    )
+    .await?
+    .0)
+}
+
+async fn recommend_type_impl(
+    db: &Database,
+    config: &Config,
+    payload: TypeRecommendRequest,
+) -> AppResult<Json<Value>> {
     // The old service requires a stored Cookie, even though the metadata API
     // might return some information publicly. `bili_get` owns this check.
-    if cookie_header(&stored(&state.db).await?)?.is_empty() {
+    if cookie_header(&stored(db).await?)?.is_empty() {
         return Err(AppError::Invalid("bilibili cookie is not set".into()));
     }
-    let profile = crate::settings::effective(&state.db, "subtitle.auto_profile").await?;
-    let translation = crate::settings::effective(&state.db, "subtitle.translate").await?;
+    let profile = crate::settings::effective(db, "subtitle.auto_profile").await?;
+    let translation = crate::settings::effective(db, "subtitle.translate").await?;
     let provider_name = profile
         .get("translate_provider")
         .and_then(Value::as_str)
@@ -481,13 +512,13 @@ async fn recommend_archive_type(
         .get("translate_model_id")
         .and_then(Value::as_str)
         .unwrap_or("");
-    let model = crate::providers::resolve(&state.db, &state.config, provider_id, model_id).await?;
+    let model = crate::providers::resolve(db, config, provider_id, model_id).await?;
     let from_task: Option<String> = match payload.task_id {
         Some(task) => sqlx::query_scalar(
             "SELECT NULLIF(btrim(value_json->>'summary'),'') FROM app_settings WHERE key=$1",
         )
         .bind(format!("bilibili.tags.{task}"))
-        .fetch_optional(&state.db.pool)
+        .fetch_optional(&db.pool)
         .await?
         .flatten(),
         None => None,
@@ -509,8 +540,9 @@ async fn recommend_archive_type(
         text.to_owned()
     };
     let ts = Utc::now().timestamp_millis();
-    let bili_payload = bili_get(
-        &state,
+    let bili_payload = bili_get_from(
+        db,
+        config,
         "member.bilibili.com",
         &format!("/x/vupre/web/archive/pre?ts={ts}"),
     )
@@ -553,7 +585,7 @@ async fn recommend_archive_type(
         request = request.bearer_auth(key);
     }
     let result = crate::ai_usage::chat_json(
-        &state.db,
+        db,
         request,
         &model.endpoint,
         &model.model,

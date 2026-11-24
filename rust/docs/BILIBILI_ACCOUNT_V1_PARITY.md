@@ -15,4 +15,4 @@
 
 2026-11-24 新增 `POST /bilibili/archive/type/recommend`：读取原 `bilibili.tags.{task_id}` 摘要（优先于请求文本）、原 `subtitle.auto_profile` 选择的模型、原 `subtitle.translate`/Provider 配置，并获取投稿 API 的真实多级分区叶节点。通过原 OpenAI 兼容接口执行 JSON 分类，只有候选列表中存在的 typeid 才能返回 `ok=true`；不存在的分区会得到 `ok=false`，不会伪造分区。单次请求有模型超时、响应大小限制，记录 AI 使用量，不回传 Cookie/API Key。采用临时 PostgreSQL、模拟 B 站分区 API 和模拟 OpenAI 接口验证分区候选、任务摘要、模型配置及未知 ID 拒绝。
 
-2026-11-24：`POST /bilibili/publish` 已新增**部分适配**，复用原 Python `publish_jobs` 与原 `operation_inbox`、Rust 原生 UPOS 投稿 Worker；完整限制与测试证据见 `BILIBILI_PUBLISH_NATIVE_V1.md`。仍未通过生产级验收，包括多账号选择、跨批次完成、原 Python 后处理的全部差异与真实 B 站平台故障恢复。
+2026-11-24：`POST /bilibili/publish` 已新增**部分适配**，复用原 Python `publish_jobs` 与原 `operation_inbox`、Rust 原生 UPOS 投稿 Worker；完整限制与测试证据见 `BILIBILI_PUBLISH_NATIVE_V1.md`。本轮继续接通 `ai_summary` 同源分类、`batch_id` 单一 B 站默认目标的持久化结算；仍未通过生产级验收，包括多账号选择、多平台批次汇总/回调/清理、原 Python 后处理的全部差异与真实 B 站平台故障恢复。
