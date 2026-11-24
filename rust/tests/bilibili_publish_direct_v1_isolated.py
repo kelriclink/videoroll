@@ -286,11 +286,24 @@ process(finished_task,'published')
 with engine.connect() as db:
     assert db.execute(text('SELECT state FROM publish_batches WHERE id=CAST(:id AS uuid)'),{'id':str(finished_batch)}).scalar_one()=='succeeded'
     assert db.execute(text('SELECT status::text FROM tasks WHERE id=CAST(:id AS uuid)'),{'id':str(finished_task)}).scalar_one()=='published'
-    events=db.execute(text("SELECT event_type,available_at FROM outbox_events WHERE aggregate_id=:id ORDER BY event_type"),{'id':str(finished_batch)}).all()
+    events=db.execute(text("SELECT event_type,available_at,task_name,status FROM outbox_events WHERE aggregate_id=:id ORDER BY event_type"),{'id':str(finished_batch)}).all()
     assert [e.event_type for e in events]==['publish.cleanup','workflow.publish.finished'],events
+    assert [e.task_name for e in events]==['rust.publish.cleanup','rust.publish.batch_finished'],events
+    assert events[0].status=='native_pending' and events[1].status in ('native_pending','native_completed'),events
     from datetime import datetime,timezone,timedelta
     assert timedelta(hours=23)<events[0].available_at-datetime.now(timezone.utc)<timedelta(hours=25),events
-print('PASS: all original platform receipts reconcile a multi-target batch atomically and schedule Python-compatible 24-hour cleanup')
+print('PASS: all original platform receipts reconcile a multi-target batch atomically and schedule native 24-hour cleanup')
+# Native event delivery is persisted without Hatchet and correlated to
+# the actual direct publication workflow. A second tick must not duplicate it.
+for _ in range(2):
+    subprocess.run([str(worker),'publish-batch-tick'],check=True,timeout=20)
+with engine.connect() as db:
+    key='workflow-publish-finished:'+str(finished_batch)+':succeeded'
+    assert db.execute(text("SELECT status FROM outbox_events WHERE operation_key=:k"),{'k':key}).scalar_one()=='native_completed'
+    assert db.execute(text("SELECT runtime_engine,status FROM operation_inbox WHERE operation_key=:k"),{'k':key}).one()==('rust-publish-batch','completed')
+    assert db.execute(text("SELECT count(*) FROM workflow_events WHERE kind='publish.batch.finished' AND details->>'operation_key'=:k"),{'k':key}).scalar_one()==1
+print('PASS: native batch completion notification, durable acknowledgment and replay dedupe')
+
 
 partial_task,partial_payload=fixture('batch-only')
 partial_batch=make_batch(partial_task,single+[{'platform':'douyin'}])

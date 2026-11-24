@@ -15,6 +15,28 @@ pub struct AssetRegistry {
     pub db: Database,
     pub root: PathBuf,
 }
+/// Revalidate publication safety under the parent task lock, at both
+/// reference release and physical GC time.
+pub(crate) async fn publication_cleanup_blocked(
+    tx: &mut Transaction<'_, Postgres>,
+    task: Uuid,
+) -> AppResult<bool> {
+    Ok(sqlx::query_scalar(r#"SELECT
+      EXISTS(SELECT 1 FROM pipeline_runs WHERE task_id=$1 AND state IN ('submitted','submitting','running','paused','unknown','cancel_requested'))
+      OR EXISTS(SELECT 1 FROM operation_inbox WHERE task_id=$1 AND status IN ('pending','queued','awaiting','running','processing','dispatching','accepted','unknown'))
+      OR EXISTS(SELECT 1 FROM publish_jobs WHERE task_id=$1 AND
+         (state::text IN ('draft','submitting','unknown') OR
+          (state::text='submitted' AND response_json->>'runtime'='rust' AND response_json->>'receipt_verified'='false'
+           AND NULLIF(external_id,'') IS NULL AND NULLIF(external_url,'') IS NULL)))
+      OR EXISTS(SELECT 1 FROM subtitle_jobs WHERE task_id=$1 AND status::text IN ('queued','running'))
+      OR EXISTS(SELECT 1 FROM render_jobs WHERE task_id=$1 AND status::text IN ('queued','running'))
+      OR EXISTS(SELECT 1 FROM dubbing_jobs WHERE task_id=$1 AND
+        (status IN ('queued','preparing','synthesizing','aligning','mixing','rendering','pause_requested','cancel_requested')
+        OR (status IN ('paused','preview_ready','needs_review') AND updated_at>now()-interval '7 days')))
+      OR EXISTS(SELECT 1 FROM vr2_bilibili_p2_appends WHERE task_id=$1 AND state<>'published')
+      OR EXISTS(SELECT 1 FROM vr2_social_publish_intents WHERE task_id=$1 AND state NOT IN ('submitted','published','failed'))"#)
+      .bind(task).fetch_one(&mut **tx).await?)
+}
 impl AssetRegistry {
     pub fn new(db: Database, root: PathBuf) -> Self {
         Self { db, root }
@@ -318,6 +340,19 @@ impl AssetRegistry {
                 "ongoing dubbing or unresolved platform publication still needs media".into(),
             ));
         }
+        if state.as_deref() == Some("PUBLISHED") {
+            let batches =
+                crate::bilibili_batch_reconcile_v1::current_batches(&mut tx, task_id).await?;
+            if batches.iter().any(|(_, s, finished, _)| {
+                *s != crate::bilibili_batch_reconcile_v1::State::Succeeded
+                    || finished.is_none_or(|t| t + chrono::Duration::hours(24) > Utc::now())
+            }) {
+                return Err(AppError::Conflict(
+                    "current publication batches have not completed their 24h protection period"
+                        .into(),
+                ));
+            }
+        }
         let rows=sqlx::query(
             "DELETE FROM storage_object_refs WHERE (owner_type='workflow' AND owner_id=$1) OR (owner_type='task' AND owner_id=$2) RETURNING storage_key"
         ).bind(workflow_id).bind(task_id).fetch_all(&mut *tx).await?;
@@ -371,6 +406,21 @@ impl AssetRegistry {
             if unfinished.0 {
                 return Ok(false);
             }
+            if publication_cleanup_blocked(&mut tx, task_id).await? {
+                return Ok(false);
+            }
+            if state == "PUBLISHED"
+                && crate::bilibili_batch_reconcile_v1::current_batches(&mut tx, task_id)
+                    .await?
+                    .iter()
+                    .any(|(_, s, finished, _)| {
+                        *s != crate::bilibili_batch_reconcile_v1::State::Succeeded
+                            || finished.is_none_or(|t| t + chrono::Duration::hours(24) > Utc::now())
+                    })
+            {
+                return Ok(false);
+            }
+
             // Legacy/Python playout rows have no detach lifecycle and therefore
             // remain hard references until deleted. Native Rust rows are active
             // only while staging/ready; a detached audit row must not pin source
@@ -500,7 +550,24 @@ impl AssetRegistry {
                     .bind(task_id)
                     .fetch_one(&self.db.pool)
                     .await?;
+            let mut safety_tx = self.db.pool.begin().await?;
+            sqlx::query("SELECT id FROM tasks WHERE id=$1 FOR UPDATE")
+                .bind(task_id)
+                .fetch_one(&mut *safety_tx)
+                .await?;
+            let publish_blocked = publication_cleanup_blocked(&mut safety_tx, task_id).await?;
+            let batch_blocked = task_state == "PUBLISHED"
+                && crate::bilibili_batch_reconcile_v1::current_batches(&mut safety_tx, task_id)
+                    .await?
+                    .iter()
+                    .any(|(_, s, t, _)| {
+                        *s != crate::bilibili_batch_reconcile_v1::State::Succeeded
+                            || t.is_none_or(|t| t + chrono::Duration::hours(24) > Utc::now())
+                    });
+            safety_tx.commit().await?;
             if !expected
+                || publish_blocked
+                || batch_blocked
                 || parents.0
                 || unfinished.0
                 || active_operation.0

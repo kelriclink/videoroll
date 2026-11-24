@@ -80,6 +80,15 @@ if ! docker exec "$container_name" psql -At -U postgres -d videoroll_test -c 'SE
 fi
 docker exec -i "$container_name" psql -v ON_ERROR_STOP=1 -U postgres -d videoroll_test   < rust/tests/bootstrap_legacy_for_integration.sql >/dev/null
 export DATABASE_URL="postgresql://postgres:videoroll-test-20261121@127.0.0.1:${smoke_db_port}/videoroll_test"
+if [[ "${VIDEOROLL_V2_TEST_PUBLISH_BATCH_EVENTS_ONLY:-false}" == "true" ]]; then
+  export VIDEOROLL_V2_INTERNAL_TOKEN="isolated-native-batch-internal-token-0123456789"
+  export VIDEOROLL_V2_STORAGE_ROOT="$(mktemp -d "$repo_root/rust/target/v2-publish-batch-objects.XXXXXX")"
+  "$CARGO_HOME/bin/cargo" build --manifest-path "$repo_root/rust/Cargo.toml" --bin videoroll-v2 --locked --offline --quiet
+  "$repo_root/rust/target/debug/videoroll-v2" migrate
+  PYTHONPATH="$repo_root/src" /opt/videoroll/venvs/core/bin/python "$repo_root/rust/tests/publish_batch_events_isolated.py"
+  echo 'PASS: native publication event and delayed intermediate GC'
+  exit 0
+fi
 if [[ "${VIDEOROLL_V2_TEST_SAU_NATIVE_WORKER_ONLY:-false}" == "true" ]]; then
   export INTERNAL_API_SECRET="isolated-sau-native-worker-secret"
   export VIDEOROLL_V2_INTERNAL_TOKEN="isolated-sau-worker-internal-token-0123456789"
