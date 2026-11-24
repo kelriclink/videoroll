@@ -33,7 +33,9 @@ model_proxy_pid=""
 hf_hub_pid=""
 asr_provider_pid=""
 youtube_home_pid=""
+bili_discovery_pid=""
 cleanup() {
+  if [[ -n "$bili_discovery_pid" ]]; then kill "$bili_discovery_pid" 2>/dev/null || true; wait "$bili_discovery_pid" 2>/dev/null || true; fi
   if [[ -n "$youtube_home_pid" ]]; then kill "$youtube_home_pid" 2>/dev/null || true; wait "$youtube_home_pid" 2>/dev/null || true; fi
   if [[ -n "$model_catalog_pid" ]]; then kill "$model_catalog_pid" 2>/dev/null || true; wait "$model_catalog_pid" 2>/dev/null || true; fi
   if [[ -n "$model_proxy_pid" ]]; then kill "$model_proxy_pid" 2>/dev/null || true; wait "$model_proxy_pid" 2>/dev/null || true; fi
@@ -161,6 +163,10 @@ mkdir -p "$SUBTITLE_WHISPER_MODEL_DIR"
 export VIDEOROLL_V2_ALLOW_TEST_MODEL_CATALOG_LOOPBACK="true"
 export VIDEOROLL_V2_ALLOW_TEST_BILIBILI_LOOPBACK="true"
 export VIDEOROLL_V2_TEST_BILIBILI_BASE="http://127.0.0.1:18096/"
+# All isolated runs override the new discovery path: no public Bilibili
+# request may escape the disposable test harness during contract probing.
+export VIDEOROLL_V2_ALLOW_TEST_BILI_DISCOVERY_LOOPBACK="true"
+export VIDEOROLL_V2_TEST_BILI_DISCOVERY_BASE="http://127.0.0.1:18196/"
 # Keep both HTTP API and the worker on the SAME isolated Bilibili mock.
 if [[ "${VIDEOROLL_V2_TEST_BILI_DIRECT_ONLY:-false}" == "true" ]]; then
   export VIDEOROLL_V2_TEST_BILIBILI_BASE="http://127.0.0.1:18199/"
@@ -203,6 +209,8 @@ legacy_pid=$!
 mkdir -p "$VIDEOROLL_V2_STORAGE_ROOT"
 python3 "$repo_root/rust/tests/mock_bilibili_subtitles.py" > "$repo_root/rust/target/v2-bili-subs-mock.log" 2>&1 &
 bili_pid=$!
+python3 "$repo_root/rust/tests/mock_bilibili_discovery_v1.py" > "$repo_root/rust/target/v2-mock-bili-discovery.log" 2>&1 &
+bili_discovery_pid=$!
 python3 "$repo_root/rust/tests/mock_social_sau.py" > "$repo_root/rust/target/v2-mock-sau.log" 2>&1 &
 sau_pid=$!
 python3 "$repo_root/rust/tests/mock_model_catalog.py" > "$repo_root/rust/target/v2-mock-model-catalog.log" 2>&1 &
@@ -299,6 +307,12 @@ fi
 if [[ "${VIDEOROLL_V2_TEST_PLAYOUT_ACTION_ONLY:-false}" == "true" ]]; then
   PYTHONPATH="$repo_root/src" /opt/videoroll/venvs/core/bin/python \
     "$repo_root/rust/tests/legacy_playout_action_v1_isolated.py"
+  exit 0
+fi
+if [[ "${VIDEOROLL_V2_TEST_BILI_DISCOVERY_ONLY:-false}" == "true" ]]; then
+  PYTHONPATH="$repo_root/src" /opt/videoroll/venvs/core/bin/python \
+    "$repo_root/rust/tests/bilibili_discovery_v1_isolated.py"
+  echo 'PASS: Bilibili discovery ranking, public activity catalogue, exact Python payload and TTL'
   exit 0
 fi
 if [[ "${VIDEOROLL_V2_TEST_BILIBILI_ACCOUNT_ONLY:-false}" == "true" ]]; then

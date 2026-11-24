@@ -1,12 +1,12 @@
-# VideoRoll Rust V1 部分适配 API：189 条逐接口探测
+# VideoRoll Rust V1 部分适配 API：190 条逐接口探测
 
-测试日期：2026-11-24T07:28:18.090530+00:00。
+测试日期：2026-11-24T07:46:46.389713+00:00。
 环境：隔离 PostgreSQL + 本地模拟平台，不使用生产账号、生产数据库或真实投稿。
 独立 Egress Gateway 另有 2 条接口，需运行专项 HTTP/SSRF 套件；不计入本 API 探测。
 注意：HTTP 请求得到响应不代表与 Python 完全等价；仅拒绝路径不代表正向业务通过。
 隔离探测不能替代 Python/Rust 双端业务差分验收。
 
-逐项执行：189；2xx 正向：98；4xx 拒绝路径：90；异常/需要复核：0；完整业务等价验收：0。
+逐项执行：190；2xx 正向：99；4xx 拒绝路径：90；异常/需要复核：0；完整业务等价验收：0。
 
 | HTTP 方法 | 原 Python 路径 | Rust 返回 | 测试类型 | 鉴权检查 | 问题 |
 |---|---|---:|---|---:|---|
@@ -20,6 +20,7 @@
 | GET | `/bilibili/auth/me` | 400 | rejection | 401 | - |
 | GET | `/bilibili/auth/settings` | 200 | positive | 401 | - |
 | PUT | `/bilibili/auth/settings` | 200 | positive | 401 | - |
+| GET | `/bilibili/discovery` | 200 | positive | 401 | - |
 | POST | `/bilibili/publish` | 422 | rejection | 401 | - |
 | GET | `/bilibili/publish/jobs/{job_id}` | 404 | rejection | 401 | - |
 | GET | `/bilibili/publish/settings` | 200 | positive | 401 | - |
@@ -229,3 +230,12 @@
   设置相同环境变量仍拒绝私网/本机 URL。
 - Gateway 两条接口作为独立服务登记，不进入主 API 的 189 条隔离探测。
   具体测试与未验收边界见 EGRESS_GATEWAY_NATIVE_V1.md。
+
+## 2026-11-24：B站公开工作台排行榜与活动
+
+- 原 GET /bilibili/discovery 已由 Rust 原生访问固定 B站公开 HTTPS API，
+  保留排行榜热门回退、活动两页合并、过滤/去重、缓存节流及过期降级。
+- 原 Python parse_ranking/parse_activities 已用隔离 HTTP 模拟数据差分比较，
+  真实平台未验收，详情见 BILIBILI_DISCOVERY_NATIVE_V1.md。
+- 公开目录 ID 不会被当作投稿所需的 topic_id/mission_id，
+  也不推断账号已报名。
