@@ -75,6 +75,11 @@ impl SauState {
             .ok()
             .as_deref()
             == Some("true");
+        if crate::outbox_dispatcher::native_only() && publish_outbox_enabled {
+            return Err(AppError::Conflict(
+                "native-only outbox forbids SAU legacy Celery delivery".into(),
+            ));
+        }
         let native_publish = if std::env::var("VIDEOROLL_V2_SAU_ENABLE_NATIVE_PUBLISH")
             .ok()
             .as_deref()

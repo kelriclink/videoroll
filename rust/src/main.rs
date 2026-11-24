@@ -39,6 +39,23 @@ enum Command {
     SocialTick,
     /// Settle due native publish batch events, without running any external publisher.
     PublishBatchTick,
+    /// Unified broker-free control-plane dispatch.
+    OutboxTick,
+    /// Read-only delivery ledger and cutover blocker inventory.
+    OutboxAudit {
+        /// Exit nonzero if any unresolved delivery rows remain.
+        #[arg(long)]
+        require_ready: bool,
+    },
+    /// Adopt only provably untouched compatible historical events.
+    OutboxAdopt {
+        /// Confirm all old and new producers/consumers have been stopped.
+        #[arg(long)]
+        quiesced: bool,
+        /// Confirm the native SAU executor is configured for this database.
+        #[arg(long)]
+        sau_ready: bool,
+    },
     /// Reconcile committed remote-render receipts without contacting a worker.
     RenderTick,
     /// Run one due-check for the original YouTube Home recommendation scanner.
@@ -57,6 +74,7 @@ async fn main() -> anyhow::Result<()> {
         .init();
     let cli = Cli::parse();
     let config = Arc::new(Config::from_env()?);
+    videoroll_v2::outbox_dispatcher::validate_config(&config)?;
     let db = Database::connect(&config.database_url).await?;
     match cli.command {
         Command::Migrate => db.migrate().await?,
@@ -218,30 +236,17 @@ async fn main() -> anyhow::Result<()> {
                     }
                 });
             }
-            let render_db = db.clone();
-            let render_config = config.clone();
+            let outbox_db = db.clone();
+            let outbox_config = config.clone();
             tokio::spawn(async move {
                 let mut timer = tokio::time::interval(std::time::Duration::from_secs(5));
                 timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 loop {
                     timer.tick().await;
                     if let Err(error) =
-                        videoroll_v2::render_events::tick(&render_db, &render_config, 100).await
+                        videoroll_v2::outbox_dispatcher::tick(&outbox_db, &outbox_config, 100).await
                     {
-                        tracing::warn!(%error,"render receipt recovery unavailable");
-                    }
-                }
-            });
-            let batch_db = db.clone();
-            tokio::spawn(async move {
-                let mut timer = tokio::time::interval(std::time::Duration::from_secs(5));
-                timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                loop {
-                    timer.tick().await;
-                    if let Err(error) =
-                        videoroll_v2::publish_batch_events::tick(&batch_db, 100).await
-                    {
-                        tracing::warn!(%error,"native publish batch events unavailable");
+                        tracing::warn!(%error,"native outbox dispatch incomplete");
                     }
                 }
             });
@@ -316,6 +321,28 @@ async fn main() -> anyhow::Result<()> {
                 receipts,
                 dispatched,
                 "SAU social publish tick finished"
+            );
+        }
+        Command::OutboxTick => {
+            let result = videoroll_v2::outbox_dispatcher::tick(&db, &config, 100).await?;
+            println!("{}", result);
+        }
+        Command::OutboxAudit { require_ready } => {
+            let report = videoroll_v2::outbox_dispatcher::audit(&db).await?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+            if require_ready && report["delivery_ledger_ready"] != true {
+                anyhow::bail!("unresolved outbox delivery rows block cutover");
+            }
+        }
+        Command::OutboxAdopt {
+            quiesced,
+            sau_ready,
+        } => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(
+                    &videoroll_v2::outbox_dispatcher::adopt(&db, quiesced, sau_ready).await?
+                )?
             );
         }
         Command::RenderTick => {
