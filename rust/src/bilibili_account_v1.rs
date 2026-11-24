@@ -135,6 +135,102 @@ pub(crate) async fn publication_credentials(
         config.native_bilibili_csrf.as_deref(),
     )
 }
+/// Original Account row is the source of truth for non-default Bilibili
+/// identities. No default-cookie fallback is permitted for a selected account.
+/// A fingerprint of the secret is recorded at enqueue, not the secret itself,
+/// so rotation or revocation before dispatch cannot publish with a new user.
+pub(crate) async fn selected_publication_credentials(
+    db: &Database,
+    config: &Config,
+    account: Option<Uuid>,
+) -> AppResult<(String, String, Option<String>)> {
+    let Some(account) = account else {
+        let (cookie, csrf) = publication_credentials(db, config).await?;
+        return Ok((cookie, csrf, None));
+    };
+    let row = sqlx::query(
+        "SELECT platform::text AS platform,is_active,secrets_encrypted,rotated_at
+        FROM accounts WHERE id=$1",
+    )
+    .bind(account)
+    .fetch_optional(&db.pool)
+    .await?
+    .ok_or_else(|| AppError::Invalid("selected Bilibili account does not exist".into()))?;
+    let platform: String = row.try_get("platform")?;
+    let active: bool = row.try_get("is_active")?;
+    if platform != "bilibili" || !active {
+        return Err(AppError::Conflict(
+            "selected account is inactive or not a Bilibili account".into(),
+        ));
+    }
+    let encoded: String = row.try_get("secrets_encrypted")?;
+    if encoded.is_empty() || encoded.len() > LIMIT {
+        return Err(AppError::Conflict(
+            "selected Bilibili account has no valid credentials".into(),
+        ));
+    }
+    let decoded = decode_secret(&encoded)?
+        .ok_or_else(|| AppError::Conflict("selected account credentials missing".into()))?;
+    let value = if decoded.trim_start().starts_with('{') {
+        let record: Value = serde_json::from_str(&decoded)
+            .map_err(|_| AppError::Invalid("invalid Bilibili account JSON".into()))?;
+        let map = record.as_object().ok_or_else(|| {
+            AppError::Invalid("Bilibili account credential must be an object".into())
+        })?;
+        // No browser sidecar storageState JSON, API key, or ambiguous hidden
+        // fallback to global credentials: only explicit creator-center Cookie.
+        let cookie = map
+            .get("cookie_enc")
+            .or_else(|| map.get("cookie"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| AppError::Invalid("Bilibili account Cookie is missing".into()))?;
+        let cookie = decode_secret(cookie)?
+            .ok_or_else(|| AppError::Invalid("empty Bilibili account Cookie".into()))?;
+        let csrf = map
+            .get("bili_jct_enc")
+            .or_else(|| map.get("bili_jct"))
+            .and_then(Value::as_str)
+            .map(decode_secret)
+            .transpose()?
+            .flatten();
+        if let Some(csrf) = csrf {
+            let embedded = cookie_parts(&cookie).get("bili_jct").cloned();
+            if embedded.as_deref().is_some_and(|v| v != csrf) {
+                return Err(AppError::Conflict(
+                    "Bilibili account CSRF differs from its Cookie".into(),
+                ));
+            }
+            // Explicitly scoped account credentials; never use global fallback.
+            json!({"cookie_enc":cookie,"bili_jct_enc":csrf})
+        } else {
+            json!({"cookie_enc":cookie})
+        }
+    } else {
+        json!({"cookie_enc":decoded})
+    };
+    let (cookie, csrf) = credential_values(&value, None, None)?;
+    if cookie_parts(&cookie)
+        .get("SESSDATA")
+        .is_none_or(|v| v.is_empty())
+        || cookie_parts(&cookie)
+            .get("bili_jct")
+            .is_none_or(|v| v != &csrf)
+    {
+        return Err(AppError::Invalid(
+            "selected Bilibili account must contain matching SESSDATA and bili_jct Cookies".into(),
+        ));
+    }
+    use sha2::Digest as _;
+    let rotated: Option<DateTime<Utc>> = row.try_get("rotated_at")?;
+    let mut digest = sha2::Sha256::new();
+    digest.update(cookie.as_bytes());
+    digest.update(b"\0");
+    if let Some(at) = rotated {
+        digest.update(at.timestamp_micros().to_be_bytes());
+    }
+    let fingerprint = format!("{:x}", digest.finalize());
+    Ok((cookie, csrf, Some(fingerprint)))
+}
 fn safe_secret(v: &str) -> AppResult<String> {
     let v = v.trim();
     if v.len() > LIMIT || v.chars().any(|c| c.is_control()) {
@@ -246,8 +342,16 @@ async fn bili_get(state: &AppState, host: &str, path: &str) -> AppResult<Value> 
 }
 async fn bili_get_from(db: &Database, config: &Config, host: &str, path: &str) -> AppResult<Value> {
     let cookie = cookie_header(&stored(db).await?)?;
+    bili_get_cookie(config, host, path, &cookie).await
+}
+async fn bili_get_cookie(
+    config: &Config,
+    host: &str,
+    path: &str,
+    cookie: &str,
+) -> AppResult<Value> {
     if cookie.is_empty() {
-        return Err(AppError::Invalid("bilibili cookie is not set".into()));
+        return Err(AppError::Invalid("Bilibili Cookie is missing".into()));
     }
     let client = Client::builder()
         .timeout(Duration::from_secs(15))
@@ -629,9 +733,205 @@ async fn publish_job(
         "bvid":found.try_get::<Option<String>,_>("bvid")?,
         "created_at":created_at,"updated_at":updated_at})))
 }
+/// Account-management extension using the original Python `accounts` table.
+/// Only owner-authenticated V2 API clients can call these routes. Never return
+/// plaintext Cookies, including in errors, responses or account list views.
+#[derive(Debug, Deserialize)]
+struct NamedAccountInput {
+    name: String,
+    cookie: String,
+}
+fn validate_account_name(name: &str) -> AppResult<&str> {
+    if name.is_empty()
+        || name.len() > 64
+        || !name
+            .bytes()
+            .enumerate()
+            .all(|(i, b)| b.is_ascii_alphanumeric() || (i > 0 && matches!(b, b'.' | b'_' | b'-')))
+    {
+        return Err(AppError::Invalid(
+            "Bilibili account name must contain 1-64 letters, digits, dot, underscore or hyphen"
+                .into(),
+        ));
+    }
+    Ok(name)
+}
+async fn list_named_accounts(State(state): State<AppState>) -> AppResult<Json<Value>> {
+    let rows = sqlx::query(
+        "SELECT id,name,is_active,check_state,last_checked_at,rotated_at,
+       length(secrets_encrypted)>0 AS cookie_set FROM accounts
+       WHERE platform='bilibili'::platform ORDER BY name",
+    )
+    .fetch_all(&state.db.pool)
+    .await?;
+    let accounts = rows
+        .iter()
+        .map(|row| {
+            Ok(json!({
+                "id":row.try_get::<Uuid,_>("id")?,"name":row.try_get::<String,_>("name")?,
+                "is_active":row.try_get::<bool,_>("is_active")?,
+                "check_state":row.try_get::<String,_>("check_state")?,
+                "cookie_set":row.try_get::<bool,_>("cookie_set")?,
+                "rotated_at":row.try_get::<Option<DateTime<Utc>>,_>("rotated_at")?,
+                "last_checked_at":row.try_get::<Option<DateTime<Utc>>,_>("last_checked_at")?
+            }))
+        })
+        .collect::<AppResult<Vec<Value>>>()?;
+    Ok(Json(json!({"accounts":accounts})))
+}
+async fn save_named_account(
+    State(state): State<AppState>,
+    Json(body): Json<NamedAccountInput>,
+) -> AppResult<Json<Value>> {
+    let name = validate_account_name(&body.name)?;
+    let cookie = normalize_cookie(&body.cookie)?;
+    let parts = cookie_parts(&cookie);
+    if parts.get("SESSDATA").is_none_or(|v| v.is_empty())
+        || parts.get("bili_jct").is_none_or(|v| v.is_empty())
+    {
+        return Err(AppError::Invalid(
+            "Bilibili named account requires SESSDATA and bili_jct Cookies".into(),
+        ));
+    }
+    // This validates CSRF and rejects inconsistent or malformed cookies.
+    credential_values(&json!({"cookie_enc":cookie}), None, None)?;
+    let encrypted = format!("dbplain:v1:{cookie}");
+    let row = sqlx::query(
+        "INSERT INTO accounts(id,platform,name,secrets_encrypted,rotated_at,
+        is_active,check_state,last_checked_at,last_check_message)
+        VALUES($1,'bilibili'::platform,$2,$3,now(),true,'unchecked',NULL,NULL)
+        ON CONFLICT (platform,name) DO UPDATE SET
+          secrets_encrypted=EXCLUDED.secrets_encrypted,rotated_at=now(),
+          is_active=true,check_state='unchecked',last_checked_at=NULL,last_check_message=NULL
+        RETURNING id,name",
+    )
+    .bind(Uuid::new_v4())
+    .bind(name)
+    .bind(encrypted)
+    .fetch_one(&state.db.pool)
+    .await?;
+    Ok(Json(json!({"id":row.try_get::<Uuid,_>("id")?,
+        "name":row.try_get::<String,_>("name")?,"is_active":true,
+        "check_state":"unchecked","cookie_set":true})))
+}
+async fn disable_named_account(
+    State(state): State<AppState>,
+    Path(account_id): Path<Uuid>,
+) -> AppResult<Json<Value>> {
+    let mut tx = state.db.pool.begin().await?;
+    let row = sqlx::query(
+        "SELECT id,name FROM accounts WHERE id=$1 AND platform='bilibili'::platform FOR UPDATE",
+    )
+    .bind(account_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| AppError::NotFound("Bilibili account not found".into()))?;
+    let in_flight: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM publish_jobs
+       WHERE account_id=$1 AND platform='bilibili' AND state='submitting')",
+    )
+    .bind(account_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    sqlx::query(
+        "UPDATE accounts SET secrets_encrypted='',is_active=false,
+      check_state='unchecked',last_checked_at=NULL,last_check_message=NULL,
+      rotated_at=now() WHERE id=$1",
+    )
+    .bind(account_id)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(Json(
+        json!({"id":account_id,"name":row.try_get::<String,_>("name")?,
+        "is_active":false,"cookie_set":false,"in_flight":in_flight,
+        "warning":if in_flight {Some("already running platform publication may still finish; verify external result")} else {None}}),
+    ))
+}
+/// Verify a named account via Bilibili's authenticated member profile.
+async fn check_named_account(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> AppResult<Json<Value>> {
+    let (cookie, _, fingerprint) =
+        selected_publication_credentials(&state.db, &state.config, Some(id)).await?;
+    let profile = bili_get_cookie(
+        &state.config,
+        "api.bilibili.com",
+        "/x/member/web/account",
+        &cookie,
+    )
+    .await?;
+    if profile.get("code").and_then(Value::as_i64) != Some(0) {
+        return Err(AppError::Unauthorized);
+    }
+    let data = profile
+        .get("data")
+        .and_then(Value::as_object)
+        .ok_or_else(|| AppError::Unavailable("Bilibili profile is incomplete".into()))?;
+    let mid = data
+        .get("mid")
+        .and_then(Value::as_i64)
+        .or_else(|| {
+            data.get("mid")
+                .and_then(Value::as_str)
+                .and_then(|v| v.parse().ok())
+        })
+        .filter(|v| *v > 0)
+        .ok_or_else(|| AppError::Unavailable("Bilibili account mid missing".into()))?;
+    let uname = data
+        .get("uname")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    if uname.is_empty() {
+        return Err(AppError::Unavailable(
+            "Bilibili account name missing".into(),
+        ));
+    }
+    let (_, _, current) =
+        selected_publication_credentials(&state.db, &state.config, Some(id)).await?;
+    if current != fingerprint {
+        return Err(AppError::Conflict(
+            "Bilibili account changed during verification".into(),
+        ));
+    }
+    let label = format!(
+        "Bilibili mid={mid}, uname={}",
+        uname.chars().take(80).collect::<String>()
+    );
+    let n = sqlx::query(
+        "UPDATE accounts SET check_state='valid',last_check_message=$2,
+        last_checked_at=now() WHERE id=$1 AND platform='bilibili'::platform AND is_active=true",
+    )
+    .bind(id)
+    .bind(label)
+    .execute(&state.db.pool)
+    .await?;
+    if n.rows_affected() != 1 {
+        return Err(AppError::Conflict(
+            "Bilibili account no longer active".into(),
+        ));
+    }
+    Ok(Json(
+        json!({"id":id,"check_state":"valid","mid":mid,"uname":uname}),
+    ))
+}
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/bilibili/auth/settings", get(get_auth).put(put_auth))
+        .route(
+            "/bilibili/accounts",
+            get(list_named_accounts).post(save_named_account),
+        )
+        .route(
+            "/bilibili/accounts/{account_id}",
+            axum::routing::delete(disable_named_account),
+        )
+        .route(
+            "/bilibili/accounts/{account_id}/check",
+            post(check_named_account),
+        )
         .route("/bilibili/auth/me", get(auth_me))
         .route("/bilibili/archive/types", get(archive_types))
         .route(

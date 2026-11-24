@@ -1044,7 +1044,6 @@ pub async fn publish(
             "native Bilibili publisher is not enabled".into(),
         ));
     }
-    let (cookie, csrf) = crate::bilibili_account_v1::publication_credentials(db, config).await?;
     if !crate::publish_platforms::enabled(db, "bilibili").await? {
         return Err(AppError::Conflict(
             "Bilibili publishing is disabled in V2 platform settings".into(),
@@ -1058,6 +1057,41 @@ pub async fn publish(
     .fetch_optional(&db.pool)
     .await?
     .flatten();
+    let account = direct
+        .as_ref()
+        .and_then(|v| v.get("account_id"))
+        .filter(|v| !v.is_null())
+        .map(|v| serde_json::from_value::<uuid::Uuid>(v.clone()))
+        .transpose()
+        .map_err(|_| AppError::Invalid("Bilibili direct account id is invalid".into()))?;
+    let (cookie, csrf, fingerprint) =
+        crate::bilibili_account_v1::selected_publication_credentials(db, config, account).await?;
+    if direct.is_some() {
+        let recorded = direct
+            .as_ref()
+            .and_then(|d| d.get("cookie_fingerprint"))
+            .and_then(Value::as_str);
+        if account.is_some() && fingerprint.as_deref() != recorded {
+            return Err(AppError::Conflict(
+                "Bilibili account credentials rotated after enqueue; refuse unsafe publication"
+                    .into(),
+            ));
+        }
+        let job_account: Option<uuid::Uuid> = sqlx::query_scalar(
+            "SELECT account_id FROM publish_jobs
+          WHERE id=(SELECT (configuration->'bilibili_direct_v1'->>'publish_job_id')::uuid
+           FROM vr2_workflows WHERE id=$1)",
+        )
+        .bind(job.workflow_id)
+        .fetch_optional(&db.pool)
+        .await?
+        .flatten();
+        if job_account != account {
+            return Err(AppError::Conflict(
+                "Bilibili publish job account differs from workflow account".into(),
+            ));
+        }
+    }
     let reviewed_meta = if direct.is_some() {
         Some(
             serde_json::to_value(&meta)

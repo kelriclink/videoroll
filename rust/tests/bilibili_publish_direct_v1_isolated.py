@@ -43,11 +43,11 @@ def fixture(title):
               'copyright':2,'source':'https://youtu.be/0123456789A'}}
     return task,payload
 
-def check(task,status):
+def check(task,status,account_id=None):
     end=time.monotonic()+75
     while time.monotonic()<end:
         with engine.connect() as db:
-            value=db.execute(text("SELECT state::text FROM publish_jobs WHERE task_id=CAST(:id AS uuid) AND platform='bilibili'"),{'id':str(task)}).scalar_one()
+            value=db.execute(text("SELECT state::text FROM publish_jobs WHERE task_id=CAST(:id AS uuid) AND platform='bilibili' AND account_id IS NOT DISTINCT FROM CAST(:account AS uuid)"),{'id':str(task),'account':account_id}).scalar_one()
         if value==status:return
         if value not in ('submitting',):raise AssertionError((value,status))
         time.sleep(.6)
@@ -81,11 +81,11 @@ print('PASS: original publish_jobs and Python recovery fence persisted atomicall
 
 worker=Path(__file__).resolve().parents[1]/'target/debug/videoroll-v2'
 log=Path(__file__).resolve().parents[1]/'target/bili-direct-worker.log'
-def process(task,final):
+def process(task,final,account_id=None):
     with log.open('w') as output:
         proc=subprocess.Popen([str(worker),'worker'],env={**os.environ,'VIDEOROLL_V2_WORKERS':'1','RUST_LOG':'warn'},stdout=output,stderr=subprocess.STDOUT)
         try:
-            check(task,final)
+            check(task,final,account_id)
         finally:
             proc.terminate()
             try:proc.wait(timeout=8)
@@ -374,6 +374,103 @@ with engine.connect() as db:
     assert db.execute(text('SELECT status::text FROM tasks WHERE id=CAST(:id AS uuid)'),{'id':str(parallel_task)}).scalar_one()=='publishing'
     assert db.execute(text("SELECT count(*) FROM outbox_events WHERE aggregate_id=:id AND event_type='publish.cleanup'"),{'id':str(separate_bili_batch)}).scalar_one()==0
 print('PASS: independent Bilibili and Douyin batches coexist; legacy empty marker ignored; active Douyin target prevents premature task published and cleanup')
+counts=counters()
+
+name_a=uuid4()
+named_task,named_payload=fixture('named-account-A')
+with engine.begin() as db:
+    db.execute(text("INSERT INTO accounts(id,platform,name,secrets_encrypted,is_active) VALUES(CAST(:id AS uuid),'bilibili','test-a',:secret,true)"),
+        {'id':str(name_a),'secret':'dbplain:v1:'+json.dumps({'cookie':'SESSDATA=isolated-account-A; bili_jct=ABCD123456789012'})})
+named_payload['account_id']=str(name_a)
+code,named_receipt=api('/bilibili/publish',named_payload)
+assert code==200 and named_receipt['state']=='submitting',(code,named_receipt)
+process(named_task,'published',str(name_a))
+assert api('/bilibili/publish',named_payload)[1]['job_id']==named_receipt['job_id']
+print('PASS: named Bilibili account direct post uses original accounts Cookie instead of global Cookie')
+
+name_b=uuid4()
+with engine.begin() as db:
+    db.execute(text("INSERT INTO accounts(id,platform,name,secrets_encrypted,is_active) VALUES(CAST(:id AS uuid),'bilibili','test-b',:secret,true)"),
+        {'id':str(name_b),'secret':'dbplain:v1:'+json.dumps({'cookie':'SESSDATA=isolated-account-B; bili_jct=BCDE123456789012'})})
+pair_task,first=fixture('named-account-A')
+second=dict(first)
+second['meta']={**first['meta'],'title':'named-account-B'}
+pair_batch=make_batch(pair_task,[{'platform':'bilibili','account_id':str(name_a)},
+    {'platform':'bilibili','account_id':str(name_b)}])
+first.update(account_id=str(name_a),batch_id=str(pair_batch))
+second.update(account_id=str(name_b),batch_id=str(pair_batch))
+code,first_job=api('/bilibili/publish',first)
+assert code==200 and first_job['state']=='submitting',(code,first_job)
+process(pair_task,'published',str(name_a))
+with engine.connect() as db:
+    assert db.execute(text('SELECT state FROM publish_batches WHERE id=CAST(:id AS uuid)'),{'id':str(pair_batch)}).scalar_one()=='active'
+    assert db.execute(text('SELECT status::text FROM tasks WHERE id=CAST(:id AS uuid)'),{'id':str(pair_task)}).scalar_one()=='publishing'
+code,second_job=api('/bilibili/publish',second)
+assert code==200 and second_job['job_id']!=first_job['job_id'],(code,second_job)
+process(pair_task,'published',str(name_b))
+with engine.connect() as db:
+    assert db.execute(text('SELECT state FROM publish_batches WHERE id=CAST(:id AS uuid)'),{'id':str(pair_batch)}).scalar_one()=='succeeded'
+    assert db.execute(text('SELECT count(*) FROM publish_jobs WHERE task_id=CAST(:id AS uuid)'),{'id':str(pair_task)}).scalar_one()==2
+assert api('/bilibili/publish',first)[1]['job_id']==first_job['job_id']
+assert api('/bilibili/publish',second)[1]['job_id']==second_job['job_id']
+print('PASS: same Task publishes to two distinct Bilibili accounts in one batch, with separate Cookies and independent receipts')
+
+code,listed=api('/bilibili/accounts')
+assert code==200 and {str(name_a),str(name_b)}.issubset({x['id'] for x in listed['accounts']}),(code,listed)
+assert 'SESSDATA' not in json.dumps(listed) and 'cookie_enc' not in json.dumps(listed)
+code,created=api('/bilibili/accounts',{'name':'created-by-api','cookie':'SESSDATA=isolated-account-B; bili_jct=BCDE123456789012'})
+assert code==200 and created['cookie_set'] and created['is_active'],(code,created)
+code,reused=api('/bilibili/accounts',{'name':'created-by-api','cookie':'SESSDATA=isolated-account-B; bili_jct=BCDE123456789012'})
+assert code==200 and reused['id']==created['id'],(code,reused)
+code,not_valid=api('/bilibili/accounts',{'name':'invalid name','cookie':'SESSDATA=isolated-account-B; bili_jct=BCDE123456789012'})
+assert code==400,(code,not_valid)
+assert 'SESSDATA' not in json.dumps(created)
+code,verified=api('/bilibili/accounts/'+created['id']+'/check',{})
+assert code==200 and verified['check_state']=='valid' and verified['mid']==61002,(code,verified)
+code,checked_list=api('/bilibili/accounts')
+assert code==200 and next(v for v in checked_list['accounts'] if v['id']==created['id'])['check_state']=='valid'
+print('PASS: named account profile check uses the account-specific Cookie and confirms remote Bilibili UID')
+print('PASS: account-management API uses original accounts, stable upsert identity and redacted list/response')
+remove=Request('http://127.0.0.1:18080/api/v1/bilibili/accounts/'+created['id'],headers=headers,method='DELETE')
+with urlopen(remove,timeout=15) as reply:
+    result=json.loads(reply.read())
+assert not result['is_active'] and not result['cookie_set'] and not result['in_flight'],result
+print('PASS: account-management disable endpoint returns no account credentials')
+with engine.connect() as db:
+    stored=db.execute(text('SELECT is_active,secrets_encrypted FROM accounts WHERE id=CAST(:id AS uuid)'),{'id':created['id']}).one()
+    assert not stored.is_active and not stored.secrets_encrypted
+code,restored=api('/bilibili/accounts',{'name':'created-by-api','cookie':'SESSDATA=isolated-account-B; bili_jct=BCDE123456789012'})
+assert code==200 and restored['id']==created['id'] and restored['is_active'],(code,restored)
+print('PASS: original account row supports safe revocation and reimport with stable id')
+
+
+rot_task,rot_payload=fixture('named-account-A')
+rot_payload['account_id']=str(name_a)
+code,rot_job=api('/bilibili/publish',rot_payload)
+assert code==200 and rot_job['state']=='submitting',(code,rot_job)
+with engine.begin() as db:
+    db.execute(text('UPDATE accounts SET secrets_encrypted=:value WHERE id=CAST(:id AS uuid)'),
+      {'id':str(name_a),'value':'dbplain:v1:'+json.dumps({'cookie':'SESSDATA=isolated-rotated; bili_jct=ABCD123456789012'})})
+before_rot=counters()
+process(rot_task,'unknown',str(name_a))
+assert api('/bilibili/publish',rot_payload)[1]['state']=='unknown'
+assert counters()['submit']==before_rot['submit'] and counters()['preupload']==before_rot['preupload']
+print('PASS: named Bilibili Cookie changed after enqueue cannot submit an archive')
+with engine.begin() as db:
+    db.execute(text('UPDATE accounts SET is_active=false WHERE id=CAST(:id AS uuid)'),{'id':str(name_b)})
+wrong_task,wrong_payload=fixture('named-account-B')
+code,_=api('/bilibili/publish',dict(wrong_payload,account_id=str(name_b)))
+assert code==409,code
+wrong_id=uuid4()
+with engine.begin() as db:
+    db.execute(text("INSERT INTO accounts(id,platform,name,secrets_encrypted,is_active) VALUES(CAST(:id AS uuid),'douyin','test-wrong',:secret,true)"),
+       {'id':str(wrong_id),'secret':'dbplain:v1:'+json.dumps({'cookie':'SESSDATA=isolated-account-B; bili_jct=BCDE123456789012'})})
+code,_=api('/bilibili/publish',dict(wrong_payload,account_id=str(wrong_id)))
+assert code==409,code
+with engine.connect() as db:
+    assert db.execute(text('SELECT count(*) FROM publish_jobs WHERE task_id=CAST(:id AS uuid)'),{'id':str(wrong_task)}).scalar_one()==0
+print('PASS: inactive Bilibili and non-Bilibili Account rows cannot publish')
+
 counts=counters()
 
 # Restarting a disconnected Rust process must not replay a Bilibili archive

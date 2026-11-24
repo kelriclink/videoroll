@@ -133,6 +133,10 @@ mkdir -p "$SUBTITLE_WHISPER_MODEL_DIR"
 export VIDEOROLL_V2_ALLOW_TEST_MODEL_CATALOG_LOOPBACK="true"
 export VIDEOROLL_V2_ALLOW_TEST_BILIBILI_LOOPBACK="true"
 export VIDEOROLL_V2_TEST_BILIBILI_BASE="http://127.0.0.1:18096/"
+# Keep both HTTP API and the worker on the SAME isolated Bilibili mock.
+if [[ "${VIDEOROLL_V2_TEST_BILI_DIRECT_ONLY:-false}" == "true" ]]; then
+  export VIDEOROLL_V2_TEST_BILIBILI_BASE="http://127.0.0.1:18199/"
+fi
 export VIDEOROLL_V2_YT_DLP="$repo_root/rust/tests/mock_source_feed.sh"
 export VIDEOROLL_V2_MOCK_YT_LOG="$repo_root/rust/target/v2-mock-ytdlp-args.log"
 : > "$VIDEOROLL_V2_MOCK_YT_LOG"

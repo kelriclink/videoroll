@@ -190,9 +190,6 @@ async fn create(
             "native Bilibili publisher not enabled".into(),
         ));
     }
-    if body.account_id.is_some() {
-        return Err(AppError::Conflict("account_id requires a matching account-specific Bilibili Cookie; not implemented in Rust yet".into()));
-    }
     if body.force_retry {
         return Err(AppError::Conflict(
             "force_retry risks duplicate external archives; reconcile before retry".into(),
@@ -215,7 +212,12 @@ async fn create(
         .transpose()?
         .map(str::to_owned);
     // Require an actual live account and approved metadata, not only settings.
-    crate::bilibili_account_v1::publication_credentials(&state.db, &state.config).await?;
+    let (_, _, fingerprint) = crate::bilibili_account_v1::selected_publication_credentials(
+        &state.db,
+        &state.config,
+        body.account_id,
+    )
+    .await?;
     let snapshot = serde_json::to_value(&meta)
         .map_err(|_| AppError::Invalid("Bilibili metadata cannot be serialized".into()))?;
     crate::publish_review::ensure_approved(
@@ -269,17 +271,15 @@ async fn create(
         batch_is_active = batch.try_get::<String, _>("state")? == "active";
         let targets: Value = batch.try_get("expected_targets")?;
         let keys = crate::bilibili_batch_reconcile_v1::keys(&targets)?;
-        if !keys.iter().any(|key| key == "bilibili:default") {
+        let expected_target = format!(
+            "bilibili:{}",
+            body.account_id
+                .map(|v| v.to_string())
+                .unwrap_or("default".into())
+        );
+        if !keys.iter().any(|key| key == &expected_target) {
             return Err(AppError::Invalid(
                 "Bilibili default account is not an expected batch target".into(),
-            ));
-        }
-        if keys
-            .iter()
-            .any(|key| key.starts_with("bilibili:") && key != "bilibili:default")
-        {
-            return Err(AppError::Conflict(
-                "additional Bilibili account needs independently bound credentials".into(),
             ));
         }
     }
@@ -287,11 +287,13 @@ async fn create(
     // even when a different HTTP caller generated them (Python or Rust).
     let existing = sqlx::query(
         "SELECT id,state::text AS state,aid,bvid,response_json,batch_id
-       FROM publish_jobs WHERE task_id=$1 AND platform='bilibili' AND account_id IS NULL
+       FROM publish_jobs WHERE task_id=$1 AND platform='bilibili'
+         AND (($2::uuid IS NULL AND account_id IS NULL AND bili_account_id IS NULL)
+           OR ($2::uuid IS NOT NULL AND (account_id=$2 OR (account_id IS NULL AND bili_account_id=$2))))
          AND state::text IN ('published','submitting','submitted','unknown')
          ORDER BY updated_at DESC,created_at DESC,id DESC LIMIT 1",
     )
-    .bind(body.task_id)
+    .bind(body.task_id).bind(body.account_id)
     .fetch_optional(&mut *tx)
     .await?;
     if let Some(row) = existing {
@@ -323,14 +325,21 @@ async fn create(
                 continue;
             }
             let keys = crate::bilibili_batch_reconcile_v1::keys(&expected)?;
-            if keys.iter().any(|key| key == "bilibili:default") {
+            let account_target = format!(
+                "bilibili:{}",
+                body.account_id
+                    .map(|v| v.to_string())
+                    .unwrap_or("default".into())
+            );
+            if keys.iter().any(|key| key == &account_target) {
                 return Err(AppError::Conflict(
                     "another Bilibili batch owns this default account target".into(),
                 ));
             }
         }
     }
-    if matches!(status.as_str(), "CANCELED" | "PUBLISHED")
+    if status == "CANCELED"
+        || (status == "PUBLISHED" && body.batch_id.is_none())
         || (status == "PUBLISHING" && body.batch_id.is_none())
     {
         return Err(AppError::Conflict(
@@ -338,11 +347,16 @@ async fn create(
         ));
     }
     let unsafe_other: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM vr2_jobs
-       WHERE task_id=$1 AND stage='publish' AND
-         (state IN ('pending','running','awaiting','unknown','succeeded')))",
+        "SELECT EXISTS(SELECT 1 FROM vr2_jobs j
+         JOIN vr2_workflows w ON w.id=j.workflow_id
+       WHERE j.task_id=$1 AND j.stage='publish' AND
+         j.state IN ('pending','running','awaiting','unknown','succeeded') AND
+         (w.configuration->'bilibili_direct_v1' IS NULL OR
+         (w.configuration->'bilibili_direct_v1'->>'account_id')
+            IS NOT DISTINCT FROM $2::text))",
     )
     .bind(body.task_id)
+    .bind(body.account_id.map(|v| v.to_string()))
     .fetch_one(&mut *tx)
     .await?;
     if unsafe_other {
@@ -352,9 +366,13 @@ async fn create(
     }
     let busy: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM vr2_workflows
-       WHERE task_id=$1 AND state IN ('running','paused','unknown'))",
+       WHERE task_id=$1 AND state IN ('running','paused','unknown') AND
+          (configuration->'bilibili_direct_v1' IS NULL OR
+            (configuration->'bilibili_direct_v1'->>'account_id')
+              IS NOT DISTINCT FROM $2::text))",
     )
     .bind(body.task_id)
+    .bind(body.account_id.map(|v| v.to_string()))
     .fetch_one(&mut *tx)
     .await?;
     if busy {
@@ -413,10 +431,11 @@ async fn create(
     let stage_id = Uuid::new_v4();
     let original_operation = format!("publish-job:{job_id}");
     let original_meta = json!({"meta":snapshot,"video":body.video,"video_parts":body.video_parts,
-        "account_id":null,"platform":"bilibili","typeid_mode":body.typeid_mode});
+        "account_id":body.account_id,"platform":"bilibili","typeid_mode":body.typeid_mode});
     let direct = json!({"publish_job_id":job_id,"meta":meta,"parts":parts.iter()
         .map(|(key,title,kind)|json!({"key":key,"title":title,"kind":kind})).collect::<Vec<_>>(),
-        "cover_key":cover,"typeid_mode":body.typeid_mode});
+        "cover_key":cover,"typeid_mode":body.typeid_mode,
+        "account_id":body.account_id,"cookie_fingerprint":fingerprint});
     let config = json!({"auto_publish":true,"auto_publish_platforms":["bilibili"],"bilibili_direct_v1":direct});
     // Commit the legacy publish job + native stage + Python-recovery fence as
     // one transaction. Without this, a Python dispatcher can double-upload.
@@ -444,9 +463,9 @@ async fn create(
     .await?;
     sqlx::query("INSERT INTO publish_jobs(id,task_id,batch_id,platform,account_id,bili_account_id,meta_json,cover_key,
        state,operation_key,lease_owner,lease_until)
-       VALUES($1,$2,$3,'bilibili',NULL,NULL,$4,$5,'submitting',$6,
+       VALUES($1,$2,$3,'bilibili',$4,$4,$5,$6,'submitting',$7,
           'rust-v2',now()+interval '48 hours')")
-        .bind(job_id).bind(body.task_id).bind(body.batch_id).bind(&original_meta).bind(&cover)
+        .bind(job_id).bind(body.task_id).bind(body.batch_id).bind(body.account_id).bind(&original_meta).bind(&cover)
         .bind(&original_operation).execute(&mut *tx).await?;
     sqlx::query(
         "INSERT INTO operation_inbox(id,operation_key,status,request_json,lease_owner,

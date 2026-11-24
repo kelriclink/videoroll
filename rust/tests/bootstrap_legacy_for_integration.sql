@@ -4,6 +4,20 @@ CREATE TYPE source_license AS ENUM ('own','authorized','cc','unknown');
 CREATE TYPE task_status AS ENUM ('created','ingested','downloaded','audio_extracted','asr_done','translated','subtitle_ready','rendered','ready_for_review','approved','publishing','published','failed','canceled');
 CREATE TYPE subtitle_format AS ENUM ('srt','vtt','ass');
 CREATE TYPE asset_kind AS ENUM ('video_raw','metadata_json','audio_wav','segments_json','subtitle_srt','subtitle_ass','video_final','dubbing_audio','video_dubbed','cover_image','log','publish_result');
+CREATE TYPE platform AS ENUM ('bilibili','youtube','douyin','xiaohongshu','kuaishou','tencent');
+CREATE TABLE accounts (
+  id UUID PRIMARY KEY,
+  platform platform NOT NULL,
+  name VARCHAR(128) NOT NULL,
+  secrets_encrypted TEXT NOT NULL DEFAULT '',
+  rotated_at TIMESTAMPTZ,
+  is_active BOOLEAN NOT NULL DEFAULT true,
+  check_state VARCHAR(16) NOT NULL DEFAULT 'unchecked',
+  last_checked_at TIMESTAMPTZ,
+  last_check_message TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE(platform,name)
+);
 
 CREATE TABLE tasks (
   id UUID PRIMARY KEY,

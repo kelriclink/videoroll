@@ -19,7 +19,10 @@
 
 ## 暂不支持的旧合约
 
-- `account_id` 对应的 B 站多账号 Cookie **原 Python 实现也有实际缺陷**：`main.py` 会把 account_id 写入原 `publish_jobs`，但 `worker.py` 实际调用的是全局 `get_bilibili_cookie_header/get_bilibili_csrf_token`，没有读取对应的账号 Cookie。因此 Rust 不得仅为了让接口返回 200 而将稿件发给错误账号；非空 `account_id` 仍显式拒绝，需先完成账号专属凭据与真实发布身份绑定的跨语言设计和隔离验证。对于 `expected_targets` 中其他渠道账号 ID，当前只读原有投稿凭据与回执，不擅自向这些平台发帖。
+- `account_id` 已接通原 `accounts(platform=bilibili)` 账号行。Rust 解析原 `secrets_encrypted` 的 `dbplain:v1:` 格式及兼容 JSON Cookie 字段，**绝不**把指定账号降级成全局 `bilibili.auth`。入队时同时保存原 `publish_jobs.account_id/bili_account_id`、工作流账号 ID 和 Cookie+`rotated_at` 指纹；Worker 开始上传前再次读取同一账号记录并校验 ID/指纹，发现停用、平台不匹配、丢失或轮换凭据，直接进入 `unknown` 且不得重投。`batch_id` 必须显式包含该 B 站账号目标，允许同一任务两个 B 站账号各产生独立稿件，并在全部目标完成后才结算批次。
+- 由于旧 Python Worker 会无条件读取全局 Cookie，旧版 `account_id` 虽然有字段却会错号投稿；Rust **没有复制这个缺陷**。新增 Rust API 扩展：`GET /bilibili/accounts`、`POST /bilibili/accounts`（按名称 upsert/重置账号检查状态）、`DELETE /bilibili/accounts/{id}`（停用并清空 Cookie）、`POST /bilibili/accounts/{id}/check`（使用该账号 Cookie 向官方 B 站成员接口核对 UID）。账号 API 返回 ID、名称、状态/UID 等必要资料，**不返回 Cookie**，亦不向客户端回显原始凭据。此 CRUD 是 Rust 扩展而非原 Python 217 条路由之一。
+- 保持与 Python 现有数据库恢复模型相同的 Cookie 存储方式（PostgreSQL 可恢复 `dbplain:v1:`）；数据库权限和备份必须按高敏感凭据保护。Fernet 历史密文仍要求先在可信旧环境解密/迁移，Rust 不会猜测原旧密钥。默认账号仍读原全局 `bilibili.auth`，且不会被命名账号的更新修改。
+
 - `batch_id` 已支持原 `publish_batches.expected_targets` 中包含 `bilibili:default` 的多目标批次，也支持 B 站和其他平台各自拥有独立活动批次。全部复用原表 `publish_batches`、`publish_jobs`、`outbox_events` 与原字段。锁定 Task→Workflow→Job→Batch；Rust 的单次 B 站回执和批次状态在同一个事务中结算。按 Python `publish_lifecycle.py` 对每个 `(platform,account_id)` 选取最新作业，缺少作业时回退原 `outcomes_json`：全部成功才标 `succeeded`，还有未完成目标则维持 `active`，部分失败为 `partial_failed`，全部失败为 `failed`。任务状态按照各渠道的**最新批次**综合计算，防止 B 站成功提前覆盖仍在运行的抖音等目标。
 - 批次终态生成与原 Python 相同 operation_key 的 `workflow.publish.finished` Outbox；所有当前渠道均成功时生成延迟 24 小时的 `publish.cleanup` Outbox（只入队不伪称实际执行）。原 `PublishResponse`、原作业租约与未知回执的防重原则不变；历史空 `expected_targets=[]` 的遗留 marker 不参与当前批次统计。已有批次终态的重复请求复用其原回执，不会重新发布或把 B 站成功回执误转移给新批次。
 - `force_retry=true` 会覆盖未知平台回执，Rust 直接拒绝，必须人工检查 B 站真实稿件后再设计有审核的恢复流程。

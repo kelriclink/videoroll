@@ -12,11 +12,15 @@ class Handler(BaseHTTPRequestHandler):
   if etag:self.send_header('ETag',etag)
   self.send_header('Content-Length',str(len(value)))
   self.end_headers();self.wfile.write(value)
- def auth(self):return 'SESSDATA=video-roll-test' in self.headers.get('Cookie','')
+ def auth(self):return any('SESSDATA='+item in self.headers.get('Cookie','') for item in ('video-roll-test','isolated-account-A','isolated-account-B','isolated-rotated'))
  def do_GET(self):
   url=urlparse(self.path)
   if url.path=='/__state':return self.send(200,STATE)
   if not self.auth():return self.send(403,{'code':-101})
+  if url.path=='/x/member/web/account':
+   cookie=self.headers.get('Cookie','')
+   mid=61001 if 'isolated-account-A' in cookie else 61002 if 'isolated-account-B' in cookie else 61000
+   return self.send(200,{'code':0,'data':{'mid':mid,'uname':'isolated-user-'+str(mid)}})
   if url.path=='/x/vupre/web/archive/pre':
    STATE['type_catalog']+=1
    return self.send(200,{'code':0,'data':{'typelist':[
@@ -71,8 +75,11 @@ class Handler(BaseHTTPRequestHandler):
    return self.send(200,{'code':0,'data':{'url':'https://i0.hdslb.com/mock_cover.jpg'}})
   if url.path=='/x/vu/web/add/v3':
    data=json.loads(body)
-   assert data['csrf']=='1234567890123456',data
-   assert data['title'] in ['isolated Rust P1','ambiguous-publish','two-part','ai-summary','ai-invalid','batch-only','batch-unknown'],data
+   expected={'named-account-A':('isolated-account-A','ABCD123456789012'),
+             'named-account-B':('isolated-account-B','BCDE123456789012')}.get(data['title'],('video-roll-test','1234567890123456'))
+   assert 'SESSDATA='+expected[0] in self.headers.get('Cookie',''),data['title']
+   assert data['csrf']==expected[1],data['title']
+   assert data['title'] in ['isolated Rust P1','ambiguous-publish','two-part','ai-summary','ai-invalid','batch-only','batch-unknown','named-account-A','named-account-B'],data
    assert data['copyright']==2 and data['source'].startswith('https://youtu.be/'),data
    assert data['videos'][0]['filename']=='rust-test' and data['videos'][0]['cid']==421,data
    if data['title']=='isolated Rust P1':assert data['cover']=='https://i0.hdslb.com/mock_cover.jpg',data
