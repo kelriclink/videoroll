@@ -228,6 +228,11 @@ pub async fn bulk(
                 "bulk adoption requires the complete verified migration ledger".into(),
             ));
         }
+        if preflight["database_collation"]["compatible"] != true {
+            return Err(AppError::Conflict(
+                "bulk adoption requires compatible database collation".into(),
+            ));
+        }
     } else if quiesced || expected_plan.is_some() {
         return Err(AppError::Invalid(
             "quiesced and plan-token are only valid with apply".into(),
