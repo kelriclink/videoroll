@@ -14,6 +14,9 @@ def db():return psycopg.connect(url)
 def setting(k,v):
     with db() as c:c.execute("INSERT INTO app_settings(key,value_json) VALUES(%s,%s) ON CONFLICT(key) DO UPDATE SET value_json=EXCLUDED.value_json",(k,json.dumps(v)))
 parallel=os.getenv("VIDEOROLL_TEST_PARALLEL_RAG")=="true"
+web_fault=os.getenv("VIDEOROLL_TEST_RAG_WEB_FAULT")=="true"
+assert not web_fault or parallel
+web_calls=[]
 source=["First 10 volts.","Second 20 volts.","Rust compiler line." if parallel else "Rust line.","Fourth line.","Fifth line."]
 starts=[.2,1.2,2.2,7.2,8.2]
 target=["10伏特","10伏特（第二次）","第三句","第四句","第五句"]
@@ -21,6 +24,23 @@ observed=[];errors=[];asr_calls=[];repairs=[];research_calls=[];failed_once=Fals
 child_calls={};peak=0;active=0;child_failed=False
 mutex=threading.Lock();barrier=threading.Barrier(2,timeout=8)
 class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        global child_failed
+        from urllib.parse import parse_qs
+        try:
+            assert web_fault
+            parsed=urlsplit(self.path)
+            assert parsed.path=="/search"
+            query=parse_qs(parsed.query)
+            assert query=={"q":["Fourth line"],"format":["json"]},query
+            web_calls.append(query["q"][0])
+            if len(web_calls)==1:
+                child_failed=True
+                self.send_error(503,"injected search failure")
+                return
+            self.reply_json({"results":[{"title":"Fixture","url":"https://example.invalid/fixture","content":"fixture-web-evidence"}]})
+        except Exception as e:
+            errors.append(repr(e));self.send_error(400)
     def do_POST(self):
         global failed_once,child_failed,peak,active
         try:
@@ -38,13 +58,16 @@ class Handler(BaseHTTPRequestHandler):
                     result={"terms":[{"term":"Rust","category":"proper_noun","scope":"global","priority":0.9,"need_rag":True,"need_search":True},{"term":"volts","category":"unit_or_number","scope":"global","need_rag":True},{"term":"fabricated term","category":"proper_noun","scope":"global","need_rag":True}]}
                     if parallel:
                         result["terms"][0]["term"]="Rust compiler"
+                        if web_fault:result["terms"][0]["need_search"]=False
                         result["terms"].append({"term":"Fourth line","category":"task_context","scope":"task","priority":0.8,"need_rag":True,"need_search":True})
                     return self.reply_json({"choices":[{"message":{"content":json.dumps(result)}}]})
                 if "VideoRoll term specialist" in messages[0]["content"]:
                     assert parallel
                     payload=json.loads(messages[-1]["content"]);term=payload["candidate"]["term"]
                     assert term in ("Rust compiler","Fourth line"),payload
-                    assert not payload["web_evidence"],payload
+                    if web_fault and term=="Fourth line":
+                        assert "fixture-web-evidence" in json.dumps(payload["web_evidence"]),payload
+                    else:assert not payload["web_evidence"],payload
                     assert "fixture-pending" not in json.dumps(payload),payload
                     if term=="Rust compiler":
                         assert "fixture-original-compiler" in json.dumps(payload["local_evidence"]),payload
@@ -53,9 +76,9 @@ class Handler(BaseHTTPRequestHandler):
                         child_calls[term]=child_calls.get(term,0)+1
                         attempt=child_calls[term]
                     try:
-                        if attempt==1:barrier.wait()
+                        if attempt==1 and not web_fault:barrier.wait()
                         time.sleep(.15)
-                        if term=="Fourth line" and attempt==1:
+                        if term=="Fourth line" and attempt==1 and not web_fault:
                             child_failed=True
                             # Fail one specialist only. The other must be committed and reused.
                             self.send_error(503,"injected specialist failure")
@@ -110,8 +133,8 @@ server=ThreadingHTTPServer(("127.0.0.1",0),Handler)
 threading.Thread(target=server.serve_forever,daemon=True).start()
 base=f"http://127.0.0.1:{server.server_address[1]}"
 setting("subtitle.auto_profile",{"translate_enabled":True,"translate_provider":"openai","translate_model_provider_id":"legacy","translate_glossary":{"volts":"伏特"},"target_lang":"zh","bilingual":False,"auto_publish":False,"auto_publish_platforms":[],"auto_dub_p2":False,"burn_in":False})
-setting("subtitle.translate",{"default_batch_size":2,"default_enable_summary":True,"rag_enabled":True,"rag_auto_discover_terms":True,"rag_search_enabled":False,"rag_agent_parallelism":2 if parallel else 1,"rag_domain":"electronics","openai":{"base_url":base+"/v1","model":"fixture-translation","api_key_enc":"dbplain:v1:fixture-translation-key"}})
-setting("subtitle.rag",{"enabled":False,"research_blocking":parallel,"max_research_steps":2})
+setting("subtitle.translate",{"default_batch_size":2,"default_enable_summary":True,"rag_enabled":True,"rag_auto_discover_terms":True,"rag_search_enabled":web_fault,"rag_agent_parallelism":2 if parallel else 1,"rag_domain":"electronics","openai":{"base_url":base+"/v1","model":"fixture-translation","api_key_enc":"dbplain:v1:fixture-translation-key"}})
+setting("subtitle.rag",{"enabled":False,"research_blocking":parallel,"max_research_steps":2,"max_web_searches":2 if web_fault else 0,"web_search_endpoint":base+"/search" if web_fault else None})
 setting("youtube.settings",{"home_scan_enabled":False})
 env={k:v for k,v in os.environ.items() if k in ("PATH","HOME","LANG","LC_ALL","LD_LIBRARY_PATH","DATABASE_URL","VIDEOROLL_V2_STORAGE_ROOT","VIDEOROLL_V2_INTERNAL_TOKEN","INTERNAL_API_SECRET")}
 env.update(VIDEOROLL_V2_NATIVE_OUTBOX_ONLY="true",VIDEOROLL_V2_STANDALONE="true",VIDEOROLL_V2_SOURCE_SCANNER="false",VIDEOROLL_V2_ENABLE_NATIVE_BILIBILI="false",VIDEOROLL_V2_ENABLE_SAU_PUBLISH="false",VIDEOROLL_V2_ENABLE_LEGACY_PUBLISH="false",VIDEOROLL_V2_COMPAT_WRITE="false",VIDEOROLL_V2_REMOTE_RENDER="false",VIDEOROLL_V2_WORKERS="1",VIDEOROLL_V2_ASR_ENDPOINT=base+"/v1/audio/transcriptions",VIDEOROLL_V2_ASR_MODEL="whisper-fixture")
@@ -188,21 +211,30 @@ try:
         assert state=="succeeded" and plan["gate_completed"],(state,plan)
         assert c.execute("SELECT count(*) FROM translation_knowledge_items").fetchone()[0]==2
         if parallel:
-            assert peak==2 and child_calls=={"Rust compiler":1,"Fourth line":2} and research_calls==["gate"],(peak,child_calls,research_calls)
+            assert (web_fault or peak==2) and child_calls=={"Rust compiler":1,"Fourth line":1 if web_fault else 2} and research_calls==["gate"],(peak,child_calls,research_calls)
             assert len(plan["gate_candidates"])==2 and plan["parallelism"]==2
             master=uuid.UUID(plan["master_agent_id"])
             assert result["master_agent_id"]==str(master) and result["failed_children"]==0
             parent=c.execute("SELECT agent_type,status,checkpoint FROM translation_agent_runs WHERE id=%s",(master,)).fetchone()
             assert parent[:2]==("rag_master","succeeded"),parent
-            assert parent[2]["model_calls"]==parent[2]["model_budget"]==4 and parent[2]["web_calls"]==0,parent
+            assert parent[2]["model_calls"]==(3 if web_fault else 4) and parent[2]["model_budget"]==4,parent
+            assert parent[2]["web_calls"]==parent[2]["web_budget"]==(2 if web_fault else 0),parent
+            assert parent[2]["knowledge_calls"]==2 and parent[2]["knowledge_budget"]==4,parent
             children=c.execute("SELECT term,status,checkpoint->>'attempts' FROM translation_agent_runs WHERE parent_agent_run_id=%s ORDER BY term",(master,)).fetchall()
             assert children==[("Fourth line","succeeded","2"),("Rust compiler","succeeded","1")],children
             receipts=c.execute("SELECT term,checkpoint->'initial_evidence' FROM translation_agent_runs WHERE parent_agent_run_id=%s ORDER BY term",(master,)).fetchall()
             assert all(isinstance(v,dict) for _,v in receipts),receipts
+            assert c.execute("SELECT count(*) FROM translation_agent_runs WHERE parent_agent_run_id=%s AND jsonb_typeof(checkpoint->'knowledge_receipt')='array'",(master,)).fetchone()[0]==2
+            assert c.execute("SELECT count(*) FROM translation_agent_events e JOIN translation_agent_runs r ON r.id=e.run_id WHERE r.parent_agent_run_id=%s AND e.action='search_knowledge' AND e.status='succeeded'",(master,)).fetchone()[0]==2
+            if web_fault:
+                assert web_calls==["Fourth line","Fourth line"],web_calls
+                assert c.execute("SELECT count(*) FROM translation_agent_events e JOIN translation_agent_runs r ON r.id=e.run_id WHERE r.parent_agent_run_id=%s AND e.action='search_web' AND e.status='failed'",(master,)).fetchone()[0]==1
+                assert c.execute("SELECT count(*) FROM translation_agent_runs WHERE parent_agent_run_id=%s AND jsonb_typeof(checkpoint->'web_receipt')='array'",(master,)).fetchone()[0]==1
+                print("PASS: web 503 retried independently, knowledge receipts reused, model budget not consumed by failed search",flush=True)
             assert c.execute("SELECT count(*) FROM translation_agent_events e JOIN translation_agent_runs r ON r.id=e.run_id WHERE r.parent_agent_run_id=%s AND e.action='initial_retrieval' AND e.status='succeeded'",(master,)).fetchone()[0]==2
             print("PASS: initial evidence checkpoint saved once per specialist, survives subsequent model failure",flush=True)
             assert c.execute("SELECT count(*) FROM translation_agent_events WHERE run_id IN (SELECT id FROM translation_agent_runs WHERE task_id=%s) AND status='failed'",(task,)).fetchone()[0]>=1
-            print("PASS: two concurrent specialists; one injected failure; persisted gate and successful child not replayed; shared model budget 4/4, no web, original master/child history and events",flush=True)
+            print("PASS: specialist recovery, persisted gate and successful child not replayed; separate model, knowledge and web budgets, original history and events",flush=True)
         else:
             assert research_calls==["gate","search_knowledge","finish"],research_calls
             assert len(plan["gate_candidates"])==1 and result["tool_steps"][0]["action"]=="search_knowledge"
