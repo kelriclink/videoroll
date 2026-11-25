@@ -289,8 +289,8 @@ async fn execution_read(state: &AppState, id: Uuid) -> AppResult<Json<Value>> {
         .await?;
     Ok(Json(execution_payload(&row)?))
 }
-// Only operate on an exact native awaiting render stage. Never reset a live
-// worker, a registered output, a historical execution, or a completed receipt.
+// Only operate on an exact native awaiting render stage. Cancel fences a live
+// worker; requeue never resets it. Committed outputs and legacy rows are protected.
 async fn native_execution_change(
     state: &AppState,
     id: Uuid,
@@ -353,7 +353,7 @@ async fn native_execution_change(
     let task_status: String = task_row.try_get("status")?;
     let safe_state = execution_state == "queued"
         || (matches!(execution_state.as_str(), "running" | "uploading")
-            && row.try_get::<bool, _>("expired")?);
+            && (!requeue || row.try_get::<bool, _>("expired")?));
     if !safe_state
         || row
             .try_get::<Option<Uuid>, _>("uploaded_asset_id")?
@@ -369,7 +369,7 @@ async fn native_execution_change(
             "canceled" | "failed" | "published" | "publishing"
         )
     {
-        return Err(AppError::Conflict("render control requires queued or expired execution without uploaded output in a running render stage".into()));
+        return Err(AppError::Conflict("render control requires an eligible execution without uploaded output in a running render stage".into()));
     }
     let other_active: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM operation_inbox WHERE workflow_id=$1 AND runtime_engine='rust-v2' AND id<>$2 AND status IN ('pending','running','awaiting','unknown'))")
         .bind(flow).bind(job).fetch_one(&mut *tx).await?;
@@ -391,7 +391,7 @@ async fn native_execution_change(
         sqlx::query("UPDATE render_executions SET state='queued',worker_id=NULL,fence_token=NULL,lease_until=NULL,progress=0,finished_at=NULL,error_message=$2,updated_at=now() WHERE id=$1")
             .bind(id).bind(reason).execute(&mut *tx).await?;
     } else {
-        sqlx::query("UPDATE render_executions SET state='canceled',lease_until=NULL,finished_at=now(),error_message=$2,updated_at=now() WHERE id=$1")
+        sqlx::query("UPDATE render_executions SET state='canceled',lease_until=CASE WHEN state IN ('running','uploading') AND lease_until>now() THEN lease_until ELSE NULL END,finished_at=now(),error_message=$2,updated_at=now() WHERE id=$1")
             .bind(id).bind(reason).execute(&mut *tx).await?;
         sqlx::query("UPDATE vr2_jobs SET state='canceled',lease_token=NULL,lease_until=NULL,last_error=$2,finished_at=now(),updated_at=now() WHERE id=$1")
             .bind(job).bind(reason).execute(&mut *tx).await?;

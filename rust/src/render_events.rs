@@ -207,6 +207,10 @@ async fn recover_uploaded(
 pub async fn tick(db: &Database, config: &Config, limit: i64) -> AppResult<u64> {
     let store = AssetRegistry::new(db.clone(), config.storage_root.clone());
     let scheduler = Scheduler::new(db.clone(), config.job_lease);
+    // Canceled executions retain their former slot until stop acknowledgment
+    // or lease expiry; never extend a canceled lease or requeue that execution.
+    sqlx::query("WITH expired AS (SELECT id FROM render_executions WHERE runtime_engine='rust-v2' AND state='canceled' AND lease_until<=now() ORDER BY lease_until,id LIMIT $1 FOR UPDATE SKIP LOCKED) UPDATE render_executions e SET lease_until=NULL,updated_at=now() FROM expired WHERE e.id=expired.id")
+        .bind(limit.clamp(1,100)).execute(&db.pool).await?;
     // Limit expensive full-file verification per tick. Preserve bad evidence
     // for manual reconciliation rather than silently re-rendering or posting.
     let uploads=sqlx::query("SELECT e.* FROM render_executions e JOIN operation_inbox j ON j.id=e.job_id

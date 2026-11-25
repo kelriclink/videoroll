@@ -108,14 +108,14 @@ try:
     assert items[historical]["runtime_engine"]=="python"
     assert items[queued[2]]["cancel_supported"] and items[queued[2]]["requeue_supported"]
     assert items[expired[2]]["cancel_supported"] and items[expired[2]]["requeue_supported"]
-    assert all(not items[x]["control_supported"] for x in (live[2],completed[2],historical))
+    assert items[live[2]]["cancel_supported"] and not items[live[2]]["requeue_supported"]
+    assert all(not items[x]["control_supported"] for x in (completed[2],historical))
     assert ok("GET",mgmt+"/executions/"+live[2])["task_id"]==live[0]
     assert [r["id"] for r in ok("GET",mgmt+"/executions?state=succeeded")]==[completed[2]]
     assert [r["id"] for r in ok("GET",mgmt+"/executions?task_id="+queued[0])]==[queued[2]]
     assert len(ok("GET",mgmt+"/executions?worker_id="+worker))==3
     node=ok("GET",mgmt+"/workers")[0]
     assert node["active_jobs"]==1 and node["available_slots"]==2,node
-    assert call("POST",mgmt+"/executions/"+live[2]+"/cancel",{"reason":"fixture"})[0]==409
     assert call("POST",mgmt+"/executions/"+historical+"/requeue",{"reason":"fixture"})[0]==409
     with db() as c:
         assert c.execute("SELECT state FROM render_executions WHERE id=%s",(live[2],)).fetchone()[0]=="running"
@@ -159,7 +159,50 @@ try:
     assert call("POST",mgmt+"/executions/"+live[2]+"/requeue",{})[0]==409
     with db() as c:
         assert c.execute("SELECT count(*) FROM outbox_events").fetchone()[0]==0
-    print("PASS: native queued cancel and expired requeue are atomic/idempotent; live lease, uploaded output, exhausted budget, foreign ticket, completed and Python rows protected",flush=True)
+    print("PASS: native queued cancel and expired requeue are atomic/idempotent; live requeue, uploaded output, exhausted budget, foreign ticket, completed and Python rows protected",flush=True)
+    fence=uuid.uuid4().hex+uuid.uuid4().hex
+    with db() as c:
+        c.execute("UPDATE render_executions SET fence_token=%s WHERE id=%s",(fence,live[2]))
+        before=c.execute("SELECT lease_until FROM render_executions WHERE id=%s",(live[2],)).fetchone()[0]
+    path=mgmt+"/executions/"+live[2]+"/cancel"
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+        results=list(pool.map(lambda _:call("POST",path,{"reason":"stop live worker"}),range(3)))
+    assert all(code==200 and data["state"]=="canceled" for code,data in results),results
+    endpoint="/render-workers/v1/executions/"+live[2]
+    def worker_call(method,suffix,payload=None):
+        return call(method,endpoint+suffix,payload,auth=False,credential=credential)
+    code,poll=worker_call("GET","/cancel")
+    assert code==200 and poll["cancel_requested"] and poll["reason"]=="stop live worker"
+    assert worker_call("POST","/heartbeat",{"fence_token":fence,"progress":30,"metrics":{}})[0]==409
+    assert worker_call("POST","/complete",{"fence_token":fence,"output":{}})[0]==409
+    assert worker_call("POST","/fail",{"fence_token":"x"*64,"error":"wrong token","retryable":True})[0]==409
+    with db() as c:
+        assert c.execute("SELECT state,lease_until FROM render_executions WHERE id=%s",(live[2],)).fetchone()==("canceled",before)
+        assert c.execute("SELECT status FROM operation_inbox WHERE id=%s",(live[1],)).fetchone()[0]=="canceled"
+        assert c.execute("SELECT count(*) FROM workflow_events WHERE job_id=%s AND kind='workflow.canceled'",(live[1],)).fetchone()[0]==1
+    assert ok("GET",mgmt+"/workers")[0]["active_jobs"]==1
+    ok("PATCH",mgmt+"/workers/"+worker,{"max_concurrency":1})
+    claim=ok("POST","/render-workers/v1/"+worker+"/claim",{"available_slots":1,"accepted_transfer_modes":["http"],"available_encoders":["h264"]},auth=False,credential=credential)
+    assert claim["execution"] is None,claim
+    for _ in range(2):
+        code,body=worker_call("POST","/fail",{"fence_token":fence,"error":"worker stopped","retryable":True})
+        assert code==200 and body["state"]=="canceled",(code,body)
+    assert ok("GET",mgmt+"/workers")[0]["active_jobs"]==0
+    offline=native("uploading",300)
+    with db() as c:
+        c.execute("UPDATE render_executions SET fence_token=%s WHERE id=%s",(uuid.uuid4().hex+uuid.uuid4().hex,offline[2]))
+    assert ok("POST",mgmt+"/executions/"+offline[2]+"/cancel",{"reason":"offline worker"})["state"]=="canceled"
+    assert ok("GET",mgmt+"/workers")[0]["active_jobs"]==1
+    with db() as c:
+        c.execute("UPDATE render_executions SET lease_until=now()-interval '1 second' WHERE id=%s",(offline[2],))
+    subprocess.run([str(exe),"render-tick"],check=True,timeout=20)
+    assert ok("GET",mgmt+"/workers")[0]["active_jobs"]==0
+    with db() as c:
+        for item in (live,offline):
+            assert c.execute("SELECT state,lease_until FROM render_executions WHERE id=%s",(item[2],)).fetchone()==("canceled",None)
+            assert c.execute("SELECT status FROM operation_inbox WHERE id=%s",(item[1],)).fetchone()[0]=="canceled"
+            assert c.execute("SELECT count(*) FROM operation_inbox WHERE task_id=%s AND stage IN ('dubbing','publish')",(item[0],)).fetchone()[0]==0
+    print("PASS: live cancellation, fence acknowledgment, stale heartbeat/completion rejected, reserved slot, idempotent stop and offline expiry",flush=True)
     revoked_worker=ok("POST",mgmt+"/workers/"+worker+"/revoke-credential",{})
     assert not revoked_worker["credential_active"] and not revoked_worker["enabled"]
     assert call("POST","/render-workers/v1/"+worker+"/heartbeat",{

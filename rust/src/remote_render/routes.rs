@@ -78,7 +78,7 @@ async fn enrolled_execution(
 }
 async fn read_worker(state: &AppState, id: Uuid) -> AppResult<WorkerInfo> {
     let row=sqlx::query(
-        "SELECT w.*, (SELECT count(*) FROM vr2_render_executions e WHERE e.worker_id=w.id AND e.state IN ('running','uploading') AND e.lease_until>now())::bigint AS active_jobs FROM vr2_render_workers w WHERE w.id=$1"
+        "SELECT w.*, (SELECT count(*) FROM vr2_render_executions e WHERE e.worker_id=w.id AND e.state IN ('running','uploading','canceled') AND e.lease_until>now())::bigint AS active_jobs FROM vr2_render_workers w WHERE w.id=$1"
     ).bind(id).fetch_optional(&state.db.pool).await?
         .ok_or_else(||AppError::NotFound("render worker not found".into()))?;
     Ok(WorkerInfo {
@@ -384,7 +384,7 @@ async fn claim(
         return Ok(empty());
     }
     let active:i64=sqlx::query_scalar(
-        "SELECT count(*) FROM vr2_render_executions WHERE worker_id=$1 AND state IN ('running','uploading') AND lease_until>now()"
+        "SELECT count(*) FROM vr2_render_executions WHERE worker_id=$1 AND state IN ('running','uploading','canceled') AND lease_until>now()"
     ).bind(id).fetch_one(&mut *tx).await?;
     if active >= max as i64 {
         return Ok(empty());
@@ -555,6 +555,14 @@ async fn execution_cancel(
     let row = enrolled_execution(&s, &headers, id).await?;
     let task_id: Uuid = row.try_get("task_id")?;
     let workflow_id: Uuid = row.try_get("workflow_id")?;
+    let execution_state: String = row.try_get("state")?;
+    if execution_state == "canceled" {
+        return Ok(Json(CancelState {
+            cancel_requested: true,
+            reason: row.try_get("last_error")?,
+        })
+        .into_response());
+    }
     let current:Option<(String,String)>=sqlx::query_as(
         "SELECT upper(t.status::text),w.state FROM vr2_workflows w JOIN tasks t ON t.id=w.task_id WHERE w.id=$1 AND t.id=$2"
     ).bind(workflow_id).bind(task_id).fetch_optional(&s.db.pool).await?;
@@ -935,6 +943,23 @@ async fn execution_failed(
             .fetch_optional(&mut *tx)
             .await?
             .ok_or(AppError::Unauthorized)?;
+    // A worker may report its stop through the existing failure endpoint.
+    // Acknowledge cancellation without converting it to a retry or failure.
+    if row.try_get::<String, _>("state")? == "canceled" {
+        let fence: Option<String> = row.try_get("fence_token")?;
+        if !fence
+            .as_deref()
+            .is_some_and(|f| is_fence(f, &payload.fence_token))
+        {
+            return Err(AppError::Conflict(
+                "canceled render execution fenced".into(),
+            ));
+        }
+        let row=sqlx::query("UPDATE vr2_render_executions SET lease_until=NULL,updated_at=now() WHERE id=$1 RETURNING *")
+            .bind(id).fetch_one(&mut *tx).await?;
+        tx.commit().await?;
+        return Ok(Json(execution_info(&row)?));
+    }
     validate_lease(&row, &payload.fence_token)?;
     let attempt: i32 = row.try_get("attempt")?;
     let job_id: Uuid = row.try_get("job_id")?;
