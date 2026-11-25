@@ -565,6 +565,9 @@ if args.all_services:
             try:obj=json.loads(raw)
             except ValueError:obj=None
             return res.status,res.headers.get("Content-Type","").split(";")[0],obj
+    from contract_services_v5 import Fixtures
+    service_fixtures=Fixtures(root)
+    atexit.register(service_fixtures.close)
     for service,(binary,cmd,bindvar) in specifications.items():
         with socket.socket() as sock:
             sock.bind(("127.0.0.1",0))
@@ -576,6 +579,7 @@ if args.all_services:
              "VIDEOROLL_V2_SAU_ENABLE_NATIVE_LOGIN":"false",
              "VIDEOROLL_V2_SAU_ENABLE_NATIVE_PUBLISH":"false",
              "VIDEOROLL_V2_SAU_ENABLE_BROWSER_OUTBOX":"false"}
+        service_fixtures.configure(service,env)
         proc=subprocess.Popen([str(binaries/binary),*cmd],env=env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
         try:
             for _ in range(80):
@@ -585,6 +589,9 @@ if args.all_services:
                 except (OSError,urllib.error.URLError):pass
                 time.sleep(.15)
             else:raise RuntimeError(f"{service} health timeout")
+            positive_fixtures=service_fixtures.probe(service,lambda method,path,body=None,auth=True,form=False:service_call(port,method,path,body,auth,form))
+            results.extend(positive_fixtures)
+            fixture_routes={(r['method'],r['path']) for r in positive_fixtures}
             # Use real IDs returned by create routes, and run deletion last.
             provider_base="/subtitle/translate/model-providers"
             source_base="/youtube/sources"
@@ -657,6 +664,7 @@ if args.all_services:
                 key=lambda r:lifecycle_order.get((r["method"],r["path"]),1))
             for row in service_order:
                 template=row["path"];method=row["method"];path=template
+                if (method,template) in fixture_routes:continue
                 ctx=service_context
                 for field in re.findall(r"\{([^{}]+)\}",path):
                     path=path.replace("{"+field+"}",ctx.get(field,fake))
@@ -763,6 +771,7 @@ if args.all_services:
             proc.terminate()
             try:proc.wait(timeout=5)
             except subprocess.TimeoutExpired:proc.kill();proc.wait(timeout=5)
+            service_fixtures.restore()
     assert len(results)==len(matrix["routes"])
     assert {(r["service"],r["method"],r["path"]) for r in results}=={(r["service"],r["method"],r["path"]) for r in matrix["routes"]}
 summary={"standalone_egress_routes":len(standalone),
