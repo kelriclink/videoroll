@@ -26,6 +26,7 @@ pub mod download_runtime;
 pub mod egress_gateway_v1;
 pub mod error;
 pub mod executor;
+pub mod historical_p2_append;
 pub mod historical_p2_render;
 pub mod ingest;
 pub mod legacy_asset_delete_v1;

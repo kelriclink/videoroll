@@ -568,7 +568,7 @@ export function TaskDetailPublish({ controller }: { controller: TaskDetailContro
                   job.platform === "bilibili"
                   && job.state === "published"
                   && Boolean(job.aid)
-                  && (!job.auto_dub_p2 || job.auto_dub_p2.state === "failed");
+                  && (!job.auto_dub_p2 || (job.auto_dub_p2.state === "failed" && job.auto_dub_p2.retry_supported !== false));
                 const completedDub = dubbingJobs.find(
                   (item) => item.status === "succeeded" && Boolean(item.output.video_key)
                 );

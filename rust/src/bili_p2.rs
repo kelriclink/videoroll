@@ -55,7 +55,7 @@ struct ResolveRequest {
     evidence: String,
 }
 
-fn trim_title(raw: Option<&str>, p1: &str) -> AppResult<String> {
+pub(crate) fn trim_title(raw: Option<&str>, p1: &str) -> AppResult<String> {
     let result = raw
         .map(str::trim)
         .filter(|v| !v.is_empty())
@@ -131,7 +131,7 @@ async fn get(
     Path((task_id, publish_job_id)): Path<(Uuid, Uuid)>,
 ) -> AppResult<Json<AppendRecord>> {
     read_task(&state.db, task_id).await?;
-    let record = sqlx::query_as::<_, AppendRecord>(&format!(
+    let mut record = sqlx::query_as::<_, AppendRecord>(&format!(
         "{LOOKUP} WHERE publish_job_id=$1 AND task_id=$2"
     ))
     .bind(publish_job_id)
@@ -139,6 +139,7 @@ async fn get(
     .fetch_optional(&state.db.pool)
     .await?
     .ok_or_else(|| AppError::NotFound("P2 append not found".into()))?;
+    if let Some(dub)=sqlx::query_scalar::<_,Uuid>("SELECT (request_json->>'historical_dubbing_id')::uuid FROM operation_inbox WHERE id=$1 AND runtime_engine='rust-historical-p2-append'").bind(publish_job_id).fetch_optional(&state.db.pool).await? {record.dubbing_job_id=dub;}
     Ok(Json(record))
 }
 async fn enqueue(
@@ -152,6 +153,24 @@ async fn enqueue(
     {
         return Err(AppError::Conflict(
             "native Bilibili publishing disabled".into(),
+        ));
+    }
+    let historical: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM publish_jobs WHERE id=$1 AND task_id=$2)")
+            .bind(publish_job_id)
+            .bind(task_id)
+            .fetch_one(&state.db.pool)
+            .await?;
+    if historical {
+        return Ok(Json(
+            crate::historical_p2_append::enqueue(
+                &state.db,
+                task_id,
+                publish_job_id,
+                request.dubbing_job_id,
+                request.title.as_deref(),
+            )
+            .await?,
         ));
     }
     let video_key = verify_dubbing(&state.db, task_id, request.dubbing_job_id).await?;
@@ -177,6 +196,22 @@ async fn enqueue(
         .try_get::<Option<Value>, _>("result")?
         .unwrap_or(Value::Null);
     let aid = receipt_aid(&receipt)?;
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(aid)
+        .execute(&mut *tx)
+        .await?;
+    let other: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM vr2_bilibili_p2_appends WHERE aid=$1 AND publish_job_id<>$2)",
+    )
+    .bind(aid)
+    .bind(publish_job_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    if other {
+        return Err(AppError::Conflict(
+            "another P2 intent owns the archive".into(),
+        ));
+    }
     let p1 = crate::publish_meta::saved(&state.db, task_id)
         .await?
         .and_then(|meta| meta.get("title").and_then(Value::as_str).map(str::to_owned))
@@ -351,12 +386,44 @@ async fn claim(db: &Database) -> AppResult<Option<AppendRecord>> {
     tx.commit().await?;
     Ok(row)
 }
+fn check_historical_p1(
+    owner: &Value,
+    evidence: Option<&crate::historical_p2_append::Evidence>,
+) -> AppResult<()> {
+    if let Some(ev) = evidence {
+        if owner.pointer("/videos/0/cid").and_then(Value::as_i64) != Some(ev.cid)
+            || owner
+                .pointer("/archive/bvid")
+                .and_then(Value::as_str)
+                .is_some_and(|b| b != ev.bvid)
+        {
+            return Err(AppError::Conflict(
+                "historical P1 owner-side identity mismatch".into(),
+            ));
+        }
+    }
+    Ok(())
+}
 async fn process(
     config: &Config,
     db: &Database,
     store: &AssetRegistry,
     row: &AppendRecord,
 ) -> AppResult<()> {
+    let historical = crate::historical_p2_append::execution_evidence(
+        db,
+        store,
+        row.publish_job_id,
+        row.task_id,
+        row.dubbing_job_id,
+    )
+    .await?;
+    if historical
+        .as_ref()
+        .is_some_and(|e| e.aid != row.aid || e.key != row.output_video_key)
+    {
+        return Err(AppError::Conflict("historical P2 intent changed".into()));
+    }
     let client = NativeP2Client::new(config, db).await?;
     if !crate::publish_platforms::enabled(db, "bilibili").await? {
         return Err(AppError::Conflict(
@@ -364,6 +431,7 @@ async fn process(
         ));
     }
     let owner = client.owner(row.aid).await?;
+    check_historical_p1(&owner, historical.as_ref())?;
     if owned_p1(&owner, row.aid, row.uploaded_cid)? {
         update(db, row.publish_job_id, "published", None, None, None).await?;
         return Ok(());
@@ -384,7 +452,7 @@ async fn process(
         update(
             db,
             row.publish_job_id,
-            "uploaded",
+            "submitting",
             Some(&receipt.0),
             Some(receipt.1),
             None,
@@ -395,6 +463,7 @@ async fn process(
     // Fetch again before changing external archive. Its metadata may have been
     // edited during the potentially large upload.
     let current = client.owner(row.aid).await?;
+    check_historical_p1(&current, historical.as_ref())?;
     if owned_p1(&current, row.aid, Some(cid))? {
         update(db, row.publish_job_id, "published", None, None, None).await?;
         return Ok(());
@@ -575,6 +644,17 @@ async fn resolve(
             "only unknown P2 outcome can be manually resolved".into(),
         ));
     }
+    let historical = crate::historical_p2_append::execution_evidence(
+        &state.db,
+        &state.storage,
+        row.publish_job_id,
+        row.task_id,
+        row.dubbing_job_id,
+    )
+    .await?;
+    if historical.is_some() && !request.published {
+        return Err(AppError::Conflict("historical unknown P2 requires verified owner-side publication; failed replay remains disabled".into()));
+    }
     if request.published {
         let cid = row.uploaded_cid.ok_or_else(|| {
             AppError::Conflict("P2 CID unavailable; cannot prove publication".into())
@@ -583,6 +663,7 @@ async fn resolve(
             .await?
             .owner(row.aid)
             .await?;
+        check_historical_p1(&owner, historical.as_ref())?;
         if !owned_p1(&owner, row.aid, Some(cid))? {
             return Err(AppError::Conflict(
                 "author-side archive does not have the expected P2 CID".into(),
