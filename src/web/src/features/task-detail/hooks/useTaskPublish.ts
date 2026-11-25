@@ -332,7 +332,7 @@ export function useTaskPublish({
       setError("只能向当前任务已确认发布的 B 站 P1 稿件追加 P2");
       return;
     }
-    if (job.auto_dub_p2 && job.auto_dub_p2.state !== "failed") {
+    if (job.auto_dub_p2 && (job.auto_dub_p2.state !== "failed" || job.auto_dub_p2.retry_supported === false)) {
       setError(`配音 P2 当前状态：${job.auto_dub_p2.state}，请先核实，不能重复追加`);
       return;
     }

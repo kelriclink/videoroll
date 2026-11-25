@@ -526,6 +526,20 @@ async fn dubbing_jobs(
             "updated_at":row.try_get::<DateTime<Utc>,_>("updated_at")?,
         }));
     }
+    // Keep original recovered dubbing IDs selectable for a historical P1.
+    let historical = sqlx::query_scalar::<_,Value>(
+        "SELECT jsonb_build_object('id',d.id,'task_id',d.task_id,'subtitle_job_id',d.subtitle_job_id,
+          'status',d.status,'progress',d.progress,'operation_key',d.operation_key,
+          'request','{}'::jsonb,'output',jsonb_build_object('video_key',d.output_json->>'video_key'),
+          'error_message',d.error_message,'created_at',d.created_at,'updated_at',d.updated_at)
+         FROM dubbing_jobs d JOIN operation_inbox i ON i.task_id=d.task_id
+           AND i.runtime_engine='rust-historical-p2-render' AND i.status='completed'
+           AND i.result_json->>'historical_dubbing_id'=d.id::text
+           AND i.result_json->>'video_key'=d.output_json->>'video_key'
+         WHERE d.task_id=$1 AND d.status='succeeded'
+         ORDER BY d.created_at DESC LIMIT $2"
+    ).bind(id).bind(q.limit.unwrap_or(50).clamp(1,500)).fetch_all(&state.db.pool).await?;
+    output.extend(historical);
     Ok(Json(output))
 }
 async fn publish_jobs(
@@ -610,6 +624,21 @@ async fn publish_jobs(
             "updated_at":row.try_get::<DateTime<Utc>,_>("updated_at")?
         }));
     }
+    let historical=sqlx::query_scalar::<_,Value>(
+      "SELECT jsonb_build_object('id',p.id,'task_id',p.task_id,'batch_id',p.batch_id,
+        'platform',p.platform::text,'state',p.state::text,'aid',p.aid::text,'bvid',p.bvid,
+        'external_id',p.external_id,'external_url',p.external_url,'account_id',p.account_id,
+        'upload_progress',p.upload_progress,'upload_active',p.upload_active,
+        'started_at',p.started_at,'finished_at',p.finished_at,'created_at',p.created_at,'updated_at',p.updated_at,
+        'auto_dub_p2',CASE WHEN i.id IS NOT NULL THEN jsonb_build_object('state',i.p2_state,'title',i.p2_title,'error',i.p2_last_error,'dub_job_id',i.request_json->>'historical_dubbing_id','cid',i.p2_uploaded_cid,'retry_supported',false)
+          WHEN p.response_json->'auto_dub_p2' IS NOT NULL THEN jsonb_build_object('state',p.response_json->'auto_dub_p2'->>'state','title',p.response_json->'auto_dub_p2'->>'title') ELSE NULL END)
+       FROM publish_jobs p LEFT JOIN operation_inbox i ON i.id=p.id AND i.task_id=p.task_id AND i.runtime_engine='rust-historical-p2-append'
+       WHERE p.task_id=$1 AND p.platform::text='bilibili' AND p.state::text='published'
+         AND NOT EXISTS(SELECT 1 FROM vr2_jobs j WHERE j.id=p.id)
+         AND EXISTS(SELECT 1 FROM operation_inbox r WHERE r.task_id=p.task_id AND r.runtime_engine='rust-historical-p2-render' AND r.status='completed')
+       ORDER BY p.created_at DESC LIMIT $2"
+    ).bind(id).bind(q.limit.unwrap_or(50).clamp(1,500)).fetch_all(&state.db.pool).await?;
+    output.extend(historical);
     Ok(Json(output))
 }
 async fn playout_assets(
