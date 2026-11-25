@@ -13,13 +13,16 @@ exe=Path(__file__).resolve().parents[1]/"target/debug/videoroll-v2"
 def db():return psycopg.connect(url)
 def setting(k,v):
     with db() as c:c.execute("INSERT INTO app_settings(key,value_json) VALUES(%s,%s) ON CONFLICT(key) DO UPDATE SET value_json=EXCLUDED.value_json",(k,json.dumps(v)))
-source=["First 10 volts.","Second 20 volts.","Rust line.","Fourth line.","Fifth line."]
+parallel=os.getenv("VIDEOROLL_TEST_PARALLEL_RAG")=="true"
+source=["First 10 volts.","Second 20 volts.","Rust compiler line." if parallel else "Rust line.","Fourth line.","Fifth line."]
 starts=[.2,1.2,2.2,7.2,8.2]
 target=["10伏特","10伏特（第二次）","第三句","第四句","第五句"]
 observed=[];errors=[];asr_calls=[];repairs=[];research_calls=[];failed_once=False
+child_calls={};peak=0;active=0;child_failed=False
+mutex=threading.Lock();barrier=threading.Barrier(2,timeout=8)
 class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
-        global failed_once
+        global failed_once,child_failed,peak,active
         try:
             body=self.rfile.read(int(self.headers["Content-Length"]))
             if self.path=="/v1/audio/transcriptions":
@@ -33,7 +36,34 @@ class Handler(BaseHTTPRequestHandler):
                 if "pre-translation RAG gate" in messages[0]["content"]:
                     research_calls.append("gate")
                     result={"terms":[{"term":"Rust","category":"proper_noun","scope":"global","priority":0.9,"need_rag":True,"need_search":True},{"term":"volts","category":"unit_or_number","scope":"global","need_rag":True},{"term":"fabricated term","category":"proper_noun","scope":"global","need_rag":True}]}
+                    if parallel:
+                        result["terms"][0]["term"]="Rust compiler"
+                        result["terms"].append({"term":"Fourth line","category":"task_context","scope":"task","priority":0.8,"need_rag":True,"need_search":True})
                     return self.reply_json({"choices":[{"message":{"content":json.dumps(result)}}]})
+                if "VideoRoll term specialist" in messages[0]["content"]:
+                    assert parallel
+                    payload=json.loads(messages[-1]["content"]);term=payload["candidate"]["term"]
+                    assert term in ("Rust compiler","Fourth line"),payload
+                    assert not payload["web_evidence"],payload
+                    assert "fixture-pending" not in json.dumps(payload),payload
+                    if term=="Rust compiler":
+                        assert "fixture-original-compiler" in json.dumps(payload["local_evidence"]),payload
+                    with mutex:
+                        active+=1;peak=max(peak,active)
+                        child_calls[term]=child_calls.get(term,0)+1
+                        attempt=child_calls[term]
+                    try:
+                        if attempt==1:barrier.wait()
+                        time.sleep(.15)
+                        if term=="Fourth line" and attempt==1:
+                            child_failed=True
+                            # Fail one specialist only. The other must be committed and reused.
+                            self.send_error(503,"injected specialist failure")
+                            return
+                        result={"target":"Rust 编译器" if term=="Rust compiler" else "第四句","note":"fixture"}
+                        return self.reply_json({"choices":[{"message":{"content":json.dumps(result)}}]})
+                    finally:
+                        with mutex:active-=1
                 if "字幕术语研究 Agent" in messages[0]["content"]:
                     if "检索动作执行结果" in messages[-1]["content"]:
                         assert "fixture-original-compiler" in messages[-1]["content"],messages
@@ -80,8 +110,8 @@ server=ThreadingHTTPServer(("127.0.0.1",0),Handler)
 threading.Thread(target=server.serve_forever,daemon=True).start()
 base=f"http://127.0.0.1:{server.server_address[1]}"
 setting("subtitle.auto_profile",{"translate_enabled":True,"translate_provider":"openai","translate_model_provider_id":"legacy","translate_glossary":{"volts":"伏特"},"target_lang":"zh","bilingual":False,"auto_publish":False,"auto_publish_platforms":[],"auto_dub_p2":False,"burn_in":False})
-setting("subtitle.translate",{"default_batch_size":2,"default_enable_summary":True,"rag_enabled":True,"rag_auto_discover_terms":True,"rag_search_enabled":False,"rag_domain":"electronics","openai":{"base_url":base+"/v1","model":"fixture-translation","api_key_enc":"dbplain:v1:fixture-translation-key"}})
-setting("subtitle.rag",{"enabled":False})
+setting("subtitle.translate",{"default_batch_size":2,"default_enable_summary":True,"rag_enabled":True,"rag_auto_discover_terms":True,"rag_search_enabled":False,"rag_agent_parallelism":2 if parallel else 1,"rag_domain":"electronics","openai":{"base_url":base+"/v1","model":"fixture-translation","api_key_enc":"dbplain:v1:fixture-translation-key"}})
+setting("subtitle.rag",{"enabled":False,"research_blocking":parallel,"max_research_steps":2})
 setting("youtube.settings",{"home_scan_enabled":False})
 env={k:v for k,v in os.environ.items() if k in ("PATH","HOME","LANG","LC_ALL","LD_LIBRARY_PATH","DATABASE_URL","VIDEOROLL_V2_STORAGE_ROOT","VIDEOROLL_V2_INTERNAL_TOKEN","INTERNAL_API_SECRET")}
 env.update(VIDEOROLL_V2_NATIVE_OUTBOX_ONLY="true",VIDEOROLL_V2_STANDALONE="true",VIDEOROLL_V2_SOURCE_SCANNER="false",VIDEOROLL_V2_ENABLE_NATIVE_BILIBILI="false",VIDEOROLL_V2_ENABLE_SAU_PUBLISH="false",VIDEOROLL_V2_ENABLE_LEGACY_PUBLISH="false",VIDEOROLL_V2_COMPAT_WRITE="false",VIDEOROLL_V2_REMOTE_RENDER="false",VIDEOROLL_V2_WORKERS="1",VIDEOROLL_V2_ASR_ENDPOINT=base+"/v1/audio/transcriptions",VIDEOROLL_V2_ASR_MODEL="whisper-fixture")
@@ -114,7 +144,7 @@ try:
         assert worker.poll() is None,log.read_text()
         with db() as c:
             row=c.execute("SELECT status,last_error,attempt_count FROM operation_inbox WHERE task_id=%s AND runtime_engine='rust-v2' AND stage='subtitle'",(task,)).fetchone()
-            if row and row[0]=="pending" and row[1] and failed_once:
+            if row and row[0]=="pending" and row[1] and (failed_once or child_failed):
                 # Only accelerate the isolated fixture's retry deadline.
                 c.execute("UPDATE operation_inbox SET available_at=now() WHERE task_id=%s AND runtime_engine='rust-v2' AND stage='subtitle' AND status='pending'",(task,))
         assert not errors,errors
@@ -123,7 +153,7 @@ try:
         time.sleep(.3)
     else:raise AssertionError(log.read_text()[-3000:])
     assert [len(x[0]) for x in observed]==[2,1,1,2],observed
-    assert failed_once and row[2]==2 and len(asr_calls)==1 and len(repairs)==1,(row,asr_calls,repairs)
+    assert failed_once and row[2]==(3 if parallel else 2) and len(asr_calls)==1 and len(repairs)==1,(row,asr_calls,repairs)
     examples=observed[0][1]["translation_examples"]
     assert {"reviewed-same-task","approved-global"}<={e["target"] for e in examples},examples
     assert observed[1][1]["context"]["previous_source"][-1]["translation"]==target[1]
@@ -152,14 +182,27 @@ try:
     assert meta["context_memory"]["ambiguities"]==[{"term":"volts","resolution":"voltage unit"}]
     assert meta["context_memory"]["topic"]=="electronics"
     assert "MUST NOT LEARN REPAIR" not in json.dumps(meta)
-    assert research_calls==["gate","search_knowledge","finish"],research_calls
     assert str(dynamic_id) in meta["rag_evidence_ids"],meta
     with db() as c:
         state,plan,result=c.execute("SELECT research_state,research_plan,research_result FROM pipeline_runs WHERE task_id=%s AND engine='rust-v2'",(task,)).fetchone()
-        assert state=="succeeded" and plan["gate_completed"] and len(plan["gate_candidates"])==1,(state,plan)
-        assert result["tool_steps"][0]["action"]=="search_knowledge"
+        assert state=="succeeded" and plan["gate_completed"],(state,plan)
         assert c.execute("SELECT count(*) FROM translation_knowledge_items").fetchone()[0]==2
-    print("PASS: original discovery config activates gate; grounded candidate filter, original approved dynamic lookup, durable provenance and cached research reuse; no web or automatic learning",flush=True)
+        if parallel:
+            assert peak==2 and child_calls=={"Rust compiler":1,"Fourth line":2} and research_calls==["gate"],(peak,child_calls,research_calls)
+            assert len(plan["gate_candidates"])==2 and plan["parallelism"]==2
+            master=uuid.UUID(plan["master_agent_id"])
+            assert result["master_agent_id"]==str(master) and result["failed_children"]==0
+            parent=c.execute("SELECT agent_type,status,checkpoint FROM translation_agent_runs WHERE id=%s",(master,)).fetchone()
+            assert parent[:2]==("rag_master","succeeded"),parent
+            assert parent[2]["model_calls"]==parent[2]["model_budget"]==4 and parent[2]["web_calls"]==0,parent
+            children=c.execute("SELECT term,status,checkpoint->>'attempts' FROM translation_agent_runs WHERE parent_agent_run_id=%s ORDER BY term",(master,)).fetchall()
+            assert children==[("Fourth line","succeeded","2"),("Rust compiler","succeeded","1")],children
+            assert c.execute("SELECT count(*) FROM translation_agent_events WHERE run_id IN (SELECT id FROM translation_agent_runs WHERE task_id=%s) AND status='failed'",(task,)).fetchone()[0]>=1
+            print("PASS: two concurrent specialists; one injected failure; persisted gate and successful child not replayed; shared model budget 4/4, no web, original master/child history and events",flush=True)
+        else:
+            assert research_calls==["gate","search_knowledge","finish"],research_calls
+            assert len(plan["gate_candidates"])==1 and result["tool_steps"][0]["action"]=="search_knowledge"
+            print("PASS: original discovery config activates gate; grounded candidate filter, original approved dynamic lookup, durable provenance and cached research reuse; no web or automatic learning",flush=True)
 
     print("PASS: native worker hard glossary+adjacent duplicate repair only affected rows, numeric warning nonblocking, prior repaired checkpoint and grounded memory restored, original IDs and approved memory protected",flush=True)
 finally:
