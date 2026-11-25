@@ -15,6 +15,9 @@ use std::{collections::HashSet, time::Duration};
 use uuid::Uuid;
 #[path = "agent_parallel.rs"]
 mod parallel;
+#[path = "agent_tools.rs"]
+mod tools;
+use tools::{RetrievalKind, RetrievalQuery};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WebEvidence {
@@ -530,12 +533,8 @@ async fn run_steps(
                 return Ok(combined);
             }
             "search_knowledge" => {
-                if query.is_empty() {
-                    return Err(AppError::Unavailable(
-                        "RAG Agent asked for empty knowledge query".into(),
-                    ));
-                }
-                if !queries.insert(("knowledge", query.to_lowercase())) {
+                let invocation = RetrievalQuery::new(RetrievalKind::Knowledge, &query)?;
+                if !queries.insert(invocation.key()) {
                     return Err(AppError::Unavailable(
                         "duplicate research knowledge query".into(),
                     ));
@@ -550,31 +549,7 @@ async fn run_steps(
                     ));
                 }
                 let original = crate::rag_original_v1::settings(db).await?;
-                let mut rows = if original.enabled {
-                    crate::rag_original_v1::exact(db, &query, task.target_lang, &original).await?
-                } else {
-                    Vec::new()
-                };
-                if settings.enabled {
-                    rows.extend(
-                        crate::rag::search(
-                            db,
-                            &SearchKnowledge {
-                                query: query.clone(),
-                                collection: settings.collection.clone(),
-                                task_id: Some(job.task_id),
-                                limit: Some(5),
-                                embedding: None,
-                                embedding_model: None,
-                            },
-                        )
-                        .await?,
-                    );
-                }
-                let mut seen = HashSet::new();
-                rows.retain(|h| seen.insert(h.id));
-                rows.truncate(5);
-                lease(db, job).await?;
+                let rows = invocation.knowledge(db, task, &original).await?;
                 documents.extend(rows.iter().cloned());
                 let result = json!({
                     "action":"search_knowledge","query":query,
@@ -602,7 +577,8 @@ async fn run_steps(
                         "RAG Agent exceeded web-search tool budget".into(),
                     ));
                 }
-                if !queries.insert(("web", query.to_lowercase()))
+                let invocation = RetrievalQuery::new(RetrievalKind::Web, &query)?;
+                if !queries.insert(invocation.key())
                     || (task.gate
                         && !candidates.iter().any(|v| {
                             v.need_search
@@ -614,7 +590,7 @@ async fn run_steps(
                     ));
                 }
                 web_calls += 1;
-                let results = search_web(&client, settings, &query).await?;
+                let results = invocation.web(db, task, &client, true).await?;
                 let count = results.len();
                 let response = json!({"action":"search_web","query":query,
                     "results":results});

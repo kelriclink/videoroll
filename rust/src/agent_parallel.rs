@@ -182,14 +182,8 @@ async fn child(
         let InitialEvidence { knowledge, web } = if let Some(value) = cached {
             value
         } else {
-            let mut knowledge=if original.enabled{crate::rag_original_v1::exact(db,&candidate.term,task.target_lang,original).await?}else{vec![]};
-            if task.settings.enabled{
-                knowledge.extend(crate::rag::search(db,&SearchKnowledge{query:candidate.term.clone(),collection:task.settings.collection.clone(),task_id:Some(task.job.task_id),limit:Some(5),embedding:None,embedding_model:None}).await?);
-            }
-            let mut seen=HashSet::new();knowledge.retain(|h|seen.insert(h.id));knowledge.truncate(5);
-            for h in &mut knowledge{h.content=h.content.chars().take(650).collect();h.title=h.title.chars().take(200).collect();}
-            lease(db,task.job).await?;
-            let web=if web{search_web(client,task.settings,&candidate.term).await?}else{vec![]};
+            let knowledge=RetrievalQuery::new(RetrievalKind::Knowledge,&candidate.term)?.knowledge(db,task,original).await?;
+            let web=if web{RetrievalQuery::new(RetrievalKind::Web,&candidate.term)?.web(db,task,client,allow_web).await?}else{vec![]};
             let value = InitialEvidence { knowledge, web };
             let mut tx = fenced(db,task.job).await?;
             sqlx::query("UPDATE translation_agent_runs SET checkpoint=checkpoint||$2,checkpointed_at=now(),updated_at=now() WHERE id=$1")
