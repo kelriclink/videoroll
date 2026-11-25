@@ -564,6 +564,124 @@ async fn recommend_archive_type(
     recommend_type_impl(&state.db, &state.config, payload).await
 }
 
+/// Resolve creator-center content tags using the legacy priority:
+/// generated AI tags -> explicit user tags -> authenticated recommendations
+/// -> generic fallback. Public topic/mission catalogues are never tag sources.
+pub(crate) async fn resolve_publish_tags(
+    db: &Database,
+    config: &Config,
+    task: Uuid,
+    typeid: u32,
+    title: &str,
+    description: &str,
+    external: bool,
+    explicit: &[String],
+) -> Vec<String> {
+    let generated: Vec<String> = sqlx::query_scalar(
+        "SELECT COALESCE(value_json->'tags','[]'::jsonb) FROM app_settings WHERE key=$1",
+    )
+    .bind(format!("bilibili.tags.{task}"))
+    .fetch_optional(&db.pool)
+    .await
+    .ok()
+    .flatten()
+    .and_then(|v| serde_json::from_value::<Vec<String>>(v).ok())
+    .unwrap_or_default();
+    let mut out = merge_publish_tags(generated, external);
+    out.extend(
+        explicit
+            .iter()
+            .map(|v| v.trim().to_owned())
+            .filter(|v| !v.is_empty()),
+    );
+    dedupe_publish_tags(&mut out);
+    if !out.is_empty() {
+        out.truncate(10);
+        return out;
+    }
+    let mut endpoint = Url::parse("https://member.bilibili.com/x/vupre/web/tag/recommend")
+        .expect("static Bilibili endpoint");
+    endpoint
+        .query_pairs_mut()
+        .append_pair("subtype_id", &typeid.to_string())
+        .append_pair("title", &title.chars().take(80).collect::<String>())
+        .append_pair(
+            "description",
+            &description.chars().take(500).collect::<String>(),
+        );
+    let path = format!("{}?{}", endpoint.path(), endpoint.query().unwrap_or(""));
+    if let Ok(response) = bili_get_from(db, config, "member.bilibili.com", &path).await
+        && response.get("code").and_then(Value::as_i64) == Some(0)
+        && let Some(rows) = response.get("data").and_then(Value::as_array)
+    {
+        for row in rows.iter().take(10) {
+            if let Some(tag) = row.get("tag").and_then(Value::as_str) {
+                let tag = tag.trim().trim_start_matches(['#', '＃']).trim();
+                if tag.is_empty()
+                    || tag.chars().count() > 20
+                    || matches!(
+                        tag,
+                        "生活记录" | "记录" | "热门" | "视频分享" | "分享" | "videoroll"
+                    )
+                    || (external && matches!(tag, "原创" | "首发" | "独家" | "自制" | "独家首发"))
+                {
+                    continue;
+                }
+                out.push(tag.to_owned());
+            }
+        }
+    }
+    dedupe_publish_tags(&mut out);
+    out.truncate(10);
+    if out.is_empty() {
+        vec!["视频分享".into()]
+    } else {
+        out
+    }
+}
+fn merge_publish_tags(generated: Vec<String>, external: bool) -> Vec<String> {
+    generated
+        .into_iter()
+        .filter_map(|v| {
+            let t = v.trim().to_owned();
+            if t.is_empty()
+                || t.eq_ignore_ascii_case("videoroll")
+                || (external
+                    && matches!(t.as_str(), "原创" | "首发" | "独家" | "自制" | "独家首发"))
+            {
+                None
+            } else {
+                Some(t)
+            }
+        })
+        .collect()
+}
+fn dedupe_publish_tags(tags: &mut Vec<String>) {
+    let mut seen = std::collections::HashSet::new();
+    tags.retain(|t| !t.trim().is_empty() && seen.insert(t.trim().to_lowercase()));
+}
+#[cfg(test)]
+mod publish_tag_tests {
+    use super::*;
+    #[test]
+    fn external_auto_brand_and_misleading_tags_are_filtered_but_explicit_survives() {
+        let mut v =
+            merge_publish_tags(vec!["videoroll".into(), "原创".into(), "技术".into()], true);
+        v.extend(vec!["videoroll".into(), "独家".into(), "人工标签".into()]);
+        dedupe_publish_tags(&mut v);
+        assert_eq!(v, vec!["技术", "videoroll", "独家", "人工标签"]);
+    }
+    #[test]
+    fn generated_then_explicit_dedup_is_case_insensitive() {
+        let mut v = merge_publish_tags(vec!["Rust".into(), " rust ".into()], false);
+        v.extend(merge_publish_tags(
+            vec!["RUST".into(), "编程".into()],
+            false,
+        ));
+        dedupe_publish_tags(&mut v);
+        assert_eq!(v, vec!["Rust", "编程"]);
+    }
+}
 // Direct publisher reuses exactly the same source priority, provider selection,
 // official partition leaf whitelist, LLM prompt and usage ledger as the V1 API.
 pub(crate) async fn recommend_for_publish(
