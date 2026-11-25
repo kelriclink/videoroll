@@ -53,25 +53,15 @@ fn endpoint(value: &str) -> AppResult<Url> {
     Ok(parsed)
 }
 pub(crate) fn decode_secret(encoded: &str) -> AppResult<Option<String>> {
-    if encoded.trim().is_empty() {
+    let Some(decoded) = crate::secret_compat::decode(encoded)? else {
         return Ok(None);
-    }
-    if encoded.starts_with("gAAAA") {
-        return Err(AppError::Unavailable(
-            "legacy Fernet credential cannot be recovered without the original encryption key"
-                .into(),
-        ));
-    }
-    let decoded = encoded.strip_prefix("dbplain:v1:").unwrap_or(encoded);
-    if decoded.is_empty()
-        || decoded.len() > 16384
-        || decoded.contains('\r')
-        || decoded.contains('\n')
-    {
+    };
+    if decoded.len() > 16384 || decoded.contains('\r') || decoded.contains('\n') {
         return Err(AppError::Invalid("invalid stored translation token".into()));
     }
-    Ok(Some(decoded.into()))
+    Ok(Some(decoded))
 }
+
 fn parse_positive(value: Option<&Value>) -> Option<u64> {
     let value = value?;
     let v = value

@@ -84,11 +84,24 @@ try:
     status,v=call('/bilibili/auth/settings')
     assert status==200 and v=={'cookie_set':False,'sessdata_set':False,'bili_jct_set':False},(status,v)
     status,v=call('/bilibili/archive/types')
-    assert status==400 and 'cookie' in v['detail'],(status,v)
+    assert status==400 and 'cookie' in v['detail'].lower(),(status,v)
     with Session(engine) as db:
         expected=update_bilibili_auth_settings(db,{'cookie':'Cookie: SESSDATA=previous; bili_jct=existing'})
     status,v=call('/bilibili/auth/settings')
     assert status==200 and v==BilibiliAuthSettingsRead(**expected).model_dump(),(status,v,expected)
+    if os.getenv("VIDEOROLL_TEST_CREDENTIAL_COMPAT")=="true":
+        from cryptography.fernet import Fernet
+        from pathlib import Path
+        key=Path(os.environ["VIDEOROLL_FERNET_KEY_PATH"]).read_bytes().strip()
+        cipher=Fernet(key).encrypt(b"SESSDATA=legacy-fixture; bili_jct=legacy-csrf").decode()
+        with engine.begin() as db:
+            db.execute(text("UPDATE app_settings SET value_json=CAST(:v AS jsonb) WHERE key='bilibili.auth'"),{"v":json.dumps({"cookie_enc":cipher})})
+        status,v=call('/bilibili/auth/me')
+        assert status==200 and observed[-1][1]=="SESSDATA=legacy-fixture; bili_jct=legacy-csrf"
+        with engine.begin() as db:
+            assert db.execute(text("SELECT value_json->>'cookie_enc' FROM app_settings WHERE key='bilibili.auth'")).scalar_one()==cipher
+        observed.clear()
+        print("PASS: original Fernet Bilibili cookie authenticated through loopback API; ciphertext unchanged")
     status,v=call('/bilibili/auth/settings','PUT',{'cookie':'Cookie: SESSDATA=abc; bili_jct=xyz'})
     assert status==200 and v=={'cookie_set':True,'sessdata_set':True,'bili_jct_set':True},(status,v)
     with Session(engine) as db:
@@ -109,6 +122,9 @@ try:
     provider_config={'default_provider':'openai','openai':{
         'base_url':f'http://127.0.0.1:{model_server.server_address[1]}/v1',
         'model':'mock-bili-typeid','api_key_enc':'dbplain:v1:isolated-typeid-key'}}
+    if os.getenv("VIDEOROLL_TEST_CREDENTIAL_COMPAT")=="true":
+        provider_config["openai"]["api_key_enc"]=Fernet(key).encrypt(b"isolated-typeid-key").decode()
+
     with engine.begin() as db:
         db.execute(text("""INSERT INTO app_settings(key,value_json,version)
               VALUES('subtitle.translate',CAST(:v AS jsonb),1)

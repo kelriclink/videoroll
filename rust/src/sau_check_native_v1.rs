@@ -386,8 +386,8 @@ pub(crate) fn materialize_account_state(
     secret: &str,
 ) -> AppResult<CookieFile> {
     use std::{io::Write, os::unix::fs::OpenOptionsExt};
-    let raw = secret.strip_prefix("dbplain:v1:").unwrap_or(secret);
-    // Pre-DB-only Fernet credentials are not interpreted as JSON or copied.
+    let raw = crate::secret_compat::decode(secret)?
+        .ok_or_else(|| AppError::Invalid("SAU state is empty".into()))?;
     let canonical = canonical(raw.as_bytes())?;
     let file = runtime.cookies.join(format!(
         "{}_{}.json",

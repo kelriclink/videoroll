@@ -169,7 +169,7 @@ pub(crate) async fn selected_publication_credentials(
             "selected Bilibili account has no valid credentials".into(),
         ));
     }
-    let decoded = decode_secret(&encoded)?
+    let decoded = crate::secret_compat::decode(&encoded)?
         .ok_or_else(|| AppError::Conflict("selected account credentials missing".into()))?;
     let value = if decoded.trim_start().starts_with('{') {
         let record: Value = serde_json::from_str(&decoded)

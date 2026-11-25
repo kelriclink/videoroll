@@ -1,7 +1,7 @@
 //! Native V1 YouTube settings facade.
-//! Cookies are ONLY stored as owner-readable Netscape files, never DB rows,
-//! JSON responses, logs, or V2 assets. Legacy encrypted v1 cookies are NOT
-//! silently imported or decrypted; users must explicitly import into Rust.
+//! Original encrypted/DB-only cookies can be decoded in memory. New cookies
+//! use private files; downloads receive a disposable owner-readable copy.
+//! No raw cookies in JSON responses, logs or V2 assets.
 use crate::{AppError, AppResult, Config, Database, api::AppState};
 use axum::{Json, Router, extract::State, routing::get};
 use chrono::Utc;
@@ -18,10 +18,10 @@ use uuid::Uuid;
 const SETTING_KEY: &str = "youtube.settings";
 const MAX_COOKIES: usize = 200_000;
 const MAX_PROXY: usize = 512;
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct YoutubeRuntime {
     pub proxy: Option<String>,
-    pub cookie_file: Option<PathBuf>,
+    cookie_text: Option<String>,
     pub parallel: bool,
     pub connections: u8,
     pub compatibility: bool,
@@ -130,20 +130,14 @@ pub async fn prepare_cookie_copy(
     config: &Config,
     settings: &YoutubeRuntime,
 ) -> AppResult<Option<tempfile::TempDir>> {
-    let Some(path) = settings.cookie_file.as_deref() else {
+    let Some(raw) = settings.cookie_text.as_deref() else {
         return Ok(None);
     };
-    let dir = config.storage_root.join(".videoroll-private");
+    let dir = private_dir(config).await?;
     let temp = tempfile::Builder::new()
         .prefix("yt-worker-")
         .tempdir_in(&dir)?;
-    let bytes = fs::read(path).await?;
-    if bytes.len() > MAX_COOKIES + 10_000 {
-        return Err(AppError::Invalid("cookie source file oversized".into()));
-    }
-    let parsed = std::str::from_utf8(&bytes)
-        .map_err(|_| AppError::Invalid("cookie source is not UTF8".into()))?;
-    let validated = validate_cookies(parsed)?;
+    let validated = validate_cookies(raw)?;
     #[cfg(unix)]
     {
         use tokio::io::AsyncWriteExt;
@@ -223,7 +217,7 @@ pub(crate) async fn read_cookie(config: &Config) -> AppResult<Option<String>> {
     }
 }
 #[cfg(unix)]
-async fn save_cookie(config: &Config, value: Option<&str>) -> AppResult<()> {
+async fn private_dir(config: &Config) -> AppResult<PathBuf> {
     let dir = config.storage_root.join(".videoroll-private");
     match fs::symlink_metadata(&dir).await {
         Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => {
@@ -244,10 +238,34 @@ async fn save_cookie(config: &Config, value: Option<&str>) -> AppResult<()> {
                 .recursive(false)
                 .mode(0o700)
                 .create(&dir)
-                .await?;
+                .await
+                .or_else(|e| {
+                    if e.kind() == std::io::ErrorKind::AlreadyExists {
+                        Ok(())
+                    } else {
+                        Err(e)
+                    }
+                })?;
+            let meta = fs::symlink_metadata(&dir).await?;
+            use std::os::unix::fs::PermissionsExt;
+            if !meta.is_dir()
+                || meta.file_type().is_symlink()
+                || meta.permissions().mode() & 0o077 != 0
+            {
+                return Err(AppError::Invalid("unsafe cookie directory".into()));
+            }
         }
         Err(err) => return Err(err.into()),
     }
+    Ok(dir)
+}
+#[cfg(not(unix))]
+async fn private_dir(_config: &Config) -> AppResult<PathBuf> {
+    Err(AppError::Unavailable("secure cookies require Unix".into()))
+}
+#[cfg(unix)]
+async fn save_cookie(config: &Config, value: Option<&str>) -> AppResult<()> {
+    let dir = private_dir(config).await?;
     let path = cookie_path(config);
     if let Some(raw) = value {
         let temp = dir.join(format!(".youtube-{}.tmp", Uuid::new_v4()));
@@ -289,15 +307,26 @@ async fn save_cookie(_config: &Config, _value: Option<&str>) -> AppResult<()> {
     ))
 }
 pub(crate) async fn read_settings(db: &Database) -> AppResult<Value> {
-    // Use original settings including proxy and concurrency. Existing
-    // cookies_txt_enc is retained, but not misused as a plaintext cookie.
+    // Use original settings including proxy, credentials and concurrency.
     let own: Option<Value> = sqlx::query_scalar("SELECT value_json FROM app_settings WHERE key=$1")
         .bind(SETTING_KEY)
         .fetch_optional(&db.pool)
         .await?;
     Ok(own.unwrap_or(json!({})))
 }
-fn runtime_from_json(value: &Value, cookie_file: Option<PathBuf>) -> AppResult<YoutubeRuntime> {
+pub(crate) async fn effective_cookie(config: &Config, stored: &Value) -> AppResult<Option<String>> {
+    if let Some(encoded) = stored
+        .get("cookies_txt_enc")
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+    {
+        let text = crate::secret_compat::decode(encoded)?
+            .ok_or_else(|| AppError::Invalid("empty legacy YouTube cookie".into()))?;
+        return Ok(Some(validate_cookies(&text)?));
+    }
+    read_cookie(config).await
+}
+fn runtime_from_json(value: &Value, cookie_text: Option<String>) -> AppResult<YoutubeRuntime> {
     let proxy = validate_proxy(value.get("proxy").and_then(Value::as_str).unwrap_or(""))?;
     let parallel = value
         .get("parallel_download_enabled")
@@ -316,14 +345,14 @@ fn runtime_from_json(value: &Value, cookie_file: Option<PathBuf>) -> AppResult<Y
         .get("cookies_enabled")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    if enabled && cookie_file.is_none() {
+    if enabled && cookie_text.is_none() {
         return Err(AppError::Invalid(
             "YouTube cookies enabled but no valid cookies.txt available".into(),
         ));
     }
     Ok(YoutubeRuntime {
         proxy,
-        cookie_file: if enabled { cookie_file } else { None },
+        cookie_text: if enabled { cookie_text } else { None },
         parallel,
         connections: connections as u8,
         compatibility: value
@@ -334,8 +363,16 @@ fn runtime_from_json(value: &Value, cookie_file: Option<PathBuf>) -> AppResult<Y
 }
 pub async fn runtime(db: &Database, config: &Config) -> AppResult<YoutubeRuntime> {
     let stored = read_settings(db).await?;
-    let cookies = read_cookie(config).await?;
-    runtime_from_json(&stored, cookies.map(|_| cookie_path(config)))
+    let cookies = if stored
+        .get("cookies_enabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        effective_cookie(config, &stored).await?
+    } else {
+        None
+    };
+    runtime_from_json(&stored, cookies)
 }
 fn summary(value: &str) -> Value {
     let mut count = 0usize;
@@ -425,11 +462,8 @@ async fn legacy_home_scan_history(db: &Database) -> AppResult<serde_json::Map<St
 
 async fn snapshot(state: &AppState) -> AppResult<Value> {
     let stored = read_settings(&state.db).await?;
-    let cookies = read_cookie(&state.config).await?;
-    let runtime = runtime_from_json(
-        &stored,
-        cookies.as_ref().map(|_| cookie_path(&state.config)),
-    )?;
+    let cookies = effective_cookie(&state.config, &stored).await?;
+    let runtime = runtime_from_json(&stored, cookies.clone())?;
     let mut result = json!({
         "proxy":runtime.proxy.unwrap_or_default(),
         "cookies_set":cookies.is_some(),
@@ -513,7 +547,11 @@ async fn update(State(state): State<AppState>, Json(patch): Json<Value>) -> AppR
             .await?;
     let old = old.unwrap_or_else(|| json!({}));
     let mut merged = old.as_object().cloned().unwrap_or_default();
-    let old_cookie = read_cookie(&state.config).await?;
+    let old_cookie = if updates.get("cookies_txt").is_some_and(Value::is_string) {
+        None
+    } else {
+        effective_cookie(&state.config, &old).await?
+    };
     let mut next_cookie = None;
     for (key, value) in updates {
         if value.is_null() {
@@ -530,6 +568,7 @@ async fn update(State(state): State<AppState>, Json(patch): Json<Value>) -> AppR
                 let input = value
                     .as_str()
                     .ok_or_else(|| AppError::Invalid("cookies_txt must be a string".into()))?;
+                merged.remove("cookies_txt_enc");
                 if input.trim().is_empty() {
                     merged.insert("cookies_enabled".into(), json!(false));
                     merged.insert("cookies_updated_at".into(), Value::Null);
@@ -579,18 +618,8 @@ async fn update(State(state): State<AppState>, Json(patch): Json<Value>) -> AppR
             _ => unreachable!(),
         }
     }
-    let valid_cookie = next_cookie
-        .as_ref()
-        .map(|v| v.is_some())
-        .unwrap_or(old_cookie.is_some());
-    runtime_from_json(
-        &Value::Object(merged.clone()),
-        if valid_cookie {
-            Some(cookie_path(&state.config))
-        } else {
-            None
-        },
-    )?;
+    let effective = next_cookie.as_ref().cloned().unwrap_or(old_cookie);
+    runtime_from_json(&Value::Object(merged.clone()), effective)?;
     // Persist the new private cookie before the DB points to it. Filesystem
     // failure never enables a missing cookie. A DB failure leaves an inert
     // private file, not a published asset.

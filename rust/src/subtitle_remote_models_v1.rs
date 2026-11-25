@@ -227,13 +227,8 @@ pub(crate) async fn remote_models(
         .get("api_key_enc")
         .and_then(Value::as_str)
         .unwrap_or("");
-    if token.starts_with("gAAAA") {
-        return Err(AppError::Unavailable(
-            "legacy encrypted model provider credential requires migration".into(),
-        ));
-    }
-    let token = token.strip_prefix("dbplain:v1:").unwrap_or(token);
-    if token.contains('\n') || token.contains('\r') || token.len() > 8192 {
+    let token = providers::decode_secret(token)?.unwrap_or_default();
+    if token.len() > 8192 {
         return Err(bad("stored provider token invalid"));
     }
     let mut request = client.get(url);

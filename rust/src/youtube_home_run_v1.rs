@@ -262,7 +262,7 @@ async fn finish(
     Ok(())
 }
 async fn execute(state: &AppState, owner: &str, settings: &Value) -> AppResult<Value> {
-    let cookies = youtube_settings_v1::read_cookie(&state.config)
+    let cookies = youtube_settings_v1::effective_cookie(&state.config, settings)
         .await?
         .ok_or_else(|| {
             AppError::Invalid(
