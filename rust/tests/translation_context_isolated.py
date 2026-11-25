@@ -15,8 +15,8 @@ def setting(k,v):
     with db() as c:c.execute("INSERT INTO app_settings(key,value_json) VALUES(%s,%s) ON CONFLICT(key) DO UPDATE SET value_json=EXCLUDED.value_json",(k,json.dumps(v)))
 source=["First 10 volts.","Second 20 volts.","Third line.","Fourth line.","Fifth line."]
 starts=[.2,1.2,2.2,7.2,8.2]
-target=["10伏","10伏","第三句","第四句","第五句"]
-observed=[];errors=[];asr_calls=[];failed_once=False
+target=["10伏特","10伏特（第二次）","第三句","第四句","第五句"]
+observed=[];errors=[];asr_calls=[];repairs=[];failed_once=False
 class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         global failed_once
@@ -30,10 +30,23 @@ class Handler(BaseHTTPRequestHandler):
                 assert self.headers["Authorization"]=="Bearer fixture-translation-key"
                 data=json.loads(body);assert data["model"]=="fixture-translation"
                 lines=json.loads(data["messages"][-1]["content"])
+                if isinstance(lines,dict) and "repair_rows" in lines:
+                    repairs.append(lines)
+                    assert [v["i"] for v in lines["repair_rows"]]==[0,1],lines
+                    assert {i["type"] for i in lines["issues"]}=={"hard_term_missing","adjacent_duplicate_translation"},lines
+                    assert all(v["draft"]=="10伏" for v in lines["repair_rows"])
+                    # Preserve numeric warning to prove it never causes
+                    # another repair call. Only corrected rows returned.
+                    result={"items":[{"i":v["i"],"text":target[v["i"]]} for v in lines["repair_rows"]],"context_update":{"topic":"MUST NOT LEARN REPAIR"}}
+                    raw=json.dumps({"choices":[{"message":{"content":json.dumps(result,ensure_ascii=False)}}]}).encode()
+                    self.send_response(200);self.send_header("Content-Type","application/json");self.send_header("Content-Length",str(len(raw)));self.end_headers();self.wfile.write(raw)
+                    return
                 context=json.loads(next(m["content"].split("instructions: ",1)[1] for m in data["messages"] if m["content"].startswith("Untrusted batch context")))
                 observed.append((lines,context))
                 result={"items":[{"i":v["i"],"text":target[source.index(v["source"])]} for v in lines]}
                 if lines[0]["source"]==source[0]:
+                    assert context["translation_constraints"]==[{"source":"volts","target":"伏特","mode":"hard","applies_to_blocks":[1,2]}],context
+                    result["items"]=[{"i":v["i"],"text":"10伏"} for v in lines]
                     result["updated_summary"]="Electrical measurements."
                     result["context_update"]={"topic":"electronics","terminology":[{"source":"volts","target":"伏"},{"source":"invented capacitor","target":"电容"}],"characters":[{"name":"Unseen person","target_name":"无关人物"}],"ambiguities":[{"term":"volts","resolution":"voltage unit"}],"scene_summary":"Voltage measurements"}
                 if lines[0]["source"]==source[2] and not failed_once:
@@ -48,7 +61,7 @@ class Handler(BaseHTTPRequestHandler):
 server=ThreadingHTTPServer(("127.0.0.1",0),Handler)
 threading.Thread(target=server.serve_forever,daemon=True).start()
 base=f"http://127.0.0.1:{server.server_address[1]}"
-setting("subtitle.auto_profile",{"translate_enabled":True,"translate_provider":"openai","translate_model_provider_id":"legacy","target_lang":"zh","bilingual":False,"auto_publish":False,"auto_publish_platforms":[],"auto_dub_p2":False,"burn_in":False})
+setting("subtitle.auto_profile",{"translate_enabled":True,"translate_provider":"openai","translate_model_provider_id":"legacy","translate_glossary":{"volts":"伏特"},"target_lang":"zh","bilingual":False,"auto_publish":False,"auto_publish_platforms":[],"auto_dub_p2":False,"burn_in":False})
 setting("subtitle.translate",{"default_batch_size":2,"default_enable_summary":True,"rag_enabled":False,"rag_domain":"electronics","openai":{"base_url":base+"/v1","model":"fixture-translation","api_key_enc":"dbplain:v1:fixture-translation-key"}})
 setting("subtitle.rag",{"enabled":False})
 setting("youtube.settings",{"home_scan_enabled":False})
@@ -89,10 +102,10 @@ try:
         time.sleep(.3)
     else:raise AssertionError(log.read_text()[-3000:])
     assert [len(x[0]) for x in observed]==[2,1,1,2],observed
-    assert failed_once and row[2]==2 and len(asr_calls)==1,(row,asr_calls)
+    assert failed_once and row[2]==2 and len(asr_calls)==1 and len(repairs)==1,(row,asr_calls,repairs)
     examples=observed[0][1]["translation_examples"]
     assert {"reviewed-same-task","approved-global"}<={e["target"] for e in examples},examples
-    assert observed[1][1]["context"]["previous_source"][-1]["translation"]=="10伏"
+    assert observed[1][1]["context"]["previous_source"][-1]["translation"]==target[1]
     assert observed[1][1]==observed[2][1],"retry lost checkpoint context"
     assert observed[3][1]["context"]["scene"]["scene_id"]==2
     for i in (1,2,3):
@@ -112,12 +125,13 @@ try:
     meta=json.loads((root/meta_key).read_text())
     assert meta["translation_scenes"]["scenes"]==[[0,3],[3,5]],meta
     assert meta["translation_scenes"]["batches"]==[[0,2],[2,3],[3,5]],meta
-    assert {i["type"] for i in meta["translation_quality_issues"]}=={"number_mismatch","adjacent_duplicate_translation"},meta
+    assert {i["type"] for i in meta["translation_quality_issues"]}=={"number_mismatch"},meta
     assert meta["running_summary"]=="Electrical measurements."
     assert meta["context_memory"]["terminology"]==[{"source":"volts","target":"伏","meaning":""}]
     assert meta["context_memory"]["ambiguities"]==[{"term":"volts","resolution":"voltage unit"}]
     assert meta["context_memory"]["topic"]=="electronics"
-    print("PASS: native worker 3 scene-aware batches, injected invalid mapping retries from checkpoint, ASR/first batch not replayed, grounded rolling summary/memory restored, fuzzy approved recall, original UUIDv5 and isolation, quality warnings",flush=True)
+    assert "MUST NOT LEARN REPAIR" not in json.dumps(meta)
+    print("PASS: native worker hard glossary+adjacent duplicate repair only affected rows, numeric warning nonblocking, prior repaired checkpoint and grounded memory restored, original IDs and approved memory protected",flush=True)
 finally:
     worker.terminate()
     try:worker.wait(timeout=5)

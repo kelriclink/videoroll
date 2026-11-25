@@ -66,11 +66,16 @@ pub(crate) struct SubtitleAction {
     #[serde(default)]
     translate_enable_summary: Option<bool>,
     #[serde(default)]
+    translate_glossary: Option<Value>,
+    #[serde(default)]
     auto_publish: Option<bool>,
     #[serde(default)]
     publish_payload: Option<Value>,
 }
 pub(crate) fn subtitle_config(request: SubtitleAction) -> AppResult<Value> {
+    if let Some(g) = request.translate_glossary.as_ref() {
+        crate::media::translation_quality::validate_glossary(g)?;
+    }
     if request
         .translate_batch_size
         .is_some_and(|n| n < 1 || n > 50)
@@ -132,6 +137,7 @@ pub(crate) fn subtitle_config(request: SubtitleAction) -> AppResult<Value> {
         "translate_enable_summary",
         request.translate_enable_summary
     );
+    put!(subtitle, "translate_glossary", request.translate_glossary);
     put!(subtitle, "asr_model", request.asr_model);
     put!(subtitle, "asr_language", request.asr_language);
     put!(subtitle, "translate_enabled", request.translate_enabled);

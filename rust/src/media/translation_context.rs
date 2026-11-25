@@ -438,21 +438,7 @@ pub async fn remember(
 pub fn quality(source: &[SubtitleCue], target: &[String], start: usize) -> Vec<Value> {
     let mut issues = Vec::new();
     for (i, (s, t)) in source.iter().zip(target).enumerate() {
-        let digits = |text: &str| {
-            text.split(|c: char| !c.is_ascii_digit())
-                .filter(|s| !s.is_empty())
-                .map(str::to_owned)
-                .collect::<Vec<_>>()
-        };
-        let mut numbers = digits(t);
-        let mut missing = Vec::new();
-        for n in digits(&s.text) {
-            if let Some(j) = numbers.iter().position(|v| v == &n) {
-                numbers.remove(j);
-            } else {
-                missing.push(n);
-            }
-        }
+        let missing = super::translation_quality::missing_numbers(&s.text, t);
         if !missing.is_empty() {
             issues.push(json!({"idx":start+i+1,"type":"number_mismatch","severity":"warning","expected":missing.into_iter().take(12).collect::<Vec<_>>()}));
         }
