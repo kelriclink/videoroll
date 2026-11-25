@@ -498,3 +498,97 @@ with log.open('a') as output:
 after_restart=counters()
 assert after_restart['submit']==counts['submit'],after_restart
 print('PASS: restarting the Rust worker cannot resubmit an unknown Bilibili archive')
+
+# The TaskDetail action must enter the same native publisher and original
+# single-target batch, not synthesize a second workflow-only job identity.
+from concurrent.futures import ThreadPoolExecutor
+
+def task_action(task,payload):
+    return api(f'/tasks/{task}/actions/publish',payload)
+def batch_evidence(task,job,account=None,expected_state='active'):
+    with engine.connect() as db:
+        row=db.execute(text("""SELECT p.id::text,p.state::text,p.account_id::text,b.id::text AS batch_id,
+             b.state AS batch_state,b.expected_targets,t.active_publish_batch_id::text AS active,
+             (SELECT count(*) FROM publish_jobs WHERE task_id=t.id) AS job_count,
+             (SELECT count(*) FROM publish_batches WHERE task_id=t.id) AS batch_count
+             FROM tasks t JOIN publish_jobs p ON p.task_id=t.id JOIN publish_batches b ON b.id=p.batch_id
+             WHERE t.id=CAST(:task AS uuid)"""),{'task':str(task)}).one()
+        assert row.id==job and row.account_id==account and row.batch_id==row.active,row
+        assert row.batch_state==expected_state and row.job_count==row.batch_count==1,row
+        assert row.expected_targets==[{'key':'bilibili:'+(account or 'default'),'platform':'bilibili','account_id':account}],row
+        return row.batch_id
+
+# Default video selection, metadata draft, concurrency, persisted original
+# job identifier and actual loopback publication receipt.
+task,payload=fixture('batch-only')
+body={'meta':payload['meta']}
+path=f'/tasks/{task}/actions/publish'
+req=Request('http://127.0.0.1:18080/api/v1'+path,data=json.dumps(body).encode(),method='POST',headers={'content-type':'application/json'})
+try:urlopen(req,timeout=10);raise AssertionError('anonymous publication accepted')
+except HTTPError as err:assert err.code==401
+before=counters()
+with ThreadPoolExecutor(max_workers=3) as pool:
+    results=list(pool.map(lambda _:task_action(task,body),range(3)))
+code,result=results[0]
+assert code==200 and result['state']=='submitting' and result['platform']=='bilibili' and all(v==results[0] for v in results),results
+batch=batch_evidence(task,result['job_id'])
+assert counters()['submit']==before['submit']
+process(task,'published')
+code,final=task_action(task,body)
+assert code==200 and final['state']=='published' and final['job_id']==result['job_id'] and final['bvid']=='BV1RUSTMOCK1',final
+assert batch_evidence(task,result['job_id'],expected_state='succeeded')==batch
+assert counters()['submit']==before['submit']+1
+assert api('/bilibili/publish',payload)[0]==409 # never reassign to a different batch
+print('PASS: TaskDetail default Bilibili action concurrent enqueue, one original batch/job, real mock receipt and replay')
+
+# Explicit named account, video and cover. Reuse the credential fixture
+# restored above; the real mock asserts the expected Cookie/CSRF.
+task,payload=fixture('named-account-B')
+key=payload['video']['key']; ck=f'v2/cover/{task}/cover.png'
+(root/ck).parent.mkdir(parents=True,exist_ok=True);(root/ck).write_bytes(cover_file.read_bytes())
+with engine.begin() as db:
+    db.execute(text("INSERT INTO assets(id,task_id,kind,storage_key) VALUES(CAST(:a AS uuid),CAST(:t AS uuid),'cover_image',:k)"),{'a':str(uuid4()),'t':str(task),'k':ck})
+body={'platform':'bilibili','account_id':restored['id'],'video_key':key,'cover_key':ck,'meta':payload['meta'],'platform_options':{'bilibili':{'typeid_mode':'meta'}}}
+for bad in ({**body,'video_key':two['video']['key']},{**body,'cover_key':cover_key},{**body,'account_id':str(wrong_id)},{**body,'force_retry':True},{**body,'skip_review':True},{**body,'platform_options':{'bilibili':{'unrecognized':True}}}):
+    assert task_action(task,bad)[0] in (400,409),bad
+with engine.connect() as db:
+    assert db.execute(text('SELECT count(*) FROM publish_batches WHERE task_id=CAST(:t AS uuid)'),{'t':str(task)}).scalar_one()==0
+before=counters();code,result=task_action(task,body)
+assert code==200 and result['state']=='submitting',(code,result)
+batch_evidence(task,result['job_id'],restored['id']);process(task,'published',restored['id'])
+assert batch_evidence(task,result['job_id'],restored['id'],'succeeded')
+assert counters()['submit']==before['submit']+1 and counters()['cover']==before['cover']+1
+print('PASS: TaskDetail Bilibili named account, owned video/cover, options and foreign inputs/review bypass rejected')
+
+# Original P1/P2 media receipt checks are applied by the same Task action.
+task,payload=fixture('two-part'); key=payload['video']['key'];dub_key=f'v2/dub/{task}/dub.mp4';srt_key=f'v2/sub/{task}/subtitle.srt'
+(root/dub_key).parent.mkdir(parents=True,exist_ok=True);shutil.copyfile(root/key,root/dub_key)
+(root/srt_key).parent.mkdir(parents=True,exist_ok=True);(root/srt_key).write_text('1\n00:00:00,000 --> 00:00:01,000\n测试\n')
+with engine.begin() as db:
+    for kind,k in [('video_raw',key),('video_dubbed',dub_key),('subtitle_srt',srt_key)]:
+        db.execute(text('INSERT INTO assets(id,task_id,kind,storage_key) VALUES(CAST(:a AS uuid),CAST(:t AS uuid),CAST(:kind AS asset_kind),:k)'),{'a':str(uuid4()),'t':str(task),'kind':kind,'k':k})
+body={'video_key':key,'video_parts':[{'video':{'type':'storage','key':key},'title':'P1中文字幕版'},{'video':{'type':'storage','key':dub_key},'title':'P2中文配音版'}],'meta':payload['meta'],'typeid_mode':'meta'}
+assert task_action(task,body)[0]==409
+w,j=uuid4(),uuid4()
+with engine.begin() as db:
+    db.execute(text("INSERT INTO pipeline_runs(id,task_id,generation,engine,workflow_name,state,request_json) VALUES(CAST(:w AS uuid),CAST(:t AS uuid),1,'rust-v2','videoroll.rust.pipeline','succeeded','{}'::jsonb)"),{'w':str(w),'t':str(task)})
+    db.execute(text("""INSERT INTO operation_inbox(id,operation_key,status,runtime_engine,workflow_id,task_id,stage,generation,dubbing_source_video_key,dubbing_source_srt_key,dubbing_output_video_key,dubbing_model_status,dubbing_model_job_id,dubbing_run_created_at)
+        VALUES(CAST(:j AS uuid),:op,'succeeded','rust-v2',CAST(:w AS uuid),CAST(:t AS uuid),'dubbing',1,:raw,:srt,:dub,'succeeded',CAST(:model AS uuid),now())"""),{'j':str(j),'op':'task-action-dub:'+str(j),'w':str(w),'t':str(task),'raw':key,'srt':srt_key,'dub':dub_key,'model':str(uuid4())})
+before=counters();code,result=task_action(task,body);assert code==200 and result['state']=='submitting',(code,result)
+batch_evidence(task,result['job_id']);process(task,'published');batch_evidence(task,result['job_id'],expected_state='succeeded')
+assert counters()['submit']==before['submit']+1 and counters()['complete']==before['complete']+2
+print('PASS: TaskDetail Bilibili P1/P2 requires original succeeded dubbing receipt and submits two ordered parts once')
+
+# Unknown receipt stays in the original batch; task action replay does not
+# issue another archive. Original same-target draft cannot silently requeue.
+task,payload=fixture('ambiguous-publish');body={'meta':payload['meta']}
+before=counters();code,result=task_action(task,body);assert code==200
+process(task,'unknown');code,unknown=task_action(task,body)
+assert code==200 and unknown['state']=='unknown' and unknown['job_id']==result['job_id']
+assert counters()['submit']==before['submit']+1
+batch_evidence(task,result['job_id'],expected_state='failed')
+task,payload=fixture('batch-only')
+with engine.begin() as db:
+    db.execute(text("INSERT INTO publish_jobs(id,task_id,platform,state) VALUES(CAST(:id AS uuid),CAST(:t AS uuid),'bilibili','draft')"),{'id':str(uuid4()),'t':str(task)})
+assert task_action(task,{'meta':payload['meta']})[0]==409
+print('PASS: TaskDetail unknown result remains fenced and historical draft blocks new submission')

@@ -183,6 +183,19 @@ async fn create(
     State(state): State<AppState>,
     Json(body): Json<Request>,
 ) -> AppResult<Json<Value>> {
+    enqueue(&state, body, false).await.map(Json)
+}
+
+/// The original Task action owns a single-target batch. Reuse the same
+/// publisher transaction as the independent service, rather than restarting
+/// an unrelated workflow with a second publication identity.
+pub(crate) async fn enqueue_task_action(state: &AppState, raw: Value) -> AppResult<Value> {
+    let body: Request = serde_json::from_value(raw)
+        .map_err(|_| AppError::Invalid("invalid Bilibili task publish fields".into()))?;
+    enqueue(state, body, true).await
+}
+
+async fn enqueue(state: &AppState, mut body: Request, task_action: bool) -> AppResult<Value> {
     if !state.config.native_bilibili_allowed
         || !crate::publish_platforms::enabled(&state.db, "bilibili").await?
     {
@@ -298,10 +311,10 @@ async fn create(
     .await?;
     if let Some(row) = existing {
         let previous: Option<Uuid> = row.try_get("batch_id")?;
-        if previous != body.batch_id {
+        if !task_action && previous != body.batch_id {
             return Err(AppError::Conflict("previous Bilibili publish belongs to a different batch; reconcile before reusing it".into()));
         }
-        return Ok(Json(view(&row)?));
+        return view(&row);
     }
     if !batch_is_active {
         return Err(AppError::Conflict(
@@ -420,6 +433,81 @@ async fn create(
             return Err(AppError::Conflict("Bilibili cover empty".into()));
         }
     }
+    if task_action {
+        // The unbatched legacy SAU facade does not participate in original
+        // batch aggregation. Do not claim this task is fully published while
+        // its unbatched publication may still be outstanding.
+        let unbatched: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM vr2_social_publish_intents WHERE task_id=$1)
+              OR EXISTS(SELECT 1 FROM publish_jobs WHERE task_id=$1 AND batch_id IS NULL)",
+        )
+        .bind(body.task_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if unbatched {
+            return Err(AppError::Conflict(
+                "unbatched publication history requires reconciliation before a new target batch"
+                    .into(),
+            ));
+        }
+        // Do not replace a draft/failed historical receipt or an existing
+        // target batch merely because the task action was retried. Those
+        // cases need explicit reconciliation, not a new archive submission.
+        let prior: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM publish_jobs WHERE task_id=$1 AND platform='bilibili'
+               AND (($2::uuid IS NULL AND account_id IS NULL AND bili_account_id IS NULL)
+               OR ($2::uuid IS NOT NULL AND (account_id=$2 OR (account_id IS NULL AND bili_account_id=$2)))))",
+        )
+        .bind(body.task_id).bind(body.account_id).fetch_one(&mut *tx).await?;
+        if prior {
+            return Err(AppError::Conflict(
+                "previous Bilibili receipt requires reconciliation".into(),
+            ));
+        }
+        let target = format!(
+            "bilibili:{}",
+            body.account_id
+                .map(|v| v.to_string())
+                .unwrap_or("default".into())
+        );
+        let batches = sqlx::query_scalar::<_, Value>(
+            "SELECT expected_targets FROM publish_batches WHERE task_id=$1",
+        )
+        .bind(body.task_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        for expected in batches {
+            if expected.as_array().is_some_and(|v| v.is_empty()) {
+                continue;
+            }
+            if crate::bilibili_batch_reconcile_v1::keys(&expected)?.contains(&target) {
+                return Err(AppError::Conflict(
+                    "previous Bilibili target batch requires reconciliation".into(),
+                ));
+            }
+        }
+        let batch = Uuid::new_v4();
+        let expected = json!([{"key":target,"platform":"bilibili","account_id":body.account_id}]);
+        let request = json!({"platforms":["bilibili"],"account_id":body.account_id,
+            "video_key":body.video.key,"video_parts":body.video_parts,"cover_key":cover,
+            "meta":snapshot,"typeid_mode":body.typeid_mode});
+        sqlx::query(
+            "INSERT INTO publish_batches(id,task_id,state,expected_targets,request_json)
+                     VALUES($1,$2,'active',$3,$4)",
+        )
+        .bind(batch)
+        .bind(body.task_id)
+        .bind(expected)
+        .bind(request)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("UPDATE tasks SET active_publish_batch_id=$2 WHERE id=$1")
+            .bind(body.task_id)
+            .bind(batch)
+            .execute(&mut *tx)
+            .await?;
+        body.batch_id = Some(batch);
+    }
     let generation: i32 = sqlx::query_scalar(
         "SELECT COALESCE(MAX(generation),0)+1 FROM vr2_workflows WHERE task_id=$1",
     )
@@ -484,9 +572,7 @@ async fn create(
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
-    Ok(Json(
-        json!({"job_id":job_id,"state":"submitting","aid":null,"bvid":null,"response":null}),
-    ))
+    Ok(json!({"job_id":job_id,"state":"submitting","aid":null,"bvid":null,"response":null}))
 }
 
 pub fn router() -> Router<AppState> {
