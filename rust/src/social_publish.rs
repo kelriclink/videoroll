@@ -1302,6 +1302,43 @@ pub(crate) async fn automatic(
             }
         }
     }
+    if has_bili {
+        let external: bool =
+            sqlx::query_scalar("SELECT source_type::text='youtube' FROM tasks WHERE id=$1")
+                .bind(item.task_id)
+                .fetch_optional(&state.db.pool)
+                .await?
+                .unwrap_or(false);
+        let explicit = meta["tags"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        // The old draft's generic fallback is not a user tag and must not
+        // suppress creator-center recommendations.
+        let explicit = if explicit.len() == 1 && explicit[0] == "视频分享" {
+            Vec::new()
+        } else {
+            explicit
+        };
+        meta["tags"] = json!(
+            crate::bilibili_account_v1::resolve_publish_tags(
+                &state.db,
+                &state.config,
+                item.task_id,
+                meta["typeid"].as_u64().unwrap_or(0) as u32,
+                meta["title"].as_str().unwrap_or(""),
+                meta["desc"].as_str().unwrap_or(""),
+                external,
+                &explicit
+            )
+            .await
+        );
+    }
     for p in &platforms {
         if p == "bilibili" {
             platform_meta.insert(p.clone(), crate::publish_meta::normalized(meta.clone())?);
