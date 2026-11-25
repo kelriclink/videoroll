@@ -145,6 +145,15 @@ if [[ "${VIDEOROLL_V2_TEST_ORIGINAL_RAG_ONLY:-false}" == "true" ]]; then
   "$CARGO_HOME/bin/cargo" test --manifest-path "$repo_root/rust/Cargo.toml" --locked --offline --test original_rag_retrieval -- --nocapture
   exit 0
 fi
+if [[ "${VIDEOROLL_V2_TEST_CLOUDFLARE_ASR_ONLY:-false}" == "true" ]]; then
+  export VIDEOROLL_V2_INTERNAL_TOKEN="isolated-cloudflare-asr-token-0123456789"
+  export INTERNAL_API_SECRET="isolated-cloudflare-asr-secret"
+  export VIDEOROLL_V2_STORAGE_ROOT="$(mktemp -d "$repo_root/rust/target/v2-cloudflare-asr.XXXXXX")"
+  "$CARGO_HOME/bin/cargo" build --manifest-path "$repo_root/rust/Cargo.toml" --bin videoroll-v2 --locked --offline --quiet
+  "$repo_root/rust/target/debug/videoroll-v2" migrate
+  /opt/videoroll/venvs/core/bin/python "$repo_root/rust/tests/cloudflare_asr_isolated.py"
+  exit 0
+fi
 if [[ "${VIDEOROLL_V2_TEST_LOCAL_INFERENCE_ONLY:-false}" == "true" ]]; then
   export VIDEOROLL_V2_INTERNAL_TOKEN="isolated-local-inference-token-0123456789"
   export INTERNAL_API_SECRET="isolated-local-inference-service-secret"

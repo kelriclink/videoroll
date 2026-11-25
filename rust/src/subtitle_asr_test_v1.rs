@@ -112,7 +112,7 @@ fn audio_url(base: &str) -> AppResult<Url> {
     url.set_path(&path);
     Ok(url)
 }
-fn test_override(var: &str, production: &str) -> AppResult<String> {
+pub(crate) fn test_override(var: &str, production: &str) -> AppResult<String> {
     match std::env::var(var) {
         Ok(raw) => {
             let url = base_url(&raw)?;
