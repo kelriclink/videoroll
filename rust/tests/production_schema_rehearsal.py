@@ -101,7 +101,7 @@ if sys.argv[1]=="seed":
 assert sys.argv[1]=="verify"
 m=json.loads(manifest.read_text());ids=m["ids"]
 with db() as c:
-    assert c.execute("SELECT count(*) FROM _sqlx_migrations WHERE success").fetchone()[0]==39
+    assert c.execute("SELECT count(*) FROM _sqlx_migrations WHERE success").fetchone()[0]==40
     assert c.execute("SELECT count(*) FROM pg_tables WHERE schemaname='public' AND tablename LIKE 'vr2_%'").fetchone()[0]==0
     assert c.execute("SELECT count(*) FROM tasks WHERE runtime_owner='python'").fetchone()[0]==5
     for k,v in m["config"].items():
@@ -111,7 +111,7 @@ with db() as c:
         assert c.execute("SELECT storage_key,sha256 FROM assets WHERE id=%s",(a,)).fetchone()==(k,h)
     assert c.execute("SELECT state,external_run_id FROM pipeline_runs WHERE id=%s",(m["run"],)).fetchone()==("launch_failed","fixture-stopped-run")
     assert c.execute("SELECT status,task_name FROM outbox_events WHERE id=%s",(m["event"],)).fetchone()==("pending","subtitle_service.push_publish_workflow_event")
-print("PASS: 39 migrations preserve original config, task/asset IDs, publication receipt, historical run and pending outbox; no physical vr2 tables",flush=True)
+print("PASS: 40 migrations preserve original config, task/asset IDs, publication receipt, historical run and pending outbox; no physical vr2 tables",flush=True)
 pre=run("standalone-preflight",ok=False)
 assert pre["historical_blockers"]["legacy_tasks"]==5
 assert pre["historical_blockers"]["uncertain_publications"]==1
