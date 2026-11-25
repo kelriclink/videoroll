@@ -145,14 +145,17 @@ impl Executor {
                 .await?;
                 if selective {
                     let result =
-                        crate::media::asr::process(&self.config, &self.db, &self.registry, item)
+                        crate::media::asr::process(&self.config, &self.db, &self.registry, item,None)
                             .await?;
                     Ok(StageOutcome::Completed { result })
+                } else if let Some(captions)=crate::media::asr::preferred_source(&self.config,&self.db,&self.registry,item).await?{
+                    let result=crate::media::asr::process(&self.config,&self.db,&self.registry,item,Some(captions)).await?;
+                    Ok(StageOutcome::Completed{result})
                 } else if let Some(runtime) =
                     crate::media::asr::runtime_asr_config(&self.config, &self.db,item).await?
                 {
                     let result =
-                        crate::media::asr::process(&runtime, &self.db, &self.registry, item)
+                        crate::media::asr::process(&runtime, &self.db, &self.registry, item,None)
                             .await?;
                     Ok(StageOutcome::Completed { result })
                 } else {

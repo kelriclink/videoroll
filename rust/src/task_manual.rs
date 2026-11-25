@@ -96,11 +96,6 @@ pub(crate) fn subtitle_config(request: SubtitleAction) -> AppResult<Value> {
             request.asr_engine.as_deref(),
             Some("openvino" | "faster-whisper" | "cloudflare-workers-ai")
         ))
-        || request.prefer_youtube_subtitles == Some(true)
-        || request
-            .youtube_subtitle_mode
-            .as_deref()
-            .is_some_and(|s| s != "off")
         || request.auto_publish == Some(true)
         || request.publish_payload.is_some()
     {
@@ -118,6 +113,15 @@ pub(crate) fn subtitle_config(request: SubtitleAction) -> AppResult<Value> {
         ));
     }
     let mut subtitle = json!({});
+    if request.prefer_youtube_subtitles.is_some() || request.youtube_subtitle_mode.is_some() {
+        let mode = crate::media::youtube_subtitles::mode(
+            request.youtube_subtitle_mode.as_deref(),
+            request.prefer_youtube_subtitles,
+        )?;
+        subtitle["prefer_youtube_subtitles"] = json!(mode != "off");
+        subtitle["youtube_subtitle_mode"] = json!(mode);
+    }
+
     let mut render = json!({});
     macro_rules! put {
         ($target:ident,$name:literal,$val:expr) => {
@@ -880,7 +884,7 @@ mod tests {
         assert!(
             subtitle_config(
                 serde_json::from_value(json!({
-            "prefer_youtube_subtitles":true}))
+            "youtube_subtitle_mode":"invalid"}))
                 .unwrap()
             )
             .is_err()
