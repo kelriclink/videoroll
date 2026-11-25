@@ -418,6 +418,8 @@ if args.all_services:
     results.extend(probe(args.base,token))
     from contract_render_worker_v4 import probe as worker_probe
     results.extend(worker_probe(args.base,token))
+    from contract_orchestrator_v6 import probe as orchestrator_probe
+    results.extend(orchestrator_probe(root,send))
 covered={(r["method"],r["path"]) for r in results}
 for row in ordered:
     if (row["method"],row["path"]) in covered:continue
