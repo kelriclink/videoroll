@@ -137,7 +137,7 @@ impl Scheduler {
         // enum-like value; created_by can contain the original metadata.
         // Both must be committed atomically with the durable workflow.
         sqlx::query(
-            "INSERT INTO tasks(id,source_type,source_url,source_license,status,priority,origin_kind,origin_run_id,restart_generation,created_by,source_proof_url) VALUES($1,'youtube'::source_type,$2,$3::source_license,'created'::task_status,$4,$6,$5,0,$7,$8)"
+            "INSERT INTO tasks(id,source_type,source_url,source_license,status,priority,origin_kind,origin_run_id,restart_generation,created_by,source_proof_url,retry_count) VALUES($1,'youtube'::source_type,$2,$3::source_license,'created'::task_status,$4,$6,$5,0,$7,$8,0)"
         ).bind(task_id).bind(canonical_url).bind(license).bind(priority.clamp(-100,100))
             .bind(run_id).bind(origin).bind(created_by).bind(source_proof_url)
             .execute(&mut *tx).await?;

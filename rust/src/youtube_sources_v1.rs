@@ -414,8 +414,8 @@ async fn create(
     .await?;
     let row=sqlx::query_scalar::<_,Uuid>(
         "INSERT INTO youtube_sources (id,source_type,source_id,source_url,display_name,license,proof_url,
-                 enabled,scan_interval_minutes,scan_limit,auto_process)
-         VALUES($1,$2::youtube_source_type,$3,$4,$5,$6::youtube_source_license,$7,$8,$9,$10,$11)
+                 enabled,scan_interval_minutes,scan_limit,auto_process,last_scan_discovered_count,last_scan_created_count,last_scan_started_pipeline_count,last_scan_skipped_duplicates)
+         VALUES($1,$2::youtube_source_type,$3,$4,$5,$6::youtube_source_license,$7,$8,$9,$10,$11,0,0,0,0)
          ON CONFLICT (source_type,source_id) DO UPDATE SET
            source_url=EXCLUDED.source_url,
            display_name=COALESCE(EXCLUDED.display_name,youtube_sources.display_name),

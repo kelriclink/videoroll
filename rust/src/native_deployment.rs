@@ -106,7 +106,8 @@ pub async fn preflight(db: &Database, cfg: &Config, startup: bool) -> AppResult<
             WHERE j.operation_key=i.operation_key AND j.platform::text='bilibili' AND t.runtime_owner='rust')))
         AS legacy_operations,
       (SELECT count(*) FROM render_executions WHERE runtime_engine='python'
-        AND state NOT IN ('completed','failed','canceled','lost')) AS legacy_render_executions,
+        AND state NOT IN ('completed','failed','canceled','lost')
+        AND NOT (state='succeeded' AND finished_at IS NOT NULL)) AS legacy_render_executions,
       (SELECT count(*) FROM publish_jobs WHERE state::text='unknown'
         OR (state::text='submitted' AND COALESCE(NULLIF(external_id,''),NULLIF(external_url,''),NULLIF(bvid,''),NULLIF(aid,'')) IS NULL)) AS uncertain_publications"#)
       .fetch_one(&mut *tx).await?;

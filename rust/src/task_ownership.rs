@@ -18,7 +18,8 @@ const BLOCKERS: &str = r#"SELECT array_remove(ARRAY[
  CASE WHEN EXISTS(SELECT 1 FROM render_jobs j WHERE j.task_id=t.id
    AND (j.status::text NOT IN ('succeeded','failed','canceled','completed') OR j.lease_owner IS NOT NULL OR j.lease_until IS NOT NULL)) THEN 'render_job_unsettled' END,
  CASE WHEN EXISTS(SELECT 1 FROM render_executions e LEFT JOIN render_jobs j ON j.id=e.render_job_id
-   WHERE (e.task_id=t.id OR j.task_id=t.id) AND e.state NOT IN ('completed','failed','canceled','lost')) THEN 'render_execution_unsettled' END,
+   WHERE (e.task_id=t.id OR j.task_id=t.id) AND e.state NOT IN ('completed','failed','canceled','lost')
+   AND NOT (e.runtime_engine='python' AND e.state='succeeded' AND e.finished_at IS NOT NULL)) THEN 'render_execution_unsettled' END,
  CASE WHEN EXISTS(SELECT 1 FROM dubbing_jobs j WHERE j.task_id=t.id
    AND (j.status NOT IN ('succeeded','failed','canceled','completed') OR j.lease_owner IS NOT NULL OR j.lease_until IS NOT NULL)) THEN 'dubbing_job_unsettled' END,
  CASE WHEN EXISTS(SELECT 1 FROM publish_jobs j WHERE j.task_id=t.id
