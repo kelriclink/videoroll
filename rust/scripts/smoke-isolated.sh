@@ -3,6 +3,23 @@ set -euo pipefail
 export CARGO_INCREMENTAL=0
 cd "$(dirname "$0")/../.."
 repo_root="$PWD"
+# Python is only used for isolated fixtures and comparisons against the legacy
+# implementation. CI supplies its own interpreter; retain the existing link
+# development environment as a fallback without requiring that installation.
+smoke_python="${VIDEOROLL_V2_TEST_PYTHON:-}"
+if [[ -z "$smoke_python" ]]; then
+  if [[ -x /opt/videoroll/venvs/core/bin/python ]]; then
+    smoke_python=/opt/videoroll/venvs/core/bin/python
+  else
+    smoke_python=python3
+  fi
+fi
+if ! command -v "$smoke_python" >/dev/null 2>&1; then
+  echo 'isolated test Python not found; set VIDEOROLL_V2_TEST_PYTHON' >&2
+  exit 1
+fi
+# Mock logs and scratch fixtures are created before the first Cargo build.
+mkdir -p "$repo_root/rust/target"
 python3 "$repo_root/rust/scripts/audit_contract_matrix.py" --check
 if [[ -n "${CARGO_HOME:-}" && -x "$CARGO_HOME/bin/cargo" ]]; then
   : # Honor an explicitly supplied isolated Rust toolchain.
@@ -125,11 +142,11 @@ if [[ "${VIDEOROLL_V2_TEST_REAL_SCHEMA_ONLY:-false}" == "true" ]]; then
   export VIDEOROLL_V2_STORAGE_ROOT="$(mktemp -d "$repo_root/rust/target/v2-schema-rehearsal.XXXXXX")"
   "$CARGO_HOME/bin/cargo" build --manifest-path "$repo_root/rust/Cargo.toml" --bin videoroll-v2 --locked --offline --quiet
   : "${VIDEOROLL_TEST_CONTROLS_SNAPSHOT:?nonsecret controls snapshot required}"
-  /opt/videoroll/venvs/core/bin/python "$repo_root/rust/tests/production_schema_rehearsal.py" seed
+  "$smoke_python" "$repo_root/rust/tests/production_schema_rehearsal.py" seed
   "$repo_root/rust/target/debug/videoroll-v2" migrate
-  /opt/videoroll/venvs/core/bin/python "$repo_root/rust/tests/production_schema_rehearsal.py" verify
+  "$smoke_python" "$repo_root/rust/tests/production_schema_rehearsal.py" verify
   if [[ "${VIDEOROLL_V2_TEST_BULK_ADOPTION:-false}" == "true" ]]; then
-    /opt/videoroll/venvs/core/bin/python "$repo_root/rust/tests/bulk_adoption_isolated.py"
+    "$smoke_python" "$repo_root/rust/tests/bulk_adoption_isolated.py"
   fi
   exit 0
 fi
@@ -151,7 +168,7 @@ if [[ "${VIDEOROLL_V2_TEST_TRANSLATION_CONTEXT_ONLY:-false}" == "true" ]]; then
   export VIDEOROLL_V2_STORAGE_ROOT="$(mktemp -d "$repo_root/rust/target/v2-translation-context.XXXXXX")"
   "$CARGO_HOME/bin/cargo" build --manifest-path "$repo_root/rust/Cargo.toml" --bin videoroll-v2 --locked --offline --quiet
   "$repo_root/rust/target/debug/videoroll-v2" migrate
-  /opt/videoroll/venvs/core/bin/python "$repo_root/rust/tests/translation_context_isolated.py"
+  "$smoke_python" "$repo_root/rust/tests/translation_context_isolated.py"
   exit 0
 fi
 if [[ "${VIDEOROLL_V2_TEST_CLOUDFLARE_ASR_ONLY:-false}" == "true" ]]; then
@@ -160,7 +177,7 @@ if [[ "${VIDEOROLL_V2_TEST_CLOUDFLARE_ASR_ONLY:-false}" == "true" ]]; then
   export VIDEOROLL_V2_STORAGE_ROOT="$(mktemp -d "$repo_root/rust/target/v2-cloudflare-asr.XXXXXX")"
   "$CARGO_HOME/bin/cargo" build --manifest-path "$repo_root/rust/Cargo.toml" --bin videoroll-v2 --locked --offline --quiet
   "$repo_root/rust/target/debug/videoroll-v2" migrate
-  /opt/videoroll/venvs/core/bin/python "$repo_root/rust/tests/cloudflare_asr_isolated.py"
+  "$smoke_python" "$repo_root/rust/tests/cloudflare_asr_isolated.py"
   exit 0
 fi
 if [[ "${VIDEOROLL_V2_TEST_LOCAL_INFERENCE_ONLY:-false}" == "true" ]]; then
@@ -172,7 +189,7 @@ if [[ "${VIDEOROLL_V2_TEST_LOCAL_INFERENCE_ONLY:-false}" == "true" ]]; then
   export VIDEOROLL_V2_LOCAL_INFERENCE_BRIDGE="$repo_root/scripts/native/local_inference.py"
   "$CARGO_HOME/bin/cargo" build --manifest-path "$repo_root/rust/Cargo.toml" --bin videoroll-v2 --locked --offline --quiet
   "$repo_root/rust/target/debug/videoroll-v2" migrate
-  PYTHONPATH="$repo_root/src" /opt/videoroll/venvs/core/bin/python "$repo_root/rust/tests/local_inference_isolated.py"
+  PYTHONPATH="$repo_root/src" "$smoke_python" "$repo_root/rust/tests/local_inference_isolated.py"
   exit 0
 fi
 if [[ "${VIDEOROLL_V2_TEST_RENDER_ADMIN_ONLY:-false}" == "true" ]]; then
@@ -180,7 +197,7 @@ if [[ "${VIDEOROLL_V2_TEST_RENDER_ADMIN_ONLY:-false}" == "true" ]]; then
   export VIDEOROLL_V2_STORAGE_ROOT="$(mktemp -d "$repo_root/rust/target/v2-render-admin.XXXXXX")"
   "$CARGO_HOME/bin/cargo" build --manifest-path "$repo_root/rust/Cargo.toml" --bin videoroll-v2 --locked --offline --quiet
   "$repo_root/rust/target/debug/videoroll-v2" migrate
-  /opt/videoroll/venvs/core/bin/python "$repo_root/rust/tests/render_admin_native_isolated.py"
+  "$smoke_python" "$repo_root/rust/tests/render_admin_native_isolated.py"
   exit 0
 fi
 if [[ "${VIDEOROLL_V2_TEST_NATIVE_DEPLOYMENT_ONLY:-false}" == "true" ]]; then
@@ -188,7 +205,7 @@ if [[ "${VIDEOROLL_V2_TEST_NATIVE_DEPLOYMENT_ONLY:-false}" == "true" ]]; then
   export VIDEOROLL_V2_STORAGE_ROOT="$(mktemp -d "$repo_root/rust/target/v2-native-deploy.XXXXXX")"
   "$CARGO_HOME/bin/cargo" build --manifest-path "$repo_root/rust/Cargo.toml" --bins --locked --offline --quiet
   "$repo_root/rust/target/debug/videoroll-v2" migrate
-  PYTHONPATH="$repo_root/src" /opt/videoroll/venvs/core/bin/python "$repo_root/rust/tests/native_deployment_isolated.py"
+  PYTHONPATH="$repo_root/src" "$smoke_python" "$repo_root/rust/tests/native_deployment_isolated.py"
   echo 'PASS: broker-free Rust native deployment'
   exit 0
 fi
@@ -197,7 +214,7 @@ if [[ "${VIDEOROLL_V2_TEST_TASK_OWNERSHIP_ONLY:-false}" == "true" ]]; then
   export VIDEOROLL_V2_STORAGE_ROOT="$(mktemp -d "$repo_root/rust/target/v2-task-ownership-objects.XXXXXX")"
   "$CARGO_HOME/bin/cargo" build --manifest-path "$repo_root/rust/Cargo.toml" --bin videoroll-v2 --locked --offline --quiet
   "$repo_root/rust/target/debug/videoroll-v2" migrate
-  PYTHONPATH="$repo_root/src" /opt/videoroll/venvs/core/bin/python "$repo_root/rust/tests/task_ownership_isolated.py"
+  PYTHONPATH="$repo_root/src" "$smoke_python" "$repo_root/rust/tests/task_ownership_isolated.py"
   echo 'PASS: historical task ownership and verified checkpoint recovery'
   exit 0
 fi
@@ -206,7 +223,7 @@ if [[ "${VIDEOROLL_V2_TEST_OUTBOX_DISPATCHER_ONLY:-false}" == "true" ]]; then
   export VIDEOROLL_V2_STORAGE_ROOT="$(mktemp -d "$repo_root/rust/target/v2-outbox-objects.XXXXXX")"
   "$CARGO_HOME/bin/cargo" build --manifest-path "$repo_root/rust/Cargo.toml" --bin videoroll-v2 --locked --offline --quiet
   "$repo_root/rust/target/debug/videoroll-v2" migrate
-  PYTHONPATH="$repo_root/src" /opt/videoroll/venvs/core/bin/python "$repo_root/rust/tests/outbox_dispatcher_isolated.py"
+  PYTHONPATH="$repo_root/src" "$smoke_python" "$repo_root/rust/tests/outbox_dispatcher_isolated.py"
   echo 'PASS: global native outbox dispatcher'
   exit 0
 fi
@@ -216,7 +233,7 @@ if [[ "${VIDEOROLL_V2_TEST_RENDER_EVENTS_ONLY:-false}" == "true" ]]; then
   if ss -lntH "( sport = :18194 )" | grep -q .; then echo 'isolated port occupied' >&2;exit 1;fi
   "$CARGO_HOME/bin/cargo" build --manifest-path "$repo_root/rust/Cargo.toml" --bin videoroll-v2 --locked --offline --quiet
   "$repo_root/rust/target/debug/videoroll-v2" migrate
-  PYTHONPATH="$repo_root/src" /opt/videoroll/venvs/core/bin/python "$repo_root/rust/tests/render_events_isolated.py"
+  PYTHONPATH="$repo_root/src" "$smoke_python" "$repo_root/rust/tests/render_events_isolated.py"
   echo 'PASS: native render control events and committed receipt recovery'
   exit 0
 fi
@@ -225,7 +242,7 @@ if [[ "${VIDEOROLL_V2_TEST_PUBLISH_BATCH_EVENTS_ONLY:-false}" == "true" ]]; then
   export VIDEOROLL_V2_STORAGE_ROOT="$(mktemp -d "$repo_root/rust/target/v2-publish-batch-objects.XXXXXX")"
   "$CARGO_HOME/bin/cargo" build --manifest-path "$repo_root/rust/Cargo.toml" --bin videoroll-v2 --locked --offline --quiet
   "$repo_root/rust/target/debug/videoroll-v2" migrate
-  PYTHONPATH="$repo_root/src" /opt/videoroll/venvs/core/bin/python "$repo_root/rust/tests/publish_batch_events_isolated.py"
+  PYTHONPATH="$repo_root/src" "$smoke_python" "$repo_root/rust/tests/publish_batch_events_isolated.py"
   echo 'PASS: native publication event and delayed intermediate GC'
   exit 0
 fi
@@ -241,7 +258,7 @@ ALTER TABLE publish_jobs ALTER COLUMN state TYPE publish_state USING state::publ
 SQL
   "$CARGO_HOME/bin/cargo" build --manifest-path "$repo_root/rust/Cargo.toml" --bin videoroll-sau --bin videoroll-v2 --locked --offline --quiet
   "$repo_root/rust/target/debug/videoroll-v2" migrate
-  PYTHONPATH="$repo_root/src" /opt/videoroll/venvs/core/bin/python "$repo_root/rust/tests/sau_worker_native_v1_isolated.py"
+  PYTHONPATH="$repo_root/src" "$smoke_python" "$repo_root/rust/tests/sau_worker_native_v1_isolated.py"
   echo 'PASS: native SAU publication worker without Celery or Redis'
   exit 0
 fi
@@ -257,7 +274,7 @@ if [[ "${VIDEOROLL_V2_TEST_SAU_NATIVE_LOGIN_ONLY:-false}" == "true" ]]; then
   fi
   "$CARGO_HOME/bin/cargo" build --manifest-path "$repo_root/rust/Cargo.toml" --bin videoroll-sau --bin videoroll-v2 --locked --offline --quiet
   "$repo_root/rust/target/debug/videoroll-v2" migrate
-  PYTHONPATH="$repo_root/src" /opt/videoroll/venvs/core/bin/python "$repo_root/rust/tests/sau_login_native_v1_isolated.py"
+  PYTHONPATH="$repo_root/src" "$smoke_python" "$repo_root/rust/tests/sau_login_native_v1_isolated.py"
   "$repo_root/rust/target/debug/videoroll-v2" api >"$repo_root/rust/target/sau-login-ws-api.log" 2>&1 &
   api_pid=$!
   for i in $(seq 1 40); do
@@ -265,7 +282,7 @@ if [[ "${VIDEOROLL_V2_TEST_SAU_NATIVE_LOGIN_ONLY:-false}" == "true" ]]; then
     sleep 1
   done
   curl --silent --fail http://127.0.0.1:18081/ready >/dev/null
-  PYTHONPATH="$repo_root/src" /opt/videoroll/venvs/core/bin/python "$repo_root/rust/tests/sau_login_realtime_isolated.py"
+  PYTHONPATH="$repo_root/src" "$smoke_python" "$repo_root/rust/tests/sau_login_realtime_isolated.py"
   echo 'PASS: native SAU login sessions, full DB migrations and authenticated original realtime events'
   exit 0
 fi
@@ -275,7 +292,7 @@ if [[ "${VIDEOROLL_V2_TEST_SAU_NATIVE_CHECK_ONLY:-false}" == "true" ]]; then
   docker exec -i "$container_name" psql -v ON_ERROR_STOP=1 -U postgres -d videoroll_test < rust/migrations/20261124000035_sau_check_queue_indexes.sql >/dev/null
   docker exec -i "$container_name" psql -v ON_ERROR_STOP=1 -U postgres -d videoroll_test < rust/migrations/20261124000036_sau_login_session_indexes.sql >/dev/null
   "$CARGO_HOME/bin/cargo" build --manifest-path "$repo_root/rust/Cargo.toml" --bin videoroll-sau --locked --offline --quiet
-  PYTHONPATH="$repo_root/src" /opt/videoroll/venvs/core/bin/python "$repo_root/rust/tests/sau_check_native_v1_isolated.py"
+  PYTHONPATH="$repo_root/src" "$smoke_python" "$repo_root/rust/tests/sau_check_native_v1_isolated.py"
   echo 'PASS: native SAU account import/check and durable queue with fake browser CLI'
   exit 0
 fi
@@ -290,12 +307,12 @@ ALTER TABLE publish_jobs ALTER COLUMN platform TYPE platform USING platform::pla
 ALTER TABLE publish_jobs ALTER COLUMN state TYPE publish_state USING state::publish_state;
 SQL
   "$CARGO_HOME/bin/cargo" build --manifest-path "$repo_root/rust/Cargo.toml" --bin videoroll-sau --locked --offline --quiet
-  PYTHONPATH="$repo_root/src" /opt/videoroll/venvs/core/bin/python "$repo_root/rust/tests/sau_publish_native_v1_isolated.py"
+  PYTHONPATH="$repo_root/src" "$smoke_python" "$repo_root/rust/tests/sau_publish_native_v1_isolated.py"
   echo 'PASS: native SAU publication intake and durable original outbox; browser worker not started'
   exit 0
 fi
 if [[ "${VIDEOROLL_V2_TEST_SCHEMA_EMPTY_ONLY:-false}" == "true" ]]; then
-  /opt/videoroll/venvs/core/bin/python "$repo_root/rust/tests/schema_unify_empty_v2.py"
+  "$smoke_python" "$repo_root/rust/tests/schema_unify_empty_v2.py"
   echo 'PASS: empty Rust V2 schema fully unified into original business tables'
   exit 0
 fi
@@ -303,7 +320,7 @@ fi
 # Backfill the distinct coordinator SAU dispatch intent into the original
 # operation inbox without duplicating the external receipt publish_jobs row.
 if [[ "${VIDEOROLL_V2_TEST_SAU_BACKFILL_ONLY:-false}" == "true" ]]; then
-  PYTHONPATH="$repo_root/src" /opt/videoroll/venvs/core/bin/python \
+  PYTHONPATH="$repo_root/src" "$smoke_python" \
     "$repo_root/rust/tests/schema_backfill_sau_intents.py"
   echo 'PASS: original publish_jobs unchanged and SAU dispatch intents stored in operation_inbox'
   exit 0
@@ -312,7 +329,7 @@ fi
 # Durable preexisting native YouDub/P2 side effects, with unknown receipts,
 # migrated into original Stage operation records without touching P1.
 if [[ "${VIDEOROLL_V2_TEST_DUBBING_P2_BACKFILL_ONLY:-false}" == "true" ]]; then
-  PYTHONPATH="$repo_root/src" /opt/videoroll/venvs/core/bin/python \
+  PYTHONPATH="$repo_root/src" "$smoke_python" \
     "$repo_root/rust/tests/schema_backfill_dubbing_p2.py"
   echo 'PASS: original dubbing and Bilibili P1 preserved, native P2 evidence backfilled'
   exit 0
@@ -321,7 +338,7 @@ fi
 # Test migration of already-enrolled Python and Rust remote workers, queued
 # and running executions, leases and foreign keys on this disposable DB.
 if [[ "${VIDEOROLL_V2_TEST_RENDER_BACKFILL_ONLY:-false}" == "true" ]]; then
-  PYTHONPATH="$repo_root/src" /opt/videoroll/venvs/core/bin/python \
+  PYTHONPATH="$repo_root/src" "$smoke_python" \
     "$repo_root/rust/tests/schema_backfill_render_workers.py"
   echo 'PASS: old original/native worker and execution records migrate without loss'
   exit 0
@@ -330,7 +347,7 @@ fi
 # Directly test migration of preexisting durable Rust workflow/job rows, not
 # only new empty databases. All migrations are applied to this throwaway DB.
 if [[ "${VIDEOROLL_V2_TEST_BACKFILL_ONLY:-false}" == "true" ]]; then
-  PYTHONPATH="$repo_root/src" /opt/videoroll/venvs/core/bin/python \
+  PYTHONPATH="$repo_root/src" "$smoke_python" \
     "$repo_root/rust/tests/schema_backfill_preexisting_v2.py"
   echo 'PASS: old Rust durable workflow/job rows backfilled without changing Python histories'
   exit 0
@@ -455,53 +472,53 @@ hdr=(-H "x-videoroll-v2-internal-token: $VIDEOROLL_V2_INTERNAL_TOKEN" -H 'conten
 # Native old-UI endpoints: YouDub live status, configured Skill registry,
 # and strictly local legacy RenderWorker bootstrap (disposable DB only).
 if [[ "${VIDEOROLL_V2_TEST_DESKTOP_ONLY:-false}" == "true" ]]; then
-  PYTHONPATH="$repo_root/src" /opt/videoroll/venvs/core/bin/python \
+  PYTHONPATH="$repo_root/src" "$smoke_python" \
     "$repo_root/rust/tests/desktop_grants_v1_isolated.py"
   echo 'PASS: original Python/Rust desktop grant cookie and reconnect fence'
   exit 0
 fi
 if [[ "${VIDEOROLL_V2_TEST_SAU_ACCOUNTS_ONLY:-false}" == "true" ]]; then
   "$CARGO_HOME/bin/cargo" build --manifest-path "$repo_root/rust/Cargo.toml"     --bin videoroll-sau --locked --offline --quiet
-  PYTHONPATH="$repo_root/src" /opt/videoroll/venvs/core/bin/python     "$repo_root/rust/tests/sau_account_native_v1_isolated.py"
+  PYTHONPATH="$repo_root/src" "$smoke_python"     "$repo_root/rust/tests/sau_account_native_v1_isolated.py"
   echo "PASS: standalone SAU health, original account listing and safe revocation"
   exit 0
 fi
 if [[ "${VIDEOROLL_V2_TEST_REMOTE_AUTO_ONLY:-false}" == "true" ]]; then
-  PYTHONPATH="$repo_root/src" /opt/videoroll/venvs/core/bin/python \
+  PYTHONPATH="$repo_root/src" "$smoke_python" \
     "$repo_root/rust/tests/remote_auto_youtube_v1_isolated.py"
   echo 'PASS: independent remote Bearer intake, original PBKDF2/idempotency ledger and concurrent dedupe'
   exit 0
 fi
 if [[ "${VIDEOROLL_V2_TEST_TERMINAL_ONLY:-false}" == "true" ]]; then
-  container_name="$container_name" PYTHONPATH="$repo_root/src" /opt/videoroll/venvs/core/bin/python \
+  container_name="$container_name" PYTHONPATH="$repo_root/src" "$smoke_python" \
     "$repo_root/rust/tests/maintenance_terminal_storage_v1_isolated.py"
   echo 'PASS: original terminal storage cleanup matches safe V1 behavior'
   exit 0
 fi
 if [[ "${VIDEOROLL_V2_TEST_HOME_ONLY:-false}" == "true" ]]; then
-  container_name="$container_name" PYTHONPATH="$repo_root/src" /opt/videoroll/venvs/core/bin/python \
+  container_name="$container_name" PYTHONPATH="$repo_root/src" "$smoke_python" \
     "$repo_root/rust/tests/youtube_home_run_v1_isolated.py"
-  PYTHONPATH="$repo_root/src" /opt/videoroll/venvs/core/bin/python \
+  PYTHONPATH="$repo_root/src" "$smoke_python" \
     "$repo_root/rust/tests/youtube_home_automatic_v1_isolated.py"
   echo 'PASS: original YouTube home scan lock, native Browse, duplicate workflow fencing and legacy telemetry'
   exit 0
 fi
 if [[ "${VIDEOROLL_V2_TEST_YOUDUB_CONTROL_ONLY:-false}" == "true" ]]; then
-  PYTHONPATH="$repo_root/src" /opt/videoroll/venvs/core/bin/python \
+  PYTHONPATH="$repo_root/src" "$smoke_python" \
     "$repo_root/rust/tests/youdub_control_v1_isolated.py"
   echo 'PASS: YouDub original native configure and resident process management'
   exit 0
 fi
 if [[ "${VIDEOROLL_V2_TEST_WORKDIR_ONLY:-false}" == "true" ]]; then
-  container_name="$container_name" PYTHONPATH="$repo_root/src" /opt/videoroll/venvs/core/bin/python \
+  container_name="$container_name" PYTHONPATH="$repo_root/src" "$smoke_python" \
     "$repo_root/rust/tests/maintenance_workdir_v1_isolated.py"
   echo 'PASS: isolated original workdir read/cleanup contract'
   exit 0
 fi
 if [[ "${VIDEOROLL_V2_TEST_LEGACY_GAPS_ONLY:-false}" == "true" ]]; then
-  PYTHONPATH="$repo_root/src" /opt/videoroll/venvs/core/bin/python \
+  PYTHONPATH="$repo_root/src" "$smoke_python" \
     "$repo_root/rust/tests/legacy_gap_youdub_skills_local_enroll.py"
-  PYTHONPATH="$repo_root/src" /opt/videoroll/venvs/core/bin/python \
+  PYTHONPATH="$repo_root/src" "$smoke_python" \
     "$repo_root/rust/tests/legacy_gap_delete_final_asset.py"
   echo 'PASS: original YouDub, Skills, private worker bootstrap and deferred original final-asset deletion'
   exit 0
@@ -514,50 +531,50 @@ if [[ "${VIDEOROLL_V2_TEST_BILI_DIRECT_ONLY:-false}" == "true" ]]; then
   export VIDEOROLL_V2_ALLOW_TEST_BILIBILI_LOOPBACK=true
   python3 "$repo_root/rust/tests/mock_bilibili_publish_direct.py" > "$repo_root/rust/target/v2-bili-direct-mock.log" 2>&1 &
   ai_pid=$!
-  PYTHONPATH="$repo_root/src" /opt/videoroll/venvs/core/bin/python \
+  PYTHONPATH="$repo_root/src" "$smoke_python" \
     "$repo_root/rust/tests/bilibili_publish_direct_v1_isolated.py"
   exit 0
 fi
 if [[ "${VIDEOROLL_V2_TEST_SELECTIVE_ONLY:-false}" == "true" ]]; then
   python3 "$repo_root/rust/tests/mock_ai_server.py" > "$repo_root/rust/target/v2-selective-mock-ai.log" 2>&1 &
   ai_pid=$!
-  PYTHONPATH="$repo_root/src" /opt/videoroll/venvs/core/bin/python \
+  PYTHONPATH="$repo_root/src" "$smoke_python" \
     "$repo_root/rust/tests/selective_retranslate_v1_isolated.py"
   exit 0
 fi
 if [[ "${VIDEOROLL_V2_TEST_MISSING_ACTIONS_ONLY:-false}" == "true" ]]; then
-  PYTHONPATH="$repo_root/src" /opt/videoroll/venvs/core/bin/python \
+  PYTHONPATH="$repo_root/src" "$smoke_python" \
     "$repo_root/rust/tests/legacy_missing_actions_v1_isolated.py"
   exit 0
 fi
 if [[ "${VIDEOROLL_V2_TEST_PLAYOUT_ACTION_ONLY:-false}" == "true" ]]; then
-  PYTHONPATH="$repo_root/src" /opt/videoroll/venvs/core/bin/python \
+  PYTHONPATH="$repo_root/src" "$smoke_python" \
     "$repo_root/rust/tests/legacy_playout_action_v1_isolated.py"
   exit 0
 fi
 if [[ "${VIDEOROLL_V2_TEST_BILI_DISCOVERY_ONLY:-false}" == "true" ]]; then
-  PYTHONPATH="$repo_root/src" /opt/videoroll/venvs/core/bin/python \
+  PYTHONPATH="$repo_root/src" "$smoke_python" \
     "$repo_root/rust/tests/bilibili_discovery_v1_isolated.py"
   echo 'PASS: Bilibili discovery ranking, public activity catalogue, exact Python payload and TTL'
   exit 0
 fi
 if [[ "${VIDEOROLL_V2_TEST_BILIBILI_ACCOUNT_ONLY:-false}" == "true" ]]; then
-  PYTHONPATH="$repo_root/src" /opt/videoroll/venvs/core/bin/python \
+  PYTHONPATH="$repo_root/src" "$smoke_python" \
     "$repo_root/rust/tests/bilibili_account_v1_isolated.py"
   exit 0
 fi
 if [[ "${VIDEOROLL_V2_TEST_BILIBILI_SETTINGS_ONLY:-false}" == "true" ]]; then
-  PYTHONPATH="$repo_root/src" /opt/videoroll/venvs/core/bin/python \
+  PYTHONPATH="$repo_root/src" "$smoke_python" \
     "$repo_root/rust/tests/bilibili_settings_v1_isolated.py"
   exit 0
 fi
 if [[ "${VIDEOROLL_V2_TEST_REMOTE_SETTINGS_ONLY:-false}" == "true" ]]; then
-  PYTHONPATH="$repo_root/src" /opt/videoroll/venvs/core/bin/python \
+  PYTHONPATH="$repo_root/src" "$smoke_python" \
     "$repo_root/rust/tests/remote_api_settings_v1_isolated.py"
   exit 0
 fi
 if [[ "${VIDEOROLL_V2_TEST_SUBTITLE_REMAINING_ONLY:-false}" == "true" ]]; then
-  /opt/videoroll/venvs/core/bin/python "$repo_root/rust/tests/subtitle_remaining_v1_focused.py"
+  "$smoke_python" "$repo_root/rust/tests/subtitle_remaining_v1_focused.py"
   echo 'PASS: remaining native subtitle-service V1 read/diagnostic adapters'
   exit 0
 fi
@@ -577,7 +594,7 @@ if [[ "${VIDEOROLL_V2_TEST_NATIVE_RAG_ONLY:-false}" == "true" ]]; then
 fi
 
 if [[ "${VIDEOROLL_V2_TEST_DIFF_ONLY:-false}" == "true" ]]; then
-  PYTHONPATH="$repo_root/src" /opt/videoroll/venvs/core/bin/python \
+  PYTHONPATH="$repo_root/src" "$smoke_python" \
      "$repo_root/rust/tests/python_rust_subtitle_render_diff.py"
   echo 'PASS: focused original Python/Rust differential'
   exit 0
@@ -586,9 +603,9 @@ fi
 # Fast isolated Knowledge API differential: no expensive video/worker suite.
 # Useful for local repair iterations without stressing production memory.
 if [[ "${VIDEOROLL_V2_TEST_KNOWLEDGE_ONLY:-false}" == "true" ]]; then
-  PYTHONPATH="$repo_root/src" /opt/videoroll/venvs/core/bin/python \
+  PYTHONPATH="$repo_root/src" "$smoke_python" \
      "$repo_root/rust/tests/dictionary_promote_v1_focused_diff.py"
-  PYTHONPATH="$repo_root/src" /opt/videoroll/venvs/core/bin/python \
+  PYTHONPATH="$repo_root/src" "$smoke_python" \
      "$repo_root/rust/tests/knowledge_write_v1_focused_diff.py"
   echo 'PASS: isolated native knowledge write/rebuild differential'
   exit 0
@@ -597,7 +614,7 @@ fi
 # Focused reliability differential: genuine PNG/JPEG/WebP uploads, durable
 # original publish batch receipts, and removed YouDub operations.
 if [[ "${VIDEOROLL_V2_TEST_RELIABILITY_ONLY:-false}" == "true" ]]; then
-  PYTHONPATH="$repo_root/src" /opt/videoroll/venvs/core/bin/python \
+  PYTHONPATH="$repo_root/src" "$smoke_python" \
     "$repo_root/rust/tests/task_reliability_v1_focused_diff.py"
   echo 'PASS: isolated publish batch and cover differential'
   exit 0
@@ -606,7 +623,7 @@ fi
 # Unified RenderWorker registry: both original vrw_/vre_ credentials and native
 # 64-hex wire requests authenticate and persist in original Python tables.
 if [[ "${VIDEOROLL_V2_TEST_WORKER_AUTH_ONLY:-false}" == "true" ]]; then
-  PYTHONPATH="$repo_root/src" /opt/videoroll/venvs/core/bin/python \
+  PYTHONPATH="$repo_root/src" "$smoke_python" \
     "$repo_root/rust/tests/unified_worker_auth_isolated.py"
   echo 'PASS: original/native worker HTTP identity and single-use enrollment'
   exit 0
@@ -614,7 +631,7 @@ fi
 
 # Canonical Python original tables (no vr2_settings/vr2_alerts).
 if [[ "${VIDEOROLL_V2_TEST_CANONICAL_ONLY:-false}" == "true" ]]; then
-  PYTHONPATH="$repo_root/src" /opt/videoroll/venvs/core/bin/python \
+  PYTHONPATH="$repo_root/src" "$smoke_python" \
     "$repo_root/rust/tests/canonical_tables_v1_focused.py"
   echo 'PASS: original Python settings/alert tables are the single source of truth'
   exit 0
@@ -664,17 +681,17 @@ if [[ "${VIDEOROLL_V2_TEST_CONTRACT_217_ONLY:-false}" == "true" ]]; then
   probe_task_id="$(FIRST="$first" python3 -c 'import json,os;print(json.loads(os.environ["FIRST"])["task"]["id"])')"
   probe_alert="$(curl --silent --fail-with-body "${hdr[@]}" -d '{"fingerprint":"vr2.contract.alert","source":"isolated","severity":"warning","title":"Contract fixture","message":"mock only","details":{}}' http://127.0.0.1:18080/api/v1/operations/alerts/report)"
   probe_alert_id="$(ALERT="$probe_alert" python3 -c 'import json,os;print(json.loads(os.environ["ALERT"])["id"])')"
-  /opt/videoroll/venvs/core/bin/python "$repo_root/rust/tests/contract_parity_64.py" --all-services \
+  "$smoke_python" "$repo_root/rust/tests/contract_parity_64.py" --all-services \
     --task-id "$probe_task_id" --alert-id "$probe_alert_id" \
     --out "$repo_root/rust/target/contract-parity-217.json"
   exit 0
 fi
 "$CARGO_HOME/bin/cargo" build --manifest-path "$repo_root/rust/Cargo.toml"   --bin videoroll-sau --locked --offline --quiet
-PYTHONPATH="$repo_root/src" /opt/videoroll/venvs/core/bin/python   "$repo_root/rust/tests/sau_account_native_v1_isolated.py"
+PYTHONPATH="$repo_root/src" "$smoke_python"   "$repo_root/rust/tests/sau_account_native_v1_isolated.py"
 
 # Test the Nginx desktop auth_request boundary only after native admin auth
 # is established; use disposable Python V1 cookie and original grant schema.
-PYTHONPATH="$repo_root/src" /opt/videoroll/venvs/core/bin/python \
+PYTHONPATH="$repo_root/src" "$smoke_python" \
   "$repo_root/rust/tests/desktop_grants_v1_isolated.py"
 if [[ "${VIDEOROLL_V2_TEST_WS_PROBE_ONLY:-false}" == "true" ]]; then
   PYTHONPATH="$repo_root/src" python3 "$repo_root/rust/tests/contract_parity_64.py" \
@@ -1941,32 +1958,32 @@ fi
 echo 'PASS: isolated worker stopped before fixed-fixture Python/Rust differential'
 
 # Actual original Python service functions and Rust HTTP on the same temporary DB.
-PYTHONPATH="$repo_root/src" /opt/videoroll/venvs/core/bin/python \
+PYTHONPATH="$repo_root/src" "$smoke_python" \
   "$repo_root/rust/tests/python_rust_subtitle_render_diff.py"
 
 # Python original and Rust API must agree on embedding models and vector runtime.
-PYTHONPATH="$repo_root/src" /opt/videoroll/venvs/core/bin/python \
+PYTHONPATH="$repo_root/src" "$smoke_python" \
   "$repo_root/rust/tests/embedding_v1_focused_diff.py"
 
 # Promote glossary terms into original RAG knowledge via transactional SQL.
-PYTHONPATH="$repo_root/src" /opt/videoroll/venvs/core/bin/python \
+PYTHONPATH="$repo_root/src" "$smoke_python" \
   "$repo_root/rust/tests/dictionary_promote_v1_focused_diff.py"
 
 # Import real glossary files via multipart and compare the source Python DB rows.
-PYTHONPATH="$repo_root/src" /opt/videoroll/venvs/core/bin/python \
+PYTHONPATH="$repo_root/src" "$smoke_python" \
   "$repo_root/rust/tests/dictionary_import_v1_focused_diff.py"
 
 # Real Python and Rust RAG item writes / vector rebuild through localhost
 # OpenAI-compatible Embedding API. All rows and credentials are disposable.
-PYTHONPATH="$repo_root/src" /opt/videoroll/venvs/core/bin/python \
+PYTHONPATH="$repo_root/src" "$smoke_python" \
   "$repo_root/rust/tests/knowledge_write_v1_focused_diff.py"
 
 # Test original Python vs Rust publish batches and cover upload on disposable DB.
-PYTHONPATH="$repo_root/src" /opt/videoroll/venvs/core/bin/python \
+PYTHONPATH="$repo_root/src" "$smoke_python" \
   "$repo_root/rust/tests/task_reliability_v1_focused_diff.py"
 
 # Probe every mapped native /api/v1 route independently.
 # Only local disposable fixtures are used; this is not Python-side parity signoff.
-/opt/videoroll/venvs/core/bin/python "$repo_root/rust/tests/contract_parity_64.py" --all-services \
+"$smoke_python" "$repo_root/rust/tests/contract_parity_64.py" --all-services \
   --task-id "$manual_dub_id" --alert-id "$alert_id" \
   --out "$repo_root/rust/target/contract-parity-217.json"
