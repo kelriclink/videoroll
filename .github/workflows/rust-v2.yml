@@ -58,14 +58,33 @@ jobs:
 
   isolated-integration:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
-      - name: Verify runtime requirements
-        run: docker version && ffmpeg -version && ffprobe -version
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: requirements.lock
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install isolated comparison dependencies
+        run: |
+          python -m pip install -c requirements.lock -e ".[dev,dubbing]"
+          npm install --prefix "$RUNNER_TEMP/vr-smoke-node" --no-save --package-lock=false --no-audit --no-fund ws@8.18.3
+          echo "VIDEOROLL_V2_TEST_PYTHON=$(command -v python)" >> "$GITHUB_ENV"
+          echo "NODE_PATH=$RUNNER_TEMP/vr-smoke-node/node_modules" >> "$GITHUB_ENV"
+      - name: Install FFmpeg and verify runtime requirements
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends ffmpeg
+          docker version && ffmpeg -version && ffprobe -version
+      - name: Fetch locked Rust dependencies for offline smoke commands
+        run: cargo fetch --manifest-path rust/Cargo.toml --locked
       - name: Full disposable PostgreSQL + synthetic video flow
         run: bash rust/scripts/smoke-isolated.sh
