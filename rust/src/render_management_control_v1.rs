@@ -281,7 +281,9 @@ fn active(state: &str) -> bool {
     matches!(state, "claimed" | "running" | "uploading")
 }
 async fn execution_read(state: &AppState, id: Uuid) -> AppResult<Json<Value>> {
-    let sql = format!("{EXEC_SQL} WHERE e.id=$1 AND e.runtime_engine=$2");
+    let sql = format!(
+        "{EXEC_SQL} WHERE e.id=$1 AND (e.runtime_engine=$2 OR ($2='rust-v2' AND e.runtime_engine='python'))"
+    );
     let row = sqlx::query(&sql)
         .bind(id)
         .bind(management_engine())
@@ -305,6 +307,11 @@ async fn native_execution_change(
     .fetch_optional(&mut *tx)
     .await?
     .ok_or_else(|| AppError::NotFound("render execution not found".into()))?;
+    if peek.try_get::<String, _>("runtime_engine")? == "python" && requeue {
+        tx.rollback().await?;
+        crate::historical_p2_render::enqueue(&state.db, id, reason).await?;
+        return execution_read(state, id).await;
+    }
     if peek.try_get::<String, _>("runtime_engine")? != "rust-v2" {
         return Err(AppError::Conflict(
             "historical render executions are read-only".into(),

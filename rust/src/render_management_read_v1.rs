@@ -170,9 +170,15 @@ pub(crate) fn execution_payload(row: &PgRow) -> AppResult<Value> {
     if native_management() {
         result["runtime_engine"] = json!(row.try_get::<String, _>("runtime_engine")?);
         let cancel: bool = row.try_get("native_control_safe")?;
-        let requeue = cancel
+        let requeue = (cancel
             && row.try_get::<bool, _>("native_requeue_safe")?
-            && row.try_get::<i32, _>("attempt")? < crate::remote_render::MAX_RENDER_ATTEMPTS;
+            && row.try_get::<i32, _>("attempt")? < crate::remote_render::MAX_RENDER_ATTEMPTS)
+            || (crate::historical_p2_render::enabled()
+                && row.try_get::<bool, _>("historical_p2_candidate")?);
+        if crate::historical_p2_render::enabled() {
+            result["historical_recovery_status"] =
+                json!(row.try_get::<Option<String>, _>("historical_recovery_status")?);
+        }
         result["control_supported"] = json!(cancel || requeue);
         result["cancel_supported"] = json!(cancel);
         result["requeue_supported"] = json!(requeue);
@@ -194,13 +200,23 @@ pub(crate) const EXEC_SQL: &str = r#"
              AND f.engine='rust-v2' AND f.task_id=e.task_id AND f.state='running' AND f.current_stage='render'
              AND t.runtime_owner='rust' AND t.status::text NOT IN ('canceled','failed','published','publishing')
              AND NOT EXISTS(SELECT 1 FROM operation_inbox other WHERE other.workflow_id=e.workflow_id AND other.runtime_engine='rust-v2' AND other.id<>e.job_id AND other.status IN ('pending','running','awaiting','unknown')),false) AS native_control_safe,
-           COALESCE(e.state='queued' OR (e.state IN ('running','uploading') AND e.lease_until<=now()),false) AS native_requeue_safe
+           COALESCE(e.state='queued' OR (e.state IN ('running','uploading') AND e.lease_until<=now()),false) AS native_requeue_safe,
+           COALESCE(e.runtime_engine='python' AND e.state IN ('failed','canceled','lost')
+             AND (e.lease_until IS NULL OR e.lease_until<=now()) AND j.status::text IN ('failed','canceled')
+             AND j.lease_owner IS NULL AND j.lease_until IS NULL
+             AND d.status IN ('failed','paused') AND d.lease_owner IS NULL AND d.lease_until IS NULL
+             AND j.operation_key='youdub:p2-render:'||d.id::text AND d.output_json->>'render_job_id'=j.id::text
+             AND d.output_json->'youdub'->>'stage'='rendering_p2' AND t.runtime_owner='rust'
+             AND t.status::text NOT IN ('canceled','publishing') AND h.id IS NULL,false) AS historical_p2_candidate,
+           h.status AS historical_recovery_status
     FROM render_executions e
     LEFT JOIN render_workers w ON w.id=e.worker_id
     LEFT JOIN render_jobs j ON j.id=e.render_job_id
     LEFT JOIN operation_inbox o ON o.id=e.job_id AND o.runtime_engine='rust-v2'
     LEFT JOIN pipeline_runs f ON f.id=e.workflow_id
-    LEFT JOIN tasks t ON t.id=e.task_id
+    LEFT JOIN tasks t ON t.id=COALESCE(e.task_id,j.task_id)
+    LEFT JOIN dubbing_jobs d ON d.id::text=j.request_json->>'dubbing_job_id' AND d.task_id=j.task_id
+    LEFT JOIN operation_inbox h ON h.operation_key='rust-historical-p2-render:'||j.id::text AND h.runtime_engine='rust-historical-p2-render'
 "#;
 #[derive(Deserialize)]
 struct ExecutionFilter {

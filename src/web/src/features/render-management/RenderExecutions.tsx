@@ -54,6 +54,7 @@ export function RenderExecutions({
                       <span className={`rounded-full px-2 py-1 text-xs ${badgeClass(execution.state)}`}>
                         {executionStatusLabel(execution.state)}
                       </span>
+                      {execution.historical_recovery_status ? <div className="mt-1 text-xs text-slate-500">历史 P2 恢复：{execution.historical_recovery_status}</div> : null}
                     </td>
                     <td>
                       <div>{execution.worker_name ?? (execution.worker_id ? "未知节点" : "等待分配")}</div>
