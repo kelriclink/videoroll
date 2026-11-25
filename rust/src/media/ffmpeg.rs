@@ -341,7 +341,7 @@ pub async fn render(
     // A new selective subtitle version invalidates the previously burned-in
     // video; never reuse a video_final from an earlier subtitle generation.
     let selective: bool = sqlx::query_scalar(
-        "SELECT configuration ? 'selective_retranslate' OR configuration ? 'subtitle_resume_plan'
+        "SELECT configuration ? 'selective_retranslate' OR configuration ? 'subtitle_resume_plan' OR configuration ? 'after_render_publish'
         FROM vr2_workflows WHERE id=$1",
     )
     .bind(job.workflow_id)
@@ -361,7 +361,12 @@ pub async fn render(
     let pinned =
         crate::subtitle_resume_v1::render_inputs(db, registry, job.task_id, job.workflow_id)
             .await?;
-    let source_key = if let Some((raw, _, _)) = &pinned {
+    let explicit =
+        crate::social_publish::explicit_render_inputs(db, registry, job.task_id, job.workflow_id)
+            .await?;
+    let source_key = if let Some((raw, _, _)) = &explicit {
+        raw.clone()
+    } else if let Some((raw, _, _)) = &pinned {
         raw.clone()
     } else {
         latest_asset_key(db, job.task_id, "video_raw")
@@ -371,7 +376,9 @@ pub async fn render(
     let input = registry.resolve_existing(&source_key).await?;
     probe_video(&config.ffprobe_binary, &input).await?;
     let cfg = profile(db, job).await?;
-    let subtitle_key = if let Some((_, ass, _)) = pinned {
+    let subtitle_key = if let Some((_, ass, srt)) = explicit {
+        ass.or(srt)
+    } else if let Some((_, ass, _)) = pinned {
         Some(ass)
     } else {
         latest_asset_key(db, job.task_id, "subtitle_ass")

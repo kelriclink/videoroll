@@ -280,7 +280,11 @@ async fn build_spec(s: &AppState, exec: &ExecutionInfo) -> AppResult<RenderSpec>
         payload: Value::Null,
     };
     let profile = crate::media::ffmpeg::profile(&s.db, &job).await?;
-    let (source, ass, srt) = if let Some((raw, ass, srt)) =
+    let (source, ass, srt) = if let Some(inputs) =
+        crate::social_publish::explicit_render_inputs(&s.db, &s.storage, task_id, flow_id).await?
+    {
+        inputs
+    } else if let Some((raw, ass, srt)) =
         crate::subtitle_resume_v1::render_inputs(&s.db, &s.storage, task_id, flow_id).await?
     {
         (raw, Some(ass), Some(srt))

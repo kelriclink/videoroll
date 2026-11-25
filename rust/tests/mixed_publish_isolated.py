@@ -253,6 +253,101 @@ if n=='mixed-fail':sys.exit(1)
             assert resolve(tc,dj,{**receipt,'external_id':'7412345678901234573'})[0]==200
             assert parent_state(wc,jc)[:3]==('succeeded','succeeded','native-batch:'+bc) and state(tc,bc)==('succeeded','published',None,1)
             print('PASS: original automatic action preserves explicitly selected prior successful P2 receipt and sends exactly two Bilibili parts',flush=True)
+            # Actual standalone subtitle -> render -> explicit publication.
+            # A stale video_final exists; the worker must bind the new output.
+            def after_seed(platforms):
+                t,body=seed()
+                old=body['video_key'];raw=f'v2/raw/{t}/after-render.mp4';p=root/raw;p.write_bytes((root/old).read_bytes())
+                db("INSERT INTO assets(id,task_id,kind,storage_key,sha256,size_bytes) VALUES(CAST(:a AS uuid),CAST(:t AS uuid),'video_raw',:k,:sha,:size)",{'a':str(uuid.uuid4()),'t':t,'k':raw,'sha':hashlib.sha256(p.read_bytes()).hexdigest(),'size':p.stat().st_size})
+                db("UPDATE tasks SET status='downloaded' WHERE id=CAST(:t AS uuid)",{'t':t})
+                payload={'platforms':platforms,'account_ids':{'douyin':good} if 'douyin' in platforms else {},'platform_meta':{k:v for k,v in body['platform_meta'].items() if k in platforms}}
+                req={'task_id':t,'input':{'type':'storage','key':raw},'runtime_profile':False,'prefer_youtube_subtitles':False,'youtube_subtitle_mode':'off','translate':{'enabled':False},'output':{'render':{'burn_in':False}},'after_render':{'publish':True,'publish_payload':payload}}
+                return t,raw,old,req
+            def child_state(t,stage):
+                rows=db("SELECT status,result_json FROM operation_inbox WHERE task_id=CAST(:t AS uuid) AND stage=:stage AND runtime_engine='rust-v2' ORDER BY created_at LIMIT 1",{'t':t,'stage':stage},True)
+                return rows[0] if rows else None
+            t,raw,old,req=after_seed(['bilibili','douyin'])
+            # Reject dangerous/malformed intent before creating any job.
+            for patch in [{'force_retry':True},{'skip_review':True},{'platforms':[]},{'account_ids':{}},{'video_parts':[{}]}]:
+                code,bad=api('/subtitle/jobs',{**req,'after_render':{'publish':True,'publish_payload':{**req['after_render']['publish_payload'],**patch}}})
+                assert code==400,(code,bad)
+            code,admitted=api('/subtitle/jobs',req);assert code==200,(code,admitted)
+            assert api('/subtitle/jobs',req)==(code,admitted)
+            code,bad=api('/subtitle/jobs',{**req,'after_render':{'publish':True,'payload':{**req['after_render']['publish_payload'],'platform_meta':{**req['after_render']['publish_payload']['platform_meta'],'douyin':{'title':'changed'}}}}})
+            assert code==409,(code,bad)
+            assert auto_batch(t) is None
+            # Explicit targets and meta must not depend on current global profile.
+            db("UPDATE app_settings SET value_json=CAST(:v AS jsonb) WHERE key='subtitle.auto_profile'",{'v':json.dumps({'auto_publish':False,'auto_publish_platforms':['kuaishou'],'auto_dub_p2':True,'youtube_subtitle_mode':'off'})})
+            env={**os.environ,'VIDEOROLL_V2_WORKERS':'1','VIDEOROLL_V2_ASR_ENDPOINT':'http://127.0.0.1:1/v1/audio/transcriptions','VIDEOROLL_V2_ASR_MODEL':'no-audio-fixture','VIDEOROLL_V2_REMOTE_RENDER':'false','RUST_LOG':'warn'}
+            before=counters();old_calls=(runtime/'calls').read_text().splitlines()
+            with (root.parent/'after-render-worker.log').open('w') as out:
+                core=subprocess.Popen([str(worker),'worker'],env=env,stdout=out,stderr=subprocess.STDOUT)
+                try:
+                    wait(lambda:auto_batch(t) is not None or (child_state(t,'publish') or [''])[0]=='unknown')
+                    batch,proof=auto_batch(t) or (None,None);assert batch,(child_state(t,'subtitle'),child_state(t,'render'),child_state(t,'publish'))
+                    wait(lambda:(child_state(t,'publish') or [''])[0]=='unknown')
+                    assert child_state(t,'render')[0]=='succeeded' and child_state(t,'render')[1]['storage_key']==raw
+                    assert child_state(t,'dubbing')[1].get('skipped')
+                    assert set(proof['platforms'])=={'bilibili','douyin'}
+                    dj,aid,meta=db("SELECT id::text,account_id::text,meta_json FROM publish_jobs WHERE batch_id=CAST(:b AS uuid) AND platform='douyin'",{'b':batch})
+                    assert aid==good and meta['video']['key']==raw and meta['meta']['title']=='mixed fixture',meta
+                    assert state(t,batch)==('partial_failed','publishing','PUBLISH_PARTIAL_FAILURE',0)
+                    assert resolve(t,dj,{**receipt,'external_id':'7412345678901234574'})[0]==200
+                    assert state(t,batch)==('succeeded','published',None,1)
+                    assert child_state(t,'publish')[0]=='succeeded'
+                    # Single Bilibili explicit after_render uses the same parent
+                    # settlement, without depending on the global auto profile.
+                    t2,raw2,_,req2=after_seed(['bilibili'])
+                    req2['after_render']['payload']=req2['after_render'].pop('publish_payload')
+                    assert api('/subtitle/jobs',req2)[0]==200
+                    wait(lambda:(child_state(t2,'publish') or [''])[0] in ('succeeded','unknown'))
+                    assert child_state(t2,'publish')[0]=='succeeded',child_state(t2,'publish')
+                    b2,_=auto_batch(t2);assert state(t2,b2)==('succeeded','published',None,1)
+                    # Explicit stale video pin fails closed after actual render.
+                    t3,raw3,old3,req3=after_seed(['douyin']);req3['after_render']['publish_payload']['video_key']=old3
+                    assert api('/subtitle/jobs',req3)[0]==200
+                    wait(lambda:(child_state(t3,'publish') or [''])[0]=='unknown')
+                    assert child_state(t3,'render')[0]=='succeeded' and auto_batch(t3) is None
+                    assert db("SELECT count(*) FROM publish_jobs WHERE task_id=CAST(:t AS uuid)",{'t':t3})==(0,)
+                    assert counters()['submit']==before['submit']+2 and (runtime/'calls').read_text().splitlines()==old_calls+['mixed-ok']
+                finally:
+                    core.terminate()
+                    try:core.wait(timeout=8)
+                    except subprocess.TimeoutExpired:core.kill();core.wait(timeout=5)
+            print('PASS: standalone after_render explicit mixed and single Bilibili publication, current render receipt pin, disabled global auto settings ignored, stale video blocked, no duplicate dispatch',flush=True)
+            # Failure-injection: an old verified source snapshot produces an
+            # actual ASS, then the render executable fails. No Publish job.
+            tf,rf,_,qf=after_seed(['douyin'])
+            source=[{'start':0.1,'end':0.8,'text':'fixture render failure'}]
+            data=json.dumps(source).encode();sha=hashlib.sha256(data).hexdigest();k=f'sub/{tf}/segments_{sha[:16]}_{uuid.uuid4().hex[:12]}.json'
+            path=root/k;path.parent.mkdir(parents=True,exist_ok=True);path.write_bytes(data)
+            db("INSERT INTO assets(id,task_id,kind,storage_key,sha256,size_bytes) VALUES(CAST(:a AS uuid),CAST(:t AS uuid),'segments_json',:k,:sha,:n)",{'a':str(uuid.uuid4()),'t':tf,'k':k,'sha':sha,'n':len(data)})
+            qf.update(resume=True,artifacts={'source_segments_key':k},output={'render':{'burn_in':True,'video_codec':'h264','use_intel_gpu':False}})
+            db("INSERT INTO subtitle_jobs(id,task_id,status,request_json) VALUES(CAST(:a AS uuid),CAST(:t AS uuid),'failed',CAST(:r AS jsonb))",{'a':str(uuid.uuid4()),'t':tf,'r':json.dumps({'input':{'type':'storage','key':rf},'artifacts':qf['artifacts']})})
+            assert api('/subtitle/jobs',qf)[0]==200
+            tx,rx,_,qx=after_seed(['douyin'])
+            assert api('/subtitle/jobs',qx)[0]==200
+            (root/rx).write_bytes(b'changed after admission')
+            db("UPDATE operation_inbox SET max_attempts=1 WHERE task_id=CAST(:t AS uuid) AND stage='subtitle'",{'t':tx})
+            with (root.parent/'after-render-failure.log').open('w') as out:
+                core=subprocess.Popen([str(worker),'worker'],env={**env,'VIDEOROLL_V2_FFMPEG':'/nonexistent/isolated-ffmpeg'},stdout=out,stderr=subprocess.STDOUT)
+                try:
+                    wait(lambda:(child_state(tf,'render') or [''])[0]=='pending' and db("SELECT attempts>0 FROM vr2_jobs WHERE task_id=CAST(:t AS uuid) AND stage='render'",{'t':tf})==(True,))
+                    db("UPDATE operation_inbox SET max_attempts=1,available_at=now() WHERE task_id=CAST(:t AS uuid) AND stage='render'",{'t':tf})
+                    wait(lambda:(child_state(tf,'render') or [''])[0]=='failed')
+                    wait(lambda:(child_state(tx,'subtitle') or [''])[0]=='failed')
+                    assert child_state(tf,'subtitle')[0]=='succeeded'
+                    for z in (tf,tx):
+                        assert child_state(z,'publish') is None and auto_batch(z) is None
+                        assert db("SELECT count(*) FROM publish_jobs WHERE task_id=CAST(:t AS uuid)",{'t':z})==(0,)
+                    assert counters()['submit']==before['submit']+2 and (runtime/'calls').read_text().splitlines()==old_calls+['mixed-ok']
+                finally:
+                    core.terminate()
+                    try:core.wait(timeout=8)
+                    except subprocess.TimeoutExpired:core.kill();core.wait(timeout=5)
+            print('PASS: actual render failure and changed original raw input never admit after_render publication',flush=True)
+
+
 
 
 

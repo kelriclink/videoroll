@@ -378,6 +378,15 @@ impl Scheduler {
             }
             configuration = previous.try_get("configuration")?;
         }
+        // A new manual stage cannot inherit a past explicit posting intent.
+        if matches!(stage, Stage::Subtitle | Stage::Publish)
+            && !changes.contains_key("after_render_publish")
+        {
+            if let Some(base) = configuration.as_object_mut() {
+                base.remove("after_render_publish");
+                base.remove("after_render_input");
+            }
+        }
         if stage == Stage::Subtitle && !changes.contains_key("subtitle_resume_plan") {
             if let Some(base) = configuration.as_object_mut() {
                 base.remove("subtitle_resume_plan");
