@@ -31,16 +31,24 @@ impl Default for RenderProfile {
     }
 }
 pub async fn profile(db: &Database, job: &WorkItem) -> AppResult<RenderProfile> {
-    let runtime: Option<Value> =
-        Some(crate::settings::effective(db, "subtitle.auto_profile").await?);
-    // Runtime profile is read at render time rather than frozen at ingest.
-    let mut p =
-        serde_json::from_value::<RenderProfile>(runtime.unwrap_or(json!({}))).unwrap_or_default();
+    let runtime = crate::settings::effective(db, "subtitle.auto_profile").await?;
     let settings: Option<Value> =
         sqlx::query_scalar("SELECT configuration FROM vr2_workflows WHERE id=$1")
             .bind(job.workflow_id)
             .fetch_optional(&db.pool)
             .await?;
+    // Explicit runtime-profile requests use the original UI defaults as well
+    // as the current settings; ordinary existing workflows are unchanged.
+    let runtime = if settings
+        .as_ref()
+        .and_then(|v| v["standalone_subtitle_runtime_profile"].as_bool())
+        == Some(true)
+    {
+        crate::subtitle_management_v1::normalized_profile(&runtime)
+    } else {
+        runtime
+    };
+    let mut p = serde_json::from_value::<RenderProfile>(runtime).unwrap_or_default();
     if let Some(overrides) = settings.and_then(|v| v.get("render").cloned()) {
         let override_values = serde_json::to_value(&p).unwrap_or_default();
         let mut combined = override_values;

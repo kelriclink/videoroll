@@ -64,36 +64,90 @@ fn config(request: &Value) -> AppResult<(Uuid, String, Value)> {
         .ok_or_else(|| invalid("task_id must be UUID"))?;
     if map
         .get("runtime_profile")
-        .is_some_and(|v| v == &Value::Bool(true))
-    {
-        return Err(invalid(
-            "runtime_profile=true requires an automatic workflow already owned by Rust",
-        ));
-    }
-    if map
-        .get("runtime_profile")
         .is_some_and(|v| !v.is_null() && !v.is_boolean())
     {
         return Err(invalid("runtime_profile must be boolean or null"));
     }
-    for key in ["artifacts", "selective_retranslate", "after_render"] {
-        if map
-            .get(key)
-            .is_some_and(|v| !v.is_null() && v.as_object().is_none_or(|o| !o.is_empty()))
+    let selective = optional_object(map, "selective_retranslate")?.filter(|v| !v.is_empty());
+    let artifacts = optional_object(map, "artifacts")?.filter(|v| !v.is_empty());
+    if let Some(plan) = selective {
+        if map.get("runtime_profile").and_then(Value::as_bool) == Some(true) {
+            return Err(invalid(
+                "native selective retranslation freezes the prior source configuration; runtime_profile=true is not supported",
+            ));
+        }
+
+        allowed(
+            plan,
+            &[
+                "indices",
+                "base_translated_segments_key",
+                "translation_context_key",
+            ],
+            "selective_retranslate",
+        )?;
+        if !plan.get("indices").is_some_and(|v| v.is_array()) {
+            return Err(invalid("selective indices required"));
+        }
+        if plan
+            .get("translation_context_key")
+            .is_some_and(|v| !v.is_null() && v.as_str().is_none_or(|s| !s.is_empty()))
         {
-            return Err(invalid(&format!(
-                "{key} requires the unported Python subtitle worker"
-            )));
+            return Err(invalid(
+                "legacy separate translation context is not supported; use native aligned snapshot",
+            ));
+        }
+        if let Some(a) = artifacts {
+            allowed(
+                a,
+                &["source_segments_key", "final_subtitle_segments_key"],
+                "artifacts",
+            )?;
+            for key in ["source_segments_key", "final_subtitle_segments_key"] {
+                if let Some(v) = a.get(key).filter(|v| !v.is_null()) {
+                    if v.as_str().is_none() || Some(v) != plan.get("base_translated_segments_key") {
+                        return Err(invalid(
+                            "selective artifacts must match the single native aligned snapshot",
+                        ));
+                    }
+                }
+            }
+        }
+    } else if artifacts.is_some() {
+        return Err(invalid(
+            "non-selective legacy artifacts require pinned resume support",
+        ));
+    }
+    if let Some(after) = optional_object(map, "after_render")? {
+        allowed(
+            after,
+            &["publish", "publish_payload", "payload"],
+            "after_render",
+        )?;
+        if after
+            .get("publish")
+            .is_some_and(|v| v.as_bool() != Some(false))
+            || after
+                .get("publish_payload")
+                .or_else(|| after.get("payload"))
+                .is_some_and(|v| !v.is_null() && v.as_object().is_none_or(|o| !o.is_empty()))
+        {
+            return Err(invalid(
+                "explicit after_render publication requires native payload binding",
+            ));
         }
     }
-    if map
-        .get("output_prefix")
-        .and_then(Value::as_str)
-        .is_some_and(|v| !v.is_empty())
-    {
-        return Err(invalid(
-            "output_prefix requires the unported Python subtitle worker",
-        ));
+    if let Some(prefix) = map.get("output_prefix") {
+        let prefix = prefix
+            .as_str()
+            .ok_or_else(|| invalid("output_prefix must be a string"))?;
+        // Original worker uses content-addressed task directories, not this
+        // request hint. Accept only the original canonical task prefix.
+        if !prefix.is_empty() && prefix != format!("sub/{id}/") {
+            return Err(invalid(
+                "output_prefix must be empty or the original task-owned sub/<task_id>/ prefix",
+            ));
+        }
     }
     let input = object(
         map.get("input")
@@ -282,7 +336,7 @@ async fn create(
     State(state): State<AppState>,
     Json(request): Json<Value>,
 ) -> AppResult<Json<Value>> {
-    let (task_id, key, config) = config(&request)?;
+    let (task_id, key, mut config) = config(&request)?;
     let task = read_task(&state.db, task_id).await?;
     if matches!(
         task.status.as_str(),
@@ -318,6 +372,46 @@ async fn create(
         return Err(AppError::Conflict(
             "requested input.key is not the task's current V2 raw video asset".into(),
         ));
+    }
+    if let Some(plan) = request
+        .get("selective_retranslate")
+        .and_then(Value::as_object)
+        .filter(|v| !v.is_empty())
+    {
+        let indices: Vec<i64> = serde_json::from_value(plan["indices"].clone())
+            .map_err(|_| invalid("selective indices must be integers"))?;
+        let pinned = plan
+            .get("base_translated_segments_key")
+            .filter(|v| !v.is_null())
+            .map(|v| {
+                v.as_str()
+                    .ok_or_else(|| invalid("base snapshot key must be string"))
+            })
+            .transpose()?;
+        // Native selective retranslation must inherit its proven source
+        // configuration; separate Python-only artifacts are rejected above.
+        return crate::subtitle_retranslate_v1::schedule(&state, task_id, &indices, pinned)
+            .await
+            .map(Json);
+    }
+    let automatic=match request.get("runtime_profile").and_then(Value::as_bool){
+        Some(value)=>value,
+        None=>sqlx::query_scalar::<_,bool>("SELECT COALESCE(lower(trim(origin_kind)) IN ('auto_youtube','youtube_home_scan','youtube_task_restart'),false) OR COALESCE(lower(trim(split_part(created_by,';',1))) IN ('auto_youtube','youtube_home_scan','youtube_task_restart'),false) FROM tasks WHERE id=$1").bind(task_id).fetch_one(&state.db.pool).await?,
+    };
+    config["standalone_subtitle_runtime_profile"] = json!(automatic);
+    if automatic {
+        config["subtitle"] = json!({});
+        config["render"] = json!({});
+        if request["resume"].as_bool() == Some(true) {
+            config["subtitle"]["resume"] = json!(true);
+        }
+        config.as_object_mut().unwrap().remove("auto_publish");
+        config
+            .as_object_mut()
+            .unwrap()
+            .remove("auto_publish_platforms");
+    } else {
+        config["auto_dub_p2"] = json!(false);
     }
     // An active native subtitle stage may produce an SRT before its lease is
     // committed. A repeated request must reuse that exact in-flight stage,
@@ -404,7 +498,7 @@ mod tests {
         assert_eq!(defaults["render"]["video_codec"], "av1");
         for (field, value) in [
             ("youtube_subtitle_mode", json!("invalid")),
-            ("selective_retranslate", json!({"indices":[1]})),
+            ("selective_retranslate", json!({"indices":"invalid"})),
             ("output_prefix", json!("ignored")),
         ] {
             let mut bad = request.clone();

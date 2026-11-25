@@ -166,6 +166,19 @@ async fn request(
     Path(task_id): Path<Uuid>,
     Json(request): Json<Request>,
 ) -> AppResult<Json<Value>> {
+    schedule(&state, task_id, &request.indices, None)
+        .await
+        .map(Json)
+}
+pub(crate) async fn schedule(
+    state: &AppState,
+    task_id: Uuid,
+    indices: &[i64],
+    pinned: Option<&str>,
+) -> AppResult<Value> {
+    if let Some(key) = pinned {
+        source_job(task_id, key)?;
+    }
     let task = read_task(&state.db, task_id).await?;
     if matches!(
         task.status.as_str(),
@@ -192,10 +205,11 @@ async fn request(
            AND a.storage_key=('v2/sub/'||a.task_id::text||'/'||j.id::text||'/segments.json')
          JOIN vr2_workflows w ON w.id=j.workflow_id
          WHERE a.task_id=$1 AND a.kind='segments_json'::asset_kind
-           AND j.stage='subtitle' AND j.state='succeeded'
+           AND j.stage='subtitle' AND j.state='succeeded' AND ($2::text IS NULL OR a.storage_key=$2)
          ORDER BY a.created_at DESC,a.id DESC LIMIT 1",
     )
     .bind(task_id)
+    .bind(pinned)
     .fetch_optional(&state.db.pool)
     .await?
     .ok_or_else(|| {
@@ -211,7 +225,7 @@ async fn request(
         ));
     }
     let (snapshot, digest) = load_snapshot(&state.storage, task_id, &key).await?;
-    let indices = selected(&request.indices, snapshot.source.len())?;
+    let indices = selected(indices, snapshot.source.len())?;
     let existing_srt = key.replace("/segments.json", "/subtitle.srt");
     let exists: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM assets
@@ -285,7 +299,7 @@ async fn request(
             task_id,
             Stage::Subtitle,
             json!({
-                "selective_retranslate":plan,"subtitle":subtitle,
+                "selective_retranslate":plan,"subtitle":subtitle,"standalone_subtitle_runtime_profile":false,
                 "auto_publish":false,"auto_publish_platforms":[]
             }),
         )
@@ -309,9 +323,7 @@ async fn request(
             )));
         }
     };
-    Ok(Json(
-        json!({"job_id":row.try_get::<Uuid,_>("id")?,"status":status}),
-    ))
+    Ok(json!({"job_id":row.try_get::<Uuid,_>("id")?,"status":status}))
 }
 pub fn router() -> Router<AppState> {
     Router::new().route(

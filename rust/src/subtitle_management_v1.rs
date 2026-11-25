@@ -32,7 +32,7 @@ fn default_profile() -> Value {
         "publish_enable_reprint":true
     })
 }
-fn normalized_profile(raw: &Value) -> Value {
+pub(crate) fn normalized_profile(raw: &Value) -> Value {
     let mut baseline = default_profile();
     let Some(out) = baseline.as_object_mut() else {
         return baseline;
