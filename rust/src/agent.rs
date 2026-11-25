@@ -654,7 +654,7 @@ pub async fn run(
     .await?;
     let fingerprint = hex::encode(Sha256::digest(
         serde_json::to_vec(&json!({
-            "revision":3,"parallelism":task.parallelism,"gate":task.gate,"target_lang":task.target_lang,"timeout":task.timeout_seconds,"source":source,"model_provider":settings.research_provider_id,
+            "revision":if settings.learn_pending{4}else{3},"parallelism":task.parallelism,"gate":task.gate,"target_lang":task.target_lang,"timeout":task.timeout_seconds,"source":source,"model_provider":settings.research_provider_id,
             "model_id":settings.research_model_id,"resolved_model":provider.model,"resolved_endpoint":provider.endpoint.as_str(),"resolved_api_type":provider.api_type,"resolved_output_tokens":provider.max_output_tokens,
             "rag":settings,"query":query.query,
             "evidence_ids":initial.evidence_ids,

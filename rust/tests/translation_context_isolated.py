@@ -20,6 +20,9 @@ assert not page or web_fault
 multistep=os.getenv("VIDEOROLL_TEST_RAG_MULTISTEP")=="true"
 learning=os.getenv("VIDEOROLL_TEST_RAG_LEARNING")=="true"
 assert not learning or multistep
+reject_learning=os.getenv("VIDEOROLL_TEST_RAG_VERIFIER_REJECT")=="true"
+assert not reject_learning or learning
+verifier_calls=[]
 wiki=os.getenv("VIDEOROLL_TEST_RAG_WIKI")=="true"
 wiki_fault=os.getenv("VIDEOROLL_TEST_RAG_WIKI_FAULT")=="true"
 assert not wiki_fault or wiki
@@ -82,6 +85,22 @@ class Handler(BaseHTTPRequestHandler):
                         if web_fault or wiki:result["terms"][0]["need_search"]=False
                         result["terms"].append({"term":"Fourth line","category":"domain_jargon" if learning else "task_context","scope":"global" if learning else "task","priority":0.8,"need_rag":True,"need_search":True})
                     return self.reply_json({"choices":[{"message":{"content":json.dumps(result)}}]})
+                if "VideoRoll independent knowledge verifier" in messages[0]["content"]:
+                    assert learning
+                    payload=json.loads(messages[-1]["content"])
+                    assert payload["candidate"]["source"]=="Fourth line" and payload["candidate"]["target"]=="第四句",payload
+                    assert len(payload["evidence"])==1 and payload["evidence"][0]["id"]==str(extra_id),payload
+                    verifier_calls.append(payload)
+                    decision={"supported":True,"context_consistent":True,"should_write":True,"should_auto_approve":True,"confidence":0.95,"reason":"fixture","evidence_ids":[str(extra_id)]}
+                    if len(verifier_calls)==1:
+                        if reject_learning:
+                            decision["evidence_ids"]=[str(uuid.uuid4())]
+                            return self.reply_json({"choices":[{"message":{"content":json.dumps(decision)}}]})
+                        self.send_error(503,"injected verifier failure")
+                        return
+                    if reject_learning:
+                        decision.update(supported=False,should_write=False,should_auto_approve=False,confidence=0.2,reason="unsupported translation",evidence_ids=[])
+                    return self.reply_json({"choices":[{"message":{"content":json.dumps(decision)}}]})
                 if "VideoRoll term specialist" in messages[0]["content"]:
                     assert parallel
                     payload=json.loads(messages[-1]["content"]);term=payload["candidate"]["term"]
@@ -249,7 +268,7 @@ try:
     with db() as c:
         state,plan,result=c.execute("SELECT research_state,research_plan,research_result FROM pipeline_runs WHERE task_id=%s AND engine='rust-v2'",(task,)).fetchone()
         assert state=="succeeded" and plan["gate_completed"],(state,plan)
-        assert c.execute("SELECT count(*) FROM translation_knowledge_items").fetchone()[0]==(4 if learning else (3 if multistep else 2))
+        assert c.execute("SELECT count(*) FROM translation_knowledge_items").fetchone()[0]==(4 if learning and not reject_learning else (3 if multistep else 2))
         if parallel:
             assert (web_fault or wiki_fault or peak==2) and child_calls=={"Rust compiler":1,"Fourth line":1 if (web_fault or wiki_fault) else (3 if multistep else 2)} and research_calls==["gate"],(peak,child_calls,research_calls)
             assert len(plan["gate_candidates"])==2 and plan["parallelism"]==2
@@ -269,17 +288,30 @@ try:
             assert parent[2]["wiki_calls"]==(2 if wiki_fault else int(wiki)) and parent[2]["wiki_budget"]==(2 if wiki else 0),parent
             assert wiki_calls==(["Fourth line"]*(2 if wiki_fault else int(wiki))),wiki_calls
             assert parent[2]["page_calls"]==int(page) and parent[2]["page_budget"]==(2 if page else 0),parent
+            assert parent[2]["verification_calls"]==(2 if learning else 0) and parent[2]["verification_budget"]==(4 if learning else 0),parent
+            assert len(verifier_calls)==(2 if learning else 0),verifier_calls
             if learning:
+                assert verifier_calls[0]==verifier_calls[1],verifier_calls
                 assert c.execute("SELECT translation,status,created_by FROM translation_knowledge_items WHERE id=%s",(dynamic_id,)).fetchone()==("fixture-original-compiler","approved","manual")
                 learned=c.execute("SELECT id,translation,status,created_by,confidence,sources,last_verified_at,embedding IS NULL FROM translation_knowledge_items WHERE normalized_term='fourth line' AND domain='electronics' AND target_lang='zh'").fetchone()
-                assert learned and learned[1:5]==("第四句","pending","agent",0.0) and learned[6] is None and learned[7],learned
-                assert learned[5][0]["knowledge_item_id"]==str(extra_id) and learned[5][0]["task_id"]==str(task),learned
-                assert c.execute("SELECT knowledge_item_id FROM translation_agent_runs WHERE parent_agent_run_id=%s AND term='Fourth line'",(master,)).fetchone()[0]==learned[0]
                 decisions={v["term"]:v for v in result["knowledge_learning"]}
-                assert decisions["Rust compiler"]["reason"]=="existing_term" and decisions["Fourth line"]["status"]=="pending",decisions
-                assert str(learned[0]) not in meta["rag_evidence_ids"],meta
+                assert decisions["Rust compiler"]["reason"]=="existing_term",decisions
+                child=c.execute("SELECT id,knowledge_item_id,checkpoint->'verification_receipt' FROM translation_agent_runs WHERE parent_agent_run_id=%s AND term='Fourth line'",(master,)).fetchone()
+                assert child[2]["decision"]["supported"]==(not reject_learning),child
+                assert c.execute("SELECT count(*) FROM translation_agent_events WHERE run_id=%s AND action='knowledge_verify' AND status='failed'",(child[0],)).fetchone()[0]==1
+                assert c.execute("SELECT count(*) FROM translation_agent_events WHERE run_id=%s AND action='knowledge_verify' AND status='succeeded'",(child[0],)).fetchone()[0]==1
+                if reject_learning:
+                    assert learned is None and child[1] is None
+                    assert decisions["Fourth line"]["reason"]=="verification_rejected",decisions
+                    assert not any(v["source"]=="Fourth line" for v in result["terms"]),result
+                    print("PASS: forged evidence rejected, independent negative verdict suppresses proposed mapping and knowledge write",flush=True)
+                else:
+                    assert learned and learned[1:5]==("第四句","pending","agent",0.0) and learned[6] is None and learned[7],learned
+                    assert learned[5][0]["knowledge_item_id"]==str(extra_id) and learned[5][0]["task_id"]==str(task),learned
+                    assert child[1]==learned[0] and decisions["Fourth line"]["status"]=="pending",decisions
+                    assert child[2]["decision"]["should_auto_approve"] and str(learned[0]) not in meta["rag_evidence_ids"],meta
+                    print("PASS: independent verifier 503 recovered, pending-only write despite model auto-approve, original term protected and verification not replayed",flush=True)
                 assert c.execute("SELECT count(*) FROM translation_agent_events WHERE run_id=%s AND action='knowledge_learning'",(master,)).fetchone()[0]==2
-                print("PASS: original unique term index, pending candidate provenance and agent linkage; approved term unchanged, no duplicate learning on stage retry",flush=True)
             else:
                 assert result["knowledge_learning"]==[],result
             if page:
