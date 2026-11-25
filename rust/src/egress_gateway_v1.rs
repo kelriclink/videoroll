@@ -409,7 +409,7 @@ async fn fetch(req: FetchRequest) -> Result<FetchResponse, Failure> {
 }
 // Internal research adapter. Reuse the same destination validation and pinned
 // transport as /fetch, but never expose arbitrary headers or redirects.
-pub(crate) async fn research_plain_text(raw: &str) -> crate::AppResult<Option<String>> {
+pub(crate) async fn research_page_text(raw: &str) -> crate::AppResult<Option<String>> {
     let Ok((url, _, _)) = target(raw) else {
         return Ok(None);
     };
@@ -421,7 +421,7 @@ pub(crate) async fn research_plain_text(raw: &str) -> crate::AppResult<Option<St
         timeout: 12.0,
         max_bytes: 500_000,
         redirects: 0,
-        headers: BTreeMap::from([("accept".into(), "text/plain".into())]),
+        headers: BTreeMap::from([("accept".into(), "text/html, text/plain;q=0.9".into())]),
     };
     let response = match tokio::time::timeout(Duration::from_secs(12), fetch(req)).await {
         Ok(Ok(v)) => v,
@@ -445,17 +445,43 @@ pub(crate) async fn research_plain_text(raw: &str) -> crate::AppResult<Option<St
         .get("content-type")
         .map(String::as_str)
         .unwrap_or("");
-    if !mime
+    let mime = mime
         .split(';')
         .next()
-        .is_some_and(|s| s.trim().eq_ignore_ascii_case("text/plain"))
-    {
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    if !matches!(
+        mime.as_str(),
+        "text/plain" | "text/html" | "application/xhtml+xml"
+    ) {
         return Ok(None);
     }
     let bytes = STANDARD
         .decode(response.body_base64)
         .map_err(|_| crate::AppError::Unavailable("research page response invalid".into()))?;
-    Ok(clean_research_text(&bytes))
+    if mime == "text/plain" {
+        return Ok(clean_research_text(&bytes));
+    }
+    // A timed-out blocking parser cannot be forcibly interrupted. Hold the
+    // permit inside the closure until it really exits, even if the caller
+    // times out. Never allow an unbounded queue of parser jobs.
+    static PARSERS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+    let Ok(permit) = PARSERS.try_acquire() else {
+        return Ok(None);
+    };
+    let result = tokio::time::timeout(
+        Duration::from_secs(3),
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            extract_research_html(&bytes)
+        }),
+    )
+    .await;
+    Ok(match result {
+        Ok(Ok(text)) => text,
+        _ => None,
+    })
 }
 fn research_test_url(url: &Url) -> bool {
     url.host_str() == Some("127.0.0.1")
@@ -474,6 +500,34 @@ fn clean_research_text(bytes: &[u8]) -> Option<String> {
     let collapsed = raw.split_whitespace().collect::<Vec<_>>().join(" ");
     let text: String = collapsed.chars().take(5000).collect();
     (!text.is_empty()).then_some(text)
+}
+
+// Parse HTML in memory only; no script execution, link requests, or rendering.
+fn extract_research_html(bytes: &[u8]) -> Option<String> {
+    if bytes.len() > 500_000 || bytes.iter().filter(|b| **b == b'<').take(12_001).count() > 12_000 {
+        return None;
+    }
+    let raw = std::str::from_utf8(bytes).ok()?;
+    if raw
+        .chars()
+        .any(|c| c.is_control() && !matches!(c, '\n' | '\r' | '\t'))
+    {
+        return None;
+    }
+    let config = dom_smoothie::Config {
+        max_elements_to_parse: 8_000,
+        disable_json_ld: true,
+        text_mode: dom_smoothie::TextMode::Formatted,
+        ..Default::default()
+    };
+    let mut reader = dom_smoothie::Readability::new(raw, None, Some(config)).ok()?;
+    let article = reader
+        .parse_with_policy(dom_smoothie::ParsePolicy::Strict)
+        .ok()?;
+    // Short pages and navigation-only documents are poor evidence. Do not
+    // fall back to raw HTML or metadata supplied by the document.
+    let text = clean_research_text(article.text_content.as_bytes())?;
+    (text.chars().count() >= 140).then_some(text)
 }
 
 async fn health() -> Json<serde_json::Value> {
@@ -540,6 +594,26 @@ mod tests {
             5000
         );
     }
+    fn html_fixture() -> String {
+        format!("<!doctype html><html><head><title>Fixture</title></head><body><nav class='menu'><a href='/elsewhere'>NAVIGATION_ONLY</a></nav><main><article><h1>Technical evidence</h1>{}<script>SCRIPT_PAYLOAD</script><style>STYLE_PAYLOAD</style></article></main><footer>FOOTER_ONLY</footer></body></html>", "<p>fixture technical evidence &amp; source context. The measured signal follows a reproducible relationship with the component under test, and the observations support the documented engineering explanation.</p>".repeat(8))
+    }
+    #[test]
+    fn html_article_cleaning_and_bounds() {
+        let text = extract_research_html(html_fixture().as_bytes()).unwrap();
+        assert!(text.contains("fixture technical evidence & source context"));
+        for removed in [
+            "SCRIPT_PAYLOAD",
+            "STYLE_PAYLOAD",
+            "NAVIGATION_ONLY",
+            "FOOTER_ONLY",
+        ] {
+            assert!(!text.contains(removed), "{removed}");
+        }
+        assert!(extract_research_html(b"<html><body>tiny</body></html>").is_none());
+        assert!(extract_research_html(&[255]).is_none());
+        assert!(extract_research_html("<p>".repeat(12001).as_bytes()).is_none());
+        assert!(extract_research_html(&vec![b'a'; 500001]).is_none());
+    }
     #[tokio::test]
     async fn research_rejects_nonpublic_and_invalid_urls() {
         for raw in [
@@ -551,12 +625,12 @@ mod tests {
             "https://example.invalid:444/",
             "https://u:p@example.invalid/",
         ] {
-            assert!(research_plain_text(raw).await.unwrap().is_none(), "{raw}");
+            assert!(research_page_text(raw).await.unwrap().is_none(), "{raw}");
         }
     }
     #[cfg(feature = "egress-test-loopback")]
     #[tokio::test]
-    async fn research_plain_text_loopback_fixture() {
+    async fn research_page_text_loopback_fixture() {
         assert!(isolated_loopback(
             IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
             18098
@@ -587,6 +661,15 @@ mod tests {
                 }),
             )
             .route(
+                "/article",
+                get(|| async {
+                    (
+                        [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
+                        html_fixture(),
+                    )
+                }),
+            )
+            .route(
                 "/redirect",
                 get(|| async { axum::response::Redirect::temporary("/plain") }),
             )
@@ -602,15 +685,22 @@ mod tests {
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let base = "http://127.0.0.1:18098";
         assert_eq!(
-            research_plain_text(&format!("{base}/plain"))
+            research_page_text(&format!("{base}/plain"))
                 .await
                 .unwrap()
                 .as_deref(),
             Some("Fixture plain text")
         );
+        let article = research_page_text(&format!("{base}/article"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(article.contains("fixture technical evidence"));
+        assert!(!article.contains("SCRIPT_PAYLOAD"));
+        assert!(!article.contains("NAVIGATION_ONLY"));
         for path in ["html", "redirect", "large"] {
             assert!(
-                research_plain_text(&format!("{base}/{path}"))
+                research_page_text(&format!("{base}/{path}"))
                     .await
                     .unwrap()
                     .is_none(),

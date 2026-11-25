@@ -49,6 +49,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 uuid = { version = "1", features = ["serde", "v4", "v5"] }
 zip = { version = "=2.4.2", default-features = false, features = ["deflate", "bzip2", "lzma"] }
+dom_smoothie = { version = "=0.19.0", default-features = false }
 
 [dev-dependencies]
 tempfile = "3"

@@ -110,7 +110,7 @@ pub(super) async fn page_text(
         return Err(AppError::Invalid("research page retrieval disabled".into()));
     }
     lease(db, task.job).await?;
-    let body = crate::egress_gateway_v1::research_plain_text(&hit.url).await?;
+    let body = crate::egress_gateway_v1::research_page_text(&hit.url).await?;
     lease(db, task.job).await?;
     Ok(body.map(|snippet| WebEvidence {
         title: hit.title.clone(),
