@@ -196,6 +196,10 @@ impl Executor {
                         reason: "automatic publishing has no enabled platform targets".into(),
                     });
                 }
+                if choice.platforms.iter().any(|p|p!="bilibili") && crate::social_publish::mixed_enabled(){
+                    let state=crate::api::AppState{config:self.config.clone(),db:self.db.clone(),scheduler:self.scheduler.clone(),storage:self.registry.clone()};
+                    return crate::social_publish::automatic(&state,item,choice.platforms).await;
+                }
                 if self.config.native_bilibili_allowed {
                     let result =
                         crate::bilibili::publish(&self.config, &self.db, &self.registry, item)

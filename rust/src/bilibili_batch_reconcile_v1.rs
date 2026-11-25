@@ -157,7 +157,7 @@ async fn reconcile_impl(
     native_events: bool,
 ) -> AppResult<()> {
     let row = sqlx::query(
-        "SELECT state,expected_targets,outcomes_json,finished_at,cleanup_enqueued_at
+        "SELECT state,expected_targets,outcomes_json,finished_at,cleanup_enqueued_at,request_json
         FROM publish_batches WHERE id=$1 AND task_id=$2 FOR UPDATE",
     )
     .bind(batch)
@@ -248,6 +248,60 @@ async fn reconcile_impl(
             + Duration::hours(24);
         crate::publish_batch_events::enqueue(tx, task, batch, target.name(), Some(retention))
             .await?;
+    }
+    let request: Value = row.try_get("request_json")?;
+    if let Some(parent) = request.get("auto_parent").filter(|v| !v.is_null()) {
+        let parse = |key: &str| {
+            parent[key]
+                .as_str()
+                .and_then(|v| Uuid::parse_str(v).ok())
+                .ok_or_else(|| AppError::Conflict("invalid automatic batch parent identity".into()))
+        };
+        let flow = parse("workflow_id")?;
+        let job = parse("job_id")?;
+        let generation = parent["generation"]
+            .as_i64()
+            .and_then(|v| i32::try_from(v).ok())
+            .ok_or_else(|| AppError::Conflict("invalid automatic batch generation".into()))?;
+        let ticket = format!("native-batch:{batch}");
+        let parent_state:Option<String>=sqlx::query_scalar("SELECT state FROM vr2_workflows WHERE id=$1 AND task_id=$2 AND generation=$3 FOR UPDATE").bind(flow).bind(task).bind(generation).fetch_optional(&mut **tx).await?;
+        let job_state:Option<String>=sqlx::query_scalar("SELECT state FROM vr2_jobs WHERE id=$1 AND workflow_id=$2 AND task_id=$3 AND generation=$4 AND stage='publish' AND external_ticket=$5 FOR UPDATE").bind(job).bind(flow).bind(task).bind(generation).bind(ticket).fetch_optional(&mut **tx).await?;
+        if target != State::Active
+            && matches!(parent_state.as_deref(), Some("running" | "unknown"))
+            && matches!(job_state.as_deref(), Some("awaiting" | "unknown"))
+        {
+            let success = target == State::Succeeded;
+            let next = if success { "succeeded" } else { "unknown" };
+            if job_state.as_deref() != Some(next) {
+                let result = serde_json::json!({"batch_id":batch,"confirmed":success,"batch_state":target.name()});
+                let error = if success {
+                    None
+                } else {
+                    Some("native batch contains failed or unverified target receipts")
+                };
+                sqlx::query("UPDATE vr2_jobs SET state=$2,result=$3,last_error=$4,finished_at=now(),updated_at=now() WHERE id=$1").bind(job).bind(next).bind(&result).bind(error).execute(&mut **tx).await?;
+                sqlx::query(
+                    "UPDATE vr2_workflows SET state=$2,last_error=$3,updated_at=now() WHERE id=$1",
+                )
+                .bind(flow)
+                .bind(next)
+                .bind(error)
+                .execute(&mut **tx)
+                .await?;
+                crate::scheduler::Scheduler::event(
+                    tx,
+                    flow,
+                    Some(job),
+                    if success {
+                        "workflow.succeeded"
+                    } else {
+                        "job.unknown"
+                    },
+                    result,
+                )
+                .await?;
+            }
+        }
     }
     Ok(())
 }

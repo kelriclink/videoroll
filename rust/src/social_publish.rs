@@ -709,7 +709,7 @@ fn batch_platforms(input: &PublishAllRequest) -> AppResult<Vec<String>> {
 }
 // Native mixed admission is deliberately opt-in: both consumers must be
 // configured against the same original DB and media root, with Python stopped.
-fn mixed_enabled() -> bool {
+pub(crate) fn mixed_enabled() -> bool {
     crate::outbox_dispatcher::native_only()
         && std::env::var("VIDEOROLL_V2_ENABLE_NATIVE_MIXED_PUBLISH")
             .ok()
@@ -790,6 +790,14 @@ async fn mixed_receipt(
     ))
 }
 async fn mixed_publish(state: &AppState, task: Uuid, input: PublishAllRequest) -> AppResult<Value> {
+    admit_batch(state, task, input, None).await
+}
+async fn admit_batch(
+    state: &AppState,
+    task: Uuid,
+    input: PublishAllRequest,
+    parent: Option<&crate::domain::WorkItem>,
+) -> AppResult<Value> {
     if !mixed_enabled() {
         return Err(AppError::Conflict("native mixed publication requires native-only outbox and explicit native SAU/mixed opt-in".into()));
     }
@@ -840,7 +848,7 @@ async fn mixed_publish(state: &AppState, task: Uuid, input: PublishAllRequest) -
         )
     );
     // Fast replay works after media retention or account rotation; no side effect.
-    {
+    if parent.is_none() {
         let mut tx = state.db.pool.begin().await?;
         sqlx::query("SELECT id FROM tasks WHERE id=$1 AND runtime_owner='rust' FOR UPDATE")
             .bind(task)
@@ -884,18 +892,22 @@ async fn mixed_publish(state: &AppState, task: Uuid, input: PublishAllRequest) -
         if p == "bilibili" {
             let saved = crate::publish_meta::saved(&state.db, task).await?;
             let supplied = meta.map(crate::publish_meta::normalized).transpose()?;
-            if saved
-                .as_ref()
-                .zip(supplied.as_ref())
-                .is_some_and(|(a, b)| a != b)
+            if parent.is_none()
+                && saved
+                    .as_ref()
+                    .zip(supplied.as_ref())
+                    .is_some_and(|(a, b)| a != b)
             {
                 return Err(AppError::Conflict(
                     "save changed Bilibili draft first".into(),
                 ));
             }
-            let meta = saved
-                .or(supplied)
-                .ok_or_else(|| AppError::Invalid("Bilibili metadata missing".into()))?;
+            let meta = (if parent.is_some() {
+                supplied.or(saved)
+            } else {
+                saved.or(supplied)
+            })
+            .ok_or_else(|| AppError::Invalid("Bilibili metadata missing".into()))?;
             if options
                 .as_object()
                 .unwrap()
@@ -937,10 +949,27 @@ async fn mixed_publish(state: &AppState, task: Uuid, input: PublishAllRequest) -
     }
     let mut tx = state.db.pool.begin().await?;
     let status:Option<String>=sqlx::query_scalar("SELECT status::text FROM tasks WHERE id=$1 AND runtime_owner='rust' AND source_license::text<>'unknown' FOR UPDATE").bind(task).fetch_optional(&mut *tx).await?;
-    if let Some(result) = mixed_receipt(&mut tx, task, &fingerprint).await? {
-        tx.commit().await?;
-        return Ok(result);
+    if parent.is_none() {
+        if let Some(result) = mixed_receipt(&mut tx, task, &fingerprint).await? {
+            tx.commit().await?;
+            return Ok(result);
+        }
     }
+    if let Some(item) = parent {
+        if item.task_id != task || item.stage != crate::domain::Stage::Publish {
+            return Err(AppError::Conflict(
+                "invalid automatic publication parent".into(),
+            ));
+        }
+        let flow:Option<String>=sqlx::query_scalar("SELECT state FROM vr2_workflows WHERE id=$1 AND task_id=$2 AND generation=$3 AND current_stage='publish' FOR UPDATE").bind(item.workflow_id).bind(task).bind(item.generation).fetch_optional(&mut *tx).await?;
+        let job:Option<Uuid>=sqlx::query_scalar("SELECT id FROM vr2_jobs WHERE id=$1 AND workflow_id=$2 AND task_id=$3 AND stage='publish' AND state='running' AND lease_token=$4 AND lease_until>now() FOR UPDATE").bind(item.id).bind(item.workflow_id).bind(task).bind(item.lease_token).fetch_optional(&mut *tx).await?;
+        if flow.as_deref() != Some("running") || job != Some(item.id) {
+            return Err(AppError::Conflict(
+                "automatic publish stage lease lost".into(),
+            ));
+        }
+    }
+
     if !matches!(
         status.as_deref(),
         Some("rendered" | "approved" | "ready_for_review" | "subtitle_ready")
@@ -949,17 +978,24 @@ async fn mixed_publish(state: &AppState, task: Uuid, input: PublishAllRequest) -
             "mixed admission requires a licensed, ready Rust task".into(),
         ));
     }
-    let occupied:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM publish_jobs WHERE task_id=$1) OR EXISTS(SELECT 1 FROM publish_batches WHERE task_id=$1) OR EXISTS(SELECT 1 FROM vr2_social_publish_intents WHERE task_id=$1) OR EXISTS(SELECT 1 FROM vr2_workflows WHERE task_id=$1 AND state IN ('running','paused','unknown')) OR EXISTS(SELECT 1 FROM vr2_jobs WHERE task_id=$1 AND stage='publish' AND state IN ('pending','running','awaiting','unknown','succeeded'))").bind(task).fetch_one(&mut *tx).await?;
+    let occupied:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM publish_jobs WHERE task_id=$1) OR EXISTS(SELECT 1 FROM publish_batches WHERE task_id=$1) OR EXISTS(SELECT 1 FROM vr2_social_publish_intents WHERE task_id=$1) OR EXISTS(SELECT 1 FROM vr2_workflows WHERE task_id=$1 AND ($2::uuid IS NULL OR id<>$2) AND state IN ('running','paused','unknown')) OR EXISTS(SELECT 1 FROM vr2_jobs WHERE task_id=$1 AND ($3::uuid IS NULL OR id<>$3) AND stage='publish' AND state IN ('pending','running','awaiting','unknown','succeeded'))").bind(task).bind(parent.map(|p|p.workflow_id)).bind(parent.map(|p|p.id)).fetch_one(&mut *tx).await?;
     if occupied {
         return Err(AppError::Conflict("existing publication or active workflow requires reconciliation before mixed admission".into()));
     }
     let batch = Uuid::new_v4();
-    sqlx::query("INSERT INTO publish_batches(id,task_id,state,expected_targets,request_json) VALUES($1,$2,'active',$3,$4)").bind(batch).bind(task).bind(json!(expected)).bind(json!({"runtime":"rust-mixed-v1","fingerprint":fingerprint,"platforms":platforms})).execute(&mut *tx).await?;
+    sqlx::query("INSERT INTO publish_batches(id,task_id,state,expected_targets,request_json) VALUES($1,$2,'active',$3,$4)").bind(batch).bind(task).bind(json!(expected)).bind(json!({"runtime":"rust-mixed-v1","fingerprint":fingerprint,"platforms":platforms,"auto_parent":parent.map(|p|json!({"workflow_id":p.workflow_id,"job_id":p.id,"generation":p.generation}))})).execute(&mut *tx).await?;
     // Shared original Bilibili admission validates P1/P2, file and ownership in
     // the SAME transaction. No commit or HTTP handoff until all targets exist.
     if let Some(mut bili) = bili {
         bili.bind_batch(batch);
-        crate::bilibili_publish_v1::enqueue_prepared(state, &mut tx, bili, false).await?;
+        crate::bilibili_publish_v1::enqueue_prepared(
+            state,
+            &mut tx,
+            bili,
+            false,
+            parent.map(|p| p.workflow_id),
+        )
+        .await?;
     }
     // Recheck ownership under the same task lock, after any concurrent asset
     // deletion/GC. Do not admit a dangling file or a foreign storage key.
@@ -995,6 +1031,18 @@ async fn mixed_publish(state: &AppState, task: Uuid, input: PublishAllRequest) -
         crate::sau_worker_native_v1::enqueue(&mut tx, id, &operation).await?;
     }
     sqlx::query("UPDATE tasks SET active_publish_batch_id=$2,status='publishing',error_code=NULL,error_message=NULL,updated_at=now() WHERE id=$1").bind(task).bind(batch).execute(&mut *tx).await?;
+    if let Some(item) = parent {
+        let ticket = format!("native-batch:{batch}");
+        sqlx::query("UPDATE vr2_jobs SET state='awaiting',external_ticket=$2,lease_token=NULL,lease_until=NULL,updated_at=now() WHERE id=$1").bind(item.id).bind(&ticket).execute(&mut *tx).await?;
+        crate::scheduler::Scheduler::event(
+            &mut tx,
+            item.workflow_id,
+            Some(item.id),
+            "job.awaiting",
+            json!({"ticket":ticket}),
+        )
+        .await?;
+    }
     let result = mixed_receipt(&mut tx, task, &fingerprint)
         .await?
         .ok_or_else(|| AppError::Conflict("mixed admission missing batch".into()))?;
@@ -1002,6 +1050,195 @@ async fn mixed_publish(state: &AppState, task: Uuid, input: PublishAllRequest) -
     Ok(result)
 }
 
+/// Runtime selection follows the original auto box. All target parameters
+/// freeze in the original batch transaction, under the exact parent lease.
+pub(crate) async fn automatic(
+    state: &AppState,
+    item: &crate::domain::WorkItem,
+    platforms: Vec<String>,
+) -> AppResult<crate::domain::StageOutcome> {
+    let profile = crate::settings::effective(&state.db, "subtitle.auto_profile").await?;
+    let mut meta = crate::publish_meta::automatic_draft(state, item.task_id).await?;
+    let has_bili = platforms.iter().any(|p| p == "bilibili");
+    let mut account_ids = HashMap::new();
+    let mut platform_meta = HashMap::new();
+    let source_meta =
+        crate::media::ffmpeg::latest_asset_key(&state.db, item.task_id, "metadata_json").await?;
+    let author = if let Some(key) = source_meta {
+        let path = state.storage.resolve_existing(&key).await?;
+        if tokio::fs::metadata(&path).await?.len() > 2 * 1024 * 1024 {
+            return Err(AppError::Invalid("source metadata oversized".into()));
+        }
+        let raw: Value = serde_json::from_slice(&tokio::fs::read(path).await?)
+            .map_err(|_| AppError::Invalid("source metadata invalid".into()))?;
+        raw["uploader"].as_str().unwrap_or("").to_owned()
+    } else {
+        String::new()
+    };
+    let no_speech:bool=sqlx::query_scalar("SELECT COALESCE((SELECT result->>'no_speech'='true' FROM vr2_jobs WHERE workflow_id=$1 AND stage='subtitle' AND state='succeeded' ORDER BY created_at DESC LIMIT 1),false)").bind(item.workflow_id).fetch_one(&state.db.pool).await?;
+    if no_speech {
+        let prefix = profile["publish_title_prefix"].as_str().unwrap_or("");
+        if !prefix.is_empty() {
+            if let Some(title) = meta["title"].as_str().and_then(|t| t.strip_prefix(prefix)) {
+                meta["title"] = json!(title.trim());
+            }
+        }
+    }
+    for p in &platforms {
+        if p == "bilibili" {
+            platform_meta.insert(p.clone(), crate::publish_meta::normalized(meta.clone())?);
+            continue;
+        }
+        platform(p)?;
+        let account:Option<Uuid>=sqlx::query_scalar("SELECT id FROM accounts WHERE platform::text=$1 AND is_active AND check_state='valid' ORDER BY created_at DESC,id DESC LIMIT 1").bind(p).fetch_optional(&state.db.pool).await?;
+        let account = account
+            .ok_or_else(|| AppError::Conflict(format!("no active validated account for {p}")))?;
+        account_ids.insert(p.clone(), account.to_string());
+        let mut m = meta.clone();
+        if p == "douyin" && !author.trim().is_empty() {
+            m["desc"] = json!(format!("原作者：{}", author.trim()));
+        }
+        platform_meta.insert(
+            p.clone(),
+            crate::sau_publish_native_v1::normalize_meta(&m, p)?,
+        );
+    }
+    let video = asset_key(&state.db, item.task_id, "video_final", None).await?;
+    let cover = if profile["publish_use_youtube_cover"].as_bool() == Some(true) {
+        crate::media::ffmpeg::latest_asset_key(&state.db, item.task_id, "cover_image").await?
+    } else {
+        None
+    };
+    let config: Value = sqlx::query_scalar("SELECT configuration FROM vr2_workflows WHERE id=$1")
+        .bind(item.workflow_id)
+        .fetch_one(&state.db.pool)
+        .await?;
+    let selected = config
+        .get("auto_publish_dubbing_job_id")
+        .filter(|v| !v.is_null())
+        .map(|v| {
+            v.as_str()
+                .and_then(|s| Uuid::parse_str(s).ok())
+                .ok_or_else(|| AppError::Invalid("invalid selected automatic P2 job".into()))
+        })
+        .transpose()?;
+    if selected.is_some() && (!has_bili || no_speech) {
+        return Err(AppError::Conflict(
+            "selected P2 incompatible with current targets or no-speech source".into(),
+        ));
+    }
+    let mut parts = None;
+    if has_bili
+        && !no_speech
+        && (selected.is_some() || profile["auto_dub_p2"].as_bool() == Some(true))
+    {
+        let dub:Option<String>=sqlx::query_scalar("SELECT r.output_video_key FROM vr2_dubbing_runs r JOIN vr2_jobs j ON j.id=r.job_id WHERE (($3::uuid IS NULL AND j.workflow_id=$1) OR j.id=$3) AND j.task_id=$2 AND j.stage='dubbing' AND j.state='succeeded' AND r.model_status='succeeded' ORDER BY j.created_at DESC LIMIT 1").bind(item.workflow_id).bind(item.task_id).bind(selected).fetch_optional(&state.db.pool).await?.flatten();
+        if selected.is_some() && dub.is_none() {
+            return Err(AppError::Conflict(
+                "selected P2 receipt no longer succeeded".into(),
+            ));
+        }
+        if let Some(dub) = dub {
+            let main = meta["title"].as_str().unwrap_or("").trim();
+            if main.is_empty() {
+                return Err(AppError::Invalid(
+                    "automatic P2 requires original title".into(),
+                ));
+            }
+            let p1_prefix = profile["publish_title_prefix"]
+                .as_str()
+                .unwrap_or("【熟肉】")
+                .trim();
+            let raw = profile["auto_dub_p2_prefix"]
+                .as_str()
+                .unwrap_or("【中配】")
+                .trim();
+            let marker = if raw.is_empty() {
+                "中配"
+            } else {
+                raw.strip_prefix('【')
+                    .and_then(|v| v.strip_suffix('】'))
+                    .unwrap_or(raw)
+                    .trim()
+            };
+            if marker.is_empty()
+                || marker.chars().count() > 20
+                || marker
+                    .chars()
+                    .any(|c| c.is_control() || matches!(c, '【' | '】' | '/' | '\\'))
+            {
+                return Err(AppError::Invalid("invalid P2 title prefix".into()));
+            }
+            let stripped = if p1_prefix.is_empty() {
+                main
+            } else {
+                main.strip_prefix(p1_prefix).unwrap_or(main).trim_start()
+            };
+            let p2 = format!(
+                "【{marker}】{}",
+                if stripped.is_empty() {
+                    "中文配音"
+                } else {
+                    stripped
+                }
+            );
+            let combined = if main.starts_with("【熟肉&中配】") {
+                main.to_owned()
+            } else {
+                let original = if !p1_prefix.is_empty() && main.starts_with(p1_prefix) {
+                    stripped
+                } else {
+                    main.strip_prefix("【熟肉】").unwrap_or(main).trim_start()
+                };
+                format!("【熟肉&中配】{original}")
+            };
+            let title = if combined.chars().count() > 80 {
+                format!("{}…", combined.chars().take(79).collect::<String>())
+            } else {
+                combined
+            };
+            platform_meta
+                .get_mut("bilibili")
+                .ok_or_else(|| AppError::Conflict("Bilibili metadata missing".into()))?["title"] =
+                json!(title);
+            parts = Some(vec![
+                json!({"video":{"type":"storage","key":video},"title":main.chars().take(80).collect::<String>()}),
+                json!({"video":{"type":"storage","key":dub},"title":p2.chars().take(80).collect::<String>()}),
+            ]);
+        }
+    }
+    let input = PublishAllRequest {
+        account_id: None,
+        platforms: Some(platforms),
+        account_ids,
+        video_key: Some(video),
+        video_parts: parts,
+        cover_key: cover,
+        typeid_mode: if has_bili {
+            Some(
+                profile["publish_typeid_mode"]
+                    .as_str()
+                    .unwrap_or("meta")
+                    .into(),
+            )
+        } else {
+            None
+        },
+        meta: None,
+        platform_meta,
+        platform_options: HashMap::new(),
+        skip_review: false,
+        force_retry: false,
+        fresh_batch: false,
+    };
+    let result = admit_batch(state, item.task_id, input, Some(item)).await?;
+    let batch = result["batch_id"]
+        .as_str()
+        .ok_or_else(|| AppError::Conflict("automatic batch receipt missing".into()))?;
+    Ok(crate::domain::StageOutcome::Awaiting {
+        ticket: format!("native-batch:{batch}"),
+    })
+}
 async fn publish_all(
     State(state): State<AppState>,
     Path(task_id): Path<Uuid>,

@@ -79,7 +79,7 @@ class Handler(BaseHTTPRequestHandler):
              'named-account-B':('isolated-account-B','BCDE123456789012')}.get(data['title'],('video-roll-test','1234567890123456'))
    assert 'SESSDATA='+expected[0] in self.headers.get('Cookie',''),data['title']
    assert data['csrf']==expected[1],data['title']
-   assert data['title'] in ['isolated Rust P1','ambiguous-publish','two-part','ai-summary','ai-invalid','batch-only','batch-unknown','named-account-A','named-account-B'],data
+   assert data['title'] in ['isolated Rust P1','ambiguous-publish','two-part','【熟肉&中配】two-part','ai-summary','ai-invalid','batch-only','batch-unknown','named-account-A','named-account-B'],data
    assert data['copyright']==2 and data['source'].startswith('https://youtu.be/'),data
    assert data['videos'][0]['filename']=='rust-test' and data['videos'][0]['cid']==421,data
    if data['title']=='isolated Rust P1':assert data['cover']=='https://i0.hdslb.com/mock_cover.jpg',data
@@ -87,6 +87,10 @@ class Handler(BaseHTTPRequestHandler):
     assert data['videos']==[
       {'filename':'rust-test','title':'P1中文字幕版','desc':'','cid':421},
       {'filename':'rust-dub','title':'P2中文配音版','desc':'','cid':422}],data
+   elif data['title']=='【熟肉&中配】two-part':
+    assert data['videos']==[
+      {'filename':'rust-test','title':'two-part','desc':'','cid':421},
+      {'filename':'rust-dub','title':'【中配】two-part','desc':'','cid':422}],data
    else:
     assert len(data['videos'])==1,data
    expected_tid={'isolated Rust P1':180,'ai-summary':172,'ai-invalid':180}.get(data['title'],171)

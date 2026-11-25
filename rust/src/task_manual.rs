@@ -414,7 +414,10 @@ async fn auto_subtitle_handoff(
     })))
 }
 
-fn auto_platform_selection(profile: &Value, overrides: &Value) -> AppResult<(bool, Vec<String>)> {
+pub(crate) fn auto_platform_selection(
+    profile: &Value,
+    overrides: &Value,
+) -> AppResult<(bool, Vec<String>)> {
     let enabled = overrides
         .get("auto_publish")
         .and_then(Value::as_bool)
@@ -448,9 +451,8 @@ fn auto_platform_selection(profile: &Value, overrides: &Value) -> AppResult<(boo
     Ok((enabled, names))
 }
 
-/// The original automatic publisher can target four external platforms; V2
-/// only permits the genuine Bilibili single-archive workflow today. Keeping
-/// social selections as an explicit error prevents silently skipping targets.
+/// Schedule the original automatic publish action. Native batch mode handles
+/// social targets; without it, fail closed rather than dropping platforms.
 async fn auto_publish(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -486,20 +488,26 @@ async fn auto_publish(
             json!({"status":"skipped","detail":"no automatic publishing platforms selected"}),
         ));
     }
-    if platforms.len() != 1 || platforms[0] != "bilibili" {
+    if (platforms.len() != 1 || platforms[0] != "bilibili")
+        && !crate::social_publish::mixed_enabled()
+    {
         return Err(AppError::Conflict(
             "automatic publish cannot silently drop unfinished Douyin/Xiaohongshu/Kuaishou targets"
                 .into(),
         ));
     }
-    if !state.config.native_bilibili_allowed
-        || !crate::publish_platforms::enabled(&state.db, "bilibili").await?
+    if platforms.iter().any(|p| p == "bilibili")
+        && (!state.config.native_bilibili_allowed
+            || !crate::publish_platforms::enabled(&state.db, "bilibili").await?)
     {
         return Err(AppError::Conflict(
             "native Bilibili publishing disabled".into(),
         ));
     }
     if let Some(dubbing_job_id) = query.dubbing_job_id {
+        if !platforms.iter().any(|p| p == "bilibili") {
+            return Err(AppError::Invalid("P2 requires a Bilibili target".into()));
+        }
         let matching: bool = sqlx::query_scalar(
             "SELECT EXISTS(
                 SELECT 1 FROM vr2_dubbing_runs r
@@ -531,12 +539,12 @@ async fn auto_publish(
         .restart_at(
             id,
             Stage::Publish,
-            json!({"auto_publish":true,"auto_publish_platforms":["bilibili"]}),
+            json!({"auto_publish":true,"auto_publish_platforms":platforms,"auto_publish_dubbing_job_id":query.dubbing_job_id}),
         )
         .await?;
     let job = response(&state, flow, Stage::Publish).await?.0;
     Ok(Json(json!({"status":job.status,"job_id":job.job_id,
-        "detail":"automatic native Bilibili stage scheduled"})))
+        "detail":"automatic native publish stage scheduled"})))
 }
 #[derive(Debug, Deserialize)]
 struct AutoPublishQuery {
