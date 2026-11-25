@@ -413,7 +413,12 @@ late = {"/tasks/actions/stop_all","/tasks/actions/resume_stopped",
 ordered = sorted(mapped, key=lambda r: (
     r["method"] != "WEBSOCKET", r["path"] in late, r["method"] != "GET"))
 results = []
+if args.all_services:
+    from contract_media_v3 import probe
+    results.extend(probe(args.base,token))
+covered={(r["method"],r["path"]) for r in results}
 for row in ordered:
+    if (row["method"],row["path"]) in covered:continue
     template=row["path"]
     if row["method"]=="WEBSOCKET":
         try:
