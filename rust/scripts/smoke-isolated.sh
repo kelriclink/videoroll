@@ -128,6 +128,9 @@ if [[ "${VIDEOROLL_V2_TEST_REAL_SCHEMA_ONLY:-false}" == "true" ]]; then
   /opt/videoroll/venvs/core/bin/python "$repo_root/rust/tests/production_schema_rehearsal.py" seed
   "$repo_root/rust/target/debug/videoroll-v2" migrate
   /opt/videoroll/venvs/core/bin/python "$repo_root/rust/tests/production_schema_rehearsal.py" verify
+  if [[ "${VIDEOROLL_V2_TEST_BULK_ADOPTION:-false}" == "true" ]]; then
+    /opt/videoroll/venvs/core/bin/python "$repo_root/rust/tests/bulk_adoption_isolated.py"
+  fi
   exit 0
 fi
 if [[ "${VIDEOROLL_V2_TEST_DB_CLEANUP_ONLY:-false}" == "true" ]]; then

@@ -2,11 +2,13 @@
 //! are copied or rewritten as successful native executions.
 use crate::{AppError, AppResult, Config, Database, domain::Stage, storage::AssetRegistry};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use sqlx::{Postgres, Row, Transaction};
 use uuid::Uuid;
 
 const ENGINE: &str = "rust-task-cutover";
 const TERMINAL: &str = "('succeeded','failed','canceled','completed','superseded')";
+const ADOPTION_LOCK: &str = "LOCK TABLE tasks,pipeline_runs,operation_inbox,assets,subtitles,subtitle_jobs,render_jobs,render_executions,dubbing_jobs,publish_jobs,publish_batches,outbox_events IN SHARE ROW EXCLUSIVE MODE NOWAIT";
 
 // Resolve the original outbox aggregate to its owning task without casting
 // untrusted historical strings to UUID. Include inbox evidence by operation key.
@@ -106,6 +108,183 @@ pub async fn audit(db: &Database, after: Option<Uuid>, limit: i64) -> AppResult<
         json!({"python_owned_total":total,"items":items,"next_after":if rows.len()>limit.clamp(1,1000) as usize{next}else{None},"note":"database preflight only; file verification and stopped-runtime confirmation required for adoption"}),
     )
 }
+async fn bulk_plan(
+    tx: &mut Transaction<'_, Postgres>,
+    after: Option<Uuid>,
+    limit: i64,
+) -> AppResult<Value> {
+    let rows=sqlx::query(
+        "SELECT id,status::text AS status,source_type::text AS source_type,
+        source_license::text AS license,updated_at,
+        (lock_owner IS NOT NULL OR lock_until IS NOT NULL) AS task_locked,
+        EXISTS(SELECT 1 FROM publish_jobs j WHERE j.task_id=t.id) AS publication_history,
+        EXISTS(SELECT 1 FROM publish_jobs j WHERE j.task_id=t.id AND j.state::text='published'
+            AND (CASE WHEN j.platform::text='bilibili' THEN COALESCE(NULLIF(j.bvid,''),NULLIF(j.aid,''),NULLIF(j.external_id,'')) ELSE COALESCE(NULLIF(j.external_id,''),NULLIF(j.external_url,'')) END) IS NOT NULL) AS published_receipt,
+        EXISTS(SELECT 1 FROM operation_inbox i WHERE i.operation_key='youtube-download:'||t.id::text AND i.status='pending') AS pending_download,
+        EXISTS(SELECT 1 FROM operation_inbox i WHERE i.operation_key='task-ownership-cutover:'||t.id::text) AS adoption_receipt
+        FROM tasks t WHERE runtime_owner='python' AND ($1::uuid IS NULL OR id>$1)
+        ORDER BY id LIMIT $2")
+        .bind(after).bind(limit+1).fetch_all(&mut **tx).await?;
+    let mut items = Vec::new();
+    let mut counts = std::collections::BTreeMap::<String, i64>::new();
+    let mut next = None;
+    let total: i64 = sqlx::query_scalar("SELECT count(*) FROM tasks WHERE runtime_owner='python'")
+        .fetch_one(&mut **tx)
+        .await?;
+    for row in rows.iter().take(limit as usize) {
+        let task: Uuid = row.try_get("id")?;
+        let status: String = row.try_get("status")?;
+        let source: String = row.try_get("source_type")?;
+        let license: String = row.try_get("license")?;
+        let history: bool = row.try_get("publication_history")?;
+        let mut reasons = blockers(tx, task).await?;
+        if row.try_get::<bool, _>("task_locked")? {
+            reasons.push("task_lease_present".into());
+        }
+        if row.try_get::<bool, _>("pending_download")? {
+            reasons.push("pending_download_requires_explicit_resume".into());
+        }
+        if row.try_get::<bool, _>("adoption_receipt")? {
+            reasons.push("adoption_receipt_already_exists".into());
+        }
+        if status == "published" && !row.try_get::<bool, _>("published_receipt")? {
+            reasons.push("published_without_confirmed_receipt".into());
+        }
+        let resume = if reasons.is_empty() && !history && license != "unknown" {
+            stage_for(&status, &source).map(|s| s.as_str())
+        } else {
+            None
+        };
+        // This operation only transfers historical terminal ownership. Any
+        // resumable or reviewable task needs the explicit single-task path.
+        let disposition = if !reasons.is_empty() {
+            "requires_reconciliation"
+        } else if matches!(status.as_str(), "published" | "failed" | "canceled") {
+            "safe_terminal"
+        } else if resume.is_some() {
+            "resume_candidate"
+        } else {
+            "manual_review"
+        };
+        *counts.entry(disposition.into()).or_default() += 1;
+        next = Some(task);
+        items.push(json!({"task_id":task,"status":status,"updated_at":row.try_get::<chrono::DateTime<chrono::Utc>,_>("updated_at")?,"disposition":disposition,
+            "blockers":reasons,"resume_candidate":resume,"has_publish_history":history}));
+    }
+    let next_after = if rows.len() > limit as usize {
+        next
+    } else {
+        None
+    };
+    // This token binds the exact reviewed page, not an authorization secret
+    // or a complete snapshot of the database. All eligibility is checked
+    // again under the same table locks as single-task adoption.
+    let page = json!({"after":after,"limit":limit,"items":items,"next_after":next_after});
+    let token =
+        hex::encode(Sha256::digest(serde_json::to_vec(&page).map_err(|_| {
+            AppError::Invalid("cannot encode adoption plan".into())
+        })?));
+    Ok(
+        json!({"mode":"plan","python_owned_total":total,"after":after,"limit":limit,"items":items,
+        "counts":counts,"next_after":next_after,"plan_token":token,"automatic_resume":false,"automatic_publish":false}),
+    )
+}
+
+/// Review a bounded page and optionally adopt exactly the safe terminal
+/// subset atomically. Never invoke worker scheduling or external services.
+pub async fn bulk(
+    db: &Database,
+    cfg: &Config,
+    after: Option<Uuid>,
+    limit: i64,
+    apply: bool,
+    quiesced: bool,
+    expected_plan: Option<&str>,
+) -> AppResult<Value> {
+    if !(1..=500).contains(&limit) {
+        return Err(AppError::Invalid("bulk page limit must be 1..500".into()));
+    }
+    if apply {
+        if !crate::native_deployment::enabled()
+            || !crate::outbox_dispatcher::native_only()
+            || !quiesced
+        {
+            return Err(AppError::Conflict("bulk adoption requires standalone native-only mode and stopped producers/consumers confirmation".into()));
+        }
+        crate::native_deployment::validate(cfg)?;
+        if expected_plan.is_none_or(|s| s.len() != 64 || !s.bytes().all(|c| c.is_ascii_hexdigit()))
+        {
+            return Err(AppError::Invalid(
+                "bulk apply requires the reviewed page plan token".into(),
+            ));
+        }
+        // No schema writes or implicit migrations. A checksum mismatch must
+        // not be ignored merely because individual queries happen to work.
+        let preflight = crate::native_deployment::preflight(db, cfg, false).await?;
+        if preflight.get("missing_migrations").is_some()
+            || preflight.get("invalid_migrations").is_some()
+        {
+            return Err(AppError::Conflict(
+                "bulk adoption requires the complete verified migration ledger".into(),
+            ));
+        }
+    } else if quiesced || expected_plan.is_some() {
+        return Err(AppError::Invalid(
+            "quiesced and plan-token are only valid with apply".into(),
+        ));
+    }
+    let mut tx = db.pool.begin().await?;
+    if apply {
+        sqlx::query(ADOPTION_LOCK).execute(&mut *tx).await?;
+    } else {
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            .execute(&mut *tx)
+            .await?;
+    }
+    sqlx::query("SET LOCAL statement_timeout='30s'")
+        .execute(&mut *tx)
+        .await?;
+    let mut plan = bulk_plan(&mut tx, after, limit).await?;
+    if apply {
+        if plan["plan_token"].as_str() != expected_plan {
+            return Err(AppError::Conflict(
+                "bulk plan changed; re-run the read-only plan before applying".into(),
+            ));
+        }
+        let mut adopted = Vec::new();
+        for item in plan["items"].as_array().expect("bulk plan items") {
+            if item["disposition"] != "safe_terminal" {
+                continue;
+            }
+            let task = Uuid::parse_str(item["task_id"].as_str().expect("task id"))
+                .map_err(|_| AppError::Invalid("invalid bulk task id".into()))?;
+            let status = &item["status"];
+            let key = format!("task-ownership-cutover:{task}");
+            let updated=sqlx::query("UPDATE tasks SET runtime_owner='rust',runtime_origin=COALESCE(runtime_origin,'legacy_adopted'),updated_at=now() WHERE id=$1 AND runtime_owner='python'")
+                .bind(task).execute(&mut *tx).await?.rows_affected();
+            if updated != 1 {
+                return Err(AppError::Conflict("bulk task ownership changed".into()));
+            }
+            let result = json!({"task_id":task,"previous_owner":"python","previous_status":status,"runtime_owner":"rust",
+                "workflow_id":null,"resumed_stage":null,"verified_assets":[],"retired_unattempted_downloads":0,"retired_hatchet_runs":[],"automatic_publish":false});
+            sqlx::query("INSERT INTO operation_inbox(id,operation_key,runtime_engine,status,task_id,request_json,result_json,completed_at) VALUES($1,$2,$3,'completed',$4,$5,$6,now())")
+                .bind(Uuid::new_v4()).bind(key).bind(ENGINE).bind(task)
+                .bind(json!({"resume":false,"bulk_plan_token":expected_plan})).bind(result).execute(&mut *tx).await?;
+            adopted.push(task);
+        }
+        plan["mode"] = json!("applied");
+        plan["adopted_count"] = json!(adopted.len());
+        plan["adopted_task_ids"] = json!(adopted);
+        plan["python_owned_remaining"] = json!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM tasks WHERE runtime_owner='python'")
+                .fetch_one(&mut *tx)
+                .await?
+        );
+    }
+    tx.commit().await?;
+    Ok(plan)
+}
+
 async fn verify_asset(
     tx: &mut Transaction<'_, Postgres>,
     store: &AssetRegistry,
@@ -182,7 +361,7 @@ pub async fn adopt(
     let mut tx = db.pool.begin().await?;
     // Offline cutover; lock every original business ledger used by the
     // decision, so old workers cannot create an unobserved side effect.
-    sqlx::query("LOCK TABLE tasks,pipeline_runs,operation_inbox,assets,subtitles,subtitle_jobs,render_jobs,render_executions,dubbing_jobs,publish_jobs,publish_batches,outbox_events IN SHARE ROW EXCLUSIVE MODE NOWAIT").execute(&mut *tx).await?;
+    sqlx::query(ADOPTION_LOCK).execute(&mut *tx).await?;
     let r=sqlx::query("SELECT runtime_owner,status::text AS status,source_type::text AS source_type,source_license::text AS license,source_url FROM tasks WHERE id=$1 FOR UPDATE")
         .bind(task).fetch_optional(&mut *tx).await?.ok_or_else(||AppError::NotFound("historical task not found".into()))?;
     let owner: String = r.try_get("runtime_owner")?;
