@@ -85,5 +85,27 @@ def probe(root,send):
     check('/settings/publish/social/accounts/{account_id}/check','/settings/publish/social/accounts/'+account+'/check',{},lambda x:x['check_job_id']=='mock' and x['account']['id']==account and x['account']['check_state']=='valid')
     data=b'--vr2contract\r\nContent-Disposition: form-data; name="account_name"\r\n\r\nContractV7\r\n--vr2contract\r\nContent-Disposition: form-data; name="file"; filename="storage_state.json"\r\nContent-Type: application/json\r\n\r\n{"cookies":[],"origins":[]}\r\n--vr2contract--\r\n'
     check('/settings/publish/social/accounts/{platform}','/settings/publish/social/accounts/douyin',data,lambda x:x['check_job_id']=='mock' and x['account']['platform']=='douyin' and x['account']['check_state']=='pending',form=True)
+    # A valid diagnostic request should return the original structured
+    # failure DTO when the configured proxy cannot establish a connection.
+    # CONNECT never leaves the loopback test server; no official host I/O.
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    import threading
+    connects=[]
+    class RejectingProxy(BaseHTTPRequestHandler):
+        def do_CONNECT(self):
+            connects.append(self.path)
+            self.send_response(502);self.send_header('Content-Length','0');self.end_headers()
+        def log_message(self,*args):pass
+    proxy=ThreadingHTTPServer(('127.0.0.1',0),RejectingProxy)
+    threading.Thread(target=proxy.serve_forever,daemon=True).start()
+    try:
+        proxy_url=f'http://127.0.0.1:{proxy.server_port}'
+        url='https://www.youtube.com/robots.txt'
+        check('/settings/youtube/test','/settings/youtube/test',{'url':url,'proxy':proxy_url},lambda x:x['ok'] is False and x['url']==url and x['used_proxy']==proxy_url and x['status_code'] is None and isinstance(x['elapsed_ms'],int) and 'credentials' in x['error'])
+        assert connects==['www.youtube.com:443'],connects
+        assert call('POST','/settings/youtube/test',{'url':'http://127.0.0.1/admin','proxy':proxy_url})[0]==400
+        assert len(connects)==1
+    finally:
+        proxy.shutdown();proxy.server_close()
     print(f'PASS: {len(records)} independent task action and account proxy assertions',flush=True)
     return records

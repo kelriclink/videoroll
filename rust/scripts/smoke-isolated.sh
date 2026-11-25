@@ -684,7 +684,7 @@ setup="$(curl --silent --fail-with-body \
   -H 'x-videoroll-admin-bootstrap: rust-local-test-bootstrap' \
   -H 'content-type: application/json' \
   -d '{"password":"rust-test-secret-123"}' \
-  http://127.0.0.1:18080/api/auth/setup)"
+  http://127.0.0.1:18080/api/v1/auth/setup)"
 echo "$setup" | grep -q '"password_set":true'
 jar="$repo_root/rust/target/v2-login-cookies.txt"
 curl --silent --fail-with-body -c "$jar" -H 'content-type: application/json' \
@@ -693,6 +693,9 @@ curl --silent --fail-with-body -c "$jar" -H 'content-type: application/json' \
 curl --silent --fail-with-body -b "$jar" \
   http://127.0.0.1:18080/api/v2/tasks | grep -q '0123456789A'
 echo 'PASS: native admin setup/login and browser cookie compatibility'
+# Original versioned setup path was exercised before login; replay must fail closed.
+test "$(curl --silent -o /dev/null -w '%{http_code}' -H 'x-videoroll-admin-bootstrap: rust-local-test-bootstrap' -H 'content-type: application/json' -d '{"password":"rust-test-secret-123"}' http://127.0.0.1:18080/api/v1/auth/setup)" = 409
+echo 'PASS: original V1 admin initialization and setup replay rejected'
 if [[ "${VIDEOROLL_V2_TEST_CONTRACT_217_ONLY:-false}" == "true" ]]; then
   probe_task_id="$(FIRST="$first" python3 -c 'import json,os;print(json.loads(os.environ["FIRST"])["task"]["id"])')"
   probe_alert="$(curl --silent --fail-with-body "${hdr[@]}" -d '{"fingerprint":"vr2.contract.alert","source":"isolated","severity":"warning","title":"Contract fixture","message":"mock only","details":{}}' http://127.0.0.1:18080/api/v1/operations/alerts/report)"
