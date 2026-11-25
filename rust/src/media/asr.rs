@@ -7,6 +7,7 @@ use crate::{
     storage::AssetRegistry,
     subtitles::{SubtitleCue, to_ass, to_srt},
 };
+use base64::{Engine, engine::general_purpose::STANDARD};
 use reqwest::{Client, Url, multipart};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -181,14 +182,130 @@ fn normalize_asr(
     }
     Ok(items)
 }
+// Original Cloudflare provider emits segments, words, or only text.
+// Preserve the actual chunk offset and bounded fallback duration.
+fn cloudflare_response(data: Value, seconds: f64) -> AppResult<AsrResponse> {
+    if !data.is_object() || data.get("success") == Some(&Value::Bool(false)) {
+        return Err(AppError::Invalid(
+            "Cloudflare ASR rejected the request".into(),
+        ));
+    }
+    let result = data
+        .get("result")
+        .filter(|v| v.is_object())
+        .unwrap_or(&data);
+    let normalize = |v: &Value, key: &str| {
+        v.get(key)
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let number = |v: &Value, key: &str| {
+        v.get(key)
+            .and_then(|x| x.as_f64().or_else(|| x.as_str()?.parse().ok()))
+            .filter(|x| x.is_finite())
+    };
+    let mut segments = Vec::new();
+    let make = |start: f64, end: f64, text: String| AsrSegment {
+        start,
+        end,
+        text,
+        no_speech_prob: None,
+        avg_logprob: None,
+        compression_ratio: None,
+    };
+    if let Some(rows) = result["segments"].as_array() {
+        for row in rows {
+            let text = normalize(row, "text");
+            if text.is_empty() {
+                continue;
+            }
+            let start = number(row, "start").unwrap_or(0.).clamp(0., seconds);
+            let end = number(row, "end").unwrap_or(start).clamp(start, seconds);
+            if end > start {
+                segments.push(make(start, end, text));
+            }
+        }
+    }
+    if segments.is_empty() {
+        if let Some(words) = result["words"].as_array() {
+            let mut timed = Vec::new();
+            for row in words {
+                let text = normalize(row, "word");
+                let start = number(row, "start").unwrap_or(0.).clamp(0., seconds);
+                let end = number(row, "end").unwrap_or(start).clamp(start, seconds);
+                if !text.is_empty() && end > start {
+                    timed.push((start, end, text));
+                }
+            }
+            if let (Some(first), Some(last)) = (timed.first(), timed.last()) {
+                if last.1 > first.0 {
+                    segments.push(make(
+                        first.0,
+                        last.1,
+                        timed
+                            .iter()
+                            .map(|x| x.2.as_str())
+                            .collect::<Vec<_>>()
+                            .join(" "),
+                    ));
+                }
+            }
+        }
+    }
+    if segments.is_empty() {
+        let text = normalize(result, "text");
+        if !text.is_empty() && seconds > 0. {
+            segments.push(make(0., seconds, text));
+        }
+    }
+    Ok(AsrResponse {
+        segments,
+        text: String::new(),
+    })
+}
+// Transaction-scoped advisory locks are automatically released on
+// cancellation or connection loss. Never keep a waiting transaction open.
+async fn cloudflare_slot(
+    db: &Database,
+    job: &WorkItem,
+) -> AppResult<sqlx::Transaction<'static, sqlx::Postgres>> {
+    let cap = std::env::var("CLOUDFLARE_ASR_MAX_CONCURRENCY")
+        .ok()
+        .and_then(|s| s.parse::<i32>().ok())
+        .unwrap_or(2)
+        .clamp(1, 8);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+    loop {
+        selective_lease(db, job).await?;
+        let mut tx = db.pool.begin().await?;
+        for slot in 0..cap {
+            let held:bool=sqlx::query_scalar("SELECT pg_try_advisory_xact_lock(hashtextextended('videoroll:asr:cloudflare:'||$1::text,0))").bind(slot).fetch_one(&mut *tx).await?;
+            if held {
+                return Ok(tx);
+            }
+        }
+        tx.rollback().await?;
+        if tokio::time::Instant::now() >= deadline {
+            return Err(AppError::Unavailable(
+                "Cloudflare ASR admission timeout".into(),
+            ));
+        }
+        sleep(Duration::from_millis(250)).await;
+    }
+}
 async fn run_asr(
     db: &Database,
-    task_id: Uuid,
+    job: &WorkItem,
     client: &Client,
     config: &Config,
     path: &Path,
     lang: &str,
+    seconds: f64,
 ) -> AppResult<AsrResponse> {
+    let task_id = job.task_id;
     if let Some(mut request) = config.local_asr.clone() {
         request["audio"] = json!(path);
         request["language"] = json!(lang);
@@ -201,6 +318,46 @@ async fn run_asr(
         .as_deref()
         .ok_or_else(|| AppError::Unavailable("no native ASR endpoint configured".into()))?;
     let parsed_endpoint = endpoint(target)?;
+    if config.cloudflare_asr {
+        if fs::metadata(path).await?.len() > 1_100_000 {
+            return Err(AppError::Invalid(
+                "Cloudflare WAV chunk exceeds budget".into(),
+            ));
+        }
+        let audio = fs::read(path).await?;
+        if !audio.starts_with(b"RIFF") || audio.get(8..12) != Some(b"WAVE") {
+            return Err(AppError::Invalid("invalid Cloudflare PCM WAV".into()));
+        }
+        let mut payload = json!({"audio":STANDARD.encode(audio),"task":"transcribe"});
+        if !lang.is_empty() && !lang.eq_ignore_ascii_case("auto") {
+            payload["language"] = json!(lang);
+        }
+        let key = config
+            .asr_api_key
+            .as_ref()
+            .ok_or_else(|| AppError::Invalid("Cloudflare ASR API key is not set".into()))?;
+        let slot = cloudflare_slot(db, job).await?;
+        selective_lease(db, job).await?;
+        let result = crate::ai_usage::chat_json(
+            db,
+            client
+                .post(parsed_endpoint.clone())
+                .timeout(Duration::from_secs(180))
+                .bearer_auth(key)
+                .json(&payload),
+            &parsed_endpoint,
+            &config.asr_model,
+            "asr_cloudflare",
+            Some(task_id),
+            MAX_BYTES,
+            "Cloudflare ASR",
+        )
+        .await;
+        slot.rollback().await?;
+        selective_lease(db, job).await?;
+        let body = result?;
+        return cloudflare_response(body, seconds);
+    }
     if fs::metadata(path).await?.len() > 24 * 1024 * 1024 {
         return Err(AppError::Invalid("ASR audio chunk exceeds 24 MiB".into()));
     }
@@ -251,7 +408,20 @@ async fn convert_audio(
         .arg(video)
         .arg("-t")
         .arg(format!("{seconds:.3}"))
-        .args(["-vn", "-ac", "1", "-ar", "16000", "-c:a", "flac", "-y"])
+        .args([
+            "-vn",
+            "-ac",
+            "1",
+            "-ar",
+            "16000",
+            "-c:a",
+            if config.cloudflare_asr {
+                "pcm_s16le"
+            } else {
+                "flac"
+            },
+            "-y",
+        ])
         .arg(target)
         .stdin(Stdio::null())
         .kill_on_drop(true)
@@ -519,7 +689,65 @@ pub async fn runtime_asr_config(
             out.asr_model = model.into();
             Ok(Some(out))
         }
-        "mock" | "cloudflare-workers-ai" => Ok(None), // These require a different worker/API, not Whisper HTTP.
+        "cloudflare-workers-ai" => {
+            let account = read["cloudflare_workers_ai_account_id"]
+                .as_str()
+                .unwrap_or("")
+                .trim();
+            if account.is_empty()
+                || account.len() > 128
+                || !account
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-'))
+            {
+                return Err(AppError::Invalid("invalid Cloudflare ASR account".into()));
+            }
+            let model = overrides
+                .as_ref()
+                .and_then(|v| v["asr_model"].as_str())
+                .filter(|s| !s.is_empty())
+                .or_else(|| stored["default_model"].as_str().filter(|s| !s.is_empty()))
+                .unwrap_or(read["cloudflare_workers_ai_model"].as_str().unwrap_or(""));
+            if !model.starts_with("@cf/")
+                || model.len() > 256
+                || !model.bytes().all(|c| {
+                    c.is_ascii_alphanumeric() || matches!(c, b'@' | b'/' | b'_' | b'.' | b'-')
+                })
+                || model
+                    .split('/')
+                    .any(|s| s == ".." || s == "." || s.is_empty())
+            {
+                return Err(AppError::Invalid("invalid Cloudflare ASR model".into()));
+            }
+            let secret = stored["cloudflare_workers_ai"]["api_key_enc"]
+                .as_str()
+                .filter(|s| !s.is_empty());
+            out.asr_api_key = match secret {
+                Some(s) => crate::providers::decode_secret(s)?,
+                None => std::env::var("SUBTITLE_CLOUDFLARE_API_KEY")
+                    .ok()
+                    .filter(|s| !s.is_empty()),
+            };
+            if out.asr_api_key.is_none() {
+                return Err(AppError::Invalid(
+                    "Cloudflare ASR API key is not set".into(),
+                ));
+            }
+            let base = crate::subtitle_asr_test_v1::test_override(
+                "VIDEOROLL_V2_TEST_CLOUDFLARE_BASE",
+                "https://api.cloudflare.com",
+            )?;
+            let mut url = endpoint(&base)?;
+            url.set_path(&format!("/client/v4/accounts/{account}/ai/run/{model}"));
+            url.set_query(None);
+            url.set_fragment(None);
+            out.asr_endpoint = Some(url.to_string());
+            out.asr_model = model.into();
+            out.local_asr = None;
+            out.cloudflare_asr = true;
+            Ok(Some(out))
+        }
+        "mock" => Ok(None),
         _ => Err(AppError::Invalid("ASR engine not supported".into())),
     }
 }
@@ -839,6 +1067,27 @@ pub async fn process(
             }
         }
     }
+    if config.cloudflare_asr && profile.asr_language == "auto" {
+        let saved: Option<Value> =
+            sqlx::query_scalar("SELECT value_json FROM app_settings WHERE key='subtitle.asr'")
+                .fetch_optional(&db.pool)
+                .await?;
+        let overrides: Option<Value> =
+            sqlx::query_scalar("SELECT configuration->'subtitle' FROM vr2_workflows WHERE id=$1")
+                .bind(job.workflow_id)
+                .fetch_optional(&db.pool)
+                .await?
+                .flatten();
+        if overrides
+            .as_ref()
+            .and_then(|x| x.get("asr_language"))
+            .is_none()
+        {
+            if let Some(lang) = saved.as_ref().and_then(|x| x["default_language"].as_str()) {
+                profile.asr_language = lang.into();
+            }
+        }
+    }
     let original_hash:Option<String>=sqlx::query_scalar(
         "SELECT sha256 FROM assets WHERE task_id=$1 AND storage_key=$2 AND kind='video_raw'::asset_kind ORDER BY created_at DESC LIMIT 1"
     ).bind(job.task_id).bind(&video_key).fetch_optional(&db.pool).await?.flatten();
@@ -847,19 +1096,28 @@ pub async fn process(
     } else {
         registry.sha256(&video_key).await?.0
     };
+    let (window, overlap) = if config.cloudflare_asr {
+        (30., 0.)
+    } else {
+        (WINDOW, OVERLAP)
+    };
     let asr_identity = fingerprint(&json!({
         "checkpoint_version":2,"video_sha256":source_digest,
         "model":config.asr_model,"asr_endpoint":config.asr_endpoint,"local_asr":config.local_asr,
         "language":profile.asr_language,"duration_ms":(duration*1000.0).round() as u64,
-        "window_seconds":WINDOW,"overlap_seconds":OVERLAP
+        "window_seconds":window,"overlap_seconds":overlap,"cloudflare_asr":config.cloudflare_asr
     }))?;
-    let client = Client::builder()
-        .timeout(Duration::from_secs(300))
-        .build()?;
+    let builder = Client::builder().timeout(Duration::from_secs(300));
+    let client = if config.cloudflare_asr {
+        builder.redirect(reqwest::redirect::Policy::none())
+    } else {
+        builder
+    }
+    .build()?;
     let prefix = format!("v2/sub/{}/{}", job.task_id, job.id);
     let workspace = registry.resolve_existing(&format!("{prefix}/work")).await?;
     fs::create_dir_all(&workspace).await?;
-    let stride = WINDOW - OVERLAP;
+    let stride = window - overlap;
     let count = (duration / stride).ceil() as usize;
     let mut cues = Vec::new();
     for index in 0..count {
@@ -867,7 +1125,7 @@ pub async fn process(
         if start >= duration {
             break;
         }
-        let seconds = (duration - start).min(WINDOW);
+        let seconds = (duration - start).min(window);
         let offset_ms = (start * 1000.0).round() as u64;
         let checkpoint = workspace.join(format!("asr-{index:05}.json"));
         let cached = fs::read(&checkpoint)
@@ -880,23 +1138,42 @@ pub async fn process(
         let rows = if let Some(cached) = cached {
             cached.cues
         } else {
-            let flac = workspace.join(format!("audio-{index:05}.flac"));
+            let flac = workspace.join(format!(
+                "audio-{index:05}.{}",
+                if config.cloudflare_asr { "wav" } else { "flac" }
+            ));
             convert_audio(config, &video, &flac, start, seconds).await?;
             let mut result = None;
             for attempt in 0..3 {
+                if config.cloudflare_asr {
+                    selective_lease(db, job).await?;
+                }
                 match run_asr(
                     db,
-                    job.task_id,
+                    job,
                     &client,
                     config,
                     &flac,
                     &profile.asr_language,
+                    seconds,
                 )
                 .await
                 {
                     Ok(resp) => {
                         result = Some(resp);
                         break;
+                    }
+                    Err(err)
+                        if config.cloudflare_asr
+                            && matches!(err, AppError::Invalid(_) | AppError::Conflict(_)) =>
+                    {
+                        return Err(err);
+                    }
+                    Err(err)
+                        if config.cloudflare_asr
+                            && matches!(&err,AppError::Unavailable(msg) if ["HTTP 400","HTTP 401","HTTP 403","HTTP 404","HTTP 413"].iter().any(|code|msg.contains(code))) =>
+                    {
+                        return Err(err);
                     }
                     Err(err) if attempt < 2 => {
                         tracing::warn!(chunk=index,attempt,error=%err,"ASR chunk retry");
@@ -909,7 +1186,7 @@ pub async fn process(
             let keep_after = if index == 0 {
                 0
             } else {
-                offset_ms + (OVERLAP * 500.0) as u64
+                offset_ms + (overlap * 500.0) as u64
             };
             let result = normalize_asr(
                 result.ok_or_else(|| AppError::Unavailable("ASR returned no result".into()))?,
@@ -917,6 +1194,9 @@ pub async fn process(
                 keep_after,
                 (duration * 1000.0) as u64,
             )?;
+            if config.cloudflare_asr {
+                selective_lease(db, job).await?;
+            }
             atomic_write(
                 &checkpoint,
                 &serde_json::to_vec(&Checkpoint {
@@ -1116,7 +1396,13 @@ pub async fn process(
         (&ass_key, ass.as_bytes(), "subtitle_ass"),
     ] {
         let path = registry.resolve_existing(key).await?;
+        if config.cloudflare_asr {
+            selective_lease(db, job).await?;
+        }
         atomic_write(&path, body).await?;
+        if config.cloudflare_asr {
+            selective_lease(db, job).await?;
+        }
         ensure_task_asset(db, registry, job.task_id, job, kind, key).await?;
     }
     Ok(json!({"no_speech":false,"cues":cues.len(),
@@ -1217,6 +1503,26 @@ mod tests {
             .is_err()
         );
         assert!(parse_translation("{\"items\":[]}", 2).is_err());
+    }
+    #[test]
+    fn cloudflare_response_shapes_and_bounds() {
+        let result=cloudflare_response(json!({"success":true,"result":{"segments":[{"start":"0.2","end":1.1,"text":"  test   cue "},{"start":29.5,"end":33.,"text":"bounded"}],"words":[{"word":"ignored","start":0,"end":1}]}}),30.).unwrap();
+        assert_eq!(result.segments.len(), 2);
+        assert_eq!(result.segments[0].text, "test cue");
+        assert_eq!(result.segments[1].end, 30.);
+        let words=cloudflare_response(json!({"words":[{"word":"one","start":0.1,"end":0.7},{"word":"two","start":0.8,"end":1.4}]}),30.).unwrap();
+        assert_eq!(words.segments[0].text, "one two");
+        assert_eq!(words.segments[0].start, 0.1);
+        assert_eq!(words.segments[0].end, 1.4);
+        let text = cloudflare_response(json!({"text":"last"}), 4.5).unwrap();
+        assert_eq!(text.segments[0].end, 4.5);
+        assert!(cloudflare_response(json!({"success":false,"errors":["fixture"]}), 30.).is_err());
+        assert!(
+            cloudflare_response(json!({"text":""}), 30.)
+                .unwrap()
+                .segments
+                .is_empty()
+        );
     }
     #[test]
     fn provider_endpoint_is_explicit_and_secured() {

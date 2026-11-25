@@ -73,15 +73,16 @@ pub(crate) struct SubtitleAction {
 pub(crate) fn subtitle_config(request: SubtitleAction) -> AppResult<Value> {
     // Local inference may be explicitly selected. Other engine-specific
     // selectors stay rejected until their request semantics are migrated.
-    if request
-        .asr_engine
-        .as_deref()
-        .is_some_and(|s| !matches!(s, "auto" | "openvino" | "faster-whisper"))
-        || (request.asr_model.is_some()
-            && !matches!(
-                request.asr_engine.as_deref(),
-                Some("openvino" | "faster-whisper")
-            ))
+    if request.asr_engine.as_deref().is_some_and(|s| {
+        !matches!(
+            s,
+            "auto" | "openvino" | "faster-whisper" | "cloudflare-workers-ai"
+        )
+    }) || (request.asr_model.is_some()
+        && !matches!(
+            request.asr_engine.as_deref(),
+            Some("openvino" | "faster-whisper" | "cloudflare-workers-ai")
+        ))
         || request.prefer_youtube_subtitles == Some(true)
         || request
             .youtube_subtitle_mode
