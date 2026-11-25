@@ -171,6 +171,15 @@ if [[ "${VIDEOROLL_V2_TEST_TRANSLATION_CONTEXT_ONLY:-false}" == "true" ]]; then
   "$smoke_python" "$repo_root/rust/tests/translation_context_isolated.py"
   exit 0
 fi
+if [[ "${VIDEOROLL_V2_TEST_YOUTUBE_SUBTITLES_ONLY:-false}" == "true" ]]; then
+  export VIDEOROLL_V2_INTERNAL_TOKEN="isolated-youtube-subtitles-token-0123456789"
+  export INTERNAL_API_SECRET="isolated-youtube-subtitles-secret"
+  export VIDEOROLL_V2_STORAGE_ROOT="$(mktemp -d "$repo_root/rust/target/v2-youtube-subtitles.XXXXXX")"
+  "$CARGO_HOME/bin/cargo" build --manifest-path "$repo_root/rust/Cargo.toml" --bin videoroll-v2 --locked --offline --quiet
+  "$repo_root/rust/target/debug/videoroll-v2" migrate
+  "$smoke_python" "$repo_root/rust/tests/youtube_subtitles_isolated.py"
+  exit 0
+fi
 if [[ "${VIDEOROLL_V2_TEST_CLOUDFLARE_ASR_ONLY:-false}" == "true" ]]; then
   export VIDEOROLL_V2_INTERNAL_TOKEN="isolated-cloudflare-asr-token-0123456789"
   export INTERNAL_API_SECRET="isolated-cloudflare-asr-secret"

@@ -129,19 +129,10 @@ fn config(request: &Value) -> AppResult<(Uuid, String, Value)> {
     {
         return Err(invalid("youtube_subtitle_mode must be a string"));
     }
-    let prefer = map
-        .get("prefer_youtube_subtitles")
-        .and_then(Value::as_bool)
-        .unwrap_or(true);
-    let mode = map
-        .get("youtube_subtitle_mode")
-        .and_then(Value::as_str)
-        .unwrap_or(if prefer { "target" } else { "off" });
-    if prefer || mode != "off" {
-        return Err(invalid(
-            "YouTube subtitle source selection is not supported by the native ASR stage",
-        ));
-    }
+    let mode = crate::media::youtube_subtitles::mode(
+        map.get("youtube_subtitle_mode").and_then(Value::as_str),
+        map.get("prefer_youtube_subtitles").and_then(Value::as_bool),
+    )?;
     let asr = optional_object(map, "asr")?;
     let translation = optional_object(map, "translate")?;
     let output = optional_object(map, "output")?;
@@ -233,8 +224,8 @@ fn config(request: &Value) -> AppResult<(Uuid, String, Value)> {
     if let Some(v) = map.get("resume") {
         flat.insert("resume".into(), v.clone());
     }
-    flat.insert("prefer_youtube_subtitles".into(), json!(false));
-    flat.insert("youtube_subtitle_mode".into(), json!("off"));
+    flat.insert("prefer_youtube_subtitles".into(), json!(mode != "off"));
+    flat.insert("youtube_subtitle_mode".into(), json!(mode));
     if let Some(v) = asr {
         for (from, to) in [
             ("engine", "asr_engine"),
@@ -412,8 +403,7 @@ mod tests {
         assert_eq!(defaults["render"]["burn_in"], false);
         assert_eq!(defaults["render"]["video_codec"], "av1");
         for (field, value) in [
-            ("prefer_youtube_subtitles", json!(true)),
-            ("youtube_subtitle_mode", json!("target")),
+            ("youtube_subtitle_mode", json!("invalid")),
             ("selective_retranslate", json!({"indices":[1]})),
             ("output_prefix", json!("ignored")),
         ] {

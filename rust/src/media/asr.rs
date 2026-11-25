@@ -71,6 +71,7 @@ pub struct SubtitleProfile {
     pub translate_batch_size: Option<usize>,
     pub translate_enable_summary: Option<bool>,
     pub translate_glossary: Value,
+    pub youtube_subtitle_mode: String,
 }
 impl Default for SubtitleProfile {
     fn default() -> Self {
@@ -86,6 +87,7 @@ impl Default for SubtitleProfile {
             translate_batch_size: None,
             translate_enable_summary: None,
             translate_glossary: Value::Null,
+            youtube_subtitle_mode: "target".into(),
         }
     }
 }
@@ -135,6 +137,18 @@ async fn settings(db: &Database, job: &WorkItem) -> AppResult<SubtitleProfile> {
             target.insert(k.clone(), v.clone());
         }
     }
+    let override_source = workflow.as_ref().and_then(|v| v.get("subtitle"));
+    let saved_source = runtime.as_ref();
+    let source = override_source
+        .filter(|v| {
+            v.get("youtube_subtitle_mode").is_some() || v.get("prefer_youtube_subtitles").is_some()
+        })
+        .or(saved_source);
+    let mode = crate::media::youtube_subtitles::mode(
+        source.and_then(|v| v["youtube_subtitle_mode"].as_str()),
+        source.and_then(|v| v["prefer_youtube_subtitles"].as_bool()),
+    )?;
+    v["youtube_subtitle_mode"] = json!(mode);
     let profile: SubtitleProfile = serde_json::from_value(v)
         .map_err(|_| AppError::Invalid("subtitle config types invalid".into()))?;
     crate::media::translation_quality::validate_glossary(&profile.translate_glossary)?;
@@ -1165,11 +1179,111 @@ async fn process_selective(
     )
 }
 
-pub async fn process(
+/// Probe before resolving ASR configuration so a target-language caption
+/// can complete even when no inference provider is configured.
+pub(crate) async fn preferred_source(
     config: &Config,
     db: &Database,
     registry: &AssetRegistry,
     job: &WorkItem,
+) -> AppResult<Option<crate::media::youtube_subtitles::Captions>> {
+    let profile = settings(db, job).await?;
+    if profile.youtube_subtitle_mode == "off" {
+        return Ok(None);
+    }
+    if let Some(srt) = latest_asset_key(db, job.task_id, "subtitle_srt").await? {
+        if let Ok(path) = registry.resolve_existing(&srt).await {
+            if fs::metadata(path).await.is_ok() {
+                return Ok(None);
+            }
+        }
+    }
+    let task = db.task(job.task_id).await?;
+    if task.source_type != "youtube" {
+        return Ok(None);
+    }
+    let raw = latest_asset_key(db, job.task_id, "video_raw")
+        .await?
+        .ok_or_else(|| AppError::NotFound("raw video missing".into()))?;
+    let identity = fingerprint(
+        &json!({"version":1,"source_url":task.source_url,"video_sha256":registry.sha256(&raw).await?.0,"mode":profile.youtube_subtitle_mode,"target":profile.target_lang}),
+    )?;
+    let key = format!(
+        "v2/sub/{}/{}/work/youtube-captions.json",
+        job.task_id, job.id
+    );
+    let path = registry.resolve_existing(&key).await?;
+    if let Ok(bytes) = fs::read(&path).await {
+        if let Ok(value) = serde_json::from_slice::<Value>(&bytes) {
+            if value["fingerprint"].as_str() == Some(identity.as_str()) {
+                if let Ok(captions) = serde_json::from_value::<
+                    crate::media::youtube_subtitles::Captions,
+                >(value["captions"].clone())
+                {
+                    if !captions.cues.is_empty() {
+                        return Ok(Some(captions));
+                    }
+                }
+            }
+        }
+    }
+    selective_lease(db, job).await?;
+    let mut captions = match crate::media::youtube_subtitles::fetch(
+        config,
+        db,
+        job.task_id,
+        &profile.target_lang,
+        &profile.youtube_subtitle_mode,
+    )
+    .await
+    {
+        Ok(value) => value,
+        Err(_) => {
+            tracing::warn!(job_id=%job.id,"YouTube caption probe/download failed; falling back to ASR");
+            None
+        }
+    };
+    selective_lease(db, job).await?;
+    if let Some(ref mut picked) = captions {
+        let path = registry.resolve_existing(&raw).await?;
+        let probe = probe_video(&config.ffprobe_binary, &path).await?;
+        let duration = probe
+            .pointer("/format/duration")
+            .and_then(Value::as_str)
+            .and_then(|s| s.parse::<f64>().ok())
+            .filter(|d| d.is_finite() && *d > 0.0 && *d <= 48.0 * 3600.0)
+            .ok_or_else(|| AppError::Invalid("source duration invalid".into()))?;
+        let end = (duration * 1000.0) as u64;
+        picked
+            .cues
+            .retain(|c| c.start_ms < end && c.end_ms > c.start_ms && !c.text.trim().is_empty());
+        for cue in &mut picked.cues {
+            cue.end_ms = cue.end_ms.min(end);
+        }
+        if picked.cues.is_empty() || crate::subtitles::validate(&picked.cues).is_err() {
+            tracing::warn!(job_id=%job.id,"YouTube caption timeline unusable; falling back to ASR");
+            captions = None;
+        }
+    }
+    if let Some(ref captions) = captions {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).await?;
+        }
+        atomic_write(
+            &path,
+            &serde_json::to_vec(&json!({"fingerprint":identity,"captions":captions}))
+                .map_err(|_| AppError::Invalid("caption checkpoint encode failed".into()))?,
+        )
+        .await?;
+    }
+    Ok(captions)
+}
+pub(crate) async fn process(
+    config: &Config,
+    db: &Database,
+    registry: &AssetRegistry,
+    job: &WorkItem,
+    preferred: Option<crate::media::youtube_subtitles::Captions>,
 ) -> AppResult<Value> {
     let selective: Option<Value> = sqlx::query_scalar(
         "SELECT configuration->'selective_retranslate' FROM vr2_workflows WHERE id=$1",
@@ -1200,7 +1314,7 @@ pub async fn process(
                 .iter()
                 .any(|s| s.get("codec_type").and_then(Value::as_str) == Some("audio"))
         });
-    if !audio_present {
+    if !audio_present && preferred.is_none() {
         return Ok(json!({"no_speech":true,"reason":"no_audio_stream"}));
     }
     let duration = probe
@@ -1214,6 +1328,12 @@ pub async fn process(
         ));
     }
     let mut profile = settings(db, job).await?;
+    let youtube_info = preferred.as_ref().map(|p| p.selection.clone());
+    if youtube_info.as_ref().is_some_and(|s| s.reason == "target") {
+        profile.translate_enabled = false;
+        profile.bilingual = false;
+    }
+
     if let Some(local) = config.local_asr.as_ref() {
         // The job/profile keeps precedence; saved ASR default is used for auto.
         if profile.asr_language == "auto" {
@@ -1275,97 +1395,113 @@ pub async fn process(
     let stride = window - overlap;
     let count = (duration / stride).ceil() as usize;
     let mut cues = Vec::new();
-    for index in 0..count {
-        let start = index as f64 * stride;
-        if start >= duration {
-            break;
+    if let Some(captions) = preferred {
+        cues = captions.cues;
+        let end = (duration * 1000.) as u64;
+        cues.retain(|c| c.start_ms < end && c.end_ms > c.start_ms && !c.text.trim().is_empty());
+        for cue in &mut cues {
+            cue.end_ms = cue.end_ms.min(end);
         }
-        let seconds = (duration - start).min(window);
-        let offset_ms = (start * 1000.0).round() as u64;
-        let checkpoint = workspace.join(format!("asr-{index:05}.json"));
-        let cached = fs::read(&checkpoint)
-            .await
-            .ok()
-            .and_then(|raw| serde_json::from_slice::<Checkpoint>(&raw).ok())
-            .filter(|row| {
-                row.revision == 2 && row.offset_ms == offset_ms && row.fingerprint == asr_identity
-            });
-        let rows = if let Some(cached) = cached {
-            cached.cues
-        } else {
-            let flac = workspace.join(format!(
-                "audio-{index:05}.{}",
-                if config.cloudflare_asr { "wav" } else { "flac" }
+        if cues.is_empty() {
+            return Err(AppError::Invalid(
+                "downloaded captions outside source duration".into(),
             ));
-            convert_audio(config, &video, &flac, start, seconds).await?;
-            let mut result = None;
-            for attempt in 0..3 {
+        }
+    } else {
+        for index in 0..count {
+            let start = index as f64 * stride;
+            if start >= duration {
+                break;
+            }
+            let seconds = (duration - start).min(window);
+            let offset_ms = (start * 1000.0).round() as u64;
+            let checkpoint = workspace.join(format!("asr-{index:05}.json"));
+            let cached = fs::read(&checkpoint)
+                .await
+                .ok()
+                .and_then(|raw| serde_json::from_slice::<Checkpoint>(&raw).ok())
+                .filter(|row| {
+                    row.revision == 2
+                        && row.offset_ms == offset_ms
+                        && row.fingerprint == asr_identity
+                });
+            let rows = if let Some(cached) = cached {
+                cached.cues
+            } else {
+                let flac = workspace.join(format!(
+                    "audio-{index:05}.{}",
+                    if config.cloudflare_asr { "wav" } else { "flac" }
+                ));
+                convert_audio(config, &video, &flac, start, seconds).await?;
+                let mut result = None;
+                for attempt in 0..3 {
+                    if config.cloudflare_asr {
+                        selective_lease(db, job).await?;
+                    }
+                    match run_asr(
+                        db,
+                        job,
+                        &client,
+                        config,
+                        &flac,
+                        &profile.asr_language,
+                        seconds,
+                    )
+                    .await
+                    {
+                        Ok(resp) => {
+                            result = Some(resp);
+                            break;
+                        }
+                        Err(err)
+                            if config.cloudflare_asr
+                                && matches!(err, AppError::Invalid(_) | AppError::Conflict(_)) =>
+                        {
+                            return Err(err);
+                        }
+                        Err(err)
+                            if config.cloudflare_asr
+                                && matches!(&err,AppError::Unavailable(msg) if ["HTTP 400","HTTP 401","HTTP 403","HTTP 404","HTTP 413"].iter().any(|code|msg.contains(code))) =>
+                        {
+                            return Err(err);
+                        }
+                        Err(err) if attempt < 2 => {
+                            tracing::warn!(chunk=index,attempt,error=%err,"ASR chunk retry");
+                            sleep(Duration::from_secs(2_u64.pow(attempt))).await;
+                        }
+                        Err(err) => return Err(err),
+                    }
+                }
+                let _ = fs::remove_file(&flac).await;
+                let keep_after = if index == 0 {
+                    0
+                } else {
+                    offset_ms + (overlap * 500.0) as u64
+                };
+                let result = normalize_asr(
+                    result.ok_or_else(|| AppError::Unavailable("ASR returned no result".into()))?,
+                    offset_ms,
+                    keep_after,
+                    (duration * 1000.0) as u64,
+                )?;
                 if config.cloudflare_asr {
                     selective_lease(db, job).await?;
                 }
-                match run_asr(
-                    db,
-                    job,
-                    &client,
-                    config,
-                    &flac,
-                    &profile.asr_language,
-                    seconds,
+                atomic_write(
+                    &checkpoint,
+                    &serde_json::to_vec(&Checkpoint {
+                        revision: 2,
+                        fingerprint: asr_identity.clone(),
+                        offset_ms,
+                        cues: result.clone(),
+                    })
+                    .map_err(|_| AppError::Invalid("ASR checkpoint encode failed".into()))?,
                 )
-                .await
-                {
-                    Ok(resp) => {
-                        result = Some(resp);
-                        break;
-                    }
-                    Err(err)
-                        if config.cloudflare_asr
-                            && matches!(err, AppError::Invalid(_) | AppError::Conflict(_)) =>
-                    {
-                        return Err(err);
-                    }
-                    Err(err)
-                        if config.cloudflare_asr
-                            && matches!(&err,AppError::Unavailable(msg) if ["HTTP 400","HTTP 401","HTTP 403","HTTP 404","HTTP 413"].iter().any(|code|msg.contains(code))) =>
-                    {
-                        return Err(err);
-                    }
-                    Err(err) if attempt < 2 => {
-                        tracing::warn!(chunk=index,attempt,error=%err,"ASR chunk retry");
-                        sleep(Duration::from_secs(2_u64.pow(attempt))).await;
-                    }
-                    Err(err) => return Err(err),
-                }
-            }
-            let _ = fs::remove_file(&flac).await;
-            let keep_after = if index == 0 {
-                0
-            } else {
-                offset_ms + (overlap * 500.0) as u64
+                .await?;
+                result
             };
-            let result = normalize_asr(
-                result.ok_or_else(|| AppError::Unavailable("ASR returned no result".into()))?,
-                offset_ms,
-                keep_after,
-                (duration * 1000.0) as u64,
-            )?;
-            if config.cloudflare_asr {
-                selective_lease(db, job).await?;
-            }
-            atomic_write(
-                &checkpoint,
-                &serde_json::to_vec(&Checkpoint {
-                    revision: 2,
-                    fingerprint: asr_identity.clone(),
-                    offset_ms,
-                    cues: result.clone(),
-                })
-                .map_err(|_| AppError::Invalid("ASR checkpoint encode failed".into()))?,
-            )
-            .await?;
-            result
-        };
-        cues.extend(rows);
+            cues.extend(rows);
+        }
     }
     cues.sort_by_key(|cue| cue.start_ms);
     cues.dedup_by(|a, b| {
@@ -1726,7 +1862,7 @@ pub async fn process(
     let ass = to_ass(&cues, 1920, 1080, "Arial", 48, profile.bilingual)?;
     let metadata = serde_json::to_vec(&json!({
         "source":original,"translated":cues,
-        "model":config.asr_model,"translation":profile.translate_enabled,
+        "model":config.asr_model,"translation":profile.translate_enabled,"youtube_subtitle":youtube_info,
         "rag_evidence_ids":research.evidence_ids,"rag_digest":research.digest,
         "translation_scenes":translation_scenes,"translation_quality_issues":translation_quality,"context_memory":rolling_memory,"running_summary":rolling_summary
     }))
@@ -1750,7 +1886,7 @@ pub async fn process(
         ensure_task_asset(db, registry, job.task_id, job, kind, key).await?;
     }
     Ok(json!({"no_speech":false,"cues":cues.len(),
-        "srt_key":srt_key,"ass_key":ass_key,"segments_key":segments_key}))
+        "srt_key":srt_key,"ass_key":ass_key,"segments_key":segments_key,"youtube_subtitle":youtube_info}))
 }
 
 #[cfg(test)]
