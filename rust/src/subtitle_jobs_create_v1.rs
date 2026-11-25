@@ -131,19 +131,43 @@ fn config(request: &Value) -> AppResult<(Uuid, String, Value)> {
     if let Some(after) = optional_object(map, "after_render")? {
         allowed(
             after,
-            &["publish", "publish_payload", "payload"],
+            &["publish", "publish_payload", "payload", "runtime_profile"],
             "after_render",
         )?;
-        if after
-            .get("publish")
-            .is_some_and(|v| v.as_bool() != Some(false))
-            || after
-                .get("publish_payload")
-                .or_else(|| after.get("payload"))
-                .is_some_and(|v| !v.is_null() && v.as_object().is_none_or(|o| !o.is_empty()))
-        {
+        for k in ["publish", "runtime_profile"] {
+            if after.get(k).is_some_and(|v| !v.is_boolean()) {
+                return Err(invalid("after_render flags must be boolean"));
+            }
+        }
+        let a = after.get("publish_payload").filter(|v| !v.is_null());
+        let b = after.get("payload").filter(|v| !v.is_null());
+        if a.is_some() && b.is_some() && a != b {
+            return Err(invalid("conflicting after_render payload aliases"));
+        }
+        let payload = a
+            .or(b)
+            .filter(|v| v.as_object().is_none_or(|o| !o.is_empty()));
+        if after.get("publish").and_then(Value::as_bool) == Some(true) {
+            if selective.is_some() {
+                return Err(invalid(
+                    "selective retranslation cannot automatically publish",
+                ));
+            }
+            if let Some(payload) = payload {
+                if after.get("runtime_profile").and_then(Value::as_bool) == Some(true) {
+                    return Err(invalid(
+                        "explicit after_render payload and runtime profile are mutually exclusive",
+                    ));
+                }
+                crate::social_publish::validate_after_render(payload.clone())?;
+            } else if after.get("runtime_profile").and_then(Value::as_bool) != Some(true) {
+                return Err(invalid(
+                    "after_render publish requires explicit payload or runtime_profile=true",
+                ));
+            }
+        } else if payload.is_some() {
             return Err(invalid(
-                "explicit after_render publication requires native payload binding",
+                "disabled after_render cannot carry a publication payload",
             ));
         }
     }
@@ -425,6 +449,48 @@ async fn create(
             .remove("auto_publish_platforms");
     } else {
         config["auto_dub_p2"] = json!(false);
+    }
+    if request["after_render"]["publish"].as_bool() == Some(true) {
+        if let Some(payload) = request["after_render"]
+            .get("publish_payload")
+            .filter(|v| !v.is_null())
+            .or_else(|| {
+                request["after_render"]
+                    .get("payload")
+                    .filter(|v| !v.is_null())
+            })
+            .filter(|v| v.as_object().is_some_and(|o| !o.is_empty()))
+        {
+            if !crate::social_publish::mixed_enabled() {
+                return Err(AppError::Conflict(
+                    "explicit after_render requires native-only publication batch mode".into(),
+                ));
+            }
+            if automatic {
+                return Err(invalid(
+                    "explicit after_render payload requires runtime_profile=false",
+                ));
+            }
+            config["after_render_input"] = json!(
+                crate::subtitle_resume_v1::asset_digest(
+                    &state.db,
+                    &state.storage,
+                    task_id,
+                    "video_raw",
+                    &key
+                )
+                .await?
+            );
+            config["after_render_publish"] =
+                crate::social_publish::validate_after_render(payload.clone())?;
+            config["auto_publish"] = json!(true);
+            config["auto_publish_platforms"] = config["after_render_publish"]["platforms"].clone();
+            config["auto_dub_p2"] = json!(false);
+        } else if !automatic {
+            return Err(invalid(
+                "after_render runtime profile requires automatic subtitle execution",
+            ));
+        }
     }
     let resume = request["resume"].as_bool() == Some(true);
     if resume {

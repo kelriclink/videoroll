@@ -29,7 +29,7 @@ pub(crate) struct Plan {
 fn conflict(s: &str) -> AppError {
     AppError::Conflict(s.into())
 }
-async fn asset_digest(
+pub(crate) async fn asset_digest(
     db: &Database,
     registry: &AssetRegistry,
     task: Uuid,

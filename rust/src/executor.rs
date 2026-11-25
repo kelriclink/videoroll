@@ -134,6 +134,7 @@ impl Executor {
                 Ok(StageOutcome::Completed { result })
             }
             Stage::Subtitle => {
+                crate::social_publish::explicit_input(&self.db,&self.registry,item.task_id,item.workflow_id).await?;
                 // Selective retranslation uses preserved aligned source cues
                 // and must execute natively even when the configured ASR
                 // engine itself is delegated to an external worker.
@@ -197,6 +198,11 @@ impl Executor {
                 }
             }
             Stage::Publish => {
+                let explicit:Option<serde_json::Value>=sqlx::query_scalar("SELECT configuration->'after_render_publish' FROM vr2_workflows WHERE id=$1").bind(item.workflow_id).fetch_one(&self.db.pool).await?;
+                if let Some(payload)=explicit{
+                    let state=crate::api::AppState{config:self.config.clone(),db:self.db.clone(),scheduler:self.scheduler.clone(),storage:self.registry.clone()};
+                    return crate::social_publish::explicit_after_render(&state,item,payload).await;
+                }
                 let choice = crate::publish_legacy::read_selection(&self.db, item).await?;
                 if !choice.enabled || choice.platforms.is_empty() {
                     return Ok(StageOutcome::Skipped {

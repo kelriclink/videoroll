@@ -809,7 +809,7 @@ async fn admit_batch(
     if !has_bili {
         batch_platforms(&input)?;
     }
-    if platforms.len() < if has_bili { 2 } else { 1 }
+    if platforms.len() < if has_bili && parent.is_none() { 2 } else { 1 }
         || platforms.len() > 4
         || input.skip_review
         || input.force_retry
@@ -1048,6 +1048,224 @@ async fn admit_batch(
         .ok_or_else(|| AppError::Conflict("mixed admission missing batch".into()))?;
     tx.commit().await?;
     Ok(result)
+}
+
+/// Freeze the original explicit after_render request. Unlike automatic
+/// profile selection, missing/invalid targets are never silently expanded.
+pub(crate) fn validate_after_render(raw: Value) -> AppResult<Value> {
+    let mut input: PublishAllRequest = serde_json::from_value(raw)
+        .map_err(|_| AppError::Invalid("invalid after_render PublishAllRequest".into()))?;
+    let platforms = input
+        .platforms
+        .as_ref()
+        .ok_or_else(|| AppError::Invalid("explicit after_render platforms required".into()))?;
+    if platforms.is_empty()
+        || platforms.len() > 4
+        || input.skip_review
+        || input.force_retry
+        || input.fresh_batch
+        || input.video_parts.as_ref().is_some_and(|v| !v.is_empty())
+    {
+        return Err(AppError::Invalid("after_render requires explicit targets without bypass, forced retry, fresh batch or preselected P2".into()));
+    }
+    input.video_parts = None;
+    let mut unique = HashSet::new();
+    for p in platforms {
+        if p != "bilibili" {
+            platform(p)?;
+        }
+        if !unique.insert(p.as_str()) {
+            return Err(AppError::Invalid("duplicate after_render platform".into()));
+        }
+        let account = input.account_ids.get(p).or(input.account_id.as_ref());
+        if let Some(a) = account {
+            Uuid::parse_str(a)
+                .map_err(|_| AppError::Invalid("invalid after_render account UUID".into()))?;
+        }
+        if p != "bilibili" && account.is_none() {
+            return Err(AppError::Invalid(
+                "explicit SAU account required for after_render".into(),
+            ));
+        }
+        if let Some(meta) = input.platform_meta.get(p).or(input.meta.as_ref()) {
+            if p == "bilibili" {
+                crate::publish_meta::normalized(meta.clone())?;
+            } else {
+                crate::sau_publish_native_v1::normalize_meta(meta, p)?;
+            }
+        } else if p != "bilibili" {
+            return Err(AppError::Invalid(
+                "explicit SAU metadata required for after_render".into(),
+            ));
+        }
+    }
+    for k in input
+        .account_ids
+        .keys()
+        .chain(input.platform_meta.keys())
+        .chain(input.platform_options.keys())
+    {
+        if !unique.contains(k.as_str()) {
+            return Err(AppError::Invalid(
+                "after_render settings for unrequested platform".into(),
+            ));
+        }
+    }
+    if !platforms.iter().any(|v| v == "bilibili") && input.typeid_mode.is_some() {
+        return Err(AppError::Invalid("typeid_mode requires Bilibili".into()));
+    }
+    if let Some(mode) = input.typeid_mode.as_deref() {
+        if !matches!(mode, "meta" | "bilibili_predict" | "ai_summary") {
+            return Err(AppError::Invalid(
+                "unsupported after_render typeid_mode".into(),
+            ));
+        }
+    }
+    for options in input.platform_options.values() {
+        if !options.is_object() || serde_json::to_vec(options).map_or(true, |v| v.len() > 16384) {
+            return Err(AppError::Invalid(
+                "invalid after_render platform options".into(),
+            ));
+        }
+    }
+    if input.video_key.as_deref() == Some("") {
+        input.video_key = None;
+    }
+    if input.cover_key.as_deref() == Some("") {
+        input.cover_key = None;
+    }
+    for key in input.video_key.iter().chain(input.cover_key.iter()) {
+        AssetRegistry::checked_key(key)?;
+    }
+    serde_json::to_value(input)
+        .map_err(|_| AppError::Invalid("after_render payload encode failed".into()))
+}
+/// Pin the original input separately from the output publication request.
+pub(crate) async fn explicit_input(
+    db: &Database,
+    registry: &AssetRegistry,
+    task: Uuid,
+    flow: Uuid,
+) -> AppResult<Option<String>> {
+    let config: Value =
+        sqlx::query_scalar("SELECT configuration FROM vr2_workflows WHERE id=$1 AND task_id=$2")
+            .bind(flow)
+            .bind(task)
+            .fetch_one(&db.pool)
+            .await?;
+    if config.get("after_render_publish").is_none() {
+        return Ok(None);
+    }
+    let pinned: crate::subtitle_resume_v1::Artifact =
+        serde_json::from_value(config["after_render_input"].clone()).map_err(|_| {
+            AppError::Conflict("explicit publication missing original input digest".into())
+        })?;
+    let current = crate::media::ffmpeg::latest_asset_key(db, task, "video_raw").await?;
+    if current.as_deref() != Some(pinned.key.as_str())
+        || crate::subtitle_resume_v1::asset_digest(db, registry, task, "video_raw", &pinned.key)
+            .await?
+            != pinned
+    {
+        return Err(AppError::Conflict(
+            "explicit after_render original video changed".into(),
+        ));
+    }
+    Ok(Some(pinned.key))
+}
+pub(crate) async fn explicit_render_inputs(
+    db: &Database,
+    registry: &AssetRegistry,
+    task: Uuid,
+    flow: Uuid,
+) -> AppResult<Option<(String, Option<String>, Option<String>)>> {
+    let Some(raw) = explicit_input(db, registry, task, flow).await? else {
+        return Ok(None);
+    };
+    let row=sqlx::query("SELECT id,result FROM vr2_jobs WHERE workflow_id=$1 AND task_id=$2 AND stage='subtitle' AND state='succeeded'").bind(flow).bind(task).fetch_optional(&db.pool).await?.ok_or_else(||AppError::Conflict("explicit publication render lacks current subtitle receipt".into()))?;
+    let job: Uuid = row.try_get("id")?;
+    let result: Value = row.try_get("result")?;
+    if result["no_speech"].as_bool() == Some(true) {
+        return Ok(Some((raw, None, None)));
+    }
+    let ass = format!("v2/sub/{task}/{job}/subtitle.ass");
+    let srt = format!("v2/sub/{task}/{job}/subtitle.srt");
+    if result["ass_key"].as_str() != Some(ass.as_str())
+        || result["srt_key"].as_str() != Some(srt.as_str())
+    {
+        return Err(AppError::Conflict(
+            "explicit publication requires this generation's subtitle assets".into(),
+        ));
+    }
+    crate::subtitle_resume_v1::asset_digest(db, registry, task, "subtitle_ass", &ass).await?;
+    crate::subtitle_resume_v1::asset_digest(db, registry, task, "subtitle_srt", &srt).await?;
+    Ok(Some((raw, Some(ass), Some(srt))))
+}
+pub(crate) async fn explicit_after_render(
+    state: &AppState,
+    item: &crate::domain::WorkItem,
+    raw: Value,
+) -> AppResult<crate::domain::StageOutcome> {
+    explicit_input(&state.db, &state.storage, item.task_id, item.workflow_id)
+        .await?
+        .ok_or_else(|| AppError::Conflict("explicit publication input missing".into()))?;
+    let mut input: PublishAllRequest = serde_json::from_value(validate_after_render(raw)?)
+        .map_err(|_| AppError::Invalid("invalid stored after_render payload".into()))?;
+    let receipt:Option<Value>=sqlx::query_scalar("SELECT result FROM vr2_jobs WHERE workflow_id=$1 AND task_id=$2 AND generation=$3 AND stage='render' AND state='succeeded'").bind(item.workflow_id).bind(item.task_id).bind(item.generation).fetch_optional(&state.db.pool).await?.flatten();
+    let receipt = receipt.ok_or_else(|| {
+        AppError::Conflict(
+            "after_render requires this generation's successful render receipt".into(),
+        )
+    })?;
+    let key = receipt["storage_key"]
+        .as_str()
+        .ok_or_else(|| AppError::Conflict("render receipt missing storage key".into()))?;
+    if receipt["reused"].as_bool() == Some(true)
+        || input.video_key.as_deref().is_some_and(|v| v != key)
+    {
+        return Err(AppError::Conflict(
+            "after_render video must match this generation's render receipt".into(),
+        ));
+    }
+    let key = asset_key(&state.db, item.task_id, "video_final", Some(key)).await?;
+    let (sha, size) = state.storage.sha256(&key).await?;
+    // Local render results include SHA/size; remote results name the
+    // original execution and uploaded asset. Validate that exact receipt.
+    if receipt["remote_completed"].as_bool() == Some(true) {
+        let execution = receipt["remote_execution_id"]
+            .as_str()
+            .and_then(|v| Uuid::parse_str(v).ok())
+            .ok_or_else(|| AppError::Conflict("remote render execution missing".into()))?;
+        let asset = receipt["asset_id"]
+            .as_str()
+            .and_then(|v| Uuid::parse_str(v).ok())
+            .ok_or_else(|| AppError::Conflict("remote render asset receipt missing".into()))?;
+        let exact:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM render_executions e JOIN assets a ON a.id=$2 JOIN vr2_jobs j ON j.id=e.job_id WHERE e.id=$1 AND e.task_id=$3 AND e.workflow_id=$4 AND e.runtime_engine='rust-v2' AND e.state='completed' AND j.stage='render' AND j.state='succeeded' AND j.result=$5 AND e.output_json=$5 AND a.task_id=$3 AND a.kind='video_final' AND a.storage_key=$6 AND a.sha256=$7 AND a.size_bytes=$8)").bind(execution).bind(asset).bind(item.task_id).bind(item.workflow_id).bind(&receipt).bind(&key).bind(&sha).bind(size).fetch_one(&state.db.pool).await?;
+        if !exact {
+            return Err(AppError::Conflict(
+                "remote render receipt or asset digest mismatch".into(),
+            ));
+        }
+    } else if receipt["sha256"].as_str() != Some(sha.as_str())
+        || receipt["size_bytes"].as_i64() != Some(size)
+    {
+        return Err(AppError::Conflict(
+            "after_render receipt media digest mismatch".into(),
+        ));
+    }
+    let owned:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM assets a JOIN storage_objects o ON o.storage_key=a.storage_key JOIN storage_object_refs r ON r.storage_key=a.storage_key WHERE a.task_id=$1 AND a.kind='video_final' AND a.storage_key=$2 AND a.sha256=$3 AND a.size_bytes=$4 AND o.state='live' AND o.checksum_sha256=$3 AND o.size_bytes=$4 AND r.owner_type='workflow' AND r.owner_id=$5 AND r.role='video_final')").bind(item.task_id).bind(&key).bind(&sha).bind(size).bind(item.workflow_id).fetch_one(&state.db.pool).await?;
+    if !owned {
+        return Err(AppError::Conflict(
+            "after_render rendered asset ownership mismatch".into(),
+        ));
+    }
+    input.video_key = Some(key);
+    let result = admit_batch(state, item.task_id, input, Some(item)).await?;
+    let batch = result["batch_id"]
+        .as_str()
+        .ok_or_else(|| AppError::Conflict("after_render batch receipt missing".into()))?;
+    Ok(crate::domain::StageOutcome::Awaiting {
+        ticket: format!("native-batch:{batch}"),
+    })
 }
 
 /// Runtime selection follows the original auto box. All target parameters
