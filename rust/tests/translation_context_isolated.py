@@ -16,13 +16,15 @@ def setting(k,v):
 source=["First 10 volts.","Second 20 volts.","Third line.","Fourth line.","Fifth line."]
 starts=[.2,1.2,2.2,7.2,8.2]
 target=["10伏","10伏","第三句","第四句","第五句"]
-observed=[];errors=[]
+observed=[];errors=[];asr_calls=[];failed_once=False
 class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
+        global failed_once
         try:
             body=self.rfile.read(int(self.headers["Content-Length"]))
             if self.path=="/v1/audio/transcriptions":
                 assert b"whisper-fixture" in body and b"fLaC" in body
+                asr_calls.append(True)
                 out={"segments":[{"start":s,"end":s+.6,"text":t} for s,t in zip(starts,source)]}
             elif self.path=="/v1/chat/completions":
                 assert self.headers["Authorization"]=="Bearer fixture-translation-key"
@@ -30,7 +32,14 @@ class Handler(BaseHTTPRequestHandler):
                 lines=json.loads(data["messages"][-1]["content"])
                 context=json.loads(next(m["content"].split("instructions: ",1)[1] for m in data["messages"] if m["content"].startswith("Untrusted batch context")))
                 observed.append((lines,context))
-                out={"choices":[{"message":{"content":json.dumps({"items":[{"i":v["i"],"text":target[source.index(v["source"])]} for v in lines]},ensure_ascii=False)}}]}
+                result={"items":[{"i":v["i"],"text":target[source.index(v["source"])]} for v in lines]}
+                if lines[0]["source"]==source[0]:
+                    result["updated_summary"]="Electrical measurements."
+                    result["context_update"]={"topic":"electronics","terminology":[{"source":"volts","target":"伏"},{"source":"invented capacitor","target":"电容"}],"characters":[{"name":"Unseen person","target_name":"无关人物"}],"ambiguities":[{"term":"volts","resolution":"voltage unit"}],"scene_summary":"Voltage measurements"}
+                if lines[0]["source"]==source[2] and not failed_once:
+                    failed_once=True
+                    result={"items":[],"updated_summary":"DO NOT LEARN","context_update":{"topic":"INVALID FAILED BATCH"}}
+                out={"choices":[{"message":{"content":json.dumps(result,ensure_ascii=False)}}]}
             else:raise AssertionError(self.path)
             raw=json.dumps(out).encode();self.send_response(200);self.send_header("Content-Type","application/json");self.send_header("Content-Length",str(len(raw)));self.end_headers();self.wfile.write(raw)
         except Exception as e:
@@ -40,7 +49,7 @@ server=ThreadingHTTPServer(("127.0.0.1",0),Handler)
 threading.Thread(target=server.serve_forever,daemon=True).start()
 base=f"http://127.0.0.1:{server.server_address[1]}"
 setting("subtitle.auto_profile",{"translate_enabled":True,"translate_provider":"openai","translate_model_provider_id":"legacy","target_lang":"zh","bilingual":False,"auto_publish":False,"auto_publish_platforms":[],"auto_dub_p2":False,"burn_in":False})
-setting("subtitle.translate",{"default_batch_size":2,"rag_enabled":False,"rag_domain":"electronics","openai":{"base_url":base+"/v1","model":"fixture-translation","api_key_enc":"dbplain:v1:fixture-translation-key"}})
+setting("subtitle.translate",{"default_batch_size":2,"default_enable_summary":True,"rag_enabled":False,"rag_domain":"electronics","openai":{"base_url":base+"/v1","model":"fixture-translation","api_key_enc":"dbplain:v1:fixture-translation-key"}})
 setting("subtitle.rag",{"enabled":False})
 setting("youtube.settings",{"home_scan_enabled":False})
 env={k:v for k,v in os.environ.items() if k in ("PATH","HOME","LANG","LC_ALL","LD_LIBRARY_PATH","DATABASE_URL","VIDEOROLL_V2_STORAGE_ROOT","VIDEOROLL_V2_INTERNAL_TOKEN","INTERNAL_API_SECRET")}
@@ -56,6 +65,7 @@ with db() as c:
     for ident,t,s,translated,lang,domain,status in [
         (mid(source[0]),task,source[0],"reviewed-same-task","zh","electronics","approved"),
         (uuid.uuid4(),other,source[0],"approved-global","zh","electronics","approved"),
+        (uuid.uuid4(),other,"Fourth lines.","approved-fuzzy","zh","electronics","approved"),
         (uuid.uuid4(),other,source[1],"private-other-task","zh","electronics","machine"),
         (uuid.uuid4(),other,source[1],"wrong-domain","zh","medical","approved"),
         (uuid.uuid4(),other,source[1],"wrong-language","ja","electronics","approved")]:
@@ -68,17 +78,30 @@ try:
     deadline=time.monotonic()+90
     while time.monotonic()<deadline:
         assert worker.poll() is None,log.read_text()
-        with db() as c:row=c.execute("SELECT status,last_error FROM operation_inbox WHERE task_id=%s AND runtime_engine='rust-v2' AND stage='subtitle'",(task,)).fetchone()
+        with db() as c:
+            row=c.execute("SELECT status,last_error,attempt_count FROM operation_inbox WHERE task_id=%s AND runtime_engine='rust-v2' AND stage='subtitle'",(task,)).fetchone()
+            if row and row[0]=="pending" and row[1] and failed_once:
+                # Only accelerate the isolated fixture's retry deadline.
+                c.execute("UPDATE operation_inbox SET available_at=now() WHERE task_id=%s AND runtime_engine='rust-v2' AND stage='subtitle' AND status='pending'",(task,))
         assert not errors,errors
         assert row and row[0] not in ("failed","unknown","canceled"),(row,log.read_text()[-3000:])
         if row[0] in ("completed","succeeded"):break
         time.sleep(.3)
     else:raise AssertionError(log.read_text()[-3000:])
-    assert [len(x[0]) for x in observed]==[2,1,2],observed
+    assert [len(x[0]) for x in observed]==[2,1,1,2],observed
+    assert failed_once and row[2]==2 and len(asr_calls)==1,(row,asr_calls)
     examples=observed[0][1]["translation_examples"]
-    assert {e["target"] for e in examples}=={"reviewed-same-task","approved-global"},examples
+    assert {"reviewed-same-task","approved-global"}<={e["target"] for e in examples},examples
     assert observed[1][1]["context"]["previous_source"][-1]["translation"]=="10伏"
-    assert observed[2][1]["context"]["scene"]["scene_id"]==2
+    assert observed[1][1]==observed[2][1],"retry lost checkpoint context"
+    assert observed[3][1]["context"]["scene"]["scene_id"]==2
+    for i in (1,2,3):
+        ctx=observed[i][1]["context"]
+        assert ctx["running_summary"]=="Electrical measurements.",ctx
+        assert ctx["memory"]["terminology"]==[{"source":"volts","target":"伏","meaning":""}],ctx
+        assert ctx["memory"]["characters"]==[],ctx
+    assert any(e["target"]=="approved-fuzzy" and 0.78<=e["similarity"]<1 and e["scope"]=="approved_global" for e in observed[3][1]["translation_examples"]),observed[3]
+    assert "INVALID FAILED BATCH" not in json.dumps(observed) and "DO NOT LEARN" not in json.dumps(observed)
     assert all(x not in json.dumps(observed) for x in ("private-other-task","wrong-domain","wrong-language"))
     with db() as c:
         assert c.execute("SELECT target_text,status FROM translation_memory_entries WHERE id=%s",(mid(source[0]),)).fetchone()==("reviewed-same-task","approved")
@@ -90,7 +113,11 @@ try:
     assert meta["translation_scenes"]["scenes"]==[[0,3],[3,5]],meta
     assert meta["translation_scenes"]["batches"]==[[0,2],[2,3],[3,5]],meta
     assert {i["type"] for i in meta["translation_quality_issues"]}=={"number_mismatch","adjacent_duplicate_translation"},meta
-    print("PASS: native worker 3 scene-aware OpenAI batches, original UUIDv5 memory, approved same-task preservation, cross-task approved only, previous translations, quality warnings and original asset metadata",flush=True)
+    assert meta["running_summary"]=="Electrical measurements."
+    assert meta["context_memory"]["terminology"]==[{"source":"volts","target":"伏","meaning":""}]
+    assert meta["context_memory"]["ambiguities"]==[{"term":"volts","resolution":"voltage unit"}]
+    assert meta["context_memory"]["topic"]=="electronics"
+    print("PASS: native worker 3 scene-aware batches, injected invalid mapping retries from checkpoint, ASR/first batch not replayed, grounded rolling summary/memory restored, fuzzy approved recall, original UUIDv5 and isolation, quality warnings",flush=True)
 finally:
     worker.terminate()
     try:worker.wait(timeout=5)

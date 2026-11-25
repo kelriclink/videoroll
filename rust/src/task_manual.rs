@@ -96,7 +96,6 @@ pub(crate) fn subtitle_config(request: SubtitleAction) -> AppResult<Value> {
             .youtube_subtitle_mode
             .as_deref()
             .is_some_and(|s| s != "off")
-        || request.translate_enable_summary.is_some()
         || request.auto_publish == Some(true)
         || request.publish_payload.is_some()
     {
@@ -127,6 +126,11 @@ pub(crate) fn subtitle_config(request: SubtitleAction) -> AppResult<Value> {
         subtitle,
         "translate_batch_size",
         request.translate_batch_size
+    );
+    put!(
+        subtitle,
+        "translate_enable_summary",
+        request.translate_enable_summary
     );
     put!(subtitle, "asr_model", request.asr_model);
     put!(subtitle, "asr_language", request.asr_language);

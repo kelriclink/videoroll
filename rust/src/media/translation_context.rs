@@ -161,6 +161,49 @@ fn memory_id(task: Uuid, lang: &str, source: &str) -> Uuid {
     )
 }
 
+// Ratcliff/Obershelp matching blocks, like Python SequenceMatcher
+// (autojunk=False). Bounded fuzzy candidates; exact long matches remain valid.
+fn ratio(a: &str, b: &str) -> f64 {
+    if a == b {
+        return 1.;
+    }
+    let a: Vec<char> = a.chars().take(257).collect();
+    let b: Vec<char> = b.chars().take(257).collect();
+    if a.is_empty() || b.is_empty() || a.len() > 256 || b.len() > 256 {
+        return 0.;
+    }
+    let mut work = vec![(0, a.len(), 0, b.len())];
+    let mut matched = 0;
+    while let Some((al, ah, bl, bh)) = work.pop() {
+        let mut prev = vec![0usize; bh - bl + 1];
+        let mut best = (0, al, bl);
+        for i in al..ah {
+            let mut next = vec![0; bh - bl + 1];
+            for j in bl..bh {
+                if a[i] == b[j] {
+                    let n = prev[j - bl] + 1;
+                    next[j - bl + 1] = n;
+                    if n > best.0 {
+                        best = (n, i + 1 - n, j + 1 - n);
+                    }
+                }
+            }
+            prev = next;
+        }
+        let (n, i, j) = best;
+        if n == 0 {
+            continue;
+        }
+        matched += n;
+        if i > al && j > bl {
+            work.push((al, i, bl, j));
+        }
+        if i + n < ah && j + n < bh {
+            work.push((i + n, ah, j + n, bh));
+        }
+    }
+    2. * matched as f64 / (a.len() + b.len()) as f64
+}
 pub async fn recall(
     db: &Database,
     task: Uuid,
@@ -169,31 +212,201 @@ pub async fn recall(
     batch: &[SubtitleCue],
     start: usize,
 ) -> AppResult<Value> {
-    // Exact matches only in this first port. Bounded query, no global
-    // machine-generated examples; never trust recalled text as instructions.
-    let norms = batch
-        .iter()
-        .map(|s| norm(&s.text))
-        .filter(|s| !s.is_empty())
-        .collect::<Vec<_>>();
-    let rows=sqlx::query("SELECT source_text,source_norm,target_text,task_id=$1 AS same_task FROM translation_memory_entries WHERE target_lang=$2 AND source_norm=ANY($3) AND (task_id=$1 OR status='approved') AND (task_id=$1 OR $4='' OR domain='' OR domain=$4) ORDER BY (task_id=$1) DESC NULLS LAST,(status='approved') DESC,updated_at DESC,id LIMIT 400")
+    let norms = batch.iter().map(|s| norm(&s.text)).collect::<Vec<_>>();
+    // Exact candidates first, then original same-task/approved ranking.
+    // Limit CPU work even with long pathological texts.
+    let rows=sqlx::query("SELECT source_text,source_norm,target_text,task_id=$1 AS same_task FROM translation_memory_entries WHERE target_lang=$2 AND (task_id=$1 OR status='approved') AND (task_id=$1 OR $4='' OR domain='' OR domain=$4) ORDER BY (source_norm=ANY($3)) DESC,(task_id=$1) DESC NULLS LAST,(status='approved') DESC,updated_at DESC,id LIMIT 400")
         .bind(task).bind(take(lang,16)).bind(&norms).bind(take(domain,500)).fetch_all(&db.pool).await?;
-    let mut out = Vec::new();
-    for (i, cue) in batch.iter().enumerate() {
-        let n = norm(&cue.text);
-        for row in rows
-            .iter()
-            .filter(|r| r.get::<String, _>("source_norm") == n)
-            .take(2)
+    let candidates = rows
+        .iter()
+        .map(|r| {
+            (
+                r.get::<String, _>("source_text"),
+                r.get::<String, _>("source_norm"),
+                r.get::<String, _>("target_text"),
+                r.get::<Option<bool>, _>("same_task") == Some(true),
+            )
+        })
+        .collect::<Vec<_>>();
+    // CPU-heavy matching must not block Tokio's worker or lease heartbeat.
+    let ranked=tokio::task::spawn_blocking(move||{
+        let mut ranked=Vec::new();let mut budget=24_000_000usize;
+        for (i,n) in norms.iter().enumerate(){
+            if n.is_empty(){continue;}let len=n.chars().count();let mut local=Vec::new();
+            for (source,cn,target,same) in &candidates{
+                if cn.is_empty()||target.trim().is_empty(){continue;}
+                let threshold=if len<12{if *same{0.85}else{0.92}}else if *same{0.58}else{0.78};
+                let score=if cn==n{1.}else{
+                    let m=cn.chars().count();
+                    if len>256||m>256||2.*len.min(m) as f64/((len+m)as f64)<threshold{continue;}
+                    let cost=len*m;if cost>budget{continue;}budget-=cost;
+                    ratio(n,cn)
+                };
+                if score>=threshold{local.push((score,*same,source,target));}
+            }
+            local.sort_by(|a,b|b.0.total_cmp(&a.0).then_with(||b.1.cmp(&a.1)).then_with(||a.2.chars().count().cmp(&b.2.chars().count())));
+            for (score,same,source,target) in local.into_iter().take(2){
+                ranked.push((score,i,json!({"source":take(source,240),"target":take(target,240),"similarity":(score*10000.).round()/10000.,"scope":if same{"same_task"}else{"approved_global"},"applies_to_blocks":[start+i+1]})));
+            }
+        }
+        ranked.sort_by(|a,b|b.0.total_cmp(&a.0).then_with(||a.1.cmp(&b.1)));
+        let mut seen=std::collections::HashSet::new();
+        ranked.into_iter().filter(|(_,i,v)|seen.insert((*i,norm(v["source"].as_str().unwrap_or("")),v["target"].as_str().unwrap_or("").to_owned()))).take(6).map(|(_,_,v)|v).collect::<Vec<_>>()
+    }).await.map_err(|_|crate::AppError::Unavailable("translation memory matcher failed".into()))?;
+    Ok(json!(ranked))
+}
+
+// Model-provided context is untrusted reference data, never an instruction.
+// Only learn named records whose source spelling occurs in this batch.
+pub fn mentions(source: &str, needle: &str) -> bool {
+    let source = norm(source);
+    let needle = norm(needle);
+    if needle.is_empty() {
+        return false;
+    }
+    let ascii = needle
+        .as_bytes()
+        .first()
+        .is_some_and(u8::is_ascii_alphanumeric)
+        && needle
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"_.+- ".contains(&b));
+    source.match_indices(&needle).any(|(i, m)| {
+        !ascii
+            || (!source[..i]
+                .as_bytes()
+                .last()
+                .is_some_and(u8::is_ascii_alphanumeric)
+                && !source[i + m.len()..]
+                    .as_bytes()
+                    .first()
+                    .is_some_and(u8::is_ascii_alphanumeric))
+    })
+}
+fn field(v: &Value, k: &str, limit: usize) -> String {
+    take(&clean(v[k].as_str().unwrap_or("")), limit)
+}
+pub fn merge_context(base: &Value, update: &Value, batch: &[SubtitleCue], scene_id: u64) -> Value {
+    let mut out = if base.is_object() {
+        base.clone()
+    } else {
+        json!({"version":1,"topic":"","style_notes":"","characters":[],"terminology":[],"ambiguities":[]})
+    };
+    for k in ["topic", "style_notes"] {
+        let v = field(update, k, 500);
+        if !v.is_empty() {
+            out[k] = json!(v);
+        }
+    }
+    let grounded = |v: &str| batch.iter().any(|s| mentions(&s.text, v));
+    for (kind, key, limit) in [
+        ("characters", "name", 32),
+        ("terminology", "source", 64),
+        ("ambiguities", "term", 32),
+    ] {
+        let mut rows = out[kind].as_array().cloned().unwrap_or_default();
+        for raw in update[kind]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .take(limit * 2)
         {
-            out.push(json!({"source":take(&row.get::<String,_>("source_text"),240),"target":take(&row.get::<String,_>("target_text"),240),"similarity":1.0,"scope":if row.get::<Option<bool>,_>("same_task")==Some(true){"same_task"}else{"approved_global"},"applies_to_blocks":[start+i+1]}));
-            if out.len() == 6 {
-                return Ok(json!(out));
+            let name = field(raw, key, if kind == "characters" { 120 } else { 160 });
+            let aliases = raw["aliases"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(|v| take(&clean(v), 120))
+                .filter(|v| !v.is_empty())
+                .take(8)
+                .collect::<Vec<_>>();
+            if name.is_empty()
+                || !(grounded(&name)
+                    || (kind == "characters" && aliases.iter().any(|v| grounded(v))))
+            {
+                continue;
+            }
+            let row = match kind {
+                "characters" => {
+                    json!({"name":name,"target_name":field(raw,"target_name",120),"role":field(raw,"role",240),"notes":field(raw,"notes",500),"aliases":aliases})
+                }
+                "terminology" => {
+                    let target = field(raw, "target", 160);
+                    if target.is_empty() {
+                        continue;
+                    }
+                    json!({"source":name,"target":target,"meaning":field(raw,"meaning",500)})
+                }
+                _ => {
+                    let res = field(raw, "resolution", 500);
+                    if res.is_empty() {
+                        continue;
+                    }
+                    json!({"term":name,"resolution":res})
+                }
+            };
+            if let Some(old) = rows
+                .iter_mut()
+                .find(|v| norm(v[key].as_str().unwrap_or("")) == norm(&name))
+            {
+                if let Some(fields) = row.as_object() {
+                    for (k, v) in fields {
+                        if !v.is_null()
+                            && v.as_str() != Some("")
+                            && v.as_array().is_none_or(|x| !x.is_empty())
+                        {
+                            old[k] = v.clone();
+                        }
+                    }
+                }
+            } else if rows.len() < limit {
+                rows.push(row);
+            }
+        }
+        rows.truncate(limit);
+        out[kind] = json!(rows);
+    }
+    let summary = field(update, "scene_summary", 800);
+    let summary = if summary.is_empty() {
+        field(&update["recent_scene"], "summary", 800)
+    } else {
+        summary
+    };
+    if !summary.is_empty() {
+        out["recent_scene"] = json!({"scene_id":scene_id.max(1),"summary":summary});
+    }
+    out
+}
+pub fn bounded_context(memory: &Value) -> Value {
+    let mut v = memory.clone();
+    // Bound prompt independently from persisted memory. Prefer recent
+    // records, keeping complete JSON rather than truncating a JSON string.
+    for (key, n) in [("characters", 8), ("terminology", 16), ("ambiguities", 8)] {
+        if let Some(rows) = v[key].as_array_mut() {
+            if rows.len() > n {
+                rows.drain(..rows.len() - n);
             }
         }
     }
-    Ok(json!(out))
+    while v.to_string().len() > 12000 {
+        let mut removed = false;
+        for key in ["characters", "ambiguities", "terminology"] {
+            if let Some(rows) = v[key].as_array_mut() {
+                if !rows.is_empty() {
+                    rows.remove(0);
+                    removed = true;
+                    break;
+                }
+            }
+        }
+        if !removed {
+            break;
+        }
+    }
+    v
 }
+
 pub async fn remember(
     db: &Database,
     job: &WorkItem,
@@ -268,6 +481,31 @@ mod tests {
             text: text.into(),
             secondary_text: None,
         }
+    }
+    #[test]
+    fn fuzzy_and_grounded_memory() {
+        assert!((ratio("abcd", "abdc") - 0.75).abs() < 1e-8);
+        assert_eq!(ratio("abcd", "abcd"), 1.);
+        assert!(ratio("The resistor is red.", "The resistor is blue.") > 0.7);
+        assert!(!mentions("a transistor", "trans"));
+        assert!(mentions("A resistor.", "resistor"));
+        let batch = vec![cue(0, 1000, "Alice uses a resistor.")];
+        let m = merge_context(
+            &Value::Null,
+            &json!({"topic":"electronics","characters":[{"name":"Alice","target_name":"爱丽丝"},{"name":"Bob","target_name":"鲍勃"}],"terminology":[{"source":"resistor","target":"电阻"},{"source":"capacitor","target":"电容"}],"scene_summary":"testing"}),
+            &batch,
+            2,
+        );
+        assert_eq!(m["characters"].as_array().unwrap().len(), 1);
+        assert_eq!(m["terminology"].as_array().unwrap().len(), 1);
+        assert_eq!(m["recent_scene"]["scene_id"], 2);
+        let next = merge_context(
+            &m,
+            &json!({"characters":[{"name":"Alice","role":"engineer"}]}),
+            &batch,
+            2,
+        );
+        assert_eq!(next["characters"][0]["target_name"], "爱丽丝");
     }
     #[test]
     fn scene_pause_boundary_and_context() {
