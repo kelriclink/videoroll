@@ -107,6 +107,8 @@ pub struct RagConfig {
     pub research_model_id: Option<String>,
     pub max_research_steps: usize,
     pub max_web_searches: usize,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub wiki_enabled: bool,
     pub web_search_endpoint: Option<String>,
     pub web_search_api_key: Option<String>,
 }
@@ -124,6 +126,7 @@ impl Default for RagConfig {
             research_model_id: None,
             max_research_steps: 5,
             max_web_searches: 2,
+            wiki_enabled: false,
             web_search_endpoint: None,
             web_search_api_key: None,
         }
@@ -671,6 +674,9 @@ pub async fn prepare(
         if gate && legacy["rag_search_enabled"].as_bool() != Some(true) {
             settings.max_web_searches = 0;
         }
+        // The original opt-in is authoritative; a general web-search switch
+        // does not implicitly enable Wikipedia.
+        settings.wiki_enabled = gate && legacy["rag_wiki_enabled"].as_bool() == Some(true);
         let research_task = crate::agent::ResearchTask {
             job,
             settings: &settings,
