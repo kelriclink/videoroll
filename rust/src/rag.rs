@@ -591,7 +591,8 @@ pub async fn prepare(
     cues: &[crate::subtitles::SubtitleCue],
     target_lang: &str,
 ) -> AppResult<ResearchContext> {
-    let settings = rag_config(db).await?;
+    let mut settings = rag_config(db).await?;
+    let legacy = crate::settings::effective(db, "subtitle.translate").await?;
     let original = crate::rag_original_v1::settings(db).await?;
     if (!settings.enabled && !original.enabled) || cues.is_empty() {
         return Ok(ResearchContext {
@@ -658,14 +659,40 @@ pub async fn prepare(
     };
     hits.truncate(max_items.min(30));
     let prepared = prompt_from_hits(&hits, settings.max_context_chars);
-    if settings.enabled && settings.research_enabled {
+    let gate = original.enabled && legacy["rag_auto_discover_terms"].as_bool() == Some(true);
+    if gate || (settings.enabled && settings.research_enabled) {
+        // Explicit original discovery settings can activate the Rust
+        // researcher without requiring a separate native configuration.
+        if gate && settings.research_provider_id.is_none() {
+            settings.research_provider_id = Some("legacy".into());
+        }
+        // External search requires explicit original permission in gate mode.
+        // Keep the configured native provider; do not guess a remote endpoint.
+        if gate && legacy["rag_search_enabled"].as_bool() != Some(true) {
+            settings.max_web_searches = 0;
+        }
         let research_task = crate::agent::ResearchTask {
             job,
             settings: &settings,
             query: &query,
             evidence: &hits,
+            target_lang,
+            gate,
+            timeout_seconds: legacy["rag_agent_timeout_seconds"]
+                .as_f64()
+                .filter(|v| v.is_finite())
+                .unwrap_or(120.)
+                .clamp(10., 900.) as u64,
         };
-        return crate::agent::run(config, db, &research_task, cues, prepared).await;
+        return match crate::agent::run(config, db, &research_task, cues, prepared.clone()).await {
+            Ok(v) => Ok(v),
+            Err(e @ AppError::Conflict(_)) => Err(e),
+            Err(e) if settings.research_blocking => Err(e),
+            Err(_) => {
+                tracing::warn!(job_id=%job.id,"research unavailable; preserving retrieved local evidence");
+                Ok(prepared)
+            }
+        };
     }
     Ok(prepared)
 }
