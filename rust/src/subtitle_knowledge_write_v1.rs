@@ -49,7 +49,7 @@ fn approved() -> String {
 fn manual() -> String {
     "manual".into()
 }
-fn normalize_term(raw: &str) -> String {
+pub(crate) fn normalize_term(raw: &str) -> String {
     raw.trim()
         .to_lowercase()
         .split(|c: char| c.is_whitespace() || c == '_' || c == '-')

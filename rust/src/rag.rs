@@ -111,6 +111,8 @@ pub struct RagConfig {
     pub wiki_enabled: bool,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub page_text_enabled: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub learn_pending: bool,
     pub web_search_endpoint: Option<String>,
     pub web_search_api_key: Option<String>,
 }
@@ -130,6 +132,7 @@ impl Default for RagConfig {
             max_web_searches: 2,
             wiki_enabled: false,
             page_text_enabled: false,
+            learn_pending: false,
             web_search_endpoint: None,
             web_search_api_key: None,
         }
@@ -680,6 +683,7 @@ pub async fn prepare(
         // The original opt-in is authoritative; a general web-search switch
         // does not implicitly enable Wikipedia.
         settings.wiki_enabled = gate && legacy["rag_wiki_enabled"].as_bool() == Some(true);
+        settings.learn_pending = gate && legacy["rag_auto_learn_terms"].as_bool() == Some(true);
         let research_task = crate::agent::ResearchTask {
             job,
             settings: &settings,
