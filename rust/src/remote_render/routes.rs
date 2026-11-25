@@ -534,7 +534,10 @@ async fn execution_log(
             .await?
             .ok_or(AppError::Unauthorized)?;
     validate_lease(&row, &payload.fence_token)?;
-    let prior: String = row.try_get("log_tail")?;
+    // The canonical V1 table allows NULL before the first log message.
+    let prior: String = row
+        .try_get::<Option<String>, _>("log_tail")?
+        .unwrap_or_default();
     let tail = log_message_tail(&prior, &payload.text)?;
     sqlx::query("UPDATE vr2_render_executions SET log_tail=$1,updated_at=now() WHERE id=$2")
         .bind(tail)
