@@ -164,6 +164,27 @@ impl Row {
     }
 }
 
+pub(crate) async fn reviewed_identities(
+    db: &Database,
+    keys: &[String],
+    target: &str,
+    cfg: &Settings,
+) -> AppResult<Vec<(String, SearchHit)>> {
+    if keys.is_empty() {
+        return Ok(vec![]);
+    }
+    let rows=sqlx::query_as::<_,Row>(
+        "SELECT DISTINCT ON (normalized_term) id,item_type,term,translation,title,content,description,domain,1.0::float8 AS score
+         FROM translation_knowledge_items WHERE native_scope IS NULL AND item_type='term'
+           AND target_lang=$1 AND status IN ('approved','auto_approved') AND normalized_term=ANY($2)
+           AND (domain=$3 OR domain='')
+         ORDER BY normalized_term,(domain=$3) DESC,(status='approved') DESC,confidence DESC,updated_at DESC,id")
+        .bind(target).bind(keys).bind(&cfg.domain).fetch_all(&db.pool).await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| (normalize(&row.term), row.hit()))
+        .collect())
+}
 pub(crate) async fn exact(
     db: &Database,
     text: &str,

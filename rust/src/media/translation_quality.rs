@@ -147,22 +147,53 @@ pub fn validate_glossary(g: &Value) -> crate::AppResult<()> {
     let map = g
         .as_object()
         .ok_or_else(|| crate::AppError::Invalid("translate_glossary must be an object".into()))?;
+    let mut identities = BTreeSet::new();
     if map.len() > 64
         || map.iter().any(|(k, v)| {
             k.trim().is_empty()
+                || glossary_key(k).is_empty()
+                || !identities.insert(glossary_key(k))
                 || k.chars().count() > 240
                 || v.as_str()
                     .is_none_or(|s| s.trim().is_empty() || s.chars().count() > 240)
         })
     {
         return Err(crate::AppError::Invalid(
-            "invalid translation glossary (maximum 64 bounded string mappings)".into(),
+            "invalid translation glossary (maximum 64 distinct bounded term mappings)".into(),
         ));
     }
     Ok(())
 }
+pub(crate) fn glossary_key(raw: &str) -> String {
+    crate::subtitle_knowledge_write_v1::normalize_term(&norm(raw))
+}
+pub(crate) fn glossary_contains(glossary: &Value, term: &str) -> bool {
+    let key = glossary_key(term);
+    !key.is_empty()
+        && glossary
+            .as_object()
+            .is_some_and(|g| g.keys().any(|s| glossary_key(s) == key))
+}
+// Drop lower-priority memory entries instead of sending contradictory
+// recommendations alongside the explicitly required glossary.
+pub(crate) fn protect_glossary(memory: &mut Value, glossary: &Value) {
+    for (kind, field) in [("terminology", "source"), ("characters", "name")] {
+        if let Some(rows) = memory.get_mut(kind).and_then(Value::as_array_mut) {
+            rows.retain(|r| {
+                !glossary_contains(glossary, r[field].as_str().unwrap_or(""))
+                    && !r["aliases"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_str)
+                        .any(|s| glossary_contains(glossary, s))
+            });
+        }
+    }
+}
 pub fn constraints(batch: &[SubtitleCue], glossary: &Value, memory: &Value) -> Value {
     let mut out = Vec::new();
+    let mut seen = BTreeSet::new();
     let mut add = |source: &str, target: &str, mode: &str, aliases: &[Value]| {
         let s = source.trim();
         let t = target.trim();
@@ -181,7 +212,7 @@ pub fn constraints(batch: &[SubtitleCue], glossary: &Value, memory: &Value) -> V
             })
             .map(|(i, _)| i + 1)
             .collect::<Vec<_>>();
-        if !ids.is_empty() && out.len() < 64 {
+        if !ids.is_empty() && out.len() < 64 && seen.insert(glossary_key(s)) {
             out.push(json!({"source":s,"target":t,"mode":mode,"applies_to_blocks":ids}));
         }
     };
@@ -198,6 +229,9 @@ pub fn constraints(batch: &[SubtitleCue], glossary: &Value, memory: &Value) -> V
         .flatten()
         .take(64)
     {
+        if glossary_contains(glossary, row["source"].as_str().unwrap_or("")) {
+            continue;
+        }
         add(
             row["source"].as_str().unwrap_or(""),
             row["target"].as_str().unwrap_or(""),
@@ -211,6 +245,16 @@ pub fn constraints(batch: &[SubtitleCue], glossary: &Value, memory: &Value) -> V
         .flatten()
         .take(32)
     {
+        if glossary_contains(glossary, row["name"].as_str().unwrap_or(""))
+            || row["aliases"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .any(|s| glossary_contains(glossary, s))
+        {
+            continue;
+        }
         add(
             row["name"].as_str().unwrap_or(""),
             row["target_name"].as_str().unwrap_or(""),
@@ -271,6 +315,18 @@ mod tests {
         assert_eq!(missing_numbers("0.125", "125"), vec!["0.125"]);
     }
     #[test]
+    fn explicit_glossary_protects_memory() {
+        let glossary = json!({"Volts":"伏特","PCB board":"电路板"});
+        let mut memory = json!({"terminology":[{"source":"volts","target":"伏"},{"source":"resistor","target":"电阻"}],"characters":[{"name":"PCB","aliases":["PCB-board"],"target_name":"旧译名"}]});
+        protect_glossary(&mut memory, &glossary);
+        assert_eq!(
+            memory["terminology"],
+            json!([{"source":"resistor","target":"电阻"}])
+        );
+        assert_eq!(memory["characters"], json!([]));
+        assert!(validate_glossary(&json!({"PCB-board":"甲","pcb board":"乙"})).is_err());
+    }
+    #[test]
     fn hard_vs_preferred() {
         let batch = vec![SubtitleCue {
             start_ms: 0,
@@ -283,7 +339,7 @@ mod tests {
             &json!({"resistor":"电阻","capacitor":"电容"}),
             &json!({"terminology":[{"source":"resistor","target":"电阻器"}]}),
         );
-        assert_eq!(c.as_array().unwrap().len(), 2);
+        assert_eq!(c.as_array().unwrap().len(), 1);
         assert!(blocking(&issues(&batch, &["元件".into()], &c)));
         assert!(!blocking(&issues(&batch, &["电阻".into()], &c)));
     }

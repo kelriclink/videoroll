@@ -244,7 +244,7 @@ try:
     for i in (1,2,3):
         ctx=observed[i][1]["context"]
         assert ctx["running_summary"]=="Electrical measurements.",ctx
-        assert ctx["memory"]["terminology"]==[{"source":"volts","target":"伏","meaning":""}],ctx
+        assert ctx["memory"]["terminology"]==[],ctx
         assert ctx["memory"]["characters"]==[],ctx
     assert any(e["target"]=="approved-fuzzy" and 0.78<=e["similarity"]<1 and e["scope"]=="approved_global" for e in observed[3][1]["translation_examples"]),observed[3]
     assert "INVALID FAILED BATCH" not in json.dumps(observed) and "DO NOT LEARN" not in json.dumps(observed)
@@ -260,7 +260,7 @@ try:
     assert meta["translation_scenes"]["batches"]==[[0,2],[2,3],[3,5]],meta
     assert {i["type"] for i in meta["translation_quality_issues"]}=={"number_mismatch"},meta
     assert meta["running_summary"]=="Electrical measurements."
-    assert meta["context_memory"]["terminology"]==[{"source":"volts","target":"伏","meaning":""}]
+    assert meta["context_memory"]["terminology"]==[]
     assert meta["context_memory"]["ambiguities"]==[{"term":"volts","resolution":"voltage unit"}]
     assert meta["context_memory"]["topic"]=="electronics"
     assert "MUST NOT LEARN REPAIR" not in json.dumps(meta)
@@ -274,6 +274,9 @@ try:
             assert len(plan["gate_candidates"])==2 and plan["parallelism"]==2
             master=uuid.UUID(plan["master_agent_id"])
             assert result["master_agent_id"]==str(master) and result["failed_children"]==0
+            assert not any(v["source"]=="Rust compiler" for v in result["terms"]),result
+            assert "Rust compiler → Rust 编译器" not in result["context"]["prompt"],result
+            print("PASS: reviewed term takes precedence over conflicting specialist recommendation; explicit glossary protected from rolling memory",flush=True)
             parent=c.execute("SELECT agent_type,status,checkpoint FROM translation_agent_runs WHERE id=%s",(master,)).fetchone()
             assert parent[:2]==("rag_master","succeeded"),parent
             assert parent[2]["model_calls"]==(3 if (web_fault or wiki_fault) else (5 if multistep else 4)) and parent[2]["model_budget"]==6,parent

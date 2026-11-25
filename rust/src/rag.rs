@@ -600,6 +600,16 @@ pub async fn prepare(
     cues: &[crate::subtitles::SubtitleCue],
     target_lang: &str,
 ) -> AppResult<ResearchContext> {
+    prepare_with_glossary(config, db, job, cues, target_lang, &Value::Null).await
+}
+pub async fn prepare_with_glossary(
+    config: &Config,
+    db: &Database,
+    job: &WorkItem,
+    cues: &[crate::subtitles::SubtitleCue],
+    target_lang: &str,
+    glossary: &Value,
+) -> AppResult<ResearchContext> {
     let mut settings = rag_config(db).await?;
     let legacy = crate::settings::effective(db, "subtitle.translate").await?;
     let original = crate::rag_original_v1::settings(db).await?;
@@ -689,6 +699,7 @@ pub async fn prepare(
             settings: &settings,
             query: &query,
             evidence: &hits,
+            glossary,
             target_lang,
             gate,
             parallelism: legacy["rag_agent_parallelism"]
