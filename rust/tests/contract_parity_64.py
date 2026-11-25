@@ -420,6 +420,8 @@ if args.all_services:
     results.extend(worker_probe(args.base,token))
     from contract_orchestrator_v6 import probe as orchestrator_probe
     results.extend(orchestrator_probe(root,send))
+    from contract_actions_v7 import probe as action_probe
+    results.extend(action_probe(root,send))
 covered={(r["method"],r["path"]) for r in results}
 for row in ordered:
     if (row["method"],row["path"]) in covered:continue
