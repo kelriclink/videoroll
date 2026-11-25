@@ -220,15 +220,22 @@ async fn resume_subtitle(
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<ManualJobResponse>> {
     read_task(&state.db, id).await?;
+    let raw = crate::media::ffmpeg::latest_asset_key(&state.db, id, "video_raw").await?;
+    let mut changes = json!({"auto_publish":false,"auto_publish_platforms":[]});
+    if let Some(raw) = raw {
+        if let Some(plan) =
+            crate::subtitle_resume_v1::prepare(&state.db, &state.storage, id, &raw, None, None)
+                .await?
+        {
+            changes["subtitle_resume_plan"] = json!(plan);
+            changes["auto_dub_p2"] = json!(false);
+            changes["standalone_subtitle_runtime_profile"] = json!(false);
+        }
+    }
+
     let flow = state
         .scheduler
-        .restart_at(
-            id,
-            Stage::Subtitle,
-            json!({
-                "auto_publish":false,"auto_publish_platforms":[]
-            }),
-        )
+        .restart_at(id, Stage::Subtitle, changes)
         .await?;
     response(&state, flow, Stage::Subtitle).await
 }

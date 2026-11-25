@@ -280,11 +280,21 @@ async fn build_spec(s: &AppState, exec: &ExecutionInfo) -> AppResult<RenderSpec>
         payload: Value::Null,
     };
     let profile = crate::media::ffmpeg::profile(&s.db, &job).await?;
-    let source = latest_asset_key(&s.db, task_id, "video_raw")
-        .await?
-        .ok_or_else(|| AppError::NotFound("remote render input video_raw missing".into()))?;
-    let ass = latest_asset_key(&s.db, task_id, "subtitle_ass").await?;
-    let srt = latest_asset_key(&s.db, task_id, "subtitle_srt").await?;
+    let (source, ass, srt) = if let Some((raw, ass, srt)) =
+        crate::subtitle_resume_v1::render_inputs(&s.db, &s.storage, task_id, flow_id).await?
+    {
+        (raw, Some(ass), Some(srt))
+    } else {
+        (
+            latest_asset_key(&s.db, task_id, "video_raw")
+                .await?
+                .ok_or_else(|| {
+                    AppError::NotFound("remote render input video_raw missing".into())
+                })?,
+            latest_asset_key(&s.db, task_id, "subtitle_ass").await?,
+            latest_asset_key(&s.db, task_id, "subtitle_srt").await?,
+        )
+    };
     let mode = if profile.burn_in && ass.is_some() {
         "burn_in"
     } else if profile.soft_sub && srt.is_some() {

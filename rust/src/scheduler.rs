@@ -378,6 +378,11 @@ impl Scheduler {
             }
             configuration = previous.try_get("configuration")?;
         }
+        if stage == Stage::Subtitle && !changes.contains_key("subtitle_resume_plan") {
+            if let Some(base) = configuration.as_object_mut() {
+                base.remove("subtitle_resume_plan");
+            }
+        }
         // A fresh standalone subtitle request is a new execution policy,
         // not a merge with stale manual parameters or prior selective plan.
         if stage == Stage::Subtitle
@@ -389,6 +394,7 @@ impl Scheduler {
                     "subtitle",
                     "render",
                     "selective_retranslate",
+                    "subtitle_resume_plan",
                     "auto_publish",
                     "auto_publish_platforms",
                     "auto_dub_p2",

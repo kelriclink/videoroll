@@ -143,7 +143,8 @@ impl Executor {
                 .bind(item.workflow_id)
                 .fetch_one(&self.db.pool)
                 .await?;
-                if selective {
+                let resume:bool=sqlx::query_scalar("SELECT configuration ? 'subtitle_resume_plan' FROM vr2_workflows WHERE id=$1").bind(item.workflow_id).fetch_one(&self.db.pool).await?;
+                if selective || resume {
                     let result =
                         crate::media::asr::process(&self.config, &self.db, &self.registry, item,None)
                             .await?;
@@ -174,9 +175,12 @@ impl Executor {
                         .await?;
                 Ok(StageOutcome::Completed { result })
             }
-            Stage::Dubbing if sqlx::query_scalar::<_,bool>("SELECT COALESCE(configuration->'historical_adoption'='true'::jsonb,false) AND COALESCE(configuration->'auto_dub_p2'='false'::jsonb,false) FROM vr2_workflows WHERE id=$1")
+            Stage::Dubbing if !crate::media::dubbing::auto_enabled(&self.db,item).await? => {
+                Ok(StageOutcome::Skipped{reason:"automatic P2 dubbing is disabled".into()})
+            }
+            Stage::Dubbing if sqlx::query_scalar::<_,bool>("SELECT EXISTS(SELECT 1 FROM vr2_jobs WHERE workflow_id=$1 AND stage='subtitle' AND state='succeeded' AND result->'no_speech'='true'::jsonb)")
                 .bind(item.workflow_id).fetch_one(&self.db.pool).await? => {
-                Ok(StageOutcome::Skipped{reason:"historical recovery does not automatically create dubbing work".into()})
+                Ok(StageOutcome::Skipped{reason:"no credible speech: P2 was not generated".into()})
             }
             Stage::Dubbing
                 if self.config.youdub_bridge.is_some() && self.config.youdub_python.is_some() =>

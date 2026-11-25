@@ -113,10 +113,20 @@ fn config(request: &Value) -> AppResult<(Uuid, String, Value)> {
                 }
             }
         }
-    } else if artifacts.is_some() {
-        return Err(invalid(
-            "non-selective legacy artifacts require pinned resume support",
-        ));
+    } else if let Some(a) = artifacts {
+        if map.get("resume").and_then(Value::as_bool) != Some(true) {
+            return Err(invalid("legacy artifacts require resume=true"));
+        }
+        allowed(
+            a,
+            &["source_segments_key", "final_subtitle_segments_key"],
+            "artifacts",
+        )?;
+        for value in a.values() {
+            if !value.is_null() && value.as_str().is_none_or(|s| s.is_empty()) {
+                return Err(invalid("legacy artifact key must be a nonempty string"));
+            }
+        }
     }
     if let Some(after) = optional_object(map, "after_render")? {
         allowed(
@@ -166,7 +176,10 @@ fn config(request: &Value) -> AppResult<(Uuid, String, Value)> {
         return Err(invalid("only V2-owned storage input is supported"));
     }
     let key = input.get("key").and_then(Value::as_str).unwrap_or("");
-    if !key.starts_with("v2/") || key.len() > 512 || key.chars().any(char::is_control) {
+    if (!key.starts_with("v2/") && map.get("resume").and_then(Value::as_bool) != Some(true))
+        || key.len() > 512
+        || crate::storage::AssetRegistry::checked_key(key).is_err()
+    {
         return Err(invalid(
             "input.key must reference a V2-owned storage object",
         ));
@@ -413,6 +426,21 @@ async fn create(
     } else {
         config["auto_dub_p2"] = json!(false);
     }
+    let resume = request["resume"].as_bool() == Some(true);
+    if resume {
+        let plan = crate::subtitle_resume_v1::prepare(
+            &state.db,
+            &state.storage,
+            task_id,
+            &key,
+            request["artifacts"]["source_segments_key"].as_str(),
+            request["artifacts"]["final_subtitle_segments_key"].as_str(),
+        )
+        .await?;
+        if let Some(plan) = plan {
+            config["subtitle_resume_plan"] = json!(plan);
+        }
+    }
     // An active native subtitle stage may produce an SRT before its lease is
     // committed. A repeated request must reuse that exact in-flight stage,
     // not be rejected simply because the output artifact appeared meanwhile.
@@ -432,7 +460,7 @@ async fn create(
     .bind(task_id)
     .fetch_one(&state.db.pool)
     .await?;
-    if latest_srt && !active_native {
+    if latest_srt && !active_native && config.get("subtitle_resume_plan").is_none() {
         return Err(AppError::Conflict(
             "existing subtitles cannot be silently reused as a new V1 subtitle job".into(),
         ));

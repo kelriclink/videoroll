@@ -341,7 +341,7 @@ pub async fn render(
     // A new selective subtitle version invalidates the previously burned-in
     // video; never reuse a video_final from an earlier subtitle generation.
     let selective: bool = sqlx::query_scalar(
-        "SELECT configuration ? 'selective_retranslate'
+        "SELECT configuration ? 'selective_retranslate' OR configuration ? 'subtitle_resume_plan'
         FROM vr2_workflows WHERE id=$1",
     )
     .bind(job.workflow_id)
@@ -358,15 +358,26 @@ pub async fn render(
     {
         return Ok(json!({"storage_key":key,"reused":true}));
     }
-    let source_key = latest_asset_key(db, job.task_id, "video_raw")
-        .await?
-        .ok_or_else(|| AppError::NotFound("render input video_raw asset missing".into()))?;
+    let pinned =
+        crate::subtitle_resume_v1::render_inputs(db, registry, job.task_id, job.workflow_id)
+            .await?;
+    let source_key = if let Some((raw, _, _)) = &pinned {
+        raw.clone()
+    } else {
+        latest_asset_key(db, job.task_id, "video_raw")
+            .await?
+            .ok_or_else(|| AppError::NotFound("render input video_raw asset missing".into()))?
+    };
     let input = registry.resolve_existing(&source_key).await?;
     probe_video(&config.ffprobe_binary, &input).await?;
     let cfg = profile(db, job).await?;
-    let subtitle_key = latest_asset_key(db, job.task_id, "subtitle_ass")
-        .await?
-        .or(latest_asset_key(db, job.task_id, "subtitle_srt").await?);
+    let subtitle_key = if let Some((_, ass, _)) = pinned {
+        Some(ass)
+    } else {
+        latest_asset_key(db, job.task_id, "subtitle_ass")
+            .await?
+            .or(latest_asset_key(db, job.task_id, "subtitle_srt").await?)
+    };
     let subtitle = match subtitle_key {
         Some(key) => Some(registry.resolve_existing(&key).await?),
         None => None,

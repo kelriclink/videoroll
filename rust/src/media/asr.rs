@@ -1311,15 +1311,38 @@ pub(crate) async fn process(
     if let Some(plan) = selective {
         return process_selective(config, db, registry, job, plan).await;
     }
-    if let Some(srt) = latest_asset_key(db, job.task_id, "subtitle_srt").await?
+    let resume: Option<Value> = sqlx::query_scalar(
+        "SELECT configuration->'subtitle_resume_plan' FROM vr2_workflows WHERE id=$1",
+    )
+    .bind(job.workflow_id)
+    .fetch_one(&db.pool)
+    .await?;
+    let resume = resume
+        .map(|v| {
+            serde_json::from_value::<crate::subtitle_resume_v1::Plan>(v)
+                .map_err(|_| AppError::Conflict("invalid persisted subtitle resume plan".into()))
+        })
+        .transpose()?;
+    let recovered = if let Some(plan) = &resume {
+        selective_lease(db, job).await?;
+        Some(crate::subtitle_resume_v1::load(db, registry, job.task_id, plan).await?)
+    } else {
+        None
+    };
+    if resume.is_none()
+        && let Some(srt) = latest_asset_key(db, job.task_id, "subtitle_srt").await?
         && let Ok(path) = registry.resolve_existing(&srt).await
         && fs::metadata(path).await.is_ok()
     {
         return Ok(json!({"srt_key":srt,"reused":true}));
     }
-    let video_key = latest_asset_key(db, job.task_id, "video_raw")
-        .await?
-        .ok_or_else(|| AppError::NotFound("raw video is missing for transcription".into()))?;
+    let video_key = if let Some(plan) = &resume {
+        plan.video.key.clone()
+    } else {
+        latest_asset_key(db, job.task_id, "video_raw")
+            .await?
+            .ok_or_else(|| AppError::NotFound("raw video is missing for transcription".into()))?
+    };
     let video = registry.resolve_existing(&video_key).await?;
     let probe = probe_video(&config.ffprobe_binary, &video).await?;
     let audio_present = probe
@@ -1330,7 +1353,7 @@ pub(crate) async fn process(
                 .iter()
                 .any(|s| s.get("codec_type").and_then(Value::as_str) == Some("audio"))
         });
-    if !audio_present && preferred.is_none() {
+    if !audio_present && preferred.is_none() && recovered.is_none() {
         return Ok(json!({"no_speech":true,"reason":"no_audio_stream"}));
     }
     let duration = probe
@@ -1345,6 +1368,27 @@ pub(crate) async fn process(
     }
     let mut profile = settings(db, job).await?;
     let youtube_info = preferred.as_ref().map(|p| p.selection.clone());
+    let recovered_final = recovered.as_ref().and_then(|(_, f)| f.as_ref()).is_some();
+    if recovered_final {
+        profile.translate_enabled = false;
+        profile.bilingual = recovered
+            .as_ref()
+            .and_then(|(_, f)| f.as_ref())
+            .is_some_and(|f| f.iter().any(|c| c.secondary_text.is_some()));
+    }
+    if let Some((source, final_cues)) = &recovered {
+        let end = (duration * 1000.0).round() as u64;
+        if source
+            .iter()
+            .chain(final_cues.iter().flatten())
+            .any(|c| c.end_ms > end)
+        {
+            return Err(AppError::Conflict(
+                "legacy snapshot exceeds pinned video duration".into(),
+            ));
+        }
+    }
+
     if youtube_info.as_ref().is_some_and(|s| s.reason == "target") {
         profile.translate_enabled = false;
         profile.bilingual = false;
@@ -1382,7 +1426,9 @@ pub(crate) async fn process(
     let original_hash:Option<String>=sqlx::query_scalar(
         "SELECT sha256 FROM assets WHERE task_id=$1 AND storage_key=$2 AND kind='video_raw'::asset_kind ORDER BY created_at DESC LIMIT 1"
     ).bind(job.task_id).bind(&video_key).fetch_optional(&db.pool).await?.flatten();
-    let source_digest = if let Some(source_hash) = original_hash.filter(|v| v.len() == 64) {
+    let source_digest = if let Some(plan) = &resume {
+        plan.video.sha256.clone()
+    } else if let Some(source_hash) = original_hash.filter(|v| v.len() == 64) {
         source_hash
     } else {
         registry.sha256(&video_key).await?.0
@@ -1411,7 +1457,9 @@ pub(crate) async fn process(
     let stride = window - overlap;
     let count = (duration / stride).ceil() as usize;
     let mut cues = Vec::new();
-    if let Some(captions) = preferred {
+    if let Some((source, final_cues)) = &recovered {
+        cues = final_cues.as_ref().unwrap_or(source).clone();
+    } else if let Some(captions) = preferred {
         cues = captions.cues;
         let end = (duration * 1000.) as u64;
         cues.retain(|c| c.start_ms < end && c.end_ms > c.start_ms && !c.text.trim().is_empty());
@@ -1519,14 +1567,19 @@ pub(crate) async fn process(
             cues.extend(rows);
         }
     }
-    cues.sort_by_key(|cue| cue.start_ms);
-    cues.dedup_by(|a, b| {
-        a.text.eq_ignore_ascii_case(&b.text) && a.start_ms.abs_diff(b.start_ms) < 800
-    });
+    if recovered.is_none() {
+        cues.sort_by_key(|cue| cue.start_ms);
+        cues.dedup_by(|a, b| {
+            a.text.eq_ignore_ascii_case(&b.text) && a.start_ms.abs_diff(b.start_ms) < 800
+        });
+    }
     if cues.is_empty() {
         return Ok(json!({"no_speech":true,"reason":"no_credible_segments"}));
     }
-    let original = cues.clone();
+    let original = recovered
+        .as_ref()
+        .map(|(source, _)| source.clone())
+        .unwrap_or_else(|| cues.clone());
     let mut research = crate::rag::ResearchContext::default();
     if profile.translate_enabled {
         let options = crate::rag::rag_config(db).await?;
@@ -1876,9 +1929,16 @@ pub(crate) async fn process(
     }
     let srt = to_srt(&cues)?;
     let ass = to_ass(&cues, 1920, 1080, "Arial", 48, profile.bilingual)?;
+    let aligned = original.len() == cues.len()
+        && original
+            .iter()
+            .zip(&cues)
+            .all(|(a, b)| a.start_ms == b.start_ms && a.end_ms == b.end_ms);
+    let translated = profile.translate_enabled
+        || (recovered_final && aligned && resume.as_ref().is_some_and(|p| p.original_translated));
     let metadata = serde_json::to_vec(&json!({
         "source":original,"translated":cues,
-        "model":config.asr_model,"translation":profile.translate_enabled,"youtube_subtitle":youtube_info,
+        "model":config.asr_model,"translation":translated,"youtube_subtitle":youtube_info,"subtitle_resume_plan":resume,"source_video_sha256":source_digest,
         "rag_evidence_ids":research.evidence_ids,"rag_digest":research.digest,
         "translation_scenes":translation_scenes,"translation_quality_issues":translation_quality,"context_memory":rolling_memory,"running_summary":rolling_summary
     }))
@@ -1892,17 +1952,17 @@ pub(crate) async fn process(
         (&ass_key, ass.as_bytes(), "subtitle_ass"),
     ] {
         let path = registry.resolve_existing(key).await?;
-        if config.cloudflare_asr {
+        if config.cloudflare_asr || resume.is_some() {
             selective_lease(db, job).await?;
         }
         atomic_write(&path, body).await?;
-        if config.cloudflare_asr {
+        if config.cloudflare_asr || resume.is_some() {
             selective_lease(db, job).await?;
         }
         ensure_task_asset(db, registry, job.task_id, job, kind, key).await?;
     }
     Ok(json!({"no_speech":false,"cues":cues.len(),
-        "srt_key":srt_key,"ass_key":ass_key,"segments_key":segments_key,"youtube_subtitle":youtube_info}))
+        "srt_key":srt_key,"ass_key":ass_key,"segments_key":segments_key,"youtube_subtitle":youtube_info,"subtitle_resume_plan":resume}))
 }
 
 #[cfg(test)]
