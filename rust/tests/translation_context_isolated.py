@@ -197,6 +197,10 @@ try:
             assert parent[2]["model_calls"]==parent[2]["model_budget"]==4 and parent[2]["web_calls"]==0,parent
             children=c.execute("SELECT term,status,checkpoint->>'attempts' FROM translation_agent_runs WHERE parent_agent_run_id=%s ORDER BY term",(master,)).fetchall()
             assert children==[("Fourth line","succeeded","2"),("Rust compiler","succeeded","1")],children
+            receipts=c.execute("SELECT term,checkpoint->'initial_evidence' FROM translation_agent_runs WHERE parent_agent_run_id=%s ORDER BY term",(master,)).fetchall()
+            assert all(isinstance(v,dict) for _,v in receipts),receipts
+            assert c.execute("SELECT count(*) FROM translation_agent_events e JOIN translation_agent_runs r ON r.id=e.run_id WHERE r.parent_agent_run_id=%s AND e.action='initial_retrieval' AND e.status='succeeded'",(master,)).fetchone()[0]==2
+            print("PASS: initial evidence checkpoint saved once per specialist, survives subsequent model failure",flush=True)
             assert c.execute("SELECT count(*) FROM translation_agent_events WHERE run_id IN (SELECT id FROM translation_agent_runs WHERE task_id=%s) AND status='failed'",(task,)).fetchone()[0]>=1
             print("PASS: two concurrent specialists; one injected failure; persisted gate and successful child not replayed; shared model budget 4/4, no web, original master/child history and events",flush=True)
         else:
