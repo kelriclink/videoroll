@@ -106,6 +106,14 @@ if [[ "${VIDEOROLL_V2_TEST_DB_CLEANUP_ONLY:-false}" == "true" ]]; then
   echo "PASS: isolated PostgreSQL bootstrap; EXIT trap will remove its dedicated volume"
   exit 0
 fi
+if [[ "${VIDEOROLL_V2_TEST_ORIGINAL_RAG_ONLY:-false}" == "true" ]]; then
+  export VIDEOROLL_V2_INTERNAL_TOKEN="isolated-original-rag-token-0123456789"
+  export VIDEOROLL_V2_STORAGE_ROOT="$(mktemp -d "$repo_root/rust/target/v2-original-rag.XXXXXX")"
+  export VIDEOROLL_V2_LOCAL_INFERENCE_BRIDGE="$repo_root/scripts/native/local_inference.py"
+  export VIDEOROLL_V2_TEST_ORIGINAL_RAG=1
+  "$CARGO_HOME/bin/cargo" test --manifest-path "$repo_root/rust/Cargo.toml" --locked --offline --test original_rag_retrieval -- --nocapture
+  exit 0
+fi
 if [[ "${VIDEOROLL_V2_TEST_LOCAL_INFERENCE_ONLY:-false}" == "true" ]]; then
   export VIDEOROLL_V2_INTERNAL_TOKEN="isolated-local-inference-token-0123456789"
   export INTERNAL_API_SECRET="isolated-local-inference-service-secret"
@@ -1328,6 +1336,18 @@ rag_settings="$(curl --silent --fail-with-body "${hdr[@]}"   -X PUT -d '{"expect
 echo "$rag_settings" | grep -q '"version":1'
 echo 'PASS: scoped RAG knowledge storage, native lexical ranking and explicit research settings'
 
+# Original V1 RAG and native V2 RAG must both contribute to actual translation.
+original_term_id="$(python3 -c 'import uuid;print(uuid.uuid4())')"
+original_doc_id="$(python3 -c 'import uuid;print(uuid.uuid4())')"
+saved_translate="$(docker exec "$container_name" psql -At -U postgres -d videoroll_test -c "SELECT value_json FROM app_settings WHERE key='subtitle.translate'")"
+docker exec -i "$container_name" psql -v ON_ERROR_STOP=1 -v term_id="$original_term_id" -v doc_id="$original_doc_id" -U postgres -d videoroll_test >/dev/null <<'PSQL'
+INSERT INTO translation_knowledge_items(id,item_type,term,normalized_term,translation,target_lang,status,confidence)
+VALUES(:'term_id','term','Rust integration','rust integration','原版术语验证','zh','approved',1);
+INSERT INTO translation_knowledge_items(id,item_type,title,content,target_lang,status,confidence,embedding_model,embedding)
+VALUES(:'doc_id','document','Original vector fixture','原版向量验证','zh','approved',1,'openai:original-rag-test','[1,0,0]'::vector);
+INSERT INTO app_settings(key,value_json) VALUES('subtitle.translate','{"rag_enabled":true,"rag_top_k":8,"rag_min_score":0.8,"rag_domain":"","rag_embedding_provider":"openai","rag_embedding_model":"original-rag-test","rag_embedding_dimensions":3,"rag_embedding_openai":{"base_url":"http://127.0.0.1:18082/v1","api_key_enc":"dbplain:v1:original-rag-test-key","timeout_seconds":5}}')
+ON CONFLICT(key) DO UPDATE SET value_json=app_settings.value_json||EXCLUDED.value_json;
+PSQL
 # Native official Index-Translate-compatible JSON numbering and missing-line repair.
 index_task="$(curl --silent --fail-with-body "${hdr[@]}" -d   '{"url":"https://youtu.be/0123456789I","source_license":"authorized","configuration":{"auto_publish":true,"auto_publish_platforms":["bilibili"],"subtitle":{"translate_enabled":true,"translate_provider":"index_translate","translate_model_provider_id":"index_translate","translate_model_id":"Index-Translate-35B-A3B"}}}'   http://127.0.0.1:18080/api/v2/auto/youtube)"
 index_task_id="$(INDEX_TASK="$index_task" python3 -c 'import json,os;print(json.loads(os.environ["INDEX_TASK"])["task"]["id"])')"
@@ -1351,13 +1371,38 @@ test "$(grep -c '译文：' "$VIDEOROLL_V2_STORAGE_ROOT/$index_srt")" = 3
 echo 'PASS: native Index-Translate API payload, numbered 3-cue mapping, missing-line repair'
 index_workflow_id="$(INDEX_TASK="$index_task" python3 -c 'import json,os;print(json.loads(os.environ["INDEX_TASK"])["workflow"]["id"])')"
 agent_runs="$(curl --silent --fail-with-body "${hdr[@]}"   "http://127.0.0.1:18080/api/v2/rag/agents/$index_workflow_id")"
-AGENT_RUNS="$agent_runs" KNOWLEDGE_ID="$knowledge_id" python3 - <<'PYAGENT'
+AGENT_RUNS="$agent_runs" KNOWLEDGE_ID="$knowledge_id" ORIGINAL_TERM="$original_term_id" ORIGINAL_DOC="$original_doc_id" python3 - <<'PYAGENT'
 import json,os
 rows=json.loads(os.environ["AGENT_RUNS"])
 assert len(rows)==1,rows
 assert rows[0]["state"]=="succeeded",rows
 assert os.environ["KNOWLEDGE_ID"] in rows[0]["result"]["context"]["evidence_ids"],rows
+context=rows[0]["result"]["context"]
+assert os.environ["ORIGINAL_TERM"] in context["evidence_ids"],rows
+assert os.environ["ORIGINAL_DOC"] in context["evidence_ids"],rows
+assert "原版术语验证" in context["prompt"] and "原版向量验证" in context["prompt"],rows
 PYAGENT
+segments_key="$(docker exec "$container_name" psql -At -U postgres -d videoroll_test -c "SELECT storage_key FROM assets WHERE task_id='$index_task_id' AND kind='segments_json' ORDER BY created_at DESC LIMIT 1")"
+ORIGINAL_TERM="$original_term_id" ORIGINAL_DOC="$original_doc_id" SEGMENTS="$VIDEOROLL_V2_STORAGE_ROOT/$segments_key" python3 - <<'PYRAG'
+import json,os
+from pathlib import Path
+record=json.loads(Path(os.environ["SEGMENTS"]).read_text())
+assert {os.environ["ORIGINAL_TERM"],os.environ["ORIGINAL_DOC"]} <= set(record["rag_evidence_ids"]),record
+assert len(record["rag_digest"])==64
+PYRAG
+# Restore the disposable config so subsequent test cases remain independent.
+if [[ -n "$saved_translate" ]]; then
+  docker exec -i "$container_name" psql -v ON_ERROR_STOP=1 -v saved="$saved_translate" -U postgres -d videoroll_test >/dev/null <<'PSQL'
+UPDATE app_settings SET value_json=:'saved'::jsonb WHERE key='subtitle.translate';
+PSQL
+else
+  docker exec "$container_name" psql -v ON_ERROR_STOP=1 -U postgres -d videoroll_test -c "DELETE FROM app_settings WHERE key='subtitle.translate'" >/dev/null
+fi
+docker exec -i "$container_name" psql -v ON_ERROR_STOP=1 -v term_id="$original_term_id" -v doc_id="$original_doc_id" -U postgres -d videoroll_test >/dev/null <<'PSQL'
+DELETE FROM translation_knowledge_items WHERE id IN (:'term_id',:'doc_id');
+PSQL
+echo 'PASS: original approved exact term and pgvector evidence reach real Rust Index-Translate workflow and durable segment metadata'
+
 echo 'PASS: RAG evidence attached to translated workflow and persisted as auditable research'
 
 # Deterministic YouDub mock: the real V2 adapter must create exactly one

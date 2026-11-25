@@ -6,6 +6,11 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         if self.path == "/v1/chat/completions":
             return self.chat()
+        if self.path == "/v1/embeddings":
+            body=json.loads(self.rfile.read(int(self.headers["content-length"])))
+            if self.headers.get("Authorization")!="Bearer original-rag-test-key" or body.get("model")!="original-rag-test" or body.get("dimensions")!=3:
+                return self.reply(400,{"error":"invalid original RAG fixture"})
+            return self.reply(200,{"data":[{"embedding":[1,0,0]}]})
         if self.path != "/v1/audio/transcriptions":
             return self.reply(404, {"error":"unknown model route"})
         length=int(self.headers.get("content-length","0"))

@@ -943,15 +943,13 @@ pub async fn process(
     let mut research = crate::rag::ResearchContext::default();
     if profile.translate_enabled {
         let options = crate::rag::rag_config(db).await?;
-        if options.enabled {
-            match crate::rag::prepare(config, db, job, &original).await {
-                Ok(context) => research = context,
-                Err(error) if !options.research_blocking => {
-                    tracing::warn!(error = %error, job_id = %job.id,
-                        "RAG retrieval unavailable; continuing without external evidence");
-                }
-                Err(error) => return Err(error),
+        match crate::rag::prepare(config, db, job, &original, &profile.target_lang).await {
+            Ok(context) => research = context,
+            Err(error) if !options.research_blocking => {
+                tracing::warn!(error = %error, job_id = %job.id,
+                    "RAG retrieval unavailable; continuing without external evidence");
             }
+            Err(error) => return Err(error),
         }
     }
     if profile.translate_enabled {
@@ -1105,7 +1103,8 @@ pub async fn process(
     let ass = to_ass(&cues, 1920, 1080, "Arial", 48, profile.bilingual)?;
     let metadata = serde_json::to_vec(&json!({
         "source":original,"translated":cues,
-        "model":config.asr_model,"translation":profile.translate_enabled
+        "model":config.asr_model,"translation":profile.translate_enabled,
+        "rag_evidence_ids":research.evidence_ids,"rag_digest":research.digest
     }))
     .map_err(|_| AppError::Invalid("segment metadata encode failed".into()))?;
     let segments_key = format!("{prefix}/segments.json");

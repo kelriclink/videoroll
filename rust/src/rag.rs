@@ -589,9 +589,11 @@ pub async fn prepare(
     db: &Database,
     job: &WorkItem,
     cues: &[crate::subtitles::SubtitleCue],
+    target_lang: &str,
 ) -> AppResult<ResearchContext> {
     let settings = rag_config(db).await?;
-    if !settings.enabled || cues.is_empty() {
+    let original = crate::rag_original_v1::settings(db).await?;
+    if (!settings.enabled && !original.enabled) || cues.is_empty() {
         return Ok(ResearchContext {
             evidence_ids: vec![],
             prompt: String::new(),
@@ -614,13 +616,49 @@ pub async fn prepare(
         embedding: None,
         embedding_model: None,
     };
-    if settings.use_embedding {
-        query.embedding = embed(config, &query.query).await?;
-        query.embedding_model = config.embedding_model.clone();
+    let mut hits = Vec::new();
+    if original.enabled {
+        let target = if target_lang.trim().is_empty() {
+            "zh"
+        } else {
+            target_lang.trim()
+        };
+        hits = crate::rag_original_v1::exact(db, &query.query, target, &original).await?;
+        match crate::rag_original_v1::vector(db, &query.query, target, &original).await {
+            Ok(rows) => hits.extend(rows),
+            Err(error) if !settings.research_blocking => {
+                tracing::warn!(%error,task_id=%job.task_id,"original RAG vector retrieval unavailable; retaining exact approved terms")
+            }
+            Err(error) => return Err(error),
+        }
     }
-    let hits = search(db, &query).await?;
+    if settings.enabled {
+        if settings.use_embedding {
+            match embed(config, &query.query).await {
+                Ok(v) => {
+                    query.embedding = v;
+                    query.embedding_model = config.embedding_model.clone();
+                }
+                Err(error) if !settings.research_blocking => {
+                    tracing::warn!(%error,task_id=%job.task_id,"native RAG embedding unavailable; retaining lexical results")
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        hits.extend(search(db, &query).await?);
+    }
+    // Stable exact-term-first merge. Respect the existing prompt character
+    // budget and preserve IDs for the translation checkpoint fingerprint.
+    let mut seen = HashSet::new();
+    hits.retain(|h| seen.insert(h.id));
+    let max_items = if original.enabled {
+        original.top_k.max(settings.max_items)
+    } else {
+        settings.max_items
+    };
+    hits.truncate(max_items.min(30));
     let prepared = prompt_from_hits(&hits, settings.max_context_chars);
-    if settings.research_enabled {
+    if settings.enabled && settings.research_enabled {
         let research_task = crate::agent::ResearchTask {
             job,
             settings: &settings,
