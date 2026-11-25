@@ -71,6 +71,14 @@ pub(crate) struct SubtitleAction {
     publish_payload: Option<Value>,
 }
 pub(crate) fn subtitle_config(request: SubtitleAction) -> AppResult<Value> {
+    if request
+        .translate_batch_size
+        .is_some_and(|n| n < 1 || n > 50)
+    {
+        return Err(AppError::Invalid(
+            "translation batch size must be 1..50".into(),
+        ));
+    }
     // Local inference may be explicitly selected. Other engine-specific
     // selectors stay rejected until their request semantics are migrated.
     if request.asr_engine.as_deref().is_some_and(|s| {
@@ -88,7 +96,6 @@ pub(crate) fn subtitle_config(request: SubtitleAction) -> AppResult<Value> {
             .youtube_subtitle_mode
             .as_deref()
             .is_some_and(|s| s != "off")
-        || request.translate_batch_size.is_some()
         || request.translate_enable_summary.is_some()
         || request.auto_publish == Some(true)
         || request.publish_payload.is_some()
@@ -116,6 +123,11 @@ pub(crate) fn subtitle_config(request: SubtitleAction) -> AppResult<Value> {
         };
     }
     put!(subtitle, "asr_engine", request.asr_engine);
+    put!(
+        subtitle,
+        "translate_batch_size",
+        request.translate_batch_size
+    );
     put!(subtitle, "asr_model", request.asr_model);
     put!(subtitle, "asr_language", request.asr_language);
     put!(subtitle, "translate_enabled", request.translate_enabled);

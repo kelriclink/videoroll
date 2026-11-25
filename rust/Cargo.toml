@@ -16,6 +16,7 @@ path = "src/main.rs"
 egress-test-loopback = []
 
 [dependencies]
+unicode-normalization = "0.1.26"
 anyhow = "1"
 base64 = "0.22"
 hmac = "0.12"

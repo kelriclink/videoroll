@@ -194,7 +194,7 @@ try:
     with log.open("ab") as err:
         proc([str(binary),"migrate"],env=env,stdout=err,stderr=err,timeout=300)
     report["migration_seconds"]=round(time.monotonic()-t,2)
-    assert clone("SELECT count(*) FROM _sqlx_migrations WHERE success;")=="39"
+    assert clone("SELECT count(*) FROM _sqlx_migrations WHERE success;")=="40"
     assert clone("SELECT count(*) FROM pg_tables WHERE schemaname='public' AND tablename LIKE 'vr2_%';")=="0"
     migrated=counts(clone(inventory))
     # All original physical tables and row counts preserved; extra Rust
@@ -202,7 +202,7 @@ try:
     assert all(migrated.get(k)==v for k,v in expected.items()),"original row counts changed during migration"
     report["original_tables"]=len(expected)
     report["original_rows"]=sum(expected.values())
-    report["migration_success_count"]=39
+    report["migration_success_count"]=40
     report["physical_vr2_tables"]=0
     # Audit only; strict admission should still block unknown historical
     # effects. Do not adopt, modify or call any live platform.
@@ -211,7 +211,7 @@ try:
     out=json.loads(q.stdout[q.stdout.index("{"):])
     assert q.returncode!=0 and out["ready"] is False
     report["strict_preflight_blockers"]=out["historical_blockers"]
-    mark(f"39 migrations on full restored rows; original row counts preserved; strict preflight correctly blocked")
+    mark(f"40 migrations on full restored rows; original row counts preserved; strict preflight correctly blocked")
     report["status"]="passed"
 finally:
     if snapshot_proc is not None:
