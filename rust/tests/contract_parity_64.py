@@ -584,6 +584,10 @@ if args.all_services:
              "VIDEOROLL_V2_SAU_ENABLE_NATIVE_PUBLISH":"false",
              "VIDEOROLL_V2_SAU_ENABLE_BROWSER_OUTBOX":"false"}
         service_fixtures.configure(service,env)
+        sau_fixtures=[]
+        if service=="social_publisher":
+            from contract_sau_v8 import probe as sau_probe
+            sau_fixtures=sau_probe(root,env,port,binaries/binary,lambda method,path,body=None,auth=True,form=False:service_call(port,method,path,body,auth,form))
         proc=subprocess.Popen([str(binaries/binary),*cmd],env=env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
         try:
             for _ in range(80):
@@ -594,6 +598,7 @@ if args.all_services:
                 time.sleep(.15)
             else:raise RuntimeError(f"{service} health timeout")
             positive_fixtures=service_fixtures.probe(service,lambda method,path,body=None,auth=True,form=False:service_call(port,method,path,body,auth,form))
+            positive_fixtures.extend(sau_fixtures)
             results.extend(positive_fixtures)
             fixture_routes={(r['method'],r['path']) for r in positive_fixtures}
             # Use real IDs returned by create routes, and run deletion last.
