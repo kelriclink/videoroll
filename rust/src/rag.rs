@@ -109,6 +109,8 @@ pub struct RagConfig {
     pub max_web_searches: usize,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub wiki_enabled: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub page_text_enabled: bool,
     pub web_search_endpoint: Option<String>,
     pub web_search_api_key: Option<String>,
 }
@@ -127,6 +129,7 @@ impl Default for RagConfig {
             max_research_steps: 5,
             max_web_searches: 2,
             wiki_enabled: false,
+            page_text_enabled: false,
             web_search_endpoint: None,
             web_search_api_key: None,
         }
