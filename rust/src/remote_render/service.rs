@@ -3,6 +3,9 @@ use serde_json::json;
 use sqlx::Row;
 use uuid::Uuid;
 
+/// Shared ceiling for explicit failures and abandoned worker leases.
+pub(crate) const MAX_RENDER_ATTEMPTS: i32 = 5;
+
 /// Durable queue handoff: the actual worker claim and stage completion happen
 /// after the scheduler has committed its independent awaiting(ticket) state.
 pub async fn enqueue(db: &Database, _registry: &AssetRegistry, job: &WorkItem) -> AppResult<Uuid> {

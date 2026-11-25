@@ -146,6 +146,41 @@ try:
         assert c.execute("SELECT result_json FROM operation_inbox WHERE id=%s",(j,)).fetchone()[0]==receipt
         assert c.execute("SELECT count(*) FROM operation_inbox WHERE workflow_id=%s AND stage='dubbing'",(w,)).fetchone()[0]==1
     print("PASS: HTTP worker completion, durable exact receipt, wrong fence rejected, duplicate callback idempotent",flush=True)
+    # A sixth attempt is forbidden even before the recovery dispatcher ticks.
+    expired=native(state="running")
+    queued=native(state="queued")
+    def set_attempt(item, attempts, lease_seconds, state=None):
+        with db() as c:
+            c.execute("UPDATE render_executions SET attempt=%s,worker_id=%s,fence_token=%s,lease_until=CASE WHEN %s::int IS NULL THEN NULL ELSE now()+%s::int*interval '1 second' END WHERE id=%s",(attempts,worker,uuid.uuid4().hex+uuid.uuid4().hex,lease_seconds,lease_seconds,item[3]))
+            if state:
+                c.execute("UPDATE pipeline_runs SET state=%s WHERE id=%s",(state,item[1]))
+    set_attempt(expired,5,-60)
+    set_attempt(queued,5,None)
+    claim=Request(base+f"/render-workers/v1/{worker}/claim",data=json.dumps({"available_slots":1,"available_encoders":["h264"],"accepted_transfer_modes":["http"]}).encode(),headers={"Content-Type":"application/json","Authorization":"Bearer "+token})
+    with urlopen(claim,timeout=10) as response:
+        assert json.load(response)["execution"] is None
+    live=native(state="running")
+    retry=native(state="uploading")
+    paused=native(state="running")
+    unrelated=native(state="running",ticket_wrong=True)
+    set_attempt(live,5,300)
+    set_attempt(retry,4,-60)
+    set_attempt(paused,5,-60,"paused")
+    set_attempt(unrelated,5,-60)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+        list(pool.map(lambda _:tick(),range(3)))
+    tick()
+    with db() as c:
+        for t,w,j,e,key in (expired,queued):
+            state,attempt,lease,finished=c.execute("SELECT state,attempt,lease_until,finished_at FROM render_executions WHERE id=%s",(e,)).fetchone()
+            assert (state,attempt,lease)==("failed",5,None) and finished is not None
+            assert c.execute("SELECT status FROM operation_inbox WHERE id=%s",(j,)).fetchone()[0]=="failed"
+            assert c.execute("SELECT state FROM pipeline_runs WHERE id=%s",(w,)).fetchone()[0]=="failed"
+            assert c.execute("SELECT count(*) FROM workflow_events WHERE workflow_id=%s AND kind='render.remote_failed'",(w,)).fetchone()[0]==1
+        for item,state in ((live,"running"),(retry,"uploading"),(paused,"running"),(unrelated,"running")):
+            assert c.execute("SELECT state FROM render_executions WHERE id=%s",(item[3],)).fetchone()[0]==state
+            assert c.execute("SELECT status FROM operation_inbox WHERE id=%s",(item[2],)).fetchone()[0]=="awaiting"
+    print("PASS: exhausted expired or queued render attempt budget, no sixth claim, exact failure receipt, live/retryable/paused/foreign ticket untouched",flush=True)
 finally:
     proc.terminate()
     try:proc.wait(timeout=5)

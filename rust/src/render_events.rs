@@ -124,6 +124,25 @@ pub(crate) async fn completed_receipt(
 pub async fn tick(db: &Database, config: &Config, limit: i64) -> AppResult<u64> {
     let store = AssetRegistry::new(db.clone(), config.storage_root.clone());
     let scheduler = Scheduler::new(db.clone(), config.job_lease);
+    // A dead worker cannot send an explicit failure callback. Reclaim attempts
+    // must obey the same budget as callback-driven retries. Persist terminal
+    // evidence first so an interrupted tick is recovered by the receipt scan.
+    // Do not touch an active lease, paused flow, unrelated ticket or legacy row.
+    sqlx::query("WITH exhausted AS (
+      SELECT e.id FROM render_executions e JOIN operation_inbox j ON j.id=e.job_id
+      JOIN pipeline_runs w ON w.id=e.workflow_id JOIN tasks t ON t.id=e.task_id
+      WHERE e.runtime_engine='rust-v2' AND j.runtime_engine='rust-v2' AND j.stage='render'
+        AND j.task_id=e.task_id AND j.workflow_id=e.workflow_id AND j.status='awaiting'
+        AND j.external_ticket=e.id::text AND w.engine='rust-v2' AND w.task_id=e.task_id AND w.state='running'
+        AND t.runtime_owner='rust' AND t.status::text NOT IN ('canceled','failed')
+        AND e.attempt >= $1 AND (e.state='queued' OR
+          (e.state IN ('running','uploading') AND e.lease_until<=now()))
+      ORDER BY e.updated_at,e.id LIMIT $2 FOR UPDATE OF e SKIP LOCKED
+    ) UPDATE render_executions e SET state='failed',lease_until=NULL,
+      error_message='remote render attempt budget exhausted after worker lease expiry',
+      finished_at=now(),updated_at=now() FROM exhausted WHERE e.id=exhausted.id")
+        .bind(crate::remote_render::MAX_RENDER_ATTEMPTS)
+        .bind(limit.clamp(1,100)).execute(&db.pool).await?;
     let rows=sqlx::query("SELECT e.* FROM render_executions e JOIN operation_inbox j ON j.id=e.job_id
       JOIN pipeline_runs w ON w.id=e.workflow_id JOIN tasks t ON t.id=e.task_id
       WHERE e.runtime_engine='rust-v2' AND j.runtime_engine='rust-v2' AND j.stage='render'

@@ -8,4 +8,4 @@ pub(crate) use protocol::EnrollRequest;
 
 pub use routes::{admin_router, worker_router};
 pub use service::enqueue;
-pub(crate) use service::{output_key, receipt};
+pub(crate) use service::{MAX_RENDER_ATTEMPTS, output_key, receipt};
