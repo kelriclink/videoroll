@@ -227,6 +227,19 @@ pub async fn manual(state: &AppState, task_id: Uuid, raw: Value) -> AppResult<Va
         .map_err(|_| AppError::Invalid("invalid SAU manual publish fields".into()))?;
     let platform = platform(&body.platform)?;
     let (account, meta, options) = validate(&body)?;
+    if mixed_enabled() {
+        let request: PublishAllRequest = serde_json::from_value(json!({
+            "platforms":[platform],"account_ids":{(platform):account.to_string()},
+            "platform_meta":{(platform):meta},"platform_options":{(platform):options},
+            "video_key":body.video_key,"cover_key":body.cover_key
+        }))
+        .map_err(|_| AppError::Invalid("invalid single SAU batch request".into()))?;
+        let result = mixed_publish(state, task_id, request).await?;
+        let mut job = result["results"][platform].clone();
+        job["batch_id"] = result["batch_id"].clone();
+        return Ok(job);
+    }
+
     let task = read_task(&state.db, task_id).await?;
     if task.source_license == "unknown" || task.status == "CANCELED" {
         return Err(AppError::Conflict(
@@ -351,6 +364,8 @@ pub async fn manual(state: &AppState, task_id: Uuid, raw: Value) -> AppResult<Va
         "external_id":null,"external_url":null,"sau_job_id":null,"response":null,"attempt":1}),
     )
 }
+// Original batch-backed SAU jobs are visible through the older facade list/detail as well.
+const NATIVE_SOCIAL_VIEW: &str = "SELECT jsonb_build_object('job_id',p.id,'sau_job_id',p.id,'batch_id',p.batch_id,'platform',p.platform::text,'account_id',p.account_id,'state',CASE WHEN p.state::text='submitted' AND p.response_json->>'receipt_verified'='false' AND NULLIF(p.external_id,'') IS NULL AND NULLIF(p.external_url,'') IS NULL THEN 'unknown' ELSE p.state::text END,'external_id',p.external_id,'external_url',p.external_url,'response',NULL,'attempt',1) FROM publish_jobs p JOIN publish_batches b ON b.id=p.batch_id AND b.task_id=p.task_id WHERE p.task_id=$1 AND b.request_json->>'runtime'='rust-mixed-v1' AND p.platform::text IN ('douyin','xiaohongshu','kuaishou')";
 async fn list(
     State(state): State<AppState>,
     Path(task_id): Path<Uuid>,
@@ -363,13 +378,31 @@ async fn list(
     .bind(task_id)
     .fetch_all(&state.db.pool)
     .await?;
-    Ok(Json(records.iter().map(visible).collect()))
+    let native = sqlx::query_scalar::<_, Value>(&format!(
+        "{NATIVE_SOCIAL_VIEW} ORDER BY p.created_at DESC,p.id DESC LIMIT 100"
+    ))
+    .bind(task_id)
+    .fetch_all(&state.db.pool)
+    .await?;
+    let mut result: Vec<Value> = records.iter().map(visible).collect();
+    result.extend(native);
+    result.truncate(100);
+    Ok(Json(result))
 }
 async fn get(
     State(state): State<AppState>,
     Path((task_id, id)): Path<(Uuid, Uuid)>,
 ) -> AppResult<Json<Value>> {
     read_task(&state.db, task_id).await?;
+    if let Some(native) =
+        sqlx::query_scalar::<_, Value>(&format!("{NATIVE_SOCIAL_VIEW} AND p.id=$2"))
+            .bind(task_id)
+            .bind(id)
+            .fetch_optional(&state.db.pool)
+            .await?
+    {
+        return Ok(Json(native));
+    }
     let record = sqlx::query_as::<_, SocialIntent>(&format!(
         "SELECT {PROJECTION} FROM vr2_social_publish_intents WHERE id=$1 AND task_id=$2"
     ))
@@ -764,14 +797,18 @@ async fn mixed_publish(state: &AppState, task: Uuid, input: PublishAllRequest) -
         .platforms
         .as_ref()
         .ok_or_else(|| AppError::Invalid("explicit platforms required".into()))?;
-    if platforms.len() < 2
+    let has_bili = platforms.iter().any(|p| p == "bilibili");
+    if !has_bili {
+        batch_platforms(&input)?;
+    }
+    if platforms.len() < if has_bili { 2 } else { 1 }
         || platforms.len() > 4
         || input.skip_review
         || input.force_retry
         || input.fresh_batch
     {
         return Err(AppError::Invalid(
-            "mixed publication requires 2–4 explicit targets without bypass or forced retry".into(),
+            "native publication requires explicit targets without bypass or forced retry".into(),
         ));
     }
     let mut unique = HashSet::new();
@@ -920,9 +957,30 @@ async fn mixed_publish(state: &AppState, task: Uuid, input: PublishAllRequest) -
     sqlx::query("INSERT INTO publish_batches(id,task_id,state,expected_targets,request_json) VALUES($1,$2,'active',$3,$4)").bind(batch).bind(task).bind(json!(expected)).bind(json!({"runtime":"rust-mixed-v1","fingerprint":fingerprint,"platforms":platforms})).execute(&mut *tx).await?;
     // Shared original Bilibili admission validates P1/P2, file and ownership in
     // the SAME transaction. No commit or HTTP handoff until all targets exist.
-    let mut bili = bili.ok_or_else(|| AppError::Invalid("Bilibili target required".into()))?;
-    bili.bind_batch(batch);
-    crate::bilibili_publish_v1::enqueue_prepared(state, &mut tx, bili, false).await?;
+    if let Some(mut bili) = bili {
+        bili.bind_batch(batch);
+        crate::bilibili_publish_v1::enqueue_prepared(state, &mut tx, bili, false).await?;
+    }
+    // Recheck ownership under the same task lock, after any concurrent asset
+    // deletion/GC. Do not admit a dangling file or a foreign storage key.
+    for (kind, key) in std::iter::once(("video_final", video.as_str()))
+        .chain(cover.as_deref().map(|k| ("cover_image", k)))
+    {
+        let valid:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM assets a JOIN storage_objects o ON o.storage_key=a.storage_key AND o.state='live' WHERE a.task_id=$1 AND a.kind::text=$2 AND a.storage_key=$3)").bind(task).bind(kind).bind(key).fetch_one(&mut *tx).await?;
+        if !valid {
+            return Err(AppError::Conflict(
+                "native publication asset no longer available".into(),
+            ));
+        }
+        let p = state.storage.resolve_existing(key).await?;
+        let m = tokio::fs::metadata(p).await?;
+        if !m.is_file() || m.len() == 0 {
+            return Err(AppError::Conflict(
+                "native publication file missing or empty".into(),
+            ));
+        }
+    }
+
     // The shared native SAU enqueue persists original outbox + inbox atomically.
     for (p, account, meta, options) in socials {
         let name:Option<String>=sqlx::query_scalar("SELECT name FROM accounts WHERE id=$1 AND platform::text=$2 AND is_active AND check_state='valid' FOR UPDATE").bind(account).bind(&p).fetch_optional(&mut *tx).await?;
@@ -950,10 +1008,11 @@ async fn publish_all(
     Json(input): Json<PublishAllRequest>,
 ) -> AppResult<Json<Value>> {
     read_task(&state.db, task_id).await?;
-    if input
-        .platforms
-        .as_ref()
-        .is_some_and(|p| p.iter().any(|v| v == "bilibili"))
+    if mixed_enabled()
+        || input
+            .platforms
+            .as_ref()
+            .is_some_and(|p| p.iter().any(|v| v == "bilibili"))
     {
         return mixed_publish(&state, task_id, input).await.map(Json);
     }
