@@ -142,6 +142,40 @@ if n=='mixed-fail':sys.exit(1)
             assert (runtime/'calls').read_text()==before_calls and counters()==before
             verify(t2,post(t2,body2)[1],3)
             print('PASS: explicit operator receipt attestation, exact original evidence, concurrent dedupe, duplicate ID rejection, success settlement and fresh delayed cleanup without replay',flush=True)
+            # Pure SAU uses the same original batch, not the old facade intent.
+            t3,body3=seed();body3['platforms']=['douyin','kuaishou'];body3['platform_meta'].pop('bilibili');body3['platform_meta']['kuaishou']={'title':'pure SAU fixture'};body3['account_ids']['kuaishou']=bad
+            assert post(t3,body3)[0]==409
+            assert db("SELECT (SELECT count(*) FROM publish_batches WHERE task_id=CAST(:t AS uuid)),(SELECT count(*) FROM publish_jobs WHERE task_id=CAST(:t AS uuid)),(SELECT count(*) FROM vr2_social_publish_intents WHERE task_id=CAST(:t AS uuid)),status::text FROM tasks WHERE id=CAST(:t AS uuid)",{'t':t3})==(0,0,0,'rendered')
+            ks=account('kuaishou','pure-ks');body3['account_ids']['kuaishou']=ks
+            with ThreadPoolExecutor(max_workers=3) as pool:rs=list(pool.map(lambda _:post(t3,body3),range(3)))
+            code,r3=rs[0];assert code==200 and r3['all_accepted'] and all(x==rs[0] for x in rs),rs
+            b3=verify(t3,r3,2);settle(t3,b3,2)
+            assert db('SELECT count(*) FROM vr2_social_publish_intents WHERE task_id=CAST(:t AS uuid)',{'t':t3})==(0,)
+            assert db('SELECT count(*) FROM pipeline_runs WHERE task_id=CAST(:t AS uuid)',{'t':t3})==(0,)
+            assert state(t3,b3)==('failed','failed','PUBLISH_FAILED',0),state(t3,b3)
+            code,social=api(f'/tasks/{t3}/social_publish_jobs');assert code==200 and {v['job_id'] for v in social}=={v['job_id'] for v in r3['results'].values()} and all(v['state']=='unknown' for v in social),social
+            dj=r3['results']['douyin']['job_id'];kj=r3['results']['kuaishou']['job_id']
+            code,detail=api(f'/tasks/{t3}/social_publish_jobs/{dj}');assert code==200 and detail['job_id']==dj and detail['state']=='unknown',detail
+            assert resolve(t3,dj,{**receipt,'external_id':'7412345678901234569'})[0]==200
+            assert state(t3,b3)==('partial_failed','publishing','PUBLISH_PARTIAL_FAILURE',0),state(t3,b3)
+            assert resolve(t3,kj,{**kreceipt,'account_id':ks,'external_id':'PureKuaishouFixture123'})[0]==200
+            assert state(t3,b3)==('succeeded','published',None,1)
+            assert post(t3,body3)[1]['all_published'] is True
+            # Single-platform TaskDetail and equivalent publish_all share one
+            # original batch and identical fingerprint, no facade dispatch.
+            t4,body4=seed();body4['platforms']=['douyin'];body4['platform_meta'].pop('bilibili');body4['platform_options']={'douyin':{}}
+            single={'platform':'douyin','account_id':good,'video_key':body4['video_key'],'meta':body4['platform_meta']['douyin'],'platform_options':{}}
+            code,one=api(f'/tasks/{t4}/actions/publish',single);assert code==200 and one['batch_id'] and one['job_id'],(code,one)
+            code,r4=post(t4,body4);assert code==200 and r4['batch_id']==one['batch_id'] and r4['results']['douyin']['job_id']==one['job_id'],(code,r4)
+            b4=verify(t4,r4,1);settle(t4,b4,1)
+            assert db('SELECT count(*) FROM vr2_social_publish_intents WHERE task_id=CAST(:t AS uuid)',{'t':t4})==(0,)
+            assert resolve(t4,one['job_id'],{**receipt,'external_id':'7412345678901234570'})[0]==200
+            assert state(t4,b4)==('succeeded','published',None,1)
+            code,replay=api(f'/tasks/{t4}/actions/publish',single);assert code==200 and replay['job_id']==one['job_id'] and replay['state']=='published',replay
+            assert api(f'/tasks/{t4}/actions/publish',{**single,'meta':{'title':'different'}})[0]==409
+            assert counters()==before and sorted((runtime/'calls').read_text().splitlines())==sorted(before_calls.splitlines()+['mixed-ok','pure-ks','mixed-ok'])
+            print('PASS: pure SAU single and multi-target native batches, rollback, stable original IDs, facade history and operator settlement without legacy intents or replay',flush=True)
+
 
         finally:
             proc.terminate()

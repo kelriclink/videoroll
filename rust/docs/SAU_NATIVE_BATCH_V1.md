@@ -1,0 +1,7 @@
+# 纯 SAU 投稿原生批次接入（2026-11-25）
+
+基线 `26fba46`。在既有 `VIDEOROLL_V2_NATIVE_OUTBOX_ONLY=true`、`VIDEOROLL_V2_ENABLE_NATIVE_MIXED_PUBLISH=true` 和 `VIDEOROLL_V2_SAU_ENABLE_NATIVE_PUBLISH=true` 开关下，主服务单平台 SAU 和纯 SAU publish_all 复用原混合批次事务、原 publish_batches/publish_jobs/native Outbox 与人工核验接口。保留已部署配置下的旧 facade 路径和历史读取，不修改旧记录、不新增数据库表或迁移。沿用原 rust-mixed-v1 runtime 标记以复用所有权、防重、资产删除保护和批次事件机制；该标记现在也涵盖纯 SAU。纯 SAU 无 B 站 workflow，显式账号、目标、元数据、素材所有权、原审核和有效账号条件不变。不同请求不能强行追加或覆盖已入队批次，现有历史投稿/活动工作流仍要求先核验。原单平台入口与采用等价规范请求的 publish_all 共用原批次；不同 JSON 表达未保证相同指纹。原 facade list/get 同时支持新批次的原稿件 UUID，未确认回执显示 unknown。新增 task lock 下资产所有权、存储 live 状态、文件存在与非空复查；未引入素材内容不可变快照或新的凭据轮换栅栏。
+
+隔离专项 `VIDEOROLL_V2_TEST_BILI_DIRECT_ONLY=true VIDEOROLL_V2_TEST_MIXED_PUBLISH=true` 退出 0，33 个 PASS 标记。纯 SAU 两平台第二目标无效时全部事务回滚；三次并发入队只有一个 batch、同组 publish_jobs；真实 Rust SAU Worker 与无网络 CLI 验证两个未确认结果、历史 list/get、逐个核验直至 succeeded、一次清理事件；单平台与等价 publish_all 返回同一批次和稿件 ID，核验后可幂等回读，不接受修改元数据；无旧 intent、纯 SAU 无 pipeline_run，B 站提交次数不变。旧混合/B站专项保持通过。`CONTRACT_217_ONLY` 退出 0，204 正向、12 拒绝、1 主动阻断、0 异常；原 217 条仅请求证据非全部业务等价。cargo check --locked、fmt --check、Python py_compile 和 git diff --check 通过。日志 `/4t/videoroll-rust-sau-batch-target/SAU_BATCH.log` 与 `CONTRACT_217.log`，隔离 PG 35488。
+
+限制：未彻底退役旧 facade/历史 intent 消费器，原配置仍可走旧路径；统一批次仅覆盖启用上述开关的新任务，独立 SAU 服务入口仍有自身旧兼容逻辑。纯 SAU 全部未知时沿用旧批次 failed 聚合，原稿件仍 unknown 并保留资源，可人工确认后恢复；不自动重放。人工核验非程序平台核验，未实现自动回执、前端核验 UI、生产配置隔离验收、历史接管、账号凭据轮换强化、实际到期清理或完整 smoke。无真实登录/投稿、生产库写入、部署或推送。
