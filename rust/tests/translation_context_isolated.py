@@ -16,6 +16,11 @@ def setting(k,v):
 parallel=os.getenv("VIDEOROLL_TEST_PARALLEL_RAG")=="true"
 web_fault=os.getenv("VIDEOROLL_TEST_RAG_WEB_FAULT")=="true"
 multistep=os.getenv("VIDEOROLL_TEST_RAG_MULTISTEP")=="true"
+wiki=os.getenv("VIDEOROLL_TEST_RAG_WIKI")=="true"
+wiki_fault=os.getenv("VIDEOROLL_TEST_RAG_WIKI_FAULT")=="true"
+assert not wiki_fault or wiki
+assert not wiki or (parallel and not web_fault and not multistep)
+wiki_calls=[]
 assert not multistep or (parallel and not web_fault)
 assert not web_fault or parallel
 web_calls=[]
@@ -30,6 +35,16 @@ class Handler(BaseHTTPRequestHandler):
         global child_failed
         from urllib.parse import parse_qs
         try:
+            if urlsplit(self.path).path=="/w/api.php":
+                assert wiki and self.headers.get("Authorization") is None
+                query=parse_qs(urlsplit(self.path).query)
+                assert query=={"action":["query"],"generator":["search"],"gsrsearch":["Fourth line"],"gsrnamespace":["0"],"gsrlimit":["3"],"prop":["extracts"],"exintro":["1"],"explaintext":["1"],"exchars":["1200"],"exlimit":["3"],"format":["json"],"formatversion":["2"]},query
+                wiki_calls.append(query["gsrsearch"][0])
+                if wiki_fault and len(wiki_calls)==1:
+                    child_failed=True
+                    self.send_error(503,"injected wiki failure")
+                    return
+                return self.reply_json({"query":{"pages":[{"pageid":123,"ns":0,"index":1,"title":"Fixture encyclopedia","extract":"fixture-wikipedia-extract","fullurl":"https://example.invalid/ignored"},{"pageid":123,"ns":0,"index":2,"title":"Duplicate","extract":"duplicate"},{"pageid":456,"ns":1,"title":"Talk","extract":"ignored"}]}})
             assert web_fault
             parsed=urlsplit(self.path)
             assert parsed.path=="/search"
@@ -60,7 +75,7 @@ class Handler(BaseHTTPRequestHandler):
                     result={"terms":[{"term":"Rust","category":"proper_noun","scope":"global","priority":0.9,"need_rag":True,"need_search":True},{"term":"volts","category":"unit_or_number","scope":"global","need_rag":True},{"term":"fabricated term","category":"proper_noun","scope":"global","need_rag":True}]}
                     if parallel:
                         result["terms"][0]["term"]="Rust compiler"
-                        if web_fault:result["terms"][0]["need_search"]=False
+                        if web_fault or wiki:result["terms"][0]["need_search"]=False
                         result["terms"].append({"term":"Fourth line","category":"task_context","scope":"task","priority":0.8,"need_rag":True,"need_search":True})
                     return self.reply_json({"choices":[{"message":{"content":json.dumps(result)}}]})
                 if "VideoRoll term specialist" in messages[0]["content"]:
@@ -69,6 +84,8 @@ class Handler(BaseHTTPRequestHandler):
                     assert term in ("Rust compiler","Fourth line"),payload
                     if web_fault and term=="Fourth line":
                         assert "fixture-web-evidence" in json.dumps(payload["web_evidence"]),payload
+                    elif wiki and term=="Fourth line":
+                        assert payload["web_evidence"]==[{"title":"Fixture encyclopedia","url":"https://en.wikipedia.org/?curid=123","snippet":"fixture-wikipedia-extract"}],payload
                     else:assert not payload["web_evidence"],payload
                     assert "fixture-pending" not in json.dumps(payload),payload
                     if term=="Rust compiler":
@@ -78,7 +95,7 @@ class Handler(BaseHTTPRequestHandler):
                         child_calls[term]=child_calls.get(term,0)+1
                         attempt=child_calls[term]
                     try:
-                        if attempt==1 and not web_fault:barrier.wait()
+                        if attempt==1 and not web_fault and not wiki_fault:barrier.wait()
                         time.sleep(.15)
                         if multistep and term=="Fourth line":
                             if attempt==1:
@@ -91,7 +108,7 @@ class Handler(BaseHTTPRequestHandler):
                                 child_failed=True
                                 self.send_error(503,"injected failure after extra lookup")
                                 return
-                        if term=="Fourth line" and attempt==1 and not web_fault and not multistep:
+                        if term=="Fourth line" and attempt==1 and not web_fault and not multistep and not wiki_fault:
                             child_failed=True
                             # Fail one specialist only. The other must be committed and reused.
                             self.send_error(503,"injected specialist failure")
@@ -146,11 +163,12 @@ server=ThreadingHTTPServer(("127.0.0.1",0),Handler)
 threading.Thread(target=server.serve_forever,daemon=True).start()
 base=f"http://127.0.0.1:{server.server_address[1]}"
 setting("subtitle.auto_profile",{"translate_enabled":True,"translate_provider":"openai","translate_model_provider_id":"legacy","translate_glossary":{"volts":"伏特"},"target_lang":"zh","bilingual":False,"auto_publish":False,"auto_publish_platforms":[],"auto_dub_p2":False,"burn_in":False})
-setting("subtitle.translate",{"default_batch_size":2,"default_enable_summary":True,"rag_enabled":True,"rag_auto_discover_terms":True,"rag_search_enabled":web_fault,"rag_agent_parallelism":2 if parallel else 1,"rag_domain":"electronics","openai":{"base_url":base+"/v1","model":"fixture-translation","api_key_enc":"dbplain:v1:fixture-translation-key"}})
+setting("subtitle.translate",{"default_batch_size":2,"default_enable_summary":True,"rag_enabled":True,"rag_auto_discover_terms":True,"rag_search_enabled":web_fault,"rag_wiki_enabled":wiki,"rag_agent_parallelism":2 if parallel else 1,"rag_domain":"electronics","openai":{"base_url":base+"/v1","model":"fixture-translation","api_key_enc":"dbplain:v1:fixture-translation-key"}})
 setting("subtitle.rag",{"enabled":False,"research_blocking":parallel,"max_research_steps":2,"max_web_searches":2 if web_fault else 0,"web_search_endpoint":base+"/search" if web_fault else None})
 setting("youtube.settings",{"home_scan_enabled":False})
 env={k:v for k,v in os.environ.items() if k in ("PATH","HOME","LANG","LC_ALL","LD_LIBRARY_PATH","DATABASE_URL","VIDEOROLL_V2_STORAGE_ROOT","VIDEOROLL_V2_INTERNAL_TOKEN","INTERNAL_API_SECRET")}
 env.update(VIDEOROLL_V2_NATIVE_OUTBOX_ONLY="true",VIDEOROLL_V2_STANDALONE="true",VIDEOROLL_V2_SOURCE_SCANNER="false",VIDEOROLL_V2_ENABLE_NATIVE_BILIBILI="false",VIDEOROLL_V2_ENABLE_SAU_PUBLISH="false",VIDEOROLL_V2_ENABLE_LEGACY_PUBLISH="false",VIDEOROLL_V2_COMPAT_WRITE="false",VIDEOROLL_V2_REMOTE_RENDER="false",VIDEOROLL_V2_WORKERS="1",VIDEOROLL_V2_ASR_ENDPOINT=base+"/v1/audio/transcriptions",VIDEOROLL_V2_ASR_MODEL="whisper-fixture")
+env.update(VIDEOROLL_V2_ALLOW_TEST_WIKI_LOOPBACK="true",VIDEOROLL_V2_TEST_WIKI_ENDPOINT=base+"/w/api.php")
 task=uuid.uuid4();other=uuid.uuid4()
 namespace=uuid.UUID("35a14aca-ebce-46a0-96a1-bae6b30d83e1")
 def mid(s):return uuid.uuid5(namespace,f"videoroll-translation-memory|{task}|zh|{s.casefold()}")
@@ -227,13 +245,13 @@ try:
         assert state=="succeeded" and plan["gate_completed"],(state,plan)
         assert c.execute("SELECT count(*) FROM translation_knowledge_items").fetchone()[0]==(3 if multistep else 2)
         if parallel:
-            assert (web_fault or peak==2) and child_calls=={"Rust compiler":1,"Fourth line":1 if web_fault else (3 if multistep else 2)} and research_calls==["gate"],(peak,child_calls,research_calls)
+            assert (web_fault or wiki_fault or peak==2) and child_calls=={"Rust compiler":1,"Fourth line":1 if (web_fault or wiki_fault) else (3 if multistep else 2)} and research_calls==["gate"],(peak,child_calls,research_calls)
             assert len(plan["gate_candidates"])==2 and plan["parallelism"]==2
             master=uuid.UUID(plan["master_agent_id"])
             assert result["master_agent_id"]==str(master) and result["failed_children"]==0
             parent=c.execute("SELECT agent_type,status,checkpoint FROM translation_agent_runs WHERE id=%s",(master,)).fetchone()
             assert parent[:2]==("rag_master","succeeded"),parent
-            assert parent[2]["model_calls"]==(3 if web_fault else (5 if multistep else 4)) and parent[2]["model_budget"]==6,parent
+            assert parent[2]["model_calls"]==(3 if (web_fault or wiki_fault) else (5 if multistep else 4)) and parent[2]["model_budget"]==6,parent
             assert parent[2]["web_calls"]==parent[2]["web_budget"]==(2 if web_fault else 0),parent
             assert parent[2]["knowledge_calls"]==(3 if multistep else 2) and parent[2]["knowledge_budget"]==8,parent
             children=c.execute("SELECT term,status,checkpoint->>'attempts' FROM translation_agent_runs WHERE parent_agent_run_id=%s ORDER BY term",(master,)).fetchall()
@@ -242,6 +260,15 @@ try:
             assert all(isinstance(v,dict) for _,v in receipts),receipts
             assert c.execute("SELECT count(*) FROM translation_agent_runs WHERE parent_agent_run_id=%s AND jsonb_typeof(checkpoint->'knowledge_receipt')='array'",(master,)).fetchone()[0]==2
             assert c.execute("SELECT count(*) FROM translation_agent_events e JOIN translation_agent_runs r ON r.id=e.run_id WHERE r.parent_agent_run_id=%s AND e.action='search_knowledge' AND e.status='succeeded'",(master,)).fetchone()[0]==2
+            assert parent[2]["wiki_calls"]==(2 if wiki_fault else int(wiki)) and parent[2]["wiki_budget"]==(2 if wiki else 0),parent
+            assert wiki_calls==(["Fourth line"]*(2 if wiki_fault else int(wiki))),wiki_calls
+            if wiki:
+                receipt=c.execute("SELECT checkpoint->'wiki_receipt' FROM translation_agent_runs WHERE parent_agent_run_id=%s AND term='Fourth line'",(master,)).fetchone()[0]
+                assert len(receipt)==1 and receipt[0]["url"]=="https://en.wikipedia.org/?curid=123",receipt
+                assert c.execute("SELECT count(*) FROM translation_agent_events e JOIN translation_agent_runs r ON r.id=e.run_id WHERE r.parent_agent_run_id=%s AND e.action='wiki_search' AND e.status='succeeded'",(master,)).fetchone()[0]==1
+                assert c.execute("SELECT count(*) FROM translation_agent_events e JOIN translation_agent_runs r ON r.id=e.run_id WHERE r.parent_agent_run_id=%s AND e.action='wiki_search' AND e.status='failed'",(master,)).fetchone()[0]==int(wiki_fault)
+                assert "fixture-wikipedia-extract" in result["context"]["prompt"],result
+                print("PASS: fixed Wikipedia search/extract, page ID provenance, independent budget and receipt recovery",flush=True)
             if multistep:
                 assert str(extra_id) in meta["rag_evidence_ids"],meta
                 extra=c.execute("SELECT checkpoint->>'extra_query',checkpoint->'extra_receipt' FROM translation_agent_runs WHERE parent_agent_run_id=%s AND term='Fourth line'",(master,)).fetchone()

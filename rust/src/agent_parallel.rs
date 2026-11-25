@@ -5,7 +5,7 @@ use super::*;
 use futures_util::{StreamExt, stream};
 use sqlx::{Postgres, Transaction};
 
-const REVISION: i32 = 3;
+const REVISION: i32 = 4;
 const CHILD_ATTEMPTS: u64 = 2;
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -58,7 +58,7 @@ async fn parent(
     budget: u64,
 ) -> AppResult<Value> {
     let mut tx = fenced(db, task.job).await?;
-    let checkpoint = json!({"revision":REVISION,"model_calls":0,"web_calls":0,"model_budget":budget,"web_budget":task.settings.max_web_searches,"knowledge_calls":0,"knowledge_budget":task.settings.max_research_steps as u64 * CHILD_ATTEMPTS * 2});
+    let checkpoint = json!({"revision":REVISION,"model_calls":0,"web_calls":0,"model_budget":budget,"web_budget":task.settings.max_web_searches,"wiki_calls":0,"wiki_budget":if task.settings.wiki_enabled {tools::WIKI_BUDGET}else{0},"knowledge_calls":0,"knowledge_budget":task.settings.max_research_steps as u64 * CHILD_ATTEMPTS * 2});
     sqlx::query("INSERT INTO translation_agent_runs(id,agent_type,status,task_id,target_lang,domain,checkpoint,checkpoint_version,checkpointed_at) VALUES($1,'rag_master','running',$2,$3,$4,$5,$6,now()) ON CONFLICT(id) DO NOTHING")
         .bind(id).bind(task.job.task_id).bind(task.target_lang).bind(domain).bind(checkpoint).bind(REVISION).execute(&mut *tx).await?;
     let ck:Value=sqlx::query_scalar("SELECT checkpoint FROM translation_agent_runs WHERE id=$1 AND task_id=$2 AND agent_type='rag_master' AND checkpoint_version=$3 FOR UPDATE")
@@ -84,6 +84,7 @@ async fn reserve(
         None => ("model_calls", "model_budget"),
         Some(RetrievalKind::Knowledge) => ("knowledge_calls", "knowledge_budget"),
         Some(RetrievalKind::Web) => ("web_calls", "web_budget"),
+        Some(RetrievalKind::Wikipedia) => ("wiki_calls", "wiki_budget"),
     };
     let count = ck[counter]
         .as_u64()
@@ -92,7 +93,7 @@ async fn reserve(
         .as_u64()
         .ok_or_else(|| AppError::Invalid("research budget limit invalid".into()))?;
     if count >= budget {
-        if kind == Some(RetrievalKind::Web) {
+        if matches!(kind, Some(RetrievalKind::Web | RetrievalKind::Wikipedia)) {
             return Ok(false);
         }
         return Err(AppError::Unavailable(
@@ -166,6 +167,7 @@ async fn child(
     candidate: &Candidate,
     original: &crate::rag_original_v1::Settings,
     allow_web: bool,
+    allow_wiki: bool,
 ) -> AppResult<ChildResult> {
     let id = Uuid::new_v5(&parent, candidate.term.to_lowercase().as_bytes());
     let mut tx = fenced(db, task.job).await?;
@@ -263,6 +265,39 @@ async fn child(
             tx.commit().await?;
             value
         };
+        // Wikipedia has an independent receipt: retry only the failed lookup.
+        // Initial knowledge and configured web search remain reusable.
+        let mut web = web;
+        if allow_wiki {
+            let wiki: Vec<WebEvidence> = if let Some(value)=ck.get("wiki_receipt") {
+                serde_json::from_value(value.clone()).map_err(|_| AppError::Invalid("invalid Wikipedia receipt".into()))?
+            } else {
+                let mut tx=fenced(db,task.job).await?;
+                let permitted=reserve(&mut tx,parent,Some(RetrievalKind::Wikipedia)).await?;
+                event(&mut tx,id,"wiki_search",if permitted{"running"}else{"skipped"},json!({})).await?;
+                tx.commit().await?;
+                if permitted {
+                    let result=RetrievalQuery::new(RetrievalKind::Wikipedia,&candidate.term)?.wikipedia(db,task,allow_wiki).await;
+                    let mut tx=fenced(db,task.job).await?;
+                    match result {
+                        Ok(rows)=>{
+                            receipt(&mut tx,id,"wiki_receipt",json!(rows)).await?;
+                            event(&mut tx,id,"wiki_search","succeeded",json!({"count":rows.len()})).await?;
+                            tx.commit().await?;
+                            rows
+                        }
+                        Err(e)=>{
+                            event(&mut tx,id,"wiki_search","failed",json!({})).await?;
+                            tx.commit().await?;
+                            return Err(e);
+                        }
+                    }
+                }else{vec![]}
+            };
+            web.extend(wiki);
+            let mut seen=HashSet::new();
+            web.retain(|h|seen.insert(h.url.clone()));
+        }
         let mut knowledge = knowledge;
         let mut query = ck.get("extra_query").map(|v|v.as_str().ok_or_else(||AppError::Invalid("invalid specialist query checkpoint".into()))).transpose()?.map(str::to_owned);
         let mut extra: Option<Vec<SearchHit>> = ck.get("extra_receipt").map(|v|serde_json::from_value(v.clone())).transpose().map_err(|_|AppError::Invalid("invalid specialist extra receipt".into()))?;
@@ -350,7 +385,7 @@ fn parent_id(
 ) -> Uuid {
     let identity = hex::encode(Sha256::digest(
         format!(
-            "parallel-v3|{fingerprint}|{}|{}|{}",
+            "parallel-v4|{fingerprint}|{}|{}|{}",
             provider.id, provider.model, provider.endpoint
         )
         .as_bytes(),
@@ -398,16 +433,19 @@ pub(super) async fn run(
         // Allocate web eligibility deterministically by candidate priority.
         // The persisted shared reservation additionally bounds all retries.
         let mut remaining=task.settings.max_web_searches;
+        let mut wiki_remaining=if task.settings.wiki_enabled{tools::WIKI_BUDGET}else{0};
         let planned=candidates.iter().enumerate().map(|(index,c)|{
             let web=c.need_search&&remaining>0&&task.settings.web_search_endpoint.is_some();
             if web{remaining-=1;}
-            (index,c,web)
+            let wiki=c.need_search&&wiki_remaining>0;
+            if wiki{wiki_remaining-=1;}
+            (index,c,web,wiki)
         }).collect::<Vec<_>>();
         let original=&original;
         type ChildFuture<'a> = std::pin::Pin<Box<dyn std::future::Future<Output=(usize,AppResult<ChildResult>)>+Send+'a>>;
         let mut futures:Vec<ChildFuture<'_>>=Vec::new();
-        for (index,c,web) in planned {
-            futures.push(Box::pin(async move{(index,child(db,task,client,provider,pid,source,c,original,web).await)}));
+        for (index,c,web,wiki) in planned {
+            futures.push(Box::pin(async move{(index,child(db,task,client,provider,pid,source,c,original,web,wiki).await)}));
         }
         let mut outcomes=stream::iter(futures).buffer_unordered(task.parallelism).collect::<Vec<_>>().await;
         outcomes.sort_by_key(|(i,_)|*i);
