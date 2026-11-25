@@ -272,6 +272,21 @@ pub async fn manual(state: &AppState, task_id: Uuid, raw: Value) -> AppResult<Va
     }
     let fingerprint = digest(account, platform, &video, cover.as_deref(), &meta, &options)?;
     let mut tx = state.db.pool.begin().await?;
+    let owner: Option<String> =
+        sqlx::query_scalar("SELECT runtime_owner FROM tasks WHERE id=$1 FOR UPDATE")
+            .bind(task_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    if owner.as_deref() != Some("rust") {
+        return Err(AppError::Conflict("Rust task ownership changed".into()));
+    }
+    let mixed: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM publish_batches WHERE task_id=$1 AND request_json->>'runtime'='rust-mixed-v1')")
+        .bind(task_id).fetch_one(&mut *tx).await?;
+    if mixed {
+        return Err(AppError::Conflict(
+            "mixed batch owns admission; use publish_all".into(),
+        ));
+    }
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))")
         .bind(format!("v2:sau:{}:{}:{}", task_id, platform, account))
         .execute(&mut *tx)
@@ -594,7 +609,7 @@ pub async fn reconcile_receipts(db: &Database) -> AppResult<u64> {
     }
     Ok(updated)
 }
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct PublishAllRequest {
     account_id: Option<String>,
@@ -659,12 +674,289 @@ fn batch_platforms(input: &PublishAllRequest) -> AppResult<Vec<String>> {
     }
     Ok(platforms.clone())
 }
+// Native mixed admission is deliberately opt-in: both consumers must be
+// configured against the same original DB and media root, with Python stopped.
+fn mixed_enabled() -> bool {
+    crate::outbox_dispatcher::native_only()
+        && std::env::var("VIDEOROLL_V2_ENABLE_NATIVE_MIXED_PUBLISH")
+            .ok()
+            .as_deref()
+            == Some("true")
+        && std::env::var("VIDEOROLL_V2_SAU_ENABLE_NATIVE_PUBLISH")
+            .ok()
+            .as_deref()
+            == Some("true")
+}
+async fn mixed_receipt(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    task: Uuid,
+    fingerprint: &str,
+) -> AppResult<Option<Value>> {
+    let row=sqlx::query("SELECT id,request_json,expected_targets FROM publish_batches WHERE task_id=$1 AND request_json->>'runtime'='rust-mixed-v1' FOR UPDATE")
+        .bind(task).fetch_optional(&mut **tx).await?;
+    let Some(row) = row else { return Ok(None) };
+    let request: Value = row.try_get("request_json")?;
+    if request["fingerprint"].as_str() != Some(fingerprint) {
+        return Err(AppError::Conflict(
+            "mixed batch request differs from durable admission; reconcile before changing targets"
+                .into(),
+        ));
+    }
+    let batch: Uuid = row.try_get("id")?;
+    let expected: Value = row.try_get("expected_targets")?;
+    let keys = crate::bilibili_batch_reconcile_v1::keys(&expected)?;
+    let jobs=sqlx::query("SELECT id,platform::text AS platform,account_id,state::text AS state,aid,bvid,external_id,external_url,response_json FROM publish_jobs WHERE task_id=$1 AND batch_id=$2")
+        .bind(task).bind(batch).fetch_all(&mut **tx).await?;
+    let mut results = serde_json::Map::new();
+    let mut errors = serde_json::Map::new();
+    let mut ok = 0;
+    let mut published = 0;
+    let mut seen = HashSet::new();
+    for j in jobs {
+        let p: String = j.try_get("platform")?;
+        let a: Option<Uuid> = j.try_get("account_id")?;
+        let key = format!(
+            "{p}:{}",
+            a.map(|v| v.to_string()).unwrap_or("default".into())
+        );
+        if !keys.contains(&key) || !seen.insert(key) {
+            return Err(AppError::Conflict(
+                "mixed batch receipt identity mismatch".into(),
+            ));
+        }
+        let status: String = j.try_get("state")?;
+        let response: Option<Value> = j.try_get("response_json")?;
+        let external_id: Option<String> = j.try_get("external_id")?;
+        let external_url: Option<String> = j.try_get("external_url")?;
+        let confirmed = matches!(status.as_str(), "published" | "submitted")
+            && (external_id.as_ref().is_some_and(|v| !v.is_empty())
+                || external_url.as_ref().is_some_and(|v| !v.is_empty()));
+        let uncertain = matches!(status.as_str(), "failed" | "unknown")
+            || (matches!(status.as_str(), "published" | "submitted") && !confirmed);
+        if uncertain {
+            errors.insert(
+                p.clone(),
+                json!("publication failed or remains unverified; reconcile before retry"),
+            );
+        } else {
+            ok += 1;
+        }
+        if confirmed {
+            published += 1;
+        }
+        results.insert(p.clone(),json!({"platform":p,"job_id":j.try_get::<Uuid,_>("id")?,"state":status,"account_id":a,"aid":j.try_get::<Option<String>,_>("aid")?,"bvid":j.try_get::<Option<String>,_>("bvid")?,"external_id":external_id,"external_url":external_url,"response":response}));
+    }
+    let n = keys.len();
+    if seen.len() != n {
+        return Err(AppError::Conflict(
+            "mixed batch has missing durable targets".into(),
+        ));
+    }
+    Ok(Some(
+        json!({"batch_id":batch,"results":results,"errors":errors,"platform_count":n,"ok_count":ok,"error_count":errors.len(),"all_accepted":ok==n,"has_any_accepted":ok>0,"all_published":published==n,"all_succeeded":published==n}),
+    ))
+}
+async fn mixed_publish(state: &AppState, task: Uuid, input: PublishAllRequest) -> AppResult<Value> {
+    if !mixed_enabled() {
+        return Err(AppError::Conflict("native mixed publication requires native-only outbox and explicit native SAU/mixed opt-in".into()));
+    }
+    let platforms = input
+        .platforms
+        .as_ref()
+        .ok_or_else(|| AppError::Invalid("explicit platforms required".into()))?;
+    if platforms.len() < 2
+        || platforms.len() > 4
+        || input.skip_review
+        || input.force_retry
+        || input.fresh_batch
+    {
+        return Err(AppError::Invalid(
+            "mixed publication requires 2–4 explicit targets without bypass or forced retry".into(),
+        ));
+    }
+    let mut unique = HashSet::new();
+    for p in platforms {
+        if p != "bilibili" {
+            platform(p)?;
+        }
+        if !unique.insert(p.as_str()) {
+            return Err(AppError::Invalid("duplicate platform".into()));
+        }
+    }
+    for k in input
+        .account_ids
+        .keys()
+        .chain(input.platform_meta.keys())
+        .chain(input.platform_options.keys())
+    {
+        if !unique.contains(k.as_str()) {
+            return Err(AppError::Invalid("options for unrequested platform".into()));
+        }
+    }
+    let canonical = serde_json::to_value(&input)
+        .map_err(|_| AppError::Invalid("invalid mixed request".into()))?;
+    let fingerprint = format!(
+        "{:x}",
+        Sha256::digest(
+            serde_json::to_vec(&canonical)
+                .map_err(|_| AppError::Invalid("invalid mixed request".into()))?
+        )
+    );
+    // Fast replay works after media retention or account rotation; no side effect.
+    {
+        let mut tx = state.db.pool.begin().await?;
+        sqlx::query("SELECT id FROM tasks WHERE id=$1 AND runtime_owner='rust' FOR UPDATE")
+            .bind(task)
+            .fetch_one(&mut *tx)
+            .await?;
+        if let Some(result) = mixed_receipt(&mut tx, task, &fingerprint).await? {
+            tx.commit().await?;
+            return Ok(result);
+        }
+    }
+    shared_media_root(&state.config).await?;
+    let video = asset_key(&state.db, task, "video_final", input.video_key.as_deref()).await?;
+    let cover = match input.cover_key.as_deref() {
+        Some(k) => Some(asset_key(&state.db, task, "cover_image", Some(k)).await?),
+        None => None,
+    };
+    let path = state.storage.resolve_existing(&video).await?;
+    crate::media::ffmpeg::probe_video(&state.config.ffprobe_binary, &path).await?;
+    let mut expected = Vec::new();
+    let mut socials = Vec::new();
+    let mut bili = None;
+    for p in platforms {
+        let account = input
+            .account_ids
+            .get(p)
+            .or(input.account_id.as_ref())
+            .map(|v| {
+                Uuid::parse_str(v).map_err(|_| AppError::Invalid("invalid account UUID".into()))
+            })
+            .transpose()?;
+        let meta = input.platform_meta.get(p).or(input.meta.as_ref()).cloned();
+        let options = input
+            .platform_options
+            .get(p)
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        if !options.is_object() || serde_json::to_vec(&options).map_or(true, |v| v.len() > 16384) {
+            return Err(AppError::Invalid("invalid platform options".into()));
+        }
+        expected.push(json!({"platform":p,"account_id":account,"key":format!("{p}:{}",account.map(|v|v.to_string()).unwrap_or("default".into()))}));
+        if p == "bilibili" {
+            let saved = crate::publish_meta::saved(&state.db, task).await?;
+            let supplied = meta.map(crate::publish_meta::normalized).transpose()?;
+            if saved
+                .as_ref()
+                .zip(supplied.as_ref())
+                .is_some_and(|(a, b)| a != b)
+            {
+                return Err(AppError::Conflict(
+                    "save changed Bilibili draft first".into(),
+                ));
+            }
+            let meta = saved
+                .or(supplied)
+                .ok_or_else(|| AppError::Invalid("Bilibili metadata missing".into()))?;
+            if options
+                .as_object()
+                .unwrap()
+                .keys()
+                .any(|k| k != "typeid_mode")
+            {
+                return Err(AppError::Invalid("unsupported Bilibili option".into()));
+            }
+            let mode = options
+                .get("typeid_mode")
+                .map(|v| {
+                    v.as_str()
+                        .ok_or_else(|| AppError::Invalid("typeid_mode must be a string".into()))
+                })
+                .transpose()?
+                .or(input.typeid_mode.as_deref())
+                .unwrap_or("meta");
+            bili=Some(crate::bilibili_publish_v1::prepare_mixed(state,json!({"task_id":task,"account_id":account,"video":{"type":"storage","key":video},"cover":cover.as_ref().map(|k|json!({"type":"storage","key":k})),"video_parts":input.video_parts.clone().unwrap_or_default(),"meta":meta,"typeid_mode":mode})).await?);
+        } else {
+            if !crate::publish_platforms::social_enabled(&state.config, &state.db, p).await? {
+                return Err(AppError::Conflict("SAU target disabled".into()));
+            }
+            let account =
+                account.ok_or_else(|| AppError::Invalid("explicit SAU account required".into()))?;
+            let meta = crate::sau_publish_native_v1::normalize_meta(
+                &meta.ok_or_else(|| AppError::Invalid("explicit SAU metadata required".into()))?,
+                p,
+            )?;
+            crate::publish_review::ensure_approved(
+                &state.db,
+                &state.storage,
+                &state.config,
+                task,
+                &meta,
+            )
+            .await?;
+            socials.push((p.clone(), account, meta, options));
+        }
+    }
+    let mut tx = state.db.pool.begin().await?;
+    let status:Option<String>=sqlx::query_scalar("SELECT status::text FROM tasks WHERE id=$1 AND runtime_owner='rust' AND source_license::text<>'unknown' FOR UPDATE").bind(task).fetch_optional(&mut *tx).await?;
+    if let Some(result) = mixed_receipt(&mut tx, task, &fingerprint).await? {
+        tx.commit().await?;
+        return Ok(result);
+    }
+    if !matches!(
+        status.as_deref(),
+        Some("rendered" | "approved" | "ready_for_review" | "subtitle_ready")
+    ) {
+        return Err(AppError::Conflict(
+            "mixed admission requires a licensed, ready Rust task".into(),
+        ));
+    }
+    let occupied:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM publish_jobs WHERE task_id=$1) OR EXISTS(SELECT 1 FROM publish_batches WHERE task_id=$1) OR EXISTS(SELECT 1 FROM vr2_social_publish_intents WHERE task_id=$1) OR EXISTS(SELECT 1 FROM vr2_workflows WHERE task_id=$1 AND state IN ('running','paused','unknown')) OR EXISTS(SELECT 1 FROM vr2_jobs WHERE task_id=$1 AND stage='publish' AND state IN ('pending','running','awaiting','unknown','succeeded'))").bind(task).fetch_one(&mut *tx).await?;
+    if occupied {
+        return Err(AppError::Conflict("existing publication or active workflow requires reconciliation before mixed admission".into()));
+    }
+    let batch = Uuid::new_v4();
+    sqlx::query("INSERT INTO publish_batches(id,task_id,state,expected_targets,request_json) VALUES($1,$2,'active',$3,$4)").bind(batch).bind(task).bind(json!(expected)).bind(json!({"runtime":"rust-mixed-v1","fingerprint":fingerprint,"platforms":platforms})).execute(&mut *tx).await?;
+    // Shared original Bilibili admission validates P1/P2, file and ownership in
+    // the SAME transaction. No commit or HTTP handoff until all targets exist.
+    let mut bili = bili.ok_or_else(|| AppError::Invalid("Bilibili target required".into()))?;
+    bili.bind_batch(batch);
+    crate::bilibili_publish_v1::enqueue_prepared(state, &mut tx, bili, false).await?;
+    // The shared native SAU enqueue persists original outbox + inbox atomically.
+    for (p, account, meta, options) in socials {
+        let name:Option<String>=sqlx::query_scalar("SELECT name FROM accounts WHERE id=$1 AND platform::text=$2 AND is_active AND check_state='valid' FOR UPDATE").bind(account).bind(&p).fetch_optional(&mut *tx).await?;
+        let name = name.ok_or_else(|| {
+            AppError::Conflict("SAU account missing, inactive or unvalidated".into())
+        })?;
+        crate::sau_login_native_v1::ensure_not_logging_in(&mut tx, &p, &name).await?;
+        let id = Uuid::new_v4();
+        let operation = format!("publish-job:{id}");
+        let saved = json!({"platform":p,"account_id":account,"account_name":name,"video":{"type":"storage","key":video},"cover":cover.as_ref().map(|k|json!({"type":"storage","key":k})),"meta":meta,"platform_options":options});
+        sqlx::query("INSERT INTO publish_jobs(id,task_id,batch_id,platform,account_id,cover_key,meta_json,state,operation_key) SELECT $1,$2,$3,platform,id,$4,$5,'submitting',$6 FROM accounts WHERE id=$7").bind(id).bind(task).bind(batch).bind(&cover).bind(saved).bind(&operation).bind(account).execute(&mut *tx).await?;
+        crate::sau_worker_native_v1::enqueue(&mut tx, id, &operation).await?;
+    }
+    sqlx::query("UPDATE tasks SET active_publish_batch_id=$2,status='publishing',error_code=NULL,error_message=NULL,updated_at=now() WHERE id=$1").bind(task).bind(batch).execute(&mut *tx).await?;
+    let result = mixed_receipt(&mut tx, task, &fingerprint)
+        .await?
+        .ok_or_else(|| AppError::Conflict("mixed admission missing batch".into()))?;
+    tx.commit().await?;
+    Ok(result)
+}
+
 async fn publish_all(
     State(state): State<AppState>,
     Path(task_id): Path<Uuid>,
     Json(input): Json<PublishAllRequest>,
 ) -> AppResult<Json<Value>> {
     read_task(&state.db, task_id).await?;
+    if input
+        .platforms
+        .as_ref()
+        .is_some_and(|p| p.iter().any(|v| v == "bilibili"))
+    {
+        return mixed_publish(&state, task_id, input).await.map(Json);
+    }
     let platforms = batch_platforms(&input)?;
     // The old contract permits partial per-target outcomes. Native V2 returns
     // errors explicitly and never reports a partially accepted batch as done.

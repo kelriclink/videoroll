@@ -548,6 +548,23 @@ async fn publish_jobs(
     Query(q): Query<LimitQuery>,
 ) -> AppResult<Json<Vec<Value>>> {
     read_task(&state.db, id).await?;
+    // A mixed batch owns original publish_jobs, not the synthetic stage ID.
+    // Return each original target once, with the persisted batch identity.
+    let mixed: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM publish_batches WHERE task_id=$1 AND request_json->>'runtime'='rust-mixed-v1')")
+        .bind(id).fetch_one(&state.db.pool).await?;
+    if mixed {
+        let rows = sqlx::query_scalar::<_, Value>("SELECT jsonb_build_object(
+          'id',p.id,'task_id',p.task_id,'batch_id',p.batch_id,'platform',p.platform::text,
+          'state',CASE WHEN p.state::text='submitted' AND p.response_json->>'receipt_verified'='false'
+            AND NULLIF(p.external_id,'') IS NULL AND NULLIF(p.external_url,'') IS NULL THEN 'unknown' ELSE p.state::text END,
+          'aid',p.aid::text,'bvid',p.bvid,'external_id',p.external_id,'external_url',p.external_url,
+          'account_id',p.account_id,'upload_progress',p.upload_progress,'upload_active',p.upload_active,
+          'started_at',p.started_at,'finished_at',p.finished_at,'created_at',p.created_at,'updated_at',p.updated_at)
+          FROM publish_jobs p WHERE p.task_id=$1 ORDER BY p.created_at DESC,p.id DESC LIMIT $2")
+          .bind(id).bind(q.limit.unwrap_or(50).clamp(1,500)).fetch_all(&state.db.pool).await?;
+        return Ok(Json(rows));
+    }
+
     let rows = sqlx::query(
         "SELECT id,task_id,state,result,last_error,started_at,finished_at,created_at,updated_at
          FROM vr2_jobs WHERE task_id=$1 AND stage='publish'

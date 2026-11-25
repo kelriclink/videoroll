@@ -592,3 +592,8 @@ with engine.begin() as db:
     db.execute(text("INSERT INTO publish_jobs(id,task_id,platform,state) VALUES(CAST(:id AS uuid),CAST(:t AS uuid),'bilibili','draft')"),{'id':str(uuid4()),'t':str(task)})
 assert task_action(task,{'meta':payload['meta']})[0]==409
 print('PASS: TaskDetail unknown result remains fenced and historical draft blocks new submission')
+
+
+if os.environ.get("VIDEOROLL_V2_TEST_MIXED_PUBLISH")=="true":
+    from mixed_publish_isolated import run_mixed
+    run_mixed(engine,root,api,fixture,process,counters,worker)

@@ -61,7 +61,7 @@ fn text(v: Option<&Value>) -> String {
         _ => String::new(),
     }
 }
-fn normalize_meta(meta: &Value, platform: &str) -> AppResult<Value> {
+pub(crate) fn normalize_meta(meta: &Value, platform: &str) -> AppResult<Value> {
     if !meta.is_object() || serde_json::to_vec(meta).map_or(true, |v| v.len() > 65536) {
         return Err(AppError::Invalid(
             "meta must be a JSON object <=64 KiB".into(),
@@ -288,6 +288,13 @@ pub(crate) async fn publish(
         let id: Uuid = prior.try_get("id")?;
         let existing_batch: Option<Uuid> = prior.try_get("batch_id")?;
         let status: String = prior.try_get("state")?;
+        let mixed: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM publish_batches WHERE task_id=$1 AND request_json->>'runtime'='rust-mixed-v1')")
+            .bind(body.task_id).fetch_one(&mut *tx).await?;
+        if mixed && body.batch_id != existing_batch && body.batch_id.is_some() {
+            return Err(AppError::Conflict(
+                "mixed publication receipt cannot be rebound".into(),
+            ));
+        }
         let mut result_id = id;
         if let Some(batch) = body.batch_id.filter(|_| body.batch_id != existing_batch) {
             if matches!(status.as_str(), "submitted" | "published") {
@@ -326,6 +333,13 @@ pub(crate) async fn publish(
         let response = read_receipt(&mut tx, result_id).await?;
         tx.commit().await?;
         return Ok(Json(response));
+    }
+    let mixed: Option<Uuid> = sqlx::query_scalar("SELECT id FROM publish_batches WHERE task_id=$1 AND request_json->>'runtime'='rust-mixed-v1' LIMIT 1")
+        .bind(body.task_id).fetch_optional(&mut *tx).await?;
+    if mixed.is_some() {
+        return Err(AppError::Conflict(
+            "mixed batch owns all admission; use publish_all".into(),
+        ));
     }
     if task_status == "canceled" {
         return Err(AppError::Conflict(
