@@ -416,6 +416,8 @@ results = []
 if args.all_services:
     from contract_media_v3 import probe
     results.extend(probe(args.base,token))
+    from contract_render_worker_v4 import probe as worker_probe
+    results.extend(worker_probe(args.base,token))
 covered={(r["method"],r["path"]) for r in results}
 for row in ordered:
     if (row["method"],row["path"]) in covered:continue
@@ -598,6 +600,14 @@ if args.all_services:
                     db.execute("INSERT INTO translation_dictionary_sources(id,name,slug,source_lang,target_lang,entry_count) VALUES (%s,'Contract dictionary',%s,'en','zh',1)",(source_id,'contract-'+source_id))
                     db.execute("INSERT INTO translation_dictionary_entries(id,source_id,source_lang,target_lang,term,normalized_term,translations,translation_text) VALUES (%s,%s,'en','zh','contract term','contract term','[\"测试术语\"]'::jsonb,'测试术语')",(entry_id,source_id))
                     service_context.update(task_id=task_id,job_id=job_id,run_id=run_id,source_id=source_id,entry_id=entry_id)
+                    # Separate native subtitle creation task with an actual source file.
+                    create_task=str(uuid.uuid4());media_key=f"v2/contract-subtitle/{create_task}/input.mp4"
+                    media=(root/"target/contract-v3-media.mp4").read_bytes()
+                    target=Path(os.environ["VIDEOROLL_V2_STORAGE_ROOT"])/media_key
+                    target.parent.mkdir(parents=True,exist_ok=True);target.write_bytes(media)
+                    db.execute("INSERT INTO tasks(id,source_type,source_license,status,runtime_owner) VALUES(%s,'local','own','ingested','rust')",(create_task,))
+                    db.execute("INSERT INTO assets(id,task_id,kind,storage_key,sha256,size_bytes) VALUES(%s,%s,'video_raw',%s,%s,%s)",(uuid.uuid4(),create_task,media_key,hashlib.sha256(media).hexdigest(),len(media)))
+                    service_context.update(create_task=create_task,media_key=media_key,import_slug="contract-v4-"+uuid.uuid4().hex[:12],knowledge_term="contract knowledge "+uuid.uuid4().hex[:12])
                 elif service=="bilibili_publisher":
                     task_id,job_id=[str(uuid.uuid4()) for _ in range(2)]
                     db.execute("INSERT INTO tasks(id,source_type,source_license,status) VALUES (%s,'local','own','ready_for_review')",(task_id,))
@@ -633,6 +643,7 @@ if args.all_services:
                 ("DELETE",source_base+"/{source_pk}"):4,
                 ("POST",knowledge_base):0,
                 ("DELETE",knowledge_base+"/{item_id}"):4,
+                ("POST","/subtitle/dictionaries/lookup"):0,
                 ("POST","/subtitle/dictionaries/promote"):1,
                 ("PUT","/subtitle/dictionaries/entries/{entry_id}"):2,
                 ("PUT","/subtitle/dictionaries/sources/{source_id}"):2,
@@ -677,6 +688,20 @@ if args.all_services:
                 if template=="/accounts":path+="?platform=douyin"
                 form=template in ("/accounts/{platform}","/subtitle/models/upload")
                 if form:body=b"--vr2contract\r\nContent-Disposition: form-data; name=\"account_name\"\r\n\r\nTest\r\n--vr2contract--\r\n"
+                if service=="subtitle_service":
+                    def multipart_fixture(fields,filename,data):
+                        raw=b""
+                        for key,value in fields.items():
+                            raw+=f'--vr2contract\r\nContent-Disposition: form-data; name="{key}"\r\n\r\n{value}\r\n'.encode()
+                        return raw+f'--vr2contract\r\nContent-Disposition: form-data; name="file"; filename="{filename}"\r\nContent-Type: application/octet-stream\r\n\r\n'.encode()+data+b"\r\n--vr2contract--\r\n"
+                    if template=="/subtitle/jobs":
+                        body={"task_id":ctx["create_task"],"input":{"type":"storage","key":ctx["media_key"]},"prefer_youtube_subtitles":False,"youtube_subtitle_mode":"off","translate":{"enabled":False}}
+                    elif template=="/subtitle/dictionaries/lookup":
+                        body={"term":"contract term","source_lang":"en","target_lang":"zh","exact":True}
+                    elif template=="/subtitle/dictionaries/import":
+                        form=True;body=multipart_fixture({"slug":ctx["import_slug"],"name":"Contract v4 import","format_name":"csv","source_lang":"en","target_lang":"zh","import_mode":"upsert"},"contract.csv","term,translation\nfixture trace,测试走线\n".encode())
+                    elif template=="/subtitle/knowledge/import":
+                        form=True;body=multipart_fixture({"import_format":"json","target_lang":"zh"},"contract.json",json.dumps([{"item_type":"term","term":ctx["knowledge_term"],"translation":"测试知识"}]).encode())
                 record={"service":service,"method":method,"path":template}
                 try:
                     code,mime,obj=service_call(port,method,path,body,auth=template!="/health",form=form)
@@ -694,6 +719,20 @@ if args.all_services:
                             ctx["source_pk"]=obj["id"]
                         elif template==knowledge_base:
                             ctx["item_id"]=obj["id"]
+                    if service=="subtitle_service" and method=="POST" and template in ("/subtitle/jobs","/subtitle/dictionaries/lookup","/subtitle/dictionaries/import","/subtitle/knowledge/import"):
+                        checked=False
+                        if code==200 and isinstance(obj,dict):
+                            with psycopg.connect(os.environ["DATABASE_URL"]) as db:
+                                if template=="/subtitle/jobs":
+                                    checked=obj.get("status")=="queued" and db.execute("SELECT task_id::text,stage,status FROM operation_inbox WHERE id=%s",(obj.get("job_id"),)).fetchone()==(ctx["create_task"],"subtitle","pending")
+                                elif template=="/subtitle/dictionaries/lookup":
+                                    checked=any(x.get("id")==ctx["entry_id"] and x.get("translation")=="测试术语" for x in obj.get("results",[])) and db.execute("SELECT usage_count FROM translation_dictionary_entries WHERE id=%s",(ctx["entry_id"],)).fetchone()==(1,)
+                                elif template=="/subtitle/dictionaries/import":
+                                    checked=obj.get("upserted")==1 and obj.get("status")=="succeeded" and db.execute("SELECT e.translation_text FROM translation_dictionary_entries e JOIN translation_dictionary_sources s ON s.id=e.source_id WHERE s.slug=%s AND e.normalized_term='fixture trace'",(ctx["import_slug"],)).fetchone()==("测试走线",)
+                                elif template=="/subtitle/knowledge/import":
+                                    checked=obj.get("imported")==1 and obj.get("failed")==0 and db.execute("SELECT translation FROM translation_knowledge_items WHERE term=%s",(ctx["knowledge_term"],)).fetchone()==("测试知识",)
+                        record["fixture_asserted"]=bool(checked)
+                        if not checked:record.update(probe="failed",issue="positive_fixture_assertion_failed",error_detail=str(obj)[:300])
                     if service=="social_publisher" and template=="/login-sessions/{session_id}":
                         checked=code==200 and isinstance(obj,dict) and obj.get("id")==ctx["session_id"] and obj.get("state")==("canceled" if method=="DELETE" else "starting")
                         record["fixture_asserted"]=bool(checked)
