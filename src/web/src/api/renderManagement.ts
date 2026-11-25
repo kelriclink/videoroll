@@ -14,6 +14,7 @@ export type RenderWorker = {
   status: string; enabled: boolean; draining: boolean; max_concurrency: number; active_jobs: number;
   device_count?: number; detected_capacity?: number; effective_capacity?: number; available_slots?: number;
   last_seen_at: string; stale: boolean; seconds_since_heartbeat: number; credential_active: boolean;
+  runtime_engine?: string; device_control_supported?: boolean;
 };
 
 export type RenderConnection = { server_url: string; worker_api_path: string; protocol_version: number };
@@ -21,8 +22,9 @@ export type RenderEnrollment = { id: string; label: string; status: string; expi
 export type CreatedEnrollment = { id: string; token: string; server_url: string; expires_at: string };
 
 export type RenderExecution = {
-  id: string; render_job_id: string; worker_id: string; attempt: number;
-  state: string; transfer_mode: string; progress: number; lease_until?: string | null;
+  id: string; render_job_id: string; worker_id: string | null; attempt: number;
+  state: string; transfer_mode: string; progress: number;
+  runtime_engine?: string; control_supported?: boolean; lease_until?: string | null;
   render_spec: Record<string, unknown>; worker_name?: string | null; task_id?: string | null;
   job_status?: string | null; metrics: Record<string, unknown>; log_tail?: string | null;
   error_message?: string | null; heartbeat_at?: string | null; started_at: string; finished_at?: string | null;

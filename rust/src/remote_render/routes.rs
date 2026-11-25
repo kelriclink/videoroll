@@ -197,7 +197,7 @@ async fn enroll(
     }
     let mut tx = s.db.pool.begin().await?;
     let enrollment=sqlx::query(
-        "SELECT id FROM vr2_render_enrollments WHERE token_hash=$1 AND consumed_at IS NULL AND expires_at>now() FOR UPDATE"
+        "SELECT id FROM vr2_render_enrollments WHERE token_hash=$1 AND status='active' AND consumed_at IS NULL AND expires_at>now() FOR UPDATE"
     ).bind(token_hash(&payload.enrollment_token)).fetch_optional(&mut *tx).await?
         .ok_or(AppError::Unauthorized)?;
     let enrollment_id: Uuid = enrollment.try_get("id")?;
