@@ -5,8 +5,8 @@ use super::{
         ExecutionLog, OutputProbe, RenderSpec, WorkerHeartbeat, WorkerInfo, WorkerResponse,
     },
     service::{
-        check_worker_label, is_fence, log_message_tail, output_key, receipt, strong_token,
-        token_hash, validate_lease,
+        MAX_RENDER_ATTEMPTS, check_worker_label, is_fence, log_message_tail, output_key, receipt,
+        strong_token, token_hash, validate_lease,
     },
 };
 use crate::{
@@ -397,6 +397,7 @@ async fn claim(
           JOIN tasks t ON t.id=r.task_id
           WHERE w.state='running' AND j.state='awaiting'
             AND j.external_ticket=r.id::text
+            AND r.attempt < $4
             AND upper(t.status::text) NOT IN ('CANCELED','FAILED')
             AND (
               r.state='queued'
@@ -414,6 +415,7 @@ async fn claim(
     .bind(id)
     .bind(strong_token())
     .bind(LEASE_SECONDS)
+    .bind(MAX_RENDER_ATTEMPTS)
     .fetch_optional(&mut *tx)
     .await?;
     tx.commit().await?;
@@ -935,7 +937,7 @@ async fn execution_failed(
     validate_lease(&row, &payload.fence_token)?;
     let attempt: i32 = row.try_get("attempt")?;
     let job_id: Uuid = row.try_get("job_id")?;
-    let will_retry = payload.retryable && attempt < 5;
+    let will_retry = payload.retryable && attempt < MAX_RENDER_ATTEMPTS;
     let next = if will_retry { "queued" } else { "failed" };
     let row=sqlx::query(
         "UPDATE vr2_render_executions SET state=$1,worker_id=CASE WHEN $2 THEN NULL ELSE worker_id END,fence_token=CASE WHEN $2 THEN NULL ELSE fence_token END,lease_until=NULL,last_error=$3,updated_at=now(),finished_at=CASE WHEN $2 THEN NULL ELSE now() END WHERE id=$4 RETURNING *"
