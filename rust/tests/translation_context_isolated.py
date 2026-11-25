@@ -15,6 +15,8 @@ def setting(k,v):
     with db() as c:c.execute("INSERT INTO app_settings(key,value_json) VALUES(%s,%s) ON CONFLICT(key) DO UPDATE SET value_json=EXCLUDED.value_json",(k,json.dumps(v)))
 parallel=os.getenv("VIDEOROLL_TEST_PARALLEL_RAG")=="true"
 web_fault=os.getenv("VIDEOROLL_TEST_RAG_WEB_FAULT")=="true"
+multistep=os.getenv("VIDEOROLL_TEST_RAG_MULTISTEP")=="true"
+assert not multistep or (parallel and not web_fault)
 assert not web_fault or parallel
 web_calls=[]
 source=["First 10 volts.","Second 20 volts.","Rust compiler line." if parallel else "Rust line.","Fourth line.","Fifth line."]
@@ -78,7 +80,18 @@ class Handler(BaseHTTPRequestHandler):
                     try:
                         if attempt==1 and not web_fault:barrier.wait()
                         time.sleep(.15)
-                        if term=="Fourth line" and attempt==1 and not web_fault:
+                        if multistep and term=="Fourth line":
+                            if attempt==1:
+                                assert payload["additional_lookup_allowed"] and payload["additional_query"] is None,payload
+                                assert "fixture-extra-context" not in json.dumps(payload),payload
+                                return self.reply_json({"choices":[{"message":{"content":json.dumps({"action":"search_knowledge","query":"Fourth line context"})}}]})
+                            assert not payload["additional_lookup_allowed"] and payload["additional_query"]=="Fourth line context",payload
+                            assert "fixture-extra-context" in json.dumps(payload["local_evidence"]),payload
+                            if attempt==2:
+                                child_failed=True
+                                self.send_error(503,"injected failure after extra lookup")
+                                return
+                        if term=="Fourth line" and attempt==1 and not web_fault and not multistep:
                             child_failed=True
                             # Fail one specialist only. The other must be committed and reused.
                             self.send_error(503,"injected specialist failure")
@@ -149,6 +162,9 @@ with db() as c:
     dynamic_id=uuid.uuid4()
     for ident,translation,status in [(dynamic_id,"fixture-original-compiler","approved"),(uuid.uuid4(),"fixture-pending","pending")]:
         c.execute("INSERT INTO translation_knowledge_items(id,item_type,term,normalized_term,translation,target_lang,domain,status,confidence) VALUES(%s,'term','Rust compiler','rust compiler',%s,'zh','electronics',%s,1)",(ident,translation,status))
+    extra_id=uuid.uuid4()
+    if multistep:
+        c.execute("INSERT INTO translation_knowledge_items(id,item_type,term,normalized_term,translation,target_lang,domain,status,confidence) VALUES(%s,'term','Fourth line context','fourth line context','fixture-extra-context','zh','electronics','approved',1)",(extra_id,))
     for ident,t,s,translated,lang,domain,status in [
         (mid(source[0]),task,source[0],"reviewed-same-task","zh","electronics","approved"),
         (uuid.uuid4(),other,source[0],"approved-global","zh","electronics","approved"),
@@ -209,23 +225,29 @@ try:
     with db() as c:
         state,plan,result=c.execute("SELECT research_state,research_plan,research_result FROM pipeline_runs WHERE task_id=%s AND engine='rust-v2'",(task,)).fetchone()
         assert state=="succeeded" and plan["gate_completed"],(state,plan)
-        assert c.execute("SELECT count(*) FROM translation_knowledge_items").fetchone()[0]==2
+        assert c.execute("SELECT count(*) FROM translation_knowledge_items").fetchone()[0]==(3 if multistep else 2)
         if parallel:
-            assert (web_fault or peak==2) and child_calls=={"Rust compiler":1,"Fourth line":1 if web_fault else 2} and research_calls==["gate"],(peak,child_calls,research_calls)
+            assert (web_fault or peak==2) and child_calls=={"Rust compiler":1,"Fourth line":1 if web_fault else (3 if multistep else 2)} and research_calls==["gate"],(peak,child_calls,research_calls)
             assert len(plan["gate_candidates"])==2 and plan["parallelism"]==2
             master=uuid.UUID(plan["master_agent_id"])
             assert result["master_agent_id"]==str(master) and result["failed_children"]==0
             parent=c.execute("SELECT agent_type,status,checkpoint FROM translation_agent_runs WHERE id=%s",(master,)).fetchone()
             assert parent[:2]==("rag_master","succeeded"),parent
-            assert parent[2]["model_calls"]==(3 if web_fault else 4) and parent[2]["model_budget"]==4,parent
+            assert parent[2]["model_calls"]==(3 if web_fault else (5 if multistep else 4)) and parent[2]["model_budget"]==6,parent
             assert parent[2]["web_calls"]==parent[2]["web_budget"]==(2 if web_fault else 0),parent
-            assert parent[2]["knowledge_calls"]==2 and parent[2]["knowledge_budget"]==4,parent
+            assert parent[2]["knowledge_calls"]==(3 if multistep else 2) and parent[2]["knowledge_budget"]==8,parent
             children=c.execute("SELECT term,status,checkpoint->>'attempts' FROM translation_agent_runs WHERE parent_agent_run_id=%s ORDER BY term",(master,)).fetchall()
             assert children==[("Fourth line","succeeded","2"),("Rust compiler","succeeded","1")],children
             receipts=c.execute("SELECT term,checkpoint->'initial_evidence' FROM translation_agent_runs WHERE parent_agent_run_id=%s ORDER BY term",(master,)).fetchall()
             assert all(isinstance(v,dict) for _,v in receipts),receipts
             assert c.execute("SELECT count(*) FROM translation_agent_runs WHERE parent_agent_run_id=%s AND jsonb_typeof(checkpoint->'knowledge_receipt')='array'",(master,)).fetchone()[0]==2
             assert c.execute("SELECT count(*) FROM translation_agent_events e JOIN translation_agent_runs r ON r.id=e.run_id WHERE r.parent_agent_run_id=%s AND e.action='search_knowledge' AND e.status='succeeded'",(master,)).fetchone()[0]==2
+            if multistep:
+                assert str(extra_id) in meta["rag_evidence_ids"],meta
+                extra=c.execute("SELECT checkpoint->>'extra_query',checkpoint->'extra_receipt' FROM translation_agent_runs WHERE parent_agent_run_id=%s AND term='Fourth line'",(master,)).fetchone()
+                assert extra[0]=="Fourth line context" and any(h["id"]==str(extra_id) for h in extra[1]),extra
+                assert c.execute("SELECT count(*) FROM translation_agent_events e JOIN translation_agent_runs r ON r.id=e.run_id WHERE r.parent_agent_run_id=%s AND e.action='extra_knowledge' AND e.status='succeeded'",(master,)).fetchone()[0]==1
+                print("PASS: model-selected extra lookup, durable intent and receipt, final model 503 recovery without replaying lookup",flush=True)
             if web_fault:
                 assert web_calls==["Fourth line","Fourth line"],web_calls
                 assert c.execute("SELECT count(*) FROM translation_agent_events e JOIN translation_agent_runs r ON r.id=e.run_id WHERE r.parent_agent_run_id=%s AND e.action='search_web' AND e.status='failed'",(master,)).fetchone()[0]==1

@@ -96,9 +96,121 @@ impl RetrievalQuery {
     }
 }
 
+// The specialist can request one additional local lookup or finish.
+// Legacy target/note replies are accepted as finish only.
+#[derive(Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+enum SpecialistAction {
+    SearchKnowledge {
+        query: String,
+    },
+    Finish {
+        target: String,
+        #[serde(default)]
+        note: String,
+    },
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyFinish {
+    target: String,
+    #[serde(default)]
+    note: String,
+}
+
+pub(super) enum SpecialistDecision {
+    Search(String),
+    Finish(Option<VerifiedTerm>),
+}
+
+pub(super) fn extra_query(raw: &str, term: &str) -> AppResult<String> {
+    let query = RetrievalQuery::new(RetrievalKind::Knowledge, raw)?;
+    let initial = RetrievalQuery::new(RetrievalKind::Knowledge, term)?;
+    if query.key() == initial.key()
+        || !crate::media::translation_context::mentions(&query.text, term)
+    {
+        return Err(AppError::Invalid(
+            "duplicate or ungrounded specialist query".into(),
+        ));
+    }
+    Ok(query.text)
+}
+
+pub(super) fn specialist_decision(
+    raw: Value,
+    term: &str,
+    can_search: bool,
+) -> AppResult<SpecialistDecision> {
+    let action = if raw.get("action").is_some() {
+        serde_json::from_value::<SpecialistAction>(raw)
+            .map_err(|_| AppError::Invalid("unknown or malformed specialist action".into()))?
+    } else {
+        let value: LegacyFinish = serde_json::from_value(raw)
+            .map_err(|_| AppError::Invalid("invalid specialist finish".into()))?;
+        SpecialistAction::Finish {
+            target: value.target,
+            note: value.note,
+        }
+    };
+    match action {
+        SpecialistAction::SearchKnowledge { query } if can_search => {
+            Ok(SpecialistDecision::Search(extra_query(&query, term)?))
+        }
+        SpecialistAction::SearchKnowledge { .. } => {
+            Err(AppError::Invalid("specialist lookup limit reached".into()))
+        }
+        SpecialistAction::Finish { target, note } => {
+            let target = target.trim();
+            if target.chars().count() > 160 || target.chars().any(char::is_control) {
+                return Err(AppError::Invalid("invalid specialist translation".into()));
+            }
+            Ok(SpecialistDecision::Finish((!target.is_empty()).then(
+                || VerifiedTerm {
+                    source: term.into(),
+                    target: target.into(),
+                    note: note.chars().take(180).collect(),
+                },
+            )))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn specialist_action_validation() {
+        assert!(matches!(
+            specialist_decision(
+                json!({"action":"search_knowledge","query":"Rust compiler context"}),
+                "Rust compiler",
+                true
+            )
+            .unwrap(),
+            SpecialistDecision::Search(_)
+        ));
+        for bad in [
+            json!({"action":"search_knowledge","query":"Rust  compiler"}),
+            json!({"action":"search_knowledge","query":"unrelated"}),
+            json!({"action":"search_web","query":"Rust compiler"}),
+            json!({"action":"search_knowledge","query":"Rust compiler context","other":1}),
+        ] {
+            assert!(specialist_decision(bad, "Rust compiler", true).is_err());
+        }
+        assert!(
+            specialist_decision(
+                json!({"action":"search_knowledge","query":"Rust compiler context"}),
+                "Rust compiler",
+                false
+            )
+            .is_err()
+        );
+        assert!(matches!(
+            specialist_decision(json!({"target":"编译器"}), "Rust compiler", false).unwrap(),
+            SpecialistDecision::Finish(Some(_))
+        ));
+    }
     #[test]
     fn query_identity_and_bounds() {
         use RetrievalKind::*;
