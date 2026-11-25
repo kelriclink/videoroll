@@ -47,6 +47,7 @@ export function executionStatusLabel(state: string) {
     lost: "节点失联",
     canceled: "已取消",
     queued: "等待中",
+    paused: "已暂停（等待恢复）",
   };
   return labels[state] ?? "未知";
 }

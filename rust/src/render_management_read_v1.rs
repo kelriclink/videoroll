@@ -32,7 +32,7 @@ pub(crate) fn management_engine() -> &'static str {
 pub(crate) const WORKER_SQL: &str = r#"SELECT w.*,
  CASE WHEN w.runtime_engine='rust-v2' THEN
    (SELECT count(*)::int FROM render_executions e WHERE e.worker_id=w.id
-     AND e.runtime_engine='rust-v2' AND e.state IN ('running','uploading','canceled')
+     AND e.runtime_engine='rust-v2' AND e.state IN ('running','uploading','canceled','paused')
      AND e.lease_until>now())
  ELSE w.active_jobs END AS live_active_jobs FROM render_workers w"#;
 

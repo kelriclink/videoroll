@@ -203,6 +203,59 @@ try:
             assert c.execute("SELECT status FROM operation_inbox WHERE id=%s",(item[1],)).fetchone()[0]=="canceled"
             assert c.execute("SELECT count(*) FROM operation_inbox WHERE task_id=%s AND stage IN ('dubbing','publish')",(item[0],)).fetchone()[0]==0
     print("PASS: live cancellation, fence acknowledgment, stale heartbeat/completion rejected, reserved slot, idempotent stop and offline expiry",flush=True)
+    def flow_id(item):
+        with db() as c:return str(c.execute("SELECT workflow_id FROM operation_inbox WHERE id=%s",(item[1],)).fetchone()[0])
+    def stop_worker(item, suffix, payload=None, method="POST"):
+        return call(method,"/render-workers/v1/executions/"+item[2]+suffix,payload,auth=False,credential=credential)
+    def bind_fence(item):
+        f=uuid.uuid4().hex+uuid.uuid4().hex
+        with db() as c:c.execute("UPDATE render_executions SET fence_token=%s WHERE id=%s",(f,item[2]))
+        return f
+    def render_tick():subprocess.run([str(exe),"render-tick"],check=True,timeout=20)
+    paused=native("running",300);pf=bind_fence(paused);pw=flow_id(paused)
+    stop="/api/v1/tasks/"+paused[0]+"/actions/stop";resume="/api/v1/tasks/"+paused[0]+"/actions/resume"
+    ok("POST",stop,{})
+    ok("POST",stop,{})
+    with db() as c:
+        assert c.execute("SELECT status::text,stopped_status::text FROM tasks WHERE id=%s",(paused[0],)).fetchone()==("canceled","subtitle_ready")
+        assert c.execute("SELECT state FROM pipeline_runs WHERE id=%s",(pw,)).fetchone()[0]=="paused"
+        assert c.execute("SELECT state,attempt,lease_until>now() FROM render_executions WHERE id=%s",(paused[2],)).fetchone()==("paused",1,True)
+        assert c.execute("SELECT status FROM operation_inbox WHERE id=%s",(paused[1],)).fetchone()[0]=="awaiting"
+    assert stop_worker(paused,"/cancel",method="GET")[1]["cancel_requested"]
+    ok("POST",resume,{})
+    render_tick()
+    assert ok("GET",mgmt+"/workers")[0]["active_jobs"]==1
+    assert stop_worker(paused,"/heartbeat",{"fence_token":pf,"progress":10,"metrics":{}})[0]==409
+    assert stop_worker(paused,"/complete",{"fence_token":pf,"output":{}})[0]==409
+    assert stop_worker(paused,"/fail",{"fence_token":"0"*64,"error":"wrong","retryable":True})[0]==409
+    assert stop_worker(paused,"/fail",{"fence_token":pf,"error":"stopped","retryable":False})[1]["state"]=="paused"
+    render_tick()
+    with db() as c:
+        assert c.execute("SELECT state,attempt,worker_id,fence_token,lease_until FROM render_executions WHERE id=%s",(paused[2],)).fetchone()==("queued",1,None,None,None)
+        assert c.execute("SELECT state FROM pipeline_runs WHERE id=%s",(pw,)).fetchone()[0]=="running"
+        assert c.execute("SELECT status FROM operation_inbox WHERE id=%s",(paused[1],)).fetchone()[0]=="awaiting"
+    # A second pause, then terminal cancellation, cannot be resumed through V1.
+    ok("POST",stop,{})
+    ok("POST","/api/v2/workflows/"+pw+"/cancel",{})
+    assert call("POST",resume,{})[0]==409
+    with db() as c:
+        assert c.execute("SELECT status::text,stopped_status FROM tasks WHERE id=%s",(paused[0],)).fetchone()==("canceled",None)
+        assert c.execute("SELECT state FROM render_executions WHERE id=%s",(paused[2],)).fetchone()[0]=="canceled"
+    terminal=native("running",300);tf=bind_fence(terminal);tw=flow_id(terminal)
+    asset=uuid.uuid4()
+    with db() as c:c.execute("INSERT INTO assets(id,task_id,kind,storage_key) VALUES(%s,%s,'video_final',%s)",(asset,terminal[0],f"v2/render/{terminal[0]}/fixture.mp4"))
+    ok("POST","/api/v2/workflows/"+tw+"/cancel",{})
+    assert stop_worker(terminal,"/heartbeat",{"fence_token":tf,"progress":10})[0]==409
+    assert stop_worker(terminal,"/cancel",method="GET")[1]["cancel_requested"]
+    assert ok("GET",mgmt+"/workers")[0]["active_jobs"]==1
+    assert call("DELETE",f"/api/v1/tasks/{terminal[0]}/assets/{asset}")[0]==409
+    with db() as c:c.execute("UPDATE render_executions SET lease_until=now()-interval '1 second' WHERE id=%s",(terminal[2],))
+    render_tick()
+    with db() as c:
+        assert c.execute("SELECT state,lease_until FROM render_executions WHERE id=%s",(terminal[2],)).fetchone()==("canceled",None)
+        assert c.execute("SELECT status FROM operation_inbox WHERE id=%s",(terminal[1],)).fetchone()[0]=="canceled"
+    assert ok("GET",mgmt+"/workers")[0]["active_jobs"]==0
+    print("PASS: legacy task stop/resume, immediate resume fences stale worker, drained slot, preserved attempt, terminal cancel and asset deletion guard",flush=True)
     revoked_worker=ok("POST",mgmt+"/workers/"+worker+"/revoke-credential",{})
     assert not revoked_worker["credential_active"] and not revoked_worker["enabled"]
     assert call("POST","/render-workers/v1/"+worker+"/heartbeat",{

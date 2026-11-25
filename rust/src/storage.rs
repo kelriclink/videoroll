@@ -30,7 +30,7 @@ pub(crate) async fn publication_cleanup_blocked(
            AND NULLIF(external_id,'') IS NULL AND NULLIF(external_url,'') IS NULL)))
       OR EXISTS(SELECT 1 FROM subtitle_jobs WHERE task_id=$1 AND status::text IN ('queued','running'))
       OR EXISTS(SELECT 1 FROM render_jobs WHERE task_id=$1 AND status::text IN ('queued','running'))
-      OR EXISTS(SELECT 1 FROM render_executions WHERE task_id=$1 AND runtime_engine='rust-v2' AND state='canceled' AND lease_until>now())
+      OR EXISTS(SELECT 1 FROM render_executions WHERE task_id=$1 AND runtime_engine='rust-v2' AND state IN ('running','uploading','canceled','paused') AND lease_until>now())
       OR EXISTS(SELECT 1 FROM dubbing_jobs WHERE task_id=$1 AND
         (status IN ('queued','preparing','synthesizing','aligning','mixing','rendering','pause_requested','cancel_requested')
         OR (status IN ('paused','preview_ready','needs_review') AND updated_at>now()-interval '7 days')))

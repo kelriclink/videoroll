@@ -55,7 +55,7 @@ async fn delete_final(
          OR EXISTS(SELECT 1 FROM vr2_workflows w WHERE w.task_id=$1
            AND w.state IN ('running','paused','unknown'))
          OR EXISTS(SELECT 1 FROM vr2_render_executions e WHERE e.task_id=$1
-           AND e.state IN ('queued','running','uploading'))
+           AND (e.state IN ('queued','running','uploading','paused') OR (e.state='canceled' AND e.lease_until>now())))
          OR EXISTS(SELECT 1 FROM vr2_bilibili_p2_appends p WHERE p.task_id=$1
            AND p.state NOT IN ('published','failed'))
          OR EXISTS(SELECT 1 FROM vr2_social_publish_intents p WHERE p.task_id=$1
