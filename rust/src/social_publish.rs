@@ -1010,9 +1010,212 @@ async fn publish_all(
         "platform_count":n,"ok_count":ok,"error_count":err,"errors":errors
     })))
 }
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManualReceipt {
+    platform: String,
+    account_id: Uuid,
+    external_id: String,
+    evidence: String,
+    /// Explicit operator attestation, not an automated platform API check.
+    confirmed_in_creator_center: bool,
+}
+fn receipt_id(p: &str, raw: &str) -> AppResult<String> {
+    let s = raw.trim();
+    let valid = match p {
+        "douyin" => (12..=32).contains(&s.len()) && s.bytes().all(|c| c.is_ascii_digit()),
+        "xiaohongshu" => s.len() == 24 && s.bytes().all(|c| c.is_ascii_hexdigit()),
+        "kuaishou" => {
+            (6..=64).contains(&s.len())
+                && s.bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-')
+        }
+        _ => false,
+    };
+    if !valid {
+        return Err(AppError::Invalid(
+            "invalid platform work ID; use the original creator-center ID, not a URL".into(),
+        ));
+    }
+    Ok(if p == "xiaohongshu" {
+        s.to_ascii_lowercase()
+    } else {
+        s.to_owned()
+    })
+}
+async fn resolve_mixed_receipt(
+    State(state): State<AppState>,
+    Path((task, job)): Path<(Uuid, Uuid)>,
+    Json(body): Json<ManualReceipt>,
+) -> AppResult<Json<Value>> {
+    if !mixed_enabled() {
+        return Err(AppError::Conflict(
+            "native mixed publication is not enabled".into(),
+        ));
+    }
+    let external_id = receipt_id(&body.platform, &body.external_id)?;
+    let evidence = body.evidence.trim();
+    if !body.confirmed_in_creator_center
+        || !(12..=2000).contains(&evidence.chars().count())
+        || evidence.chars().any(|c| c.is_control() && c != '\n')
+    {
+        return Err(AppError::Invalid(
+            "explicit creator-center confirmation and 12–2000 characters of evidence required"
+                .into(),
+        ));
+    }
+    let mut tx = state.db.pool.begin().await?;
+    let parent=sqlx::query("SELECT status::text AS status,runtime_owner,active_publish_batch_id FROM tasks WHERE id=$1 FOR UPDATE").bind(task).fetch_optional(&mut *tx).await?.ok_or_else(||AppError::NotFound("task not found".into()))?;
+    if parent.try_get::<String, _>("runtime_owner")? != "rust"
+        || parent.try_get::<String, _>("status")? == "canceled"
+    {
+        return Err(AppError::Conflict(
+            "task is not an active Rust-owned publication".into(),
+        ));
+    }
+    // Same Task -> Account -> Job -> Inbox/Outbox -> Batch order as worker.
+    let account: Option<Uuid> =
+        sqlx::query_scalar("SELECT id FROM accounts WHERE id=$1 AND platform::text=$2 FOR UPDATE")
+            .bind(body.account_id)
+            .bind(&body.platform)
+            .fetch_optional(&mut *tx)
+            .await?;
+    if account.is_none() {
+        return Err(AppError::Conflict(
+            "receipt account/platform mismatch".into(),
+        ));
+    }
+    let row=sqlx::query("SELECT id,batch_id,platform::text AS platform,account_id,state::text AS state,operation_key,started_at,lease_owner,lease_until,response_json,external_id,external_url FROM publish_jobs WHERE id=$1 AND task_id=$2 FOR UPDATE").bind(job).bind(task).fetch_optional(&mut *tx).await?.ok_or_else(||AppError::NotFound("original publish job not found".into()))?;
+    if row.try_get::<String, _>("platform")? != body.platform
+        || row.try_get::<Option<Uuid>, _>("account_id")? != Some(body.account_id)
+    {
+        return Err(AppError::Conflict("receipt job identity mismatch".into()));
+    }
+    let batch = row.try_get::<Option<Uuid>, _>("batch_id")?.ok_or_else(|| {
+        AppError::Conflict("only original native mixed batches are supported".into())
+    })?;
+    if parent.try_get::<Option<Uuid>, _>("active_publish_batch_id")? != Some(batch) {
+        return Err(AppError::Conflict(
+            "publication batch no longer owns this task".into(),
+        ));
+    }
+    let key: Option<String> = row.try_get("operation_key")?;
+    if key.as_deref() != Some(format!("publish-job:{job}").as_str()) {
+        return Err(AppError::Conflict(
+            "original SAU operation key mismatch".into(),
+        ));
+    }
+    let key = key.unwrap();
+    let proof:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM operation_inbox WHERE operation_key=$1 AND runtime_engine='rust-sau-publish' AND status='completed' AND lease_owner IS NULL AND lease_until IS NULL AND request_json->>'job_id'=$2 AND result_json->>'job_id'=$2 AND result_json->>'status' IN ('submitted','unknown')) AND (SELECT count(*) FROM outbox_events WHERE operation_key=$1)=1 AND EXISTS(SELECT 1 FROM outbox_events WHERE operation_key=$1 AND aggregate_id=$2 AND task_name='social_publisher.process_job' AND status='native_completed' AND lease_owner IS NULL AND lease_until IS NULL)").bind(&key).bind(job.to_string()).fetch_one(&mut *tx).await?;
+    if !proof
+        || row
+            .try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("started_at")?
+            .is_none()
+        || row.try_get::<Option<String>, _>("lease_owner")?.is_some()
+        || row
+            .try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("lease_until")?
+            .is_some()
+    {
+        return Err(AppError::Conflict(
+            "original browser execution has not settled or lacks start evidence".into(),
+        ));
+    }
+    let batch_row=sqlx::query("SELECT expected_targets,request_json FROM publish_batches WHERE id=$1 AND task_id=$2 FOR UPDATE").bind(batch).bind(task).fetch_one(&mut *tx).await?;
+    let req: Value = batch_row.try_get("request_json")?;
+    let expected: Value = batch_row.try_get("expected_targets")?;
+    let keys = crate::bilibili_batch_reconcile_v1::keys(&expected)?;
+    if req["runtime"] != "rust-mixed-v1"
+        || !keys.contains(&format!("{}:{}", body.platform, body.account_id))
+    {
+        return Err(AppError::Conflict(
+            "receipt is not an expected native mixed target".into(),
+        ));
+    }
+    let current: Vec<(String, Option<Uuid>)> = sqlx::query_as(
+        "SELECT platform::text,account_id FROM publish_jobs WHERE task_id=$1 AND batch_id=$2",
+    )
+    .bind(task)
+    .bind(batch)
+    .fetch_all(&mut *tx)
+    .await?;
+    let identities: HashSet<String> = current
+        .iter()
+        .map(|(p, a)| {
+            format!(
+                "{p}:{}",
+                a.map(|v| v.to_string()).unwrap_or("default".into())
+            )
+        })
+        .collect();
+    if current.len() != keys.len()
+        || identities.len() != keys.len()
+        || keys.iter().any(|k| !identities.contains(k))
+    {
+        return Err(AppError::Conflict(
+            "mixed target ledger incomplete or duplicated".into(),
+        ));
+    }
+    let status: String = row.try_get("state")?;
+    let response: Option<Value> = row.try_get("response_json")?;
+    let mut response = response.unwrap_or(Value::Null);
+    let prior: Option<String> = row.try_get("external_id")?;
+    let prior_url: Option<String> = row.try_get("external_url")?;
+    let attest = json!({"source":"operator_creator_center","platform":body.platform,"account_id":body.account_id,"external_id":external_id,"evidence":evidence,"confirmed_in_creator_center":true});
+    if status == "published"
+        && response.get("operator_receipt") == Some(&attest)
+        && prior.as_deref() == Some(external_id.as_str())
+    {
+        tx.commit().await?;
+        return Ok(Json(
+            json!({"job_id":job,"batch_id":batch,"state":"published","external_id":external_id,"verification":"operator_creator_center"}),
+        ));
+    }
+    if !matches!(status.as_str(), "submitted" | "unknown")
+        || response["runtime"] != "rust"
+        || response["driver"] != "sau"
+        || response["receipt_verified"] != false
+        || response.get("operator_receipt").is_some()
+        || prior.as_deref().is_some_and(|s| !s.is_empty())
+        || prior_url.as_deref().is_some_and(|s| !s.is_empty())
+    {
+        return Err(AppError::Conflict(
+            "only an unresolved native SAU receipt can be attested once".into(),
+        ));
+    }
+    // Serializes identical work IDs even across different tasks. No external
+    // URL fetching, browser action, credential use or submission replay.
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))")
+        .bind(format!(
+            "videoroll:sau-receipt:{}:{external_id}",
+            body.platform
+        ))
+        .execute(&mut *tx)
+        .await?;
+    let duplicate:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM publish_jobs WHERE platform::text=$1 AND external_id=$2 AND id<>$3)").bind(&body.platform).bind(&external_id).bind(job).fetch_one(&mut *tx).await?;
+    if duplicate {
+        return Err(AppError::Conflict(
+            "platform work ID already belongs to another original publish job".into(),
+        ));
+    }
+    // Preserve original worker response, including receipt_verified=false.
+    // Manual attestation is explicitly different from automated verification.
+    response["operator_receipt"] = attest;
+    response["operator_confirmed_at"] = json!(chrono::Utc::now());
+    sqlx::query("UPDATE publish_jobs SET state='published',external_id=$2,response_json=$3,finished_at=now(),updated_at=now() WHERE id=$1").bind(job).bind(&external_id).bind(response).execute(&mut *tx).await?;
+    crate::bilibili_batch_reconcile_v1::reconcile_native_sau(&mut tx, task, batch).await?;
+    tx.commit().await?;
+    Ok(Json(
+        json!({"job_id":job,"batch_id":batch,"state":"published","external_id":external_id,"verification":"operator_creator_center"}),
+    ))
+}
+
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/tasks/{id}/actions/publish_all", post(publish_all))
+        .route(
+            "/tasks/{id}/publish_jobs/{job_id}/sau/resolve",
+            post(resolve_mixed_receipt),
+        )
         .route("/tasks/{id}/social_publish_jobs", route_get(list))
         .route("/tasks/{id}/social_publish_jobs/{job_id}", route_get(get))
 }
