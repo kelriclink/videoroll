@@ -265,23 +265,40 @@ async fn manual_publish(
         .await
         .map(Json);
     }
-    if payload.platform != "bilibili"
-        || payload.account_id.is_some()
-        || payload.video_key.is_some()
-        || payload.video_parts.is_some()
-        || payload.cover_key.is_some()
-        || payload.typeid_mode.is_some()
-        || payload
-            .platform_options
-            .as_object()
-            .is_some_and(|v| !v.is_empty())
-        || payload.skip_review
-        || payload.force_retry
-    {
+    if payload.skip_review || payload.force_retry {
         return Err(AppError::Invalid(
-            "only Bilibili's saved-metadata single-upload workflow is supported; explicit account, P2, cover, review bypass and forced retry are not migrated".into()
+            "review bypass and forced Bilibili retry are not supported; reconcile first".into(),
         ));
     }
+    // Original platform_options are scoped by platform. Only the partition
+    // selection override is supported by the native Bilibili publisher.
+    let options = match &payload.platform_options {
+        Value::Null => None,
+        Value::Object(map) if map.is_empty() => None,
+        Value::Object(map) if map.len() == 1 && map.contains_key("bilibili") => {
+            let opts = map["bilibili"].as_object().ok_or_else(|| {
+                AppError::Invalid("Bilibili platform_options must be an object".into())
+            })?;
+            if opts.keys().any(|k| k != "typeid_mode") {
+                return Err(AppError::Invalid(
+                    "unsupported Bilibili platform option".into(),
+                ));
+            }
+            opts.get("typeid_mode")
+                .map(|v| {
+                    v.as_str()
+                        .ok_or_else(|| AppError::Invalid("typeid_mode must be a string".into()))
+                })
+                .transpose()?
+        }
+        _ => {
+            return Err(AppError::Invalid(
+                "invalid Bilibili platform_options".into(),
+            ));
+        }
+    };
+    let typeid_mode = options.or(payload.typeid_mode.as_deref()).unwrap_or("meta");
+
     if !crate::publish_platforms::enabled(&state.db, "bilibili").await? {
         return Err(AppError::Conflict("Bilibili platform is disabled".into()));
     }
@@ -307,27 +324,22 @@ async fn manual_publish(
     let resolved = saved
         .or(meta)
         .ok_or_else(|| AppError::Invalid("save Bilibili metadata before publishing".into()))?;
-    let parsed: crate::bilibili::ArchiveMeta = serde_json::from_value(resolved.clone())
-        .map_err(|_| AppError::Invalid("invalid Bilibili metadata".into()))?;
-    parsed.validate()?;
-    // An activity mission must be revalidated at actual publish time.
-    // AI review is invoked by the Bilibili executor before any UPOS upload.
-    let flow = state
-        .scheduler
-        .restart_at(
-            id,
-            Stage::Publish,
-            json!({
-                "auto_publish":true,"auto_publish_platforms":["bilibili"],
-                "publish":{"bilibili":resolved}
-            }),
-        )
-        .await?;
-    let job = response(&state, flow, Stage::Publish).await?;
-    Ok(Json(json!({
-        "state":job.0.status,"platform":"bilibili","job_id":job.0.job_id,
-        "bvid":null,"aid":null,"response":null
-    })))
+    let video_key = if let Some(key) = payload.video_key.as_deref() {
+        key.to_owned()
+    } else {
+        sqlx::query_scalar::<_, String>("SELECT storage_key FROM assets WHERE task_id=$1 AND kind='video_final'::asset_kind ORDER BY created_at DESC,id DESC LIMIT 1")
+            .bind(id).fetch_optional(&state.db.pool).await?
+            .ok_or_else(|| AppError::Invalid("no final video asset found; render first".into()))?
+    };
+    let cover = payload
+        .cover_key
+        .as_ref()
+        .map(|key| json!({"type":"storage","key":key}));
+    let request = json!({"task_id":id,"account_id":payload.account_id,"video":{"type":"storage","key":video_key},
+        "video_parts":payload.video_parts.unwrap_or_default(),"cover":cover,"meta":resolved,"typeid_mode":typeid_mode});
+    let mut result = crate::bilibili_publish_v1::enqueue_task_action(&state, request).await?;
+    result["platform"] = json!("bilibili");
+    Ok(Json(result))
 }
 /// Resume the V2-owned auto pipeline at the earliest remaining reversible
 /// stage. Reuse active stage jobs; never queue a second download or rerun an
