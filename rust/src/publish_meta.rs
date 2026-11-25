@@ -254,6 +254,20 @@ async fn source_metadata(state: &AppState, id: Uuid) -> AppResult<Option<Value>>
         .map_err(|_| AppError::Invalid("invalid cached YouTube metadata".into()))?;
     Ok(if value.is_object() { Some(value) } else { None })
 }
+pub(crate) async fn automatic_draft(state: &AppState, id: Uuid) -> AppResult<Value> {
+    if let Some(meta) = saved(&state.db, id).await? {
+        return Ok(meta);
+    }
+    build_draft(
+        state,
+        id,
+        DraftRequest {
+            mode: "source".into(),
+            meta: None,
+        },
+    )
+    .await
+}
 async fn build_draft(state: &AppState, id: Uuid, req: DraftRequest) -> AppResult<Value> {
     if !matches!(req.mode.as_str(), "auto" | "default" | "source") {
         return Err(AppError::Invalid(

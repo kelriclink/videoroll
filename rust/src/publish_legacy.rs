@@ -40,10 +40,11 @@ pub async fn read_selection(db: &Database, job: &WorkItem) -> AppResult<PublishS
             .bind(job.workflow_id)
             .fetch_optional(&db.pool)
             .await?;
-    Ok(selection(
+    let (enabled, platforms) = crate::task_manual::auto_platform_selection(
         &saved.unwrap_or(json!({})),
         &overrides.unwrap_or(json!({})),
-    ))
+    )?;
+    Ok(PublishSelection { enabled, platforms })
 }
 #[derive(Debug, Clone)]
 struct PublishedReceipt {

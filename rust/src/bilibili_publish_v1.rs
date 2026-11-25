@@ -198,7 +198,7 @@ pub(crate) async fn enqueue_task_action(state: &AppState, raw: Value) -> AppResu
 async fn enqueue(state: &AppState, body: Request, task_action: bool) -> AppResult<Value> {
     let prepared = prepare(state, body).await?;
     let mut tx = state.db.pool.begin().await?;
-    let result = enqueue_prepared(state, &mut tx, prepared, task_action).await?;
+    let result = enqueue_prepared(state, &mut tx, prepared, task_action, None).await?;
     tx.commit().await?;
     Ok(result)
 }
@@ -282,6 +282,7 @@ pub(crate) async fn enqueue_prepared(
     tx: &mut Transaction<'_, Postgres>,
     prepared: Prepared,
     task_action: bool,
+    parent: Option<Uuid>,
 ) -> AppResult<Value> {
     let Prepared {
         mut body,
@@ -417,7 +418,7 @@ pub(crate) async fn enqueue_prepared(
     let unsafe_other: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM vr2_jobs j
          JOIN vr2_workflows w ON w.id=j.workflow_id
-       WHERE j.task_id=$1 AND j.stage='publish' AND
+       WHERE j.task_id=$1 AND ($3::uuid IS NULL OR w.id<>$3) AND j.stage='publish' AND
          j.state IN ('pending','running','awaiting','unknown','succeeded') AND
          (w.configuration->'bilibili_direct_v1' IS NULL OR
          (w.configuration->'bilibili_direct_v1'->>'account_id')
@@ -425,6 +426,7 @@ pub(crate) async fn enqueue_prepared(
     )
     .bind(body.task_id)
     .bind(body.account_id.map(|v| v.to_string()))
+    .bind(parent)
     .fetch_one(&mut **tx)
     .await?;
     if unsafe_other {
@@ -434,13 +436,14 @@ pub(crate) async fn enqueue_prepared(
     }
     let busy: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM vr2_workflows
-       WHERE task_id=$1 AND state IN ('running','paused','unknown') AND
+       WHERE task_id=$1 AND ($3::uuid IS NULL OR id<>$3) AND state IN ('running','paused','unknown') AND
           (configuration->'bilibili_direct_v1' IS NULL OR
             (configuration->'bilibili_direct_v1'->>'account_id')
               IS NOT DISTINCT FROM $2::text))",
     )
     .bind(body.task_id)
     .bind(body.account_id.map(|v| v.to_string()))
+    .bind(parent)
     .fetch_one(&mut **tx)
     .await?;
     if busy {

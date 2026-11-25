@@ -556,7 +556,7 @@ impl Scheduler {
             .execute(&mut **tx).await?;
         Ok(())
     }
-    async fn event(
+    pub(crate) async fn event(
         tx: &mut Transaction<'_, Postgres>,
         workflow_id: Uuid,
         job_id: Option<Uuid>,
@@ -613,7 +613,7 @@ impl Scheduler {
         let candidates = sqlx::query(
             "SELECT id,task_id,workflow_id FROM vr2_jobs
             WHERE stage='publish' AND ((state='running' AND lease_until<now())
-                OR (state='awaiting' AND updated_at<now()-interval '48 hours'))
+                OR (state='awaiting' AND COALESCE(external_ticket,'') NOT LIKE 'native-batch:%' AND updated_at<now()-interval '48 hours'))
             ORDER BY updated_at,id LIMIT 100",
         )
         .fetch_all(&self.db.pool)
@@ -636,7 +636,7 @@ impl Scheduler {
                 lease_until=NULL,last_error='publish ownership expired; external outcome must be verified',
                 updated_at=now() WHERE id=$1 AND stage='publish'
                 AND ((state='running' AND lease_until<now())
-                    OR (state='awaiting' AND updated_at<now()-interval '48 hours'))
+                    OR (state='awaiting' AND COALESCE(external_ticket,'') NOT LIKE 'native-batch:%' AND updated_at<now()-interval '48 hours'))
                 RETURNING id")
                 .bind(job_id).fetch_optional(&mut *tx).await?;
             if fenced.is_none() {
@@ -780,6 +780,18 @@ impl Scheduler {
         .ok_or_else(|| AppError::NotFound("job disappeared".into()))?;
         let job_state: String = job.try_get("state")?;
         let lease_token: Option<Uuid> = job.try_get("lease_token")?;
+        if let StageOutcome::Awaiting { ticket } = &outcome {
+            if ticket.starts_with("native-batch:")
+                && job
+                    .try_get::<Option<String>, _>("external_ticket")?
+                    .as_deref()
+                    == Some(ticket.as_str())
+                && matches!(job_state.as_str(), "awaiting" | "unknown" | "succeeded")
+            {
+                tx.commit().await?;
+                return Ok(());
+            }
+        }
         if job_state == "succeeded" {
             tx.commit().await?;
             return Ok(());
@@ -882,6 +894,11 @@ impl Scheduler {
         ticket: &str,
         result: Value,
     ) -> AppResult<()> {
+        if ticket.starts_with("native-batch:") {
+            return Err(AppError::Conflict(
+                "native batch settles only from original target receipts".into(),
+            ));
+        }
         if ticket.len() > 1024 || ticket.is_empty() {
             return Err(AppError::Invalid("external ticket required".into()));
         }
@@ -1116,6 +1133,13 @@ impl Scheduler {
             .bind(task_id)
             .fetch_one(&mut *tx)
             .await?;
+        let batch_parent:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM vr2_jobs WHERE workflow_id=$1 AND external_ticket LIKE 'native-batch:%' AND state IN ('awaiting','unknown'))").bind(workflow_id).fetch_one(&mut *tx).await?;
+        if batch_parent {
+            return Err(AppError::Conflict(
+                "native batch publication already admitted; verify individual target receipts"
+                    .into(),
+            ));
+        }
         let state: String =
             sqlx::query_scalar("SELECT state FROM vr2_workflows WHERE id=$1 FOR UPDATE")
                 .bind(workflow_id)
@@ -1278,6 +1302,13 @@ impl Scheduler {
             .bind(task_id)
             .fetch_one(&mut *tx)
             .await?;
+        let batch_parent:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM vr2_jobs WHERE workflow_id=$1 AND external_ticket LIKE 'native-batch:%' AND state IN ('awaiting','unknown'))").bind(workflow_id).fetch_one(&mut *tx).await?;
+        if batch_parent {
+            return Err(AppError::Conflict(
+                "native batch publication already admitted; verify individual target receipts"
+                    .into(),
+            ));
+        }
         let state: String =
             sqlx::query_scalar("SELECT state FROM vr2_workflows WHERE id=$1 FOR UPDATE")
                 .bind(workflow_id)
@@ -1373,6 +1404,12 @@ impl Scheduler {
                 .bind(job_id)
                 .fetch_one(&mut *tx)
                 .await?;
+        let batch_parent:bool=sqlx::query_scalar("SELECT COALESCE(external_ticket LIKE 'native-batch:%',false) FROM vr2_jobs WHERE id=$1").bind(job_id).fetch_one(&mut *tx).await?;
+        if batch_parent {
+            return Err(AppError::Conflict(
+                "resolve individual original publication receipts instead".into(),
+            ));
+        }
         if flow != "unknown" || job_state != "unknown" {
             return Err(AppError::Conflict("publish is not in UNKNOWN state".into()));
         }

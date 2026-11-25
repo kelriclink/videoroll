@@ -175,6 +175,86 @@ if n=='mixed-fail':sys.exit(1)
             assert api(f'/tasks/{t4}/actions/publish',{**single,'meta':{'title':'different'}})[0]==409
             assert counters()==before and sorted((runtime/'calls').read_text().splitlines())==sorted(before_calls.splitlines()+['mixed-ok','pure-ks','mixed-ok'])
             print('PASS: pure SAU single and multi-target native batches, rollback, stable original IDs, facade history and operator settlement without legacy intents or replay',flush=True)
+            # Exercise the actual automatic Publish stage, not a second call to
+            # the manual batch endpoint. The parent lease must be converted
+            # to an exact durable batch ticket before children can run.
+            def auto_seed(platforms, via_action):
+                task,payload=seed();meta=payload['platform_meta']['bilibili']
+                db("UPDATE tasks SET publish_meta_json=CAST(:m AS jsonb),publish_meta_sha256=:sha,publish_meta_revision=1 WHERE id=CAST(:t AS uuid)",{'t':task,'m':json.dumps(meta),'sha':hashlib.sha256(json.dumps(meta).encode()).hexdigest()})
+                if via_action:
+                    db("INSERT INTO app_settings(key,value_json,version) VALUES('subtitle.auto_profile',CAST(:v AS jsonb),1) ON CONFLICT(key) DO UPDATE SET value_json=EXCLUDED.value_json",{'v':json.dumps({'auto_publish':True,'auto_publish_platforms':platforms,'publish_typeid_mode':'meta','auto_dub_p2':False,'publish_use_youtube_cover':False})})
+                    code,r=api(f'/tasks/{task}/actions/auto_publish',{});assert code==200,(code,r)
+                    job=r['job_id'];flow=db('SELECT workflow_id::text FROM operation_inbox WHERE id=CAST(:j AS uuid)',{'j':job})[0]
+                else:
+                    flow,job=str(uuid.uuid4()),str(uuid.uuid4())
+                    db("INSERT INTO vr2_workflows(id,task_id,generation,state,current_stage,configuration) VALUES(CAST(:w AS uuid),CAST(:t AS uuid),1,'running','publish',CAST(:c AS jsonb))",{'w':flow,'t':task,'c':json.dumps({'auto_publish':True,'auto_publish_platforms':platforms})})
+                    db("INSERT INTO operation_inbox(id,workflow_id,task_id,stage,generation,operation_key,request_json,max_attempts,runtime_engine) VALUES(CAST(:j AS uuid),CAST(:w AS uuid),CAST(:t AS uuid),'publish',1,:op,'{}',1,'rust-v2')",{'j':job,'w':flow,'t':task,'op':'vr2:'+flow+':publish:1'})
+                return task,flow,job
+            def parent_state(flow,job):
+                return db("SELECT w.state,i.status,i.external_ticket,i.result_json FROM pipeline_runs w JOIN operation_inbox i ON i.workflow_id=w.id WHERE w.id=CAST(:w AS uuid) AND i.id=CAST(:j AS uuid)",{'w':flow,'j':job})
+            def auto_batch(task):
+                rows=db("SELECT id::text,request_json FROM publish_batches WHERE task_id=CAST(:t AS uuid)",{'t':task},True)
+                return rows[0] if rows else None
+            def run_auto(task,flow,job,n):
+                with (root.parent/'auto-batch-worker.log').open('a') as out:
+                    core=subprocess.Popen([str(worker),'worker'],env={**os.environ,'VIDEOROLL_V2_WORKERS':'1','RUST_LOG':'warn'},stdout=out,stderr=subprocess.STDOUT)
+                    try:
+                        wait(lambda:auto_batch(task) is not None or parent_state(flow,job)[1]=='unknown')
+                        pair=auto_batch(task);assert pair is not None,parent_state(flow,job)
+                        batch,req=pair;generation=db('SELECT generation FROM pipeline_runs WHERE id=CAST(:w AS uuid)',{'w':flow})[0];assert req['auto_parent']=={'workflow_id':flow,'job_id':job,'generation':generation},req
+                        wait(lambda:parent_state(flow,job)[1]=='unknown')
+                        assert parent_state(flow,job)[:3]==('unknown','unknown','native-batch:'+batch),parent_state(flow,job)
+                        assert db("SELECT count(*) FROM publish_jobs WHERE batch_id=CAST(:b AS uuid)",{'b':batch})==(n,)
+                        return batch
+                    finally:
+                        core.terminate()
+                        try:core.wait(timeout=8)
+                        except subprocess.TimeoutExpired:core.kill();core.wait(timeout=5)
+            before_auto=counters();calls_before=(runtime/'calls').read_text().splitlines()
+            # Old UI auto action reads current settings and selects the newest
+            # active/validated SAU account, without an account in the request.
+            ta,wa,ja=auto_seed(['douyin'],True);ba=run_auto(ta,wa,ja,1)
+            assert state(ta,ba)==('failed','failed','PUBLISH_FAILED',0),state(ta,ba)
+            dj,account_id=db("SELECT id::text,account_id::text FROM publish_jobs WHERE batch_id=CAST(:b AS uuid) AND platform='douyin'",{'b':ba});assert account_id==good
+            assert resolve(ta,dj,{**receipt,'external_id':'7412345678901234571'})[0]==200
+            assert parent_state(wa,ja)[:3]==('succeeded','succeeded','native-batch:'+ba) and state(ta,ba)==('succeeded','published',None,1)
+            # A pipeline-origin stage with both targets; child Bilibili stage
+            # and SAU worker settle their original rows. No second parent flow.
+            tb,wb,jb=auto_seed(['bilibili','douyin'],False);bb=run_auto(tb,wb,jb,2)
+            assert state(tb,bb)==('partial_failed','publishing','PUBLISH_PARTIAL_FAILURE',0),state(tb,bb)
+            assert db("SELECT count(*) FROM publish_jobs WHERE batch_id=CAST(:b AS uuid) AND platform='bilibili' AND state='published'",{'b':bb})==(1,)
+            dj,aid=db("SELECT id::text,account_id::text FROM publish_jobs WHERE batch_id=CAST(:b AS uuid) AND platform='douyin'",{'b':bb});assert aid==good
+            assert resolve(tb,dj,{**receipt,'external_id':'7412345678901234572'})[0]==200
+            assert parent_state(wb,jb)[:3]==('succeeded','succeeded','native-batch:'+bb) and state(tb,bb)==('succeeded','published',None,1)
+            assert counters()['submit']==before_auto['submit']+1 and (runtime/'calls').read_text().splitlines()==calls_before+['mixed-ok','mixed-ok']
+            assert db("SELECT count(*) FROM operation_inbox WHERE workflow_id=CAST(:w AS uuid) AND stage='cleanup'",{'w':wb})==(0,)
+            assert api(f'/tasks/{tb}/actions/auto_publish',{})[1]['status']=='complete'
+            print('PASS: real automatic pure SAU and mixed Publish stages, current-profile account selection, exact durable parent tickets, original receipts and batch-only cleanup',flush=True)
+            # Explicit P2 from an older successful generation must not be
+            # silently dropped when the original auto action starts Publish.
+            tc,payload=seed('two-part');meta=payload['platform_meta']['bilibili'];key=payload['video_key']
+            db("UPDATE tasks SET publish_meta_json=CAST(:m AS jsonb),publish_meta_sha256=:sha,publish_meta_revision=1 WHERE id=CAST(:t AS uuid)",{'t':tc,'m':json.dumps(meta),'sha':hashlib.sha256(json.dumps(meta).encode()).hexdigest()})
+            dub=f'v2/dub/{tc}/dub.mp4';srt=f'v2/sub/{tc}/subtitle.srt'
+            (root/dub).parent.mkdir(parents=True,exist_ok=True);(root/dub).write_bytes((root/key).read_bytes())
+            (root/srt).parent.mkdir(parents=True,exist_ok=True);(root/srt).write_text('1\n00:00:00,000 --> 00:00:01,000\n测试\n')
+            for kind,k in [('video_raw',key),('video_dubbed',dub),('subtitle_srt',srt)]:
+                db('INSERT INTO assets(id,task_id,kind,storage_key) VALUES(CAST(:a AS uuid),CAST(:t AS uuid),CAST(:kind AS asset_kind),:k)',{'a':str(uuid.uuid4()),'t':tc,'kind':kind,'k':k})
+            old,oldjob=str(uuid.uuid4()),str(uuid.uuid4())
+            db("INSERT INTO vr2_workflows(id,task_id,generation,state,current_stage,configuration) VALUES(CAST(:w AS uuid),CAST(:t AS uuid),1,'succeeded','dubbing','{}'::jsonb)",{'w':old,'t':tc})
+            db("""INSERT INTO operation_inbox(id,operation_key,status,runtime_engine,workflow_id,task_id,stage,generation,dubbing_source_video_key,dubbing_source_srt_key,dubbing_output_video_key,dubbing_model_status,dubbing_model_job_id,dubbing_run_created_at)
+            VALUES(CAST(:j AS uuid),:op,'succeeded','rust-v2',CAST(:w AS uuid),CAST(:t AS uuid),'dubbing',1,:raw,:srt,:dub,'succeeded',CAST(:model AS uuid),now())""",{'j':oldjob,'op':'auto-batch-dub:'+oldjob,'w':old,'t':tc,'raw':key,'srt':srt,'dub':dub,'model':str(uuid.uuid4())})
+            db("UPDATE app_settings SET value_json=CAST(:v AS jsonb) WHERE key='subtitle.auto_profile'",{'v':json.dumps({'auto_publish':True,'auto_publish_platforms':['bilibili','douyin'],'publish_typeid_mode':'meta','auto_dub_p2':False,'publish_use_youtube_cover':False})})
+            assert api(f'/tasks/{tc}/actions/auto_publish?dubbing_job_id={uuid.uuid4()}',{})[0]==409
+            code,rc=api(f'/tasks/{tc}/actions/auto_publish?dubbing_job_id={oldjob}',{});assert code==200,(code,rc)
+            jc=rc['job_id'];wc=db('SELECT workflow_id::text FROM operation_inbox WHERE id=CAST(:j AS uuid)',{'j':jc})[0]
+            pre=counters();bc=run_auto(tc,wc,jc,2)
+            assert counters()['submit']==pre['submit']+1 and counters()['complete']==pre['complete']+2
+            dj,aid=db("SELECT id::text,account_id::text FROM publish_jobs WHERE batch_id=CAST(:b AS uuid) AND platform='douyin'",{'b':bc});assert aid==good
+            assert resolve(tc,dj,{**receipt,'external_id':'7412345678901234573'})[0]==200
+            assert parent_state(wc,jc)[:3]==('succeeded','succeeded','native-batch:'+bc) and state(tc,bc)==('succeeded','published',None,1)
+            print('PASS: original automatic action preserves explicitly selected prior successful P2 receipt and sends exactly two Bilibili parts',flush=True)
+
+
 
 
         finally:
