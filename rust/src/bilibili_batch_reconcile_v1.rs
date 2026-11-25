@@ -146,7 +146,9 @@ pub(crate) async fn reconcile_native_sau(
     task: Uuid,
     batch: Uuid,
 ) -> AppResult<()> {
-    reconcile_impl(tx, task, batch, false).await
+    let native_mixed: bool = sqlx::query_scalar("SELECT COALESCE(request_json->>'runtime'='rust-mixed-v1',false) FROM publish_batches WHERE id=$1 AND task_id=$2")
+        .bind(batch).bind(task).fetch_one(&mut **tx).await?;
+    reconcile_impl(tx, task, batch, native_mixed).await
 }
 async fn reconcile_impl(
     tx: &mut Transaction<'_, Postgres>,

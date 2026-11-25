@@ -424,6 +424,18 @@ export VIDEOROLL_V2_MOCK_YT_LOG="$repo_root/rust/target/v2-mock-ytdlp-args.log"
 export VIDEOROLL_V2_INDEX_ENDPOINT="http://127.0.0.1:18082/v1/chat/completions"
 export VIDEOROLL_V2_COMPAT_URL="http://127.0.0.1:18083"
 export VIDEOROLL_V2_SOCIAL_PUBLISHER_URL="http://127.0.0.1:18085"
+if [[ "${VIDEOROLL_V2_TEST_MIXED_PUBLISH:-false}" == "true" ]]; then
+  [[ "${VIDEOROLL_V2_TEST_BILI_DIRECT_ONLY:-false}" == "true" ]]
+  # Use the same real legacy enum definitions as native SAU worker smoke.
+  docker exec -i "$container_name" psql -v ON_ERROR_STOP=1 -U postgres -d videoroll_test <<'SQL'
+CREATE TYPE publish_state AS ENUM ('draft','submitting','submitted','published','unknown','failed');
+ALTER TABLE publish_jobs ALTER COLUMN platform TYPE platform USING platform::platform;
+ALTER TABLE publish_jobs ALTER COLUMN state TYPE publish_state USING state::publish_state;
+SQL
+  export VIDEOROLL_V2_NATIVE_OUTBOX_ONLY=true VIDEOROLL_V2_ENABLE_NATIVE_MIXED_PUBLISH=true
+  export VIDEOROLL_V2_ENABLE_SAU_PUBLISH=true VIDEOROLL_V2_SAU_ENABLE_NATIVE_PUBLISH=true
+  export VIDEOROLL_V2_SAU_STORAGE_ROOT="$VIDEOROLL_V2_STORAGE_ROOT"
+fi
 export VIDEOROLL_V2_PLAYOUT_ROOT="$repo_root/rust/target/playout-sandbox"
 export VIDEOROLL_V2_YOUDUB_PYTHON="$(command -v python3)"
 # Never inspect or clean the host production WORK_DIR during isolated tests.

@@ -60,6 +60,10 @@ async fn delete_final(
            AND p.state NOT IN ('published','failed'))
          OR EXISTS(SELECT 1 FROM vr2_social_publish_intents p WHERE p.task_id=$1
            AND p.state NOT IN ('published','failed'))
+         OR EXISTS(SELECT 1 FROM publish_jobs p JOIN publish_batches b ON b.id=p.batch_id
+           WHERE p.task_id=$1 AND b.task_id=$1 AND b.request_json->>'runtime'='rust-mixed-v1'
+           AND (p.state::text IN ('draft','submitting','unknown') OR
+             (p.state::text='submitted' AND NULLIF(p.external_id,'') IS NULL AND NULLIF(p.external_url,'') IS NULL)))
          OR EXISTS(SELECT 1 FROM dubbing_jobs d WHERE d.task_id=$1
            AND d.status IN('queued','preparing','synthesizing','aligning','mixing',
                            'rendering','pause_requested','cancel_requested'))",

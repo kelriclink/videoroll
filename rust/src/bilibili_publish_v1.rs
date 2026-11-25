@@ -195,7 +195,33 @@ pub(crate) async fn enqueue_task_action(state: &AppState, raw: Value) -> AppResu
     enqueue(state, body, true).await
 }
 
-async fn enqueue(state: &AppState, mut body: Request, task_action: bool) -> AppResult<Value> {
+async fn enqueue(state: &AppState, body: Request, task_action: bool) -> AppResult<Value> {
+    let prepared = prepare(state, body).await?;
+    let mut tx = state.db.pool.begin().await?;
+    let result = enqueue_prepared(state, &mut tx, prepared, task_action).await?;
+    tx.commit().await?;
+    Ok(result)
+}
+
+pub(crate) struct Prepared {
+    body: Request,
+    meta: crate::bilibili::ArchiveMeta,
+    parts: Vec<(String, String, &'static str)>,
+    cover: Option<String>,
+    fingerprint: Option<String>,
+    snapshot: Value,
+}
+impl Prepared {
+    pub(crate) fn bind_batch(&mut self, batch: Uuid) {
+        self.body.batch_id = Some(batch);
+    }
+}
+pub(crate) async fn prepare_mixed(state: &AppState, raw: Value) -> AppResult<Prepared> {
+    let body = serde_json::from_value(raw)
+        .map_err(|_| AppError::Invalid("invalid Bilibili mixed target".into()))?;
+    prepare(state, body).await
+}
+async fn prepare(state: &AppState, body: Request) -> AppResult<Prepared> {
     if !state.config.native_bilibili_allowed
         || !crate::publish_platforms::enabled(&state.db, "bilibili").await?
     {
@@ -241,21 +267,43 @@ async fn enqueue(state: &AppState, mut body: Request, task_action: bool) -> AppR
         &snapshot,
     )
     .await?;
-    // The original Python endpoint uses SELECT ... FOR UPDATE on tasks to
-    // serialize duplicate submits across services. Preserve that same lock.
-    let mut tx = state.db.pool.begin().await?;
+    Ok(Prepared {
+        body,
+        meta,
+        parts,
+        cover,
+        fingerprint,
+        snapshot,
+    })
+}
+
+pub(crate) async fn enqueue_prepared(
+    state: &AppState,
+    tx: &mut Transaction<'_, Postgres>,
+    prepared: Prepared,
+    task_action: bool,
+) -> AppResult<Value> {
+    let Prepared {
+        mut body,
+        meta,
+        parts,
+        cover,
+        fingerprint,
+        snapshot,
+    } = prepared;
+    // Original task row lock is shared across admission and batch settlement.
     let status: Option<String> = sqlx::query_scalar(
         "SELECT upper(status::text) FROM tasks
        WHERE id=$1 AND runtime_owner='rust' FOR UPDATE",
     )
     .bind(body.task_id)
-    .fetch_optional(&mut *tx)
+    .fetch_optional(&mut **tx)
     .await?;
     let status = status.ok_or_else(|| AppError::NotFound("Rust-owned task not found".into()))?;
     let licensed: bool =
         sqlx::query_scalar("SELECT source_license::text <> 'unknown' FROM tasks WHERE id=$1")
             .bind(body.task_id)
-            .fetch_one(&mut *tx)
+            .fetch_one(&mut **tx)
             .await?;
     if !licensed {
         return Err(AppError::Conflict(
@@ -273,7 +321,7 @@ async fn enqueue(state: &AppState, mut body: Request, task_action: bool) -> AppR
              WHERE id=$1 FOR UPDATE",
         )
         .bind(batch_id)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&mut **tx)
         .await?
         .ok_or_else(|| AppError::Invalid("publish batch does not exist".into()))?;
         if batch.try_get::<Uuid, _>("task_id")? != body.task_id {
@@ -307,7 +355,7 @@ async fn enqueue(state: &AppState, mut body: Request, task_action: bool) -> AppR
          ORDER BY updated_at DESC,created_at DESC,id DESC LIMIT 1",
     )
     .bind(body.task_id).bind(body.account_id)
-    .fetch_optional(&mut *tx)
+    .fetch_optional(&mut **tx)
     .await?;
     if let Some(row) = existing {
         let previous: Option<Uuid> = row.try_get("batch_id")?;
@@ -315,6 +363,13 @@ async fn enqueue(state: &AppState, mut body: Request, task_action: bool) -> AppR
             return Err(AppError::Conflict("previous Bilibili publish belongs to a different batch; reconcile before reusing it".into()));
         }
         return view(&row);
+    }
+    let mixed: Option<Uuid> = sqlx::query_scalar("SELECT id FROM publish_batches WHERE task_id=$1 AND request_json->>'runtime'='rust-mixed-v1' LIMIT 1")
+        .bind(body.task_id).fetch_optional(&mut **tx).await?;
+    if mixed.is_some() && mixed != body.batch_id {
+        return Err(AppError::Conflict(
+            "task belongs to a native mixed publication batch".into(),
+        ));
     }
     if !batch_is_active {
         return Err(AppError::Conflict(
@@ -330,7 +385,7 @@ async fn enqueue(state: &AppState, mut body: Request, task_action: bool) -> AppR
         )
         .bind(body.task_id)
         .bind(batch_id)
-        .fetch_all(&mut *tx)
+        .fetch_all(&mut **tx)
         .await?;
         for row in related {
             let expected: Value = row.try_get("expected_targets")?;
@@ -370,7 +425,7 @@ async fn enqueue(state: &AppState, mut body: Request, task_action: bool) -> AppR
     )
     .bind(body.task_id)
     .bind(body.account_id.map(|v| v.to_string()))
-    .fetch_one(&mut *tx)
+    .fetch_one(&mut **tx)
     .await?;
     if unsafe_other {
         return Err(AppError::Conflict(
@@ -386,16 +441,16 @@ async fn enqueue(state: &AppState, mut body: Request, task_action: bool) -> AppR
     )
     .bind(body.task_id)
     .bind(body.account_id.map(|v| v.to_string()))
-    .fetch_one(&mut *tx)
+    .fetch_one(&mut **tx)
     .await?;
     if busy {
         return Err(AppError::Conflict("another workflow owns this task".into()));
     }
     for (key, _, kind) in &parts {
-        owned_asset(&mut tx, body.task_id, kind, key).await?;
+        owned_asset(tx, body.task_id, kind, key).await?;
     }
     if let Some(ref key) = cover {
-        owned_asset(&mut tx, body.task_id, "cover_image", key).await?;
+        owned_asset(tx, body.task_id, "cover_image", key).await?;
     }
     if parts.len() == 2 {
         let p2 = &parts[1].0;
@@ -407,7 +462,7 @@ async fn enqueue(state: &AppState, mut body: Request, task_action: bool) -> AppR
         )
         .bind(body.task_id)
         .bind(p2)
-        .fetch_one(&mut *tx)
+        .fetch_one(&mut **tx)
         .await?;
         if !valid {
             return Err(AppError::Conflict(
@@ -442,7 +497,7 @@ async fn enqueue(state: &AppState, mut body: Request, task_action: bool) -> AppR
               OR EXISTS(SELECT 1 FROM publish_jobs WHERE task_id=$1 AND batch_id IS NULL)",
         )
         .bind(body.task_id)
-        .fetch_one(&mut *tx)
+        .fetch_one(&mut **tx)
         .await?;
         if unbatched {
             return Err(AppError::Conflict(
@@ -458,7 +513,7 @@ async fn enqueue(state: &AppState, mut body: Request, task_action: bool) -> AppR
                AND (($2::uuid IS NULL AND account_id IS NULL AND bili_account_id IS NULL)
                OR ($2::uuid IS NOT NULL AND (account_id=$2 OR (account_id IS NULL AND bili_account_id=$2)))))",
         )
-        .bind(body.task_id).bind(body.account_id).fetch_one(&mut *tx).await?;
+        .bind(body.task_id).bind(body.account_id).fetch_one(&mut **tx).await?;
         if prior {
             return Err(AppError::Conflict(
                 "previous Bilibili receipt requires reconciliation".into(),
@@ -474,7 +529,7 @@ async fn enqueue(state: &AppState, mut body: Request, task_action: bool) -> AppR
             "SELECT expected_targets FROM publish_batches WHERE task_id=$1",
         )
         .bind(body.task_id)
-        .fetch_all(&mut *tx)
+        .fetch_all(&mut **tx)
         .await?;
         for expected in batches {
             if expected.as_array().is_some_and(|v| v.is_empty()) {
@@ -499,12 +554,12 @@ async fn enqueue(state: &AppState, mut body: Request, task_action: bool) -> AppR
         .bind(body.task_id)
         .bind(expected)
         .bind(request)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
         sqlx::query("UPDATE tasks SET active_publish_batch_id=$2 WHERE id=$1")
             .bind(body.task_id)
             .bind(batch)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?;
         body.batch_id = Some(batch);
     }
@@ -512,7 +567,7 @@ async fn enqueue(state: &AppState, mut body: Request, task_action: bool) -> AppR
         "SELECT COALESCE(MAX(generation),0)+1 FROM vr2_workflows WHERE task_id=$1",
     )
     .bind(body.task_id)
-    .fetch_one(&mut *tx)
+    .fetch_one(&mut **tx)
     .await?;
     let workflow_id = Uuid::new_v4();
     let job_id = Uuid::new_v4();
@@ -535,7 +590,7 @@ async fn enqueue(state: &AppState, mut body: Request, task_action: bool) -> AppR
     .bind(body.task_id)
     .bind(generation)
     .bind(config)
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await?;
     sqlx::query(
         "INSERT INTO operation_inbox(id,workflow_id,task_id,stage,generation,operation_key,
@@ -547,14 +602,14 @@ async fn enqueue(state: &AppState, mut body: Request, task_action: bool) -> AppR
     .bind(body.task_id)
     .bind(generation)
     .bind(format!("vr2:{workflow_id}:publish:{generation}"))
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await?;
     sqlx::query("INSERT INTO publish_jobs(id,task_id,batch_id,platform,account_id,bili_account_id,meta_json,cover_key,
        state,operation_key,lease_owner,lease_until)
        VALUES($1,$2,$3,'bilibili',$4,$4,$5,$6,'submitting',$7,
           'rust-v2',now()+interval '48 hours')")
         .bind(job_id).bind(body.task_id).bind(body.batch_id).bind(body.account_id).bind(&original_meta).bind(&cover)
-        .bind(&original_operation).execute(&mut *tx).await?;
+        .bind(&original_operation).execute(&mut **tx).await?;
     sqlx::query(
         "INSERT INTO operation_inbox(id,operation_key,status,request_json,lease_owner,
         lease_until,runtime_engine)
@@ -562,16 +617,15 @@ async fn enqueue(state: &AppState, mut body: Request, task_action: bool) -> AppR
     )
     .bind(Uuid::new_v4())
     .bind(&original_operation)
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await?;
     sqlx::query(
         "UPDATE tasks SET status='publishing'::task_status,
          error_code=NULL,error_message=NULL,updated_at=now() WHERE id=$1",
     )
     .bind(body.task_id)
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await?;
-    tx.commit().await?;
     Ok(json!({"job_id":job_id,"state":"submitting","aid":null,"bvid":null,"response":null}))
 }
 
