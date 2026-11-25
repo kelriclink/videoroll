@@ -1,9 +1,45 @@
 #!/usr/bin/env python3
-"""Offline, one-request model adapter. No DB, API, queue, network or task logic."""
+"""Offline model adapter, one-shot or bounded persistent subprocess. No business state."""
 import contextlib
 import json
+import functools
+import fcntl
+import os
+import stat
+import struct
 import sys
 from pathlib import Path
+
+@functools.lru_cache(maxsize=1)
+def faster_model(model, device, compute_type, cpu_threads, num_workers):
+    from faster_whisper import WhisperModel
+    return WhisperModel(model, device=device, compute_type=compute_type,
+                        local_files_only=True, cpu_threads=cpu_threads, num_workers=num_workers)
+
+@functools.lru_cache(maxsize=1)
+def ov_whisper(model, device):
+    from openvino_genai import WhisperPipeline
+    return WhisperPipeline(model, device=device)
+
+@functools.lru_cache(maxsize=1)
+def ov_embedding(model, device):
+    import openvino as ov
+    from tokenizers import Tokenizer
+    path=Path(model)
+    ir=path/"openvino_model.xml"
+    if not ir.is_file():ir=path/"openvino"/"openvino_model.xml"
+    if not ir.is_file():raise RuntimeError("OpenVINO embedding export missing")
+    tokenizer=Tokenizer.from_file(str(path/"tokenizer.json"))
+    max_len=512
+    config=path/"sentence_bert_config.json"
+    if config.is_file():max_len=min(512,max(1,int(json.loads(config.read_text()).get("max_seq_length",512))))
+    tokenizer.enable_truncation(max_length=max_len)
+    return tokenizer,ov.Core().compile_model(str(ir),device.partition(":")[2] or "CPU")
+
+@functools.lru_cache(maxsize=1)
+def st_embedding(model, device):
+    from sentence_transformers import SentenceTransformer
+    return SentenceTransformer(model,device=device,local_files_only=True,trust_remote_code=False)
 
 def transcribe(req):
     import av
@@ -14,10 +50,7 @@ def transcribe(req):
     language = req.get("language", "auto")
     if language == "auto": language = None
     if engine == "faster-whisper":
-        from faster_whisper import WhisperModel
-        kwargs = {"device":req["device"],"compute_type":req["compute_type"],"local_files_only":True,
-                  "cpu_threads":req["cpu_threads"],"num_workers":req["num_workers"]}
-        pipeline = WhisperModel(model, **kwargs)
+        pipeline = faster_model(model,req["device"],req["compute_type"],req["cpu_threads"],req["num_workers"])
         segments, _ = pipeline.transcribe(audio, language=language, vad_filter=True,
             vad_parameters={"min_silence_duration_ms":2000,"speech_pad_ms":400})
         return {"segments":[{"start":float(s.start),"end":float(s.end),"text":s.text,
@@ -32,8 +65,7 @@ def transcribe(req):
         spans=get_speech_timestamps(samples,VadOptions(threshold=req["vad_threshold"],min_silence_duration_ms=2000,speech_pad_ms=400))
     else: spans=[{"start":0,"end":len(samples)}]
     if not spans:return {"segments":[]}
-    from openvino_genai import WhisperPipeline
-    pipeline=WhisperPipeline(model,device=req["device"])
+    pipeline=ov_whisper(model,req["device"])
     cfg=pipeline.get_generation_config()
     cfg.return_timestamps=True
     cfg.task="transcribe"
@@ -65,21 +97,11 @@ def embedding(req):
     if device.lower().startswith("openvino"):
         # Existing exported IR is required; never export/download or modify a
         # production model directory implicitly during a knowledge write.
-        import openvino as ov
-        from tokenizers import Tokenizer
-        ir=path/"openvino_model.xml"
-        if not ir.is_file():ir=path/"openvino"/"openvino_model.xml"
-        if not ir.is_file():raise RuntimeError("OpenVINO embedding export missing")
-        tokenizer=Tokenizer.from_file(str(path/"tokenizer.json"))
-        max_len=512
-        config=path/"sentence_bert_config.json"
-        if config.is_file():max_len=min(512,max(1,int(json.loads(config.read_text()).get("max_seq_length",512))))
-        tokenizer.enable_truncation(max_length=max_len)
+        tokenizer,compiled=ov_embedding(str(path),device)
         encoded=tokenizer.encode(text)
         ids=np.asarray([encoded.ids],dtype=np.int64)
         mask=np.asarray([encoded.attention_mask],dtype=np.int64)
         types=np.asarray([encoded.type_ids],dtype=np.int64)
-        compiled=ov.Core().compile_model(str(ir),device.partition(":")[2] or "CPU")
         values={"input_ids":ids,"attention_mask":mask,"token_type_ids":types}
         inputs={port.any_name:values[port.any_name] for port in compiled.inputs}
         outputs=compiled(inputs)
@@ -92,23 +114,90 @@ def embedding(req):
         vector=(hidden*weighted).sum(axis=1)/np.maximum(weighted.sum(axis=1),1e-9)
         vector=vector[0].astype(np.float32)
     else:
-        from sentence_transformers import SentenceTransformer
-        model=SentenceTransformer(str(path),device=device,local_files_only=True,trust_remote_code=False)
+        model=st_embedding(str(path),device)
         vector=np.asarray(model.encode(text,normalize_embeddings=True),dtype=np.float32)
     norm=float(np.linalg.norm(vector))
     if vector.ndim!=1 or not np.isfinite(vector).all() or norm<=0:raise RuntimeError("invalid embedding")
     return {"embedding":(vector/norm).tolist()}
 
+MAX_REQUEST=256*1024
+MAX_RESPONSE=12*1024*1024
+
+def dispatch(req):
+    if req["kind"]=="asr":return transcribe(req)
+    if req["kind"]=="embedding":return embedding(req)
+    if req["kind"]=="devices":
+        import openvino as ov
+        return {"devices":ov.Core().available_devices}
+    raise ValueError("unsupported operation")
+
+def identity(req):
+    return tuple(req.get(k) for k in ("kind","engine","model_path","device","compute_type","cpu_threads","num_workers"))
+
+def lock_gpu(req):
+    device=str(req.get("device","")).lower()
+    if req["kind"]=="devices" or device in ("cpu","openvino","openvino:cpu"):
+        return None
+    path=os.environ["VIDEOROLL_LOCAL_GPU_LOCK"]
+    fd=os.open(path,os.O_RDWR|os.O_CREAT|os.O_NOFOLLOW|os.O_CLOEXEC,0o600)
+    try:
+        info=os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid!=os.geteuid() or info.st_nlink!=1 or info.st_mode&0o077:
+            raise RuntimeError("unsafe GPU admission lock")
+        # Held for the entire resident process, not merely during generate().
+        fcntl.flock(fd,fcntl.LOCK_EX)
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+def serve():
+    # Reserve a private protocol stream; native runtime writes to fd 1
+    # are redirected too, not only Python print().
+    output=os.fdopen(os.dup(sys.stdout.fileno()),"wb")
+    os.dup2(sys.stderr.fileno(),sys.stdout.fileno())
+    stdin=sys.stdin.buffer
+    current=None
+    gpu_lock=None
+    try:
+        while True:
+            header=stdin.read(4)
+            if not header:return
+            if len(header)!=4:raise ValueError("truncated frame")
+            length=struct.unpack(">I",header)[0]
+            if not 0<length<=MAX_REQUEST:raise ValueError("request frame too large")
+            raw=stdin.read(length)
+            if len(raw)!=length:raise ValueError("truncated request")
+            try:
+                req=json.loads(raw)
+                key=identity(req)
+                if current is None:
+                    gpu_lock=lock_gpu(req)
+                    current=key
+                elif current!=key:
+                    raise ValueError("model identity changed within session")
+                result={"ok":True,"result":dispatch(req)}
+                encoded=json.dumps(result,ensure_ascii=False,allow_nan=False).encode()
+                if len(encoded)>MAX_RESPONSE:raise ValueError("response too large")
+            except Exception as exc:
+                # Never include request text, model secrets or traceback in the response.
+                encoded=json.dumps({"ok":False,"error_type":type(exc).__name__}).encode()
+                output.write(struct.pack(">I",len(encoded))+encoded)
+                output.flush()
+                return
+            output.write(struct.pack(">I",len(encoded))+encoded)
+            output.flush()
+    finally:
+        # Keep the lock held until process exit (including runtime teardown).
+        output.close()
+
 def main():
+    if sys.argv[1:]==["--serve"]:
+        return serve()
+    if sys.argv[1:]:raise ValueError("unsupported arguments")
     req=json.load(sys.stdin)
-    # Third-party progress output must not corrupt the JSON protocol.
     with contextlib.redirect_stdout(sys.stderr):
-        if req["kind"]=="asr":out=transcribe(req)
-        elif req["kind"]=="embedding":out=embedding(req)
-        elif req["kind"]=="devices":
-            import openvino as ov
-            out={"devices":ov.Core().available_devices}
-        else:raise ValueError("unsupported operation")
+        out=dispatch(req)
     print(json.dumps(out,ensure_ascii=False,allow_nan=False))
 
 if __name__=="__main__":
