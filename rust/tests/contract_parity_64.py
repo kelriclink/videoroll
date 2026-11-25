@@ -371,6 +371,39 @@ bodies = {
  "/tasks/actions/resume_stopped":{},
  "/tasks/actions/resume_failed_recent":{},
 }
+# Give positive reads and lifecycle operations their own stable fixtures rather
+# than accidentally probing a nonexistent ID or a task mutated by another test.
+fixture_ids={}
+if args.all_services:
+    meta_task,yt_task,render_task,render_job,execution,worker,enrollment=[str(uuid.uuid4()) for _ in range(7)]
+    metadata={"title":"Contract fixture metadata","description":"Isolated fixture","webpage_url":"https://youtu.be/0123456789A","uploader":"Contract fixture","duration":23}
+    storage=Path(os.environ["VIDEOROLL_V2_STORAGE_ROOT"])
+    assert storage==root/"target/v2-smoke-objects"
+    key=f"v2/metadata/{yt_task}/contract.json"
+    file=storage/key;file.parent.mkdir(parents=True,exist_ok=True)
+    raw=json.dumps(metadata).encode();file.write_bytes(raw)
+    with psycopg.connect(os.environ["DATABASE_URL"]) as db:
+        db.execute("INSERT INTO tasks(id,source_type,source_license,status,runtime_owner) VALUES(%s,'local','own','ready_for_review','rust'),(%s,'local','own','subtitle_ready','rust')",(meta_task,render_task))
+        db.execute("INSERT INTO tasks(id,source_type,source_license,status,runtime_owner,source_url) VALUES(%s,'youtube','authorized','created','rust',%s)",(yt_task,metadata['webpage_url']))
+        db.execute("INSERT INTO assets(id,task_id,kind,storage_key,sha256,size_bytes) VALUES(%s,%s,'metadata_json',%s,%s,%s)",(uuid.uuid4(),yt_task,key,hashlib.sha256(raw).hexdigest(),len(raw)))
+        db.execute("INSERT INTO render_workers(id,worker_key,name,platform,resources,credential_hash) VALUES(%s,%s,'contract render worker','linux',%s,%s)",(worker,'contract-'+worker,json.dumps({'devices':[{'id':'gpu0','name':'fixture','status':'idle'}]}),'f'*64))
+        db.execute("INSERT INTO render_worker_enrollments(id,label,status,expires_at) VALUES(%s,'contract fixture','active',now()+interval '10 minutes')",(enrollment,))
+        db.execute("INSERT INTO render_jobs(id,task_id,status) VALUES(%s,%s,'running')",(render_job,render_task))
+        db.execute("INSERT INTO render_executions(id,render_job_id,worker_id,state,progress,metrics) VALUES(%s,%s,%s,'running',47,'{\"fps\":18.5}')",(execution,render_job,worker))
+    fixture_ids.update(meta_task=meta_task,yt_task=yt_task,execution=execution,worker=worker,enrollment=enrollment)
+    context.update(execution_id=execution,worker_id=worker,enrollment_id=enrollment,**{"device_id:path":"gpu0"})
+    bodies["/tasks/{task_id}/publish_meta"]={"title":"Contract fixture title","typeid":21,"tags":["fixture"],"copyright":1}
+    bodies["/tasks/{task_id}/publish_meta/draft"]={"mode":"source","meta":{"typeid":21}}
+    bodies["/render-management/workers/{worker_id}"]={"max_concurrency":3,"draining":True}
+    bodies["/render-management/workers/{worker_id}/devices/{device_id:path}"]={"enabled":False}
+    # Use the proxy's real session response before probing GET/DELETE. The
+    # sidecar is the explicit loopback mock, not an actual browser/account.
+    assert os.environ["VIDEOROLL_V2_SOCIAL_PUBLISHER_URL"]=="http://127.0.0.1:18085"
+    code,_,session=send("POST","/api/v1/settings/publish/social/login-sessions/douyin",{"account_name":"ContractProbe"})
+    assert code==200 and first_id(session), (code,session)
+    context["session_id"]=first_id(session)
+    code,_,saved=send("PUT",f"/api/v1/tasks/{meta_task}/publish_meta",bodies["/tasks/{task_id}/publish_meta"])
+    assert code==200 and saved.get("stored") and saved["meta"]["title"]=="Contract fixture title", (code,saved)
 # Do not interfere with other probes; global worker stop/resume actions run last.
 late = {"/tasks/actions/stop_all","/tasks/actions/resume_stopped",
         "/tasks/actions/resume_failed_recent","/tasks/{task_id}/actions/stop",
@@ -401,8 +434,14 @@ for row in ordered:
         results.append(record)
         continue
     path=template
+    probe_context=dict(context)
+    if fixture_ids and template in ("/tasks/{task_id}/publish_meta","/tasks/{task_id}/publish_meta/draft"):
+        probe_context["task_id"]=fixture_ids["meta_task"]
+    elif fixture_ids and template=="/tasks/{task_id}/youtube_meta":
+        probe_context["task_id"]=fixture_ids["yt_task"]
+    if template=="/settings/publish/social/login-sessions/{platform}":probe_context["platform"]="douyin"
     for field in re.findall(r"\{([^{}]+)\}",path):
-        path=path.replace("{"+field+"}",context.get(field, fake))
+        path=path.replace("{"+field+"}",probe_context.get(field, fake))
     if template=="/settings/publish/social/accounts":
         path += "?platform=douyin"
     if template=="/settings/publish/platforms/{platform}":
@@ -450,6 +489,20 @@ for row in ordered:
         record={"method":row["method"],"path":template,"http_status":status,
                 "response_kind":mime,"probe":category,"issue":issue,
                 "json_fields":sorted(obj.keys())[:22] if isinstance(obj,dict) else []}
+        if fixture_ids:
+            checked=None
+            if template=="/render-management/executions/{execution_id}" and row["method"]=="GET":
+                checked=status==200 and isinstance(obj,dict) and obj.get("id")==fixture_ids["execution"] and obj.get("progress")==47 and obj.get("metrics")=={"fps":18.5}
+            elif template=="/tasks/{task_id}/publish_meta":
+                if row["method"]=="GET":checked=status==200 and isinstance(obj,dict) and obj.get("title")=="Contract fixture title"
+                elif row["method"]=="PUT":checked=status==200 and isinstance(obj,dict) and obj.get("stored") is True and obj.get("meta",{}).get("title")=="Contract fixture title"
+            elif template=="/tasks/{task_id}/youtube_meta" and row["method"]=="GET":
+                checked=status==200 and isinstance(obj,dict) and obj.get("title")=="Contract fixture metadata" and obj.get("duration")==23
+            elif template=="/settings/publish/social/login-sessions/{session_id}":
+                checked=status==200 and isinstance(obj,dict) and obj.get("id")==context["session_id"] and obj.get("state")==("canceled" if row["method"]=="DELETE" else "pending")
+            if checked is not None:
+                record["fixture_asserted"]=bool(checked)
+                if not checked:record.update(probe="failed",issue="positive_fixture_assertion_failed")
         if template=="/settings/publish/social/login-sessions/{platform}" and isinstance(obj,dict):
             context["session_id"]=first_id(obj) or fake
         if template=="/operations/alerts/report" and isinstance(obj,dict):
@@ -549,6 +602,11 @@ if args.all_services:
                     account_id=str(uuid.uuid4())
                     db.execute("INSERT INTO accounts(id,platform,name,check_state) VALUES (%s,'douyin',%s,'unchecked')",(account_id,'contract-'+account_id))
                     service_context.update(account_id=account_id)
+                    # Exercise persisted session read/cancel with browser login
+                    # deliberately disabled; this never starts a real browser.
+                    session_id=str(uuid.uuid4())
+                    db.execute("INSERT INTO operation_inbox(id,operation_key,runtime_engine,status,request_json,result_json) VALUES(%s,%s,'rust-sau-login','pending',%s,%s)",(session_id,'sau-login:'+session_id,json.dumps({'platform':'douyin','account_name':'Contract session','browser_url':'http://127.0.0.1:8090/session'}),json.dumps({'state':'starting','message':None})))
+                    service_context.update(session_id=session_id)
             if service=="subtitle_service":
                 # A named disposable model for each delete endpoint, never the deployed model directory.
                 model_name="contract-model-"+uuid.uuid4().hex[:12]
@@ -576,6 +634,8 @@ if args.all_services:
                 ("DELETE","/subtitle/dictionaries/entries/{entry_id}"):3,
                 ("DELETE","/subtitle/dictionaries/sources/{source_id}"):4,
                 ("DELETE","/accounts/{account_id}"):4,
+                ("GET","/login-sessions/{session_id}"):0,
+                ("DELETE","/login-sessions/{session_id}"):4,
             }
             service_order=sorted((r for r in service_rows if r["service"]==service),
                 key=lambda r:lifecycle_order.get((r["method"],r["path"]),1))
@@ -629,6 +689,10 @@ if args.all_services:
                             ctx["source_pk"]=obj["id"]
                         elif template==knowledge_base:
                             ctx["item_id"]=obj["id"]
+                    if service=="social_publisher" and template=="/login-sessions/{session_id}":
+                        checked=code==200 and isinstance(obj,dict) and obj.get("id")==ctx["session_id"] and obj.get("state")==("canceled" if method=="DELETE" else "starting")
+                        record["fixture_asserted"]=bool(checked)
+                        if not checked:record.update(probe="failed",issue="positive_fixture_assertion_failed")
                     if template==provider_base+"/{provider_id}/remote-models":
                         if code!=200 or not isinstance(obj,dict) or obj.get("details",{}).get("model-z")!={"context_window":131072,"max_output_tokens":8192}:
                             record["probe"]="failed"
