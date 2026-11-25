@@ -62,6 +62,17 @@ assert settings["cookies_set"] is True
 assert "isolated-home-token" not in json.dumps(settings) and "isolated-home-token" not in json.dumps(current())
 print("PASS: original Home config accepts scan options and stores Netscape credentials outside PostgreSQL")
 
+if os.getenv("VIDEOROLL_TEST_CREDENTIAL_COMPAT")=="true":
+    from cryptography.fernet import Fernet
+    key=Path(os.environ["VIDEOROLL_FERNET_KEY_PATH"]).read_bytes().strip()
+    cipher=Fernet(key).encrypt(cookies.encode()).decode()
+    with psycopg.connect(db_url) as conn:
+        conn.execute("UPDATE app_settings SET value_json=value_json||jsonb_build_object('cookies_txt_enc',%s::text) WHERE key='youtube.settings'",(cipher,))
+    (storage/".videoroll-private"/"youtube-cookies.txt").unlink()
+    code,settings=api("GET","/settings/youtube")
+    assert code==200 and settings["cookies_set"] and "isolated-home-token" not in json.dumps(settings)
+    assert current()["cookies_txt_enc"]==cipher
+    print("PASS: legacy Fernet YouTube cookie read without importing a persistent plaintext file")
 existing_id=uuid.uuid4()
 with psycopg.connect(db_url) as conn:
     conn.execute("""INSERT INTO tasks(id,source_type,source_url,source_license,status)
@@ -148,3 +159,16 @@ assert last["explicit_shorts_count"]==1,last
 assert last["skipped_duplicates"]==2,last
 assert len(last["created_task_ids"])==1,last
 print("PASS: GET/PUT original Home settings and manual scan mode reflect selected filters")
+if os.getenv("VIDEOROLL_TEST_CREDENTIAL_COMPAT")=="true":
+    assert current()["cookies_txt_enc"]==cipher
+    assert not (storage/".videoroll-private"/"youtube-cookies.txt").exists()
+    code,settings=api("PUT","/settings/youtube",{"cookies_txt":cookies})
+    assert code==200 and settings["cookies_set"] and "cookies_txt_enc" not in current()
+    code,settings=api("PUT","/settings/youtube",{"cookies_txt":""})
+    assert code==200 and not settings["cookies_set"] and not settings["cookies_enabled"]
+    assert "cookies_txt_enc" not in current()
+    print("PASS: encrypted original cookie supports full Home workflow, explicit replace and clear without resurrection")
+    # Restore the original private-file fixture for the following automatic
+    # Home scan regression (same disposable database and API).
+    code,settings=api("PUT","/settings/youtube",{"cookies_txt":cookies})
+    assert code==200 and settings["cookies_set"] and settings["cookies_enabled"]

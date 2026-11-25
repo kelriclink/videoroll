@@ -36,6 +36,9 @@ Python/Playwright 浏览器引擎，账号检查、登录、任务执行控制�
 ## 构建与组装
 
 正式发布使用受支持的 Node 22 和 lockfile 安装依赖，运行 build-web.sh。
+Rust 原生历史 Fernet 认证解密依赖系统 OpenSSL 3 libcrypto；构建需
+libssl-dev，部署需对应 libcrypto.so.3。原密钥仅在配置绝对路径后读取，
+必须属于 videoroll 服务用户、权限 0600，不复制或写回生产历史密文。
 Cargo 使用 cargo build --release --locked --bins；CARGO_TARGET_DIR 可设到
 空间充足的磁盘。stage-release.sh 接受新绝对目录、Cargo 二进制目录、
 Nginx 二进制与 mime.types，生成源码版本及 SHA256SUMS，不安装、不启动。

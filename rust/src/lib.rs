@@ -46,6 +46,7 @@ pub mod operations_v1;
 pub mod parity;
 pub mod playout;
 pub mod providers;
+mod secret_compat;
 pub mod publish;
 pub mod publish_legacy;
 pub mod publish_meta;

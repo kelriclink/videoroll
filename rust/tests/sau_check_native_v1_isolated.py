@@ -156,6 +156,24 @@ cookie.write_text(json.dumps(state))
             assert "SENSITIVE_FIXTURE_REFRESHED" in stored
         assert (root/"invocations").read_text().count("xiaohongshu:dedupe\n")==1
         print("PASS: original DTO and credential format, concurrent import/recheck dedupe, busy fences, cookie refresh and cleanup")
+        if os.getenv("VIDEOROLL_TEST_CREDENTIAL_COMPAT")=="true":
+            from cryptography.fernet import Fernet
+            key=Path(os.environ["VIDEOROLL_FERNET_KEY_PATH"]).read_bytes().strip()
+            cipher=Fernet(key).encrypt(json.dumps(fixture,indent=2).encode()).decode()
+            with db() as conn:
+                conn.execute("UPDATE accounts SET secrets_encrypted=%s WHERE id=%s",(cipher,aid))
+            code,r=recheck(aid)
+            assert code==200,r
+            check_op=r["check_job_id"]
+            wait_for(lambda:opstate(check_op)==("completed",{"status":"valid"}))
+            assert state(aid)=="valid"
+            assert not list(cookies.glob("*.json"))
+            assert (root/"invocations").read_text().count("xiaohongshu:dedupe\n")==2
+            with db() as conn:
+                stored=conn.execute("SELECT secrets_encrypted FROM accounts WHERE id=%s",(aid,)).fetchone()[0]
+                assert stored.startswith("dbplain:v1:") and "SENSITIVE_FIXTURE_REFRESHED" in stored
+            print("PASS: legacy Fernet multiline SAU state authenticated, refreshed by mock browser and securely cleaned")
+
 
         for account_name in ("invalid","timeout"):
             code,r=upload("kuaishou",account_name)
