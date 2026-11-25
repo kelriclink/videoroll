@@ -1380,6 +1380,7 @@ pub async fn process(
         let options = crate::rag::rag_config(db).await?;
         match crate::rag::prepare(config, db, job, &original, &profile.target_lang).await {
             Ok(context) => research = context,
+            Err(error @ AppError::Conflict(_)) => return Err(error),
             Err(error) if !options.research_blocking => {
                 tracing::warn!(error = %error, job_id = %job.id,
                     "RAG retrieval unavailable; continuing without external evidence");

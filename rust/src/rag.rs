@@ -83,7 +83,7 @@ pub struct SearchKnowledge {
     pub embedding: Option<Vec<f32>>,
     pub embedding_model: Option<String>,
 }
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct SearchHit {
     pub id: Uuid,
     pub kind: String,
@@ -678,6 +678,10 @@ pub async fn prepare(
             evidence: &hits,
             target_lang,
             gate,
+            parallelism: legacy["rag_agent_parallelism"]
+                .as_u64()
+                .unwrap_or(1)
+                .clamp(1, 8) as usize,
             timeout_seconds: legacy["rag_agent_timeout_seconds"]
                 .as_f64()
                 .filter(|v| v.is_finite())
