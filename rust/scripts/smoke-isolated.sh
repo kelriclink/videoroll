@@ -192,6 +192,14 @@ if [[ "${VIDEOROLL_V2_TEST_LOCAL_INFERENCE_ONLY:-false}" == "true" ]]; then
   PYTHONPATH="$repo_root/src" "$smoke_python" "$repo_root/rust/tests/local_inference_isolated.py"
   exit 0
 fi
+if [[ "${VIDEOROLL_V2_TEST_HISTORICAL_P2_RENDER_ONLY:-false}" == "true" ]]; then
+  export VIDEOROLL_V2_INTERNAL_TOKEN="isolated-historical-p2-render-token-0123456789"
+  export VIDEOROLL_V2_STORAGE_ROOT="$(mktemp -d "$repo_root/rust/target/v2-historical-p2-render.XXXXXX")"
+  "$CARGO_HOME/bin/cargo" build --manifest-path "$repo_root/rust/Cargo.toml" --bin videoroll-v2 --locked --offline --quiet
+  "$repo_root/rust/target/debug/videoroll-v2" migrate
+  "$smoke_python" "$repo_root/rust/tests/historical_p2_render_isolated.py"
+  exit 0
+fi
 if [[ "${VIDEOROLL_V2_TEST_RENDER_ADMIN_ONLY:-false}" == "true" ]]; then
   export VIDEOROLL_V2_INTERNAL_TOKEN="isolated-render-admin-token-0123456789"
   export VIDEOROLL_V2_STORAGE_ROOT="$(mktemp -d "$repo_root/rust/target/v2-render-admin.XXXXXX")"

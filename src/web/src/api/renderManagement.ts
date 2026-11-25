@@ -26,7 +26,7 @@ export type RenderExecution = {
   state: string; transfer_mode: string; progress: number;
   runtime_engine?: string; control_supported?: boolean; cancel_supported?: boolean; requeue_supported?: boolean; lease_until?: string | null;
   render_spec: Record<string, unknown>; worker_name?: string | null; task_id?: string | null;
-  job_status?: string | null; metrics: Record<string, unknown>; log_tail?: string | null;
+  job_status?: string | null; historical_recovery_status?: string | null; metrics: Record<string, unknown>; log_tail?: string | null;
   error_message?: string | null; heartbeat_at?: string | null; started_at: string; finished_at?: string | null;
 };
 
