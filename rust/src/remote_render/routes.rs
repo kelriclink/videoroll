@@ -398,6 +398,7 @@ async fn claim(
           WHERE w.state='running' AND j.state='awaiting'
             AND j.external_ticket=r.id::text
             AND r.attempt < $4
+            AND r.uploaded_asset_id IS NULL
             AND upper(t.status::text) NOT IN ('CANCELED','FAILED')
             AND (
               r.state='queued'
@@ -937,6 +938,14 @@ async fn execution_failed(
     validate_lease(&row, &payload.fence_token)?;
     let attempt: i32 = row.try_get("attempt")?;
     let job_id: Uuid = row.try_get("job_id")?;
+    if row
+        .try_get::<Option<Uuid>, _>("uploaded_asset_id")?
+        .is_some()
+    {
+        return Err(AppError::Conflict(
+            "render output already committed; await completion or receipt recovery".into(),
+        ));
+    }
     let will_retry = payload.retryable && attempt < MAX_RENDER_ATTEMPTS;
     let next = if will_retry { "queued" } else { "failed" };
     let row=sqlx::query(

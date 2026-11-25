@@ -121,9 +121,110 @@ pub(crate) async fn completed_receipt(
     }
     Ok(expected)
 }
+// An upload is acknowledged only after ffprobe, fsync, rename, asset insert
+// and storage reference commit. Recover its lost completion callback without
+// claiming a second worker. Require both the original asset and object ledger
+// to match the exact bytes, not just an arbitrary final asset of this task.
+async fn recover_uploaded(
+    db: &Database,
+    store: &AssetRegistry,
+    row: &sqlx::postgres::PgRow,
+) -> AppResult<()> {
+    let id: Uuid = row.try_get("id")?;
+    let task: Uuid = row.try_get("task_id")?;
+    let flow: Uuid = row.try_get("workflow_id")?;
+    let job: Uuid = row.try_get("job_id")?;
+    let asset: Uuid = row.try_get("uploaded_asset_id")?;
+    let mode: String = row.try_get("mode")?;
+    let key = crate::remote_render::output_key(task, id);
+    let record = db.asset(asset).await?;
+    if mode == "noop"
+        || record.task_id != task
+        || record.kind != "video_final"
+        || record.storage_key != key
+    {
+        return Err(AppError::Conflict(
+            "uploaded render asset identity mismatch".into(),
+        ));
+    }
+    let sha = record
+        .sha256
+        .filter(|v| v.len() == 64)
+        .ok_or_else(|| AppError::Conflict("uploaded render checksum absent".into()))?;
+    let size = record
+        .size_bytes
+        .filter(|v| *v > 0)
+        .ok_or_else(|| AppError::Conflict("uploaded render size absent".into()))?;
+    let path = store.resolve_existing(&key).await?;
+    let metadata = tokio::fs::metadata(path).await?;
+    if !metadata.is_file() || metadata.len() != size as u64 {
+        return Err(AppError::Conflict("uploaded render size mismatch".into()));
+    }
+    // Hash outside the row locks. A still-active worker cannot be recovered;
+    // the final transaction rechecks the lease and every durable identity.
+    let (actual_sha, actual_size) = store.sha256(&key).await?;
+    if actual_sha != sha || actual_size != size {
+        return Err(AppError::Conflict(
+            "uploaded render checksum mismatch".into(),
+        ));
+    }
+    let mut tx = db.pool.begin().await?;
+    let task_ok:Option<bool>=sqlx::query_scalar("SELECT runtime_owner='rust' AND status::text NOT IN ('canceled','failed','publishing','published') FROM tasks WHERE id=$1 FOR UPDATE")
+        .bind(task).fetch_optional(&mut *tx).await?;
+    let flow_ok:Option<bool>=sqlx::query_scalar("SELECT engine='rust-v2' AND task_id=$2 AND state='running' AND current_stage='render' FROM pipeline_runs WHERE id=$1 FOR UPDATE")
+        .bind(flow).bind(task).fetch_optional(&mut *tx).await?;
+    let job_ok:Option<bool>=sqlx::query_scalar("SELECT runtime_engine='rust-v2' AND stage='render' AND task_id=$2 AND workflow_id=$3 AND status='awaiting' AND external_ticket=$4 FROM operation_inbox WHERE id=$1 FOR UPDATE")
+        .bind(job).bind(task).bind(flow).bind(id.to_string()).fetch_optional(&mut *tx).await?;
+    if task_ok != Some(true) || flow_ok != Some(true) || job_ok != Some(true) {
+        return Ok(());
+    }
+    let result = crate::remote_render::receipt(id, Some(asset), Some(&key), &mode);
+    // No output can be reassigned or overwritten by this path. Recheck the
+    // registered upload evidence at the same commit as the durable receipt.
+    let updated=sqlx::query("UPDATE render_executions e SET state='completed',progress=100,output_json=$5,lease_until=NULL,error_message=NULL,finished_at=now(),updated_at=now()
+      WHERE e.id=$1 AND e.task_id=$2 AND e.workflow_id=$3 AND e.job_id=$4 AND e.runtime_engine='rust-v2'
+        AND e.mode=$6 AND e.uploaded_asset_id=$7 AND (e.state='queued' OR (e.state IN ('running','uploading') AND e.lease_until<=now()))
+        AND EXISTS(SELECT 1 FROM assets a JOIN storage_objects o ON o.storage_key=a.storage_key
+          JOIN storage_object_refs r ON r.storage_key=a.storage_key
+          WHERE a.id=$7 AND a.task_id=$2 AND a.kind::text='video_final' AND a.storage_key=$8 AND a.sha256=$9 AND a.size_bytes=$10
+            AND o.state='live' AND o.checksum_sha256=$9 AND o.size_bytes=$10 AND r.owner_type='workflow' AND r.owner_id=$3 AND r.role='video_final')")
+      .bind(id).bind(task).bind(flow).bind(job).bind(result).bind(mode).bind(asset).bind(key).bind(sha).bind(size).execute(&mut *tx).await?;
+    if updated.rows_affected() == 0 {
+        // A concurrent tick/callback may already have changed the state.
+        let current: String = sqlx::query_scalar("SELECT state FROM render_executions WHERE id=$1")
+            .bind(id)
+            .fetch_one(&mut *tx)
+            .await?;
+        if matches!(current.as_str(), "queued" | "running" | "uploading") {
+            return Err(AppError::Conflict(
+                "uploaded render evidence or lease changed".into(),
+            ));
+        }
+    }
+    tx.commit().await?;
+    Ok(())
+}
 pub async fn tick(db: &Database, config: &Config, limit: i64) -> AppResult<u64> {
     let store = AssetRegistry::new(db.clone(), config.storage_root.clone());
     let scheduler = Scheduler::new(db.clone(), config.job_lease);
+    // Limit expensive full-file verification per tick. Preserve bad evidence
+    // for manual reconciliation rather than silently re-rendering or posting.
+    let uploads=sqlx::query("SELECT e.* FROM render_executions e JOIN operation_inbox j ON j.id=e.job_id
+      JOIN pipeline_runs w ON w.id=e.workflow_id JOIN tasks t ON t.id=e.task_id
+      WHERE e.runtime_engine='rust-v2' AND j.runtime_engine='rust-v2' AND j.stage='render'
+        AND j.task_id=e.task_id AND j.workflow_id=e.workflow_id AND j.status='awaiting'
+        AND j.external_ticket=e.id::text AND w.engine='rust-v2' AND w.task_id=e.task_id AND w.state='running' AND w.current_stage='render'
+        AND t.runtime_owner='rust' AND t.status::text NOT IN ('canceled','failed','publishing','published')
+        AND e.uploaded_asset_id IS NOT NULL AND (e.state='queued' OR (e.state IN ('running','uploading') AND e.lease_until<=now()))
+      ORDER BY e.updated_at,e.id LIMIT $1").bind(limit.clamp(1,4)).fetch_all(&db.pool).await?;
+    for row in uploads {
+        if let Err(error) = recover_uploaded(db, &store, &row).await {
+            let id: Uuid = row.try_get("id")?;
+            tracing::warn!(execution_id=%id,%error,"uploaded render recovery deferred");
+            sqlx::query("UPDATE render_executions SET updated_at=now() WHERE id=$1 AND runtime_engine='rust-v2' AND uploaded_asset_id IS NOT NULL AND (state='queued' OR (state IN ('running','uploading') AND lease_until<=now()))")
+                .bind(id).execute(&db.pool).await?;
+        }
+    }
     // A dead worker cannot send an explicit failure callback. Reclaim attempts
     // must obey the same budget as callback-driven retries. Persist terminal
     // evidence first so an interrupted tick is recovered by the receipt scan.
@@ -135,7 +236,7 @@ pub async fn tick(db: &Database, config: &Config, limit: i64) -> AppResult<u64> 
         AND j.task_id=e.task_id AND j.workflow_id=e.workflow_id AND j.status='awaiting'
         AND j.external_ticket=e.id::text AND w.engine='rust-v2' AND w.task_id=e.task_id AND w.state='running'
         AND t.runtime_owner='rust' AND t.status::text NOT IN ('canceled','failed')
-        AND e.attempt >= $1 AND (e.state='queued' OR
+        AND e.uploaded_asset_id IS NULL AND e.attempt >= $1 AND (e.state='queued' OR
           (e.state IN ('running','uploading') AND e.lease_until<=now()))
       ORDER BY e.updated_at,e.id LIMIT $2 FOR UPDATE OF e SKIP LOCKED
     ) UPDATE render_executions e SET state='failed',lease_until=NULL,

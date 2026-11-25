@@ -79,17 +79,18 @@ finally:
     try:proc.wait(timeout=5)
     except subprocess.TimeoutExpired:proc.kill();proc.wait(timeout=5)
 
-def native(mode="burn_in",state="completed",wrong=False,canceled=False,ticket_wrong=False):
+def native(mode="burn_in",state="completed",wrong=False,canceled=False,ticket_wrong=False,uploaded=True):
     t,w,j,e,a=[uuid.uuid4() for _ in range(5)]
     key=f"v2/render/{t}/remote-{e}.mp4"
     if mode=="noop":key=f"v2/raw/{t}/original.mp4"
-    path=root/key;path.parent.mkdir(parents=True,exist_ok=True);path.write_bytes(b"fixture")
+    path=root/key;path.parent.mkdir(parents=True,exist_ok=True)
+    if uploaded: path.write_bytes(b"fixture")
     with db() as c:
         c.execute("INSERT INTO tasks(id,source_type,source_license,status,runtime_owner) VALUES(%s,'local','own',%s,'rust')",(t,"canceled" if canceled else "subtitle_ready"))
         c.execute("INSERT INTO pipeline_runs(id,task_id,generation,engine,workflow_name,state,current_stage) VALUES(%s,%s,1,'rust-v2','videoroll.rust.pipeline','running','render')",(w,t))
         c.execute("INSERT INTO operation_inbox(id,operation_key,runtime_engine,task_id,workflow_id,stage,generation,status,external_ticket) VALUES(%s,%s,'rust-v2',%s,%s,'render',1,'awaiting',%s)",(j,"render-test:"+str(j),t,w,str(uuid.uuid4() if ticket_wrong else e)))
-        c.execute("INSERT INTO assets(id,task_id,kind,storage_key) VALUES(%s,%s,'video_final',%s)",(a,t,key if not wrong else key+".different"))
-        c.execute("INSERT INTO render_executions(id,job_id,task_id,workflow_id,runtime_engine,state,mode,uploaded_asset_id,render_spec,error_message) VALUES(%s,%s,%s,%s,'rust-v2',%s,%s,%s,%s,%s)",(e,j,t,w,state,mode,None if mode=="noop" else a,json.dumps({"request":{"input_key":key}}),"simulated renderer failure" if state=="failed" else None))
+        if uploaded: c.execute("INSERT INTO assets(id,task_id,kind,storage_key) VALUES(%s,%s,'video_final',%s)",(a,t,key if not wrong else key+".different"))
+        c.execute("INSERT INTO render_executions(id,job_id,task_id,workflow_id,runtime_engine,state,mode,uploaded_asset_id,render_spec,error_message) VALUES(%s,%s,%s,%s,'rust-v2',%s,%s,%s,%s,%s)",(e,j,t,w,state,mode,None if mode=="noop" or not uploaded else a,json.dumps({"request":{"input_key":key}}),"simulated renderer failure" if state=="failed" else None))
     return t,w,j,e,key
 ok=native()
 noop=native("noop")
@@ -151,7 +152,7 @@ try:
     queued=native(state="queued")
     def set_attempt(item, attempts, lease_seconds, state=None):
         with db() as c:
-            c.execute("UPDATE render_executions SET attempt=%s,worker_id=%s,fence_token=%s,lease_until=CASE WHEN %s::int IS NULL THEN NULL ELSE now()+%s::int*interval '1 second' END WHERE id=%s",(attempts,worker,uuid.uuid4().hex+uuid.uuid4().hex,lease_seconds,lease_seconds,item[3]))
+            c.execute("UPDATE render_executions SET uploaded_asset_id=NULL,attempt=%s,worker_id=%s,fence_token=%s,lease_until=CASE WHEN %s::int IS NULL THEN NULL ELSE now()+%s::int*interval '1 second' END WHERE id=%s",(attempts,worker,uuid.uuid4().hex+uuid.uuid4().hex,lease_seconds,lease_seconds,item[3]))
             if state:
                 c.execute("UPDATE pipeline_runs SET state=%s WHERE id=%s",(state,item[1]))
     set_attempt(expired,5,-60)
@@ -181,6 +182,60 @@ try:
             assert c.execute("SELECT state FROM render_executions WHERE id=%s",(item[3],)).fetchone()[0]==state
             assert c.execute("SELECT status FROM operation_inbox WHERE id=%s",(item[2],)).fetchone()[0]=="awaiting"
     print("PASS: exhausted expired or queued render attempt budget, no sixth claim, exact failure receipt, live/retryable/paused/foreign ticket untouched",flush=True)
+    # Use the actual worker upload HTTP endpoint and actual ffmpeg media,
+    # then simulate the process dying before the completion callback.
+    source=root/"recovery-fixture.mp4"
+    subprocess.run(["ffmpeg","-hide_banner","-loglevel","error","-f","lavfi","-i","color=c=blue:s=64x64:d=1","-c:v","mpeg4","-y",str(source)],check=True,timeout=30)
+    media=source.read_bytes()
+    def upload_fixture():
+        item=native(state="running",uploaded=False)
+        t,w,j,e,key=item
+        f=uuid.uuid4().hex+uuid.uuid4().hex
+        with db() as c:
+            c.execute("UPDATE render_executions SET worker_id=%s,fence_token=%s,attempt=5,lease_until=now()+interval '5 minutes' WHERE id=%s",(worker,f,e))
+        boundary="vr-upload-"+uuid.uuid4().hex
+        body=(f'--{boundary}\r\nContent-Disposition: form-data; name="fence_token"\r\n\r\n{f}\r\n--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="fixture.mp4"\r\nContent-Type: video/mp4\r\n\r\n'.encode()+media+f'\r\n--{boundary}--\r\n'.encode())
+        req=Request(base+f"/render-workers/v1/executions/{e}/output",data=body,headers={"Authorization":"Bearer "+token,"Content-Type":"multipart/form-data; boundary="+boundary})
+        with urlopen(req,timeout=20) as response: a=json.load(response)
+        assert a["sha256"]==hashlib.sha256(media).hexdigest() and a["size_bytes"]==len(media)
+        return item,f,a["id"]
+    good,gf,ga=upload_fixture()
+    corrupt,cf,ca=upload_fixture()
+    still_live,lf,la=upload_fixture()
+    # Explicit failure after committed upload must not discard the evidence.
+    req=Request(base+f"/render-workers/v1/executions/{good[3]}/fail",data=json.dumps({"fence_token":gf,"error":"lost upload reply","retryable":True}).encode(),headers={"Content-Type":"application/json","Authorization":"Bearer "+token})
+    try:
+        with urlopen(req,timeout=10): raise AssertionError("committed upload was failed")
+    except HTTPError as exc: assert exc.code==409
+    with db() as c:
+        for item in (good,corrupt):
+            c.execute("UPDATE render_executions SET lease_until=now()-interval '1 minute' WHERE id=%s",(item[3],))
+        # Isolate claim eligibility: leave a free slot and a committed upload
+        # below the attempt ceiling, with unrelated retry fixtures paused.
+        c.execute("UPDATE render_executions SET attempt=4 WHERE id=%s",(corrupt[3],))
+        c.execute("UPDATE pipeline_runs SET state='paused' WHERE id=%s",(retry[1],))
+        c.execute("UPDATE render_workers SET max_concurrency=3,last_seen_at=now() WHERE id=%s",(worker,))
+    with urlopen(claim,timeout=10) as response:
+        assert json.load(response)["execution"] is None
+    damaged=bytearray(media);damaged[-1]^=1;(root/corrupt[4]).write_bytes(damaged)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+        list(pool.map(lambda _:tick(),range(3)))
+    tick()
+    with db() as c:
+        t,w,j,e,key=good
+        state,receipt,attempt,lease=c.execute("SELECT state,output_json,attempt,lease_until FROM render_executions WHERE id=%s",(e,)).fetchone()
+        assert state=="completed" and attempt==5 and lease is None and receipt["asset_id"]==ga and receipt["storage_key"]==key
+        assert c.execute("SELECT result_json FROM operation_inbox WHERE id=%s",(j,)).fetchone()[0]==receipt
+        assert c.execute("SELECT count(*) FROM operation_inbox WHERE workflow_id=%s AND stage='dubbing'",(w,)).fetchone()[0]==1
+        assert c.execute("SELECT count(*) FROM workflow_events WHERE workflow_id=%s AND kind='job.succeeded'",(w,)).fetchone()[0]==1
+        for item in (corrupt,still_live):
+            assert c.execute("SELECT state FROM render_executions WHERE id=%s",(item[3],)).fetchone()[0]=="uploading"
+            assert c.execute("SELECT status FROM operation_inbox WHERE id=%s",(item[2],)).fetchone()[0]=="awaiting"
+    # A worker replay with the original fence after recovery remains idempotent.
+    req=Request(base+f"/render-workers/v1/executions/{good[3]}/complete",data=json.dumps({"fence_token":gf,"output_asset_id":ga,"output":{}}).encode(),headers={"Content-Type":"application/json","Authorization":"Bearer "+token})
+    with urlopen(req,timeout=10) as response: assert response.status==200
+    print("PASS: actual uploaded MP4 recovered after lost callback at attempt five; corrupt bytes and live lease preserved; replay idempotent",flush=True)
+
 finally:
     proc.terminate()
     try:proc.wait(timeout=5)
