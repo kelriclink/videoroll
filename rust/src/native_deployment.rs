@@ -93,6 +93,13 @@ pub async fn preflight(db: &Database, cfg: &Config, startup: bool) -> AppResult<
     sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
         .execute(&mut *tx)
         .await?;
+    // Do not admit a deployment with stale libc/ICU sorting metadata.
+    // NULL/NULL is valid for versionless locales such as C.
+    let collation = sqlx::query("SELECT datcollversion AS recorded, pg_database_collation_actual_version(oid) AS actual FROM pg_database WHERE datname=current_database()")
+        .fetch_one(&mut *tx).await?;
+    let recorded: Option<String> = collation.try_get("recorded")?;
+    let actual: Option<String> = collation.try_get("actual")?;
+    let collation_ok = recorded == actual;
     let row=sqlx::query(r#"SELECT
       (SELECT count(*) FROM tasks WHERE runtime_owner IS DISTINCT FROM 'rust') AS legacy_tasks,
       (SELECT count(*) FROM pipeline_runs WHERE engine<>'rust-v2'
@@ -166,9 +173,10 @@ pub async fn preflight(db: &Database, cfg: &Config, startup: bool) -> AppResult<
         outbox["delivery_ledger_ready"] == true
     }) && storage_ok
         && secret_ok
-        && sau_ok;
+        && sau_ok
+        && collation_ok;
     Ok(
-        json!({"ready":ready,"mode":if startup{"startup"}else{"cutover"},"historical_blockers":counts,"outbox":outbox,"storage_directory_exists":storage_ok,"internal_secret_configured":secret_ok,"native_sau_configured_if_required":sau_ok,
+        json!({"ready":ready,"mode":if startup{"startup"}else{"cutover"}, "historical_blockers":counts,"database_collation":{"recorded":recorded,"actual":actual,"compatible":collation_ok},"outbox":outbox,"storage_directory_exists":storage_ok,"internal_secret_configured":secret_ok,"native_sau_configured_if_required":sau_ok,
       "note":"read-only admission, not proof of external runtime shutdown, credential validity, GPU availability or platform parity"}),
     )
 }

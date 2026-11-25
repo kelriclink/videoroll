@@ -48,6 +48,23 @@ with db() as c:
     c.execute("UPDATE _sqlx_migrations SET checksum=%s WHERE version=%s",(checksum,version))
     c.execute("INSERT INTO app_settings(key,value_json) VALUES('youtube.settings','{\"home_scan_enabled\":false}') ON CONFLICT(key) DO UPDATE SET value_json=EXCLUDED.value_json")
 assert check()["ready"] is True
+# Deliberately falsify ONLY the disposable database's recorded version.
+# Verify both initial and startup gates are read-only and fail closed.
+with db() as c:
+    recorded,actual=c.execute("SELECT datcollversion,pg_database_collation_actual_version(oid) FROM pg_database WHERE datname=current_database()").fetchone()
+    assert recorded==actual
+    c.execute("UPDATE pg_database SET datcollversion='0.0-fixture' WHERE datname=current_database()")
+for startup in (False,True):
+    blocked=check(False,startup=startup)
+    assert blocked["database_collation"]=={"recorded":"0.0-fixture","actual":actual,"compatible":False},blocked
+with db() as c:
+    assert c.execute("SELECT datcollversion FROM pg_database WHERE datname=current_database()").fetchone()[0]=="0.0-fixture"
+# This is fixture metadata restoration, not production repair. Indexes were
+# built with the same actual libc throughout the test.
+with db() as c:
+    c.execute("UPDATE pg_database SET datcollversion=%s WHERE datname=current_database()",(recorded,))
+assert check()["database_collation"]["compatible"] is True
+print("PASS: both standalone gates reject mismatched database collation; no implicit metadata repair",flush=True)
 # A native ambiguous publication must block the initial cutover, but not
 # prevent the entire control plane from recovering after a crash.
 j=uuid.uuid4()
