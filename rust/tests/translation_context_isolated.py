@@ -13,10 +13,10 @@ exe=Path(__file__).resolve().parents[1]/"target/debug/videoroll-v2"
 def db():return psycopg.connect(url)
 def setting(k,v):
     with db() as c:c.execute("INSERT INTO app_settings(key,value_json) VALUES(%s,%s) ON CONFLICT(key) DO UPDATE SET value_json=EXCLUDED.value_json",(k,json.dumps(v)))
-source=["First 10 volts.","Second 20 volts.","Third line.","Fourth line.","Fifth line."]
+source=["First 10 volts.","Second 20 volts.","Rust line.","Fourth line.","Fifth line."]
 starts=[.2,1.2,2.2,7.2,8.2]
 target=["10伏特","10伏特（第二次）","第三句","第四句","第五句"]
-observed=[];errors=[];asr_calls=[];repairs=[];failed_once=False
+observed=[];errors=[];asr_calls=[];repairs=[];research_calls=[];failed_once=False
 class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         global failed_once
@@ -29,7 +29,23 @@ class Handler(BaseHTTPRequestHandler):
             elif self.path=="/v1/chat/completions":
                 assert self.headers["Authorization"]=="Bearer fixture-translation-key"
                 data=json.loads(body);assert data["model"]=="fixture-translation"
-                lines=json.loads(data["messages"][-1]["content"])
+                messages=data["messages"]
+                if "pre-translation RAG gate" in messages[0]["content"]:
+                    research_calls.append("gate")
+                    result={"terms":[{"term":"Rust","category":"proper_noun","scope":"global","priority":0.9,"need_rag":True,"need_search":True},{"term":"volts","category":"unit_or_number","scope":"global","need_rag":True},{"term":"fabricated term","category":"proper_noun","scope":"global","need_rag":True}]}
+                    return self.reply_json({"choices":[{"message":{"content":json.dumps(result)}}]})
+                if "字幕术语研究 Agent" in messages[0]["content"]:
+                    if "检索动作执行结果" in messages[-1]["content"]:
+                        assert "fixture-original-compiler" in messages[-1]["content"],messages
+                        assert "fixture-pending" not in messages[-1]["content"],messages
+                        research_calls.append("finish")
+                        result={"action":"finish","summary":"Rust tooling","terms":[{"source":"Rust","target":"Rust","note":"language"}]}
+                    else:
+                        assert "fabricated term" not in messages[-1]["content"] and "volts" not in messages[-1]["content"],messages
+                        research_calls.append("search_knowledge")
+                        result={"action":"search_knowledge","query":"Rust compiler"}
+                    return self.reply_json({"choices":[{"message":{"content":json.dumps(result)}}]})
+                lines=json.loads(messages[-1]["content"])
                 if isinstance(lines,dict) and "repair_rows" in lines:
                     repairs.append(lines)
                     assert [v["i"] for v in lines["repair_rows"]]==[0,1],lines
@@ -57,12 +73,14 @@ class Handler(BaseHTTPRequestHandler):
             raw=json.dumps(out).encode();self.send_response(200);self.send_header("Content-Type","application/json");self.send_header("Content-Length",str(len(raw)));self.end_headers();self.wfile.write(raw)
         except Exception as e:
             errors.append(repr(e));self.send_error(400)
+    def reply_json(self,obj):
+        raw=json.dumps(obj,ensure_ascii=False).encode();self.send_response(200);self.send_header("Content-Type","application/json");self.send_header("Content-Length",str(len(raw)));self.end_headers();self.wfile.write(raw)
     def log_message(self,*args):pass
 server=ThreadingHTTPServer(("127.0.0.1",0),Handler)
 threading.Thread(target=server.serve_forever,daemon=True).start()
 base=f"http://127.0.0.1:{server.server_address[1]}"
 setting("subtitle.auto_profile",{"translate_enabled":True,"translate_provider":"openai","translate_model_provider_id":"legacy","translate_glossary":{"volts":"伏特"},"target_lang":"zh","bilingual":False,"auto_publish":False,"auto_publish_platforms":[],"auto_dub_p2":False,"burn_in":False})
-setting("subtitle.translate",{"default_batch_size":2,"default_enable_summary":True,"rag_enabled":False,"rag_domain":"electronics","openai":{"base_url":base+"/v1","model":"fixture-translation","api_key_enc":"dbplain:v1:fixture-translation-key"}})
+setting("subtitle.translate",{"default_batch_size":2,"default_enable_summary":True,"rag_enabled":True,"rag_auto_discover_terms":True,"rag_search_enabled":False,"rag_domain":"electronics","openai":{"base_url":base+"/v1","model":"fixture-translation","api_key_enc":"dbplain:v1:fixture-translation-key"}})
 setting("subtitle.rag",{"enabled":False})
 setting("youtube.settings",{"home_scan_enabled":False})
 env={k:v for k,v in os.environ.items() if k in ("PATH","HOME","LANG","LC_ALL","LD_LIBRARY_PATH","DATABASE_URL","VIDEOROLL_V2_STORAGE_ROOT","VIDEOROLL_V2_INTERNAL_TOKEN","INTERNAL_API_SECRET")}
@@ -75,6 +93,9 @@ subprocess.run(["ffmpeg","-nostdin","-v","error","-f","lavfi","-i","color=black:
 with db() as c:
     c.execute("INSERT INTO tasks(id,source_type,source_license,status,runtime_owner,retry_count) VALUES(%s,'local','own','downloaded','python',0)",(task,))
     c.execute("INSERT INTO assets(id,task_id,kind,storage_key,sha256,size_bytes) VALUES(%s,%s,'video_raw',%s,%s,%s)",(uuid.uuid4(),task,key,hashlib.sha256(video.read_bytes()).hexdigest(),video.stat().st_size))
+    dynamic_id=uuid.uuid4()
+    for ident,translation,status in [(dynamic_id,"fixture-original-compiler","approved"),(uuid.uuid4(),"fixture-pending","pending")]:
+        c.execute("INSERT INTO translation_knowledge_items(id,item_type,term,normalized_term,translation,target_lang,domain,status,confidence) VALUES(%s,'term','Rust compiler','rust compiler',%s,'zh','electronics',%s,1)",(ident,translation,status))
     for ident,t,s,translated,lang,domain,status in [
         (mid(source[0]),task,source[0],"reviewed-same-task","zh","electronics","approved"),
         (uuid.uuid4(),other,source[0],"approved-global","zh","electronics","approved"),
@@ -131,6 +152,15 @@ try:
     assert meta["context_memory"]["ambiguities"]==[{"term":"volts","resolution":"voltage unit"}]
     assert meta["context_memory"]["topic"]=="electronics"
     assert "MUST NOT LEARN REPAIR" not in json.dumps(meta)
+    assert research_calls==["gate","search_knowledge","finish"],research_calls
+    assert str(dynamic_id) in meta["rag_evidence_ids"],meta
+    with db() as c:
+        state,plan,result=c.execute("SELECT research_state,research_plan,research_result FROM pipeline_runs WHERE task_id=%s AND engine='rust-v2'",(task,)).fetchone()
+        assert state=="succeeded" and plan["gate_completed"] and len(plan["gate_candidates"])==1,(state,plan)
+        assert result["tool_steps"][0]["action"]=="search_knowledge"
+        assert c.execute("SELECT count(*) FROM translation_knowledge_items").fetchone()[0]==2
+    print("PASS: original discovery config activates gate; grounded candidate filter, original approved dynamic lookup, durable provenance and cached research reuse; no web or automatic learning",flush=True)
+
     print("PASS: native worker hard glossary+adjacent duplicate repair only affected rows, numeric warning nonblocking, prior repaired checkpoint and grounded memory restored, original IDs and approved memory protected",flush=True)
 finally:
     worker.terminate()
