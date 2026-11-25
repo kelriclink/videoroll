@@ -209,8 +209,20 @@ pub async fn tick(db: &Database, config: &Config, limit: i64) -> AppResult<u64> 
     let scheduler = Scheduler::new(db.clone(), config.job_lease);
     // Canceled executions retain their former slot until stop acknowledgment
     // or lease expiry; never extend a canceled lease or requeue that execution.
-    sqlx::query("WITH expired AS (SELECT id FROM render_executions WHERE runtime_engine='rust-v2' AND state='canceled' AND lease_until<=now() ORDER BY lease_until,id LIMIT $1 FOR UPDATE SKIP LOCKED) UPDATE render_executions e SET lease_until=NULL,updated_at=now() FROM expired WHERE e.id=expired.id")
+    sqlx::query("WITH expired AS (SELECT id FROM render_executions WHERE runtime_engine='rust-v2' AND state IN ('canceled','paused') AND lease_until<=now() ORDER BY lease_until,id LIMIT $1 FOR UPDATE SKIP LOCKED) UPDATE render_executions e SET lease_until=NULL,updated_at=now() FROM expired WHERE e.id=expired.id")
         .bind(limit.clamp(1,100)).execute(&db.pool).await?;
+    // Resume only after the former lease is drained. Keep uploaded asset
+    // evidence and original fence for completed-receipt replay; the claim
+    // path excludes uploaded assets. Do not reset the attempt budget.
+    sqlx::query("WITH ready AS (SELECT e.id FROM render_executions e JOIN operation_inbox j ON j.id=e.job_id JOIN pipeline_runs w ON w.id=e.workflow_id JOIN tasks t ON t.id=e.task_id
+      WHERE e.runtime_engine='rust-v2' AND e.state='paused' AND (e.lease_until IS NULL OR e.lease_until<=now())
+        AND j.runtime_engine='rust-v2' AND j.stage='render' AND j.status='awaiting' AND j.task_id=e.task_id AND j.workflow_id=e.workflow_id AND j.external_ticket=e.id::text
+        AND w.engine='rust-v2' AND w.task_id=e.task_id AND w.state='running' AND w.current_stage='render'
+        AND t.runtime_owner='rust' AND t.status::text NOT IN ('canceled','failed','publishing','published')
+      ORDER BY e.updated_at,e.id LIMIT $1 FOR UPDATE OF e SKIP LOCKED)
+      UPDATE render_executions e SET state='queued',lease_until=NULL,error_message=NULL,updated_at=now(),progress=CASE WHEN e.uploaded_asset_id IS NULL THEN 0 ELSE e.progress END,
+        worker_id=CASE WHEN e.uploaded_asset_id IS NULL THEN NULL ELSE e.worker_id END,fence_token=CASE WHEN e.uploaded_asset_id IS NULL THEN NULL ELSE e.fence_token END FROM ready WHERE e.id=ready.id")
+       .bind(limit.clamp(1,100)).execute(&db.pool).await?;
     // Limit expensive full-file verification per tick. Preserve bad evidence
     // for manual reconciliation rather than silently re-rendering or posting.
     let uploads=sqlx::query("SELECT e.* FROM render_executions e JOIN operation_inbox j ON j.id=e.job_id

@@ -136,6 +136,7 @@ async fn unsafe_to_delete(tx: &mut Transaction<'_, Postgres>, task: Uuid) -> App
     let busy:bool=sqlx::query_scalar(r#"
       SELECT EXISTS(SELECT 1 FROM subtitle_jobs WHERE task_id=$1 AND status::text IN ('queued','running'))
        OR EXISTS(SELECT 1 FROM render_jobs WHERE task_id=$1 AND status::text IN ('queued','running'))
+       OR EXISTS(SELECT 1 FROM render_executions WHERE task_id=$1 AND runtime_engine='rust-v2' AND state IN ('running','uploading','canceled','paused') AND lease_until>now())
        OR EXISTS(SELECT 1 FROM dubbing_jobs WHERE task_id=$1 AND
          (status IN ('queued','preparing','synthesizing','aligning','mixing','rendering',
                      'pause_requested','cancel_requested','paused','preview_ready','needs_review')))

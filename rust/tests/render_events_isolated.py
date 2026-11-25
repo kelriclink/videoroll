@@ -235,6 +235,32 @@ try:
     req=Request(base+f"/render-workers/v1/executions/{good[3]}/complete",data=json.dumps({"fence_token":gf,"output_asset_id":ga,"output":{}}).encode(),headers={"Content-Type":"application/json","Authorization":"Bearer "+token})
     with urlopen(req,timeout=10) as response: assert response.status==200
     print("PASS: actual uploaded MP4 recovered after lost callback at attempt five; corrupt bytes and live lease preserved; replay idempotent",flush=True)
+    # A committed output survives V2 workflow pause, including the fifth
+    # attempt, without a second render. Resume waits until the lease drains.
+    paused,pf,pa=upload_fixture()
+    def api_post(path, payload=None, worker=False):
+        headers={"Content-Type":"application/json"}
+        if worker:headers["Authorization"]="Bearer "+token
+        else:headers["x-videoroll-v2-internal-token"]=os.environ["VIDEOROLL_V2_INTERNAL_TOKEN"]
+        req=Request(base+path,data=json.dumps(payload or {}).encode(),headers=headers)
+        try:r=urlopen(req,timeout=10)
+        except HTTPError as exc:r=exc
+        with r:return r.status,json.load(r)
+    assert api_post(f"/api/v2/workflows/{paused[1]}/pause")[0]==200
+    assert api_post(f"/api/v2/workflows/{paused[1]}/resume")[0]==200
+    tick()
+    with db() as c:
+        assert c.execute("SELECT state,attempt,uploaded_asset_id::text,lease_until>now() FROM render_executions WHERE id=%s",(paused[3],)).fetchone()==("paused",5,pa,True)
+    assert api_post(f"/render-workers/v1/executions/{paused[3]}/complete",{"fence_token":pf,"output_asset_id":pa,"output":{}},True)[0]==409
+    assert api_post(f"/render-workers/v1/executions/{paused[3]}/fail",{"fence_token":pf,"error":"paused","retryable":False},True)[0]==200
+    tick();tick()
+    with db() as c:
+        assert c.execute("SELECT state,attempt,uploaded_asset_id::text,lease_until FROM render_executions WHERE id=%s",(paused[3],)).fetchone()==("completed",5,pa,None)
+        assert c.execute("SELECT status FROM operation_inbox WHERE id=%s",(paused[2],)).fetchone()[0]=="succeeded"
+        assert c.execute("SELECT count(*) FROM operation_inbox WHERE workflow_id=%s AND stage='dubbing'",(paused[1],)).fetchone()[0]==1
+    assert api_post(f"/render-workers/v1/executions/{paused[3]}/complete",{"fence_token":pf,"output_asset_id":pa,"output":{}},True)[0]==200
+    print("PASS: paused uploaded fifth-attempt output survives immediate resume, waits for acknowledgment, then settles exactly once",flush=True)
+
 
 finally:
     proc.terminate()

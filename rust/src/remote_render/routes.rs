@@ -78,7 +78,7 @@ async fn enrolled_execution(
 }
 async fn read_worker(state: &AppState, id: Uuid) -> AppResult<WorkerInfo> {
     let row=sqlx::query(
-        "SELECT w.*, (SELECT count(*) FROM vr2_render_executions e WHERE e.worker_id=w.id AND e.state IN ('running','uploading','canceled') AND e.lease_until>now())::bigint AS active_jobs FROM vr2_render_workers w WHERE w.id=$1"
+        "SELECT w.*, (SELECT count(*) FROM vr2_render_executions e WHERE e.worker_id=w.id AND e.state IN ('running','uploading','canceled','paused') AND e.lease_until>now())::bigint AS active_jobs FROM vr2_render_workers w WHERE w.id=$1"
     ).bind(id).fetch_optional(&state.db.pool).await?
         .ok_or_else(||AppError::NotFound("render worker not found".into()))?;
     Ok(WorkerInfo {
@@ -384,7 +384,7 @@ async fn claim(
         return Ok(empty());
     }
     let active:i64=sqlx::query_scalar(
-        "SELECT count(*) FROM vr2_render_executions WHERE worker_id=$1 AND state IN ('running','uploading','canceled') AND lease_until>now()"
+        "SELECT count(*) FROM vr2_render_executions WHERE worker_id=$1 AND state IN ('running','uploading','canceled','paused') AND lease_until>now()"
     ).bind(id).fetch_one(&mut *tx).await?;
     if active >= max as i64 {
         return Ok(empty());
@@ -397,6 +397,8 @@ async fn claim(
           JOIN tasks t ON t.id=r.task_id
           WHERE w.state='running' AND j.state='awaiting'
             AND j.external_ticket=r.id::text
+            AND j.task_id=r.task_id AND j.workflow_id=r.workflow_id AND j.stage='render'
+            AND w.task_id=r.task_id AND w.current_stage='render' AND t.runtime_owner='rust'
             AND r.attempt < $4
             AND r.uploaded_asset_id IS NULL
             AND upper(t.status::text) NOT IN ('CANCELED','FAILED')
@@ -425,10 +427,13 @@ async fn claim(
     let spec = build_spec(&s, &info).await?;
     info.render_spec = serde_json::to_value(&spec)
         .map_err(|_| AppError::Invalid("render spec serialization failed".into()))?;
-    sqlx::query(
-        "UPDATE vr2_render_executions SET mode=$1,render_spec=$2,updated_at=now() WHERE id=$3 AND worker_id=$4 AND fence_token=$5 AND state='running'"
+    let changed=sqlx::query(
+        "UPDATE vr2_render_executions SET mode=$1,render_spec=$2,updated_at=now() WHERE id=$3 AND worker_id=$4 AND fence_token=$5 AND state='running' AND lease_until>now()"
     ).bind(&spec.mode).bind(&info.render_spec).bind(info.id).bind(id)
-        .bind(&info.fence_token).execute(&s.db.pool).await?;
+        .bind(&info.fence_token).execute(&s.db.pool).await?.rows_affected();
+    if changed != 1 {
+        return Ok(empty());
+    }
     Ok(Json(ClaimResponse {
         execution: Some(info),
         render_spec: Some(spec),
@@ -556,7 +561,7 @@ async fn execution_cancel(
     let task_id: Uuid = row.try_get("task_id")?;
     let workflow_id: Uuid = row.try_get("workflow_id")?;
     let execution_state: String = row.try_get("state")?;
-    if execution_state == "canceled" {
+    if matches!(execution_state.as_str(), "canceled" | "paused") {
         return Ok(Json(CancelState {
             cancel_requested: true,
             reason: row.try_get("last_error")?,
@@ -852,35 +857,6 @@ async fn execution_completed(
             .filter(|s| !s.is_empty())
             .ok_or_else(|| AppError::Conflict("noop render has no pinned source".into()))?
             .to_owned();
-        let owned:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM assets WHERE task_id=$1 AND storage_key=$2 AND kind::text='video_raw')")
-            .bind(task_id).bind(&key).fetch_one(&s.db.pool).await?;
-        if !owned {
-            return Err(AppError::Conflict(
-                "noop source no longer belongs to task".into(),
-            ));
-        }
-
-        let job = crate::domain::WorkItem {
-            id: job_id,
-            workflow_id: flow_id,
-            task_id,
-            stage: crate::domain::Stage::Render,
-            generation: 1,
-            operation_key: String::new(),
-            lease_token: Uuid::nil(),
-            attempts: 0,
-            max_attempts: 5,
-            payload: Value::Null,
-        };
-        crate::media::ffmpeg::ensure_task_asset(
-            &s.db,
-            &s.storage,
-            task_id,
-            &job,
-            "video_final",
-            &key,
-        )
-        .await?;
         (None, Some(key))
     } else {
         let asset = asset_id.ok_or_else(|| {
@@ -905,16 +881,101 @@ async fn execution_completed(
             return Err(AppError::Conflict("render output missing or empty".into()));
         }
     }
-    // A state update can commit even if the subsequent stage completion call
-    // loses network; repeated calls are idempotent via the exact ticket+result.
-    if state != "completed" {
-        let row=sqlx::query(
-            "UPDATE render_executions SET state='completed',progress=100,output_json=$4,finished_at=now(),updated_at=now() WHERE id=$1 AND worker_id=$2 AND fence_token=$3 AND runtime_engine='rust-v2' AND state IN ('running','uploading') AND lease_until>now() RETURNING *"
-        ).bind(id).bind(worker_id).bind(&payload.fence_token).bind(&result)
-            .fetch_optional(&s.db.pool).await?
-            .ok_or_else(||AppError::Conflict("render fence expired before completion".into()))?;
-        let _ = row;
+    // Commit noop asset registration and the execution receipt together,
+    // under the same parent locks as upload/stop. No stale worker can
+    // create a final asset after a pause or terminal cancellation.
+    let noop_proof = if mode == "noop" {
+        Some(
+            s.storage
+                .sha256(
+                    key.as_deref()
+                        .ok_or_else(|| AppError::Conflict("noop key missing".into()))?,
+                )
+                .await?,
+        )
+    } else {
+        None
+    };
+    let mut tx = s.db.pool.begin().await?;
+    let status: Option<String> = sqlx::query_scalar(
+        "SELECT upper(status::text) FROM tasks WHERE id=$1 AND runtime_owner='rust' FOR UPDATE",
+    )
+    .bind(task_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let flow:Option<String>=sqlx::query_scalar("SELECT state FROM vr2_workflows WHERE id=$1 AND task_id=$2 AND current_stage='render' FOR UPDATE").bind(flow_id).bind(task_id).fetch_optional(&mut *tx).await?;
+    let job:Option<bool>=sqlx::query_scalar("SELECT state='awaiting' AND external_ticket=$4 FROM vr2_jobs WHERE id=$1 AND task_id=$2 AND workflow_id=$3 AND stage='render' FOR UPDATE").bind(job_id).bind(task_id).bind(flow_id).bind(id.to_string()).fetch_optional(&mut *tx).await?;
+    if !status
+        .as_deref()
+        .is_some_and(|v| !matches!(v, "CANCELED" | "FAILED" | "PUBLISHING" | "PUBLISHED"))
+        || flow.as_deref() != Some("running")
+        || job != Some(true)
+    {
+        return Err(AppError::Conflict(
+            "render parent no longer awaits completion".into(),
+        ));
     }
+    let current =
+        sqlx::query("SELECT * FROM vr2_render_executions WHERE id=$1 AND worker_id=$2 FOR UPDATE")
+            .bind(id)
+            .bind(worker_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or(AppError::Unauthorized)?;
+    // If another callback already committed this fence, leave the stored
+    // evidence intact and let the scheduler settle it idempotently.
+    if current.try_get::<String, _>("state")? == "completed" {
+        if current
+            .try_get::<Option<String>, _>("fence_token")?
+            .as_deref()
+            != Some(payload.fence_token.as_str())
+        {
+            return Err(AppError::Conflict("completed render fence changed".into()));
+        }
+        let saved: Value =
+            sqlx::query_scalar("SELECT output_json FROM render_executions WHERE id=$1")
+                .bind(id)
+                .fetch_one(&mut *tx)
+                .await?;
+        if saved != result {
+            return Err(AppError::Conflict(
+                "completed render receipt changed".into(),
+            ));
+        }
+    } else {
+        validate_lease(&current, &payload.fence_token)?;
+        if current.try_get::<String, _>("mode")? != mode
+            || current.try_get::<Option<Uuid>, _>("uploaded_asset_id")? != asset_id
+        {
+            return Err(AppError::Conflict("render output changed".into()));
+        }
+        if let Some((sha, size)) = noop_proof {
+            let key = key
+                .as_deref()
+                .ok_or_else(|| AppError::Conflict("noop key missing".into()))?;
+            let spec: Value = current.try_get("render_spec")?;
+            let owned:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM assets WHERE task_id=$1 AND storage_key=$2 AND kind::text='video_raw')").bind(task_id).bind(key).fetch_one(&mut *tx).await?;
+            if !owned || size <= 0 || spec["request"]["input_key"].as_str() != Some(key) {
+                return Err(AppError::Conflict("noop pinned input changed".into()));
+            }
+            let object=sqlx::query("INSERT INTO storage_objects(storage_key,checksum_sha256,size_bytes,state,retain_until) VALUES($1,$2,$3,'live',now()+interval '2 days') ON CONFLICT(storage_key) DO UPDATE SET retain_until=GREATEST(storage_objects.retain_until,now()+interval '2 days') WHERE storage_objects.state='live' AND storage_objects.checksum_sha256=$2 AND storage_objects.size_bytes=$3").bind(key).bind(&sha).bind(size).execute(&mut *tx).await?.rows_affected();
+            if object != 1 {
+                return Err(AppError::Conflict(
+                    "noop source storage evidence changed".into(),
+                ));
+            }
+            sqlx::query("INSERT INTO storage_object_refs(storage_key,owner_type,owner_id,role) VALUES($1,'workflow',$2,'video_final') ON CONFLICT DO NOTHING").bind(key).bind(flow_id).execute(&mut *tx).await?;
+            sqlx::query("INSERT INTO assets(id,task_id,kind,storage_key,sha256,size_bytes) SELECT $1,$2,'video_final'::asset_kind,$3,$4,$5 WHERE NOT EXISTS(SELECT 1 FROM assets WHERE task_id=$2 AND kind::text='video_final' AND storage_key=$3)").bind(Uuid::new_v4()).bind(task_id).bind(key).bind(&sha).bind(size).execute(&mut *tx).await?;
+            sqlx::query("UPDATE tasks SET status='rendered'::task_status,updated_at=now() WHERE id=$1 AND status::text IN ('created','ingested','downloaded','audio_extracted','asr_done','translated','subtitle_ready')").bind(task_id).execute(&mut *tx).await?;
+        }
+        let changed=sqlx::query("UPDATE render_executions SET state='completed',progress=100,output_json=$4,lease_until=NULL,finished_at=now(),updated_at=now() WHERE id=$1 AND worker_id=$2 AND fence_token=$3 AND runtime_engine='rust-v2' AND state IN ('running','uploading') AND lease_until>now()").bind(id).bind(worker_id).bind(&payload.fence_token).bind(&result).execute(&mut *tx).await?.rows_affected();
+        if changed != 1 {
+            return Err(AppError::Conflict(
+                "render fence expired before completion".into(),
+            ));
+        }
+    }
+    tx.commit().await?;
     let scheduler = crate::scheduler::Scheduler::new(s.db.clone(), s.config.job_lease);
     scheduler
         .complete_external(job_id, &id.to_string(), result)
@@ -945,15 +1006,16 @@ async fn execution_failed(
             .ok_or(AppError::Unauthorized)?;
     // A worker may report its stop through the existing failure endpoint.
     // Acknowledge cancellation without converting it to a retry or failure.
-    if row.try_get::<String, _>("state")? == "canceled" {
+    if matches!(
+        row.try_get::<String, _>("state")?.as_str(),
+        "canceled" | "paused"
+    ) {
         let fence: Option<String> = row.try_get("fence_token")?;
         if !fence
             .as_deref()
             .is_some_and(|f| is_fence(f, &payload.fence_token))
         {
-            return Err(AppError::Conflict(
-                "canceled render execution fenced".into(),
-            ));
+            return Err(AppError::Conflict("stopped render execution fenced".into()));
         }
         let row=sqlx::query("UPDATE vr2_render_executions SET lease_until=NULL,updated_at=now() WHERE id=$1 RETURNING *")
             .bind(id).fetch_one(&mut *tx).await?;

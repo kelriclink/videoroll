@@ -1081,6 +1081,29 @@ impl Scheduler {
         tx.commit().await?;
         Ok(())
     }
+    // Parent task and workflow are already locked. Lock the original awaiting
+    // render job before its execution, matching the upload lock order. A
+    // paused execution retains its evidence/fence and reserves a live slot;
+    // only the resumed workflow may requeue it after the worker drains.
+    async fn stop_remote_render(
+        tx: &mut Transaction<'_, Postgres>,
+        workflow: Uuid,
+        terminal: bool,
+    ) -> AppResult<()> {
+        sqlx::query("SELECT id FROM operation_inbox WHERE workflow_id=$1 AND runtime_engine='rust-v2' AND stage='render' AND status='awaiting' ORDER BY id FOR UPDATE")
+            .bind(workflow).fetch_all(&mut **tx).await?;
+        sqlx::query("UPDATE render_executions e SET state=$2,lease_until=CASE WHEN e.lease_until>now() THEN e.lease_until ELSE NULL END,
+          error_message=$3,finished_at=CASE WHEN $2='canceled' THEN now() ELSE NULL END,updated_at=now()
+          FROM operation_inbox j,pipeline_runs w,tasks t
+          WHERE e.runtime_engine='rust-v2' AND e.workflow_id=$1 AND e.state IN ('queued','running','uploading','paused')
+          AND j.id=e.job_id AND j.runtime_engine='rust-v2' AND j.stage='render' AND j.status='awaiting'
+          AND j.task_id=e.task_id AND j.workflow_id=e.workflow_id AND j.external_ticket=e.id::text
+          AND w.id=e.workflow_id AND w.engine='rust-v2' AND w.task_id=e.task_id
+          AND t.id=e.task_id AND t.runtime_owner='rust'")
+          .bind(workflow).bind(if terminal {"canceled"} else {"paused"})
+          .bind(if terminal {"workflow canceled"} else {"workflow paused"}).execute(&mut **tx).await?;
+        Ok(())
+    }
     pub async fn pause(&self, workflow_id: Uuid) -> AppResult<WorkflowInfo> {
         let mut tx = self.db.pool.begin().await?;
         let peek = sqlx::query("SELECT task_id FROM vr2_workflows WHERE id=$1")
@@ -1103,6 +1126,7 @@ impl Scheduler {
                 "cannot pause workflow in state {state}"
             )));
         }
+        Self::stop_remote_render(&mut tx, workflow_id, false).await?;
         sqlx::query("UPDATE vr2_workflows SET state='paused',updated_at=now() WHERE id=$1")
             .bind(workflow_id)
             .execute(&mut *tx)
@@ -1174,6 +1198,7 @@ impl Scheduler {
                 ));
             }
             let id: Uuid = flow.try_get("id")?;
+            Self::stop_remote_render(&mut tx, id, false).await?;
             sqlx::query("UPDATE vr2_workflows SET state='paused',updated_at=now() WHERE id=$1")
                 .bind(id)
                 .execute(&mut *tx)
@@ -1286,9 +1311,10 @@ impl Scheduler {
             )
             .await?;
         } else {
+            Self::stop_remote_render(&mut tx, workflow_id, true).await?;
             sqlx::query("UPDATE vr2_jobs SET state='canceled',lease_token=NULL,lease_until=NULL,updated_at=now() WHERE workflow_id=$1 AND state IN ('pending','running','awaiting')")
                 .bind(workflow_id).execute(&mut *tx).await?;
-            sqlx::query("UPDATE tasks SET status='canceled'::task_status,updated_at=now() WHERE id=$1 AND status<>'published'::task_status")
+            sqlx::query("UPDATE tasks SET status='canceled'::task_status,stopped_status=NULL,updated_at=now() WHERE id=$1 AND status<>'published'::task_status")
                 .bind(task_id).execute(&mut *tx).await?;
             sqlx::query("UPDATE vr2_workflows SET state='canceled',updated_at=now() WHERE id=$1")
                 .bind(workflow_id)
