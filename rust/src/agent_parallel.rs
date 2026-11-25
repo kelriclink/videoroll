@@ -287,6 +287,9 @@ async fn learn_pending(
 ) -> AppResult<Value> {
     let child_id = Uuid::new_v5(&parent, candidate.term.to_lowercase().as_bytes());
     let skipped = |reason: &str| json!({"agent_run_id":child_id,"term":candidate.term,"status":"skipped","reason":reason});
+    if crate::media::translation_quality::glossary_contains(task.glossary, &candidate.term) {
+        return Ok(skipped("explicit_glossary"));
+    }
     let Some(mapping) = result.mapping.as_ref() else {
         return Ok(skipped("no_mapping"));
     };
@@ -843,6 +846,7 @@ pub(super) async fn run(
                 verified_candidates.push((*index,result,verified));
             }
         }
+        documents.extend(suppress_conflicts(db,task,&mut mappings).await?);
         let final_terms=json!({"terms":mappings});
         base=merge_result(base.clone(),source,&final_terms,&web);
         let mut seen=base.evidence_ids.iter().copied().collect::<HashSet<_>>();

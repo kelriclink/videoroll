@@ -223,6 +223,33 @@ fn terms_from_result(result: &Value, source: &str) -> Vec<VerifiedTerm> {
     }
     accepted
 }
+// Suppress suggestions for explicit or reviewed identities. Fetch the
+// actual approved rows, not term strings parsed from model-generated text.
+async fn suppress_conflicts(
+    db: &Database,
+    task: &ResearchTask<'_>,
+    terms: &mut Vec<VerifiedTerm>,
+) -> AppResult<Vec<SearchHit>> {
+    terms.retain(|m| {
+        !crate::media::translation_quality::glossary_contains(task.glossary, &m.source)
+    });
+    let settings = crate::rag_original_v1::settings(db).await?;
+    if !settings.enabled || terms.is_empty() {
+        return Ok(vec![]);
+    }
+    let keys = terms
+        .iter()
+        .map(|m| crate::subtitle_knowledge_write_v1::normalize_term(&m.source))
+        .collect::<Vec<_>>();
+    let reviewed =
+        crate::rag_original_v1::reviewed_identities(db, &keys, task.target_lang, &settings).await?;
+    terms.retain(|m| {
+        !reviewed
+            .iter()
+            .any(|(key, _)| *key == crate::subtitle_knowledge_write_v1::normalize_term(&m.source))
+    });
+    Ok(reviewed.into_iter().map(|(_, h)| h).collect())
+}
 fn merge_result(
     mut context: ResearchContext,
     source: &str,
@@ -395,6 +422,7 @@ pub struct ResearchTask<'a> {
     pub settings: &'a RagConfig,
     pub query: &'a SearchKnowledge,
     pub evidence: &'a [SearchHit],
+    pub glossary: &'a Value,
     pub target_lang: &'a str,
     pub gate: bool,
     pub timeout_seconds: u64,
@@ -492,6 +520,10 @@ async fn run_steps(
             .collect::<String>();
         match kind {
             "finish" => {
+                let mut mappings = terms_from_result(&action, source);
+                let reviewed = suppress_conflicts(db, task, &mut mappings).await?;
+                documents.extend(reviewed);
+                let action = json!({"summary":action.get("summary"),"terms":mappings});
                 let mut combined = merge_result(base, source, &action, &web_results);
                 // Dynamic knowledge evidence must be retained, not merely
                 // shown to the model and then omitted from the checkpoint.
@@ -654,7 +686,7 @@ pub async fn run(
     .await?;
     let fingerprint = hex::encode(Sha256::digest(
         serde_json::to_vec(&json!({
-            "revision":if settings.learn_pending{4}else{3},"parallelism":task.parallelism,"gate":task.gate,"target_lang":task.target_lang,"timeout":task.timeout_seconds,"source":source,"model_provider":settings.research_provider_id,
+            "revision":5,"glossary":task.glossary,"parallelism":task.parallelism,"gate":task.gate,"target_lang":task.target_lang,"timeout":task.timeout_seconds,"source":source,"model_provider":settings.research_provider_id,
             "model_id":settings.research_model_id,"resolved_model":provider.model,"resolved_endpoint":provider.endpoint.as_str(),"resolved_api_type":provider.api_type,"resolved_output_tokens":provider.max_output_tokens,
             "rag":settings,"query":query.query,
             "evidence_ids":initial.evidence_ids,
