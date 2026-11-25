@@ -104,6 +104,45 @@ if n=='mixed-fail':sys.exit(1)
             try:urlopen(req,timeout=10);raise AssertionError('separate SAU target was admitted')
             except HTTPError as err:assert err.code==409,err.code
             verify(t2,r2final,3)
+            # Explicit creator-center attestation, never automatic proof or replay.
+            def resolve(task,job,body):return api(f'/tasks/{task}/publish_jobs/{job}/sau/resolve',body)
+            j=final['results']['douyin']['job_id'];j2=r2final['results']['douyin']['job_id'];k2=r2final['results']['kuaishou']['job_id']
+            receipt={'platform':'douyin','account_id':good,'external_id':'7412345678901234567','evidence':'测试操作者在模拟创作者中心核对对应作品和账号','confirmed_in_creator_center':True}
+            assert resolve(t,j,{**receipt,'confirmed_in_creator_center':False})[0]==400
+            assert resolve(t,j,{**receipt,'external_id':'https://example.invalid/video'})[0]==400
+            assert resolve(t,j,{**receipt,'account_id':fail})[0]==409
+            assert resolve(t,j2,receipt)[0]==404
+            assert resolve(t,final['results']['bilibili']['job_id'],receipt)[0]==409
+            req=Request(f'http://127.0.0.1:18080/api/v1/tasks/{t}/publish_jobs/{j}/sau/resolve',headers={'content-type':'application/json'},data=json.dumps(receipt).encode(),method='POST')
+            try:urlopen(req,timeout=10);raise AssertionError('anonymous receipt accepted')
+            except HTTPError as err:assert err.code==401,err.code
+            before_calls=(runtime/'calls').read_text();before=counters()
+            # A previously failed batch may be old. Cleanup must use the new
+            # successful settlement time, never the old failure timestamp.
+            db("UPDATE publish_batches SET finished_at=now()-interval '3 days' WHERE id=CAST(:b AS uuid)",{'b':b})
+            with ThreadPoolExecutor(max_workers=3) as pool:rs=list(pool.map(lambda _:resolve(t,j,receipt),range(3)))
+            code,attested=rs[0];assert code==200 and all(x==rs[0] for x in rs) and attested['verification']=='operator_creator_center',rs
+            assert state(t,b)==('succeeded','published',None,1),state(t,b)
+            row=db("SELECT p.state::text,p.external_id,p.response_json,i.result_json,e.status FROM publish_jobs p JOIN operation_inbox i ON i.operation_key=p.operation_key JOIN outbox_events e ON e.operation_key=p.operation_key WHERE p.id=CAST(:j AS uuid)",{'j':j})
+            assert row[0:2]==('published',receipt['external_id']) and row[2]['receipt_verified'] is False and row[2]['operator_receipt']['source']=='operator_creator_center' and row[2]['operator_receipt']['evidence']==receipt['evidence'] and row[3]['status']=='submitted' and row[4]=='native_completed',row
+            assert db("SELECT count(*) FROM outbox_events WHERE aggregate_id=:b AND event_type='workflow.publish.finished' AND args_json->'args'->>1='succeeded'",{'b':b})==(1,)
+            assert db("SELECT available_at BETWEEN now()+interval '23 hours' AND now()+interval '25 hours' FROM outbox_events WHERE aggregate_id=:b AND event_type='publish.cleanup'",{'b':b})==(True,)
+            assert resolve(t,j,{**receipt,'evidence':'不同的核验说明不得覆盖原确认记录'})[0]==409
+            assert resolve(t2,j2,receipt)[0]==409 # ID cannot be assigned to a second job
+            # Two uncertain targets in another batch; only the final explicit
+            # confirmation can settle all targets. Unknown after browser start
+            # may be reconciled but no upload is ever retried.
+            receipt2={**receipt,'external_id':'7412345678901234568'}
+            assert resolve(t2,j2,receipt2)[0]==200
+            assert state(t2,b2)==('partial_failed','publishing','PUBLISH_PARTIAL_FAILURE',0)
+            kreceipt={**receipt,'platform':'kuaishou','account_id':fail,'external_id':'KuaishouFixture123','evidence':'测试操作者在模拟后台核对启动后未知的快手作品'}
+            assert resolve(t2,k2,kreceipt)[0]==200
+            assert state(t2,b2)==('succeeded','published',None,1)
+            assert post(t2,body2)[1]['all_published'] is True
+            assert (runtime/'calls').read_text()==before_calls and counters()==before
+            verify(t2,post(t2,body2)[1],3)
+            print('PASS: explicit operator receipt attestation, exact original evidence, concurrent dedupe, duplicate ID rejection, success settlement and fresh delayed cleanup without replay',flush=True)
+
         finally:
             proc.terminate()
             try:proc.wait(timeout=5)

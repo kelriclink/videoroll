@@ -196,7 +196,7 @@ async fn reconcile_impl(
     let prior: String = row.try_get("state")?;
     sqlx::query(
         "UPDATE publish_batches SET state=$2,
-        finished_at=CASE WHEN $3 THEN COALESCE(finished_at,now()) ELSE NULL END,
+        finished_at=CASE WHEN $2='succeeded' AND state<>'succeeded' THEN now() WHEN $3 THEN COALESCE(finished_at,now()) ELSE NULL END,
         updated_at=now() WHERE id=$1",
     )
     .bind(batch)
