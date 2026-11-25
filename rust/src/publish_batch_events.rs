@@ -48,9 +48,9 @@ async fn finish(
     key: &str,
     result: Value,
 ) -> AppResult<()> {
-    sqlx::query("INSERT INTO operation_inbox(id,operation_key,runtime_engine,status,result_json,completed_at)
-      VALUES($1,$2,$3,'completed',$4,now()) ON CONFLICT(operation_key) DO NOTHING")
-        .bind(Uuid::new_v4()).bind(key).bind(ENGINE).bind(&result).execute(&mut **tx).await?;
+    sqlx::query("INSERT INTO operation_inbox(id,operation_key,runtime_engine,status,result_json,request_json,completed_at)
+      VALUES($1,$2,$3,'completed',$4,jsonb_build_object('outbox_event_id',$5::text),now()) ON CONFLICT(operation_key) DO NOTHING")
+        .bind(Uuid::new_v4()).bind(key).bind(ENGINE).bind(&result).bind(event.to_string()).execute(&mut **tx).await?;
     let owned:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM operation_inbox WHERE operation_key=$1 AND runtime_engine=$2 AND status='completed')")
         .bind(key).bind(ENGINE).fetch_one(&mut **tx).await?;
     if !owned {

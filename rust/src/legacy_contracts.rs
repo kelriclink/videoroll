@@ -173,8 +173,8 @@ async fn create_task(
             let id = Uuid::new_v4();
             let mut tx = state.db.pool.begin().await?;
             sqlx::query(
-                "INSERT INTO tasks(id,source_type,source_url,source_license,source_proof_url,status,priority,created_by,origin_kind)
-                 VALUES($1,'local'::source_type,NULL,$2::source_license,$3,'created'::task_status,$4,$5,'v2_local_upload')"
+                "INSERT INTO tasks(id,source_type,source_url,source_license,source_proof_url,status,priority,created_by,origin_kind,retry_count)
+                 VALUES($1,'local'::source_type,NULL,$2::source_license,$3,'created'::task_status,$4,$5,'v2_local_upload',0)"
             ).bind(id).bind(&payload.source_license).bind(proof).bind(priority)
                 .bind(payload.created_by.as_deref().unwrap_or("web"))
                 .execute(&mut *tx).await?;

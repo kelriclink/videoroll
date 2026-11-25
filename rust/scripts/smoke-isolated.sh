@@ -100,8 +100,36 @@ if ! docker exec "$container_name" psql -At -U postgres -d videoroll_test -c 'SE
   echo 'ephemeral PostgreSQL did not reach steady-state readiness' >&2
   exit 1
 fi
-docker exec -i "$container_name" psql -v ON_ERROR_STOP=1 -U postgres -d videoroll_test   < rust/tests/bootstrap_legacy_for_integration.sql >/dev/null
+if [[ "${VIDEOROLL_V2_TEST_REAL_SCHEMA_ONLY:-false}" == "true" ]]; then
+  : "${VIDEOROLL_TEST_SCHEMA_SNAPSHOT:?schema-only snapshot required}"
+  test -f "$VIDEOROLL_TEST_SCHEMA_SNAPSHOT"
+  if grep -qE '^(COPY |INSERT INTO )' "$VIDEOROLL_TEST_SCHEMA_SNAPSHOT"; then
+    echo 'schema rehearsal refuses row-bearing dumps' >&2
+    exit 1
+  fi
+  docker exec "$container_name" psql -X -v ON_ERROR_STOP=1 -U postgres -d videoroll_test -c "DROP SCHEMA public CASCADE;" >/dev/null
+  python3 - "$VIDEOROLL_TEST_SCHEMA_SNAPSHOT" <<'PYSCHEMA' | docker exec -i "$container_name" psql -X -v ON_ERROR_STOP=1 -U postgres -d videoroll_test >/dev/null
+import sys
+from pathlib import Path
+schema=Path(sys.argv[1]).read_text()
+assert schema.count("CREATE SCHEMA public;")==1
+print(schema.replace("CREATE SCHEMA public;", "CREATE SCHEMA public;\nCREATE EXTENSION vector WITH SCHEMA public;", 1))
+PYSCHEMA
+else
+  docker exec -i "$container_name" psql -v ON_ERROR_STOP=1 -U postgres -d videoroll_test < rust/tests/bootstrap_legacy_for_integration.sql >/dev/null
+fi
 export DATABASE_URL="postgresql://postgres:videoroll-test-20261121@127.0.0.1:${smoke_db_port}/videoroll_test"
+if [[ "${VIDEOROLL_V2_TEST_REAL_SCHEMA_ONLY:-false}" == "true" ]]; then
+  export VIDEOROLL_V2_INTERNAL_TOKEN="isolated-schema-rehearsal-token-0123456789"
+  export INTERNAL_API_SECRET="isolated-schema-rehearsal-service-secret"
+  export VIDEOROLL_V2_STORAGE_ROOT="$(mktemp -d "$repo_root/rust/target/v2-schema-rehearsal.XXXXXX")"
+  "$CARGO_HOME/bin/cargo" build --manifest-path "$repo_root/rust/Cargo.toml" --bin videoroll-v2 --locked --offline --quiet
+  : "${VIDEOROLL_TEST_CONTROLS_SNAPSHOT:?nonsecret controls snapshot required}"
+  /opt/videoroll/venvs/core/bin/python "$repo_root/rust/tests/production_schema_rehearsal.py" seed
+  "$repo_root/rust/target/debug/videoroll-v2" migrate
+  /opt/videoroll/venvs/core/bin/python "$repo_root/rust/tests/production_schema_rehearsal.py" verify
+  exit 0
+fi
 if [[ "${VIDEOROLL_V2_TEST_DB_CLEANUP_ONLY:-false}" == "true" ]]; then
   echo "PASS: isolated PostgreSQL bootstrap; EXIT trap will remove its dedicated volume"
   exit 0

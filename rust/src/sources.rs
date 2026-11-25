@@ -159,7 +159,7 @@ async fn create(
     }
     let id = Uuid::new_v4();
     sqlx::query(
-        "INSERT INTO youtube_sources(id,source_type,source_id,source_url,display_name,license,enabled,scan_interval_minutes,scan_limit,auto_process) VALUES($1,$2::youtube_source_type,$3,$4,$5,$6::youtube_source_license,$7,$8,$9,$10)"
+        "INSERT INTO youtube_sources(id,source_type,source_id,source_url,display_name,license,enabled,scan_interval_minutes,scan_limit,auto_process,last_scan_discovered_count,last_scan_created_count,last_scan_started_pipeline_count,last_scan_skipped_duplicates) VALUES($1,$2::youtube_source_type,$3,$4,$5,$6::youtube_source_license,$7,$8,$9,$10,0,0,0,0)"
     ).bind(id).bind(&v.source_type).bind(&v.source_id).bind(url).bind(v.display_name.as_ref().map(|s|s.chars().take(255).collect::<String>()))
         .bind(&v.license).bind(v.enabled).bind(v.scan_interval_minutes.clamp(1,1440))
         .bind(v.scan_limit.clamp(1,200)).bind(v.auto_process)
