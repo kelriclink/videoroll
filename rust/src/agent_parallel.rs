@@ -50,6 +50,90 @@ async fn event(
         .bind(Uuid::new_v4()).bind(id).bind(action).bind(status).bind(data).execute(&mut **tx).await?;
     Ok(())
 }
+// Conservative first-stage learning: only grounded global terms backed by
+// still-approved original knowledge, never overwrite an existing row.
+async fn learn_pending(
+    tx: &mut Transaction<'_, Postgres>,
+    task: &ResearchTask<'_>,
+    original: &crate::rag_original_v1::Settings,
+    parent: Uuid,
+    source: &str,
+    candidate: &Candidate,
+    result: &ChildResult,
+) -> AppResult<Value> {
+    let child_id = Uuid::new_v5(&parent, candidate.term.to_lowercase().as_bytes());
+    let skipped = |reason: &str| json!({"agent_run_id":child_id,"term":candidate.term,"status":"skipped","reason":reason});
+    let Some(mapping) = result.mapping.as_ref() else {
+        return Ok(skipped("no_mapping"));
+    };
+    if candidate.scope != "global"
+        || !matches!(
+            candidate.category.as_str(),
+            "proper_noun" | "acronym" | "domain_jargon" | "technical_standard"
+        )
+        || mapping.source != candidate.term
+        || !crate::media::translation_context::mentions(source, &candidate.term)
+        || candidate.term.chars().any(char::is_control)
+        || mapping.target.trim().is_empty()
+        || mapping.target.chars().count() > 160
+        || mapping.target.chars().any(char::is_control)
+    {
+        return Ok(skipped("context_only_or_invalid"));
+    }
+    let norm = crate::subtitle_knowledge_write_v1::normalize_term(&candidate.term);
+    if norm.is_empty() || task.target_lang.is_empty() || task.target_lang.chars().count() > 16 {
+        return Ok(skipped("invalid_identity"));
+    }
+    // Same lock namespace as manual upsert. Never hold a workflow lease
+    // waiting on a human editor or another research transaction.
+    let key = format!("{}:{}:{}", task.target_lang, original.domain, norm);
+    let locked: bool =
+        sqlx::query_scalar("SELECT pg_try_advisory_xact_lock(hashtextextended($1,0))")
+            .bind(&key)
+            .fetch_one(&mut **tx)
+            .await?;
+    if !locked {
+        return Ok(skipped("concurrent_editor"));
+    }
+    let exists:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM translation_knowledge_items WHERE item_type='term' AND target_lang=$1 AND normalized_term=$2 AND (domain=$3 OR domain=''))")
+        .bind(task.target_lang).bind(&norm).bind(&original.domain).fetch_one(&mut **tx).await?;
+    if exists {
+        return Ok(skipped("existing_term"));
+    }
+    let ids = result
+        .knowledge
+        .iter()
+        .filter(|h| h.source_ref.as_deref() == Some("translation_knowledge_items"))
+        .map(|h| h.id)
+        .collect::<Vec<_>>();
+    if ids.is_empty() {
+        return Ok(skipped("no_approved_evidence"));
+    }
+    let rows:Vec<(Uuid,String,String,String)>=sqlx::query_as("SELECT id,term,title,description FROM translation_knowledge_items WHERE id=ANY($1) AND native_scope IS NULL AND status IN ('approved','auto_approved') AND target_lang=$2 AND (domain=$3 OR domain='') ORDER BY id LIMIT 10")
+        .bind(&ids).bind(task.target_lang).bind(&original.domain).fetch_all(&mut **tx).await?;
+    let sources=rows.into_iter().filter(|(_,term,title,description)|{
+        crate::media::translation_context::mentions(term,&candidate.term)
+        ||crate::media::translation_context::mentions(title,&candidate.term)
+        ||crate::media::translation_context::mentions(description,&candidate.term)
+    }).take(5).map(|(id,term,title,_)|json!({"tool":"knowledge_lookup","knowledge_item_id":id,"title":if title.is_empty(){term}else{title}.chars().take(200).collect::<String>(),"agent_run_id":child_id,"task_id":task.job.task_id})).collect::<Vec<_>>();
+    if sources.is_empty() {
+        return Ok(skipped("no_approved_evidence"));
+    }
+    let id = Uuid::new_v5(&child_id, b"pending-knowledge-v1");
+    let changed=sqlx::query("INSERT INTO translation_knowledge_items(id,item_type,term,normalized_term,translation,target_lang,domain,description,sources,confidence,status,created_by) VALUES($1,'term',$2,$3,$4,$5,$6,$7,$8,0,'pending','agent') ON CONFLICT DO NOTHING")
+        .bind(id).bind(&candidate.term).bind(&norm).bind(&mapping.target).bind(task.target_lang).bind(&original.domain)
+        .bind("Rust Agent candidate; requires independent human review.")
+        .bind(json!(sources)).execute(&mut **tx).await?.rows_affected();
+    if changed == 0 {
+        return Ok(skipped("existing_term"));
+    }
+    sqlx::query("UPDATE translation_agent_runs SET knowledge_item_id=$2,updated_at=now() WHERE id=$1 AND status='succeeded'")
+        .bind(child_id).bind(id).execute(&mut **tx).await?;
+    Ok(
+        json!({"agent_run_id":child_id,"term":candidate.term,"status":"pending","knowledge_item_id":id}),
+    )
+}
+
 async fn parent(
     db: &Database,
     task: &ResearchTask<'_>,
@@ -488,9 +572,10 @@ pub(super) async fn run(
         let mut outcomes=stream::iter(futures).buffer_unordered(task.parallelism).collect::<Vec<_>>().await;
         outcomes.sort_by_key(|(i,_)|*i);
         let mut mappings=Vec::new();let mut documents=Vec::new();let mut web=Vec::new();let mut failed=0;
-        for (_,outcome) in outcomes{
+        let mut learned_candidates=Vec::new();
+        for (index,outcome) in outcomes{
             match outcome{
-                Ok(v)=>{mappings.extend(v.mapping);documents.extend(v.knowledge);web.extend(v.web);}
+                Ok(v)=>{if task.settings.learn_pending{learned_candidates.push((index,v.clone()));} mappings.extend(v.mapping);documents.extend(v.knowledge);web.extend(v.web);}
                 Err(e @ AppError::Conflict(_))=>return Err(e),
                 Err(_)=>failed+=1,
             }
@@ -508,7 +593,16 @@ pub(super) async fn run(
         }
         base.digest=hex::encode(Sha256::digest(base.prompt.as_bytes()));
         let mut tx=fenced(db,task.job).await?;
-        let summary=json!({"context":base,"master_agent_id":pid,"terms":mappings,"failed_children":failed,"gate_skipped_research":candidates.is_empty()});
+        let mut learning=Vec::new();
+        if task.settings.learn_pending && failed==0{
+            learned_candidates.sort_by_key(|(i,_)|crate::subtitle_knowledge_write_v1::normalize_term(&candidates[*i].term));
+            for (index,result) in &learned_candidates{
+                let decision=learn_pending(&mut tx,task,original,pid,source,&candidates[*index],result).await?;
+                event(&mut tx,pid,"knowledge_learning",decision["status"].as_str().unwrap_or("skipped"),decision.clone()).await?;
+                learning.push(decision);
+            }
+        }
+        let summary=json!({"context":base,"master_agent_id":pid,"terms":mappings,"failed_children":failed,"gate_skipped_research":candidates.is_empty(),"knowledge_learning":learning});
         sqlx::query("UPDATE translation_agent_runs SET status='succeeded',result=$2,finished_at=now(),updated_at=now() WHERE id=$1").bind(pid).bind(&summary).execute(&mut *tx).await?;
         event(&mut tx,pid,"aggregate_children","succeeded",json!({"total":candidates.len(),"failed":failed})).await?;
         sqlx::query("UPDATE pipeline_runs SET research_state='succeeded',research_result=$2,research_finished_at=now(),updated_at=now() WHERE id=$1")

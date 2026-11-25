@@ -18,6 +18,8 @@ web_fault=os.getenv("VIDEOROLL_TEST_RAG_WEB_FAULT")=="true"
 page=os.getenv("VIDEOROLL_TEST_RAG_PAGE_DENIED")=="true"
 assert not page or web_fault
 multistep=os.getenv("VIDEOROLL_TEST_RAG_MULTISTEP")=="true"
+learning=os.getenv("VIDEOROLL_TEST_RAG_LEARNING")=="true"
+assert not learning or multistep
 wiki=os.getenv("VIDEOROLL_TEST_RAG_WIKI")=="true"
 wiki_fault=os.getenv("VIDEOROLL_TEST_RAG_WIKI_FAULT")=="true"
 assert not wiki_fault or wiki
@@ -78,7 +80,7 @@ class Handler(BaseHTTPRequestHandler):
                     if parallel:
                         result["terms"][0]["term"]="Rust compiler"
                         if web_fault or wiki:result["terms"][0]["need_search"]=False
-                        result["terms"].append({"term":"Fourth line","category":"task_context","scope":"task","priority":0.8,"need_rag":True,"need_search":True})
+                        result["terms"].append({"term":"Fourth line","category":"domain_jargon" if learning else "task_context","scope":"global" if learning else "task","priority":0.8,"need_rag":True,"need_search":True})
                     return self.reply_json({"choices":[{"message":{"content":json.dumps(result)}}]})
                 if "VideoRoll term specialist" in messages[0]["content"]:
                     assert parallel
@@ -165,7 +167,7 @@ server=ThreadingHTTPServer(("127.0.0.1",0),Handler)
 threading.Thread(target=server.serve_forever,daemon=True).start()
 base=f"http://127.0.0.1:{server.server_address[1]}"
 setting("subtitle.auto_profile",{"translate_enabled":True,"translate_provider":"openai","translate_model_provider_id":"legacy","translate_glossary":{"volts":"伏特"},"target_lang":"zh","bilingual":False,"auto_publish":False,"auto_publish_platforms":[],"auto_dub_p2":False,"burn_in":False})
-setting("subtitle.translate",{"default_batch_size":2,"default_enable_summary":True,"rag_enabled":True,"rag_auto_discover_terms":True,"rag_search_enabled":web_fault,"rag_wiki_enabled":wiki,"rag_agent_parallelism":2 if parallel else 1,"rag_domain":"electronics","openai":{"base_url":base+"/v1","model":"fixture-translation","api_key_enc":"dbplain:v1:fixture-translation-key"}})
+setting("subtitle.translate",{"default_batch_size":2,"default_enable_summary":True,"rag_enabled":True,"rag_auto_discover_terms":True,"rag_auto_learn_terms":learning,"rag_search_enabled":web_fault,"rag_wiki_enabled":wiki,"rag_agent_parallelism":2 if parallel else 1,"rag_domain":"electronics","openai":{"base_url":base+"/v1","model":"fixture-translation","api_key_enc":"dbplain:v1:fixture-translation-key"}})
 setting("subtitle.rag",{"enabled":False,"research_blocking":parallel,"page_text_enabled":page,"max_research_steps":2,"max_web_searches":2 if web_fault else 0,"web_search_endpoint":base+"/search" if web_fault else None})
 setting("youtube.settings",{"home_scan_enabled":False})
 env={k:v for k,v in os.environ.items() if k in ("PATH","HOME","LANG","LC_ALL","LD_LIBRARY_PATH","DATABASE_URL","VIDEOROLL_V2_STORAGE_ROOT","VIDEOROLL_V2_INTERNAL_TOKEN","INTERNAL_API_SECRET")}
@@ -180,8 +182,10 @@ with db() as c:
     c.execute("INSERT INTO tasks(id,source_type,source_license,status,runtime_owner,retry_count) VALUES(%s,'local','own','downloaded','python',0)",(task,))
     c.execute("INSERT INTO assets(id,task_id,kind,storage_key,sha256,size_bytes) VALUES(%s,%s,'video_raw',%s,%s,%s)",(uuid.uuid4(),task,key,hashlib.sha256(video.read_bytes()).hexdigest(),video.stat().st_size))
     dynamic_id=uuid.uuid4()
+    if learning:
+        c.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_translation_terms_lang_domain_norm ON translation_knowledge_items(target_lang,domain,normalized_term) WHERE item_type='term' AND normalized_term<>''")
     for ident,translation,status in [(dynamic_id,"fixture-original-compiler","approved"),(uuid.uuid4(),"fixture-pending","pending")]:
-        c.execute("INSERT INTO translation_knowledge_items(id,item_type,term,normalized_term,translation,target_lang,domain,status,confidence) VALUES(%s,'term','Rust compiler','rust compiler',%s,'zh','electronics',%s,1)",(ident,translation,status))
+        c.execute("INSERT INTO translation_knowledge_items(id,item_type,term,normalized_term,translation,target_lang,domain,status,confidence) VALUES(%s,'term','Rust compiler','rust compiler',%s,'zh',%s,%s,1)",(ident,translation,"medical" if learning and status=="pending" else "electronics",status))
     extra_id=uuid.uuid4()
     if multistep:
         c.execute("INSERT INTO translation_knowledge_items(id,item_type,term,normalized_term,translation,target_lang,domain,status,confidence) VALUES(%s,'term','Fourth line context','fourth line context','fixture-extra-context','zh','electronics','approved',1)",(extra_id,))
@@ -245,7 +249,7 @@ try:
     with db() as c:
         state,plan,result=c.execute("SELECT research_state,research_plan,research_result FROM pipeline_runs WHERE task_id=%s AND engine='rust-v2'",(task,)).fetchone()
         assert state=="succeeded" and plan["gate_completed"],(state,plan)
-        assert c.execute("SELECT count(*) FROM translation_knowledge_items").fetchone()[0]==(3 if multistep else 2)
+        assert c.execute("SELECT count(*) FROM translation_knowledge_items").fetchone()[0]==(4 if learning else (3 if multistep else 2))
         if parallel:
             assert (web_fault or wiki_fault or peak==2) and child_calls=={"Rust compiler":1,"Fourth line":1 if (web_fault or wiki_fault) else (3 if multistep else 2)} and research_calls==["gate"],(peak,child_calls,research_calls)
             assert len(plan["gate_candidates"])==2 and plan["parallelism"]==2
@@ -265,6 +269,19 @@ try:
             assert parent[2]["wiki_calls"]==(2 if wiki_fault else int(wiki)) and parent[2]["wiki_budget"]==(2 if wiki else 0),parent
             assert wiki_calls==(["Fourth line"]*(2 if wiki_fault else int(wiki))),wiki_calls
             assert parent[2]["page_calls"]==int(page) and parent[2]["page_budget"]==(2 if page else 0),parent
+            if learning:
+                assert c.execute("SELECT translation,status,created_by FROM translation_knowledge_items WHERE id=%s",(dynamic_id,)).fetchone()==("fixture-original-compiler","approved","manual")
+                learned=c.execute("SELECT id,translation,status,created_by,confidence,sources,last_verified_at,embedding IS NULL FROM translation_knowledge_items WHERE normalized_term='fourth line' AND domain='electronics' AND target_lang='zh'").fetchone()
+                assert learned and learned[1:5]==("第四句","pending","agent",0.0) and learned[6] is None and learned[7],learned
+                assert learned[5][0]["knowledge_item_id"]==str(extra_id) and learned[5][0]["task_id"]==str(task),learned
+                assert c.execute("SELECT knowledge_item_id FROM translation_agent_runs WHERE parent_agent_run_id=%s AND term='Fourth line'",(master,)).fetchone()[0]==learned[0]
+                decisions={v["term"]:v for v in result["knowledge_learning"]}
+                assert decisions["Rust compiler"]["reason"]=="existing_term" and decisions["Fourth line"]["status"]=="pending",decisions
+                assert str(learned[0]) not in meta["rag_evidence_ids"],meta
+                assert c.execute("SELECT count(*) FROM translation_agent_events WHERE run_id=%s AND action='knowledge_learning'",(master,)).fetchone()[0]==2
+                print("PASS: original unique term index, pending candidate provenance and agent linkage; approved term unchanged, no duplicate learning on stage retry",flush=True)
+            else:
+                assert result["knowledge_learning"]==[],result
             if page:
                 assert c.execute("SELECT count(*) FROM translation_agent_runs WHERE parent_agent_run_id=%s AND checkpoint->'page_receipt'='null'::jsonb",(master,)).fetchone()[0]==1
                 assert c.execute("SELECT count(*) FROM translation_agent_events e JOIN translation_agent_runs r ON r.id=e.run_id WHERE r.parent_agent_run_id=%s AND e.action='page_text' AND e.status='skipped'",(master,)).fetchone()[0]==1
