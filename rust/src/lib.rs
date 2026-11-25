@@ -52,6 +52,7 @@ pub mod publish_meta;
 pub mod publish_platforms;
 pub mod publish_review;
 pub mod rag;
+mod rag_original_v1;
 pub mod realtime;
 pub mod remote_api_settings_v1;
 pub mod remote_auto_youtube_v1;
