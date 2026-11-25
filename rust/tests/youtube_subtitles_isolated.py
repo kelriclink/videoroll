@@ -210,6 +210,87 @@ try:
     for vid in ("NOTRACK0001","PROBEFAIL01","WRONGID0001"):assert ids.count(vid)==1,(vid,ids)
     for vid in ("DOWNLOADF01","EMPTYTRACK1","OUTOFRANGE1"):assert ids.count(vid)==2,(vid,ids)
     print("PASS: no-track, probe/download failure, empty/out-of-range/wrong-video captions fallback to ASR; off and local skip yt-dlp",flush=True)
+    stop(worker)
+    def legacy_fixture(final=True):
+        t=uuid.uuid4();raw=f"v2/raw/{t}/raw.mp4";p=root/raw;p.parent.mkdir(parents=True)
+        subprocess.run(["ffmpeg","-nostdin","-v","error","-f","lavfi","-i","color=blue:s=320x180:r=10:d=2","-c:v","libx264","-y",str(p)],check=True,timeout=20)
+        def artifact(role,cues):
+            body=json.dumps(cues,ensure_ascii=False).encode();sha=hashlib.sha256(body).hexdigest()
+            key=f"sub/{t}/{role}_{sha[:16]}_{uuid.uuid4().hex[:12]}.json"
+            path=root/key;path.parent.mkdir(parents=True,exist_ok=True);path.write_bytes(body)
+            return key,sha,len(body)
+        src,sha,size=artifact("segments",[{"start":0.1,"end":0.8,"text":"legacy English"},{"start":0.9,"end":1.6,"text":"second cue"}])
+        final_key,_,_=artifact("subtitle_segments",[{"start":0.1,"end":0.8,"text":"历史译文","secondary_text":"legacy English"},{"start":0.9,"end":1.6,"text":"第二句"}])
+        artifacts={"source_segments_key":src}
+        if final:artifacts["final_subtitle_segments_key"]=final_key
+        req={"task_id":str(t),"input":{"type":"storage","key":raw},"translate":{"enabled":True},"artifacts":artifacts}
+        with db() as c:
+            c.execute("INSERT INTO tasks(id,source_type,source_license,status,runtime_owner) VALUES(%s,'local','own','failed','rust')",(t,))
+            c.execute("INSERT INTO assets(id,task_id,kind,storage_key,sha256,size_bytes) VALUES(%s,%s,'video_raw',%s,%s,%s)",(uuid.uuid4(),t,raw,hashlib.sha256(p.read_bytes()).hexdigest(),p.stat().st_size))
+            c.execute("INSERT INTO assets(id,task_id,kind,storage_key,sha256,size_bytes) VALUES(%s,%s,'segments_json',%s,%s,%s)",(uuid.uuid4(),t,src,sha,size))
+            c.execute("INSERT INTO subtitle_jobs(id,task_id,status,request_json) VALUES(%s,%s,'failed',%s)",(uuid.uuid4(),t,json.dumps(req)))
+            if final:
+                old_srt=f"sub/{t}/old.srt";(root/old_srt).write_text("1\n00:00:00,100 --> 00:00:00,800\nSTALE\n")
+                c.execute("INSERT INTO assets(id,task_id,kind,storage_key) VALUES(%s,%s,'subtitle_srt',%s),(%s,%s,'video_final',%s)",(uuid.uuid4(),t,old_srt,uuid.uuid4(),t,raw))
+        payload={"task_id":str(t),"input":{"type":"storage","key":raw},"resume":True,"runtime_profile":False,"prefer_youtube_subtitles":False,"translate":{"enabled":True,"provider":"mock","target_lang":"zh"},"output":{"render":{"burn_in":True,"video_codec":"h264","use_intel_gpu":False}},"artifacts":artifacts}
+        return t,payload,src,final_key
+    src_task,src_payload,src_key,_=legacy_fixture(False)
+    end_task,end_payload,end_src,end_key=legacy_fixture(True)
+    bad_task,bad_payload,bad_src,_=legacy_fixture(False)
+    for t,p in [(src_task,src_payload),(end_task,end_payload),(bad_task,bad_payload)]:
+        code,r=api("/subtitle/jobs",p);assert code==200,(code,r)
+        code,replay=api("/subtitle/jobs",p);assert code==200 and replay==r,(code,replay)
+    foreign_task,foreign_payload,_,_=legacy_fixture(False)
+    code,bad=api("/subtitle/jobs",{**foreign_payload,"artifacts":{"source_segments_key":src_key}})
+    assert code==409,(code,bad)
+    code,bad=api("/subtitle/jobs",{**foreign_payload,"resume":False})
+    assert code in (400,422),(code,bad)
+    # Exercise the original task resume action on a separate proven snapshot.
+    action_task,action_payload,_,_=legacy_fixture(True)
+    code,r=api(f"/tasks/{action_task}/actions/subtitle_resume",{})
+    assert code==200,(code,r)
+    with db() as c:
+        c.execute("UPDATE operation_inbox SET max_attempts=1 WHERE task_id=%s AND stage='subtitle' AND runtime_engine='rust-v2'",(bad_task,))
+    # Tamper after admission; worker must fail without publishing a new subtitle.
+    (root/bad_src).write_bytes(b"[]")
+    before_asr=len(asr);before_calls=calls.read_bytes()
+    worker=start_worker(False)
+    first=inspect(src_task,"[zh] legacy English")
+    last=inspect(end_task,"历史译文")
+    inspect(action_task,"历史译文")
+    assert "[zh]" not in (root/last["srt_key"]).read_text()
+    md=json.loads((root/last["segments_key"]).read_text())
+    assert md["source"][0]["text"]=="legacy English" and md["translated"][0]["secondary_text"]=="legacy English" and md["translation"] is True
+    def rendered(t):
+        with db() as c:
+            row=c.execute("SELECT status,result_json FROM operation_inbox WHERE task_id=%s AND stage='render' AND runtime_engine='rust-v2'",(t,)).fetchone()
+        if row and row[0] in ("failed","unknown","canceled"):raise AssertionError(row)
+        return row[1] if row and row[0]=="succeeded" else None
+    for t in (src_task,end_task):
+        r=wait(lambda:rendered(t));assert r["storage_key"].startswith(f"v2/render/{t}/"),r
+    def refused():
+        with db() as c:
+            row=c.execute("SELECT status,last_error FROM operation_inbox WHERE task_id=%s AND stage='subtitle' AND runtime_engine='rust-v2'",(bad_task,)).fetchone()
+        return row if row and row[0]=="failed" else None
+    assert "digest" in wait(refused,90)[1]
+    def workflow_done(t):
+        with db() as c:
+            row=c.execute("SELECT state FROM vr2_workflows WHERE task_id=%s ORDER BY generation DESC LIMIT 1",(t,)).fetchone()
+            if row and row[0] in ("failed","unknown","canceled"):raise AssertionError((t,row))
+            return row and row[0]=="succeeded"
+    for t in (src_task,end_task,action_task):
+        wait(lambda:workflow_done(t),30)
+        with db() as c:
+            dub=c.execute("SELECT result_json FROM operation_inbox WHERE task_id=%s AND stage='dubbing' AND status='succeeded'",(t,)).fetchone()
+            assert dub and dub[0].get("skipped"),dub
+            assert c.execute("SELECT count(*) FROM publish_jobs WHERE task_id=%s",(t,)).fetchone()[0]==0
+    with db() as c:
+        assert c.execute("SELECT count(*) FROM assets WHERE task_id=%s AND kind::text IN ('subtitle_srt','subtitle_ass')",(bad_task,)).fetchone()[0]==0
+
+    assert len(asr)==before_asr and calls.read_bytes()==before_calls
+    assert (root/end_src).is_file() and (root/end_key).is_file()
+    print("PASS: historical original source and final snapshots resume natively, preserve bilingual/source timeline, new render generation, reject foreign/tampered artifacts without ASR or caption probe",flush=True)
+
 finally:
     for p,f in reversed(procs):
         if p.poll() is None:stop(p)
