@@ -28,7 +28,7 @@ export function RenderExecutions({
         <div className="mb-4">
           <div className="text-sm font-semibold text-slate-950 dark:text-white">执行记录</div>
           <div className="mt-1 text-xs text-slate-500">
-            每次重新执行都会留下独立记录；调度租约、内部 ID 和原始指标仅在技术详情中显示。
+            调度租约、内部 ID 和原始指标仅在技术详情中显示；Rust 执行的取消或重试请在任务工作流中操作。
           </div>
         </div>
 
@@ -56,7 +56,7 @@ export function RenderExecutions({
                       </span>
                     </td>
                     <td>
-                      <div>{execution.worker_name ?? "未知节点"}</div>
+                      <div>{execution.worker_name ?? (execution.worker_id ? "未知节点" : "等待分配")}</div>
                       {telemetry.deviceName ? <div className="mt-0.5 text-[11px] text-slate-500">{telemetry.deviceName}</div> : null}
                     </td>
                     <td>
@@ -90,7 +90,7 @@ export function RenderExecutions({
                           <Button
                             size="xs"
                             tone="danger"
-                            disabled={busy === execution.id}
+                            disabled={execution.control_supported === false || busy === execution.id}
                             onClick={() => onAction(execution, "cancel")}
                           >
                             取消
@@ -98,7 +98,7 @@ export function RenderExecutions({
                         ) : null}
                         <Button
                           size="xs"
-                          disabled={busy === execution.id || execution.state === "succeeded"}
+                          disabled={execution.control_supported === false || busy === execution.id || execution.state === "succeeded"}
                           onClick={() => onAction(execution, "requeue")}
                         >
                           重新执行

@@ -138,10 +138,10 @@ export function RenderWorkerCard({
               <Button
                 size="xs"
                 tone={device.enabled === false ? "primary" : "secondary"}
-                disabled={busy !== null || worker.stale || !worker.credential_active}
+                disabled={worker.device_control_supported === false || busy !== null || worker.stale || !worker.credential_active}
                 onClick={() => onDeviceAction(worker, device, device.enabled === false)}
               >
-                {device.enabled === false ? "允许分配新任务" : "停止分配新任务"}
+                {worker.device_control_supported === false ? "仅支持整节点调度" : device.enabled === false ? "允许分配新任务" : "停止分配新任务"}
               </Button>
             </div>
           ))}

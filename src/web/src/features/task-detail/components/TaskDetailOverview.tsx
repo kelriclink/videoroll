@@ -60,7 +60,7 @@ export function TaskDetailOverview({ controller }: { controller: TaskDetailContr
                 const telemetry = getRenderTelemetry(execution);
                 return <div key={execution.id} className="rounded-lg border border-sky-200 bg-sky-50/70 p-3 dark:border-sky-900 dark:bg-sky-950/20">
                   <div className="flex flex-wrap items-center justify-between gap-2">
-                    <div><div className="text-sm font-semibold">正在渲染 · {execution.worker_name ?? execution.worker_id.slice(0, 8)}</div><div className="mt-0.5 text-xs text-slate-500">{telemetry.encoder ?? "—"} · {telemetry.deviceName ?? telemetry.backend ?? "—"} · {renderStageLabel(telemetry.stage)}</div></div>
+                    <div><div className="text-sm font-semibold">正在渲染 · {execution.worker_name ?? execution.worker_id?.slice(0, 8) ?? "等待分配"}</div><div className="mt-0.5 text-xs text-slate-500">{telemetry.encoder ?? "—"} · {telemetry.deviceName ?? telemetry.backend ?? "—"} · {renderStageLabel(telemetry.stage)}</div></div>
                     <div className="flex flex-wrap gap-4 font-mono text-sm"><span>{formatRenderFps(telemetry.fps)}</span><span className="font-semibold text-sky-700">{formatRenderSpeed(telemetry.speed)}</span><span>预计 {formatRenderDuration(telemetry.etaSeconds)}</span></div>
                   </div>
                   <div className="mt-3 h-2.5 overflow-hidden rounded-full bg-slate-200 dark:bg-slate-800"><div className="h-full rounded-full bg-sky-500 transition-all" style={{ width: `${telemetry.overallProgress}%` }} /></div>

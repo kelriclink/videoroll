@@ -175,6 +175,14 @@ if [[ "${VIDEOROLL_V2_TEST_LOCAL_INFERENCE_ONLY:-false}" == "true" ]]; then
   PYTHONPATH="$repo_root/src" /opt/videoroll/venvs/core/bin/python "$repo_root/rust/tests/local_inference_isolated.py"
   exit 0
 fi
+if [[ "${VIDEOROLL_V2_TEST_RENDER_ADMIN_ONLY:-false}" == "true" ]]; then
+  export VIDEOROLL_V2_INTERNAL_TOKEN="isolated-render-admin-token-0123456789"
+  export VIDEOROLL_V2_STORAGE_ROOT="$(mktemp -d "$repo_root/rust/target/v2-render-admin.XXXXXX")"
+  "$CARGO_HOME/bin/cargo" build --manifest-path "$repo_root/rust/Cargo.toml" --bin videoroll-v2 --locked --offline --quiet
+  "$repo_root/rust/target/debug/videoroll-v2" migrate
+  /opt/videoroll/venvs/core/bin/python "$repo_root/rust/tests/render_admin_native_isolated.py"
+  exit 0
+fi
 if [[ "${VIDEOROLL_V2_TEST_NATIVE_DEPLOYMENT_ONLY:-false}" == "true" ]]; then
   export VIDEOROLL_V2_INTERNAL_TOKEN="isolated-native-deploy-token-0123456789"
   export VIDEOROLL_V2_STORAGE_ROOT="$(mktemp -d "$repo_root/rust/target/v2-native-deploy.XXXXXX")"

@@ -5,7 +5,10 @@
 use crate::{
     AppError, AppResult,
     api::AppState,
-    render_management_read_v1::{EXEC_SQL, execution_payload, worker_payload},
+    render_management_read_v1::{
+        EXEC_SQL, WORKER_SQL, execution_payload, management_engine, native_management,
+        worker_payload,
+    },
 };
 use axum::{
     Json, Router,
@@ -22,6 +25,9 @@ use std::collections::BTreeSet;
 use uuid::Uuid;
 
 fn can_write() -> AppResult<()> {
+    if native_management() {
+        return Ok(());
+    }
     if !matches!(
         std::env::var("VIDEOROLL_V2_ALLOW_V1_RENDER_CONTROL")
             .ok()
@@ -33,15 +39,18 @@ fn can_write() -> AppResult<()> {
     Ok(())
 }
 async fn worker_lock(tx: &mut Transaction<'_, Postgres>, id: Uuid) -> AppResult<PgRow> {
-    sqlx::query("SELECT * FROM render_workers WHERE id=$1 AND runtime_engine='python' FOR UPDATE")
+    sqlx::query("SELECT * FROM render_workers WHERE id=$1 AND runtime_engine=$2 FOR UPDATE")
         .bind(id)
+        .bind(management_engine())
         .fetch_optional(&mut **tx)
         .await?
         .ok_or_else(|| AppError::NotFound("render worker not found".into()))
 }
 async fn worker_read(state: &AppState, id: Uuid) -> AppResult<Json<Value>> {
-    let row = sqlx::query("SELECT * FROM render_workers WHERE id=$1 AND runtime_engine='python'")
+    let query = format!("{WORKER_SQL} WHERE w.id=$1 AND w.runtime_engine=$2");
+    let row = sqlx::query(&query)
         .bind(id)
+        .bind(management_engine())
         .fetch_one(&state.db.pool)
         .await?;
     Ok(Json(worker_payload(&row)?))
@@ -118,6 +127,12 @@ async fn device_update(
     Json(p): Json<DevicePatch>,
 ) -> AppResult<Json<Value>> {
     can_write()?;
+    if native_management() {
+        return Err(AppError::Conflict(
+            "native render device scheduling is not yet supported; drain the entire worker instead"
+                .into(),
+        ));
+    }
     if device.is_empty() || device.len() > 256 {
         return Err(AppError::Invalid("render device ID is invalid".into()));
     }
@@ -208,18 +223,24 @@ async fn enrollment_create(
             "label must be <=128 bytes, ttl_minutes 5..1440".into(),
         ));
     }
-    let token = format!("vre_{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+    let raw = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+    let token = if native_management() {
+        raw
+    } else {
+        format!("vre_{raw}")
+    };
     let hash = hex::encode(Sha256::digest(token.as_bytes()));
     let id = Uuid::new_v4();
     let expiry: DateTime<Utc> = sqlx::query_scalar(
-        "INSERT INTO render_worker_enrollments(id,token_hash,label,status,expires_at)
-         VALUES ($1,$2,$3,'active',now()+($4*interval '1 minute'))
+        "INSERT INTO render_worker_enrollments(id,token_hash,label,status,expires_at,runtime_engine)
+         VALUES ($1,$2,$3,'active',now()+($4*interval '1 minute'),$5)
          RETURNING expires_at",
     )
     .bind(id)
     .bind(hash)
     .bind(label)
     .bind(ttl)
+    .bind(management_engine())
     .fetch_one(&state.db.pool)
     .await?;
     let origin = crate::management_v1::render_server_url(&state.db, &headers).await?;
@@ -233,10 +254,11 @@ async fn enrollment_revoke(
     can_write()?;
     let row = sqlx::query(
         "UPDATE render_worker_enrollments SET status=CASE WHEN status='active'
-         THEN 'revoked' ELSE status END WHERE id=$1 AND runtime_engine='python'
+         THEN 'revoked' ELSE status END WHERE id=$1 AND runtime_engine=$2
        RETURNING id,label,status,expires_at,consumed_at,worker_id,created_at",
     )
     .bind(id)
+    .bind(management_engine())
     .fetch_optional(&state.db.pool)
     .await?
     .ok_or_else(|| AppError::NotFound("render worker enrollment not found".into()))?;
@@ -270,6 +292,9 @@ async fn execution_change(
     requeue: bool,
 ) -> AppResult<Json<Value>> {
     can_write()?;
+    if native_management() {
+        return Err(AppError::Conflict("native render execution control requires restarting or canceling the task workflow; historical executions are read-only".into()));
+    }
     let mut tx = state.db.pool.begin().await?;
     let task_id:Uuid=sqlx::query_scalar("SELECT j.task_id FROM render_executions e JOIN render_jobs j ON j.id=e.render_job_id WHERE e.id=$1 AND e.runtime_engine='python'")
         .bind(id).fetch_optional(&mut *tx).await?.ok_or_else(||AppError::NotFound("render execution not found".into()))?;
