@@ -86,11 +86,11 @@ export function RenderExecutions({
                     <td>{ago(execution.started_at)}</td>
                     <td>
                       <div className="flex gap-1" onClick={(event) => event.stopPropagation()}>
-                        {ACTIVE_RENDER_STATES.has(execution.state) ? (
+                        {(ACTIVE_RENDER_STATES.has(execution.state) || execution.cancel_supported === true) ? (
                           <Button
                             size="xs"
                             tone="danger"
-                            disabled={execution.control_supported === false || busy === execution.id}
+                            disabled={(execution.cancel_supported ?? execution.control_supported) === false || busy === execution.id}
                             onClick={() => onAction(execution, "cancel")}
                           >
                             取消
@@ -98,7 +98,7 @@ export function RenderExecutions({
                         ) : null}
                         <Button
                           size="xs"
-                          disabled={execution.control_supported === false || busy === execution.id || execution.state === "succeeded"}
+                          disabled={(execution.requeue_supported ?? execution.control_supported) === false || busy === execution.id || execution.state === "succeeded"}
                           onClick={() => onAction(execution, "requeue")}
                         >
                           重新执行

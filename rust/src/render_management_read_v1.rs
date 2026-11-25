@@ -169,9 +169,12 @@ pub(crate) fn execution_payload(row: &PgRow) -> AppResult<Value> {
     });
     if native_management() {
         result["runtime_engine"] = json!(row.try_get::<String, _>("runtime_engine")?);
-        // Native administrative cancellation/requeue requires scheduler
-        // fencing and receipt reconciliation, not a legacy SQL mutation.
-        result["control_supported"] = json!(false);
+        let cancel: bool = row.try_get("native_control_safe")?;
+        let requeue =
+            cancel && row.try_get::<i32, _>("attempt")? < crate::remote_render::MAX_RENDER_ATTEMPTS;
+        result["control_supported"] = json!(cancel || requeue);
+        result["cancel_supported"] = json!(cancel);
+        result["requeue_supported"] = json!(requeue);
     }
     Ok(result)
 }
@@ -182,11 +185,20 @@ pub(crate) const EXEC_SQL: &str = r#"
            e.metrics,e.log_tail,e.error_message,
            CASE WHEN e.runtime_engine='rust-v2' AND e.state IN ('running','uploading') THEN e.updated_at ELSE e.heartbeat_at END AS heartbeat_at,
            e.started_at,e.finished_at,e.created_at,e.runtime_engine,
-           w.name AS worker_name,COALESCE(j.task_id,e.task_id) AS task_id,COALESCE(j.status::text,o.status) AS job_status
+           w.name AS worker_name,COALESCE(j.task_id,e.task_id) AS task_id,COALESCE(j.status::text,o.status) AS job_status,
+           COALESCE(e.runtime_engine='rust-v2' AND e.uploaded_asset_id IS NULL
+             AND (e.state='queued' OR (e.state IN ('running','uploading') AND e.lease_until<=now()))
+             AND o.status='awaiting' AND o.stage='render' AND o.external_ticket=e.id::text
+             AND o.task_id=e.task_id AND o.workflow_id=e.workflow_id
+             AND f.engine='rust-v2' AND f.task_id=e.task_id AND f.state='running' AND f.current_stage='render'
+             AND t.runtime_owner='rust' AND t.status::text NOT IN ('canceled','failed','published','publishing')
+             AND NOT EXISTS(SELECT 1 FROM operation_inbox other WHERE other.workflow_id=e.workflow_id AND other.runtime_engine='rust-v2' AND other.id<>e.job_id AND other.status IN ('pending','running','awaiting','unknown')),false) AS native_control_safe
     FROM render_executions e
     LEFT JOIN render_workers w ON w.id=e.worker_id
     LEFT JOIN render_jobs j ON j.id=e.render_job_id
     LEFT JOIN operation_inbox o ON o.id=e.job_id AND o.runtime_engine='rust-v2'
+    LEFT JOIN pipeline_runs f ON f.id=e.workflow_id
+    LEFT JOIN tasks t ON t.id=e.task_id
 "#;
 #[derive(Deserialize)]
 struct ExecutionFilter {

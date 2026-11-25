@@ -1,5 +1,5 @@
 """Original browser management on real Rust API + disposable PostgreSQL."""
-import json, os, socket, subprocess, time, uuid
+import concurrent.futures, json, os, socket, subprocess, time, uuid
 from pathlib import Path
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
@@ -106,7 +106,9 @@ try:
     assert items[queued[2]]["worker_id"] is None and items[queued[2]]["render_job_id"]==queued[1]
     assert items[completed[2]]["state"]=="succeeded"
     assert items[historical]["runtime_engine"]=="python"
-    assert all(not r["control_supported"] for r in rows)
+    assert items[queued[2]]["cancel_supported"] and items[queued[2]]["requeue_supported"]
+    assert items[expired[2]]["cancel_supported"] and items[expired[2]]["requeue_supported"]
+    assert all(not items[x]["control_supported"] for x in (live[2],completed[2],historical))
     assert ok("GET",mgmt+"/executions/"+live[2])["task_id"]==live[0]
     assert [r["id"] for r in ok("GET",mgmt+"/executions?state=succeeded")]==[completed[2]]
     assert [r["id"] for r in ok("GET",mgmt+"/executions?task_id="+queued[0])]==[queued[2]]
@@ -119,7 +121,45 @@ try:
         assert c.execute("SELECT state FROM render_executions WHERE id=%s",(live[2],)).fetchone()[0]=="running"
         assert c.execute("SELECT state FROM render_executions WHERE id=%s",(historical,)).fetchone()[0]=="failed"
         assert c.execute("SELECT count(*) FROM outbox_events").fetchone()[0]==0
-    print("PASS: queued/native active+expired/completed and original historical execution reads, filters, real lease count, no unsafe legacy requeue",flush=True)
+    # Retry preserves attempt budget; repeated requests do not enqueue a second job.
+    requeue_path=mgmt+"/executions/"+expired[2]+"/requeue"
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+        results=list(pool.map(lambda _:call("POST",requeue_path,{"reason":"expired fixture"}),range(3)))
+    assert all(code==200 and data["state"]=="queued" for code,data in results),results
+    with db() as c:
+        assert c.execute("SELECT state,attempt,worker_id,fence_token,lease_until FROM render_executions WHERE id=%s",(expired[2],)).fetchone()==("queued",1,None,None,None)
+        assert c.execute("SELECT status FROM operation_inbox WHERE id=%s",(expired[1],)).fetchone()[0]=="awaiting"
+        assert c.execute("SELECT count(*) FROM workflow_events WHERE job_id=%s AND kind='render.admin_requeued'",(expired[1],)).fetchone()[0]==1
+    # A canceled workflow is never silently requeued. Repeated cancellation is idempotent.
+    cancel_path=mgmt+"/executions/"+queued[2]+"/cancel"
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+        results=list(pool.map(lambda _:call("POST",cancel_path,{"reason":"cancel fixture"}),range(3)))
+    assert all(code==200 and data["state"]=="canceled" for code,data in results),results
+    assert call("POST",mgmt+"/executions/"+queued[2]+"/requeue",{})[0]==409
+    exhausted=native("running",-300)
+    uploaded=native("uploading",-300)
+    foreign=native("queued",None)
+    with db() as c:
+        c.execute("UPDATE render_executions SET attempt=5 WHERE id=%s",(exhausted[2],))
+        asset=uuid.uuid4()
+        c.execute("INSERT INTO assets(id,task_id,kind,storage_key) VALUES(%s,%s,'video_final',%s)",(asset,uploaded[0],"isolated/"+str(asset)))
+        c.execute("UPDATE render_executions SET uploaded_asset_id=%s WHERE id=%s",(asset,uploaded[2]))
+        c.execute("UPDATE operation_inbox SET external_ticket='different' WHERE id=%s",(foreign[1],))
+        assert c.execute("SELECT status::text FROM tasks WHERE id=%s",(queued[0],)).fetchone()[0]=="canceled"
+        assert c.execute("SELECT status FROM operation_inbox WHERE id=%s",(queued[1],)).fetchone()[0]=="canceled"
+        assert c.execute("SELECT count(*) FROM workflow_events WHERE job_id=%s AND kind='workflow.canceled'",(queued[1],)).fetchone()[0]==1
+        assert c.execute("SELECT state FROM pipeline_runs WHERE id=(SELECT workflow_id FROM operation_inbox WHERE id=%s)",(queued[1],)).fetchone()[0]=="canceled"
+    for item in (uploaded,foreign):
+        data=ok("GET",mgmt+"/executions/"+item[2]); assert not data["control_supported"]
+        for action in ("cancel","requeue"):
+            assert call("POST",mgmt+"/executions/"+item[2]+"/"+action,{})[0]==409
+    data=ok("GET",mgmt+"/executions/"+exhausted[2]); assert data["cancel_supported"] and not data["requeue_supported"]
+    assert call("POST",mgmt+"/executions/"+exhausted[2]+"/requeue",{})[0]==409
+    assert call("POST",mgmt+"/executions/"+completed[2]+"/cancel",{})[0]==409
+    assert call("POST",mgmt+"/executions/"+live[2]+"/requeue",{})[0]==409
+    with db() as c:
+        assert c.execute("SELECT count(*) FROM outbox_events").fetchone()[0]==0
+    print("PASS: native queued cancel and expired requeue are atomic/idempotent; live lease, uploaded output, exhausted budget, foreign ticket, completed and Python rows protected",flush=True)
     revoked_worker=ok("POST",mgmt+"/workers/"+worker+"/revoke-credential",{})
     assert not revoked_worker["credential_active"] and not revoked_worker["enabled"]
     assert call("POST","/render-workers/v1/"+worker+"/heartbeat",{

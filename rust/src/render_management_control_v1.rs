@@ -281,9 +281,148 @@ fn active(state: &str) -> bool {
     matches!(state, "claimed" | "running" | "uploading")
 }
 async fn execution_read(state: &AppState, id: Uuid) -> AppResult<Json<Value>> {
-    let sql = format!("{EXEC_SQL} WHERE e.id=$1 AND e.runtime_engine='python'");
-    let row = sqlx::query(&sql).bind(id).fetch_one(&state.db.pool).await?;
+    let sql = format!("{EXEC_SQL} WHERE e.id=$1 AND e.runtime_engine=$2");
+    let row = sqlx::query(&sql)
+        .bind(id)
+        .bind(management_engine())
+        .fetch_one(&state.db.pool)
+        .await?;
     Ok(Json(execution_payload(&row)?))
+}
+// Only operate on an exact native awaiting render stage. Never reset a live
+// worker, a registered output, a historical execution, or a completed receipt.
+async fn native_execution_change(
+    state: &AppState,
+    id: Uuid,
+    reason: &str,
+    requeue: bool,
+) -> AppResult<Json<Value>> {
+    let mut tx = state.db.pool.begin().await?;
+    let peek = sqlx::query(
+        "SELECT task_id,workflow_id,job_id,runtime_engine FROM render_executions WHERE id=$1",
+    )
+    .bind(id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| AppError::NotFound("render execution not found".into()))?;
+    if peek.try_get::<String, _>("runtime_engine")? != "rust-v2" {
+        return Err(AppError::Conflict(
+            "historical render executions are read-only".into(),
+        ));
+    }
+    let task: Uuid = peek.try_get("task_id")?;
+    let flow: Uuid = peek.try_get("workflow_id")?;
+    let job: Uuid = peek.try_get("job_id")?;
+    // Same lock order as scheduler and upload: task -> workflow -> job -> execution.
+    let task_row = sqlx::query(
+        "SELECT runtime_owner,status::text AS status FROM tasks WHERE id=$1 FOR UPDATE",
+    )
+    .bind(task)
+    .fetch_one(&mut *tx)
+    .await?;
+    let flow_row = sqlx::query("SELECT state,current_stage FROM pipeline_runs WHERE id=$1 AND task_id=$2 AND engine='rust-v2' FOR UPDATE")
+        .bind(flow).bind(task).fetch_optional(&mut *tx).await?
+        .ok_or_else(|| AppError::Conflict("render workflow identity mismatch".into()))?;
+    let job_row = sqlx::query("SELECT status,external_ticket FROM operation_inbox WHERE id=$1 AND task_id=$2 AND workflow_id=$3 AND stage='render' AND runtime_engine='rust-v2' FOR UPDATE")
+        .bind(job).bind(task).bind(flow).fetch_optional(&mut *tx).await?
+        .ok_or_else(|| AppError::Conflict("render job identity mismatch".into()))?;
+    let row = sqlx::query("SELECT state,attempt,uploaded_asset_id,COALESCE(lease_until<=now(),false) AS expired FROM render_executions WHERE id=$1 AND task_id=$2 AND workflow_id=$3 AND job_id=$4 AND runtime_engine='rust-v2' FOR UPDATE")
+        .bind(id).bind(task).bind(flow).bind(job).fetch_optional(&mut *tx).await?
+        .ok_or_else(|| AppError::Conflict("render execution identity mismatch".into()))?;
+    let execution_state: String = row.try_get("state")?;
+    let flow_state: String = flow_row.try_get("state")?;
+    let job_state: String = job_row.try_get("status")?;
+    if task_row.try_get::<String, _>("runtime_owner")? != "rust"
+        || job_row
+            .try_get::<Option<String>, _>("external_ticket")?
+            .as_deref()
+            != Some(id.to_string().as_str())
+    {
+        return Err(AppError::Conflict(
+            "render ownership or ticket mismatch".into(),
+        ));
+    }
+    if !requeue
+        && execution_state == "canceled"
+        && flow_state == "canceled"
+        && job_state == "canceled"
+    {
+        tx.commit().await?;
+        return execution_read(state, id).await;
+    }
+    let task_status: String = task_row.try_get("status")?;
+    let safe_state = execution_state == "queued"
+        || (matches!(execution_state.as_str(), "running" | "uploading")
+            && row.try_get::<bool, _>("expired")?);
+    if !safe_state
+        || row
+            .try_get::<Option<Uuid>, _>("uploaded_asset_id")?
+            .is_some()
+        || flow_state != "running"
+        || flow_row
+            .try_get::<Option<String>, _>("current_stage")?
+            .as_deref()
+            != Some("render")
+        || job_state != "awaiting"
+        || matches!(
+            task_status.as_str(),
+            "canceled" | "failed" | "published" | "publishing"
+        )
+    {
+        return Err(AppError::Conflict("render control requires queued or expired execution without uploaded output in a running render stage".into()));
+    }
+    let other_active: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM operation_inbox WHERE workflow_id=$1 AND runtime_engine='rust-v2' AND id<>$2 AND status IN ('pending','running','awaiting','unknown'))")
+        .bind(flow).bind(job).fetch_one(&mut *tx).await?;
+    if other_active {
+        return Err(AppError::Conflict(
+            "another workflow stage is active or uncertain".into(),
+        ));
+    }
+    if requeue {
+        if row.try_get::<i32, _>("attempt")? >= crate::remote_render::MAX_RENDER_ATTEMPTS {
+            return Err(AppError::Conflict(
+                "render retry budget exhausted; restart the task workflow".into(),
+            ));
+        }
+        if execution_state == "queued" {
+            tx.commit().await?;
+            return execution_read(state, id).await;
+        }
+        sqlx::query("UPDATE render_executions SET state='queued',worker_id=NULL,fence_token=NULL,lease_until=NULL,progress=0,finished_at=NULL,error_message=$2,updated_at=now() WHERE id=$1")
+            .bind(id).bind(reason).execute(&mut *tx).await?;
+    } else {
+        sqlx::query("UPDATE render_executions SET state='canceled',lease_until=NULL,finished_at=now(),error_message=$2,updated_at=now() WHERE id=$1")
+            .bind(id).bind(reason).execute(&mut *tx).await?;
+        sqlx::query("UPDATE vr2_jobs SET state='canceled',lease_token=NULL,lease_until=NULL,last_error=$2,finished_at=now(),updated_at=now() WHERE id=$1")
+            .bind(job).bind(reason).execute(&mut *tx).await?;
+        sqlx::query(
+            "UPDATE vr2_workflows SET state='canceled',last_error=$2,updated_at=now() WHERE id=$1",
+        )
+        .bind(flow)
+        .bind(reason)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("UPDATE tasks SET status='canceled'::task_status,updated_at=now() WHERE id=$1")
+            .bind(task)
+            .execute(&mut *tx)
+            .await?;
+    }
+    sqlx::query(
+        "INSERT INTO workflow_events(id,workflow_id,job_id,kind,details) VALUES($1,$2,$3,$4,$5)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(flow)
+    .bind(job)
+    .bind(if requeue {
+        "render.admin_requeued"
+    } else {
+        "workflow.canceled"
+    })
+    .bind(json!({"execution_id":id,"reason":reason}))
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    execution_read(state, id).await
 }
 async fn execution_change(
     state: &AppState,
@@ -293,7 +432,7 @@ async fn execution_change(
 ) -> AppResult<Json<Value>> {
     can_write()?;
     if native_management() {
-        return Err(AppError::Conflict("native render execution control requires restarting or canceling the task workflow; historical executions are read-only".into()));
+        return native_execution_change(state, id, reason, requeue).await;
     }
     let mut tx = state.db.pool.begin().await?;
     let task_id:Uuid=sqlx::query_scalar("SELECT j.task_id FROM render_executions e JOIN render_jobs j ON j.id=e.render_job_id WHERE e.id=$1 AND e.runtime_engine='python'")
