@@ -15,6 +15,8 @@ def setting(k,v):
     with db() as c:c.execute("INSERT INTO app_settings(key,value_json) VALUES(%s,%s) ON CONFLICT(key) DO UPDATE SET value_json=EXCLUDED.value_json",(k,json.dumps(v)))
 parallel=os.getenv("VIDEOROLL_TEST_PARALLEL_RAG")=="true"
 web_fault=os.getenv("VIDEOROLL_TEST_RAG_WEB_FAULT")=="true"
+page=os.getenv("VIDEOROLL_TEST_RAG_PAGE_DENIED")=="true"
+assert not page or web_fault
 multistep=os.getenv("VIDEOROLL_TEST_RAG_MULTISTEP")=="true"
 wiki=os.getenv("VIDEOROLL_TEST_RAG_WIKI")=="true"
 wiki_fault=os.getenv("VIDEOROLL_TEST_RAG_WIKI_FAULT")=="true"
@@ -55,7 +57,7 @@ class Handler(BaseHTTPRequestHandler):
                 child_failed=True
                 self.send_error(503,"injected search failure")
                 return
-            self.reply_json({"results":[{"title":"Fixture","url":"https://example.invalid/fixture","content":"fixture-web-evidence"}]})
+            self.reply_json({"results":[{"title":"Fixture","url":"https://127.0.0.1/fixture" if page else "https://example.invalid/fixture","content":"fixture-web-evidence"}]})
         except Exception as e:
             errors.append(repr(e));self.send_error(400)
     def do_POST(self):
@@ -164,7 +166,7 @@ threading.Thread(target=server.serve_forever,daemon=True).start()
 base=f"http://127.0.0.1:{server.server_address[1]}"
 setting("subtitle.auto_profile",{"translate_enabled":True,"translate_provider":"openai","translate_model_provider_id":"legacy","translate_glossary":{"volts":"伏特"},"target_lang":"zh","bilingual":False,"auto_publish":False,"auto_publish_platforms":[],"auto_dub_p2":False,"burn_in":False})
 setting("subtitle.translate",{"default_batch_size":2,"default_enable_summary":True,"rag_enabled":True,"rag_auto_discover_terms":True,"rag_search_enabled":web_fault,"rag_wiki_enabled":wiki,"rag_agent_parallelism":2 if parallel else 1,"rag_domain":"electronics","openai":{"base_url":base+"/v1","model":"fixture-translation","api_key_enc":"dbplain:v1:fixture-translation-key"}})
-setting("subtitle.rag",{"enabled":False,"research_blocking":parallel,"max_research_steps":2,"max_web_searches":2 if web_fault else 0,"web_search_endpoint":base+"/search" if web_fault else None})
+setting("subtitle.rag",{"enabled":False,"research_blocking":parallel,"page_text_enabled":page,"max_research_steps":2,"max_web_searches":2 if web_fault else 0,"web_search_endpoint":base+"/search" if web_fault else None})
 setting("youtube.settings",{"home_scan_enabled":False})
 env={k:v for k,v in os.environ.items() if k in ("PATH","HOME","LANG","LC_ALL","LD_LIBRARY_PATH","DATABASE_URL","VIDEOROLL_V2_STORAGE_ROOT","VIDEOROLL_V2_INTERNAL_TOKEN","INTERNAL_API_SECRET")}
 env.update(VIDEOROLL_V2_NATIVE_OUTBOX_ONLY="true",VIDEOROLL_V2_STANDALONE="true",VIDEOROLL_V2_SOURCE_SCANNER="false",VIDEOROLL_V2_ENABLE_NATIVE_BILIBILI="false",VIDEOROLL_V2_ENABLE_SAU_PUBLISH="false",VIDEOROLL_V2_ENABLE_LEGACY_PUBLISH="false",VIDEOROLL_V2_COMPAT_WRITE="false",VIDEOROLL_V2_REMOTE_RENDER="false",VIDEOROLL_V2_WORKERS="1",VIDEOROLL_V2_ASR_ENDPOINT=base+"/v1/audio/transcriptions",VIDEOROLL_V2_ASR_MODEL="whisper-fixture")
@@ -262,6 +264,12 @@ try:
             assert c.execute("SELECT count(*) FROM translation_agent_events e JOIN translation_agent_runs r ON r.id=e.run_id WHERE r.parent_agent_run_id=%s AND e.action='search_knowledge' AND e.status='succeeded'",(master,)).fetchone()[0]==2
             assert parent[2]["wiki_calls"]==(2 if wiki_fault else int(wiki)) and parent[2]["wiki_budget"]==(2 if wiki else 0),parent
             assert wiki_calls==(["Fourth line"]*(2 if wiki_fault else int(wiki))),wiki_calls
+            assert parent[2]["page_calls"]==int(page) and parent[2]["page_budget"]==(2 if page else 0),parent
+            if page:
+                assert c.execute("SELECT count(*) FROM translation_agent_runs WHERE parent_agent_run_id=%s AND checkpoint->'page_receipt'='null'::jsonb",(master,)).fetchone()[0]==1
+                assert c.execute("SELECT count(*) FROM translation_agent_events e JOIN translation_agent_runs r ON r.id=e.run_id WHERE r.parent_agent_run_id=%s AND e.action='page_text' AND e.status='skipped'",(master,)).fetchone()[0]==1
+                assert "fixture-web-evidence" in result["context"]["prompt"],result
+                print("PASS: private search-result page denied, skipped receipt preserved, original snippet retained",flush=True)
             if wiki:
                 receipt=c.execute("SELECT checkpoint->'wiki_receipt' FROM translation_agent_runs WHERE parent_agent_run_id=%s AND term='Fourth line'",(master,)).fetchone()[0]
                 assert len(receipt)==1 and receipt[0]["url"]=="https://en.wikipedia.org/?curid=123",receipt

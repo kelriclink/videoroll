@@ -407,6 +407,75 @@ async fn fetch(req: FetchRequest) -> Result<FetchResponse, Failure> {
     }
     Err(denied("egress redirect limit exceeded"))
 }
+// Internal research adapter. Reuse the same destination validation and pinned
+// transport as /fetch, but never expose arbitrary headers or redirects.
+pub(crate) async fn research_plain_text(raw: &str) -> crate::AppResult<Option<String>> {
+    let Ok((url, _, _)) = target(raw) else {
+        return Ok(None);
+    };
+    if url.query().is_some() || (url.scheme() != "https" && !research_test_url(&url)) {
+        return Ok(None);
+    }
+    let req = FetchRequest {
+        url: url.into(),
+        timeout: 12.0,
+        max_bytes: 500_000,
+        redirects: 0,
+        headers: BTreeMap::from([("accept".into(), "text/plain".into())]),
+    };
+    let response = match tokio::time::timeout(Duration::from_secs(12), fetch(req)).await {
+        Ok(Ok(v)) => v,
+        Ok(Err((StatusCode::FORBIDDEN, _))) => return Ok(None),
+        _ => {
+            return Err(crate::AppError::Unavailable(
+                "research page fetch unavailable".into(),
+            ));
+        }
+    };
+    if response.status_code >= 500 || response.status_code == 429 {
+        return Err(crate::AppError::Unavailable(
+            "research page temporarily unavailable".into(),
+        ));
+    }
+    if !(200..300).contains(&response.status_code) || response.truncated {
+        return Ok(None);
+    }
+    let mime = response
+        .headers
+        .get("content-type")
+        .map(String::as_str)
+        .unwrap_or("");
+    if !mime
+        .split(';')
+        .next()
+        .is_some_and(|s| s.trim().eq_ignore_ascii_case("text/plain"))
+    {
+        return Ok(None);
+    }
+    let bytes = STANDARD
+        .decode(response.body_base64)
+        .map_err(|_| crate::AppError::Unavailable("research page response invalid".into()))?;
+    Ok(clean_research_text(&bytes))
+}
+fn research_test_url(url: &Url) -> bool {
+    url.host_str() == Some("127.0.0.1")
+        && url
+            .port()
+            .is_some_and(|port| isolated_loopback(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), port))
+}
+fn clean_research_text(bytes: &[u8]) -> Option<String> {
+    let raw = std::str::from_utf8(bytes).ok()?;
+    if raw
+        .chars()
+        .any(|c| c.is_control() && !matches!(c, '\n' | '\r' | '\t'))
+    {
+        return None;
+    }
+    let collapsed = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    let text: String = collapsed.chars().take(5000).collect();
+    (!text.is_empty()).then_some(text)
+}
+
 async fn health() -> Json<serde_json::Value> {
     Json(json!({"status":"ok"}))
 }
@@ -454,6 +523,102 @@ pub fn router(state: EgressState) -> Router {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn research_text_validation() {
+        assert_eq!(
+            clean_research_text(b"one\n\t two").as_deref(),
+            Some("one two")
+        );
+        assert!(clean_research_text(b"\0binary").is_none());
+        assert!(clean_research_text(&[255, 254]).is_none());
+        assert!(clean_research_text(b"  ").is_none());
+        assert_eq!(
+            clean_research_text("汉".repeat(6000).as_bytes())
+                .unwrap()
+                .chars()
+                .count(),
+            5000
+        );
+    }
+    #[tokio::test]
+    async fn research_rejects_nonpublic_and_invalid_urls() {
+        for raw in [
+            "https://127.0.0.1/",
+            "https://[::1]/",
+            "https://169.254.169.254/",
+            "http://example.invalid/",
+            "https://example.invalid/?token=x",
+            "https://example.invalid:444/",
+            "https://u:p@example.invalid/",
+        ] {
+            assert!(research_plain_text(raw).await.unwrap().is_none(), "{raw}");
+        }
+    }
+    #[cfg(feature = "egress-test-loopback")]
+    #[tokio::test]
+    async fn research_plain_text_loopback_fixture() {
+        assert!(isolated_loopback(
+            IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            18098
+        ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:18098")
+            .await
+            .unwrap();
+        let app = Router::new()
+            .route(
+                "/plain",
+                get(|| async {
+                    (
+                        [(
+                            axum::http::header::CONTENT_TYPE,
+                            "text/plain; charset=utf-8",
+                        )],
+                        "Fixture\nplain text",
+                    )
+                }),
+            )
+            .route(
+                "/html",
+                get(|| async {
+                    (
+                        [(axum::http::header::CONTENT_TYPE, "text/html")],
+                        "<html>ignored</html>",
+                    )
+                }),
+            )
+            .route(
+                "/redirect",
+                get(|| async { axum::response::Redirect::temporary("/plain") }),
+            )
+            .route(
+                "/large",
+                get(|| async {
+                    (
+                        [(axum::http::header::CONTENT_TYPE, "text/plain")],
+                        "x".repeat(500001),
+                    )
+                }),
+            );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let base = "http://127.0.0.1:18098";
+        assert_eq!(
+            research_plain_text(&format!("{base}/plain"))
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("Fixture plain text")
+        );
+        for path in ["html", "redirect", "large"] {
+            assert!(
+                research_plain_text(&format!("{base}/{path}"))
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "{path}"
+            );
+        }
+        server.abort();
+    }
     #[test]
     fn private_ipv4_ipv6_and_embedded_ip_rejected() {
         for raw in [

@@ -5,7 +5,7 @@ use super::*;
 use futures_util::{StreamExt, stream};
 use sqlx::{Postgres, Transaction};
 
-const REVISION: i32 = 4;
+const REVISION: i32 = 5;
 const CHILD_ATTEMPTS: u64 = 2;
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -58,7 +58,7 @@ async fn parent(
     budget: u64,
 ) -> AppResult<Value> {
     let mut tx = fenced(db, task.job).await?;
-    let checkpoint = json!({"revision":REVISION,"model_calls":0,"web_calls":0,"model_budget":budget,"web_budget":task.settings.max_web_searches,"wiki_calls":0,"wiki_budget":if task.settings.wiki_enabled {tools::WIKI_BUDGET}else{0},"knowledge_calls":0,"knowledge_budget":task.settings.max_research_steps as u64 * CHILD_ATTEMPTS * 2});
+    let checkpoint = json!({"revision":REVISION,"model_calls":0,"web_calls":0,"model_budget":budget,"web_budget":task.settings.max_web_searches,"page_calls":0,"page_budget":if task.settings.page_text_enabled&&task.settings.max_web_searches>0{tools::PAGE_BUDGET}else{0},"wiki_calls":0,"wiki_budget":if task.settings.wiki_enabled {tools::WIKI_BUDGET}else{0},"knowledge_calls":0,"knowledge_budget":task.settings.max_research_steps as u64 * CHILD_ATTEMPTS * 2});
     sqlx::query("INSERT INTO translation_agent_runs(id,agent_type,status,task_id,target_lang,domain,checkpoint,checkpoint_version,checkpointed_at) VALUES($1,'rag_master','running',$2,$3,$4,$5,$6,now()) ON CONFLICT(id) DO NOTHING")
         .bind(id).bind(task.job.task_id).bind(task.target_lang).bind(domain).bind(checkpoint).bind(REVISION).execute(&mut *tx).await?;
     let ck:Value=sqlx::query_scalar("SELECT checkpoint FROM translation_agent_runs WHERE id=$1 AND task_id=$2 AND agent_type='rag_master' AND checkpoint_version=$3 FOR UPDATE")
@@ -85,6 +85,7 @@ async fn reserve(
         Some(RetrievalKind::Knowledge) => ("knowledge_calls", "knowledge_budget"),
         Some(RetrievalKind::Web) => ("web_calls", "web_budget"),
         Some(RetrievalKind::Wikipedia) => ("wiki_calls", "wiki_budget"),
+        Some(RetrievalKind::PageText) => ("page_calls", "page_budget"),
     };
     let count = ck[counter]
         .as_u64()
@@ -93,7 +94,10 @@ async fn reserve(
         .as_u64()
         .ok_or_else(|| AppError::Invalid("research budget limit invalid".into()))?;
     if count >= budget {
-        if matches!(kind, Some(RetrievalKind::Web | RetrievalKind::Wikipedia)) {
+        if matches!(
+            kind,
+            Some(RetrievalKind::Web | RetrievalKind::Wikipedia | RetrievalKind::PageText)
+        ) {
             return Ok(false);
         }
         return Err(AppError::Unavailable(
@@ -268,6 +272,40 @@ async fn child(
         // Wikipedia has an independent receipt: retry only the failed lookup.
         // Initial knowledge and configured web search remain reusable.
         let mut web = web;
+        // Only the first configured search result is eligible. Preserve the
+        // snippet if the site is denied, unsupported, or the budget is exhausted.
+        if allow_web && task.settings.page_text_enabled && !web.is_empty() {
+            let hit=&web[0];
+            let page:Option<WebEvidence>=if let Some(value)=ck.get("page_receipt"){
+                serde_json::from_value(value.clone()).map_err(|_|AppError::Invalid("invalid page receipt".into()))?
+            }else{
+                let mut tx=fenced(db,task.job).await?;
+                let permitted=reserve(&mut tx,parent,Some(RetrievalKind::PageText)).await?;
+                event(&mut tx,id,"page_text",if permitted{"running"}else{"skipped"},json!({})).await?;
+                tx.commit().await?;
+                if permitted{
+                    let result=tools::page_text(db,task,hit).await;
+                    let mut tx=fenced(db,task.job).await?;
+                    match result{
+                        Ok(value)=>{
+                            receipt(&mut tx,id,"page_receipt",json!(value)).await?;
+                            event(&mut tx,id,"page_text",if value.is_some(){"succeeded"}else{"skipped"},json!({})).await?;
+                            tx.commit().await?;
+                            value
+                        }
+                        Err(e)=>{
+                            event(&mut tx,id,"page_text","failed",json!({})).await?;
+                            tx.commit().await?;
+                            return Err(e);
+                        }
+                    }
+                }else{None}
+            };
+            if let Some(page)=page{
+                if page.url!=hit.url{return Err(AppError::Invalid("page receipt source mismatch".into()));}
+                web[0]=page;
+            }
+        }
         if allow_wiki {
             let wiki: Vec<WebEvidence> = if let Some(value)=ck.get("wiki_receipt") {
                 serde_json::from_value(value.clone()).map_err(|_| AppError::Invalid("invalid Wikipedia receipt".into()))?
@@ -385,7 +423,7 @@ fn parent_id(
 ) -> Uuid {
     let identity = hex::encode(Sha256::digest(
         format!(
-            "parallel-v4|{fingerprint}|{}|{}|{}",
+            "parallel-v5|{fingerprint}|{}|{}|{}",
             provider.id, provider.model, provider.endpoint
         )
         .as_bytes(),

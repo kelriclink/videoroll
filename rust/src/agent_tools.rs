@@ -6,6 +6,7 @@ pub(super) enum RetrievalKind {
     Knowledge,
     Web,
     Wikipedia,
+    PageText,
 }
 
 pub(super) struct RetrievalQuery {
@@ -95,6 +96,27 @@ impl RetrievalQuery {
         lease(db, task.job).await?;
         Ok(results)
     }
+}
+
+// Only an existing configured search result is eligible. No model-supplied
+// URL and no Wikipedia follow-up fetch.
+pub(super) const PAGE_BUDGET: usize = 2;
+pub(super) async fn page_text(
+    db: &Database,
+    task: &ResearchTask<'_>,
+    hit: &WebEvidence,
+) -> AppResult<Option<WebEvidence>> {
+    if !task.settings.page_text_enabled || task.settings.max_web_searches == 0 {
+        return Err(AppError::Invalid("research page retrieval disabled".into()));
+    }
+    lease(db, task.job).await?;
+    let body = crate::egress_gateway_v1::research_plain_text(&hit.url).await?;
+    lease(db, task.job).await?;
+    Ok(body.map(|snippet| WebEvidence {
+        title: hit.title.clone(),
+        url: hit.url.clone(),
+        snippet,
+    }))
 }
 
 // Fixed public Wikipedia API; response text and page IDs are data, never URLs
