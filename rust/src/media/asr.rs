@@ -753,12 +753,20 @@ pub async fn runtime_asr_config(
         sqlx::query_scalar("SELECT value_json FROM app_settings WHERE key='subtitle.asr'")
             .fetch_optional(&db.pool)
             .await?;
-    let overrides: Option<Value> =
-        sqlx::query_scalar("SELECT configuration->'subtitle' FROM vr2_workflows WHERE id=$1")
+    let flow: Option<Value> =
+        sqlx::query_scalar("SELECT configuration FROM vr2_workflows WHERE id=$1")
             .bind(job.workflow_id)
             .fetch_optional(&db.pool)
-            .await?
-            .flatten();
+            .await?;
+    let overrides = if flow
+        .as_ref()
+        .and_then(|v| v["standalone_subtitle_runtime_profile"].as_bool())
+        == Some(true)
+    {
+        Some(crate::settings::effective(db, "subtitle.auto_profile").await?)
+    } else {
+        flow.as_ref().and_then(|v| v.get("subtitle")).cloned()
+    };
     let explicit = overrides
         .as_ref()
         .and_then(|v| v["asr_engine"].as_str())
@@ -782,7 +790,15 @@ pub async fn runtime_asr_config(
         && explicit.is_none()
         && config.asr_endpoint.is_some()
     {
-        return Ok(Some(config.clone()));
+        let mut runtime = config.clone();
+        if let Some(model) = overrides
+            .as_ref()
+            .and_then(|v| v["asr_model"].as_str())
+            .filter(|v| !v.trim().is_empty())
+        {
+            runtime.asr_model = model.to_owned();
+        }
+        return Ok(Some(runtime));
     }
     if stored["default_engine"].as_str().is_none() && !crate::local_inference::configured() {
         return Ok(None);

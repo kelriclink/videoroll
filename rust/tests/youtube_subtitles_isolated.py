@@ -42,7 +42,7 @@ if vid=="DOWNLOADF01":sys.exit(1)
 lang=args[args.index("--sub-langs")+1]
 assert lang.startswith("^") and lang.endswith("$")
 lang=lang[1:-1]
-if vid=="AUTOSOURCE1":
+if vid.startswith("AUTOSOURCE"):
     assert lang=="en" and "--write-auto-subs" in args and "--no-write-subs" in args
     text="original English cue"
 elif vid=="AUTOTARGET1":
@@ -64,7 +64,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         data=self.rfile.read(int(self.headers["Content-Length"]))
         assert self.path=="/v1/audio/transcriptions" and b"fLaC" in data
-        asr.append(True)
+        asr.append(data)
         raw=json.dumps({"segments":[{"start":0.2,"end":0.8,"text":"ASR fallback"}]}).encode()
         self.send_response(200);self.send_header("Content-Type","application/json");self.send_header("Content-Length",str(len(raw)));self.end_headers();self.wfile.write(raw)
     def log_message(self,*a):pass
@@ -84,7 +84,7 @@ def wait(fn,secs=45):
         if result:return result
         time.sleep(.2)
     raise AssertionError("caption test timeout")
-def seed(vid,mode,translate=True,local=False,via="standalone",audio=True):
+def seed(vid,mode,translate=True,local=False,via="standalone",audio=True,extra=None,origin=None,prior=False):
     t=uuid.uuid4();key=f"v2/raw/{t}/raw.mp4";video=root/key;video.parent.mkdir(parents=True)
     args=["ffmpeg","-nostdin","-v","error","-f","lavfi","-i","color=black:s=64x64:r=5:d=2"]
     if audio:args+=["-f","lavfi","-i","sine=frequency=440:sample_rate=16000:duration=2","-shortest","-c:a","aac"]
@@ -92,6 +92,11 @@ def seed(vid,mode,translate=True,local=False,via="standalone",audio=True):
     with db() as c:
         c.execute("INSERT INTO tasks(id,source_type,source_url,source_license,status,runtime_owner) VALUES(%s,%s,%s,'authorized','downloaded','rust')",(t,"local" if local else "youtube",None if local else "https://youtu.be/"+vid))
         c.execute("INSERT INTO assets(id,task_id,kind,storage_key,sha256,size_bytes) VALUES(%s,%s,'video_raw',%s,%s,%s)",(uuid.uuid4(),t,key,hashlib.sha256(video.read_bytes()).hexdigest(),video.stat().st_size))
+    if origin or prior:
+        with db() as c:
+            if origin:c.execute("UPDATE tasks SET origin_kind=%s WHERE id=%s",(origin,t))
+            if prior:
+                c.execute("INSERT INTO vr2_workflows(id,task_id,generation,state,current_stage,configuration) VALUES(%s,%s,1,'succeeded','subtitle',%s)",(uuid.uuid4(),t,json.dumps({"subtitle":{"youtube_subtitle_mode":"off","translate_enabled":False,"translate_provider":"noop"},"render":{"burn_in":True},"auto_publish":True,"auto_publish_platforms":["bilibili"],"auto_dub_p2":True})))
     if via=="pipeline":
         w,j=uuid.uuid4(),uuid.uuid4()
         with db() as c:
@@ -103,7 +108,25 @@ def seed(vid,mode,translate=True,local=False,via="standalone",audio=True):
         status,value=api(f"/tasks/{t}/actions/subtitle",payload)
     else:
         payload={"task_id":str(t),"input":{"type":"storage","key":key},"prefer_youtube_subtitles":mode!="off","youtube_subtitle_mode":mode,"translate":{"enabled":translate,"provider":"mock","target_lang":"zh"},"output":{"render":{"burn_in":False}}}
+        if extra:
+            payload.update(extra)
+            payload["output_prefix"]=f"sub/{t}/"
         status,value=api("/subtitle/jobs",payload)
+        if extra:
+            assert status==200,(status,value)
+            code,same=api("/subtitle/jobs",payload)
+            assert code==200 and same==value,(code,same)
+            code,bad=api("/subtitle/jobs",{**payload,"output_prefix":"sub/another-task/"})
+            assert code in (400,422),(code,bad)
+            with db() as c:
+                cfg=c.execute("SELECT configuration FROM vr2_workflows WHERE task_id=%s ORDER BY generation DESC LIMIT 1",(t,)).fetchone()[0]
+            expected=extra.get("runtime_profile",origin in ("auto_youtube","youtube_home_scan","youtube_task_restart"))
+            assert cfg["standalone_subtitle_runtime_profile"] is expected,cfg
+            if expected:
+                assert cfg["subtitle"]=={} and cfg["render"]=={} and "auto_publish" not in cfg and "auto_publish_platforms" not in cfg and "auto_dub_p2" not in cfg,cfg
+            else:
+                assert cfg["subtitle"]["youtube_subtitle_mode"]==mode and cfg["auto_publish"] is False and cfg["auto_dub_p2"] is False,cfg
+
     assert status in (200,201,202),(status,value)
     return t
 def result(t):
@@ -154,11 +177,33 @@ try:
     assert not asr
     stop(worker)
     print("PASS: manual and automatic target captions without ASR configuration, actual VTT conversion, automatic source translation and provenance",flush=True)
+    # These requests intentionally conflict with the saved profile when
+    # admitted. Automatic execution re-reads settings when the worker starts.
+    e=seed("AUTOSOURCE2","off",translate=False,extra={"runtime_profile":True,"after_render":{"publish":False}},prior=True)
+    f=seed("AUTOSOURCE3","off",translate=False,extra={"after_render":{"publish":False}},origin="youtube_home_scan")
+    g=seed("MANUALCAP02","target",translate=False,extra={"runtime_profile":False},origin="auto_youtube",prior=True)
+    setting("subtitle.auto_profile",{"translate_enabled":True,"translate_provider":"mock","target_lang":"zh","auto_publish":False,"auto_publish_platforms":[],"auto_dub_p2":False,"burn_in":False,"youtube_subtitle_mode":"auto_source"})
+    worker=start_worker(False)
+    inspect(e,"[zh] original English cue","auto_source","en")
+    inspect(f,"[zh] original English cue","auto_source","en")
+    inspect(g,"人工中文字幕","target","zh-Hans")
+    assert not asr
+    stop(worker)
+    setting("subtitle.auto_profile",{"translate_enabled":True,"translate_provider":"mock","target_lang":"zh","auto_publish":False,"auto_publish_platforms":[],"auto_dub_p2":False,"burn_in":False,"youtube_subtitle_mode":"target"})
+    print("PASS: explicit and inferred runtime profile reads current worker settings, explicit false preserves manual mode, canonical output prefix and generation isolation",flush=True)
     cases=[("NOTRACK0001","target",False),("PROBEFAIL01","target",False),("DOWNLOADF01","target",False),("EMPTYTRACK1","target",False),("OUTOFRANGE1","target",False),("WRONGID0001","target",False),("OFFMODE0001","off",False),("LOCALVID001","target",True)]
     tasks=[(vid,seed(vid,mode,translate=False,local=local)) for vid,mode,local in cases]
     worker=start_worker(True)
     for vid,t in tasks:inspect(t,"ASR fallback")
     assert len(asr)==len(tasks),len(asr)
+    stop(worker)
+    z=seed("OFFRUNTIME1","target",translate=False,extra={"runtime_profile":True})
+    setting("subtitle.auto_profile",{"translate_enabled":True,"translate_provider":"mock","target_lang":"zh","auto_publish":False,"auto_publish_platforms":[],"auto_dub_p2":False,"burn_in":False,"youtube_subtitle_mode":"off","asr_engine":"auto","asr_model":"runtime-whisper","asr_language":"en"})
+    worker=start_worker(True)
+    inspect(z,"[zh] ASR fallback")
+    assert len(asr)==len(tasks)+1 and b"runtime-whisper" in asr[-1] and b'name="language"' in asr[-1] and b"en" in asr[-1]
+    print("PASS: runtime profile resolves current ASR model and translation options at execution",flush=True)
+
     logged=[json.loads(line) for line in calls.read_text().splitlines()]
     ids=[x[0] for x in logged]
     assert "OFFMODE0001" not in ids and "LOCALVID001" not in ids

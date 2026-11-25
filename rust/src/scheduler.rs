@@ -378,6 +378,28 @@ impl Scheduler {
             }
             configuration = previous.try_get("configuration")?;
         }
+        // A fresh standalone subtitle request is a new execution policy,
+        // not a merge with stale manual parameters or prior selective plan.
+        if stage == Stage::Subtitle
+            && changes.contains_key("standalone_subtitle_runtime_profile")
+            && !changes.contains_key("selective_retranslate")
+        {
+            if let Some(base) = configuration.as_object_mut() {
+                for key in [
+                    "subtitle",
+                    "render",
+                    "selective_retranslate",
+                    "auto_publish",
+                    "auto_publish_platforms",
+                    "auto_dub_p2",
+                    "dubbing",
+                    "publish",
+                    "auto_publish_dubbing_job_id",
+                ] {
+                    base.remove(key);
+                }
+            }
+        }
         if let (Some(base), Some(overrides)) = (configuration.as_object_mut(), Some(changes)) {
             for (key, value) in overrides {
                 if (key == "subtitle" || key == "render")

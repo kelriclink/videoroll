@@ -78,6 +78,15 @@ with engine.connect() as db:
 code,response=post(f'/tasks/{task}/actions/subtitle_retranslate',{'indices':[3,1,3]})
 assert code==200 and response['status']=='queued',(code,response)
 job_id=response['job_id']
+standalone={'task_id':str(task),'input':{'type':'storage','key':raw_key},'resume':True,'runtime_profile':False,'output_prefix':f'sub/{task}/','selective_retranslate':{'indices':[1,3],'base_translated_segments_key':segments_key},'artifacts':{'source_segments_key':segments_key,'final_subtitle_segments_key':segments_key}}
+code,same=post('/subtitle/jobs',standalone)
+assert code==200 and same==response,(code,same)
+code,conflict=post('/subtitle/jobs',{**standalone,'selective_retranslate':{'indices':[2],'base_translated_segments_key':segments_key}})
+assert code==409,(code,conflict)
+code,bad=post('/subtitle/jobs',{**standalone,'artifacts':{'source_segments_key':'v2/foreign/segments.json'}})
+assert code in (400,422),(code,bad)
+print('PASS: independent subtitle request reuses the pinned native selective stage and rejects foreign artifacts')
+
 code,same=post(f'/tasks/{task}/actions/subtitle_retranslate',{'indices':[1,3]})
 assert code==200 and same==response,(code,same)
 code,conflict=post(f'/tasks/{task}/actions/subtitle_retranslate',{'indices':[2]})
