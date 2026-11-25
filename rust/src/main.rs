@@ -56,6 +56,20 @@ enum Command {
         #[arg(long, default_value_t = 100)]
         limit: i64,
     },
+    /// Plan a bounded page of historical tasks; explicitly apply only safe terminal ownership.
+    TaskOwnershipBulk {
+        #[arg(long)]
+        after: Option<uuid::Uuid>,
+        #[arg(long, default_value_t = 200)]
+        limit: i64,
+        #[arg(long)]
+        apply: bool,
+        #[arg(long, requires = "apply")]
+        quiesced: bool,
+        /// Exact token returned by the reviewed read-only page.
+        #[arg(long, requires = "apply")]
+        plan_token: Option<String>,
+    },
     /// Adopt one original task; optionally recover from verified media.
     TaskOwnershipAdopt {
         #[arg(long)]
@@ -357,6 +371,29 @@ async fn main() -> anyhow::Result<()> {
                 "{}",
                 serde_json::to_string_pretty(
                     &videoroll_v2::task_ownership::audit(&db, after, limit).await?
+                )?
+            );
+        }
+        Command::TaskOwnershipBulk {
+            after,
+            limit,
+            apply,
+            quiesced,
+            plan_token,
+        } => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(
+                    &videoroll_v2::task_ownership::bulk(
+                        &db,
+                        &config,
+                        after,
+                        limit,
+                        apply,
+                        quiesced,
+                        plan_token.as_deref()
+                    )
+                    .await?
                 )?
             );
         }
