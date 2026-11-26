@@ -159,6 +159,7 @@ pub(crate) fn test_state() -> (tempfile::TempDir, AppState) {
         ffprobe_binary: "ffprobe".into(),
         asr_endpoint: None,
         local_asr: None,
+        asr_request_options: None,
         cloudflare_asr: false,
         asr_api_key: None,
         asr_model: "".into(),

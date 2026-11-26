@@ -146,6 +146,7 @@ pub(crate) fn view(v: &Value) -> Value {
        "external_whisper_model":short(string(ext,"model",&env("SUBTITLE_EXTERNAL_WHISPER_MODEL","whisper-1")),256),
        "external_whisper_api_key_set":secret_set(ext,"api_key_enc","SUBTITLE_EXTERNAL_WHISPER_API_KEY"),
        "external_whisper_batch_size":integer(ext,"batch_size",env_n("SUBTITLE_EXTERNAL_WHISPER_BATCH_SIZE",1),1,32),
+       "external_whisper_max_concurrency":integer(ext,"max_concurrency",env_n("SUBTITLE_EXTERNAL_WHISPER_MAX_CONCURRENCY",1),1,8),
        "external_whisper_vad_enabled":boolean(ext,"vad_enabled",env_b("SUBTITLE_EXTERNAL_WHISPER_VAD_ENABLED",true)),
        "external_whisper_vad_threshold":number(ext,"vad_threshold",env_f("SUBTITLE_EXTERNAL_WHISPER_VAD_THRESHOLD",0.5),0.1,0.95),
        "external_whisper_min_silence_ms":integer(ext,"min_silence_ms",env_n("SUBTITLE_EXTERNAL_WHISPER_MIN_SILENCE_MS",2000),50,5000),
@@ -203,6 +204,7 @@ fn validate_number(field: &str, val: &Value) -> AppResult<()> {
         "openvino_max_new_tokens" => (1., 4096.),
         "openvino_vad_threshold" => (0.1, 0.95),
         "external_whisper_batch_size" => (1., 32.),
+        "external_whisper_max_concurrency" => (1., 8.),
         "external_whisper_vad_threshold" => (0.1, 0.95),
         "external_whisper_min_silence_ms" => (50., 5000.),
         "external_whisper_speech_pad_ms" => (0., 2000.),
@@ -219,6 +221,7 @@ fn validate_number(field: &str, val: &Value) -> AppResult<()> {
         || field.ends_with("_chars")
         || field == "openvino_num_beams"
         || field == "openvino_max_new_tokens"
+        || field.ends_with("_concurrency")
     {
         if val.as_i64().is_none() {
             return Err(bad("ASR integer required"));
@@ -277,6 +280,7 @@ pub(crate) fn patch(stored: &mut Map<String, Value>, body: &Value) -> AppResult<
             | "external_whisper_model"
             | "external_whisper_api_key"
             | "external_whisper_batch_size"
+            | "external_whisper_max_concurrency"
             | "external_whisper_vad_enabled"
             | "external_whisper_vad_threshold"
             | "external_whisper_min_silence_ms"
@@ -426,7 +430,7 @@ mod tests {
             &mut values,
             &json!({
                 "default_engine":"groq-whisper","groq_whisper_model":"whisper-large-v3",
-                "external_whisper_vad_threshold":0.7,"external_whisper_batch_size":4,
+                "external_whisper_vad_threshold":0.7,"external_whisper_batch_size":4,"external_whisper_max_concurrency":2,
                 "external_whisper_api_key":"test-token"
             }),
         )
@@ -435,8 +439,10 @@ mod tests {
         assert_eq!(read["default_engine"], "groq-whisper");
         assert_eq!(read["groq_whisper_model"], "whisper-large-v3");
         assert_eq!(read["external_whisper_batch_size"], 4);
+        assert_eq!(read["external_whisper_max_concurrency"], 2);
         assert_eq!(read["external_whisper_api_key_set"], true);
         assert!(patch(&mut values, &json!({"default_engine":"not-real"})).is_err());
         assert!(patch(&mut values, &json!({"external_whisper_batch_size":40})).is_err());
+        assert!(patch(&mut values, &json!({"external_whisper_max_concurrency":9})).is_err());
     }
 }

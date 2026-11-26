@@ -74,3 +74,7 @@ VIDEOROLL_V2_TEST_NATIVE_DEPLOYMENT_ONLY=true bash rust/scripts/smoke-isolated.s
 仅临时 PostgreSQL 与本地进程；实际启动七个 Rust 角色及 Nginx，
 检查旧浏览器 API、V1/V2、Worker 协议、桌面授权、静态页面和切换预检。
 测试禁用真实模型与投稿；未安装 systemd 单元或绑定生产端口。
+
+### Intel VAAPI local rendering
+
+For local Intel GPU rendering, set `INTEL_GPU_RENDER_DEVICE` (for example `/dev/dri/renderD128`) in `videoroll.env`. Install the optional `systemd/videoroll-rust@worker.service.d/20-gpu-access.conf` drop-in so the worker receives the `render` and `video` supplementary groups; verify those groups exist on the host. Before enabling local render, check `vainfo --display drm --device <render-node>` and that the deployed FFmpeg exposes `ass`, `overlay_vaapi`, and the selected VAAPI encoder. The renderer preserves the profile GPU setting by default. Optionally set `VIDEOROLL_V2_RENDER_GPU_AUTO=true` to select the configured GPU even for profiles that do not request it. It probes hardware decode at runtime and safely falls back when the device/filter path is unavailable.

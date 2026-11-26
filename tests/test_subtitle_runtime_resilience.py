@@ -50,11 +50,14 @@ def test_asr_stage_ends_settings_transaction_before_provider(monkeypatch, tmp_pa
             "external_whisper_base_url": "http://whisper.test/v1",
             "external_whisper_api_key": "test",
             "external_whisper_model": "whisper-1",
+            "external_whisper_max_concurrency": 3,
         },
     )
+    captured = {}
 
-    def fake_transcribe(*_args, **_kwargs):
+    def fake_transcribe(*_args, **kwargs):
         assert db.rollback.called
+        captured.update(kwargs)
         return []
 
     monkeypatch.setattr(worker, "transcribe_external_whisper", fake_transcribe)
@@ -69,6 +72,7 @@ def test_asr_stage_ends_settings_transaction_before_provider(monkeypatch, tmp_pa
     )
 
     assert result == []
+    assert captured["provider_max_concurrency"] == 3
     db.rollback.assert_called_once()
 
 

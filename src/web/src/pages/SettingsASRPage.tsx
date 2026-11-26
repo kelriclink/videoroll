@@ -28,6 +28,7 @@ type WhisperSettings = {
   external_whisper_model: string;
   external_whisper_api_key_set: boolean;
   external_whisper_batch_size: number;
+  external_whisper_max_concurrency: number;
   external_whisper_vad_enabled: boolean;
   external_whisper_vad_threshold: number;
   external_whisper_min_silence_ms: number;
@@ -126,6 +127,7 @@ function asrDefaultsSnapshot(defaults: ASRDefaults): string {
     externalWhisperBaseUrl: defaults.external_whisper_base_url || "",
     externalWhisperModel: defaults.external_whisper_model || "whisper-1",
     externalWhisperBatchSize: String(defaults.external_whisper_batch_size ?? 1),
+    externalWhisperMaxConcurrency: String(defaults.external_whisper_max_concurrency ?? 1),
     externalWhisperVadEnabled: Boolean(defaults.external_whisper_vad_enabled),
     externalWhisperVadThreshold: String(defaults.external_whisper_vad_threshold ?? 0.5),
     externalWhisperMinSilenceMs: String(defaults.external_whisper_min_silence_ms ?? 2000),
@@ -162,6 +164,7 @@ export default function SettingsASRPage() {
     externalWhisperModel, setExternalWhisperModel,
     externalWhisperApiKey, setExternalWhisperApiKey,
     externalWhisperBatchSize, setExternalWhisperBatchSize,
+    externalWhisperMaxConcurrency, setExternalWhisperMaxConcurrency,
     externalWhisperVadEnabled, setExternalWhisperVadEnabled,
     externalWhisperVadThreshold, setExternalWhisperVadThreshold,
     externalWhisperMinSilenceMs, setExternalWhisperMinSilenceMs,
@@ -242,6 +245,7 @@ export default function SettingsASRPage() {
     externalWhisperBaseUrl,
     externalWhisperModel,
     externalWhisperBatchSize,
+    externalWhisperMaxConcurrency,
     externalWhisperVadEnabled,
     externalWhisperVadThreshold,
     externalWhisperMinSilenceMs,
@@ -284,6 +288,7 @@ export default function SettingsASRPage() {
         Math.max(0.1, Number.isFinite(parsedOpenvinoVadThreshold) ? parsedOpenvinoVadThreshold : 0.5),
       );
       const externalWhisperBatchSizeValue = Math.min(32, Math.max(1, Number.parseInt(externalWhisperBatchSize || "1", 10) || 1));
+      const externalWhisperMaxConcurrencyValue = Math.min(8, Math.max(1, Number.parseInt(externalWhisperMaxConcurrency || "1", 10) || 1));
       const externalWhisperVadThresholdValue = Math.min(0.95, Math.max(0.1, Number.parseFloat(externalWhisperVadThreshold || "0.5") || 0.5));
       const externalWhisperMinSilenceMsValue = Math.min(5000, Math.max(50, Number.parseInt(externalWhisperMinSilenceMs || "500", 10) || 500));
       const externalWhisperSpeechPadMsValue = Math.min(2000, Math.max(0, Number.parseInt(externalWhisperSpeechPadMs || "180", 10) || 0));
@@ -305,6 +310,7 @@ export default function SettingsASRPage() {
           external_whisper_base_url: externalWhisperBaseUrl,
           external_whisper_model: externalWhisperModel,
           external_whisper_batch_size: externalWhisperBatchSizeValue,
+          external_whisper_max_concurrency: externalWhisperMaxConcurrencyValue,
           external_whisper_vad_enabled: externalWhisperVadEnabled,
           external_whisper_vad_threshold: externalWhisperVadThresholdValue,
           external_whisper_min_silence_ms: externalWhisperMinSilenceMsValue,
@@ -558,6 +564,11 @@ export default function SettingsASRPage() {
                   <div className="mb-1 text-xs text-slate-600">推理 Batch Size</div>
                   <input type="number" min={1} max={32} className="w-full rounded border px-3 py-2 text-sm" value={externalWhisperBatchSize} onChange={(e) => setExternalWhisperBatchSize(e.target.value)} />
                   <div className="mt-1 text-xs text-slate-500">字幕优先建议 1。大于 1 会启用 batched pipeline，吞吐更高但上游 segment 往往更粗。</div>
+                </label>
+                <label className="block">
+                  <div className="mb-1 text-xs text-slate-600">服务端最大并发</div>
+                  <input type="number" min={1} max={8} className="w-full rounded border px-3 py-2 text-sm" value={externalWhisperMaxConcurrency} onChange={(e) => setExternalWhisperMaxConcurrency(e.target.value)} />
+                  <div className="mt-1 text-xs text-slate-500">跨任务共享的在线 Whisper 推理准入槽位，默认 1；只有服务端有足够 GPU 显存/worker 时才提高。</div>
                 </label>
                 <label className="block">
                   <div className="mb-1 text-xs text-slate-600">语义分段硬上限（秒）</div>

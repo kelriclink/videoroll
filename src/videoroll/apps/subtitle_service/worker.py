@@ -541,7 +541,7 @@ def _run_asr_stage(
             language=language,
             timeout_seconds=600.0,
             redis_url=settings.redis_url,
-            provider_max_concurrency=1,
+            provider_max_concurrency=max(1, min(8, int(asr_defaults.get("external_whisper_max_concurrency") or 1))),
             batch_size=int(asr_defaults.get("external_whisper_batch_size") or 1),
             vad_filter=bool(asr_defaults.get("external_whisper_vad_enabled", True)),
             vad_threshold=float(asr_defaults.get("external_whisper_vad_threshold") or 0.5),
