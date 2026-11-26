@@ -150,6 +150,112 @@ fn numeric_retry_after(value: Option<&reqwest::header::HeaderValue>) -> Option<f
         .and_then(|v| v.trim().parse::<f64>().ok())
         .filter(|v| v.is_finite() && *v >= 0.0)
 }
+// Keep only final assistant content and token usage. Reasoning is never
+// persisted or returned as a translation. The existing HTTP byte budget
+// covers all SSE data including reasoning and incomplete events.
+fn decode_chat_envelope(raw: &[u8], sse: bool) -> Result<Value, ()> {
+    if !sse {
+        return serde_json::from_slice(raw).map_err(|_| ());
+    }
+    let text = std::str::from_utf8(raw).map_err(|_| ())?;
+    let mut content = String::new();
+    let mut usage = Value::Null;
+    let mut done = false;
+    for line in text.lines() {
+        let Some(data) = line.trim().strip_prefix("data:") else {
+            continue;
+        };
+        let data = data.trim();
+        if data == "[DONE]" {
+            done = true;
+            break;
+        }
+        let Ok(event) = serde_json::from_str::<Value>(data) else {
+            continue;
+        };
+        if !event["error"].is_null() {
+            return Err(());
+        }
+        if event["usage"].is_object() {
+            usage = event["usage"].clone();
+        }
+        if let Some(choice) = event.pointer("/choices/0") {
+            if let Some(finish) = choice["finish_reason"].as_str() {
+                if finish == "stop" {
+                    done = true;
+                } else if matches!(finish, "length" | "content_filter" | "tool_calls") {
+                    return Err(());
+                }
+            }
+            let delta = choice.get("delta").or_else(|| choice.get("message"));
+            if let Some(delta) = delta {
+                match &delta["content"] {
+                    Value::String(v) => content.push_str(v),
+                    Value::Array(values) => {
+                        for v in values {
+                            if let Some(t) = v.as_str().or_else(|| v["text"].as_str()) {
+                                content.push_str(t);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    if !done || content.trim().is_empty() {
+        return Err(());
+    }
+    Ok(serde_json::json!({"choices":[{"message":{"content":content}}],"usage":usage}))
+}
+fn rejected_field(raw: &[u8]) -> Option<&'static str> {
+    let value: Value = serde_json::from_slice(raw).ok()?;
+    let err = value.get("error").unwrap_or(&value);
+    let code = err["code"].as_str().unwrap_or("").to_ascii_lowercase();
+    let message = err["message"]
+        .as_str()
+        .or_else(|| err.as_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if code == "context_length_exceeded"
+        || code == "context_window_exceeded"
+        || [
+            "maximum context length",
+            "context length exceeded",
+            "context window exceeded",
+            "input tokens exceed",
+        ]
+        .iter()
+        .any(|v| message.contains(v))
+    {
+        return Some("context");
+    }
+    if message.contains("enable_thinking")
+        && [
+            "unsupported",
+            "unknown",
+            "not permitted",
+            "not allowed",
+            "extra forbidden",
+            "unrecognized",
+        ]
+        .iter()
+        .any(|v| message.contains(v))
+    {
+        return Some("thinking");
+    }
+    None
+}
+async fn bounded_error(mut response: reqwest::Response) -> Option<&'static str> {
+    let mut raw = Vec::new();
+    while let Ok(Some(chunk)) = response.chunk().await {
+        if chunk.len() > 16384usize.saturating_sub(raw.len()) {
+            return None;
+        }
+        raw.extend_from_slice(&chunk);
+    }
+    rejected_field(&raw)
+}
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn chat_json_observed(
     db: &Database,
@@ -209,9 +315,18 @@ pub(crate) async fn chat_json_observed(
             },
         )
         .await;
-        return Err(AppError::Unavailable(format!(
-            "{error_label} HTTP {status}"
-        )));
+        let reason = if status.as_u16() == 400 {
+            bounded_error(response).await
+        } else {
+            None
+        };
+        return Err(AppError::Unavailable(match reason {
+            Some("context") => {
+                "translation prompt exceeds context budget: provider rejected context length".into()
+            }
+            Some("thinking") => "OpenAI provider explicitly rejected enable_thinking".into(),
+            _ => format!("{error_label} HTTP {status}"),
+        }));
     }
     if response
         .content_length()
@@ -236,6 +351,11 @@ pub(crate) async fn chat_json_observed(
             "{error_label} response too large"
         )));
     }
+    let sse = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.to_ascii_lowercase().contains("text/event-stream"));
     let mut response = response;
     let mut raw = Vec::new();
     loop {
@@ -284,7 +404,7 @@ pub(crate) async fn chat_json_observed(
             }
         }
     }
-    let envelope: Value = match serde_json::from_slice(&raw) {
+    let envelope: Value = match decode_chat_envelope(&raw, sse) {
         Ok(v) => v,
         Err(_) => {
             save(
@@ -328,6 +448,47 @@ pub(crate) async fn chat_json_observed(
 mod tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn sse_final_content_usage_and_typed_rejections() {
+        let raw = concat!(
+            ": keep-alive\n",
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"private reasoning\"}}]}\r\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"{\\\"answer\\\":\"}}]}\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"1}\"},\"finish_reason\":\"stop\"}]}\n",
+            "data: {\"usage\":{\"total_tokens\":17}}\n",
+            "data: [DONE]\n"
+        );
+        let result = decode_chat_envelope(raw.as_bytes(), true).unwrap();
+        assert_eq!(result["choices"][0]["message"]["content"], "{\"answer\":1}");
+        assert_eq!(result["usage"]["total_tokens"], 17);
+        assert!(!result.to_string().contains("private reasoning"));
+        assert!(
+            decode_chat_envelope(
+                b"data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n",
+                true
+            )
+            .is_err()
+        );
+        assert!(
+            decode_chat_envelope(
+                b"data: {\"error\":{\"message\":\"fail\"}}\ndata: [DONE]",
+                true
+            )
+            .is_err()
+        );
+        assert_eq!(
+            rejected_field(br#"{"error":{"code":"context_length_exceeded"}}"#),
+            Some("context")
+        );
+        assert_eq!(
+            rejected_field(br#"{"error":{"message":"unknown enable_thinking"}}"#),
+            Some("thinking")
+        );
+        assert_eq!(
+            rejected_field(br#"{"error":{"message":"authentication failed"}}"#),
+            None
+        );
+    }
     #[test]
     fn counts_and_pricing_match_python_micro_usd() {
         assert_eq!(

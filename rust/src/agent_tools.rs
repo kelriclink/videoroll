@@ -110,12 +110,36 @@ pub(super) async fn page_text(
         return Err(AppError::Invalid("research page retrieval disabled".into()));
     }
     lease(db, task.job).await?;
-    let body = crate::egress_gateway_v1::research_page_text(&hit.url).await?;
+    // Revalidate even a cache hit against the egress URL and DNS policy.
+    if !crate::egress_gateway_v1::research_page_allowed(&hit.url).await {
+        return Ok(None);
+    }
+    let provider = provider_cache::identity("public_page", "egress-policy-v1", None);
+    let key = provider_cache::identity(&provider, &hit.url, None);
+    let docs = provider_cache::retrieve_slots(
+        db,
+        task.job,
+        &provider,
+        &key,
+        Duration::from_secs(300),
+        4,
+        || async {
+            let body = crate::egress_gateway_v1::research_page_text(&hit.url).await?;
+            Ok(body
+                .map(|snippet| WebEvidence {
+                    title: String::new(),
+                    url: hit.url.clone(),
+                    snippet,
+                })
+                .into_iter()
+                .collect())
+        },
+    )
+    .await?;
     lease(db, task.job).await?;
-    Ok(body.map(|snippet| WebEvidence {
-        title: hit.title.clone(),
-        url: hit.url.clone(),
-        snippet,
+    Ok(docs.into_iter().next().map(|mut row| {
+        row.title = hit.title.clone();
+        row
     }))
 }
 
@@ -241,12 +265,13 @@ impl RetrievalQuery {
             ("formatversion", "2"),
         ]);
         let cache_key = provider_cache::identity(&provider, url.as_str(), None);
-        let docs = provider_cache::retrieve_shared(
+        let docs = provider_cache::retrieve_slots(
             db,
             task.job,
             &provider,
             &cache_key,
             Duration::from_secs(900),
+            1,
             || async {
                 tokio::time::sleep(Duration::from_millis(200)).await;
                 let client = Client::builder()

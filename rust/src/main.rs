@@ -238,6 +238,31 @@ async fn main() -> anyhow::Result<()> {
                 });
             }
             if config.native_bilibili_allowed {
+                let collection_config = config.clone();
+                let collection_db = db.clone();
+                tokio::spawn(async move {
+                    let mut tick = tokio::time::interval(std::time::Duration::from_secs(45));
+                    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    loop {
+                        tick.tick().await;
+                        match videoroll_v2::bilibili::collection_tick(
+                            &collection_config,
+                            &collection_db,
+                        )
+                        .await
+                        {
+                            Ok(true) => {
+                                tracing::debug!("optional Bilibili collection task processed")
+                            }
+                            Ok(false) => {}
+                            Err(error) => {
+                                tracing::warn!(error=%error,"optional Bilibili collection sync unavailable; publication unaffected")
+                            }
+                        }
+                    }
+                });
+            }
+            if config.native_bilibili_allowed {
                 let p2_config = config.clone();
                 let p2_db = db.clone();
                 let p2_registry = storage.clone();

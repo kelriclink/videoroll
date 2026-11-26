@@ -2,7 +2,10 @@
 //! retrieval. Never cache private documents, local knowledge, or AI replies.
 use super::*;
 use sqlx::{Connection, PgConnection};
-use std::{future::Future, sync::Arc, time::Instant};
+use std::future::Future;
+#[cfg(test)]
+use std::{sync::Arc, time::Instant};
+#[cfg(test)]
 use tokio::sync::Mutex;
 
 const CACHE_MAX: usize = 128;
@@ -14,12 +17,14 @@ struct Entry {
     value: Evidence,
 }
 #[derive(Default)]
+#[cfg(test)]
 struct Health {
     #[cfg(test)]
     failures: u8,
     until: Option<Instant>,
 }
 #[derive(Default)]
+#[cfg(test)]
 struct Gate {
     #[cfg(test)]
     serial: Mutex<()>,
@@ -27,6 +32,7 @@ struct Gate {
 }
 #[cfg(test)]
 static CACHE: Mutex<Vec<(String, Entry)>> = Mutex::const_new(Vec::new());
+#[cfg(test)]
 static GATES: Mutex<Vec<(String, Arc<Gate>)>> = Mutex::const_new(Vec::new());
 pub(super) fn identity(kind: &str, endpoint: &str, credential: Option<&str>) -> String {
     let mut hash = Sha256::new();
@@ -36,6 +42,7 @@ pub(super) fn identity(kind: &str, endpoint: &str, credential: Option<&str>) -> 
     }
     hex::encode(hash.finalize())
 }
+#[cfg(test)]
 async fn gate(provider: &str) -> AppResult<Arc<Gate>> {
     let mut gates = GATES.lock().await;
     if let Some((_, g)) = gates.iter().find(|(key, _)| key == provider) {
@@ -91,7 +98,7 @@ async fn admit(g: &Gate) -> AppResult<()> {
     }
     Ok(())
 }
-pub(super) async fn check_status(provider: &str, response: &reqwest::Response) -> AppResult<()> {
+pub(super) async fn check_status(_provider: &str, response: &reqwest::Response) -> AppResult<()> {
     let status = response.status();
     if status.is_success() {
         return Ok(());
@@ -105,10 +112,9 @@ pub(super) async fn check_status(provider: &str, response: &reqwest::Response) -
             .filter(|v| v.is_finite())
             .unwrap_or(2.0)
             .clamp(1., 60.);
-        let g = gate(provider).await?;
-        let mut h = g.health.lock().await;
-        let until = Instant::now() + Duration::from_secs_f64(delay);
-        h.until = Some(h.until.map_or(until, |old| old.max(until)));
+        return Err(AppError::Unavailable(format!(
+            "RAG provider HTTP 429; retry_after={delay:.3}"
+        )));
     }
     Err(AppError::Unavailable(format!("RAG provider HTTP {status}")))
 }
@@ -212,6 +218,11 @@ impl Shared {
         self.health.retain(|h| h.provider != provider);
         match result {
             Ok(value) => {
+                // A concurrent successful request must not clear an active
+                // cooldown recorded by a different slot.
+                if let Some(old) = old.filter(|h| h.until > now) {
+                    self.health.push(old);
+                }
                 self.entries.retain(|v| v.key != key);
                 while self.entries.len() >= CACHE_MAX {
                     self.entries.remove(0);
@@ -297,12 +308,28 @@ async fn shared_record(
     tx.commit().await?;
     Ok(())
 }
+#[cfg(test)]
 pub(super) async fn retrieve_shared<F, Fut>(
     db: &Database,
     job: &WorkItem,
     provider: &str,
     key: &str,
     ttl: Duration,
+    call: F,
+) -> AppResult<Evidence>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = AppResult<Evidence>>,
+{
+    retrieve_slots(db, job, provider, key, ttl, 1, call).await
+}
+pub(super) async fn retrieve_slots<F, Fut>(
+    db: &Database,
+    job: &WorkItem,
+    provider: &str,
+    key: &str,
+    ttl: Duration,
+    slots: usize,
     call: F,
 ) -> AppResult<Evidence>
 where
@@ -318,7 +345,7 @@ where
     {
         return Ok(v.value);
     }
-    let gate_key = format!("runtime.rag.provider.{provider}");
+    let gate_key = format!("runtime.rag.query.{provider}.{key}");
     let mut connection = tokio::time::timeout(
         Duration::from_secs(5),
         PgConnection::connect_with(&db.pool.connect_options()),
@@ -363,10 +390,53 @@ where
             "RAG shared provider circuit or cooldown active".into(),
         ));
     }
+    loop {
+        lease(db, job).await?;
+        let (shared, now) = shared_read(db).await?;
+        if shared
+            .health
+            .iter()
+            .any(|h| h.provider == provider && h.until > now)
+        {
+            return Err(AppError::Unavailable(
+                "RAG shared provider circuit or cooldown active".into(),
+            ));
+        }
+        let mut acquired = false;
+        for slot in 0..slots.clamp(1, 4) {
+            let slot_key = format!("runtime.rag.provider.{provider}.{slot}");
+            let held: bool =
+                sqlx::query_scalar("SELECT pg_try_advisory_lock(hashtextextended($1::text,0))")
+                    .bind(slot_key)
+                    .fetch_one(&mut connection)
+                    .await?;
+            if held {
+                acquired = true;
+                break;
+            }
+        }
+        if acquired {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(AppError::Unavailable(
+                "RAG provider admission timeout".into(),
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    // Recheck provider health after waiting for a slot.
     lease(db, job).await?;
-    let g = gate(provider).await?;
-    // The local gate carries the typed Retry-After from the HTTP parser.
-    // Only the dedicated PostgreSQL session owns actual cross-process admission.
+    let (shared, now) = shared_read(db).await?;
+    if shared
+        .health
+        .iter()
+        .any(|h| h.provider == provider && h.until > now)
+    {
+        return Err(AppError::Unavailable(
+            "RAG shared provider circuit or cooldown active".into(),
+        ));
+    }
     let result = {
         let request = call();
         tokio::pin!(request);
@@ -383,14 +453,14 @@ where
         }
     };
     lease(db, job).await?;
-    let cooldown = {
-        let mut h = g.health.lock().await;
-        let seconds = h
-            .until
-            .map(|t| t.saturating_duration_since(Instant::now()).as_secs_f64())
-            .unwrap_or(0.);
-        *h = Health::default();
-        seconds
+    let cooldown = match &result {
+        Err(AppError::Unavailable(message)) => message
+            .strip_prefix("RAG provider HTTP 429; retry_after=")
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite())
+            .unwrap_or(0.)
+            .clamp(0., 60.),
+        _ => 0.,
     };
     shared_record(db, provider, key, &result, ttl, cooldown).await?;
     drop(connection);
@@ -474,6 +544,77 @@ mod tests {
             .await
             .unwrap();
         assert!(!raw.to_string().contains("secret-fixture"));
+        let concurrent_provider = identity("search", "parallel-fixture", None);
+        let active = AtomicUsize::new(0);
+        let peak = AtomicUsize::new(0);
+        let parallel_fetch = || async {
+            let n = active.fetch_add(1, Ordering::SeqCst) + 1;
+            peak.fetch_max(n, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(450)).await;
+            active.fetch_sub(1, Ordering::SeqCst);
+            Ok(vec![])
+        };
+        let keys = (0..8).map(|i| format!("parallel-{i}")).collect::<Vec<_>>();
+        let results = futures_util::future::join_all(keys.iter().enumerate().map(|(i, key)| {
+            retrieve_slots(
+                if i % 2 == 0 { &db } else { &other },
+                &jobs[i % 2],
+                &concurrent_provider,
+                key,
+                Duration::from_secs(60),
+                4,
+                parallel_fetch,
+            )
+        }))
+        .await;
+        assert!(results.iter().all(Result::is_ok));
+        assert_eq!(peak.load(Ordering::SeqCst), 4);
+        // A later in-flight success must not erase a 429 cooldown.
+        let cooldown_provider = identity("search", "cooldown-fixture", None);
+        let (failure, success) = tokio::join!(
+            retrieve_slots(
+                &db,
+                &jobs[0],
+                &cooldown_provider,
+                "rate-error",
+                Duration::from_secs(60),
+                4,
+                || async {
+                    Err(AppError::Unavailable(
+                        "RAG provider HTTP 429; retry_after=10.000".into(),
+                    ))
+                }
+            ),
+            retrieve_slots(
+                &other,
+                &jobs[1],
+                &cooldown_provider,
+                "late-success",
+                Duration::from_secs(60),
+                4,
+                || async {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    Ok(vec![])
+                }
+            )
+        );
+        assert!(failure.is_err());
+        // The second call either entered before cooldown (success) or was denied.
+        let _ = success;
+        assert!(
+            retrieve_slots(
+                &other,
+                &jobs[1],
+                &cooldown_provider,
+                "new",
+                Duration::from_secs(60),
+                4,
+                || async { panic!("cooldown should prevent request") }
+            )
+            .await
+            .is_err()
+        );
+        println!("PASS RAG 8 requests, peak 4 independent queries, shared 429 cooldown");
         for i in 0..4 {
             let result = retrieve_shared(
                 &db,

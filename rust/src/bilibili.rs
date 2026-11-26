@@ -1,7 +1,8 @@
 //! Native Rust Bilibili UPOS multi-part upload and single-archive submission.
 //! Implements core Bilibili Web API following original BilibiliWebClient contract.
 //! Never shares Cookie with the UPOS CDN. The irreversible archive POST is made
-//! only once. Network uncertainty is handled by vr2_jobs state=unknown.
+//! only once except a documented, explicit description rejection. Network
+//! uncertainty is handled by vr2_jobs state=unknown.
 use crate::{
     AppError, AppResult, Config, Database,
     domain::WorkItem,
@@ -22,6 +23,11 @@ use tokio::{
     time::sleep,
 };
 
+#[path = "bili_collection.rs"]
+mod collection;
+pub async fn collection_tick(config: &Config, db: &Database) -> AppResult<bool> {
+    collection::tick(config, db).await
+}
 const UPLOAD_MAX_CHUNK: usize = 64 * 1024 * 1024;
 const MAX_METADATA_BYTES: usize = 2 * 1024 * 1024;
 const MAX_PARTS: u64 = 25_000;
@@ -569,6 +575,42 @@ async fn publish_gate(db: &Database, job: &WorkItem, stage: PublishGate) -> AppR
         // No idle SQL transaction and no long uninterruptible sleep.
         tokio::time::sleep(Duration::from_secs_f64(delay.clamp(0.05, 2.0))).await;
     }
+}
+const DESC_REJECTED: &str = "Bilibili confirmed description length rejection";
+fn description_rejected(value: &Value) -> bool {
+    let code = value["code"]
+        .as_i64()
+        .or_else(|| value["code"].as_str()?.parse().ok());
+    let message = value["message"].as_str().unwrap_or("");
+    code == Some(21010)
+        && message.contains("简介")
+        && message.contains("过长")
+        && value.pointer("/data/bvid").is_none_or(Value::is_null)
+        && value.pointer("/data/aid").is_none_or(Value::is_null)
+}
+fn retry_description(meta: &ArchiveMeta) -> Option<ArchiveMeta> {
+    let mut retry = meta.clone();
+    let mut units = 0usize;
+    let mut desc = String::new();
+    for ch in meta.desc.trim().chars() {
+        let n = if ch.is_ascii() { 1 } else { 2 };
+        if units + n > 1598 {
+            break;
+        }
+        units += n;
+        desc.push(ch);
+    }
+    let original: usize = meta
+        .desc
+        .trim()
+        .chars()
+        .map(|c| if c.is_ascii() { 1 } else { 2 })
+        .sum();
+    if original > 1600 {
+        retry.desc = format!("{}…", desc.trim_end());
+    }
+    let cleared = retry.extra.remove("desc_v2").is_some_and(|v| !v.is_null());
+    (retry.desc != meta.desc || cleared).then_some(retry)
 }
 fn rate_limited_payload(value: &Value) -> bool {
     let code = value
@@ -1118,6 +1160,9 @@ impl BilibiliClient {
             .send()
             .await?;
         let value = Self::read_json(response).await?;
+        if description_rejected(&value) {
+            return Err(AppError::Unavailable(DESC_REJECTED.into()));
+        }
         Self::ensure_ok(&value, false)?;
         let bvid = value
             .pointer("/data/bvid")
@@ -1535,15 +1580,40 @@ pub async fn publish(
             }
         }
     }
-    // Single archive creation: UPOS uploads are preparatory side-effects;
-    // archive POST is the irreversible boundary and is NEVER retried.
+    // Freeze optional uploader identity before the archive POST so normal
+    // post-publication storage cleanup cannot remove its source metadata.
+    let collection_intent =
+        match collection::intent(db, registry, job.task_id, account, &cookie, &csrf).await {
+            Ok(value) => value,
+            Err(_) => {
+                tracing::warn!(job_id=%job.id,"optional Bilibili collection metadata unavailable");
+                None
+            }
+        };
+    // Only the exact platform rejection (21010 + description too long +
+    // no receipt) authorizes a single corrected POST. A timeout, malformed
+    // response or any other ambiguous outcome is never replayed.
     publish_gate(db, job, PublishGate::Submit).await?;
     publish_lease(db, job).await?;
-    let mut receipt = match client.submit_once(&csrf, &meta, &uploaded).await {
+    let mut result = client.submit_once(&csrf, &meta, &uploaded).await;
+    if matches!(&result,Err(AppError::Unavailable(message)) if message==DESC_REJECTED) {
+        if let Some(retry) = retry_description(&meta) {
+            // A shorter description is new review material. Preserve the
+            // publication review contract rather than bypassing its rules.
+            let value = serde_json::to_value(&retry)
+                .map_err(|_| AppError::Invalid("retry metadata invalid".into()))?;
+            crate::publish_review::ensure_approved(db, registry, config, job.task_id, &value)
+                .await?;
+            publish_gate(db, job, PublishGate::Submit).await?;
+            publish_lease(db, job).await?;
+            result = client.submit_once(&csrf, &retry, &uploaded).await;
+            meta = retry;
+        }
+    }
+    let mut receipt = match result {
         Ok(v) => v,
         Err(error) => {
             if rate_limited_error(&error) {
-                // Extend future admission, but do not replay this irreversible POST.
                 if let Err(e) =
                     extend_publish_cooldown(db, PublishGate::Submit, job.attempts as i32).await
                 {
@@ -1557,6 +1627,13 @@ pub async fn publish(
     // tags and cover. This is not the pre-upload draft.
     receipt["submitted_meta"] = serde_json::to_value(&meta)
         .map_err(|_| AppError::Invalid("final metadata serialization failed".into()))?;
+    if let Some(intent) = collection_intent {
+        if receipt["aid"].as_i64().is_some_and(|aid| aid > 0) {
+            receipt["collection"] =
+                json!({"ok":false,"pending":true,"state":"pending","title":intent["title"]});
+            receipt["collection_sync"] = intent;
+        }
+    }
     tracing::info!(job_id=%job.id,parts=uploaded.len(),"Bilibili native archive confirmed");
     Ok(receipt)
 }
@@ -1564,6 +1641,27 @@ pub async fn publish(
 mod tests {
     use super::*;
 
+    #[test]
+    fn description_repair_requires_exact_rejection_and_changes_payload() {
+        assert!(description_rejected(
+            &json!({"code":21010,"message":"简介过长"})
+        ));
+        assert!(!description_rejected(
+            &json!({"code":21010,"message":"标题过长"})
+        ));
+        assert!(!description_rejected(
+            &json!({"code":21010,"message":"简介过长","data":{"aid":10}})
+        ));
+        assert!(!description_rejected(
+            &json!({"code":-500,"message":"简介过长"})
+        ));
+        let meta:ArchiveMeta=serde_json::from_value(json!({"title":"fixture","desc":"中".repeat(900),"typeid":171,"tags":["测试"],"source":"https://youtu.be/abcdefghijk","desc_v2":[{"raw_text":"old"}]})).unwrap();
+        let retry = retry_description(&meta).unwrap();
+        assert!(retry.desc.ends_with('…'));
+        assert_eq!(retry.desc.chars().count(), 800);
+        assert!(!retry.extra.contains_key("desc_v2"));
+        assert!(retry_description(&retry).is_none());
+    }
     #[test]
     fn typed_publish_quota_errors_are_distinct_from_uncertain_receipts() {
         for value in [
