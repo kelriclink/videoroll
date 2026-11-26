@@ -8,6 +8,7 @@ use crate::{
     media::ffmpeg::{latest_asset_key, probe_video},
     storage::AssetRegistry,
 };
+use futures_util::{StreamExt, stream};
 use reqwest::{
     Client, Url,
     header::{self, HeaderValue},
@@ -15,7 +16,11 @@ use reqwest::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{collections::HashSet, path::Path, time::Duration};
-use tokio::{fs, io::AsyncReadExt, time::sleep};
+use tokio::{
+    fs,
+    io::{AsyncReadExt, AsyncSeekExt},
+    time::sleep,
+};
 
 const UPLOAD_MAX_CHUNK: usize = 64 * 1024 * 1024;
 const MAX_METADATA_BYTES: usize = 2 * 1024 * 1024;
@@ -419,6 +424,50 @@ pub async fn archive_spec(
     validate_assets(&parts)?;
     Ok((meta, parts))
 }
+// Per-upload buffer budget: each PUT can hold one original buffer and one
+// request copy. A single server-requested 64 MiB chunk is still supported.
+const UPOS_BUFFER_BUDGET: u64 = 128 * 1024 * 1024;
+fn upload_parallelism(requested: usize, chunks: u64, chunk_size: u64) -> usize {
+    if chunks < 4 || chunk_size == 0 {
+        return 1;
+    }
+    requested
+        .clamp(1, 8)
+        .min(chunks as usize)
+        .min((UPOS_BUFFER_BUDGET / chunk_size.saturating_mul(2)).max(1) as usize)
+}
+async fn configured_upload_workers(db: &Database) -> AppResult<usize> {
+    let stored = crate::settings::effective(db, "bilibili.publish").await?;
+    Ok(stored["upload_workers"].as_i64().unwrap_or(4).clamp(1, 8) as usize)
+}
+#[derive(Clone, Copy)]
+struct UploadProgress<'a> {
+    db: &'a Database,
+    job: &'a WorkItem,
+    done_before: u64,
+    total: u64,
+}
+async fn publish_lease(db: &Database, job: &WorkItem) -> AppResult<()> {
+    let active:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM vr2_jobs j JOIN vr2_workflows w ON w.id=j.workflow_id WHERE j.id=$1 AND j.lease_token=$2 AND j.state='running' AND j.lease_until>now() AND w.state='running')")
+        .bind(job.id).bind(job.lease_token).fetch_one(&db.pool).await?;
+    if !active {
+        return Err(AppError::Conflict("Bilibili publish lease lost".into()));
+    }
+    Ok(())
+}
+impl UploadProgress<'_> {
+    async fn record(&self, done: u64, active: bool) -> AppResult<()> {
+        publish_lease(self.db, self.job).await?;
+        let pct = ((self.done_before.saturating_add(done)).saturating_mul(100) / self.total.max(1))
+            .min(100) as i32;
+        // Only direct V1 jobs have an original publish_jobs row at this point.
+        // Keep its progress monotonic, guarded by the current execution lease.
+        sqlx::query("UPDATE publish_jobs p SET upload_active=$1,upload_progress=GREATEST(p.upload_progress,$2),heartbeat_at=now(),updated_at=now() FROM vr2_jobs j JOIN vr2_workflows w ON w.id=j.workflow_id WHERE j.id=$3 AND j.lease_token=$4 AND j.state='running' AND j.lease_until>now() AND w.state='running' AND p.id::text=w.configuration->'bilibili_direct_v1'->>'publish_job_id' AND p.task_id=j.task_id AND p.state='submitting'")
+            .bind(active).bind(pct).bind(self.job.id).bind(self.job.lease_token)
+            .execute(&self.db.pool).await?;
+        Ok(())
+    }
+}
 struct BilibiliClient {
     member: Client,
     upos: Client,
@@ -667,87 +716,168 @@ impl BilibiliClient {
         }
         Ok(id.into())
     }
-    async fn upload(&self, path: &Path) -> AppResult<UploadedVideo> {
-        let size = fs::metadata(path).await?.len();
-        if size == 0 || size > 80 * 1024 * 1024 * 1024 {
-            return Err(AppError::Invalid(
-                "Bilibili video size must be within 80 GiB".into(),
-            ));
+    async fn upload_part(
+        &self,
+        path: &Path,
+        target: &UploadTarget,
+        upload_id: &str,
+        size: u64,
+        chunks: u64,
+        idx: u64,
+    ) -> AppResult<(PutPart, u64)> {
+        let start = idx * target.chunk_size;
+        let length = (size - start).min(target.chunk_size) as usize;
+        let mut file = fs::File::open(path).await?;
+        file.seek(std::io::SeekFrom::Start(start)).await?;
+        let mut data = vec![0u8; length];
+        file.read_exact(&mut data).await?;
+        for attempt in 0..4 {
+            let response = self
+                .upos
+                .put(target.url.clone())
+                .query(&[
+                    ("partNumber", (idx + 1).to_string()),
+                    ("uploadId", upload_id.to_owned()),
+                    ("chunk", idx.to_string()),
+                    ("chunks", chunks.to_string()),
+                    ("size", length.to_string()),
+                    ("start", start.to_string()),
+                    ("end", (start + length as u64).to_string()),
+                    ("total", size.to_string()),
+                ])
+                .header("x-upos-auth", &target.auth)
+                .header(header::CONTENT_TYPE, "application/octet-stream")
+                .body(data.clone())
+                .send()
+                .await;
+            match response {
+                Ok(response) if response.status().as_u16() == 200 => {
+                    let etag = response
+                        .headers()
+                        .get(header::ETAG)
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("")
+                        .trim()
+                        .trim_matches('"')
+                        .to_owned();
+                    let etag = if etag.is_empty() {
+                        format!("{:x}", md5::compute(&data))
+                    } else {
+                        etag
+                    };
+                    return Ok((
+                        PutPart {
+                            number: idx + 1,
+                            etag,
+                        },
+                        length as u64,
+                    ));
+                }
+                Ok(response) => {
+                    let code = response.status().as_u16();
+                    if attempt == 3 || !matches!(code, 408 | 500 | 502 | 503 | 504) {
+                        return Err(AppError::Unavailable(format!(
+                            "Bilibili UPOS part {} HTTP {code}",
+                            idx + 1
+                        )));
+                    }
+                }
+                Err(error) => {
+                    if attempt == 3
+                        || !(error.is_timeout()
+                            || error.is_connect()
+                            || error.is_request()
+                            || error.is_body())
+                    {
+                        return Err(AppError::Unavailable(format!(
+                            "Bilibili UPOS part {} transport failure",
+                            idx + 1
+                        )));
+                    }
+                }
+            }
+            sleep(Duration::from_millis(250 * (1_u64 << attempt))).await;
         }
-        let pre = self.preupload(path).await?;
-        let target = upos_target(&pre)?;
-        let upload_id = self.init_upos(&target, size).await?;
+        Err(AppError::Unavailable(
+            "Bilibili UPOS retry budget exhausted".into(),
+        ))
+    }
+    async fn upload_parts(
+        &self,
+        path: &Path,
+        target: &UploadTarget,
+        upload_id: &str,
+        size: u64,
+        requested: usize,
+        progress: Option<UploadProgress<'_>>,
+    ) -> AppResult<Vec<PutPart>> {
         let chunks = size.div_ceil(target.chunk_size);
         if chunks == 0 || chunks > MAX_PARTS {
             return Err(AppError::Invalid(
                 "Bilibili upload needs too many parts".into(),
             ));
         }
+        let workers = upload_parallelism(requested, chunks, target.chunk_size);
+        let mut uploads = stream::iter(0..chunks)
+            .map(|idx| self.upload_part(path, target, upload_id, size, chunks, idx))
+            .buffer_unordered(workers);
         let mut parts = Vec::with_capacity(chunks as usize);
-        let mut file = fs::File::open(path).await?;
-        for idx in 0..chunks {
-            let start = idx * target.chunk_size;
-            let length = std::cmp::min(target.chunk_size, size - start) as usize;
-            let mut data = vec![0u8; length];
-            file.read_exact(&mut data).await?;
-            let response = loop {
-                let mut last = None;
-                for attempt in 0..4 {
-                    let result = self
-                        .upos
-                        .put(target.url.clone())
-                        .query(&[
-                            ("partNumber", (idx + 1).to_string()),
-                            ("uploadId", upload_id.clone()),
-                            ("chunk", idx.to_string()),
-                            ("chunks", chunks.to_string()),
-                            ("size", length.to_string()),
-                            ("start", start.to_string()),
-                            ("end", (start + length as u64).to_string()),
-                            ("total", size.to_string()),
-                        ])
-                        .header("x-upos-auth", &target.auth)
-                        .header(header::CONTENT_TYPE, "application/octet-stream")
-                        .body(data.clone())
-                        .send()
-                        .await;
-                    match result {
-                        Ok(response) if response.status().is_success() => {
-                            last = Some(response);
-                            break;
-                        }
-                        _ if attempt < 3 => {
-                            sleep(Duration::from_millis(250 * (1_u64 << attempt))).await;
-                        }
-                        _ => {
-                            return Err(AppError::Unavailable(
-                                "Bilibili UPOS chunk upload exceeded retry budget".into(),
-                            ));
-                        }
-                    }
+        let mut completed = 0u64;
+        let mut last_record = std::time::Instant::now() - Duration::from_secs(2);
+        while let Some(result) = uploads.next().await {
+            let (part, len) = result?;
+            completed = completed
+                .checked_add(len)
+                .ok_or_else(|| AppError::Invalid("upload byte count overflow".into()))?;
+            parts.push(part);
+            if last_record.elapsed() >= Duration::from_secs(2) || completed == size {
+                if let Some(progress) = progress {
+                    progress.record(completed, true).await?;
                 }
-                if let Some(response) = last {
-                    break response;
-                }
-            };
-            let etag = response
-                .headers()
-                .get(header::ETAG)
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("")
-                .trim_matches('"')
-                .to_string();
-            // UPOS may omit ETag; use file chunk MD5 as current v1 does.
-            let etag = if etag.is_empty() {
-                format!("{:x}", md5::compute(&data))
-            } else {
-                etag
-            };
-            parts.push(PutPart {
-                number: idx + 1,
-                etag,
-            });
+                last_record = std::time::Instant::now();
+            }
         }
+        parts.sort_unstable_by_key(|part| part.number);
+        if completed != size
+            || parts.len() != chunks as usize
+            || parts
+                .iter()
+                .enumerate()
+                .any(|(i, p)| p.number != i as u64 + 1)
+        {
+            return Err(AppError::Unavailable(
+                "Bilibili UPOS incomplete ordered parts".into(),
+            ));
+        }
+        tracing::info!(
+            workers,
+            chunks,
+            bytes = completed,
+            "UPOS multipart upload acknowledged"
+        );
+        Ok(parts)
+    }
+    async fn upload(
+        &self,
+        path: &Path,
+        requested: usize,
+        progress: Option<UploadProgress<'_>>,
+    ) -> AppResult<UploadedVideo> {
+        let size = fs::metadata(path).await?.len();
+        if size == 0 || size > 80 * 1024 * 1024 * 1024 {
+            return Err(AppError::Invalid(
+                "Bilibili video size must be within 80 GiB".into(),
+            ));
+        }
+        if let Some(progress) = progress {
+            progress.record(0, true).await?;
+        }
+        let pre = self.preupload(path).await?;
+        let target = upos_target(&pre)?;
+        let upload_id = self.init_upos(&target, size).await?;
+        let parts = self
+            .upload_parts(path, &target, &upload_id, size, requested, progress)
+            .await?;
         let response = self
             .upos
             .post(target.url.clone())
@@ -951,6 +1081,7 @@ pub(crate) struct NativeP2Client {
     inner: BilibiliClient,
     origin: Url,
     csrf: String,
+    upload_workers: usize,
 }
 impl NativeP2Client {
     pub(crate) async fn new(config: &Config, db: &Database) -> AppResult<Self> {
@@ -965,6 +1096,7 @@ impl NativeP2Client {
             inner: BilibiliClient::new(&cookie, member_origin(config)?)?,
             origin: member_origin(config)?,
             csrf,
+            upload_workers: configured_upload_workers(db).await?,
         })
     }
     fn url(&self, path: &str) -> AppResult<Url> {
@@ -1005,7 +1137,7 @@ impl NativeP2Client {
                 "UPOS upload disabled in loopback test mode".into(),
             ));
         }
-        let uploaded = self.inner.upload(path).await?;
+        let uploaded = self.inner.upload(path, self.upload_workers, None).await?;
         Ok((uploaded.filename, uploaded.cid))
     }
     pub(crate) async fn edit(
@@ -1120,13 +1252,40 @@ pub async fn publish(
             meta.cover = client.upload_cover(&csrf, &path).await?;
         }
     }
-    let mut uploaded = Vec::new();
+    let requested = configured_upload_workers(db).await?;
+    let mut prepared = Vec::new();
+    let mut total = 0u64;
     for (key, title) in parts {
         let path = registry.resolve_existing(&key).await?;
         probe_video(&config.ffprobe_binary, &path).await?;
-        let upload = client.upload(&path).await?;
+        let bytes = fs::metadata(&path).await?.len();
+        total = total
+            .checked_add(bytes)
+            .ok_or_else(|| AppError::Invalid("Bilibili total size overflow".into()))?;
+        prepared.push((path, title, bytes));
+    }
+    let mut uploaded = Vec::new();
+    let mut done = 0u64;
+    for (path, title, bytes) in prepared {
+        let progress = UploadProgress {
+            db,
+            job,
+            done_before: done,
+            total,
+        };
+        let upload = client.upload(&path, requested, Some(progress)).await?;
+        done += bytes;
         uploaded.push((upload, title));
     }
+    UploadProgress {
+        db,
+        job,
+        done_before: 0,
+        total,
+    }
+    .record(done, false)
+    .await?;
+
     // The original Python Worker computes AI summary classification after the
     // preparatory UPOS upload, then falls back to Bilibili prediction and
     // finally to the supplied metadata tid. Reuse the *same* Rust classifier
@@ -1174,6 +1333,7 @@ pub async fn publish(
     }
     // Single archive creation: UPOS uploads are preparatory side-effects;
     // archive POST is the irreversible boundary and is NEVER retried.
+    publish_lease(db, job).await?;
     let receipt = client.submit_once(&csrf, &meta, &uploaded).await?;
     tracing::info!(job_id=%job.id,parts=uploaded.len(),"Bilibili native archive confirmed");
     Ok(receipt)
@@ -1182,6 +1342,101 @@ pub async fn publish(
 mod tests {
     use super::*;
 
+    #[test]
+    fn upos_parallelism_preserves_small_upload_and_bounds_buffers() {
+        assert_eq!(upload_parallelism(8, 3, 1024), 1);
+        assert_eq!(upload_parallelism(4, 20, 4 * 1024 * 1024), 4);
+        assert_eq!(upload_parallelism(8, 20, 16 * 1024 * 1024), 4);
+        assert_eq!(upload_parallelism(8, 20, 64 * 1024 * 1024), 1);
+        assert_eq!(upload_parallelism(100, 20, 1024), 8);
+    }
+    #[tokio::test]
+    async fn upos_parts_parallel_order_retry_and_byte_integrity() {
+        use axum::{
+            Router,
+            body::Bytes,
+            extract::{Query, State},
+            http::StatusCode,
+            routing::put,
+        };
+        use std::collections::{BTreeMap, HashMap};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        #[derive(Default)]
+        struct Observed {
+            active: AtomicUsize,
+            peak: AtomicUsize,
+            seen: std::sync::Mutex<BTreeMap<u64, Vec<u8>>>,
+            tries: std::sync::Mutex<BTreeMap<u64, usize>>,
+        }
+        async fn handler(
+            State(state): State<Arc<Observed>>,
+            Query(q): Query<HashMap<String, String>>,
+            body: Bytes,
+        ) -> (StatusCode, [(header::HeaderName, &'static str); 1]) {
+            let i = q["partNumber"].parse::<u64>().unwrap();
+            assert_eq!(q["uploadId"], "test-id");
+            assert_eq!(q["size"].parse::<usize>().unwrap(), body.len());
+            let active = state.active.fetch_add(1, Ordering::SeqCst) + 1;
+            state.peak.fetch_max(active, Ordering::SeqCst);
+            let attempt = {
+                let mut tries = state.tries.lock().unwrap();
+                let n = tries.entry(i).or_default();
+                *n += 1;
+                *n
+            };
+            sleep(Duration::from_millis(40 + (8 - i.min(8)) * 12)).await;
+            state.active.fetch_sub(1, Ordering::SeqCst);
+            if i == 2 && attempt == 1 {
+                return (StatusCode::SERVICE_UNAVAILABLE, [(header::ETAG, "retry")]);
+            }
+            state.seen.lock().unwrap().insert(i, body.to_vec());
+            (StatusCode::OK, [(header::ETAG, "test-etag")])
+        }
+        let observed = Arc::new(Observed::default());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = Url::parse(&format!("http://{}/chunk", listener.local_addr().unwrap())).unwrap();
+        let app = Router::new()
+            .route("/chunk", put(handler))
+            .with_state(observed.clone());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("video.bin");
+        let data = (0..(7 * 1024 + 17))
+            .map(|n| (n % 251) as u8)
+            .collect::<Vec<_>>();
+        fs::write(&path, &data).await.unwrap();
+        let client = BilibiliClient::new("SESSDATA=isolated", url.clone()).unwrap();
+        let target = UploadTarget {
+            url,
+            auth: "test".into(),
+            cid: 1,
+            chunk_size: 1024,
+            filename: "test".into(),
+        };
+        let parts = client
+            .upload_parts(&path, &target, "test-id", data.len() as u64, 3, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            parts.iter().map(|p| p.number).collect::<Vec<_>>(),
+            (1..=8).collect::<Vec<_>>()
+        );
+        assert_eq!(observed.peak.load(Ordering::SeqCst), 3);
+        assert_eq!(observed.tries.lock().unwrap()[&2], 2);
+        let actual = observed
+            .seen
+            .lock()
+            .unwrap()
+            .values()
+            .flatten()
+            .copied()
+            .collect::<Vec<_>>();
+        assert_eq!(actual, data);
+        server.abort();
+    }
     #[test]
     fn p2_owner_edit_preserves_archive_and_never_overwrites_existing_p2() {
         let input = json!({"archive":{"aid":10,"title":"Original","copyright":2,
