@@ -1013,6 +1013,25 @@ async fn run_groq(
         "Groq Whisper retry budget exhausted".into(),
     ))
 }
+fn groq_vad_empty(value: &Value) -> bool {
+    value["available"].as_bool() == Some(true)
+        && value["spans"].as_array().is_some_and(Vec::is_empty)
+}
+async fn groq_no_speech(config: &Config, path: &Path) -> bool {
+    let options = config.asr_request_options.as_ref().unwrap_or(&Value::Null);
+    if options["groq_vad_enabled"].as_bool() == Some(false) || !crate::local_inference::configured()
+    {
+        return false;
+    }
+    let request = json!({"kind":"vad","device":"CPU","audio":path,"threshold":options["groq_vad_threshold"].as_f64().unwrap_or(0.5).clamp(0.01,0.99)});
+    match crate::local_inference::invoke(&request, Duration::from_secs(60)).await {
+        Ok(value) => groq_vad_empty(&value),
+        Err(_) => {
+            tracing::warn!("Groq Silero unavailable; uploading complete window");
+            false
+        }
+    }
+}
 async fn run_asr(
     db: &Database,
     job: &WorkItem,
@@ -1036,6 +1055,14 @@ async fn run_asr(
         .ok_or_else(|| AppError::Unavailable("no native ASR endpoint configured".into()))?;
     let parsed_endpoint = endpoint(target)?;
     if groq_endpoint(config) {
+        if groq_no_speech(config, path).await {
+            selective_lease(db, job).await?;
+            return Ok(AsrResponse {
+                segments: Vec::new(),
+                text: String::new(),
+            });
+        }
+        selective_lease(db, job).await?;
         return run_groq(db, job, client, config, path, lang, &parsed_endpoint).await;
     }
     if config.asr_request_options.is_some() {
@@ -1921,6 +1948,10 @@ pub async fn runtime_asr_config(
             };
             out.asr_endpoint = Some("https://api.groq.com/openai/v1/audio/transcriptions".into());
             out.asr_model = model.into();
+            // The original Python Groq settings reuse OpenVINO's VAD controls.
+            out.asr_request_options = Some(
+                json!({"groq_vad_enabled":read["openvino_vad_enabled"].as_bool().unwrap_or(true),"groq_vad_threshold":read["openvino_vad_threshold"].as_f64().unwrap_or(0.5),"groq_vad_revision":1}),
+            );
             Ok(Some(out))
         }
         "openvino" | "faster-whisper" => {
@@ -3853,6 +3884,15 @@ mod tests {
                 .iter()
                 .any(|(key, value)| key == "response_format" && value == "verbose_json")
         );
+    }
+    #[test]
+    fn groq_vad_only_skips_confirmed_empty_spans() {
+        assert!(groq_vad_empty(&json!({"available":true,"spans":[]})));
+        assert!(!groq_vad_empty(&json!({"available":false,"spans":[]})));
+        assert!(!groq_vad_empty(&json!({"available":true})));
+        assert!(!groq_vad_empty(
+            &json!({"available":true,"spans":[{"start_ms":100,"end_ms":500}]})
+        ));
     }
     #[test]
     fn groq_retry_budget_and_typed_status_are_bounded() {

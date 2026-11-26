@@ -38,6 +38,86 @@ pub(crate) async fn publication_cleanup_blocked(
       OR EXISTS(SELECT 1 FROM vr2_social_publish_intents WHERE task_id=$1 AND state NOT IN ('submitted','published','failed'))"#)
       .bind(task).fetch_one(&mut **tx).await?)
 }
+fn sweep_uploads(root: &Path, age: Duration, limit: u64) -> AppResult<u64> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    use std::time::SystemTime;
+    let dirs = match std::fs::read_dir(root) {
+        Ok(d) => d,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(e.into()),
+    };
+    let cutoff = SystemTime::now()
+        .checked_sub(age)
+        .ok_or_else(|| AppError::Invalid("upload expiry overflow".into()))?;
+    let mut count = 0;
+    for dir in dirs {
+        let dir = dir?;
+        if !dir.file_type()?.is_dir()
+            || Uuid::parse_str(&dir.file_name().to_string_lossy()).is_err()
+        {
+            continue;
+        }
+        for item in std::fs::read_dir(dir.path())? {
+            let item = item?;
+            let name = item.file_name();
+            let name = name.to_string_lossy();
+            if !name
+                .strip_suffix(".vr2-upload.partial")
+                .is_some_and(|id| Uuid::parse_str(id).is_ok())
+            {
+                continue;
+            }
+            // Never follow a link; recheck age and identity under exclusive
+            // inode lock. Active uploads, including a stalled HTTP stream,
+            // retain this lock until they rename or exit.
+            let path = item.path();
+            let Ok(before) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if !before.is_file()
+                || before.nlink() != 1
+                || !before.modified().is_ok_and(|t| t < cutoff)
+            {
+                continue;
+            }
+            let Ok(file) = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                .open(&path)
+            else {
+                continue;
+            };
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+                continue;
+            }
+            let actual = file.metadata()?;
+            let Ok(current) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if !actual.is_file()
+                || actual.nlink() != 1
+                || actual.dev() != current.dev()
+                || actual.ino() != current.ino()
+                || !actual.modified().is_ok_and(|t| t < cutoff)
+            {
+                continue;
+            }
+            match std::fs::remove_file(&path) {
+                Ok(()) => {
+                    count += 1;
+                    if count >= limit {
+                        return Ok(count);
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => tracing::warn!(error=%e,"abandoned upload cleanup deferred"),
+            }
+        }
+    }
+    Ok(count)
+}
 impl AssetRegistry {
     pub fn new(db: Database, root: PathBuf) -> Self {
         Self { db, root }
@@ -507,6 +587,16 @@ impl AssetRegistry {
         }
         Ok(deleted)
     }
+    /// Clean only the new upload-specific temporary namespace. Never scan
+    /// the Python sibling .partial directory or yt-dlp resumable transfers.
+    pub async fn collect_abandoned_uploads(&self) -> AppResult<u64> {
+        let root = self.resolve_existing("v2/artifacts").await?;
+        tokio::task::spawn_blocking(move || {
+            sweep_uploads(&root, std::time::Duration::from_secs(86400), 500)
+        })
+        .await
+        .map_err(|e| AppError::Unavailable(format!("upload cleanup task failed: {e}")))?
+    }
     /// Cleanup only explicit v2/{raw,sub,render,dubbing}/{UUID} directories.
     pub async fn collect_workdirs(&self, limit: i64) -> AppResult<u64> {
         let keys = sqlx::query(
@@ -632,6 +722,35 @@ mod tests {
             );
         }
         assert!(AssetRegistry::checked_key("raw/550e8400.mp4").is_ok());
+    }
+    #[test]
+    fn abandoned_upload_sweep_preserves_locked_and_unrelated_files() {
+        use std::os::fd::AsRawFd;
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join(Uuid::new_v4().to_string());
+        std::fs::create_dir(&dir).unwrap();
+        let stale = dir.join(format!("{}.vr2-upload.partial", Uuid::new_v4()));
+        let locked = dir.join(format!("{}.vr2-upload.partial", Uuid::new_v4()));
+        let unrelated = dir.join("source.mp4.part");
+        let symlink = dir.join(format!("{}.vr2-upload.partial", Uuid::new_v4()));
+        std::fs::write(&stale, b"x").unwrap();
+        std::fs::write(&locked, b"x").unwrap();
+        std::fs::write(&unrelated, b"x").unwrap();
+        std::os::unix::fs::symlink(&unrelated, &symlink).unwrap();
+        let active = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&locked)
+            .unwrap();
+        assert_eq!(
+            unsafe { libc::flock(active.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(sweep_uploads(root.path(), Duration::ZERO, 500).unwrap(), 1);
+        assert!(!stale.exists() && locked.exists() && unrelated.exists() && symlink.exists());
+        drop(active);
+        assert_eq!(sweep_uploads(root.path(), Duration::ZERO, 500).unwrap(), 1);
     }
     #[tokio::test]
     async fn rejects_symlink_without_touching_outside() {
