@@ -91,6 +91,34 @@ def transcribe(req):
             raise RuntimeError("OpenVINO returned text without timestamps")
     return {"segments":out}
 
+def speech_spans(req):
+    """CPU Silero VAD only; return uncertainty instead of suppressing speech
+    when the optional dependency or audio decoding is unavailable."""
+    try:
+        import numpy as np
+        from faster_whisper.audio import decode_audio
+        from faster_whisper.vad import VadOptions, get_speech_timestamps
+        audio=Path(req["audio"])
+        if not audio.is_file() or audio.stat().st_size>24*1024*1024:
+            return {"available":False}
+        samples=decode_audio(str(audio),sampling_rate=16000)
+        if len(samples)>60*16000 or not np.isfinite(samples).all():
+            return {"available":False}
+        if len(samples)==0:
+            return {"available":False}
+        if float(np.max(np.abs(samples)))<0.0001:
+            return {"available":True,"spans":[]}
+        spans=get_speech_timestamps(samples,VadOptions(
+            threshold=max(0.01,min(0.99,float(req.get("threshold",0.5)))),
+            min_speech_duration_ms=250,min_silence_duration_ms=500,
+            speech_pad_ms=180,max_speech_duration_s=30))
+        return {"available":True,"spans":[
+            {"start_ms":round(max(0,int(span["start"]))/16),
+             "end_ms":round(min(len(samples),int(span["end"]))/16)}
+            for span in spans if int(span["end"])>int(span["start"])]}
+    except Exception:
+        return {"available":False}
+
 def embedding(req):
     import numpy as np
     path=Path(req["model_path"])
@@ -128,6 +156,7 @@ MAX_RESPONSE=12*1024*1024
 def dispatch(req):
     if req["kind"]=="asr":return transcribe(req)
     if req["kind"]=="embedding":return embedding(req)
+    if req["kind"]=="vad":return speech_spans(req)
     if req["kind"]=="devices":
         import openvino as ov
         return {"devices":ov.Core().available_devices}

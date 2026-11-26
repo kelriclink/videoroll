@@ -19,18 +19,32 @@ use uuid::Uuid;
 
 const KEY: &str = "publish.review.settings";
 fn normalized_words(raw: &Value) -> AppResult<Vec<String>> {
-    let input = raw
-        .as_array()
-        .ok_or_else(|| AppError::Invalid("blocked_words must be string array".into()))?;
+    let items;
+    let input: Vec<&str> = match raw {
+        Value::Null => Vec::new(),
+        Value::String(text) => text.split(['\n', ',', '，', ';', '；']).collect(),
+        Value::Array(values) => {
+            items = values
+                .iter()
+                .map(|item| {
+                    item.as_str()
+                        .ok_or_else(|| AppError::Invalid("blocked word must be string".into()))
+                })
+                .collect::<AppResult<Vec<_>>>()?;
+            items
+        }
+        _ => {
+            return Err(AppError::Invalid(
+                "blocked_words must be string or string array".into(),
+            ));
+        }
+    };
     if input.len() > 300 {
         return Err(AppError::Invalid("too many blocked words".into()));
     }
     let mut result = Vec::new();
     for item in input {
-        let word = item
-            .as_str()
-            .ok_or_else(|| AppError::Invalid("blocked word must be string".into()))?
-            .trim();
+        let word = item.trim();
         if word.is_empty() {
             continue;
         }
@@ -125,17 +139,55 @@ async fn update_settings(
     Ok(Json(result))
 }
 fn blocked_words(title: &str, summary: &str, subtitles: &str, words: &[String]) -> Vec<String> {
-    let content = format!("{title}\n{summary}\n{subtitles}").to_lowercase();
+    let content = [
+        title.to_lowercase(),
+        summary.to_lowercase(),
+        subtitles.to_lowercase(),
+    ];
     words
         .iter()
-        .filter(|word| content.contains(&word.to_lowercase()))
+        .filter(|word| {
+            let lower = word.to_lowercase();
+            content.iter().any(|text| text.contains(&lower))
+        })
         .cloned()
         .collect()
+}
+fn plain_subtitle(raw: &str) -> String {
+    // Mirror Python's SRT index/timing, ASS override and HTML tag
+    // normalization. Unclosed markup is retained, never discarded.
+    let mut out = String::new();
+    for line in raw.trim_start_matches('\u{feff}').lines() {
+        let line = line.trim();
+        if line.is_empty() || line.chars().all(|c| c.is_numeric()) || line.contains("-->") {
+            continue;
+        }
+        let line = line.replace("\\N", " ").replace("\\n", " ");
+        let mut rest = line.as_str();
+        while let Some((offset, c)) = rest.char_indices().next() {
+            debug_assert_eq!(offset, 0);
+            let tail = &rest[c.len_utf8()..];
+            if matches!(c, '{' | '<') {
+                let close = if c == '{' { '}' } else { '>' };
+                if let Some(end) = tail.find(close) {
+                    let inside = &tail[..end];
+                    if (c == '{' && !inside.contains('{')) || (c == '<' && !inside.is_empty()) {
+                        rest = &tail[end + close.len_utf8()..];
+                        continue;
+                    }
+                }
+            }
+            out.push(c);
+            rest = tail;
+        }
+        out.push(' ');
+    }
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 async fn subtitle_content(db: &Database, storage: &AssetRegistry, id: Uuid) -> AppResult<String> {
     let key: Option<String> = sqlx::query_scalar(
         "SELECT storage_key FROM assets WHERE task_id=$1 AND kind='subtitle_srt'::asset_kind
-         AND storage_key LIKE 'v2/%' ORDER BY created_at DESC,id DESC LIMIT 1",
+         ORDER BY created_at DESC,id DESC LIMIT 1",
     )
     .bind(id)
     .fetch_optional(&db.pool)
@@ -151,19 +203,22 @@ async fn subtitle_content(db: &Database, storage: &AssetRegistry, id: Uuid) -> A
     let bytes = tokio::fs::read(path).await?;
     let raw =
         String::from_utf8(bytes).map_err(|_| AppError::Invalid("subtitle UTF8 invalid".into()))?;
-    let text = crate::subtitles::parse_srt(&raw)?
-        .into_iter()
-        .map(|cue| cue.text)
-        .collect::<Vec<_>>()
-        .join(" ");
-    Ok(text)
+    Ok(plain_subtitle(&raw))
 }
 fn limited(value: &str, max: usize) -> String {
-    value.chars().take(max).collect::<String>()
+    let text = value.trim();
+    if text.chars().count() <= max {
+        return text.to_owned();
+    }
+    if max <= 1 {
+        return text.chars().take(max).collect();
+    }
+    format!("{}…", text.chars().take(max - 1).collect::<String>())
 }
 fn fingerprint(meta: &Value, settings: &Value, subtitle: &str) -> AppResult<String> {
-    let buffer = serde_json::to_vec(&json!({"meta":meta,"rules":settings,"subtitle":subtitle}))
-        .map_err(|_| AppError::Invalid("review fingerprint serialization failed".into()))?;
+    let buffer =
+        serde_json::to_vec(&json!({"revision":2,"meta":meta,"rules":settings,"subtitle":subtitle}))
+            .map_err(|_| AppError::Invalid("review fingerprint serialization failed".into()))?;
     Ok(hex::encode(Sha256::digest(&buffer)))
 }
 async fn from_model(
@@ -289,7 +344,7 @@ async fn review(
     let clean_title = limited(title, 120);
     let clean_summary = limited(summary, 3000);
     let clean_subtitle = limited(&subtitle, 12000);
-    let fp = fingerprint(meta, &settings, &clean_subtitle)?;
+    let fp = fingerprint(meta, &settings, &subtitle)?;
     if !enabled {
         return Ok(standard_result(
             false,
@@ -323,7 +378,8 @@ async fn review(
         .filter_map(Value::as_str)
         .map(str::to_owned)
         .collect::<Vec<_>>();
-    let matched = blocked_words(&clean_title, &clean_summary, &clean_subtitle, &words);
+    // Scan the full bounded materials; the AI prompt alone is excerpted.
+    let matched = blocked_words(title, summary, &subtitle, &words);
     let result = if !matched.is_empty() {
         standard_result(
             true,
@@ -493,6 +549,23 @@ pub fn router() -> Router<AppState> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn legacy_review_normalization_and_full_text_rules() {
+        let words = normalized_words(&json!("Bad, bad；违禁\n危险")).unwrap();
+        assert_eq!(words, vec!["Bad", "违禁", "危险"]);
+        let subtitle = plain_subtitle(
+            "\u{feff}1\n00:00:00,000 --> 00:00:01,000\n<b>违</b>{\\an8}禁\\Nnext\n\n2\n00:00:01,000 --> 00:00:02,000\nDanger",
+        );
+        assert_eq!(subtitle, "违禁 next Danger");
+        assert_eq!(blocked_words("", "", &subtitle, &words), vec!["违禁"]);
+        let full = format!("{}Bad", "中".repeat(13000));
+        assert_eq!(blocked_words("", "", &full, &words), vec!["Bad"]);
+        assert!(!limited(&full, 12000).contains("Bad"));
+        assert_ne!(
+            fingerprint(&json!({}), &json!({}), &full).unwrap(),
+            fingerprint(&json!({}), &json!({}), &format!("{full}x")).unwrap()
+        );
+    }
     #[test]
     fn block_words_and_missing_content_never_auto_approve() {
         let ws = normalized_words(&json!(["违禁", "违禁", " 失败 "])).unwrap();

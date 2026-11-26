@@ -44,27 +44,72 @@ pub struct LinkQuery {
     pub task_id: Option<Uuid>,
     pub channel_id: Option<i32>,
 }
-fn safe_filename(title: &str, task_id: Uuid, part: u8) -> String {
-    let mut cleaned = String::new();
-    for c in title.trim().chars().take(110) {
-        if c.is_alphanumeric() || matches!(c, ' ' | '.' | '-' | '_') {
-            cleaned.push(c);
-        } else if c.is_whitespace()
-            || matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|')
-        {
-            cleaned.push('_');
-        }
+fn truncate_bytes(value: &str, limit: usize) -> String {
+    let mut end = value.len().min(limit);
+    while !value.is_char_boundary(end) {
+        end -= 1;
     }
-    let cleaned = cleaned.trim_matches(|c| matches!(c, ' ' | '.' | '_'));
-    let cleaned = if cleaned.is_empty() {
-        "VideoRoll"
+    value[..end].trim_matches([' ', '.']).to_owned()
+}
+fn safe_filename(title: &str, key: &str, asset: Uuid) -> String {
+    let path = FilePath::new(key);
+    let extension = path
+        .extension()
+        .and_then(|v| v.to_str())
+        .unwrap_or("mp4")
+        .to_ascii_lowercase();
+    let extension = if ["mp4", "mkv", "webm", "mov", "m4v"].contains(&extension.as_str()) {
+        extension.as_str()
     } else {
-        cleaned
+        "mp4"
+    };
+    let title = if title.trim().is_empty() {
+        path.file_stem().and_then(|v| v.to_str()).unwrap_or("")
+    } else {
+        title
+    };
+    let sanitized = title
+        .chars()
+        .map(|c| {
+            if c.is_control() || matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect::<String>();
+    let name = sanitized.split_whitespace().collect::<Vec<_>>().join(" ");
+    let name = name.trim_matches([' ', '.']);
+    let reserved = name.split('.').next().unwrap_or("").to_ascii_uppercase();
+    let reserved = matches!(reserved.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || (reserved.len() == 4
+            && (reserved.starts_with("COM") || reserved.starts_with("LPT"))
+            && matches!(reserved.as_bytes()[3], b'1'..=b'9'));
+    let fallback = format!("视频-{}", &asset.simple().to_string()[..8]);
+    let name = if name.is_empty() || reserved {
+        &fallback
+    } else {
+        name
     };
     format!(
-        "{cleaned}-{}-P{part}.mp4",
-        &task_id.simple().to_string()[..8]
+        "{}.{}",
+        truncate_bytes(name, 180 - extension.len() - 1),
+        extension
     )
+}
+fn collision_names(filename: &str, asset: Uuid) -> Vec<String> {
+    let path = FilePath::new(filename);
+    let stem = path.file_stem().and_then(|v| v.to_str()).unwrap_or("视频");
+    let ext = path.extension().and_then(|v| v.to_str()).unwrap_or("mp4");
+    let suffix = &asset.simple().to_string()[..8];
+    vec![
+        filename.to_owned(),
+        format!(
+            "{}-{suffix}.{ext}",
+            truncate_bytes(stem, 180 - 1 - ext.len() - 9)
+        ),
+        format!("{asset}.{ext}"),
+    ]
 }
 fn checked_channel(channel_id: i32) -> AppResult<()> {
     if !(1..=100_000).contains(&channel_id) {
@@ -75,6 +120,14 @@ fn checked_channel(channel_id: i32) -> AppResult<()> {
     Ok(())
 }
 async fn playout_path(state: &AppState, filename: &str) -> AppResult<PathBuf> {
+    if filename.is_empty()
+        || filename == "."
+        || filename == ".."
+        || filename.contains(['/', '\\'])
+        || filename.chars().any(char::is_control)
+    {
+        return Err(AppError::Invalid("invalid playout basename".into()));
+    }
     let root =
         state.config.playout_root.as_ref().ok_or_else(|| {
             AppError::Unavailable("V2 ffplayout media root is not configured".into())
@@ -151,9 +204,14 @@ async fn candidate_asset(state: &AppState, request: &ImportRequest) -> AppResult
             })?)
             .await?
     };
+    if (part == 1 && asset.kind != "video_final") || (part == 2 && asset.kind != "video_dubbed") {
+        return Err(AppError::Invalid(
+            "playout part does not match asset kind".into(),
+        ));
+    }
     if part == 2 {
         let associated:Option<Uuid>=sqlx::query_scalar(
-            "SELECT job_id FROM vr2_dubbing_runs WHERE task_id=$1 AND output_video_key=$2 AND model_status='succeeded' ORDER BY finished_at DESC LIMIT 1"
+            "SELECT job_id FROM vr2_dubbing_runs WHERE task_id=$1 AND output_video_key=$2 AND model_status='succeeded' ORDER BY created_at DESC LIMIT 1"
         ).bind(request.task_id).bind(&asset.storage_key)
             .fetch_optional(&state.db.pool).await?;
         if associated.is_none() {
@@ -164,17 +222,25 @@ async fn candidate_asset(state: &AppState, request: &ImportRequest) -> AppResult
     }
     Ok((asset.id, asset.storage_key))
 }
-async fn title(db: &Database, task_id: Uuid) -> String {
-    let result: Result<Option<String>, sqlx::Error> =
-        sqlx::query_scalar("SELECT NULLIF(title,'') FROM youtube_video_meta WHERE task_id=$1")
-            .bind(task_id)
-            .fetch_optional(&db.pool)
-            .await;
-    result
-        .ok()
-        .flatten()
-        .filter(|v| !v.trim().is_empty())
-        .unwrap_or_else(|| format!("VideoRoll-{}", task_id.simple()))
+async fn title(db: &Database, task_id: Uuid) -> AppResult<String> {
+    let result:Option<String>=sqlx::query_scalar("SELECT COALESCE(NULLIF(trim(value_json->>'translated_title'),''),NULLIF(trim(value_json->>'source_title'),'')) FROM app_settings WHERE key=$1")
+        .bind(format!("task.title.{task_id}")).fetch_optional(&db.pool).await?.flatten();
+    Ok(result.unwrap_or_default())
+}
+async fn file_sha(path: &FilePath) -> AppResult<String> {
+    use sha2::Digest;
+    use tokio::io::AsyncReadExt;
+    let mut file = fs::File::open(path).await?;
+    let mut sha = sha2::Sha256::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        sha.update(&buf[..n]);
+    }
+    Ok(hex::encode(sha.finalize()))
 }
 async fn secure_link(source: &FilePath, destination: &FilePath) -> AppResult<String> {
     let info = fs::symlink_metadata(source).await?;
@@ -245,16 +311,58 @@ pub async fn import(state: &AppState, body: ImportRequest) -> AppResult<PlayoutL
             "ffplayout source video size invalid".into(),
         ));
     }
-    let name = body
-        .title
-        .clone()
-        .unwrap_or(title(&state.db, body.task_id).await);
-    let part = body.part.unwrap_or(1);
-    let relative = format!("VideoRoll/{}", safe_filename(&name, body.task_id, part));
-    let filename = relative.rsplit('/').next().unwrap_or_default();
-    let dest = playout_path(state, filename).await?;
-    let actual_path = dest.to_string_lossy().to_string();
+    let name = match body.title.as_deref().filter(|v| !v.trim().is_empty()) {
+        Some(v) => v.to_owned(),
+        None => title(&state.db, body.task_id).await?,
+    };
     let mut tx = state.db.pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('videoroll:playout:filename',0))")
+        .execute(&mut *tx)
+        .await?;
+    let previous:Option<(String,String,String)>=sqlx::query_as("SELECT relative_media_path,source_checksum,runtime_engine FROM playout_asset_links WHERE asset_id=$1 AND ffplayout_channel_id=$2")
+        .bind(asset_id).bind(body.channel_id).fetch_optional(&mut *tx).await?;
+    let filename = if let Some((relative, checksum, engine)) = previous {
+        if engine != "rust-v2" || checksum != sha {
+            return Err(AppError::Conflict(
+                "historical or changed playout link requires reconciliation".into(),
+            ));
+        }
+        let file = relative
+            .strip_prefix("VideoRoll/")
+            .filter(|v| !v.is_empty() && !v.contains(['/', '\\']) && *v != "." && *v != "..")
+            .ok_or_else(|| {
+                AppError::Conflict("historical nested path requires reconciliation".into())
+            })?;
+        file.to_owned()
+    } else {
+        let mut chosen = None;
+        for candidate in collision_names(&safe_filename(&name, &key, asset_id), asset_id) {
+            let relative = format!("VideoRoll/{candidate}");
+            let occupied: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM playout_asset_links WHERE relative_media_path=$1)",
+            )
+            .bind(&relative)
+            .fetch_one(&mut *tx)
+            .await?;
+            if occupied {
+                continue;
+            }
+            let path = playout_path(state, &candidate).await?;
+            match fs::symlink_metadata(&path).await {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    chosen = Some(candidate);
+                    break;
+                }
+                Ok(_) => continue,
+                Err(e) => return Err(e.into()),
+            }
+        }
+        chosen
+            .ok_or_else(|| AppError::Conflict("cannot allocate unique playout filename".into()))?
+    };
+    let relative = format!("VideoRoll/{filename}");
+    let dest = playout_path(state, &filename).await?;
+    let actual_path = dest.to_string_lossy().to_string();
     let row = sqlx::query(
         "INSERT INTO playout_asset_links(
           id,task_id,asset_id,source_asset_id,ffplayout_channel_id,
@@ -288,22 +396,7 @@ pub async fn import(state: &AppState, body: ImportRequest) -> AppResult<PlayoutL
     tx.commit().await?;
     let transfer = secure_link(&source, &dest).await?;
     // The checksum of destination is verified even when the filename existed.
-    let destination_sha = {
-        let mut file = fs::File::open(&dest).await?;
-        let mut hasher = sha2::Sha256::new();
-        let mut buffer = vec![0u8; 64 * 1024];
-        loop {
-            use tokio::io::AsyncReadExt;
-            let n = file.read(&mut buffer).await?;
-            if n == 0 {
-                break;
-            }
-            use sha2::Digest;
-            hasher.update(&buffer[..n]);
-        }
-        use sha2::Digest;
-        hex::encode(hasher.finalize())
-    };
+    let destination_sha = file_sha(&dest).await?;
     if destination_sha != sha {
         return Err(AppError::Conflict(
             "ffplayout media checksum mismatch".into(),
@@ -323,7 +416,14 @@ pub async fn import(state: &AppState, body: ImportRequest) -> AppResult<PlayoutL
         "UPDATE vr2_playout_links SET status='ready',transfer_mode=$1,updated_at=now() WHERE id=$2",
     )
     .bind(if transfer == "existing" {
-        "copy"
+        use std::os::unix::fs::MetadataExt;
+        let src = fs::metadata(&source).await?;
+        let dst = fs::metadata(&dest).await?;
+        if src.dev() == dst.dev() && src.ino() == dst.ino() {
+            "hardlink"
+        } else {
+            "copy"
+        }
     } else {
         transfer.as_str()
     })
@@ -399,11 +499,21 @@ mod tests {
     use super::*;
     #[test]
     fn sanitized_filename_stable_and_safe() {
-        let task = Uuid::new_v4();
-        let name = safe_filename("../测试/Footage:*?|<>", task, 1);
+        let asset = Uuid::new_v4();
+        assert_eq!(
+            safe_filename("中文标题", "raw/a.mkv", asset),
+            "中文标题.mkv"
+        );
+        let name = safe_filename("../测试/Footage:*?|<>", "raw/a.mp4", asset);
         assert!(!name.contains('/'));
         assert!(!name.contains('\\'));
-        assert!(name.ends_with("-P1.mp4"));
+        assert!(safe_filename("CON.txt", "raw/a.mp4", asset).starts_with("视频-"));
+        let long = safe_filename(&"中文".repeat(200), "raw/a.webm", asset);
+        for name in collision_names(&long, asset) {
+            assert!(name.len() <= 180);
+            assert!(name.ends_with(".webm"));
+        }
+        assert_eq!(collision_names("视频.mp4", asset)[0], "视频.mp4");
     }
     #[tokio::test]
     async fn destination_is_not_overwritten_by_link() {

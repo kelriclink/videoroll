@@ -41,6 +41,13 @@ fn allowed_asset(kind: &str, ext: &str) -> Option<u64> {
         _ => None,
     }
 }
+fn lock_upload(file: &fs::File) -> AppResult<()> {
+    use std::os::fd::AsRawFd;
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(())
+}
 async fn list_assets(
     State(state): State<AppState>,
     Path(task_id): Path<Uuid>,
@@ -66,10 +73,11 @@ async fn upload(
     let key = format!("{directory}/{file_id}.{}", p.extension);
     AssetRegistry::checked_key(&key)?;
     let completed = state.storage.resolve_existing(&key).await?;
-    let temporary = dir.join(format!("{file_id}.incomplete"));
+    let temporary = dir.join(format!("{file_id}.vr2-upload.partial"));
     let mut committed = false;
     let result=async {
         let mut file=fs::OpenOptions::new().write(true).create_new(true).open(&temporary).await?;
+        lock_upload(&file)?;
         let mut sha=Sha256::new();
         let mut bytes=0u64;
         let mut stream=request.into_body().into_data_stream();
@@ -84,8 +92,8 @@ async fn upload(
         if bytes==0 {return Err(AppError::Invalid("zero-byte media is not a valid asset".into()));}
         file.flush().await?;
         file.sync_all().await?;
-        drop(file);
         fs::rename(&temporary,&completed).await?;
+        drop(file);
         let digest=hex::encode(sha.finalize());
         let mut tx=state.db.pool.begin().await?;
         let status:Option<String>=sqlx::query_scalar(
@@ -177,7 +185,7 @@ pub(crate) async fn upload_video_form(
     let file_id = Uuid::new_v4();
     let key = format!("{directory}/{file_id}.{ext}");
     let dest = state.storage.resolve_existing(&key).await?;
-    let temporary = dir.join(format!("{file_id}.uploading"));
+    let temporary = dir.join(format!("{file_id}.vr2-upload.partial"));
     let mut committed = false;
     let result = async {
         let mut file = fs::OpenOptions::new()
@@ -185,6 +193,7 @@ pub(crate) async fn upload_video_form(
             .create_new(true)
             .open(&temporary)
             .await?;
+        lock_upload(&file)?;
         let mut sha = Sha256::new();
         let mut bytes = 0u64;
         while let Some(chunk) = field
@@ -208,10 +217,10 @@ pub(crate) async fn upload_video_form(
         }
         file.flush().await?;
         file.sync_all().await?;
-        drop(file);
         // Verify a valid video exists before committing any asset record.
         crate::media::ffmpeg::probe_video(&state.config.ffprobe_binary, &temporary).await?;
         fs::rename(&temporary, &dest).await?;
+        drop(file);
         let sha = hex::encode(sha.finalize());
         let mut tx = state.db.pool.begin().await?;
         let task = sqlx::query(

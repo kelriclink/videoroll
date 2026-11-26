@@ -124,7 +124,6 @@ pub(super) async fn page_text(
 const WIKI_API: &str = "https://en.wikipedia.org/w/api.php";
 const WIKI_MAX_BYTES: usize = 512 * 1024;
 pub(super) const WIKI_BUDGET: usize = 2;
-static WIKI_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn wiki_endpoint() -> AppResult<Url> {
     if let Ok(raw) = std::env::var("VIDEOROLL_V2_TEST_WIKI_ENDPOINT") {
@@ -224,10 +223,9 @@ impl RetrievalQuery {
                 "Wikipedia retrieval not permitted".into(),
             ));
         }
-        let _guard = WIKI_GATE.lock().await;
-        tokio::time::sleep(Duration::from_millis(200)).await;
         lease(db, task.job).await?;
         let mut url = wiki_endpoint()?;
+        let provider = provider_cache::identity("wiki", url.as_str(), None);
         url.query_pairs_mut().extend_pairs([
             ("action", "query"),
             ("generator", "search"),
@@ -242,38 +240,27 @@ impl RetrievalQuery {
             ("format", "json"),
             ("formatversion", "2"),
         ]);
-        let client = Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(Duration::from_secs(12))
-            .user_agent("VideoRoll-Rust/0.1 (https://github.com/kelriclink/videoroll)")
-            .build()?;
-        let mut response = client
-            .get(url)
-            .header("Accept", "application/json")
-            .send()
+        let cache_key = provider_cache::identity(&provider, url.as_str(), None);
+        let docs =
+            provider_cache::retrieve(&provider, &cache_key, Duration::from_secs(900), || async {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                let client = Client::builder()
+                    .redirect(reqwest::redirect::Policy::none())
+                    .timeout(Duration::from_secs(12))
+                    .user_agent("VideoRoll-Rust/0.1 (https://github.com/kelriclink/videoroll)")
+                    .build()?;
+                let response = client
+                    .get(url)
+                    .header("Accept", "application/json")
+                    .send()
+                    .await?;
+                provider_cache::check_status(&provider, &response).await?;
+                let body = provider_cache::bounded_body(response, WIKI_MAX_BYTES).await?;
+                let payload: Value = serde_json::from_slice(&body)
+                    .map_err(|_| AppError::Unavailable("invalid Wikipedia JSON".into()))?;
+                wiki_pages(&payload)
+            })
             .await?;
-        if !response.status().is_success() {
-            return Err(AppError::Unavailable(format!(
-                "Wikipedia HTTP {}",
-                response.status()
-            )));
-        }
-        if response
-            .content_length()
-            .is_some_and(|n| n > WIKI_MAX_BYTES as u64)
-        {
-            return Err(AppError::Unavailable("Wikipedia response too large".into()));
-        }
-        let mut body = Vec::new();
-        while let Some(chunk) = response.chunk().await? {
-            if chunk.len() > WIKI_MAX_BYTES.saturating_sub(body.len()) {
-                return Err(AppError::Unavailable("Wikipedia response too large".into()));
-            }
-            body.extend_from_slice(&chunk);
-        }
-        let payload: Value = serde_json::from_slice(&body)
-            .map_err(|_| AppError::Unavailable("invalid Wikipedia JSON".into()))?;
-        let docs = wiki_pages(&payload)?;
         lease(db, task.job).await?;
         Ok(docs)
     }

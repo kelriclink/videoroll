@@ -315,8 +315,17 @@ async fn main() -> anyhow::Result<()> {
             workers.spawn(async move {
                 // Indexed due-date GC; zero directory scans on idle cycles.
                 let mut tick = tokio::time::interval(std::time::Duration::from_secs(300));
+                let mut next_upload_sweep=tokio::time::Instant::now();
                 loop {
                     tick.tick().await;
+                    if tokio::time::Instant::now()>=next_upload_sweep{
+                        next_upload_sweep=tokio::time::Instant::now()+std::time::Duration::from_secs(3600);
+                        match maintenance_store.collect_abandoned_uploads().await{
+                            Ok(n) if n>0=>tracing::info!(removed=n,"abandoned uploads cleaned"),
+                            Ok(_)=>{},
+                            Err(error)=>tracing::warn!(%error,"abandoned upload cleanup deferred")
+                        }
+                    }
                     if let Err(e) = maintenance_store
                         .reconcile_terminal_resources(50, std::time::Duration::from_secs(86_400))
                         .await
