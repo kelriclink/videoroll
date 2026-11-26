@@ -108,10 +108,12 @@ def speech_spans(req):
             return {"available":False}
         if float(np.max(np.abs(samples)))<0.0001:
             return {"available":True,"spans":[]}
+        refine=req.get("purpose")=="timing"
         spans=get_speech_timestamps(samples,VadOptions(
             threshold=max(0.01,min(0.99,float(req.get("threshold",0.5)))),
-            min_speech_duration_ms=250,min_silence_duration_ms=500,
-            speech_pad_ms=180,max_speech_duration_s=30))
+            min_speech_duration_ms=120 if refine else 250,
+            min_silence_duration_ms=160 if refine else 500,
+            speech_pad_ms=80 if refine else 180,max_speech_duration_s=60 if refine else 30))
         return {"available":True,"spans":[
             {"start_ms":round(max(0,int(span["start"]))/16),
              "end_ms":round(min(len(samples),int(span["end"]))/16)}

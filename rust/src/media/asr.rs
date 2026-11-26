@@ -1013,6 +1013,8 @@ async fn run_groq(
         "Groq Whisper retry budget exhausted".into(),
     ))
 }
+#[path = "asr_timing.rs"]
+mod timing;
 fn groq_vad_empty(value: &Value) -> bool {
     value["available"].as_bool() == Some(true)
         && value["spans"].as_array().is_some_and(Vec::is_empty)
@@ -2539,7 +2541,7 @@ pub(crate) async fn process(
         (WINDOW, OVERLAP)
     };
     let asr_identity = fingerprint(&json!({
-        "checkpoint_version":3,"video_sha256":source_digest,
+        "checkpoint_version":4,"timing_refine_revision":1,"vad_runtime_configured":crate::local_inference::configured(),"video_sha256":source_digest,
         "model":config.asr_model,"asr_endpoint":config.asr_endpoint,"local_asr":config.local_asr,
         "asr_request_options":config.asr_request_options,
         "language":profile.asr_language,"duration_ms":(duration*1000.0).round() as u64,
@@ -2587,7 +2589,7 @@ pub(crate) async fn process(
                 .ok()
                 .and_then(|raw| serde_json::from_slice::<Checkpoint>(&raw).ok())
                 .filter(|row| {
-                    row.revision == 3
+                    row.revision == 4
                         && row.offset_ms == offset_ms
                         && row.fingerprint == asr_identity
                 });
@@ -2639,20 +2641,47 @@ pub(crate) async fn process(
                         Err(err) => return Err(err),
                     }
                 }
-                let _ = fs::remove_file(&flac).await;
                 // Retain the full overlap. Midpoint clipping loses continuing
                 // utterances and genuine repetitions before reconciliation.
-                let result = normalize_asr(
+                let mut result = normalize_asr(
                     result.ok_or_else(|| AppError::Unavailable("ASR returned no result".into()))?,
                     offset_ms,
                     0,
                     (duration * 1000.0) as u64,
                 )?;
+                if !result.is_empty() && crate::local_inference::configured() {
+                    let options = config.asr_request_options.as_ref().unwrap_or(&Value::Null);
+                    let threshold = options["groq_vad_threshold"]
+                        .as_f64()
+                        .or(options["vad_threshold"].as_f64())
+                        .or_else(|| {
+                            config
+                                .local_asr
+                                .as_ref()
+                                .and_then(|v| v["vad_threshold"].as_f64())
+                        })
+                        .unwrap_or(0.5);
+                    let request = json!({"kind":"vad","device":"CPU","purpose":"timing","audio":flac,"threshold":threshold});
+                    if let Ok(value) =
+                        crate::local_inference::invoke(&request, Duration::from_secs(60)).await
+                    {
+                        if let Some(spans) =
+                            timing::parse_spans(&value, offset_ms, (seconds * 1000.).round() as u64)
+                        {
+                            timing::refine(
+                                &mut result,
+                                &spans,
+                                offset_ms.saturating_add((seconds * 1000.).round() as u64),
+                            );
+                        }
+                    }
+                }
+                let _ = fs::remove_file(&flac).await;
                 selective_lease(db, job).await?;
                 atomic_write(
                     &checkpoint,
                     &serde_json::to_vec(&Checkpoint {
-                        revision: 3,
+                        revision: 4,
                         fingerprint: asr_identity.clone(),
                         offset_ms,
                         cues: result.clone(),

@@ -149,6 +149,9 @@ fn supported_update(key: &str) -> bool {
             | "translate_provider"
             | "translate_model_provider_id"
             | "translate_model_id"
+            | "publish_translate_title"
+            | "publish_enable_reprint"
+            | "publish_title_prefix"
     )
 }
 fn validate_update(update: &Map<String, Value>) -> AppResult<()> {
@@ -162,8 +165,20 @@ fn validate_update(update: &Map<String, Value>) -> AppResult<()> {
             continue;
         }
         match key.as_str() {
-            "translate_enabled" | "bilingual" if !value.is_boolean() => {
+            "translate_enabled"
+            | "bilingual"
+            | "publish_translate_title"
+            | "publish_enable_reprint"
+                if !value.is_boolean() =>
+            {
                 return Err(AppError::Invalid(format!("{key} requires bool")));
+            }
+            "publish_title_prefix"
+                if value
+                    .as_str()
+                    .is_none_or(|s| s.chars().count() > 40 || s.chars().any(char::is_control)) =>
+            {
+                return Err(AppError::Invalid("invalid publish title prefix".into()));
             }
             "translate_provider"
                 if !value.as_str().is_some_and(|s| {

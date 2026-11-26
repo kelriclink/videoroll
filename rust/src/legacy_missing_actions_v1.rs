@@ -325,10 +325,7 @@ async fn add_asset_to_playout(
 ) -> AppResult<Json<Value>> {
     read_task(&state.db, task_id).await?;
     let asset = state.db.asset(asset_id).await?;
-    if asset.task_id != task_id
-        || asset.kind != "video_final"
-        || !asset.storage_key.starts_with("v2/")
-    {
+    if asset.task_id != task_id || asset.kind != "video_final" {
         return Err(AppError::NotFound("final task video not found".into()));
     }
     let link = crate::playout::import(

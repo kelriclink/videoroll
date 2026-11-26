@@ -119,49 +119,65 @@ fn checked_channel(channel_id: i32) -> AppResult<()> {
     }
     Ok(())
 }
-async fn playout_path(state: &AppState, filename: &str) -> AppResult<PathBuf> {
-    if filename.is_empty()
-        || filename == "."
-        || filename == ".."
-        || filename.contains(['/', '\\'])
-        || filename.chars().any(char::is_control)
-    {
-        return Err(AppError::Invalid("invalid playout basename".into()));
+fn checked_playout_relative(relative: &str) -> AppResult<&str> {
+    AssetRegistry::checked_key(relative)?;
+    if !relative.starts_with("VideoRoll/") || relative.split('/').count() < 2 {
+        return Err(AppError::Invalid("invalid historical playout path".into()));
     }
-    let root =
+    Ok(relative)
+}
+async fn relative_playout_path(
+    state: &AppState,
+    relative: &str,
+    create: bool,
+) -> AppResult<PathBuf> {
+    let relative = checked_playout_relative(relative)?;
+    let configured =
         state.config.playout_root.as_ref().ok_or_else(|| {
             AppError::Unavailable("V2 ffplayout media root is not configured".into())
         })?;
-    let root_meta = fs::symlink_metadata(root).await?;
-    if root_meta.file_type().is_symlink() {
-        return Err(AppError::Invalid(
-            "ffplayout root cannot be a symbolic link".into(),
-        ));
+    let meta = fs::symlink_metadata(configured).await?;
+    if !meta.is_dir() || meta.file_type().is_symlink() {
+        return Err(AppError::Invalid("unsafe playout root".into()));
     }
-    let root = fs::canonicalize(root).await?;
-    let directory = root.join("VideoRoll");
-    match fs::symlink_metadata(&directory).await {
-        Ok(meta) if meta.file_type().is_symlink() => {
-            return Err(AppError::Invalid(
-                "ffplayout VideoRoll directory cannot be a link".into(),
-            ));
+    let mut path = fs::canonicalize(configured).await?;
+    let segments = relative.split('/').collect::<Vec<_>>();
+    for (i, name) in segments.iter().enumerate() {
+        path.push(name);
+        let last = i + 1 == segments.len();
+        match fs::symlink_metadata(&path).await {
+            Ok(m)
+                if m.file_type().is_symlink()
+                    || (!last && !m.is_dir())
+                    || (last && !m.is_file()) =>
+            {
+                return Err(AppError::Invalid("unsafe playout path component".into()));
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if !last && create {
+                    match fs::create_dir(&path).await {
+                        Ok(()) => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                            let m = fs::symlink_metadata(&path).await?;
+                            if !m.is_dir() || m.file_type().is_symlink() {
+                                return Err(AppError::Invalid("unsafe playout directory".into()));
+                            }
+                        }
+                        Err(e) => return Err(e.into()),
+                    }
+                }
+            }
+            Err(e) => return Err(e.into()),
         }
-        Ok(meta) if !meta.is_dir() => {
-            return Err(AppError::Invalid(
-                "ffplayout VideoRoll path is not a directory".into(),
-            ));
-        }
-        Ok(_) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => fs::create_dir(&directory).await?,
-        Err(e) => return Err(e.into()),
     }
-    let dest = directory.join(filename);
-    if !dest.starts_with(&root) {
-        return Err(AppError::Invalid(
-            "media path escaped ffplayout root".into(),
-        ));
+    Ok(path)
+}
+async fn playout_path(state: &AppState, filename: &str) -> AppResult<PathBuf> {
+    if filename.contains(['/', '\\']) {
+        return Err(AppError::Invalid("invalid playout basename".into()));
     }
-    Ok(dest)
+    relative_playout_path(state, &format!("VideoRoll/{filename}"), true).await
 }
 async fn find(db: &Database, id: Uuid) -> AppResult<PlayoutLink> {
     sqlx::query_as::<_, PlayoutLink>("SELECT * FROM vr2_playout_links WHERE id=$1")
@@ -311,6 +327,23 @@ pub async fn import(state: &AppState, body: ImportRequest) -> AppResult<PlayoutL
             "ffplayout source video size invalid".into(),
         ));
     }
+    let historical=sqlx::query_as::<_,PlayoutLink>("SELECT id,task_id,asset_id,COALESCE(source_asset_id,asset_id) AS source_asset_id,ffplayout_channel_id AS channel_id,status,relative_media_path,COALESCE(playout_path,relative_media_path) AS playout_path,transfer_mode,source_checksum,reason,created_at,updated_at FROM playout_asset_links WHERE asset_id=$1 AND ffplayout_channel_id=$2 AND runtime_engine='python'")
+        .bind(asset_id).bind(body.channel_id).fetch_optional(&state.db.pool).await?;
+    if let Some(link) = historical {
+        if link.task_id != body.task_id || link.source_checksum != sha || link.status != "ready" {
+            return Err(AppError::Conflict(
+                "historical playout identity changed".into(),
+            ));
+        }
+        let dest = relative_playout_path(state, &link.relative_media_path, true).await?;
+        secure_link(&source, &dest).await?;
+        if file_sha(&dest).await? != sha {
+            return Err(AppError::Conflict(
+                "historical playout media checksum mismatch".into(),
+            ));
+        }
+        return Ok(link);
+    }
     let name = match body.title.as_deref().filter(|v| !v.trim().is_empty()) {
         Some(v) => v.to_owned(),
         None => title(&state.db, body.task_id).await?,
@@ -327,13 +360,10 @@ pub async fn import(state: &AppState, body: ImportRequest) -> AppResult<PlayoutL
                 "historical or changed playout link requires reconciliation".into(),
             ));
         }
-        let file = relative
+        checked_playout_relative(&relative)?
             .strip_prefix("VideoRoll/")
-            .filter(|v| !v.is_empty() && !v.contains(['/', '\\']) && *v != "." && *v != "..")
-            .ok_or_else(|| {
-                AppError::Conflict("historical nested path requires reconciliation".into())
-            })?;
-        file.to_owned()
+            .unwrap()
+            .to_owned()
     } else {
         let mut chosen = None;
         for candidate in collision_names(&safe_filename(&name, &key, asset_id), asset_id) {
@@ -361,7 +391,7 @@ pub async fn import(state: &AppState, body: ImportRequest) -> AppResult<PlayoutL
             .ok_or_else(|| AppError::Conflict("cannot allocate unique playout filename".into()))?
     };
     let relative = format!("VideoRoll/{filename}");
-    let dest = playout_path(state, &filename).await?;
+    let dest = relative_playout_path(state, &relative, true).await?;
     let actual_path = dest.to_string_lossy().to_string();
     let row = sqlx::query(
         "INSERT INTO playout_asset_links(
@@ -497,6 +527,20 @@ pub fn router() -> Router<AppState> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn historical_paths_preserve_nested_names_but_reject_escape() {
+        assert!(checked_playout_relative("VideoRoll/旧目录/中文.mp4").is_ok());
+        for p in [
+            "VideoRoll/../secret",
+            "/VideoRoll/a.mp4",
+            "Other/a.mp4",
+            "VideoRoll//a.mp4",
+            "VideoRoll/a\\b.mp4",
+            "VideoRoll/",
+        ] {
+            assert!(checked_playout_relative(p).is_err(), "{p}");
+        }
+    }
     #[test]
     fn sanitized_filename_stable_and_safe() {
         let asset = Uuid::new_v4();

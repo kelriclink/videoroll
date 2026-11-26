@@ -7,6 +7,8 @@ case "${VIDEOROLL_TEST_ASR_SCENARIO:-external-whisper}" in
   translation) test_name=media::asr::tests::translation_recovery_real_postgres_http ;;
   download) test_name=download_runtime::tests::download_fallback_real_postgres_and_process ;;
   publish-gate) test_name=bilibili::tests::publish_gate_real_postgres ;;
+  rag-shared) test_name=agent::provider_cache::tests::shared_cache_real_postgres ;;
+  title) test_name=publish_meta::tests::title_translation_real_postgres_http ;;
   *) echo "invalid test scenario" >&2; exit 1 ;;
 esac
 cargo test --lib "$test_name" --no-run
@@ -44,6 +46,8 @@ case "${VIDEOROLL_TEST_ASR_SCENARIO:-external-whisper}" in
   translation) export VIDEOROLL_TEST_TRANSLATION_DB_URL="$DATABASE_URL"; unset VIDEOROLL_TEST_EXTERNAL_WHISPER_DB_URL ;;
   download) export VIDEOROLL_TEST_DOWNLOAD_DB_URL="$DATABASE_URL"; unset VIDEOROLL_TEST_EXTERNAL_WHISPER_DB_URL ;;
   publish-gate) export VIDEOROLL_TEST_PUBLISH_GATE_DB_URL="$DATABASE_URL"; unset VIDEOROLL_TEST_EXTERNAL_WHISPER_DB_URL ;;
+  rag-shared) export VIDEOROLL_TEST_RAG_SHARED_DB_URL="$DATABASE_URL"; unset VIDEOROLL_TEST_EXTERNAL_WHISPER_DB_URL ;;
+  title) export VIDEOROLL_TEST_TITLE_DB_URL="$DATABASE_URL"; unset VIDEOROLL_TEST_EXTERNAL_WHISPER_DB_URL ;;
   external-whisper) export GROQ_ASR_MAX_CONCURRENCY=1 ;;
 esac
 cargo test --lib "$test_name" -- --nocapture

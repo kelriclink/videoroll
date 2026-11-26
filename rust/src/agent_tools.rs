@@ -92,7 +92,7 @@ impl RetrievalQuery {
             return Err(AppError::Invalid("web retrieval not permitted".into()));
         }
         lease(db, task.job).await?;
-        let results = search_web(client, task.settings, &self.text).await?;
+        let results = search_web(db, task.job, client, task.settings, &self.text).await?;
         lease(db, task.job).await?;
         Ok(results)
     }
@@ -241,8 +241,13 @@ impl RetrievalQuery {
             ("formatversion", "2"),
         ]);
         let cache_key = provider_cache::identity(&provider, url.as_str(), None);
-        let docs =
-            provider_cache::retrieve(&provider, &cache_key, Duration::from_secs(900), || async {
+        let docs = provider_cache::retrieve_shared(
+            db,
+            task.job,
+            &provider,
+            &cache_key,
+            Duration::from_secs(900),
+            || async {
                 tokio::time::sleep(Duration::from_millis(200)).await;
                 let client = Client::builder()
                     .redirect(reqwest::redirect::Policy::none())
@@ -259,8 +264,9 @@ impl RetrievalQuery {
                 let payload: Value = serde_json::from_slice(&body)
                     .map_err(|_| AppError::Unavailable("invalid Wikipedia JSON".into()))?;
                 wiki_pages(&payload)
-            })
-            .await?;
+            },
+        )
+        .await?;
         lease(db, task.job).await?;
         Ok(docs)
     }

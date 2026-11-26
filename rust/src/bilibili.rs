@@ -282,6 +282,8 @@ fn validate_assets(parts: &[(String, String)]) -> AppResult<()> {
 pub async fn archive_spec(
     db: &Database,
     job: &WorkItem,
+    config: &Config,
+    registry: &AssetRegistry,
 ) -> AppResult<(ArchiveMeta, Vec<(String, String)>)> {
     let profile: Option<Value> =
         sqlx::query_scalar("SELECT configuration FROM vr2_workflows WHERE id=$1")
@@ -370,12 +372,64 @@ pub async fn archive_spec(
     }
 
     let saved = crate::publish_meta::saved(db, job.task_id).await?;
-    let meta:ArchiveMeta=serde_json::from_value(
-        saved.or_else(||profile.pointer("/publish/bilibili").cloned())
-            .ok_or_else(||AppError::Unavailable(
-            "native Bilibili requires saved metadata or explicit publish.bilibili configuration".into()
-        ))?
-    ).map_err(|_|AppError::Invalid("Bilibili metadata schema invalid".into()))?;
+    let draft = match saved.or_else(|| profile.pointer("/publish/bilibili").cloned()) {
+        Some(value) => value,
+        None => {
+            // Single-platform automatic Bilibili follows the same source
+            // draft as mixed publication. Explicit and saved drafts retain
+            // their original precedence and are not retranslated.
+            let state = crate::api::AppState {
+                config: std::sync::Arc::new(config.clone()),
+                db: db.clone(),
+                scheduler: crate::scheduler::Scheduler::new(db.clone(), config.job_lease),
+                storage: registry.clone(),
+            };
+            let mut value = crate::publish_meta::automatic_draft(&state, job.task_id).await?;
+            let auto = crate::settings::effective(db, "subtitle.auto_profile").await?;
+            let no_speech:bool=sqlx::query_scalar("SELECT COALESCE((SELECT result->>'no_speech'='true' FROM vr2_jobs WHERE workflow_id=$1 AND stage='subtitle' AND state='succeeded' ORDER BY created_at DESC LIMIT 1),false)").bind(job.workflow_id).fetch_one(&db.pool).await?;
+            if no_speech {
+                let prefix = auto["publish_title_prefix"].as_str().unwrap_or("【熟肉】");
+                if !prefix.is_empty() {
+                    if let Some(t) = value["title"].as_str().and_then(|t| t.strip_prefix(prefix)) {
+                        value["title"] = json!(t.trim());
+                    }
+                }
+            }
+            // The generic draft fallback must not suppress platform tags.
+            let tags = value["tags"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            let explicit = if tags == ["视频分享"] {
+                Vec::new()
+            } else {
+                tags
+            };
+            let external: bool =
+                sqlx::query_scalar("SELECT source_type::text='youtube' FROM tasks WHERE id=$1")
+                    .bind(job.task_id)
+                    .fetch_one(&db.pool)
+                    .await?;
+            let tags = crate::bilibili_account_v1::resolve_publish_tags(
+                db,
+                config,
+                job.task_id,
+                value["typeid"].as_u64().unwrap_or(0) as u32,
+                value["title"].as_str().unwrap_or(""),
+                value["desc"].as_str().unwrap_or(""),
+                external,
+                &explicit,
+            )
+            .await;
+            value["tags"] = json!(tags);
+            crate::publish_meta::normalized(value)?
+        }
+    };
+    let meta: ArchiveMeta = serde_json::from_value(draft)
+        .map_err(|_| AppError::Invalid("Bilibili metadata schema invalid".into()))?;
     meta.validate()?;
     let p1 = latest_asset_key(db, job.task_id, "video_final")
         .await?
@@ -515,6 +569,46 @@ async fn publish_gate(db: &Database, job: &WorkItem, stage: PublishGate) -> AppR
         // No idle SQL transaction and no long uninterruptible sleep.
         tokio::time::sleep(Duration::from_secs_f64(delay.clamp(0.05, 2.0))).await;
     }
+}
+fn rate_limited_payload(value: &Value) -> bool {
+    let code = value
+        .get("code")
+        .and_then(|v| v.as_i64().or_else(|| v.as_str()?.parse().ok()));
+    matches!(code, Some(601 | 406 | -702))
+        || ["message", "msg"]
+            .iter()
+            .filter_map(|k| value[*k].as_str())
+            .any(|text| {
+                ["请求频率过高", "投稿过于频繁", "上传过快", "上传视频过快"]
+                    .iter()
+                    .any(|v| text.contains(v))
+            })
+}
+const RATE_LIMITED: &str = "Bilibili confirmed rate limit";
+fn rate_limited_error(error: &AppError) -> bool {
+    matches!(error,AppError::Unavailable(message) if message==RATE_LIMITED)
+}
+async fn extend_publish_cooldown(db: &Database, stage: PublishGate, attempt: i32) -> AppResult<()> {
+    let key = format!("runtime.bilibili.throttle.{}", stage.name());
+    let delay = match stage {
+        PublishGate::Upload => (2f64.powi(attempt.clamp(0, 8) + 1)).clamp(60., 180.),
+        PublishGate::Submit => (2f64.powi(attempt.clamp(0, 8) + 1)).clamp(20., 90.),
+    };
+    let mut tx = db.pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1::text,0))")
+        .bind(&key)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("INSERT INTO app_settings(key,value_json,version) VALUES($1,jsonb_build_object('not_before',EXTRACT(EPOCH FROM clock_timestamp())::double precision+$2::double precision),1)
+    ON CONFLICT(key) DO UPDATE SET value_json=jsonb_build_object('not_before',GREATEST(CASE WHEN jsonb_typeof(app_settings.value_json->'not_before')='number' THEN (app_settings.value_json->>'not_before')::double precision ELSE 0 END,(EXCLUDED.value_json->>'not_before')::double precision)),version=app_settings.version+1,updated_at=now()")
+        .bind(&key).bind(delay).execute(&mut *tx).await?;
+    tx.commit().await?;
+    tracing::warn!(
+        stage = stage.name(),
+        delay_seconds = delay,
+        "Bilibili shared provider cooldown extended"
+    );
+    Ok(())
 }
 async fn configured_upload_workers(db: &Database) -> AppResult<usize> {
     let stored = crate::settings::effective(db, "bilibili.publish").await?;
@@ -712,11 +806,14 @@ impl BilibiliClient {
             })?;
         Ok(url.to_owned())
     }
-    async fn read_json(response: reqwest::Response) -> AppResult<Value> {
-        if !response.status().is_success() {
+    async fn read_json(mut response: reqwest::Response) -> AppResult<Value> {
+        let status = response.status();
+        if status.as_u16() == 429 {
+            return Err(AppError::Unavailable(RATE_LIMITED.into()));
+        }
+        if !status.is_success() && status.as_u16() != 406 {
             return Err(AppError::Unavailable(format!(
-                "Bilibili server returned HTTP {}",
-                response.status()
+                "Bilibili server returned HTTP {status}"
             )));
         }
         if response
@@ -725,14 +822,29 @@ impl BilibiliClient {
         {
             return Err(AppError::Unavailable("Bilibili response oversized".into()));
         }
-        let raw = response.bytes().await?;
-        if raw.len() > MAX_METADATA_BYTES {
-            return Err(AppError::Unavailable("Bilibili response oversized".into()));
+        let mut raw = Vec::new();
+        while let Some(chunk) = response.chunk().await? {
+            if chunk.len() > MAX_METADATA_BYTES.saturating_sub(raw.len()) {
+                return Err(AppError::Unavailable("Bilibili response oversized".into()));
+            }
+            raw.extend_from_slice(&chunk);
         }
-        serde_json::from_slice(&raw)
-            .map_err(|_| AppError::Unavailable("Bilibili returned invalid JSON".into()))
+        let value: Value = serde_json::from_slice(&raw)
+            .map_err(|_| AppError::Unavailable("Bilibili returned invalid JSON".into()))?;
+        if rate_limited_payload(&value) {
+            return Err(AppError::Unavailable(RATE_LIMITED.into()));
+        }
+        if !status.is_success() {
+            return Err(AppError::Unavailable(format!(
+                "Bilibili server returned HTTP {status}"
+            )));
+        }
+        Ok(value)
     }
     fn ensure_ok(value: &Value, upload: bool) -> AppResult<()> {
+        if rate_limited_payload(value) {
+            return Err(AppError::Unavailable(RATE_LIMITED.into()));
+        }
         let ok = if upload {
             value.get("OK").and_then(Value::as_i64) == Some(1)
         } else {
@@ -831,6 +943,9 @@ impl BilibiliClient {
                 .send()
                 .await;
             match response {
+                Ok(response) if response.status().as_u16() == 429 => {
+                    return Err(AppError::Unavailable(RATE_LIMITED.into()));
+                }
                 Ok(response) if response.status().as_u16() == 200 => {
                     let etag = response
                         .headers()
@@ -1261,7 +1376,7 @@ pub async fn publish(
             "Bilibili publishing is disabled in V2 platform settings".into(),
         ));
     }
-    let (mut meta, parts) = archive_spec(db, job).await?;
+    let (mut meta, parts) = archive_spec(db, job, config, registry).await?;
     let direct: Option<Value> = sqlx::query_scalar(
         "SELECT configuration->'bilibili_direct_v1' FROM vr2_workflows WHERE id=$1",
     )
@@ -1354,7 +1469,15 @@ pub async fn publish(
             done_before: done,
             total,
         };
-        let upload = client.upload(&path, requested, Some(progress)).await?;
+        let upload = match client.upload(&path, requested, Some(progress)).await {
+            Ok(v) => v,
+            Err(error) => {
+                if rate_limited_error(&error) {
+                    extend_publish_cooldown(db, PublishGate::Upload, job.attempts as i32).await?;
+                }
+                return Err(error);
+            }
+        };
         done += bytes;
         uploaded.push((upload, title));
     }
@@ -1416,7 +1539,20 @@ pub async fn publish(
     // archive POST is the irreversible boundary and is NEVER retried.
     publish_gate(db, job, PublishGate::Submit).await?;
     publish_lease(db, job).await?;
-    let mut receipt = client.submit_once(&csrf, &meta, &uploaded).await?;
+    let mut receipt = match client.submit_once(&csrf, &meta, &uploaded).await {
+        Ok(v) => v,
+        Err(error) => {
+            if rate_limited_error(&error) {
+                // Extend future admission, but do not replay this irreversible POST.
+                if let Err(e) =
+                    extend_publish_cooldown(db, PublishGate::Submit, job.attempts as i32).await
+                {
+                    tracing::warn!(error=%e,"submit cooldown persistence failed");
+                }
+            }
+            return Err(error);
+        }
+    };
     // Capture the final typed metadata, including actual partition, activity,
     // tags and cover. This is not the pre-upload draft.
     receipt["submitted_meta"] = serde_json::to_value(&meta)
@@ -1428,6 +1564,21 @@ pub async fn publish(
 mod tests {
     use super::*;
 
+    #[test]
+    fn typed_publish_quota_errors_are_distinct_from_uncertain_receipts() {
+        for value in [
+            json!({"code":601}),
+            json!({"code":"-702"}),
+            json!({"code":-1,"message":"投稿过于频繁"}),
+        ] {
+            let err = BilibiliClient::ensure_ok(&value, false).unwrap_err();
+            assert!(rate_limited_error(&err));
+        }
+        assert!(!rate_limited_error(
+            &BilibiliClient::ensure_ok(&json!({"code":-500}), false).unwrap_err()
+        ));
+        assert!(BilibiliClient::ensure_ok(&json!({"code":0}), false).is_ok());
+    }
     #[tokio::test]
     async fn publish_gate_real_postgres() {
         let Ok(url) = std::env::var("VIDEOROLL_TEST_PUBLISH_GATE_DB_URL") else {
@@ -1480,6 +1631,12 @@ mod tests {
         publish_gate(&db, &jobs[0], PublishGate::Upload)
             .await
             .unwrap();
+        extend_publish_cooldown(&db, PublishGate::Upload, 5)
+            .await
+            .unwrap();
+        let remaining:f64=sqlx::query_scalar("SELECT (value_json->>'not_before')::double precision-EXTRACT(EPOCH FROM clock_timestamp())::double precision FROM app_settings WHERE key='runtime.bilibili.throttle.upload'").fetch_one(&db.pool).await.unwrap();
+        assert!(remaining >= 59. && remaining <= 180.);
+
         publish_gate(&db, &jobs[1], PublishGate::Submit)
             .await
             .unwrap();

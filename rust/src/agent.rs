@@ -68,6 +68,8 @@ fn search_uri(raw: &str) -> AppResult<Url> {
 #[path = "agent_provider_cache.rs"]
 mod provider_cache;
 async fn search_web(
+    db: &Database,
+    job: &WorkItem,
     http: &Client,
     settings: &RagConfig,
     query: &str,
@@ -87,62 +89,69 @@ async fn search_web(
         .append_pair("format", "json");
     let provider = provider_cache::identity("search", raw, settings.web_search_api_key.as_deref());
     let cache_key = provider_cache::identity(&provider, url.as_str(), None);
-    provider_cache::retrieve(&provider, &cache_key, Duration::from_secs(60), || async {
-        let mut request = http.get(url).timeout(Duration::from_secs(12));
-        if let Some(token) = settings.web_search_api_key.as_ref() {
-            request = request.bearer_auth(token);
-        }
-        let response = request.send().await?;
-        provider_cache::check_status(&provider, &response).await?;
-        let bytes = provider_cache::bounded_body(response, 4 * 1024 * 1024).await?;
-        let payload: Value = serde_json::from_slice(&bytes)
-            .map_err(|_| AppError::Unavailable("RAG search JSON invalid".into()))?;
-        let mut docs = Vec::new();
-        for item in payload
-            .get("results")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .take(20)
-        {
-            let Some(raw) = item.get("url").and_then(Value::as_str) else {
-                continue;
-            };
-            let Ok(url) = Url::parse(raw) else { continue };
-            if url.scheme() != "https"
-                || url.host_str().is_none()
-                || !url.username().is_empty()
-                || url.password().is_some()
-                || raw.len() > 2048
+    provider_cache::retrieve_shared(
+        db,
+        job,
+        &provider,
+        &cache_key,
+        Duration::from_secs(60),
+        || async {
+            let mut request = http.get(url).timeout(Duration::from_secs(12));
+            if let Some(token) = settings.web_search_api_key.as_ref() {
+                request = request.bearer_auth(token);
+            }
+            let response = request.send().await?;
+            provider_cache::check_status(&provider, &response).await?;
+            let bytes = provider_cache::bounded_body(response, 4 * 1024 * 1024).await?;
+            let payload: Value = serde_json::from_slice(&bytes)
+                .map_err(|_| AppError::Unavailable("RAG search JSON invalid".into()))?;
+            let mut docs = Vec::new();
+            for item in payload
+                .get("results")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .take(20)
             {
-                continue;
+                let Some(raw) = item.get("url").and_then(Value::as_str) else {
+                    continue;
+                };
+                let Ok(url) = Url::parse(raw) else { continue };
+                if url.scheme() != "https"
+                    || url.host_str().is_none()
+                    || !url.username().is_empty()
+                    || url.password().is_some()
+                    || raw.len() > 2048
+                {
+                    continue;
+                }
+                let title = item
+                    .get("title")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .chars()
+                    .take(200)
+                    .collect();
+                let snippet = item
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .or_else(|| item.get("snippet").and_then(Value::as_str))
+                    .unwrap_or("")
+                    .chars()
+                    .take(1000)
+                    .collect();
+                docs.push(WebEvidence {
+                    title,
+                    url: url.into(),
+                    snippet,
+                });
+                if docs.len() >= 6 {
+                    break;
+                }
             }
-            let title = item
-                .get("title")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .chars()
-                .take(200)
-                .collect();
-            let snippet = item
-                .get("content")
-                .and_then(Value::as_str)
-                .or_else(|| item.get("snippet").and_then(Value::as_str))
-                .unwrap_or("")
-                .chars()
-                .take(1000)
-                .collect();
-            docs.push(WebEvidence {
-                title,
-                url: url.into(),
-                snippet,
-            });
-            if docs.len() >= 6 {
-                break;
-            }
-        }
-        Ok(docs)
-    })
+            Ok(docs)
+        },
+    )
     .await
 }
 fn response_json(raw: &Value) -> AppResult<Value> {
