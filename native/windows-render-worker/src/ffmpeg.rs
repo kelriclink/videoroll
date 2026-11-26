@@ -1,5 +1,9 @@
 use crate::hardware::Device;
 use crate::logging::SharedLog;
+// Reuse the same pure ASS event planner as the Linux renderer.
+#[allow(dead_code)]
+#[path = "../../../rust/src/media/render_optimization.rs"]
+mod render_optimization;
 use anyhow::{Context, Result};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -7,8 +11,8 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -138,15 +142,59 @@ pub fn render_burn_in(
     ));
 
     if device.backend == "qsv" {
-        let overlay_args = qsv_overlay_args(
-            input,
-            ass_name,
-            output,
-            &encoder,
-            preset,
-            quality,
-            &media,
-        );
+        // Candidate path: Windows QSV/D3D11 needs physical-node validation
+        // before the sparse timeline can be enabled by default.
+        if qsv_event_cache_enabled() {
+            match build_qsv_event_cache(ffmpeg, work_dir, ass, &media, Arc::clone(&cancel), log) {
+                Ok(Some(cache)) => {
+                    let _ = std::fs::remove_file(output);
+                    let args = qsv_event_overlay_args(
+                        input,
+                        &cache.relative_timeline(),
+                        output,
+                        &encoder,
+                        preset,
+                        quality,
+                        &media,
+                    );
+                    let result = run_ffmpeg(
+                        ffmpeg,
+                        work_dir,
+                        &args,
+                        Arc::clone(&cancel),
+                        log,
+                        "qsv-hwdecode-overlay_qsv-event-vfr",
+                        &encoder,
+                        &media,
+                        progress.clone(),
+                    )
+                    .and_then(|_| validate_qsv_cache_output(ffprobe, output, &media));
+                    match result {
+                        Ok(()) => return Ok(()),
+                        Err(error) => {
+                            let _ = std::fs::remove_file(output);
+                            if cancel.load(Ordering::Relaxed) {
+                                return Err(error);
+                            }
+                            log.warn(format!(
+                                "QSV event cache render failed; retrying live overlay: {error:#}"
+                            ));
+                        }
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    if cancel.load(Ordering::Relaxed) {
+                        return Err(error);
+                    }
+                    log.warn(format!(
+                        "QSV event cache build failed; retrying live overlay: {error:#}"
+                    ));
+                }
+            }
+        }
+        let overlay_args =
+            qsv_overlay_args(input, ass_name, output, &encoder, preset, quality, &media);
         if let Some(args) = overlay_args {
             let _ = std::fs::remove_file(output);
             match run_ffmpeg(
@@ -170,15 +218,8 @@ pub fn render_burn_in(
         }
 
         let _ = std::fs::remove_file(output);
-        let hwdecode_args = qsv_hwdecode_cpu_ass_args(
-            input,
-            ass_name,
-            output,
-            &encoder,
-            preset,
-            quality,
-            &media,
-        );
+        let hwdecode_args =
+            qsv_hwdecode_cpu_ass_args(input, ass_name, output, &encoder, preset, quality, &media);
         match run_ffmpeg(
             ffmpeg,
             work_dir,
@@ -200,30 +241,14 @@ pub fn render_burn_in(
     }
 
     let _ = std::fs::remove_file(output);
-    let args = software_filter_args(
-        input,
-        ass_name,
-        output,
-        device,
-        &encoder,
-        preset,
-        quality,
-    );
+    let args = software_filter_args(input, ass_name, output, device, &encoder, preset, quality);
     let pipeline = match device.backend.as_str() {
         "nvidia" => "cpu-decode-cpu-ass-nvenc",
         "qsv" => "cpu-decode-cpu-ass-qsv",
         _ => "cpu-decode-cpu-ass-software",
     };
     run_ffmpeg(
-        ffmpeg,
-        work_dir,
-        &args,
-        cancel,
-        log,
-        pipeline,
-        &encoder,
-        &media,
-        progress,
+        ffmpeg, work_dir, &args, cancel, log, pipeline, &encoder, &media, progress,
     )
 }
 
@@ -258,7 +283,9 @@ pub fn mux_soft_sub(
         "srt".to_string(),
         output.display().to_string(),
     ];
-    let work_dir = output.parent().context("mux output has no parent directory")?;
+    let work_dir = output
+        .parent()
+        .context("mux output has no parent directory")?;
     let media = probe_media(ffprobe, input).unwrap_or_default();
     run_ffmpeg(
         ffmpeg,
@@ -274,8 +301,8 @@ pub fn mux_soft_sub(
 }
 
 pub fn sha256_file(path: &Path) -> Result<String> {
-    let mut file = File::open(path)
-        .with_context(|| format!("cannot open {} for SHA256", path.display()))?;
+    let mut file =
+        File::open(path).with_context(|| format!("cannot open {} for SHA256", path.display()))?;
     let mut hasher = Sha256::new();
     let mut buffer = [0_u8; 1024 * 1024];
     loop {
@@ -294,6 +321,273 @@ pub fn output_path(work_dir: &Path, mode: &str) -> PathBuf {
     } else {
         work_dir.join("video_burnin.mp4")
     }
+}
+
+fn qsv_event_cache_enabled() -> bool {
+    std::env::var("VIDEOROLL_RENDER_QSV_EVENT_CACHE")
+        .ok()
+        .is_some_and(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+}
+
+// Full-frame cache is deliberately conservative: avoid ASS geometry changes
+// until the Windows renderer has passed a physical QSV pixel-equivalence test.
+const CACHE_BUDGET: u64 = 256 * 1024 * 1024;
+struct QsvEventCache {
+    dir: PathBuf,
+    folder: String,
+}
+impl QsvEventCache {
+    fn relative_timeline(&self) -> PathBuf {
+        PathBuf::from(&self.folder).join("overlay.ffconcat")
+    }
+}
+impl Drop for QsvEventCache {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+fn qsv_cache_plan(text: &str, media: &MediaInfo) -> Option<render_optimization::EventCachePlan> {
+    if media.width == 0 || media.height == 0 {
+        return None;
+    }
+    // The shared planner assumes standard ASS v4+ event fields. Refuse
+    // reordered formats and noncanonical/malformed Dialogue records.
+    let expected = "Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text";
+    let mut events = false;
+    let mut format_ok = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            events = trimmed.eq_ignore_ascii_case("[Events]");
+        }
+        if !events {
+            continue;
+        }
+        if let Some(format) = trimmed.strip_prefix("Format:") {
+            if !format.trim().eq_ignore_ascii_case(expected) {
+                return None;
+            }
+            format_ok = true;
+        }
+        if trimmed.to_ascii_lowercase().starts_with("dialogue:") {
+            if !format_ok || !line.starts_with("Dialogue:") {
+                return None;
+            }
+            let fields = line.splitn(10, ',').collect::<Vec<_>>();
+            if fields.len() != 10
+                || render_optimization::timestamp_us(fields[2])?
+                    <= render_optimization::timestamp_us(fields[1])?
+            {
+                return None;
+            }
+        }
+    }
+    if !format_ok {
+        return None;
+    }
+    let rate = render_optimization::reduced_overlay_rate(&media.frame_rate, 15.0);
+    let plan = render_optimization::plan_event_cache(text, &rate, media.duration_seconds?).0?;
+    // Bound rasterization before spawning FFmpeg. Raw RGBA is a
+    // conservative admission estimate; reserve 20% for PNG overhead.
+    let bytes = u64::from(media.width)
+        .checked_mul(u64::from(media.height))?
+        .checked_mul(4)?
+        .checked_mul(plan.boundaries_us.len() as u64)?;
+    (bytes <= CACHE_BUDGET * 4 / 5).then_some(plan)
+}
+
+fn build_qsv_event_cache(
+    ffmpeg: &Path,
+    work_dir: &Path,
+    ass: &Path,
+    media: &MediaInfo,
+    cancel: Arc<AtomicBool>,
+    log: &SharedLog,
+) -> Result<Option<QsvEventCache>> {
+    if std::fs::metadata(ass)?.len() > 8 * 1024 * 1024 {
+        return Ok(None);
+    }
+    let text = std::fs::read_to_string(ass)?;
+    let Some(plan) = qsv_cache_plan(&text, media) else {
+        return Ok(None);
+    };
+    let started = Instant::now();
+    let folder = format!("qsv-ass-cache-{}", uuid::Uuid::new_v4().simple());
+    let dir = work_dir.join(&folder);
+    std::fs::create_dir(&dir)?;
+    let cache = QsvEventCache { dir, folder };
+    std::fs::write(cache.dir.join("subtitle.ass"), text)?;
+    let mut clock = String::from("ffconcat version 1.0\n");
+    let mut timeline = String::from("ffconcat version 1.0\n");
+    for (i, time) in plan.boundaries_us.iter().enumerate() {
+        clock.push_str("file blank.png\noption framerate 1000\n");
+        timeline.push_str(&format!(
+            "file state_{:06}.png\noption framerate 1000\n",
+            i + 1
+        ));
+        if let Some(next) = plan.boundaries_us.get(i + 1) {
+            let duration = (next - time) as f64 / 1_000_000.0;
+            let line = format!("duration {duration:.6}\n");
+            clock.push_str(&line);
+            timeline.push_str(&line);
+        }
+    }
+    std::fs::write(cache.dir.join("clock.ffconcat"), clock)?;
+    let blank = vec![
+        "-hide_banner".into(),
+        "-v".into(),
+        "error".into(),
+        "-y".into(),
+        "-f".into(),
+        "lavfi".into(),
+        "-i".into(),
+        format!(
+            "color=c=black@0.0:s={}x{}:r=1,format=rgba",
+            media.width, media.height
+        ),
+        "-frames:v".into(),
+        "1".into(),
+        "-threads".into(),
+        "1".into(),
+        "blank.png".into(),
+    ];
+    run_ffmpeg(
+        ffmpeg,
+        &cache.dir,
+        &blank,
+        Arc::clone(&cancel),
+        log,
+        "qsv-event-cache-blank",
+        "png",
+        media,
+        None,
+    )?;
+    let raster = vec![
+        "-hide_banner".into(),
+        "-v".into(),
+        "error".into(),
+        "-y".into(),
+        "-f".into(),
+        "concat".into(),
+        "-safe".into(),
+        "0".into(),
+        "-i".into(),
+        "clock.ffconcat".into(),
+        "-vf".into(),
+        "ass=subtitle.ass:alpha=1,format=rgba".into(),
+        "-fps_mode".into(),
+        "passthrough".into(),
+        "-threads".into(),
+        "1".into(),
+        "state_%06d.png".into(),
+    ];
+    run_ffmpeg(
+        ffmpeg,
+        &cache.dir,
+        &raster,
+        cancel,
+        log,
+        "qsv-event-cache-rasterize",
+        "png",
+        media,
+        None,
+    )?;
+    let mut bytes = 0_u64;
+    for i in 1..=plan.boundaries_us.len() {
+        let size = std::fs::metadata(cache.dir.join(format!("state_{i:06}.png")))?.len();
+        if size == 0 {
+            anyhow::bail!("empty event cache image");
+        }
+        bytes = bytes.saturating_add(size);
+    }
+    if cache
+        .dir
+        .join(format!("state_{:06}.png", plan.boundaries_us.len() + 1))
+        .exists()
+        || bytes > CACHE_BUDGET
+    {
+        anyhow::bail!("event cache exceeds its frame count or byte budget");
+    }
+    std::fs::write(cache.dir.join("overlay.ffconcat"), timeline)?;
+    log.info(format!(
+        "QSV event cache: states={} bytes={} build={:.3}s",
+        plan.boundaries_us.len(),
+        bytes,
+        started.elapsed().as_secs_f64()
+    ));
+    Ok(Some(cache))
+}
+
+fn qsv_event_overlay_args(
+    input: &Path,
+    timeline: &Path,
+    output: &Path,
+    encoder: &str,
+    preset: Option<&str>,
+    quality: Option<i64>,
+    media: &MediaInfo,
+) -> Vec<String> {
+    let ten_bit = media.pix_fmt.contains("10") || media.pix_fmt.contains("p010");
+    let format = if ten_bit && encoder != "h264_qsv" {
+        "p010"
+    } else {
+        "nv12"
+    };
+    let graph = format!(
+        "[0:v]scale_qsv=format={format}[main];[1:v]format=bgra,hwupload=extra_hw_frames=64[sub];[main][sub]overlay_qsv=shortest=0:repeatlast=1:eof_action=repeat[out]"
+    );
+    let mut args = vec![
+        "-y".into(),
+        "-hide_banner".into(),
+        "-init_hw_device".into(),
+        "qsv:hw,child_device_type=d3d11va".into(),
+        "-filter_hw_device".into(),
+        "hw".into(),
+        "-hwaccel".into(),
+        "qsv".into(),
+        "-hwaccel_output_format".into(),
+        "qsv".into(),
+        "-i".into(),
+        input.display().to_string(),
+        "-f".into(),
+        "concat".into(),
+        "-safe".into(),
+        "0".into(),
+        "-i".into(),
+        timeline.display().to_string(),
+        "-filter_complex".into(),
+        graph,
+        "-map".into(),
+        "[out]".into(),
+        "-map".into(),
+        "0:a?".into(),
+        "-c:v".into(),
+        encoder.to_owned(),
+    ];
+    args.extend(encoder_quality_args("qsv", None, encoder, preset, quality));
+    args.extend(["-c:a".into(), "copy".into(), output.display().to_string()]);
+    args
+}
+fn validate_qsv_cache_output(ffprobe: &Path, output: &Path, source: &MediaInfo) -> Result<()> {
+    let actual = probe_media(ffprobe, output)?;
+    let tolerance = (2.0 / source.fps.max(1.0)).max(0.25);
+    if actual.width != source.width
+        || actual.height != source.height
+        || (actual.fps - source.fps).abs() > 0.05
+        || source
+            .duration_seconds
+            .zip(actual.duration_seconds)
+            .is_none_or(|(a, b)| (a - b).abs() > tolerance)
+    {
+        anyhow::bail!("QSV sparse overlay output metadata differs from source");
+    }
+    Ok(())
 }
 
 fn qsv_overlay_args(
@@ -598,7 +892,8 @@ fn run_ffmpeg(
         thread::spawn(move || {
             let start = Instant::now();
             let buffered = BufReader::new(stdout);
-            let mut progress = base_progress(&progress_pipeline, &progress_encoder, &progress_media);
+            let mut progress =
+                base_progress(&progress_pipeline, &progress_encoder, &progress_media);
             for line in buffered.lines().map_while(Result::ok) {
                 let Some((key, value)) = line.split_once('=') else {
                     continue;
@@ -607,7 +902,9 @@ fn run_ffmpeg(
                     "frame" => progress.frame = value.parse().unwrap_or(progress.frame),
                     "fps" => progress.fps = value.parse().unwrap_or(progress.fps),
                     "bitrate" => progress.bitrate = value.to_string(),
-                    "total_size" => progress.total_size = value.parse().unwrap_or(progress.total_size),
+                    "total_size" => {
+                        progress.total_size = value.parse().unwrap_or(progress.total_size)
+                    }
                     "out_time_us" => {
                         progress.out_time_seconds =
                             value.parse::<f64>().unwrap_or(0.0) / 1_000_000.0;
@@ -712,5 +1009,170 @@ fn parse_fraction(value: &str) -> Option<f64> {
         }
     } else {
         value.parse::<f64>().ok()
+    }
+}
+
+#[cfg(test)]
+mod qsv_event_cache_tests {
+    use super::*;
+    fn ass() -> String {
+        r#"[Script Info]
+ScriptType: v4.00+
+PlayResX: 640
+PlayResY: 360
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,Arial,30,&H00FFFFFF,&H000000FF,&H00000000,&H80000000,0,0,0,0,100,100,0,0,1,2,0,2,20,20,20,1
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 0,0:00:01.00,0:00:03.00,Default,,0,0,0,,First static subtitle
+Dialogue: 0,0:00:05.00,0:00:07.00,Default,,0,0,0,,Second static subtitle
+"#.into()
+    }
+    fn media() -> MediaInfo {
+        MediaInfo {
+            width: 640,
+            height: 360,
+            frame_rate: "60/1".into(),
+            fps: 60.0,
+            pix_fmt: "yuv420p".into(),
+            duration_seconds: Some(8.0),
+            ..MediaInfo::default()
+        }
+    }
+    #[test]
+    fn qsv_cache_is_bounded_and_conservative() {
+        let m = media();
+        assert_eq!(
+            qsv_cache_plan(&ass(), &m).unwrap().boundaries_us,
+            vec![0, 1_000_000, 3_000_000, 5_000_000, 7_000_000]
+        );
+        assert!(
+            qsv_cache_plan(
+                &ass().replace("First static", r"{\fad(100,100)}First static"),
+                &m
+            )
+            .is_none()
+        );
+        assert!(
+            qsv_cache_plan(&ass().replace("Layer, Start, End", "Layer, End, Start"), &m).is_none()
+        );
+        assert!(qsv_cache_plan(&ass().replace("0:00:01.00", "broken"), &m).is_none());
+        assert!(
+            qsv_cache_plan(
+                &ass(),
+                &MediaInfo {
+                    width: 7680,
+                    height: 4320,
+                    ..m.clone()
+                }
+            )
+            .is_none()
+        );
+        let args = qsv_event_overlay_args(
+            Path::new("source.mp4"),
+            Path::new("cache/overlay.ffconcat"),
+            Path::new("out.mp4"),
+            "av1_qsv",
+            None,
+            None,
+            &m,
+        );
+        assert!(
+            args.iter()
+                .any(|arg| arg.contains("shortest=0:repeatlast=1"))
+        );
+        assert!(args.iter().any(|arg| arg == "concat"));
+    }
+
+    // Run native worker cache code with the Linux FFmpeg executable.
+    // This proves event rasterization/timing, not Windows QSV hardware.
+    #[test]
+    fn qsv_cache_cpu_pixel_equivalence() {
+        let Ok(ffmpeg) = std::env::var("VIDEOROLL_TEST_QSV_CACHE_FFMPEG") else {
+            return;
+        };
+        let root = tempfile::tempdir().unwrap();
+        let paths = crate::paths::AppPaths {
+            root: root.path().to_path_buf(),
+            bin: root.path().join("bin"),
+            config: root.path().join("config"),
+            logs: root.path().join("logs"),
+            cache: root.path().join("cache"),
+            work: root.path().join("work"),
+        };
+        paths.ensure().unwrap();
+        let log = SharedLog::new(&paths);
+        let subtitle = paths.work.join("fixture.ass");
+        std::fs::write(&subtitle, ass()).unwrap();
+        let ffmpeg = Path::new(&ffmpeg);
+        let cache = build_qsv_event_cache(
+            ffmpeg,
+            &paths.work,
+            &subtitle,
+            &media(),
+            Arc::new(AtomicBool::new(false)),
+            &log,
+        )
+        .unwrap()
+        .unwrap();
+        let run = |cached: bool| {
+            let mut command = Command::new(ffmpeg);
+            command.current_dir(&paths.work).args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-filter_complex_threads",
+                "1",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=640x360:rate=60:duration=8",
+            ]);
+            if cached {
+                command
+                    .args(["-f", "concat", "-safe", "0", "-i"])
+                    .arg(cache.relative_timeline());
+                command.args(["-filter_complex","[1:v]format=rgba[sub];[0:v][sub]overlay=shortest=0:repeatlast=1:eof_action=repeat[out]"]);
+            } else {
+                command.args(["-f","lavfi","-i","color=c=black@0.0:s=640x360:r=60,format=rgba","-filter_complex",
+                    "[1:v]ass=fixture.ass:alpha=1,format=rgba[sub];[0:v][sub]overlay=shortest=0:repeatlast=1:eof_action=repeat[out]"]);
+            }
+            let out = command
+                .args([
+                    "-map",
+                    "[out]",
+                    "-frames:v",
+                    "480",
+                    "-threads",
+                    "1",
+                    "-f",
+                    "framemd5",
+                    "-",
+                ])
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8(out.stdout)
+                .unwrap()
+                .lines()
+                .filter(|l| !l.starts_with('#'))
+                .map(|l| l.rsplit(',').next().unwrap().trim().to_owned())
+                .collect::<Vec<_>>()
+        };
+        let live = run(false);
+        let cached = run(true);
+        assert_eq!(live.len(), 480);
+        assert_eq!(live, cached);
+        let dir = cache.dir.clone();
+        drop(cache);
+        assert!(!dir.exists());
+        println!(
+            "PASS native Windows worker cache rasterization, CPU reference 480/480 frame hashes, and cache cleanup"
+        );
     }
 }
