@@ -14,6 +14,7 @@ export type ASRDefaults = {
   external_whisper_model: string;
   external_whisper_api_key_set: boolean;
   external_whisper_batch_size: number;
+  external_whisper_max_concurrency: number;
   external_whisper_vad_enabled: boolean;
   external_whisper_vad_threshold: number;
   external_whisper_min_silence_ms: number;
@@ -48,6 +49,7 @@ export type ASRFormState = {
   externalWhisperModel: string;
   externalWhisperApiKey: string;
   externalWhisperBatchSize: string;
+  externalWhisperMaxConcurrency: string;
   externalWhisperVadEnabled: boolean;
   externalWhisperVadThreshold: string;
   externalWhisperMinSilenceMs: string;
@@ -82,6 +84,7 @@ export const initialASRForm: ASRFormState = {
   externalWhisperModel: "whisper-1",
   externalWhisperApiKey: "",
   externalWhisperBatchSize: "1",
+  externalWhisperMaxConcurrency: "1",
   externalWhisperVadEnabled: true,
   externalWhisperVadThreshold: "0.5",
   externalWhisperMinSilenceMs: "2000",
@@ -138,6 +141,10 @@ export function asrFormReducer(state: ASRFormState, action: ASRFormAction): ASRF
       typeof defaults.external_whisper_batch_size === "number"
         ? String(defaults.external_whisper_batch_size)
         : state.externalWhisperBatchSize,
+    externalWhisperMaxConcurrency:
+      typeof defaults.external_whisper_max_concurrency === "number"
+        ? String(defaults.external_whisper_max_concurrency)
+        : state.externalWhisperMaxConcurrency,
     externalWhisperVadEnabled:
       typeof defaults.external_whisper_vad_enabled === "boolean"
         ? defaults.external_whisper_vad_enabled
@@ -206,6 +213,7 @@ export function useASRForm() {
     setExternalWhisperModel: setField("externalWhisperModel"),
     setExternalWhisperApiKey: setField("externalWhisperApiKey"),
     setExternalWhisperBatchSize: setField("externalWhisperBatchSize"),
+    setExternalWhisperMaxConcurrency: setField("externalWhisperMaxConcurrency"),
     setExternalWhisperVadEnabled: setField("externalWhisperVadEnabled"),
     setExternalWhisperVadThreshold: setField("externalWhisperVadThreshold"),
     setExternalWhisperMinSilenceMs: setField("externalWhisperMinSilenceMs"),

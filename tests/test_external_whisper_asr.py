@@ -8,7 +8,7 @@ import httpx
 import pytest
 
 from videoroll.apps.subtitle_service import processing
-from videoroll.apps.subtitle_service.asr_settings_store import get_asr_settings
+from videoroll.apps.subtitle_service.asr_settings_store import get_asr_settings, update_asr_settings
 from videoroll.apps.subtitle_service.schemas import ExternalWhisperTestRequest
 
 
@@ -26,6 +26,7 @@ def _defaults() -> SimpleNamespace:
         external_whisper_api_key="env-key",
         external_whisper_model="whisper-1",
         external_whisper_batch_size=1,
+        external_whisper_max_concurrency=1,
         external_whisper_vad_enabled=True,
         external_whisper_vad_threshold=0.5,
         external_whisper_min_silence_ms=2000,
@@ -48,6 +49,7 @@ def test_asr_settings_exposes_external_whisper_defaults() -> None:
     assert settings["external_whisper_api_key"] == "env-key"
     assert settings["external_whisper_api_key_set"] is True
     assert settings["external_whisper_batch_size"] == 1
+    assert settings["external_whisper_max_concurrency"] == 1
     assert settings["external_whisper_vad_enabled"] is True
     assert settings["external_whisper_vad_threshold"] == 0.5
     assert settings["external_whisper_min_silence_ms"] == 2000
@@ -55,6 +57,23 @@ def test_asr_settings_exposes_external_whisper_defaults() -> None:
     assert settings["external_whisper_condition_on_previous_text"] is True
     assert settings["external_whisper_max_segment_seconds"] == 12.0
     assert settings["external_whisper_max_segment_chars"] == 120
+
+
+def test_asr_settings_reads_and_bounds_external_whisper_concurrency() -> None:
+    db = MagicMock()
+    db.get.return_value = SimpleNamespace(version=2, value_json={"external_whisper": {"max_concurrency": 5}})
+    assert get_asr_settings(db, _defaults())["external_whisper_max_concurrency"] == 5
+    db.get.return_value = SimpleNamespace(version=2, value_json={"external_whisper": {"max_concurrency": 99}})
+    assert get_asr_settings(db, _defaults())["external_whisper_max_concurrency"] == 8
+
+
+def test_asr_settings_update_persists_external_whisper_concurrency() -> None:
+    db = MagicMock()
+    row = SimpleNamespace(version=2, value_json={})
+    db.get.return_value = row
+    result = update_asr_settings(db, _defaults(), {"external_whisper_max_concurrency": 4})
+    assert row.value_json["external_whisper"]["max_concurrency"] == 4
+    assert result["external_whisper_max_concurrency"] == 4
 
 
 def test_asr_settings_upgrades_exact_legacy_external_profile() -> None:

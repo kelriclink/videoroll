@@ -79,6 +79,7 @@ class SubtitleServiceSettings(CommonSettings):
     external_whisper_api_key: str | None = Field(None, alias="SUBTITLE_EXTERNAL_WHISPER_API_KEY")
     external_whisper_model: str = Field("whisper-1", alias="SUBTITLE_EXTERNAL_WHISPER_MODEL")
     external_whisper_batch_size: int = Field(1, ge=1, le=32, alias="SUBTITLE_EXTERNAL_WHISPER_BATCH_SIZE")
+    external_whisper_max_concurrency: int = Field(1, ge=1, le=8, alias="SUBTITLE_EXTERNAL_WHISPER_MAX_CONCURRENCY")
     external_whisper_vad_enabled: bool = Field(True, alias="SUBTITLE_EXTERNAL_WHISPER_VAD_ENABLED")
     external_whisper_vad_threshold: float = Field(0.5, ge=0.1, le=0.95, alias="SUBTITLE_EXTERNAL_WHISPER_VAD_THRESHOLD")
     external_whisper_min_silence_ms: int = Field(2000, ge=50, le=5000, alias="SUBTITLE_EXTERNAL_WHISPER_MIN_SILENCE_MS")

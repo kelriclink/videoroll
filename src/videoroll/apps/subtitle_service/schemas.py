@@ -101,6 +101,7 @@ class WhisperSettingsRead(BaseModel):
     external_whisper_model: str = ""
     external_whisper_api_key_set: bool = False
     external_whisper_batch_size: int = 1
+    external_whisper_max_concurrency: int = 1
     external_whisper_vad_enabled: bool = True
     external_whisper_vad_threshold: float = 0.5
     external_whisper_min_silence_ms: int = 2000
@@ -143,6 +144,7 @@ class ASRDefaultsRead(BaseModel):
     external_whisper_model: str = "whisper-1"
     external_whisper_api_key_set: bool = False
     external_whisper_batch_size: int = 1
+    external_whisper_max_concurrency: int = 1
     external_whisper_vad_enabled: bool = True
     external_whisper_vad_threshold: float = 0.5
     external_whisper_min_silence_ms: int = 2000
@@ -171,6 +173,7 @@ class ASRDefaultsUpdate(BaseModel):
     external_whisper_model: Optional[str] = Field(default=None, max_length=256)
     external_whisper_api_key: Optional[str] = Field(default=None, max_length=4096)
     external_whisper_batch_size: Optional[int] = Field(default=None, ge=1, le=32)
+    external_whisper_max_concurrency: Optional[int] = Field(default=None, ge=1, le=8)
     external_whisper_vad_enabled: Optional[bool] = None
     external_whisper_vad_threshold: Optional[float] = Field(default=None, ge=0.1, le=0.95)
     external_whisper_min_silence_ms: Optional[int] = Field(default=None, ge=50, le=5000)

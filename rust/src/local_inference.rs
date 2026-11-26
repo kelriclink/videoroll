@@ -29,12 +29,30 @@ struct Session {
 fn unavailable(message: &str) -> AppError {
     AppError::Unavailable(message.into())
 }
+fn parse_idle_timeout(value: Option<&str>) -> u64 {
+    value
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(300)
+        .clamp(1, 600)
+}
 fn idle_timeout() -> Duration {
-    Duration::from_secs(
-        env("VIDEOROLL_V2_LOCAL_INFERENCE_IDLE_SECONDS", "30")
-            .parse::<u64>()
-            .unwrap_or(30)
-            .clamp(1, 600),
+    Duration::from_secs(parse_idle_timeout(
+        std::env::var("VIDEOROLL_V2_LOCAL_INFERENCE_IDLE_SECONDS")
+            .ok()
+            .as_deref(),
+    ))
+}
+fn parse_gpu_lock_slots(value: Option<&str>) -> u8 {
+    value
+        .and_then(|value| value.parse::<u8>().ok())
+        .unwrap_or(1)
+        .clamp(1, 8)
+}
+fn gpu_lock_slots() -> u8 {
+    parse_gpu_lock_slots(
+        std::env::var("VIDEOROLL_V2_LOCAL_INFERENCE_GPU_SLOTS")
+            .ok()
+            .as_deref(),
     )
 }
 fn gpu_lock_path() -> AppResult<PathBuf> {
@@ -99,6 +117,7 @@ impl Session {
         cmd.env("HF_HUB_OFFLINE", "1")
             .env("TRANSFORMERS_OFFLINE", "1")
             .env("VIDEOROLL_LOCAL_GPU_LOCK", lock)
+            .env("VIDEOROLL_LOCAL_GPU_SLOTS", gpu_lock_slots().to_string())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -295,6 +314,9 @@ pub async fn invoke(request: &Value, timeout: Duration) -> AppResult<Value> {
         let key=json!({"model":model_identity(request).await?,"python":python,"bridge":bridge,"gpu_lock":lock});
         let mut existing=slot.take();
         if let Some(session)=existing.as_mut(){
+            if session.key!=key {
+                tracing::info!(from_kind=%session.key["model"]["kind"].as_str().unwrap_or("unknown"),to_kind=%request["kind"].as_str().unwrap_or("unknown"),from_device=%session.key["model"]["device"].as_str().unwrap_or("unknown"),to_device=%request["device"].as_str().unwrap_or("unknown"),"local inference model identity changed; resident process will be replaced and the next call may incur cold-start latency");
+            }
             if session.key!=key||session.child.try_wait()?.is_some(){
                 let _=session.child.kill().await;
                 existing=None;
@@ -309,4 +331,23 @@ pub async fn invoke(request: &Value, timeout: Duration) -> AppResult<Value> {
         if fresh{monitor_idle(id);}
         Ok(response)
     }).await.map_err(|_|unavailable("local inference deadline exceeded"))?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn local_model_idle_timeout_defaults_to_five_minutes_and_is_bounded() {
+        assert_eq!(parse_idle_timeout(None), 300);
+        assert_eq!(parse_idle_timeout(Some("0")), 1);
+        assert_eq!(parse_idle_timeout(Some("9999")), 600);
+        assert_eq!(parse_idle_timeout(Some("bad")), 300);
+    }
+    #[test]
+    fn local_model_gpu_slots_default_to_one_and_are_bounded() {
+        assert_eq!(parse_gpu_lock_slots(None), 1);
+        assert_eq!(parse_gpu_lock_slots(Some("0")), 1);
+        assert_eq!(parse_gpu_lock_slots(Some("99")), 8);
+        assert_eq!(parse_gpu_lock_slots(Some("3")), 3);
+    }
 }

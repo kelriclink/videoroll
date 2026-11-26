@@ -1,8 +1,14 @@
 //! Spawn FFmpeg in a separate OS process. No native FFmpeg pointers cross Rust lifetimes.
+use crate::media::render_optimization as render_opt;
 use crate::{AppError, AppResult, Config, Database, domain::WorkItem, storage::AssetRegistry};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::{path::Path, process::Stdio};
+use std::{
+    path::{Path, PathBuf},
+    process::Stdio,
+    time::Instant,
+};
+use tempfile::Builder;
 use tokio::{fs, process::Command};
 use uuid::Uuid;
 
@@ -76,7 +82,7 @@ pub async fn probe_video(binary: &Path, path: &Path) -> AppResult<Value> {
         .arg("-v")
         .arg("error")
         .arg("-show_entries")
-        .arg("format=duration:stream=codec_type,codec_name,width,height")
+        .arg("format=duration:stream=codec_type,codec_name,width,height,pix_fmt,bits_per_raw_sample,avg_frame_rate,r_frame_rate")
         .arg("-of")
         .arg("json")
         .arg(path)
@@ -117,9 +123,12 @@ fn ffmpeg_subtitle_filter(path: &Path) -> AppResult<String> {
     let s = path
         .to_str()
         .ok_or_else(|| AppError::Invalid("non-UTF8 subtitle path".into()))?;
-    if s.chars()
-        .any(|c| matches!(c, '\'' | ':' | '[' | ']' | ',' | '\\' | '\n' | '\r' | '='))
-    {
+    if s.chars().any(|c| {
+        matches!(
+            c,
+            '\'' | ':' | '[' | ']' | ',' | ';' | '\\' | '\n' | '\r' | '='
+        )
+    }) {
         return Err(AppError::Invalid(
             "subtitle path contains FFmpeg filter syntax".into(),
         ));
@@ -237,46 +246,742 @@ pub fn encode_args(
     args.push(output.to_string_lossy().to_string());
     Ok(args)
 }
+#[derive(Debug, Clone)]
+struct RenderInfo {
+    width: u32,
+    height: u32,
+    duration_seconds: f64,
+    frame_rate: String,
+    pixel_format: String,
+    bit_depth: u32,
+}
+fn render_info(probe: &Value) -> AppResult<RenderInfo> {
+    let streams = probe
+        .get("streams")
+        .and_then(Value::as_array)
+        .ok_or_else(|| AppError::Unavailable("ffprobe video stream missing".into()))?;
+    let stream = streams
+        .iter()
+        .find(|row| row.get("codec_type").and_then(Value::as_str) == Some("video"))
+        .ok_or_else(|| AppError::Unavailable("ffprobe video stream missing".into()))?;
+    let number = |key: &str| {
+        stream
+            .get(key)
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            .min(u32::MAX as u64) as u32
+    };
+    let duration = probe
+        .get("format")
+        .and_then(|v| v.get("duration"))
+        .and_then(|v| {
+            v.as_str()
+                .and_then(|s| s.parse::<f64>().ok())
+                .or_else(|| v.as_f64())
+        })
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .ok_or_else(|| AppError::Unavailable("ffprobe video duration missing".into()))?;
+    let pixel_format = stream
+        .get("pix_fmt")
+        .and_then(Value::as_str)
+        .unwrap_or("yuv420p")
+        .to_owned();
+    let raw_depth = stream.get("bits_per_raw_sample").and_then(|v| {
+        v.as_str()
+            .and_then(|s| s.parse::<u32>().ok())
+            .or_else(|| v.as_u64().map(|n| n as u32))
+    });
+    let bit_depth = render_opt::pixel_format_bit_depth(&pixel_format, raw_depth);
+    let frame_rate = ["avg_frame_rate", "r_frame_rate"]
+        .iter()
+        .filter_map(|key| stream.get(*key).and_then(Value::as_str))
+        .find(|rate| render_opt::parse_rational(rate).is_some())
+        .unwrap_or("30/1")
+        .to_owned();
+    let width = number("width");
+    let height = number("height");
+    if width == 0 || height == 0 {
+        return Err(AppError::Unavailable(
+            "ffprobe video dimensions invalid".into(),
+        ));
+    }
+    Ok(RenderInfo {
+        width,
+        height,
+        duration_seconds: duration,
+        frame_rate,
+        pixel_format,
+        bit_depth,
+    })
+}
+fn vaapi_device_args(device: &str) -> Vec<String> {
+    vec![
+        "-init_hw_device".into(),
+        format!("vaapi=va:{device}"),
+        "-filter_hw_device".into(),
+        "va".into(),
+    ]
+}
+fn vaapi_decode_args() -> Vec<String> {
+    vec![
+        "-hwaccel".into(),
+        "vaapi".into(),
+        "-hwaccel_device".into(),
+        "va".into(),
+        "-hwaccel_output_format".into(),
+        "vaapi".into(),
+    ]
+}
+fn ffmpeg_ass_filter(path: &Path) -> AppResult<String> {
+    let filter = ffmpeg_subtitle_filter(path)?;
+    let path = filter
+        .strip_prefix("subtitles=")
+        .ok_or_else(|| AppError::Invalid("invalid ASS filter path".into()))?;
+    Ok(format!("ass={path}:alpha=1"))
+}
+async fn ffmpeg_filter_available(config: &Config, name: &str) -> bool {
+    let output = Command::new(&config.ffmpeg_binary)
+        .args(["-hide_banner", "-filters"])
+        .stdin(Stdio::null())
+        .kill_on_drop(true)
+        .output()
+        .await;
+    let Ok(output) = output else { return false };
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    text.lines()
+        .any(|line| line.split_whitespace().nth(1) == Some(name))
+}
+async fn run_ffmpeg(config: &Config, args: &[String], label: &str) -> AppResult<()> {
+    let output = Command::new(&config.ffmpeg_binary)
+        .args(args)
+        .stdin(Stdio::null())
+        .kill_on_drop(true)
+        .output()
+        .await?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let detail = stderr
+        .chars()
+        .rev()
+        .take(1600)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect::<String>();
+    tracing::warn!(operation=label,status=%output.status,stderr=%detail,"FFmpeg media operation failed");
+    Err(AppError::Unavailable(format!(
+        "FFmpeg {label} failed with {}",
+        output.status
+    )))
+}
+async fn vaapi_decode_preflight(
+    config: &Config,
+    source: &Path,
+    device: &str,
+    vaapi_format: &str,
+    software_format: &str,
+) -> bool {
+    let mut args = vec![
+        "-hide_banner".into(),
+        "-nostdin".into(),
+        "-v".into(),
+        "error".into(),
+    ];
+    args.extend(vaapi_device_args(device));
+    args.extend(vaapi_decode_args());
+    args.extend([
+        "-i".into(),
+        source.to_string_lossy().to_string(),
+        "-map".into(),
+        "0:v:0".into(),
+        "-frames:v".into(),
+        "1".into(),
+        "-an".into(),
+        "-sn".into(),
+        "-dn".into(),
+        "-vf".into(),
+        format!("scale_vaapi=format={vaapi_format},hwdownload,format={software_format}"),
+        "-f".into(),
+        "null".into(),
+        "-".into(),
+    ]);
+    match run_ffmpeg(config, &args, "VAAPI decode preflight").await {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::warn!(error=%error,"VAAPI decode unavailable; using software decode and GPU upload");
+            false
+        }
+    }
+}
+fn intel_h264_preset_quality(preset: Option<&str>) -> Option<u8> {
+    match preset?.trim().to_ascii_lowercase().as_str() {
+        "placebo" | "veryslow" => Some(1),
+        "slower" => Some(2),
+        "slow" => Some(3),
+        "medium" => Some(4),
+        "fast" => Some(5),
+        "faster" => Some(6),
+        "veryfast" => Some(7),
+        "superfast" | "ultrafast" => Some(8),
+        _ => None,
+    }
+}
+fn intel_av1_preset_quality(preset: Option<&str>) -> Option<u8> {
+    if let Some(value) = intel_h264_preset_quality(preset) {
+        return Some(value);
+    }
+    let number = preset?.trim().parse::<i32>().ok()?.clamp(0, 13);
+    Some(1 + ((number as f64 * 7.0 / 13.0).round() as u8))
+}
+fn vaapi_encoder_args(profile: &RenderProfile, codec: &str) -> Vec<String> {
+    let quality = profile.video_crf.unwrap_or(23);
+    let (encoder, flag, max_quality) = match codec {
+        "h264" => ("h264_vaapi", "-qp", 51),
+        "hevc" => ("hevc_vaapi", "-qp", 51),
+        _ => ("av1_vaapi", "-global_quality", 63),
+    };
+    let mut args = vec![
+        "-c:v".into(),
+        encoder.into(),
+        "-rc_mode".into(),
+        "CQP".into(),
+        flag.into(),
+        quality.min(max_quality).to_string(),
+    ];
+    let preset_quality = match codec {
+        "h264" => intel_h264_preset_quality(profile.video_preset.as_deref()),
+        "av1" => intel_av1_preset_quality(profile.video_preset.as_deref()),
+        _ => None,
+    };
+    if let Some(preset) = preset_quality {
+        args.extend(["-quality".into(), preset.to_string()]);
+    }
+    args
+}
+
+struct EventCache {
+    timeline: PathBuf,
+    frame_count: usize,
+    cache_bytes: u64,
+    build_seconds: f64,
+    savings_ratio: f64,
+}
+async fn build_event_cache(
+    config: &Config,
+    ass_path: &Path,
+    ass_text: &str,
+    width: u32,
+    overlay_height: u32,
+    overlay_rate: &str,
+    duration: f64,
+    work_dir: &Path,
+) -> AppResult<Option<EventCache>> {
+    let (plan, reason) = render_opt::plan_event_cache(ass_text, overlay_rate, duration);
+    let Some(plan) = plan else {
+        tracing::info!(reason=%reason,"ASS event cache skipped");
+        return Ok(None);
+    };
+    let started = Instant::now();
+    let dir = work_dir.join("ass-event-cache");
+    fs::create_dir_all(&dir).await?;
+    let blank = dir.join("blank.png");
+    let clock = dir.join("clock.ffconcat");
+    let blank_args = vec![
+        "-hide_banner".into(),
+        "-nostdin".into(),
+        "-loglevel".into(),
+        "error".into(),
+        "-y".into(),
+        "-f".into(),
+        "lavfi".into(),
+        "-i".into(),
+        format!("color=c=black@0.0:s={width}x{overlay_height}:r=1,format=rgba"),
+        "-frames:v".into(),
+        "1".into(),
+        blank.to_string_lossy().to_string(),
+    ];
+    run_ffmpeg(config, &blank_args, "ASS event cache blank frame").await?;
+    let mut clock_lines = vec!["ffconcat version 1.0".to_owned()];
+    for (index, boundary) in plan.boundaries_us.iter().enumerate() {
+        clock_lines.push("file blank.png".into());
+        clock_lines.push("option framerate 1000".into());
+        if let Some(next) = plan.boundaries_us.get(index + 1) {
+            let delta = next.saturating_sub(*boundary);
+            if delta == 0 {
+                return Err(AppError::Invalid(
+                    "ASS event timestamps are not strictly increasing".into(),
+                ));
+            }
+            clock_lines.push(format!("duration {:.6}", delta as f64 / 1_000_000.0));
+        }
+    }
+    fs::write(&clock, clock_lines.join("\n") + "\n").await?;
+    let ass_filter = ffmpeg_ass_filter(ass_path)?;
+    let pattern = dir.join("state_%06d.png");
+    let render_args = vec![
+        "-hide_banner".into(),
+        "-nostdin".into(),
+        "-loglevel".into(),
+        "error".into(),
+        "-y".into(),
+        "-f".into(),
+        "concat".into(),
+        "-safe".into(),
+        "0".into(),
+        "-i".into(),
+        clock.to_string_lossy().to_string(),
+        "-vf".into(),
+        format!("{ass_filter},format=rgba"),
+        "-fps_mode".into(),
+        "passthrough".into(),
+        pattern.to_string_lossy().to_string(),
+    ];
+    run_ffmpeg(config, &render_args, "ASS event cache rasterization").await?;
+    let mut entries = fs::read_dir(&dir).await?;
+    let mut frames = Vec::new();
+    while let Some(entry) = entries.next_entry().await? {
+        let path = entry.path();
+        let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+        if name.starts_with("state_") && name.ends_with(".png") {
+            frames.push(path)
+        }
+    }
+    frames.sort();
+    if frames.len() != plan.boundaries_us.len() {
+        return Err(AppError::Unavailable(format!(
+            "ASS event cache frame count mismatch: expected={} actual={}",
+            plan.boundaries_us.len(),
+            frames.len()
+        )));
+    }
+    let mut cache_bytes = 0_u64;
+    for path in &frames {
+        cache_bytes = cache_bytes.saturating_add(fs::metadata(path).await?.len());
+    }
+    if cache_bytes > 256 * 1024 * 1024 {
+        tracing::warn!(
+            cache_bytes,
+            "ASS event cache exceeds 256 MiB; using live overlay"
+        );
+        return Ok(None);
+    }
+    let mut timeline_lines = vec!["ffconcat version 1.0".to_owned()];
+    for (index, path) in frames.iter().enumerate() {
+        let name = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| AppError::Invalid("invalid event cache image filename".into()))?;
+        if !name.starts_with("state_") || !name.ends_with(".png") {
+            return Err(AppError::Invalid(
+                "unsafe event cache image filename".into(),
+            ));
+        }
+        timeline_lines.push(format!("file {name}"));
+        timeline_lines.push("option framerate 1000".into());
+        if let Some(next) = plan.boundaries_us.get(index + 1) {
+            timeline_lines.push(format!(
+                "duration {:.6}",
+                next.saturating_sub(plan.boundaries_us[index]) as f64 / 1_000_000.0
+            ));
+        }
+    }
+    let timeline = dir.join("overlay_events.ffconcat");
+    fs::write(&timeline, timeline_lines.join("\n") + "\n").await?;
+    Ok(Some(EventCache {
+        timeline,
+        frame_count: frames.len(),
+        cache_bytes,
+        build_seconds: started.elapsed().as_secs_f64(),
+        savings_ratio: plan.savings_ratio,
+    }))
+}
+async fn run_vaapi_overlay(
+    config: &Config,
+    source: &Path,
+    output: &Path,
+    device: &str,
+    hw_decode: bool,
+    vaapi_format: &str,
+    software_format: &str,
+    profile: &RenderProfile,
+    codec: &str,
+    video_width: u32,
+    overlay_height: u32,
+    overlay_y: u32,
+    overlay_rate: &str,
+    ass_path: Option<&Path>,
+    timeline: Option<&Path>,
+) -> AppResult<()> {
+    let mut args = vec![
+        "-hide_banner".into(),
+        "-nostdin".into(),
+        "-y".into(),
+        "-v".into(),
+        "warning".into(),
+    ];
+    args.extend(vaapi_device_args(device));
+    if hw_decode {
+        args.extend(vaapi_decode_args())
+    }
+    args.extend(["-i".into(), source.to_string_lossy().to_string()]);
+    if let Some(path) = timeline {
+        args.extend([
+            "-f".into(),
+            "concat".into(),
+            "-safe".into(),
+            "0".into(),
+            "-i".into(),
+            path.to_string_lossy().to_string(),
+        ]);
+    } else {
+        args.extend(["-f".into(),"lavfi".into(),"-i".into(),format!("color=c=black@0.0:s={video_width}x{overlay_height}:r={overlay_rate},format=yuva420p")]);
+    }
+    let main = if hw_decode {
+        format!("scale_vaapi=format={vaapi_format}")
+    } else {
+        format!("format={software_format},hwupload")
+    };
+    let graph = if timeline.is_some() {
+        format!(
+            "[0:v]{main}[main];[1:v]format=bgra,hwupload[sub];[main][sub]overlay_vaapi=x=0:y={overlay_y}:shortest=0:repeatlast=1:eof_action=repeat[out]"
+        )
+    } else {
+        let ass = ffmpeg_ass_filter(
+            ass_path.ok_or_else(|| AppError::Invalid("live overlay ASS path missing".into()))?,
+        )?;
+        format!(
+            "[0:v]{main}[main];[1:v]{ass},format=bgra,hwupload[sub];[main][sub]overlay_vaapi=x=0:y={overlay_y}:shortest=1[out]"
+        )
+    };
+    args.extend([
+        "-filter_complex".into(),
+        graph,
+        "-map".into(),
+        "[out]".into(),
+    ]);
+    args.extend(vaapi_encoder_args(profile, codec));
+    args.extend([
+        "-map".into(),
+        "0:a?".into(),
+        "-c:a".into(),
+        "aac".into(),
+        "-b:a".into(),
+        "192k".into(),
+        "-movflags".into(),
+        "+faststart".into(),
+        output.to_string_lossy().to_string(),
+    ]);
+    run_ffmpeg(config, &args, "VAAPI subtitle overlay").await
+}
+async fn run_vaapi_legacy(
+    config: &Config,
+    source: &Path,
+    output: &Path,
+    subtitle: Option<&Path>,
+    device: &str,
+    hw_decode: bool,
+    vaapi_format: &str,
+    software_format: &str,
+    profile: &RenderProfile,
+    codec: &str,
+) -> AppResult<()> {
+    let mut args = vec![
+        "-hide_banner".into(),
+        "-nostdin".into(),
+        "-y".into(),
+        "-v".into(),
+        "warning".into(),
+    ];
+    args.extend(vaapi_device_args(device));
+    if hw_decode {
+        args.extend(vaapi_decode_args())
+    }
+    args.extend(["-i".into(), source.to_string_lossy().to_string()]);
+    let filter = if let Some(sub) = subtitle {
+        let sub = ffmpeg_subtitle_filter(sub)?;
+        if hw_decode {
+            format!(
+                "scale_vaapi=format={vaapi_format},hwdownload,format={software_format},{sub},format={software_format},hwupload"
+            )
+        } else {
+            format!("{sub},format={software_format},hwupload")
+        }
+    } else if hw_decode {
+        format!("scale_vaapi=format={vaapi_format}")
+    } else {
+        format!("format={software_format},hwupload")
+    };
+    args.extend(["-vf".into(), filter]);
+    args.extend(vaapi_encoder_args(profile, codec));
+    args.extend([
+        "-map".into(),
+        "0:v:0".into(),
+        "-map".into(),
+        "0:a?".into(),
+        "-c:a".into(),
+        "aac".into(),
+        "-b:a".into(),
+        "192k".into(),
+        "-movflags".into(),
+        "+faststart".into(),
+        output.to_string_lossy().to_string(),
+    ]);
+    run_ffmpeg(config, &args, "VAAPI legacy subtitle render").await
+}
+async fn render_intel_gpu(
+    config: &Config,
+    source: &Path,
+    output: &Path,
+    subtitle: Option<&Path>,
+    profile: &RenderProfile,
+    device: &str,
+) -> AppResult<Value> {
+    let probe = probe_video(&config.ffprobe_binary, source).await?;
+    let info = render_info(&probe)?;
+    let codec = match profile.video_codec.as_str() {
+        "h264" | "avc" => "h264",
+        "hevc" | "h265" => "hevc",
+        "av1" => "av1",
+        _ => {
+            return Err(AppError::Invalid(
+                "unsupported requested video codec".into(),
+            ));
+        }
+    };
+    let preserve_10bit = info.bit_depth > 8 && codec == "av1";
+    let vaapi_format = if preserve_10bit { "p010" } else { "nv12" };
+    let software_format = if preserve_10bit { "p010le" } else { "nv12" };
+    let hw_decode =
+        vaapi_decode_preflight(config, source, device, vaapi_format, software_format).await;
+    let overlay_available = ffmpeg_filter_available(config, "overlay_vaapi").await;
+    let mut metrics = json!({"encoder":format!("{codec}_vaapi"),"decode_mode":if hw_decode{"vaapi"}else{"software-upload"},"source_bit_depth":info.bit_depth,"output_bit_depth":if preserve_10bit{10}else{8},"source_pixel_format":info.pixel_format,"source_frame_rate":info.frame_rate,"source_duration_seconds":info.duration_seconds,"video_width":info.width,"video_height":info.height,"overlay_vaapi_available":overlay_available});
+    if let Some(subtitle) = subtitle.filter(|_| overlay_available) {
+        let ass_text = fs::read_to_string(subtitle).await?;
+        let parent = output.parent().unwrap_or_else(|| Path::new("."));
+        let work = Builder::new()
+            .prefix("videoroll-render-")
+            .tempdir_in(parent)?;
+        let band = render_opt::prepare_overlay_band(&ass_text, info.width, info.height);
+        let (overlay_ass, overlay_height, band_used) = if let Some((script, height)) = band {
+            let path = work.path().join("subtitle-band.ass");
+            fs::write(&path, script).await?;
+            (path, height, true)
+        } else {
+            (subtitle.to_path_buf(), info.height, false)
+        };
+        let static_overlay = band_used && render_opt::ass_is_static(&ass_text);
+        let overlay_rate = if static_overlay {
+            render_opt::reduced_overlay_rate(&info.frame_rate, 15.0)
+        } else {
+            info.frame_rate.clone()
+        };
+        let overlay_y = info.height.saturating_sub(overlay_height);
+        let mut event_cache = None;
+        if static_overlay {
+            let (cache_plan, cache_reason) =
+                render_opt::plan_event_cache(&ass_text, &overlay_rate, info.duration_seconds);
+            if cache_plan.is_none() {
+                metrics["event_cache_skip_reason"] = json!(cache_reason);
+            }
+            match build_event_cache(
+                config,
+                &overlay_ass,
+                &ass_text,
+                info.width,
+                overlay_height,
+                &overlay_rate,
+                info.duration_seconds,
+                work.path(),
+            )
+            .await
+            {
+                Ok(cache) => event_cache = cache,
+                Err(error) => {
+                    metrics["event_cache_build_fallback"] = json!(error.to_string());
+                    tracing::warn!(error=%error,"ASS event cache failed; using live VAAPI overlay")
+                }
+            }
+        }
+        if let Some(cache) = event_cache.as_ref() {
+            match run_vaapi_overlay(
+                config,
+                source,
+                output,
+                device,
+                hw_decode,
+                vaapi_format,
+                software_format,
+                profile,
+                codec,
+                info.width,
+                overlay_height,
+                overlay_y,
+                &overlay_rate,
+                None,
+                Some(&cache.timeline),
+            )
+            .await
+            {
+                Ok(()) => {
+                    metrics["subtitle_overlay_mode"] = json!("event-vfr");
+                    metrics["subtitle_overlay_fps"] = json!(overlay_rate);
+                    metrics["subtitle_event_cache_states"] = json!(cache.frame_count);
+                    metrics["subtitle_event_cache_bytes"] = json!(cache.cache_bytes);
+                    metrics["subtitle_event_cache_build_seconds"] = json!(cache.build_seconds);
+                    metrics["subtitle_event_cache_savings_ratio"] = json!(cache.savings_ratio);
+                    return Ok(metrics);
+                }
+                Err(error) => {
+                    metrics["event_cache_overlay_fallback"] = json!(error.to_string());
+                    tracing::warn!(error=%error,"ASS event-cache overlay failed; retrying live overlay");
+                    let _ = fs::remove_file(output).await;
+                }
+            }
+        }
+        match run_vaapi_overlay(
+            config,
+            source,
+            output,
+            device,
+            hw_decode,
+            vaapi_format,
+            software_format,
+            profile,
+            codec,
+            info.width,
+            overlay_height,
+            overlay_y,
+            &overlay_rate,
+            Some(&overlay_ass),
+            None,
+        )
+        .await
+        {
+            Ok(()) => {
+                metrics["subtitle_overlay_mode"] = json!(if static_overlay {
+                    "live-static"
+                } else if band_used {
+                    "live-band-dynamic"
+                } else {
+                    "live-full-frame"
+                });
+                metrics["subtitle_overlay_fps"] = json!(overlay_rate);
+                return Ok(metrics);
+            }
+            Err(error) => {
+                metrics["live_overlay_fallback"] = json!(error.to_string());
+                tracing::warn!(error=%error,"live VAAPI overlay failed; retrying legacy CPU ASS composition");
+                let _ = fs::remove_file(output).await;
+            }
+        }
+        run_vaapi_legacy(
+            config,
+            source,
+            output,
+            Some(subtitle),
+            device,
+            hw_decode,
+            vaapi_format,
+            software_format,
+            profile,
+            codec,
+        )
+        .await?;
+        metrics["subtitle_overlay_mode"] = json!("legacy-full-frame-fallback");
+        return Ok(metrics);
+    }
+    run_vaapi_legacy(
+        config,
+        source,
+        output,
+        subtitle,
+        device,
+        hw_decode,
+        vaapi_format,
+        software_format,
+        profile,
+        codec,
+    )
+    .await?;
+    metrics["subtitle_overlay_mode"] = json!(if subtitle.is_some() {
+        "legacy-full-frame"
+    } else {
+        "none"
+    });
+    Ok(metrics)
+}
+fn render_gpu_auto_enabled() -> bool {
+    let value = std::env::var("VIDEOROLL_V2_RENDER_GPU_AUTO")
+        .ok()
+        .map(|value| value.to_ascii_lowercase());
+    matches!(value.as_deref(), Some("true" | "1" | "yes" | "on"))
+}
+fn render_gpu_requested(
+    profile_explicit: bool,
+    device_available: bool,
+    auto_enabled: bool,
+) -> bool {
+    profile_explicit || (device_available && auto_enabled)
+}
 pub async fn transcode(
     config: &Config,
     source: &Path,
     output: &Path,
     subtitles: Option<&Path>,
     profile: &RenderProfile,
-) -> AppResult<()> {
+) -> AppResult<Value> {
     let device = std::env::var("INTEL_GPU_RENDER_DEVICE")
         .ok()
-        .filter(|s| s.starts_with("/dev/dri/renderD"));
-    let plans = if profile.use_intel_gpu && device.is_some() {
-        vec![true, false]
-    } else {
-        vec![false]
-    };
-    for try_gpu in plans {
-        let mut options = profile.clone();
-        options.use_intel_gpu = try_gpu;
-        let args = encode_args(source, output, subtitles, &options, device.as_deref())?;
-        let result = Command::new(&config.ffmpeg_binary)
-            .args(args)
-            .stdin(Stdio::null())
-            .kill_on_drop(true)
-            .output()
-            .await?;
-        if result.status.success() {
-            return Ok(());
+        .filter(|s| s.starts_with("/dev/dri/renderD") && Path::new(s).exists());
+    let gpu_requested = render_gpu_requested(
+        profile.use_intel_gpu,
+        device.is_some(),
+        render_gpu_auto_enabled(),
+    );
+    let mut gpu_fallback_reason = None;
+    if gpu_requested {
+        if let Some(device) = device.as_deref() {
+            match render_intel_gpu(config, source, output, subtitles, profile, device).await {
+                Ok(mut metrics) => {
+                    metrics["gpu_requested"] = json!(gpu_requested);
+                    metrics["gpu_device"] = json!(device);
+                    metrics["gpu_auto_enabled"] = json!(render_gpu_auto_enabled());
+                    return Ok(metrics);
+                }
+                Err(error) => {
+                    gpu_fallback_reason = Some(error.to_string());
+                    tracing::warn!(error=%error,"optimized VAAPI render failed; falling back to software encoding");
+                    let _ = fs::remove_file(output).await;
+                }
+            }
+        } else {
+            gpu_fallback_reason = Some(
+                "INTEL_GPU_RENDER_DEVICE is unset or is not an existing /dev/dri/renderD* node"
+                    .into(),
+            );
         }
-        let text = String::from_utf8_lossy(&result.stderr);
-        tracing::warn!(gpu=try_gpu,error=%text.chars().rev().take(1200).collect::<String>().chars().rev().collect::<String>(),"FFmpeg encode failed");
-        if try_gpu {
-            let _ = fs::remove_file(output).await;
-            continue;
-        }
-        return Err(AppError::Unavailable(format!(
-            "FFmpeg render failed with {}",
-            result.status
-        )));
     }
-    Err(AppError::Unavailable("no usable video encoder".into()))
+    let mut cpu_profile = profile.clone();
+    cpu_profile.use_intel_gpu = false;
+    let args = encode_args(source, output, subtitles, &cpu_profile, None)?;
+    run_ffmpeg(config, &args, "software render").await?;
+    let mut metrics = json!({
+        "encoder":match cpu_profile.video_codec.as_str(){"av1"=>"libsvtav1","hevc"|"h265"=>"libx265",_=>"libx264"},
+        "pipeline":"cpu-ass-software-encoder-fallback",
+        "decode_mode":"software",
+        "subtitle_overlay_mode":if subtitles.is_some(){"cpu-libass"}else{"none"},
+        "gpu_requested":gpu_requested
+    });
+    if let Some(reason) = gpu_fallback_reason {
+        metrics["gpu_fallback_reason"] = json!(reason);
+    }
+    Ok(metrics)
 }
 pub(crate) async fn ensure_task_asset(
     db: &Database,
@@ -405,15 +1110,25 @@ pub async fn render(
     }
     let temp = output.with_extension("partial.mp4");
     let _ = fs::remove_file(&temp).await;
-    transcode(config, &input, &temp, subtitle.as_deref(), &cfg).await?;
+    let render_metrics = transcode(config, &input, &temp, subtitle.as_deref(), &cfg).await?;
     probe_video(&config.ffprobe_binary, &temp).await?;
     fs::rename(&temp, &output).await?;
-    ensure_task_asset(db, registry, job.task_id, job, "video_final", &output_key).await
+    let mut result =
+        ensure_task_asset(db, registry, job.task_id, job, "video_final", &output_key).await?;
+    result["render_metrics"] = render_metrics;
+    Ok(result)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn configured_intel_render_node_is_used_automatically_unless_disabled() {
+        assert!(render_gpu_requested(false, true, true));
+        assert!(!render_gpu_requested(false, true, false));
+        assert!(!render_gpu_requested(false, false, true));
+        assert!(render_gpu_requested(true, false, false));
+    }
     #[test]
     fn supported_encoders_and_presets() {
         let src = Path::new("/tmp/source.mp4");
@@ -430,9 +1145,177 @@ mod tests {
         av1.video_codec = "rawvideo".into();
         assert!(encode_args(src, dst, None, &av1, None).is_err());
     }
+    // Opt-in benchmark: no DB connection, no production jobs, identical fixture
+    // and encoder quality as the Python reference.
+    #[tokio::test]
+    async fn vaapi_render_benchmark() {
+        let Ok(root) = std::env::var("VIDEOROLL_RENDER_BENCH_ROOT") else {
+            return;
+        };
+        let config = Config::from_env().expect("isolated benchmark config");
+        let root = PathBuf::from(root);
+        let profile = RenderProfile {
+            video_codec: "av1".into(),
+            use_intel_gpu: true,
+            video_crf: Some(24),
+            video_preset: Some("4".into()),
+            ..RenderProfile::default()
+        };
+        for name in ["1080p60", "4k60"] {
+            let source = root.join(format!("{name}.mp4"));
+            let ass = root.join(format!("{name}.ass"));
+            let output = root.join(format!("{name}-rust.mp4"));
+            let start = Instant::now();
+            let metrics = transcode(&config, &source, &output, Some(&ass), &profile)
+                .await
+                .unwrap();
+            let elapsed = start.elapsed().as_secs_f64();
+            assert_eq!(metrics["subtitle_overlay_mode"], "event-vfr", "{metrics}");
+            assert_eq!(metrics["decode_mode"], "vaapi", "{metrics}");
+            println!(
+                "BENCH {}",
+                json!({"engine":"rust","fixture":name,"seconds":elapsed,"metrics":metrics})
+            );
+        }
+    }
+    #[tokio::test]
+    async fn vaapi_two_concurrent_render_benchmark() {
+        let Ok(root) = std::env::var("VIDEOROLL_RENDER_BENCH_ROOT") else {
+            return;
+        };
+        let config = Config::from_env().expect("isolated benchmark config");
+        let root = PathBuf::from(root);
+        let source = root.join("4k60.mp4");
+        let ass = root.join("4k60.ass");
+        let a = root.join("4k60-concurrent-a.mp4");
+        let b = root.join("4k60-concurrent-b.mp4");
+        let profile = RenderProfile {
+            video_codec: "av1".into(),
+            use_intel_gpu: true,
+            video_crf: Some(24),
+            video_preset: Some("4".into()),
+            ..RenderProfile::default()
+        };
+        let start = Instant::now();
+        let (ra, rb) = tokio::join!(
+            transcode(&config, &source, &a, Some(&ass), &profile),
+            transcode(&config, &source, &b, Some(&ass), &profile)
+        );
+        let elapsed = start.elapsed().as_secs_f64();
+        for result in [ra.unwrap(), rb.unwrap()] {
+            assert_eq!(result["subtitle_overlay_mode"], "event-vfr", "{result}");
+            assert_eq!(result["decode_mode"], "vaapi", "{result}");
+        }
+        println!(
+            "CONCURRENT_BENCH {}",
+            json!({"jobs":2,"fixture":"4k60","seconds":elapsed})
+        );
+    }
+    #[tokio::test]
+    async fn vaapi_event_cache_hardware_smoke() {
+        if std::env::var_os("VIDEOROLL_RUN_VAAPI_SMOKE").is_none() {
+            return;
+        }
+        let config = Config::from_env().expect("isolated smoke config");
+        let source =
+            PathBuf::from(std::env::var("VIDEOROLL_RENDER_SMOKE_SOURCE").expect("smoke source"));
+        let subtitle =
+            PathBuf::from(std::env::var("VIDEOROLL_RENDER_SMOKE_ASS").expect("smoke ASS"));
+        let output_dir = Builder::new()
+            .prefix("videoroll-vaapi-smoke-")
+            .tempdir()
+            .unwrap();
+        let output = output_dir.path().join("event-cache.mp4");
+        let profile = RenderProfile {
+            burn_in: true,
+            soft_sub: false,
+            video_codec: "h264".into(),
+            use_intel_gpu: false,
+            video_crf: Some(23),
+            video_preset: Some("fast".into()),
+            ass_style: "clean_white".into(),
+        };
+        let metrics = transcode(&config, &source, &output, Some(&subtitle), &profile)
+            .await
+            .unwrap();
+        assert_eq!(
+            metrics["subtitle_overlay_mode"], "event-vfr",
+            "metrics={metrics}"
+        );
+        assert_eq!(metrics["decode_mode"], "vaapi");
+        assert!(metrics["subtitle_event_cache_states"].as_u64().unwrap_or(0) >= 2);
+        let probe = probe_video(&config.ffprobe_binary, &output).await.unwrap();
+        assert!(
+            probe["streams"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|stream| stream["codec_type"] == "video")
+        );
+        let mut dynamic_text = std::fs::read_to_string(&subtitle).unwrap();
+        dynamic_text = dynamic_text.replace(
+            "First static subtitle",
+            "{\\fad(100,100)}First animated subtitle",
+        );
+        let dynamic_ass = output_dir.path().join("dynamic.ass");
+        std::fs::write(&dynamic_ass, dynamic_text).unwrap();
+        let dynamic_output = output_dir.path().join("live-dynamic.mp4");
+        let dynamic_metrics = transcode(
+            &config,
+            &source,
+            &dynamic_output,
+            Some(&dynamic_ass),
+            &profile,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            dynamic_metrics["subtitle_overlay_mode"], "live-band-dynamic",
+            "metrics={dynamic_metrics}"
+        );
+        assert_eq!(dynamic_metrics["subtitle_overlay_fps"], "60/1");
+    }
+    #[tokio::test]
+    async fn vaapi_p010_av1_smoke() {
+        if std::env::var_os("VIDEOROLL_RUN_VAAPI_SMOKE").is_none() {
+            return;
+        }
+        let Ok(source) = std::env::var("VIDEOROLL_RENDER_SMOKE_10BIT_SOURCE") else {
+            return;
+        };
+        let config = Config::from_env().expect("isolated smoke config");
+        let subtitle =
+            PathBuf::from(std::env::var("VIDEOROLL_RENDER_SMOKE_ASS").expect("smoke ASS"));
+        let output_dir = Builder::new()
+            .prefix("videoroll-vaapi-p010-smoke-")
+            .tempdir()
+            .unwrap();
+        let output = output_dir.path().join("p010-av1.mp4");
+        let profile = RenderProfile {
+            burn_in: true,
+            soft_sub: false,
+            video_codec: "av1".into(),
+            use_intel_gpu: false,
+            video_crf: Some(24),
+            video_preset: Some("4".into()),
+            ass_style: "clean_white".into(),
+        };
+        let metrics = transcode(
+            &config,
+            Path::new(&source),
+            &output,
+            Some(&subtitle),
+            &profile,
+        )
+        .await
+        .unwrap();
+        assert_eq!(metrics["output_bit_depth"], 10, "metrics={metrics}");
+        let probe = probe_video(&config.ffprobe_binary, &output).await.unwrap();
+        assert!(probe["streams"].as_array().unwrap().iter().any(|stream|stream["codec_type"]=="video"&&stream["pix_fmt"]=="yuv420p10le"));
+    }
     #[test]
     fn reject_filter_argument_injection() {
-        assert!(ffmpeg_subtitle_filter(Path::new("/tmp/b;safe.srt")).is_ok());
+        assert!(ffmpeg_subtitle_filter(Path::new("/tmp/b;unsafe.srt")).is_err());
         assert!(ffmpeg_subtitle_filter(Path::new("/tmp/b'a.srt")).is_err());
         assert!(ffmpeg_subtitle_filter(Path::new("/tmp/b:c.srt")).is_err());
     }

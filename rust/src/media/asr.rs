@@ -323,6 +323,480 @@ async fn cloudflare_slot(
         sleep(Duration::from_millis(250)).await;
     }
 }
+async fn external_whisper_slot(
+    db: &Database,
+    job: &WorkItem,
+    cap: i32,
+) -> AppResult<sqlx::Transaction<'static, sqlx::Postgres>> {
+    let cap = cap.clamp(1, 8);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3600);
+    loop {
+        selective_lease(db, job).await?;
+        let mut tx = db.pool.begin().await?;
+        for slot in 0..cap {
+            let held:bool=sqlx::query_scalar("SELECT pg_try_advisory_xact_lock(hashtextextended('videoroll:asr:external-whisper:'||$1::text,0))")
+                .bind(slot).fetch_one(&mut *tx).await?;
+            if held {
+                return Ok(tx);
+            }
+        }
+        tx.rollback().await?;
+        if tokio::time::Instant::now() >= deadline {
+            return Err(AppError::Unavailable(
+                "external Whisper admission timeout".into(),
+            ));
+        }
+        sleep(Duration::from_millis(250)).await;
+    }
+}
+fn external_whisper_fields(
+    model: &str,
+    options: &Value,
+    lang: &str,
+    extended: bool,
+) -> Vec<(String, String)> {
+    let mut fields = vec![
+        ("model".into(), model.to_owned()),
+        ("response_format".into(), "verbose_json".into()),
+    ];
+    if !lang.is_empty() && !lang.eq_ignore_ascii_case("auto") {
+        fields.push(("language".into(), lang.into()));
+    }
+    if extended {
+        let number = |key: &str, default: f64, min: f64, max: f64| {
+            options
+                .get(key)
+                .and_then(Value::as_f64)
+                .unwrap_or(default)
+                .clamp(min, max)
+        };
+        let integer = |key: &str, default: i64, min: i64, max: i64| {
+            options
+                .get(key)
+                .and_then(Value::as_i64)
+                .unwrap_or(default)
+                .clamp(min, max)
+        };
+        let boolean =
+            |key: &str, default: bool| options.get(key).and_then(Value::as_bool).unwrap_or(default);
+        fields.extend([
+            ("temperature".into(), "0".into()),
+            ("beam_size".into(), "5".into()),
+            (
+                "batch_size".into(),
+                integer("batch_size", 1, 1, 32).to_string(),
+            ),
+            ("word_timestamps".into(), "true".into()),
+            ("vad_filter".into(), boolean("vad_filter", true).to_string()),
+            (
+                "vad_threshold".into(),
+                number("vad_threshold", 0.5, 0.1, 0.95).to_string(),
+            ),
+            (
+                "min_silence_duration_ms".into(),
+                integer("min_silence_duration_ms", 2000, 50, 5000).to_string(),
+            ),
+            (
+                "speech_pad_ms".into(),
+                integer("speech_pad_ms", 400, 0, 2000).to_string(),
+            ),
+            (
+                "condition_on_previous_text".into(),
+                boolean("condition_on_previous_text", true).to_string(),
+            ),
+            ("no_speech_threshold".into(), "0.6".into()),
+            ("log_prob_threshold".into(), "-1.0".into()),
+            ("compression_ratio_threshold".into(), "2.4".into()),
+        ]);
+    }
+    fields
+}
+fn external_whisper_portable_rejection(error: &AppError) -> bool {
+    matches!(error,AppError::Unavailable(message) if message.contains("HTTP 400")||message.contains("HTTP 422"))
+}
+#[derive(Clone)]
+struct ExternalWhisperWord {
+    start: f64,
+    end: f64,
+    text: String,
+}
+fn terminal_asr_punctuation(text: &str) -> bool {
+    text.trim_end()
+        .chars()
+        .last()
+        .is_some_and(|c| matches!(c, '.' | '!' | '?' | '。' | '！' | '？'))
+}
+fn join_external_words(words: &[ExternalWhisperWord]) -> String {
+    let raw = words
+        .iter()
+        .map(|word| word.text.as_str())
+        .collect::<String>();
+    if raw.is_empty() {
+        return raw;
+    }
+    if !raw.contains(' ')
+        && words.len() > 1
+        && words.iter().all(|word| {
+            word.text
+                .trim()
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "'’._-,!?;:".contains(c))
+        })
+    {
+        return words
+            .iter()
+            .map(|word| word.text.trim())
+            .collect::<Vec<_>>()
+            .join(" ")
+            .replace(" ,", ",")
+            .replace(" .", ".")
+            .replace(" !", "!")
+            .replace(" ?", "?");
+    }
+    raw.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim()
+        .to_owned()
+}
+fn external_text_chunks(text: &str, max_chars: usize) -> Vec<String> {
+    let mut units = Vec::new();
+    let mut current = String::new();
+    for ch in text.chars() {
+        current.push(ch);
+        if matches!(ch, '。' | '！' | '？' | '!' | '?' | '；' | ';' | '：' | ':') {
+            if !current.trim().is_empty() {
+                units.push(current.trim().to_owned())
+            }
+            current.clear();
+        }
+    }
+    if !current.trim().is_empty() {
+        units.push(current.trim().to_owned())
+    }
+    if units.is_empty() {
+        return Vec::new();
+    }
+    let mut bounded = Vec::new();
+    for unit in units {
+        if unit.chars().count() <= max_chars {
+            bounded.push(unit);
+            continue;
+        }
+        if unit.contains(char::is_whitespace) {
+            let mut part = String::new();
+            for token in unit.split_whitespace() {
+                let candidate = if part.is_empty() {
+                    token.to_owned()
+                } else {
+                    format!("{part} {token}")
+                };
+                if !part.is_empty() && candidate.chars().count() > max_chars {
+                    bounded.push(part);
+                    part = token.to_owned()
+                } else {
+                    part = candidate
+                }
+            }
+            if !part.is_empty() {
+                bounded.push(part)
+            }
+        } else {
+            let chars = unit.chars().collect::<Vec<_>>();
+            for chunk in chars.chunks(max_chars) {
+                bounded.push(chunk.iter().collect())
+            }
+        }
+    }
+    let mut merged: Vec<String> = Vec::new();
+    for unit in bounded {
+        let candidate = merged
+            .last()
+            .map(|last| format!("{last}{unit}"))
+            .unwrap_or_else(|| unit.clone());
+        if !merged.is_empty() && candidate.chars().count() > max_chars {
+            merged.push(unit)
+        } else if let Some(last) = merged.last_mut() {
+            last.push_str(&unit)
+        } else {
+            merged.push(unit)
+        }
+    }
+    merged
+}
+fn external_whisper_response(
+    payload: Value,
+    options: &Value,
+    audio_duration: f64,
+) -> AppResult<AsrResponse> {
+    let max_seconds = options
+        .get("max_segment_seconds")
+        .and_then(Value::as_f64)
+        .unwrap_or(12.0)
+        .clamp(1.0, 30.0);
+    let max_chars = options
+        .get("max_segment_chars")
+        .and_then(Value::as_i64)
+        .unwrap_or(120)
+        .clamp(10, 500) as usize;
+    let top_text = payload
+        .get("text")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_owned();
+    let raw_segments = payload.get("segments").and_then(Value::as_array);
+    let mut segments = Vec::new();
+    if let Some(raw_segments) = raw_segments {
+        let mut words = Vec::new();
+        for item in raw_segments {
+            let Some(raw_words) = item.get("words").and_then(Value::as_array) else {
+                continue;
+            };
+            for raw in raw_words {
+                let Some(text) = raw
+                    .get("word")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.trim().is_empty())
+                else {
+                    continue;
+                };
+                let start = raw.get("start").and_then(Value::as_f64).unwrap_or(-1.0);
+                let end = raw.get("end").and_then(Value::as_f64).unwrap_or(-1.0);
+                if start.is_finite()
+                    && end.is_finite()
+                    && end > start
+                    && audio_duration.is_finite()
+                    && audio_duration > 0.0
+                {
+                    let start = start.max(0.0).min(audio_duration);
+                    let end = end.max(0.0).min(audio_duration);
+                    if end > start {
+                        words.push(ExternalWhisperWord {
+                            start,
+                            end,
+                            text: text.to_owned(),
+                        });
+                    }
+                }
+            }
+        }
+        if !words.is_empty() {
+            words.sort_by(|a, b| a.start.total_cmp(&b.start).then(a.end.total_cmp(&b.end)));
+            let mut current: Vec<ExternalWhisperWord> = Vec::new();
+            let emit = |group: &mut Vec<ExternalWhisperWord>, out: &mut Vec<AsrSegment>| {
+                if group.is_empty() {
+                    return;
+                }
+                let text = join_external_words(group);
+                if !text.is_empty() {
+                    out.push(AsrSegment {
+                        start: group[0].start,
+                        end: group.last().unwrap().end,
+                        text,
+                        no_speech_prob: None,
+                        avg_logprob: None,
+                        compression_ratio: None,
+                    })
+                }
+                group.clear();
+            };
+            for word in words {
+                if !current.is_empty() {
+                    let gap = (word.start - current.last().unwrap().end).max(0.0);
+                    let duration = current.last().unwrap().end - current[0].start;
+                    let text = join_external_words(&current);
+                    let next_chars = text.chars().count() + word.text.chars().count();
+                    if (gap >= 0.8 && duration >= 0.8)
+                        || terminal_asr_punctuation(&text)
+                        || duration >= max_seconds
+                        || next_chars > max_chars
+                    {
+                        emit(&mut current, &mut segments);
+                    }
+                }
+                current.push(word);
+            }
+            emit(&mut current, &mut segments);
+        } else {
+            for item in raw_segments {
+                let Ok(segment) = serde_json::from_value::<AsrSegment>(item.clone()) else {
+                    continue;
+                };
+                let text = segment.text.trim().to_owned();
+                if text.is_empty()
+                    || !segment.start.is_finite()
+                    || !segment.end.is_finite()
+                    || !audio_duration.is_finite()
+                    || audio_duration <= 0.0
+                {
+                    continue;
+                }
+                let start = segment.start.max(0.0).min(audio_duration);
+                let end = segment.end.max(0.0).min(audio_duration);
+                if end <= start {
+                    continue;
+                }
+                if end - start <= max_seconds * 2.0 && text.chars().count() <= max_chars * 2 {
+                    segments.push(AsrSegment {
+                        start,
+                        end,
+                        text,
+                        ..segment
+                    });
+                    continue;
+                }
+                let chunks = external_text_chunks(&text, max_chars);
+                let weights = chunks
+                    .iter()
+                    .map(|chunk| chunk.chars().filter(|c| !c.is_whitespace()).count().max(1))
+                    .collect::<Vec<_>>();
+                let total = weights.iter().sum::<usize>().max(1);
+                let duration = end - start;
+                let mut consumed = 0usize;
+                let mut cursor = start;
+                for (index, chunk) in chunks.into_iter().enumerate() {
+                    consumed += weights[index];
+                    let end = if index + 1 == weights.len() {
+                        end
+                    } else {
+                        (start + duration * (consumed as f64 / total as f64)).min(end)
+                    };
+                    segments.push(AsrSegment {
+                        start: cursor,
+                        end: end.max(cursor),
+                        text: chunk,
+                        no_speech_prob: segment.no_speech_prob,
+                        avg_logprob: segment.avg_logprob,
+                        compression_ratio: segment.compression_ratio,
+                    });
+                    cursor = end;
+                }
+            }
+        }
+    }
+    if segments.is_empty() && !top_text.is_empty() {
+        if audio_duration > max_seconds {
+            return Err(AppError::Unavailable("external Whisper returned text without segment/word timestamps; subtitle timeline is unavailable".into()));
+        }
+        segments.push(AsrSegment {
+            start: 0.0,
+            end: audio_duration.max(0.0),
+            text: top_text.clone(),
+            no_speech_prob: None,
+            avg_logprob: None,
+            compression_ratio: None,
+        });
+    }
+    let text = if top_text.is_empty() {
+        segments
+            .iter()
+            .map(|segment| segment.text.as_str())
+            .collect::<Vec<_>>()
+            .join("")
+    } else {
+        top_text
+    };
+    Ok(AsrResponse { text, segments })
+}
+
+async fn run_external_whisper(
+    db: &Database,
+    job: &WorkItem,
+    client: &Client,
+    config: &Config,
+    path: &Path,
+    lang: &str,
+    target: &str,
+    parsed_endpoint: &Url,
+    audio_duration: f64,
+) -> AppResult<AsrResponse> {
+    if fs::metadata(path).await?.len() > 24 * 1024 * 1024 {
+        return Err(AppError::Invalid("ASR audio chunk exceeds 24 MiB".into()));
+    }
+    let audio = fs::read(path).await?;
+    let options = config.asr_request_options.as_ref().unwrap_or(&Value::Null);
+    let max_concurrency = options
+        .get("max_concurrency")
+        .and_then(Value::as_i64)
+        .unwrap_or(1)
+        .clamp(1, 8) as i32;
+    let slot = external_whisper_slot(db, job, max_concurrency).await?;
+    let mut extended = true;
+    let mut connect_attempt = 0_u8;
+    loop {
+        connect_attempt = connect_attempt.saturating_add(1);
+        selective_lease(db, job).await?;
+        let part = multipart::Part::bytes(audio.clone())
+            .file_name("audio.flac")
+            .mime_str("audio/flac")
+            .map_err(|_| AppError::Invalid("invalid external Whisper audio MIME".into()))?;
+        let mut form = multipart::Form::new().part("file", part);
+        for (key, value) in external_whisper_fields(
+            &config.asr_model,
+            config.asr_request_options.as_ref().unwrap_or(&Value::Null),
+            lang,
+            extended,
+        ) {
+            form = form.text(key, value);
+        }
+        let mut request = client
+            .post(target)
+            .timeout(Duration::from_secs(600))
+            .multipart(form);
+        if let Some(key) = config.asr_api_key.as_ref() {
+            request = request.bearer_auth(key);
+        }
+        let result = crate::ai_usage::chat_json(
+            db,
+            request,
+            parsed_endpoint,
+            &config.asr_model,
+            "asr_external_whisper",
+            Some(job.task_id),
+            MAX_BYTES,
+            "ASR",
+        )
+        .await;
+        match result {
+            Ok(body) => {
+                slot.rollback().await?;
+                selective_lease(db, job).await?;
+                return external_whisper_response(
+                    body,
+                    config.asr_request_options.as_ref().unwrap_or(&Value::Null),
+                    audio_duration,
+                );
+            }
+            Err(error) if extended && external_whisper_portable_rejection(&error) => {
+                tracing::info!(
+                    "external Whisper rejected extension fields; retrying once with portable OpenAI fields"
+                );
+                extended = false;
+                connect_attempt = 0;
+            }
+            Err(AppError::Upstream(error)) if error.is_connect() && connect_attempt < 4 => {
+                let delay = Duration::from_millis(
+                    500_u64
+                        .saturating_mul(1_u64 << (connect_attempt - 1))
+                        .min(4000),
+                );
+                tracing::warn!(
+                    attempt = connect_attempt,
+                    delay_ms = delay.as_millis(),
+                    "external Whisper connection failed; retrying"
+                );
+                sleep(delay).await;
+            }
+            Err(error) => {
+                slot.rollback().await?;
+                selective_lease(db, job).await?;
+                return Err(error);
+            }
+        }
+    }
+}
+
 async fn run_asr(
     db: &Database,
     job: &WorkItem,
@@ -345,6 +819,20 @@ async fn run_asr(
         .as_deref()
         .ok_or_else(|| AppError::Unavailable("no native ASR endpoint configured".into()))?;
     let parsed_endpoint = endpoint(target)?;
+    if config.asr_request_options.is_some() {
+        return run_external_whisper(
+            db,
+            job,
+            client,
+            config,
+            path,
+            lang,
+            target,
+            &parsed_endpoint,
+            seconds,
+        )
+        .await;
+    }
     if config.cloudflare_asr {
         if fs::metadata(path).await?.len() > 1_100_000 {
             return Err(AppError::Invalid(
@@ -844,6 +1332,17 @@ pub async fn runtime_asr_config(
             };
             out.asr_endpoint = Some(target);
             out.asr_model = model.into();
+            out.asr_request_options = Some(json!({
+                "batch_size":read["external_whisper_batch_size"],
+                "vad_filter":read["external_whisper_vad_enabled"],
+                "vad_threshold":read["external_whisper_vad_threshold"],
+                "min_silence_duration_ms":read["external_whisper_min_silence_ms"],
+                "speech_pad_ms":read["external_whisper_speech_pad_ms"],
+                "condition_on_previous_text":read["external_whisper_condition_on_previous_text"],
+                "max_segment_seconds":read["external_whisper_max_segment_seconds"],
+                "max_segment_chars":read["external_whisper_max_segment_chars"],
+                "max_concurrency":read["external_whisper_max_concurrency"]
+            }));
             Ok(Some(out))
         }
         "groq-whisper" => {
@@ -2078,6 +2577,111 @@ mod tests {
                 .unwrap()
                 .segments
                 .is_empty()
+        );
+    }
+    #[test]
+    fn external_whisper_fields_match_python_and_portable_fallback() {
+        let options = json!({"batch_size":4,"vad_filter":false,"vad_threshold":0.7,"min_silence_duration_ms":800,"speech_pad_ms":250,"condition_on_previous_text":false});
+        let extended = external_whisper_fields("whisper-1", &options, "zh", true)
+            .into_iter()
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(extended.get("model").map(String::as_str), Some("whisper-1"));
+        assert_eq!(extended.get("language").map(String::as_str), Some("zh"));
+        assert_eq!(extended.get("temperature").map(String::as_str), Some("0"));
+        assert_eq!(extended.get("beam_size").map(String::as_str), Some("5"));
+        assert_eq!(extended.get("batch_size").map(String::as_str), Some("4"));
+        assert_eq!(
+            extended.get("word_timestamps").map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            extended.get("vad_filter").map(String::as_str),
+            Some("false")
+        );
+        assert_eq!(
+            extended.get("vad_threshold").map(String::as_str),
+            Some("0.7")
+        );
+        assert_eq!(
+            extended.get("min_silence_duration_ms").map(String::as_str),
+            Some("800")
+        );
+        assert_eq!(
+            extended.get("speech_pad_ms").map(String::as_str),
+            Some("250")
+        );
+        assert_eq!(
+            extended
+                .get("condition_on_previous_text")
+                .map(String::as_str),
+            Some("false")
+        );
+        assert_eq!(
+            extended.get("no_speech_threshold").map(String::as_str),
+            Some("0.6")
+        );
+        assert_eq!(
+            extended.get("log_prob_threshold").map(String::as_str),
+            Some("-1.0")
+        );
+        assert_eq!(
+            extended
+                .get("compression_ratio_threshold")
+                .map(String::as_str),
+            Some("2.4")
+        );
+        let portable = external_whisper_fields("whisper-1", &options, "auto", false);
+        assert_eq!(portable.len(), 2);
+        assert!(
+            portable
+                .iter()
+                .any(|(key, value)| key == "response_format" && value == "verbose_json")
+        );
+    }
+    #[test]
+    fn external_whisper_only_falls_back_for_portable_field_rejections() {
+        assert!(external_whisper_portable_rejection(&AppError::Unavailable(
+            "ASR HTTP 400 Bad Request".into()
+        )));
+        assert!(external_whisper_portable_rejection(&AppError::Unavailable(
+            "ASR HTTP 422 Unprocessable Entity".into()
+        )));
+        assert!(!external_whisper_portable_rejection(
+            &AppError::Unavailable("ASR HTTP 429 Too Many Requests".into())
+        ));
+        assert!(!external_whisper_portable_rejection(
+            &AppError::Unavailable("ASR HTTP 500 Internal Server Error".into())
+        ));
+    }
+    #[test]
+    fn external_whisper_word_timestamps_are_regrouped_and_bounded() {
+        let payload = json!({"text":"Hello world. Again now.","segments":[{"start":0.0,"end":3.0,"text":"Hello world. Again now.","words":[
+            {"word":"Hello","start":0.1,"end":0.6},{"word":" world.","start":0.7,"end":1.2},
+            {"word":" Again","start":1.8,"end":2.1},{"word":" now.","start":2.2,"end":2.8}
+        ]}]});
+        let response = external_whisper_response(
+            payload,
+            &json!({"max_segment_seconds":12.0,"max_segment_chars":120}),
+            3.0,
+        )
+        .unwrap();
+        assert_eq!(response.segments.len(), 2);
+        assert_eq!(response.segments[0].text, "Hello world.");
+        assert_eq!(response.segments[1].text, "Again now.");
+        assert!(response.segments[0].start >= 0.0 && response.segments[1].end <= 3.0);
+    }
+    #[test]
+    fn external_whisper_text_without_timestamps_is_not_given_fake_long_timeline() {
+        let error = external_whisper_response(
+            json!({"text":"a long transcript"}),
+            &json!({"max_segment_seconds":5}),
+            20.0,
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("without segment/word timestamps")
         );
     }
     #[test]

@@ -657,6 +657,7 @@ asr_payload={
  "external_whisper_base_url":"https://whisper.example.test",
  "external_whisper_model":"whisper-batch",
  "external_whisper_batch_size":3,
+ "external_whisper_max_concurrency":2,
  "external_whisper_vad_enabled":False,
  "external_whisper_vad_threshold":0.8,
  "external_whisper_min_silence_ms":850,

@@ -16,6 +16,7 @@ const defaults: ASRDefaults = {
   external_whisper_model: "whisper-1",
   external_whisper_api_key_set: true,
   external_whisper_batch_size: 1,
+  external_whisper_max_concurrency: 2,
   external_whisper_vad_enabled: true,
   external_whisper_vad_threshold: 0.5,
   external_whisper_min_silence_ms: 2000,
@@ -40,6 +41,7 @@ describe("ASR settings form", () => {
     expect(next.openvinoVadEnabled).toBe(false);
     expect(next.openvinoVadThreshold).toBe("0.42");
     expect(next.externalWhisperBatchSize).toBe("1");
+    expect(next.externalWhisperMaxConcurrency).toBe("2");
     expect(next.externalWhisperVadEnabled).toBe(true);
     expect(next.externalWhisperMaxSegmentSeconds).toBe("12");
     expect(next.externalWhisperMaxSegmentChars).toBe("120");

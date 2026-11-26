@@ -147,6 +147,7 @@ def get_asr_settings(db: Session, defaults: SubtitleServiceSettings) -> dict[str
     external_model = str(external.get("model") or defaults.external_whisper_model or "whisper-1").strip()[:_MAX_EXTERNAL_MODEL_LEN]
     external_api_key = _decrypt_api_key(external.get("api_key_enc")) or str(defaults.external_whisper_api_key or "").strip()
     external_batch_size = max(1, min(32, int(external.get("batch_size") or getattr(defaults, "external_whisper_batch_size", 1) or 1)))
+    external_max_concurrency = max(1, min(8, int(external.get("max_concurrency") or getattr(defaults, "external_whisper_max_concurrency", 1) or 1)))
     stored_external_vad_enabled = external.get("vad_enabled")
     external_vad_enabled = (
         bool(stored_external_vad_enabled)
@@ -201,6 +202,7 @@ def get_asr_settings(db: Session, defaults: SubtitleServiceSettings) -> dict[str
         "external_whisper_api_key": external_api_key,
         "external_whisper_api_key_set": bool(external_api_key),
         "external_whisper_batch_size": external_batch_size,
+        "external_whisper_max_concurrency": external_max_concurrency,
         "external_whisper_vad_enabled": external_vad_enabled,
         "external_whisper_vad_threshold": external_vad_threshold,
         "external_whisper_min_silence_ms": external_min_silence_ms,
@@ -315,6 +317,8 @@ def update_asr_settings(db: Session, defaults: SubtitleServiceSettings, update: 
 
     if "external_whisper_batch_size" in update and update["external_whisper_batch_size"] is not None:
         external["batch_size"] = max(1, min(32, int(update["external_whisper_batch_size"])))
+    if "external_whisper_max_concurrency" in update and update["external_whisper_max_concurrency"] is not None:
+        external["max_concurrency"] = max(1, min(8, int(update["external_whisper_max_concurrency"])))
     if "external_whisper_vad_enabled" in update and update["external_whisper_vad_enabled"] is not None:
         external["vad_enabled"] = bool(update["external_whisper_vad_enabled"])
     if "external_whisper_vad_threshold" in update and update["external_whisper_vad_threshold"] is not None:

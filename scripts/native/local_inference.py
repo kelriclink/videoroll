@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Offline model adapter, one-shot or bounded persistent subprocess. No business state."""
 import contextlib
+import hashlib
 import json
 import functools
 import fcntl
@@ -8,6 +9,7 @@ import os
 import stat
 import struct
 import sys
+import time
 from pathlib import Path
 
 @functools.lru_cache(maxsize=1)
@@ -134,22 +136,49 @@ def dispatch(req):
 def identity(req):
     return tuple(req.get(k) for k in ("kind","engine","model_path","device","compute_type","cpu_threads","num_workers"))
 
+def _gpu_lock_device(req):
+    device=str(req.get("device","")).strip().upper()
+    engine=str(req.get("engine","")).strip().lower()
+    if engine=="openvino" and device in {"GPU","GPU.0","AUTO"}:
+        return "GPU.0"
+    return device or "GPU"
+
+def _gpu_lock_slots():
+    try:return max(1,min(8,int(os.environ.get("VIDEOROLL_LOCAL_GPU_SLOTS","1"))))
+    except (TypeError,ValueError):return 1
+
 def lock_gpu(req):
-    device=str(req.get("device","")).lower()
-    if req["kind"]=="devices" or device in ("cpu","openvino","openvino:cpu"):
+    device=_gpu_lock_device(req)
+    if req["kind"]=="devices" or device in {"CPU","OPENVINO:CPU"}:
         return None
-    path=os.environ["VIDEOROLL_LOCAL_GPU_LOCK"]
-    fd=os.open(path,os.O_RDWR|os.O_CREAT|os.O_NOFOLLOW|os.O_CLOEXEC,0o600)
-    try:
-        info=os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode) or info.st_uid!=os.geteuid() or info.st_nlink!=1 or info.st_mode&0o077:
-            raise RuntimeError("unsafe GPU admission lock")
-        # Held for the entire resident process, not merely during generate().
-        fcntl.flock(fd,fcntl.LOCK_EX)
-        return fd
-    except BaseException:
-        os.close(fd)
-        raise
+    base=os.environ["VIDEOROLL_LOCAL_GPU_LOCK"]
+    digest=hashlib.sha256(device.encode("utf-8")).hexdigest()[:16]
+    slots=_gpu_lock_slots()
+    waiting_logged=False
+    deadline=time.monotonic()+3600.0
+    while time.monotonic()<deadline:
+        for slot in range(slots):
+            path=f"{base}.{digest}.slot-{slot}.lock"
+            fd=os.open(path,os.O_RDWR|os.O_CREAT|os.O_NOFOLLOW|os.O_CLOEXEC,0o600)
+            try:
+                info=os.fstat(fd)
+                if not stat.S_ISREG(info.st_mode) or info.st_uid!=os.geteuid() or info.st_nlink!=1 or info.st_mode&0o077:
+                    raise RuntimeError("unsafe GPU admission lock")
+                try:
+                    fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
+                    return fd
+                except BlockingIOError:
+                    os.close(fd)
+            except BaseException:
+                try:os.close(fd)
+                except OSError:pass
+                raise
+        if not waiting_logged:
+            sys.stderr.write(f"local inference waiting for GPU admission: device={device} slots={slots}\n")
+            sys.stderr.flush()
+            waiting_logged=True
+        time.sleep(0.25)
+    raise TimeoutError("local inference GPU admission timeout")
 
 def serve():
     # Reserve a private protocol stream; native runtime writes to fd 1
