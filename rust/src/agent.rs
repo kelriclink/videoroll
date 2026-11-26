@@ -89,12 +89,13 @@ async fn search_web(
         .append_pair("format", "json");
     let provider = provider_cache::identity("search", raw, settings.web_search_api_key.as_deref());
     let cache_key = provider_cache::identity(&provider, url.as_str(), None);
-    provider_cache::retrieve_shared(
+    provider_cache::retrieve_slots(
         db,
         job,
         &provider,
         &cache_key,
         Duration::from_secs(60),
+        4,
         || async {
             let mut request = http.get(url).timeout(Duration::from_secs(12));
             if let Some(token) = settings.web_search_api_key.as_ref() {

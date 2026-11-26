@@ -46,7 +46,7 @@ fn installed(state: &AppState, runtime: &Path) -> bool {
             .is_ok_and(|m| m.len() > 1_000_000_000)
         && model.join("audiovae.pth").is_file()
 }
-async fn resident_loaded(runtime: &Path) -> bool {
+pub(crate) async fn resident_loaded(runtime: &Path) -> bool {
     #[cfg(unix)]
     {
         use tokio::{
@@ -334,7 +334,7 @@ async fn stop_resident(runtime: &Path, bridge: &Path) -> AppResult<()> {
     }
     Ok(())
 }
-async fn start_resident(state: &AppState, runtime: &Path) -> AppResult<bool> {
+pub(crate) async fn start_resident(state: &AppState, runtime: &Path) -> AppResult<bool> {
     let bridge = fs::canonicalize(bridge_path(state))
         .map_err(|_| AppError::Conflict("YouDub bridge is missing".into()))?;
     if !bridge.is_file() {

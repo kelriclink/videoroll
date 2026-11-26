@@ -500,10 +500,21 @@ async fn dubbing_jobs(
     let mut output = Vec::with_capacity(rows.len());
     for row in rows {
         let status: String = row.try_get("state")?;
+        let result: Option<Value> = row.try_get("result")?;
+        let progress = result
+            .as_ref()
+            .and_then(|v| v["dubbing_progress"]["progress"].as_u64())
+            .unwrap_or(0)
+            .min(96);
+        let phase = result
+            .as_ref()
+            .and_then(|v| v["dubbing_progress"]["phase"].as_str())
+            .filter(|v| matches!(*v, "preparing" | "synthesizing" | "aligning" | "mixing"))
+            .unwrap_or("preparing");
         let mapped = match status.as_str() {
             "pending" => "queued",
             "awaiting" => "preparing",
-            "running" => "preparing",
+            "running" => phase,
             "succeeded" => "succeeded",
             "unknown" => "needs_review",
             value => value,
@@ -513,7 +524,7 @@ async fn dubbing_jobs(
             "task_id":row.try_get::<Uuid,_>("task_id")?,
             "subtitle_job_id":row.try_get::<Option<Uuid>,_>("subtitle_job_id")?,
             "status":mapped,
-            "progress": if status=="succeeded"{100}else{0},
+            "progress": if status=="succeeded"{100}else if status=="running"{progress}else{0},
             "operation_key":row.try_get::<String,_>("operation_key")?,
             "request":row.try_get::<Value,_>("payload")?,
             "output":{

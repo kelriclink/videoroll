@@ -152,6 +152,291 @@ async fn command(config: &Config, runtime: &Path, args: &[&str]) -> AppResult<Va
     }
     parse_json_stdout(&result.stdout)
 }
+fn native_progress(value: &Value) -> (String, u64) {
+    let stage = value["current_stage"].as_str().unwrap_or("");
+    let rows = value["stages"].as_array();
+    let count = rows.map_or(0, |r| r.len()).clamp(1, 64);
+    let completed = rows
+        .into_iter()
+        .flatten()
+        .filter(|v| matches!(v["status"].as_str(), Some("succeeded" | "skipped")))
+        .count()
+        .min(count);
+    let partial = rows
+        .into_iter()
+        .flatten()
+        .find(|v| {
+            v["name"].as_str() == Some(stage)
+                && !matches!(v["status"].as_str(), Some("succeeded" | "skipped"))
+        })
+        .and_then(|v| v["progress"].as_f64())
+        .filter(|v| v.is_finite())
+        .unwrap_or(0.)
+        .clamp(0., 100.);
+    let progress = ((completed as f64 + partial / 100.) * 96. / count as f64)
+        .floor()
+        .clamp(1., 96.) as u64;
+    let status = match stage {
+        "tts" => "synthesizing",
+        "merge_audio" | "split_audio" => "aligning",
+        "merge_video" => "mixing",
+        _ => "preparing",
+    };
+    (status.into(), progress)
+}
+async fn save_progress(db: &Database, job: &WorkItem, value: &Value) -> AppResult<()> {
+    let (phase, progress) = native_progress(value);
+    let stage = value["current_stage"]
+        .as_str()
+        .unwrap_or("")
+        .chars()
+        .take(64)
+        .collect::<String>();
+    let rows=sqlx::query("UPDATE operation_inbox j SET result_json=jsonb_set(COALESCE(j.result_json,'{}'::jsonb),'{dubbing_progress}',jsonb_build_object('phase',$3::text,'progress',GREATEST($4::int,CASE WHEN jsonb_typeof(j.result_json#>'{dubbing_progress,progress}')='number' THEN (j.result_json#>>'{dubbing_progress,progress}')::int ELSE 0 END),'stage',$5::text),true),updated_at=now() WHERE j.id=$1 AND j.lease_token=$2 AND j.runtime_engine='rust-v2' AND j.status='running' AND j.lease_until>now() AND EXISTS(SELECT 1 FROM pipeline_runs w WHERE w.id=j.workflow_id AND w.state='running')")
+        .bind(job.id).bind(job.lease_token).bind(phase).bind(progress as i32).bind(stage).execute(&db.pool).await?.rows_affected();
+    if rows != 1 {
+        return Err(AppError::Conflict(
+            "YouDub lease lost while reporting progress".into(),
+        ));
+    }
+    Ok(())
+}
+struct OwnedGroup(Option<u32>);
+impl Drop for OwnedGroup {
+    fn drop(&mut self) {
+        if let Some(pid) = self.0.take() {
+            if pid > 1 && pid <= i32::MAX as u32 {
+                unsafe {
+                    libc::kill(-(pid as i32), libc::SIGKILL);
+                }
+            }
+        }
+    }
+}
+// Capture an exact resident process via a Linux pidfd; never signal a
+// reused PID, a process from another runtime, or an arbitrary PID file.
+// The control API starts residents with setsid and a dedicated runtime.
+struct ResidentGuard {
+    fd: std::os::fd::OwnedFd,
+    armed: bool,
+}
+impl ResidentGuard {
+    fn capture(runtime: &Path, bridge: &Path) -> AppResult<Self> {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        let pid = std::fs::read_to_string(runtime.join("voxcpm-resident.pid"))?
+            .trim()
+            .parse::<i32>()
+            .map_err(|_| AppError::Conflict("invalid resident identity".into()))?;
+        if pid <= 1 {
+            return Err(AppError::Conflict("unsafe resident identity".into()));
+        }
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd as i32) };
+        let cmd = std::fs::read(format!("/proc/{pid}/cmdline"))?;
+        let expected = std::fs::canonicalize(bridge)?;
+        use std::os::unix::ffi::OsStrExt;
+        let args = cmd.split(|c| *c == 0).collect::<Vec<_>>();
+        if !args.contains(&expected.as_os_str().as_bytes())
+            || !args.contains(&b"--serve".as_slice())
+        {
+            return Err(AppError::Conflict(
+                "resident process does not match bridge".into(),
+            ));
+        }
+        let environment = std::fs::read(format!("/proc/{pid}/environ"))?;
+        let root = std::fs::canonicalize(runtime)?;
+        let valid = environment
+            .split(|c| *c == 0)
+            .filter_map(|v| v.strip_prefix(b"VIDEOROLL_YOUDUB_RUNTIME="))
+            .any(|v| {
+                std::fs::canonicalize(std::ffi::OsStr::from_bytes(v)).is_ok_and(|p| p == root)
+            });
+        if !valid {
+            return Err(AppError::Conflict(
+                "resident runtime identity mismatch".into(),
+            ));
+        }
+        let mut poll = libc::pollfd {
+            fd: fd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        if unsafe { libc::poll(&mut poll, 1, 0) } != 0 {
+            return Err(AppError::Conflict("resident process exited".into()));
+        }
+        Ok(Self { fd, armed: false })
+    }
+    fn stop(&mut self) {
+        use std::os::fd::AsRawFd;
+        if self.armed {
+            unsafe {
+                libc::syscall(
+                    libc::SYS_pidfd_send_signal,
+                    self.fd.as_raw_fd(),
+                    libc::SIGKILL,
+                    std::ptr::null::<libc::siginfo_t>(),
+                    0,
+                );
+            };
+            self.armed = false;
+        }
+    }
+    async fn wait_stopped(&self) -> AppResult<()> {
+        use std::os::fd::AsRawFd;
+        for _ in 0..100 {
+            let mut poll = libc::pollfd {
+                fd: self.fd.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            if unsafe { libc::poll(&mut poll, 1, 0) } > 0 {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        Err(AppError::Conflict(
+            "resident process stop not confirmed".into(),
+        ))
+    }
+}
+impl Drop for ResidentGuard {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+async fn run_monitored(
+    config: &Config,
+    db: &Database,
+    job: &WorkItem,
+    runtime: &Path,
+    id: &str,
+    registry: &AssetRegistry,
+) -> AppResult<Value> {
+    let python = config
+        .youdub_python
+        .as_ref()
+        .ok_or_else(|| AppError::Unavailable("YouDub Python missing".into()))?;
+    let bridge = config
+        .youdub_bridge
+        .as_ref()
+        .ok_or_else(|| AppError::Unavailable("YouDub bridge missing".into()))?;
+    let control: Value = match fs::read(runtime.join("videoroll-control.json")).await {
+        Ok(raw) => serde_json::from_slice(&raw)
+            .map_err(|_| AppError::Conflict("YouDub control invalid".into()))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => json!({}),
+        Err(e) => return Err(e.into()),
+    };
+    if control["enabled"].as_bool() == Some(false) {
+        return Err(AppError::Unavailable("YouDub disabled".into()));
+    }
+    let resident = control["resident"]
+        .as_bool()
+        .unwrap_or_else(|| std::env::var("VIDEOROLL_YOUDUB_RESIDENT").as_deref() == Ok("1"));
+    let mut resident_guard = if resident {
+        let state = crate::api::AppState {
+            config: std::sync::Arc::new(config.clone()),
+            db: db.clone(),
+            scheduler: crate::scheduler::Scheduler::new(db.clone(), config.job_lease),
+            storage: registry.clone(),
+        };
+        crate::youdub_control_v1::start_resident(&state, runtime).await?;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(180);
+        loop {
+            active_lease(db, job).await?;
+            if crate::youdub_control_v1::resident_loaded(runtime).await {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(AppError::Unavailable(
+                    "YouDub resident startup timeout".into(),
+                ));
+            }
+            save_progress(db, job, &json!({"current_stage":"loading_model"})).await?;
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+        Some(ResidentGuard::capture(runtime, bridge)?)
+    } else {
+        if fs::symlink_metadata(runtime.join("voxcpm-resident.sock"))
+            .await
+            .is_ok()
+        {
+            return Err(AppError::Conflict(
+                "resident YouDub socket exists; refuse competing on-demand model".into(),
+            ));
+        }
+        None
+    };
+    let log = tempfile::tempfile_in(runtime)?;
+    let mut command = Command::new(python);
+    command
+        .arg(bridge)
+        .args(bridge_args("--run", id))
+        .env("VIDEOROLL_YOUDUB_RUNTIME", runtime)
+        .env("VIDEOROLL_YOUDUB_STATUS_PROTOCOL", "2")
+        .env(
+            "VIDEOROLL_YOUDUB_RESIDENT",
+            if resident { "1" } else { "0" },
+        )
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log.try_clone()?))
+        .stderr(Stdio::from(log.try_clone()?))
+        .kill_on_drop(true)
+        .process_group(0);
+    active_lease(db, job).await?;
+    let mut child = command.spawn()?;
+    let mut group = OwnedGroup(child.id());
+    if let Some(guard) = resident_guard.as_mut() {
+        guard.armed = true;
+    }
+    let mut tick = tokio::time::interval(Duration::from_secs(5));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let outcome = loop {
+        tokio::select! {
+            exited=child.wait()=>{let result=exited?;group.0=None;break Ok(result);}
+            _=tick.tick()=>{
+                if let Err(e)=active_lease(db,job).await{break Err(e);}
+                match tokio::time::timeout(Duration::from_secs(3),self::command(config,runtime,&bridge_args("--status",id))).await{
+                    Ok(Ok(value))=>{if let Err(e)=save_progress(db,job,&value).await{break Err(e);}},
+                    _=>{tracing::debug!(job_id=%job.id,"YouDub status sample temporarily unavailable");}
+                }
+            }
+        }
+    };
+    let exit = match outcome {
+        Ok(v) => v,
+        Err(error) => {
+            // Kill only the group we created, then wait before releasing the
+            // GPU lock. Lease loss never authorizes an external replay.
+            drop(group);
+            let _ = child.wait().await;
+            if let Some(guard) = resident_guard.as_mut() {
+                guard.stop();
+                guard.wait_stopped().await?;
+            }
+            // The owned runner has exited. Reconcile only its exact native
+            // task; a later worker can resume the completed upstream stages.
+            let _ = tokio::time::timeout(
+                Duration::from_secs(10),
+                self::command(config, runtime, &bridge_args("--interrupt", id)),
+            )
+            .await;
+            return Err(error);
+        }
+    };
+    if !exit.success() {
+        return Err(AppError::Unavailable(format!(
+            "YouDub runner exited with {exit}"
+        )));
+    }
+    if let Some(guard) = resident_guard.as_mut() {
+        guard.armed = false;
+    }
+    active_lease(db, job).await?;
+    self::command(config, runtime, &bridge_args("--status", id)).await
+}
 pub async fn process(
     config: &Config,
     db: &Database,
@@ -200,7 +485,33 @@ pub async fn process(
     let existing=sqlx::query("SELECT source_video_key,source_srt_key,output_video_key,model_job_id FROM vr2_dubbing_runs WHERE job_id=$1")
         .bind(job.id).fetch_optional(&db.pool).await?;
     use sqlx::Row;
+    let source_pin = json!({
+        "schema":1,"native_id":native_id,"video_key":video_key,"srt_key":srt_key,
+        "video_sha256":registry.sha256(&video_key).await?.0,
+        "srt_sha256":registry.sha256(&srt_key).await?.0
+    });
+    let pin_dir = runtime.join(".videoroll-source-pins");
+    let pin = pin_dir.join(format!("{id}.json"));
+    let pinned = match fs::read(&pin).await {
+        Ok(bytes) => {
+            let previous: Value = serde_json::from_slice(&bytes)
+                .map_err(|_| AppError::Conflict("YouDub source pin is invalid".into()))?;
+            if previous != source_pin {
+                return Err(AppError::Conflict(
+                    "YouDub input changed after native task creation".into(),
+                ));
+            }
+            true
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => return Err(e.into()),
+    };
     if let Some(proof) = existing.as_ref() {
+        if !pinned {
+            return Err(AppError::Conflict(
+                "confirmed YouDub receipt has no input fingerprint".into(),
+            ));
+        }
         if proof.try_get::<String, _>("source_video_key")? != video_key
             || proof.try_get::<String, _>("source_srt_key")? != srt_key
             || proof.try_get::<String, _>("output_video_key")? != dest_key
@@ -241,21 +552,14 @@ pub async fn process(
     // Keep the input identity durable across creation, interrupted copies,
     // retries and native status recovery. Never attach an old model result
     // to a changed subtitle/source just because the workflow UUID matches.
-    let source_pin = json!({
-        "schema":1,"native_id":native_id,"video_key":video_key,"srt_key":srt_key,
-        "video_sha256":registry.sha256(&video_key).await?.0,
-        "srt_sha256":registry.sha256(&srt_key).await?.0
-    });
-    let pin_dir = runtime.join(".videoroll-source-pins");
     fs::create_dir_all(&pin_dir).await?;
-    let pin = pin_dir.join(format!("{id}.json"));
     let pinned = match fs::read(&pin).await {
         Ok(bytes) => {
             let previous: Value = serde_json::from_slice(&bytes)
-                .map_err(|_| AppError::Conflict("YouDub source pin is invalid".into()))?;
+                .map_err(|_| AppError::Conflict("invalid YouDub source pin".into()))?;
             if previous != source_pin {
                 return Err(AppError::Conflict(
-                    "YouDub input changed after native task creation".into(),
+                    "YouDub source changed while waiting for GPU".into(),
                 ));
             }
             true
@@ -320,10 +624,10 @@ pub async fn process(
     let status = state.get("status").and_then(Value::as_str).unwrap_or("");
     let final_result = match status {
         "succeeded" => state,
-        "queued" | "paused" => command(config, runtime, &bridge_args("--run", &id)).await?,
+        "queued" | "paused" => run_monitored(config, db, job, runtime, &id, registry).await?,
         "failed" => {
             command(config, runtime, &bridge_args("--resume", &id)).await?;
-            command(config, runtime, &bridge_args("--run", &id)).await?
+            run_monitored(config, db, job, runtime, &id, registry).await?
         }
         other => {
             return Err(AppError::Unavailable(format!(
@@ -425,6 +729,18 @@ pub async fn process(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn progress_matches_native_stage_and_is_bounded() {
+        let (phase, progress) = native_progress(
+            &json!({"current_stage":"tts","stages":[{"name":"download","status":"succeeded","progress":100},{"name":"tts","status":"running","progress":50},{"name":"merge_video","status":"queued"}]}),
+        );
+        assert_eq!(phase, "synthesizing");
+        assert_eq!(progress, 48);
+        assert_eq!(
+            native_progress(&json!({"current_stage":"waiting_gpu","stages":[]})),
+            ("preparing".into(), 1)
+        );
+    }
     #[test]
     fn only_explicit_absence_allows_native_create() {
         assert!(missing_task(&AppError::NotFound(

@@ -1292,6 +1292,68 @@ fn check_translation_prompt_budget(
     }
     Ok(())
 }
+async fn translation_chat(
+    db: &Database,
+    client: &Client,
+    provider: &crate::providers::TranslationProvider,
+    task_id: Uuid,
+    operation: &str,
+    payload: &Value,
+    label: &str,
+) -> AppResult<Value> {
+    let mut body = payload.clone();
+    if provider.enable_thinking {
+        body["stream"] = json!(true);
+        if provider.api_type == "cerebras" {
+            if let Some(obj) = body.as_object_mut() {
+                obj.remove("response_format");
+                obj.remove("chat_template_kwargs");
+                if let Some(limit) = obj.remove("max_tokens") {
+                    obj.insert("max_completion_tokens".into(), limit);
+                }
+            }
+            body["reasoning_format"] = json!("parsed");
+        } else {
+            body["enable_thinking"] = json!(true);
+        }
+    }
+    for attempt in 0..2 {
+        let mut request = client
+            .post(provider.endpoint.clone())
+            .timeout(Duration::from_secs(provider.timeout_seconds))
+            .json(&body);
+        if provider.enable_thinking {
+            request = request.header("Accept", "text/event-stream");
+        }
+        if let Some(key) = provider.api_key.as_ref() {
+            request = request.bearer_auth(key);
+        }
+        let result = crate::ai_usage::chat_json(
+            db,
+            request,
+            &provider.endpoint,
+            &provider.model,
+            operation,
+            Some(task_id),
+            MAX_BYTES,
+            label,
+        )
+        .await;
+        if attempt == 0
+            && provider.enable_thinking
+            && provider.api_type != "cerebras"
+            && matches!(&result,Err(AppError::Unavailable(message)) if message=="OpenAI provider explicitly rejected enable_thinking")
+        {
+            if let Some(obj) = body.as_object_mut() {
+                obj.remove("enable_thinking");
+                obj.remove("chat_template_kwargs");
+            }
+            continue;
+        }
+        return result;
+    }
+    unreachable!("bounded translation fallback")
+}
 fn can_shrink_translation(error: &AppError) -> bool {
     match error {
         AppError::Upstream(e) => e.is_timeout() || e.is_connect() || e.is_request() || e.is_body(),
@@ -1655,21 +1717,13 @@ async fn translate_batch_once(
     check_translation_prompt_budget(provider, &payload)?;
     let attempts = provider.max_retries.clamp(1, 5);
     for attempt in 0..attempts {
-        let mut request = client
-            .post(provider.endpoint.clone())
-            .timeout(Duration::from_secs(provider.timeout_seconds))
-            .json(&payload);
-        if let Some(key) = provider.api_key.as_ref() {
-            request = request.bearer_auth(key);
-        }
-        match crate::ai_usage::chat_json(
+        match translation_chat(
             db,
-            request,
-            &provider.endpoint,
-            &provider.model,
+            client,
+            provider,
+            task_id,
             "subtitle_translate",
-            Some(task_id),
-            MAX_BYTES,
+            &payload,
             "translation provider",
         )
         .await
@@ -1764,21 +1818,13 @@ async fn repair_translation(
         payload["reasoning_effort"] = json!("medium");
     }
     check_translation_prompt_budget(provider, &payload)?;
-    let mut request = client
-        .post(provider.endpoint.clone())
-        .timeout(Duration::from_secs(provider.timeout_seconds))
-        .json(&payload);
-    if let Some(key) = provider.api_key.as_ref() {
-        request = request.bearer_auth(key);
-    }
-    let response = crate::ai_usage::chat_json(
+    let response = translation_chat(
         db,
-        request,
-        &provider.endpoint,
-        &provider.model,
+        client,
+        provider,
+        job.task_id,
         "subtitle_translate_repair",
-        Some(job.task_id),
-        MAX_BYTES,
+        &payload,
         "subtitle translation repair",
     )
     .await?;
@@ -3241,6 +3287,147 @@ mod tests {
                 .unwrap()
                 .segments
                 .is_empty()
+        );
+    }
+    #[tokio::test]
+    async fn thinking_real_postgres_http() {
+        use axum::{
+            Json, Router, extract::State, http::StatusCode, response::IntoResponse, routing::post,
+        };
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let Ok(url) = std::env::var("VIDEOROLL_TEST_THINKING_DB_URL") else {
+            return;
+        };
+        let parsed = Url::parse(&url).unwrap();
+        assert_eq!(parsed.host_str(), Some("127.0.0.1"));
+        assert_eq!(parsed.path(), "/videoroll_test");
+        let db = Database::connect(&url).await.unwrap();
+        sqlx::raw_sql("CREATE TABLE app_settings(key text PRIMARY KEY,value_json jsonb);CREATE TABLE ai_usage_events(id uuid PRIMARY KEY,task_id uuid,provider text,model text,operation text,success bool,status_code int,input_tokens int,output_tokens int,total_tokens int,latency_ms int,estimated_cost_microusd bigint,error_type text,error_message text);").execute(&db.pool).await.unwrap();
+        async fn mock(
+            State(calls): State<Arc<AtomicUsize>>,
+            Json(body): Json<Value>,
+        ) -> axum::response::Response {
+            let n = calls.fetch_add(1, Ordering::SeqCst);
+            match n {
+                0 => {
+                    assert_eq!(body["stream"], true);
+                    assert_eq!(body["enable_thinking"], true);
+                    (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({"error":{"message":"unknown enable_thinking"}})),
+                    )
+                        .into_response()
+                }
+                1 => {
+                    assert_eq!(body["stream"], true);
+                    assert!(body.get("enable_thinking").is_none());
+                    assert!(body.get("chat_template_kwargs").is_none());
+                    let lines = [
+                        json!({"choices":[{"delta":{"reasoning_content":"not translation"}}]}),
+                        json!({"choices":[{"delta":{"content":"{\"items\":[]}"}}]}),
+                        json!({"choices":[{"finish_reason":"stop"}],"usage":{"total_tokens":23}}),
+                    ];
+                    let raw = lines
+                        .iter()
+                        .map(|v| format!("data: {v}\n\n"))
+                        .collect::<String>()
+                        + "data: [DONE]\n\n";
+                    ([("content-type", "text/event-stream")], raw).into_response()
+                }
+                2 => {
+                    assert_eq!(body["reasoning_format"], "parsed");
+                    assert!(body.get("response_format").is_none());
+                    assert!(body.get("enable_thinking").is_none());
+                    assert_eq!(body["max_completion_tokens"], 100);
+                    Json(json!({"choices":[{"message":{"content":"{\"items\":[]}"}}],"usage":{"total_tokens":10}})).into_response()
+                }
+                _ => (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error":{"code":"context_length_exceeded"}})),
+                )
+                    .into_response(),
+            }
+        }
+        let calls = Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = Url::parse(&format!(
+            "http://{}/v1/chat/completions",
+            listener.local_addr().unwrap()
+        ))
+        .unwrap();
+        let router = Router::new()
+            .route("/v1/chat/completions", post(mock))
+            .with_state(calls.clone());
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let mut provider = crate::providers::TranslationProvider {
+            id: "fixture".into(),
+            endpoint,
+            model: "fixture".into(),
+            api_type: "openai".into(),
+            api_key: None,
+            temperature: 0.1,
+            max_output_tokens: Some(100),
+            context_window: None,
+            enable_thinking: true,
+            timeout_seconds: 10,
+            max_retries: 1,
+        };
+        let task = Uuid::new_v4();
+        let client = Client::new();
+        let body = json!({"model":"fixture","messages":[],"response_format":{"type":"json_object"},"max_tokens":100,"chat_template_kwargs":{"enable_thinking":true}});
+        let result = translation_chat(
+            &db,
+            &client,
+            &provider,
+            task,
+            "test_thinking",
+            &body,
+            "fixture",
+        )
+        .await
+        .unwrap();
+        assert_eq!(result["choices"][0]["message"]["content"], "{\"items\":[]}");
+        assert_eq!(result["usage"]["total_tokens"], 23);
+        provider.api_type = "cerebras".into();
+        assert!(
+            translation_chat(
+                &db,
+                &client,
+                &provider,
+                task,
+                "test_thinking",
+                &body,
+                "fixture"
+            )
+            .await
+            .is_ok()
+        );
+        let error = translation_chat(
+            &db,
+            &client,
+            &provider,
+            task,
+            "test_thinking",
+            &body,
+            "fixture",
+        )
+        .await
+        .unwrap_err();
+        assert!(can_shrink_translation(&error));
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM ai_usage_events")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap(),
+            4
+        );
+        server.abort();
+        println!(
+            "PASS HTTP SSE, one explicit thinking fallback, Cerebras JSON fallback, typed context rejection and usage"
         );
     }
     #[tokio::test]

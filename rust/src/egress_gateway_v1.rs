@@ -409,6 +409,17 @@ async fn fetch(req: FetchRequest) -> Result<FetchResponse, Failure> {
 }
 // Internal research adapter. Reuse the same destination validation and pinned
 // transport as /fetch, but never expose arbitrary headers or redirects.
+pub(crate) async fn research_page_allowed(raw: &str) -> bool {
+    let Ok((url, host, port)) = target(raw) else {
+        return false;
+    };
+    if url.query().is_some() || (url.scheme() != "https" && !research_test_url(&url)) {
+        return false;
+    }
+    tokio::time::timeout(Duration::from_secs(3), endpoint(&host, port))
+        .await
+        .is_ok_and(|r| r.is_ok())
+}
 pub(crate) async fn research_page_text(raw: &str) -> crate::AppResult<Option<String>> {
     let Ok((url, _, _)) = target(raw) else {
         return Ok(None);
