@@ -56,6 +56,38 @@ async fn lifecycle() {
             .unwrap()
             .starts_with("v2-model-runtime.")
     );
+    if mode == "pool" {
+        let a = json!({"kind":"asr","device":"cpu","value":1});
+        let e = json!({"kind":"embedding","device":"openvino:CPU","value":2});
+        let first = invoke(&a, LONG).await.unwrap();
+        let second = invoke(&e, LONG).await.unwrap();
+        assert_ne!(pid(&first), pid(&second));
+        assert_eq!(children().len(), 2);
+        let again = invoke(&a, LONG).await.unwrap();
+        assert_eq!(pid(&again), pid(&first));
+        assert_eq!(again["calls"], 2);
+        let probe = invoke(&json!({"kind":"devices"}), LONG).await.unwrap();
+        gone(pid(&probe)).await;
+        assert_eq!(children().len(), 2);
+        let failed = json!({"kind":"asr","device":"cpu","op":"error"});
+        assert!(invoke(&failed, LONG).await.is_err());
+        gone(pid(&first)).await;
+        assert_eq!(pid(&invoke(&e, LONG).await.unwrap()), pid(&second));
+        let gpu = json!({"kind":"asr","device":"GPU","engine":"openvino"});
+        let g = invoke(&gpu, LONG).await.unwrap();
+        assert_eq!(children().len(), 2);
+        let other_gpu = json!({"kind":"embedding","device":"openvino:GPU"});
+        let h = invoke(&other_gpu, LONG).await.unwrap();
+        gone(pid(&g)).await;
+        gone(pid(&second)).await;
+        assert_eq!(children().len(), 1);
+        gone(pid(&h)).await;
+        assert!(children().is_empty());
+        println!(
+            "PASS bounded pool: ASR/Embedding residency, ephemeral device probe, independent failure, GPU replacement and idle reaping"
+        );
+        return;
+    }
     if mode == "mock" {
         let model = root.join("model");
         std::fs::create_dir_all(&model).unwrap();
@@ -170,26 +202,29 @@ async fn lifecycle() {
     );
     assert!(String::from_utf8_lossy(&out.stdout).contains("PASS contender admission timed out"));
     assert_eq!(children(), first);
-    let lock = root.join(".local-inference-gpu.lock");
+    use sha2::{Digest, Sha256};
+    let digest = format!("{:x}", Sha256::digest(b"GPU.0"));
+    let lock = root.join(format!(
+        ".local-inference-gpu.lock.{}.slot-0.lock",
+        &digest[..16]
+    ));
     assert!(
         !lock_available(&lock),
         "GPU lock must remain held between requests"
     );
-    // Switching to CPU frees GPU residency and the process itself.
+    // With a two-entry pool the CPU embedding and GPU ASR coexist.
     let model = PathBuf::from(std::env::var_os("SUBTITLE_RAG_EMBEDDING_MODEL_DIR").unwrap())
         .join("BAAI--bge-small-zh-v1.5");
     let req = json!({"kind":"embedding","model_path":model,"device":"openvino:CPU","text":"电子电路和电容"});
     let start = Instant::now();
     let e = invoke(&req, LONG).await.unwrap();
     let cold = start.elapsed();
-    gone(first[0] as i64).await;
-    assert!(
-        lock_available(&lock),
-        "GPU lock must be released after model switch"
-    );
     let cpu = children();
-    assert_eq!(cpu.len(), 1);
-    assert_ne!(cpu, first);
+    assert_eq!(cpu.len(), 2);
+    assert!(cpu.contains(&first[0]));
+    assert!(!lock_available(&lock));
+    assert_eq!(invoke(&gpu, LONG).await.unwrap(), result);
+    assert_eq!(children(), cpu);
     let start = Instant::now();
     let e2 = invoke(&req, LONG).await.unwrap();
     let warm = start.elapsed();
@@ -219,8 +254,11 @@ async fn lifecycle() {
             .contains("circuit")
     }));
     let fw_child = children();
-    assert_eq!(fw_child.len(), 1);
-    assert_ne!(fw_child, cpu);
+    assert_eq!(fw_child.len(), 2);
+    gone(first[0] as i64).await;
+    assert!(lock_available(&lock));
+    assert!(!fw_child.contains(&first[0]));
+    assert!(fw_child.iter().any(|pid| cpu.contains(pid)));
     let start = Instant::now();
     let f2 = invoke(&fw, LONG).await.unwrap();
     let warm = start.elapsed();

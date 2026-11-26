@@ -139,8 +139,13 @@ def identity(req):
 def _gpu_lock_device(req):
     device=str(req.get("device","")).strip().upper()
     engine=str(req.get("engine","")).strip().lower()
+    if device in {"OPENVINO", "OPENVINO:"}: return "CPU"
+    if device.startswith("OPENVINO:"):
+        device=device.split(":",1)[1]
+        engine="openvino"
     if engine=="openvino" and device in {"GPU","GPU.0","AUTO"}:
         return "GPU.0"
+    if device in {"CUDA","CUDA:0"}: return "CUDA"
     return device or "GPU"
 
 def _gpu_lock_slots():

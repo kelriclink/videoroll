@@ -19,6 +19,9 @@ class LocalInferenceGpuLockTests(unittest.TestCase):
         self.assertEqual(bridge._gpu_lock_device({"kind": "asr", "engine": "openvino", "device": "AUTO"}), "GPU.0")
         self.assertEqual(bridge._gpu_lock_device({"kind": "asr", "engine": "faster-whisper", "device": "cuda"}), "CUDA")
         self.assertIsNone(bridge.lock_gpu({"kind": "asr", "engine": "openvino", "device": "CPU"}))
+        self.assertEqual(bridge._gpu_lock_device({"kind": "embedding", "device": "openvino:GPU"}), "GPU.0")
+        self.assertEqual(bridge._gpu_lock_device({"kind": "embedding", "device": "cuda:0"}), "CUDA")
+        self.assertIsNone(bridge.lock_gpu({"kind": "embedding", "device": "openvino"}))
 
     def test_gpu_lock_is_device_scoped_and_uses_secure_slot_files(self):
         with tempfile.TemporaryDirectory() as root:
