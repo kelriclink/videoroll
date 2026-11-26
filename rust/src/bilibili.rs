@@ -436,6 +436,86 @@ fn upload_parallelism(requested: usize, chunks: u64, chunk_size: u64) -> usize {
         .min(chunks as usize)
         .min((UPOS_BUFFER_BUDGET / chunk_size.saturating_mul(2)).max(1) as usize)
 }
+#[derive(Clone, Copy)]
+enum PublishGate {
+    Upload,
+    Submit,
+}
+impl PublishGate {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Upload => "upload",
+            Self::Submit => "submit",
+        }
+    }
+    fn defaults(self) -> (f64, f64, f64) {
+        match self {
+            Self::Upload => (45.0, 15.0, 180.0),
+            Self::Submit => (20.0, 8.0, 90.0),
+        }
+    }
+    fn interval(self, pending: i64) -> f64 {
+        let (base, step, cap) = self.defaults();
+        let env = |key: &str, default: f64, low: f64| {
+            std::env::var(format!(
+                "BILIBILI_PUBLISH_{}_{key}_SECONDS",
+                self.name().to_ascii_uppercase()
+            ))
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite())
+            .unwrap_or(default)
+            .clamp(low, 3600.0)
+        };
+        throttle_interval(
+            env("BASE", base, 1.0),
+            env("QUEUE_STEP", step, 0.0),
+            env("MAX", cap, 1.0),
+            pending,
+        )
+    }
+}
+fn throttle_interval(base: f64, step: f64, cap: f64, pending: i64) -> f64 {
+    (base + pending.saturating_sub(1).max(0) as f64 * step).min(cap)
+}
+/// Reserve only an immediately available time slot in the original DB.
+/// The transaction is short; queued workers wait outside it and renew their
+/// own lease through the ordinary scheduler heartbeat. Separate stage keys
+/// prevent a slow UPOS transfer from blocking every archive submission.
+async fn publish_gate(db: &Database, job: &WorkItem, stage: PublishGate) -> AppResult<()> {
+    let key = format!("runtime.bilibili.throttle.{}", stage.name());
+    loop {
+        publish_lease(db, job).await?;
+        let mut tx = db.pool.begin().await?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1::text,0))")
+            .bind(&key)
+            .execute(&mut *tx)
+            .await?;
+        let next:Option<f64>=sqlx::query_scalar("SELECT CASE WHEN jsonb_typeof(value_json->'not_before')='number' THEN (value_json->>'not_before')::double precision ELSE NULL END FROM app_settings WHERE key=$1")
+            .bind(&key).fetch_optional(&mut *tx).await?.flatten();
+        let now: f64 =
+            sqlx::query_scalar("SELECT EXTRACT(EPOCH FROM clock_timestamp())::double precision")
+                .fetch_one(&mut *tx)
+                .await?;
+        let delay = next.unwrap_or(0.0) - now;
+        if delay <= 0.0 {
+            let pending: i64 =
+                sqlx::query_scalar("SELECT count(*) FROM tasks WHERE status::text='publishing'")
+                    .fetch_one(&mut *tx)
+                    .await?;
+            let gap = stage.interval(pending);
+            sqlx::query("INSERT INTO app_settings(key,value_json,version) VALUES($1,jsonb_build_object('not_before',$2::double precision),1) ON CONFLICT(key) DO UPDATE SET value_json=EXCLUDED.value_json,version=app_settings.version+1,updated_at=now()")
+                .bind(&key).bind(now+gap).execute(&mut *tx).await?;
+            tx.commit().await?;
+            publish_lease(db, job).await?;
+            tracing::info!(job_id=%job.id,stage=stage.name(),pending_jobs=pending,interval_seconds=gap,"Bilibili publish admission granted");
+            return Ok(());
+        }
+        tx.rollback().await?;
+        // No idle SQL transaction and no long uninterruptible sleep.
+        tokio::time::sleep(Duration::from_secs_f64(delay.clamp(0.05, 2.0))).await;
+    }
+}
 async fn configured_upload_workers(db: &Database) -> AppResult<usize> {
     let stored = crate::settings::effective(db, "bilibili.publish").await?;
     Ok(stored["upload_workers"].as_i64().unwrap_or(4).clamp(1, 8) as usize)
@@ -1241,6 +1321,7 @@ pub async fn publish(
     let client = BilibiliClient::new(&cookie, member_origin(config)?)?;
     // Validate creator-center ID pairing and rules before any UPOS upload.
     crate::bili_activity::verify_remote(&client.member, &meta).await?;
+    publish_gate(db, job, PublishGate::Upload).await?;
     if direct.is_some() {
         crate::bilibili_publish_v1::mark_started(db, job).await?;
         if let Some(cover) = direct
@@ -1333,8 +1414,13 @@ pub async fn publish(
     }
     // Single archive creation: UPOS uploads are preparatory side-effects;
     // archive POST is the irreversible boundary and is NEVER retried.
+    publish_gate(db, job, PublishGate::Submit).await?;
     publish_lease(db, job).await?;
-    let receipt = client.submit_once(&csrf, &meta, &uploaded).await?;
+    let mut receipt = client.submit_once(&csrf, &meta, &uploaded).await?;
+    // Capture the final typed metadata, including actual partition, activity,
+    // tags and cover. This is not the pre-upload draft.
+    receipt["submitted_meta"] = serde_json::to_value(&meta)
+        .map_err(|_| AppError::Invalid("final metadata serialization failed".into()))?;
     tracing::info!(job_id=%job.id,parts=uploaded.len(),"Bilibili native archive confirmed");
     Ok(receipt)
 }
@@ -1342,6 +1428,95 @@ pub async fn publish(
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn publish_gate_real_postgres() {
+        let Ok(url) = std::env::var("VIDEOROLL_TEST_PUBLISH_GATE_DB_URL") else {
+            return;
+        };
+        let parsed = Url::parse(&url).unwrap();
+        assert_eq!(parsed.host_str(), Some("127.0.0.1"));
+        assert_eq!(parsed.path(), "/videoroll_test");
+        let db = Database::connect(&url).await.unwrap();
+        sqlx::raw_sql("CREATE TABLE vr2_workflows(id uuid PRIMARY KEY,state text);
+            CREATE TABLE vr2_jobs(id uuid PRIMARY KEY,workflow_id uuid,lease_token uuid,state text,lease_until timestamptz);
+            CREATE TABLE app_settings(key text PRIMARY KEY,value_json jsonb,version int,updated_at timestamptz DEFAULT now());
+            CREATE TABLE tasks(id uuid PRIMARY KEY,status text);")
+            .execute(&db.pool).await.unwrap();
+        let mut jobs = Vec::new();
+        for _ in 0..2 {
+            let job = WorkItem {
+                id: uuid::Uuid::new_v4(),
+                workflow_id: uuid::Uuid::new_v4(),
+                task_id: uuid::Uuid::new_v4(),
+                stage: crate::domain::Stage::Publish,
+                generation: 1,
+                operation_key: uuid::Uuid::new_v4().to_string(),
+                lease_token: uuid::Uuid::new_v4(),
+                attempts: 1,
+                max_attempts: 3,
+                payload: json!({}),
+            };
+            sqlx::query("INSERT INTO tasks VALUES($1,'publishing')")
+                .bind(job.task_id)
+                .execute(&db.pool)
+                .await
+                .unwrap();
+            sqlx::query("INSERT INTO vr2_workflows VALUES($1,'running')")
+                .bind(job.workflow_id)
+                .execute(&db.pool)
+                .await
+                .unwrap();
+            sqlx::query(
+                "INSERT INTO vr2_jobs VALUES($1,$2,$3,'running',now()+interval '10 minutes')",
+            )
+            .bind(job.id)
+            .bind(job.workflow_id)
+            .bind(job.lease_token)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+            jobs.push(job);
+        }
+        publish_gate(&db, &jobs[0], PublishGate::Upload)
+            .await
+            .unwrap();
+        publish_gate(&db, &jobs[1], PublishGate::Submit)
+            .await
+            .unwrap();
+        let row:(i64,f64)=sqlx::query_as("SELECT count(*),max((value_json->>'not_before')::double precision-EXTRACT(EPOCH FROM clock_timestamp())::double precision) FROM app_settings")
+            .fetch_one(&db.pool).await.unwrap();
+        assert_eq!(row.0, 2);
+        assert!(row.1 > 0.0);
+        // Another upload is blocked by the shared persisted slot, not an
+        // idle transaction or a process-local mutex. Cancel its lease.
+        let wait = publish_gate(&db, &jobs[1], PublishGate::Upload);
+        tokio::pin!(wait);
+        tokio::select! {_=&mut wait=>panic!("second upload incorrectly admitted"),_=sleep(Duration::from_millis(350))=>{}}
+        sqlx::query("UPDATE vr2_jobs SET state='canceled' WHERE id=$1")
+            .bind(jobs[1].id)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(4), &mut wait)
+                .await
+                .unwrap()
+                .is_err()
+        );
+        println!(
+            "PASS real PostgreSQL separate persistent publish gates, queued admission and cancellation without idle transaction"
+        );
+    }
+    #[test]
+    fn publish_throttle_matches_legacy_queue_scaling() {
+        assert_eq!(throttle_interval(45., 15., 180., 0), 45.);
+        assert_eq!(throttle_interval(45., 15., 180., 5), 105.);
+        assert_eq!(throttle_interval(45., 15., 180., 20), 180.);
+        assert_eq!(throttle_interval(20., 8., 90., 5), 52.);
+        assert_eq!(throttle_interval(20., 8., 90., 20), 90.);
+        assert_eq!(PublishGate::Upload.name(), "upload");
+        assert_eq!(PublishGate::Submit.name(), "submit");
+    }
     #[test]
     fn upos_parallelism_preserves_small_upload_and_bounds_buffers() {
         assert_eq!(upload_parallelism(8, 3, 1024), 1);
