@@ -126,6 +126,42 @@ pub async fn chat_json(
     max_bytes: usize,
     error_label: &str,
 ) -> AppResult<Value> {
+    chat_json_observed(
+        db,
+        request,
+        endpoint,
+        model,
+        operation,
+        task_id,
+        max_bytes,
+        error_label,
+        None,
+    )
+    .await
+}
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct HttpFailure {
+    pub status: u16,
+    pub retry_after: Option<f64>,
+}
+fn numeric_retry_after(value: Option<&reqwest::header::HeaderValue>) -> Option<f64> {
+    value
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v >= 0.0)
+}
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn chat_json_observed(
+    db: &Database,
+    request: RequestBuilder,
+    endpoint: &Url,
+    model: &str,
+    operation: &str,
+    task_id: Option<Uuid>,
+    max_bytes: usize,
+    error_label: &str,
+    observed: Option<&mut Option<HttpFailure>>,
+) -> AppResult<Value> {
     let started = Instant::now();
     let response = match request.send().await {
         Ok(v) => v,
@@ -150,6 +186,14 @@ pub async fn chat_json(
     };
     let status = response.status();
     if !status.is_success() {
+        if let Some(out) = observed {
+            *out = Some(HttpFailure {
+                status: status.as_u16(),
+                retry_after: numeric_retry_after(
+                    response.headers().get(reqwest::header::RETRY_AFTER),
+                ),
+            });
+        }
         save(
             db,
             UsageRecord {
@@ -192,46 +236,53 @@ pub async fn chat_json(
             "{error_label} response too large"
         )));
     }
-    let raw = match response.bytes().await {
-        Ok(v) => v,
-        Err(e) => {
-            save(
-                db,
-                UsageRecord {
-                    url: endpoint,
-                    model,
-                    operation,
-                    task_id,
-                    success: false,
-                    status: Some(status.as_u16()),
-                    usage: None,
-                    elapsed: started.elapsed(),
-                    error_type: Some("ResponseReadError"),
-                },
-            )
-            .await;
-            return Err(AppError::Upstream(e));
+    let mut response = response;
+    let mut raw = Vec::new();
+    loop {
+        match response.chunk().await {
+            Ok(Some(chunk)) if chunk.len() <= max_bytes.saturating_sub(raw.len()) => {
+                raw.extend_from_slice(&chunk)
+            }
+            Ok(Some(_)) => {
+                save(
+                    db,
+                    UsageRecord {
+                        url: endpoint,
+                        model,
+                        operation,
+                        task_id,
+                        success: false,
+                        status: Some(status.as_u16()),
+                        usage: None,
+                        elapsed: started.elapsed(),
+                        error_type: Some("OversizedResponse"),
+                    },
+                )
+                .await;
+                return Err(AppError::Unavailable(format!(
+                    "{error_label} response exceeds budget"
+                )));
+            }
+            Ok(None) => break,
+            Err(e) => {
+                save(
+                    db,
+                    UsageRecord {
+                        url: endpoint,
+                        model,
+                        operation,
+                        task_id,
+                        success: false,
+                        status: Some(status.as_u16()),
+                        usage: None,
+                        elapsed: started.elapsed(),
+                        error_type: Some("ResponseReadError"),
+                    },
+                )
+                .await;
+                return Err(AppError::Upstream(e));
+            }
         }
-    };
-    if raw.len() > max_bytes {
-        save(
-            db,
-            UsageRecord {
-                url: endpoint,
-                model,
-                operation,
-                task_id,
-                success: false,
-                status: Some(status.as_u16()),
-                usage: None,
-                elapsed: started.elapsed(),
-                error_type: Some("OversizedResponse"),
-            },
-        )
-        .await;
-        return Err(AppError::Unavailable(format!(
-            "{error_label} response exceeds budget"
-        )));
     }
     let envelope: Value = match serde_json::from_slice(&raw) {
         Ok(v) => v,

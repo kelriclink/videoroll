@@ -5,6 +5,8 @@ cd "$(dirname "$0")/.."
 case "${VIDEOROLL_TEST_ASR_SCENARIO:-external-whisper}" in
   external-whisper) test_name=media::asr::tests::external_whisper_real_postgres_http_admission ;;
   translation) test_name=media::asr::tests::translation_recovery_real_postgres_http ;;
+  download) test_name=download_runtime::tests::download_fallback_real_postgres_and_process ;;
+  publish-gate) test_name=bilibili::tests::publish_gate_real_postgres ;;
   *) echo "invalid test scenario" >&2; exit 1 ;;
 esac
 cargo test --lib "$test_name" --no-run
@@ -38,8 +40,10 @@ port="$(docker port "$name" 5432/tcp | awk -F: '/^127.0.0.1:/ {print $NF}')"
 export VIDEOROLL_TEST_EXTERNAL_WHISPER_DB_URL="postgresql://postgres:videoroll-test-only@127.0.0.1:$port/videoroll_test"
 export DATABASE_URL="$VIDEOROLL_TEST_EXTERNAL_WHISPER_DB_URL"
 export VIDEOROLL_V2_STORAGE_ROOT="$tmp" VIDEOROLL_V2_INTERNAL_TOKEN=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-if [[ "${VIDEOROLL_TEST_ASR_SCENARIO:-external-whisper}" == "translation" ]]; then
-  export VIDEOROLL_TEST_TRANSLATION_DB_URL="$DATABASE_URL"
-  unset VIDEOROLL_TEST_EXTERNAL_WHISPER_DB_URL
-fi
+case "${VIDEOROLL_TEST_ASR_SCENARIO:-external-whisper}" in
+  translation) export VIDEOROLL_TEST_TRANSLATION_DB_URL="$DATABASE_URL"; unset VIDEOROLL_TEST_EXTERNAL_WHISPER_DB_URL ;;
+  download) export VIDEOROLL_TEST_DOWNLOAD_DB_URL="$DATABASE_URL"; unset VIDEOROLL_TEST_EXTERNAL_WHISPER_DB_URL ;;
+  publish-gate) export VIDEOROLL_TEST_PUBLISH_GATE_DB_URL="$DATABASE_URL"; unset VIDEOROLL_TEST_EXTERNAL_WHISPER_DB_URL ;;
+  external-whisper) export GROQ_ASR_MAX_CONCURRENCY=1 ;;
+esac
 cargo test --lib "$test_name" -- --nocapture
