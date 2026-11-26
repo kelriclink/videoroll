@@ -2,11 +2,11 @@
 
 基线 91824c3。Rust 仍掌握任务、配置、超时、存储和数据库；Python 仅作为第三方模型运行适配器。没有新增业务表、服务端口或 Python 调度器。
 
-- 每个 Rust 角色进程至多一个常驻模型子进程；相同模型路径、设备及加载参数复用。目录原子替换通过 inode/mtime 使缓存失效，切换模型或设备时回收旧进程。运行期间不支持原地修改模型文件。
+- 每个 Rust 角色进程默认至多两个常驻模型子进程（ASR、Embedding 各一个；最多一个非 CPU 模型）；可通过 `VIDEOROLL_V2_LOCAL_INFERENCE_POOL_SIZE=1` 恢复单进程单模型。相同模型路径、设备及加载参数复用。目录原子替换通过 inode/mtime 使缓存失效，同类模型切换时回收旧进程。设备探测不占常驻槽位。运行期间不支持原地修改模型文件。
 - 有界长度帧 JSON 协议，输入 256 KiB、输出 12 MiB，stdout 原生日志重定向。串行交换，等待准入和执行均计入调用期限。超时、取消、退出、损坏帧或模型错误均淘汰当前子进程，不自动重复推理；上层现有重试机制仍生效。
 - Linux GPU/非明确 CPU 设备以共享本地 flock 文件实施跨角色准入，驻留期间持锁；明确 CPU 不持 GPU 锁。锁按归一化设备名生成 SHA-256 短标识，并按 slot 编号拆分；默认每设备 1 个 slot，可通过 `VIDEOROLL_V2_LOCAL_INFERENCE_GPU_SLOTS` 配置 1–8，Python bridge 接收同名值 `VIDEOROLL_LOCAL_GPU_SLOTS`，非阻塞轮询空闲 slot。默认共享存储根下 `.local-inference-gpu.lock` 为锁文件基名，可显式指定，所有角色必须使用同一路径、同一服务用户和同一底层本地文件系统。文件禁止符号链接、硬链接、不安全权限；不要在运行时删除锁文件。直接执行旧单次桥接脚本是诊断方式，不受此准入管理。
-- 空闲 300 秒自动卸载，可通过 `VIDEOROLL_V2_LOCAL_INFERENCE_IDLE_SECONDS` 配置 1–600 秒。子进程 kill-on-drop 与 Linux parent-death signal；systemd 原有 KillMode=control-group 保留。未验证任意第三方派生孙进程的强制清理、整机断电恢复和不同外部应用的 GPU 并发。并不保证跨进程 FIFO、公平性或自动 VRAM 配额；长批次连续使用可能使其他 GPU 调用等待超时。CPU 仍按角色独立运行，没有全机 CPU 模型数限制。
-- 单进程单模型是保守显存/内存策略；ASR 与 Embedding 交替时仍可能反复切换加载。身份变化会记录 from/to kind 与 device，并明确提示下一次调用可能冷启动；本轮没有宣称解决多模型常驻。未来可按设备与模型配置扩展有界池。
+- CPU 空闲默认 300 秒自动卸载，可通过 `VIDEOROLL_V2_LOCAL_INFERENCE_IDLE_SECONDS` 配置 1–600 秒。GPU 空闲默认取 CPU 空闲时间与 30 秒的较小值，可独立配置 `VIDEOROLL_V2_LOCAL_INFERENCE_GPU_IDLE_SECONDS`（1–600 秒）。子进程 kill-on-drop 与 Linux parent-death signal；systemd 原有 KillMode=control-group 保留。未验证任意第三方派生孙进程的强制清理、整机断电恢复和不同外部应用的 GPU 并发。并不保证跨进程 FIFO、公平性或自动 VRAM 配额；长批次连续使用可能使其他 GPU 调用等待超时。CPU 仍按角色独立运行，没有全机 CPU 模型数限制。
+- 有界池允许 CPU ASR 与 CPU Embedding、GPU ASR 与 CPU Embedding 等组合复用；两个 GPU 模型仍需交替淘汰，避免同角色等待自身持有的锁。调用仍按角色串行；超时/取消只淘汰当前子进程，空闲模型可在其他调用期间独立回收。默认不扩大单 GPU 驻留数量。
 
 ## 验证记录（2026-11-25）
 
@@ -25,3 +25,10 @@
 Rust `external-whisper` 请求复用原 `subtitle.asr` 设置，向 OpenAI-compatible `/v1/audio/transcriptions` 发送 `verbose_json`、语言、temperature、beam_size、batch_size、word_timestamps、VAD 阈值/静音/填充、previous-text 条件及 no-speech/log-prob/compression 阈值。仅在扩展字段遭遇 HTTP 400/422 时重试一次 portable OpenAI 字段；连接错误最多 4 次指数退避，所有请求 attempt 仍经过 `ai_usage` 记录。
 
 `external_whisper_max_concurrency`（1–8，默认 1）使用 PostgreSQL transaction advisory slot。等待时立即回滚事务，不占用连接；获得 slot 后在请求期间持有 transaction lock，结束后释放。ASR word timestamps 会按 12 秒/120 字默认上限重新组合，并裁剪到音频 chunk 时长。
+
+## 双模型常驻池专项验收（2026-11-26）
+
+- Mock 子进程：原生命周期回归与双模型池专项均通过；验证同类替换、ASR/Embedding 同时驻留、设备探测不占驻留槽、独立错误处理及空闲回收。
+- GPU 锁文件专项：3 项通过，包括 OpenVINO GPU 与 openvino:GPU、CUDA 与 CUDA:0 的归一化。
+- 真实离线语音合成素材，原本地模型只读加载，未访问生产数据库：OpenVINO GPU ASR 冷/热 51.640/1.311 秒；OpenVINO CPU BGE 冷/热 2.214/0.0094 秒；faster-whisper CPU INT8 冷/热 34.452/12.897 秒。验证 GPU ASR 与 CPU Embedding 同时驻留、交替调用复用原进程及相同输出，另一个 Rust 进程争用 GPU 准入槽位时超时，切换 CPU ASR 后释放原 GPU 锁、保留 CPU Embedding。真实专项共 104.81 秒，测试通过。
+- 真实专项使用 GPU 空闲 120 秒防止长冷启动测量干扰生命周期断言；生产默认 GPU 空闲 30 秒，CPU 空闲 300 秒。未验证多 GPU 同时常驻或跨角色长期公平性，未提升默认 GPU admission slots。

@@ -15,7 +15,9 @@ use tokio::{
 };
 const MAX_REQUEST: usize = 256 * 1024;
 const MAX_RESPONSE: usize = 12 * 1024 * 1024;
-static SESSION: Mutex<Option<Session>> = Mutex::const_new(None);
+// Serialize requests within one role, but allow idle eviction during an exchange.
+static EXCHANGE_GATE: Mutex<()> = Mutex::const_new(());
+static SESSIONS: Mutex<Vec<Session>> = Mutex::const_new(Vec::new());
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 struct Session {
@@ -25,6 +27,8 @@ struct Session {
     stdin: ChildStdin,
     stdout: ChildStdout,
     last_used: Instant,
+    idle_task: Option<tokio::task::AbortHandle>,
+    idle_generation: u64,
 }
 fn unavailable(message: &str) -> AppError {
     AppError::Unavailable(message.into())
@@ -41,6 +45,44 @@ fn idle_timeout() -> Duration {
             .ok()
             .as_deref(),
     ))
+}
+fn is_cpu(model: &Value) -> bool {
+    let device = model["device"]
+        .as_str()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_uppercase();
+    matches!(
+        device.as_str(),
+        "CPU" | "OPENVINO" | "OPENVINO:" | "OPENVINO:CPU"
+    )
+}
+fn is_probe(model: &Value) -> bool {
+    model["kind"] == "devices"
+}
+fn pool_capacity() -> usize {
+    std::env::var("VIDEOROLL_V2_LOCAL_INFERENCE_POOL_SIZE")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(2)
+        .clamp(1, 2)
+}
+fn session_idle_timeout(model: &Value) -> Duration {
+    if is_cpu(model) {
+        return idle_timeout();
+    }
+    Duration::from_secs(
+        std::env::var("VIDEOROLL_V2_LOCAL_INFERENCE_GPU_IDLE_SECONDS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(idle_timeout().as_secs().min(30))
+            .clamp(1, 600),
+    )
+}
+fn conflicts(old: &Value, new: &Value) -> bool {
+    // One model per operation kind; conservatively at most one accelerator
+    // model per role so a new child never waits for its own resident GPU slot.
+    old["kind"] == new["kind"] || (!is_cpu(old) && !is_cpu(new))
 }
 fn parse_gpu_lock_slots(value: Option<&str>) -> u8 {
     value
@@ -151,6 +193,8 @@ impl Session {
             stdin,
             stdout,
             last_used: Instant::now(),
+            idle_task: None,
+            idle_generation: 0,
         })
     }
     async fn exchange(&mut self, input: &[u8]) -> AppResult<Value> {
@@ -176,27 +220,25 @@ impl Session {
             .ok_or_else(|| unavailable("local inference response missing result"))
     }
 }
-fn monitor_idle(id: u64) {
+fn monitor_idle(id: u64, generation: u64, idle: Duration) -> tokio::task::AbortHandle {
     tokio::spawn(async move {
-        loop {
-            let wait = {
-                let mut slot = SESSION.lock().await;
-                let Some(session) = slot.as_ref().filter(|s| s.id == id) else {
-                    return;
-                };
-                let idle = idle_timeout();
-                let elapsed = session.last_used.elapsed();
-                if elapsed >= idle {
-                    if let Some(mut session) = slot.take() {
-                        let _ = session.child.kill().await;
-                    }
-                    return;
-                }
-                idle - elapsed
-            };
-            tokio::time::sleep(wait).await;
+        tokio::time::sleep(idle).await;
+        let mut pool = SESSIONS.lock().await;
+        if let Some(index) = pool
+            .iter()
+            .position(|s| s.id == id && s.idle_generation == generation)
+        {
+            let mut expired = pool.remove(index);
+            let _ = expired.child.kill().await;
         }
-    });
+    })
+    .abort_handle()
+}
+async fn evict(mut session: Session) {
+    if let Some(task) = session.idle_task.take() {
+        task.abort();
+    }
+    let _ = session.child.kill().await;
 }
 fn env(key: &str, default: &str) -> String {
     std::env::var(key)
@@ -306,31 +348,45 @@ pub async fn invoke(request: &Value, timeout: Duration) -> AppResult<Value> {
     }
     let lock = gpu_lock_path()?;
     let timeout = timeout.clamp(Duration::from_secs(1), Duration::from_secs(1800));
-    tokio::time::timeout(timeout,async {
-        // The mutex is held throughout one exchange. Once taken out of the
-        // slot, a session is owned by this future, so cancellation/timeout
-        // drops the child (kill_on_drop) rather than retaining a stale reply.
-        let mut slot=SESSION.lock().await;
-        let key=json!({"model":model_identity(request).await?,"python":python,"bridge":bridge,"gpu_lock":lock});
-        let mut existing=slot.take();
-        if let Some(session)=existing.as_mut(){
-            if session.key!=key {
-                tracing::info!(from_kind=%session.key["model"]["kind"].as_str().unwrap_or("unknown"),to_kind=%request["kind"].as_str().unwrap_or("unknown"),from_device=%session.key["model"]["device"].as_str().unwrap_or("unknown"),to_device=%request["device"].as_str().unwrap_or("unknown"),"local inference model identity changed; resident process will be replaced and the next call may incur cold-start latency");
+    tokio::time::timeout(timeout, async {
+        let _gate = EXCHANGE_GATE.lock().await;
+        let key = json!({"model":model_identity(request).await?,"python":python,"bridge":bridge,"gpu_lock":lock});
+        let probe = is_probe(&key["model"]);
+        let mut existing = None;
+        if !probe {
+            let mut pool = SESSIONS.lock().await;
+            if let Some(index) = pool.iter().position(|s| s.key == key) {
+                let mut session = pool.remove(index);
+                if let Some(task) = session.idle_task.take() { task.abort(); }
+                if session.child.try_wait()?.is_none() { existing = Some(session); }
             }
-            if session.key!=key||session.child.try_wait()?.is_some(){
-                let _=session.child.kill().await;
-                existing=None;
+            // Evict stale identities and same-role GPU holders before spawning.
+            // Hold the pool lock through reaping so a replacement cannot race
+            // the old process releasing its resource lock.
+            let mut index = 0;
+            while index < pool.len() {
+                if conflicts(&pool[index].key["model"], &key["model"]) {
+                    evict(pool.remove(index)).await;
+                } else { index += 1; }
+            }
+            while pool.len() >= pool_capacity() {
+                let index = pool.iter().enumerate().min_by_key(|(_, s)| s.last_used).unwrap().0;
+                evict(pool.remove(index)).await;
             }
         }
-        let fresh=existing.is_none();
-        let mut session=match existing{Some(s)=>s,None=>Session::spawn(key,&python,&bridge,&lock)?};
-        let response=session.exchange(&input).await?;
-        session.last_used=Instant::now();
-        let id=session.id;
-        *slot=Some(session);
-        if fresh{monitor_idle(id);}
+        // While the exchange waits for admission or inference, idle siblings
+        // can still be reaped. Cancellation drops only the checked-out child.
+        let mut session = match existing { Some(s) => s, None => Session::spawn(key, &python, &bridge, &lock)? };
+        let response = session.exchange(&input).await?;
+        if probe { evict(session).await; return Ok(response); }
+        session.last_used = Instant::now();
+        session.idle_generation = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        let idle = session_idle_timeout(&session.key["model"]);
+        let mut pool = SESSIONS.lock().await;
+        session.idle_task = Some(monitor_idle(session.id, session.idle_generation, idle));
+        pool.push(session);
         Ok(response)
-    }).await.map_err(|_|unavailable("local inference deadline exceeded"))?
+    }).await.map_err(|_| unavailable("local inference deadline exceeded"))?
 }
 
 #[cfg(test)]
