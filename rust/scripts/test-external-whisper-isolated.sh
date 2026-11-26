@@ -2,7 +2,12 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 # Build first so the disposable database is not kept open during compilation.
-cargo test --lib media::asr::tests::external_whisper_real_postgres_http_admission --no-run
+case "${VIDEOROLL_TEST_ASR_SCENARIO:-external-whisper}" in
+  external-whisper) test_name=media::asr::tests::external_whisper_real_postgres_http_admission ;;
+  translation) test_name=media::asr::tests::translation_recovery_real_postgres_http ;;
+  *) echo "invalid test scenario" >&2; exit 1 ;;
+esac
+cargo test --lib "$test_name" --no-run
 name="vr2-whisper-test-$(python3 -c 'import uuid;print(uuid.uuid4().hex[:12])')"
 volume="$name-db"
 tmp="$(mktemp -d)"
@@ -33,4 +38,8 @@ port="$(docker port "$name" 5432/tcp | awk -F: '/^127.0.0.1:/ {print $NF}')"
 export VIDEOROLL_TEST_EXTERNAL_WHISPER_DB_URL="postgresql://postgres:videoroll-test-only@127.0.0.1:$port/videoroll_test"
 export DATABASE_URL="$VIDEOROLL_TEST_EXTERNAL_WHISPER_DB_URL"
 export VIDEOROLL_V2_STORAGE_ROOT="$tmp" VIDEOROLL_V2_INTERNAL_TOKEN=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-cargo test --lib media::asr::tests::external_whisper_real_postgres_http_admission -- --nocapture
+if [[ "${VIDEOROLL_TEST_ASR_SCENARIO:-external-whisper}" == "translation" ]]; then
+  export VIDEOROLL_TEST_TRANSLATION_DB_URL="$DATABASE_URL"
+  unset VIDEOROLL_TEST_EXTERNAL_WHISPER_DB_URL
+fi
+cargo test --lib "$test_name" -- --nocapture
