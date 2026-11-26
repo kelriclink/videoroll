@@ -42,8 +42,8 @@ def main(argv: list[str]) -> int:
     manifest = runtime / f"{job_id}.json"
     if mode == "--status":
         if not manifest.is_file():
-            print("not found", file=sys.stderr)
-            return 2
+            print("VIDEOROLL_YOUDUB_TASK_NOT_FOUND", file=sys.stderr)
+            return 44
         print(manifest.read_text(encoding="utf-8"))
         return 0
     if mode == "--create":

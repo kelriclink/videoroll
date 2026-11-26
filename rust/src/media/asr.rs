@@ -294,79 +294,107 @@ fn cloudflare_response(data: Value, seconds: f64) -> AppResult<AsrResponse> {
         text: String::new(),
     })
 }
-// Transaction-scoped advisory locks are automatically released on
-// cancellation or connection loss. Never keep a waiting transaction open.
-async fn cloudflare_slot(
-    db: &Database,
-    job: &WorkItem,
-) -> AppResult<sqlx::Transaction<'static, sqlx::Postgres>> {
-    let cap = std::env::var("CLOUDFLARE_ASR_MAX_CONCURRENCY")
-        .ok()
-        .and_then(|s| s.parse::<i32>().ok())
-        .unwrap_or(2)
-        .clamp(1, 8);
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
-    loop {
-        selective_lease(db, job).await?;
-        let mut tx = db.pool.begin().await?;
-        for slot in 0..cap {
-            let held:bool=sqlx::query_scalar("SELECT pg_try_advisory_xact_lock(hashtextextended('videoroll:asr:cloudflare:'||$1::text,0))").bind(slot).fetch_one(&mut *tx).await?;
-            if held {
-                return Ok(tx);
-            }
+// Dedicated PostgreSQL sessions own admission locks. A pooled transaction
+// must never be left idle during a potentially long upstream request.
+#[derive(Clone, Copy)]
+enum AsrGate {
+    External,
+    Cloudflare,
+    Groq,
+}
+impl AsrGate {
+    fn key(self) -> &'static str {
+        match self {
+            Self::External => "videoroll:asr:external-whisper:",
+            Self::Cloudflare => "videoroll:asr:cloudflare:",
+            Self::Groq => "videoroll:asr:groq-whisper:",
         }
-        tx.rollback().await?;
-        if tokio::time::Instant::now() >= deadline {
-            return Err(AppError::Unavailable(
-                "Cloudflare ASR admission timeout".into(),
-            ));
-        }
-        sleep(Duration::from_millis(250)).await;
     }
 }
-// A dedicated connection owns the session lock. Never return a locked
-// session to the shared query pool, even when the caller is canceled.
-// Do not keep an idle transaction open across the upstream HTTP request.
-async fn try_external_whisper_slot(pool: &PgPool, cap: i32) -> AppResult<Option<PgConnection>> {
+async fn try_provider_slot(
+    pool: &PgPool,
+    gate: AsrGate,
+    cap: i32,
+) -> AppResult<Option<PgConnection>> {
     let options = pool.connect_options();
     let mut connection = tokio::time::timeout(
         Duration::from_secs(10),
         PgConnection::connect_with(&options),
     )
     .await
-    .map_err(|_| AppError::Unavailable("external Whisper admission connection timeout".into()))??;
-    // PostgreSQL >= 16 is required by VideoRoll. Only this dedicated
-    // session is exempted from the idle-session timeout.
-    sqlx::query("SET idle_session_timeout = 0")
+    .map_err(|_| AppError::Unavailable("ASR admission connection timeout".into()))??;
+    sqlx::query("SET idle_session_timeout=0")
         .execute(&mut connection)
         .await?;
     for slot in 0..cap.clamp(1, 8) {
-        let held: bool = sqlx::query_scalar(
-            "SELECT pg_try_advisory_lock(hashtextextended('videoroll:asr:external-whisper:'||$1::text,0))"
-        ).bind(slot).fetch_one(&mut connection).await?;
+        let key = format!("{}{slot}", gate.key());
+        let held: bool =
+            sqlx::query_scalar("SELECT pg_try_advisory_lock(hashtextextended($1::text,0))")
+                .bind(&key)
+                .fetch_one(&mut connection)
+                .await?;
         if held {
             return Ok(Some(connection));
         }
     }
-    // Dropping a raw PgConnection closes the socket; there is no pool return.
     Ok(None)
 }
-async fn external_whisper_slot(db: &Database, job: &WorkItem, cap: i32) -> AppResult<PgConnection> {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(3600);
+#[cfg(test)]
+async fn try_external_whisper_slot(pool: &PgPool, cap: i32) -> AppResult<Option<PgConnection>> {
+    try_provider_slot(pool, AsrGate::External, cap).await
+}
+const GROQ_COOLDOWN: &str = "runtime.asr.groq.cooldown";
+async fn groq_cooldown_remaining(db: &Database) -> AppResult<f64> {
+    let delay:Option<f64>=sqlx::query_scalar("SELECT CASE WHEN jsonb_typeof(value_json->'not_before')='number' THEN (value_json->>'not_before')::double precision-EXTRACT(EPOCH FROM clock_timestamp())::double precision ELSE 0 END FROM app_settings WHERE key=$1")
+        .bind(GROQ_COOLDOWN).fetch_optional(&db.pool).await?;
+    Ok(delay.unwrap_or(0.0).max(0.0))
+}
+async fn set_groq_cooldown(db: &Database, seconds: f64) -> AppResult<()> {
+    sqlx::query("INSERT INTO app_settings(key,value_json,version) VALUES($1,jsonb_build_object('not_before',EXTRACT(EPOCH FROM clock_timestamp())::double precision+$2::double precision),1)
+        ON CONFLICT(key) DO UPDATE SET value_json=jsonb_build_object('not_before',GREATEST(COALESCE((app_settings.value_json->>'not_before')::double precision,0),(EXCLUDED.value_json->>'not_before')::double precision)),version=app_settings.version+1,updated_at=now()")
+        .bind(GROQ_COOLDOWN).bind(seconds).execute(&db.pool).await?;
+    Ok(())
+}
+async fn provider_slot(
+    db: &Database,
+    job: &WorkItem,
+    gate: AsrGate,
+    cap: i32,
+    wait_seconds: u64,
+) -> AppResult<PgConnection> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(wait_seconds);
     let mut delay = Duration::from_millis(250);
     loop {
         selective_lease(db, job).await?;
-        if let Some(connection) = try_external_whisper_slot(&db.pool, cap).await? {
-            return Ok(connection);
+        if !matches!(gate, AsrGate::Groq) || groq_cooldown_remaining(db).await? <= 0.0 {
+            if let Some(connection) = try_provider_slot(&db.pool, gate, cap).await? {
+                // Re-check shared cooldown after acquiring the slot so
+                // concurrent 429 responses gate newly admitted requests.
+                if !matches!(gate, AsrGate::Groq) || groq_cooldown_remaining(db).await? <= 0.0 {
+                    return Ok(connection);
+                }
+                drop(connection);
+            }
         }
         if tokio::time::Instant::now() >= deadline {
             return Err(AppError::Unavailable(
-                "external Whisper admission timeout".into(),
+                "ASR provider admission timeout".into(),
             ));
         }
         sleep(delay).await;
         delay = (delay * 2).min(Duration::from_secs(1));
     }
+}
+async fn cloudflare_slot(db: &Database, job: &WorkItem) -> AppResult<PgConnection> {
+    let cap = std::env::var("CLOUDFLARE_ASR_MAX_CONCURRENCY")
+        .ok()
+        .and_then(|s| s.parse::<i32>().ok())
+        .unwrap_or(2)
+        .clamp(1, 8);
+    provider_slot(db, job, AsrGate::Cloudflare, cap, 120).await
+}
+async fn external_whisper_slot(db: &Database, job: &WorkItem, cap: i32) -> AppResult<PgConnection> {
+    provider_slot(db, job, AsrGate::External, cap, 3600).await
 }
 // Check that the dedicated connection is still alive during long upstream
 // requests. Loss of ownership terminates the local request; the provider
@@ -851,6 +879,140 @@ async fn run_external_whisper(
     }
 }
 
+fn groq_retryable(status: u16) -> bool {
+    matches!(status, 408 | 409 | 425 | 429) || (500..=599).contains(&status)
+}
+fn groq_delay(attempt: u32, retry_after: Option<f64>) -> Duration {
+    Duration::from_secs_f64(
+        retry_after
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or_else(|| 3.0 * 2f64.powi(attempt.min(4) as i32))
+            .clamp(0.5, 45.0),
+    )
+}
+fn groq_endpoint(config: &Config) -> bool {
+    config
+        .asr_endpoint
+        .as_deref()
+        .and_then(|v| Url::parse(v).ok())
+        .is_some_and(|v| v.host_str() == Some("api.groq.com"))
+}
+async fn run_groq(
+    db: &Database,
+    job: &WorkItem,
+    client: &Client,
+    config: &Config,
+    path: &Path,
+    lang: &str,
+    target: &Url,
+) -> AppResult<AsrResponse> {
+    if !matches!(
+        config.asr_model.as_str(),
+        "whisper-large-v3" | "whisper-large-v3-turbo"
+    ) {
+        return Err(AppError::Invalid("unsupported Groq Whisper model".into()));
+    }
+    let key = config
+        .asr_api_key
+        .as_deref()
+        .filter(|v| !v.trim().is_empty())
+        .ok_or_else(|| AppError::Invalid("Groq Whisper API key missing".into()))?;
+    if fs::metadata(path).await?.len() > 24 * 1024 * 1024 {
+        return Err(AppError::Invalid(
+            "Groq FLAC exceeds safe upload budget".into(),
+        ));
+    }
+    let audio = fs::read(path).await?;
+    let cap = std::env::var("GROQ_ASR_MAX_CONCURRENCY")
+        .ok()
+        .and_then(|s| s.parse::<i32>().ok())
+        .unwrap_or(1)
+        .clamp(1, 8);
+    let wait = std::env::var("GROQ_ASR_GATE_WAIT_SECONDS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(3600)
+        .clamp(210, 43200);
+    for attempt in 0..5 {
+        let mut slot = provider_slot(db, job, AsrGate::Groq, cap, wait).await?;
+        check_external_whisper_admission(&mut slot).await?;
+        selective_lease(db, job).await?;
+        let part = multipart::Part::bytes(audio.clone())
+            .file_name("audio.flac")
+            .mime_str("audio/flac")
+            .map_err(|_| AppError::Invalid("invalid FLAC MIME".into()))?;
+        let mut form = multipart::Form::new()
+            .part("file", part)
+            .text("model", config.asr_model.clone())
+            .text("response_format", "verbose_json")
+            .text("temperature", "0");
+        if !lang.is_empty() && !lang.eq_ignore_ascii_case("auto") {
+            form = form.text("language", lang.to_owned());
+        }
+        let mut observed = None;
+        let result = {
+            let request = crate::ai_usage::chat_json_observed(
+                db,
+                client
+                    .post(target.clone())
+                    .timeout(Duration::from_secs(180))
+                    .bearer_auth(key)
+                    .multipart(form),
+                target,
+                &config.asr_model,
+                "asr_groq",
+                Some(job.task_id),
+                MAX_BYTES,
+                "Groq Whisper",
+                Some(&mut observed),
+            );
+            tokio::pin!(request);
+            let mut ticker = tokio::time::interval(Duration::from_secs(10));
+            loop {
+                tokio::select! {
+                    result=&mut request=>break result,
+                    _=ticker.tick()=>{check_external_whisper_admission(&mut slot).await?;selective_lease(db,job).await?;}
+                }
+            }
+        };
+        // Publish the cooldown before releasing this quota slot, including
+        // the final retry. Never serialize or log API keys/response bodies.
+        let delay = groq_delay(attempt, observed.and_then(|v| v.retry_after));
+        if observed.is_some_and(|v| v.status == 429) {
+            set_groq_cooldown(db, delay.as_secs_f64()).await?;
+        }
+        drop(slot);
+        selective_lease(db, job).await?;
+        match result {
+            Ok(body) => {
+                return serde_json::from_value(body).map_err(|_| {
+                    AppError::Unavailable("Groq Whisper response schema invalid".into())
+                });
+            }
+            Err(err) => {
+                let retry = observed.is_some_and(|v| groq_retryable(v.status))
+                    || matches!(&err,AppError::Upstream(e) if e.is_timeout()||e.is_connect()||e.is_request()||e.is_body());
+                if !retry || attempt == 4 {
+                    return Err(err);
+                }
+                tracing::warn!(job_id=%job.id,attempt=attempt+1,delay_ms=delay.as_millis(),"Groq Whisper chunk retry");
+                let deadline = tokio::time::Instant::now() + delay;
+                while tokio::time::Instant::now() < deadline {
+                    selective_lease(db, job).await?;
+                    sleep(
+                        deadline
+                            .saturating_duration_since(tokio::time::Instant::now())
+                            .min(Duration::from_secs(1)),
+                    )
+                    .await;
+                }
+            }
+        }
+    }
+    Err(AppError::Unavailable(
+        "Groq Whisper retry budget exhausted".into(),
+    ))
+}
 async fn run_asr(
     db: &Database,
     job: &WorkItem,
@@ -873,6 +1035,9 @@ async fn run_asr(
         .as_deref()
         .ok_or_else(|| AppError::Unavailable("no native ASR endpoint configured".into()))?;
     let parsed_endpoint = endpoint(target)?;
+    if groq_endpoint(config) {
+        return run_groq(db, job, client, config, path, lang, &parsed_endpoint).await;
+    }
     if config.asr_request_options.is_some() {
         return run_external_whisper(
             db,
@@ -905,9 +1070,9 @@ async fn run_asr(
             .asr_api_key
             .as_ref()
             .ok_or_else(|| AppError::Invalid("Cloudflare ASR API key is not set".into()))?;
-        let slot = cloudflare_slot(db, job).await?;
+        let mut slot = cloudflare_slot(db, job).await?;
         selective_lease(db, job).await?;
-        let result = crate::ai_usage::chat_json(
+        let request = crate::ai_usage::chat_json(
             db,
             client
                 .post(parsed_endpoint.clone())
@@ -920,9 +1085,16 @@ async fn run_asr(
             Some(task_id),
             MAX_BYTES,
             "Cloudflare ASR",
-        )
-        .await;
-        slot.rollback().await?;
+        );
+        tokio::pin!(request);
+        let mut ticker = tokio::time::interval(Duration::from_secs(10));
+        let result = loop {
+            tokio::select! {
+                response=&mut request=>break response,
+                _=ticker.tick()=>{check_external_whisper_admission(&mut slot).await?;selective_lease(db,job).await?;}
+            }
+        };
+        drop(slot);
         selective_lease(db, job).await?;
         let body = result?;
         return cloudflare_response(body, seconds);
@@ -2397,7 +2569,8 @@ pub(crate) async fn process(
                 ));
                 convert_audio(config, &video, &flac, start, seconds).await?;
                 let mut result = None;
-                for attempt in 0..3 {
+                let attempts = if groq_endpoint(config) { 1 } else { 3 };
+                for attempt in 0..attempts {
                     if config.cloudflare_asr {
                         selective_lease(db, job).await?;
                     }
@@ -2428,7 +2601,7 @@ pub(crate) async fn process(
                         {
                             return Err(err);
                         }
-                        Err(err) if attempt < 2 => {
+                        Err(err) if attempt + 1 < attempts => {
                             tracing::warn!(chunk=index,attempt,error=%err,"ASR chunk retry");
                             sleep(Duration::from_secs(2_u64.pow(attempt))).await;
                         }
@@ -3303,7 +3476,7 @@ mod tests {
         // Dedicated, empty test database; never reuse a production schema.
         sqlx::raw_sql("CREATE TABLE vr2_workflows(id uuid PRIMARY KEY,state text);
             CREATE TABLE vr2_jobs(id uuid PRIMARY KEY,workflow_id uuid,lease_token uuid,state text,lease_until timestamptz);
-            CREATE TABLE app_settings(key text PRIMARY KEY,value_json jsonb);
+            CREATE TABLE app_settings(key text PRIMARY KEY,value_json jsonb,version int NOT NULL DEFAULT 1,updated_at timestamptz DEFAULT now());
             CREATE TABLE ai_usage_events(id uuid PRIMARY KEY,task_id uuid,provider text,model text,operation text,
                 success bool,status_code int,input_tokens int,output_tokens int,total_tokens int,latency_ms int,
                 estimated_cost_microusd bigint,error_type text,error_message text);")
@@ -3506,8 +3679,120 @@ mod tests {
             sleep(Duration::from_millis(25)).await;
         }
         server.abort();
+        // The same transaction-timeout protection must hold for Cloudflare
+        // and Groq, independently of External Whisper's slots.
+        let cf = try_provider_slot(&db.pool, AsrGate::Cloudflare, 1)
+            .await
+            .unwrap()
+            .unwrap();
+        sleep(Duration::from_millis(350)).await;
+        assert!(
+            try_provider_slot(&db.pool, AsrGate::Cloudflare, 1)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        drop(cf);
+        #[derive(Default)]
+        struct GroqObserved {
+            calls: AtomicUsize,
+            active: AtomicUsize,
+            peak: AtomicUsize,
+            starts: std::sync::Mutex<Vec<std::time::Instant>>,
+        }
+        async fn groq_fixture(
+            State(state): State<Arc<GroqObserved>>,
+            body: Bytes,
+        ) -> impl IntoResponse {
+            let index = state.calls.fetch_add(1, Ordering::SeqCst);
+            state.starts.lock().unwrap().push(std::time::Instant::now());
+            let n = state.active.fetch_add(1, Ordering::SeqCst) + 1;
+            state.peak.fetch_max(n, Ordering::SeqCst);
+            let body = String::from_utf8_lossy(&body);
+            assert!(
+                body.contains("name=\"temperature\"") && body.contains("whisper-large-v3-turbo")
+            );
+            sleep(Duration::from_millis(80)).await;
+            state.active.fetch_sub(1, Ordering::SeqCst);
+            if index == 0 {
+                (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    [(reqwest::header::RETRY_AFTER, "0.5")],
+                    axum::Json(json!({"error":"test quota"})),
+                )
+            } else {
+                (
+                    StatusCode::OK,
+                    [(reqwest::header::RETRY_AFTER, "0")],
+                    axum::Json(
+                        json!({"text":"Groq fixture","segments":[{"start":0.0,"end":1.0,"text":"Groq fixture"}]}),
+                    ),
+                )
+            }
+        }
+        let state = Arc::new(GroqObserved::default());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target =
+            Url::parse(&format!("http://{}/groq", listener.local_addr().unwrap())).unwrap();
+        let app = Router::new()
+            .route("/groq", post(groq_fixture))
+            .with_state(state.clone());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut config = config.clone();
+        config.asr_api_key = Some("isolated-not-a-real-secret".into());
+        config.asr_model = "whisper-large-v3-turbo".into();
+        let mut jobs = Vec::new();
+        for _ in 0..2 {
+            let job = WorkItem {
+                id: Uuid::new_v4(),
+                workflow_id: Uuid::new_v4(),
+                task_id: Uuid::new_v4(),
+                stage: crate::domain::Stage::Subtitle,
+                generation: 1,
+                operation_key: Uuid::new_v4().to_string(),
+                lease_token: Uuid::new_v4(),
+                attempts: 1,
+                max_attempts: 3,
+                payload: json!({}),
+            };
+            sqlx::query("INSERT INTO vr2_workflows VALUES($1,'running')")
+                .bind(job.workflow_id)
+                .execute(&db.pool)
+                .await
+                .unwrap();
+            sqlx::query(
+                "INSERT INTO vr2_jobs VALUES($1,$2,$3,'running',now()+interval '10 minutes')",
+            )
+            .bind(job.id)
+            .bind(job.workflow_id)
+            .bind(job.lease_token)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+            jobs.push(job);
+        }
+        let first = run_groq(&db, &jobs[0], &client, &config, &audio, "en", &target);
+        let second = run_groq(&db, &jobs[1], &client, &config, &audio, "en", &target);
+        let (a, b) = tokio::join!(first, second);
+        assert_eq!(a.unwrap().segments[0].text, "Groq fixture");
+        assert_eq!(b.unwrap().segments[0].text, "Groq fixture");
+        assert_eq!(state.calls.load(Ordering::SeqCst), 3);
+        assert_eq!(state.peak.load(Ordering::SeqCst), 1);
+        let starts = state.starts.lock().unwrap();
+        assert!(starts[1].duration_since(starts[0]) >= Duration::from_millis(500));
+        drop(starts);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM ai_usage_events WHERE operation='asr_groq'"
+            )
+            .fetch_one(&db.pool)
+            .await
+            .unwrap(),
+            3
+        );
+        server.abort();
         println!(
-            "PASS real PostgreSQL advisory session slots, idle transaction timeout, backend termination, four concurrent HTTP jobs (peak 2), 422 fallback, eight usage records, cancellation recovery"
+            "PASS real PostgreSQL session locks, Cloudflare idle transaction protection, Groq shared 429 cooldown/Retry-After and quota, existing external Whisper HTTP concurrency and cancellation"
         );
     }
     #[test]
@@ -3568,6 +3853,16 @@ mod tests {
                 .iter()
                 .any(|(key, value)| key == "response_format" && value == "verbose_json")
         );
+    }
+    #[test]
+    fn groq_retry_budget_and_typed_status_are_bounded() {
+        assert!(groq_retryable(429) && groq_retryable(524) && groq_retryable(408));
+        assert!(!groq_retryable(400) && !groq_retryable(401) && !groq_retryable(413));
+        assert_eq!(groq_delay(0, Some(0.)).as_millis(), 500);
+        assert_eq!(groq_delay(4, Some(100.)).as_secs(), 45);
+        assert_eq!(groq_delay(0, None).as_secs(), 3);
+        assert_eq!(groq_delay(4, None).as_secs(), 45);
+        assert_ne!(AsrGate::Cloudflare.key(), AsrGate::Groq.key());
     }
     #[test]
     fn external_whisper_only_falls_back_for_portable_field_rejections() {

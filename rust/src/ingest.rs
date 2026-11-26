@@ -68,13 +68,20 @@ pub fn youtube_video_id(value: &str) -> AppResult<String> {
     }
     Ok(id)
 }
-async fn find_finished_video(root: &Path) -> AppResult<Option<PathBuf>> {
+pub(crate) async fn find_finished_video(
+    config: &Config,
+    root: &Path,
+) -> AppResult<Option<PathBuf>> {
     let mut entries = fs::read_dir(root).await?;
     let mut candidates = Vec::new();
     while let Some(entry) = entries.next_entry().await? {
         let path = entry.path();
         let metadata = entry.metadata().await?;
-        if !metadata.is_file() || metadata.len() == 0 {
+        if !entry.file_type().await?.is_file()
+            || !metadata.is_file()
+            || metadata.len() == 0
+            || path.file_stem().and_then(|s| s.to_str()) != Some("source")
+        {
             continue;
         }
         let Some(ext) = path.extension().and_then(|s| s.to_str()) else {
@@ -83,9 +90,22 @@ async fn find_finished_video(root: &Path) -> AppResult<Option<PathBuf>> {
         if !["mp4", "mkv", "webm", "mov"].contains(&ext.to_lowercase().as_str()) {
             continue;
         }
-        candidates.push(path);
+        if tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            crate::media::ffmpeg::probe_video(&config.ffprobe_binary, &path),
+        )
+        .await
+        .is_ok_and(|r| r.is_ok())
+        {
+            candidates.push(path);
+        }
     }
     candidates.sort();
+    if candidates.len() > 1 {
+        return Err(AppError::Conflict(
+            "multiple completed source formats require reconciliation".into(),
+        ));
+    }
     Ok(candidates.into_iter().next())
 }
 pub async fn download_youtube(
@@ -113,8 +133,9 @@ pub async fn download_youtube(
     fs::create_dir_all(&output_dir).await?;
 
     // Resume from an already registered source when it exists and passed integrity.
+    let mut missing_source: Option<(String, String, Option<i64>)> = None;
     if let Some(row) = sqlx::query(
-        "SELECT storage_key FROM assets WHERE task_id=$1 AND kind='video_raw'::asset_kind
+        "SELECT storage_key,sha256,size_bytes FROM assets WHERE task_id=$1 AND kind='video_raw'::asset_kind
          AND storage_key LIKE 'v2/%' ORDER BY created_at DESC LIMIT 1",
     )
     .bind(job.task_id)
@@ -128,6 +149,14 @@ pub async fn download_youtube(
                 .map(|m| m.len() > 0)
                 .unwrap_or(false)
         {
+            let expected:Option<String>=row.try_get("sha256")?;
+            let expected_size:Option<i64>=row.try_get("size_bytes")?;
+            let (actual,size)=registry.sha256(&key).await?;
+            if expected.as_ref().is_some_and(|v|!v.eq_ignore_ascii_case(&actual))||expected_size.is_some_and(|v|v!=size){
+                return Err(AppError::Conflict("registered source checksum/size mismatch; reconcile source before retry".into()));
+            }
+            let path=registry.resolve_existing(&key).await?;
+            tokio::time::timeout(std::time::Duration::from_secs(30),crate::media::ffmpeg::probe_video(&config.ffprobe_binary,&path)).await.map_err(|_|AppError::Unavailable("source probe timed out".into()))??;
             // A previous worker may have committed its legacy Asset but crashed
             // before registering the v2 ownership link. Reconcile it on reuse.
             // Legacy paths stay outside v2 GC jurisdiction.
@@ -154,6 +183,10 @@ pub async fn download_youtube(
             .await?;
             return Ok(serde_json::json!({"source":"existing_asset","storage_key":key}));
         }
+        let expected:Option<String>=row.try_get("sha256")?;
+        let expected=expected.filter(|v|v.len()==64&&v.bytes().all(|b|b.is_ascii_hexdigit()))
+            .ok_or_else(||AppError::Conflict("missing registered source has no verified checksum".into()))?;
+        missing_source=Some((key,expected,row.try_get("size_bytes")?));
     }
     // Local uploads have no remote URL. They MUST reuse a registered
     // task-owned video_raw asset and are never sent through yt-dlp.
@@ -163,23 +196,37 @@ pub async fn download_youtube(
         )
     })?;
     // A run can have produced a full media file, then crash before DB commit.
-    let video = match find_finished_video(&output_dir).await? {
+    let video = match find_finished_video(config, &output_dir).await? {
         Some(existing) => existing,
         None => {
-            let template = output_dir.join("source.%(ext)s");
-            crate::download_runtime::run(config, db, scheduler, job, &template, &source).await?;
-            find_finished_video(&output_dir).await?.ok_or_else(|| {
-                AppError::Unavailable("yt-dlp returned success without a completed video".into())
-            })?
+            crate::download_runtime::run(config, db, scheduler, job, &output_dir, &source).await?
         }
     };
     let root = fs::canonicalize(&registry.root).await?;
-    let key = video
+    let mut key = video
         .strip_prefix(&root)
         .map_err(|_| AppError::Invalid("downloaded file must belong to storage root".into()))?
         .to_string_lossy()
         .replace('\\', "/");
     let (digest, size) = registry.sha256(&key).await?;
+    if let Some((old_key, expected, expected_size)) = missing_source {
+        if !expected.eq_ignore_ascii_case(&digest) || expected_size.is_some_and(|v| v != size) {
+            return Err(AppError::Conflict("redownloaded source differs from historical asset; reconcile before using derived media".into()));
+        }
+        if old_key != key {
+            let old_path = registry.resolve_existing(&old_key).await?;
+            if let Some(parent) = old_path.parent() {
+                fs::create_dir_all(parent).await?;
+            }
+            if fs::symlink_metadata(&old_path).await.is_ok() {
+                return Err(AppError::Conflict(
+                    "historical source reappeared during recovery".into(),
+                ));
+            }
+            fs::rename(&video, &old_path).await?;
+            key = old_key;
+        }
+    }
     registry
         .register(
             &key,

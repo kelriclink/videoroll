@@ -750,9 +750,15 @@ pub(crate) async fn mark_confirmed(
     });
     let receipt = json!({"bvid":bvid,"aid":aid,"native_bilibili":true,"confirmed":true,
         "parts":result.get("parts")});
+    // Some recovered historical results predate submitted_meta. Preserve
+    // their original request snapshot instead of inventing final metadata.
+    let final_meta = result.get("submitted_meta").filter(|v| v.is_object());
     let updated = sqlx::query(
         "UPDATE publish_jobs SET state='published',
         aid=$3,bvid=$4,external_id=$4,external_url=$5,response_json=$6,
+        meta_json=CASE WHEN $7::jsonb IS NULL THEN meta_json
+          WHEN jsonb_typeof(meta_json->'meta')='object' THEN jsonb_set(meta_json,'{meta}',$7::jsonb)
+          ELSE meta_json || $7::jsonb END,
         upload_active=false,upload_progress=100,lease_owner=NULL,lease_until=NULL,
         heartbeat_at=now(),finished_at=now(),updated_at=now()
         WHERE id=$1 AND task_id=$2 AND state='submitting'",
@@ -763,6 +769,7 @@ pub(crate) async fn mark_confirmed(
     .bind(bvid)
     .bind(format!("https://www.bilibili.com/video/{bvid}"))
     .bind(&receipt)
+    .bind(final_meta)
     .execute(&mut **tx)
     .await?;
     if updated.rows_affected() != 1 {
