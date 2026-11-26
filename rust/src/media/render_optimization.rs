@@ -49,7 +49,7 @@ pub(crate) fn pixel_format_bit_depth(pixel_format: &str, raw_depth: Option<u32>)
     }
     8
 }
-fn timestamp_us(value: &str) -> Option<u64> {
+pub(crate) fn timestamp_us(value: &str) -> Option<u64> {
     let mut parts = value.trim().split(':');
     let h = parts.next()?.parse::<u64>().ok()?;
     let m = parts.next()?.parse::<u64>().ok()?;
