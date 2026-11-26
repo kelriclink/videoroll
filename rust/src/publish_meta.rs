@@ -20,22 +20,154 @@ const MAX_DESC_UNITS: usize = 1_800;
 fn desc_units(s: &str) -> usize {
     s.chars().map(|c| if c.is_ascii() { 1 } else { 2 }).sum()
 }
+fn clamp_chars(s: &str, limit: usize) -> String {
+    let s = s.trim();
+    if s.chars().count() <= limit {
+        return s.to_owned();
+    }
+    if limit <= 1 {
+        return s.chars().take(limit).collect();
+    }
+    format!("{}…", s.chars().take(limit - 1).collect::<String>())
+}
+fn take_desc_units(s: &str, limit: usize) -> String {
+    let mut used = 0;
+    s.chars()
+        .take_while(|c| {
+            used += if c.is_ascii() { 1 } else { 2 };
+            used <= limit
+        })
+        .collect()
+}
+fn clamp_desc_to(s: &str, limit: usize) -> String {
+    let s = s.trim();
+    if desc_units(s) <= limit {
+        return s.to_owned();
+    }
+    if limit <= 2 {
+        return take_desc_units(s, limit);
+    }
+    format!("{}…", take_desc_units(s, limit - 2).trim_end())
+}
 fn clamped_desc(s: &str) -> String {
-    let trimmed = s.trim();
-    if desc_units(trimmed) <= MAX_DESC_UNITS {
-        return trimmed.to_string();
+    clamp_desc_to(s, MAX_DESC_UNITS)
+}
+fn title_with_uploader(title: &str, uploader: &str) -> String {
+    let title = if title.trim().is_empty() {
+        "未命名"
+    } else {
+        title.trim()
+    };
+    let uploader = uploader.split_whitespace().collect::<Vec<_>>().join(" ");
+    if uploader.is_empty()
+        || title.ends_with(&format!("-{uploader}"))
+        || title.ends_with(&format!(" - {uploader}"))
+    {
+        return clamp_chars(title, 80);
     }
-    let mut out = String::new();
-    let mut used = 0usize;
-    for c in trimmed.chars() {
-        let units = if c.is_ascii() { 1 } else { 2 };
-        if used + units + 2 > MAX_DESC_UNITS {
-            break;
+    let suffix = format!("-{uploader}");
+    let available = 80usize.saturating_sub(suffix.chars().count());
+    if available == 0 {
+        return clamp_chars(&uploader, 80);
+    }
+    format!("{}{suffix}", clamp_chars(title, available).trim_end())
+}
+fn source_description(body: &str, url: &str, uploader: &str) -> String {
+    let url = url.trim();
+    let uploader = uploader.trim();
+    let source = if !url.is_empty() {
+        let line = format!("原视频：{url}");
+        let prefix = "博主：";
+        let available = MAX_DESC_UNITS.saturating_sub(desc_units(&line) + 1 + desc_units(prefix));
+        if uploader.is_empty() || available == 0 {
+            clamped_desc(&line)
+        } else {
+            format!("{line}\n{prefix}{}", clamp_desc_to(uploader, available))
         }
-        out.push(c);
-        used += units;
+    } else if !uploader.is_empty() {
+        clamped_desc(&format!("博主：{uploader}"))
+    } else {
+        String::new()
+    };
+    let body = body.trim();
+    let lines = body.lines().collect::<Vec<_>>();
+    let mut i = 0;
+    let mut removed = false;
+    while let Some(line) = lines.get(i) {
+        let t = line.trim();
+        if t.starts_with("原视频：") || t.starts_with("原视频:") {
+            removed = true;
+            i += 1;
+            continue;
+        }
+        if removed
+            && (t.is_empty()
+                || ["博主：", "博主:", "作者：", "作者:", "UP：", "UP:"]
+                    .iter()
+                    .any(|p| t.starts_with(p)))
+        {
+            i += 1;
+            continue;
+        }
+        break;
     }
-    format!("{}…", out.trim_end())
+    let body = if removed {
+        lines[i..].join("\n").trim().to_owned()
+    } else {
+        body.to_owned()
+    };
+    if source.is_empty() {
+        return clamped_desc(&body);
+    }
+    let avail = MAX_DESC_UNITS.saturating_sub(desc_units(&source) + 2);
+    if body.is_empty() || avail == 0 {
+        return source;
+    }
+    let tail = clamp_desc_to(&body, avail);
+    if tail.is_empty() {
+        source
+    } else {
+        format!("{source}\n\n{tail}")
+    }
+}
+fn apply_source_rules(
+    meta: &mut Map<String, Value>,
+    title: &str,
+    body: &str,
+    url: &str,
+    uploader: &str,
+    profile: &Value,
+) {
+    let prefix = profile["publish_title_prefix"]
+        .as_str()
+        .unwrap_or("")
+        .trim();
+    let title = if title.trim().is_empty() {
+        meta.get("title")
+            .and_then(Value::as_str)
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or("未命名")
+    } else {
+        title.trim()
+    };
+    let title = if !prefix.is_empty() && !title.starts_with(prefix) {
+        format!("{prefix}{title}")
+    } else {
+        title.to_owned()
+    };
+    meta.insert("title".into(), json!(title_with_uploader(&title, uploader)));
+    if !body.trim().is_empty() || !url.trim().is_empty() {
+        meta.insert(
+            "desc".into(),
+            json!(source_description(body, url, uploader)),
+        );
+    }
+    let reprint = profile["publish_enable_reprint"].as_bool().unwrap_or(true);
+    meta.insert("copyright".into(), json!(if reprint { 2 } else { 1 }));
+    meta.insert(
+        "source".into(),
+        json!(if reprint { url.trim() } else { "" }),
+    );
 }
 fn tags_from_input(value: &Value) -> AppResult<Vec<String>> {
     let tags: Vec<String> = if let Some(raw) = value.as_str() {
@@ -224,9 +356,13 @@ async fn title_for(db: &Database, id: Uuid) -> AppResult<Option<String>> {
             .await?;
     let v1 = value.and_then(|v| {
         v.get("translated_title")
-            .or_else(|| v.get("source_title"))
             .and_then(Value::as_str)
             .filter(|s| !s.trim().is_empty())
+            .or_else(|| {
+                v.get("source_title")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.trim().is_empty())
+            })
             .map(str::to_owned)
     });
     if v1.is_some() {
@@ -237,22 +373,33 @@ async fn title_for(db: &Database, id: Uuid) -> AppResult<Option<String>> {
 async fn source_metadata(state: &AppState, id: Uuid) -> AppResult<Option<Value>> {
     let key: Option<String> = sqlx::query_scalar(
         "SELECT storage_key FROM assets WHERE task_id=$1 AND kind='metadata_json'::asset_kind
-         AND storage_key LIKE 'v2/%' ORDER BY created_at DESC,id DESC LIMIT 1",
+         ORDER BY created_at DESC,id DESC LIMIT 1",
     )
     .bind(id)
     .fetch_optional(&state.db.pool)
     .await?;
     let Some(key) = key else { return Ok(None) };
-    let path = state.storage.resolve_existing(&key).await?;
-    let bytes = tokio::fs::read(path).await?;
-    if bytes.len() > 2_000_000 {
-        return Err(AppError::Invalid(
-            "YouTube metadata exceeds read budget".into(),
-        ));
+    // Old metadata objects may have been cleaned up. Missing/corrupt
+    // optional metadata must not prevent using the task's source/title.
+    let Ok(path) = state.storage.resolve_existing(&key).await else {
+        return Ok(None);
+    };
+    let Ok(meta) = tokio::fs::metadata(&path).await else {
+        return Ok(None);
+    };
+    if meta.len() > 2_000_000 {
+        return Ok(None);
     }
-    let value: Value = serde_json::from_slice(&bytes)
-        .map_err(|_| AppError::Invalid("invalid cached YouTube metadata".into()))?;
-    Ok(if value.is_object() { Some(value) } else { None })
+    let Ok(bytes) = tokio::fs::read(path).await else {
+        return Ok(None);
+    };
+    if bytes.len() > 2_000_000 {
+        return Ok(None);
+    }
+    let Ok(value) = serde_json::from_slice::<Value>(&bytes) else {
+        return Ok(None);
+    };
+    Ok(value.is_object().then_some(value))
 }
 pub(crate) async fn automatic_draft(state: &AppState, id: Uuid) -> AppResult<Value> {
     if let Some(meta) = saved(&state.db, id).await? {
@@ -275,7 +422,12 @@ async fn build_draft(state: &AppState, id: Uuid, req: DraftRequest) -> AppResult
         ));
     }
     let task = read_task(&state.db, id).await?;
-    let configured = crate::settings::effective(&state.db, "publish.settings").await?;
+    let original = crate::settings::effective(&state.db, "bilibili.publish").await?;
+    let configured = if original["default_meta"].is_object() {
+        original
+    } else {
+        crate::settings::effective(&state.db, "publish.settings").await?
+    };
     let mut meta = configured
         .get("default_meta")
         .and_then(Value::as_object)
@@ -292,53 +444,34 @@ async fn build_draft(state: &AppState, id: Uuid, req: DraftRequest) -> AppResult
     }
     let use_source =
         req.mode == "source" || (req.mode == "auto" && stored.is_none() && req.meta.is_none());
-    if use_source {
-        let yt = source_metadata(state, id).await?;
+    if use_source && task.source_type == "youtube" {
+        let yt = source_metadata(state, id).await?.unwrap_or(Value::Null);
         let source_title = title_for(&state.db, id)
             .await?
-            .filter(|v| !v.trim().is_empty())
-            .or_else(|| {
-                yt.as_ref()
-                    .and_then(|v| v.get("title").and_then(Value::as_str))
-                    .map(str::to_owned)
-            });
-        if let Some(title) = source_title.filter(|v| !v.trim().is_empty()) {
-            let profile = crate::settings::effective(&state.db, "subtitle.auto_profile").await?;
-            let prefix = profile
-                .get("publish_title_prefix")
-                .and_then(Value::as_str)
-                .unwrap_or("");
-            let combined = if !prefix.is_empty() && !title.starts_with(prefix) {
-                format!("{prefix}{title}")
-            } else {
-                title
-            };
-            meta.insert(
-                "title".into(),
-                json!(combined.chars().take(80).collect::<String>()),
-            );
-        }
-        if let Some(source) = task.source_url.as_deref() {
-            // Source attribution is required for reposted content.
-            meta.insert("copyright".into(), json!(2));
-            meta.insert("source".into(), json!(source));
-            let desc = yt
-                .as_ref()
-                .and_then(|v| v.get("description").and_then(Value::as_str))
-                .unwrap_or("");
-            if !desc.is_empty()
-                && meta
-                    .get("desc")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .is_empty()
-            {
-                meta.insert(
-                    "desc".into(),
-                    json!(clamped_desc(&format!("{desc}\n\n原视频：{source}"))),
-                );
-            }
-        }
+            .or_else(|| yt["title"].as_str().map(str::to_owned))
+            .unwrap_or_default();
+        let original = task.source_url.as_deref().unwrap_or("");
+        let source = yt["webpage_url"]
+            .as_str()
+            .filter(|url| {
+                crate::ingest::youtube_video_id(url)
+                    .ok()
+                    .zip(crate::ingest::youtube_video_id(original).ok())
+                    .is_some_and(|(a, b)| a == b)
+            })
+            .unwrap_or(original);
+        let profile = crate::settings::effective(&state.db, "subtitle.auto_profile").await?;
+        apply_source_rules(
+            &mut meta,
+            &source_title,
+            yt["description"].as_str().unwrap_or(""),
+            source,
+            yt["uploader"]
+                .as_str()
+                .or_else(|| yt["channel"].as_str())
+                .unwrap_or(""),
+            &profile,
+        );
     }
     // Never invent a partition or a mission ID. A missing partition prevents
     // save/publish until the operator selects one.
@@ -436,6 +569,47 @@ pub fn router() -> Router<AppState> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn source_metadata_preserves_uploader_and_attribution_under_limits() {
+        let url = "https://youtu.be/0123456789A";
+        let mut meta = json!({"title":"default","desc":"old","tags":["技术"]})
+            .as_object()
+            .unwrap()
+            .clone();
+        let body = format!("原视频：old\n作者：old\n\n{}", "中".repeat(1500));
+        apply_source_rules(
+            &mut meta,
+            &"很长标题".repeat(40),
+            &body,
+            url,
+            "Some  Creator",
+            &json!({"publish_title_prefix":"【熟肉&中配】","publish_enable_reprint":true}),
+        );
+        let title = meta["title"].as_str().unwrap();
+        assert!(
+            title.starts_with("【熟肉&中配】")
+                && title.ends_with("-Some Creator")
+                && title.chars().count() <= 80
+        );
+        let desc = meta["desc"].as_str().unwrap();
+        assert!(desc.starts_with(&format!("原视频：{url}\n博主：Some  Creator\n\n")));
+        assert_eq!(desc.matches("原视频：").count(), 1);
+        assert!(desc_units(desc) <= MAX_DESC_UNITS);
+        assert_eq!(meta["copyright"], 2);
+        assert_eq!(meta["tags"], json!(["技术"]));
+        apply_source_rules(
+            &mut meta,
+            "Existing-Some Creator",
+            "",
+            url,
+            "Some Creator",
+            &json!({"publish_enable_reprint":false}),
+        );
+        assert_eq!(meta["title"], "Existing-Some Creator");
+        assert_eq!(meta["copyright"], 1);
+        assert_eq!(meta["source"], "");
+        assert!(meta["desc"].as_str().unwrap().starts_with("原视频："));
+    }
     #[test]
     fn metadata_validation_prevents_unreviewed_activity_and_bad_tags() {
         let valid = json!({"title":"测试","typeid":21,"tags":["视频分享"],"copyright":2,

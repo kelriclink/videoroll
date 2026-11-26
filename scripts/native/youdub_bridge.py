@@ -301,7 +301,15 @@ def main() -> None:
         result = create(a.video.resolve(), a.srt.resolve(),
                         direction=a.direction, task_id=a.task_id)
     elif a.status:
-        result = status(a.task_id)
+        try:
+            result = status(a.task_id)
+        except LookupError as exc:
+            # Preserve the original Python caller's exception contract.
+            # Only the Rust adapter explicitly opts into the typed exit code.
+            if os.getenv("VIDEOROLL_YOUDUB_STATUS_PROTOCOL") != "2" or str(exc) != f"Unknown YouDub task {str(uuid.UUID(a.task_id))}":
+                raise
+            print("VIDEOROLL_YOUDUB_TASK_NOT_FOUND", file=sys.stderr)
+            raise SystemExit(44) from None
     elif a.resume:
         result = resume(a.task_id)
     elif a.interrupt:

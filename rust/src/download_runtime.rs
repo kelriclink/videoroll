@@ -12,14 +12,14 @@ use crate::{
     youtube_settings_v1::{YoutubeRuntime, prepare_cookie_copy},
 };
 use futures_util::StreamExt;
-use serde_json::{Value, json};
 use sqlx::Row;
 use std::{
-    path::Path,
+    path::{Path, PathBuf},
     process::Stdio,
     time::{Duration, Instant},
 };
 use tokio::{
+    io::AsyncReadExt,
     process::Command,
     time::{interval, timeout},
 };
@@ -209,23 +209,279 @@ pub async fn active_progress(
     })
     .transpose()
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FailureKind {
+    FormatUnavailable,
+    Verification,
+    RateLimited,
+    Network,
+    Disk,
+    Other,
+}
+impl FailureKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::FormatUnavailable => "requested format is not available",
+            Self::Verification => "authentication or bot verification required",
+            Self::RateLimited => "upstream rate limited",
+            Self::Network => "network or incomplete transfer",
+            Self::Disk => "local storage write failed",
+            Self::Other => "unclassified extractor failure",
+        }
+    }
+}
+// Keep only the last 16 KiB in RAM to match a pattern across read boundaries.
+// Persist *only* fixed classifications; raw upstream error text can contain
+// signed URLs, proxy credentials and arbitrary cookie-like values.
+#[derive(Default)]
+struct DiagnosticTail {
+    tail: Vec<u8>,
+    format: bool,
+    verification: bool,
+    rate: bool,
+    network: bool,
+    disk: bool,
+}
+impl DiagnosticTail {
+    fn push(&mut self, bytes: &[u8]) {
+        self.tail.extend_from_slice(bytes);
+        if self.tail.len() > 16384 {
+            let drop = self.tail.len() - 16384;
+            self.tail.drain(..drop);
+        }
+        let t = String::from_utf8_lossy(&self.tail).to_ascii_lowercase();
+        self.format |= t.contains("requested format is not available");
+        self.verification |= [
+            "sign in",
+            "confirm you",
+            "login required",
+            "cookies are required",
+            "http error 401",
+        ]
+        .iter()
+        .any(|p| t.contains(p));
+        self.rate |= t.contains("http error 429") || t.contains("too many requests");
+        self.network |= [
+            "timed out",
+            "connection reset",
+            "incomplete read",
+            "bytes read",
+            "network is unreachable",
+            "unable to download",
+            "temporary failure in name resolution",
+        ]
+        .iter()
+        .any(|p| t.contains(p));
+        self.disk |= [
+            "no space left",
+            "read-only file system",
+            "disk quota exceeded",
+            "permission denied",
+        ]
+        .iter()
+        .any(|p| t.contains(p));
+    }
+    fn classify(&self) -> FailureKind {
+        if self.disk {
+            FailureKind::Disk
+        } else if self.verification {
+            FailureKind::Verification
+        } else if self.rate {
+            FailureKind::RateLimited
+        } else if self.format {
+            FailureKind::FormatUnavailable
+        } else if self.network {
+            FailureKind::Network
+        } else {
+            FailureKind::Other
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Backend {
+    Parallel,
+    Native,
+    TvAndroidWeb,
+    AndroidWeb,
+}
+impl Backend {
+    fn dir(self) -> &'static str {
+        match self {
+            Self::Parallel => "parallel",
+            Self::Native => "native",
+            Self::TvAndroidWeb => "native-tv-android-web",
+            Self::AndroidWeb => "native-android-web",
+        }
+    }
+    fn client(self) -> Option<&'static str> {
+        match self {
+            Self::TvAndroidWeb => Some("youtube:player_client=tv,android_sdkless,web"),
+            Self::AndroidWeb => Some("youtube:player_client=android,web"),
+            _ => None,
+        }
+    }
+    fn fallback(self, error: FailureKind, compat: bool) -> Option<Self> {
+        match self {
+            Self::Parallel
+                if !matches!(
+                    error,
+                    FailureKind::Disk | FailureKind::Verification | FailureKind::RateLimited
+                ) =>
+            {
+                Some(Self::Native)
+            }
+            Self::Native if !compat && error == FailureKind::FormatUnavailable => {
+                Some(Self::TvAndroidWeb)
+            }
+            Self::TvAndroidWeb if !compat && error == FailureKind::FormatUnavailable => {
+                Some(Self::AndroidWeb)
+            }
+            _ => None,
+        }
+    }
+}
 pub async fn run(
+    config: &Config,
+    db: &Database,
+    scheduler: &Scheduler,
+    job: &WorkItem,
+    root: &Path,
+    url: &str,
+) -> AppResult<PathBuf> {
+    let settings = crate::youtube_settings_v1::runtime(db, config).await?;
+    let cookies = prepare_cookie_copy(config, &settings).await?;
+    let parallel_args = prepare_args(&config.download_binary, &settings, true).await;
+    let mut backend = if parallel_args.iter().any(|v| v == "http,https:aria2c") {
+        Backend::Parallel
+    } else {
+        Backend::Native
+    };
+    let native_args = prepare_args(&config.download_binary, &settings, false).await;
+    // A retry may already have completed the fallback directory. Check
+    // all owned backend paths before starting another upstream transfer.
+    let mut recovered = Vec::new();
+    for candidate in [
+        Backend::Parallel,
+        Backend::Native,
+        Backend::TvAndroidWeb,
+        Backend::AndroidWeb,
+    ] {
+        let dir = root.join(candidate.dir());
+        match tokio::fs::symlink_metadata(&dir).await {
+            Ok(meta) if !meta.file_type().is_dir() => {
+                return Err(AppError::Conflict(
+                    "download backend path is not a real directory".into(),
+                ));
+            }
+            Ok(_) => {
+                if let Some(path) = crate::ingest::find_finished_video(config, &dir).await? {
+                    recovered.push(path);
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    if recovered.len() > 1 {
+        return Err(AppError::Conflict(
+            "multiple completed backend outputs require reconciliation".into(),
+        ));
+    }
+    if let Some(path) = recovered.pop() {
+        return Ok(path);
+    }
+    loop {
+        if !scheduler.heartbeat(job).await? {
+            return Err(AppError::Conflict("download lease lost".into()));
+        }
+        // Each downloader/client has independent partials. Never delete
+        // another attempt's bytes or reuse aria2 fragments with native yt-dlp.
+        let dir = root.join(backend.dir());
+        tokio::fs::create_dir_all(&dir).await?;
+        if !tokio::fs::symlink_metadata(&dir)
+            .await?
+            .file_type()
+            .is_dir()
+        {
+            return Err(AppError::Conflict(
+                "download backend directory is unsafe".into(),
+            ));
+        }
+        if let Some(path) = crate::ingest::find_finished_video(config, &dir).await? {
+            return Ok(path);
+        }
+        let mut args = if backend == Backend::Parallel {
+            parallel_args.clone()
+        } else {
+            native_args.clone()
+        };
+        if let Some(client) = backend.client() {
+            args.extend(["--extractor-args".into(), client.into()]);
+        }
+        tracing::info!(job_id=%job.id,backend=backend.dir(),"starting isolated download attempt");
+        match run_attempt(
+            config,
+            db,
+            scheduler,
+            job,
+            &dir.join("source.%(ext)s"),
+            url,
+            args,
+            &settings,
+            cookies.as_ref(),
+        )
+        .await?
+        {
+            None => {
+                return crate::ingest::find_finished_video(config, &dir)
+                    .await?
+                    .ok_or_else(|| {
+                        AppError::Unavailable("yt-dlp returned no valid completed media".into())
+                    });
+            }
+            Some(error) => {
+                if let Some(next) = backend.fallback(error, settings.compatibility) {
+                    record(
+                        db,
+                        job,
+                        &Progress {
+                            downloaded_bytes: 0,
+                            total_bytes: None,
+                            speed_bytes_per_second: None,
+                            eta_seconds: None,
+                            percent: 0,
+                        },
+                    )
+                    .await?;
+                    backend = next;
+                } else {
+                    return Err(AppError::Unavailable(format!(
+                        "yt-dlp {}: {}",
+                        backend.dir(),
+                        error.label()
+                    )));
+                }
+            }
+        }
+    }
+}
+async fn run_attempt(
     config: &Config,
     db: &Database,
     scheduler: &Scheduler,
     job: &WorkItem,
     output: &Path,
     url: &str,
-) -> AppResult<Value> {
-    let settings = crate::youtube_settings_v1::runtime(db, config).await?;
+    mut args: Vec<String>,
+    settings: &YoutubeRuntime,
+    cookies: Option<&tempfile::TempDir>,
+) -> AppResult<Option<FailureKind>> {
     let binary = &config.download_binary;
-    let cookies = prepare_cookie_copy(config, &settings).await?;
-    let mut args = prepare_args(binary, &settings, true).await;
     if let Some(proxy) = settings.proxy.as_deref() {
         args.push("--proxy".into());
         args.push(proxy.into());
     }
-    if let Some(ref secret) = cookies {
+    if let Some(secret) = cookies {
         args.push("--cookies".into());
         args.push(
             secret
@@ -248,13 +504,20 @@ pub async fn run(
         .args(&args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .kill_on_drop(true);
     let mut child = command.spawn()?;
     let stdout = child
         .stdout
         .take()
         .ok_or_else(|| AppError::Unavailable("yt-dlp progress stdout unavailable".into()))?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| AppError::Unavailable("yt-dlp diagnostics unavailable".into()))?;
+    let mut diagnostics = DiagnosticTail::default();
+    let mut errbuf = [0u8; 4096];
+    let mut stderr_closed = false;
     // Hard-cap each line; output from remote extractors is untrusted.
     let mut lines = FramedRead::new(stdout, LinesCodec::new_with_max_length(8192));
     let mut heartbeat = interval(Duration::from_secs(30));
@@ -280,15 +543,23 @@ pub async fn run(
                     None=>has_closed=true,
                 }
             },
+            read=stderr.read(&mut errbuf),if !stderr_closed=>{
+                match read{Ok(0)=>stderr_closed=true,Ok(n)=>diagnostics.push(&errbuf[..n]),Err(_)=>stderr_closed=true}
+            },
             res=child.wait()=>{
                 let status=res?;
                 if !status.success(){
-                    return Err(AppError::Unavailable(format!(
-                        "yt-dlp exited with status {}; inspect task worker diagnostics",status.code().unwrap_or(-1)
-                    )));
+                    // Child exited: drain its remaining stderr, never store raw
+                    // URLs, cookies, proxy credentials or remote text in logs.
+                    let _=timeout(Duration::from_secs(2),async{
+                        while !stderr_closed{match stderr.read(&mut errbuf).await{Ok(0)|Err(_)=>break,Ok(n)=>diagnostics.push(&errbuf[..n])}}
+                    }).await;
+                    let kind=diagnostics.classify();
+                    tracing::warn!(job_id=%job.id,exit_code=status.code().unwrap_or(-1),category=kind.label(),"yt-dlp attempt failed");
+                    return Ok(Some(kind));
                 }
                 if let Some(p)=last_p.as_ref(){record(db,job,p).await?;}
-                return Ok(json!({"tool":"yt-dlp","resumed":true}));
+                return Ok(None);
             },
             _=heartbeat.tick()=>{
                 if !scheduler.heartbeat(job).await?{
@@ -301,6 +572,174 @@ pub async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn download_fallback_real_postgres_and_process() {
+        let Ok(url) = std::env::var("VIDEOROLL_TEST_DOWNLOAD_DB_URL") else {
+            return;
+        };
+        let parsed = reqwest::Url::parse(&url).unwrap();
+        assert_eq!(parsed.host_str(), Some("127.0.0.1"));
+        assert_eq!(parsed.path(), "/videoroll_test");
+        let db = Database::connect(&url).await.unwrap();
+        sqlx::raw_sql("CREATE TABLE vr2_workflows(id uuid PRIMARY KEY,state text);
+            CREATE TABLE vr2_jobs(id uuid PRIMARY KEY,workflow_id uuid,task_id uuid,lease_token uuid,state text,stage text,lease_until timestamptz,updated_at timestamptz);
+            CREATE TABLE app_settings(key text PRIMARY KEY,value_json jsonb);
+            CREATE TABLE tasks(id uuid PRIMARY KEY,runtime_owner text,download_stage_job_id uuid,download_stage_bytes bigint,download_stage_total_bytes bigint,download_stage_speed float8,download_stage_eta_seconds int,download_stage_percent smallint,download_stage_updated_at timestamptz);")
+            .execute(&db.pool).await.unwrap();
+        sqlx::query("INSERT INTO app_settings VALUES('youtube.settings',$1)")
+            .bind(serde_json::json!({"parallel_download_enabled":false,"cookies_enabled":false,"compatibility_mode_enabled":false}))
+            .execute(&db.pool).await.unwrap();
+        let job = WorkItem {
+            id: uuid::Uuid::new_v4(),
+            workflow_id: uuid::Uuid::new_v4(),
+            task_id: uuid::Uuid::new_v4(),
+            stage: crate::domain::Stage::Download,
+            generation: 1,
+            operation_key: "test-download".into(),
+            lease_token: uuid::Uuid::new_v4(),
+            attempts: 1,
+            max_attempts: 3,
+            payload: serde_json::json!({}),
+        };
+        sqlx::query("INSERT INTO tasks(id,runtime_owner) VALUES($1,'rust')")
+            .bind(job.task_id)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO vr2_workflows VALUES($1,'running')")
+            .bind(job.workflow_id)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO vr2_jobs VALUES($1,$2,$3,$4,'running','download',now()+interval '10 minutes',now())")
+            .bind(job.id).bind(job.workflow_id).bind(job.task_id).bind(job.lease_token).execute(&db.pool).await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let sample = dir.path().join("fixture.mp4");
+        let status = Command::new("/usr/bin/ffmpeg")
+            .args([
+                "-nostdin",
+                "-v",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=s=160x120:r=10",
+                "-t",
+                "1",
+                "-c:v",
+                "libx264",
+                "-threads",
+                "1",
+                "-pix_fmt",
+                "yuv420p",
+            ])
+            .arg(&sample)
+            .status()
+            .await
+            .unwrap();
+        assert!(status.success());
+        let mock = dir.path().join("fake-yt-dlp");
+        let script = r#"#!/usr/bin/python3
+import pathlib,sys,shutil
+args=sys.argv[1:]
+root=pathlib.Path(__file__).parent
+out=pathlib.Path(args[args.index('-o')+1]).parent
+with (root/'calls').open('a') as f:f.write(out.name+'\n')
+if '--extractor-args' not in args:
+    (out/'source.mp4.part').write_bytes(b'resumable-native-partial')
+    print('ERROR: Requested format is not available. secret credential',file=sys.stderr)
+    sys.exit(1)
+assert args[args.index('--extractor-args')+1]=='youtube:player_client=tv,android_sdkless,web'
+shutil.copyfile(root/'fixture.mp4',out/'source.mp4')
+print('[download] vr2|100|100|NA|1000|0|100.0%')
+"#;
+        tokio::fs::write(&mock, script).await.unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        tokio::fs::set_permissions(&mock, std::fs::Permissions::from_mode(0o700))
+            .await
+            .unwrap();
+        let mut config = Config::from_env().unwrap();
+        config.download_binary = mock;
+        config.ffprobe_binary = "/usr/bin/ffprobe".into();
+        let scheduler = Scheduler::new(db.clone(), Duration::from_secs(180));
+        let root = dir.path().join("transfer");
+        tokio::fs::create_dir(&root).await.unwrap();
+        let result = run(
+            &config,
+            &db,
+            &scheduler,
+            &job,
+            &root,
+            "https://youtu.be/0123456789A",
+        )
+        .await
+        .unwrap();
+        assert_eq!(result, root.join("native-tv-android-web/source.mp4"));
+        assert_eq!(
+            tokio::fs::read(root.join("native/source.mp4.part"))
+                .await
+                .unwrap(),
+            b"resumable-native-partial"
+        );
+        assert_eq!(
+            tokio::fs::read(&result).await.unwrap(),
+            tokio::fs::read(&sample).await.unwrap()
+        );
+        let recovered = run(
+            &config,
+            &db,
+            &scheduler,
+            &job,
+            &root,
+            "https://youtu.be/0123456789A",
+        )
+        .await
+        .unwrap();
+        assert_eq!(recovered, result);
+        assert_eq!(
+            tokio::fs::read_to_string(dir.path().join("calls"))
+                .await
+                .unwrap(),
+            "native\nnative-tv-android-web\n"
+        );
+        println!(
+            "PASS real PostgreSQL lease, subprocess format fallback, independent partial, FFprobe validation, no replay of finished fallback"
+        );
+    }
+    #[test]
+    fn downloader_fallback_only_on_safe_categories() {
+        assert_eq!(
+            Backend::Parallel.fallback(FailureKind::Network, false),
+            Some(Backend::Native)
+        );
+        assert_eq!(
+            Backend::Native.fallback(FailureKind::FormatUnavailable, false),
+            Some(Backend::TvAndroidWeb)
+        );
+        assert_eq!(
+            Backend::TvAndroidWeb.fallback(FailureKind::FormatUnavailable, false),
+            Some(Backend::AndroidWeb)
+        );
+        assert_eq!(
+            Backend::Native.fallback(FailureKind::FormatUnavailable, true),
+            None
+        );
+        assert_eq!(Backend::Native.fallback(FailureKind::Network, false), None);
+        assert_eq!(
+            Backend::Parallel.fallback(FailureKind::RateLimited, false),
+            None
+        );
+        let mut tail = DiagnosticTail::default();
+        tail.push(b"secret proxy user:password requested format is not ");
+        tail.push(b"available");
+        tail.push(&vec![b'x'; 20000]);
+        assert!(tail.tail.len() <= 16384);
+        assert_eq!(tail.classify(), FailureKind::FormatUnavailable);
+        tail.push(b"HTTP Error 429");
+        assert_eq!(tail.classify(), FailureKind::RateLimited);
+        assert!(!tail.classify().label().contains("password"));
+    }
     #[test]
     fn bounded_progress_parser_is_strict() {
         let p = parse_progress("vr2|1200|6000|NA|2500.0|2| 20.0%").unwrap();

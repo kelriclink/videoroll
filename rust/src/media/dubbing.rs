@@ -10,6 +10,7 @@ use serde_json::{Value, json};
 use std::{
     path::{Path, PathBuf},
     process::Stdio,
+    time::Duration,
 };
 use tokio::{fs, process::Command};
 use uuid::Uuid;
@@ -74,6 +75,42 @@ fn parse_json_stdout(output: &[u8]) -> AppResult<Value> {
         "YouDub adapter did not return JSON".into(),
     ))
 }
+async fn active_lease(db: &Database, job: &WorkItem) -> AppResult<()> {
+    let active:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM vr2_jobs j JOIN vr2_workflows w ON w.id=j.workflow_id WHERE j.id=$1 AND j.lease_token=$2 AND j.state='running' AND j.lease_until>now() AND w.state='running')")
+        .bind(job.id).bind(job.lease_token).fetch_one(&db.pool).await?;
+    if !active {
+        return Err(AppError::Conflict("YouDub lease lost".into()));
+    }
+    Ok(())
+}
+async fn gpu_slot(runtime: &Path, db: &Database, job: &WorkItem) -> AppResult<std::fs::File> {
+    fs::create_dir_all(runtime).await?;
+    // This is the same per-runtime flock used by the old Python adapter.
+    // Never hold a SQL transaction during GPU admission or inference.
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(runtime.join(".videoroll-native-gpu.lock"))?;
+    use std::os::fd::AsRawFd;
+    loop {
+        active_lease(db, job).await?;
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(file);
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::WouldBlock {
+            return Err(error.into());
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+}
+fn missing_task(error: &AppError) -> bool {
+    // Only an explicit missing task response authorizes creation. Do not
+    // treat SQLite busy, transport, permission or malformed JSON as absent.
+    matches!(error,AppError::NotFound(message) if message=="YouDub task absent")
+}
 async fn command(config: &Config, runtime: &Path, args: &[&str]) -> AppResult<Value> {
     let python = config
         .youdub_python
@@ -87,12 +124,19 @@ async fn command(config: &Config, runtime: &Path, args: &[&str]) -> AppResult<Va
         .arg(bridge)
         .args(args)
         .env("VIDEOROLL_YOUDUB_RUNTIME", runtime)
+        .env("VIDEOROLL_YOUDUB_STATUS_PROTOCOL", "2")
         .stdin(Stdio::null())
         .kill_on_drop(true)
         .output()
         .await?;
     if !result.status.success() {
         let error = String::from_utf8_lossy(&result.stderr);
+        if args.first() == Some(&"--status")
+            && result.status.code() == Some(44)
+            && error.trim() == "VIDEOROLL_YOUDUB_TASK_NOT_FOUND"
+        {
+            return Err(AppError::NotFound("YouDub task absent".into()));
+        }
         return Err(AppError::Unavailable(format!(
             "YouDub bridge exited with {}: {}",
             result.status,
@@ -153,18 +197,101 @@ pub async fn process(
     let id = native_id.to_string();
     let dest_key = format!("v2/dubbing/{}/{}.mp4", job.task_id, job.id);
     let dest = registry.resolve_existing(&dest_key).await?;
-    if fs::metadata(&dest).await.is_ok() && probe_video(&config.ffprobe_binary, &dest).await.is_ok()
-    {
-        return ensure_task_asset(db, registry, job.task_id, job, "video_dubbed", &dest_key).await;
+    let existing=sqlx::query("SELECT source_video_key,source_srt_key,output_video_key,model_job_id FROM vr2_dubbing_runs WHERE job_id=$1")
+        .bind(job.id).fetch_optional(&db.pool).await?;
+    use sqlx::Row;
+    if let Some(proof) = existing.as_ref() {
+        if proof.try_get::<String, _>("source_video_key")? != video_key
+            || proof.try_get::<String, _>("source_srt_key")? != srt_key
+            || proof.try_get::<String, _>("output_video_key")? != dest_key
+            || proof.try_get::<Uuid, _>("model_job_id")? != native_id
+        {
+            return Err(AppError::Conflict(
+                "YouDub source or receipt changed; cannot reuse output".into(),
+            ));
+        }
+        if fs::metadata(&dest).await.is_ok()
+            && probe_video(&config.ffprobe_binary, &dest).await.is_ok()
+        {
+            let expected:Option<String>=sqlx::query_scalar("SELECT sha256 FROM assets WHERE task_id=$1 AND kind::text='video_dubbed' AND storage_key=$2 ORDER BY created_at DESC LIMIT 1")
+                .bind(job.task_id).bind(&dest_key).fetch_optional(&db.pool).await?.flatten();
+            let actual = registry.sha256(&dest_key).await?.0;
+            if expected
+                .as_ref()
+                .is_some_and(|v| v.eq_ignore_ascii_case(&actual))
+            {
+                active_lease(db, job).await?;
+                let outcome =
+                    ensure_task_asset(db, registry, job.task_id, job, "video_dubbed", &dest_key)
+                        .await?;
+                return Ok(json!({"native_id":native_id,"video_key":dest_key,"result":outcome}));
+            }
+            return Err(AppError::Conflict(
+                "YouDub output checksum is absent or mismatched".into(),
+            ));
+        }
     }
+    let _gpu = gpu_slot(runtime, db, job).await?;
+    active_lease(db, job).await?;
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent).await?;
     }
     // The dedicated v2 runtime is persistent, and can resume YouDub stages.
     command(config, runtime, &["--prepare"]).await?;
+    // Keep the input identity durable across creation, interrupted copies,
+    // retries and native status recovery. Never attach an old model result
+    // to a changed subtitle/source just because the workflow UUID matches.
+    let source_pin = json!({
+        "schema":1,"native_id":native_id,"video_key":video_key,"srt_key":srt_key,
+        "video_sha256":registry.sha256(&video_key).await?.0,
+        "srt_sha256":registry.sha256(&srt_key).await?.0
+    });
+    let pin_dir = runtime.join(".videoroll-source-pins");
+    fs::create_dir_all(&pin_dir).await?;
+    let pin = pin_dir.join(format!("{id}.json"));
+    let pinned = match fs::read(&pin).await {
+        Ok(bytes) => {
+            let previous: Value = serde_json::from_slice(&bytes)
+                .map_err(|_| AppError::Conflict("YouDub source pin is invalid".into()))?;
+            if previous != source_pin {
+                return Err(AppError::Conflict(
+                    "YouDub input changed after native task creation".into(),
+                ));
+            }
+            true
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => return Err(e.into()),
+    };
     let state = match command(config, runtime, &bridge_args("--status", &id)).await {
-        Ok(value) => value,
-        Err(_) => {
+        Ok(value) if pinned || existing.is_some() => value,
+        Ok(_) => {
+            return Err(AppError::Conflict(
+                "unproven historical YouDub task; reconcile source receipt before reuse".into(),
+            ));
+        }
+        Err(error) if missing_task(&error) => {
+            if existing.is_some() {
+                return Err(AppError::Conflict(
+                    "previously confirmed YouDub task is absent".into(),
+                ));
+            }
+            if !pinned {
+                let temporary = pin.with_extension(format!("{}.partial", Uuid::new_v4()));
+                let bytes = serde_json::to_vec(&source_pin)
+                    .map_err(|_| AppError::Invalid("YouDub source pin encode failed".into()))?;
+                {
+                    use tokio::io::AsyncWriteExt;
+                    let mut file = fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(&temporary)
+                        .await?;
+                    file.write_all(&bytes).await?;
+                    file.sync_all().await?;
+                }
+                fs::rename(&temporary, &pin).await?;
+            }
             let video = video
                 .to_str()
                 .ok_or_else(|| AppError::Invalid("YouDub video path is not UTF-8".into()))?;
@@ -188,6 +315,7 @@ pub async fn process(
             )
             .await?
         }
+        Err(error) => return Err(error),
     };
     let status = state.get("status").and_then(Value::as_str).unwrap_or("");
     let final_result = match status {
@@ -227,7 +355,27 @@ pub async fn process(
     let file = fs::OpenOptions::new().read(true).open(&temp).await?;
     file.sync_all().await?;
     drop(file);
-    fs::rename(temp, &dest).await?;
+    active_lease(db, job).await?;
+    if let Ok(meta) = fs::metadata(&dest).await {
+        // A prior worker may have copied the exact native result and died
+        // before writing its proof. Compare actual bytes, not existence.
+        // Use registry relative path with the actual extension replacement.
+        let partial_key = Path::new(&dest_key)
+            .with_extension("partial")
+            .to_string_lossy()
+            .into_owned();
+        let same = meta.len() == fs::metadata(&temp).await?.len()
+            && registry.sha256(&dest_key).await?.0 == registry.sha256(&partial_key).await?.0;
+        if !same {
+            let _ = fs::remove_file(&temp).await;
+            return Err(AppError::Conflict(
+                "existing YouDub output differs from recovered native receipt".into(),
+            ));
+        }
+        fs::remove_file(&temp).await?;
+    } else {
+        fs::rename(temp, &dest).await?;
+    }
     let outcome =
         ensure_task_asset(db, registry, job.task_id, job, "video_dubbed", &dest_key).await?;
     sqlx::query(
@@ -237,7 +385,9 @@ pub async fn process(
             dubbing_model_status='succeeded',dubbing_run_created_at=now(),updated_at=now()
           WHERE id=$1 AND workflow_id=$2 AND task_id=$3
             AND runtime_engine='rust-v2' AND stage='dubbing'
-            AND dubbing_model_status IS NULL",
+            AND dubbing_model_status IS NULL
+            AND EXISTS(SELECT 1 FROM vr2_jobs j JOIN vr2_workflows w ON w.id=j.workflow_id
+                WHERE j.id=$1 AND j.lease_token=$8 AND j.state='running' AND j.lease_until>now() AND w.state='running')",
     )
     .bind(job.id)
     .bind(job.workflow_id)
@@ -246,6 +396,7 @@ pub async fn process(
     .bind(&srt_key)
     .bind(&dest_key)
     .bind(native_id)
+    .bind(job.lease_token)
     .execute(&db.pool)
     .await?;
     // Completed dubbing is an immutable proof for the selected subtitle and
@@ -260,7 +411,6 @@ pub async fn process(
     .ok_or_else(|| {
         AppError::Conflict("native YouDub operation no longer owns dubbing evidence".into())
     })?;
-    use sqlx::Row;
     if proof.try_get::<String, _>("source_video_key")? != video_key
         || proof.try_get::<String, _>("source_srt_key")? != srt_key
         || proof.try_get::<String, _>("output_video_key")? != dest_key
@@ -275,6 +425,18 @@ pub async fn process(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn only_explicit_absence_allows_native_create() {
+        assert!(missing_task(&AppError::NotFound(
+            "YouDub task absent".into()
+        )));
+        assert!(!missing_task(&AppError::Unavailable(
+            "SQLite database locked".into()
+        )));
+        assert!(!missing_task(&AppError::Unavailable(
+            "Unknown YouDub task".into()
+        )));
+    }
     #[test]
     fn requires_dedicated_external_runtime() {
         assert!(ensure_isolated_runtime(Path::new("/DATA/youdub-runtime")).is_err());
