@@ -542,7 +542,7 @@ fn external_text_chunks(text: &str, max_chars: usize) -> Vec<String> {
     for unit in bounded {
         let candidate = merged
             .last()
-            .map(|last| format!("{last}{unit}"))
+            .map(|last| format!("{last} {unit}"))
             .unwrap_or_else(|| unit.clone());
         if !merged.is_empty() && candidate.chars().count() > max_chars {
             merged.push(unit)
@@ -575,136 +575,150 @@ fn external_whisper_response(
         .unwrap_or("")
         .trim()
         .to_owned();
-    let raw_segments = payload.get("segments").and_then(Value::as_array);
     let mut segments = Vec::new();
-    if let Some(raw_segments) = raw_segments {
-        let mut words = Vec::new();
-        for item in raw_segments {
-            let Some(raw_words) = item.get("words").and_then(Value::as_array) else {
-                continue;
-            };
-            for raw in raw_words {
-                let Some(text) = raw
+    let raw_segments = payload.get("segments").and_then(Value::as_array);
+    let parse_words = |raw: &Value| -> Vec<ExternalWhisperWord> {
+        raw.as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|word| {
+                let text = word
                     .get("word")
                     .and_then(Value::as_str)
-                    .filter(|s| !s.trim().is_empty())
-                else {
-                    continue;
-                };
-                let start = raw.get("start").and_then(Value::as_f64).unwrap_or(-1.0);
-                let end = raw.get("end").and_then(Value::as_f64).unwrap_or(-1.0);
-                if start.is_finite()
-                    && end.is_finite()
-                    && end > start
-                    && audio_duration.is_finite()
-                    && audio_duration > 0.0
-                {
-                    let start = start.max(0.0).min(audio_duration);
-                    let end = end.max(0.0).min(audio_duration);
-                    if end > start {
-                        words.push(ExternalWhisperWord {
-                            start,
-                            end,
-                            text: text.to_owned(),
-                        });
-                    }
-                }
-            }
-        }
-        if !words.is_empty() {
-            words.sort_by(|a, b| a.start.total_cmp(&b.start).then(a.end.total_cmp(&b.end)));
-            let mut current: Vec<ExternalWhisperWord> = Vec::new();
-            let emit = |group: &mut Vec<ExternalWhisperWord>, out: &mut Vec<AsrSegment>| {
-                if group.is_empty() {
-                    return;
-                }
-                let text = join_external_words(group);
-                if !text.is_empty() {
-                    out.push(AsrSegment {
-                        start: group[0].start,
-                        end: group.last().unwrap().end,
-                        text,
-                        no_speech_prob: None,
-                        avg_logprob: None,
-                        compression_ratio: None,
-                    })
-                }
-                group.clear();
-            };
-            for word in words {
-                if !current.is_empty() {
-                    let gap = (word.start - current.last().unwrap().end).max(0.0);
-                    let duration = current.last().unwrap().end - current[0].start;
-                    let text = join_external_words(&current);
-                    let next_chars = text.chars().count() + word.text.chars().count();
-                    if (gap >= 0.8 && duration >= 0.8)
-                        || terminal_asr_punctuation(&text)
-                        || duration >= max_seconds
-                        || next_chars > max_chars
-                    {
-                        emit(&mut current, &mut segments);
-                    }
-                }
-                current.push(word);
-            }
-            emit(&mut current, &mut segments);
-        } else {
-            for item in raw_segments {
-                let Ok(segment) = serde_json::from_value::<AsrSegment>(item.clone()) else {
-                    continue;
-                };
-                let text = segment.text.trim().to_owned();
-                if text.is_empty()
-                    || !segment.start.is_finite()
-                    || !segment.end.is_finite()
+                    .filter(|s| !s.trim().is_empty())?;
+                let start = word.get("start")?.as_f64()?;
+                let end = word.get("end")?.as_f64()?;
+                if !start.is_finite()
+                    || !end.is_finite()
                     || !audio_duration.is_finite()
                     || audio_duration <= 0.0
                 {
-                    continue;
+                    return None;
                 }
-                let start = segment.start.max(0.0).min(audio_duration);
-                let end = segment.end.max(0.0).min(audio_duration);
-                if end <= start {
-                    continue;
+                let start = start.clamp(0.0, audio_duration);
+                let end = end.clamp(0.0, audio_duration);
+                (end > start).then(|| ExternalWhisperWord {
+                    start,
+                    end,
+                    text: text.to_owned(),
+                })
+            })
+            .collect()
+    };
+    let regroup = |mut words: Vec<ExternalWhisperWord>,
+                   quality: Option<&AsrSegment>,
+                   out: &mut Vec<AsrSegment>| {
+        words.sort_by(|a, b| a.start.total_cmp(&b.start).then(a.end.total_cmp(&b.end)));
+        let mut group: Vec<ExternalWhisperWord> = Vec::new();
+        let emit = |group: &mut Vec<ExternalWhisperWord>, out: &mut Vec<AsrSegment>| {
+            if group.is_empty() {
+                return;
+            }
+            let text = join_external_words(group);
+            if !text.is_empty() {
+                out.push(AsrSegment {
+                    start: group[0].start,
+                    end: group.iter().map(|w| w.end).fold(0.0, f64::max),
+                    text,
+                    no_speech_prob: quality.and_then(|q| q.no_speech_prob),
+                    avg_logprob: quality.and_then(|q| q.avg_logprob),
+                    compression_ratio: quality.and_then(|q| q.compression_ratio),
+                });
+            }
+            group.clear();
+        };
+        for word in words {
+            if !group.is_empty() {
+                let end = group.iter().map(|w| w.end).fold(0.0, f64::max);
+                let duration = end - group[0].start;
+                let text = join_external_words(&group);
+                let next_chars = text.chars().count() + word.text.chars().count() + 1;
+                if ((word.start - end) >= 0.8 && duration >= 0.8)
+                    || terminal_asr_punctuation(&text)
+                    || word.end.max(end) - group[0].start > max_seconds
+                    || next_chars > max_chars
+                {
+                    emit(&mut group, out);
                 }
-                if end - start <= max_seconds * 2.0 && text.chars().count() <= max_chars * 2 {
-                    segments.push(AsrSegment {
-                        start,
-                        end,
-                        text,
-                        ..segment
-                    });
-                    continue;
-                }
-                let chunks = external_text_chunks(&text, max_chars);
-                let weights = chunks
-                    .iter()
-                    .map(|chunk| chunk.chars().filter(|c| !c.is_whitespace()).count().max(1))
-                    .collect::<Vec<_>>();
-                let total = weights.iter().sum::<usize>().max(1);
-                let duration = end - start;
-                let mut consumed = 0usize;
-                let mut cursor = start;
-                for (index, chunk) in chunks.into_iter().enumerate() {
-                    consumed += weights[index];
-                    let end = if index + 1 == weights.len() {
-                        end
-                    } else {
-                        (start + duration * (consumed as f64 / total as f64)).min(end)
-                    };
-                    segments.push(AsrSegment {
-                        start: cursor,
-                        end: end.max(cursor),
-                        text: chunk,
-                        no_speech_prob: segment.no_speech_prob,
-                        avg_logprob: segment.avg_logprob,
-                        compression_ratio: segment.compression_ratio,
-                    });
-                    cursor = end;
-                }
+            }
+            group.push(word);
+        }
+        emit(&mut group, out);
+    };
+    let fallback = |item: &Value, out: &mut Vec<AsrSegment>| {
+        let Ok(segment) = serde_json::from_value::<AsrSegment>(item.clone()) else {
+            return;
+        };
+        let text = segment.text.trim().to_owned();
+        if text.is_empty()
+            || !segment.start.is_finite()
+            || !segment.end.is_finite()
+            || !audio_duration.is_finite()
+            || audio_duration <= 0.0
+        {
+            return;
+        }
+        let start = segment.start.max(0.0).min(audio_duration);
+        let end = segment.end.max(0.0).min(audio_duration);
+        if end <= start {
+            return;
+        }
+        if end - start <= max_seconds * 2.0 && text.chars().count() <= max_chars * 2 {
+            out.push(AsrSegment {
+                start,
+                end,
+                text,
+                ..segment
+            });
+            return;
+        }
+        let chunks = external_text_chunks(&text, max_chars);
+        let weights = chunks
+            .iter()
+            .map(|chunk| chunk.chars().filter(|c| !c.is_whitespace()).count().max(1))
+            .collect::<Vec<_>>();
+        let total = weights.iter().sum::<usize>().max(1);
+        let duration = end - start;
+        let mut consumed = 0usize;
+        let mut cursor = start;
+        for (index, chunk) in chunks.into_iter().enumerate() {
+            consumed += weights[index];
+            let end = if index + 1 == weights.len() {
+                end
+            } else {
+                (start + duration * (consumed as f64 / total as f64)).min(end)
+            };
+            out.push(AsrSegment {
+                start: cursor,
+                end: end.max(cursor),
+                text: chunk,
+                no_speech_prob: segment.no_speech_prob,
+                avg_logprob: segment.avg_logprob,
+                compression_ratio: segment.compression_ratio,
+            });
+            cursor = end;
+        }
+    };
+    // A provider may return both word-timed and segment-only captions.
+    // Never discard the latter merely because one other segment has words.
+    // Retain quality metadata on each group, for correlated hallucination filtering.
+    if let Some(rows) = raw_segments {
+        for item in rows {
+            let words = parse_words(&item["words"]);
+            if words.is_empty() {
+                fallback(item, &mut segments);
+            } else {
+                let quality = serde_json::from_value::<AsrSegment>(item.clone()).ok();
+                regroup(words, quality.as_ref(), &mut segments);
             }
         }
     }
+    // Top-level word timing is used only when no usable segment timing exists;
+    // mixing two alternative representations would duplicate captions.
+    if segments.is_empty() {
+        regroup(parse_words(&payload["words"]), None, &mut segments);
+    }
+    segments.sort_by(|a, b| a.start.total_cmp(&b.start).then(a.end.total_cmp(&b.end)));
     if segments.is_empty() && !top_text.is_empty() {
         if audio_duration > max_seconds {
             return Err(AppError::Unavailable("external Whisper returned text without segment/word timestamps; subtitle timeline is unavailable".into()));
@@ -1974,12 +1988,20 @@ pub(crate) async fn process(
     };
     let (window, overlap) = if config.cloudflare_asr {
         (30., 0.)
+    } else if config
+        .asr_endpoint
+        .as_deref()
+        .and_then(|v| Url::parse(v).ok())
+        .is_some_and(|v| v.host_str() == Some("api.groq.com"))
+    {
+        (WINDOW, 5.0)
     } else {
         (WINDOW, OVERLAP)
     };
     let asr_identity = fingerprint(&json!({
-        "checkpoint_version":2,"video_sha256":source_digest,
+        "checkpoint_version":3,"video_sha256":source_digest,
         "model":config.asr_model,"asr_endpoint":config.asr_endpoint,"local_asr":config.local_asr,
+        "asr_request_options":config.asr_request_options,
         "language":profile.asr_language,"duration_ms":(duration*1000.0).round() as u64,
         "window_seconds":window,"overlap_seconds":overlap,"cloudflare_asr":config.cloudflare_asr
     }))?;
@@ -1994,8 +2016,9 @@ pub(crate) async fn process(
     let workspace = registry.resolve_existing(&format!("{prefix}/work")).await?;
     fs::create_dir_all(&workspace).await?;
     let stride = window - overlap;
-    let count = (duration / stride).ceil() as usize;
+    let count = 1 + ((duration - window).max(0.0) / stride).ceil() as usize;
     let mut cues = Vec::new();
+    let used_source_captions = preferred.is_some();
     if let Some((source, final_cues)) = &recovered {
         cues = final_cues.as_ref().unwrap_or(source).clone();
     } else if let Some(captions) = preferred {
@@ -2024,7 +2047,7 @@ pub(crate) async fn process(
                 .ok()
                 .and_then(|raw| serde_json::from_slice::<Checkpoint>(&raw).ok())
                 .filter(|row| {
-                    row.revision == 2
+                    row.revision == 3
                         && row.offset_ms == offset_ms
                         && row.fingerprint == asr_identity
                 });
@@ -2076,24 +2099,19 @@ pub(crate) async fn process(
                     }
                 }
                 let _ = fs::remove_file(&flac).await;
-                let keep_after = if index == 0 {
-                    0
-                } else {
-                    offset_ms + (overlap * 500.0) as u64
-                };
+                // Retain the full overlap. Midpoint clipping loses continuing
+                // utterances and genuine repetitions before reconciliation.
                 let result = normalize_asr(
                     result.ok_or_else(|| AppError::Unavailable("ASR returned no result".into()))?,
                     offset_ms,
-                    keep_after,
+                    0,
                     (duration * 1000.0) as u64,
                 )?;
-                if config.cloudflare_asr {
-                    selective_lease(db, job).await?;
-                }
+                selective_lease(db, job).await?;
                 atomic_write(
                     &checkpoint,
                     &serde_json::to_vec(&Checkpoint {
-                        revision: 2,
+                        revision: 3,
                         fingerprint: asr_identity.clone(),
                         offset_ms,
                         cues: result.clone(),
@@ -2106,11 +2124,8 @@ pub(crate) async fn process(
             cues.extend(rows);
         }
     }
-    if recovered.is_none() {
-        cues.sort_by_key(|cue| cue.start_ms);
-        cues.dedup_by(|a, b| {
-            a.text.eq_ignore_ascii_case(&b.text) && a.start_ms.abs_diff(b.start_ms) < 800
-        });
+    if recovered.is_none() && !used_source_captions {
+        cues = crate::media::asr_overlap::reconcile(cues);
     }
     if cues.is_empty() {
         return Ok(json!({"no_speech":true,"reason":"no_credible_segments"}));
@@ -2936,6 +2951,41 @@ mod tests {
         assert_eq!(response.segments[0].text, "Hello world.");
         assert_eq!(response.segments[1].text, "Again now.");
         assert!(response.segments[0].start >= 0.0 && response.segments[1].end <= 3.0);
+    }
+    #[test]
+    fn external_whisper_mixed_timing_preserves_all_segments_and_quality() {
+        let payload = json!({"segments":[
+            {"start":0.0,"end":2.0,"text":"first segment","words":[{"word":"first","start":0.1,"end":0.7},{"word":" segment","start":0.8,"end":1.5}],"no_speech_prob":0.9,"avg_logprob":-2.0},
+            {"start":2.0,"end":4.0,"text":"second segment"},
+            {"start":4.0,"end":5.0,"text":"third segment","words":[{"word":"bad","start":5.0,"end":4.0}]}
+        ]});
+        let response = external_whisper_response(payload, &json!({}), 6.0).unwrap();
+        assert_eq!(response.segments.len(), 3);
+        assert_eq!(response.segments[0].no_speech_prob, Some(0.9));
+        let normalized = normalize_asr(response, 0, 0, 6000).unwrap();
+        assert_eq!(
+            normalized
+                .iter()
+                .map(|c| c.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["second segment", "third segment"]
+        );
+    }
+    #[test]
+    fn external_whisper_top_words_and_projected_duration() {
+        let response = external_whisper_response(
+            json!({"text":"one two three","words":[
+                {"word":"one","start":0.0,"end":0.6},
+                {"word":" two","start":0.7,"end":1.5},
+                {"word":" three","start":1.6,"end":2.5}
+            ]}),
+            &json!({"max_segment_seconds":2}),
+            3.0,
+        )
+        .unwrap();
+        assert_eq!(response.segments.len(), 2);
+        assert_eq!(response.segments[0].text, "one two");
+        assert_eq!(response.segments[1].text, "three");
     }
     #[test]
     fn external_whisper_text_without_timestamps_is_not_given_fake_long_timeline() {
