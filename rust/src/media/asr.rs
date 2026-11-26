@@ -12,6 +12,7 @@ use reqwest::{Client, Url, multipart};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use sqlx::{Connection, PgConnection, PgPool};
 use std::{path::Path, process::Stdio, time::Duration};
 use tokio::{fs, process::Command, time::sleep};
 use uuid::Uuid;
@@ -323,31 +324,60 @@ async fn cloudflare_slot(
         sleep(Duration::from_millis(250)).await;
     }
 }
-async fn external_whisper_slot(
-    db: &Database,
-    job: &WorkItem,
-    cap: i32,
-) -> AppResult<sqlx::Transaction<'static, sqlx::Postgres>> {
-    let cap = cap.clamp(1, 8);
+// A dedicated connection owns the session lock. Never return a locked
+// session to the shared query pool, even when the caller is canceled.
+// Do not keep an idle transaction open across the upstream HTTP request.
+async fn try_external_whisper_slot(pool: &PgPool, cap: i32) -> AppResult<Option<PgConnection>> {
+    let options = pool.connect_options();
+    let mut connection = tokio::time::timeout(
+        Duration::from_secs(10),
+        PgConnection::connect_with(&options),
+    )
+    .await
+    .map_err(|_| AppError::Unavailable("external Whisper admission connection timeout".into()))??;
+    // PostgreSQL >= 16 is required by VideoRoll. Only this dedicated
+    // session is exempted from the idle-session timeout.
+    sqlx::query("SET idle_session_timeout = 0")
+        .execute(&mut connection)
+        .await?;
+    for slot in 0..cap.clamp(1, 8) {
+        let held: bool = sqlx::query_scalar(
+            "SELECT pg_try_advisory_lock(hashtextextended('videoroll:asr:external-whisper:'||$1::text,0))"
+        ).bind(slot).fetch_one(&mut connection).await?;
+        if held {
+            return Ok(Some(connection));
+        }
+    }
+    // Dropping a raw PgConnection closes the socket; there is no pool return.
+    Ok(None)
+}
+async fn external_whisper_slot(db: &Database, job: &WorkItem, cap: i32) -> AppResult<PgConnection> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(3600);
+    let mut delay = Duration::from_millis(250);
     loop {
         selective_lease(db, job).await?;
-        let mut tx = db.pool.begin().await?;
-        for slot in 0..cap {
-            let held:bool=sqlx::query_scalar("SELECT pg_try_advisory_xact_lock(hashtextextended('videoroll:asr:external-whisper:'||$1::text,0))")
-                .bind(slot).fetch_one(&mut *tx).await?;
-            if held {
-                return Ok(tx);
-            }
+        if let Some(connection) = try_external_whisper_slot(&db.pool, cap).await? {
+            return Ok(connection);
         }
-        tx.rollback().await?;
         if tokio::time::Instant::now() >= deadline {
             return Err(AppError::Unavailable(
                 "external Whisper admission timeout".into(),
             ));
         }
-        sleep(Duration::from_millis(250)).await;
+        sleep(delay).await;
+        delay = (delay * 2).min(Duration::from_secs(1));
     }
+}
+// Check that the dedicated connection is still alive during long upstream
+// requests. Loss of ownership terminates the local request; the provider
+// may still be processing a request already accepted remotely.
+async fn check_external_whisper_admission(connection: &mut PgConnection) -> AppResult<()> {
+    tokio::time::timeout(Duration::from_secs(5), connection.ping())
+        .await
+        .map_err(|_| {
+            AppError::Unavailable("external Whisper admission connection lost".into())
+        })??;
+    Ok(())
 }
 fn external_whisper_fields(
     model: &str,
@@ -721,7 +751,7 @@ async fn run_external_whisper(
         .and_then(Value::as_i64)
         .unwrap_or(1)
         .clamp(1, 8) as i32;
-    let slot = external_whisper_slot(db, job, max_concurrency).await?;
+    let mut slot = external_whisper_slot(db, job, max_concurrency).await?;
     let mut extended = true;
     let mut connect_attempt = 0_u8;
     loop {
@@ -747,7 +777,8 @@ async fn run_external_whisper(
         if let Some(key) = config.asr_api_key.as_ref() {
             request = request.bearer_auth(key);
         }
-        let result = crate::ai_usage::chat_json(
+        check_external_whisper_admission(&mut slot).await?;
+        let attempt = crate::ai_usage::chat_json(
             db,
             request,
             parsed_endpoint,
@@ -756,11 +787,20 @@ async fn run_external_whisper(
             Some(job.task_id),
             MAX_BYTES,
             "ASR",
-        )
-        .await;
+        );
+        tokio::pin!(attempt);
+        let result = loop {
+            tokio::select! {
+                result = &mut attempt => break result,
+                _ = sleep(Duration::from_secs(10)) => {
+                    check_external_whisper_admission(&mut slot).await?;
+                    selective_lease(db, job).await?;
+                }
+            }
+        };
         match result {
             Ok(body) => {
-                slot.rollback().await?;
+                drop(slot);
                 selective_lease(db, job).await?;
                 return external_whisper_response(
                     body,
@@ -789,7 +829,7 @@ async fn run_external_whisper(
                 sleep(delay).await;
             }
             Err(error) => {
-                slot.rollback().await?;
+                drop(slot);
                 selective_lease(db, job).await?;
                 return Err(error);
             }
@@ -2577,6 +2617,233 @@ mod tests {
                 .unwrap()
                 .segments
                 .is_empty()
+        );
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn external_whisper_real_postgres_http_admission() {
+        use axum::{
+            Router, body::Bytes, extract::State, http::StatusCode, response::IntoResponse,
+            routing::post,
+        };
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let Ok(url) = std::env::var("VIDEOROLL_TEST_EXTERNAL_WHISPER_DB_URL") else {
+            return;
+        };
+        let parsed = Url::parse(&url).unwrap();
+        assert_eq!(parsed.host_str(), Some("127.0.0.1"));
+        assert_eq!(parsed.path(), "/videoroll_test");
+        let db = Database::connect(&url).await.unwrap();
+        // Dedicated, empty test database; never reuse a production schema.
+        sqlx::raw_sql("CREATE TABLE vr2_workflows(id uuid PRIMARY KEY,state text);
+            CREATE TABLE vr2_jobs(id uuid PRIMARY KEY,workflow_id uuid,lease_token uuid,state text,lease_until timestamptz);
+            CREATE TABLE app_settings(key text PRIMARY KEY,value_json jsonb);
+            CREATE TABLE ai_usage_events(id uuid PRIMARY KEY,task_id uuid,provider text,model text,operation text,
+                success bool,status_code int,input_tokens int,output_tokens int,total_tokens int,latency_ms int,
+                estimated_cost_microusd bigint,error_type text,error_message text);")
+            .execute(&db.pool).await.unwrap();
+        let idle_ms: String = sqlx::query_scalar("SHOW idle_in_transaction_session_timeout")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            idle_ms, "100ms",
+            "test server must impose the old lock failure condition"
+        );
+        // Test the real PostgreSQL lock even after the server would have
+        // terminated an idle transaction, and cancellation/socket drop.
+        let mut first = try_external_whisper_slot(&db.pool, 1)
+            .await
+            .unwrap()
+            .unwrap();
+        sleep(Duration::from_millis(350)).await;
+        assert!(
+            try_external_whisper_slot(&db.pool, 1)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        check_external_whisper_admission(&mut first).await.unwrap();
+        let mut second = try_external_whisper_slot(&db.pool, 2)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            try_external_whisper_slot(&db.pool, 2)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let backend: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut second)
+            .await
+            .unwrap();
+        assert!(
+            sqlx::query_scalar::<_, bool>("SELECT pg_terminate_backend($1)")
+                .bind(backend)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap()
+        );
+        assert!(check_external_whisper_admission(&mut second).await.is_err());
+        drop(second);
+        drop(first);
+        for _ in 0..100 {
+            if let Some(c) = try_external_whisper_slot(&db.pool, 1).await.unwrap() {
+                drop(c);
+                break;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+        #[derive(Default)]
+        struct Counts {
+            active: AtomicUsize,
+            peak: AtomicUsize,
+            extended: AtomicUsize,
+            portable: AtomicUsize,
+        }
+        struct Active(Arc<Counts>);
+        impl Drop for Active {
+            fn drop(&mut self) {
+                self.0.active.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+        async fn provider(State(counts): State<Arc<Counts>>, body: Bytes) -> impl IntoResponse {
+            let active = counts.active.fetch_add(1, Ordering::SeqCst) + 1;
+            let _guard = Active(counts.clone());
+            counts.peak.fetch_max(active, Ordering::SeqCst);
+            let body = String::from_utf8_lossy(&body);
+            assert!(body.contains("name=\"file\"") && body.contains("name=\"model\""));
+            let extended = body.contains("name=\"word_timestamps\"");
+            sleep(Duration::from_millis(400)).await;
+            if extended {
+                counts.extended.fetch_add(1, Ordering::SeqCst);
+                (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    axum::Json(json!({"error":"extension unsupported"})),
+                )
+            } else {
+                counts.portable.fetch_add(1, Ordering::SeqCst);
+                (
+                    StatusCode::OK,
+                    axum::Json(
+                        json!({"text":"Hello world.","segments":[{"start":0.1,"end":1.0,"text":"Hello world."}]}),
+                    ),
+                )
+            }
+        }
+        let counts = Arc::new(Counts::default());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = format!(
+            "http://{}/v1/audio/transcriptions",
+            listener.local_addr().unwrap()
+        );
+        let server = tokio::spawn(
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/v1/audio/transcriptions", post(provider))
+                    .with_state(counts.clone()),
+            )
+            .into_future(),
+        );
+        let fixture = tempfile::tempdir().unwrap();
+        let audio = fixture.path().join("audio.flac");
+        fs::write(&audio, b"mock audio; no real provider")
+            .await
+            .unwrap();
+        let mut config = Config::from_env().unwrap();
+        config.asr_model = "whisper-test".into();
+        config.asr_api_key = None;
+        config.asr_request_options = Some(json!({"max_concurrency":2}));
+        let client = Client::builder().no_proxy().build().unwrap();
+        let endpoint = Url::parse(&target).unwrap();
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let job = WorkItem {
+                id: Uuid::new_v4(),
+                workflow_id: Uuid::new_v4(),
+                task_id: Uuid::new_v4(),
+                stage: crate::domain::Stage::Subtitle,
+                generation: 1,
+                operation_key: Uuid::new_v4().to_string(),
+                lease_token: Uuid::new_v4(),
+                attempts: 1,
+                max_attempts: 3,
+                payload: json!({}),
+            };
+            sqlx::query("INSERT INTO vr2_workflows VALUES($1,'running')")
+                .bind(job.workflow_id)
+                .execute(&db.pool)
+                .await
+                .unwrap();
+            sqlx::query(
+                "INSERT INTO vr2_jobs VALUES($1,$2,$3,'running',now()+interval '10 minutes')",
+            )
+            .bind(job.id)
+            .bind(job.workflow_id)
+            .bind(job.lease_token)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+            let (db, client, config, audio, target, endpoint) = (
+                db.clone(),
+                client.clone(),
+                config.clone(),
+                audio.clone(),
+                target.clone(),
+                endpoint.clone(),
+            );
+            handles.push(tokio::spawn(async move {
+                run_external_whisper(
+                    &db, &job, &client, &config, &audio, "en", &target, &endpoint, 2.0,
+                )
+                .await
+                .unwrap()
+            }));
+        }
+        for handle in handles {
+            let response = handle.await.unwrap();
+            assert_eq!(response.segments[0].text, "Hello world.");
+        }
+        assert_eq!(counts.peak.load(Ordering::SeqCst), 2);
+        assert_eq!(counts.extended.load(Ordering::SeqCst), 4);
+        assert_eq!(counts.portable.load(Ordering::SeqCst), 4);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM ai_usage_events")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap(),
+            8
+        );
+        // A canceled future must close the dedicated session, not poison the pool.
+        let pool = db.pool.clone();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let holder = tokio::spawn(async move {
+            let _lock = try_external_whisper_slot(&pool, 1).await.unwrap().unwrap();
+            tx.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+        rx.await.unwrap();
+        holder.abort();
+        let _ = holder.await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            if let Some(lock) = try_external_whisper_slot(&db.pool, 1).await.unwrap() {
+                drop(lock);
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "canceled session lock did not release"
+            );
+            sleep(Duration::from_millis(25)).await;
+        }
+        server.abort();
+        println!(
+            "PASS real PostgreSQL advisory session slots, idle transaction timeout, backend termination, four concurrent HTTP jobs (peak 2), 422 fallback, eight usage records, cancellation recovery"
         );
     }
     #[test]

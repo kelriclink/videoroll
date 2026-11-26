@@ -24,7 +24,7 @@
 
 Rust `external-whisper` 请求复用原 `subtitle.asr` 设置，向 OpenAI-compatible `/v1/audio/transcriptions` 发送 `verbose_json`、语言、temperature、beam_size、batch_size、word_timestamps、VAD 阈值/静音/填充、previous-text 条件及 no-speech/log-prob/compression 阈值。仅在扩展字段遭遇 HTTP 400/422 时重试一次 portable OpenAI 字段；连接错误最多 4 次指数退避，所有请求 attempt 仍经过 `ai_usage` 记录。
 
-`external_whisper_max_concurrency`（1–8，默认 1）使用 PostgreSQL transaction advisory slot。等待时立即回滚事务，不占用连接；获得 slot 后在请求期间持有 transaction lock，结束后释放。ASR word timestamps 会按 12 秒/120 字默认上限重新组合，并裁剪到音频 chunk 时长。
+`external_whisper_max_concurrency`（1–8，默认 1）使用独立 PostgreSQL session advisory slot（直接连接真实 PostgreSQL，不支持事务池模式的代理）。等待时关闭未获得锁的独立连接，获得 slot 后不保留空闲事务；本地调用完成、超时、取消或连接断开后关闭专用连接释放锁，不返回业务连接池。请求期间每 10 秒检查锁连接与任务租约，连接故障终止本地请求。ASR word timestamps 会按 12 秒/120 字默认上限重新组合，并裁剪到音频 chunk 时长。
 
 ## 双模型常驻池专项验收（2026-11-26）
 
@@ -32,3 +32,10 @@ Rust `external-whisper` 请求复用原 `subtitle.asr` 设置，向 OpenAI-compa
 - GPU 锁文件专项：3 项通过，包括 OpenVINO GPU 与 openvino:GPU、CUDA 与 CUDA:0 的归一化。
 - 真实离线语音合成素材，原本地模型只读加载，未访问生产数据库：OpenVINO GPU ASR 冷/热 51.640/1.311 秒；OpenVINO CPU BGE 冷/热 2.214/0.0094 秒；faster-whisper CPU INT8 冷/热 34.452/12.897 秒。验证 GPU ASR 与 CPU Embedding 同时驻留、交替调用复用原进程及相同输出，另一个 Rust 进程争用 GPU 准入槽位时超时，切换 CPU ASR 后释放原 GPU 锁、保留 CPU Embedding。真实专项共 104.81 秒，测试通过。
 - 真实专项使用 GPU 空闲 120 秒防止长冷启动测量干扰生命周期断言；生产默认 GPU 空闲 30 秒，CPU 空闲 300 秒。未验证多 GPU 同时常驻或跨角色长期公平性，未提升默认 GPU admission slots。
+
+
+## External Whisper 并发锁专项验收（2026-11-26）
+
+使用全新 PostgreSQL 18 容器（idle_in_transaction_session_timeout=100ms）和 loopback 模拟 Whisper HTTP 服务。4 个请求任务、cap=2，实际最大同时 HTTP 调用数为 2；模拟 422 拒绝扩展字段后 4 次 portable 重试全部成功，8 条 AI 用量记录齐全。实际数据库会话锁跨越空闲事务超时仍有效，终止锁连接可检测失败，取消持锁任务可重新获取锁。容器及专属卷已删除。
+
+可复现：`rust/scripts/test-external-whisper-isolated.sh`（要求本地 Docker 及已存在的 pgvector/pgvector:pg18 镜像）。不访问生产数据或真实 Whisper 服务。请求被上游接受后，即使本地连接中断也无法保证第三方立即终止推理；Python 旧 Redis 准入与 Rust PostgreSQL 准入不共用，不能把两套调度器同时运行视为统一并发限制。

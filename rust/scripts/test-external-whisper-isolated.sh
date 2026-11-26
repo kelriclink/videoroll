@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$0")/.."
+# Build first so the disposable database is not kept open during compilation.
+cargo test --lib media::asr::tests::external_whisper_real_postgres_http_admission --no-run
+name="vr2-whisper-test-$(python3 -c 'import uuid;print(uuid.uuid4().hex[:12])')"
+volume="$name-db"
+tmp="$(mktemp -d)"
+cleanup() {
+  docker rm -f "$name" >/dev/null 2>&1 || true
+  rm -rf -- "$tmp"
+  docker volume rm "$volume" >/dev/null
+}
+docker volume create --label io.videoroll.purpose=isolated-whisper "$volume" >/dev/null
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+docker run -d --rm --pull=never --name "$name" --memory=512m \
+  --mount "type=volume,source=$volume,target=/var/lib/postgresql" \
+  -p 127.0.0.1::5432 -e POSTGRES_PASSWORD=videoroll-test-only \
+  -e POSTGRES_DB=videoroll_test pgvector/pgvector:pg18 \
+  -c idle_in_transaction_session_timeout=100ms >/dev/null
+for i in $(seq 1 60); do
+  if docker logs "$name" 2>&1 | grep -q 'PostgreSQL init process complete; ready for start up' &&
+     docker exec "$name" pg_isready -U postgres -d videoroll_test >/dev/null 2>&1; then
+    break
+  fi
+  sleep 1
+done
+docker exec "$name" psql -At -U postgres -d videoroll_test -c 'SELECT 1' | grep -qx 1
+port="$(docker port "$name" 5432/tcp | awk -F: '/^127.0.0.1:/ {print $NF}')"
+[[ "$port" =~ ^[0-9]+$ ]]
+export VIDEOROLL_TEST_EXTERNAL_WHISPER_DB_URL="postgresql://postgres:videoroll-test-only@127.0.0.1:$port/videoroll_test"
+export DATABASE_URL="$VIDEOROLL_TEST_EXTERNAL_WHISPER_DB_URL"
+export VIDEOROLL_V2_STORAGE_ROOT="$tmp" VIDEOROLL_V2_INTERNAL_TOKEN=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+cargo test --lib media::asr::tests::external_whisper_real_postgres_http_admission -- --nocapture
