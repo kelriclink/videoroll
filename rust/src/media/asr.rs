@@ -1024,43 +1024,373 @@ async fn atomic_write(path: &Path, body: &[u8]) -> AppResult<()> {
     }
     outcome
 }
-fn parse_translation(content: &str, count: usize) -> AppResult<Vec<String>> {
+fn parse_translation_partial(content: &str, count: usize) -> AppResult<Vec<String>> {
     let parsed: Value = serde_json::from_str(content.trim())
         .map_err(|_| AppError::Unavailable("translation is not a JSON object".into()))?;
     let entries = parsed
         .get("items")
         .and_then(Value::as_array)
         .ok_or_else(|| AppError::Unavailable("translation item mapping absent".into()))?;
-    if entries.len() != count {
+    if entries.len() > count {
         return Err(AppError::Unavailable(
             "translation output count mismatch".into(),
         ));
     }
-    let mut output = vec![None::<String>; count];
+    let mut output = vec![String::new(); count];
+    let mut seen = std::collections::BTreeSet::new();
     for item in entries {
-        let index = item
-            .get("i")
-            .and_then(Value::as_u64)
-            .ok_or_else(|| AppError::Unavailable("translation mapping index absent".into()))?
-            as usize;
-        let value = item
-            .get("text")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .trim();
-        if index >= count || value.is_empty() || output[index].is_some() {
+        let index = item["i"]
+            .as_u64()
+            .and_then(|v| usize::try_from(v).ok())
+            .filter(|i| *i < count)
+            .ok_or_else(|| {
+                AppError::Unavailable("translation mapping index absent or out of range".into())
+            })?;
+        if !seen.insert(index) {
             return Err(AppError::Unavailable(
-                "translation mapping has duplicate or missing IDs".into(),
+                "translation mapping has duplicate IDs".into(),
             ));
         }
-        output[index] = Some(value.chars().take(6000).collect());
+        if let Some(text) = item["text"].as_str() {
+            output[index] = text.trim().chars().take(6000).collect();
+        }
     }
-    output
-        .into_iter()
-        .map(|v| v.ok_or_else(|| AppError::Unavailable("missing translation".into())))
-        .collect()
+    Ok(output)
 }
+#[cfg(test)]
+fn parse_translation(content: &str, count: usize) -> AppResult<Vec<String>> {
+    let rows = parse_translation_partial(content, count)?;
+    if rows.iter().any(String::is_empty) {
+        return Err(AppError::Unavailable("missing translation".into()));
+    }
+    Ok(rows)
+}
+fn check_translation_prompt_budget(
+    provider: &crate::providers::TranslationProvider,
+    payload: &Value,
+) -> AppResult<()> {
+    let Some(window) = provider.context_window else {
+        return Ok(());
+    };
+    let output = provider
+        .max_output_tokens
+        .map(|n| n.min(8192))
+        .unwrap_or((window / 4).clamp(512, 4096));
+    let budget = window.saturating_sub(output).saturating_sub(512);
+    let estimate = payload["messages"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|m| m["content"].as_str())
+        .map(|s| s.chars().count().max(s.len().div_ceil(2)) as u64)
+        .sum::<u64>();
+    if estimate > budget {
+        return Err(AppError::Unavailable(format!(
+            "translation prompt exceeds context budget: estimated {estimate}, input budget {budget}, context {window}"
+        )));
+    }
+    Ok(())
+}
+fn can_shrink_translation(error: &AppError) -> bool {
+    match error {
+        AppError::Upstream(e) => e.is_timeout() || e.is_connect() || e.is_request() || e.is_body(),
+        AppError::Unavailable(message) => {
+            let format = [
+                "translation is not a JSON object",
+                "translation item mapping absent",
+                "translation output count mismatch",
+                "translation mapping",
+                "translation content missing",
+                "translation JSON invalid",
+                "translation prompt exceeds context budget",
+                "translation repair mapping absent",
+                "translation repair omitted rows",
+                "translation repair returned unexpected",
+                "invalid translation repair",
+                "translation repair content missing",
+            ];
+            format.iter().any(|prefix| message.starts_with(prefix))
+                || [
+                    " HTTP 408",
+                    " HTTP 413",
+                    " HTTP 502",
+                    " HTTP 503",
+                    " HTTP 504",
+                ]
+                .iter()
+                .any(|code| message.contains(code))
+        }
+        _ => false,
+    }
+}
+fn missing_runs(rows: &[String], start: usize, end: usize) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let mut i = start;
+    while i < end {
+        if !rows[i].is_empty() {
+            i += 1;
+            continue;
+        }
+        let a = i;
+        while i < end && rows[i].is_empty() {
+            i += 1;
+        }
+        out.push((a, i));
+    }
+    out
+}
+fn sub_batch_context(parent: &Value, start: usize, end: usize, summary: &str) -> Value {
+    let mut context = parent.clone();
+    if !context.is_object() {
+        return context;
+    }
+    let constraints = parent["translation_constraints"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|row| {
+            let mut item = row.clone();
+            let ids = row["applies_to_blocks"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_u64)
+                .filter(|id| *id > start as u64 && *id <= end as u64)
+                .map(|id| id - start as u64)
+                .collect::<Vec<_>>();
+            if ids.is_empty() {
+                return None;
+            }
+            item["applies_to_blocks"] = json!(ids);
+            Some(item)
+        })
+        .collect::<Vec<_>>();
+    context["translation_constraints"] = json!(constraints);
+    let global = parent
+        .pointer("/context/batch/segment_start")
+        .and_then(Value::as_u64)
+        .unwrap_or(1);
+    if context["context"].is_object() {
+        context["context"]["batch"]["segment_start"] = json!(global + start as u64);
+        context["context"]["batch"]["segment_end"] = json!(global + end as u64 - 1);
+        if let Some(scene) = context["context"]["scene"].as_object_mut() {
+            let offset = scene
+                .get("batch_offset")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            scene.insert("batch_offset".into(), json!(offset + start as u64));
+            scene.insert("batch_count".into(), json!(end - start));
+        }
+        if !summary.is_empty() {
+            context["context"]["running_summary"] = json!(summary);
+        }
+    }
+    if let Some(examples) = parent["translation_examples"].as_array() {
+        context["translation_examples"] = json!(
+            examples
+                .iter()
+                .filter(|row| {
+                    row["applies_to_blocks"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_u64)
+                        .any(|id| id >= global + start as u64 && id < global + end as u64)
+                })
+                .collect::<Vec<_>>()
+        );
+    }
+    context
+}
+#[derive(Debug, Serialize, Deserialize)]
+struct PartialTranslation {
+    revision: u32,
+    fingerprint: String,
+    rows: Vec<String>,
+    update: Value,
+    summary: String,
+}
+async fn persist_partial_translation(
+    db: &Database,
+    job: &WorkItem,
+    checkpoint: Option<(&Path, &str)>,
+    partial: &PartialTranslation,
+) -> AppResult<()> {
+    selective_lease(db, job).await?;
+    if let Some((path, _)) = checkpoint {
+        atomic_write(
+            path,
+            &serde_json::to_vec(partial).map_err(|_| {
+                AppError::Invalid("partial translation checkpoint encoding failed".into())
+            })?,
+        )
+        .await?;
+    }
+    Ok(())
+}
+/// Recover only missing rows and shrink failed batches, never re-request rows
+/// already stored in the fingerprinted checkpoint. All final quality checks
+/// still run in the original caller, including hard glossary constraints.
 async fn translate_batch(
+    db: &Database,
+    job: &WorkItem,
+    client: &Client,
+    provider: &crate::providers::TranslationProvider,
+    profile: &SubtitleProfile,
+    batch: &[SubtitleCue],
+    research_context: &str,
+    batch_context: Option<&Value>,
+    enable_summary: bool,
+    checkpoint: Option<(&Path, &str)>,
+) -> AppResult<(Vec<String>, Value, String)> {
+    let mut partial = PartialTranslation {
+        revision: 1,
+        fingerprint: checkpoint.map(|(_, id)| id.to_owned()).unwrap_or_default(),
+        rows: vec![String::new(); batch.len()],
+        update: Value::Null,
+        summary: String::new(),
+    };
+    if let Some((path, id)) = checkpoint {
+        if fs::metadata(path)
+            .await
+            .is_ok_and(|m| m.len() <= 8 * 1024 * 1024)
+        {
+            if let Ok(bytes) = fs::read(path).await {
+                if let Ok(saved) = serde_json::from_slice::<PartialTranslation>(&bytes) {
+                    if saved.revision == 1
+                        && saved.fingerprint == id
+                        && saved.rows.len() == batch.len()
+                        && saved.rows.iter().all(|s| s.chars().count() <= 6000)
+                    {
+                        partial = saved;
+                    }
+                }
+            }
+        }
+    }
+    let mut pending = std::collections::VecDeque::from(missing_runs(&partial.rows, 0, batch.len()));
+    // Bounded binary subdivision plus one targeted repair per attempted subset.
+    let mut remaining = batch.len().saturating_mul(4).max(1);
+    while let Some((start, end)) = pending.pop_front() {
+        if remaining == 0 {
+            return Err(AppError::Unavailable(
+                "translation subdivision budget exhausted".into(),
+            ));
+        }
+        remaining -= 1;
+        selective_lease(db, job).await?;
+        let context = batch_context.map(|v| sub_batch_context(v, start, end, &partial.summary));
+        let result = translate_batch_once(
+            db,
+            job.task_id,
+            client,
+            provider,
+            profile,
+            &batch[start..end],
+            research_context,
+            context.as_ref(),
+            enable_summary,
+        )
+        .await;
+        let (mut values, update, summary) = match result {
+            Ok(v) => v,
+            Err(e) if end - start > 1 && can_shrink_translation(&e) => {
+                let mid = start + (end - start) / 2;
+                pending.push_front((mid, end));
+                pending.push_front((start, mid));
+                tracing::warn!(job_id=%job.id,batch=end-start,"translation batch reduced after recoverable error");
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
+        let scene = context
+            .as_ref()
+            .and_then(|v| v.pointer("/context/scene/scene_id"))
+            .and_then(Value::as_u64)
+            .unwrap_or(1);
+        if update.is_object() {
+            partial.update = crate::media::translation_context::merge_context(
+                &partial.update,
+                &update,
+                &batch[start..end],
+                scene,
+            );
+        }
+        if enable_summary && !summary.is_empty() {
+            partial.summary = summary;
+        }
+        for (i, text) in values.iter().enumerate() {
+            if !text.is_empty() {
+                partial.rows[start + i] = text.clone();
+            }
+        }
+        persist_partial_translation(db, job, checkpoint, &partial).await?;
+        let issues = values
+            .iter()
+            .enumerate()
+            .filter(|(_, v)| v.is_empty())
+            .map(|(i, _)| json!({"idx":i+1,"type":"missing_translation","severity":"error"}))
+            .collect::<Vec<_>>();
+        if !issues.is_empty() {
+            let constraints = context
+                .as_ref()
+                .map(|c| c["translation_constraints"].clone())
+                .unwrap_or_else(|| {
+                    crate::media::translation_quality::constraints(
+                        &batch[start..end],
+                        &profile.translate_glossary,
+                        &Value::Null,
+                    )
+                });
+            match repair_translation(
+                db,
+                job,
+                client,
+                provider,
+                profile,
+                &batch[start..end],
+                &values,
+                &constraints,
+                &issues,
+            )
+            .await
+            {
+                Ok(repaired) => values = repaired,
+                Err(e) if can_shrink_translation(&e) => {
+                    tracing::warn!(job_id=%job.id,missing=issues.len(),"targeted translation repair failed; reducing missing subset");
+                }
+                Err(e) => return Err(e),
+            }
+            for (i, text) in values.into_iter().enumerate() {
+                if !text.is_empty() {
+                    partial.rows[start + i] = text;
+                }
+            }
+            persist_partial_translation(db, job, checkpoint, &partial).await?;
+            for (a, b) in missing_runs(&partial.rows, start, end).into_iter().rev() {
+                if a == start && b == end {
+                    if b - a == 1 {
+                        return Err(AppError::Unavailable(
+                            "single subtitle still missing after targeted repair".into(),
+                        ));
+                    }
+                    let mid = a + (b - a) / 2;
+                    pending.push_front((mid, b));
+                    pending.push_front((a, mid));
+                } else {
+                    pending.push_front((a, b));
+                }
+            }
+        }
+    }
+    if partial.rows.iter().any(String::is_empty) {
+        return Err(AppError::Unavailable(
+            "translation still missing rows".into(),
+        ));
+    }
+    Ok((partial.rows, partial.update, partial.summary))
+}
+async fn translate_batch_once(
     db: &Database,
     task_id: Uuid,
     client: &Client,
@@ -1121,6 +1451,7 @@ async fn translate_batch(
     if provider.api_type == "cerebras" {
         payload["reasoning_effort"] = json!("medium");
     }
+    check_translation_prompt_budget(provider, &payload)?;
     let attempts = provider.max_retries.clamp(1, 5);
     for attempt in 0..attempts {
         let mut request = client
@@ -1147,7 +1478,7 @@ async fn translate_batch(
                     .pointer("/choices/0/message/content")
                     .and_then(Value::as_str)
                     .ok_or_else(|| AppError::Unavailable("translation content missing".into()))?;
-                let translated = parse_translation(content, batch.len())?;
+                let translated = parse_translation_partial(content, batch.len())?;
                 let parsed: Value = serde_json::from_str(content.trim())
                     .map_err(|_| AppError::Unavailable("translation JSON invalid".into()))?;
                 let update = if batch_context.is_some() {
@@ -1231,6 +1562,7 @@ async fn repair_translation(
     if provider.api_type == "cerebras" {
         payload["reasoning_effort"] = json!("medium");
     }
+    check_translation_prompt_budget(provider, &payload)?;
     let mut request = client
         .post(provider.endpoint.clone())
         .timeout(Duration::from_secs(provider.timeout_seconds))
@@ -1275,7 +1607,11 @@ async fn repair_translation(
         }
         out[i] = t.chars().take(6000).collect();
     }
-    if seen != affected {
+    if seen != affected
+        && !issues
+            .iter()
+            .all(|issue| issue["type"] == "missing_translation")
+    {
         return Err(AppError::Unavailable(
             "translation repair omitted rows".into(),
         ));
@@ -1683,7 +2019,7 @@ async fn process_selective(
                     .collect::<Vec<_>>();
                 let translated = translate_batch(
                     db,
-                    job.task_id,
+                    job,
                     &client,
                     &provider,
                     &profile,
@@ -1691,6 +2027,7 @@ async fn process_selective(
                     &context.chars().take(8000).collect::<String>(),
                     None,
                     false,
+                    None,
                 )
                 .await?
                 .0;
@@ -2321,9 +2658,11 @@ pub(crate) async fn process(
                         )
                         .await?
                     } else if let Some(model) = model.as_ref() {
+                        let progress_checkpoint =
+                            workspace.join(format!("translation-{index:05}.progress.json"));
                         let (mut values, update, summary) = translate_batch(
                             db,
-                            job.task_id,
+                            job,
                             &client,
                             model,
                             &profile,
@@ -2331,6 +2670,7 @@ pub(crate) async fn process(
                             &research.prompt,
                             Some(&context_payload),
                             enable_summary,
+                            Some((&progress_checkpoint, &identity)),
                         )
                         .await?;
                         let issues =
@@ -2600,6 +2940,42 @@ mod tests {
         assert_ne!(a, b);
     }
     #[test]
+    fn translation_partial_preserves_good_rows_and_rebases_constraints() {
+        let rows =
+            parse_translation_partial(r#"{"items":[{"i":3,"text":"四"},{"i":0,"text":"一"}]}"#, 5)
+                .unwrap();
+        assert_eq!(rows, vec!["一", "", "", "四", ""]);
+        assert_eq!(missing_runs(&rows, 0, 5), vec![(1, 3), (4, 5)]);
+        let parent = json!({"context":{"batch":{"segment_start":10,"segment_end":14},"scene":{"batch_offset":2,"batch_count":5}},
+            "translation_constraints":[{"source":"PCB","target":"电路板","mode":"hard","applies_to_blocks":[1,3,5]}],
+            "translation_examples":[{"source":"x","applies_to_blocks":[10]},{"source":"y","applies_to_blocks":[12]}]});
+        let child = sub_batch_context(&parent, 1, 3, "running");
+        assert_eq!(
+            child["translation_constraints"][0]["applies_to_blocks"],
+            json!([2])
+        );
+        assert_eq!(
+            child["context"]["batch"],
+            json!({"segment_start":11,"segment_end":12})
+        );
+        assert_eq!(child["context"]["scene"]["batch_count"], 2);
+        assert_eq!(child["translation_examples"].as_array().unwrap().len(), 1);
+        assert_eq!(child["context"]["running_summary"], "running");
+        assert!(
+            parse_translation_partial(r#"{"items":[{"i":0,"text":""},{"i":0,"text":"A"}]}"#, 2)
+                .is_err()
+        );
+        assert!(!can_shrink_translation(&AppError::Unavailable(
+            "translation provider HTTP 401 Unauthorized".into()
+        )));
+        assert!(!can_shrink_translation(&AppError::Unavailable(
+            "translation provider HTTP 429 Too Many Requests".into()
+        )));
+        assert!(can_shrink_translation(&AppError::Unavailable(
+            "translation prompt exceeds context budget".into()
+        )));
+    }
+    #[test]
     fn rejects_duplicate_or_missing_translation_indices() {
         assert_eq!(
             parse_translation("{\"items\":[{\"i\":0,\"text\":\"你好\"}]}", 1).unwrap(),
@@ -2632,6 +3008,279 @@ mod tests {
                 .unwrap()
                 .segments
                 .is_empty()
+        );
+    }
+    #[tokio::test]
+    async fn translation_recovery_real_postgres_http() {
+        use axum::{Json, Router, extract::State, http::StatusCode, routing::post};
+        use std::sync::{Arc, Mutex};
+        let Ok(url) = std::env::var("VIDEOROLL_TEST_TRANSLATION_DB_URL") else {
+            return;
+        };
+        let parsed = Url::parse(&url).unwrap();
+        assert_eq!(parsed.host_str(), Some("127.0.0.1"));
+        assert_eq!(parsed.path(), "/videoroll_test");
+        let db = Database::connect(&url).await.unwrap();
+        sqlx::raw_sql("CREATE TABLE vr2_workflows(id uuid PRIMARY KEY,state text);
+            CREATE TABLE vr2_jobs(id uuid PRIMARY KEY,workflow_id uuid,lease_token uuid,state text,lease_until timestamptz);
+            CREATE TABLE app_settings(key text PRIMARY KEY,value_json jsonb);
+            CREATE TABLE ai_usage_events(id uuid PRIMARY KEY,task_id uuid,provider text,model text,operation text,
+                success bool,status_code int,input_tokens int,output_tokens int,total_tokens int,latency_ms int,
+                estimated_cost_microusd bigint,error_type text,error_message text);")
+            .execute(&db.pool).await.unwrap();
+        #[derive(Default)]
+        struct Observed {
+            mode: u8,
+            calls: Vec<Vec<String>>,
+            repairs: Vec<Vec<u64>>,
+        }
+        async fn handler(
+            State(state): State<Arc<Mutex<Observed>>>,
+            Json(body): Json<Value>,
+        ) -> (StatusCode, Json<Value>) {
+            let input: Value = serde_json::from_str(
+                body["messages"].as_array().unwrap().last().unwrap()["content"]
+                    .as_str()
+                    .unwrap(),
+            )
+            .unwrap();
+            let mut s = state.lock().unwrap();
+            let rows = if let Some(repair) = input["repair_rows"].as_array() {
+                s.repairs
+                    .push(repair.iter().map(|r| r["i"].as_u64().unwrap()).collect());
+                if s.mode == 0 {
+                    return (
+                        StatusCode::UNAUTHORIZED,
+                        Json(json!({"error":"test-only repair denied"})),
+                    );
+                }
+                if s.mode == 3 {
+                    repair.iter().take(1).cloned().collect()
+                } else {
+                    repair.clone()
+                }
+            } else {
+                let rows = input.as_array().unwrap().clone();
+                s.calls.push(
+                    rows.iter()
+                        .map(|r| r["source"].as_str().unwrap().to_owned())
+                        .collect(),
+                );
+                if s.mode == 2 && rows.len() > 2 {
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Json(json!({"error":"test batch too large"})),
+                    );
+                }
+                if s.mode == 0 || s.mode == 3 {
+                    rows.into_iter()
+                        .filter(|r| matches!(r["i"].as_u64(), Some(0 | 3)))
+                        .collect()
+                } else {
+                    rows
+                }
+            };
+            let items = rows
+                .iter()
+                .map(
+                    |r| json!({"i":r["i"],"text":format!("译文:{}",r["source"].as_str().unwrap())}),
+                )
+                .collect::<Vec<_>>();
+            (
+                StatusCode::OK,
+                Json(
+                    json!({"choices":[{"message":{"content":json!({"items":items}).to_string()}}],"usage":{"total_tokens":10}}),
+                ),
+            )
+        }
+        let state = Arc::new(Mutex::new(Observed::default()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = Url::parse(&format!(
+            "http://{}/v1/chat/completions",
+            listener.local_addr().unwrap()
+        ))
+        .unwrap();
+        let app = Router::new()
+            .route("/v1/chat/completions", post(handler))
+            .with_state(state.clone());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let fixture = tempfile::tempdir().unwrap();
+        let job = WorkItem {
+            id: Uuid::new_v4(),
+            workflow_id: Uuid::new_v4(),
+            task_id: Uuid::new_v4(),
+            stage: crate::domain::Stage::Subtitle,
+            generation: 1,
+            operation_key: Uuid::new_v4().to_string(),
+            lease_token: Uuid::new_v4(),
+            attempts: 1,
+            max_attempts: 3,
+            payload: json!({}),
+        };
+        sqlx::query("INSERT INTO vr2_workflows VALUES($1,'running')")
+            .bind(job.workflow_id)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO vr2_jobs VALUES($1,$2,$3,'running',now()+interval '10 minutes')")
+            .bind(job.id)
+            .bind(job.workflow_id)
+            .bind(job.lease_token)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let provider = crate::providers::TranslationProvider {
+            id: "fixture".into(),
+            endpoint,
+            model: "fixture".into(),
+            api_type: "openai".into(),
+            api_key: None,
+            temperature: 0.0,
+            max_output_tokens: None,
+            context_window: None,
+            enable_thinking: false,
+            timeout_seconds: 5,
+            max_retries: 1,
+        };
+        let client = Client::builder().no_proxy().build().unwrap();
+        let profile = SubtitleProfile::default();
+        let batch = ["alpha", "beta", "gamma", "delta"]
+            .into_iter()
+            .enumerate()
+            .map(|(i, text)| SubtitleCue {
+                start_ms: i as u64 * 1000,
+                end_ms: (i as u64 + 1) * 1000,
+                text: text.into(),
+                secondary_text: None,
+            })
+            .collect::<Vec<_>>();
+        let expected = batch
+            .iter()
+            .map(|v| format!("译文:{}", v.text))
+            .collect::<Vec<_>>();
+        let path = fixture.path().join("translation-progress.json");
+        assert!(
+            translate_batch(
+                &db,
+                &job,
+                &client,
+                &provider,
+                &profile,
+                &batch,
+                "",
+                None,
+                false,
+                Some((&path, "fixture-v1"))
+            )
+            .await
+            .is_err()
+        );
+        let saved: PartialTranslation =
+            serde_json::from_slice(&fs::read(&path).await.unwrap()).unwrap();
+        assert_eq!(saved.rows, vec!["译文:alpha", "", "", "译文:delta"]);
+        {
+            let mut s = state.lock().unwrap();
+            assert_eq!(s.repairs, vec![vec![1, 2]]);
+            s.mode = 1;
+            s.calls.clear();
+            s.repairs.clear();
+        }
+        let recovered = translate_batch(
+            &db,
+            &job,
+            &client,
+            &provider,
+            &profile,
+            &batch,
+            "",
+            None,
+            false,
+            Some((&path, "fixture-v1")),
+        )
+        .await
+        .unwrap();
+        assert_eq!(recovered.0, expected);
+        assert_eq!(state.lock().unwrap().calls, vec![vec!["beta", "gamma"]]);
+        {
+            let mut s = state.lock().unwrap();
+            s.mode = 2;
+            s.calls.clear();
+            s.repairs.clear();
+        }
+        let split = translate_batch(
+            &db,
+            &job,
+            &client,
+            &provider,
+            &profile,
+            &batch,
+            "",
+            None,
+            false,
+            Some((&path, "fixture-v2")),
+        )
+        .await
+        .unwrap();
+        assert_eq!(split.0, expected);
+        assert_eq!(
+            state
+                .lock()
+                .unwrap()
+                .calls
+                .iter()
+                .map(Vec::len)
+                .collect::<Vec<_>>(),
+            vec![4, 2, 2]
+        );
+        {
+            let mut s = state.lock().unwrap();
+            s.mode = 3;
+            s.calls.clear();
+            s.repairs.clear();
+        }
+        let repair = translate_batch(
+            &db,
+            &job,
+            &client,
+            &provider,
+            &profile,
+            &batch,
+            "",
+            None,
+            false,
+            Some((&path, "fixture-v3")),
+        )
+        .await
+        .unwrap();
+        assert_eq!(repair.0, expected);
+        assert_eq!(state.lock().unwrap().repairs, vec![vec![1, 2]]);
+        assert_eq!(
+            state.lock().unwrap().calls,
+            vec![vec!["alpha", "beta", "gamma", "delta"], vec!["gamma"]]
+        );
+        let mut limited = provider.clone();
+        limited.context_window = Some(512);
+        let before = state.lock().unwrap().calls.len();
+        assert!(
+            translate_batch(
+                &db,
+                &job,
+                &client,
+                &limited,
+                &profile,
+                &batch[..1],
+                "",
+                None,
+                false,
+                None
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(state.lock().unwrap().calls.len(), before);
+        server.abort();
+        println!(
+            "PASS: targeted missing indices, partial repair, durable subset recovery, HTTP failure subdivision, preflight context budget"
         );
     }
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
