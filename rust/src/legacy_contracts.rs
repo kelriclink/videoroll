@@ -666,12 +666,12 @@ async fn playout_assets(
     let rows = sqlx::query_scalar::<_, Value>(
         r#"SELECT jsonb_build_object(
           'id',p.id,'status',p.status,'task_id',p.task_id,'asset_id',p.asset_id,
-          'ffplayout_channel_id',p.channel_id,
-          'playout_path',p.playout_path,
+          'ffplayout_channel_id',p.ffplayout_channel_id,
+          'playout_path',p.relative_media_path,
           'relative_media_path',p.relative_media_path,
           'transfer_mode',p.transfer_mode,'source_checksum',p.source_checksum,
           'created_at',p.created_at,'updated_at',p.updated_at)
-          FROM vr2_playout_links p WHERE p.task_id=$1
+          FROM playout_asset_links p WHERE p.task_id=$1
           AND p.status='ready' AND p.asset_id IS NOT NULL
           ORDER BY p.created_at DESC"#,
     )

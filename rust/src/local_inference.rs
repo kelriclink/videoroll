@@ -60,6 +60,10 @@ fn is_cpu(model: &Value) -> bool {
 fn is_probe(model: &Value) -> bool {
     model["kind"] == "devices"
 }
+fn is_vad(model: &Value) -> bool {
+    model["kind"] == "vad" && is_cpu(model)
+}
+
 fn pool_capacity() -> usize {
     std::env::var("VIDEOROLL_V2_LOCAL_INFERENCE_POOL_SIZE")
         .ok()
@@ -68,6 +72,9 @@ fn pool_capacity() -> usize {
         .clamp(1, 2)
 }
 fn session_idle_timeout(model: &Value) -> Duration {
+    if is_vad(model) {
+        return Duration::from_secs(60);
+    }
     if is_cpu(model) {
         return idle_timeout();
     }
@@ -369,8 +376,13 @@ pub async fn invoke(request: &Value, timeout: Duration) -> AppResult<Value> {
                     evict(pool.remove(index)).await;
                 } else { index += 1; }
             }
-            while pool.len() >= pool_capacity() {
-                let index = pool.iter().enumerate().min_by_key(|(_, s)| s.last_used).unwrap().0;
+            // Keep one bounded CPU VAD session independently of the two
+            // heavyweight ASR/embedding roles. Otherwise every timing pass
+            // evicts a warm model and defeats the prior pool optimization.
+            let vad=is_vad(&key["model"]);
+            let capacity=if vad{1}else{pool_capacity()};
+            while pool.iter().filter(|s|is_vad(&s.key["model"])==vad).count()>=capacity{
+                let index=pool.iter().enumerate().filter(|(_,s)|is_vad(&s.key["model"])==vad).min_by_key(|(_,s)|s.last_used).unwrap().0;
                 evict(pool.remove(index)).await;
             }
         }
