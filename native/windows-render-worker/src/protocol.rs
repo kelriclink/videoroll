@@ -89,6 +89,8 @@ pub struct CancelState {
 #[derive(Debug, Clone, Deserialize)]
 pub struct AssetRead {
     pub id: Uuid,
+    pub sha256: Option<String>,
+    pub size_bytes: Option<u64>,
 }
 
 fn default_retry() -> u64 {
