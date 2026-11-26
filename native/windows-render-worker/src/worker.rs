@@ -4,9 +4,8 @@ use crate::ffmpeg;
 use crate::hardware::{self, Device, HardwareSnapshot};
 use crate::logging::SharedLog;
 use crate::paths::AppPaths;
-use crate::protocol::{
-    ClaimRequest, ClaimResponse, EnrollRequest, WorkerHeartbeat,
-};
+use crate::protocol::{ClaimRequest, ClaimResponse, EnrollRequest, WorkerHeartbeat};
+use crate::render_cache::{self, CacheKey};
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use std::collections::{BTreeSet, HashMap};
@@ -47,7 +46,6 @@ pub struct JobTelemetry {
     pub source_height: u32,
     pub source_pix_fmt: String,
 }
-
 
 #[derive(Debug, Clone, Default)]
 pub struct WorkerStatus {
@@ -124,7 +122,10 @@ impl WorkerHandle {
     }
 
     pub fn status(&self) -> WorkerStatus {
-        self.status.lock().map(|state| state.clone()).unwrap_or_default()
+        self.status
+            .lock()
+            .map(|state| state.clone())
+            .unwrap_or_default()
     }
 
     pub fn is_running(&self) -> bool {
@@ -181,9 +182,8 @@ fn run_worker(
         // without requiring the operator to manually remove credential.json.
         enroll(&api, &config, &hardware, token, &paths, &log)?
     } else {
-        Credential::load(&paths).context(
-            "this node is not paired; provide a one-time vre_* enrollment token",
-        )?
+        Credential::load(&paths)
+            .context("this node is not paired; provide a one-time vre_* enrollment token")?
     };
 
     log.info(format!(
@@ -201,6 +201,7 @@ fn run_worker(
         Arc::new(Mutex::new(HashMap::new()));
     let mut next_worker_heartbeat = Instant::now();
     let mut next_claim = Instant::now();
+    let mut next_cache_prune = Instant::now();
 
     loop {
         let stopping = stop_accepting.load(Ordering::Relaxed);
@@ -213,14 +214,16 @@ fn run_worker(
         }
 
         let now = Instant::now();
+        if active_count == 0 && now >= next_cache_prune {
+            match render_cache::prune(&paths.work) {
+                Ok(n) if n > 0 => log.info(format!("expired render cache entries removed: {n}")),
+                Err(e) => log.warn(format!("render cache prune failed: {e:#}")),
+                _ => {}
+            }
+            next_cache_prune = now + Duration::from_secs(3600);
+        }
         if now >= next_worker_heartbeat {
-            match send_worker_heartbeat(
-                &api,
-                &credential,
-                &hardware,
-                &active,
-                stopping,
-            ) {
+            match send_worker_heartbeat(&api, &credential, &hardware, &active, stopping) {
                 Ok(()) => {
                     if let Ok(mut state) = status.lock() {
                         state.connected = true;
@@ -237,8 +240,7 @@ fn run_worker(
         }
 
         if !stopping && now >= next_claim {
-            let (available_slots, available_encoders) =
-                available_capacity(&hardware.devices);
+            let (available_slots, available_encoders) = available_capacity(&hardware.devices);
             if available_slots > 0 {
                 let request = ClaimRequest {
                     available_slots,
@@ -362,9 +364,7 @@ fn send_worker_heartbeat(
     Ok(())
 }
 
-fn available_capacity(
-    devices: &[Device],
-) -> (usize, Vec<String>) {
+fn available_capacity(devices: &[Device]) -> (usize, Vec<String>) {
     let encoders = devices
         .iter()
         .flat_map(|device| device.encoders.iter().cloned())
@@ -558,122 +558,159 @@ fn run_execution(
     );
 
     let result = (|| -> Result<()> {
-        let mut artifacts = HashMap::<String, PathBuf>::new();
-        for artifact in &spec.artifacts {
-            let target = artifact_target(&root, &artifact.role, &artifact.storage_key);
-            api.download_artifact(
-                execution_id,
-                &artifact.role,
-                &credential.credential,
-                &target,
-            )?;
-            if let Some(expected) = artifact.sha256.as_deref() {
-                let actual = ffmpeg::sha256_file(&target)?;
-                if !actual.eq_ignore_ascii_case(expected) {
-                    anyhow::bail!("artifact checksum mismatch: {}", artifact.role);
+        let cache_key = CacheKey::new(&paths.work, &spec, WORKER_VERSION, &device.id);
+        let mut cached = cache_key.as_ref().and_then(CacheKey::load);
+        let output = if let Some(entry) = cached.as_ref() {
+            log.info(format!(
+                "reusing verified rendered media: {}",
+                entry.path.display()
+            ));
+            entry.path.clone()
+        } else {
+            let mut artifacts = HashMap::<String, PathBuf>::new();
+            for artifact in &spec.artifacts {
+                let target = artifact_target(&root, &artifact.role, &artifact.storage_key);
+                api.download_artifact(
+                    execution_id,
+                    &artifact.role,
+                    &credential.credential,
+                    &target,
+                )?;
+                if let Some(expected) = artifact.sha256.as_deref() {
+                    let actual = ffmpeg::sha256_file(&target)?;
+                    if !actual.eq_ignore_ascii_case(expected) {
+                        anyhow::bail!("artifact checksum mismatch: {}", artifact.role);
+                    }
                 }
+                artifacts.insert(artifact.role.clone(), target);
             }
-            artifacts.insert(artifact.role.clone(), target);
-        }
 
-        let input = artifacts.get("input").context("input artifact missing")?;
-        let render = spec
-            .request
-            .get("render")
-            .and_then(Value::as_object);
-        let codec = render
-            .and_then(|value| value.get("video_codec"))
-            .and_then(Value::as_str)
-            .unwrap_or("av1");
-        let preset = render
-            .and_then(|value| value.get("video_preset"))
-            .and_then(Value::as_str);
-        let quality = render
-            .and_then(|value| value.get("video_crf"))
-            .and_then(Value::as_i64);
+            let input = artifacts.get("input").context("input artifact missing")?;
+            let render = spec.request.get("render").and_then(Value::as_object);
+            let codec = render
+                .and_then(|value| value.get("video_codec"))
+                .and_then(Value::as_str)
+                .unwrap_or("av1");
+            let preset = render
+                .and_then(|value| value.get("video_preset"))
+                .and_then(Value::as_str);
+            let quality = render
+                .and_then(|value| value.get("video_crf"))
+                .and_then(Value::as_i64);
 
-        let telemetry_for_progress = Arc::clone(&telemetry);
-        let progress_callback: ffmpeg::ProgressCallback = Arc::new(move |progress| {
-            if let Ok(mut job) = telemetry_for_progress.lock() {
-                job.pipeline = progress.pipeline;
-                job.encoder = progress.encoder;
-                job.frame = progress.frame;
-                job.fps = progress.fps;
-                job.speed = progress.speed;
-                job.percent = progress.percent;
-                job.out_time_seconds = progress.out_time_seconds;
-                job.duration_seconds = progress.duration_seconds;
-                job.elapsed_seconds = progress.elapsed_seconds;
-                job.bitrate = progress.bitrate;
-                job.total_size = progress.total_size;
-                job.source_codec = progress.source_codec;
-                job.source_width = progress.source_width;
-                job.source_height = progress.source_height;
-                job.source_pix_fmt = progress.source_pix_fmt;
-                job.stage = "rendering".to_string();
-            }
-        });
-        set_job_stage(&telemetry, "rendering");
+            let telemetry_for_progress = Arc::clone(&telemetry);
+            let progress_callback: ffmpeg::ProgressCallback = Arc::new(move |progress| {
+                if let Ok(mut job) = telemetry_for_progress.lock() {
+                    job.pipeline = progress.pipeline;
+                    job.encoder = progress.encoder;
+                    job.frame = progress.frame;
+                    job.fps = progress.fps;
+                    job.speed = progress.speed;
+                    job.percent = progress.percent;
+                    job.out_time_seconds = progress.out_time_seconds;
+                    job.duration_seconds = progress.duration_seconds;
+                    job.elapsed_seconds = progress.elapsed_seconds;
+                    job.bitrate = progress.bitrate;
+                    job.total_size = progress.total_size;
+                    job.source_codec = progress.source_codec;
+                    job.source_width = progress.source_width;
+                    job.source_height = progress.source_height;
+                    job.source_pix_fmt = progress.source_pix_fmt;
+                    job.stage = "rendering".to_string();
+                }
+            });
+            set_job_stage(&telemetry, "rendering");
 
-        api.execution_post(
-            execution_id,
-            "progress",
-            &credential.credential,
-            &json!({
-                "fence_token": fence,
-                "progress": 20,
-                "metrics": metrics(&device, &telemetry),
-                "stage": "rendering",
-            }),
-        )?;
-
-        if spec.mode == "noop" {
             api.execution_post(
                 execution_id,
-                "complete",
+                "progress",
                 &credential.credential,
-                &json!({"fence_token": fence, "output": {}}),
+                &json!({
+                    "fence_token": fence,
+                    "progress": 20,
+                    "metrics": metrics(&device, &telemetry),
+                    "stage": "rendering",
+                }),
             )?;
-            return Ok(());
-        }
 
-        let output = ffmpeg::output_path(&root, &spec.mode);
-        if spec.mode == "burn_in" {
-            let ass = artifacts.get("ass").context("burn-in ASS artifact missing")?;
-            ffmpeg::render_burn_in(
-                &paths.ffmpeg(),
-                &paths.ffprobe(),
-                input,
-                ass,
-                &output,
-                &device,
-                codec,
-                preset,
-                quality,
-                Arc::clone(&cancel),
-                &log,
-                Some(Arc::clone(&progress_callback)),
-            )?;
-        } else if spec.mode == "soft_sub" {
-            let srt = artifacts.get("srt").context("soft-sub SRT artifact missing")?;
-            ffmpeg::mux_soft_sub(
-                &paths.ffmpeg(),
-                &paths.ffprobe(),
-                input,
-                srt,
-                &output,
-                Arc::clone(&cancel),
-                &log,
-                Some(Arc::clone(&progress_callback)),
-            )?;
-        } else {
-            anyhow::bail!("unsupported render mode {}", spec.mode);
-        }
+            if spec.mode == "noop" {
+                api.execution_post(
+                    execution_id,
+                    "complete",
+                    &credential.credential,
+                    &json!({"fence_token": fence, "output": {}}),
+                )?;
+                return Ok(());
+            }
 
+            let output = ffmpeg::output_path(&root, &spec.mode);
+            if spec.mode == "burn_in" {
+                let ass = artifacts
+                    .get("ass")
+                    .context("burn-in ASS artifact missing")?;
+                ffmpeg::render_burn_in(
+                    &paths.ffmpeg(),
+                    &paths.ffprobe(),
+                    input,
+                    ass,
+                    &output,
+                    &device,
+                    codec,
+                    preset,
+                    quality,
+                    Arc::clone(&cancel),
+                    &log,
+                    Some(Arc::clone(&progress_callback)),
+                )?;
+            } else if spec.mode == "soft_sub" {
+                let srt = artifacts
+                    .get("srt")
+                    .context("soft-sub SRT artifact missing")?;
+                ffmpeg::mux_soft_sub(
+                    &paths.ffmpeg(),
+                    &paths.ffprobe(),
+                    input,
+                    srt,
+                    &output,
+                    Arc::clone(&cancel),
+                    &log,
+                    Some(Arc::clone(&progress_callback)),
+                )?;
+            } else {
+                anyhow::bail!("unsupported render mode {}", spec.mode);
+            }
+
+            if cancel.load(Ordering::Relaxed) {
+                anyhow::bail!("render execution canceled by coordinator");
+            }
+
+            if let Some(key) = cache_key.as_ref() {
+                match key.persist(&output) {
+                    Ok(entry) => {
+                        let path = entry.path.clone();
+                        cached = Some(entry);
+                        path
+                    }
+                    Err(e) if output.is_file() => {
+                        log.warn(format!(
+                            "render cache persist failed; uploading direct: {e:#}"
+                        ));
+                        output
+                    }
+                    Err(e) => return Err(e),
+                }
+            } else {
+                output
+            }
+        };
         if cancel.load(Ordering::Relaxed) {
             anyhow::bail!("render execution canceled by coordinator");
         }
-
+        let (size, sha256) = if let Some(entry) = cached.as_ref() {
+            (entry.size, entry.sha256.clone())
+        } else {
+            (fs::metadata(&output)?.len(), ffmpeg::sha256_file(&output)?)
+        };
         set_job_stage(&telemetry, "uploading");
         api.execution_post(
             execution_id,
@@ -692,9 +729,13 @@ fn run_execution(
             &fence,
             &credential.credential,
             &output,
+            size,
+            &sha256,
+            &cancel,
         )?;
-        let size = fs::metadata(&output)?.len();
-        let sha256 = ffmpeg::sha256_file(&output)?;
+        if cancel.load(Ordering::Relaxed) {
+            anyhow::bail!("render execution canceled by coordinator");
+        }
         api.execution_post(
             execution_id,
             "complete",
@@ -705,7 +746,13 @@ fn run_execution(
                 "output": {"sha256": sha256, "size_bytes": size},
             }),
         )?;
-        log.info(format!("execution complete: id={} bytes={}", execution_id, size));
+        if let Some(entry) = cached.take() {
+            entry.clear();
+        }
+        log.info(format!(
+            "execution complete: id={} bytes={}",
+            execution_id, size
+        ));
         if let Ok(mut job) = telemetry.lock() {
             job.stage = "complete".to_string();
             job.percent = 100.0;
@@ -765,7 +812,9 @@ fn start_execution_heartbeat(
                     cancel.store(true, Ordering::Relaxed);
                     break;
                 }
-                log.warn(format!("execution heartbeat failed: {execution_id}: {error:#}"));
+                log.warn(format!(
+                    "execution heartbeat failed: {execution_id}: {error:#}"
+                ));
             }
 
             if Instant::now() >= next_cancel {
@@ -774,7 +823,9 @@ fn start_execution_heartbeat(
                         log.warn(format!(
                             "execution cancel requested: {}: {}",
                             execution_id,
-                            state.reason.unwrap_or_else(|| "coordinator request".to_string())
+                            state
+                                .reason
+                                .unwrap_or_else(|| "coordinator request".to_string())
                         ));
                         cancel.store(true, Ordering::Relaxed);
                         break;

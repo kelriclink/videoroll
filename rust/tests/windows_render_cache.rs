@@ -11,3 +11,10 @@ mod logging;
 #[rustfmt::skip]
 #[path = "../../native/windows-render-worker/src/paths.rs"]
 mod paths;
+
+#[rustfmt::skip]
+#[path = "../../native/windows-render-worker/src/protocol.rs"]
+mod protocol;
+#[rustfmt::skip]
+#[path = "../../native/windows-render-worker/src/render_cache.rs"]
+mod render_cache;

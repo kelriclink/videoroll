@@ -7,6 +7,7 @@ mod hardware;
 mod logging;
 mod paths;
 mod protocol;
+mod render_cache;
 mod worker;
 
 use config::{AppConfig, Credential};
