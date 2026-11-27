@@ -23,6 +23,14 @@ fn requested_settings_match(saved: &Value, changes: &serde_json::Map<String, Val
     })
 }
 
+/// Snapshot of a bulk recovery decision, checked again under the Task lock.
+pub(crate) struct BulkResumeGuard {
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+    pub native_job: Option<Uuid>,
+    pub subtitle_job: Option<(Uuid, Value)>,
+    pub raw_key: Option<String>,
+}
+
 #[derive(Clone)]
 pub struct Scheduler {
     db: Database,
@@ -383,6 +391,18 @@ impl Scheduler {
         stage: Stage,
         overrides: Value,
     ) -> AppResult<WorkflowInfo> {
+        self.restart_at_inner(task_id, stage, overrides, None).await
+    }
+
+    pub(crate) async fn restart_recent(
+        &self, task_id:Uuid, stage:Stage, overrides:Value, guard:BulkResumeGuard,
+    )->AppResult<WorkflowInfo>{
+        self.restart_at_inner(task_id,stage,overrides,Some(guard)).await
+    }
+
+    async fn restart_at_inner(
+        &self,task_id:Uuid,stage:Stage,overrides:Value,bulk:Option<BulkResumeGuard>,
+    )->AppResult<WorkflowInfo>{
         if stage == Stage::Cleanup {
             return Err(AppError::Invalid(
                 "cleanup is not a restartable user stage".into(),
@@ -408,6 +428,40 @@ impl Scheduler {
         .fetch_optional(&mut *tx)
         .await?;
         let status = status.ok_or_else(|| AppError::NotFound("V2-owned task not found".into()))?;
+        if let Some(guard)=bulk {
+            // Never turn a stale bulk list into a restart of a newer task.
+            // Nonblocking ledger locks also fence old direct writers.
+            if status!="FAILED" {return Err(AppError::Conflict("task is no longer failed".into()))}
+            sqlx::query("LOCK TABLE pipeline_runs,operation_inbox,assets,subtitles,subtitle_jobs,render_jobs,render_executions,dubbing_jobs,publish_jobs,publish_batches,outbox_events IN SHARE ROW EXCLUSIVE MODE NOWAIT")
+                .execute(&mut *tx).await.map_err(|e|if e.as_database_error().and_then(|e|e.code()).as_deref()==Some("55P03"){
+                    AppError::Conflict("another worker is changing a recovery ledger".into())
+                }else{e.into()})?;
+            let eligible:bool=sqlx::query_scalar("SELECT updated_at=$2 AND source_license::text<>'unknown'
+                AND stopped_status IS NULL AND to_jsonb(t)->>'lock_owner' IS NULL AND to_jsonb(t)->>'lock_until' IS NULL
+                AND active_publish_batch_id IS NULL FROM tasks t WHERE id=$1")
+                .bind(task_id).bind(guard.updated_at).fetch_one(&mut *tx).await?;
+            let latest:Option<Uuid>=sqlx::query_scalar("SELECT id FROM vr2_jobs WHERE task_id=$1 ORDER BY created_at DESC,id DESC LIMIT 1")
+                .bind(task_id).fetch_optional(&mut *tx).await?;
+            let native_failed=if let Some(job)=latest{
+                sqlx::query_scalar::<_,bool>("SELECT state='failed' AND stage=$2 AND lease_token IS NULL AND lease_until IS NULL FROM vr2_jobs WHERE id=$1")
+                    .bind(job).bind(stage.as_str()).fetch_one(&mut *tx).await?
+            }else{true};
+            if !eligible || !native_failed || latest!=guard.native_job || !crate::task_ownership::blockers(&mut tx,task_id).await?.is_empty()
+                || crate::storage::publication_cleanup_blocked(&mut tx,task_id).await? {
+                return Err(AppError::Conflict("task or recovery ledger changed or is unsettled".into()));
+            }
+            if latest.is_none(){
+                let old:Option<(Uuid,Value)>=sqlx::query_as("SELECT id,request_json FROM subtitle_jobs WHERE task_id=$1 ORDER BY created_at DESC,id DESC LIMIT 1")
+                    .bind(task_id).fetch_optional(&mut *tx).await?;
+                let raw:Option<String>=sqlx::query_scalar("SELECT storage_key FROM assets WHERE task_id=$1 AND kind::text='video_raw' ORDER BY created_at DESC,id DESC LIMIT 1")
+                    .bind(task_id).fetch_optional(&mut *tx).await?;
+                let history:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM publish_jobs WHERE task_id=$1) OR EXISTS(SELECT 1 FROM publish_batches WHERE task_id=$1) OR EXISTS(SELECT 1 FROM pipeline_runs WHERE task_id=$1 AND engine='rust-v2')")
+                    .bind(task_id).fetch_one(&mut *tx).await?;
+                if old!=guard.subtitle_job || raw!=guard.raw_key || history{
+                    return Err(AppError::Conflict("historical recovery evidence changed or publication history exists".into()))
+                }
+            }
+        }
         if stage == Stage::Dubbing
             && let Some(key) = changes
                 .get("manual_dub_operation_key")

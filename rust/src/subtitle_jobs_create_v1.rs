@@ -36,7 +36,7 @@ fn optional_object<'a>(
         .map(|v| object(v, key))
         .transpose()
 }
-fn config(request: &Value) -> AppResult<(Uuid, String, Value)> {
+pub(crate) fn config(request: &Value) -> AppResult<(Uuid, String, Value)> {
     let map = object(request, "subtitle job")?;
     allowed(
         map,

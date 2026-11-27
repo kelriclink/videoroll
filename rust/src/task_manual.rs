@@ -578,16 +578,17 @@ async fn resume_recent(
         ));
     }
     let rows = sqlx::query(
-        "SELECT t.id,j.stage,j.state FROM tasks t
-         JOIN tasks m ON m.id=t.id AND m.runtime_owner='rust'
-         JOIN LATERAL (
-           SELECT stage,state FROM vr2_jobs
+        "SELECT t.id,t.updated_at,t.source_type::text AS source_type,t.source_url,t.source_license::text AS license,
+          j.id AS native_job,j.stage,j.state
+         FROM tasks t
+         LEFT JOIN LATERAL (
+           SELECT id,stage,state FROM vr2_jobs
            WHERE task_id=t.id
            ORDER BY created_at DESC,id DESC LIMIT 1
          ) j ON true
-         WHERE t.status='failed'::task_status
+         WHERE t.runtime_owner='rust' AND t.status='failed'::task_status
            AND t.updated_at>=now()-($1 * interval '1 hour')
-         ORDER BY t.updated_at DESC LIMIT $2",
+         ORDER BY t.updated_at DESC,t.created_at DESC,t.id DESC LIMIT $2",
     )
     .bind(hours)
     .bind(limit)
@@ -599,35 +600,23 @@ async fn resume_recent(
     let mut failed = 0;
     for row in &rows {
         let id: Uuid = row.try_get("id")?;
-        let stage_name: String = row.try_get("stage")?;
-        let state_name: String = row.try_get("state")?;
-        let stage = Stage::from_name(&stage_name);
-        let answer = if state_name != "failed"
-            || stage.is_none_or(|s| s == Stage::Publish || s == Stage::Cleanup)
-        {
-            skipped += 1;
-            json!({"task_id":id,"job_id":null,"status":"skipped",
-                "detail":"only failed, reversible V2 stages can be resumed"})
-        } else {
-            let stage = stage.expect("verified above");
-            match state.scheduler.restart_at(id, stage, json!({})).await {
-                Ok(flow) => {
-                    resumed += 1;
-                    let job: Option<Uuid> = sqlx::query_scalar(
-                        "SELECT id FROM vr2_jobs WHERE workflow_id=$1 AND stage=$2",
-                    )
-                    .bind(flow.id)
-                    .bind(stage.as_str())
-                    .fetch_optional(&state.db.pool)
-                    .await?;
-                    json!({"task_id":id,"job_id":job,"status":"resumed","detail":stage.as_str()})
-                }
-                Err(err) => {
-                    failed += 1;
-                    tracing::warn!(task_id=%id,error=%err,"V2 bulk resume refused");
-                    json!({"task_id":id,"job_id":null,"status":"failed",
-                        "detail":"safety or asset precondition rejected restart"})
-                }
+        let answer=match resume_recent_one(&state,row).await {
+            Ok((flow,stage))=>{
+                let job:Uuid=sqlx::query_scalar("SELECT id FROM vr2_jobs WHERE workflow_id=$1 AND stage=$2")
+                    .bind(flow.id).bind(stage.as_str()).fetch_one(&state.db.pool).await?;
+                resumed+=1;
+                json!({"task_id":id,"job_id":job,"status":"queued","detail":stage.as_str()})
+            }
+            Err(err @ (AppError::Conflict(_) | AppError::Invalid(_) | AppError::NotFound(_) | AppError::Forbidden(_)))=>{
+                skipped+=1;
+                // These errors are fixed admission/precondition reasons.
+                tracing::debug!(task_id=%id,"V2 bulk recovery deferred");
+                json!({"task_id":id,"job_id":null,"status":"skipped","detail":err.to_string()})
+            }
+            Err(_)=>{
+                failed+=1;
+                tracing::warn!(task_id=%id,"V2 bulk recovery encountered an internal error");
+                json!({"task_id":id,"job_id":null,"status":"error","detail":"recovery admission failed"})
             }
         };
         results.push(answer);
@@ -637,6 +626,91 @@ async fn resume_recent(
         "resumed_count":resumed,"skipped_count":skipped,
         "failed_count":failed,"results":results}),
     ))
+}
+/// Resume the original task, never create a second Task for the same source.
+async fn resume_recent_one(state:&AppState,row:&sqlx::postgres::PgRow)->AppResult<(WorkflowInfo,Stage)>{
+    let task:Uuid=row.try_get("id")?;
+    if row.try_get::<String,_>("license")?=="unknown" {
+        return Err(AppError::Conflict("source_license=unknown; add proof before auto publish".into()))
+    }
+    let native:Option<Uuid>=row.try_get("native_job")?;
+    let mut guard=crate::scheduler::BulkResumeGuard{
+        updated_at:row.try_get("updated_at")?,native_job:native,subtitle_job:None,raw_key:None,
+    };
+    let (stage,changes)=if native.is_some(){
+        let name:Option<String>=row.try_get("stage")?;
+        let stage=name.as_deref().and_then(Stage::from_name)
+            .filter(|s|!matches!(s,Stage::Publish|Stage::Cleanup))
+            .ok_or_else(||AppError::Conflict("only failed, reversible V2 stages can be resumed".into()))?;
+        if row.try_get::<Option<String>,_>("state")?.as_deref()!=Some("failed"){
+            return Err(AppError::Conflict("latest native operation is not failed".into()))
+        }
+        (stage,json!({}))
+    }else{
+        // Historical tasks are already explicitly adopted, never adopt them
+        // implicitly on a user list action. Prefer the latest original request.
+        let old:Option<(Uuid,Value)>=sqlx::query_as("SELECT id,request_json FROM subtitle_jobs WHERE task_id=$1 ORDER BY created_at DESC,id DESC LIMIT 1")
+            .bind(task).fetch_optional(&state.db.pool).await?;
+        let raw=crate::media::ffmpeg::latest_asset_key(&state.db,task,"video_raw").await?;
+        guard.subtitle_job=old.clone();
+        guard.raw_key=raw.clone();
+        let mut changes=json!({"auto_publish":false,"auto_publish_platforms":[],"auto_dub_p2":false,"historical_adoption":true});
+        let stage=if let Some((old_id,mut request))=old{
+            if request.as_object().is_none_or(|o|o.is_empty()){
+                return Err(AppError::Conflict("subtitle job request is empty".into()))
+            }
+            let key=raw.as_deref().ok_or_else(||AppError::Conflict("saved subtitle input is no longer available; restore source media first".into()))?;
+            // Do not silently substitute a different input into old checkpoints.
+            if request["input"]["key"].as_str()!=Some(key){
+                return Err(AppError::Conflict("saved subtitle input differs from current raw asset; verify before retrying".into()))
+            }
+            crate::subtitle_resume_v1::asset_digest(&state.db,&state.storage,task,"video_raw",key).await?;
+            request["task_id"]=json!(task);
+            request["resume"]=json!(true);
+            request.as_object_mut().unwrap().remove("after_render");
+            if request.get("selective_retranslate").is_some_and(|v|v.as_object().is_some_and(|o|!o.is_empty())){
+                return Err(AppError::Conflict("selective historical retranslation needs explicit resume".into()))
+            }
+            let (_,_,mut config)=crate::subtitle_jobs_create_v1::config(&request)?;
+            let automatic=request["runtime_profile"].as_bool().unwrap_or(false);
+            if automatic {
+                config["subtitle"]=json!({"resume":true});
+                config["render"]=json!({});
+            }
+            config["standalone_subtitle_runtime_profile"]=json!(automatic);
+            config["auto_publish"]=json!(false);
+            config["auto_publish_platforms"]=json!([]);
+            config["auto_dub_p2"]=json!(false);
+            config["historical_adoption"]=json!(true);
+            let plan=crate::subtitle_resume_v1::prepare(&state.db,&state.storage,task,key,
+                request["artifacts"]["source_segments_key"].as_str(),request["artifacts"]["final_subtitle_segments_key"].as_str()).await?;
+            if let Some(plan)=plan{
+                if plan.original_job!=old_id{return Err(AppError::Conflict("subtitle checkpoint belongs to an older request".into()))}
+                config["subtitle_resume_plan"]=json!(plan);
+            }else if crate::media::ffmpeg::latest_asset_key(&state.db,task,"subtitle_srt").await?.is_some(){
+                return Err(AppError::Conflict("existing subtitle lacks a verified resume checkpoint".into()))
+            }
+            changes=config;
+            Stage::Subtitle
+        }else if row.try_get::<String,_>("source_type")?=="youtube"{
+            let url:Option<String>=row.try_get("source_url")?;
+            crate::ingest::youtube_video_id(url.as_deref().unwrap_or_default())?;
+            changes["standalone_subtitle_runtime_profile"]=json!(true);
+            if let Some(key)=raw.as_deref(){
+                // Reuse verified existing source instead of downloading over it.
+                crate::subtitle_resume_v1::asset_digest(&state.db,&state.storage,task,"video_raw",key).await?;
+                if crate::media::ffmpeg::latest_asset_key(&state.db,task,"subtitle_srt").await?.is_some(){
+                    return Err(AppError::Conflict("subtitle history is missing; verify existing SRT before restarting".into()))
+                }
+                Stage::Subtitle
+            }else{Stage::Download}
+        }else{
+            return Err(AppError::Conflict("no subtitle job found to resume".into()))
+        };
+        (stage,changes)
+    };
+    let flow=state.scheduler.restart_recent(task,stage,changes,guard).await?;
+    Ok((flow,stage))
 }
 // The current Python service has already retired sentence rewriting, preview
 // and the old CosyVoice paths. Only native YouDub VoxCPM2 is supported here.

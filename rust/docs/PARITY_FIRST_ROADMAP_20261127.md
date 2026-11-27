@@ -38,3 +38,17 @@ SAU 代码检查：当前原生领取仍采用全局单投稿互斥；账户导�
 ## 第三十批：SAU 执行边界及原始账本恢复
 
 原 Python 账户锁、凭据物化、Job/Inbox 租约与 started_at 执行边界已逐段对照。Rust 原生 Worker 增加启动前 Task generation、Account credential version、三账本身份及租约复核，超时恢复需三账本同 owner 且均过期；保留已有响应与进度，拒绝覆盖外部标识。当前仅全局串行，不提前放开跨实例账户并发；原生账本冲突仍需显式核实。详细边界见 SAU_WORKER_NATIVE_V1.md。专项使用无网络模拟 CLI、隔离 PG、领取时账户版本变化和 Inbox 延迟过期故障注入。
+
+## 第三十一批：SAU 异常投递隔离
+
+基线 a87a7ac，提交 58d35a3。原队列资格与 retry_after 保护、终态 Outbox 补偿和审计已恢复，详见 SAU_WORKER_NATIVE_V1.md。仍不能自动释放未决外部执行。
+
+## 第三十二批：原版批量恢复最近失败任务
+
+基线 58d35a3。参考 Python orchestrator_api/services/subtitle_service.py:271-319、630-715、tests/test_resume_failed_recent.py。原版先查询失败任务，再跳过活动字幕/渲染及未知授权；旧字幕请求复用、无字幕作业的 YouTube 任务重新入队。Rust 原入口内连接原生 job，漏掉无原生工作流的历史任务。
+
+- 原 POST /tasks/actions/resume_failed_recent 保留 window_hours/limit 和 matched/resumed/skipped/failed 计数，Rust 所有权下 LEFT JOIN 最新原生 job；已失败可逆原生阶段按原逻辑恢复；历史无原生记录时使用最新原字幕请求、原源视频 digest/size、已有字幕快照；无字幕作业的 YouTube 任务通过 URL 校验后，源视频存在则复用，否则排队下载；本地无字幕历史跳过。原作业/资产/投稿记录不重写。预条件拒绝分类为 skipped，内部错误分类为 error。
+- bulk 专用 admission 在 Task 行锁内重核失败状态、updated_at、授权、暂停、所有权、最新 native job/阶段/失败状态/租约、旧请求和 raw key；原物理账本 NOWAIT 表锁及 ownership/cleanup blockers，防止重复工作、活动历史作业、未决投稿。旧业务记录不自动接管 Python owner；历史分支拒绝任何投稿历史及已有空壳原生工作流。并发列表的过时决策可跳过而非重复创建代次。
+- 安全差异：历史恢复使用原版请求的已支持字段或显式 runtime_profile，关闭自动投稿/配音，不沿用旧 after_render 副作用；原生失败阶段仍继承既有原生配置。旧输入与当前 raw 不一致、丢失文件、没有校验信息、旧选择性重译、无法证明的字幕成果及未支持请求字段保守跳过。尚未等价实现原版替换缺失输入、最新自动投稿策略、完整 legacy request 适配与所有 native stage checkpoint 复用；本轮只验证入队及账本不变，未运行新入队的全链路真实模型/平台。全局 NOWAIT 锁与逐任务文件校验有生产负载成本，需后续压测。
+
+专项：VIDEOROLL_V2_TEST_BULK_RESUME_ONLY=true bash rust/scripts/smoke-isolated.sh；真实 PG/API、FFmpeg 生成隔离媒体、15 个命中（4 入队/11 跳过）、排除 Python/过期、重复/并发请求、原始资产及业务表对照。下一批检查全部停止/恢复及暂停的活动历史作业保护。

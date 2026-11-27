@@ -633,6 +633,10 @@ if [[ "${VIDEOROLL_V2_TEST_STORAGE_RETENTION_ONLY:-false}" == "true" ]]; then
   "$smoke_python" "$repo_root/rust/tests/storage_retention_v1_isolated.py"
   exit 0
 fi
+if [[ "${VIDEOROLL_V2_TEST_BULK_RESUME_ONLY:-false}" == "true" ]]; then
+  "$smoke_python" "$repo_root/rust/tests/bulk_resume_v1_isolated.py"
+  exit 0
+fi
 if [[ "${VIDEOROLL_V2_TEST_SOURCE_RECOVERY_ONLY:-false}" == "true" ]]; then
   PYTHONPATH="$repo_root/src" "$smoke_python" "$repo_root/rust/tests/source_recovery_v1_isolated.py"
   exit 0
