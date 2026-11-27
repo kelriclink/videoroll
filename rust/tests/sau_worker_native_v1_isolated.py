@@ -144,6 +144,16 @@ if name=='nonzero':sys.exit(1)
         assert len(set(ids)) == 1
         job = ids[0]
         wait_for(lambda: "hold" in calls())
+        # Older malformed delivery rows must not hide healthy queued work.
+        bad = {}
+        for name in ("wrong-inbox","wrong-envelope","attempted","backoff"):
+            bad[name] = submit(seed("kuaishou",name))
+        with psycopg.connect(url) as conn:
+            conn.execute("UPDATE operation_inbox SET request_json='{}' WHERE operation_key=%s",("publish-job:"+bad["wrong-inbox"],))
+            conn.execute("UPDATE outbox_events SET args_json='{}' WHERE aggregate_id=%s",(bad["wrong-envelope"],))
+            conn.execute("UPDATE operation_inbox SET attempt_count=1 WHERE operation_key=%s",("publish-job:"+bad["attempted"],))
+            conn.execute("UPDATE operation_inbox SET retry_after=now()+interval '1 hour' WHERE operation_key=%s",("publish-job:"+bad["backoff"],))
+        before_bad={name:row(j) for name,j in bad.items()}
         queued = submit(seed("xiaohongshu","queued"))
         assert row(queued)[3:5] == ("native_pending","pending")
         with Session(create_engine(url.replace("postgresql://","postgresql+psycopg://",1))) as session:
@@ -153,6 +163,18 @@ if name=='nonzero':sys.exit(1)
         assert result[1]["receipt_verified"] is False
         terminal(queued,"submitted")
         assert submit(held) == job and calls().count("hold") == 1
+        assert all(row(j)==before_bad[name] and name not in calls() for name,j in bad.items())
+        controller=exe.with_name("videoroll-v2")
+        audit=json.loads(subprocess.check_output([str(controller),"outbox-audit"],timeout=15))
+        assert any(g["handler"]=="social_publisher.process_job" and g["status"]=="native_pending"
+            and g["disposition"]=="requires_reconciliation" and g["count"]==3 for g in audit["groups"]),audit
+        assert any(g["handler"]=="social_publisher.process_job" and g["status"]=="native_pending"
+            and g["disposition"]=="native_sau_queue" and g["count"]==1 for g in audit["groups"]),audit
+        with psycopg.connect(url) as conn:
+            conn.execute("UPDATE operation_inbox SET retry_after=now()-interval '1 second' WHERE operation_key=%s",("publish-job:"+bad["backoff"],))
+        terminal(bad["backoff"],"submitted")
+        assert calls().count("backoff")==1
+        print("PASS: malformed pending rows skipped and audited, retry_after respected, healthy queue progresses",flush=True)
         print("PASS: native execution, concurrent idempotency, Python dispatcher exclusion",flush=True)
 
         for platform,n,status,missing in (("kuaishou","ok","submitted",False),
@@ -245,5 +267,35 @@ if name=='nonzero':sys.exit(1)
             assert conn.execute("SELECT upload_progress FROM publish_jobs WHERE id=%s",(job,)).fetchone()[0]==37
         assert submit(interrupted) == job and calls().count("interrupted") == 1
         print("PASS: interrupted worker recovery; never replay browser submission",flush=True)
+        # An orphaned running Outbox acknowledgement can be cleared only
+        # when the independently terminal job and Inbox agree.
+        saved=row(job)
+        def business_snapshot():
+            with psycopg.connect(url) as conn:
+                return conn.execute("""SELECT to_jsonb(j),to_jsonb(i),to_jsonb(t)
+                    FROM publish_jobs j JOIN operation_inbox i ON i.operation_key=j.operation_key
+                    JOIN tasks t ON t.id=j.task_id WHERE j.id=%s""",(job,)).fetchone()
+        original=business_snapshot()
+        with psycopg.connect(url) as conn:
+            conn.execute("""UPDATE outbox_events SET status='native_running',lease_owner='rust-sau-publish:fixture',
+              lease_until=now()-interval '1 second',delivered_at=NULL WHERE aggregate_id=%s""",(job,))
+            conn.execute("UPDATE operation_inbox SET result_json=result_json||'{\"status\":\"submitted\"}'::jsonb WHERE operation_key=%s",("publish-job:"+job,))
+        blocked=submit(seed("xiaohongshu","after-ack"))
+        time.sleep(2)
+        assert row(job)[3]=="native_running" and row(blocked)[3]=="native_pending"
+        assert "after-ack" not in calls()
+        audit=json.loads(subprocess.check_output([str(controller),"outbox-audit"],timeout=15))
+        assert any(g["status"]=="native_running" and g["disposition"]=="requires_reconciliation" for g in audit["groups"]),audit
+        with psycopg.connect(url) as conn:
+            conn.execute("UPDATE operation_inbox SET result_json=%s::jsonb WHERE operation_key=%s",(json.dumps(saved[5]),"publish-job:"+job))
+            conn.execute("UPDATE outbox_events SET lease_until=now()+interval '1 hour' WHERE aggregate_id=%s",(job,))
+        time.sleep(2)
+        assert row(job)[3]=="native_running" and row(blocked)[3]=="native_pending"
+        with psycopg.connect(url) as conn:
+            conn.execute("UPDATE outbox_events SET lease_until=now()-interval '1 second' WHERE aggregate_id=%s",(job,))
+        terminal(blocked,"submitted")
+        assert row(job)==saved and business_snapshot()==original
+        assert calls().count("interrupted")==1 and calls().count("after-ack")==1
+        print("PASS: terminal acknowledgement repaired only after exact receipt agreement and expiry; original business rows unchanged",flush=True)
     finally:
         stop(proc)

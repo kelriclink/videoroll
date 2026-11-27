@@ -42,6 +42,14 @@
 - 过期恢复必须同时满足三份账本属于相同原生 owner、正确操作身份、各自租约过期；事务内再次加锁复核，不因单份过期或 NULL/错 owner 推断执行失败。冲突或未知回执仍留待核实，不重放浏览器。异常账本可能继续阻塞全局队列，后续需显式核对工具，不能自动丢弃。
 - 保持原生全局单投稿互斥，不引入账户分组并发。原账户级 Redis 锁仅作参考：浏览器运行目录隔离、登录/检测跨实例协调和真实平台仍需验收。启动围栏提交后到实际 spawn 的极短窗口无法与第三方进程原子化；正常原生账户操作继续由 busy 校验保护。未新增表/API/依赖。
 
+## 第三十一批：异常投递队列隔离与终态确认补偿
+
+参考 Python publish_lifecycle.recover_stale_publish_dispatches：现存投递不等于丢失投递，pending retry_after 应尊重，已开始或过期不能盲目重试。原 Rust 领取仅检查最早 Outbox 与 Job 部分状态，异常 Inbox 可反复阻塞健康待执行任务。
+
+- 领取前 SQL 与事务内加锁后共用 PENDING_FENCE：精确 Job/Inbox/Outbox 操作身份、原生 engine、唯一事件、未尝试、无租约/完成标记/历史回执、原生任务所有权；尊重三处 available_at/retry_after 与活动登录。畸形待执行行保留并跳过，正常队列继续；已终态且有完成时间的 pristine pending 仅确认投递，不启动 CLI。原 outbox-audit 共用领取身份判定，把异常 pending 与不一致 running 归入 requires_reconciliation。退避中的合法行仍为 native_sau_queue。
+- 单独修复已终态 Job 和已完成 Inbox 的精确匹配结果、无残留租约、相同尝试次数、原生 task、唯一且正确 envelope 的过期 running Outbox。每轮最多 32，行锁 SKIP LOCKED，只更新 Outbox 确认，不修改 Job/Inbox/Task/Batch，不产生外部动作。未过期或结果不一致继续阻塞，不把缺少证据当成功。
+- 仍采用全局单投稿互斥；损坏且不能独立证明终态的 running 记录依然 fail-closed，尚无自动纠正/人工核实工具。待执行异常行只跳过不删除；待后续人工确认。未迁移到分组并发或引入新表/API。恢复扫描仍可能因其他表锁/错误延后。
+
 ## 隔离验收
 
 VIDEOROLL_V2_TEST_SAU_NATIVE_WORKER_ONLY=true bash rust/scripts/smoke-isolated.sh

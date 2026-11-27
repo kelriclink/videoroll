@@ -37,7 +37,8 @@ pub fn validate_config(cfg: &Config) -> AppResult<()> {
 /// No external calls. Counts are delivery state, not business success.
 /// All unrecognized or unresolved legacy rows remain visible blockers.
 pub async fn audit(db: &Database) -> AppResult<Value> {
-    let rows=sqlx::query(r#"SELECT e.task_name,e.status,
+    let pending_fence=crate::sau_worker_native_v1::PENDING_FENCE;
+    let sql=format!(r#"SELECT e.task_name,e.status,
         CASE
           WHEN e.status='native_completed' AND e.task_name IN
             ('rust.publish.batch_finished','rust.publish.cleanup','rust.render.dubbing_failed','social_publisher.process_job')
@@ -48,12 +49,22 @@ pub async fn audit(db: &Database) -> AppResult<Value> {
           WHEN e.status='native_pending' AND e.task_name IN ('rust.publish.batch_finished','rust.publish.cleanup')
             AND EXISTS(SELECT 1 FROM publish_batches b JOIN tasks t ON t.id=b.task_id WHERE b.id::text=e.aggregate_id AND t.runtime_owner='rust')
             THEN 'native_batch_queue'
-          WHEN e.status IN ('native_pending','native_running') AND e.task_name='social_publisher.process_job'
-            AND i.runtime_engine='rust-sau-publish'
-            AND ((e.status='native_pending' AND i.status='pending') OR
-                 (e.status='native_running' AND i.status='processing' AND e.lease_owner IS NOT NULL AND e.lease_owner=i.lease_owner))
+          WHEN e.status='native_pending' AND e.task_name='social_publisher.process_job'
+            AND EXISTS(SELECT 1 FROM publish_jobs j JOIN tasks t ON t.id=j.task_id
+              WHERE j.id::text=e.aggregate_id AND j.operation_key=e.operation_key AND t.runtime_owner='rust'
+              AND {pending_fence}) THEN 'native_sau_queue'
+          WHEN e.status='native_running' AND e.task_name='social_publisher.process_job'
+            AND i.runtime_engine='rust-sau-publish' AND i.status='processing'
+            AND e.lease_owner LIKE 'rust-sau-publish:%' AND e.lease_owner=i.lease_owner
+            AND e.lease_until IS NOT NULL AND i.lease_until IS NOT NULL AND i.lease_token IS NULL
             AND EXISTS(SELECT 1 FROM publish_jobs j JOIN tasks t ON t.id=j.task_id WHERE j.id::text=e.aggregate_id
-              AND j.operation_key=e.operation_key AND t.runtime_owner='rust') THEN 'native_sau_queue'
+              AND j.operation_key=e.operation_key AND t.runtime_owner='rust' AND j.state::text='submitting'
+              AND j.lease_owner=e.lease_owner AND j.lease_until IS NOT NULL
+              AND i.request_json->>'job_id'=j.id::text AND e.operation_key='publish-job:'||j.id::text
+              AND e.event_type='publish.dispatch' AND e.aggregate_type='publish_job'
+              AND e.args_json->'args'=jsonb_build_array(j.id::text)
+              AND NOT EXISTS(SELECT 1 FROM outbox_events dup WHERE dup.operation_key=e.operation_key AND dup.id<>e.id))
+            THEN 'native_sau_queue'
           WHEN e.status='dispatched' AND e.task_name=ANY($1) AND i.status='completed' AND i.runtime_engine='python'
             THEN 'legacy_acknowledged'
           WHEN e.status='pending' AND e.attempt_count=0 AND e.lease_owner IS NULL AND e.lease_until IS NULL
@@ -62,8 +73,8 @@ pub async fn audit(db: &Database) -> AppResult<Value> {
           ELSE 'requires_reconciliation'
         END AS disposition,count(*)::bigint AS count
       FROM outbox_events e LEFT JOIN operation_inbox i ON i.operation_key=e.operation_key
-      GROUP BY e.task_name,e.status,disposition ORDER BY e.task_name,e.status,disposition"#)
-      .bind(LEGACY_HANDLERS).fetch_all(&db.pool).await?;
+      GROUP BY e.task_name,e.status,disposition ORDER BY e.task_name,e.status,disposition"#);
+    let rows=sqlx::query(&sql).bind(LEGACY_HANDLERS).fetch_all(&db.pool).await?;
     let mut blockers = 0_i64;
     let mut groups = vec![];
     for r in rows {

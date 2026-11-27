@@ -113,14 +113,46 @@ async fn lock_task(tx: &mut Transaction<'_, Postgres>, task: Uuid) -> AppResult<
         .await
         .map_err(Into::into)
 }
+// A pending native delivery is claimable only if it has never crossed
+// the execution boundary. A malformed older row must not hide healthy work.
+// The same predicate is used before selection and again under row locks.
+pub(crate) const PENDING_FENCE:&str = r#"
+    e.task_name='social_publisher.process_job' AND e.event_type='publish.dispatch'
+    AND e.aggregate_type='publish_job' AND e.aggregate_id=j.id::text
+    AND e.operation_key='publish-job:'||j.id::text
+    AND e.args_json->'args'=jsonb_build_array(j.id::text)
+    AND COALESCE(e.args_json->'kwargs','{}'::jsonb)='{}'::jsonb
+    AND e.status='native_pending' AND e.attempt_count=0
+    AND e.lease_owner IS NULL AND e.lease_until IS NULL AND e.delivered_at IS NULL
+    AND i.runtime_engine='rust-sau-publish' AND i.status='pending'
+    AND i.request_json->>'job_id'=j.id::text AND i.attempt_count=0
+    AND i.lease_owner IS NULL AND i.lease_until IS NULL AND i.lease_token IS NULL
+    AND i.started_at IS NULL AND i.finished_at IS NULL AND i.completed_at IS NULL AND i.result_json IS NULL
+    AND j.platform::text IN ('douyin','xiaohongshu','kuaishou')
+    AND j.lease_owner IS NULL AND j.lease_until IS NULL
+    AND NOT EXISTS(SELECT 1 FROM outbox_events dup WHERE dup.operation_key=e.operation_key AND dup.id<>e.id)
+    AND ((j.state::text='submitting' AND j.started_at IS NULL AND j.finished_at IS NULL
+        AND NOT j.upload_active AND j.upload_progress=0 AND j.response_json IS NULL
+        AND COALESCE(j.external_id,'')='' AND COALESCE(j.external_url,'')=''
+        AND COALESCE(j.bvid,'')='' AND COALESCE(j.aid,'')='')
+        OR (j.state::text IN ('submitted','published','failed','unknown') AND j.finished_at IS NOT NULL))
+"#;
+const PENDING_READY:&str = r#"
+    AND e.available_at<=now() AND (i.available_at IS NULL OR i.available_at<=now())
+    AND (i.retry_after IS NULL OR i.retry_after<=now())
+    AND NOT EXISTS(SELECT 1 FROM accounts a JOIN operation_inbox login
+        ON login.runtime_engine='rust-sau-login' AND login.status IN ('pending','processing')
+        AND login.request_json->>'platform'=a.platform::text AND login.request_json->>'account_name'=a.name
+        WHERE a.id=j.account_id)
+"#;
 async fn claim(state: &SauState, cfg: &PublishConfig) -> AppResult<Option<Work>> {
-    let candidate=sqlx::query("SELECT e.id AS event,j.id AS job,j.task_id,j.account_id
+    let candidate_sql=format!("SELECT e.id AS event,j.id AS job,j.task_id,j.account_id
         FROM outbox_events e JOIN publish_jobs j ON j.operation_key=e.operation_key AND j.id::text=e.aggregate_id
-        WHERE e.task_name='social_publisher.process_job' AND e.status='native_pending'
-        AND e.available_at<=now()
-        AND (j.state::text<>'submitting' OR (j.started_at IS NULL AND j.lease_owner IS NULL AND j.lease_until IS NULL))
-        ORDER BY e.available_at,e.created_at,e.id LIMIT 1")
-        .fetch_optional(&state.pool).await?;
+        JOIN operation_inbox i ON i.operation_key=e.operation_key
+        JOIN tasks t ON t.id=j.task_id
+        WHERE t.runtime_owner='rust' AND {PENDING_FENCE} {PENDING_READY}
+        ORDER BY e.available_at,e.created_at,e.id LIMIT 1");
+    let candidate=sqlx::query(&candidate_sql).fetch_optional(&state.pool).await?;
     let Some(c) = candidate else { return Ok(None) };
     let event: Uuid = c.try_get("event")?;
     let job: Uuid = c.try_get("job")?;
@@ -150,17 +182,29 @@ async fn claim(state: &SauState, cfg: &PublishConfig) -> AppResult<Option<Work>>
     };
     let row=sqlx::query("SELECT platform::text AS platform,state::text AS state,meta_json,operation_key,batch_id,started_at,lease_owner,lease_until
       FROM publish_jobs WHERE id=$1 FOR UPDATE").bind(job).fetch_one(&mut *tx).await?;
-    let queued: Option<String> =
-        sqlx::query_scalar("SELECT status FROM outbox_events WHERE id=$1 FOR UPDATE")
+    let queued: Option<Uuid> =
+        sqlx::query_scalar("SELECT id FROM outbox_events WHERE id=$1 FOR UPDATE")
             .bind(event)
             .fetch_optional(&mut *tx)
             .await?;
-    if queued.as_deref() != Some("native_pending") {
-        return Ok(None);
-    }
+    if queued.is_none(){return Ok(None)}
     let key: String = row.try_get("operation_key")?;
+    let locked_inbox:Option<Uuid>=sqlx::query_scalar("SELECT id FROM operation_inbox WHERE operation_key=$1 FOR UPDATE")
+        .bind(&key).fetch_optional(&mut *tx).await?;
+    if locked_inbox.is_none(){return Ok(None)}
+    let check_sql=format!("SELECT EXISTS(SELECT 1 FROM outbox_events e
+        JOIN publish_jobs j ON j.operation_key=e.operation_key AND j.id::text=e.aggregate_id
+        JOIN operation_inbox i ON i.operation_key=e.operation_key
+        JOIN tasks t ON t.id=j.task_id
+        WHERE t.runtime_owner='rust' AND e.id=$1 AND j.id=$2 AND j.task_id=$3 AND j.account_id IS NOT DISTINCT FROM $4
+        AND {PENDING_FENCE} {PENDING_READY})");
+    let eligible:bool=sqlx::query_scalar(&check_sql)
+        .bind(event).bind(job).bind(task).bind(account).fetch_one(&mut *tx).await?;
+    if !eligible{return Ok(None)}
     let status: String = row.try_get("state")?;
     if status != "submitting" {
+        // A pristine pending delivery for an already terminal job is
+        // acknowledged, not executed. Never promote its business outcome.
         sqlx::query("UPDATE outbox_events SET status='native_completed',delivered_at=now(),updated_at=now() WHERE id=$1").bind(event).execute(&mut *tx).await?;
         sqlx::query("UPDATE operation_inbox SET status='completed',result_json=$2,completed_at=now(),updated_at=now()
           WHERE operation_key=$1 AND runtime_engine=$3 AND status='pending'").bind(&key).bind(json!({"status":status,"job_id":job})).bind(ENGINE).execute(&mut *tx).await?;
@@ -609,7 +653,42 @@ async fn finish(state: &SauState, work: &Work, outcome: Outcome) -> AppResult<()
     tx.commit().await?;
     Ok(())
 }
+// Recover only the delivery acknowledgement when both other ledgers
+// independently agree on the terminal result. Do not settle business state
+// again, regenerate events, or clear a live/unprovable execution.
+pub(crate) const TERMINAL_ACK_FENCE:&str = r#"
+    e.task_name='social_publisher.process_job' AND e.event_type='publish.dispatch'
+    AND e.aggregate_type='publish_job' AND e.aggregate_id=j.id::text
+    AND e.operation_key='publish-job:'||j.id::text
+    AND e.args_json->'args'=jsonb_build_array(j.id::text)
+    AND e.status='native_running' AND e.lease_until<=now()
+    AND e.lease_owner LIKE 'rust-sau-publish:%' AND e.delivered_at IS NULL
+    AND e.attempt_count>0 AND e.attempt_count=i.attempt_count
+    AND j.platform::text IN ('douyin','xiaohongshu','kuaishou')
+    AND j.state::text IN ('submitted','published','failed','unknown')
+    AND j.finished_at IS NOT NULL AND j.lease_owner IS NULL AND j.lease_until IS NULL AND NOT j.upload_active
+    AND i.runtime_engine='rust-sau-publish' AND i.status='completed'
+    AND i.request_json->>'job_id'=j.id::text AND i.result_json->>'job_id'=j.id::text
+    AND i.result_json->>'status'=j.state::text AND i.completed_at IS NOT NULL
+    AND i.lease_owner IS NULL AND i.lease_until IS NULL AND i.lease_token IS NULL
+    AND NOT EXISTS(SELECT 1 FROM outbox_events dup WHERE dup.operation_key=e.operation_key AND dup.id<>e.id)
+"#;
+async fn recover_acknowledgements(state:&SauState)->AppResult<()>{
+    let sql=format!("WITH settled AS (
+        SELECT e.id FROM outbox_events e
+        JOIN publish_jobs j ON j.operation_key=e.operation_key AND j.id::text=e.aggregate_id
+        JOIN operation_inbox i ON i.operation_key=e.operation_key
+        JOIN tasks t ON t.id=j.task_id
+        WHERE t.runtime_owner='rust' AND {TERMINAL_ACK_FENCE}
+        ORDER BY e.lease_until,e.id LIMIT 32 FOR UPDATE OF t,j,e,i SKIP LOCKED
+    ) UPDATE outbox_events e SET status='native_completed',lease_owner=NULL,lease_until=NULL,
+        delivered_at=now(),updated_at=now() FROM settled WHERE e.id=settled.id");
+    let count=sqlx::query(&sql).execute(&state.pool).await?.rows_affected();
+    if count>0{tracing::info!(count,"recovered settled SAU delivery acknowledgements")}
+    Ok(())
+}
 async fn recover(state: &SauState) -> AppResult<()> {
+    recover_acknowledgements(state).await?;
     let rows=sqlx::query("SELECT e.id AS event,j.id AS job,j.task_id,j.batch_id,j.account_id,j.platform::text AS platform,
       j.operation_key,j.lease_owner FROM outbox_events e JOIN publish_jobs j ON j.operation_key=e.operation_key AND j.id::text=e.aggregate_id
       JOIN operation_inbox i ON i.operation_key=j.operation_key
