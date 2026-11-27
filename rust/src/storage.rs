@@ -15,6 +15,12 @@ pub struct AssetRegistry {
     pub db: Database,
     pub root: PathBuf,
 }
+/// A canceled task with a saved checkpoint is paused, not disposable.
+pub(crate) fn terminal_resources_releasable(status: &str, stopped: Option<&str>) -> bool {
+    status.eq_ignore_ascii_case("published")
+        || status.eq_ignore_ascii_case("failed")
+        || (status.eq_ignore_ascii_case("canceled") && stopped.is_none())
+}
 /// Revalidate publication safety under the parent task lock, at both
 /// reference release and physical GC time.
 pub(crate) async fn publication_cleanup_blocked(
@@ -473,12 +479,13 @@ impl AssetRegistry {
         }
         if let Some(row) = rows.first() {
             let task_id: Uuid = row.try_get("task_id")?;
-            let state: String =
-                sqlx::query_scalar("SELECT upper(status::text) FROM tasks WHERE id=$1 FOR UPDATE")
-                    .bind(task_id)
-                    .fetch_one(&mut *tx)
-                    .await?;
-            if !matches!(state.as_str(), "PUBLISHED" | "FAILED" | "CANCELED") {
+            let (state, stopped): (String, Option<String>) = sqlx::query_as(
+                "SELECT upper(status::text),stopped_status::text FROM tasks WHERE id=$1 FOR UPDATE",
+            )
+            .bind(task_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            if !terminal_resources_releasable(&state, stopped.as_deref()) {
                 return Ok(false);
             }
             let unfinished:(bool,)=sqlx::query_as(
@@ -636,16 +643,13 @@ impl AssetRegistry {
             let legacy_ref:(bool,)=sqlx::query_as(
                 "SELECT EXISTS(SELECT 1 FROM assets WHERE storage_key LIKE ($1 || '/%') UNION ALL SELECT 1 FROM subtitles WHERE storage_key LIKE ($1 || '/%'))"
             ).bind(&key).fetch_one(&self.db.pool).await?;
-            let task_state: String =
-                sqlx::query_scalar("SELECT upper(status::text) FROM tasks WHERE id=$1")
-                    .bind(task_id)
-                    .fetch_one(&self.db.pool)
-                    .await?;
             let mut safety_tx = self.db.pool.begin().await?;
-            sqlx::query("SELECT id FROM tasks WHERE id=$1 FOR UPDATE")
-                .bind(task_id)
-                .fetch_one(&mut *safety_tx)
-                .await?;
+            let (task_state, stopped): (String, Option<String>) = sqlx::query_as(
+                "SELECT upper(status::text),stopped_status::text FROM tasks WHERE id=$1 FOR UPDATE",
+            )
+            .bind(task_id)
+            .fetch_one(&mut *safety_tx)
+            .await?;
             let publish_blocked = publication_cleanup_blocked(&mut safety_tx, task_id).await?;
             let batch_blocked = task_state == "PUBLISHED"
                 && crate::bilibili_batch_reconcile_v1::current_batches(&mut safety_tx, task_id)
@@ -655,7 +659,6 @@ impl AssetRegistry {
                         *s != crate::bilibili_batch_reconcile_v1::State::Succeeded
                             || t.is_none_or(|t| t + chrono::Duration::hours(24) > Utc::now())
                     });
-            safety_tx.commit().await?;
             if !expected
                 || publish_blocked
                 || batch_blocked
@@ -663,8 +666,9 @@ impl AssetRegistry {
                 || unfinished.0
                 || active_operation.0
                 || legacy_ref.0
-                || !matches!(task_state.as_str(), "PUBLISHED" | "FAILED" | "CANCELED")
+                || !terminal_resources_releasable(&task_state, stopped.as_deref())
             {
+                safety_tx.commit().await?;
                 sqlx::query("UPDATE storage_workdirs SET state='retained',lease_until=NULL,due_at=now()+interval '10 minutes',updated_at=now() WHERE path_key=$1")
                     .bind(&key).execute(&self.db.pool).await?;
                 continue;
@@ -678,6 +682,8 @@ impl AssetRegistry {
                 }
             }
             .await;
+            // Keep the parent task locked until the filesystem operation finishes.
+            safety_tx.commit().await?;
             match result {
                 Ok(()) => {
                     sqlx::query("UPDATE storage_workdirs SET state='deleted',lease_until=NULL,updated_at=now() WHERE path_key=$1 AND workflow_id=$2")
@@ -704,6 +710,15 @@ impl AssetRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn terminal_cleanup_preserves_resumable_canceled_tasks() {
+        assert!(terminal_resources_releasable("published", None));
+        assert!(terminal_resources_releasable("FAILED", None));
+        assert!(terminal_resources_releasable("canceled", None));
+        assert!(!terminal_resources_releasable("CANCELED", Some("rendering")));
+        assert!(!terminal_resources_releasable("publishing", None));
+        assert!(!terminal_resources_releasable("created", None));
+    }
     #[test]
     fn rejects_path_traversal_and_platform_ambiguity() {
         for s in [

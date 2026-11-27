@@ -133,6 +133,9 @@ fn scan_orphans(root: &Path, task: Uuid) -> io::Result<HashSet<String>> {
 async fn unsafe_to_delete(tx: &mut Transaction<'_, Postgres>, task: Uuid) -> AppResult<bool> {
     // A canceled task with stopped_status is resumable, not terminal.
     // Check all original and native in-flight work before removing any media.
+    if crate::storage::publication_cleanup_blocked(tx, task).await? {
+        return Ok(true);
+    }
     let busy:bool=sqlx::query_scalar(r#"
       SELECT EXISTS(SELECT 1 FROM subtitle_jobs WHERE task_id=$1 AND status::text IN ('queued','running'))
        OR EXISTS(SELECT 1 FROM render_jobs WHERE task_id=$1 AND status::text IN ('queued','running'))
@@ -252,8 +255,7 @@ async fn cleanup(state: &AppState) -> AppResult<Value> {
             let Some(row) = row else { continue };
             let status: String = row.try_get("status")?;
             let stopped: Option<String> = row.try_get("stopped")?;
-            if !matches!(status.as_str(), "published" | "failed" | "canceled")
-                || (status == "canceled" && stopped.is_some())
+            if !crate::storage::terminal_resources_releasable(&status, stopped.as_deref())
                 || unsafe_to_delete(&mut tx, task).await?
             {
                 continue;

@@ -30,6 +30,7 @@ def id_for(index):
     return uuid.UUID(f"00000000-0000-0000-0000-{93000+index:012d}")
 pub,failed,canceled,paused,live,dubbing,shared,unsafe=(id_for(x) for x in range(1,9))
 pending_task=id_for(9)
+paused_pipeline,unknown_pipeline,accepted_operation=(id_for(x) for x in range(10,13))
 asset_pending=id_for(26)
 asset1,asset2,asset3,asset_shared,asset_other=(id_for(x) for x in range(21,26))
 sub_id=id_for(30)
@@ -42,7 +43,15 @@ pg(f"""INSERT INTO tasks(id,source_type,source_license,status,stopped_status) VA
  ('{dubbing}','local','own','published',NULL),
  ('{shared}','local','own','published',NULL),
  ('{unsafe}','local','own','published',NULL),
- ('{pending_task}','local','own','failed',NULL);
+ ('{pending_task}','local','own','failed',NULL),
+ ('{paused_pipeline}','local','own','failed',NULL),
+ ('{unknown_pipeline}','local','own','failed',NULL),
+ ('{accepted_operation}','local','own','failed',NULL);
+ INSERT INTO pipeline_runs(id,task_id,engine,workflow_name,state) VALUES
+ ('{id_for(51)}','{paused_pipeline}','hatchet','fixture','paused'),
+ ('{id_for(52)}','{unknown_pipeline}','hatchet','fixture','unknown');
+ INSERT INTO operation_inbox(id,operation_key,task_id,runtime_engine,status) VALUES
+ ('{id_for(53)}','fixture:terminal-cleanup:{accepted_operation}','{accepted_operation}','python','accepted');
  INSERT INTO assets(id,task_id,kind,storage_key) VALUES
  ('{asset1}','{pub}','video_raw','raw/{pub}/video.mp4'),
  ('{asset2}','{pub}','subtitle_srt','sub/{pub}/zh.srt'),
@@ -73,7 +82,10 @@ retained={
     f"raw/{paused}/paused.mp4":b"resumable",
     f"raw/{live}/live.mp4":b"working",
     f"dub/{dubbing}/audio.wav":b"active dubbing",
-    f"final/{shared}/shared.mp4":b"other task owns shared file"}
+    f"final/{shared}/shared.mp4":b"other task owns shared file",
+    f"raw/{paused_pipeline}/paused.mp4":b"paused pipeline still owns media",
+    f"raw/{unknown_pipeline}/unknown.mp4":b"unknown pipeline may still own media",
+    f"raw/{accepted_operation}/accepted.mp4":b"accepted operation still owns media"}
 for key,payload in (positive|retained).items():
     file=root/key
     file.parent.mkdir(parents=True,exist_ok=True)
@@ -131,7 +143,7 @@ external.unlink()
 for key in retained:
     (root/key).unlink()
 shutil.rmtree(root/"meta"/str(pending_task))
-for task in (paused,live,dubbing,shared):
+for task in (paused,live,dubbing,shared,paused_pipeline,unknown_pipeline,accepted_operation):
     for prefix in ("raw","final","dub"):
         parent=root/prefix/str(task)
         if parent.exists():
