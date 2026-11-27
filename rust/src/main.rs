@@ -105,7 +105,7 @@ enum Command {
     /// Run one due-check for the original YouTube Home recommendation scanner.
     /// Exits without side effects unless home_scan_enabled is true and due.
     HomeTick,
-    /// Process expired, unreferenced v2 artifacts. Never touches v1-only assets.
+    /// Process expired v2 artifacts and explicitly enabled legacy pending deletes.
     Gc {
         #[arg(long, default_value_t = 50)]
         limit: i64,
@@ -384,6 +384,11 @@ async fn main() -> anyhow::Result<()> {
                         },
                         Err(error)=>tracing::warn!(%error,"published retention settings unavailable"),
                     }
+                    match videoroll_v2::maintenance_terminal_storage_v1::retry_pending_deletes(&maintenance_store, 100).await {
+                        Ok(n) if n > 0 => tracing::info!(removed=n,"legacy pending storage deletes completed"),
+                        Ok(_) => {},
+                        Err(error) => tracing::warn!(%error,"legacy pending storage deletion deferred"),
+                    }
                     if let Err(e) = maintenance_store.collect(100).await {
                         tracing::warn!(error=%e,"v2 object garbage collection failed");
                     }
@@ -534,11 +539,13 @@ async fn main() -> anyhow::Result<()> {
                 .await?;
             let ttl = videoroll_v2::operations_v1::published_retention(&registry.db).await?;
             let published = registry.reconcile_published_resources(limit, ttl).await?;
+            let legacy_pending = videoroll_v2::maintenance_terminal_storage_v1::retry_pending_deletes(&registry, limit).await?;
             let deleted = registry.collect(limit).await?;
             let directories = registry.collect_workdirs(limit).await?;
             tracing::info!(
                 batch_events,
                 released,
+                legacy_pending,
                 deleted,
                 published,
                 directories,

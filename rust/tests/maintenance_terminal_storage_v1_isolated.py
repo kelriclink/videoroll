@@ -137,6 +137,63 @@ code,again=call("POST","/maintenance/storage/cleanup-terminal")
 assert code==200 and again["deleted_objects"]==0 and again["deleted_assets"]==0,again
 print("PASS: terminal cleanup reuses original assets/subtitles, orphans and Python lock; blocks paused, active, shared, symlink and dubbing files")
 print("PASS: task history remains, pending counts honest, second call idempotent and external symlink target unchanged")
+
+# Exercise the actual native GC command and original Python pending-delete keys.
+# The original test script starts only the isolated API, no competing workers.
+old_request=datetime.now(timezone.utc)-timedelta(minutes=20)
+def queue(key,bucket="filesystem",fake_hash=False):
+    digest=hashlib.sha256(((bucket or "")+"\0"+key).encode()).hexdigest()
+    setting="storage.pending_delete."+("0"*64 if fake_hash else digest)
+    payload=json.dumps({"storage_key":key,"bucket":bucket,
+        "reason":"manual_asset_delete","requested_at":old_request.isoformat()})
+    pg(f"INSERT INTO app_settings(key,value_json,updated_at) VALUES('{setting}','{payload}'::jsonb,now()-interval '20 minutes')")
+    return setting
+def fixture(key,old=True):
+    path=root/key
+    path.parent.mkdir(parents=True,exist_ok=True)
+    path.write_bytes(b"pending fixture")
+    if old:
+        stamp=(old_request-timedelta(minutes=1)).timestamp()
+        os.utime(path,(stamp,stamp))
+    return path
+retry_key=f"raw/{failed}/retry.mp4"
+missing_key=f"raw/{failed}/already-gone.mp4"
+new_key=f"raw/{failed}/replacement.mp4"
+active_key=f"raw/{live}/pending-active.mp4"
+ref_key=f"raw/{failed}/referenced.mp4"
+native_key=f"v2/raw/{failed}/untouched.mp4"
+bad_hash_key=f"raw/{failed}/bad-hash.mp4"
+link_key=f"raw/{unsafe}/external-link"
+retry_file=fixture(retry_key)
+new_file=fixture(new_key,False)
+active_file=fixture(active_key)
+ref_file=fixture(ref_key)
+native_file=fixture(native_key)
+bad_hash_file=fixture(bad_hash_key)
+pg(f"INSERT INTO assets(id,task_id,kind,storage_key) VALUES('{id_for(54)}','{live}','video_raw','{ref_key}')")
+completed=[queue(retry_key,None),queue(missing_key)]
+protected=[queue(new_key),queue(active_key),queue(ref_key),queue(native_key),queue(bad_hash_key,fake_hash=True),queue(link_key)]
+pg(f"UPDATE app_settings SET updated_at=now()-interval '20 minutes' WHERE key='{pending_setting}'")
+gc_exe=Path(__file__).resolve().parents[1]/"target"/"debug"/"videoroll-v2"
+def gc(enabled):
+    env=os.environ.copy()
+    env["VIDEOROLL_V2_ALLOW_V1_TERMINAL_CLEANUP"]="true" if enabled else "false"
+    subprocess.run([str(gc_exe),"gc","--limit","100"],env=env,check=True)
+def pending_exists(setting):
+    return pg(f"SELECT count(*) FROM app_settings WHERE key='{setting}'",True)=="1"
+gc(False)
+assert retry_file.is_file() and all(pending_exists(s) for s in completed)
+gc(True)
+assert not retry_file.exists() and not any(pending_exists(s) for s in completed)
+assert all(pending_exists(s) for s in protected+[pending_setting])
+assert all(p.is_file() for p in (new_file,active_file,ref_file,native_file,bad_hash_file))
+assert link.is_symlink() and external.read_text()=="never delete outside STORAGE_ROOT"
+gc(True)
+assert all(pending_exists(s) for s in protected+[pending_setting])
+assert all(p.is_file() for p in (new_file,active_file,ref_file,native_file,bad_hash_file))
+print("PASS: native pending delete GC respects opt-in, original hash, missing files, active/shared refs, replacements, symlinks and v2 ownership")
+for path in (new_file,active_file,ref_file,native_file,bad_hash_file):
+    path.unlink()
 link.unlink()
 shutil.rmtree(unsafe_dir)
 external.unlink()

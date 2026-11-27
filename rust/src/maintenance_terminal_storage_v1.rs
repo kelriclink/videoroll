@@ -185,6 +185,148 @@ async fn pending(tx: &mut Transaction<'_, Postgres>, key: &str) -> AppResult<()>
         .execute(&mut **tx).await?;
     Ok(())
 }
+// Only claim original filesystem records with an identifiable task owner.
+// Native v2 objects belong to the separate registry collector.
+fn pending_identity(setting: &str, value: &Value) -> Option<(Uuid, String, DateTime<Utc>)> {
+    let key = value.get("storage_key")?.as_str()?;
+    AssetRegistry::checked_key(key).ok()?;
+    let bucket = match value.get("bucket") {
+        None | Some(Value::Null) => "",
+        Some(Value::String(s)) if s.is_empty() || s == "filesystem" => s.as_str(),
+        _ => return None,
+    };
+    let expected = format!(
+        "storage.pending_delete.{}",
+        hex::encode(Sha256::digest(format!("{bucket}\0{key}").as_bytes()))
+    );
+    if setting != expected {
+        return None;
+    }
+    let task = Uuid::parse_str(key.split('/').nth(1)?).ok()?;
+    if !resource_key(key, task) {
+        return None;
+    }
+    let requested = DateTime::parse_from_rfc3339(value.get("requested_at")?.as_str()?)
+        .ok()?
+        .with_timezone(&Utc);
+    if requested > Utc::now() {
+        return None;
+    }
+    Some((task, key.to_owned(), requested))
+}
+
+/// Retry the original durable pending-delete queue without traversing storage.
+/// Only opt in after the Python retention worker has been retired.
+pub async fn retry_pending_deletes(registry: &AssetRegistry, limit: i64) -> AppResult<u64> {
+    if !enabled() {
+        return Ok(0);
+    }
+    let candidates = sqlx::query_as::<_, (String, Value)>(
+        "SELECT key,value_json FROM app_settings
+         WHERE starts_with(key,'storage.pending_delete.') AND updated_at<=now()-interval '5 minutes'
+         ORDER BY updated_at,key LIMIT $1",
+    )
+    .bind(limit.clamp(1, 200))
+    .fetch_all(&registry.db.pool)
+    .await?;
+    let mut removed = 0;
+    for (setting, snapshot) in candidates {
+        let mut tx = registry.db.pool.begin().await?;
+        let identity = pending_identity(&setting, &snapshot);
+        // Match terminal cleanup's task -> settings lock order.
+        let parent: Option<(String, Option<String>)> = if let Some((task, _, _)) = &identity {
+            sqlx::query_as(
+                "SELECT status::text,stopped_status::text FROM tasks WHERE id=$1 FOR UPDATE SKIP LOCKED",
+            )
+            .bind(task)
+            .fetch_optional(&mut *tx)
+            .await?
+        } else {
+            None
+        };
+        let current: Option<Value> = sqlx::query_scalar(
+            "SELECT value_json FROM app_settings WHERE key=$1 AND updated_at<=now()-interval '5 minutes' FOR UPDATE SKIP LOCKED",
+        )
+        .bind(&setting)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if current.as_ref() != Some(&snapshot) {
+            continue;
+        }
+        let mut completed = false;
+        if let (Some((task, key, requested)), Some((status, stopped))) = (identity, parent) {
+            if crate::storage::terminal_resources_releasable(&status, stopped.as_deref())
+                && !unsafe_to_delete(&mut tx, task).await?
+            {
+                // A short nonblocking table lock fences cross-task references
+                // too. Never wait behind a writer while holding a task lock.
+                if let Err(error) = sqlx::query(
+                    "LOCK TABLE assets, subtitles, storage_objects, storage_object_refs IN SHARE MODE NOWAIT",
+                )
+                .execute(&mut *tx)
+                .await
+                {
+                    if error.as_database_error().and_then(|e| e.code()).as_deref() == Some("55P03") {
+                        continue;
+                    }
+                    return Err(error.into());
+                }
+                let referenced: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM assets WHERE storage_key=$1)
+                     OR EXISTS(SELECT 1 FROM subtitles WHERE storage_key=$1)
+                     OR EXISTS(SELECT 1 FROM storage_objects WHERE storage_key=$1)
+                     OR EXISTS(SELECT 1 FROM storage_object_refs WHERE storage_key=$1)",
+                )
+                .bind(&key)
+                .fetch_one(&mut *tx)
+                .await?;
+                if !referenced {
+                    let deletion: AppResult<bool> = async {
+                        let path = registry.resolve_existing(&key).await?;
+                        match tokio::fs::symlink_metadata(&path).await {
+                            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(true),
+                            Err(err) => Err(err.into()),
+                            Ok(meta) if meta.is_file()
+                                && DateTime::<Utc>::from(meta.modified()?) <= requested =>
+                            {
+                                match tokio::fs::remove_file(path).await {
+                                    Ok(()) => Ok(true),
+                                    Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(true),
+                                    Err(err) => Err(err.into()),
+                                }
+                            }
+                            // Never delete a replacement created after the old
+                            // request, directories, or non-regular objects.
+                            Ok(_) => Ok(false),
+                        }
+                    }
+                    .await;
+                    match deletion {
+                        Ok(done) => completed = done,
+                        Err(error) => tracing::warn!(%task,%key,%error,"legacy pending delete deferred"),
+                    }
+                }
+            }
+        }
+        if completed {
+            sqlx::query("DELETE FROM app_settings WHERE key=$1")
+                .bind(&setting)
+                .execute(&mut *tx)
+                .await?;
+            removed += 1;
+        } else {
+            // Rotate blocked/malformed records behind other due requests.
+            // Preserve their original payload for operator reconciliation.
+            sqlx::query("UPDATE app_settings SET updated_at=now() WHERE key=$1")
+                .bind(&setting)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+    }
+    Ok(removed)
+}
+
 #[derive(Default)]
 struct Summary {
     matched_tasks: i64,
@@ -378,6 +520,26 @@ pub fn router() -> Router<AppState> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn pending_identity_checks_original_hash_and_namespace() {
+        let task = Uuid::new_v4();
+        let key = format!("raw/{task}/video.mp4");
+        let requested = (Utc::now() - Duration::minutes(10)).to_rfc3339();
+        for bucket in [json!(null), json!("filesystem")] {
+            let name = bucket.as_str().unwrap_or("");
+            let setting = format!(
+                "storage.pending_delete.{}",
+                hex::encode(Sha256::digest(format!("{name}\0{key}").as_bytes()))
+            );
+            let value = json!({"storage_key":key,"bucket":bucket,"requested_at":requested});
+            assert_eq!(pending_identity(&setting, &value).unwrap().0, task);
+            assert!(pending_identity("storage.pending_delete.fake", &value).is_none());
+        }
+        for key in [format!("v2/raw/{task}/video.mp4"), format!("raw/{task}/../x"), format!("raw/{task}")] {
+            let setting = format!("storage.pending_delete.{}", hex::encode(Sha256::digest(format!("filesystem\0{key}").as_bytes())));
+            assert!(pending_identity(&setting,&json!({"storage_key":key,"bucket":"filesystem","requested_at":requested})).is_none());
+        }
+    }
     #[test]
     fn prefix_scope_is_exact() {
         let task = Uuid::new_v4();

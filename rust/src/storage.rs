@@ -373,12 +373,15 @@ impl AssetRegistry {
     ) -> AppResult<u64> {
         let grace_seconds = grace.as_secs().clamp(3600, 3650 * 86400) as i64;
         let mut tx = self.db.pool.begin().await?;
-        let state: Option<String> =
-            sqlx::query_scalar("SELECT upper(status::text) FROM tasks WHERE id=$1 FOR UPDATE")
-                .bind(task_id)
-                .fetch_optional(&mut *tx)
-                .await?;
-        if !matches!(state.as_deref(), Some("PUBLISHED" | "FAILED" | "CANCELED")) {
+        let state: Option<(String, Option<String>)> = sqlx::query_as(
+            "SELECT upper(status::text),stopped_status::text FROM tasks WHERE id=$1 FOR UPDATE",
+        )
+        .bind(task_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if !state.as_ref().is_some_and(|(status, stopped)| {
+            terminal_resources_releasable(status, stopped.as_deref())
+        }) {
             return Err(AppError::Conflict(
                 "automatic release requires a confirmed terminal task".into(),
             ));
@@ -427,7 +430,7 @@ impl AssetRegistry {
                 "ongoing dubbing or unresolved platform publication still needs media".into(),
             ));
         }
-        if state.as_deref() == Some("PUBLISHED") {
+        if state.as_ref().is_some_and(|(status, _)| status == "PUBLISHED") {
             let batches =
                 crate::bilibili_batch_reconcile_v1::current_batches(&mut tx, task_id).await?;
             if batches.iter().any(|(_, s, finished, _)| {

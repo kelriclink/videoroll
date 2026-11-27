@@ -21,8 +21,8 @@ fi
 # Mock logs and scratch fixtures are created before the first Cargo build.
 mkdir -p "$repo_root/rust/target"
 python3 "$repo_root/rust/scripts/audit_contract_matrix.py" --check
-if [[ -n "${CARGO_HOME:-}" && -x "$CARGO_HOME/bin/cargo" ]]; then
-  : # Honor an explicitly supplied isolated Rust toolchain.
+if [[ -n "${CARGO_HOME:-}" ]]; then
+  : # Honor an explicit cache, including when Cargo itself is on PATH.
 elif [[ -x "$repo_root/.toolchains/cargo/bin/cargo" ]]; then
   export RUSTUP_HOME="$repo_root/.toolchains/rustup"
   export CARGO_HOME="$repo_root/.toolchains/cargo"
