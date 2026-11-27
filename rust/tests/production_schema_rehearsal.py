@@ -14,7 +14,7 @@ assert parsed.hostname=="127.0.0.1" and parsed.path=="/videoroll_test"
 assert os.environ["VIDEOROLL_V2_INTERNAL_TOKEN"]=="isolated-schema-rehearsal-token-0123456789"
 root=Path(os.environ["VIDEOROLL_V2_STORAGE_ROOT"])
 assert root.name.startswith("v2-schema-rehearsal.")
-exe=Path(__file__).resolve().parents[1]/"target/debug/videoroll-v2"
+exe=Path(os.environ.get("VIDEOROLL_TEST_SCHEMA_BINARY", str(Path(__file__).resolve().parents[1]/"target/debug/videoroll-v2"))).resolve(strict=True)
 manifest=root/"fixture-manifest.json"
 # Explicit allowlist. Never copy whole production objects or nested secrets.
 fields={
@@ -101,7 +101,9 @@ if sys.argv[1]=="seed":
 assert sys.argv[1]=="verify"
 m=json.loads(manifest.read_text());ids=m["ids"]
 with db() as c:
-    assert c.execute("SELECT count(*) FROM _sqlx_migrations WHERE success").fetchone()[0]==40
+    expected_versions=sorted(int(p.name.split("_",1)[0]) for p in (Path(__file__).resolve().parents[1]/"migrations").glob("*.sql") if not p.name.endswith(".down.sql"))
+    applied=c.execute("SELECT version,success FROM _sqlx_migrations ORDER BY version").fetchall()
+    assert applied==[(v,True) for v in expected_versions],(applied,expected_versions)
     assert c.execute("SELECT count(*) FROM pg_tables WHERE schemaname='public' AND tablename LIKE 'vr2_%'").fetchone()[0]==0
     assert c.execute("SELECT count(*) FROM tasks WHERE runtime_owner='python'").fetchone()[0]==5
     for k,v in m["config"].items():
@@ -111,7 +113,7 @@ with db() as c:
         assert c.execute("SELECT storage_key,sha256 FROM assets WHERE id=%s",(a,)).fetchone()==(k,h)
     assert c.execute("SELECT state,external_run_id FROM pipeline_runs WHERE id=%s",(m["run"],)).fetchone()==("launch_failed","fixture-stopped-run")
     assert c.execute("SELECT status,task_name FROM outbox_events WHERE id=%s",(m["event"],)).fetchone()==("pending","subtitle_service.push_publish_workflow_event")
-print("PASS: 40 migrations preserve original config, task/asset IDs, publication receipt, historical run and pending outbox; no physical vr2 tables",flush=True)
+print(f"PASS: {len(expected_versions)} migrations preserve original config, task/asset IDs, publication receipt, historical run and pending outbox; no physical vr2 tables",flush=True)
 pre=run("standalone-preflight",ok=False)
 assert pre["historical_blockers"]["legacy_tasks"]==5
 assert pre["historical_blockers"]["uncertain_publications"]==1

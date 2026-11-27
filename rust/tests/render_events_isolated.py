@@ -22,11 +22,11 @@ def tick():
 def seed_legacy(owner="rust",wrong=False,oldflow=False):
     t,w,r,d,e=[uuid.uuid4() for _ in range(5)]
     with db() as c:
-        c.execute("INSERT INTO tasks(id,source_type,source_license,status,runtime_owner) VALUES(%s,'local','own','published',%s)",(t,owner))
+        c.execute("INSERT INTO tasks(id,source_type,source_license,status,runtime_owner,priority,retry_count) VALUES(%s,'local','own','published',%s,0,0)",(t,owner))
         c.execute("INSERT INTO render_workers(id,worker_key,name,platform,active_jobs,status) VALUES(%s,%s,'fixture','linux',1,'busy')",(w,str(w)))
         c.execute("INSERT INTO dubbing_jobs(id,task_id,status,output_json) VALUES(%s,%s,'rendering',%s)",(d,t,json.dumps({"render_job_id":str(uuid.uuid4() if wrong else r)})))
-        c.execute("INSERT INTO render_jobs(id,task_id,status,request_json,lease_owner,lease_until) VALUES(%s,%s,'running',%s,%s,now()+interval '5 minutes')",(r,t,json.dumps({"dubbing_job_id":str(d)}),"render-worker:"+str(e)))
-        c.execute("INSERT INTO render_executions(id,render_job_id,worker_id,state,lease_until) VALUES(%s,%s,%s,'running',now()+interval '5 minutes')",(e,r,w))
+        c.execute("INSERT INTO render_jobs(id,task_id,status,request_json,progress,retry_count,lease_owner,lease_until) VALUES(%s,%s,'running',%s,0,0,%s,now()+interval '5 minutes')",(r,t,json.dumps({"dubbing_job_id":str(d)}),"render-worker:"+str(e)))
+        c.execute("INSERT INTO render_executions(id,render_job_id,worker_id,state,fence_token,lease_until) VALUES(%s,%s,%s,'running',%s,now()+interval '5 minutes')",(e,r,w,str(e)))
         if oldflow:c.execute("INSERT INTO pipeline_runs(id,task_id,engine,workflow_name,state) VALUES(%s,%s,'hatchet','fixture','running')",(uuid.uuid4(),t))
     return t,w,r,d,e
 def cancel(e,auth=True):return post(f"/render-management/executions/{e}/cancel",{"reason":"isolated cancellation"},auth)
@@ -66,7 +66,7 @@ try:
         t,w,r,d,e=seed_legacy()
         k=f"workflow-dubbing-finished:{d}:failed"
         with db() as c:
-            c.execute("INSERT INTO outbox_events(id,event_type,aggregate_type,aggregate_id,task_name,operation_key,status,attempt_count) VALUES(%s,'workflow.dubbing.finished','dubbing_job',%s,'subtitle_service.push_dubbing_workflow_event',%s,'pending',%s)",(uuid.uuid4(),str(d),k,int(attempted)))
+            c.execute("INSERT INTO outbox_events(id,event_type,aggregate_type,aggregate_id,task_name,args_json,operation_key,status,attempt_count) VALUES(%s,'workflow.dubbing.finished','dubbing_job',%s,'subtitle_service.push_dubbing_workflow_event','{}',%s,'pending',%s)",(uuid.uuid4(),str(d),k,int(attempted)))
         assert cancel(e)[0]==(409 if attempted else 200)
         with db() as c:
             assert c.execute("SELECT status,task_name FROM outbox_events WHERE operation_key=%s",(k,)).fetchone()==(("pending","subtitle_service.push_dubbing_workflow_event") if attempted else ("native_completed","rust.render.dubbing_failed"))
@@ -86,9 +86,9 @@ def native(mode="burn_in",state="completed",wrong=False,canceled=False,ticket_wr
     path=root/key;path.parent.mkdir(parents=True,exist_ok=True)
     if uploaded: path.write_bytes(b"fixture")
     with db() as c:
-        c.execute("INSERT INTO tasks(id,source_type,source_license,status,runtime_owner) VALUES(%s,'local','own',%s,'rust')",(t,"canceled" if canceled else "subtitle_ready"))
+        c.execute("INSERT INTO tasks(id,source_type,source_license,status,runtime_owner,priority,retry_count) VALUES(%s,'local','own',%s,'rust',0,0)",(t,"canceled" if canceled else "subtitle_ready"))
         c.execute("INSERT INTO pipeline_runs(id,task_id,generation,engine,workflow_name,state,current_stage) VALUES(%s,%s,1,'rust-v2','videoroll.rust.pipeline','running','render')",(w,t))
-        c.execute("INSERT INTO operation_inbox(id,operation_key,runtime_engine,task_id,workflow_id,stage,generation,status,external_ticket) VALUES(%s,%s,'rust-v2',%s,%s,'render',1,'awaiting',%s)",(j,"render-test:"+str(j),t,w,str(uuid.uuid4() if ticket_wrong else e)))
+        c.execute("INSERT INTO operation_inbox(id,operation_key,runtime_engine,task_id,workflow_id,stage,generation,status,request_json,external_ticket) VALUES(%s,%s,'rust-v2',%s,%s,'render',1,'awaiting','{}',%s)",(j,"render-test:"+str(j),t,w,str(uuid.uuid4() if ticket_wrong else e)))
         if uploaded: c.execute("INSERT INTO assets(id,task_id,kind,storage_key) VALUES(%s,%s,'video_final',%s)",(a,t,key if not wrong else key+".different"))
         c.execute("INSERT INTO render_executions(id,job_id,task_id,workflow_id,runtime_engine,state,mode,uploaded_asset_id,render_spec,error_message) VALUES(%s,%s,%s,%s,'rust-v2',%s,%s,%s,%s,%s)",(e,j,t,w,state,mode,None if mode=="noop" or not uploaded else a,json.dumps({"request":{"input_key":key}}),"simulated renderer failure" if state=="failed" else None))
     return t,w,j,e,key

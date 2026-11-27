@@ -97,13 +97,16 @@ async fn search_web(
         Duration::from_secs(60),
         4,
         || async {
-            let mut request = http.get(url).timeout(Duration::from_secs(12));
-            if let Some(token) = settings.web_search_api_key.as_ref() {
-                request = request.bearer_auth(token);
-            }
-            let response = request.send().await?;
-            provider_cache::check_status(&provider, &response).await?;
-            let bytes = provider_cache::bounded_body(response, 4 * 1024 * 1024).await?;
+            let bytes = provider_cache::retry_read(db, job, || async {
+                let mut request = http.get(url.clone()).timeout(Duration::from_secs(12));
+                if let Some(token) = settings.web_search_api_key.as_ref() {
+                    request = request.bearer_auth(token);
+                }
+                let response = request.send().await?;
+                provider_cache::check_status(&provider, &response).await?;
+                provider_cache::bounded_body(response, 4 * 1024 * 1024).await
+            })
+            .await?;
             let payload: Value = serde_json::from_slice(&bytes)
                 .map_err(|_| AppError::Unavailable("RAG search JSON invalid".into()))?;
             let mut docs = Vec::new();

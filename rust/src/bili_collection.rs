@@ -3,7 +3,7 @@
 //! uncertain writes are reconciled by reads, never automatically replayed.
 use super::*;
 use sha2::{Digest, Sha256};
-use sqlx::{Connection, PgConnection, Row};
+use sqlx::{Connection, PgConnection};
 use uuid::Uuid;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]

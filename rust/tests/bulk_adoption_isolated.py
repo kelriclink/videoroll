@@ -17,7 +17,7 @@ assert u.hostname=="127.0.0.1" and u.path=="/videoroll_test"
 assert os.environ["VIDEOROLL_V2_INTERNAL_TOKEN"]=="isolated-schema-rehearsal-token-0123456789"
 root=Path(os.environ["VIDEOROLL_V2_STORAGE_ROOT"])
 assert root.name.startswith("v2-schema-rehearsal.")
-exe=Path(__file__).resolve().parents[1]/"target/debug/videoroll-v2"
+exe=Path(os.environ.get("VIDEOROLL_TEST_SCHEMA_BINARY", str(Path(__file__).resolve().parents[1]/"target/debug/videoroll-v2"))).resolve(strict=True)
 env={k:v for k,v in os.environ.items() if k in ("PATH","HOME","LANG","LC_ALL","DATABASE_URL","VIDEOROLL_V2_STORAGE_ROOT","VIDEOROLL_V2_INTERNAL_TOKEN","INTERNAL_API_SECRET")}
 env.update(VIDEOROLL_V2_STANDALONE="true",VIDEOROLL_V2_NATIVE_OUTBOX_ONLY="true",
     VIDEOROLL_V2_SOURCE_SCANNER="false",VIDEOROLL_V2_REMOTE_RENDER="false",

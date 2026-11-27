@@ -231,6 +231,69 @@ pub(crate) async fn selected_publication_credentials(
     let fingerprint = format!("{:x}", digest.finalize());
     Ok((cookie, csrf, Some(fingerprint)))
 }
+/// Bind follow-up writes to the credentials used for the confirmed archive.
+/// Existing explicit-account receipts use the original enqueue fingerprint;
+/// a missing or changed account must never fall back to the global Cookie.
+pub(crate) fn publication_binding(account: Option<Uuid>, cookie: &str, csrf: &str) -> Value {
+    use sha2::{Digest, Sha256};
+    let mut digest = Sha256::new();
+    digest.update((cookie.len() as u64).to_be_bytes());
+    digest.update(cookie.as_bytes());
+    digest.update(csrf.as_bytes());
+    json!({"account_id":account,"credential_sha256":hex::encode(digest.finalize())})
+}
+pub(crate) async fn confirmed_credentials(
+    db: &Database,
+    config: &Config,
+    publish_id: Uuid,
+    task_id: Uuid,
+) -> AppResult<(String, String)> {
+    let row=sqlx::query("SELECT j.result,w.configuration FROM vr2_jobs j JOIN vr2_workflows w ON w.id=j.workflow_id WHERE j.id=$1 AND j.task_id=$2 AND j.stage='publish' AND j.state='succeeded'").bind(publish_id).bind(task_id).fetch_optional(&db.pool).await?.ok_or_else(||AppError::Conflict("confirmed native archive receipt missing".into()))?;
+    let receipt: Value = row
+        .try_get::<Option<Value>, _>("result")?
+        .unwrap_or_default();
+    if receipt["native_bilibili"] != true || receipt["confirmed"] != true {
+        return Err(AppError::Conflict(
+            "native publication is not confirmed".into(),
+        ));
+    }
+    let workflow: Value = row.try_get("configuration")?;
+    let direct = &workflow["bilibili_direct_v1"];
+    let account = direct
+        .get("account_id")
+        .filter(|v| !v.is_null())
+        .map(|v| serde_json::from_value::<Uuid>(v.clone()))
+        .transpose()
+        .map_err(|_| AppError::Conflict("invalid original account identity".into()))?;
+    if !direct.is_null() {
+        let id = direct["publish_job_id"]
+            .as_str()
+            .and_then(|v| Uuid::parse_str(v).ok())
+            .ok_or_else(|| AppError::Conflict("original publish job identity missing".into()))?;
+        let owner:Option<Option<Uuid>>=sqlx::query_scalar("SELECT account_id FROM publish_jobs WHERE id=$1 AND task_id=$2 AND state::text='published' AND bvid=$3").bind(id).bind(task_id).bind(receipt["bvid"].as_str().unwrap_or("")).fetch_optional(&db.pool).await?;
+        if owner != Some(account) {
+            return Err(AppError::Conflict(
+                "original publish account or archive identity changed".into(),
+            ));
+        }
+    }
+    let (cookie, csrf, fingerprint) = selected_publication_credentials(db, config, account).await?;
+    if account.is_some() && fingerprint.as_deref() != direct["cookie_fingerprint"].as_str() {
+        return Err(AppError::Conflict(
+            "publication account credentials rotated; manual reconciliation required".into(),
+        ));
+    }
+    if let Some(binding) = receipt.get("publication_binding") {
+        if binding != &publication_binding(account, &cookie, &csrf) {
+            return Err(AppError::Conflict(
+                "confirmed archive credentials changed; manual reconciliation required".into(),
+            ));
+        }
+    }
+    // Receipts predating publication_binding retain legacy default-account
+    // behavior. Explicit accounts still require their enqueue fingerprint.
+    Ok((cookie, csrf))
+}
 fn safe_secret(v: &str) -> AppResult<String> {
     let v = v.trim();
     if v.len() > LIMIT || v.chars().any(|c| c.is_control()) {
@@ -1061,6 +1124,100 @@ pub fn router() -> Router<AppState> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn confirmed_account_real_postgres() {
+        let Ok(url) = std::env::var("VIDEOROLL_TEST_BILI_ACCOUNT_DB_URL") else {
+            return;
+        };
+        let parsed = Url::parse(&url).unwrap();
+        assert_eq!(parsed.host_str(), Some("127.0.0.1"));
+        assert_eq!(parsed.path(), "/videoroll_test");
+        let db = Database::connect(&url).await.unwrap();
+        sqlx::raw_sql("CREATE TABLE vr2_workflows(id uuid PRIMARY KEY,configuration jsonb);
+            CREATE TABLE vr2_jobs(id uuid PRIMARY KEY,task_id uuid,workflow_id uuid,stage text,state text,result jsonb);
+            CREATE TABLE accounts(id uuid PRIMARY KEY,platform text,is_active bool,secrets_encrypted text,rotated_at timestamptz);
+            CREATE TABLE publish_jobs(id uuid PRIMARY KEY,task_id uuid,account_id uuid,state text,bvid text);
+            CREATE TABLE app_settings(key text PRIMARY KEY,value_json jsonb);")
+            .execute(&db.pool).await.unwrap();
+        let mut config = Config::from_env().unwrap();
+        config.native_bilibili_cookie = Some("SESSDATA=global; bili_jct=globaltoken123".into());
+        let (account, task, workflow, job, original) = (
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+        );
+        let selected = "SESSDATA=selected; bili_jct=selectedtoken123";
+        sqlx::query("INSERT INTO accounts VALUES($1,'bilibili',true,$2,NULL)")
+            .bind(account)
+            .bind(format!("dbplain:v1:{selected}"))
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let (cookie, csrf, fingerprint) =
+            selected_publication_credentials(&db, &config, Some(account))
+                .await
+                .unwrap();
+        assert_eq!(cookie, selected);
+        sqlx::query("INSERT INTO vr2_workflows VALUES($1,$2)").bind(workflow).bind(json!({"bilibili_direct_v1":{"account_id":account,"publish_job_id":original,"cookie_fingerprint":fingerprint}})).execute(&db.pool).await.unwrap();
+        let receipt = json!({"native_bilibili":true,"confirmed":true,"bvid":"BVfixture","publication_binding":publication_binding(Some(account),&cookie,&csrf)});
+        sqlx::query("INSERT INTO vr2_jobs VALUES($1,$2,$3,'publish','succeeded',$4)")
+            .bind(job)
+            .bind(task)
+            .bind(workflow)
+            .bind(receipt)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO publish_jobs VALUES($1,$2,$3,'published','BVfixture')")
+            .bind(original)
+            .bind(task)
+            .bind(account)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            confirmed_credentials(&db, &config, job, task)
+                .await
+                .unwrap(),
+            (cookie, csrf)
+        );
+        assert!(
+            confirmed_credentials(&db, &config, job, Uuid::new_v4())
+                .await
+                .is_err()
+        );
+        sqlx::query("UPDATE publish_jobs SET account_id=NULL WHERE id=$1")
+            .bind(original)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        assert!(
+            confirmed_credentials(&db, &config, job, task)
+                .await
+                .is_err()
+        );
+        sqlx::query("UPDATE publish_jobs SET account_id=$2 WHERE id=$1")
+            .bind(original)
+            .bind(account)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE accounts SET rotated_at=now() WHERE id=$1")
+            .bind(account)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        assert!(
+            confirmed_credentials(&db, &config, job, task)
+                .await
+                .is_err()
+        );
+        println!(
+            "PASS selected original account, wrong task/account and rotated credentials rejected, no global fallback"
+        );
+    }
     #[test]
     fn typeid_candidates_are_leaf_only_and_model_choice_is_fenced() {
         let rows = vec![json!({"id":17,"name":"科技","children":[

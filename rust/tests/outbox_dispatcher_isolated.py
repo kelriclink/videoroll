@@ -26,12 +26,12 @@ def ev(handler,kind,aggregate_type,aggregate,key,args,status="pending",attempt=0
 def task(owner="rust",old=False):
     id=uuid.uuid4()
     with db() as c:
-        c.execute("INSERT INTO tasks(id,source_type,source_license,status,runtime_owner) VALUES(%s,'local','own','published',%s)",(id,owner))
+        c.execute("INSERT INTO tasks(id,source_type,source_license,status,runtime_owner,priority,retry_count) VALUES(%s,'local','own','published',%s,0,0)",(id,owner))
         if old:c.execute("INSERT INTO pipeline_runs(id,task_id,engine,workflow_name,state) VALUES(%s,%s,'hatchet','test','running')",(uuid.uuid4(),id))
     return id
 def batch(t,state="succeeded"):
     b=uuid.uuid4()
-    with db() as c:c.execute("INSERT INTO publish_batches(id,task_id,state,expected_targets,finished_at) VALUES(%s,%s,%s,%s,now()-interval '25 hours')",(b,t,state,json.dumps([{"platform":"bilibili"}])))
+    with db() as c:c.execute("INSERT INTO publish_batches(id,task_id,state,expected_targets,request_json,outcomes_json,cleanup_delivery_version,finished_at) VALUES(%s,%s,%s,%s,'{}','{}',0,now()-interval '25 hours')",(b,t,state,json.dumps([{"platform":"bilibili"}])))
     return b
 def notice(t,b,**kw):
     return ev("subtitle_service.push_publish_workflow_event","workflow.publish.finished","publish_batch",b,f"workflow-publish-finished:{b}:succeeded",[str(b),"succeeded",str(t)],**kw)

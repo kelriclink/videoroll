@@ -279,13 +279,16 @@ impl RetrievalQuery {
                     .timeout(Duration::from_secs(12))
                     .user_agent("VideoRoll-Rust/0.1 (https://github.com/kelriclink/videoroll)")
                     .build()?;
-                let response = client
-                    .get(url)
-                    .header("Accept", "application/json")
-                    .send()
-                    .await?;
-                provider_cache::check_status(&provider, &response).await?;
-                let body = provider_cache::bounded_body(response, WIKI_MAX_BYTES).await?;
+                let body = provider_cache::retry_read(db, task.job, || async {
+                    let response = client
+                        .get(url.clone())
+                        .header("Accept", "application/json")
+                        .send()
+                        .await?;
+                    provider_cache::check_status(&provider, &response).await?;
+                    provider_cache::bounded_body(response, WIKI_MAX_BYTES).await
+                })
+                .await?;
                 let payload: Value = serde_json::from_slice(&body)
                     .map_err(|_| AppError::Unavailable("invalid Wikipedia JSON".into()))?;
                 wiki_pages(&payload)
