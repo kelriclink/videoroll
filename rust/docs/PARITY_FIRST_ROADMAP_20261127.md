@@ -94,3 +94,7 @@ SAU 代码检查：当前原生领取仍采用全局单投稿互斥；账户导�
 基线 86d3ac8。原 Python segments_to_ass、mux_soft_sub、subtitle_finalization 与 native asr/ffmpeg/remote_render 对照。主辅字号独立 25..300%，原 native 1920x1080/48px 基础样式保持，辅字号基于未缩放主字号的 0.68 倍，而非跟随缩放后的主字号；自动 profile PUT、手动 action、嵌套 SubtitleJobCreate render 参数接入 ASR 两条生成路径。尚未在自动 render 时重新生成 ASS，也未实现格式选择，P2 专用对齐 ASS 沿用原样式。soft_sub 保存后本地优先硬字幕，否则有 SRT 则无视频/音频重编码封装 MKV；无字幕保持原 no-op。远端新软字幕上传验证 Matroska/SubRip，使用 .mkv；回执/GC/丢失回调仍允许该 execution 精确历史 .mp4 路径，非任意文件。自动封面与分区模式 PUT 接通已有消费逻辑，真实活动自动候选收集/选择仍未实现，不能把公开 ID 当作 mission_id。配音独立不变。
 
 验收：readability 真 PG/FFmpeg，验证实际 ASS 主字号72、MKV字幕轨、原 MPEG4 编码及重复执行；AUTO_RUNTIME_PROFILE_ONLY HTTP 与269项库测试；实际 /dev/dri/renderD128（Intel）720p H.264 60fps 8s 静态/动态字幕及 HEVC 10bit 30fps 6s → AV1 P010，两个 gated 硬件测试均退出0（不是 CPU fallback）。RENDER_EVENTS_ONLY、dub-handoff（模拟模型，真实HTTP音频/ASS/MP4与失败恢复）、PLAYOUT_ACTION_ONLY 均退出0。V100 既有显存使用25899MiB/32768MiB，低于 YouDub 驻留启动要求的12000MiB空闲，不停止生产模型。未真实加载 YouDub、未真实投稿。播控现有 UI 直接嵌入 ffplayout 原生网页，nginx 有原生节目单/控制 API 反代；未部署真实孤立播控服务，当前 docker 本地镜像清单无 ffplayout 镜像。生产 DB/服务均未变更。
+
+### 研究预算与播控契约补充
+
+串行、并行、候选门控与验证模型调用共享 pipeline_runs.research_plan 的保守 Token 预约，采用 JSON UTF-8 字节估算加64及最大输出额度，失败不退还；原配置 rag_agent_max_total_tokens（默认500000，10000..20000000）用于总额，配置降低可以收紧、同工作流重试不能增加。数据库时钟持久化 deadline_ms，旧记录缺字段时首次初始化；指纹变化也不刷新时间与额度。指纹包含原检索策略及模型上下文容量。此为请求估算上限，非精确 tokenizer、实际计费或成本预算；动态知识撤销的所有缓存失效仍待完善。真实隔离 PG 串行503与并行故障恢复、过期/旧租约及预约超额拒绝通过。播控静态测试同时覆盖旧及 Rust nginx 配置，解析上游多行路由，四项断言通过；机器已有 /opt/videoroll/bin/ffplayout 2.7.1，继续保留上游 API 而非复制控制状态。尚未执行独立频道启停及节目单写入的端到端验收。

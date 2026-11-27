@@ -6,6 +6,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 NGINX_CONF = ROOT / "src" / "web" / "nginx.conf"
+RUST_NGINX_CONF = ROOT / "deploy" / "rust-native" / "nginx.conf"
 FFPLAYOUT_PATHS = ROOT / "services" / "ffplayout" / "crates" / "app" / "src" / "api" / "path.rs"
 FFPLAYOUT_SSE_PATHS = ROOT / "services" / "ffplayout" / "crates" / "app" / "src" / "sse" / "routes.rs"
 
@@ -15,13 +16,13 @@ def _ffplayout_api_paths() -> list[str]:
     start = source.index('.nest(\n            "/api",')
     end = source.index('.nest("/data"', start)
     api_block = source[start:end]
-    paths = [f"/api{path}" for path in re.findall(r'\.route\("([^"]+)"', api_block)]
+    paths = [f"/api{path}" for path in re.findall(r'\.route\(\s*"([^"]+)"', api_block)]
 
     sse_source = FFPLAYOUT_SSE_PATHS.read_text(encoding="utf-8")
     api_routes_start = sse_source.index("pub fn api_routes()")
     data_routes_start = sse_source.index("pub fn data_routes()", api_routes_start)
     sse_api_block = sse_source[api_routes_start:data_routes_start]
-    paths.extend(f"/api{path}" for path in re.findall(r'\.route\("([^"]+)"', sse_api_block))
+    paths.extend(f"/api{path}" for path in re.findall(r'\.route\(\s*"([^"]+)"', sse_api_block))
     return paths
 
 
@@ -48,6 +49,21 @@ def test_ffplayout_gateway_does_not_capture_videoroll_api_routes() -> None:
     assert not gateway_pattern.match("/api/ws/events")
     assert not gateway_pattern.match("/api/system/resources")
     assert not gateway_pattern.match("/api/auth/status")
+
+
+def test_rust_gateway_preserves_native_playlist_and_control_api() -> None:
+    nginx = RUST_NGINX_CONF.read_text(encoding="utf-8")
+    match = re.search(r"location ~ (\^/api/\(\?:[^\n]+\)) \{", nginx)
+    assert match
+    gateway_pattern = re.compile(match.group(1))
+    assert not [path for path in _ffplayout_api_paths() if not gateway_pattern.match(_sample_route(path))]
+    for path in ("/api/playlist/1", "/api/playlist/1/2026-11-27", "/api/control/1/process", "/api/control/1/playout", "/api/control/1/media/current"):
+        assert gateway_pattern.match(path), path
+    for path in ("/api/v1/tasks", "/api/v2/tasks", "/api/ws/events", "/api/auth/status", "/api/system/resources"):
+        assert not gateway_pattern.match(path), path
+    assert "location /playout/" in nginx
+    assert "rewrite ^/playout/(.*)$ /$1 break;" in nginx
+    assert "proxy_pass $ffplayout_upstream;" in nginx
 
 
 def test_ffplayout_is_mounted_on_same_origin_path() -> None:
