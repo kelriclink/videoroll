@@ -154,6 +154,13 @@ class Handler(BaseHTTPRequestHandler):
                 lines=json.loads(messages[-1]["content"])
                 if isinstance(lines,dict) and "repair_rows" in lines:
                     repairs.append(lines)
+                    if {i["type"] for i in lines["issues"]}=={"missing_translation"}:
+                        # The newer native worker first repairs missing rows.
+                        # A non-shrinkable fixture error forces durable resume.
+                        assert failed_once and len(lines["repair_rows"])==1,lines
+                        assert lines["repair_rows"][0]["source"]==source[2] and lines["repair_rows"][0]["draft"]=="",lines
+                        self.send_error(401,"injected missing-row repair failure")
+                        return
                     assert [v["i"] for v in lines["repair_rows"]]==[0,1],lines
                     assert {i["type"] for i in lines["issues"]}=={"hard_term_missing","adjacent_duplicate_translation"},lines
                     assert all(v["draft"]=="10伏" for v in lines["repair_rows"])
@@ -235,7 +242,7 @@ try:
         time.sleep(.3)
     else:raise AssertionError(log.read_text()[-3000:])
     assert [len(x[0]) for x in observed]==[2,1,1,2],observed
-    assert failed_once and row[2]==(3 if parallel else 2) and len(asr_calls)==1 and len(repairs)==1,(row,asr_calls,repairs)
+    assert failed_once and row[2]==(3 if parallel else 2) and len(asr_calls)==1 and len(repairs)==2,(row,asr_calls,repairs)
     examples=observed[0][1]["translation_examples"]
     assert {"reviewed-same-task","approved-global"}<={e["target"] for e in examples},examples
     assert observed[1][1]["context"]["previous_source"][-1]["translation"]==target[1]

@@ -1552,7 +1552,7 @@ async fn convert_audio(
 }
 // Work checkpoints are not published assets. Preserve their stable recovery
 // path but avoid concurrent attempts sharing and truncating a temp file.
-async fn atomic_write(path: &Path, body: &[u8]) -> AppResult<()> {
+async fn atomic_write(db: &Database, job: &WorkItem, path: &Path, body: &[u8]) -> AppResult<()> {
     use tokio::io::AsyncWriteExt;
     let parent = path
         .parent()
@@ -1570,7 +1570,38 @@ async fn atomic_write(path: &Path, body: &[u8]) -> AppResult<()> {
     file.write_all(body).await?;
     file.sync_all().await?;
     drop(file);
+    // Serialize the final replacement with pause, failure, expiry/reclaim
+    // and restart, in the same Task -> Workflow -> Job lock order as the
+    // scheduler. Expensive file writes stay outside the transaction.
+    let mut tx = db.pool.begin().await?;
+    let task: Option<Uuid> = sqlx::query_scalar("SELECT id FROM tasks WHERE id=$1 AND runtime_owner='rust'
+        AND status::text<>'canceled' AND stopped_status IS NULL FOR UPDATE")
+        .bind(job.task_id).fetch_optional(&mut *tx).await?;
+    if task.is_none() {
+        return Err(AppError::Conflict("stale checkpoint task".into()));
+    }
+    let flow: Option<Uuid> = sqlx::query_scalar("SELECT id FROM vr2_workflows WHERE id=$1 AND task_id=$2
+        AND generation=$3 AND current_stage=$4 AND state='running' FOR UPDATE")
+        .bind(job.workflow_id).bind(job.task_id).bind(job.generation).bind(job.stage.as_str())
+        .fetch_optional(&mut *tx).await?;
+    if flow.is_none() {
+        return Err(AppError::Conflict("stale checkpoint workflow".into()));
+    }
+    let held: Option<Uuid> = sqlx::query_scalar("SELECT id FROM vr2_jobs WHERE id=$1 AND workflow_id=$2
+        AND task_id=$3 AND generation=$4 AND stage=$5 AND state='running' AND lease_token=$6 FOR UPDATE")
+        .bind(job.id).bind(job.workflow_id).bind(job.task_id).bind(job.generation).bind(job.stage.as_str())
+        .bind(job.lease_token).fetch_optional(&mut *tx).await?;
+    if held.is_none() {
+        return Err(AppError::Conflict("stale checkpoint worker".into()));
+    }
+    // Recheck wall-clock expiry AFTER any lock wait, not transaction now().
+    let live: bool = sqlx::query_scalar("SELECT COALESCE(lease_until>clock_timestamp(),false) FROM vr2_jobs WHERE id=$1")
+        .bind(job.id).fetch_one(&mut *tx).await?;
+    if !live {
+        return Err(AppError::Conflict("expired checkpoint lease".into()));
+    }
     std::fs::rename(temp.path(), path)?;
+    tx.commit().await?;
     Ok(())
 }
 fn parse_translation_partial(content: &str, count: usize) -> AppResult<Vec<String>> {
@@ -1844,7 +1875,7 @@ async fn persist_partial_translation(
     selective_lease(db, job).await?;
     if let Some((path, _)) = checkpoint {
         atomic_write(
-            path,
+            db, job, path,
             &serde_json::to_vec(partial).map_err(|_| {
                 AppError::Invalid("partial translation checkpoint encoding failed".into())
             })?,
@@ -1869,7 +1900,8 @@ async fn translate_batch(
     checkpoint: Option<(&Path, &str)>,
 ) -> AppResult<(Vec<String>, Value, String)> {
     let mut partial = PartialTranslation {
-        revision: 1,
+        // Older partial files may contain context from incomplete responses.
+        revision: 2,
         fingerprint: checkpoint.map(|(_, id)| id.to_owned()).unwrap_or_default(),
         rows: vec![String::new(); batch.len()],
         update: Value::Null,
@@ -1882,7 +1914,7 @@ async fn translate_batch(
         {
             if let Ok(bytes) = fs::read(path).await {
                 if let Ok(saved) = serde_json::from_slice::<PartialTranslation>(&bytes) {
-                    if saved.revision == 1
+                    if saved.revision == 2
                         && saved.fingerprint == id
                         && saved.rows.len() == batch.len()
                         && saved.rows.iter().all(|s| s.chars().count() <= 6000)
@@ -1933,16 +1965,21 @@ async fn translate_batch(
             .and_then(|v| v.pointer("/context/scene/scene_id"))
             .and_then(Value::as_u64)
             .unwrap_or(1);
-        if update.is_object() {
-            partial.update = crate::media::translation_context::merge_context(
-                &partial.update,
-                &update,
-                &batch[start..end],
-                scene,
-            );
-        }
-        if enable_summary && !summary.is_empty() {
-            partial.summary = summary;
+        // Preserve independently valid rows even when the response is
+        // incomplete, but do not learn its summary/context. A later repair
+        // can fill the holes; it cannot retroactively validate that memory.
+        if values.iter().all(|text| !text.trim().is_empty()) {
+            if update.is_object() {
+                partial.update = crate::media::translation_context::merge_context(
+                    &partial.update,
+                    &update,
+                    &batch[start..end],
+                    scene,
+                );
+            }
+            if enable_summary && !summary.is_empty() {
+                partial.summary = summary;
+            }
         }
         for (i, text) in values.iter().enumerate() {
             if !text.is_empty() {
@@ -2822,7 +2859,7 @@ pub(crate) async fn preferred_source(
             fs::create_dir_all(parent).await?;
         }
         atomic_write(
-            &path,
+            db, job, &path,
             &serde_json::to_vec(&json!({"fingerprint":identity,"captions":captions}))
                 .map_err(|_| AppError::Invalid("caption checkpoint encode failed".into()))?,
         )
@@ -3163,7 +3200,7 @@ async fn process_inner(
                 let _ = fs::remove_file(&flac).await;
                 selective_lease(db, job).await?;
                 atomic_write(
-                    &checkpoint,
+                    db, job, &checkpoint,
                     &serde_json::to_vec(&Checkpoint {
                         revision: 7,
                         fingerprint: asr_identity.clone(),
@@ -3526,7 +3563,7 @@ async fn process_inner(
                     }
                     selective_lease(db, job).await?;
                     atomic_write(
-                        &checkpoint,
+                        db, job, &checkpoint,
                         &serde_json::to_vec(&TranslationCheckpoint {
                             revision: 7,
                             fingerprint: identity,
@@ -4076,8 +4113,9 @@ mod tests {
         assert_eq!(parsed.host_str(), Some("127.0.0.1"));
         assert_eq!(parsed.path(), "/videoroll_test");
         let db = Database::connect(&url).await.unwrap();
-        sqlx::raw_sql("CREATE TABLE vr2_workflows(id uuid PRIMARY KEY,state text);
-            CREATE TABLE vr2_jobs(id uuid PRIMARY KEY,workflow_id uuid,lease_token uuid,state text,lease_until timestamptz);
+        sqlx::raw_sql("CREATE TABLE tasks(id uuid PRIMARY KEY,runtime_owner text,status text,stopped_status text);
+            CREATE TABLE vr2_workflows(id uuid PRIMARY KEY,state text,task_id uuid,generation int,current_stage text);
+            CREATE TABLE vr2_jobs(id uuid PRIMARY KEY,workflow_id uuid,lease_token uuid,state text,lease_until timestamptz,task_id uuid,generation int,stage text);
             CREATE TABLE app_settings(key text PRIMARY KEY,value_json jsonb);
             CREATE TABLE ai_usage_events(id uuid PRIMARY KEY,task_id uuid,provider text,model text,operation text,
                 success bool,status_code int,input_tokens int,output_tokens int,total_tokens int,latency_ms int,
@@ -4144,7 +4182,7 @@ mod tests {
             (
                 StatusCode::OK,
                 Json(
-                    json!({"choices":[{"message":{"content":json!({"items":items}).to_string()}}],"usage":{"total_tokens":10}}),
+                    json!({"choices":[{"message":{"content":json!({"items":items,"updated_summary":if s.mode==0{"INVALID PARTIAL SUMMARY"}else{"valid summary"}}).to_string()}}],"usage":{"total_tokens":10}}),
                 ),
             )
         }
@@ -4172,18 +4210,14 @@ mod tests {
             max_attempts: 3,
             payload: json!({}),
         };
-        sqlx::query("INSERT INTO vr2_workflows VALUES($1,'running')")
-            .bind(job.workflow_id)
-            .execute(&db.pool)
-            .await
-            .unwrap();
-        sqlx::query("INSERT INTO vr2_jobs VALUES($1,$2,$3,'running',now()+interval '10 minutes')")
-            .bind(job.id)
-            .bind(job.workflow_id)
-            .bind(job.lease_token)
-            .execute(&db.pool)
-            .await
-            .unwrap();
+        sqlx::query("INSERT INTO tasks VALUES($1,'rust','downloaded',NULL)")
+            .bind(job.task_id).execute(&db.pool).await.unwrap();
+        sqlx::query("INSERT INTO vr2_workflows VALUES($1,'running',$2,1,'subtitle')")
+            .bind(job.workflow_id).bind(job.task_id)
+            .execute(&db.pool).await.unwrap();
+        sqlx::query("INSERT INTO vr2_jobs VALUES($1,$2,$3,'running',now()+interval '10 minutes',$4,1,'subtitle')")
+            .bind(job.id).bind(job.workflow_id).bind(job.lease_token).bind(job.task_id)
+            .execute(&db.pool).await.unwrap();
         let provider = crate::providers::TranslationProvider {
             id: "fixture".into(),
             endpoint,
@@ -4224,7 +4258,7 @@ mod tests {
                 &batch,
                 "",
                 None,
-                false,
+                true,
                 Some((&path, "fixture-v1"))
             )
             .await
@@ -4233,6 +4267,8 @@ mod tests {
         let saved: PartialTranslation =
             serde_json::from_slice(&fs::read(&path).await.unwrap()).unwrap();
         assert_eq!(saved.rows, vec!["译文:alpha", "", "", "译文:delta"]);
+        assert_eq!(saved.revision,2);
+        assert!(saved.summary.is_empty() && saved.update.is_null());
         {
             let mut s = state.lock().unwrap();
             assert_eq!(s.repairs, vec![vec![1, 2]]);
@@ -4249,7 +4285,7 @@ mod tests {
             &batch,
             "",
             None,
-            false,
+            true,
             Some((&path, "fixture-v1")),
         )
         .await
@@ -4333,9 +4369,38 @@ mod tests {
             .is_err()
         );
         assert_eq!(state.lock().unwrap().calls.len(), before);
+        // Exercise the replacement boundary directly, including a stale
+        // token that passed the earlier cheap selective_lease check.
+        let marker=fixture.path().join("fenced-checkpoint.json");
+        selective_lease(&db,&job).await.unwrap();
+        atomic_write(&db,&job,&marker,b"old-progress").await.unwrap();
+        let next=Uuid::new_v4();
+        sqlx::query("UPDATE vr2_jobs SET lease_token=$2 WHERE id=$1")
+            .bind(job.id).bind(next).execute(&db.pool).await.unwrap();
+        let mut newer=job.clone();
+        newer.lease_token=next;
+        atomic_write(&db,&newer,&marker,b"new-progress").await.unwrap();
+        assert!(matches!(atomic_write(&db,&job,&marker,b"stale-progress").await,Err(AppError::Conflict(_))));
+        assert_eq!(fs::read(&marker).await.unwrap(),b"new-progress");
+        sqlx::query("UPDATE vr2_workflows SET state='paused' WHERE id=$1")
+            .bind(job.workflow_id).execute(&db.pool).await.unwrap();
+        assert!(matches!(atomic_write(&db,&newer,&marker,b"paused").await,Err(AppError::Conflict(_))));
+        sqlx::query("UPDATE vr2_workflows SET state='running' WHERE id=$1")
+            .bind(job.workflow_id).execute(&db.pool).await.unwrap();
+        sqlx::query("UPDATE tasks SET status='canceled',stopped_status='downloaded' WHERE id=$1")
+            .bind(job.task_id).execute(&db.pool).await.unwrap();
+        assert!(matches!(atomic_write(&db,&newer,&marker,b"stopped").await,Err(AppError::Conflict(_))));
+        sqlx::query("UPDATE tasks SET status='downloaded',stopped_status=NULL WHERE id=$1")
+            .bind(job.task_id).execute(&db.pool).await.unwrap();
+        sqlx::query("UPDATE vr2_jobs SET lease_until=clock_timestamp()-interval '1 second' WHERE id=$1")
+            .bind(job.id).execute(&db.pool).await.unwrap();
+        assert!(matches!(atomic_write(&db,&newer,&marker,b"expired").await,Err(AppError::Conflict(_))));
+        assert_eq!(fs::read(&marker).await.unwrap(),b"new-progress");
+        let names=std::fs::read_dir(fixture.path()).unwrap().map(|x|x.unwrap().file_name()).collect::<Vec<_>>();
+        assert!(!names.iter().any(|n|n.to_string_lossy().starts_with(".checkpoint-")));
         server.abort();
         println!(
-            "PASS: targeted missing indices, partial repair, durable subset recovery, HTTP failure subdivision, preflight context budget"
+            "PASS: targeted missing indices, partial repair, durable subset recovery, HTTP failure subdivision, preflight context budget, stale/paused/expired checkpoint fences"
         );
     }
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

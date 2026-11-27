@@ -72,3 +72,7 @@ SAU 代码检查：当前原生领取仍采用全局单投稿互斥；账户导�
 ## 第三十五批：ASR/翻译配置入口收尾
 
 基线 320a55d。对照 Python auto_profile_store.py:get_auto_profile/update_auto_profile、schemas.py:245-335、translation_checkpoint.py、translation_stage.py 与 Rust media/asr.rs:settings/runtime_asr_config、youtube_subtitles.rs。Rust 已支持实际阶段读取 ASR engine/model、摘要开关和三种 YouTube 字幕策略，原 profile PUT 却拒绝这些字段。本批开放已支持字段，校验类型/长度/枚举，模型空字符串清除覆盖，显式字幕模式优先、兼容布尔同步，旧仅布尔记录读取一致。设置首写采用与通用 settings 一致的 advisory lock 及原表冲突安全插入，避免并发首写覆盖；无新表。前端基于已加载表单快照仅发送实际改动，不丢弃未知改动或绕过未实现字段的拒绝。仍不开放尚未完全验收的格式/渲染/投稿等字段。配音和投稿保持独立。原 RAG/Agent/checkpoint 全行为仍需专项复查，本批不是完整迁移签收。
+
+## 第三十五批续：翻译检查点提交围栏
+
+基线 15891c4。对照 Python translation_checkpoint.py 的 source_segments_key/provider/时间戳匹配、translation_stage.py 的 batch checkpoint 与 Rust media/asr.rs 的批次 fingerprint、partial rows 和滚动上下文。原 Rust 已支持更细的缺失片段恢复，不重写。发现 stable checkpoint 在 cheap lease 检查后、临时文件写入和 rename 前存在旧租约覆盖窗口。四种检查点（YouTube 字幕、ASR 分段、翻译部分结果、翻译完整批次）统一在临时文件写完后，按 Task → Workflow → Job 顺序加锁，校验所有权/暂停/状态/代次/阶段/身份/token，并在全部锁取得后以 clock_timestamp 复查 lease，持锁完成 rename。保留原路径、格式、fingerprint 与恢复逻辑。文件 rename 与 DB commit 不具备跨系统原子性，且未覆盖临时音频文件/所有 Agent checkpoint 写入；不宣称完整消除所有文件竞争。测试：隔离 PostgreSQL+模拟 HTTP translation recovery，旧 token、暂停、停止、过期均不得覆盖新结果；完整 translation_context 集成回归。复查发现旧 partial 在模型响应缺失行时先学习摘要/上下文，可能污染恢复。改为只学习完整子批次响应的上下文，仍保留合法已返回行及针对缺失行修复；旧 revision=1 部分检查点失效重算，不改既有完整批次。原集成 fixture 补齐新增的缺失行修复请求并故意使之失败以继续验证持久恢复，仍核查失败摘要/上下文不传播。
