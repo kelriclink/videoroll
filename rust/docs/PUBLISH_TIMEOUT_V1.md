@@ -30,3 +30,13 @@
 - 所有权阻断查询仅对已核验的这一对 UUID 排除等待父节点；原历史 adoption 查询仍传 NULL，保持原本全部阻断条件。其他 workflow、inbox、outbox、活跃子目标、P2、SAU intent 仍然阻断。完整目标验证、孤儿回执隔离及原回执保全沿用第二十四批。
 - 复用现有批次 reconciler：成功原子结算任务、批次和父流程/阶段为 succeeded，保留原票据，安排 24h 后 cleanup；部分失败、未核实 SAU、全部失败时父流程/阶段为 unknown 而非重新执行，保留已成功目标及资料；完成事件和阶段事件仅生成一次。
 - 限制：不自动接管已经 unknown 的父流程、活动或 unknown 子工作流、存在不确定投递的目标、终态批次/父节点不一致、缺少身份凭据、多批次及 Python 所有权任务。没有对真实平台执行请求，未变更生产数据库或 API 契约。
+
+## 第二十六批：终态批次父节点状态修复
+
+基线 8fe99df。参考 Python workflows/api.py 的按 batch scope 投递完成事件、pipeline_status_sync.py 的精确 dispatch_key 与终态保护；不从 Task 状态反推工作流结果。Rust 直接基于持久化目标快照核对终态，不重放 Hatchet/Celery 事件。
+
+- 超时分页扫描额外纳入 published/failed 且存在明确原生自动批次等待阶段的任务；partial_failed/publishing 沿原扫描。仅单批次、active_publish_batch_id 精确匹配，任务状态及错误码与批次结算结果一致，任务、批次、父等待节点、所有目标均过截止时间。无更新的原生代次、活动执行或不确定投递，父身份与无租约规则沿第二十五批。
+- 每个目标均有唯一同任务/批次原记录及 finished_at（不晚于批次完成时间），不接受 draft/submitting、目标缺失、成功但无外部回执、实际聚合与批次状态矛盾。native SAU submitted 且未核实且无外部标识仍视为失败侧。未知回执不提升成功。
+- 原生完成/清理事件缺失、精确的未领取 native_pending 或已完成 native_completed（有原生完成 Inbox）允许父节点修复。事件名称、操作键、参数与批次状态需完全吻合；其他投递、重复事件、残留租约均阻断。历史 adoption 不豁免事件。
+- 复用 normal reconcile 的父节点结算函数，只写等待阶段、父流程及阶段事件；不改 Task、PublishBatch、PublishJob、Outbox、已保存的 finished_at 或 cleanup 计划；不补发缺失的清理/完成通知。重复扫描不重复结算。自动批次 unknown 父节点、已经终态的父节点、未一致结算的业务状态及历史多批次仍不处理。
+- 隔离专项新增 5 个可恢复及 12 个应阻断的终态批次样本，逐行 JSON 快照比较原任务、批次、目标和原事件未变化。未调用外部平台。

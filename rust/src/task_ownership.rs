@@ -52,6 +52,18 @@ const BLOCKERS: &str = r#"SELECT array_remove(ARRAY[
       OR (e.aggregate_type='dubbing_job' AND EXISTS(SELECT 1 FROM dubbing_jobs j WHERE j.task_id=t.id AND j.id::text=e.aggregate_id))
       OR (e.aggregate_type='subtitle_job' AND EXISTS(SELECT 1 FROM subtitle_jobs j WHERE j.task_id=t.id AND j.id::text=e.aggregate_id)))
    AND NOT (e.status IN ('dispatched','native_completed') AND COALESCE(i.status,'')='completed')
+   AND NOT ($4::uuid IS NOT NULL AND e.aggregate_type='publish_batch' AND e.aggregate_id=$4::text
+      AND e.status='native_pending' AND e.attempt_count=0 AND e.lease_owner IS NULL
+      AND e.lease_until IS NULL AND e.delivered_at IS NULL AND i.id IS NULL
+      AND EXISTS(SELECT 1 FROM publish_batches b WHERE b.id=$4 AND b.task_id=t.id
+        AND b.state IN ('succeeded','partial_failed','failed')
+        AND ((e.task_name='rust.publish.batch_finished' AND e.event_type='workflow.publish.finished'
+          AND e.operation_key='workflow-publish-finished:'||b.id::text||':'||b.state
+          AND e.args_json=jsonb_build_object('args',jsonb_build_array(b.id,b.state,t.id)))
+        OR (b.state='succeeded' AND e.task_name='rust.publish.cleanup' AND e.event_type='publish.cleanup'
+          AND e.operation_key='publish-cleanup:'||b.id::text
+          AND e.args_json=jsonb_build_object('args',jsonb_build_array(t.id,b.id)))))
+      AND NOT EXISTS(SELECT 1 FROM outbox_events dup WHERE dup.operation_key=e.operation_key AND dup.id<>e.id))
    AND NOT (e.status='pending' AND e.attempt_count=0 AND e.lease_owner IS NULL AND e.lease_until IS NULL AND e.delivered_at IS NULL AND i.id IS NULL
       AND e.aggregate_type='publish_batch' AND e.task_name IN ('subtitle_service.cleanup_task','subtitle_service.push_publish_workflow_event')
       AND NOT EXISTS(SELECT 1 FROM outbox_events dup WHERE dup.operation_key=e.operation_key AND dup.id<>e.id))
@@ -60,14 +72,14 @@ const BLOCKERS: &str = r#"SELECT array_remove(ARRAY[
 ],NULL)::text[] AS blockers FROM tasks t WHERE t.id=$1"#;
 
 pub(crate) async fn blockers(tx: &mut Transaction<'_, Postgres>, task: Uuid) -> AppResult<Vec<String>> {
-    blockers_except_batch_waiter(tx,task,None,None).await
+    blockers_except_batch_waiter(tx,task,None,None,None).await
 }
 
 /// Only the timeout reconciler may exempt a single verified, lease-free
 /// native batch waiter. Adoption and all other callers use no exemptions.
-pub(crate) async fn blockers_except_batch_waiter(tx:&mut Transaction<'_,Postgres>,task:Uuid,flow:Option<Uuid>,job:Option<Uuid>)->AppResult<Vec<String>> {
+pub(crate) async fn blockers_except_batch_waiter(tx:&mut Transaction<'_,Postgres>,task:Uuid,flow:Option<Uuid>,job:Option<Uuid>,terminal_batch:Option<Uuid>)->AppResult<Vec<String>> {
     Ok(sqlx::query_scalar(BLOCKERS)
-        .bind(task).bind(flow).bind(job)
+        .bind(task).bind(flow).bind(job).bind(terminal_batch)
         .fetch_one(&mut **tx)
         .await?)
 }

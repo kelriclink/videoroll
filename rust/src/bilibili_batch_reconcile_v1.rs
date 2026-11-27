@@ -67,7 +67,7 @@ pub(crate) enum State {
     Failed,
 }
 impl State {
-    fn name(self) -> &'static str {
+    pub(crate) fn name(self) -> &'static str {
         match self {
             Self::Active => "active",
             Self::Succeeded => "succeeded",
@@ -250,6 +250,14 @@ async fn reconcile_impl(
             .await?;
     }
     let request: Value = row.try_get("request_json")?;
+    settle_auto_parent(tx,task,batch,&request,target).await
+}
+
+/// Settle the exact parent from the target aggregate. The normal receipt
+/// path and the terminal-batch repair share this transition.
+pub(crate) async fn settle_auto_parent(
+    tx:&mut Transaction<'_,Postgres>,task:Uuid,batch:Uuid,request:&Value,target:State,
+)->AppResult<()> {
     if let Some(parent) = request.get("auto_parent").filter(|v| !v.is_null()) {
         let parse = |key: &str| {
             parent[key]

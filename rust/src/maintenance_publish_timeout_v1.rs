@@ -43,6 +43,7 @@ async fn verified_waiter(tx:&mut Transaction<'_,Postgres>,task:Uuid,batch:Uuid,p
           AND i.operation_key=$7 AND i.updated_at<$6 AND i.lease_owner IS NULL
           AND i.lease_token IS NULL AND i.lease_until IS NULL AND i.finished_at IS NULL
           AND i.completed_at IS NULL AND i.result_json IS NULL
+          AND NOT EXISTS(SELECT 1 FROM pipeline_runs newer WHERE newer.task_id=$3 AND newer.engine='rust-v2' AND newer.generation>$4)
           AND NOT EXISTS(SELECT 1 FROM publish_jobs p WHERE p.operation_key=i.operation_key)
           AND NOT EXISTS(SELECT 1 FROM outbox_events e WHERE e.operation_key=i.operation_key)
           AND NOT EXISTS(SELECT 1 FROM operation_inbox other WHERE other.workflow_id=w.id
@@ -58,7 +59,8 @@ async fn verified_waiter(tx:&mut Transaction<'_,Postgres>,task:Uuid,batch:Uuid,p
 /// Repair only a single explicit native batch with its entire target snapshot
 /// and no live or ambiguous delivery ledger. Multiple attempts or missing
 /// targets remain with their respective reconciliation paths.
-async fn recover_batch(tx:&mut Transaction<'_,Postgres>,task:Uuid,cutoff:DateTime<Utc>)->AppResult<bool> {
+async fn recover_batch(tx:&mut Transaction<'_,Postgres>,task:Uuid,cutoff:DateTime<Utc>,task_status:&str,task_error:Option<&str>)->AppResult<bool> {
+    use crate::bilibili_batch_reconcile_v1::State;
     let batches=sqlx::query("SELECT id,state,expected_targets,outcomes_json,request_json,updated_at,
         finished_at,cleanup_enqueued_at FROM publish_batches WHERE task_id=$1 ORDER BY id")
         .bind(task).fetch_all(&mut **tx).await?;
@@ -66,11 +68,19 @@ async fn recover_batch(tx:&mut Transaction<'_,Postgres>,task:Uuid,cutoff:DateTim
     let row=&batches[0];
     let batch:Uuid=row.try_get("id")?;
     let request:Value=row.try_get("request_json")?;
-    if row.try_get::<String,_>("state")?!="active"
-        || row.try_get::<DateTime<Utc>,_>("updated_at")?>=cutoff
-        || row.try_get::<Option<DateTime<Utc>>,_>("finished_at")?.is_some()
-        || row.try_get::<Option<DateTime<Utc>>,_>("cleanup_enqueued_at")?.is_some()
-        || request["runtime"]!="rust-mixed-v1" {
+    let state:String=row.try_get("state")?;
+    let finished:Option<DateTime<Utc>>=row.try_get("finished_at")?;
+    let cleanup:Option<DateTime<Utc>>=row.try_get("cleanup_enqueued_at")?;
+    let terminal=match state.as_str() {
+        "active" if task_status=="publishing" && finished.is_none() && cleanup.is_none()=>None,
+        "succeeded" if task_status=="published" && task_error.is_none()=>Some(State::Succeeded),
+        "partial_failed" if task_status=="publishing" && task_error==Some("PUBLISH_PARTIAL_FAILURE") && cleanup.is_none()=>Some(State::PartialFailed),
+        "failed" if task_status=="failed" && task_error==Some("PUBLISH_FAILED") && cleanup.is_none()=>Some(State::Failed),
+        _=>return Ok(false)
+    };
+    if row.try_get::<DateTime<Utc>,_>("updated_at")?>=cutoff
+        || request["runtime"]!="rust-mixed-v1"
+        || (terminal.is_some() && (finished.is_none_or(|v|v>=cutoff) || request["auto_parent"].is_null())) {
         return Ok(false)
     }
     let (parent_flow,parent_job)=if request["auto_parent"].is_null() {
@@ -79,7 +89,7 @@ async fn recover_batch(tx:&mut Transaction<'_,Postgres>,task:Uuid,cutoff:DateTim
         let Some((flow,job))=verified_waiter(tx,task,batch,&request["auto_parent"],cutoff).await? else {return Ok(false)};
         (Some(flow),Some(job))
     };
-    let blockers=crate::task_ownership::blockers_except_batch_waiter(tx,task,parent_flow,parent_job).await?;
+    let blockers=crate::task_ownership::blockers_except_batch_waiter(tx,task,parent_flow,parent_job,terminal.map(|_|batch)).await?;
     if blockers.iter().any(|s| !matches!(s.as_str(),"task_publishing"|"publication_unsettled"|"publish_batch_unsettled")) {
         return Ok(false)
     }
@@ -102,11 +112,23 @@ async fn recover_batch(tx:&mut Transaction<'_,Postgres>,task:Uuid,cutoff:DateTim
           AND i.id IS DISTINCT FROM $4::uuid
           AND (i.status NOT IN ('completed','succeeded','failed','canceled') OR
                i.lease_owner IS NOT NULL OR i.lease_until IS NOT NULL OR i.lease_token IS NOT NULL))
-      OR EXISTS(SELECT 1 FROM outbox_events WHERE aggregate_type='publish_batch' AND aggregate_id=$2::text)")
-        .bind(task).bind(batch).bind(parent_flow).bind(parent_job).fetch_one(&mut **tx).await?;
+      OR EXISTS(SELECT 1 FROM outbox_events e LEFT JOIN operation_inbox i ON i.operation_key=e.operation_key
+        WHERE e.aggregate_type='publish_batch' AND e.aggregate_id=$2::text
+        AND NOT COALESCE(($5::text IS NOT NULL AND e.lease_owner IS NULL AND e.lease_until IS NULL
+          AND ((e.status='native_pending' AND e.attempt_count=0 AND e.delivered_at IS NULL AND i.id IS NULL)
+            OR (e.status='native_completed' AND i.runtime_engine='rust-publish-batch' AND i.status='completed'
+              AND i.lease_owner IS NULL AND i.lease_until IS NULL AND i.lease_token IS NULL))
+          AND ((e.task_name='rust.publish.batch_finished' AND e.event_type='workflow.publish.finished'
+            AND e.operation_key='workflow-publish-finished:'||$2::text||':'||$5
+            AND e.args_json=jsonb_build_object('args',jsonb_build_array($2::uuid,$5::text,$1::uuid)))
+            OR ($5='succeeded' AND e.task_name='rust.publish.cleanup' AND e.event_type='publish.cleanup'
+            AND e.operation_key='publish-cleanup:'||$2::text
+            AND e.args_json=jsonb_build_object('args',jsonb_build_array($1::uuid,$2::uuid))))
+          AND NOT EXISTS(SELECT 1 FROM outbox_events dup WHERE dup.operation_key=e.operation_key AND dup.id<>e.id)),false))")
+        .bind(task).bind(batch).bind(parent_flow).bind(parent_job).bind(terminal.map(State::name)).fetch_one(&mut **tx).await?;
     if busy{return Ok(false)}
     let jobs=sqlx::query("SELECT j.id,j.task_id,j.batch_id,j.platform::text AS platform,j.account_id,j.state::text AS state,
-      j.operation_key,j.response_json,
+      j.operation_key,j.response_json,j.finished_at,
       (j.updated_at >= $2 OR j.heartbeat_at >= $2 OR j.lease_owner IS NOT NULL OR j.lease_until IS NOT NULL OR j.upload_active
         OR COALESCE(j.response_json->'auto_dub_p2'->>'state','') NOT IN ('','published','failed')) IS TRUE AS busy,
       (NULLIF(j.external_id,'') IS NOT NULL OR NULLIF(j.external_url,'') IS NOT NULL
@@ -130,6 +152,7 @@ async fn recover_batch(tx:&mut Transaction<'_,Postgres>,task:Uuid,cutoff:DateTim
     if jobs.len()!=keys.len(){return Ok(false)}
     let mut seen=HashSet::new();
     let mut orphans=Vec::new();
+    let mut successes=0usize;
     for job in jobs {
         let id:Uuid=job.try_get("id")?;
         let platform:String=job.try_get("platform")?;
@@ -144,19 +167,31 @@ async fn recover_batch(tx:&mut Transaction<'_,Postgres>,task:Uuid,cutoff:DateTim
         let state:String=job.try_get("state")?;
         let response:Option<Value>=job.try_get("response_json")?;
         let any_receipt=job.try_get::<bool,_>("any_receipt")?;
+        if terminal.is_some() && job.try_get::<Option<DateTime<Utc>>,_>("finished_at")?.is_none_or(|v|finished.is_none_or(|end|v>end)) {
+            return Ok(false)
+        }
         match state.as_str() {
-            "published"|"submitted" if job.try_get::<bool,_>("valid_receipt")? => {},
+            "published"|"submitted" if job.try_get::<bool,_>("valid_receipt")? => {successes+=1;},
             // The existing reconciler treats this exact native unverified
             // SAU receipt as unknown, while preserving the original row.
             "submitted" if !any_receipt && response.as_ref().is_some_and(|v|v["runtime"]=="rust" && v["receipt_verified"]==false)=>{},
             "failed" if !any_receipt=>{},
             "unknown"=>{},
-            "draft"|"submitting" if !any_receipt
+            "draft"|"submitting" if terminal.is_none() && !any_receipt
                 && !job.try_get::<bool,_>("has_delivery")?
                 && job.try_get::<Option<String>,_>("operation_key")?.as_deref()==Some(format!("publish-job:{id}").as_str())
                 && response.as_ref().is_none_or(Value::is_object)=>{orphans.push(id);},
             _=>return Ok(false)
         }
+    }
+    if let Some(recorded)=terminal {
+        // The original terminal task and batch are already settled. Do not
+        // run the full reconciler, which would touch their timestamps and
+        // cleanup schedule. Verify every target and settle only the waiter.
+        let computed=if successes==keys.len(){State::Succeeded}else if successes>0{State::PartialFailed}else{State::Failed};
+        if computed!=recorded{return Ok(false)}
+        crate::bilibili_batch_reconcile_v1::settle_auto_parent(tx,task,batch,&request,recorded).await?;
+        return Ok(true)
     }
     for id in orphans {
         sqlx::query("UPDATE publish_jobs SET state='unknown',upload_active=false,
@@ -172,13 +207,13 @@ async fn recover_batch(tx:&mut Transaction<'_,Postgres>,task:Uuid,cutoff:DateTim
 
 async fn recover_one(db:&Database, task:Uuid, cutoff:DateTime<Utc>, hours:i64)->AppResult<bool> {
     let mut tx=db.pool.begin().await?;
-    let parent:Option<Uuid>=sqlx::query_scalar("SELECT id FROM tasks t
-       WHERE id=$1 AND runtime_owner='rust' AND status::text='publishing' AND updated_at<$2
+    let parent:Option<(String,Option<String>)>=sqlx::query_as("SELECT status::text,error_code FROM tasks t
+       WHERE id=$1 AND runtime_owner='rust' AND status::text IN ('publishing','published','failed') AND updated_at<$2
        AND stopped_status IS NULL AND to_jsonb(t)->>'lock_owner' IS NULL
        AND to_jsonb(t)->>'lock_until' IS NULL
        FOR UPDATE SKIP LOCKED")
        .bind(task).bind(cutoff).fetch_optional(&mut *tx).await?;
-    if parent.is_none(){return Ok(false)}
+    let Some((status,error))=parent else{return Ok(false)};
     // Legacy writers may update a receipt without taking the task lock.
     // Never wait for a competing write while holding the parent lock.
     sqlx::query("LOCK TABLE publish_jobs,publish_batches,operation_inbox,outbox_events IN SHARE ROW EXCLUSIVE MODE NOWAIT")
@@ -186,10 +221,11 @@ async fn recover_one(db:&Database, task:Uuid, cutoff:DateTime<Utc>, hours:i64)->
     let has_batch:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM publish_batches WHERE task_id=$1)")
         .bind(task).fetch_one(&mut *tx).await?;
     if has_batch {
-        if !recover_batch(&mut tx,task,cutoff).await? {return Ok(false)}
+        if !recover_batch(&mut tx,task,cutoff,&status,error.as_deref()).await? {return Ok(false)}
         tx.commit().await?;
         return Ok(true)
     }
+    if status!="publishing"{return Ok(false)}
     let blockers=crate::task_ownership::blockers(&mut tx,task).await?;
     if blockers.iter().any(|s| !matches!(s.as_str(),"task_publishing"|"publication_unsettled")){
         return Ok(false);
@@ -251,9 +287,15 @@ pub async fn tick(db:&Database, hours:i64, cursor:&mut Cursor)->AppResult<u64> {
     let hours=hours.clamp(1,3650*24);
     let cutoff=Utc::now()-Duration::hours(hours);
     let rows:Vec<(DateTime<Utc>,Uuid)>=sqlx::query_as(
-        "SELECT updated_at,id FROM tasks WHERE runtime_owner='rust' AND status::text='publishing'
-         AND updated_at<$1 AND ($2::timestamptz IS NULL OR (updated_at,id)>($2,$3::uuid))
-         ORDER BY updated_at,id LIMIT 100")
+        "SELECT t.updated_at,t.id FROM tasks t WHERE t.runtime_owner='rust'
+         AND (t.status::text='publishing' OR (t.status::text IN ('published','failed') AND EXISTS(
+            SELECT 1 FROM publish_batches b JOIN operation_inbox i
+              ON i.task_id=t.id AND i.external_ticket='native-batch:'||b.id::text
+              AND i.runtime_engine='rust-v2' AND i.stage='publish' AND i.status='awaiting'
+            WHERE b.id=t.active_publish_batch_id AND b.task_id=t.id AND b.state IN ('succeeded','failed','partial_failed')
+              AND b.request_json->>'runtime'='rust-mixed-v1' AND b.request_json->'auto_parent'->>'job_id'=i.id::text)))
+         AND t.updated_at<$1 AND ($2::timestamptz IS NULL OR (t.updated_at,t.id)>($2,$3::uuid))
+         ORDER BY t.updated_at,t.id LIMIT 100")
         .bind(cutoff).bind(cursor.map(|c|c.0)).bind(cursor.map(|c|c.1))
         .fetch_all(&db.pool).await?;
     let mut changed=0;

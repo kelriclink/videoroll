@@ -267,6 +267,84 @@ with db() as c:
     assert c.execute("SELECT count(*) FROM outbox_events WHERE event_type='publish.dispatch'").fetchone()[0]==0
 print("PASS: exact automatic batch waiter identity, parent success/unknown settlement, active and ambiguous waiter deferral, idempotency and zero external replay")
 
+# Terminal batches whose exact automatic parent is still waiting. The
+# repair must never change the existing business receipt or retention date.
+def terminal_batch(states, recorded, *, fault=None, notification="missing"):
+    item=auto_batch(states)
+    t,b,ids,flow,stage=item
+    status,code={"succeeded":("published",None),"partial_failed":("publishing","PUBLISH_PARTIAL_FAILURE"),"failed":("failed","PUBLISH_FAILED")}[recorded]
+    with db() as c:
+        c.execute("UPDATE tasks SET status=%s::task_status,error_code=%s,updated_at=now()-interval '72 hours' WHERE id=%s",(status,code,t))
+        c.execute("UPDATE publish_batches SET state=%s,finished_at=now()-interval '73 hours',updated_at=now()-interval '72 hours' WHERE id=%s",(recorded,b))
+        c.execute("UPDATE publish_jobs SET finished_at=now()-interval '74 hours' WHERE batch_id=%s",(b,))
+        if notification!="missing":
+            event=uuid4(); key=f"workflow-publish-finished:{b}:{recorded}"
+            args={"args":[str(b),recorded,str(t)]}
+            if notification=="wrong_envelope":args["args"][2]=str(uuid4())
+            c.execute("INSERT INTO outbox_events(id,event_type,aggregate_type,aggregate_id,task_name,args_json,operation_key,status) VALUES(%s,'workflow.publish.finished','publish_batch',%s,'rust.publish.batch_finished',%s::jsonb,%s,%s)",
+                (event,str(b),json.dumps(args),key,"native_completed" if notification=="completed" else "native_pending"))
+            if notification=="completed":
+                c.execute("INSERT INTO operation_inbox(id,operation_key,status,runtime_engine,request_json,result_json) VALUES(%s,%s,'completed','rust-publish-batch','{}','{}')",(uuid4(),key))
+            if notification=="leased":
+                c.execute("UPDATE outbox_events SET lease_owner='fixture',lease_until=now()+interval '1 hour' WHERE id=%s",(event,))
+        if notification=="cleanup":
+            c.execute("INSERT INTO outbox_events(id,event_type,aggregate_type,aggregate_id,task_name,args_json,operation_key,status) VALUES(%s,'publish.cleanup','publish_batch',%s,'rust.publish.cleanup',%s::jsonb,%s,'native_pending')",
+                (uuid4(),str(b),json.dumps({"args":[str(t),str(b)]}),f"publish-cleanup:{b}"))
+        if fault=="missing_finish":c.execute("UPDATE publish_jobs SET finished_at=NULL WHERE id=%s",(ids[1],))
+        elif fault=="late_finish":c.execute("UPDATE publish_jobs SET finished_at=now()-interval '71 hours' WHERE id=%s",(ids[1],))
+        elif fault=="no_receipt":c.execute("UPDATE publish_jobs SET external_id=NULL WHERE id=%s",(ids[0],))
+        elif fault=="newer":c.execute("INSERT INTO vr2_workflows(id,task_id,generation,state,current_stage) VALUES(%s,%s,4,'succeeded','publish')",(uuid4(),t))
+        elif fault=="canceled":c.execute("UPDATE tasks SET status='canceled' WHERE id=%s",(t,))
+        elif fault=="different_status":c.execute("UPDATE tasks SET status='failed',error_code='OTHER' WHERE id=%s",(t,))
+        elif fault=="other_batch":c.execute("INSERT INTO publish_batches(id,task_id,state,expected_targets) VALUES(%s,%s,'failed','[]')",(uuid4(),t))
+        elif fault=="other_event":
+            c.execute("INSERT INTO outbox_events(id,event_type,aggregate_type,aggregate_id,task_name,args_json,operation_key,status) VALUES(%s,'publish.dispatch','task',%s,'social_publisher.process_job','{}',%s,'native_pending')",(uuid4(),str(t),"fixture:"+str(uuid4())))
+    return item
+
+def business_snapshot(item):
+    t,b,ids,flow,stage=item
+    with db() as c:
+        return (c.execute("SELECT to_jsonb(t) FROM tasks t WHERE id=%s",(t,)).fetchone(),
+                c.execute("SELECT to_jsonb(b) FROM publish_batches b WHERE id=%s",(b,)).fetchone(),
+                c.execute("SELECT to_jsonb(j) FROM publish_jobs j WHERE batch_id=%s ORDER BY id",(b,)).fetchall(),
+                c.execute("SELECT to_jsonb(e) FROM outbox_events e WHERE aggregate_type='publish_batch' AND aggregate_id=%s ORDER BY id",(str(b),)).fetchall())
+
+terminal_ok=[
+    (terminal_batch(["published","published"],"succeeded"),"succeeded"),
+    (terminal_batch(["published","published"],"succeeded",notification="cleanup"),"succeeded"),
+    (terminal_batch(["published","unknown"],"partial_failed",notification="completed"),"unknown"),
+    (terminal_batch(["failed","unknown"],"failed",notification="pending"),"unknown"),
+    (terminal_batch(["published","unverified"],"partial_failed"),"unknown"),
+]
+terminal_blocked=[terminal_batch(["published","published"],"succeeded",fault=f)
+    for f in ("missing_finish","late_finish","no_receipt","newer","canceled","different_status","other_batch","other_event")]
+terminal_blocked.extend([
+    terminal_batch(["published","unknown"],"succeeded"),
+    terminal_batch(["published","submitting"],"succeeded"),
+    terminal_batch(["published","published"],"succeeded",notification="wrong_envelope"),
+    terminal_batch(["published","published"],"succeeded",notification="leased"),
+])
+before_terminal={item[0]:business_snapshot(item) for item in [x[0] for x in terminal_ok]+terminal_blocked}
+with ThreadPoolExecutor(max_workers=2) as pool:
+    list(pool.map(lambda _:tick(),range(2)))
+tick()
+for item,want in terminal_ok:
+    actual=parent_state_of(item)
+    assert actual[:2]==(want,want),(item,actual)
+    assert actual[3]["batch_id"]==str(item[1]) and actual[3]["confirmed"]==(want=="succeeded")
+    assert business_snapshot(item)==before_terminal[item[0]]
+    with db() as c:
+        assert c.execute("SELECT count(*) FROM workflow_events WHERE workflow_id=%s AND kind=%s",(item[3],"workflow.succeeded" if want=="succeeded" else "job.unknown")).fetchone()[0]==1
+for item in terminal_blocked:
+    assert parent_state_of(item)[:2]==("running","awaiting"),item
+    assert business_snapshot(item)==before_terminal[item[0]]
+snapshot={item[0]:parent_state_of(item) for item,_ in terminal_ok}
+tick()
+for item,_ in terminal_ok:
+    assert parent_state_of(item)==snapshot[item[0]]
+    assert business_snapshot(item)==before_terminal[item[0]]
+print("PASS: terminal automatic batch exact waiter repair, immutable business snapshots, pending/completed/missing notifications, contradictory receipts and newer generations blocked, idempotent")
+
 # Exercise the original native Bilibili cancellation path without running
 # any external worker. The scheduler must preserve both prior JSON snapshots.
 t=task(); j=job(t); flow=uuid4(); stage=uuid4()
