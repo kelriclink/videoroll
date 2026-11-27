@@ -259,7 +259,18 @@ async fn heartbeat(
         .execute(&s.db.pool).await?;
     Ok(Json(read_worker(&s, id).await?).into_response())
 }
-async fn build_spec(s: &AppState, exec: &ExecutionInfo) -> AppResult<RenderSpec> {
+async fn build_spec(s: &AppState, exec: &ExecutionInfo, mode: &str) -> AppResult<RenderSpec> {
+    if mode == crate::media::dubbing_handoff::MODE {
+        let spec: RenderSpec = serde_json::from_value(exec.render_spec.clone())
+            .map_err(|_| AppError::Conflict("invalid pinned P2 render spec".into()))?;
+        if spec.mode != mode || spec.render_job_id != exec.render_job_id {
+            return Err(AppError::Conflict(
+                "P2 render spec identity mismatch".into(),
+            ));
+        }
+        return Ok(spec);
+    }
+
     let row =
         sqlx::query("SELECT j.workflow_id,j.task_id,j.id AS job_id FROM vr2_jobs j WHERE j.id=$1")
             .bind(exec.render_job_id)
@@ -382,7 +393,7 @@ async fn claim(
     }
     let mut tx = s.db.pool.begin().await?;
     let worker=sqlx::query(
-        "SELECT enabled,draining,max_concurrency,status,last_seen_at FROM vr2_render_workers WHERE id=$1 FOR UPDATE"
+        "SELECT enabled,draining,max_concurrency,status,last_seen_at,capabilities FROM vr2_render_workers WHERE id=$1 FOR UPDATE"
     ).bind(id).fetch_one(&mut *tx).await?;
     let enabled: bool = worker.try_get("enabled")?;
     let draining: bool = worker.try_get("draining")?;
@@ -397,6 +408,8 @@ async fn claim(
     {
         return Ok(empty());
     }
+    let capabilities: Value = worker.try_get("capabilities")?;
+    let dubbed = capabilities["dub_burn_in"] == true;
     let active:i64=sqlx::query_scalar(
         "SELECT count(*) FROM vr2_render_executions WHERE worker_id=$1 AND state IN ('running','uploading','canceled','paused') AND lease_until>now()"
     ).bind(id).fetch_one(&mut *tx).await?;
@@ -411,8 +424,8 @@ async fn claim(
           JOIN tasks t ON t.id=r.task_id
           WHERE w.state='running' AND j.state='awaiting'
             AND j.external_ticket=r.id::text
-            AND j.task_id=r.task_id AND j.workflow_id=r.workflow_id AND j.stage='render'
-            AND w.task_id=r.task_id AND w.current_stage='render' AND t.runtime_owner='rust'
+            AND j.task_id=r.task_id AND j.workflow_id=r.workflow_id AND ((j.stage='render' AND r.mode<>'dub_burn_in') OR (j.stage='dubbing' AND r.mode='dub_burn_in' AND $5))
+            AND w.task_id=r.task_id AND w.current_stage=j.stage AND t.runtime_owner='rust'
             AND r.attempt < $4
             AND r.uploaded_asset_id IS NULL
             AND upper(t.status::text) NOT IN ('CANCELED','FAILED')
@@ -433,12 +446,14 @@ async fn claim(
     .bind(strong_token())
     .bind(LEASE_SECONDS)
     .bind(MAX_RENDER_ATTEMPTS)
+    .bind(dubbed)
     .fetch_optional(&mut *tx)
     .await?;
     tx.commit().await?;
     let Some(row) = row else { return Ok(empty()) };
     let mut info = execution_info(&row)?;
-    let spec = build_spec(&s, &info).await?;
+    let mode: String = row.try_get("mode")?;
+    let spec = build_spec(&s, &info, &mode).await?;
     info.render_spec = serde_json::to_value(&spec)
         .map_err(|_| AppError::Invalid("render spec serialization failed".into()))?;
     let changed=sqlx::query(
@@ -716,12 +731,14 @@ async fn execution_output_upload(
     let task_id: Uuid = initial.try_get("task_id")?;
     let workflow_id: Uuid = initial.try_get("workflow_id")?;
     let stage_job: Uuid = initial.try_get("job_id")?;
+    let mode: String = initial.try_get("mode")?;
+    let kind = super::service::output_kind(&mode);
     let file_key = output_key(task_id, id);
     let dest = s.storage.resolve_existing(&file_key).await?;
     if let Some(dir) = dest.parent() {
         fs::create_dir_all(dir).await?;
     }
-    let temp = dest.with_extension("uploading");
+    let temp = dest.with_extension(format!("{}.uploading", Uuid::new_v4()));
     let task=async {
         let mut fence=None::<String>;
         let mut size=0u64;
@@ -767,39 +784,43 @@ async fn execution_output_upload(
         drop(file);
         let bytes_digest=hex::encode(digest.finalize());
         // Validate expensive media outside any row lock.
-        let _=probe_video(&s.config.ffprobe_binary,&temp).await?;
+        let media=probe_video(&s.config.ffprobe_binary,&temp).await?;
+        if kind=="video_dubbed" && !media["streams"].as_array().is_some_and(|a|a.iter().any(|v|v["codec_type"]=="audio")){return Err(AppError::Invalid("P2 output lacks audio stream".into()));}
         let mut tx=s.db.pool.begin().await?;
         // Acquire locks in the same order as the Scheduler: Task -> Workflow -> Job -> Execution.
         let status:String=sqlx::query_scalar("SELECT upper(status::text) FROM tasks WHERE id=$1 FOR UPDATE")
             .bind(task_id).fetch_one(&mut *tx).await?;
-        let flow:String=sqlx::query_scalar("SELECT state FROM vr2_workflows WHERE id=$1 FOR UPDATE")
-            .bind(workflow_id).fetch_one(&mut *tx).await?;
-        let job_state:String=sqlx::query_scalar("SELECT state FROM vr2_jobs WHERE id=$1 FOR UPDATE")
-            .bind(stage_job).fetch_one(&mut *tx).await?;
+        let stage=super::service::output_stage(&mode);
+        let flow:bool=sqlx::query_scalar("SELECT state='running' AND current_stage=$2 AND task_id=$3 FROM vr2_workflows WHERE id=$1 FOR UPDATE")
+            .bind(workflow_id).bind(stage).bind(task_id).fetch_one(&mut *tx).await?;
+        let job_state:bool=sqlx::query_scalar("SELECT state='awaiting' AND stage=$2 AND task_id=$3 AND workflow_id=$4 AND external_ticket=$5 FROM vr2_jobs WHERE id=$1 FOR UPDATE")
+            .bind(stage_job).bind(stage).bind(task_id).bind(workflow_id).bind(id.to_string()).fetch_one(&mut *tx).await?;
         let row=sqlx::query(
             "SELECT * FROM vr2_render_executions WHERE id=$1 AND worker_id=$2 FOR UPDATE"
         ).bind(id).bind(worker_id).fetch_one(&mut *tx).await?;
         validate_lease(&row,&fence)?;
-        if status=="CANCELED" || flow!="running" || job_state!="awaiting" {
+        if matches!(status.as_str(),"CANCELED"|"FAILED"|"PUBLISHED"|"PUBLISHING") || !flow || !job_state || row.try_get::<String,_>("mode")?!=mode {
             return Err(AppError::Conflict("render upload rejected after parent stopped".into()));
         }
         if row.try_get::<Option<Uuid>,_>("uploaded_asset_id")?.is_some(){
             return Err(AppError::Conflict("render output already registered".into()));
         }
-        // Atomic rename before SQL commit; on failure file becomes an orphan
-        // under the v2 workdir, eligible for safe terminal cleanup.
-        fs::rename(&temp,&dest).await?;
         let asset_id=Uuid::new_v4();
-        sqlx::query(
-            "INSERT INTO storage_objects(storage_key,checksum_sha256,size_bytes,state,retain_until) VALUES($1,$2,$3,'live',now()+interval '2 days') ON CONFLICT(storage_key) DO UPDATE SET checksum_sha256=$2,size_bytes=$3,retain_until=GREATEST(storage_objects.retain_until,now()+interval '2 days') WHERE storage_objects.state='live'"
+        let registered=sqlx::query(
+            "INSERT INTO storage_objects(storage_key,checksum_sha256,size_bytes,state,retain_until) VALUES($1,$2,$3,'live',now()+interval '2 days') ON CONFLICT(storage_key) DO UPDATE SET retain_until=GREATEST(storage_objects.retain_until,now()+interval '2 days') WHERE storage_objects.state='live' AND storage_objects.checksum_sha256=$2 AND storage_objects.size_bytes=$3"
         ).bind(&file_key).bind(&bytes_digest).bind(size as i64)
-            .execute(&mut *tx).await?;
+            .execute(&mut *tx).await?.rows_affected();
+        if registered!=1{return Err(AppError::Conflict("render output storage evidence changed".into()));}
+        // A conflicting ledger must never permit overwriting existing media.
+        // Rename only after registration passes; DB rollback leaves an orphan
+        // under the execution-specific key, never a different execution's asset.
+        fs::rename(&temp,&dest).await?;
         sqlx::query(
-            "INSERT INTO storage_object_refs(storage_key,owner_type,owner_id,role) VALUES($1,'workflow',$2,'video_final') ON CONFLICT DO NOTHING"
-        ).bind(&file_key).bind(workflow_id).execute(&mut *tx).await?;
+            "INSERT INTO storage_object_refs(storage_key,owner_type,owner_id,role) VALUES($1,'workflow',$2,$3) ON CONFLICT DO NOTHING"
+        ).bind(&file_key).bind(workflow_id).bind(kind).execute(&mut *tx).await?;
         sqlx::query(
-            "INSERT INTO assets(id,task_id,kind,storage_key,sha256,size_bytes) VALUES($1,$2,'video_final'::asset_kind,$3,$4,$5)"
-        ).bind(asset_id).bind(task_id).bind(&file_key).bind(&bytes_digest).bind(size as i64)
+            "INSERT INTO assets(id,task_id,kind,storage_key,sha256,size_bytes) VALUES($1,$2,$6::asset_kind,$3,$4,$5)"
+        ).bind(asset_id).bind(task_id).bind(&file_key).bind(&bytes_digest).bind(size as i64).bind(kind)
             .execute(&mut *tx).await?;
         sqlx::query(
             "UPDATE vr2_render_executions SET uploaded_asset_id=$1,state='uploading',updated_at=now() WHERE id=$2"
@@ -881,7 +902,7 @@ async fn execution_completed(
         })?;
         let record = s.db.asset(asset).await?;
         if record.task_id != task_id
-            || record.kind != "video_final"
+            || record.kind != super::service::output_kind(&mode)
             || record.storage_key != output_key(task_id, id)
         {
             return Err(AppError::Conflict(
@@ -890,6 +911,16 @@ async fn execution_completed(
         }
         (Some(asset), Some(record.storage_key))
     };
+    if mode == crate::media::dubbing_handoff::MODE {
+        let asset = s
+            .db
+            .asset(asset_id.ok_or_else(|| AppError::Conflict("P2 output asset absent".into()))?)
+            .await?;
+        let (sha, size) = s.storage.sha256(&asset.storage_key).await?;
+        if asset.sha256.as_deref() != Some(&sha) || asset.size_bytes != Some(size) {
+            return Err(AppError::Conflict("P2 output checksum mismatch".into()));
+        }
+    }
     let result = receipt(id, asset_id, key.as_deref(), &mode);
     if let Some(key) = key.as_deref() {
         let path = s.storage.resolve_existing(key).await?;
@@ -920,8 +951,8 @@ async fn execution_completed(
     .bind(task_id)
     .fetch_optional(&mut *tx)
     .await?;
-    let flow:Option<String>=sqlx::query_scalar("SELECT state FROM vr2_workflows WHERE id=$1 AND task_id=$2 AND current_stage='render' FOR UPDATE").bind(flow_id).bind(task_id).fetch_optional(&mut *tx).await?;
-    let job:Option<bool>=sqlx::query_scalar("SELECT state='awaiting' AND external_ticket=$4 FROM vr2_jobs WHERE id=$1 AND task_id=$2 AND workflow_id=$3 AND stage='render' FOR UPDATE").bind(job_id).bind(task_id).bind(flow_id).bind(id.to_string()).fetch_optional(&mut *tx).await?;
+    let flow:Option<String>=sqlx::query_scalar("SELECT state FROM vr2_workflows WHERE id=$1 AND task_id=$2 AND current_stage=$3 FOR UPDATE").bind(flow_id).bind(task_id).bind(super::service::output_stage(&mode)).fetch_optional(&mut *tx).await?;
+    let job:Option<bool>=sqlx::query_scalar("SELECT state='awaiting' AND external_ticket=$4 FROM vr2_jobs WHERE id=$1 AND task_id=$2 AND workflow_id=$3 AND stage=$5 FOR UPDATE").bind(job_id).bind(task_id).bind(flow_id).bind(id.to_string()).bind(super::service::output_stage(&mode)).fetch_optional(&mut *tx).await?;
     if !status
         .as_deref()
         .is_some_and(|v| !matches!(v, "CANCELED" | "FAILED" | "PUBLISHING" | "PUBLISHED"))

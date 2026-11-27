@@ -602,22 +602,26 @@ pub async fn process(
             let srt = srt
                 .to_str()
                 .ok_or_else(|| AppError::Invalid("YouDub SRT path is not UTF-8".into()))?;
-            command(
-                config,
-                runtime,
-                &[
-                    "--create",
-                    "--task-id",
-                    &id,
-                    "--video",
-                    video,
-                    "--srt",
-                    srt,
-                    "--direction",
-                    "en-zh",
-                ],
-            )
-            .await?
+            let mut args = vec![
+                "--create",
+                "--task-id",
+                &id,
+                "--video",
+                video,
+                "--srt",
+                srt,
+                "--direction",
+                "en-zh",
+            ];
+            if config.remote_renderer_enabled
+                && std::env::var("VIDEOROLL_V2_YOUDUB_AUDIO_ONLY")
+                    .ok()
+                    .as_deref()
+                    == Some("1")
+            {
+                args.push("--audio-only");
+            }
+            command(config, runtime, &args).await?
         }
         Err(error) => return Err(error),
     };
@@ -639,6 +643,30 @@ pub async fn process(
         return Err(AppError::Unavailable(
             "YouDub did not report completed status".into(),
         ));
+    }
+    // A source may be replaced while the model is running. Do not attach
+    // audio or video generated from the old snapshot to a new source.
+    if registry.sha256(&video_key).await?.0 != source_pin["video_sha256"].as_str().unwrap_or("")
+        || registry.sha256(&srt_key).await?.0 != source_pin["srt_sha256"].as_str().unwrap_or("")
+    {
+        return Err(AppError::Conflict(
+            "YouDub inputs changed during inference".into(),
+        ));
+    }
+    if final_result["audio_only"] == true {
+        let ticket = super::dubbing_handoff::enqueue(
+            config,
+            db,
+            registry,
+            job,
+            runtime,
+            native_id,
+            &video_key,
+            &srt_key,
+            &final_result,
+        )
+        .await?;
+        return Ok(json!({"remote_render_ticket":ticket}));
     }
     let output = final_result
         .get("output_video")

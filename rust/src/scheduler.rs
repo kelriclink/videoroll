@@ -809,7 +809,7 @@ impl Scheduler {
             return Err(AppError::NotFound("workflow disappeared".into()));
         };
         let job = sqlx::query(
-            "SELECT state,lease_token,external_ticket FROM vr2_jobs WHERE id=$1 FOR UPDATE",
+            "SELECT state,lease_token,external_ticket,COALESCE(lease_until>now(),false) AS lease_active FROM vr2_jobs WHERE id=$1 FOR UPDATE",
         )
         .bind(item.id)
         .fetch_optional(&mut *tx)
@@ -833,7 +833,10 @@ impl Scheduler {
             tx.commit().await?;
             return Ok(());
         }
-        if job_state != "running" || lease_token != Some(item.lease_token) {
+        if job_state != "running"
+            || lease_token != Some(item.lease_token)
+            || !job.try_get::<bool, _>("lease_active")?
+        {
             return Err(AppError::Conflict(
                 "stale or superseded job completion".into(),
             ));
@@ -871,6 +874,54 @@ impl Scheduler {
         item: &WorkItem,
         result: Value,
     ) -> AppResult<()> {
+        let p2_pending = if item.stage == Stage::Dubbing {
+            sqlx::query_scalar::<_,bool>("SELECT EXISTS(SELECT 1 FROM render_executions WHERE job_id=$1 AND runtime_engine='rust-v2' AND mode='dub_burn_in')").bind(item.id).fetch_one(&mut **tx).await?
+        } else {
+            false
+        };
+        if p2_pending
+            || (item.stage == Stage::Dubbing
+                && result["mode"] == crate::media::dubbing_handoff::MODE)
+        {
+            if result["mode"] != crate::media::dubbing_handoff::MODE
+                || result["remote_completed"] != true
+            {
+                return Err(AppError::Conflict(
+                    "P2 requires exact completed renderer receipt".into(),
+                ));
+            }
+            let execution = result["remote_execution_id"]
+                .as_str()
+                .and_then(|s| Uuid::parse_str(s).ok())
+                .ok_or_else(|| AppError::Conflict("P2 execution identity missing".into()))?;
+            let row=sqlx::query("SELECT render_spec,output_json,uploaded_asset_id FROM render_executions WHERE id=$1 AND job_id=$2 AND task_id=$3 AND workflow_id=$4 AND runtime_engine='rust-v2' AND state='completed' AND mode='dub_burn_in' FOR UPDATE").bind(execution).bind(item.id).bind(item.task_id).bind(item.workflow_id).fetch_optional(&mut **tx).await?.ok_or_else(||AppError::Conflict("P2 render receipt missing".into()))?;
+            let stored: Value = row.try_get("output_json")?;
+            let spec: Value = row.try_get("render_spec")?;
+            let asset: Uuid = row.try_get("uploaded_asset_id")?;
+            let key = result["storage_key"]
+                .as_str()
+                .ok_or_else(|| AppError::Conflict("P2 output key missing".into()))?;
+            let expected = crate::remote_render::output_key(item.task_id, execution);
+            let owned:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM assets WHERE id=$1 AND task_id=$2 AND kind::text='video_dubbed' AND storage_key=$3)").bind(asset).bind(item.task_id).bind(key).fetch_one(&mut **tx).await?;
+            if stored != result || key != expected || !owned || result["asset_id"] != json!(asset) {
+                return Err(AppError::Conflict("P2 output receipt differs".into()));
+            }
+            let request = &spec["request"];
+            let input = request["input_key"]
+                .as_str()
+                .ok_or_else(|| AppError::Conflict("P2 input missing".into()))?;
+            let subtitle = request["dubbing_source_srt_key"]
+                .as_str()
+                .ok_or_else(|| AppError::Conflict("P2 source subtitles missing".into()))?;
+            let native = request["dubbing_model_job_id"]
+                .as_str()
+                .and_then(|s| Uuid::parse_str(s).ok())
+                .ok_or_else(|| AppError::Conflict("P2 model job missing".into()))?;
+            let written=sqlx::query("UPDATE operation_inbox SET dubbing_source_video_key=$2,dubbing_source_srt_key=$3,dubbing_output_video_key=$4,dubbing_model_job_id=$5,dubbing_model_status='succeeded',dubbing_run_created_at=now() WHERE id=$1 AND stage='dubbing' AND status='awaiting' AND dubbing_model_status IS NULL").bind(item.id).bind(input).bind(subtitle).bind(key).bind(native).execute(&mut **tx).await?.rows_affected();
+            if written != 1 {
+                return Err(AppError::Conflict("P2 completion ownership lost".into()));
+            }
+        }
         if item.stage == Stage::Publish && result.get("skipped").is_none() {
             if !crate::publish::has_confirmed_result(&result) {
                 return Err(AppError::Invalid(
@@ -1016,7 +1067,10 @@ impl Scheduler {
             .ok_or_else(|| AppError::NotFound("external stage job missing".into()))?;
         let task_id: Uuid = peek.try_get("task_id")?;
         let workflow_id: Uuid = peek.try_get("workflow_id")?;
-        if peek.try_get::<String, _>("stage")? != "render" {
+        if !matches!(
+            peek.try_get::<String, _>("stage")?.as_str(),
+            "render" | "dubbing"
+        ) {
             return Err(AppError::Invalid(
                 "only external renderer failure accepted".into(),
             ));
@@ -1036,6 +1090,12 @@ impl Scheduler {
         .bind(job_id)
         .fetch_one(&mut *tx)
         .await?;
+        if peek.try_get::<String, _>("stage")? == "dubbing" {
+            let valid:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM render_executions WHERE job_id=$1 AND id::text=$2 AND runtime_engine='rust-v2' AND mode='dub_burn_in' AND state='failed')").bind(job_id).bind(ticket).fetch_one(&mut *tx).await?;
+            if !valid {
+                return Err(AppError::Conflict("P2 failure receipt missing".into()));
+            }
+        }
         let state: String = row.try_get("state")?;
         let old_ticket: Option<String> = row.try_get("external_ticket")?;
         let message = error.chars().take(1000).collect::<String>();
@@ -1144,13 +1204,13 @@ impl Scheduler {
         workflow: Uuid,
         terminal: bool,
     ) -> AppResult<()> {
-        sqlx::query("SELECT id FROM operation_inbox WHERE workflow_id=$1 AND runtime_engine='rust-v2' AND stage='render' AND status='awaiting' ORDER BY id FOR UPDATE")
+        sqlx::query("SELECT id FROM operation_inbox WHERE workflow_id=$1 AND runtime_engine='rust-v2' AND stage IN ('render','dubbing') AND status='awaiting' ORDER BY id FOR UPDATE")
             .bind(workflow).fetch_all(&mut **tx).await?;
         sqlx::query("UPDATE render_executions e SET state=$2,lease_until=CASE WHEN e.lease_until>now() THEN e.lease_until ELSE NULL END,
           error_message=$3,finished_at=CASE WHEN $2='canceled' THEN now() ELSE NULL END,updated_at=now()
           FROM operation_inbox j,pipeline_runs w,tasks t
           WHERE e.runtime_engine='rust-v2' AND e.workflow_id=$1 AND e.state IN ('queued','running','uploading','paused')
-          AND j.id=e.job_id AND j.runtime_engine='rust-v2' AND j.stage='render' AND j.status='awaiting'
+          AND j.id=e.job_id AND j.runtime_engine='rust-v2' AND j.stage IN ('render','dubbing') AND j.status='awaiting'
           AND j.task_id=e.task_id AND j.workflow_id=e.workflow_id AND j.external_ticket=e.id::text
           AND w.id=e.workflow_id AND w.engine='rust-v2' AND w.task_id=e.task_id
           AND t.id=e.task_id AND t.runtime_owner='rust'")

@@ -5,6 +5,7 @@ workdir isolation, task identity, P2 rendering receipt and source coupling.
 import json
 import os
 import shutil
+import subprocess
 import sys
 import uuid
 from pathlib import Path
@@ -53,7 +54,7 @@ def main(argv: list[str]) -> int:
             raise ValueError("original media and subtitle must exist")
         if "--direction" not in argv or get_arg("--direction") != "en-zh":
             raise ValueError("mock bridge only accepts en-zh")
-        record = {"status": "queued", "video": str(video), "srt": str(subtitles)}
+        record = {"status": "queued", "video": str(video), "srt": str(subtitles), "audio_only": "--audio-only" in argv}
         manifest.write_text(json.dumps(record), encoding="utf-8")
         print(json.dumps(record))
         return 0
@@ -68,8 +69,19 @@ def main(argv: list[str]) -> int:
         output_dir = runtime / "outputs"
         output_dir.mkdir(exist_ok=True)
         output = output_dir / f"{job_id}.mp4"
-        shutil.copyfile(record["video"], output)
-        record.update({"status": "succeeded", "output_video": str(output)})
+        if record["audio_only"]:
+            session=output_dir/job_id
+            session.mkdir(exist_ok=True)
+            mixed=session/"mixed.m4a"
+            voice=session/"voice.wav"
+            aligned=session/"aligned.srt"
+            for path,codec in ((mixed,"aac"),(voice,"pcm_s16le")):
+                subprocess.run(["ffmpeg","-v","error","-f","lavfi","-i","sine=frequency=880:duration=1","-c:a",codec,"-y",str(path)],check=True)
+            shutil.copyfile(record["srt"],aligned)
+            record.update({"status":"succeeded","output_video":str(mixed),"mixed_audio":str(mixed),"voice_audio":str(voice),"aligned_srt":str(aligned)})
+        else:
+            shutil.copyfile(record["video"], output)
+            record.update({"status": "succeeded", "output_video": str(output)})
         manifest.write_text(json.dumps(record), encoding="utf-8")
         print(json.dumps(record))
         return 0

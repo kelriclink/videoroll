@@ -1,6 +1,7 @@
 pub mod asr;
 pub(crate) mod asr_overlap;
 pub mod dubbing;
+pub(crate) mod dubbing_handoff;
 pub mod ffmpeg;
 pub mod index_translate;
 pub(crate) mod render_optimization;

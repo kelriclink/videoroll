@@ -189,7 +189,9 @@ impl Executor {
                 let result =
                     crate::media::dubbing::process(&self.config, &self.db, &self.registry, item)
                         .await?;
-                if let Some(reason) = result.get("skipped").and_then(serde_json::Value::as_str) {
+                if let Some(ticket)=result.get("remote_render_ticket").and_then(serde_json::Value::as_str) {
+                    Ok(StageOutcome::Awaiting {ticket:ticket.to_owned()})
+                } else if let Some(reason) = result.get("skipped").and_then(serde_json::Value::as_str) {
                     Ok(StageOutcome::Skipped {
                         reason: reason.to_string(),
                     })
