@@ -496,6 +496,21 @@ async fn task_quality(
     State(state): State<AppState>,
     Path(task_id): Path<Uuid>,
 ) -> AppResult<Json<Value>> {
+    // Compare the latest original/native subtitle jobs by creation time.
+    // Native reports live in the existing operation receipt, not a new table.
+    let native=sqlx::query("SELECT j.id,j.state,j.result FROM vr2_jobs j JOIN tasks t ON t.id=j.task_id WHERE j.task_id=$1 AND j.stage='subtitle' AND t.runtime_owner='rust' AND NOT EXISTS(SELECT 1 FROM subtitle_jobs s WHERE s.task_id=j.task_id AND s.created_at>j.created_at) ORDER BY j.created_at DESC,j.id DESC LIMIT 1").bind(task_id).fetch_optional(&state.db.pool).await?;
+    if let Some(row) = native {
+        let id: Uuid = row.try_get("id")?;
+        let status: String = row.try_get("state")?;
+        let result: Option<Value> = row.try_get("result")?;
+        let report = result
+            .as_ref()
+            .and_then(|v| v.get("subtitle_quality"))
+            .filter(|v| status == "succeeded" && v.is_object());
+        return Ok(Json(
+            json!({"available":report.is_some(),"job_id":id,"report":report}),
+        ));
+    }
     let (job_id, request) = latest_task_subtitle_job(&state, task_id).await?;
     let Some(key) = job_artifact_key(&request, "subtitle_quality_key") else {
         return Ok(Json(

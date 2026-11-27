@@ -2654,6 +2654,20 @@ async fn process_selective(
         }
         let edited = merge(&snapshot, &plan.indices, &replacements)?;
         let mut metadata = snapshot.metadata.clone();
+        let display_profile = super::readability::profile(&edited, &profile.target_lang);
+        let (display, stats) =
+            super::readability::optimize(&edited, profile.bilingual, display_profile)?;
+        metadata["readability"] = json!(stats);
+        metadata["subtitle_quality"] = super::readability::report(
+            &snapshot.source,
+            &edited,
+            &display,
+            display_profile,
+            &snapshot.metadata["context_memory"],
+        );
+        if let Some(m) = metadata.as_object_mut() {
+            m.remove("display_cues");
+        }
         metadata["translated"] = json!(edited);
         metadata["translation"] = json!(true);
         metadata["selective_retranslate"] = json!(plan);
@@ -2677,8 +2691,18 @@ async fn process_selective(
         write_task_asset(db, registry, job, "segments_json", &segments_key, &content).await?;
         edited
     };
-    let srt = to_srt(&edited)?;
-    let ass = to_ass(&edited, 1920, 1080, "Arial", 48, profile.bilingual)?;
+    let display_profile = super::readability::profile(&edited, &profile.target_lang);
+    let (display, readability_stats) =
+        super::readability::optimize(&edited, profile.bilingual, display_profile)?;
+    let quality = super::readability::report(
+        &snapshot.source,
+        &edited,
+        &display,
+        display_profile,
+        &snapshot.metadata["context_memory"],
+    );
+    let srt = to_srt(&display)?;
+    let ass = to_ass(&display, 1920, 1080, "Arial", 48, profile.bilingual)?;
     for (key, body, kind) in [
         (&segments_key, None::<&[u8]>, "segments_json"),
         (&srt_key, Some(srt.as_bytes()), "subtitle_srt"),
@@ -2693,7 +2717,7 @@ async fn process_selective(
     }
     Ok(
         json!({"no_speech":false,"selective_retranslate":plan.indices,
-        "cues":edited.len(),"srt_key":srt_key,"ass_key":ass_key,"segments_key":segments_key}),
+        "cues":display.len(),"aligned_cues":edited.len(),"readability":readability_stats,"subtitle_quality":quality,"srt_key":srt_key,"ass_key":ass_key,"segments_key":segments_key}),
     )
 }
 
@@ -2850,6 +2874,33 @@ async fn process_inner(
         && let Ok(path) = registry.resolve_existing(&srt).await
         && fs::metadata(path).await.is_ok()
     {
+        let prefix = format!("v2/sub/{}/{}", job.task_id, job.id);
+        let segments_key = format!("{prefix}/segments.json");
+        let ass_key = format!("{prefix}/subtitle.ass");
+        // After a crash between asset registration and workflow settlement,
+        // preserve the same report. Only reuse current-job native evidence
+        // when every registered artifact is present and hash-verified.
+        if srt == format!("{prefix}/subtitle.srt") {
+            for (key, kind) in [
+                (&segments_key, "segments_json"),
+                (&srt, "subtitle_srt"),
+                (&ass_key, "subtitle_ass"),
+            ] {
+                ensure_task_asset(db, registry, job.task_id, job, kind, key).await?;
+            }
+            let path = registry.resolve_existing(&segments_key).await?;
+            if fs::metadata(&path).await?.len() > 32 * 1024 * 1024 {
+                return Err(AppError::Invalid(
+                    "native subtitle snapshot exceeds recovery limit".into(),
+                ));
+            }
+            let value: Value = serde_json::from_slice(&fs::read(path).await?)
+                .map_err(|_| AppError::Conflict("native subtitle snapshot invalid".into()))?;
+            return Ok(
+                json!({"srt_key":srt,"ass_key":ass_key,"segments_key":segments_key,"reused":true,"no_speech":false,
+                "subtitle_quality":value["subtitle_quality"],"readability":value["readability"],"cues":value["subtitle_quality"]["segment_count"],"aligned_cues":value["translated"].as_array().map(Vec::len)}),
+            );
+        }
         return Ok(json!({"srt_key":srt,"reused":true}));
     }
     let video_key = if let Some(plan) = &resume {
@@ -3531,8 +3582,13 @@ async fn process_inner(
             cue.text = text;
         }
     }
-    let srt = to_srt(&cues)?;
-    let ass = to_ass(&cues, 1920, 1080, "Arial", 48, profile.bilingual)?;
+    let display_profile = super::readability::profile(&cues, &profile.target_lang);
+    let (display, readability_stats) =
+        super::readability::optimize(&cues, profile.bilingual, display_profile)?;
+    let quality =
+        super::readability::report(&original, &cues, &display, display_profile, &rolling_memory);
+    let srt = to_srt(&display)?;
+    let ass = to_ass(&display, 1920, 1080, "Arial", 48, profile.bilingual)?;
     let aligned = original.len() == cues.len()
         && original
             .iter()
@@ -3542,6 +3598,7 @@ async fn process_inner(
         || (recovered_final && aligned && resume.as_ref().is_some_and(|p| p.original_translated));
     let metadata = serde_json::to_vec(&json!({
         "source":original,"translated":cues,
+        "readability":readability_stats,"subtitle_quality":quality,
         "model":config.asr_model,"translation":translated,"youtube_subtitle":youtube_info,"subtitle_resume_plan":resume,"source_video_sha256":source_digest,
         "rag_evidence_ids":research.evidence_ids,"rag_digest":research.digest,
         "translation_scenes":translation_scenes,"translation_quality_issues":translation_quality,"context_memory":rolling_memory,"running_summary":rolling_summary
@@ -3552,18 +3609,160 @@ async fn process_inner(
     let ass_key = format!("{prefix}/subtitle.ass");
     for (key, body, kind) in [
         (&segments_key, metadata.as_slice(), "segments_json"),
-        (&srt_key, srt.as_bytes(), "subtitle_srt"),
         (&ass_key, ass.as_bytes(), "subtitle_ass"),
+        (&srt_key, srt.as_bytes(), "subtitle_srt"),
     ] {
         write_task_asset(db, registry, job, kind, key, body).await?;
     }
-    Ok(json!({"no_speech":false,"cues":cues.len(),
-        "srt_key":srt_key,"ass_key":ass_key,"segments_key":segments_key,"youtube_subtitle":youtube_info,"subtitle_resume_plan":resume}))
+    Ok(
+        json!({"no_speech":false,"cues":display.len(),"aligned_cues":cues.len(),"readability":readability_stats,"subtitle_quality":quality,
+        "srt_key":srt_key,"ass_key":ass_key,"segments_key":segments_key,"youtube_subtitle":youtube_info,"subtitle_resume_plan":resume}),
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn readability_native_output_real_postgres_http() {
+        use crate::{api::AppState, domain::StageOutcome, scheduler::Scheduler};
+        use std::sync::Arc;
+        let Ok(url) = std::env::var("VIDEOROLL_TEST_READABILITY_DB_URL") else {
+            return;
+        };
+        let parsed = Url::parse(&url).unwrap();
+        assert_eq!(parsed.host_str(), Some("127.0.0.1"));
+        assert_eq!(parsed.path(), "/videoroll_test");
+        let db = Database::connect(&url).await.unwrap();
+        sqlx::raw_sql(include_str!(
+            "../../tests/bootstrap_legacy_for_integration.sql"
+        ))
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        db.migrate().await.unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = Config::from_env().unwrap();
+        config.storage_root = tmp.path().join("storage");
+        fs::create_dir_all(&config.storage_root).await.unwrap();
+        let config = Arc::new(config);
+        let store = AssetRegistry::new(db.clone(), config.storage_root.clone());
+        let scheduler = Scheduler::new(db.clone(), Duration::from_secs(300));
+        let (task, flow, id) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        sqlx::query("INSERT INTO tasks(id,source_type,source_license,status,runtime_owner,priority,retry_count) VALUES($1,'local','own','downloaded','rust',0,0)").bind(task).execute(&db.pool).await.unwrap();
+        sqlx::query("INSERT INTO pipeline_runs(id,task_id,generation,engine,workflow_name,state,current_stage,request_json) VALUES($1,$2,1,'rust-v2','videoroll.rust.pipeline','running','subtitle',$3)").bind(flow).bind(task).bind(json!({"subtitle":{"translate_enabled":false,"target_lang":"zh"}})).execute(&db.pool).await.unwrap();
+        sqlx::query("INSERT INTO operation_inbox(id,operation_key,runtime_engine,task_id,workflow_id,stage,generation,status,request_json) VALUES($1,$2,'rust-v2',$3,$4,'subtitle',1,'pending','{}')").bind(id).bind(format!("readability:{id}")).bind(task).bind(flow).execute(&db.pool).await.unwrap();
+        let key = format!("v2/raw/{task}/source.mp4");
+        let path = store.resolve_existing(&key).await.unwrap();
+        fs::create_dir_all(path.parent().unwrap()).await.unwrap();
+        assert!(
+            tokio::process::Command::new("ffmpeg")
+                .args([
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "color=c=blue:s=160x120:r=25:d=8",
+                    "-c:v",
+                    "mpeg4",
+                    "-y"
+                ])
+                .arg(&path)
+                .status()
+                .await
+                .unwrap()
+                .success()
+        );
+        let (sha, size) = store.sha256(&key).await.unwrap();
+        sqlx::query("INSERT INTO assets(id,task_id,kind,storage_key,sha256,size_bytes) VALUES($1,$2,'video_raw',$3,$4,$5)").bind(Uuid::new_v4()).bind(task).bind(&key).bind(sha).bind(size).execute(&db.pool).await.unwrap();
+        let job = scheduler.claim().await.unwrap().unwrap();
+        assert_eq!(job.id, id);
+        let cues = vec![
+            SubtitleCue {
+                start_ms: 0,
+                end_ms: 5000,
+                text: "这是一个用于测试字幕可读性优化器的比较长的中文字幕句子，".repeat(4),
+                secondary_text: None,
+            },
+            SubtitleCue {
+                start_ms: 6000,
+                end_ms: 7500,
+                text: "结束。".into(),
+                secondary_text: None,
+            },
+        ];
+        let captions = super::super::youtube_subtitles::Captions {
+            selection: super::super::youtube_subtitles::Selection {
+                language: "zh".into(),
+                source: "fixture".into(),
+                reason: "target".into(),
+            },
+            cues: cues.clone(),
+        };
+        let result = process(&config, &db, &store, &job, Some(captions))
+            .await
+            .unwrap();
+        assert_eq!(result["aligned_cues"], 2);
+        assert!(result["cues"].as_u64().unwrap() > 2);
+        let key = result["segments_key"].as_str().unwrap();
+        // Target-language source captions are not a translated snapshot:
+        // verify the stored alignment without falsely labeling them translated.
+        let snapshot: Value = serde_json::from_slice(
+            &fs::read(store.resolve_existing(key).await.unwrap())
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(snapshot["source"], json!(cues));
+        assert_eq!(snapshot["translated"], json!(cues));
+        assert_eq!(snapshot["translation"], false);
+
+        let srt = fs::read_to_string(
+            store
+                .resolve_existing(result["srt_key"].as_str().unwrap())
+                .await
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        let display = crate::subtitles::parse_srt(&srt).unwrap();
+        assert!(display.len() > cues.len() && display.iter().all(|c| c.text.lines().count() <= 2));
+        assert_eq!(result["subtitle_quality"]["segment_count"], display.len());
+        let retry = process(&config, &db, &store, &job, None).await.unwrap();
+        assert_eq!(retry["subtitle_quality"], result["subtitle_quality"]);
+        scheduler
+            .complete(&job, StageOutcome::Completed { result: retry })
+            .await
+            .unwrap();
+        let state = AppState {
+            config,
+            db: db.clone(),
+            scheduler,
+            storage: store,
+        };
+        let app = crate::subtitle_management_v1::router().with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let actual: Value = Client::new()
+            .get(format!("http://{addr}/subtitle/tasks/{task}/quality"))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(actual["available"], true);
+        assert_eq!(actual["job_id"], json!(id));
+        assert_eq!(actual["report"], result["subtitle_quality"]);
+        server.abort();
+        println!(
+            "PASS native subtitle output, immutable aligned snapshot, same-job recovery, real PG receipt and quality HTTP endpoint"
+        );
+    }
     #[test]
     fn segment_offsets_are_not_invented() {
         assert!(
