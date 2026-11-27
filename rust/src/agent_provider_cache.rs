@@ -118,6 +118,45 @@ pub(super) async fn check_status(_provider: &str, response: &reqwest::Response) 
     }
     Err(AppError::Unavailable(format!("RAG provider HTTP {status}")))
 }
+pub(super) fn transient_read(error: &AppError) -> bool {
+    match error {
+        AppError::Upstream(e) => e.is_timeout() || e.is_connect() || e.is_body(),
+        AppError::Unavailable(message) => [
+            "RAG provider HTTP 408",
+            "RAG provider HTTP 500",
+            "RAG provider HTTP 502",
+            "RAG provider HTTP 503",
+            "RAG provider HTTP 504",
+        ]
+        .contains(&message.as_str()),
+        _ => false,
+    }
+}
+pub(super) async fn retry_read<F, Fut, T>(
+    db: &Database,
+    job: &WorkItem,
+    mut call: F,
+) -> AppResult<T>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = AppResult<T>>,
+{
+    for attempt in 0..3 {
+        lease(db, job).await?;
+        match call().await {
+            Err(e) if attempt < 2 && transient_read(&e) => {
+                // Respect cancellation during a backoff; the provider lease
+                // is also polled by retrieve_slots outside this future.
+                for _ in 0..(2 << attempt) {
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                    lease(db, job).await?;
+                }
+            }
+            result => return result,
+        }
+    }
+    unreachable!("bounded retrieval retry")
+}
 pub(super) async fn bounded_body(
     mut response: reqwest::Response,
     limit: usize,
@@ -506,6 +545,29 @@ mod tests {
             sqlx::query("INSERT INTO operation_inbox VALUES($1,$2,$3,'running',now()+interval '10 minutes')").bind(job.id).bind(job.workflow_id).bind(job.lease_token).execute(&db.pool).await.unwrap();
             jobs.push(job);
         }
+        let retries = AtomicUsize::new(0);
+        let recovered = retry_read(&db, &jobs[0], || async {
+            if retries.fetch_add(1, Ordering::SeqCst) < 2 {
+                Err(AppError::Unavailable("RAG provider HTTP 503".into()))
+            } else {
+                Ok(42)
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(recovered, 42);
+        assert_eq!(retries.load(Ordering::SeqCst), 3);
+        let rate_calls = AtomicUsize::new(0);
+        let denied = retry_read(&db, &jobs[0], || async {
+            rate_calls.fetch_add(1, Ordering::SeqCst);
+            Err::<(), _>(AppError::Unavailable(
+                "RAG provider HTTP 429; retry_after=10.000".into(),
+            ))
+        })
+        .await;
+        assert!(denied.is_err());
+        assert_eq!(rate_calls.load(Ordering::SeqCst), 1);
+        println!("PASS bounded transient retrieval retries and no 429 retry");
         let provider = identity("search", "fixture", Some("secret-fixture"));
         let key = identity(&provider, "query", None);
         let calls = AtomicUsize::new(0);

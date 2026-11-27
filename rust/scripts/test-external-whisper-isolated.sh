@@ -8,6 +8,7 @@ case "${VIDEOROLL_TEST_ASR_SCENARIO:-external-whisper}" in
   thinking) test_name=media::asr::tests::thinking_real_postgres_http ;;
   collection) test_name=bilibili::collection::tests::collection_real_postgres_http ;;
   download) test_name=download_runtime::tests::download_fallback_real_postgres_and_process ;;
+  bili-account-binding) test_name=bilibili_account_v1::tests::confirmed_account_real_postgres ;;
   publish-gate) test_name=bilibili::tests::publish_gate_real_postgres ;;
   rag-shared) test_name=agent::provider_cache::tests::shared_cache_real_postgres ;;
   title) test_name=publish_meta::tests::title_translation_real_postgres_http ;;
@@ -49,6 +50,7 @@ case "${VIDEOROLL_TEST_ASR_SCENARIO:-external-whisper}" in
   thinking) export VIDEOROLL_TEST_THINKING_DB_URL="$DATABASE_URL"; unset VIDEOROLL_TEST_EXTERNAL_WHISPER_DB_URL ;;
   collection) export VIDEOROLL_TEST_COLLECTION_DB_URL="$DATABASE_URL"; unset VIDEOROLL_TEST_EXTERNAL_WHISPER_DB_URL ;;
   download) export VIDEOROLL_TEST_DOWNLOAD_DB_URL="$DATABASE_URL"; unset VIDEOROLL_TEST_EXTERNAL_WHISPER_DB_URL ;;
+  bili-account-binding) export VIDEOROLL_TEST_BILI_ACCOUNT_DB_URL="$DATABASE_URL"; unset VIDEOROLL_TEST_EXTERNAL_WHISPER_DB_URL ;;
   publish-gate) export VIDEOROLL_TEST_PUBLISH_GATE_DB_URL="$DATABASE_URL"; unset VIDEOROLL_TEST_EXTERNAL_WHISPER_DB_URL ;;
   rag-shared) export VIDEOROLL_TEST_RAG_SHARED_DB_URL="$DATABASE_URL"; unset VIDEOROLL_TEST_EXTERNAL_WHISPER_DB_URL ;;
   title) export VIDEOROLL_TEST_TITLE_DB_URL="$DATABASE_URL"; unset VIDEOROLL_TEST_EXTERNAL_WHISPER_DB_URL ;;

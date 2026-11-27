@@ -32,12 +32,12 @@ check(False,VIDEOROLL_V2_NATIVE_OUTBOX_ONLY="false")
 check(False,VIDEOROLL_V2_ENABLE_SAU_PUBLISH="true",VIDEOROLL_V2_SOCIAL_PUBLISHER_URL="http://127.0.0.1:18088")
 t=uuid.uuid4()
 with db() as c:
-    c.execute("INSERT INTO tasks(id,source_type,source_license,status,runtime_owner) VALUES(%s,'local','own','created','python')",(t,))
+    c.execute("INSERT INTO tasks(id,source_type,source_license,status,runtime_owner,priority,retry_count) VALUES(%s,'local','own','created','python',0,0)",(t,))
 assert check(False)["historical_blockers"]["legacy_tasks"]==1
 with db() as c:
     c.execute("UPDATE tasks SET runtime_owner='rust' WHERE id=%s",(t,))
     e=uuid.uuid4()
-    c.execute("INSERT INTO outbox_events(id,event_type,aggregate_type,aggregate_id,task_name,operation_key) VALUES(%s,'custom','task',%s,'legacy.unknown',%s)",(e,str(t),"fixture:"+str(e)))
+    c.execute("INSERT INTO outbox_events(id,event_type,aggregate_type,aggregate_id,task_name,args_json,operation_key) VALUES(%s,'custom','task',%s,'legacy.unknown','{}',%s)",(e,str(t),"fixture:"+str(e)))
 assert check(False)["outbox"]["unresolved_delivery_rows"]==1
 with db() as c:
     c.execute("DELETE FROM outbox_events WHERE id=%s",(e,))

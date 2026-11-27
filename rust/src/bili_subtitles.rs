@@ -237,7 +237,7 @@ fn cookie_client(cookie: &str) -> AppResult<Client> {
         .build()
         .map_err(Into::into)
 }
-async fn bili_json(response: reqwest::Response) -> AppResult<Value> {
+async fn bili_json(mut response: reqwest::Response) -> AppResult<Value> {
     if !response.status().is_success() {
         return Err(AppError::Unavailable(format!(
             "Bilibili subtitle API HTTP {}",
@@ -250,9 +250,12 @@ async fn bili_json(response: reqwest::Response) -> AppResult<Value> {
     {
         return Err(AppError::Unavailable("Bilibili response too large".into()));
     }
-    let bytes = response.bytes().await?;
-    if bytes.len() > 2 * 1024 * 1024 {
-        return Err(AppError::Unavailable("Bilibili response too large".into()));
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if chunk.len() > (2 * 1024 * 1024usize).saturating_sub(bytes.len()) {
+            return Err(AppError::Unavailable("Bilibili response too large".into()));
+        }
+        bytes.extend_from_slice(&chunk);
     }
     let value: Value = serde_json::from_slice(&bytes)
         .map_err(|_| AppError::Unavailable("invalid Bilibili response".into()))?;
@@ -414,7 +417,13 @@ async fn run_claimed(
     token: Uuid,
 ) -> AppResult<()> {
     let base = api_base(config)?;
-    let (cookie, csrf) = crate::bilibili_account_v1::publication_credentials(db, config).await?;
+    let (cookie, csrf) = crate::bilibili_account_v1::confirmed_credentials(
+        db,
+        config,
+        record.publish_job_id,
+        record.task_id,
+    )
+    .await?;
     let (sha, size) = store.sha256(&record.source_key).await?;
     if size <= 0 || size as u64 > MAX_SUBTITLE_SIZE {
         return Err(AppError::Invalid("SRT source is empty or oversized".into()));
@@ -434,7 +443,7 @@ async fn run_claimed(
         return Err(AppError::Conflict("SRT data changed during sync".into()));
     }
     sqlx::query(
-        "UPDATE vr2_bilibili_subtitle_syncs SET source_checksum=$1 WHERE publish_job_id=$2 AND lease_token=$3 AND state='running'"
+        "UPDATE vr2_bilibili_subtitle_syncs SET source_checksum=$1 WHERE publish_job_id=$2 AND lease_token=$3 AND state='running' AND lease_until>now()"
     ).bind(&sha).bind(record.publish_job_id).bind(token).execute(&db.pool).await?;
     let client = cookie_client(&cookie)?;
     let page_data = bili_json(
@@ -445,17 +454,36 @@ async fn run_claimed(
             .await?,
     )
     .await?;
+    if page_data
+        .pointer("/data/aid")
+        .and_then(Value::as_i64)
+        .is_some_and(|aid| aid != record.aid)
+        || page_data
+            .pointer("/data/bvid")
+            .and_then(Value::as_str)
+            .is_some_and(|bvid| bvid != record.bvid)
+    {
+        return Err(AppError::Conflict(
+            "subtitle archive identity mismatch".into(),
+        ));
+    }
     let cids = archive_cids(&page_data, record.expected_parts)?;
     for cid in cids {
         let token_key = completed_token(cid, &sha);
         if record.submitted.get(&token_key).is_some() {
             continue;
         }
+        // Refresh the lease before every preparatory upload and refuse stale
+        // claims before an external side effect.
+        let renewed=sqlx::query("UPDATE vr2_bilibili_subtitle_syncs SET lease_until=now()+interval '5 minutes' WHERE publish_job_id=$1 AND lease_token=$2 AND state='running' AND lease_until>now()").bind(record.publish_job_id).bind(token).execute(&db.pool).await?.rows_affected();
+        if renewed != 1 {
+            return Err(AppError::Conflict("subtitle sync lease expired".into()));
+        }
         let location = upload_srt(&client, &base, &csrf, raw.clone()).await?;
         // Durable irreversible boundary. Crash/timeout from here is UNKNOWN;
         // the worker must not create a second draft automatically.
         let updated=sqlx::query(
-            "UPDATE vr2_bilibili_subtitle_syncs SET state='submitting',inflight_cid=$1,updated_at=now() WHERE publish_job_id=$2 AND lease_token=$3 AND state='running'"
+            "UPDATE vr2_bilibili_subtitle_syncs SET state='submitting',inflight_cid=$1,lease_until=now()+interval '5 minutes',updated_at=now() WHERE publish_job_id=$2 AND lease_token=$3 AND state='running' AND lease_until>now()"
         ).bind(cid).bind(record.publish_job_id).bind(token)
             .execute(&db.pool).await?.rows_affected();
         if updated != 1 {
@@ -475,9 +503,12 @@ async fn run_claimed(
             .execute(&db.pool).await?;
     }
     let mut tx = db.pool.begin().await?;
-    sqlx::query(
+    let completed=sqlx::query(
         "UPDATE vr2_bilibili_subtitle_syncs SET state='submitted',inflight_cid=NULL,lease_token=NULL,lease_until=NULL,last_error=NULL,updated_at=now() WHERE publish_job_id=$1 AND lease_token=$2 AND state='running'"
-    ).bind(record.publish_job_id).bind(token).execute(&mut *tx).await?;
+    ).bind(record.publish_job_id).bind(token).execute(&mut *tx).await?.rows_affected();
+    if completed != 1 {
+        return Err(AppError::Conflict("subtitle completion lease lost".into()));
+    }
     release_ref(&mut tx, record).await?;
     tx.commit().await?;
     Ok(())

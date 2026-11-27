@@ -26,13 +26,13 @@ def event(batch,task,kind="cleanup",status="native_pending",attempt=0,legacy=Fal
 def batch(task,platform="bilibili",state="succeeded",age=26):
     b=uuid.uuid4()
     with db() as c:
-        c.execute("""INSERT INTO publish_batches(id,task_id,state,expected_targets,finished_at)
-         VALUES(%s,%s,%s,%s,now()-(%s*interval '1 hour'))""",(b,task,state,json.dumps([{"platform":platform}]),age))
+        c.execute("""INSERT INTO publish_batches(id,task_id,state,expected_targets,request_json,outcomes_json,cleanup_delivery_version,finished_at)
+         VALUES(%s,%s,%s,%s,'{}','{}',0,now()-(%s*interval '1 hour'))""",(b,task,state,json.dumps([{"platform":platform}]),age))
     return b
 def seed(owner="rust",final=True,age=26):
     task,flow,job=uuid.uuid4(),uuid.uuid4(),uuid.uuid4()
     with db() as c:
-        c.execute("INSERT INTO tasks(id,source_type,source_license,status,runtime_owner) VALUES(%s,'local','own','published',%s)",(task,owner))
+        c.execute("INSERT INTO tasks(id,source_type,source_license,status,runtime_owner,priority,retry_count) VALUES(%s,'local','own','published',%s,0,0)",(task,owner))
         c.execute("INSERT INTO pipeline_runs(id,task_id,generation,engine,workflow_name,state,request_json) VALUES(%s,%s,1,'rust-v2','videoroll.rust.pipeline','succeeded',%s)",
                   (flow,task,json.dumps({"bilibili_direct_v1":{"publish_job_id":str(job)}})))
     b=batch(task,age=age)

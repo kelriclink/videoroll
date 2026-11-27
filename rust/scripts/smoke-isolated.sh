@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
-export CARGO_INCREMENTAL=0
+export CARGO_INCREMENTAL="${CARGO_INCREMENTAL:-0}"
 cd "$(dirname "$0")/../.."
 repo_root="$PWD"
 # Python is only used for isolated fixtures and comparisons against the legacy
@@ -27,12 +27,17 @@ elif [[ -x "$repo_root/.toolchains/cargo/bin/cargo" ]]; then
   export RUSTUP_HOME="$repo_root/.toolchains/rustup"
   export CARGO_HOME="$repo_root/.toolchains/cargo"
 else
-  export CARGO_HOME="$HOME/.cargo"
+  export CARGO_HOME="${CARGO_HOME:-$(getent passwd "$(id -u)" | cut -d: -f6)/.cargo}"
+fi
+if [[ -x "$CARGO_HOME/bin/cargo" ]]; then
+  cargo_bin="$CARGO_HOME/bin/cargo"
+else
+  cargo_bin="$(command -v cargo)"
 fi
 if [[ "${VIDEOROLL_V2_TEST_EGRESS_ONLY:-false}" == "true" ]]; then
   export VIDEOROLL_V2_TEST_EGRESS_LOOPBACK="true"
   export VIDEOROLL_V2_TEST_EGRESS_DB="disposable"
-  "$CARGO_HOME/bin/cargo" build --manifest-path "$repo_root/rust/Cargo.toml" --bin videoroll-egress --features egress-test-loopback --locked --offline --quiet
+  "$cargo_bin" build --manifest-path "$repo_root/rust/Cargo.toml" --bin videoroll-egress --features egress-test-loopback --locked --offline --quiet
   PYTHONPATH="$repo_root/src" python3 "$repo_root/rust/tests/egress_gateway_v1_isolated.py"
   echo "PASS: standalone Egress Gateway dedicated HMAC service and SSRF defense"
   exit 0
@@ -140,7 +145,7 @@ if [[ "${VIDEOROLL_V2_TEST_REAL_SCHEMA_ONLY:-false}" == "true" ]]; then
   export VIDEOROLL_V2_INTERNAL_TOKEN="isolated-schema-rehearsal-token-0123456789"
   export INTERNAL_API_SECRET="isolated-schema-rehearsal-service-secret"
   export VIDEOROLL_V2_STORAGE_ROOT="$(mktemp -d "$repo_root/rust/target/v2-schema-rehearsal.XXXXXX")"
-  "$CARGO_HOME/bin/cargo" build --manifest-path "$repo_root/rust/Cargo.toml" --bin videoroll-v2 --locked --offline --quiet
+  "$cargo_bin" build --manifest-path "$repo_root/rust/Cargo.toml" --bin videoroll-v2 --locked --offline --quiet
   : "${VIDEOROLL_TEST_CONTROLS_SNAPSHOT:?nonsecret controls snapshot required}"
   "$smoke_python" "$repo_root/rust/tests/production_schema_rehearsal.py" seed
   "$repo_root/rust/target/debug/videoroll-v2" migrate
@@ -159,14 +164,14 @@ if [[ "${VIDEOROLL_V2_TEST_ORIGINAL_RAG_ONLY:-false}" == "true" ]]; then
   export VIDEOROLL_V2_STORAGE_ROOT="$(mktemp -d "$repo_root/rust/target/v2-original-rag.XXXXXX")"
   export VIDEOROLL_V2_LOCAL_INFERENCE_BRIDGE="$repo_root/scripts/native/local_inference.py"
   export VIDEOROLL_V2_TEST_ORIGINAL_RAG=1
-  "$CARGO_HOME/bin/cargo" test --manifest-path "$repo_root/rust/Cargo.toml" --locked --offline --test original_rag_retrieval -- --nocapture
+  "$cargo_bin" test --manifest-path "$repo_root/rust/Cargo.toml" --locked --offline --test original_rag_retrieval -- --nocapture
   exit 0
 fi
 if [[ "${VIDEOROLL_V2_TEST_TRANSLATION_CONTEXT_ONLY:-false}" == "true" ]]; then
   export VIDEOROLL_V2_INTERNAL_TOKEN="isolated-translation-context-token-0123456789"
   export INTERNAL_API_SECRET="isolated-translation-context-secret"
   export VIDEOROLL_V2_STORAGE_ROOT="$(mktemp -d "$repo_root/rust/target/v2-translation-context.XXXXXX")"
-  "$CARGO_HOME/bin/cargo" build --manifest-path "$repo_root/rust/Cargo.toml" --bin videoroll-v2 --locked --offline --quiet
+  "$cargo_bin" build --manifest-path "$repo_root/rust/Cargo.toml" --bin videoroll-v2 --locked --offline --quiet
   "$repo_root/rust/target/debug/videoroll-v2" migrate
   "$smoke_python" "$repo_root/rust/tests/translation_context_isolated.py"
   exit 0
@@ -175,7 +180,7 @@ if [[ "${VIDEOROLL_V2_TEST_YOUTUBE_SUBTITLES_ONLY:-false}" == "true" ]]; then
   export VIDEOROLL_V2_INTERNAL_TOKEN="isolated-youtube-subtitles-token-0123456789"
   export INTERNAL_API_SECRET="isolated-youtube-subtitles-secret"
   export VIDEOROLL_V2_STORAGE_ROOT="$(mktemp -d "$repo_root/rust/target/v2-youtube-subtitles.XXXXXX")"
-  "$CARGO_HOME/bin/cargo" build --manifest-path "$repo_root/rust/Cargo.toml" --bin videoroll-v2 --locked --offline --quiet
+  "$cargo_bin" build --manifest-path "$repo_root/rust/Cargo.toml" --bin videoroll-v2 --locked --offline --quiet
   "$repo_root/rust/target/debug/videoroll-v2" migrate
   "$smoke_python" "$repo_root/rust/tests/youtube_subtitles_isolated.py"
   exit 0
@@ -184,7 +189,7 @@ if [[ "${VIDEOROLL_V2_TEST_CLOUDFLARE_ASR_ONLY:-false}" == "true" ]]; then
   export VIDEOROLL_V2_INTERNAL_TOKEN="isolated-cloudflare-asr-token-0123456789"
   export INTERNAL_API_SECRET="isolated-cloudflare-asr-secret"
   export VIDEOROLL_V2_STORAGE_ROOT="$(mktemp -d "$repo_root/rust/target/v2-cloudflare-asr.XXXXXX")"
-  "$CARGO_HOME/bin/cargo" build --manifest-path "$repo_root/rust/Cargo.toml" --bin videoroll-v2 --locked --offline --quiet
+  "$cargo_bin" build --manifest-path "$repo_root/rust/Cargo.toml" --bin videoroll-v2 --locked --offline --quiet
   "$repo_root/rust/target/debug/videoroll-v2" migrate
   "$smoke_python" "$repo_root/rust/tests/cloudflare_asr_isolated.py"
   exit 0
@@ -196,7 +201,7 @@ if [[ "${VIDEOROLL_V2_TEST_LOCAL_INFERENCE_ONLY:-false}" == "true" ]]; then
   : "${VIDEOROLL_TEST_INFERENCE_CONFIG:?nonsecret configuration snapshot required}"
   : "${VIDEOROLL_V2_LOCAL_INFERENCE_PYTHON:?explicit model runtime required}"
   export VIDEOROLL_V2_LOCAL_INFERENCE_BRIDGE="$repo_root/scripts/native/local_inference.py"
-  "$CARGO_HOME/bin/cargo" build --manifest-path "$repo_root/rust/Cargo.toml" --bin videoroll-v2 --locked --offline --quiet
+  "$cargo_bin" build --manifest-path "$repo_root/rust/Cargo.toml" --bin videoroll-v2 --locked --offline --quiet
   "$repo_root/rust/target/debug/videoroll-v2" migrate
   PYTHONPATH="$repo_root/src" "$smoke_python" "$repo_root/rust/tests/local_inference_isolated.py"
   exit 0
@@ -204,7 +209,7 @@ fi
 if [[ "${VIDEOROLL_V2_TEST_HISTORICAL_P2_APPEND_ONLY:-false}" == "true" ]]; then
   export VIDEOROLL_V2_INTERNAL_TOKEN="isolated-historical-p2-append-token-0123456789"
   export VIDEOROLL_V2_STORAGE_ROOT="$(mktemp -d "$repo_root/rust/target/v2-historical-p2-append.XXXXXX")"
-  "$CARGO_HOME/bin/cargo" build --manifest-path "$repo_root/rust/Cargo.toml" --bin videoroll-v2 --locked --offline --quiet
+  "$cargo_bin" build --manifest-path "$repo_root/rust/Cargo.toml" --bin videoroll-v2 --locked --offline --quiet
   "$repo_root/rust/target/debug/videoroll-v2" migrate
   "$smoke_python" "$repo_root/rust/tests/historical_p2_append_isolated.py"
   exit 0
@@ -212,7 +217,7 @@ fi
 if [[ "${VIDEOROLL_V2_TEST_HISTORICAL_P2_RENDER_ONLY:-false}" == "true" ]]; then
   export VIDEOROLL_V2_INTERNAL_TOKEN="isolated-historical-p2-render-token-0123456789"
   export VIDEOROLL_V2_STORAGE_ROOT="$(mktemp -d "$repo_root/rust/target/v2-historical-p2-render.XXXXXX")"
-  "$CARGO_HOME/bin/cargo" build --manifest-path "$repo_root/rust/Cargo.toml" --bin videoroll-v2 --locked --offline --quiet
+  "$cargo_bin" build --manifest-path "$repo_root/rust/Cargo.toml" --bin videoroll-v2 --locked --offline --quiet
   "$repo_root/rust/target/debug/videoroll-v2" migrate
   "$smoke_python" "$repo_root/rust/tests/historical_p2_render_isolated.py"
   exit 0
@@ -220,7 +225,7 @@ fi
 if [[ "${VIDEOROLL_V2_TEST_RENDER_ADMIN_ONLY:-false}" == "true" ]]; then
   export VIDEOROLL_V2_INTERNAL_TOKEN="isolated-render-admin-token-0123456789"
   export VIDEOROLL_V2_STORAGE_ROOT="$(mktemp -d "$repo_root/rust/target/v2-render-admin.XXXXXX")"
-  "$CARGO_HOME/bin/cargo" build --manifest-path "$repo_root/rust/Cargo.toml" --bin videoroll-v2 --locked --offline --quiet
+  "$cargo_bin" build --manifest-path "$repo_root/rust/Cargo.toml" --bin videoroll-v2 --locked --offline --quiet
   "$repo_root/rust/target/debug/videoroll-v2" migrate
   "$smoke_python" "$repo_root/rust/tests/render_admin_native_isolated.py"
   exit 0
@@ -228,7 +233,7 @@ fi
 if [[ "${VIDEOROLL_V2_TEST_NATIVE_DEPLOYMENT_ONLY:-false}" == "true" ]]; then
   export VIDEOROLL_V2_INTERNAL_TOKEN="isolated-native-deploy-token-0123456789"
   export VIDEOROLL_V2_STORAGE_ROOT="$(mktemp -d "$repo_root/rust/target/v2-native-deploy.XXXXXX")"
-  "$CARGO_HOME/bin/cargo" build --manifest-path "$repo_root/rust/Cargo.toml" --bins --locked --offline --quiet
+  "$cargo_bin" build --manifest-path "$repo_root/rust/Cargo.toml" --bins --locked --offline --quiet
   "$repo_root/rust/target/debug/videoroll-v2" migrate
   PYTHONPATH="$repo_root/src" "$smoke_python" "$repo_root/rust/tests/native_deployment_isolated.py"
   echo 'PASS: broker-free Rust native deployment'
@@ -237,7 +242,7 @@ fi
 if [[ "${VIDEOROLL_V2_TEST_TASK_OWNERSHIP_ONLY:-false}" == "true" ]]; then
   export VIDEOROLL_V2_INTERNAL_TOKEN="isolated-task-ownership-token-0123456789"
   export VIDEOROLL_V2_STORAGE_ROOT="$(mktemp -d "$repo_root/rust/target/v2-task-ownership-objects.XXXXXX")"
-  "$CARGO_HOME/bin/cargo" build --manifest-path "$repo_root/rust/Cargo.toml" --bin videoroll-v2 --locked --offline --quiet
+  "$cargo_bin" build --manifest-path "$repo_root/rust/Cargo.toml" --bin videoroll-v2 --locked --offline --quiet
   "$repo_root/rust/target/debug/videoroll-v2" migrate
   PYTHONPATH="$repo_root/src" "$smoke_python" "$repo_root/rust/tests/task_ownership_isolated.py"
   echo 'PASS: historical task ownership and verified checkpoint recovery'
@@ -246,7 +251,7 @@ fi
 if [[ "${VIDEOROLL_V2_TEST_OUTBOX_DISPATCHER_ONLY:-false}" == "true" ]]; then
   export VIDEOROLL_V2_INTERNAL_TOKEN="isolated-global-outbox-token-0123456789"
   export VIDEOROLL_V2_STORAGE_ROOT="$(mktemp -d "$repo_root/rust/target/v2-outbox-objects.XXXXXX")"
-  "$CARGO_HOME/bin/cargo" build --manifest-path "$repo_root/rust/Cargo.toml" --bin videoroll-v2 --locked --offline --quiet
+  "$cargo_bin" build --manifest-path "$repo_root/rust/Cargo.toml" --bin videoroll-v2 --locked --offline --quiet
   "$repo_root/rust/target/debug/videoroll-v2" migrate
   PYTHONPATH="$repo_root/src" "$smoke_python" "$repo_root/rust/tests/outbox_dispatcher_isolated.py"
   echo 'PASS: global native outbox dispatcher'
@@ -256,7 +261,7 @@ if [[ "${VIDEOROLL_V2_TEST_RENDER_EVENTS_ONLY:-false}" == "true" ]]; then
   export VIDEOROLL_V2_INTERNAL_TOKEN="isolated-native-render-events-token-0123456789"
   export VIDEOROLL_V2_STORAGE_ROOT="$(mktemp -d "$repo_root/rust/target/v2-render-events-objects.XXXXXX")"
   if ss -lntH "( sport = :18194 )" | grep -q .; then echo 'isolated port occupied' >&2;exit 1;fi
-  "$CARGO_HOME/bin/cargo" build --manifest-path "$repo_root/rust/Cargo.toml" --bin videoroll-v2 --locked --offline --quiet
+  "$cargo_bin" build --manifest-path "$repo_root/rust/Cargo.toml" --bin videoroll-v2 --locked --offline --quiet
   "$repo_root/rust/target/debug/videoroll-v2" migrate
   PYTHONPATH="$repo_root/src" "$smoke_python" "$repo_root/rust/tests/render_events_isolated.py"
   echo 'PASS: native render control events and committed receipt recovery'
@@ -265,7 +270,7 @@ fi
 if [[ "${VIDEOROLL_V2_TEST_PUBLISH_BATCH_EVENTS_ONLY:-false}" == "true" ]]; then
   export VIDEOROLL_V2_INTERNAL_TOKEN="isolated-native-batch-internal-token-0123456789"
   export VIDEOROLL_V2_STORAGE_ROOT="$(mktemp -d "$repo_root/rust/target/v2-publish-batch-objects.XXXXXX")"
-  "$CARGO_HOME/bin/cargo" build --manifest-path "$repo_root/rust/Cargo.toml" --bin videoroll-v2 --locked --offline --quiet
+  "$cargo_bin" build --manifest-path "$repo_root/rust/Cargo.toml" --bin videoroll-v2 --locked --offline --quiet
   "$repo_root/rust/target/debug/videoroll-v2" migrate
   PYTHONPATH="$repo_root/src" "$smoke_python" "$repo_root/rust/tests/publish_batch_events_isolated.py"
   echo 'PASS: native publication event and delayed intermediate GC'
@@ -281,7 +286,7 @@ CREATE TYPE publish_state AS ENUM ('draft','submitting','submitted','published',
 ALTER TABLE publish_jobs ALTER COLUMN platform TYPE platform USING platform::platform;
 ALTER TABLE publish_jobs ALTER COLUMN state TYPE publish_state USING state::publish_state;
 SQL
-  "$CARGO_HOME/bin/cargo" build --manifest-path "$repo_root/rust/Cargo.toml" --bin videoroll-sau --bin videoroll-v2 --locked --offline --quiet
+  "$cargo_bin" build --manifest-path "$repo_root/rust/Cargo.toml" --bin videoroll-sau --bin videoroll-v2 --locked --offline --quiet
   "$repo_root/rust/target/debug/videoroll-v2" migrate
   PYTHONPATH="$repo_root/src" "$smoke_python" "$repo_root/rust/tests/sau_worker_native_v1_isolated.py"
   echo 'PASS: native SAU publication worker without Celery or Redis'
@@ -297,7 +302,7 @@ if [[ "${VIDEOROLL_V2_TEST_SAU_NATIVE_LOGIN_ONLY:-false}" == "true" ]]; then
   if ss -lntH "( sport = :18081 or sport = :18191 )" | grep -q .; then
     echo "isolated SAU test port occupied" >&2;exit 1
   fi
-  "$CARGO_HOME/bin/cargo" build --manifest-path "$repo_root/rust/Cargo.toml" --bin videoroll-sau --bin videoroll-v2 --locked --offline --quiet
+  "$cargo_bin" build --manifest-path "$repo_root/rust/Cargo.toml" --bin videoroll-sau --bin videoroll-v2 --locked --offline --quiet
   "$repo_root/rust/target/debug/videoroll-v2" migrate
   PYTHONPATH="$repo_root/src" "$smoke_python" "$repo_root/rust/tests/sau_login_native_v1_isolated.py"
   "$repo_root/rust/target/debug/videoroll-v2" api >"$repo_root/rust/target/sau-login-ws-api.log" 2>&1 &
@@ -316,7 +321,7 @@ if [[ "${VIDEOROLL_V2_TEST_SAU_NATIVE_CHECK_ONLY:-false}" == "true" ]]; then
   docker exec "$container_name" psql -v ON_ERROR_STOP=1 -U postgres -d videoroll_test -c "ALTER TABLE operation_inbox ADD COLUMN runtime_engine TEXT NOT NULL DEFAULT 'python'" >/dev/null
   docker exec -i "$container_name" psql -v ON_ERROR_STOP=1 -U postgres -d videoroll_test < rust/migrations/20261124000035_sau_check_queue_indexes.sql >/dev/null
   docker exec -i "$container_name" psql -v ON_ERROR_STOP=1 -U postgres -d videoroll_test < rust/migrations/20261124000036_sau_login_session_indexes.sql >/dev/null
-  "$CARGO_HOME/bin/cargo" build --manifest-path "$repo_root/rust/Cargo.toml" --bin videoroll-sau --locked --offline --quiet
+  "$cargo_bin" build --manifest-path "$repo_root/rust/Cargo.toml" --bin videoroll-sau --locked --offline --quiet
   PYTHONPATH="$repo_root/src" "$smoke_python" "$repo_root/rust/tests/sau_check_native_v1_isolated.py"
   echo 'PASS: native SAU account import/check and durable queue with fake browser CLI'
   exit 0
@@ -331,7 +336,7 @@ CREATE TYPE publish_state AS ENUM ('draft','submitting','submitted','published',
 ALTER TABLE publish_jobs ALTER COLUMN platform TYPE platform USING platform::platform;
 ALTER TABLE publish_jobs ALTER COLUMN state TYPE publish_state USING state::publish_state;
 SQL
-  "$CARGO_HOME/bin/cargo" build --manifest-path "$repo_root/rust/Cargo.toml" --bin videoroll-sau --locked --offline --quiet
+  "$cargo_bin" build --manifest-path "$repo_root/rust/Cargo.toml" --bin videoroll-sau --locked --offline --quiet
   PYTHONPATH="$repo_root/src" "$smoke_python" "$repo_root/rust/tests/sau_publish_native_v1_isolated.py"
   echo 'PASS: native SAU publication intake and durable original outbox; browser worker not started'
   exit 0
@@ -494,7 +499,7 @@ for i in $(seq 1 25); do
   sleep 0.2
 done
 cd rust
-"$CARGO_HOME/bin/cargo" build --quiet
+"$cargo_bin" build --quiet
 ./target/debug/videoroll-v2 migrate
 ./target/debug/videoroll-v2 api > "$repo_root/rust/target/v2-smoke-api.log" 2>&1 &
 api_pid=$!
@@ -515,7 +520,7 @@ if [[ "${VIDEOROLL_V2_TEST_DESKTOP_ONLY:-false}" == "true" ]]; then
   exit 0
 fi
 if [[ "${VIDEOROLL_V2_TEST_SAU_ACCOUNTS_ONLY:-false}" == "true" ]]; then
-  "$CARGO_HOME/bin/cargo" build --manifest-path "$repo_root/rust/Cargo.toml"     --bin videoroll-sau --locked --offline --quiet
+  "$cargo_bin" build --manifest-path "$repo_root/rust/Cargo.toml"     --bin videoroll-sau --locked --offline --quiet
   PYTHONPATH="$repo_root/src" "$smoke_python"     "$repo_root/rust/tests/sau_account_native_v1_isolated.py"
   echo "PASS: standalone SAU health, original account listing and safe revocation"
   exit 0
@@ -676,7 +681,7 @@ fi
 
 # Verify real concurrent Rust worker claims against the same downloaded
 # concurrency setting used by Python. The test owns no live production data.
-VIDEOROLL_V2_TEST_QUEUE_CLAIM=1 CARGO_BUILD_JOBS=1   nice -n 10 ionice -c3 "$CARGO_HOME/bin/cargo" test --locked -j1   --test queue_claim_limits -- --nocapture
+VIDEOROLL_V2_TEST_QUEUE_CLAIM=1 CARGO_BUILD_JOBS=1   nice -n 10 ionice -c3 "$cargo_bin" test --locked -j1   --test queue_claim_limits -- --nocapture
 echo 'PASS: Rust worker claim cap is enforced by PostgreSQL lease admission'
 
 # Price the mock OpenAI-compatible RAG/review requests before their execution.
@@ -726,7 +731,7 @@ if [[ "${VIDEOROLL_V2_TEST_CONTRACT_217_ONLY:-false}" == "true" ]]; then
     --out "$repo_root/rust/target/contract-parity-217.json"
   exit 0
 fi
-"$CARGO_HOME/bin/cargo" build --manifest-path "$repo_root/rust/Cargo.toml"   --bin videoroll-sau --locked --offline --quiet
+"$cargo_bin" build --manifest-path "$repo_root/rust/Cargo.toml"   --bin videoroll-sau --locked --offline --quiet
 PYTHONPATH="$repo_root/src" "$smoke_python"   "$repo_root/rust/tests/sau_account_native_v1_isolated.py"
 
 # Test the Nginx desktop auth_request boundary only after native admin auth

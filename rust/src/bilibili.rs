@@ -576,6 +576,63 @@ async fn publish_gate(db: &Database, job: &WorkItem, stage: PublishGate) -> AppR
         tokio::time::sleep(Duration::from_secs_f64(delay.clamp(0.05, 2.0))).await;
     }
 }
+/// P2 appends use the same global admission keys as new archives. The
+/// existing append claim is refreshed while waiting; never reserve in advance.
+pub(crate) async fn append_admission(db: &Database, id: uuid::Uuid, upload: bool) -> AppResult<()> {
+    let stage = if upload {
+        PublishGate::Upload
+    } else {
+        PublishGate::Submit
+    };
+    let expected = if upload { "uploading" } else { "submitting" };
+    let key = format!("runtime.bilibili.throttle.{}", stage.name());
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(600);
+    loop {
+        let mut tx = db.pool.begin().await?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1::text,0))")
+            .bind(&key)
+            .execute(&mut *tx)
+            .await?;
+        let active=sqlx::query("UPDATE vr2_bilibili_p2_appends SET claimed_at=now(),updated_at=now() WHERE publish_job_id=$1 AND state=$2 AND claimed_at>now()-interval '30 minutes'").bind(id).bind(expected).execute(&mut *tx).await?.rows_affected();
+        if active != 1 {
+            return Err(AppError::Conflict(
+                "P2 append admission ownership lost".into(),
+            ));
+        }
+        let now: f64 =
+            sqlx::query_scalar("SELECT EXTRACT(EPOCH FROM clock_timestamp())::double precision")
+                .fetch_one(&mut *tx)
+                .await?;
+        let next:Option<f64>=sqlx::query_scalar("SELECT CASE WHEN jsonb_typeof(value_json->'not_before')='number' THEN (value_json->>'not_before')::double precision ELSE NULL END FROM app_settings WHERE key=$1").bind(&key).fetch_optional(&mut *tx).await?.flatten();
+        let delay = next.unwrap_or(0.) - now;
+        if delay <= 0. {
+            let pending:i64=sqlx::query_scalar("SELECT (SELECT count(*) FROM tasks WHERE status::text='publishing')+(SELECT count(*) FROM vr2_bilibili_p2_appends WHERE state IN ('queued','uploaded','uploading','submitting'))").fetch_one(&mut *tx).await?;
+            let gap = stage.interval(pending);
+            sqlx::query("INSERT INTO app_settings(key,value_json,version) VALUES($1,jsonb_build_object('not_before',$2::double precision),1) ON CONFLICT(key) DO UPDATE SET value_json=EXCLUDED.value_json,version=app_settings.version+1,updated_at=now()").bind(&key).bind(now+gap).execute(&mut *tx).await?;
+            tx.commit().await?;
+            return Ok(());
+        }
+        tx.commit().await?;
+        if tokio::time::Instant::now() >= deadline {
+            return Err(AppError::Unavailable(
+                "P2 append admission wait exceeded".into(),
+            ));
+        }
+        sleep(Duration::from_secs_f64(delay.clamp(0.05, 2.))).await;
+    }
+}
+pub(crate) async fn append_rate_limit(db: &Database, upload: bool, attempt: i32, error: &AppError) {
+    if rate_limited_error(error) {
+        let stage = if upload {
+            PublishGate::Upload
+        } else {
+            PublishGate::Submit
+        };
+        if let Err(e) = extend_publish_cooldown(db, stage, attempt).await {
+            tracing::warn!(error=%e,"P2 cooldown persistence failed");
+        }
+    }
+}
 const DESC_REJECTED: &str = "Bilibili confirmed description length rejection";
 fn description_rejected(value: &Value) -> bool {
     let code = value["code"]
@@ -1332,6 +1389,29 @@ impl NativeP2Client {
         }
         let (cookie, csrf) =
             crate::bilibili_account_v1::publication_credentials(db, config).await?;
+        Self::with_credentials(config, db, cookie, csrf).await
+    }
+    pub(crate) async fn for_confirmed(
+        config: &Config,
+        db: &Database,
+        id: uuid::Uuid,
+        task: uuid::Uuid,
+    ) -> AppResult<Self> {
+        if !config.native_bilibili_allowed {
+            return Err(AppError::Unavailable(
+                "native Bilibili publisher disabled".into(),
+            ));
+        }
+        let (cookie, csrf) =
+            crate::bilibili_account_v1::confirmed_credentials(db, config, id, task).await?;
+        Self::with_credentials(config, db, cookie, csrf).await
+    }
+    async fn with_credentials(
+        config: &Config,
+        db: &Database,
+        cookie: String,
+        csrf: String,
+    ) -> AppResult<Self> {
         Ok(Self {
             inner: BilibiliClient::new(&cookie, member_origin(config)?)?,
             origin: member_origin(config)?,
@@ -1627,6 +1707,8 @@ pub async fn publish(
     // tags and cover. This is not the pre-upload draft.
     receipt["submitted_meta"] = serde_json::to_value(&meta)
         .map_err(|_| AppError::Invalid("final metadata serialization failed".into()))?;
+    receipt["publication_binding"] =
+        crate::bilibili_account_v1::publication_binding(account, &cookie, &csrf);
     if let Some(intent) = collection_intent {
         if receipt["aid"].as_i64().is_some_and(|aid| aid > 0) {
             receipt["collection"] =
@@ -1757,6 +1839,39 @@ mod tests {
                 .await
                 .unwrap()
                 .is_err()
+        );
+        sqlx::raw_sql("CREATE TABLE vr2_bilibili_p2_appends(publish_job_id uuid PRIMARY KEY,state text,claimed_at timestamptz,updated_at timestamptz);") .execute(&db.pool).await.unwrap();
+        let append = uuid::Uuid::new_v4();
+        sqlx::query("INSERT INTO vr2_bilibili_p2_appends VALUES($1,'uploading',now(),now())")
+            .bind(append)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let queued = append_admission(&db, append, true);
+        tokio::pin!(queued);
+        tokio::select! {_=&mut queued=>panic!("P2 bypassed shared upload gate"),_=sleep(Duration::from_millis(350))=>{}}
+        sqlx::query("UPDATE vr2_bilibili_p2_appends SET state='failed' WHERE publish_job_id=$1")
+            .bind(append)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(4), &mut queued)
+                .await
+                .unwrap()
+                .is_err()
+        );
+        sqlx::query("UPDATE app_settings SET value_json=jsonb_build_object('not_before',0) WHERE key='runtime.bilibili.throttle.upload'").execute(&db.pool).await.unwrap();
+        sqlx::query("UPDATE vr2_bilibili_p2_appends SET state='uploading' WHERE publish_job_id=$1")
+            .bind(append)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        append_admission(&db, append, true).await.unwrap();
+        let reserved:bool=sqlx::query_scalar("SELECT (value_json->>'not_before')::double precision > EXTRACT(EPOCH FROM clock_timestamp()) FROM app_settings WHERE key='runtime.bilibili.throttle.upload'").fetch_one(&db.pool).await.unwrap();
+        assert!(reserved);
+        println!(
+            "PASS P2 shares normal publication admission, cancellation and persisted reservation"
         );
         println!(
             "PASS real PostgreSQL separate persistent publish gates, queued admission and cancellation without idle transaction"

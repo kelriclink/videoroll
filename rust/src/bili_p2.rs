@@ -424,7 +424,11 @@ async fn process(
     {
         return Err(AppError::Conflict("historical P2 intent changed".into()));
     }
-    let client = NativeP2Client::new(config, db).await?;
+    let client = if historical.is_some() {
+        NativeP2Client::new(config, db).await?
+    } else {
+        NativeP2Client::for_confirmed(config, db, row.publish_job_id, row.task_id).await?
+    };
     if !crate::publish_platforms::enabled(db, "bilibili").await? {
         return Err(AppError::Conflict(
             "Bilibili disabled between enqueue and execution".into(),
@@ -447,7 +451,14 @@ async fn process(
     } else {
         let path = store.resolve_existing(&row.output_video_key).await?;
         crate::media::ffmpeg::probe_video(&config.ffprobe_binary, &path).await?;
-        let receipt = client.upload(&path).await?;
+        crate::bilibili::append_admission(db, row.publish_job_id, true).await?;
+        let receipt = match client.upload(&path).await {
+            Ok(v) => v,
+            Err(error) => {
+                crate::bilibili::append_rate_limit(db, true, row.attempt, &error).await;
+                return Err(error);
+            }
+        };
         // Persist immutable upload receipt separately from the irreversible edit.
         update(
             db,
@@ -462,6 +473,7 @@ async fn process(
     };
     // Fetch again before changing external archive. Its metadata may have been
     // edited during the potentially large upload.
+    crate::bilibili::append_admission(db, row.publish_job_id, false).await?;
     let current = client.owner(row.aid).await?;
     check_historical_p1(&current, historical.as_ref())?;
     if owned_p1(&current, row.aid, Some(cid))? {
@@ -475,6 +487,7 @@ async fn process(
         .edit(&current, row.aid, &filename, cid, &row.title)
         .await
     {
+        crate::bilibili::append_rate_limit(db, false, row.attempt, &error).await;
         tracing::warn!(publish_job_id=%row.publish_job_id,error=%error,
             "Bilibili P2 archive edit outcome uncertain; do not retry");
         update(
@@ -659,10 +672,13 @@ async fn resolve(
         let cid = row.uploaded_cid.ok_or_else(|| {
             AppError::Conflict("P2 CID unavailable; cannot prove publication".into())
         })?;
-        let owner = NativeP2Client::new(&state.config, &state.db)
-            .await?
-            .owner(row.aid)
-            .await?;
+        let client = if historical.is_some() {
+            NativeP2Client::new(&state.config, &state.db).await?
+        } else {
+            NativeP2Client::for_confirmed(&state.config, &state.db, row.publish_job_id, row.task_id)
+                .await?
+        };
+        let owner = client.owner(row.aid).await?;
         check_historical_p1(&owner, historical.as_ref())?;
         if !owned_p1(&owner, row.aid, Some(cid))? {
             return Err(AppError::Conflict(
