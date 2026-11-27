@@ -1,14 +1,33 @@
 //! Original task-level publishing timeout, without replaying an irreversible
 //! external action. Explicitly native, quiescent batches use the normal
 //! per-target reconciler; ambiguous historical ownership is never inferred.
-use crate::{AppResult, Database};
+use crate::{AppError, AppResult, Database};
 use chrono::{DateTime, Duration, Utc};
 use serde_json::Value;
-use sqlx::{Postgres, Row, Transaction};
+use sqlx::{Connection, PgConnection, Postgres, Row, Transaction};
 use std::collections::HashSet;
 use uuid::Uuid;
 
 pub type Cursor = Option<(DateTime<Utc>, Uuid)>;
+const SCAN_GATE: &str = "videoroll:v2:publish-timeout-scan";
+
+/// Use a dedicated session, like the existing ASR admission gates.
+/// A dropped or disconnected connection releases the lock on the server.
+/// Never return a session carrying this lock to the application pool.
+async fn try_scan_gate(db: &Database) -> AppResult<Option<PgConnection>> {
+    let mut conn = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        PgConnection::connect_with(&db.pool.connect_options()),
+    )
+    .await
+    .map_err(|_| AppError::Unavailable("publish maintenance connection timeout".into()))??;
+    sqlx::query("SET idle_session_timeout=0").execute(&mut conn).await?;
+    let held: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock(hashtextextended($1::text,0))")
+        .bind(SCAN_GATE)
+        .fetch_one(&mut conn)
+        .await?;
+    Ok(held.then_some(conn))
+}
 
 pub fn timeout_hours() -> i64 {
     std::env::var("PUBLISHING_TASK_TIMEOUT_HOURS").ok()
@@ -284,6 +303,10 @@ async fn recover_one(db:&Database, task:Uuid, cutoff:DateTime<Utc>, hours:i64)->
 /// Bounded keyset scan, rotating even if oldest rows are blocked. The cursor
 /// is local to one maintenance loop; no production schema change is needed.
 pub async fn tick(db:&Database, hours:i64, cursor:&mut Cursor)->AppResult<u64> {
+    let Some(mut gate) = try_scan_gate(db).await? else {
+        tracing::debug!("publishing timeout scan skipped: another scanner holds the gate");
+        return Ok(0);
+    };
     let hours=hours.clamp(1,3650*24);
     let cutoff=Utc::now()-Duration::hours(hours);
     let rows:Vec<(DateTime<Utc>,Uuid)>=sqlx::query_as(
@@ -297,9 +320,12 @@ pub async fn tick(db:&Database, hours:i64, cursor:&mut Cursor)->AppResult<u64> {
          AND t.updated_at<$1 AND ($2::timestamptz IS NULL OR (t.updated_at,t.id)>($2,$3::uuid))
          ORDER BY t.updated_at,t.id LIMIT 100")
         .bind(cutoff).bind(cursor.map(|c|c.0)).bind(cursor.map(|c|c.1))
-        .fetch_all(&db.pool).await?;
+        .fetch_all(&mut gate).await?;
     let mut changed=0;
     for &(updated,task) in &rows {
+        // A terminated gate connection stops the remaining scan. The
+        // existing per-task locks still protect the current transaction.
+        gate.ping().await?;
         match recover_one(db,task,cutoff,hours).await {
             Ok(true)=>changed+=1,
             Ok(false)=>{},

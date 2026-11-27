@@ -42,6 +42,22 @@ def start(t):
         with urlopen(req,timeout=10) as r:return r.status
     except HTTPError as e:return e.code
 
+# A maintenance scanner must not run a second page while another session
+# owns the scan gate. Closing the session releases it even without unlock.
+gate_key="videoroll:v2:publish-timeout-scan"
+gate_task=task()
+with db() as gate:
+    gate.execute("SELECT pg_advisory_lock(hashtextextended(%s,0))",(gate_key,))
+    gate.commit()
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        list(pool.map(lambda _:tick(),range(3)))
+    assert task_state(gate_task)==("publishing",None)
+tick()
+assert task_state(gate_task)==("failed","PUBLISHING_TIMEOUT")
+with db() as gate:
+    assert gate.execute("SELECT pg_try_advisory_lock(hashtextextended(%s,0))",(gate_key,)).fetchone()[0]
+print("PASS: single maintenance scanner across processes, automatic session release, deferred work recovered")
+
 empty=task()
 failed=task()
 failure=job(failed,"failed")
