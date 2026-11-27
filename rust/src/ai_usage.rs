@@ -248,7 +248,7 @@ fn rejected_field(raw: &[u8]) -> Option<&'static str> {
 }
 async fn bounded_error(mut response: reqwest::Response) -> Option<&'static str> {
     let mut raw = Vec::new();
-    while let Ok(Some(chunk)) = response.chunk().await {
+    while let Some(chunk) = response.chunk().await.ok()? {
         if chunk.len() > 16384usize.saturating_sub(raw.len()) {
             return None;
         }
@@ -267,6 +267,63 @@ pub(crate) async fn chat_json_observed(
     max_bytes: usize,
     error_label: &str,
     observed: Option<&mut Option<HttpFailure>>,
+) -> AppResult<Value> {
+    chat_json_inner(
+        db,
+        request,
+        endpoint,
+        model,
+        operation,
+        task_id,
+        max_bytes,
+        error_label,
+        observed,
+        None,
+    )
+    .await
+}
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn chat_json_traced(
+    db: &Database,
+    request: RequestBuilder,
+    endpoint: &Url,
+    model: &str,
+    operation: &str,
+    task_id: Option<Uuid>,
+    max_bytes: usize,
+    error_label: &str,
+) -> AppResult<Value> {
+    let mut trace = crate::media::translation_trace::Trace::start(db, model, operation).await;
+    let result = chat_json_inner(
+        db,
+        request,
+        endpoint,
+        model,
+        operation,
+        task_id,
+        max_bytes,
+        error_label,
+        None,
+        trace.as_mut(),
+    )
+    .await;
+    if let Some(trace) = trace {
+        trace.finish(result.is_ok()).await;
+    }
+    result
+}
+#[allow(clippy::too_many_arguments)]
+async fn chat_json_inner(
+    db: &Database,
+    request: RequestBuilder,
+    endpoint: &Url,
+    model: &str,
+    operation: &str,
+    task_id: Option<Uuid>,
+    max_bytes: usize,
+    error_label: &str,
+    observed: Option<&mut Option<HttpFailure>>,
+    mut trace: Option<&mut crate::media::translation_trace::Trace>,
 ) -> AppResult<Value> {
     let started = Instant::now();
     let response = match request.send().await {
@@ -358,10 +415,23 @@ pub(crate) async fn chat_json_observed(
         .is_some_and(|v| v.to_ascii_lowercase().contains("text/event-stream"));
     let mut response = response;
     let mut raw = Vec::new();
+    let mut line_start = 0;
+    let mut scanned = 0;
     loop {
         match response.chunk().await {
             Ok(Some(chunk)) if chunk.len() <= max_bytes.saturating_sub(raw.len()) => {
-                raw.extend_from_slice(&chunk)
+                raw.extend_from_slice(&chunk);
+                if sse {
+                    if let Some(trace) = trace.as_deref_mut() {
+                        for end in scanned..raw.len() {
+                            if raw[end] == b'\n' {
+                                trace.consume(&raw[line_start..end]).await;
+                                line_start = end + 1;
+                            }
+                        }
+                        scanned = raw.len();
+                    }
+                }
             }
             Ok(Some(_)) => {
                 save(
@@ -402,6 +472,11 @@ pub(crate) async fn chat_json_observed(
                 .await;
                 return Err(AppError::Upstream(e));
             }
+        }
+    }
+    if sse && line_start < raw.len() {
+        if let Some(trace) = trace.as_deref_mut() {
+            trace.consume(&raw[line_start..]).await;
         }
     }
     let envelope: Value = match decode_chat_envelope(&raw, sse) {

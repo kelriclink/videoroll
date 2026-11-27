@@ -146,6 +146,9 @@ async fn event_batch(state: &AppState, cursor: Cursor) -> AppResult<Vec<sqlx::po
     Ok(rows)
 }
 fn event_topics(task: Uuid, kind: &str) -> Vec<String> {
+    if kind.starts_with("agent_run.") {
+        return vec!["agents".into(), format!("task:{task}")];
+    }
     let mut topics = vec!["tasks".into(), "queue".into(), format!("task:{task}")];
     if kind.contains("publish") || kind.contains("bilibili") {
         topics.push("publishing".into());
@@ -271,11 +274,12 @@ async fn serve(socket: &mut WebSocket, state: AppState) {
                             let kind:String=row.get("kind");
                             let all_topics=event_topics(task,&kind);
                             if !all_topics.iter().any(|topic|topics.contains(topic)){continue;}
-                            let data:Value=row.get("task_data");
+                            let agent=kind.starts_with("agent_run.");
+                            let data:Value=if agent{row.get("details")}else{row.get("task_data")};
                             if !send(socket,json!({
                                 "v":1,"type":"event","event_id":id,
-                                "entity_id":task,"occurred_at":timestamp,
-                                "topics":all_topics,"name":"task.updated","data":data
+                                "entity_id":if agent{data["run_id"].as_str().and_then(|v|Uuid::parse_str(v).ok()).unwrap_or(task)}else{task},"occurred_at":timestamp,
+                                "topics":all_topics,"name":if kind.starts_with("agent_run."){kind.as_str()}else{"task.updated"},"data":data
                             })).await{break;}
                         }
                     },

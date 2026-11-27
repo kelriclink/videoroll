@@ -39,6 +39,8 @@ struct AsrResponse {
     segments: Vec<AsrSegment>,
     #[serde(default)]
     text: String,
+    #[serde(skip)]
+    timed_words: Option<Vec<ExternalWhisperWord>>,
 }
 #[derive(Debug, Serialize, Deserialize)]
 struct Checkpoint {
@@ -46,6 +48,10 @@ struct Checkpoint {
     fingerprint: String,
     offset_ms: u64,
     cues: Vec<SubtitleCue>,
+    #[serde(default)]
+    words: Option<Vec<ExternalWhisperWord>>,
+    #[serde(default)]
+    vad_spans: Vec<(u64, u64)>,
 }
 #[derive(Debug, Serialize, Deserialize)]
 struct TranslationCheckpoint {
@@ -292,6 +298,7 @@ fn cloudflare_response(data: Value, seconds: f64) -> AppResult<AsrResponse> {
     Ok(AsrResponse {
         segments,
         text: String::new(),
+        timed_words: None,
     })
 }
 // Dedicated PostgreSQL sessions own admission locks. A pooled transaction
@@ -472,7 +479,7 @@ fn external_whisper_fields(
 fn external_whisper_portable_rejection(error: &AppError) -> bool {
     matches!(error,AppError::Unavailable(message) if message.contains("HTTP 400")||message.contains("HTTP 422"))
 }
-#[derive(Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct ExternalWhisperWord {
     start: f64,
     end: f64,
@@ -651,6 +658,81 @@ fn semantic_word_chunks(
     }
     chunks
 }
+fn stitch_word_window(
+    all: &mut Vec<ExternalWhisperWord>,
+    next: Vec<ExternalWhisperWord>,
+    start: f64,
+    overlap: f64,
+) -> bool {
+    if next.is_empty() {
+        return true;
+    }
+    if all.is_empty() {
+        all.extend(next);
+        return true;
+    }
+    if all.last().unwrap().end <= next[0].start {
+        all.extend(next);
+        return true;
+    }
+    if overlap <= 0. {
+        return false;
+    }
+    use unicode_normalization::UnicodeNormalization;
+    let norm = |v: &str| {
+        v.nfkc()
+            .filter(|c| c.is_alphanumeric())
+            .flat_map(char::to_lowercase)
+            .collect::<String>()
+    };
+    let lo = all.partition_point(|w| w.start < start - 2.0);
+    let hi = next.partition_point(|w| w.start <= start + overlap + 0.5);
+    if all.len() - lo > 256 || hi > 256 {
+        return false;
+    }
+    let left = all[lo..].iter().map(|w| norm(&w.text)).collect::<Vec<_>>();
+    let right = next[..hi].iter().map(|w| norm(&w.text)).collect::<Vec<_>>();
+    let mut best: Option<(usize, f64, usize, usize)> = None;
+    for i in 0..left.len() {
+        for j in 0..right.len() {
+            let mut n = 0;
+            while i + n < left.len()
+                && j + n < right.len()
+                && !left[i + n].is_empty()
+                && left[i + n] == right[j + n]
+                && (all[lo + i + n].start - next[j + n].start).abs() <= 0.45
+                && (all[lo + i + n].end - next[j + n].end).abs() <= 0.65
+            {
+                n += 1;
+            }
+            if n < 2 || i + n != left.len() || j != 0 {
+                continue;
+            }
+            let k = n / 2;
+            let cut_left = lo + i + k;
+            let cut_right = j + k;
+            let dist = (all[cut_left].start - (start + overlap / 2.)).abs();
+            if best.is_none_or(|(len, d, _, _)| n > len || (n == len && dist < d)) {
+                best = Some((n, dist, cut_left, cut_right));
+            }
+        }
+    }
+    let Some((_, _, a, b)) = best else {
+        return false;
+    };
+    // Avoid discarding unmatched edge words outside the shared audio region.
+    if all[a..].iter().any(|w| w.start > start + overlap + 0.5)
+        || next[..b].iter().any(|w| w.end < start - 0.5)
+    {
+        return false;
+    }
+    if a > 0 && next[b].start < all[a - 1].start {
+        return false;
+    }
+    all.truncate(a);
+    all.extend(next.into_iter().skip(b));
+    true
+}
 fn external_text_chunks(text: &str, max_chars: usize) -> Vec<String> {
     let mut units = Vec::new();
     let mut current = String::new();
@@ -767,6 +849,63 @@ fn external_whisper_response(
             })
             .collect()
     };
+    let normalized = |text: &str| {
+        text.chars()
+            .filter(|c| c.is_alphanumeric())
+            .flat_map(char::to_lowercase)
+            .collect::<String>()
+    };
+    let complete_words = |raw: &Value, text: &str| -> Option<Vec<ExternalWhisperWord>> {
+        let rows = raw.as_array()?;
+        let words = parse_words(raw);
+        if words.len() != rows.len()
+            || words.is_empty()
+            || normalized(&join_external_words(&words)) != normalized(text)
+        {
+            return None;
+        }
+        Some(words)
+    };
+    let mut timeline = Some(Vec::new());
+    if let Some(rows) = raw_segments.filter(|r| !r.is_empty()) {
+        for item in rows {
+            let text = item["text"].as_str().unwrap_or("");
+            if text.trim().is_empty() {
+                if !parse_words(&item["words"]).is_empty() {
+                    timeline = None;
+                    break;
+                }
+                continue;
+            }
+            let q = serde_json::from_value::<AsrSegment>(item.clone()).ok();
+            let suspicious = q.as_ref().is_some_and(|q| {
+                let low = q.avg_logprob.is_some_and(|v| v.is_finite() && v < -1.);
+                low && (q.no_speech_prob.is_some_and(|v| v.is_finite() && v > 0.85)
+                    || q.compression_ratio
+                        .is_some_and(|v| v.is_finite() && v > 3.5))
+            });
+            if suspicious {
+                continue;
+            }
+            let Some(words) = complete_words(&item["words"], text) else {
+                timeline = None;
+                break;
+            };
+            if let Some(ref mut t) = timeline {
+                t.extend(words);
+            }
+        }
+    } else if !top_text.is_empty() {
+        timeline = complete_words(&payload["words"], &top_text);
+    } else if !parse_words(&payload["words"]).is_empty() {
+        timeline = payload["words"].as_array().and_then(|raw| {
+            let words = parse_words(&payload["words"]);
+            (words.len() == raw.len()).then_some(words)
+        });
+    }
+    if let Some(ref mut t) = timeline {
+        t.sort_by(|a, b| a.start.total_cmp(&b.start).then(a.end.total_cmp(&b.end)));
+    }
     let regroup = |mut words: Vec<ExternalWhisperWord>,
                    quality: Option<&AsrSegment>,
                    out: &mut Vec<AsrSegment>| {
@@ -911,7 +1050,11 @@ fn external_whisper_response(
     } else {
         top_text
     };
-    Ok(AsrResponse { text, segments })
+    Ok(AsrResponse {
+        text,
+        segments,
+        timed_words: timeline,
+    })
 }
 
 async fn run_external_whisper(
@@ -1204,6 +1347,7 @@ async fn run_asr(
             return Ok(AsrResponse {
                 segments: Vec::new(),
                 text: String::new(),
+                timed_words: Some(Vec::new()),
             });
         }
         selective_lease(db, job).await?;
@@ -1470,17 +1614,31 @@ async fn translation_chat(
         if let Some(key) = provider.api_key.as_ref() {
             request = request.bearer_auth(key);
         }
-        let result = crate::ai_usage::chat_json(
-            db,
-            request,
-            &provider.endpoint,
-            &provider.model,
-            operation,
-            Some(task_id),
-            MAX_BYTES,
-            label,
-        )
-        .await;
+        let result = if provider.enable_thinking {
+            crate::ai_usage::chat_json_traced(
+                db,
+                request,
+                &provider.endpoint,
+                &provider.model,
+                operation,
+                Some(task_id),
+                MAX_BYTES,
+                label,
+            )
+            .await
+        } else {
+            crate::ai_usage::chat_json(
+                db,
+                request,
+                &provider.endpoint,
+                &provider.model,
+                operation,
+                Some(task_id),
+                MAX_BYTES,
+                label,
+            )
+            .await
+        };
         if attempt == 0
             && provider.enable_thinking
             && provider.api_type != "cerebras"
@@ -2584,6 +2742,20 @@ pub(crate) async fn process(
     job: &WorkItem,
     preferred: Option<crate::media::youtube_subtitles::Captions>,
 ) -> AppResult<Value> {
+    super::translation_trace::SUBTITLE_JOB
+        .scope(
+            job.clone(),
+            process_inner(config, db, registry, job, preferred),
+        )
+        .await
+}
+async fn process_inner(
+    config: &Config,
+    db: &Database,
+    registry: &AssetRegistry,
+    job: &WorkItem,
+    preferred: Option<crate::media::youtube_subtitles::Captions>,
+) -> AppResult<Value> {
     let selective: Option<Value> = sqlx::query_scalar(
         "SELECT configuration->'selective_retranslate' FROM vr2_workflows WHERE id=$1",
     )
@@ -2729,7 +2901,7 @@ pub(crate) async fn process(
         (WINDOW, OVERLAP)
     };
     let asr_identity = fingerprint(&json!({
-        "checkpoint_version":5,"timing_refine_revision":1,"semantic_word_revision":1,"vad_runtime_configured":crate::local_inference::configured(),"video_sha256":source_digest,
+        "checkpoint_version":6,"timing_refine_revision":1,"semantic_word_revision":2,"vad_runtime_configured":crate::local_inference::configured(),"video_sha256":source_digest,
         "model":config.asr_model,"asr_endpoint":config.asr_endpoint,"local_asr":config.local_asr,
         "asr_request_options":config.asr_request_options,
         "language":profile.asr_language,"duration_ms":(duration*1000.0).round() as u64,
@@ -2748,6 +2920,8 @@ pub(crate) async fn process(
     let stride = window - overlap;
     let count = 1 + ((duration - window).max(0.0) / stride).ceil() as usize;
     let mut cues = Vec::new();
+    let mut global_words = Some(Vec::<ExternalWhisperWord>::new());
+    let mut global_vad = Vec::new();
     let used_source_captions = preferred.is_some();
     if let Some((source, final_cues)) = &recovered {
         cues = final_cues.as_ref().unwrap_or(source).clone();
@@ -2777,12 +2951,12 @@ pub(crate) async fn process(
                 .ok()
                 .and_then(|raw| serde_json::from_slice::<Checkpoint>(&raw).ok())
                 .filter(|row| {
-                    row.revision == 5
+                    row.revision == 6
                         && row.offset_ms == offset_ms
                         && row.fingerprint == asr_identity
                 });
-            let rows = if let Some(cached) = cached {
-                cached.cues
+            let (rows, words, vad_spans) = if let Some(cached) = cached {
+                (cached.cues, cached.words, cached.vad_spans)
             } else {
                 let flac = workspace.join(format!(
                     "audio-{index:05}.{}",
@@ -2831,12 +3005,11 @@ pub(crate) async fn process(
                 }
                 // Retain the full overlap. Midpoint clipping loses continuing
                 // utterances and genuine repetitions before reconciliation.
-                let mut result = normalize_asr(
-                    result.ok_or_else(|| AppError::Unavailable("ASR returned no result".into()))?,
-                    offset_ms,
-                    0,
-                    (duration * 1000.0) as u64,
-                )?;
+                let response =
+                    result.ok_or_else(|| AppError::Unavailable("ASR returned no result".into()))?;
+                let words = response.timed_words.clone();
+                let mut vad_spans = Vec::new();
+                let mut result = normalize_asr(response, offset_ms, 0, (duration * 1000.) as u64)?;
                 if !result.is_empty() && crate::local_inference::configured() {
                     let options = config.asr_request_options.as_ref().unwrap_or(&Value::Null);
                     let threshold = options["groq_vad_threshold"]
@@ -2856,6 +3029,7 @@ pub(crate) async fn process(
                         if let Some(spans) =
                             timing::parse_spans(&value, offset_ms, (seconds * 1000.).round() as u64)
                         {
+                            vad_spans = spans.clone();
                             timing::refine(
                                 &mut result,
                                 &spans,
@@ -2869,21 +3043,75 @@ pub(crate) async fn process(
                 atomic_write(
                     &checkpoint,
                     &serde_json::to_vec(&Checkpoint {
-                        revision: 5,
+                        revision: 6,
                         fingerprint: asr_identity.clone(),
                         offset_ms,
                         cues: result.clone(),
+                        words: words.clone(),
+                        vad_spans: vad_spans.clone(),
                     })
                     .map_err(|_| AppError::Invalid("ASR checkpoint encode failed".into()))?,
                 )
                 .await?;
-                result
+                (result, words, vad_spans)
             };
+            if let Some(mut all) = global_words.take() {
+                if let Some(mut next) = words {
+                    for w in &mut next {
+                        w.start = (w.start + start).min(duration);
+                        w.end = (w.end + start).min(duration);
+                    }
+                    next.retain(|w| w.end > w.start);
+                    if all.len() + next.len() <= 250_000
+                        && stitch_word_window(&mut all, next, start, overlap)
+                    {
+                        global_words = Some(all);
+                        global_vad.extend(vad_spans);
+                    }
+                }
+            }
             cues.extend(rows);
         }
     }
     if recovered.is_none() && !used_source_captions {
-        cues = crate::media::asr_overlap::reconcile(cues);
+        if let Some(words) = global_words.filter(|w| !w.is_empty()) {
+            let options = config.asr_request_options.as_ref().unwrap_or(&Value::Null);
+            let hard = options["max_segment_seconds"]
+                .as_f64()
+                .unwrap_or(12.)
+                .clamp(1., 30.);
+            let chars = options["max_segment_chars"]
+                .as_u64()
+                .unwrap_or(120)
+                .clamp(10, 500) as usize;
+            let mut merged = semantic_word_chunks(words, hard, chars)
+                .into_iter()
+                .map(|g| SubtitleCue {
+                    start_ms: (g[0].start * 1000.).round() as u64,
+                    end_ms: (g.iter().map(|w| w.end).fold(0., f64::max) * 1000.).round() as u64,
+                    text: join_external_words(&g),
+                    secondary_text: None,
+                })
+                .collect::<Vec<_>>();
+            merged = crate::media::asr_overlap::reconcile(merged);
+            global_vad.sort_unstable();
+            let mut union: Vec<(u64, u64)> = Vec::new();
+            for span in global_vad {
+                if let Some(last) = union.last_mut() {
+                    if span.0 <= last.1 {
+                        last.1 = last.1.max(span.1);
+                        continue;
+                    }
+                }
+                union.push(span);
+            }
+            timing::refine(&mut merged, &union, (duration * 1000.) as u64);
+            if !merged.is_empty() {
+                cues = merged;
+            }
+        } else {
+            cues = crate::media::asr_overlap::reconcile(cues);
+        }
     }
     if cues.is_empty() {
         return Ok(json!({"no_speech":true,"reason":"no_credible_segments"}));
@@ -3289,6 +3517,7 @@ mod tests {
             normalize_asr(
                 AsrResponse {
                     text: "hello".into(),
+                    timed_words: None,
                     segments: vec![]
                 },
                 0,
@@ -3300,6 +3529,7 @@ mod tests {
         let rows = normalize_asr(
             AsrResponse {
                 text: String::new(),
+                timed_words: None,
                 segments: vec![
                     AsrSegment {
                         start: 0.0,
@@ -3331,6 +3561,7 @@ mod tests {
     fn confidence_filter_needs_correlated_warning_signals() {
         let response = AsrResponse {
             text: "".into(),
+            timed_words: None,
             segments: vec![
                 AsrSegment {
                     start: 0.0,
@@ -4293,6 +4524,43 @@ mod tests {
         assert_eq!(response.segments[0].text, "Hello world.");
         assert_eq!(response.segments[1].text, "Again now.");
         assert!(response.segments[0].start >= 0.0 && response.segments[1].end <= 3.0);
+    }
+    #[test]
+    fn global_words_stitch_only_time_aligned_overlap_and_preserve_repeated_speech() {
+        let w = |text: &str, start: f64, end: f64| ExternalWhisperWord {
+            text: text.into(),
+            start,
+            end,
+        };
+        let mut all = vec![
+            w("We", 39., 39.4),
+            w(" need", 40.8, 41.2),
+            w(" two", 41.3, 41.7),
+            w(" screws", 41.8, 42.2),
+            w(" here", 42.3, 42.6),
+        ];
+        let next = vec![
+            w("need", 40.9, 41.3),
+            w(" two", 41.4, 41.8),
+            w(" screws", 41.9, 42.3),
+            w(" here", 42.4, 42.7),
+            w(" and", 43., 43.4),
+            w(" two", 43.5, 44.),
+            w(" screws.", 44.1, 44.5),
+        ];
+        assert!(stitch_word_window(&mut all, next, 40., 5.));
+        assert_eq!(
+            join_external_words(&all),
+            "We need two screws here and two screws."
+        );
+        let before = join_external_words(&all);
+        assert!(!stitch_word_window(
+            &mut all,
+            vec![w("unrelated", 44., 44.4), w(" phrase", 44.5, 45.)],
+            43.,
+            5.
+        ));
+        assert_eq!(join_external_words(&all), before);
     }
     #[test]
     fn semantic_word_boundaries_cross_provider_segments_without_losing_timestamps() {

@@ -44,3 +44,20 @@ export function buildAgentMonitorGroups(runs: AgentMonitorRun[]) {
   const recent = roots.filter((run) => !runningIds.has(run.id)).slice(0, 6);
   return { childrenByParent, running, recent };
 }
+
+
+// Provider reasoning is data, not markup. Bound client-side accumulation
+// even if an older backend returns unusually large trace records.
+export function thinkingText(run: AgentMonitorRun): string {
+  if (run.agent_type !== "subtitle_translation_thinking") return "";
+  let value = "";
+  for (const step of run.steps ?? []) {
+    if (step.action !== "translation_thinking.delta") continue;
+    const output = step.output;
+    if (typeof output !== "object" || output === null) continue;
+    const delta = (output as Record<string, unknown>).thinking_delta;
+    if (typeof delta === "string") value += delta.slice(0, 32_000 - value.length);
+    if (value.length >= 32_000) break;
+  }
+  return value;
+}

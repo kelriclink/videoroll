@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   buildAgentMonitorGroups,
+  thinkingText,
   type AgentMonitorRun,
 } from "./AgentMonitorPanel.helpers";
 
@@ -38,5 +39,19 @@ describe("AgentMonitorPanel grouping", () => {
       status: "running",
     });
     expect(buildAgentMonitorGroups([root, child]).running.map((item) => item.id)).toEqual(["root"]);
+  });
+});
+
+
+describe("provider thinking trace", () => {
+  it("renders only explicit reasoning deltas, in order, as bounded plain text", () => {
+    const trace = run({ agent_type: "subtitle_translation_thinking", steps: [
+      { action: "translation_thinking.delta", output: { thinking_delta: "分析" } },
+      { action: "translation_thinking.finished", output: { thinking_delta: "ignore" } },
+      { action: "translation_thinking.delta", output: { thinking_delta: "<tag>结果" } },
+    ] });
+    expect(thinkingText(trace)).toBe("分析<tag>结果");
+    expect(thinkingText({ ...trace, agent_type: "rag_master" })).toBe("");
+    expect(thinkingText({ ...trace, steps: [{ action: "translation_thinking.delta", output: { thinking_delta: "x".repeat(40_000) } }] }).length).toBe(32_000);
   });
 });

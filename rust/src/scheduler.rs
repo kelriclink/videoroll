@@ -32,6 +32,9 @@ impl Scheduler {
     pub fn new(db: Database, lease: Duration) -> Self {
         Self { db, lease }
     }
+    pub async fn reconcile_translation_traces(&self) -> AppResult<u64> {
+        crate::media::translation_trace::reap(&self.db).await
+    }
     fn lease_seconds(&self) -> i64 {
         self.lease.as_secs().clamp(30, 3600) as i64
     }

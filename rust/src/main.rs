@@ -171,6 +171,18 @@ async fn main() -> anyhow::Result<()> {
             let scheduler = Scheduler::new(db.clone(), config.job_lease);
             let storage = AssetRegistry::new(db.clone(), config.storage_root.clone());
             let maintenance_store = storage.clone();
+            let trace_scheduler = scheduler.clone();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    tick.tick().await;
+                    if let Err(error) = trace_scheduler.reconcile_translation_traces().await {
+                        tracing::warn!(%error,"translation trace recovery unavailable");
+                    }
+                }
+            });
+
             // The original youtube.settings.home_scan_enabled flag is the
             // owner of this schedule. Worker startup checks due immediately;
             // API-only instances never start a scanner.
