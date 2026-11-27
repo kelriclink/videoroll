@@ -810,20 +810,28 @@ pub(crate) async fn mark_uncertain(
         return Ok(());
     };
     let details = json!({"recovery":"unknown","error":reason.chars().take(400).collect::<String>(),
-        "native_bilibili":true,"verify_platform_before_retry":true});
-    sqlx::query(
+        "native_bilibili":true,"confirmed":false,"verify_platform_before_retry":true});
+    let changed=sqlx::query(
         "UPDATE publish_jobs SET state='unknown',upload_active=false,
-        lease_owner=NULL,lease_until=NULL,heartbeat_at=now(),finished_at=now(),
-        response_json=$2,updated_at=now() WHERE id=$1 AND state='submitting'",
+        lease_owner=NULL,lease_until=NULL,heartbeat_at=now(),finished_at=COALESCE(finished_at,now()),
+        response_json=CASE WHEN response_json IS NULL THEN $2::jsonb
+          WHEN jsonb_typeof(response_json)='object' THEN response_json || jsonb_build_object('previous_response',response_json) || $2::jsonb
+          ELSE jsonb_build_object('previous_response',response_json) || $2::jsonb END,
+        updated_at=now() WHERE id=$1 AND state='submitting'
+        AND platform::text='bilibili' AND task_id=(SELECT task_id FROM vr2_workflows WHERE id=$3)",
     )
     .bind(id)
     .bind(&details)
+    .bind(workflow_id)
     .execute(&mut **tx)
-    .await?;
+    .await?.rows_affected();
+    if changed==0 {return Ok(())}
     sqlx::query(
-        "UPDATE operation_inbox SET status='completed',result_json=$2,
+        "UPDATE operation_inbox SET status='completed',
+        result_json=CASE WHEN result_json IS NULL THEN $2::jsonb
+          ELSE jsonb_build_object('previous_result',result_json) || $2::jsonb END,
         completed_at=now(),lease_owner=NULL,lease_until=NULL,updated_at=now()
-        WHERE operation_key=$1 AND runtime_engine='python' AND status='processing'",
+        WHERE operation_key=$1 AND runtime_engine='python' AND status='processing' AND lease_owner='rust-v2'",
     )
     .bind(format!("publish-job:{id}"))
     .bind(&details)
