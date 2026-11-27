@@ -316,6 +316,7 @@ fn merge_result(
 }
 async fn persist_step(
     db: &Database,
+    job: &WorkItem,
     id: Uuid,
     step: usize,
     history: &[ToolStep],
@@ -330,11 +331,14 @@ async fn persist_step(
         })).collect::<Vec<_>>()
     }))
     .map_err(|_| AppError::Invalid("research evidence encoding failed".into()))?;
-    sqlx::query(
-        "UPDATE vr2_rag_agent_runs SET evidence=$1,result=$2,updated_at=now() WHERE id=$3 AND state='running'"
+    let mut tx=parallel::fenced(db,job).await?;
+    let changed=sqlx::query(
+        "UPDATE vr2_rag_agent_runs SET evidence=$1,result=$2,updated_at=now() WHERE id=$3 AND workflow_id=$4 AND task_id=$5 AND state='running'"
     ).bind(evidence)
         .bind(json!({"step":step,"tool_calls":history.len(),"status":"researching"}))
-        .bind(id).execute(&db.pool).await?;
+        .bind(id).bind(job.workflow_id).bind(job.task_id).execute(&mut *tx).await?.rows_affected();
+    if changed!=1{return Err(AppError::Conflict("research progress identity changed".into()))}
+    tx.commit().await?;
     Ok(())
 }
 async fn call_model(
@@ -425,7 +429,12 @@ fn gate_candidates(value: &Value, source: &str, known: &[SearchHit]) -> AppResul
     Ok(out)
 }
 async fn lease(db: &Database, job: &WorkItem) -> AppResult<()> {
-    let ok:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM operation_inbox j JOIN pipeline_runs w ON w.id=j.workflow_id WHERE j.id=$1 AND j.lease_token=$2 AND j.status='running' AND j.lease_until>now() AND w.state='running')").bind(job.id).bind(job.lease_token).fetch_one(&db.pool).await?;
+    let ok:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM operation_inbox j JOIN pipeline_runs w ON w.id=j.workflow_id JOIN tasks t ON t.id=w.task_id
+        WHERE j.id=$1 AND j.lease_token=$2 AND j.workflow_id=$3 AND j.task_id=$4 AND j.generation=$5 AND j.stage=$6
+          AND j.runtime_engine='rust-v2' AND j.status='running' AND j.lease_until>clock_timestamp()
+          AND w.task_id=$4 AND w.engine='rust-v2' AND w.state='running' AND w.generation=$5 AND w.current_stage=$6
+          AND t.runtime_owner='rust' AND t.status::text<>'canceled' AND t.stopped_status IS NULL)")
+        .bind(job.id).bind(job.lease_token).bind(job.workflow_id).bind(job.task_id).bind(job.generation).bind(job.stage.as_str()).fetch_one(&db.pool).await?;
     if !ok {
         return Err(AppError::Conflict("stale research worker lease".into()));
     }
@@ -482,13 +491,18 @@ async fn run_steps(
         let result = call_model(db, job.task_id, &client, provider, &gate_history).await?;
         lease(db, job).await?;
         let candidates = gate_candidates(&result, source, known)?;
-        sqlx::query("UPDATE vr2_rag_agent_runs SET plan=plan||$1,updated_at=now() WHERE id=$2 AND state='running'")
-            .bind(json!({"gate_candidates":candidates,"gate_completed":true})).bind(run_id).execute(&db.pool).await?;
+        let mut tx=parallel::fenced(db,job).await?;
+        let changed=sqlx::query("UPDATE vr2_rag_agent_runs SET plan=plan||$1,updated_at=now() WHERE id=$2 AND workflow_id=$3 AND task_id=$4 AND state='running'")
+            .bind(json!({"gate_candidates":candidates,"gate_completed":true})).bind(run_id).bind(job.workflow_id).bind(job.task_id).execute(&mut *tx).await?.rows_affected();
+        if changed!=1{return Err(AppError::Conflict("research gate identity changed".into()))}
         if candidates.is_empty() {
-            sqlx::query("UPDATE vr2_rag_agent_runs SET state='succeeded',result=$1,finished_at=now(),updated_at=now() WHERE id=$2 AND state='running'")
-                .bind(json!({"context":base,"gate_skipped_research":true,"tool_steps":[]})).bind(run_id).execute(&db.pool).await?;
+            let changed=sqlx::query("UPDATE vr2_rag_agent_runs SET state='succeeded',result=$1,finished_at=now(),updated_at=now() WHERE id=$2 AND workflow_id=$3 AND task_id=$4 AND state='running'")
+                .bind(json!({"context":base,"gate_skipped_research":true,"tool_steps":[]})).bind(run_id).bind(job.workflow_id).bind(job.task_id).execute(&mut *tx).await?.rows_affected();
+            if changed!=1{return Err(AppError::Conflict("research gate result identity changed".into()))}
+            tx.commit().await?;
             return Ok(base);
         }
+        tx.commit().await?;
         candidates
     } else {
         Vec::new()
@@ -564,8 +578,9 @@ async fn run_steps(
                 }
                 combined.digest = hex::encode(Sha256::digest(combined.prompt.as_bytes()));
 
-                sqlx::query(
-                    "UPDATE vr2_rag_agent_runs SET state='succeeded',result=$1,evidence=$2,finished_at=now(),updated_at=now() WHERE id=$3"
+                let mut tx=parallel::fenced(db,job).await?;
+                let changed=sqlx::query(
+                    "UPDATE vr2_rag_agent_runs SET state='succeeded',result=$1,evidence=$2,finished_at=now(),updated_at=now() WHERE id=$3 AND workflow_id=$4 AND task_id=$5 AND state='running'"
                 ).bind(json!({
                     "context":combined,
                     "summary":action.get("summary"),
@@ -575,7 +590,9 @@ async fn run_steps(
                 .bind(json!({
                     "knowledge":documents.iter().map(|v|json!({"id":v.id,"score":v.score})).collect::<Vec<_>>(),
                     "web":web_results
-                })).bind(run_id).execute(&db.pool).await?;
+                })).bind(run_id).bind(job.workflow_id).bind(job.task_id).execute(&mut *tx).await?.rows_affected();
+                if changed!=1{return Err(AppError::Conflict("research result identity changed".into()))}
+                tx.commit().await?;
                 return Ok(combined);
             }
             "search_knowledge" => {
@@ -660,7 +677,7 @@ async fn run_steps(
             }
         }
         lease(db, job).await?;
-        persist_step(db, run_id, step, &tool_history, &web_results, &documents).await?;
+        persist_step(db, job, run_id, step, &tool_history, &web_results, &documents).await?;
         if serde_json::to_string(&history).unwrap_or_default().len() > 45_000 {
             return Err(AppError::Unavailable(
                 "RAG Agent context budget exhausted".into(),
@@ -708,18 +725,20 @@ pub async fn run(
         }))
         .map_err(|_| AppError::Invalid("RAG fingerprint encoding failed".into()))?,
     ));
+    let mut tx = parallel::fenced(db, job).await?;
     let prior:Option<(String,Value,Value)>=sqlx::query_as(
-        "SELECT state,plan,result FROM vr2_rag_agent_runs WHERE workflow_id=$1 AND stage='research'"
-    ).bind(job.workflow_id).fetch_optional(&db.pool).await?;
+        "SELECT state,plan,result FROM vr2_rag_agent_runs WHERE workflow_id=$1 AND task_id=$2 AND stage='research'"
+    ).bind(job.workflow_id).bind(job.task_id).fetch_optional(&mut *tx).await?;
     if let Some((state, plan, result)) = prior
         && state == "succeeded"
         && plan.get("fingerprint").and_then(Value::as_str) == Some(&fingerprint)
         && let Some(cached) = result.get("context")
     {
-        return serde_json::from_value(cached.clone())
+        let result=serde_json::from_value(cached.clone())
             .map_err(|_| AppError::Unavailable("RAG saved result corrupted".into()));
+        tx.commit().await?;
+        return result;
     }
-    let mut tx = parallel::fenced(db, job).await?;
     let effective_id: Uuid = sqlx::query_scalar(
         "UPDATE pipeline_runs SET research_run_id=COALESCE(research_run_id,$1),
             research_stage='research',research_state='running',research_plan=$4,
@@ -774,9 +793,9 @@ pub async fn run(
             parallel::fail_unfinished(&mut tx, job, effective_id, &fingerprint, &provider).await?;
         }
         sqlx::query(
-            "UPDATE vr2_rag_agent_runs SET state='failed',error=$1,finished_at=now(),updated_at=now() WHERE id=$2"
+            "UPDATE vr2_rag_agent_runs SET state='failed',error=$1,finished_at=now(),updated_at=now() WHERE id=$2 AND workflow_id=$3 AND task_id=$4 AND state='running'"
         ).bind(match error{AppError::Conflict(_)=>"research lease conflict",_=>"research failed or budget exhausted"})
-            .bind(effective_id).execute(&mut *tx).await?;
+            .bind(effective_id).bind(job.workflow_id).bind(job.task_id).execute(&mut *tx).await?;
         tx.commit().await?;
     }
     result
@@ -784,6 +803,65 @@ pub async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn research_fence_real_postgres(){
+        let Ok(url)=std::env::var("VIDEOROLL_TEST_RESEARCH_FENCE_DB_URL")else{return};
+        let parsed=Url::parse(&url).unwrap();
+        assert_eq!(parsed.host_str(),Some("127.0.0.1"));
+        assert_eq!(parsed.path(),"/videoroll_test");
+        let db=Database::connect(&url).await.unwrap();
+        let job=WorkItem{id:Uuid::new_v4(),task_id:Uuid::new_v4(),workflow_id:Uuid::new_v4(),
+            stage:crate::domain::Stage::Subtitle,generation:1,operation_key:format!("fixture:{}",Uuid::new_v4()),
+            lease_token:Uuid::new_v4(),attempts:1,max_attempts:3,payload:json!({})};
+        let run=Uuid::new_v4();
+        sqlx::query("INSERT INTO tasks(id,source_type,source_license,status,runtime_owner) VALUES($1,'local','own','downloaded','rust')")
+            .bind(job.task_id).execute(&db.pool).await.unwrap();
+        sqlx::query("INSERT INTO vr2_workflows(id,task_id,generation,state,current_stage) VALUES($1,$2,1,'running','subtitle')")
+            .bind(job.workflow_id).bind(job.task_id).execute(&db.pool).await.unwrap();
+        sqlx::query("UPDATE pipeline_runs SET research_run_id=$2,research_stage='research',research_state='running',research_plan='{}',research_evidence='{}',research_result='{}' WHERE id=$1")
+            .bind(job.workflow_id).bind(run).execute(&db.pool).await.unwrap();
+        sqlx::query("INSERT INTO operation_inbox(id,operation_key,runtime_engine,workflow_id,task_id,stage,generation,status,lease_token,lease_until) VALUES($1,$2,'rust-v2',$3,$4,'subtitle',1,'running',$5,now()+interval '5 minutes')")
+            .bind(job.id).bind(&job.operation_key).bind(job.workflow_id).bind(job.task_id).bind(job.lease_token).execute(&db.pool).await.unwrap();
+        lease(&db,&job).await.unwrap();
+        persist_step(&db,&job,run,1,&[],&[],&[]).await.unwrap();
+        let next=Uuid::new_v4();
+        sqlx::query("UPDATE operation_inbox SET lease_token=$2 WHERE id=$1").bind(job.id).bind(next).execute(&db.pool).await.unwrap();
+        let mut new=job.clone();new.lease_token=next;
+        persist_step(&db,&new,run,2,&[],&[],&[]).await.unwrap();
+        async fn snapshot(db:&Database,run:Uuid)->Value{
+            sqlx::query_scalar("SELECT to_jsonb(r) FROM vr2_rag_agent_runs r WHERE id=$1").bind(run).fetch_one(&db.pool).await.unwrap()
+        }
+        let before=snapshot(&db,run).await;
+        assert!(matches!(persist_step(&db,&job,run,3,&[],&[],&[]).await,Err(AppError::Conflict(_))));
+        let mut wrong=new.clone();wrong.generation=2;
+        assert!(matches!(persist_step(&db,&wrong,run,3,&[],&[],&[]).await,Err(AppError::Conflict(_))));
+        wrong=new.clone();wrong.stage=crate::domain::Stage::Render;
+        assert!(matches!(persist_step(&db,&wrong,run,3,&[],&[],&[]).await,Err(AppError::Conflict(_))));
+        assert!(matches!(persist_step(&db,&new,Uuid::new_v4(),3,&[],&[],&[]).await,Err(AppError::Conflict(_))));
+        sqlx::query("UPDATE tasks SET status='canceled',stopped_status='downloaded' WHERE id=$1").bind(job.task_id).execute(&db.pool).await.unwrap();
+        assert!(lease(&db,&new).await.is_err());
+        assert!(matches!(parallel::fenced(&db,&new).await,Err(AppError::Conflict(_))));
+        sqlx::query("UPDATE tasks SET status='downloaded',stopped_status=NULL,runtime_owner='python' WHERE id=$1").bind(job.task_id).execute(&db.pool).await.unwrap();
+        assert!(matches!(persist_step(&db,&new,run,3,&[],&[],&[]).await,Err(AppError::Conflict(_))));
+        sqlx::query("UPDATE tasks SET runtime_owner='rust' WHERE id=$1").bind(job.task_id).execute(&db.pool).await.unwrap();
+        sqlx::query("UPDATE pipeline_runs SET state='paused' WHERE id=$1").bind(job.workflow_id).execute(&db.pool).await.unwrap();
+        assert!(matches!(persist_step(&db,&new,run,3,&[],&[],&[]).await,Err(AppError::Conflict(_))));
+        sqlx::query("UPDATE pipeline_runs SET state='running' WHERE id=$1").bind(job.workflow_id).execute(&db.pool).await.unwrap();
+        // Expiry while blocked on the final row must be checked after lock acquisition.
+        sqlx::query("UPDATE operation_inbox SET lease_until=clock_timestamp()+interval '500 milliseconds' WHERE id=$1").bind(job.id).execute(&db.pool).await.unwrap();
+        let mut blocker=db.pool.begin().await.unwrap();
+        sqlx::query("SELECT id FROM operation_inbox WHERE id=$1 FOR UPDATE").bind(job.id).execute(&mut *blocker).await.unwrap();
+        let other=db.clone();let candidate=new.clone();
+        let pending=tokio::spawn(async move{persist_step(&other,&candidate,run,3,&[],&[],&[]).await});
+        tokio::time::sleep(Duration::from_millis(750)).await;
+        blocker.commit().await.unwrap();
+        assert!(matches!(pending.await.unwrap(),Err(AppError::Conflict(_))));
+        assert_eq!(snapshot(&db,run).await["result"],before["result"]);
+        assert_eq!(snapshot(&db,run).await["evidence"],before["evidence"]);
+        assert_eq!(snapshot(&db,run).await["plan"],before["plan"]);
+        assert_eq!(snapshot(&db,run).await["state"],before["state"]);
+        println!("PASS: serial and parallel shared research fence, stale lease, wrong stage/generation/run, ownership, stop/pause, expiry during row-lock wait");
+    }
     #[test]
     fn gate_filters_and_local_reuse() {
         let known = vec![SearchHit {

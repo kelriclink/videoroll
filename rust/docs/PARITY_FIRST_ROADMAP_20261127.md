@@ -76,3 +76,7 @@ SAU 代码检查：当前原生领取仍采用全局单投稿互斥；账户导�
 ## 第三十五批续：翻译检查点提交围栏
 
 基线 15891c4。对照 Python translation_checkpoint.py 的 source_segments_key/provider/时间戳匹配、translation_stage.py 的 batch checkpoint 与 Rust media/asr.rs 的批次 fingerprint、partial rows 和滚动上下文。原 Rust 已支持更细的缺失片段恢复，不重写。发现 stable checkpoint 在 cheap lease 检查后、临时文件写入和 rename 前存在旧租约覆盖窗口。四种检查点（YouTube 字幕、ASR 分段、翻译部分结果、翻译完整批次）统一在临时文件写完后，按 Task → Workflow → Job 顺序加锁，校验所有权/暂停/状态/代次/阶段/身份/token，并在全部锁取得后以 clock_timestamp 复查 lease，持锁完成 rename。保留原路径、格式、fingerprint 与恢复逻辑。文件 rename 与 DB commit 不具备跨系统原子性，且未覆盖临时音频文件/所有 Agent checkpoint 写入；不宣称完整消除所有文件竞争。测试：隔离 PostgreSQL+模拟 HTTP translation recovery，旧 token、暂停、停止、过期均不得覆盖新结果；完整 translation_context 集成回归。复查发现旧 partial 在模型响应缺失行时先学习摘要/上下文，可能污染恢复。改为只学习完整子批次响应的上下文，仍保留合法已返回行及针对缺失行修复；旧 revision=1 部分检查点失效重算，不改既有完整批次。原集成 fixture 补齐新增的缺失行修复请求并故意使之失败以继续验证持久恢复，仍核查失败摘要/上下文不传播。
+
+## 第三十五批续：RAG 研究写入围栏
+
+基线 6db88cf。对照 Python agent_runtime.py:check_budget/before_llm/before_tool 与 Rust agent.rs/agent_parallel.rs。现有并行 Agent 已持久化父子研究、预算预约及工具收据，单 Agent 只有逐次 lease 检查，门控、进度、最终结果存在检查和写入之间竞争。统一使用原 Task → Pipeline → Inbox 行锁，核对 Rust 所有权、暂停/取消、当前阶段/代次、精确作业身份及 token，取得最后一把锁后再以 clock_timestamp 核对租约；串行门控、证据、最终结果、失败与缓存读取进入同一围栏，匹配原研究 ID/工作流/任务，拒绝影响其他研究。外部请求不持有事务。仍不改变串行模型/工具预算跨重试重置和未完成步骤不复用的行为；并行预算沿用既有持久化计数，未新增 token/成本预算；外部请求已经发出时无法回收。通过实际迁移 PG 测试旧 token、错误代次/阶段、暂停、所有权、锁等待期间过期及正常串行/并行研究回归。

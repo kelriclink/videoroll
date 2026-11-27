@@ -184,6 +184,9 @@ if [[ "${VIDEOROLL_V2_TEST_TRANSLATION_CONTEXT_ONLY:-false}" == "true" ]]; then
   "$cargo_bin" build --manifest-path "$repo_root/rust/Cargo.toml" --bin videoroll-v2 --locked --offline --quiet
   "$repo_root/rust/target/debug/videoroll-v2" migrate
   "$smoke_python" "$repo_root/rust/tests/translation_context_isolated.py"
+  if [[ "${VIDEOROLL_V2_TEST_RESEARCH_FENCE:-false}" == "true" ]]; then
+    VIDEOROLL_TEST_RESEARCH_FENCE_DB_URL="$DATABASE_URL" CARGO_INCREMENTAL=0 "$cargo_bin" test --manifest-path "$repo_root/rust/Cargo.toml" --locked --offline --lib agent::tests::research_fence_real_postgres -- --nocapture
+  fi
   exit 0
 fi
 if [[ "${VIDEOROLL_V2_TEST_YOUTUBE_SUBTITLES_ONLY:-false}" == "true" ]]; then

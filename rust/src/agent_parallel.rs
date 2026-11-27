@@ -26,17 +26,24 @@ pub(super) async fn fenced(
     job: &WorkItem,
 ) -> AppResult<Transaction<'static, Postgres>> {
     let mut tx = db.pool.begin().await?;
-    // Match the native scheduler's workflow -> operation lock order.
-    let wf:Option<Uuid>=sqlx::query_scalar("SELECT id FROM pipeline_runs WHERE id=$1 AND task_id=$2 AND engine='rust-v2' AND state='running' FOR UPDATE")
-        .bind(job.workflow_id).bind(job.task_id).fetch_optional(&mut *tx).await?;
+    // Match the scheduler and asset installer: Task -> Workflow -> Job.
+    let owner:Option<Uuid>=sqlx::query_scalar("SELECT id FROM tasks WHERE id=$1 AND runtime_owner='rust' AND status::text<>'canceled' AND stopped_status IS NULL FOR UPDATE")
+        .bind(job.task_id).fetch_optional(&mut *tx).await?;
+    if owner.is_none(){return Err(AppError::Conflict("stale research task".into()))}
+    let wf:Option<Uuid>=sqlx::query_scalar("SELECT id FROM pipeline_runs WHERE id=$1 AND task_id=$2 AND engine='rust-v2' AND state='running' AND generation=$3 AND current_stage=$4 FOR UPDATE")
+        .bind(job.workflow_id).bind(job.task_id).bind(job.generation).bind(job.stage.as_str()).fetch_optional(&mut *tx).await?;
     if wf.is_none() {
         return Err(AppError::Conflict("stale research workflow".into()));
     }
-    let held:Option<Uuid>=sqlx::query_scalar("SELECT id FROM operation_inbox WHERE id=$1 AND workflow_id=$2 AND runtime_engine='rust-v2' AND status='running' AND lease_token=$3 AND lease_until>clock_timestamp() FOR UPDATE")
-        .bind(job.id).bind(job.workflow_id).bind(job.lease_token).fetch_optional(&mut *tx).await?;
+    let held:Option<Uuid>=sqlx::query_scalar("SELECT id FROM operation_inbox WHERE id=$1 AND workflow_id=$2 AND task_id=$3 AND generation=$4 AND stage=$5 AND runtime_engine='rust-v2' AND status='running' AND lease_token=$6 FOR UPDATE")
+        .bind(job.id).bind(job.workflow_id).bind(job.task_id).bind(job.generation).bind(job.stage.as_str()).bind(job.lease_token).fetch_optional(&mut *tx).await?;
     if held.is_none() {
         return Err(AppError::Conflict("stale research worker lease".into()));
     }
+    // A lease may expire while waiting for a row lock.
+    let live:bool=sqlx::query_scalar("SELECT COALESCE(lease_until>clock_timestamp(),false) FROM operation_inbox WHERE id=$1")
+        .bind(job.id).fetch_one(&mut *tx).await?;
+    if !live{return Err(AppError::Conflict("expired research worker lease".into()))}
     Ok(tx)
 }
 async fn event(
