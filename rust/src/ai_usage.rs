@@ -60,6 +60,15 @@ fn estimated_cost(
     }
     Some(total as i64)
 }
+// Cost only when the provider reports both counters and the configured
+// pricing contains this provider/model. Missing data is not zero cost.
+pub(crate) async fn reported_cost(db:&Database,endpoint:&Url,model:&str,usage:&Value)->Option<u64>{
+    let field=|a:&str,b:&str|usage[a].as_u64().or_else(||usage[b].as_u64()).and_then(|v|i32::try_from(v).ok());
+    let input=field("prompt_tokens","input_tokens")?;
+    let output=field("completion_tokens","output_tokens")?;
+    let pricing=settings::effective(db,"ai.usage.pricing").await.ok()?;
+    estimated_cost(&pricing,&provider_name(endpoint),model,input,output).and_then(|v|u64::try_from(v).ok())
+}
 struct UsageRecord<'a> {
     url: &'a Url,
     model: &'a str,

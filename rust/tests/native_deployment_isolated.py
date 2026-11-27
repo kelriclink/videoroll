@@ -15,6 +15,7 @@ env={**os.environ,"VIDEOROLL_V2_STANDALONE":"true","VIDEOROLL_V2_NATIVE_OUTBOX_O
     "VIDEOROLL_V2_ENABLE_LEGACY_PUBLISH":"false","VIDEOROLL_V2_COMPAT_WRITE":"false",
     "VIDEOROLL_V2_COMPAT_URL":"","VIDEOROLL_V2_LEGACY_ORCHESTRATOR_URL":"","VIDEOROLL_V2_WORKER_GATEWAY":"",
     "INTERNAL_API_SECRET":"isolated-native-stack-secret-0123456789",
+    "ADMIN_BOOTSTRAP_SECRET":"isolated-browser-bootstrap-not-production",
     "VIDEOROLL_V2_SOURCE_SCANNER":"false","VIDEOROLL_V2_REMOTE_RENDER":"false","VIDEOROLL_V2_ENABLE_NATIVE_BILIBILI":"false",
     "VIDEOROLL_V2_ENABLE_SAU_PUBLISH":"false","VIDEOROLL_V2_SAU_ENABLE_NATIVE_CHECK":"false",
     "VIDEOROLL_V2_SAU_ENABLE_NATIVE_LOGIN":"false","VIDEOROLL_V2_SAU_ENABLE_NATIVE_PUBLISH":"false",
@@ -132,7 +133,10 @@ try:
         mime=release/"share/nginx/mime.types"
         nginx=str(release/"bin/nginx")
     else:
-        web.mkdir();(web/"index.html").write_text("<html>isolated-native-web</html>")
+        if os.environ.get("VIDEOROLL_TEST_BROWSER")=="true":
+            shutil.copytree(repo/"src/web/dist",web)
+        else:
+            web.mkdir();(web/"index.html").write_text("<html>isolated-native-web</html>")
         config_source=repo/"deploy/rust-native/nginx.conf"
         mime=Path("/opt/videoroll/share/nginx/mime.types")
         nginx="/opt/videoroll/bin/nginx"
@@ -163,6 +167,9 @@ try:
             code,body,_=get(p,path)
             assert code==200 and body==(web/path.lstrip("/")).read_bytes(),path
         print(f"PASS: staged production index and {len(paths)} entry assets served byte-for-byte",flush=True)
+    if os.environ.get("VIDEOROLL_TEST_BROWSER")=="true":
+        from native_browser_isolated import browser
+        browser(root,p,str(t),env["ADMIN_BOOTSTRAP_SECRET"])
     for proc,log in procs:assert proc.poll() is None,log.read_text()
     print("PASS: seven native processes and real Nginx; original browser routes, V1/V2 API, worker protocol, protected noVNC and workflow redirect; no broker",flush=True)
 finally:

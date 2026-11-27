@@ -433,9 +433,35 @@ async fn reserve_model_tokens(db:&Database,job:&WorkItem,input:u64,output:u64)->
     let used=plan["token_reserved"].as_u64().ok_or_else(||AppError::Conflict("research token ledger missing".into()))?;
     let next=used.checked_add(input).and_then(|v|v.checked_add(output)).filter(|v|*v<=limit)
         .ok_or_else(||AppError::Unavailable("research token reservation exhausted".into()))?;
+    let calls=plan["model_requests_reserved"].as_u64().unwrap_or(0).saturating_add(1);
     let changed=sqlx::query("UPDATE pipeline_runs SET research_plan=research_plan||$2,updated_at=now() WHERE id=$1 AND research_state='running'")
-        .bind(job.workflow_id).bind(json!({"token_reserved":next})).execute(&mut *tx).await?.rows_affected();
+        .bind(job.workflow_id).bind(json!({"token_reserved":next,"model_requests_reserved":calls})).execute(&mut *tx).await?.rows_affected();
     if changed!=1 {return Err(AppError::Conflict("research token ledger changed".into()))}
+    tx.commit().await?;
+    Ok(())
+}
+// Actual provider usage is separate from the conservative admission ledger.
+// Never refund reservations: unknown/failed calls can still be billed. A
+// provider that exceeds its declared reservation consumes the excess too.
+async fn observe_model_usage(db:&Database,job:&WorkItem,reserved:u64,usage:&Value,price:Option<u64>)->AppResult<()>{
+    let number=|a:&str,b:&str|usage[a].as_u64().or_else(||usage[b].as_u64());
+    let (Some(input),Some(output))=(number("prompt_tokens","input_tokens"),number("completion_tokens","output_tokens")) else{return Ok(())};
+    let total=usage["total_tokens"].as_u64().unwrap_or_else(||input.saturating_add(output)).max(input.saturating_add(output));
+    let mut tx=parallel::fenced(db,job).await?;
+    let plan:Value=sqlx::query_scalar("SELECT research_plan FROM pipeline_runs WHERE id=$1 AND research_state='running'").bind(job.workflow_id).fetch_one(&mut *tx).await?;
+    let get=|key:&str|plan[key].as_u64().unwrap_or(0);
+    let count=get("model_requests_observed").saturating_add(1);
+    if count>get("model_requests_reserved"){return Err(AppError::Conflict("research usage exceeds reserved requests".into()))}
+    let mut patch=json!({"model_requests_observed":count,"observed_input_tokens":get("observed_input_tokens").saturating_add(input),
+        "observed_output_tokens":get("observed_output_tokens").saturating_add(output),"observed_total_tokens":get("observed_total_tokens").saturating_add(total),
+        "token_reserved":get("token_reserved").saturating_add(total.saturating_sub(reserved))});
+    if let Some(price)=price{
+        patch["model_requests_priced"]=json!(get("model_requests_priced").saturating_add(1));
+        patch["observed_estimated_cost_microusd"]=json!(get("observed_estimated_cost_microusd").saturating_add(price));
+    }
+    let changed=sqlx::query("UPDATE pipeline_runs SET research_plan=research_plan||$2,updated_at=now() WHERE id=$1 AND research_state='running'")
+        .bind(job.workflow_id).bind(patch).execute(&mut *tx).await?.rows_affected();
+    if changed!=1{return Err(AppError::Conflict("research usage ledger changed".into()))}
     tx.commit().await?;
     Ok(())
 }
@@ -481,6 +507,10 @@ async fn call_model(
         "RAG Agent",
     )
     .await?;
+    if let Some(usage)=value.get("usage"){
+        let price=crate::ai_usage::reported_cost(db,&provider.endpoint,&provider.model,usage).await;
+        observe_model_usage(db,job,input.saturating_add(output),usage,price).await?;
+    }
     response_json(&value)
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -843,6 +873,20 @@ async fn run_steps(
         "RAG Agent stopped at its bounded step budget without finish".into(),
     ))
 }
+// A cache fingerprint must account for changed or revoked evidence beyond
+// the initially retrieved hits. xmin captures original Python/SQL writes too;
+// a commutative aggregate is bounded in memory and excludes other task scope.
+async fn corpus_revision(db:&Database,task_id:Uuid,collection:&str,target:&str,original:&crate::rag_original_v1::Settings)->AppResult<Value>{
+    let mut tx=db.pool.begin().await?;
+    sqlx::query("SET LOCAL statement_timeout='5s'").execute(&mut *tx).await?;
+    let revision:Value=sqlx::query_scalar("SELECT jsonb_build_array(count(*),COALESCE(sum(hashtextextended(id::text||':'||xmin::text,0)::numeric),0)::text)
+        FROM translation_knowledge_items WHERE
+        (created_by='rust-v2' AND native_collection=$2 AND (native_scope='global' OR (native_scope='task' AND native_task_id=$1)) AND (native_retain_until IS NULL OR native_retain_until>now()))
+        OR ($3 AND native_scope IS NULL AND status IN ('approved','auto_approved') AND target_lang=$4 AND ($5='' OR domain='' OR domain=$5))")
+        .bind(task_id).bind(collection).bind(original.enabled).bind(target).bind(&original.domain).fetch_one(&mut *tx).await?;
+    tx.commit().await?;
+    Ok(revision)
+}
 pub async fn run(
     config: &Config,
     db: &Database,
@@ -871,9 +915,10 @@ pub async fn run(
     )
     .await?;
     let original=crate::rag_original_v1::settings(db).await?;
+    let revision=corpus_revision(db,job.task_id,&query.collection,task.target_lang,&original).await?;
     let fingerprint = hex::encode(Sha256::digest(
         serde_json::to_vec(&json!({
-            "revision":6,"original_retrieval":{"enabled":original.enabled,"domain":original.domain,"top_k":original.top_k,"min_score":original.min_score},"context_window":provider.context_window,"glossary":task.glossary,"parallelism":task.parallelism,"gate":task.gate,"target_lang":task.target_lang,"timeout":task.timeout_seconds,"source":source,"model_provider":settings.research_provider_id,
+            "revision":7,"corpus_revision":revision,"provider_credential_identity":provider_cache::identity("research",provider.endpoint.as_str(),provider.api_key.as_deref()),"original_retrieval":{"enabled":original.enabled,"domain":original.domain,"top_k":original.top_k,"min_score":original.min_score},"context_window":provider.context_window,"glossary":task.glossary,"parallelism":task.parallelism,"gate":task.gate,"target_lang":task.target_lang,"timeout":task.timeout_seconds,"source":source,"model_provider":settings.research_provider_id,
             "model_id":settings.research_model_id,"resolved_model":provider.model,"resolved_endpoint":provider.endpoint.as_str(),"resolved_api_type":provider.api_type,"resolved_output_tokens":provider.max_output_tokens,
             "rag":settings,"query":query.query,
             "evidence_ids":initial.evidence_ids,
@@ -914,6 +959,9 @@ pub async fn run(
     plan["deadline_ms"]=json!(deadline);
     plan["token_limit"]=json!(token_limit);
     plan["token_reserved"]=json!(token_reserved);
+    for key in ["model_requests_reserved","model_requests_observed","model_requests_priced","observed_input_tokens","observed_output_tokens","observed_total_tokens","observed_estimated_cost_microusd"]{
+        plan[key]=json!(saved.and_then(|p|p[key].as_u64()).unwrap_or(0));
+    }
     let effective_id: Uuid = sqlx::query_scalar(
         "UPDATE pipeline_runs SET research_run_id=COALESCE(research_run_id,$1),
             research_stage='research',research_state='running',research_plan=$4,
@@ -1010,6 +1058,27 @@ mod tests {
         assert!(reserve_model_tokens(&db,&new,1,1).await.is_err());
         let used:Value=sqlx::query_scalar("SELECT research_plan->'token_reserved' FROM pipeline_runs WHERE id=$1").bind(job.workflow_id).fetch_one(&db.pool).await.unwrap();
         assert_eq!(used,json!(100));
+        observe_model_usage(&db,&new,50,&json!({"prompt_tokens":30,"completion_tokens":25,"total_tokens":55}),Some(42)).await.unwrap();
+        let plan:Value=sqlx::query_scalar("SELECT research_plan FROM pipeline_runs WHERE id=$1").bind(job.workflow_id).fetch_one(&db.pool).await.unwrap();
+        assert_eq!(plan["token_reserved"],105);
+        assert_eq!(plan["model_requests_reserved"],2);
+        assert_eq!(plan["model_requests_observed"],1);
+        assert_eq!(plan["observed_total_tokens"],55);
+        assert_eq!(plan["observed_estimated_cost_microusd"],42);
+        assert!(observe_model_usage(&db,&job,50,&json!({"prompt_tokens":1,"completion_tokens":1}),None).await.is_err());
+        let original=crate::rag_original_v1::Settings{enabled:false,domain:"".into(),top_k:8,min_score:0.68};
+        let collection=format!("fixture-{}",Uuid::new_v4());
+        let rev=corpus_revision(&db,job.task_id,&collection,"zh",&original).await.unwrap();
+        let doc=Uuid::new_v4();
+        sqlx::query("INSERT INTO translation_knowledge_items(id,created_by,item_type,native_collection,native_scope,native_kind,title,content) VALUES($1,'rust-v2','document',$2,'global','passage','fixture','before')")
+            .bind(doc).bind(&collection).execute(&db.pool).await.unwrap();
+        let added=corpus_revision(&db,job.task_id,&collection,"zh",&original).await.unwrap();
+        assert_ne!(rev,added);
+        sqlx::query("UPDATE translation_knowledge_items SET content='after' WHERE id=$1").bind(doc).execute(&db.pool).await.unwrap();
+        assert_ne!(added,corpus_revision(&db,job.task_id,&collection,"zh",&original).await.unwrap());
+        sqlx::query("UPDATE translation_knowledge_items SET native_retain_until=now()-interval '1 second' WHERE id=$1").bind(doc).execute(&db.pool).await.unwrap();
+        assert_eq!(rev,corpus_revision(&db,job.task_id,&collection,"zh",&original).await.unwrap());
+        sqlx::query("DELETE FROM translation_knowledge_items WHERE id=$1").bind(doc).execute(&db.pool).await.unwrap();
         sqlx::query("UPDATE pipeline_runs SET research_plan=research_plan||jsonb_build_object('deadline_ms',0,'token_limit',1000) WHERE id=$1").bind(job.workflow_id).execute(&db.pool).await.unwrap();
         assert!(reserve_model_tokens(&db,&new,1,1).await.is_err());
         async fn snapshot(db:&Database,run:Uuid)->Value{
