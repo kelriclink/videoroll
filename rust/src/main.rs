@@ -105,6 +105,8 @@ enum Command {
     /// Run one due-check for the original YouTube Home recommendation scanner.
     /// Exits without side effects unless home_scan_enabled is true and due.
     HomeTick,
+    /// Run one bounded legacy storage retention page, with both opt-in flags.
+    LegacyStorageTick,
     /// Process expired v2 artifacts and explicitly enabled legacy pending deletes.
     Gc {
         #[arg(long, default_value_t = 50)]
@@ -353,6 +355,20 @@ async fn main() -> anyhow::Result<()> {
             let executor = Executor::new(config.clone(), db.clone(), scheduler, storage);
             let mut workers = tokio::task::JoinSet::new();
             let failed_retention = config.cleanup_grace;
+            if videoroll_v2::maintenance_terminal_storage_v1::scheduled_enabled() {
+                let legacy_store=maintenance_store.clone();
+                workers.spawn(async move {
+                    let mut tick=tokio::time::interval(std::time::Duration::from_secs(60));
+                    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    loop {
+                        tick.tick().await;
+                        if let Err(error)=videoroll_v2::maintenance_terminal_storage_v1::scheduled_tick(
+                            &legacy_store,failed_retention,false).await {
+                            tracing::warn!(%error,"legacy retention page deferred");
+                        }
+                    }
+                });
+            }
             workers.spawn(async move {
                 // Indexed due-date GC; zero directory scans on idle cycles.
                 let mut tick = tokio::time::interval(std::time::Duration::from_secs(300));
@@ -527,6 +543,12 @@ async fn main() -> anyhow::Result<()> {
         Command::PublishBatchTick => {
             let processed = videoroll_v2::publish_batch_events::tick(&db, 100).await?;
             tracing::info!(processed, "native publish batch event tick finished");
+        }
+        Command::LegacyStorageTick => {
+            let registry=AssetRegistry::new(db,config.storage_root.clone());
+            let removed=videoroll_v2::maintenance_terminal_storage_v1::scheduled_tick(
+                &registry,config.cleanup_grace,true).await?;
+            tracing::info!(removed,"legacy retention page finished");
         }
         Command::Gc { limit } => {
             let registry = AssetRegistry::new(db, config.storage_root.clone());

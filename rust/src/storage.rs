@@ -46,7 +46,7 @@ pub(crate) async fn publication_cleanup_blocked(
 }
 /// Re-read the original retention setting in the deletion transaction.
 /// A batch's independent 24h cleanup permission only covers intermediates.
-async fn deletion_policy(
+pub(crate) async fn deletion_policy(
     tx: &mut Transaction<'_, Postgres>, task: Uuid, status: &str,
     stopped: Option<&str>, updated: DateTime<Utc>, failed_retention: Duration,
 ) -> AppResult<(bool, bool)> {

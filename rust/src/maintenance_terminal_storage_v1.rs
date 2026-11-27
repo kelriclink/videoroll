@@ -23,9 +23,9 @@ fn enabled() -> bool {
         Some("true" | "1")
     )
 }
-async fn acquire(state: &AppState) -> AppResult<String> {
+async fn acquire(db: &crate::Database) -> AppResult<String> {
     let owner = format!("rust:{}:{}", std::process::id(), Uuid::new_v4());
-    let mut tx = state.db.pool.begin().await?;
+    let mut tx = db.pool.begin().await?;
     sqlx::query("INSERT INTO app_settings(key,value_json) VALUES($1,'{}'::jsonb) ON CONFLICT(key) DO NOTHING")
         .bind(LOCK).execute(&mut *tx).await?;
     let current: Value =
@@ -57,9 +57,9 @@ async fn acquire(state: &AppState) -> AppResult<String> {
     tx.commit().await?;
     Ok(owner)
 }
-async fn release(state: &AppState, owner: &str) -> AppResult<()> {
+async fn release(db: &crate::Database, owner: &str) -> AppResult<()> {
     sqlx::query("UPDATE app_settings SET value_json=value_json-'lock_owner'-'lock_until',updated_at=now() WHERE key=$1 AND value_json->>'lock_owner'=$2")
-        .bind(LOCK).bind(owner).execute(&state.db.pool).await?;
+        .bind(LOCK).bind(owner).execute(&db.pool).await?;
     Ok(())
 }
 fn resource_key(key: &str, task: Uuid) -> bool {
@@ -168,6 +168,7 @@ async fn externally_referenced(
         SELECT EXISTS(SELECT 1 FROM assets WHERE storage_key=$1 AND task_id<>$2)
            OR EXISTS(SELECT 1 FROM subtitles WHERE storage_key=$1 AND task_id<>$2)
            OR EXISTS(SELECT 1 FROM storage_object_refs WHERE storage_key=$1)
+           OR EXISTS(SELECT 1 FROM storage_objects WHERE storage_key=$1)
     "#,
     )
     .bind(key)
@@ -446,7 +447,7 @@ async fn cleanup(state: &AppState) -> AppResult<Value> {
             }
             let mut protected = false;
             for key in &keys {
-                if externally_referenced(&mut tx, key, task).await? {
+                if key.starts_with("v2/") || externally_referenced(&mut tx, key, task).await? {
                     protected = true;
                     break;
                 }
@@ -498,6 +499,188 @@ async fn cleanup(state: &AppState) -> AppResult<Value> {
     }
     Ok(summary.into_json())
 }
+// Scheduled legacy cleanup is intentionally a second opt-in: an operator
+// who enabled manual cleanup or pending-delete retries did not necessarily
+// consent to periodic deletion of all eligible historical task media.
+pub fn scheduled_enabled() -> bool {
+    enabled() && matches!(std::env::var("VIDEOROLL_V2_ALLOW_V1_SCHEDULED_CLEANUP").ok().as_deref(), Some("true"|"1"))
+}
+const SCAN_LIMIT: i64 = 128;
+fn scan_interval() -> i64 {
+    std::env::var("STORAGE_CLEANUP_INTERVAL_SECONDS").ok()
+        .and_then(|v|v.parse::<i64>().ok()).unwrap_or(3600).clamp(60,86400)
+}
+fn timestamp(value: &Value, key: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(value.get(key)?.as_str()?).ok().map(|t|t.with_timezone(&Utc))
+}
+fn scan_cursor(value: &Value) -> Option<(DateTime<Utc>,Uuid)> {
+    Some((timestamp(value,"rust_scan_after_at")?,Uuid::parse_str(value.get("rust_scan_after_id")?.as_str()?).ok()?))
+}
+
+/// Lock the original maintenance lease, then refresh it before every task.
+/// No destructive action proceeds after a competing cleanup took ownership.
+async fn renew_scan(tx:&mut Transaction<'_,Postgres>, owner:&str) -> AppResult<()> {
+    let current:Value=sqlx::query_scalar("SELECT value_json FROM app_settings WHERE key=$1 FOR UPDATE")
+        .bind(LOCK).fetch_one(&mut **tx).await?;
+    if current.get("lock_owner").and_then(Value::as_str)!=Some(owner)
+        || timestamp(&current,"lock_until").is_none_or(|until|until<=Utc::now()) {
+        return Err(AppError::Conflict("legacy resource scan lease lost".into()));
+    }
+    let ttl=std::env::var("STORAGE_RESOURCE_CLEANUP_LOCK_TTL_SECONDS").ok()
+        .and_then(|v|v.parse::<i64>().ok()).unwrap_or(3600).clamp(60,7200);
+    sqlx::query("UPDATE app_settings SET value_json=jsonb_set(value_json,'{lock_until}',to_jsonb($2::text)),updated_at=now() WHERE key=$1")
+        .bind(LOCK).bind((Utc::now()+Duration::seconds(ttl)).to_rfc3339()).execute(&mut **tx).await?;
+    Ok(())
+}
+
+/// Bounded original namespace only. Unlike explicit manual purge, a recent
+/// replacement, registered object, noncanonical key or failed unlink is
+/// retained, including its original database rows.
+async fn scheduled_task(registry:&AssetRegistry, owner:&str, task:Uuid, failed:std::time::Duration) -> AppResult<u64> {
+    let mut tx=registry.db.pool.begin().await?;
+    renew_scan(&mut tx,owner).await?;
+    let parent:Option<(String,Option<String>,DateTime<Utc>)>=sqlx::query_as(
+        "SELECT upper(status::text),stopped_status::text,updated_at FROM tasks WHERE id=$1 FOR UPDATE SKIP LOCKED")
+        .bind(task).fetch_optional(&mut *tx).await?;
+    let Some((status,stopped,updated))=parent else {return Ok(0)};
+    let (full,_)=crate::storage::deletion_policy(&mut tx,task,&status,stopped.as_deref(),updated,failed).await?;
+    if !full || unsafe_to_delete(&mut tx,task).await? {return Ok(0)}
+    let root=registry.root.clone();
+    let listed=tokio::task::spawn_blocking(move||scan_orphans(&root,task)).await
+        .map_err(|e|AppError::Unavailable(format!("legacy scan join failed: {e}")))?;
+    let Ok(mut keys)=listed else {
+        tracing::warn!(%task,"unsafe or oversized original directory retained");
+        return Ok(0)
+    };
+    // Fence cross-task changes only after enumeration; never wait for a
+    // writer while holding the parent. Registry-managed objects are excluded.
+    sqlx::query("LOCK TABLE assets, subtitles, storage_objects, storage_object_refs IN SHARE ROW EXCLUSIVE MODE NOWAIT")
+        .execute(&mut *tx).await?;
+    let referenced:Vec<String>=sqlx::query_scalar(
+        "SELECT storage_key FROM assets WHERE task_id=$1 UNION SELECT storage_key FROM subtitles WHERE task_id=$1")
+        .bind(task).fetch_all(&mut *tx).await?;
+    for key in referenced {
+        if resource_key(&key,task) && AssetRegistry::checked_key(&key).is_ok() {keys.insert(key);}
+    }
+    if keys.len()>MAX_FILES {return Ok(0)}
+    let mut keys:Vec<String>=keys.into_iter().collect();
+    keys.sort();
+    let mut removed=0;
+    for key in keys {
+        if externally_referenced(&mut tx,&key,task).await? {continue}
+        // Do not bypass the stricter pending-delete identity/mtime checks.
+        let queued:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM app_settings WHERE starts_with(key,'storage.pending_delete.') AND value_json->>'storage_key'=$1)")
+            .bind(&key).fetch_one(&mut *tx).await?;
+        if queued {continue}
+        let path=match registry.resolve_existing(&key).await {
+            Ok(p)=>p,Err(error)=>{tracing::warn!(%task,%key,%error,"legacy path retained");continue}
+        };
+        let present=match tokio::fs::symlink_metadata(&path).await {
+            Ok(meta) if meta.is_file() && meta.modified().is_ok_and(|t|DateTime::<Utc>::from(t)<=updated)=>true,
+            Err(e) if e.kind()==io::ErrorKind::NotFound=>false,
+            _=>continue,
+        };
+        sqlx::query("SAVEPOINT original_resource").execute(&mut *tx).await?;
+        let delete_rows:AppResult<()> = async {
+            sqlx::query("DELETE FROM subtitles WHERE task_id=$1 AND storage_key=$2").bind(task).bind(&key).execute(&mut *tx).await?;
+            sqlx::query("DELETE FROM assets WHERE task_id=$1 AND storage_key=$2").bind(task).bind(&key).execute(&mut *tx).await?;
+            Ok(())
+        }.await;
+        if let Err(error)=delete_rows {
+            sqlx::query("ROLLBACK TO SAVEPOINT original_resource").execute(&mut *tx).await?;
+            sqlx::query("RELEASE SAVEPOINT original_resource").execute(&mut *tx).await?;
+            tracing::warn!(%task,%key,%error,"legacy relational references retained");
+            continue;
+        }
+        if present {
+            match tokio::fs::remove_file(&path).await {
+                Ok(())=>{},
+                Err(e) if e.kind()==io::ErrorKind::NotFound=>{},
+                Err(error)=>{
+                    sqlx::query("ROLLBACK TO SAVEPOINT original_resource").execute(&mut *tx).await?;
+                    sqlx::query("RELEASE SAVEPOINT original_resource").execute(&mut *tx).await?;
+                    tracing::warn!(%task,%key,%error,"legacy unlink failed; rows retained");
+                    continue;
+                }
+            }
+        }
+        sqlx::query("RELEASE SAVEPOINT original_resource").execute(&mut *tx).await?;
+        removed+=1;
+    }
+    tx.commit().await?;
+    Ok(removed)
+}
+
+async fn scheduled_page(registry:&AssetRegistry, owner:&str, failed:std::time::Duration, force:bool) -> AppResult<u64> {
+    let value:Value=sqlx::query_scalar("SELECT value_json FROM app_settings WHERE key=$1")
+        .bind(LOCK).fetch_one(&registry.db.pool).await?;
+    if !force && timestamp(&value,"rust_scan_next_due_at").is_some_and(|t|t>Utc::now()) {return Ok(0)}
+    let cursor=scan_cursor(&value);
+    let now=Utc::now();
+    let failed_before=now-Duration::seconds(failed.as_secs().clamp(3600,3650*86400) as i64);
+    let published_before=crate::operations_v1::published_retention(&registry.db).await?
+        .map(|ttl|now-Duration::seconds(ttl.as_secs() as i64));
+    let rows:Vec<(DateTime<Utc>,Uuid)>=sqlx::query_as(
+        "SELECT updated_at,id FROM tasks WHERE
+          ((status::text='failed' AND updated_at<=$1)
+          OR ((status::text='published' OR (status::text='canceled' AND stopped_status IS NULL))
+              AND $2::timestamptz IS NOT NULL AND updated_at<=$2))
+          AND ($3::timestamptz IS NULL OR (updated_at,id)>($3,$4::uuid))
+          ORDER BY updated_at,id LIMIT $5")
+        .bind(failed_before).bind(published_before).bind(cursor.map(|c|c.0)).bind(cursor.map(|c|c.1))
+        .bind(SCAN_LIMIT).fetch_all(&registry.db.pool).await?;
+    let mut next=None;
+    let mut removed=0;
+    let mut processed=0;
+    let mut matched=0;
+    for &(updated,task) in &rows {
+        if matched>=MAX_TASKS {break}
+        match scheduled_task(registry,owner,task,failed).await {
+            Ok(n)=>{removed+=n;if n>0{matched+=1}},
+            Err(AppError::Conflict(detail))=>return Err(AppError::Conflict(detail)),
+            Err(error)=>tracing::warn!(%task,%error,"legacy scheduled task deferred"),
+        }
+        processed+=1;
+        next=Some((updated,task));
+    }
+    // Resume after this page across restarts. Once the end is reached, wrap
+    // back to the start on a subsequent sweep, so skipped locks and new
+    // tasks that sort before the cursor eventually get another chance.
+    if processed==rows.len() && (rows.len() as i64)<SCAN_LIMIT {next=None}
+    let mut tx=registry.db.pool.begin().await?;
+    renew_scan(&mut tx,owner).await?;
+    sqlx::query("UPDATE app_settings SET value_json=(value_json-'rust_scan_after_at'-'rust_scan_after_id') || $2::jsonb,updated_at=now() WHERE key=$1")
+        .bind(LOCK).bind(json!({
+            "rust_scan_after_at":next.map(|c|c.0.to_rfc3339()),
+            "rust_scan_after_id":next.map(|c|c.1),
+            "rust_scan_next_due_at":(Utc::now()+Duration::seconds(scan_interval())).to_rfc3339()
+        })).execute(&mut *tx).await?;
+    tx.commit().await?;
+    tracing::info!(scanned=processed,removed,more=next.is_some(),"legacy retention page complete");
+    Ok(removed)
+}
+
+pub async fn scheduled_tick(registry:&AssetRegistry, failed:std::time::Duration, force:bool)->AppResult<u64> {
+    if !scheduled_enabled(){return Ok(0)}
+    if !force {
+        let value:Option<Value>=sqlx::query_scalar("SELECT value_json FROM app_settings WHERE key=$1")
+            .bind(LOCK).fetch_optional(&registry.db.pool).await?;
+        if value.as_ref().and_then(|v|timestamp(v,"rust_scan_next_due_at")).is_some_and(|t|t>Utc::now()) {
+            return Ok(0)
+        }
+    }
+    let root=fs::canonicalize(&registry.root)?;
+    let registry=AssetRegistry::new(registry.db.clone(),root);
+    let owner=match acquire(&registry.db).await {
+        Ok(owner)=>owner,
+        Err(AppError::Conflict(_))=>return Ok(0),
+        Err(error)=>return Err(error),
+    };
+    let result=scheduled_page(&registry,&owner,failed,force).await;
+    release(&registry.db,&owner).await?;
+    result
+}
+
 async fn cleanup_terminal(State(state): State<AppState>) -> AppResult<Json<Value>> {
     // Explicit opt-in because unlike workdir cleanup this removes original
     // business-visible assets and orphan media. Production defaults safe.
@@ -506,9 +689,9 @@ async fn cleanup_terminal(State(state): State<AppState>) -> AppResult<Json<Value
             "terminal storage cleanup disabled; enable explicitly".into(),
         ));
     }
-    let owner = acquire(&state).await?;
+    let owner = acquire(&state.db).await?;
     let result = cleanup(&state).await;
-    release(&state, &owner).await?;
+    release(&state.db, &owner).await?;
     result.map(Json)
 }
 pub fn router() -> Router<AppState> {

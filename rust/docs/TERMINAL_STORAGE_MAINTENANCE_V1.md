@@ -31,3 +31,14 @@ Rust Worker 的五分钟维护周期和 `gc --limit 100` 同时接管原 `storag
 - 本策略比 Python 原版更保守：不会自动删除活跃任务、未知归属或非标准命名空间中的待删除文件；也不会自动清理 Python .partial 目录。
 
 已知差异：Python 手动清理默认枚举所有终态且没有额外防误删，Rust 增加手动启用、批次限额和跨系统引用保护。历史资源差分、真实工作流验收仍未完成，不能计为完全生产等价。
+
+## 定时历史存储保留期回收
+
+须确认原 Python 保留期线程已停用，再同时启用 `VIDEOROLL_V2_ALLOW_V1_TERMINAL_CLEANUP=true` 和 `VIDEOROLL_V2_ALLOW_V1_SCHEDULED_CLEANUP=true`。第二个开关默认关闭，不因曾经启用手动清理而意外触发定时删除。
+
+- 独立 Worker 维护循环，每分钟检查一次持久化截止时间，实际扫描周期复用 `STORAGE_CLEANUP_INTERVAL_SECONDS`（默认 3600，60–86400 秒）。
+- 复用原 `orchestrator.storage_resource_cleanup` 锁，在原 JSON 内保存 `rust_scan_after_at`、`rust_scan_after_id`、`rust_scan_next_due_at`，每轮最多 128 候选任务、32 个实际回收任务。游标到末尾后回绕；进程重启不会重新从首批扫描。独立 `legacy-storage-tick` 命令允许显式触发单页，但不绕过开关或任务保留期。
+- 失败任务使用原环境变量（默认 48h）；已投稿和不可恢复的取消任务使用原 `storage.retention.asset_ttl_days`；实际删除前持锁重新检查当前设置、任务状态、发布批次和其他引用。
+- 只清理原七类任务 UUID 目录及对应资产行，不碰 v2 注册表、非标准路径、待删除队列已有记录、新于任务最后更新时间的文件、符号链接或有活跃引用的资源。
+- 旧资源删除失败时保留原资产/字幕行，后续扫描重试。没有文件系统与 PostgreSQL 的跨系统原子事务；崩溃后再次扫描可处理缺失文件对应的旧行。
+- 与原 Python 全盘扫描相比，故意保留非标准路径及近期被替换的文件，需要人工核查。

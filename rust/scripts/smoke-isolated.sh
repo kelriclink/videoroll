@@ -543,6 +543,10 @@ if [[ "${VIDEOROLL_V2_TEST_REMOTE_AUTO_ONLY:-false}" == "true" ]]; then
   echo 'PASS: independent remote Bearer intake, original PBKDF2/idempotency ledger and concurrent dedupe'
   exit 0
 fi
+if [[ "${VIDEOROLL_V2_TEST_LEGACY_RETENTION_ONLY:-false}" == "true" ]]; then
+  "$smoke_python" "$repo_root/rust/tests/legacy_storage_retention_isolated.py"
+  exit 0
+fi
 if [[ "${VIDEOROLL_V2_TEST_TERMINAL_ONLY:-false}" == "true" ]]; then
   container_name="$container_name" PYTHONPATH="$repo_root/src" "$smoke_python" \
     "$repo_root/rust/tests/maintenance_terminal_storage_v1_isolated.py"
