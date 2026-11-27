@@ -1677,7 +1677,7 @@ link_id="$(python3 -c 'import uuid; print(uuid.uuid4())')"
 docker exec "$container_name" psql -v ON_ERROR_STOP=1 -U postgres -d videoroll_test -c \
   "INSERT INTO playout_asset_links(id,task_id,asset_id,ffplayout_channel_id) VALUES('$link_id','$asr_task_id','$final_id',2)" >/dev/null
 docker exec "$container_name" psql -v ON_ERROR_STOP=1 -U postgres -d videoroll_test -c \
-  "UPDATE storage_objects SET retain_until=now()-interval '1 minute' WHERE storage_key LIKE 'v2/%' AND storage_key LIKE '%$asr_task_id%'; UPDATE storage_workdirs SET due_at=now()-interval '1 minute' WHERE task_id='$asr_task_id';" >/dev/null
+  "UPDATE tasks SET updated_at=now()-interval '2 days' WHERE id='$asr_task_id'; UPDATE storage_objects SET retain_until=now()-interval '1 minute' WHERE storage_key LIKE 'v2/%' AND storage_key LIKE '%$asr_task_id%'; UPDATE storage_workdirs SET due_at=now()-interval '1 minute' WHERE task_id='$asr_task_id';" >/dev/null
 ./target/debug/videoroll-v2 gc --limit 100 >/dev/null
 test -f "$VIDEOROLL_V2_STORAGE_ROOT/$video_key"
 test "$(docker exec "$container_name" psql -At -U postgres -d videoroll_test -c \

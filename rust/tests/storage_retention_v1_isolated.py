@@ -2,6 +2,8 @@
 import json
 import os
 import subprocess
+import shutil
+from pathlib import Path
 from uuid import uuid4
 from urllib.parse import urlsplit
 import psycopg
@@ -61,3 +63,68 @@ check(recent_canceled,False)
 gc(hours=12)
 for item in (old_failed,recent_failed,old_canceled,published): check(item,True)
 print("PASS: original failed 48h default and configurable override, canceled/published TTL=0 and 1d, paused preservation, single durable cleanup event")
+
+# Force only the queued lease deadlines, then change the governing retention.
+# The physical file, old asset row and orphan workdir must still be retained.
+root=Path(os.environ["VIDEOROLL_V2_STORAGE_ROOT"])
+assert root.name=="v2-smoke-objects"
+bad=seed("failed",72)
+held=seed("failed",72)
+orphan=seed("failed",72)
+gc()
+fixtures=[old_failed,recent_failed,old_canceled,published,bad,held,orphan]
+def force_due(items):
+    with db() as c:
+        for task,flow,key in items:
+            c.execute("UPDATE storage_objects SET retain_until=now()-interval '1 minute' WHERE storage_key=%s",(key,))
+            c.execute("UPDATE storage_workdirs SET due_at=now()-interval '1 minute' WHERE task_id=%s",(task,))
+def state(item):
+    with db() as c:
+        task,_,key=item
+        return (c.execute("SELECT state FROM storage_objects WHERE storage_key=%s",(key,)).fetchone()[0],
+                c.execute("SELECT count(*) FROM assets WHERE task_id=%s AND storage_key=%s",(task,key)).fetchone()[0])
+def retained(item,rows=1):
+    assert (root/item[2]).exists(),item
+    assert state(item)==("live",rows),(item,state(item))
+def deleted(item):
+    assert not (root/item[2]).exists(),item
+    assert state(item)==("deleted",0),(item,state(item))
+def workdir(item):
+    return root/f"v2/sub/{item[0]}"
+try:
+    for item in fixtures:
+        task,_,key=item
+        p=root/key
+        p.parent.mkdir(parents=True,exist_ok=True)
+        if item==bad: p.mkdir()
+        else: p.write_bytes(b"test")
+        workdir(item).mkdir(parents=True,exist_ok=True)
+        (workdir(item)/"orphan.tmp").write_text("test")
+        if item!=orphan:
+            with db() as c:
+                c.execute("INSERT INTO assets(id,task_id,kind,storage_key,size_bytes) VALUES(%s,%s,%s,%s,4)",
+                    (uuid4(),task,"video_final" if item==published else "video_raw",key))
+    with db() as c:
+        c.execute("UPDATE tasks SET updated_at=now()-interval '1 hour' WHERE id=%s",(old_failed[0],))
+        c.execute("UPDATE storage_objects SET manual_hold_until=now()+interval '1 day' WHERE storage_key=%s",(held[2],))
+    ttl(0)
+    force_due(fixtures)
+    gc()
+    for item in (old_failed,recent_failed,old_canceled,published,bad,held): retained(item)
+    for item in (old_failed,recent_failed,old_canceled,published): assert workdir(item).is_dir(),item
+    deleted(orphan)
+    assert not workdir(orphan).exists()
+    # An unlink failure must roll back the SQL asset deletion.
+    assert (root/bad[2]).is_dir()
+    # Reenable TTL and shorten failed retention; eligible physical GC resumes.
+    ttl(1)
+    force_due(fixtures)
+    gc(hours=12)
+    for item in (recent_failed,old_canceled,published): deleted(item)
+    for item in (recent_failed,old_canceled,published): assert not workdir(item).exists(),item
+    for item in (old_failed,bad,held): retained(item)
+    print("PASS: queued TTL reevaluation, changed failed retention and task age, manual hold, orphan ownership, workdir preservation, rollback on unlink failure")
+finally:
+    for item in fixtures:
+        shutil.rmtree(root/f"v2/raw/{item[0]}",ignore_errors=True)
+        shutil.rmtree(workdir(item),ignore_errors=True)

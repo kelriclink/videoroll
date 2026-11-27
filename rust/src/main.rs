@@ -387,10 +387,10 @@ async fn main() -> anyhow::Result<()> {
                         Ok(_) => {},
                         Err(error) => tracing::warn!(%error,"legacy pending storage deletion deferred"),
                     }
-                    if let Err(e) = maintenance_store.collect(100).await {
+                    if let Err(e) = maintenance_store.collect(100, failed_retention).await {
                         tracing::warn!(error=%e,"v2 object garbage collection failed");
                     }
-                    if let Err(e) = maintenance_store.collect_workdirs(20).await {
+                    if let Err(e) = maintenance_store.collect_workdirs(20, failed_retention).await {
                         tracing::warn!(error=%e,"v2 workdir garbage collection failed");
                     }
                 }
@@ -538,8 +538,8 @@ async fn main() -> anyhow::Result<()> {
                 .await?;
             let published = registry.reconcile_published_resources(limit, ttl).await?;
             let legacy_pending = videoroll_v2::maintenance_terminal_storage_v1::retry_pending_deletes(&registry, limit).await?;
-            let deleted = registry.collect(limit).await?;
-            let directories = registry.collect_workdirs(limit).await?;
+            let deleted = registry.collect(limit, config.cleanup_grace).await?;
+            let directories = registry.collect_workdirs(limit, config.cleanup_grace).await?;
             tracing::info!(
                 batch_events,
                 released,

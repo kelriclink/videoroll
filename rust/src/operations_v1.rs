@@ -28,7 +28,7 @@ async fn persist(db: &Database, key: &str, data: Value) -> AppResult<()> {
     Ok(())
 }
 
-fn ttl_from_value(value: &Value) -> i64 {
+pub(crate) fn ttl_from_value(value: &Value) -> i64 {
     value
         .get("asset_ttl_days")
         .and_then(Value::as_i64)

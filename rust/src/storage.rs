@@ -44,6 +44,42 @@ pub(crate) async fn publication_cleanup_blocked(
       OR EXISTS(SELECT 1 FROM vr2_social_publish_intents WHERE task_id=$1 AND state NOT IN ('submitted','published','failed'))"#)
       .bind(task).fetch_one(&mut **tx).await?)
 }
+/// Re-read the original retention setting in the deletion transaction.
+/// A batch's independent 24h cleanup permission only covers intermediates.
+async fn deletion_policy(
+    tx: &mut Transaction<'_, Postgres>, task: Uuid, status: &str,
+    stopped: Option<&str>, updated: DateTime<Utc>, failed_retention: Duration,
+) -> AppResult<(bool, bool)> {
+    if !terminal_resources_releasable(status, stopped)
+        || publication_cleanup_blocked(tx, task).await? {
+        return Ok((false, false));
+    }
+    let now = Utc::now();
+    let full = if status == "FAILED" {
+        updated <= now - chrono::Duration::seconds(failed_retention.as_secs().clamp(3600, 3650*86400) as i64)
+    } else {
+        let settings: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT value_json FROM app_settings WHERE key='storage.retention' FOR SHARE"
+        ).fetch_optional(&mut **tx).await?;
+        let days = settings.as_ref().map(crate::operations_v1::ttl_from_value).unwrap_or(0);
+        days > 0 && updated <= now - chrono::Duration::days(days)
+    };
+    if status != "PUBLISHED" { return Ok((full,false)); }
+    let batches = crate::bilibili_batch_reconcile_v1::current_batches(tx,task).await?;
+    if batches.iter().any(|(_,s,finished,_)| *s != crate::bilibili_batch_reconcile_v1::State::Succeeded
+        || finished.is_none_or(|t|t+chrono::Duration::hours(24)>now)) {
+        return Ok((false,false));
+    }
+    Ok((full, batches.iter().any(|(_,_,_,scheduled)|*scheduled)))
+}
+
+fn native_key_task(key: &str) -> Option<Uuid> {
+    let mut parts=key.split('/');
+    if parts.next()? != "v2" { return None; }
+    if !matches!(parts.next()?, "raw"|"sub"|"render"|"dubbing"|"artifacts"|"youtube-meta"|"subtitles") { return None; }
+    Uuid::parse_str(parts.next()?).ok()
+}
+
 fn sweep_uploads(root: &Path, age: Duration, limit: u64) -> AppResult<u64> {
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
@@ -231,26 +267,23 @@ impl AssetRegistry {
     async fn claim_expired(
         tx: &mut Transaction<'_, Postgres>,
         limit: i64,
-    ) -> AppResult<Vec<String>> {
-        let rows = sqlx::query(
+    ) -> AppResult<Vec<(String, DateTime<Utc>)>> {
+        Ok(sqlx::query_as(
             r#"WITH eligible AS (
                 SELECT o.storage_key FROM storage_objects o
                 WHERE ((o.state='live' AND o.retain_until<=now())
                    OR (o.state='deleting' AND o.lease_until<now()))
+                AND (o.manual_hold_until IS NULL OR o.manual_hold_until<=now())
                 AND NOT EXISTS (SELECT 1 FROM storage_object_refs r WHERE r.storage_key=o.storage_key)
                 ORDER BY o.retain_until ASC
                 FOR UPDATE OF o SKIP LOCKED LIMIT $1
             ) UPDATE storage_objects o SET state='deleting',lease_until=now()+interval '5 minutes',
                 updated_at=now() FROM eligible e WHERE o.storage_key=e.storage_key
-                RETURNING o.storage_key"#,
+                RETURNING o.storage_key,o.lease_until"#,
         )
         .bind(limit.clamp(1, 100))
         .fetch_all(&mut **tx)
-        .await?;
-        Ok(rows
-            .into_iter()
-            .map(|row| row.get::<String, _>("storage_key"))
-            .collect())
+        .await?)
     }
     /// Make storage retention an explicit terminal event, never a full-disk scan.
     /// Reconcile completed failed/canceled flows and release their own objects.
@@ -483,7 +516,7 @@ impl AssetRegistry {
         for category in ["raw", "sub", "render", "dubbing"] {
             let key = format!("v2/{category}/{task_id}");
             sqlx::query(
-                "INSERT INTO storage_workdirs(path_key,task_id,workflow_id,due_at) VALUES($1,$2,$3,now()+($4*interval '1 second')) ON CONFLICT(path_key) DO UPDATE SET due_at=GREATEST(storage_workdirs.due_at,EXCLUDED.due_at),updated_at=now()"
+                "INSERT INTO storage_workdirs(path_key,task_id,workflow_id,due_at) VALUES($1,$2,$3,now()+($4*interval '1 second')) ON CONFLICT(path_key) DO UPDATE SET due_at=GREATEST(storage_workdirs.due_at,EXCLUDED.due_at),state='retained',lease_until=NULL,workflow_id=EXCLUDED.workflow_id,updated_at=now() WHERE storage_workdirs.task_id=EXCLUDED.task_id"
             ).bind(key).bind(task_id).bind(workflow_id).bind(grace_seconds)
                 .execute(&mut *tx).await?;
         }
@@ -495,129 +528,100 @@ impl AssetRegistry {
         tx.commit().await?;
         Ok(rows.len() as u64)
     }
-    /// Drop only v2-owned legacy display rows, after every relevant workflow is
-    /// terminal and no ffplayout hardlink/copy relationship is using this asset.
-    async fn remove_legacy_refs_if_safe(&self, key: &str) -> AppResult<bool> {
+    /// Check the exact claimed lease, parent task, current policy and all
+    /// references in one transaction; retain business rows on unlink failure.
+    async fn collect_claim(&self,key: &str, lease: DateTime<Utc>, failed_retention: Duration) -> AppResult<bool> {
         let mut tx = self.db.pool.begin().await?;
-        let rows=sqlx::query(
+        let owners = sqlx::query_scalar::<_,Uuid>(
             "SELECT DISTINCT task_id FROM (SELECT task_id FROM assets WHERE storage_key=$1 UNION ALL SELECT task_id FROM subtitles WHERE storage_key=$1) v"
         ).bind(key).fetch_all(&mut *tx).await?;
-        if rows.len() > 1 {
-            return Ok(false);
+        let task = match owners.as_slice() {
+            [task] if native_key_task(key).is_none_or(|id|id==*task) => Some(*task),
+            [] => native_key_task(key),
+            _ => None,
+        };
+        let parent: Option<(String,Option<String>,DateTime<Utc>)> = if let Some(task)=task {
+            sqlx::query_as("SELECT upper(status::text),stopped_status::text,updated_at FROM tasks WHERE id=$1 FOR UPDATE")
+                .bind(task).fetch_optional(&mut *tx).await?
+        } else { None };
+        let claim: Option<bool> = sqlx::query_scalar(
+            "SELECT retain_until<=now() AND (manual_hold_until IS NULL OR manual_hold_until<=now()) AND lease_until>now()
+             FROM storage_objects WHERE storage_key=$1 AND state='deleting' AND lease_until=$2 FOR UPDATE"
+        ).bind(key).bind(lease).fetch_optional(&mut *tx).await?;
+        let Some(due) = claim else { return Ok(false) };
+        let mut allowed=false;
+        if key.starts_with("v2/") && due {
+            if let (Some(task),Some((status,stopped,updated)))=(task,parent) {
+                let (full,batch)=deletion_policy(&mut tx,task,&status,stopped.as_deref(),updated,failed_retention).await?;
+                if full || batch {
+                    // Short nonblocking table fence also protects against
+                    // cross-task references created outside the native scheduler.
+                    sqlx::query("LOCK TABLE assets, subtitles IN SHARE ROW EXCLUSIVE MODE NOWAIT")
+                        .execute(&mut *tx).await?;
+                    let shared:bool=sqlx::query_scalar("SELECT
+                        EXISTS(SELECT 1 FROM assets WHERE storage_key=$1 AND task_id<>$2)
+                        OR EXISTS(SELECT 1 FROM subtitles WHERE storage_key=$1 AND task_id<>$2)
+                        OR EXISTS(SELECT 1 FROM storage_object_refs WHERE storage_key=$1)
+                        OR EXISTS(SELECT 1 FROM playout_asset_links p JOIN assets a ON a.id=p.asset_id
+                             WHERE a.storage_key=$1 AND (p.runtime_engine<>'rust-v2' OR p.status IN ('staging','ready')))
+                        OR EXISTS(SELECT 1 FROM render_executions e JOIN assets a ON a.id=e.uploaded_asset_id
+                             WHERE a.storage_key=$1)"
+                    ).bind(key).bind(task).fetch_one(&mut *tx).await?;
+                    let intermediate:bool=if !full && batch {
+                        sqlx::query_scalar("SELECT
+                            EXISTS(SELECT 1 FROM assets WHERE task_id=$2 AND storage_key=$1)
+                            AND NOT EXISTS(SELECT 1 FROM assets WHERE task_id=$2 AND storage_key=$1
+                                AND kind::text IN ('video_final','video_dubbed','dubbing_audio','publish_result'))
+                            AND (EXISTS(SELECT 1 FROM assets WHERE task_id=$2 AND kind::text='video_final')
+                                OR $1 IS DISTINCT FROM (SELECT storage_key FROM assets WHERE task_id=$2 AND kind::text='video_raw'
+                                     ORDER BY created_at DESC,id DESC LIMIT 1))"
+                        ).bind(key).bind(task).fetch_one(&mut *tx).await?
+                    } else { false };
+                    allowed=!shared && (full || intermediate);
+                    if allowed {
+                        // Run the relational deletes before the unlink, but
+                        // roll them back on filesystem failure.
+                        sqlx::query("SAVEPOINT gc_business_rows").execute(&mut *tx).await?;
+                        sqlx::query("DELETE FROM subtitles WHERE task_id=$1 AND storage_key=$2").bind(task).bind(key).execute(&mut *tx).await?;
+                        sqlx::query("DELETE FROM assets WHERE task_id=$1 AND storage_key=$2").bind(task).bind(key).execute(&mut *tx).await?;
+                        let deletion=async {
+                            let path=self.resolve_existing(key).await?;
+                            match fs::remove_file(path).await {
+                                Ok(())=>Ok(()),
+                                Err(e) if e.kind()==std::io::ErrorKind::NotFound=>Ok(()),
+                                Err(e)=>Err(AppError::Io(e)),
+                            }
+                        }.await;
+                        if let Err(error)=deletion {
+                            tracing::warn!(%key,%error,"defer GC file unlink; retained business rows");
+                            sqlx::query("ROLLBACK TO SAVEPOINT gc_business_rows").execute(&mut *tx).await?;
+                            allowed=false;
+                        }
+                    }
+                }
+            }
         }
-        if let Some(row) = rows.first() {
-            let task_id: Uuid = row.try_get("task_id")?;
-            let (state, stopped): (String, Option<String>) = sqlx::query_as(
-                "SELECT upper(status::text),stopped_status::text FROM tasks WHERE id=$1 FOR UPDATE",
-            )
-            .bind(task_id)
-            .fetch_one(&mut *tx)
-            .await?;
-            if !terminal_resources_releasable(&state, stopped.as_deref()) {
-                return Ok(false);
-            }
-            let unfinished:(bool,)=sqlx::query_as(
-                "SELECT EXISTS(SELECT 1 FROM vr2_workflows WHERE task_id=$1 AND state IN ('running','paused','unknown'))"
-            ).bind(task_id).fetch_one(&mut *tx).await?;
-            if unfinished.0 {
-                return Ok(false);
-            }
-            if publication_cleanup_blocked(&mut tx, task_id).await? {
-                return Ok(false);
-            }
-            if state == "PUBLISHED"
-                && crate::bilibili_batch_reconcile_v1::current_batches(&mut tx, task_id)
-                    .await?
-                    .iter()
-                    .any(|(_, s, finished, _)| {
-                        *s != crate::bilibili_batch_reconcile_v1::State::Succeeded
-                            || finished.is_none_or(|t| t + chrono::Duration::hours(24) > Utc::now())
-                    })
-            {
-                return Ok(false);
-            }
-
-            // Legacy/Python playout rows have no detach lifecycle and therefore
-            // remain hard references until deleted. Native Rust rows are active
-            // only while staging/ready; a detached audit row must not pin source
-            // media forever after it has been removed from playout.
-            let playout: (bool,) = sqlx::query_as(
-                "SELECT EXISTS(SELECT 1 FROM playout_asset_links p
-                 JOIN assets a ON p.asset_id=a.id
-                 WHERE a.storage_key=$1 AND
-                   (p.runtime_engine<>'rust-v2' OR p.status IN ('staging','ready')))",
-            )
-            .bind(key)
-            .fetch_one(&mut *tx)
-            .await?;
-            if playout.0 {
-                return Ok(false);
-            }
-            let refs: (bool,) = sqlx::query_as(
-                "SELECT EXISTS(SELECT 1 FROM storage_object_refs WHERE storage_key=$1)",
-            )
-            .bind(key)
-            .fetch_one(&mut *tx)
-            .await?;
-            if refs.0 {
-                return Ok(false);
-            }
-            sqlx::query("DELETE FROM subtitles WHERE task_id=$1 AND storage_key=$2")
-                .bind(task_id)
-                .bind(key)
-                .execute(&mut *tx)
-                .await?;
-            sqlx::query("DELETE FROM assets WHERE task_id=$1 AND storage_key=$2")
-                .bind(task_id)
-                .bind(key)
-                .execute(&mut *tx)
-                .await?;
+        if allowed {
+            sqlx::query("UPDATE storage_objects SET state='deleted',lease_until=NULL,updated_at=now() WHERE storage_key=$1")
+                .bind(key).execute(&mut *tx).await?;
+        } else {
+            sqlx::query("UPDATE storage_objects SET state='live',lease_until=NULL,retain_until=GREATEST(retain_until,now()+interval '10 minutes',manual_hold_until),updated_at=now() WHERE storage_key=$1")
+                .bind(key).execute(&mut *tx).await?;
         }
         tx.commit().await?;
-        Ok(true)
+        Ok(allowed)
     }
-    /// A two-phase fenced deletion. Failed/deferred objects are retried by an
-    /// indexed due-date query rather than periodic filesystem traversal.
-    pub async fn collect(&self, limit: i64) -> AppResult<u64> {
+    /// Durable lease claim followed by a short parent/object locked deletion.
+    pub async fn collect(&self, limit: i64, failed_retention: Duration) -> AppResult<u64> {
         let mut tx = self.db.pool.begin().await?;
         let keys = Self::claim_expired(&mut tx, limit).await?;
         tx.commit().await?;
         let mut deleted = 0;
-        for key in keys {
-            let remaining: (bool,) = sqlx::query_as(
-                "SELECT EXISTS(SELECT 1 FROM storage_object_refs WHERE storage_key=$1)",
-            )
-            .bind(&key)
-            .fetch_one(&self.db.pool)
-            .await?;
-            if !key.starts_with("v2/")
-                || remaining.0
-                || !self.remove_legacy_refs_if_safe(&key).await?
-            {
-                sqlx::query("UPDATE storage_objects SET state='live',lease_until=NULL,retain_until=GREATEST(now()+interval '10 minutes',manual_hold_until),updated_at=now() WHERE storage_key=$1")
-                    .bind(&key).execute(&self.db.pool).await?;
-                continue;
-            }
-            let deletion = async {
-                let path = self.resolve_existing(&key).await?;
-                match fs::remove_file(path).await {
-                    Ok(()) => Ok(()),
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                    Err(e) => Err(AppError::Io(e)),
-                }
-            }
-            .await;
-            match deletion {
-                Ok(()) => {
-                    sqlx::query("UPDATE storage_objects SET state='deleted',lease_until=NULL,updated_at=now() WHERE storage_key=$1 AND state='deleting'")
-                        .bind(&key).execute(&self.db.pool).await?;
-                    deleted += 1;
-                }
-                Err(error) => {
-                    tracing::warn!(key=%key,error=%error,"defer GC file unlink");
-                    sqlx::query("UPDATE storage_objects SET state='live',lease_until=NULL,retain_until=now()+interval '10 minutes',updated_at=now() WHERE storage_key=$1")
-                        .bind(&key).execute(&self.db.pool).await?;
-                }
+        for (key,lease) in keys {
+            match self.collect_claim(&key,lease,failed_retention).await {
+                Ok(true)=>deleted+=1,
+                Ok(false)=>{},
+                Err(error)=>tracing::warn!(%key,%error,"GC claim deferred until lease expiry"),
             }
         }
         Ok(deleted)
@@ -633,7 +637,7 @@ impl AssetRegistry {
         .map_err(|e| AppError::Unavailable(format!("upload cleanup task failed: {e}")))?
     }
     /// Cleanup only explicit v2/{raw,sub,render,dubbing}/{UUID} directories.
-    pub async fn collect_workdirs(&self, limit: i64) -> AppResult<u64> {
+    pub async fn collect_workdirs(&self, limit: i64, failed_retention: Duration) -> AppResult<u64> {
         let keys = sqlx::query(
             r#"WITH due AS (
               SELECT path_key FROM storage_workdirs
@@ -642,7 +646,7 @@ impl AssetRegistry {
               ORDER BY due_at FOR UPDATE SKIP LOCKED LIMIT $1
             ) UPDATE storage_workdirs w SET state='deleting',lease_until=now()+interval '5 minutes',
               updated_at=now() FROM due WHERE w.path_key=due.path_key
-              RETURNING w.path_key,w.task_id,w.workflow_id"#,
+              RETURNING w.path_key,w.task_id,w.workflow_id,w.lease_until"#,
         )
         .bind(limit.clamp(1, 50))
         .fetch_all(&self.db.pool)
@@ -657,48 +661,25 @@ impl AssetRegistry {
                 && parts[0] == "v2"
                 && ["raw", "sub", "render", "dubbing"].contains(&parts[1])
                 && parts[2] == task_id.to_string();
-            let parents: (bool,)=sqlx::query_as(
-                "SELECT EXISTS(SELECT 1 FROM vr2_workflows WHERE task_id=$1 AND state IN ('running','paused','unknown'))"
-            ).bind(task_id).fetch_one(&self.db.pool).await?;
-            let unfinished:(bool,)=sqlx::query_as(
-                "SELECT EXISTS(SELECT 1 FROM storage_objects WHERE storage_key LIKE ($1 || '/%') AND state<>'deleted')"
-            ).bind(&key).fetch_one(&self.db.pool).await?;
-            // The legacy inbox is the durable source of active pipeline operations.
-            // A terminal task row alone does not prove its worker has released files.
-            let active_operation: (bool,) = sqlx::query_as(
-                "SELECT EXISTS(SELECT 1 FROM operation_inbox WHERE task_id=$1 AND status IN ('pending','awaiting','running','processing'))"
-            ).bind(task_id).fetch_one(&self.db.pool).await?;
-            let legacy_ref:(bool,)=sqlx::query_as(
-                "SELECT EXISTS(SELECT 1 FROM assets WHERE storage_key LIKE ($1 || '/%') UNION ALL SELECT 1 FROM subtitles WHERE storage_key LIKE ($1 || '/%'))"
-            ).bind(&key).fetch_one(&self.db.pool).await?;
+            let lease: DateTime<Utc>=row.try_get("lease_until")?;
             let mut safety_tx = self.db.pool.begin().await?;
-            let (task_state, stopped): (String, Option<String>) = sqlx::query_as(
-                "SELECT upper(status::text),stopped_status::text FROM tasks WHERE id=$1 FOR UPDATE",
-            )
-            .bind(task_id)
-            .fetch_one(&mut *safety_tx)
-            .await?;
-            let publish_blocked = publication_cleanup_blocked(&mut safety_tx, task_id).await?;
-            let batch_blocked = task_state == "PUBLISHED"
-                && crate::bilibili_batch_reconcile_v1::current_batches(&mut safety_tx, task_id)
-                    .await?
-                    .iter()
-                    .any(|(_, s, t, _)| {
-                        *s != crate::bilibili_batch_reconcile_v1::State::Succeeded
-                            || t.is_none_or(|t| t + chrono::Duration::hours(24) > Utc::now())
-                    });
-            if !expected
-                || publish_blocked
-                || batch_blocked
-                || parents.0
-                || unfinished.0
-                || active_operation.0
-                || legacy_ref.0
-                || !terminal_resources_releasable(&task_state, stopped.as_deref())
-            {
+            let (task_state, stopped, updated): (String, Option<String>, DateTime<Utc>) = sqlx::query_as(
+                "SELECT upper(status::text),stopped_status::text,updated_at FROM tasks WHERE id=$1 FOR UPDATE",
+            ).bind(task_id).fetch_one(&mut *safety_tx).await?;
+            let claim: Option<bool>=sqlx::query_scalar("SELECT due_at<=now() AND lease_until>now()
+                FROM storage_workdirs WHERE path_key=$1 AND workflow_id=$2 AND state='deleting' AND lease_until=$3 FOR UPDATE")
+                .bind(&key).bind(workflow_id).bind(lease).fetch_optional(&mut *safety_tx).await?;
+            let Some(due)=claim else {continue};
+            let (full,batch)=deletion_policy(&mut safety_tx,task_id,&task_state,stopped.as_deref(),updated,failed_retention).await?;
+            let referenced:bool=sqlx::query_scalar("SELECT
+                EXISTS(SELECT 1 FROM storage_objects WHERE storage_key LIKE ($1 || '/%') AND state<>'deleted')
+                OR EXISTS(SELECT 1 FROM assets WHERE storage_key LIKE ($1 || '/%'))
+                OR EXISTS(SELECT 1 FROM subtitles WHERE storage_key LIKE ($1 || '/%'))")
+                .bind(&key).fetch_one(&mut *safety_tx).await?;
+            if !expected || !due || !(full || batch) || referenced {
+                sqlx::query("UPDATE storage_workdirs SET state='retained',lease_until=NULL,due_at=GREATEST(due_at,now()+interval '10 minutes'),updated_at=now() WHERE path_key=$1")
+                    .bind(&key).execute(&mut *safety_tx).await?;
                 safety_tx.commit().await?;
-                sqlx::query("UPDATE storage_workdirs SET state='retained',lease_until=NULL,due_at=now()+interval '10 minutes',updated_at=now() WHERE path_key=$1")
-                    .bind(&key).execute(&self.db.pool).await?;
                 continue;
             }
             let result = async {
@@ -710,20 +691,20 @@ impl AssetRegistry {
                 }
             }
             .await;
-            // Keep the parent task locked until the filesystem operation finishes.
-            safety_tx.commit().await?;
+            // Keep both parent and exact workdir claim locked through settlement.
             match result {
                 Ok(()) => {
                     sqlx::query("UPDATE storage_workdirs SET state='deleted',lease_until=NULL,updated_at=now() WHERE path_key=$1 AND workflow_id=$2")
-                        .bind(&key).bind(workflow_id).execute(&self.db.pool).await?;
+                        .bind(&key).bind(workflow_id).execute(&mut *safety_tx).await?;
                     cleaned += 1;
                 }
                 Err(e) => {
                     tracing::error!(directory=%key,error=%e,"workdir cleanup deferred");
                     sqlx::query("UPDATE storage_workdirs SET state='retained',lease_until=NULL,due_at=now()+interval '10 minutes',last_error=$2,updated_at=now() WHERE path_key=$1")
-                        .bind(&key).bind(e.to_string()).execute(&self.db.pool).await?;
+                        .bind(&key).bind(e.to_string()).execute(&mut *safety_tx).await?;
                 }
             }
+            safety_tx.commit().await?;
         }
         Ok(cleaned)
     }
