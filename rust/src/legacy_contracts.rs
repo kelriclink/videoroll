@@ -490,10 +490,11 @@ async fn dubbing_jobs(
     let rows=sqlx::query(
         "SELECT j.id,j.task_id,j.workflow_id,j.state,j.payload,j.result,j.operation_key,j.last_error,
            j.created_at,j.updated_at,s.id AS subtitle_job_id,
-           r.output_video_key,r.source_video_key,r.source_srt_key
+           r.output_video_key,r.source_video_key,r.source_srt_key,e.render_spec AS p2_spec,e.progress AS p2_progress,e.id AS p2_execution_id
          FROM vr2_jobs j LEFT JOIN vr2_jobs s
            ON s.workflow_id=j.workflow_id AND s.stage='subtitle'
          LEFT JOIN vr2_dubbing_runs r ON r.job_id=j.id
+         LEFT JOIN render_executions e ON e.job_id=j.id AND e.runtime_engine='rust-v2' AND e.mode='dub_burn_in'
          WHERE j.task_id=$1 AND j.stage='dubbing'
          ORDER BY j.created_at DESC LIMIT $2"
     ).bind(id).bind(q.limit.unwrap_or(50).clamp(1,500)).fetch_all(&state.db.pool).await?;
@@ -511,8 +512,10 @@ async fn dubbing_jobs(
             .and_then(|v| v["dubbing_progress"]["phase"].as_str())
             .filter(|v| matches!(*v, "preparing" | "synthesizing" | "aligning" | "mixing"))
             .unwrap_or("preparing");
+        let p2: Option<Value> = row.try_get("p2_spec")?;
         let mapped = match status.as_str() {
             "pending" => "queued",
+            "awaiting" if p2.is_some() => "rendering",
             "awaiting" => "preparing",
             "running" => phase,
             "succeeded" => "succeeded",
@@ -524,13 +527,17 @@ async fn dubbing_jobs(
             "task_id":row.try_get::<Uuid,_>("task_id")?,
             "subtitle_job_id":row.try_get::<Option<Uuid>,_>("subtitle_job_id")?,
             "status":mapped,
-            "progress": if status=="succeeded"{100}else if status=="running"{progress}else{0},
+            "progress": if status=="succeeded"{100}else if status=="awaiting" && p2.is_some(){96+(row.try_get::<Option<i32>,_>("p2_progress")?.unwrap_or(0).clamp(0,99) as u64)/25}else if status=="running"{progress}else{0},
             "operation_key":row.try_get::<String,_>("operation_key")?,
             "request":row.try_get::<Value,_>("payload")?,
             "output":{
                 "video_key":row.try_get::<Option<String>,_>("output_video_key")?,
                 "subtitle_video_key":row.try_get::<Option<String>,_>("source_video_key")?,
                 "subtitle_srt_key":row.try_get::<Option<String>,_>("source_srt_key")?,
+                "render_job_id":row.try_get::<Option<Uuid>,_>("p2_execution_id")?,
+                "audio_key":p2.as_ref().and_then(|v|v.pointer("/request/audio_key")),
+                "voice_key":p2.as_ref().and_then(|v|v.pointer("/request/voice_key")),
+                "aligned_srt_key":p2.as_ref().and_then(|v|v.pointer("/request/srt_key")),
             },
             "error_message":row.try_get::<Option<String>,_>("last_error")?,
             "created_at":row.try_get::<DateTime<Utc>,_>("created_at")?,

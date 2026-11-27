@@ -195,9 +195,9 @@ pub(crate) const EXEC_SQL: &str = r#"
            w.name AS worker_name,COALESCE(j.task_id,e.task_id) AS task_id,COALESCE(j.status::text,o.status) AS job_status,
            COALESCE(e.runtime_engine='rust-v2' AND e.uploaded_asset_id IS NULL
              AND e.state IN ('queued','running','uploading')
-             AND o.status='awaiting' AND o.stage='render' AND o.external_ticket=e.id::text
+             AND o.status='awaiting' AND ((o.stage='render' AND e.mode<>'dub_burn_in') OR (o.stage='dubbing' AND e.mode='dub_burn_in')) AND o.external_ticket=e.id::text
              AND o.task_id=e.task_id AND o.workflow_id=e.workflow_id
-             AND f.engine='rust-v2' AND f.task_id=e.task_id AND f.state='running' AND f.current_stage='render'
+             AND f.engine='rust-v2' AND f.task_id=e.task_id AND f.state='running' AND f.current_stage=o.stage
              AND t.runtime_owner='rust' AND t.status::text NOT IN ('canceled','failed','published','publishing')
              AND NOT EXISTS(SELECT 1 FROM operation_inbox other WHERE other.workflow_id=e.workflow_id AND other.runtime_engine='rust-v2' AND other.id<>e.job_id AND other.status IN ('pending','running','awaiting','unknown')),false) AS native_control_safe,
            COALESCE(e.state='queued' OR (e.state IN ('running','uploading') AND e.lease_until<=now()),false) AS native_requeue_safe,

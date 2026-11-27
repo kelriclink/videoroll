@@ -43,6 +43,20 @@ pub fn is_fence(old: &str, received: &str) -> bool {
     use subtle::ConstantTimeEq;
     !old.is_empty() && bool::from(old.as_bytes().ct_eq(received.as_bytes()))
 }
+pub(crate) fn output_kind(mode: &str) -> &'static str {
+    if mode == crate::media::dubbing_handoff::MODE {
+        "video_dubbed"
+    } else {
+        "video_final"
+    }
+}
+pub(crate) fn output_stage(mode: &str) -> &'static str {
+    if mode == crate::media::dubbing_handoff::MODE {
+        "dubbing"
+    } else {
+        "render"
+    }
+}
 pub fn output_key(task_id: Uuid, execution_id: Uuid) -> String {
     format!("v2/render/{task_id}/remote-{execution_id}.mp4")
 }

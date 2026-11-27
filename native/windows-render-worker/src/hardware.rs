@@ -65,6 +65,7 @@ impl HardwareSnapshot {
             },
             "gpu_model": if hardware_names.is_empty() { "CPU".to_string() } else { hardware_names.join(", ") },
             "encoders": self.all_encoders,
+            "dub_burn_in": true,
             "filters": self.filters,
             "devices": device_payloads,
         })

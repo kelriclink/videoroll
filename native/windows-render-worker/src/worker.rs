@@ -17,7 +17,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
-const WORKER_VERSION: &str = "0.1.1";
+const WORKER_VERSION: &str = "0.1.2";
 
 #[derive(Debug, Clone)]
 pub struct JobTelemetry {
@@ -487,7 +487,7 @@ fn select_device(
     let mut candidates = devices
         .iter()
         .filter(|device| {
-            if spec.mode == "burn_in" {
+            if matches!(spec.mode.as_str(), "burn_in" | "dub_burn_in") {
                 device.supports_codec(codec)
             } else {
                 true
@@ -501,7 +501,7 @@ fn select_device(
             .values()
             .filter(|assigned| assigned.id == device.id)
             .count();
-        let software_rank = if spec.mode == "burn_in" {
+        let software_rank = if matches!(spec.mode.as_str(), "burn_in" | "dub_burn_in") {
             device.backend == "software"
         } else {
             device.backend != "software"
@@ -644,10 +644,32 @@ fn run_execution(
             }
 
             let output = ffmpeg::output_path(&root, &spec.mode);
-            if spec.mode == "burn_in" {
+            if matches!(spec.mode.as_str(), "burn_in" | "dub_burn_in") {
                 let ass = artifacts
                     .get("ass")
                     .context("burn-in ASS artifact missing")?;
+                // Remux the original video with the pinned mixed soundtrack
+                // before the existing hardware subtitle pipeline. Video is
+                // stream-copied here, encoded only once in burn-in.
+                let dubbed_input = root.join("dubbed-input.mkv");
+                let input = if spec.mode == "dub_burn_in" {
+                    let audio = artifacts
+                        .get("audio")
+                        .context("P2 mixed audio artifact missing")?;
+                    ffmpeg::mux_dubbed_input(
+                        &paths.ffmpeg(),
+                        &paths.ffprobe(),
+                        input,
+                        audio,
+                        &dubbed_input,
+                        Arc::clone(&cancel),
+                        &log,
+                        Some(Arc::clone(&progress_callback)),
+                    )?;
+                    &dubbed_input
+                } else {
+                    input
+                };
                 ffmpeg::render_burn_in(
                     &paths.ffmpeg(),
                     &paths.ffprobe(),

@@ -11,8 +11,8 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -249,6 +249,59 @@ pub fn render_burn_in(
     };
     run_ffmpeg(
         ffmpeg, work_dir, &args, cancel, log, pipeline, &encoder, &media, progress,
+    )
+}
+
+/// Replace source audio without re-encoding the video. Pad short soundtracks
+/// to video duration; do not truncate the video to the dubbing duration.
+pub fn mux_dubbed_input(
+    ffmpeg: &Path,
+    ffprobe: &Path,
+    input: &Path,
+    audio: &Path,
+    output: &Path,
+    cancel: Arc<AtomicBool>,
+    log: &SharedLog,
+    progress: Option<ProgressCallback>,
+) -> Result<()> {
+    let media = probe_media(ffprobe, input)?;
+    let duration = media
+        .duration_seconds
+        .filter(|d| d.is_finite() && *d > 0.0)
+        .context("P2 source duration unavailable")?;
+    let args = vec![
+        "-y".into(),
+        "-hide_banner".into(),
+        "-i".into(),
+        input.display().to_string(),
+        "-i".into(),
+        audio.display().to_string(),
+        "-map".into(),
+        "0:v:0".into(),
+        "-map".into(),
+        "1:a:0".into(),
+        "-c:v".into(),
+        "copy".into(),
+        "-c:a".into(),
+        "aac".into(),
+        "-af".into(),
+        "apad".into(),
+        "-t".into(),
+        format!("{duration:.6}"),
+        "-shortest".into(),
+        output.display().to_string(),
+    ];
+    let work_dir = output.parent().context("P2 remux output has no parent")?;
+    run_ffmpeg(
+        ffmpeg,
+        work_dir,
+        &args,
+        cancel,
+        log,
+        "p2-audio-mux",
+        "copy",
+        &media,
+        progress,
     )
 }
 
@@ -1047,28 +1100,24 @@ Dialogue: 0,0:00:05.00,0:00:07.00,Default,,0,0,0,,Second static subtitle
             qsv_cache_plan(&ass(), &m).unwrap().boundaries_us,
             vec![0, 1_000_000, 3_000_000, 5_000_000, 7_000_000]
         );
-        assert!(
-            qsv_cache_plan(
-                &ass().replace("First static", r"{\fad(100,100)}First static"),
-                &m
-            )
-            .is_none()
-        );
+        assert!(qsv_cache_plan(
+            &ass().replace("First static", r"{\fad(100,100)}First static"),
+            &m
+        )
+        .is_none());
         assert!(
             qsv_cache_plan(&ass().replace("Layer, Start, End", "Layer, End, Start"), &m).is_none()
         );
         assert!(qsv_cache_plan(&ass().replace("0:00:01.00", "broken"), &m).is_none());
-        assert!(
-            qsv_cache_plan(
-                &ass(),
-                &MediaInfo {
-                    width: 7680,
-                    height: 4320,
-                    ..m.clone()
-                }
-            )
-            .is_none()
-        );
+        assert!(qsv_cache_plan(
+            &ass(),
+            &MediaInfo {
+                width: 7680,
+                height: 4320,
+                ..m.clone()
+            }
+        )
+        .is_none());
         let args = qsv_event_overlay_args(
             Path::new("source.mp4"),
             Path::new("cache/overlay.ffconcat"),
@@ -1078,10 +1127,9 @@ Dialogue: 0,0:00:05.00,0:00:07.00,Default,,0,0,0,,Second static subtitle
             None,
             &m,
         );
-        assert!(
-            args.iter()
-                .any(|arg| arg.contains("shortest=0:repeatlast=1"))
-        );
+        assert!(args
+            .iter()
+            .any(|arg| arg.contains("shortest=0:repeatlast=1")));
         assert!(args.iter().any(|arg| arg == "concat"));
     }
 
@@ -1174,5 +1222,127 @@ Dialogue: 0,0:00:05.00,0:00:07.00,Default,,0,0,0,,Second static subtitle
         println!(
             "PASS native Windows worker cache rasterization, CPU reference 480/480 frame hashes, and cache cleanup"
         );
+    }
+}
+
+#[cfg(test)]
+mod p2_audio_mux_tests {
+    use super::*;
+    #[test]
+    fn mux_replaces_audio_and_preserves_video_frames() {
+        let Ok(ffmpeg) = std::env::var("VIDEOROLL_TEST_QSV_CACHE_FFMPEG") else {
+            return;
+        };
+        let ffmpeg = Path::new(&ffmpeg);
+        let ffprobe = ffmpeg.with_file_name("ffprobe");
+        let root = tempfile::tempdir().unwrap();
+        let paths = crate::paths::AppPaths {
+            root: root.path().into(),
+            bin: root.path().join("bin"),
+            config: root.path().join("config"),
+            logs: root.path().join("logs"),
+            cache: root.path().join("cache"),
+            work: root.path().join("work"),
+        };
+        paths.ensure().unwrap();
+        let log = SharedLog::new(&paths);
+        let source = paths.work.join("source.mp4");
+        let audio = paths.work.join("mixed.wav");
+        let output = paths.work.join("muxed.mkv");
+        assert!(Command::new(ffmpeg)
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=s=160x120:r=25:d=2",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:duration=2",
+                "-c:v",
+                "mpeg4",
+                "-c:a",
+                "aac",
+                "-y"
+            ])
+            .arg(&source)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new(ffmpeg)
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=880:duration=0.7",
+                "-y"
+            ])
+            .arg(&audio)
+            .status()
+            .unwrap()
+            .success());
+        mux_dubbed_input(
+            ffmpeg,
+            &ffprobe,
+            &source,
+            &audio,
+            &output,
+            Arc::new(AtomicBool::new(false)),
+            &log,
+            None,
+        )
+        .unwrap();
+        let hashes = |path: &Path| {
+            let o = Command::new(ffmpeg)
+                .args(["-v", "error", "-i"])
+                .arg(path)
+                .args(["-map", "0:v:0", "-f", "framemd5", "-"])
+                .output()
+                .unwrap();
+            assert!(o.status.success());
+            String::from_utf8(o.stdout)
+                .unwrap()
+                .lines()
+                .filter(|l| !l.starts_with('#'))
+                .map(|l| l.rsplit(',').next().unwrap().trim().to_owned())
+                .collect::<Vec<_>>()
+        };
+        let original = hashes(&source);
+        let muxed = hashes(&output);
+        assert_eq!(original.len(), 50);
+        assert_eq!(muxed, original);
+        // Decode output audio and count positive zero crossings. The first
+        // half-second should contain 880Hz rather than the original 440Hz.
+        let o = Command::new(ffmpeg)
+            .args(["-v", "error", "-i"])
+            .arg(&output)
+            .args([
+                "-map", "0:a:0", "-t", "0.5", "-ac", "1", "-ar", "16000", "-f", "s16le", "-",
+            ])
+            .output()
+            .unwrap();
+        assert!(o.status.success());
+        let samples = o
+            .stdout
+            .chunks_exact(2)
+            .map(|p| i16::from_le_bytes([p[0], p[1]]))
+            .collect::<Vec<_>>();
+        let crossings = samples.windows(2).filter(|v| v[0] < 0 && v[1] >= 0).count();
+        assert!(
+            (380..470).contains(&crossings),
+            "wrong dubbed audio: {crossings}"
+        );
+        assert!(
+            probe_media(&ffprobe, &output)
+                .unwrap()
+                .duration_seconds
+                .unwrap()
+                >= 1.95
+        );
+        println!("PASS 50/50 identical video frames; 880Hz replacement audio and full 2s video preserved");
     }
 }

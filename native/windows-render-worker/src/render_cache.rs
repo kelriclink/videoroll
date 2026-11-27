@@ -58,7 +58,7 @@ fn generated_ass(role: &str, key: &str) -> bool {
 impl CacheKey {
     pub fn new(work: &Path, spec: &RenderSpec, worker_version: &str, device: &str) -> Option<Self> {
         let extension = match spec.mode.as_str() {
-            "burn_in" => "mp4",
+            "burn_in" | "dub_burn_in" => "mp4",
             "soft_sub" => "mkv",
             _ => return None,
         };

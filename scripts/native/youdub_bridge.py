@@ -91,7 +91,7 @@ def load_upstream(*, initialize_db: bool = False):
 
 
 def create(video: Path, srt: Path, *, direction: str = "en-zh",
-           task_id: str | None = None) -> dict:
+           task_id: str | None = None, audio_only: bool = False) -> dict:
     if direction not in ("en-zh", "ja-zh", "zh-en"):
         raise ValueError("Unsupported YouDub language direction")
     if not video.is_file() or video.stat().st_size < 1024 or not srt.is_file():
@@ -114,6 +114,13 @@ def create(video: Path, srt: Path, *, direction: str = "en-zh",
     # Make an independent snapshot even when VideoRoll storage shares a disk.
     shutil.copyfile(video, target_video)
     shutil.copyfile(srt, target_srt)
+    # Set only before creating a new upstream task. Never change an existing
+    # task's pipeline, including a resumed full-video job.
+    marker = target_video.parent.parent / "audio_only.flag"
+    if audio_only:
+        marker.touch()
+    else:
+        marker.unlink(missing_ok=True)
     url = f"local://upload/{task_id}?direction={direction}&filename={quote(video.name)}"
     database.create_task(url, task_id=task_id, output_mode="both", execution_mode="auto")
     database.update_task(task_id, title=video.stem)
@@ -135,7 +142,7 @@ def status(task_id: str) -> dict:
             time.sleep(0.25 * (attempt + 1))
     if not task:
         raise LookupError(f"Unknown YouDub task {task_id}")
-    return {
+    result = {
         "id": task_id, "status": task["status"],
         "current_stage": task.get("current_stage"),
         "stages": [{"name": entry["name"], "status": entry["status"],
@@ -145,6 +152,16 @@ def status(task_id: str) -> dict:
         "output_video": task.get("final_video_path"),
         "error": task.get("error_message"),
     }
+    # Read the actual upstream per-task metadata, not today's configuration.
+    if task["status"] == "succeeded" and task.get("session_path"):
+        session = Path(task["session_path"])
+        info = session / "metadata" / "local_info.json"
+        if info.is_file() and json.loads(info.read_text(encoding="utf-8")).get("audio_only") is True:
+            result["audio_only"] = True
+            result["mixed_audio"] = str(session / "tmp" / "audio_mixed.m4a")
+            result["voice_audio"] = str(session / "tmp" / "audio_dubbing.wav")
+            result["aligned_srt"] = str(session / "metadata" / "subtitles.zh.srt")
+    return result
 
 
 def run(task_id: str) -> dict:
@@ -158,7 +175,7 @@ def run(task_id: str) -> dict:
         raise RuntimeError(f"YouDub {result['status']}: {result['error']}")
     output = Path(result["output_video"])
     if not output.is_file() or output.stat().st_size < 1024:
-        raise RuntimeError("YouDub did not produce a valid MP4")
+        raise RuntimeError("YouDub did not produce a valid output artifact")
     return result
 
 
@@ -284,6 +301,7 @@ def main() -> None:
     mode = parser.add_mutually_exclusive_group(required=True)
     for value in ("prepare", "create", "run", "status", "resume", "interrupt", "serve"):
         mode.add_argument("--" + value, action="store_true")
+    parser.add_argument("--audio-only", action="store_true")
     parser.add_argument("--video", type=Path)
     parser.add_argument("--srt", type=Path)
     parser.add_argument("--direction", default="en-zh")
@@ -299,7 +317,7 @@ def main() -> None:
         if not a.video or not a.srt:
             parser.error("--create requires --video and --srt")
         result = create(a.video.resolve(), a.srt.resolve(),
-                        direction=a.direction, task_id=a.task_id)
+                        direction=a.direction, task_id=a.task_id, audio_only=a.audio_only)
     elif a.status:
         try:
             result = status(a.task_id)

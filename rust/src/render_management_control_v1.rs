@@ -330,12 +330,17 @@ async fn native_execution_change(
     let flow_row = sqlx::query("SELECT state,current_stage FROM pipeline_runs WHERE id=$1 AND task_id=$2 AND engine='rust-v2' FOR UPDATE")
         .bind(flow).bind(task).fetch_optional(&mut *tx).await?
         .ok_or_else(|| AppError::Conflict("render workflow identity mismatch".into()))?;
-    let job_row = sqlx::query("SELECT status,external_ticket FROM operation_inbox WHERE id=$1 AND task_id=$2 AND workflow_id=$3 AND stage='render' AND runtime_engine='rust-v2' FOR UPDATE")
+    let job_row = sqlx::query("SELECT status,external_ticket,stage FROM operation_inbox WHERE id=$1 AND task_id=$2 AND workflow_id=$3 AND stage IN ('render','dubbing') AND runtime_engine='rust-v2' FOR UPDATE")
         .bind(job).bind(task).bind(flow).fetch_optional(&mut *tx).await?
         .ok_or_else(|| AppError::Conflict("render job identity mismatch".into()))?;
-    let row = sqlx::query("SELECT state,attempt,uploaded_asset_id,COALESCE(lease_until<=now(),false) AS expired FROM render_executions WHERE id=$1 AND task_id=$2 AND workflow_id=$3 AND job_id=$4 AND runtime_engine='rust-v2' FOR UPDATE")
+    let row = sqlx::query("SELECT state,attempt,uploaded_asset_id,mode,COALESCE(lease_until<=now(),false) AS expired FROM render_executions WHERE id=$1 AND task_id=$2 AND workflow_id=$3 AND job_id=$4 AND runtime_engine='rust-v2' FOR UPDATE")
         .bind(id).bind(task).bind(flow).bind(job).fetch_optional(&mut *tx).await?
         .ok_or_else(|| AppError::Conflict("render execution identity mismatch".into()))?;
+    let mode: String = row.try_get("mode")?;
+    let stage = crate::remote_render::output_stage(&mode);
+    if job_row.try_get::<String, _>("stage")? != stage {
+        return Err(AppError::Conflict("render mode/stage mismatch".into()));
+    }
     let execution_state: String = row.try_get("state")?;
     let flow_state: String = flow_row.try_get("state")?;
     let job_state: String = job_row.try_get("status")?;
@@ -369,7 +374,7 @@ async fn native_execution_change(
         || flow_row
             .try_get::<Option<String>, _>("current_stage")?
             .as_deref()
-            != Some("render")
+            != Some(stage)
         || job_state != "awaiting"
         || matches!(
             task_status.as_str(),

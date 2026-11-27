@@ -11,6 +11,7 @@ case "${VIDEOROLL_TEST_ASR_SCENARIO:-external-whisper}" in
   bili-account-binding) test_name=bilibili_account_v1::tests::confirmed_account_real_postgres ;;
   publish-gate) test_name=bilibili::tests::publish_gate_real_postgres ;;
   rag-shared) test_name=agent::provider_cache::tests::shared_cache_real_postgres ;;
+  dub-handoff) test_name=media::dubbing_handoff::tests::audio_only_real_postgres_http ;;
   title) test_name=publish_meta::tests::title_translation_real_postgres_http ;;
   *) echo "invalid test scenario" >&2; exit 1 ;;
 esac
@@ -53,6 +54,7 @@ case "${VIDEOROLL_TEST_ASR_SCENARIO:-external-whisper}" in
   bili-account-binding) export VIDEOROLL_TEST_BILI_ACCOUNT_DB_URL="$DATABASE_URL"; unset VIDEOROLL_TEST_EXTERNAL_WHISPER_DB_URL ;;
   publish-gate) export VIDEOROLL_TEST_PUBLISH_GATE_DB_URL="$DATABASE_URL"; unset VIDEOROLL_TEST_EXTERNAL_WHISPER_DB_URL ;;
   rag-shared) export VIDEOROLL_TEST_RAG_SHARED_DB_URL="$DATABASE_URL"; unset VIDEOROLL_TEST_EXTERNAL_WHISPER_DB_URL ;;
+  dub-handoff) export VIDEOROLL_TEST_DUB_HANDOFF_DB_URL="$DATABASE_URL" VIDEOROLL_V2_YOUDUB_AUDIO_ONLY=1; unset VIDEOROLL_TEST_EXTERNAL_WHISPER_DB_URL ;;
   title) export VIDEOROLL_TEST_TITLE_DB_URL="$DATABASE_URL"; unset VIDEOROLL_TEST_EXTERNAL_WHISPER_DB_URL ;;
   external-whisper) export GROQ_ASR_MAX_CONCURRENCY=1 ;;
 esac
