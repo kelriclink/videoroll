@@ -543,7 +543,7 @@ if args.all_services:
     secret=os.environ["INTERNAL_API_SECRET"]
     assert secret=="rust-local-test-internal-secret"
     service_token="v1."+hmac.new(secret.encode(),b"videoroll-internal-service:v1",hashlib.sha256).hexdigest()
-    binaries=root/"target/debug"
+    binaries=Path(os.environ.get("VIDEOROLL_TEST_CONTRACT_BIN_DIR",str(root/"target/debug"))).resolve(strict=True)
     specifications={
        "bilibili_publisher":("videoroll-v2",["service","bilibili-publisher"],"VIDEOROLL_V2_BIND"),
        "subtitle_service":("videoroll-v2",["service","subtitle-service"],"VIDEOROLL_V2_BIND"),

@@ -53,11 +53,28 @@ def transcribe(req):
     if language == "auto": language = None
     if engine == "faster-whisper":
         pipeline = faster_model(model,req["device"],req["compute_type"],req["cpu_threads"],req["num_workers"])
-        segments, _ = pipeline.transcribe(audio, language=language, vad_filter=True,
-            vad_parameters={"min_silence_duration_ms":2000,"speech_pad_ms":400})
-        return {"segments":[{"start":float(s.start),"end":float(s.end),"text":s.text,
-            "no_speech_prob":float(s.no_speech_prob),"avg_logprob":float(s.avg_logprob),
-            "compression_ratio":float(s.compression_ratio)} for s in segments]}
+        import inspect
+        supported=inspect.signature(pipeline.transcribe).parameters
+        options={"language":language,"vad_filter":True,
+            "vad_parameters":{"min_silence_duration_ms":2000,"speech_pad_ms":400}}
+        for key,value in {"condition_on_previous_text":True,"word_timestamps":True,
+            "no_speech_threshold":0.6,"log_prob_threshold":-1.0,
+            "compression_ratio_threshold":2.4,"hallucination_silence_threshold":1.0}.items():
+            if key in supported: options[key]=value
+        try:
+            segments,_=pipeline.transcribe(audio,**options)
+            rows=list(segments)
+        except ValueError as e:
+            if "empty sequence" not in str(e).lower():raise
+            rows=[]
+        return {"word_timestamps":options.get("word_timestamps",False),"segments":[
+            {"start":float(s.start),"end":float(s.end),"text":s.text,
+             "no_speech_prob":float(s.no_speech_prob),"avg_logprob":float(s.avg_logprob),
+             "compression_ratio":float(s.compression_ratio),
+             "words":[{"word":str(w.word),"start":float(w.start),"end":float(w.end)}
+                for w in (getattr(s,"words",None) or [])
+                if w.start is not None and w.end is not None]}
+            for s in rows]}
     if engine != "openvino": raise ValueError("unsupported ASR engine")
     from faster_whisper.audio import decode_audio
     samples = decode_audio(audio, sampling_rate=16000)

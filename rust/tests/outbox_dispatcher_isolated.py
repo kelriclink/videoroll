@@ -8,7 +8,7 @@ from videoroll.apps.outbox.service import claim_outbox_events
 
 url=os.environ["DATABASE_URL"]
 assert url.endswith("/videoroll_test") and "127.0.0.1:" in url
-exe=Path(__file__).resolve().parents[1]/"target/debug/videoroll-v2"
+exe=Path(os.environ.get("VIDEOROLL_TEST_SCHEMA_BINARY",str(Path(__file__).resolve().parents[1]/"target/debug/videoroll-v2"))).resolve(strict=True)
 env={**os.environ,"VIDEOROLL_V2_NATIVE_OUTBOX_ONLY":"true","VIDEOROLL_V2_ENABLE_LEGACY_PUBLISH":"false","VIDEOROLL_V2_COMPAT_WRITE":"false"}
 def db():return psycopg.connect(url)
 def run(*args,ok=True,overrides=None):

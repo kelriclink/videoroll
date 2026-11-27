@@ -499,9 +499,21 @@ for i in $(seq 1 25); do
   sleep 0.2
 done
 cd rust
-"$cargo_bin" build --quiet
-./target/debug/videoroll-v2 migrate
-./target/debug/videoroll-v2 api > "$repo_root/rust/target/v2-smoke-api.log" 2>&1 &
+if [[ -n "${VIDEOROLL_TEST_CONTRACT_BIN_DIR:-}" ]]; then
+  # Explicitly exercise a frozen release rather than silently compiling or
+  # selecting a different debug executable. Only the 217-probe mode supports it.
+  [[ "${VIDEOROLL_V2_TEST_CONTRACT_217_ONLY:-false}" == true ]]
+  export VIDEOROLL_TEST_CONTRACT_BIN_DIR="$(realpath "$VIDEOROLL_TEST_CONTRACT_BIN_DIR")"
+  for candidate in videoroll-v2 videoroll-egress videoroll-sau; do
+    test -x "$VIDEOROLL_TEST_CONTRACT_BIN_DIR/$candidate"
+  done
+  smoke_exe="$VIDEOROLL_TEST_CONTRACT_BIN_DIR/videoroll-v2"
+else
+  "$cargo_bin" build --quiet
+  smoke_exe=./target/debug/videoroll-v2
+fi
+"$smoke_exe" migrate
+"$smoke_exe" api > "$repo_root/rust/target/v2-smoke-api.log" 2>&1 &
 api_pid=$!
 for i in $(seq 1 40); do
  if curl --silent --fail http://127.0.0.1:18080/health >/dev/null; then break;fi

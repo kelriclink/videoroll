@@ -8,7 +8,7 @@ import psycopg
 url=os.environ["DATABASE_URL"]
 assert "127.0.0.1:" in url and url.endswith("/videoroll_test")
 root=Path(os.environ["VIDEOROLL_V2_STORAGE_ROOT"])
-exe=Path(__file__).resolve().parents[1]/"target/debug/videoroll-v2"
+exe=Path(os.environ.get("VIDEOROLL_TEST_SCHEMA_BINARY",str(Path(__file__).resolve().parents[1]/"target/debug/videoroll-v2"))).resolve(strict=True)
 base="http://127.0.0.1:18194"
 def db():return psycopg.connect(url)
 def post(path,body,auth=True):

@@ -1319,6 +1319,62 @@ async fn groq_no_speech(config: &Config, path: &Path) -> bool {
         }
     }
 }
+// Keep the original local Whisper speech-confidence gate before semantic
+// regrouping. Word-level timestamps are passed by the model adapter; Rust
+// remains responsible for cue formation and cross-window stitching.
+fn local_whisper_response(mut payload: Value, seconds: f64) -> AppResult<AsrResponse> {
+    if payload["word_timestamps"] != true {
+        return serde_json::from_value(payload)
+            .map_err(|_| AppError::Unavailable("local ASR response schema invalid".into()));
+    }
+    let rows = payload["segments"]
+        .as_array_mut()
+        .ok_or_else(|| AppError::Unavailable("local Whisper segments missing".into()))?;
+    rows.retain(|v| {
+        let text = v["text"].as_str().unwrap_or("").trim();
+        let letters = text.chars().filter(|c| c.is_alphanumeric()).count();
+        let low = v["avg_logprob"].as_f64();
+        let silence = v["no_speech_prob"].as_f64();
+        let ratio = v["compression_ratio"].as_f64();
+        let duration = v["end"].as_f64().unwrap_or(0.) - v["start"].as_f64().unwrap_or(0.);
+        !text.is_empty()
+            && letters > 0
+            && !(silence.is_some_and(|p| p >= 0.6) && low.is_some_and(|p| p <= -1.0))
+            && !(ratio.is_some_and(|p| p >= 2.4) && letters <= 2)
+            && !(low.is_some_and(|p| p <= -1.2) && letters <= 2 && duration <= 2.)
+            && !(silence.is_some_and(|p| p >= 0.8) && letters <= 3)
+    });
+    let total_letters = rows
+        .iter()
+        .map(|v| {
+            v["text"]
+                .as_str()
+                .unwrap_or("")
+                .chars()
+                .filter(|c| c.is_alphanumeric())
+                .count()
+        })
+        .sum::<usize>();
+    let credible = rows.iter().any(|v| {
+        v["text"]
+            .as_str()
+            .unwrap_or("")
+            .chars()
+            .filter(|c| c.is_alphanumeric())
+            .count()
+            >= 2
+            && v["avg_logprob"].as_f64().is_none_or(|p| p > -0.7)
+            && v["no_speech_prob"].as_f64().is_none_or(|p| p < 0.5)
+    });
+    if !credible && total_letters < 8 {
+        rows.clear();
+    }
+    external_whisper_response(
+        payload,
+        &json!({"max_segment_seconds":12.,"max_segment_chars":120}),
+        seconds,
+    )
+}
 async fn run_asr(
     db: &Database,
     job: &WorkItem,
@@ -1333,6 +1389,9 @@ async fn run_asr(
         request["audio"] = json!(path);
         request["language"] = json!(lang);
         let response = crate::local_inference::invoke(&request, Duration::from_secs(600)).await?;
+        if request["engine"] == "faster-whisper" {
+            return local_whisper_response(response, seconds);
+        }
         return serde_json::from_value(response)
             .map_err(|_| AppError::Unavailable("local ASR response schema invalid".into()));
     }
@@ -2901,7 +2960,7 @@ async fn process_inner(
         (WINDOW, OVERLAP)
     };
     let asr_identity = fingerprint(&json!({
-        "checkpoint_version":6,"timing_refine_revision":1,"semantic_word_revision":2,"vad_runtime_configured":crate::local_inference::configured(),"video_sha256":source_digest,
+        "checkpoint_version":7,"timing_refine_revision":1,"semantic_word_revision":2,"local_word_revision":1,"vad_runtime_configured":crate::local_inference::configured(),"video_sha256":source_digest,
         "model":config.asr_model,"asr_endpoint":config.asr_endpoint,"local_asr":config.local_asr,
         "asr_request_options":config.asr_request_options,
         "language":profile.asr_language,"duration_ms":(duration*1000.0).round() as u64,
@@ -2951,7 +3010,7 @@ async fn process_inner(
                 .ok()
                 .and_then(|raw| serde_json::from_slice::<Checkpoint>(&raw).ok())
                 .filter(|row| {
-                    row.revision == 6
+                    row.revision == 7
                         && row.offset_ms == offset_ms
                         && row.fingerprint == asr_identity
                 });
@@ -3043,7 +3102,7 @@ async fn process_inner(
                 atomic_write(
                     &checkpoint,
                     &serde_json::to_vec(&Checkpoint {
-                        revision: 6,
+                        revision: 7,
                         fingerprint: asr_identity.clone(),
                         offset_ms,
                         cues: result.clone(),
@@ -4524,6 +4583,46 @@ mod tests {
         assert_eq!(response.segments[0].text, "Hello world.");
         assert_eq!(response.segments[1].text, "Again now.");
         assert!(response.segments[0].start >= 0.0 && response.segments[1].end <= 3.0);
+    }
+    #[test]
+    fn local_whisper_word_times_exclude_long_silence() {
+        let payload = json!({"word_timestamps":true,"segments":[
+            {"start":1.,"end":4.,"text":"First sentence.","words":[{"word":"First","start":1.,"end":1.5},{"word":" sentence.","start":1.6,"end":4.}]},
+            {"start":4.,"end":42.,"text":"The next sentence.","words":[{"word":"The","start":38.,"end":38.4},{"word":" next","start":38.5,"end":39.},{"word":" sentence.","start":39.1,"end":42.}]},
+            {"start":43.,"end":45.,"text":"hallucination","no_speech_prob":0.7,"avg_logprob":-1.3,"words":[{"word":"hallucination","start":43.,"end":45.}]}
+        ]});
+        let response = local_whisper_response(payload, 76.).unwrap();
+        assert!(response.timed_words.is_some());
+        let cues = normalize_asr(response, 0, 0, 76000).unwrap();
+        assert_eq!(cues.len(), 2);
+        assert_eq!(cues[1].start_ms, 38000);
+        assert_eq!(cues[1].text, "The next sentence.");
+        if let Ok(path) = std::env::var("VIDEOROLL_TEST_REAL_LOCAL_WORDS_FIXTURE") {
+            let payload: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+            let response = local_whisper_response(payload, 76.).unwrap();
+            let cues = normalize_asr(response, 0, 0, 76000).unwrap();
+            assert!(cues.iter().all(|c| c.end_ms - c.start_ms <= 12000));
+            assert!(
+                cues.iter()
+                    .all(|c| !(c.start_ms < 30000 && c.end_ms > 10000)
+                        && !(c.start_ms < 65000 && c.end_ms > 55000))
+            );
+            let text = cues
+                .iter()
+                .map(|c| c.text.as_str())
+                .collect::<Vec<_>>()
+                .join(" ")
+                .to_lowercase();
+            assert!(
+                text.contains("first sentence")
+                    && text.contains("final window")
+                    && text.matches("two screws").count() >= 2
+            );
+            println!(
+                "PASS actual CPU Whisper word timeline, no silence-spanning captions, repeated phrase and final window preserved: {} cues",
+                cues.len()
+            );
+        }
     }
     #[test]
     fn global_words_stitch_only_time_aligned_overlap_and_preserve_repeated_speech() {
