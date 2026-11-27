@@ -211,7 +211,7 @@ impl Scheduler {
         }
         let historical_publish:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM operation_inbox i WHERE i.task_id=$1 AND i.runtime_engine='rust-task-cutover' AND i.status='completed') AND EXISTS(SELECT 1 FROM publish_jobs j WHERE j.task_id=$1)")
             .bind(task_id).fetch_one(&mut *tx).await?;
-        if historical_publish {
+        if historical_publish || crate::maintenance_publish_timeout_v1::publication_fence(&mut tx, task_id).await? {
             return Err(AppError::Conflict(
                 "historical publication exists; use explicit reconciled publication controls"
                     .into(),
@@ -460,7 +460,7 @@ impl Scheduler {
         .await?;
         let historical_publish:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM operation_inbox i WHERE i.task_id=$1 AND i.runtime_engine='rust-task-cutover' AND i.status='completed') AND EXISTS(SELECT 1 FROM publish_jobs j WHERE j.task_id=$1)")
             .bind(task_id).fetch_one(&mut *tx).await?;
-        if unsafe_publish || historical_publish {
+        if unsafe_publish || historical_publish || crate::maintenance_publish_timeout_v1::publication_fence(&mut tx,task_id).await? {
             return Err(AppError::Conflict(
                 "a queued, successful or uncertain publication blocks restart; verify external outcome first".into()
             ));

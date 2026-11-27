@@ -39,6 +39,8 @@ enum Command {
     SocialTick,
     /// Settle due native publish batch events, without running any external publisher.
     PublishBatchTick,
+    /// Recover stale standalone Rust-owned publishing tasks; never submit.
+    PublishTimeoutTick,
     /// Unified broker-free control-plane dispatch.
     OutboxTick,
     /// Read-only standalone schema, ownership and outbox admission check.
@@ -355,6 +357,21 @@ async fn main() -> anyhow::Result<()> {
             let executor = Executor::new(config.clone(), db.clone(), scheduler, storage);
             let mut workers = tokio::task::JoinSet::new();
             let failed_retention = config.cleanup_grace;
+            let timeout_db=db.clone();
+            workers.spawn(async move {
+                let mut tick=tokio::time::interval(std::time::Duration::from_secs(60));
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                let hours=videoroll_v2::maintenance_publish_timeout_v1::timeout_hours();
+                let mut cursor=None;
+                loop {
+                    tick.tick().await;
+                    match videoroll_v2::maintenance_publish_timeout_v1::tick(&timeout_db,hours,&mut cursor).await {
+                        Ok(n) if n>0=>tracing::info!(recovered=n,"stale publishing tasks recovered"),
+                        Ok(_)=>{},
+                        Err(error)=>tracing::warn!(%error,"publishing timeout scan deferred"),
+                    }
+                }
+            });
             if videoroll_v2::maintenance_terminal_storage_v1::scheduled_enabled() {
                 let legacy_store=maintenance_store.clone();
                 workers.spawn(async move {
@@ -543,6 +560,12 @@ async fn main() -> anyhow::Result<()> {
         Command::PublishBatchTick => {
             let processed = videoroll_v2::publish_batch_events::tick(&db, 100).await?;
             tracing::info!(processed, "native publish batch event tick finished");
+        }
+        Command::PublishTimeoutTick => {
+            let mut cursor=None;
+            let recovered=videoroll_v2::maintenance_publish_timeout_v1::tick(
+                &db,videoroll_v2::maintenance_publish_timeout_v1::timeout_hours(),&mut cursor).await?;
+            tracing::info!(recovered,"publishing timeout scan finished");
         }
         Command::LegacyStorageTick => {
             let registry=AssetRegistry::new(db,config.storage_root.clone());
