@@ -58,6 +58,11 @@ export function useTaskCore(taskId: string | undefined) {
         setAssets(result.core.value.assets);
         setSubtitleJobs(result.core.value.subtitleJobs);
         setCoreError(null);
+      } else if (result.core.error.status === 404) {
+        setTask(null);
+        setAssets(null);
+        setSubtitleJobs(null);
+        setCoreError("任务已不存在或已被删除");
       } else {
         setCoreError(result.core.error.message);
       }
@@ -97,6 +102,11 @@ export function useTaskCore(taskId: string | undefined) {
       setAssets(result.core.value.assets);
       setSubtitleJobs(result.core.value.subtitleJobs);
       setCoreError(null);
+    } else if (result.core.error.status === 404) {
+      setTask(null);
+      setAssets(null);
+      setSubtitleJobs(null);
+      setCoreError("任务已不存在或已被删除");
     } else {
       setCoreError(result.core.error.message);
     }

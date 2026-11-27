@@ -40,13 +40,6 @@ pub(crate) fn read_concurrency(data: &Value) -> i64 {
     };
     requested.unwrap_or(2).clamp(1, 16)
 }
-fn worker_slots() -> i64 {
-    std::env::var("HATCHET_SUBTITLE_WORKER_SLOTS")
-        .ok()
-        .and_then(|s| s.parse::<i64>().ok())
-        .unwrap_or(1)
-        .clamp(1, 256)
-}
 pub(crate) async fn settings_snapshot(state: &AppState) -> AppResult<Value> {
     let saved: Option<Value> =
         sqlx::query_scalar("SELECT value_json FROM app_settings WHERE key=$1")
@@ -66,30 +59,25 @@ pub(crate) async fn settings_snapshot(state: &AppState) -> AppResult<Value> {
     let legacy_active: i64 = activity.try_get("active")?;
     let legacy_pending: i64 = activity.try_get("pending")?;
 
-    // Native V2 download jobs are never represented as Python OperationInbox
-    // rows. Count them separately, so both generations appear.
+    // Native jobs use the original inbox via the V2 view. Match the
+    // scheduler's ownership, generation, current stage and retry budget.
     let own=sqlx::query(r#"
       SELECT COUNT(*) FILTER (WHERE j.state='running' AND j.lease_until>now())::BIGINT AS active,
-        COUNT(*) FILTER (WHERE j.state='pending' OR
-          (j.state='running' AND (j.lease_until IS NULL OR j.lease_until<=now())))::BIGINT AS pending
+        COUNT(*) FILTER (WHERE j.attempts<j.max_attempts AND (j.state='pending' OR
+          (j.state='running' AND (j.lease_until IS NULL OR j.lease_until<=now()))))::BIGINT AS pending
       FROM vr2_jobs j JOIN vr2_workflows w ON w.id=j.workflow_id
       JOIN tasks t ON t.id=j.task_id
       WHERE j.stage='download' AND w.state='running'
-        AND t.status::text NOT IN ('published','canceled')
+        AND t.runtime_owner='rust' AND t.status::text<>'canceled'
+        AND w.current_stage=j.stage AND w.generation=j.generation
         AND j.state IN ('pending','running')
     "#).fetch_one(&state.db.pool).await?;
     let v2_active: i64 = own.try_get("active")?;
     let v2_pending: i64 = own.try_get("pending")?;
-    // The field is a compatibility discriminator; do not present Hatchet as
-    // the V2 scheduler. When no native jobs are present preserve Python shape.
-    let native: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM vr2_jobs WHERE state IN ('pending','running','awaiting'))",
-    )
-    .fetch_one(&state.db.pool)
-    .await?;
+    // The native API remains native even when no job is queued.
     Ok(json!({
-        "scheduler": if native {"rust-v2"}else{"hatchet"},
-        "subtitle_worker_slots":worker_slots(),
+        "scheduler":"rust-v2",
+        "subtitle_worker_slots":state.config.worker_count,
         "download_concurrency":concurrency,
         "active_downloads":legacy_active+v2_active,
         "pending_downloads":legacy_pending+v2_pending
@@ -149,7 +137,8 @@ async fn queue_get(
         r#"
       WITH candidates AS (
         SELECT j.task_id FROM vr2_jobs j JOIN vr2_workflows w ON w.id=j.workflow_id
-          WHERE w.state='running' AND j.state IN ('pending','running','awaiting')
+          WHERE w.state='running' AND w.current_stage=j.stage AND w.generation=j.generation
+            AND j.state IN ('pending','running','awaiting')
         UNION
         SELECT task_id FROM render_jobs WHERE status::text IN('queued','running')
         UNION
@@ -166,7 +155,7 @@ async fn queue_get(
       SELECT t.id AS task_id,t.priority,t.created_at AS task_created,t.updated_at AS task_updated,
              t.error_message AS task_error,
              v.id AS v_id,v.stage AS v_stage,v.state AS v_state,
-             v.lease_until AS v_lease,v.last_error AS v_error,
+             v.lease_until AS v_lease,v.last_error AS v_error,v.attempts AS v_attempts,v.max_attempts AS v_max_attempts,v.available_at AS v_available,
              v.created_at AS v_created,v.updated_at AS v_updated,
              sv.id AS subtitle_id,sv.status::text AS subtitle_state,
              sv.progress AS subtitle_progress,sv.error_message AS subtitle_error,
@@ -183,9 +172,10 @@ async fn queue_get(
              prog.percent AS download_progress
       FROM tasks t JOIN candidates c ON c.task_id=t.id
       LEFT JOIN LATERAL (
-         SELECT j.id,j.stage,j.state,j.lease_until,j.last_error,j.created_at,j.updated_at
+         SELECT j.id,j.stage,j.state,j.lease_until,j.last_error,j.created_at,j.updated_at,j.attempts,j.max_attempts,j.available_at
          FROM vr2_jobs j JOIN vr2_workflows w ON w.id=j.workflow_id
-         WHERE j.task_id=t.id AND w.state='running'
+         WHERE j.task_id=t.id AND t.runtime_owner='rust' AND w.state='running'
+             AND w.current_stage=j.stage AND w.generation=j.generation
              AND j.state IN ('pending','running','awaiting')
          ORDER BY w.generation DESC,j.created_at DESC LIMIT 1
       ) v ON TRUE
@@ -230,9 +220,9 @@ async fn queue_get(
          SELECT percent FROM vr2_download_progress dp
          WHERE dp.task_id=t.id AND dp.job_id=v.id LIMIT 1
       ) prog ON TRUE
-      WHERE t.status::text NOT IN ('published','canceled')
-        AND (v.id IS NOT NULL OR sv.id IS NOT NULL OR
-             rj.id IS NOT NULL OR p.state IS NOT NULL OR d.status IS NOT NULL)
+      WHERE t.status::text<>'canceled'
+        AND (v.id IS NOT NULL OR (t.runtime_owner<>'rust' AND t.status::text<>'published' AND (sv.id IS NOT NULL OR
+             rj.id IS NOT NULL OR p.state IS NOT NULL OR d.status IS NOT NULL)))
       ORDER BY t.priority DESC,t.created_at ASC
       LIMIT $1
     "#,
@@ -276,6 +266,17 @@ async fn queue_get(
             since = when;
             updated = row.try_get("v_updated")?;
             error = row.try_get("v_error")?;
+            // Keep stranded tasks visible while the recovery worker settles
+            // them, rather than incorrectly advertising them as claimable.
+            if !live {
+                let attempts: i32 = row.try_get("v_attempts")?;
+                let max: i32 = row.try_get("v_max_attempts")?;
+                if v_state == "running" && stage == "waiting_publish" {
+                    error = Some("投稿租约已失效，等待未知回执核对".into());
+                } else if attempts >= max {
+                    error = Some("阶段尝试次数已耗尽，等待恢复结算".into());
+                }
+            }
             if stage == "download" || stage == "waiting_download" {
                 progress = row
                     .try_get::<Option<i16>, _>("download_progress")?
@@ -380,54 +381,71 @@ async fn queue_get(
         "running_count":running,"queued_count":queued,"tasks":items
     })))
 }
-async fn queue_broker(State(state): State<AppState>) -> AppResult<Json<Value>> {
-    // This deployment has no Celery broker and no Kombu ACK state. Return
-    // the same DTO structure with named V2 stages and actual PostgreSQL
-    // lease/ready counts; do not invent Redis Unacked or worker heartbeat.
+// Shared snapshot for REST and WS. These flags use the same predicates as
+// Scheduler::claim. Ready means eligible before concurrency admission.
+pub(crate) async fn broker_snapshot(state: &AppState) -> AppResult<Value> {
     let now = Utc::now();
-    let rows=sqlx::query(r#"
-      SELECT j.stage AS name,
-       COUNT(*) FILTER (WHERE j.state='pending' AND j.available_at<=now()
-          OR j.state='running' AND j.lease_until<=now() AND j.stage<>'publish')::BIGINT AS ready,
-       COUNT(*) FILTER (WHERE j.state='running' AND j.lease_until>now())::BIGINT AS running,
-       COUNT(*) FILTER (WHERE j.state='awaiting')::BIGINT AS awaiting,
-       COALESCE(SUM(j.attempts) FILTER (WHERE j.state='pending'
-                       OR (j.state='running' AND j.lease_until<=now())),0)::BIGINT AS attempts,
-       MIN(j.created_at) FILTER (WHERE j.state='pending' AND j.available_at<=now()
-                       OR (j.state='running' AND j.lease_until<=now() AND j.stage<>'publish')) AS oldest
-      FROM vr2_jobs j JOIN vr2_workflows w ON w.id=j.workflow_id
-      JOIN tasks t ON t.id=j.task_id
-      WHERE w.state='running' AND t.status::text NOT IN('published','canceled')
-        AND j.state IN ('pending','running','awaiting')
-      GROUP BY j.stage ORDER BY j.stage
-    "#).fetch_all(&state.db.pool).await?;
-    let mut queues = Vec::<Value>::new();
+    let rows = sqlx::query(
+        r#"
+    WITH current_jobs AS (
+        SELECT j.*, (j.state='running' AND j.lease_until>now()) AS live,
+          (j.state='running' AND (j.lease_until IS NULL OR j.lease_until<=now())) AS expired
+        FROM vr2_jobs j JOIN vr2_workflows w ON w.id=j.workflow_id
+        JOIN tasks t ON t.id=j.task_id
+        WHERE w.state='running' AND w.current_stage=j.stage AND w.generation=j.generation
+          AND t.runtime_owner='rust' AND t.status::text<>'canceled'
+          AND j.state IN ('pending','running','awaiting')
+    ), classified AS (
+        SELECT *, CASE
+          WHEN state='awaiting' THEN 'awaiting'
+          WHEN live THEN 'active'
+          WHEN expired AND stage='publish' THEN 'unknown'
+          WHEN attempts>=max_attempts THEN 'exhausted'
+          WHEN state='pending' AND available_at>now() THEN 'delayed'
+          WHEN (state='pending' AND available_at<=now()) OR expired THEN 'ready'
+          ELSE 'unknown' END AS bucket
+        FROM current_jobs
+    )
+    SELECT stage AS name,
+        COUNT(*) FILTER (WHERE bucket='ready')::bigint AS ready,
+        COUNT(*) FILTER (WHERE bucket='active')::bigint AS active,
+        COUNT(*) FILTER (WHERE bucket='awaiting')::bigint AS awaiting,
+        COUNT(*) FILTER (WHERE bucket='delayed')::bigint AS delayed,
+        COUNT(*) FILTER (WHERE bucket='unknown')::bigint AS unknown,
+        COUNT(*) FILTER (WHERE bucket='exhausted')::bigint AS exhausted,
+        COALESCE(SUM(attempts) FILTER (WHERE bucket='ready'),0)::bigint AS attempts,
+        MIN(created_at) FILTER (WHERE bucket='ready') AS oldest
+    FROM classified GROUP BY stage ORDER BY stage
+    "#,
+    )
+    .fetch_all(&state.db.pool)
+    .await?;
+    let mut queues = Vec::new();
     for r in rows {
         let name: String = r.try_get("name")?;
         let ready: i64 = r.try_get("ready")?;
-        let active: i64 = r.try_get("running")?;
-        let awaiting: i64 = r.try_get("awaiting")?;
-        let attempts: i64 = r.try_get("attempts")?;
         let oldest: Option<DateTime<Utc>> = r.try_get("oldest")?;
-        queues.push(json!({
-            "name":format!("v2:{name}"),
-            "ready":ready,"reserved":Value::Null,"active":active,
-            "unacked":0,
-            "oldest_wait_seconds":if ready==0{Some(0)}else{oldest.map(|x|secs_since(x,now))},
-            "ready_retry_attempts":attempts.max(0),
-            "sampled_ready":ready,"scan_truncated":false,
-            "awaiting_external":awaiting
-        }));
+        queues.push(
+            json!({"name":format!("v2:{name}"),"ready":ready,"reserved":null,
+          "active":r.try_get::<i64,_>("active")?,"unacked":0,"unacked_applicable":false,
+          "oldest_wait_seconds":if ready==0{Some(0)}else{oldest.map(|x|secs_since(x,now))},
+          "ready_retry_attempts":r.try_get::<i64,_>("attempts")?,
+          "sampled_ready":ready,"scan_truncated":false,
+          "awaiting_external":r.try_get::<i64,_>("awaiting")?,
+          "delayed":r.try_get::<i64,_>("delayed")?,
+          "unknown_receipt":r.try_get::<i64,_>("unknown")?,
+          "exhausted":r.try_get::<i64,_>("exhausted")?}),
+        );
     }
-    Ok(Json(json!({
-        "observed_at":now,"worker_observed":false,
-        "queues":queues,
-        "warnings":[
-           "当前为 Rust PostgreSQL 持久队列；不使用 Celery/Redis Kombu，Unacked 不适用",
-           "Active 依据未到期的租约统计，尚未独立核实 Worker 心跳",
-           "Awaiting 外部执行计数在队列条目的 awaiting_external 扩展字段中"
-        ]
-    })))
+    Ok(
+        json!({"observed_at":now,"worker_observed":false,"scheduler":"rust-v2","queues":queues,
+        "warnings":["Ready 为满足阶段、代数、租约及尝试预算的待领取任务；实际领取仍受并发限制",
+            "Active 依据有效租约，不等于独立 Worker 心跳验证；Awaiting 等待外部执行",
+            "Rust PostgreSQL 队列没有 Celery Reserved / Unacked 计数"]}),
+    )
+}
+async fn queue_broker(State(state): State<AppState>) -> AppResult<Json<Value>> {
+    Ok(Json(broker_snapshot(&state).await?))
 }
 pub fn router() -> Router<AppState> {
     Router::new()

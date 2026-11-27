@@ -784,7 +784,10 @@ impl Scheduler {
                     j.stage <> 'download' OR (
                       (SELECT count(*) FROM vr2_jobs dj
                         JOIN vr2_workflows dw ON dw.id=dj.workflow_id
-                        WHERE dj.stage='download' AND dj.state='running'
+                        JOIN tasks dt ON dt.id=dj.task_id
+                        WHERE dt.runtime_owner='rust' AND dt.status<>'canceled'::task_status
+                          AND dw.current_stage=dj.stage AND dw.generation=dj.generation
+                          AND dj.stage='download' AND dj.state='running'
                           AND dj.lease_until>now() AND dw.state='running')
                       +
                       (SELECT count(*) FROM operation_inbox op

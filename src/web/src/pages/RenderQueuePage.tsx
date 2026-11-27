@@ -23,7 +23,7 @@ type TaskQueueItem = {
 
 type TaskQueue = {
   settings: {
-    scheduler: "hatchet";
+    scheduler: "hatchet" | "rust-v2";
     subtitle_worker_slots: number;
     download_concurrency: number;
     active_downloads: number;
@@ -40,6 +40,11 @@ type BrokerQueueMetrics = {
   reserved: number | null;
   active: number | null;
   unacked: number;
+  unacked_applicable?: boolean;
+  awaiting_external?: number;
+  delayed?: number;
+  unknown_receipt?: number;
+  exhausted?: number;
   oldest_wait_seconds: number | null;
   ready_retry_attempts: number;
   sampled_ready: number;
@@ -94,27 +99,33 @@ export default function RenderQueuePage() {
   const queueRef = useRef<TaskQueue | null>(null);
   const downloadInputDirtyRef = useRef(false);
   const refreshTimerRef = useRef<number | undefined>();
+  const latestQueueRequest = useRef(0);
+  const latestBrokerRequest = useRef(0);
 
   const refreshBroker = useCallback(async () => {
+    const request = ++latestBrokerRequest.current;
     try {
       const snapshot = await fetchJson<BrokerQueueSnapshot>(`${ORCHESTRATOR_URL}/subtitle/task_queue/broker`);
+      if (request !== latestBrokerRequest.current) return;
       setBroker(snapshot);
       setBrokerError(null);
     } catch (cause: unknown) {
-      setBrokerError(cause instanceof Error ? cause.message : String(cause));
+      if (request === latestBrokerRequest.current) setBrokerError(cause instanceof Error ? cause.message : String(cause));
     }
   }, []);
 
   const refresh = useCallback(async () => {
+    const request = ++latestQueueRequest.current;
     setError(null);
     try {
       const q = await fetchJson<TaskQueue>(`${ORCHESTRATOR_URL}/subtitle/task_queue?limit=2000`);
+      if (request !== latestQueueRequest.current) return;
       queueRef.current = q;
       setQueue(q);
       // Realtime queue updates must not overwrite a value while it is edited.
       if (!downloadInputDirtyRef.current) setDownloadConcurrency(q.settings.download_concurrency);
     } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : String(e));
+      if (request === latestQueueRequest.current) setError(e instanceof Error ? e.message : String(e));
     }
   }, []);
 
@@ -145,8 +156,6 @@ export default function RenderQueuePage() {
   useEffect(() => {
     void refresh();
     void refreshBroker();
-    const timer = window.setInterval(() => void refreshBroker(), 20_000);
-    return () => window.clearInterval(timer);
   }, [refresh, refreshBroker]);
 
   const scheduleRefresh = useCallback(() => {
@@ -195,6 +204,13 @@ export default function RenderQueuePage() {
   }, [scheduleRefresh]);
 
   const handleRealtimeEvent = useCallback((event: RealtimeEvent) => {
+    if (event.name === "queue.broker.snapshot") {
+      ++latestBrokerRequest.current;
+      setBroker(event.data as unknown as BrokerQueueSnapshot);
+      setBrokerError(null);
+      scheduleRefresh();
+      return;
+    }
     if (event.name.startsWith("subtitle_job.") || event.name.startsWith("render_job.")) {
       handleJobEvent(event);
       return;
@@ -205,7 +221,8 @@ export default function RenderQueuePage() {
   }, [handleJobEvent, scheduleRefresh]);
 
   useRealtimeSubscription(["queue"], handleRealtimeEvent, () => {
-    void refresh();
+    scheduleRefresh();
+    void refreshBroker();
   });
 
   useEffect(() => () => {
@@ -252,7 +269,7 @@ export default function RenderQueuePage() {
           {saveMessage ? <div role="status" className="text-xs text-slate-600">{saveMessage}</div> : null}
         </div>
         <TechnicalDetails className="mt-4" summary="调度器信息">
-          <div>调度器：{queue?.settings.scheduler ?? "hatchet"}</div>
+          <div>调度器：{queue?.settings.scheduler ?? "—"}</div>
           <div className="mt-1">字幕 Worker 槽位：{queue?.settings.subtitle_worker_slots ?? "—"}</div>
           <div className="mt-2 text-slate-500">任务优先级只在创建或恢复工作流时映射到调度器；已提交执行不会伪装成可实时重排。</div>
         </TechnicalDetails>
@@ -260,7 +277,7 @@ export default function RenderQueuePage() {
 
       <div className="vr-section space-y-3">
         <div className="flex flex-wrap items-baseline justify-between gap-2">
-          <div className="font-semibold">Celery / Redis 队列健康</div>
+          <div className="font-semibold">{queue?.settings.scheduler === "rust-v2" ? "PostgreSQL 持久队列健康" : "Celery / Redis 队列健康"}</div>
           <div className="text-xs text-slate-500">快照时间：{broker ? new Date(broker.observed_at).toLocaleString() : "尚未采集"}</div>
         </div>
         <div className="overflow-x-auto">
@@ -268,7 +285,9 @@ export default function RenderQueuePage() {
             <thead className="text-xs text-slate-500"><tr>
               <th className="py-2 pr-3">队列</th><th className="py-2 pr-3">Ready</th>
               <th className="py-2 pr-3">Reserved</th><th className="py-2 pr-3">Active</th>
-              <th className="py-2 pr-3">Unacked</th><th className="py-2 pr-3">最老等待</th>
+              <th className="py-2 pr-3">Unacked</th>
+              {queue?.settings.scheduler === "rust-v2" && <><th className="py-2 pr-3">外部等待</th><th className="py-2 pr-3">延迟</th><th className="py-2 pr-3">回执待核对</th><th className="py-2 pr-3">预算耗尽</th></>}
+              <th className="py-2 pr-3">最老等待</th>
               <th className="py-2 pr-3">排队重试次数</th>
             </tr></thead>
             <tbody>{broker?.queues.map((item) => (
@@ -277,9 +296,10 @@ export default function RenderQueuePage() {
                 <td className="py-2 pr-3 font-mono">{item.ready}</td>
                 <td className="py-2 pr-3 font-mono">{item.reserved ?? "—"}</td>
                 <td className="py-2 pr-3 font-mono">{item.active ?? "—"}</td>
-                <td className="py-2 pr-3 font-mono">{item.unacked}</td>
+                <td className="py-2 pr-3 font-mono">{item.unacked_applicable === false ? "—" : item.unacked}</td>
+                {queue?.settings.scheduler === "rust-v2" && <><td className="py-2 pr-3 font-mono">{item.awaiting_external ?? "—"}</td><td className="py-2 pr-3 font-mono">{item.delayed ?? "—"}</td><td className="py-2 pr-3 font-mono">{item.unknown_receipt ?? "—"}</td><td className="py-2 pr-3 font-mono">{item.exhausted ?? "—"}</td></>}
                 <td className="py-2 pr-3">{brokerAgeLabel(item.oldest_wait_seconds)}</td>
-                <td className="py-2 pr-3 font-mono" title={item.scan_truncated ? `已扫描 ${item.sampled_ready} 条；统计不完整` : "当前 Ready 消息头中的 Celery 重试次数之和"}>
+                <td className="py-2 pr-3 font-mono" title={item.scan_truncated ? `已扫描 ${item.sampled_ready} 条；统计不完整` : "当前 Ready 任务已尝试次数之和"}>
                   {item.ready_retry_attempts}{item.scan_truncated ? "+" : ""}
                 </td>
               </tr>
@@ -289,7 +309,7 @@ export default function RenderQueuePage() {
         </div>
         {brokerError ? <InlineNotice tone="warning" title="队列快照暂不可用">{brokerError}</InlineNotice> : null}
         {broker?.warnings.map((warning) => <p key={warning} className="text-xs text-amber-700 dark:text-amber-300">{warning}</p>)}
-        <p className="text-xs text-slate-500">Ready 是 Broker 中尚未领取的消息；Reserved 和 Active 来自 Worker 实时检查；Unacked 可能与后两者重叠。最老等待仅在消息具有可信入队时间戳时计算；未知不会显示为零。重试次数仅统计 Ready 消息。</p>
+        <p className="text-xs text-slate-500">{queue?.settings.scheduler === "rust-v2" ? "Ready 是可领取阶段，Active 是有效租约；外部等待、延迟、未知回执与预算耗尽分别统计。不适用的指标显示为 —。" : "Ready 是尚未领取的消息，Reserved 和 Active 来自 Worker 检查，Unacked 可能重叠。未知不会显示为零。"}</p>
       </div>
 
       <div className="rounded border bg-white p-4">

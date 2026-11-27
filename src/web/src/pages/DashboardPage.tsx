@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import StatusBadge from "../components/StatusBadge";
 import BilibiliDiscoveryView from "../features/bilibili-discovery/BilibiliDiscoveryView";
@@ -157,7 +157,9 @@ export default function DashboardPage() {
   const [resources, setResources] = useState<ResourceSnapshot | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
 
+  const latestLoad = useRef(0);
   const load = useCallback(async () => {
+    const request = ++latestLoad.current;
     const failures: string[] = [];
     const [taskResult, videoResult, alertResult, resourceResult] = await Promise.allSettled([
       fetchJson<Task[]>(`${ORCHESTRATOR_URL}/tasks?limit=200`),
@@ -166,6 +168,7 @@ export default function DashboardPage() {
       fetchJson<ResourceSnapshot>(`${ORCHESTRATOR_URL}/system/resources`),
     ]);
 
+    if (request !== latestLoad.current) return;
     if (taskResult.status === "fulfilled") setTasks(taskResult.value);
     else failures.push(taskResult.reason instanceof Error ? taskResult.reason.message : String(taskResult.reason));
 
@@ -192,6 +195,7 @@ export default function DashboardPage() {
       return;
     }
     if (event.name === "task.deleted") {
+      ++latestLoad.current;
       setTasks((current) => current?.filter((task) => task.id !== id) ?? current);
       return;
     }

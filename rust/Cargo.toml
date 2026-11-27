@@ -53,3 +53,4 @@ dom_smoothie = { version = "=0.19.0", default-features = false }
 
 [dev-dependencies]
 tempfile = "3"
+tokio-tungstenite = "0.29"

@@ -124,6 +124,9 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Command::Migrate => db.migrate().await?,
         Command::Api => {
+            tokio::spawn(videoroll_v2::realtime::listen_commits(
+                config.database_url.clone(),
+            ));
             let scheduler = Scheduler::new(db.clone(), config.job_lease);
             let storage = AssetRegistry::new(db.clone(), config.storage_root.clone());
             let app = api::router(AppState {
