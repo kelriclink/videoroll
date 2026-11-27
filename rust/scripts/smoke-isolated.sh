@@ -633,6 +633,11 @@ if [[ "${VIDEOROLL_V2_TEST_STORAGE_RETENTION_ONLY:-false}" == "true" ]]; then
   "$smoke_python" "$repo_root/rust/tests/storage_retention_v1_isolated.py"
   exit 0
 fi
+if [[ "${VIDEOROLL_V2_TEST_AUTO_RUNTIME_PROFILE_ONLY:-false}" == "true" ]]; then
+  "$smoke_python" "$repo_root/rust/tests/auto_runtime_profile_v1_isolated.py"
+  VIDEOROLL_TEST_AUTO_RUNTIME_PROFILE_DB_URL="$DATABASE_URL" CARGO_INCREMENTAL=0 "$cargo_bin" test --locked --offline --lib
+  exit 0
+fi
 if [[ "${VIDEOROLL_V2_TEST_TASK_CONTROLS_ONLY:-false}" == "true" ]]; then
   "$smoke_python" "$repo_root/rust/tests/task_controls_v1_isolated.py"
   exit 0

@@ -309,7 +309,7 @@ async fn execute(state: &AppState, owner: &str, settings: &Value) -> AppResult<V
                 &url,
                 "authorized",
                 0,
-                json!({"origin":"youtube_home_scan"}),
+                json!({"origin":"youtube_home_scan","legacy_auto_runtime_profile":true}),
                 true,
             )
             .await;

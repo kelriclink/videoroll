@@ -211,6 +211,11 @@ impl Executor {
                         reason: "automatic publishing has no enabled platform targets".into(),
                     });
                 }
+                // A dynamically enabled automatic policy must never bypass
+                // source authorization, even on the direct native Bili path.
+                let authorized:bool=sqlx::query_scalar("SELECT source_license::text<>'unknown' AND runtime_owner='rust' AND status::text<>'canceled' AND stopped_status IS NULL FROM tasks WHERE id=$1")
+                    .bind(item.task_id).fetch_one(&self.db.pool).await?;
+                if !authorized{return Err(AppError::Conflict("automatic publication requires authorized unstopped source".into()))}
                 if choice.platforms.iter().any(|p|p!="bilibili") && crate::social_publish::mixed_enabled(){
                     let state=crate::api::AppState{config:self.config.clone(),db:self.db.clone(),scheduler:self.scheduler.clone(),storage:self.registry.clone()};
                     return crate::social_publish::automatic(&state,item,choice.platforms).await;

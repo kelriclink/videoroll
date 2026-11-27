@@ -2251,6 +2251,16 @@ pub async fn runtime_asr_config(
         == Some(true)
     {
         Some(crate::settings::effective(db, "subtitle.auto_profile").await?)
+    } else if flow.as_ref().and_then(|v|v["legacy_auto_runtime_profile"].as_bool())==Some(true) {
+        // Original automatic handoff reads the current box ASR engine/model.
+        // Later explicit subtitle options still take precedence.
+        let mut runtime=crate::settings::effective(db,"subtitle.auto_profile").await?;
+        if let Some(overrides)=flow.as_ref().and_then(|v|v["subtitle"].as_object()){
+            if let Some(target)=runtime.as_object_mut(){
+                for (key,value) in overrides{target.insert(key.clone(),value.clone());}
+            }
+        }
+        Some(runtime)
     } else {
         flow.as_ref().and_then(|v| v.get("subtitle")).cloned()
     };

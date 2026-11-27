@@ -47,8 +47,8 @@ pub async fn profile(db: &Database, job: &WorkItem) -> AppResult<RenderProfile> 
     // as the current settings; ordinary existing workflows are unchanged.
     let runtime = if settings
         .as_ref()
-        .and_then(|v| v["standalone_subtitle_runtime_profile"].as_bool())
-        == Some(true)
+        .is_some_and(|v| v["standalone_subtitle_runtime_profile"].as_bool()==Some(true)
+            || v["legacy_auto_runtime_profile"].as_bool()==Some(true))
     {
         crate::subtitle_management_v1::normalized_profile(&runtime)
     } else {

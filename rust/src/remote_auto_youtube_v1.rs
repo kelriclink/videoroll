@@ -298,7 +298,7 @@ async fn post_remote(
             &payload.url,
             &payload.license,
             0,
-            json!({"auto_publish":false,"auto_publish_platforms":[]}),
+            json!({"legacy_auto_runtime_profile":true}),
             source_proof.as_deref(),
         )
         .await;

@@ -39,7 +39,7 @@ with engine.begin() as db:
     db.execute(text("""INSERT INTO app_settings(key,value_json,version)
       VALUES('subtitle.auto_profile',CAST(:config AS jsonb),1)
       ON CONFLICT(key) DO UPDATE SET value_json=EXCLUDED.value_json,version=app_settings.version+1"""),
-      {'config':json.dumps({'auto_publish':True,'auto_dub_p2':True,'auto_publish_platforms':['bilibili']})})
+      {'config':json.dumps({'auto_publish':False,'auto_dub_p2':True,'auto_publish_platforms':[]})})
 status,body=post(f'/tasks/{task}/actions/auto_dubbing')
 assert status==409,(status,body)
 auto=uuid4(); flow=uuid4(); sub=uuid4()
@@ -53,6 +53,15 @@ with engine.begin() as db:
       CAST(:result AS jsonb))"""),{'sub':str(sub),'key':'mock:subtitle:'+str(sub),'flow':str(flow),'id':str(auto),'result':json.dumps({'no_speech':True})})
 status,body=post(f'/tasks/{auto}/actions/auto_dubbing')
 assert status==200 and body['status']=='skipped' and 'no speech' in body['detail'],(status,body)
+# With no publication target, the enabled dubbing stage still checks speech.
+with engine.begin() as db:
+    db.execute(text("UPDATE app_settings SET value_json=value_json||CAST(:config AS jsonb) WHERE key='subtitle.auto_profile'"),{"config":json.dumps({"auto_publish":True,"auto_publish_platforms":["douyin"]})})
+status,body=post(f'/tasks/{auto}/actions/auto_dubbing')
+assert status==200 and 'no speech' in body['detail'],(status,body)
+with engine.begin() as db:
+    db.execute(text("UPDATE app_settings SET value_json=value_json||CAST(:config AS jsonb) WHERE key='subtitle.auto_profile'"),{"config":json.dumps({"auto_dub_p2":False})})
+status,body=post(f'/tasks/{auto}/actions/auto_dubbing')
+assert status==200 and 'disabled' in body['detail'],(status,body)
 with engine.connect() as db:
     assert db.execute(text("SELECT count(*) FROM operation_inbox WHERE task_id=CAST(:id AS uuid) AND stage='dubbing'"),{'id':str(auto)}).scalar()==0
 

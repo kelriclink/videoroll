@@ -243,6 +243,20 @@ impl Scheduler {
         .fetch_one(&mut *tx)
         .await?;
         let workflow_id = Uuid::new_v4();
+        if configuration["legacy_auto_runtime_profile"].as_bool()==Some(true){
+            // Explicit V1 auto-start: keep the old origin contract. Never
+            // silently switch an already-running or paused generation.
+            if !crate::task_ownership::blockers(&mut tx,task_id).await?.is_empty(){
+                return Err(AppError::Conflict("historical or active work must be settled before automatic restart".into()))
+            }
+            let run_id=Uuid::new_v4().simple().to_string();
+            let changed=sqlx::query("UPDATE tasks SET runtime_origin='youtube_auto',origin_kind='youtube_task_restart',
+                origin_run_id=$2,created_by=$3 WHERE id=$1 AND source_type::text='youtube'
+                AND source_url IS NOT NULL AND stopped_status IS NULL")
+                .bind(task_id).bind(&run_id).bind(format!("youtube_task_restart;auto_publish=;run_id={run_id}"))
+                .execute(&mut *tx).await?.rows_affected();
+            if changed!=1{return Err(AppError::Conflict("automatic restart needs an unstopped YouTube source".into()))}
+        }
         sqlx::query(
             "INSERT INTO vr2_workflows(id,task_id,generation,state,current_stage,configuration) VALUES($1,$2,$3,'running','download',$4)"
         ).bind(workflow_id).bind(task_id).bind(generation).bind(configuration)
@@ -585,6 +599,7 @@ impl Scheduler {
         {
             if let Some(base) = configuration.as_object_mut() {
                 for key in [
+                    "legacy_auto_runtime_profile",
                     "subtitle",
                     "render",
                     "selective_retranslate",

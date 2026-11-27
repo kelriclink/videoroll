@@ -86,7 +86,8 @@ with psycopg.connect(db_url) as db:
     assert task[3]==body["proof_url"],task
     flows=db.execute("SELECT count(*) FROM vr2_workflows WHERE task_id=%s",(created["task_id"],)).fetchone()[0]
     assert flows==1
-print("PASS: Python hash matches Rust canonical JSON; original durable reservation, Task and workflow created once")
+    assert db.execute("SELECT configuration FROM vr2_workflows WHERE task_id=%s",(created["task_id"],)).fetchone()[0]=={"legacy_auto_runtime_profile":True}
+print("PASS: Python hash matches Rust canonical JSON; original durable reservation, Task and workflow created once; remote runtime policy not frozen")
 
 code,replay=call(body=body,token=remote_token,key="remote-key-01")
 assert code==200 and replay==created

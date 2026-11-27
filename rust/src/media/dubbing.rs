@@ -16,33 +16,23 @@ use tokio::{fs, process::Command};
 use uuid::Uuid;
 
 pub async fn auto_enabled(db: &Database, job: &WorkItem) -> AppResult<bool> {
-    let setting: Option<Value> =
-        Some(crate::settings::effective(db, "subtitle.auto_profile").await?);
-    let mut enabled = setting
-        .as_ref()
-        .and_then(|v| v.get("auto_dub_p2"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
+    let setting = crate::settings::effective(db,"subtitle.auto_profile").await?;
     let settings: Option<Value> =
         sqlx::query_scalar("SELECT configuration FROM vr2_workflows WHERE id=$1")
             .bind(job.workflow_id)
             .fetch_optional(&db.pool)
             .await?;
-    if let Some(value) = settings
-        .as_ref()
-        .and_then(|v| v.get("auto_dub_p2"))
-        .and_then(Value::as_bool)
-    {
-        enabled = value;
+    dubbing_enabled(&setting,&settings.unwrap_or_else(||json!({})))
+}
+
+fn dubbing_enabled(profile:&Value,overrides:&Value)->AppResult<bool>{
+    // Manual/explicit settings (including historical adoption fences) win.
+    if let Some(value)=overrides.pointer("/dubbing/enabled").and_then(Value::as_bool){
+        return Ok(value)
     }
-    if let Some(value) = settings
-        .as_ref()
-        .and_then(|v| v.pointer("/dubbing/enabled"))
-        .and_then(Value::as_bool)
-    {
-        enabled = value;
-    }
-    Ok(enabled)
+    if let Some(value)=overrides["auto_dub_p2"].as_bool(){return Ok(value)}
+    // Auto dubbing is an independent media stage, not a publish option.
+    Ok(profile["auto_dub_p2"].as_bool()==Some(true))
 }
 fn ensure_isolated_runtime(path: &Path) -> AppResult<()> {
     if !path.is_absolute() {
@@ -758,6 +748,20 @@ pub async fn process(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn auto_dubbing_does_not_depend_on_publish_policy(){
+        for publish in [false,true]{
+            for platforms in [json!([]),json!(["douyin"]),json!(["bilibili"])]{
+                for enabled in [false,true]{
+                    let profile=json!({"auto_publish":publish,"auto_publish_platforms":platforms,"auto_dub_p2":enabled});
+                    assert_eq!(dubbing_enabled(&profile,&json!({"legacy_auto_runtime_profile":true})).unwrap(),enabled);
+                    assert_eq!(dubbing_enabled(&profile,&json!({})).unwrap(),enabled);
+                    assert!(!dubbing_enabled(&profile,&json!({"auto_dub_p2":false})).unwrap());
+                    assert!(dubbing_enabled(&profile,&json!({"auto_dub_p2":false,"dubbing":{"enabled":true}})).unwrap());
+                }
+            }
+        }
+    }
     #[test]
     fn progress_matches_native_stage_and_is_bounded() {
         let (phase, progress) = native_progress(

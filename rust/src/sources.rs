@@ -413,7 +413,8 @@ pub async fn scan_claimed(
             }
             let url = format!("https://www.youtube.com/watch?v={}", entry.id);
             let (task, workflow, duplicate) = scheduler
-                .create_youtube_source_task(&url, &license, 0, json!({}), auto_process)
+                .create_youtube_source_task(&url, &license, 0,
+                    if auto_process{json!({"legacy_auto_runtime_profile":true})}else{json!({})},auto_process)
                 .await?;
             if duplicate {
                 // Another scanner (including V1) won the unique source race.

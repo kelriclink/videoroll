@@ -62,3 +62,9 @@ SAU 代码检查：当前原生领取仍采用全局单投稿互斥；账户导�
 - 恢复已暂停的原生代次，不新建 job；FAILED 仍有当前可逆阶段时恢复真实 checkpoint（download=CREATED/subtitle=DOWNLOADED/render=SUBTITLE_READY/dubbing=RENDERED），避免远程渲染排斥 FAILED。无活动原生工作流且所有历史账本已平静则直接恢复保存状态，即使存在终态历史工作流。只恢复状态，不自动重启旧 Hatchet/queued subtitle；未决历史作业继续保持暂停，需显式核实，不声称实际停止外部 Python 进程。现有暂停资源保护不改变。
 - 限制：批量最多 1000，事务持有多个 Task 行锁及原账本表锁，繁忙时 409 需重试；不保证立即停止已经运行的外部程序；错误原因仅服务日志，原 API 仍只有计数；旧自动 YouTube 无活动原生工作流的重新入队、动态配置仍待后续。测试只用隔离数据库，不部署。
 - 专项 VIDEOROLL_V2_TEST_TASK_CONTROLS_ONLY=true；还需既有远程渲染暂停回归。
+
+## 第三十四批：自动配置按执行阶段读取，配音独立于投稿
+
+基线 6238f40。对照 Python youtube_service.py:240-307、video_pipeline.py、publishing_service.py:692-735。V1 自动入口与 Remote API 的旧 auto_publish 参数仅保留 wire/hash 契约，不再冻结 false 或 B站；首页及频道自动扫描、明确的旧版自动启动使用 legacy_auto_runtime_profile 标记，ASR 模型与渲染默认按当前 profile；直接 V2 请求及手动参数不变。授权 proof 与新 Task/工作流同事务。已有工作流不改写；历史恢复明确禁用自动投稿/配音的围栏保留。
+
+用户纠正原 Python 设计：自动配音只看 auto_dub_p2，不依赖 auto_publish 或 B站目标。保持 Rust 原语义，统一旧 auto_dubbing 接口与任务详情显示、设置文字；允许原 profile PUT 单独更新 auto_dub_p2 和前缀。手动 dubbing.enabled 优先，保留无语音、暂停、成果复用等原条件。配音成果仍可用于后续 B站双 P，不强制投稿。未开放其他尚未完整验收的 profile 字段，旧前端全表单保存仍需后续适配；旧运行中的冻结配置不批量改写。测试只用隔离库与实际阶段配置读取，无真实平台或 GPU 执行。

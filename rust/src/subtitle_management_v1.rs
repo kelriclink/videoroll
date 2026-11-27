@@ -152,6 +152,8 @@ fn supported_update(key: &str) -> bool {
             | "publish_translate_title"
             | "publish_enable_reprint"
             | "publish_title_prefix"
+            | "auto_dub_p2"
+            | "auto_dub_p2_prefix"
     )
 }
 fn validate_update(update: &Map<String, Value>) -> AppResult<()> {
@@ -169,11 +171,12 @@ fn validate_update(update: &Map<String, Value>) -> AppResult<()> {
             | "bilingual"
             | "publish_translate_title"
             | "publish_enable_reprint"
+            | "auto_dub_p2"
                 if !value.is_boolean() =>
             {
                 return Err(AppError::Invalid(format!("{key} requires bool")));
             }
-            "publish_title_prefix"
+            "publish_title_prefix" | "auto_dub_p2_prefix"
                 if value
                     .as_str()
                     .is_none_or(|s| s.chars().count() > 40 || s.chars().any(char::is_control)) =>
@@ -555,6 +558,52 @@ pub fn router() -> Router<AppState> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn legacy_auto_runtime_profile_real_postgres(){
+        use crate::{Database,Config,domain::{Stage,WorkItem},media::{asr,dubbing,ffmpeg}};
+        let Ok(url)=std::env::var("VIDEOROLL_TEST_AUTO_RUNTIME_PROFILE_DB_URL")else{return};
+        let parsed=reqwest::Url::parse(&url).unwrap();
+        assert_eq!(parsed.host_str(),Some("127.0.0.1"));
+        assert_eq!(parsed.path(),"/videoroll_test");
+        let db=Database::connect(&url).await.unwrap();
+        let (task,flow,id):(Uuid,Uuid,Uuid)=sqlx::query_as("SELECT t.id,w.id,j.id FROM tasks t JOIN vr2_workflows w ON w.task_id=t.id JOIN vr2_jobs j ON j.workflow_id=w.id WHERE t.source_url='https://www.youtube.com/watch?v=AutoCfg0001' AND j.stage='download'")
+            .fetch_one(&db.pool).await.unwrap();
+        let item=WorkItem{id,workflow_id:flow,task_id:task,stage:Stage::Publish,generation:1,
+            operation_key:format!("fixture:{id}"),lease_token:Uuid::new_v4(),attempts:1,max_attempts:3,payload:json!({})};
+        let mut config=Config::from_env().unwrap();
+        config.asr_endpoint=Some("http://127.0.0.1:18089/mock-asr".into());
+        sqlx::query("DELETE FROM app_settings WHERE key='subtitle.asr'").execute(&db.pool).await.unwrap();
+        async fn saved(db:&Database,p:Value){
+            sqlx::query("INSERT INTO app_settings(key,value_json) VALUES('subtitle.auto_profile',$1) ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json")
+                .bind(p).execute(&db.pool).await.unwrap();
+        }
+        let original:Value=sqlx::query_scalar("SELECT configuration FROM vr2_workflows WHERE id=$1").bind(flow).fetch_one(&db.pool).await.unwrap();
+        saved(&db,json!({"auto_publish":false,"auto_publish_platforms":[],"auto_dub_p2":true,"asr_engine":"auto","asr_model":"fixture-one","video_codec":"h264","burn_in":false})).await;
+        let choice=crate::publish_legacy::read_selection(&db,&item).await.unwrap();
+        assert!(!choice.enabled && choice.platforms.is_empty());
+        assert!(dubbing::auto_enabled(&db,&item).await.unwrap());
+        assert_eq!(asr::runtime_asr_config(&config,&db,&item).await.unwrap().unwrap().asr_model,"fixture-one");
+        let p=ffmpeg::profile(&db,&item).await.unwrap();assert_eq!(p.video_codec,"h264");assert!(!p.burn_in);
+        saved(&db,json!({"auto_publish":true,"auto_publish_platforms":["douyin","kuaishou"],"auto_dub_p2":true,"asr_engine":"auto","asr_model":"fixture-two","video_codec":"av1","burn_in":true})).await;
+        let choice=crate::publish_legacy::read_selection(&db,&item).await.unwrap();
+        assert!(choice.enabled && choice.platforms==["douyin","kuaishou"]);
+        assert!(dubbing::auto_enabled(&db,&item).await.unwrap());
+        assert_eq!(asr::runtime_asr_config(&config,&db,&item).await.unwrap().unwrap().asr_model,"fixture-two");
+        assert_eq!(ffmpeg::profile(&db,&item).await.unwrap().video_codec,"av1");
+        saved(&db,json!({"auto_publish":true,"auto_publish_platforms":["bilibili"],"auto_dub_p2":false})).await;
+        assert!(!dubbing::auto_enabled(&db,&item).await.unwrap());
+        let current:Value=sqlx::query_scalar("SELECT configuration FROM vr2_workflows WHERE id=$1").bind(flow).fetch_one(&db.pool).await.unwrap();
+        assert_eq!(current,original);
+        saved(&db,json!({"auto_publish":true,"auto_publish_platforms":["bilibili"],"auto_dub_p2":true})).await;
+        sqlx::query("UPDATE vr2_workflows SET configuration=$2 WHERE id=$1").bind(flow).bind(json!({"legacy_auto_runtime_profile":true,
+            "auto_publish":false,"auto_publish_platforms":[],"auto_dub_p2":false,
+            "subtitle":{"asr_engine":"auto","asr_model":"explicit-model"},"render":{"video_codec":"h264"}})).execute(&db.pool).await.unwrap();
+        assert!(!crate::publish_legacy::read_selection(&db,&item).await.unwrap().enabled);
+        assert!(!dubbing::auto_enabled(&db,&item).await.unwrap());
+        assert_eq!(asr::runtime_asr_config(&config,&db,&item).await.unwrap().unwrap().asr_model,"explicit-model");
+        assert_eq!(ffmpeg::profile(&db,&item).await.unwrap().video_codec,"h264");
+        sqlx::query("UPDATE vr2_workflows SET configuration=$2 WHERE id=$1").bind(flow).bind(original).execute(&db.pool).await.unwrap();
+    }
     #[test]
     fn defaults_and_native_scope() {
         let view = normalized_profile(&json!({}));
@@ -562,5 +611,7 @@ mod tests {
         assert_eq!(view["auto_publish_platforms"], json!([]));
         assert!(validate_update(json!({"auto_publish":true}).as_object().unwrap()).is_err());
         assert!(validate_update(json!({"translate_enabled":false}).as_object().unwrap()).is_ok());
+        assert!(validate_update(json!({"auto_dub_p2":true,"auto_dub_p2_prefix":"【中配】"}).as_object().unwrap()).is_ok());
+        assert!(validate_update(json!({"auto_dub_p2":"true"}).as_object().unwrap()).is_err());
     }
 }

@@ -71,7 +71,9 @@ struct IngestYouTube {
     #[serde(default = "default_authorized")]
     license: String,
     proof_url: Option<String>,
-    auto_publish: Option<bool>,
+    // Retained for V1 wire compatibility; the saved profile is authoritative.
+    #[serde(rename="auto_publish")]
+    _auto_publish: Option<bool>,
 }
 fn default_authorized() -> String {
     "authorized".into()
@@ -235,22 +237,15 @@ async fn auto_youtube(
         return Err(AppError::Invalid("invalid YouTube license".into()));
     }
     let proof = verify_proof(req.proof_url.as_deref())?;
-    let config = json!({"auto_publish":req.auto_publish.unwrap_or(false),
-        "auto_publish_platforms":if req.auto_publish==Some(true) {vec!["bilibili"]}else{vec![]}});
+    let config = json!({"legacy_auto_runtime_profile":true});
     let (task, flow, deduped) = state
         .scheduler
-        .create_auto_youtube(&req.url, &req.license, 0, config)
+        .create_auto_youtube_with_proof(&req.url, &req.license, 0, config, proof.as_deref())
         .await?;
     if deduped {
         read_task(&state.db, task.id).await.map_err(|_| {
             AppError::Conflict("YouTube video belongs to the original V1 workflow".into())
         })?;
-    } else if proof.is_some() {
-        sqlx::query("UPDATE tasks SET source_proof_url=$1 WHERE id=$2")
-            .bind(proof)
-            .bind(task.id)
-            .execute(&state.db.pool)
-            .await?;
     }
     Ok((
         if deduped {
@@ -278,8 +273,7 @@ async fn start_existing_youtube(
         .scheduler
         .start(
             id,
-            json!({"auto_publish":false,
-        "auto_publish_platforms":[]}),
+            json!({"legacy_auto_runtime_profile":true}),
         )
         .await?;
     Ok(Json(

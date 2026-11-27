@@ -29,7 +29,7 @@ export function useTaskDetailController(taskId: string | undefined) {
     };
     void refreshDubbing();
     void subtitleApi.autoProfile().then((profile) => {
-      if (active) setAutoDubP2Enabled(Boolean(profile.auto_publish && profile.auto_dub_p2));
+      if (active) setAutoDubP2Enabled(Boolean(profile.auto_dub_p2));
     }).catch(() => {});
     const interval = window.setInterval(() => void refreshDubbing(), 5000);
     return () => { active = false; window.clearInterval(interval); };

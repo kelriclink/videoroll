@@ -231,12 +231,8 @@ async fn auto_dubbing(
 ) -> AppResult<Json<Value>> {
     let task = read_task(&state.db, task_id).await?;
     let profile = crate::settings::effective(&state.db, "subtitle.auto_profile").await?;
-    let enabled = profile.get("auto_publish").and_then(Value::as_bool) == Some(true)
-        && profile.get("auto_dub_p2").and_then(Value::as_bool) == Some(true)
-        && profile
-            .get("auto_publish_platforms")
-            .and_then(Value::as_array)
-            .is_some_and(|v| v.iter().any(|p| p.as_str() == Some("bilibili")));
+    // Dubbing is independent of automatic publication and platform targets.
+    let enabled = profile.get("auto_dub_p2").and_then(Value::as_bool) == Some(true);
     if !enabled {
         return Ok(Json(
             json!({"status":"skipped","detail":"automatic P2 is disabled","dubbing_job_id":null}),

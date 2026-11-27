@@ -815,7 +815,7 @@ export default function SettingsAutoPage() {
           <div className="mt-4 rounded border border-sky-200 bg-sky-50 p-3 text-sm space-y-3">
             <label className="flex items-center gap-2">
               <input type="checkbox" checked={autoDubP2} onChange={(e) => setAutoDubP2(e.target.checked)} />
-              将 YouDub 配音加入自动处理流程，P1+P2 一次投稿到 B站
+              将 YouDub 中文配音加入自动处理流程（独立于自动投稿）
             </label>
             <label className="block">
               <span className="mb-1 block text-xs text-slate-600">配音 P2 标题前缀（仅改变 P2 分 P 标题）</span>
@@ -824,8 +824,9 @@ export default function SettingsAutoPage() {
                 disabled={!autoDubP2} maxLength={30} />
             </label>
             <p className="text-xs text-slate-600">
-              仅作用于自动模式的 B站投稿，默认关闭。开启后稿件总标题使用【熟肉&中配】前缀；
-              P1/P2 分 P 标题保留各自的前缀，封面和简介不变。先完成渲染与配音，再一次投稿双分 P；配音失败则暂停，不提前投稿 P1。
+              默认关闭。开启后自动处理会生成中文配音，关闭自动投稿或不选择 B站也不影响配音。
+              若随后自动投稿到 B站，P1/P2 可一次投稿双分 P，稿件总标题使用【熟肉&中配】前缀；
+              分 P 标题保留各自前缀。配音失败则暂停，不提前投稿 P1。
             </p>
           </div>
           <div className="mt-2 text-xs text-slate-500">
