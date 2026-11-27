@@ -35,8 +35,10 @@ export function RealtimeProvider({ children }: PropsWithChildren) {
     socket.send(JSON.stringify({ op: "set_subscriptions", topics: Array.from(topics).sort() }));
   }, []);
 
-  const notifyResync = useCallback(() => {
-    for (const subscription of subscriptionsRef.current.values()) subscription.onResync?.();
+  const notifyResync = useCallback((topics?: string[]) => {
+    for (const subscription of subscriptionsRef.current.values()) {
+      if (!topics || intersects(subscription.topics, topics)) subscription.onResync?.();
+    }
   }, []);
 
   useEffect(() => {
@@ -70,6 +72,8 @@ export function RealtimeProvider({ children }: PropsWithChildren) {
           reconnectAttemptRef.current = 0;
           setStatus("connected");
           sendSubscriptions();
+          // Older servers do not send a post-subscribe snapshot. Keep the
+          // reconnect fallback for compatibility.
           if (reconnecting) notifyResync();
           return;
         }
@@ -78,7 +82,7 @@ export function RealtimeProvider({ children }: PropsWithChildren) {
           return;
         }
         if (record.type === "resync_required") {
-          notifyResync();
+          notifyResync(Array.isArray(record.topics) ? record.topics.filter((topic): topic is string => typeof topic === "string") : undefined);
           return;
         }
         if (record.type !== "event" || !Array.isArray(record.topics) || typeof record.name !== "string") return;
