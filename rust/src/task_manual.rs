@@ -755,6 +755,18 @@ async fn retry_dubbing(
     Path((id, job_id)): Path<(Uuid, Uuid)>,
 ) -> AppResult<Json<ManualJobResponse>> {
     read_task(&state.db, id).await?;
+    if let Some(flow) =
+        crate::media::dubbing_handoff::retry_render_only(&state.db, &state.storage, id, job_id)
+            .await?
+    {
+        return response(
+            &state,
+            state.scheduler.workflow(flow).await?,
+            Stage::Dubbing,
+        )
+        .await;
+    }
+
     let prior = sqlx::query(
         "SELECT j.state,w.id AS workflow_id FROM vr2_jobs j
          JOIN vr2_workflows w ON w.id=j.workflow_id

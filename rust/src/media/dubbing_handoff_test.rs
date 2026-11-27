@@ -169,7 +169,72 @@ async fn audio_only_real_postgres_http() {
             .len(),
         4
     );
-    let fence = claimed["execution"]["fence_token"].as_str().unwrap();
+    let old_fence = claimed["execution"]["fence_token"].as_str().unwrap();
+    let failed = client
+        .post(format!(
+            "{base}/render-workers/v1/executions/{execution}/fail"
+        ))
+        .bearer_auth(&token)
+        .json(
+            &json!({"fence_token":old_fence,"error":"fixture renderer failure","retryable":false}),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert!(failed.status().is_success(), "{:?}", failed.text().await);
+    assert_eq!(scheduler.workflow(flow).await.unwrap().state, "failed");
+    let mixed_key = claimed["render_spec"]["request"]["audio_key"]
+        .as_str()
+        .unwrap();
+    let mixed_path = store.resolve_existing(mixed_key).await.unwrap();
+    let saved = fs::read(&mixed_path).await.unwrap();
+    fs::write(&mixed_path, b"corrupted audio").await.unwrap();
+    assert!(retry_render_only(&db, &store, task, job_id).await.is_err());
+    fs::write(&mixed_path, &saved).await.unwrap();
+    // Destroy the isolated model runtime. Recovery MUST use registered audio
+    // and cannot invoke or resume the original inference process.
+    fs::remove_dir_all(config.youdub_runtime.as_ref().unwrap())
+        .await
+        .unwrap();
+    let (one, two) = tokio::join!(
+        retry_render_only(&db, &store, task, job_id),
+        retry_render_only(&db, &store, task, job_id)
+    );
+    assert_eq!(one.unwrap(), Some(flow));
+    assert_eq!(two.unwrap(), Some(flow));
+    assert_eq!(sqlx::query_scalar::<_,i64>("SELECT count(*) FROM workflow_events WHERE workflow_id=$1 AND kind='render.p2_requeued'").bind(flow).fetch_one(&db.pool).await.unwrap(),1);
+    assert_eq!(
+        scheduler.workflow(flow).await.unwrap().configuration["auto_publish"],
+        false
+    );
+    let retried: Value = claim()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(retried["execution"]["id"], ticket);
+    assert_eq!(retried["execution"]["attempt"], 1);
+    assert_eq!(retried["render_spec"], claimed["render_spec"]);
+    assert_ne!(retried["execution"]["fence_token"], old_fence);
+    let stale = client
+        .post(format!(
+            "{base}/render-workers/v1/executions/{execution}/fail"
+        ))
+        .bearer_auth(&token)
+        .json(&json!({"fence_token":old_fence,"error":"stale failure","retryable":false}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(stale.status().as_u16(), 409);
+    assert!(!config.youdub_runtime.as_ref().unwrap().exists());
+    let fence = retried["execution"]["fence_token"].as_str().unwrap();
+    println!(
+        "PASS failed P2 manual retry reuses frozen audio after removing mock runtime, corrupt input rejected, concurrent retry single event, stale fence rejected"
+    );
+
     // Actual audio and subtitle transfer.
     let get = |role: &str| {
         client

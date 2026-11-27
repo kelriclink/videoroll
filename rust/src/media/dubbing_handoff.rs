@@ -221,3 +221,158 @@ pub(crate) async fn enqueue(
 #[cfg(test)]
 #[path = "dubbing_handoff_test.rs"]
 mod tests;
+
+/// Explicit manual retry of the video stage only. If a P2 intent exists but
+/// its evidence is incomplete, reject instead of falling back to synthesis.
+pub(crate) async fn retry_render_only(
+    db: &Database,
+    store: &AssetRegistry,
+    task: Uuid,
+    job: Uuid,
+) -> AppResult<Option<Uuid>> {
+    let row=sqlx::query("SELECT id,workflow_id,render_spec FROM render_executions WHERE runtime_engine='rust-v2' AND mode='dub_burn_in' AND job_id=$1 AND task_id=$2")
+        .bind(job).bind(task).fetch_optional(&db.pool).await?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let execution: Uuid = row.try_get("id")?;
+    let flow: Uuid = row.try_get("workflow_id")?;
+    let spec: Value = row.try_get("render_spec")?;
+    let request = &spec["request"];
+    let invalid =
+        || AppError::Conflict("P2 retry requires intact original audio handoff evidence".into());
+    if spec["mode"] != MODE
+        || spec["task_id"] != json!(task)
+        || spec["render_job_id"] != json!(job)
+        || request["dubbing_model_job_id"]
+            .as_str()
+            .and_then(|s| Uuid::parse_str(s).ok())
+            .is_none()
+    {
+        return Err(invalid());
+    }
+    let mut proofs = Vec::new();
+    let artifacts = spec["artifacts"].as_array().ok_or_else(invalid)?;
+    if artifacts.len() != 4 {
+        return Err(invalid());
+    }
+    let prefix = format!("v2/dubbing/{task}/{job}/");
+    for (role, field, ref_role) in [
+        ("input", "input_key", "input"),
+        ("audio", "audio_key", "dubbing_audio"),
+        ("ass", "ass_key", "dubbing_ass"),
+        ("srt", "srt_key", "dubbing_aligned_srt"),
+    ] {
+        let key = request[field].as_str().ok_or_else(invalid)?;
+        if role != "input" && !key.starts_with(&prefix) {
+            return Err(invalid());
+        }
+        let a = artifacts
+            .iter()
+            .find(|a| a["role"] == role && a["storage_key"] == key)
+            .ok_or_else(invalid)?;
+        let sha = a["sha256"].as_str().ok_or_else(invalid)?;
+        let size = a["size_bytes"]
+            .as_i64()
+            .filter(|s| *s > 0)
+            .ok_or_else(invalid)?;
+        let actual = store.sha256(key).await?;
+        if actual != (sha.to_owned(), size) {
+            return Err(invalid());
+        }
+        proofs.push((key.to_owned(), actual, ref_role));
+    }
+    for (key_field, sha_field, role) in [
+        ("voice_key", "voice_sha256", "dubbing_audio"),
+        (
+            "dubbing_source_srt_key",
+            "dubbing_source_srt_sha256",
+            "source_srt",
+        ),
+    ] {
+        let key = request[key_field].as_str().ok_or_else(invalid)?;
+        let sha = request[sha_field].as_str().ok_or_else(invalid)?;
+        if key_field == "voice_key" && !key.starts_with(&prefix) {
+            return Err(invalid());
+        }
+        let actual = store.sha256(key).await?;
+        if actual.0 != sha || actual.1 <= 0 {
+            return Err(invalid());
+        }
+        proofs.push((key.to_owned(), actual, role));
+    }
+    // Consistent lock order with settlement, cleanup and claim controls.
+    let mut tx = db.pool.begin().await?;
+    let parent = sqlx::query(
+        "SELECT runtime_owner,status::text AS status,error_code FROM tasks WHERE id=$1 FOR UPDATE",
+    )
+    .bind(task)
+    .fetch_one(&mut *tx)
+    .await?;
+    let latest=sqlx::query("SELECT id,state,current_stage FROM vr2_workflows WHERE task_id=$1 ORDER BY generation DESC LIMIT 1 FOR UPDATE").bind(task).fetch_one(&mut *tx).await?;
+    let j=sqlx::query("SELECT state,external_ticket FROM vr2_jobs WHERE id=$1 AND workflow_id=$2 AND task_id=$3 AND stage='dubbing' FOR UPDATE").bind(job).bind(flow).bind(task).fetch_optional(&mut *tx).await?.ok_or_else(invalid)?;
+    let e=sqlx::query("SELECT state,render_spec,uploaded_asset_id,COALESCE(lease_until>now(),false) AS live FROM render_executions WHERE id=$1 AND job_id=$2 AND task_id=$3 AND workflow_id=$4 AND runtime_engine='rust-v2' AND mode='dub_burn_in' FOR UPDATE").bind(execution).bind(job).bind(task).bind(flow).fetch_optional(&mut *tx).await?.ok_or_else(invalid)?;
+    if parent.try_get::<String, _>("runtime_owner")? != "rust"
+        || latest.try_get::<Uuid, _>("id")? != flow
+        || latest.try_get::<String, _>("current_stage")? != "dubbing"
+        || j.try_get::<Option<String>, _>("external_ticket")?
+            .as_deref()
+            != Some(execution.to_string().as_str())
+        || e.try_get::<Value, _>("render_spec")? != spec
+    {
+        return Err(invalid());
+    }
+    let state: String = e.try_get("state")?;
+    let flow_state: String = latest.try_get("state")?;
+    let job_state: String = j.try_get("state")?;
+    if flow_state == "running"
+        && job_state == "awaiting"
+        && matches!(state.as_str(), "queued" | "running" | "uploading")
+    {
+        tx.commit().await?;
+        return Ok(Some(flow));
+    }
+    if parent.try_get::<String, _>("status")? != "failed"
+        || parent
+            .try_get::<Option<String>, _>("error_code")?
+            .as_deref()
+            != Some("V2_REMOTE_RENDER_FAILED")
+        || flow_state != "failed"
+        || job_state != "failed"
+        || state != "failed"
+        || e.try_get::<bool, _>("live")?
+        || e.try_get::<Option<Uuid>, _>("uploaded_asset_id")?.is_some()
+    {
+        return Err(AppError::Conflict(
+            "P2 retry requires failed render without committed output or live lease".into(),
+        ));
+    }
+    let publication:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM publish_jobs WHERE task_id=$1 AND (state::text IN ('submitting','submitted','published','unknown') OR external_id IS NOT NULL OR external_url IS NOT NULL)) OR EXISTS(SELECT 1 FROM vr2_jobs WHERE task_id=$1 AND stage='publish' AND (state IN ('pending','running','awaiting','unknown') OR (state='succeeded' AND COALESCE(result->>'skipped','')='')))").bind(task).fetch_one(&mut *tx).await?;
+    if publication {
+        return Err(AppError::Conflict(
+            "publication evidence blocks P2 retry".into(),
+        ));
+    }
+    let raw:Option<String>=sqlx::query_scalar("SELECT storage_key FROM assets WHERE task_id=$1 AND kind::text='video_raw' ORDER BY created_at DESC,id DESC LIMIT 1").bind(task).fetch_optional(&mut *tx).await?;
+    let srt:Option<String>=sqlx::query_scalar("SELECT storage_key FROM assets WHERE task_id=$1 AND kind::text='subtitle_srt' ORDER BY created_at DESC,id DESC LIMIT 1").bind(task).fetch_optional(&mut *tx).await?;
+    if raw.as_deref() != request["input_key"].as_str()
+        || srt.as_deref() != request["dubbing_source_srt_key"].as_str()
+    {
+        return Err(invalid());
+    }
+    for (key, (sha, size), role) in proofs {
+        let valid:Option<String>=sqlx::query_scalar("SELECT o.storage_key FROM storage_objects o WHERE o.storage_key=$1 AND o.state='live' AND o.checksum_sha256=$2 AND o.size_bytes=$3 AND EXISTS(SELECT 1 FROM storage_object_refs r WHERE r.storage_key=o.storage_key AND r.owner_type='workflow' AND r.owner_id=$4 AND r.role=$5) FOR UPDATE OF o").bind(&key).bind(&sha).bind(size).bind(flow).bind(role).fetch_optional(&mut *tx).await?;
+        if valid.is_none() {
+            return Err(invalid());
+        }
+        sqlx::query("UPDATE storage_objects SET retain_until=GREATEST(retain_until,now()+interval '2 days') WHERE storage_key=$1").bind(key).execute(&mut *tx).await?;
+    }
+    // Original manual retry does not silently grant permission to publish.
+    sqlx::query("UPDATE vr2_workflows SET state='running',last_error=NULL,configuration=(configuration-'after_render_publish'-'after_render_input')||jsonb_build_object('auto_publish',false,'auto_publish_platforms','[]'::jsonb),updated_at=now() WHERE id=$1").bind(flow).execute(&mut *tx).await?;
+    sqlx::query("UPDATE vr2_jobs SET state='awaiting',last_error=NULL,lease_token=NULL,lease_until=NULL,finished_at=NULL,updated_at=now() WHERE id=$1").bind(job).execute(&mut *tx).await?;
+    sqlx::query("UPDATE render_executions SET state='queued',attempt=0,worker_id=NULL,fence_token=NULL,lease_until=NULL,progress=0,metrics='{}',output_json='{}',error_message=NULL,log_tail=NULL,started_at=now(),finished_at=NULL,heartbeat_at=NULL,updated_at=now() WHERE id=$1").bind(execution).execute(&mut *tx).await?;
+    sqlx::query("UPDATE tasks SET status='rendered'::task_status,error_code=NULL,error_message=NULL,updated_at=now() WHERE id=$1").bind(task).execute(&mut *tx).await?;
+    sqlx::query("INSERT INTO workflow_events(id,workflow_id,job_id,kind,details) VALUES($1,$2,$3,'render.p2_requeued',$4)").bind(Uuid::new_v4()).bind(flow).bind(job).bind(json!({"execution_id":execution,"reuse_audio":true})).execute(&mut *tx).await?;
+    tx.commit().await?;
+    Ok(Some(flow))
+}
