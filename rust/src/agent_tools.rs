@@ -124,6 +124,8 @@ pub(super) async fn page_text(
         Duration::from_secs(300),
         4,
         || async {
+            provider_cache::reserve_http(db, task.job, RetrievalKind::PageText, PAGE_BUDGET)
+                .await?;
             let body = crate::egress_gateway_v1::research_page_text(&hit.url).await?;
             Ok(body
                 .map(|snippet| WebEvidence {
@@ -280,6 +282,13 @@ impl RetrievalQuery {
                     .user_agent("VideoRoll-Rust/0.1 (https://github.com/kelriclink/videoroll)")
                     .build()?;
                 let body = provider_cache::retry_read(db, task.job, || async {
+                    provider_cache::reserve_http(
+                        db,
+                        task.job,
+                        RetrievalKind::Wikipedia,
+                        WIKI_BUDGET,
+                    )
+                    .await?;
                     let response = client
                         .get(url.clone())
                         .header("Accept", "application/json")

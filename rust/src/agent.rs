@@ -98,6 +98,13 @@ async fn search_web(
         4,
         || async {
             let bytes = provider_cache::retry_read(db, job, || async {
+                provider_cache::reserve_http(
+                    db,
+                    job,
+                    RetrievalKind::Web,
+                    settings.max_web_searches,
+                )
+                .await?;
                 let mut request = http.get(url.clone()).timeout(Duration::from_secs(12));
                 if let Some(token) = settings.web_search_api_key.as_ref() {
                     request = request.bearer_auth(token);

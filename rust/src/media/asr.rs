@@ -517,6 +517,140 @@ fn join_external_words(words: &[ExternalWhisperWord]) -> String {
         .trim()
         .to_owned()
 }
+// Python semantic ASR clauses: prefer punctuation and acoustic gaps,
+// then soft pressure; retain original word timestamps, never invent cuts.
+fn semantic_word_chunks(
+    words: Vec<ExternalWhisperWord>,
+    hard: f64,
+    max_chars: usize,
+) -> Vec<Vec<ExternalWhisperWord>> {
+    fn duration(w: &[ExternalWhisperWord]) -> f64 {
+        w.last()
+            .map(|_| w.iter().map(|v| v.end).fold(0., f64::max) - w[0].start)
+            .unwrap_or(0.)
+    }
+    fn fits(w: &[ExternalWhisperWord], hard: f64, max_chars: usize) -> bool {
+        duration(w) <= hard && w.len() <= 24 && join_external_words(w).chars().count() <= max_chars
+    }
+    fn best(w: &[ExternalWhisperWord], hard: f64, max_chars: usize, minimum: f64) -> Option<usize> {
+        let mut best: Option<(f64, usize)> = None;
+        for i in 1..w.len() {
+            let left = &w[..i];
+            let d = duration(left);
+            if !fits(left, hard, max_chars) || (d < 0.8 && i < 3) {
+                continue;
+            }
+            let t = join_external_words(left);
+            let gap = (w[i].start - left.last().unwrap().end).max(0.);
+            let mut score = if terminal_asr_punctuation(&t) {
+                100.
+            } else if t
+                .trim_end()
+                .ends_with([',', '，', ';', '；', ':', '：', '、'])
+            {
+                34.
+            } else {
+                0.
+            };
+            score += if gap >= 1.2 {
+                90.
+            } else if gap >= 0.7 {
+                72.
+            } else if gap >= 0.45 {
+                38.
+            } else {
+                0.
+            };
+            score += if (1.5..=7.).contains(&d) {
+                12.
+            } else if d < 0.8 {
+                -60.
+            } else {
+                0.
+            };
+            if w.len() - i == 1 {
+                score -= 18.;
+            }
+            if score >= minimum && best.is_none_or(|(b, _)| score >= b) {
+                best = Some((score, i));
+            }
+        }
+        best.map(|(_, i)| i)
+    }
+    let mut chunks = Vec::new();
+    let mut current: Vec<ExternalWhisperWord> = Vec::new();
+    for word in words {
+        if !current.is_empty() {
+            let gap = word.start - current.last().unwrap().end;
+            if gap >= 0.7 && (duration(&current) >= 0.8 || current.len() >= 2) {
+                chunks.push(std::mem::take(&mut current));
+            }
+        }
+        current.push(word);
+        // Check hard limits before sentence punctuation; never emit an
+        // oversized clause just because its final word is punctuation.
+        while current.len() > 1 && !fits(&current, hard, max_chars) {
+            let split =
+                best(&current, hard, max_chars, f64::NEG_INFINITY).unwrap_or(current.len() - 1);
+            let remainder = current.split_off(split);
+            chunks.push(std::mem::replace(&mut current, remainder));
+        }
+        let text = join_external_words(&current);
+        let d = duration(&current);
+        if terminal_asr_punctuation(&text) && (d >= 0.8 || current.len() >= 2) {
+            chunks.push(std::mem::take(&mut current));
+            continue;
+        }
+        if current.len() >= 3
+            && (d >= hard.min(8.)
+                || current.len() >= 16
+                || text.chars().count() >= max_chars * 3 / 4
+                || (d >= 3.
+                    && text.chars().filter(|c| !c.is_whitespace()).count() as f64 / d >= 20.))
+        {
+            if let Some(i) = best(&current, hard, max_chars, 30.) {
+                let rest = current.split_off(i);
+                chunks.push(std::mem::replace(&mut current, rest));
+            }
+        }
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    let mut i = 0;
+    while i < chunks.len() {
+        let text = join_external_words(&chunks[i]);
+        let tiny = !terminal_asr_punctuation(&text)
+            && (duration(&chunks[i]) < 1.1
+                || text.chars().filter(|c| !c.is_whitespace()).count() <= 8
+                || chunks[i].len() == 1);
+        if tiny {
+            let merge = |a: &[ExternalWhisperWord], b: &[ExternalWhisperWord]| {
+                let mut both = a.to_vec();
+                both.extend_from_slice(b);
+                (b[0].start - a.last().unwrap().end < 0.7 && fits(&both, hard, max_chars))
+                    .then_some(both)
+            };
+            if i + 1 < chunks.len() {
+                if let Some(both) = merge(&chunks[i], &chunks[i + 1]) {
+                    chunks[i] = both;
+                    chunks.remove(i + 1);
+                    continue;
+                }
+            }
+            if i > 0 && !terminal_asr_punctuation(&join_external_words(&chunks[i - 1])) {
+                if let Some(both) = merge(&chunks[i - 1], &chunks[i]) {
+                    chunks[i - 1] = both;
+                    chunks.remove(i);
+                    i -= 1;
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+    chunks
+}
 fn external_text_chunks(text: &str, max_chars: usize) -> Vec<String> {
     let mut units = Vec::new();
     let mut current = String::new();
@@ -637,41 +771,19 @@ fn external_whisper_response(
                    quality: Option<&AsrSegment>,
                    out: &mut Vec<AsrSegment>| {
         words.sort_by(|a, b| a.start.total_cmp(&b.start).then(a.end.total_cmp(&b.end)));
-        let mut group: Vec<ExternalWhisperWord> = Vec::new();
-        let emit = |group: &mut Vec<ExternalWhisperWord>, out: &mut Vec<AsrSegment>| {
-            if group.is_empty() {
-                return;
-            }
-            let text = join_external_words(group);
+        for group in semantic_word_chunks(words, max_seconds, max_chars) {
+            let text = join_external_words(&group);
             if !text.is_empty() {
                 out.push(AsrSegment {
                     start: group[0].start,
-                    end: group.iter().map(|w| w.end).fold(0.0, f64::max),
+                    end: group.iter().map(|w| w.end).fold(0., f64::max),
                     text,
                     no_speech_prob: quality.and_then(|q| q.no_speech_prob),
                     avg_logprob: quality.and_then(|q| q.avg_logprob),
                     compression_ratio: quality.and_then(|q| q.compression_ratio),
                 });
             }
-            group.clear();
-        };
-        for word in words {
-            if !group.is_empty() {
-                let end = group.iter().map(|w| w.end).fold(0.0, f64::max);
-                let duration = end - group[0].start;
-                let text = join_external_words(&group);
-                let next_chars = text.chars().count() + word.text.chars().count() + 1;
-                if ((word.start - end) >= 0.8 && duration >= 0.8)
-                    || terminal_asr_punctuation(&text)
-                    || word.end.max(end) - group[0].start > max_seconds
-                    || next_chars > max_chars
-                {
-                    emit(&mut group, out);
-                }
-            }
-            group.push(word);
         }
-        emit(&mut group, out);
     };
     let fallback = |item: &Value, out: &mut Vec<AsrSegment>| {
         let Ok(segment) = serde_json::from_value::<AsrSegment>(item.clone()) else {
@@ -731,14 +843,44 @@ fn external_whisper_response(
     // Never discard the latter merely because one other segment has words.
     // Retain quality metadata on each group, for correlated hallucination filtering.
     if let Some(rows) = raw_segments {
+        let class = |q: Option<&AsrSegment>| {
+            let silence = q
+                .and_then(|q| q.no_speech_prob)
+                .is_some_and(|v| v.is_finite() && v > 0.85);
+            let low = q
+                .and_then(|q| q.avg_logprob)
+                .is_some_and(|v| v.is_finite() && v < -1.);
+            let repetitive = q
+                .and_then(|q| q.compression_ratio)
+                .is_some_and(|v| v.is_finite() && v > 3.5);
+            (silence, low, repetitive)
+        };
+        let mut pending = Vec::new();
+        let mut quality: Option<AsrSegment> = None;
         for item in rows {
             let words = parse_words(&item["words"]);
+            let next = serde_json::from_value::<AsrSegment>(item.clone()).ok();
+            if !pending.is_empty()
+                && (words.is_empty() || class(quality.as_ref()) != class(next.as_ref()))
+            {
+                regroup(
+                    std::mem::take(&mut pending),
+                    quality.as_ref(),
+                    &mut segments,
+                );
+                quality = None;
+            }
             if words.is_empty() {
                 fallback(item, &mut segments);
             } else {
-                let quality = serde_json::from_value::<AsrSegment>(item.clone()).ok();
-                regroup(words, quality.as_ref(), &mut segments);
+                if pending.is_empty() {
+                    quality = next;
+                }
+                pending.extend(words);
             }
+        }
+        if !pending.is_empty() {
+            regroup(pending, quality.as_ref(), &mut segments);
         }
     }
     // Top-level word timing is used only when no usable segment timing exists;
@@ -2587,7 +2729,7 @@ pub(crate) async fn process(
         (WINDOW, OVERLAP)
     };
     let asr_identity = fingerprint(&json!({
-        "checkpoint_version":4,"timing_refine_revision":1,"vad_runtime_configured":crate::local_inference::configured(),"video_sha256":source_digest,
+        "checkpoint_version":5,"timing_refine_revision":1,"semantic_word_revision":1,"vad_runtime_configured":crate::local_inference::configured(),"video_sha256":source_digest,
         "model":config.asr_model,"asr_endpoint":config.asr_endpoint,"local_asr":config.local_asr,
         "asr_request_options":config.asr_request_options,
         "language":profile.asr_language,"duration_ms":(duration*1000.0).round() as u64,
@@ -2635,7 +2777,7 @@ pub(crate) async fn process(
                 .ok()
                 .and_then(|raw| serde_json::from_slice::<Checkpoint>(&raw).ok())
                 .filter(|row| {
-                    row.revision == 4
+                    row.revision == 5
                         && row.offset_ms == offset_ms
                         && row.fingerprint == asr_identity
                 });
@@ -2727,7 +2869,7 @@ pub(crate) async fn process(
                 atomic_write(
                     &checkpoint,
                     &serde_json::to_vec(&Checkpoint {
-                        revision: 4,
+                        revision: 5,
                         fingerprint: asr_identity.clone(),
                         offset_ms,
                         cues: result.clone(),
@@ -4151,6 +4293,20 @@ mod tests {
         assert_eq!(response.segments[0].text, "Hello world.");
         assert_eq!(response.segments[1].text, "Again now.");
         assert!(response.segments[0].start >= 0.0 && response.segments[1].end <= 3.0);
+    }
+    #[test]
+    fn semantic_word_boundaries_cross_provider_segments_without_losing_timestamps() {
+        let payload = json!({"segments":[
+            {"start":0.,"end":0.4,"text":"So","words":[{"word":"So","start":0.,"end":0.4}]},
+            {"start":0.45,"end":2.,"text":"we continue.","words":[{"word":" we","start":0.45,"end":0.8},{"word":" continue.","start":0.9,"end":2.}]},
+            {"start":3.2,"end":4.5,"text":"Next sentence.","words":[{"word":" Next","start":3.2,"end":3.7},{"word":" sentence.","start":3.8,"end":4.5}]}
+        ]});
+        let result = external_whisper_response(payload, &json!({}), 5.).unwrap();
+        assert_eq!(result.segments.len(), 2);
+        assert_eq!(result.segments[0].text, "So we continue.");
+        assert_eq!((result.segments[0].start, result.segments[0].end), (0., 2.));
+        assert_eq!(result.segments[1].text, "Next sentence.");
+        assert_eq!(result.segments[1].start, 3.2);
     }
     #[test]
     fn external_whisper_mixed_timing_preserves_all_segments_and_quality() {

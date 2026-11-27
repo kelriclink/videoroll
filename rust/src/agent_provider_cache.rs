@@ -132,6 +132,83 @@ pub(super) fn transient_read(error: &AppError) -> bool {
         _ => false,
     }
 }
+// Durable physical dispatch ledger on the existing subtitle operation. It
+// survives worker restarts and is separate from logical tool-call accounting.
+// A cache hit never reaches this function. Charge before sending: a lost
+// reply or interrupted request still used its reservation.
+const PHYSICAL_BUDGET_EXHAUSTED: &str = "RAG physical HTTP request budget exhausted";
+pub(super) async fn reserve_http(
+    db: &Database,
+    job: &WorkItem,
+    kind: RetrievalKind,
+    limit: usize,
+) -> AppResult<()> {
+    let key = match kind {
+        RetrievalKind::Web => "web",
+        RetrievalKind::Wikipedia => "wiki",
+        RetrievalKind::PageText => "page",
+        RetrievalKind::Knowledge => {
+            return Err(AppError::Invalid(
+                "local knowledge has no public HTTP budget".into(),
+            ));
+        }
+    };
+    let mut tx = db.pool.begin().await?;
+    // Lock parent before child as the scheduler does. Prevent a paused or
+    // expired worker from allocating a new public HTTP dispatch.
+    let running: Option<String> =
+        sqlx::query_scalar("SELECT state FROM pipeline_runs WHERE id=$1 FOR UPDATE")
+            .bind(job.workflow_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    if running.as_deref() != Some("running") {
+        return Err(AppError::Conflict("stale research worker lease".into()));
+    }
+    let record:Option<Value>=sqlx::query_scalar("SELECT COALESCE(result_json,'{}'::jsonb) FROM operation_inbox WHERE id=$1 AND workflow_id=$2 AND lease_token=$3 AND status='running' AND lease_until>clock_timestamp() FOR UPDATE")
+        .bind(job.id).bind(job.workflow_id).bind(job.lease_token).fetch_optional(&mut *tx).await?;
+    let mut record =
+        record.ok_or_else(|| AppError::Conflict("stale research worker lease".into()))?;
+    if !record.is_object() {
+        return Err(AppError::Conflict(
+            "invalid research operation result".into(),
+        ));
+    }
+    let ledger = record
+        .as_object_mut()
+        .unwrap()
+        .entry("rag_http_budget")
+        .or_insert_with(|| json!({}));
+    if !ledger.is_object() {
+        return Err(AppError::Conflict("invalid RAG HTTP ledger".into()));
+    }
+    let limit = limit.min(4) as u64;
+    let previous = ledger.get(key);
+    let count = match previous {
+        None => 0,
+        Some(v) => v["used"]
+            .as_u64()
+            .ok_or_else(|| AppError::Conflict("invalid RAG HTTP counter".into()))?,
+    };
+    let limit = match previous {
+        None => limit,
+        Some(v) => limit.min(
+            v["limit"]
+                .as_u64()
+                .ok_or_else(|| AppError::Conflict("invalid RAG HTTP limit".into()))?,
+        ),
+    };
+    if count >= limit {
+        return Err(AppError::Unavailable(PHYSICAL_BUDGET_EXHAUSTED.into()));
+    }
+    ledger[key] = json!({"used":count+1,"limit":limit});
+    sqlx::query("UPDATE operation_inbox SET result_json=$2 WHERE id=$1")
+        .bind(job.id)
+        .bind(record)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(())
+}
 pub(super) async fn retry_read<F, Fut, T>(
     db: &Database,
     job: &WorkItem,
@@ -501,7 +578,11 @@ where
             .clamp(0., 60.),
         _ => 0.,
     };
-    shared_record(db, provider, key, &result, ttl, cooldown).await?;
+    // Exhaustion is a local task policy, not a provider health failure.
+    if !matches!(&result,Err(AppError::Unavailable(message)) if message==PHYSICAL_BUDGET_EXHAUSTED)
+    {
+        shared_record(db, provider, key, &result, ttl, cooldown).await?;
+    }
     drop(connection);
     result
 }
@@ -520,7 +601,7 @@ mod tests {
         let db = Database::connect(&url).await.unwrap();
         let other = Database::connect(&url).await.unwrap();
         sqlx::raw_sql("CREATE TABLE pipeline_runs(id uuid PRIMARY KEY,state text);
-            CREATE TABLE operation_inbox(id uuid PRIMARY KEY,workflow_id uuid,lease_token uuid,status text,lease_until timestamptz);
+            CREATE TABLE operation_inbox(id uuid PRIMARY KEY,workflow_id uuid,lease_token uuid,status text,lease_until timestamptz,result_json jsonb);
             CREATE TABLE app_settings(key text PRIMARY KEY,value_json jsonb,version int,updated_at timestamptz DEFAULT now());")
             .execute(&db.pool).await.unwrap();
         let mut jobs = Vec::new();
@@ -542,9 +623,58 @@ mod tests {
                 .execute(&db.pool)
                 .await
                 .unwrap();
-            sqlx::query("INSERT INTO operation_inbox VALUES($1,$2,$3,'running',now()+interval '10 minutes')").bind(job.id).bind(job.workflow_id).bind(job.lease_token).execute(&db.pool).await.unwrap();
+            sqlx::query("INSERT INTO operation_inbox(id,workflow_id,lease_token,status,lease_until) VALUES($1,$2,$3,'running',now()+interval '10 minutes')").bind(job.id).bind(job.workflow_id).bind(job.lease_token).execute(&db.pool).await.unwrap();
             jobs.push(job);
         }
+        // Independent DB pools share a hard physical ceiling, including
+        // retries and crashes before a receipt has been returned.
+        let requests = AtomicUsize::new(0);
+        let a = async {
+            for _ in 0..4 {
+                if reserve_http(&db, &jobs[0], RetrievalKind::Web, 3)
+                    .await
+                    .is_ok()
+                {
+                    requests.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        };
+        let b = async {
+            for _ in 0..4 {
+                if reserve_http(&other, &jobs[0], RetrievalKind::Web, 3)
+                    .await
+                    .is_ok()
+                {
+                    requests.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        };
+        tokio::join!(a, b);
+        assert_eq!(requests.load(Ordering::SeqCst), 3);
+        assert!(
+            reserve_http(&other, &jobs[0], RetrievalKind::Web, 4)
+                .await
+                .is_err()
+        );
+        assert!(
+            reserve_http(&db, &jobs[0], RetrievalKind::Wikipedia, 2)
+                .await
+                .is_ok()
+        );
+        let physical = AtomicUsize::new(0);
+        let limited = retry_read(&db, &jobs[1], || async {
+            reserve_http(&db, &jobs[1], RetrievalKind::Web, 2).await?;
+            physical.fetch_add(1, Ordering::SeqCst);
+            Err::<(), _>(AppError::Unavailable("RAG provider HTTP 503".into()))
+        })
+        .await;
+        assert!(
+            matches!(limited,Err(AppError::Unavailable(ref m)) if m==PHYSICAL_BUDGET_EXHAUSTED)
+        );
+        assert_eq!(physical.load(Ordering::SeqCst), 2);
+        println!(
+            "PASS physical HTTP budget persists across pools, reserves retries, cannot expand on resume, separate wiki budget"
+        );
         let retries = AtomicUsize::new(0);
         let recovered = retry_read(&db, &jobs[0], || async {
             if retries.fetch_add(1, Ordering::SeqCst) < 2 {
