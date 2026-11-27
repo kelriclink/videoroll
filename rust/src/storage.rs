@@ -258,13 +258,19 @@ impl AssetRegistry {
     pub async fn reconcile_terminal_resources(
         &self,
         limit: i64,
-        grace: Duration,
+        failed_retention: Duration,
+        canceled_retention: Option<Duration>,
     ) -> AppResult<u64> {
+        let failed_before = Utc::now() - chrono::Duration::seconds(failed_retention.as_secs().clamp(3600, 3650 * 86400) as i64);
+        let canceled_before = canceled_retention.map(|ttl|
+            Utc::now() - chrono::Duration::seconds(ttl.as_secs().clamp(86400,3650 * 86400) as i64));
         let rows = sqlx::query(
-            r#"SELECT w.id,w.task_id FROM vr2_workflows w
+            r#"SELECT w.id,w.task_id,upper(t.status::text) AS task_status FROM vr2_workflows w
                JOIN tasks t ON t.id=w.task_id
                WHERE w.state IN ('failed','canceled')
-                 AND upper(t.status::text) IN ('FAILED','CANCELED')
+                 AND ((t.status::text='failed' AND t.updated_at <= $2)
+                   OR (t.status::text='canceled' AND t.stopped_status IS NULL
+                       AND $3::timestamptz IS NOT NULL AND t.updated_at <= $3))
                  AND NOT EXISTS (
                     SELECT 1 FROM workflow_events e WHERE e.workflow_id=w.id
                       AND e.kind='storage.cleanup_scheduled'
@@ -277,13 +283,19 @@ impl AssetRegistry {
                ORDER BY w.updated_at ASC LIMIT $1"#,
         )
         .bind(limit.clamp(1, 50))
+        .bind(failed_before)
+        .bind(canceled_before)
         .fetch_all(&self.db.pool)
         .await?;
         let mut released = 0;
         for row in rows {
             let id: Uuid = row.try_get("id")?;
             let task_id: Uuid = row.try_get("task_id")?;
-            match self.schedule_terminal_release(task_id, id, grace).await {
+            let status: String = row.try_get("task_status")?;
+            let cutoff = if status == "FAILED" { Some(failed_before) } else { canceled_before };
+            let Some(cutoff) = cutoff else { continue };
+            match self.schedule_terminal_release_checked(task_id, id, Duration::from_secs(3600),
+                Some((status.as_str(), cutoff))).await {
                 Ok(_) => released += 1,
                 Err(e) => tracing::warn!(workflow_id=%id,error=%e,"terminal cleanup deferred"),
             }
@@ -302,11 +314,12 @@ impl AssetRegistry {
             return Ok(0);
         };
         let age_seconds = ttl.as_secs().clamp(86_400, 3650 * 86_400) as i64;
+        let cutoff = Utc::now() - chrono::Duration::seconds(age_seconds);
         let rows = sqlx::query(
             r#"SELECT w.id,w.task_id
               FROM vr2_workflows w JOIN tasks t ON t.id=w.task_id
               WHERE w.state='succeeded' AND upper(t.status::text)='PUBLISHED'
-                AND t.updated_at <= now()-($1*interval '1 second')
+                AND t.updated_at <= $1
                 AND EXISTS (
                   SELECT 1 FROM storage_object_refs r
                   WHERE ((r.owner_type='workflow' AND r.owner_id=w.id)
@@ -342,7 +355,7 @@ impl AssetRegistry {
                 )
               ORDER BY t.updated_at ASC LIMIT $2"#,
         )
-        .bind(age_seconds)
+        .bind(cutoff)
         .bind(limit.clamp(1, 50))
         .fetch_all(&self.db.pool)
         .await?;
@@ -354,7 +367,8 @@ impl AssetRegistry {
             // One hour additional grace prevents immediate deletion on a
             // recovered process that just discovered an old completed task.
             match self
-                .schedule_terminal_release(task_id, workflow_id, Duration::from_secs(3600))
+                .schedule_terminal_release_checked(task_id, workflow_id, Duration::from_secs(3600),
+                    Some(("PUBLISHED", cutoff)))
                 .await
             {
                 Ok(_) => scheduled += 1,
@@ -371,16 +385,27 @@ impl AssetRegistry {
         workflow_id: Uuid,
         grace: Duration,
     ) -> AppResult<u64> {
+        self.schedule_terminal_release_checked(task_id, workflow_id, grace, None).await
+    }
+
+    async fn schedule_terminal_release_checked(
+        &self,
+        task_id: Uuid,
+        workflow_id: Uuid,
+        grace: Duration,
+        due: Option<(&str, DateTime<Utc>)>,
+    ) -> AppResult<u64> {
         let grace_seconds = grace.as_secs().clamp(3600, 3650 * 86400) as i64;
         let mut tx = self.db.pool.begin().await?;
-        let state: Option<(String, Option<String>)> = sqlx::query_as(
-            "SELECT upper(status::text),stopped_status::text FROM tasks WHERE id=$1 FOR UPDATE",
+        let state: Option<(String, Option<String>, DateTime<Utc>)> = sqlx::query_as(
+            "SELECT upper(status::text),stopped_status::text,updated_at FROM tasks WHERE id=$1 FOR UPDATE",
         )
         .bind(task_id)
         .fetch_optional(&mut *tx)
         .await?;
-        if !state.as_ref().is_some_and(|(status, stopped)| {
+        if !state.as_ref().is_some_and(|(status, stopped, updated)| {
             terminal_resources_releasable(status, stopped.as_deref())
+                && due.is_none_or(|(expected, cutoff)| status == expected && *updated <= cutoff)
         }) {
             return Err(AppError::Conflict(
                 "automatic release requires a confirmed terminal task".into(),
@@ -430,7 +455,7 @@ impl AssetRegistry {
                 "ongoing dubbing or unresolved platform publication still needs media".into(),
             ));
         }
-        if state.as_ref().is_some_and(|(status, _)| status == "PUBLISHED") {
+        if state.as_ref().is_some_and(|(status, _, _)| status == "PUBLISHED") {
             let batches =
                 crate::bilibili_batch_reconcile_v1::current_batches(&mut tx, task_id).await?;
             if batches.iter().any(|(_, s, finished, _)| {

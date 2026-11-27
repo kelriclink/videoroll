@@ -186,7 +186,12 @@ impl Config {
             worker_count,
             worker_poll: Duration::from_secs(3),
             job_lease: Duration::from_secs(180),
-            cleanup_grace: Duration::from_secs(86_400),
+            // Preserve the Python failed-task retention configuration.
+            cleanup_grace: Duration::from_secs(
+                std::env::var("FAILED_TASK_RESOURCE_RETENTION_HOURS")
+                    .ok().and_then(|v| v.parse::<i64>().ok())
+                    .unwrap_or(48).clamp(1, 3650 * 24) as u64 * 3600,
+            ),
         })
     }
 }

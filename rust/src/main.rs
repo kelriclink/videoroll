@@ -352,6 +352,7 @@ async fn main() -> anyhow::Result<()> {
             });
             let executor = Executor::new(config.clone(), db.clone(), scheduler, storage);
             let mut workers = tokio::task::JoinSet::new();
+            let failed_retention = config.cleanup_grace;
             workers.spawn(async move {
                 // Indexed due-date GC; zero directory scans on idle cycles.
                 let mut tick = tokio::time::interval(std::time::Duration::from_secs(300));
@@ -366,17 +367,14 @@ async fn main() -> anyhow::Result<()> {
                             Err(error)=>tracing::warn!(%error,"abandoned upload cleanup deferred")
                         }
                     }
-                    if let Err(e) = maintenance_store
-                        .reconcile_terminal_resources(50, std::time::Duration::from_secs(86_400))
-                        .await
-                    {
-                        tracing::warn!(error=%e,"terminal resource release reconciliation failed");
-                    }
                     let retention=videoroll_v2::operations_v1::published_retention(
                         &maintenance_store.db
                     ).await;
                     match retention {
                         Ok(ttl)=>{
+                            if let Err(error)=maintenance_store.reconcile_terminal_resources(50,failed_retention,ttl).await {
+                                tracing::warn!(%error,"terminal resource release reconciliation failed");
+                            }
                             if let Err(error)=maintenance_store
                                 .reconcile_published_resources(50,ttl).await{
                                 tracing::warn!(%error,"published resource retention backfill failed");
@@ -534,10 +532,10 @@ async fn main() -> anyhow::Result<()> {
             let registry = AssetRegistry::new(db, config.storage_root.clone());
             let batch_events =
                 videoroll_v2::publish_batch_events::tick(&registry.db, limit).await?;
-            let released = registry
-                .reconcile_terminal_resources(limit, config.cleanup_grace)
-                .await?;
             let ttl = videoroll_v2::operations_v1::published_retention(&registry.db).await?;
+            let released = registry
+                .reconcile_terminal_resources(limit, config.cleanup_grace, ttl)
+                .await?;
             let published = registry.reconcile_published_resources(limit, ttl).await?;
             let legacy_pending = videoroll_v2::maintenance_terminal_storage_v1::retry_pending_deletes(&registry, limit).await?;
             let deleted = registry.collect(limit).await?;
