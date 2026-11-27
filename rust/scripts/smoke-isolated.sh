@@ -654,6 +654,11 @@ if [[ "${VIDEOROLL_V2_TEST_DIFF_ONLY:-false}" == "true" ]]; then
   exit 0
 fi
 
+if [[ "${VIDEOROLL_V2_TEST_DICTIONARY_ONLY:-false}" == "true" ]]; then
+  PYTHONPATH="$repo_root/src" "$smoke_python" "$repo_root/rust/tests/dictionary_import_v1_focused_diff.py"
+  exit 0
+fi
+
 # Fast isolated Knowledge API differential: no expensive video/worker suite.
 # Useful for local repair iterations without stressing production memory.
 if [[ "${VIDEOROLL_V2_TEST_KNOWLEDGE_ONLY:-false}" == "true" ]]; then
