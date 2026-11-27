@@ -1560,7 +1560,7 @@ pub async fn publish(
         .await?;
     let client = BilibiliClient::new(&cookie, member_origin(config)?)?;
     // Validate creator-center ID pairing and rules before any UPOS upload.
-    crate::bili_activity::verify_remote(&client.member, &meta).await?;
+    crate::bili_activity::verify_remote(&client.member,client.origin.as_str().trim_end_matches('/'), &meta).await?;
     publish_gate(db, job, PublishGate::Upload).await?;
     if direct.is_some() {
         crate::bilibili_publish_v1::mark_started(db, job).await?;
@@ -1660,6 +1660,26 @@ pub async fn publish(
             }
         }
     }
+    // Activity enhancement is optional; never let discovery/model failure
+    // trigger a second upload or submission. Preserve explicitly chosen IDs.
+    let activity_enabled=crate::settings::effective(db,"bilibili.publish").await.ok().is_some_and(|v|v["ai_activity_enabled"]==true);
+    let mut activity_audit=json!({"enabled":activity_enabled,"selected":false,"reason":if meta.topic_id.is_some()||meta.mission_id.is_some(){"manual_preserved"}else if activity_enabled{"no_verified_selection"}else{"disabled"}});
+    match tokio::time::timeout(Duration::from_secs(90),crate::bili_activity::auto_select(db,config,&client.member,&client.origin,job.task_id,&meta)).await{
+        Ok(Ok(Some(selected)))=>{
+            let value=serde_json::to_value(&selected).map_err(|_|AppError::Invalid("selected activity metadata invalid".into()))?;
+            if crate::publish_review::ensure_approved(db,registry,config,job.task_id,&value).await.is_ok(){
+                activity_audit["selected"]=json!(true);
+                activity_audit["reason"]=json!("verified_ai_selection");
+                activity_audit["kind"]=json!(if selected.mission_id.is_some(){"activity"}else{"topic"});
+                meta=selected;
+            }else{activity_audit["reason"]=json!("review_rejected");}
+        },
+        Ok(Ok(None))=>{},
+        _=>{
+            activity_audit["reason"]=json!("discovery_unavailable");
+            tracing::warn!(job_id=%job.id,"optional Bilibili activity discovery unavailable; preserving original metadata");
+        },
+    }
     // Freeze optional uploader identity before the archive POST so normal
     // post-publication storage cleanup cannot remove its source metadata.
     let collection_intent =
@@ -1707,6 +1727,9 @@ pub async fn publish(
     // tags and cover. This is not the pre-upload draft.
     receipt["submitted_meta"] = serde_json::to_value(&meta)
         .map_err(|_| AppError::Invalid("final metadata serialization failed".into()))?;
+    activity_audit["submitted_topic_id"]=json!(meta.topic_id);
+    activity_audit["submitted_mission_id"]=json!(meta.mission_id);
+    receipt["activity"]=activity_audit;
     receipt["publication_binding"] =
         crate::bilibili_account_v1::publication_binding(account, &cookie, &csrf);
     if let Some(intent) = collection_intent {

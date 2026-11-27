@@ -594,6 +594,36 @@ assert task_action(task,{'meta':payload['meta']})[0]==409
 print('PASS: TaskDetail unknown result remains fenced and historical draft blocks new submission')
 
 
+# The actual native publisher invokes both AI decisions, verifies distinct
+# public/creator IDs and submits a single archive on the isolated server.
+if os.environ.get("VIDEOROLL_V2_TEST_ACTIVITY")=="true":
+    with engine.begin() as db:
+        db.execute(text("INSERT INTO app_settings(key,value_json,version) VALUES('bilibili.publish',CAST(:value AS jsonb),1) ON CONFLICT(key) DO UPDATE SET value_json=EXCLUDED.value_json"),{'value':json.dumps({'ai_activity_enabled':True})})
+    for title,topic,mission,selected in (
+        ("魔兽世界活动验收",301,901,True),("魔兽世界普通话题验收",302,None,True),
+        ("魔兽世界AI伪造验收",None,None,False),("魔兽世界发现失败验收",None,None,False),
+        ("魔兽世界人工指定验收",302,None,False)):
+        task,payload=fixture(title)
+        payload['meta']['tags']=['魔兽世界']
+        if '人工指定' in title:payload['meta'].update(topic_id=302,activity_name='魔兽世界普通话题')
+        before=counters()
+        code,result=api('/bilibili/publish',payload)
+        assert code==200 and result['state']=='submitting',(code,result)
+        process(task,'published')
+        with engine.connect() as db:
+            receipt=db.execute(text("SELECT response_json FROM publish_jobs WHERE id=CAST(:id AS uuid)"),{'id':result['job_id']}).scalar_one()
+        assert receipt['activity']['selected']==selected,receipt
+        assert receipt['activity']['submitted_topic_id']==topic and receipt['activity']['submitted_mission_id']==mission,receipt
+        after=counters()
+        assert after['submit']==before['submit']+1 and after['complete']==before['complete']+1
+        if '人工指定' in title:
+            assert after['activity_shortlist']==before['activity_shortlist'] and receipt['activity']['reason']=='manual_preserved'
+        else:
+            assert after['activity_shortlist']==before['activity_shortlist']+1 and after['activity_list']==before['activity_list']+2
+            if '发现失败' not in title:assert after['activity_final']==before['activity_final']+1
+    with engine.begin() as db:
+        db.execute(text("DELETE FROM app_settings WHERE key='bilibili.publish'"))
+    print('PASS: actual native publication activity discovery, two AI decisions, real creator mission mapping, ordinary topic, manual preserve, hallucination and AI outage single-submit fallback')
 if os.environ.get("VIDEOROLL_V2_TEST_MIXED_PUBLISH")=="true":
     from mixed_publish_isolated import run_mixed
     run_mixed(engine,root,api,fixture,process,counters,worker)

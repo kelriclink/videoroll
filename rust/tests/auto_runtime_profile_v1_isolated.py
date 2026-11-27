@@ -35,8 +35,11 @@ saved=persisted()
 for bad in ({"asr_engine":"invalid"},{"youtube_subtitle_mode":"invalid"},{"translate_enable_summary":"false"},{"asr_model":"x\n"},{"asr_model":"a"*1025}):
     assert call("/subtitle/auto/profile",bad,"PUT")[0]==400
     assert persisted()==saved
-assert call("/subtitle/auto/profile",{"formats":["srt"],"asr_model":"must-not-save"},"PUT")[0]==409
+assert call("/subtitle/auto/profile",{"formats":["bad"],"asr_model":"must-not-save"},"PUT")[0]==400
 assert persisted()==saved
+for formats in (["srt"],["ass"],["srt","ass"]):
+    code,profile=call("/subtitle/auto/profile",{"formats":formats},"PUT")
+    assert code==200 and profile["formats"]==formats and persisted()["formats"]==formats,(code,profile)
 print("PASS: original ASR/summary/caption profile writes, concurrent first-save merge, validation and atomic rejection")
 # Saved publication and media options are independent and validated atomically.
 patch={"auto_publish":True,"auto_publish_platforms":["douyin","bilibili","douyin"],"auto_dub_p2":False,

@@ -240,7 +240,7 @@ pub(crate) async fn render_inputs(
     registry: &AssetRegistry,
     task: Uuid,
     workflow: Uuid,
-) -> AppResult<Option<(String, String, String)>> {
+) -> AppResult<Option<(String, Option<String>, String)>> {
     let plan:Option<Value>=sqlx::query_scalar("SELECT configuration->'subtitle_resume_plan' FROM vr2_workflows WHERE id=$1 AND task_id=$2").bind(workflow).bind(task).fetch_optional(&db.pool).await?.flatten();
     let Some(plan) = plan else { return Ok(None) };
     let plan: Plan =
@@ -259,12 +259,12 @@ pub(crate) async fn render_inputs(
     }
     let ass = format!("v2/sub/{task}/{job}/subtitle.ass");
     let srt = format!("v2/sub/{task}/{job}/subtitle.srt");
-    if result["ass_key"].as_str() != Some(ass.as_str())
+    if (!result["ass_key"].is_null() && result["ass_key"].as_str()!=Some(ass.as_str()))
         || result["srt_key"].as_str() != Some(srt.as_str())
     {
         return Err(conflict("resume render subtitle receipt mismatch"));
     }
-    asset_digest(db, registry, task, "subtitle_ass", &ass).await?;
+    let ass=if result["ass_key"].is_null(){None}else{asset_digest(db,registry,task,"subtitle_ass",&ass).await?;Some(ass)};
     asset_digest(db, registry, task, "subtitle_srt", &srt).await?;
     Ok(Some((raw.key, ass, srt)))
 }

@@ -1164,6 +1164,67 @@ async fn mux_soft_sub(config:&Config,input:&Path,srt:&Path,output:&Path)->AppRes
     if !is_soft_sub_media(&probe){return Err(AppError::Conflict("soft subtitle output lacks MKV/SRT track".into()))}
     Ok(json!({"encoder":"copy","pipeline":"soft_sub_mkv","subtitle_overlay_mode":"soft_sub"}))
 }
+// Current native subtitle receipts, including no-speech and SRT-only,
+// outrank task-wide asset history. Historical/reused inputs without a
+// current native receipt retain their established fallback.
+pub(crate) async fn current_render_subtitles(db:&Database,registry:&AssetRegistry,task:Uuid,flow:Uuid)->AppResult<Option<(Option<String>,Option<String>)>>{
+    let row:Option<(Uuid,Value)>=sqlx::query_as("SELECT id,result FROM vr2_jobs WHERE task_id=$1 AND workflow_id=$2 AND stage='subtitle' AND state='succeeded'")
+        .bind(task).bind(flow).fetch_optional(&db.pool).await?;
+    let Some((id,result))=row else{return Ok(None)};
+    if result["no_speech"]==true{return Ok(Some((None,None)))}
+    let srt=format!("v2/sub/{task}/{id}/subtitle.srt");
+    if result["srt_key"].as_str()!=Some(srt.as_str()){return Ok(None)}
+    crate::subtitle_resume_v1::asset_digest(db,registry,task,"subtitle_srt",&srt).await?;
+    let ass=if result["ass_key"].is_null(){None}else{
+        let ass=format!("v2/sub/{task}/{id}/subtitle.ass");
+        if result["ass_key"].as_str()!=Some(ass.as_str()){return Err(AppError::Conflict("subtitle receipt ASS identity changed".into()))}
+        crate::subtitle_resume_v1::asset_digest(db,registry,task,"subtitle_ass",&ass).await?;
+        Some(ass)
+    };
+    Ok(Some((ass,Some(srt))))
+}
+// Generate an execution-scoped ASS from the immutable display snapshot.
+// This runs while the render job owns its lease, before remote dispatch.
+pub(crate) async fn prepare_render_ass(config:&Config,db:&Database,registry:&AssetRegistry,job:&WorkItem,render_profile:&RenderProfile)->AppResult<Option<String>>{
+    if !render_profile.burn_in{return Ok(None)}
+    if let Some(key)=prepared_render_ass(db,registry,job.task_id,job.id).await?{
+        ensure_task_asset(db,registry,job.task_id,job,"subtitle_ass",&key).await?;
+        return Ok(Some(key))
+    }
+    let receipt:Option<(Uuid,Value)>=sqlx::query_as("SELECT id,result FROM vr2_jobs WHERE workflow_id=$1 AND task_id=$2 AND generation=$3 AND stage='subtitle' AND state='succeeded'")
+        .bind(job.workflow_id).bind(job.task_id).bind(job.generation).fetch_optional(&db.pool).await?;
+    let Some((subtitle_id,result))=receipt else{return Ok(None)};
+    if result["no_speech"]==true{return Ok(None)}
+    let key=format!("v2/sub/{}/{subtitle_id}/segments.json",job.task_id);
+    if result["segments_key"].as_str()!=Some(key.as_str()){return Ok(None)}
+    crate::subtitle_resume_v1::asset_digest(db,registry,job.task_id,"segments_json",&key).await?;
+    current_render_subtitles(db,registry,job.task_id,job.workflow_id).await?.ok_or_else(||AppError::Conflict("render subtitle receipt incomplete".into()))?;
+    let path=registry.resolve_existing(&key).await?;
+    if fs::metadata(&path).await?.len()>32*1024*1024{return Err(AppError::Invalid("subtitle snapshot too large".into()))}
+    let snapshot:Value=serde_json::from_slice(&fs::read(path).await?).map_err(|_|AppError::Conflict("render snapshot invalid".into()))?;
+    let Some(display)=snapshot.get("render_display") else{return Ok(None)};
+    let cues:Vec<crate::subtitles::SubtitleCue>=serde_json::from_value(display.clone()).map_err(|_|AppError::Conflict("render display snapshot invalid".into()))?;
+    let p=super::asr::settings(db,job).await?;
+    let raw=if let Some((raw,_,_))=crate::social_publish::explicit_render_inputs(db,registry,job.task_id,job.workflow_id).await?{raw}
+        else if let Some((raw,_,_))=crate::subtitle_resume_v1::render_inputs(db,registry,job.task_id,job.workflow_id).await?{raw}
+        else{latest_asset_key(db,job.task_id,"video_raw").await?.ok_or_else(||AppError::NotFound("render source missing".into()))?};
+    let media=probe_video(&config.ffprobe_binary,&registry.resolve_existing(&raw).await?).await?;
+    let stream=media["streams"].as_array().and_then(|s|s.iter().find(|v|v["codec_type"]=="video")).ok_or_else(||AppError::Invalid("missing video dimensions".into()))?;
+    let w=stream["width"].as_u64().unwrap_or(1920).clamp(160,16384) as u32;
+    let h=stream["height"].as_u64().unwrap_or(1080).clamp(120,16384) as u32;
+    let size=((48*h+540)/1080).clamp(12,120);
+    let ass=crate::subtitles::to_ass_scaled(&cues,w,h,"Arial",size,snapshot["render_bilingual"]==true,p.primary_font_scale_percent,p.secondary_font_scale_percent)?;
+    let out=format!("v2/render/{}/{}/subtitle.ass",job.task_id,job.id);
+    write_task_asset(db,registry,job,"subtitle_ass",&out,ass.as_bytes()).await?;
+    Ok(Some(out))
+}
+pub(crate) async fn prepared_render_ass(db:&Database,registry:&AssetRegistry,task:Uuid,job:Uuid)->AppResult<Option<String>>{
+    let key=format!("v2/render/{task}/{job}/subtitle.ass");
+    let exists:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM assets WHERE task_id=$1 AND kind::text='subtitle_ass' AND storage_key=$2)").bind(task).bind(&key).fetch_one(&db.pool).await?;
+    if !exists{return Ok(None)}
+    crate::subtitle_resume_v1::asset_digest(db,registry,task,"subtitle_ass",&key).await?;
+    Ok(Some(key))
+}
 pub async fn render(
     config: &Config,
     db: &Database,
@@ -1180,7 +1241,9 @@ pub async fn render(
     .fetch_one(&db.pool)
     .await?;
     let cfg = profile(db, job).await?;
-    let existing = if selective || cfg.soft_sub {
+    let generated=prepare_render_ass(config,db,registry,job,&cfg).await?;
+    let current=current_render_subtitles(db,registry,job.task_id,job.workflow_id).await?;
+    let existing = if selective || cfg.soft_sub || generated.is_some() || current.is_some() {
         None
     } else {
         latest_asset_key(db, job.task_id, "video_final").await?
@@ -1212,11 +1275,13 @@ pub async fn render(
     let input = registry.resolve_existing(&source_key).await?;
     probe_video(&config.ffprobe_binary, &input).await?;
     let (ass,srt)=if let Some((_,ass,srt))=explicit{(ass,srt)}
-        else if let Some((_,ass,srt))=pinned{(Some(ass),Some(srt))}
+        else if let Some((_,ass,srt))=pinned{(ass,Some(srt))}
+        else if let Some(inputs)=current{inputs}
         else{(latest_asset_key(db,job.task_id,"subtitle_ass").await?,
               latest_asset_key(db,job.task_id,"subtitle_srt").await?)};
     // Match the remote worker: hard subtitles take precedence when both
     // switches are on; otherwise mux a separate SRT track.
+    let ass=generated.or(ass);
     let burn=cfg.burn_in && (ass.is_some() || srt.is_some());
     let soft=!burn && cfg.soft_sub && srt.is_some();
     let subtitle_key=if burn{ass.or(srt)}else if soft{srt}else{None};

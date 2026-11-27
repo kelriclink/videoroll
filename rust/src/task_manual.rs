@@ -162,6 +162,7 @@ pub(crate) fn subtitle_config(request: SubtitleAction) -> AppResult<Value> {
     put!(subtitle, "target_lang", request.target_lang);
     put!(subtitle, "translate_style", request.translate_style);
     put!(subtitle, "bilingual", request.bilingual);
+    put!(subtitle, "formats", request.formats);
     put!(render, "burn_in", request.burn_in);
     put!(render, "soft_sub", request.soft_sub);
     put!(render, "ass_style", request.ass_style);

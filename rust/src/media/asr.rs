@@ -81,6 +81,7 @@ pub struct SubtitleProfile {
     pub youtube_subtitle_mode: String,
     pub primary_font_scale_percent:u32,
     pub secondary_font_scale_percent:u32,
+    pub formats:Vec<String>,
 }
 impl Default for SubtitleProfile {
     fn default() -> Self {
@@ -99,6 +100,7 @@ impl Default for SubtitleProfile {
             youtube_subtitle_mode: "target".into(),
             primary_font_scale_percent:100,
             secondary_font_scale_percent:100,
+            formats:vec!["srt".into(),"ass".into()],
         }
     }
 }
@@ -119,7 +121,7 @@ fn endpoint(value: &str) -> AppResult<Url> {
     }
     Ok(url)
 }
-async fn settings(db: &Database, job: &WorkItem) -> AppResult<SubtitleProfile> {
+pub(crate) async fn settings(db: &Database, job: &WorkItem) -> AppResult<SubtitleProfile> {
     let runtime: Option<Value> =
         Some(crate::settings::effective(db, "subtitle.auto_profile").await?);
     let mut v = serde_json::to_value(SubtitleProfile::default())
@@ -170,6 +172,9 @@ async fn settings(db: &Database, job: &WorkItem) -> AppResult<SubtitleProfile> {
     crate::media::translation_quality::validate_glossary(&profile.translate_glossary)?;
     if !(25..=300).contains(&profile.primary_font_scale_percent) || !(25..=300).contains(&profile.secondary_font_scale_percent){
         return Err(AppError::Invalid("subtitle font scales must be 25..300".into()))
+    }
+    if profile.formats.iter().any(|f|!matches!(f.as_str(),"srt"|"ass")){
+        return Err(AppError::Invalid("invalid subtitle formats".into()))
     }
     Ok(profile)
 }
@@ -2727,6 +2732,9 @@ async fn process_selective(
         if let Some(m) = metadata.as_object_mut() {
             m.remove("display_cues");
         }
+        metadata["render_display"]=json!(display);
+        metadata["render_bilingual"]=json!(profile.bilingual);
+        metadata["export_ass"]=json!(profile.formats.iter().any(|v|v=="ass"));
         metadata["translated"] = json!(edited);
         metadata["translation"] = json!(true);
         metadata["selective_retranslate"] = json!(plan);
@@ -2762,11 +2770,13 @@ async fn process_selective(
     );
     let srt = to_srt(&display)?;
     let ass = to_ass_scaled(&display,1920,1080,"Arial",48,profile.bilingual,profile.primary_font_scale_percent,profile.secondary_font_scale_percent)?;
+    let want_ass=profile.formats.iter().any(|v|v=="ass");
     for (key, body, kind) in [
         (&segments_key, None::<&[u8]>, "segments_json"),
         (&srt_key, Some(srt.as_bytes()), "subtitle_srt"),
         (&ass_key, Some(ass.as_bytes()), "subtitle_ass"),
     ] {
+        if kind=="subtitle_ass" && !want_ass{continue}
         selective_lease(db, job).await?;
         if let Some(body) = body {
             write_task_asset(db, registry, job, kind, key, body).await?;
@@ -2776,7 +2786,7 @@ async fn process_selective(
     }
     Ok(
         json!({"no_speech":false,"selective_retranslate":plan.indices,
-        "cues":display.len(),"aligned_cues":edited.len(),"readability":readability_stats,"subtitle_quality":quality,"srt_key":srt_key,"ass_key":ass_key,"segments_key":segments_key}),
+        "cues":display.len(),"aligned_cues":edited.len(),"readability":readability_stats,"subtitle_quality":quality,"srt_key":srt_key,"ass_key":want_ass.then_some(ass_key),"segments_key":segments_key}),
     )
 }
 
@@ -2943,7 +2953,6 @@ async fn process_inner(
             for (key, kind) in [
                 (&segments_key, "segments_json"),
                 (&srt, "subtitle_srt"),
-                (&ass_key, "subtitle_ass"),
             ] {
                 ensure_task_asset(db, registry, job.task_id, job, kind, key).await?;
             }
@@ -2955,6 +2964,10 @@ async fn process_inner(
             }
             let value: Value = serde_json::from_slice(&fs::read(path).await?)
                 .map_err(|_| AppError::Conflict("native subtitle snapshot invalid".into()))?;
+            let ass_key=if value["export_ass"]==false{None}else{
+                ensure_task_asset(db,registry,job.task_id,job,"subtitle_ass",&ass_key).await?;
+                Some(ass_key)
+            };
             return Ok(
                 json!({"srt_key":srt,"ass_key":ass_key,"segments_key":segments_key,"reused":true,"no_speech":false,
                 "subtitle_quality":value["subtitle_quality"],"readability":value["readability"],"cues":value["subtitle_quality"]["segment_count"],"aligned_cues":value["translated"].as_array().map(Vec::len)}),
@@ -3657,6 +3670,8 @@ async fn process_inner(
         || (recovered_final && aligned && resume.as_ref().is_some_and(|p| p.original_translated));
     let metadata = serde_json::to_vec(&json!({
         "source":original,"translated":cues,
+        "render_display":display,"render_bilingual":profile.bilingual,
+        "export_ass":profile.formats.iter().any(|v|v=="ass"),
         "readability":readability_stats,"subtitle_quality":quality,
         "model":config.asr_model,"translation":translated,"youtube_subtitle":youtube_info,"subtitle_resume_plan":resume,"source_video_sha256":source_digest,
         "rag_evidence_ids":research.evidence_ids,"rag_digest":research.digest,
@@ -3666,16 +3681,18 @@ async fn process_inner(
     let segments_key = format!("{prefix}/segments.json");
     let srt_key = format!("{prefix}/subtitle.srt");
     let ass_key = format!("{prefix}/subtitle.ass");
+    let want_ass=profile.formats.iter().any(|v|v=="ass");
     for (key, body, kind) in [
         (&segments_key, metadata.as_slice(), "segments_json"),
         (&ass_key, ass.as_bytes(), "subtitle_ass"),
         (&srt_key, srt.as_bytes(), "subtitle_srt"),
     ] {
+        if kind=="subtitle_ass" && !want_ass{continue}
         write_task_asset(db, registry, job, kind, key, body).await?;
     }
     Ok(
         json!({"no_speech":false,"cues":display.len(),"aligned_cues":cues.len(),"readability":readability_stats,"subtitle_quality":quality,
-        "srt_key":srt_key,"ass_key":ass_key,"segments_key":segments_key,"youtube_subtitle":youtube_info,"subtitle_resume_plan":resume}),
+        "srt_key":srt_key,"ass_key":want_ass.then_some(ass_key),"segments_key":segments_key,"youtube_subtitle":youtube_info,"subtitle_resume_plan":resume}),
     )
 }
 
@@ -3709,7 +3726,7 @@ mod tests {
         let scheduler = Scheduler::new(db.clone(), Duration::from_secs(300));
         let (task, flow, id) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
         sqlx::query("INSERT INTO tasks(id,source_type,source_license,status,runtime_owner,priority,retry_count) VALUES($1,'local','own','downloaded','rust',0,0)").bind(task).execute(&db.pool).await.unwrap();
-        sqlx::query("INSERT INTO pipeline_runs(id,task_id,generation,engine,workflow_name,state,current_stage,request_json) VALUES($1,$2,1,'rust-v2','videoroll.rust.pipeline','running','subtitle',$3)").bind(flow).bind(task).bind(json!({"subtitle":{"translate_enabled":false,"target_lang":"zh"},"render":{"burn_in":false,"soft_sub":true,"primary_font_scale_percent":150,"secondary_font_scale_percent":50},"auto_publish":false,"auto_dub_p2":false})).execute(&db.pool).await.unwrap();
+        sqlx::query("INSERT INTO pipeline_runs(id,task_id,generation,engine,workflow_name,state,current_stage,request_json) VALUES($1,$2,1,'rust-v2','videoroll.rust.pipeline','running','subtitle',$3)").bind(flow).bind(task).bind(json!({"subtitle":{"translate_enabled":false,"target_lang":"zh","formats":["srt"]},"render":{"burn_in":false,"soft_sub":true,"primary_font_scale_percent":150,"secondary_font_scale_percent":50},"auto_publish":false,"auto_dub_p2":false})).execute(&db.pool).await.unwrap();
         sqlx::query("INSERT INTO operation_inbox(id,operation_key,runtime_engine,task_id,workflow_id,stage,generation,status,request_json) VALUES($1,$2,'rust-v2',$3,$4,'subtitle',1,'pending','{}')").bind(id).bind(format!("readability:{id}")).bind(task).bind(flow).execute(&db.pool).await.unwrap();
         let key = format!("v2/raw/{task}/source.mp4");
         let path = store.resolve_existing(&key).await.unwrap();
@@ -3776,8 +3793,10 @@ mod tests {
         assert_eq!(snapshot["source"], json!(cues));
         assert_eq!(snapshot["translated"], json!(cues));
         assert_eq!(snapshot["translation"], false);
-        let ass=fs::read_to_string(store.resolve_existing(result["ass_key"].as_str().unwrap()).await.unwrap()).await.unwrap();
-        assert!(ass.contains("Style: Default,Arial,72,"));
+        assert!(result["ass_key"].is_null());
+        let exported:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM assets WHERE task_id=$1 AND kind::text='subtitle_ass')").bind(task).fetch_one(&db.pool).await.unwrap();
+        assert!(!exported);
+        assert_eq!(snapshot["export_ass"],false);
 
         let srt = fs::read_to_string(
             store
@@ -3798,6 +3817,13 @@ mod tests {
             .unwrap();
         let render_job=scheduler.claim().await.unwrap().unwrap();
         assert_eq!(render_job.stage,crate::domain::Stage::Render);
+        sqlx::query("UPDATE pipeline_runs SET request_json=jsonb_set(request_json,'{render}',request_json->'render'||'{\"burn_in\":true,\"primary_font_scale_percent\":200}'::jsonb) WHERE id=$1").bind(flow).execute(&db.pool).await.unwrap();
+        let render_profile=super::super::ffmpeg::profile(&db,&render_job).await.unwrap();
+        let generated=super::super::ffmpeg::prepare_render_ass(&config,&db,&store,&render_job,&render_profile).await.unwrap().unwrap();
+        let ass=fs::read_to_string(store.resolve_existing(&generated).await.unwrap()).await.unwrap();
+        assert!(ass.contains("PlayResX: 160")&&ass.contains("PlayResY: 120")&&ass.contains("Style: Default,Arial,24,"),"{ass}");
+        assert_eq!(super::super::ffmpeg::prepared_render_ass(&db,&store,task,render_job.id).await.unwrap(),Some(generated));
+        sqlx::query("UPDATE pipeline_runs SET request_json=jsonb_set(request_json,'{render,burn_in}','false'::jsonb) WHERE id=$1").bind(flow).execute(&db.pool).await.unwrap();
         let media=super::super::ffmpeg::render(&config,&db,&store,&render_job).await.unwrap();
         let final_key=media["storage_key"].as_str().unwrap();
         assert!(final_key.ends_with(".mkv"),"{media}");

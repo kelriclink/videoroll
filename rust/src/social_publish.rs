@@ -1189,16 +1189,16 @@ pub(crate) async fn explicit_render_inputs(
     }
     let ass = format!("v2/sub/{task}/{job}/subtitle.ass");
     let srt = format!("v2/sub/{task}/{job}/subtitle.srt");
-    if result["ass_key"].as_str() != Some(ass.as_str())
+    if (!result["ass_key"].is_null() && result["ass_key"].as_str()!=Some(ass.as_str()))
         || result["srt_key"].as_str() != Some(srt.as_str())
     {
         return Err(AppError::Conflict(
             "explicit publication requires this generation's subtitle assets".into(),
         ));
     }
-    crate::subtitle_resume_v1::asset_digest(db, registry, task, "subtitle_ass", &ass).await?;
+    let ass=if result["ass_key"].is_null(){None}else{crate::subtitle_resume_v1::asset_digest(db,registry,task,"subtitle_ass",&ass).await?;Some(ass)};
     crate::subtitle_resume_v1::asset_digest(db, registry, task, "subtitle_srt", &srt).await?;
-    Ok(Some((raw, Some(ass), Some(srt))))
+    Ok(Some((raw, ass, Some(srt))))
 }
 pub(crate) async fn explicit_after_render(
     state: &AppState,

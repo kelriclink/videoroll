@@ -165,7 +165,9 @@ impl Executor {
                 }
             }
             Stage::Render if self.config.remote_renderer_enabled => {
-                let id = crate::remote_render::enqueue(&self.db, &self.registry, item).await?;
+                let profile=crate::media::ffmpeg::profile(&self.db,item).await?;
+                crate::media::ffmpeg::prepare_render_ass(&self.config,&self.db,&self.registry,item,&profile).await?;
+                let id = crate::remote_render::enqueue(&self.db,item,&profile).await?;
                 Ok(StageOutcome::Awaiting {
                     ticket: id.to_string(),
                 })

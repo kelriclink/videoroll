@@ -290,7 +290,13 @@ async fn build_spec(s: &AppState, exec: &ExecutionInfo, mode: &str) -> AppResult
         max_attempts: 5,
         payload: Value::Null,
     };
-    let profile = crate::media::ffmpeg::profile(&s.db, &job).await?;
+    // Freeze the dispatch-time render profile so the generated ASS and
+    // actual Worker mode cannot disagree if settings change while queued.
+    let frozen=exec.render_spec.get("native_render_profile").or_else(||
+        (exec.render_spec["request"]["native_profile_frozen"]==true).then(||&exec.render_spec["request"]["render"]));
+    let profile=if let Some(value)=frozen{
+        serde_json::from_value::<crate::media::ffmpeg::RenderProfile>(value.clone()).map_err(|_|AppError::Conflict("invalid frozen render profile".into()))?
+    }else{crate::media::ffmpeg::profile(&s.db,&job).await?};
     let (source, ass, srt) = if let Some(inputs) =
         crate::social_publish::explicit_render_inputs(&s.db, &s.storage, task_id, flow_id).await?
     {
@@ -298,18 +304,26 @@ async fn build_spec(s: &AppState, exec: &ExecutionInfo, mode: &str) -> AppResult
     } else if let Some((raw, ass, srt)) =
         crate::subtitle_resume_v1::render_inputs(&s.db, &s.storage, task_id, flow_id).await?
     {
-        (raw, Some(ass), Some(srt))
+        (raw, ass, Some(srt))
     } else {
+        let (ass,srt)=match crate::media::ffmpeg::current_render_subtitles(&s.db,&s.storage,task_id,flow_id).await?{
+            Some(pair)=>pair,
+            None=>(latest_asset_key(&s.db,task_id,"subtitle_ass").await?,latest_asset_key(&s.db,task_id,"subtitle_srt").await?),
+        };
         (
             latest_asset_key(&s.db, task_id, "video_raw")
                 .await?
                 .ok_or_else(|| {
                     AppError::NotFound("remote render input video_raw missing".into())
                 })?,
-            latest_asset_key(&s.db, task_id, "subtitle_ass").await?,
-            latest_asset_key(&s.db, task_id, "subtitle_srt").await?,
+            ass,
+            srt,
         )
     };
+    let ass=crate::media::ffmpeg::prepared_render_ass(&s.db,&s.storage,task_id,job.id).await?.or(ass);
+    if profile.burn_in && ass.is_none() && srt.is_some(){
+        return Err(AppError::Conflict("hard subtitle render lacks prepared ASS; restart render stage".into()));
+    }
     let mode = if profile.burn_in && ass.is_some() {
         "burn_in"
     } else if profile.soft_sub && srt.is_some() {
@@ -357,7 +371,7 @@ async fn build_spec(s: &AppState, exec: &ExecutionInfo, mode: &str) -> AppResult
         task_id,
         mode: mode.into(),
         request: json!({
-            "runtime_profile":true,"burn_in":profile.burn_in,
+            "runtime_profile":true,"native_profile_frozen":frozen.is_some(),"burn_in":profile.burn_in,
             "soft_sub":profile.soft_sub,
             "input_key":source,"srt_key":srt,"ass_key":ass,
             "render":config,

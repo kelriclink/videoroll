@@ -1,9 +1,18 @@
 """Disposable local Bilibili creator + UPOS simulator for Rust V1 publish parity."""
 from http.server import BaseHTTPRequestHandler,ThreadingHTTPServer
 from urllib.parse import parse_qs,urlparse
-import json
+import json,time
+NOW=int(time.time())
+ACTIVITIES=[
+ {'id':999,'sid':888,'name':'魔兽世界活动','state':1,'stime':NOW-86400,'etime':NOW+86400},
+ {'id':998,'name':'魔兽世界报名活动','state':1,'stime':NOW-86400,'etime':NOW+86400},
+ {'id':997,'name':'魔兽世界过期活动','state':1,'stime':NOW-86400,'etime':NOW-1}]
+TOPICS=[
+ {'topic_id':301,'mission_id':901,'topic_name':'魔兽世界活动','act_protocol':'允许转载作品参与，面向全部视频创作者'},
+ {'topic_id':302,'mission_id':902,'topic_name':'魔兽世界普通话题','description':'普通话题'},
+ {'topic_id':303,'mission_id':903,'topic_name':'魔兽世界报名活动','act_protocol':'允许转载，但是需要报名审核'}]
 
-STATE={'preupload':0,'uploads':0,'chunks':0,'complete':0,'predict':0,'submit':0,'ambiguous_submit':0,'cover':0,'ai':0,'ai_invalid':0,'type_catalog':0}
+STATE={'preupload':0,'uploads':0,'chunks':0,'complete':0,'predict':0,'submit':0,'ambiguous_submit':0,'cover':0,'ai':0,'ai_invalid':0,'type_catalog':0,'activity_list':0,'activity_detail':0,'topic_search':0,'activity_shortlist':0,'activity_final':0}
 class Handler(BaseHTTPRequestHandler):
  def send(self,code,body,etag=None):
   value=json.dumps(body).encode()
@@ -16,7 +25,20 @@ class Handler(BaseHTTPRequestHandler):
  def do_GET(self):
   url=urlparse(self.path)
   if url.path=='/__state':return self.send(200,STATE)
+  if url.path=='/x/activity/page/list':
+   assert not self.headers.get('Cookie')
+   STATE['activity_list']+=1
+   return self.send(200,{'code':0,'data':{'list':ACTIVITIES}})
+  if url.path=='/x/activity/subject/info':
+   assert not self.headers.get('Cookie') and parse_qs(url.query)['sid']==['888']
+   STATE['activity_detail']+=1
+   return self.send(200,{'code':0,'data':{**ACTIVITIES[0],'id':888,'dic':'活动允许转载作品参与'}})
   if not self.auth():return self.send(403,{'code':-101})
+  if url.path=='/x/vupre/web/topic/search':
+   STATE['topic_search']+=1
+   return self.send(200,{'code':0,'data':{'result':{'topics':TOPICS}}})
+  if url.path=='/x/vupre/web/topic/type':
+   return self.send(200,{'code':0,'data':{'topics':TOPICS}})
   if url.path=='/x/member/web/account':
    cookie=self.headers.get('Cookie','')
    mid=61001 if 'isolated-account-A' in cookie else 61002 if 'isolated-account-B' in cookie else 61000
@@ -52,6 +74,22 @@ class Handler(BaseHTTPRequestHandler):
    assert body['model']=='mock-bilibili-ai-summary',body.get('model')
    assert body['response_format']=={'type':'json_object'},body
    text=body['messages'][-1]['content']
+   system=body['messages'][0]['content']
+   if '话题及活动筛选助手' in system or '已核实的ref' in system:
+    payload=json.loads(text)
+    title=payload['video']['title']
+    if '话题及活动筛选助手' in system:
+     STATE['activity_shortlist']+=1
+     refs={c['ref'] for c in payload['candidates']}
+     assert 'public:999' in refs and 'public:998' in refs and 'public:997' not in refs,refs
+     if '发现失败' in title:return self.send(503,{'error':'simulated AI outage'})
+     selected={'refs':['public:999','public:998','topic:302']}
+    else:
+     STATE['activity_final']+=1
+     refs={c['ref'] for c in payload['details']}
+     assert refs=={'public:999','topic:302'},refs
+     selected={'ref':'public:777' if '伪造' in title else 'topic:302' if '普通话题' in title else 'public:999','reason':'fixture'}
+    return self.send(200,{'choices':[{'message':{'content':json.dumps(selected)}}],'usage':{'prompt_tokens':16,'completion_tokens':10,'total_tokens':26}})
    assert '候选分区' in text and '172' in text and '180' in text,text
    STATE['ai']+=1
    invalid='ai-invalid' in text
@@ -79,7 +117,7 @@ class Handler(BaseHTTPRequestHandler):
              'named-account-B':('isolated-account-B','BCDE123456789012')}.get(data['title'],('video-roll-test','1234567890123456'))
    assert 'SESSDATA='+expected[0] in self.headers.get('Cookie',''),data['title']
    assert data['csrf']==expected[1],data['title']
-   assert data['title'] in ['isolated Rust P1','ambiguous-publish','two-part','【熟肉&中配】two-part','ai-summary','ai-invalid','batch-only','batch-unknown','named-account-A','named-account-B'],data
+   assert data['title'] in ['isolated Rust P1','ambiguous-publish','two-part','【熟肉&中配】two-part','ai-summary','ai-invalid','batch-only','batch-unknown','named-account-A','named-account-B','魔兽世界活动验收','魔兽世界普通话题验收','魔兽世界AI伪造验收','魔兽世界发现失败验收','魔兽世界人工指定验收'],data
    assert data['copyright']==2 and data['source'].startswith('https://youtu.be/'),data
    assert data['videos'][0]['filename']=='rust-test' and data['videos'][0]['cid']==421,data
    if data['title']=='isolated Rust P1':assert data['cover']=='https://i0.hdslb.com/mock_cover.jpg',data
@@ -95,6 +133,9 @@ class Handler(BaseHTTPRequestHandler):
     assert len(data['videos'])==1,data
    expected_tid={'isolated Rust P1':180,'ai-summary':172,'ai-invalid':180}.get(data['title'],171)
    assert data['tid']==expected_tid,data
+   if data['title'].startswith('魔兽世界'):
+    expected_ids={'魔兽世界活动验收':(301,901),'魔兽世界普通话题验收':(302,None),'魔兽世界人工指定验收':(302,None)}.get(data['title'],(None,None))
+    assert (data.get('topic_id'),data.get('mission_id'))==expected_ids,data
    STATE['submit']+=1
    if data['title'] in ('ambiguous-publish','batch-unknown'):
     STATE['ambiguous_submit']+=1

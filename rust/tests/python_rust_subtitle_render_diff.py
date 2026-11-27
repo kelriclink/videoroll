@@ -326,8 +326,12 @@ execute("DELETE FROM app_settings WHERE key='subtitle.auto_profile'")
 assert request("PUT","/subtitle/auto/profile",update)[0]==200
 status,ru_updated=request("PUT","/subtitle/auto/profile",patch)
 assert status==200 and py_updated==ru_updated,(status,py_updated,ru_updated)
-assert request("PUT","/subtitle/auto/profile",{"formats":["srt"],"auto_publish":True})[0]==409
-assert request("GET","/subtitle/auto/profile")[1]==ru_updated
+for formats in (["srt"],["ass"],["srt","ass"]):
+    with Session(engine) as s: py_formats=update_auto_profile(s,{"formats":formats})
+    status,ru_formats=request("PUT","/subtitle/auto/profile",{"formats":formats})
+    assert status==200 and py_formats==ru_formats,(status,py_formats,ru_formats)
+assert request("PUT","/subtitle/auto/profile",{"formats":["bad"],"auto_publish":True})[0]==400
+assert request("GET","/subtitle/auto/profile")[1]==ru_formats
 print("PASS DIFF: Python/Rust subtitle profile defaults and supported updates; Rust updates original app_settings row")
 
 # Original Python SubtitleJobRead model and artifact projection vs Rust handler.

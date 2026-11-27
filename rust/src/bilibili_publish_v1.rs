@@ -748,8 +748,11 @@ pub(crate) async fn mark_confirmed(
             .map(str::to_owned)
             .or_else(|| v.as_i64().map(|v| v.to_string()))
     });
-    let receipt = json!({"bvid":bvid,"aid":aid,"native_bilibili":true,"confirmed":true,
+    let mut receipt = json!({"bvid":bvid,"aid":aid,"native_bilibili":true,"confirmed":true,
         "parts":result.get("parts")});
+    if let Some(activity) = result.get("activity").filter(|v| v.is_object()) {
+        receipt["activity"] = activity.clone();
+    }
     // Some recovered historical results predate submitted_meta. Preserve
     // their original request snapshot instead of inventing final metadata.
     let final_meta = result.get("submitted_meta").filter(|v| v.is_object());

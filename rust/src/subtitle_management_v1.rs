@@ -196,6 +196,7 @@ fn supported_update(key: &str) -> bool {
             | "primary_font_scale_percent"
             | "secondary_font_scale_percent"
             | "soft_sub"
+            | "formats"
             | "publish_use_youtube_cover"
             | "publish_typeid_mode"
     )
@@ -233,6 +234,9 @@ fn validate_update(update: &Map<String, Value>) -> AppResult<()> {
                     .is_none_or(|s| s.chars().count() > 40 || s.chars().any(char::is_control)) =>
             {
                 return Err(AppError::Invalid("invalid publish title prefix".into()));
+            }
+            "formats" if !value.as_array().is_some_and(|v|!v.is_empty() && v.len()<=2 && v.iter().all(|s|matches!(s.as_str(),Some("srt"|"ass"))))=>{
+                return Err(AppError::Invalid("formats must contain srt and/or ass".into()));
             }
             "auto_publish_platforms"=>{
                 crate::task_manual::auto_platform_selection(&json!({}),&json!({"auto_publish_platforms":value}))?;
