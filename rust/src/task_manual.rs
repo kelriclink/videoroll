@@ -36,6 +36,10 @@ pub(crate) struct SubtitleAction {
     #[serde(default)]
     video_preset: Option<String>,
     #[serde(default)]
+    primary_font_scale_percent:Option<u32>,
+    #[serde(default)]
+    secondary_font_scale_percent:Option<u32>,
+    #[serde(default)]
     asr_engine: Option<String>,
     #[serde(default)]
     asr_language: Option<String>,
@@ -112,6 +116,9 @@ pub(crate) fn subtitle_config(request: SubtitleAction) -> AppResult<Value> {
             "only srt and ass subtitle formats supported by V2".into(),
         ));
     }
+    for value in [request.primary_font_scale_percent,request.secondary_font_scale_percent].into_iter().flatten(){
+        if !(25..=300).contains(&value){return Err(AppError::Invalid("subtitle font scales must be 25..300".into()))}
+    }
     let mut subtitle = json!({});
     if request.prefer_youtube_subtitles.is_some() || request.youtube_subtitle_mode.is_some() {
         let mode = crate::media::youtube_subtitles::mode(
@@ -162,6 +169,8 @@ pub(crate) fn subtitle_config(request: SubtitleAction) -> AppResult<Value> {
     put!(render, "use_intel_gpu", request.use_intel_gpu);
     put!(render, "video_crf", request.video_crf);
     put!(render, "video_preset", request.video_preset);
+    put!(render,"primary_font_scale_percent",request.primary_font_scale_percent);
+    put!(render,"secondary_font_scale_percent",request.secondary_font_scale_percent);
     if let Some(codec) = render["video_codec"].as_str()
         && !matches!(codec, "h264" | "av1")
     {

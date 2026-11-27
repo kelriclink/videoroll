@@ -5,7 +5,7 @@ use crate::{
     domain::WorkItem,
     media::ffmpeg::{ensure_task_asset, latest_asset_key, probe_video, write_task_asset},
     storage::AssetRegistry,
-    subtitles::{SubtitleCue, to_ass, to_srt},
+    subtitles::{SubtitleCue, to_ass_scaled, to_srt},
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
 use reqwest::{Client, Url, multipart};
@@ -79,6 +79,8 @@ pub struct SubtitleProfile {
     pub translate_enable_summary: Option<bool>,
     pub translate_glossary: Value,
     pub youtube_subtitle_mode: String,
+    pub primary_font_scale_percent:u32,
+    pub secondary_font_scale_percent:u32,
 }
 impl Default for SubtitleProfile {
     fn default() -> Self {
@@ -95,6 +97,8 @@ impl Default for SubtitleProfile {
             translate_enable_summary: None,
             translate_glossary: Value::Null,
             youtube_subtitle_mode: "target".into(),
+            primary_font_scale_percent:100,
+            secondary_font_scale_percent:100,
         }
     }
 }
@@ -144,6 +148,11 @@ async fn settings(db: &Database, job: &WorkItem) -> AppResult<SubtitleProfile> {
             target.insert(k.clone(), v.clone());
         }
     }
+    for key in ["primary_font_scale_percent","secondary_font_scale_percent"]{
+        if let Some(value)=workflow.as_ref().and_then(|w|w.get("render")).and_then(|r|r.get(key)){
+            v[key]=value.clone();
+        }
+    }
     let override_source = workflow.as_ref().and_then(|v| v.get("subtitle"));
     let saved_source = runtime.as_ref();
     let source = override_source
@@ -159,6 +168,9 @@ async fn settings(db: &Database, job: &WorkItem) -> AppResult<SubtitleProfile> {
     let profile: SubtitleProfile = serde_json::from_value(v)
         .map_err(|_| AppError::Invalid("subtitle config types invalid".into()))?;
     crate::media::translation_quality::validate_glossary(&profile.translate_glossary)?;
+    if !(25..=300).contains(&profile.primary_font_scale_percent) || !(25..=300).contains(&profile.secondary_font_scale_percent){
+        return Err(AppError::Invalid("subtitle font scales must be 25..300".into()))
+    }
     Ok(profile)
 }
 fn normalize_asr(
@@ -2749,7 +2761,7 @@ async fn process_selective(
         &snapshot.metadata["context_memory"],
     );
     let srt = to_srt(&display)?;
-    let ass = to_ass(&display, 1920, 1080, "Arial", 48, profile.bilingual)?;
+    let ass = to_ass_scaled(&display,1920,1080,"Arial",48,profile.bilingual,profile.primary_font_scale_percent,profile.secondary_font_scale_percent)?;
     for (key, body, kind) in [
         (&segments_key, None::<&[u8]>, "segments_json"),
         (&srt_key, Some(srt.as_bytes()), "subtitle_srt"),
@@ -3635,7 +3647,7 @@ async fn process_inner(
     let quality =
         super::readability::report(&original, &cues, &display, display_profile, &rolling_memory);
     let srt = to_srt(&display)?;
-    let ass = to_ass(&display, 1920, 1080, "Arial", 48, profile.bilingual)?;
+    let ass = to_ass_scaled(&display,1920,1080,"Arial",48,profile.bilingual,profile.primary_font_scale_percent,profile.secondary_font_scale_percent)?;
     let aligned = original.len() == cues.len()
         && original
             .iter()
@@ -3697,7 +3709,7 @@ mod tests {
         let scheduler = Scheduler::new(db.clone(), Duration::from_secs(300));
         let (task, flow, id) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
         sqlx::query("INSERT INTO tasks(id,source_type,source_license,status,runtime_owner,priority,retry_count) VALUES($1,'local','own','downloaded','rust',0,0)").bind(task).execute(&db.pool).await.unwrap();
-        sqlx::query("INSERT INTO pipeline_runs(id,task_id,generation,engine,workflow_name,state,current_stage,request_json) VALUES($1,$2,1,'rust-v2','videoroll.rust.pipeline','running','subtitle',$3)").bind(flow).bind(task).bind(json!({"subtitle":{"translate_enabled":false,"target_lang":"zh"}})).execute(&db.pool).await.unwrap();
+        sqlx::query("INSERT INTO pipeline_runs(id,task_id,generation,engine,workflow_name,state,current_stage,request_json) VALUES($1,$2,1,'rust-v2','videoroll.rust.pipeline','running','subtitle',$3)").bind(flow).bind(task).bind(json!({"subtitle":{"translate_enabled":false,"target_lang":"zh"},"render":{"burn_in":false,"soft_sub":true,"primary_font_scale_percent":150,"secondary_font_scale_percent":50},"auto_publish":false,"auto_dub_p2":false})).execute(&db.pool).await.unwrap();
         sqlx::query("INSERT INTO operation_inbox(id,operation_key,runtime_engine,task_id,workflow_id,stage,generation,status,request_json) VALUES($1,$2,'rust-v2',$3,$4,'subtitle',1,'pending','{}')").bind(id).bind(format!("readability:{id}")).bind(task).bind(flow).execute(&db.pool).await.unwrap();
         let key = format!("v2/raw/{task}/source.mp4");
         let path = store.resolve_existing(&key).await.unwrap();
@@ -3764,6 +3776,8 @@ mod tests {
         assert_eq!(snapshot["source"], json!(cues));
         assert_eq!(snapshot["translated"], json!(cues));
         assert_eq!(snapshot["translation"], false);
+        let ass=fs::read_to_string(store.resolve_existing(result["ass_key"].as_str().unwrap()).await.unwrap()).await.unwrap();
+        assert!(ass.contains("Style: Default,Arial,72,"));
 
         let srt = fs::read_to_string(
             store
@@ -3782,6 +3796,18 @@ mod tests {
             .complete(&job, StageOutcome::Completed { result: retry })
             .await
             .unwrap();
+        let render_job=scheduler.claim().await.unwrap().unwrap();
+        assert_eq!(render_job.stage,crate::domain::Stage::Render);
+        let media=super::super::ffmpeg::render(&config,&db,&store,&render_job).await.unwrap();
+        let final_key=media["storage_key"].as_str().unwrap();
+        assert!(final_key.ends_with(".mkv"),"{media}");
+        let final_path=store.resolve_existing(final_key).await.unwrap();
+        let probe=super::super::ffmpeg::probe_video(&config.ffprobe_binary,&final_path).await.unwrap();
+        assert!(super::super::ffmpeg::is_soft_sub_media(&probe));
+        assert!(probe["streams"].as_array().unwrap().iter().any(|s|s["codec_name"]=="mpeg4"));
+        let repeat=super::super::ffmpeg::render(&config,&db,&store,&render_job).await.unwrap();
+        assert_eq!(repeat["storage_key"],media["storage_key"]);
+        scheduler.complete(&render_job,StageOutcome::Completed{result:repeat}).await.unwrap();
         let state = AppState {
             config,
             db: db.clone(),

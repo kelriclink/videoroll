@@ -104,6 +104,14 @@ with db() as c:
 # Leave a profile saved through the actual HTTP endpoint for the Rust
 # database-backed stage-consumer regression.
 code,profile=call("/subtitle/auto/profile",{"auto_publish":True,"auto_publish_platforms":["bilibili","kuaishou"],
-    "auto_dub_p2":False,"video_codec":"av1","video_preset":"5","video_crf":58,"burn_in":True,"use_intel_gpu":True},"PUT")
+    "auto_dub_p2":False,"video_codec":"av1","video_preset":"5","video_crf":58,"burn_in":True,"use_intel_gpu":True,
+    "primary_font_scale_percent":150,"secondary_font_scale_percent":50,"soft_sub":True,
+    "publish_use_youtube_cover":False,"publish_typeid_mode":"bilibili_predict"},"PUT")
 assert code==200,(code,profile)
+assert profile["primary_font_scale_percent"]==150 and profile["secondary_font_scale_percent"]==50
+assert profile["soft_sub"] is True and profile["publish_use_youtube_cover"] is False and profile["publish_typeid_mode"]=="bilibili_predict"
+saved=persisted()
+for bad in ({"primary_font_scale_percent":24},{"secondary_font_scale_percent":301},{"publish_typeid_mode":"invalid"},{"soft_sub":"true"},{"publish_use_youtube_cover":1}):
+    assert call("/subtitle/auto/profile",bad,"PUT")[0]==400
+    assert persisted()==saved
 print("PASS: V1 intake runtime policy, atomic proof, dedupe, explicit restart origin, independent dubbing setting and preconditions, historical work protection")

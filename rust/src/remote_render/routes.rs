@@ -5,7 +5,7 @@ use super::{
         ExecutionLog, OutputProbe, RenderSpec, WorkerHeartbeat, WorkerInfo, WorkerResponse,
     },
     service::{
-        MAX_RENDER_ATTEMPTS, check_worker_label, is_fence, log_message_tail, output_key, receipt,
+        MAX_RENDER_ATTEMPTS, check_worker_label, is_fence, log_message_tail, output_key_for_mode, matches_output_key, receipt,
         strong_token, token_hash, validate_lease,
     },
 };
@@ -733,7 +733,7 @@ async fn execution_output_upload(
     let stage_job: Uuid = initial.try_get("job_id")?;
     let mode: String = initial.try_get("mode")?;
     let kind = super::service::output_kind(&mode);
-    let file_key = output_key(task_id, id);
+    let file_key = output_key_for_mode(task_id,id,&mode);
     let dest = s.storage.resolve_existing(&file_key).await?;
     if let Some(dir) = dest.parent() {
         fs::create_dir_all(dir).await?;
@@ -785,6 +785,9 @@ async fn execution_output_upload(
         let bytes_digest=hex::encode(digest.finalize());
         // Validate expensive media outside any row lock.
         let media=probe_video(&s.config.ffprobe_binary,&temp).await?;
+        if mode=="soft_sub" && !crate::media::ffmpeg::is_soft_sub_media(&media){
+            return Err(AppError::Invalid("soft-subtitle output must contain MKV/SRT track".into()))
+        }
         if kind=="video_dubbed" && !media["streams"].as_array().is_some_and(|a|a.iter().any(|v|v["codec_type"]=="audio")){return Err(AppError::Invalid("P2 output lacks audio stream".into()));}
         let mut tx=s.db.pool.begin().await?;
         // Acquire locks in the same order as the Scheduler: Task -> Workflow -> Job -> Execution.
@@ -911,7 +914,7 @@ async fn execution_completed(
         let record = s.db.asset(asset).await?;
         if record.task_id != task_id
             || record.kind != super::service::output_kind(&mode)
-            || record.storage_key != output_key(task_id, id)
+            || !matches_output_key(task_id,id,&mode,&record.storage_key)
         {
             return Err(AppError::Conflict(
                 "render asset does not belong to execution".into(),

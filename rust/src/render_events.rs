@@ -100,7 +100,7 @@ pub(crate) async fn completed_receipt(
         let record = db.asset(asset).await?;
         if record.task_id != task
             || record.kind != crate::remote_render::output_kind(&mode)
-            || record.storage_key != super::remote_render::output_key(task, id)
+            || !crate::remote_render::matches_output_key(task,id,&mode,&record.storage_key)
         {
             return Err(AppError::Conflict(
                 "completed render asset identity mismatch".into(),
@@ -158,7 +158,7 @@ pub(crate) async fn retire_asset_refs(
             || row.try_get::<Option<chrono::DateTime<chrono::Utc>>,_>("finished_at")?.is_none()
             || owner!=Some(task) || row.try_get::<Uuid,_>("asset_task")?!=task
             || mode=="noop" || row.try_get::<String,_>("asset_kind")?!=crate::remote_render::output_kind(&mode)
-            || key!=crate::remote_render::output_key(task,id)
+            || !crate::remote_render::matches_output_key(task,id,&mode,key)
             || job.is_none() || flow.is_none()
             || saved!=expected {return Ok(false)}
         let settled:bool=sqlx::query_scalar("SELECT EXISTS(
@@ -198,8 +198,8 @@ pub(crate) async fn retired_receipt(db:&Database,id:Uuid,task:Uuid,job:Uuid,flow
         .fetch_optional(&db.pool).await?;
     let Some(saved)=saved else{return Ok(None)};
     let asset=saved["asset_id"].as_str().and_then(|v|Uuid::parse_str(v).ok());
-    let key=crate::remote_render::output_key(task,id);
-    if asset.is_none() || saved!=crate::remote_render::receipt(id,asset,Some(&key),mode) {
+    let key=saved["storage_key"].as_str().unwrap_or("");
+    if asset.is_none() || !crate::remote_render::matches_output_key(task,id,mode,key) || saved!=crate::remote_render::receipt(id,asset,Some(key),mode) {
         return Err(AppError::Conflict("retired render receipt identity mismatch".into()))
     }
     Ok(Some(saved))
@@ -220,12 +220,12 @@ async fn recover_uploaded(
     let job: Uuid = row.try_get("job_id")?;
     let asset: Uuid = row.try_get("uploaded_asset_id")?;
     let mode: String = row.try_get("mode")?;
-    let key = crate::remote_render::output_key(task, id);
     let record = db.asset(asset).await?;
+    let key=record.storage_key.clone();
     if mode == "noop"
         || record.task_id != task
         || record.kind != crate::remote_render::output_kind(&mode)
-        || record.storage_key != key
+        || !crate::remote_render::matches_output_key(task,id,&mode,&key)
     {
         return Err(AppError::Conflict(
             "uploaded render asset identity mismatch".into(),

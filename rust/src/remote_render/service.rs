@@ -60,6 +60,14 @@ pub(crate) fn output_stage(mode: &str) -> &'static str {
 pub fn output_key(task_id: Uuid, execution_id: Uuid) -> String {
     format!("v2/render/{task_id}/remote-{execution_id}.mp4")
 }
+pub(crate) fn output_key_for_mode(task_id:Uuid,execution_id:Uuid,mode:&str)->String{
+    if mode=="soft_sub"{format!("v2/render/{task_id}/remote-{execution_id}.mkv")}else{output_key(task_id,execution_id)}
+}
+// Old native soft-subtitle receipts used .mp4 despite Matroska content.
+pub(crate) fn matches_output_key(task_id:Uuid,execution_id:Uuid,mode:&str,key:&str)->bool{
+    key==output_key_for_mode(task_id,execution_id,mode)
+        || (mode=="soft_sub" && key==output_key(task_id,execution_id))
+}
 pub fn validate_lease(row: &sqlx::postgres::PgRow, token: &str) -> AppResult<()> {
     let actual: String = row.try_get("fence_token")?;
     let status: String = row.try_get("state")?;
@@ -114,6 +122,11 @@ mod tests {
         let task = Uuid::new_v4();
         let exec = Uuid::new_v4();
         assert!(output_key(task, exec).starts_with("v2/render/"));
+        let soft=output_key_for_mode(task,exec,"soft_sub");
+        assert!(soft.ends_with(".mkv") && matches_output_key(task,exec,"soft_sub",&soft));
+        assert!(matches_output_key(task,exec,"soft_sub",&output_key(task,exec)));
+        assert!(!matches_output_key(task,exec,"burn_in",&soft));
+        assert!(!matches_output_key(task,Uuid::new_v4(),"soft_sub",&soft));
         assert_eq!(strong_token().len(), 64);
     }
 }

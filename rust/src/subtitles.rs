@@ -205,13 +205,23 @@ pub fn to_ass(
     primary_size: u32,
     bilingual: bool,
 ) -> AppResult<String> {
+    to_ass_scaled(cues,width,height,font,primary_size,bilingual,100,100)
+}
+/// Independently scale the two unscaled base sizes.
+pub fn to_ass_scaled(
+    cues:&[SubtitleCue],width:u32,height:u32,font:&str,base_size:u32,
+    bilingual:bool,primary_percent:u32,secondary_percent:u32,
+)->AppResult<String>{
     validate(cues)?;
     if !(160..=16384).contains(&width) || !(120..=16384).contains(&height) {
         return Err(AppError::Invalid("invalid ASS canvas dimensions".into()));
     }
-    if !(12..=120).contains(&primary_size) {
-        return Err(AppError::Invalid("invalid subtitle font size".into()));
+    if !(12..=120).contains(&base_size) || !(25..=300).contains(&primary_percent) || !(25..=300).contains(&secondary_percent) {
+        return Err(AppError::Invalid("invalid subtitle font size or scale".into()));
     }
+    let primary_size=((base_size*primary_percent+50)/100).max(12);
+    let secondary_base=(base_size as f64*0.68).round() as u32;
+    let secondary_size=((secondary_base*secondary_percent+50)/100).max(10);
     let sanitized_font: String = font
         .chars()
         .filter(|c| c.is_alphanumeric() || *c == ' ' || *c == '-' || *c == '_')
@@ -237,7 +247,6 @@ pub fn to_ass(
                 .as_deref()
                 .filter(|v| !v.trim().is_empty())
         {
-            let secondary_size = (primary_size as f64 * 0.68).round() as u32;
             text.push_str(&format!(
                 r"\N{{\fs{secondary_size}}}{}{{\fs{primary_size}}}",
                 escape_ass_text(secondary)
@@ -276,6 +285,19 @@ mod tests {
         assert!(ass.contains("Dialogue: 0,0:00:00.10,0:00:03.00"));
         assert!(!ass.contains(r"{\pos(0,0)}"));
         assert!(ass.contains("world"));
+    }
+    #[test]
+    fn independent_font_scales(){
+        let cues=[SubtitleCue{start_ms:0,end_ms:1000,text:"中文".into(),secondary_text:Some("English".into())}];
+        let ass=to_ass_scaled(&cues,1920,1080,"Arial",48,true,150,50).unwrap();
+        assert!(ass.contains("Style: Default,Arial,72,"));
+        assert!(ass.contains(r"\N{\fs17}English{\fs72}"));
+        let other=to_ass_scaled(&cues,1920,1080,"Arial",48,true,50,50).unwrap();
+        assert!(other.contains(r"\N{\fs17}English{\fs24}"));
+        assert!(to_ass_scaled(&cues,1920,1080,"Arial",48,true,24,100).is_err());
+        assert!(to_ass_scaled(&cues,1920,1080,"Arial",48,true,100,301).is_err());
+        assert_eq!(to_ass(&cues,1920,1080,"Arial",48,true).unwrap(),
+            to_ass_scaled(&cues,1920,1080,"Arial",48,true,100,100).unwrap());
     }
     #[test]
     fn malformed_timestamp_is_not_silently_clamped() {

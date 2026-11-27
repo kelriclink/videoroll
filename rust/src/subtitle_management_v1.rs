@@ -193,6 +193,11 @@ fn supported_update(key: &str) -> bool {
             | "use_intel_gpu"
             | "video_preset"
             | "video_crf"
+            | "primary_font_scale_percent"
+            | "secondary_font_scale_percent"
+            | "soft_sub"
+            | "publish_use_youtube_cover"
+            | "publish_typeid_mode"
     )
 }
 fn validate_update(update: &Map<String, Value>) -> AppResult<()> {
@@ -216,6 +221,8 @@ fn validate_update(update: &Map<String, Value>) -> AppResult<()> {
             | "auto_publish"
             | "burn_in"
             | "use_intel_gpu"
+            | "soft_sub"
+            | "publish_use_youtube_cover"
                 if !value.is_boolean() =>
             {
                 return Err(AppError::Invalid(format!("{key} requires bool")));
@@ -229,6 +236,12 @@ fn validate_update(update: &Map<String, Value>) -> AppResult<()> {
             }
             "auto_publish_platforms"=>{
                 crate::task_manual::auto_platform_selection(&json!({}),&json!({"auto_publish_platforms":value}))?;
+            }
+            "primary_font_scale_percent"|"secondary_font_scale_percent" if value.as_u64().is_none_or(|n|!(25..=300).contains(&n))=>{
+                return Err(AppError::Invalid("subtitle font scales must be 25..300".into()));
+            }
+            "publish_typeid_mode" if !value.as_str().is_some_and(|s|matches!(s,"meta"|"ai_summary"|"bilibili_predict"))=>{
+                return Err(AppError::Invalid("invalid Bilibili category mode".into()));
             }
             "video_codec" if !value.as_str().is_some_and(|s|matches!(s,"h264"|"av1"))=>{
                 return Err(AppError::Invalid("unsupported automatic render codec".into()));

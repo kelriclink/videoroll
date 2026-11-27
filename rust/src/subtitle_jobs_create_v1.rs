@@ -271,18 +271,7 @@ pub(crate) fn config(request: &Value) -> AppResult<(Uuid, String, Value)> {
             "output.render",
         )?;
     }
-    if render.is_some_and(|r| {
-        ["primary_font_scale_percent", "secondary_font_scale_percent"]
-            .iter()
-            .any(|field| {
-                r.get(*field)
-                    .is_some_and(|value| value.as_i64() != Some(100))
-            })
-    }) {
-        return Err(invalid(
-            "custom or invalid subtitle font scaling requires the unported render adapter",
-        ));
-    }
+    // Both scale fields now reach the native subtitle writer.
     if translation.is_some_and(|r| {
         r.get("glossary_id")
             .is_some_and(|v| !v.is_null() && v.as_str().is_none_or(|s| !s.is_empty()))
@@ -357,6 +346,8 @@ pub(crate) fn config(request: &Value) -> AppResult<(Uuid, String, Value)> {
             "use_intel_gpu",
             "video_preset",
             "video_crf",
+            "primary_font_scale_percent",
+            "secondary_font_scale_percent",
         ] {
             if let Some(value) = v.get(field) {
                 flat.insert(field.into(), value.clone());

@@ -82,7 +82,7 @@ pub async fn probe_video(binary: &Path, path: &Path) -> AppResult<Value> {
         .arg("-v")
         .arg("error")
         .arg("-show_entries")
-        .arg("format=duration:stream=codec_type,codec_name,width,height,pix_fmt,bits_per_raw_sample,avg_frame_rate,r_frame_rate")
+        .arg("format=duration,format_name:stream=codec_type,codec_name,width,height,pix_fmt,bits_per_raw_sample,avg_frame_rate,r_frame_rate")
         .arg("-of")
         .arg("json")
         .arg(path)
@@ -1149,6 +1149,21 @@ async fn commit_task_asset(
     Ok(json!({"storage_key":key,"sha256":sha,"size_bytes":size}))
 }
 /// Video rendering is native Rust orchestration; FFmpeg remains an external codec.
+pub(crate) fn is_soft_sub_media(probe:&Value)->bool{
+    probe["format"]["format_name"].as_str().is_some_and(|s|s.split(',').any(|f|f=="matroska"))
+        && probe["streams"].as_array().is_some_and(|s|s.iter().any(|v|v["codec_type"]=="subtitle" && v["codec_name"]=="subrip"))
+}
+async fn mux_soft_sub(config:&Config,input:&Path,srt:&Path,output:&Path)->AppResult<Value>{
+    let args=vec!["-hide_banner".into(),"-nostdin".into(),"-y".into(),"-v".into(),"error".into(),
+        "-i".into(),input.to_string_lossy().into_owned(),"-i".into(),srt.to_string_lossy().into_owned(),
+        "-map".into(),"0:v:0".into(),"-map".into(),"0:a?".into(),"-map".into(),"1:0".into(),
+        "-c:v".into(),"copy".into(),"-c:a".into(),"copy".into(),"-c:s".into(),"srt".into(),
+        "-metadata:s:s:0".into(),"language=chi".into(),"-f".into(),"matroska".into(),output.to_string_lossy().into_owned()];
+    run_ffmpeg(config,&args,"soft subtitle mux").await?;
+    let probe=probe_video(&config.ffprobe_binary,output).await?;
+    if !is_soft_sub_media(&probe){return Err(AppError::Conflict("soft subtitle output lacks MKV/SRT track".into()))}
+    Ok(json!({"encoder":"copy","pipeline":"soft_sub_mkv","subtitle_overlay_mode":"soft_sub"}))
+}
 pub async fn render(
     config: &Config,
     db: &Database,
@@ -1164,7 +1179,8 @@ pub async fn render(
     .bind(job.workflow_id)
     .fetch_one(&db.pool)
     .await?;
-    let existing = if selective {
+    let cfg = profile(db, job).await?;
+    let existing = if selective || cfg.soft_sub {
         None
     } else {
         latest_asset_key(db, job.task_id, "video_final").await?
@@ -1195,43 +1211,45 @@ pub async fn render(
     };
     let input = registry.resolve_existing(&source_key).await?;
     probe_video(&config.ffprobe_binary, &input).await?;
-    let cfg = profile(db, job).await?;
-    let subtitle_key = if let Some((_, ass, srt)) = explicit {
-        ass.or(srt)
-    } else if let Some((_, ass, _)) = pinned {
-        Some(ass)
-    } else {
-        latest_asset_key(db, job.task_id, "subtitle_ass")
-            .await?
-            .or(latest_asset_key(db, job.task_id, "subtitle_srt").await?)
-    };
+    let (ass,srt)=if let Some((_,ass,srt))=explicit{(ass,srt)}
+        else if let Some((_,ass,srt))=pinned{(Some(ass),Some(srt))}
+        else{(latest_asset_key(db,job.task_id,"subtitle_ass").await?,
+              latest_asset_key(db,job.task_id,"subtitle_srt").await?)};
+    // Match the remote worker: hard subtitles take precedence when both
+    // switches are on; otherwise mux a separate SRT track.
+    let burn=cfg.burn_in && (ass.is_some() || srt.is_some());
+    let soft=!burn && cfg.soft_sub && srt.is_some();
+    let subtitle_key=if burn{ass.or(srt)}else if soft{srt}else{None};
     let subtitle = match subtitle_key {
         Some(key) => Some(registry.resolve_existing(&key).await?),
         None => None,
     };
-    if !cfg.burn_in || subtitle.is_none() {
+    if !burn && !soft {
         // Reuse v2 original asset, keeping an explicit new reference.
         return ensure_task_asset(db, registry, job.task_id, job, "video_final", &source_key).await;
     }
-    let output_key = format!("v2/render/{}/{}.mp4", job.task_id, job.id);
+    let extension=if soft{"mkv"}else{"mp4"};
+    let output_key = format!("v2/render/{}/{}.{extension}", job.task_id, job.id);
     let output = registry.resolve_existing(&output_key).await?;
     if let Some(parent) = output.parent() {
         fs::create_dir_all(parent).await?;
     }
     if fs::metadata(&output).await.is_ok()
-        && probe_video(&config.ffprobe_binary, &output).await.is_ok()
+        && probe_video(&config.ffprobe_binary, &output).await.is_ok_and(|v|!soft || is_soft_sub_media(&v))
     {
         return ensure_task_asset(db, registry, job.task_id, job, "video_final", &output_key).await;
     }
     let temp = Builder::new()
         .prefix(".render-attempt-")
-        .suffix(".partial.mp4")
+        .suffix(&format!(".partial.{extension}"))
         .tempfile_in(
             output
                 .parent()
                 .ok_or_else(|| AppError::Invalid("render output parent missing".into()))?,
         )?;
-    let render_metrics = transcode(config, &input, temp.path(), subtitle.as_deref(), &cfg).await?;
+    let render_metrics = if soft{
+        mux_soft_sub(config,&input,subtitle.as_deref().ok_or_else(||AppError::Conflict("soft subtitle input missing".into()))?,temp.path()).await?
+    }else{transcode(config, &input, temp.path(), subtitle.as_deref(), &cfg).await?};
     probe_video(&config.ffprobe_binary, temp.path()).await?;
     fs::File::open(temp.path()).await?.sync_all().await?;
     let mut result =
