@@ -68,3 +68,7 @@ SAU 代码检查：当前原生领取仍采用全局单投稿互斥；账户导�
 基线 6238f40。对照 Python youtube_service.py:240-307、video_pipeline.py、publishing_service.py:692-735。V1 自动入口与 Remote API 的旧 auto_publish 参数仅保留 wire/hash 契约，不再冻结 false 或 B站；首页及频道自动扫描、明确的旧版自动启动使用 legacy_auto_runtime_profile 标记，ASR 模型与渲染默认按当前 profile；直接 V2 请求及手动参数不变。授权 proof 与新 Task/工作流同事务。已有工作流不改写；历史恢复明确禁用自动投稿/配音的围栏保留。
 
 用户纠正原 Python 设计：自动配音只看 auto_dub_p2，不依赖 auto_publish 或 B站目标。保持 Rust 原语义，统一旧 auto_dubbing 接口与任务详情显示、设置文字；允许原 profile PUT 单独更新 auto_dub_p2 和前缀。手动 dubbing.enabled 优先，保留无语音、暂停、成果复用等原条件。配音成果仍可用于后续 B站双 P，不强制投稿。未开放其他尚未完整验收的 profile 字段，旧前端全表单保存仍需后续适配；旧运行中的冻结配置不批量改写。测试只用隔离库与实际阶段配置读取，无真实平台或 GPU 执行。
+
+## 第三十五批：ASR/翻译配置入口收尾
+
+基线 320a55d。对照 Python auto_profile_store.py:get_auto_profile/update_auto_profile、schemas.py:245-335、translation_checkpoint.py、translation_stage.py 与 Rust media/asr.rs:settings/runtime_asr_config、youtube_subtitles.rs。Rust 已支持实际阶段读取 ASR engine/model、摘要开关和三种 YouTube 字幕策略，原 profile PUT 却拒绝这些字段。本批开放已支持字段，校验类型/长度/枚举，模型空字符串清除覆盖，显式字幕模式优先、兼容布尔同步，旧仅布尔记录读取一致。设置首写采用与通用 settings 一致的 advisory lock 及原表冲突安全插入，避免并发首写覆盖；无新表。前端基于已加载表单快照仅发送实际改动，不丢弃未知改动或绕过未实现字段的拒绝。仍不开放尚未完全验收的格式/渲染/投稿等字段。配音和投稿保持独立。原 RAG/Agent/checkpoint 全行为仍需专项复查，本批不是完整迁移签收。

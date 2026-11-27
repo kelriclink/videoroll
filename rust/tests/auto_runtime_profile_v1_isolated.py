@@ -4,6 +4,7 @@ from urllib.error import HTTPError
 from urllib.request import Request,urlopen
 from urllib.parse import urlsplit
 from uuid import uuid4
+from concurrent.futures import ThreadPoolExecutor
 import psycopg
 
 uri=os.environ["DATABASE_URL"]
@@ -16,6 +17,27 @@ def call(path,body,method="POST"):
     with r:return r.status,json.loads(r.read())
 def flow(t):
     with db() as c:return c.execute("SELECT id,configuration FROM vr2_workflows WHERE task_id=%s ORDER BY generation",(t,)).fetchall()
+# Concurrent first saves must merge rather than lose one of the edits.
+with db() as c:
+    c.execute("DELETE FROM app_settings WHERE key='subtitle.auto_profile'")
+with ThreadPoolExecutor(max_workers=2) as pool:
+    replies=list(pool.map(lambda p:call("/subtitle/auto/profile",p,"PUT"),[{"asr_engine":"auto","asr_model":"fixture-asr"},{"translate_enable_summary":False,"youtube_subtitle_mode":"auto_source"}]))
+assert all(code==200 for code,_ in replies),replies
+def persisted():
+    with db() as c:return c.execute("SELECT value_json FROM app_settings WHERE key='subtitle.auto_profile'").fetchone()[0]
+assert persisted()["asr_model"]=="fixture-asr" and persisted()["translate_enable_summary"] is False
+assert persisted()["youtube_subtitle_mode"]=="auto_source" and persisted()["prefer_youtube_subtitles"] is True
+assert call("/subtitle/auto/profile",{"prefer_youtube_subtitles":False},"PUT")[1]["youtube_subtitle_mode"]=="off"
+assert call("/subtitle/auto/profile",{"youtube_subtitle_mode":"auto_source","prefer_youtube_subtitles":False},"PUT")[1]["prefer_youtube_subtitles"] is True
+assert call("/subtitle/auto/profile",{"asr_model":""},"PUT")[1]["asr_model"] is None
+assert persisted()["asr_model"] is None
+saved=persisted()
+for bad in ({"asr_engine":"invalid"},{"youtube_subtitle_mode":"invalid"},{"translate_enable_summary":"false"},{"asr_model":"x\n"},{"asr_model":"a"*1025}):
+    assert call("/subtitle/auto/profile",bad,"PUT")[0]==400
+    assert persisted()==saved
+assert call("/subtitle/auto/profile",{"formats":["srt"],"asr_model":"must-not-save"},"PUT")[0]==409
+assert persisted()==saved
+print("PASS: original ASR/summary/caption profile writes, concurrent first-save merge, validation and atomic rejection")
 with db() as c:
     c.execute("INSERT INTO app_settings(key,value_json) VALUES('subtitle.auto_profile',%s::jsonb) ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json",(json.dumps({"auto_publish":False,"auto_publish_platforms":["douyin"],"auto_dub_p2":False}),))
 for video,switch in (("AutoCfg0001",True),("AutoCfg0002",False),("AutoCfg0003",None)):

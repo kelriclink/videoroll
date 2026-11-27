@@ -94,10 +94,9 @@ pub(crate) fn normalized_profile(raw: &Value) -> Value {
     {
         out.insert("translate_provider".into(), json!("openai"));
     }
-    let mode = out
-        .get("youtube_subtitle_mode")
-        .and_then(Value::as_str)
-        .unwrap_or("target");
+    // Older profiles may only contain the compatibility boolean.
+    let mode = raw["youtube_subtitle_mode"].as_str()
+        .unwrap_or(if raw["prefer_youtube_subtitles"].as_bool()==Some(false) {"off"} else {"target"});
     let mode = if matches!(mode, "off" | "target" | "auto_source") {
         mode.to_owned()
     } else {
@@ -145,6 +144,11 @@ fn supported_update(key: &str) -> bool {
             | "target_lang"
             | "bilingual"
             | "asr_language"
+            | "asr_engine"
+            | "asr_model"
+            | "prefer_youtube_subtitles"
+            | "youtube_subtitle_mode"
+            | "translate_enable_summary"
             | "translate_style"
             | "translate_provider"
             | "translate_model_provider_id"
@@ -172,6 +176,8 @@ fn validate_update(update: &Map<String, Value>) -> AppResult<()> {
             | "publish_translate_title"
             | "publish_enable_reprint"
             | "auto_dub_p2"
+            | "prefer_youtube_subtitles"
+            | "translate_enable_summary"
                 if !value.is_boolean() =>
             {
                 return Err(AppError::Invalid(format!("{key} requires bool")));
@@ -182,6 +188,16 @@ fn validate_update(update: &Map<String, Value>) -> AppResult<()> {
                     .is_none_or(|s| s.chars().count() > 40 || s.chars().any(char::is_control)) =>
             {
                 return Err(AppError::Invalid("invalid publish title prefix".into()));
+            }
+            "asr_engine" if !value.as_str().is_some_and(|s|matches!(s,
+                "auto"|"mock"|"faster-whisper"|"openvino"|"external-whisper"|"groq-whisper"|"cloudflare-workers-ai"))=>{
+                return Err(AppError::Invalid("unsupported ASR engine".into()));
+            }
+            "asr_model" if value.as_str().is_none_or(|s|s.len()>1024 || s.chars().any(char::is_control))=>{
+                return Err(AppError::Invalid("invalid ASR model".into()));
+            }
+            "youtube_subtitle_mode" if !value.as_str().is_some_and(|s|matches!(s,"off"|"target"|"auto_source"))=>{
+                return Err(AppError::Invalid("invalid YouTube subtitle mode".into()));
             }
             "translate_provider"
                 if !value.as_str().is_some_and(|s| {
@@ -219,6 +235,12 @@ async fn profile_put(
         .ok_or_else(|| AppError::Invalid("subtitle profile must be a JSON object".into()))?;
     validate_update(update)?;
     let mut tx = state.db.pool.begin().await?;
+    // Serialize the first write too; a missing row cannot be locked by
+    // SELECT FOR UPDATE. Share the original setting with other API writers.
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('app.settings:subtitle.auto_profile',0))")
+        .execute(&mut *tx).await?;
+    sqlx::query("INSERT INTO app_settings(key,value_json,version) VALUES('subtitle.auto_profile','{}'::jsonb,0) ON CONFLICT(key) DO NOTHING")
+        .execute(&mut *tx).await?;
     let raw: Value = sqlx::query_scalar(
         "SELECT value_json FROM app_settings WHERE key='subtitle.auto_profile' FOR UPDATE",
     )
@@ -230,6 +252,18 @@ async fn profile_put(
         if !val.is_null() {
             merged.insert(key.clone(), val.clone());
         }
+    }
+    if let Some(model)=update.get("asr_model").and_then(Value::as_str){
+        let model=model.trim();
+        merged.insert("asr_model".into(),if model.is_empty(){Value::Null}else{json!(model)});
+    }
+    // One authoritative mode. A legacy boolean-only update must not be
+    // masked by a previously saved mode; explicit mode wins if both arrive.
+    if let Some(mode)=update.get("youtube_subtitle_mode").and_then(Value::as_str){
+        merged.insert("prefer_youtube_subtitles".into(),json!(mode!="off"));
+    }else if let Some(prefer)=update.get("prefer_youtube_subtitles").and_then(Value::as_bool){
+        let mode=if !prefer{"off"}else if merged.get("youtube_subtitle_mode").and_then(Value::as_str)==Some("auto_source"){"auto_source"}else{"target"};
+        merged.insert("youtube_subtitle_mode".into(),json!(mode));
     }
     let normalized = normalized_profile(&Value::Object(merged.clone()));
     if normalized.get("translate_enabled").and_then(Value::as_bool) == Some(true)
@@ -613,5 +647,9 @@ mod tests {
         assert!(validate_update(json!({"translate_enabled":false}).as_object().unwrap()).is_ok());
         assert!(validate_update(json!({"auto_dub_p2":true,"auto_dub_p2_prefix":"【中配】"}).as_object().unwrap()).is_ok());
         assert!(validate_update(json!({"auto_dub_p2":"true"}).as_object().unwrap()).is_err());
+        assert!(validate_update(json!({"asr_engine":"external-whisper","asr_model":"whisper-1","translate_enable_summary":false,"youtube_subtitle_mode":"auto_source"}).as_object().unwrap()).is_ok());
+        assert!(validate_update(json!({"asr_engine":"not-an-engine"}).as_object().unwrap()).is_err());
+        assert!(validate_update(json!({"youtube_subtitle_mode":"invalid"}).as_object().unwrap()).is_err());
+        assert_eq!(normalized_profile(&json!({"prefer_youtube_subtitles":false}))["youtube_subtitle_mode"],"off");
     }
 }

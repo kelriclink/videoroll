@@ -5,6 +5,7 @@ import { ModelChoiceSelect } from "../components/ModelChoiceSelect";
 import { translateApi, type ModelProvider } from "../api/translate";
 import { Button, SettingsSaveBar } from "../components/ui";
 import { useUnsavedChangesGuard } from "../hooks/useUnsavedChangesGuard";
+import { autoProfilePatch } from "./autoProfilePatch";
 import { fetchJson } from "../lib/http";
 import { ORCHESTRATOR_URL } from "../lib/urls";
 import {
@@ -299,10 +300,7 @@ export default function SettingsAutoPage() {
         throw new Error("辅字幕字号百分比必须在 25~300 之间");
       }
       const presetRaw = videoPresetText.trim();
-      await fetchJson(`${ORCHESTRATOR_URL}/subtitle/auto/profile`, {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
+      const payload = {
           formats: formatsOut,
           burn_in: burnIn,
           soft_sub: softSub,
@@ -335,8 +333,15 @@ export default function SettingsAutoPage() {
           publish_translate_title: publishTranslateTitle,
           publish_use_youtube_cover: publishUseYouTubeCover,
           publish_enable_reprint: publishEnableReprint,
-        }),
-      });
+      };
+      const patch = autoProfilePatch(payload, savedSnapshotRef.current, currentSnapshot);
+      if (Object.keys(patch).length) {
+        await fetchJson(`${ORCHESTRATOR_URL}/subtitle/auto/profile`, {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(patch),
+        });
+      }
       await refresh();
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : String(e));
