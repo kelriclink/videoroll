@@ -138,7 +138,7 @@ try:
         (root/"videoroll.dump.sha256").write_text(report["archive_sha256"]+"  videoroll.dump\n")
     mark(f"consistent snapshot logical backup: {len(expected)} tables, {report['archive_bytes']} bytes, verified SHA-256")
     capture(["docker","volume","create","--label","io.videoroll.purpose=db-rehearsal",volume]);vol_created=True
-    capture(["docker","run","-d","--name",name,"--network","none","--label","io.videoroll.purpose=db-rehearsal",
+    capture(["docker","run","-d","--name",name,"--network","none","--memory=5g","--cpus=8","--label","io.videoroll.purpose=db-rehearsal",
         "-e","POSTGRES_HOST_AUTH_METHOD=trust","-e","POSTGRES_USER=postgres",
         "--mount",f"type=volume,source={volume},target=/var/lib/postgresql",
         "--mount",f"type=bind,source={sock},target=/rehearsal-socket",
@@ -194,7 +194,12 @@ try:
     with log.open("ab") as err:
         proc([str(binary),"migrate"],env=env,stdout=err,stderr=err,timeout=300)
     report["migration_seconds"]=round(time.monotonic()-t,2)
-    assert clone("SELECT count(*) FROM _sqlx_migrations WHERE success;")=="40"
+    migrations=sorted((Path(__file__).resolve().parents[1]/"migrations").glob("*.sql"))
+    expected_versions=sorted(int(p.name.split("_",1)[0]) for p in migrations)
+    actual_versions=[int(v) for v in clone("SELECT version FROM _sqlx_migrations WHERE success ORDER BY version;").splitlines()]
+    assert actual_versions==expected_versions,"candidate migration inventory mismatch"
+    assert clone("SELECT count(*) FROM _sqlx_migrations WHERE NOT success;")=="0"
+    expected_count=len(expected_versions)
     assert clone("SELECT count(*) FROM pg_tables WHERE schemaname='public' AND tablename LIKE 'vr2_%';")=="0"
     migrated=counts(clone(inventory))
     # All original physical tables and row counts preserved; extra Rust
@@ -202,7 +207,7 @@ try:
     assert all(migrated.get(k)==v for k,v in expected.items()),"original row counts changed during migration"
     report["original_tables"]=len(expected)
     report["original_rows"]=sum(expected.values())
-    report["migration_success_count"]=40
+    report["migration_success_count"]=expected_count
     report["physical_vr2_tables"]=0
     # Audit only; strict admission should still block unknown historical
     # effects. Do not adopt, modify or call any live platform.
@@ -211,7 +216,7 @@ try:
     out=json.loads(q.stdout[q.stdout.index("{"):])
     assert q.returncode!=0 and out["ready"] is False
     report["strict_preflight_blockers"]=out["historical_blockers"]
-    mark(f"40 migrations on full restored rows; original row counts preserved; strict preflight correctly blocked")
+    mark(f"{expected_count} migrations on full restored rows; original row counts preserved; strict preflight correctly blocked")
     report["status"]="passed"
 finally:
     if snapshot_proc is not None:

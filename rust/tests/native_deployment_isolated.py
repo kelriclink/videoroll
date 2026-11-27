@@ -1,12 +1,12 @@
 """Actual isolated native stack, no legacy broker, no real platform calls."""
-import os,sys,json,uuid,subprocess,time,signal,socket
+import os,sys,json,uuid,subprocess,time,signal,socket,shutil,re
 from pathlib import Path
 from urllib.request import Request,urlopen,build_opener,HTTPRedirectHandler
 from urllib.error import HTTPError,URLError
 import psycopg
 
 repo=Path(__file__).resolve().parents[2]
-target=repo/"rust/target/debug"
+target=Path(os.environ.get("VIDEOROLL_TEST_SCHEMA_BINARY",str(repo/"rust/target/debug/videoroll-v2"))).resolve(strict=True).parent
 url=os.environ["DATABASE_URL"]
 assert "127.0.0.1:" in url and url.endswith("/videoroll_test")
 root=Path(os.environ["VIDEOROLL_V2_STORAGE_ROOT"])
@@ -122,10 +122,22 @@ try:
     runtime=root/"nginx";runtime.mkdir()
     # Isolated fixture only: allow the unprivileged Nginx worker to traverse.
     root.chmod(0o755)
-    web=root/"web";web.mkdir();(web/"index.html").write_text("<html>isolated-native-web</html>")
-    config=(repo/"deploy/rust-native/nginx.conf").read_text().replace("worker_processes 2;","worker_processes 1;").replace("/opt/videoroll-rust/current/share/nginx/mime.types","/opt/videoroll/share/nginx/mime.types").replace("/run/videoroll-rust-nginx",str(runtime)).replace("/opt/videoroll-rust/current/web",str(web)).replace("127.0.0.1:18080",f"127.0.0.1:{ports['api']}").replace("127.0.0.1:13001",f"127.0.0.1:{ports['web']}")
+    web=root/"web"
+    release=os.environ.get("VIDEOROLL_TEST_RELEASE_ROOT")
+    if release:
+        release=Path(release).resolve(strict=True)
+        assert target==release/"bin"
+        shutil.copytree(release/"web",web)
+        config_source=release/"deploy/rust-native/nginx.conf"
+        mime=release/"share/nginx/mime.types"
+        nginx=str(release/"bin/nginx")
+    else:
+        web.mkdir();(web/"index.html").write_text("<html>isolated-native-web</html>")
+        config_source=repo/"deploy/rust-native/nginx.conf"
+        mime=Path("/opt/videoroll/share/nginx/mime.types")
+        nginx="/opt/videoroll/bin/nginx"
+    config=config_source.read_text().replace("worker_processes 2;","worker_processes 1;").replace("/opt/videoroll-rust/current/share/nginx/mime.types",str(mime)).replace("/run/videoroll-rust-nginx",str(runtime)).replace("/opt/videoroll-rust/current/web",str(web)).replace("127.0.0.1:18080",f"127.0.0.1:{ports['api']}").replace("127.0.0.1:13001",f"127.0.0.1:{ports['web']}")
     conf=runtime/"nginx.conf";conf.write_text(config)
-    nginx="/opt/videoroll/bin/nginx"
     subprocess.run([nginx,"-t","-c",str(conf),"-p",str(runtime)],check=True,timeout=10)
     start("nginx",[nginx,"-c",conf,"-p",runtime,"-g","daemon off;"])
     wait(ports["web"],"/api/health")
@@ -140,8 +152,17 @@ try:
     assert get(p,"/internal/desktop-auth")[0]==404
     assert get(p,"/social-login/vnc.html")[0] in (401,403)
     assert get(p,"/openapi.json")[0]==404
-    assert b"isolated-native-web" in get(p,"/workflow-ui/")[1]
-    assert b"isolated-native-web" in get(p,"/")[1]
+    index=(web/"index.html").read_bytes()
+    assert get(p,"/workflow-ui/")[1]==index
+    assert get(p,"/")[1]==index
+    if release:
+        paths=re.findall(rb'(?:src|href)="(/assets/[^"]+)"',index)
+        assert any(path.endswith(b".js") for path in paths)
+        for raw in paths:
+            path=raw.decode("ascii")
+            code,body,_=get(p,path)
+            assert code==200 and body==(web/path.lstrip("/")).read_bytes(),path
+        print(f"PASS: staged production index and {len(paths)} entry assets served byte-for-byte",flush=True)
     for proc,log in procs:assert proc.poll() is None,log.read_text()
     print("PASS: seven native processes and real Nginx; original browser routes, V1/V2 API, worker protocol, protected noVNC and workflow redirect; no broker",flush=True)
 finally:

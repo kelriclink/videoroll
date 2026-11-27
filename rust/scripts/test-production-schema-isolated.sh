@@ -28,11 +28,19 @@ docker run -d --rm --pull=never --name "$name" --memory=512m \
   --mount "type=volume,source=$volume,target=/var/lib/postgresql" \
   -p 127.0.0.1::5432 -e POSTGRES_PASSWORD=videoroll-isolated-schema \
   -e POSTGRES_DB=videoroll_test pgvector/pgvector:pg18 >/dev/null
-for i in $(seq 1 60); do
-  if docker logs "$name" 2>&1 | grep -q 'PostgreSQL init process complete; ready for start up' &&
-     docker exec "$name" pg_isready -U postgres -d videoroll_test >/dev/null 2>&1; then break; fi
+ready=false
+# pg_isready alone accepts the temporary initdb socket, even before the
+# fixture database exists. Wait for the final PID 1 postmaster and an
+# actual TCP query to our disposable database, not just a listening socket.
+for i in $(seq 1 180); do
+  if docker exec "$name" sh -c 'test "$(cat /proc/1/comm)" = postgres && PGPASSWORD="$POSTGRES_PASSWORD" psql -X -h 127.0.0.1 -U postgres -d videoroll_test -qAt -v ON_ERROR_STOP=1 -c "SELECT 1;"' 2>/dev/null | grep -qx 1; then
+    ready=true; break
+  fi
   sleep 1
 done
+if [[ "$ready" != true ]]; then
+  echo 'isolated PostgreSQL failed final readiness check' >&2; exit 1
+fi
 docker exec "$name" psql -X -v ON_ERROR_STOP=1 -U postgres -d videoroll_test -c 'DROP SCHEMA public CASCADE;' >/dev/null
 python3 - "$VIDEOROLL_TEST_SCHEMA_SNAPSHOT" <<'PY' | docker exec -i "$name" psql -X -v ON_ERROR_STOP=1 -U postgres -d videoroll_test >/dev/null
 import sys
@@ -56,8 +64,8 @@ case "${VIDEOROLL_TEST_SCHEMA_SCENARIO:-recovery}" in
   recovery) ;;
   native-stack|outbox|batch|render-events)
     # Existing repository-owned isolation tests; each gets a fresh database.
-    # These cases currently resolve the executable from target/debug.
-    test "$(realpath "$VIDEOROLL_TEST_SCHEMA_BINARY")" = "$(realpath target/debug/videoroll-v2)"
+    export VIDEOROLL_TEST_SCHEMA_BINARY="$(realpath "$VIDEOROLL_TEST_SCHEMA_BINARY")"
+    test -x "$VIDEOROLL_TEST_SCHEMA_BINARY"
     "$VIDEOROLL_TEST_SCHEMA_BINARY" migrate >/dev/null
     export PYTHONPATH="$(dirname "$PWD")/src"
     case "$VIDEOROLL_TEST_SCHEMA_SCENARIO" in

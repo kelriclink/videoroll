@@ -9,7 +9,7 @@ from videoroll.apps.outbox.service import claim_outbox_events
 url=os.environ["DATABASE_URL"]
 assert "127.0.0.1:" in url and url.endswith("/videoroll_test")
 root=Path(os.environ["VIDEOROLL_V2_STORAGE_ROOT"])
-exe=Path(__file__).resolve().parents[1]/"target/debug/videoroll-v2"
+exe=Path(os.environ.get("VIDEOROLL_TEST_SCHEMA_BINARY",str(Path(__file__).resolve().parents[1]/"target/debug/videoroll-v2"))).resolve(strict=True)
 migration=Path(__file__).resolve().parents[1]/"migrations/20261124000038_native_publish_batch_events.sql"
 def db(): return psycopg.connect(url)
 def tick(command="publish-batch-tick"):
