@@ -31,8 +31,18 @@ pub(super) fn refine(cues: &mut [SubtitleCue], spans: &[(u64, u64)], end_limit: 
         return;
     }
     let original = cues.to_vec();
+    let monotone = spans
+        .windows(2)
+        .all(|w| w[0].0 <= w[1].0 && w[0].1 <= w[1].1);
     for cue in cues.iter_mut() {
-        let relevant = spans
+        let range = if monotone {
+            let lo = spans.partition_point(|(_, b)| *b <= cue.start_ms);
+            let hi = spans.partition_point(|(a, _)| *a < cue.end_ms);
+            &spans[lo.min(hi)..hi]
+        } else {
+            spans
+        };
+        let relevant = range
             .iter()
             .filter(|(a, b)| *a < cue.end_ms && *b > cue.start_ms);
         let a = relevant.clone().map(|(a, _)| *a).min();

@@ -6,6 +6,7 @@ import { ORCHESTRATOR_URL } from "../lib/urls";
 import { reconcileAgentRunStatuses } from "../pages/dashboardPage.helpers";
 import {
   buildAgentMonitorGroups,
+  thinkingText,
   type AgentMonitorRun,
 } from "./AgentMonitorPanel.helpers";
 
@@ -128,6 +129,7 @@ function AgentCard({
   const activeDescendants = runningDescendants(run, childrenByParent);
   const meta = statusMeta(run, activeDescendants);
   const action = latestAction(run);
+  const thinking = thinkingText(run);
   const progress = sessionProgress(run, childrenByParent);
   const directChildren = childrenByParent.get(run.id) ?? [];
   const percent = progress ? Math.max(0, Math.min(100, progress.completed / progress.total * 100)) : 0;
@@ -185,6 +187,12 @@ function AgentCard({
               {new Date(run.updated_at).toLocaleTimeString()}
             </div>
           </div>
+          {thinking ? (
+            <div className="mt-2">
+              <div className="mb-1 text-[10px] text-slate-500">模型返回的推理内容</div>
+              <pre className="max-h-48 overflow-auto whitespace-pre-wrap break-words rounded bg-slate-50 p-2 font-sans dark:bg-slate-900">{thinking}</pre>
+            </div>
+          ) : null}
           {run.error ? (
             <div className="mt-2 line-clamp-3 text-rose-700 dark:text-rose-300">{run.error}</div>
           ) : null}

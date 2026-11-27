@@ -8,3 +8,5 @@ pub(crate) mod render_optimization;
 pub mod translation_context;
 pub mod translation_quality;
 pub mod youtube_subtitles;
+
+pub(crate) mod translation_trace;

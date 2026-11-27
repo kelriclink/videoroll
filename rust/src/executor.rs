@@ -317,6 +317,11 @@ impl Executor {
                             }
                         }
                     };
+                    // Release process/HTTP guards before recording terminal state.
+                    drop(future);
+                    if job.stage == Stage::Subtitle {
+                        crate::media::translation_trace::interrupt(&self.db, &job).await;
+                    }
                     let commit = match outcome {
                         Ok(result) => self.scheduler.complete(&job, result).await,
                         Err(err) => {
