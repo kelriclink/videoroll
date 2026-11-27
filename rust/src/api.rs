@@ -85,19 +85,14 @@ pub(crate) async fn admin_login(
     ConnectInfo(address): ConnectInfo<SocketAddr>,
     Json(body): Json<PasswordRequest>,
 ) -> AppResult<(HeaderMap, Json<Value>)> {
-    let source = auth::caller_identity(&headers, Some(address));
-    auth::ensure_login_allowed(&state.db, &source).await?;
+    let source = crate::trusted_proxies::caller_identity(&headers, Some(address)).await;
     let secret = state
         .config
         .legacy_internal_secret
         .as_deref()
         .ok_or_else(|| AppError::Unavailable("native admin login not configured".into()))?;
     let stored = auth::password_hash(&state.db).await?;
-    let valid = auth::verify_password(&body.password, &stored);
-    auth::record_login_result(&state.db, &source, valid).await?;
-    if !valid {
-        return Err(AppError::Unauthorized);
-    }
+    auth::authenticate_password(&state.db, &source, body.password, &stored).await?;
     let cookie = auth::mint_cookie(secret, &stored, chrono::Utc::now().timestamp());
     let mut headers = HeaderMap::new();
     headers.insert(

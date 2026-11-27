@@ -30,12 +30,23 @@ pub enum AppError {
     Unauthorized,
     #[error("too many login attempts")]
     RateLimited,
+    #[error("too many authentication attempts")]
+    AuthThrottled { retry_after: u64 },
+    #[error("authentication rate limiter unavailable")]
+    AuthenticationUnavailable,
     #[error("stage is not available: {0}")]
     Unavailable(String),
 }
 pub type AppResult<T> = std::result::Result<T, AppError>;
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
+        if let Self::AuthThrottled { retry_after } = &self {
+            let mut response=(StatusCode::TOO_MANY_REQUESTS,Json(json!({"detail":self.to_string()}))).into_response();
+            if let Ok(value)=axum::http::HeaderValue::from_str(&retry_after.to_string()) {
+                response.headers_mut().insert(axum::http::header::RETRY_AFTER,value);
+            }
+            return response;
+        }
         let code = match self {
             Self::Database(_) | Self::Io(_) | Self::Migration(_) => {
                 StatusCode::INTERNAL_SERVER_ERROR
@@ -47,7 +58,8 @@ impl IntoResponse for AppError {
             Self::Conflict(_) => StatusCode::CONFLICT,
             Self::Forbidden(_) => StatusCode::FORBIDDEN,
             Self::Unauthorized => StatusCode::UNAUTHORIZED,
-            Self::RateLimited => StatusCode::TOO_MANY_REQUESTS,
+            Self::RateLimited | Self::AuthThrottled { .. } => StatusCode::TOO_MANY_REQUESTS,
+            Self::AuthenticationUnavailable => StatusCode::SERVICE_UNAVAILABLE,
         };
         let public = match code {
             StatusCode::INTERNAL_SERVER_ERROR => "internal server error".to_string(),

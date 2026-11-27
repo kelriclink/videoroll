@@ -110,6 +110,7 @@ pub mod system_resources;
 pub mod task_manual;
 pub mod task_ownership;
 pub mod telemetry;
+mod trusted_proxies;
 pub mod youdub_control_v1;
 pub mod youtube_home_feed_v1;
 pub mod youtube_home_run_v1;

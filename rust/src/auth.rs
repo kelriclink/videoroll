@@ -7,14 +7,14 @@ use pbkdf2::pbkdf2_hmac;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use sqlx::Row;
-use std::net::SocketAddr;
 use subtle::ConstantTimeEq;
 use uuid::Uuid;
 
 type Hmac256 = Hmac<Sha256>;
 const COOKIE_NAME: &str = "videoroll_admin_device";
 const MAX_AGE: i64 = 180 * 24 * 3600;
-const MAX_FAILED_ATTEMPTS: i32 = 8;
+const MAX_FAILED_ATTEMPTS: i32 = 5;
+const LOGIN_BURST_SECONDS: i64 = 60;
 
 fn mac(key: &[u8], data: &[u8]) -> Vec<u8> {
     let mut h = Hmac256::new_from_slice(key).expect("HMAC key");
@@ -156,61 +156,65 @@ pub async fn auth_status(headers: &HeaderMap, db: &Database, config: &Config) ->
     let trusted = request_authenticated(headers, db, config).await;
     Ok(json!({"password_set":!password.is_empty(),"trusted":trusted}))
 }
-pub async fn ensure_login_allowed(db: &Database, source: &str) -> AppResult<()> {
-    let key = hex::encode(Sha256::digest(source.as_bytes()));
-    let row = sqlx::query(
-        "SELECT failures,blocked_until,window_started FROM auth_login_limits WHERE source_key=$1",
-    )
-    .bind(&key)
-    .fetch_optional(&db.pool)
-    .await?;
-    if let Some(row) = row {
-        let until: Option<chrono::DateTime<chrono::Utc>> = row.try_get("blocked_until")?;
-        if until.is_some_and(|date| date > chrono::Utc::now()) {
-            return Err(AppError::RateLimited);
-        }
-    }
-    Ok(())
+fn lockout_seconds(attempts:i32)->i64 {
+    if attempts<MAX_FAILED_ATTEMPTS{return LOGIN_BURST_SECONDS}
+    (120i64 << (attempts-MAX_FAILED_ATTEMPTS).clamp(0,16)).min(3600)
 }
-pub async fn record_login_result(db: &Database, source: &str, success: bool) -> AppResult<()> {
-    let key = hex::encode(Sha256::digest(source.as_bytes()));
-    if success {
+fn unavailable(error:sqlx::Error)->AppError {
+    tracing::warn!(%error,"authentication limiter unavailable");
+    AppError::AuthenticationUnavailable
+}
+
+/// Reserve an attempt before expensive password verification. PostgreSQL
+/// row locking closes the check/increment race without holding a transaction
+/// during PBKDF2. An interrupted verification consumes its reserved attempt.
+async fn reserve_login_attempt(db:&Database,source:&str)->AppResult<(i32,u64)> {
+    let key=hex::encode(Sha256::digest(source.as_bytes()));
+    let mut tx=db.pool.begin().await.map_err(unavailable)?;
+    sqlx::query("INSERT INTO auth_login_limits(source_key,failures) VALUES($1,0)
+        ON CONFLICT(source_key) DO NOTHING").bind(&key).execute(&mut *tx).await.map_err(unavailable)?;
+    let row=sqlx::query("SELECT failures,blocked_until,window_started FROM auth_login_limits
+        WHERE source_key=$1 FOR UPDATE").bind(&key).fetch_one(&mut *tx).await.map_err(unavailable)?;
+    let now:chrono::DateTime<chrono::Utc>=sqlx::query_scalar("SELECT clock_timestamp()")
+        .fetch_one(&mut *tx).await.map_err(unavailable)?;
+    let until:Option<chrono::DateTime<chrono::Utc>>=row.try_get("blocked_until").map_err(unavailable)?;
+    let last:chrono::DateTime<chrono::Utc>=row.try_get("window_started").map_err(unavailable)?;
+    let previous:i32=row.try_get("failures").map_err(unavailable)?;
+    let active=until.map_or(last+chrono::Duration::seconds(LOGIN_BURST_SECONDS)>now,|v|v>now);
+    let attempts=if active {previous.max(0).saturating_add(1).min(1_000_000)}else{1};
+    let seconds=lockout_seconds(attempts);
+    let blocked=(attempts>=MAX_FAILED_ATTEMPTS).then_some(now+chrono::Duration::seconds(seconds));
+    sqlx::query("UPDATE auth_login_limits SET failures=$2,window_started=$3,blocked_until=$4 WHERE source_key=$1")
+        .bind(&key).bind(attempts).bind(now).bind(blocked).execute(&mut *tx).await.map_err(unavailable)?;
+    tx.commit().await.map_err(unavailable)?;
+    Ok((attempts,seconds as u64))
+}
+
+/// Bound CPU work across callers and allow only the first five concurrent
+/// attempts per source to reach password verification.
+pub async fn authenticate_password(db:&Database,source:&str,password:String,stored:&str)->AppResult<()> {
+    static HASH_SLOTS:std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>>=std::sync::OnceLock::new();
+    let permit=HASH_SLOTS.get_or_init(||std::sync::Arc::new(tokio::sync::Semaphore::new(8)))
+        .clone().try_acquire_owned().map_err(|_|AppError::AuthThrottled{retry_after:1})?;
+    let (attempts,seconds)=reserve_login_attempt(db,source).await?;
+    if attempts>MAX_FAILED_ATTEMPTS {
+        return Err(AppError::AuthThrottled{retry_after:seconds});
+    }
+    let hash=stored.to_owned();
+    let valid=tokio::task::spawn_blocking(move||{
+        let _permit=permit;
+        password.len()<=1024 && verify_password(&password,&hash)
+    }).await.map_err(|_|AppError::AuthenticationUnavailable)?;
+    if valid {
+        let key=hex::encode(Sha256::digest(source.as_bytes()));
         sqlx::query("DELETE FROM auth_login_limits WHERE source_key=$1")
-            .bind(key)
-            .execute(&db.pool)
-            .await?;
+            .bind(key).execute(&db.pool).await.map_err(unavailable)?;
         return Ok(());
     }
-    sqlx::query(
-        r#"INSERT INTO auth_login_limits(source_key,failures,window_started,blocked_until)
-           VALUES($1,1,now(),NULL) ON CONFLICT(source_key)
-           DO UPDATE SET
-              failures=CASE WHEN auth_login_limits.window_started<now()-interval '15 minutes'
-                    THEN 1 ELSE auth_login_limits.failures+1 END,
-              window_started=CASE WHEN auth_login_limits.window_started<now()-interval '15 minutes'
-                    THEN now() ELSE auth_login_limits.window_started END,
-              blocked_until=CASE WHEN auth_login_limits.window_started>=now()-interval '15 minutes'
-                AND auth_login_limits.failures+1>=$2 THEN now()+interval '10 minutes'
-                ELSE auth_login_limits.blocked_until END"#,
-    )
-    .bind(key)
-    .bind(MAX_FAILED_ATTEMPTS)
-    .execute(&db.pool)
-    .await?;
-    Ok(())
-}
-pub fn caller_identity(headers: &HeaderMap, addr: Option<SocketAddr>) -> String {
-    // Only accept a proxy-supplied real IP when the immediate peer is loopback.
-    match addr {
-        Some(addr) if addr.ip().is_loopback() => headers
-            .get("x-real-ip")
-            .and_then(|v| v.to_str().ok())
-            .filter(|v| v.parse::<std::net::IpAddr>().is_ok())
-            .map(str::to_string)
-            .unwrap_or_else(|| addr.ip().to_string()),
-        Some(addr) => addr.ip().to_string(),
-        None => "unknown".to_string(),
+    if attempts>=MAX_FAILED_ATTEMPTS {
+        return Err(AppError::AuthThrottled{retry_after:seconds});
     }
+    Err(AppError::Unauthorized)
 }
 pub fn login_cookie_header(config: &Config, value: &str) -> AppResult<axum::http::HeaderValue> {
     let flag = if config.secure_cookies {
@@ -268,14 +272,5 @@ mod tests {
         assert!(verify_password("example-password", &hash));
         assert!(!verify_password("wrong-password", &hash));
         assert!(!verify_password("x", "invalid"));
-    }
-    #[test]
-    fn proxy_header_is_not_trusted_from_remote_clients() {
-        let mut headers = HeaderMap::new();
-        headers.insert("x-real-ip", "1.2.3.4".parse().unwrap());
-        let remote: std::net::SocketAddr = "192.0.2.10:1234".parse().unwrap();
-        assert_eq!(caller_identity(&headers, Some(remote)), "192.0.2.10");
-        let local: std::net::SocketAddr = "127.0.0.1:1234".parse().unwrap();
-        assert_eq!(caller_identity(&headers, Some(local)), "1.2.3.4");
     }
 }

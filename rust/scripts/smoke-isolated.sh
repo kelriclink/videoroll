@@ -257,6 +257,16 @@ if [[ "${VIDEOROLL_V2_TEST_OUTBOX_DISPATCHER_ONLY:-false}" == "true" ]]; then
   echo 'PASS: global native outbox dispatcher'
   exit 0
 fi
+if [[ "${VIDEOROLL_V2_TEST_AUTH_PROXY_ONLY:-false}" == "true" ]]; then
+  export VIDEOROLL_V2_INTERNAL_TOKEN="isolated-native-auth-proxy-token-0123456789"
+  export INTERNAL_API_SECRET="isolated-native-auth-proxy-secret"
+  export VIDEOROLL_V2_STORAGE_ROOT="$(mktemp -d "$repo_root/rust/target/v2-auth-proxy-objects.XXXXXX")"
+  if ss -lntH "( sport = :18195 )" | grep -q .; then echo 'isolated port occupied' >&2;exit 1;fi
+  "$cargo_bin" build --manifest-path "$repo_root/rust/Cargo.toml" --bin videoroll-v2 --locked --offline --quiet
+  "$repo_root/rust/target/debug/videoroll-v2" migrate
+  "$smoke_python" "$repo_root/rust/tests/auth_proxy_isolated.py"
+  exit 0
+fi
 if [[ "${VIDEOROLL_V2_TEST_RENDER_EVENTS_ONLY:-false}" == "true" ]]; then
   export VIDEOROLL_V2_INTERNAL_TOKEN="isolated-native-render-events-token-0123456789"
   export VIDEOROLL_V2_STORAGE_ROOT="$(mktemp -d "$repo_root/rust/target/v2-render-events-objects.XXXXXX")"
