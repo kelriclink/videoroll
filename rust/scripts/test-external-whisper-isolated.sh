@@ -4,6 +4,7 @@ cd "$(dirname "$0")/.."
 # Build first so the disposable database is not kept open during compilation.
 case "${VIDEOROLL_TEST_ASR_SCENARIO:-external-whisper}" in
   external-whisper) test_name=media::asr::tests::external_whisper_real_postgres_http_admission ;;
+  readability) test_name=media::asr::tests::readability_native_output_real_postgres_http ;;
   translation) test_name=media::asr::tests::translation_recovery_real_postgres_http ;;
   exhausted-lease) test_name=scheduler::tests::exhausted_lease_and_asset_real_postgres ;;
   live-thinking) test_name=media::translation_trace::tests::live_thinking_real_postgres_http ;;
@@ -31,7 +32,7 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 idle_tx_timeout=100ms
-if [[ "${VIDEOROLL_TEST_ASR_SCENARIO:-external-whisper}" == exhausted-lease ]]; then idle_tx_timeout=5s; fi
+if [[ "${VIDEOROLL_TEST_ASR_SCENARIO:-external-whisper}" == exhausted-lease || "${VIDEOROLL_TEST_ASR_SCENARIO:-external-whisper}" == readability ]]; then idle_tx_timeout=5s; fi
 docker run -d --rm --pull=never --name "$name" --memory=512m \
   --mount "type=volume,source=$volume,target=/var/lib/postgresql" \
   -p 127.0.0.1::5432 -e POSTGRES_PASSWORD=videoroll-test-only \
@@ -51,6 +52,7 @@ export VIDEOROLL_TEST_EXTERNAL_WHISPER_DB_URL="postgresql://postgres:videoroll-t
 export DATABASE_URL="$VIDEOROLL_TEST_EXTERNAL_WHISPER_DB_URL"
 export VIDEOROLL_V2_STORAGE_ROOT="$tmp" VIDEOROLL_V2_INTERNAL_TOKEN=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 case "${VIDEOROLL_TEST_ASR_SCENARIO:-external-whisper}" in
+  readability) export VIDEOROLL_TEST_READABILITY_DB_URL="$DATABASE_URL"; unset VIDEOROLL_TEST_EXTERNAL_WHISPER_DB_URL ;;
   translation) export VIDEOROLL_TEST_TRANSLATION_DB_URL="$DATABASE_URL"; unset VIDEOROLL_TEST_EXTERNAL_WHISPER_DB_URL ;;
   exhausted-lease) export VIDEOROLL_TEST_EXHAUSTED_LEASE_DB_URL="$DATABASE_URL"; unset VIDEOROLL_TEST_EXTERNAL_WHISPER_DB_URL ;;
   live-thinking) export VIDEOROLL_TEST_LIVE_THINKING_DB_URL="$DATABASE_URL"; unset VIDEOROLL_TEST_EXTERNAL_WHISPER_DB_URL ;;

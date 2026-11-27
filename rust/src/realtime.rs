@@ -233,7 +233,7 @@ async fn serve(socket: &mut WebSocket, state: AppState) {
                 if !send(socket,json!({"type":"heartbeat"})).await {break;}
             }
             _=resource_poll.tick(), if topics.contains("resources")=>{
-                if let Ok(data)=crate::system_resources::sample().await
+                if let Ok(data)=crate::system_resources::sample(&state).await
                     && !send(socket,json!({
                         "v":1,"type":"event","event_id":Uuid::new_v4(),
                         "topics":["resources"],"name":"system.resources.sample","data":data,
