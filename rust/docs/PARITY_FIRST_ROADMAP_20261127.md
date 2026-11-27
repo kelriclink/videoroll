@@ -24,3 +24,13 @@
 - 无生产表、API 或新增依赖，实际测试仅使用临时 PG 和独立根，禁止生产清理。原版存储删除及其他维护任务不改变。后续增加目录游标、在途成果/播放路径等更全面引用证据、实际负载及前端展示。
 
 测试：VIDEOROLL_V2_TEST_STORAGE_INTEGRITY_ONLY=true bash rust/scripts/smoke-isolated.sh。
+
+## 第二十九批：原版独立已投稿状态补偿
+
+基线 3142e93。原 publishing_service.reconcile_published_task_state 及 task_service.list_tasks/get_task 在读取时补偿 batch_id=NULL 的 published job。原版先按状态筛选/限制页，再补偿并移除不再匹配筛选条件的行。Rust 原 V1 list/detail 未实现。现在恢复这一行为，仅在原两个 GET 入口触发（内部 read_task 继续纯读），保留原字段/状态筛选。
+
+安全差异：仅 Rust 所有权、无取消/暂停/旧任务锁、无任何历史批次、全部独立投稿记录已 published 且有明确平台标识、不含未核实标记；无活动工作流/阶段/投递/租约/P2/SAU intent、无比回执更新的工作流。其他失败、未知或冲突目标留待人工核对，不根据任意旧成功记录覆盖现有状态。Task 行锁 SKIP LOCKED + 原物理表 NOWAIT 锁排除并发写者，争用时读原状态而不等待。仅更新 tasks.status/error_code/error_message/updated_at，复用原事务实时通知，不改变回执、工作流、清理计划，不发外部请求。
+
+SAU 代码检查：当前原生领取仍采用全局单投稿互斥；账户导入/删除/检查使用 account_busy 阻止 submitting/checking，登录和检查完成以 rotated_at/加密凭据等比较保护旧版本写回。尚未引入分组并发。需要进一步验证多进程的浏览器目录隔离及执行边界凭据复核，避免仅放开全局锁导致同一账号或浏览器状态竞争。
+
+测试：VIDEOROLL_V2_TEST_LEGACY_PUBLISH_RECONCILE_ONLY=true bash rust/scripts/smoke-isolated.sh。

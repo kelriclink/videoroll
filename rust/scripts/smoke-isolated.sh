@@ -564,6 +564,10 @@ if [[ "${VIDEOROLL_V2_TEST_REMOTE_AUTO_ONLY:-false}" == "true" ]]; then
   echo 'PASS: independent remote Bearer intake, original PBKDF2/idempotency ledger and concurrent dedupe'
   exit 0
 fi
+if [[ "${VIDEOROLL_V2_TEST_LEGACY_PUBLISH_RECONCILE_ONLY:-false}" == "true" ]]; then
+  "$smoke_python" "$repo_root/rust/tests/legacy_publish_reconcile_isolated.py"
+  exit 0
+fi
 if [[ "${VIDEOROLL_V2_TEST_PUBLISH_TIMEOUT_ONLY:-false}" == "true" ]]; then
   "$smoke_python" "$repo_root/rust/tests/publish_timeout_isolated.py"
   exit 0

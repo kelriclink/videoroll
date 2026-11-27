@@ -51,6 +51,7 @@ pub mod providers;
 pub mod publish;
 pub mod publish_batch_events;
 pub mod publish_legacy;
+mod publish_legacy_reconcile;
 pub mod publish_meta;
 pub mod publish_platforms;
 pub mod publish_review;

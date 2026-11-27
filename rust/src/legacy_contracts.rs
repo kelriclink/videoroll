@@ -383,14 +383,25 @@ async fn list_tasks(
     let sql = format!(
         "{TASK_VIEW} AND ($1::text IS NULL OR upper(t.status::text)=$1) ORDER BY t.created_at DESC LIMIT $2"
     );
-    let rows = sqlx::query_as::<_, V1Task>(&sql)
-        .bind(q.status)
+    let mut rows = sqlx::query_as::<_, V1Task>(&sql)
+        .bind(q.status.as_deref())
         .bind(q.limit.unwrap_or(50).clamp(1, 500))
         .fetch_all(&state.db.pool)
         .await?;
+    // Python filters and limits first, compensates that page, then removes
+    // rows whose status changed out of the requested filter; no refill.
+    let ids:Vec<_>=rows.iter().map(|row|row.id).collect();
+    let repaired=crate::publish_legacy_reconcile::repair(&state.db,&ids).await?;
+    if !repaired.is_empty() {
+        for row in &mut rows {
+            if repaired.contains(&row.id) {*row=read_task(&state.db,row.id).await?;}
+        }
+        if let Some(status)=q.status.as_deref(){rows.retain(|row|row.status==status);}
+    }
     Ok(Json(rows))
 }
 async fn get_task(State(state): State<AppState>, Path(id): Path<Uuid>) -> AppResult<Json<V1Task>> {
+    crate::publish_legacy_reconcile::repair(&state.db,&[id]).await?;
     Ok(Json(read_task(&state.db, id).await?))
 }
 async fn task_assets(
