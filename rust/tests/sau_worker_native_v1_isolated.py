@@ -169,6 +169,27 @@ if name=='nonzero':sys.exit(1)
                 assert submit(body) == job
                 assert call("/sau/"+platform+"/publish",{**body,"force_retry":True})[0] == 409
         print("PASS: three platforms, preflight failure, uncertain external results",flush=True)
+        # Rotate the account in the claim transaction after its snapshot
+        # was read. A stale cookie must never reach the browser.
+        rotated=seed("douyin","rotated-before-start")
+        with psycopg.connect(url) as conn:
+            conn.execute("""CREATE FUNCTION fixture_rotate_sau() RETURNS trigger LANGUAGE plpgsql AS $$
+                BEGIN
+                    IF OLD.lease_owner IS NULL AND NEW.lease_owner LIKE 'rust-sau-publish:%' THEN
+                        UPDATE accounts SET rotated_at=clock_timestamp()
+                            WHERE id=NEW.account_id AND name='rotated-before-start';
+                    END IF;
+                    RETURN NEW;
+                END $$""")
+            conn.execute("CREATE TRIGGER fixture_rotate_sau AFTER UPDATE ON publish_jobs FOR EACH ROW EXECUTE FUNCTION fixture_rotate_sau()")
+        rotated_job=submit(rotated)
+        result=terminal(rotated_job,"failed")
+        assert result[2] is None and "rotated-before-start" not in calls(),result
+        assert result[1]["started"] is False
+        with psycopg.connect(url) as conn:
+            conn.execute("DROP TRIGGER fixture_rotate_sau ON publish_jobs")
+            conn.execute("DROP FUNCTION fixture_rotate_sau()")
+        print("PASS: credential rotation between claim and browser start blocks stale execution",flush=True)
         # CLI exit=0 is not independent platform evidence: a batch remains
         # unverified, with no legacy workflow or cleanup dispatch.
         batch_body=seed("kuaishou","batch")
@@ -207,11 +228,21 @@ if name=='nonzero':sys.exit(1)
         wait_for(lambda: "interrupted" in calls())
         stop(proc,hard=True)
         with psycopg.connect(url) as conn:
-            conn.execute("UPDATE publish_jobs SET lease_until=now()-interval '1 second' WHERE id=%s",(job,))
+            conn.execute("UPDATE publish_jobs SET lease_until=now()-interval '1 second',response_json=%s::jsonb,upload_progress=37 WHERE id=%s",(json.dumps({"prior":"preserve","started":True}),job))
             conn.execute("UPDATE outbox_events SET lease_until=now()-interval '1 second' WHERE aggregate_id=%s",(job,))
-            conn.execute("UPDATE operation_inbox SET lease_until=now()-interval '1 second' WHERE operation_key=%s",("publish-job:"+job,))
+            # The inbox remains live even though the other two leases expired.
+            conn.execute("UPDATE operation_inbox SET lease_until=now()+interval '1 hour',result_json=%s::jsonb WHERE operation_key=%s",(json.dumps({"progress":"preserve"}),"publish-job:"+job))
         proc = spawn()
-        terminal(job,"unknown")
+        time.sleep(2)
+        assert row(job)[0]=="submitting" and row(job)[3:5]==("native_running","processing"),row(job)
+        assert calls().count("interrupted")==1
+        with psycopg.connect(url) as conn:
+            conn.execute("UPDATE operation_inbox SET lease_until=now()-interval '1 second' WHERE operation_key=%s",("publish-job:"+job,))
+        result=terminal(job,"unknown")
+        assert result[1]["previous_response"]=={"prior":"preserve","started":True}
+        assert result[5]["previous_result"]=={"progress":"preserve"}
+        with psycopg.connect(url) as conn:
+            assert conn.execute("SELECT upload_progress FROM publish_jobs WHERE id=%s",(job,)).fetchone()[0]==37
         assert submit(interrupted) == job and calls().count("interrupted") == 1
         print("PASS: interrupted worker recovery; never replay browser submission",flush=True)
     finally:

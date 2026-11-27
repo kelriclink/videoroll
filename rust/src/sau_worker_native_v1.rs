@@ -94,6 +94,8 @@ struct Work {
     event: Uuid,
     job: Uuid,
     task: Uuid,
+    generation: Option<i32>,
+    batch: Option<Uuid>,
     account: Option<Uuid>,
     platform: String,
     key: String,
@@ -138,6 +140,8 @@ async fn claim(state: &SauState, cfg: &PublishConfig) -> AppResult<Option<Work>>
         return Ok(None);
     }
     let task_status = lock_task(&mut tx, task).await?;
+    let generation:i32=sqlx::query_scalar("SELECT restart_generation FROM tasks WHERE id=$1")
+        .bind(task).fetch_one(&mut *tx).await?;
     let acct = if let Some(id) = account {
         sqlx::query("SELECT platform::text AS platform,name,secrets_encrypted,is_active,check_state,rotated_at
           FROM accounts WHERE id=$1 FOR UPDATE").bind(id).fetch_optional(&mut *tx).await?
@@ -216,6 +220,8 @@ async fn claim(state: &SauState, cfg: &PublishConfig) -> AppResult<Option<Work>>
         event,
         job,
         task,
+        generation: Some(generation),
+        batch: row.try_get("batch_id")?,
         account,
         platform: p,
         key,
@@ -362,6 +368,60 @@ impl Outcome {
         }
     }
 }
+/// Lock the same parent/account as claim and finish. Recheck the exact
+/// delivery envelope and all leases before crossing the browser boundary.
+/// A changed account or task may never start with a cached credential.
+async fn mark_started(state:&SauState,work:&Work,cfg:&PublishConfig)->AppResult<bool>{
+    let mut tx=state.pool.begin().await?;
+    let task:Option<Uuid>=sqlx::query_scalar("SELECT id FROM tasks WHERE id=$1 AND runtime_owner='rust'
+        AND source_license::text<>'unknown' AND status::text<>'canceled' AND stopped_status IS NULL
+        AND restart_generation=$2 FOR UPDATE")
+        .bind(work.task).bind(work.generation).fetch_optional(&mut *tx).await?;
+    if task.is_none(){return Ok(false)}
+    let account:Option<Uuid>=sqlx::query_scalar("SELECT id FROM accounts WHERE id=$1 AND is_active
+        AND check_state='valid' AND platform::text=$2 AND name=$3 AND secrets_encrypted=$4
+        AND rotated_at IS NOT DISTINCT FROM $5 FOR UPDATE")
+        .bind(work.account).bind(&work.platform).bind(&work.name).bind(&work.secret).bind(work.rotated)
+        .fetch_optional(&mut *tx).await?;
+    if account.is_none(){return Ok(false)}
+    match crate::sau_login_native_v1::ensure_not_logging_in(&mut tx,&work.platform,work.name.as_deref().unwrap_or("")).await {
+        Ok(())=>{},
+        Err(AppError::Conflict(_))=>return Ok(false),
+        Err(e)=>return Err(e),
+    }
+    let remaining=cfg.timeout.as_secs() as i64+30;
+    // All three records must still belong to this execution and remain
+    // leased through the bounded browser call. Lock the job first.
+    let job:Option<Uuid>=sqlx::query_scalar("SELECT id FROM publish_jobs WHERE id=$1 AND task_id=$2
+        AND account_id IS NOT DISTINCT FROM $3 AND batch_id IS NOT DISTINCT FROM $4
+        AND platform::text=$5 AND operation_key=$6 AND meta_json=$7
+        AND lease_owner=$8 AND lease_until>clock_timestamp()+($9::bigint*interval '1 second')
+        AND state::text='submitting' AND started_at IS NULL AND finished_at IS NULL
+        AND COALESCE(external_id,'')='' AND COALESCE(external_url,'')=''
+        AND COALESCE(bvid,'')='' AND COALESCE(aid,'')='' FOR UPDATE")
+        .bind(work.job).bind(work.task).bind(work.account).bind(work.batch).bind(&work.platform)
+        .bind(&work.key).bind(&work.meta).bind(&work.owner).bind(remaining).fetch_optional(&mut *tx).await?;
+    if job.is_none(){return Ok(false)}
+    let event:Option<Uuid>=sqlx::query_scalar("SELECT id FROM outbox_events WHERE id=$1 AND operation_key=$2
+        AND aggregate_type='publish_job' AND aggregate_id=$3 AND event_type='publish.dispatch'
+        AND task_name='social_publisher.process_job' AND args_json->'args'=jsonb_build_array($3::text)
+        AND status='native_running' AND lease_owner=$4 AND delivered_at IS NULL
+        AND lease_until>clock_timestamp()+($5::bigint*interval '1 second') FOR UPDATE")
+        .bind(work.event).bind(&work.key).bind(work.job.to_string()).bind(&work.owner).bind(remaining)
+        .fetch_optional(&mut *tx).await?;
+    if event.is_none(){return Ok(false)}
+    let inbox:Option<Uuid>=sqlx::query_scalar("SELECT id FROM operation_inbox WHERE operation_key=$1
+        AND runtime_engine=$2 AND status='processing' AND request_json->>'job_id'=$3
+        AND lease_owner=$4 AND lease_token IS NULL AND completed_at IS NULL
+        AND lease_until>clock_timestamp()+($5::bigint*interval '1 second') FOR UPDATE")
+        .bind(&work.key).bind(ENGINE).bind(work.job.to_string()).bind(&work.owner).bind(remaining)
+        .fetch_optional(&mut *tx).await?;
+    if inbox.is_none(){return Ok(false)}
+    let changed=sqlx::query("UPDATE publish_jobs SET started_at=now(),updated_at=now() WHERE id=$1")
+        .bind(work.job).execute(&mut *tx).await?.rows_affected();
+    tx.commit().await?;
+    Ok(changed==1)
+}
 async fn execute(state: &SauState, runtime: &Runtime, cfg: &PublishConfig, work: &Work) -> Outcome {
     if !work.valid {
         return Outcome::before("task canceled or account not valid");
@@ -381,13 +441,9 @@ async fn execute(state: &SauState, runtime: &Runtime, cfg: &PublishConfig, work:
     };
     // Persist the irreversible boundary before invoking the browser. The
     // claim lease is long enough for the bounded CLI execution + DB commit.
-    let started=sqlx::query("UPDATE publish_jobs SET started_at=now(),updated_at=now()
-      WHERE id=$1 AND lease_owner=$2 AND lease_until>now() AND state::text='submitting' AND started_at IS NULL
-      AND EXISTS(SELECT 1 FROM tasks WHERE id=$3 AND status::text<>'canceled')")
-        .bind(work.job).bind(&work.owner).bind(work.task).execute(&state.pool).await;
-    match started {
-        Ok(r) if r.rows_affected() == 1 => {}
-        Ok(_) => return Outcome::before("SAU execution no longer owns pending task"),
+    match mark_started(state,work,cfg).await {
+        Ok(true) => {}
+        Ok(false) => return Outcome::before("SAU task, credential or delivery fence changed before browser start"),
         Err(_) => return Outcome::uncertain("SAU start marker could not be confirmed"),
     }
     let mut cmd = tokio::process::Command::new(&runtime.executable);
@@ -465,11 +521,18 @@ async fn finalize(
     outcome: Outcome,
 ) -> AppResult<()> {
     let changed=sqlx::query("UPDATE publish_jobs SET state=CASE WHEN $3='submitted' THEN 'submitted' WHEN $3='failed' THEN 'failed' ELSE 'unknown' END::publish_state,
-      response_json=$4,finished_at=now(),lease_owner=NULL,lease_until=NULL,heartbeat_at=now(),updated_at=now()
-      WHERE id=$1 AND lease_owner=$2 AND state::text='submitting'")
+      response_json=CASE WHEN response_json IS NULL THEN $4::jsonb
+        WHEN jsonb_typeof(response_json)='object' THEN response_json||$4::jsonb||jsonb_build_object('previous_response',response_json)
+        ELSE $4::jsonb||jsonb_build_object('previous_response',response_json) END,
+      finished_at=COALESCE(finished_at,now()),lease_owner=NULL,lease_until=NULL,heartbeat_at=now(),updated_at=now()
+      WHERE id=$1 AND lease_owner=$2 AND state::text='submitting' AND task_id=$5
+        AND account_id IS NOT DISTINCT FROM $6 AND batch_id IS NOT DISTINCT FROM $7
+        AND operation_key=$8 AND platform::text=$9
+        AND COALESCE(external_id,'')='' AND COALESCE(external_url,'')='' AND COALESCE(bvid,'')='' AND COALESCE(aid,'')=''")
         .bind(work.job).bind(&work.owner).bind(outcome.status)
         .bind(json!({"driver":"sau","runtime":"rust","returncode":outcome.code,"timed_out":outcome.timed_out,
           "started":outcome.started,"message":outcome.message,"receipt_verified":false}))
+        .bind(work.task).bind(work.account).bind(work.batch).bind(&work.key).bind(&work.platform)
         .execute(&mut **tx).await?.rows_affected();
     if changed != 1 {
         return Err(AppError::Conflict(
@@ -482,23 +545,30 @@ async fn finalize(
             .bind(account).bind(secret).bind(work.rotated).bind(&work.secret).execute(&mut **tx).await?;
     }
     let result = json!({"status":outcome.status,"job_id":work.job});
-    let changed=sqlx::query("UPDATE operation_inbox SET status='completed',result_json=$3,completed_at=now(),updated_at=now(),lease_owner=NULL,lease_until=NULL
-        WHERE operation_key=$1 AND lease_owner=$2 AND runtime_engine=$4 AND status='processing'")
-        .bind(&work.key).bind(&work.owner).bind(&result).bind(ENGINE).execute(&mut **tx).await?.rows_affected();
+    let changed=sqlx::query("UPDATE operation_inbox SET status='completed',
+        result_json=CASE WHEN result_json IS NULL THEN $3::jsonb ELSE $3::jsonb||jsonb_build_object('previous_result',result_json) END,
+        completed_at=COALESCE(completed_at,now()),updated_at=now(),lease_owner=NULL,lease_until=NULL
+        WHERE operation_key=$1 AND lease_owner=$2 AND runtime_engine=$4 AND status='processing'
+        AND lease_token IS NULL AND request_json->>'job_id'=$5")
+        .bind(&work.key).bind(&work.owner).bind(&result).bind(ENGINE).bind(work.job.to_string()).execute(&mut **tx).await?.rows_affected();
     if changed != 1 {
         return Err(AppError::Conflict("SAU operation lease lost".into()));
     }
     let changed=sqlx::query("UPDATE outbox_events SET status='native_completed',delivered_at=now(),updated_at=now(),lease_owner=NULL,lease_until=NULL
-        WHERE id=$1 AND lease_owner=$2 AND status='native_running'")
-        .bind(work.event).bind(&work.owner).execute(&mut **tx).await?.rows_affected();
+        WHERE id=$1 AND lease_owner=$2 AND status='native_running' AND operation_key=$3
+        AND aggregate_type='publish_job' AND aggregate_id=$4 AND event_type='publish.dispatch'
+        AND task_name='social_publisher.process_job' AND args_json->'args'=jsonb_build_array($4::text)")
+        .bind(work.event).bind(&work.owner).bind(&work.key).bind(work.job.to_string()).execute(&mut **tx).await?.rows_affected();
     if changed != 1 {
         return Err(AppError::Conflict("SAU event lease lost".into()));
     }
-    let batch: Option<Uuid> = sqlx::query_scalar("SELECT batch_id FROM publish_jobs WHERE id=$1")
-        .bind(work.job)
-        .fetch_one(&mut **tx)
-        .await?;
-    if let Some(batch) = batch {
+    // A terminal receipt belongs to the old execution even if the task
+    // changed ownership/generation. Do not overwrite the newer task.
+    let parent_valid:bool=sqlx::query_scalar("SELECT runtime_owner='rust' AND stopped_status IS NULL
+        AND status::text<>'canceled' AND ($2::int IS NULL OR restart_generation=$2) FROM tasks WHERE id=$1")
+        .bind(work.task).bind(work.generation).fetch_one(&mut **tx).await?;
+    if !parent_valid{return Ok(())}
+    if let Some(batch) = work.batch {
         // Same original batch/task evaluation, but no Python follow-up
         // dispatch for Rust-owned SAU work. Preserve unverified media.
         crate::bilibili_batch_reconcile_v1::reconcile_native_sau(tx, work.task, batch).await?;
@@ -542,7 +612,13 @@ async fn finish(state: &SauState, work: &Work, outcome: Outcome) -> AppResult<()
 async fn recover(state: &SauState) -> AppResult<()> {
     let rows=sqlx::query("SELECT e.id AS event,j.id AS job,j.task_id,j.batch_id,j.account_id,j.platform::text AS platform,
       j.operation_key,j.lease_owner FROM outbox_events e JOIN publish_jobs j ON j.operation_key=e.operation_key AND j.id::text=e.aggregate_id
+      JOIN operation_inbox i ON i.operation_key=j.operation_key
       WHERE e.task_name='social_publisher.process_job' AND e.status='native_running' AND e.lease_until<=now()
+        AND j.state::text='submitting' AND j.lease_until<=now() AND j.lease_owner=e.lease_owner
+        AND j.lease_owner LIKE 'rust-sau-publish:%' AND i.runtime_engine='rust-sau-publish'
+        AND i.status='processing' AND i.lease_owner=e.lease_owner AND i.lease_until<=now() AND i.lease_token IS NULL
+        AND i.request_json->>'job_id'=j.id::text
+        AND COALESCE(j.external_id,'')='' AND COALESCE(j.external_url,'')='' AND COALESCE(j.bvid,'')='' AND COALESCE(j.aid,'')=''
       ORDER BY e.lease_until LIMIT 32").fetch_all(&state.pool).await?;
     for row in rows {
         let event: Uuid = row.try_get("event")?;
@@ -550,6 +626,8 @@ async fn recover(state: &SauState) -> AppResult<()> {
             event,
             job: row.try_get("job")?,
             task: row.try_get("task_id")?,
+            generation: None, // Historical recovery has no admission generation.
+            batch: row.try_get("batch_id")?,
             account: row.try_get("account_id")?,
             platform: row.try_get("platform")?,
             key: row.try_get("operation_key")?,
@@ -569,8 +647,14 @@ async fn recover(state: &SauState) -> AppResult<()> {
                 .await?;
         }
         // Only the exact expired owner can be finalized; do not reacquire it.
-        let expired:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM outbox_events WHERE id=$1 AND status='native_running' AND lease_owner=$2 AND lease_until<=now())")
-            .bind(event).bind(&work.owner).fetch_one(&mut *tx).await?;
+        let expired_job:Option<Uuid>=sqlx::query_scalar("SELECT id FROM publish_jobs WHERE id=$1 AND lease_owner=$2 AND lease_until<=now() AND state::text='submitting' FOR UPDATE")
+            .bind(work.job).bind(&work.owner).fetch_optional(&mut *tx).await?;
+        if expired_job.is_none(){continue}
+        let expired_event:Option<Uuid>=sqlx::query_scalar("SELECT id FROM outbox_events WHERE id=$1 AND status='native_running' AND lease_owner=$2 AND lease_until<=now() FOR UPDATE")
+            .bind(event).bind(&work.owner).fetch_optional(&mut *tx).await?;
+        let expired_inbox:Option<Uuid>=sqlx::query_scalar("SELECT id FROM operation_inbox WHERE operation_key=$1 AND runtime_engine=$2 AND status='processing' AND lease_owner=$3 AND lease_until<=now() FOR UPDATE")
+            .bind(&work.key).bind(ENGINE).bind(&work.owner).fetch_optional(&mut *tx).await?;
+        let expired=expired_event.is_some()&&expired_inbox.is_some();
         if expired {
             finalize(
                 &mut tx,

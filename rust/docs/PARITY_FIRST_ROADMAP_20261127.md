@@ -34,3 +34,7 @@
 SAU 代码检查：当前原生领取仍采用全局单投稿互斥；账户导入/删除/检查使用 account_busy 阻止 submitting/checking，登录和检查完成以 rotated_at/加密凭据等比较保护旧版本写回。尚未引入分组并发。需要进一步验证多进程的浏览器目录隔离及执行边界凭据复核，避免仅放开全局锁导致同一账号或浏览器状态竞争。
 
 测试：VIDEOROLL_V2_TEST_LEGACY_PUBLISH_RECONCILE_ONLY=true bash rust/scripts/smoke-isolated.sh。
+
+## 第三十批：SAU 执行边界及原始账本恢复
+
+原 Python 账户锁、凭据物化、Job/Inbox 租约与 started_at 执行边界已逐段对照。Rust 原生 Worker 增加启动前 Task generation、Account credential version、三账本身份及租约复核，超时恢复需三账本同 owner 且均过期；保留已有响应与进度，拒绝覆盖外部标识。当前仅全局串行，不提前放开跨实例账户并发；原生账本冲突仍需显式核实。详细边界见 SAU_WORKER_NATIVE_V1.md。专项使用无网络模拟 CLI、隔离 PG、领取时账户版本变化和 Inbox 延迟过期故障注入。

@@ -33,6 +33,15 @@
   未核实投稿。真实平台回执获取和完整批次确认后续流程仍需验收，
   不能把 CLI 成功等同于平台发布成功。
 
+## 第三十批：浏览器启动前执行围栏与回执保全
+
+参考 Python social_publisher/worker.py 的 _process_job_impl、process_job 与 runtime.py 的账户 Cookie 物化。Python 使用账户级 Redis 锁、Job lease heartbeat、独立 Inbox claim，并在启动 CLI 前写入 started_at；Rust 继续不依赖 Redis/Celery。
+
+- 领取时保存任务 restart_generation、账户 rotated_at/加密凭据、平台/账户/批次/操作键和 meta_json。浏览器启动前在同一事务按 Task → Account → PublishJob → Outbox → Inbox 加锁，复核 Rust 所有权、来源授权、非暂停/取消、代次、有效账户、无活动登录、原始凭据版本与投递身份；三份租约必须同属本执行者且剩余时间超过 CLI 超时加 30 秒。通过后才提交 started_at，之后才启动 CLI。已存在外部标识或已结束记录不允许重新启动。
+- 完成或超时隔离写入保留 response_json 原字段及 previous_response、原 Inbox result_json 的 previous_result、原 finished_at 与 upload_progress；外部 ID/URL/BVID/AID 存在时拒绝覆盖。任务所有权或领取代次已经变化时，只结算原执行账本，不更新较新的父任务。恢复历史领取无法获得原代次，故只核实当前所有权与暂停/取消，保留此限制。
+- 过期恢复必须同时满足三份账本属于相同原生 owner、正确操作身份、各自租约过期；事务内再次加锁复核，不因单份过期或 NULL/错 owner 推断执行失败。冲突或未知回执仍留待核实，不重放浏览器。异常账本可能继续阻塞全局队列，后续需显式核对工具，不能自动丢弃。
+- 保持原生全局单投稿互斥，不引入账户分组并发。原账户级 Redis 锁仅作参考：浏览器运行目录隔离、登录/检测跨实例协调和真实平台仍需验收。启动围栏提交后到实际 spawn 的极短窗口无法与第三方进程原子化；正常原生账户操作继续由 busy 校验保护。未新增表/API/依赖。
+
 ## 隔离验收
 
 VIDEOROLL_V2_TEST_SAU_NATIVE_WORKER_ONLY=true bash rust/scripts/smoke-isolated.sh
