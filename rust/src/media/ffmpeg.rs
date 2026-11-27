@@ -991,22 +991,130 @@ pub(crate) async fn ensure_task_asset(
     kind: &str,
     key: &str,
 ) -> AppResult<Value> {
+    commit_task_asset(db, registry, task_id, job, kind, key, None).await
+}
+/// Install a fully written attempt-private file under the same lease and
+/// object locks as its ledger entry. A stale attempt never renames over the
+/// canonical output. A failed DB commit leaves only recoverable local bytes.
+pub(crate) async fn install_task_asset(
+    db: &Database,
+    registry: &AssetRegistry,
+    job: &WorkItem,
+    kind: &str,
+    key: &str,
+    prepared: &Path,
+) -> AppResult<Value> {
+    commit_task_asset(db, registry, job.task_id, job, kind, key, Some(prepared)).await
+}
+pub(crate) async fn write_task_asset(
+    db: &Database,
+    registry: &AssetRegistry,
+    job: &WorkItem,
+    kind: &str,
+    key: &str,
+    body: &[u8],
+) -> AppResult<Value> {
+    use tokio::io::AsyncWriteExt;
+    let dest = registry.resolve_existing(key).await?;
+    let parent = dest
+        .parent()
+        .ok_or_else(|| AppError::Invalid("asset parent missing".into()))?;
+    fs::create_dir_all(parent).await?;
+    let temp = Builder::new()
+        .prefix(".asset-attempt-")
+        .suffix(".vr2-upload.partial")
+        .tempfile_in(parent)?;
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(temp.path())
+        .await?;
+    file.write_all(body).await?;
+    file.sync_all().await?;
+    drop(file);
+    install_task_asset(db, registry, job, kind, key, temp.path()).await
+}
+async fn commit_task_asset(
+    db: &Database,
+    registry: &AssetRegistry,
+    task_id: Uuid,
+    job: &WorkItem,
+    kind: &str,
+    key: &str,
+    prepared: Option<&Path>,
+) -> AppResult<Value> {
     let key = AssetRegistry::checked_key(key)?;
-    let (sha, size) = registry.sha256(key).await?;
+    let dest = registry.resolve_existing(key).await?;
+    let (sha, size) = if let Some(prepared) = prepared {
+        if prepared.parent() != dest.parent() || prepared == dest {
+            return Err(AppError::Invalid(
+                "asset attempt path must be private and colocated".into(),
+            ));
+        }
+        let name = prepared
+            .file_name()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| AppError::Invalid("asset attempt filename invalid".into()))?;
+        let temp_key = Path::new(key).with_file_name(name);
+        let temp_key = temp_key
+            .to_str()
+            .ok_or_else(|| AppError::Invalid("asset attempt key invalid".into()))?;
+        if registry.resolve_existing(temp_key).await? != prepared {
+            return Err(AppError::Invalid("asset attempt identity mismatch".into()));
+        }
+        registry.sha256(temp_key).await?
+    } else {
+        registry.sha256(key).await?
+    };
     let mut tx = db.pool.begin().await?;
-    let status: Option<String> =
-        sqlx::query_scalar("SELECT upper(status::text) FROM tasks WHERE id=$1 FOR UPDATE")
-            .bind(task_id)
-            .fetch_optional(&mut *tx)
-            .await?;
-    if status.as_deref() == Some("CANCELED") || status.is_none() {
+    // Only the current stage can publish an asset. Match the scheduler's
+    // Task -> Workflow -> Job -> storage object lock order.
+    if task_id != job.task_id {
+        return Err(AppError::Conflict("asset task identity mismatch".into()));
+    }
+    let active:Option<Uuid>=sqlx::query_scalar("SELECT id FROM tasks WHERE id=$1 AND runtime_owner='rust' AND status<>'canceled'::task_status FOR UPDATE").bind(task_id).fetch_optional(&mut *tx).await?;
+    if active.is_none() {
+        return Err(AppError::Conflict("asset task stopped".into()));
+    }
+    let active:Option<Uuid>=sqlx::query_scalar("SELECT id FROM vr2_workflows WHERE id=$1 AND task_id=$2 AND generation=$3 AND current_stage=$4 AND state='running' FOR UPDATE").bind(job.workflow_id).bind(task_id).bind(job.generation).bind(job.stage.as_str()).fetch_optional(&mut *tx).await?;
+    if active.is_none() {
         return Err(AppError::Conflict(
-            "render result cannot commit for stopped task".into(),
+            "asset workflow stopped or superseded".into(),
         ));
     }
-    sqlx::query(
-        "INSERT INTO storage_objects(storage_key,checksum_sha256,size_bytes,state,retain_until) VALUES($1,$2,$3,'live',now()+interval '2 days') ON CONFLICT(storage_key) DO UPDATE SET retain_until=GREATEST(storage_objects.retain_until,now()+interval '2 days') WHERE storage_objects.state='live'"
+    let active:Option<Uuid>=sqlx::query_scalar("SELECT id FROM vr2_jobs WHERE id=$1 AND task_id=$2 AND workflow_id=$3 AND generation=$4 AND stage=$5 AND state='running' AND lease_token=$6 AND lease_until>clock_timestamp() FOR UPDATE").bind(job.id).bind(task_id).bind(job.workflow_id).bind(job.generation).bind(job.stage.as_str()).bind(job.lease_token).fetch_optional(&mut *tx).await?;
+    if active.is_none() {
+        return Err(AppError::Conflict("asset stage lease expired".into()));
+    }
+    let registered=sqlx::query(
+        "INSERT INTO storage_objects(storage_key,checksum_sha256,size_bytes,state,retain_until) VALUES($1,$2,$3,'live',now()+interval '2 days') ON CONFLICT(storage_key) DO UPDATE SET retain_until=GREATEST(storage_objects.retain_until,now()+interval '2 days') WHERE storage_objects.state='live' AND storage_objects.checksum_sha256=EXCLUDED.checksum_sha256 AND storage_objects.size_bytes=EXCLUDED.size_bytes"
     ).bind(key).bind(&sha).bind(size).execute(&mut *tx).await?;
+    if registered.rows_affected() != 1 {
+        return Err(AppError::Conflict(
+            "asset storage identity mismatch or GC fenced".into(),
+        ));
+    }
+    let mismatch:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM assets WHERE storage_key=$1 AND ((sha256 IS NOT NULL AND sha256<>$2) OR (size_bytes IS NOT NULL AND size_bytes<>$3)))").bind(key).bind(&sha).bind(size).fetch_one(&mut *tx).await?;
+    if mismatch {
+        return Err(AppError::Conflict(
+            "original asset checksum or size mismatch".into(),
+        ));
+    }
+    let active:bool=sqlx::query_scalar("SELECT COALESCE(lease_until>clock_timestamp(),false) FROM vr2_jobs WHERE id=$1 AND lease_token=$2 AND state='running'").bind(job.id).bind(job.lease_token).fetch_one(&mut *tx).await?;
+    if !active {
+        return Err(AppError::Conflict(
+            "asset lease expired before commit".into(),
+        ));
+    }
+    if let Some(prepared) = prepared {
+        // Do not dispatch an asynchronous rename that could outlive the
+        // transaction on cancellation. The only potentially long IO (copy,
+        // encode, hash, fsync of the file) already happened outside the lock.
+        std::fs::rename(prepared, &dest)?;
+        if let Some(parent) = dest.parent() {
+            std::fs::File::open(parent)?.sync_all()?;
+        }
+    }
     sqlx::query(
         "INSERT INTO storage_object_refs(storage_key,owner_type,owner_id,role) VALUES($1,'workflow',$2,$3) ON CONFLICT DO NOTHING"
     ).bind(key).bind(job.workflow_id).bind(kind).execute(&mut *tx).await?;
@@ -1061,7 +1169,10 @@ pub async fn render(
         && let Ok(path) = registry.resolve_existing(&key).await
         && probe_video(&config.ffprobe_binary, &path).await.is_ok()
     {
-        return Ok(json!({"storage_key":key,"reused":true}));
+        let mut result =
+            ensure_task_asset(db, registry, job.task_id, job, "video_final", &key).await?;
+        result["reused"] = json!(true);
+        return Ok(result);
     }
     let pinned =
         crate::subtitle_resume_v1::render_inputs(db, registry, job.task_id, job.workflow_id)
@@ -1108,13 +1219,19 @@ pub async fn render(
     {
         return ensure_task_asset(db, registry, job.task_id, job, "video_final", &output_key).await;
     }
-    let temp = output.with_extension("partial.mp4");
-    let _ = fs::remove_file(&temp).await;
-    let render_metrics = transcode(config, &input, &temp, subtitle.as_deref(), &cfg).await?;
-    probe_video(&config.ffprobe_binary, &temp).await?;
-    fs::rename(&temp, &output).await?;
+    let temp = Builder::new()
+        .prefix(".render-attempt-")
+        .suffix(".partial.mp4")
+        .tempfile_in(
+            output
+                .parent()
+                .ok_or_else(|| AppError::Invalid("render output parent missing".into()))?,
+        )?;
+    let render_metrics = transcode(config, &input, temp.path(), subtitle.as_deref(), &cfg).await?;
+    probe_video(&config.ffprobe_binary, temp.path()).await?;
+    fs::File::open(temp.path()).await?.sync_all().await?;
     let mut result =
-        ensure_task_asset(db, registry, job.task_id, job, "video_final", &output_key).await?;
+        install_task_asset(db, registry, job, "video_final", &output_key, temp.path()).await?;
     result["render_metrics"] = render_metrics;
     Ok(result)
 }

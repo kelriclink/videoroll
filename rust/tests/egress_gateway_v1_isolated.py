@@ -31,6 +31,16 @@ class Mock(BaseHTTPRequestHandler):
                               "auth_seen":self.headers.get("authorization"),
                               "accept_language":self.headers.get("accept-language")}).encode()
             code,mime=200,"application/json"
+        elif self.path=="/rate-limit":
+            value=b"rate limited"
+            code,mime=429,"text/plain; charset=iso-8859-1"
+        elif self.path=="/slow-redirect":
+            time.sleep(0.08)
+            value=b""
+            code,mime=302,"text/plain"
+        elif self.path=="/slow-body":
+            value=b"12345"
+            code,mime=200,"text/plain"
         elif self.path=="/long":
             value=b"a"*5000
             code,mime=200,"text/plain"
@@ -49,12 +59,23 @@ class Mock(BaseHTTPRequestHandler):
         else:code,mime,value=404,"text/plain",b"not found"
         self.send_response(code)
         self.send_header("Content-Type",mime)
+        if self.path=="/rate-limit":
+            self.send_header("Retry-After","7")
+            self.send_header("X-Evidence","one")
+            self.send_header("X-Evidence","caf\xe9")
+        if self.path=="/slow-redirect":self.send_header("Location","/slow-body")
         if self.path=="/redirect":self.send_header("Location","/json")
         if self.path=="/redirect-private":self.send_header("Location","http://127.0.0.2:18098/private")
         if self.path=="/redirect-redirect":self.send_header("Location","/redirect-redirect")
         self.send_header("Content-Length",str(len(value)))
         self.end_headers()
-        self.wfile.write(value)
+        try:
+            if self.path=="/slow-body":
+                for b in value:
+                    time.sleep(0.06)
+                    self.wfile.write(bytes([b]));self.wfile.flush()
+            else:self.wfile.write(value)
+        except (BrokenPipeError,ConnectionResetError):pass
     def log_message(self,*_):pass
 
 upstream=ThreadingHTTPServer(("127.0.0.1",18098),Mock)
@@ -119,6 +140,14 @@ try:
     assert call({"url":UPSTREAM+"/redirect-redirect","redirects":2})[0]==403
     print("PASS: redirect-by-redirect global-IP verification, max hops and failure containment")
 
+    code,body=call({"url":UPSTREAM+"/rate-limit"})
+    assert code==200 and body["status_code"]==429
+    assert body["headers"]["retry-after"]=="7"
+    assert body["headers"]["x-evidence"]=="one, caf\xe9"
+    started=time.monotonic()
+    assert call({"url":UPSTREAM+"/slow-redirect","timeout":0.18})[0]==502
+    assert time.monotonic()-started<1.0
+    print("PASS: original Retry-After, repeated Latin-1 headers and a single total deadline across redirect/trickle")
     for bad in ["file:///etc/passwd","http://127.0.0.1:12345/foo",
                 "http://169.254.169.254/latest/meta-data/",
                 "http://10.0.0.1/","http://192.168.1.1/",

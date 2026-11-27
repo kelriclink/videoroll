@@ -11,7 +11,7 @@ from urllib.request import Request,urlopen
 from urllib.error import HTTPError
 from sqlalchemy import create_engine,text
 from sqlalchemy.orm import Session
-from videoroll.apps.subtitle_service.dictionaries import import_dictionary_file
+from videoroll.apps.subtitle_service.dictionaries import import_dictionary_file, lookup_dictionary_entries
 
 url=os.environ["DATABASE_URL"]
 assert url.rsplit("/",1)[-1]=="videoroll_test","refuse non-disposable database"
@@ -148,3 +148,20 @@ assert set(final)=={"b","c"} and final["b"]!=after["b"]
 for fields in ({"format_name":"unknown"},{"import_mode":"drop"},{"dictionary_preset":"fake"}):
     assert call(initial,"terms.csv",fields)[0]==400,fields
 print("PASS DIFF: Python/Rust CSV/TSV/JSONL/CEDICT/TMX/TBX presets, SHA-256 archives, source/batch/entry writes, max_entries and upsert/replace")
+
+# Compare lookup's actual edge-value behavior with the original implementation.
+for q in (
+    {"term":"  PCB___Trace  ","target_lang":"zh","source_lang":"en","limit":0,"min_quality":-1.0},
+    {"term":"trace","target_lang":"zh","source_lang":"en","exact":False,"limit":500,"min_quality":-0.5},
+    {"term":"resistor","target_lang":"zh","source_lang":"en","limit":500,"min_quality":2.0},
+):
+    with Session(engine) as db:
+        expected=lookup_dictionary_entries(db,**q)
+        db.rollback()
+    request=Request(base+"/subtitle/dictionaries/lookup",method="POST",
+        data=json.dumps(q).encode(),headers={"x-videoroll-v2-internal-token":token,"content-type":"application/json"})
+    with urlopen(request,timeout=15) as result:
+        actual=json.loads(result.read())
+    assert actual["count"]==len(expected),(q,actual,expected)
+    assert [str(r["id"]) for r in actual["results"]]==[str(r["id"]) for r in expected],q
+print("PASS DIFF: original dictionary normalized lookup, bounded quality/limit and result ordering")

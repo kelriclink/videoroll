@@ -3,7 +3,7 @@
 use crate::{
     AppError, AppResult, Config, Database,
     domain::WorkItem,
-    media::ffmpeg::{ensure_task_asset, latest_asset_key, probe_video},
+    media::ffmpeg::{ensure_task_asset, install_task_asset, latest_asset_key, probe_video},
     storage::AssetRegistry,
 };
 use serde_json::{Value, json};
@@ -682,34 +682,35 @@ pub async fn process(
         ));
     }
     probe_video(&config.ffprobe_binary, &source).await?;
-    let temp = dest.with_extension("partial");
-    fs::copy(&source, &temp).await?;
-    let file = fs::OpenOptions::new().read(true).open(&temp).await?;
-    file.sync_all().await?;
-    drop(file);
+    let temp = tempfile::Builder::new()
+        .prefix(".dub-attempt-")
+        .suffix(".vr2-upload.partial")
+        .tempfile_in(
+            dest.parent()
+                .ok_or_else(|| AppError::Invalid("YouDub output parent missing".into()))?,
+        )?;
+    fs::copy(&source, temp.path()).await?;
+    fs::File::open(temp.path()).await?.sync_all().await?;
     active_lease(db, job).await?;
     if let Ok(meta) = fs::metadata(&dest).await {
-        // A prior worker may have copied the exact native result and died
-        // before writing its proof. Compare actual bytes, not existence.
-        // Use registry relative path with the actual extension replacement.
-        let partial_key = Path::new(&dest_key)
-            .with_extension("partial")
-            .to_string_lossy()
-            .into_owned();
-        let same = meta.len() == fs::metadata(&temp).await?.len()
-            && registry.sha256(&dest_key).await?.0 == registry.sha256(&partial_key).await?.0;
+        let partial_key = Path::new(&dest_key).with_file_name(
+            temp.path()
+                .file_name()
+                .ok_or_else(|| AppError::Invalid("YouDub attempt filename missing".into()))?,
+        );
+        let partial_key = partial_key
+            .to_str()
+            .ok_or_else(|| AppError::Invalid("YouDub attempt key invalid".into()))?;
+        let same = meta.len() == fs::metadata(temp.path()).await?.len()
+            && registry.sha256(&dest_key).await?.0 == registry.sha256(partial_key).await?.0;
         if !same {
-            let _ = fs::remove_file(&temp).await;
             return Err(AppError::Conflict(
                 "existing YouDub output differs from recovered native receipt".into(),
             ));
         }
-        fs::remove_file(&temp).await?;
-    } else {
-        fs::rename(temp, &dest).await?;
     }
     let outcome =
-        ensure_task_asset(db, registry, job.task_id, job, "video_dubbed", &dest_key).await?;
+        install_task_asset(db, registry, job, "video_dubbed", &dest_key, temp.path()).await?;
     sqlx::query(
         "UPDATE operation_inbox SET
             dubbing_source_video_key=$4,dubbing_source_srt_key=$5,

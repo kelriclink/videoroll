@@ -3,7 +3,7 @@
 use crate::{
     AppError, AppResult, Config, Database,
     domain::WorkItem,
-    media::ffmpeg::{ensure_task_asset, latest_asset_key, probe_video},
+    media::ffmpeg::{ensure_task_asset, latest_asset_key, probe_video, write_task_asset},
     storage::AssetRegistry,
     subtitles::{SubtitleCue, to_ass, to_srt},
 };
@@ -1550,25 +1550,28 @@ async fn convert_audio(
     }
     Ok(())
 }
+// Work checkpoints are not published assets. Preserve their stable recovery
+// path but avoid concurrent attempts sharing and truncating a temp file.
 async fn atomic_write(path: &Path, body: &[u8]) -> AppResult<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).await?;
-    }
-    let temp = path.with_extension("partial");
-    let outcome = async {
-        use tokio::io::AsyncWriteExt;
-        let mut file = fs::File::create(&temp).await?;
-        file.write_all(body).await?;
-        file.sync_all().await?;
-        drop(file);
-        fs::rename(&temp, path).await?;
-        Ok::<(), AppError>(())
-    }
-    .await;
-    if outcome.is_err() {
-        let _ = fs::remove_file(&temp).await;
-    }
-    outcome
+    use tokio::io::AsyncWriteExt;
+    let parent = path
+        .parent()
+        .ok_or_else(|| AppError::Invalid("checkpoint parent missing".into()))?;
+    fs::create_dir_all(parent).await?;
+    let temp = tempfile::Builder::new()
+        .prefix(".checkpoint-")
+        .suffix(".vr2-upload.partial")
+        .tempfile_in(parent)?;
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(temp.path())
+        .await?;
+    file.write_all(body).await?;
+    file.sync_all().await?;
+    drop(file);
+    std::fs::rename(temp.path(), path)?;
+    Ok(())
 }
 fn parse_translation_partial(content: &str, count: usize) -> AppResult<Vec<String>> {
     let parsed: Value = serde_json::from_str(content.trim())
@@ -2671,7 +2674,7 @@ async fn process_selective(
         // Persist checkpoint only if this stage still holds the lease.
         // A stale worker must not overwrite the replacement snapshot.
         selective_lease(db, job).await?;
-        atomic_write(&checkpoint, &content).await?;
+        write_task_asset(db, registry, job, "segments_json", &segments_key, &content).await?;
         edited
     };
     let srt = to_srt(&edited)?;
@@ -2682,12 +2685,11 @@ async fn process_selective(
         (&ass_key, Some(ass.as_bytes()), "subtitle_ass"),
     ] {
         selective_lease(db, job).await?;
-        let path = registry.resolve_existing(key).await?;
         if let Some(body) = body {
-            atomic_write(&path, body).await?;
+            write_task_asset(db, registry, job, kind, key, body).await?;
+        } else {
+            ensure_task_asset(db, registry, job.task_id, job, kind, key).await?;
         }
-        selective_lease(db, job).await?;
-        ensure_task_asset(db, registry, job.task_id, job, kind, key).await?;
     }
     Ok(
         json!({"no_speech":false,"selective_retranslate":plan.indices,
@@ -3553,15 +3555,7 @@ async fn process_inner(
         (&srt_key, srt.as_bytes(), "subtitle_srt"),
         (&ass_key, ass.as_bytes(), "subtitle_ass"),
     ] {
-        let path = registry.resolve_existing(key).await?;
-        if config.cloudflare_asr || resume.is_some() {
-            selective_lease(db, job).await?;
-        }
-        atomic_write(&path, body).await?;
-        if config.cloudflare_asr || resume.is_some() {
-            selective_lease(db, job).await?;
-        }
-        ensure_task_asset(db, registry, job.task_id, job, kind, key).await?;
+        write_task_asset(db, registry, job, kind, key, body).await?;
     }
     Ok(json!({"no_speech":false,"cues":cues.len(),
         "srt_key":srt_key,"ass_key":ass_key,"segments_key":segments_key,"youtube_subtitle":youtube_info,"subtitle_resume_plan":resume}))

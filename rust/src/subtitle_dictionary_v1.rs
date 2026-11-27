@@ -355,9 +355,9 @@ async fn lookup(
     State(state): State<AppState>,
     Json(input): Json<Lookup>,
 ) -> AppResult<Json<Value>> {
-    if !(0.0..=1.0).contains(&input.min_quality) || !(1..=50).contains(&input.limit) {
-        return Err(invalid("dictionary lookup quality or limit out of range"));
-    }
+    // Original Python lookup clamps numerical controls, not HTTP 400.
+    let min_quality = input.min_quality.clamp(0.0, 1.0);
+    let limit = input.limit.clamp(1, 50);
     let term = input.term.split_whitespace().collect::<Vec<_>>().join(" ");
     if term.is_empty() {
         return Ok(Json(json!({"count":0,"results":[]})));
@@ -385,14 +385,14 @@ async fn lookup(
     );
     let mut tx = state.db.pool.begin().await?;
     let rows: Vec<Entry> = sqlx::query_as(&sql)
-        .bind(input.min_quality)
+        .bind(min_quality)
         .bind(dest)
         .bind(src)
         .bind(domain)
         .bind(input.exact)
         .bind(norm)
         .bind(format!("%{term}%"))
-        .bind(input.limit)
+        .bind(limit)
         .fetch_all(&mut *tx)
         .await?;
     let count = rows.len();

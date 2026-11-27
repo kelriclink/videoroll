@@ -710,6 +710,49 @@ impl Scheduler {
         }
         Ok(count)
     }
+    /// A crashed worker consumes its claimed attempt, just like a normal
+    /// stage failure. Terminalize only the current reversible stage after
+    /// the last lease expired; paused/canceled/older generations are untouched.
+    pub async fn reconcile_exhausted_jobs(&self) -> AppResult<u64> {
+        let candidates=sqlx::query("SELECT j.id,j.task_id,j.workflow_id FROM vr2_jobs j JOIN vr2_workflows w ON w.id=j.workflow_id JOIN tasks t ON t.id=j.task_id
+            WHERE t.runtime_owner='rust' AND t.status<>'canceled'::task_status
+              AND w.state='running' AND w.current_stage=j.stage AND w.generation=j.generation
+              AND j.stage<>'publish' AND j.attempts>=j.max_attempts
+              AND (j.state='pending' OR (j.state='running' AND (j.lease_until IS NULL OR j.lease_until<=clock_timestamp())))
+            ORDER BY j.updated_at,j.id LIMIT 100").fetch_all(&self.db.pool).await?;
+        let mut changed = 0;
+        for candidate in candidates {
+            let id: Uuid = candidate.try_get("id")?;
+            let task: Uuid = candidate.try_get("task_id")?;
+            let flow: Uuid = candidate.try_get("workflow_id")?;
+            let mut tx = self.db.pool.begin().await?;
+            let active:Option<Uuid>=sqlx::query_scalar("SELECT id FROM tasks WHERE id=$1 AND runtime_owner='rust' AND status<>'canceled'::task_status FOR UPDATE").bind(task).fetch_optional(&mut *tx).await?;
+            if active.is_none() {
+                continue;
+            }
+            let active:Option<Uuid>=sqlx::query_scalar("SELECT id FROM vr2_workflows WHERE id=$1 AND task_id=$2 AND state='running' FOR UPDATE").bind(flow).bind(task).fetch_optional(&mut *tx).await?;
+            if active.is_none() {
+                continue;
+            }
+            let row=sqlx::query("UPDATE vr2_jobs j SET state='failed',last_error='stage attempt budget exhausted after worker lease expiry',lease_token=NULL,lease_until=NULL,finished_at=now(),updated_at=now()
+                WHERE j.id=$1 AND j.task_id=$2 AND j.workflow_id=$3 AND j.stage<>'publish' AND j.attempts>=j.max_attempts
+                 AND (j.state='pending' OR (j.state='running' AND (j.lease_until IS NULL OR j.lease_until<=clock_timestamp())))
+                 AND EXISTS(SELECT 1 FROM vr2_workflows w WHERE w.id=j.workflow_id AND w.state='running' AND w.current_stage=j.stage AND w.generation=j.generation)
+                RETURNING j.stage,j.attempts").bind(id).bind(task).bind(flow).fetch_optional(&mut *tx).await?;
+            let Some(row) = row else {
+                continue;
+            };
+            let stage: String = row.try_get("stage")?;
+            let attempts: i32 = row.try_get("attempts")?;
+            let error = "stage attempt budget exhausted after worker lease expiry";
+            sqlx::query("UPDATE vr2_workflows SET state='failed',last_error=$2,updated_at=now() WHERE id=$1").bind(flow).bind(error).execute(&mut *tx).await?;
+            sqlx::query("UPDATE tasks SET status='failed'::task_status,error_code='V2_WORKFLOW_FAILED',error_message=$2,updated_at=now() WHERE id=$1 AND status NOT IN ('published'::task_status,'canceled'::task_status)").bind(task).bind(error).execute(&mut *tx).await?;
+            Self::event(&mut tx,flow,Some(id),"job.failed_attempt",json!({"stage":stage,"attempts":attempts,"state":"failed","reason":"lease_attempt_budget_exhausted"})).await?;
+            tx.commit().await?;
+            changed += 1;
+        }
+        Ok(changed)
+    }
     /// Claims are atomically fenced by a new UUID and a renewed PostgreSQL lease.
     /// The claim query can be safely used by multiple processes.
     pub async fn claim(&self) -> AppResult<Option<WorkItem>> {
@@ -732,9 +775,10 @@ impl Scheduler {
                 JOIN vr2_workflows w ON w.id=j.workflow_id
                 JOIN tasks t ON t.id=j.task_id
                 WHERE w.state='running' AND t.runtime_owner='rust' AND t.status <> 'canceled'::task_status
+                  AND w.current_stage=j.stage AND w.generation=j.generation AND j.attempts<j.max_attempts
                   AND (
                      (j.state='pending' AND j.available_at<=now())
-                     OR (j.state='running' AND j.lease_until<now() AND j.stage <> 'publish')
+                     OR (j.state='running' AND (j.lease_until IS NULL OR j.lease_until<=clock_timestamp()) AND j.stage <> 'publish')
                   )
                   AND (
                     j.stage <> 'download' OR (
@@ -751,7 +795,7 @@ impl Scheduler {
                 ORDER BY t.priority DESC, j.available_at, j.created_at
                 FOR UPDATE OF j SKIP LOCKED LIMIT 1
             ) UPDATE vr2_jobs j SET state='running',lease_token=$1,
-                lease_until=now()+($2 * interval '1 second'),
+                lease_until=clock_timestamp()+($2 * interval '1 second'),
                 attempts=attempts+1,started_at=COALESCE(started_at,now()),
                 updated_at=now() FROM next WHERE j.id=next.id
                 RETURNING j.id,j.workflow_id,j.task_id,j.stage,j.generation,j.operation_key,
@@ -782,7 +826,7 @@ impl Scheduler {
     }
     pub async fn heartbeat(&self, item: &WorkItem) -> AppResult<bool> {
         let result = sqlx::query(
-            "UPDATE vr2_jobs SET lease_until=now()+($1 * interval '1 second'),updated_at=now() WHERE id=$2 AND lease_token=$3 AND state='running' AND lease_until>now() AND EXISTS(SELECT 1 FROM vr2_workflows w WHERE w.id=vr2_jobs.workflow_id AND w.state='running')"
+             "UPDATE vr2_jobs SET lease_until=clock_timestamp()+($1 * interval '1 second'),updated_at=now() WHERE id=$2 AND lease_token=$3 AND state='running' AND lease_until>clock_timestamp() AND EXISTS(SELECT 1 FROM vr2_workflows w JOIN tasks t ON t.id=w.task_id WHERE w.id=vr2_jobs.workflow_id AND w.state='running' AND w.current_stage=vr2_jobs.stage AND w.generation=vr2_jobs.generation AND t.runtime_owner='rust' AND t.status<>'canceled'::task_status)"
         ).bind(self.lease_seconds()).bind(item.id).bind(item.lease_token)
             .execute(&self.db.pool).await?;
         Ok(result.rows_affected() == 1)
@@ -812,7 +856,7 @@ impl Scheduler {
             return Err(AppError::NotFound("workflow disappeared".into()));
         };
         let job = sqlx::query(
-            "SELECT state,lease_token,external_ticket,COALESCE(lease_until>now(),false) AS lease_active FROM vr2_jobs WHERE id=$1 FOR UPDATE",
+            "SELECT state,lease_token,external_ticket,COALESCE(lease_until>clock_timestamp(),false) AS lease_active FROM vr2_jobs WHERE id=$1 FOR UPDATE",
         )
         .bind(item.id)
         .fetch_optional(&mut *tx)
@@ -1139,24 +1183,23 @@ impl Scheduler {
     }
     pub async fn fail(&self, item: &WorkItem, error: &str) -> AppResult<()> {
         let mut tx = self.db.pool.begin().await?;
-        // Maintain the global transaction lock order: Task -> Workflow -> Job.
-        sqlx::query("SELECT id FROM tasks WHERE id=$1 FOR UPDATE")
-            .bind(item.task_id)
-            .fetch_one(&mut *tx)
-            .await?;
-        sqlx::query("SELECT id FROM vr2_workflows WHERE id=$1 FOR UPDATE")
-            .bind(item.workflow_id)
-            .fetch_one(&mut *tx)
-            .await?;
-        let row = sqlx::query(
-            "SELECT state,lease_token,attempts,max_attempts FROM vr2_jobs WHERE id=$1 FOR UPDATE",
-        )
-        .bind(item.id)
-        .fetch_one(&mut *tx)
-        .await?;
+        let task:Option<Uuid>=sqlx::query_scalar("SELECT id FROM tasks WHERE id=$1 AND runtime_owner='rust' AND status<>'canceled'::task_status FOR UPDATE").bind(item.task_id).fetch_optional(&mut *tx).await?;
+        if task.is_none() {
+            return Err(AppError::Conflict("stale stage failure ignored".into()));
+        }
+        let flow:Option<Uuid>=sqlx::query_scalar("SELECT id FROM vr2_workflows WHERE id=$1 AND task_id=$2 AND state='running' AND generation=$3 AND current_stage=$4 FOR UPDATE")
+            .bind(item.workflow_id).bind(item.task_id).bind(item.generation).bind(item.stage.as_str()).fetch_optional(&mut *tx).await?;
+        if flow.is_none() {
+            return Err(AppError::Conflict("stale stage failure ignored".into()));
+        }
+        let row=sqlx::query("SELECT state,lease_token,attempts,max_attempts,COALESCE(lease_until>clock_timestamp(),false) AS lease_active FROM vr2_jobs WHERE id=$1 AND task_id=$2 AND workflow_id=$3 AND generation=$4 AND stage=$5 FOR UPDATE")
+            .bind(item.id).bind(item.task_id).bind(item.workflow_id).bind(item.generation).bind(item.stage.as_str()).fetch_optional(&mut *tx).await?.ok_or_else(||AppError::Conflict("stale stage failure ignored".into()))?;
         let state: String = row.try_get("state")?;
         let owner: Option<Uuid> = row.try_get("lease_token")?;
-        if state != "running" || owner != Some(item.lease_token) {
+        if state != "running"
+            || owner != Some(item.lease_token)
+            || !row.try_get::<bool, _>("lease_active")?
+        {
             return Err(AppError::Conflict("stale stage failure ignored".into()));
         }
         let attempts: i32 = row.try_get("attempts")?;
@@ -1591,6 +1634,279 @@ impl Scheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn exhausted_lease_and_asset_real_postgres() {
+        let Ok(url) = std::env::var("VIDEOROLL_TEST_EXHAUSTED_LEASE_DB_URL") else {
+            return;
+        };
+        let parsed = reqwest::Url::parse(&url).unwrap();
+        assert_eq!(parsed.host_str(), Some("127.0.0.1"));
+        assert_eq!(parsed.path(), "/videoroll_test");
+        let db = Database::connect(&url).await.unwrap();
+        sqlx::raw_sql(include_str!(
+            "../tests/bootstrap_legacy_for_integration.sql"
+        ))
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        db.migrate().await.unwrap();
+        let scheduler = Scheduler::new(db.clone(), Duration::from_secs(300));
+        async fn seed(
+            db: &Database,
+            stage: Stage,
+            flow_state: &str,
+            attempts: i32,
+            max: i32,
+            expired: bool,
+        ) -> WorkItem {
+            let (task, flow, id, lease) = (
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+            );
+            let operation_key = format!("exhausted-lease:{id}");
+            sqlx::query("INSERT INTO tasks(id,source_type,source_license,status,runtime_owner,priority,retry_count) VALUES($1,'local','own','downloaded','rust',0,0)").bind(task).execute(&db.pool).await.unwrap();
+            sqlx::query("INSERT INTO vr2_workflows(id,task_id,generation,state,current_stage) VALUES($1,$2,1,$3,$4)").bind(flow).bind(task).bind(flow_state).bind(stage.as_str()).execute(&db.pool).await.unwrap();
+            sqlx::query("INSERT INTO vr2_jobs(id,workflow_id,task_id,stage,generation,operation_key,state,attempts,max_attempts,lease_token,lease_until,payload) VALUES($1,$2,$3,$4,1,$5,'running',$6,$7,$8,now()+($9*interval '1 second'),'{}')").bind(id).bind(flow).bind(task).bind(stage.as_str()).bind(&operation_key).bind(attempts).bind(max).bind(lease).bind(if expired{-60i64}else{300}).execute(&db.pool).await.unwrap();
+            WorkItem {
+                id,
+                workflow_id: flow,
+                task_id: task,
+                stage,
+                generation: 1,
+                operation_key,
+                lease_token: lease,
+                attempts,
+                max_attempts: max,
+                payload: json!({}),
+            }
+        }
+        async fn state(db: &Database, id: Uuid) -> String {
+            sqlx::query_scalar("SELECT state FROM vr2_jobs WHERE id=$1")
+                .bind(id)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap()
+        }
+        let expired = seed(&db, Stage::Subtitle, "running", 5, 5, true).await;
+        let paused = seed(&db, Stage::Subtitle, "paused", 5, 5, true).await;
+        let live = seed(&db, Stage::Render, "running", 5, 5, false).await;
+        let retry = seed(&db, Stage::Download, "running", 4, 5, true).await;
+        let publish = seed(&db, Stage::Publish, "running", 1, 1, true).await;
+        let replacement = scheduler.claim().await.unwrap().unwrap();
+        assert_eq!(replacement.id, retry.id);
+        assert_eq!(replacement.attempts, 5);
+        assert_ne!(replacement.lease_token, retry.lease_token);
+        assert!(
+            scheduler.claim().await.unwrap().is_none(),
+            "exhausted stage must not be reclaimed"
+        );
+        assert!(scheduler.fail(&expired, "late failure").await.is_err());
+        assert!(scheduler.fail(&paused, "paused failure").await.is_err());
+        let a = scheduler.clone();
+        let b = scheduler.clone();
+        let (a, b) = tokio::join!(a.reconcile_exhausted_jobs(), b.reconcile_exhausted_jobs());
+        assert_eq!(a.unwrap() + b.unwrap(), 1);
+        assert_eq!(state(&db, expired.id).await, "failed");
+        assert_eq!(state(&db, paused.id).await, "running");
+        assert_eq!(state(&db, live.id).await, "running");
+        assert_eq!(state(&db, publish.id).await, "running");
+        let event_count:i64=sqlx::query_scalar("SELECT count(*) FROM workflow_events WHERE job_id=$1 AND details->>'reason'='lease_attempt_budget_exhausted'").bind(expired.id).fetch_one(&db.pool).await.unwrap();
+        assert_eq!(event_count, 1);
+        assert_eq!(scheduler.reconcile_exhausted_jobs().await.unwrap(), 0);
+        assert!(
+            scheduler
+                .fail(&retry, "previous worker failed")
+                .await
+                .is_err()
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::storage::AssetRegistry::new(db.clone(), dir.path().to_path_buf());
+        let key = "fixture/output.mp4";
+        let path = store.resolve_existing(key).await.unwrap();
+        tokio::fs::create_dir_all(path.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&path, b"original bytes").await.unwrap();
+        assert!(
+            crate::media::ffmpeg::ensure_task_asset(
+                &db,
+                &store,
+                expired.task_id,
+                &expired,
+                "video_final",
+                key
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            crate::media::ffmpeg::ensure_task_asset(
+                &db,
+                &store,
+                paused.task_id,
+                &paused,
+                "video_final",
+                key
+            )
+            .await
+            .is_err()
+        );
+        let asset = crate::media::ffmpeg::ensure_task_asset(
+            &db,
+            &store,
+            live.task_id,
+            &live,
+            "video_final",
+            key,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            crate::media::ffmpeg::ensure_task_asset(
+                &db,
+                &store,
+                live.task_id,
+                &live,
+                "video_final",
+                key
+            )
+            .await
+            .unwrap(),
+            asset
+        );
+        let wrong = WorkItem {
+            lease_token: Uuid::new_v4(),
+            ..live.clone()
+        };
+        assert!(
+            crate::media::ffmpeg::ensure_task_asset(
+                &db,
+                &store,
+                live.task_id,
+                &wrong,
+                "video_final",
+                key
+            )
+            .await
+            .is_err()
+        );
+        // Stale workers are rejected before the file rename, even when
+        // the old canonical object already has live references.
+        assert!(
+            crate::media::ffmpeg::write_task_asset(
+                &db,
+                &store,
+                &wrong,
+                "video_final",
+                key,
+                b"stale overwrite"
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(tokio::fs::read(&path).await.unwrap(), b"original bytes");
+        assert!(
+            crate::media::ffmpeg::write_task_asset(
+                &db,
+                &store,
+                &live,
+                "video_final",
+                key,
+                b"conflicting bytes"
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(tokio::fs::read(&path).await.unwrap(), b"original bytes");
+        assert_eq!(
+            crate::media::ffmpeg::write_task_asset(
+                &db,
+                &store,
+                &live,
+                "video_final",
+                key,
+                b"original bytes"
+            )
+            .await
+            .unwrap(),
+            asset
+        );
+        let new_key = "fixture/new.mp4";
+        assert!(
+            crate::media::ffmpeg::write_task_asset(
+                &db,
+                &store,
+                &wrong,
+                "video_final",
+                new_key,
+                b"stale"
+            )
+            .await
+            .is_err()
+        );
+        assert!(!store.resolve_existing(new_key).await.unwrap().exists());
+        assert!(
+            crate::media::ffmpeg::write_task_asset(
+                &db,
+                &store,
+                &live,
+                "video_final",
+                new_key,
+                b"valid"
+            )
+            .await
+            .is_ok()
+        );
+        assert_eq!(
+            tokio::fs::read(store.resolve_existing(new_key).await.unwrap())
+                .await
+                .unwrap(),
+            b"valid"
+        );
+        tokio::fs::write(&path, b"different bytes").await.unwrap();
+        assert!(
+            crate::media::ffmpeg::ensure_task_asset(
+                &db,
+                &store,
+                live.task_id,
+                &live,
+                "video_final",
+                key
+            )
+            .await
+            .is_err()
+        );
+        tokio::fs::write(&path, b"original bytes").await.unwrap();
+        sqlx::query("UPDATE storage_objects SET state='deleting' WHERE storage_key=$1")
+            .bind(key)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        assert!(
+            crate::media::ffmpeg::ensure_task_asset(
+                &db,
+                &store,
+                live.task_id,
+                &live,
+                "video_final",
+                key
+            )
+            .await
+            .is_err()
+        );
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM assets WHERE storage_key=$1")
+            .bind(key)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
+        assert!(scheduler.heartbeat(&live).await.unwrap());
+        println!(
+            "PASS exhausted lease budget and concurrent reconciliation; paused and live retained; stale failure rejected; publish kept for separate quarantine; asset lease/hash/GC fencing"
+        );
+    }
     #[test]
     fn publish_stages_have_no_automatic_retry() {
         assert!(Stage::Publish.has_irreversible_external_effect());

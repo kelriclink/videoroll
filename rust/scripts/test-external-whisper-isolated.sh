@@ -5,6 +5,7 @@ cd "$(dirname "$0")/.."
 case "${VIDEOROLL_TEST_ASR_SCENARIO:-external-whisper}" in
   external-whisper) test_name=media::asr::tests::external_whisper_real_postgres_http_admission ;;
   translation) test_name=media::asr::tests::translation_recovery_real_postgres_http ;;
+  exhausted-lease) test_name=scheduler::tests::exhausted_lease_and_asset_real_postgres ;;
   live-thinking) test_name=media::translation_trace::tests::live_thinking_real_postgres_http ;;
   thinking) test_name=media::asr::tests::thinking_real_postgres_http ;;
   collection) test_name=bilibili::collection::tests::collection_real_postgres_http ;;
@@ -29,11 +30,13 @@ docker volume create --label io.videoroll.purpose=isolated-whisper "$volume" >/d
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
+idle_tx_timeout=100ms
+if [[ "${VIDEOROLL_TEST_ASR_SCENARIO:-external-whisper}" == exhausted-lease ]]; then idle_tx_timeout=5s; fi
 docker run -d --rm --pull=never --name "$name" --memory=512m \
   --mount "type=volume,source=$volume,target=/var/lib/postgresql" \
   -p 127.0.0.1::5432 -e POSTGRES_PASSWORD=videoroll-test-only \
   -e POSTGRES_DB=videoroll_test pgvector/pgvector:pg18 \
-  -c idle_in_transaction_session_timeout=100ms >/dev/null
+  -c "idle_in_transaction_session_timeout=$idle_tx_timeout" >/dev/null
 for i in $(seq 1 60); do
   if docker logs "$name" 2>&1 | grep -q 'PostgreSQL init process complete; ready for start up' &&
      docker exec "$name" pg_isready -U postgres -d videoroll_test >/dev/null 2>&1; then
@@ -49,6 +52,7 @@ export DATABASE_URL="$VIDEOROLL_TEST_EXTERNAL_WHISPER_DB_URL"
 export VIDEOROLL_V2_STORAGE_ROOT="$tmp" VIDEOROLL_V2_INTERNAL_TOKEN=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 case "${VIDEOROLL_TEST_ASR_SCENARIO:-external-whisper}" in
   translation) export VIDEOROLL_TEST_TRANSLATION_DB_URL="$DATABASE_URL"; unset VIDEOROLL_TEST_EXTERNAL_WHISPER_DB_URL ;;
+  exhausted-lease) export VIDEOROLL_TEST_EXHAUSTED_LEASE_DB_URL="$DATABASE_URL"; unset VIDEOROLL_TEST_EXTERNAL_WHISPER_DB_URL ;;
   live-thinking) export VIDEOROLL_TEST_LIVE_THINKING_DB_URL="$DATABASE_URL"; unset VIDEOROLL_TEST_EXTERNAL_WHISPER_DB_URL ;;
   thinking) export VIDEOROLL_TEST_THINKING_DB_URL="$DATABASE_URL"; unset VIDEOROLL_TEST_EXTERNAL_WHISPER_DB_URL ;;
   collection) export VIDEOROLL_TEST_COLLECTION_DB_URL="$DATABASE_URL"; unset VIDEOROLL_TEST_EXTERNAL_WHISPER_DB_URL ;;

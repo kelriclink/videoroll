@@ -296,6 +296,9 @@ impl Executor {
             if let Err(e) = self.scheduler.quarantine_expired_publish().await {
                 warn!(worker_index,error=%e,"expired publish audit unavailable");
             }
+            if let Err(e) = self.scheduler.reconcile_exhausted_jobs().await {
+                warn!(worker_index,error=%e,"expired stage recovery unavailable");
+            }
             match self.scheduler.claim().await {
                 Ok(Some(job)) => {
                     info!(worker_index,job_id=%job.id,stage=%job.stage.as_str(),"stage started");

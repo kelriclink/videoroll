@@ -15,7 +15,7 @@ use serde_json::json;
 use sha2::Sha256;
 use std::{
     collections::BTreeMap,
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, SocketAddr, ToSocketAddrs},
     str::FromStr,
     time::Duration,
 };
@@ -230,13 +230,30 @@ fn target(url: &str) -> Result<(Url, String, u16), Failure> {
     Ok((parsed, host, port))
 }
 async fn endpoint(host: &str, port: u16) -> Result<IpAddr, Failure> {
-    let mut addresses = tokio::net::lookup_host((host, port))
-        .await
-        .map_err(|_| denied("egress DNS resolution failed"))?
-        .map(|x| x.ip())
-        .collect::<Vec<_>>();
-    addresses.sort_unstable();
-    addresses.dedup();
+    // Like Python's resolver semaphore, keep the slot in the actual
+    // blocking resolver even if its HTTP caller times out or disconnects.
+    // Canceling a Tokio join future cannot interrupt libc getaddrinfo.
+    static DNS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(16);
+    let permit = DNS.acquire().await.map_err(|_| failed())?;
+    let hostname = host.to_owned();
+    let addresses = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        (hostname.as_str(), port).to_socket_addrs().map(|iter| {
+            let mut addresses = Vec::new();
+            for addr in iter {
+                let ip = addr.ip();
+                if !addresses.contains(&ip) {
+                    addresses.push(ip);
+                }
+            }
+            addresses
+        })
+    })
+    .await
+    .map_err(|_| failed())?
+    .map_err(|_| denied("egress DNS resolution failed"))?;
+    // Preserve resolver preference (as Python does), rather than sort IPv4
+    // ahead of IPv6; still reject any mixed private answer below.
     if addresses.is_empty() {
         return Err(denied("egress DNS resolution returned no addresses"));
     }
@@ -275,6 +292,8 @@ fn request_headers(raw: &BTreeMap<String, String>) -> Result<HeaderMap, Failure>
         "content-length",
         "x-forwarded-for",
         "x-real-ip",
+        "x-videoroll-internal-token",
+        "x-videoroll-v2-internal-token",
     ];
     for (name, value) in raw.iter().take(MAX_HEADERS) {
         let name = name.trim().to_ascii_lowercase();
@@ -311,6 +330,22 @@ fn content_type_ok(headers: &reqwest::header::HeaderMap) -> bool {
         || mime == "application/xhtml+xml"
         || mime.ends_with("+xml")
 }
+fn response_headers(raw: &HeaderMap) -> BTreeMap<String, String> {
+    let mut result = BTreeMap::<String, String>::new();
+    for (name, value) in raw {
+        // RFC field values may contain obs-text. The original Python
+        // adapter decodes Latin-1 and preserves all repeated fields.
+        let value: String = value.as_bytes().iter().map(|b| char::from(*b)).collect();
+        result
+            .entry(name.as_str().to_owned())
+            .and_modify(|old| {
+                old.push_str(", ");
+                old.push_str(&value);
+            })
+            .or_insert(value);
+    }
+    result
+}
 fn redirect_status(n: u16) -> bool {
     matches!(n, 301 | 302 | 303 | 307 | 308)
 }
@@ -325,6 +360,8 @@ async fn fetch(req: FetchRequest) -> Result<FetchResponse, Failure> {
             "egress request limits are invalid",
         ));
     }
+    static FETCHES: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(40);
+    let _permit = FETCHES.acquire().await.map_err(|_| failed())?;
     let outbound = request_headers(&req.headers)?;
     let mut current = req.url;
     for hop in 0..=req.redirects {
@@ -353,13 +390,7 @@ async fn fetch(req: FetchRequest) -> Result<FetchResponse, Failure> {
             }
         }
         let code = response.status().as_u16();
-        let headers = response
-            .headers()
-            .iter()
-            .filter_map(|(name, value)| {
-                Some((name.as_str().to_owned(), value.to_str().ok()?.to_owned()))
-            })
-            .collect::<BTreeMap<_, _>>();
+        let headers = response_headers(response.headers());
         if redirect_status(code) {
             let Some(location) = response
                 .headers()
@@ -551,12 +582,20 @@ async fn fetch_http(
 ) -> Result<Json<FetchResponse>, (StatusCode, Json<serde_json::Value>)> {
     let err = |error: (StatusCode, &'static str)| (error.0, Json(json!({"detail":error.1})));
     state.check(req.headers()).map_err(err)?;
-    let body = to_bytes(req.into_body(), 32768).await.map_err(|_| {
-        err((
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "egress request body is too large",
-        ))
-    })?;
+    let body = tokio::time::timeout(Duration::from_secs(10), to_bytes(req.into_body(), 32768))
+        .await
+        .map_err(|_| {
+            err((
+                StatusCode::REQUEST_TIMEOUT,
+                "egress request body deadline exceeded",
+            ))
+        })?
+        .map_err(|_| {
+            err((
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "egress request body is too large",
+            ))
+        })?;
     let payload: FetchRequest = serde_json::from_slice(&body).map_err(|_| {
         err((
             StatusCode::UNPROCESSABLE_ENTITY,
