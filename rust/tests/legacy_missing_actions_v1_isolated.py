@@ -71,11 +71,11 @@ job_request={'task_id':str(subtask),'input':{'type':'storage','key':raw_key},
     'translate':{'enabled':False,'provider':'mock','target_lang':'zh'},
     'output':{'formats':['srt'],'render':{'burn_in':False}}}
 for invalid in [{**job_request,'input':{'type':'storage','key':'v2/other-task/raw.mp4'}},
-                {**job_request,'youtube_subtitle_mode':'target'},
+                {**job_request,'youtube_subtitle_mode':'invalid'},
                 {**job_request,'selective_retranslate':{'indices':[1]}},
                 {**job_request,'asr':{'engine':'groq-whisper'}}]:
     status,body=post('/subtitle/jobs',invalid)
-    assert status in (400,409),(status,body)
+    assert status in (400,409),(invalid,status,body)
 with engine.connect() as db:
     assert db.execute(text("SELECT count(*) FROM operation_inbox WHERE task_id=CAST(:id AS uuid) AND stage='subtitle'"),{'id':str(subtask)}).scalar()==0
 status,body=post('/subtitle/jobs',job_request)

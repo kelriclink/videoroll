@@ -39,12 +39,18 @@ async fn enqueue_youtube_download(
     .await?;
     if let Some(row) = latest {
         let status: String = row.try_get("state")?;
-        if matches!(
-            status.as_str(),
-            "pending" | "running" | "awaiting" | "succeeded"
-        ) {
-            return Ok(Json(json!({"task_id":task_id,
-                "status":if status=="succeeded"{"completed"}else{"queued"}})));
+        if status == "succeeded" {
+            if let Some(raw) = latest_asset(&state, task_id, "video_raw").await?
+                && valid_media(&state, &raw).await? {
+                return Ok(Json(json!({"task_id":task_id,"status":"completed"})));
+            }
+            if state.scheduler.recover_missing_download(&state.storage,task_id).await? {
+                return Ok(Json(json!({"task_id":task_id,"status":"queued"})));
+            }
+            return Err(AppError::Conflict("successful download has missing media; reconcile storage before retry".into()));
+        }
+        if matches!(status.as_str(), "pending" | "running" | "awaiting") {
+            return Ok(Json(json!({"task_id":task_id,"status":"queued"})));
         }
         if status == "unknown" {
             return Err(AppError::Conflict(
@@ -192,6 +198,12 @@ async fn native_youtube_download(
     .fetch_optional(&state.db.pool)
     .await?;
     if latest.as_deref() == Some("succeeded") {
+        if state.scheduler.recover_missing_download(&state.storage,task_id).await? {
+            return Ok(download_conflict(
+                "YOUTUBE_DOWNLOAD_IN_PROGRESS",
+                "verified missing source recovery queued; poll download progress",
+            ));
+        }
         return Ok(download_conflict(
             "YOUTUBE_DOWNLOAD_RESULT_RECOVERING",
             "download succeeded but media object is unavailable; reconcile storage before retry",

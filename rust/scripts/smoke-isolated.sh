@@ -596,6 +596,10 @@ if [[ "${VIDEOROLL_V2_TEST_SELECTIVE_ONLY:-false}" == "true" ]]; then
     "$repo_root/rust/tests/selective_retranslate_v1_isolated.py"
   exit 0
 fi
+if [[ "${VIDEOROLL_V2_TEST_SOURCE_RECOVERY_ONLY:-false}" == "true" ]]; then
+  PYTHONPATH="$repo_root/src" "$smoke_python" "$repo_root/rust/tests/source_recovery_v1_isolated.py"
+  exit 0
+fi
 if [[ "${VIDEOROLL_V2_TEST_MISSING_ACTIONS_ONLY:-false}" == "true" ]]; then
   PYTHONPATH="$repo_root/src" "$smoke_python" \
     "$repo_root/rust/tests/legacy_missing_actions_v1_isolated.py"

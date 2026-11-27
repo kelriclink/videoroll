@@ -57,7 +57,7 @@ const BLOCKERS: &str = r#"SELECT array_remove(ARRAY[
  CASE WHEN t.status::text='publishing' THEN 'task_publishing' END
 ],NULL)::text[] AS blockers FROM tasks t WHERE t.id=$1"#;
 
-async fn blockers(tx: &mut Transaction<'_, Postgres>, task: Uuid) -> AppResult<Vec<String>> {
+pub(crate) async fn blockers(tx: &mut Transaction<'_, Postgres>, task: Uuid) -> AppResult<Vec<String>> {
     Ok(sqlx::query_scalar(BLOCKERS)
         .bind(task)
         .fetch_one(&mut **tx)
@@ -116,7 +116,7 @@ async fn bulk_plan(
     let rows=sqlx::query(
         "SELECT id,status::text AS status,source_type::text AS source_type,
         source_license::text AS license,updated_at,
-        (lock_owner IS NOT NULL OR lock_until IS NOT NULL) AS task_locked,
+        (to_jsonb(t)->>'lock_owner' IS NOT NULL OR to_jsonb(t)->>'lock_until' IS NOT NULL) AS task_locked,
         EXISTS(SELECT 1 FROM publish_jobs j WHERE j.task_id=t.id) AS publication_history,
         EXISTS(SELECT 1 FROM publish_jobs j WHERE j.task_id=t.id AND j.state::text='published'
             AND (CASE WHEN j.platform::text='bilibili' THEN COALESCE(NULLIF(j.bvid,''),NULLIF(j.aid,''),NULLIF(j.external_id,'')) ELSE COALESCE(NULLIF(j.external_id,''),NULLIF(j.external_url,'')) END) IS NOT NULL) AS published_receipt,

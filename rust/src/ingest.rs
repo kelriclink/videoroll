@@ -108,6 +108,28 @@ pub(crate) async fn find_finished_video(
     }
     Ok(candidates.into_iter().next())
 }
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub(crate) struct SourceRecovery {
+    pub asset_id: Uuid,
+    pub storage_key: String,
+    pub sha256: String,
+    pub size_bytes: i64,
+    pub video_id: String,
+}
+impl SourceRecovery {
+    pub(crate) fn from_asset(asset: &crate::domain::AssetInfo, video_id: String) -> Option<Self> {
+        let sha = asset.sha256.as_deref()?;
+        let size = asset.size_bytes?;
+        if size <= 0 || sha.len()!=64 || !sha.bytes().all(|b| b.is_ascii_hexdigit())
+            || asset.kind!="video_raw"
+            || !asset.storage_key.starts_with(&format!("v2/raw/{}/",asset.task_id))
+            || AssetRegistry::checked_key(&asset.storage_key).is_err() {
+            return None;
+        }
+        Some(Self { asset_id:asset.id, storage_key:asset.storage_key.clone(),
+            sha256:sha.to_ascii_lowercase(),size_bytes:size,video_id })
+    }
+}
 pub async fn download_youtube(
     db: &Database,
     registry: &AssetRegistry,
@@ -128,7 +150,34 @@ pub async fn download_youtube(
     } else {
         return Err(AppError::Invalid("unsupported V2 download source".into()));
     };
-    let rel_dir = format!("v2/raw/{}", job.task_id);
+    let recovery: Option<serde_json::Value> = sqlx::query_scalar(
+        "SELECT configuration->'source_recovery' FROM vr2_workflows WHERE id=$1",
+    ).bind(job.workflow_id).fetch_one(&db.pool).await?;
+    let recovery: Option<SourceRecovery> = recovery.map(serde_json::from_value).transpose()
+        .map_err(|_|AppError::Conflict("invalid source recovery proof".into()))?;
+    if let Some(proof) = &recovery {
+        let raw = sqlx::query_as::<_,crate::domain::AssetInfo>(
+            "SELECT id,task_id,kind::text AS kind,storage_key,sha256,size_bytes,duration_ms,created_at
+             FROM assets WHERE task_id=$1 AND kind::text='video_raw' ORDER BY created_at DESC,id DESC LIMIT 1",
+        ).bind(job.task_id).fetch_optional(&db.pool).await?;
+        let current = raw.as_ref().and_then(|a| SourceRecovery::from_asset(a,
+            source.as_deref().and_then(|u|youtube_video_id(u).ok()).unwrap_or_default()));
+        if current.as_ref()!=Some(proof) {
+            return Err(AppError::Conflict("historical source identity changed during recovery".into()));
+        }
+        let path = registry.resolve_existing(&proof.storage_key).await?;
+        match fs::symlink_metadata(&path).await {
+            Err(e) if e.kind()==std::io::ErrorKind::NotFound => {},
+            Err(e) => return Err(e.into()),
+            Ok(meta) if meta.is_file() && meta.len()>0 => {},
+            Ok(_) => return Err(AppError::Conflict("historical source path is not a nonempty regular file".into())),
+        }
+    }
+    let rel_dir = if recovery.is_some() {
+        format!("v2/raw/{}/recovery-{}", job.task_id,job.workflow_id)
+    } else {
+        format!("v2/raw/{}", job.task_id)
+    };
     let output_dir = registry.resolve_existing(&rel_dir).await?;
     fs::create_dir_all(&output_dir).await?;
 
@@ -136,7 +185,7 @@ pub async fn download_youtube(
     let mut missing_source: Option<(String, String, Option<i64>)> = None;
     if let Some(row) = sqlx::query(
         "SELECT storage_key,sha256,size_bytes FROM assets WHERE task_id=$1 AND kind='video_raw'::asset_kind
-         AND storage_key LIKE 'v2/%' ORDER BY created_at DESC LIMIT 1",
+         AND storage_key LIKE 'v2/%' ORDER BY created_at DESC,id DESC LIMIT 1",
     )
     .bind(job.task_id)
     .fetch_optional(&db.pool)
@@ -181,7 +230,7 @@ pub async fn download_youtube(
             .bind(job.task_id)
             .execute(&db.pool)
             .await?;
-            return Ok(serde_json::json!({"source":"existing_asset","storage_key":key}));
+            return Ok(serde_json::json!({"source":"existing_asset","storage_key":key,"sha256":actual,"size_bytes":size}));
         }
         let expected:Option<String>=row.try_get("sha256")?;
         let expected=expected.filter(|v|v.len()==64&&v.bytes().all(|b|b.is_ascii_hexdigit()))
@@ -223,7 +272,16 @@ pub async fn download_youtube(
                     "historical source reappeared during recovery".into(),
                 ));
             }
-            fs::rename(&video, &old_path).await?;
+            if !scheduler.heartbeat(job).await? {
+                return Err(AppError::Conflict("download lease lost before source restoration".into()));
+            }
+            // Link rather than rename: never overwrite a source restored by
+            // another process after the existence check. Both paths are under
+            // the same storage root; unsupported links fail closed.
+            fs::hard_link(&video, &old_path).await?;
+            if let Err(error) = fs::remove_file(&video).await {
+                tracing::warn!(%error,"recovery staging file retained");
+            }
             key = old_key;
         }
     }
@@ -251,6 +309,26 @@ pub async fn download_youtube(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn recovery_requires_task_owned_native_raw_and_digest() {
+        let task=Uuid::new_v4();
+        let mut asset=crate::domain::AssetInfo {
+            id:Uuid::new_v4(),task_id:task,kind:"video_raw".into(),
+            storage_key:format!("v2/raw/{task}/native/source.mp4"),
+            sha256:Some("AB".repeat(32)),size_bytes:Some(42),duration_ms:None,
+            created_at:chrono::Utc::now(),
+        };
+        let proof=SourceRecovery::from_asset(&asset,"0123456789A".into()).unwrap();
+        assert_eq!(proof.sha256,"ab".repeat(32));
+        asset.storage_key=format!("v2/raw/{}/source.mp4",Uuid::new_v4());
+        assert!(SourceRecovery::from_asset(&asset,"0123456789A".into()).is_none());
+        asset.storage_key=format!("v2/raw/{task}/source.mp4");
+        asset.sha256=None;
+        assert!(SourceRecovery::from_asset(&asset,"0123456789A".into()).is_none());
+        asset.sha256=Some("ab".repeat(32));
+        asset.size_bytes=Some(0);
+        assert!(SourceRecovery::from_asset(&asset,"0123456789A".into()).is_none());
+    }
     #[test]
     fn youtube_validation_is_not_an_arbitrary_ssrf_gate() {
         for s in [

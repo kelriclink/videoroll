@@ -251,6 +251,126 @@ impl Scheduler {
         tx.commit().await?;
         self.workflow(workflow_id).await
     }
+    /// Restore a proven missing native source without resetting its history.
+    /// The old download receipt remains immutable; the new generation ends at
+    /// download, never inheriting publication or dubbing intent.
+    pub(crate) async fn recover_missing_download(
+        &self,
+        store: &crate::storage::AssetRegistry,
+        task_id: Uuid,
+    ) -> AppResult<bool> {
+        let mut tx = self.db.pool.begin().await?;
+        let task = sqlx::query(
+            "SELECT source_url,source_license::text AS license,status::text AS status,
+                (to_jsonb(t)->>'lock_owner' IS NOT NULL OR to_jsonb(t)->>'lock_until' IS NOT NULL) AS locked
+             FROM tasks t WHERE id=$1 AND runtime_owner='rust' AND source_type::text='youtube' FOR UPDATE",
+        ).bind(task_id).fetch_optional(&mut *tx).await?;
+        let Some(task) = task else { return Ok(false) };
+        let status: String = task.try_get("status")?;
+        let url: Option<String> = task.try_get("source_url")?;
+        if matches!(status.as_str(), "published" | "publishing" | "canceled")
+            || task.try_get::<bool,_>("locked")?
+            || task.try_get::<String,_>("license")? == "unknown"
+        {
+            return Ok(false);
+        }
+        let Some(video_id) = url.as_deref().and_then(|s| crate::ingest::youtube_video_id(s).ok()) else {
+            return Ok(false);
+        };
+        let latest = sqlx::query(
+            "SELECT id,state,configuration FROM vr2_workflows WHERE task_id=$1
+             ORDER BY generation DESC LIMIT 1 FOR UPDATE",
+        ).bind(task_id).fetch_optional(&mut *tx).await?;
+        let Some(latest) = latest else { return Ok(false) };
+        let flow_state: String = latest.try_get("state")?;
+        let config: Value = latest.try_get("configuration")?;
+        if flow_state == "running" && config.get("source_recovery").is_some() {
+            let active: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM vr2_jobs WHERE workflow_id=$1 AND stage='download'
+                 AND state IN ('pending','running'))",
+            ).bind(latest.try_get::<Uuid,_>("id")?).fetch_one(&mut *tx).await?;
+            return Ok(active);
+        }
+        if !matches!(flow_state.as_str(), "succeeded" | "failed" | "canceled")
+            || !crate::task_ownership::blockers(&mut tx, task_id).await?.is_empty()
+            || crate::storage::publication_cleanup_blocked(&mut tx, task_id).await?
+        {
+            return Ok(false);
+        }
+        let blocked: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM publish_jobs WHERE task_id=$1)
+              OR EXISTS(SELECT 1 FROM publish_batches WHERE task_id=$1)
+              OR EXISTS(SELECT 1 FROM vr2_jobs WHERE task_id=$1 AND stage IN ('publish','sau_publish')
+                AND NOT (state='succeeded' AND COALESCE(result->>'skipped','')<>''))
+              OR EXISTS(SELECT 1 FROM operation_inbox WHERE operation_key='youtube-download:'||$1::text
+                AND (status NOT IN ('completed','succeeded','failed','canceled') OR lease_owner IS NOT NULL OR lease_until IS NOT NULL))
+              OR EXISTS(SELECT 1 FROM vr2_bilibili_p2_appends WHERE task_id=$1)
+              OR EXISTS(SELECT 1 FROM vr2_social_publish_intents WHERE task_id=$1)",
+        ).bind(task_id).fetch_one(&mut *tx).await?;
+        if blocked { return Ok(false); }
+        let receipt = sqlx::query(
+            "SELECT id,state,result FROM vr2_jobs WHERE task_id=$1 AND stage='download'
+             ORDER BY generation DESC,created_at DESC,id DESC LIMIT 1",
+        ).bind(task_id).fetch_optional(&mut *tx).await?;
+        let Some(receipt) = receipt else { return Ok(false) };
+        if receipt.try_get::<String,_>("state")? != "succeeded" { return Ok(false); }
+        let result: Option<Value> = receipt.try_get("result")?;
+        let raw = sqlx::query_as::<_, crate::domain::AssetInfo>(
+            "SELECT id,task_id,kind::text AS kind,storage_key,sha256,size_bytes,duration_ms,created_at
+             FROM assets WHERE task_id=$1 AND kind::text='video_raw'
+             ORDER BY created_at DESC,id DESC LIMIT 1 FOR UPDATE",
+        ).bind(task_id).fetch_optional(&mut *tx).await?;
+        let Some(raw) = raw else { return Ok(false) };
+        let Some(proof) = crate::ingest::SourceRecovery::from_asset(&raw, video_id) else { return Ok(false) };
+        if result.as_ref().and_then(|r| r.get("storage_key")).and_then(Value::as_str)
+            != Some(proof.storage_key.as_str())
+            || result.as_ref().and_then(|r|r.get("sha256")).and_then(Value::as_str)
+                .is_some_and(|sha| !sha.eq_ignore_ascii_case(&proof.sha256))
+            || result.as_ref().and_then(|r|r.get("size_bytes")).and_then(Value::as_i64)
+                .is_some_and(|size| size!=proof.size_bytes)
+        {
+            return Ok(false);
+        }
+        let path = store.resolve_existing(&proof.storage_key).await?;
+        match tokio::fs::symlink_metadata(path).await {
+            Err(e) if e.kind()==std::io::ErrorKind::NotFound => {},
+            Err(e) => return Err(e.into()),
+            Ok(_) => return Ok(false),
+        }
+        // Existing GC claims must finish before recovery. A live registered
+        // object is pinned by the new workflow reference before committing.
+        let object: Option<String> = sqlx::query_scalar(
+            "SELECT state FROM storage_objects WHERE storage_key=$1 FOR UPDATE",
+        ).bind(&proof.storage_key).fetch_optional(&mut *tx).await?;
+        let workdir: Option<String> = sqlx::query_scalar(
+            "SELECT state FROM storage_workdirs WHERE path_key=$1 FOR UPDATE",
+        ).bind(format!("v2/raw/{task_id}")).fetch_optional(&mut *tx).await?;
+        if object.as_deref()==Some("deleting") || workdir.as_deref()==Some("deleting") {
+            return Ok(false);
+        }
+        let generation: i32 = sqlx::query_scalar(
+            "SELECT COALESCE(MAX(generation),0)+1 FROM vr2_workflows WHERE task_id=$1",
+        ).bind(task_id).fetch_one(&mut *tx).await?;
+        let flow = Uuid::new_v4();
+        let configuration = json!({"source_recovery":proof,"auto_publish":false,
+            "auto_publish_platforms":[],"auto_dub_p2":false});
+        sqlx::query("INSERT INTO vr2_workflows(id,task_id,generation,state,current_stage,configuration)
+            VALUES($1,$2,$3,'running','download',$4)")
+            .bind(flow).bind(task_id).bind(generation).bind(&configuration).execute(&mut *tx).await?;
+        Self::insert_job(&mut tx, flow, task_id, generation, Stage::Download).await?;
+        if object.as_deref()==Some("live") {
+            sqlx::query("INSERT INTO storage_object_refs(storage_key,owner_type,owner_id,role)
+                VALUES($1,'workflow',$2,'video_raw') ON CONFLICT DO NOTHING")
+                .bind(&raw.storage_key).bind(flow).execute(&mut *tx).await?;
+        }
+        sqlx::query("UPDATE tasks SET status='created'::task_status,error_code=NULL,error_message=NULL,updated_at=now() WHERE id=$1")
+            .bind(task_id).execute(&mut *tx).await?;
+        Self::event(&mut tx,flow,None,"workflow.source_recovery_started",
+            json!({"previous_download_job":receipt.try_get::<Uuid,_>("id")?,"asset_id":raw.id,"generation":generation})).await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
     /// Restart a V2-owned task at an exact stage without reissuing earlier work.
     ///
     /// Every restart creates a new workflow generation and independent operation
@@ -380,6 +500,14 @@ impl Scheduler {
                 ));
             }
             configuration = previous.try_get("configuration")?;
+        }
+        // A source-only recovery is an independent generation. Ordinary
+        // manual stage restarts must not inherit its download-only policy.
+        if let Some(base) = configuration.as_object_mut() {
+            base.remove("source_recovery");
+        }
+        if changes.contains_key("source_recovery") {
+            return Err(AppError::Invalid("source recovery is an internal operation".into()));
         }
         // A new manual stage cannot inherit a past explicit posting intent.
         if matches!(stage, Stage::Subtitle | Stage::Publish)
@@ -998,6 +1126,25 @@ impl Scheduler {
             json!({"stage":item.stage,"result":result}),
         )
         .await?;
+        let recovery: Option<Value> = if item.stage == Stage::Download {
+            sqlx::query_scalar("SELECT configuration->'source_recovery' FROM vr2_workflows WHERE id=$1")
+                .bind(item.workflow_id).fetch_one(&mut **tx).await?
+        } else { None };
+        if let Some(recovery) = recovery {
+            let proof: crate::ingest::SourceRecovery = serde_json::from_value(recovery)
+                .map_err(|_| AppError::Conflict("invalid source recovery proof".into()))?;
+            if result["storage_key"] != json!(proof.storage_key)
+                || result["sha256"] != json!(proof.sha256)
+                || result["size_bytes"] != json!(proof.size_bytes) {
+                return Err(AppError::Conflict("source recovery receipt differs from original asset".into()));
+            }
+            sqlx::query("UPDATE vr2_workflows SET state='succeeded',updated_at=now() WHERE id=$1")
+                .bind(item.workflow_id).execute(&mut **tx).await?;
+            sqlx::query("UPDATE tasks SET status='downloaded'::task_status,error_code=NULL,error_message=NULL,updated_at=now() WHERE id=$1")
+                .bind(item.task_id).execute(&mut **tx).await?;
+            Self::event(tx,item.workflow_id,Some(item.id),"workflow.source_recovered",json!({"asset_id":proof.asset_id})).await?;
+            return Ok(());
+        }
         if let Some(next) = item.stage.after() {
             Self::insert_job(tx, item.workflow_id, item.task_id, item.generation, next).await?;
             sqlx::query("UPDATE vr2_workflows SET current_stage=$1,updated_at=now() WHERE id=$2")
