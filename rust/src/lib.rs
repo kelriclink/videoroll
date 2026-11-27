@@ -76,6 +76,7 @@ pub mod social_accounts;
 pub mod social_publish;
 pub mod sources;
 pub mod storage;
+pub mod storage_integrity;
 pub mod subtitle_asr_settings_v1;
 pub mod subtitle_asr_test_v1;
 pub mod subtitle_builtin_provider_v1;

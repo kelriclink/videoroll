@@ -109,6 +109,30 @@ enum Command {
     HomeTick,
     /// Run one bounded legacy storage retention page, with both opt-in flags.
     LegacyStorageTick,
+    /// Read-only registered media integrity page and optional shallow directory scan.
+    StorageIntegrityAudit {
+        #[arg(long)]
+        after: Option<String>,
+        #[arg(long, default_value_t=100)]
+        limit: i64,
+        #[arg(long, default_value_t=256)]
+        max_hash_mib: u64,
+        #[arg(long)]
+        directory: Option<String>,
+    },
+    /// Audit old Python sibling partials; delete exact selected names only offline.
+    LegacyPartials {
+        #[arg(long)]
+        older_than_seconds: Option<u64>,
+        #[arg(long, default_value_t=100)]
+        limit: usize,
+        #[arg(long, requires_all=["quiesced","exclusive_root"])]
+        delete: Vec<String>,
+        #[arg(long)]
+        quiesced: bool,
+        #[arg(long)]
+        exclusive_root: bool,
+    },
     /// Process expired v2 artifacts and explicitly enabled legacy pending deletes.
     Gc {
         #[arg(long, default_value_t = 50)]
@@ -577,6 +601,16 @@ async fn main() -> anyhow::Result<()> {
             let removed=videoroll_v2::maintenance_terminal_storage_v1::scheduled_tick(
                 &registry,config.cleanup_grace,true).await?;
             tracing::info!(removed,"legacy retention page finished");
+        }
+        Command::StorageIntegrityAudit{after,limit,max_hash_mib,directory}=>{
+            let registry=AssetRegistry::new(db,config.storage_root.clone());
+            println!("{}",serde_json::to_string_pretty(&videoroll_v2::storage_integrity::audit(&registry,after,limit,max_hash_mib,directory).await?)?);
+        }
+        Command::LegacyPartials{older_than_seconds,limit,delete,quiesced,exclusive_root}=>{
+            let older=older_than_seconds.or_else(||std::env::var("STORAGE_PARTIAL_RETENTION_SECONDS").ok().and_then(|v|v.parse().ok())).unwrap_or(86400);
+            let root=config.storage_root.clone();
+            let report=tokio::task::spawn_blocking(move||videoroll_v2::storage_integrity::legacy_partials(&root,older,limit,&delete,quiesced,exclusive_root)).await??;
+            println!("{}",serde_json::to_string_pretty(&report)?);
         }
         Command::Gc { limit } => {
             let registry = AssetRegistry::new(db, config.storage_root.clone());

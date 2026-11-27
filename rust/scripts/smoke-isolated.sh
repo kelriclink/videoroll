@@ -141,6 +141,16 @@ else
   docker exec -i "$container_name" psql -v ON_ERROR_STOP=1 -U postgres -d videoroll_test < rust/tests/bootstrap_legacy_for_integration.sql >/dev/null
 fi
 export DATABASE_URL="postgresql://postgres:videoroll-test-20261121@127.0.0.1:${smoke_db_port}/videoroll_test"
+if [[ "${VIDEOROLL_V2_TEST_STORAGE_INTEGRITY_ONLY:-false}" == "true" ]]; then
+  export VIDEOROLL_V2_INTERNAL_TOKEN="isolated-storage-integrity-token-0123456789"
+  export INTERNAL_API_SECRET="isolated-storage-integrity-service-secret"
+  export VIDEOROLL_V2_STORAGE_ROOT="$(mktemp -d "$repo_root/rust/target/v2-integrity-bootstrap.XXXXXX")"
+  "$cargo_bin" build --manifest-path "$repo_root/rust/Cargo.toml" --bin videoroll-v2 --locked --offline --quiet
+  "$repo_root/rust/target/debug/videoroll-v2" migrate
+  "$smoke_python" "$repo_root/rust/tests/storage_integrity_isolated.py"
+  rmdir "$VIDEOROLL_V2_STORAGE_ROOT"
+  exit 0
+fi
 if [[ "${VIDEOROLL_V2_TEST_REAL_SCHEMA_ONLY:-false}" == "true" ]]; then
   export VIDEOROLL_V2_INTERNAL_TOKEN="isolated-schema-rehearsal-token-0123456789"
   export INTERNAL_API_SECRET="isolated-schema-rehearsal-service-secret"
