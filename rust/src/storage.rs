@@ -36,7 +36,7 @@ pub(crate) async fn publication_cleanup_blocked(
            AND NULLIF(external_id,'') IS NULL AND NULLIF(external_url,'') IS NULL)))
       OR EXISTS(SELECT 1 FROM subtitle_jobs WHERE task_id=$1 AND status::text IN ('queued','running'))
       OR EXISTS(SELECT 1 FROM render_jobs WHERE task_id=$1 AND status::text IN ('queued','running'))
-      OR EXISTS(SELECT 1 FROM render_executions WHERE task_id=$1 AND runtime_engine='rust-v2' AND state IN ('running','uploading','canceled','paused') AND lease_until>now())
+      OR EXISTS(SELECT 1 FROM render_executions WHERE task_id=$1 AND runtime_engine='rust-v2' AND (state IN ('queued','running','uploading','paused','unknown') OR lease_until>now()))
       OR EXISTS(SELECT 1 FROM dubbing_jobs WHERE task_id=$1 AND
         (status IN ('queued','preparing','synthesizing','aligning','mixing','rendering','pause_requested','cancel_requested')
         OR (status IN ('paused','preview_ready','needs_review') AND updated_at>now()-interval '7 days')))
@@ -556,16 +556,14 @@ impl AssetRegistry {
                 if full || batch {
                     // Short nonblocking table fence also protects against
                     // cross-task references created outside the native scheduler.
-                    sqlx::query("LOCK TABLE assets, subtitles IN SHARE ROW EXCLUSIVE MODE NOWAIT")
+                    sqlx::query("LOCK TABLE assets, subtitles, render_executions IN SHARE ROW EXCLUSIVE MODE NOWAIT")
                         .execute(&mut *tx).await?;
                     let shared:bool=sqlx::query_scalar("SELECT
                         EXISTS(SELECT 1 FROM assets WHERE storage_key=$1 AND task_id<>$2)
                         OR EXISTS(SELECT 1 FROM subtitles WHERE storage_key=$1 AND task_id<>$2)
                         OR EXISTS(SELECT 1 FROM storage_object_refs WHERE storage_key=$1)
                         OR EXISTS(SELECT 1 FROM playout_asset_links p JOIN assets a ON a.id=p.asset_id
-                             WHERE a.storage_key=$1 AND (p.runtime_engine<>'rust-v2' OR p.status IN ('staging','ready')))
-                        OR EXISTS(SELECT 1 FROM render_executions e JOIN assets a ON a.id=e.uploaded_asset_id
-                             WHERE a.storage_key=$1)"
+                             WHERE a.storage_key=$1 AND (p.runtime_engine<>'rust-v2' OR p.status IN ('staging','ready')))"
                     ).bind(key).bind(task).fetch_one(&mut *tx).await?;
                     let intermediate:bool=if !full && batch {
                         sqlx::query_scalar("SELECT
@@ -582,6 +580,10 @@ impl AssetRegistry {
                         // Run the relational deletes before the unlink, but
                         // roll them back on filesystem failure.
                         sqlx::query("SAVEPOINT gc_business_rows").execute(&mut *tx).await?;
+                        allowed=crate::render_events::retire_asset_refs(&mut tx,task,key,full).await?;
+                        if !allowed {
+                            sqlx::query("ROLLBACK TO SAVEPOINT gc_business_rows").execute(&mut *tx).await?;
+                        } else {
                         sqlx::query("DELETE FROM subtitles WHERE task_id=$1 AND storage_key=$2").bind(task).bind(key).execute(&mut *tx).await?;
                         sqlx::query("DELETE FROM assets WHERE task_id=$1 AND storage_key=$2").bind(task).bind(key).execute(&mut *tx).await?;
                         let deletion=async {
@@ -596,6 +598,7 @@ impl AssetRegistry {
                             tracing::warn!(%key,%error,"defer GC file unlink; retained business rows");
                             sqlx::query("ROLLBACK TO SAVEPOINT gc_business_rows").execute(&mut *tx).await?;
                             allowed=false;
+                        }
                         }
                     }
                 }

@@ -261,6 +261,69 @@ try:
     assert api_post(f"/render-workers/v1/executions/{paused[3]}/complete",{"fence_token":pf,"output_asset_id":pa,"output":{}},True)[0]==200
     print("PASS: paused uploaded fifth-attempt output survives immediate resume, waits for acknowledgment, then settles exactly once",flush=True)
 
+    # Reuse real uploaded outputs and their actual settled receipt. A terminal
+    # fixture only accelerates time; no external publication is performed.
+    def gc():
+        subprocess.run([str(exe),"gc","--limit","100"],check=True,timeout=40)
+    def terminal(item):
+        t,w,j,e,key=item
+        with db() as c:
+            c.execute("UPDATE tasks SET status='published',updated_at=now()-interval '3 days' WHERE id=%s",(t,))
+            c.execute("UPDATE pipeline_runs SET state='succeeded' WHERE id=%s",(w,))
+            c.execute("UPDATE operation_inbox SET status='canceled',lease_token=NULL,lease_until=NULL,lease_owner=NULL WHERE workflow_id=%s AND id<>%s",(w,j))
+    def due(item):
+        with db() as c:
+            c.execute("UPDATE storage_objects SET retain_until=now()-interval '1 minute' WHERE storage_key=%s",(item[4],))
+    def ttl(days):
+        with db() as c:
+            c.execute("INSERT INTO app_settings(key,value_json) VALUES('storage.retention',%s::jsonb) ON CONFLICT(key) DO UPDATE SET value_json=EXCLUDED.value_json",(json.dumps({"asset_ttl_days":days}),))
+    def refs(item):
+        with db() as c:
+            return c.execute("SELECT uploaded_asset_id::text,output_json,metrics FROM render_executions WHERE id=%s",(item[3],)).fetchone()
+    terminal(good)
+    terminal(paused)
+    good_before=refs(good)
+    paused_before=refs(paused)
+    with db() as c:
+        c.execute("UPDATE operation_inbox SET result_json=result_json||'{\"wrong_fixture\":true}'::jsonb WHERE id=%s",(paused[2],))
+    ttl(1)
+    gc()
+    ttl(0)
+    for item in (good,paused): due(item)
+    gc()
+    assert refs(good)==good_before and (root/good[4]).is_file()
+    # Enable retention again but simulate an unlink failure. The real FK,
+    # original asset and exact receipt must all survive the savepoint rollback.
+    ttl(1)
+    good_path=root/good[4]
+    good_path.unlink()
+    good_path.mkdir()
+    due(good);due(paused);gc()
+    assert good_path.is_dir() and refs(good)==good_before
+    with db() as c:
+        assert c.execute("SELECT count(*) FROM assets WHERE id=%s",(ga,)).fetchone()[0]==1
+    assert refs(paused)==paused_before and (root/paused[4]).is_file()
+    # Restore the fixture bytes, then allow the exact terminal output to retire.
+    good_path.rmdir()
+    good_path.write_bytes(media)
+    due(good);due(paused);gc()
+    after=refs(good)
+    assert after[0] is None and after[1]==good_before[1] and after[2]["resource_retired"] is True,after
+    assert not good_path.exists()
+    assert refs(paused)==paused_before and (root/paused[4]).is_file()
+    assert refs(still_live)[0]==la and (root/still_live[4]).is_file()
+    with db() as c:
+        assert c.execute("SELECT count(*) FROM assets WHERE id=%s",(ga,)).fetchone()[0]==0
+        assert c.execute("SELECT result_json FROM operation_inbox WHERE id=%s",(good[2],)).fetchone()[0]==good_before[1]
+        assert c.execute("SELECT count(*) FROM workflow_events WHERE workflow_id=%s AND kind='job.succeeded'",(good[1],)).fetchone()[0]==1
+    endpoint=f"/render-workers/v1/executions/{good[3]}/complete"
+    assert api_post(endpoint,{"fence_token":gf,"output_asset_id":ga,"output":{}},True)[0]==200
+    assert api_post(endpoint,{"fence_token":"bad","output_asset_id":ga,"output":{}},True)[0]==409
+    assert api_post(endpoint,{"fence_token":gf,"output_asset_id":str(uuid.uuid4()),"output":{}},True)[0]==409
+    gc()
+    assert refs(good)==after and not good_path.exists()
+    print("PASS: terminal render FK retirement under TTL, failed unlink rollback, mismatched receipt/live upload preservation, authenticated late replay without re-creation",flush=True)
+
 
 finally:
     proc.terminate()

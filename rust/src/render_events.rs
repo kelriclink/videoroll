@@ -127,6 +127,84 @@ pub(crate) async fn completed_receipt(
     }
     Ok(expected)
 }
+/// Called only by the physical GC transaction after checking current TTL,
+/// ownership, shared references, and task activity. The caller holds the task
+/// and render_executions table fence and rolls back on any failed unlink.
+/// Never retire a failed/canceled upload whose outcome was not settled.
+pub(crate) async fn retire_asset_refs(
+    tx: &mut Transaction<'_, Postgres>,
+    task: Uuid,
+    key: &str,
+    full_retention: bool,
+) -> AppResult<bool> {
+    let rows=sqlx::query("SELECT e.*,a.task_id AS asset_task,a.kind::text AS asset_kind
+        FROM render_executions e JOIN assets a ON a.id=e.uploaded_asset_id
+        WHERE a.storage_key=$1 ORDER BY e.id FOR UPDATE OF e")
+        .bind(key).fetch_all(&mut **tx).await?;
+    if rows.is_empty(){return Ok(true)}
+    if !full_retention{return Ok(false)}
+    for row in rows {
+        let id:Uuid=row.try_get("id")?;
+        let mode:String=row.try_get("mode")?;
+        let asset:Uuid=row.try_get("uploaded_asset_id")?;
+        let owner:Option<Uuid>=row.try_get("task_id")?;
+        let job:Option<Uuid>=row.try_get("job_id")?;
+        let flow:Option<Uuid>=row.try_get("workflow_id")?;
+        let saved:Value=row.try_get("output_json")?;
+        let expected=crate::remote_render::receipt(id,Some(asset),Some(key),&mode);
+        if row.try_get::<String,_>("runtime_engine")?!="rust-v2"
+            || row.try_get::<String,_>("state")?!="completed"
+            || row.try_get::<Option<chrono::DateTime<chrono::Utc>>,_>("lease_until")?.is_some()
+            || row.try_get::<Option<chrono::DateTime<chrono::Utc>>,_>("finished_at")?.is_none()
+            || owner!=Some(task) || row.try_get::<Uuid,_>("asset_task")?!=task
+            || mode=="noop" || row.try_get::<String,_>("asset_kind")?!=crate::remote_render::output_kind(&mode)
+            || key!=crate::remote_render::output_key(task,id)
+            || job.is_none() || flow.is_none()
+            || saved!=expected {return Ok(false)}
+        let settled:bool=sqlx::query_scalar("SELECT EXISTS(
+            SELECT 1 FROM operation_inbox j JOIN pipeline_runs w ON w.id=j.workflow_id
+            WHERE j.id=$1 AND j.task_id=$2 AND j.workflow_id=$3 AND j.runtime_engine='rust-v2'
+            AND j.stage=$4 AND j.external_ticket=$5 AND j.status='succeeded'
+            AND j.result_json=$6 AND j.lease_until IS NULL AND j.lease_owner IS NULL
+            AND w.engine='rust-v2' AND w.task_id=$2 AND w.state IN ('succeeded','failed','canceled'))")
+            .bind(job).bind(task).bind(flow).bind(crate::remote_render::output_stage(&mode))
+            .bind(id.to_string()).bind(&expected).fetch_one(&mut **tx).await?;
+        if !settled {return Ok(false)}
+        let changed=sqlx::query("UPDATE render_executions SET uploaded_asset_id=NULL,
+            metrics=COALESCE(metrics,'{}'::jsonb)||jsonb_build_object('resource_retired',true),
+            updated_at=now() WHERE id=$1 AND uploaded_asset_id=$2 AND state='completed'
+            AND jsonb_typeof(metrics)='object'")
+            .bind(id).bind(asset).execute(&mut **tx).await?.rows_affected();
+        if changed!=1{return Ok(false)}
+    }
+    Ok(true)
+}
+
+/// A late callback after successful TTL retirement is an acknowledgement
+/// of historical completion, not proof that bytes still exist. The settled
+/// job and immutable execution receipt must agree exactly.
+pub(crate) async fn retired_receipt(db:&Database,id:Uuid,task:Uuid,job:Uuid,flow:Uuid,mode:&str)->AppResult<Option<Value>> {
+    let saved:Option<Value>=sqlx::query_scalar("SELECT e.output_json FROM render_executions e
+        JOIN operation_inbox j ON j.id=e.job_id
+        WHERE e.id=$1 AND e.task_id=$2 AND e.job_id=$3 AND e.workflow_id=$4
+        AND e.mode=$5 AND e.runtime_engine='rust-v2' AND e.state='completed'
+        AND e.uploaded_asset_id IS NULL AND e.finished_at IS NOT NULL
+        AND e.metrics->'resource_retired'='true'::jsonb
+        AND j.task_id=$2 AND j.workflow_id=$4 AND j.runtime_engine='rust-v2'
+        AND j.status='succeeded' AND j.stage=$6 AND j.external_ticket=$7
+        AND j.result_json=e.output_json")
+        .bind(id).bind(task).bind(job).bind(flow).bind(mode)
+        .bind(crate::remote_render::output_stage(mode)).bind(id.to_string())
+        .fetch_optional(&db.pool).await?;
+    let Some(saved)=saved else{return Ok(None)};
+    let asset=saved["asset_id"].as_str().and_then(|v|Uuid::parse_str(v).ok());
+    let key=crate::remote_render::output_key(task,id);
+    if asset.is_none() || saved!=crate::remote_render::receipt(id,asset,Some(&key),mode) {
+        return Err(AppError::Conflict("retired render receipt identity mismatch".into()))
+    }
+    Ok(Some(saved))
+}
+
 // An upload is acknowledged only after ffprobe, fsync, rename, asset insert
 // and storage reference commit. Recover its lost completion callback without
 // claiming a second worker. Require both the original asset and object ledger

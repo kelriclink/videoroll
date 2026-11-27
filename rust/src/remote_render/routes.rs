@@ -868,6 +868,14 @@ async fn execution_completed(
         }
     }
     let asset_id: Option<Uuid> = row.try_get("uploaded_asset_id")?;
+    if state=="completed" && asset_id.is_none() && mode!="noop" {
+        if let Some(saved)=crate::render_events::retired_receipt(&s.db,id,task_id,job_id,flow_id,&mode).await? {
+            if payload.output_asset_id.is_some() && saved["asset_id"]!=serde_json::json!(payload.output_asset_id) {
+                return Err(AppError::Conflict("retired render asset identity mismatch".into()));
+            }
+            return Ok(Json(execution_info(&row)?));
+        }
+    }
     if payload.output_asset_id.is_some() && payload.output_asset_id != asset_id {
         return Err(AppError::Conflict(
             "uploaded render asset does not match completion".into(),
