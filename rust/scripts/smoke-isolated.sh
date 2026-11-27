@@ -633,6 +633,10 @@ if [[ "${VIDEOROLL_V2_TEST_STORAGE_RETENTION_ONLY:-false}" == "true" ]]; then
   "$smoke_python" "$repo_root/rust/tests/storage_retention_v1_isolated.py"
   exit 0
 fi
+if [[ "${VIDEOROLL_V2_TEST_TASK_CONTROLS_ONLY:-false}" == "true" ]]; then
+  "$smoke_python" "$repo_root/rust/tests/task_controls_v1_isolated.py"
+  exit 0
+fi
 if [[ "${VIDEOROLL_V2_TEST_BULK_RESUME_ONLY:-false}" == "true" ]]; then
   "$smoke_python" "$repo_root/rust/tests/bulk_resume_v1_isolated.py"
   exit 0

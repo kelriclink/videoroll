@@ -336,36 +336,8 @@ async fn resume_task(
     Ok(Json(read_task(&state.db, id).await?))
 }
 async fn bulk_change(state: AppState, stop: bool) -> AppResult<Json<Value>> {
-    let where_expr = if stop {
-        "upper(t.status::text) IN ('CREATED','INGESTED','DOWNLOADED','AUDIO_EXTRACTED',
-        'ASR_DONE','TRANSLATED','SUBTITLE_READY','RENDERED','READY_FOR_REVIEW','APPROVED')"
-    } else {
-        "upper(t.status::text)='CANCELED' AND t.stopped_status IS NOT NULL"
-    };
-    let sql = format!(
-        "SELECT t.id FROM tasks t JOIN tasks v ON v.id=t.id AND v.runtime_owner='rust'
-         WHERE {where_expr} ORDER BY t.id LIMIT 1001"
-    );
-    let ids = sqlx::query_scalar::<_, Uuid>(&sql)
-        .fetch_all(&state.db.pool)
-        .await?;
-    if ids.len() > 1000 {
-        return Err(AppError::Conflict(
-            "more than 1000 V2 tasks selected; split the operation".into(),
-        ));
-    }
-    let mut changed = 0usize;
-    for id in &ids {
-        if stop {
-            state.scheduler.stop_task_compat(*id).await?;
-        } else {
-            state.scheduler.resume_task_compat(*id).await?;
-        }
-        changed += 1;
-    }
-    Ok(Json(
-        json!({"matched_count":ids.len(),"changed_count":changed}),
-    ))
+    let (matched,changed)=state.scheduler.bulk_task_control(stop).await?;
+    Ok(Json(json!({"matched_count":matched,"changed_count":changed})))
 }
 async fn stop_all(State(state): State<AppState>) -> AppResult<Json<Value>> {
     bulk_change(state, true).await

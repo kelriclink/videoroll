@@ -1511,130 +1511,158 @@ impl Scheduler {
     /// eligible for resumption when that lease expires. Never pause external
     /// publisher results that may already have caused irreversible effects.
     pub async fn stop_task_compat(&self, task_id: Uuid) -> AppResult<()> {
-        let mut tx = self.db.pool.begin().await?;
-        let row = sqlx::query(
-            "SELECT upper(status::text) AS status,upper(stopped_status::text) AS stopped
-             FROM tasks WHERE id=$1
-             AND EXISTS(SELECT 1 FROM tasks WHERE id=$1 AND runtime_owner='rust')
-             FOR UPDATE",
-        )
-        .bind(task_id)
-        .fetch_optional(&mut *tx)
-        .await?
-        .ok_or_else(|| AppError::NotFound("V2 task missing".into()))?;
-        let status: String = row.try_get("status")?;
-        let stopped: Option<String> = row.try_get("stopped")?;
-        if status == "CANCELED" && stopped.is_some() {
-            tx.commit().await?;
-            return Ok(());
-        }
-        if !matches!(
-            status.as_str(),
-            "CREATED"
-                | "INGESTED"
-                | "DOWNLOADED"
-                | "AUDIO_EXTRACTED"
-                | "ASR_DONE"
-                | "TRANSLATED"
-                | "SUBTITLE_READY"
-                | "RENDERED"
-                | "READY_FOR_REVIEW"
-                | "APPROVED"
-        ) {
-            return Err(AppError::Conflict(
-                "V2 task cannot be stopped in its current state".into(),
-            ));
-        }
-        let publishing: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM vr2_jobs WHERE task_id=$1
-             AND stage='publish' AND state IN ('pending','running','awaiting','unknown'))",
-        )
-        .bind(task_id)
-        .fetch_one(&mut *tx)
-        .await?;
-        if publishing {
-            return Err(AppError::Conflict(
-                "potential Bilibili publish must be verified before stopping task".into(),
-            ));
-        }
-        let flow=sqlx::query(
-            "SELECT id,state FROM vr2_workflows WHERE task_id=$1
-             AND state IN ('running','paused','unknown') ORDER BY generation DESC LIMIT 1 FOR UPDATE"
-        ).bind(task_id).fetch_optional(&mut *tx).await?;
-        if let Some(flow) = flow {
-            let state: String = flow.try_get("state")?;
-            if state == "unknown" {
-                return Err(AppError::Conflict(
-                    "external workflow outcome unknown".into(),
-                ));
-            }
-            let id: Uuid = flow.try_get("id")?;
-            Self::stop_remote_render(&mut tx, id, false).await?;
-            sqlx::query("UPDATE vr2_workflows SET state='paused',updated_at=now() WHERE id=$1")
-                .bind(id)
-                .execute(&mut *tx)
-                .await?;
-            Self::event(
-                &mut tx,
-                id,
-                None,
-                "workflow.legacy_task_stopped",
-                json!({"from_status":status}),
-            )
-            .await?;
-        }
-        sqlx::query(
-            "UPDATE tasks SET stopped_status=lower($1)::task_status,status='canceled'::task_status,updated_at=now() WHERE id=$2"
-        ).bind(status).bind(task_id).execute(&mut *tx).await?;
+        let mut tx=self.db.pool.begin().await?;
+        Self::lock_control_task(&mut tx,task_id).await?;
+        Self::lock_control_ledgers(&mut tx).await?;
+        Self::stop_task_locked(&mut tx,task_id,false).await?;
         tx.commit().await?;
         Ok(())
     }
-    /// Restore the original task stage and resume the same workflow generation.
-    /// No completed or uncertain external publisher is ever automatically reissued.
-    pub async fn resume_task_compat(&self, task_id: Uuid) -> AppResult<()> {
-        let mut tx = self.db.pool.begin().await?;
-        let row = sqlx::query(
-            "SELECT upper(status::text) AS status,upper(stopped_status::text) AS stopped FROM tasks
-             WHERE id=$1 AND EXISTS(SELECT 1 FROM tasks WHERE id=$1 AND runtime_owner='rust')
-             FOR UPDATE",
-        )
-        .bind(task_id)
-        .fetch_optional(&mut *tx)
-        .await?
-        .ok_or_else(|| AppError::NotFound("V2 task missing".into()))?;
-        let status: String = row.try_get("status")?;
-        let stopped: Option<String> = row.try_get("stopped")?;
-        if status != "CANCELED" || stopped.is_none() {
-            return Err(AppError::Conflict(
-                "V2 task was not stopped by task controls".into(),
-            ));
-        }
-        let flow = sqlx::query(
-            "SELECT id,state FROM vr2_workflows WHERE task_id=$1
-             ORDER BY generation DESC LIMIT 1 FOR UPDATE",
-        )
-        .bind(task_id)
-        .fetch_optional(&mut *tx)
-        .await?;
-        if let Some(flow) = flow {
-            let state: String = flow.try_get("state")?;
-            if state != "paused" {
-                return Err(AppError::Conflict(
-                    "V2 task cannot resume a completed, canceled or uncertain workflow".into(),
-                ));
+
+    const STOPPABLE:&str = "t.status::text IN ('created','ingested','downloaded','audio_extracted','asr_done','translated','subtitle_ready','rendered','ready_for_review','approved')";
+    // Python's bulk stop includes failed tasks with live subtitle/render
+    // jobs. Also cover the equivalent reversible native operation.
+    const FAILED_LIVE:&str = "t.status::text='failed' AND (
+        EXISTS(SELECT 1 FROM subtitle_jobs j WHERE j.task_id=t.id AND j.status::text IN ('queued','running'))
+        OR EXISTS(SELECT 1 FROM render_jobs j WHERE j.task_id=t.id AND j.status::text IN ('queued','running'))
+        OR EXISTS(SELECT 1 FROM vr2_jobs j JOIN vr2_workflows w ON w.id=j.workflow_id
+          WHERE j.task_id=t.id AND w.task_id=t.id AND w.state IN ('running','paused')
+          AND w.current_stage=j.stage AND w.generation=j.generation
+          AND j.stage IN ('download','subtitle','render','dubbing') AND j.state IN ('pending','running','awaiting')))";
+
+    async fn lock_control_task(tx:&mut Transaction<'_,Postgres>,task:Uuid)->AppResult<()>{
+        sqlx::query_scalar::<_,Uuid>("SELECT id FROM tasks WHERE id=$1 AND runtime_owner='rust' FOR UPDATE")
+            .bind(task).fetch_optional(&mut **tx).await?
+            .ok_or_else(||AppError::NotFound("V2 task missing".into()))?;
+        Ok(())
+    }
+    async fn lock_control_ledgers(tx:&mut Transaction<'_,Postgres>)->AppResult<()>{
+        sqlx::query("LOCK TABLE pipeline_runs,operation_inbox,subtitle_jobs,render_jobs,render_executions,dubbing_jobs,publish_jobs,publish_batches,outbox_events IN SHARE ROW EXCLUSIVE MODE NOWAIT")
+            .execute(&mut **tx).await.map_err(|e|if e.as_database_error().and_then(|e|e.code()).as_deref()==Some("55P03"){
+                AppError::Conflict("another worker is updating task control ledgers; retry".into())
+            }else{e.into()})?;
+        Ok(())
+    }
+
+    /// All eligible changes commit together. A business precondition failure
+    /// leaves that task unchanged; database errors roll back the whole batch.
+    pub(crate) async fn bulk_task_control(&self,stop:bool)->AppResult<(usize,usize)>{
+        let mut tx=self.db.pool.begin().await?;
+        let predicate=if stop{format!("({} OR ({}))",Self::STOPPABLE,Self::FAILED_LIVE)}
+            else{"t.status::text='canceled' AND t.stopped_status IS NOT NULL".into()};
+        let sql=format!("SELECT t.id FROM tasks t WHERE t.runtime_owner='rust' AND {predicate} ORDER BY t.id LIMIT 1001 FOR UPDATE OF t");
+        let ids:Vec<Uuid>=sqlx::query_scalar(&sql).fetch_all(&mut *tx).await?;
+        if ids.len()>1000{return Err(AppError::Conflict("more than 1000 V2 tasks selected; split the operation".into()))}
+        if !ids.is_empty(){Self::lock_control_ledgers(&mut tx).await?;}
+        let mut changed=0;
+        for id in &ids{
+            let result=if stop{Self::stop_task_locked(&mut tx,*id,true).await}
+                else{Self::resume_task_locked(&mut tx,*id).await};
+            match result{
+                Ok(true)=>changed+=1,
+                Ok(false)=>{},
+                Err(AppError::Conflict(reason))=>tracing::debug!(task_id=%id,%reason,"bulk task control deferred"),
+                Err(e)=>return Err(e),
             }
-            let id: Uuid = flow.try_get("id")?;
-            sqlx::query("UPDATE vr2_workflows SET state='running',updated_at=now() WHERE id=$1")
-                .bind(id)
-                .execute(&mut *tx)
-                .await?;
-            Self::event(&mut tx, id, None, "workflow.legacy_task_resumed", json!({})).await?;
         }
-        sqlx::query(
-            "UPDATE tasks SET status=lower($1)::task_status,stopped_status=NULL,updated_at=now() WHERE id=$2"
-        ).bind(stopped).bind(task_id).execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok((ids.len(),changed))
+    }
+
+    async fn task_control_fence(tx:&mut Transaction<'_,Postgres>,task:Uuid)->AppResult<()>{
+        let blocked:bool=sqlx::query_scalar("SELECT
+          EXISTS(SELECT 1 FROM vr2_jobs WHERE task_id=$1 AND stage IN ('publish','sau_publish') AND state IN ('pending','queued','running','awaiting','dispatching','accepted','unknown'))
+          OR EXISTS(SELECT 1 FROM publish_jobs WHERE task_id=$1 AND (state::text IN ('draft','submitting','unknown') OR lease_owner IS NOT NULL OR lease_until IS NOT NULL OR upload_active
+            OR (state::text='submitted' AND NULLIF(external_id,'') IS NULL AND NULLIF(external_url,'') IS NULL AND NULLIF(bvid,'') IS NULL AND NULLIF(aid,'') IS NULL)))
+          OR EXISTS(SELECT 1 FROM publish_batches WHERE task_id=$1 AND state NOT IN ('succeeded','failed','partial_failed'))
+          OR EXISTS(SELECT 1 FROM vr2_bilibili_p2_appends WHERE task_id=$1 AND state<>'published')
+          OR EXISTS(SELECT 1 FROM vr2_social_publish_intents WHERE task_id=$1 AND state NOT IN ('submitted','published','failed'))
+          OR EXISTS(SELECT 1 FROM pipeline_runs WHERE task_id=$1 AND state='unknown')")
+            .bind(task).fetch_one(&mut **tx).await?;
+        if blocked{return Err(AppError::Conflict("unsettled publication or external workflow prevents task control".into()))}
+        Ok(())
+    }
+    // Only the unique current native workflow may be paused or resumed.
+    // Terminal history is not an active workflow and must remain untouched.
+    async fn control_flow(tx:&mut Transaction<'_,Postgres>,task:Uuid)->AppResult<Option<(Uuid,String,String)>>{
+        let rows=sqlx::query("SELECT id,state,current_stage,generation FROM vr2_workflows WHERE task_id=$1
+            AND state IN ('running','paused','unknown') ORDER BY generation DESC FOR UPDATE")
+            .bind(task).fetch_all(&mut **tx).await?;
+        if rows.len()>1{return Err(AppError::Conflict("multiple active native workflows require reconciliation".into()))}
+        let Some(row)=rows.first() else{return Ok(None)};
+        let id:Uuid=row.try_get("id")?;
+        let state:String=row.try_get("state")?;
+        let stage:String=row.try_get("current_stage")?;
+        let generation:i32=row.try_get("generation")?;
+        let current:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM vr2_jobs WHERE workflow_id=$1 AND task_id=$2
+          AND stage=$3 AND generation=$4 AND state IN ('pending','running','awaiting'))
+          AND NOT EXISTS(SELECT 1 FROM vr2_workflows WHERE task_id=$2 AND generation>$4)")
+            .bind(id).bind(task).bind(&stage).bind(generation).fetch_one(&mut **tx).await?;
+        if state=="unknown" || !current || !matches!(stage.as_str(),"download"|"subtitle"|"render"|"dubbing"){
+            return Err(AppError::Conflict("native workflow lacks a current reversible job".into()))
+        }
+        Ok(Some((id,state,stage)))
+    }
+
+    async fn stop_task_locked(tx:&mut Transaction<'_,Postgres>,task_id:Uuid,bulk:bool)->AppResult<bool>{
+        let (status,stopped):(String,Option<String>)=sqlx::query_as("SELECT upper(status::text),upper(stopped_status::text) FROM tasks WHERE id=$1 AND runtime_owner='rust'")
+            .bind(task_id).fetch_one(&mut **tx).await?;
+        if status=="CANCELED" && stopped.is_some(){return Ok(false)}
+        let predicate=if bulk{format!("({} OR ({}))",Self::STOPPABLE,Self::FAILED_LIVE)}else{Self::STOPPABLE.into()};
+        let allowed:bool=sqlx::query_scalar(&format!("SELECT {predicate} FROM tasks t WHERE t.id=$1"))
+            .bind(task_id).fetch_one(&mut **tx).await?;
+        if !allowed || stopped.is_some(){return Err(AppError::Conflict("V2 task cannot be stopped in its current state".into()))}
+        Self::task_control_fence(tx,task_id).await?;
+        if let Some((id,_,_))=Self::control_flow(tx,task_id).await?{
+            Self::stop_remote_render(tx,id,false).await?;
+            sqlx::query("UPDATE vr2_workflows SET state='paused',updated_at=now() WHERE id=$1")
+                .bind(id).execute(&mut **tx).await?;
+            Self::event(tx,id,None,"workflow.legacy_task_stopped",json!({"from_status":status})).await?;
+        }
+        sqlx::query("UPDATE tasks SET stopped_status=lower($1)::task_status,status='canceled'::task_status,updated_at=now() WHERE id=$2")
+            .bind(status).bind(task_id).execute(&mut **tx).await?;
+        Ok(true)
+    }
+
+    /// Restore a checkpoint, not an old terminal workflow.
+    pub async fn resume_task_compat(&self,task_id:Uuid)->AppResult<()>{
+        let mut tx=self.db.pool.begin().await?;
+        Self::lock_control_task(&mut tx,task_id).await?;
+        Self::lock_control_ledgers(&mut tx).await?;
+        Self::resume_task_locked(&mut tx,task_id).await?;
         tx.commit().await?;
         Ok(())
+    }
+    async fn resume_task_locked(tx:&mut Transaction<'_,Postgres>,task_id:Uuid)->AppResult<bool>{
+        let (status,stopped):(String,Option<String>)=sqlx::query_as("SELECT upper(status::text),upper(stopped_status::text) FROM tasks WHERE id=$1 AND runtime_owner='rust'")
+            .bind(task_id).fetch_one(&mut **tx).await?;
+        let Some(mut restored)=stopped.filter(|_|status=="CANCELED") else{
+            return Err(AppError::Conflict("V2 task was not stopped by task controls".into()))
+        };
+        Self::task_control_fence(tx,task_id).await?;
+        if let Some((id,state,stage))=Self::control_flow(tx,task_id).await?{
+            if state!="paused"{return Err(AppError::Conflict("native workflow is not paused".into()))}
+            // Remote render explicitly excludes FAILED. A verified current
+            // paused operation must return to its actual stage checkpoint.
+            if restored=="FAILED"{
+                restored=match stage.as_str(){
+                    "download"=>"CREATED","subtitle"=>"DOWNLOADED","render"=>"SUBTITLE_READY","dubbing"=>"RENDERED",
+                    _=>return Err(AppError::Conflict("failed task has no reversible paused stage".into()))
+                }.into();
+            }
+            sqlx::query("UPDATE vr2_workflows SET state='running',updated_at=now() WHERE id=$1")
+                .bind(id).execute(&mut **tx).await?;
+            Self::event(tx,id,None,"workflow.legacy_task_resumed",json!({"restored_status":restored})).await?;
+        }else{
+            // Historical live rows cannot be relaunched safely without a
+            // native owner. A quiescent terminal flow needs no revival.
+            if !crate::task_ownership::blockers(tx,task_id).await?.is_empty(){
+                return Err(AppError::Conflict("stopped task has unsettled historical work; reconcile before resuming".into()))
+            }
+        }
+        sqlx::query("UPDATE tasks SET status=lower($1)::task_status,stopped_status=NULL,updated_at=now() WHERE id=$2")
+            .bind(restored).bind(task_id).execute(&mut **tx).await?;
+        Ok(true)
     }
     /// Stop a workflow without pretending that an in-flight external publish was rejected.
     pub async fn cancel(&self, workflow_id: Uuid) -> AppResult<WorkflowInfo> {

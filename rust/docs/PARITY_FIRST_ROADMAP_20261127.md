@@ -52,3 +52,13 @@ SAU 代码检查：当前原生领取仍采用全局单投稿互斥；账户导�
 - 安全差异：历史恢复使用原版请求的已支持字段或显式 runtime_profile，关闭自动投稿/配音，不沿用旧 after_render 副作用；原生失败阶段仍继承既有原生配置。旧输入与当前 raw 不一致、丢失文件、没有校验信息、旧选择性重译、无法证明的字幕成果及未支持请求字段保守跳过。尚未等价实现原版替换缺失输入、最新自动投稿策略、完整 legacy request 适配与所有 native stage checkpoint 复用；本轮只验证入队及账本不变，未运行新入队的全链路真实模型/平台。全局 NOWAIT 锁与逐任务文件校验有生产负载成本，需后续压测。
 
 专项：VIDEOROLL_V2_TEST_BULK_RESUME_ONLY=true bash rust/scripts/smoke-isolated.sh；真实 PG/API、FFmpeg 生成隔离媒体、15 个命中（4 入队/11 跳过）、排除 Python/过期、重复/并发请求、原始资产及业务表对照。下一批检查全部停止/恢复及暂停的活动历史作业保护。
+
+## 第三十三批：原版任务停止/恢复
+
+基线 402e88d。对照 Python task_service.py:160-257、routers/tasks.py:96-139、tests/test_task_stop_controls.py。原版批量停止包括 FAILED 且字幕/渲染活跃的任务，恢复时还重新启动自动 YouTube 和 queued subtitle。Rust 之前漏掉失败活跃任务，批量逐个提交可出现前面已修改而请求整体失败；单任务有终态历史工作流时停止后无法恢复。
+
+- bulk 统一在原 Task 行锁顺序、原物理账本 NOWAIT 表锁下处理；增加原 subtitle_jobs/render_jobs 活跃条件及等价的原生可逆阶段。单任务停止 FAILED 仍拒绝，与原契约相同。仅 Rust owner，最多 1000；保留原 matched_count/changed_count；不可安全控制的任务不计 changed，其他合法任务一起提交，SQL 错误整体回滚。
+- 只暂停唯一最新的原生工作流且存在当前可逆 job，复用 remote render stop 函数保留租约/尝试/成果；已终态历史工作流不复活。存在原生/历史未决投稿、P2、活动批次、unknown workflow、多活动/旧代次冲突则保守拒绝。
+- 恢复已暂停的原生代次，不新建 job；FAILED 仍有当前可逆阶段时恢复真实 checkpoint（download=CREATED/subtitle=DOWNLOADED/render=SUBTITLE_READY/dubbing=RENDERED），避免远程渲染排斥 FAILED。无活动原生工作流且所有历史账本已平静则直接恢复保存状态，即使存在终态历史工作流。只恢复状态，不自动重启旧 Hatchet/queued subtitle；未决历史作业继续保持暂停，需显式核实，不声称实际停止外部 Python 进程。现有暂停资源保护不改变。
+- 限制：批量最多 1000，事务持有多个 Task 行锁及原账本表锁，繁忙时 409 需重试；不保证立即停止已经运行的外部程序；错误原因仅服务日志，原 API 仍只有计数；旧自动 YouTube 无活动原生工作流的重新入队、动态配置仍待后续。测试只用隔离数据库，不部署。
+- 专项 VIDEOROLL_V2_TEST_TASK_CONTROLS_ONLY=true；还需既有远程渲染暂停回归。
