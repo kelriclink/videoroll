@@ -14,6 +14,8 @@ def db():return psycopg.connect(url)
 def setting(k,v):
     with db() as c:c.execute("INSERT INTO app_settings(key,value_json) VALUES(%s,%s) ON CONFLICT(key) DO UPDATE SET value_json=EXCLUDED.value_json",(k,json.dumps(v)))
 parallel=os.getenv("VIDEOROLL_TEST_PARALLEL_RAG")=="true"
+serial_fault=os.getenv("VIDEOROLL_TEST_SERIAL_RAG_FAULT")=="true"
+assert not (parallel and serial_fault)
 web_fault=os.getenv("VIDEOROLL_TEST_RAG_WEB_FAULT")=="true"
 page=os.getenv("VIDEOROLL_TEST_RAG_PAGE_DENIED")=="true"
 assert not page or web_fault
@@ -145,6 +147,10 @@ class Handler(BaseHTTPRequestHandler):
                         assert "fixture-original-compiler" in messages[-1]["content"],messages
                         assert "fixture-pending" not in messages[-1]["content"],messages
                         research_calls.append("finish")
+                        if serial_fault and research_calls.count("finish")==1:
+                            child_failed=True
+                            self.send_error(503,"injected failure after serial tool receipt")
+                            return
                         result={"action":"finish","summary":"Rust tooling","terms":[{"source":"Rust","target":"Rust","note":"language"}]}
                     else:
                         assert "fabricated term" not in messages[-1]["content"] and "volts" not in messages[-1]["content"],messages
@@ -194,7 +200,7 @@ threading.Thread(target=server.serve_forever,daemon=True).start()
 base=f"http://127.0.0.1:{server.server_address[1]}"
 setting("subtitle.auto_profile",{"translate_enabled":True,"translate_provider":"openai","translate_model_provider_id":"legacy","translate_glossary":{"volts":"伏特"},"target_lang":"zh","bilingual":False,"auto_publish":False,"auto_publish_platforms":[],"auto_dub_p2":False,"burn_in":False})
 setting("subtitle.translate",{"default_batch_size":2,"default_enable_summary":True,"rag_enabled":True,"rag_auto_discover_terms":True,"rag_auto_learn_terms":learning,"rag_search_enabled":web_fault,"rag_wiki_enabled":wiki,"rag_agent_parallelism":2 if parallel else 1,"rag_domain":"electronics","openai":{"base_url":base+"/v1","model":"fixture-translation","api_key_enc":"dbplain:v1:fixture-translation-key"}})
-setting("subtitle.rag",{"enabled":False,"research_blocking":parallel,"page_text_enabled":page,"max_research_steps":2,"max_web_searches":2 if web_fault else 0,"web_search_endpoint":base+"/search" if web_fault else None})
+setting("subtitle.rag",{"enabled":False,"research_blocking":parallel or serial_fault,"page_text_enabled":page,"max_research_steps":2,"max_web_searches":2 if web_fault else 0,"web_search_endpoint":base+"/search" if web_fault else None})
 setting("youtube.settings",{"home_scan_enabled":False})
 env={k:v for k,v in os.environ.items() if k in ("PATH","HOME","LANG","LC_ALL","LD_LIBRARY_PATH","DATABASE_URL","VIDEOROLL_V2_STORAGE_ROOT","VIDEOROLL_V2_INTERNAL_TOKEN","INTERNAL_API_SECRET")}
 env.update(VIDEOROLL_V2_NATIVE_OUTBOX_ONLY="true",VIDEOROLL_V2_STANDALONE="true",VIDEOROLL_V2_SOURCE_SCANNER="false",VIDEOROLL_V2_ENABLE_NATIVE_BILIBILI="false",VIDEOROLL_V2_ENABLE_SAU_PUBLISH="false",VIDEOROLL_V2_ENABLE_LEGACY_PUBLISH="false",VIDEOROLL_V2_COMPAT_WRITE="false",VIDEOROLL_V2_REMOTE_RENDER="false",VIDEOROLL_V2_WORKERS="1",VIDEOROLL_V2_ASR_ENDPOINT=base+"/v1/audio/transcriptions",VIDEOROLL_V2_ASR_MODEL="whisper-fixture")
@@ -242,7 +248,7 @@ try:
         time.sleep(.3)
     else:raise AssertionError(log.read_text()[-3000:])
     assert [len(x[0]) for x in observed]==[2,1,1,2],observed
-    assert failed_once and row[2]==(3 if parallel else 2) and len(asr_calls)==1 and len(repairs)==2,(row,asr_calls,repairs)
+    assert failed_once and row[2]==(3 if parallel or serial_fault else 2) and len(asr_calls)==1 and len(repairs)==2,(row,asr_calls,repairs)
     examples=observed[0][1]["translation_examples"]
     assert {"reviewed-same-task","approved-global"}<={e["target"] for e in examples},examples
     assert observed[1][1]["context"]["previous_source"][-1]["translation"]==target[1]
@@ -352,8 +358,14 @@ try:
             assert c.execute("SELECT count(*) FROM translation_agent_events WHERE run_id IN (SELECT id FROM translation_agent_runs WHERE task_id=%s) AND status='failed'",(task,)).fetchone()[0]>=1
             print("PASS: specialist recovery, persisted gate and successful child not replayed; separate model, knowledge and web budgets, original history and events",flush=True)
         else:
-            assert research_calls==["gate","search_knowledge","finish"],research_calls
+            assert research_calls==(["gate","search_knowledge","finish","finish"] if serial_fault else ["gate","search_knowledge","finish"]),research_calls
             assert len(plan["gate_candidates"])==1 and result["tool_steps"][0]["action"]=="search_knowledge"
+            ck=plan["serial_checkpoint"]
+            assert ck["model_calls"]==(4 if serial_fault else 3) and ck["knowledge_calls"]==1 and ck["web_calls"]==0,ck
+            assert len(ck["steps"])==1 and len(ck["messages"])==2 and ck["pending"] is None,ck
+            assert any(h["id"]==str(dynamic_id) for h in ck["knowledge"]),ck
+            if serial_fault:
+                print("PASS: serial 503 charged; gate, prior tool action and evidence reused; bounded model count retained",flush=True)
             print("PASS: original discovery config activates gate; grounded candidate filter, original approved dynamic lookup, durable provenance and cached research reuse; no web or automatic learning",flush=True)
 
     print("PASS: native worker hard glossary+adjacent duplicate repair only affected rows, numeric warning nonblocking, prior repaired checkpoint and grounded memory restored, original IDs and approved memory protected",flush=True)

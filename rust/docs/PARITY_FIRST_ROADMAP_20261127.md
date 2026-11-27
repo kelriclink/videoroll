@@ -80,3 +80,7 @@ SAU 代码检查：当前原生领取仍采用全局单投稿互斥；账户导�
 ## 第三十五批续：RAG 研究写入围栏
 
 基线 6db88cf。对照 Python agent_runtime.py:check_budget/before_llm/before_tool 与 Rust agent.rs/agent_parallel.rs。现有并行 Agent 已持久化父子研究、预算预约及工具收据，单 Agent 只有逐次 lease 检查，门控、进度、最终结果存在检查和写入之间竞争。统一使用原 Task → Pipeline → Inbox 行锁，核对 Rust 所有权、暂停/取消、当前阶段/代次、精确作业身份及 token，取得最后一把锁后再以 clock_timestamp 核对租约；串行门控、证据、最终结果、失败与缓存读取进入同一围栏，匹配原研究 ID/工作流/任务，拒绝影响其他研究。外部请求不持有事务。仍不改变串行模型/工具预算跨重试重置和未完成步骤不复用的行为；并行预算沿用既有持久化计数，未新增 token/成本预算；外部请求已经发出时无法回收。通过实际迁移 PG 测试旧 token、错误代次/阶段、暂停、所有权、锁等待期间过期及正常串行/并行研究回归。
+
+## 第三十五批续：串行 Agent 持久化预算和步骤收据
+
+基线 dbb1d54。参考 Python agent_runtime.py 的 before_llm/before_tool/parent_runtime 预算及 Rust agent_parallel.rs:reserve/receipt。串行同原研究 fingerprint 在 pipeline_runs.research_plan.serial_checkpoint (revision=1) 保存门控结果、已完成工具步、有限对话、知识/网页证据、合法待执行动作及累计预约计数。外部请求前在统一任务租约围栏事务中持久化预约，失败/未知请求不退款；有效模型动作先保存，成功工具收据和进度同事务提交。每次重试复用原门控和已完成工具步；缺少成功收据的调用可能再次发出但消耗剩余预算。逻辑步骤仍按 max_research_steps，模型请求上限 max_research_steps + 门控1（如开启）+ 全局共享额外尝试1；知识检索预约上限 max_research_steps+1，网页预约严格 max_web_searches；没有改变并行预算。对话45KB、动作32KB、检查点256KiB边界；非法/重复/非 grounded 动作不保存为待执行。旧未完成研究无该字段时从头开始；原成功结果缓存仍保留；新指纹不复用旧状态。本轮计数是逻辑模型/工具调用预约，不是 HTTP 实际次数、token、费用或跨重试总耗时；没有补齐所有 Provider 内部重试及最终术语冲突检查的预算。动态检索证据按同指纹原快照恢复，知识撤销/原检索策略变化未额外校验，未来需细化。测试 VIDEOROLL_V2_TEST_TRANSLATION_CONTEXT_ONLY=true VIDEOROLL_TEST_SERIAL_RAG_FAULT=true VIDEOROLL_V2_TEST_RESEARCH_FENCE=true：检索成功后模型503，真实 Worker 重试仅恢复缺失结果，门控1次、检索1次、模型预约4次，无真实外部服务。
