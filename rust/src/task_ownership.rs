@@ -14,6 +14,7 @@ const ADOPTION_LOCK: &str = "LOCK TABLE tasks,pipeline_runs,operation_inbox,asse
 // untrusted historical strings to UUID. Include inbox evidence by operation key.
 const BLOCKERS: &str = r#"SELECT array_remove(ARRAY[
  CASE WHEN EXISTS(SELECT 1 FROM pipeline_runs w WHERE w.task_id=t.id
+   AND w.id IS DISTINCT FROM $2::uuid
    AND w.state NOT IN ('succeeded','failed','canceled','completed','superseded')) THEN 'active_workflow' END,
  CASE WHEN EXISTS(SELECT 1 FROM subtitle_jobs j WHERE j.task_id=t.id
    AND (j.status::text NOT IN ('succeeded','failed','canceled','completed') OR j.lease_owner IS NOT NULL OR j.lease_until IS NOT NULL)) THEN 'subtitle_job_unsettled' END,
@@ -32,6 +33,7 @@ const BLOCKERS: &str = r#"SELECT array_remove(ARRAY[
    THEN 'publication_unsettled' END,
  CASE WHEN EXISTS(SELECT 1 FROM publish_batches b WHERE b.task_id=t.id AND b.state NOT IN ('succeeded','failed','partial_failed')) THEN 'publish_batch_unsettled' END,
  CASE WHEN EXISTS(SELECT 1 FROM operation_inbox i WHERE
+   i.id IS DISTINCT FROM $3::uuid AND
    (i.task_id=t.id OR i.request_json->>'task_id'=t.id::text OR i.operation_key='youtube-download:'||t.id::text
       OR EXISTS(SELECT 1 FROM subtitle_jobs j WHERE j.task_id=t.id AND j.operation_key=i.operation_key)
       OR EXISTS(SELECT 1 FROM render_jobs j WHERE j.task_id=t.id AND j.operation_key=i.operation_key)
@@ -58,8 +60,14 @@ const BLOCKERS: &str = r#"SELECT array_remove(ARRAY[
 ],NULL)::text[] AS blockers FROM tasks t WHERE t.id=$1"#;
 
 pub(crate) async fn blockers(tx: &mut Transaction<'_, Postgres>, task: Uuid) -> AppResult<Vec<String>> {
+    blockers_except_batch_waiter(tx,task,None,None).await
+}
+
+/// Only the timeout reconciler may exempt a single verified, lease-free
+/// native batch waiter. Adoption and all other callers use no exemptions.
+pub(crate) async fn blockers_except_batch_waiter(tx:&mut Transaction<'_,Postgres>,task:Uuid,flow:Option<Uuid>,job:Option<Uuid>)->AppResult<Vec<String>> {
     Ok(sqlx::query_scalar(BLOCKERS)
-        .bind(task)
+        .bind(task).bind(flow).bind(job)
         .fetch_one(&mut **tx)
         .await?)
 }

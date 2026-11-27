@@ -105,8 +105,8 @@ for t in (python,heartbeat,leased,fresh,published,batch,busy,inbox):
     assert task_state(t)==("publishing",None),(t,task_state(t))
 print("PASS: original timeout config, concurrent ticks, row lock, unknown receipt quarantine and restart fence, active/batch/receipt/Python protection; no external dispatch")
 
-# Native mixed batch recovery is limited to an explicit, manual, complete
-# target snapshot. All fixtures below are disposable and no publisher runs.
+# Native mixed batch recovery requires an explicit, complete target snapshot.
+# All fixtures below are disposable and no publisher runs.
 def mixed(states,owner="rust",auto=False):
     t=task(owner=owner); b=uuid4(); ids=[]
     targets=[{"platform":p,"account_id":None,"key":p+":default"} for p in ("bilibili","douyin")]
@@ -182,6 +182,90 @@ assert batch_state(partial[1])==before and len(events(partial[1]))==1
 with db() as c:
     assert c.execute("SELECT count(*) FROM outbox_events WHERE event_type='publish.dispatch'").fetchone()[0]==0
 print("PASS: stale native mixed batch convergence, verified targets untouched, orphan quarantine, unverified receipt protection, no replay, conservative deferral, delayed cleanup and event idempotency")
+
+# Automatic batch waiting is not an executing external publisher. The
+# original immutable ticket, operation identity and generation must match.
+def auto_batch(states, *, parent_state="running", waiter_state="awaiting", owner="rust", fault=None):
+    t,b,ids=mixed(states,owner=owner)
+    flow=uuid4(); stage=uuid4(); gen=3
+    parent={"workflow_id":str(flow),"job_id":str(stage),"generation":gen}
+    with db() as c:
+        c.execute("INSERT INTO vr2_workflows(id,task_id,generation,state,current_stage,updated_at) VALUES(%s,%s,%s,%s,'publish',now()-interval '72 hours')",
+            (flow,t,gen,parent_state))
+        c.execute("INSERT INTO vr2_jobs(id,workflow_id,task_id,stage,generation,operation_key,state,external_ticket,updated_at) VALUES(%s,%s,%s,'publish',%s,%s,%s,%s,now()-interval '72 hours')",
+            (stage,flow,t,gen,f"vr2:{flow}:publish:{gen}",waiter_state,"native-batch:"+str(b)))
+        c.execute("UPDATE publish_batches SET request_json=jsonb_set(request_json,'{auto_parent}',%s::jsonb) WHERE id=%s",(json.dumps(parent),b))
+        if fault=="ticket":
+            c.execute("UPDATE operation_inbox SET external_ticket=%s WHERE id=%s",("native-batch:"+str(uuid4()),stage))
+        elif fault=="generation":
+            c.execute("UPDATE publish_batches SET request_json=jsonb_set(request_json,'{auto_parent,generation}','4'::jsonb) WHERE id=%s",(b,))
+        elif fault=="lease":
+            c.execute("UPDATE operation_inbox SET lease_token=%s,lease_until=now()+interval '1 hour' WHERE id=%s",(uuid4(),stage))
+        elif fault=="stale_token":
+            c.execute("UPDATE operation_inbox SET lease_token=%s WHERE id=%s",(uuid4(),stage))
+        elif fault=="fresh":
+            c.execute("UPDATE operation_inbox SET updated_at=now() WHERE id=%s",(stage,))
+        elif fault=="fresh_flow":
+            c.execute("UPDATE pipeline_runs SET updated_at=now() WHERE id=%s",(flow,))
+        elif fault=="other_operation":
+            c.execute("INSERT INTO operation_inbox(id,operation_key,status,task_id,request_json) VALUES(%s,%s,'processing',%s,'{}')",(uuid4(),"fixture-other:"+str(uuid4()),t))
+        elif fault=="other_workflow":
+            c.execute("INSERT INTO vr2_workflows(id,task_id,generation,state,current_stage) VALUES(%s,%s,4,'running','publish')",(uuid4(),t))
+        elif fault=="delivery":
+            c.execute("INSERT INTO operation_inbox(id,operation_key,status,request_json) VALUES(%s,%s,'pending','{}')",(uuid4(),"publish-job:"+str(ids[1])))
+        elif fault=="wrong_key":
+            c.execute("UPDATE operation_inbox SET operation_key=%s WHERE id=%s",("wrong:"+str(stage),stage))
+        elif fault=="result":
+            c.execute("UPDATE operation_inbox SET result_json='{\"unexpected\":true}' WHERE id=%s",(stage,))
+    return t,b,ids,flow,stage
+
+def parent_state_of(item):
+    with db() as c:
+        return c.execute("SELECT w.state,i.status,i.external_ticket,i.result_json,i.finished_at FROM pipeline_runs w JOIN operation_inbox i ON i.workflow_id=w.id WHERE w.id=%s AND i.id=%s",(item[3],item[4])).fetchone()
+
+auto_success=auto_batch(["published","published"])
+auto_partial=auto_batch(["published","submitting"])
+auto_failure=auto_batch(["failed","unknown"])
+auto_unverified=auto_batch(["published","unverified"])
+auto_blocked=[auto_batch(["published","submitting"],fault=f) for f in
+    ("ticket","generation","lease","stale_token","fresh","fresh_flow","other_operation","other_workflow","delivery","wrong_key","result")]
+auto_blocked.extend([auto_batch(["published","submitting"],parent_state="paused"),
+                     auto_batch(["published","submitting"],waiter_state="running"),
+                     auto_batch(["published","submitting"],owner="python")])
+with ThreadPoolExecutor(max_workers=2) as pool:
+    list(pool.map(lambda _:tick(),range(2)))
+tick()
+for item,expected_batch,expected_task,expected_parent in (
+    (auto_success,"succeeded",("published",None),"succeeded"),
+    (auto_partial,"partial_failed",("publishing","PUBLISH_PARTIAL_FAILURE"),"unknown"),
+    (auto_failure,"failed",("failed","PUBLISH_FAILED"),"unknown"),
+    (auto_unverified,"partial_failed",("publishing","PUBLISH_PARTIAL_FAILURE"),"unknown"),
+):
+    t,b,ids,flow,stage=item
+    assert task_state(t)==expected_task,(item,task_state(t))
+    assert batch_state(b)[0]==expected_batch
+    p=parent_state_of(item)
+    assert p[:4]==(expected_parent,expected_parent,"native-batch:"+str(b),{"batch_id":str(b),"confirmed":expected_parent=="succeeded","batch_state":expected_batch}),p
+    assert p[4] is not None
+    assert len(events(b))==(2 if expected_parent=="succeeded" else 1)
+    with db() as c:
+        assert c.execute("SELECT count(*) FROM workflow_events WHERE workflow_id=%s AND kind=%s",(flow,"workflow.succeeded" if expected_parent=="succeeded" else "job.unknown")).fetchone()[0]==1
+    assert start(t)==409
+assert receipt_state(auto_partial[2][1])[0]=="unknown"
+assert receipt_state(auto_unverified[2][1])[0]=="submitted"
+for item in auto_blocked:
+    assert task_state(item[0])==("publishing",None),(item,task_state(item[0]))
+    assert batch_state(item[1])[0]=="active" and not events(item[1])
+    assert receipt_state(item[2][1])[0]=="submitting"
+snap=parent_state_of(auto_partial)
+with db() as c:
+    c.execute("UPDATE tasks SET updated_at=now()-interval '72 hours' WHERE id=%s",(auto_partial[0],))
+tick()
+assert parent_state_of(auto_partial)==snap
+assert len(events(auto_partial[1]))==1
+with db() as c:
+    assert c.execute("SELECT count(*) FROM outbox_events WHERE event_type='publish.dispatch'").fetchone()[0]==0
+print("PASS: exact automatic batch waiter identity, parent success/unknown settlement, active and ambiguous waiter deferral, idempotency and zero external replay")
 
 # Exercise the original native Bilibili cancellation path without running
 # any external worker. The scheduler must preserve both prior JSON snapshots.

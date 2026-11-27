@@ -8,7 +8,7 @@
 - 无外部投稿痕迹或仅明确失败回执：原任务状态 failed，error_code PUBLISHING_TIMEOUT。
 - 遗留 draft/submitting 且无活动持有者：转 unknown，保留已有 response_json 与上传进度，释放旧租约，不再发送外部请求。已有 unknown 保持原回执；任务 UI 为 failed / PUBLISH_OUTCOME_UNKNOWN，不能作为普通失败重跑。
 - 原业务 publish_jobs 中 draft/submitting/submitted/published/unknown 或任何外部 ID/URL 会阻止普通 workflow start/restart_at；显式原投稿处理器继续采用各自目标级回执策略。
-- 不自动宣称投稿成功，不自动重放，不新增数据库业务表。独立原版 unknown 回执仍需人工平台核验，多批次、自动批次父工作流与独立回执确认入口尚待进一步验收。
+- 不自动宣称投稿成功，不自动重放，不新增数据库业务表。独立原版 unknown 回执仍需人工平台核验，多批次、自动批次父工作流与独立回执确认入口尚待进一步验收（第二十五批补齐一类可验证的自动等待父节点）。
 
 隔离测试：`VIDEOROLL_V2_TEST_PUBLISH_TIMEOUT_ONLY=true bash rust/scripts/smoke-isolated.sh`。临时 PostgreSQL + Rust API/CLI，未运行执行投稿的 Worker。
 
@@ -21,3 +21,12 @@
 - 复用正常批次 reconciler，全部成功才能生成原生 finished 与至少 24h 后 cleanup 事件；部分失败保持 publishing / PUBLISH_PARTIAL_FAILURE，不生成 cleanup；全部失败按原聚合 failed。UNKNOWN 和原生未核实 SAU 仍受既有存储及普通 workflow 重启栅栏保护。原生 finished 事件不是投稿操作。不会自动重试目标。
 - Bilibili mark_uncertain 在原任务及平台范围内更新，保留原 response_json（冲突字段通过 previous_response 保存）、原 progress 和原 operation result（previous_result）；新回执明确 confirmed=false。仅当原 job 确实转 unknown 才结算原 Python fence，且要求 lease_owner=rust-v2，避免覆盖另一持有者或已结算结果。
 - 本批不处理历史 Python 所有权、自动批次父工作流、多个当前渠道批次或有投递记录但证据冲突的目标；这些仍需针对账本状态的显式核对。不是完整生产接管。没有新增表或生产写入。
+
+## 第二十五批：自动投稿批次父工作流
+
+基线 3043e18。参考 Python workflows/video_pipeline.py 的 publish-wait（等待指定批次完成，48h 执行窗口，非成功为不可重试失败）以及 subtitle_service/worker.py 的 push_publish_workflow_event（持久化 Outbox→Hatchet 事件）。Rust 已通过同事务更新父工作流替代外部事件，本批补齐超时扫描错误地将等待中的父节点作为执行阻断条件的问题。
+
+- 仅接受明确 rust-mixed-v1 单批次和完整 auto_parent 元组。原 pipeline_runs 与 operation_inbox 必须同时匹配任务、workflow UUID、job UUID、generation、publish 阶段、原稳定 operation_key 与 native-batch:UUID ticket。父流程 running、阶段 awaiting、均过截止时间、无 lease_owner/token/until、无 finished/completed/result，父节点无独立外部投递，不存在同流程其他未结算执行。继续持有 Task 行锁、原有非阻塞表锁，额外 NOWAIT 锁定 pipeline_runs。竞争时推迟，不抢占。
+- 所有权阻断查询仅对已核验的这一对 UUID 排除等待父节点；原历史 adoption 查询仍传 NULL，保持原本全部阻断条件。其他 workflow、inbox、outbox、活跃子目标、P2、SAU intent 仍然阻断。完整目标验证、孤儿回执隔离及原回执保全沿用第二十四批。
+- 复用现有批次 reconciler：成功原子结算任务、批次和父流程/阶段为 succeeded，保留原票据，安排 24h 后 cleanup；部分失败、未核实 SAU、全部失败时父流程/阶段为 unknown 而非重新执行，保留已成功目标及资料；完成事件和阶段事件仅生成一次。
+- 限制：不自动接管已经 unknown 的父流程、活动或 unknown 子工作流、存在不确定投递的目标、终态批次/父节点不一致、缺少身份凭据、多批次及 Python 所有权任务。没有对真实平台执行请求，未变更生产数据库或 API 契约。
