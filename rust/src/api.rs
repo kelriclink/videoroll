@@ -112,21 +112,30 @@ pub(crate) async fn admin_logout(State(state): State<AppState>) -> (HeaderMap, J
 pub(crate) async fn admin_setup(
     State(state): State<AppState>,
     headers: HeaderMap,
+    ConnectInfo(address): ConnectInfo<SocketAddr>,
     Json(body): Json<PasswordRequest>,
 ) -> AppResult<(StatusCode, Json<Value>)> {
-    let secret = state
-        .config
-        .bootstrap_secret
-        .as_deref()
-        .ok_or_else(|| AppError::Unavailable("bootstrap secret not configured".into()))?;
+    let source=crate::trusted_proxies::caller_identity(&headers,Some(address)).await;
+    let permit=auth::hash_permit()?;
+    let attempt=auth::AuthAttempt::begin(&state.db,auth::AuthEndpoint::Setup,&source).await?;
+    let Some(secret)=state.config.bootstrap_secret.as_deref() else {
+        return Err(attempt.failure(&state.db,"bootstrap_unavailable",AppError::Unavailable("bootstrap secret not configured".into())).await)
+    };
     let candidate = headers
         .get("x-videoroll-admin-bootstrap")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     if !bool::from(secret.as_bytes().ct_eq(candidate.as_bytes())) {
-        return Err(AppError::Unauthorized);
+        return Err(attempt.failure(&state.db,"invalid_bootstrap_secret",AppError::Unauthorized).await);
     }
-    let encoded = auth::encode_password(&body.password)?;
+    let password=body.password;
+    let encoded=match tokio::task::spawn_blocking(move||{
+        let _permit=permit;
+        auth::encode_password(&password)
+    }).await.map_err(|_|AppError::AuthenticationUnavailable)? {
+        Ok(encoded)=>encoded,
+        Err(error)=>return Err(attempt.failure(&state.db,"invalid_password",error).await),
+    };
     let mut tx = state.db.pool.begin().await?;
     sqlx::query("INSERT INTO app_settings(key,value_json,version) VALUES('admin.auth','{}'::jsonb,1) ON CONFLICT(key) DO NOTHING")
         .execute(&mut *tx).await?;
@@ -141,12 +150,14 @@ pub(crate) async fn admin_setup(
             .and_then(Value::as_str)
             .is_some_and(|v| !v.is_empty())
     {
-        return Err(AppError::Conflict("admin setup already completed".into()));
+        tx.rollback().await?;
+        return Err(attempt.failure(&state.db,"password_already_set",AppError::Conflict("admin setup already completed".into())).await);
     }
     stored["bootstrap_consumed"] = json!(true);
     stored["password_hash"] = json!(encoded);
     sqlx::query("UPDATE app_settings SET value_json=$1,version=version+1,updated_at=now() WHERE key='admin.auth'")
         .bind(stored).execute(&mut *tx).await?;
+    attempt.succeed(&mut tx).await?;
     tx.commit().await?;
     Ok((
         StatusCode::CREATED,

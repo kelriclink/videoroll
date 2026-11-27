@@ -11,3 +11,12 @@
 
 ## 继续深挖的范围
 P0：publish_lifecycle、social_publisher、publish_service 的历史批次与目标级 unknown 回执，避免状态覆写和重复投稿；P1：auth_service 的 setup/安全审计/过期桶、filesystem 的 sibling .partial 文件、SAU 账户级并发与凭据更新、工作流与历史渲染失败/取消的安全回收。第三方快照作为依赖边界处理，不重写其模型及浏览器运行时。
+
+## 第二十三批：初始化、安全审计与限流回收
+
+基线 df70255。完整对照 Python auth_service 的 setup/login 处理、security/audit 的字段白名单、rate_limits 的 TTL 与 service_auth 的一次性初始化授权。保留 Rust 既有初始化 HTTP 契约（成功 201/trusted=false、重复 409、错误授权 401；与 Python 的 200/trusted=true、400、403 仍不同），不在本批静默改变调用者行为。
+
+- 登录保留已有 SHA256(IP) 桶键；初始化使用 SHA256("setup:"+IP)，两个版本入口共享对应动作桶。共享 PBKDF2 并发上限，初始化哈希同样移到阻塞线程。第五次正确请求可成功，失败进入 429。
+- 原 security_audit_events 表写入固定事件、规范 IP、结果、固定错误码及 attempts/retry_after 数值。无原始请求头、密码、Cookie、bootstrap token、request_id 或异常正文。登录成功的限流清除与审计同事务；初始化成功还与密码及 bootstrap_consumed 更新同事务。审计写入失败阻止成功响应。限流存储故障尽力保留审计，数据库完全不可用时无法持久化；CPU 槽位饱和和请求解析失败不保证有审计记录。
+- 每 300 秒最多回收 1000 个已超过实际过期时间一小时的桶；行锁 SKIP LOCKED，删除前再检查过期。已有 gc CLI 也执行有界回收，不删除审计历史。未增加生产业务表或迁移；隔离 schema 补上原版 security_audit_events。
+- 专项隔离测试扩展：登录/初始化独立桶、错误授权、未设置密码、无效密码、审计故障事务回滚、竞争初始化仅一次成功、敏感字段不入库、过期桶回收与锁保护。未使用生产库或真实账号。

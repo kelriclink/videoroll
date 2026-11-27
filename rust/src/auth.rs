@@ -168,8 +168,7 @@ fn unavailable(error:sqlx::Error)->AppError {
 /// Reserve an attempt before expensive password verification. PostgreSQL
 /// row locking closes the check/increment race without holding a transaction
 /// during PBKDF2. An interrupted verification consumes its reserved attempt.
-async fn reserve_login_attempt(db:&Database,source:&str)->AppResult<(i32,u64)> {
-    let key=hex::encode(Sha256::digest(source.as_bytes()));
+async fn reserve_login_attempt(db:&Database,key:&str)->AppResult<(i32,u64)> {
     let mut tx=db.pool.begin().await.map_err(unavailable)?;
     sqlx::query("INSERT INTO auth_login_limits(source_key,failures) VALUES($1,0)
         ON CONFLICT(source_key) DO NOTHING").bind(&key).execute(&mut *tx).await.map_err(unavailable)?;
@@ -190,15 +189,86 @@ async fn reserve_login_attempt(db:&Database,source:&str)->AppResult<(i32,u64)> {
     Ok((attempts,seconds as u64))
 }
 
+#[derive(Clone,Copy)]
+pub(crate) enum AuthEndpoint { Login, Setup }
+impl AuthEndpoint {
+    fn name(self)->&'static str { match self { Self::Login=>"login",Self::Setup=>"setup" } }
+    fn key(self,source:&str)->String {
+        // Retain the deployed Rust login bucket identity across upgrades.
+        let input=match self {Self::Login=>source.to_owned(),Self::Setup=>format!("setup:{source}")};
+        hex::encode(Sha256::digest(input.as_bytes()))
+    }
+}
+/// Only fixed event codes, normalized source IP and numeric counters enter
+/// the original audit table. Never persist request headers or error text.
+async fn audit(
+    conn:&mut sqlx::PgConnection,endpoint:AuthEndpoint,source:&str,
+    event:&str,outcome:&str,code:Option<&str>,payload:Value
+)->AppResult<()> {
+    sqlx::query("INSERT INTO security_audit_events(id,event_type,actor_type,outcome,source_ip,payload_json,error_code)
+        VALUES($1,$2,'admin',$3,$4,$5,$6)")
+        .bind(Uuid::new_v4()).bind(format!("admin.{}.{event}",endpoint.name()))
+        .bind(outcome).bind(source).bind(payload).bind(code)
+        .execute(conn).await.map_err(unavailable)?;
+    Ok(())
+}
+pub(crate) struct AuthAttempt {
+    endpoint:AuthEndpoint,
+    source:String,
+    key:String,
+    attempts:i32,
+    seconds:u64,
+}
+impl AuthAttempt {
+    pub(crate) async fn begin(db:&Database,endpoint:AuthEndpoint,source:&str)->AppResult<Self> {
+        let key=endpoint.key(source);
+        let (attempts,seconds)=match reserve_login_attempt(db,&key).await {
+            Ok(pair)=>pair,
+            Err(error)=>{
+                // If the limiter failed but the audit table is reachable,
+                // retain the failure without exposing any database error.
+                if let Ok(mut conn)=db.pool.acquire().await {
+                    let _=audit(&mut conn,endpoint,source,"failure","failure",Some("rate_limiter_unavailable"),json!({})).await;
+                }
+                return Err(error)
+            }
+        };
+        let attempt=Self{endpoint,source:source.to_owned(),key,attempts,seconds};
+        if attempts>MAX_FAILED_ATTEMPTS {
+            return Err(attempt.failure(db,"rate_limited",AppError::Unauthorized).await);
+        }
+        Ok(attempt)
+    }
+    pub(crate) async fn failure(&self,db:&Database,code:&'static str,error:AppError)->AppError {
+        let (event,outcome,code,payload,result)=if self.attempts>=MAX_FAILED_ATTEMPTS {
+            ("throttle","throttled","rate_limited",json!({"attempts":self.attempts,"retry_after":self.seconds}),AppError::AuthThrottled{retry_after:self.seconds})
+        } else {
+            ("failure","failure",code,json!({"attempts":self.attempts}),error)
+        };
+        let mut conn=match db.pool.acquire().await {Ok(c)=>c,Err(e)=>return unavailable(e)};
+        match audit(&mut conn,self.endpoint,&self.source,event,outcome,Some(code),payload).await {
+            Ok(())=>result,Err(e)=>e
+        }
+    }
+    pub(crate) async fn succeed(&self,conn:&mut sqlx::PgConnection)->AppResult<()> {
+        sqlx::query("DELETE FROM auth_login_limits WHERE source_key=$1")
+            .bind(&self.key).execute(&mut *conn).await.map_err(unavailable)?;
+        audit(conn,self.endpoint,&self.source,"success","success",None,json!({})).await
+    }
+}
+pub(crate) fn hash_permit()->AppResult<tokio::sync::OwnedSemaphorePermit> {
+    static HASH_SLOTS:std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>>=std::sync::OnceLock::new();
+    HASH_SLOTS.get_or_init(||std::sync::Arc::new(tokio::sync::Semaphore::new(8)))
+        .clone().try_acquire_owned().map_err(|_|AppError::AuthThrottled{retry_after:1})
+}
+
 /// Bound CPU work across callers and allow only the first five concurrent
 /// attempts per source to reach password verification.
 pub async fn authenticate_password(db:&Database,source:&str,password:String,stored:&str)->AppResult<()> {
-    static HASH_SLOTS:std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>>=std::sync::OnceLock::new();
-    let permit=HASH_SLOTS.get_or_init(||std::sync::Arc::new(tokio::sync::Semaphore::new(8)))
-        .clone().try_acquire_owned().map_err(|_|AppError::AuthThrottled{retry_after:1})?;
-    let (attempts,seconds)=reserve_login_attempt(db,source).await?;
-    if attempts>MAX_FAILED_ATTEMPTS {
-        return Err(AppError::AuthThrottled{retry_after:seconds});
+    let permit=hash_permit()?;
+    let attempt=AuthAttempt::begin(db,AuthEndpoint::Login,source).await?;
+    if stored.is_empty() {
+        return Err(attempt.failure(db,"password_not_set",AppError::Invalid("admin password is not set".into())).await)
     }
     let hash=stored.to_owned();
     let valid=tokio::task::spawn_blocking(move||{
@@ -206,15 +276,26 @@ pub async fn authenticate_password(db:&Database,source:&str,password:String,stor
         password.len()<=1024 && verify_password(&password,&hash)
     }).await.map_err(|_|AppError::AuthenticationUnavailable)?;
     if valid {
-        let key=hex::encode(Sha256::digest(source.as_bytes()));
-        sqlx::query("DELETE FROM auth_login_limits WHERE source_key=$1")
-            .bind(key).execute(&db.pool).await.map_err(unavailable)?;
+        let mut tx=db.pool.begin().await.map_err(unavailable)?;
+        attempt.succeed(&mut tx).await?;
+        tx.commit().await.map_err(unavailable)?;
         return Ok(());
     }
-    if attempts>=MAX_FAILED_ATTEMPTS {
-        return Err(AppError::AuthThrottled{retry_after:seconds});
-    }
-    Err(AppError::Unauthorized)
+    Err(attempt.failure(db,"invalid_password",AppError::Unauthorized).await)
+}
+
+/// PostgreSQL buckets do not have Redis TTL. Keep a one-hour grace beyond
+/// their expiry, and lock only a bounded page of rows that are not in use.
+pub async fn collect_expired_login_limits(db:&Database,limit:i64)->AppResult<u64> {
+    let result=sqlx::query("WITH due AS (
+        SELECT source_key FROM auth_login_limits
+        WHERE COALESCE(blocked_until,window_started+interval '60 seconds') < now()-interval '1 hour'
+        ORDER BY COALESCE(blocked_until,window_started+interval '60 seconds'),source_key
+        LIMIT $1 FOR UPDATE SKIP LOCKED
+    ) DELETE FROM auth_login_limits l USING due WHERE l.source_key=due.source_key
+        AND COALESCE(l.blocked_until,l.window_started+interval '60 seconds') < now()-interval '1 hour'")
+        .bind(limit.clamp(1,1000)).execute(&db.pool).await?;
+    Ok(result.rows_affected())
 }
 pub fn login_cookie_header(config: &Config, value: &str) -> AppResult<axum::http::HeaderValue> {
     let flag = if config.secure_cookies {

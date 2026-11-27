@@ -392,6 +392,11 @@ async fn main() -> anyhow::Result<()> {
                 let mut next_upload_sweep=tokio::time::Instant::now();
                 loop {
                     tick.tick().await;
+                    match videoroll_v2::auth::collect_expired_login_limits(&maintenance_store.db,1000).await {
+                        Ok(n) if n>0=>tracing::info!(removed=n,"expired authentication buckets removed"),
+                        Ok(_)=>{},
+                        Err(error)=>tracing::warn!(%error,"authentication bucket cleanup deferred"),
+                    }
                     if tokio::time::Instant::now()>=next_upload_sweep{
                         next_upload_sweep=tokio::time::Instant::now()+std::time::Duration::from_secs(3600);
                         match maintenance_store.collect_abandoned_uploads().await{
@@ -585,7 +590,9 @@ async fn main() -> anyhow::Result<()> {
             let legacy_pending = videoroll_v2::maintenance_terminal_storage_v1::retry_pending_deletes(&registry, limit).await?;
             let deleted = registry.collect(limit, config.cleanup_grace).await?;
             let directories = registry.collect_workdirs(limit, config.cleanup_grace).await?;
+            let auth_buckets=videoroll_v2::auth::collect_expired_login_limits(&registry.db,limit).await?;
             tracing::info!(
+                auth_buckets,
                 batch_events,
                 released,
                 legacy_pending,

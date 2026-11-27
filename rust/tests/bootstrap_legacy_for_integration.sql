@@ -5,6 +5,22 @@ CREATE TYPE task_status AS ENUM ('created','ingested','downloaded','audio_extrac
 CREATE TYPE subtitle_format AS ENUM ('srt','vtt','ass');
 CREATE TYPE asset_kind AS ENUM ('video_raw','metadata_json','audio_wav','segments_json','subtitle_srt','subtitle_ass','video_final','dubbing_audio','video_dubbed','cover_image','log','publish_result');
 CREATE TYPE platform AS ENUM ('bilibili','youtube','douyin','xiaohongshu','kuaishou','tencent');
+-- Original Python security audit schema (not a new production table).
+CREATE TABLE security_audit_events (
+  id UUID PRIMARY KEY,
+  event_type VARCHAR(128) NOT NULL,
+  actor_type VARCHAR(64) NOT NULL,
+  actor_id VARCHAR(128),
+  outcome VARCHAR(32) NOT NULL,
+  request_id VARCHAR(128),
+  source_ip VARCHAR(64),
+  payload_json JSONB NOT NULL,
+  error_code VARCHAR(64),
+  error_message VARCHAR(512),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX ix_security_audit_events_type_created ON security_audit_events(event_type,created_at);
+CREATE INDEX ix_security_audit_events_actor_created ON security_audit_events(actor_type,actor_id,created_at);
 CREATE TABLE accounts (
   id UUID PRIMARY KEY,
   platform platform NOT NULL,

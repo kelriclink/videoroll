@@ -260,6 +260,7 @@ fi
 if [[ "${VIDEOROLL_V2_TEST_AUTH_PROXY_ONLY:-false}" == "true" ]]; then
   export VIDEOROLL_V2_INTERNAL_TOKEN="isolated-native-auth-proxy-token-0123456789"
   export INTERNAL_API_SECRET="isolated-native-auth-proxy-secret"
+  export ADMIN_BOOTSTRAP_SECRET="isolated-native-auth-setup-secret"
   export VIDEOROLL_V2_STORAGE_ROOT="$(mktemp -d "$repo_root/rust/target/v2-auth-proxy-objects.XXXXXX")"
   if ss -lntH "( sport = :18195 )" | grep -q .; then echo 'isolated port occupied' >&2;exit 1;fi
   "$cargo_bin" build --manifest-path "$repo_root/rust/Cargo.toml" --bin videoroll-v2 --locked --offline --quiet
