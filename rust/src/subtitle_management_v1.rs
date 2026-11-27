@@ -115,6 +115,22 @@ pub(crate) fn normalized_profile(raw: &Value) -> Value {
     if let Some(v) = out.get("video_crf").and_then(Value::as_i64) {
         out.insert("video_crf".into(), json!(v.clamp(0, 63)));
     }
+    let codec=out["video_codec"].as_str().unwrap_or("av1");
+    let preset=normalized_preset(codec,&out["video_preset"]);
+    out.insert("video_preset".into(),preset);
+    // Match the original profile view: stable ordering, distinct known platforms.
+    let mut platforms=Vec::new();
+    if let Some(items)=out["auto_publish_platforms"].as_array(){
+        for item in items{
+            if let Some(name)=item.as_str(){
+                let name=name.trim().to_ascii_lowercase();
+                if matches!(name.as_str(),"bilibili"|"douyin"|"xiaohongshu"|"kuaishou") && !platforms.contains(&name){
+                    platforms.push(name);
+                }
+            }
+        }
+    }
+    out.insert("auto_publish_platforms".into(),json!(platforms));
     for name in [
         "burn_in",
         "soft_sub",
@@ -137,6 +153,18 @@ async fn profile_get(State(state): State<AppState>) -> AppResult<Json<Value>> {
     let stored = settings::effective(&state.db, "subtitle.auto_profile").await?;
     Ok(Json(normalized_profile(&stored)))
 }
+fn normalized_preset(codec:&str,value:&Value)->Value{
+    let Some(preset)=value.as_str().map(str::trim).filter(|s|!s.is_empty())else{return Value::Null};
+    if codec=="h264"{
+        let name=preset.to_ascii_lowercase();
+        if matches!(name.as_str(),"ultrafast"|"superfast"|"veryfast"|"faster"|"fast"|"medium"|"slow"|"slower"|"veryslow"|"placebo"){
+            return json!(name)
+        }
+    }else if let Ok(n)=preset.parse::<i32>(){
+        return json!(n.clamp(0,13).to_string())
+    }
+    Value::Null
+}
 fn supported_update(key: &str) -> bool {
     matches!(
         key,
@@ -158,6 +186,13 @@ fn supported_update(key: &str) -> bool {
             | "publish_title_prefix"
             | "auto_dub_p2"
             | "auto_dub_p2_prefix"
+            | "auto_publish"
+            | "auto_publish_platforms"
+            | "burn_in"
+            | "video_codec"
+            | "use_intel_gpu"
+            | "video_preset"
+            | "video_crf"
     )
 }
 fn validate_update(update: &Map<String, Value>) -> AppResult<()> {
@@ -178,6 +213,9 @@ fn validate_update(update: &Map<String, Value>) -> AppResult<()> {
             | "auto_dub_p2"
             | "prefer_youtube_subtitles"
             | "translate_enable_summary"
+            | "auto_publish"
+            | "burn_in"
+            | "use_intel_gpu"
                 if !value.is_boolean() =>
             {
                 return Err(AppError::Invalid(format!("{key} requires bool")));
@@ -188,6 +226,18 @@ fn validate_update(update: &Map<String, Value>) -> AppResult<()> {
                     .is_none_or(|s| s.chars().count() > 40 || s.chars().any(char::is_control)) =>
             {
                 return Err(AppError::Invalid("invalid publish title prefix".into()));
+            }
+            "auto_publish_platforms"=>{
+                crate::task_manual::auto_platform_selection(&json!({}),&json!({"auto_publish_platforms":value}))?;
+            }
+            "video_codec" if !value.as_str().is_some_and(|s|matches!(s,"h264"|"av1"))=>{
+                return Err(AppError::Invalid("unsupported automatic render codec".into()));
+            }
+            "video_crf" if value.as_i64().is_none_or(|n|!(0..=63).contains(&n))=>{
+                return Err(AppError::Invalid("video_crf must be an integer between 0 and 63".into()));
+            }
+            "video_preset" if value.as_str().is_none_or(|s|s.len()>32 || s.chars().any(char::is_control))=>{
+                return Err(AppError::Invalid("invalid video preset".into()));
             }
             "asr_engine" if !value.as_str().is_some_and(|s|matches!(s,
                 "auto"|"mock"|"faster-whisper"|"openvino"|"external-whisper"|"groq-whisper"|"cloudflare-workers-ai"))=>{
@@ -249,9 +299,27 @@ async fn profile_put(
     .unwrap_or(json!({}));
     let mut merged = raw.as_object().cloned().unwrap_or_default();
     for (key, val) in update {
-        if !val.is_null() {
+        // The original nullable preset/quality fields explicitly support
+        // clearing an override. Other nulls retain the saved value.
+        if !val.is_null() || matches!(key.as_str(),"video_preset"|"video_crf") {
             merged.insert(key.clone(), val.clone());
         }
+    }
+    if update.get("auto_publish_platforms").is_some_and(|v|!v.is_null()){
+        let (_,platforms)=crate::task_manual::auto_platform_selection(&json!({}),&Value::Object(merged.clone()))?;
+        merged.insert("auto_publish_platforms".into(),json!(platforms));
+    }
+    if update.get("video_preset").is_some() || update.get("video_codec").is_some_and(|v|!v.is_null()){
+        let codec=merged.get("video_codec").and_then(Value::as_str).unwrap_or("av1");
+        let raw=merged.get("video_preset").cloned().unwrap_or(Value::Null);
+        let preset=normalized_preset(codec,&raw);
+        if let Some(input)=update.get("video_preset").and_then(Value::as_str).filter(|s|!s.trim().is_empty()){
+            let valid=if codec=="h264"{!preset.is_null()}else{input.trim().parse::<i32>().is_ok_and(|n|(0..=13).contains(&n))};
+            if !valid{return Err(AppError::Invalid("preset is incompatible with the selected codec (H.264 names or AV1 0..13)".into()))}
+        }
+        // Changing codecs without a new compatible preset clears the old
+        // codec-specific override, rather than pretending it still applies.
+        merged.insert("video_preset".into(),preset);
     }
     if let Some(model)=update.get("asr_model").and_then(Value::as_str){
         let model=model.trim();
@@ -612,6 +680,15 @@ mod tests {
                 .bind(p).execute(&db.pool).await.unwrap();
         }
         let original:Value=sqlx::query_scalar("SELECT configuration FROM vr2_workflows WHERE id=$1").bind(flow).fetch_one(&db.pool).await.unwrap();
+        // The Python HTTP fixture saved these fields via PUT, after the
+        // workflow had already been created. Verify the actual consumers.
+        let choice=crate::publish_legacy::read_selection(&db,&item).await.unwrap();
+        assert!(choice.enabled && choice.platforms==["bilibili","kuaishou"]);
+        assert!(!dubbing::auto_enabled(&db,&item).await.unwrap());
+        let p=ffmpeg::profile(&db,&item).await.unwrap();
+        assert!(p.burn_in && p.use_intel_gpu && p.video_codec=="av1");
+        assert_eq!(p.video_preset.as_deref(),Some("5"));
+        assert_eq!(p.video_crf,Some(58));
         saved(&db,json!({"auto_publish":false,"auto_publish_platforms":[],"auto_dub_p2":true,"asr_engine":"auto","asr_model":"fixture-one","video_codec":"h264","burn_in":false})).await;
         let choice=crate::publish_legacy::read_selection(&db,&item).await.unwrap();
         assert!(!choice.enabled && choice.platforms.is_empty());
@@ -643,7 +720,12 @@ mod tests {
         let view = normalized_profile(&json!({}));
         assert_eq!(view["translate_provider"], "openai");
         assert_eq!(view["auto_publish_platforms"], json!([]));
-        assert!(validate_update(json!({"auto_publish":true}).as_object().unwrap()).is_err());
+        assert!(validate_update(json!({"auto_publish":true,"auto_publish_platforms":["bilibili","douyin"],"burn_in":false,"video_codec":"av1","video_preset":"4","video_crf":60,"use_intel_gpu":true}).as_object().unwrap()).is_ok());
+        assert!(validate_update(json!({"auto_publish_platforms":["unknown"]}).as_object().unwrap()).is_err());
+        assert!(validate_update(json!({"video_crf":64}).as_object().unwrap()).is_err());
+        assert!(validate_update(json!({"video_codec":"rawvideo"}).as_object().unwrap()).is_err());
+        assert_eq!(normalized_preset("h264",&json!(" FAST ")),json!("fast"));
+        assert_eq!(normalized_preset("av1",&json!("4")),json!("4"));
         assert!(validate_update(json!({"translate_enabled":false}).as_object().unwrap()).is_ok());
         assert!(validate_update(json!({"auto_dub_p2":true,"auto_dub_p2_prefix":"【中配】"}).as_object().unwrap()).is_ok());
         assert!(validate_update(json!({"auto_dub_p2":"true"}).as_object().unwrap()).is_err());

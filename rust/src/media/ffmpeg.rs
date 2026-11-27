@@ -158,10 +158,10 @@ pub fn encode_args(
                     | "slow"
                     | "slower"
                     | "veryslow"
+                    | "placebo"
             )
         })
         .unwrap_or("medium");
-    let crf = profile.video_crf.unwrap_or(23).clamp(1, 51);
     let codec = match profile.video_codec.as_str() {
         "h264" | "avc" => "h264",
         "hevc" | "h265" => "hevc",
@@ -172,6 +172,7 @@ pub fn encode_args(
             ));
         }
     };
+    let crf = profile.video_crf.unwrap_or(23).min(if codec=="av1"{63}else{51});
     let mut args = vec!["-hide_banner", "-nostdin", "-y", "-v", "warning", "-i"]
         .into_iter()
         .map(str::to_owned)
@@ -220,7 +221,10 @@ pub fn encode_args(
         args.push("-crf".into());
         args.push(crf.to_string());
         args.push("-preset".into());
-        args.push("8".into());
+        // Preserve the native default but honor the saved numeric SVT preset.
+        let preset=profile.video_preset.as_deref().and_then(|s|s.trim().parse::<i32>().ok())
+            .map(|n|n.clamp(0,13)).unwrap_or(8);
+        args.push(preset.to_string());
     } else {
         args.push("-crf".into());
         args.push(crf.to_string());
@@ -1259,6 +1263,21 @@ mod tests {
         let args = encode_args(src, dst, None, &av1, Some("/dev/dri/renderD128")).unwrap();
         assert!(args.iter().any(|s| s == "av1_vaapi"));
         assert!(args.iter().any(|s| s == "/dev/dri/renderD128"));
+        av1.use_intel_gpu=false;
+        av1.video_preset=Some("4".into());
+        av1.video_crf=Some(60);
+        let args=encode_args(src,dst,None,&av1,None).unwrap();
+        assert!(args.windows(2).any(|v|v[0]=="-preset" && v[1]=="4"));
+        assert!(args.windows(2).any(|v|v[0]=="-crf" && v[1]=="60"));
+        let args=vaapi_encoder_args(&av1,"av1");
+        assert!(args.windows(2).any(|v|v[0]=="-global_quality" && v[1]=="60"));
+        av1.video_codec="h264".into();
+        av1.video_preset=Some("placebo".into());
+        let args=encode_args(src,dst,None,&av1,None).unwrap();
+        assert!(args.windows(2).any(|v|v[0]=="-crf" && v[1]=="51"));
+        assert!(args.windows(2).any(|v|v[0]=="-preset" && v[1]=="placebo"));
+        av1.video_crf=Some(0);
+        assert!(encode_args(src,dst,None,&av1,None).unwrap().windows(2).any(|v|v[0]=="-crf" && v[1]=="0"));
         av1.video_codec = "rawvideo".into();
         assert!(encode_args(src, dst, None, &av1, None).is_err());
     }

@@ -319,7 +319,14 @@ status,ru_updated=request("PUT","/subtitle/auto/profile",update)
 assert status==200,(status,ru_updated)
 assert py_updated==ru_updated,(py_updated,ru_updated)
 assert read("SELECT count(*) AS n FROM app_settings WHERE key='subtitle.auto_profile'")["n"]==1
-assert request("PUT","/subtitle/auto/profile",{"auto_publish":True})[0]==409
+patch={"auto_publish":False,"auto_publish_platforms":["douyin","bilibili","douyin"],"auto_dub_p2":True,
+       "burn_in":True,"video_codec":"av1","video_preset":"4","video_crf":60,"use_intel_gpu":True}
+with Session(engine) as s: py_updated=update_auto_profile(s,patch)
+execute("DELETE FROM app_settings WHERE key='subtitle.auto_profile'")
+assert request("PUT","/subtitle/auto/profile",update)[0]==200
+status,ru_updated=request("PUT","/subtitle/auto/profile",patch)
+assert status==200 and py_updated==ru_updated,(status,py_updated,ru_updated)
+assert request("PUT","/subtitle/auto/profile",{"formats":["srt"],"auto_publish":True})[0]==409
 assert request("GET","/subtitle/auto/profile")[1]==ru_updated
 print("PASS DIFF: Python/Rust subtitle profile defaults and supported updates; Rust updates original app_settings row")
 
@@ -824,7 +831,19 @@ with Session(engine) as session:
 status,rust_queue=request("GET","/subtitle/task_queue?limit=200")
 assert status==200,(status,rust_queue)
 ours={row["task_id"]:row for row in rust_queue["tasks"]}
+# The earlier P2 cutover fixture is deliberately Rust-owned but still
+# has historical active-looking subtitle/render rows. Python projects
+# those as runnable; Rust must not advertise them without a current
+# native workflow. Assert this specific ownership difference, rather
+# than dropping arbitrary missing rows from the comparison.
+assert read("SELECT runtime_owner FROM tasks WHERE id=:id",{"id":TASK_RU})["runtime_owner"]=="rust"
+assert read("""SELECT count(*) AS n FROM vr2_jobs j JOIN vr2_workflows w ON w.id=j.workflow_id
+  WHERE j.task_id=:id AND w.state='running' AND w.generation=j.generation
+  AND w.current_stage=j.stage AND j.state IN ('pending','running','awaiting')""",{"id":TASK_RU})["n"]==0
+assert str(TASK_RU) in {row["task_id"] for row in py_queue["tasks"]} and str(TASK_RU) not in ours
 for row in py_queue["tasks"]:
+    if row["task_id"]==str(TASK_RU):
+        continue
     r=ours[row["task_id"]]
     for field in ("task_id","state","stage","priority",
         "subtitle_job_id","render_job_id","progress","error_message"):
@@ -832,11 +851,18 @@ for row in py_queue["tasks"]:
     assert abs(row["stage_elapsed_seconds"]-r["stage_elapsed_seconds"])<=4,(row,r)
 for name,task,_ in QUEUE_FIXTURES[:4]:
     assert task in ours,(name,rust_queue)
-for field in ("subtitle_worker_slots","download_concurrency","active_downloads","pending_downloads"):
+for field in ("download_concurrency","active_downloads","pending_downloads"):
     assert rust_queue["settings"][field]==py_settings[field],(field,rust_queue["settings"],py_settings)
-assert rust_queue["settings"]["scheduler"] in ("hatchet","rust-v2")
-# The Rust queue truthfully exposes its own scheduler after V2 tasks are present; the
-# original Python Pydantic DTO hard-codes "hatchet", so this field intentionally differs.
+# Runtime capacity is not a shared setting: Hatchet and Rust read their
+# respective worker-count variables, with independent defaults/limits.
+try:
+    expected_rust_slots=int(os.environ.get("VIDEOROLL_V2_WORKERS","2"))
+except ValueError:
+    expected_rust_slots=2
+expected_rust_slots=max(1,min(32,expected_rust_slots))
+assert rust_queue["settings"]["subtitle_worker_slots"]==expected_rust_slots
+assert py_settings["subtitle_worker_slots"]==max(1,min(256,int(os.environ.get("HATCHET_SUBTITLE_WORKER_SLOTS") or "1")))
+assert rust_queue["settings"]["scheduler"]=="rust-v2" and py_settings["scheduler"]=="hatchet"
 print("PASS DIFF: original Python/Rust task queue states, real leases, workflow retry and download inbox")
 # Python's update method writes the original workflow.youtube_download_concurrency
 # rather than a V2 overlay; compare both DB side effect and API DTO.
@@ -853,9 +879,11 @@ else:
         {"value":json.dumps(saved["value_json"]),"version":saved["version"]})
 status,rust_settings=request("PUT","/subtitle/task_queue/settings",{"max_concurrent":4})
 assert status==200,(status,rust_settings)
-for field in ("subtitle_worker_slots","download_concurrency","active_downloads","pending_downloads"):
+for field in ("download_concurrency","active_downloads","pending_downloads"):
     assert rust_settings[field]==py_queue_after[field],(field,rust_settings,py_queue_after)
-assert rust_settings["scheduler"] in ("hatchet","rust-v2")
+assert rust_settings["subtitle_worker_slots"]==expected_rust_slots
+assert py_queue_after["subtitle_worker_slots"]==py_settings["subtitle_worker_slots"]
+assert rust_settings["scheduler"]=="rust-v2"
 assert read("SELECT value_json,version FROM app_settings WHERE key='workflow.youtube_download_concurrency'")==py_row
 assert request("PUT","/subtitle/task_queue/settings",{"max_concurrent":17})[0] in (400,422)
 assert read("SELECT value_json,version FROM app_settings WHERE key='workflow.youtube_download_concurrency'")==py_row

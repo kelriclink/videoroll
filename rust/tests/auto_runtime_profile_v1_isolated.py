@@ -38,6 +38,27 @@ for bad in ({"asr_engine":"invalid"},{"youtube_subtitle_mode":"invalid"},{"trans
 assert call("/subtitle/auto/profile",{"formats":["srt"],"asr_model":"must-not-save"},"PUT")[0]==409
 assert persisted()==saved
 print("PASS: original ASR/summary/caption profile writes, concurrent first-save merge, validation and atomic rejection")
+# Saved publication and media options are independent and validated atomically.
+patch={"auto_publish":True,"auto_publish_platforms":["douyin","bilibili","douyin"],"auto_dub_p2":False,
+       "burn_in":True,"video_codec":"av1","video_preset":"4","video_crf":60,"use_intel_gpu":True}
+code,profile=call("/subtitle/auto/profile",patch,"PUT")
+assert code==200,(code,profile)
+assert profile["auto_publish_platforms"]==["douyin","bilibili"] and profile["auto_dub_p2"] is False
+for key in patch:
+    assert persisted()[key]==profile[key],(key,persisted(),profile)
+saved=persisted()
+for bad in ({"auto_publish":"true"},{"auto_publish_platforms":["unknown"]},{"auto_publish_platforms":"bilibili"},
+            {"video_preset":"fast"},{"video_preset":"14"},{"video_crf":64},{"video_codec":"rawvideo"},
+            {"burn_in":"true"},{"use_intel_gpu":1}):
+    assert call("/subtitle/auto/profile",{"auto_publish":False,**bad},"PUT")[0]==400,bad
+    assert persisted()==saved
+code,profile=call("/subtitle/auto/profile",{"video_codec":"h264"},"PUT")
+assert code==200 and profile["video_preset"] is None and persisted()["video_preset"] is None,(code,profile)
+assert call("/subtitle/auto/profile",{"video_preset":" FAST ","video_crf":0},"PUT")[1]["video_preset"]=="fast"
+code,profile=call("/subtitle/auto/profile",{"video_preset":None,"video_crf":None,"auto_publish":False,"auto_publish_platforms":[]},"PUT")
+assert code==200 and profile["video_crf"] is None and profile["video_preset"] is None and profile["auto_publish"] is False
+assert persisted()["video_crf"] is None and persisted()["auto_publish_platforms"]==[]
+print("PASS: publication settings and render options persist; codec-specific preset and nullable reset; invalid changes roll back")
 with db() as c:
     c.execute("INSERT INTO app_settings(key,value_json) VALUES('subtitle.auto_profile',%s::jsonb) ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json",(json.dumps({"auto_publish":False,"auto_publish_platforms":["douyin"],"auto_dub_p2":False}),))
 for video,switch in (("AutoCfg0001",True),("AutoCfg0002",False),("AutoCfg0003",None)):
@@ -80,4 +101,9 @@ assert call("/tasks/"+str(blocked)+"/actions/auto_youtube_start",{})[0]==409 and
 with db() as c:
     assert c.execute("SELECT count(*) FROM publish_jobs").fetchone()[0]==0
     assert c.execute("SELECT count(*) FROM publish_batches").fetchone()[0]==0
+# Leave a profile saved through the actual HTTP endpoint for the Rust
+# database-backed stage-consumer regression.
+code,profile=call("/subtitle/auto/profile",{"auto_publish":True,"auto_publish_platforms":["bilibili","kuaishou"],
+    "auto_dub_p2":False,"video_codec":"av1","video_preset":"5","video_crf":58,"burn_in":True,"use_intel_gpu":True},"PUT")
+assert code==200,(code,profile)
 print("PASS: V1 intake runtime policy, atomic proof, dedupe, explicit restart origin, independent dubbing setting and preconditions, historical work protection")
