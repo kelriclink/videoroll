@@ -3006,7 +3006,7 @@ async fn original_log(db:&Database,registry:&AssetRegistry,job:&WorkItem,message
 }
 /// Persist original 16 kHz mono WAV once. Only reuse an asset whose original
 /// job request pins the same source, and whose bytes match its ledger.
-async fn original_audio(config:&Config,db:&Database,registry:&AssetRegistry,job:&WorkItem,video:&Path,video_key:&str,workspace:&Path)->AppResult<std::path::PathBuf>{
+async fn original_audio(config:&Config,db:&Database,registry:&AssetRegistry,job:&WorkItem,video:&Path,video_key:&str,_workspace:&Path)->AppResult<std::path::PathBuf>{
     let old:Option<String>=sqlx::query_scalar("SELECT request_json#>>'{artifacts,audio_key}' FROM subtitle_jobs WHERE id=$1 AND task_id=$2 AND request_json#>>'{input,key}'=$3")
         .bind(job.id).bind(job.task_id).bind(video_key).fetch_optional(&db.pool).await?.flatten();
     if let Some(key)=old {
@@ -3020,16 +3020,21 @@ async fn original_audio(config:&Config,db:&Database,registry:&AssetRegistry,job:
         }
     }
     let _=original_log(db,registry,job,"ffmpeg: extract audio (mono PCM, 16000 Hz)").await;
-    let temp=workspace.join(format!("audio-{}.wav",job.lease_token));
+    // The original asset installer requires an attempt-private file in
+    // the destination directory (atomic publication on the same filesystem).
+    let directory_key=format!("work/{}",job.task_id);
+    let directory=registry.resolve_existing(&directory_key).await?;
+    fs::create_dir_all(&directory).await?;
+    let temp=tempfile::Builder::new().prefix(".audio-attempt-").suffix(".wav").tempfile_in(&directory)?;
     let output=Command::new(&config.ffmpeg_binary).args(["-hide_banner","-nostdin","-loglevel","error","-y","-i"])
-        .arg(video).args(["-vn","-ac","1","-ar","16000","-c:a","pcm_s16le"]).arg(&temp)
+        .arg(video).args(["-vn","-ac","1","-ar","16000","-c:a","pcm_s16le"]).arg(temp.path())
         .stdin(Stdio::null()).kill_on_drop(true).output().await?;
-    if !output.status.success(){let _=fs::remove_file(&temp).await;return Err(AppError::Unavailable("FFmpeg audio extraction failed".into()));}
-    let tmp_key=format!("v2/sub/{}/{}/work/audio-{}.wav",job.task_id,job.id,job.lease_token);
+    if !output.status.success(){return Err(AppError::Unavailable("FFmpeg audio extraction failed".into()));}
+    let tmp_key=format!("{directory_key}/{}",temp.path().file_name().and_then(|n|n.to_str()).ok_or_else(||AppError::Invalid("audio attempt filename invalid".into()))?);
     let (sha,size)=registry.sha256(&tmp_key).await?;
     let nonce=job.id.simple().to_string();
     let key=format!("work/{}/audio_{}_{}.wav",job.task_id,&sha[..16],&nonce[..12]);
-    super::ffmpeg::install_task_asset(db,registry,job,"audio_wav",&key,&temp).await?;
+    super::ffmpeg::install_task_asset(db,registry,job,"audio_wav",&key,temp.path()).await?;
     original_progress(db,job,25,Some(("audio_key",&key))).await?;
     let mut tx=original_job_transaction(db,job).await?;
     sqlx::query("UPDATE tasks SET status='audio_extracted'::task_status,updated_at=now() WHERE id=$1 AND status::text IN ('created','ingested','downloaded')")

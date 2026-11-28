@@ -55,6 +55,12 @@
 - 首轮 `cargo check --tests` 因新增字段后七处测试构造缺失而失败，修正后全部测试目标编译检查通过（`/4t/videoroll-rust-trial-build-ed42980/asr-assets-final-check.log`）。完整 build/lib 测试在保存此检查点时尚未取得最终结果；真实音频资产/日志、置信度差分和故障注入未验收，不能标记完成。未部署、未修改生产库。
 - 只读核实原 NASA 任务 `aa1c8626`：第三代仍 succeeded，任务 rendered，video_raw/video_final 各 52477014 字节，subtitle_jobs=0、publish_jobs=0；属于旧媒体试跑，不能作为本轮 ASR 修复通过证据。保留整体 FAILED 状态。
 
+## 2026-11-28 NASA 第四代工作流实测
+
+- `d9fd669` 主程序构建、全部测试目标编译及 276 项库测试通过。使用原生产任务 `aa1c8626-fe2a-4f9f-8ab4-908697427f88`，新建第四代 `53c3a4fe-4fda-4e34-87fa-3d55471947e8`，只启动专用 Worker，禁止真实投稿、配音和资源清理，不替换正式服务。前两次字幕尝试因临时 WAV 未与最终资产同目录而被原资产安装约束拒绝；等待重试时停止旧 Worker。修正为目标 `work/{task_id}` 内的私有 tempfile，保持原原子安装校验，构建通过后使用同代第三次尝试恢复。
+- 11:07:46 第四代工作流 succeeded，task rendered，无任务错误；原 subtitle_jobs `8e9e2d4d-68bb-451f-bdae-ac52276ed911` succeeded/100，错误及租约清空。完整 WAV 5,165,950 bytes，16kHz mono PCM s16le，161.4335s，原路径与 SHA256 校验一致；原始识别 JSON 为 []，2 bytes，no_speech_detected=true。实际日志覆盖两次失败及后续音频提取、两个 120s/5s overlap 窗口、无语音结论。原视频复用，翻译/硬字幕编码没有实际执行；0 投稿。内部成功作业 last_error 仍残留前次路径错误，待修复，不等于当前任务失败。此次路径修复的完整库回归尚未重跑，实际主程序构建与生产单任务回归已通过。
+- 独立原 Python OpenVINO 对同一完整 161.4335s 音轨测试：VAD 开启为 []；关闭 VAD 得到 0–2.06s 'you' 和 90–144.98s 'I'm sorry. Thank you.'，另有 3 条幻觉或无效时间字幕被原算法丢弃。不能据此确认有可信旁白，未人工试听。证据 `/4t/vr2-nasa-full-audio.qE2EN0/results.log`；工作流日志目录 `/4t/vr2-nasa-d9fd669.SZzGwq`、`/4t/vr2-nasa-audio-retry.E5rNAN`；构建 `/4t/videoroll-rust-trial-build-ed42980/asr-audio-colocated-build.log`。正式 API 服务未替换，整体 FAILED 不变。
+
 以下为历史审计记录，不再视为当前验收结论。当前不满足完整生产替换门槛。
 
 2026-11-23 迁移状态（最新接口审计）：**175/217** 条原版 API 具有部分 Rust 原生适配，剩余 **42** 条尚无原生 V1 入口；**0** 条达到完整生产等价签收。测试采用一次性数据库、回环侧服务和原版 Python 同库差分；生产 Python 服务不切换。
