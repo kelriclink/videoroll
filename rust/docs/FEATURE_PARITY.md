@@ -21,6 +21,12 @@
 - 验证：`/4t/videoroll-rust-trial-build-ed42980/round-next-lib.log` 273 库测试通过（历史进度/异步变更前）；`round-next-http-build.log` 最终主程序编译通过；`/4t/vr2-original-contract.vrMkpx/legacy-actions.log` 原 V1 HTTP 下载、入队、历史进度、原字幕和 P2 入口共六组断言通过，独立 PG 及合成 FFmpeg 媒体；此轮附加 Cookie 测试脚本 SQL 百分号转义失败，独立重跑 `/4t/vr2-cookie-contract.z2v5iE/cookie-contract.log` 两组通过，验证环境文件优先、DB 回退、字段、清空及无投稿。测试仅使用合成 Cookie 和模拟 yt-dlp，不代表真实 YouTube 或整个自动流水线验收。未触碰生产环境。
 - 后续 P0：原任务列表/详情、资产、成品、流媒体仍错误过滤历史 Python 所有权或 `v2/` 路径，先恢复原只读查询与实际 Range 验收；写操作保持独立所有权检查。随后完成原进度写入/下载诊断日志资产、封面、真实 aria2c 选择与回退、原 proxy 兼容和 FFmpeg 参数、自动恢复及其余模块。未通过全量行为差分前继续 FAILED。前端候选部署改动不与本次后端提交混合。
 
+## 重写接力记录：历史任务及媒体读取
+
+- 基于 `0d0c44c`，对照原 Python task_service 的任务列表/详情、标题回退、成品列表、上传进度及 asset_service 资产查询/下载。V1 只读接口恢复全部历史任务及原存储键；任务标题按原元数据回退，历史 B 站上传进度从原 publish_jobs 读取。资产列表恢复时间正序，成品列表恢复原查询范围和封面关联，媒体读取允许原路径且验证任务与资产归属。写操作仍执行独立所有权检查；只读不会接管历史任务或生成新作业。
+- 最新主程序编译成功；独立 PostgreSQL、真实 HTTP、合成 FFmpeg 视频、模拟 yt-dlp 回归七组通过，日志 `/4t/vr2-historical-read.NtGVxt/legacy-actions.log`。新增测试使用 Python 所有权的旧任务、原 raw 存储键、旧标题及封面、HTTP Range 206 与跨任务 404，检查所有权不变且未产生 Rust 作业。未操作生产。该测试不是实际 YouTube 或完整原版端到端验收。
+- 后续优先补齐历史字幕/配音/投稿记录读取、资产 DTO 与流媒体响应细节；继续对照下载日志/封面、真实 aria2c/代理参数及工作流恢复。全量差分及真实平台验收仍未完成，继续 FAILED。
+
 以下为历史审计记录，不再视为当前验收结论。当前不满足完整生产替换门槛。
 
 2026-11-23 迁移状态（最新接口审计）：**175/217** 条原版 API 具有部分 Rust 原生适配，剩余 **42** 条尚无原生 V1 入口；**0** 条达到完整生产等价签收。测试采用一次性数据库、回环侧服务和原版 Python 同库差分；生产 Python 服务不切换。

@@ -1,6 +1,6 @@
 //! Source-verified V1 response adapters backed by the V2 runtime.
 //! These are native database queries, not Python or HTTP reverse proxies.
-//! Only V2-owned tasks are exposed. Unsupported legacy operations stay absent.
+//! Original read APIs expose the shared historical tables. Mutations retain their Rust ownership guard.
 use crate::{AppError, AppResult, api::AppState, domain::AssetInfo};
 use axum::{
     Json, Router,
@@ -44,12 +44,17 @@ SELECT t.id,t.source_type::text AS source_type,t.source_url,
     NULLIF(trim(title.value_json->>'translated_title'),''),
     NULLIF(trim(title.value_json->>'source_title'),'')
   ) AS display_title,
-  t.error_code,t.error_message,t.retry_count,NULL::jsonb AS bilibili_upload,
+  t.error_code,t.error_message,t.retry_count,upload.value AS bilibili_upload,
   t.created_at,t.updated_at
 FROM tasks t
 LEFT JOIN app_settings title ON title.key=('task.title.'||t.id::text)
-WHERE (EXISTS(SELECT 1 FROM vr2_workflows v WHERE v.task_id=t.id)
-    OR t.runtime_owner='rust')
+LEFT JOIN LATERAL (
+    SELECT jsonb_build_object('job_id',p.id,'progress',GREATEST(0,LEAST(100,COALESCE(p.upload_progress,0)))) AS value
+    FROM publish_jobs p WHERE p.task_id=t.id AND p.platform::text='bilibili'
+      AND p.state::text='submitting' AND p.upload_active
+    ORDER BY p.updated_at DESC,p.id DESC LIMIT 1
+) upload ON true
+WHERE true
 "#;
 
 #[derive(Debug, Deserialize)]
@@ -311,12 +316,39 @@ struct LimitQuery {
     limit: Option<i64>,
 }
 pub async fn read_task(db: &crate::Database, id: Uuid) -> AppResult<V1Task> {
-    let sql = format!("{TASK_VIEW} AND t.id=$1");
+    let sql = format!("{TASK_VIEW} AND t.id=$1 AND (t.runtime_owner='rust' OR EXISTS(SELECT 1 FROM vr2_workflows v WHERE v.task_id=t.id))");
     sqlx::query_as::<_, V1Task>(&sql)
         .bind(id)
         .fetch_optional(&db.pool)
         .await?
         .ok_or_else(|| AppError::NotFound("V2 task not found".into()))
+}
+/// Read the original task row even when historical work is not adopted.
+pub(crate) async fn read_visible_task(db:&crate::Database,id:Uuid)->AppResult<V1Task> {
+    sqlx::query_as::<_,V1Task>(&format!("{TASK_VIEW} AND t.id=$1"))
+        .bind(id).fetch_optional(&db.pool).await?
+        .ok_or_else(||AppError::NotFound("task not found".into()))
+}
+async fn fill_original_titles(state:&AppState,tasks:&mut [V1Task])->AppResult<()> {
+    let missing:Vec<_>=tasks.iter().filter(|t|t.display_title.is_none()).map(|t|t.id).collect();
+    if missing.is_empty() { return Ok(()); }
+    // Match the original batched fallback, selecting only the latest metadata.
+    let keys:Vec<(Uuid,String)>=sqlx::query_as("SELECT DISTINCT ON(task_id) task_id,storage_key FROM assets
+        WHERE task_id=ANY($1) AND kind::text='metadata_json' ORDER BY task_id,created_at DESC,id DESC")
+        .bind(&missing).fetch_all(&state.db.pool).await?;
+    let keys:std::collections::HashMap<_,_>=keys.into_iter().collect();
+    for task in tasks {
+        let Some(key)=keys.get(&task.id) else {continue};
+        // The original tolerates missing/corrupt metadata without losing the task.
+        let Ok(path)=state.storage.resolve_existing(key).await else {continue};
+        let Ok(meta)=tokio::fs::metadata(&path).await else {continue};
+        if !meta.is_file() || meta.len()>2_000_000 {continue}
+        let Ok(raw)=tokio::fs::read(path).await else {continue};
+        let Ok(info)=serde_json::from_slice::<Value>(&raw) else {continue};
+        task.display_title=["title","fulltitle","alt_title"].iter()
+            .find_map(|key|info.get(*key).and_then(Value::as_str).map(str::trim).filter(|s|!s.is_empty()).map(str::to_owned));
+    }
+    Ok(())
 }
 async fn stop_task(State(state): State<AppState>, Path(id): Path<Uuid>) -> AppResult<Json<V1Task>> {
     state.scheduler.stop_task_compat(id).await?;
@@ -360,24 +392,27 @@ async fn list_tasks(
     let repaired=crate::publish_legacy_reconcile::repair(&state.db,&ids).await?;
     if !repaired.is_empty() {
         for row in &mut rows {
-            if repaired.contains(&row.id) {*row=read_task(&state.db,row.id).await?;}
+            if repaired.contains(&row.id) {*row=read_visible_task(&state.db,row.id).await?;}
         }
         if let Some(status)=q.status.as_deref(){rows.retain(|row|row.status==status);}
     }
+    fill_original_titles(&state,&mut rows).await?;
     Ok(Json(rows))
 }
 async fn get_task(State(state): State<AppState>, Path(id): Path<Uuid>) -> AppResult<Json<V1Task>> {
     crate::publish_legacy_reconcile::repair(&state.db,&[id]).await?;
-    Ok(Json(read_task(&state.db, id).await?))
+    let mut task=read_visible_task(&state.db,id).await?;
+    fill_original_titles(&state,std::slice::from_mut(&mut task)).await?;
+    Ok(Json(task))
 }
 async fn task_assets(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<Vec<AssetInfo>>> {
-    read_task(&state.db, id).await?;
+    read_visible_task(&state.db, id).await?;
     let rows = sqlx::query_as::<_, AssetInfo>(
         "SELECT id,task_id,kind::text,storage_key,sha256,size_bytes,duration_ms,created_at
-         FROM assets WHERE task_id=$1 AND storage_key LIKE 'v2/%' ORDER BY created_at DESC",
+         FROM assets WHERE task_id=$1 ORDER BY created_at ASC,id ASC",
     )
     .bind(id)
     .fetch_all(&state.db.pool)
@@ -400,11 +435,9 @@ async fn converted(
     let candidates = sqlx::query_as::<_, AssetInfo>(
         "SELECT a.id,a.task_id,a.kind::text,a.storage_key,a.sha256,a.size_bytes,a.duration_ms,a.created_at
          FROM assets a WHERE a.kind::text='video_final'
-         AND a.storage_key LIKE 'v2/%'
-         AND EXISTS(SELECT 1 FROM vr2_workflows v WHERE v.task_id=a.task_id)
          ORDER BY a.created_at DESC,a.id DESC LIMIT $1",
     )
-    .bind(limit.saturating_mul(8).min(1600))
+    .bind(limit.saturating_mul(5).min(1000))
     .fetch_all(&state.db.pool)
     .await?;
     let mut seen = HashSet::new();
@@ -413,11 +446,11 @@ async fn converted(
         if !seen.insert(asset.task_id) {
             continue;
         }
-        let task = read_task(&state.db, asset.task_id).await?;
+        let task = read_visible_task(&state.db, asset.task_id).await?;
         let cover = sqlx::query_as::<_, AssetInfo>(
             "SELECT id,task_id,kind::text,storage_key,sha256,size_bytes,duration_ms,created_at
              FROM assets WHERE task_id=$1 AND kind::text='cover_image'
-             AND storage_key LIKE 'v2/%' ORDER BY created_at DESC,id DESC LIMIT 1",
+             ORDER BY created_at DESC,id DESC LIMIT 1",
         )
         .bind(asset.task_id)
         .fetch_optional(&state.db.pool)
@@ -680,10 +713,9 @@ async fn asset_for_task(
     Path((task_id, asset_id)): Path<(Uuid, Uuid)>,
     request: axum::extract::Request,
 ) -> AppResult<axum::response::Response> {
-    read_task(&state.db, task_id).await?;
     let asset = state.db.asset(asset_id).await?;
-    if asset.task_id != task_id || !asset.storage_key.starts_with("v2/") {
-        return Err(AppError::NotFound("V2 task asset not found".into()));
+    if asset.task_id != task_id {
+        return Err(AppError::NotFound("asset not found".into()));
     }
     crate::assets::download(State(state), Path(asset_id), request).await
 }

@@ -232,3 +232,37 @@ assert status==409 and recovery['detail']['code']=='YOUTUBE_DOWNLOAD_RESULT_RECO
 with engine.connect() as db:
     assert db.execute(text("SELECT count(*) FROM operation_inbox WHERE task_id=CAST(:id AS uuid) AND stage='download'"),{'id':str(lost_task)}).scalar()==1
 print('PASS: lost successful download cannot claim completion or dispatch an unsafe retry')
+
+# Original task list/detail and assets must include unadopted historical rows,
+# using their original object keys without rewriting the existing files.
+historical=uuid4(); old_meta=uuid4(); old_final=uuid4(); old_cover=uuid4()
+old_dir=root/'raw'/str(historical)
+old_dir.mkdir(parents=True)
+(old_dir/'metadata.json').write_text(json.dumps({'fulltitle':'Historical original title'}))
+(old_dir/'final.mp4').write_bytes(b'0123456789abcdef')
+(old_dir/'cover.jpg').write_bytes(b'fixture-cover')
+with engine.begin() as db:
+    db.execute(text("INSERT INTO tasks(id,source_type,source_license,status,runtime_owner) VALUES(:id,'youtube','authorized','rendered','python')"),{'id':historical})
+    for aid,kind,name in [(old_meta,'metadata_json','metadata.json'),(old_final,'video_final','final.mp4'),(old_cover,'cover_image','cover.jpg')]:
+        db.execute(text("INSERT INTO assets(id,task_id,kind,storage_key) VALUES(:aid,:tid,CAST(:kind AS asset_kind),:key)"),{'aid':aid,'tid':historical,'kind':kind,'key':f'raw/{historical}/{name}'})
+def get(path,extra=None):
+    with urlopen(Request(base+path,headers={**hdr,**(extra or {})}),timeout=12) as r:
+        return r.status,r.read()
+detail=json.loads(get(f'/tasks/{historical}')[1])
+assert detail['display_title']=='Historical original title' and detail['status']=='RENDERED',detail
+rows=json.loads(get('/tasks?status=RENDERED&limit=500')[1])
+assert any(x['id']==str(historical) and x['display_title']=='Historical original title' for x in rows),rows
+assets=json.loads(get(f'/tasks/{historical}/assets')[1])
+assert {a['id'] for a in assets}=={str(old_meta),str(old_final),str(old_cover)},assets
+converted=json.loads(get('/videos/converted?limit=200')[1])
+assert any(x['task']['id']==str(historical) and x['final_asset']['id']==str(old_final) and x['cover_asset']['id']==str(old_cover) for x in converted)
+assert get(f'/tasks/{historical}/assets/{old_final}/stream',{'Range':'bytes=2-5'})==(206,b'2345')
+try:
+    get(f'/tasks/{task}/assets/{old_final}/stream')
+    raise AssertionError('cross-task media access must not succeed')
+except HTTPError as e:
+    assert e.code==404
+with engine.connect() as db:
+    assert db.execute(text("SELECT runtime_owner FROM tasks WHERE id=:id"),{'id':historical}).scalar()=='python'
+    assert db.execute(text("SELECT count(*) FROM vr2_jobs WHERE task_id=:id"),{'id':historical}).scalar()==0
+print('PASS: original historical task, title, assets, converted video and Range stream, without adoption or new jobs')
