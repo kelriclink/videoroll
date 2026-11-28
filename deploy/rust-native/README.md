@@ -25,7 +25,13 @@ Worker 等待内部服务健康检查后才领取；Web 等待 API readiness。
 
 ## 第三方边界
 
-保留 yt-dlp/aria2c、FFmpeg/FFprobe、远程 RenderWorker。SAU 保留
+下载器使用上游正式发布的 `yt-dlp_linux` 独立可执行文件，安装到
+`/opt/videoroll/bin/yt-dlp`（校验发行文件 SHA-256，root 持有、0755）；
+Deno 独立安装到 `/usr/local/bin/deno`，确保服务 PATH 可发现。
+Rust 通过 `VIDEOROLL_V2_YT_DLP` 直接调用，不依赖旧 Python 虚拟环境。
+升级时先以服务用户验证 `--version` 及公开 YouTube 视频的 `--simulate`，
+确认 JavaScript 挑战使用 Deno，再原子替换可执行文件。
+保留 aria2c、FFmpeg/FFprobe、远程 RenderWorker。SAU 保留
 Python/Playwright 浏览器引擎，账号检查、登录、任务执行控制与持久
 投递由 Rust 管理；启用前独立配置 CLI、X11/noVNC/websockify 和 cookie
 目录，仍使用 scoped grant 的 auth_request。保留 YouDub 的 Python
