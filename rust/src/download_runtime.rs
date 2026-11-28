@@ -111,6 +111,51 @@ async fn usable_aria2c() -> bool {
         .stderr(Stdio::null()).stdin(Stdio::null()).kill_on_drop(true).status()).await,
         Ok(Ok(status)) if status.success())
 }
+/// Shared transport defaults from Python build_ydl_opts, also used for metadata.
+pub(crate) fn original_transport_args() -> Vec<String> {
+    let user_agent = std::env::var("YOUTUBE_USER_AGENT").unwrap_or_else(|_| "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36".into());
+    let mut args = vec!["--retries".into(), "3".into(), "--fragment-retries".into(), "3".into(), "--user-agent".into(), user_agent];
+    let timeout = std::env::var("YTDLP_SOCKET_TIMEOUT_SECONDS").ok()
+        .and_then(|s| s.trim().parse::<f64>().ok()).unwrap_or(20.0);
+    if timeout.is_finite() && timeout > 0.0 {
+        args.extend(["--socket-timeout".into(), timeout.to_string()]);
+    }
+    args
+}
+/// Preserve Python _merged_extractor_args: compatibility replaces player_client,
+/// while per-operation overrides append unique list elements.
+fn extractor_args_from(raw: &str, compatibility: bool, extra: Option<(&str, &[&str])>) -> AppResult<Vec<String>> {
+    let mut value: serde_json::Value = if raw.trim().is_empty() { serde_json::json!({}) } else {
+        serde_json::from_str(raw).map_err(|_| AppError::Invalid("invalid YOUTUBE_EXTRACTOR_ARGS_JSON".into()))?
+    };
+    let root = value.as_object_mut().ok_or_else(|| AppError::Invalid("YOUTUBE_EXTRACTOR_ARGS_JSON must be a JSON object".into()))?;
+    if compatibility || extra.is_some() {
+        let youtube = root.entry("youtube").or_insert_with(|| serde_json::json!({}));
+        if !youtube.is_object() { *youtube = serde_json::json!({}); }
+        let youtube = youtube.as_object_mut().unwrap();
+        if compatibility { youtube.insert("player_client".into(), serde_json::json!(["default","web_embedded"])); }
+        if let Some((key, additions)) = extra {
+            let mut list = youtube.get(key).and_then(|v|v.as_array()).cloned().unwrap_or_default();
+            for item in additions { let item = serde_json::json!(item); if !list.contains(&item) { list.push(item); } }
+            youtube.insert(key.into(), serde_json::Value::Array(list));
+        }
+    }
+    let mut args = Vec::new();
+    for (extractor, options) in root {
+        let options = options.as_object().ok_or_else(||AppError::Invalid("extractor arguments must be objects".into()))?;
+        let mut fields = Vec::new();
+        for (key, values) in options {
+            let values = values.as_array().ok_or_else(||AppError::Invalid("extractor argument values must be lists".into()))?;
+            let values = values.iter().map(|v|v.as_str().ok_or_else(||AppError::Invalid("extractor argument must be a string".into()))).collect::<AppResult<Vec<_>>>()?;
+            fields.push(format!("{key}={}",values.join(",")));
+        }
+        if !fields.is_empty() { args.extend(["--extractor-args".into(),format!("{extractor}:{}",fields.join(";"))]); }
+    }
+    Ok(args)
+}
+pub(crate) fn original_extractor_args(compatibility: bool, extra: Option<(&str, &[&str])>) -> AppResult<Vec<String>> {
+    extractor_args_from(&std::env::var("YOUTUBE_EXTRACTOR_ARGS_JSON").unwrap_or_default(),compatibility,extra)
+}
 pub async fn prepare_args(binary: &Path, settings: &YoutubeRuntime, opts: bool) -> Vec<String> {
     let mut args = vec![
         "--ignore-config".into(),
@@ -124,12 +169,7 @@ pub async fn prepare_args(binary: &Path, settings: &YoutubeRuntime, opts: bool) 
         "--progress-template".into(),
         PROGRESS_TEMPLATE.into(),
     ];
-    if settings.compatibility {
-        args.extend([
-            "--extractor-args".into(),
-            "youtube:player_client=default,web_embedded".into(),
-        ]);
-    }
+    args.extend(original_transport_args());
     if settings.parallel {
         args.extend([
             "--concurrent-fragments".into(),
@@ -139,7 +179,7 @@ pub async fn prepare_args(binary: &Path, settings: &YoutubeRuntime, opts: bool) 
             && !settings
                 .proxy
                 .as_deref()
-                .is_some_and(|p| p.starts_with("socks5"))
+                .is_some_and(|p| { let p=p.to_ascii_lowercase(); p.starts_with("socks5:") || p.starts_with("socks5h:") || p.starts_with("socks4:") || p.starts_with("socks4a:") })
             && patched_ytdlp(binary).await
             && usable_aria2c().await
         {
@@ -148,7 +188,7 @@ pub async fn prepare_args(binary: &Path, settings: &YoutubeRuntime, opts: bool) 
                 "http,https:aria2c".into(),
                 "--downloader-args".into(),
                 format!(
-                    "aria2c:-c -x {} -s {} -k 1M",
+                    "aria2c:-c -x {} -s {} -k 8M",
                     settings.connections, settings.connections
                 ),
             ]);
@@ -313,13 +353,6 @@ impl Backend {
             Self::AndroidWeb => "native-android-web",
         }
     }
-    fn client(self) -> Option<&'static str> {
-        match self {
-            Self::TvAndroidWeb => Some("youtube:player_client=tv,android_sdkless,web"),
-            Self::AndroidWeb => Some("youtube:player_client=android,web"),
-            _ => None,
-        }
-    }
     fn fallback(self, error: FailureKind, compat: bool) -> Option<Self> {
         match self {
             Self::Parallel
@@ -415,9 +448,12 @@ pub async fn run(
         } else {
             native_args.clone()
         };
-        if let Some(client) = backend.client() {
-            args.extend(["--extractor-args".into(), client.into()]);
-        }
+        let fallback_clients: Option<&[&str]> = match backend {
+            Backend::TvAndroidWeb => Some(&["tv","android_sdkless","web"]),
+            Backend::AndroidWeb => Some(&["android","web"]),
+            _ => None,
+        };
+        args.extend(original_extractor_args(settings.compatibility, fallback_clients.map(|v|("player_client",v)))?);
         tracing::info!(job_id=%job.id,backend=backend.dir(),"starting isolated download attempt");
         match run_attempt(
             config,
@@ -474,7 +510,7 @@ async fn run_attempt(
     url: &str,
     mut args: Vec<String>,
     settings: &YoutubeRuntime,
-    cookies: Option<&tempfile::TempDir>,
+    cookies: Option<&crate::youtube_settings_v1::CookieInput>,
 ) -> AppResult<Option<FailureKind>> {
     let binary = &config.download_binary;
     if let Some(proxy) = settings.proxy.as_deref() {
@@ -484,14 +520,13 @@ async fn run_attempt(
     if let Some(secret) = cookies {
         args.push("--cookies".into());
         args.push(
-            secret
-                .path()
-                .join("cookies.txt")
+            secret.path()
                 .to_string_lossy()
                 .into_owned(),
         );
     }
     args.extend([
+        "--write-info-json".into(),
         "--merge-output-format".into(),
         "mp4".into(),
         "-o".into(),
@@ -706,6 +741,16 @@ print('[download] vr2|100|100|NA|1000|0|100.0%')
         println!(
             "PASS real PostgreSQL lease, subprocess format fallback, independent partial, FFprobe validation, no replay of finished fallback"
         );
+    }
+    #[test]
+    fn original_python_extractor_merge_preserves_other_options() {
+        let raw = r#"{"youtube":{"skip":["translated_subs"],"player_client":["tv"]}}"#;
+        let compatible = extractor_args_from(raw,true,None).unwrap();
+        assert!(compatible[1].contains("player_client=default,web_embedded"));
+        assert!(compatible[1].contains("skip=translated_subs"));
+        let merged = extractor_args_from(raw,false,Some(("player_client",&["tv","android_sdkless","web"]))).unwrap();
+        assert!(merged[1].contains("player_client=tv,android_sdkless,web"));
+        assert!(extractor_args_from("[]",false,None).is_err());
     }
     #[test]
     fn downloader_fallback_only_on_safe_categories() {

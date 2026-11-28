@@ -55,6 +55,14 @@ CREATE TABLE tasks (
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+-- Original Python legacy_schema.py YouTubeVideoMeta table, not a Rust shadow table.
+CREATE TABLE youtube_video_meta (
+  task_id UUID PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+  source_id VARCHAR(64), title TEXT NOT NULL, description TEXT NOT NULL,
+  webpage_url TEXT NOT NULL, uploader VARCHAR(256), upload_date VARCHAR(32), duration INTEGER,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(), updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX ix_youtube_video_meta_source_id ON youtube_video_meta(source_id);
 CREATE TABLE ingested_videos (
   id UUID PRIMARY KEY, platform VARCHAR(32) NOT NULL,
   source_id VARCHAR(64) NOT NULL,

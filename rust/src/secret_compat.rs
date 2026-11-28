@@ -181,6 +181,12 @@ fn decrypt(token: &str, key: &Key) -> AppResult<String> {
     cleanse(&mut output);
     result
 }
+/// Match the original Python database representation for recoverable settings.
+pub(crate) fn encode(value: &str) -> String {
+    let value = value.trim();
+    if value.is_empty() { String::new() } else { format!("dbplain:v1:{value}") }
+}
+
 pub(crate) fn decode(encoded: &str) -> AppResult<Option<String>> {
     let encoded = encoded.trim();
     if encoded.is_empty() {

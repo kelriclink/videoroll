@@ -94,6 +94,8 @@ impl Config {
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("yt-dlp")),
             ffmpeg_binary: std::env::var_os("VIDEOROLL_V2_FFMPEG")
+                .or_else(||std::env::var_os("FFMPEG_PATH"))
+                .filter(|v|!v.is_empty())
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("ffmpeg")),
             ffprobe_binary: std::env::var_os("VIDEOROLL_V2_FFPROBE")

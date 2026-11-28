@@ -216,6 +216,7 @@ pub(crate) async fn fetch(
     let runtime = crate::youtube_settings_v1::runtime(db, config).await?;
     let cookies = crate::youtube_settings_v1::prepare_cookie_copy(config, &runtime).await?;
     let temp = tempfile::Builder::new().prefix("vr-ytsub-").tempdir()?;
+    let extractor_args = crate::download_runtime::original_extractor_args(runtime.compatibility,Some(("skip",&["translated_subs"])))?;
     let command = || {
         let mut cmd = Command::new(&config.download_binary);
         cmd.args([
@@ -223,24 +224,13 @@ pub(crate) async fn fetch(
             "--no-playlist",
             "--skip-download",
             "--no-warnings",
-            "--socket-timeout",
-            "15",
-            "--retries",
-            "1",
-            "--extractor-retries",
-            "1",
-            "--extractor-args",
-            if runtime.compatibility {
-                "youtube:player_client=default,web_embedded;skip=translated_subs"
-            } else {
-                "youtube:skip=translated_subs"
-            },
         ]);
+        cmd.args(crate::download_runtime::original_transport_args()).args(&extractor_args);
         if let Some(proxy) = runtime.proxy.as_deref() {
             cmd.arg("--proxy").arg(proxy);
         }
         if let Some(cookie) = cookies.as_ref() {
-            cmd.arg("--cookies").arg(cookie.path().join("cookies.txt"));
+            cmd.arg("--cookies").arg(cookie.path());
         }
         cmd.current_dir(temp.path());
         cmd

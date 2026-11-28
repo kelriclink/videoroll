@@ -8,7 +8,8 @@ from sqlalchemy import create_engine,text
 uri=os.environ['DATABASE_URL'].replace('postgresql://','postgresql+psycopg://',1)
 assert '127.0.0.1:' in uri and uri.endswith('/videoroll_test')
 engine=create_engine(uri)
-base='http://127.0.0.1:18080/api/v1'
+base=os.getenv('VIDEOROLL_TEST_V1_BASE','http://127.0.0.1:18080/api/v1')
+assert base.startswith('http://127.0.0.1:') and base.endswith('/api/v1')
 hdr={'x-videoroll-v2-internal-token':os.environ['VIDEOROLL_V2_INTERNAL_TOKEN'],'content-type':'application/json'}
 def post(path,payload=None):
     data=json.dumps({} if payload is None else payload).encode()
@@ -29,6 +30,10 @@ assert status==200 and body=={'status':'queued','task_id':str(task)},(status,bod
 with engine.connect() as db:
     jobs=db.execute(text("SELECT id,status,workflow_id FROM operation_inbox WHERE task_id=CAST(:id AS uuid) AND stage='download'"),{'id':str(task)}).all()
 assert len(jobs)==1 and jobs[0].status=='pending',jobs
+with engine.connect() as db:
+    flow=db.execute(text("SELECT configuration FROM vr2_workflows WHERE id=:id"),{'id':jobs[0].workflow_id}).scalar()
+    assert flow['manual_download_only'] and flow['manual_download_enqueued']
+    assert db.execute(text("SELECT max_attempts FROM vr2_jobs WHERE id=:id"),{'id':jobs[0].id}).scalar()==4
 status,body=post(f'/tasks/{task}/actions/youtube_download_enqueue')
 assert status==200 and body['status']=='queued',(status,body)
 with engine.connect() as db:
@@ -129,6 +134,23 @@ print('PASS: V1 /subtitle/jobs schedules real native subtitle operation, preserv
 
 print('PASS: original V1 youtube enqueue is durable and idempotent; automatic P2 rejects manual tasks, skips disabled/no-speech without creating jobs')
 
+# A fresh explicit download must not need a second click or a new route.
+# Use the isolated yt-dlp fixture, actual FFprobe and real HTTP response.
+manual_task=uuid4()
+with engine.begin() as db:
+    db.execute(text("INSERT INTO tasks(id,source_type,source_url,source_license,status,runtime_owner,error_code,error_message) VALUES(CAST(:id AS uuid),'youtube','https://youtu.be/0123456789A','authorized','failed','rust','YOUTUBE_DOWNLOAD_FAILED','old error')"),{'id':str(manual_task)})
+status,rejected=post(f'/tasks/{manual_task}/actions/youtube_download_enqueue')
+assert status==409 and rejected['detail']['code']=='YOUTUBE_DOWNLOAD_ENQUEUE_REJECTED',(status,rejected)
+status,downloaded=post(f'/tasks/{manual_task}/actions/youtube_download')
+assert status==200 and downloaded['metadata']['title']=='English title of test',(status,downloaded)
+from videoroll.apps.orchestrator_api.schemas import YouTubeDownloadActionResponse
+YouTubeDownloadActionResponse.model_validate(downloaded)
+with engine.connect() as db:
+    assert db.execute(text("SELECT status::text,error_code,error_message FROM tasks WHERE id=CAST(:id AS uuid)"),{'id':str(manual_task)}).one()==('downloaded',None,None)
+    assert db.execute(text("SELECT stage,status FROM operation_inbox WHERE task_id=CAST(:id AS uuid)"),{'id':str(manual_task)}).all()==[('download','succeeded')]
+    assert db.execute(text("SELECT source_id,uploader,duration FROM youtube_video_meta WHERE task_id=CAST(:id AS uuid)"),{'id':str(manual_task)}).one()==('0123456789A','Test Channel',23)
+print('PASS: original synchronous manual retry downloads, returns DTO, clears old failure, persists source metadata and does not start subtitle/publish')
+
 # The old synchronous download action returns complete assets ONLY when they
 # exist on disk, and it never pretends a queued Rust stage is a finished file.
 from pathlib import Path
@@ -176,14 +198,33 @@ status,conflict=post(f'/tasks/{python_task}/actions/youtube_download')
 assert status==409 and conflict['detail']['code']=='YOUTUBE_DOWNLOAD_IN_PROGRESS',(status,conflict)
 with engine.connect() as db:
     assert db.execute(text("SELECT count(*) FROM vr2_jobs WHERE task_id=CAST(:id AS uuid) AND stage='download'"),{'id':str(python_task)}).scalar()==0
-print('PASS: V1 synchronous YouTube download returns validated original DTO when ready, queues without false success and protects Python lease and corrupt metadata')
+print('PASS: V1 synchronous YouTube download returns validated original DTO when ready, conflicts only on existing work, protects Python lease and corrupt metadata')
+
+# Original Python writes the fallback download progress in app_settings and
+# operation_inbox; after replacement a historical job must not become idle.
+from videoroll.apps.orchestrator_api.schemas import YouTubeDownloadProgressRead
+with engine.begin() as db:
+    db.execute(text("INSERT INTO app_settings(key,value_json) VALUES(:key,CAST(:value AS jsonb))"),
+        {'key':'youtube.download_progress.'+str(python_task),'value':json.dumps({'status':'downloading','active':True,'progress':47,'downloaded_bytes':470,'total_bytes':1000,'filename':'fixture.mp4'})})
+    db.execute(text("UPDATE operation_inbox SET lease_until=now()-interval '1 minute' WHERE operation_key=:key"),{'key':'youtube-download:'+str(python_task)})
+    db.execute(text("UPDATE tasks SET runtime_owner='python' WHERE id=CAST(:id AS uuid)"),{'id':str(python_task)})
+def get_progress(t):
+    with urlopen(Request(base+f'/tasks/{t}/youtube_download_progress',headers=hdr),timeout=12) as r:
+        return YouTubeDownloadProgressRead.model_validate(json.load(r))
+progress=get_progress(python_task)
+assert progress.status=='queued' and not progress.active and progress.progress==47 and progress.downloaded_bytes==470,progress
+with engine.begin() as db:
+    db.execute(text("UPDATE operation_inbox SET status='completed' WHERE operation_key=:key"),{'key':'youtube-download:'+str(python_task)})
+progress=get_progress(python_task)
+assert progress.status=='completed' and not progress.active and progress.progress==100 and progress.error is None,progress
+print('PASS: original PostgreSQL historical progress and expired download lease projection')
 # A stage whose receipt was persisted but whose media object is missing must
 # never be marked completed or replayed automatically: reconcile the storage.
 lost_task=uuid4()
 with engine.begin() as db:
     db.execute(text("INSERT INTO tasks(id,source_type,source_url,source_license,status,runtime_owner) VALUES(CAST(:id AS uuid),'youtube','https://youtu.be/0123456789C','authorized','created','rust')"),{'id':str(lost_task)})
-status,queued=post(f'/tasks/{lost_task}/actions/youtube_download')
-assert status==409 and queued['detail']['code']=='YOUTUBE_DOWNLOAD_IN_PROGRESS',(status,queued)
+status,queued=post(f'/tasks/{lost_task}/actions/youtube_download_enqueue')
+assert status==200 and queued['status']=='queued',(status,queued)
 with engine.begin() as db:
     db.execute(text("UPDATE operation_inbox SET status='succeeded' WHERE task_id=CAST(:id AS uuid) AND stage='download'"),{'id':str(lost_task)})
 status,recovery=post(f'/tasks/{lost_task}/actions/youtube_download')

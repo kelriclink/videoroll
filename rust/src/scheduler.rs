@@ -262,6 +262,9 @@ impl Scheduler {
         ).bind(workflow_id).bind(task_id).bind(generation).bind(configuration)
             .execute(&mut *tx).await?;
         Self::insert_job(&mut tx, workflow_id, task_id, generation, Stage::Download).await?;
+        // A new download generation must not expose the previous failure as its current state.
+        sqlx::query("UPDATE tasks SET status='created'::task_status,error_code=NULL,error_message=NULL,updated_at=now() WHERE id=$1 AND status='failed'::task_status")
+            .bind(task_id).execute(&mut *tx).await?;
         Self::event(
             &mut tx,
             workflow_id,
@@ -573,6 +576,8 @@ impl Scheduler {
         // manual stage restarts must not inherit its download-only policy.
         if let Some(base) = configuration.as_object_mut() {
             base.remove("source_recovery");
+            base.remove("manual_download_only");
+            base.remove("manual_download_enqueued");
         }
         if changes.contains_key("source_recovery") {
             return Err(AppError::Invalid("source recovery is an internal operation".into()));
@@ -789,7 +794,11 @@ impl Scheduler {
             "INSERT INTO operation_inbox(id,workflow_id,task_id,stage,generation,operation_key,request_json,max_attempts,runtime_engine) VALUES($1,$2,$3,$4,$5,$6,'{}'::jsonb,$7,'rust-v2') ON CONFLICT(operation_key) DO NOTHING"
         ).bind(Uuid::new_v4()).bind(workflow_id).bind(task_id)
             .bind(stage.as_str()).bind(generation).bind(operation_key)
-            .bind(if stage == Stage::Publish {1i32} else {5i32})
+            .bind(if stage == Stage::Publish {1i32} else if stage == Stage::Download {
+                let manual: bool = sqlx::query_scalar("SELECT COALESCE(configuration->'manual_download_only'='true'::jsonb,false) AND NOT COALESCE(configuration->'manual_download_enqueued'='true'::jsonb,false) FROM vr2_workflows WHERE id=$1")
+                    .bind(workflow_id).fetch_one(&mut **tx).await?;
+                if manual { 1i32 } else { 4i32 }
+            } else {5i32})
             .execute(&mut **tx).await?;
         Ok(())
     }
@@ -953,6 +962,10 @@ impl Scheduler {
     /// Claims are atomically fenced by a new UUID and a renewed PostgreSQL lease.
     /// The claim query can be safely used by multiple processes.
     pub async fn claim(&self) -> AppResult<Option<WorkItem>> {
+        self.claim_scoped(None).await
+    }
+    /// Optional exact task/workflow scope for a controlled media-only trial.
+    pub async fn claim_scoped(&self, scope: Option<(Uuid, Uuid)>) -> AppResult<Option<WorkItem>> {
         let mut tx = self.db.pool.begin().await?;
         // Serialise admission across V2 workers: the queue settings must
         // actually govern downloads rather than only change a UI number.
@@ -972,6 +985,7 @@ impl Scheduler {
                 JOIN vr2_workflows w ON w.id=j.workflow_id
                 JOIN tasks t ON t.id=j.task_id
                 WHERE w.state='running' AND t.runtime_owner='rust' AND t.status <> 'canceled'::task_status
+                  AND ($4::uuid IS NULL OR (j.task_id=$4 AND j.workflow_id=$5))
                   AND w.current_stage=j.stage AND w.generation=j.generation AND j.attempts<j.max_attempts
                   AND (
                      (j.state='pending' AND j.available_at<=now())
@@ -1004,6 +1018,8 @@ impl Scheduler {
         .bind(Uuid::new_v4())
         .bind(self.lease_seconds())
         .bind(max_downloads)
+        .bind(scope.map(|s| s.0))
+        .bind(scope.map(|s| s.1))
         .fetch_optional(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -1213,6 +1229,18 @@ impl Scheduler {
                 .bind(item.task_id).execute(&mut **tx).await?;
             Self::event(tx,item.workflow_id,Some(item.id),"workflow.source_recovered",json!({"asset_id":proof.asset_id})).await?;
             return Ok(());
+        }
+        // The original manual download action completes at the source asset;
+        // only the automatic pipeline advances to subtitle processing.
+        if item.stage == Stage::Download {
+            let manual: bool = sqlx::query_scalar("SELECT COALESCE(configuration->'manual_download_only'='true'::jsonb,false) FROM vr2_workflows WHERE id=$1")
+                .bind(item.workflow_id).fetch_one(&mut **tx).await?;
+            if manual {
+                sqlx::query("UPDATE vr2_workflows SET state='succeeded',updated_at=now() WHERE id=$1")
+                    .bind(item.workflow_id).execute(&mut **tx).await?;
+                Self::event(tx,item.workflow_id,Some(item.id),"workflow.succeeded",json!({})).await?;
+                return Ok(());
+            }
         }
         if let Some(next) = item.stage.after() {
             Self::insert_job(tx, item.workflow_id, item.task_id, item.generation, next).await?;

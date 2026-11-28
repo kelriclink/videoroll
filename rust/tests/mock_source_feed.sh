@@ -23,6 +23,9 @@ if [ -n "$output" ]; then
   printf '%s\n' '[download] vr2|2000|10000|NA|2000.0|3| 20.0%'
   sleep 3
   cp "$VIDEOROLL_V2_MOCK_YT_VIDEO" "$dir/source.mp4"
+  case "$*" in
+    *0123456789A*) printf '%s\n' '{"id":"0123456789A","title":"English title of test","description":"A synthetic tech explainer","webpage_url":"https://youtu.be/0123456789A","uploader":"Test Channel","upload_date":"20261122","duration":23.5}' > "$dir/source.info.json" ;;
+  esac
   printf '%s\n' '[download] vr2|10000|10000|NA|5000.0|0|100.0%'
   exit 0
 fi

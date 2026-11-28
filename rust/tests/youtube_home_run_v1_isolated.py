@@ -59,8 +59,10 @@ assert code==200,(code,settings)
 assert settings["home_scan_enabled"] is False and settings["home_scan_limit"]==4
 assert settings["home_scan_long_videos_only"] and settings["home_scan_min_duration_seconds"]==180
 assert settings["cookies_set"] is True
-assert "isolated-home-token" not in json.dumps(settings) and "isolated-home-token" not in json.dumps(current())
-print("PASS: original Home config accepts scan options and stores Netscape credentials outside PostgreSQL")
+assert "isolated-home-token" not in json.dumps(settings)
+assert current()["cookies_txt_enc"].startswith("dbplain:v1:")
+assert not (storage/".videoroll-private"/"youtube-cookies.txt").exists()
+print("PASS: original Home config accepts scan options and stores Netscape settings in original PostgreSQL field")
 
 if os.getenv("VIDEOROLL_TEST_CREDENTIAL_COMPAT")=="true":
     from cryptography.fernet import Fernet
@@ -68,7 +70,7 @@ if os.getenv("VIDEOROLL_TEST_CREDENTIAL_COMPAT")=="true":
     cipher=Fernet(key).encrypt(cookies.encode()).decode()
     with psycopg.connect(db_url) as conn:
         conn.execute("UPDATE app_settings SET value_json=value_json||jsonb_build_object('cookies_txt_enc',%s::text) WHERE key='youtube.settings'",(cipher,))
-    (storage/".videoroll-private"/"youtube-cookies.txt").unlink()
+    (storage/".videoroll-private"/"youtube-cookies.txt").unlink(missing_ok=True)
     code,settings=api("GET","/settings/youtube")
     assert code==200 and settings["cookies_set"] and "isolated-home-token" not in json.dumps(settings)
     assert current()["cookies_txt_enc"]==cipher
@@ -163,7 +165,7 @@ if os.getenv("VIDEOROLL_TEST_CREDENTIAL_COMPAT")=="true":
     assert current()["cookies_txt_enc"]==cipher
     assert not (storage/".videoroll-private"/"youtube-cookies.txt").exists()
     code,settings=api("PUT","/settings/youtube",{"cookies_txt":cookies})
-    assert code==200 and settings["cookies_set"] and "cookies_txt_enc" not in current()
+    assert code==200 and settings["cookies_set"] and current()["cookies_txt_enc"].startswith("dbplain:v1:")
     code,settings=api("PUT","/settings/youtube",{"cookies_txt":""})
     assert code==200 and not settings["cookies_set"] and not settings["cookies_enabled"]
     assert "cookies_txt_enc" not in current()

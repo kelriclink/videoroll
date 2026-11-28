@@ -1,6 +1,27 @@
 # VideoRoll Rust v2 功能差异
 
-当前不满足完整生产替换门槛。
+## 2026-11-28：迁移验收失败（FAILED）
+
+用户已明确判定本轮 Rust 迁移失败。现有实现仅作为重写参考，不作为原版兼容基准；此前接口覆盖率、估算完成度及模拟测试通过均不能代表迁移成功。当前已发现 Cookies 持久化方式偏离原数据库契约、手动下载入队后错误返回 409、旧失败状态残留、下载参数/元数据行为差异及额外 V2 对外接口。真实 YouTube 自动下载尚未通过。保留现有提交和未提交修复，不回滚或删除生产数据，不宣称完成切换。
+
+重写规则：先阅读原 Python 源码、调用链、数据库模型、配置默认值、原测试及前端调用，再检查 Rust 对应实现，逐项迁移原行为。保持原公开 API、字段、HTTP 状态、任务状态、原 PostgreSQL 业务表与媒体引用；不新增业务表或对外接口，不擅自优化或改变业务语义。第三方 yt-dlp、SAU、YouDub、ffplayout 等保持原集成边界。对照测试以原 Python 行为为准，使用隔离数据库与实际 HTTP 调用，区分模拟测试和真实平台验收。每轮记录源文件、函数、差异、修改、测试结果与剩余缺陷，下一轮从未完成项继续。
+
+重写顺序：YouTube 设置/下载/进度/恢复/自动工作流 → 任务调度及历史兼容 → ASR/翻译/词典/Embedding/RAG → 字幕渲染/远程节点/YouDub → B 站/SAU 投稿 → 播控/存储/回收 → 原前端全交互及 217 条原 API 全量行为差分。每次修改前检查工作树与其他开发任务，避免覆盖并行工作；仅提交已验证的变更（中文提交），不自动部署、不操作生产库、不真实投稿。
+
+## 重写接力记录：第二轮（2026-11-28）
+
+- 基线仍为 `ed42980`，接续未提交工作，未改生产配置/库/服务。第一轮手动下载原 HTTP 接口隔离测试证据 `/4t/vr2-youtube-rewrite-test.LQGeLj`，不是本轮重新执行结果。
+- 本轮参考 `youtube_downloader.py` 的 `_extractor_args`、`_merged_extractor_args`、`build_ydl_opts`、`download_youtube_video`，`youtube_service.py` 的 `effective_youtube_settings`、`get_download_progress`，`youtube_settings_store.py` 的代理/登录态及 Cookie 格式，以及 `config.py`、原下载器/设置/字幕测试。修复显式空代理不应回退环境变量；保留原 `YOUTUBE_EXTRACTOR_ARGS_JSON` 对象配置，兼容模式替换 player_client、普通覆盖合并列表，其他提取器选项保留；视频、元数据、字幕、来源扫描/解析共用参数；补全 Cookie 登录态名称，恢复 `FFMPEG_PATH` 配置别名。未新增公开接口或业务表。
+- 证据：`/4t/videoroll-rust-trial-build-ed42980/round2-check.log` 编译检查通过；`round2-unit.log` 两项新增测试通过；`round2-lib.log` 272 项通过、0 失败（普通库测试，依赖显式环境变量的外部集成分支不等于均已实跑）。原 Python unittest 下载器 7、设置 2、字幕选择 6 共 15 项通过；实际 yt-dlp CLI 参数解析与 Python `build_ydl_opts` 的兼容模式/skip 示例一致。pytest 不在现有 Python 环境，原并行下载 pytest 套件尚未执行。`git diff --check` 通过。
+- 下一轮优先：严格复刻原 Cookie 规范化（域名前导点、TRUE/FALSE、空格分隔、标准头、已有字段默认值）和 `YOUTUBE_COOKIE_FILE` 优先级，核对 `FFMPEG_PATH` 实际传给 yt-dlp、旧 proxy 支持范围；对照 Python aria2c 大文件选择/重试回退与进度，补原 log 资产及封面/元数据字段回退、旧任务进度读取及自动模式恢复。修复前先读对应 Python 函数及原测试。完整 HTTP 回归及真实 YouTube 测试仍未完成，不可将本轮编译或单元测试计为生产等价验收。当前工作树包含前轮混合未提交修改，暂不将其整体提交；完成相关回归后分组审查提交。
+
+## 重写接力记录：11-28 上午人工接手
+
+- 夜间调度结束后只有 Cookies 规范化代码和 3 项专项测试新增，未形成提交。接手保留全部修改，继续对照原 `youtube_service.effective_youtube_settings/get_download_progress`、`youtube_settings_store`、`routers/settings.py`、`download_dispatch.enqueue_download/download_operation_status`、`routers/youtube.py` 和 `video_pipeline._wait_for_youtube_download`。恢复环境 `YOUTUBE_COOKIE_FILE` 优先级（缺失且启用 DB 时回退）、原字段状态报告、域名归并；下载/字幕/元数据/来源共用原文件选择；历史进度读取原 `app_settings` 和 `operation_inbox`，过期租约映射 queued，完成映射 100%，不更改历史账本；原异步下载入队不隐式开始字幕/投稿，失败任务明确拒绝，异步 4 次、同步 1 次。原公开 API 未增加，原业务表未增加。
+- 验证：`/4t/videoroll-rust-trial-build-ed42980/round-next-lib.log` 273 库测试通过（历史进度/异步变更前）；`round-next-http-build.log` 最终主程序编译通过；`/4t/vr2-original-contract.vrMkpx/legacy-actions.log` 原 V1 HTTP 下载、入队、历史进度、原字幕和 P2 入口共六组断言通过，独立 PG 及合成 FFmpeg 媒体；此轮附加 Cookie 测试脚本 SQL 百分号转义失败，独立重跑 `/4t/vr2-cookie-contract.z2v5iE/cookie-contract.log` 两组通过，验证环境文件优先、DB 回退、字段、清空及无投稿。测试仅使用合成 Cookie 和模拟 yt-dlp，不代表真实 YouTube 或整个自动流水线验收。未触碰生产环境。
+- 后续 P0：原任务列表/详情、资产、成品、流媒体仍错误过滤历史 Python 所有权或 `v2/` 路径，先恢复原只读查询与实际 Range 验收；写操作保持独立所有权检查。随后完成原进度写入/下载诊断日志资产、封面、真实 aria2c 选择与回退、原 proxy 兼容和 FFmpeg 参数、自动恢复及其余模块。未通过全量行为差分前继续 FAILED。前端候选部署改动不与本次后端提交混合。
+
+以下为历史审计记录，不再视为当前验收结论。当前不满足完整生产替换门槛。
 
 2026-11-23 迁移状态（最新接口审计）：**175/217** 条原版 API 具有部分 Rust 原生适配，剩余 **42** 条尚无原生 V1 入口；**0** 条达到完整生产等价签收。测试采用一次性数据库、回环侧服务和原版 Python 同库差分；生产 Python 服务不切换。
 

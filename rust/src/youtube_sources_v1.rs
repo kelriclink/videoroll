@@ -296,13 +296,9 @@ async fn resolve_source(
                 if let Some(cookie_file) = cookies.as_ref() {
                     downloader
                         .arg("--cookies")
-                        .arg(cookie_file.path().join("cookies.txt"));
+                        .arg(cookie_file.path());
                 }
-                if settings.compatibility {
-                    downloader
-                        .arg("--extractor-args")
-                        .arg("youtube:player_client=default,web_embedded");
-                }
+                downloader.args(crate::download_runtime::original_transport_args()).args(crate::download_runtime::original_extractor_args(settings.compatibility,None)?);
                 let output = timeout(
                     Duration::from_secs(45),
                     downloader

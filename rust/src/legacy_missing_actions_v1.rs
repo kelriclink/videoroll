@@ -15,18 +15,20 @@ use uuid::Uuid;
 async fn enqueue_youtube_download(
     State(state): State<AppState>,
     Path(task_id): Path<Uuid>,
-) -> AppResult<Json<Value>> {
-    let task = read_task(&state.db, task_id).await?;
-    if task.source_type != "youtube" {
-        return Err(AppError::NotFound("YouTube task not found".into()));
+) -> AppResult<Response> {
+    // Original enqueue returns a structured conflict for invalid or terminal tasks.
+    let task=match read_task(&state.db, task_id).await {
+        Ok(task)=>task,
+        Err(AppError::NotFound(_))=>return Ok(download_conflict("YOUTUBE_DOWNLOAD_ENQUEUE_REJECTED","YouTube task not found")),
+        Err(e)=>return Err(e),
+    };
+    if task.source_type != "youtube" || matches!(task.status.as_str(),"PUBLISHED"|"PUBLISHING"|"CANCELED"|"FAILED") {
+        return Ok(download_conflict("YOUTUBE_DOWNLOAD_ENQUEUE_REJECTED","task is not an eligible YouTube automatic download"));
     }
-    if matches!(
-        task.status.as_str(),
-        "PUBLISHED" | "PUBLISHING" | "CANCELED"
-    ) {
-        return Err(AppError::Conflict(
-            "terminal task cannot enqueue download".into(),
-        ));
+    let legacy:Option<String>=sqlx::query_scalar("SELECT status FROM operation_inbox WHERE operation_key=$1")
+        .bind(format!("youtube-download:{task_id}")).fetch_optional(&state.db.pool).await?;
+    if matches!(legacy.as_deref(),Some("pending"|"queued"|"processing"|"unknown")) {
+        return Ok(download_conflict("YOUTUBE_DOWNLOAD_ENQUEUE_REJECTED","historical download ownership must be reconciled"));
     }
     let latest = sqlx::query(
         "SELECT j.id,j.state FROM vr2_jobs j
@@ -42,25 +44,23 @@ async fn enqueue_youtube_download(
         if status == "succeeded" {
             if let Some(raw) = latest_asset(&state, task_id, "video_raw").await?
                 && valid_media(&state, &raw).await? {
-                return Ok(Json(json!({"task_id":task_id,"status":"completed"})));
+                return Ok(Json(json!({"task_id":task_id,"status":"completed"})).into_response());
             }
             if state.scheduler.recover_missing_download(&state.storage,task_id).await? {
-                return Ok(Json(json!({"task_id":task_id,"status":"queued"})));
+                return Ok(Json(json!({"task_id":task_id,"status":"queued"})).into_response());
             }
             return Err(AppError::Conflict("successful download has missing media; reconcile storage before retry".into()));
         }
         if matches!(status.as_str(), "pending" | "running" | "awaiting") {
-            return Ok(Json(json!({"task_id":task_id,"status":"queued"})));
+            return Ok(Json(json!({"task_id":task_id,"status":"queued"})).into_response());
         }
         if status == "unknown" {
             return Err(AppError::Conflict(
                 "download state is uncertain; resolve before retry".into(),
             ));
         }
-        if status == "failed" && task.status == "FAILED" {
-            return Err(AppError::Conflict(
-                "failed task must be explicitly resumed before downloading".into(),
-            ));
+        if status == "failed" {
+            return Ok(download_conflict("YOUTUBE_DOWNLOAD_RETRIES_EXHAUSTED","download failed after bounded retries; inspect task error"));
         }
     }
     let workflow = state
@@ -68,7 +68,7 @@ async fn enqueue_youtube_download(
         .restart_at(
             task_id,
             Stage::Download,
-            json!({"auto_publish":false,"auto_publish_platforms":[]}),
+            json!({"manual_download_only":true,"manual_download_enqueued":true,"legacy_auto_runtime_profile":false,"auto_publish":false,"auto_publish_platforms":[],"auto_dub_p2":false}),
         )
         .await?;
     let job_exists: bool = sqlx::query_scalar(
@@ -82,13 +82,11 @@ async fn enqueue_youtube_download(
             "download stage was not persisted".into(),
         ));
     }
-    Ok(Json(json!({"task_id":task_id,"status":"queued"})))
+    Ok(Json(json!({"task_id":task_id,"status":"queued"})).into_response())
 }
 
-/// Original Python download action returned its complete media/metadata DTO.
-/// The Rust worker is durable and async: the legacy action returns that DTO
-/// only for verified existing assets, otherwise queues the real download and
-/// uses the original structured 409 in-progress error (never a fake success).
+/// Original synchronous download returns the complete media/metadata DTO.
+/// The separate enqueue action remains asynchronous, as in Python.
 fn legacy_asset(asset: &crate::domain::AssetInfo) -> Value {
     json!({"id":asset.id,"kind":asset.kind,"storage_key":asset.storage_key,
         "sha256":asset.sha256,"size_bytes":asset.size_bytes,
@@ -102,9 +100,6 @@ fn download_conflict(code: &str, message: &str) -> Response {
         .into_response()
 }
 async fn valid_media(state: &AppState, asset: &crate::domain::AssetInfo) -> AppResult<bool> {
-    if !asset.storage_key.starts_with("v2/") {
-        return Ok(false);
-    }
     let path = state.storage.resolve_existing(&asset.storage_key).await?;
     match tokio::fs::metadata(&path).await {
         Ok(meta) => Ok(meta.is_file() && meta.len() > 0),
@@ -119,7 +114,7 @@ async fn latest_asset(
 ) -> AppResult<Option<crate::domain::AssetInfo>> {
     sqlx::query_as::<_, crate::domain::AssetInfo>(
         "SELECT id,task_id,kind::text AS kind,storage_key,sha256,size_bytes,duration_ms,created_at
-         FROM assets WHERE task_id=$1 AND kind::text=$2 AND storage_key LIKE 'v2/%'
+         FROM assets WHERE task_id=$1 AND kind::text=$2
          ORDER BY created_at DESC,id DESC LIMIT 1",
     )
     .bind(task_id)
@@ -215,14 +210,22 @@ async fn native_youtube_download(
             "download result uncertain; reconcile before retry",
         ));
     }
-    let Json(state_info) = enqueue_youtube_download(State(state.clone()), Path(task_id)).await?;
-    let state_label = state_info["status"].as_str().unwrap_or("queued");
-    Ok(download_conflict(
-        "YOUTUBE_DOWNLOAD_IN_PROGRESS",
-        &format!(
-            "download {state_label} in durable Rust worker; poll /tasks/{task_id}/youtube_download_progress and retry for the complete legacy asset response"
-        ),
-    ))
+    if matches!(latest.as_deref(), Some("pending" | "running" | "awaiting")) {
+        return Ok(download_conflict("YOUTUBE_DOWNLOAD_IN_PROGRESS", "youtube download is already in progress"));
+    }
+    // An explicit click can reopen a failed download; automatic enqueue cannot.
+    let workflow = state.scheduler.restart_at(task_id, Stage::Download,
+        json!({"manual_download_only":true,"legacy_auto_runtime_profile":false,"auto_publish":false,"auto_publish_platforms":[],"auto_dub_p2":false})).await?;
+    let executor = crate::executor::Executor::new(state.config.clone(), state.db.clone(), state.scheduler.clone(), state.storage.clone());
+    // Keep the durable operation alive even if the browser disconnects.
+    let worker = tokio::spawn(async move { executor.manual_download(task_id, workflow.id).await });
+    match worker.await {
+        Ok(Ok(())) => {},
+        Ok(Err(err)) => return Ok((StatusCode::BAD_GATEWAY, Json(json!({"detail":format!("youtube download failed: {err}")}))).into_response()),
+        Err(_) => return Err(AppError::Unavailable("YouTube download worker interrupted".into())),
+    }
+    // Return the same original DTO, using the now-completed asset branch.
+    Box::pin(native_youtube_download(State(state), Path(task_id))).await
 }
 
 async fn auto_dubbing(

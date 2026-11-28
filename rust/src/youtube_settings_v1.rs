@@ -1,6 +1,6 @@
 //! Native V1 YouTube settings facade.
-//! Original encrypted/DB-only cookies can be decoded in memory. New cookies
-//! use private files; downloads receive a disposable owner-readable copy.
+//! Preserve the original PostgreSQL cookie settings contract.
+//! Downloads receive a disposable copy; no persistent cookie file.
 //! No raw cookies in JSON responses, logs or V2 assets.
 use crate::{AppError, AppResult, Config, Database, api::AppState};
 use axum::{Json, Router, extract::State, routing::get};
@@ -13,7 +13,6 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::fs;
-use uuid::Uuid;
 
 const SETTING_KEY: &str = "youtube.settings";
 const MAX_COOKIES: usize = 200_000;
@@ -22,6 +21,7 @@ const MAX_PROXY: usize = 512;
 pub struct YoutubeRuntime {
     pub proxy: Option<String>,
     cookie_text: Option<String>,
+    cookies_enabled: bool,
     pub parallel: bool,
     pub connections: u8,
     pub compatibility: bool,
@@ -56,6 +56,7 @@ pub fn validate_proxy(s: &str) -> AppResult<Option<String>> {
     }
     Ok(Some(p.into()))
 }
+#[allow(dead_code)]
 fn trusted_domain(domain: &str) -> bool {
     const ROOTS: [&str; 6] = [
         "youtube.com",
@@ -73,63 +74,70 @@ fn trusted_domain(domain: &str) -> bool {
     })
 }
 pub fn validate_cookies(raw: &str) -> AppResult<String> {
-    let s = raw
-        .trim_start_matches('\u{feff}')
-        .replace("\r\n", "\n")
-        .replace('\r', "\n");
-    if s.len() > MAX_COOKIES {
-        return Err(AppError::Invalid("cookies.txt exceeds 200KB".into()));
+    let s = raw.trim_start_matches('\u{feff}').replace("\r\n", "\n").replace('\r', "\n");
+    if s.trim().is_empty() { return Ok(String::new()); }
+    let mut input = s.lines().peekable();
+    while input.peek().is_some_and(|v| v.trim().is_empty()) { input.next(); }
+    if input.peek().is_some_and(|v| v.starts_with("# Netscape HTTP Cookie File") || v.starts_with("# HTTP Cookie File")) {
+        input.next();
+        while let Some(line) = input.peek() {
+            if line.trim().is_empty() { input.next(); break; }
+            if line.trim_start().starts_with('#') && !line.trim_start().starts_with("#HttpOnly_") { input.next(); } else { break; }
+        }
     }
     let mut lines = Vec::new();
-    let mut count = 0;
-    for line in s.lines() {
-        if line.trim().is_empty() {
+    for line in input {
+        let line = line.trim();
+        if line.is_empty() || (line.starts_with('#') && !line.starts_with("#HttpOnly_")) {
+            lines.push(line.to_owned());
             continue;
         }
-        if line.starts_with('#') && !line.starts_with("#HttpOnly_") {
-            if !line.chars().any(|c| c == '\0') {
-                lines.push(line.to_owned());
-            }
-            continue;
+        let (prefix, data) = match line.strip_prefix("#HttpOnly_") {
+            Some(v) => ("#HttpOnly_", v), None => ("", line),
+        };
+        let mut parts: Vec<String> = if data.contains('\t') {
+            data.split('\t').map(str::to_owned).collect()
+        } else { data.split_whitespace().map(str::to_owned).collect() };
+        if parts.len() != 7 { return Err(AppError::Invalid("invalid Netscape cookie fields".into())); }
+        let mut domain = parts[0].trim().to_owned();
+        let mut flag = parts[1].trim().to_uppercase();
+        if flag != "TRUE" && flag != "FALSE" { flag = if domain.starts_with('.') {"TRUE"} else {"FALSE"}.into(); }
+        if flag == "TRUE" && !domain.starts_with('.') && domain.contains('.') { domain.insert(0,'.'); }
+        if domain.starts_with('.') { flag = "TRUE".into(); }
+        if (flag == "TRUE") != domain.starts_with('.') || (!parts[4].is_empty() && parts[4].parse::<i64>().is_err()) {
+            return Err(AppError::Invalid("invalid Netscape cookie fields".into()));
         }
-        let parts = line.split('\t').collect::<Vec<_>>();
-        if parts.len() != 7 || parts.iter().any(|v| v.chars().any(|c| c.is_control())) {
-            return Err(AppError::Invalid(
-                "cookies.txt must use Netscape tab-delimited fields".into(),
-            ));
-        }
-        let domain = parts[0]
-            .trim_start_matches("#HttpOnly_")
-            .trim_start_matches('.')
-            .to_ascii_lowercase();
-        if !trusted_domain(&domain)
-            || !matches!(parts[1], "TRUE" | "FALSE")
-            || !parts[2].starts_with('/')
-            || !matches!(parts[3], "TRUE" | "FALSE")
-            || parts[4].parse::<i64>().is_err()
-            || parts[5].is_empty()
-        {
-            return Err(AppError::Invalid(
-                "cookie domain/fields invalid or not YouTube/Google".into(),
-            ));
-        }
-        lines.push(line.to_owned());
-        count += 1;
+        parts[0] = domain;
+        parts[1] = flag;
+        lines.push(format!("{prefix}{}", parts.join("\t")));
     }
-    if count == 0 {
-        return Err(AppError::Invalid(
-            "cookies.txt has no Netscape cookie records".into(),
-        ));
-    }
-    Ok(format!(
-        "# Netscape HTTP Cookie File\n{}\n",
-        lines.join("\n")
-    ))
+    let normalized = format!("# Netscape HTTP Cookie File\n# http://curl.haxx.se/rfc/cookie_spec.html\n# This is a generated file!  Do not edit.\n\n{}\n", lines.join("\n").trim_end());
+    if normalized.chars().count() > MAX_COOKIES { return Err(AppError::Invalid("cookies.txt exceeds limit".into())); }
+    Ok(normalized)
 }
-pub async fn prepare_cookie_copy(
+/// The original environment cookie file takes precedence over DB cookies.
+fn configured_cookie_file() -> Option<PathBuf> {
+    std::env::var("YOUTUBE_COOKIE_FILE").ok().map(|s|s.trim().to_owned()).filter(|s|!s.is_empty()).map(PathBuf::from)
+}
+pub(crate) enum CookieInput {
+    Configured(PathBuf),
+    Temporary(tempfile::TempDir),
+}
+impl CookieInput {
+    pub(crate) fn path(&self) -> PathBuf {
+        match self { Self::Configured(path)=>path.clone(), Self::Temporary(dir)=>dir.path().join("cookies.txt") }
+    }
+}
+fn select_cookie_file(configured: Option<PathBuf>, enabled: bool) -> Option<PathBuf> {
+    configured.filter(|p| !enabled || p.is_file())
+}
+pub(crate) async fn prepare_cookie_copy(
     config: &Config,
     settings: &YoutubeRuntime,
-) -> AppResult<Option<tempfile::TempDir>> {
+) -> AppResult<Option<CookieInput>> {
+    if let Some(path)=select_cookie_file(configured_cookie_file(), settings.cookies_enabled) {
+        return Ok(Some(CookieInput::Configured(path)));
+    }
     let Some(raw) = settings.cookie_text.as_deref() else {
         return Ok(None);
     };
@@ -156,66 +164,9 @@ pub async fn prepare_cookie_copy(
             "secure cookies require Unix permissions".into(),
         ));
     }
-    Ok(Some(temp))
+    Ok(Some(CookieInput::Temporary(temp)))
 }
 
-fn cookie_path(config: &Config) -> PathBuf {
-    config
-        .storage_root
-        .join(".videoroll-private")
-        .join("youtube-cookies.txt")
-}
-pub(crate) async fn read_cookie(config: &Config) -> AppResult<Option<String>> {
-    let file = cookie_path(config);
-    let dir = config.storage_root.join(".videoroll-private");
-    match fs::symlink_metadata(&dir).await {
-        Ok(m) if m.is_dir() && !m.file_type().is_symlink() => {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                if m.permissions().mode() & 0o077 != 0 {
-                    return Err(AppError::Invalid(
-                        "YouTube cookie directory permissions must be 0700".into(),
-                    ));
-                }
-            }
-        }
-        Ok(_) => {
-            return Err(AppError::Invalid(
-                "YouTube cookie directory is not a safe directory".into(),
-            ));
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e.into()),
-    }
-    match fs::symlink_metadata(&file).await {
-        Ok(metadata) => {
-            if !metadata.is_file()
-                || metadata.file_type().is_symlink()
-                || metadata.len() > MAX_COOKIES as u64 + 10_000
-            {
-                return Err(AppError::Invalid(
-                    "V2 cookies file is not a bounded regular file".into(),
-                ));
-            }
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                if metadata.permissions().mode() & 0o077 != 0 {
-                    return Err(AppError::Invalid(
-                        "YouTube cookie file permissions must be 0600".into(),
-                    ));
-                }
-            }
-            let bytes = fs::read(&file).await?;
-            let value = String::from_utf8(bytes)
-                .map_err(|_| AppError::Invalid("invalid cookie file UTF8".into()))?;
-            Ok(Some(validate_cookies(&value)?))
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e.into()),
-    }
-}
 #[cfg(unix)]
 async fn private_dir(config: &Config) -> AppResult<PathBuf> {
     let dir = config.storage_root.join(".videoroll-private");
@@ -263,49 +214,6 @@ async fn private_dir(config: &Config) -> AppResult<PathBuf> {
 async fn private_dir(_config: &Config) -> AppResult<PathBuf> {
     Err(AppError::Unavailable("secure cookies require Unix".into()))
 }
-#[cfg(unix)]
-async fn save_cookie(config: &Config, value: Option<&str>) -> AppResult<()> {
-    let dir = private_dir(config).await?;
-    let path = cookie_path(config);
-    if let Some(raw) = value {
-        let temp = dir.join(format!(".youtube-{}.tmp", Uuid::new_v4()));
-        let mut file = fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .mode(0o600)
-            .open(&temp)
-            .await?;
-        use tokio::io::AsyncWriteExt;
-        let result = async {
-            file.write_all(raw.as_bytes()).await?;
-            file.sync_all().await?;
-            Ok::<_, std::io::Error>(())
-        }
-        .await;
-        drop(file);
-        if let Err(err) = result {
-            let _ = fs::remove_file(&temp).await;
-            return Err(err.into());
-        }
-        if let Err(err) = fs::rename(&temp, &path).await {
-            let _ = fs::remove_file(&temp).await;
-            return Err(err.into());
-        }
-    } else {
-        match fs::remove_file(path).await {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e.into()),
-        }
-    }
-    Ok(())
-}
-#[cfg(not(unix))]
-async fn save_cookie(_config: &Config, _value: Option<&str>) -> AppResult<()> {
-    Err(AppError::Unavailable(
-        "secure cookie storage requires Unix file permissions".into(),
-    ))
-}
 pub(crate) async fn read_settings(db: &Database) -> AppResult<Value> {
     // Use original settings including proxy, credentials and concurrency.
     let own: Option<Value> = sqlx::query_scalar("SELECT value_json FROM app_settings WHERE key=$1")
@@ -314,7 +222,7 @@ pub(crate) async fn read_settings(db: &Database) -> AppResult<Value> {
         .await?;
     Ok(own.unwrap_or(json!({})))
 }
-pub(crate) async fn effective_cookie(config: &Config, stored: &Value) -> AppResult<Option<String>> {
+pub(crate) async fn effective_cookie(_config: &Config, stored: &Value) -> AppResult<Option<String>> {
     if let Some(encoded) = stored
         .get("cookies_txt_enc")
         .and_then(Value::as_str)
@@ -324,10 +232,12 @@ pub(crate) async fn effective_cookie(config: &Config, stored: &Value) -> AppResu
             .ok_or_else(|| AppError::Invalid("empty legacy YouTube cookie".into()))?;
         return Ok(Some(validate_cookies(&text)?));
     }
-    read_cookie(config).await
+    Ok(None)
 }
 fn runtime_from_json(value: &Value, cookie_text: Option<String>) -> AppResult<YoutubeRuntime> {
-    let proxy = validate_proxy(value.get("proxy").and_then(Value::as_str).unwrap_or(""))?;
+    let default_proxy = std::env::var("YOUTUBE_PROXY").unwrap_or_default();
+    // An absent key uses the environment; an explicitly cleared value does not.
+    let proxy = validate_proxy(match value.get("proxy") { None => &default_proxy, Some(v) => v.as_str().unwrap_or("") })?;
     let parallel = value
         .get("parallel_download_enabled")
         .and_then(Value::as_bool)
@@ -344,14 +254,10 @@ fn runtime_from_json(value: &Value, cookie_text: Option<String>) -> AppResult<Yo
     let enabled = value
         .get("cookies_enabled")
         .and_then(Value::as_bool)
-        .unwrap_or(false);
-    if enabled && cookie_text.is_none() {
-        return Err(AppError::Invalid(
-            "YouTube cookies enabled but no valid cookies.txt available".into(),
-        ));
-    }
+        .unwrap_or(cookie_text.is_some());
     Ok(YoutubeRuntime {
         proxy,
+        cookies_enabled: enabled,
         cookie_text: if enabled { cookie_text } else { None },
         parallel,
         connections: connections as u8,
@@ -363,14 +269,10 @@ fn runtime_from_json(value: &Value, cookie_text: Option<String>) -> AppResult<Yo
 }
 pub async fn runtime(db: &Database, config: &Config) -> AppResult<YoutubeRuntime> {
     let stored = read_settings(db).await?;
-    let cookies = if stored
-        .get("cookies_enabled")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-    {
-        effective_cookie(config, &stored).await?
-    } else {
+    let cookies = if stored.get("cookies_enabled").and_then(Value::as_bool) == Some(false) {
         None
+    } else {
+        effective_cookie(config, &stored).await?
     };
     runtime_from_json(&stored, cookies)
 }
@@ -389,8 +291,9 @@ fn summary(value: &str) -> Value {
             continue;
         }
         count += 1;
-        domains.insert(p[0].trim_start_matches("#HttpOnly_").to_string());
-        auth |= matches!(p[5], "SID" | "SAPISID" | "__Secure-3PSID" | "LOGIN_INFO");
+        let domain=p[0].trim_start_matches("#HttpOnly_").trim().trim_start_matches('.').to_ascii_lowercase();
+        if !domain.is_empty() { domains.insert(domain); }
+        auth |= matches!(p[5], "SID" | "HSID" | "SSID" | "APISID" | "SAPISID" | "__Secure-1PSID" | "__Secure-3PSID" | "__Secure-1PAPISID" | "__Secure-3PAPISID" | "LOGIN_INFO");
         visitor |= p[5] == "VISITOR_INFO1_LIVE";
         captcha |= p[5] == "GOOGLE_ABUSE_EXEMPTION";
     }
@@ -467,14 +370,14 @@ async fn snapshot(state: &AppState) -> AppResult<Value> {
     let mut result = json!({
         "proxy":runtime.proxy.unwrap_or_default(),
         "cookies_set":cookies.is_some(),
-        "cookies_enabled":stored.get("cookies_enabled").and_then(Value::as_bool).unwrap_or(false),
+        "cookies_enabled":stored.get("cookies_enabled").and_then(Value::as_bool).unwrap_or(cookies.is_some()),
         "compatibility_mode_enabled":runtime.compatibility,
         "parallel_download_enabled":runtime.parallel,
         "parallel_download_connections":runtime.connections,
         "cookies_updated_at":stored.get("cookies_updated_at"),
-        // This is a private V2-managed file, NOT the legacy YOUTUBE_COOKIE_FILE env option.
-        "cookie_file_configured":false,
-        "cookie_file_exists":false,
+        // The original environment file option is separate from DB-managed cookies.
+        "cookie_file_configured":configured_cookie_file().is_some(),
+        "cookie_file_exists":configured_cookie_file().is_some_and(|p|p.is_file()),
         "home_scan_enabled":stored.get("home_scan_enabled").and_then(Value::as_bool).unwrap_or(false),
         "home_scan_interval_minutes":stored.get("home_scan_interval_minutes").and_then(Value::as_i64).unwrap_or(60).clamp(1,1440),
         "home_scan_limit":stored.get("home_scan_limit").and_then(Value::as_i64).unwrap_or(10).clamp(1,100),
@@ -562,7 +465,7 @@ async fn update(State(state): State<AppState>, Json(patch): Json<Value>) -> AppR
                 let input = value
                     .as_str()
                     .ok_or_else(|| AppError::Invalid("proxy must be a string".into()))?;
-                merged.insert(key.clone(), json!(validate_proxy(input)?));
+                merged.insert(key.clone(), json!(validate_proxy(input)?.unwrap_or_default()));
             }
             "cookies_txt" => {
                 let input = value
@@ -571,7 +474,7 @@ async fn update(State(state): State<AppState>, Json(patch): Json<Value>) -> AppR
                 merged.remove("cookies_txt_enc");
                 if input.trim().is_empty() {
                     merged.insert("cookies_enabled".into(), json!(false));
-                    merged.insert("cookies_updated_at".into(), Value::Null);
+                    merged.remove("cookies_updated_at");
                     next_cookie = Some(None);
                 } else {
                     let verified = validate_cookies(input)?;
@@ -619,12 +522,20 @@ async fn update(State(state): State<AppState>, Json(patch): Json<Value>) -> AppR
         }
     }
     let effective = next_cookie.as_ref().cloned().unwrap_or(old_cookie);
+    // Original update validates explicit enablement, not unrelated settings reads.
+    if updates.get("cookies_enabled").and_then(Value::as_bool)==Some(true)
+        && effective.as_deref().is_none_or(|s|s.trim().is_empty()) {
+        return Err(AppError::Invalid("cookies_txt is not set; paste cookies.txt first".into()));
+    }
     runtime_from_json(&Value::Object(merged.clone()), effective)?;
-    // Persist the new private cookie before the DB points to it. Filesystem
-    // failure never enables a missing cookie. A DB failure leaves an inert
-    // private file, not a published asset.
-    if let Some(change) = next_cookie.as_ref() {
-        save_cookie(&state.config, change.as_deref()).await?;
+    // Preserve the original settings field and Python database representation.
+    // Replacement, enablement and timestamp commit in the same transaction.
+    if let Some(Some(raw)) = next_cookie.as_ref() {
+        merged.insert("cookies_txt_enc".into(), json!(crate::secret_compat::encode(raw)));
+    } else if next_cookie.is_none() && updates.get("cookies_enabled").and_then(Value::as_bool)==Some(true) {
+        if let Some(raw)=effective_cookie(&state.config, &old).await? {
+            merged.insert("cookies_txt_enc".into(), json!(crate::secret_compat::encode(&raw)));
+        }
     }
     sqlx::query(
         "INSERT INTO app_settings(key,value_json,version) VALUES($1,$2,1)
@@ -705,9 +616,28 @@ mod tests {
         let cleaned = validate_cookies(correct).unwrap();
         assert!(cleaned.starts_with("# Netscape"));
         assert!(cleaned.contains("SID\tsecret"));
-        assert!(validate_cookies(".evil.test\tTRUE\t/\tTRUE\t1788912012\tSID\tsecret").is_err());
+        assert!(validate_cookies(".example.test\tTRUE\t/\tTRUE\t1788912012\tSID\tfixture").is_ok());
+        assert!(validate_cookies("youtube.com true / TRUE 0 SID fixture").unwrap().contains(".youtube.com\tTRUE\t/\tTRUE\t0\tSID\tfixture"));
         assert!(validate_cookies("Cookie: SID=secret").is_err());
         assert!(validate_cookies("not-a-cookie").is_err());
+    }
+    #[test]
+    fn explicit_empty_proxy_and_cookie_summary_match_original() {
+        assert!(runtime_from_json(&json!({"proxy":null}),None).unwrap().proxy.is_none());
+        assert!(runtime_from_json(&json!({"proxy":""}),None).unwrap().proxy.is_none());
+        let result=summary("#HttpOnly_.youtube.com\tTRUE\t/\tTRUE\t0\tHSID\tfixture");
+        assert_eq!(result["cookies_has_auth"],true);
+    }
+    #[test]
+    fn original_cookie_file_precedence() {
+        let dir=tempfile::tempdir().unwrap();
+        let path=dir.path().join("fixture.txt");
+        assert_eq!(select_cookie_file(Some(path.clone()),true),None);
+        assert_eq!(select_cookie_file(Some(path.clone()),false),Some(path.clone()));
+        std::fs::write(&path,"fixture").unwrap();
+        assert_eq!(select_cookie_file(Some(path.clone()),true),Some(path));
+        let s=summary(".youtube.com\tTRUE\t/\tTRUE\t0\tSID\tfixture\nyoutube.com\tFALSE\t/\tTRUE\t0\tHSID\tfixture");
+        assert_eq!(s["cookies_domains_count"],1);
     }
     #[test]
     fn reject_proxy_credentials_and_arbitrary_schemes() {

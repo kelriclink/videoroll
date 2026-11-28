@@ -459,6 +459,9 @@ fi
 export VIDEOROLL_V2_YT_DLP="$repo_root/rust/tests/mock_source_feed.sh"
 export VIDEOROLL_V2_MOCK_YT_LOG="$repo_root/rust/target/v2-mock-ytdlp-args.log"
 : > "$VIDEOROLL_V2_MOCK_YT_LOG"
+# Manual-download regression must have a real media fixture before API startup.
+export VIDEOROLL_V2_MOCK_YT_VIDEO="$repo_root/rust/target/v2-v1-local-upload.mp4"
+ffmpeg -hide_banner -nostdin -loglevel error -f lavfi -i 'color=c=black:s=160x90:r=25' -f lavfi -i 'sine=frequency=470:sample_rate=44100' -t 1.5 -c:v libx264 -pix_fmt yuv420p -c:a aac -shortest -y "$VIDEOROLL_V2_MOCK_YT_VIDEO"
 export VIDEOROLL_V2_INDEX_ENDPOINT="http://127.0.0.1:18082/v1/chat/completions"
 export VIDEOROLL_V2_COMPAT_URL="http://127.0.0.1:18083"
 export VIDEOROLL_V2_SOCIAL_PUBLISHER_URL="http://127.0.0.1:18085"
@@ -939,9 +942,8 @@ v=json.loads(os.environ["COOKIE_UPLOADED"])
 assert v["cookies_enabled"] and v["cookies_set"] and v["cookies_count"]==1,v
 assert v["cookies_has_auth"] and "test-cookie-secret" not in str(v),v
 PYCOOKIESETTINGS
-test "$(stat -c '%a' "$VIDEOROLL_V2_STORAGE_ROOT/.videoroll-private")" = 700
-test "$(stat -c '%a' "$VIDEOROLL_V2_STORAGE_ROOT/.videoroll-private/youtube-cookies.txt")" = 600
-! docker exec "$container_name" psql -At -U postgres -d videoroll_test -c  "SELECT value_json::text FROM app_settings WHERE key='youtube.settings'" | grep -q 'test-cookie-secret'
+test ! -e "$VIDEOROLL_V2_STORAGE_ROOT/.videoroll-private/youtube-cookies.txt"
+test "$(docker exec "$container_name" psql -At -U postgres -d videoroll_test -c "SELECT (value_json->>'cookies_txt_enc' LIKE 'dbplain:v1:%') FROM app_settings WHERE key='youtube.settings'")" = t
 test "$(curl --silent -o /dev/null -w '%{http_code}' "${hdr[@]}" -X POST  -d '{"url":"http://127.0.0.1/admin"}'  "http://127.0.0.1:18080/api/v1/settings/youtube/test")" = 400
 echo 'PASS: original YouTube settings native proxy/concurrency/compatibility and private Netscape cookies'
 

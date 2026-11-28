@@ -258,6 +258,10 @@ pub async fn download_youtube(
         .to_string_lossy()
         .replace('\\', "/");
     let (digest, size) = registry.sha256(&key).await?;
+    // The downloader emits its own info JSON from the same extraction that
+    // produced the video. Avoid a second network request after media succeeds.
+    let info_path = video.with_extension("info.json");
+    let downloaded_info = crate::youtube_meta::read_downloaded_info(registry, &info_path, &source).await?;
     if let Some((old_key, expected, expected_size)) = missing_source {
         if !expected.eq_ignore_ascii_case(&digest) || expected_size.is_some_and(|v| v != size) {
             return Err(AppError::Conflict("redownloaded source differs from historical asset; reconcile before using derived media".into()));
@@ -300,8 +304,11 @@ pub async fn download_youtube(
         "INSERT INTO assets(id,task_id,kind,storage_key,sha256,size_bytes) SELECT $1,$2,'video_raw'::asset_kind,$3,$4,$5 WHERE NOT EXISTS(SELECT 1 FROM assets WHERE task_id=$2 AND kind='video_raw'::asset_kind AND storage_key=$3)"
     ).bind(Uuid::new_v4()).bind(job.task_id).bind(&key).bind(&digest).bind(size)
         .execute(&mut *tx).await?;
+    if let Some(info) = downloaded_info.as_ref() {
+        crate::youtube_meta::persist_downloaded_info(&mut tx, job.task_id, info, &source).await?;
+    }
     sqlx::query(
-        "UPDATE tasks SET status='downloaded'::task_status,updated_at=now() WHERE id=$1 AND status IN ('created'::task_status,'ingested'::task_status)"
+        "UPDATE tasks SET status='downloaded'::task_status,error_code=NULL,error_message=NULL,updated_at=now() WHERE id=$1 AND status IN ('created'::task_status,'ingested'::task_status)"
     ).bind(job.task_id).execute(&mut *tx).await?;
     tx.commit().await?;
     Ok(serde_json::json!({"storage_key":key,"sha256":digest,"size_bytes":size}))

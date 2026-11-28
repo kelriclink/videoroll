@@ -299,17 +299,59 @@ impl Executor {
         }
     }
     pub async fn worker_loop(&self, worker_index: usize) {
+        self.worker_loop_inner(worker_index, None).await;
+    }
+    /// Execute the original synchronous manual-download operation with the same
+    /// durable claim and heartbeat as the automatic worker. No new HTTP route.
+    pub(crate) async fn manual_download(&self, task: uuid::Uuid, workflow: uuid::Uuid) -> AppResult<()> {
+        let f = self.scheduler.workflow(workflow).await?;
+        if f.task_id != task || f.configuration["manual_download_only"].as_bool() != Some(true) || f.current_stage != "download" {
+            return Err(AppError::Conflict("not a manual download workflow".into()));
+        }
+        self.worker_loop_inner(0, Some((task, workflow))).await;
+        let f = self.scheduler.workflow(workflow).await?;
+        if f.state == "succeeded" { Ok(()) } else {
+            Err(AppError::Unavailable(f.last_error.unwrap_or_else(|| "YouTube download did not complete".into())))
+        }
+    }
+    /// A single explicitly identified workflow, without global maintenance or publication.
+    pub async fn trial_worker(&self, task: uuid::Uuid, workflow: uuid::Uuid) -> AppResult<()> {
+        let f = self.scheduler.workflow(workflow).await?;
+        if f.task_id != task || f.configuration["auto_publish"].as_bool() != Some(false)
+            || f.configuration["auto_dub_p2"].as_bool() != Some(false)
+            || f.configuration.get("after_render_publish").is_some()
+            || f.configuration.get("bilibili_direct_v1").is_some() {
+            return Err(AppError::Conflict("trial requires explicit media-only workflow configuration".into()));
+        }
+        self.worker_loop_inner(0, Some((task, workflow))).await;
+        let f = self.scheduler.workflow(workflow).await?;
+        if f.state == "succeeded" { Ok(()) } else {
+            Err(AppError::Conflict(format!("trial ended in {}: {:?}",f.state,f.last_error)))
+        }
+    }
+    async fn worker_loop_inner(&self, worker_index: usize, scope: Option<(uuid::Uuid,uuid::Uuid)>) {
         loop {
-            if let Err(e) = self.scheduler.quarantine_expired_publish().await {
-                warn!(worker_index,error=%e,"expired publish audit unavailable");
+            if let Some((task,workflow))=scope {
+                match self.scheduler.workflow(workflow).await {
+                    Ok(f) if f.task_id==task && f.state=="running" => {},
+                    _ => return,
+                }
+            } else {
+                if let Err(e) = self.scheduler.quarantine_expired_publish().await {
+                    warn!(worker_index,error=%e,"expired publish audit unavailable");
+                }
+                if let Err(e) = self.scheduler.reconcile_exhausted_jobs().await {
+                    warn!(worker_index,error=%e,"expired stage recovery unavailable");
+                }
             }
-            if let Err(e) = self.scheduler.reconcile_exhausted_jobs().await {
-                warn!(worker_index,error=%e,"expired stage recovery unavailable");
-            }
-            match self.scheduler.claim().await {
+            match self.scheduler.claim_scoped(scope).await {
                 Ok(Some(job)) => {
                     info!(worker_index,job_id=%job.id,stage=%job.stage.as_str(),"stage started");
-                    let mut future = Box::pin(self.execute(&job));
+                    let mut future = Box::pin(async {
+                        if scope.is_some() && matches!(job.stage, Stage::Dubbing | Stage::Publish | Stage::Cleanup) {
+                            Ok(StageOutcome::Skipped { reason: "media-only trial: retain output, no external submission".into() })
+                        } else { self.execute(&job).await }
+                    });
                     let mut tick = interval(Duration::from_secs(30));
                     let outcome = loop {
                         tokio::select! {

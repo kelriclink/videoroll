@@ -54,6 +54,49 @@ pub(crate) fn meta_view(value: &Value, fallback: &str) -> AppResult<Value> {
           .filter(|d| d.is_finite() && *d>=0.0).map(|d|d as u64)
     }))
 }
+pub(crate) struct DownloadedInfo {
+    key: String,
+    sha: String,
+    size: i64,
+    value: Value,
+}
+/// Read the info JSON produced by the same successful download. Older
+/// completed staging directories may predate --write-info-json.
+pub(crate) async fn read_downloaded_info(registry: &crate::storage::AssetRegistry, path: &std::path::Path, url: &str) -> AppResult<Option<DownloadedInfo>> {
+    let meta = match fs::symlink_metadata(path).await {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    if !meta.is_file() || meta.len() > MAX_INFO as u64 { return Err(AppError::Invalid("downloaded YouTube metadata invalid".into())); }
+    let bytes = fs::read(path).await?;
+    let value: Value = serde_json::from_slice(&bytes).map_err(|_| AppError::Invalid("downloaded YouTube metadata is not JSON".into()))?;
+    if value.get("id").and_then(Value::as_str) != Some(crate::ingest::youtube_video_id(url)?.as_str()) {
+        return Err(AppError::Invalid("downloaded YouTube metadata ID mismatch".into()));
+    }
+    meta_view(&value, url)?;
+    let root = fs::canonicalize(&registry.root).await?;
+    let canonical = fs::canonicalize(path).await?;
+    let key = canonical.strip_prefix(root).map_err(|_| AppError::Invalid("metadata outside storage root".into()))?.to_string_lossy().into_owned();
+    Ok(Some(DownloadedInfo { key, sha:hex::encode(Sha256::digest(&bytes)),size:bytes.len() as i64,value }))
+}
+/// Match Python snapshot_downloaded_youtube_info and commit alongside raw media.
+pub(crate) async fn persist_downloaded_info(tx: &mut sqlx::Transaction<'_,sqlx::Postgres>, task: Uuid, info: &DownloadedInfo, url: &str) -> AppResult<()> {
+    let value = &info.value;
+    let view = meta_view(value,url)?;
+    let uploader = value.get("uploader").and_then(Value::as_str).filter(|s| !s.trim().is_empty()).or_else(|| value.get("channel").and_then(Value::as_str)).map(|s| s.trim().chars().take(256).collect::<String>());
+    let date = value.get("upload_date").and_then(Value::as_str).map(|s|s.trim().chars().take(32).collect::<String>());
+    let duration = view["duration"].as_u64().and_then(|d|i32::try_from(d).ok());
+    sqlx::query("INSERT INTO youtube_video_meta(task_id,source_id,title,description,webpage_url,uploader,upload_date,duration) VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT(task_id) DO UPDATE SET source_id=EXCLUDED.source_id,title=EXCLUDED.title,description=EXCLUDED.description,webpage_url=EXCLUDED.webpage_url,uploader=EXCLUDED.uploader,upload_date=EXCLUDED.upload_date,duration=EXCLUDED.duration,updated_at=now()")
+        .bind(task).bind(value["id"].as_str()).bind(view["title"].as_str().unwrap_or_default()).bind(value["description"].as_str().unwrap_or_default()).bind(view["webpage_url"].as_str().unwrap_or(url)).bind(uploader).bind(date).bind(duration).execute(&mut **tx).await?;
+    sqlx::query("INSERT INTO storage_objects(storage_key,checksum_sha256,size_bytes,state,retain_until) VALUES($1,$2,$3,'live',now()+interval '2 days') ON CONFLICT(storage_key) DO NOTHING")
+        .bind(&info.key).bind(&info.sha).bind(info.size).execute(&mut **tx).await?;
+    sqlx::query("INSERT INTO storage_object_refs(storage_key,owner_type,owner_id,role) VALUES($1,'task',$2,'metadata_json') ON CONFLICT DO NOTHING")
+        .bind(&info.key).bind(task).execute(&mut **tx).await?;
+    sqlx::query("INSERT INTO assets(id,task_id,kind,storage_key,sha256,size_bytes) SELECT $1,$2,'metadata_json'::asset_kind,$3,$4,$5 WHERE NOT EXISTS(SELECT 1 FROM assets WHERE task_id=$2 AND kind='metadata_json'::asset_kind AND storage_key=$3)")
+        .bind(Uuid::new_v4()).bind(task).bind(&info.key).bind(&info.sha).bind(info.size).execute(&mut **tx).await?;
+    Ok(())
+}
 pub(crate) async fn latest_info(
     state: &AppState,
     id: Uuid,
@@ -61,7 +104,6 @@ pub(crate) async fn latest_info(
     let asset = sqlx::query_as::<_, AssetInfo>(
         "SELECT id,task_id,kind::text,storage_key,sha256,size_bytes,duration_ms,created_at
          FROM assets WHERE task_id=$1 AND kind='metadata_json'::asset_kind
-         AND storage_key LIKE 'v2/%'
          ORDER BY created_at DESC,id DESC LIMIT 1",
     )
     .bind(id)
@@ -105,23 +147,20 @@ async fn extract_info(
     let cookies = crate::youtube_settings_v1::prepare_cookie_copy(config, settings).await?;
     let mut process = Command::new(&config.download_binary);
     process
+        .args(crate::download_runtime::original_transport_args())
         .arg("--ignore-config")
         .arg("--no-playlist")
         .arg("--skip-download")
         .arg("--dump-single-json")
         .arg("--no-warnings");
-    if settings.compatibility {
-        process
-            .arg("--extractor-args")
-            .arg("youtube:player_client=default,web_embedded");
-    }
+    process.args(crate::download_runtime::original_extractor_args(settings.compatibility,None)?);
     if let Some(proxy) = settings.proxy.as_deref() {
         process.arg("--proxy").arg(proxy);
     }
     if let Some(secret) = cookies.as_ref() {
         process
             .arg("--cookies")
-            .arg(secret.path().join("cookies.txt"));
+            .arg(secret.path());
     }
     process
         .arg("--")
@@ -280,11 +319,49 @@ pub(crate) async fn fetch_metadata(
         }
     }
 }
-async fn progress(State(state): State<AppState>, Path(id): Path<Uuid>) -> AppResult<Json<Value>> {
-    let task = read_task(&state.db, id).await?;
-    if task.source_type != "youtube" {
-        return Err(AppError::Invalid("not a YouTube task".into()));
+/// Original Python durable progress fallback and operation status projection.
+/// Read only: never adopt a historical operation merely because a page is opened.
+async fn historical_progress(state: &AppState, id: Uuid) -> AppResult<Value> {
+    let stored: Option<Value> = sqlx::query_scalar("SELECT value_json FROM app_settings WHERE key=$1")
+        .bind(format!("youtube.download_progress.{id}")).fetch_optional(&state.db.pool).await?;
+    let mut data=json!({"task_id":id,"status":"idle","active":false,"progress":0,
+        "downloaded_bytes":0,"total_bytes":null,"speed_bytes_per_second":null,
+        "eta_seconds":null,"filename":null,"error":null,"updated_at":null});
+    if let Some(stored)=stored.as_ref().and_then(Value::as_object) {
+        for (key,value) in data.as_object_mut().unwrap() {
+            if key!="task_id" { if let Some(old)=stored.get(key) { *value=old.clone(); } }
+        }
     }
+    let row=sqlx::query("SELECT status,lease_until,updated_at,last_error FROM operation_inbox WHERE operation_key=$1")
+        .bind(format!("youtube-download:{id}")).fetch_optional(&state.db.pool).await?;
+    if let Some(row)=row {
+        let status:String=row.try_get("status")?;
+        let lease:Option<chrono::DateTime<chrono::Utc>>=row.try_get("lease_until")?;
+        let updated:chrono::DateTime<chrono::Utc>=row.try_get("updated_at")?;
+        let error:Option<String>=row.try_get("last_error")?;
+        match status.as_str() {
+            "processing" if lease.is_none_or(|t|t<=chrono::Utc::now()) => {
+                data["status"]=json!("queued"); data["active"]=json!(false);
+                data["error"]=json!("Download owner lost; awaiting lease recovery");
+                data["updated_at"]=json!(updated.to_rfc3339());
+            }
+            "queued"|"pending" => {
+                data["status"]=json!("queued"); data["active"]=json!(false);
+                data["error"]=json!(error); data["updated_at"]=json!(updated.to_rfc3339());
+            }
+            "failed" => { data["status"]=json!("failed"); data["active"]=json!(false); data["error"]=json!(error); }
+            "completed" => { data["status"]=json!("completed"); data["active"]=json!(false); data["progress"]=json!(100); data["error"]=Value::Null; }
+            "processing" => { data["active"]=json!(true); }
+            _ => {}
+        }
+    }
+    Ok(data)
+}
+async fn progress(State(state): State<AppState>, Path(id): Path<Uuid>) -> AppResult<Json<Value>> {
+    // Original endpoint checks the task table, not the Rust ownership-filtered view.
+    let exists:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM tasks WHERE id=$1)")
+        .bind(id).fetch_one(&state.db.pool).await?;
+    if !exists { return Err(AppError::NotFound("task not found".into())); }
     let row = sqlx::query(
         "SELECT id,state,attempts,last_error,updated_at,lease_until FROM vr2_jobs
          WHERE task_id=$1 AND stage='download'
@@ -293,6 +370,7 @@ async fn progress(State(state): State<AppState>, Path(id): Path<Uuid>) -> AppRes
     .bind(id)
     .fetch_optional(&state.db.pool)
     .await?;
+    if row.is_none() { return Ok(Json(historical_progress(&state,id).await?)); }
     let stored_progress = crate::download_runtime::active_progress(&state.db, id).await?;
     let (status, active, percentage, error, updated, live_metrics) = if let Some(row) = row {
         let state: String = row.try_get("state")?;
@@ -319,7 +397,7 @@ async fn progress(State(state): State<AppState>, Path(id): Path<Uuid>) -> AppRes
             } else {
                 0
             },
-            row.try_get::<Option<String>, _>("last_error")?,
+            if state=="succeeded" { None } else { row.try_get::<Option<String>, _>("last_error")? },
             row.try_get::<chrono::DateTime<chrono::Utc>, _>("updated_at")?
                 .to_rfc3339(),
             if active {
@@ -333,7 +411,7 @@ async fn progress(State(state): State<AppState>, Path(id): Path<Uuid>) -> AppRes
     };
     let asset: Option<(String, Option<i64>)> = sqlx::query_as(
         "SELECT storage_key,size_bytes FROM assets
-         WHERE task_id=$1 AND kind='video_raw'::asset_kind AND storage_key LIKE 'v2/%'
+         WHERE task_id=$1 AND kind='video_raw'::asset_kind
          ORDER BY created_at DESC,id DESC LIMIT 1",
     )
     .bind(id)
