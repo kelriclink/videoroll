@@ -248,7 +248,7 @@ impl Executor {
                 // publication merely because another target is still running.
                 let batched: bool = sqlx::query_scalar(
                     "SELECT EXISTS(SELECT 1 FROM vr2_workflows w JOIN publish_jobs j
-                    ON j.id::text=w.configuration->'bilibili_direct_v1'->>'publish_job_id'
+                    ON j.id::text=COALESCE(w.configuration->'bilibili_direct_v1'->>'publish_job_id',w.configuration->>'bilibili_auto_job_id')
                     WHERE w.id=$1 AND j.task_id=$2 AND j.batch_id IS NOT NULL)",
                 )
                 .bind(item.workflow_id)

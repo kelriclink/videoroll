@@ -693,7 +693,7 @@ pub(crate) async fn register_automatic(
     // This synchronous stage advances its own workflow, unlike mixed auto_parent.
     let batch=Uuid::new_v4();
     let expected=json!([{"key":"bilibili:default","platform":"bilibili","account_id":null}]);
-    let request=json!({"platforms":["bilibili"],"account_id":null,"video_key":video.0,"video_parts":snapshot["video_parts"],"cover_key":cover,"meta":meta,"typeid_mode":mode});
+    let request=json!({"runtime":"rust-auto-bilibili-v1","platforms":["bilibili"],"account_id":null,"video_key":video.0,"video_parts":snapshot["video_parts"],"cover_key":cover,"meta":meta,"typeid_mode":mode});
     sqlx::query("INSERT INTO publish_batches(id,task_id,state,expected_targets,request_json) VALUES($1,$2,'active',$3,$4)")
         .bind(batch).bind(job.task_id).bind(expected).bind(request).execute(&mut *tx).await?;
     sqlx::query("INSERT INTO publish_jobs(id,task_id,platform,meta_json,cover_key,state,operation_key,lease_owner,lease_until,batch_id) VALUES($1,$2,'bilibili',$3,$4,'submitting',$5,'rust-v2',now()+interval '48 hours',$6)")

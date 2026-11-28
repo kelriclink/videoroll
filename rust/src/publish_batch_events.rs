@@ -183,7 +183,7 @@ async fn consume(db: &Database, id: Uuid, batch: Uuid, task: Uuid) -> AppResult<
             .await?;
         } else {
             let flow:Option<Uuid>=sqlx::query_scalar("SELECT w.id FROM vr2_workflows w JOIN publish_jobs j
-              ON j.id::text=w.configuration->'bilibili_direct_v1'->>'publish_job_id'
+              ON j.id::text=COALESCE(w.configuration->'bilibili_direct_v1'->>'publish_job_id',w.configuration->>'bilibili_auto_job_id')
               WHERE w.task_id=$1 AND j.task_id=$1 AND j.batch_id=$2 ORDER BY w.generation DESC LIMIT 1")
                 .bind(task).bind(batch).fetch_optional(&mut *tx).await?;
             if let Some(flow) = flow {
