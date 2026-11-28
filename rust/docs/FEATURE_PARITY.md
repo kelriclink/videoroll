@@ -67,6 +67,13 @@
 - 原 Python 同一实际黑洞源/ASS 测试 `/4t/vr2-encode-vbr-study.Fg5CvT/results.log`：CQP24 + copy 67,981,666 bytes / 8.623s；CQP24 + AAC/faststart 68,690,483 bytes / 8.36s（单次对照不支持音频转码是两倍耗时的主因）；VBR 1Mbps 14,810,301 bytes / 8.85s，完整2793帧相对CQP24 SSIM 0.990172；QVBR失败，未采用。旧 Rust 独立 benchmark `/4t/vr2-old-rust-render-bench.G3ytPy/result.log` 同样93s源重复两次，固定preset4，7.37/7.46s；并非真的1080p60/4k60两个不同样本，不能与前生产任务15.67s直接等同。调试sha2对约65MiB文件单独计算3.621s；未定位历史阶段额外耗时的全部来源。新增探测、预检、编码、输出probe、fsync、asset_install和总阶段耗时指标，保留原资产安全校验。
 - 新 Rust 实测 `/4t/vr2-rust-av1-adaptive.oeauVl/benchmark.log`：固定CQP24/未指定preset 输出67,981,666 bytes，7.300s，实际视频码率5,694,676bps；自动VBR目标995,000bps，实际1,125,464bps，输出14,754,296 bytes，7.718s；两者均AV1 VAAPI event-VFR、32缓存状态、1080p/29.97fps/93.221s、Opus 134,538bps。原片和两种输出音频压缩流SHA256均为6e35698e3008afecec08283ef5026f42faeb712b6dc193385f65155a596b1d9e。固定质量与Python结果码率、体积一致，整容器哈希因封装不同不一致；真实画质对照为前述Python VBR实验，非新Rust成品独立SSIM。Rust lib 278/278通过（条件门控外部测试除外），日志 `/4t/videoroll-rust-trial-build-ed42980/render-adaptive-lib.log`；实际GPU专项1/1通过。未运行最终主程序构建/生产工作流重放、未部署、未改生产数据库；VBR失败回退、复杂字幕/10-bit自动码率和其他素材视觉验收仍需专项。整体迁移状态FAILED不变。
 
+## 2026-11-28 原 B 站自动投稿路径修复
+
+- 第三代真实自动工作流 `3b88a3bd-7f3b-4568-8f3a-a0547e59aba6` 使用用户确认的 authorized 来源及原自动设置，进入投稿后在 archive_spec 的元数据校验处报 typeid required；当时未到封面/UPOS/稿件提交，原 publish_jobs 为 0。保留 unknown 状态，未在本轮重复真实投稿。
+- 学习原 Python worker.py:833–1105、publish_settings_store.py、publish_meta_draft.py、publish_request_builder.py、tag_recommendation.py、activity_selector.py、bilibili_web_client.py 及历史提交 70c4d1a/f0e69f2/8fa8fbc/cf4d299/b1a4371/88a8864。恢复原完整默认模板合并、缺省分区17（仅推荐失败后的模板兜底）、neutral_mark 可空字段；单平台自动路径读取 publish_typeid_mode、YouTube 封面设置、实际推荐结果及审计，复用已有上传并发/节流/标签/活动及回执结算。自动路径在外部上传前于同一事务登记原 publish_jobs 和 Python 兼容 inbox 防重记录；进度、实际元数据及 BV/AID 与 Rust 阶段结算关联。新增独立 auto-worker CLI 限定明确任务/工作流及原 B 站自动目标；原 trial-worker 仍禁止投稿。无新增业务表或公开 API。
+- 隔离 PostgreSQL + 原仓库 B 站 HTTP/UPOS mock 实测 `/4t/vr2-auto-publish-verified.TXRRv7/auto.log`：原 auto_youtube_start HTTP200，已有下载/字幕/成品复用，6阶段均 succeeded/attempts1，默认分区17->平台推荐180，封面/预上传/分片/合并/推荐/稿件提交各1次，原 publish_jobs published/100、实际元数据及模拟 BV1RUSTMOCK1 落库。前几次隔离验证暴露 neutral_mark=null 校验问题及测试素材路径、模型根、仅本地 mock UPOS 开关的设置问题；已修正并完成验证。原 Python 专项74/74（活动、标签、上传、限流、草稿），日志 `/4t/vr2-python-publish-baseline.5bdmzu/result2.log`；Rust 最终主程序构建通过，最终库测试日志 `/4t/videoroll-rust-trial-build-ed42980/auto-publish-final-lib.log`。
+- 未完成：单平台自动路径原 publish_batches 聚合契约、历史稿件快照文件兼容、AI 分类/活动/标签三级回退的完整自动路径专项、原安全元数据网络重试、原生字幕同步/合集/清理及真实 B 站回执和故障注入。已有代码不能代替验收。正式服务未部署、此轮没有修改生产数据库或执行真实投稿，整体迁移仍 FAILED。
+
 以下为历史审计记录，不再视为当前验收结论。当前不满足完整生产替换门槛。
 
 2026-11-23 迁移状态（最新接口审计）：**175/217** 条原版 API 具有部分 Rust 原生适配，剩余 **42** 条尚无原生 V1 入口；**0** 条达到完整生产等价签收。测试采用一次性数据库、回环侧服务和原版 Python 同库差分；生产 Python 服务不切换。

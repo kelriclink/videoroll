@@ -673,11 +673,40 @@ mod tests {
 /// Python's recovery scans original `publish_jobs` and requires an active
 /// original inbox ownership fence. It must never enqueue a competing Celery
 /// dispatcher for a native Rust archive upload.
+/// Register the original publication ledger before any external upload.
+pub(crate) async fn register_automatic(
+    db: &crate::Database, job: &crate::domain::WorkItem,
+    meta: &Value, parts: &[(String,String)], cover: Option<&str>, mode: &str,
+) -> AppResult<()> {
+    let mut tx = db.pool.begin().await?;
+    let owned:Option<Uuid>=sqlx::query_scalar("SELECT id FROM tasks WHERE id=$1 AND runtime_owner='rust' AND source_license::text<>'unknown' AND status::text NOT IN ('canceled','published','publishing') AND stopped_status IS NULL FOR UPDATE").bind(job.task_id).fetch_optional(&mut *tx).await?;
+    let flow:Option<Uuid>=sqlx::query_scalar("SELECT id FROM vr2_workflows WHERE id=$1 AND task_id=$2 AND generation=$3 AND state='running' AND current_stage='publish' AND NOT configuration ? 'bilibili_auto_job_id' FOR UPDATE").bind(job.workflow_id).bind(job.task_id).bind(job.generation).fetch_optional(&mut *tx).await?;
+    let live:Option<Uuid>=sqlx::query_scalar("SELECT id FROM vr2_jobs WHERE id=$1 AND task_id=$2 AND workflow_id=$3 AND lease_token=$4 AND state='running' AND lease_until>clock_timestamp() FOR UPDATE").bind(job.id).bind(job.task_id).bind(job.workflow_id).bind(job.lease_token).fetch_optional(&mut *tx).await?;
+    if owned.is_none() || flow.is_none() || live.is_none() {
+        return Err(AppError::Conflict("automatic Bilibili publication ownership lost".into()));
+    }
+    let prior:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM publish_jobs WHERE task_id=$1 AND platform::text='bilibili') OR EXISTS(SELECT 1 FROM publish_batches WHERE task_id=$1)").bind(job.task_id).fetch_one(&mut *tx).await?;
+    if prior {return Err(AppError::Conflict("previous publication requires reconciliation".into()));}
+    let video=parts.first().ok_or_else(||AppError::Invalid("automatic Bilibili P1 missing".into()))?;
+    let snapshot=json!({"meta":meta,"video":{"type":"storage","key":video.0},"video_key":video.0,
+        "video_parts":parts.iter().map(|(key,title)|json!({"video":{"type":"storage","key":key},"title":title})).collect::<Vec<_>>(),"typeid_mode":mode});
+    let id=job.id;
+    let operation=format!("publish-job:{id}");
+    sqlx::query("INSERT INTO publish_jobs(id,task_id,platform,meta_json,cover_key,state,operation_key,lease_owner,lease_until) VALUES($1,$2,'bilibili',$3,$4,'submitting',$5,'rust-v2',now()+interval '48 hours')")
+        .bind(id).bind(job.task_id).bind(snapshot).bind(cover).bind(&operation).execute(&mut *tx).await?;
+    sqlx::query("INSERT INTO operation_inbox(id,operation_key,status,request_json,lease_owner,lease_until,runtime_engine) VALUES($1,$2,'processing','{}'::jsonb,'rust-v2',now()+interval '48 hours','python')")
+        .bind(Uuid::new_v4()).bind(&operation).execute(&mut *tx).await?;
+    sqlx::query("UPDATE vr2_workflows SET configuration=jsonb_set(configuration,'{bilibili_auto_job_id}',to_jsonb($2::uuid)),updated_at=now() WHERE id=$1")
+        .bind(job.workflow_id).bind(id).execute(&mut *tx).await?;
+    sqlx::query("UPDATE tasks SET status='publishing'::task_status,error_code=NULL,error_message=NULL,updated_at=now() WHERE id=$1").bind(job.task_id).execute(&mut *tx).await?;
+    tx.commit().await?;
+    Ok(())
+}
 pub(crate) async fn mark_started(
     db: &crate::Database,
     job: &crate::domain::WorkItem,
 ) -> AppResult<()> {
-    let id:Option<Uuid>=sqlx::query_scalar("SELECT (configuration->'bilibili_direct_v1'->>'publish_job_id')::uuid FROM vr2_workflows WHERE id=$1")
+    let id:Option<Uuid>=sqlx::query_scalar("SELECT COALESCE(configuration->'bilibili_direct_v1'->>'publish_job_id',configuration->>'bilibili_auto_job_id')::uuid FROM vr2_workflows WHERE id=$1")
         .bind(job.workflow_id).fetch_optional(&db.pool).await?.flatten();
     let Some(id) = id else {
         return Ok(());
@@ -731,7 +760,7 @@ pub(crate) async fn mark_confirmed(
     job: &crate::domain::WorkItem,
     result: &Value,
 ) -> AppResult<bool> {
-    let id:Option<Uuid>=sqlx::query_scalar("SELECT (configuration->'bilibili_direct_v1'->>'publish_job_id')::uuid FROM vr2_workflows WHERE id=$1")
+    let id:Option<Uuid>=sqlx::query_scalar("SELECT COALESCE(configuration->'bilibili_direct_v1'->>'publish_job_id',configuration->>'bilibili_auto_job_id')::uuid FROM vr2_workflows WHERE id=$1")
         .bind(job.workflow_id).fetch_optional(&mut **tx).await?.flatten();
     let Some(id) = id else {
         return Ok(true);
@@ -752,6 +781,9 @@ pub(crate) async fn mark_confirmed(
         "parts":result.get("parts")});
     if let Some(activity) = result.get("activity").filter(|v| v.is_object()) {
         receipt["activity"] = activity.clone();
+    }
+    if let Some(typeid) = result.get("typeid").filter(|v| v.is_object()) {
+        receipt["typeid"] = typeid.clone();
     }
     // Some recovered historical results predate submitted_meta. Preserve
     // their original request snapshot instead of inventing final metadata.
@@ -807,7 +839,7 @@ pub(crate) async fn mark_uncertain(
     workflow_id: Uuid,
     reason: &str,
 ) -> AppResult<()> {
-    let id:Option<Uuid>=sqlx::query_scalar("SELECT (configuration->'bilibili_direct_v1'->>'publish_job_id')::uuid FROM vr2_workflows WHERE id=$1")
+    let id:Option<Uuid>=sqlx::query_scalar("SELECT COALESCE(configuration->'bilibili_direct_v1'->>'publish_job_id',configuration->>'bilibili_auto_job_id')::uuid FROM vr2_workflows WHERE id=$1")
         .bind(workflow_id).fetch_optional(&mut **tx).await?.flatten();
     let Some(id) = id else {
         return Ok(());

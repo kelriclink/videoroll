@@ -37,6 +37,13 @@ enum Command {
         #[arg(long)]
         workflow: uuid::Uuid,
     },
+    /// Execute one authorized automatic workflow with the normal production stage handlers.
+    AutoWorker {
+        #[arg(long)]
+        task: uuid::Uuid,
+        #[arg(long)]
+        workflow: uuid::Uuid,
+    },
     /// Process at most one native Bilibili subtitle draft (outbox remains
     /// independent of the irreversible archive submission).
     SubtitlesTick,
@@ -210,6 +217,12 @@ async fn main() -> anyhow::Result<()> {
             let scheduler = Scheduler::new(db.clone(), config.job_lease);
             let storage = AssetRegistry::new(db.clone(), config.storage_root.clone());
             Executor::new(config.clone(), db, scheduler, storage).trial_worker(task, workflow).await?;
+        }
+        Command::AutoWorker { task, workflow } => {
+            anyhow::ensure!(config.native_bilibili_allowed && !config.legacy_publish_allowed && !config.social_publish_allowed && !config.remote_renderer_enabled, "scoped automatic worker requires native Bilibili and local rendering");
+            let scheduler = Scheduler::new(db.clone(), config.job_lease);
+            let storage = AssetRegistry::new(db.clone(), config.storage_root.clone());
+            Executor::new(config.clone(), db, scheduler, storage).auto_worker(task, workflow).await?;
         }
         Command::Worker => {
             let scheduler = Scheduler::new(db.clone(), config.job_lease);

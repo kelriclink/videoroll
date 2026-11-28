@@ -593,16 +593,11 @@ async fn build_draft(state: &AppState, id: Uuid, req: DraftRequest) -> AppResult
     }
     let task = read_task(&state.db, id).await?;
     let original = crate::settings::effective(&state.db, "bilibili.publish").await?;
-    let configured = if original["default_meta"].is_object() {
-        original
-    } else {
-        crate::settings::effective(&state.db, "publish.settings").await?
-    };
-    let mut meta = configured
-        .get("default_meta")
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
+    // Original get_bilibili_publish_settings merges a complete baseline
+    // even when the saved settings contain only upload/activity preferences.
+    let configured = crate::bilibili_settings_v1::view(&original);
+    let mut meta = configured["default_meta"].as_object().cloned()
+        .ok_or_else(|| AppError::Invalid("Bilibili default metadata missing".into()))?;
     let stored = saved(&state.db, id).await?;
     if req.mode == "auto"
         && let Some(value) = stored.as_ref()
@@ -654,8 +649,8 @@ async fn build_draft(state: &AppState, id: Uuid, req: DraftRequest) -> AppResult
             &profile,
         );
     }
-    // Never invent a partition or a mission ID. A missing partition prevents
-    // save/publish until the operator selects one.
+    // Preserve the configured original fallback partition (default 17).
+    // Explicit invalid metadata still fails validation; never invent a mission ID.
     if !meta.contains_key("typeid")
         && let Some(tid) = meta.get("tid").cloned()
     {

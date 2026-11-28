@@ -299,7 +299,7 @@ impl Executor {
         }
     }
     pub async fn worker_loop(&self, worker_index: usize) {
-        self.worker_loop_inner(worker_index, None).await;
+        self.worker_loop_inner(worker_index, None, false).await;
     }
     /// Execute the original synchronous manual-download operation with the same
     /// durable claim and heartbeat as the automatic worker. No new HTTP route.
@@ -308,7 +308,7 @@ impl Executor {
         if f.task_id != task || f.configuration["manual_download_only"].as_bool() != Some(true) || f.current_stage != "download" {
             return Err(AppError::Conflict("not a manual download workflow".into()));
         }
-        self.worker_loop_inner(0, Some((task, workflow))).await;
+        self.worker_loop_inner(0, Some((task, workflow)), true).await;
         let f = self.scheduler.workflow(workflow).await?;
         if f.state == "succeeded" { Ok(()) } else {
             Err(AppError::Unavailable(f.last_error.unwrap_or_else(|| "YouTube download did not complete".into())))
@@ -323,13 +323,31 @@ impl Executor {
             || f.configuration.get("bilibili_direct_v1").is_some() {
             return Err(AppError::Conflict("trial requires explicit media-only workflow configuration".into()));
         }
-        self.worker_loop_inner(0, Some((task, workflow))).await;
+        self.worker_loop_inner(0, Some((task, workflow)), true).await;
         let f = self.scheduler.workflow(workflow).await?;
         if f.state == "succeeded" { Ok(()) } else {
             Err(AppError::Conflict(format!("trial ended in {}: {:?}",f.state,f.last_error)))
         }
     }
-    async fn worker_loop_inner(&self, worker_index: usize, scope: Option<(uuid::Uuid,uuid::Uuid)>) {
+    /// Scoped production admission; unlike a trial, execute normal stages.
+    /// Source authorization, platform settings and publication fencing remain mandatory.
+    pub async fn auto_worker(&self, task: uuid::Uuid, workflow: uuid::Uuid) -> AppResult<()> {
+        let f = self.scheduler.workflow(workflow).await?;
+        let authorized:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM tasks WHERE id=$1 AND source_license::text<>'unknown' AND runtime_owner='rust' AND status::text NOT IN ('canceled','published','publishing') AND stopped_status IS NULL)")
+            .bind(task).fetch_one(&self.db.pool).await?;
+        if f.task_id!=task || f.state!="running" || !authorized || f.configuration["legacy_auto_runtime_profile"]!=true || f.configuration["trial_media_only"]==true || f.configuration["auto_publish"]==false || f.configuration.get("after_render_publish").is_some() || f.configuration.get("bilibili_direct_v1").is_some() {
+            return Err(AppError::Conflict("not an authorized active automatic workflow".into()));
+        }
+        let profile=crate::settings::effective(&self.db,"subtitle.auto_profile").await?;
+        let (enabled,platforms)=crate::task_manual::auto_platform_selection(&profile,&f.configuration)?;
+        if !enabled || platforms.as_slice()!=["bilibili"] || !self.config.native_bilibili_allowed || !crate::publish_platforms::enabled(&self.db,"bilibili").await? {
+            return Err(AppError::Conflict("scoped auto worker requires the enabled original Bilibili target".into()));
+        }
+        self.worker_loop_inner(0, Some((task,workflow)), false).await;
+        let f=self.scheduler.workflow(workflow).await?;
+        if f.state=="succeeded" {Ok(())}else{Err(AppError::Conflict(format!("automatic workflow ended in {}: {:?}",f.state,f.last_error)))}
+    }
+    async fn worker_loop_inner(&self, worker_index: usize, scope: Option<(uuid::Uuid,uuid::Uuid)>, media_only:bool) {
         loop {
             if let Some((task,workflow))=scope {
                 match self.scheduler.workflow(workflow).await {
@@ -348,7 +366,7 @@ impl Executor {
                 Ok(Some(job)) => {
                     info!(worker_index,job_id=%job.id,stage=%job.stage.as_str(),"stage started");
                     let mut future = Box::pin(async {
-                        if scope.is_some() && matches!(job.stage, Stage::Dubbing | Stage::Publish | Stage::Cleanup) {
+                        if media_only && matches!(job.stage, Stage::Dubbing | Stage::Publish | Stage::Cleanup) {
                             Ok(StageOutcome::Skipped { reason: "media-only trial: retain output, no external submission".into() })
                         } else { self.execute(&job).await }
                     });

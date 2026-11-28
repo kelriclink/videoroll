@@ -98,9 +98,8 @@ impl ArchiveMeta {
         for (key, value) in &self.extra {
             let valid = match key.as_str() {
                 "activity_name" => value.as_str().is_some_and(|v| v.chars().count() <= 120),
-                "dynamic" | "neutral_mark" => {
-                    value.as_str().is_some_and(|v| v.chars().count() <= 2_000)
-                }
+                "dynamic" => value.as_str().is_some_and(|v| v.chars().count() <= 2_000),
+                "neutral_mark" => value.is_null() || value.as_str().is_some_and(|v| v.chars().count() <= 2_000),
                 "dtime" => value.is_null() || value.as_i64().is_some_and(|v| v > 0),
                 "desc_v2" => value.is_null() || value.is_array() || value.is_object(),
                 "subtitle" => {
@@ -733,9 +732,9 @@ impl UploadProgress<'_> {
         publish_lease(self.db, self.job).await?;
         let pct = ((self.done_before.saturating_add(done)).saturating_mul(100) / self.total.max(1))
             .min(100) as i32;
-        // Only direct V1 jobs have an original publish_jobs row at this point.
+        // Both direct V1 and automatic publications use the original ledger.
         // Keep its progress monotonic, guarded by the current execution lease.
-        sqlx::query("UPDATE publish_jobs p SET upload_active=$1,upload_progress=GREATEST(p.upload_progress,$2),heartbeat_at=now(),updated_at=now() FROM vr2_jobs j JOIN vr2_workflows w ON w.id=j.workflow_id WHERE j.id=$3 AND j.lease_token=$4 AND j.state='running' AND j.lease_until>now() AND w.state='running' AND p.id::text=w.configuration->'bilibili_direct_v1'->>'publish_job_id' AND p.task_id=j.task_id AND p.state='submitting'")
+        sqlx::query("UPDATE publish_jobs p SET upload_active=$1,upload_progress=GREATEST(p.upload_progress,$2),heartbeat_at=now(),updated_at=now() FROM vr2_jobs j JOIN vr2_workflows w ON w.id=j.workflow_id WHERE j.id=$3 AND j.lease_token=$4 AND j.state='running' AND j.lease_until>now() AND w.state='running' AND p.id::text=COALESCE(w.configuration->'bilibili_direct_v1'->>'publish_job_id',w.configuration->>'bilibili_auto_job_id') AND p.task_id=j.task_id AND p.state='submitting'")
             .bind(active).bind(pct).bind(self.job.id).bind(self.job.lease_token)
             .execute(&self.db.pool).await?;
         Ok(())
@@ -1562,16 +1561,23 @@ pub async fn publish(
     // Validate creator-center ID pairing and rules before any UPOS upload.
     crate::bili_activity::verify_remote(&client.member,client.origin.as_str().trim_end_matches('/'), &meta).await?;
     publish_gate(db, job, PublishGate::Upload).await?;
-    if direct.is_some() {
-        crate::bilibili_publish_v1::mark_started(db, job).await?;
-        if let Some(cover) = direct
-            .as_ref()
-            .and_then(|d| d.get("cover_key"))
-            .and_then(Value::as_str)
-        {
-            let path = registry.resolve_existing(cover).await?;
-            meta.cover = client.upload_cover(&csrf, &path).await?;
-        }
+    let auto = crate::subtitle_management_v1::normalized_profile(
+        &crate::settings::effective(db, "subtitle.auto_profile").await?);
+    let cover_key = if let Some(d) = direct.as_ref() {
+        d["cover_key"].as_str().map(str::to_owned)
+    } else if auto["publish_use_youtube_cover"] == true && meta.cover.is_empty() {
+        latest_asset_key(db, job.task_id, "cover_image").await?
+    } else { None };
+    let mode = direct.as_ref().and_then(|v| v.get("typeid_mode")).and_then(Value::as_str)
+        .or_else(|| auto["publish_typeid_mode"].as_str()).unwrap_or("ai_summary");
+    if direct.is_none() {
+        let snapshot=serde_json::to_value(&meta).map_err(|_|AppError::Invalid("automatic metadata encoding failed".into()))?;
+        crate::bilibili_publish_v1::register_automatic(db,job,&snapshot,&parts,cover_key.as_deref(),mode).await?;
+    }
+    crate::bilibili_publish_v1::mark_started(db,job).await?;
+    if let Some(cover) = cover_key {
+        let path = registry.resolve_existing(&cover).await?;
+        meta.cover = client.upload_cover(&csrf, &path).await?;
     }
     let requested = configured_upload_workers(db).await?;
     let mut prepared = Vec::new();
@@ -1619,10 +1625,10 @@ pub async fn publish(
     // preparatory UPOS upload, then falls back to Bilibili prediction and
     // finally to the supplied metadata tid. Reuse the *same* Rust classifier
     // as the independent /bilibili/archive/type/recommend endpoint.
-    let mode = direct
-        .as_ref()
-        .and_then(|v| v.get("typeid_mode"))
-        .and_then(Value::as_str);
+    let mode = Some(mode);
+    let original_typeid = meta.typeid;
+    let mut predicted_typeid = None;
+    let mut ai_audit = json!({"ok":false});
     let mut selected_by_ai = false;
     if mode == Some("ai_summary") {
         let fallback = format!("{}\n{}", meta.title, meta.desc);
@@ -1639,8 +1645,10 @@ pub async fn publish(
                     meta.typeid = id;
                     selected_by_ai = true;
                 }
+                ai_audit = choice;
             }
             Ok(choice) => {
+                ai_audit = choice.clone();
                 let reason = choice
                     .get("reason")
                     .and_then(Value::as_str)
@@ -1657,9 +1665,13 @@ pub async fn publish(
         if let Some((p1, _)) = uploaded.first() {
             if let Ok(Some(predicted)) = client.predict_type(&csrf, p1, &meta.title).await {
                 meta.typeid = predicted;
+                predicted_typeid = Some(predicted);
             }
         }
     }
+    let typeid_audit = json!({"mode":mode,"selected":meta.typeid,"meta":original_typeid,
+        "selected_by":if selected_by_ai {"ai_summary"} else if predicted_typeid.is_some() {"bilibili_predict"} else {"meta"},
+        "predicted":predicted_typeid,"ai":ai_audit});
     // Activity enhancement is optional; never let discovery/model failure
     // trigger a second upload or submission. Preserve explicitly chosen IDs.
     let activity_enabled=crate::settings::effective(db,"bilibili.publish").await.ok().is_some_and(|v|v["ai_activity_enabled"]==true);
@@ -1730,6 +1742,7 @@ pub async fn publish(
     activity_audit["submitted_topic_id"]=json!(meta.topic_id);
     activity_audit["submitted_mission_id"]=json!(meta.mission_id);
     receipt["activity"]=activity_audit;
+    receipt["typeid"]=typeid_audit;
     receipt["publication_binding"] =
         crate::bilibili_account_v1::publication_binding(account, &cookie, &csrf);
     if let Some(intent) = collection_intent {

@@ -115,7 +115,7 @@ fn normalize(input: &Value) -> AppResult<Value> {
     }
     Ok(Value::Object(out))
 }
-fn view(stored: &Value) -> Value {
+pub(crate) fn view(stored: &Value) -> Value {
     let raw = stored
         .get("default_meta")
         .filter(|v| v.is_object())
@@ -205,6 +205,19 @@ pub fn router() -> Router<AppState> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn complete_original_template_is_valid_for_actual_submission() {
+        let mut meta = view(&json!({"upload_workers":4,"ai_activity_enabled":false}))["default_meta"].clone();
+        assert_eq!(meta["typeid"],17);
+        meta["title"]=json!("automatic science fixture");
+        meta["tags"]=json!(["science"]);
+        meta["copyright"]=json!(2);
+        meta["source"]=json!("https://youtu.be/0123456789A");
+        let normalized=crate::publish_meta::normalized(meta).unwrap();
+        let archive:crate::bilibili::ArchiveMeta=serde_json::from_value(normalized).unwrap();
+        archive.validate().unwrap();
+        assert!(archive.extra["neutral_mark"].is_null());
+    }
     #[test]
     fn templates_support_empty_tags_without_weakening_archive_validation() {
         assert_eq!(view(&json!({}))["default_meta"]["tags"], json!([]));
