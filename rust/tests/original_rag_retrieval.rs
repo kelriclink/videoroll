@@ -248,6 +248,7 @@ async fn original_settings_and_vector_filters() {
         end_ms: 1000,
         text: "The electronic circuit uses a capacitor.".into(),
         secondary_text: None,
+        confidence: None,
     }];
     let context = rag::prepare(&config, &db, &job, &cues, "zh").await.unwrap();
     assert_eq!(context.evidence_ids, vec![exact, semantic, generic]);
@@ -319,6 +320,7 @@ async fn original_settings_and_vector_filters() {
             end_ms: 1000,
             text: text.into(),
             secondary_text: None,
+            confidence: None,
         }];
         let actual = rag::prepare(&config, &db, &job, &source, "zh")
             .await

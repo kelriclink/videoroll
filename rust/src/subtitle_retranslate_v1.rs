@@ -349,18 +349,21 @@ mod tests {
                 end_ms: 1000,
                 text: "one".into(),
                 secondary_text: None,
+                confidence: None,
             },
             SubtitleCue {
                 start_ms: 1000,
                 end_ms: 2000,
                 text: "two".into(),
                 secondary_text: None,
+                confidence: None,
             },
             SubtitleCue {
                 start_ms: 2000,
                 end_ms: 3000,
                 text: "three".into(),
                 secondary_text: None,
+                confidence: None,
             },
         ];
         let out = src

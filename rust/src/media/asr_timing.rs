@@ -100,6 +100,7 @@ mod tests {
             end_ms: b,
             text: text.into(),
             secondary_text: Some("译文".into()),
+            confidence: None,
         }
     }
     #[test]

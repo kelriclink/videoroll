@@ -128,6 +128,7 @@ async fn snapshot(
             end_ms: stamp("end")?,
             text: text.into(),
             secondary_text: secondary,
+            confidence: row["confidence"].as_f64().filter(|v|v.is_finite() && (0.0..=1.0).contains(v)),
         });
     }
     validate(&cues)?;

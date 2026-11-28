@@ -435,6 +435,7 @@ mod tests {
                 end_ms: i * 1000 + 500,
                 text: "words ".repeat(90),
                 secondary_text: None,
+                confidence: None,
             })
             .collect::<Vec<_>>();
         let text = context(&cues, 500, 6000);

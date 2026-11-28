@@ -27,6 +27,8 @@ struct AsrSegment {
     end: f64,
     text: String,
     #[serde(default)]
+    confidence: Option<f64>,
+    #[serde(default)]
     no_speech_prob: Option<f64>,
     #[serde(default)]
     avg_logprob: Option<f64>,
@@ -229,6 +231,7 @@ fn normalize_asr(
             end_ms: end,
             text: segment.text.trim().into(),
             secondary_text: None,
+            confidence: segment.confidence.or_else(||segment.no_speech_prob.map(|v|1.-v)).filter(|v|v.is_finite()).map(round_confidence),
         });
     }
     Ok(items)
@@ -266,6 +269,7 @@ fn cloudflare_response(data: Value, seconds: f64) -> AppResult<AsrResponse> {
         no_speech_prob: None,
         avg_logprob: None,
         compression_ratio: None,
+        confidence: None,
     };
     if let Some(rows) = result["segments"].as_array() {
         for row in rows {
@@ -501,6 +505,13 @@ struct ExternalWhisperWord {
     start: f64,
     end: f64,
     text: String,
+    #[serde(default)]
+    probability: Option<f64>,
+}
+fn round_confidence(v:f64)->f64 {(v.clamp(0.,1.)*10_000.).round()/10_000.}
+fn word_confidence(words:&[ExternalWhisperWord])->Option<f64>{
+    let values=words.iter().filter_map(|w|w.probability).filter(|v|v.is_finite()).collect::<Vec<_>>();
+    (!values.is_empty()).then(||round_confidence(values.iter().sum::<f64>()/values.len() as f64))
 }
 fn terminal_asr_punctuation(text: &str) -> bool {
     text.trim_end()
@@ -862,6 +873,7 @@ fn external_whisper_response(
                     start,
                     end,
                     text: text.to_owned(),
+                    probability: word["probability"].as_f64().filter(|v|v.is_finite()).map(|v|v.clamp(0.,1.)),
                 })
             })
             .collect()
@@ -937,6 +949,7 @@ fn external_whisper_response(
                     no_speech_prob: quality.and_then(|q| q.no_speech_prob),
                     avg_logprob: quality.and_then(|q| q.avg_logprob),
                     compression_ratio: quality.and_then(|q| q.compression_ratio),
+                    confidence: word_confidence(&group).or_else(||quality.and_then(|q|q.confidence)),
                 });
             }
         }
@@ -991,6 +1004,7 @@ fn external_whisper_response(
                 no_speech_prob: segment.no_speech_prob,
                 avg_logprob: segment.avg_logprob,
                 compression_ratio: segment.compression_ratio,
+                confidence: segment.confidence,
             });
             cursor = end;
         }
@@ -1056,6 +1070,7 @@ fn external_whisper_response(
             no_speech_prob: None,
             avg_logprob: None,
             compression_ratio: None,
+            confidence: None,
         });
     }
     let text = if top_text.is_empty() {
@@ -2969,10 +2984,65 @@ async fn original_progress(db:&Database,job:&WorkItem,progress:i32,artifact:Opti
     tx.commit().await?;
     Ok(())
 }
+/// Original worker logs are mutable, best-effort files; do not overwrite a
+/// registered immutable log asset from a previous release.
+async fn original_log(db:&Database,registry:&AssetRegistry,job:&WorkItem,message:&str)->AppResult<()> {
+    use tokio::io::AsyncWriteExt;
+    let mut tx=original_job_transaction(db,job).await?;
+    let key=format!("log/{}/subtitle_{}.log",job.task_id,job.id);
+    let path=registry.resolve_existing(&key).await?;
+    let immutable:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM assets WHERE task_id=$1 AND storage_key=$2 AND sha256 IS NOT NULL)")
+        .bind(job.task_id).bind(&key).fetch_one(&mut *tx).await?;
+    if !immutable {
+        if let Some(parent)=path.parent(){fs::create_dir_all(parent).await?;}
+        let mut f=fs::OpenOptions::new().create(true).append(true).open(&path).await?;
+        f.write_all(format!("{} {}\n",chrono::Utc::now().to_rfc3339(),message).as_bytes()).await?;
+        f.flush().await?;
+        sqlx::query("INSERT INTO assets(id,task_id,kind,storage_key) SELECT $1,$2,'log'::asset_kind,$3 WHERE NOT EXISTS(SELECT 1 FROM assets WHERE task_id=$2 AND kind='log'::asset_kind AND storage_key=$3)")
+            .bind(Uuid::new_v4()).bind(job.task_id).bind(&key).execute(&mut *tx).await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+/// Persist original 16 kHz mono WAV once. Only reuse an asset whose original
+/// job request pins the same source, and whose bytes match its ledger.
+async fn original_audio(config:&Config,db:&Database,registry:&AssetRegistry,job:&WorkItem,video:&Path,video_key:&str,workspace:&Path)->AppResult<std::path::PathBuf>{
+    let old:Option<String>=sqlx::query_scalar("SELECT request_json#>>'{artifacts,audio_key}' FROM subtitle_jobs WHERE id=$1 AND task_id=$2 AND request_json#>>'{input,key}'=$3")
+        .bind(job.id).bind(job.task_id).bind(video_key).fetch_optional(&db.pool).await?.flatten();
+    if let Some(key)=old {
+        let expected:Option<(Option<String>,Option<i64>)>=sqlx::query_as("SELECT sha256,size_bytes FROM assets WHERE task_id=$1 AND kind='audio_wav'::asset_kind AND storage_key=$2")
+            .bind(job.task_id).bind(&key).fetch_optional(&db.pool).await?;
+        if let Some((Some(sha),Some(size)))=expected {
+            if registry.sha256(&key).await.ok()==Some((sha,size)) {
+                let _=original_log(db,registry,job,"resume: found existing audio_wav asset").await;
+                return registry.resolve_existing(&key).await;
+            }
+        }
+    }
+    let _=original_log(db,registry,job,"ffmpeg: extract audio (mono PCM, 16000 Hz)").await;
+    let temp=workspace.join(format!("audio-{}.wav",job.lease_token));
+    let output=Command::new(&config.ffmpeg_binary).args(["-hide_banner","-nostdin","-loglevel","error","-y","-i"])
+        .arg(video).args(["-vn","-ac","1","-ar","16000","-c:a","pcm_s16le"]).arg(&temp)
+        .stdin(Stdio::null()).kill_on_drop(true).output().await?;
+    if !output.status.success(){let _=fs::remove_file(&temp).await;return Err(AppError::Unavailable("FFmpeg audio extraction failed".into()));}
+    let tmp_key=format!("v2/sub/{}/{}/work/audio-{}.wav",job.task_id,job.id,job.lease_token);
+    let (sha,size)=registry.sha256(&tmp_key).await?;
+    let nonce=job.id.simple().to_string();
+    let key=format!("work/{}/audio_{}_{}.wav",job.task_id,&sha[..16],&nonce[..12]);
+    super::ffmpeg::install_task_asset(db,registry,job,"audio_wav",&key,&temp).await?;
+    original_progress(db,job,25,Some(("audio_key",&key))).await?;
+    let mut tx=original_job_transaction(db,job).await?;
+    sqlx::query("UPDATE tasks SET status='audio_extracted'::task_status,updated_at=now() WHERE id=$1 AND status::text IN ('created','ingested','downloaded')")
+        .bind(job.task_id).execute(&mut *tx).await?;
+    tx.commit().await?;
+    let _=original_log(db,registry,job,&format!("ffmpeg: audio extracted; bytes={size}")).await;
+    registry.resolve_existing(&key).await
+}
 async fn original_segments(db:&Database,registry:&AssetRegistry,job:&WorkItem,rows:&[SubtitleCue],final_segments:bool)->AppResult<String>{
     let data=rows.iter().map(|c|{
         let mut v=json!({"start":c.start_ms as f64/1000.,"end":c.end_ms as f64/1000.,"text":c.text});
         if let Some(text)=c.secondary_text.as_ref().filter(|s|!s.is_empty()){v["secondary_text"]=json!(text);}
+        if let Some(confidence)=c.confidence{v["confidence"]=json!(confidence);}
         v
     }).collect::<Vec<_>>();
     let bytes=serde_json::to_vec(&data).map_err(|_|AppError::Invalid("original subtitle segments encode failed".into()))?;
@@ -3002,12 +3072,15 @@ pub(crate) async fn process(
         if value["no_speech"]==true {
             original_segments(db,registry,job,&[],false).await?;
         }
-        let log_key=format!("log/{}/subtitle_{}.log",job.task_id,job.id);
         let line=if value["no_speech"]==true {
             "未检测到可信语音：跳过字幕和配音，继续使用原视频。".to_owned()
         } else {format!("subtitle processing finished; cues={}",value["cues"].as_u64().unwrap_or(0))};
-        let log=format!("asr: job {}\n{line}\n",job.id);
-        write_task_asset(db,registry,job,"log",&log_key,log.as_bytes()).await?;
+        if let Err(error)=original_log(db,registry,job,&line).await {
+            tracing::warn!(job_id=%job.id,error=%error,"subtitle final log unavailable");
+        }
+    } else {
+        // Avoid persisting arbitrary provider response bodies or credentials.
+        let _=original_log(db,registry,job,"ERROR: subtitle processing failed; see task error").await;
     }
     result
 }
@@ -3197,7 +3270,7 @@ async fn process_inner(
         (WINDOW, OVERLAP)
     };
     let asr_identity = fingerprint(&json!({
-        "checkpoint_version":8,"timing_refine_revision":1,"semantic_word_revision":2,"local_word_revision":2,"vad_runtime_configured":crate::local_inference::configured(),"video_sha256":source_digest,
+        "checkpoint_version":9,"timing_refine_revision":1,"semantic_word_revision":2,"local_word_revision":2,"vad_runtime_configured":crate::local_inference::configured(),"video_sha256":source_digest,
         "model":config.asr_model,"asr_endpoint":config.asr_endpoint,"local_asr":config.local_asr,
         "asr_request_options":config.asr_request_options,
         "language":profile.asr_language,"duration_ms":(duration*1000.0).round() as u64,
@@ -3213,6 +3286,9 @@ async fn process_inner(
     let prefix = format!("v2/sub/{}/{}", job.task_id, job.id);
     let workspace = registry.resolve_existing(&format!("{prefix}/work")).await?;
     fs::create_dir_all(&workspace).await?;
+    let audio=if recovered.is_none() && preferred.is_none() {
+        Some(original_audio(config,db,registry,job,&video,&video_key,&workspace).await?)
+    }else{None};
     let stride = window - overlap;
     let count = 1 + ((duration - window).max(0.0) / stride).ceil() as usize;
     original_progress(db,job,25,None).await?;
@@ -3253,13 +3329,19 @@ async fn process_inner(
                         && row.fingerprint == asr_identity
                 });
             let (rows, words, vad_spans) = if let Some(cached) = cached {
+                let _=original_log(db,registry,job,&format!("asr: resume window {}/{}",index+1,count)).await;
                 (cached.cues, cached.words, cached.vad_spans)
             } else {
                 let flac = workspace.join(format!(
                     "audio-{index:05}.{}",
                     if original_wav_input(config) { "wav" } else { "flac" }
                 ));
-                convert_audio(config, &video, &flac, start, seconds).await?;
+                let _=original_log(db,registry,job,&format!("asr: window {}/{} offset={start:.3}s duration={seconds:.3}s",index+1,count)).await;
+                // External Whisper receives the exact original complete WAV.
+                // Other providers consume bounded windows of that same asset.
+                let direct=original_external_input(config);
+                if !direct {convert_audio(config, audio.as_deref().unwrap_or(&video), &flac, start, seconds).await?;}
+                let input=if direct {audio.as_deref().ok_or_else(||AppError::Conflict("original WAV missing".into()))?}else{&flac};
                 let mut result = None;
                 let attempts = if groq_endpoint(config) { 1 } else { 3 };
                 for attempt in 0..attempts {
@@ -3271,7 +3353,7 @@ async fn process_inner(
                         job,
                         &client,
                         config,
-                        &flac,
+                        input,
                         &profile.asr_language,
                         seconds,
                     )
@@ -3295,6 +3377,7 @@ async fn process_inner(
                         }
                         Err(err) if attempt + 1 < attempts => {
                             tracing::warn!(chunk=index,attempt,error=%err,"ASR chunk retry");
+                            let _=original_log(db,registry,job,&format!("asr: window {} retry {}",index+1,attempt+1)).await;
                             sleep(Duration::from_secs(2_u64.pow(attempt))).await;
                         }
                         Err(err) => return Err(err),
@@ -3319,7 +3402,7 @@ async fn process_inner(
                                 .and_then(|v| v["vad_threshold"].as_f64())
                         })
                         .unwrap_or(0.5);
-                    let request = json!({"kind":"vad","device":"CPU","purpose":"timing","audio":flac,"threshold":threshold});
+                    let request = json!({"kind":"vad","device":"CPU","purpose":"timing","audio":input,"threshold":threshold});
                     if let Ok(value) =
                         crate::local_inference::invoke(&request, Duration::from_secs(60)).await
                     {
@@ -3335,7 +3418,7 @@ async fn process_inner(
                         }
                     }
                 }
-                let _ = fs::remove_file(&flac).await;
+                if !direct {let _ = fs::remove_file(&flac).await;}
                 selective_lease(db, job).await?;
                 atomic_write(
                     db, job, &checkpoint,
@@ -3390,6 +3473,7 @@ async fn process_inner(
                     end_ms: (g.iter().map(|w| w.end).fold(0., f64::max) * 1000.).round() as u64,
                     text: join_external_words(&g),
                     secondary_text: None,
+                    confidence: word_confidence(&g),
                 })
                 .collect::<Vec<_>>();
             merged = crate::media::asr_overlap::reconcile(merged);
@@ -3433,6 +3517,7 @@ async fn process_inner(
         .map(|(source, _)| source.clone())
         .unwrap_or_else(|| cues.clone());
     original_segments(db,registry,job,&original,false).await?;
+    let _=original_log(db,registry,job,&format!("asr done: segments={}",original.len())).await;
     let mut research = crate::rag::ResearchContext::default();
     if profile.translate_enabled {
         let options = crate::rag::rag_config(db).await?;
@@ -3890,12 +3975,14 @@ mod tests {
                 end_ms: 5000,
                 text: "这是一个用于测试字幕可读性优化器的比较长的中文字幕句子，".repeat(4),
                 secondary_text: None,
+                confidence: None,
             },
             SubtitleCue {
                 start_ms: 6000,
                 end_ms: 7500,
                 text: "结束。".into(),
                 secondary_text: None,
+                confidence: None,
             },
         ];
         let captions = super::super::youtube_subtitles::Captions {
@@ -4019,6 +4106,7 @@ mod tests {
                         no_speech_prob: None,
                         avg_logprob: None,
                         compression_ratio: None,
+                        confidence: None,
                     },
                     AsrSegment {
                         start: 2.0,
@@ -4027,6 +4115,7 @@ mod tests {
                         no_speech_prob: None,
                         avg_logprob: None,
                         compression_ratio: None,
+                        confidence: None,
                     },
                 ],
             },
@@ -4051,6 +4140,7 @@ mod tests {
                     no_speech_prob: Some(0.98),
                     avg_logprob: Some(-1.6),
                     compression_ratio: None,
+                    confidence: None,
                 },
                 AsrSegment {
                     start: 1.0,
@@ -4059,6 +4149,7 @@ mod tests {
                     no_speech_prob: Some(0.92),
                     avg_logprob: Some(-0.4),
                     compression_ratio: None,
+                    confidence: None,
                 },
             ],
         };
@@ -4423,6 +4514,7 @@ mod tests {
                 end_ms: (i as u64 + 1) * 1000,
                 text: text.into(),
                 secondary_text: None,
+                confidence: None,
             })
             .collect::<Vec<_>>();
         let expected = batch
@@ -5080,6 +5172,7 @@ mod tests {
             text: text.into(),
             start,
             end,
+            probability: None,
         };
         let mut all = vec![
             w("We", 39., 39.4),

@@ -333,6 +333,7 @@ mod tests {
             end_ms: 1000,
             text: "a resistor".into(),
             secondary_text: None,
+            confidence: None,
         }];
         let c = constraints(
             &batch,

@@ -356,6 +356,7 @@ pub(crate) fn optimize(
                 end_ms: end,
                 text,
                 secondary_text: secondary,
+                confidence: c.confidence,
             });
             cursor = end;
             if out.len() > 250_000 {
@@ -492,6 +493,7 @@ mod tests {
             end_ms,
             text: text.into(),
             secondary_text: None,
+            confidence: None,
         }
     }
     #[test]

@@ -121,7 +121,7 @@ def transcribe(req):
             {"start":float(s.start),"end":float(s.end),"text":s.text,
              "no_speech_prob":float(s.no_speech_prob),"avg_logprob":float(s.avg_logprob),
              "compression_ratio":float(s.compression_ratio),
-             "words":[{"word":str(w.word),"start":float(w.start),"end":float(w.end)}
+             "words":[{"word":str(w.word),"start":float(w.start),"end":float(w.end),"probability":float(w.probability) if getattr(w,"probability",None) is not None else None}
                 for w in (getattr(s,"words",None) or [])
                 if w.start is not None and w.end is not None]}
             for s in rows if not _garbage(str(s.text or ""))]}

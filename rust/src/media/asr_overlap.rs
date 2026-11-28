@@ -200,6 +200,7 @@ pub(crate) fn reconcile(mut cues: Vec<SubtitleCue>) -> Vec<SubtitleCue> {
             prev.text =
                 stitch(&prev.text, &cue.text).unwrap_or_else(|| join(&prev.text, &cue.text));
             prev.end_ms = prev.end_ms.max(cue.end_ms);
+            prev.confidence=prev.confidence.into_iter().chain(cue.confidence).reduce(f64::max);
         } else if cue.start_ms.saturating_sub(prev.start_ms) >= 120 {
             prev.end_ms = cue.start_ms;
             out.push(cue);
@@ -209,6 +210,7 @@ pub(crate) fn reconcile(mut cues: Vec<SubtitleCue>) -> Vec<SubtitleCue> {
         } else {
             prev.text = join(&prev.text, &cue.text);
             prev.end_ms = prev.end_ms.max(cue.end_ms);
+            prev.confidence=prev.confidence.into_iter().chain(cue.confidence).reduce(f64::max);
         }
     }
     out
@@ -223,6 +225,7 @@ mod tests {
             end_ms: b,
             text: text.into(),
             secondary_text: None,
+            confidence: None,
         }
     }
     fn assert_one(rows: Vec<SubtitleCue>, a: u64, b: u64, text: &str) {

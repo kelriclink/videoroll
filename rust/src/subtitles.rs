@@ -2,13 +2,15 @@
 use crate::{AppError, AppResult};
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SubtitleCue {
     pub start_ms: u64,
     pub end_ms: u64,
     pub text: String,
     #[serde(default)]
     pub secondary_text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<f64>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReadabilityReport {
@@ -117,6 +119,7 @@ pub fn parse_srt(data: &str) -> AppResult<Vec<SubtitleCue>> {
             end_ms: end,
             text,
             secondary_text: None,
+            confidence: None,
         });
     }
     Ok(cues)
@@ -280,6 +283,7 @@ mod tests {
             end_ms: 3000,
             text: "你好{\\pos(0,0)}".into(),
             secondary_text: Some("world".into()),
+            confidence: None,
         }];
         let ass = to_ass(&cues, 1920, 1080, "Arial", 48, true).unwrap();
         assert!(ass.contains("Dialogue: 0,0:00:00.10,0:00:03.00"));
@@ -288,7 +292,7 @@ mod tests {
     }
     #[test]
     fn independent_font_scales(){
-        let cues=[SubtitleCue{start_ms:0,end_ms:1000,text:"中文".into(),secondary_text:Some("English".into())}];
+        let cues=[SubtitleCue{start_ms:0,end_ms:1000,text:"中文".into(),secondary_text:Some("English".into()),confidence:None}];
         let ass=to_ass_scaled(&cues,1920,1080,"Arial",48,true,150,50).unwrap();
         assert!(ass.contains("Style: Default,Arial,72,"));
         assert!(ass.contains(r"\N{\fs17}English{\fs72}"));
@@ -307,6 +311,7 @@ mod tests {
             end_ms: 1000,
             text: "x".into(),
             secondary_text: None,
+            confidence: None,
         };
         assert!(to_srt(&[bad]).is_err());
     }

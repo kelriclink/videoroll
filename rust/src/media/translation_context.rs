@@ -466,6 +466,7 @@ mod tests {
             end_ms: end,
             text: text.into(),
             secondary_text: None,
+            confidence: None,
         }
     }
     #[test]

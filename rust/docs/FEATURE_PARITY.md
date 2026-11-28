@@ -48,6 +48,13 @@
 - 真实验证：原 Python OpenVINO 和新版桥接在同一 GPU、同一合成英语语音、同一模型上得到相同文本和时间戳（0.044–5.764s），结果 /4t/vr2-asr-real-diff.XxdFlM/{original,bridge}.json；隔离真实 OpenVINO 无语音路径通过原 subtitle_jobs/原请求 Pydantic 校验/[]/日志/列表无重复（/4t/vr2-asr-ledger.6Ei68r/ledger.log）；External Whisper 模拟 HTTP 验收完整 65s WAV，422 回退再次上传完整 WAV、原始及最终快照、原字幕任务及零投稿（/4t/vr2-external-wav.E2lIpk/external.log）。不是真实在线提供商验收。
 - 原 Python 专项 pytest 64/64 通过；合并运行 98 项中 92 通过、6 失败（长音频测试涉及 NumPy 重复导入，单独运行首个用例又遇到 pytest.approx 嵌套结构不支持）。不修改原测试来掩盖问题。Rust 主程序构建和 276/276 库测试通过，随后队列/心跳补丁单独核查；日志 /4t/videoroll-rust-trial-build-ed42980/asr-parity-{build,lib,final-check}.log。真实 Faster-Whisper、Groq、Cloudflare 平台、长期断点恢复和详细日志尚未完成最终验收。继续 FAILED，未部署或改生产库。
 
+## ASR 后续修复检查点（2026-11-28）
+
+- 基于 `80321fd`，对照原 processing.py 的 `_segment_confidence`、词级概率均值和 `_combined_segment_confidence`，增加可选 confidence、词级 probability，贯穿识别结果、重叠合并、可读性拆分和历史快照读取；未知值不伪造。更新检查点策略指纹，避免复用缺失新字段的旧识别结果。
+- 对照原 worker.py 音频提取及日志路径：完整 16kHz 单声道 PCM WAV 保存为 `work/{task_id}/audio_...wav`，登记原 audio_wav 资产；同一作业重试通过原请求关联与 SHA256/大小校验复用音频。External Whisper 直接上传此完整 WAV，其余引擎由该文件生成有界识别窗口。恢复 audio_extracted 状态。日志追加提取、窗口、重试、结果和失败摘要，使用原 log 资产及日志路径；不覆盖旧不可变日志。原完整实时事件通知、详细供应商失败日志、跨代历史音频复用及手动字幕兼容仍需验证或补齐。
+- 首轮 `cargo check --tests` 因新增字段后七处测试构造缺失而失败，修正后全部测试目标编译检查通过（`/4t/videoroll-rust-trial-build-ed42980/asr-assets-final-check.log`）。完整 build/lib 测试在保存此检查点时尚未取得最终结果；真实音频资产/日志、置信度差分和故障注入未验收，不能标记完成。未部署、未修改生产库。
+- 只读核实原 NASA 任务 `aa1c8626`：第三代仍 succeeded，任务 rendered，video_raw/video_final 各 52477014 字节，subtitle_jobs=0、publish_jobs=0；属于旧媒体试跑，不能作为本轮 ASR 修复通过证据。保留整体 FAILED 状态。
+
 以下为历史审计记录，不再视为当前验收结论。当前不满足完整生产替换门槛。
 
 2026-11-23 迁移状态（最新接口审计）：**175/217** 条原版 API 具有部分 Rust 原生适配，剩余 **42** 条尚无原生 V1 入口；**0** 条达到完整生产等价签收。测试采用一次性数据库、回环侧服务和原版 Python 同库差分；生产 Python 服务不切换。
