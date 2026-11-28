@@ -601,6 +601,7 @@ if os.environ.get("VIDEOROLL_V2_TEST_ACTIVITY")=="true":
         db.execute(text("INSERT INTO app_settings(key,value_json,version) VALUES('bilibili.publish',CAST(:value AS jsonb),1) ON CONFLICT(key) DO UPDATE SET value_json=EXCLUDED.value_json"),{'value':json.dumps({'ai_activity_enabled':True})})
     for title,topic,mission,selected in (
         ("魔兽世界活动验收",301,901,True),("魔兽世界普通话题验收",302,None,True),
+        ("魔兽世界普通回退验收",302,None,True),("魔兽世界无关拒绝验收",None,None,False),
         ("魔兽世界AI伪造验收",None,None,False),("魔兽世界发现失败验收",None,None,False),
         ("魔兽世界人工指定验收",302,None,False)):
         task,payload=fixture(title)
@@ -619,8 +620,18 @@ if os.environ.get("VIDEOROLL_V2_TEST_ACTIVITY")=="true":
         if '人工指定' in title:
             assert after['activity_shortlist']==before['activity_shortlist'] and receipt['activity']['reason']=='manual_preserved'
         else:
-            assert after['activity_shortlist']==before['activity_shortlist']+1 and after['activity_list']==before['activity_list']+2
-            if '发现失败' not in title:assert after['activity_final']==before['activity_final']+1
+            assert after['activity_shortlist']==before['activity_shortlist']+1 and after['activity_list']==before['activity_list']+1
+            audit=receipt['activity']
+            assert audit['candidate_topic_count']==3 and audit['candidate_activity_count']==2,audit
+            assert audit['candidate_count']==5 and audit['discovery_ms']>=0,audit
+            if '发现失败' not in title:
+                assert after['activity_final']==before['activity_final']+1
+                assert audit['shortlist_refs']==['public:999','public:998','topic:302'],audit
+                assert audit['topic_verified_count']==1 and audit['activity_verified_count']==1,audit
+                assert 'public:998' in audit['rejected_refs'],audit
+                assert audit['detail_checked_count']==2 and audit['total_ms']>=0,audit
+                if '普通回退' in title:assert audit['decision_fallback']=='topic_not_activity',audit
+                if '无关拒绝' in title:assert 'decision_fallback' not in audit,audit
     with engine.begin() as db:
         db.execute(text("DELETE FROM app_settings WHERE key='bilibili.publish'"))
     print('PASS: actual native publication activity discovery, two AI decisions, real creator mission mapping, ordinary topic, manual preserve, hallucination and AI outage single-submit fallback')

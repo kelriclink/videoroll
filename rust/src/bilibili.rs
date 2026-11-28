@@ -376,7 +376,7 @@ pub async fn archive_spec(
         return Ok((meta, parts));
     }
 
-    let saved = crate::publish_meta::saved(db, job.task_id).await?;
+    let saved = crate::publish_meta::saved(db,registry,job.task_id).await?;
     let draft = match saved.or_else(|| profile.pointer("/publish/bilibili").cloned()) {
         Some(value) => value,
         None => {
@@ -1484,6 +1484,13 @@ impl NativeP2Client {
         Ok(())
     }
 }
+/// Read-only activity catalogue audit via the existing publication credential
+/// resolver; credentials stay in the normal authenticated HTTP client.
+pub async fn activity_catalog_audit(config:&Config,db:&Database,limit:usize)->AppResult<Value>{
+    let (cookie,_,_)=crate::bilibili_account_v1::selected_publication_credentials(db,config,None).await?;
+    let client=BilibiliClient::new(&cookie,member_origin(config)?)?;
+    crate::bili_activity::audit_catalog(&client.member,&client.origin,limit).await
+}
 pub async fn publish(
     config: &Config,
     db: &Database,
@@ -1549,7 +1556,7 @@ pub async fn publish(
                 .map_err(|_| AppError::Invalid("metadata encoding failed".into()))?,
         )
     } else {
-        crate::publish_meta::saved(db, job.task_id).await?
+        crate::publish_meta::saved(db,registry,job.task_id).await?
     };
     let reviewed_meta = reviewed_meta.unwrap_or(
         serde_json::to_value(&meta)
@@ -1572,7 +1579,7 @@ pub async fn publish(
         .or_else(|| auto["publish_typeid_mode"].as_str()).unwrap_or("ai_summary");
     if direct.is_none() {
         let snapshot=serde_json::to_value(&meta).map_err(|_|AppError::Invalid("automatic metadata encoding failed".into()))?;
-        crate::bilibili_publish_v1::register_automatic(db,job,&snapshot,&parts,cover_key.as_deref(),mode).await?;
+        crate::bilibili_publish_v1::register_automatic(db,registry,job,&snapshot,&parts,cover_key.as_deref(),mode).await?;
     }
     crate::bilibili_publish_v1::mark_started(db,job).await?;
     if let Some(cover) = cover_key {
@@ -1687,12 +1694,12 @@ pub async fn publish(
     // trigger a second upload or submission. Preserve explicitly chosen IDs.
     let activity_enabled=crate::settings::effective(db,"bilibili.publish").await.ok().is_some_and(|v|v["ai_activity_enabled"]==true);
     let mut activity_audit=json!({"enabled":activity_enabled,"selected":false,"reason":if meta.topic_id.is_some()||meta.mission_id.is_some(){"manual_preserved"}else if activity_enabled{"no_verified_selection"}else{"disabled"}});
-    match tokio::time::timeout(Duration::from_secs(90),crate::bili_activity::auto_select(db,config,&client.member,&client.origin,job.task_id,&meta)).await{
+    match tokio::time::timeout(Duration::from_secs(90),crate::bili_activity::auto_select(db,config,&client.member,&client.origin,job.task_id,&meta,&mut activity_audit)).await{
         Ok(Ok(Some(selected)))=>{
             let value=serde_json::to_value(&selected).map_err(|_|AppError::Invalid("selected activity metadata invalid".into()))?;
             if crate::publish_review::ensure_approved(db,registry,config,job.task_id,&value).await.is_ok(){
                 activity_audit["selected"]=json!(true);
-                activity_audit["reason"]=json!("verified_ai_selection");
+                if activity_audit["reason"]=="no_verified_selection"{activity_audit["reason"]=json!("verified_ai_selection");}
                 activity_audit["kind"]=json!(if selected.mission_id.is_some(){"activity"}else{"topic"});
                 meta=selected;
             }else{activity_audit["reason"]=json!("review_rejected");}
@@ -1752,6 +1759,7 @@ pub async fn publish(
         .map_err(|_| AppError::Invalid("final metadata serialization failed".into()))?;
     activity_audit["submitted_topic_id"]=json!(meta.topic_id);
     activity_audit["submitted_mission_id"]=json!(meta.mission_id);
+    activity_audit["submitted_tags"]=json!(meta.tags);
     receipt["activity"]=activity_audit;
     receipt["typeid"]=typeid_audit;
     receipt["publication_binding"] =

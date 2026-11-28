@@ -47,6 +47,12 @@ enum Command {
     /// Process at most one native Bilibili subtitle draft (outbox remains
     /// independent of the irreversible archive submission).
     SubtitlesTick,
+    /// Inspect live Bilibili activity catalogue and creator mission mapping;
+    /// read-only, never uploads, joins an event or submits a video.
+    BilibiliActivityAudit {
+        #[arg(long,default_value_t=8)]
+        limit:usize,
+    },
     /// Process at most one independently scheduled published-P1/P2 append.
     P2Tick,
     /// Process one durable SAU social publication intent and reconcile receipts.
@@ -492,6 +498,10 @@ async fn main() -> anyhow::Result<()> {
             while let Some(result) = workers.join_next().await {
                 result?;
             }
+        }
+        Command::BilibiliActivityAudit {limit}=>{
+            let result=videoroll_v2::bilibili::activity_catalog_audit(&config,&db,limit).await?;
+            println!("{}",serde_json::to_string_pretty(&result)?);
         }
         Command::SubtitlesTick => {
             let storage = AssetRegistry::new(db.clone(), config.storage_root.clone());

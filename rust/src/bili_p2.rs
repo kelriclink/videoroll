@@ -215,7 +215,7 @@ async fn enqueue(
             "another P2 intent owns the archive".into(),
         ));
     }
-    let p1 = crate::publish_meta::saved(&state.db, task_id)
+    let p1 = crate::publish_meta::saved(&state.db,&state.storage,task_id)
         .await?
         .and_then(|meta| meta.get("title").and_then(Value::as_str).map(str::to_owned))
         .unwrap_or_else(|| "已发布视频".into());

@@ -328,7 +328,7 @@ async fn manual_publish(
             "manual native Bilibili publishing is not enabled on this isolated V2 host".into(),
         ));
     }
-    let saved = crate::publish_meta::saved(&state.db, id).await?;
+    let saved = crate::publish_meta::saved(&state.db,&state.storage,id).await?;
     let meta = if let Some(provided) = payload.meta {
         let provided = crate::publish_meta::normalized(provided)?;
         if let Some(ref existing) = saved

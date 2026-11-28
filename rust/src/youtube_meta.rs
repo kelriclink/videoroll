@@ -19,7 +19,15 @@ use tokio::{
 };
 use uuid::Uuid;
 
-const MAX_INFO: usize = 2_000_000;
+// Original yt-dlp JSON includes format and caption manifests; production
+// objects exceed 13 MB. Bound actual bytes read instead of rejecting them.
+pub(crate) const MAX_INFO: usize = 64 * 1024 * 1024;
+pub(crate) async fn read_info_file(path:&std::path::Path)->AppResult<Value>{
+    let mut reader=fs::File::open(path).await?.take((MAX_INFO+1) as u64);
+    let mut bytes=Vec::new();reader.read_to_end(&mut bytes).await?;
+    if bytes.len()>MAX_INFO{return Err(AppError::Invalid("metadata asset exceeds read budget".into()));}
+    serde_json::from_slice(&bytes).map_err(|_|AppError::Invalid("cached YouTube metadata corrupt".into()))
+}
 pub(crate) fn meta_view(value: &Value, fallback: &str) -> AppResult<Value> {
     let source = value
         .as_object()
@@ -201,9 +209,7 @@ pub(crate) async fn latest_info(
             "metadata asset exceeds read budget".into(),
         ));
     }
-    let bytes = fs::read(&file).await?;
-    let value: Value = serde_json::from_slice(&bytes)
-        .map_err(|_| AppError::Invalid("cached YouTube metadata corrupt".into()))?;
+    let value = read_info_file(&file).await?;
     Ok(Some((value, asset)))
 }
 async fn read_metadata(

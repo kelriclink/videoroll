@@ -325,7 +325,43 @@ fn overlay(base: &mut Map<String, Value>, value: &Value) -> AppResult<()> {
     }
     Ok(())
 }
-pub async fn saved(db: &Database, id: Uuid) -> AppResult<Option<Value>> {
+pub(crate) fn original_key(id:Uuid)->String{format!("meta/{id}/publish_meta.json")}
+async fn write_snapshot_file(store:&crate::storage::AssetRegistry,key:&str,bytes:&[u8])->AppResult<()>{
+    let path=store.resolve_existing(key).await?;
+    let parent=path.parent().ok_or_else(||AppError::Invalid("metadata directory missing".into()))?;
+    tokio::fs::create_dir_all(parent).await?;
+    let path=store.resolve_existing(key).await?;
+    let parent=parent.to_owned();let bytes=bytes.to_vec();
+    tokio::task::spawn_blocking(move || -> AppResult<()> {
+        use std::io::Write;
+        let mut tmp=tempfile::NamedTempFile::new_in(&parent)?;
+        tmp.write_all(&bytes)?;tmp.as_file().sync_all()?;
+        tmp.persist(&path).map_err(|e|AppError::from(e.error))?;
+        std::fs::File::open(&parent)?.sync_all()?;
+        Ok(())
+    }).await.map_err(|_|AppError::Unavailable("metadata snapshot writer failed".into()))?
+}
+pub(crate) async fn persist_original(store:&crate::storage::AssetRegistry,id:Uuid,meta:&Value,platform_snapshot:bool)->AppResult<()>{
+    let bytes=serde_json::to_vec_pretty(meta).map_err(|_|AppError::Invalid("cannot serialize metadata".into()))?;
+    if bytes.len()>MAX_META_BYTES{return Err(AppError::Invalid("publish metadata exceeds read budget".into()));}
+    if platform_snapshot{write_snapshot_file(store,&format!("meta/{id}/publish/bilibili.json"),&bytes).await?;}
+    write_snapshot_file(store,&original_key(id),&bytes).await
+}
+pub async fn saved(db: &Database, store:&crate::storage::AssetRegistry,id: Uuid) -> AppResult<Option<Value>> {
+    let path=store.resolve_existing(&original_key(id)).await?;
+    match tokio::fs::File::open(path).await {
+        Ok(file)=>{
+            use tokio::io::AsyncReadExt;
+            let mut raw=Vec::new();file.take((MAX_META_BYTES+1) as u64).read_to_end(&mut raw).await?;
+            if raw.len()>MAX_META_BYTES{return Err(AppError::Invalid("publish metadata exceeds read budget".into()));}
+            let value:Value=serde_json::from_slice(&raw).map_err(|_|AppError::Invalid("original publish metadata corrupt".into()))?;
+            if !value.is_object(){return Err(AppError::Invalid("original publish metadata is not an object".into()));}
+            return Ok(Some(value));
+        }
+        Err(e) if e.kind()==std::io::ErrorKind::NotFound=>{},
+        Err(e)=>return Err(e.into()),
+    }
+    // Read earlier Rust-only snapshots without creating a second task.
     sqlx::query_scalar::<_, Value>("SELECT value_json FROM vr2_publish_meta WHERE task_id=$1")
         .bind(id)
         .fetch_optional(&db.pool)
@@ -334,7 +370,7 @@ pub async fn saved(db: &Database, id: Uuid) -> AppResult<Option<Value>> {
 }
 async fn read_saved(State(state): State<AppState>, Path(id): Path<Uuid>) -> AppResult<Json<Value>> {
     crate::legacy_contracts::read_visible_task(&state.db, id).await?;
-    let meta = saved(&state.db, id)
+    let meta = saved(&state.db, &state.storage,id)
         .await?
         .ok_or_else(|| AppError::NotFound("publish_meta not saved".into()))?;
     Ok(Json(meta))
@@ -557,22 +593,16 @@ async fn source_metadata(state: &AppState, id: Uuid) -> AppResult<Option<Value>>
     let Ok(meta) = tokio::fs::metadata(&path).await else {
         return Ok(None);
     };
-    if meta.len() > 2_000_000 {
+    if meta.len() > crate::youtube_meta::MAX_INFO as u64 {
         return Ok(None);
     }
-    let Ok(bytes) = tokio::fs::read(path).await else {
-        return Ok(None);
-    };
-    if bytes.len() > 2_000_000 {
-        return Ok(None);
-    }
-    let Ok(value) = serde_json::from_slice::<Value>(&bytes) else {
+    let Ok(value) = crate::youtube_meta::read_info_file(&path).await else {
         return Ok(None);
     };
     Ok(value.is_object().then_some(value))
 }
 pub(crate) async fn automatic_draft(state: &AppState, id: Uuid) -> AppResult<Value> {
-    if let Some(meta) = saved(&state.db, id).await? {
+    if let Some(meta) = saved(&state.db, &state.storage,id).await? {
         return Ok(meta);
     }
     build_draft(
@@ -591,14 +621,14 @@ async fn build_draft(state: &AppState, id: Uuid, req: DraftRequest) -> AppResult
             "draft mode must be auto,default,source".into(),
         ));
     }
-    let task = read_task(&state.db, id).await?;
+    let task = crate::legacy_contracts::read_visible_task(&state.db, id).await?;
     let original = crate::settings::effective(&state.db, "bilibili.publish").await?;
     // Original get_bilibili_publish_settings merges a complete baseline
     // even when the saved settings contain only upload/activity preferences.
     let configured = crate::bilibili_settings_v1::view(&original);
     let mut meta = configured["default_meta"].as_object().cloned()
         .ok_or_else(|| AppError::Invalid("Bilibili default metadata missing".into()))?;
-    let stored = saved(&state.db, id).await?;
+    let stored = saved(&state.db, &state.storage,id).await?;
     if req.mode == "auto"
         && let Some(value) = stored.as_ref()
     {
@@ -729,10 +759,9 @@ async fn save_meta(
     .bind(&digest)
     .execute(&mut *tx)
     .await?;
+    persist_original(&state.storage,id,&normalized,false).await?;
     tx.commit().await?;
-    Ok(Json(
-        json!({"stored":true,"key":format!("db:vr2_publish_meta:{id}"),"meta":normalized}),
-    ))
+    Ok(Json(json!({"stored":true,"key":original_key(id),"meta":normalized})))
 }
 pub fn router() -> Router<AppState> {
     Router::new()

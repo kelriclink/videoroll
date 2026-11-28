@@ -342,9 +342,8 @@ async fn fill_original_titles(state:&AppState,tasks:&mut [V1Task])->AppResult<()
         // The original tolerates missing/corrupt metadata without losing the task.
         let Ok(path)=state.storage.resolve_existing(key).await else {continue};
         let Ok(meta)=tokio::fs::metadata(&path).await else {continue};
-        if !meta.is_file() || meta.len()>2_000_000 {continue}
-        let Ok(raw)=tokio::fs::read(path).await else {continue};
-        let Ok(info)=serde_json::from_slice::<Value>(&raw) else {continue};
+        if !meta.is_file() || meta.len()>crate::youtube_meta::MAX_INFO as u64 {continue}
+        let Ok(info)=crate::youtube_meta::read_info_file(&path).await else {continue};
         task.display_title=["title","fulltitle","alt_title"].iter()
             .find_map(|key|info.get(*key).and_then(Value::as_str).map(str::trim).filter(|s|!s.is_empty()).map(str::to_owned));
     }

@@ -672,7 +672,7 @@ mod tests {
 /// dispatcher for a native Rust archive upload.
 /// Register the original publication ledger before any external upload.
 pub(crate) async fn register_automatic(
-    db: &crate::Database, job: &crate::domain::WorkItem,
+    db: &crate::Database,store:&crate::storage::AssetRegistry,job: &crate::domain::WorkItem,
     meta: &Value, parts: &[(String,String)], cover: Option<&str>, mode: &str,
 ) -> AppResult<()> {
     let mut tx = db.pool.begin().await?;
@@ -689,8 +689,17 @@ pub(crate) async fn register_automatic(
         "video_parts":parts.iter().map(|(key,title)|json!({"video":{"type":"storage","key":key},"title":title})).collect::<Vec<_>>(),"typeid_mode":mode});
     let id=job.id;
     let operation=format!("publish-job:{id}");
-    sqlx::query("INSERT INTO publish_jobs(id,task_id,platform,meta_json,cover_key,state,operation_key,lease_owner,lease_until) VALUES($1,$2,'bilibili',$3,$4,'submitting',$5,'rust-v2',now()+interval '48 hours')")
-        .bind(id).bind(job.task_id).bind(snapshot).bind(cover).bind(&operation).execute(&mut *tx).await?;
+    // Original lifecycle includes a batch even for a single platform.
+    // This synchronous stage advances its own workflow, unlike mixed auto_parent.
+    let batch=Uuid::new_v4();
+    let expected=json!([{"key":"bilibili:default","platform":"bilibili","account_id":null}]);
+    let request=json!({"platforms":["bilibili"],"account_id":null,"video_key":video.0,"video_parts":snapshot["video_parts"],"cover_key":cover,"meta":meta,"typeid_mode":mode});
+    sqlx::query("INSERT INTO publish_batches(id,task_id,state,expected_targets,request_json) VALUES($1,$2,'active',$3,$4)")
+        .bind(batch).bind(job.task_id).bind(expected).bind(request).execute(&mut *tx).await?;
+    sqlx::query("INSERT INTO publish_jobs(id,task_id,platform,meta_json,cover_key,state,operation_key,lease_owner,lease_until,batch_id) VALUES($1,$2,'bilibili',$3,$4,'submitting',$5,'rust-v2',now()+interval '48 hours',$6)")
+        .bind(id).bind(job.task_id).bind(snapshot).bind(cover).bind(&operation).bind(batch).execute(&mut *tx).await?;
+    crate::publish_meta::persist_original(store,job.task_id,meta,true).await?;
+    sqlx::query("UPDATE tasks SET active_publish_batch_id=$2 WHERE id=$1").bind(job.task_id).bind(batch).execute(&mut *tx).await?;
     sqlx::query("INSERT INTO operation_inbox(id,operation_key,status,request_json,lease_owner,lease_until,runtime_engine) VALUES($1,$2,'processing','{}'::jsonb,'rust-v2',now()+interval '48 hours','python')")
         .bind(Uuid::new_v4()).bind(&operation).execute(&mut *tx).await?;
     sqlx::query("UPDATE vr2_workflows SET configuration=jsonb_set(configuration,'{bilibili_auto_job_id}',to_jsonb($2::uuid)),updated_at=now() WHERE id=$1")

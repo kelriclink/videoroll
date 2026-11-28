@@ -495,7 +495,7 @@ async fn read_review(
             .fetch_optional(&state.db.pool)
             .await?;
     if let Some((saved_fingerprint, mut result)) = saved
-        && let Some(meta) = crate::publish_meta::saved(&state.db, id).await?
+        && let Some(meta) = crate::publish_meta::saved(&state.db,&state.storage,id).await?
     {
         let subtitle = subtitle_content(&state.db, &state.storage, id).await?;
         let fingerprint = fingerprint(&meta, &cfg, &limited(&subtitle, 12000))?;
@@ -527,7 +527,7 @@ async fn run_review(
         .get("meta")
         .filter(|v| v.is_object())
         .cloned()
-        .or(crate::publish_meta::saved(&state.db, id).await?)
+        .or(crate::publish_meta::saved(&state.db,&state.storage,id).await?)
         .ok_or_else(|| AppError::Invalid("publish review requires Bilibili metadata".into()))?;
     let meta = crate::publish_meta::normalized(meta)?;
     let parsed: crate::bilibili::ArchiveMeta = serde_json::from_value(meta.clone())

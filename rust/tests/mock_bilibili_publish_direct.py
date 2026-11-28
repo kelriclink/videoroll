@@ -88,7 +88,9 @@ class Handler(BaseHTTPRequestHandler):
      STATE['activity_final']+=1
      refs={c['ref'] for c in payload['details']}
      assert refs=={'public:999','topic:302'},refs
-     selected={'ref':'public:777' if '伪造' in title else 'topic:302' if '普通话题' in title else 'public:999','reason':'fixture'}
+     if '普通回退' in title: selected={'ref':'none','reason':'只是普通话题，不属于奖励活动'}
+     elif '无关拒绝' in title: selected={'ref':'none','reason':'不属于活动且与视频无关'}
+     else: selected={'ref':'public:777' if '伪造' in title else 'topic:302' if '普通话题' in title else 'public:999','reason':'fixture'}
     return self.send(200,{'choices':[{'message':{'content':json.dumps(selected)}}],'usage':{'prompt_tokens':16,'completion_tokens':10,'total_tokens':26}})
    assert '候选分区' in text and '172' in text and '180' in text,text
    STATE['ai']+=1
@@ -117,7 +119,7 @@ class Handler(BaseHTTPRequestHandler):
              'named-account-B':('isolated-account-B','BCDE123456789012')}.get(data['title'],('video-roll-test','1234567890123456'))
    assert 'SESSDATA='+expected[0] in self.headers.get('Cookie',''),data['title']
    assert data['csrf']==expected[1],data['title']
-   assert data['title'] in ['isolated Rust P1','ambiguous-publish','two-part','【熟肉&中配】two-part','ai-summary','ai-invalid','batch-only','batch-unknown','named-account-A','named-account-B','魔兽世界活动验收','魔兽世界普通话题验收','魔兽世界AI伪造验收','魔兽世界发现失败验收','魔兽世界人工指定验收'],data
+   assert data['title'] in ['isolated Rust P1','ambiguous-publish','two-part','【熟肉&中配】two-part','ai-summary','ai-invalid','batch-only','batch-unknown','named-account-A','named-account-B','魔兽世界活动验收','魔兽世界普通话题验收','魔兽世界普通回退验收','魔兽世界无关拒绝验收','魔兽世界AI伪造验收','魔兽世界发现失败验收','魔兽世界人工指定验收'],data
    assert data['copyright']==2 and data['source'].startswith('https://youtu.be/'),data
    assert data['videos'][0]['filename']=='rust-test' and data['videos'][0]['cid']==421,data
    if data['title']=='isolated Rust P1':assert data['cover']=='https://i0.hdslb.com/mock_cover.jpg',data
@@ -134,7 +136,7 @@ class Handler(BaseHTTPRequestHandler):
    expected_tid={'isolated Rust P1':180,'ai-summary':172,'ai-invalid':180}.get(data['title'],171)
    assert data['tid']==expected_tid,data
    if data['title'].startswith('魔兽世界'):
-    expected_ids={'魔兽世界活动验收':(301,901),'魔兽世界普通话题验收':(302,None),'魔兽世界人工指定验收':(302,None)}.get(data['title'],(None,None))
+    expected_ids={'魔兽世界活动验收':(301,901),'魔兽世界普通话题验收':(302,None),'魔兽世界普通回退验收':(302,None),'魔兽世界人工指定验收':(302,None)}.get(data['title'],(None,None))
     assert (data.get('topic_id'),data.get('mission_id'))==expected_ids,data
    STATE['submit']+=1
    if data['title'] in ('ambiguous-publish','batch-unknown'):

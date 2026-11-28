@@ -893,7 +893,7 @@ async fn admit_batch(
         }
         expected.push(json!({"platform":p,"account_id":account,"key":format!("{p}:{}",account.map(|v|v.to_string()).unwrap_or("default".into()))}));
         if p == "bilibili" {
-            let saved = crate::publish_meta::saved(&state.db, task).await?;
+            let saved = crate::publish_meta::saved(&state.db,&state.storage,task).await?;
             let supplied = meta.map(crate::publish_meta::normalized).transpose()?;
             if parent.is_none()
                 && saved
