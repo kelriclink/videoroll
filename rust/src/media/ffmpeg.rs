@@ -30,7 +30,7 @@ impl Default for RenderProfile {
             soft_sub: false,
             video_codec: "h264".into(),
             use_intel_gpu: false,
-            video_crf: Some(23),
+            video_crf: None,
             video_preset: None,
             ass_style: "clean_white".into(),
         }
@@ -82,7 +82,7 @@ pub async fn probe_video(binary: &Path, path: &Path) -> AppResult<Value> {
         .arg("-v")
         .arg("error")
         .arg("-show_entries")
-        .arg("format=duration,format_name:stream=codec_type,codec_name,width,height,pix_fmt,bits_per_raw_sample,avg_frame_rate,r_frame_rate")
+        .arg("format=duration,format_name,bit_rate:stream=codec_type,codec_name,width,height,pix_fmt,bits_per_raw_sample,avg_frame_rate,r_frame_rate,bit_rate")
         .arg("-of")
         .arg("json")
         .arg(path)
@@ -172,7 +172,7 @@ pub fn encode_args(
             ));
         }
     };
-    let crf = profile.video_crf.unwrap_or(23).min(if codec=="av1"{63}else{51});
+    let crf = profile.video_crf.unwrap_or(if codec=="av1"{24}else{23}).min(if codec=="av1"{63}else{51});
     let mut args = vec!["-hide_banner", "-nostdin", "-y", "-v", "warning", "-i"]
         .into_iter()
         .map(str::to_owned)
@@ -212,20 +212,19 @@ pub fn encode_args(
         args.push("-vaapi_device".into());
         args.push(device.unwrap().to_owned());
     }
-    args.push("-c:v".into());
-    args.push(encoder.into());
     if gpu {
-        args.push("-qp".into());
-        args.push(crf.to_string());
+        args.extend(vaapi_encoder_args(profile, codec, None));
     } else if codec == "av1" {
+        args.extend(["-c:v".into(), encoder.into()]);
         args.push("-crf".into());
         args.push(crf.to_string());
         args.push("-preset".into());
         // Preserve the native default but honor the saved numeric SVT preset.
         let preset=profile.video_preset.as_deref().and_then(|s|s.trim().parse::<i32>().ok())
-            .map(|n|n.clamp(0,13)).unwrap_or(8);
+            .map(|n|n.clamp(0,13)).unwrap_or(4);
         args.push(preset.to_string());
     } else {
+        args.extend(["-c:v".into(),encoder.into()]);
         args.push("-crf".into());
         args.push(crf.to_string());
         args.push("-preset".into());
@@ -238,9 +237,7 @@ pub fn encode_args(
             "-map",
             "0:a?",
             "-c:a",
-            "aac",
-            "-b:a",
-            "192k",
+            "copy",
             "-movflags",
             "+faststart",
         ]
@@ -443,21 +440,37 @@ fn intel_av1_preset_quality(preset: Option<&str>) -> Option<u8> {
     let number = preset?.trim().parse::<i32>().ok()?.clamp(0, 13);
     Some(1 + ((number as f64 * 7.0 / 13.0).round() as u8))
 }
-fn vaapi_encoder_args(profile: &RenderProfile, codec: &str) -> Vec<String> {
-    let quality = profile.video_crf.unwrap_or(23);
+// Null quality selects automatic bitrate. Explicit quality retains CQP.
+// Container bitrate is not a substitute for the selected video stream rate.
+fn adaptive_av1_bitrate(profile: &RenderProfile, probe: &Value) -> Option<u64> {
+    if profile.video_codec != "av1" || profile.video_crf.is_some() {
+        return None;
+    }
+    let info = render_info(probe).ok()?;
+    let value = &probe["streams"].as_array()?.iter().find(|s| s["codec_type"] == "video")?["bit_rate"];
+    let source = value.as_u64().or_else(|| value.as_str()?.parse().ok())?;
+    if source == 0 || source > 120_000_000 { return None; }
+    let fps = render_opt::parse_rational(&info.frame_rate)?;
+    if !fps.is_finite() || fps <= 0.0 || fps > 240.0 { return None; }
+    // 50% generational/subtitle headroom, with a pixel-rate floor.
+    let floor = (info.width as f64 * info.height as f64 * fps * 0.016).ceil() as u64;
+    let target = source.saturating_mul(3).div_ceil(2).max(floor).clamp(250_000,120_000_000);
+    Some(target.div_ceil(1000)*1000)
+}
+fn vaapi_encoder_args(profile: &RenderProfile, codec: &str, target: Option<u64>) -> Vec<String> {
+    let quality = profile.video_crf.unwrap_or(if codec=="av1"{24}else{23});
     let (encoder, flag, max_quality) = match codec {
         "h264" => ("h264_vaapi", "-qp", 51),
         "hevc" => ("hevc_vaapi", "-qp", 51),
         _ => ("av1_vaapi", "-global_quality", 63),
     };
-    let mut args = vec![
-        "-c:v".into(),
-        encoder.into(),
-        "-rc_mode".into(),
-        "CQP".into(),
-        flag.into(),
-        quality.min(max_quality).to_string(),
-    ];
+    let mut args = vec!["-c:v".into(), encoder.into()];
+    if let Some(rate) = target.filter(|_| codec=="av1" && profile.video_crf.is_none()) {
+        args.extend(["-rc_mode".into(),"VBR".into(),"-b:v".into(),rate.to_string(),
+            "-maxrate".into(),rate.saturating_mul(2).to_string(),"-bufsize".into(),rate.saturating_mul(4).to_string()]);
+    } else {
+        args.extend(["-rc_mode".into(),"CQP".into(),flag.into(),quality.min(max_quality).to_string()]);
+    }
     let preset_quality = match codec {
         "h264" => intel_h264_preset_quality(profile.video_preset.as_deref()),
         "av1" => intel_av1_preset_quality(profile.video_preset.as_deref()),
@@ -615,6 +628,7 @@ async fn run_vaapi_overlay(
     software_format: &str,
     profile: &RenderProfile,
     codec: &str,
+    target_bitrate: Option<u64>,
     video_width: u32,
     overlay_height: u32,
     overlay_y: u32,
@@ -669,14 +683,12 @@ async fn run_vaapi_overlay(
         "-map".into(),
         "[out]".into(),
     ]);
-    args.extend(vaapi_encoder_args(profile, codec));
+    args.extend(vaapi_encoder_args(profile, codec,target_bitrate));
     args.extend([
         "-map".into(),
         "0:a?".into(),
         "-c:a".into(),
-        "aac".into(),
-        "-b:a".into(),
-        "192k".into(),
+        "copy".into(),
         "-movflags".into(),
         "+faststart".into(),
         output.to_string_lossy().to_string(),
@@ -694,6 +706,7 @@ async fn run_vaapi_legacy(
     software_format: &str,
     profile: &RenderProfile,
     codec: &str,
+    target_bitrate: Option<u64>,
 ) -> AppResult<()> {
     let mut args = vec![
         "-hide_banner".into(),
@@ -722,16 +735,14 @@ async fn run_vaapi_legacy(
         format!("format={software_format},hwupload")
     };
     args.extend(["-vf".into(), filter]);
-    args.extend(vaapi_encoder_args(profile, codec));
+    args.extend(vaapi_encoder_args(profile, codec,target_bitrate));
     args.extend([
         "-map".into(),
         "0:v:0".into(),
         "-map".into(),
         "0:a?".into(),
         "-c:a".into(),
-        "aac".into(),
-        "-b:a".into(),
-        "192k".into(),
+        "copy".into(),
         "-movflags".into(),
         "+faststart".into(),
         output.to_string_lossy().to_string(),
@@ -745,9 +756,10 @@ async fn render_intel_gpu(
     subtitle: Option<&Path>,
     profile: &RenderProfile,
     device: &str,
+    probe: &Value,
+    target_bitrate: Option<u64>,
 ) -> AppResult<Value> {
-    let probe = probe_video(&config.ffprobe_binary, source).await?;
-    let info = render_info(&probe)?;
+    let info = render_info(probe)?;
     let codec = match profile.video_codec.as_str() {
         "h264" | "avc" => "h264",
         "hevc" | "h265" => "hevc",
@@ -761,10 +773,20 @@ async fn render_intel_gpu(
     let preserve_10bit = info.bit_depth > 8 && codec == "av1";
     let vaapi_format = if preserve_10bit { "p010" } else { "nv12" };
     let software_format = if preserve_10bit { "p010le" } else { "nv12" };
+    let tick=Instant::now();
     let hw_decode =
         vaapi_decode_preflight(config, source, device, vaapi_format, software_format).await;
+    let preflight_seconds=tick.elapsed().as_secs_f64();
+    let tick=Instant::now();
     let overlay_available = ffmpeg_filter_available(config, "overlay_vaapi").await;
+    let filter_probe_seconds=tick.elapsed().as_secs_f64();
     let mut metrics = json!({"encoder":format!("{codec}_vaapi"),"decode_mode":if hw_decode{"vaapi"}else{"software-upload"},"source_bit_depth":info.bit_depth,"output_bit_depth":if preserve_10bit{10}else{8},"source_pixel_format":info.pixel_format,"source_frame_rate":info.frame_rate,"source_duration_seconds":info.duration_seconds,"video_width":info.width,"video_height":info.height,"overlay_vaapi_available":overlay_available});
+    metrics["audio_mode"]=json!("copy");
+    metrics["video_rate_control"]=json!(if target_bitrate.is_some(){"VBR"}else{"CQP"});
+    metrics["target_video_bitrate"]=json!(target_bitrate);
+    metrics["video_quantizer"]=json!(if target_bitrate.is_some(){None}else{Some(profile.video_crf.unwrap_or(if codec=="av1"{24}else{23}).min(if codec=="av1"{63}else{51}))});
+    metrics["vaapi_preflight_seconds"]=json!(preflight_seconds);
+    metrics["overlay_filter_probe_seconds"]=json!(filter_probe_seconds);
     if let Some(subtitle) = subtitle.filter(|_| overlay_available) {
         let ass_text = fs::read_to_string(subtitle).await?;
         let parent = output.parent().unwrap_or_else(|| Path::new("."));
@@ -813,6 +835,7 @@ async fn render_intel_gpu(
             }
         }
         if let Some(cache) = event_cache.as_ref() {
+            let encode_started=Instant::now();
             match run_vaapi_overlay(
                 config,
                 source,
@@ -823,6 +846,7 @@ async fn render_intel_gpu(
                 software_format,
                 profile,
                 codec,
+                target_bitrate,
                 info.width,
                 overlay_height,
                 overlay_y,
@@ -833,6 +857,7 @@ async fn render_intel_gpu(
             .await
             {
                 Ok(()) => {
+                    metrics["ffmpeg_encode_seconds"]=json!(encode_started.elapsed().as_secs_f64());
                     metrics["subtitle_overlay_mode"] = json!("event-vfr");
                     metrics["subtitle_overlay_fps"] = json!(overlay_rate);
                     metrics["subtitle_event_cache_states"] = json!(cache.frame_count);
@@ -848,6 +873,7 @@ async fn render_intel_gpu(
                 }
             }
         }
+        let encode_started=Instant::now();
         match run_vaapi_overlay(
             config,
             source,
@@ -858,6 +884,7 @@ async fn render_intel_gpu(
             software_format,
             profile,
             codec,
+            target_bitrate,
             info.width,
             overlay_height,
             overlay_y,
@@ -868,6 +895,7 @@ async fn render_intel_gpu(
         .await
         {
             Ok(()) => {
+                metrics["ffmpeg_encode_seconds"]=json!(encode_started.elapsed().as_secs_f64());
                 metrics["subtitle_overlay_mode"] = json!(if static_overlay {
                     "live-static"
                 } else if band_used {
@@ -895,6 +923,7 @@ async fn render_intel_gpu(
             software_format,
             profile,
             codec,
+            target_bitrate,
         )
         .await?;
         metrics["subtitle_overlay_mode"] = json!("legacy-full-frame-fallback");
@@ -911,6 +940,7 @@ async fn render_intel_gpu(
         software_format,
         profile,
         codec,
+        target_bitrate,
     )
     .await?;
     metrics["subtitle_overlay_mode"] = json!(if subtitle.is_some() {
@@ -940,6 +970,7 @@ pub async fn transcode(
     subtitles: Option<&Path>,
     profile: &RenderProfile,
 ) -> AppResult<Value> {
+    let transcode_started=Instant::now();
     let device = std::env::var("INTEL_GPU_RENDER_DEVICE")
         .ok()
         .filter(|s| s.starts_with("/dev/dri/renderD") && Path::new(s).exists());
@@ -951,11 +982,26 @@ pub async fn transcode(
     let mut gpu_fallback_reason = None;
     if gpu_requested {
         if let Some(device) = device.as_deref() {
-            match render_intel_gpu(config, source, output, subtitles, profile, device).await {
+            let probe_started=Instant::now();
+            let probe=probe_video(&config.ffprobe_binary,source).await?;
+            let probe_seconds=probe_started.elapsed().as_secs_f64();
+            let target=adaptive_av1_bitrate(profile,&probe);
+            let mut result=render_intel_gpu(config, source, output, subtitles, profile, device,&probe,target).await;
+            if target.is_some() && result.is_err() {
+                // Some VAAPI drivers do not support VBR. Preserve the GPU
+                // composition path with original CQP before CPU fallback.
+                tracing::warn!("adaptive AV1 VBR failed; retrying original CQP on GPU");
+                let _=fs::remove_file(output).await;
+                result=render_intel_gpu(config,source,output,subtitles,profile,device,&probe,None).await;
+                if let Ok(metrics)=&mut result{metrics["rate_control_fallback"]=json!("VBR failed; original CQP");}
+            }
+            match result {
                 Ok(mut metrics) => {
                     metrics["gpu_requested"] = json!(gpu_requested);
                     metrics["gpu_device"] = json!(device);
                     metrics["gpu_auto_enabled"] = json!(render_gpu_auto_enabled());
+                    metrics["input_probe_seconds"]=json!(probe_seconds);
+                    metrics["transcode_seconds"]=json!(transcode_started.elapsed().as_secs_f64());
                     return Ok(metrics);
                 }
                 Err(error) => {
@@ -980,7 +1026,9 @@ pub async fn transcode(
         "pipeline":"cpu-ass-software-encoder-fallback",
         "decode_mode":"software",
         "subtitle_overlay_mode":if subtitles.is_some(){"cpu-libass"}else{"none"},
-        "gpu_requested":gpu_requested
+        "gpu_requested":gpu_requested,
+        "audio_mode":"copy",
+        "transcode_seconds":transcode_started.elapsed().as_secs_f64()
     });
     if let Some(reason) = gpu_fallback_reason {
         metrics["gpu_fallback_reason"] = json!(reason);
@@ -1231,6 +1279,7 @@ pub async fn render(
     registry: &AssetRegistry,
     job: &WorkItem,
 ) -> AppResult<Value> {
+    let stage_started=Instant::now();
     // A new selective subtitle version invalidates the previously burned-in
     // video; never reuse a video_final from an earlier subtitle generation.
     let selective: bool = sqlx::query_scalar(
@@ -1312,13 +1361,21 @@ pub async fn render(
                 .parent()
                 .ok_or_else(|| AppError::Invalid("render output parent missing".into()))?,
         )?;
-    let render_metrics = if soft{
+    let mut render_metrics = if soft{
         mux_soft_sub(config,&input,subtitle.as_deref().ok_or_else(||AppError::Conflict("soft subtitle input missing".into()))?,temp.path()).await?
     }else{transcode(config, &input, temp.path(), subtitle.as_deref(), &cfg).await?};
-    probe_video(&config.ffprobe_binary, temp.path()).await?;
+    let tick=Instant::now();
+    let output_probe=probe_video(&config.ffprobe_binary, temp.path()).await?;
+    render_metrics["output_probe_seconds"]=json!(tick.elapsed().as_secs_f64());
+    render_metrics["output_video_bitrate"]=output_probe["streams"].as_array().and_then(|s|s.iter().find(|x|x["codec_type"]=="video")).map(|s|s["bit_rate"].clone()).unwrap_or(Value::Null);
+    let tick=Instant::now();
     fs::File::open(temp.path()).await?.sync_all().await?;
+    render_metrics["output_sync_seconds"]=json!(tick.elapsed().as_secs_f64());
+    let tick=Instant::now();
     let mut result =
         install_task_asset(db, registry, job, "video_final", &output_key, temp.path()).await?;
+    render_metrics["asset_install_seconds"]=json!(tick.elapsed().as_secs_f64());
+    render_metrics["render_stage_seconds"]=json!(stage_started.elapsed().as_secs_f64());
     result["render_metrics"] = render_metrics;
     Ok(result)
 }
@@ -1352,7 +1409,7 @@ mod tests {
         let args=encode_args(src,dst,None,&av1,None).unwrap();
         assert!(args.windows(2).any(|v|v[0]=="-preset" && v[1]=="4"));
         assert!(args.windows(2).any(|v|v[0]=="-crf" && v[1]=="60"));
-        let args=vaapi_encoder_args(&av1,"av1");
+        let args=vaapi_encoder_args(&av1,"av1",None);
         assert!(args.windows(2).any(|v|v[0]=="-global_quality" && v[1]=="60"));
         av1.video_codec="h264".into();
         av1.video_preset=Some("placebo".into());
@@ -1363,6 +1420,45 @@ mod tests {
         assert!(encode_args(src,dst,None,&av1,None).unwrap().windows(2).any(|v|v[0]=="-crf" && v[1]=="0"));
         av1.video_codec = "rawvideo".into();
         assert!(encode_args(src, dst, None, &av1, None).is_err());
+    }
+    #[test]
+    fn automatic_av1_rate_uses_source_and_explicit_quality_wins() {
+        let mut p=RenderProfile{video_codec:"av1".into(),video_crf:None,..RenderProfile::default()};
+        let probe=json!({"format":{"duration":"93.221"},"streams":[{"codec_type":"video","width":1920,"height":1080,"avg_frame_rate":"30000/1001","bit_rate":"653796"}]});
+        let target=adaptive_av1_bitrate(&p,&probe).unwrap();
+        assert!((980_000..=1_000_000).contains(&target));
+        let args=vaapi_encoder_args(&p,"av1",Some(target));
+        assert!(args.windows(2).any(|v|v[0]=="-rc_mode" && v[1]=="VBR"));
+        assert!(!args.iter().any(|s|s=="-global_quality"));
+        let fallback=vaapi_encoder_args(&p,"av1",None);
+        assert!(fallback.windows(2).any(|v|v[0]=="-global_quality" && v[1]=="24"));
+        p.video_crf=Some(36);
+        assert!(adaptive_av1_bitrate(&p,&probe).is_none());
+        assert!(vaapi_encoder_args(&p,"av1",Some(target)).windows(2).any(|v|v[0]=="-global_quality" && v[1]=="36"));
+        p.video_crf=None;
+        assert!(adaptive_av1_bitrate(&p,&json!({"format":{"duration":"10"},"streams":[{"codec_type":"video","width":1920,"height":1080}]})).is_none());
+        let args=encode_args(Path::new("/tmp/a.mp4"),Path::new("/tmp/b.mp4"),None,&p,None).unwrap();
+        assert!(args.windows(2).any(|v|v[0]=="-c:a" && v[1]=="copy"));
+        assert!(args.windows(2).any(|v|v[0]=="-crf" && v[1]=="24"));
+    }
+    #[tokio::test]
+    async fn original_video_av1_rate_benchmark() {
+        let Ok(root)=std::env::var("VIDEOROLL_AV1_RATE_TEST_ROOT") else{return;};
+        let root=PathBuf::from(root);
+        let config=Config::from_env().unwrap();
+        let source=root.join("source.mp4");
+        let ass=root.join("subtitle.ass");
+        for (label,quality) in [("cqp24",Some(24)),("adaptive",None)] {
+            let p=RenderProfile{video_codec:"av1".into(),video_crf:quality,use_intel_gpu:true,..RenderProfile::default()};
+            let output=root.join(format!("{label}-rust.mp4"));
+            let result=transcode(&config,&source,&output,Some(&ass),&p).await.unwrap();
+            let probe=probe_video(&config.ffprobe_binary,&output).await.unwrap();
+            assert_eq!(result["encoder"],"av1_vaapi");
+            assert_eq!(result["subtitle_overlay_mode"],"event-vfr");
+            assert_eq!(result["video_rate_control"],if quality.is_none(){"VBR"}else{"CQP"});
+            assert!(probe["streams"].as_array().unwrap().iter().any(|s|s["codec_type"]=="audio" && s["codec_name"]=="opus"));
+            println!("BENCH {}",json!({"label":label,"size":fs::metadata(&output).await.unwrap().len(),"metrics":result,"probe":probe}));
+        }
     }
     // Opt-in benchmark: no DB connection, no production jobs, identical fixture
     // and encoder quality as the Python reference.
