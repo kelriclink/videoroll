@@ -358,6 +358,7 @@ pub async fn active_progress(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FailureKind {
     FormatUnavailable,
+    MembersOnly,
     Verification,
     RateLimited,
     Network,
@@ -368,6 +369,7 @@ impl FailureKind {
     fn label(self) -> &'static str {
         match self {
             Self::FormatUnavailable => "requested format is not available",
+            Self::MembersOnly => "YouTube members-only content requires channel membership",
             Self::Verification => "authentication or bot verification required",
             Self::RateLimited => "upstream rate limited",
             Self::Network => "network or incomplete transfer",
@@ -383,6 +385,7 @@ impl FailureKind {
 struct DiagnosticTail {
     tail: Vec<u8>,
     format: bool,
+    members_only: bool,
     verification: bool,
     rate: bool,
     network: bool,
@@ -397,6 +400,9 @@ impl DiagnosticTail {
         }
         let t = String::from_utf8_lossy(&self.tail).to_ascii_lowercase();
         self.format |= t.contains("requested format is not available");
+        self.members_only |= t.contains("members-only content")
+            || t.contains("members-only video")
+            || t.contains("join this channel to get access");
         self.verification |= [
             "sign in",
             "confirm you",
@@ -430,6 +436,8 @@ impl DiagnosticTail {
     fn classify(&self) -> FailureKind {
         if self.disk {
             FailureKind::Disk
+        } else if self.members_only {
+            FailureKind::MembersOnly
         } else if self.verification {
             FailureKind::Verification
         } else if self.rate {
@@ -464,7 +472,7 @@ impl Backend {
             Self::Parallel
                 if !matches!(
                     error,
-                    FailureKind::Disk | FailureKind::Verification | FailureKind::RateLimited
+                    FailureKind::Disk | FailureKind::MembersOnly | FailureKind::Verification | FailureKind::RateLimited
                 ) =>
             {
                 Some(Self::Native)
@@ -898,6 +906,16 @@ print('[download] vr2|100|100|NA|1000|0|100.0%')
         tail.push(b"HTTP Error 429");
         assert_eq!(tail.classify(), FailureKind::RateLimited);
         assert!(!tail.classify().label().contains("password"));
+    }
+    #[test]
+    fn members_only_error_is_classified_without_backend_fallback() {
+        let mut tail = DiagnosticTail::default();
+        tail.push(b"ERROR: [youtube] SWcY2Q58zGA: Join this channel to get access to members-");
+        tail.push(b"only content like this video, and other exclusive perks.");
+        assert_eq!(tail.classify(), FailureKind::MembersOnly);
+        assert_eq!(Backend::Parallel.fallback(tail.classify(), false), None);
+        assert_eq!(Backend::Native.fallback(tail.classify(), false), None);
+        assert!(!tail.classify().label().contains("SWcY2Q58zGA"));
     }
     #[test]
     fn original_python_split_format_progress_aggregation() {
