@@ -27,14 +27,19 @@
 - 最新主程序编译成功；独立 PostgreSQL、真实 HTTP、合成 FFmpeg 视频、模拟 yt-dlp 回归七组通过，日志 `/4t/vr2-historical-read.NtGVxt/legacy-actions.log`。新增测试使用 Python 所有权的旧任务、原 raw 存储键、旧标题及封面、HTTP Range 206 与跨任务 404，检查所有权不变且未产生 Rust 作业。未操作生产。该测试不是实际 YouTube 或完整原版端到端验收。
 - 后续优先补齐历史字幕/配音/投稿记录读取、资产 DTO 与流媒体响应细节；继续对照下载日志/封面、真实 aria2c/代理参数及工作流恢复。全量差分及真实平台验收仍未完成，继续 FAILED。
 
-## P0 待修复：真实 YouTube 下载验收遗留（2026-11-28）
+## P0 已修复：真实 YouTube 下载验收遗留（2026-11-28）
 
 基线 `8e94992`。使用昨晚原任务 `aa1c8626-fe2a-4f9f-8ab4-908697427f88`（NASA | Evolution of the Moon，UIKmSQqp8wY）及现有数据库 Cookies，在隔离 PostgreSQL 和独立媒体目录调用原同步下载接口，真实 yt-dlp 下载成功，HTTP 200、52,477,014 bytes、1 次尝试、任务 downloaded、旧错误清除、metadata_json 134,502 bytes、0 条投稿。测试目录 `/4t/vr2-nasa-real-replay.XlDMCc`。生产原任务未修改；不代表完整自动模式通过。首次准备隔离数据库时迁移顺序错误，修正后重放通过。
 
-- [ ] **P0 封面下载及登记遗漏。** 实测 `cover_asset` 缺失。直接移植原 `src/videoroll/apps/orchestrator_api/youtube_downloader.py:328-467` 的 `pick_thumbnail_url`、`_stream_thumbnail`、`download_thumbnail_jpg`，以及 `services/youtube_service.py:789-826` 的封面登记流程：按原规则选择缩略图、使用原下载配置、转换 JPEG、SHA256 去重、原 `final/{task_id}/cover_youtube` 命名规则及 `assets.kind=cover_image`，下载失败回退已有封面且不影响视频成功；原事务和清理行为保持一致。验收：真实 NASA 下载返回非空 cover_asset，数据库资产与 JPEG 文件一致，重复执行不重复登记，原失败回退通过。
-- [ ] **P0 分离音视频下载进度回跳。** 实测原进度接口依次报告 downloading 57% / 31,453,932 bytes、99% / 2,498,967 bytes，字节数随音视频分段切换回退。直接移植 `services/youtube_service.py` 下载进度 reporter 的 `_requested_total`、`_download_key`、`hook`（约 622-666 行）：按分段/文件标识记录已完成字节，存在 requested_total 时聚合各分段，保留原 95% 下载阶段上限及单次尝试内进度非回退约束；无总量时保持原回退逻辑；仅真实 retrying 时重置；storing 99、completed 100。对照 `youtube_parallel_downloader.py` 原 aria2 进度字段。验收：独立音视频分段、未知总量、重试及完成场景按 Python 原 hook 逐事件差分；使用同一真实 NASA 视频复测，不以单一百分比模板替代原聚合规则。
+- [x] **P0 封面下载及登记遗漏。** 实测 `cover_asset` 缺失。直接移植原 `src/videoroll/apps/orchestrator_api/youtube_downloader.py:328-467` 的 `pick_thumbnail_url`、`_stream_thumbnail`、`download_thumbnail_jpg`，以及 `services/youtube_service.py:789-826` 的封面登记流程：按原规则选择缩略图、使用原下载配置、转换 JPEG、SHA256 去重、原 `final/{task_id}/cover_youtube` 命名规则及 `assets.kind=cover_image`，下载失败回退已有封面且不影响视频成功；原事务和清理行为保持一致。验收：真实 NASA 下载返回非空 cover_asset，数据库资产与 JPEG 文件一致，重复执行不重复登记，原失败回退通过。
+- [x] **P0 分离音视频下载进度回跳。** 实测原进度接口依次报告 downloading 57% / 31,453,932 bytes、99% / 2,498,967 bytes，字节数随音视频分段切换回退。直接移植 `services/youtube_service.py` 下载进度 reporter 的 `_requested_total`、`_download_key`、`hook`（约 622-666 行）：按分段/文件标识记录已完成字节，存在 requested_total 时聚合各分段，保留原 95% 下载阶段上限及单次尝试内进度非回退约束；无总量时保持原回退逻辑；仅真实 retrying 时重置；storing 99、completed 100。对照 `youtube_parallel_downloader.py` 原 aria2 进度字段。验收：独立音视频分段、未知总量、重试及完成场景按 Python 原 hook 逐事件差分；使用同一真实 NASA 视频复测，不以单一百分比模板替代原聚合规则。
 
-这两项保持未完成，先于其余下载优化修复。必须先读原 Python 对应完整函数及测试，再修改 Rust；不再根据 Rust 当前实现重新定义验收。未通过真实复测前不得关闭待办。整体迁移仍为 FAILED。
+### 本轮修复及真实复测
+
+- `youtube_meta.rs`、`ingest.rs` 移植 Python 缩略图评分、原代理和 UA、逐跳原域名校验、30s 超时、大小上限、FFmpeg JPEG 比例、SHA256 去重、原 `final/{task}/cover_youtube` 文件命名及原 assets 登记。原 Python 实机 `download_thumbnail_jpg` 与 Rust 对同一 NASA 缩略图均输出 1146×716 MJPEG（原 1146×717 FFmpeg crop 指令因色度采样取整）；不修改原参数。封面下载/转换错误非致命，保留既有封面；新文件在事务失败或重复时清理。真实下载和重复读取已通过；故障注入（网络失败同时已有封面）及崩溃中断专项仍待补测。
+- `download_runtime.rs` 移植 Python reporter 的格式 ID、已完成字节累计和 95% 上限。原 Python hook 直接执行的四事件期望 (50,150,31)、(100,150,63)、(105,150,66)、(150,150,95)，新增 Rust 对照用例使用相同期望。CLI 每流 info_dict 可能不含 requested_downloads，使用 before_dl 输出选中格式；HLS 缺少精确大小时按 bitrate×duration 估计并随传输修正，不把已知单流大小误当总量，未知总量仍保留原 fallback 并按分段推进。补 storing 99、completed 100/ETA 0、失败保留当前进度。该 CLI 适配是为恢复原累计语义，不是新增公开 API/业务表。
+- 初次真实重放 `/4t/vr2-cover-progress-real.DVFTXj/replay.log` HTTP 200、封面 148367 bytes、零字节/百分比回跳，但发现部分总量错误导致提前 95%，以及测试错误假设 717 像素。运行原 Python 封面函数确认 716，继续修正 HLS 总量后复测。最终 `/4t/vr2-cover-progress-final.WmaBB6/replay.log`：HTTP 200、视频 52,477,014 bytes、metadata_json 134,815 bytes、JPEG 148,367 bytes；10 次 active 采样无字节或百分比回退，94→processing 95→storing 99→completed 100；SHA256 一致，重复请求返回同一 cover_asset ID；原库克隆的任务状态 downloaded、download succeeded 1/1、三类资产各 1、0 投稿。HLS 估算总字节可随实际片段变化，非累计下载字节回退。使用真实 yt-dlp、现有数据库 Cookies、独立 PG 和媒体根，未更改生产任务或部署。
+- 两项主要缺陷已修复且真实复测通过；上述未覆盖异常专项继续记录为待验证。原下载器 7 项 unittest 通过；最终 Rust 全库测试 276 通过、0 失败（环境条件未满足而提前返回的外部集成分支不等同于实跑）。最终构建及测试日志 `/4t/videoroll-rust-trial-build-ed42980/cover-progress-final-build.log`、`/4t/videoroll-rust-trial-build-ed42980/cover-progress-final-lib.log`。整体迁移仍为 FAILED；不将本次下载验收等同于自动流水线、全部 API 或生产切换验收。
 
 以下为历史审计记录，不再视为当前验收结论。当前不满足完整生产替换门槛。
 

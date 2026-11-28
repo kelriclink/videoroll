@@ -258,6 +258,11 @@ pub async fn download_youtube(
         .to_string_lossy()
         .replace('\\', "/");
     let (digest, size) = registry.sha256(&key).await?;
+    // Original reporter reserves 99 for storing; 100 only follows commit.
+    crate::download_runtime::record(db,job,&crate::download_runtime::Progress{
+        downloaded_bytes:size,total_bytes:Some(size),speed_bytes_per_second:None,
+        eta_seconds:None,percent:99,
+    }).await?;
     // The downloader emits its own info JSON from the same extraction that
     // produced the video. Avoid a second network request after media succeeds.
     let info_path = video.with_extension("info.json");
@@ -289,6 +294,14 @@ pub async fn download_youtube(
             key = old_key;
         }
     }
+    // Match Python: cover failure never discards the successfully downloaded
+    // video or prior cover asset. Prepare outside the database transaction.
+    let mut cover=if let Some(info)=downloaded_info.as_ref(){
+        match crate::youtube_meta::prepare_downloaded_cover(db,registry,config,job.task_id,info).await {
+            Ok(v)=>v,Err(_)=>{tracing::warn!(task_id=%job.task_id,"YouTube cover unavailable; keeping existing cover");None}
+        }
+    }else{None};
+    if !scheduler.heartbeat(job).await?{return Err(AppError::Conflict("download lease lost before asset registration".into()));}
     registry
         .register(
             &key,
@@ -307,10 +320,12 @@ pub async fn download_youtube(
     if let Some(info) = downloaded_info.as_ref() {
         crate::youtube_meta::persist_downloaded_info(&mut tx, job.task_id, info, &source).await?;
     }
+    let registered_cover=if let Some(c)=cover.as_ref(){crate::youtube_meta::persist_downloaded_cover(&mut tx,job.task_id,c).await?}else{false};
     sqlx::query(
         "UPDATE tasks SET status='downloaded'::task_status,error_code=NULL,error_message=NULL,updated_at=now() WHERE id=$1 AND status IN ('created'::task_status,'ingested'::task_status)"
     ).bind(job.task_id).execute(&mut *tx).await?;
     tx.commit().await?;
+    if registered_cover {if let Some(c)=cover.as_mut(){c.committed();}}
     Ok(serde_json::json!({"storage_key":key,"sha256":digest,"size_bytes":size}))
 }
 #[cfg(test)]

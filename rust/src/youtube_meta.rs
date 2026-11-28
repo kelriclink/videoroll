@@ -60,6 +60,90 @@ pub(crate) struct DownloadedInfo {
     size: i64,
     value: Value,
 }
+/// Python pick_thumbnail_url: pixel area plus preference, first maximum wins.
+fn pick_thumbnail_url(info:&Value)->Option<String>{
+    let int=|v:&Value| v.as_i64().or_else(||v.as_str()?.parse().ok()).unwrap_or(0);
+    let mut best=None;
+    let mut score=-1i64;
+    if let Some(items)=info["thumbnails"].as_array(){
+        for item in items{
+            let Some(url)=item["url"].as_str().filter(|s|!s.is_empty()).or_else(||item["src"].as_str()).map(str::trim).filter(|s|!s.is_empty()) else {continue};
+            let candidate=int(&item["width"]).saturating_mul(int(&item["height"])).saturating_add(int(&item["preference"]).saturating_mul(10));
+            if candidate>score {score=candidate;best=Some(url.to_owned());}
+        }
+    }
+    best.or_else(||info["thumbnail"].as_str().map(str::trim).filter(|s|!s.is_empty()).map(str::to_owned))
+}
+fn thumbnail_url(raw:&str)->AppResult<reqwest::Url>{
+    let url=reqwest::Url::parse(raw).map_err(|_|AppError::Invalid("invalid YouTube thumbnail URL".into()))?;
+    let host=url.host_str().unwrap_or("").trim_end_matches('.').to_ascii_lowercase();
+    if !matches!(url.scheme(),"http"|"https") || !["youtube.com","ytimg.com","googleusercontent.com","ggpht.com"].iter().any(|s|host==*s||host.ends_with(&format!(".{s}"))){
+        return Err(AppError::Invalid("YouTube thumbnail URL host is not allowed".into()))
+    }
+    Ok(url)
+}
+/// A prepared cover is removed on rollback or duplicate; the committed file
+/// stays under the original final/<task>/cover_youtube_<digest>_<uuid>.jpg key.
+pub(crate) struct PreparedCover {key:String,path:std::path::PathBuf,sha:String,size:i64,keep:bool}
+impl Drop for PreparedCover {
+    fn drop(&mut self){if !self.keep {let _=std::fs::remove_file(&self.path);}}
+}
+impl PreparedCover {pub(crate) fn committed(&mut self){self.keep=true;}}
+pub(crate) async fn prepare_downloaded_cover(db:&crate::Database,registry:&crate::storage::AssetRegistry,config:&crate::Config,task:Uuid,info:&DownloadedInfo)->AppResult<Option<PreparedCover>>{
+    let Some(raw)=pick_thumbnail_url(&info.value) else {return Ok(None)};
+    let mut url=thumbnail_url(&raw)?;
+    let settings=crate::youtube_settings_v1::runtime(db,config).await?;
+    let ua=std::env::var("YOUTUBE_USER_AGENT").unwrap_or_else(|_| "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36".into());
+    let mut builder=reqwest::Client::builder().timeout(Duration::from_secs(30)).redirect(reqwest::redirect::Policy::none()).user_agent(ua);
+    if let Some(proxy)=settings.proxy.as_deref(){builder=builder.proxy(reqwest::Proxy::all(proxy).map_err(|_|AppError::Invalid("invalid thumbnail proxy".into()))?);}
+    let client=builder.build().map_err(|_|AppError::Unavailable("thumbnail client initialization failed".into()))?;
+    let max=std::env::var("YOUTUBE_THUMBNAIL_MAX_BYTES").ok().and_then(|x|x.parse::<u64>().ok()).unwrap_or(20*1024*1024).clamp(1024*1024,50*1024*1024);
+    let dir=tempfile::tempdir_in(&registry.root)?;
+    let input=dir.path().join("thumbnail.img");let output=dir.path().join("thumbnail.jpg");
+    let mut response=None;
+    for hop in 0..=5{
+        let r=client.get(url.clone()).send().await.map_err(|_|AppError::Unavailable("thumbnail download failed".into()))?;
+        if matches!(r.status().as_u16(),301|302|303|307|308){
+            if hop==5 {return Err(AppError::Unavailable("thumbnail exceeded redirect limit".into()));}
+            let next=r.headers().get(reqwest::header::LOCATION).and_then(|v|v.to_str().ok()).ok_or_else(||AppError::Invalid("thumbnail redirect missing Location".into()))?;
+            url=thumbnail_url(url.join(next).map_err(|_|AppError::Invalid("invalid thumbnail redirect".into()))?.as_str())?;
+        }else{response=Some(r.error_for_status().map_err(|_|AppError::Unavailable("thumbnail HTTP failure".into()))?);break;}
+    }
+    let mut response=response.ok_or_else(||AppError::Unavailable("thumbnail unavailable".into()))?;
+    if response.content_length().is_some_and(|n|n>max){return Err(AppError::Invalid("thumbnail exceeds size limit".into()));}
+    let mut file=fs::File::create(&input).await?;let mut total=0u64;
+    while let Some(chunk)=response.chunk().await.map_err(|_|AppError::Unavailable("thumbnail stream failed".into()))?{
+        total=total.saturating_add(chunk.len() as u64);if total>max {return Err(AppError::Invalid("thumbnail exceeds size limit".into()));}
+        file.write_all(&chunk).await?;
+    }
+    file.flush().await?;drop(file);
+    if total==0 {return Ok(None);}
+    let status=timeout(Duration::from_secs(60),Command::new(&config.ffmpeg_binary).args(["-nostdin","-y","-loglevel","error","-i"]).arg(&input)
+        .args(["-vf","scale=1146:717:force_original_aspect_ratio=increase,crop=1146:717","-frames:v","1","-q:v","2"]).arg(&output)
+        .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).kill_on_drop(true).status()).await
+        .map_err(|_|AppError::Unavailable("thumbnail conversion timed out".into()))??;
+    if !status.success(){return Err(AppError::Unavailable("thumbnail JPEG conversion failed".into()));}
+    let bytes=fs::read(&output).await?;if bytes.is_empty(){return Ok(None);}
+    let sha=hex::encode(Sha256::digest(&bytes));let nonce=Uuid::new_v4().simple().to_string();
+    let key=format!("final/{task}/cover_youtube_{}_{}.jpg",&sha[..16],&nonce[..12]);
+    let path=registry.resolve_existing(&key).await?;
+    if let Some(parent)=path.parent(){fs::create_dir_all(parent).await?;}
+    fs::hard_link(&output,&path).await?;
+    Ok(Some(PreparedCover{key,path,sha,size:bytes.len() as i64,keep:false}))
+}
+pub(crate) async fn persist_downloaded_cover(tx:&mut sqlx::Transaction<'_,sqlx::Postgres>,task:Uuid,cover:&PreparedCover)->AppResult<bool>{
+    // The original deduplicates by task + cover SHA, not by generated key.
+    let existing:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM assets WHERE task_id=$1 AND kind='cover_image'::asset_kind AND sha256=$2)")
+        .bind(task).bind(&cover.sha).fetch_one(&mut **tx).await?;
+    if existing{return Ok(false)}
+    sqlx::query("INSERT INTO storage_objects(storage_key,checksum_sha256,size_bytes,state,retain_until) VALUES($1,$2,$3,'live',now()+interval '2 days')")
+        .bind(&cover.key).bind(&cover.sha).bind(cover.size).execute(&mut **tx).await?;
+    sqlx::query("INSERT INTO storage_object_refs(storage_key,owner_type,owner_id,role) VALUES($1,'task',$2,'cover_image') ON CONFLICT DO NOTHING")
+        .bind(&cover.key).bind(task).execute(&mut **tx).await?;
+    sqlx::query("INSERT INTO assets(id,task_id,kind,storage_key,sha256,size_bytes) VALUES($1,$2,'cover_image'::asset_kind,$3,$4,$5)")
+        .bind(Uuid::new_v4()).bind(task).bind(&cover.key).bind(&cover.sha).bind(cover.size).execute(&mut **tx).await?;
+    Ok(true)
+}
 /// Read the info JSON produced by the same successful download. Older
 /// completed staging directories may predate --write-info-json.
 pub(crate) async fn read_downloaded_info(registry: &crate::storage::AssetRegistry, path: &std::path::Path, url: &str) -> AppResult<Option<DownloadedInfo>> {
@@ -380,6 +464,8 @@ async fn progress(State(state): State<AppState>, Path(id): Path<Uuid>) -> AppRes
         let live_metrics = stored_progress.as_ref().filter(|(id, _, _)| *id == job_id);
         let status = match state.as_str() {
             "pending" => "queued",
+            "running" if active && live_metrics.is_some_and(|(_,p,_)|p.percent==99) => "storing",
+            "running" if active && live_metrics.is_some_and(|(_,p,_)|p.percent==95) => "processing",
             "running" if active => "downloading",
             "running" => "queued",
             "awaiting" => "processing",
@@ -392,7 +478,7 @@ async fn progress(State(state): State<AppState>, Path(id): Path<Uuid>) -> AppRes
             active,
             if state == "succeeded" {
                 100
-            } else if active {
+            } else if active || state=="failed" {
                 live_metrics.map(|(_, p, _)| p.percent).unwrap_or(0)
             } else {
                 0
@@ -400,7 +486,7 @@ async fn progress(State(state): State<AppState>, Path(id): Path<Uuid>) -> AppRes
             if state=="succeeded" { None } else { row.try_get::<Option<String>, _>("last_error")? },
             row.try_get::<chrono::DateTime<chrono::Utc>, _>("updated_at")?
                 .to_rfc3339(),
-            if active {
+            if active || state=="failed" {
                 live_metrics.map(|(_, p, _)| p.clone())
             } else {
                 None
@@ -430,7 +516,7 @@ async fn progress(State(state): State<AppState>, Path(id): Path<Uuid>) -> AppRes
         "downloaded_bytes":if status=="completed"{bytes.unwrap_or(0)}else{live_metrics.as_ref().map(|p|p.downloaded_bytes).unwrap_or(0)},
         "total_bytes":if status=="completed"{bytes}else{live_metrics.as_ref().and_then(|p|p.total_bytes)},
         "speed_bytes_per_second":live_metrics.as_ref().and_then(|p|p.speed_bytes_per_second),
-        "eta_seconds":live_metrics.as_ref().and_then(|p|p.eta_seconds),
+        "eta_seconds":if status=="completed"{Some(0)}else{live_metrics.as_ref().and_then(|p|p.eta_seconds)},
         "filename":if status=="completed"{asset.as_ref().and_then(|(key,_)|key.rsplit('/').next())}else{None},
         "error":error,"updated_at":if updated.is_empty(){None}else{Some(updated)},
     })))
@@ -447,6 +533,15 @@ pub fn router() -> Router<AppState> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn original_thumbnail_selection_and_allowed_redirect_hosts() {
+        let info=json!({"thumbnail":"https://i.ytimg.com/fallback.jpg","thumbnails":[{"url":"https://i.ytimg.com/small.jpg","width":100,"height":100},{"src":"https://i.ytimg.com/big.jpg","width":640,"height":360}]});
+        assert_eq!(pick_thumbnail_url(&info).as_deref(),Some("https://i.ytimg.com/big.jpg"));
+        assert_eq!(pick_thumbnail_url(&json!({"thumbnail":"https://i.ytimg.com/fallback.jpg"})).as_deref(),Some("https://i.ytimg.com/fallback.jpg"));
+        assert!(thumbnail_url("https://i.ytimg.com/a.jpg").is_ok());
+        assert!(thumbnail_url("https://ytimg.com.invalid/a.jpg").is_err());
+        assert!(thumbnail_url("http://127.0.0.1/a.jpg").is_err());
+    }
     #[test]
     fn normalize_yt_info_requires_a_real_video_url_and_title() {
         let info = json!({"id":"0123456789A","title":" A ",

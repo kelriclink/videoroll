@@ -25,7 +25,7 @@ use tokio::{
 };
 use tokio_util::codec::{FramedRead, LinesCodec};
 
-pub const PROGRESS_TEMPLATE: &str = "download:vr2|%(progress.downloaded_bytes)s|%(progress.total_bytes)s|%(progress.total_bytes_estimate)s|%(progress.speed)s|%(progress.eta)s|%(progress._percent_str)s";
+pub const PROGRESS_TEMPLATE: &str = "download:vr2p\t%(progress.{downloaded_bytes,total_bytes,total_bytes_estimate,speed,eta,status,filename,tmpfilename})j\t%(info.format_id)j\t%(info.requested_downloads.:.{filesize,filesize_approx})j";
 #[derive(Debug, Clone, PartialEq)]
 pub struct Progress {
     pub downloaded_bytes: i64,
@@ -78,6 +78,109 @@ pub fn parse_progress(line: &str) -> Option<Progress> {
         eta_seconds: eta,
         percent,
     })
+}
+/// Port Python _YouTubeDownloadProgressReporter.hook: per-format completion,
+/// requested total, monotonic 0..95% progress; a new attempt gets a new reporter.
+#[derive(Default)]
+struct DownloadProgressReporter {
+    completed: std::collections::HashMap<String, i64>,
+    last_percent: i16,
+    selected_sizes: std::collections::HashMap<String, Option<i64>>,
+}
+fn event_number(v: &serde_json::Value) -> Option<i64> {
+    let n=v.as_f64().or_else(||v.as_str()?.parse().ok())?;
+    n.is_finite().then(||n.max(0.0) as i64)
+}
+fn requested_total(v: &serde_json::Value)->Option<i64>{
+    let sum=v.as_array()?.iter().filter_map(|x|event_number(&x["filesize"]).filter(|n|*n>0)
+        .or_else(||event_number(&x["filesize_approx"])).filter(|n|*n>0))
+        .fold(0i64,|a,b|a.saturating_add(b));
+    (sum>0).then_some(sum)
+}
+impl DownloadProgressReporter {
+    fn hook(&mut self,line:&str)->Option<(Progress,bool)> {
+        let line=line.trim_start_matches("[download] ");
+        // yt-dlp's per-format callback may omit requested_downloads (CLI
+        // creates a fresh info_dict per stream). Capture the selected format
+        // sizes before downloading, equivalent to Python requested totals.
+        if let Some(raw)=line.strip_prefix("vr2total\t"){
+            let (parts,duration)=raw.split_once('\t').unwrap_or((raw,"null"));
+            let duration=serde_json::from_str::<serde_json::Value>(duration).ok()
+                .and_then(|v|v.as_f64()).filter(|n|n.is_finite()&&*n>0.0);
+            if let Ok(parts)=serde_json::from_str::<serde_json::Value>(parts){
+                self.selected_sizes.clear();
+                if let Some(parts)=parts.as_array(){
+                    for part in parts{
+                        let Some(id)=part["format_id"].as_str() else{continue};
+                        // yt-dlp may omit HLS filesize entirely. Estimate
+                        // that part from selected bitrate and video duration,
+                        // then replace with actual transfer total as it arrives.
+                        let size=event_number(&part["filesize"]).filter(|n|*n>0)
+                            .or_else(||event_number(&part["filesize_approx"]).filter(|n|*n>0))
+                            .or_else(||{
+                                let bytes=part["tbr"].as_f64()?*1000.0/8.0*duration?;
+                                (bytes.is_finite()&&bytes>0.0).then_some(bytes as i64)
+                            });
+                        self.selected_sizes.insert(id.to_owned(),size);
+                    }
+                }
+            }
+            return None;
+        }
+        // Keep the old protocol for historical fixture processes.
+        if !line.starts_with("vr2p\t") {
+            let mut p=parse_progress(line)?;
+            p.percent=p.percent.min(95).max(self.last_percent);
+            self.last_percent=p.percent;
+            return Some((p,false))
+        }
+        let mut fields=line.strip_prefix("vr2p\t")?.splitn(3,'\t');
+        let event:serde_json::Value=serde_json::from_str(fields.next()?).ok()?;
+        let format:serde_json::Value=serde_json::from_str(fields.next()?).unwrap_or_default();
+        let requested:serde_json::Value=serde_json::from_str(fields.next()?).unwrap_or_default();
+        let status=event["status"].as_str()?;
+        if status=="retrying" { *self=Self::default(); return Some((Progress{downloaded_bytes:0,total_bytes:None,speed_bytes_per_second:None,eta_seconds:None,percent:0},true)); }
+        if !matches!(status,"downloading"|"finished"){return None}
+        let current=event_number(&event["total_bytes"]).filter(|n|*n>0)
+            .or_else(||event_number(&event["total_bytes_estimate"]).filter(|n|*n>0));
+        let finished=status=="finished";
+        let downloaded=event_number(&event["downloaded_bytes"]).or_else(||if finished{current}else{None}).unwrap_or(0);
+        let key=format.as_str().filter(|s|!s.is_empty())
+            .or_else(||event["filename"].as_str().filter(|s|!s.is_empty()))
+            .or_else(||event["tmpfilename"].as_str().filter(|s|!s.is_empty())).unwrap_or("download");
+        if finished {self.completed.insert(key.to_owned(),current.unwrap_or(downloaded));}
+        let aggregate=self.completed.iter().filter(|(k,_)|k.as_str()!=key)
+            .fold(downloaded,|a,(_,b)|a.saturating_add(*b));
+        let selected_split=self.selected_sizes.len()>1 && self.selected_sizes.contains_key(key);
+        // Never mistake the sum of known sizes for a complete total when
+        // another selected stream is missing its estimate.
+        if selected_split {
+            if let Some(size)=current.or_else(||finished.then_some(downloaded)){
+                self.selected_sizes.insert(key.to_owned(),Some(size.max(downloaded)));
+            }
+        }
+        let total=if selected_split {
+            self.selected_sizes.values().try_fold(0i64,|sum,n|n.map(|n|sum.saturating_add(n))).filter(|n|*n>0)
+        }else{requested_total(&requested)};
+        let split=selected_split||total.is_some();
+        let numerator=if split{aggregate}else{downloaded};
+        let effective_total=if selected_split {total.map(|n|n.max(numerator))}else{total.or(current)};
+        let all_finished=selected_split && self.selected_sizes.keys().all(|k|self.completed.contains_key(k));
+        let ratio=if let Some(n)=effective_total.filter(|n|*n>0){
+            numerator as f64/n as f64
+        }else if selected_split{
+            let completed=self.selected_sizes.keys().filter(|k|k.as_str()!=key&&self.completed.contains_key(*k)).count();
+            let part=if finished{1.0}else{current.filter(|n|*n>0).map(|n|(downloaded as f64/n as f64).clamp(0.0,1.0)).unwrap_or(0.0)};
+            (completed as f64+part)/self.selected_sizes.len() as f64
+        }else{0.0};
+        let mut percent=((ratio.clamp(0.0,1.0)*95.0) as i16).max(self.last_percent).min(95);
+        if selected_split && !all_finished {percent=percent.min(94);}
+        if all_finished || (finished && !selected_split && total.is_none()){percent=95}
+        self.last_percent=percent;
+        Some((Progress{downloaded_bytes:numerator,total_bytes:effective_total,
+            speed_bytes_per_second:event["speed"].as_f64().filter(|n|n.is_finite()).map(|n|n.max(0.0)),
+            eta_seconds:event_number(&event["eta"]).and_then(|n|i32::try_from(n).ok()),percent},finished))
+    }
 }
 pub fn is_patched_version(version: &str) -> bool {
     let parts: Vec<_> = version.trim().split('.').collect();
@@ -168,6 +271,9 @@ pub async fn prepare_args(binary: &Path, settings: &YoutubeRuntime, opts: bool) 
         "1".into(),
         "--progress-template".into(),
         PROGRESS_TEMPLATE.into(),
+        "--no-simulate".into(),
+        "--print".into(),
+        "before_dl:vr2total\t%(requested_formats.:.{format_id,filesize,filesize_approx,tbr})j\t%(duration)j".into(),
     ];
     args.extend(original_transport_args());
     if settings.parallel {
@@ -558,14 +664,15 @@ async fn run_attempt(
     let mut heartbeat = interval(Duration::from_secs(30));
     let mut last_record = Instant::now() - Duration::from_secs(3);
     let mut last_p = None::<Progress>;
+    let mut reporter = DownloadProgressReporter::default();
     let mut has_closed = false;
     loop {
         tokio::select! {
             line=lines.next(),if !has_closed=>{
                 match line{
                     Some(Ok(line))=>{
-                        if let Some(p)=parse_progress(&line){
-                            if last_record.elapsed()>=Duration::from_secs(2)
+                        if let Some((p,finished))=reporter.hook(&line){
+                            if finished || last_record.elapsed()>=Duration::from_millis(500)
                                 || last_p.as_ref().is_none_or(|old|p.percent!=old.percent && (p.percent-old.percent).abs()>=5)
                             {
                                 record(db,job,&p).await?;
@@ -593,6 +700,13 @@ async fn run_attempt(
                     tracing::warn!(job_id=%job.id,exit_code=status.code().unwrap_or(-1),category=kind.label(),"yt-dlp attempt failed");
                     return Ok(Some(kind));
                 }
+                // Drain remaining stdout: yt-dlp may exit before the final
+                // per-format finished event has been read by select!.
+                let _=timeout(Duration::from_secs(2),async{
+                    while let Some(Ok(line))=lines.next().await{
+                        if let Some((p,_))=reporter.hook(&line){last_p=Some(p);}
+                    }
+                }).await;
                 if let Some(p)=last_p.as_ref(){record(db,job,p).await?;}
                 return Ok(None);
             },
@@ -784,6 +898,29 @@ print('[download] vr2|100|100|NA|1000|0|100.0%')
         tail.push(b"HTTP Error 429");
         assert_eq!(tail.classify(), FailureKind::RateLimited);
         assert!(!tail.classify().label().contains("password"));
+    }
+    #[test]
+    fn original_python_split_format_progress_aggregation() {
+        let mut r=DownloadProgressReporter::default();
+        let evt=|key:&str,status:&str,bytes:i64,total:i64|format!("vr2p\t{}\t{}\t{}",serde_json::json!({"status":status,"downloaded_bytes":bytes,"total_bytes":total}),serde_json::json!(key),serde_json::json!([{"filesize":100},{"filesize_approx":50}]));
+        let (p,_)=r.hook(&evt("video","downloading",50,100)).unwrap(); assert_eq!((p.downloaded_bytes,p.total_bytes,p.percent),(50,Some(150),31));
+        let (p,done)=r.hook(&evt("video","finished",100,100)).unwrap(); assert!(done);assert_eq!((p.downloaded_bytes,p.percent),(100,63));
+        let (p,_)=r.hook(&evt("audio","downloading",5,50)).unwrap();assert_eq!((p.downloaded_bytes,p.percent),(105,66));
+        let (p,_)=r.hook(&evt("audio","finished",50,50)).unwrap();assert_eq!((p.downloaded_bytes,p.percent),(150,95));
+        let (p,_)=r.hook("vr2p\t{\"status\":\"retrying\"}\tNA\t[]").unwrap();assert_eq!((p.downloaded_bytes,p.percent),(0,0));
+        let (p,_)=r.hook("vr2p\t{\"status\":\"finished\",\"total_bytes\":100,\"downloaded_bytes\":100}\tNA\t[]").unwrap();assert_eq!(p.percent,95);
+    }
+    #[test]
+    fn selected_hls_without_filesize_does_not_count_audio_as_entire_video() {
+        let mut r=DownloadProgressReporter::default();
+        assert!(r.hook("vr2total\t[{\"format_id\":\"audio\",\"filesize\":2500000},{\"format_id\":\"video\",\"tbr\":3760.0}]\t161").is_none());
+        let evt=|key:&str,status:&str,bytes:i64,total:i64|format!("vr2p\t{}\t{}\t[]",serde_json::json!({"status":status,"downloaded_bytes":bytes,"total_bytes":total}),serde_json::json!(key));
+        let (p,_)=r.hook(&evt("audio","finished",2500000,2500000)).unwrap();
+        assert!(p.total_bytes.unwrap()>75_000_000);assert!(p.percent<10);
+        let (q,_)=r.hook(&evt("video","downloading",10000000,50000000)).unwrap();
+        assert_eq!(q.downloaded_bytes,12500000);assert_eq!(q.total_bytes,Some(52500000));assert!(q.percent>=p.percent&&q.percent<95);
+        let (q,_)=r.hook(&evt("video","finished",50000000,50000000)).unwrap();
+        assert_eq!((q.downloaded_bytes,q.percent),(52500000,95));
     }
     #[test]
     fn bounded_progress_parser_is_strict() {
