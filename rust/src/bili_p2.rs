@@ -130,7 +130,7 @@ async fn get(
     State(state): State<AppState>,
     Path((task_id, publish_job_id)): Path<(Uuid, Uuid)>,
 ) -> AppResult<Json<AppendRecord>> {
-    read_task(&state.db, task_id).await?;
+    crate::legacy_contracts::read_visible_task(&state.db, task_id).await?;
     let mut record = sqlx::query_as::<_, AppendRecord>(&format!(
         "{LOOKUP} WHERE publish_job_id=$1 AND task_id=$2"
     ))

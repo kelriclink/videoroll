@@ -352,14 +352,14 @@ async fn fill_original_titles(state:&AppState,tasks:&mut [V1Task])->AppResult<()
 }
 async fn stop_task(State(state): State<AppState>, Path(id): Path<Uuid>) -> AppResult<Json<V1Task>> {
     state.scheduler.stop_task_compat(id).await?;
-    Ok(Json(read_task(&state.db, id).await?))
+    Ok(Json(read_visible_task(&state.db, id).await?))
 }
 async fn resume_task(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<V1Task>> {
     state.scheduler.resume_task_compat(id).await?;
-    Ok(Json(read_task(&state.db, id).await?))
+    Ok(Json(read_visible_task(&state.db, id).await?))
 }
 async fn bulk_change(state: AppState, stop: bool) -> AppResult<Json<Value>> {
     let (matched,changed)=state.scheduler.bulk_task_control(stop).await?;
@@ -497,7 +497,7 @@ async fn dubbing_jobs(
     Path(id): Path<Uuid>,
     Query(q): Query<LimitQuery>,
 ) -> AppResult<Json<Vec<Value>>> {
-    read_task(&state.db, id).await?;
+    read_visible_task(&state.db, id).await?;
     let rows=sqlx::query(
         "SELECT j.id,j.task_id,j.workflow_id,j.state,j.payload,j.result,j.operation_key,j.last_error,
            j.created_at,j.updated_at,s.id AS subtitle_job_id,
@@ -576,7 +576,7 @@ async fn publish_jobs(
     Path(id): Path<Uuid>,
     Query(q): Query<LimitQuery>,
 ) -> AppResult<Json<Vec<Value>>> {
-    read_task(&state.db, id).await?;
+    read_visible_task(&state.db, id).await?;
     // A mixed batch owns original publish_jobs, not the synthetic stage ID.
     // Return each original target once, with the persisted batch identity.
     let mixed: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM publish_batches WHERE task_id=$1 AND request_json->>'runtime'='rust-mixed-v1')")
@@ -691,7 +691,7 @@ async fn playout_assets(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<Vec<Value>>> {
-    read_task(&state.db, id).await?;
+    read_visible_task(&state.db, id).await?;
     let rows = sqlx::query_scalar::<_, Value>(
         r#"SELECT jsonb_build_object(
           'id',p.id,'status',p.status,'task_id',p.task_id,'asset_id',p.asset_id,

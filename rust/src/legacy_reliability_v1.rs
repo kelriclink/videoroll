@@ -93,7 +93,7 @@ async fn publish_batches(
     if !(1..=100).contains(&limit) {
         return Err(AppError::Invalid("limit must be between 1 and 100".into()));
     }
-    crate::legacy_contracts::read_task(&state.db, task_id).await?;
+    crate::legacy_contracts::read_visible_task(&state.db, task_id).await?;
     let rows = sqlx::query(
         "SELECT id,task_id,state,expected_targets,outcomes_json,
           cleanup_enqueued_at,finished_at,created_at,updated_at

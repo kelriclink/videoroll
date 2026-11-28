@@ -368,7 +368,7 @@ async fn list(
     State(state): State<AppState>,
     Path(task_id): Path<Uuid>,
 ) -> AppResult<Json<Vec<Value>>> {
-    read_task(&state.db, task_id).await?;
+    crate::legacy_contracts::read_visible_task(&state.db, task_id).await?;
     let records = sqlx::query_as::<_, SocialIntent>(&format!(
         "SELECT {PROJECTION} FROM vr2_social_publish_intents
          WHERE task_id=$1 ORDER BY created_at DESC LIMIT 100"
@@ -391,7 +391,7 @@ async fn get(
     State(state): State<AppState>,
     Path((task_id, id)): Path<(Uuid, Uuid)>,
 ) -> AppResult<Json<Value>> {
-    read_task(&state.db, task_id).await?;
+    crate::legacy_contracts::read_visible_task(&state.db, task_id).await?;
     if let Some(native) =
         sqlx::query_scalar::<_, Value>(&format!("{NATIVE_SOCIAL_VIEW} AND p.id=$2"))
             .bind(task_id)

@@ -11,7 +11,7 @@ uri=os.environ["DATABASE_URL"]
 assert urlsplit(uri).hostname=="127.0.0.1" and urlsplit(uri).path=="/videoroll_test"
 def db():return psycopg.connect(uri)
 def post(path):
-    req=Request("http://127.0.0.1:18080/api/v1"+path,data=b"{}",method="POST",
+    req=Request(os.environ.get("VIDEOROLL_TEST_V1_BASE","http://127.0.0.1:18080/api/v1")+path,data=b"{}",method="POST",
       headers={"x-videoroll-v2-internal-token":os.environ["VIDEOROLL_V2_INTERNAL_TOKEN"],"content-type":"application/json"})
     try:r=urlopen(req,timeout=30)
     except HTTPError as e:r=e
@@ -61,7 +61,10 @@ tables=("subtitle_jobs","render_jobs","publish_jobs","publish_batches","operatio
 original={t:snapshot(t) for t in tables}
 assert stop(failed_sub)[0]==409 # individual semantics unchanged
 assert stop(unsafe)[0]==409
-assert stop(python)[0]==404
+assert stop(uuid4())[0]==404
+assert stop(python)[0]==200 and state(python)==("canceled","downloaded")
+assert resume(python)[0]==200 and state(python)==("downloaded",None)
+with db() as c: assert c.execute("SELECT runtime_owner FROM tasks WHERE id=%s",(python,)).fetchone()[0]=="python"
 with db() as c:
     c.execute("LOCK TABLE publish_jobs IN ROW EXCLUSIVE MODE")
     assert post(bulk_stop)[0]==409
@@ -81,11 +84,11 @@ with db() as c:
     c.execute("DROP FUNCTION fixture_stop_failure()")
     c.execute("UPDATE tasks SET error_code='FIXTURE' WHERE error_code='FIXTURE_ABORT'")
 code,body=post(bulk_stop)
-assert code==200 and body=={"matched_count":9,"changed_count":5},(code,body)
-for t,prev in [(normal,"downloaded"),(terminal,"rendered"),(failed_sub,"failed"),(failed_render,"failed"),(failed_native,"failed")]:
+assert code==200 and body=={"matched_count":10,"changed_count":6},(code,body)
+for t,prev in [(normal,"downloaded"),(terminal,"rendered"),(failed_sub,"failed"),(failed_render,"failed"),(failed_native,"failed"),(python,"downloaded")]:
     assert state(t)==("canceled",prev),(t,state(t))
 assert workflow(nw)==("paused",1) and workflow(tw)==("succeeded",1)
-for t,prev in [(failed_plain,"failed"),(canceled,"canceled"),(published,"published"),(python,"downloaded"),(unsafe,"approved"),(active_batch,"downloaded"),(multi,"downloaded"),(newer,"downloaded")]:
+for t,prev in [(failed_plain,"failed"),(canceled,"canceled"),(published,"published"),(unsafe,"approved"),(active_batch,"downloaded"),(multi,"downloaded"),(newer,"downloaded")]:
     assert state(t)==(prev,None),(t,state(t))
 assert {t:snapshot(t) for t in tables}==original
 assert stop(normal)[0]==200 # idempotent
@@ -93,7 +96,7 @@ assert post(bulk_stop)[1]=={"matched_count":4,"changed_count":0}
 # Native resumes same generation; quiescent terminal history stays terminal.
 # Old live rows remain protected until explicitly reconciled.
 code,body=post(bulk_resume)
-assert code==200 and body=={"matched_count":6,"changed_count":4},(code,body)
+assert code==200 and body=={"matched_count":7,"changed_count":5},(code,body)
 assert state(terminal)==("rendered",None) and workflow(tw)==("succeeded",1)
 assert state(normal)==("downloaded",None)
 assert state(already)==("ingested",None)
@@ -120,4 +123,32 @@ assert state(race)==("downloaded",None) and workflow(rw)==("running",1)
 with db() as c:
     assert c.execute("SELECT count(*) FROM pipeline_runs WHERE task_id=%s",(race,)).fetchone()[0]==1
     assert c.execute("SELECT count(*) FROM operation_inbox WHERE task_id=%s",(race,)).fetchone()[0]==1
-print("PASS: original bulk failed-live coverage, terminal workflow checkpoint restore, native same-generation recovery, unsafe publication/multiple generation fences, ownership, count semantics, transaction rollback and concurrent controls")
+legacy_busy=task("downloaded",owner="python")
+old_run=uuid4()
+with db() as c:
+    c.execute("INSERT INTO pipeline_runs(id,task_id,engine,workflow_name,state,external_run_id) VALUES(%s,%s,'hatchet','fixture','running','fixture-external')",(old_run,legacy_busy))
+code,body=stop(legacy_busy)
+assert code==200,(code,body)
+assert state(legacy_busy)==("canceled","downloaded")
+assert stop(legacy_busy)[0]==200
+assert resume(legacy_busy)[0]==409
+with db() as c:
+    assert c.execute("SELECT state,external_run_id FROM pipeline_runs WHERE id=%s",(old_run,)).fetchone()==("cancel_requested","fixture-external")
+    events=c.execute("SELECT status,args_json FROM outbox_events WHERE operation_key=%s",("workflow-cancel:"+str(old_run),)).fetchall()
+    assert events==[("pending",{"args":[str(old_run),"fixture-external"],"queue":"subtitle-control"})],events
+    assert c.execute("SELECT runtime_owner FROM tasks WHERE id=%s",(legacy_busy,)).fetchone()[0]=="python"
+    assert c.execute("SELECT count(*) FROM vr2_workflows WHERE task_id=%s",(legacy_busy,)).fetchone()[0]==0
+assert state(python)==("downloaded",None)
+# Read-only task detail subresources must not depend on the historical
+# migration label. Reading them must not adopt the task or start work.
+old_read=task("rendered",owner="python")
+for suffix in ("","/assets","/subtitle_jobs","/dubbing_jobs","/publish_jobs","/playout-assets"):
+    req=Request(os.environ.get("VIDEOROLL_TEST_V1_BASE","http://127.0.0.1:18080/api/v1")+"/tasks/"+str(old_read)+suffix,
+      headers={"x-videoroll-v2-internal-token":os.environ["VIDEOROLL_V2_INTERNAL_TOKEN"]})
+    with urlopen(req,timeout=15) as response:
+        assert response.status==200,(suffix,response.status)
+        json.loads(response.read())
+with db() as c:
+    assert c.execute("SELECT runtime_owner,status::text FROM tasks WHERE id=%s",(old_read,)).fetchone()==("python","rendered")
+    assert c.execute("SELECT count(*) FROM pipeline_runs WHERE task_id=%s",(old_read,)).fetchone()[0]==0
+print("PASS: original bulk failed-live coverage, historical quiescent stop/resume, historical cancellation intent with resume fence, native same-generation recovery, unsafe publication/multiple generation fences, original task detail reads, count semantics, transaction rollback and concurrent controls")

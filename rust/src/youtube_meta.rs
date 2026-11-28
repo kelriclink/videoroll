@@ -210,7 +210,7 @@ async fn read_metadata(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<Value>> {
-    let task = read_task(&state.db, id).await?;
+    let task = crate::legacy_contracts::read_visible_task(&state.db, id).await?;
     if task.source_type != "youtube" {
         return Err(AppError::Invalid("not a YouTube task".into()));
     }

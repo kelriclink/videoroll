@@ -333,7 +333,7 @@ pub async fn saved(db: &Database, id: Uuid) -> AppResult<Option<Value>> {
         .map_err(Into::into)
 }
 async fn read_saved(State(state): State<AppState>, Path(id): Path<Uuid>) -> AppResult<Json<Value>> {
-    read_task(&state.db, id).await?;
+    crate::legacy_contracts::read_visible_task(&state.db, id).await?;
     let meta = saved(&state.db, id)
         .await?
         .ok_or_else(|| AppError::NotFound("publish_meta not saved".into()))?;

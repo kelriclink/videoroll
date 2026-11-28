@@ -1632,9 +1632,9 @@ impl Scheduler {
           AND j.stage IN ('download','subtitle','render','dubbing') AND j.state IN ('pending','running','awaiting')))";
 
     async fn lock_control_task(tx:&mut Transaction<'_,Postgres>,task:Uuid)->AppResult<()>{
-        sqlx::query_scalar::<_,Uuid>("SELECT id FROM tasks WHERE id=$1 AND runtime_owner='rust' FOR UPDATE")
+        sqlx::query_scalar::<_,Uuid>("SELECT id FROM tasks WHERE id=$1 FOR UPDATE")
             .bind(task).fetch_optional(&mut **tx).await?
-            .ok_or_else(||AppError::NotFound("V2 task missing".into()))?;
+            .ok_or_else(||AppError::NotFound("task not found".into()))?;
         Ok(())
     }
     async fn lock_control_ledgers(tx:&mut Transaction<'_,Postgres>)->AppResult<()>{
@@ -1651,7 +1651,7 @@ impl Scheduler {
         let mut tx=self.db.pool.begin().await?;
         let predicate=if stop{format!("({} OR ({}))",Self::STOPPABLE,Self::FAILED_LIVE)}
             else{"t.status::text='canceled' AND t.stopped_status IS NOT NULL".into()};
-        let sql=format!("SELECT t.id FROM tasks t WHERE t.runtime_owner='rust' AND {predicate} ORDER BY t.id LIMIT 1001 FOR UPDATE OF t");
+        let sql=format!("SELECT t.id FROM tasks t WHERE {predicate} ORDER BY t.id LIMIT 1001 FOR UPDATE OF t");
         let ids:Vec<Uuid>=sqlx::query_scalar(&sql).fetch_all(&mut *tx).await?;
         if ids.len()>1000{return Err(AppError::Conflict("more than 1000 V2 tasks selected; split the operation".into()))}
         if !ids.is_empty(){Self::lock_control_ledgers(&mut tx).await?;}
@@ -1705,8 +1705,47 @@ impl Scheduler {
         Ok(Some((id,state,stage)))
     }
 
+    // Task-level control does not transfer historical runtime ownership.
+    async fn legacy_control_fence(tx:&mut Transaction<'_,Postgres>,task:Uuid,owner:&str)->AppResult<()>{
+        if owner=="rust"{return Ok(());}
+        if owner!="python"{return Err(AppError::Conflict("unknown task runtime owner".into()));}
+        let blockers=crate::task_ownership::blockers(tx,task).await?;
+        if !blockers.is_empty(){return Err(AppError::Conflict(format!("historical task requires reconciliation before control: {}",blockers.join(", "))));}
+        Ok(())
+    }
+    // Mirror the original stop contract: record cancellation intent for
+    // reversible Hatchet runs, without asserting remote cancellation or
+    // starting a legacy dispatcher. Resume remains fenced until reconciled.
+    async fn stop_historical_runs(tx:&mut Transaction<'_,Postgres>,task:Uuid,owner:&str)->AppResult<()>{
+        if owner=="rust"{return Ok(());}
+        if owner!="python"{return Err(AppError::Conflict("unknown task runtime owner".into()));}
+        let blockers=crate::task_ownership::blockers(tx,task).await?;
+        if blockers.iter().any(|b|b!="active_workflow"){
+            return Err(AppError::Conflict(format!("historical task requires reconciliation before control: {}",blockers.join(", "))));
+        }
+        let runs=sqlx::query("SELECT id,engine,state,external_run_id FROM pipeline_runs WHERE task_id=$1 AND state NOT IN ('succeeded','failed','canceled','completed','superseded') FOR UPDATE")
+            .bind(task).fetch_all(&mut **tx).await?;
+        for run in &runs{
+            let engine:String=run.try_get("engine")?;
+            let state:String=run.try_get("state")?;
+            if engine!="hatchet" || !matches!(state.as_str(),"queued"|"submitting"|"submitted"|"running"|"waiting"|"launch_failed"|"cancel_requested"){
+                return Err(AppError::Conflict("historical workflow needs explicit reconciliation before stop".into()));
+            }
+        }
+        for run in runs{
+            let id:Uuid=run.try_get("id")?;
+            let external:Option<String>=run.try_get("external_run_id")?;
+            if let Some(external)=external.filter(|s|!s.is_empty()){
+                let key=format!("workflow-cancel:{id}");
+                sqlx::query("INSERT INTO outbox_events(id,event_type,aggregate_type,aggregate_id,task_name,args_json,operation_key,status) SELECT $1,'workflow.cancel','pipeline_run',$2,'subtitle_service.cancel_workflow_run',$3,$4,'pending' WHERE NOT EXISTS(SELECT 1 FROM outbox_events WHERE operation_key=$4)")
+                    .bind(Uuid::new_v4()).bind(id.to_string()).bind(json!({"args":[id.to_string(),external],"queue":"subtitle-control"})).bind(key).execute(&mut **tx).await?;
+            }
+            sqlx::query("UPDATE pipeline_runs SET state='cancel_requested',updated_at=now() WHERE id=$1").bind(id).execute(&mut **tx).await?;
+        }
+        Ok(())
+    }
     async fn stop_task_locked(tx:&mut Transaction<'_,Postgres>,task_id:Uuid,bulk:bool)->AppResult<bool>{
-        let (status,stopped):(String,Option<String>)=sqlx::query_as("SELECT upper(status::text),upper(stopped_status::text) FROM tasks WHERE id=$1 AND runtime_owner='rust'")
+        let (status,stopped,owner):(String,Option<String>,String)=sqlx::query_as("SELECT upper(status::text),upper(stopped_status::text),runtime_owner FROM tasks WHERE id=$1")
             .bind(task_id).fetch_one(&mut **tx).await?;
         if status=="CANCELED" && stopped.is_some(){return Ok(false)}
         let predicate=if bulk{format!("({} OR ({}))",Self::STOPPABLE,Self::FAILED_LIVE)}else{Self::STOPPABLE.into()};
@@ -1714,6 +1753,7 @@ impl Scheduler {
             .bind(task_id).fetch_one(&mut **tx).await?;
         if !allowed || stopped.is_some(){return Err(AppError::Conflict("V2 task cannot be stopped in its current state".into()))}
         Self::task_control_fence(tx,task_id).await?;
+        Self::stop_historical_runs(tx,task_id,&owner).await?;
         if let Some((id,_,_))=Self::control_flow(tx,task_id).await?{
             Self::stop_remote_render(tx,id,false).await?;
             sqlx::query("UPDATE subtitle_jobs s SET status='queued',lease_owner=NULL,lease_until=NULL,updated_at=now() FROM vr2_jobs j WHERE j.workflow_id=$1 AND j.stage='subtitle' AND s.id=j.id AND s.operation_key=j.operation_key AND s.status::text='running'").bind(id).execute(&mut **tx).await?;
@@ -1736,12 +1776,13 @@ impl Scheduler {
         Ok(())
     }
     async fn resume_task_locked(tx:&mut Transaction<'_,Postgres>,task_id:Uuid)->AppResult<bool>{
-        let (status,stopped):(String,Option<String>)=sqlx::query_as("SELECT upper(status::text),upper(stopped_status::text) FROM tasks WHERE id=$1 AND runtime_owner='rust'")
+        let (status,stopped,owner):(String,Option<String>,String)=sqlx::query_as("SELECT upper(status::text),upper(stopped_status::text),runtime_owner FROM tasks WHERE id=$1")
             .bind(task_id).fetch_one(&mut **tx).await?;
         let Some(mut restored)=stopped.filter(|_|status=="CANCELED") else{
             return Err(AppError::Conflict("V2 task was not stopped by task controls".into()))
         };
         Self::task_control_fence(tx,task_id).await?;
+        Self::legacy_control_fence(tx,task_id,&owner).await?;
         if let Some((id,state,stage))=Self::control_flow(tx,task_id).await?{
             if state!="paused"{return Err(AppError::Conflict("native workflow is not paused".into()))}
             // Remote render explicitly excludes FAILED. A verified current

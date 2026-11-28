@@ -89,6 +89,13 @@
 - 原 Python 专项 tests/test_youtube_source_service.py、test_youtube_feed.py、test_youtube_home_feed.py 48/48、22 subtests，/4t/vr2-python-source-baseline.1cCzsa/result.log。新版 Rust 主程序构建通过，隔离 PG/真实 Rust V1 HTTP/模拟 yt-dlp /4t/vr2-source-scan-parity.WgnKFT/source-test.log 六组通过（原 CRUD、全量补录与日期、双标签授权/来源/时间/统计、失败时保留前项、两个独立进程到期争抢、enqueue 故障注入仍继续第三项）；首页回归 /4t/vr2-home-regression.UKAZBy/{home,periodic}.log 共15组通过，使用本地 Innertube 模拟器，无真实凭据。原首页扫描代码未全面重写，本轮仅共享入口回归。
 - 剩余差异：保留 Rust 对正在直播/预约直播的过滤、yt-dlp 单标签240秒及输出预算、RSS 禁止重定向等安全/可用性边界；源请求取消/租约到期等异常仍待专门故障注入，首页实际登录推荐及其逐项 enqueue 失败语义未重新对齐。真实频道/RSS/首页扫描与扫描产生任务的生产全链路待验收。未部署、未启用生产 scanner/worker、未创建生产任务；整体迁移状态 FAILED 不变。
 
+## 2026-11-28 历史任务控制与运行时迁移标签退役（第一阶段）
+
+- 原 Python task_service.stop_task/resume_stopped_task 按原任务行状态控制；旧实现 Rust lock_control_task 及响应 read_task 限制 runtime_owner=rust，导致列表可见但停止返回 404。移除单项/批量控制的任务选择所有权过滤、使用原任务可见读取；历史静止任务原地停止/恢复不改 runtime_owner。保留当前原生工作流 generation、执行租约及未确认投稿防重。只涉及可逆历史 Hatchet 工作流时复刻原 cancel_requested 与原 workflow.cancel Outbox 意图，重复停止不重复插入；不确认外部取消、不启动 Python/Hatchet 或遗留 dispatcher，未结算期间禁止恢复。其他历史未结算操作仍返回真实冲突。
+- 原任务配音/投稿/播控、稿件模板读取、审核读取、批次记录、SAU 读取、P2 记录及缓存 YouTube 元数据读取不再依赖迁移标签。
+- 隔离 PostgreSQL 原任务控制回归 `/4t/vr2-retirement-regression.tVtQRp/control.log` 通过：原历史任务 stop/resume、带外部 ID 的旧运行取消请求及恢复阻断、真实不存在 ID 404、批量计数、事务回滚、并发与同代恢复、未确认投稿保护、六项历史任务详情读取。首次附加诊断的临时 fixture 在提交数据库事务前调用 HTTP，返回 404；已由干净回归排除。
+- 生产只读审计 `/4t/vr2-runtime-retirement-audit.NDFhx8/plan.json`：74 条仍标记 Python，71 条需要核对、3 条已 rendered 无阻塞且无投稿记录；57 条任务有未结算投稿（含 34 条 unknown 稿件、26 条无外部回执的 submitted 稿件，数量口径不同），8 条任务有历史工作流阻塞（353 条 connection refused 的 launch_failed、1 条 running、1 条 published），4 条渲染任务阻塞、1 条字幕任务阻塞、5 条任务 Outbox 阻塞，原因可重叠。三个静止任务的完整原片/成品哈希核查因诊断超时尚未完成，不修改归属、不重放外部提交。剩余执行边界及所有权字段删除必须以外部回执/执行结算为依据，不能批量伪造完成。未完成全量所有权退役。
+
 以下为历史审计记录，不再视为当前验收结论。当前不满足完整生产替换门槛。
 
 2026-11-23 迁移状态（最新接口审计）：**175/217** 条原版 API 具有部分 Rust 原生适配，剩余 **42** 条尚无原生 V1 入口；**0** 条达到完整生产等价签收。测试采用一次性数据库、回环侧服务和原版 Python 同库差分；生产 Python 服务不切换。

@@ -486,7 +486,7 @@ async fn read_review(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<Value>> {
-    read_task(&state.db, id).await?;
+    crate::legacy_contracts::read_visible_task(&state.db, id).await?;
     let cfg = settings(&state.db).await?;
     let enabled = cfg["enabled"] == true;
     let saved: Option<(String, Value)> =
