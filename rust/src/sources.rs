@@ -8,7 +8,7 @@ use axum::{
     routing::{get, post},
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::Value;
 use sqlx::{FromRow, Row};
 use std::process::Stdio;
 use tokio::{process::Command, time::timeout};
@@ -262,21 +262,59 @@ fn normalize_flat_feed(
     }
     Ok(videos)
 }
+fn parse_rss(raw:&str)->AppResult<Vec<FeedVideo>>{
+    let doc=roxmltree::Document::parse(raw).map_err(|_|AppError::Unavailable("invalid YouTube RSS XML".into()))?;
+    let root=doc.root_element();
+    let atom="http://www.w3.org/2005/Atom";
+    let yt="http://www.youtube.com/xml/schemas/2015";
+    if !root.has_tag_name((atom,"feed")){return Err(AppError::Unavailable("YouTube RSS response is not an Atom feed".into()));}
+    let mut seen=std::collections::HashSet::new();
+    let mut entries=Vec::new();
+    for item in root.children().filter(|n|n.has_tag_name((atom,"entry"))){
+        let Some(id)=item.children().find(|n|n.has_tag_name((yt,"videoId"))).and_then(|n|n.text()).map(str::trim) else{continue;};
+        if id.len()!=11 || !id.bytes().all(|b|b.is_ascii_alphanumeric()||b==b'_'||b==b'-')||!seen.insert(id.to_owned()){continue;}
+        let Some(date)=item.children().find(|n|n.has_tag_name((atom,"published"))).and_then(|n|n.text()) else{continue;};
+        let date=chrono::DateTime::parse_from_rfc3339(date.trim()).map_err(|_|AppError::Unavailable("invalid YouTube RSS published date".into()))?;
+        entries.push(FeedVideo{id:id.to_owned(),published_at:Some(date.with_timezone(&chrono::Utc))});
+    }
+    Ok(entries)
+}
+async fn fetch_rss(kind:&str,id:&str,proxy:Option<&str>)->AppResult<Vec<FeedVideo>>{
+    let param=if kind=="channel"{"channel_id"}else{"playlist_id"};
+    let mut builder=reqwest::Client::builder().timeout(std::time::Duration::from_secs(20))
+        .redirect(reqwest::redirect::Policy::none())
+        .user_agent(std::env::var("YOUTUBE_USER_AGENT").unwrap_or_else(|_|"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36".into()));
+    if let Some(proxy)=proxy{builder=builder.proxy(reqwest::Proxy::all(proxy).map_err(|_|AppError::Invalid("invalid YouTube RSS proxy".into()))?);}
+    let mut response=builder.build()?.get("https://www.youtube.com/feeds/videos.xml").query(&[(param,id)]).send().await.map_err(|_|AppError::Unavailable("YouTube RSS request failed".into()))?;
+    if !response.status().is_success(){return Err(AppError::Unavailable(format!("YouTube RSS HTTP {}",response.status())));}
+    let mut bytes=Vec::new();
+    while let Some(chunk)=response.chunk().await.map_err(|_|AppError::Unavailable("YouTube RSS read failed".into()))?{
+        if bytes.len()+chunk.len()>2*1024*1024{return Err(AppError::Unavailable("YouTube RSS exceeded size budget".into()));}
+        bytes.extend_from_slice(&chunk);
+    }
+    let raw=std::str::from_utf8(&bytes).map_err(|_|AppError::Unavailable("YouTube RSS non-UTF8".into()))?;
+    parse_rss(raw)
+}
 /// Claim the source before an HTTP 202 response. The lease survives process
 /// crashes, so callers cannot accidentally schedule duplicate scans.
 pub async fn claim_scan(
     db: &Database,
     source_id: Uuid,
 ) -> AppResult<(String, chrono::DateTime<chrono::Utc>)> {
+    claim_scan_inner(db,source_id,true).await?
+        .ok_or_else(||AppError::Conflict("source is disabled or already being scanned".into()))
+}
+async fn claim_scan_inner(db:&Database,source_id:Uuid,force:bool)->AppResult<Option<(String,chrono::DateTime<chrono::Utc>)>>{
     let token = Uuid::new_v4().to_string();
     let started = sqlx::query_scalar::<_, chrono::DateTime<chrono::Utc>>(
-        "UPDATE youtube_sources SET scan_lock_owner=$1,scan_lock_until=now()+interval '15 minutes',last_scan_started_at=now(),updated_at=now()
+        "UPDATE youtube_sources SET scan_lock_owner=$1,scan_lock_until=now()+($4*interval '1 second'),last_scan_started_at=now(),last_scan_error=NULL,updated_at=now()
          WHERE id=$2 AND enabled=true AND (scan_lock_until IS NULL OR scan_lock_until<now())
+         AND ($3 OR COALESCE(last_scan_finished_at,last_scan_started_at) IS NULL OR COALESCE(last_scan_finished_at,last_scan_started_at)+scan_interval_minutes*interval '1 minute'<=now())
          RETURNING last_scan_started_at"
-    ).bind(&token).bind(source_id).fetch_optional(&db.pool).await?
-        .ok_or_else(|| AppError::Conflict("source is disabled or already being scanned".into()))?;
-    Ok((token, started))
+    ).bind(&token).bind(source_id).bind(force).bind(scan_ttl()).fetch_optional(&db.pool).await?;
+    Ok(started.map(|date|(token,date)))
 }
+fn scan_ttl()->i64{std::env::var("YOUTUBE_SOURCE_SCAN_LOCK_TTL_SECONDS").ok().and_then(|v|v.parse::<i64>().ok()).unwrap_or(900).max(60)}
 
 pub async fn scan_claimed(
     config: &Config,
@@ -289,7 +327,7 @@ pub async fn scan_claimed(
     since: Option<chrono::DateTime<chrono::Utc>>,
 ) -> AppResult<ScanReport> {
     let lease = sqlx::query(
-        "SELECT source_url,source_type::text,source_id,license::text,scan_limit,auto_process
+        "SELECT source_url,source_type::text,source_id,license::text,proof_url,scan_limit,auto_process
          FROM youtube_sources WHERE id=$1 AND scan_lock_owner=$2 AND scan_lock_until>now()",
     )
     .bind(source_id)
@@ -302,6 +340,7 @@ pub async fn scan_claimed(
     let url: Option<String> = lease.try_get("source_url")?;
     let url = check_source(&source_type, &canonical_id, url.as_deref())?;
     let license: String = lease.try_get("license")?;
+    let proof:Option<String>=lease.try_get("proof_url")?;
     let scan_limit: i32 = limit_override.unwrap_or(lease.try_get("scan_limit")?);
     let auto_process: bool = auto_override.unwrap_or(lease.try_get("auto_process")?);
     // Python heartbeats its manual source lease throughout long enumerations.
@@ -309,13 +348,14 @@ pub async fn scan_claimed(
     let heartbeat_token = lease_token.to_string();
     let heartbeat = tokio::spawn(async move {
         loop {
-            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            tokio::time::sleep(std::time::Duration::from_secs((scan_ttl()/3).clamp(15,60) as u64)).await;
             let renewed = sqlx::query(
-                "UPDATE youtube_sources SET scan_lock_until=now()+interval '15 minutes'
+                "UPDATE youtube_sources SET scan_lock_until=now()+($3*interval '1 second')
                  WHERE id=$1 AND scan_lock_owner=$2 AND scan_lock_until>now()",
             )
             .bind(source_id)
             .bind(&heartbeat_token)
+            .bind(scan_ttl())
             .execute(&heartbeat_db.pool)
             .await;
             match renewed {
@@ -328,9 +368,18 @@ pub async fn scan_claimed(
             }
         }
     });
+    let mut report = ScanReport {source_id,discovered:0,created:0,duplicated:0,pipelines_started:0,created_task_ids:Vec::new(),started_pipeline_job_ids:Vec::new()};
+    let mut feed_completed=false;
+    let mut enqueue_error=None;
     let result = async {
         let settings = crate::youtube_settings_v1::runtime(db, config).await?;
         let cookies = crate::youtube_settings_v1::prepare_cookie_copy(config, &settings).await?;
+        let urls=if source_type=="channel"{vec![url.clone(),format!("https://www.youtube.com/channel/{canonical_id}/shorts")]}else{vec![url]};
+        let mut ids=Vec::new();
+        let mut successful=false;
+        let mut seen=std::collections::HashSet::new();
+        for feed_url in urls {
+        let fetched=async {
         let mut downloader = Command::new(&config.download_binary);
         // Enumerate the entire source and use the same proxy/cookie settings
         // as the existing VideoRoll downloader. Never log credential contents.
@@ -352,7 +401,7 @@ pub async fn scan_claimed(
         downloader.args(crate::download_runtime::original_transport_args()).args(crate::download_runtime::original_extractor_args(settings.compatibility,None)?);
         let command = downloader
             .arg("--")
-            .arg(url)
+            .arg(feed_url)
             .stdin(Stdio::null())
             .kill_on_drop(true)
             .output();
@@ -365,7 +414,23 @@ pub async fn scan_claimed(
                 output.status
             )));
         }
-        let ids = normalize_flat_feed(&output.stdout, since)?;
+        normalize_flat_feed(&output.stdout,None)
+        }.await;
+        match fetched {
+            Ok(entries)=>{successful=true;for item in entries{if seen.insert(item.id.clone()){ids.push(item);}}},
+            Err(error)=>tracing::warn!(%source_id,%error,"YouTube source tab failed"),
+        }
+        }
+        if source_type=="channel" {ids.sort_by(|a,b|b.published_at.cmp(&a.published_at));}
+        if ids.is_empty(){
+            match fetch_rss(&source_type,&canonical_id,settings.proxy.as_deref()).await{
+                Ok(entries)=>{ids=entries;successful=true;},
+                Err(error)=>{if !successful{return Err(AppError::Unavailable(format!("all YouTube feed fetch attempts failed: {error}")));}tracing::warn!(%source_id,%error,"YouTube RSS fallback failed");}
+            }
+        }
+        ids.retain(|item|since.is_none_or(|cutoff|item.published_at.is_some_and(|d|d>cutoff)));
+        feed_completed=true;
+        report.discovered=ids.len();
         // The Python scanner enumerates *all* entries, then takes the first
         // N missing videos. Checking only the first N entries repeatedly
         // starves older, still-unprocessed playlist items.
@@ -381,15 +446,7 @@ pub async fn scan_claimed(
             .await?;
             ingested.extend(existing);
         }
-        let mut report = ScanReport {
-            source_id,
-            discovered: ids.len(),
-            created: 0,
-            duplicated: ids.iter().filter(|v| ingested.contains(&v.id)).count(),
-            pipelines_started: 0,
-            created_task_ids: Vec::new(),
-            started_pipeline_job_ids: Vec::new(),
-        };
+        report.duplicated=ids.iter().filter(|v| ingested.contains(&v.id)).count();
         for entry in ids
             .into_iter()
             .filter(|v| !ingested.contains(&v.id))
@@ -408,9 +465,8 @@ pub async fn scan_claimed(
                 return Err(AppError::Conflict("YouTube source scan lease lost".into()));
             }
             let url = format!("https://www.youtube.com/watch?v={}", entry.id);
-            let (task, workflow, duplicate) = scheduler
-                .create_youtube_source_task(&url, &license, 0,
-                    if auto_process{json!({"legacy_auto_runtime_profile":true})}else{json!({})},auto_process)
+            let (task, workflow, duplicate, start_error) = scheduler
+                .create_scanned_youtube_task(&url,&license,auto_process,proof.as_deref(),entry.published_at,source_id,lease_token)
                 .await?;
             if duplicate {
                 // Another scanner (including V1) won the unique source race.
@@ -423,32 +479,18 @@ pub async fn scan_claimed(
                 report.pipelines_started += 1;
                 report.started_pipeline_job_ids.push(flow.id.to_string());
             }
+            if let Some(error)=start_error{tracing::warn!(%source_id,%error,"source pipeline enqueue failed");enqueue_error=Some(error);}
         }
-        Ok::<ScanReport, AppError>(report)
-    }
-    .await;
+        Ok::<(), AppError>(())
+    }.await;
     heartbeat.abort();
-    let (discovered, created, duplicates, pipelines, error) = match &result {
-        Ok(r) => (
-            r.discovered as i32,
-            r.created as i32,
-            r.duplicated as i32,
-            r.pipelines_started as i32,
-            None,
-        ),
-        Err(e) => (
-            0,
-            0,
-            0,
-            0,
-            Some(e.to_string().chars().take(1000).collect::<String>()),
-        ),
-    };
+    let error=result.as_ref().err().map(|e|e.to_string().chars().take(1000).collect::<String>()).or(enqueue_error);
+    let (discovered,created,duplicates,pipelines)=(report.discovered as i32,report.created as i32,report.duplicated as i32,report.pipelines_started as i32);
     sqlx::query(
-        "UPDATE youtube_sources SET last_scan_finished_at=now(),last_scan_discovered_count=$1,last_scan_created_count=$2,last_scan_skipped_duplicates=$3,last_scan_started_pipeline_count=$4,last_scan_error=$5,last_nonempty_scan_finished_at=CASE WHEN $1>0 THEN now() ELSE last_nonempty_scan_finished_at END,last_nonempty_discovered_count=CASE WHEN $1>0 THEN $1 ELSE last_nonempty_discovered_count END,total_scan_count=total_scan_count+1,total_failed_scan_count=total_failed_scan_count+CASE WHEN $5 IS NULL THEN 0 ELSE 1 END,total_created_count=total_created_count+$2,total_started_pipeline_count=total_started_pipeline_count+$4,scan_lock_owner=NULL,scan_lock_until=NULL,updated_at=now() WHERE id=$6 AND scan_lock_owner=$7"
+        "UPDATE youtube_sources SET last_scan_finished_at=now(),last_scan_discovered_count=CASE WHEN $8 THEN $1 ELSE last_scan_discovered_count END,last_scan_created_count=CASE WHEN $8 THEN $2 ELSE last_scan_created_count END,last_scan_skipped_duplicates=CASE WHEN $8 THEN $3 ELSE last_scan_skipped_duplicates END,last_scan_started_pipeline_count=CASE WHEN $8 THEN $4 ELSE last_scan_started_pipeline_count END,last_scan_error=$5,last_nonempty_scan_finished_at=CASE WHEN $8 AND $1>0 THEN now() ELSE COALESCE(last_nonempty_scan_finished_at,CASE WHEN last_scan_discovered_count>0 THEN last_scan_finished_at END) END,last_nonempty_discovered_count=CASE WHEN $8 AND $1>0 THEN $1 WHEN last_nonempty_scan_finished_at IS NULL AND last_scan_discovered_count>0 THEN last_scan_discovered_count ELSE last_nonempty_discovered_count END,total_scan_count=COALESCE(total_scan_count,0)+CASE WHEN $8 AND $5 IS NULL THEN 1 ELSE 0 END,total_failed_scan_count=COALESCE(total_failed_scan_count,0)+CASE WHEN $5 IS NULL THEN 0 ELSE 1 END,total_created_count=COALESCE(total_created_count,0)+$2,total_started_pipeline_count=COALESCE(total_started_pipeline_count,0)+$4,scan_lock_owner=NULL,scan_lock_until=NULL,updated_at=now() WHERE id=$6 AND scan_lock_owner=$7"
     ).bind(discovered).bind(created).bind(duplicates).bind(pipelines).bind(error)
-        .bind(source_id).bind(&lease_token).execute(&db.pool).await?;
-    result
+        .bind(source_id).bind(&lease_token).bind(feed_completed).execute(&db.pool).await?;
+    result.map(|()|report)
 }
 pub async fn scan_source(
     config: &Config,
@@ -467,15 +509,17 @@ async fn scan(State(state): State<AppState>, Path(id): Path<Uuid>) -> AppResult<
 }
 pub async fn scan_due(config: &Config, db: &Database, scheduler: &Scheduler) -> AppResult<u64> {
     let ids=sqlx::query_scalar::<_,Uuid>(
-        "SELECT id FROM youtube_sources WHERE enabled=true AND (last_scan_started_at IS NULL OR last_scan_started_at + (scan_interval_minutes*interval '1 minute')<=now()) AND (scan_lock_until IS NULL OR scan_lock_until<now()) ORDER BY last_scan_started_at NULLS FIRST LIMIT 3"
+        "SELECT id FROM youtube_sources WHERE enabled=true AND (COALESCE(last_scan_finished_at,last_scan_started_at) IS NULL OR COALESCE(last_scan_finished_at,last_scan_started_at)+scan_interval_minutes*interval '1 minute'<=now()) AND (scan_lock_until IS NULL OR scan_lock_until<now()) ORDER BY COALESCE(last_scan_finished_at,last_scan_started_at,created_at),id"
     ).fetch_all(&db.pool).await?;
-    let count = ids.len();
+    let mut count=0u64;
     for id in ids {
-        if let Err(error) = scan_source(config, db, scheduler, id).await {
-            tracing::warn!(source_id=%id,error=%error,"YouTube source scan failed");
+        let Some((token,_))=claim_scan_inner(db,id,false).await? else{continue;};
+        match scan_claimed(config,db,scheduler,id,&token,None,None,None).await {
+            Ok(_)=>count+=1,
+            Err(error)=>tracing::warn!(source_id=%id,error=%error,"YouTube source scan failed"),
         }
     }
-    Ok(count as u64)
+    Ok(count)
 }
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -519,6 +563,16 @@ mod tests {
             rows.iter().map(|v| v.id.as_str()).collect::<Vec<_>>(),
             vec!["0123456789B"]
         );
+    }
+    #[test]
+    fn rss_atom_parsing_preserves_original_publication_date() {
+        let raw=r#"<feed xmlns="http://www.w3.org/2005/Atom" xmlns:yt="http://www.youtube.com/xml/schemas/2015"><entry><yt:videoId>0123456789A</yt:videoId><published>2026-11-22T12:00:00Z</published></entry></feed>"#;
+        let rows=parse_rss(raw).unwrap();
+        assert_eq!(rows.len(),1);
+        assert_eq!(rows[0].id,"0123456789A");
+        assert_eq!(rows[0].published_at.unwrap().to_rfc3339(),"2026-11-22T12:00:00+00:00");
+        assert!(parse_rss("<html/>").is_err());
+        assert!(parse_rss(r#"<feed xmlns="http://www.w3.org/2005/Atom"/>"#).unwrap().is_empty());
     }
     #[test]
     fn user_source_url_cannot_switch_to_internal_network() {

@@ -11,10 +11,10 @@ import psycopg
 
 database=os.environ["DATABASE_URL"]
 assert database.endswith("/videoroll_test") and "127.0.0.1:" in database
-base="http://127.0.0.1:18080/api/v1"
+base=os.environ.get("VIDEOROLL_TEST_V1_BASE","http://127.0.0.1:18080/api/v1")
 home="http://127.0.0.1:18195/"
 token=os.environ["VIDEOROLL_V2_INTERNAL_TOKEN"]
-binary=Path(__file__).resolve().parents[1]/"target/debug/videoroll-v2"
+binary=Path(os.environ.get("VIDEOROLL_TEST_BIN",str(Path(__file__).resolve().parents[1]/"target/debug/videoroll-v2")))
 assert binary.is_file(),binary
 def api(method,path,body=None):
     headers={"x-videoroll-v2-internal-token":token}

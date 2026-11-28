@@ -81,6 +81,14 @@
 - 隔离 PostgreSQL /4t/vr2-original-layout-check.jllLMo/paths.log：原路径手动字幕有效请求通过，外任务和错误摘要拒绝；原片复用真实下载阶段成功（yt-dlp 禁用）；原路径 B 站 P1+封面模拟 UPOS 上传及单次提交成功；SAU 原路径视频/封面模拟派发成功。首轮 P2 请求误用 v2 路由、字幕模拟固定文本不符、混合清理残留任务级引用保护；分别纠正测试入口/素材及逐文件回收判断。最终 /4t/vr2-layout-final-check.jDqT21/paths.log：原 SRT 模拟上传及 preSave 提交、P2 原 raw/SRT 及 YouDub 成功输出追加准入、混合终态任务仅清理原未登记文件（删除1文件/1资产行，登记文件及行保留）均通过。retention.log：原 TTL/暂停/人工持有/删除失败保护、原路径注册文件物理回收及篡改/共享/未知文件保留、已确认投稿清理失败补偿与不确认回执保留均通过。
 - 上述为隔离测试，P2 只验证持久追加准入，非实际平台编辑；SAU 仅模拟 sidecar，非真实浏览器；未重放 USGS 投稿或清理生产资产，未部署。原路径任意未证明可回收的文件保留；历史单资产删除接口 legacy_asset_delete_v1.rs 的独立 V2 限制、真实多平台/YouDub/外部字幕同步及跨模块全部差分仍待验收。不能据此将整体迁移标记完成。
 
+## 2026-11-28 YouTube 订阅源扫描原行为对齐
+
+- 对照 Python youtube_ingest/source_service.py 的 youtube_source_is_due/get_due_youtube_source_ids/finish_youtube_source_scan_lock/scan_youtube_source_by_id、youtube_feed.py 的 _fetch_channel_uploads_ytdlp/_merge_channel_entries/fetch_youtube_feed、orchestrator_api/infrastructure/scheduler.py:_run_due_source_scans/_source_scan_loop 与 utils/auto_youtube.py。频道枚举 Videos+Shorts、去重后已知日期降序、未知日期稳定发现顺序，空结果/双标签失败时尝试官方 RSS；播放列表保持原顺序。保留完整枚举后限额、since 日期筛选及原 Cookie/代理运行配置。RSS 固定官方端点、20s/2MiB、禁止重定向，使用已依赖 roxmltree 安全解析。未对真实 RSS 网络回退做专项实测。
+- 原 youtube_sources.proof_url、ingested_videos.published_at（确认生产原列已存在）与 ingested 状态、原 auto_youtube created_by/run_id 同事务登记，非自动任务不设置原自动来源字段。唯一索引防重复；source row 与租约校验纳入单视频创建事务。自动工作流 enqueue 失败使用 savepoint 只回滚流水线，保留 Task 与去重记录，继续后续视频；其它数据库异常保留此前已提交任务及统计。成功/失败累计分开，抓取失败保留上次有效扫描快照，旧 last_nonempty 统计补偿。
+- 原完成时间优先的 due 条件在领取租约时再次原子检查，清除上次错误，恢复原默认900s及 YOUTUBE_SOURCE_SCAN_LOCK_TTL_SECONDS；取消任意三源上限，仍按原 Python 串行处理已到期来源，恢复默认30s检查/至少15s。新增内部 source-tick 诊断命令复用同一逻辑、遵守启用开关，不启动媒体 Worker；未新增公开 API、业务表或生产迁移。测试 bootstrap 补原 published_at 列。
+- 原 Python 专项 tests/test_youtube_source_service.py、test_youtube_feed.py、test_youtube_home_feed.py 48/48、22 subtests，/4t/vr2-python-source-baseline.1cCzsa/result.log。新版 Rust 主程序构建通过，隔离 PG/真实 Rust V1 HTTP/模拟 yt-dlp /4t/vr2-source-scan-parity.WgnKFT/source-test.log 六组通过（原 CRUD、全量补录与日期、双标签授权/来源/时间/统计、失败时保留前项、两个独立进程到期争抢、enqueue 故障注入仍继续第三项）；首页回归 /4t/vr2-home-regression.UKAZBy/{home,periodic}.log 共15组通过，使用本地 Innertube 模拟器，无真实凭据。原首页扫描代码未全面重写，本轮仅共享入口回归。
+- 剩余差异：保留 Rust 对正在直播/预约直播的过滤、yt-dlp 单标签240秒及输出预算、RSS 禁止重定向等安全/可用性边界；源请求取消/租约到期等异常仍待专门故障注入，首页实际登录推荐及其逐项 enqueue 失败语义未重新对齐。真实频道/RSS/首页扫描与扫描产生任务的生产全链路待验收。未部署、未启用生产 scanner/worker、未创建生产任务；整体迁移状态 FAILED 不变。
+
 以下为历史审计记录，不再视为当前验收结论。当前不满足完整生产替换门槛。
 
 2026-11-23 迁移状态（最新接口审计）：**175/217** 条原版 API 具有部分 Rust 原生适配，剩余 **42** 条尚无原生 V1 入口；**0** 条达到完整生产等价签收。测试采用一次性数据库、回环侧服务和原版 Python 同库差分；生产 Python 服务不切换。

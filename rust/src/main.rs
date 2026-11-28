@@ -121,6 +121,8 @@ enum Command {
     /// Run one due-check for the original YouTube Home recommendation scanner.
     /// Exits without side effects unless home_scan_enabled is true and due.
     HomeTick,
+    /// Run one original due-source scan cycle; never starts media workers.
+    SourceTick,
     /// Run one bounded legacy storage retention page, with both opt-in flags.
     LegacyStorageTick,
     /// Read-only registered media integrity page and optional shallow directory scan.
@@ -268,9 +270,8 @@ async fn main() -> anyhow::Result<()> {
                 let scanner_db = db.clone();
                 let scanner_scheduler = scheduler.clone();
                 tokio::spawn(async move {
-                    let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+                    let seconds=std::env::var("YOUTUBE_SOURCE_SCAN_TICK_SECONDS").ok().and_then(|v|v.parse::<u64>().ok()).unwrap_or(30).max(15);
                     loop {
-                        tick.tick().await;
                         if let Err(error) = videoroll_v2::sources::scan_due(
                             &scanner_config,
                             &scanner_db,
@@ -280,6 +281,7 @@ async fn main() -> anyhow::Result<()> {
                         {
                             tracing::warn!(error=%error,"periodic YouTube source scan unavailable");
                         }
+                        tokio::time::sleep(std::time::Duration::from_secs(seconds)).await;
                     }
                 });
             }
@@ -501,6 +503,13 @@ async fn main() -> anyhow::Result<()> {
             let stale = videoroll_v2::bili_p2::reconcile_stale(&db).await?;
             let processed = videoroll_v2::bili_p2::tick(&config, &db, &store).await?;
             tracing::info!(stale, processed, "native post-P1 P2 append tick finished");
+        }
+        Command::SourceTick => {
+            let count=if config.source_scanner_enabled{
+                let scheduler=Scheduler::new(db.clone(),config.job_lease);
+                videoroll_v2::sources::scan_due(&config,&db,&scheduler).await?
+            }else{0};
+            println!("source_scans_completed={count}");
         }
         Command::HomeTick => {
             let state = AppState {

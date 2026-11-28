@@ -38,6 +38,22 @@ done
 # Regression fixture: the first two entries have already been ingested,
 # while a third later playlist entry is new. A limit=1 scan must reach it.
 case "$*" in
+  *UC77777777777777777777/shorts*)
+    printf '%s\n' '{"id":"SCANFAIL003","upload_date":"20261121"}'
+    exit 0
+    ;;
+  *UC77777777777777777777/videos*)
+    printf '%s\n' '{"id":"SCANFAIL001","upload_date":"20261124"}' '{"id":"SCANFAIL002","upload_date":"20261123"}'
+    exit 0
+    ;;
+  *UC88888888888888888888/shorts*)
+    printf '%s\n' '{"id":"SCANSHORT01","upload_date":"20261125"}' '{"id":"SCANVIDEO01","upload_date":"20261123"}'
+    exit 0
+    ;;
+  *UC88888888888888888888/videos*)
+    printf '%s\n' '{"id":"SCANVIDEO01","upload_date":"20261123"}' '{"id":"SCANVIDEO02"}'
+    exit 0
+    ;;
   *UC99999999999999999999*)
     printf '%s\n' '{"id":"0123456789E","title":"already ingested A"}' \
       '{"id":"0123456789F","title":"already ingested B"}' \

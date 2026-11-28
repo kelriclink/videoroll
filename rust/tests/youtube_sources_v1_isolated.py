@@ -9,7 +9,7 @@ import time
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
-BASE = "http://127.0.0.1:18080/api/v1"
+BASE = os.environ.get("VIDEOROLL_TEST_V1_BASE","http://127.0.0.1:18080/api/v1")
 TOKEN = os.environ["VIDEOROLL_V2_INTERNAL_TOKEN"]
 CONTAINER = os.environ["container_name"]
 HEADERS = {"x-videoroll-v2-internal-token": TOKEN, "content-type":"application/json"}
@@ -28,9 +28,9 @@ def req(method, path, body=None, authenticated=True):
         return err.code,json.loads(err.read())
 
 def pg(sql):
-    subprocess.run(["docker","exec",CONTAINER,"psql","-v","ON_ERROR_STOP=1",
+    return subprocess.run(["docker","exec",CONTAINER,"psql","-X","-At","-v","ON_ERROR_STOP=1",
       "-U","postgres","-d","videoroll_test","-c",sql],check=True,
-      stdout=subprocess.DEVNULL,stderr=subprocess.PIPE)
+      stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True).stdout.strip()
 
 def check_equal(row):
     expected = {
@@ -160,3 +160,51 @@ assert settings["home_scan_last_eligible_count"]==0
 print("PASS: V1 YouTube settings historical source counters read from existing records without changing V2 scanner state")
 
 print("PASS: V1 Python-shaped YouTube source CRUD, dedupe, source schema, locks, async/sync scans, auth and deletion")
+
+# Dedicated independent channel verifies Videos+Shorts merge, known-date
+# ordering, proof and original metadata, partial failure and due semantics.
+status,src=req("POST","/youtube/sources",{"source_type":"channel","source_id":"UC88888888888888888888","license":"authorized","proof_url":"https://example.test/permission","enabled":True,"auto_process":True,"scan_limit":3})
+assert status==200,(status,src)
+sid=src["id"]
+pg("""CREATE FUNCTION reject_scan_fixture() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN IF NEW.source_url LIKE '%SCANVIDEO01' THEN RAISE EXCEPTION 'fixture second entry fails'; END IF; RETURN NEW; END$$;
+CREATE TRIGGER reject_scan_fixture BEFORE INSERT ON tasks FOR EACH ROW EXECUTE FUNCTION reject_scan_fixture()""")
+status,body=req("POST",f"/youtube/sources/{sid}/scan",{})
+assert status>=400,(status,body)
+pg("DROP TRIGGER reject_scan_fixture ON tasks; DROP FUNCTION reject_scan_fixture()")
+assert pg(f"SELECT concat_ws('|',last_scan_discovered_count,last_scan_created_count,last_scan_started_pipeline_count,total_scan_count,total_failed_scan_count,scan_lock_owner IS NULL) FROM youtube_sources WHERE id='{sid}'")=="3|1|1|0|1|t"
+assert pg("SELECT concat_ws('|',t.source_proof_url,t.status::text,t.origin_kind,t.created_by LIKE 'auto_youtube;auto_publish=;run_id=%',i.published_at::date) FROM ingested_videos i JOIN tasks t ON t.id=i.task_id WHERE i.source_id='SCANSHORT01'")=="https://example.test/permission|ingested|auto_youtube|t|2026-11-25"
+status,body=req("POST",f"/youtube/sources/{sid}/scan",{"auto_process":False})
+assert status==200 and len(body["created_task_ids"])==2,(status,body)
+assert pg("SELECT concat_ws('|',t.source_proof_url,t.status::text,t.origin_kind IS NULL,t.created_by IS NULL,t.origin_run_id IS NULL,i.published_at::date) FROM ingested_videos i JOIN tasks t ON t.id=i.task_id WHERE i.source_id='SCANVIDEO01'")=="https://example.test/permission|ingested|t|t|t|2026-11-23"
+assert pg(f"SELECT concat_ws('|',last_scan_discovered_count,last_scan_created_count,last_scan_skipped_duplicates,total_scan_count,total_failed_scan_count,total_created_count,total_started_pipeline_count) FROM youtube_sources WHERE id='{sid}'")=="3|2|1|1|1|3|1"
+print("PASS: both tabs, stable date order, source proof, original origin/ingested status, partial failure and historical counters")
+if os.environ.get("VIDEOROLL_TEST_BIN"):
+    bin=os.environ["VIDEOROLL_TEST_BIN"]
+    env={**os.environ,"VIDEOROLL_V2_SOURCE_SCANNER":"true"}
+    pg(f"UPDATE youtube_sources SET last_scan_started_at=now()-interval '2 days',last_scan_finished_at=now() WHERE id='{sid}'")
+    before=pg(f"SELECT total_scan_count FROM youtube_sources WHERE id='{sid}'")
+    result=subprocess.check_output([bin,"source-tick"],env=env,text=True)
+    assert "source_scans_completed=0" in result,result
+    assert pg(f"SELECT total_scan_count FROM youtube_sources WHERE id='{sid}'")==before
+    pg(f"UPDATE youtube_sources SET last_scan_finished_at=now()-interval '2 days' WHERE id='{sid}'")
+    a=subprocess.Popen([bin,"source-tick"],env=env,stdout=subprocess.PIPE,text=True)
+    b=subprocess.Popen([bin,"source-tick"],env=env,stdout=subprocess.PIPE,text=True)
+    outputs=[p.communicate(timeout=30)[0] for p in (a,b)]
+    assert a.returncode==b.returncode==0,outputs
+    assert sum("source_scans_completed=1" in x for x in outputs)==1 and sum("source_scans_completed=0" in x for x in outputs)==1,outputs
+    assert pg(f"SELECT total_scan_count FROM youtube_sources WHERE id='{sid}'")==str(int(before)+1)
+    print("PASS: completed-time interval and atomic scheduled claim across two processes")
+assert req("DELETE",f"/youtube/sources/{sid}")[0]==200
+
+status,src=req("POST","/youtube/sources",{"source_type":"channel","source_id":"UC77777777777777777777","license":"authorized","enabled":True,"auto_process":True,"scan_limit":3})
+assert status==200,(status,src)
+sid=src["id"]
+pg("""CREATE FUNCTION reject_pipeline_fixture() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN IF EXISTS(SELECT 1 FROM tasks WHERE id=NEW.task_id AND source_url LIKE '%SCANFAIL002') THEN RAISE EXCEPTION 'fixture enqueue fails'; END IF; RETURN NEW; END$$;
+CREATE TRIGGER reject_pipeline_fixture BEFORE INSERT ON pipeline_runs FOR EACH ROW EXECUTE FUNCTION reject_pipeline_fixture()""")
+status,body=req("POST",f"/youtube/sources/{sid}/scan",{})
+pg("DROP TRIGGER reject_pipeline_fixture ON pipeline_runs; DROP FUNCTION reject_pipeline_fixture()")
+assert status==200 and len(body["created_task_ids"])==3 and len(body["started_pipeline_job_ids"])==2,(status,body)
+assert pg(f"SELECT concat_ws('|',last_scan_discovered_count,last_scan_created_count,last_scan_started_pipeline_count,total_scan_count,total_failed_scan_count,last_scan_error LIKE '%SCANFAIL002%') FROM youtube_sources WHERE id='{sid}'")=="3|3|2|0|1|t"
+assert pg("SELECT concat_ws('|',t.status::text,(SELECT count(*) FROM vr2_workflows w WHERE w.task_id=t.id)) FROM ingested_videos i JOIN tasks t ON t.id=i.task_id WHERE i.source_id='SCANFAIL002'")=="ingested|0"
+assert req("DELETE",f"/youtube/sources/{sid}")[0]==200
+print("PASS: failed workflow enqueue preserves task and dedupe, scans subsequent entries, original failed-scan counters")

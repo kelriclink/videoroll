@@ -67,6 +67,7 @@ CREATE TABLE ingested_videos (
   id UUID PRIMARY KEY, platform VARCHAR(32) NOT NULL,
   source_id VARCHAR(64) NOT NULL,
   task_id UUID NOT NULL REFERENCES tasks(id),
+  published_at TIMESTAMPTZ,
   UNIQUE(platform,source_id)
 );
 CREATE TABLE assets (

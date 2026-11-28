@@ -7,7 +7,7 @@ from urllib.error import HTTPError
 from pathlib import Path
 import psycopg
 
-base="http://127.0.0.1:18080/api/v1"
+base=os.environ.get("VIDEOROLL_TEST_V1_BASE","http://127.0.0.1:18080/api/v1")
 url="http://127.0.0.1:18195/"
 token=os.environ["VIDEOROLL_V2_INTERNAL_TOKEN"]
 db_url=os.environ["DATABASE_URL"]

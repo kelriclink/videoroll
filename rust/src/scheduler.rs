@@ -74,8 +74,9 @@ impl Scheduler {
             configuration,
             true,
             source_proof_url,
+            None,
         )
-        .await
+        .await.map(|(task,flow,duplicate,_)|(task,flow,duplicate))
     }
     pub async fn create_youtube_source_task(
         &self,
@@ -92,8 +93,20 @@ impl Scheduler {
             configuration,
             auto_process,
             None,
+            None,
         )
-        .await
+        .await.map(|(task,flow,duplicate,_)|(task,flow,duplicate))
+    }
+    /// Original subscription intake: keep source proof and publication date,
+    /// and fence task creation against the source's current scan lease.
+    pub async fn create_scanned_youtube_task(
+        &self, source_url:&str, license:&str, auto_process:bool,
+        proof:Option<&str>, published_at:Option<chrono::DateTime<chrono::Utc>>,
+        source_id:Uuid, lease_token:&str,
+    )->AppResult<(TaskInfo,Option<WorkflowInfo>,bool,Option<String>)>{
+        self.create_youtube_source_task_inner(source_url,license,0,
+            if auto_process {json!({"legacy_auto_runtime_profile":true})}else{json!({})},
+            auto_process,proof,Some((source_id,lease_token,published_at))).await
     }
     async fn create_youtube_source_task_inner(
         &self,
@@ -103,7 +116,8 @@ impl Scheduler {
         configuration: Value,
         auto_process: bool,
         source_proof_url: Option<&str>,
-    ) -> AppResult<(TaskInfo, Option<WorkflowInfo>, bool)> {
+        scan:Option<(Uuid,&str,Option<chrono::DateTime<chrono::Utc>>)>,
+    ) -> AppResult<(TaskInfo, Option<WorkflowInfo>, bool, Option<String>)> {
         let video_id = crate::ingest::youtube_video_id(source_url)?;
         let license = match source_license {
             "own" | "authorized" | "cc" | "unknown" => source_license,
@@ -116,6 +130,11 @@ impl Scheduler {
             .bind(format!("youtube:{video_id}"))
             .execute(&mut *tx)
             .await?;
+        if let Some((source,token,_))=scan.as_ref(){
+            let owned:Option<Uuid>=sqlx::query_scalar("SELECT id FROM youtube_sources WHERE id=$1 AND enabled AND scan_lock_owner=$2 AND scan_lock_until>clock_timestamp() FOR UPDATE")
+                .bind(source).bind(token).fetch_optional(&mut *tx).await?;
+            if owned.is_none(){return Err(AppError::Conflict("YouTube source scan lease lost".into()));}
+        }
         if let Some(task_id) = sqlx::query_scalar::<_, Uuid>(
             "SELECT task_id FROM ingested_videos WHERE platform='youtube' AND source_id=$1",
         )
@@ -124,7 +143,7 @@ impl Scheduler {
         .await?
         {
             tx.commit().await?;
-            return Ok((self.db.task(task_id).await?, None, true));
+            return Ok((self.db.task(task_id).await?, None, true,None));
         }
         let task_id = Uuid::new_v4();
         let workflow_id = Uuid::new_v4();
@@ -138,23 +157,25 @@ impl Scheduler {
         } else {
             "source_scan"
         };
-        let created_by = if home_scan {
-            format!("youtube_home_scan;auto_publish=;run_id={run_id}")
-        } else {
-            origin.to_string()
-        };
+        let created_by = if home_scan || (scan.is_some() && auto_process) {
+            Some(format!("{origin};auto_publish=;run_id={run_id}"))
+        } else if scan.is_some() {None} else {Some(origin.to_string())};
+        let stored_origin=if scan.is_some()&&!auto_process{None}else{Some(origin)};
+        let stored_run=if scan.is_some()&&!auto_process{None}else{Some(run_id)};
+        let status=if scan.is_some(){"ingested"}else{"created"};
         let canonical_url = format!("https://www.youtube.com/watch?v={video_id}");
         // Original Task columns are distinct: origin_kind has a 32-char
         // enum-like value; created_by can contain the original metadata.
         // Both must be committed atomically with the durable workflow.
         sqlx::query(
-            "INSERT INTO tasks(id,source_type,source_url,source_license,status,priority,origin_kind,origin_run_id,restart_generation,created_by,source_proof_url,retry_count) VALUES($1,'youtube'::source_type,$2,$3::source_license,'created'::task_status,$4,$6,$5,0,$7,$8,0)"
+            "INSERT INTO tasks(id,source_type,source_url,source_license,status,priority,origin_kind,origin_run_id,restart_generation,created_by,source_proof_url,retry_count) VALUES($1,'youtube'::source_type,$2,$3::source_license,$9::task_status,$4,$6,$5,0,$7,$8,0)"
         ).bind(task_id).bind(canonical_url).bind(license).bind(priority.clamp(-100,100))
-            .bind(run_id).bind(origin).bind(created_by).bind(source_proof_url)
+            .bind(stored_run).bind(stored_origin).bind(created_by).bind(source_proof_url).bind(status)
             .execute(&mut *tx).await?;
+        let source_scan=scan.is_some();
         let inserted=sqlx::query(
-            "INSERT INTO ingested_videos(id,platform,source_id,task_id) VALUES($1,'youtube',$2,$3) ON CONFLICT(platform,source_id) DO NOTHING"
-        ).bind(Uuid::new_v4()).bind(&video_id).bind(task_id).execute(&mut *tx).await?;
+            "INSERT INTO ingested_videos(id,platform,source_id,task_id,published_at) VALUES($1,'youtube',$2,$3,$4) ON CONFLICT(platform,source_id) DO NOTHING"
+        ).bind(Uuid::new_v4()).bind(&video_id).bind(task_id).bind(scan.and_then(|(_,_,date)|date)).execute(&mut *tx).await?;
         if inserted.rows_affected() != 1 {
             // Concurrent v1 intake won. The new Task must not be committed.
             tx.rollback().await?;
@@ -164,7 +185,7 @@ impl Scheduler {
             .bind(&video_id)
             .fetch_one(&self.db.pool)
             .await?;
-            return Ok((self.db.task(winner).await?, None, true));
+            return Ok((self.db.task(winner).await?, None, true,None));
         }
         sqlx::query("UPDATE tasks SET runtime_owner='rust',runtime_origin=$2 WHERE id=$1")
             .bind(task_id)
@@ -175,29 +196,36 @@ impl Scheduler {
             })
             .execute(&mut *tx)
             .await?;
+        let mut start_error=None;
         if auto_process {
-            sqlx::query(
-            "INSERT INTO vr2_workflows(id,task_id,generation,state,current_stage,configuration) VALUES($1,$2,1,'running','download',$3)"
-        ).bind(workflow_id).bind(task_id).bind(configuration).execute(&mut *tx).await?;
-            Self::insert_job(&mut tx, workflow_id, task_id, 1, Stage::Download).await?;
-            Self::event(
-                &mut tx,
-                workflow_id,
-                None,
-                "workflow.started",
-                json!({"generation":1,"video_id":video_id}),
-            )
-            .await?;
+            // Python retains an ingested task if only pipeline enqueue fails,
+            // then continues scanning subsequent entries. Keep the task and
+            // dedupe rows in the outer transaction; rollback only the enqueue.
+            if source_scan{sqlx::query("SAVEPOINT scan_enqueue").execute(&mut *tx).await?;}
+            let enqueue=async{
+                sqlx::query(
+                    "INSERT INTO vr2_workflows(id,task_id,generation,state,current_stage,configuration) VALUES($1,$2,1,'running','download',$3)"
+                ).bind(workflow_id).bind(task_id).bind(configuration).execute(&mut *tx).await?;
+                Self::insert_job(&mut tx, workflow_id, task_id, 1, Stage::Download).await?;
+                Self::event(&mut tx,workflow_id,None,"workflow.started",json!({"generation":1,"video_id":video_id})).await?;
+                Ok::<(),AppError>(())
+            }.await;
+            if let Err(error)=enqueue{
+                if !source_scan{return Err(error);}
+                sqlx::query("ROLLBACK TO SAVEPOINT scan_enqueue").execute(&mut *tx).await?;
+                start_error=Some(format!("{video_id}: start pipeline failed: {error}").chars().take(1000).collect());
+            }
+            if source_scan{sqlx::query("RELEASE SAVEPOINT scan_enqueue").execute(&mut *tx).await?;}
         }
         tx.commit().await?;
         Ok((
             self.db.task(task_id).await?,
-            if auto_process {
+            if auto_process && start_error.is_none() {
                 Some(self.workflow(workflow_id).await?)
             } else {
                 None
             },
-            false,
+            false,start_error,
         ))
     }
     pub async fn start(&self, task_id: Uuid, configuration: Value) -> AppResult<WorkflowInfo> {
