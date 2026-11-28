@@ -146,9 +146,10 @@ async fn model_identity(request: &Value) -> AppResult<Value> {
     Ok(key)
 }
 impl Session {
-    fn spawn(key: Value, python: &Path, bridge: &Path, lock: &Path) -> AppResult<Self> {
-        let mut cmd = Command::new(python);
-        cmd.arg("-I").arg(bridge).arg("--serve").env_clear();
+    fn spawn(key: Value, executable: &Path, bridge: Option<&Path>, lock: &Path) -> AppResult<Self> {
+        let mut cmd = Command::new(executable);
+        if let Some(bridge) = bridge { cmd.arg("-I").arg(bridge); }
+        cmd.arg("--serve").env_clear();
         for name in [
             "PATH",
             "LD_LIBRARY_PATH",
@@ -162,6 +163,16 @@ impl Session {
             if let Some(v) = std::env::var_os(name) {
                 cmd.env(name, v);
             }
+        }
+        if bridge.is_none() {
+            let ov = native_runtime_root("VIDEOROLL_V2_OPENVINO_RUNTIME", "/opt/videoroll/runtime/openvino-2026.4.1")?;
+            let vad = native_runtime_root("VIDEOROLL_V2_SILERO_RUNTIME", "/opt/videoroll/runtime/silero-v6-ort-1.30.0")?;
+            let libraries = std::env::join_paths([ov.join("runtime/3rdparty/tbb/lib"), ov.join("runtime/lib/intel64")])
+                .map_err(|_| AppError::Invalid("invalid native inference library path".into()))?;
+            cmd.env("OPENVINO_INSTALL_DIR", &ov)
+                .env("VIDEOROLL_OPENVINO_RUNTIME", &ov)
+                .env("VIDEOROLL_SILERO_RUNTIME", &vad)
+                .env("LD_LIBRARY_PATH", libraries);
         }
         cmd.env("HF_HUB_OFFLINE", "1")
             .env("TRANSFORMERS_OFFLINE", "1")
@@ -253,9 +264,30 @@ fn env(key: &str, default: &str) -> String {
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| default.into())
 }
+fn native_runtime_root(key: &str, default: &str) -> AppResult<PathBuf> {
+    let p = std::env::var_os(key).map(PathBuf::from).unwrap_or_else(|| PathBuf::from(default));
+    if !p.is_absolute() { return Err(AppError::Invalid("native inference runtime must use absolute paths".into())); }
+    Ok(p)
+}
+fn native_supported(request: &Value) -> bool {
+    match request["kind"].as_str() {
+        Some("vad" | "devices") => true,
+        Some("asr") => request["engine"] == "openvino",
+        Some("embedding") => request["device"].as_str().is_some_and(|s| s.to_ascii_lowercase().starts_with("openvino")),
+        _ => false,
+    }
+}
+pub fn runtime_revision() -> Value {
+    if let Some(executable) = std::env::var_os("VIDEOROLL_V2_LOCAL_INFERENCE_NATIVE") {
+        json!({"backend":"native-openvino-v1","executable":PathBuf::from(executable),
+            "openvino":std::env::var("VIDEOROLL_V2_OPENVINO_RUNTIME").unwrap_or_else(|_| "/opt/videoroll/runtime/openvino-2026.4.1".into()),
+            "silero":std::env::var("VIDEOROLL_V2_SILERO_RUNTIME").unwrap_or_else(|_| "/opt/videoroll/runtime/silero-v6-ort-1.30.0".into())})
+    } else { Value::Null }
+}
 pub fn configured() -> bool {
-    std::env::var_os("VIDEOROLL_V2_LOCAL_INFERENCE_PYTHON").is_some()
-        && std::env::var_os("VIDEOROLL_V2_LOCAL_INFERENCE_BRIDGE").is_some()
+    std::env::var_os("VIDEOROLL_V2_LOCAL_INFERENCE_NATIVE").is_some() ||
+    (std::env::var_os("VIDEOROLL_V2_LOCAL_INFERENCE_PYTHON").is_some()
+        && std::env::var_os("VIDEOROLL_V2_LOCAL_INFERENCE_BRIDGE").is_some())
 }
 pub async fn model_path(root: &Path, model: &str, embedding: bool) -> AppResult<PathBuf> {
     let root = tokio::fs::canonicalize(root)
@@ -333,18 +365,17 @@ pub async fn asr_settings(engine: &str, model: &str, settings: &Value) -> AppRes
     )
 }
 pub async fn invoke(request: &Value, timeout: Duration) -> AppResult<Value> {
-    let python = PathBuf::from(
-        std::env::var_os("VIDEOROLL_V2_LOCAL_INFERENCE_PYTHON")
-            .ok_or_else(|| unavailable("local inference Python runtime not configured"))?,
-    );
-    let bridge = PathBuf::from(
-        std::env::var_os("VIDEOROLL_V2_LOCAL_INFERENCE_BRIDGE")
-            .ok_or_else(|| unavailable("local inference bridge not configured"))?,
-    );
-    if !python.is_absolute() || !bridge.is_absolute() {
-        return Err(AppError::Invalid(
-            "local inference executables must use absolute paths".into(),
-        ));
+    let native = std::env::var_os("VIDEOROLL_V2_LOCAL_INFERENCE_NATIVE").filter(|_| native_supported(request));
+    let (executable, bridge) = if let Some(path) = native {
+        (PathBuf::from(path), None)
+    } else {
+        (PathBuf::from(std::env::var_os("VIDEOROLL_V2_LOCAL_INFERENCE_PYTHON")
+            .ok_or_else(|| unavailable("requested local inference backend is not configured"))?),
+         Some(PathBuf::from(std::env::var_os("VIDEOROLL_V2_LOCAL_INFERENCE_BRIDGE")
+            .ok_or_else(|| unavailable("local inference bridge not configured"))?)))
+    };
+    if !executable.is_absolute() || bridge.as_ref().is_some_and(|p| !p.is_absolute()) {
+        return Err(AppError::Invalid("local inference executables must use absolute paths".into()));
     }
     let input = serde_json::to_vec(request)
         .map_err(|_| AppError::Invalid("local inference request invalid".into()))?;
@@ -357,7 +388,7 @@ pub async fn invoke(request: &Value, timeout: Duration) -> AppResult<Value> {
     let timeout = timeout.clamp(Duration::from_secs(1), Duration::from_secs(1800));
     tokio::time::timeout(timeout, async {
         let _gate = EXCHANGE_GATE.lock().await;
-        let key = json!({"model":model_identity(request).await?,"python":python,"bridge":bridge,"gpu_lock":lock});
+        let key = json!({"model":model_identity(request).await?,"executable":executable,"bridge":bridge,"runtime":runtime_revision(),"gpu_lock":lock});
         let probe = is_probe(&key["model"]);
         let mut existing = None;
         if !probe {
@@ -388,7 +419,7 @@ pub async fn invoke(request: &Value, timeout: Duration) -> AppResult<Value> {
         }
         // While the exchange waits for admission or inference, idle siblings
         // can still be reaped. Cancellation drops only the checked-out child.
-        let mut session = match existing { Some(s) => s, None => Session::spawn(key, &python, &bridge, &lock)? };
+        let mut session = match existing { Some(s) => s, None => Session::spawn(key, &executable, bridge.as_deref(), &lock)? };
         let response = session.exchange(&input).await?;
         if probe { evict(session).await; return Ok(response); }
         session.last_used = Instant::now();
@@ -404,6 +435,15 @@ pub async fn invoke(request: &Value, timeout: Duration) -> AppResult<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn native_adapter_routes_only_supported_backends() {
+        assert!(native_supported(&json!({"kind":"asr","engine":"openvino"})));
+        assert!(native_supported(&json!({"kind":"vad","device":"CPU"})));
+        assert!(native_supported(&json!({"kind":"devices"})));
+        assert!(native_supported(&json!({"kind":"embedding","device":"openvino:GPU"})));
+        assert!(!native_supported(&json!({"kind":"asr","engine":"faster-whisper"})));
+        assert!(!native_supported(&json!({"kind":"embedding","device":"cuda"})));
+    }
     #[test]
     fn local_model_idle_timeout_defaults_to_five_minutes_and_is_bounded() {
         assert_eq!(parse_idle_timeout(None), 300);

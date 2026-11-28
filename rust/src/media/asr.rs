@@ -3274,13 +3274,16 @@ async fn process_inner(
     } else {
         (WINDOW, OVERLAP)
     };
-    let asr_identity = fingerprint(&json!({
+    let mut asr_identity_inputs = json!({
         "checkpoint_version":9,"timing_refine_revision":1,"semantic_word_revision":2,"local_word_revision":2,"vad_runtime_configured":crate::local_inference::configured(),"video_sha256":source_digest,
         "model":config.asr_model,"asr_endpoint":config.asr_endpoint,"local_asr":config.local_asr,
         "asr_request_options":config.asr_request_options,
         "language":profile.asr_language,"duration_ms":(duration*1000.0).round() as u64,
         "window_seconds":window,"overlap_seconds":overlap,"cloudflare_asr":config.cloudflare_asr
-    }))?;
+    });
+    let native_revision = crate::local_inference::runtime_revision();
+    if !native_revision.is_null() { asr_identity_inputs["native_inference_revision"] = native_revision; }
+    let asr_identity = fingerprint(&asr_identity_inputs)?;
     let builder = Client::builder().timeout(Duration::from_secs(300));
     let client = if config.cloudflare_asr {
         builder.redirect(reqwest::redirect::Policy::none())

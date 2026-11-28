@@ -1,0 +1,16 @@
+[package]
+name = "videoroll-native-inference"
+version = "0.1.0"
+edition = "2024"
+[dependencies]
+openvino = { version = "=0.11.1", features = ["runtime-linking"] }
+openvino-genai = { version = "=0.11.1", features = ["runtime-linking"] }
+ort = { version = "=2.0.0-rc.15", default-features = false, features = ["std", "load-dynamic", "api-30"] }
+serde_json = "1"
+anyhow = "1"
+hound = "3.5.1"
+tokenizers = { version = "=0.22.2", default-features = false, features = ["onig"] }
+libc = "0.2"
+sha2 = "0.10"
+unicode-general-category = "1"
+tempfile = "3"
