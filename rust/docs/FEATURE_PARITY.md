@@ -41,6 +41,13 @@
 - 初次真实重放 `/4t/vr2-cover-progress-real.DVFTXj/replay.log` HTTP 200、封面 148367 bytes、零字节/百分比回跳，但发现部分总量错误导致提前 95%，以及测试错误假设 717 像素。运行原 Python 封面函数确认 716，继续修正 HLS 总量后复测。最终 `/4t/vr2-cover-progress-final.WmaBB6/replay.log`：HTTP 200、视频 52,477,014 bytes、metadata_json 134,815 bytes、JPEG 148,367 bytes；10 次 active 采样无字节或百分比回退，94→processing 95→storing 99→completed 100；SHA256 一致，重复请求返回同一 cover_asset ID；原库克隆的任务状态 downloaded、download succeeded 1/1、三类资产各 1、0 投稿。HLS 估算总字节可随实际片段变化，非累计下载字节回退。使用真实 yt-dlp、现有数据库 Cookies、独立 PG 和媒体根，未更改生产任务或部署。
 - 两项主要缺陷已修复且真实复测通过；上述未覆盖异常专项继续记录为待验证。原下载器 7 项 unittest 通过；最终 Rust 全库测试 276 通过、0 失败（环境条件未满足而提前返回的外部集成分支不等同于实跑）。最终构建及测试日志 `/4t/videoroll-rust-trial-build-ed42980/cover-progress-final-build.log`、`/4t/videoroll-rust-trial-build-ed42980/cover-progress-final-lib.log`。整体迁移仍为 FAILED；不将本次下载验收等同于自动流水线、全部 API 或生产切换验收。
 
+## 2026-11-28 ASR 原版行为重写
+
+- 核查原 NASA 任务音轨 161.4335s，原 Python 120s/5s 和旧 Rust 45s/4s 的 VAD 均无语音片段，不能以此推断识别故障。修复原版 OpenVINO 250ms/30s/500ms/180ms VAD 参数、三项静音阈值、紧凑 float32 数组、时间戳回退、垃圾文本与可信度/幻觉过滤。本地引擎恢复 120s/5s PCM WAV，External Whisper 恢复完整 WAV 流式上传，Groq 45s/5s 和 Cloudflare 30s 不变；更新 ASR 检查点指纹以避免复用旧策略结果。
+- 原版 subtitle_jobs 以同一 Rust 作业 UUID 写入，原请求结构及 source_segments_key/final_subtitle_segments_key 对应原 sub/<task>/ 路径、assets 登记，成功空识别写入 [] 和 no_speech_detected=true；恢复原进度、日志路径、历史列表读取，终态/失败/暂停/取消及租约同步。无需新增业务表或公开 API。日志目前为简化阶段摘要，仍须补齐原详细实时日志和失败路径；逐词/逐段 confidence 的完整保留、全长语音时间轴一致性、所有重启/断点恢复故障注入及旧任务未补写记录仍待验收。队列进度/心跳为最后一批变更，不能以早期集成测试替代其最终验收。
+- 真实验证：原 Python OpenVINO 和新版桥接在同一 GPU、同一合成英语语音、同一模型上得到相同文本和时间戳（0.044–5.764s），结果 /4t/vr2-asr-real-diff.XxdFlM/{original,bridge}.json；隔离真实 OpenVINO 无语音路径通过原 subtitle_jobs/原请求 Pydantic 校验/[]/日志/列表无重复（/4t/vr2-asr-ledger.6Ei68r/ledger.log）；External Whisper 模拟 HTTP 验收完整 65s WAV，422 回退再次上传完整 WAV、原始及最终快照、原字幕任务及零投稿（/4t/vr2-external-wav.E2lIpk/external.log）。不是真实在线提供商验收。
+- 原 Python 专项 pytest 64/64 通过；合并运行 98 项中 92 通过、6 失败（长音频测试涉及 NumPy 重复导入，单独运行首个用例又遇到 pytest.approx 嵌套结构不支持）。不修改原测试来掩盖问题。Rust 主程序构建和 276/276 库测试通过，随后队列/心跳补丁单独核查；日志 /4t/videoroll-rust-trial-build-ed42980/asr-parity-{build,lib,final-check}.log。真实 Faster-Whisper、Groq、Cloudflare 平台、长期断点恢复和详细日志尚未完成最终验收。继续 FAILED，未部署或改生产库。
+
 以下为历史审计记录，不再视为当前验收结论。当前不满足完整生产替换门槛。
 
 2026-11-23 迁移状态（最新接口审计）：**175/217** 条原版 API 具有部分 Rust 原生适配，剩余 **42** 条尚无原生 V1 入口；**0** 条达到完整生产等价签收。测试采用一次性数据库、回环侧服务和原版 Python 同库差分；生产 Python 服务不切换。

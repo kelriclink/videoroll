@@ -472,18 +472,19 @@ async fn subtitle_jobs(
     Path(id): Path<Uuid>,
     Query(q): Query<LimitQuery>,
 ) -> AppResult<Json<Vec<Value>>> {
-    read_task(&state.db, id).await?;
+    read_visible_task(&state.db, id).await?;
     let rows = sqlx::query_scalar::<_, Value>(
-        r#"SELECT jsonb_build_object(
-              'id',j.id,'task_id',j.task_id,
-              'status', CASE WHEN j.state='pending' THEN 'queued'
-                             WHEN j.state='awaiting' THEN 'processing'
-                             ELSE j.state END,
-              'progress', CASE WHEN j.state='succeeded' THEN 100 ELSE 0 END,
-              'error_message',j.last_error,
-              'created_at',j.created_at,'updated_at',j.updated_at)
-           FROM vr2_jobs j WHERE j.task_id=$1 AND j.stage='subtitle'
-           ORDER BY j.created_at DESC LIMIT $2"#,
+        r#"SELECT jsonb_build_object('id',r.id,'task_id',r.task_id,'status',r.status,
+            'progress',r.progress,'error_message',r.error_message,'created_at',r.created_at,'updated_at',r.updated_at)
+           FROM (
+             SELECT s.id,s.task_id,s.status::text AS status,s.progress,s.error_message,s.created_at,s.updated_at
+             FROM subtitle_jobs s WHERE s.task_id=$1
+             UNION ALL
+             SELECT j.id,j.task_id,CASE WHEN j.state='pending' THEN 'queued' WHEN j.state='awaiting' THEN 'processing' ELSE j.state END,
+               CASE WHEN j.state='succeeded' THEN 100 ELSE 0 END,j.last_error,j.created_at,j.updated_at
+             FROM vr2_jobs j WHERE j.task_id=$1 AND j.stage='subtitle'
+             AND NOT EXISTS(SELECT 1 FROM subtitle_jobs s WHERE s.id=j.id)
+           ) r ORDER BY r.created_at DESC,r.id DESC LIMIT $2"#,
     )
     .bind(id)
     .bind(q.limit.unwrap_or(50).clamp(1, 500))

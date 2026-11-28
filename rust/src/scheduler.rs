@@ -951,6 +951,9 @@ impl Scheduler {
             let stage: String = row.try_get("stage")?;
             let attempts: i32 = row.try_get("attempts")?;
             let error = "stage attempt budget exhausted after worker lease expiry";
+            if stage=="subtitle" {
+                sqlx::query("UPDATE subtitle_jobs s SET status='failed',error_message=$2,lease_owner=NULL,lease_until=NULL,updated_at=now() FROM vr2_jobs j WHERE j.id=$1 AND s.id=j.id AND s.operation_key=j.operation_key").bind(id).bind(error).execute(&mut *tx).await?;
+            }
             sqlx::query("UPDATE vr2_workflows SET state='failed',last_error=$2,updated_at=now() WHERE id=$1").bind(flow).bind(error).execute(&mut *tx).await?;
             sqlx::query("UPDATE tasks SET status='failed'::task_status,error_code='V2_WORKFLOW_FAILED',error_message=$2,updated_at=now() WHERE id=$1 AND status NOT IN ('published'::task_status,'canceled'::task_status)").bind(task).bind(error).execute(&mut *tx).await?;
             Self::event(&mut tx,flow,Some(id),"job.failed_attempt",json!({"stage":stage,"attempts":attempts,"state":"failed","reason":"lease_attempt_budget_exhausted"})).await?;
@@ -1045,7 +1048,16 @@ impl Scheduler {
              "UPDATE vr2_jobs SET lease_until=clock_timestamp()+($1 * interval '1 second'),updated_at=now() WHERE id=$2 AND lease_token=$3 AND state='running' AND lease_until>clock_timestamp() AND EXISTS(SELECT 1 FROM vr2_workflows w JOIN tasks t ON t.id=w.task_id WHERE w.id=vr2_jobs.workflow_id AND w.state='running' AND w.current_stage=vr2_jobs.stage AND w.generation=vr2_jobs.generation AND t.runtime_owner='rust' AND t.status<>'canceled'::task_status)"
         ).bind(self.lease_seconds()).bind(item.id).bind(item.lease_token)
             .execute(&self.db.pool).await?;
-        Ok(result.rows_affected() == 1)
+        let held=result.rows_affected()==1;
+        if held && item.stage==Stage::Subtitle {
+            sqlx::query("UPDATE subtitle_jobs s SET lease_until=j.lease_until,heartbeat_at=now()
+                FROM vr2_jobs j JOIN vr2_workflows w ON w.id=j.workflow_id
+                WHERE s.id=j.id AND s.operation_key=j.operation_key AND s.lease_owner=$3::text
+                AND j.id=$1 AND j.lease_token=$2 AND j.state='running' AND w.state='running' AND s.status::text='running'")
+                .bind(item.id).bind(item.lease_token).bind(item.lease_token.to_string())
+                .execute(&self.db.pool).await?;
+        }
+        Ok(held)
     }
     async fn transition(
         &self,
@@ -1200,6 +1212,15 @@ impl Scheduler {
                 sqlx::query("UPDATE tasks SET status='published'::task_status,error_code=NULL,error_message=NULL,updated_at=now() WHERE id=$1 AND status <> 'canceled'::task_status")
                     .bind(item.task_id).execute(&mut **tx).await?;
             }
+        }
+        if item.stage == Stage::Subtitle {
+            sqlx::query("UPDATE subtitle_jobs SET status='succeeded',progress=100,error_message=NULL,
+                request_json=jsonb_set(request_json,'{artifacts}',COALESCE(request_json->'artifacts','{}'::jsonb)||$3::jsonb),
+                lease_owner=NULL,lease_until=NULL,heartbeat_at=NULL,updated_at=now()
+                WHERE id=$1 AND operation_key=$2")
+                .bind(item.id).bind(&item.operation_key)
+                .bind(if result["no_speech"]==true {json!({"no_speech_detected":true})}else{json!({})})
+                .execute(&mut **tx).await?;
         }
         sqlx::query("UPDATE vr2_jobs SET state='succeeded',result=$1,lease_token=NULL,lease_until=NULL,finished_at=now(),updated_at=now() WHERE id=$2")
             .bind(&result).bind(item.id).execute(&mut **tx).await?;
@@ -1465,6 +1486,14 @@ impl Scheduler {
         sqlx::query("UPDATE vr2_jobs SET state=$1,last_error=$2,lease_token=NULL,lease_until=NULL,available_at=now()+($3*interval '1 second'),updated_at=now(),finished_at=CASE WHEN $4 THEN now() ELSE NULL END WHERE id=$5")
             .bind(target).bind(error.chars().take(2000).collect::<String>())
             .bind(retry_seconds).bind(failed).bind(item.id).execute(&mut *tx).await?;
+        if item.stage == Stage::Subtitle {
+            let statement=if failed {
+                "UPDATE subtitle_jobs SET status='failed',error_message=$3,lease_owner=NULL,lease_until=NULL,updated_at=now() WHERE id=$1 AND operation_key=$2"
+            }else{
+                "UPDATE subtitle_jobs SET status='queued',error_message=$3,lease_owner=NULL,lease_until=NULL,updated_at=now() WHERE id=$1 AND operation_key=$2"
+            };
+            sqlx::query(statement).bind(item.id).bind(&item.operation_key).bind(error.chars().take(2000).collect::<String>()).execute(&mut *tx).await?;
+        }
         if failed {
             if item.stage == Stage::Publish {
                 crate::bilibili_publish_v1::mark_uncertain(
@@ -1541,6 +1570,7 @@ impl Scheduler {
             )));
         }
         Self::stop_remote_render(&mut tx, workflow_id, false).await?;
+        sqlx::query("UPDATE subtitle_jobs s SET status='queued',lease_owner=NULL,lease_until=NULL,updated_at=now() FROM vr2_jobs j WHERE j.workflow_id=$1 AND j.stage='subtitle' AND s.id=j.id AND s.operation_key=j.operation_key AND s.status::text='running'").bind(workflow_id).execute(&mut *tx).await?;
         sqlx::query("UPDATE vr2_workflows SET state='paused',updated_at=now() WHERE id=$1")
             .bind(workflow_id)
             .execute(&mut *tx)
@@ -1658,6 +1688,7 @@ impl Scheduler {
         Self::task_control_fence(tx,task_id).await?;
         if let Some((id,_,_))=Self::control_flow(tx,task_id).await?{
             Self::stop_remote_render(tx,id,false).await?;
+            sqlx::query("UPDATE subtitle_jobs s SET status='queued',lease_owner=NULL,lease_until=NULL,updated_at=now() FROM vr2_jobs j WHERE j.workflow_id=$1 AND j.stage='subtitle' AND s.id=j.id AND s.operation_key=j.operation_key AND s.status::text='running'").bind(id).execute(&mut **tx).await?;
             sqlx::query("UPDATE vr2_workflows SET state='paused',updated_at=now() WHERE id=$1")
                 .bind(id).execute(&mut **tx).await?;
             Self::event(tx,id,None,"workflow.legacy_task_stopped",json!({"from_status":status})).await?;
@@ -1761,6 +1792,7 @@ impl Scheduler {
             .await?;
         } else {
             Self::stop_remote_render(&mut tx, workflow_id, true).await?;
+            sqlx::query("UPDATE subtitle_jobs s SET status='failed',error_message='workflow canceled',lease_owner=NULL,lease_until=NULL,updated_at=now() FROM vr2_jobs j WHERE j.workflow_id=$1 AND j.stage='subtitle' AND s.id=j.id AND s.operation_key=j.operation_key AND s.status::text IN ('queued','running')").bind(workflow_id).execute(&mut *tx).await?;
             sqlx::query("UPDATE vr2_jobs SET state='canceled',lease_token=NULL,lease_until=NULL,updated_at=now() WHERE workflow_id=$1 AND state IN ('pending','running','awaiting')")
                 .bind(workflow_id).execute(&mut *tx).await?;
             sqlx::query("UPDATE tasks SET status='canceled'::task_status,stopped_status=NULL,updated_at=now() WHERE id=$1 AND status<>'published'::task_status")

@@ -43,6 +43,52 @@ def st_embedding(model, device):
     from sentence_transformers import SentenceTransformer
     return SentenceTransformer(model,device=device,local_files_only=True,trust_remote_code=False)
 
+# Keep these pure ASR rules aligned with processing.py. The bridge owns only
+# inference; Rust owns queues, leases and artifact persistence.
+def _effectively_silent(samples):
+    import numpy as np
+    if not len(samples):
+        return True
+    a=np.abs(samples)
+    return bool(a.max() <= .005 and np.sqrt(np.mean(a.astype(np.float64)**2)) <= .0008
+                and np.mean(a >= .015) <= .0005)
+
+def _letters(text):
+    import unicodedata
+    return sum(unicodedata.category(c).startswith("L") for c in text)
+
+def _garbage(text):
+    import re, unicodedata
+    compact="".join(text.split())
+    letters=_letters(compact)
+    digits=sum(c.isdigit() for c in compact)
+    punct=sum(unicodedata.category(c).startswith(("P","S")) for c in compact)
+    return (not compact or (not letters and not digits)
+            or bool(re.fullmatch(r"(?:\d+[.,:;!?-]*){2,}",compact))
+            or (not letters and digits>0 and punct>=2)
+            or (len(compact)>=4 and len(set(compact.lower()))==1)
+            or (not letters and digits<=1 and punct>=max(3,len(compact)-1)))
+
+def _openvino_rows(result, duration):
+    rows=[]
+    for seg in getattr(result,"chunks",None) or []:
+        text=" ".join(str(getattr(seg,"text","") or "").split())
+        if not text:
+            continue
+        start=getattr(seg,"start_ts",None)
+        end=getattr(seg,"end_ts",None)
+        if start is None: start=getattr(seg,"start",0)
+        if end is None: end=getattr(seg,"end",duration)
+        a=max(0.,min(duration,float(start or 0)))
+        b=max(a,min(duration,float(duration if end is None else end)))
+        if b>a: rows.append({"start":a,"end":b,"text":text})
+    if not rows:
+        text=" ".join(str(getattr(result,"text","") or "").split())
+        if not text and isinstance(getattr(result,"texts",None),list):
+            text=" ".join(" ".join(str(t or "") for t in result.texts).split())
+        if text: rows=[{"start":0.,"end":duration,"text":text}]
+    return rows
+
 def transcribe(req):
     import av
     import numpy as np
@@ -52,6 +98,10 @@ def transcribe(req):
     language = req.get("language", "auto")
     if language == "auto": language = None
     if engine == "faster-whisper":
+        from faster_whisper.audio import decode_audio
+        samples=decode_audio(audio,sampling_rate=16000)
+        if _effectively_silent(samples):
+            return {"word_timestamps":True,"segments":[]}
         pipeline = faster_model(model,req["device"],req["compute_type"],req["cpu_threads"],req["num_workers"])
         import inspect
         supported=inspect.signature(pipeline.transcribe).parameters
@@ -74,39 +124,51 @@ def transcribe(req):
              "words":[{"word":str(w.word),"start":float(w.start),"end":float(w.end)}
                 for w in (getattr(s,"words",None) or [])
                 if w.start is not None and w.end is not None]}
-            for s in rows]}
+            for s in rows if not _garbage(str(s.text or ""))]}
     if engine != "openvino": raise ValueError("unsupported ASR engine")
     from faster_whisper.audio import decode_audio
     samples = decode_audio(audio, sampling_rate=16000)
-    if samples.size==0 or float(np.max(np.abs(samples))) < 0.0001:return {"segments":[]}
+    if _effectively_silent(samples):return {"segments":[]}
     if req["vad_enabled"]:
         from faster_whisper.vad import get_speech_timestamps,VadOptions
-        spans=get_speech_timestamps(samples,VadOptions(threshold=req["vad_threshold"],min_silence_duration_ms=2000,speech_pad_ms=400))
+        spans=get_speech_timestamps(samples,VadOptions(
+            threshold=max(.01,min(.99,float(req["vad_threshold"]))),
+            min_speech_duration_ms=250,max_speech_duration_s=30.,
+            min_silence_duration_ms=500,speech_pad_ms=180),sampling_rate=16000)
     else: spans=[{"start":0,"end":len(samples)}]
     if not spans:return {"segments":[]}
     pipeline=ov_whisper(model,req["device"])
-    cfg=pipeline.get_generation_config()
-    cfg.return_timestamps=True
-    cfg.task="transcribe"
-    cfg.num_beams=req["num_beams"]
-    cfg.max_new_tokens=req["max_new_tokens"]
-    if language:cfg.language=language if language.startswith("<|") else f"<|{language.lower()}|>"
+    from array import array
+    try: cfg=pipeline.get_generation_config()
+    except Exception: cfg=None
+    kwargs={}
+    options={"return_timestamps":True,"num_beams":max(1,int(req["num_beams"])),
+             "max_new_tokens":max(1,int(req["max_new_tokens"]))}
+    if language:
+        options["language"]=language if language.startswith("<|") else f"<|{language.lower()}|>"
+    if cfg is not None and hasattr(cfg,"task"):
+        try: cfg.task="transcribe"
+        except Exception: pass
+    for key,value in options.items():
+        if cfg is not None and hasattr(cfg,key): setattr(cfg,key,value)
+        else: kwargs[key]=value
+    if cfg is not None: kwargs["generation_config"]=cfg
     out=[]
     for span in spans:
         start,end=span["start"],span["end"]
         chunk=samples[start:end]
-        result=pipeline.generate(chunk.tolist(),generation_config=cfg)
+        if not len(chunk):continue
+        packed=array("f")
+        packed.frombytes(chunk.astype("<f4",copy=False).tobytes())
+        result=pipeline.generate(packed,**kwargs)
         duration=len(chunk)/16000
-        for seg in getattr(result,"chunks",[]):
-            text=str(seg.text).strip()
-            a=max(0.,min(duration,float(seg.start_ts)))
-            b=max(a,min(duration,float(seg.end_ts)))
-            if not text or b<=a:continue
-            if (b-a>=8 and len(text.split())<=3) or (b-a>=4 and len(text.split())<=1):continue
-            out.append({"start":start/16000+a,"end":start/16000+b,"text":text})
-        if not getattr(result,"chunks",[]) and any(str(x).strip() for x in getattr(result,"texts",[])):
-            raise RuntimeError("OpenVINO returned text without timestamps")
-    return {"segments":out}
+        for row in _openvino_rows(result,duration):
+            row["start"]+=start/16000
+            row["end"]+=start/16000
+            out.append(row)
+    # Global credibility and duration filtering is completed by Rust after
+    # all outer windows have been reconciled, as in the original service.
+    return {"segments":[r for r in out if not _garbage(r["text"])]}
 
 def speech_spans(req):
     """CPU Silero VAD only; return uncertainty instead of suppressing speech
@@ -119,11 +181,11 @@ def speech_spans(req):
         if not audio.is_file() or audio.stat().st_size>24*1024*1024:
             return {"available":False}
         samples=decode_audio(str(audio),sampling_rate=16000)
-        if len(samples)>60*16000 or not np.isfinite(samples).all():
+        if len(samples)>120*16000 or not np.isfinite(samples).all():
             return {"available":False}
         if len(samples)==0:
             return {"available":False}
-        if float(np.max(np.abs(samples)))<0.0001:
+        if _effectively_silent(samples):
             return {"available":True,"spans":[]}
         refine=req.get("purpose")=="timing"
         spans=get_speech_timestamps(samples,VadOptions(

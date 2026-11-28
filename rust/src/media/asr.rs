@@ -1085,10 +1085,9 @@ async fn run_external_whisper(
     parsed_endpoint: &Url,
     audio_duration: f64,
 ) -> AppResult<AsrResponse> {
-    if fs::metadata(path).await?.len() > 24 * 1024 * 1024 {
-        return Err(AppError::Invalid("ASR audio chunk exceeds 24 MiB".into()));
-    }
-    let audio = fs::read(path).await?;
+    // Original External Whisper uploads the whole PCM WAV. Stream the file
+    // instead of loading a potentially hours-long recording into memory.
+    let audio_len = fs::metadata(path).await?.len();
     let options = config.asr_request_options.as_ref().unwrap_or(&Value::Null);
     let max_concurrency = options
         .get("max_concurrency")
@@ -1101,9 +1100,10 @@ async fn run_external_whisper(
     loop {
         connect_attempt = connect_attempt.saturating_add(1);
         selective_lease(db, job).await?;
-        let part = multipart::Part::bytes(audio.clone())
-            .file_name("audio.flac")
-            .mime_str("audio/flac")
+        let file = fs::File::open(path).await?;
+        let part = multipart::Part::stream_with_length(reqwest::Body::wrap_stream(tokio_util::io::ReaderStream::new(file)),audio_len)
+            .file_name("audio.wav")
+            .mime_str("audio/wav")
             .map_err(|_| AppError::Invalid("invalid external Whisper audio MIME".into()))?;
         let mut form = multipart::Form::new().part("file", part);
         for (key, value) in external_whisper_fields(
@@ -1349,7 +1349,7 @@ fn local_whisper_response(mut payload: Value, seconds: f64) -> AppResult<AsrResp
         .ok_or_else(|| AppError::Unavailable("local Whisper segments missing".into()))?;
     rows.retain(|v| {
         let text = v["text"].as_str().unwrap_or("").trim();
-        let letters = text.chars().filter(|c| c.is_alphanumeric()).count();
+        let letters = text.chars().filter(|c| c.is_alphabetic()).count();
         let low = v["avg_logprob"].as_f64();
         let silence = v["no_speech_prob"].as_f64();
         let ratio = v["compression_ratio"].as_f64();
@@ -1368,7 +1368,7 @@ fn local_whisper_response(mut payload: Value, seconds: f64) -> AppResult<AsrResp
                 .as_str()
                 .unwrap_or("")
                 .chars()
-                .filter(|c| c.is_alphanumeric())
+                .filter(|c| c.is_alphabetic())
                 .count()
         })
         .sum::<usize>();
@@ -1377,7 +1377,7 @@ fn local_whisper_response(mut payload: Value, seconds: f64) -> AppResult<AsrResp
             .as_str()
             .unwrap_or("")
             .chars()
-            .filter(|c| c.is_alphanumeric())
+            .filter(|c| c.is_alphabetic())
             .count()
             >= 2
             && v["avg_logprob"].as_f64().is_none_or(|p| p > -0.7)
@@ -1525,6 +1525,13 @@ async fn run_asr(
     serde_json::from_value(body)
         .map_err(|_| AppError::Unavailable("ASR response schema invalid".into()))
 }
+fn original_external_input(config:&Config)->bool {
+    config.local_asr.is_none() && !config.cloudflare_asr && !groq_endpoint(config)
+        && config.asr_request_options.is_some()
+}
+fn original_wav_input(config:&Config)->bool {
+    config.cloudflare_asr || config.local_asr.is_some() || original_external_input(config)
+}
 async fn convert_audio(
     config: &Config,
     video: &Path,
@@ -1547,7 +1554,7 @@ async fn convert_audio(
             "-ar",
             "16000",
             "-c:a",
-            if config.cloudflare_asr {
+            if original_wav_input(config) {
                 "pcm_s16le"
             } else {
                 "flac"
@@ -2889,6 +2896,94 @@ pub(crate) async fn preferred_source(
     }
     Ok(captions)
 }
+/// Record native work in the original subtitle_jobs ledger using the SAME
+/// job UUID. No second dispatcher or shadow execution is created.
+async fn start_original_subtitle_job(config:&Config,db:&Database,registry:&AssetRegistry,job:&WorkItem)->AppResult<()> {
+    let input=latest_asset_key(db,job.task_id,"video_raw").await?
+        .ok_or_else(||AppError::NotFound("raw video is missing for transcription".into()))?;
+    let profile=settings(db,job).await?;
+    let render=super::ffmpeg::profile(db,job).await?;
+    let flow:Value=sqlx::query_scalar("SELECT configuration FROM vr2_workflows WHERE id=$1")
+        .bind(job.workflow_id).fetch_one(&db.pool).await?;
+    let engine=if let Some(local)=config.local_asr.as_ref(){local["engine"].as_str().unwrap_or("auto")}
+        else if config.cloudflare_asr {"cloudflare-workers-ai"}
+        else if groq_endpoint(config) {"groq-whisper"}
+        else if original_external_input(config) {"external-whisper"} else {"auto"};
+    let mut render=serde_json::to_value(render).map_err(|_|AppError::Invalid("render profile serialization failed".into()))?;
+    render["primary_font_scale_percent"]=json!(profile.primary_font_scale_percent);
+    render["secondary_font_scale_percent"]=json!(profile.secondary_font_scale_percent);
+    let request=json!({"task_id":job.task_id,
+        "runtime_profile":flow["legacy_auto_runtime_profile"]==true||flow["standalone_subtitle_runtime_profile"]==true,
+        "resume":flow["subtitle"]["resume"]==true,
+        "input":{"type":"storage","key":input},
+        "prefer_youtube_subtitles":profile.youtube_subtitle_mode!="off","youtube_subtitle_mode":profile.youtube_subtitle_mode,
+        "asr":{"engine":engine,"language":profile.asr_language,"model":config.asr_model},
+        "translate":{"enabled":profile.translate_enabled,"target_lang":profile.target_lang,"provider":profile.translate_provider,
+            "style":profile.translate_style,"batch_size":profile.translate_batch_size,"enable_summary":profile.translate_enable_summary,"bilingual":profile.bilingual},
+        "output":{"formats":profile.formats,"render":render},"artifacts":{},
+        "output_prefix":format!("sub/{}/",job.task_id)});
+    let log_key=format!("log/{}/subtitle_{}.log",job.task_id,job.id);
+    let log_path=registry.resolve_existing(&log_key).await?;
+    if !fs::try_exists(&log_path).await?{
+        atomic_write(db,job,&log_path,format!("asr: native subtitle job {} started\n",job.id).as_bytes()).await?;
+    }
+    let mut tx=original_job_transaction(db,job).await?;
+    let rows=sqlx::query("INSERT INTO subtitle_jobs(id,task_id,status,progress,request_json,logs_key,operation_key,created_at,lease_owner,lease_until,heartbeat_at)
+        SELECT j.id,j.task_id,'running',0,$3,$4,j.operation_key,j.created_at,j.lease_token::text,j.lease_until,now() FROM vr2_jobs j JOIN vr2_workflows w ON w.id=j.workflow_id
+        WHERE j.id=$1 AND j.lease_token=$2 AND j.state='running' AND j.lease_until>clock_timestamp() AND w.state='running'
+        ON CONFLICT(id) DO UPDATE SET status='running',error_message=NULL,lease_owner=EXCLUDED.lease_owner,lease_until=EXCLUDED.lease_until,heartbeat_at=now(),updated_at=now()
+        WHERE subtitle_jobs.task_id=EXCLUDED.task_id AND subtitle_jobs.operation_key=EXCLUDED.operation_key")
+        .bind(job.id).bind(job.lease_token).bind(request).bind(log_key).execute(&mut *tx).await?;
+    tx.commit().await?;
+    if rows.rows_affected()!=1{return Err(AppError::Conflict("original subtitle job ownership lost".into()));}
+    Ok(())
+}
+async fn original_job_transaction<'a>(db:&'a Database,job:&WorkItem)->AppResult<sqlx::Transaction<'a,sqlx::Postgres>>{
+    let mut tx=db.pool.begin().await?;
+    let task:Option<Uuid>=sqlx::query_scalar("SELECT id FROM tasks WHERE id=$1 AND runtime_owner='rust' AND status::text<>'canceled' AND stopped_status IS NULL FOR UPDATE")
+        .bind(job.task_id).fetch_optional(&mut *tx).await?;
+    let flow:Option<Uuid>=sqlx::query_scalar("SELECT id FROM vr2_workflows WHERE id=$1 AND task_id=$2 AND generation=$3 AND current_stage='subtitle' AND state='running' FOR UPDATE")
+        .bind(job.workflow_id).bind(job.task_id).bind(job.generation).fetch_optional(&mut *tx).await?;
+    let held:Option<Uuid>=sqlx::query_scalar("SELECT id FROM vr2_jobs WHERE id=$1 AND task_id=$2 AND workflow_id=$3 AND generation=$4 AND stage='subtitle' AND state='running' AND lease_token=$5 FOR UPDATE")
+        .bind(job.id).bind(job.task_id).bind(job.workflow_id).bind(job.generation).bind(job.lease_token).fetch_optional(&mut *tx).await?;
+    let live:bool=sqlx::query_scalar("SELECT COALESCE(lease_until>clock_timestamp(),false) FROM vr2_jobs WHERE id=$1")
+        .bind(job.id).fetch_optional(&mut *tx).await?.unwrap_or(false);
+    if task.is_none()||flow.is_none()||held.is_none()||!live{return Err(AppError::Conflict("original subtitle job lease lost".into()));}
+    Ok(tx)
+}
+async fn original_progress(db:&Database,job:&WorkItem,progress:i32,artifact:Option<(&str,&str)>)->AppResult<()>{
+    let patch=artifact.map(|(name,key)|json!({(name):key})).unwrap_or_else(||json!({}));
+    let mut tx=original_job_transaction(db,job).await?;
+    let rows=sqlx::query("UPDATE subtitle_jobs s SET progress=GREATEST(s.progress,$3),
+        lease_owner=j.lease_token::text,lease_until=j.lease_until,heartbeat_at=now(),
+        request_json=jsonb_set(s.request_json,'{artifacts}',COALESCE(s.request_json->'artifacts','{}'::jsonb)||$4::jsonb),updated_at=now()
+        FROM vr2_jobs j JOIN vr2_workflows w ON w.id=j.workflow_id
+        WHERE s.id=j.id AND s.task_id=j.task_id AND s.operation_key=j.operation_key AND j.id=$1
+          AND j.lease_token=$2 AND j.state='running' AND j.lease_until>clock_timestamp() AND w.state='running'")
+        .bind(job.id).bind(job.lease_token).bind(progress).bind(patch).execute(&mut *tx).await?;
+    if rows.rows_affected()!=1{return Err(AppError::Conflict("original subtitle job lease lost".into()));}
+    if artifact.is_some_and(|(k,_)|k=="source_segments_key") {
+        sqlx::query("UPDATE tasks SET status='asr_done'::task_status,updated_at=now() WHERE id=$1 AND status::text IN ('created','ingested','downloaded','audio_extracted')")
+            .bind(job.task_id).execute(&mut *tx).await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+async fn original_segments(db:&Database,registry:&AssetRegistry,job:&WorkItem,rows:&[SubtitleCue],final_segments:bool)->AppResult<String>{
+    let data=rows.iter().map(|c|{
+        let mut v=json!({"start":c.start_ms as f64/1000.,"end":c.end_ms as f64/1000.,"text":c.text});
+        if let Some(text)=c.secondary_text.as_ref().filter(|s|!s.is_empty()){v["secondary_text"]=json!(text);}
+        v
+    }).collect::<Vec<_>>();
+    let bytes=serde_json::to_vec(&data).map_err(|_|AppError::Invalid("original subtitle segments encode failed".into()))?;
+    let sha=hex::encode(Sha256::digest(&bytes));
+    let nonce=job.id.simple().to_string();
+    let role=if final_segments{"subtitle_segments"}else{"segments"};
+    let key=format!("sub/{}/{role}_{}_{}.json",job.task_id,&sha[..16],&nonce[..12]);
+    write_task_asset(db,registry,job,"segments_json",&key,&bytes).await?;
+    original_progress(db,job,if final_segments{90}else{60},Some((if final_segments{"final_subtitle_segments_key"}else{"source_segments_key"},&key))).await?;
+    Ok(key)
+}
 pub(crate) async fn process(
     config: &Config,
     db: &Database,
@@ -2896,12 +2991,25 @@ pub(crate) async fn process(
     job: &WorkItem,
     preferred: Option<crate::media::youtube_subtitles::Captions>,
 ) -> AppResult<Value> {
-    super::translation_trace::SUBTITLE_JOB
+    start_original_subtitle_job(config,db,registry,job).await?;
+    let result=super::translation_trace::SUBTITLE_JOB
         .scope(
             job.clone(),
             process_inner(config, db, registry, job, preferred),
         )
-        .await
+        .await;
+    if let Ok(value)=&result {
+        if value["no_speech"]==true {
+            original_segments(db,registry,job,&[],false).await?;
+        }
+        let log_key=format!("log/{}/subtitle_{}.log",job.task_id,job.id);
+        let line=if value["no_speech"]==true {
+            "未检测到可信语音：跳过字幕和配音，继续使用原视频。".to_owned()
+        } else {format!("subtitle processing finished; cues={}",value["cues"].as_u64().unwrap_or(0))};
+        let log=format!("asr: job {}\n{line}\n",job.id);
+        write_task_asset(db,registry,job,"log",&log_key,log.as_bytes()).await?;
+    }
+    result
 }
 async fn process_inner(
     config: &Config,
@@ -3072,7 +3180,11 @@ async fn process_inner(
     } else {
         registry.sha256(&video_key).await?.0
     };
-    let (window, overlap) = if config.cloudflare_asr {
+    let (window, overlap) = if config.local_asr.is_some() {
+        (120., 5.)
+    } else if original_external_input(config) {
+        (duration, 0.)
+    } else if config.cloudflare_asr {
         (30., 0.)
     } else if config
         .asr_endpoint
@@ -3085,7 +3197,7 @@ async fn process_inner(
         (WINDOW, OVERLAP)
     };
     let asr_identity = fingerprint(&json!({
-        "checkpoint_version":7,"timing_refine_revision":1,"semantic_word_revision":2,"local_word_revision":1,"vad_runtime_configured":crate::local_inference::configured(),"video_sha256":source_digest,
+        "checkpoint_version":8,"timing_refine_revision":1,"semantic_word_revision":2,"local_word_revision":2,"vad_runtime_configured":crate::local_inference::configured(),"video_sha256":source_digest,
         "model":config.asr_model,"asr_endpoint":config.asr_endpoint,"local_asr":config.local_asr,
         "asr_request_options":config.asr_request_options,
         "language":profile.asr_language,"duration_ms":(duration*1000.0).round() as u64,
@@ -3103,6 +3215,7 @@ async fn process_inner(
     fs::create_dir_all(&workspace).await?;
     let stride = window - overlap;
     let count = 1 + ((duration - window).max(0.0) / stride).ceil() as usize;
+    original_progress(db,job,25,None).await?;
     let mut cues = Vec::new();
     let mut global_words = Some(Vec::<ExternalWhisperWord>::new());
     let mut global_vad = Vec::new();
@@ -3144,7 +3257,7 @@ async fn process_inner(
             } else {
                 let flac = workspace.join(format!(
                     "audio-{index:05}.{}",
-                    if config.cloudflare_asr { "wav" } else { "flac" }
+                    if original_wav_input(config) { "wav" } else { "flac" }
                 ));
                 convert_audio(config, &video, &flac, start, seconds).await?;
                 let mut result = None;
@@ -3255,6 +3368,8 @@ async fn process_inner(
                 }
             }
             cues.extend(rows);
+            let progress=25+(34.0*((start+seconds).min(duration)/duration)) as i32;
+            original_progress(db,job,progress,None).await?;
         }
     }
     if recovered.is_none() && !used_source_captions {
@@ -3297,6 +3412,19 @@ async fn process_inner(
             cues = crate::media::asr_overlap::reconcile(cues);
         }
     }
+    if config.local_asr.as_ref().is_some_and(|v|v["engine"]=="openvino") && recovered.is_none() && !used_source_captions {
+        // Python applies credibility across the complete transcript, then
+        // rejects sparse text spanning unusually long OpenVINO chunks.
+        let letters=|s:&str|s.chars().filter(|c|c.is_alphabetic()).count();
+        if !cues.iter().any(|c|letters(&c.text)>=2) && cues.iter().map(|c|letters(&c.text)).sum::<usize>()<8 {
+            cues.clear();
+        }
+        cues.retain(|c| {
+            let duration=c.end_ms.saturating_sub(c.start_ms);
+            let words=c.text.split_whitespace().count();
+            !((duration>=8000&&words<=3)||(duration>=4000&&words<=1))
+        });
+    }
     if cues.is_empty() {
         return Ok(json!({"no_speech":true,"reason":"no_credible_segments"}));
     }
@@ -3304,6 +3432,7 @@ async fn process_inner(
         .as_ref()
         .map(|(source, _)| source.clone())
         .unwrap_or_else(|| cues.clone());
+    original_segments(db,registry,job,&original,false).await?;
     let mut research = crate::rag::ResearchContext::default();
     if profile.translate_enabled {
         let options = crate::rag::rag_config(db).await?;
@@ -3678,6 +3807,7 @@ async fn process_inner(
         "translation_scenes":translation_scenes,"translation_quality_issues":translation_quality,"context_memory":rolling_memory,"running_summary":rolling_summary
     }))
     .map_err(|_| AppError::Invalid("segment metadata encode failed".into()))?;
+    original_segments(db,registry,job,&cues,true).await?;
     let segments_key = format!("{prefix}/segments.json");
     let srt_key = format!("{prefix}/subtitle.srt");
     let ass_key = format!("{prefix}/subtitle.ass");

@@ -184,7 +184,8 @@ async fn queue_get(
          FROM subtitle_jobs sj
          WHERE sj.task_id=t.id AND sj.status::text IN ('queued','running')
            AND (
-             (sj.status::text='running' AND sj.lease_owner IS NOT NULL AND
+             (v.stage='subtitle' AND sj.id=v.id)
+             OR (sj.status::text='running' AND sj.lease_owner IS NOT NULL AND
                 sj.lease_owner<>'' AND sj.lease_until>now())
              OR EXISTS (
                 SELECT 1 FROM pipeline_runs q
@@ -192,7 +193,7 @@ async fn queue_get(
                   AND q.state IN ('submitting','submitted','running','cancel_requested')
                   AND q.request_json->>'job_id'=sj.id::text)
            )
-         ORDER BY sj.updated_at DESC,sj.created_at DESC LIMIT 1
+         ORDER BY (sj.id=v.id) DESC NULLS LAST,sj.updated_at DESC,sj.created_at DESC LIMIT 1
       ) sv ON TRUE
       LEFT JOIN LATERAL (
          SELECT r.id,r.subtitle_job_id,r.status,r.progress,r.error_message,
@@ -283,6 +284,9 @@ async fn queue_get(
                     .unwrap_or(0) as i32;
             }
             if stage == "subtitle" {
+                if subtitle_id==v_id {
+                    progress=row.try_get::<Option<i32>,_>("subtitle_progress")?.unwrap_or(0);
+                }
                 subtitle_id = v_id;
             }
             if stage == "render" || stage == "waiting_render" {

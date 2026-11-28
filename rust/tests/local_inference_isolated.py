@@ -88,7 +88,19 @@ try:
         text=(root/srt[0]).read_text()
         assert "circuit" in text.lower() or "capacitor" in text.lower(),text
         assert c.execute("SELECT count(*) FROM publish_jobs WHERE task_id=%s",(t,)).fetchone()[0]==0
-    print("PASS: real Rust worker, original OpenVINO GPU ASR settings, actual Whisper timestamps and original assets table SRT",flush=True)
+        native=c.execute("SELECT id FROM operation_inbox WHERE task_id=%s AND runtime_engine='rust-v2' AND stage='subtitle'",(t,)).fetchone()
+        legacy=c.execute("SELECT status::text,progress,request_json,logs_key FROM subtitle_jobs WHERE id=%s AND task_id=%s",(native[0],t)).fetchone()
+        assert legacy and legacy[:2]==('succeeded',100),legacy
+        request=legacy[2]
+        assert request['input']['type']=='storage' and request['input']['key']==key,request
+        assert request['asr']['engine']=='openvino',request
+        for name in ('source_segments_key','final_subtitle_segments_key'):
+            artifact=request['artifacts'][name]
+            data=json.loads((root/artifact).read_text())
+            assert isinstance(data,list) and data and all('start' in cue and 'end' in cue and 'text' in cue for cue in data),data
+            assert c.execute("SELECT count(*) FROM assets WHERE task_id=%s AND kind='segments_json' AND storage_key=%s",(t,artifact)).fetchone()[0]==1
+        assert (root/legacy[3]).is_file()
+    print("PASS: real Rust worker, original OpenVINO GPU ASR settings, actual Whisper timestamps, original subtitle_jobs and assets",flush=True)
     # Local embedding is an explicit second scenario; the production setting
     # remains recorded separately as openai / Qwen3-Embedding-8B, not replaced.
     model_dir=os.environ["SUBTITLE_RAG_EMBEDDING_MODEL_DIR"]
