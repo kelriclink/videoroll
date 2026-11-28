@@ -146,9 +146,8 @@ async fn model_identity(request: &Value) -> AppResult<Value> {
     Ok(key)
 }
 impl Session {
-    fn spawn(key: Value, executable: &Path, bridge: Option<&Path>, lock: &Path) -> AppResult<Self> {
+    fn spawn(key: Value, executable: &Path, lock: &Path) -> AppResult<Self> {
         let mut cmd = Command::new(executable);
-        if let Some(bridge) = bridge { cmd.arg("-I").arg(bridge); }
         cmd.arg("--serve").env_clear();
         for name in [
             "PATH",
@@ -164,7 +163,7 @@ impl Session {
                 cmd.env(name, v);
             }
         }
-        if bridge.is_none() {
+        {
             let ov = native_runtime_root("VIDEOROLL_V2_OPENVINO_RUNTIME", "/opt/videoroll/runtime/openvino-2026.4.1")?;
             let vad = native_runtime_root("VIDEOROLL_V2_SILERO_RUNTIME", "/opt/videoroll/runtime/silero-v6-ort-1.30.0")?;
             let libraries = std::env::join_paths([ov.join("runtime/3rdparty/tbb/lib"), ov.join("runtime/lib/intel64")])
@@ -285,9 +284,7 @@ pub fn runtime_revision() -> Value {
     } else { Value::Null }
 }
 pub fn configured() -> bool {
-    std::env::var_os("VIDEOROLL_V2_LOCAL_INFERENCE_NATIVE").is_some() ||
-    (std::env::var_os("VIDEOROLL_V2_LOCAL_INFERENCE_PYTHON").is_some()
-        && std::env::var_os("VIDEOROLL_V2_LOCAL_INFERENCE_BRIDGE").is_some())
+    std::env::var_os("VIDEOROLL_V2_LOCAL_INFERENCE_NATIVE").is_some()
 }
 pub async fn model_path(root: &Path, model: &str, embedding: bool) -> AppResult<PathBuf> {
     let root = tokio::fs::canonicalize(root)
@@ -365,17 +362,13 @@ pub async fn asr_settings(engine: &str, model: &str, settings: &Value) -> AppRes
     )
 }
 pub async fn invoke(request: &Value, timeout: Duration) -> AppResult<Value> {
-    let native = std::env::var_os("VIDEOROLL_V2_LOCAL_INFERENCE_NATIVE").filter(|_| native_supported(request));
-    let (executable, bridge) = if let Some(path) = native {
-        (PathBuf::from(path), None)
-    } else {
-        (PathBuf::from(std::env::var_os("VIDEOROLL_V2_LOCAL_INFERENCE_PYTHON")
-            .ok_or_else(|| unavailable("requested local inference backend is not configured"))?),
-         Some(PathBuf::from(std::env::var_os("VIDEOROLL_V2_LOCAL_INFERENCE_BRIDGE")
-            .ok_or_else(|| unavailable("local inference bridge not configured"))?)))
-    };
-    if !executable.is_absolute() || bridge.as_ref().is_some_and(|p| !p.is_absolute()) {
-        return Err(AppError::Invalid("local inference executables must use absolute paths".into()));
+    if !native_supported(request) {
+        return Err(AppError::Invalid("unsupported local inference backend; use OpenVINO".into()));
+    }
+    let executable = PathBuf::from(std::env::var_os("VIDEOROLL_V2_LOCAL_INFERENCE_NATIVE")
+        .ok_or_else(|| unavailable("native inference executable not configured"))?);
+    if !executable.is_absolute() {
+        return Err(AppError::Invalid("local inference executable must use absolute path".into()));
     }
     let input = serde_json::to_vec(request)
         .map_err(|_| AppError::Invalid("local inference request invalid".into()))?;
@@ -388,7 +381,7 @@ pub async fn invoke(request: &Value, timeout: Duration) -> AppResult<Value> {
     let timeout = timeout.clamp(Duration::from_secs(1), Duration::from_secs(1800));
     tokio::time::timeout(timeout, async {
         let _gate = EXCHANGE_GATE.lock().await;
-        let key = json!({"model":model_identity(request).await?,"executable":executable,"bridge":bridge,"runtime":runtime_revision(),"gpu_lock":lock});
+        let key = json!({"model":model_identity(request).await?,"executable":executable,"runtime":runtime_revision(),"gpu_lock":lock});
         let probe = is_probe(&key["model"]);
         let mut existing = None;
         if !probe {
@@ -419,7 +412,7 @@ pub async fn invoke(request: &Value, timeout: Duration) -> AppResult<Value> {
         }
         // While the exchange waits for admission or inference, idle siblings
         // can still be reaped. Cancellation drops only the checked-out child.
-        let mut session = match existing { Some(s) => s, None => Session::spawn(key, &executable, bridge.as_deref(), &lock)? };
+        let mut session = match existing { Some(s) => s, None => Session::spawn(key, &executable, &lock)? };
         let response = session.exchange(&input).await?;
         if probe { evict(session).await; return Ok(response); }
         session.last_used = Instant::now();

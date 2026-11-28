@@ -172,7 +172,6 @@ fi
 if [[ "${VIDEOROLL_V2_TEST_ORIGINAL_RAG_ONLY:-false}" == "true" ]]; then
   export VIDEOROLL_V2_INTERNAL_TOKEN="isolated-original-rag-token-0123456789"
   export VIDEOROLL_V2_STORAGE_ROOT="$(mktemp -d "$repo_root/rust/target/v2-original-rag.XXXXXX")"
-  export VIDEOROLL_V2_LOCAL_INFERENCE_BRIDGE="$repo_root/scripts/native/local_inference.py"
   export VIDEOROLL_V2_TEST_ORIGINAL_RAG=1
   "$cargo_bin" test --manifest-path "$repo_root/rust/Cargo.toml" --locked --offline --test original_rag_retrieval -- --nocapture
   exit 0
@@ -212,8 +211,7 @@ if [[ "${VIDEOROLL_V2_TEST_LOCAL_INFERENCE_ONLY:-false}" == "true" ]]; then
   export INTERNAL_API_SECRET="isolated-local-inference-service-secret"
   export VIDEOROLL_V2_STORAGE_ROOT="$(mktemp -d "$repo_root/rust/target/v2-local-inference.XXXXXX")"
   : "${VIDEOROLL_TEST_INFERENCE_CONFIG:?nonsecret configuration snapshot required}"
-  : "${VIDEOROLL_V2_LOCAL_INFERENCE_PYTHON:?explicit model runtime required}"
-  export VIDEOROLL_V2_LOCAL_INFERENCE_BRIDGE="$repo_root/scripts/native/local_inference.py"
+  : "${VIDEOROLL_V2_LOCAL_INFERENCE_NATIVE:?explicit native model runtime required}"
   "$cargo_bin" build --manifest-path "$repo_root/rust/Cargo.toml" --bin videoroll-v2 --locked --offline --quiet
   "$repo_root/rust/target/debug/videoroll-v2" migrate
   PYTHONPATH="$repo_root/src" "$smoke_python" "$repo_root/rust/tests/local_inference_isolated.py"

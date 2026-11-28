@@ -66,12 +66,12 @@ export type ASRFormState = {
 
 export const initialASRForm: ASRFormState = {
   downloadModel: "tiny",
-  downloadEngine: "faster-whisper",
+  downloadEngine: "openvino",
   downloadName: "",
   downloadRevision: "",
   downloadForce: false,
   uploadName: "",
-  defaultEngine: "faster-whisper",
+  defaultEngine: "openvino",
   defaultLanguage: "auto",
   defaultModel: "",
   openvinoDevice: "GPU",

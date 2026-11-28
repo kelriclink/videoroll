@@ -9,7 +9,6 @@ use sqlx::{Postgres, Transaction};
 const KEY: &str = "subtitle.asr";
 const ENGINES: &[&str] = &[
     "mock",
-    "faster-whisper",
     "openvino",
     "external-whisper",
     "groq-whisper",
@@ -72,10 +71,11 @@ pub(crate) fn view(v: &Value) -> Value {
     let mut engine = string(
         v,
         "default_engine",
-        &env("SUBTITLE_ASR_ENGINE", "faster-whisper"),
+        &env("SUBTITLE_ASR_ENGINE", "openvino"),
     );
+    let retired_engine = engine == "faster-whisper";
     if !ENGINES.contains(&engine.as_str()) {
-        engine = "faster-whisper".into();
+        engine = "openvino".into();
     }
     let model_default = match engine.as_str() {
         "openvino" => env("SUBTITLE_OPENVINO_MODEL", ""),
@@ -87,7 +87,7 @@ pub(crate) fn view(v: &Value) -> Value {
         ),
         _ => env("SUBTITLE_WHISPER_MODEL", "tiny"),
     };
-    let mut model = string(v, "default_model", &model_default);
+    let mut model = if retired_engine { model_default.clone() } else { string(v, "default_model", &model_default) };
     if engine == "groq-whisper"
         && !matches!(
             model.as_str(),

@@ -30,7 +30,7 @@
   "rag_embedding_model": "text-embedding-3-small",
   "rag_embedding_dimensions": 1536,
   "rag_embedding_model_dir": "/models/embeddings",
-  "rag_embedding_device": "cpu",
+  "rag_embedding_device": "openvino:CPU",
   "rag_embedding_api_key_set": false,
   "rag_embedding_base_url": "https://api.openai.com/v1",
   "rag_embedding_timeout_seconds": 60.0,

@@ -93,12 +93,12 @@ pub(crate) fn subtitle_config(request: SubtitleAction) -> AppResult<Value> {
     if request.asr_engine.as_deref().is_some_and(|s| {
         !matches!(
             s,
-            "auto" | "openvino" | "faster-whisper" | "cloudflare-workers-ai"
+            "auto" | "openvino" | "cloudflare-workers-ai"
         )
     }) || (request.asr_model.is_some()
         && !matches!(
             request.asr_engine.as_deref(),
-            Some("openvino" | "faster-whisper" | "cloudflare-workers-ai")
+            Some("openvino" | "cloudflare-workers-ai")
         ))
         || request.auto_publish == Some(true)
         || request.publish_payload.is_some()

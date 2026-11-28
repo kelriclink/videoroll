@@ -569,6 +569,12 @@ fn main() -> Result<()> {
 mod tests {
     use super::*;
     #[test]
+    fn cpu_devices_never_take_gpu_lock() {
+        assert!(lock_gpu(&json!({"kind":"asr","engine":"openvino","device":"CPU"})).unwrap().is_none());
+        assert!(lock_gpu(&json!({"kind":"embedding","device":"openvino:CPU"})).unwrap().is_none());
+        assert!(lock_gpu(&json!({"kind":"devices"})).unwrap().is_none());
+    }
+    #[test]
     fn garbage_filter() {
         assert!(garbage("!!!"));
         assert!(garbage("1,2,3"));

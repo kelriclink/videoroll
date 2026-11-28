@@ -17,7 +17,7 @@ use uuid::Uuid;
 const MAX_REPO_BYTES: u64 = 512 * 1024 * 1024 * 1024;
 const MAX_FILES: usize = 100_000;
 fn def_engine() -> String {
-    "faster-whisper".into()
+    "openvino".into()
 }
 #[derive(Debug, Deserialize)]
 struct Request {
@@ -42,7 +42,7 @@ struct Manifest {
 fn model_repository(engine: &str, model: &str) -> AppResult<(String, String)> {
     let engine = engine.trim().to_lowercase();
     let model = model.trim();
-    if !matches!(engine.as_str(), "faster-whisper" | "openvino" | "embedding") {
+    if !matches!(engine.as_str(), "openvino" | "embedding") {
         return Err(AppError::Invalid(format!(
             "unsupported model download engine: {engine}"
         )));
@@ -51,13 +51,6 @@ fn model_repository(engine: &str, model: &str) -> AppResult<(String, String)> {
         return Err(AppError::Invalid("model is required".into()));
     }
     let repo = match (engine.as_str(), model) {
-        ("faster-whisper", "tiny") => "Systran/faster-whisper-tiny",
-        ("faster-whisper", "base") => "Systran/faster-whisper-base",
-        ("faster-whisper", "small") => "Systran/faster-whisper-small",
-        ("faster-whisper", "medium") => "Systran/faster-whisper-medium",
-        ("faster-whisper", "large-v1") => "Systran/faster-whisper-large-v1",
-        ("faster-whisper", "large-v2") => "Systran/faster-whisper-large-v2",
-        ("faster-whisper", "large-v3") => "Systran/faster-whisper-large-v3",
         ("openvino", "tiny") => "OpenVINO/whisper-tiny-fp16-ov",
         ("openvino", "base") => "OpenVINO/whisper-base-fp16-ov",
         ("openvino", "small") => "OpenVINO/whisper-small-fp16-ov",
@@ -68,9 +61,7 @@ fn model_repository(engine: &str, model: &str) -> AppResult<(String, String)> {
         _ => model,
     }
     .to_owned();
-    let default_name = if engine == "faster-whisper" && model != repo {
-        model.to_owned()
-    } else if repo != model {
+    let default_name = if repo != model {
         repo.split_once('/')
             .map(|(_, name)| name.to_string())
             .unwrap_or_default()
@@ -366,10 +357,7 @@ mod tests {
     use super::*;
     #[test]
     fn repository_names() {
-        assert_eq!(
-            model_repository("faster-whisper", "tiny").unwrap(),
-            ("Systran/faster-whisper-tiny".into(), "tiny".into())
-        );
+        assert!(model_repository("faster-whisper", "tiny").is_err());
         assert_eq!(
             model_repository("openvino", "base").unwrap(),
             (
@@ -381,10 +369,7 @@ mod tests {
             model_repository("embedding", "bge-m3").unwrap(),
             ("BAAI/bge-m3".into(), "bge-m3".into())
         );
-        assert_eq!(
-            model_repository("faster-whisper", "ORG/custom").unwrap(),
-            ("ORG/custom".into(), "ORG--custom".into())
-        );
+        assert!(model_repository("faster-whisper", "ORG/custom").is_err());
         assert!(model_repository("unknown", "tiny").is_err());
     }
 }

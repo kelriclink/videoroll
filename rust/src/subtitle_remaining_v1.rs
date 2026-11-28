@@ -280,7 +280,7 @@ async fn subtitle_settings(State(state): State<AppState>) -> AppResult<Json<Valu
             .unwrap_or(4)
     };
     Ok(Json(json!({
-        "asr_engine":env("SUBTITLE_ASR_ENGINE","faster-whisper"),
+        "asr_engine":runtime["default_engine"],
         "whisper_model":env("SUBTITLE_WHISPER_MODEL","tiny"),
         "whisper_model_dir":env("SUBTITLE_WHISPER_MODEL_DIR","/models/whisper"),
         "whisper_device":env("SUBTITLE_WHISPER_DEVICE","cpu"),
@@ -297,7 +297,7 @@ async fn subtitle_settings(State(state): State<AppState>) -> AppResult<Json<Valu
         "whisper_num_workers_effective":workers,
         // Python package-presence flags do not apply to the native replacement.
         "faster_whisper_installed":false,
-        "openvino_installed":false,
+        "openvino_installed":crate::local_inference::configured(),
         "external_whisper_base_url":runtime["external_whisper_base_url"],
         "external_whisper_model":runtime["external_whisper_model"],
         "external_whisper_api_key_set":runtime["external_whisper_api_key_set"],

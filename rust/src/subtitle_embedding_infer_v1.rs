@@ -79,7 +79,7 @@ pub async fn load_db(db: &crate::Database) -> AppResult<Settings> {
             .filter(|s| !s.is_empty())
             .unwrap_or("/models/embeddings")
             .into(),
-        device: cfg["rag_embedding_device"].as_str().unwrap_or("cpu").into(),
+        device: cfg["rag_embedding_device"].as_str().unwrap_or("openvino:CPU").into(),
         model,
         dimensions,
         api_key: key,
@@ -172,6 +172,9 @@ pub fn model_key(settings: &Settings) -> String {
 }
 pub async fn embed(settings: &Settings, text: &str) -> AppResult<Vec<f32>> {
     if settings.provider == "local" {
+        if !matches!(settings.device.to_ascii_lowercase().as_str(), "openvino" | "openvino:cpu" | "openvino:gpu" | "openvino:gpu.0" | "openvino:gpu.1") {
+            return Err(AppError::Invalid("local embedding requires an OpenVINO device".into()));
+        }
         if text.trim().is_empty() || text.len() > 128 * 1024 {
             return Err(AppError::Invalid(
                 "local embedding text size invalid".into(),

@@ -77,7 +77,6 @@ pub(crate) fn normalized_profile(raw: &Value) -> Value {
                 s,
                 "auto"
                     | "mock"
-                    | "faster-whisper"
                     | "openvino"
                     | "external-whisper"
                     | "groq-whisper"
@@ -257,7 +256,7 @@ fn validate_update(update: &Map<String, Value>) -> AppResult<()> {
                 return Err(AppError::Invalid("invalid video preset".into()));
             }
             "asr_engine" if !value.as_str().is_some_and(|s|matches!(s,
-                "auto"|"mock"|"faster-whisper"|"openvino"|"external-whisper"|"groq-whisper"|"cloudflare-workers-ai"))=>{
+                "auto"|"mock"|"openvino"|"external-whisper"|"groq-whisper"|"cloudflare-workers-ai"))=>{
                 return Err(AppError::Invalid("unsupported ASR engine".into()));
             }
             "asr_model" if value.as_str().is_none_or(|s|s.len()>1024 || s.chars().any(char::is_control))=>{

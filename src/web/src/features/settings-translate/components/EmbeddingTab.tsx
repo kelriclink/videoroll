@@ -159,7 +159,6 @@ export function EmbeddingTab({ controller }: { controller: SettingsTranslateCont
           <label className="block">
             <div className="mb-1 text-xs text-slate-600">运行设备</div>
             <select className="w-full rounded border px-3 py-2 text-sm" value={ragEmbeddingDevice} onChange={(e) => setRagEmbeddingDevice(e.target.value)}>
-              <option value="cpu">CPU（PyTorch）</option>
               <option value="openvino:CPU">CPU（OpenVINO）</option>
               <option value="openvino:GPU">Intel GPU（OpenVINO）</option>
             </select>

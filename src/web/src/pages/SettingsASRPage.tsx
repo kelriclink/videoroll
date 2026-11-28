@@ -115,7 +115,7 @@ function formatBytes(n?: number | null): string {
 
 function asrDefaultsSnapshot(defaults: ASRDefaults): string {
   return JSON.stringify({
-    defaultEngine: defaults.default_engine || "faster-whisper",
+    defaultEngine: defaults.default_engine || "openvino",
     defaultLanguage: defaults.default_language || "auto",
     effectiveDefaultModel: defaults.default_model || "",
     openvinoDevice: defaults.openvino_device?.trim() || "GPU",
@@ -407,42 +407,12 @@ export default function SettingsASRPage() {
               <div className="mt-1 font-mono text-[11px] text-slate-400">SUBTITLE_ASR_ENGINE</div>
             </div>
             <div className="rounded border p-3">
-              <div className="text-xs text-slate-500">faster-whisper 运行时</div>
-              <div className={["mt-1 text-sm font-medium", settings.faster_whisper_installed ? "text-emerald-700" : "text-rose-700"].join(" ")}>{settings.faster_whisper_installed ? "已安装" : "未安装"}</div>
-            </div>
-            <div className="rounded border p-3">
               <div className="text-xs text-slate-500">OpenVINO GenAI 运行时</div>
               <div className={["mt-1 text-sm font-medium", settings.openvino_installed ? "text-emerald-700" : "text-rose-700"].join(" ")}>{settings.openvino_installed ? "已安装" : "未安装"}</div>
-            </div>
-            <div className="rounded border p-3">
-              <div className="text-xs text-slate-500">Whisper 默认模型 <span className="font-mono text-[10px] text-slate-400">SUBTITLE_WHISPER_MODEL</span></div>
-              <div className="mt-1 font-mono text-sm">{settings.whisper_model}</div>
             </div>
             <div className="rounded border p-3 lg:col-span-2">
               <div className="text-xs text-slate-500">ASR 模型目录 <span className="font-mono text-[10px] text-slate-400">SUBTITLE_WHISPER_MODEL_DIR</span></div>
               <div className="mt-1 font-mono text-sm">{settings.whisper_model_dir}</div>
-            </div>
-            <div className="rounded border p-3">
-              <div className="text-xs text-slate-500">faster-whisper 设备</div>
-              <div className="mt-1 font-mono text-sm">{settings.whisper_device}</div>
-            </div>
-            <div className="rounded border p-3">
-              <div className="text-xs text-slate-500">计算精度</div>
-              <div className="mt-1 font-mono text-sm">{settings.whisper_compute_type}</div>
-            </div>
-            <div className="rounded border p-3">
-              <div className="text-xs text-slate-500">CPU 线程 <span className="font-mono text-[10px] text-slate-400">SUBTITLE_WHISPER_CPU_THREADS</span></div>
-              <div className="mt-1 font-mono text-sm">
-                {settings.whisper_cpu_threads}{" "}
-                {settings.whisper_cpu_threads !== settings.whisper_cpu_threads_effective ? `(effective: ${settings.whisper_cpu_threads_effective})` : null}
-              </div>
-            </div>
-            <div className="rounded border p-3">
-              <div className="text-xs text-slate-500">ASR Worker 数 <span className="font-mono text-[10px] text-slate-400">SUBTITLE_WHISPER_NUM_WORKERS</span></div>
-              <div className="mt-1 font-mono text-sm">
-                {settings.whisper_num_workers}{" "}
-                {settings.whisper_num_workers !== settings.whisper_num_workers_effective ? `(effective: ${settings.whisper_num_workers_effective})` : null}
-              </div>
             </div>
             <div className="rounded border p-3 lg:col-span-2">
               <div className="text-xs text-slate-500">OpenVINO 模型 <span className="font-mono text-[10px] text-slate-400">SUBTITLE_OPENVINO_MODEL</span></div>
@@ -463,7 +433,7 @@ export default function SettingsASRPage() {
           </div>
         )}
         <div className="mt-3 text-xs text-slate-500">
-          提示：`faster-whisper` 和 `openvino-genai` 都依赖 `INSTALL_ASR=1` 构建。要启用方案 2，请把默认引擎切到 `openvino`，并提供一个已导出的 OpenVINO Whisper 模型目录。
+          本地 ASR 使用 Rust 原生 OpenVINO GenAI，需提供已导出的 OpenVINO Whisper 模型目录。
         </div>
       </div>
 
@@ -479,7 +449,7 @@ export default function SettingsASRPage() {
           <label className="block">
             <div className="mb-1 text-xs text-slate-600">默认引擎</div>
             <select className="w-full rounded border px-3 py-2 text-sm" value={defaultEngine} onChange={(e) => setDefaultEngine(e.target.value)}>
-              <option value="faster-whisper">faster-whisper</option>
+
               <option value="openvino">openvino（方案2 / Intel Arc）</option>
               <option value="external-whisper">在线 Whisper（自建 faster-whisper / OpenAI 兼容）</option>
               <option value="groq-whisper">groq-whisper（GroqCloud，自动切片）</option>
@@ -499,7 +469,7 @@ export default function SettingsASRPage() {
               className="w-full rounded border px-3 py-2 text-sm"
               value={defaultModel}
               onChange={(e) => setDefaultModel(e.target.value)}
-              placeholder="例如 tiny / Systran/faster-whisper-small / /models/whisper/whisper-large-v3-ov"
+              placeholder="例如 /models/whisper/whisper-large-v3-fp16-ov"
             />
             <div className="mt-2 flex flex-wrap gap-2">
               {knownSizes.map((s) => (
@@ -533,7 +503,7 @@ export default function SettingsASRPage() {
               </div>
             ) : null}
             <div className="mt-2 text-xs text-slate-500">
-              `faster-whisper` 可用 size/repo id/本地路径；`openvino` 需要填写一个已导出的 OpenVINO Whisper 模型目录路径；在线 Whisper 使用下方配置的远程服务地址与模型名。
+              `openvino` 需要填写一个已导出的 OpenVINO Whisper 模型目录路径；在线 Whisper 使用下方配置的远程服务地址与模型名。
             </div>
           </label>
 
@@ -955,13 +925,13 @@ export default function SettingsASRPage() {
       <div className="vr-section">
         <div className="text-sm font-semibold">下载模型（从 Hugging Face）</div>
         <div className="mt-2 text-xs text-slate-500">
-          支持 `faster-whisper` 和 `openvino`。选择 `openvino` 时，`tiny/base/small/medium/large-v3` 会映射到 OpenVINO 官方预转换 Whisper 仓库。
+          本地模型仅支持 OpenVINO。`tiny/base/small/medium/large-v3` 会映射到 OpenVINO 官方预转换 Whisper 仓库。
         </div>
         <div className="mt-3 grid gap-3 lg:grid-cols-2">
           <label className="block">
             <div className="mb-1 text-xs text-slate-600">engine</div>
             <select className="w-full rounded border px-3 py-2 text-sm" value={downloadEngine} onChange={(e) => setDownloadEngine(e.target.value)}>
-              <option value="faster-whisper">faster-whisper</option>
+
               <option value="openvino">openvino（OpenVINO 官方源）</option>
             </select>
           </label>
@@ -1036,7 +1006,7 @@ export default function SettingsASRPage() {
       <div className="vr-section">
         <div className="text-sm font-semibold">上传模型（zip）</div>
         <div className="mt-2 text-xs text-slate-500">
-          上传一个 zip 包。解压后可以是 `faster-whisper/ctranslate2` 模型目录，也可以是已导出的 OpenVINO Whisper 模型目录。目录名仅允许字母数字与 `._-`。
+          上传一个 zip 包。解压后应为已导出的 OpenVINO Whisper 模型目录。目录名仅允许字母数字与 `._-`。
         </div>
         <div className="mt-3 grid gap-3 lg:grid-cols-2">
           <label className="block">
@@ -1081,7 +1051,7 @@ export default function SettingsASRPage() {
       <div className="rounded-lg border border-slate-200 bg-slate-50 p-4 text-xs text-slate-600">
         <div className="font-semibold text-slate-700">如何在任务里使用本地模型？</div>
         <div className="mt-2">
-          在任务详情页生成字幕时，可将 `asr_engine` 设为 `faster-whisper` 或 `openvino`；`asr_model` 支持模型目录路径（例如：`/models/whisper/tiny` 或 `/models/whisper/whisper-large-v3-ov`）。
+          在任务详情页生成字幕时，可将 `asr_engine` 设为 `openvino`；`asr_model` 支持模型目录路径（例如：`/models/whisper/whisper-large-v3-fp16-ov`）。
         </div>
       </div>
       <SettingsSaveBar

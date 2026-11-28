@@ -259,7 +259,7 @@ export function TaskDetailSubtitle({ controller }: { controller: TaskDetailContr
                 <select className="w-full rounded border px-3 py-2 text-sm" value={asrEngine} onChange={(e) => setAsrEngine(e.target.value)}>
                   <option value="auto">auto（使用后端默认）</option>
                   <option value="mock">mock</option>
-                  <option value="faster-whisper">faster-whisper</option>
+
                   <option value="openvino">openvino（方案2 / Intel Arc）</option>
                   <option value="external-whisper">在线 Whisper（使用 ASR 设置中的服务地址）</option>
                   <option value="groq-whisper">groq-whisper（GroqCloud，自动切片）</option>
@@ -294,7 +294,7 @@ export function TaskDetailSubtitle({ controller }: { controller: TaskDetailContr
                   ))}
                 </select>
                 <div className="mt-2 text-xs text-slate-500">
-                  提示：`faster-whisper` 和 `openvino` 可以传本地模型目录路径；在线 Whisper 使用“ASR 设置”中保存的服务地址；Groq 使用 `whisper-large-v3(-turbo)`，Cloudflare 使用 `@cf/` 模型 ID。
+                  提示：`openvino` 可以传本地模型目录路径；在线 Whisper 使用“ASR 设置”中保存的服务地址；Groq 使用 `whisper-large-v3(-turbo)`，Cloudflare 使用 `@cf/` 模型 ID。
                 </div>
               </label>
             </div>

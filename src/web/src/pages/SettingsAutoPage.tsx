@@ -685,7 +685,7 @@ export default function SettingsAutoPage() {
                 <select className="w-full rounded border px-3 py-2 text-sm" value={asrEngine} onChange={(e) => setAsrEngine(e.target.value)}>
                   <option value="auto">使用系统默认</option>
                   {asrEngine === "mock" ? <option value="mock">开发兼容配置：mock</option> : null}
-                  <option value="faster-whisper">faster-whisper</option>
+
                   <option value="openvino">OpenVINO（Intel）</option>
                   <option value="external-whisper">OpenAI 兼容 Whisper 服务</option>
                   <option value="groq-whisper">GroqCloud Whisper</option>

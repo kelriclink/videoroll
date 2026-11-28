@@ -1354,6 +1354,7 @@ async fn groq_no_speech(config: &Config, path: &Path) -> bool {
 // Keep the original local Whisper speech-confidence gate before semantic
 // regrouping. Word-level timestamps are passed by the model adapter; Rust
 // remains responsible for cue formation and cross-window stitching.
+#[cfg(test)]
 fn local_whisper_response(mut payload: Value, seconds: f64) -> AppResult<AsrResponse> {
     if payload["word_timestamps"] != true {
         return serde_json::from_value(payload)
@@ -1421,9 +1422,6 @@ async fn run_asr(
         request["audio"] = json!(path);
         request["language"] = json!(lang);
         let response = crate::local_inference::invoke(&request, Duration::from_secs(600)).await?;
-        if request["engine"] == "faster-whisper" {
-            return local_whisper_response(response, seconds);
-        }
         return serde_json::from_value(response)
             .map_err(|_| AppError::Unavailable("local ASR response schema invalid".into()));
     }
@@ -2344,6 +2342,9 @@ pub async fn runtime_asr_config(
         .as_ref()
         .and_then(|v| v["asr_engine"].as_str())
         .filter(|s| *s != "auto");
+    if explicit == Some("faster-whisper") {
+        return Err(AppError::Invalid("local Faster-Whisper retired; select OpenVINO".into()));
+    }
     let mut stored = stored.unwrap_or_else(|| json!({}));
     if let Some(engine) = explicit {
         let previous = stored["default_engine"].as_str().map(str::to_owned);
@@ -2377,7 +2378,7 @@ pub async fn runtime_asr_config(
         return Ok(None);
     }
     let read = crate::subtitle_asr_settings_v1::view(&stored);
-    let engine = read["default_engine"].as_str().unwrap_or("faster-whisper");
+    let engine = read["default_engine"].as_str().unwrap_or("openvino");
     let mut out = config.clone();
     let model = read
         .get("default_model")
@@ -2450,7 +2451,7 @@ pub async fn runtime_asr_config(
             );
             Ok(Some(out))
         }
-        "openvino" | "faster-whisper" => {
+        "openvino" => {
             let mut local = crate::local_inference::asr_settings(engine, model, &read).await?;
             local["default_language"] = read["default_language"].clone();
             out.local_asr = Some(local);
