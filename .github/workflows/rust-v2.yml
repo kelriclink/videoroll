@@ -1,14 +1,7 @@
 name: Rust VideoRoll 2.0 control-plane checks
 
 on:
-  push:
-    branches:
-      - rewrite/rust-v2
-  pull_request:
-    paths:
-      - 'rust/**'
-      - 'src/web/**'
-      - '.github/workflows/rust-v2.yml'
+  workflow_dispatch:
 
 permissions:
   contents: read

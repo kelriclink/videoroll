@@ -1,13 +1,6 @@
 name: Build Native Windows Render Worker
 
 on:
-  push:
-    branches:
-      - windows-render-worker
-    paths:
-      - "native/windows-render-worker/**"
-      - "scripts/build_native_windows_render_worker.ps1"
-      - ".github/workflows/build-native-windows-render-worker.yml"
   workflow_dispatch:
 
 permissions:
