@@ -79,9 +79,10 @@ def browser(root,port,task_id,bootstrap):
                 fill(0,password)
                 assert click_text("Login")
                 wait("!!document.querySelector('main') && document.querySelector('main').innerText.includes('工作台')")
-                print("PASS: Chromium real React admin setup, login cookie and dashboard",flush=True)
+                assert ev("!document.querySelector('nav a[href=\"/rust-v2\"]')")
+                print("PASS: Chromium real React admin setup, login cookie and original dashboard",flush=True)
                 paths=["/tasks","/tasks/new",f"/tasks/{task_id}","/videos","/youtube/sources",
-                    "/queue/render","/render","/knowledge","/dictionaries","/operations","/workflow","/rust-v2",
+                    "/queue/render","/render","/knowledge","/dictionaries","/operations","/workflow",
                     "/settings/auto","/settings/dubbing","/settings/youtube","/settings/publish",
                     "/settings/asr","/settings/translate","/settings/review","/settings/storage","/settings/api"]
                 # Read-only navigation; actual platform/discovery page and embedded

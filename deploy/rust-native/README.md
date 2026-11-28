@@ -19,8 +19,8 @@ PostgreSQL/pgvector 沿用原库、原表。旧版部署目录及 unit 保留；
 
 Worker 等待内部服务健康检查后才领取；Web 等待 API readiness。
 默认不开启自动扫描和真实平台投稿。原浏览器 /api/* 映射到 /api/v1/*；
-原 /api/v1/*、/api/v2/*、/render-workers/v1/* 保留 URI。
-原 Hatchet iframe 替换为原生工作流诊断入口。
+原 /api/v1/*、/render-workers/v1/* 保留 URI；实验 /api/v2/* 仅用于本机内部开发及测试，不经正式 Web 网关暴露。
+原 Hatchet 诊断入口沿用原处理队列与运维页面，正式构建关闭独立 Rust V2 测试控制台。
 外部 TLS 反代与访问控制需独立配置；内部 API/noVNC 不直接暴露公网。
 
 ## 第三方边界

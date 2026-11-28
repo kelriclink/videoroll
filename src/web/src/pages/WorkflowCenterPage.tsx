@@ -12,10 +12,10 @@ export default function WorkflowCenterPage() {
       <div className="flex flex-col gap-4">
         <PageHeader title="工作流诊断（Rust）" description="原生 PostgreSQL 工作流、租约与事件诊断，不依赖旧调度平台。" />
         <InlineNotice title="Rust 原生调度" tone="info">
-          通过原生控制台查看工作流、等待阶段、执行结果及未知回执。
+          日常任务执行、等待阶段与错误详情请使用原处理队列及任务详情页面。
         </InlineNotice>
         <div className="flex gap-3">
-          <Link to="/rust-v2" className="rounded-lg border px-3 py-2 text-sm">原生工作流控制台</Link>
+          <Link to="/queue/render" className="rounded-lg border px-3 py-2 text-sm">处理队列</Link>
           <Link to="/operations" className="rounded-lg border px-3 py-2 text-sm">返回运维</Link>
         </div>
       </div>

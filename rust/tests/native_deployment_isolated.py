@@ -150,7 +150,8 @@ try:
         code,body,_=get(p,path)
         assert code==200,(path,code,body)
         json.loads(body)
-    code,body,_=get(p,"/api/v2/queue",env["VIDEOROLL_V2_INTERNAL_TOKEN"])
+    assert get(p,"/api/v2/queue",env["VIDEOROLL_V2_INTERNAL_TOKEN"])[0]==404
+    code,body,_=get(ports["api"],"/api/v2/queue",env["VIDEOROLL_V2_INTERNAL_TOKEN"])
     assert code==200,(code,body)
     assert get(p,"/api/desktop/authorize")[0]==404
     assert get(p,"/internal/desktop-auth")[0]==404
