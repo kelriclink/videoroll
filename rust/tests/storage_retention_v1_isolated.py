@@ -28,7 +28,7 @@ def gc(hours=None):
     env.pop("FAILED_TASK_RESOURCE_RETENTION_HOURS",None)
     if hours is not None: env["FAILED_TASK_RESOURCE_RETENTION_HOURS"]=str(hours)
     env["VIDEOROLL_V2_ALLOW_V1_TERMINAL_CLEANUP"]="false"
-    subprocess.run(["./target/debug/videoroll-v2","gc","--limit","50"],env=env,check=True)
+    subprocess.run([os.environ.get("VIDEOROLL_TEST_BIN","./target/debug/videoroll-v2"),"gc","--limit","50"],env=env,check=True)
 def ttl(days):
     with db() as c:
         c.execute("INSERT INTO app_settings(key,value_json) VALUES('storage.retention',%s::jsonb) ON CONFLICT(key) DO UPDATE SET value_json=EXCLUDED.value_json",(json.dumps({"asset_ttl_days":days}),))
@@ -128,3 +128,56 @@ finally:
     for item in fixtures:
         shutil.rmtree(root/f"v2/raw/{item[0]}",ignore_errors=True)
         shutil.rmtree(workdir(item),ignore_errors=True)
+
+# Original-layout files produced by the Rust ASR/YouTube writers must be
+# released and collected under the same policy. Unknown/shared/mutated
+# legacy files must survive even if a native reference exists.
+import hashlib
+payload=b"registered original fixture"
+digest=hashlib.sha256(payload).hexdigest()
+legacy=[]
+for case in ("audio","source","translated","cover","shared","wrong_digest","changed","unknown"):
+    task,flow,unused=seed("published",72)
+    if case=="cover": key=f"final/{task}/cover_youtube_{digest[:16]}_123456789abc.jpg"; kind="cover_image"
+    elif case in ("source","translated"): key=f"sub/{task}/{'subtitle_segments' if case=='translated' else 'segments'}_{digest[:16]}_123456789abc.json"; kind="segments_json"
+    elif case=="unknown": key=f"work/{task}/arbitrary.wav"; kind="audio_wav"
+    else: key=f"work/{task}/audio_{digest[:16]}_123456789abc.wav"; kind="audio_wav"
+    p=root/key;p.parent.mkdir(parents=True,exist_ok=True);p.write_bytes(payload)
+    with db() as c:
+        c.execute("DELETE FROM storage_object_refs WHERE storage_key=%s",(unused,))
+        c.execute("DELETE FROM storage_objects WHERE storage_key=%s",(unused,))
+        c.execute("INSERT INTO storage_objects(storage_key,checksum_sha256,size_bytes,retain_until,state) VALUES(%s,%s,%s,now()+interval '2 days','live')",(key,digest,len(payload)))
+        c.execute("INSERT INTO storage_object_refs(storage_key,owner_type,owner_id,role) VALUES(%s,'workflow',%s,%s)",(key,flow,kind))
+        c.execute("INSERT INTO assets(id,task_id,kind,storage_key,sha256,size_bytes) VALUES(%s,%s,%s,%s,%s,%s)",(uuid4(),task,kind,key,"0"*64 if case=="wrong_digest" else digest,len(payload)))
+        if case=="shared":
+            other=uuid4()
+            c.execute("INSERT INTO tasks(id,source_type,source_license,status,runtime_owner) VALUES(%s,'local','own','created','python')",(other,))
+            c.execute("INSERT INTO assets(id,task_id,kind,storage_key,sha256,size_bytes) VALUES(%s,%s,%s,%s,%s,%s)",(uuid4(),other,kind,key,digest,len(payload)))
+    legacy.append((case,task,flow,key))
+ttl(1);gc()
+for case,task,flow,key in legacy:
+    with db() as c:
+        refs=c.execute("SELECT count(*) FROM storage_object_refs WHERE storage_key=%s",(key,)).fetchone()[0]
+        assert refs==(1 if case in ("shared","wrong_digest","unknown") else 0),(case,refs)
+        c.execute("UPDATE storage_objects SET retain_until=now()-interval '1 minute' WHERE storage_key=%s",(key,))
+    if case=="changed": (root/key).write_bytes(b"tampered")
+gc()
+for case,task,flow,key in legacy:
+    if case in ("audio","source","translated","cover"): deleted((task,flow,key))
+    else: retained((task,flow,key))
+print("PASS: registered original work/sub/final paths released and physically collected, shared/unknown/digest-mismatch/tampered files retained")
+
+# A failed cleanup cannot invalidate a confirmed publication. Backfill its
+# retention without replaying the publish stage; ambiguous receipts stay held.
+for confirmed in (True,False):
+    item=seed("published",72)
+    task,flow,key=item
+    with db() as c:
+        c.execute("UPDATE vr2_workflows SET state='failed',current_stage='cleanup' WHERE id=%s",(flow,))
+        j=uuid4()
+        c.execute("INSERT INTO vr2_jobs(id,workflow_id,task_id,stage,generation,operation_key,state,result,attempts,max_attempts,finished_at) VALUES(%s,%s,%s,'publish',1,%s,'succeeded',%s::jsonb,1,1,now())",(j,flow,task,"retention-fixture:"+str(j),json.dumps({"confirmed":confirmed,"bvid":"BV1TESTONLY","external_id":"BV1TESTONLY"})))
+    gc()
+    check(item,confirmed)
+    with db() as c:
+        assert c.execute("SELECT state FROM vr2_jobs WHERE id=%s",(j,)).fetchone()[0]=="succeeded"
+print("PASS: confirmed publication with failed cleanup receives retention backfill; ambiguous result is retained")

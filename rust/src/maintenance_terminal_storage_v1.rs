@@ -152,7 +152,6 @@ async fn unsafe_to_delete(tx: &mut Transaction<'_, Postgres>, task: Uuid) -> App
             AND NULLIF(external_id,'') IS NULL AND NULLIF(external_url,'') IS NULL)))
        OR EXISTS(SELECT 1 FROM vr2_workflows WHERE task_id=$1 AND state IN ('running','paused','unknown'))
        OR EXISTS(SELECT 1 FROM vr2_jobs WHERE task_id=$1 AND state IN ('pending','running','awaiting','unknown'))
-       OR EXISTS(SELECT 1 FROM storage_object_refs WHERE owner_type='task' AND owner_id=$1)
        OR EXISTS(SELECT 1 FROM playout_asset_links p JOIN assets a ON a.id=p.asset_id WHERE a.task_id=$1)
        OR EXISTS(SELECT 1 FROM render_executions e JOIN assets a ON e.uploaded_asset_id=a.id WHERE a.task_id=$1)
      "#).bind(task).fetch_one(&mut **tx).await?;
@@ -445,25 +444,25 @@ async fn cleanup(state: &AppState) -> AppResult<Value> {
                 tracing::warn!(%task,"terminal resource cleanup exceeds per-task file cap");
                 continue;
             }
-            let mut protected = false;
-            for key in &keys {
-                if key.starts_with("v2/") || externally_referenced(&mut tx, key, task).await? {
-                    protected = true;
-                    break;
-                }
-                // Fails closed before any unlink if a symlink exists in the path.
-                if registry.resolve_existing(key).await.is_err() {
-                    protected = true;
-                    break;
-                }
+            // Fence cross-task reference writes before the per-key decision.
+            sqlx::query("LOCK TABLE assets, subtitles, storage_objects, storage_object_refs IN SHARE ROW EXCLUSIVE MODE NOWAIT")
+                .execute(&mut *tx).await?;
+            // A mixed-layout task is not indivisible: leave registry-owned
+            // and shared keys for their own collectors, without blocking
+            // eligible original-layout files or deleting their business rows.
+            let mut ordered=Vec::new();
+            for key in keys {
+                // Nonstandard keys are permitted only from the exact original
+                // asset/subtitle rows, as in Python. Known foreign task paths
+                // and every registry-managed object remain protected.
+                let explicit=assets.iter().chain(subtitles.iter()).any(|r|r.try_get::<String,_>("storage_key").ok().as_deref()==Some(key.as_str()));
+                let known_prefix=key.split('/').next().is_some_and(|p|PREFIXES.contains(&p));
+                if key.starts_with("v2/") || (known_prefix && !resource_key(&key,task)) || (!resource_key(&key,task) && !explicit) || externally_referenced(&mut tx,&key,task).await? || registry.resolve_existing(&key).await.is_err(){continue;}
+                ordered.push(key);
             }
-            if protected {
-                tracing::warn!(%task,"terminal resource has shared refs or unsafe path; retained");
-                continue;
-            }
+            if ordered.is_empty(){continue;}
             let mut task_deleted = 0;
             let mut task_pending = 0;
-            let mut ordered = keys.into_iter().collect::<Vec<_>>();
             ordered.sort();
             for key in &ordered {
                 let path = registry.resolve_existing(key).await?;
@@ -477,13 +476,13 @@ async fn cleanup(state: &AppState) -> AppResult<Value> {
                     }
                 }
             }
-            let deleted_subs = sqlx::query("DELETE FROM subtitles WHERE task_id=$1")
-                .bind(task)
+            let deleted_subs = sqlx::query("DELETE FROM subtitles WHERE task_id=$1 AND storage_key=ANY($2::text[])")
+                .bind(task).bind(&ordered)
                 .execute(&mut *tx)
                 .await?
                 .rows_affected() as i64;
-            let deleted_assets = sqlx::query("DELETE FROM assets WHERE task_id=$1")
-                .bind(task)
+            let deleted_assets = sqlx::query("DELETE FROM assets WHERE task_id=$1 AND storage_key=ANY($2::text[])")
+                .bind(task).bind(&ordered)
                 .execute(&mut *tx)
                 .await?
                 .rows_affected() as i64;

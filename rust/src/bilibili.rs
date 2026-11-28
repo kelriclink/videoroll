@@ -1576,13 +1576,24 @@ pub async fn publish(
     }
     crate::bilibili_publish_v1::mark_started(db,job).await?;
     if let Some(cover) = cover_key {
+        let mut tx=db.pool.begin().await?;
+        crate::storage::verify_original_read(registry,&mut tx,job.task_id,"cover_image",&cover,false).await?;
+        tx.commit().await?;
         let path = registry.resolve_existing(&cover).await?;
         meta.cover = client.upload_cover(&csrf, &path).await?;
     }
     let requested = configured_upload_workers(db).await?;
     let mut prepared = Vec::new();
     let mut total = 0u64;
-    for (key, title) in parts {
+    for (index,(key, title)) in parts.into_iter().enumerate() {
+        let kind=if index==0 {"video_final"} else {"video_dubbed"};
+        let mut tx=db.pool.begin().await?;
+        if !key.starts_with("v2/") && index==0 {
+            // No-speech publication may legally alias the original raw video.
+            let final_asset:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM assets WHERE task_id=$1 AND storage_key=$2 AND kind='video_final'::asset_kind)").bind(job.task_id).bind(&key).fetch_one(&mut *tx).await?;
+            crate::storage::verify_original_read(registry,&mut tx,job.task_id,if final_asset{kind}else{"video_raw"},&key,false).await?;
+        }else{crate::storage::verify_original_read(registry,&mut tx,job.task_id,kind,&key,false).await?;}
+        tx.commit().await?;
         let path = registry.resolve_existing(&key).await?;
         probe_video(&config.ffprobe_binary, &path).await?;
         let bytes = fs::metadata(&path).await?.len();

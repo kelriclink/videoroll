@@ -106,12 +106,10 @@ async fn verify_dubbing(db: &Database, task_id: Uuid, job_id: Uuid) -> AppResult
            AND r.source_video_key=(
              SELECT a0.storage_key FROM assets a0
              WHERE a0.task_id=$1 AND a0.kind='video_raw'::asset_kind
-               AND a0.storage_key LIKE 'v2/%'
              ORDER BY a0.created_at DESC,a0.id DESC LIMIT 1)
            AND r.source_srt_key=(
              SELECT a1.storage_key FROM assets a1
              WHERE a1.task_id=$1 AND a1.kind='subtitle_srt'::asset_kind
-               AND a1.storage_key LIKE 'v2/%'
              ORDER BY a1.created_at DESC,a1.id DESC LIMIT 1)
          LIMIT 1",
     )
@@ -124,7 +122,9 @@ async fn verify_dubbing(db: &Database, task_id: Uuid, job_id: Uuid) -> AppResult
             "P2 requires verified same-task YouDub, current original video and current SRT".into(),
         )
     })?;
-    Ok(row.get("output_video_key"))
+    let key:String=row.get("output_video_key");
+    if !crate::storage::task_asset_key(task_id,&key){return Err(AppError::Conflict("P2 asset does not belong to task".into()));}
+    Ok(key)
 }
 async fn get(
     State(state): State<AppState>,
@@ -176,6 +176,9 @@ async fn enqueue(
     let video_key = verify_dubbing(&state.db, task_id, request.dubbing_job_id).await?;
     // Forbid enqueuing a different P2 when an existing intent is unresolved.
     let mut tx = state.db.pool.begin().await?;
+    let owner:Option<Uuid>=sqlx::query_scalar("SELECT id FROM tasks WHERE id=$1 AND runtime_owner='rust' FOR UPDATE").bind(task_id).fetch_optional(&mut *tx).await?;
+    if owner.is_none(){return Err(AppError::Conflict("P2 task ownership changed".into()));}
+    crate::storage::verify_original_read(&state.storage,&mut tx,task_id,"video_dubbed",&video_key,true).await?;
     let original = sqlx::query(
         "SELECT result,state FROM vr2_jobs j
          JOIN tasks m ON m.id=j.task_id AND m.runtime_owner='rust'

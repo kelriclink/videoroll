@@ -146,9 +146,8 @@ async fn asset_key(
         AssetRegistry::checked_key(chosen)?;
         let key: Option<String> = sqlx::query_scalar(
             "SELECT a.storage_key FROM assets a
-             JOIN storage_objects o ON o.storage_key=a.storage_key AND o.state='live'
              WHERE a.task_id=$1 AND a.kind::text=$2 AND a.storage_key=$3
-               AND a.storage_key LIKE 'v2/%' LIMIT 1",
+             AND (a.storage_key NOT LIKE 'v2/%' OR EXISTS(SELECT 1 FROM storage_objects o WHERE o.storage_key=a.storage_key AND o.state='live')) LIMIT 1",
         )
         .bind(task)
         .bind(kind)
@@ -159,9 +158,8 @@ async fn asset_key(
     } else {
         sqlx::query_scalar(
             "SELECT a.storage_key FROM assets a
-             JOIN storage_objects o ON o.storage_key=a.storage_key AND o.state='live'
              WHERE a.task_id=$1 AND a.kind::text=$2
-               AND a.storage_key LIKE 'v2/%'
+             AND (a.storage_key NOT LIKE 'v2/%' OR EXISTS(SELECT 1 FROM storage_objects o WHERE o.storage_key=a.storage_key AND o.state='live'))
              ORDER BY a.created_at DESC,a.id DESC LIMIT 1",
         )
         .bind(task)
@@ -169,11 +167,9 @@ async fn asset_key(
         .fetch_optional(&db.pool)
         .await?
     };
-    key.ok_or_else(|| {
-        AppError::NotFound(format!(
-            "verified V2 {kind} video asset missing for SAU publication"
-        ))
-    })
+    let key=key.ok_or_else(|| AppError::NotFound(format!("task {kind} asset missing for SAU publication")))?;
+    if !crate::storage::task_asset_key(task,&key){return Err(AppError::Conflict("SAU asset key does not match task".into()));}
+    Ok(key)
 }
 fn digest(
     account: Uuid,
@@ -293,6 +289,8 @@ pub async fn manual(state: &AppState, task_id: Uuid, raw: Value) -> AppResult<Va
     if owner.as_deref() != Some("rust") {
         return Err(AppError::Conflict("Rust task ownership changed".into()));
     }
+    crate::storage::verify_original_read(&state.storage,&mut tx,task_id,"video_final",&video,true).await?;
+    if let Some(k)=cover.as_deref(){crate::storage::verify_original_read(&state.storage,&mut tx,task_id,"cover_image",k,true).await?;}
     let mixed: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM publish_batches WHERE task_id=$1 AND request_json->>'runtime'='rust-mixed-v1')")
         .bind(task_id).fetch_one(&mut *tx).await?;
     if mixed {
@@ -464,6 +462,11 @@ async fn dispatch(config: &Config, db: &Database, record: &SocialIntent) -> AppR
             "SAU platform was disabled after intent creation".into(),
         ));
     }
+    let store=AssetRegistry::new(db.clone(),config.storage_root.clone());
+    let mut tx=db.pool.begin().await?;
+    crate::storage::verify_original_read(&store,&mut tx,record.task_id,"video_final",&record.video_key,false).await?;
+    if let Some(k)=record.cover_key.as_deref(){crate::storage::verify_original_read(&store,&mut tx,record.task_id,"cover_image",k,false).await?;}
+    tx.commit().await?;
     // No retry after this boundary, because the sidecar might have persisted a
     // job and begun an irreversible browser submission.
     let result = crate::social_accounts::call(
@@ -1002,6 +1005,7 @@ async fn admit_batch(
     for (kind, key) in std::iter::once(("video_final", video.as_str()))
         .chain(cover.as_deref().map(|k| ("cover_image", k)))
     {
+        crate::storage::verify_original_read(&state.storage,&mut tx,task,kind,key,true).await?;
         let valid:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM assets a JOIN storage_objects o ON o.storage_key=a.storage_key AND o.state='live' WHERE a.task_id=$1 AND a.kind::text=$2 AND a.storage_key=$3)").bind(task).bind(kind).bind(key).fetch_one(&mut *tx).await?;
         if !valid {
             return Err(AppError::Conflict(

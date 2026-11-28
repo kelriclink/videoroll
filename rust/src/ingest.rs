@@ -185,13 +185,14 @@ pub async fn download_youtube(
     let mut missing_source: Option<(String, String, Option<i64>)> = None;
     if let Some(row) = sqlx::query(
         "SELECT storage_key,sha256,size_bytes FROM assets WHERE task_id=$1 AND kind='video_raw'::asset_kind
-         AND storage_key LIKE 'v2/%' ORDER BY created_at DESC,id DESC LIMIT 1",
+         ORDER BY created_at DESC,id DESC LIMIT 1",
     )
     .bind(job.task_id)
     .fetch_optional(&db.pool)
     .await?
     {
         let key: String = row.try_get("storage_key")?;
+        if !crate::storage::task_asset_key(job.task_id,&key){return Err(AppError::Conflict("source storage key does not belong to task".into()));}
         if let Ok(path) = registry.resolve_existing(&key).await
             && fs::metadata(path)
                 .await

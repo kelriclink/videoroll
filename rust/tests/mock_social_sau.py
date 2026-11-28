@@ -72,7 +72,8 @@ class Handler(BaseHTTPRequestHandler):
                 or payload.get("account_id")!=ACCOUNTS[platform]
                 or payload.get("force_retry") is not False
                 or payload.get("video",{}).get("type")!="storage"
-                or not payload.get("video",{}).get("key","").startswith("v2/")
+                or not (payload.get("video",{}).get("key","").startswith("v2/")
+                    or payload.get("video",{}).get("key","").startswith(f"final/{payload.get('task_id')}/"))
                 or not payload.get("meta",{}).get("title")):
                 return self.output({"detail":"invalid SAU publish request"},400)
             if payload["meta"]["title"]=="simulate-timeout":

@@ -74,6 +74,13 @@
 - 隔离 PostgreSQL + 原仓库 B 站 HTTP/UPOS mock 实测 `/4t/vr2-auto-publish-verified.TXRRv7/auto.log`：原 auto_youtube_start HTTP200，已有下载/字幕/成品复用，6阶段均 succeeded/attempts1，默认分区17->平台推荐180，封面/预上传/分片/合并/推荐/稿件提交各1次，原 publish_jobs published/100、实际元数据及模拟 BV1RUSTMOCK1 落库。前几次隔离验证暴露 neutral_mark=null 校验问题及测试素材路径、模型根、仅本地 mock UPOS 开关的设置问题；已修正并完成验证。原 Python 专项74/74（活动、标签、上传、限流、草稿），日志 `/4t/vr2-python-publish-baseline.5bdmzu/result2.log`；Rust 最终主程序构建通过，最终库测试日志 `/4t/videoroll-rust-trial-build-ed42980/auto-publish-final-lib.log`。
 - 未完成：单平台自动路径原 publish_batches 聚合契约、历史稿件快照文件兼容、AI 分类/活动/标签三级回退的完整自动路径专项、原安全元数据网络重试、原生字幕同步/合集/清理及真实 B 站回执和故障注入。已有代码不能代替验收。正式服务未部署、此轮没有修改生产数据库或执行真实投稿，整体迁移仍 FAILED。
 
+## 2026-11-28 原资产布局跨模块兼容与安全回收
+
+- 真实 USGS 任务 9f4c9752-688a-42df-b5e7-d8d728398909 已有确认投稿回执 BV1UM1KzcEsE；原清理错误 refused release of legacy file。对照 Python subtitle_service/worker.py:_cleanup_task_impl、storage_retention_store.py、maintenance_service.py:cleanup_terminal_task_resources、youtube_service.py 与 subtitle_finalization.py 的原资产命名及保留规则。Rust 资源释放、批次清理、物理 GC 统一校验原布局任务 UUID、业务资产类型、文件名摘要、注册摘要/大小及共享引用；实际原路径文件删除前复验哈希，保留未知/共享/变更资产。到期补偿包含已确认投稿但 cleanup failed 的工作流，未重放投稿；成功阶段清除历史 last_error。原历史清理逐文件区分注册对象和原未注册文件，防止任意一个任务级引用阻断其他合规文件；保留跨任务、活跃操作、人工持有等保护。
+- 手动字幕及调度前置条件、原片下载复用、直接 B 站投稿、原生字幕同步、P2 源素材选择、SAU 单平台/批次准入均支持原业务资产路径。原路径读取与删除授权分离；异步入口建立引用，上传前复验，保留原表及 API。未全局取消路径/所有权约束；未注册或任意旧文件不自动取得 GC 删除权。
+- 隔离 PostgreSQL /4t/vr2-original-layout-check.jllLMo/paths.log：原路径手动字幕有效请求通过，外任务和错误摘要拒绝；原片复用真实下载阶段成功（yt-dlp 禁用）；原路径 B 站 P1+封面模拟 UPOS 上传及单次提交成功；SAU 原路径视频/封面模拟派发成功。首轮 P2 请求误用 v2 路由、字幕模拟固定文本不符、混合清理残留任务级引用保护；分别纠正测试入口/素材及逐文件回收判断。最终 /4t/vr2-layout-final-check.jDqT21/paths.log：原 SRT 模拟上传及 preSave 提交、P2 原 raw/SRT 及 YouDub 成功输出追加准入、混合终态任务仅清理原未登记文件（删除1文件/1资产行，登记文件及行保留）均通过。retention.log：原 TTL/暂停/人工持有/删除失败保护、原路径注册文件物理回收及篡改/共享/未知文件保留、已确认投稿清理失败补偿与不确认回执保留均通过。
+- 上述为隔离测试，P2 只验证持久追加准入，非实际平台编辑；SAU 仅模拟 sidecar，非真实浏览器；未重放 USGS 投稿或清理生产资产，未部署。原路径任意未证明可回收的文件保留；历史单资产删除接口 legacy_asset_delete_v1.rs 的独立 V2 限制、真实多平台/YouDub/外部字幕同步及跨模块全部差分仍待验收。不能据此将整体迁移标记完成。
+
 以下为历史审计记录，不再视为当前验收结论。当前不满足完整生产替换门槛。
 
 2026-11-23 迁移状态（最新接口审计）：**175/217** 条原版 API 具有部分 Rust 原生适配，剩余 **42** 条尚无原生 V1 入口；**0** 条达到完整生产等价签收。测试采用一次性数据库、回环侧服务和原版 Python 同库差分；生产 Python 服务不切换。

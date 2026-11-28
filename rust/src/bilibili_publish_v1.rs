@@ -105,11 +105,6 @@ fn check_ref(input: &MediaRef) -> AppResult<&str> {
             "native Bilibili requires storage inputs; S3 bridge not configured".into(),
         ));
     }
-    if !input.key.starts_with("v2/") {
-        return Err(AppError::Invalid(
-            "native Bilibili requires a Rust-managed V2 asset".into(),
-        ));
-    }
     AssetRegistry::checked_key(&input.key)?;
     Ok(&input.key)
 }
@@ -451,9 +446,11 @@ pub(crate) async fn enqueue_prepared(
     }
     for (key, _, kind) in &parts {
         owned_asset(tx, body.task_id, kind, key).await?;
+        crate::storage::verify_original_read(&state.storage,tx,body.task_id,kind,key,true).await?;
     }
     if let Some(ref key) = cover {
         owned_asset(tx, body.task_id, "cover_image", key).await?;
+        crate::storage::verify_original_read(&state.storage,tx,body.task_id,"cover_image",key,true).await?;
     }
     if parts.len() == 2 {
         let p2 = &parts[1].0;

@@ -647,7 +647,7 @@ impl Scheduler {
         if let Some(kind) = asset_needed {
             let has_asset: bool = sqlx::query_scalar(
                 "SELECT EXISTS(SELECT 1 FROM assets WHERE task_id=$1
-                  AND kind::text=$2 AND (storage_key LIKE 'v2/%' OR EXISTS(SELECT 1 FROM operation_inbox i WHERE i.task_id=$1 AND i.runtime_engine='rust-task-cutover' AND i.status='completed')))",
+                  AND kind::text=$2)",
             )
             .bind(task_id)
             .bind(kind)
@@ -657,7 +657,7 @@ impl Scheduler {
                 && !(stage == Stage::Publish
                     && sqlx::query_scalar::<_, bool>(
                         "SELECT EXISTS(SELECT 1 FROM assets WHERE task_id=$1
-                 AND kind='video_raw'::asset_kind AND storage_key LIKE 'v2/%')",
+                 AND kind='video_raw'::asset_kind)",
                     )
                     .bind(task_id)
                     .fetch_one(&mut *tx)
@@ -672,7 +672,7 @@ impl Scheduler {
         if matches!(stage, Stage::Render | Stage::Dubbing) {
             let has_subtitle: bool = sqlx::query_scalar(
                 "SELECT EXISTS(SELECT 1 FROM assets WHERE task_id=$1
-                 AND kind='subtitle_srt'::asset_kind AND (storage_key LIKE 'v2/%' OR EXISTS(SELECT 1 FROM operation_inbox i WHERE i.task_id=$1 AND i.runtime_engine='rust-task-cutover' AND i.status='completed')))",
+                 AND kind='subtitle_srt'::asset_kind)",
             )
             .bind(task_id)
             .fetch_one(&mut *tx)
@@ -1222,7 +1222,7 @@ impl Scheduler {
                 .bind(if result["no_speech"]==true {json!({"no_speech_detected":true})}else{json!({})})
                 .execute(&mut **tx).await?;
         }
-        sqlx::query("UPDATE vr2_jobs SET state='succeeded',result=$1,lease_token=NULL,lease_until=NULL,finished_at=now(),updated_at=now() WHERE id=$2")
+        sqlx::query("UPDATE vr2_jobs SET state='succeeded',result=$1,last_error=NULL,lease_token=NULL,lease_until=NULL,finished_at=now(),updated_at=now() WHERE id=$2")
             .bind(&result).bind(item.id).execute(&mut **tx).await?;
         Self::event(
             tx,

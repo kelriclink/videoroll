@@ -278,8 +278,8 @@ async fn auto_dubbing(
         ));
     }
     let ready:bool=sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM assets WHERE task_id=$1 AND kind='video_raw'::asset_kind AND storage_key LIKE 'v2/%')
-           AND EXISTS(SELECT 1 FROM assets WHERE task_id=$1 AND kind='subtitle_srt'::asset_kind AND storage_key LIKE 'v2/%')"
+        "SELECT EXISTS(SELECT 1 FROM assets WHERE task_id=$1 AND kind='video_raw'::asset_kind)
+           AND EXISTS(SELECT 1 FROM assets WHERE task_id=$1 AND kind='subtitle_srt'::asset_kind)"
     ).bind(task_id).fetch_one(&state.db.pool).await?;
     if subtitle.is_none() || !ready {
         return Err(AppError::Conflict(

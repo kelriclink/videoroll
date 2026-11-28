@@ -383,7 +383,7 @@ async fn auto_subtitle_handoff(
     }
     let has_final: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM assets
-         WHERE task_id=$1 AND kind='video_final'::asset_kind AND storage_key LIKE 'v2/%')",
+         WHERE task_id=$1 AND kind='video_final'::asset_kind)",
     )
     .bind(id)
     .fetch_one(&state.db.pool)
@@ -416,7 +416,7 @@ async fn auto_subtitle_handoff(
     }
     let has_srt: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM assets
-         WHERE task_id=$1 AND kind='subtitle_srt'::asset_kind AND storage_key LIKE 'v2/%')",
+         WHERE task_id=$1 AND kind='subtitle_srt'::asset_kind)",
     )
     .bind(id)
     .fetch_one(&state.db.pool)
@@ -784,7 +784,7 @@ async fn manual_dubbing(
     }
     let video_owned: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM assets WHERE task_id=$1
-          AND kind='video_raw'::asset_kind AND storage_key=$2 AND storage_key LIKE 'v2/%')",
+          AND kind='video_raw'::asset_kind AND storage_key=$2)",
     )
     .bind(id)
     .bind(&request.subtitle_video_key)
@@ -794,6 +794,11 @@ async fn manual_dubbing(
         return Err(AppError::Conflict(
             "YouDub source key must reference the task's V2 raw video".into(),
         ));
+    }
+    {
+        let mut tx=state.db.pool.begin().await?;
+        crate::storage::verify_original_read(&state.storage,&mut tx,id,"video_raw",&request.subtitle_video_key,false).await?;
+        tx.commit().await?;
     }
     let latest_raw = crate::media::ffmpeg::latest_asset_key(&state.db, id, "video_raw").await?;
     if latest_raw.as_deref() != Some(request.subtitle_video_key.as_str()) {

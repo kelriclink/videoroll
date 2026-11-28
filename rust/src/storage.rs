@@ -1,4 +1,4 @@
-//! Explicit asset ownership. Legacy v1 data is never garbage-collected by this module.
+//! Explicit asset ownership. Original-layout files require verified Rust registration; unowned legacy files are never garbage-collected here.
 use crate::{AppError, AppResult, Database};
 use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
@@ -80,6 +80,81 @@ fn native_key_task(key: &str) -> Option<Uuid> {
     Uuid::parse_str(parts.next()?).ok()
 }
 
+/// Original Python task directories are valid read inputs. This is not a
+/// deletion authorization: GC separately checks immutable writer provenance.
+pub(crate) fn task_asset_key(task:Uuid,key:&str)->bool {
+    if AssetRegistry::checked_key(key).is_err(){return false;}
+    if key.starts_with("v2/"){return native_key_task(key).is_none_or(|id|id==task);}
+    let mut p=key.split('/');
+    matches!(p.next(),Some("raw"|"final"|"sub"|"work"|"log"|"meta"|"dub"))
+        && p.next().and_then(|s|Uuid::parse_str(s).ok())==Some(task) && p.next().is_some()
+}
+/// Validate original-layout reads against the exact task/asset row. A
+/// historical object need not be GC-registered to be a valid input.
+pub(crate) async fn verify_original_read(store:&AssetRegistry,tx:&mut Transaction<'_,Postgres>,task:Uuid,kind:&str,key:&str,pin:bool)->AppResult<()> {
+    if !task_asset_key(task,key){return Err(AppError::Conflict("storage key does not match task namespace".into()));}
+    if key.starts_with("v2/"){return Ok(());}
+    let row:Option<(Option<String>,Option<i64>)>=sqlx::query_as("SELECT a.sha256,a.size_bytes FROM assets a JOIN tasks t ON t.id=a.task_id WHERE a.task_id=$1 AND a.kind::text=$2 AND a.storage_key=$3 AND t.runtime_owner='rust' ORDER BY a.created_at DESC,a.id DESC LIMIT 1 FOR UPDATE OF a")
+        .bind(task).bind(kind).bind(key).fetch_optional(&mut **tx).await?;
+    let Some((expected,expected_size))=row else{return Err(AppError::Conflict("original asset does not belong to Rust task".into()));};
+    let path=store.resolve_existing(key).await?;
+    if !fs::symlink_metadata(&path).await?.is_file(){return Err(AppError::Conflict("original asset is not a regular file".into()));}
+    let (sha,size)=store.sha256(key).await?;
+    if size<=0 || expected.as_ref().is_some_and(|s|!s.is_empty()&&!s.eq_ignore_ascii_case(&sha)) || expected_size.is_some_and(|n|n!=size){
+        return Err(AppError::Conflict("original asset checksum or size mismatch".into()));
+    }
+    let existing:Option<(String,Option<String>,i64)>=sqlx::query_as("SELECT state,checksum_sha256,size_bytes FROM storage_objects WHERE storage_key=$1 FOR UPDATE").bind(key).fetch_optional(&mut **tx).await?;
+    if existing.is_some_and(|(state,digest,bytes)|state!="live" || digest.as_deref()!=Some(sha.as_str()) || bytes!=size){
+        return Err(AppError::Conflict("original asset registry identity mismatch".into()));
+    }
+    if pin {
+        let written=sqlx::query("INSERT INTO storage_objects(storage_key,checksum_sha256,size_bytes,state,retain_until) VALUES($1,$2,$3,'live',now()+interval '2 days') ON CONFLICT(storage_key) DO UPDATE SET retain_until=GREATEST(storage_objects.retain_until,EXCLUDED.retain_until) WHERE storage_objects.state='live' AND storage_objects.checksum_sha256=EXCLUDED.checksum_sha256 AND storage_objects.size_bytes=EXCLUDED.size_bytes")
+            .bind(key).bind(&sha).bind(size).execute(&mut **tx).await?;
+        if written.rows_affected()!=1{return Err(AppError::Conflict("original asset registry identity mismatch".into()));}
+        // Keep historical ownership; a pin does not make an arbitrary legacy
+        // path eligible for automatic GC.
+        sqlx::query("INSERT INTO storage_object_refs(storage_key,owner_type,owner_id,role) VALUES($1,'task',$2,$3) ON CONFLICT DO NOTHING").bind(key).bind(task).bind(kind).execute(&mut **tx).await?;
+    }
+    Ok(())
+}
+/// Original content-addressed names from the Python/Rust writers qualify only
+/// with matching immutable registration and original business rows.
+fn original_generated_key(key: &str) -> Option<(Uuid, &'static str, &str)> {
+    AssetRegistry::checked_key(key).ok()?;
+    let mut p=key.split('/');
+    let category=p.next()?;
+    let task=Uuid::parse_str(p.next()?).ok()?;
+    let name=p.next()?;
+    if p.next().is_some() {return None;}
+    let (kind,tail)=match category {
+        "work"=>("audio_wav",name.strip_prefix("audio_")?.strip_suffix(".wav")?),
+        "raw" if name.starts_with("video_") => ("video_raw",name.strip_prefix("video_")?.rsplit_once('.')?.0),
+        "raw" => ("metadata_json",name.strip_prefix("metadata_")?.strip_suffix(".json")?),
+        "sub" if name.ends_with(".srt")=>("subtitle_srt",name.strip_prefix("subtitle_zh_")?.strip_suffix(".srt")?),
+        "sub" if name.ends_with(".ass")=>("subtitle_ass",name.strip_prefix("subtitle_zh_")?.strip_suffix(".ass")?),
+        "sub"=>("segments_json",name.strip_prefix("subtitle_segments_").or_else(||name.strip_prefix("segments_"))?.strip_suffix(".json")?),
+        "final"=>("cover_image",name.strip_prefix("cover_youtube_")?.strip_suffix(".jpg")?),
+        _=>return None,
+    };
+    let (digest,nonce)=tail.split_once('_')?;
+    if digest.len()!=16 || nonce.len()!=12 || !digest.bytes().chain(nonce.bytes()).all(|b|b.is_ascii_hexdigit()) {return None;}
+    Some((task,kind,digest))
+}
+/// Match the original asset ledger to the immutable Rust object registry.
+pub(crate) async fn release_key_owned(tx:&mut Transaction<'_,Postgres>, task:Uuid,key:&str)->AppResult<bool> {
+    if key.starts_with("v2/") {return Ok(task_asset_key(task,key));}
+    let Some((owner,kind,digest))=original_generated_key(key) else{return Ok(false);};
+    if owner!=task{return Ok(false);}
+    Ok(sqlx::query_scalar(r#"SELECT EXISTS(
+        SELECT 1 FROM assets a JOIN storage_objects o ON o.storage_key=a.storage_key
+        JOIN tasks t ON t.id=a.task_id WHERE a.task_id=$1 AND a.storage_key=$2 AND a.kind::text=$3
+        AND t.runtime_owner='rust' AND o.state IN ('live','deleting')
+        AND a.sha256=o.checksum_sha256 AND length(a.sha256)=64 AND left(a.sha256,16)=$4
+        AND a.size_bytes=o.size_bytes AND a.size_bytes>0
+        AND NOT EXISTS(SELECT 1 FROM assets other WHERE other.storage_key=$2 AND other.task_id<>$1)
+        AND NOT EXISTS(SELECT 1 FROM subtitles other WHERE other.storage_key=$2 AND other.task_id<>$1))"#)
+        .bind(task).bind(key).bind(kind).bind(digest).fetch_one(&mut **tx).await?)
+}
 fn sweep_uploads(root: &Path, age: Duration, limit: u64) -> AppResult<u64> {
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
@@ -351,13 +426,13 @@ impl AssetRegistry {
         let rows = sqlx::query(
             r#"SELECT w.id,w.task_id
               FROM vr2_workflows w JOIN tasks t ON t.id=w.task_id
-              WHERE w.state='succeeded' AND upper(t.status::text)='PUBLISHED'
+              WHERE (w.state='succeeded' OR (w.state='failed' AND w.current_stage='cleanup' AND EXISTS(SELECT 1 FROM vr2_jobs p WHERE p.workflow_id=w.id AND p.stage='publish' AND p.state='succeeded' AND p.result->>'confirmed'='true' AND NULLIF(COALESCE(p.result->>'bvid',p.result->>'external_id'),'') IS NOT NULL))) AND upper(t.status::text)='PUBLISHED'
                 AND t.updated_at <= $1
                 AND EXISTS (
                   SELECT 1 FROM storage_object_refs r
                   WHERE ((r.owner_type='workflow' AND r.owner_id=w.id)
                       OR (r.owner_type='task' AND r.owner_id=t.id))
-                    AND r.storage_key LIKE 'v2/%'
+                    AND (r.storage_key LIKE 'v2/%' OR EXISTS(SELECT 1 FROM assets a JOIN storage_objects o ON o.storage_key=a.storage_key WHERE a.task_id=t.id AND a.storage_key=r.storage_key AND a.sha256=o.checksum_sha256 AND a.size_bytes=o.size_bytes AND a.kind::text IN ('audio_wav','segments_json','cover_image','subtitle_srt','subtitle_ass','video_raw','metadata_json')))
                 )
                 AND NOT EXISTS(
                   SELECT 1 FROM workflow_events e WHERE e.workflow_id=w.id
@@ -501,16 +576,21 @@ impl AssetRegistry {
                 ));
             }
         }
-        let rows=sqlx::query(
-            "DELETE FROM storage_object_refs WHERE (owner_type='workflow' AND owner_id=$1) OR (owner_type='task' AND owner_id=$2) RETURNING storage_key"
+        let keys=sqlx::query_scalar::<_,String>(
+            "SELECT DISTINCT storage_key FROM storage_object_refs WHERE (owner_type='workflow' AND owner_id=$1) OR (owner_type='task' AND owner_id=$2)"
         ).bind(workflow_id).bind(task_id).fetch_all(&mut *tx).await?;
-        for row in &rows {
-            let key: String = row.try_get("storage_key")?;
-            if !key.starts_with("v2/") {
-                return Err(AppError::Conflict("refused release of legacy file".into()));
+        let mut released=0u64;
+        let mut retained=0u64;
+        for key in keys {
+            if !release_key_owned(&mut tx,task_id,&key).await? {
+                retained+=1;
+                tracing::warn!(%task_id,%key,"unverified original-layout asset retained");
+                continue;
             }
+            released+=sqlx::query("DELETE FROM storage_object_refs WHERE storage_key=$3 AND ((owner_type='workflow' AND owner_id=$1) OR (owner_type='task' AND owner_id=$2))")
+                .bind(workflow_id).bind(task_id).bind(&key).execute(&mut *tx).await?.rows_affected();
             sqlx::query(
-                "UPDATE storage_objects SET retain_until=GREATEST(now()+($1*interval '1 second'),manual_hold_until),updated_at=now() WHERE storage_key=$2 AND state='live'"
+                "UPDATE storage_objects SET retain_until=GREATEST(retain_until,now()+($1*interval '1 second'),manual_hold_until),updated_at=now() WHERE storage_key=$2 AND state='live'"
             ).bind(grace_seconds).bind(key).execute(&mut *tx).await?;
         }
         for category in ["raw", "sub", "render", "dubbing"] {
@@ -523,10 +603,10 @@ impl AssetRegistry {
         sqlx::query(
             "INSERT INTO workflow_events(id,workflow_id,kind,details) VALUES($1,$2,'storage.cleanup_scheduled',$3)"
         ).bind(Uuid::new_v4()).bind(workflow_id)
-            .bind(serde_json::json!({"task_id":task_id,"grace_seconds":grace_seconds,"released_refs":rows.len()}))
+            .bind(serde_json::json!({"task_id":task_id,"grace_seconds":grace_seconds,"released_refs":released,"unverified_keys_retained":retained}))
             .execute(&mut *tx).await?;
         tx.commit().await?;
-        Ok(rows.len() as u64)
+        Ok(released)
     }
     /// Check the exact claimed lease, parent task, current policy and all
     /// references in one transaction; retain business rows on unlink failure.
@@ -550,10 +630,11 @@ impl AssetRegistry {
         ).bind(key).bind(lease).fetch_optional(&mut *tx).await?;
         let Some(due) = claim else { return Ok(false) };
         let mut allowed=false;
-        if key.starts_with("v2/") && due {
+        if due {
             if let (Some(task),Some((status,stopped,updated)))=(task,parent) {
+                let owned=release_key_owned(&mut tx,task,key).await?;
                 let (full,batch)=deletion_policy(&mut tx,task,&status,stopped.as_deref(),updated,failed_retention).await?;
-                if full || batch {
+                if owned && (full || batch) {
                     // Short nonblocking table fence also protects against
                     // cross-task references created outside the native scheduler.
                     sqlx::query("LOCK TABLE assets, subtitles, render_executions IN SHARE ROW EXCLUSIVE MODE NOWAIT")
@@ -576,6 +657,16 @@ impl AssetRegistry {
                         ).bind(key).bind(task).fetch_one(&mut *tx).await?
                     } else { false };
                     allowed=!shared && (full || intermediate);
+                    // Revalidate original-layout identity under the deletion fence,
+                    // including actual bytes before any relational or physical delete.
+                    if allowed && !key.starts_with("v2/") {
+                        allowed=release_key_owned(&mut tx,task,key).await?;
+                        if allowed {
+                            let expected: (Option<String>,i64)=sqlx::query_as("SELECT checksum_sha256,size_bytes FROM storage_objects WHERE storage_key=$1")
+                                .bind(key).fetch_one(&mut *tx).await?;
+                            allowed=self.sha256(key).await.ok().is_some_and(|(sha,size)|expected.0.as_deref()==Some(sha.as_str()) && expected.1==size);
+                        }
+                    }
                     if allowed {
                         // Run the relational deletes before the unlink, but
                         // roll them back on filesystem failure.
@@ -722,6 +813,23 @@ impl AssetRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn original_generated_assets_require_exact_task_names() {
+        let task=Uuid::new_v4();
+        let foreign=Uuid::new_v4();
+        assert!(task_asset_key(task,&format!("raw/{task}/video.mp4")));
+        assert!(!task_asset_key(task,&format!("raw/{foreign}/video.mp4")));
+        assert!(!task_asset_key(task,&format!("v2/raw/{foreign}/video.mp4")));
+        assert!(!task_asset_key(task,&format!("sub/{task}/../x")));
+        let name=format!("work/{task}/audio_0123456789abcdef_123456789abc.wav");
+        assert_eq!(original_generated_key(&name),Some((task,"audio_wav","0123456789abcdef")));
+        for (key,kind) in [(format!("sub/{task}/segments_0123456789abcdef_123456789abc.json"),"segments_json"),(format!("sub/{task}/subtitle_segments_0123456789abcdef_123456789abc.json"),"segments_json"),(format!("final/{task}/cover_youtube_0123456789abcdef_123456789abc.jpg"),"cover_image")] {
+            assert_eq!(original_generated_key(&key),Some((task,kind,"0123456789abcdef")));
+        }
+        for key in [format!("work/{task}/audio.wav"),format!("work/{task}/../audio_0123456789abcdef_123456789abc.wav"),format!("sub/{task}/nested/segments_0123456789abcdef_123456789abc.json"),format!("raw/{task}/source.mp4"),format!("log/{task}/subtitle.log")] {
+            assert!(original_generated_key(&key).is_none(),"{key}");
+        }
+    }
     #[test]
     fn terminal_cleanup_preserves_resumable_canceled_tasks() {
         assert!(terminal_resources_releasable("published", None));

@@ -110,12 +110,13 @@ pub async fn enqueue_locked(
         .filter(|v| (1..=2).contains(v))
         .ok_or_else(|| AppError::Invalid("invalid Bilibili archive parts".into()))?;
     let source:Option<String>=sqlx::query_scalar(
-        "SELECT a.storage_key FROM assets a JOIN storage_objects o ON o.storage_key=a.storage_key AND o.state='live' WHERE a.task_id=$1 AND a.kind::text='subtitle_srt' AND a.storage_key LIKE 'v2/%' ORDER BY a.created_at DESC,a.id DESC LIMIT 1"
+        "SELECT a.storage_key FROM assets a JOIN storage_objects o ON o.storage_key=a.storage_key AND o.state='live' WHERE a.task_id=$1 AND a.kind::text='subtitle_srt' ORDER BY a.created_at DESC,a.id DESC LIMIT 1"
     ).bind(item.task_id).fetch_optional(&mut **tx).await?;
     let Some(source) = source else {
         // The source had no credible speech, or no verified SRT was generated.
         return Ok(false);
     };
+    if !crate::storage::task_asset_key(item.task_id,&source){return Err(AppError::Conflict("SRT key does not match task".into()));}
     let inserted = sqlx::query(
         "UPDATE operation_inbox SET
            bili_sync_source_key=$4,bili_sync_aid=$5,bili_sync_bvid=$6,
@@ -147,9 +148,9 @@ pub async fn enqueue_locked(
 
 /// Reconciliation also repairs a crash between external publication and outbox
 /// discovery. It reads only confirmed Rust-native receipts, never v1 jobs.
-pub async fn recover_confirmed(db: &Database, limit: i64) -> AppResult<u64> {
+pub async fn recover_confirmed(db: &Database, store:&AssetRegistry, limit: i64) -> AppResult<u64> {
     let rows=sqlx::query(
-        "SELECT j.id,j.workflow_id,j.task_id,j.generation,j.operation_key,j.result FROM vr2_jobs j WHERE j.stage='publish' AND j.state='succeeded' AND j.result->>'native_bilibili'='true' AND NOT EXISTS (SELECT 1 FROM vr2_bilibili_subtitle_syncs s WHERE s.publish_job_id=j.id) AND EXISTS (SELECT 1 FROM assets a JOIN storage_objects o ON o.storage_key=a.storage_key AND o.state='live' WHERE a.task_id=j.task_id AND a.kind::text='subtitle_srt' AND a.storage_key LIKE 'v2/%') ORDER BY j.finished_at DESC LIMIT $1"
+        "SELECT j.id,j.workflow_id,j.task_id,j.generation,j.operation_key,j.result FROM vr2_jobs j WHERE j.stage='publish' AND j.state='succeeded' AND j.result->>'native_bilibili'='true' AND NOT EXISTS (SELECT 1 FROM vr2_bilibili_subtitle_syncs s WHERE s.publish_job_id=j.id) AND EXISTS (SELECT 1 FROM assets a WHERE a.task_id=j.task_id AND a.kind::text='subtitle_srt') ORDER BY j.finished_at DESC LIMIT $1"
     ).bind(limit.clamp(1,40)).fetch_all(&db.pool).await?;
     let mut n = 0;
     for row in rows {
@@ -167,6 +168,15 @@ pub async fn recover_confirmed(db: &Database, limit: i64) -> AppResult<u64> {
             payload: json!({}),
         };
         let mut tx = db.pool.begin().await?;
+        let locked:Option<Uuid>=sqlx::query_scalar("SELECT id FROM tasks WHERE id=$1 AND runtime_owner='rust' FOR UPDATE").bind(job.task_id).fetch_optional(&mut *tx).await?;
+        if locked.is_none(){continue;}
+        let source:Option<String>=sqlx::query_scalar("SELECT storage_key FROM assets WHERE task_id=$1 AND kind::text='subtitle_srt' ORDER BY created_at DESC,id DESC LIMIT 1").bind(job.task_id).fetch_optional(&mut *tx).await?;
+        if let Some(key)=source {
+            if let Err(error)=crate::storage::verify_original_read(store,&mut tx,job.task_id,"subtitle_srt",&key,true).await {
+                tracing::warn!(job_id=%job.id,%error,"original subtitle asset not verified");
+                continue;
+            }
+        }
         match enqueue_locked(&mut tx, &job, &result).await {
             Ok(created) => {
                 tx.commit().await?;
@@ -424,6 +434,9 @@ async fn run_claimed(
         record.task_id,
     )
     .await?;
+    let mut tx=db.pool.begin().await?;
+    crate::storage::verify_original_read(store,&mut tx,record.task_id,"subtitle_srt",&record.source_key,false).await?;
+    tx.commit().await?;
     let (sha, size) = store.sha256(&record.source_key).await?;
     if size <= 0 || size as u64 > MAX_SUBTITLE_SIZE {
         return Err(AppError::Invalid("SRT source is empty or oversized".into()));
@@ -518,7 +531,7 @@ pub async fn tick(config: &Config, db: &Database, store: &AssetRegistry) -> AppR
         return Ok(false);
     }
     reconcile_expired(db).await?;
-    recover_confirmed(db, 30).await?;
+    recover_confirmed(db, store, 30).await?;
     let Some((record, token)) = claim(db).await? else {
         return Ok(false);
     };

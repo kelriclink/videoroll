@@ -200,12 +200,10 @@ pub(crate) fn config(request: &Value) -> AppResult<(Uuid, String, Value)> {
         return Err(invalid("only V2-owned storage input is supported"));
     }
     let key = input.get("key").and_then(Value::as_str).unwrap_or("");
-    if (!key.starts_with("v2/") && map.get("resume").and_then(Value::as_bool) != Some(true))
-        || key.len() > 512
-        || crate::storage::AssetRegistry::checked_key(key).is_err()
+    if key.len() > 512 || !crate::storage::task_asset_key(id,key)
     {
         return Err(invalid(
-            "input.key must reference a V2-owned storage object",
+            "input.key must reference a task-owned storage object",
         ));
     }
     if map
@@ -398,8 +396,13 @@ async fn create(
     .await?;
     if actual.as_deref() != Some(key.as_str()) {
         return Err(AppError::Conflict(
-            "requested input.key is not the task's current V2 raw video asset".into(),
+            "requested input.key is not the task's current raw video asset".into(),
         ));
+    }
+    {
+        let mut tx=state.db.pool.begin().await?;
+        crate::storage::verify_original_read(&state.storage,&mut tx,task_id,"video_raw",&key,false).await?;
+        tx.commit().await?;
     }
     if let Some(plan) = request
         .get("selective_retranslate")
@@ -590,6 +593,11 @@ mod tests {
             bad[field] = value;
             assert!(config(&bad).is_err(), "{field} not rejected");
         }
+        let mut original=request.clone();
+        original["input"]["key"]=json!(format!("raw/{id}/video.mp4"));
+        assert!(config(&original).is_ok());
+        original["input"]["key"]=json!(format!("raw/{}/video.mp4",Uuid::new_v4()));
+        assert!(config(&original).is_err());
         let mut wrong = request.clone();
         wrong["input"]["key"] = json!("other-task.mp4");
         assert!(config(&wrong).is_err());

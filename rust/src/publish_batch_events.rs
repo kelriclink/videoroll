@@ -245,9 +245,9 @@ async fn consume(db: &Database, id: Uuid, batch: Uuid, task: Uuid) -> AppResult<
             } else {
                 // Only native registered task-owned intermediates. Do not
                 // directly unlink files, scan legacy paths or shorten holds.
-                let released=sqlx::query_scalar::<_,String>(r#"DELETE FROM storage_object_refs r
-                  USING storage_objects o WHERE r.storage_key=o.storage_key AND o.state='live'
-                    AND r.storage_key LIKE 'v2/%'
+                let candidates=sqlx::query_scalar::<_,String>(r#"SELECT DISTINCT r.storage_key FROM storage_object_refs r
+                  JOIN storage_objects o ON r.storage_key=o.storage_key AND o.state='live'
+                  WHERE true
                     AND ((r.owner_type='task' AND r.owner_id=$1) OR
                          (r.owner_type='workflow' AND EXISTS(SELECT 1 FROM vr2_workflows w WHERE w.id=r.owner_id AND w.task_id=$1 AND w.state IN ('succeeded','failed','canceled'))))
                     AND EXISTS(SELECT 1 FROM assets a WHERE a.task_id=$1 AND a.storage_key=r.storage_key)
@@ -257,7 +257,14 @@ async fn consume(db: &Database, id: Uuid, batch: Uuid, task: Uuid) -> AppResult<
                     AND NOT EXISTS(SELECT 1 FROM subtitles s WHERE s.task_id<>$1 AND s.storage_key=r.storage_key)
                     AND (EXISTS(SELECT 1 FROM assets a WHERE a.task_id=$1 AND a.kind::text='video_final')
                          OR r.storage_key IS DISTINCT FROM (SELECT a.storage_key FROM assets a WHERE a.task_id=$1 AND a.kind::text='video_raw' ORDER BY a.created_at DESC,a.id DESC LIMIT 1))
-                  RETURNING r.storage_key"#).bind(task).fetch_all(&mut *tx).await?;
+                  "#).bind(task).fetch_all(&mut *tx).await?;
+                let mut released=Vec::new();
+                for key in candidates {
+                    if !crate::storage::release_key_owned(&mut tx,task,&key).await? {continue;}
+                    sqlx::query("DELETE FROM storage_object_refs r WHERE r.storage_key=$2 AND ((r.owner_type='task' AND r.owner_id=$1) OR (r.owner_type='workflow' AND EXISTS(SELECT 1 FROM vr2_workflows w WHERE w.id=r.owner_id AND w.task_id=$1 AND w.state IN ('succeeded','failed','canceled'))))")
+                        .bind(task).bind(&key).execute(&mut *tx).await?;
+                    released.push(key);
+                }
                 for key in &released {
                     sqlx::query("UPDATE storage_objects SET retain_until=GREATEST(retain_until,manual_hold_until,now()+interval '1 hour'),updated_at=now() WHERE storage_key=$1 AND state='live'")
                         .bind(key).execute(&mut *tx).await?;
